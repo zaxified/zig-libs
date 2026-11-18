@@ -1687,14 +1687,14 @@ test "mutation: header reserved-field encoding at its edges, hasExtension, IV co
     const r_none = try ed.encodeReserved(0x0001, 0);
     try testing.expectEqual(@as(u16, 0x0001), r_none[0]); // no extension: no flag
 
-    const ts = HeaderProfile.ts2007;
-    const t_max = try ts.encodeReserved(0x0100, 0xff);
+    const hdr07 = HeaderProfile.ts2007;
+    const t_max = try hdr07.encodeReserved(0x0100, 0xff);
     try testing.expectEqual(@as(u16, 0x01ff), t_max[0]);
     try testing.expectEqual(@as(u16, 0), t_max[1]);
-    try testing.expectError(error.ExtensionTooLong, ts.encodeReserved(0, 0x100));
-    try testing.expectError(error.ReservedBitsConflict, ts.encodeReserved(0x0080, 5));
-    try testing.expectError(error.ReservedBitsConflict, ts.encodeReserved(0x0001, 5));
-    try testing.expectEqual(@as(u16, 0x0105), (try ts.encodeReserved(0x0100, 5))[0]);
+    try testing.expectError(error.ExtensionTooLong, hdr07.encodeReserved(0, 0x100));
+    try testing.expectError(error.ReservedBitsConflict, hdr07.encodeReserved(0x0080, 5));
+    try testing.expectError(error.ReservedBitsConflict, hdr07.encodeReserved(0x0001, 5));
+    try testing.expectEqual(@as(u16, 0x0105), (try hdr07.encodeReserved(0x0100, 5))[0]);
 
     var f = Frame{ .bytes = &.{}, .ether_type = 0, .appid = 0, .length = 0, .reserved1 = 0, .reserved2 = 0, .apdu = &.{}, .extension = &.{} };
     try testing.expect(!f.hasExtension());

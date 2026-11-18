@@ -6,7 +6,7 @@
 
 **Scope:** core — libiec61850 v1.6.2.1 (its IEC 62351-3/4 support; no open reference exists for -6) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (338/352, 14 eq) · src d903916ae3e87bb2
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (338/352, 14 eq) · src cdab976dedde4c68
 
 **Hardening:** fuzz 2026-10-10 (IEC62351_FUZZ: `iec62351-goose` and `iec62351-replay` 200,000-run budget clean; `iec62351-acse` at `.scale` 4 = 50,000 runs — a signed token in an AARQ; RSA-PSS sealers are not driven; the existing parser harnesses are unchanged) · ct 2026-10-10 (ctgrind: GOOSE/SV MAC key through computeMac/verifyMac, all HMAC and GMAC algorithms; 0 in-file; signature profiles via rsa/p256)
 **Performance:** not measured

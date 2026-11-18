@@ -1796,7 +1796,7 @@ dnp3	ReleaseFast	mac	1	0	2ff4825a5c6f1f58	0dcd2c9e71d8d02f
 dnp3	ReleaseFast	keys	1	2	2ff4825a5c6f1f58	d2337903af778cbe
 # iec62351 (2026-10-10) — mac: GOOSE/SV MAC key through computeMac/verifyMac
 # for HMAC-SHA256-80/128/256 and AES-GMAC-64/128 (AES-128/256): 0.
-iec62351	ReleaseFast	mac	1	0	2f7d619a02903cab	760ede68c6c5b472
+iec62351	ReleaseFast	mac	1	0	ff413992e4aa0c2f	760ede68c6c5b472
 # opcua (2026-10-10, Basic256Sha256) — kdf: both channel nonces through
 # deriveKeys: 0. chunk: channel keys + body through symmetricSignAndEncrypt/
 # symmetricDecryptAndVerify (Sign, SignAndEncrypt, wrong-direction reject).
