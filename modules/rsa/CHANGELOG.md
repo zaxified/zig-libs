@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE (output byte-identical):** `toPem`/`toPkcs1Der`/`toPkcs8Der` trim each INTEGER without branching on the secret bytes (only the DER length and sign pad are declassified); `fromPem`/`fromDer` declassify their single accept/reject verdict. Two new ctgrind rows pinned: `rsa/pemenc` 0 in-file, `rsa/pemdec` 2 in-file (both argued, SPEC Backlog). Delta mutation 8/8 killed.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** docs only: the ctgrind measurement of `SecretKey.toPem`/`fromPem` is recorded in SPEC (not clean: DER length bytes and `fromPrimes` residue; no row pinned).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).

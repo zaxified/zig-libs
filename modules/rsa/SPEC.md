@@ -540,7 +540,7 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
     `keygen`'s claim and would otherwise be counted twice.
   Delta mutation of the trim: 8 mutants (loop bound, first-byte select, top-byte capture, `seen`,
   the `z` count, the last-byte arm, the pad bit, the pad emission), 8/8 killed. Original text:
-- **Private-key PEM base64 is not constant-time** *(2026-10-16, found while wiring RSA into `acme`)*:
+- ✅ DONE 2026-10-17 (`676fa12e2`: `marshal.zig` and `pemDecodeBody` go through the constant-time `b64ct`; ctgrind rows `rsa/pemenc` and `rsa/pemdec` pinned 2026-11-17, see the ctgrind item above). **Private-key PEM base64 is not constant-time** *(2026-10-16, found while wiring RSA into `acme`)*:
   `marshal.zig:282` encodes and `root.zig:2681` decodes the private-key DER through std's base64
   alphabet tables — loads indexed by key bytes, the class ctgrind found in `acme`'s EC key PEM on
   2026-10-13 (fixed there with `acme/src/b64ct.zig`). Fix: the same constant-time codec (a 4th copy, or
