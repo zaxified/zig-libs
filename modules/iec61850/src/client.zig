@@ -1064,3 +1064,142 @@ test "awaitNotification propagates Canceled instead of retrying it as an empty r
     // back immediately, on the first round, as `error.Canceled`.
     try testing.expectError(error.Canceled, c.awaitNotification(1000));
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): client pins ───────
+
+/// A link that answers each read with the next scripted frame (then with
+/// nothing) and counts what the client does with it.
+const ScriptLink = struct {
+    frames: []const []const u8 = &.{},
+    next: usize = 0,
+    reads: usize = 0,
+    writes: usize = 0,
+    last_len: usize = 0,
+
+    fn link(self: *ScriptLink) transport.Transport {
+        return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
+    }
+    fn readFn(ctx: *anyopaque, buf: []u8) transport.TransportError!usize {
+        const self: *ScriptLink = @ptrCast(@alignCast(ctx));
+        self.reads += 1;
+        if (self.next >= self.frames.len) return 0;
+        const f = self.frames[self.next];
+        self.next += 1;
+        @memcpy(buf[0..f.len], f);
+        return f.len;
+    }
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) transport.TransportError!void {
+        const self: *ScriptLink = @ptrCast(@alignCast(ctx));
+        self.writes += 1;
+        self.last_len = bytes.len;
+    }
+};
+
+test "every wait loop makes exactly max_read_rounds reads and then gives up" {
+    var link: ScriptLink = .{};
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(link.link(), &buf, .{ .max_read_rounds = 3 });
+    // connect: nothing at all comes back.
+    try testing.expectError(error.NoResponse, c.connect());
+    try testing.expectEqual(@as(usize, 3), link.reads);
+    // connect: the transport confirms, the association never answers.
+    link = .{};
+    var cc_body: [64]u8 = undefined;
+    var cc_tp: [96]u8 = undefined;
+    const cc = try cotp.encodeConnect(.cc, 1, 1, .b8192, &[_]u8{ 0, 1 }, &[_]u8{ 0, 1 }, &cc_body);
+    const cc_frame = try tpkt.encode(cc, &cc_tp);
+    link.frames = &[_][]const u8{cc_frame};
+    try testing.expectError(error.NoResponse, c.connect());
+    try testing.expectEqual(@as(usize, 1 + 3), link.reads);
+    // exchange: the request goes out, no answer.
+    link = .{};
+    c.connected = true;
+    try testing.expectError(error.NoResponse, c.exchange(&[_]u8{ 0xA0, 0x00 }, 1, .read));
+    try testing.expectEqual(@as(usize, 3), link.reads);
+    try testing.expectEqual(@as(usize, 1), link.writes);
+    // awaitNotification: one poll, one read, per round.
+    link = .{};
+    try testing.expectError(error.NoResponse, c.awaitNotification(3));
+    try testing.expectEqual(@as(usize, 3), link.reads);
+    c.connected = false;
+    try testing.expectError(error.NotConnected, c.awaitNotification(3));
+}
+
+test "pushTpkt: a segmented answer survives across reads and keeps its octets" {
+    var link: ScriptLink = .{};
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(link.link(), &buf, .{});
+    var f1: [64]u8 = undefined;
+    var t1: [64]u8 = undefined;
+    var f2: [64]u8 = undefined;
+    var t2: [64]u8 = undefined;
+    const a = try tpkt.encode(try cotp.encodeData("hello ", false, &f1), &t1);
+    const b = try tpkt.encode(try cotp.encodeData("world", true, &f2), &t2);
+    try testing.expect((try c.pushTpkt(a)) == null);
+    try testing.expectEqual(@as(usize, 6), c.reasm_len);
+    const done = (try c.pushTpkt(b)).?;
+    try testing.expectEqualStrings("hello world", done);
+}
+
+test "attribute: a reference that exactly fills the buffer is built, one octet more is refused" {
+    var five: [5]u8 = undefined;
+    try testing.expectEqualStrings("AB.CD", try attribute("AB", "CD", &five));
+    var four: [4]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, attribute("AB", "CD", &four));
+}
+
+test "writeTpkt: a payload that exactly fills the transmit buffer goes out, one more does not" {
+    var link: ScriptLink = .{};
+    var buf: [4 * 512]u8 = undefined;
+    var c = try Client.init(link.link(), &buf, .{});
+    var payload: [600]u8 = @splat(0);
+    const fit = c.tx.len - tpkt.header_len;
+    try c.writeTpkt(payload[0..fit]);
+    try testing.expectEqual(@as(usize, 1), link.writes);
+    try testing.expectError(error.BufferTooSmall, c.writeTpkt(payload[0 .. fit + 1]));
+    try testing.expectEqual(@as(usize, 1), link.writes);
+}
+
+test "sendMms: the largest TPKT the length field can carry goes out, one octet more is refused" {
+    var link: ScriptLink = .{};
+    const big = try testing.allocator.alloc(u8, 4 * 70000);
+    defer testing.allocator.free(big);
+    var c = try Client.init(link.link(), big, .{});
+    const pdu = try testing.allocator.alloc(u8, 70000);
+    defer testing.allocator.free(pdu);
+    @memset(pdu, 0);
+    var l: usize = tpkt.max_length;
+    while (true) : (l -= 1) {
+        c.sendMms(pdu[0..l]) catch |e| {
+            try testing.expect(e == error.BufferTooSmall);
+            continue;
+        };
+        break;
+    }
+    try testing.expectEqual(@as(usize, tpkt.max_length), link.last_len);
+    try testing.expectError(error.BufferTooSmall, c.sendMms(pdu[0 .. l + 1]));
+}
+
+test "the AARQ carries the MMS presentation context the client proposed" {
+    const lt = try testing.allocator.create(transport.LoopTransport);
+    defer testing.allocator.destroy(lt);
+    lt.* = .{};
+    var cc_body: [64]u8 = undefined;
+    var cc_tp: [96]u8 = undefined;
+    const cc = try cotp.encodeConnect(.cc, 1, 1, .b8192, &[_]u8{ 0, 1 }, &[_]u8{ 0, 1 }, &cc_body);
+    lt.deliver(try tpkt.encode(cc, &cc_tp));
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(lt.transport(), &buf, .{});
+    c.mms_context = 5; // distinguishable from the encoder's default
+    try testing.expectError(error.NoResponse, c.connect());
+    const sent = lt.sent();
+    const cr_len = try tpkt.peekLength(sent);
+    const second = try tpkt.decode(sent[cr_len..]);
+    const dt = (try cotp.decode(second.payload)).dt;
+    const cn = try session.decodeConnect(dt.payload);
+    const cp = try presentation.decodeCp(cn.user_data);
+    var pdvs = presentation.PdvIterator.init(cp.user_data);
+    const pdv = (try pdvs.next()).?;
+    const aarq = try acse.decodeAarq(pdv.value);
+    try testing.expectEqual(@as(?u16, 5), aarq.indirect_reference);
+}

@@ -1868,3 +1868,448 @@ test "corpus: every deletion seed reaches its decoder, and the counts are pinned
     try testing.expectEqual(@as(usize, 4), deletes);
     try testing.expectEqual(@as(usize, 1), init_resps);
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): the journal ──────
+
+fn bodyOf(pdu: []const u8) ![]const u8 {
+    return switch (try mms.decode(pdu)) {
+        .confirmed_request => |r| r.body,
+        .confirmed_response => |r| r.body,
+        else => error.TestUnexpectedResult,
+    };
+}
+
+fn lBool(buf: []u8, v: bool) !mmsdata.Data {
+    var w = ber.Writer.init(buf);
+    try mmsdata.Emit.boolean(&w, v);
+    return mmsdata.Data.decode(w.done());
+}
+
+fn lUnsigned(buf: []u8, v: u32) !mmsdata.Data {
+    var w = ber.Writer.init(buf);
+    try mmsdata.Emit.unsigned(&w, v);
+    return mmsdata.Data.decode(w.done());
+}
+
+/// A source with `n` members that has a value for every member below 64, so
+/// a loop that runs one member too far shows up in the entry.
+const CountSource = struct {
+    n: usize,
+    val: [8]u8 = undefined,
+    vlen: usize = 0,
+
+    fn init(n: usize) !CountSource {
+        var s = CountSource{ .n = n };
+        var w = ber.Writer.init(&s.val);
+        try mmsdata.Emit.boolean(&w, true);
+        const d = w.done();
+        std.mem.copyForwards(u8, s.val[0..d.len], d);
+        s.vlen = d.len;
+        return s;
+    }
+    fn source(self: *CountSource) Source {
+        return .{ .ctx = self, .vtable = &.{ .count = countFn, .value = valueFn, .reference = referenceFn } };
+    }
+    fn countFn(ctx: *anyopaque, _: usize) usize {
+        const self: *CountSource = @ptrCast(@alignCast(ctx));
+        return self.n;
+    }
+    fn valueFn(ctx: *anyopaque, _: usize, m: usize) ?[]const u8 {
+        const self: *CountSource = @ptrCast(@alignCast(ctx));
+        if (m >= 64) return null;
+        return self.val[0..self.vlen];
+    }
+    fn referenceFn(_: *anyopaque, _: usize, m: usize, out: []u8) ?[]const u8 {
+        return std.mem.print(out, "R{d}", .{m}) catch null;
+    }
+};
+
+test "emitLogReason: each reason is its own bit of the seven" {
+    const Case = struct { r: Reason, bit: usize };
+    const cases = [_]Case{
+        .{ .r = .{ .data_change = true }, .bit = 1 },
+        .{ .r = .{ .quality_change = true }, .bit = 2 },
+        .{ .r = .{ .data_update = true }, .bit = 3 },
+        .{ .r = .{ .integrity = true }, .bit = 4 },
+        .{ .r = .{ .general_interrogation = true }, .bit = 5 },
+    };
+    for (cases) |c| {
+        var buf: [16]u8 = undefined;
+        var w = ber.Writer.init(&buf);
+        try emitLogReason(&w, c.r);
+        const bs = try (try mmsdata.Data.decode(w.done())).bitString();
+        try testing.expectEqual(@as(usize, log_reason_bits), bs.bitCount());
+        for (0..log_reason_bits) |i| try testing.expectEqual(i == c.bit, bs.bit(i));
+    }
+}
+
+test "Store: slot floor, clear, stale entries, dropOldest and the empty answers" {
+    var entries: [2]Entry = @splat(.{});
+    var arena: [32]u8 = undefined;
+    _ = try Store.init(&entries, &arena); // a slot of exactly 16
+    try testing.expectError(error.LogStoreTooSmall, Store.init(&entries, arena[0..31]));
+    try testing.expectError(error.LogStoreTooSmall, Store.init(entries[0..0], &arena));
+    var none = Store.none;
+    try testing.expectError(error.LogStoreTooSmall, none.push());
+
+    var s = try Store.init(&entries, &arena);
+    s.head = 1;
+    s.count = 2;
+    s.clear();
+    try testing.expectEqual(@as(usize, 0), s.head);
+    try testing.expectEqual(@as(usize, 0), s.count);
+    entries[0] = .{ .entry_id = 9, .used = 5, .count = 3 };
+    const e0 = try s.push();
+    try testing.expectEqual(@as(u64, 0), e0.entry_id);
+    try testing.expectEqual(@as(u16, 0), e0.used);
+    try testing.expectEqual(@as(u8, 0), e0.count);
+
+    var empty = try Store.init(&entries, &arena);
+    empty.dropOldest();
+    try testing.expectEqual(@as(usize, 0), empty.count);
+    try testing.expect(empty.oldest() == null);
+    try testing.expect(empty.newest() == null);
+    _ = try empty.push();
+    _ = try empty.push();
+    empty.dropOldest();
+    try testing.expectEqual(@as(usize, 1), empty.count);
+    try testing.expectEqual(@as(u64, 0), empty.purged); // a deletion is not a purge
+}
+
+test "a log's signal and sweep: every guard, the counters and the entry header" {
+    var h: Harness = .{};
+    try h.src.init();
+    var lcb = h.lcb();
+    const src = h.src.source();
+    try testing.expect(!try lcb.sweep(src, .integrity, 0)); // not enabled
+    lcb.log_ena = true;
+    try testing.expect(!try lcb.signal(src, 5, 0, .data_change, 0)); // another data set
+    try testing.expect(!try lcb.signal(src, 0, 3, .data_change, 0)); // member == count
+    try testing.expect(!try lcb.signal(src, 0, 9, .data_change, 0));
+    try testing.expectEqual(@as(usize, 0), lcb.store.count);
+    lcb.trg_ops.integrity = false;
+    try testing.expect(!try lcb.sweep(src, .integrity, 0));
+    lcb.trg_ops.integrity = true;
+    try testing.expectEqual(@as(usize, 0), lcb.store.count);
+    var bare = h.lcb();
+    bare.store = Store.none;
+    bare.log_ena = true;
+    try testing.expect(!try bare.sweep(src, .integrity, 0));
+
+    try testing.expect(try lcb.sweep(src, .integrity, 777));
+    try testing.expect(try lcb.sweep(src, .integrity, 888));
+    const e = lcb.store.newest().?;
+    try testing.expectEqual(@as(u64, 2), e.entry_id);
+    try testing.expectEqual(@as(u64, 888), e.time_ms);
+    try testing.expect(e.reason.integrity);
+    try testing.expectEqual(@as(u8, 6), e.count); // three members, each with its ReasonCode
+    try testing.expectEqual(@as(u64, 2), lcb.entries_written);
+    try testing.expect(try lcb.signal(src, 0, 0, .data_change, 999));
+    try testing.expectEqual(@as(u64, 3), lcb.entries_written);
+}
+
+test "a log sweep: the 32-member bound, an empty data set and exactly the data set's members" {
+    var entries: [1]Entry = @splat(.{});
+    var arena: [1024]u8 = undefined;
+    var lcb = ControlBlock{
+        .domain = "D",
+        .item = "LLN0$LG$L",
+        .trg_ops = .{ .integrity = true },
+        .store = try Store.init(&entries, &arena),
+    };
+    lcb.log_ena = true;
+    var s = try CountSource.init(0);
+    try testing.expect(!try lcb.sweep(s.source(), .integrity, 0));
+    s.n = 33;
+    try testing.expectError(error.TooManyMembers, lcb.sweep(s.source(), .integrity, 0));
+    s.n = 32;
+    try testing.expect(try lcb.sweep(s.source(), .integrity, 0));
+    try testing.expectEqual(@as(u8, 64), lcb.store.newest().?.count);
+    s.n = 2;
+    try testing.expect(try lcb.sweep(s.source(), .integrity, 1));
+    try testing.expectEqual(@as(u8, 4), lcb.store.newest().?.count);
+}
+
+test "a log's tick: a disabled log, or one without the integrity trigger, does not even re-arm" {
+    var h: Harness = .{};
+    try h.src.init();
+    var lcb = h.lcb();
+    lcb.intg_pd_ms = 100;
+    lcb.next_integrity_ms = 0;
+    try testing.expect(!try lcb.tick(h.src.source(), 200));
+    try testing.expectEqual(@as(u64, 0), lcb.next_integrity_ms);
+    lcb.log_ena = true;
+    lcb.trg_ops.integrity = false;
+    try testing.expect(!try lcb.tick(h.src.source(), 200));
+    try testing.expectEqual(@as(u64, 0), lcb.next_integrity_ms);
+}
+
+test "a logged entry reads back exactly, and a slot of exactly its size holds it" {
+    var h: Harness = .{};
+    try h.src.init();
+    var lcb = h.lcb();
+    lcb.log_ena = true;
+    try h.src.set(1, true);
+    try testing.expect(try lcb.signal(h.src.source(), 0, 1, .data_change, 5000));
+    const query = ReadJournalRequest{
+        .journal = .{ .domain_specific = .{ .domain = "TESTLD", .item = "LLN0$EventLog" } },
+    };
+    const resp = (try mms.decode(try answerReadJournal(&lcb, query, 1, &h.out))).confirmed_response;
+    var r = try decodeReadJournalResponse(resp.body);
+    const e = (try r.entries.next()).?;
+    var vars = e.iterate();
+    const a = (try vars.next()).?;
+    try testing.expectEqualStrings(h.src.refs[1], a.tag);
+    try testing.expectEqualSlices(u8, h.src.values[1][0..h.src.lens[1]], a.value);
+    const b = (try vars.next()).?;
+    try testing.expectEqualStrings(reason_code_tag, b.tag);
+    try testing.expect(parseLogReason(try (try mmsdata.Data.decode(b.value)).bitString()).data_change);
+    try testing.expect((try vars.next()) == null);
+    const used = lcb.store.newest().?.used;
+
+    // A slot of exactly `used` octets holds it, one less does not.
+    var entries: [1]Entry = @splat(.{});
+    var arena: [64]u8 = undefined;
+    var tight = h.lcb();
+    tight.store = try Store.init(&entries, arena[0..used]);
+    tight.log_ena = true;
+    try testing.expect(try tight.signal(h.src.source(), 0, 1, .data_change, 1));
+    var entries2: [1]Entry = @splat(.{});
+    var loose = h.lcb();
+    loose.store = try Store.init(&entries2, arena[0 .. used - 1]);
+    loose.log_ena = true;
+    try testing.expectError(error.EntryTooLarge, loose.signal(h.src.source(), 0, 1, .data_change, 1));
+}
+
+test "LCB writes: LogEna arms the integrity clock, TrgOps and IntgPd take effect, status is read-only" {
+    var h: Harness = .{};
+    var lcb = h.lcb();
+    lcb.intg_pd_ms = 100;
+    var bb: [16]u8 = undefined;
+    try testing.expectEqual(WriteOutcome.ok, lcb.writeAttribute("LogEna", try lBool(&bb, true), 50));
+    try testing.expect(lcb.log_ena);
+    try testing.expectEqual(@as(u64, 150), lcb.next_integrity_ms);
+    lcb.next_integrity_ms = 7;
+    try testing.expectEqual(WriteOutcome.ok, lcb.writeAttribute("LogEna", try lBool(&bb, false), 60));
+    try testing.expect(!lcb.log_ena);
+    try testing.expectEqual(@as(u64, 7), lcb.next_integrity_ms);
+
+    var tw = ber.Writer.init(&bb);
+    try mmsdata.Emit.bitString(&tw, 0, 6);
+    try testing.expectEqual(WriteOutcome.ok, lcb.writeAttribute("TrgOps", try mmsdata.Data.decode(tw.done()), 0));
+    try testing.expect(!lcb.trg_ops.data_change);
+    try testing.expect(!lcb.trg_ops.integrity);
+    var ib: [16]u8 = undefined;
+    try testing.expectEqual(WriteOutcome.ok, lcb.writeAttribute("IntgPd", try lUnsigned(&ib, 321), 0));
+    try testing.expectEqual(@as(u32, 321), lcb.intg_pd_ms);
+
+    // DatSet is read-only but must still be a string.
+    var sb: [32]u8 = undefined;
+    var sw = ber.Writer.init(&sb);
+    try mmsdata.Emit.visibleString(&sw, "TESTLD/LLN0$Other");
+    try testing.expectEqual(WriteOutcome.denied, lcb.writeAttribute("DatSet", try mmsdata.Data.decode(sw.done()), 0));
+    try testing.expectEqual(WriteOutcome.invalid, lcb.writeAttribute("DatSet", try lBool(&bb, true), 0));
+    try testing.expectEqual(WriteOutcome.denied, lcb.writeAttribute("OldEntr", try lBool(&bb, true), 0));
+    try testing.expectEqual(WriteOutcome.unknown, lcb.writeAttribute("NoSuchThing", try lBool(&bb, true), 0));
+}
+
+test "ReadJournal requests: each half of a range survives the codecs on its own" {
+    var buf: [1024]u8 = undefined;
+    const jn = mms.ObjectName{ .domain_specific = .{ .domain = "D", .item = "J" } };
+    const t = reporting.binaryTimeFromMillis(1_700_000_000_000);
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 3 };
+    const none: []const []const u8 = &.{};
+
+    var r = try decodeReadJournal(try bodyOf(try encodeReadJournalFiltered(1, jn, .{ .after_time = t }, none, &buf)));
+    try testing.expect(r.range.after_time != null);
+    try testing.expect(r.range.after_entry == null);
+    r = try decodeReadJournal(try bodyOf(try encodeReadJournalFiltered(1, jn, .{ .after_entry = &id }, none, &buf)));
+    try testing.expect(r.range.after_time == null);
+    try testing.expect(r.range.after_entry != null);
+    r = try decodeReadJournal(try bodyOf(try encodeReadJournalFiltered(1, jn, .{ .starting_entry = &id }, none, &buf)));
+    try testing.expect(r.range.starting_time == null);
+    try testing.expect(r.range.starting_entry != null);
+    r = try decodeReadJournal(try bodyOf(try encodeReadJournalFiltered(1, jn, .{ .starting_time = t }, none, &buf)));
+    try testing.expect(r.range.starting_time != null);
+    try testing.expect(r.range.starting_entry == null);
+
+    // The filter bound is exact: sixteen names are accepted, seventeen are not.
+    const sixteen: [max_filter_variables][]const u8 = @splat("x");
+    const q = try decodeReadJournal(try bodyOf(try encodeReadJournalFiltered(1, jn, .{}, &sixteen, &buf)));
+    try testing.expectEqual(@as(u8, max_filter_variables), q.variable_count);
+    // A hand-built request naming seventeen variables is refused by the decoder.
+    var w = ber.Writer.init(&buf);
+    const m = w.mark();
+    const list = w.mark();
+    for (0..max_filter_variables + 1) |_| try w.primitive(ber.Tag.uni(ber.Universal.visible_string), "x");
+    try w.header(ber.Tag.ctxc(list_of_variables_tag), list);
+    const name = w.mark();
+    try jn.encode(&w);
+    try w.header(ber.Tag.ctxc(0), name);
+    try mms.closeConfirmedRequest(&w, m, read_journal_service, 1);
+    try testing.expectError(error.TooManyEntries, decodeReadJournal(try bodyOf(w.done())));
+
+    // InitializeJournal: a time limit alone is encoded.
+    const ij = try decodeInitializeJournal(try bodyOf(try encodeInitializeJournal(1, jn, .{ .limiting_time = t }, &buf)));
+    try testing.expect(ij.limit.limiting_time != null);
+    try testing.expect(ij.limit.limiting_entry == null);
+}
+
+test "journal decoders ignore elements that are not context-tagged, whatever their number" {
+    var buf: [1024]u8 = undefined;
+    const jn = mms.ObjectName{ .domain_specific = .{ .domain = "D", .item = "J" } };
+    // Universal elements numbered 0, 1 and 2: the numbers the decoders switch on.
+    const decoys = [_]u8{ 0x00, 0x01, 0x05, 0x01, 0x01, 0xFF, 0x02, 0x01, 0x05 };
+    const a = testing.allocator;
+
+    const rj = try bodyOf(try encodeReadJournalFiltered(1, jn, .{ .number_of_entries = 4 }, &.{}, &buf));
+    const rj2 = try std.mem.concat(a, u8, &.{ rj, &decoys });
+    defer a.free(rj2);
+    const q = try decodeReadJournal(rj2);
+    try testing.expectEqual(@as(i32, 4), q.range.number_of_entries.?);
+
+    var buf2: [1024]u8 = undefined;
+    const ij = try bodyOf(try encodeInitializeJournal(1, jn, .{}, &buf2));
+    const ij2 = try std.mem.concat(a, u8, &.{ ij, &decoys });
+    defer a.free(ij2);
+    _ = try decodeInitializeJournal(ij2);
+
+    // A response with one entry: moreFollows stays false, the entries stay.
+    var vb: [8]u8 = undefined;
+    var vw = ber.Writer.init(&vb);
+    try mmsdata.Emit.boolean(&vw, true);
+    const vars = [_]JournalVariable{.{ .tag = "t", .value = vw.done() }};
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 9 };
+    const entries = [_]JournalEntry{.{
+        .entry_id = &id,
+        .occurrence_time = .{ .ms_since_midnight = 1, .days_since_1984 = 2 },
+        .variables = &vars,
+    }};
+    var buf3: [1024]u8 = undefined;
+    const resp = try bodyOf(try encodeReadJournalResponse(1, &entries, false, &buf3));
+    const resp2 = try std.mem.concat(a, u8, &.{ resp, &decoys });
+    defer a.free(resp2);
+    var rr = try decodeReadJournalResponse(resp2);
+    try testing.expect(!rr.more_follows);
+    try testing.expect((try rr.entries.next()) != null);
+
+    var buf4: [256]u8 = undefined;
+    const st = try bodyOf(try encodeGetJournalStatusResponse(1, .{ .current_entries = 7, .limit_entries = 9 }, &buf4));
+    const st2 = try std.mem.concat(a, u8, &.{ st, &decoys });
+    defer a.free(st2);
+    const status = try decodeGetJournalStatusResponse(st2);
+    try testing.expectEqual(@as(u32, 7), status.current_entries);
+    try testing.expectEqual(@as(?u32, 9), status.limit_entries);
+
+    // InitializeJournal-Response: the count is the context [0] element, only.
+    var buf5: [64]u8 = undefined;
+    const done = try bodyOf(try encodeInitializeJournalResponse(1, 5, &buf5));
+    const lead_universal = try std.mem.concat(a, u8, &.{ &[_]u8{ 0x00, 0x01, 0x07 }, done });
+    defer a.free(lead_universal);
+    try testing.expectEqual(@as(u32, 5), try decodeInitializeJournalResponse(lead_universal));
+    const lead_other = try std.mem.concat(a, u8, &.{ &[_]u8{ 0x81, 0x01, 0x09 }, done });
+    defer a.free(lead_other);
+    try testing.expectEqual(@as(u32, 5), try decodeInitializeJournalResponse(lead_other));
+}
+
+test "journal entry and variable iterators ignore non-context elements inside an entry" {
+    const d0 = [_]u8{ 0x00, 0x01, 0x05 };
+    const d1 = [_]u8{ 0x01, 0x01, 0xFF };
+    const d2 = [_]u8{ 0x02, 0x01, 0x05 };
+
+    // One variable: [0] tag, decoys, [1] { value }, decoys.
+    var vb: [128]u8 = undefined;
+    var vw = ber.Writer.init(&vb);
+    const var_outer = vw.mark();
+    try vw.bytes(&d1);
+    try vw.bytes(&d0);
+    const spec = vw.mark();
+    try vw.bytes(&[_]u8{ 0x83, 0x01, 0x01 });
+    try vw.header(ber.Tag.ctxc(1), spec);
+    try vw.bytes(&d0);
+    try vw.primitive(ber.Tag.ctx(0), "tagname");
+    try vw.header(ber.Tag.sequence, var_outer);
+    var vit = VariableIterator{ .inner = ber.Iterator.init(vw.done()) };
+    const v = (try vit.next()).?;
+    try testing.expectEqualStrings("tagname", v.tag);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x83, 0x01, 0x01 }, v.value);
+
+    // One entry: [0] id, decoys, [2] { [0] time, decoys, [2] { [1] list } }.
+    var eb: [256]u8 = undefined;
+    var ew = ber.Writer.init(&eb);
+    const outer = ew.mark();
+    const content = ew.mark();
+    const form = ew.mark();
+    try ew.bytes(&[_]u8{ 0xA1, 0x00 });
+    try ew.header(ber.Tag.ctxc(2), form);
+    try ew.bytes(&d2);
+    try ew.bytes(&d0);
+    try emitTime(&ew, ber.Tag.ctx(0), .{ .ms_since_midnight = 1000, .days_since_1984 = 5 });
+    try ew.header(ber.Tag.ctxc(2), content);
+    try ew.bytes(&d2);
+    try ew.bytes(&d0);
+    try ew.primitive(ber.Tag.ctx(0), &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 7 });
+    try ew.header(ber.Tag.sequence, outer);
+    var eit = EntryIterator{ .inner = ber.Iterator.init(ew.done()) };
+    const e = (try eit.next()).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 7 }, e.entry_id);
+    try testing.expectEqual(@as(u16, 5), e.occurrence_time.?.days_since_1984.?);
+    try testing.expectEqual(@as(usize, 0), e.variables.len);
+}
+
+/// The entry ids a `ReadJournal` response carries, oldest first.
+fn journalIds(pdu: []const u8, ids: []u64) !struct { n: usize, more: bool } {
+    const resp = (try mms.decode(pdu)).confirmed_response;
+    var r = try decodeReadJournalResponse(resp.body);
+    var n: usize = 0;
+    while (try r.entries.next()) |e| : (n += 1) ids[n] = std.mem.readInt(u64, e.entry_id[0..8], .big);
+    return .{ .n = n, .more = r.more_follows };
+}
+
+test "ReadJournal: after, starting and ending bounds, the entry limit and the page size" {
+    var h: Harness = .{};
+    try h.src.init();
+    var lcb = h.lcb();
+    const base: u64 = 1_700_000_000_000;
+    try fillLog(&h, &lcb, 4, base); // ids 1..4 at base, +1 s, +2 s, +3 s
+    const jn = mms.ObjectName{ .domain_specific = .{ .domain = "TESTLD", .item = "LLN0$EventLog" } };
+    var ids: [32]u64 = undefined;
+
+    var id2: [8]u8 = undefined;
+    std.mem.writeInt(u64, &id2, 2, .big);
+    var res = try journalIds(try answerReadJournal(&lcb, .{ .journal = jn, .range = .{ .after_entry = &id2 } }, 1, &h.out), &ids);
+    try testing.expectEqualSlices(u64, &[_]u64{ 3, 4 }, ids[0..res.n]);
+    res = try journalIds(try answerReadJournal(&lcb, .{ .journal = jn, .range = .{ .starting_entry = &id2 } }, 1, &h.out), &ids);
+    try testing.expectEqualSlices(u64, &[_]u64{ 2, 3, 4 }, ids[0..res.n]);
+    const zero: [8]u8 = @splat(0);
+    res = try journalIds(try answerReadJournal(&lcb, .{ .journal = jn, .range = .{ .starting_entry = &zero } }, 1, &h.out), &ids);
+    try testing.expectEqual(@as(usize, 4), res.n);
+
+    // An ending time is inclusive.
+    const until = reporting.binaryTimeFromMillis(base + 2000);
+    res = try journalIds(try answerReadJournal(&lcb, .{ .journal = jn, .range = .{ .ending_time = until } }, 1, &h.out), &ids);
+    try testing.expectEqualSlices(u64, &[_]u64{ 1, 2, 3 }, ids[0..res.n]);
+
+    // numberOfEntries: zero returns nothing and says more follows, negative is no limit.
+    res = try journalIds(try answerReadJournal(&lcb, .{ .journal = jn, .range = .{ .number_of_entries = 0 } }, 1, &h.out), &ids);
+    try testing.expectEqual(@as(usize, 0), res.n);
+    try testing.expect(res.more);
+    res = try journalIds(try answerReadJournal(&lcb, .{ .journal = jn, .range = .{ .number_of_entries = -1 } }, 1, &h.out), &ids);
+    try testing.expectEqual(@as(usize, 4), res.n);
+    try testing.expect(!res.more);
+    res = try journalIds(try answerReadJournal(&lcb, .{ .journal = jn, .range = .{ .number_of_entries = 2 } }, 1, &h.out), &ids);
+    try testing.expectEqualSlices(u64, &[_]u64{ 1, 2 }, ids[0..res.n]);
+    try testing.expect(res.more);
+
+    // A page is at most max_entries_per_response entries, then moreFollows.
+    var big_entries: [20]Entry = @splat(.{});
+    var big_arena: [20 * 256]u8 = undefined;
+    var big = h.lcb();
+    big.store = try Store.init(&big_entries, &big_arena);
+    big.log_ena = true;
+    for (0..20) |i| _ = try big.signal(h.src.source(), 0, i % 3, .data_change, base + i);
+    var out: [8192]u8 = undefined;
+    res = try journalIds(try answerReadJournal(&big, .{ .journal = jn }, 1, &out), &ids);
+    try testing.expectEqual(max_entries_per_response, res.n);
+    try testing.expect(res.more);
+}

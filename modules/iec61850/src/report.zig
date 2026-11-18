@@ -1381,3 +1381,54 @@ test "Reassembler: each fresh report reuses the arena; the header store is bound
 test "Reason.toInt places data-update at its own bit" {
     try testing.expectEqual(@as(u64, 1) << (Reason.bit_count - 1 - 3), (Reason{ .data_update = true }).toInt());
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): bounds of the decoder ──
+
+/// A report with no optional field whose inclusion bit string is `bit_count`
+/// bits long and entirely set, and nothing after it.
+fn reportWithInclusion(out: []u8, bit_count: usize) ![]const u8 {
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    const octets = (bit_count + 7) / 8;
+    var raw: [32]u8 = @splat(0xFF);
+    const unused: u8 = @intCast(octets * 8 - bit_count);
+    // The padding bits of the last octet stay clear.
+    raw[octets - 1] = @as(u8, 0xFF) << @intCast(unused);
+    const bm = w.mark();
+    try w.bytes(raw[0..octets]);
+    try w.bytes(&[_]u8{unused});
+    try w.header(mmsdata.Kind.bit_string.tag(), bm);
+    try (OptFlds{}).emit(&w);
+    try mmsdata.Emit.visibleString(&w, "X");
+    try mms.closeInformationReport(&w, m, .{
+        .variable_list = .{ .vmd_specific = report_variable_name },
+    });
+    return w.done();
+}
+
+test "decode: more included entries than max_entries is TooManyEntries, exactly max_entries is not" {
+    var buf: [128]u8 = undefined;
+    var r: Report = undefined;
+    const over = try mms.decode(try reportWithInclusion(&buf, max_entries + 1));
+    try testing.expectError(error.TooManyEntries, decodeInformationReport(&r, over.unconfirmed.body));
+    // 128 entries are announced and none follow: a different, later error.
+    const exact = try mms.decode(try reportWithInclusion(&buf, max_entries));
+    if (decodeInformationReport(&r, exact.unconfirmed.body)) |_| {
+        return error.TestUnexpectedResult;
+    } else |e| try testing.expect(e != error.TooManyEntries);
+}
+
+test "Reassembler: a value that exactly fills the arena is accepted" {
+    var buf: [256]u8 = undefined;
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 9 };
+    const r = try decodeSegment(try segmentFor(&buf, 0, false, 4, &id, &.{0}, 2));
+    const need = r.included()[0].value.raw.len;
+    var arena: [3]u8 = undefined;
+    try testing.expectEqual(@as(usize, 3), need);
+    var slots: [2]AssembledEntry = undefined;
+    var re = Reassembler.init(&slots, arena[0..need]);
+    const a = (try re.push(r)).?;
+    try testing.expectEqual(@as(usize, 1), a.entries.len);
+    var small = Reassembler.init(&slots, arena[0 .. need - 1]);
+    try testing.expectError(error.ReassemblyBufferTooSmall, small.push(r));
+}

@@ -2488,3 +2488,397 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): the parser of untrusted SCL ──
+
+const hdr = "<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\">";
+
+test "Communication: decoy elements are skipped and every address is read from its own access point" {
+    const doc = hdr ++
+        \\<Communication>
+        \\  <Text>not a subnetwork</Text>
+        \\  <SubNetwork name="n1" type="8-MMS">
+        \\    <Text>not an access point</Text>
+        \\    <ConnectedAP iedName="A" apName="AP1">
+        \\      <Address><P type="IP">10.0.0.1</P><Q type="IP">9.9.9.9</Q></Address>
+        \\      <GSE ldInst="L1" cbName="g1"><Address><P type="APPID">1000</P></Address></GSE>
+        \\      <SMV ldInst="L1" cbName="s1"><Address><P type="APPID">4000</P></Address></SMV>
+        \\    </ConnectedAP>
+        \\    <ConnectedAP iedName="B" apName="AP1">
+        \\      <GSE ldInst="L1" cbName="g1"><Address><P type="APPID">2000</P></Address></GSE>
+        \\      <SMV ldInst="L2" cbName="s1"><Address><P type="APPID">5000</P></Address></SMV>
+        \\    </ConnectedAP>
+        \\  </SubNetwork>
+        \\</Communication>
+        \\<IED name="A">
+        \\  <Services><Server><LDevice inst="GHOSTA"><LN0 lnClass="LLN0" lnType="T"/></LDevice></Server></Services>
+        \\  <AccessPoint name="AP1">
+        \\    <Services><LDevice inst="GHOSTB"><LN0 lnClass="LLN0" lnType="T"/></LDevice></Services>
+        \\    <Server>
+        \\      <Authentication/>
+        \\      <LDevice inst="L1"><LN0 lnClass="LLN0" lnType="T"/></LDevice>
+        \\    </Server>
+        \\  </AccessPoint>
+        \\</IED>
+        \\</SCL>
+    ;
+    var s = try parse(testing.allocator, doc, .{});
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 1), s.subnetworks.len);
+    try testing.expectEqual(@as(usize, 2), s.subnetworks[0].aps.len);
+    const a = s.subnetworks[0].aps[0];
+    try testing.expectEqual(@as(usize, 1), a.address.params.len);
+    try testing.expectEqual(@as(usize, 1), a.gse.len);
+    try testing.expectEqual(@as(usize, 1), a.smv.len);
+    try testing.expectEqualStrings("s1", a.smv[0].cb_name);
+    try testing.expectEqual(@as(usize, 1), s.ieds.len);
+    try testing.expectEqual(@as(usize, 1), s.ieds[0].access_points.len);
+    try testing.expectEqual(@as(usize, 1), s.ieds[0].access_points[0].devices.len);
+    try testing.expectEqualStrings("L1", s.ieds[0].access_points[0].devices[0].inst);
+
+    // A control block is found by IED, logical device and name, in GSE and SMV alike.
+    try testing.expectEqual(@as(?u16, 1000), s.cbAddress("A", "L1", "g1").?.address.appId());
+    try testing.expectEqual(@as(?u16, 2000), s.cbAddress("B", "L1", "g1").?.address.appId());
+    try testing.expectEqual(@as(?u16, 4000), s.cbAddress("A", "L1", "s1").?.address.appId());
+    try testing.expectEqual(@as(?u16, 5000), s.cbAddress("B", "L2", "s1").?.address.appId());
+    try testing.expect(s.cbAddress("B", "L9", "g1") == null);
+    try testing.expect(s.cbAddress("B", "L1", "s1") == null);
+    try testing.expect(s.cbAddress("B", "L2", "zzz") == null);
+    try testing.expect(s.cbAddress("A", "L1", "nope") == null);
+}
+
+fn kindOf(comptime body: []const u8) !Kind {
+    var s = try parse(testing.allocator, hdr ++ body ++ "</SCL>", .{});
+    defer s.deinit();
+    return s.kind();
+}
+
+test "Scl.kind: a substation with an IED is an SCD, an address makes a CID, nothing makes an ICD" {
+    try testing.expectEqual(Kind.scd, try kindOf("<Substation name=\"S\"/><IED name=\"A\"/>"));
+    try testing.expectEqual(Kind.scd, try kindOf("<Substation name=\"S\"/><IED name=\"A\"/><IED name=\"B\"/>"));
+    try testing.expectEqual(Kind.unknown, try kindOf("<Substation name=\"S\"/>"));
+    try testing.expectEqual(Kind.unknown, try kindOf("<IED name=\"A\"/><IED name=\"B\"/>"));
+    const ap = "<Communication><SubNetwork name=\"n\"><ConnectedAP iedName=\"A\" apName=\"p\">";
+    const end = "</ConnectedAP></SubNetwork></Communication><IED name=\"A\"/>";
+    try testing.expectEqual(Kind.icd, try kindOf(ap ++ end));
+    try testing.expectEqual(Kind.icd, try kindOf(ap ++ "<Address><P type=\"IP\"></P></Address>" ++ end));
+    try testing.expectEqual(Kind.cid, try kindOf(ap ++ "<Address><P type=\"IP\">10.0.0.1</P></Address>" ++ end));
+    try testing.expectEqual(Kind.cid, try kindOf(ap ++ "<GSE ldInst=\"L\" cbName=\"g\"/>" ++ end));
+    try testing.expectEqual(Kind.cid, try kindOf(ap ++ "<SMV ldInst=\"L\" cbName=\"s\"/>" ++ end));
+}
+
+test "the logical-node level parses its control blocks, flags and values exactly" {
+    const doc = hdr ++
+        \\<IED name="TESTIED"><AccessPoint name="AP1"><Server><LDevice inst="LD">
+        \\  <LN0 lnClass="LLN0" lnType="T0" inst="">
+        \\    <DataSet name="DS"><Text>decoy</Text><FCDA ldInst="LD" lnClass="LLN0" fc="ST" doName="Beh" daName="stVal"/></DataSet>
+        \\    <ReportControl name="R1" buffered="1" indexed="0"><RptEnabled max="0"/></ReportControl>
+        \\    <ReportControl name="R2" buffered="false" indexed="false"><TrgOps dchg="1" gi="0"/></ReportControl>
+        \\    <LogControl name="L1" logName="x"><TrgOps dchg="true"/><Text>decoy</Text></LogControl>
+        \\    <SettingControl numOfSGs="4" actSG="2"/>
+        \\    <DOI name="Beh"><DAI name="stVal"><Val>5</Val><Text>decoy</Text></DAI></DOI>
+        \\  </LN0>
+        \\</LDevice></Server></AccessPoint></IED>
+        \\<DataTypeTemplates>
+        \\  <LNodeType id="T0" lnClass="LLN0"><Text/><DO name="Beh" type="D0"/></LNodeType>
+        \\  <DOType id="D0"><DA name="stVal" bType="INT32" fc="ST"><Text>x</Text><Val>7</Val></DA><DA name="a" bType="Struct" type="Z" fc="ST"/></DOType>
+        \\  <DAType id="Z"><Text/><BDA name="q" bType="BOOLEAN"/></DAType>
+        \\  <EnumType id="E"><Text>x</Text><EnumVal ord="3">  three </EnumVal></EnumType>
+        \\</DataTypeTemplates>
+        \\</SCL>
+    ;
+    var s = try parse(testing.allocator, doc, .{});
+    defer s.deinit();
+    const ln0 = s.ieds[0].access_points[0].devices[0].lns[0];
+    try testing.expectEqual(@as(usize, 1), ln0.data_sets[0].fcdas.len);
+    try testing.expectEqual(@as(usize, 2), ln0.report_controls.len);
+    const r1 = ln0.report_controls[0];
+    try testing.expect(r1.buffered);
+    try testing.expect(!r1.indexed);
+    try testing.expectEqual(@as(u8, 1), r1.max_instances);
+    const r2 = ln0.report_controls[1];
+    try testing.expect(!r2.buffered);
+    try testing.expect(!r2.indexed);
+    try testing.expect(r2.trg_ops.dchg);
+    try testing.expect(!r2.trg_ops.gi);
+    try testing.expect(ln0.log_controls[0].trg_ops.dchg);
+    try testing.expectEqual(@as(u8, 4), ln0.setting_control.?.num_of_sgs);
+    try testing.expectEqual(@as(u8, 2), ln0.setting_control.?.act_sg);
+    const dai = ln0.dois[0].dais[0];
+    try testing.expectEqual(@as(usize, 1), dai.values.len);
+    try testing.expectEqualStrings("5", dai.first().?);
+    try testing.expectEqual(@as(usize, 1), s.templates.ln_types[0].dos.len);
+    try testing.expectEqualStrings("7", s.templates.do_types[0].das[0].val.?);
+    try testing.expectEqual(@as(usize, 1), s.templates.da_types[0].bdas.len);
+    try testing.expectEqual(@as(usize, 1), s.templates.enum_types[0].vals.len);
+    try testing.expectEqualStrings("three", s.templates.enum_types[0].vals[0].text);
+}
+
+test "Fcda.mmsItem, Dai.first, Ln.mmsName, LDevice.domain and joinDots at their buffer bounds" {
+    const f = Fcda{
+        .ld_inst = "LD",
+        .prefix = "pre",
+        .ln_class = "GGIO",
+        .ln_inst = "1",
+        .do_name = "Ind..Sub",
+        .da_name = "a..b",
+        .fc = .ST,
+    };
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("preGGIO1$ST$Ind$Sub$a$b", try f.mmsItem(&buf));
+    var exact: [23]u8 = undefined;
+    try testing.expectEqualStrings("preGGIO1$ST$Ind$Sub$a$b", try f.mmsItem(&exact));
+    var short: [22]u8 = undefined;
+    try testing.expectError(error.NameTooLong, f.mmsItem(&short));
+
+    try testing.expect((Dai{ .path = "p" }).first() == null);
+
+    const ln = Ln{ .prefix = "P", .ln_class = "GGIO", .inst = "1", .ln_type = "T" };
+    try testing.expectEqualStrings("PGGIO1", try ln.mmsName(&buf));
+
+    const named = LDevice{ .inst = "I", .ld_name = "MyLD" };
+    try testing.expectEqualStrings("MyLD", try named.domain("IED", &buf));
+    var four: [4]u8 = undefined;
+    try testing.expectEqualStrings("MyLD", try named.domain("IED", &four));
+    var three: [3]u8 = undefined;
+    try testing.expectError(error.NameTooLong, named.domain("IED", &three));
+    const plain = LDevice{ .inst = "I" };
+    try testing.expectEqualStrings("IEDI", try plain.domain("IED", &buf));
+
+    var b129: [129]u8 = undefined;
+    const long: [130]u8 = @splat('x');
+    try testing.expectEqual(@as(usize, 129), (try joinDots(&b129, "", long[0..129])).len);
+    try testing.expectError(error.NameTooLong, joinDots(&b129, "", &long));
+}
+
+/// Two logical devices of one IED. `LD1` has a setting-group control block (so
+/// it mirrors `SE` to `SG`) and every kind of control block; `LD2` has none of
+/// them and must not inherit anything.
+const resolve_doc = hdr ++
+    \\<IED name="TESTIED"><AccessPoint name="AP1"><Server>
+    \\<LDevice inst="LD1">
+    \\  <LN0 lnClass="LLN0" lnType="T0" inst="">
+    \\    <DataSet name="DS"><FCDA ldInst="LD2" lnClass="GGIO" lnInst="1" fc="ST" doName="Ind" daName="stVal"/></DataSet>
+    \\    <ReportControl name="BRCB" buffered="true"/>
+    \\    <ReportControl name="URCB" buffered="false"/>
+    \\    <GSEControl name="goose1" type="GOOSE"/>
+    \\    <GSEControl name="gsse1" type="GSSE"/>
+    \\    <LogControl name="lcb1"/>
+    \\    <SettingControl numOfSGs="3" actSG="1"/>
+    \\    <DOI name="DoA"><DAI name="n"><Val>1</Val></DAI></DOI>
+    \\    <DOI name="DoB"><DAI name="n"><Val>2</Val></DAI></DOI>
+    \\  </LN0>
+    \\  <LN lnClass="GGIO" lnType="TG" inst="1"/>
+    \\  <LN lnClass="GGIO" lnType="TP" inst="2"/>
+    \\</LDevice>
+    \\<LDevice inst="LD2">
+    \\  <LN0 lnClass="LLN0" lnType="T0" inst=""/>
+    \\  <LN lnClass="GGIO" lnType="TG" inst="1"/>
+    \\  <LN lnClass="GGIO" lnType="TS" inst="2"/>
+    \\</LDevice>
+    \\</Server></AccessPoint></IED>
+    \\<DataTypeTemplates>
+    \\  <LNodeType id="T0" lnClass="LLN0"><DO name="Beh" type="INS"/><DO name="Set" type="SET"/><DO name="DoA" type="NN"/><DO name="DoB" type="NN"/></LNodeType>
+    \\  <LNodeType id="TG" lnClass="GGIO"><DO name="Ind" type="INS"/></LNodeType>
+    \\  <LNodeType id="TP" lnClass="GGIO"><DO name="Sp" type="SPD"/></LNodeType>
+    \\  <LNodeType id="TS" lnClass="GGIO"><DO name="Sx" type="SEO"/></LNodeType>
+    \\  <DOType id="SEO" cdc="ASG"><DA name="x" bType="INT32" fc="SE"/></DOType>
+    \\  <DOType id="INS" cdc="INS"><DA name="stVal" bType="INT32" fc="ST"/></DOType>
+    \\  <DOType id="NN" cdc="ING"><DA name="n" bType="INT32" fc="CF"/></DOType>
+    \\  <DOType id="SPD" cdc="ASG"><DA name="setVal" bType="INT32" fc="SP"/></DOType>
+    \\  <DOType id="SET" cdc="ASG">
+    \\    <DA name="x" bType="INT32" fc="SE"/>
+    \\    <DA name="y" bType="INT32" fc="SE"/>
+    \\    <DA name="y" bType="INT32" fc="SG"/>
+    \\    <DA name="z" bType="INT32" fc="SG"/>
+    \\    <SDO name="deep" type="SUB"/>
+    \\    <SDO name="arr" type="SUB" count="3"/>
+    \\    <SDO name="plain" type="INS"/>
+    \\  </DOType>
+    \\  <DOType id="SUB"><DA name="v" bType="INT32" fc="SE"/></DOType>
+    \\</DataTypeTemplates>
+    \\</SCL>
+;
+
+test "resolve: functional constraints, control blocks and the SE to SG mirror, per logical device" {
+    var s = try parse(testing.allocator, resolve_doc, .{});
+    defer s.deinit();
+    var m = try resolve(&s, testing.allocator, "TESTIED");
+    defer m.deinit();
+    const d1 = "TESTIEDLD1";
+    const d2 = "TESTIEDLD2";
+
+    // Report control blocks sit under their own constraint, with their own attributes.
+    try testing.expect(m.has(d1, "LLN0$BR$BRCB01"));
+    try testing.expect(m.has(d1, "LLN0$BR$BRCB01$EntryID"));
+    try testing.expect(m.has(d1, "LLN0$RP$URCB01$Resv"));
+    try testing.expect(!m.has(d1, "LLN0$RP$URCB01$EntryID"));
+    try testing.expect(!m.has(d1, "LLN0$RP$BRCB01"));
+    try testing.expect(!m.has(d1, "LLN0$BR$URCB01"));
+    // GOOSE and GSSE blocks are told apart, and only DstAddress has members.
+    try testing.expect(m.has(d1, "LLN0$GO$goose1"));
+    try testing.expect(m.has(d1, "LLN0$GS$gsse1"));
+    try testing.expect(!m.has(d1, "LLN0$GO$gsse1"));
+    try testing.expect(!m.has(d1, "LLN0$GS$goose1"));
+    try testing.expect(m.has(d1, "LLN0$GO$goose1$DstAddress$Addr"));
+    try testing.expect(!m.has(d1, "LLN0$GO$goose1$GoID$Addr"));
+    // A log control block adds LG, and only where there is one.
+    try testing.expect(m.has(d1, "LLN0$LG$lcb1"));
+    try testing.expect(!m.has(d1, "GGIO1$LG"));
+    // The setting-group block lives under SP; an SP attribute alone does not make one.
+    try testing.expect(m.has(d1, "LLN0$SP$SGCB"));
+    try testing.expect(m.has(d1, "LLN0$SP$SGCB$NumOfSG"));
+    try testing.expect(m.has(d1, "GGIO2$SP$Sp$setVal"));
+    try testing.expect(!m.has(d1, "GGIO2$SP$SGCB"));
+    // A data object appears only under a constraint it has attributes in.
+    try testing.expect(m.has(d1, "LLN0$ST$Beh$stVal"));
+    try testing.expect(!m.has(d1, "LLN0$RP$Beh"));
+    try testing.expect(!m.has(d1, "LLN0$SE$Beh"));
+    // SE mirrored to SG where the device has an SGCB: once per name, and only for LN0's SE.
+    try testing.expect(m.has(d1, "LLN0$SE$Set$x"));
+    try testing.expect(m.has(d1, "LLN0$SG$Set$x"));
+    try testing.expect(m.has(d1, "LLN0$SG$Set$z"));
+    var y_sg: usize = 0;
+    for (m.nodes) |n| {
+        if (std.mem.eql(u8, n.domain, d1) and std.mem.eql(u8, n.item, "LLN0$SG$Set$y")) y_sg += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), y_sg);
+    try testing.expect(!m.has(d1, "GGIO1$SG"));
+    // SDOs: a nested one opens up, an array is one leaf, one without the constraint is absent.
+    try testing.expect(!m.find(d1, "LLN0$SE$Set$deep").?.leaf);
+    try testing.expect(m.has(d1, "LLN0$SE$Set$deep$v"));
+    try testing.expect(m.find(d1, "LLN0$SE$Set$arr").?.leaf);
+    try testing.expect(!m.has(d1, "LLN0$SE$Set$arr$v"));
+    try testing.expect(!m.has(d1, "LLN0$SE$Set$plain"));
+    // The configured value belongs to its own data object.
+    try testing.expectEqualStrings("1", m.find(d1, "LLN0$CF$DoA$n").?.value.?);
+    try testing.expectEqualStrings("2", m.find(d1, "LLN0$CF$DoB$n").?.value.?);
+
+    // LD2 has no setting-group control block: nothing is mirrored there, and a
+    // lookup names its own device.
+    try testing.expect(m.has(d2, "LLN0$SE$Set$x"));
+    try testing.expect(m.has(d2, "LLN0$SG$Set$z")); // declared, so written
+    try testing.expect(!m.has(d2, "LLN0$SG$Set$x"));
+    try testing.expect(!m.has(d2, "LLN0$SG$Set$deep$v"));
+    try testing.expect(m.has(d2, "GGIO2$SE$Sx$x"));
+    try testing.expect(!m.has(d2, "GGIO2$SG"));
+    try testing.expect(m.has(d1, "LLN0$SG$Set$deep$v"));
+    try testing.expectEqualStrings(d2, m.find(d2, "LLN0$ST$Beh$stVal").?.domain);
+    try testing.expectEqualStrings(d1, m.find(d1, "LLN0$ST$Beh$stVal").?.domain);
+    var leaves: usize = 0;
+    for (m.nodes) |n| {
+        if (n.leaf) leaves += 1;
+    }
+    try testing.expect(leaves > 0);
+    try testing.expectEqual(leaves, m.leafCount());
+}
+
+test "an FCDA that names no logical device must resolve in its own, and one that names another is left alone" {
+    const base = hdr ++
+        \\<IED name="TESTIED"><AccessPoint name="AP1"><Server><LDevice inst="LD">
+        \\<LN0 lnClass="LLN0" lnType="T0" inst="">
+        \\<DataSet name="DS">
+    ;
+    const tail =
+        \\</DataSet></LN0></LDevice></Server></AccessPoint></IED>
+        \\<DataTypeTemplates>
+        \\<LNodeType id="T0" lnClass="LLN0"><DO name="Beh" type="INS"/></LNodeType>
+        \\<DOType id="INS"><DA name="stVal" bType="INT32" fc="ST"/></DOType>
+        \\</DataTypeTemplates></SCL>
+    ;
+    // No ldInst, naming something that is not there: refused.
+    try testing.expectError(error.UnresolvedFcda, resolveText(base ++
+        "<FCDA lnClass=\"GGIO\" lnInst=\"9\" fc=\"ST\" doName=\"Ind\" daName=\"stVal\"/>" ++ tail));
+    // Another logical device is named: not checked here.
+    try resolveText(base ++
+        "<FCDA ldInst=\"OTHER\" lnClass=\"GGIO\" lnInst=\"9\" fc=\"ST\" doName=\"Ind\" daName=\"stVal\"/>" ++ tail);
+    // Its own, and present: fine.
+    try resolveText(base ++
+        "<FCDA ldInst=\"LD\" lnClass=\"LLN0\" fc=\"ST\" doName=\"Beh\" daName=\"stVal\"/>" ++ tail);
+}
+
+fn checkOne(a: std.mem.Allocator, b_type: []const u8, type_attr: []const u8, extra: []const u8, val: []const u8) !void {
+    const text = try std.fmt.allocPrint(a,
+        \\<SCL xmlns="http://www.iec.ch/61850/2003/SCL"><IED name="TESTIED"><AccessPoint name="AP1"><Server>
+        \\<LDevice inst="LD"><LN lnClass="GGIO" lnType="T1" inst="1"><DOI name="X"><DAI name="v"><Val>{s}</Val></DAI></DOI></LN></LDevice>
+        \\</Server></AccessPoint></IED><DataTypeTemplates>
+        \\<LNodeType id="T1" lnClass="GGIO"><DO name="X" type="D1"/></LNodeType>
+        \\<DOType id="D1"><DA name="v" bType="{s}"{s} fc="CF"/></DOType>{s}
+        \\</DataTypeTemplates></SCL>
+    , .{ val, b_type, type_attr, extra });
+    defer a.free(text);
+    try resolveText(text);
+}
+
+test "a DAI value is checked against the exact range and length of its bType" {
+    const a = testing.allocator;
+    const ok = [_][2][]const u8{
+        .{ "INT8U", "0" },        .{ "INT8U", "255" },                                    .{ "INT8", "-128" }, .{ "INT8", "127" },
+        .{ "INT16U", "65535" },   .{ "INT32", "-2147483648" },                            .{ "BOOLEAN", "1" }, .{ "BOOLEAN", "0" },
+        .{ "FLOAT32", "-1.5e3" }, .{ "VisString32", "12345678901234567890123456789012" },
+    };
+    for (ok) |c| try checkOne(a, c[0], "", "", c[1]);
+    const bad = [_][2][]const u8{
+        .{ "INT8U", "256" },    .{ "INT8U", "-1" },    .{ "INT8", "128" },    .{ "INT8", "-129" },
+        .{ "INT16U", "65536" }, .{ "BOOLEAN", "yes" }, .{ "FLOAT32", "one" }, .{ "VisString32", "123456789012345678901234567890123" },
+    };
+    for (bad) |c| try testing.expectError(error.ValueTypeMismatch, checkOne(a, c[0], "", "", c[1]));
+    // Octet64: 64 characters is the longest.
+    const o64: [64]u8 = @splat('o');
+    const o65: [65]u8 = @splat('o');
+    try checkOne(a, "Octet64", "", "", &o64);
+    try testing.expectError(error.ValueTypeMismatch, checkOne(a, "Octet64", "", "", &o65));
+    // Dbpos names, and an Enum that names no enumeration accepts anything.
+    try checkOne(a, "Dbpos", "", "", "on");
+    try checkOne(a, "Dbpos", "", "", "intermediate-state");
+    try testing.expectError(error.ValueTypeMismatch, checkOne(a, "Dbpos", "", "", "sideways"));
+    try checkOne(a, "Enum", "", "", "whatever");
+}
+
+test "the type graph is bounded at max_type_depth structure levels, not one more" {
+    const a = testing.allocator;
+    for ([_]usize{ max_type_depth, max_type_depth + 1 }) |levels| {
+        var types: std.ArrayList(u8) = .empty;
+        defer types.deinit(a);
+        for (0..levels) |i| {
+            if (i + 1 < levels) {
+                try types.print(a, "<DAType id=\"S{d}\"><BDA name=\"c\" bType=\"Struct\" type=\"S{d}\"/></DAType>", .{ i, i + 1 });
+            } else {
+                try types.print(a, "<DAType id=\"S{d}\"><BDA name=\"c\" bType=\"BOOLEAN\"/></DAType>", .{i});
+            }
+        }
+        const text = try std.fmt.allocPrint(a,
+            \\<SCL xmlns="http://www.iec.ch/61850/2003/SCL"><IED name="TESTIED"><AccessPoint name="AP1"><Server>
+            \\<LDevice inst="LD"><LN lnClass="GGIO" lnType="T1" inst="1"/></LDevice></Server></AccessPoint></IED>
+            \\<DataTypeTemplates><LNodeType id="T1" lnClass="GGIO"><DO name="X" type="D1"/></LNodeType>
+            \\<DOType id="D1"><DA name="s" bType="Struct" type="S0" fc="ST"/></DOType>{s}</DataTypeTemplates></SCL>
+        , .{types.items});
+        defer a.free(text);
+        if (levels <= max_type_depth) {
+            try resolveText(text);
+        } else {
+            try testing.expectError(error.TypeTooDeep, resolveText(text));
+        }
+    }
+}
+
+test "a PhyComAddr and an array attribute are each one name with the members the standard gives them" {
+    const text = wrap(
+        \\<LNodeType id="T1" lnClass="GGIO"><DO name="X" type="D1"/></LNodeType>
+        \\<DOType id="D1"><DA name="addr" bType="PhyComAddr" fc="ST"/><DA name="arr" bType="Struct" type="Z" count="4" fc="ST"/></DOType>
+        \\<DAType id="Z"><BDA name="q" bType="BOOLEAN"/></DAType>
+    , "");
+    var s = try parse(testing.allocator, text, .{});
+    defer s.deinit();
+    var m = try resolve(&s, testing.allocator, "TESTIED");
+    defer m.deinit();
+    try testing.expectEqual(BType.PhyComAddr, m.find("TESTIEDLD", "GGIO1$ST$X$addr").?.b_type.?);
+    try testing.expect(!m.find("TESTIEDLD", "GGIO1$ST$X$addr").?.leaf);
+    for (phy_com_addr_members) |member| {
+        var item_buf: [64]u8 = undefined;
+        const item = try std.mem.print(&item_buf, "GGIO1$ST$X$addr${s}", .{member});
+        try testing.expect(m.find("TESTIEDLD", item).?.leaf);
+    }
+    try testing.expect(m.find("TESTIEDLD", "GGIO1$ST$X$arr").?.leaf);
+    try testing.expect(!m.has("TESTIEDLD", "GGIO1$ST$X$arr$q"));
+}
