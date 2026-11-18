@@ -1027,3 +1027,49 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+
+test "FileStat.id and device: major and minor each fill their own 32 bits" {
+    const s: FileStat = .{ .mode = 0, .nlink = 1, .size = 0, .blocks = 0, .dev_major = 8, .dev_minor = 17, .ino = 42 };
+    const want: u64 = (@as(u64, 8) << 32) | 17;
+    try testing.expectEqual(want, s.device());
+    try testing.expectEqual(Id{ .dev = want, .ino = 42 }, s.id());
+    // Swapped halves are another device, and a major with high bits survives.
+    var t = s;
+    t.dev_major = 17;
+    t.dev_minor = 8;
+    try testing.expect(t.device() != s.device());
+    try testing.expect(t.id().dev != s.id().dev);
+    t.dev_major = 0xffff_ffff;
+    t.dev_minor = 0;
+    try testing.expectEqual(@as(u64, 0xffff_ffff_0000_0000), t.device());
+    try testing.expectEqual(@as(u64, 0xffff_ffff_0000_0000), t.id().dev);
+}
+
+test "detect: statx, unless the kernel answers ENOSYS to a probe of our own" {
+    var buf: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, "/", linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &buf);
+    const want: Backend = if (fstatat_available and linux.errno(rc) == .NOSYS) .fstatat else .statx;
+    try testing.expectEqual(want, detect());
+}
+
+test "clampNonNegative: 1 stays 1, for signed and unsigned fields" {
+    try testing.expectEqual(@as(u64, 1), clampNonNegative(@as(i64, 1)));
+    try testing.expectEqual(@as(u64, 1), clampNonNegative(@as(u64, 1)));
+    try testing.expectEqual(@as(u64, 1), clampNonNegative(@as(i32, 1)));
+    try testing.expectEqual(@as(u64, 0), clampNonNegative(@as(u64, 0)));
+}
+
+test "mapErrno: every errno the module names keeps its own error" {
+    try testing.expectEqual(error.FileNotFound, mapErrno(.NOENT));
+    try testing.expectEqual(error.AccessDenied, mapErrno(.ACCES));
+    try testing.expectEqual(error.AccessDenied, mapErrno(.PERM));
+    try testing.expectEqual(error.NotDir, mapErrno(.NOTDIR));
+    try testing.expectEqual(error.NameTooLong, mapErrno(.NAMETOOLONG));
+    try testing.expectEqual(error.TooManySymlinks, mapErrno(.LOOP));
+    try testing.expectEqual(error.IoError, mapErrno(.IO));
+    try testing.expectEqual(error.Unsupported, mapErrno(.NOSYS));
+    try testing.expectEqual(error.Unexpected, mapErrno(.INVAL));
+    try testing.expectEqual(error.Unexpected, mapErrno(.NOMEM));
+}

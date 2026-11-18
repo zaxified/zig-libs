@@ -1186,3 +1186,184 @@ const FailingSink = struct {
         return error.SinkFailed;
     }
 };
+
+// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+
+test "scanAt: a path longer than PATH_MAX is NameTooLong, not InvalidPath" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var long: [5000]u8 = @splat('a');
+    try testing.expectError(error.NameTooLong, scanAt(testing.allocator, io, tmp.dir, &long, .{}));
+}
+
+test "scanning a plain file reports it once through the sink: empty path, depth 0, its own totals" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fixture.init(io);
+    defer f.deinit();
+
+    var sink: CollectSink = .{ .gpa = testing.allocator };
+    defer sink.deinit();
+    const r = try scanAt(testing.allocator, io, f.tmp.dir, "plain/data.bin", .{
+        .on_directory = .{ .context = &sink, .func = CollectSink.onDirectory },
+    });
+    try testing.expectEqual(@as(usize, 1), sink.entries.items.len);
+    const e = sink.entries.items[0];
+    try testing.expectEqualStrings("", e.path);
+    try testing.expectEqual(@as(u32, 0), e.depth);
+    try testing.expectEqual(r.total, e.totals);
+    try testing.expectEqual(@as(u64, 1), e.totals.entries);
+    try testing.expectEqual(@as(u64, Fixture.plain_size), e.totals.apparent_bytes);
+    try testing.expect(e.totals.allocated_bytes >= Fixture.plain_size);
+}
+
+test "currentPath: the deepest open frame's path, the empty string with none" {
+    try testing.expectEqualStrings("", currentPath(&.{}));
+    var a = "root-frame".*;
+    var b = "child/frame".*;
+    const frames = [_]Frame{
+        .{ .path = &a, .totals = .{} },
+        .{ .path = &b, .totals = .{} },
+    };
+    try testing.expectEqualStrings("child/frame", currentPath(&frames));
+    try testing.expectEqualStrings("root-frame", currentPath(frames[0..1]));
+}
+
+/// While `should_descend` is being asked about `victim`, renames it away and
+/// puts something else in its place: the race the identity re-check exists for,
+/// made deterministic (the filter runs between the `lstat` and the open).
+const Swapper = struct {
+    dir: std.Io.Dir,
+    io: std.Io,
+    /// Replace by a symlink to `other` instead of by a fresh directory.
+    symlink: bool,
+    fired: bool = false,
+
+    fn onDescend(ctx: ?*anyopaque, path: []const u8, _: u32) Descend {
+        const self: *Swapper = @ptrCast(@alignCast(ctx.?));
+        if (!self.fired and std.mem.eql(u8, path, "victim")) {
+            self.fired = true;
+            self.dir.rename("victim", self.dir, "victim.old", self.io) catch return .yes;
+            if (self.symlink) {
+                self.dir.symLink(self.io, "other", "victim", .{}) catch {};
+            } else {
+                self.dir.createDirPath(self.io, "victim") catch {};
+                self.dir.writeFile(self.io, .{ .sub_path = "victim/marker", .data = "m" }) catch {};
+            }
+        }
+        return .yes;
+    }
+};
+
+fn swapFixture(io: std.Io, tmp: *testing.TmpDir) !void {
+    try tmp.dir.createDirPath(io, "victim");
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim/original", .data = "o" });
+    try tmp.dir.createDirPath(io, "other");
+    try tmp.dir.writeFile(io, .{ .sub_path = "other/file", .data = "f" });
+}
+
+test "a directory swapped for another between lstat and open is refused: counted, reported, never entered" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    for ([_]bool{ false, true }) |symlink| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try swapFixture(io, &tmp);
+
+        var swapper: Swapper = .{ .dir = tmp.dir, .io = io, .symlink = symlink };
+        var errs: ErrorCollector = .{};
+        var sink: CollectSink = .{ .gpa = testing.allocator };
+        defer sink.deinit();
+        const r = try scanAt(testing.allocator, io, tmp.dir, ".", .{
+            .on_error = .{ .context = &errs, .func = ErrorCollector.onError },
+            .on_directory = .{ .context = &sink, .func = CollectSink.onDirectory },
+            .should_descend = .{ .context = &swapper, .func = Swapper.onDescend },
+        });
+        try testing.expect(swapper.fired);
+        try testing.expectEqual(@as(u64, 1), r.errors);
+        try testing.expectEqual(@as(usize, 1), errs.count);
+        try testing.expectEqual(anyerror.DirectoryChanged, errs.last_err.?);
+        try testing.expectEqualStrings("victim", errs.last_path[0..errs.last_path_len]);
+        // The refused directory is still a real entry with its own size, reported
+        // on its own and rolled into the root; what it now holds (the marker, or
+        // `other` through the symlink) was never read.
+        try testing.expectEqual(@as(u64, 1), (sink.find("victim") orelse return error.TestUnexpectedResult).entries);
+        try testing.expectEqual(@as(u64, 3), r.directories); // root, victim, other
+        try testing.expectEqual(@as(u64, 1), r.regular_files); // other/file only
+        try testing.expectEqual(@as(u64, 4), r.total.entries);
+    }
+}
+
+/// Fails exactly one allocation (the `fail_at`-th) and lets every other one
+/// through. `std.testing.FailingAllocator` keeps failing from its index on, so
+/// a site that swallows the first failure is still rescued by a later one.
+const OnceFailing = struct {
+    inner: Allocator,
+    fail_at: usize,
+    count: usize = 0,
+    failed: bool = false,
+
+    fn allocator(self: *OnceFailing) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *OnceFailing = @ptrCast(@alignCast(ctx));
+        if (self.count == self.fail_at and !self.failed) {
+            self.failed = true;
+            return null;
+        }
+        self.count += 1;
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *OnceFailing = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *OnceFailing = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *OnceFailing = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
+test "an induced allocation failure is always reported, never swallowed" {
+    // The sweep above accepts a run that succeeded after a failure was
+    // induced ("not on a path this run took"), and `FailingAllocator` keeps
+    // failing once it has started, which rescues a site that swallows the
+    // first failure. One failed allocation, then normal service: the only
+    // acceptable answer is OutOfMemory.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fixture.init(io);
+    defer f.deinit();
+
+    var counting: OnceFailing = .{ .inner = testing.allocator, .fail_at = std.math.maxInt(usize) };
+    _ = try scanFixture(counting.allocator(), &f, .{ .on_directory = .{ .func = ignoreDirectory } });
+    const total_allocations = counting.count;
+    try testing.expect(total_allocations > 0);
+
+    var i: usize = 0;
+    while (i < total_allocations) : (i += 1) {
+        var failing: OnceFailing = .{ .inner = testing.allocator, .fail_at = i };
+        const result = scanFixture(failing.allocator(), &f, .{ .on_directory = .{ .func = ignoreDirectory } });
+        try testing.expect(failing.failed);
+        try testing.expectError(error.OutOfMemory, result);
+    }
+}

@@ -6,7 +6,7 @@
 
 **Scope:** core — GNU coreutils du 9.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-04 · mutation 2026-09-04 · src ?
+**Audit:** review 2026-09-04 · mutation 2026-11-17 (312/350, 38 eq) · src 83316980cbb48cc9
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DISKUSAGE_FUZZ) · ct n/a — filesystem walking (keyword review, 2026-10-07)
 
@@ -543,6 +543,19 @@ its own test: removed, red; restored, green.
   extension when a consumer needs one.
 - **`statfs`, mount tables, filesystem type.** That is `diskfree`. Neither
   module imports the other.
+
+## Audit 2026-11-17 (whole-module mutation)
+
+350 mutants over every non-test line of `src/stat.zig`, `src/scan.zig` and `src/parallel.zig`: the `FileStat` identity and kind tests, `detect`, both stat backends (flags, errno, mask check, every copied field), `decodeDev`, `mapErrno`, `clampNonNegative`, `Totals`, the sequential walk (root and file handling, error counting and reporting, the one-filesystem boundary, the prune predicate, hard-link de-duplication, frames and subtotals, the identity re-check of the descent, `classify`), and the parallel walk (the node and reference accounting, completion folding, abort and discard mode, counters merge, worker loop, open and identity re-check, listing, path building, queueing). Five schemata builds (one of them an unmutated compile after a kit input error).
+
+257 mutants died on the existing suite (3 as hangs), 90 survived the first round. Tests added at the end of each file: `FileStat.id`/`device` with distinct major and minor, `detect` against an independent probe, `clampNonNegative(1)`, every `mapErrno` arm, a path beyond PATH_MAX, a plain-file scan through the sink, `currentPath`, an entry that vanishes after it was listed (the first `should_descend` call deletes its siblings, so the outcome is the same for any listing order) in sequential and parallel scans, `should_descend` and `on_directory` and `on_error` each alone (root-relative paths and depths), the one-filesystem boundary in a parallel scan, descriptors closed after a parallel scan, `mergeCounters` saturation, a one-shot failing allocator (`OnceFailing`: exactly one allocation fails, then normal service, so a site that swallows the failure is not rescued by a later one, unlike `std.testing.FailingAllocator`, which keeps failing) for both walks, and the TOCTOU swap made deterministic: `should_descend` runs between the `lstat` and the open, and renames the directory away and puts a new one (or a symlink) in its place, so the identity re-check, its error path, and the parallel open's `O_NOFOLLOW` are exercised without any timing window. 312 mutants die in total.
+
+38 do not die, none of them a defect:
+
+- 20 EQUIVALENT: `|` for `^` in the device key and `decodeDev` (disjoint bits); the two backends swapped or overridden (they are specified to agree); clamp of 0; cost-only link-set guards (`nlink > 1`, `!isDir`); dead stores after the last use (`n.dir`, the finished node's `pending`); a name never freed that `processNode` has already freed; the 256-byte name buffer bound (NAME_MAX is 255); `oom` break after an abort already set; spurious or missing wake-ups and a missing extra worker (cost only); an aborted run continuing to open directories (its Report is discarded).
+- 18 UNOBSERVABLE: a kernel without `statx`, an automount point, a filesystem declining a stat field, a filesystem reporting `d_type` unknown, two devices with colliding inode numbers, a getdents failure inside a walk (6 mutants: error counting, reporting, `currentPath` use, frame paths of an `on_error`-only scan, the parallel listing error), a name beyond NAME_MAX, a second worker aborting mid-listing (2), cancelation of the calling task (2), and the root's `follow_symlinks` (the identity re-check refuses whatever it opens).
+
+Not mutated: the per-architecture `fstatat` structs and their comptime layout asserts, the `family` table and `fstatat_available` (comptime; the x86-64 layout is exercised by the backend-agreement test), mutex lock/unlock pairs, doc comments. Counts on the card are whole-module.
 
 ## Backlog / deferred
 
