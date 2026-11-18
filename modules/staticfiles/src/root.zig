@@ -974,7 +974,14 @@ pub const Handler = struct {
         var start: u64 = 0;
         var length: u64 = total;
         var rbuf: [http.range.default_max_ranges]http.range.ResolvedRange = undefined;
-        const applied = if (http.conditional.ifRangeAllows(req, .{ .etag = etag, .last_modified = mtime_s }))
+        //
+        // A date validator counts only when the `Last-Modified` we send is
+        // STRONG (RFC 9110 §8.8.2.2, §13.1.5): at least one second older than
+        // the response's `Date`. A file written within the last second can be
+        // replaced within the same second under the same date, so the date
+        // would authorize a range across two versions; then only an entity
+        // tag may (`strongLastModified`).
+        const applied = if (http.conditional.ifRangeAllows(req, .{ .etag = etag, .last_modified = if (isStrongLastModified(h.io, opened.stat.mtime)) mtime_s else null }))
             http.range.apply(req, rw, total, &rbuf) catch return failUnsafeResponse(rw)
         else
             http.range.Applied{ .outcome = .no_range, .ranges = &.{} };
@@ -1198,6 +1205,15 @@ pub fn httpHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) a
 }
 
 // ── response helpers ─────────────────────────────────────────────────────────
+
+/// Whether `mtime` is old enough to be a STRONG `Last-Modified` (RFC 9110
+/// §8.8.2.2): at least one second before the response's `Date`, compared at
+/// full timestamp precision (the header itself only carries whole seconds).
+/// A modification time in the future is not strong either.
+fn isStrongLastModified(io: Io, mtime: Io.Timestamp) bool {
+    const now = Io.Timestamp.now(io, .real);
+    return now.nanoseconds - mtime.nanoseconds >= std.time.ns_per_s;
+}
 
 /// An `ETag` from size + mtime: `"<size:x>-<mtime:x>"`, weak (`W/` prefix)
 /// unless `weak` is false, written into `buf` (the caller's — `setHeader`
@@ -3795,6 +3811,9 @@ test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, 
     var h = Handler.init(testing.io, fx.root, .{ .strong_etag = true });
     var out: [4096]u8 = undefined;
     var wire: [512]u8 = undefined;
+    // A date validator needs a STRONG Last-Modified (>= 1 s old, see the
+    // same-second test below); the fixture was written just now.
+    try ageFile(fx.root, "hello.txt", -60);
 
     // Stale entity-tag: the client's copy is not this file, so it gets the
     // whole resource — and no Content-Range, since no range was applied.
@@ -3832,6 +3851,72 @@ test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, 
         "If-Range: \"not-a-real-etag\"\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(no_range));
     try testing.expect(mem.endsWith(u8, no_range, "hello world"));
+}
+
+/// Move a file's mtime by `secs` (negative: into the past).
+fn ageFile(root: Dir, name: []const u8, secs: i64) !void {
+    try bumpMtime(root, name, secs);
+}
+
+test "If-Range by date (RFC 9110 §13.1.5 / §8.8.2.2): a Last-Modified younger than one second is not a strong validator, an older one is" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    // strong_etag so the date is the only thing in question: with the weak
+    // default the entity tag never authorizes a range either.
+    var h = Handler.init(testing.io, fx.root, .{ .strong_etag = true });
+    var out: [4096]u8 = undefined;
+    var wire: [512]u8 = undefined;
+
+    // Same-second replace: the file was written just now, so its date cannot
+    // tell two versions apart and the Range is ignored (full 200) even though
+    // the client's date equals the one we sent.
+    const first = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    const lm = extractHeader(first, "Last-Modified: ") orelse return error.NoLastModified;
+    const req = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+        "If-Range: {s}\r\nConnection: close\r\n\r\n", .{lm}) catch unreachable;
+    var b1: [4096]u8 = undefined;
+    const young = runRequest(&h, req, &b1);
+    try testing.expectEqual(@as(u16, 200), statusOf(young));
+    try testing.expect(mem.endsWith(u8, young, "hello world"));
+
+    // The entity tag still authorizes the range: the date rule only removes
+    // the date branch.
+    const etag = extractHeader(first, "ETag: ") orelse return error.NoETag;
+    const req_tag = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+        "If-Range: {s}\r\nConnection: close\r\n\r\n", .{etag}) catch unreachable;
+    var b2: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 206), statusOf(runRequest(&h, req_tag, &b2)));
+
+    // An mtime in the future is not strong either.
+    try ageFile(fx.root, "hello.txt", 3600);
+    const fut = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    const lm_fut = extractHeader(fut, "Last-Modified: ") orelse return error.NoLastModified;
+    const req_fut = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+        "If-Range: {s}\r\nConnection: close\r\n\r\n", .{lm_fut}) catch unreachable;
+    var b3: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 200), statusOf(runRequest(&h, req_fut, &b3)));
+
+    // Old enough: the date authorizes the range.
+    try ageFile(fx.root, "hello.txt", -7200);
+    const old = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    const lm_old = extractHeader(old, "Last-Modified: ") orelse return error.NoLastModified;
+    const req_old = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+        "If-Range: {s}\r\nConnection: close\r\n\r\n", .{lm_old}) catch unreachable;
+    var b4: [4096]u8 = undefined;
+    const ok = runRequest(&h, req_old, &b4);
+    try testing.expectEqual(@as(u16, 206), statusOf(ok));
+    try testing.expect(mem.endsWith(u8, ok, "hello"));
+}
+
+test "isStrongLastModified: the one-second bound at full timestamp precision" {
+    const io = testing.io;
+    const now = Io.Timestamp.now(io, .real);
+    const s = std.time.ns_per_s;
+    // Margins of a second tolerate the clock moving between the two reads.
+    try testing.expect(isStrongLastModified(io, .{ .nanoseconds = now.nanoseconds - 2 * s }));
+    try testing.expect(!isStrongLastModified(io, .{ .nanoseconds = now.nanoseconds - s / 2 }));
+    try testing.expect(!isStrongLastModified(io, now));
+    try testing.expect(!isStrongLastModified(io, .{ .nanoseconds = now.nanoseconds + s }));
 }
 
 test "serve: with the DEFAULT weak ETag, If-Range never authorizes a range — not even with the current, served tag (A1 F5)" {
