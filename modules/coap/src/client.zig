@@ -401,3 +401,68 @@ test "non-confirmable request is typed NON" {
     const msg = try coap.parse(req.datagram, &in_opts);
     try testing.expectEqual(coap.Type.non_confirmable, msg.type);
 }
+
+// ── whole-module mutation (2026-11-17): token bytes, scratch and array capacity ──
+
+test "buildRequest: the token is the counter's low bytes, big-endian; 8 is the longest" {
+    var c = Client.init(1, 0x0102030405060708);
+    var opts: [16]coap.Option = undefined;
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const r4 = try c.buildRequest(.get, "coap://h/p", .{ .token_len = 4 }, &opts, &scratch, &out);
+    try testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8 }, r4.exchange.token());
+    const r8 = try c.buildRequest(.get, "coap://h/p", .{ .token_len = 8 }, &opts, &scratch, &out);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 9 }, r8.exchange.token());
+    try testing.expectError(error.BadTokenLength, c.buildRequest(.get, "coap://h/p", .{ .token_len = 9 }, &opts, &scratch, &out));
+}
+
+test "buildRequest: appended Content-Format/Accept never overwrite the URI's scratch bytes" {
+    var c = Client.init(1, 1);
+    var opts: [16]coap.Option = undefined;
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    // The upper-case host is lowered into the first scratch bytes.
+    const req = try c.buildRequest(.get, "coap://EXAMPLE.com:9999/p", .{ .content_format = 50, .accept = 60 }, &opts, &scratch, &out);
+    var in_opts: [16]coap.Option = undefined;
+    const msg = try coap.parse(req.datagram, &in_opts);
+    try testing.expectEqualStrings("example.com", findOption(msg, opt.number.uri_host).?);
+    try testing.expectEqual(@as(u64, 9999), opt.decodeUint(findOption(msg, opt.number.uri_port).?));
+    try testing.expectEqual(@as(?u16, 50), try opt.contentFormat(msg));
+    try testing.expectEqual(@as(?u16, 60), try opt.accept(msg));
+}
+
+test "buildRequest: the option array and the scratch tail are exact for the appended option" {
+    var c = Client.init(1, 1);
+    var out: [128]u8 = undefined;
+    var o3: [3]coap.Option = undefined;
+    var o2: [2]coap.Option = undefined;
+    var s1: [1]u8 = undefined;
+    var s0: [0]u8 = undefined;
+    // host + path + content-format = 3 options; the value 50 takes one scratch byte.
+    _ = try c.buildRequest(.get, "coap://h/p", .{ .content_format = 50 }, &o3, &s1, &out);
+    try testing.expectError(error.ScratchTooSmall, c.buildRequest(.get, "coap://h/p", .{ .content_format = 50 }, &o3, &s0, &out));
+    try testing.expectError(error.TooManyOptions, c.buildRequest(.get, "coap://h/p", .{ .content_format = 50 }, &o2, &s1, &out));
+}
+
+test "Exchange.match: a CON/NON with the right token but the Empty code is not a response" {
+    var c = Client.init(5, 0x99);
+    var opts: [8]coap.Option = undefined;
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const req = try c.buildRequest(.get, "coap://h/x", .{}, &opts, &scratch, &out);
+    const ex = req.exchange;
+    try testing.expectEqual(Match.unrelated, ex.match(.{ .type = .confirmable, .code = .empty, .message_id = 9, .token = ex.token() }));
+    try testing.expectEqual(Match.unrelated, ex.match(.{ .type = .non_confirmable, .code = .empty, .message_id = 9, .token = ex.token() }));
+}
+
+test "buildRequest: a scratch value at offset 0 counts as used (an upper-case host is the only scratch user)" {
+    var c = Client.init(1, 1);
+    var opts: [16]coap.Option = undefined;
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const req = try c.buildRequest(.get, "coap://EXAMPLE.com/p", .{ .content_format = 50 }, &opts, &scratch, &out);
+    var in_opts: [16]coap.Option = undefined;
+    const msg = try coap.parse(req.datagram, &in_opts);
+    try testing.expectEqualStrings("example.com", findOption(msg, opt.number.uri_host).?);
+    try testing.expectEqual(@as(?u16, 50), try opt.contentFormat(msg));
+}

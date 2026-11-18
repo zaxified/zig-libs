@@ -791,3 +791,60 @@ test "C7 reliability glue: a dead CON notification cancels the subscription" {
     if (rt2.isDone()) _ = reg.cancel(token, resource);
     try testing.expectEqual(@as(usize, 0), reg.count());
 }
+
+// ── whole-module mutation (2026-11-17): boundary tests ──────────────────────
+
+fn ctxAdmit(ctx: ?*anyopaque, source_id: u64, token: []const u8, resource: u64) bool {
+    _ = token;
+    _ = resource;
+    const seen: *u64 = @ptrCast(@alignCast(ctx.?));
+    seen.* = source_id;
+    return true;
+}
+
+test "isNewer: exactly half the space apart is not newer in either direction" {
+    try testing.expect(!isNewer(0, 1 << 23));
+    try testing.expect(!isNewer(1 << 23, 0));
+    try testing.expect(isNewer(0, (1 << 23) - 1));
+    try testing.expect(isNewer((1 << 23) + 1, 0));
+}
+
+test "tryRegister hands the caller's context and source id to the admission hook" {
+    var seen: u64 = 0;
+    var st: [2]Registry.Entry = undefined;
+    var reg = Registry.init(&st);
+    reg.admit_fn = ctxAdmit;
+    reg.admit_ctx = &seen;
+    try testing.expect(reg.tryRegister(77, "a", 1, 0, t0) != null);
+    try testing.expectEqual(@as(u64, 77), seen);
+}
+
+test "a refresh restarts the 128 s clock; an 8-byte token is stored whole" {
+    var st: [2]Registry.Entry = undefined;
+    var reg = Registry.init(&st);
+    _ = reg.register("t", 1, 100, t0);
+    _ = reg.register("t", 1, 200, t0 + 500_000); // refresh, much later
+    // A lower sequence 5 s after the refresh is stale: the age rule has not elapsed.
+    try testing.expectEqual(@as(?Registry.Update, .stale), reg.notify("t", 1, 150, t0 + 505_000));
+
+    _ = reg.register("12345678", 9, 1, t0);
+    try testing.expectEqual(@as(?Registry.Update, .accepted), reg.notify("12345678", 9, 2, t0 + 1));
+}
+
+test "cancel needs token AND resource and keeps the others reachable" {
+    var st: [4]Registry.Entry = undefined;
+    var reg = Registry.init(&st);
+    _ = reg.register("a", 1, 0, t0);
+    _ = reg.register("b", 1, 0, t0);
+    _ = reg.register("a", 2, 0, t0);
+    _ = reg.register("c", 3, 0, t0);
+    try testing.expect(!reg.cancel("zzz", 1)); // resource matches, token does not
+    try testing.expect(!reg.cancel("a", 99)); // token matches, resource does not
+    try testing.expectEqual(@as(usize, 4), reg.count());
+    try testing.expect(reg.cancel("a", 1)); // the first one: the rest shift down
+    try testing.expectEqual(@as(usize, 3), reg.count());
+    try testing.expect(reg.notify("a", 1, 1, t0) == null);
+    try testing.expect(reg.notify("b", 1, 1, t0) != null);
+    try testing.expect(reg.notify("a", 2, 1, t0) != null);
+    try testing.expect(reg.notify("c", 3, 1, t0) != null);
+}

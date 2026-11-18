@@ -475,3 +475,30 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-17): boundary tests ──────────────────────
+
+test "Block.offset multiplies; split refuses start == len + 1; the assembler refuses a gap of one byte" {
+    try testing.expectEqual(@as(usize, 192), (Block{ .num = 3, .szx = 2 }).offset());
+
+    const p15: [15]u8 = @splat(1);
+    try testing.expectError(error.OutOfRange, split(&p15, 0, 1)); // start 16 = len + 1
+    const c0 = try split(&p15, 0, 0);
+    try testing.expectEqual(@as(usize, 15), c0.data.len);
+    try testing.expect(!c0.descriptor.more);
+
+    var buf: [32]u8 = undefined;
+    var a = Assembler.init(&buf);
+    const short: [15]u8 = @splat(2);
+    try a.accept(.{ .num = 0, .more = true, .szx = 0 }, &short);
+    // Block 1 starts at 16, one byte beyond the 15 bytes written: a gap.
+    try testing.expectError(error.NonContiguousBlock, a.accept(.{ .num = 1, .more = false, .szx = 0 }, &short));
+
+    // A buffer of exactly two full blocks takes them both.
+    var b = Assembler.init(&buf);
+    const full: [16]u8 = @splat(3);
+    try b.accept(.{ .num = 0, .more = true, .szx = 0 }, &full);
+    try b.accept(.{ .num = 1, .more = false, .szx = 0 }, &full);
+    try testing.expect(b.isComplete());
+    try testing.expectEqual(@as(usize, 32), b.payload().len);
+}

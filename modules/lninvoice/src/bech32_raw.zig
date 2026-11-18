@@ -758,3 +758,50 @@ test "corpus: every string script builds a string, and what decode made of it is
     var zero: [128]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), buildString(&.{}, &zero).len);
 }
+
+// ── whole-module mutation (2026-11-17): boundary tests ──────────────────────
+
+test "mutation: mixed case is detected at the letter-range edges a, z, A, Z" {
+    const a = testing.allocator;
+    for ([_][]const u8{ "Ba1aaaaa", "Bz1zzzzz", "bA1AAAAA", "bZ1ZZZZZ" }) |s| {
+        try testing.expectError(error.MixedCase, decodeNoChecksum(a, s));
+    }
+}
+
+test "mutation: HRP rules at their edges (empty, space, '!', DEL, '~') on all four entry points" {
+    const a = testing.allocator;
+    try testing.expectError(error.EmptyHrp, decodeNoChecksum(a, "1qqqqq"));
+    try testing.expectError(error.HrpCharOutOfRange, decodeNoChecksum(a, "a b1qqqqq"));
+    try testing.expectError(error.HrpCharOutOfRange, decodeNoChecksum(a, "a\x7fb1qqqqq"));
+    for ([_][]const u8{ "a!b1qqqqq", "a~b1qqqqq" }) |s| {
+        var d = try decodeNoChecksum(a, s);
+        d.deinit(a);
+    }
+
+    try testing.expectError(error.EmptyHrp, encode(a, "", &.{}));
+    try testing.expectError(error.HrpCharOutOfRange, encode(a, "a b", &.{}));
+    try testing.expectError(error.HrpCharOutOfRange, encode(a, "a\x7fb", &.{}));
+    for ([_][]const u8{ "a!b", "a~b" }) |h| a.free(try encode(a, h, &.{}));
+
+    try testing.expectError(error.EmptyHrp, encodeNoChecksum(a, "", &.{}));
+    try testing.expectError(error.HrpCharOutOfRange, encodeNoChecksum(a, "a b", &.{}));
+    try testing.expectError(error.HrpCharOutOfRange, encodeNoChecksum(a, "a\x7fb", &.{}));
+    for ([_][]const u8{ "a!b", "a~b" }) |h| a.free(try encodeNoChecksum(a, h, &.{}));
+}
+
+test "mutation: both encoders write the HRP in lower case" {
+    const a = testing.allocator;
+    const c = try encode(a, "AbC", &.{});
+    defer a.free(c);
+    try testing.expect(std.mem.startsWith(u8, c, "abc1"));
+    const n = try encodeNoChecksum(a, "AbC", &.{});
+    defer a.free(n);
+    try testing.expectEqualStrings("abc1", n);
+}
+
+test "mutation: stripContinuation drops whitespace only right after a '+'" {
+    const a = testing.allocator;
+    const out = try stripContinuation(a, "a b+ c");
+    defer a.free(out);
+    try testing.expectEqualStrings("a bc", out);
+}

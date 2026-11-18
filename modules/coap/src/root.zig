@@ -894,3 +894,87 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-17): boundary and exact-fit tests ────────
+
+test "Code: detail covers the full 5 bits; hasRequestBody is exactly the five body methods" {
+    try testing.expectEqual(@as(u5, 22), Code.unprocessable_entity.detail());
+    try testing.expectEqual(@as(u3, 4), Code.unprocessable_entity.class());
+    try testing.expectEqual(Code.unprocessable_entity, Code.init(4, 22));
+    try testing.expectEqual(Code.@"continue", Code.init(2, 31));
+    for ([_]Code{ .post, .put, .fetch, .patch, .ipatch }) |c| try testing.expect(c.hasRequestBody());
+    for ([_]Code{ .get, .delete, .empty, .content, .not_found }) |c| try testing.expect(!c.hasRequestBody());
+}
+
+test "parse: option number 65535 is the last valid one, 65536 is not; exact-fit option array; extension byte at the end" {
+    var one: [1]Option = undefined;
+    // delta 65535 = nibble 14 + ext 65535 - 269 = 0xFEF2, empty value.
+    const edge = [_]u8{ 0x40, 0x01, 0, 1, 0xe0, 0xfe, 0xf2 };
+    const m = try parse(&edge, &one);
+    try testing.expectEqual(@as(usize, 1), m.options.len);
+    try testing.expectEqual(@as(u16, 65535), m.options[0].number);
+    const over = [_]u8{ 0x40, 0x01, 0, 1, 0xe0, 0xfe, 0xf3 };
+    try testing.expectError(error.BadOption, parse(&over, &one));
+    // delta 13 whose extension byte is the very last byte of the datagram.
+    const ext13 = [_]u8{ 0x40, 0x01, 0, 1, 0xd0, 0x00 };
+    const m13 = try parse(&ext13, &one);
+    try testing.expectEqual(@as(u16, 13), m13.options[0].number);
+}
+
+/// serialize into a buffer of exactly `encodedLen` bytes, then into every
+/// shorter one: each must be refused, never panic or report success.
+fn expectExactFit(msg: Message, comptime extended: bool) !void {
+    const need = if (extended) encodedLenExtended(msg) else encodedLen(msg);
+    var buf: [768]u8 = undefined;
+    try testing.expect(need <= buf.len);
+    const n = if (extended) try serializeExtended(msg, buf[0..need]) else try serialize(msg, buf[0..need]);
+    try testing.expectEqual(need, n);
+    var len: usize = 0;
+    while (len < need) : (len += 1) {
+        const r = if (extended) serializeExtended(msg, buf[0..len]) else serialize(msg, buf[0..len]);
+        try testing.expectError(error.BufferTooSmall, r);
+    }
+}
+
+test "serialize: a buffer of exactly encodedLen fits, one byte less is refused (header, token, every option form, payload)" {
+    const v13: [13]u8 = @splat(1);
+    const v300: [300]u8 = @splat(2);
+    const tok2 = [_]u8{ 1, 2 };
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = &tok2 }, false);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .options = &.{.{ .number = 1, .value = "" }} }, false);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .options = &.{.{ .number = 13, .value = "" }} }, false);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .options = &.{.{ .number = 300, .value = "" }} }, false);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .options = &.{.{ .number = 1, .value = &v13 }} }, false);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .options = &.{.{ .number = 1, .value = &v300 }} }, false);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .payload = "x" }, false);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = &tok2, .options = &.{ .{ .number = 11, .value = "a" }, .{ .number = 11, .value = "b" } }, .payload = "xy" }, false);
+    // RFC 8974 extended token length: one and two extension octets.
+    const t13: [13]u8 = @splat(3);
+    const t300: [300]u8 = @splat(4);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = &t13 }, true);
+    try expectExactFit(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = &t300, .payload = "p" }, true);
+}
+
+test "serializeExtended: lengths 9..12 have no encoding; the maximum token round-trips and one more is refused" {
+    var out: [32]u8 = undefined;
+    const tok: [12]u8 = @splat(7);
+    for (9..13) |l| {
+        try testing.expectError(error.BadTokenLength, serializeExtended(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = tok[0..l] }, &out));
+    }
+    const gpa = testing.allocator;
+    const big = try gpa.alloc(u8, max_extended_token_len + 1);
+    defer gpa.free(big);
+    @memset(big, 0x5a);
+    big[0] = 1;
+    big[max_extended_token_len - 1] = 2;
+    const wire = try gpa.alloc(u8, max_extended_token_len + 16);
+    defer gpa.free(wire);
+    const max_msg: Message = .{ .type = .confirmable, .code = .get, .message_id = 1, .token = big[0..max_extended_token_len] };
+    const n = try serializeExtended(max_msg, wire);
+    try testing.expectEqual(encodedLenExtended(max_msg), n);
+    var none: [0]Option = undefined;
+    const back = try parseExtended(wire[0..n], &none);
+    try testing.expectEqualSlices(u8, max_msg.token, back.token);
+    try testing.expectError(error.BufferTooSmall, serializeExtended(max_msg, wire[0 .. n - 1]));
+    try testing.expectError(error.BadTokenLength, serializeExtended(.{ .type = .confirmable, .code = .get, .message_id = 1, .token = big }, wire));
+}

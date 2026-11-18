@@ -870,3 +870,144 @@ test "optionsFromUri feeds coap.serialize / coap.parse round-trip" {
     const len = try uriFromOptions(parsed.options, false, "", &uri_buf);
     try testing.expectEqualStrings("coap://example.com:9999/sensors/temp?unit=c", uri_buf[0..len]);
 }
+
+// ── whole-module mutation (2026-11-17): boundary and character-set tests ────
+
+test "noCacheKey is the 0b11100 pattern over bits 1..4 only (bits 0 and 5 are free)" {
+    for ([_]u16{ 28, 29, 60, 61 }) |n| try testing.expect(noCacheKey(n));
+    for ([_]u16{ 0, 12, 14, 24, 26, 27, 30, 31, 62 }) |n| try testing.expect(!noCacheKey(n));
+}
+
+test "decodeUint folds exactly the last 8 bytes of an over-long value" {
+    try testing.expectEqual(@as(u64, 0x0102030405060708), decodeUint(&.{ 0xaa, 1, 2, 3, 4, 5, 6, 7, 8 }));
+}
+
+test "option length edges: Accept 0xFFFF, Request-Tag of exactly 8 octets" {
+    const acc = [_]Option{.{ .number = number.accept, .value = &.{ 0xff, 0xff } }};
+    try testing.expectEqual(@as(?u16, 0xffff), try accept(.{ .type = .confirmable, .code = .get, .message_id = 1, .options = &acc }));
+    const tag8: [8]u8 = @splat(3);
+    const tags = [_]Option{.{ .number = number.request_tag, .value = &tag8 }};
+    var it = requestTags(.{ .type = .confirmable, .code = .fetch, .message_id = 1, .options = &tags });
+    try testing.expectEqualSlices(u8, &tag8, (try it.next()).?);
+    try testing.expect((try it.next()) == null);
+}
+
+test "optionsFromUri: scheme is case-insensitive, the authority may end at '?', malformed IPv6 authorities" {
+    var out: [8]Option = undefined;
+    var scratch: [64]u8 = undefined;
+    var o = try optionsFromUri("COAP://h/p", &out, &scratch);
+    try testing.expectEqual(@as(usize, 2), o.len);
+    o = try optionsFromUri("CoApS://h:5683/p", &out, &scratch); // 5683 is not coaps' default
+    try testing.expectEqual(@as(usize, 3), o.len);
+    o = try optionsFromUri("coap://h?x=1", &out, &scratch);
+    try testing.expectEqual(@as(usize, 2), o.len);
+    try testing.expectEqualStrings("h", o[0].value);
+    try testing.expectEqual(number.uri_query, o[1].number);
+    try testing.expectEqualStrings("x=1", o[1].value);
+    try testing.expectError(error.BadUri, optionsFromUri("coap://[::1/p", &out, &scratch));
+    try testing.expectError(error.BadUri, optionsFromUri("coap://[::1]x/p", &out, &scratch));
+    try testing.expectError(error.BadUri, optionsFromUri("coap://[::1]p", &out, &scratch));
+}
+
+test "optionsFromUri: scratch accounting is exact (host, port window, percent-decoding)" {
+    var out: [8]Option = undefined;
+    // A lower-case host is borrowed from the URI: no scratch needed at all.
+    var none: [0]u8 = undefined;
+    const b = try optionsFromUri("coap://h.example/p", &out, &none);
+    try testing.expectEqualStrings("h.example", b[0].value);
+    // An upper-case host needs exactly its length.
+    var s9: [9]u8 = undefined;
+    const u = try optionsFromUri("coap://H.EXAMPLE/p", &out, &s9);
+    try testing.expectEqualStrings("h.example", u[0].value);
+    var s8: [8]u8 = undefined;
+    try testing.expectError(error.ScratchTooSmall, optionsFromUri("coap://H.EXAMPLE/p", &out, &s8));
+    // A non-default port wants an 8-byte window.
+    const p = try optionsFromUri("coap://h:9999/x", &out, &s8);
+    try testing.expectEqual(@as(u64, 9999), decodeUint(p[1].value));
+    var s7: [7]u8 = undefined;
+    try testing.expectError(error.ScratchTooSmall, optionsFromUri("coap://h:9999/x", &out, &s7));
+    // A percent-encoded segment wants its encoded length.
+    var s5: [5]u8 = undefined;
+    const d = try optionsFromUri("coap://h/a%20b", &out, &s5);
+    try testing.expectEqualStrings("a b", d[1].value);
+    var s4: [4]u8 = undefined;
+    try testing.expectError(error.ScratchTooSmall, optionsFromUri("coap://h/a%20b", &out, &s4));
+    // Earlier scratch users keep their bytes while later ones are written.
+    var s64: [64]u8 = undefined;
+    const k = try optionsFromUri("coap://HOST:9999/a%20b/c%20d?q%3D1", &out, &s64);
+    try testing.expectEqual(@as(usize, 5), k.len);
+    try testing.expectEqualStrings("host", k[0].value);
+    try testing.expectEqual(@as(u64, 9999), decodeUint(k[1].value));
+    try testing.expectEqualStrings("a b", k[2].value);
+    try testing.expectEqualStrings("c d", k[3].value);
+    try testing.expectEqualStrings("q=1", k[4].value);
+}
+
+test "optionsFromUri: the option array capacity is exact for host, port, path and query" {
+    var scratch: [64]u8 = undefined;
+    var o0: [0]Option = undefined;
+    var o1: [1]Option = undefined;
+    var o2: [2]Option = undefined;
+    var o3: [3]Option = undefined;
+    try testing.expectError(error.TooManyOptions, optionsFromUri("coap://h/", &o0, &scratch));
+    try testing.expectEqual(@as(usize, 1), (try optionsFromUri("coap://h/", &o1, &scratch)).len);
+    try testing.expectError(error.TooManyOptions, optionsFromUri("coap://h:9999/", &o1, &scratch));
+    try testing.expectEqual(@as(usize, 2), (try optionsFromUri("coap://h:9999/", &o2, &scratch)).len);
+    try testing.expectEqual(@as(usize, 2), (try optionsFromUri("coap://h/a", &o2, &scratch)).len);
+    try testing.expectError(error.TooManyOptions, optionsFromUri("coap://h:9999/a", &o2, &scratch));
+    try testing.expectEqual(@as(usize, 2), (try optionsFromUri("coap://h?x", &o2, &scratch)).len);
+    try testing.expectError(error.TooManyOptions, optionsFromUri("coap://h?x", &o1, &scratch));
+    try testing.expectEqual(@as(usize, 3), (try optionsFromUri("coap://h/a/b", &o3, &scratch)).len);
+}
+
+test "optionsFromUri: a one-digit port, empty query parameters are dropped" {
+    var out: [8]Option = undefined;
+    var scratch: [64]u8 = undefined;
+    const p = try optionsFromUri("coap://h:7/", &out, &scratch);
+    try testing.expectEqual(@as(usize, 2), p.len);
+    try testing.expectEqual(@as(u64, 7), decodeUint(p[1].value));
+    const q = try optionsFromUri("coap://h/a?x&&y&", &out, &scratch);
+    try testing.expectEqual(@as(usize, 4), q.len);
+    try testing.expectEqualStrings("x", q[2].value);
+    try testing.expectEqualStrings("y", q[3].value);
+}
+
+fn expectedEncoding(b: u8, literal: bool, buf: *[3]u8) []const u8 {
+    if (literal) {
+        buf[0] = b;
+        return buf[0..1];
+    }
+    const hex = "0123456789ABCDEF";
+    buf.* = .{ '%', hex[b >> 4], hex[b & 15] };
+    return buf[0..3];
+}
+
+test "uriFromOptions: which bytes stay literal in host, path and query, for all 256 values (independent oracle)" {
+    const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    const sub_delims = "!$&'()*+,;=";
+    var out: [64]u8 = undefined;
+    for (0..256) |bi| {
+        const b: u8 = @intCast(bi);
+        const lit_host = std.mem.findScalar(u8, unreserved, b) != null;
+        const lit_path = lit_host or std.mem.findScalar(u8, sub_delims, b) != null or b == ':' or b == '@';
+        const lit_query = (lit_path and b != '&') or b == '/' or b == '?';
+        var v = [1]u8{b};
+        var eb: [3]u8 = undefined;
+        var want: [16]u8 = undefined;
+
+        const host_opts = [_]Option{.{ .number = number.uri_host, .value = &v }};
+        var n = try uriFromOptions(&host_opts, false, "", &out);
+        var w = try std.fmt.bufPrint(&want, "coap://{s}/", .{expectedEncoding(b, lit_host, &eb)});
+        try testing.expectEqualStrings(w, out[0..n]);
+
+        const path_opts = [_]Option{ .{ .number = number.uri_host, .value = "h" }, .{ .number = number.uri_path, .value = &v } };
+        n = try uriFromOptions(&path_opts, false, "", &out);
+        w = try std.fmt.bufPrint(&want, "coap://h/{s}", .{expectedEncoding(b, lit_path, &eb)});
+        try testing.expectEqualStrings(w, out[0..n]);
+
+        const query_opts = [_]Option{ .{ .number = number.uri_host, .value = "h" }, .{ .number = number.uri_query, .value = &v } };
+        n = try uriFromOptions(&query_opts, false, "", &out);
+        w = try std.fmt.bufPrint(&want, "coap://h/?{s}", .{expectedEncoding(b, lit_query, &eb)});
+        try testing.expectEqualStrings(w, out[0..n]);
+    }
+}

@@ -437,3 +437,54 @@ test "emptyAck/reset build the right type and code" {
     try testing.expectEqual(coap.Code.empty, r.code);
     try testing.expectEqual(@as(u16, 0x1234), r.message_id);
 }
+
+// ── whole-module mutation (2026-11-17): boundary tests ──────────────────────
+
+test "Retransmit: the initial window saturates, the next window is armed from the poll instant" {
+    const big = Retransmit.init(.{ .ack_timeout_ms = std.math.maxInt(u32), .ack_random_factor_permille = 2000 }, 0, 1000);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), big.timeout_ms);
+
+    var r = Retransmit.init(.{}, 0, 0); // window 2000 ms
+    try testing.expectEqual(Retransmit.Action.waiting, r.poll(1999));
+    // Polled late: the doubled window (4000 ms) starts at the poll instant, not at the old deadline.
+    try testing.expectEqual(Retransmit.Action.retransmit, r.poll(5000));
+    try testing.expectEqual(@as(u64, 9000), r.deadline_ms);
+    try testing.expectEqual(Retransmit.Action.waiting, r.poll(8999));
+    try testing.expectEqual(Retransmit.Action.retransmit, r.poll(9000));
+}
+
+test "Dedup: ties evict the oldest, reclaimed slots are reused, the soonest to expire need not sit in slot 0" {
+    var st: [2]Dedup.Entry = undefined;
+    // Same expiry for all: the first-recorded entry is the one evicted.
+    var dd = Dedup.init(&st, 1000);
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(1, 0));
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(2, 0));
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(3, 0));
+    try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(2, 1));
+    try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(3, 1));
+
+    // An expired entry's slot is reused: no live entry is evicted while there is room.
+    dd = Dedup.init(&st, 100);
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(1, 0)); // expiry 100
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(2, 50)); // expiry 150
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(3, 120)); // 1 expired and reclaimed
+    try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(2, 121));
+    try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(3, 121));
+
+    // The soonest-to-expire entry sits in slot 1 and is the one evicted.
+    dd = Dedup.init(&st, 1000);
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(1, 100)); // expiry 1100
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(2, 0)); // expiry 1000
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(3, 200));
+    try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(1, 300));
+    try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(3, 300));
+
+    // Compaction shortens the table: a live entry followed by an expired one
+    // is not evicted when a new id arrives, the expired slot is reused.
+    dd = Dedup.init(&st, 100);
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(1, 100)); // expiry 200
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(2, 0)); // expiry 100
+    try testing.expectEqual(Dedup.Verdict.fresh, dd.check(3, 150)); // 2 expired, 1 live
+    try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(1, 151));
+    try testing.expectEqual(Dedup.Verdict.duplicate, dd.check(3, 151));
+}
