@@ -36,7 +36,7 @@
 //! so a hostile SNP can neither wedge nor starve the database. See `SPEC.md`.
 //!
 //! ## Receive-side self-defence (ISO/IEC 10589 §7.3.16.1)
-//! IS-IS here is unauthenticated (auth is deferred, `SPEC.md` §8), so the update
+//! Without `Config.auth_keys` IS-IS here is unauthenticated, so the update
 //! process must defend itself against an on-link peer: a copy of **our own** LSP
 //! received from a circuit is never accepted (the owner is told to re-originate
 //! at `InsertResult.self_challenge + 1`), a local origination at
@@ -45,9 +45,11 @@
 //! check out is discarded with `error.CorruptedLsp` before any comparison
 //! (§7.3.14.2 e), the precondition §7.3.16.1(d)'s checksum tie-break assumes —
 //! see `compare.zig`). Purges and locally originated LSPs are exempt, for the
-//! reasons spelled out at `Lsdb.insert`. What remains missing is
-//! **authentication** (RFC 5304/5310, `SPEC.md` §8): the checksum is unkeyed, so
-//! it stops corruption and accidents, not a determined on-link forger.
+//! reasons spelled out at `Lsdb.insert`. The checksum is unkeyed, so it stops
+//! corruption and accidents, not a determined on-link forger; that is what
+//! **authentication** is for (RFC 5304/5310, `Config.auth_keys`, `SPEC.md`
+//! §8a): received LSPs, purges and SNPs verified, purges kept with their #10,
+//! aged-out LSPs purged under our own signature.
 //!
 //! Provenance: clean-room from ISO/IEC 10589 §7.3; the §7.3.16.1 comparison was
 //! cross-checked against FRRouting `isis_lsp.c:lsp_compare` for the (oriented)
@@ -84,6 +86,7 @@ pub const LspId = store.LspId;
 pub const InterfaceSet = store.InterfaceSet;
 pub const InsertResult = store.InsertResult;
 pub const InsertError = store.InsertError;
+pub const SnpError = store.SnpError;
 pub const AgeReport = store.AgeReport;
 pub const EntryView = store.EntryView;
 pub const Ordering = compare.Ordering;
@@ -661,6 +664,7 @@ test {
     _ = @import("goldens.zig");
     _ = @import("bench.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("auth_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

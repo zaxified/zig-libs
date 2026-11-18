@@ -110,7 +110,38 @@ pub const Config = struct {
     /// `tick` drops it (the next CSNP re-creates it if the LSP is still wanted).
     /// Without this a placeholder for an LSP that never arrives is immortal.
     request_timeout: u16 = default_request_timeout,
+    /// LSP and SNP authentication (TLV #10; RFC 5304 / RFC 5310): this
+    /// level's keys — the "Area Authentication string" for a Level 1 database,
+    /// the domain one for Level 2 (RFC 5310 §3.2; one `Lsdb` holds one level).
+    /// Empty (the default): nothing is checked, byte-for-byte the behaviour
+    /// before this field existed. Non-empty:
+    /// - `insert` refuses a **received** LSP (`arrival_iface != null`) without
+    ///   a #10 (`error.AuthMissing`) or one that verifies against none of
+    ///   these keys (`error.AuthFailed`), before anything else; a received
+    ///   purge must also carry only TLVs allowed in a purge (`error.InvalidPurge`,
+    ///   RFC 5304 §2 as updated by RFC 6233). A local origination is not
+    ///   checked (the store is the generator's sink, as for the checksum).
+    /// - a purge is retained WITH its TLVs (it carries the #10 every
+    ///   authenticated peer requires), and a purge this store makes by aging
+    ///   is signed with `auth_keys[0]` (RFC 5304 §2: "MUST remove the body of
+    ///   the LSP and add the authentication TLV").
+    /// - `reconcileCsnpBytes` / `reconcilePsnpBytes` verify an SNP the same
+    ///   way before reconciling it (holo-isis validates every SNP when a key
+    ///   is set). `reconcileCsnp`/`reconcilePsnp` take an already-decoded SNP
+    ///   and check nothing.
+    /// Several keys allow a rollover (each verifies, the first signs).
+    /// Borrowed: the slice and every `secret` must outlive the `Lsdb`, and
+    /// the caller wipes the secrets (`isis.auth.Key`).
+    auth_keys: []const isis.auth.Key = &.{},
 };
+
+/// TLV codes a purge may carry when authentication is in use: Authentication
+/// (#10), Purge Originator Identification (#13, RFC 6232) and Dynamic
+/// Hostname (#137). RFC 5304 §2: "ISes MUST NOT accept purges that contain
+/// TLVs other than the authentication TLV"; RFC 6233 §3 replaces that with
+/// the IANA registry's "Purge" column, which marks exactly these three
+/// (holo-isis `valid_purge_tlvs` accepts the same set).
+pub const purge_allowed_tlvs = [_]u8{ isis.auth.tlv_code, 13, isis.tlvs.code.dynamic_hostname };
 
 pub const InsertError = error{
     /// The store is at `capacity` and this is a new distinct LSP-ID.
@@ -126,7 +157,29 @@ pub const InsertError = error{
     /// returned for a live LSP carrying a zero checksum (RFC 3719 §7). See
     /// `insert`'s "§7.3.14.2 receive validation" note.
     CorruptedLsp,
+    /// `Config.auth_keys` is set and a received LSP carries no Authentication
+    /// TLV (#10). Discarded, store unchanged (RFC 5304 §2: "MUST NOT accept
+    /// unauthenticated purges"; holo-isis `AuthTypeMismatch`).
+    AuthMissing,
+    /// `Config.auth_keys` is set and a received LSP's #10 does not verify:
+    /// wrong digest or password, no key for its type or (RFC 5310) Key ID,
+    /// an unknown authentication type, a malformed #10, or a TLV stream that
+    /// breaks before #10 is found. Discarded, store unchanged (RFC 5304 §2,
+    /// RFC 5310 §3.5).
+    AuthFailed,
+    /// `Config.auth_keys` is set and a received purge carries a TLV outside
+    /// `purge_allowed_tlvs` (RFC 5304 §2 / RFC 6233), or a TLV stream that
+    /// does not walk. Discarded, store unchanged.
+    InvalidPurge,
 } || std.mem.Allocator.Error || isis.pdu.DecodeError;
+
+/// What `reconcileCsnpBytes` / `reconcilePsnpBytes` can refuse.
+pub const SnpError = error{
+    /// See `InsertError.AuthMissing`.
+    AuthMissing,
+    /// See `InsertError.AuthFailed`.
+    AuthFailed,
+} || isis.pdu.DecodeError;
 
 /// The outcome of an `insert`.
 pub const InsertResult = struct {
@@ -189,6 +242,9 @@ pub const EntryView = struct {
     /// is not retained and is therefore not observable by any reader, and not
     /// re-flooded: `isis.Lsp.decode(bytes).tlv_bytes` is empty and
     /// `pdu_length == isis.pdu.lsp_fixed_len`. See `Lsdb.retainHeaderOnly`.
+    /// With `Config.auth_keys` set, a purge keeps its (verified) TLVs — only
+    /// #10, #13 and #137 can be there — and an aged one carries our own
+    /// signed #10 (`Lsdb.retainSignedPurge`).
     bytes: []const u8,
 };
 
@@ -406,12 +462,19 @@ pub const Lsdb = struct {
     /// corruption, not an adversary: an on-link attacker can compute a valid
     /// checksum for forged content as easily as we can. What it removes is the
     /// specific primitive where *arbitrary* checksum bytes at an *equal*
-    /// sequence number sufficed. Authentication (RFC 5304/5310, `SPEC.md` §8)
+    /// sequence number sufficed. Authentication (RFC 5304/5310, `Config.auth_keys`, `SPEC.md` §8a)
     /// remains the only defence against a deliberate on-link forger.
     pub fn insert(self: *Lsdb, bytes: []const u8, arrival_iface: ?u8, now: Time) InsertError!InsertResult {
         const lsp = try isis.Lsp.decode(bytes);
         const id = lsp.lsp_id;
         const is_self = std.mem.eql(u8, id[0..6], &self.cfg.local_system_id);
+
+        // RFC 5304 §2 / RFC 5310 §3.5 — a received LSP that does not verify is
+        // discarded before anything else, purges included.
+        if (arrival_iface != null and self.cfg.auth_keys.len != 0) {
+            try self.authenticate(bytes);
+            if (lsp.remaining_lifetime == 0 and !purgeTlvsAllowed(lsp)) return error.InvalidPurge;
+        }
 
         // §7.3.14.2 e) — before the §7.3.16.1 comparison, before the own-LSP
         // rule, before any mutation.
@@ -515,8 +578,15 @@ pub const Lsdb = struct {
     /// as it arrived: §7.3.16.4's note 36 has the check "succeed even though the
     /// data portion is not present", i.e. the field survives the purge and is
     /// simply not re-verified.
+    ///
+    /// **With `Config.auth_keys` set** a purge is retained whole: an
+    /// authenticated peer refuses a purge without its #10 (RFC 5304 §2), so
+    /// the header alone could not be flooded on. The content-injection hole
+    /// above stays closed because `insert` has then already verified the
+    /// purge's digest and refused any TLV outside `purge_allowed_tlvs`.
     fn dupeRetainedBytes(self: *Lsdb, lsp: isis.Lsp, bytes: []const u8) ![]u8 {
-        if (lsp.remaining_lifetime != 0) return self.alloc.dupe(u8, bytes[0..lsp.pdu_length]);
+        if (lsp.remaining_lifetime != 0 or self.cfg.auth_keys.len != 0)
+            return self.alloc.dupe(u8, bytes[0..lsp.pdu_length]);
         const hdr = try self.alloc.dupe(u8, bytes[0..isis.pdu.lsp_fixed_len]);
         stampPurgeHeader(hdr);
         return hdr;
@@ -728,8 +798,16 @@ pub const Lsdb = struct {
     /// still erased in place and PDU Length still says "header only", so no
     /// reader and no re-flood can observe it — only the allocation stays larger
     /// than it needs to be.
+    ///
+    /// With `Config.auth_keys` set the purge is the header plus an
+    /// Authentication TLV signed with `auth_keys[0]` (`retainSignedPurge`;
+    /// RFC 5304 §2). If that cannot be built (no memory, a cleartext password
+    /// too long for a TLV) it falls back to the header alone, which
+    /// authenticated peers will drop: the LSP then leaves their databases by
+    /// their own aging instead of by this purge.
     fn retainHeaderOnly(self: *Lsdb, e: *Entry) void {
         if (e.bytes.len < isis.pdu.lsp_fixed_len) return; // request placeholder
+        if (self.cfg.auth_keys.len != 0 and self.retainSignedPurge(e)) return;
         if (e.bytes.len > isis.pdu.lsp_fixed_len) {
             if (self.alloc.realloc(e.bytes, isis.pdu.lsp_fixed_len)) |shrunk| {
                 e.bytes = shrunk;
@@ -738,6 +816,41 @@ pub const Lsdb = struct {
             }
         }
         stampPurgeHeader(e.bytes);
+    }
+
+    /// The aging purge with authentication: the 27-octet header (Remaining
+    /// Lifetime 0, PDU Length covering the new TLV) and one #10 signed with
+    /// `auth_keys[0]`. The Checksum field is put back as it was after
+    /// signing, like the header-only purge keeps it (§7.3.16.4 note 36); the
+    /// digest does not cover it (RFC 5304 §2). Returns false, leaving `e`
+    /// untouched, when the TLV does not fit or the allocation fails.
+    fn retainSignedPurge(self: *Lsdb, e: *Entry) bool {
+        const key = self.cfg.auth_keys[0];
+        const hl = isis.pdu.lsp_fixed_len;
+        var tmp: [hl + 2 + isis.tlv.max_value_len]u8 = undefined;
+        @memcpy(tmp[0..hl], e.bytes[0..hl]);
+        const carried = tmp[isis.pdu.lsp_checksum_off..][0..2].*;
+        stampPurgeHeader(tmp[0..hl]);
+        var tb = isis.tlv.Builder.init(tmp[hl..]);
+        isis.auth.addPlaceholder(&tb, key) catch return false;
+        const n = hl + tb.pos;
+        std.mem.writeInt(u16, tmp[8..10], @intCast(n), .big);
+        isis.auth.sign(tmp[0..n], key) catch return false;
+        tmp[isis.pdu.lsp_checksum_off..][0..2].* = carried;
+        const resized = self.alloc.realloc(e.bytes, n) catch return false;
+        @memcpy(resized, tmp[0..n]);
+        e.bytes = resized;
+        return true;
+    }
+
+    /// `isis.auth.verify` against `Config.auth_keys`, folded to the two
+    /// outcomes a caller acts on. Every refusal except a missing #10 is
+    /// `AuthFailed`, including a TLV stream that breaks before #10 is found.
+    fn authenticate(self: *const Lsdb, bytes: []const u8) error{ AuthMissing, AuthFailed }!void {
+        _ = isis.auth.verify(bytes, self.cfg.auth_keys) catch |e| switch (e) {
+            error.AuthMissing => return error.AuthMissing,
+            else => return error.AuthFailed,
+        };
     }
 
     // ── flooding-flag queries (the flooding layer's read/clear surface) ─────
@@ -976,6 +1089,24 @@ pub const Lsdb = struct {
         _ = self.reconcileEntriesMarking(psnp.tlv_bytes, iface, now);
     }
 
+    /// Decode a received PSNP, verify its authentication when
+    /// `Config.auth_keys` is set (RFC 5304 §2 / RFC 5310 §3.5), then
+    /// `reconcilePsnp`. A refused SNP changes nothing.
+    pub fn reconcilePsnpBytes(self: *Lsdb, bytes: []const u8, iface: u8, now: Time) SnpError!void {
+        const psnp = try isis.Psnp.decode(bytes);
+        if (self.cfg.auth_keys.len != 0) try self.authenticate(bytes);
+        self.reconcilePsnp(psnp, iface, now);
+    }
+
+    /// Decode a received CSNP, verify its authentication when
+    /// `Config.auth_keys` is set, then `reconcileCsnp`. A refused SNP changes
+    /// nothing (no request placeholder, no completeness re-flood).
+    pub fn reconcileCsnpBytes(self: *Lsdb, bytes: []const u8, iface: u8, now: Time) SnpError!void {
+        const csnp = try isis.Csnp.decode(bytes);
+        if (self.cfg.auth_keys.len != 0) try self.authenticate(bytes);
+        self.reconcileCsnp(csnp, iface, now);
+    }
+
     /// Reconcile a received **CSNP** on `iface`. A CSNP is a *complete* summary
     /// of the inclusive range `[start_lsp_id, end_lsp_id]`, so beyond the
     /// per-entry matrix it also drives **completeness**: any LSP we hold in that
@@ -1130,6 +1261,16 @@ fn stampPurgeHeader(hdr: []u8) void {
     std.debug.assert(hdr.len >= isis.pdu.lsp_fixed_len);
     std.mem.writeInt(u16, hdr[8..10], @intCast(isis.pdu.lsp_fixed_len), .big);
     std.mem.writeInt(u16, hdr[10..12], 0, .big);
+}
+
+/// Every TLV of a purge is one `purge_allowed_tlvs` names, and the stream
+/// walks to its end.
+fn purgeTlvsAllowed(lsp: isis.Lsp) bool {
+    var it = lsp.tlvIterator();
+    while (true) {
+        const t = (it.next() catch return false) orelse return true;
+        if (std.mem.indexOfScalar(u8, &purge_allowed_tlvs, t.code) == null) return false;
+    }
 }
 
 /// Inclusive byte-wise (lexicographic) LSP-ID range test — the ordering a CSNP's

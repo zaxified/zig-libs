@@ -12,8 +12,9 @@ the `isis` codec), and reads/clears the flags to drive flooding.
 Status: **gap** — first increment. Implements the store + the ISO §7.3.16.1
 comparison + time-injected aging/purge + the SRM/SSN flag matrix + CSNP/PSNP
 reconcile. The flooding transmit loop (the SRM consumer) lives in the sibling
-`isis-flood`, SPF in `isis-spf`; generating our own LSP (fragmentation),
-authentication, and MT/multi-level are deliberately deferred — see `SPEC.md`.
+`isis-flood`, SPF in `isis-spf`; generating our own LSP (fragmentation) and
+MT/multi-level are deliberately deferred — see `SPEC.md`. LSP/SNP
+authentication (RFC 5304/5310) is in: see below.
 
 Model after: **ISO/IEC 10589 §7.3** (the update process). The §7.3.16.1 newer
 comparison was cross-checked against FRRouting `isis_lsp.c:lsp_compare` for the
@@ -78,7 +79,7 @@ it with a higher sequence number.
 
 ## Receive-side self-defence (ISO §7.3.16.1)
 
-IS-IS as built here is unauthenticated (auth is deferred, `SPEC.md` §8), so the
+Without `Config.auth_keys` IS-IS as built here is unauthenticated, so the
 update process defends itself against an on-link peer:
 
 - **Own LSPs are never accepted from the wire.** A copy of an LSP whose LSP-ID
@@ -101,10 +102,15 @@ update process defends itself against an on-link peer:
   arbitrary bytes at an equal sequence number. Purges (§7.3.16.4 note 36) and
   locally originated LSPs are exempt; see `SPEC.md` §8 for why each has to be.
 
-Still open: **authentication** (RFC 5304/5310). The Fletcher checksum is unkeyed,
-so it catches corruption, not a deliberate on-link forger — one who computes a
-valid checksum for forged content is still only bounded by the sequence-number
-and own-LSP rules above. See `SPEC.md` §8.
+The Fletcher checksum is unkeyed, so it catches corruption, not a deliberate
+on-link forger. **Authentication** (RFC 5304 HMAC-MD5, RFC 5310 HMAC-SHA,
+cleartext) does: set `Config.auth_keys` and `insert` refuses a received LSP
+without a verifying #10 (`error.AuthMissing` / `error.AuthFailed`) and a purge
+carrying anything but #10/#13/#137 (`error.InvalidPurge`); verified purges are
+kept whole so they can be flooded on, an LSP aged out here becomes a purge
+signed with `auth_keys[0]`, and `reconcileCsnpBytes`/`reconcilePsnpBytes`
+verify SNPs before reconciling. Empty keys (the default) change nothing. See
+`SPEC.md` §8a.
 
 ## Capacity / DoS bound
 
