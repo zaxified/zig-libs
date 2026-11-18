@@ -2411,3 +2411,150 @@ test "invoice_error: encode refuses what decode would refuse" {
     try testing.expectError(error.BadErrorUtf8, encodeInvoiceError(allocator, .{ .erroneous_field = null, .suggested_value = null, .error_message = @constCast("\xff") }));
     try testing.expectError(error.SuggestedValueWithoutField, encodeInvoiceError(allocator, .{ .erroneous_field = null, .suggested_value = @constCast("v"), .error_message = @constCast("e") }));
 }
+
+// ── whole-module mutation (2026-11-17): TLV-level boundary tests ────────────
+
+/// One TLV record with a one-byte type and a one-byte length (types < 253, values < 253 bytes).
+fn mtlv(list: *std.ArrayList(u8), a: Allocator, t: u8, v: []const u8) !void {
+    try list.append(a, t);
+    try list.append(a, @intCast(v.len));
+    try list.appendSlice(a, v);
+}
+
+fn tlvString(a: Allocator, hrp: []const u8, stream: []const u8, extra_zero_quintets: usize) ![]u8 {
+    const q = try bitpack.bytesToQuintets(a, stream);
+    defer a.free(q);
+    var all: std.ArrayList(u5) = .empty;
+    defer all.deinit(a);
+    try all.appendSlice(a, q);
+    for (0..extra_zero_quintets) |_| try all.append(a, 0);
+    return bech32raw.encodeNoChecksum(a, hrp, all.items);
+}
+
+test "mutation: offer_chains must be a whole number of 32-byte hashes (33 bytes is refused)" {
+    const a = testing.allocator;
+    var st: std.ArrayList(u8) = .empty;
+    defer st.deinit(a);
+    const c33: [33]u8 = @splat(7);
+    try mtlv(&st, a, TYPE_CHAINS, &c33);
+    const s = try tlvString(a, "lno", st.items, 0);
+    defer a.free(s);
+    try testing.expectError(error.BadChainsLength, decodeOffer(a, s));
+
+    st.clearRetainingCapacity();
+    const c64: [64]u8 = @splat(7);
+    try mtlv(&st, a, TYPE_CHAINS, &c64);
+    const s2 = try tlvString(a, "lno", st.items, 0);
+    defer a.free(s2);
+    var offer = try decodeOffer(a, s2);
+    defer offer.deinit(a);
+    try testing.expectEqual(@as(usize, 2), offer.chains.len);
+}
+
+test "mutation: each malformed truncated integer in an offer has its own error" {
+    const a = testing.allocator;
+    const nine: [9]u8 = @splat(1);
+    const Case = struct { t: u64, err: anyerror };
+    for ([_]Case{
+        .{ .t = TYPE_AMOUNT, .err = error.BadAmount },
+        .{ .t = TYPE_ABSOLUTE_EXPIRY, .err = error.BadAbsoluteExpiry },
+        .{ .t = TYPE_QUANTITY_MAX, .err = error.BadQuantityMax },
+    }) |c| {
+        var st: std.ArrayList(u8) = .empty;
+        defer st.deinit(a);
+        try mtlv(&st, a, @intCast(c.t), &nine);
+        const s = try tlvString(a, "lno", st.items, 0);
+        defer a.free(s);
+        try testing.expectError(c.err, decodeOffer(a, s));
+    }
+}
+
+test "mutation: a duplicated known offer type is a stream error, never a silent last-wins" {
+    const a = testing.allocator;
+    var st: std.ArrayList(u8) = .empty;
+    defer st.deinit(a);
+    try mtlv(&st, a, TYPE_METADATA, "one");
+    try mtlv(&st, a, TYPE_METADATA, "two");
+    const s = try tlvString(a, "lno", st.items, 0);
+    defer a.free(s);
+    try testing.expectError(error.NotStrictlyIncreasing, decodeOffer(a, s));
+}
+
+test "mutation: merkleRoot refuses a record that claims one byte more than the stream holds" {
+    const a = testing.allocator;
+    try testing.expectError(error.Truncated, merkleRoot(a, &.{ 0x02, 0x02, 0xaa }));
+    try testing.expectError(error.Truncated, merkleRoot(a, &.{ 0x02, 0x05, 0xaa }));
+    try testing.expectError(error.EmptyMerkleStream, merkleRoot(a, &.{ 0xf0, 0x01, 0xaa })); // only a signature record
+}
+
+test "mutation: verifyMerkle reports a non-curve key as an error and a malformed signature as false" {
+    const a = testing.allocator;
+    const stream = [_]u8{ 0x02, 0x01, 0xaa };
+    const g_x = hexToBytes(32, "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+    const bad_sig: [64]u8 = @splat(0xff);
+    try testing.expectError(error.InvalidPublicKey, verifyMerkle(a, &stream, invoice_sig_tag, @as([32]u8, @splat(0xff)), bad_sig));
+    try testing.expect(!(try verifyMerkle(a, &stream, invoice_sig_tag, g_x, bad_sig)));
+}
+
+test "mutation: invoice_request and invoice strings reject 5+ bits of bech32 padding, like offers" {
+    const a = testing.allocator;
+    var st: std.ArrayList(u8) = .empty;
+    defer st.deinit(a);
+    try mtlv(&st, a, IREQ_METADATA, "m");
+    const lnr = try tlvString(a, "lnr", st.items, 1);
+    defer a.free(lnr);
+    try testing.expectError(error.PaddingTooLong, decodeInvoiceRequest(a, lnr));
+
+    st.clearRetainingCapacity();
+    try mtlv(&st, a, INVOICE_CREATED_AT, &.{1});
+    const lni = try tlvString(a, "lni", st.items, 1);
+    defer a.free(lni);
+    try testing.expectError(error.PaddingTooLong, decodeInvoice(a, lni));
+}
+
+test "mutation: invoice fixed-width fields are refused when one byte short or long" {
+    const a = testing.allocator;
+    const Case = struct { t: u8, len: usize, err: anyerror };
+    for ([_]Case{
+        .{ .t = INVOICE_PAYMENT_HASH, .len = 31, .err = error.BadPaymentHashLength },
+        .{ .t = INVOICE_PAYMENT_HASH, .len = 33, .err = error.BadPaymentHashLength },
+        .{ .t = INVOICE_NODE_ID, .len = 32, .err = error.BadNodeIdLength },
+        .{ .t = INVOICE_NODE_ID, .len = 34, .err = error.BadNodeIdLength },
+        .{ .t = SIGNATURE, .len = 63, .err = error.BadSignatureLength },
+        .{ .t = SIGNATURE, .len = 65, .err = error.BadSignatureLength },
+    }) |c| {
+        var st: std.ArrayList(u8) = .empty;
+        defer st.deinit(a);
+        var v: [65]u8 = @splat(3);
+        try mtlv(&st, a, c.t, v[0..c.len]);
+        const s = try tlvString(a, "lni", st.items, 0);
+        defer a.free(s);
+        try testing.expectError(c.err, decodeInvoice(a, s));
+    }
+}
+
+test "mutation: Invoice.verify names the missing piece" {
+    const a = testing.allocator;
+    var raw: [0]u8 = undefined;
+    const none: Invoice = .{ .raw = &raw, .invoice_created_at = null, .invoice_relative_expiry = null, .invoice_payment_hash = null, .invoice_amount = null, .invoice_node_id = null, .signature = null };
+    try testing.expectError(error.MissingSignature, none.verify(a));
+    var with_sig = none;
+    with_sig.signature = @splat(0);
+    try testing.expectError(error.MissingNodeId, with_sig.verify(a));
+}
+
+test "mutation: a request carrying invreq_chain (type 80) and no offer field is a refund" {
+    const a = testing.allocator;
+    var st: std.ArrayList(u8) = .empty;
+    defer st.deinit(a);
+    const chain: [32]u8 = @splat(1);
+    const payer: [33]u8 = @splat(2);
+    try mtlv(&st, a, IREQ_METADATA, "m");
+    try mtlv(&st, a, INVREQ_CHAIN, &chain);
+    try mtlv(&st, a, INVREQ_PAYER_ID, &payer);
+    const s = try tlvString(a, "lnr", st.items, 0);
+    defer a.free(s);
+    var ir = try decodeInvoiceRequest(a, s);
+    defer ir.deinit(a);
+    try testing.expect(try invoiceRequestIsRefund(a, ir));
+}

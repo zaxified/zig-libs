@@ -436,3 +436,42 @@ test "quintetsToUint / uintToQuintets: timestamp round-trip + minimal encoding" 
     var buf2: [13]u5 = undefined;
     try testing.expectEqual(@as(usize, 0), uintToQuintets(0, &buf2).len);
 }
+
+// ── whole-module mutation (2026-11-17): boundary tests ──────────────────────
+
+test "mutation: strict decode checks a single leftover padding bit" {
+    const a = testing.allocator;
+    // 5 quintets = 25 bits = 3 bytes + 1 bit.
+    try testing.expectError(error.NonZeroPadding, quintetsToBytesStrict(a, &.{ 0, 0, 0, 0, 1 }));
+    const ok = try quintetsToBytesStrict(a, &.{ 0, 0, 0, 0, 0 });
+    defer a.free(ok);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, ok);
+}
+
+test "mutation: the 9 field's top quintet may reach past the vector (bit index beyond the last byte reads 0)" {
+    const a = testing.allocator;
+    // bit 7 set: highest bit 7 -> 2 quintets, covering bits 9..0.
+    const q = try featureBytesToQuintets(a, &.{0x80});
+    defer a.free(q);
+    try testing.expectEqualSlices(u5, &.{ 4, 0 }, q);
+}
+
+test "mutation: the 9 field decodes into exactly ceil(bits/8) bytes" {
+    const a = testing.allocator;
+    const five = try quintetsToFeatureBytes(a, &.{ 0, 0, 0, 0, 1 }); // 25 bits -> 4 bytes
+    defer a.free(five);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1 }, five);
+    const eight = try quintetsToFeatureBytes(a, &.{ 0, 0, 0, 0, 0, 0, 0, 1 }); // 40 bits -> 5 bytes
+    defer a.free(eight);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 1 }, eight);
+}
+
+test "mutation: a base-32 integer takes at most 13 digits, and the 13th may lead with 0x0F but not 0x10" {
+    var thirteen: [13]u5 = @splat(0);
+    thirteen[0] = 0x0f;
+    try testing.expectEqual(@as(u64, 0x0f) << 60, try quintetsToUint(&thirteen));
+    thirteen[0] = 0x10;
+    try testing.expectError(error.IntegerTooLarge, quintetsToUint(&thirteen));
+    const fourteen: [14]u5 = @splat(0);
+    try testing.expectError(error.TooManyQuintets, quintetsToUint(&fourteen));
+}

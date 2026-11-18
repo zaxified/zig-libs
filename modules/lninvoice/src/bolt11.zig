@@ -1684,3 +1684,422 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-17): crafted invoices and boundaries ─────
+
+fn tfq(a: Allocator, list: *std.ArrayList(u5), tag: u5, value: []const u5) !void {
+    try list.append(a, tag);
+    try list.append(a, @intCast((value.len >> 5) & 0x1f));
+    try list.append(a, @intCast(value.len & 0x1f));
+    try list.appendSlice(a, value);
+}
+
+fn tfb(a: Allocator, list: *std.ArrayList(u5), tag: u5, bytes: []const u8) !void {
+    const q = try bitpack.bytesToQuintets(a, bytes);
+    defer a.free(q);
+    try tfq(a, list, tag, q);
+}
+
+fn tfu(a: Allocator, list: *std.ArrayList(u5), tag: u5, v: u64) !void {
+    var buf: [13]u5 = undefined;
+    try tfq(a, list, tag, bitpack.uintToQuintets(v, &buf));
+}
+
+const ts7 = [7]u5{ 0, 0, 0, 0, 0, 0, 1 };
+
+/// `body` (timestamp + tagged fields) signed with the spec key, wrapped as a bech32 invoice.
+fn rawInvoiceSig(a: Allocator, hrp: []const u8, body: []const u5, r: [32]u8, s: [32]u8, recid: u8) ![]u8 {
+    var sb: [65]u8 = undefined;
+    sb[0..32].* = r;
+    sb[32..64].* = s;
+    sb[64] = recid;
+    const sq = try bitpack.bytesToQuintets(a, &sb);
+    defer a.free(sq);
+    var all: std.ArrayList(u5) = .empty;
+    defer all.deinit(a);
+    try all.appendSlice(a, body);
+    try all.appendSlice(a, sq);
+    return bech32raw.encode(a, hrp, all.items);
+}
+
+fn rawInvoice(a: Allocator, hrp: []const u8, body: []const u5) ![]u8 {
+    const data_bytes = try bitpack.quintetsToBytesPadded(a, body);
+    defer a.free(data_bytes);
+    const preimage = try std.mem.concat(a, u8, &.{ hrp, data_bytes });
+    defer a.free(preimage);
+    var hash: [32]u8 = undefined;
+    Sha256.hash(preimage, &hash, .{});
+    const sig = try ecdsa.sign(&spec_privkey, hash);
+    return rawInvoiceSig(a, hrp, body, sig.r, sig.s, sig.recid);
+}
+
+const fx_hash_a: [32]u8 = @splat(0xa1);
+const fx_hash_b: [32]u8 = @splat(0xb2);
+const fx_secret_a: [32]u8 = @splat(0xc3);
+const fx_secret_b: [32]u8 = @splat(0xd4);
+
+/// timestamp + p + s + `d "x"`: the smallest body `decode` accepts.
+fn minimalBody(a: Allocator, body: *std.ArrayList(u5)) !void {
+    try body.appendSlice(a, &ts7);
+    try tfb(a, body, TAG_PAYMENT_HASH, &fx_hash_a);
+    try tfb(a, body, TAG_PAYMENT_SECRET, &fx_secret_a);
+    try tfb(a, body, TAG_DESCRIPTION, "x");
+}
+
+test "mutation: HRP amount grammar at its edges" {
+    try testing.expectError(error.InvalidAmountDigits, parseAmountMsat("m"));
+    try testing.expectError(error.AmountLeadingZero, parseAmountMsat("01"));
+    try testing.expectEqual(@as(?u64, 0), try parseAmountMsat("0"));
+    // 20 digits is the widest accepted run: 10^19 pico-bitcoin = 10^18 msat.
+    try testing.expectEqual(@as(?u64, 1_000_000_000_000_000_000), try parseAmountMsat("10000000000000000000p"));
+    // 21 characters of digits+junk: refused as too large before the digit scan.
+    try testing.expectError(error.AmountTooLarge, parseAmountMsat("12345678901234567890x"));
+    try testing.expectError(error.InvalidAmountDigits, parseAmountMsat("1:"));
+    try testing.expectError(error.SubMilliSatoshiPrecision, parseAmountMsat("5p"));
+    try testing.expectEqual(@as(?u64, 1), try parseAmountMsat("10p"));
+    try testing.expectEqual(@as(?u64, 2), try parseAmountMsat("20p"));
+    // u64 range edge: 184467440737095516 n = 18446744073709551600 msat fits, ...517 does not.
+    try testing.expectEqual(@as(?u64, 18446744073709551600), try parseAmountMsat("184467440737095516n"));
+    try testing.expectError(error.AmountTooLarge, parseAmountMsat("184467440737095517n"));
+}
+
+test "mutation: every network writes its own prefix; each decodes back to itself" {
+    const a = testing.allocator;
+    const fields = [_]TaggedFieldOut{
+        .{ .payment_hash = fx_hash_a },
+        .{ .payment_secret = fx_secret_a },
+        .{ .description = "x" },
+    };
+    const Case = struct { n: Network, prefix: []const u8 };
+    for ([_]Case{
+        .{ .n = .mainnet, .prefix = "lnbc1" },
+        .{ .n = .testnet, .prefix = "lntb1" },
+        .{ .n = .signet, .prefix = "lntbs1" },
+        .{ .n = .regtest, .prefix = "lnbcrt1" },
+    }) |c| {
+        const s = try encode(a, .{ .network = c.n, .timestamp = 1, .fields = &fields }, .{ .private_key = &spec_privkey });
+        defer a.free(s);
+        try testing.expect(std.mem.startsWith(u8, s, c.prefix));
+        var inv = try decode(a, s);
+        defer inv.deinit(a);
+        try testing.expectEqual(c.n, inv.network);
+    }
+}
+
+test "mutation: data-part length edges and a bare 'ln' prefix" {
+    const a = testing.allocator;
+    const z111: [111]u5 = @splat(0);
+    const z110: [110]u5 = @splat(0);
+    const s111 = try bech32raw.encode(a, "lnbc", &z111);
+    defer a.free(s111);
+    try testing.expectError(error.MissingPaymentHash, decode(a, s111));
+    const s110 = try bech32raw.encode(a, "lnbc", &z110);
+    defer a.free(s110);
+    try testing.expectError(error.InvoiceTooShort, decode(a, s110));
+    const sln = try bech32raw.encode(a, "ln", &z111);
+    defer a.free(sln);
+    try testing.expectError(error.UnknownNetwork, decode(a, sln));
+    const sl = try bech32raw.encode(a, "l", &z111);
+    defer a.free(sl);
+    try testing.expectError(error.UnknownPrefix, decode(a, sl));
+}
+
+test "mutation: a tagged-field header needs exactly 3 quintets before the signature; 1 or 2 stray ones are truncation" {
+    const a = testing.allocator;
+    var body: std.ArrayList(u5) = .empty;
+    defer body.deinit(a);
+    try minimalBody(a, &body);
+    const base = body.items.len;
+
+    // A zero-length `d` right before the signature is a complete (empty) field.
+    try tfq(a, &body, TAG_DESCRIPTION, &.{});
+    const s0 = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(s0);
+    var inv = try decode(a, s0);
+    inv.deinit(a);
+
+    for ([_][]const u5{ &.{0}, &.{ 0, 0 } }) |stray| {
+        body.shrinkRetainingCapacity(base);
+        try body.appendSlice(a, stray);
+        const s = try rawInvoice(a, "lnbc", body.items);
+        defer a.free(s);
+        try testing.expectError(error.TruncatedTaggedField, decode(a, s));
+    }
+}
+
+test "mutation: p, s, h, n take the first correctly sized occurrence, a wrong size is skipped" {
+    const a = testing.allocator;
+    const z54: [54]u5 = @splat(0);
+    const z53: [53]u5 = @splat(0);
+    const z52: [52]u5 = @splat(0);
+    const z51: [51]u5 = @splat(0);
+    const other_node: [33]u8 = @splat(0x02);
+    var body: std.ArrayList(u5) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, &ts7);
+    for ([_]struct { tag: u5, one: *const [32]u8, two: *const [32]u8 }{
+        .{ .tag = TAG_PAYMENT_HASH, .one = &fx_hash_a, .two = &fx_hash_b },
+        .{ .tag = TAG_PAYMENT_SECRET, .one = &fx_secret_a, .two = &fx_secret_b },
+        .{ .tag = TAG_DESCRIPTION_HASH, .one = &fx_hash_b, .two = &fx_hash_a },
+    }) |f| {
+        try tfq(a, &body, f.tag, &z53);
+        try tfq(a, &body, f.tag, &z51);
+        try tfb(a, &body, f.tag, f.one);
+        try tfb(a, &body, f.tag, f.two);
+    }
+    try tfq(a, &body, TAG_NODE_ID, &z54);
+    try tfq(a, &body, TAG_NODE_ID, &z52);
+    try tfb(a, &body, TAG_NODE_ID, &spec_node_id);
+    try tfb(a, &body, TAG_NODE_ID, &other_node);
+    const s = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(s);
+    var inv = try decode(a, s);
+    defer inv.deinit(a);
+    try testing.expectEqualSlices(u8, &fx_hash_a, &inv.payment_hash);
+    try testing.expectEqualSlices(u8, &fx_secret_a, &inv.payment_secret);
+    try testing.expectEqualSlices(u8, &fx_hash_b, &inv.description_hash.?);
+    try testing.expectEqualSlices(u8, &spec_node_id, &inv.node_id_field.?);
+    try testing.expectEqual(VerificationSource.declared_node_id, inv.verification);
+}
+
+test "mutation: d, m, x, c, 9 take the first occurrence" {
+    const a = testing.allocator;
+    var body: std.ArrayList(u5) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, &ts7);
+    try tfb(a, &body, TAG_PAYMENT_HASH, &fx_hash_a);
+    try tfb(a, &body, TAG_PAYMENT_SECRET, &fx_secret_a);
+    try tfb(a, &body, TAG_DESCRIPTION, "first");
+    try tfb(a, &body, TAG_DESCRIPTION, "second");
+    try tfb(a, &body, TAG_METADATA, "m1");
+    try tfb(a, &body, TAG_METADATA, "m2");
+    try tfu(a, &body, TAG_EXPIRY, 5);
+    try tfu(a, &body, TAG_EXPIRY, 7);
+    try tfu(a, &body, TAG_MIN_FINAL_CLTV, 9);
+    try tfu(a, &body, TAG_MIN_FINAL_CLTV, 12);
+    try tfq(a, &body, TAG_FEATURES, &.{ 0, 0, 1 });
+    try tfq(a, &body, TAG_FEATURES, &.{ 1, 0, 0, 0 });
+    const s = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(s);
+    var inv = try decode(a, s);
+    defer inv.deinit(a);
+    try testing.expectEqualStrings("first", inv.description.?);
+    try testing.expectEqualStrings("m1", inv.metadata.?);
+    try testing.expectEqual(@as(u64, 5), inv.expiry_seconds);
+    try testing.expectEqual(@as(u64, 9), inv.min_final_cltv_expiry);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, inv.features.?);
+}
+
+test "mutation: defaults and the optional fields an invoice carries through decode" {
+    const a = testing.allocator;
+    var body: std.ArrayList(u5) = .empty;
+    defer body.deinit(a);
+    try minimalBody(a, &body);
+    const s = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(s);
+    var inv = try decode(a, s);
+    defer inv.deinit(a);
+    try testing.expectEqual(@as(u64, 3600), inv.expiry_seconds);
+    try testing.expectEqual(@as(u64, 18), inv.min_final_cltv_expiry);
+    try testing.expect(inv.features == null and inv.metadata == null and inv.node_id_field == null);
+    try testing.expectEqual(VerificationSource.recovered, inv.verification);
+
+    try tfb(a, &body, TAG_METADATA, "meta");
+    try tfb(a, &body, TAG_NODE_ID, &spec_node_id);
+    const s2 = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(s2);
+    var inv2 = try decode(a, s2);
+    defer inv2.deinit(a);
+    try testing.expectEqualStrings("meta", inv2.metadata.?);
+    try testing.expectEqualSlices(u8, &spec_node_id, &inv2.node_id_field.?);
+    try testing.expectEqualSlices(u8, &spec_node_id, &inv2.verified_pubkey);
+}
+
+test "mutation: required fields and the d/h exclusivity" {
+    const a = testing.allocator;
+    var body: std.ArrayList(u5) = .empty;
+    defer body.deinit(a);
+
+    try body.appendSlice(a, &ts7);
+    try tfb(a, &body, TAG_PAYMENT_SECRET, &fx_secret_a);
+    try tfb(a, &body, TAG_DESCRIPTION, "x");
+    const no_p = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(no_p);
+    try testing.expectError(error.MissingPaymentHash, decode(a, no_p));
+
+    body.clearRetainingCapacity();
+    try body.appendSlice(a, &ts7);
+    try tfb(a, &body, TAG_PAYMENT_HASH, &fx_hash_a);
+    try tfb(a, &body, TAG_DESCRIPTION, "x");
+    const no_s = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(no_s);
+    try testing.expectError(error.MissingPaymentSecret, decode(a, no_s));
+
+    body.clearRetainingCapacity();
+    try body.appendSlice(a, &ts7);
+    try tfb(a, &body, TAG_PAYMENT_HASH, &fx_hash_a);
+    try tfb(a, &body, TAG_PAYMENT_SECRET, &fx_secret_a);
+    const no_d = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(no_d);
+    try testing.expectError(error.MissingDescription, decode(a, no_d));
+
+    try tfb(a, &body, TAG_DESCRIPTION, "x");
+    try tfb(a, &body, TAG_DESCRIPTION_HASH, &fx_hash_b);
+    const both = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(both);
+    try testing.expectError(error.AmbiguousDescription, decode(a, both));
+}
+
+test "mutation: fallback and routing-hint fields decode field by field" {
+    const a = testing.allocator;
+    var body: std.ArrayList(u5) = .empty;
+    defer body.deinit(a);
+    try minimalBody(a, &body);
+    const base = body.items.len;
+
+    // f: version 17 + a 20-byte program.
+    const prog: [20]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
+    const pq = try bitpack.bytesToQuintets(a, &prog);
+    defer a.free(pq);
+    var fv: std.ArrayList(u5) = .empty;
+    defer fv.deinit(a);
+    try fv.append(a, 17);
+    try fv.appendSlice(a, pq);
+    try tfq(a, &body, TAG_FALLBACK, fv.items);
+
+    // r: two hops with every field distinct, serialized here independently of the module.
+    var hops_bytes: [102]u8 = undefined;
+    for (0..2) |h| {
+        const o = h * 51;
+        hops_bytes[o] = 2 + @as(u8, @intCast(h));
+        for (1..33) |i| hops_bytes[o + i] = @intCast(10 * (h + 1) + i);
+        std.mem.writeInt(u64, hops_bytes[o + 33 ..][0..8], @as(u64, 0x0102030405060708) + h, .big);
+        std.mem.writeInt(u32, hops_bytes[o + 41 ..][0..4], @as(u32, 0x090a0b0c) + @as(u32, @intCast(h)), .big);
+        std.mem.writeInt(u32, hops_bytes[o + 45 ..][0..4], @as(u32, 0x0d0e0f10) + @as(u32, @intCast(h)), .big);
+        std.mem.writeInt(u16, hops_bytes[o + 49 ..][0..2], @as(u16, 0x1112) + @as(u16, @intCast(h)), .big);
+    }
+    try tfb(a, &body, TAG_ROUTING_INFO, &hops_bytes);
+    const s = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(s);
+    var inv = try decode(a, s);
+    defer inv.deinit(a);
+    try testing.expectEqual(@as(usize, 1), inv.fallbacks.len);
+    try testing.expectEqual(@as(u5, 17), inv.fallbacks[0].version);
+    try testing.expectEqualSlices(u8, &prog, inv.fallbacks[0].program);
+    try testing.expectEqual(@as(usize, 1), inv.route_hints.len);
+    try testing.expectEqual(@as(usize, 2), inv.route_hints[0].hops.len);
+    for (inv.route_hints[0].hops, 0..) |hop, h| {
+        const o = h * 51;
+        try testing.expectEqualSlices(u8, hops_bytes[o..][0..33], &hop.pubkey);
+        try testing.expectEqual(@as(u64, 0x0102030405060708) + @as(u64, @intCast(h)), hop.short_channel_id);
+        try testing.expectEqual(@as(u32, 0x090a0b0c) + @as(u32, @intCast(h)), hop.fee_base_msat);
+        try testing.expectEqual(@as(u32, 0x0d0e0f10) + @as(u32, @intCast(h)), hop.fee_proportional_millionths);
+        try testing.expectEqual(@as(u16, 0x1112) + @as(u16, @intCast(h)), hop.cltv_expiry_delta);
+    }
+
+    // An empty `f`, an empty `r` and an `r` that is not a multiple of 51 bytes are refused.
+    body.shrinkRetainingCapacity(base);
+    try tfq(a, &body, TAG_FALLBACK, &.{});
+    const f0 = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(f0);
+    try testing.expectError(error.WrongFixedFieldLength, decode(a, f0));
+    body.shrinkRetainingCapacity(base);
+    try tfq(a, &body, TAG_ROUTING_INFO, &.{});
+    const r0 = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(r0);
+    try testing.expectError(error.BadRouteHintLength, decode(a, r0));
+    body.shrinkRetainingCapacity(base);
+    try tfb(a, &body, TAG_ROUTING_INFO, hops_bytes[0..52]);
+    const r52 = try rawInvoice(a, "lnbc", body.items);
+    defer a.free(r52);
+    try testing.expectError(error.BadRouteHintLength, decode(a, r52));
+}
+
+test "mutation: recovery id 3 is not the 'out of range' error" {
+    const a = testing.allocator;
+    var body: std.ArrayList(u5) = .empty;
+    defer body.deinit(a);
+    try minimalBody(a, &body);
+    const data_bytes = try bitpack.quintetsToBytesPadded(a, body.items);
+    defer a.free(data_bytes);
+    const preimage = try std.mem.concat(a, u8, &.{ "lnbc", data_bytes });
+    defer a.free(preimage);
+    var hash: [32]u8 = undefined;
+    Sha256.hash(preimage, &hash, .{});
+    const sig = try ecdsa.sign(&spec_privkey, hash);
+    const s = try rawInvoiceSig(a, "lnbc", body.items, sig.r, sig.s, 3);
+    defer a.free(s);
+    var res = decode(a, s) catch |e| {
+        try testing.expect(e != error.InvalidRecoveryId);
+        return;
+    };
+    res.deinit(a);
+}
+
+test "mutation: encode round-trips description_hash, metadata, fallback, an asymmetric route hint; all-zero features are omitted" {
+    const a = testing.allocator;
+    var pk: [33]u8 = undefined;
+    pk[0] = 2;
+    for (1..33) |i| pk[i] = @intCast(i);
+    const hop: RouteHop = .{
+        .pubkey = pk,
+        .short_channel_id = 0x0102030405060708,
+        .fee_base_msat = 0x090a0b0c,
+        .fee_proportional_millionths = 0x0d0e0f10,
+        .cltv_expiry_delta = 0x1112,
+    };
+    const hops = [_]RouteHop{hop};
+    const prog: [20]u8 = .{ 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const fields = [_]TaggedFieldOut{
+        .{ .payment_hash = fx_hash_a },
+        .{ .payment_secret = fx_secret_a },
+        .{ .description_hash = fx_hash_b },
+        .{ .metadata = "meta" },
+        .{ .fallback = .{ .version = 17, .program = &prog } },
+        .{ .route_hint = &hops },
+        .{ .features = &.{ 0, 0 } },
+        .{ .expiry_seconds = 7200 },
+        .{ .min_final_cltv_expiry = 40 },
+    };
+    const s = try encode(a, .{ .network = .mainnet, .timestamp = 1496314658, .fields = &fields }, .{ .private_key = &spec_privkey });
+    defer a.free(s);
+    var inv = try decode(a, s);
+    defer inv.deinit(a);
+    try testing.expectEqualSlices(u8, &fx_hash_b, &inv.description_hash.?);
+    try testing.expect(inv.description == null);
+    try testing.expectEqualStrings("meta", inv.metadata.?);
+    try testing.expectEqual(@as(usize, 1), inv.fallbacks.len);
+    try testing.expectEqual(@as(u5, 17), inv.fallbacks[0].version);
+    try testing.expectEqualSlices(u8, &prog, inv.fallbacks[0].program);
+    try testing.expectEqual(@as(usize, 1), inv.route_hints.len);
+    try testing.expectEqualSlices(u8, &hop.pubkey, &inv.route_hints[0].hops[0].pubkey);
+    try testing.expectEqual(hop.short_channel_id, inv.route_hints[0].hops[0].short_channel_id);
+    try testing.expectEqual(hop.fee_base_msat, inv.route_hints[0].hops[0].fee_base_msat);
+    try testing.expectEqual(hop.fee_proportional_millionths, inv.route_hints[0].hops[0].fee_proportional_millionths);
+    try testing.expectEqual(hop.cltv_expiry_delta, inv.route_hints[0].hops[0].cltv_expiry_delta);
+    try testing.expect(inv.features == null); // an all-zero vector omits the field
+    try testing.expectEqual(@as(u64, 7200), inv.expiry_seconds);
+    try testing.expectEqual(@as(u64, 40), inv.min_final_cltv_expiry);
+}
+
+test "mutation: a tagged field holds at most 1023 quintets (639 bytes of description are the longest)" {
+    const a = testing.allocator;
+    const long: [640]u8 = @splat('x');
+    const base = [_]TaggedFieldOut{
+        .{ .payment_hash = fx_hash_a },
+        .{ .payment_secret = fx_secret_a },
+    };
+    var ok_fields: [3]TaggedFieldOut = undefined;
+    @memcpy(ok_fields[0..2], &base);
+    ok_fields[2] = .{ .description = long[0..639] };
+    const s = try encode(a, .{ .network = .mainnet, .timestamp = 1, .fields = &ok_fields }, .{ .private_key = &spec_privkey });
+    defer a.free(s);
+    var inv = try decode(a, s);
+    defer inv.deinit(a);
+    try testing.expectEqual(@as(usize, 639), inv.description.?.len);
+
+    var bad_fields: [3]TaggedFieldOut = undefined;
+    @memcpy(bad_fields[0..2], &base);
+    bad_fields[2] = .{ .description = &long };
+    try testing.expectError(error.TaggedFieldTooLong, encode(a, .{ .network = .mainnet, .timestamp = 1, .fields = &bad_fields }, .{ .private_key = &spec_privkey }));
+}
