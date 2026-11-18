@@ -302,9 +302,15 @@ the tests that depend on them, not mutated. Counts on the card are whole-module.
   restart is not counted by `pendingCount` at reopen (`readyCount` skips it). Nothing is lost
   (the WAL keeps the record for `recover()`); the contract "`flushAll` blocks until clean" is
   what breaks. Pinned by three tests that assert today's behaviour and are marked FINDING.
-- *wbmut-2 — `deinitNoFlush` leaks the tasks of queued jobs.* `shutdownNow` drops queued flush
-  jobs unrun; their `FlushTask`, key and value (three allocations each) are never freed. Only
-  completed tasks are. The test that shows the drop runs on a non-leak-checking allocator.
+- *wbmut-2 — `deinitNoFlush` leaks the tasks of queued jobs.* **Fixed 2026-11-19.**
+  `shutdownNow` drops queued flush jobs unrun; their `FlushTask`, key and value (three
+  allocations each) were never freed, only completed tasks were. `in_flight` now maps each key to
+  its task and `deinitNoFlush` frees the tasks still listed after the harvest; the test runs on the
+  leak-checking allocator. Found with it: the harvest ran after `pool.deinit`, so a completed
+  flush that advanced its key to the next record submitted to a freed pool. The harvest now
+  runs first, against a stopped pool that refuses the submit (the record stays in the WAL).
+  Regression test: *"deinitNoFlush: a harvested flush that advances its key meets a stopped
+  pool, not a freed one"*.
 - Note: the coordinator never calls `jobqueue`'s `reapExpiredLeases`, so a lost lease (a sink
   call that never returns) is redelivered only after a restart.
 

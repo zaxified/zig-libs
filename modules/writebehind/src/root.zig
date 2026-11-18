@@ -442,8 +442,9 @@ pub const Coordinator = struct {
     unflushed: usize = 0,
 
     /// Keys with a flush currently in flight (single-flight per key → per-key
-    /// ordering → LWW). Owns its key strings.
-    in_flight: std.StringHashMapUnmanaged(void) = .empty,
+    /// ordering → LWW), each with the task submitted for it (so a teardown
+    /// that drops queued jobs can free their tasks). Owns its key strings.
+    in_flight: std.StringHashMapUnmanaged(*FlushTask) = .empty,
     /// Dirty keys evicted from the cache before being flushed (the `on_evict`
     /// safety net): their WAL records are still durable, so the flusher must
     /// revisit them even though the cache no longer lists them dirty. Owns keys.
@@ -530,7 +531,7 @@ pub const Coordinator = struct {
         self.pool.deinit();
         self.wal.close();
         self.cache.deinit();
-        self.freeKeySet(&self.in_flight);
+        self.freeInFlight();
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
         self.scratch.deinit(self.gpa);
@@ -546,14 +547,20 @@ pub const Coordinator = struct {
     /// caller still owns (and must close) the sink's storage.
     pub fn deinitNoFlush(self: *Coordinator) void {
         self.pool.shutdownNow();
-        self.pool.deinit();
-        // Free any un-harvested completion tasks (their sink writes ran but were
-        // never acked — the durable WAL still covers them for recovery).
-        self.pump(); // acks whatever completed; the rest are simply dropped
+        // Harvest the flushes that completed: ack them. This runs BEFORE
+        // `pool.deinit`, because acking a key can advance it to its next record
+        // and `startFlush` then calls `pool.submit` -- which a stopped pool
+        // refuses (the record goes back to the WAL), but a freed one would be a
+        // use-after-free.
+        self.pump();
         self.drainCompletionTasks();
+        self.pool.deinit();
         self.wal.close();
         self.cache.deinit();
-        self.freeKeySet(&self.in_flight);
+        // What is still in flight now is a job `shutdownNow` dropped unrun: its
+        // task was never handed back, so free it here (its WAL record stays
+        // durable for the next process's `recover()`).
+        self.freeInFlight();
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
         self.scratch.deinit(self.gpa);
@@ -773,7 +780,7 @@ pub const Coordinator = struct {
     }
 
     fn finishTask(self: *Coordinator, t: *FlushTask) void {
-        self.removeKeySet(&self.in_flight, t.key);
+        self.clearInFlight(t.key);
         if (t.ok) {
             self.wal.ack(t.lease) catch {};
             if (self.unflushed > 0) self.unflushed -= 1;
@@ -908,13 +915,13 @@ pub const Coordinator = struct {
             },
             .lease = lease,
         };
-        self.addKeySet(&self.in_flight, key) catch {
+        self.markInFlight(key, task) catch {
             self.freeTask(task);
             self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
             return;
         };
         self.pool.submit(.{ .func = flushEntry, .ctx = task }) catch {
-            self.removeKeySet(&self.in_flight, key);
+            self.clearInFlight(key);
             self.freeTask(task);
             self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
         };
@@ -983,6 +990,28 @@ pub const Coordinator = struct {
         self.addKeySet(&self.orphans, key) catch {
             self.n_dropped_orphans += 1;
         };
+    }
+
+    /// Free the in-flight set: its keys and the task of every entry (a task
+    /// still listed here never reached the completion list).
+    fn freeInFlight(self: *Coordinator) void {
+        var it = self.in_flight.iterator();
+        while (it.next()) |e| {
+            self.freeTask(e.value_ptr.*);
+            self.gpa.free(e.key_ptr.*);
+        }
+        self.in_flight.deinit(self.gpa);
+    }
+
+    fn markInFlight(self: *Coordinator, key: []const u8, task: *FlushTask) !void {
+        std.debug.assert(!self.in_flight.contains(key));
+        const dup = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(dup);
+        try self.in_flight.put(self.gpa, dup, task);
+    }
+
+    fn clearInFlight(self: *Coordinator, key: []const u8) void {
+        if (self.in_flight.fetchRemove(key)) |kv| self.gpa.free(kv.key);
     }
 
     fn freeTask(self: *Coordinator, t: *FlushTask) void {
@@ -2931,11 +2960,10 @@ test "deinitNoFlush discards queued flush jobs: only the running write finishes"
     defer wal_sim.deinit();
     var gs: GateSink = .{ .inner = MapSink.init(testing.allocator), .io = threaded.io() };
     defer gs.inner.deinit();
-    // FINDING wbmut-2: `deinitNoFlush` frees the FlushTasks of completed flushes
-    // only; the tasks of jobs the pool drops unrun (task, key, value: three
-    // allocations each) are leaked. The test therefore runs on an allocator
-    // that does not report leaks; it asserts what `shutdownNow` guarantees.
-    const c = try Coordinator.init(std.heap.smp_allocator, .{
+    // wbmut-2 (fixed 2026-11-19): the tasks of the jobs the pool drops unrun
+    // (task, key, value: three allocations each) used to leak; the leak-checked
+    // allocator now proves `deinitNoFlush` frees them.
+    const c = try Coordinator.init(testing.allocator, .{
         .io = threaded.io(),
         .sink = .{ .ptr = &gs, .vtable = &GateSink.vt },
         .wal_store = wal_sim.storage(),
@@ -2957,4 +2985,27 @@ test "deinitNoFlush discards queued flush jobs: only the running write finishes"
     t.join();
     try testing.expectEqual(@as(u32, 1), gs.writes.load(.acquire));
     try testing.expectEqual(@as(usize, 1), gs.inner.count());
+}
+
+test "deinitNoFlush: a harvested flush that advances its key meets a stopped pool, not a freed one" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        const c = try rig.open(1);
+        try c.put("k", "old");
+        try c.put("k", "new");
+        c.drain(); // single flight per key: only "old" is submitted
+        try waitCompletion(c);
+        // The harvest inside deinitNoFlush acks "old" and hands "new" to
+        // startFlush, whose submit must find the pool stopped (and give the
+        // lease back), not already freed.
+        c.deinitNoFlush();
+    }
+    try testing.expectEqualStrings("old", rig.sink.peek("k").?);
+    const c2 = try rig.open(1);
+    defer c2.deinit();
+    try testing.expectEqual(@as(usize, 1), c2.pendingCount());
+    try c2.recover();
+    try testing.expectEqualStrings("new", rig.sink.peek("k").?);
 }
