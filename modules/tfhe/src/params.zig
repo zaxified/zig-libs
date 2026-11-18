@@ -298,3 +298,84 @@ test "validate rejects malformed sets" {
     p.ell = 2;
     try testing.expectError(error.PreparedProductNotExact, p.validate());
 }
+
+test "mutation: validate's gadget-width and ring-degree edges; per-sample draw sizes" {
+    const ok = Params{ .n = 7, .N = 8, .bg_bits = 4, .ell = 2, .bks_bits = 4, .ell_ks = 2, .lwe_noise = .{ .uniform = 1 }, .glwe_noise = .{ .uniform = 1 } };
+    try ok.validate();
+    var p = ok;
+    p.N = 1; // a power of two, but below the smallest ring degree
+    try testing.expectError(error.RingDegreeNotPowerOfTwo, p.validate());
+    p = ok;
+    p.bg_bits = 0;
+    try testing.expectError(error.BadGgswGadget, p.validate());
+    p = ok;
+    p.bks_bits = 0;
+    try testing.expectError(error.BadKeySwitchGadget, p.validate());
+    p = ok;
+    p.ell_ks = 0;
+    try testing.expectError(error.BadKeySwitchGadget, p.validate());
+    // Exactly 32 bits is allowed, 33 is not.
+    p = ok;
+    p.bg_bits = 8;
+    p.ell = 4;
+    try p.validate();
+    p.bg_bits = 11;
+    p.ell = 3;
+    try testing.expectError(error.BadGgswGadget, p.validate());
+    p = ok;
+    p.bks_bits = 8;
+    p.ell_ks = 4;
+    try p.validate();
+    p.bks_bits = 11;
+    p.ell_ks = 3;
+    try testing.expectError(error.BadKeySwitchGadget, p.validate());
+    // One u64 per uniform error; two (Box–Muller) per Gaussian.
+    try testing.expectEqual(@as(usize, 8), (Noise{ .uniform = 5 }).drawBytes());
+    try testing.expectEqual(@as(usize, 16), (Noise{ .gaussian = 1e-5 }).drawBytes());
+}
+
+test "mutation: validate's noise-range and prepared-bound edges, and the bound's rounding" {
+    const ok = Params{ .n = 7, .N = 8, .bg_bits = 4, .ell = 2, .bks_bits = 4, .ell_ks = 2, .lwe_noise = .{ .uniform = 1 }, .glwe_noise = .{ .uniform = 1 } };
+    var p = ok;
+    // Uniform width: 2^30 − 1 is the widest, 2^30 is refused; 0 is refused.
+    p.lwe_noise = .{ .uniform = (1 << 30) - 1 };
+    try p.validate();
+    p.lwe_noise = .{ .uniform = 1 << 30 };
+    try testing.expectError(error.BadNoise, p.validate());
+    p = ok;
+    p.glwe_noise = .{ .uniform = (1 << 30) - 1 };
+    try p.validate();
+    p.glwe_noise = .{ .uniform = 1 << 30 };
+    try testing.expectError(error.BadNoise, p.validate());
+    p = ok;
+    p.glwe_noise = .{ .uniform = 0 };
+    try testing.expectError(error.BadNoise, p.validate());
+    // Gaussian width: the open interval (0, 1/4).
+    p = ok;
+    p.lwe_noise = .{ .gaussian = 0.2499 };
+    try p.validate();
+    p.lwe_noise = .{ .gaussian = 0.25 };
+    try testing.expectError(error.BadNoise, p.validate());
+    p.lwe_noise = .{ .gaussian = 0 };
+    try testing.expectError(error.BadNoise, p.validate());
+    p = ok;
+    p.glwe_noise = .{ .gaussian = 0.2499 };
+    try p.validate();
+    p.glwe_noise = .{ .gaussian = 0.25 };
+    try testing.expectError(error.BadNoise, p.validate());
+    // The prepared-product bound: 60 passes, 61 (the first value with fewer
+    // than two bits of margin below log2(p/2)) is refused. N = 8, k = 1,
+    // ℓ = 1: rows·N = 16, so the bound is 4 + (bg_bits − 1) + 32.
+    p = ok;
+    p.ell = 1;
+    p.bg_bits = 25;
+    try testing.expectEqual(@as(u32, 60), p.preparedBoundLog2());
+    try p.validate();
+    p.bg_bits = 26;
+    try testing.expectEqual(@as(u32, 61), p.preparedBoundLog2());
+    try testing.expectError(error.PreparedProductNotExact, p.validate());
+    // rows·N need not be a power of two: ℓ = 3 gives 48 terms → ⌈log2⌉ = 6.
+    p = ok;
+    p.ell = 3;
+    try testing.expectEqual(@as(u32, 6 + 3 + 32), p.preparedBoundLog2());
+}

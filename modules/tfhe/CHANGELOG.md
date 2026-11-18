@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of the nine runtime files (441 mutants, 424 killed, 12 EQUIVALENT, 5 UNOBSERVABLE; the card now carries whole-module counts). 11 tests added (ring exponent reduction and `eql`, decomposition at the top of the range, `addMod` at `p`, `ln`/`cos2pi` precision at the widest series arguments, every `Params.validate` boundary and the prepared-bound rounding, `drawBytes`, codec header byte 7, `ClientKey.deinit`, `ServerKey.generate`/`fromKeys` under a failing allocator, an all-zero random stream pinning `lweEncrypt`/`glweEncrypt`'s error sign, mask draw and message space, and the gates byte-identical to tfhe-rs's). No module code changed. `SPEC.md` § Verification.
+
 - **2026-10-18** — Ported to Zig 0.17.0: `Fn.params` -> `param_types` (test seam).
 - **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** fuzz verdict recorded for the codec readers (`TFHE_FUZZ`, all six kinds on damaged encodings: whatever is accepted re-encodes to the bytes read, an intact encoding is accepted): 200,000 runs clean in ReleaseSafe, every outcome reached; new in-suite reach test (400 seeds, every kind both accepted and refused).
 

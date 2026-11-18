@@ -158,3 +158,23 @@ test "KAT: tfhe-rs 1.8.1 SignedDecomposer digits (black-box samples)" {
     };
     for (cases) |c| try testing.expectEqual(c[1], decompose(3, 5, c[0]));
 }
+
+test "mutation: decompose at the top of the range, for every digit width incl. b = 1" {
+    // x close to 2^32 rounds up to 2^L and must wrap to 0 (the bits above L are
+    // not part of the representation): the digits recompose to x within the
+    // dropped-tail bound for every shape, including the 1-bit digit.
+    const xs = [_]T{ 0xFFFF_FFFF, 0xFFFF_FFF0, 0xFFFF_FF00, 0x8000_0000, 0x7FFF_FFFF, 0x8000_0001, 1, 0 };
+    inline for (.{ .{ 1, 8 }, .{ 1, 16 }, .{ 1, 31 }, .{ 2, 5 }, .{ 3, 10 }, .{ 7, 4 }, .{ 15, 2 } }) |sh| {
+        const bb: u6 = sh[0];
+        const ell: usize = sh[1];
+        const bound = maxError(bb, ell);
+        for (xs) |x| {
+            const d = decompose(bb, ell, x);
+            const back = recompose(bb, ell, d);
+            const diff: i32 = @bitCast(x -% back);
+            try testing.expect(@as(u64, @abs(diff)) <= bound);
+            // balanced digits
+            for (d) |dig| try testing.expect(@abs(dig) <= (@as(u32, 1) << (bb - 1)));
+        }
+    }
+}

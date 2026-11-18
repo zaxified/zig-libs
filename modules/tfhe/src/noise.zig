@@ -243,3 +243,24 @@ test "KAT: Box–Muller on fixed draws (values from Python's math.log/math.cos)"
     };
     for (cases) |c| try testing.expectEqual(c[2], @as(i32, @bitCast(gaussianTorus(sigma, c[0], c[1]))));
 }
+
+test "mutation: ln is within 2 ulp at the widest series argument; cos2pi within 1.5e-15 near the quarter points" {
+    // |z| is largest (0.1716) where the folded mantissa is √½ or √2: there the
+    // z^19 term alone is ≈ 6 ulp of the result, so a 2-ulp bound pins it.
+    const pts = [_]f64{ 0.7071067811865476, 0.7071067811865475, 0.7071067811865477, 0.7071067811865474, 1.4142135623730951, 1.414213562373095, 1.4142135623730954, 0.7071067811865478 };
+    for (pts) |x| {
+        const want = @log(x);
+        const ulp = std.math.floatEps(f64) * 0.5 * std.math.pow(f64, 2.0, @floor(@log2(@abs(want))) + 1.0);
+        try testing.expect(@abs(ln(x) - want) <= 2.0 * ulp);
+    }
+    // The x^20 term of the cosine series is ≈ 3.5e-15 at x = π/2.
+    const quarters = [_]u64{ 1 << 51, 3 << 51, 1 << 50, 3 << 50, 5 << 50, 7 << 50 };
+    for (quarters) |w0| {
+        for ([_]i64{ 0, 1, -1, 1 << 20, -(1 << 20), 1 << 30, -(1 << 30) }) |d| {
+            const w: u64 = @intCast(@as(i64, @intCast(w0)) + d);
+            const u = w << 11;
+            const v = @as(f64, @floatFromInt(w)) * ulp53;
+            try testing.expectApproxEqAbs(@cos(two_pi * v), cos2pi(u), 1.5e-15);
+        }
+    }
+}

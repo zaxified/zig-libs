@@ -303,3 +303,25 @@ test "codec payloads are tfhe-rs's standard containers, word for word" {
     try C.writeLwe(&aw.writer, &ct);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(record("SINP"))[5 * 17 * 4 ..][0 .. 17 * 4], aw.written()[24..]);
 }
+
+test "mutation: small k = 2 set: this module's gate outputs are byte-identical to tfhe-rs's" {
+    const lwe = SL.lweKey(16, record("SLSK"));
+    _ = lwe;
+    var bsk = try SL.bsk(testing.allocator, record("SBSK"));
+    defer bsk.deinit(testing.allocator);
+    const ksk = try SL.ksk(testing.allocator, record("SKSK"));
+    var sk = try Small.ServerKey.fromKeys(testing.allocator, &bsk, ksk);
+    defer sk.deinit(testing.allocator);
+    inline for (gate_names, 0..) |name, g| {
+        const outs = record(std.fmt.comptimePrint("SGT{d}", .{g}));
+        for (0..16) |i| {
+            const a = SL.lwe(16, record("SINP"), 2 * i);
+            const b = SL.lwe(16, record("SINP"), 2 * i + 1);
+            const c = SL.lwe(16, record("SINP"), (2 * i + 2) % 32);
+            const theirs = SL.lwe(16, outs, i);
+            const ours = if (comptime std.mem.eql(u8, name, "mux")) sk.mux(&c, &a, &b) else @field(Small.ServerKey, name)(&sk, &a, &b);
+            try testing.expectEqualSlices(u32, &theirs.a, &ours.a);
+            try testing.expectEqual(theirs.b, ours.b);
+        }
+    }
+}

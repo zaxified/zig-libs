@@ -421,3 +421,12 @@ test "forward∘inverse is the identity" {
     E.inverse(&x);
     try testing.expectEqualSlices(u64, &orig, &x);
 }
+
+test "mutation: addMod/subMod at the wrap and canonical-reduction edges" {
+    try testing.expectEqual(@as(u64, 0), addMod(p - 1, 1)); // a + b == p exactly: must reduce to 0, not stay p
+    try testing.expectEqual(@as(u64, p - 2), addMod(p - 1, p - 1));
+    try testing.expectEqual(@as(u64, 0), addMod(0, 0));
+    try testing.expectEqual(@as(u64, p - 1), subMod(0, 1));
+    try testing.expectEqual(@as(u64, 1), subMod(0, p - 1));
+    try testing.expectEqual(@as(u64, 0), subMod(p - 1, p - 1));
+}

@@ -294,3 +294,25 @@ test "mulMonomial by X^{2N} is identity; X^N negates" {
     neg.negate();
     try testing.expect(neg.eql(&P.mulMonomial(&a, N)));
 }
+
+test "mutation: mulMonomial reduces its exponent mod 2N; eql sees every coefficient" {
+    const N = 8;
+    const P = Poly(N);
+    var raw: [N]T = undefined;
+    for (&raw, 0..) |*x, i| x.* = @intCast(i * 7 + 1);
+    const a = P.fromCoeffs(raw);
+    // The doc: "`e` is taken mod 2N". Far above 2N, a single conditional
+    // subtraction would index past the array.
+    for ([_]usize{ 0, 1, 3, 9, 15 }) |e| {
+        try testing.expect(P.mulMonomial(&a, e).eql(&P.mulMonomial(&a, e + 2 * N)));
+        try testing.expect(P.mulMonomial(&a, e).eql(&P.mulMonomial(&a, e + 6 * N)));
+        try testing.expect(P.mulMonomial(&a, e).eql(&P.mulMonomial(&a, e + 10 * N)));
+    }
+    for (0..N) |i| {
+        var b = a;
+        b.c[i] +%= 1;
+        try testing.expect(!a.eql(&b));
+        try testing.expect(!b.eql(&a));
+    }
+    try testing.expect(a.eql(&a));
+}

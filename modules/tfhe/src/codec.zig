@@ -352,6 +352,7 @@ test "the header: layout pinned, and every field is checked" {
         .{ 4, 2, error.UnsupportedVersion },
         .{ 5, @backingInt(Kind.lwe_big), error.WrongKind },
         .{ 6, 1, error.WrongKind },
+        .{ 7, 1, error.WrongKind },
         .{ 8, 17, error.ParameterMismatch },
         .{ 12, 3, error.ParameterMismatch },
         .{ 16, 128, error.ParameterMismatch },
