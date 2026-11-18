@@ -1109,6 +1109,8 @@ test "replay: a counter that fell off the trailing edge is rejected" {
     _ = try r.open(&out, &high, t0);
     // … the counter exactly `cap` behind it is still inside the window …
     _ = try r.open(&out, &edge, t0);
+    // … and it was recorded there: the same packet again is a replay.
+    try testing.expectError(error.Replayed, r.open(&out, &edge, t0));
     // … and 99, one further back, has fallen off the trailing edge.
     try testing.expectError(error.Replayed, r.open(&out, &old, t0));
 }
@@ -1371,6 +1373,26 @@ test "lifetime: Session.init gives both halves one birth time" {
 
     var wire: [64]u8 = undefined;
     try testing.expectError(error.SessionExpired, a.send.seal(&wire, "x", born + 180));
+}
+
+test "Session.wipe: neither key is left in the session's bytes" {
+    // The session sits in a byte buffer, read back through that buffer after
+    // `wipe` (its own fields are undefined then): both keys must be gone. In a
+    // safe build `self.* = undefined` would hide a skipped wipe; in an
+    // optimised one it writes nothing, and only the key wipes clear the bytes.
+    const keys = TransportKeys{ .send = testKey(26), .recv = testKey(27) };
+    var raw: [@sizeOf(Session)]u8 align(@alignOf(Session)) = undefined;
+    const s: *Session = @ptrCast(&raw);
+    s.init(&keys, 1, 2, t0);
+    try testing.expect(std.mem.indexOf(u8, &raw, &keys.send) != null);
+    try testing.expect(std.mem.indexOf(u8, &raw, &keys.recv) != null);
+    s.wipe();
+    // A volatile read: the compiler may treat bytes it stored `undefined` to as
+    // anything, so the check reads the memory itself.
+    const vp: *volatile [@sizeOf(Session)]u8 = &raw;
+    const after = vp.*;
+    try testing.expect(std.mem.indexOf(u8, &after, &keys.send) == null);
+    try testing.expect(std.mem.indexOf(u8, &after, &keys.recv) == null);
 }
 
 // ── replay window: the unrepresentable counter ─────────────────────────────

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **Behaviour change:** `Tunnel` keeps the second-keepalive flag when it sends and when it gives up a handshake, as wireguard-go (`device/timers.go`: `timersAnyAuthenticatedPacketSent`, `expiredRetransmitHandshake`) and the kernel (`wg_timers_any_authenticated_packet_sent`, `wg_expired_retransmit_handshake`) do: after a burst of data, a send and more data, one more keepalive goes out 10 s after the first. Found by the whole-module mutation audit.
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit, 658/766 killed, 108 equivalent or unobservable (SPEC § Backlog, "Audit 2026-11-18"); 49 new tests; ctgrind source digests re-pinned, counts unchanged.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the UAPI `Deadline` monotonic read (duplicate-code pass) is replaced by `clock.monotonicNs()` in ms. New dependency: `clock`.
 - **2026-11-08** — NO CONSUMER-VISIBLE CHANGE in this module: re-measured after `chachapoly` took x/crypto's amd64 ChaCha20-Poly1305 for 193 B..4 KiB; open_1424 1.11 → 1.04x wireguard-go, worst row 1.05x (card P3 → P2).

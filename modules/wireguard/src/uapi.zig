@@ -725,6 +725,79 @@ test "GetParser: a real wireguard-go reply, frozen from tools/interop.zig --uapi
     try testing.expectEqual(@as(usize, 1), other.allowed_ips.len);
 }
 
+test "GetParser: every counter and time field lands on its peer (whole-module mutation audit)" {
+    const text = "public_key=" ++ hex_a ++ "\n" ++
+        "last_handshake_time_sec=1700000001\n" ++
+        "last_handshake_time_nsec=999\n" ++
+        "tx_bytes=12\n" ++
+        "rx_bytes=34\n";
+    var dev: Device = undefined;
+    _ = try parseAll(testing.allocator, text, .{}, &dev);
+    defer dev.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 1700000001), dev.peers[0].last_handshake_time.sec);
+    try testing.expectEqual(@as(i64, 999), dev.peers[0].last_handshake_time.nsec);
+    try testing.expectEqual(@as(u64, 12), dev.peers[0].tx_bytes);
+    try testing.expectEqual(@as(u64, 34), dev.peers[0].rx_bytes);
+}
+
+test "GetParser: after a refused public_key, a peer line has no peer to land on" {
+    var p: GetParser = .init(testing.allocator, .{ .max_peers = 1 });
+    defer p.deinit();
+    try p.feedLine("public_key=" ++ hex_a);
+    try p.feedLine("allowed_ip=10.0.0.1/32");
+    try testing.expectError(error.LimitExceeded, p.feedLine("public_key=" ++ hex_b));
+    try testing.expectError(error.MalformedReply, p.feedLine("allowed_ip=10.0.0.2/32"));
+    try testing.expectEqual(@as(usize, 1), p.peers.items[0].allowed_ips.len);
+}
+
+test "number: plain decimal digits only, 0 through 9" {
+    try testing.expectEqual(@as(?u32, 9), number(u32, "9"));
+    try testing.expectEqual(@as(?u32, 90), number(u32, "90"));
+    try testing.expectEqual(@as(?u32, null), number(u32, "1_0"));
+    try testing.expectEqual(@as(?u32, null), number(u32, "+1"));
+    try testing.expectEqual(@as(?u32, null), number(u32, ""));
+}
+
+test "Deadline: a zero timeout is no end, any other an end" {
+    try testing.expectEqual(@as(?u64, null), Deadline.after(0).end_ms);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), try Deadline.after(0).remainingMs());
+    const d = Deadline.after(60_000);
+    try testing.expect(d.end_ms != null);
+    try testing.expect((try d.remainingMs()) <= 60_000);
+}
+
+test "GetParser: deinit, and finishInto, leave no key in the parser's bytes or its freed blocks" {
+    const text = [_][]const u8{ "private_key=" ++ hex_a, "public_key=" ++ hex_b, "preshared_key=" ++ hex_c };
+    var priv: Key = undefined;
+    try keyFromHex(hex_a, &priv);
+    var psk: Key = undefined;
+    try keyFromHex(hex_c, &psk);
+    for ([_]bool{ false, true }) |finish| {
+        var backing: [16 * 1024]u8 = @splat(0); // zeroed: a stack buffer holds older frames' bytes
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        const gpa = fba.allocator();
+        var p: GetParser = .init(gpa, .{});
+        for (text) |l| try p.feedLine(l);
+        var dev: Device = undefined;
+        if (finish) try p.finishInto(&dev);
+        // The parser's own bytes, after it handed the device over (or dropped it).
+        if (finish) {
+            const vp: *volatile [@sizeOf(GetParser)]u8 = @ptrCast(&p);
+            const mine = vp.*;
+            try testing.expect(std.mem.indexOf(u8, &mine, &priv) == null);
+            dev.deinit(gpa);
+        }
+        p.deinit();
+        const vp: *volatile [@sizeOf(GetParser)]u8 = @ptrCast(&p);
+        const after = vp.*;
+        try testing.expect(std.mem.indexOf(u8, &after, &priv) == null);
+        const vb: *volatile [backing.len]u8 = &backing;
+        const heap = vb.*;
+        try testing.expect(std.mem.indexOf(u8, &heap, &psk) == null);
+        try testing.expect(std.mem.indexOf(u8, &heap, &priv) == null);
+    }
+}
+
 test "GetParser: what it refuses, and what it skips" {
     const a = testing.allocator;
     var dev: Device = undefined;
@@ -1147,6 +1220,119 @@ test "Client: names that are no path component are refused before any syscall" {
     const long_dir: [200]u8 = @splat('x');
     var long: Client = .{ .gpa = testing.allocator, .dir = &long_dir };
     try testing.expectError(error.InvalidName, long.getDevice("wg0", &dev));
+}
+
+test "Deadline: an end reached this very millisecond is TimedOut, never a zero wait" {
+    // Zero is no timeout for SO_RCVTIMEO/SO_SNDTIMEO and poll's "return at
+    // once": `remainingMs` answers at least 1 or the error. Repeated so that
+    // some rounds read the same millisecond twice.
+    for (0..2000) |_| {
+        const d: Deadline = .{ .end_ms = Deadline.nowMs() };
+        try testing.expectError(error.TimedOut, d.remainingMs());
+    }
+}
+
+test "Client: an exchange under a deadline completes when the daemon answers" {
+    const a = testing.allocator;
+    var c: Client = .{ .gpa = a };
+    const fds = try pair();
+    defer _ = linux.close(fds[0]);
+    var d: FakeDaemon = .{ .fd = fds[1], .reply = "listen_port=7\nerrno=0\n\n" };
+    const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
+    var dev: Device = undefined;
+    try c.getOverFd(fds[0], "wg0", &dev, .after(10_000));
+    defer dev.deinit(a);
+    th.join();
+    try testing.expectEqual(@as(u16, 7), dev.listen_port);
+}
+
+test "Client: a reply longer than the line buffer streams through it" {
+    const a = testing.allocator;
+    var c: Client = .{ .gpa = a };
+    const line = "listen_port=7\n";
+    const reps = 1500; // 21000 bytes, the buffer is 8192
+    const reply = try a.alloc(u8, line.len * reps + "listen_port=9\nerrno=0\n\n".len);
+    defer a.free(reply);
+    for (0..reps) |i| @memcpy(reply[i * line.len ..][0..line.len], line);
+    @memcpy(reply[line.len * reps ..], "listen_port=9\nerrno=0\n\n");
+    const fds = try pair();
+    defer _ = linux.close(fds[0]);
+    var d: FakeDaemon = .{ .fd = fds[1], .reply = reply };
+    const th = try std.Thread.spawn(.{}, FakeDaemon.run, .{&d});
+    var dev: Device = undefined;
+    try c.getOverFd(fds[0], "wg0", &dev, .{});
+    defer dev.deinit(a);
+    th.join();
+    try testing.expectEqual(@as(u16, 9), dev.listen_port);
+}
+
+test "Client: a line of exactly max_line_len may still be arriving" {
+    const fds = try pair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var r: LineReader = .{ .fd = fds[0], .max_total = 1 << 20 };
+    @memset(r.buf[0..max_line_len], 'x');
+    r.end = max_line_len;
+    _ = linux.sendto(fds[1], "\n", 1, linux.MSG.NOSIGNAL, null, 0);
+    try testing.expectEqual(max_line_len, (try r.next()).len);
+}
+
+test "Client: under a deadline a send to a daemon that never reads times out, it does not block" {
+    const a = testing.allocator;
+    const fds = try pair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const big = try a.alloc(u8, 4 << 20); // far past any socket buffer
+    defer a.free(big);
+    @memset(big, 'x');
+    try testing.expectError(error.TimedOut, sendAll(fds[0], big, .after(50)));
+}
+
+test "listDevices: only sockets, and only those named like an interface" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const dir_path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    (try tmp.dir.createFile(io, "file0.sock", .{})).close(io);
+    for ([_][]const u8{ "wg0.sock", "0123456789abcdefg.sock", "wg9", "plainname" }) |name| {
+        const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        const fd: i32 = @intCast(rc);
+        defer _ = linux.close(fd);
+        var sa: linux.sockaddr.un = .{ .path = @splat(0) };
+        _ = try std.mem.print(&sa.path, "{s}/{s}", .{ dir_path, name });
+        if (linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.un))) != .SUCCESS) return error.SkipZigTest;
+    }
+    const names = try listDevices(io, testing.allocator, dir_path);
+    defer testing.allocator.free(names);
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("wg0", names[0].slice());
+}
+
+test "Client: connect to a daemon whose backlog is full times out under a deadline" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const dir_path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    var sa: linux.sockaddr.un = .{ .path = @splat(0) };
+    _ = try std.mem.print(&sa.path, "{s}/wg0.sock", .{dir_path});
+    const lrc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(lrc) != .SUCCESS) return error.SkipZigTest;
+    const lfd: i32 = @intCast(lrc);
+    defer _ = linux.close(lfd);
+    if (linux.errno(linux.bind(lfd, @ptrCast(&sa), @sizeOf(linux.sockaddr.un))) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
+    // One connection the daemon never accepts fills a backlog of 0.
+    const crc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(crc) != .SUCCESS) return error.SkipZigTest;
+    const cfd: i32 = @intCast(crc);
+    defer _ = linux.close(cfd);
+    if (linux.errno(linux.connect(cfd, @ptrCast(&sa), @sizeOf(linux.sockaddr.un))) != .SUCCESS) return error.SkipZigTest;
+
+    var c: Client = .{ .gpa = testing.allocator, .dir = dir_path, .timeout_ms = 100 };
+    var dev: Device = undefined;
+    try testing.expectError(error.TimedOut, c.getDevice("wg0", &dev));
 }
 
 test "listDevices: a missing directory is an empty list" {

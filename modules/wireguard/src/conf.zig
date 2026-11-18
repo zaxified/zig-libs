@@ -599,6 +599,9 @@ test "conf: set clears what the file leaves out, add leaves it" {
     try testing.expectEqual(@as(?u16, 0), s.config.listen_port);
     try testing.expectEqual(@as(?u32, 0), s.config.fwmark);
     try testing.expect(s.config.replace_peers);
+    // A peer with no AllowedIPs line still has its list replaced (by nothing).
+    try testing.expect(s.config.peers[0].replace_allowed_ips);
+    try testing.expectEqual(@as(usize, 0), s.config.peers[0].allowed_ips.len);
     var a: ParsedConfig = undefined;
     try parse(testing.allocator, text, .{ .mode = .add }, null, &a);
     defer a.deinit();
@@ -618,6 +621,53 @@ fn expectParseError(want: ParseError, text: []const u8, opts: Options, line: u32
     var p: ParsedConfig = undefined;
     try testing.expectError(want, parse(testing.allocator, text, opts, &d, &p));
     try testing.expectEqual(line, d.line);
+}
+
+test "conf: refusals and acceptances at the edges (whole-module mutation audit)" {
+    const ok_peer = "[Peer]\nPublicKey = " ++ fixture_pub ++ "\n";
+    // `.ignore` skips wg-quick's own keys only; anything else is still unknown.
+    try expectParseError(error.UnknownKey, "[Interface]\nFoo = 1\n", .{ .wg_quick_keys = .ignore }, 2);
+    // An empty element is refused as such, before it counts toward the limit.
+    try expectParseError(error.InvalidAllowedIp, ok_peer ++ "AllowedIPs = 10.0.0.1/32,\n", .{ .max_allowed_ips = 1 }, 3);
+    // Only `0x` starts a hex fwmark.
+    try expectParseError(error.InvalidFwMark, "[Interface]\nFwMark = 1x10\n", .{}, 2);
+    // A bracketed name is no IPv6 address, and no hostname either.
+    try expectParseError(error.InvalidEndpoint, ok_peer ++ "Endpoint = [example.com]:51820\n", .{}, 3);
+    // 253 characters is a hostname (the resolver's to answer), 254 is not.
+    const name253: [253]u8 = @splat('a');
+    try expectParseError(error.EndpointNeedsResolver, ok_peer ++ "Endpoint = " ++ name253 ++ ":51820\n", .{}, 3);
+    try expectParseError(error.InvalidEndpoint, ok_peer ++ "Endpoint = " ++ name253 ++ "a:51820\n", .{}, 3);
+    try expectParseError(error.EndpointNeedsResolver, ok_peer ++ "Endpoint = my-host_1.example:51820\n", .{}, 3);
+
+    var p: ParsedConfig = undefined;
+    try parse(testing.allocator, "[Interface]\nFwMark = off\n" ++ ok_peer ++ "PresharedKey = " ++ fixture_psk ++ "\n", .{ .mode = .add }, null, &p);
+    defer p.deinit();
+    try testing.expectEqual(@as(?u32, 0), p.config.fwmark);
+    try testing.expectEqual(try root.keyFromBase64(fixture_psk), p.config.peers[0].preshared_key.?);
+
+    // Each [Peer] starts empty: nothing of the one before carries over.
+    var two: ParsedConfig = undefined;
+    try parse(testing.allocator, ok_peer ++ "Endpoint = 1.2.3.4:5\n" ++ "[Peer]\nPublicKey = " ++ fixture_psk ++ "\n", .{ .mode = .add }, null, &two);
+    defer two.deinit();
+    try testing.expect(two.config.peers[1].endpoint == null);
+}
+
+test "conf: deinit leaves no key in the config's bytes or its freed peers" {
+    var backing: [16 * 1024]u8 = @splat(0); // zeroed: a stack buffer holds older frames' bytes
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const text = "[Interface]\nPrivateKey = " ++ fixture_priv ++ "\n[Peer]\nPublicKey = " ++ fixture_pub ++ "\nPresharedKey = " ++ fixture_psk ++ "\n";
+    const priv = try root.keyFromBase64(fixture_priv);
+    const psk = try root.keyFromBase64(fixture_psk);
+    var p: ParsedConfig = undefined;
+    try parse(fba.allocator(), text, .{}, null, &p);
+    try testing.expect(std.mem.indexOf(u8, &backing, &psk) != null);
+    p.deinit();
+    const vp: *volatile [@sizeOf(ParsedConfig)]u8 = @ptrCast(&p);
+    const after = vp.*;
+    try testing.expect(std.mem.indexOf(u8, &after, &priv) == null);
+    const vb: *volatile [backing.len]u8 = &backing;
+    const heap = vb.*;
+    try testing.expect(std.mem.indexOf(u8, &heap, &psk) == null);
 }
 
 test "conf: every refusal, with its line" {
@@ -745,6 +795,78 @@ test "conf: a Device prints as a file that parses back to it" {
     var w4: std.Io.Writer = .fixed(&out2);
     try formatConfig(&w4, &Config{ .private_key = @splat(0), .listen_port = 0, .fwmark = 0 });
     try testing.expectEqualStrings("[Interface]\n", w4.buffered());
+}
+
+test "conf: sync sends a changed key and mark, a changed prefix or address, and cleans out remove/update_only" {
+    const k1 = try root.keyFromBase64(fixture_pub);
+    const k2 = try root.keyFromBase64(fixture_psk);
+    const k3 = try root.keyFromBase64(fixture_priv);
+    const a = testing.allocator;
+    // The device sorts its peers k? > k1 after desired's last: a peer that sorts
+    // after every desired one goes too.
+    const lo, const hi = if (std.mem.order(u8, &k1, &k2) == .lt) .{ k1, k2 } else .{ k2, k1 };
+    var ips16 = [_]AllowedIp{AllowedIp.v4(.{ 10, 0, 0, 0 }, 16)};
+    var ips8 = [_]AllowedIp{AllowedIp.v4(.{ 10, 0, 0, 0 }, 8)};
+    var ips11 = [_]AllowedIp{AllowedIp.v4(.{ 11, 0, 0, 0 }, 16)};
+    var cur_peers = [_]root.Peer{
+        .{ .public_key = lo, .allowed_ips = &ips16 },
+        .{ .public_key = hi, .allowed_ips = &ips16 },
+    };
+    const cur: Device = .{ .private_key = k3, .listen_port = 7, .fwmark = 9, .peers = &cur_peers };
+    const want_key = k1;
+    // Same peer, same address, another prefix length.
+    {
+        var des_peers = [_]PeerConfig{.{ .public_key = lo, .replace_allowed_ips = true, .allowed_ips = &ips8, .remove = true, .update_only = true }};
+        const des: Config = .{ .ifname = "wg0", .private_key = want_key, .listen_port = 7, .fwmark = 10, .replace_peers = true, .peers = &des_peers };
+        var d: ParsedConfig = undefined;
+        try sync(a, &cur, &des, &d);
+        defer d.deinit();
+        try testing.expectEqual(want_key, d.config.private_key.?);
+        try testing.expectEqual(@as(?u32, 10), d.config.fwmark);
+        try testing.expectEqual(@as(usize, 2), d.config.peers.len);
+        for (d.config.peers) |p| {
+            if (std.mem.eql(u8, &p.public_key, &hi)) {
+                try testing.expect(p.remove);
+            } else {
+                try testing.expectEqual(@as(u8, 8), p.allowed_ips[0].cidr);
+                try testing.expect(!p.remove and !p.update_only);
+            }
+        }
+    }
+    // Same prefix length, another address.
+    {
+        var des_peers = [_]PeerConfig{
+            .{ .public_key = lo, .replace_allowed_ips = true, .allowed_ips = &ips11 },
+            .{ .public_key = hi, .replace_allowed_ips = true, .allowed_ips = &ips16 },
+        };
+        const des: Config = .{ .ifname = "wg0", .private_key = k3, .listen_port = 7, .fwmark = 9, .replace_peers = true, .peers = &des_peers };
+        var d: ParsedConfig = undefined;
+        try sync(a, &cur, &des, &d);
+        defer d.deinit();
+        try testing.expect(d.config.private_key == null and d.config.fwmark == null);
+        try testing.expectEqual(@as(usize, 1), d.config.peers.len);
+        try testing.expectEqual(lo, d.config.peers[0].public_key);
+    }
+}
+
+test "conf: sync frees everything at every allocation failure" {
+    const k1 = try root.keyFromBase64(fixture_pub);
+    const k2 = try root.keyFromBase64(fixture_psk);
+    var ips = [_]AllowedIp{AllowedIp.v4(.{ 10, 0, 0, 1 }, 32)};
+    var cur_peers = [_]root.Peer{.{ .public_key = k1, .allowed_ips = &ips }};
+    const cur: Device = .{ .peers = &cur_peers };
+    var des_peers = [_]PeerConfig{
+        .{ .public_key = k2, .replace_allowed_ips = true, .allowed_ips = &ips },
+        .{ .public_key = k1, .replace_allowed_ips = true, .allowed_ips = &.{} },
+    };
+    const des: Config = .{ .ifname = "wg0", .replace_peers = true, .peers = &des_peers };
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: Allocator, c: *const Device, d: *const Config) !void {
+            var out: ParsedConfig = undefined;
+            try sync(gpa, c, d, &out);
+            out.deinit();
+        }
+    }.run, .{ &cur, &des });
 }
 
 test "conf: sync sends only what changed" {

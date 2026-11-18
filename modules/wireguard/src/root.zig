@@ -2570,3 +2570,179 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit (2026-11-18): the SET splitter's shape ───────
+
+/// What `buildSetRequests` produced, walked: per message its length, per peer
+/// entry its key, whether it carried WGPEER_A_FLAGS (and their value) and how
+/// many allowed-ips its WGPEER_A_ALLOWEDIPS nest held (null: no such nest).
+const SetShape = struct {
+    const Entry = struct { key: Key, flags: ?u32, ips: ?usize };
+    msgs: [64]usize = undefined,
+    msg_count: usize = 0,
+    entries: [256]Entry = undefined,
+    entry_count: usize = 0,
+    peers_attrs: usize = 0,
+
+    fn walk(buf: []const u8) !SetShape {
+        var s: SetShape = .{};
+        var it: codec.MessageIterator = .{ .buf = buf };
+        while (try it.next()) |m| {
+            s.msgs[s.msg_count] = m.payload.len + codec.header_len;
+            s.msg_count += 1;
+            const g = try genl.splitPayload(m.payload);
+            var attrs: codec.AttrIterator = .{ .buf = g.attrs };
+            while (try attrs.next()) |a| {
+                if (a.type != WGDEVICE_A.PEERS) continue;
+                s.peers_attrs += 1;
+                var pit = a.nested();
+                while (try pit.next()) |entry| {
+                    var e: Entry = .{ .key = undefined, .flags = null, .ips = null };
+                    var eit = entry.nested();
+                    while (try eit.next()) |pa| switch (pa.type) {
+                        WGPEER_A.PUBLIC_KEY => e.key = pa.data[0..key_len].*,
+                        WGPEER_A.FLAGS => e.flags = std.mem.readInt(u32, pa.data[0..4], native_endian),
+                        WGPEER_A.ALLOWEDIPS => {
+                            var n: usize = 0;
+                            var iit = pa.nested();
+                            while (try iit.next()) |_| n += 1;
+                            e.ips = n;
+                        },
+                        else => {},
+                    };
+                    s.entries[s.entry_count] = e;
+                    s.entry_count += 1;
+                }
+            }
+        }
+        return s;
+    }
+};
+
+test "set builder: across every ceiling, no message overflows, no fragment is empty, flags go once" {
+    const gpa = testing.allocator;
+    var v6: [3]AllowedIp = undefined;
+    for (&v6, 0..) |*ip, i| {
+        var addr: [16]u8 = @splat(0);
+        addr[0] = 0xfd;
+        addr[15] = @intCast(i + 1);
+        ip.* = AllowedIp.v6(addr, 64);
+    }
+    const v4 = [_]AllowedIp{ AllowedIp.v4(.{ 10, 0, 0, 1 }, 32), AllowedIp.v4(.{ 10, 0, 0, 2 }, 32) };
+    const ep: Endpoint = .{ .v4 = .{ .addr = .{ 203, 0, 113, 5 }, .port = 51820 } };
+    var peers: [14]PeerConfig = undefined;
+    for (&peers, 0..) |*p, i| {
+        const k: u8 = @intCast(i);
+        p.* = switch (i % 4) {
+            // Everything a first fragment carries, and IPv6 allowed-ips.
+            0 => .{ .public_key = @splat(k), .update_only = true, .replace_allowed_ips = true, .preshared_key = @splat(0x55), .endpoint = ep, .persistent_keepalive_interval = 25, .allowed_ips = &v6 },
+            // No allowed-ips at all.
+            1 => .{ .public_key = @splat(k), .preshared_key = @splat(0x66), .persistent_keepalive_interval = 5 },
+            2 => .{ .public_key = @splat(k), .allowed_ips = &v4 },
+            else => .{ .public_key = @splat(k), .remove = true },
+        };
+    }
+    const cfg: Config = .{ .ifname = "wg0", .private_key = @splat(0x07), .listen_port = 51820, .fwmark = 1, .replace_peers = true, .peers = &peers };
+    // Every single unit fits in 300 bytes with its message's headers.
+    var ceiling: usize = 300;
+    while (ceiling <= 1400) : (ceiling += 1) {
+        var reqs = try buildSetRequests(gpa, 0x1c, 1, cfg, ceiling);
+        defer reqs.deinit(gpa);
+        const s = try SetShape.walk(reqs.buf);
+        try testing.expectEqual(@as(usize, reqs.msg_count), s.msg_count);
+        for (s.msgs[0..s.msg_count]) |len| try testing.expect(len <= ceiling);
+        var flags_seen: [peers.len]usize = @splat(0);
+        for (s.entries[0..s.entry_count]) |e| {
+            const p = &peers[e.key[0]];
+            if (p.allowed_ips.len == 0) {
+                try testing.expectEqual(@as(?usize, null), e.ips);
+            } else {
+                try testing.expect(e.ips.? >= 1);
+            }
+            if (e.flags) |f| {
+                flags_seen[e.key[0]] += 1;
+                try testing.expectEqual(p.wireFlags(), f);
+            }
+        }
+        for (&peers, flags_seen) |*p, n| try testing.expectEqual(@as(usize, @intFromBool(p.wireFlags() != 0)), n);
+    }
+    // update_only reaches the wire (peer 0: update_only + replace_allowed_ips).
+    try testing.expectEqual(WGPEER_F.UPDATE_ONLY | WGPEER_F.REPLACE_ALLOWEDIPS, peers[0].wireFlags());
+}
+
+test "set builder: ip-less peers split by the ceiling; a new message is filled before the next" {
+    const gpa = testing.allocator;
+    var peers: [20]PeerConfig = undefined;
+    for (&peers, 0..) |*p, i| p.* = .{ .public_key = @splat(@intCast(i)) };
+    const cfg: Config = .{ .ifname = "wg0", .peers = &peers };
+    var reqs = try buildSetRequests(gpa, 0x1c, 1, cfg, 512);
+    defer reqs.deinit(gpa);
+    const s = try SetShape.walk(reqs.buf);
+    for (s.msgs[0..s.msg_count]) |len| try testing.expect(len <= 512);
+    // A peer entry is 40 bytes, a message's headers 32: 12 peers fill 512 exactly.
+    try testing.expectEqual(@as(usize, 2), s.msg_count);
+    try testing.expectEqual(@as(usize, 512), s.msgs[0]);
+
+    // Two peers with one allowed-ip each, one per message: the second message
+    // carries its peer and the peer's ip, and no third message appears.
+    const one = [_]AllowedIp{AllowedIp.v4(.{ 10, 0, 0, 1 }, 32)};
+    const two: Config = .{ .ifname = "wg0", .peers = &.{ .{ .public_key = @splat(1), .allowed_ips = &one }, .{ .public_key = @splat(2), .allowed_ips = &one } } };
+    var r2 = try buildSetRequests(gpa, 0x1c, 1, two, 64);
+    defer r2.deinit(gpa);
+    const s2 = try SetShape.walk(r2.buf);
+    try testing.expectEqual(@as(usize, 2), s2.msg_count);
+    for (s2.entries[0..s2.entry_count]) |e| try testing.expectEqual(@as(?usize, 1), e.ips);
+
+    // No peers: no WGDEVICE_A_PEERS nest at all.
+    var r3 = try buildSetRequests(gpa, 0x1c, 1, .{ .ifname = "wg0", .listen_port = 1 }, default_max_msg_len);
+    defer r3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), (try SetShape.walk(r3.buf)).peers_attrs);
+}
+
+test "WipingAllocator: no resize or remap, and a free zeroes the block first" {
+    var backing: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var wa = wipe.WipingAllocator.init(fba.allocator());
+    const a = wa.allocator();
+    const buf = try a.alloc(u8, 64);
+    @memset(buf, 0x5a);
+    try testing.expect(!a.resize(buf, 32));
+    try testing.expect(!a.resize(buf, 128));
+    try testing.expect(a.remap(buf, 128) == null);
+    const at = @intFromPtr(buf.ptr) - @intFromPtr(&backing);
+    a.free(buf);
+    for (backing[at..][0..64]) |x| try testing.expectEqual(@as(u8, 0), x);
+}
+
+test "DeviceParser: deinit, and finish, leave no key in the parser's bytes or its freed blocks" {
+    const priv = patternKey(0x30);
+    const psk = patternKey(0x90);
+    for ([_]bool{ false, true }) |finish| {
+        var backing: [16 * 1024]u8 = @splat(0); // zeroed: a stack buffer holds older frames' bytes
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        const gpa = fba.allocator();
+        var p: DeviceParser = .init(gpa);
+        p.dev.private_key = priv;
+        // Five peers through the parser's own growth (4, then 8): the block it
+        // leaves is wiped before it is freed.
+        for (0..5) |i| {
+            try p.reservePeer();
+            p.peers.appendAssumeCapacity(.{ .public_key = @splat(@intCast(i)), .preshared_key = psk });
+        }
+        if (finish) {
+            var dev = try p.finish();
+            const vp: *volatile [@sizeOf(DeviceParser)]u8 = @ptrCast(&p);
+            const mine = vp.*;
+            try testing.expect(std.mem.indexOf(u8, &mine, &priv) == null);
+            dev.deinit(gpa);
+        }
+        p.deinit();
+        const vp: *volatile [@sizeOf(DeviceParser)]u8 = @ptrCast(&p);
+        const after = vp.*;
+        try testing.expect(std.mem.indexOf(u8, &after, &priv) == null);
+        const vb: *volatile [backing.len]u8 = &backing;
+        const heap = vb.*;
+        try testing.expect(std.mem.indexOf(u8, &heap, &psk) == null);
+        try testing.expect(std.mem.indexOf(u8, &heap, &priv) == null);
+    }
+}
