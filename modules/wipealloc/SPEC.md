@@ -6,7 +6,7 @@
 
 **Scope:** unsurveyed
 
-**Audit:** review none · mutation none · src ?
+**Audit:** review none · mutation 2026-11-18 (8/8, 0 eq) · src 587079bec2c92279
 
 **Hardening:** fuzz n/a — no input parsing, nothing to fuzz · ct n/a — the wipe's data-independent loop is not a secret-dependent branch (keyword review, 2026-11-18)
 
@@ -72,4 +72,6 @@ Our own reading of the contract.
 
 ## Open
 
-No survey and no mutation run yet (card entries `unsurveyed`, `mutation none`).
+No survey yet (scope `unsurveyed`) and no independent review (`review none`).
+
+Mutation 2026-11-18 (whole module, schemata, ReleaseSafe): 8 mutants — child allocation dropped, alignment lost on `alloc` and on `free`, `resize` returning true, `remap` returning a pointer, the wipe skipped, the wipe one byte short, `rawFree` skipped — 8 killed, 0 equivalent, 0 survivors (two killed by the child allocator's own alignment checks).
