@@ -2352,3 +2352,647 @@ test "monoFrom: a failing clock reads as the end of time (every deadline past), 
     try testing.expectEqual(std.math.maxInt(u64), monoFrom(0, .{ .sec = 1, .nsec = -5 }));
     try testing.expectEqual(@as(u64, 5 * std.time.ns_per_s + 7), monoFrom(0, .{ .sec = 5, .nsec = 7 }));
 }
+
+test "whole-module mutation: msUntil rounds up to the next millisecond, is 0 when due, caps at 60 s" {
+    try testing.expectEqual(@as(i32, 0), msUntil(100, 100));
+    try testing.expectEqual(@as(i32, 0), msUntil(99, 100));
+    try testing.expectEqual(@as(i32, 1), msUntil(101, 100));
+    try testing.expectEqual(@as(i32, 3), msUntil(2 * std.time.ns_per_ms + 100, 100));
+    try testing.expectEqual(@as(i32, 60_000), msUntil(10 * 60 * std.time.ns_per_s, 0));
+    try testing.expectEqual(@as(i32, 60_000), msUntil(std.math.maxInt(u64), 1));
+}
+
+test "whole-module mutation: monoFrom accepts second 0 and saturates instead of overflowing" {
+    try testing.expectEqual(@as(u64, 7), monoFrom(0, .{ .sec = 0, .nsec = 7 }));
+    const Sec = @FieldType(linux.timespec, "sec");
+    try testing.expectEqual(std.math.maxInt(u64), monoFrom(0, .{ .sec = std.math.maxInt(Sec), .nsec = 999_999_999 }));
+    // One second is 10^9 ns, not 10^6.
+    try testing.expectEqual(@as(u64, 3 * std.time.ns_per_s), monoFrom(0, .{ .sec = 3, .nsec = 0 }));
+}
+
+test "whole-module mutation: readMessage takes only the 24-bit length of the top attr (id and extended bits are ignored)" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const frame = try codec.encodeMessage(testing.allocator, codec.MSG.DATA, 7, 9, &.{ 1, 2, 3, 4 });
+    defer testing.allocator.free(frame);
+    std.mem.writeInt(u32, frame[8..12], 0xff00_0000 | 8, .big);
+    try testing.expectEqual(frame.len, linux.write(fds[1], frame.ptr, frame.len));
+    const m = try readMessage(fds[0], testing.allocator, monoNs() + std.time.ns_per_s);
+    defer m.deinit(testing.allocator);
+    try testing.expectEqual(codec.MSG.DATA, m.type);
+    try testing.expectEqual(@as(u16, 7), m.seq);
+    try testing.expectEqual(@as(u32, 9), m.peer);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, m.payload);
+}
+
+const FillCtx = struct { fd: i32, buf: []u8 };
+
+fn readFully(ctx: *FillCtx) void {
+    var off: usize = 0;
+    while (off < ctx.buf.len) {
+        const rc = linux.read(ctx.fd, ctx.buf[off..].ptr, ctx.buf.len - off);
+        if (linux.errno(rc) != .SUCCESS or rc == 0) return;
+        off += rc;
+    }
+}
+
+test "whole-module mutation: writeAll continues a partial send exactly where it stopped" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    // Far past the socket buffer: the first sends are partial and the writer waits for room.
+    const data = try testing.allocator.alloc(u8, 2 * 1024 * 1024);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate((i *% 31) ^ (i >> 8));
+    const got = try testing.allocator.alloc(u8, data.len);
+    defer testing.allocator.free(got);
+    @memset(got, 0);
+    var ctx: FillCtx = .{ .fd = fds[1], .buf = got };
+    const t = try std.Thread.spawn(.{}, readFully, .{&ctx});
+    const res = writeAll(fds[0], data, monoNs() + 20 * std.time.ns_per_s);
+    if (res) |_| {} else |_| _ = linux.shutdown(fds[0], linux.SHUT.RDWR);
+    t.join();
+    try res;
+    try testing.expectEqualSlices(u8, data, got);
+}
+
+test "whole-module mutation: sendMessageBy keeps OutOfMemory apart from an oversized body (TooLarge)" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(Error.OutOfMemory, sendMessageBy(-1, fa.allocator(), codec.MSG.DATA, 1, 0, &.{}, 0));
+    const huge = try testing.allocator.alloc(u8, codec.LEN_MASK);
+    defer testing.allocator.free(huge);
+    try testing.expectError(Error.TooLarge, sendMessageBy(-1, testing.allocator, codec.MSG.DATA, 1, 0, huge, 0));
+}
+
+test "whole-module mutation: a socket path of exactly max_path octets connects; the sockets are close-on-exec and non-blocking" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var buf: [max_path + 1]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&buf, "/tmp/zl-blobmsg-{d}-", .{linux.getpid()});
+    @memset(buf[prefix.len..], 'p');
+    buf[max_path] = 0;
+    const sock_path = buf[0..max_path];
+    _ = linux.unlink(@ptrCast(&buf));
+    defer _ = linux.unlink(@ptrCast(&buf));
+
+    var ctx: MockCtx = .{ .listen_fd = try mockBind(sock_path), .conns = 2 };
+    defer _ = linux.close(ctx.listen_fd);
+    const th = try std.Thread.spawn(.{}, mockServe, .{&ctx});
+
+    var c = try Client.open(gpa, sock_path);
+    // FD_CLOEXEC = 1 (F_GETFD), O_NONBLOCK in F_GETFL.
+    try testing.expect(linux.fcntl(c.fd, linux.F.GETFD, 0) & 1 != 0);
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    try testing.expect(linux.fcntl(c.fd, linux.F.GETFL, 0) & nonblock != 0);
+    // The dedicated connection of a subscription goes through the same code.
+    var es = try c.subscribe(null);
+    try testing.expect(linux.fcntl(es.fd, linux.F.GETFD, 0) & 1 != 0);
+    try testing.expect(linux.fcntl(es.fd, linux.F.GETFL, 0) & nonblock != 0);
+    es.close();
+    c.close();
+    th.join();
+}
+
+test "whole-module mutation: the handshake of subscribe is bounded by Options.max_reply_bytes" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "hsbytes");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+
+    var ctx: MockCtx = .{ .listen_fd = try mockBind(sock_path), .conns = 3 };
+    defer _ = linux.close(ctx.listen_fd);
+    const th = try std.Thread.spawn(.{}, mockServe, .{&ctx});
+
+    // The ADD_OBJECT answer carries 16 octets of attrs: more than this call may accumulate.
+    var c = try Client.openWith(gpa, sock_path, .{ .max_reply_bytes = 8 });
+    try testing.expectError(Error.TooLarge, c.subscribe(null));
+    try testing.expectError(Error.TooLarge, c.subscribeObject("system"));
+    c.close();
+    th.join();
+}
+
+/// Number of open descriptors below 1024 (a leak check that needs no /proc parsing).
+fn openFdCount() usize {
+    var n: usize = 0;
+    var fd: i32 = 0;
+    while (fd < 1024) : (fd += 1) {
+        if (linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) == .SUCCESS) n += 1;
+    }
+    return n;
+}
+
+test "whole-module mutation: a failed connect gives its descriptor back" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "nobody");
+    _ = linux.unlink(sock_path.ptr);
+    const before = openFdCount();
+    for (0..4) |_| try testing.expectError(Error.Connect, Client.open(testing.allocator, sock_path));
+    try testing.expectEqual(before, openFdCount());
+}
+
+test "whole-module mutation: mapEncode and decodeJson keep their error classes apart" {
+    try testing.expectEqual(Error.OutOfMemory, mapEncode(error.OutOfMemory));
+    try testing.expectEqual(Error.Unsupported, mapEncode(error.Unsupported));
+    try testing.expectEqual(Error.TooLarge, mapEncode(error.TooLarge));
+    try testing.expectEqual(Error.TooLarge, mapEncode(error.TooDeep));
+    // A cut attr is a bad message; an allocator that refuses is not.
+    try testing.expectError(Error.BadMessage, decodeJson(testing.allocator, &.{ 0x83, 0x00, 0x00 }));
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try codec.appendInt32(testing.allocator, &body, "n", 1);
+    try testing.expectError(Error.OutOfMemory, decodeJson(fa.allocator(), body.items));
+}
+
+fn feedFrame(fd: i32, mtype: u8, seq: u16, children: []const u8) !void {
+    const fr = try codec.encodeMessage(testing.allocator, mtype, seq, 0, children);
+    defer testing.allocator.free(fr);
+    if (linux.write(fd, fr.ptr, fr.len) != fr.len) return error.WriteFailed;
+}
+
+test "whole-module mutation: a malformed attr walk in a status answer is BadMessage, never a verdict of 0" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var good: std.ArrayList(u8) = .empty;
+    defer good.deinit(testing.allocator);
+    try codec.appendAttrU32(testing.allocator, &good, codec.ATTR.STATUS, 7);
+    try testing.expectEqual(@as(?i32, 7), try statusCode(good.items));
+    try good.append(testing.allocator, 0xaa); // one stray octet: a header that is not even whole
+    try testing.expectError(Error.BadMessage, statusCode(good.items));
+    // The same walk inside `awaitStatus`, both with and without the OBJID collection.
+    for ([_]bool{ true, false }) |collect| {
+        try feedFrame(fds[1], codec.MSG.STATUS, 1, good.items);
+        var budget = CallBudget.startAt(.{}, monoNs() + 2 * std.time.ns_per_s);
+        var objid: ?u32 = null;
+        try testing.expectError(Error.BadMessage, awaitStatus(fds[0], testing.allocator, &budget, 1, if (collect) &objid else null));
+    }
+}
+
+test "whole-module mutation: list: a negative closing status is a refusal; a malformed entry is BadMessage" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    var st: std.ArrayList(u8) = .empty;
+    defer st.deinit(testing.allocator);
+    try codec.appendAttrU32(testing.allocator, &st, codec.ATTR.STATUS, 0xffff_ffff);
+    try feedFrame(fds[1], codec.MSG.STATUS, 1, st.items);
+    try testing.expectError(Error.UbusError, c.list("a*"));
+    try testing.expectEqual(@as(i32, -1), c.last_status);
+    // seq 2: one entry whose attr walk is cut.
+    try feedFrame(fds[1], codec.MSG.DATA, 2, &.{0xaa});
+    try testing.expectError(Error.BadMessage, c.list(null));
+}
+
+test "whole-module mutation: invoke: a negative ack is the daemon's refusal; any JSON whitespace means no args; bad JSON is BadMessage" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    const gpa = testing.allocator;
+    var found: std.ArrayList(u8) = .empty;
+    defer found.deinit(gpa);
+    try codec.appendAttrU32(gpa, &found, codec.ATTR.OBJID, 5);
+    try codec.appendAttrString(gpa, &found, codec.ATTR.OBJPATH, "o");
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(gpa);
+    try codec.appendAttrU32(gpa, &ok, codec.ATTR.STATUS, 0);
+    var neg: std.ArrayList(u8) = .empty;
+    defer neg.deinit(gpa);
+    try codec.appendAttrU32(gpa, &neg, codec.ATTR.STATUS, 0xffff_ffff);
+    var done: std.ArrayList(u8) = .empty;
+    defer done.deinit(gpa);
+    try codec.appendAttrU32(gpa, &done, codec.ATTR.STATUS, 0);
+    try codec.appendAttrU32(gpa, &done, codec.ATTR.OBJID, 5);
+
+    // whitespace-only args: no arguments (lookup seq 1, invoke seq 2)
+    try feedFrame(fds[1], codec.MSG.DATA, 1, found.items);
+    try feedFrame(fds[1], codec.MSG.STATUS, 1, ok.items);
+    try feedFrame(fds[1], codec.MSG.STATUS, 2, ok.items);
+    try feedFrame(fds[1], codec.MSG.STATUS, 2, done.items);
+    const r = try c.invoke("o", "m", " \t\r\n");
+    defer gpa.free(r);
+    try testing.expectEqualStrings("{}", r);
+    // bad JSON (lookup seq 3)
+    try feedFrame(fds[1], codec.MSG.DATA, 3, found.items);
+    try feedFrame(fds[1], codec.MSG.STATUS, 3, ok.items);
+    try testing.expectError(Error.BadMessage, c.invoke("o", "m", "{not json"));
+    // a negative ack (lookup seq 5: the bad-JSON call used 3 and 4; invoke seq 6)
+    try feedFrame(fds[1], codec.MSG.DATA, 5, found.items);
+    try feedFrame(fds[1], codec.MSG.STATUS, 5, ok.items);
+    try feedFrame(fds[1], codec.MSG.STATUS, 6, neg.items);
+    try testing.expectError(Error.UbusError, c.invoke("o", "m", null));
+    try testing.expectEqual(@as(i32, -1), c.last_status);
+}
+
+test "whole-module mutation: sendEvent: whitespace-only data is no data; bad JSON is BadMessage; a negative status is a refusal" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(testing.allocator);
+    try codec.appendAttrU32(testing.allocator, &ok, codec.ATTR.STATUS, 0);
+    var neg: std.ArrayList(u8) = .empty;
+    defer neg.deinit(testing.allocator);
+    try codec.appendAttrU32(testing.allocator, &neg, codec.ATTR.STATUS, 0xffff_ffff);
+    try feedFrame(fds[1], codec.MSG.STATUS, 1, ok.items);
+    try c.sendEvent("x", "\r\n\t ");
+    try testing.expectError(Error.BadMessage, c.sendEvent("x", "{not json"));
+    try feedFrame(fds[1], codec.MSG.STATUS, 2, neg.items);
+    try testing.expectError(Error.UbusError, c.sendEvent("x", null));
+    try testing.expectEqual(@as(i32, -1), c.last_status);
+}
+
+const ScriptCtx = struct { listen_fd: i32, script: []const u8, no_hello: bool = false };
+
+/// A connection of the scripted daemon: HELLO, then `script` at once, then it waits for the hang-up.
+fn scriptConn(fd: i32, script: []const u8) void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module
+    defer _ = linux.close(fd);
+    sendMessage(fd, gpa, codec.MSG.HELLO, 0, 100, &.{}) catch return;
+    var off: usize = 0;
+    while (off < script.len) {
+        const rc = linux.write(fd, script[off..].ptr, script.len - off);
+        if (linux.errno(rc) != .SUCCESS) return;
+        off += rc;
+    }
+    var b: [64]u8 = undefined;
+    while (true) {
+        const rc = linux.read(fd, &b, b.len);
+        if (linux.errno(rc) != .SUCCESS or rc == 0) return;
+    }
+}
+
+/// Two connections: the client's own (HELLO only) and the verb's (HELLO + the script).
+fn scriptServe(ctx: *ScriptCtx) void {
+    const rc1 = linux.accept(ctx.listen_fd, null, null);
+    if (linux.errno(rc1) != .SUCCESS) return;
+    const first = std.Thread.spawn(.{}, scriptConn, .{ @as(i32, @intCast(rc1)), @as([]const u8, &.{}) }) catch return;
+    defer first.join();
+    const rc2 = linux.accept(ctx.listen_fd, null, null);
+    if (linux.errno(rc2) != .SUCCESS) return;
+    if (ctx.no_hello) {
+        // Accepted, never greeted: waits for the hang-up.
+        defer _ = linux.close(@as(i32, @intCast(rc2)));
+        var b: [64]u8 = undefined;
+        while (true) {
+            const rc = linux.read(@intCast(rc2), &b, b.len);
+            if (linux.errno(rc) != .SUCCESS or rc == 0) return;
+        }
+    }
+    scriptConn(@intCast(rc2), ctx.script);
+}
+
+const ScriptVerb = enum { many, obj, mon };
+
+fn scripted(tag: []const u8, script: []const u8, verb: ScriptVerb, last_status: *i32) Error!void {
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = mockSocketPath(&pathbuf, tag) catch return Error.Connect;
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+    var ctx: ScriptCtx = .{ .listen_fd = mockBind(sock_path) catch return Error.Connect, .script = script };
+    defer _ = linux.close(ctx.listen_fd);
+    const th = std.Thread.spawn(.{}, scriptServe, .{&ctx}) catch return Error.Connect;
+    defer th.join();
+    var c = try Client.open(testing.allocator, sock_path);
+    defer c.close();
+    defer last_status.* = c.last_status;
+    switch (verb) {
+        .many => {
+            var es = try c.subscribeMany(&.{"a"});
+            es.close();
+        },
+        .obj => {
+            var st = try c.subscribeObject("o");
+            st.close();
+        },
+        .mon => {
+            var m = try c.monitor();
+            m.close();
+        },
+    }
+}
+
+fn pushFrame(list: *std.ArrayList(u8), mtype: u8, seq: u16, children: []const u8) !void {
+    const fr = try codec.encodeMessage(testing.allocator, mtype, seq, 0, children);
+    defer testing.allocator.free(fr);
+    try list.appendSlice(testing.allocator, fr);
+}
+
+fn statusAttrs(list: *std.ArrayList(u8), code: u32, objid: ?u32) !void {
+    list.clearRetainingCapacity();
+    try codec.appendAttrU32(testing.allocator, list, codec.ATTR.STATUS, code);
+    if (objid) |o| try codec.appendAttrU32(testing.allocator, list, codec.ATTR.OBJID, o);
+}
+
+test "whole-module mutation: a negative status code in any handshake step is the daemon's refusal" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    const neg: u32 = 0xffff_ffff;
+    var ls: i32 = 0;
+
+    // the first step (ADD_OBJECT) refused: all three verbs that start with one
+    try statusAttrs(&a, neg, null);
+    try pushFrame(&script, codec.MSG.STATUS, 1, a.items);
+    try testing.expectError(Error.UbusError, scripted("n1", script.items, .many, &ls));
+    try testing.expectEqual(@as(i32, -1), ls);
+    ls = 0;
+    try testing.expectError(Error.UbusError, scripted("n2", script.items, .obj, &ls));
+    try testing.expectEqual(@as(i32, -1), ls);
+    ls = 0;
+    // monitor: the verdict is the STATUS of seq 1
+    try testing.expectError(Error.UbusError, scripted("n3", script.items, .mon, &ls));
+    try testing.expectEqual(@as(i32, -1), ls);
+
+    // ADD_OBJECT accepted (seq 1), the second step refused
+    script.clearRetainingCapacity();
+    try statusAttrs(&a, 0, 9);
+    try pushFrame(&script, codec.MSG.STATUS, 1, a.items);
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(gpa);
+    try statusAttrs(&second, neg, null);
+    try pushFrame(&script, codec.MSG.STATUS, 2, second.items);
+    ls = 0;
+    try testing.expectError(Error.UbusError, scripted("n4", script.items, .many, &ls));
+    try testing.expectEqual(@as(i32, -1), ls);
+    ls = 0;
+    try testing.expectError(Error.UbusError, scripted("n5", script.items, .obj, &ls));
+    try testing.expectEqual(@as(i32, -1), ls);
+
+    // LOOKUP answered with one entry (seq 2), SUBSCRIBE (seq 3) refused
+    script.clearRetainingCapacity();
+    try statusAttrs(&a, 0, 9);
+    try pushFrame(&script, codec.MSG.STATUS, 1, a.items);
+    var entry: std.ArrayList(u8) = .empty;
+    defer entry.deinit(gpa);
+    try codec.appendAttrU32(gpa, &entry, codec.ATTR.OBJID, 7);
+    try codec.appendAttrString(gpa, &entry, codec.ATTR.OBJPATH, "o");
+    try pushFrame(&script, codec.MSG.DATA, 2, entry.items);
+    try statusAttrs(&a, 0, null);
+    try pushFrame(&script, codec.MSG.STATUS, 2, a.items);
+    try pushFrame(&script, codec.MSG.STATUS, 3, second.items);
+    ls = 0;
+    try testing.expectError(Error.UbusError, scripted("n6", script.items, .obj, &ls));
+    try testing.expectEqual(@as(i32, -1), ls);
+}
+
+test "whole-module mutation: subscribeObject refuses a name that cannot fit one message (the cap is max_msg - 64, inclusive)" {
+    var c: Client = .{ .gpa = testing.allocator, .fd = -1, .client_id = 1 }; // path_len 0: a name that passes the check ends in Connect
+    const name = try testing.allocator.alloc(u8, max_msg);
+    defer testing.allocator.free(name);
+    @memset(name, 'x');
+    try testing.expectError(Error.Connect, c.subscribeObject(name[0 .. max_msg - 65]));
+    try testing.expectError(Error.TooLarge, c.subscribeObject(name[0 .. max_msg - 64]));
+    try testing.expectError(Error.TooLarge, c.subscribeObject(name[0 .. max_msg - 63]));
+    try testing.expectError(Error.TooLarge, c.subscribeObject(name));
+}
+
+test "whole-module mutation: a dedicated connection that never says HELLO is Connect, not the read's own Timeout" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "nohello2");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+    var ctx: ScriptCtx = .{ .listen_fd = try mockBind(sock_path), .script = &.{}, .no_hello = true };
+    defer _ = linux.close(ctx.listen_fd);
+    const th = try std.Thread.spawn(.{}, scriptServe, .{&ctx});
+    defer th.join();
+    var c = try Client.openWith(testing.allocator, sock_path, .{ .call_timeout_ms = 300 });
+    defer c.close();
+    try testing.expectError(Error.Connect, c.subscribe(null));
+}
+
+test "whole-module mutation: subscribeMany takes 64 patterns and refuses 65" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "pats64");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+    var ctx: MockCtx = .{ .listen_fd = try mockBind(sock_path), .conns = 2 };
+    defer _ = linux.close(ctx.listen_fd);
+    const th = try std.Thread.spawn(.{}, mockServe, .{&ctx});
+    var c = try Client.open(testing.allocator, sock_path);
+    var pats: [65][]const u8 = undefined;
+    for (&pats) |*p| p.* = "a";
+    try testing.expectError(Error.Unsupported, c.subscribeMany(pats[0..65]));
+    var es = try c.subscribeMany(pats[0..64]);
+    es.close();
+    c.close();
+    th.join();
+}
+
+test "whole-module mutation: invoke: of several DATA replies the last wins and the first is freed" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var c: Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    const gpa = testing.allocator;
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    try codec.appendAttrU32(gpa, &a, codec.ATTR.OBJID, 5);
+    try codec.appendAttrString(gpa, &a, codec.ATTR.OBJPATH, "o");
+    try feedFrame(fds[1], codec.MSG.DATA, 1, a.items);
+    try statusAttrs(&a, 0, null);
+    try feedFrame(fds[1], codec.MSG.STATUS, 1, a.items);
+    for ([_][]const u8{ "first", "second" }) |name| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try codec.appendInt32(gpa, &body, name, 1);
+        var attrs: std.ArrayList(u8) = .empty;
+        defer attrs.deinit(gpa);
+        try codec.appendAttr(gpa, &attrs, codec.ATTR.DATA, body.items);
+        try feedFrame(fds[1], codec.MSG.DATA, 2, attrs.items);
+    }
+    try statusAttrs(&a, 0, 5);
+    try feedFrame(fds[1], codec.MSG.STATUS, 2, a.items);
+    const r = try c.invoke("o", "m", null);
+    defer gpa.free(r);
+    try testing.expectEqualStrings("{\"second\":1}", r);
+}
+
+test "whole-module mutation: a MonitorStream hands out the lines of its handshake once" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var st: MonitorStream = .{ .gpa = testing.allocator, .fd = fds[0] };
+    defer st.pending.deinit(testing.allocator);
+    try st.pending.appendSlice(testing.allocator, "{\"a\":1}\n");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(!try st.poll(&out));
+    try testing.expectEqualStrings("{\"a\":1}\n", out.items);
+    try testing.expect(!try st.poll(&out));
+    try testing.expectEqualStrings("{\"a\":1}\n", out.items);
+}
+
+test "whole-module mutation: waitFor that times out leaves no verdict in last_status" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "wf0");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+    var ctx: MockCtx = .{ .listen_fd = try mockBind(sock_path), .conns = 1 };
+    defer _ = linux.close(ctx.listen_fd);
+    const th = try std.Thread.spawn(.{}, mockServe, .{&ctx});
+    var c = try Client.open(testing.allocator, sock_path);
+    // 0 ms: the deadline is already past when the one look comes back NotFound (its code 4 is not the verdict).
+    try testing.expectError(Error.Timeout, c.waitFor(&.{"nonesuch"}, 0));
+    try testing.expectEqual(@as(i32, 0), c.last_status);
+    c.close();
+    th.join();
+}
+
+test "whole-module mutation: poll stops draining at its deadline even when no frame carries payload" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    // 8000 empty frames (12 octets each): they cost no payload budget, only time.
+    var one: [12]u8 = undefined;
+    @memset(&one, 0);
+    one[1] = codec.MSG.DATA;
+    std.mem.writeInt(u32, one[8..12], 4, .big);
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(testing.allocator);
+    for (0..8000) |_| try all.appendSlice(testing.allocator, &one);
+    try testing.expectEqual(all.items.len, linux.write(fds[1], all.items.ptr, all.items.len));
+    var es: EventStream = .{ .gpa = testing.allocator, .fd = fds[0], .opts = .{ .call_timeout_ms = 1 } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    // A deadline that falls inside a frame is a Timeout, between frames a plain false: both end the drain.
+    const closed = es.poll(&out) catch |e| if (e == error.Timeout) false else return e;
+    try testing.expect(!closed); // an empty frame (length 4) is a frame, not corruption
+    // The drain ended on the clock, not on an empty socket: frames are still queued.
+    var pfd = [_]linux.pollfd{.{ .fd = fds[0], .events = linux.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(usize, 1), linux.poll(&pfd, 1, 0));
+}
+
+test "whole-module mutation: a half-closed peer with a header cut short is the stream ending (RDHUP alone, no HUP)" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    try testing.expectEqual(@as(usize, 5), linux.write(fds[1], "\x00\x02\x00\x01\x00", 5));
+    try testing.expectEqual(@as(usize, 0), linux.shutdown(fds[1], linux.SHUT.WR));
+    var es: EventStream = .{ .gpa = testing.allocator, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(try es.poll(&out));
+    try testing.expect(es.broken);
+}
+
+test "whole-module mutation: poll takes the 24-bit length of the top attr only, and a frame of exactly max_reply_bytes fits" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    // A DATA frame (ignored by an event stream) whose top attr carries id and extended bits.
+    const frame = try codec.encodeMessage(testing.allocator, codec.MSG.DATA, 1, 0, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer testing.allocator.free(frame);
+    std.mem.writeInt(u32, frame[8..12], 0xff00_0000 | 12, .big);
+    try testing.expectEqual(frame.len, linux.write(fds[1], frame.ptr, frame.len));
+    var es: EventStream = .{ .gpa = testing.allocator, .fd = fds[0], .opts = .{ .max_reply_bytes = 8 } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(!try es.poll(&out));
+    try testing.expect(!es.broken);
+    // The frame was consumed: nothing is left to read.
+    var pfd = [_]linux.pollfd{.{ .fd = fds[0], .events = linux.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(usize, 0), linux.poll(&pfd, 1, 0));
+}
+
+fn monFrame(list: *std.ArrayList(u8), send: u8, inner: []const u8) !void {
+    const gpa = testing.allocator;
+    try codec.appendAttrU32(gpa, list, codec.MON.CLIENT, 1);
+    try codec.appendAttrU32(gpa, list, codec.MON.PEER, 2);
+    try codec.appendAttr(gpa, list, codec.MON.SEND, &.{send});
+    try codec.appendAttrU32(gpa, list, codec.MON.SEQ, 3);
+    try codec.appendAttrU32(gpa, list, codec.MON.TYPE, codec.MSG.STATUS);
+    try codec.appendAttr(gpa, list, codec.MON.DATA, inner);
+}
+
+/// The JSON line of a MONITOR payload, or null when `monitorJson` calls the frame malformed.
+fn monLine(payload: []const u8) !?[]u8 {
+    var w = std.Io.Writer.Allocating.init(testing.allocator);
+    defer w.deinit();
+    if (!try monitorJson(&w.writer, payload)) return null;
+    return try testing.allocator.dupe(u8, w.written());
+}
+
+test "whole-module mutation: monitorJson: any non-zero SEND byte is true, a cut walk or a long STATUS is malformed, unknown attrs print as two-digit hex" {
+    const gpa = testing.allocator;
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(gpa);
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(gpa);
+
+    try monFrame(&frame, 2, inner.items);
+    const l1 = (try monLine(frame.items)).?;
+    defer gpa.free(l1);
+    try testing.expectEqualStrings("{\"send\":true,\"client\":1,\"peer\":2,\"seq\":3,\"type\":\"status\",\"message\":{}}", l1);
+
+    frame.clearRetainingCapacity();
+    try monFrame(&frame, 0, inner.items);
+    const l0 = (try monLine(frame.items)).?;
+    defer gpa.free(l0);
+    try testing.expect(std.mem.startsWith(u8, l0, "{\"send\":false,"));
+
+    // a stray octet after the last attr: the walk of the payload is cut
+    try frame.append(gpa, 0xaa);
+    try testing.expectEqual(@as(?[]u8, null), try monLine(frame.items));
+
+    // STATUS must be exactly 4 octets
+    try codec.appendAttr(gpa, &inner, codec.ATTR.STATUS, &.{ 0, 0, 0, 0, 0 });
+    frame.clearRetainingCapacity();
+    try monFrame(&frame, 1, inner.items);
+    try testing.expectEqual(@as(?[]u8, null), try monLine(frame.items));
+
+    // an attr with no known name: `attr<N>` and its octets in hex, zero padded
+    inner.clearRetainingCapacity();
+    try codec.appendAttr(gpa, &inner, 20, &.{ 0x05, 0xab });
+    frame.clearRetainingCapacity();
+    try monFrame(&frame, 1, inner.items);
+    const lh = (try monLine(frame.items)).?;
+    defer gpa.free(lh);
+    try testing.expect(std.mem.endsWith(u8, lh, "\"message\":{\"attr20\":\"05ab\"}}"));
+}
+
+test "whole-module mutation: an INVOKE whose NO_REPLY attr is any non-zero byte is not answered" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const gpa = testing.allocator;
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(gpa);
+    try codec.appendAttrU32(gpa, &ch, codec.ATTR.OBJID, 7);
+    try codec.appendAttrString(gpa, &ch, codec.ATTR.METHOD, "m");
+    try codec.appendAttr(gpa, &ch, codec.ATTR.NO_REPLY, &.{2});
+    try codec.appendAttr(gpa, &ch, codec.ATTR.DATA, &.{});
+    try feedFrame(fds[1], codec.MSG.INVOKE, 9, ch.items);
+    var os: ObjectStream = .{ .gpa = gpa, .fd = fds[0], .own_id = 7, .target_id = 8 };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try testing.expect(!try os.poll(&out));
+    try testing.expectEqualStrings("{\"m\":{}}\n", out.items);
+    var pfd = [_]linux.pollfd{.{ .fd = fds[1], .events = linux.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(usize, 0), linux.poll(&pfd, 1, 0));
+}

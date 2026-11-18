@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (564 mutants over `codec.zig` and `root.zig`; 522 killed, 42 equivalent or unobservable, none surviving); 32 new tests pin the size and nesting boundaries of the codec, scalar sizes, the `DOUBLE` text switch, `msUntil`/`monoFrom`/`writeAll`/`readMessage`, negative status codes in every handshake, whitespace-only args, `waitFor`'s `last_status`, descriptor flags and leaks, and the poll hang-up/length/budget edges; the card records `mutation 2026-11-18 (522/564, 42 eq)`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-04** — card records the delta audit and the live run of the final code.
 
