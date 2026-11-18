@@ -304,7 +304,7 @@ pub const Session = struct {
             services.decodeCreateSessionResponse,
             services.result_fns.create_session,
         );
-        errdefer services.freeCreateSessionResponse(allocator, response);
+        errdefer freeCreatedSession(allocator, response);
 
         // §5.6.2.2 `ServerSignature`: RSA-PKCS1v1.5/SHA-256 over
         // clientCertificate ‖ clientNonce, verified against the *pinned*
@@ -1689,6 +1689,10 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
     var client_in_r: std.Io.Reader = .fixed(sealed_opn_resp);
     var conn = transport.Connection.init(&client_in_r, &client_out_w);
 
+    // The client's nonce is the first draw from `random` once `open` starts.
+    var nonce_prng = prng;
+    var expected_nonce: [32]u8 = undefined;
+    nonce_prng.random().bytes(&expected_nonce);
     var ch: SecureChannel = undefined;
     try SecureChannel.open(
         &conn,
@@ -1738,6 +1742,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
     defer services.freeOpenSecureChannelRequest(testing.allocator, opn_req);
     try testing.expectEqual(services.MessageSecurityMode.sign_and_encrypt, opn_req.security_mode);
     try testing.expectEqual(@as(usize, 32), opn_req.client_nonce.?.len);
+    try testing.expectEqualSlices(u8, &expected_nonce, opn_req.client_nonce.?);
 
     // The server's independent P-SHA256 derivation from the exchanged
     // nonces must agree byte-for-byte with the client's channel keys.
@@ -2654,4 +2659,182 @@ test "LIVE open62541 secure interop: Basic256Sha256 SignAndEncrypt + Sign -> OPN
     // the same server.
     try liveSecureSequence(gpa, io, .sign_and_encrypt, credentials, server_certificate, random, "opcua-live-client-open62541-server_ctt-sign_and_encrypt");
     try liveSecureSequence(gpa, io, .sign, credentials, server_certificate, random, "opcua-live-client-open62541-server_ctt-sign");
+}
+
+// ── scripted peers for the client bookkeeping that a real server never exercises ──
+
+fn renderFrame(w: *std.Io.Writer, request_id: u32, comptime Body: type, body: Body, comptime encodeFn: fn (*encoding.Encoder, Body) encoding.EncodeError!void, type_id: encoding.NodeId) !void {
+    var body_alloc = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer body_alloc.deinit();
+    var e = encoding.Encoder.init(&body_alloc.writer);
+    try e.writer.writeInt(u32, 7, .little); // SecureChannelId
+    try e.writer.writeInt(u32, 3, .little); // TokenId
+    try e.writer.writeInt(u32, request_id, .little); // SequenceNumber
+    try e.writer.writeInt(u32, request_id, .little); // RequestId
+    try e.encodeNodeId(type_id);
+    try encodeFn(&e, body);
+    const frame_body = body_alloc.writer.buffered();
+    var conn = transport.Connection.init(undefined, w);
+    try conn.sendChunk(.{ .message_type = .message, .chunk_type = .final, .message_size = 8 + @as(u32, @intCast(frame_body.len)) }, frame_body);
+}
+
+const scripted_header: services.ResponseHeader = .{ .timestamp = 0, .request_handle = 0, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = services.no_additional_header };
+
+test "Subscription offline scripted: surplus and failed CreateMonitoredItems results, every notification kind, an empty Read, and a null acknowledgement list" {
+    const testing = std.testing;
+    var server_buf: [8192]u8 = undefined;
+    var server_w: std.Io.Writer = .fixed(&server_buf);
+
+    // 1: three results for two specs (the third is the server's mistake), the middle one failed
+    const results = [_]services.MonitoredItemCreateResult{
+        .{ .status_code = 0, .monitored_item_id = 100, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter },
+        .{ .status_code = services.status.bad_node_id_unknown, .monitored_item_id = 0, .revised_sampling_interval = 0, .revised_queue_size = 0, .filter_result = services.no_filter },
+        .{ .status_code = 0, .monitored_item_id = 102, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter },
+    };
+    try renderFrame(&server_w, 1, services.CreateMonitoredItemsResponse, .{ .response_header = scripted_header, .results = &results, .diagnostic_infos = null }, services.encodeCreateMonitoredItemsResponse, services.type_id.create_monitored_items_response);
+
+    // 2: a Publish answer carrying a status change, an event list, a data change and something unknown
+    var sc_buf: [64]u8 = undefined;
+    var sc_w: std.Io.Writer = .fixed(&sc_buf);
+    var sc_e = encoding.Encoder.init(&sc_w);
+    try services.encodeStatusChangeNotification(&sc_e, .{ .status = services.status.bad_timeout, .diagnostic_info = .{} });
+    var ev_buf: [64]u8 = undefined;
+    var ev_w: std.Io.Writer = .fixed(&ev_buf);
+    var ev_e = encoding.Encoder.init(&ev_w);
+    try services.encodeEventNotificationList(&ev_e, .{ .events = null });
+    var dc_buf: [64]u8 = undefined;
+    var dc_w: std.Io.Writer = .fixed(&dc_buf);
+    var dc_e = encoding.Encoder.init(&dc_w);
+    try services.encodeDataChangeNotification(&dc_e, .{ .monitored_items = null, .diagnostic_infos = null });
+    const data = [_]encoding.ExtensionObject{
+        .{ .type_id = services.type_id.status_change_notification, .encoding = .byte_string, .body = sc_w.buffered() },
+        .{ .type_id = services.type_id.event_notification_list, .encoding = .byte_string, .body = ev_w.buffered() },
+        .{ .type_id = services.type_id.data_change_notification, .encoding = .byte_string, .body = dc_w.buffered() },
+        .{ .type_id = services.type_id.read_request, .encoding = .byte_string, .body = "" },
+    };
+    try renderFrame(&server_w, 2, services.PublishResponse, .{
+        .response_header = scripted_header,
+        .subscription_id = 1,
+        .available_sequence_numbers = null,
+        .more_notifications = false,
+        .notification_message = .{ .sequence_number = 9, .publish_time = 0, .notification_data = &data },
+        .results = null,
+        .diagnostic_infos = null,
+    }, services.encodePublishResponse, services.type_id.publish_response);
+
+    // 3: a Read answer without a single result
+    try renderFrame(&server_w, 3, services.ReadResponse, .{ .response_header = scripted_header, .results = &.{}, .diagnostic_infos = null }, services.encodeReadResponse, services.type_id.read_response);
+
+    var client_out_buf: [8192]u8 = undefined;
+    var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
+    var client_in_r: std.Io.Reader = .fixed(server_w.buffered());
+    var conn = transport.Connection.init(&client_in_r, &client_out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3 } };
+    var session: Session = .{ .channel = &ch, .allocator = testing.allocator, .authentication_token = services.null_node_id };
+    var sub: Subscription = .{ .session = &session, .allocator = testing.allocator, .subscription_id = 1 };
+    defer sub.deinit();
+
+    const specs = [_]Subscription.MonitoredItemSpec{
+        .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } }, .client_handle = 10 },
+        .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2259 } }, .client_handle = 11 },
+    };
+    const created = try sub.createMonitoredItems(&specs, .both);
+    defer services.freeCreateMonitoredItemsResponse(testing.allocator, created);
+    try testing.expectEqual(@as(usize, 1), sub.monitored_items.items.len);
+    try testing.expectEqual(@as(u32, 100), sub.findMonitoredItem(10).?);
+    try testing.expect(sub.findMonitoredItem(11) == null);
+
+    const written_before = client_out_w.buffered().len;
+    const published = try sub.publish(.{});
+    defer freePublishResult(testing.allocator, published);
+    try testing.expectEqual(@as(usize, 4), published.notifications.len);
+    try testing.expect(published.notifications[0] == .status_change);
+    try testing.expectEqual(services.status.bad_timeout, published.notifications[0].status_change.status);
+    try testing.expect(published.notifications[1] == .event);
+    try testing.expect(published.notifications[2] == .data_change);
+    try testing.expect(published.notifications[3] == .unrecognized);
+    // nothing to acknowledge yet: the list is absent (-1), not empty (0)
+    const publish_request = client_out_w.buffered()[written_before..];
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), std.mem.readInt(u32, publish_request[publish_request.len - 4 ..][0..4], .little));
+
+    try testing.expectError(error.UnexpectedResponseType, session.readAttribute(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, services.attribute_id.value));
+}
+
+test "secure offline scripted: a secured OpenSecureChannel answer with an empty server nonce is refused" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(43)));
+    const random = prng.random();
+    var client_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 512,
+        .common_name = "empty-nonce-client",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:client",
+    }, &client_creds);
+    defer client_creds.deinit(testing.allocator);
+    var server_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 768,
+        .common_name = "empty-nonce-server",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+    }, &server_creds);
+    defer server_creds.deinit(testing.allocator);
+
+    var resp = std.Io.Writer.Allocating.init(testing.allocator);
+    defer resp.deinit();
+    var e = encoding.Encoder.init(&resp.writer);
+    try e.writer.writeInt(u32, 7, .little);
+    try security.encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+        .security_policy_uri = security.SecurityPolicy.basic256sha256.uri(),
+        .sender_certificate = server_creds.certificate_der,
+        .receiver_certificate_thumbprint = &security.certificateThumbprint(client_creds.certificate_der),
+    });
+    const enc_offset = resp.writer.buffered().len;
+    try e.writer.writeInt(u32, 1, .little);
+    try e.writer.writeInt(u32, 1, .little);
+    try e.encodeNodeId(services.type_id.open_secure_channel_response);
+    try services.encodeOpenSecureChannelResponse(&e, .{
+        .response_header = scripted_header,
+        .server_protocol_version = 0,
+        .security_token = .{ .channel_id = 7, .token_id = 3, .created_at = 0, .revised_lifetime = 3_600_000 },
+        .server_nonce = "",
+    });
+    const sealed = try security.sealAsymmetricMessage(
+        testing.allocator,
+        random,
+        transport.MessageType.open_secure_channel.code(),
+        resp.writer.buffered(),
+        enc_offset,
+        &server_creds,
+        client_creds.certificate_der,
+    );
+    defer testing.allocator.free(sealed);
+
+    var out_buf: [8192]u8 = undefined;
+    var out_w: std.Io.Writer = .fixed(&out_buf);
+    var in_r: std.Io.Reader = .fixed(sealed);
+    var conn = transport.Connection.init(&in_r, &out_w);
+    var ch: SecureChannel = undefined;
+    try testing.expectError(error.InvalidSecureMessage, SecureChannel.open(&conn, testing.allocator, .{
+        .security = .{
+            .policy = .basic256sha256,
+            .mode = .sign_and_encrypt,
+            .credentials = client_creds,
+            .server_certificate = server_creds.certificate_der,
+            .random = random,
+        },
+    }, &ch));
+}
+
+/// `Session.create`'s error path: the whole response, including the two
+/// NodeIds `freeCreateSessionResponse` leaves to the caller (the session id
+/// and the AuthenticationToken, an opaque 32-byte string on this module's own
+/// server) — the success path hands them to the `Session`, a refusal after the
+/// response arrived must not leak them.
+fn freeCreatedSession(allocator: std.mem.Allocator, response: services.CreateSessionResponse) void {
+    encoding.freeNodeId(allocator, response.session_id);
+    encoding.freeNodeId(allocator, response.authentication_token);
+    services.freeCreateSessionResponse(allocator, response);
 }
