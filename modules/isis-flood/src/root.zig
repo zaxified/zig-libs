@@ -77,6 +77,7 @@ test {
     _ = @import("scheduler.zig");
     _ = @import("snp.zig");
     _ = @import("goldens.zig");
+    _ = @import("auth_test.zig");
 }
 
 test "meta is well-formed" {

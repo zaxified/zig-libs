@@ -243,6 +243,23 @@ const NodeState = struct {
     sched: isis_flood.Scheduler,
     /// Sequence number of this node's own LSP; bumped on each (re-)origination.
     seq: u32,
+    /// The keys this node signs with (`[0]`) and verifies against; empty = no authentication.
+    auth_keys: []const isis.auth.Key = &.{},
+
+    /// First TLV of an LSP this node originates: the Authentication TLV for
+    /// `auth_keys[0]` (digest still to be filled by `finishLsp`), if keyed.
+    fn addAuth(ns: *const NodeState, t: *isis.tlv.Builder) !void {
+        if (ns.auth_keys.len != 0) try isis.auth.addPlaceholder(t, ns.auth_keys[0]);
+    }
+
+    /// Finish and checksum-stamp an LSP built in `buf`, then sign it when keyed
+    /// (the signature re-stamps the checksum, which covers it).
+    fn finishLsp(ns: *const NodeState, b: *isis.pdu.LspBuilder, buf: []u8) ![]const u8 {
+        const wire = b.finishStamped();
+        if (ns.auth_keys.len == 0) return wire;
+        try isis.auth.sign(buf[0..wire.len], ns.auth_keys[0]);
+        return buf[0..wire.len];
+    }
 
     fn ifaceCount(ns: *const NodeState) usize {
         return ns.neighbours.len + ns.lan_circuits.len;
@@ -328,6 +345,26 @@ pub const Options = struct {
     /// `false` is the negative control of the LAN path: the DIS never transmits a
     /// CSNP on a LAN circuit, so a database summary can no longer repair loss.
     lan_csnp: bool = true,
+    /// IS-IS authentication (RFC 5304 / RFC 5310) on every circuit: every node
+    /// signs what it originates (LSPs, pseudonode LSPs, purges) and its CSNPs/
+    /// PSNPs with `keys[0]` and its `isis-lsdb` verifies what it receives.
+    /// `null` (the default) is the unauthenticated fabric, byte for byte.
+    auth: ?Auth = null,
+};
+
+/// See `Options.auth`.
+pub const Auth = struct {
+    keys: []const isis.auth.Key,
+    /// Sign and verify CSNP/PSNP too (`isis-lsdb`'s and `isis-flood`'s
+    /// `auth_snp`); `false` is an FRR-default fabric where only LSPs are keyed.
+    auth_snp: bool = true,
+    /// Negative control: this node is configured with other keys, so it and
+    /// every neighbour refuse each other's PDUs (the harness has no hellos —
+    /// SPEC §8 — so "adjacency refused" shows as refused LSPs/SNPs: the node
+    /// stays isolated). `null` = a correctly keyed fabric.
+    mismatched: ?Mismatched = null,
+
+    pub const Mismatched = struct { node: NodeId, keys: []const isis.auth.Key };
 };
 
 /// One link's medium, replacing `Options.link` for the undirected edge `a`-`b`.
@@ -382,6 +419,9 @@ pub const Stats = struct {
     refreshes: u64 = 0,
     purges_entered: u64 = 0,
     purges_removed: u64 = 0,
+    /// PDUs a node's `isis-lsdb` refused for authentication (`Options.auth`):
+    /// LSPs and SNPs with a missing or wrong #10.
+    auth_refused: u64 = 0,
 };
 
 // ── the Fabric (the Protocol context) ────────────────────────────────────────
@@ -636,9 +676,11 @@ pub const Fabric = struct {
                 .lan_circuits = lan_circuits,
                 .link_failed = link_failed,
                 .lsdb = undefined,
-                .sched = isis_flood.Scheduler.init(gpa, schedConfig(sys, opts)),
+                .sched = undefined,
                 .seq = 0,
+                .auth_keys = keysOf(opts, node),
             };
+            ns.sched = isis_flood.Scheduler.init(gpa, schedConfig(ns, opts));
             ns.lsdb = isis_lsdb.Lsdb.init(gpa, lsdbConfig(ns, lsdb_capacity, opts));
             initialized += 1;
         }
@@ -718,6 +760,8 @@ pub const Fabric = struct {
             // store, never hit here.
             .capacity = capacity,
             .broadcast_interfaces = bcast,
+            .auth_keys = ns.auth_keys,
+            .auth_snp = if (opts.auth) |a| a.auth_snp else true,
         };
         if (opts.aging) |a| {
             cfg.zero_age_lifetime = a.zero_age_lifetime;
@@ -726,9 +770,18 @@ pub const Fabric = struct {
         return cfg;
     }
 
-    fn schedConfig(sys: SystemId, opts: Options) isis_flood.Config {
+    /// The keys `node` is configured with under `opts.auth` (none without it).
+    fn keysOf(opts: Options, node: NodeId) []const isis.auth.Key {
+        const a = opts.auth orelse return &.{};
+        if (a.mismatched) |m| if (m.node == node) return m.keys;
+        return a.keys;
+    }
+
+    fn schedConfig(ns: *const NodeState, opts: Options) isis_flood.Config {
         return .{
-            .local_system_id = sys,
+            .local_system_id = ns.system_id,
+            .auth_keys = ns.auth_keys,
+            .auth_snp = if (opts.auth) |a| a.auth_snp else true,
             .min_lsp_transmission_interval = opts.retransmit_interval,
             .complete_snp_interval = opts.csnp_interval,
         };
@@ -782,7 +835,7 @@ pub const Fabric = struct {
             ns.lsdb.deinit();
             ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns, self.lsdb_capacity, self.opts));
             ns.sched.deinit();
-            ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id, self.opts));
+            ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns, self.opts));
             ns.seq = 0;
             @memset(ns.link_failed, false);
             for (ns.lan_circuits) |*c| self.resetLanCircuit(c);
@@ -863,7 +916,7 @@ pub const Fabric = struct {
         ns.lsdb.deinit();
         ns.lsdb = isis_lsdb.Lsdb.init(self.gpa, lsdbConfig(ns, self.lsdb_capacity, self.opts));
         ns.sched.deinit();
-        ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns.system_id, self.opts));
+        ns.sched = isis_flood.Scheduler.init(self.gpa, schedConfig(ns, self.opts));
         // `check`'s monotonicity invariant is "no stored sequence goes backwards
         // *absent a restart*". This is the restart, and it clears the high-water
         // marks of the restarting node only — every other node's row, and this
@@ -891,7 +944,15 @@ pub const Fabric = struct {
         const pdu = isis.decode(payload) catch return; // hostile/short bytes: ignore
         switch (pdu) {
             .lsp => {
-                const r = try ns.lsdb.insert(payload, iface, now);
+                const r = ns.lsdb.insert(payload, iface, now) catch |e| switch (e) {
+                    // `Options.auth`: a missing / wrong #10 is a refused PDU, not a
+                    // harness failure (the lsdb is untouched).
+                    error.AuthMissing, error.AuthFailed => {
+                        self.stats.auth_refused += 1;
+                        return;
+                    },
+                    else => return e,
+                };
                 if (r.stored) self.stats.last_change = now;
                 // A challenge to a pseudonode LSP this node originates (§7.3.16.1).
                 if (r.self_challenge) |ch| {
@@ -930,17 +991,30 @@ pub const Fabric = struct {
                 if (lan) |lc| {
                     if (lc.is_dis or self.lans[lc.lan].members[lc.dis_slot].node != from) return;
                 }
-                ns.lsdb.reconcileCsnp(c, iface, now);
+                // Bytes form: it verifies the #10 when the lsdb is keyed.
+                ns.lsdb.reconcileCsnpBytes(payload, iface, now) catch |e| switch (e) {
+                    error.AuthMissing, error.AuthFailed => {
+                        self.stats.auth_refused += 1;
+                        return;
+                    },
+                    else => return,
+                };
                 if (lan) |lc| try self.requestFromCsnp(sim, node, lc, c, now);
             },
-            .psnp => |p| {
+            .psnp => {
                 if (self.ignore_snp) return;
                 // On a LAN a PSNP is a request / ack to the DIS; other members
                 // hear it (it is multicast) and ignore it.
                 if (lan) |lc| {
                     if (!lc.is_dis) return;
                 }
-                ns.lsdb.reconcilePsnp(p, iface, now);
+                ns.lsdb.reconcilePsnpBytes(payload, iface, now) catch |e| switch (e) {
+                    error.AuthMissing, error.AuthFailed => {
+                        self.stats.auth_refused += 1;
+                        return;
+                    },
+                    else => return,
+                };
             },
             else => return,
         }
@@ -1104,11 +1178,12 @@ pub const Fabric = struct {
             .sequence_number = c.pn_seq,
             .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
         });
+        try ns.addAuth(&b.tlvs);
         for (ls.members[0..ls.count], 0..) |m, i| {
             if (!c.alive[i]) continue;
             try isis.tlvs.addExtendedIsReach(&b.tlvs, neighbourId7(systemIdForNode(m.node)), 0, &.{});
         }
-        _ = try ns.lsdb.insert(b.finishStamped(), null, now);
+        _ = try ns.lsdb.insert(try ns.finishLsp(&b, &buf), null, now);
     }
 
     /// A resigning DIS purges the pseudonode LSP it had been originating
@@ -1125,7 +1200,8 @@ pub const Fabric = struct {
             .sequence_number = c.pn_seq,
             .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
         });
-        _ = try ns.lsdb.insert(b.finishStamped(), null, now);
+        try ns.addAuth(&b.tlvs);
+        _ = try ns.lsdb.insert(try ns.finishLsp(&b, &buf), null, now);
     }
 
     /// Record and raise a safety-invariant violation. `check` never overwrites
@@ -1212,6 +1288,7 @@ pub const Fabric = struct {
             .sequence_number = ns.seq,
             .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
         });
+        try ns.addAuth(&b.tlvs);
         for (ns.neighbours, 0..) |nb, iface| {
             if (ns.link_failed[iface]) continue;
             const nbr_sys = self.nodes[nb.node].system_id;
@@ -1231,7 +1308,7 @@ pub const Fabric = struct {
         // the §7.3.14.2 e) receive check) discards the LSP as corrupt and the
         // fabric never floods anything. Two nodes holding the same LSP hold the
         // same bytes, so equal-sequence copies still compare `.same`.
-        _ = try ns.lsdb.insert(b.finishStamped(), null, now);
+        _ = try ns.lsdb.insert(try ns.finishLsp(&b, &buf), null, now);
 
         // Positive control for `check`'s LSDB-count tripwire: emit additional
         // LSP fragments for this system. Each is a distinct LSP-ID, so the
@@ -1247,7 +1324,8 @@ pub const Fabric = struct {
                 .sequence_number = ns.seq,
                 .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
             });
-            _ = try ns.lsdb.insert(fb.finishStamped(), null, now);
+            try ns.addAuth(&fb.tlvs);
+            _ = try ns.lsdb.insert(try ns.finishLsp(&fb, &fbuf), null, now);
         }
     }
 
@@ -1374,7 +1452,9 @@ pub const Fabric = struct {
         var src: [7]u8 = undefined;
         src[0..6].* = self.nodes[node].system_id;
         src[6] = 0;
-        const bytes = try isis_flood.snp.buildPsnp(&scratch, src, false, entries);
+        const ns = &self.nodes[node];
+        const key: ?isis.auth.Key = if (ns.auth_keys.len != 0 and (self.opts.auth.?.auth_snp)) ns.auth_keys[0] else null;
+        const bytes = try isis_flood.snp.buildPsnpSigned(&scratch, src, false, entries, key);
         const ls = &self.lans[c.lan];
         for (ls.members[0..ls.count], 0..) |m, i| {
             if (i == c.slot or !c.alive[i]) continue;
@@ -3250,4 +3330,235 @@ test "quiescence: an unacknowledged SSN alone keeps a node busy" {
     _ = try fab.nodes[0].lsdb.insert(try foreignCopy(&buf, lspIdOf(systemIdForNode(1), 0), 1), 0, 0);
     try testing.expectEqual(@as(usize, 0), fab.nodes[0].lsdb.interfacesWithSrm().count());
     try testing.expect(!fab.quiescent(0));
+}
+
+// ── authentication (RFC 5304 / RFC 5310, `Options.auth`) ─────────────────────
+
+const auth_key: isis.auth.Key = .{ .algorithm = .hmac_sha256, .id = 9, .secret = "fabric-secret" };
+const auth_keys = [_]isis.auth.Key{auth_key};
+const wrong_keys = [_]isis.auth.Key{.{ .algorithm = .hmac_sha256, .id = 9, .secret = "other-secret" }};
+
+test "auth: a keyed 4-node line converges with every LSP verifying and nothing refused" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xA11CE, .{ .auth = .{ .keys = &auth_keys } });
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+    try testing.expect(fab.lsdbsAgree());
+    try testing.expectEqual(@as(u64, 0), fab.stats.auth_refused);
+    // The SNP path really ran (one initial CSNP per circuit + the acks) and was
+    // accepted by the verifying receivers.
+    try testing.expect(fab.stats.snp_tx > 0);
+    var node: NodeId = 0;
+    while (node < 4) : (node += 1) {
+        var origin: NodeId = 0;
+        while (origin < 4) : (origin += 1) try testing.expectEqual(@as(?u32, 1), fab.storedSequence(node, origin));
+    }
+    try testing.expectEqual(systemIdForNode(1), (try fab.reaches(testing.allocator, 0, 3)).?);
+    // What a node stores carries the originator's signature (not a re-signed copy).
+    const stored = fab.nodes[0].lsdb.get(lspIdOf(systemIdForNode(3), 0), 0).?;
+    try testing.expectEqual(@as(usize, 0), try isis.auth.verify(stored.bytes, &auth_keys));
+}
+
+test "auth: auth_snp = false (LSPs keyed, SNPs unsigned) converges too" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xA11CE, .{ .auth = .{ .keys = &auth_keys, .auth_snp = false } });
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+    try testing.expect(fab.lsdbsAgree());
+    try testing.expectEqual(@as(u64, 0), fab.stats.auth_refused);
+    try testing.expect(fab.stats.snp_tx > 0);
+}
+
+test "auth: a node with the wrong key is kept apart — every PDU to and from it is refused" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    // Node 3 (D) is the line's end: its only neighbour is C.
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xA11CE, .{ .auth = .{
+        .keys = &auth_keys,
+        .mismatched = .{ .node = 3, .keys = &wrong_keys },
+    } });
+    defer fab.deinit();
+    _ = try fab.runToConvergence(step_cap);
+    try testing.expect(fab.stats.auth_refused > 0);
+    try testing.expect(!fab.lsdbsAgree());
+    // D never learns anyone else's LSP and nobody learns D's ...
+    var node: NodeId = 0;
+    while (node < 3) : (node += 1) {
+        try testing.expect(!fab.holds(3, node));
+        try testing.expect(!fab.holds(node, 3));
+    }
+    // ... while the correctly keyed nodes A, B, C still converge among themselves.
+    node = 0;
+    while (node < 3) : (node += 1) {
+        var origin: NodeId = 0;
+        while (origin < 3) : (origin += 1) try testing.expect(fab.holds(node, origin));
+    }
+    try testing.expect((try fab.reaches(testing.allocator, 0, 3)) == null);
+    try testing.expect((try fab.reaches(testing.allocator, 0, 2)) != null);
+}
+
+test "auth: CONTROL — the same wrong-key node, fabric unkeyed, converges (the refusal is the keys')" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.init(testing.allocator, topo, 0xA11CE);
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(step_cap));
+    try testing.expect(fab.lsdbsAgree());
+    try testing.expectEqual(@as(u64, 0), fab.stats.auth_refused);
+    try testing.expect(fab.holds(3, 0) and fab.holds(0, 3));
+}
+
+test "auth: aging with keys — refreshes are signed, steady state refuses nothing" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xA6E, .{ .aging = .{}, .auth = .{ .keys = &auth_keys } });
+    defer fab.deinit();
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(4_000));
+    try testing.expect(fab.lsdbsAgree());
+    try testing.expectEqual(@as(u64, 16), fab.stats.refreshes);
+    try testing.expectEqual(@as(u64, 0), fab.stats.auth_refused);
+    try testing.expectEqual(@as(?u32, 5), fab.storedSequence(0, 3));
+}
+
+test "auth: aging with keys — a dead originator's purge is signed, floods, and is removed everywhere" {
+    var fab = try Fabric.initWithOptions(testing.allocator, .{ .node_count = 4, .edges = &age_ring }, 0xDEAD, .{ .aging = .{}, .auth = .{ .keys = &auth_keys } });
+    defer fab.deinit();
+    fab.crash = .{ .node = 2, .time = 1_000 };
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(2_130));
+    // Each survivor purged the dead node's LSP by aging and its neighbours accepted
+    // the flooded copy: a purge without a valid #10 would be refused.
+    for ([_]NodeId{ 0, 1, 3 }) |n| try testing.expect(fab.holdsPurge(n, 2));
+    try testing.expectEqual(@as(u64, 0), fab.stats.auth_refused);
+    const purge = fab.nodes[0].lsdb.get(lspIdOf(systemIdForNode(2), 0), 2_130).?;
+    try testing.expect(purge.is_purge);
+    try testing.expect((try isis.auth.find(purge.bytes)) != null);
+    try testing.expectEqual(@as(usize, 0), try isis.auth.verify(purge.bytes, &auth_keys));
+}
+
+test "auth: a keyed LAN — DIS preemption, pseudonode purge and PSNP requests all verify" {
+    var fab = try Fabric.initWithOptions(testing.allocator, lan_topo, 0xFA11, .{ .auth = .{ .keys = &auth_keys } });
+    defer fab.deinit();
+    try fab.setLanPriorityAt(0, 1, 100, 5_000);
+    try testing.expectEqual(Outcome.converged, try fab.runToConvergence(lan_failover_step));
+    try testing.expect(fab.lsdbsAgree());
+    try testing.expectEqual(@as(u64, 0), fab.stats.auth_refused);
+    var node: NodeId = 0;
+    while (node < 6) : (node += 1) {
+        try testing.expect(fab.holdsPseudonodePurge(node, 0, 3));
+        try testing.expectEqual(@as(?u32, 1), fab.pseudonodeSequence(node, 0, 1));
+    }
+}
+
+test "auth: the keyed extra-fragment control still trips the count tripwire (fragments are signed too)" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0x1CE, .{ .auth = .{ .keys = &auth_keys } });
+    defer fab.deinit();
+    fab.extra_fragments = 2;
+    // Unsigned fragments would be refused on arrival and the database would never overflow.
+    try testing.expectEqual(Outcome.safety_violated, try fab.runToConvergence(step_cap));
+    try testing.expectEqual(@as(?anyerror, error.LsdbOverflow), fab.violation);
+    try testing.expectEqual(@as(u64, 0), fab.stats.auth_refused);
+}
+
+test "auth: the wrong-key node is the configured one, and its refusals are counted exactly" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 0xA11CE, .{ .auth = .{
+        .keys = &auth_keys,
+        .mismatched = .{ .node = 3, .keys = &wrong_keys },
+    } });
+    defer fab.deinit();
+    for (fab.nodes, 0..) |ns, n| {
+        const want: []const u8 = if (n == 3) "other-secret" else "fabric-secret";
+        try testing.expectEqualStrings(want, ns.auth_keys[0].secret);
+    }
+    _ = try fab.runToConvergence(step_cap);
+    // C refuses D's LSP; D refuses C's own LSP and C's re-flood of A's and B's
+    // (3 LSPs); and the one initial CSNP per circuit is refused both ways: 1 + 3 + 2.
+    try testing.expectEqual(@as(u64, 6), fab.stats.auth_refused);
+}
+
+test "auth: a CSNP or PSNP with no #10 or the wrong key is refused and changes nothing" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    var fab = try Fabric.initWithOptions(testing.allocator, topo, 5, .{ .auth = .{ .keys = &auth_keys } });
+    defer fab.deinit();
+    var d: Direct = .{};
+    try d.start(&fab);
+    defer d.deinit();
+    const entries = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 900, .lsp_id = lspIdOf(systemIdForNode(1), 0), .sequence_number = 4, .checksum = 1 }};
+    const src: [7]u8 = systemIdForNode(1) ++ [1]u8{0};
+    var buf: [256]u8 = undefined;
+    const bad = isis.auth.Key{ .algorithm = .hmac_sha256, .id = 9, .secret = "nope" };
+    const snp = isis_flood.snp;
+    const before = fab.nodes[0].lsdb.count();
+    try Fabric.onMessage(&fab, &d.sim, 0, 1, try snp.buildPsnp(&buf, src, false, &entries));
+    try testing.expectEqual(@as(u64, 1), fab.stats.auth_refused);
+    var buf2: [256]u8 = undefined;
+    try Fabric.onMessage(&fab, &d.sim, 0, 1, try snp.buildPsnpSigned(&buf2, src, false, &entries, bad));
+    try testing.expectEqual(@as(u64, 2), fab.stats.auth_refused);
+    try Fabric.onMessage(&fab, &d.sim, 0, 1, try snp.buildCsnp(&buf2, src, false, snp.min_lsp_id, snp.max_lsp_id, &entries));
+    try testing.expectEqual(@as(u64, 3), fab.stats.auth_refused);
+    try Fabric.onMessage(&fab, &d.sim, 0, 1, try snp.buildCsnpSigned(&buf2, src, false, snp.min_lsp_id, snp.max_lsp_id, &entries, bad));
+    try testing.expectEqual(@as(u64, 4), fab.stats.auth_refused);
+    // Nothing was requested from the refused summaries (no placeholder entry added).
+    try testing.expectEqual(before, fab.nodes[0].lsdb.count());
+    // The right key is accepted: the same CSNP now makes node 0 request the LSP it lacks.
+    try Fabric.onMessage(&fab, &d.sim, 0, 1, try snp.buildCsnpSigned(&buf2, src, false, snp.min_lsp_id, snp.max_lsp_id, &entries, auth_key));
+    try testing.expectEqual(@as(u64, 4), fab.stats.auth_refused);
+    try testing.expectEqual(before + 1, fab.nodes[0].lsdb.count());
+}
+
+/// Delivery events in `sim`'s queue whose payload carries a #10 / carries none.
+const AuthCount = struct { signed: usize, unsigned: usize };
+
+fn queuedAuth(sim: *const netsim.Sim) AuthCount {
+    var r: AuthCount = .{ .signed = 0, .unsigned = 0 };
+    for (sim.queue.items.items) |ev| switch (ev.kind) {
+        .deliver => |d| if ((isis.auth.find(d.payload) catch null) != null) {
+            r.signed += 1;
+        } else {
+            r.unsigned += 1;
+        },
+        else => {},
+    };
+    return r;
+}
+
+test "auth: a LAN member's PSNP request is signed, and unsigned when auth_snp is off" {
+    const entries = [_]isis.tlvs.LspEntry{.{ .remaining_lifetime = 900, .lsp_id = lspIdOf(systemIdForNode(1), 0), .sequence_number = 4, .checksum = 1 }};
+    for ([_]bool{ true, false }) |snp_on| {
+        var fab = try Fabric.initWithOptions(testing.allocator, lan_topo, 1, .{ .auth = .{ .keys = &auth_keys, .auth_snp = snp_on } });
+        defer fab.deinit();
+        var d: Direct = .{};
+        try d.start(&fab);
+        defer d.deinit();
+        const before = queuedAuth(&d.sim);
+        try fab.sendPsnpOnLan(&d.sim, 0, &fab.nodes[0].lan_circuits[0], &entries);
+        const after = queuedAuth(&d.sim);
+        try testing.expectEqual(@as(usize, 3), (after.signed + after.unsigned) - (before.signed + before.unsigned)); // the other 3 members
+        try testing.expectEqual(if (snp_on) @as(usize, 3) else 0, after.signed - before.signed);
+    }
+}
+
+test "auth: with auth_snp off a node's CSNPs leave unsigned while its LSPs stay signed" {
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+    for ([_]bool{ true, false }) |snp_on| {
+        var fab = try Fabric.initWithOptions(testing.allocator, topo, 2, .{ .auth = .{ .keys = &auth_keys, .auth_snp = snp_on } });
+        defer fab.deinit();
+        var d: Direct = .{};
+        try d.start(&fab);
+        defer d.deinit();
+        const before = queuedAuth(&d.sim);
+        fab.horizon = 1_000;
+        // Node 1 has two circuits: its poll sends its LSP and one initial CSNP on each.
+        try fab.pollAndSend(&d.sim, 1, 0);
+        const after = queuedAuth(&d.sim);
+        try testing.expectEqual(@as(usize, 4), (after.signed + after.unsigned) - (before.signed + before.unsigned));
+        try testing.expectEqual(if (snp_on) @as(usize, 4) else 2, after.signed - before.signed);
+    }
 }

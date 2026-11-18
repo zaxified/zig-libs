@@ -27,6 +27,8 @@ Model after: **ISO/IEC 10589 §7.3.15** (flooding / SNP generation) + **§7.3.16
 | `scheduler` | The `Scheduler`: `poll(now, up, lsdb, out, scratch)` turns the SRM/SSN flags into `Effect`s, paces LSP retransmits via a per-`(lsp, iface)` last-sent map, drains SSN into PSNPs, drives the periodic CSNP cadence, and returns the `next_wakeup` deadline. Holds the pacing/CSNP timers + a positive-control knob. |
 | `snp` | The CSNP/PSNP serialisation + chunking leaf: build a PDU into a caller scratch buffer via the `isis` builders, cap entries per PDU (one #9 TLV = 15), and tile a CSNP series into contiguous, gap-free `[start, end]` LSP-ID ranges (`successor`, `sortEntries`, `buildPsnp`, `buildCsnp`). |
 
+**Authentication:** with `Config.auth_keys` (RFC 5304 / RFC 5310, the same keys as `isis-lsdb`) every CSNP and PSNP is signed with the first key (`auth_snp = false` leaves them unsigned for peers that do not use SNP authentication); flooded LSPs are forwarded as stored, with their originator's signature. `SPEC.md` §10.
+
 ## The retransmit / pacing model (P2P)
 
 On a point-to-point circuit an LSP is flooded and then **retransmitted** every
