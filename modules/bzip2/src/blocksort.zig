@@ -58,11 +58,53 @@ fn fvswap(fmap: []u32, p1_: i32, p2_: i32, n_: i32) void {
     }
 }
 
-fn fallbackQSort3(fmap: []u32, eclass: []const u32, lo_st: i32, hi_st: i32) void {
+/// Partition work (elements scanned) one `fallbackQSort3` call may spend,
+/// per `n * (log2(n) + 1)` of its range of `n` elements, before it stops
+/// following libbzip2 and sorts what is left with a worst-case
+/// O(n log n) sort (B4, 2026-11-18). libbzip2's pivot is an LCG pick of the
+/// first, middle or last element, which a crafted block can turn into a
+/// quadratic sort (measured: 13.8 s for one 900 KiB block, against 0.14 s
+/// for the same keys shuffled). Measured peak on the shapes corpus, random,
+/// shuffled and sorted keys: see SPEC B4; below the bound every decision is
+/// libbzip2's, so the output stays byte-identical.
+pub const fallback_work_factor: u64 = 16;
+
+/// What `fallbackSortWith` reports (tests and measurement).
+pub const FallbackStats = struct {
+    /// Partition work over all `fallbackQSort3` calls (elements scanned).
+    work: u64 = 0,
+    /// Calls that hit the bound and finished with the O(n log n) sort.
+    bounded: u32 = 0,
+    /// Sub-ranges still on a bounded call's stack when it stopped (each then
+    /// sorted by key as well).
+    pending_at_bound: u32 = 0,
+    /// Largest `1000 * work / (n * (log2(n) + 1))` of one call.
+    peak_permille: u64 = 0,
+};
+
+fn keyLess(eclass: []const u32, a: u32, b: u32) bool {
+    return eclass[a] < eclass[b];
+}
+
+/// The bounded tail: `fmap[lo..hi]` sorted by `eclass` key, stably (an
+/// empty range, `hi = lo - 1`, as the partition step pushes, is a no-op).
+fn sortRangeByKey(fmap: []u32, eclass: []const u32, lo: i32, hi: i32) void {
+    std.sort.block(u32, fmap[ix(lo)..ix(hi + 1)], eclass, keyLess);
+}
+
+fn fallbackQSort3(fmap: []u32, eclass: []const u32, lo_st: i32, hi_st: i32, stats: ?*FallbackStats, work_permille: u64) void {
     var stack_lo: [100]i32 = undefined;
     var stack_hi: [100]i32 = undefined;
     var sp: usize = 0;
     var r: u32 = 0;
+    const n_call: u64 = @intCast(hi_st - lo_st + 1);
+    const nlogn: u64 = n_call * (std.math.log2_int(u64, n_call) + 1);
+    const budget: u64 = work_permille * nlogn / 1000;
+    var work: u64 = 0;
+    defer if (stats) |st| {
+        st.work += work;
+        st.peak_permille = @max(st.peak_permille, work * 1000 / nlogn);
+    };
 
     stack_lo[sp] = lo_st;
     stack_hi[sp] = hi_st;
@@ -75,6 +117,21 @@ fn fallbackQSort3(fmap: []u32, eclass: []const u32, lo_st: i32, hi_st: i32) void
         if (hi - lo < 10) {
             fallbackSimpleSort(fmap, eclass, lo, hi);
             continue;
+        }
+
+        work += @intCast(hi - lo + 1);
+        if (work > budget) {
+            // B4: past the bound, this range and every pending one (each
+            // already in its final place relative to the others) are sorted
+            // by key directly; ties may then differ from libbzip2's order.
+            sortRangeByKey(fmap, eclass, lo, hi);
+            if (stats) |st| st.pending_at_bound += @intCast(sp);
+            while (sp > 0) {
+                sp -= 1;
+                sortRangeByKey(fmap, eclass, stack_lo[sp], stack_hi[sp]);
+            }
+            if (stats) |st| st.bounded += 1;
+            return;
         }
 
         r = ((r *% 7621) +% 1) % 32768;
@@ -164,6 +221,21 @@ inline fn isSetBh(bh: []const u32, z: usize) bool {
 /// memory into `fmap`; `bhtab` is scratch (2 + nblock/32 words and the
 /// sentinel words). Afterwards the block bytes are restored.
 pub fn fallbackSort(fmap: []u32, eclass: []u32, bhtab: []u32, nblock: usize) void {
+    fallbackSortWith(fmap, eclass, bhtab, nblock, .{});
+}
+
+pub const FallbackOptions = struct {
+    /// The work bound, in thousandths of n x (log2 n + 1) per call (tests
+    /// lower it to reach the bounded path on a small block); the encoder
+    /// always uses `fallback_work_factor` x 1000.
+    work_permille: u64 = fallback_work_factor * 1000,
+    /// Receives the partition work when given.
+    stats: ?*FallbackStats = null,
+};
+
+/// `fallbackSort` with options (tests and measurement).
+pub fn fallbackSortWith(fmap: []u32, eclass: []u32, bhtab: []u32, nblock: usize, options: FallbackOptions) void {
+    const stats = options.stats;
     var ftab: [257]i32 = undefined;
     var ftab_copy: [256]i32 = undefined;
     const eclass8 = std.mem.sliceAsBytes(eclass);
@@ -221,7 +293,7 @@ pub fn fallbackSort(fmap: []u32, eclass: []u32, bhtab: []u32, nblock: usize) voi
 
             if (r > l) {
                 n_not_done += r - l + 1;
-                fallbackQSort3(fmap, eclass, l, r);
+                fallbackQSort3(fmap, eclass, l, r, stats, options.work_permille);
 
                 var cc: i64 = -1;
                 var i = l;
