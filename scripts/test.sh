@@ -2314,18 +2314,20 @@ cmd_ctgrind_portable() {
     # rows in ctgrind-expected.tsv; ctgrind.sh falls back to the plain row
     # everywhere else. Runs on tag/dispatch only, in its own job (~30 min).
     #
-    # EXCLUDED, each with an open item in its SPEC Backlog: jwe, megolm and xmlenc
-    # report UNATTRIBUTED contexts in std soft-AES frames on x86_64, which no pin
-    # may absorb.
+    # No module is excluded. jwe, megolm and xmlenc were until 2026-11-18 (wave 6):
+    # their harnesses copied / printed / freed the RETURNED plaintext, whose
+    # length std's soft-AES `undefined` batch padding (cause A2) leaves
+    # undefined where the no-`-fvalgrind` trap cannot declassify it, so those
+    # contexts were UNATTRIBUTED. The harnesses now use the length they sent;
+    # every remaining context is attributed in their variant rows.
     set_extra_args "$@"
-    local skip=" jwe megolm xmlenc " mods=() m
+    local mods=() m
     for m in modules/*/src/ctgrind_harness.zig; do
         [[ -e "$m" ]] || continue
         m="${m#modules/}"; m="${m%%/*}"
-        [[ "$skip" == *" $m "* ]] && continue
         mods+=("$m")
     done
-    echo "ctgrind-portable: CTGRIND_CPU=x86_64 (no AES-NI/ADX/BMI2/AVX) for ${#mods[@]} modules (excluded:${skip% })"
+    echo "ctgrind-portable: CTGRIND_CPU=x86_64 (no AES-NI/ADX/BMI2/AVX) for ${#mods[@]} modules"
     echo "  ⚠ needs valgrind (scripts/lib/ci-environment.sh ctgrind)"
     _ZL_KEEP_OUT="$(mktemp)"
     export CTGRIND_CPU=x86_64
@@ -2894,8 +2896,9 @@ Usage: scripts/test.sh [subcommand] [args]
                         ctgrind.sh, pinned table, CPU pin and valgrind are
                         unchanged since its last green measurement is skipped.
   ctgrind-portable      the same measurement with CTGRIND_CPU=x86_64 (no
-                        ADX/BMI2), for the modules whose portable code path is
-                        pinned equal to the asm one (p256 today). Needs valgrind.
+                        AES-NI/ADX/BMI2/AVX), for every module with a harness;
+                        `cpu=x86_64` variant rows pin where the portable code
+                        differs. Needs valgrind.
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.

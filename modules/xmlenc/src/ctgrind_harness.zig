@@ -184,7 +184,24 @@ fn publish(label: []const u8, bytes: []u8) void {
 
 fn decryptAndReport(label: []const u8, doc: *const xml.Document, sk: *const rsa.SecretKey, opts: xmlenc.Options) void {
     if (xmlenc.decryptData(std.heap.page_allocator, doc.root, sk, opts)) |out| { // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
-        publish(label, out);
+        // The plaintext LENGTH is the caller's by contract (public), so the
+        // harness's own copy / print run on the length of the plaintext IT
+        // encrypted, checked against the returned one where that can be
+        // declassified. Copying `out.len` bytes was an UNATTRIBUTED context on
+        // baseline x86-64 (the size-class dispatch of compiler_rt's memcpy,
+        // symbolised at line 0): the CBC unpad length is tainted in the claim,
+        // and std's soft AES pads a partial bitsliced batch with `undefined`
+        // lanes (ctgrind-expected.tsv cause A2), which makes it undefined in the
+        // untainted control and the no-`-fvalgrind` trap too.
+        if (builtin.valgrind_support) {
+            var got = out.len;
+            memcheck.makeMemDefined(std.mem.asBytes(&got));
+            if (got != plaintext.len) {
+                std.debug.print("ctgrind_result {s} err=PlaintextLength\n", .{label});
+                return;
+            }
+        }
+        publish(label, out.ptr[0..plaintext.len]);
         std.debug.print("ctgrind_result {s} ok\n", .{label});
     } else |e| {
         std.debug.print("ctgrind_result {s} err={t}\n", .{ label, e });

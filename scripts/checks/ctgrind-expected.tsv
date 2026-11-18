@@ -2335,8 +2335,51 @@ snmp	ReleaseFast	aes	1	312	f7b2d59406205574	07f7c9867f83b17e	cpu=x86_64 control=
 aes192	ReleaseFast	enc	1	128	91e9bb5ec00b01a9	0c5f76d6ab016242	cpu=x86_64
 aes192	ReleaseFast	dec	1	304	91e9bb5ec00b01a9	68602ef849690825	cpu=x86_64
 aes192	ReleaseFast	bitsliced	1	128	ba4c8387c14267e7	5ea64f081b0ffcbb	cpu=x86_64
+# jwe, megolm, xmlenc (joined the portable lane 2026-11-18, wave 6). Attributed context by context
+# against a native --stacks run of the same rows; nothing is a branch of these modules' own on a key:
+#   A1  every claim context with a std/crypto/aes/soft.zig frame among its innermost four is a
+#       `Use of uninitialised value` (a load at a tainted index, never a jump) in std's key
+#       schedule: `expandKey`'s masked sbox (soft.zig:495-496), the decryption schedule's `invert`,
+#       and aes192's own `subWord`/`invMixColumns` through std's `Block.encryptLast` table. Reached
+#       from aescbc encryptBody/decryptBody, aeskw encBlock/decBlock and aes192 (A192GCM/A192CBC):
+#       jwe content 428, kw 304, ecdh 152, pbes2 156; megolm msg 120; xmlenc cbc 56, kw 180.
+#   A2  every untainted context (control and trap). `--track-origins` names the undefined bytes'
+#       origin for all of them: the stack frames of aescbc encryptBody/decryptBody and aeskw
+#       wrapBody/unwrapBody, whose only partly written local is std soft.zig's inlined
+#       `var buf: [w * 16]u8 = undefined` (a one-block encrypt/decrypt pads its batch), plus 2 in
+#       megolm's trap at std Ed25519's Verifier (the signature over that A2-undefined ciphertext).
+#       They surface as std base64 encoding the A2-undefined ciphertext / wrapped key on the
+#       ENCRYPT side (jwe root.zig:553/561/565), the unpad and length handling of the decrypted
+#       plaintext (aescbc :651, jwe finishDecrypt :865-866, xmlenc aesCbcDecrypt :774-775), the
+#       aeskw/aesgcm verdicts (aeskw :203, aesgcm :1048), and, in megolm's trap only (where the
+#       harness cannot declassify the wire message, 105 vs control 1), its MAC/signature checks.
+#   A2 also shows in the claims: std base64 on the encrypt side, jwe content 48, kw 24, ecdh 22,
+#       pbes2 24 contexts more than native (fewer at the shared decrypt-side sites).
+#   C   megolm: one more `mem.eql` chunk branch on a PUBLIC key -- std Ed25519 `KeyPair.sign`'s
+#       (ed25519.zig:376, via session.zig:142/176: msg +2, skey +1, pickle +1) and the pickle's
+#       stored-public-key compare (pickle.zig:211, +1).
+#   S   megolm skey +7: std Ed25519 verify of the session-key signature (session_key.zig:155, the
+#       documented public-input variable-time verifier) reports at more sites in `add`
+#       (edwards25519.zig:164) and field.zig:185; pickle: chachapoly's verdict at root.zig:1207
+#       instead of :1440 (net 0); memcpy size classes at other lines (megolm cipher.zig:138 and rsa
+#       :1914 net 0; xmlenc cbc +2 at aesCbcDecrypt :775, the copy of the documented plaintext
+#       LENGTH, whose baseline memcpy dispatches on more size classes).
+#   The three harnesses' own copy/print/free used the RETURNED plaintext length, which A2 leaves
+#   undefined where no client request can declassify it (the trap): 5/1/2 UNATTRIBUTED contexts
+#   (jwe content trap, megolm msg trap, xmlenc cbc claim+control+trap, compiler_rt memcpy symbolised
+#   at line 0). They now use the length of the plaintext they sent, checked against the returned one
+#   under -fvalgrind. jwe rsa, xmlenc oaep and xmlenc rsa15 match their plain rows (no variant).
+jwe	ReleaseFast	content	1	487	10d8c513ea326a08	5b95af95390d7044	cpu=x86_64 control=100 trap=100
+jwe	ReleaseFast	kw	1	332	198f278acedab8ab	29bdefbeeb697801	cpu=x86_64 control=55 trap=55
+jwe	ReleaseFast	ecdh	1	181	8e24d1f5528d947d	0e8a78e319485b8a	cpu=x86_64 control=51 trap=51
+jwe	ReleaseFast	pbes2	1	182	198f278acedab8ab	45882587fad30673	cpu=x86_64 control=29 trap=29
+megolm	ReleaseFast	msg	1	138	4bcd2cc0b8d7321d	505eb3dc7b45f5cd	cpu=x86_64 control=1 trap=105
+megolm	ReleaseFast	skey	1	33	4bcd2cc0b8d7321d	a22db1b8b5220a74	cpu=x86_64
+megolm	ReleaseFast	pickle	1	28	4bcd2cc0b8d7321d	f06f4b1b938d2036	cpu=x86_64
+xmlenc	ReleaseFast	cbc	1	72	11557c75cd215bf1	cb2ee56c03b2b7a6	cpu=x86_64 control=16 trap=16
+xmlenc	ReleaseFast	kw	1	182	11557c75cd215bf1	65e898b409f3bf26	cpu=x86_64 control=5 trap=5
 #
-# B -- std X25519 identity check (curve25519.zig:77, public-point outcome), plus C (std mem.eql chunk
+# B --std X25519 identity check (curve25519.zig:77, public-point outcome), plus C (std mem.eql chunk
 # branch on a public key) for wireguard and tlsclient cv/mls/ssh pem. tlsclient kex also has A2 (std
 # soft AES-GCM tag check, aes_gcm.zig:103; control/trap 1), and its printed flight differs: the
 # ClientHello's cipher-suite list is ordered by `aes.has_hardware_support` (tlsclient Client.zig

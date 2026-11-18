@@ -172,8 +172,11 @@ placement).
 `src/ctgrind_harness.zig`, driven by `scripts/checks/ctgrind.sh jwe`; the pinned table is in
 `scripts/checks/ctgrind-expected.tsv` (ReleaseFast, unattributed 0, controls and traps 0).
 Decrypt only: a token is built with an untainted key copy, the decryptor gets a tainted copy,
-accept and a flipped-octet reject per algorithm. The plaintext length is declassified in the
-harness (public once the tag verified); the module's own branches on it stay counted.
+accept and a flipped-octet reject per algorithm. The plaintext length is public once the tag
+verified: the harness's own copy / print / free use the length of the plaintext it sent, checked
+against the returned (declassified) one; the module's own branches on it stay counted. On baseline
+x86-64 (`scripts/test.sh ctgrind-portable`) the counts are `cpu=x86_64` variant rows: std's soft-AES
+key schedule (A1) and its `undefined` batch padding (A2) add contexts, none a jwe branch on a key.
 
 - **content 18** — GCM tag verdict `aesgcm` root.zig:1048 x3 (one per key size); CBC-HMAC tag
   verdict `enc.zig:314` x6 (`timing_safe.eql` result, accept + reject, 3 encs), checked BEFORE any
@@ -297,7 +300,7 @@ First pass: 18 survivors. **One defect (fixed), 15 test gaps, 3 equivalent.**
 
 ## Backlog / deferred
 
-- **Portable ctgrind (`CTGRIND_CPU=x86_64`)** *(2026-11-18)*: this module is EXCLUDED from `scripts/test.sh ctgrind-portable`, because on baseline x86-64 (std's soft AES, no AES-NI/AVX) memcheck reports UNATTRIBUTED contexts, which no pin may absorb. Measured: `content` 487 in-file (native 18), and its no-`-fvalgrind` trap 105 contexts with 5 unattributed; the controls/traps of `content`/`kw`/`ecdh`/`pbes2` read 100/55/51/29 contexts untainted (std's soft-AES bitsliced batches padded with `undefined`, see ctgrind-expected.tsv cause A2). To close: name the unattributed frames (std soft-AES/GCM frames outside the row pattern), then pin `cpu=x86_64` variants.
+- ✅ DONE 2026-11-18 (wave 6) ~~**Portable ctgrind (`CTGRIND_CPU=x86_64`)**~~ *(2026-11-18)*: jwe runs in `scripts/test.sh ctgrind-portable` with `cpu=x86_64` variant rows (content 487, kw 332, ecdh 181, pbes2 182; controls/traps 100/55/51/29; rsa equals its plain row). The 5 unattributed trap contexts were the HARNESS's own memcpy / free / munmap of the returned plaintext: its CBC-HS unpad length is undefined on baseline x86-64 even untainted (std soft AES pads a partial bitsliced batch with `undefined` lanes, cause A2; `--track-origins` names only aescbc's and aeskw's frames holding that inlined std buffer), and the no-`-fvalgrind` trap cannot declassify it. The harness now copies / prints / frees the length of the plaintext it sent, checked against the returned one under `-fvalgrind`. Every other extra context is std's soft-AES key schedule (A1, loads at tainted indices, no jump) or A2 (std base64 over the A2-undefined ciphertext on the encrypt side; untainted controls/traps); no jwe branch on a key. Itemised in ctgrind-expected.tsv.
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
 - **(survey 2026-09-30) ECDH-ES on P-384 / P-521** — `ecdhes.Curve` is `p256`/`x25519` only (`rg 'pub const Curve' -A3 src/ecdhes.zig`); go-jose and panva/jose accept the NIST curves and IdPs commonly publish P-384 keys. Effort: medium (needs a P-384 primitive; `std.crypto.ecc.P384` exists in Zig 0.16 *(inferred, not checked)*). Fits §2: yes.
