@@ -71,6 +71,7 @@ on:
           - examples ReleaseSafe arm64
           - interop ReleaseSafe amd64
           - ctgrind amd64
+          - ctgrind portable amd64
           - count amd64
           - small amd64
   # ⭐ THE ROUTE TO A TAG (owner, 2026-11-02; CONVENTIONS §8). Every other day the
@@ -894,6 +895,17 @@ jobs:
           # harnesses, cold, on 4 vCPUs. 90 is a generous first bound, to be
           # lowered once a green run has measured the cost.
           lanes+=('{"name":"ctgrind amd64","args":"","cmd":"ctgrind","cachekey":"ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":90,"skip_live":""}')
+
+          # ⭐ THE PORTABLE CODE PATH, added 2026-11-18 (owner decision). The lane
+          # above builds the harnesses for skylake, so a module with an
+          # asm/portable split is measured on its asm path only — but aarch64 and
+          # baseline x86-64 run the portable one, where p256's montReducePortable
+          # compiled a branch on secret-point data (fixed 2026-11-18). This lane
+          # runs `ctgrind.sh --check` with CTGRIND_CPU=x86_64 for the modules
+          # whose portable counts are pinned equal to the asm ones (the list is in
+          # `cmd_ctgrind_portable`, scripts/test.sh). Same peer, no `args` (the
+          # row's optimize mode is the claim), not stamped (one module, minutes).
+          lanes+=('{"name":"ctgrind portable amd64","args":"","cmd":"ctgrind-portable","cachekey":"portable-ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":30,"skip_live":""}')
 
           # ⭐ INSTRUCTION COUNTS, added 2026-10-08 (scripts/count-insns, evaluated
           # in CML's maturity tasks § AE): every module with a

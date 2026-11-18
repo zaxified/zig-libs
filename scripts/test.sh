@@ -2294,6 +2294,31 @@ cmd_ctgrind() {
     summary
 }
 
+cmd_ctgrind_portable() {
+    # The constant-time measurement on the PORTABLE code path (added 2026-11-18,
+    # owner decision). `ctgrind` above builds the harnesses for skylake, so a
+    # module with an asm/portable split (ADX/BMI2 cores) is only ever measured on
+    # its asm path -- but aarch64 and baseline x86-64 run the portable one. On
+    # 2026-11-18 p256's portable `montReducePortable` compiled a `jae` on the
+    # REDC borrow in one inlined copy (a branch on secret-point data, ctgrind
+    # `secpt` 2 instead of 1) and nothing in CI could see it.
+    #
+    # Only modules whose portable counts were measured equal to the pinned
+    # (skylake) ones are listed: the expected table has one count per row, so a
+    # module whose portable code shape gives different counts needs its own pins
+    # before it can join. Extend the list after measuring
+    # `CTGRIND_CPU=x86_64 scripts/checks/ctgrind.sh --check <m>` green.
+    set_extra_args "$@"
+    local mods=(p256)
+    echo "ctgrind-portable: CTGRIND_CPU=x86_64 (no ADX/BMI2) for: ${mods[*]}"
+    echo "  ⚠ needs valgrind (scripts/lib/ci-environment.sh ctgrind)"
+    _ZL_KEEP_OUT="$(mktemp)"
+    export CTGRIND_CPU=x86_64
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "ctgrind-portable" scripts/checks/ctgrind.sh --check "${mods[@]}"
+    unset CTGRIND_CPU
+    summary
+}
+
 cmd_interop() {
     set_extra_args "$@"
     capability_check
@@ -2853,6 +2878,9 @@ Usage: scripts/test.sh [subcommand] [args]
                         2026-09-18: a module whose harness, dependencies,
                         ctgrind.sh, pinned table, CPU pin and valgrind are
                         unchanged since its last green measurement is skipped.
+  ctgrind-portable      the same measurement with CTGRIND_CPU=x86_64 (no
+                        ADX/BMI2), for the modules whose portable code path is
+                        pinned equal to the asm one (p256 today). Needs valgrind.
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.
@@ -2901,6 +2929,7 @@ main() {
         examples) cmd_examples "${rest[@]:-}" ;;
         interop) cmd_interop "${rest[@]:-}" ;;
         ctgrind) cmd_ctgrind "${rest[@]:-}" ;;
+        ctgrind-portable) cmd_ctgrind_portable "${rest[@]:-}" ;;
         count) cmd_count "${rest[@]:-}" ;;
         small) cmd_small "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
