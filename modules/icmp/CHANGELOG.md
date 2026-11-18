@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (590 mutants over the five source files; 536 killed, 54 equivalent or unobservable, none surviving); 52 new tests (`audit_test.zig` for the engine on the loopback rig, in-file tests for `Socket`, `pinger`, `echo`, `checksum`, `IoSocket`), the send-errno table is now the pure `Socket.sendResult` (same mapping, so each errno is tested without provoking it), the rig helpers of `sweep_test.zig` are `pub` for the new file; the card records `mutation 2026-11-17 (536/590, 54 eq)`.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the stddev / jitter update is one function (`Stats.noteReply`) that the
   reply path and its test share, so the test exercises the code the pinger runs.
 - **2026-11-16** — **NEW (additive):** `Stats.stddevNs()` (population standard deviation of received RTTs, pro-bing `StdDevRtt` definition, Welford online, no stored samples) and `Stats.jitterNs()` (mean absolute difference of consecutive RTTs; not the RFC 3550 smoothed estimator). New fields `rtt_mean`, `rtt_m2`, `jitter_sum_ns` default to zero; existing fields unchanged.

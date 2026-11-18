@@ -1135,3 +1135,103 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit (2026-11-17) ────────────────────────────────
+
+fn isIgnored(r: Reply) bool {
+    return switch (r) {
+        .ignored => true,
+        else => false,
+    };
+}
+
+/// `buf` with its checksum field (bytes 2..4) filled in.
+fn sealed(comptime n: usize, buf: [n]u8) [n]u8 {
+    var m = buf;
+    m[2] = 0;
+    m[3] = 0;
+    std.mem.writeInt(u16, m[2..4], checksum(&m), .big);
+    return m;
+}
+
+test "audit: parseV4 refuses a message one byte too short for what it would read" {
+    // A 7-byte echo reply and a 19-byte timestamp reply, both with valid
+    // checksums: refused, not indexed past their end.
+    const short7 = sealed(7, .{ v4.echo_reply, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(u16, 0), checksum(&short7));
+    try std.testing.expect(isIgnored(parseV4(&short7, false)));
+    var ts19: [19]u8 = @splat(0);
+    ts19[0] = v4.timestamp_reply;
+    ts19 = sealed(19, ts19);
+    try std.testing.expect(isIgnored(parseV4(&ts19, false)));
+    // 8 bytes is the smallest echo reply; it is read.
+    const ok8 = sealed(8, .{ v4.echo_reply, 0, 0, 0, 0x12, 0x34, 0x56, 0x78 });
+    switch (parseV4(&ok8, false)) {
+        .echo_reply => |r| {
+            try std.testing.expectEqual(@as(u16, 0x1234), r.ident);
+            try std.testing.expectEqual(@as(u16, 0x5678), r.seq);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "audit: a timestamp reply's three times come from their own fields" {
+    var m: [timestamp_msg_len]u8 = @splat(0);
+    m[0] = v4.timestamp_reply;
+    std.mem.writeInt(u16, m[4..6], 7, .big);
+    std.mem.writeInt(u16, m[6..8], 9, .big);
+    std.mem.writeInt(u32, m[8..12], 1000, .big);
+    std.mem.writeInt(u32, m[12..16], 2000, .big);
+    std.mem.writeInt(u32, m[16..20], 3000, .big);
+    m = sealed(timestamp_msg_len, m);
+    switch (parseV4(&m, false)) {
+        .echo_reply => |r| {
+            try std.testing.expectEqual(@as(u16, 7), r.ident);
+            try std.testing.expectEqual(@as(u16, 9), r.seq);
+            const ts = r.ts.?;
+            try std.testing.expectEqual(@as(u32, 1000), ts.originate_ms);
+            try std.testing.expectEqual(@as(u32, 2000), ts.receive_ms);
+            try std.testing.expectEqual(@as(u32, 3000), ts.transmit_ms);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "audit: the IHL is the low nibble only, for the outer and the quoted header" {
+    // Raw reply whose first IP byte is 0x55 (a wrong version, IHL 5): read.
+    var raw: [20 + echo_header_len]u8 = @splat(0);
+    raw[0] = 0x55;
+    raw[20] = v4.echo_reply;
+    std.mem.writeInt(u16, raw[24..26], 3, .big);
+    std.mem.writeInt(u16, raw[26..28], 4, .big);
+    std.mem.writeInt(u16, raw[22..24], checksum(raw[20..]), .big);
+    switch (parseV4(&raw, true)) {
+        .echo_reply => |r| try std.testing.expectEqual(@as(u16, 4), r.seq),
+        else => return error.TestUnexpectedResult,
+    }
+    // A quoted header claiming IHL 1 (4 bytes) is no IP header: the echo type
+    // that happens to sit 4 bytes in must not be taken as the quoted request.
+    var err: [echo_header_len + 28]u8 = @splat(0);
+    err[0] = v4.time_exceeded;
+    err[8] = 0x41;
+    err[8 + 4] = v4.echo_request;
+    err = sealed(err.len, err);
+    try std.testing.expect(isIgnored(parseV4(&err, false)));
+}
+
+test "audit: an ICMPv6 error quoting 47 bytes (a request header one short) is refused" {
+    var err: [echo_header_len + 47]u8 = @splat(0);
+    err[0] = v6.time_exceeded;
+    err[8 + 6] = 58;
+    err[8 + 40] = v6.echo_request;
+    try std.testing.expect(isIgnored(parseV6(&err)));
+    // With the 48th byte it is read.
+    var ok: [echo_header_len + 48]u8 = @splat(0);
+    ok[0] = v6.time_exceeded;
+    ok[8 + 6] = 58;
+    ok[8 + 40] = v6.echo_request;
+    switch (parseV6(&ok)) {
+        .icmp_error => {},
+        else => return error.TestUnexpectedResult,
+    }
+}

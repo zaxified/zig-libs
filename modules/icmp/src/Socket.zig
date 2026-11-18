@@ -287,6 +287,12 @@ pub fn sendTo(self: *const Socket, addr: *const linux.sockaddr, addr_len: linux.
     // error stays on the error queue for `recvErr`), so one retry sends the
     // probe; a send that fails again has an error of its own.
     if (icmpReportedErrno(e)) e = self.sendOnce(addr, addr_len, packet);
+    return sendResult(e);
+}
+
+/// The `SendError` a send's errno stands for (a pure table, so it is tested
+/// without provoking each errno from the kernel).
+fn sendResult(e: linux.E) SendError!void {
     switch (e) {
         .SUCCESS => {},
         .AGAIN, .NOBUFS => return error.WouldBlock,
@@ -890,4 +896,531 @@ test "A1 F6: a RAW socket's ident is drawn from the kernel CSPRNG, not the proce
     defer s2.close();
 
     try std.testing.expect(s1.ident != s2.ident);
+}
+
+// ── whole-module mutation audit (2026-11-17): option, ancillary-data and
+// loopback tests. A ping socket needs `net.ipv4.ping_group_range`; every test
+// that needs one skips when `open` says it cannot have one.
+
+/// Can this process make a ping socket at all? Asked of the kernel directly,
+/// so a refusal from `open` itself (a mutated mode switch, a wrong domain) is
+/// a failure and not a skip.
+fn pingAvailable(family: Family) bool {
+    const rc = linux.socket(switch (family) {
+        .v4 => linux.AF.INET,
+        .v6 => linux.AF.INET6,
+    }, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, switch (family) {
+        .v4 => linux.IPPROTO.ICMP,
+        .v6 => linux.IPPROTO.ICMPV6,
+    });
+    if (linux.errno(rc) != .SUCCESS) return false;
+    _ = linux.close(@intCast(rc));
+    return true;
+}
+
+/// Can this process make a RAW ICMP socket (CAP_NET_RAW)?
+fn rawAvailable() bool {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.RAW | linux.SOCK.CLOEXEC, linux.IPPROTO.ICMP);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    _ = linux.close(@intCast(rc));
+    return true;
+}
+
+/// Can this process set SO_MARK (CAP_NET_ADMIN)?
+fn markSettable() bool {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const mark: u32 = 0x1234;
+    return linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.MARK, @ptrCast(&mark), @sizeOf(u32))) == .SUCCESS;
+}
+
+fn openOrSkip(family: Family, mode: Mode, opts: Options) !Socket {
+    if (!pingAvailable(family)) return error.SkipZigTest;
+    return Socket.open(family, mode, opts);
+}
+
+fn getOptU32(fd: i32, level: i32, opt: u32) !u32 {
+    var v: u32 = 0;
+    var len: linux.socklen_t = @sizeOf(u32);
+    if (linux.errno(linux.getsockopt(fd, level, opt, @ptrCast(&v), &len)) != .SUCCESS) return error.TestUnexpectedResult;
+    return v;
+}
+
+fn loopback4() linux.sockaddr.in {
+    return .{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 }) };
+}
+
+test "open v4: every option and ancillary request reaches the kernel" {
+    var s = try openOrSkip(.v4, .dgram, .{ .recv_buf_size = 8192, .ttl = 77, .tos = 0x28, .dont_fragment = true });
+    defer s.close();
+    try std.testing.expectEqual(Kind.dgram, s.kind);
+    try std.testing.expect(s.ident != 0);
+    try std.testing.expectEqual(@as(u32, 77), try getOptU32(s.fd, linux.SOL.IP, linux.IP.TTL));
+    try std.testing.expectEqual(@as(u32, 0x28), try getOptU32(s.fd, linux.SOL.IP, linux.IP.TOS));
+    try std.testing.expectEqual(@as(u32, linux.IP.PMTUDISC_DO), try getOptU32(s.fd, linux.SOL.IP, linux.IP.MTU_DISCOVER));
+    try std.testing.expectEqual(@as(u32, 1), try getOptU32(s.fd, linux.SOL.IP, linux.IP.RECVTTL));
+    try std.testing.expectEqual(@as(u32, 1), try getOptU32(s.fd, linux.SOL.IP, linux.IP.RECVTOS));
+    try std.testing.expectEqual(@as(u32, 1), try getOptU32(s.fd, linux.SOL.IP, linux.IP.RECVERR));
+    try std.testing.expectEqual(@as(u32, 1), try getOptU32(s.fd, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_OLD));
+    // The kernel doubles a requested receive buffer: 8 KiB asked, 16 KiB held.
+    try std.testing.expectEqual(@as(u32, 16384), try getOptU32(s.fd, linux.SOL.SOCKET, linux.SO.RCVBUF));
+
+    // No option given: kernel defaults (TTL 64, no DF, default receive buffer),
+    // and `recv_buf_size = 0` means "leave it".
+    var d = try openOrSkip(.v4, .dgram, .{ .recv_buf_size = 0 });
+    defer d.close();
+    try std.testing.expect((try getOptU32(d.fd, linux.SOL.IP, linux.IP.TTL)) != 77);
+    try std.testing.expect((try getOptU32(d.fd, linux.SOL.IP, linux.IP.MTU_DISCOVER)) != linux.IP.PMTUDISC_DO);
+    try std.testing.expect((try getOptU32(d.fd, linux.SOL.SOCKET, linux.SO.RCVBUF)) > 100_000);
+}
+
+test "open v6: every option and ancillary request reaches the kernel" {
+    var s = try openOrSkip(.v6, .dgram, .{ .ttl = 77, .tos = 0x28, .dont_fragment = true });
+    defer s.close();
+    try std.testing.expectEqual(@as(u32, 77), try getOptU32(s.fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS));
+    try std.testing.expectEqual(@as(u32, 0x28), try getOptU32(s.fd, linux.SOL.IPV6, linux.IPV6.TCLASS));
+    try std.testing.expectEqual(@as(u32, linux.IPV6.PMTUDISC_DO), try getOptU32(s.fd, linux.SOL.IPV6, linux.IPV6.MTU_DISCOVER));
+    try std.testing.expectEqual(@as(u32, 1), try getOptU32(s.fd, linux.SOL.IPV6, linux.IPV6.RECVHOPLIMIT));
+    try std.testing.expectEqual(@as(u32, 1), try getOptU32(s.fd, linux.SOL.IPV6, linux.IPV6.RECVTCLASS));
+    try std.testing.expectEqual(@as(u32, 1), try getOptU32(s.fd, linux.SOL.IPV6, linux.IPV6.RECVERR));
+    var d = try openOrSkip(.v6, .dgram, .{});
+    defer d.close();
+    try std.testing.expect((try getOptU32(d.fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS)) != 77);
+    try std.testing.expect((try getOptU32(d.fd, linux.SOL.IPV6, linux.IPV6.MTU_DISCOVER)) != linux.IPV6.PMTUDISC_DO);
+}
+
+test "open: mode, source, interface and outgoing-interface options" {
+    // Mode: dgram and auto yield a ping socket; raw yields a raw one or a refusal.
+    var a = try openOrSkip(.v4, .auto, .{});
+    defer a.close();
+    try std.testing.expectEqual(Kind.dgram, a.kind);
+    var dg = try openOrSkip(.v4, .dgram, .{});
+    defer dg.close();
+    try std.testing.expectEqual(Kind.dgram, dg.kind);
+    if (Socket.open(.v4, .raw, .{})) |r| {
+        var rr = r;
+        defer rr.close();
+        try std.testing.expectEqual(Kind.raw, rr.kind);
+    } else |err| {
+        try std.testing.expect(!rawAvailable()); // a refusal only where the kernel refuses
+        try std.testing.expectEqual(error.PermissionDenied, err);
+    }
+
+    // A source address is bound; the ident is the bound port; pktinfo keeps it.
+    var s = try openOrSkip(.v4, .dgram, .{ .source = .{ .v4 = loopback4() }, .oiface_index = 1 });
+    defer s.close();
+    try std.testing.expectEqual(loopback4().addr, s.pktinfo_src4);
+    try std.testing.expectEqual(@as(u32, 1), s.oiface_index);
+    var sa: linux.sockaddr.in = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockname(s.fd, @ptrCast(&sa), &len)));
+    try std.testing.expectEqual(loopback4().addr, sa.addr);
+    try std.testing.expect(s.ident != 0);
+    try std.testing.expectEqual(std.mem.bigToNative(u16, sa.port), s.ident);
+
+    // A plain open binds a wildcard just to learn the ident; nothing is stored.
+    try std.testing.expectEqual(@as(u32, 0), a.oiface_index);
+    try std.testing.expectEqual(@as(u32, 0), a.pktinfo_src4);
+    try std.testing.expect(a.ident != 0);
+
+    // A source of the other family, or one that is not local, is refused.
+    try std.testing.expectError(error.SourceAddressBind, Socket.open(.v4, .dgram, .{ .source = .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = @splat(0), .scope_id = 0 } } }));
+    const v6_other = Socket.open(.v6, .dgram, .{ .source = .{ .v4 = loopback4() } });
+    if (v6_other) |o| {
+        var oo = o;
+        oo.close();
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.SourceAddressBind => {},
+        error.AddressFamilyUnsupported => {},
+        else => return err,
+    }
+    const away: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 192, 0, 2, 55 }) };
+    try std.testing.expectError(error.SourceAddressBind, Socket.open(.v4, .dgram, .{ .source = .{ .v4 = away } }));
+
+    // SO_BINDTODEVICE: an unknown name is refused, `lo` is bound.
+    try std.testing.expectError(error.InterfaceBind, Socket.open(.v4, .dgram, .{ .iface = "nonexist0" }));
+    if (Socket.open(.v4, .dgram, .{ .iface = "lo" })) |b| {
+        var bb = b;
+        defer bb.close();
+        var name: [16]u8 = @splat(0);
+        var nl: linux.socklen_t = name.len;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getsockopt(bb.fd, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, &name, &nl)));
+        try std.testing.expectEqualStrings("lo", name[0..2]);
+    } else |err| try std.testing.expectEqual(error.InterfaceBind, err); // an environment that forbids it
+
+    // SO_MARK needs CAP_NET_ADMIN; where the kernel allows it the mark must be set.
+    var m = try openOrSkip(.v4, .dgram, .{ .fwmark = 0x1234 });
+    defer m.close();
+    const got = try getOptU32(m.fd, linux.SOL.SOCKET, linux.SO.MARK);
+    if (markSettable()) try std.testing.expectEqual(@as(u32, 0x1234), got) else try std.testing.expectEqual(@as(u32, 0), got);
+}
+
+test "sendResult maps every send errno, and only those" {
+    try sendResult(.SUCCESS);
+    const table = [_]struct { e: linux.E, want: SendError }{
+        .{ .e = .AGAIN, .want = error.WouldBlock },
+        .{ .e = .NOBUFS, .want = error.WouldBlock },
+        .{ .e = .NETUNREACH, .want = error.NetworkUnreachable },
+        .{ .e = .NETDOWN, .want = error.NetworkUnreachable },
+        .{ .e = .HOSTUNREACH, .want = error.HostUnreachable },
+        .{ .e = .HOSTDOWN, .want = error.HostUnreachable },
+        .{ .e = .ACCES, .want = error.PermissionDenied },
+        .{ .e = .PERM, .want = error.PermissionDenied },
+        .{ .e = .MSGSIZE, .want = error.MessageTooLong },
+        .{ .e = .INVAL, .want = error.Unexpected },
+        .{ .e = .BADF, .want = error.Unexpected },
+    };
+    for (table) |t| try std.testing.expectError(t.want, sendResult(t.e));
+}
+
+test "buildPktinfo lays out the IP_PKTINFO / IPV6_PKTINFO control message exactly" {
+    const hdr_len = @sizeOf(linux.cmsghdr);
+    var control: [64]u8 align(@alignOf(linux.cmsghdr)) = @splat(0xAA);
+    var s4: Socket = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0, .oiface_index = 7, .pktinfo_src4 = 0x0a0b0c0d };
+    const n4 = s4.buildPktinfo(&control);
+    try std.testing.expectEqual(std.mem.alignForward(usize, hdr_len + @sizeOf(linux.in_pktinfo), @alignOf(linux.cmsghdr)), n4);
+    const h4: *const linux.cmsghdr = @ptrCast(&control);
+    try std.testing.expectEqual(hdr_len + @sizeOf(linux.in_pktinfo), h4.len);
+    try std.testing.expectEqual(@as(i32, linux.SOL.IP), h4.level);
+    try std.testing.expectEqual(@as(i32, linux.IP.PKTINFO), h4.type);
+    const p4 = std.mem.bytesToValue(linux.in_pktinfo, control[hdr_len..][0..@sizeOf(linux.in_pktinfo)]);
+    try std.testing.expectEqual(@as(i32, 7), p4.ifindex);
+    try std.testing.expectEqual(@as(u32, 0x0a0b0c0d), p4.spec_dst);
+    try std.testing.expectEqual(@as(u32, 0), p4.addr);
+
+    control = @splat(0xAA);
+    var s6: Socket = .{ .fd = -1, .family = .v6, .kind = .dgram, .ident = 0, .oiface_index = 9 };
+    const n6 = s6.buildPktinfo(&control);
+    try std.testing.expectEqual(std.mem.alignForward(usize, hdr_len + @sizeOf(linux.in6_pktinfo), @alignOf(linux.cmsghdr)), n6);
+    const h6: *const linux.cmsghdr = @ptrCast(&control);
+    try std.testing.expectEqual(hdr_len + @sizeOf(linux.in6_pktinfo), h6.len);
+    try std.testing.expectEqual(@as(i32, linux.SOL.IPV6), h6.level);
+    try std.testing.expectEqual(@as(i32, linux.IPV6.PKTINFO), h6.type);
+    const p6 = std.mem.bytesToValue(linux.in6_pktinfo, control[hdr_len..][0..@sizeOf(linux.in6_pktinfo)]);
+    try std.testing.expectEqual(@as(i32, 9), p6.ifindex);
+    try std.testing.expectEqual(@as([16]u8, @splat(0)), p6.addr);
+}
+
+/// Append one cmsg (header + `data`) to `buf` at `off`; returns the aligned end.
+fn putCmsg(buf: []u8, off: usize, level: i32, typ: i32, data: []const u8) usize {
+    const hdr_len = @sizeOf(linux.cmsghdr);
+    const hdr: linux.cmsghdr = .{ .len = hdr_len + data.len, .level = level, .type = typ };
+    @memcpy(buf[off..][0..hdr_len], std.mem.asBytes(&hdr));
+    @memcpy(buf[off + hdr_len ..][0..data.len], data);
+    return off + std.mem.alignForward(usize, hdr_len + data.len, @alignOf(linux.cmsghdr));
+}
+
+fn u32le(v: u32) [4]u8 {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    return b;
+}
+
+test "parseControl: TTL, TOS, hop limit, traffic class and the kernel timestamp, back to back" {
+    var buf: [256]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    const ts: linux.timespec = .{ .sec = 5, .nsec = 7 };
+    // TOS is 1 data byte (cmsg len 17, step 24): the timestamp after it is
+    // found only if the walk steps by the aligned length.
+    var end = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TTL, &u32le(64));
+    end = putCmsg(&buf, end, linux.SOL.IP, linux.IP.TOS, &[_]u8{0x2e});
+    end = putCmsg(&buf, end, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_OLD, std.mem.asBytes(&ts));
+    var info: RecvInfo = .{ .packet = &.{} };
+    parseControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(?u8, 64), info.ttl);
+    try std.testing.expectEqual(@as(?u8, 0x2e), info.tos);
+    try std.testing.expectEqual(@as(?i64, 5 * std.time.ns_per_s + 7), info.timestamp_real_ns);
+
+    buf = @splat(0);
+    end = putCmsg(&buf, 0, linux.SOL.IPV6, linux.IPV6.HOPLIMIT, &u32le(55));
+    end = putCmsg(&buf, end, linux.SOL.IPV6, linux.IPV6.TCLASS, &u32le(0xb8));
+    info = .{ .packet = &.{} };
+    parseControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(?u8, 55), info.ttl);
+    try std.testing.expectEqual(@as(?u8, 0xb8), info.tos);
+    try std.testing.expectEqual(@as(?i64, null), info.timestamp_real_ns);
+}
+
+test "parseControl: the level, the data length and the cmsg bounds are each checked" {
+    var buf: [256]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    var info: RecvInfo = .{ .packet = &.{} };
+    // The right type at the wrong level is not it.
+    var end = putCmsg(&buf, 0, linux.SOL.IPV6, linux.IP.TTL, &u32le(9));
+    end = putCmsg(&buf, end, linux.SOL.IP, linux.IPV6.HOPLIMIT, &u32le(9));
+    end = putCmsg(&buf, end, linux.SOL.IP, linux.IPV6.TCLASS, &u32le(9));
+    end = putCmsg(&buf, end, linux.SOL.SOCKET, linux.IP.TOS, &[_]u8{9});
+    parseControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(?u8, null), info.ttl);
+    try std.testing.expectEqual(@as(?u8, null), info.tos);
+
+    // One byte short of its payload: not read.
+    buf = @splat(0);
+    info = .{ .packet = &.{} };
+    end = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TTL, &[_]u8{ 64, 0, 0 });
+    end = putCmsg(&buf, end, linux.SOL.IP, linux.IP.TOS, &.{});
+    end = putCmsg(&buf, end, linux.SOL.IPV6, linux.IPV6.HOPLIMIT, &[_]u8{ 1, 0, 0 });
+    end = putCmsg(&buf, end, linux.SOL.IPV6, linux.IPV6.TCLASS, &[_]u8{ 1, 0, 0 });
+    end = putCmsg(&buf, end, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_OLD, &@as([15]u8, @splat(0)));
+    parseControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(?u8, null), info.ttl);
+    try std.testing.expectEqual(@as(?u8, null), info.tos);
+    try std.testing.expectEqual(@as(?i64, null), info.timestamp_real_ns);
+
+    // Exactly sized payloads (no padding, no slack) are read, at the very end of the buffer.
+    buf = @splat(0);
+    info = .{ .packet = &.{} };
+    _ = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TTL, &u32le(33));
+    parseControl(buf[0 .. @sizeOf(linux.cmsghdr) + 4], &info);
+    try std.testing.expectEqual(@as(?u8, 33), info.ttl);
+    buf = @splat(0);
+    info = .{ .packet = &.{} };
+    const ts: linux.timespec = .{ .sec = 1, .nsec = 2 };
+    _ = putCmsg(&buf, 0, linux.SOL.SOCKET, linux.SO.TIMESTAMPNS_OLD, std.mem.asBytes(&ts));
+    parseControl(buf[0 .. @sizeOf(linux.cmsghdr) + @sizeOf(linux.timespec)], &info);
+    try std.testing.expectEqual(@as(?i64, std.time.ns_per_s + 2), info.timestamp_real_ns);
+    // A one-byte TOS at the end of the buffer.
+    buf = @splat(0);
+    info = .{ .packet = &.{} };
+    _ = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TOS, &[_]u8{0x10});
+    parseControl(buf[0 .. @sizeOf(linux.cmsghdr) + 1], &info);
+    try std.testing.expectEqual(@as(?u8, 0x10), info.tos);
+
+    // A cmsg shorter than its own header ends the walk without a slice panic;
+    // a header-only cmsg (len == header) is skipped and the walk goes on.
+    buf = @splat(0);
+    info = .{ .packet = &.{} };
+    const stub: linux.cmsghdr = .{ .len = 4, .level = linux.SOL.IP, .type = linux.IP.TTL };
+    @memcpy(buf[0..@sizeOf(linux.cmsghdr)], std.mem.asBytes(&stub));
+    parseControl(buf[0..64], &info);
+    try std.testing.expectEqual(@as(?u8, null), info.ttl);
+    buf = @splat(0);
+    end = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TOS, &.{});
+    end = putCmsg(&buf, end, linux.SOL.IP, linux.IP.TTL, &u32le(12));
+    parseControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(?u8, 12), info.ttl);
+}
+
+test "parseErrControl: both families, exact sizes, wrong levels and the aligned walk" {
+    var buf: [256]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    const ee: sock_extended_err = .{ .ee_errno = 113, .ee_origin = origin_icmp, .ee_type = 3, .ee_code = 1, .ee_pad = 0, .ee_info = 0, .ee_data = 0 };
+    const ee_bytes = std.mem.asBytes(&ee);
+    var info: ErrInfo = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+
+    // v6 level, exactly sock_extended_err (no offender): read; type != code.
+    var end = putCmsg(&buf, 0, linux.SOL.IPV6, linux.IPV6.RECVERR, ee_bytes);
+    parseErrControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(u8, 3), info.err_type);
+    try std.testing.expectEqual(@as(u8, 1), info.err_code);
+    try std.testing.expectEqual(origin_icmp, info.origin);
+    try std.testing.expectEqual(RecvInfo.SrcAddr.none, info.offender);
+
+    // Wrong level/type combinations carrying the same payload are not it.
+    buf = @splat(0);
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    end = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TTL, ee_bytes);
+    end = putCmsg(&buf, end, linux.SOL.IP, linux.IPV6.RECVERR, ee_bytes);
+    end = putCmsg(&buf, end, linux.SOL.IPV6, linux.IP.RECVERR, ee_bytes);
+    end = putCmsg(&buf, end, linux.SOL.SOCKET, linux.IP.RECVERR, ee_bytes);
+    parseErrControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(u8, 0), info.err_type);
+    try std.testing.expectEqual(@as(u8, 0), info.origin);
+
+    // One byte short of sock_extended_err: ignored, no read past the data.
+    buf = @splat(0);
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    end = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.RECVERR, ee_bytes[0 .. ee_bytes.len - 1]);
+    parseErrControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(u8, 0), info.err_type);
+
+    // A cmsg shorter than its header ends the walk; a header-only cmsg is
+    // skipped and the one behind it is read.
+    buf = @splat(0);
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    const stub: linux.cmsghdr = .{ .len = 4, .level = linux.SOL.IP, .type = linux.IP.RECVERR };
+    @memcpy(buf[0..@sizeOf(linux.cmsghdr)], std.mem.asBytes(&stub));
+    parseErrControl(buf[0..64], &info);
+    try std.testing.expectEqual(@as(u8, 0), info.err_type);
+    buf = @splat(0);
+    end = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TTL, &.{});
+    end = putCmsg(&buf, end, linux.SOL.IP, linux.IP.RECVERR, ee_bytes);
+    parseErrControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(u8, 3), info.err_type);
+
+    // Two messages, the first with an unaligned length (16-byte header + 16
+    // + 4 offender bytes = 36, step 40): the second is found at the aligned offset.
+    buf = @splat(0);
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    var ee2 = ee;
+    ee2.ee_type = 11;
+    var data1: [20]u8 = @splat(0);
+    @memcpy(data1[0..16], ee_bytes);
+    end = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.RECVERR, &data1);
+    end = putCmsg(&buf, end, linux.SOL.IP, linux.IP.RECVERR, std.mem.asBytes(&ee2));
+    parseErrControl(buf[0..end], &info);
+    try std.testing.expectEqual(@as(u8, 11), info.err_type);
+}
+
+test "parseSrc and parseSrcSlice: lengths decide, a long slice is clamped" {
+    var st: [@sizeOf(linux.sockaddr.in6)]u8 align(8) = @splat(0);
+    const v4a: linux.sockaddr.in = .{ .port = 0, .addr = 0x0100007f };
+    @memcpy(st[0..@sizeOf(linux.sockaddr.in)], std.mem.asBytes(&v4a));
+    try std.testing.expectEqual(RecvInfo.SrcAddr.none, parseSrc(&st, @sizeOf(linux.sockaddr.in) - 1));
+    try std.testing.expectEqual(RecvInfo.SrcAddr.none, parseSrc(&st, 1));
+    switch (parseSrc(&st, @sizeOf(linux.sockaddr.in))) {
+        .v4 => |a| try std.testing.expectEqual(@as(u32, 0x0100007f), a.addr),
+        else => return error.TestUnexpectedResult,
+    }
+    var v6a: linux.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = @splat(0), .scope_id = 0 };
+    v6a.addr[15] = 1;
+    @memcpy(st[0..@sizeOf(linux.sockaddr.in6)], std.mem.asBytes(&v6a));
+    try std.testing.expectEqual(RecvInfo.SrcAddr.none, parseSrc(&st, @sizeOf(linux.sockaddr.in6) - 1));
+    switch (parseSrc(&st, @sizeOf(linux.sockaddr.in6))) {
+        .v6 => |a| try std.testing.expectEqual(@as(u8, 1), a.addr[15]),
+        else => return error.TestUnexpectedResult,
+    }
+    // A slice longer than a sockaddr_in6 (an error cmsg's offender is followed by padding).
+    var long: [40]u8 = @splat(0xEE);
+    @memcpy(long[0..@sizeOf(linux.sockaddr.in6)], std.mem.asBytes(&v6a));
+    switch (parseSrcSlice(&long)) {
+        .v6 => |a| try std.testing.expectEqual(@as(u8, 1), a.addr[15]),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+/// Wait (bounded) until `recvMsg` yields a packet.
+fn waitRecv(s: *const Socket, buf: []u8) !RecvInfo {
+    for (0..300) |_| {
+        if (s.recvMsg(buf)) |i| return i;
+        const nap: linux.timespec = .{ .sec = 0, .nsec = 5 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&nap, null);
+    }
+    return error.SkipZigTest; // no reply: an environment without ICMP echo
+}
+
+fn echoProbe(seq: u16, len: usize, buf: []u8) []u8 {
+    @memset(buf[0..len], 0);
+    buf[0] = 8; // echo request; the kernel fills ident and checksum on a ping socket
+    std.mem.writeInt(u16, buf[6..8], seq, .big);
+    return buf[0..len];
+}
+
+test "a ping socket round-trips echoes over loopback: recvMsg, recvBatch, sendMany, pktinfo" {
+    var s = try openOrSkip(.v4, .dgram, .{});
+    defer s.close();
+    const lo = loopback4();
+    var pk: [16]u8 = undefined;
+    var rb: [512]u8 = undefined;
+
+    // Nothing queued: null, not a bogus slice.
+    try std.testing.expect(s.recvMsg(&rb) == null);
+    try std.testing.expect(s.recvErr(&rb) == null);
+
+    s.sendTo(@ptrCast(&lo), @sizeOf(linux.sockaddr.in), echoProbe(1, 8, &pk)) catch return error.SkipZigTest;
+    const info = try waitRecv(&s, &rb);
+    try std.testing.expectEqual(@as(usize, 8), info.packet.len); // the packet, not the whole buffer
+    try std.testing.expectEqual(@as(u8, 0), info.packet[0]); // echo reply
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, info.packet[6..8], .big));
+    switch (info.src) {
+        .v4 => |a| try std.testing.expectEqual(lo.addr, a.addr),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(?u8, 64), info.ttl);
+    try std.testing.expect(info.tos != null);
+    try std.testing.expect(info.timestamp_real_ns != null and info.timestamp_real_ns.? > 0);
+
+    // A batch: three replies land in their own slots, each fully described.
+    // slot_size 16 = the reply length, so a slot one byte short truncates.
+    var slab: [batch_max * 16]u8 = undefined;
+    var b: RecvBatch = .{ .slab = &slab, .slot_size = 16 };
+    for ([_]u16{ 10, 11, 12 }) |seq| s.sendTo(@ptrCast(&lo), @sizeOf(linux.sockaddr.in), echoProbe(seq, 16, &pk)) catch return error.SkipZigTest;
+    const nap: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&nap, null);
+    const got = try s.recvBatch(&b);
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    for (got, [_]u16{ 10, 11, 12 }, 0..) |g, seq, i| {
+        try std.testing.expectEqual(@intFromPtr(&slab) + i * 16, @intFromPtr(g.packet.ptr));
+        try std.testing.expectEqual(@as(usize, 16), g.packet.len);
+        try std.testing.expectEqual(seq, std.mem.readInt(u16, g.packet[6..8], .big));
+        try std.testing.expect(g.src == .v4 and g.src.v4.addr == lo.addr);
+        try std.testing.expectEqual(@as(?u8, 64), g.ttl);
+        try std.testing.expect(g.timestamp_real_ns != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try s.recvBatch(&b)).len); // drained
+    // An exactly sized slab is accepted, one byte less is not.
+    var short: RecvBatch = .{ .slab = slab[0 .. slab.len - 1], .slot_size = 16 };
+    try std.testing.expectError(error.SlabTooSmall, s.recvBatch(&short));
+
+    // sendMany: all three go out; with an outgoing interface the pktinfo goes too.
+    var p1: [16]u8 = undefined;
+    var p2: [16]u8 = undefined;
+    var p3: [16]u8 = undefined;
+    const pkts = [_][]const u8{ echoProbe(20, 16, &p1), echoProbe(21, 16, &p2), echoProbe(22, 16, &p3) };
+    const addrs = [_]*const linux.sockaddr{ @ptrCast(&lo), @ptrCast(&lo), @ptrCast(&lo) };
+    try std.testing.expectEqual(@as(usize, 3), try s.sendMany(&addrs, @sizeOf(linux.sockaddr.in), &pkts));
+    _ = linux.nanosleep(&nap, null);
+    try std.testing.expectEqual(@as(usize, 3), (try s.recvBatch(&b)).len);
+    s.oiface_index = 1; // lo
+    s.pktinfo_src4 = lo.addr;
+    try std.testing.expectEqual(@as(usize, 3), try s.sendMany(&addrs, @sizeOf(linux.sockaddr.in), &pkts));
+    _ = linux.nanosleep(&nap, null);
+    try std.testing.expectEqual(@as(usize, 3), (try s.recvBatch(&b)).len);
+    s.sendTo(@ptrCast(&lo), @sizeOf(linux.sockaddr.in), echoProbe(30, 8, &pk)) catch return error.TestUnexpectedResult;
+    _ = try waitRecv(&s, &rb);
+    // A real outgoing interface is honoured; a nonexistent one is an error
+    // from the kernel, on the single and the batched path alike.
+    s.oiface_index = 99999;
+    try std.testing.expect(std.meta.isError(s.sendTo(@ptrCast(&lo), @sizeOf(linux.sockaddr.in), echoProbe(31, 8, &pk))));
+    try std.testing.expectEqual(@as(usize, 0), try s.sendMany(&addrs, @sizeOf(linux.sockaddr.in), &pkts));
+}
+
+test "recvErr returns the quoted destination, the ICMP error and its offender" {
+    // A UDP socket with IP_RECVERR stands in for the ping socket: a datagram to
+    // a closed port comes back as an ICMP port unreachable on the error queue.
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const on: u32 = 1;
+    if (linux.errno(linux.setsockopt(fd, linux.SOL.IP, linux.IP.RECVERR, @ptrCast(&on), @sizeOf(u32))) != .SUCCESS) return error.SkipZigTest;
+    const closed = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(closed) != .SUCCESS) return error.SkipZigTest;
+    const cfd: i32 = @intCast(closed);
+    var dst = loopback4();
+    if (linux.errno(linux.bind(cfd, @ptrCast(&dst), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(cfd);
+        return error.SkipZigTest;
+    }
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = linux.getsockname(cfd, @ptrCast(&dst), &len);
+    _ = linux.close(cfd); // nobody listens on that port now
+    const payload = "quoted-payload";
+    if (linux.errno(linux.sendto(fd, payload, payload.len, 0, @ptrCast(&dst), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+
+    const s: Socket = .{ .fd = fd, .family = .v4, .kind = .dgram, .ident = 0 };
+    var buf: [128]u8 = undefined;
+    var info: ?ErrInfo = null;
+    for (0..100) |_| {
+        info = s.recvErr(&buf);
+        if (info != null) break;
+        const nap: linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&nap, null);
+    }
+    const e = info orelse return error.SkipZigTest;
+    try std.testing.expectEqualStrings(payload, e.packet); // the quoted datagram, not the whole buffer
+    try std.testing.expectEqual(@as(u8, 3), e.err_type); // destination unreachable
+    try std.testing.expectEqual(@as(u8, 3), e.err_code); // port unreachable
+    try std.testing.expectEqual(origin_icmp, e.origin);
+    switch (e.src) {
+        .v4 => |a| {
+            try std.testing.expectEqual(dst.addr, a.addr);
+            try std.testing.expectEqual(dst.port, a.port);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (e.offender) {
+        .v4 => |a| try std.testing.expectEqual(dst.addr, a.addr),
+        else => return error.TestUnexpectedResult,
+    }
 }

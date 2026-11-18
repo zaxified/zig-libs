@@ -96,3 +96,45 @@ pub fn ipOf(sa: anytype) net.IpAddress {
         else => @compileError("not an IP sockaddr"),
     };
 }
+
+// ── whole-module mutation audit (2026-11-17) ────────────────────────────────
+
+test "audit: ipOf carries the address bytes of either family" {
+    const a4 = ipOf(linux.sockaddr.in{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 10, 1, 2, 3 }) });
+    try std.testing.expectEqual([4]u8{ 10, 1, 2, 3 }, a4.ip4.bytes);
+    var b6: [16]u8 = @splat(0);
+    b6[0] = 0x20;
+    b6[15] = 9;
+    const a6 = ipOf(linux.sockaddr.in6{ .port = 0, .flowinfo = 0, .addr = b6, .scope_id = 0 });
+    try std.testing.expectEqual(b6, a6.ip6.bytes);
+}
+
+test "audit: recvBatch sizes the slab exactly, one slot per reply, each described" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var s = open(threaded.io(), .v4, null) catch return error.SkipZigTest;
+    defer s.close();
+    var slab: [Socket.batch_max * 32]u8 = undefined;
+    var b: Socket.RecvBatch = .{ .slab = &slab, .slot_size = 32 };
+    var short: Socket.RecvBatch = .{ .slab = slab[0 .. slab.len - 1], .slot_size = 32 };
+    try std.testing.expectError(error.SlabTooSmall, s.recvBatch(&short));
+    try std.testing.expectEqual(@as(usize, 0), (try s.recvBatch(&b)).len); // exact slab, nothing queued
+    const lo = ipOf(linux.sockaddr.in{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 }) });
+    for ([_]u16{ 1, 2, 3 }) |seq| {
+        var pk: [8]u8 = @splat(0);
+        pk[0] = 8;
+        std.mem.writeInt(u16, pk[6..8], seq, .big);
+        s.sendTo(lo, &pk) catch return error.SkipZigTest;
+    }
+    const nap: linux.timespec = .{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&nap, null);
+    const got = try s.recvBatch(&b);
+    if (got.len == 0) return error.SkipZigTest; // no ICMP echo in this environment
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    for (got, [_]u16{ 1, 2, 3 }, 0..) |g, seq, i| {
+        try std.testing.expectEqual(@intFromPtr(&slab) + i * 32, @intFromPtr(g.packet.ptr));
+        try std.testing.expectEqual(@as(usize, 8), g.packet.len);
+        try std.testing.expectEqual(seq, std.mem.readInt(u16, g.packet[6..8], .big));
+        try std.testing.expect(g.src == .v4);
+    }
+}

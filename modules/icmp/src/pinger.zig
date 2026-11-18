@@ -2408,3 +2408,242 @@ test "takeSlot finds the one free id however far the cursor has to walk, and fai
     p.seqmap.cursor = free +% 1;
     try std.testing.expectEqual(free, try p.takeSlot(0, 1, now));
 }
+
+// ── whole-module mutation audit (2026-11-17): private-function tests ─────────
+
+test "audit: Stats accessors at their edges" {
+    const one: Stats = .{ .sent = 3, .recv = 1, .total_ns = 5 };
+    try std.testing.expectEqual(@as(?u64, 5), one.avgNs()); // a single reply has an average
+    try std.testing.expectEqual(@as(?u64, 0), one.stddevNs()); // and a deviation of 0
+    try std.testing.expectEqual(@as(?u64, null), one.jitterNs()); // but no jitter
+    const two: Stats = .{ .sent = 3, .recv = 2, .jitter_sum_ns = 10 };
+    try std.testing.expectEqual(@as(?u64, 10), two.jitterNs()); // two replies: one difference
+    // NaN variance is "no deviation", not an `@intFromFloat` of NaN.
+    const nan: Stats = .{ .recv = 1, .rtt_m2 = std.math.nan(f64) };
+    try std.testing.expectEqual(@as(?u64, 0), nan.stddevNs());
+    // sqrt(2^128) = 2^64 exactly: out of u64 range, so it saturates.
+    const big: Stats = .{ .recv = 1, .rtt_m2 = 0x1p128 };
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), big.stddevNs());
+    // Population deviation (divisor n): m2 = 8 over 2 samples is 2, not sqrt(8).
+    const pop: Stats = .{ .recv = 2, .rtt_m2 = 8 };
+    try std.testing.expectEqual(@as(?u64, 2), pop.stddevNs());
+    try std.testing.expect(!(Stats{}).alive());
+    try std.testing.expect((Stats{ .recv = 1 }).alive());
+    try std.testing.expectEqual(@as(u32, 250), (Stats{ .sent = 4, .recv = 3 }).lossPermille());
+    try std.testing.expectEqual(@as(u32, 0), (Stats{ .sent = 4, .recv = 4 }).lossPermille());
+    try std.testing.expectEqual(@as(u32, 1000), (Stats{ .sent = 7, .recv = 0 }).lossPermille());
+}
+
+test "audit: Stats.noteReply keeps the mean, the squared deviations and the last RTT" {
+    var s: Stats = .{};
+    s.noteReply(10);
+    s.noteReply(30);
+    try std.testing.expectEqual(@as(u32, 2), s.recv);
+    try std.testing.expectEqual(@as(u64, 20), s.jitter_sum_ns);
+    try std.testing.expectEqual(@as(u64, 30), s.last_ns);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), s.rtt_mean, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 200), s.rtt_m2, 1e-9);
+    s.noteReply(5); // a falling RTT adds the absolute difference
+    try std.testing.expectEqual(@as(u64, 45), s.jitter_sum_ns);
+    try std.testing.expectApproxEqAbs(@as(f64, 15), s.rtt_mean, 1e-9);
+}
+
+test "audit: Addr scope ids, host equality, subnet keys and sockaddr lengths" {
+    const a = try Addr.parse("fe80::1%7");
+    try std.testing.expectEqual(@as(u32, 7), a.v6.scope_id);
+    try std.testing.expectError(error.InvalidAddress, Addr.parse("192.0.2.1%1"));
+    try std.testing.expectError(error.InvalidAddress, Addr.parse("fe80::1%nonexist0"));
+    if (Addr.parse("fe80::1%lo")) |named| {
+        try std.testing.expect(named.v6.scope_id != 0);
+    } else |_| {}
+
+    const v6a = try Addr.parse("2001:db8::1");
+    var v6b = v6a;
+    try std.testing.expect(v6a.sameHost(v6b));
+    v6b.v6.scope_id = 9; // the scope is not part of the host
+    try std.testing.expect(v6a.sameHost(v6b));
+    v6b.v6.addr[15] ^= 1;
+    try std.testing.expect(!v6a.sameHost(v6b));
+    v6b = v6a;
+    v6b.v6.addr[12] ^= 1; // past the first 8 bytes
+    try std.testing.expect(!v6a.sameHost(v6b));
+    const v4a = try Addr.parse("192.0.2.1");
+    try std.testing.expect(!v6a.sameHost(v4a));
+    try std.testing.expect(!v4a.sameHost(v6a));
+    try std.testing.expect(v4a.sameHost(try Addr.parse("192.0.2.1")));
+    try std.testing.expect(!v4a.sameHost(try Addr.parse("192.0.2.2")));
+
+    // v4 keys are the /24 of the address (the tag bit that keeps them out of
+    // the v6 key space matters only inside the reserved 0000::/8).
+    try std.testing.expectEqual(v4a.subnetKey(), (try Addr.parse("192.0.2.200")).subnetKey());
+    try std.testing.expect(v4a.subnetKey() != (try Addr.parse("192.0.3.1")).subnetKey());
+    try std.testing.expect(v4a.subnetKey() != (try Addr.parse("193.0.2.1")).subnetKey());
+    try std.testing.expectEqual(@as(u64, (1 << 32) | 0xc00002), v4a.subnetKey());
+    // v6: the /64 (first eight bytes), not the interface id.
+    try std.testing.expectEqual(v6a.subnetKey(), (try Addr.parse("2001:db8::ffff")).subnetKey());
+    try std.testing.expect(v6a.subnetKey() != (try Addr.parse("2001:db8:0:1::1")).subnetKey());
+    try std.testing.expectEqual(@as(linux.socklen_t, @sizeOf(linux.sockaddr.in)), v4a.sockaddrLen());
+    try std.testing.expectEqual(@as(linux.socklen_t, @sizeOf(linux.sockaddr.in6)), v6a.sockaddrLen());
+}
+
+test "audit: eventOwns needs the same target, probe and (when recorded) send time" {
+    const e: seqmap.Entry = .{ .target = 1, .probe = 2, .sent_ns = 100, .answered = false };
+    try std.testing.expect(eventOwns(.{ .time = 0, .target = 1, .probe = 2, .sent_ns = 100 }, e));
+    try std.testing.expect(eventOwns(.{ .time = 0, .target = 1, .probe = 2 }, e)); // no_sent: unrecorded
+    try std.testing.expect(!eventOwns(.{ .time = 0, .target = 0, .probe = 2, .sent_ns = 100 }, e));
+    try std.testing.expect(!eventOwns(.{ .time = 0, .target = 1, .probe = 3, .sent_ns = 100 }, e));
+    try std.testing.expect(!eventOwns(.{ .time = 0, .target = 1, .probe = 2, .sent_ns = 101 }, e));
+}
+
+test "audit: init sizes the send slot and the receive slot from the configuration" {
+    {
+        var p = try Pinger.init(std.testing.allocator, .{});
+        defer p.deinit();
+        try std.testing.expectEqual(@as(usize, 64), p.pkt_len);
+        try std.testing.expectEqual(@as(usize, 4096), p.recv_batch.slot_size);
+    }
+    {
+        var p = try Pinger.init(std.testing.allocator, .{ .payload_size = 8000 });
+        defer p.deinit();
+        try std.testing.expectEqual(@as(usize, 8008), p.pkt_len);
+        try std.testing.expectEqual(@as(usize, 8136), p.recv_batch.slot_size); // pkt_len + 128 headroom
+        try std.testing.expectEqual(Socket.batch_max * 8008, p.send_slab.len);
+    }
+    {
+        var p = try Pinger.init(std.testing.allocator, .{ .icmp_timestamp = true, .payload_size = 500 });
+        defer p.deinit();
+        try std.testing.expectEqual(echo.timestamp_msg_len, p.pkt_len);
+    }
+}
+
+test "audit: stop records the request; a new target starts with the configured timeout" {
+    var p = try Pinger.init(std.testing.allocator, .{ .timeout_ns = 123_456 });
+    defer p.deinit();
+    try std.testing.expect(!p.stop_requested.load(.monotonic));
+    p.stop();
+    try std.testing.expect(p.stop_requested.load(.monotonic));
+    const id = try p.addTarget("192.0.2.1");
+    try std.testing.expectEqual(@as(TargetId, 0), id);
+    try std.testing.expectEqual(@as(u64, 123_456), p.targets.items[0].timeout_ns);
+    try std.testing.expectEqual(@as(TargetId, 1), try p.addTarget("192.0.2.2"));
+}
+
+const Tally = struct {
+    timeouts: usize = 0,
+    errors: usize = 0,
+    last_probe: u16 = 0,
+    fn cb(ctx: ?*anyopaque, id: TargetId, probe: u16, outcome: Outcome) void {
+        _ = id;
+        const self: *Tally = @ptrCast(@alignCast(ctx.?));
+        self.last_probe = probe;
+        switch (outcome) {
+            .timeout => self.timeouts += 1,
+            .send_error => self.errors += 1,
+            else => {},
+        }
+    }
+};
+
+test "audit: handleTimeout skips an answered entry and does not retry a done target" {
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .alive, .retries = 3 });
+    defer p.deinit();
+    var tally: Tally = .{};
+    p.setResultCallback(&tally, Tally.cb);
+    _ = try p.addTarget("192.0.2.1");
+    try p.ping_q.ensureTotalCapacity(p.gpa, 4);
+    const now = monoNow();
+
+    // An answered probe: the slot is released but nothing is counted or told.
+    var seq = try p.seqmap.add(0, 0, now);
+    p.seqmap.fetchPtr(seq).?.answered = true;
+    p.targets.items[0].pending = 1;
+    p.inflight = 1;
+    try p.handleTimeout(.{ .time = now, .target = 0, .probe = 0, .seq = seq, .sent_ns = now }, now);
+    try std.testing.expectEqual(@as(?seqmap.Entry, null), p.seqmap.fetch(seq));
+    try std.testing.expectEqual(@as(u16, 1), p.targets.items[0].pending);
+    try std.testing.expectEqual(@as(u32, 1), p.inflight);
+    try std.testing.expectEqual(@as(usize, 0), tally.timeouts);
+    try std.testing.expectEqual(@as(usize, 0), p.ping_q.items.len);
+
+    // A done target whose probe times out: counted and told, but not retried.
+    seq = try p.seqmap.add(0, 1, now);
+    p.targets.items[0].done = true;
+    try p.handleTimeout(.{ .time = now, .target = 0, .probe = 1, .seq = seq, .sent_ns = now }, now);
+    try std.testing.expectEqual(@as(u16, 0), p.targets.items[0].pending);
+    try std.testing.expectEqual(@as(u32, 0), p.inflight);
+    try std.testing.expectEqual(@as(usize, 1), tally.timeouts);
+    try std.testing.expectEqual(@as(u16, 1), tally.last_probe);
+    try std.testing.expectEqual(@as(usize, 0), p.ping_q.items.len);
+
+    // A live target is retried one probe later, with a longer timeout.
+    p.targets.items[0].done = false;
+    p.targets.items[0].attempts = 1;
+    p.targets.items[0].timeout_ns = 1000;
+    seq = try p.seqmap.add(0, 1, now);
+    p.targets.items[0].pending = 1;
+    p.inflight = 1;
+    try p.handleTimeout(.{ .time = now, .target = 0, .probe = 1, .seq = seq, .sent_ns = now }, now);
+    try std.testing.expectEqual(@as(usize, 1), p.ping_q.items.len);
+    try std.testing.expectEqual(@as(u16, 2), p.ping_q.peek().?.probe);
+    try std.testing.expectEqual(@as(u64, 1500), p.targets.items[0].timeout_ns);
+    // At the retry limit: not retried, the target is finished.
+    p.targets.items[0].attempts = 3;
+    p.ping_q.items.len = 0;
+    seq = try p.seqmap.add(0, 2, now);
+    p.targets.items[0].pending = 1;
+    p.inflight = 1;
+    try p.handleTimeout(.{ .time = now, .target = 0, .probe = 2, .seq = seq, .sent_ns = now }, now);
+    try std.testing.expectEqual(@as(usize, 1), p.ping_q.items.len); // attempts == retries still allows the last retry
+    p.targets.items[0].attempts = 4;
+    p.ping_q.items.len = 0;
+    seq = try p.seqmap.add(0, 3, now);
+    p.targets.items[0].pending = 1;
+    p.inflight = 1;
+    try p.handleTimeout(.{ .time = now, .target = 0, .probe = 3, .seq = seq, .sent_ns = now }, now);
+    try std.testing.expectEqual(@as(usize, 0), p.ping_q.items.len);
+    try std.testing.expect(p.targets.items[0].done);
+}
+
+test "audit: checkDone finishes a target only when nothing is pending and it is not looping" {
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .count, .count = 2 });
+    defer p.deinit();
+    _ = try p.addTarget("192.0.2.1");
+    const t = &p.targets.items[0];
+    t.pending = 1;
+    p.checkDone(t);
+    try std.testing.expect(!t.done);
+    t.pending = 0;
+    p.checkDone(t);
+    try std.testing.expect(t.done);
+    t.done = false;
+    p.cfg.mode = .loop;
+    p.checkDone(t);
+    try std.testing.expect(!t.done);
+}
+
+test "audit: sourceMatches never matches across families" {
+    const v4a = try Addr.parse("192.0.2.1");
+    const v6a = try Addr.parse("2001:db8::1");
+    const s4: Socket.RecvInfo.SrcAddr = .{ .v4 = v4a.v4 };
+    const s6: Socket.RecvInfo.SrcAddr = .{ .v6 = v6a.v6 };
+    try std.testing.expect(sourceMatches(s4, v4a));
+    try std.testing.expect(sourceMatches(s6, v6a));
+    try std.testing.expect(!sourceMatches(s4, v6a));
+    try std.testing.expect(!sourceMatches(s6, v4a));
+    try std.testing.expect(!sourceMatches(s4, try Addr.parse("192.0.2.9")));
+}
+
+test "audit: backoff with a zero factor, originateMsAt and ifNameToIndex" {
+    try std.testing.expectEqual(@as(u64, 0), backoff(1000, 0.0)); // a zero product is a valid product
+    try std.testing.expectEqual(@as(u64, 2000), backoff(1000, 2.0));
+    try std.testing.expectEqual(@as(u64, 1000), backoff(1000, -1.0));
+    // Milliseconds since midnight: 1 day + 123 ms + 999999 ns is 123.
+    const day_ns: i64 = 86_400 * std.time.ns_per_s;
+    try std.testing.expectEqual(@as(u32, 123), originateMsAt(day_ns + 123 * std.time.ns_per_ms + 999_999));
+    try std.testing.expectEqual(@as(u32, 86_399_999), originateMsAt(2 * day_ns - 1));
+    try std.testing.expectEqual(@as(u32, 5000), originateMsAt(5 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(?u32, null), ifNameToIndex("nonexist0"));
+    try std.testing.expectEqual(@as(?u32, null), ifNameToIndex(""));
+    try std.testing.expectEqual(@as(?u32, null), ifNameToIndex("a-name-of-twenty-chars"));
+    if (ifNameToIndex("lo")) |idx| try std.testing.expect(idx != 0);
+}

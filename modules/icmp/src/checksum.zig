@@ -54,3 +54,12 @@ test "sum does not overflow on a long all-ones input" {
     try std.testing.expectEqual(@as(u32, 0xffff), sum(&big, 0));
     try std.testing.expectEqual(@as(u16, 0), checksum(&big));
 }
+
+test "audit: finish folds an unfolded sum instead of truncating it" {
+    // 0x1ffff folds to 0x0001 (end-around carry), whose complement is 0xfffe;
+    // truncating to 16 bits would give 0xffff -> 0.
+    try std.testing.expectEqual(@as(u16, 0xfffe), finish(0x1ffff));
+    try std.testing.expectEqual(@as(u16, 0xffff), finish(0));
+    try std.testing.expectEqual(@as(u16, 0), finish(0xffff));
+    try std.testing.expectEqual(@as(u16, 0xfffe), finish(0x2fffe)); // 0x2fffe folds to 0x10000, then to 1
+}

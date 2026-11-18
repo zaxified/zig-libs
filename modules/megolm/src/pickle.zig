@@ -233,7 +233,13 @@ pub fn encodeInbound(s: *const InboundGroupSession, out: *[inbound_len]u8) void 
     out[at] = if (s.signing_key_verified) flag_verified else 0;
 }
 
+/// Burns its own dead stack (the ratchet copies of the consistency check);
+/// the by-value result is the caller's output.
 pub fn decodeInbound(bytes: []const u8) PickleError!InboundGroupSession {
+    return burn.run(burn.session_burn, PickleError!InboundGroupSession, decodeInboundUnburned, .{bytes});
+}
+
+noinline fn decodeInboundUnburned(bytes: []const u8) PickleError!InboundGroupSession {
     try checkFrame(bytes, .inbound, inbound_len);
     var at: usize = header_len;
     var initial: Ratchet = undefined;
@@ -288,6 +294,10 @@ fn openInto(bytes: []const u8, key: *const PickleKey, kind: Kind, plain: []u8) P
 }
 
 pub fn sealOutbound(io: std.Io, s: *const OutboundSession, key: *const PickleKey, out: *[sealed_outbound_len]u8) void {
+    burn.run(burn.decrypt_burn, void, sealOutboundUnburned, .{ io, s, key, out });
+}
+
+noinline fn sealOutboundUnburned(io: std.Io, s: *const OutboundSession, key: *const PickleKey, out: *[sealed_outbound_len]u8) void {
     var plain: [outbound_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &plain);
     encodeOutbound(s, &plain);
@@ -307,6 +317,10 @@ fn openOutboundBody(bytes: []const u8, key: *const PickleKey, out: *OutboundSess
 }
 
 pub fn sealInbound(io: std.Io, s: *const InboundGroupSession, key: *const PickleKey, out: *[sealed_inbound_len]u8) void {
+    burn.run(burn.decrypt_burn, void, sealInboundUnburned, .{ io, s, key, out });
+}
+
+noinline fn sealInboundUnburned(io: std.Io, s: *const InboundGroupSession, key: *const PickleKey, out: *[sealed_inbound_len]u8) void {
     var plain: [inbound_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &plain);
     encodeInbound(s, &plain);
@@ -314,6 +328,10 @@ pub fn sealInbound(io: std.Io, s: *const InboundGroupSession, key: *const Pickle
 }
 
 pub fn openInbound(bytes: []const u8, key: *const PickleKey) PickleError!InboundGroupSession {
+    return burn.run(burn.decrypt_burn, PickleError!InboundGroupSession, openInboundUnburned, .{ bytes, key });
+}
+
+noinline fn openInboundUnburned(bytes: []const u8, key: *const PickleKey) PickleError!InboundGroupSession {
     var plain: [inbound_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &plain);
     try openInto(bytes, key, .sealed_inbound, &plain);

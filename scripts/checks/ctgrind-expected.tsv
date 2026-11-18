@@ -1616,7 +1616,7 @@ quic-crypto	ReleaseFast	chacha	1	4	13687ce1a4c91aa7	d1cf9a5cadb2a284
 # (b64ct.zig:141/142, one branch at the end). pickle 26 = the AEAD verdict 2, std Ed25519 keygen/sign on
 # the decrypted seed, and parsing of the decrypted pickle (checkFrame,
 # counters, Ratchet.advanceTo to the stored index, the public-key compare).
-megolm	ReleaseFast	msg	1	16	84d9c08fb7a185dc	505eb3dc7b45f5cd
+megolm	ReleaseFast	msg	1	16	4bcd2cc0b8d7321d	505eb3dc7b45f5cd
 # 2026-10-17 (dedupe wave 3): skey 26 -> 23 — the private b64ct.zig became the b64ct
 # module, whose verdict is declassified by contract (`public`); the 3 verdict contexts
 # (b64ct.zig:141/142) are gone, nothing else moved.
@@ -1626,8 +1626,8 @@ megolm	ReleaseFast	msg	1	16	84d9c08fb7a185dc	505eb3dc7b45f5cd
 # Ed25519 PUBLIC key -- tainted only because the harness derives it from the tainted signing key.
 # Same std change as ecvrf verify (CTFIX). One mulDoubleBasePublic context moved into its `add`
 # frame (inlining), net 0. megolm SPEC.md CT note.
-megolm	ReleaseFast	skey	1	25	84d9c08fb7a185dc	a22db1b8b5220a74
-megolm	ReleaseFast	pickle	1	26	84d9c08fb7a185dc	f06f4b1b938d2036
+megolm	ReleaseFast	skey	1	25	4bcd2cc0b8d7321d	a22db1b8b5220a74
+megolm	ReleaseFast	pickle	1	26	4bcd2cc0b8d7321d	f06f4b1b938d2036
 # mls (2026-10-10, suite 0x0001) — ks: deriveEpoch with init/commit/PSK
 # secrets tainted; tree: every node secret, ratchet base, Ratchet and Window
 # under a tainted encryption secret; priv: protectPrivate with the content

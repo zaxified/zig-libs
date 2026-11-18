@@ -16,23 +16,23 @@ const seqmap = @import("seqmap");
 
 const max_u32 = std.math.maxInt(u32);
 
-fn deadSocket() Socket {
+pub fn deadSocket() Socket {
     return .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
 }
 
-fn v4(port_be: u16, last: u8) icmp.Addr {
+pub fn v4(port_be: u16, last: u8) icmp.Addr {
     return .{ .v4 = .{ .port = port_be, .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, last }) } };
 }
 
 /// Two loopback UDP sockets: `fd` is the "ICMP socket" the pinger reads and
 /// sends on, `inj` injects crafted packets into it.
-const Rig = struct {
+pub const Rig = struct {
     fd: i32,
     inj: i32,
     fd_port: u16, // network order
     inj_port: u16,
 
-    fn bound() !struct { fd: i32, port: u16 } {
+    pub fn bound() !struct { fd: i32, port: u16 } {
         const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
         if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
         const fd: i32 = @intCast(rc);
@@ -45,30 +45,30 @@ const Rig = struct {
         return .{ .fd = fd, .port = out.port };
     }
 
-    fn open() !Rig {
+    pub fn open() !Rig {
         const a = try bound();
         errdefer _ = linux.close(a.fd);
         const b = try bound();
         return .{ .fd = a.fd, .inj = b.fd, .fd_port = a.port, .inj_port = b.port };
     }
 
-    fn close(r: *Rig) void {
+    pub fn close(r: *Rig) void {
         _ = linux.close(r.fd);
         _ = linux.close(r.inj);
     }
 
-    fn socket(r: Rig) Socket {
+    pub fn socket(r: Rig) Socket {
         return .{ .fd = r.fd, .family = .v4, .kind = .dgram, .ident = 0x1234 };
     }
 
-    fn inject(r: Rig, bytes: []const u8) !void {
+    pub fn inject(r: Rig, bytes: []const u8) !void {
         const to = v4(r.fd_port, 1).v4;
         const rc = linux.sendto(r.inj, bytes.ptr, bytes.len, 0, @ptrCast(&to), @sizeOf(linux.sockaddr.in));
         if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
     }
 };
 
-fn replyPacket(seq: u16) [echo.echo_header_len]u8 {
+pub fn replyPacket(seq: u16) [echo.echo_header_len]u8 {
     var pkt: [echo.echo_header_len]u8 = @splat(0);
     pkt[0] = echo.v4.echo_reply;
     std.mem.writeInt(u16, pkt[4..6], 0x1234, .big);
@@ -77,7 +77,7 @@ fn replyPacket(seq: u16) [echo.echo_header_len]u8 {
     return pkt;
 }
 
-fn errorPacket(seq: u16) [echo.echo_header_len + 20 + echo.echo_header_len]u8 {
+pub fn errorPacket(seq: u16) [echo.echo_header_len + 20 + echo.echo_header_len]u8 {
     var pkt: [echo.echo_header_len + 20 + echo.echo_header_len]u8 = @splat(0);
     pkt[0] = echo.v4.time_exceeded;
     pkt[8] = 0x45;
