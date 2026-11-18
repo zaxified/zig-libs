@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **API addition:** back-pressure for `put`/`del`. `Options.max_unflushed` (entries, default 0 = unbounded, so existing users see no change) is a high-water mark on `pendingCount()`; at the mark the writer drives the flush and waits up to `Options.put_block_ns` (default 60 s, Kafka's `max.block.ms`; 0 = no wait), then fails with the new `PutError.Backpressure`, having written nothing. A caller that switches on `PutError` exhaustively must handle the new member. Ehcache `queueSize` / Kafka `buffer.memory`+`max.block.ms` semantics, see SPEC "Back-pressure".
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-05** — **Fix: `flushAll` could stop with a record still pending.** On its synchronous
