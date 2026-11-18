@@ -563,3 +563,48 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+
+test "Parser: a BOM only counts on the very first line, a second id: replaces the first, an overflowing retry is null" {
+    const wire = "data: a\n\xEF\xBB\xBFdata: b\nid: 1\nid: 2\nretry: 99999999999\n\n";
+    var reader: std.Io.Reader = .fixed(wire);
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    const e = (try p.next()).?;
+    try testing.expectEqualStrings("a", e.data); // the BOM line names an unknown field
+    try testing.expectEqualStrings("2", e.id.?);
+    try testing.expect(e.retry == null);
+}
+
+test "Parser: a line longer than the reader's buffer is LineTooLong" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var line: [120]u8 = @splat('x');
+    @memcpy(line[0..6], "data: ");
+    line[118] = '\n';
+    line[119] = '\n';
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "long.sse", .data = &line });
+    var f = try tmp.dir.openFile(testing.io, "long.sse", .{});
+    defer f.close(testing.io);
+    var fb: [16]u8 = undefined;
+    var fr = f.reader(testing.io, &fb);
+    var p = Parser.init(&fr.interface, testing.allocator);
+    defer p.deinit();
+    try testing.expectError(error.LineTooLong, p.next());
+}
+
+fn failingStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+    _ = r;
+    _ = w;
+    _ = limit;
+    return error.ReadFailed;
+}
+
+test "Parser: a failing reader is ReadFailed, not EndOfStream" {
+    var buf: [8]u8 = undefined;
+    var reader: std.Io.Reader = .{ .vtable = &.{ .stream = failingStream }, .buffer = &buf, .seek = 0, .end = 0 };
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    try testing.expectError(error.ReadFailed, p.next());
+}

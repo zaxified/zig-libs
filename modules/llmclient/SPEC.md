@@ -6,7 +6,7 @@
 
 **Scope:** core — official Anthropic SDKs (Python v1.9.0 / Go v1.76.0) (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after image/document blocks, the `system` block array, `anthropic-beta` and `count_tokens` landed)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (355/364, 9 eq) · src eccaf87cc1bbd807
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, LLMCLIENT_FUZZ) · ct n/a — the API key is an opaque header value copied verbatim into `x-api-key`; no key derivation, MAC or compare in the module (review, 2026-10-10)
 
@@ -211,6 +211,33 @@ against the real API is present but unconditionally `error.SkipZigTest` — the
 parameter, not from a plain `test` block (the repo's other modules read it via `std.testing.environ`, which this test does not use yet); the dead-code path (`if (false)`) still type-checks the
 real call shape so an API-shape regression fails `zig build test-llmclient` without ever making a
 network call. Run: `zig build test-llmclient`.
+
+**Audit 2026-11-17 (whole-module mutation).** 364 schemata mutants over `Client.zig`, `sse_parse.zig`, `response.zig` and
+`types.zig` (ReleaseSafe, one build per round, each mutant under `setsid -w timeout` and `ulimit -v`, baseline first):
+every header and value of `requestHeaders`, the `anthropic-beta` join and every edge character of `validBeta`, the
+endpoint paths, `mapHttpError` and `mapParserError`, `requestOptions`' no-redirect rule, the read deadline and
+`runBounded`, every branch of `BoundedAllocator` (charge, refuse, credit, roll back, for `alloc`, `resize`, `remap` and
+`free`), the 2xx test at both edges for `create` and `stream`, the `max_*` knobs reaching the iterator, the leak-on-error
+`defer`s, the SSE field grammar (CRLF, BOM, comment, leading space, `data` cap, `id` NUL, `retry` digits), the JSON key
+and `"type"` literal of every response shape and every serializer branch. Round 1: 257 killed, 4 hung (counted killed),
+103 survived. 25 tests added (110 now): a `Client` with an empty or oversized error body, the `validBeta` edge
+characters, `mapHttpError`, `readDeadline`, direct `BoundedAllocator` tests with a fixed-buffer and a failing child
+(growth, shrink, refusal, rollback, `remap`), `stream` posting to `/v1/messages` with a clean end and an empty-data
+event and `read_timeout_ms = 0` against a slow peer, 299 accepted and 300 refused on `stream`, the two knobs reaching
+the iterator and the arena and parser buffers released after a bound hit, `countTokens` bounded, `mapParserError`, a BOM
+mid-stream, a second `id:`, an overflowing `retry:`, a line over the reader's buffer, a failing reader, every
+`response` field (thinking, signature, tool_use, deltas, stop_sequence, cache usage), absent and wrongly typed fields,
+missing nested objects, bad JSON against an allocation failure, float edges of a count (0.0, 2^64, negative), and the
+tag and fields of every `tool_choice` and `thinking` variant, `toolErrorBlock`, `MessageParam.assistant` and
+`fromMessageRequest`. Final: 355 killed, 9 equivalent or unobservable, 0 survivors. The 9: a remaining time of exactly
+0 ns (`runBounded`), a result landing inside the cancelation window (a race), an equal-size `resize` charged 0 bytes,
+a 1xx as the final status (the transport never delivers one), a read failure surfacing through the parser
+(`mapParserError`: it and the default both give `HttpFailed`, and `Canceled` arrives through `runBounded`),
+`isAllDigits`' empty guard (`parseInt` rejects an empty value the same way), the comment-line skip (`:...` parses as the
+empty field name), and `number_string` in `parseTokenCount` (`u64Field` refuses it with the same error). Not mutated:
+the `type` defaults of the request structs and the 256-byte URL buffer, which a switch cannot reach; the existing
+values and `BaseUrlTooLong` tests pin them. The module has no retry or backoff (see Compared with), so there was
+none to mutate.
 
 ## Backlog / deferred
 **Survey 2026-09-30** (the pre-existing list below stays as is):

@@ -1018,3 +1018,107 @@ test "fuzz harness: token count, 300 seeds, reaches every outcome" {
 test "fuzz parseTokenCount never panics" {
     try testing.fuzz({}, fuzzParseTokenCountSmith, .{ .corpus = &token_corpus });
 }
+
+// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+
+test "parseMessage: every field of a full message, including thinking, stop_sequence and cache usage" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const m = try parseMessage(arena.allocator(),
+        \\{"id":"m","model":"mm","role":"assistant","content":[{"type":"thinking","thinking":"hmm","signature":"sig"},{"type":"text","text":"hi"}],
+        \\"stop_reason":"stop_sequence","stop_sequence":"END","usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":4}}
+    );
+    try testing.expectEqualStrings("hmm", m.content[0].thinking.thinking);
+    try testing.expectEqualStrings("sig", m.content[0].thinking.signature);
+    try testing.expectEqualStrings("END", m.stop_sequence.?);
+    try testing.expectEqual(StopReason.stop_sequence, m.stop_reason.?);
+    try testing.expectEqual(@as(?u64, 3), m.usage.cache_creation_input_tokens);
+    try testing.expectEqual(@as(?u64, 4), m.usage.cache_read_input_tokens);
+}
+
+test "parseMessage: absent and wrongly typed fields read as empty, null or 0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const m = try parseMessage(arena.allocator(), "{\"role\":\"user\",\"content\":\"notarray\",\"usage\":{\"input_tokens\":\"5\"},\"stop_reason\":7}");
+    try testing.expectEqualStrings("", m.id);
+    try testing.expectEqual(@as(usize, 0), m.content.len);
+    try testing.expect(m.stop_reason == null);
+    try testing.expect(m.stop_sequence == null);
+    try testing.expect(m.stop_details == null);
+    try testing.expectEqual(@as(u64, 0), m.usage.input_tokens); // a string is not a count
+    try testing.expectEqual(@as(u64, 0), m.usage.output_tokens); // absent
+    try testing.expect(m.usage.cache_creation_input_tokens == null);
+    try testing.expect(m.usage.cache_read_input_tokens == null);
+}
+
+test "parseStreamEvent: thinking/tool_use starts, thinking/signature deltas, message_delta stop_sequence, error message" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s1 = try parseStreamEvent(a, "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"t\"}}");
+    try testing.expectEqualStrings("t", s1.content_block_start.content_block.thinking.thinking);
+    const s2 = try parseStreamEvent(a, "{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"i\",\"name\":\"nm\",\"input\":{\"a\":1}}}");
+    try testing.expectEqualStrings("nm", s2.content_block_start.content_block.tool_use.name);
+    try testing.expect(s2.content_block_start.content_block.tool_use.input == .object);
+    const d1 = try parseStreamEvent(a, "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"x\"}}");
+    try testing.expectEqualStrings("x", d1.content_block_delta.delta.thinking_delta.thinking);
+    const d2 = try parseStreamEvent(a, "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sg\"}}");
+    try testing.expectEqualStrings("sg", d2.content_block_delta.delta.signature_delta.signature);
+    const d3 = try parseStreamEvent(a, "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\"}}");
+    try testing.expectEqualStrings("", d3.content_block_delta.delta.text_delta.text); // absent text
+    const md = try parseStreamEvent(a, "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"E\"},\"usage\":{\"output_tokens\":9}}");
+    try testing.expectEqualStrings("E", md.message_delta.delta.stop_sequence.?);
+    try testing.expectEqual(@as(u64, 9), md.message_delta.usage.?.output_tokens);
+    const er = try parseStreamEvent(a, "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}");
+    try testing.expectEqualStrings("Overloaded", er.@"error".@"error".message);
+    try testing.expectEqualStrings("overloaded_error", er.@"error".@"error".type);
+}
+
+test "parseStreamEvent: a required nested object that is missing or not an object is MalformedResponse" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bad = [_][]const u8{
+        "{\"type\":\"content_block_delta\",\"index\":0}",
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":5}",
+        "{\"type\":\"message_delta\"}",
+        "{\"type\":\"message_delta\",\"delta\":\"x\"}",
+        "{\"type\":\"error\"}",
+        "{\"type\":\"error\",\"error\":3}",
+        "{\"type\":\"message_start\"}",
+        "{\"type\":\"content_block_start\",\"index\":0}",
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"citations_delta\"}}",
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"unknown_delta\"}}",
+        "{\"type\":\"unknown_event\"}",
+        "[]",
+    };
+    for (bad) |b| try testing.expectError(error.MalformedResponse, parseStreamEvent(a, b));
+}
+
+test "parse*: syntactically bad JSON is MalformedResponse, an allocation failure is OutOfMemory" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.MalformedResponse, parseMessage(a, "{not json"));
+    try testing.expectError(error.MalformedResponse, parseMessage(a, "[]"));
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "{not json"));
+    try testing.expectError(error.MalformedResponse, parseTokenCount(a, "{not json"));
+    try testing.expectError(error.MalformedResponse, parseTokenCount(a, "[]"));
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, parseMessage(fa.allocator(), "{\"id\":\"x\"}"));
+    var fb = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, parseStreamEvent(fb.allocator(), "{\"type\":\"ping\"}"));
+    var fc = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, parseTokenCount(fc.allocator(), "{\"input_tokens\":1}"));
+}
+
+test "u64Field: 0.0 and 1.0 are counts, 2^64 and negative floats are MalformedResponse, an absent usage count is 0" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(@as(u64, 0), (try parseTokenCount(a, "{\"input_tokens\":0.0}")).input_tokens);
+    try testing.expectEqual(@as(u64, 1), (try parseTokenCount(a, "{\"input_tokens\":1.0}")).input_tokens);
+    try testing.expectError(error.MalformedResponse, parseTokenCount(a, "{\"input_tokens\":18446744073709551616.0}"));
+    try testing.expectError(error.MalformedResponse, parseTokenCount(a, "{\"input_tokens\":-1.5}"));
+    try testing.expectError(error.MalformedResponse, parseTokenCount(a, "{\"input_tokens\":\"5\"}"));
+}

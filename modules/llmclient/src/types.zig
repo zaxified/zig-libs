@@ -899,3 +899,42 @@ test "CountTokensRequest: carries system, tool_choice, thinking through; never m
         json,
     );
 }
+
+// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+
+fn jsonHas(req: MessageRequest, needle: []const u8) !void {
+    const json = try stringifyAlloc(testing.allocator, req);
+    defer testing.allocator.free(json);
+    if (std.mem.find(u8, json, needle) == null) {
+        std.debug.print("missing {s} in {s}\n", .{ needle, json });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "tool_choice and thinking: every variant's type tag and fields" {
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{}, .tool_choice = .any }, "\"tool_choice\":{\"type\":\"any\"}");
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{}, .tool_choice = .none }, "\"tool_choice\":{\"type\":\"none\"}");
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{}, .tool_choice = .auto }, "\"tool_choice\":{\"type\":\"auto\"}");
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{}, .tool_choice = .{ .tool = .{ .name = "t" } } }, "\"tool_choice\":{\"type\":\"tool\",\"name\":\"t\"}");
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{}, .thinking = .disabled }, "\"thinking\":{\"type\":\"disabled\"}");
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{}, .thinking = .{ .enabled = .{ .budget_tokens = 2048 } } }, "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}");
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{}, .thinking = .{ .adaptive = .{ .display = .summarized } } }, "\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}");
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{}, .thinking = .{ .adaptive = .{} } }, "\"thinking\":{\"type\":\"adaptive\"}");
+}
+
+test "toolErrorBlock is an error, MessageParam.assistant is the assistant" {
+    try jsonHas(.{ .max_tokens = 1, .messages = &.{MessageParam.user(&.{toolErrorBlock("id1", "oops")})} }, "\"is_error\":true");
+    try testing.expectEqual(Role.assistant, MessageParam.assistant(&.{}).role);
+    try testing.expectEqual(Role.user, MessageParam.user(&.{}).role);
+}
+
+test "CountTokensRequest.fromMessageRequest keeps system_blocks and tools" {
+    const blocks = [_]SystemBlock{systemBlockCached("sys")};
+    const tools = [_]Tool{.{ .name = "tl", .input_schema = .{ .object = .empty } }};
+    const req: MessageRequest = .{ .max_tokens = 1, .messages = &.{}, .system_blocks = &blocks, .tools = &tools };
+    const ct = CountTokensRequest.fromMessageRequest(req);
+    try testing.expect(ct.system_blocks != null);
+    try testing.expectEqual(@as(usize, 1), ct.system_blocks.?.len);
+    try testing.expect(ct.tools != null);
+    try testing.expectEqualStrings("tl", ct.tools.?[0].name);
+}
