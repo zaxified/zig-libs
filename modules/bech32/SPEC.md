@@ -6,7 +6,7 @@
 
 **Scope:** core — BIP173/BIP350 reference codec + Bitcoin Core `base58.cpp` / rust-bitcoin `Address` layer (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-14 · mutation 2026-11-17 (324/336, 12 eq) · src 952a8bf2d1bc2ff7
+**Audit:** review 2026-09-14 · mutation 2026-11-18 (325/337, 12 eq) · src e0a998d4098974a5
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BECH32_FUZZ) · ct 2026-09-06 (ctgrind)
 
@@ -78,7 +78,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   fuzz driver checks the verdict on every input), with time and addresses depending only on the
   public lengths. Every input byte/character goes through every position of a fixed-width
   accumulator (`maxEncodedLenFor(n)` digits / 132 bytes); digit <-> character is computed by
-  masks, never a table; leading zeros/`1`s are counted with a running mask and the string is
+  masks, never a table (`geBit`'s bit laundered through an asm barrier since 2026-11-18: on baseline x86-64, `-mcpu=x86_64`, LLVM compiled `digitChar`'s `7 * geBit`/`6 * geBit` into `cmp`/`jae` on the secret digit, portable ctgrind `bip32 xprv` and `btcaddr wif` 2 -> 0 in-file); leading zeros/`1`s are counted with a running mask and the string is
   moved into place by a masked barrel shifter (its mask laundered through an empty asm, else
   LLVM unswitched the loop on it: 1 context at `encodeSecret (base58.zig:0)` measured). Public
   by contract and declassified through `public`: the payload and string lengths, the decoded

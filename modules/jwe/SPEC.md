@@ -297,6 +297,7 @@ First pass: 18 survivors. **One defect (fixed), 15 test gaps, 3 equivalent.**
 
 ## Backlog / deferred
 
+- **Portable ctgrind (`CTGRIND_CPU=x86_64`)** *(2026-11-18)*: this module is EXCLUDED from `scripts/test.sh ctgrind-portable`, because on baseline x86-64 (std's soft AES, no AES-NI/AVX) memcheck reports UNATTRIBUTED contexts, which no pin may absorb. Measured: `content` 487 in-file (native 18), and its no-`-fvalgrind` trap 105 contexts with 5 unattributed; the controls/traps of `content`/`kw`/`ecdh`/`pbes2` read 100/55/51/29 contexts untainted (std's soft-AES bitsliced batches padded with `undefined`, see ctgrind-expected.tsv cause A2). To close: name the unattributed frames (std soft-AES/GCM frames outside the row pattern), then pin `cpu=x86_64` variants.
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
 - **(survey 2026-09-30) ECDH-ES on P-384 / P-521** — `ecdhes.Curve` is `p256`/`x25519` only (`rg 'pub const Curve' -A3 src/ecdhes.zig`); go-jose and panva/jose accept the NIST curves and IdPs commonly publish P-384 keys. Effort: medium (needs a P-384 primitive; `std.crypto.ecc.P384` exists in Zig 0.16 *(inferred, not checked)*). Fits §2: yes.

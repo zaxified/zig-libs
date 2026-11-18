@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: excluded from the portable ctgrind lane, because the x86_64 run reports unattributed contexts in std soft-AES frames (numbers in the item).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** constant-time evidence: `src/ctgrind_harness.zig` (decrypt side, tainted dir CEK / KW KEK / ECDH-ES key / PBES2 password / RSA-OAEP key), recorded in SPEC § Constant-time; no module code changed.
 - **2026-11-13** — **Fix (no-panic sweep):** `header.encode` (and so `encryptCompact` with an `apu`/`apv` over `header.max_member_len` = 128 bytes) overran its base64 scratch buffer — now `BufferTooSmall` / `HeaderTooLarge`; `ecdhes.concatKdfSha256` accepts an empty output (it asserted) and panics with a checked message instead of an `@intCast` on a 2^29-byte output or 2^32-byte input; `enc.encrypt` of a GCM message past 2^36 - 32 bytes is `BufferTooSmall` instead of an `aesgcm` panic. Tests in `src/sweep_test.zig` ("sweep JWE-1..3").
 - **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the `p2c` header narrowing is `std.math.cast(u32, i)` again; the i64 → u64 → u32 detour was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).

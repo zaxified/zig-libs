@@ -179,6 +179,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   instructions (`divsd`, `sqrtsd`), and this leaks through conditional
   jumps with no FP instruction anywhere.
 
+  On baseline x86-64 (`CTGRIND_CPU=x86_64`, the portable lane, 2026-11-18) the same row reads **222**: `fpr.zig`'s `pack` +67, `add` +88, `half` -26 and the sampler -12 against the native stacks. It is pinned there as a separate `cpu=x86_64` bound (`<=222`). It is the same open question as above, larger on that code shape, and is not resolved by the pin.
   The expected row is pinned as a BOUND (`<=133`), not an exact count, for
   the reason `ctgrind-expected.tsv` gives: only the direction is
   load-bearing, and the number moves with a toolchain change for reasons

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the bitsliced core's partial batch (`bitslicedBlocks`) zeroes its padding lanes instead of leaving them `undefined`. The core mixes lanes, so memcheck reported the undefined padding in the real blocks: the untainted ctgrind control `enc` read 2 contexts on `-mcpu=x86_64` (a broken control). It now reads 0. Values are unchanged, and a full batch zeroes nothing (`blocks` is comptime). The portable key-expansion contexts (`enc` 128, `dec` 304, `bitsliced` 128: std's masked S-box via `subWord`, SPEC *Constant-time contract*) are pinned as `cpu=x86_64` rows. ctgrind source digests re-pinned.
 - **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** Audit `src` refreshed — only the test-only hex helper moved to `testkit.hex`; a test-file comment no longer names a private report path.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GU). `Aes192EncryptCtx.ctr` with `dst` shorter than `src` is a checked `@panic("aes192: ctr dst shorter than src")` in every mode (was an assert = out-of-bounds write in ReleaseFast). Tests: `src/sweep_test.zig`.

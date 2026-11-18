@@ -167,6 +167,12 @@ fn bitslicedBlocks(
         const n = blocks * 16;
         var buf: [w * 16]u8 = undefined;
         @memcpy(buf[0..n], src[lo..][0..n]);
+        // The padding lanes of a partial batch are zeroed, not `undefined`
+        // (2026-11-18): the core mixes lanes in its bit transposition, and
+        // memcheck carried the undefined padding into the real blocks, so the
+        // untainted ctgrind control read 2 contexts on `-mcpu=x86_64`. Values
+        // are unchanged; `blocks` is comptime, so a full batch zeroes nothing.
+        @memset(buf[n..], 0);
         switch (op) {
             .encrypt => bitsliced.Wide.encrypt(rounds, keys, &buf),
             .decrypt => bitsliced.Wide.decrypt(rounds, keys, &buf),

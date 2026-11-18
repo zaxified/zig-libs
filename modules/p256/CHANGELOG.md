@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog 13: the portable ctgrind lane now covers every module with a harness except jwe, megolm and xmlenc. Per-CPU variant rows were added to `ctgrind-expected.tsv`.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the portable code path is now measured in CI (lane `ctgrind portable amd64`, `CTGRIND_CPU=x86_64`); SPEC Backlog 13 done for p256.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC: delta mutant 403 of the portable `montReduce` fix (`hi` without `blackBox`) measured alone on the portable ctgrind build — no context, stays UNOBSERVABLE-CT.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** new ctgrind row `ecdh`: `p256.ecdh` with the secret scalar tainted. It is the first p256 row that feeds the windowed variable-base multiply a secret digit; until now only the hpke/tls13 consumer rows covered it. 3 in-file, all verdicts: the two range checks on the secret and the product's `rejectIdentity`. The 22 constant-time mutants the whole-module audit had left unobservable were each measured alone with ctgrind. Five are killed: `Fe.cMov`'s mask (`sign` +2), the comb gather mask (`comb` +57), the comb nonzero mask (`comb` +1), `gatherSigned`'s match mask (`ecdh` +4) and the portable REDC keep mask (`secpt` +1). 17 stay unobservable, now with that measurement as the reason. Card `(282/359, 77 eq)`, which includes the 6 delta mutants of the portable fix.
