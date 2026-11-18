@@ -477,6 +477,8 @@ const Node = struct {
                 error.OutOfMemory => try self.reply(w, .err, "append failed"),
                 // Unreachable through wire.limits (1 MiB frames), kept honest.
                 error.EntryTooLarge => try self.reply(w, .err, "command too large"),
+                // Only during a leadership transfer, which this app never starts.
+                error.ProposalDropped => try self.reply(w, .err, "leadership transfer in progress"),
             }
             return;
         };

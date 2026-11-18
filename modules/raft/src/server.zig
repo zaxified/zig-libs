@@ -184,6 +184,9 @@ pub const RaftServer = struct {
     /// index → the `commandFor` value applied there (command entries only).
     applied_commands: std.AutoHashMapUnmanaged(LogIndex, Command) = .empty,
     wire: std.ArrayList(u8) = .empty,
+    /// Client commands a leader refused because a leadership transfer was
+    /// under way (`error.ProposalDropped`), in this run.
+    proposals_dropped: u64 = 0,
 
     /// Deliberate defect to run instead of the real rule, installed into every
     /// node. `.none` in every production path; the positive-control tests set
@@ -245,6 +248,7 @@ pub const RaftServer = struct {
         self.checker.reset();
         self.commit_terms.clearRetainingCapacity();
         self.applied_commands.clearRetainingCapacity();
+        self.proposals_dropped = 0;
     }
 
     fn ticksOf(self: *const RaftServer, t: Time) u32 {
@@ -296,7 +300,15 @@ pub const RaftServer = struct {
         if (self.cfg.propose_client_commands and n.role == .leader and s.ticks % n.cfg.heartbeat_ticks == 0) {
             var b: [8]u8 = undefined;
             std.mem.writeInt(Command, &b, commandFor(n.term, n.lastIndex() + 1), .little);
-            _ = try n.propose(&b);
+            _ = n.propose(&b) catch |err| switch (err) {
+                // A leadership transfer is under way: the client is turned
+                // away (etcd's ErrProposalDropped), as a real one would be.
+                error.ProposalDropped => blk: {
+                    self.proposals_dropped += 1;
+                    break :blk 0;
+                },
+                else => |e| return e,
+            };
         }
         try n.tick();
         try self.drain(sim, i);
@@ -1327,4 +1339,210 @@ test "real: PreVote + CheckQuorum uphold all five invariants across a 150-seed f
     for (0..CLUSTER_N) |i| leaders += @intFromBool(srv.node(@intCast(i)).role == .leader);
     try testing.expectEqual(@as(usize, 1), leaders);
     try testing.expect(srv.applied_commands.count() >= 30);
+}
+
+// ── leadership transfer in the model-check (SPEC Backlog 7) ────────────────
+//
+// A wrapper that asks whichever server is leader at time `at` (and every
+// `period` after, if non-zero) to hand leadership over — to `target`, or to
+// leader + 2 (mod N) when that is null.
+
+const TransferProbe = struct {
+    srv: *RaftServer,
+    at: Time,
+    period: Time = 0,
+    target: ?NodeId = null,
+    /// Transfers requested in this run, and how many found the target's log
+    /// behind the leader's (`match < lastIndex`).
+    transfers: u64 = 0,
+    lagged: u64 = 0,
+    /// The leader's last index when the (last) transfer was requested.
+    last_at_transfer: LogIndex = 0,
+    /// Transfers over every run since construction (`reset` keeps it).
+    total_transfers: u64 = 0,
+    epochs: [CLUSTER_N]u64 = @splat(0),
+
+    const TIMER_BASE: u64 = 1 << 62;
+
+    fn protocol(self: *TransferProbe) Protocol {
+        return .{
+            .ctx = self,
+            .onStartFn = onStart,
+            .onMessageFn = onMessage,
+            .onTimerFn = onTimer,
+            .checkFn = check,
+            .resetFn = reset,
+        };
+    }
+
+    fn cast(ctx: *anyopaque) *TransferProbe {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn reset(ctx: *anyopaque) void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        inner.resetFn(inner.ctx);
+        self.transfers = 0;
+        self.lagged = 0;
+        self.last_at_transfer = 0;
+        self.epochs = @splat(0);
+    }
+
+    fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        try inner.onStartFn.?(inner.ctx, sim, node);
+        self.epochs[node] += 1;
+        // First start: the chain begins at `at`. A restart resumes it a
+        // period later (a one-shot probe does not re-arm).
+        if (self.epochs[node] == 1) {
+            try sim.setTimer(node, self.at, TIMER_BASE + self.epochs[node]);
+        } else if (self.period != 0) {
+            try sim.setTimer(node, self.period, TIMER_BASE + self.epochs[node]);
+        }
+    }
+
+    fn onMessage(ctx: *anyopaque, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
+        const inner = cast(ctx).srv.protocol();
+        try inner.onMessageFn(inner.ctx, sim, node, from, payload);
+    }
+
+    fn onTimer(ctx: *anyopaque, sim: *Sim, node: NodeId, timer_id: u64) anyerror!void {
+        const self = cast(ctx);
+        if (timer_id < TIMER_BASE) {
+            const inner = self.srv.protocol();
+            return inner.onTimerFn.?(inner.ctx, sim, node, timer_id);
+        }
+        if (timer_id - TIMER_BASE != self.epochs[node]) return;
+        const n = self.srv.node(node);
+        if (n.role == .leader) {
+            const target = self.target orelse (node + 2) % CLUSTER_N;
+            if (n.match[target] < n.lastIndex()) self.lagged += 1;
+            self.last_at_transfer = n.lastIndex();
+            try n.transferLeadership(target);
+            self.transfers += 1;
+            self.total_transfers += 1;
+            try self.srv.drain(sim, node);
+        }
+        if (self.period != 0) try sim.setTimer(node, self.period, timer_id);
+    }
+
+    fn check(ctx: *anyopaque, sim: *const Sim) anyerror!void {
+        const inner = cast(ctx).srv.protocol();
+        try inner.checkFn.?(inner.ctx, sim);
+    }
+};
+
+/// Whether any applied command was proposed in `term` (`commandFor`'s high half).
+fn appliedInTerm(srv: *RaftServer, term: Term) bool {
+    var it = srv.applied_commands.valueIterator();
+    while (it.next()) |c| {
+        if (c.* >> 32 == term) return true;
+    }
+    return false;
+}
+
+test "real: a leadership transfer hands over to the target in the next term (also with PreVote + CheckQuorum)" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]bool{ false, true }) |hardened| {
+        var cfg = DEFAULT_CFG;
+        cfg.pre_vote = hardened;
+        cfg.check_quorum = hardened;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        var probe = TransferProbe{ .srv = &srv, .at = 400, .target = 2 };
+        const case = netsim.Case{ .seed = 7, .scenario = scenario, .protocol = probe.protocol(), .until = 1000 };
+        const r = try netsim.replay(gpa, case, &.{}, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+        // Precondition: node 0 led term 1 and was asked once.
+        try testing.expectEqual(@as(?NodeId, 0), srv.checker.leaders.get(1));
+        try testing.expectEqual(@as(u64, 1), probe.transfers);
+        // Node 2 won term 2 — the very next term, no election besides it —
+        // and the cluster commits under it.
+        try testing.expectEqual(@as(?NodeId, 2), srv.checker.leaders.get(2));
+        try testing.expectEqual(Role.leader, srv.node(2).role);
+        try testing.expectEqual(@as(Term, 2), maxTerm(&srv));
+        try testing.expectEqual(Role.follower, srv.node(0).role);
+        try testing.expect(appliedInTerm(&srv, 2));
+    }
+}
+
+test "real: a transfer to a lagging target catches it up first, then hands over" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Node 2 is cut away 200..380 and misses the commands of that time
+    // (PreVote keeps it from inflating its term meanwhile); the transfer is
+    // asked for right after the heal, while its log is still behind.
+    const CUT2 = [_]NodeId{2};
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 200, .kind = .{ .partition = .{ .id = 1, .cut = &CUT2 } } },
+        .{ .time = 380, .kind = .{ .heal = .{ .id = 1 } } },
+    };
+    var cfg = DEFAULT_CFG;
+    cfg.pre_vote = true;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+    defer srv.deinit(gpa);
+    var probe = TransferProbe{ .srv = &srv, .at = 381, .target = 2 };
+    const case = netsim.Case{ .seed = 7, .scenario = scenario, .protocol = probe.protocol(), .until = 1000 };
+    const r = try netsim.replay(gpa, case, &trace, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    try testing.expectEqual(@as(u64, 1), probe.transfers);
+    try testing.expectEqual(@as(u64, 1), probe.lagged); // the target WAS behind
+    try testing.expectEqual(@as(?NodeId, 2), srv.checker.leaders.get(2));
+    try testing.expectEqual(@as(Term, 2), maxTerm(&srv));
+    try testing.expectEqual(Role.leader, srv.node(2).role);
+    try testing.expect(appliedInTerm(&srv, 2));
+}
+
+test "real: a transfer to a dead target is abandoned after an election timeout; the old leader resumes" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 300, .kind = .{ .crash_node = .{ .node = 2 } } },
+    };
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+    var probe = TransferProbe{ .srv = &srv, .at = 400, .target = 2 };
+    const case = netsim.Case{ .seed = 7, .scenario = scenario, .protocol = probe.protocol(), .until = 1000 };
+    const r = try netsim.replay(gpa, case, &trace, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    try testing.expectEqual(@as(u64, 1), probe.transfers);
+    // Clients were turned away while it ran…
+    try testing.expect(srv.proposals_dropped > 0);
+    // …and then node 0, still the term-1 leader, took and committed new ones.
+    try testing.expectEqual(Role.leader, srv.node(0).role);
+    try testing.expectEqual(@as(Term, 1), maxTerm(&srv));
+    try testing.expectEqual(no_vote, srv.node(0).transferee);
+    var later: usize = 0;
+    var it = srv.applied_commands.keyIterator();
+    while (it.next()) |idx| later += @intFromBool(idx.* > probe.last_at_transfer);
+    try testing.expect(later >= 5);
+}
+
+test "real: transfers every 300 time units under a 100-seed fuzzed fault sweep (PreVote + CheckQuorum) keep all five invariants" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var cfg = DEFAULT_CFG;
+    cfg.pre_vote = true;
+    cfg.check_quorum = true;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+    defer srv.deinit(gpa);
+    var probe = TransferProbe{ .srv = &srv, .at = 300, .period = 300 };
+    const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = probe.protocol(), .until = UNTIL };
+    var seed: u64 = 1;
+    while (seed <= 100) : (seed += 1) {
+        var case = template;
+        case.seed = seed;
+        var gr = try netsim.run(gpa, case, .{});
+        defer gr.trace.deinit();
+        if (gr.result.outcome == .violated) {
+            std.debug.print("raft: transfer sweep tripped a safety check at seed {}\n", .{seed});
+            return error.HardInvariantViolated;
+        }
+        try testing.expectEqual(@as(u64, 0), srv.malformedDropped());
+    }
+    // Precondition: the sweep did transfer, at volume.
+    try testing.expect(probe.total_transfers >= 200);
 }

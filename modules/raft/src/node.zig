@@ -48,8 +48,13 @@
 //! heard from a quorum for an election timeout steps down, and a follower
 //! that heard from a leader within one ignores higher-term vote requests).
 //!
+//! Leadership transfer (Raft thesis §3.10; etcd/raft `MsgTransferLeader` /
+//! `MsgTimeoutNow`): `transferLeadership(target)` on the leader stops new
+//! proposals, brings the target's log up to date and tells it to campaign at
+//! once; abandoned after one election timeout.
+//!
 //! Not here yet (see SPEC.md § Backlog): snapshots / log compaction, membership
-//! change, leadership transfer, linearizable reads. The whole log
+//! change, linearizable reads. The whole log
 //! lives in memory, and so does every entry's data.
 
 const std = @import("std");
@@ -203,7 +208,11 @@ pub const InjectedBug = enum {
 };
 
 pub const InitError = error{ InvalidConfig, InvalidRestore } || Allocator.Error;
-pub const ProposeError = error{ NotLeader, EntryTooLarge } || Allocator.Error;
+/// `ProposalDropped`: a leadership transfer is under way (etcd/raft's
+/// `ErrProposalDropped`; hashicorp/raft's `ErrLeadershipTransferInProgress`).
+pub const ProposeError = error{ NotLeader, EntryTooLarge, ProposalDropped } || Allocator.Error;
+/// `InvalidTarget`: the target is not a server of this cluster.
+pub const TransferError = error{ NotLeader, InvalidTarget } || Allocator.Error;
 
 /// Upper bound on any `propose` payload: the wire carries an entry's length
 /// as a `u32`. The effective bound is lower — `Config.max_append_bytes` minus
@@ -267,9 +276,13 @@ pub const Node = struct {
     /// CheckQuorum: which followers sent an AppendEntries response since the
     /// leader's last quorum check (etcd/raft `Progress.RecentActive`).
     recent_active: []bool,
+    /// The server a leadership transfer is handing over to, or `no_vote`
+    /// (etcd/raft's `leadTransferee`). While set, `propose` refuses.
+    transferee: NodeId = no_vote,
 
     /// Ticks since this node last heard from a leader or granted a vote; on a
-    /// leader with `check_quorum`, ticks since the last quorum check.
+    /// leader, ticks into the current election-timeout period (the quorum
+    /// check and the transfer deadline fall at its end).
     election_elapsed: u32 = 0,
     election_timeout: u32 = 0,
     heartbeat_elapsed: u32 = 0,
@@ -431,12 +444,12 @@ pub const Node = struct {
     pub fn tick(self: *Node) Allocator.Error!void {
         std.debug.assert(!self.in_ready);
         if (self.role == .leader) {
-            if (self.cfg.check_quorum) {
-                // etcd's `tickHeartbeat` → `MsgCheckQuorum`, once per
-                // (un-jittered) election timeout.
-                self.election_elapsed += 1;
-                if (self.election_elapsed >= self.cfg.election_ticks) {
-                    self.election_elapsed = 0;
+            // etcd's `tickHeartbeat`: once per (un-jittered) election timeout,
+            // the quorum check and the transfer deadline.
+            self.election_elapsed += 1;
+            if (self.election_elapsed >= self.cfg.election_ticks) {
+                self.election_elapsed = 0;
+                if (self.cfg.check_quorum) {
                     if (!self.quorumActive()) {
                         self.becomeFollower(self.term);
                         self.leader = no_vote;
@@ -445,6 +458,10 @@ pub const Node = struct {
                     @memset(self.recent_active, false);
                     self.recent_active[self.cfg.id] = true;
                 }
+                // A transfer not finished within one election timeout is
+                // abandoned and this leader takes proposals again (etcd's
+                // `abortLeaderTransfer`, hashicorp's ElectionTimeout).
+                self.transferee = no_vote;
             }
             self.heartbeat_elapsed += 1;
             if (self.heartbeat_elapsed >= self.cfg.heartbeat_ticks) try self.bcastAppend();
@@ -452,7 +469,7 @@ pub const Node = struct {
         }
         self.election_elapsed += 1;
         if (self.election_elapsed >= self.election_timeout) {
-            if (self.cfg.pre_vote) try self.preCampaign() else try self.campaign();
+            if (self.cfg.pre_vote) try self.preCampaign() else try self.campaign(false);
         }
     }
 
@@ -463,12 +480,39 @@ pub const Node = struct {
     pub fn propose(self: *Node, bytes: []const u8) ProposeError!LogIndex {
         std.debug.assert(!self.in_ready);
         if (self.role != .leader) return error.NotLeader;
+        if (self.transferee != no_vote) return error.ProposalDropped;
         // Bounded by the per-message byte cap, not only by the wire's u32
         // length: an entry no AppendEntries can carry would wedge replication.
         if (bytes.len > self.cfg.max_append_bytes - message.Message.entry_header_len) return error.EntryTooLarge;
         const idx = try self.appendLocal(.command, bytes);
         self.bcast_pending = true;
         return idx;
+    }
+
+    /// Hand leadership to `target` (Raft thesis §3.10; etcd/raft
+    /// `TransferLeadership`). From now on `propose` refuses
+    /// (`error.ProposalDropped`); the target is sent what it is missing and,
+    /// once its log matches this leader's, a `timeout_now`, on which it starts
+    /// an election at once — no PreVote, and its RequestVote is honoured
+    /// inside a CheckQuorum lease. Done when the target wins (this node then
+    /// steps down on its RequestVote); abandoned, with proposals accepted
+    /// again, if this node is still leader one election timeout later. A
+    /// second call for the same target is a no-op; for another target it
+    /// restarts the transfer toward that one; for this node itself it cancels
+    /// a transfer under way (all as etcd/raft).
+    pub fn transferLeadership(self: *Node, target: NodeId) TransferError!void {
+        std.debug.assert(!self.in_ready);
+        if (target >= self.cfg.cluster_size) return error.InvalidTarget;
+        if (self.role != .leader) return error.NotLeader;
+        if (self.transferee != no_vote) {
+            if (self.transferee == target) return;
+            self.transferee = no_vote;
+        }
+        if (target == self.cfg.id) return;
+        // The transfer gets one full election timeout from now (etcd).
+        self.election_elapsed = 0;
+        self.transferee = target;
+        if (self.match[target] == self.lastIndex()) try self.sendTimeoutNow(target) else try self.sendAppend(target);
     }
 
     /// Decode a frame from peer `from` and step it. A frame that does not
@@ -501,6 +545,7 @@ pub const Node = struct {
             .append_resp => |a| try self.onAppendResp(m.from, a),
             .pre_vote_req => |v| try self.onPreVoteReq(m.from, v),
             .pre_vote_resp => |v| try self.onPreVoteResp(m.from, v),
+            .timeout_now => |t| try self.onTimeoutNow(t),
         }
     }
 
@@ -564,7 +609,10 @@ pub const Node = struct {
 
     // ── elections ───────────────────────────────────────────────────────────
 
-    fn campaign(self: *Node) Allocator.Error!void {
+    /// `transfer`: this election was asked for by the leader
+    /// (`timeout_now`); its RequestVotes say so, which lifts the
+    /// CheckQuorum lease on the receivers (etcd's `campaignTransfer`).
+    fn campaign(self: *Node, transfer: bool) Allocator.Error!void {
         // A term at the ceiling cannot be followed by a new one. Staying a
         // follower here is the whole defence against `term += 1` overflowing
         // (a panic) or wrapping to 0 (a term regression) — see `types.max_term`.
@@ -589,6 +637,7 @@ pub const Node = struct {
                 .term = self.term,
                 .last_log_index = li.last_index,
                 .last_log_term = li.last_term,
+                .transfer = transfer,
             } });
         }
     }
@@ -607,7 +656,7 @@ pub const Node = struct {
         self.resetElectionTimer();
         @memset(self.votes, false);
         self.votes[self.cfg.id] = true;
-        if (self.voteCount() >= self.majority()) return self.campaign();
+        if (self.voteCount() >= self.majority()) return self.campaign(false);
         const li = self.log.info();
         for (0..self.cfg.cluster_size) |p| {
             if (p == self.cfg.id) continue;
@@ -648,7 +697,23 @@ pub const Node = struct {
         if (!v.granted and v.term > self.term) return self.becomeFollower(v.term);
         if (self.role != .pre_candidate or !v.granted or v.term != self.term + 1) return;
         self.votes[from] = true;
-        if (self.voteCount() >= self.majority()) try self.campaign();
+        if (self.voteCount() >= self.majority()) try self.campaign(false);
+    }
+
+    /// The leader asks this node to campaign now (leadership transfer). As
+    /// etcd/raft's `stepFollower` → `hup(campaignTransfer)`: a higher term is
+    /// adopted first; only a follower of the message's term acts (a
+    /// candidate or pre-candidate ignores it, etcd's `stepCandidate`), and
+    /// never through PreVote.
+    fn onTimeoutNow(self: *Node, t: message.TimeoutNow) Allocator.Error!void {
+        const obs = safety.observeTerm(self.term, t.term);
+        if (obs.term_advanced) self.becomeFollower(obs.new_term);
+        if (t.term != self.term or self.role != .follower) return;
+        try self.campaign(true);
+    }
+
+    fn sendTimeoutNow(self: *Node, to: NodeId) Allocator.Error!void {
+        try self.send(to, .{ .timeout_now = .{ .term = self.term } });
     }
 
     fn quorumActive(self: *const Node) bool {
@@ -678,6 +743,7 @@ pub const Node = struct {
         @memset(self.recent_active, false);
         self.recent_active[self.cfg.id] = true;
         self.election_elapsed = 0;
+        self.transferee = no_vote;
         // §8: a fresh leader commits a no-op of its own term, which is what
         // lets the Figure-8 rule pull earlier-term entries in behind it.
         _ = try self.appendLocal(.noop, "");
@@ -694,6 +760,8 @@ pub const Node = struct {
             self.leader = no_vote;
         }
         self.role = .follower;
+        // Only a leader transfers (etcd: `reset` aborts it).
+        self.transferee = no_vote;
         // A broadcast scheduled while leader must not go out after the step
         // down: `ready` would send the stale tail under the NEW term, as a
         // leader of a term this node never won (review 2026-10-04, H1).
@@ -704,8 +772,9 @@ pub const Node = struct {
     fn onVoteReq(self: *Node, from: NodeId, v: message.VoteReq) Allocator.Error!void {
         // CheckQuorum lease (etcd/raft `Step`, thesis §4.2.3): a node that
         // heard from a leader within an election timeout neither adopts a
-        // higher term from a RequestVote nor answers it.
-        if (v.term > self.term and self.cfg.check_quorum and self.leaderLive()) return;
+        // higher term from a RequestVote nor answers it — unless the
+        // election was asked for by the leader (a transfer, etcd's `force`).
+        if (v.term > self.term and self.cfg.check_quorum and self.leaderLive() and !v.transfer) return;
         const req: types.RequestVoteReq = .{
             .term = v.term,
             .candidate_id = from,
@@ -915,6 +984,9 @@ pub const Node = struct {
             if (!progressed and self.inflFull(from)) self.inflFreeFirst(from);
             self.next[from] = @max(self.next[from], self.match[from] + 1);
             self.maybeCommit();
+            // A transfer waits for the target to hold the whole log (etcd:
+            // on the ack that brings `Match` to `lastIndex`).
+            if (progressed and from == self.transferee and self.match[from] == self.lastIndex()) try self.sendTimeoutNow(from);
             // Keep streaming only on PROGRESS: a duplicated or stale ack must
             // not fork a second stream; the heartbeat covers the rest.
             if (progressed and self.next[from] <= self.lastIndex()) try self.sendAppend(from);
@@ -2247,4 +2319,208 @@ test "PreVote receiver: same term with a known (lapsed) leader, or an older term
     from = g.msgs.items.len;
     try g.step(.{ .from = 2, .to = 1, .body = .{ .pre_vote_req = .{ .term = 1, .last_log_index = 0, .last_log_term = 0 } } });
     try testing.expect(!(try lastPreVoteResp(&g, from)).granted);
+}
+
+// ── leadership transfer (SPEC Backlog 7) ────────────────────────────────────
+
+/// `testLeaderCfg` with node `p`'s log acknowledged up to the leader's last index.
+fn ackAll(node: *Node, p: NodeId) !void {
+    try node.step(.{ .from = p, .to = 0, .body = .{ .append_resp = .{ .term = node.term, .success = true, .index = node.lastIndex() } } });
+}
+
+fn trCfg() Config {
+    var c = limitCfg();
+    c.election_ticks = 4;
+    return c;
+}
+
+test "transfer: a caught-up target gets timeout_now at once; proposals are dropped while it runs" {
+    const gpa = testing.allocator;
+    var node = try testLeaderCfg(gpa, trCfg(), 2);
+    defer node.deinit();
+    try testing.expectError(error.InvalidTarget, node.transferLeadership(3));
+    try ackAll(&node, 2);
+    try testing.expectEqual(no_vote, node.transferee);
+    // No transfer yet: a progressing ack from the would-be target sends nothing of the kind.
+    try testing.expectEqual(@as(usize, 0), countTag(&node, 0, .timeout_now));
+
+    var from = node.msgs.items.len;
+    try node.transferLeadership(2);
+    try testing.expectEqual(@as(NodeId, 2), node.transferee);
+    try testing.expectEqual(@as(usize, 1), node.msgs.items.len - from);
+    const m = node.msgs.items[from];
+    try testing.expectEqual(@as(NodeId, 2), m.to);
+    try testing.expectEqual(node.term, m.body.timeout_now.term);
+    try testing.expectError(error.ProposalDropped, node.propose("x"));
+    try testing.expectEqual(Role.leader, node.role);
+    // The same target again: nothing new is sent.
+    from = node.msgs.items.len;
+    try node.transferLeadership(2);
+    try testing.expectEqual(from, node.msgs.items.len);
+    // To itself: cancels (etcd), proposals are taken again.
+    try node.transferLeadership(0);
+    try testing.expectEqual(no_vote, node.transferee);
+    _ = try node.propose("y");
+    try testing.expectEqual(from, node.msgs.items.len);
+
+    // A follower cannot transfer.
+    var f = try Node.init(gpa, .{ .id = 1, .cluster_size = 3, .seed = 1 }, .{});
+    defer f.deinit();
+    try testing.expectError(error.NotLeader, f.transferLeadership(2));
+}
+
+test "transfer: a lagging target is caught up first; timeout_now follows the ack that reaches the leader's last index" {
+    const gpa = testing.allocator;
+    var node = try testLeaderCfg(gpa, trCfg(), 3); // last index 4
+    defer node.deinit();
+    node.next[2] = 2; // the target holds only the no-op
+    node.match[2] = 1;
+    var from = node.msgs.items.len;
+    try node.transferLeadership(2);
+    try testing.expectEqual(@as(usize, 0), countTag(&node, from, .timeout_now));
+    try testing.expectEqual(@as(usize, 1), countTag(&node, from, .append_req));
+    try testing.expectEqual(@as(usize, 3), node.msgs.items[from].body.append_req.entries.len);
+    // A partial ack: not yet.
+    from = node.msgs.items.len;
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .append_resp = .{ .term = node.term, .success = true, .index = 3 } } });
+    try testing.expectEqual(@as(usize, 0), countTag(&node, from, .timeout_now));
+    // Another follower reaching the end: not it.
+    try ackAll(&node, 1);
+    try testing.expectEqual(@as(usize, 0), countTag(&node, from, .timeout_now));
+    // The target reaching the end: now, once.
+    try ackAll(&node, 2);
+    try testing.expectEqual(@as(usize, 1), countTag(&node, from, .timeout_now));
+    // A duplicate of that ack (no progress) does not repeat it.
+    try ackAll(&node, 2);
+    try testing.expectEqual(@as(usize, 1), countTag(&node, from, .timeout_now));
+}
+
+test "transfer: abandoned one election timeout after it started, not one tick before" {
+    const gpa = testing.allocator;
+    var node = try testLeaderCfg(gpa, trCfg(), 0);
+    defer node.deinit();
+    try node.tick();
+    try node.tick(); // mid-period: the transfer still gets a full timeout
+    try node.transferLeadership(1);
+    for (0..3) |_| try node.tick();
+    try testing.expectEqual(@as(NodeId, 1), node.transferee);
+    try testing.expectError(error.ProposalDropped, node.propose("x"));
+    try node.tick();
+    try testing.expectEqual(no_vote, node.transferee);
+    try testing.expectEqual(Role.leader, node.role);
+    _ = try node.propose("x");
+    // Another target restarts it toward that one (etcd).
+    try node.transferLeadership(1);
+    try node.transferLeadership(2);
+    try testing.expectEqual(@as(NodeId, 2), node.transferee);
+}
+
+test "transfer: stepping down ends it, and a new term's leader starts with none" {
+    const gpa = testing.allocator;
+    var node = try testLeaderCfg(gpa, trCfg(), 0);
+    defer node.deinit();
+    try node.transferLeadership(1);
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = node.term + 1, .success = false, .index = 0 } } });
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expectEqual(no_vote, node.transferee);
+    // Re-elected leader with a stale transferee forced in: becomeLeader clears it.
+    while (node.role != .candidate) try node.tick();
+    node.transferee = 1;
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .vote_resp = .{ .term = node.term, .granted = true } } });
+    try testing.expectEqual(Role.leader, node.role);
+    try testing.expectEqual(no_vote, node.transferee);
+    _ = try node.propose("x");
+}
+
+test "timeout_now: a follower campaigns at once, flagged, without PreVote; stale or non-follower ignores it" {
+    const gpa = testing.allocator;
+    var cfg = pvCfg(1); // pre_vote on: the transfer must bypass it
+    cfg.election_ticks = 50;
+    var f = try Node.init(gpa, cfg, .{ .hard_state = .{ .term = 3 } });
+    defer f.deinit();
+    // An older term: ignored.
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .timeout_now = .{ .term = 2 } } });
+    try testing.expectEqual(Role.follower, f.role);
+    try testing.expectEqual(@as(usize, 0), f.msgs.items.len);
+    // Its own term: a real election now, term + 1, RequestVotes carrying the flag.
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .timeout_now = .{ .term = 3 } } });
+    try testing.expectEqual(Role.candidate, f.role);
+    try testing.expectEqual(@as(Term, 4), f.term);
+    try testing.expectEqual(@as(usize, 0), countTag(&f, 0, .pre_vote_req));
+    try testing.expectEqual(@as(usize, 2), countTag(&f, 0, .vote_req));
+    for (f.msgs.items) |m| try testing.expect(m.body.vote_req.transfer);
+    // A candidate ignores one (etcd's stepCandidate).
+    const n = f.msgs.items.len;
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .timeout_now = .{ .term = 4 } } });
+    try testing.expectEqual(@as(Term, 4), f.term);
+    try testing.expectEqual(n, f.msgs.items.len);
+    // A higher term is adopted first, then the follower campaigns.
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .timeout_now = .{ .term = 8 } } });
+    try testing.expectEqual(Role.candidate, f.role);
+    try testing.expectEqual(@as(Term, 9), f.term);
+
+    // A pre-candidate ignores one too, and an ordinary election is unflagged.
+    var p = try Node.init(gpa, pvCfg(1), .{ .hard_state = .{ .term = 3 } });
+    defer p.deinit();
+    for (0..4) |_| try p.tick();
+    try testing.expectEqual(Role.pre_candidate, p.role);
+    try p.step(.{ .from = 0, .to = 1, .body = .{ .timeout_now = .{ .term = 3 } } });
+    try testing.expectEqual(Role.pre_candidate, p.role);
+    try testing.expectEqual(@as(Term, 3), p.term);
+    var q = try Node.init(gpa, .{ .id = 1, .cluster_size = 3, .election_ticks = 2, .election_jitter_ticks = 0, .seed = 1 }, .{});
+    defer q.deinit();
+    for (0..2) |_| try q.tick();
+    try testing.expectEqual(Role.candidate, q.role);
+    for (q.msgs.items) |m| try testing.expect(!m.body.vote_req.transfer);
+}
+
+test "transfer vote: honoured inside a CheckQuorum lease, by a follower and by the old leader" {
+    const gpa = testing.allocator;
+    var cfg = cqCfg();
+    cfg.id = 1;
+    var f = try Node.init(gpa, cfg, .{ .hard_state = .{ .term = 2 } });
+    defer f.deinit();
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 2, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{} } } });
+    _ = try f.ready();
+    try f.advance();
+    try testing.expect(f.leaderLive());
+    // Unflagged: ignored (the lease). Flagged: adopted and granted.
+    try f.step(.{ .from = 2, .to = 1, .body = .{ .vote_req = .{ .term = 3, .last_log_index = 0, .last_log_term = 0 } } });
+    try testing.expectEqual(@as(Term, 2), f.term);
+    try f.step(.{ .from = 2, .to = 1, .body = .{ .vote_req = .{ .term = 3, .last_log_index = 0, .last_log_term = 0, .transfer = true } } });
+    try testing.expectEqual(@as(Term, 3), f.term);
+    try testing.expectEqual(@as(NodeId, 2), f.voted_for);
+    try testing.expect(f.msgs.items[f.msgs.items.len - 1].body.vote_resp.granted);
+
+    var l = try testLeaderCfg(gpa, cqCfg(), 0);
+    defer l.deinit();
+    try l.transferLeadership(1);
+    try l.step(.{ .from = 1, .to = 0, .body = .{ .vote_req = .{ .term = l.term + 1, .last_log_index = l.lastIndex(), .last_log_term = l.term, .transfer = true } } });
+    try testing.expectEqual(Role.follower, l.role);
+    try testing.expectEqual(@as(NodeId, 1), l.voted_for);
+    try testing.expectEqual(no_vote, l.transferee);
+}
+
+test "transfer, end to end: a three-node cluster hands leadership to node 2 in the next term, then commits under it" {
+    var c = try Cluster(3).init(testing.allocator);
+    defer c.deinit();
+    try c.tickAll(12);
+    try testing.expectEqual(@as(?NodeId, 0), c.leaderId());
+    _ = try c.nodes[0].?.propose("before");
+    try c.drain(0);
+    try c.deliver();
+    try c.nodes[0].?.transferLeadership(2);
+    try c.drain(0);
+    try c.deliver();
+    try testing.expectEqual(@as(?NodeId, 2), c.leaderId());
+    try testing.expectEqual(@as(Term, 2), c.nodes[2].?.term);
+    for (c.nodes) |m| try testing.expectEqual(@as(Term, 2), m.?.term);
+    _ = try c.nodes[2].?.propose("after");
+    try c.drain(2);
+    try c.deliver();
+    try c.tickAll(3);
+    for (c.applied) |a| {
+        try testing.expectEqual(@as(usize, 2), a.items.len);
+        try testing.expectEqualStrings("after", a.items[1]);
+    }
 }

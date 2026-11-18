@@ -16,8 +16,8 @@
 //! property/shrink/teeth harness.
 //!
 //! **Status: mvp.** Not yet: snapshots / log compaction, membership changes
-//! (`jointMajority` implemented, not wired), pre-vote / leadership transfer,
-//! linearizable reads — see SPEC.md § Backlog.
+//! (`jointMajority` implemented, not wired), linearizable reads (PreVote,
+//! CheckQuorum and leadership transfer are in) — see SPEC.md § Backlog.
 //!
 //! **What the LIVE sweep actually catches** — stated explicitly, because a
 //! checker that cannot fail is worse than no checker:
@@ -116,6 +116,7 @@ pub const Ready = node_mod.Ready;
 pub const InjectedBug = node_mod.InjectedBug;
 pub const InitError = node_mod.InitError;
 pub const ProposeError = node_mod.ProposeError;
+pub const TransferError = node_mod.TransferError;
 pub const fingerprint = node_mod.fingerprint;
 
 /// What `Node`s exchange: entries carrying the caller's bytes, and the codec.
@@ -126,6 +127,7 @@ pub const MessageBody = message.Body;
 pub const MessageTag = message.Tag;
 pub const VoteReq = message.VoteReq;
 pub const VoteResp = message.VoteResp;
+pub const TimeoutNow = message.TimeoutNow;
 pub const AppendReq = message.AppendReq;
 pub const AppendResp = message.AppendResp;
 

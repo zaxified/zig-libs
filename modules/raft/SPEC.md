@@ -37,7 +37,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [LVala/zaft](https://github.com/LVala/zaft) | Zig | MIT | 24 | push 2024-08 (Zig 0.13) | The Zig alternative: a usable node (`Raft(UserData, Entry)` with send/apply/persist callbacks) for a fixed cluster; its README lists membership changes as not yet implemented. |
 | [canonical/raft](https://github.com/canonical/raft) | C | NOASSERTION (LGPL-3.0 with linking exception *inferred*) | 945 | v0.18.1 (2024-02), push 2024-03 | C library, listed for completeness. |
 
-**Where we are ahead:** the only one of these whose safety is model-checked by a deterministic fault simulator (`netsim`) against all five Figure 3 properties, with positive-control teeth tests — and since 2026-10-04 the model-check drives the SAME `Node` a deployment runs (restart from the persisted state only, Readys batched or not). The pure decision core and the invariant checkers are reusable on their own. **Where we are even:** a runnable server in the etcd-raft/raft-rs shape — `Node` as a pure state machine (`tick` / `step` / `propose` → `ready` / `advance`) over caller-owned transport, storage and clock, any cluster size, entries carrying arbitrary bytes, restart from persisted state; zaft's level of "a usable node for a fixed cluster", with the persistence contract enforced. **Where we are behind (→ Backlog, the gaps a user will hit):** no log compaction/snapshots (the whole log and every entry's bytes live in memory), no membership changes, no leadership transfer, no linearizable reads (ReadIndex / lease). (PreVote and CheckQuorum — etcd's `Config.PreVote` / `Config.CheckQuorum` — landed 2026-11-18, off by default as in etcd/raft; see § PreVote and CheckQuorum.) (Flow control — a byte cap per AppendEntries and an in-flight window per follower, etcd's `MaxSizePerMsg` / `MaxInflightMsgs` — landed 2026-11-18; see § Flow control and hostile-peer limits.)
+**Where we are ahead:** the only one of these whose safety is model-checked by a deterministic fault simulator (`netsim`) against all five Figure 3 properties, with positive-control teeth tests — and since 2026-10-04 the model-check drives the SAME `Node` a deployment runs (restart from the persisted state only, Readys batched or not). The pure decision core and the invariant checkers are reusable on their own. **Where we are even:** a runnable server in the etcd-raft/raft-rs shape — `Node` as a pure state machine (`tick` / `step` / `propose` → `ready` / `advance`) over caller-owned transport, storage and clock, any cluster size, entries carrying arbitrary bytes, restart from persisted state; zaft's level of "a usable node for a fixed cluster", with the persistence contract enforced. **Where we are behind (→ Backlog, the gaps a user will hit):** no log compaction/snapshots (the whole log and every entry's bytes live in memory), no membership changes, no linearizable reads (ReadIndex / lease). (PreVote and CheckQuorum — etcd's `Config.PreVote` / `Config.CheckQuorum` — landed 2026-11-18, off by default as in etcd/raft; see § PreVote and CheckQuorum. Leadership transfer — etcd's `TransferLeadership` / `MsgTimeoutNow` — landed the same day; see § Leadership transfer.) (Flow control — a byte cap per AppendEntries and an in-flight window per follower, etcd's `MaxSizePerMsg` / `MaxInflightMsgs` — landed 2026-11-18; see § Flow control and hostile-peer limits.)
 
 ## Purpose
 
@@ -442,7 +442,7 @@ the module follows etcd here.
 term can still get the leader to adopt it); this `Node` already answers every
 stale AppendEntries with its term (Figure 2), so nothing was needed.
 Leadership transfer (`MsgTimeoutNow`, the `campaignTransfer` exemption from
-the lease) is not implemented — Backlog 7 stays open for it.
+the lease) followed the same day — § Leadership transfer.
 
 **Wire.** Two new tags, `pre_vote_req = 0x14` and `pre_vote_resp = 0x15`,
 the same layouts as `vote_req` / `vote_resp` (the codec versions additions by
@@ -482,6 +482,88 @@ the pre-candidate keeping its leader, its timer not restarted, its tally not
 reset, `canVote`'s "no leader known" and "same term" clauses, and
 `becomeLeader` not clearing the activity flags or the check counter; each
 got a killing test; final 43/43. Added to the card's counts (cumulative).
+
+## Leadership transfer
+
+Added 2026-11-18 (closes Backlog 7). Raft thesis (Ongaro 2014) §3.10; every
+rule follows etcd/raft (`raft.go`: `stepLeader`'s `MsgTransferLeader`,
+`MsgProp` and `MsgAppResp`, `stepFollower` / `stepCandidate`'s
+`MsgTimeoutNow`, `hup(campaignTransfer)`, `Step`'s `force` / `inLease`,
+`tickHeartbeat`, `reset` → `abortLeaderTransfer`), checked against
+hashicorp/raft (`raft.go`: `leadershipTransfer`, `timeoutNow`,
+`requestVote`'s `req.LeadershipTransfer`, `ErrLeadershipTransferInProgress`)
+for every rule where the two could differ; they agree on all of them.
+
+**API.** `Node.transferLeadership(target)` on the leader (`error.NotLeader`
+elsewhere — like `propose`, nothing is forwarded; `error.InvalidTarget` for an
+id outside the cluster). `Node.transferee` names the server it is handing over
+to (`no_vote` when none).
+
+- **Proposals are refused while it runs:** `propose` returns
+  `error.ProposalDropped` (etcd/raft `ErrProposalDropped`, raft-rs the same,
+  hashicorp `ErrLeadershipTransferInProgress` — all three refuse). The
+  leader's log stops growing, so the target can catch up with it.
+- **Catch-up first.** If the target's `matchIndex` already equals the leader's
+  last index, `timeout_now` goes at once; otherwise the target is sent an
+  AppendEntries, and `timeout_now` follows the acknowledgement that brings its
+  `matchIndex` to the last index (etcd: in `MsgAppResp`, only on an ack that
+  moved `Match`; a duplicate ack sends nothing). etcd does not re-send a lost
+  `timeout_now`; neither does this node — the transfer is then abandoned.
+- **The target campaigns at once** on `timeout_now` of its own term (a
+  higher term is adopted first): a real election in term + 1, never through
+  PreVote even with `pre_vote` set (etcd: "Leadership transfers never use
+  pre-vote"). A candidate or pre-candidate ignores it (etcd's
+  `stepCandidate`), and so does a stale one.
+- **Its RequestVotes carry a transfer flag** (`message.VoteReq.transfer`,
+  etcd's `campaignTransfer` context, hashicorp's `LeadershipTransfer`), and a
+  receiver honours a flagged RequestVote inside its CheckQuorum lease — the
+  old leader included, which then steps down on it. The vote itself is the
+  kernel's as always (§5.4.1 included); only the lease is lifted.
+- **Abandoned after one election timeout.** The request resets the leader's
+  election-timeout period (etcd: `electionElapsed = 0`); if the node is still
+  leader when it ends (`election_ticks` ticks — the same period the
+  CheckQuorum check uses, which a leader now always counts), the transfer is
+  dropped and proposals are taken again (etcd's `tickHeartbeat`; hashicorp
+  waits `ElectionTimeout` too). Any step-down ends it (etcd's `reset`); a new
+  leader starts with none.
+- **Repeat calls** (etcd): the same target again is a no-op; another target
+  restarts the transfer toward that one; the leader itself cancels a transfer
+  under way.
+
+**Wire.** A new tag, `timeout_now = 0x16` (9 bytes: the tag and the leader's
+term; term 0 and above `max_term` refused, as on every request). The flag is
+an optional 26th byte of `vote_req` (= 1; any other value, or the byte on a
+`pre_vote_req`, is refused — one encoding per message), the codec's
+optional-longer-frame rule as for `append_resp`'s hint; an unflagged
+RequestVote is the 25-byte frame of before. **Upgrade order:** a decoder from
+before 2026-11-18 drops both (undefined tag / wrong length, counted in
+`malformed_dropped`), so a transfer to — or a vote from — an old server
+fails, and the transfer is abandoned after one election timeout. Upgrade
+every server before calling `transferLeadership`; nothing else changes on the
+wire.
+
+**Tests.** `node.zig`: a caught-up target gets `timeout_now` at once, proposals
+are dropped, a repeat call sends nothing, a call for itself cancels, a follower
+cannot transfer, an unknown target is refused; a lagging target is sent its
+missing entries first and `timeout_now` follows exactly the ack that reaches
+the last index (not a partial one, not another follower's, not a duplicate);
+abandoned at `election_ticks` after the request and not one tick before, and
+another target restarts it; a step-down ends it and a new leader starts with
+none; `timeout_now` makes a follower campaign at once with flagged RequestVotes
+and no PreVote, while a stale one, a candidate and a pre-candidate ignore it;
+a flagged RequestVote is honoured inside the lease by a follower and by the
+old leader; an in-memory three-node cluster hands over to node 2 in term 2
+and commits under it. `message.zig`: the flag and `timeout_now` on the wire,
+and every refusal. `server.zig` (netsim, `TransferProbe`): the transfer
+succeeds — node 2 leads term 2, the very next term, and the cluster commits
+under it — with the defaults and with PreVote + CheckQuorum; a target cut away
+for 180 time units is still behind when asked and is caught up first; a
+transfer to a crashed target turns clients away, is abandoned, and the term-1
+leader commits again; a 100-seed fuzzed fault sweep with a transfer every 300
+time units (PreVote + CheckQuorum, ≥ 200 transfers) keeps all five
+invariants. raft-kv gained no command (a client-facing transfer needs a new
+client op and CLI verb — not trivial); its `propose` switch handles
+`error.ProposalDropped`.
 
 ## The positive control
 
@@ -550,7 +632,8 @@ see CHANGELOG for the survivors and the tests they produced.
 **Decision 2026-09-30 (user): stays a poc** — superseded **2026-10-04 (user):
 raise the grade; raft → mvp.** `Node` is the mvp item (a runnable node over
 caller I/O, any cluster size); snapshots, membership change, pre-vote and
-linearizable reads are the core items, still in the Backlog.
+linearizable reads are the core items, still in the Backlog (pre-vote and
+leadership transfer done 2026-11-18).
 
 ## Backlog
 
@@ -581,7 +664,7 @@ linearizable reads are the core items, still in the Backlog.
    is what gives `recordApply` a key that varies.
 5. Log compaction / snapshotting (§7) — out of current scope. (survey 2026-09-30) A user of hashicorp/raft or etcd/raft cannot run without it: the log grows without bound. Effort: large; fits §2.
 6. ~~(survey 2026-09-30) A runnable node outside `netsim`.~~ **Done 2026-10-04** — `Node` (`node.zig`); `example-apps/raft-kv` runs on it.
-7. ◐ PARTIAL 2026-11-18 — PreVote and CheckQuorum done (`Config.pre_vote` / `check_quorum`, off by default as in etcd/raft; § PreVote and CheckQuorum); **leadership transfer still open** (etcd's `MsgTimeoutNow` plus the lease exemption for a transfer campaign). (survey 2026-09-30) Pre-vote and leadership transfer (etcd/raft, openraft): a partitioned node rejoining must not depose a healthy leader. Effort: medium; fits §2.
+7. ✅ DONE 2026-11-18 — PreVote and CheckQuorum (`Config.pre_vote` / `check_quorum`, off by default as in etcd/raft; § PreVote and CheckQuorum) and leadership transfer (`Node.transferLeadership`, `timeout_now`, the flagged RequestVote that lifts the lease; § Leadership transfer). (survey 2026-09-30) Pre-vote and leadership transfer (etcd/raft, openraft): a partitioned node rejoining must not depose a healthy leader. Effort: medium; fits §2.
 8. (survey 2026-09-30) Linearizable reads (ReadIndex / lease): a user of a consensus library expects consistent reads without writing to the log. Effort: medium; fits §2.
 
 9. (review 2026-10-04, M3) A torn-Ready crash fault in the harness: crash a server after it persisted part of a Ready, or after it sent but before `advance`, so the sweep — not only the unit tests — checks the persist-before-send order. Effort: medium.
