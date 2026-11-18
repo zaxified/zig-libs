@@ -122,6 +122,7 @@ test {
     _ = @import("tx_locktime_test.zig");
     _ = @import("consensus_kat_vectors.zig");
     _ = @import("consensus_kat_test.zig");
+    _ = @import("mutation_gap_test.zig");
 }
 
 test "meta.deps names bitcointx, k256, bip340, ripemd160" {

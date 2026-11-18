@@ -164,3 +164,18 @@ test "castToBool: negative zero is falsy, everything else with a set byte is tru
     try testing.expect(castToBool(&.{ 0x00, 0x01 }));
     try testing.expect(castToBool(&.{ 0x00, 0x00, 0x81 })); // -1: non-zero magnitude bit alongside sign
 }
+
+test "decode: a single 0x00 or 0x80 byte is a non-minimal zero" {
+    try testing.expectError(error.NonMinimalEncoding, decode(&.{0x00}, true, 4));
+    try testing.expectError(error.NonMinimalEncoding, decode(&.{0x80}, true, 4));
+    try testing.expectEqual(@as(i64, 0), try decode(&.{0x00}, false, 4));
+    try testing.expectEqual(@as(i64, 0), try decode(&.{0x80}, false, 4));
+    // the sign byte of a multi-byte number is legitimate when the byte below has its top bit set
+    try testing.expectEqual(@as(i64, 128), try decode(&.{ 0x80, 0x00 }, true, 4));
+    try testing.expectEqual(@as(i64, -128), try decode(&.{ 0x80, 0x80 }, true, 4));
+    // little-endian magnitude and the exact bound
+    try testing.expectEqual(@as(i64, 0x0102), try decode(&.{ 0x02, 0x01 }, true, 4));
+    try testing.expectEqual(@as(i64, -0x0102), try decode(&.{ 0x02, 0x81 }, true, 4));
+    try testing.expectEqual(@as(i64, 2147483647), try decode(&.{ 0xff, 0xff, 0xff, 0x7f }, true, 4));
+    try testing.expectError(error.Overflow, decode(&.{ 0, 0, 0, 0, 1 }, true, 4));
+}

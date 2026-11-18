@@ -1265,6 +1265,16 @@ const undecodable_cases = [_]UndecodableCase{
         .expect = &.{0x4b},
         .note = "audit reproducer shape: a bare 0x4b push with fewer than 75 bytes behind it",
     },
+    .{
+        .script = &.{ 0xac, 0x4d, 0x02, 0x00 },
+        .expect = &.{ 0xac, 0x4d, 0x02, 0x00 },
+        .note = "PUSHDATA2 with EXACTLY the 2 prefix bytes left (payload missing): the prefix is read, so it is in the output",
+    },
+    .{
+        .script = &.{ 0xac, 0x4e, 0x05, 0x00, 0x00, 0x00 },
+        .expect = &.{ 0xac, 0x4e, 0x05, 0x00, 0x00, 0x00 },
+        .note = "PUSHDATA4 with EXACTLY the 4 prefix bytes left (payload missing)",
+    },
 };
 
 test "scriptCode: an undecodable tail ends Core's walk, it does not abort the CHECKSIG" {
@@ -1546,4 +1556,280 @@ fn monotonicMs() u64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+// ── whole-module mutation audit 2026-11-17: gaps found by the schemata run ──
+
+fn expectMinimal(opcode: u8, data: []const u8, want: bool) !void {
+    try testing.expectEqual(want, checkMinimalPush(opcode, data));
+}
+
+test "checkMinimalPush: the shortest-push rule at every length boundary" {
+    const big = try testing.allocator.alloc(u8, 65536);
+    defer testing.allocator.free(big);
+    @memset(big, 0xaa);
+    // one byte: 17 is NOT a small-int (OP_1..OP_16 stop at 16), -1 has OP_1NEGATE
+    try expectMinimal(0x01, &.{0x11}, true);
+    try expectMinimal(0x01, &.{0x10}, false);
+    try expectMinimal(0x01, &.{0x81}, false);
+    try expectMinimal(0x4e, &.{0x81}, false); // no push opcode is the OP_1NEGATE form
+    try expectMinimal(0x01, &.{0x00}, true); // 0x00 as DATA is a 1-byte push, not OP_0
+    // a longer push that merely STARTS with 0x81 is an ordinary direct push
+    try expectMinimal(0x02, &.{ 0x81, 0xff }, true);
+    // empty data: OP_0 only
+    try expectMinimal(0x00, &.{}, true);
+    try expectMinimal(0x01, &.{}, false);
+    // direct pushes up to 75, PUSHDATA1 up to 255, PUSHDATA2 up to 65535
+    try expectMinimal(0x4b, big[0..75], true);
+    try expectMinimal(0x4c, big[0..75], false);
+    try expectMinimal(0x4c, big[0..76], true);
+    try expectMinimal(0x4d, big[0..76], false);
+    try expectMinimal(0x4c, big[0..255], true);
+    try expectMinimal(0x4d, big[0..255], false);
+    try expectMinimal(0x4d, big[0..256], true);
+    try expectMinimal(0x4c, big[0..256], false);
+    try expectMinimal(0x4d, big[0..65535], true);
+    try expectMinimal(0x4e, big[0..65535], false);
+    try expectMinimal(0x4e, big[0..65536], true);
+    try expectMinimal(0x4d, big[0..65536], false);
+}
+
+test "canonicalPush: Core's CScript << data, at every length boundary" {
+    const a = testing.allocator;
+    const big = try a.alloc(u8, 65536);
+    defer a.free(big);
+    @memset(big, 0x5c);
+    const Case = struct { len: usize, prefix: []const u8 };
+    const cases = [_]Case{
+        .{ .len = 1, .prefix = &.{0x01} },
+        .{ .len = 75, .prefix = &.{0x4b} },
+        .{ .len = 76, .prefix = &.{ 0x4c, 0x4c } },
+        .{ .len = 255, .prefix = &.{ 0x4c, 0xff } },
+        .{ .len = 256, .prefix = &.{ 0x4d, 0x00, 0x01 } },
+        .{ .len = 65535, .prefix = &.{ 0x4d, 0xff, 0xff } },
+        .{ .len = 65536, .prefix = &.{ 0x4e, 0x00, 0x00, 0x01, 0x00 } },
+    };
+    for (cases) |c| {
+        const got = try canonicalPush(a, big[0..c.len]);
+        defer a.free(got);
+        try testing.expectEqual(c.prefix.len + c.len, got.len);
+        try testing.expectEqualSlices(u8, c.prefix, got[0..c.prefix.len]);
+        try testing.expectEqualSlices(u8, big[0..c.len], got[c.prefix.len..]);
+    }
+}
+
+test "scriptCodeFor: a signature is removed only as its canonical push (all four push shapes)" {
+    const a = testing.allocator;
+    const big = try a.alloc(u8, 300);
+    defer a.free(big);
+    @memset(big, 0x33);
+    for ([_]usize{ 10, 75, 76, 255, 256, 300 }) |n| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const push = try canonicalPush(arena.allocator(), big[0..n]);
+        const script = try std.mem.concat(arena.allocator(), u8, &.{ &[_]u8{0x51}, push, &[_]u8{0xac} });
+        const got = try scriptCodeFor(arena.allocator(), script, 0, .base, ScriptFlags.none, &.{big[0..n]});
+        try testing.expectEqualSlices(u8, &.{ 0x51, 0xac }, got);
+    }
+}
+
+test "findAndDelete: with nothing found the very same script slice comes back" {
+    const script = [_]u8{ 0x51, 0x52, 0x53 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator); // findAndDelete is arena-style
+    defer arena.deinit();
+    const r = try findAndDelete(arena.allocator(), &script, &.{0x99});
+    try testing.expectEqual(@as(usize, 0), r.found);
+    try testing.expect(r.script.ptr == (&script).ptr);
+    try testing.expectEqual(script.len, r.script.len);
+}
+
+test "readInstruction: a PUSHDATA whose prefix is the last thing in the script decodes as an empty push" {
+    const a = try readInstruction(&.{ 0x4d, 0x00, 0x00 }, 0);
+    try testing.expectEqual(@as(usize, 0), a.data.?.len);
+    try testing.expectEqual(@as(usize, 3), a.next);
+    const b = try readInstruction(&.{ 0x4e, 0x00, 0x00, 0x00, 0x00 }, 0);
+    try testing.expectEqual(@as(usize, 0), b.data.?.len);
+    try testing.expectEqual(@as(usize, 5), b.next);
+    // PUSHDATA4 with a 3-byte prefix: 3 bytes are left, 4 are needed
+    try testing.expectError(error.BadOpcode, readInstruction(&.{ 0x4e, 0x00, 0x00, 0x00 }, 0));
+    try testing.expectError(error.BadOpcode, readInstruction(&.{ 0x4d, 0x00 }, 0));
+}
+
+test "scanOpSuccess: an undecodable tail before any OP_SUCCESSx is a hard error" {
+    try testing.expectError(error.BadOpcode, scanOpSuccess(&.{0x4c}));
+    try testing.expectEqual(true, try scanOpSuccess(&.{ 0x51, 0x50 }));
+    try testing.expectEqual(false, try scanOpSuccess(&.{ 0x51, 0x61 }));
+}
+
+fn tapRun(script: []const u8, initial: []const []const u8, weight: i64, flags: ScriptFlags, exec: *ExecData) EvalError!void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stack: Stack = .empty;
+    for (initial) |e| try stack.append(arena.allocator(), e);
+    exec.* = .{ .tapleaf_hash = @as([32]u8, @splat(0)), .validation_weight = weight };
+    return evalTapscript(arena.allocator(), &stack, script, dummyCtx(), flags, exec);
+}
+
+const pk33_check = [_]u8{0x21} ++ @as([33]u8, @splat(0x02));
+
+test "evalTapscript: validation-weight budget lands exactly on zero, one less fails" {
+    var ex: ExecData = undefined;
+    const script = pk33_check ++ [_]u8{0xac};
+    try tapRun(&script, &.{"\x01"}, 50, .{}, &ex);
+    try testing.expectError(error.TapscriptValidationWeight, tapRun(&script, &.{"\x01"}, 49, .{}, &ex));
+    // an empty signature is never charged
+    try tapRun(&script, &.{""}, 0, .{}, &ex);
+}
+
+test "evalTapscript: public key typing (empty is fatal, 33 bytes is an upgrade hook, policy discourages it)" {
+    var ex: ExecData = undefined;
+    try testing.expectError(error.Pubkeytype, tapRun(&.{ 0x00, 0xac }, &.{"\x01"}, 100, .{}, &ex));
+    try testing.expectError(error.Pubkeytype, tapRun(&.{ 0x00, 0xac }, &.{""}, 100, .{}, &ex));
+    const script = pk33_check ++ [_]u8{0xac};
+    try tapRun(&script, &.{"\x01"}, 100, .{}, &ex); // 33-byte key: unknown type, signature "valid"
+    try testing.expectError(error.DiscourageUpgradablePubkeytype, tapRun(&script, &.{"\x01"}, 100, .{ .discourage_upgradable_pubkeytype = true }, &ex));
+    try testing.expectError(error.DiscourageUpgradablePubkeytype, tapRun(&script, &.{""}, 100, .{ .discourage_upgradable_pubkeytype = true }, &ex));
+}
+
+test "evalTapscript: codesep_pos records the OPCODE position of the last executed OP_CODESEPARATOR" {
+    var ex: ExecData = undefined;
+    // OP_1 OP_DROP OP_CODESEPARATOR OP_1 -> position 2
+    try tapRun(&.{ 0x51, 0x75, 0xab, 0x51 }, &.{}, 0, .{}, &ex);
+    try testing.expectEqual(@as(u32, 2), ex.codesep_pos);
+    // an unexecuted OP_CODESEPARATOR leaves it untouched
+    try tapRun(&.{ 0x00, 0x63, 0xab, 0x68, 0x51 }, &.{}, 0, .{}, &ex);
+    try testing.expectEqual(@as(u32, 0xffffffff), ex.codesep_pos);
+    // pushes count as opcode positions too: <1 byte> OP_CODESEPARATOR -> 1
+    try tapRun(&.{ 0x01, 0x07, 0xab, 0x51 }, &.{}, 0, .{}, &ex);
+    try testing.expectEqual(@as(u32, 1), ex.codesep_pos);
+}
+
+test "evalTapscript: CHECKMULTISIG is disabled, CHECKSIGADD needs three elements, MINIMALIF is mandatory" {
+    var ex: ExecData = undefined;
+    try testing.expectError(error.DisabledOpcode, tapRun(&.{ 0x00, 0x00, 0x00, 0xae }, &.{}, 0, .{}, &ex));
+    // unexecuted CHECKMULTISIG is fine
+    try tapRun(&.{ 0x00, 0x63, 0xae, 0x68, 0x51 }, &.{}, 0, .{}, &ex);
+    // [sig] <pk> CHECKSIGADD leaves only two elements: sig, pk
+    const script = pk33_check ++ [_]u8{0xba};
+    try testing.expectError(error.InvalidStackOperation, tapRun(&script, &.{"\x01"}, 100, .{}, &ex));
+    try testing.expectError(error.MinimalIf, tapRun(&.{ 0x52, 0x63, 0x51, 0x68 }, &.{}, 0, .{}, &ex));
+    try testing.expectError(error.MinimalIf, tapRun(&.{ 0x01, 0x00, 0x63, 0x51, 0x68 }, &.{}, 0, .{}, &ex));
+    try tapRun(&.{ 0x51, 0x63, 0x51, 0x68 }, &.{}, 0, .{}, &ex);
+    // the legacy disabled-opcode check is not applied to a tapscript leaf (OP_SUCCESSx is
+    // resolved by the caller's pre-scan): an unexecuted OP_CAT is just skipped,
+    // an executed one is an unknown opcode
+    try tapRun(&.{ 0x00, 0x63, 0x7e, 0x68, 0x51 }, &.{}, 0, .{}, &ex);
+    try testing.expectError(error.BadOpcode, tapRun(&.{0x7e}, &.{}, 0, .{}, &ex));
+}
+
+fn runWith(script: []const u8, sv: SigVersion, flags: ScriptFlags) EvalError!void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stack: Stack = .empty;
+    return eval(arena.allocator(), &stack, script, dummyCtx(), sv, flags);
+}
+
+test "conditionals: reserved VERIF/VERNOTIF fail even unexecuted; nested unexecuted IF pops nothing" {
+    try testing.expectError(error.BadOpcode, run(&.{ 0x00, 0x63, 0x65, 0x68 }));
+    try testing.expectError(error.BadOpcode, run(&.{ 0x00, 0x63, 0x66, 0x68 }));
+    // 0 IF 1 IF 2 ENDIF ENDIF 3 leaves exactly the 3
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stack: Stack = .empty;
+    try eval(arena.allocator(), &stack, &.{ 0x00, 0x63, 0x51, 0x63, 0x52, 0x68, 0x68, 0x53 }, dummyCtx(), .base, ScriptFlags.none);
+    try testing.expectEqual(@as(usize, 1), stack.items.len);
+    try testing.expectEqualSlices(u8, &.{3}, stack.items[0]);
+}
+
+test "OP_CODESEPARATOR policy (const_scriptcode) applies to legacy scripts only" {
+    try runWith(&.{ 0xab, 0x51 }, .witness_v0, .{ .const_scriptcode = true });
+    try testing.expectError(error.OpCodeseparator, runWith(&.{ 0xab, 0x51 }, .base, .{ .const_scriptcode = true }));
+    try runWith(&.{ 0xab, 0x51 }, .base, ScriptFlags.none);
+}
+
+test "limits: exactly at the bound passes (10000 octets, 1000 elements, 201 non-push opcodes, OP_16 is a push)" {
+    const a = testing.allocator;
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(a);
+    var i: usize = 0;
+    while (i < 19) : (i += 1) {
+        try big.appendSlice(a, &.{ 0x4d, 0x08, 0x02 });
+        try big.appendNTimes(a, 0xaa, 520);
+    }
+    try big.append(a, 62);
+    try big.appendNTimes(a, 0xaa, 62);
+    try testing.expectEqual(@as(usize, limits.max_script_size), big.items.len);
+    try runWith(big.items, .base, ScriptFlags.none);
+    try big.append(a, 0x61);
+    try testing.expectError(error.ScriptSize, runWith(big.items, .base, ScriptFlags.none));
+
+    var ones: std.ArrayList(u8) = .empty;
+    defer ones.deinit(a);
+    try ones.appendNTimes(a, 0x51, limits.max_stack_size);
+    try runWith(ones.items, .base, ScriptFlags.none);
+    try ones.append(a, 0x51);
+    try testing.expectError(error.StackSize, runWith(ones.items, .base, ScriptFlags.none));
+
+    // OP_1..OP_16 are not metered; 250 of them stay far below the stack bound
+    var sixteens: std.ArrayList(u8) = .empty;
+    defer sixteens.deinit(a);
+    try sixteens.appendNTimes(a, 0x60, 250);
+    try runWith(sixteens.items, .base, ScriptFlags.none);
+    // exactly 201 metered opcodes pass, 202 do not
+    var nops: std.ArrayList(u8) = .empty;
+    defer nops.deinit(a);
+    try nops.appendNTimes(a, 0x61, limits.max_ops_per_script);
+    try runWith(nops.items, .base, ScriptFlags.none);
+    try nops.append(a, 0x61);
+    try testing.expectError(error.OpCount, runWith(nops.items, .base, ScriptFlags.none));
+    // a tapscript leaf has neither the size nor the op-count bound
+    var ex: ExecData = undefined;
+    try tapRun(nops.items, &.{}, 0, .{}, &ex);
+}
+
+fn lockCtx(a: Allocator, version: i32, locktime: u32, sequence: u32) !TxContext {
+    const vin = try a.alloc(bitcointx.TxIn, 1);
+    vin[0] = .{ .prevout = .{ .txid = @as([32]u8, @splat(0)), .vout = 0 }, .script_sig = &.{}, .sequence = sequence };
+    return .{
+        .tx = .{ .version = version, .vin = vin, .vout = &.{}, .witness = &.{}, .locktime = locktime, .has_witness = false },
+        .input_index = 0,
+        .spent_outputs = &.{},
+    };
+}
+
+fn runLock(script: []const u8, ctx: TxContext, flags: ScriptFlags) EvalError!void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stack: Stack = .empty;
+    return eval(arena.allocator(), &stack, script, ctx, .base, flags);
+}
+
+test "CLTV / CSV: operand typing, policy NOPs, disable flags and the 16-bit mask" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cltv: ScriptFlags = .{ .checklocktimeverify = true };
+    const csv: ScriptFlags = .{ .checksequenceverify = true };
+    // inactive opcodes are NOP2/NOP3, which the upgradable-NOP policy rejects
+    try testing.expectError(error.DiscourageUpgradableNops, runLock(&.{ 0x51, 0xb1 }, try lockCtx(a, 1, 0, 0), .{ .discourage_upgradable_nops = true }));
+    try testing.expectError(error.DiscourageUpgradableNops, runLock(&.{ 0x51, 0xb2 }, try lockCtx(a, 1, 0, 0), .{ .discourage_upgradable_nops = true }));
+    // non-minimal / over-long operands are UNKNOWN_ERROR, not a locktime error
+    var minimal = cltv;
+    minimal.minimaldata = true;
+    const nonmin = [_]u8{ 0x02, 0x05, 0x00, 0xb1 };
+    try runLock(&nonmin, try lockCtx(a, 1, 10, 0), cltv);
+    try testing.expectError(error.UnknownError, runLock(&nonmin, try lockCtx(a, 1, 10, 0), minimal));
+    try testing.expectError(error.UnknownError, runLock(&.{ 0x06, 1, 2, 3, 4, 5, 6, 0xb1 }, try lockCtx(a, 1, 10, 0), cltv));
+    var csv_min = csv;
+    csv_min.minimaldata = true;
+    const nonmin_csv = [_]u8{ 0x02, 0x05, 0x00, 0xb2 };
+    try runLock(&nonmin_csv, try lockCtx(a, 2, 0, 9), csv);
+    try testing.expectError(error.UnknownError, runLock(&nonmin_csv, try lockCtx(a, 2, 0, 9), csv_min));
+    try testing.expectError(error.UnknownError, runLock(&.{ 0x06, 1, 2, 3, 4, 5, 6, 0xb2 }, try lockCtx(a, 2, 0, 9), csv));
+    // CSV: the input's own disable flag rejects, the 16-bit mask includes bit 15
+    try runLock(&.{ 0x51, 0xb2 }, try lockCtx(a, 2, 0, 1), csv);
+    try testing.expectError(error.UnsatisfiedLocktime, runLock(&.{ 0x51, 0xb2 }, try lockCtx(a, 2, 0, 0x80000001), csv));
+    const arg_8000 = [_]u8{ 0x03, 0x00, 0x80, 0x00, 0xb2 };
+    try testing.expectError(error.UnsatisfiedLocktime, runLock(&arg_8000, try lockCtx(a, 2, 0, 1), csv));
+    try runLock(&arg_8000, try lockCtx(a, 2, 0, 0x8000), csv);
 }

@@ -37,7 +37,7 @@ const ScriptFlags = flags_mod.ScriptFlags;
 /// tapscript *policy* discourage-flags OFF (so consensus-valid upgrade hooks
 /// / OP_SUCCESS / unknown pubkeys behave as consensus dictates, not as
 /// standardness would reject them).
-const consensus_taproot: ScriptFlags = .{
+pub const consensus_taproot: ScriptFlags = .{
     .p2sh = true,
     .witness = true,
     .taproot = true,
@@ -49,7 +49,7 @@ const consensus_taproot: ScriptFlags = .{
     .cleanstack = true,
 };
 
-fn keypair(seed: u8) !struct { sk: bip340.SecretKey, x: [32]u8 } {
+pub fn keypair(seed: u8) !struct { sk: bip340.SecretKey, x: [32]u8 } {
     const sk = try bip340.SecretKey.fromBytes(@as([32]u8, @splat(seed)));
     var kp: bip340.KeyPair = undefined;
     try bip340.KeyPair.fromSecretKey(&kp, &sk);
@@ -60,7 +60,7 @@ fn keypair(seed: u8) !struct { sk: bip340.SecretKey, x: [32]u8 } {
 /// internal key + Merkle root, returning its x-only serialization and
 /// y-parity. Mirrors `tapscript.verifyCommitment`'s derivation (that
 /// derivation is itself validated against external BIP341 vectors).
-fn taprootOutput(internal_x: [32]u8, merkle_root: [32]u8) struct { q: [32]u8, parity: u8 } {
+pub fn taprootOutput(internal_x: [32]u8, merkle_root: [32]u8) struct { q: [32]u8, parity: u8 } {
     var th = bip340.hash.taggedHasher("TapTweak");
     th.update(&internal_x);
     th.update(&merkle_root);
@@ -72,7 +72,7 @@ fn taprootOutput(internal_x: [32]u8, merkle_root: [32]u8) struct { q: [32]u8, pa
     return .{ .q = aff.x.toBytes(.big), .parity = if (aff.y.isOdd()) 1 else 0 };
 }
 
-const Setup = struct {
+pub const Setup = struct {
     script_pubkey: [34]u8,
     control_block: [33]u8,
     tapleaf_hash: [32]u8,
@@ -84,7 +84,7 @@ const Setup = struct {
 /// Build a single-leaf taproot output committing to `script` (leaf version
 /// 0xc0), and a spending transaction for it. Returns everything needed to
 /// assemble a witness and compute the tapscript sighash.
-fn buildSingleLeaf(a: std.mem.Allocator, internal_x: [32]u8, script: []const u8) !Setup {
+pub fn buildSingleLeaf(a: std.mem.Allocator, internal_x: [32]u8, script: []const u8) !Setup {
     const leaf_hash = tapscript.tapleafHash(0xc0, script);
     const out = taprootOutput(internal_x, leaf_hash); // single leaf: merkle root == leaf hash
 
@@ -120,7 +120,7 @@ fn buildSingleLeaf(a: std.mem.Allocator, internal_x: [32]u8, script: []const u8)
     };
 }
 
-fn signLeaf(a: std.mem.Allocator, sk: bip340.SecretKey, s: *const Setup, aux: u8) ![64]u8 {
+pub fn signLeaf(a: std.mem.Allocator, sk: bip340.SecretKey, s: *const Setup, aux: u8) ![64]u8 {
     var exec: tapscript.ExecData = .{ .tapleaf_hash = s.tapleaf_hash, .codesep_pos = 0xffffffff };
     const sighash = try tapscript.sighash(a, s.tx, 0, tapscript.SIGHASH_DEFAULT, s.spent, &exec);
     const io: std.Io = undefined;

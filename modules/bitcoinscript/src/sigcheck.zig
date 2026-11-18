@@ -105,33 +105,69 @@ fn normalizeToFieldBytes(bytes: []const u8) ?[32]u8 {
     return out;
 }
 
-fn parseDerLoose(der: []const u8) ?RS {
-    if (der.len < 8) return null;
-    if (der[0] != 0x30) return null;
-    var idx: usize = 1;
-    if (idx >= der.len) return null;
-    const seq_len = der[idx];
-    idx += 1;
-    if (seq_len & 0x80 != 0) return null; // long-form length: never valid for a sig-sized DER blob
-    if (idx + seq_len > der.len) return null;
-    if (idx >= der.len or der[idx] != 0x02) return null;
-    idx += 1;
-    if (idx >= der.len) return null;
-    const rlen = der[idx];
-    idx += 1;
-    if (rlen & 0x80 != 0) return null;
-    if (idx + rlen > der.len) return null;
-    const rbytes = der[idx .. idx + rlen];
-    idx += rlen;
-    if (idx >= der.len or der[idx] != 0x02) return null;
-    idx += 1;
-    if (idx >= der.len) return null;
-    const slen = der[idx];
-    idx += 1;
-    if (slen & 0x80 != 0) return null;
-    if (idx + slen > der.len) return null;
-    const sbytes = der[idx .. idx + slen];
+/// Reads one lax DER INTEGER at `der[pos.*..]` (Bitcoin Core `pubkey.cpp`
+/// `ecdsa_signature_parse_der_lax`, the `R` / `S` blocks): tag `0x02`, then a
+/// length that is either short-form or long-form (`0x80 | n` followed by `n`
+/// big-endian length bytes, of which leading zero bytes are skipped and at most
+/// three significant ones may remain); the content must lie inside `der`.
+/// Returns the content bytes (not yet trimmed) and advances `pos` past them.
+fn readLaxInteger(der: []const u8, pos: *usize) ?[]const u8 {
+    var p = pos.*;
+    if (p == der.len or der[p] != 0x02) return null;
+    p += 1;
+    if (p == der.len) return null;
+    var lenbyte: usize = der[p];
+    p += 1;
+    var len: usize = undefined;
+    if (lenbyte & 0x80 != 0) {
+        lenbyte -= 0x80;
+        if (lenbyte > der.len - p) return null;
+        while (lenbyte > 0 and der[p] == 0) {
+            p += 1;
+            lenbyte -= 1;
+        }
+        if (lenbyte >= 4) return null;
+        len = 0;
+        while (lenbyte > 0) {
+            len = (len << 8) + der[p];
+            p += 1;
+            lenbyte -= 1;
+        }
+    } else {
+        len = lenbyte;
+    }
+    if (len > der.len - p) return null;
+    const out = der[p .. p + len];
+    pos.* = p + len;
+    return out;
+}
 
+/// Bitcoin Core's LAX DER parser (`ecdsa_signature_parse_der_lax`), which
+/// `CPubKey::Verify` applies to every signature that no flag forced through
+/// the strict BIP66 check — historic blocks hold signatures only this parser
+/// accepts, so a consensus engine run WITHOUT `dersig` must accept the same
+/// set. What it accepts beyond strict DER: long-form lengths anywhere, a
+/// sequence length byte that is never checked against the data, integers with
+/// any number of leading zero bytes and no sign padding (R and S are read as
+/// unsigned), and trailing bytes after S. What it rejects: a wrong tag, a
+/// length that overruns the input, a long-form length with 4 or more
+/// significant bytes, and an R or S that is longer than 32 bytes once leading
+/// zeros are trimmed (Core turns that into the all-zero, never-valid signature;
+/// here it is `null`, which callers treat as "does not verify").
+fn parseDerLoose(der: []const u8) ?RS {
+    var pos: usize = 0;
+    if (pos == der.len or der[pos] != 0x30) return null;
+    pos += 1;
+    if (pos == der.len) return null;
+    var lenbyte: usize = der[pos];
+    pos += 1;
+    if (lenbyte & 0x80 != 0) {
+        lenbyte -= 0x80;
+        if (lenbyte > der.len - pos) return null;
+        pos += lenbyte; // the sequence length is skipped, never checked
+    }
+    const rbytes = readLaxInteger(der, &pos) orelse return null;
+    const sbytes = readLaxInteger(der, &pos) orelse return null;
     const r = normalizeToFieldBytes(rbytes) orelse return null;
     const s = normalizeToFieldBytes(sbytes) orelse return null;
     return .{ .r = r, .s = s };
@@ -362,4 +398,186 @@ test "checkEcdsaSig: empty signature verifies false with no allocation and no er
     const ok = try checkEcdsaSig(fail_alloc.allocator(), &.{}, &(@as([33]u8, @splat(0x02))), &.{}, ctx, .base, ScriptFlags.none);
     try testing.expect(!ok);
     _ = &t;
+}
+
+// ── whole-module mutation audit 2026-11-17 ───────────────────────────────
+
+fn rsOf(r: u8, s: u8) RS {
+    var out: RS = .{ .r = @as([32]u8, @splat(0)), .s = @as([32]u8, @splat(0)) };
+    out.r[31] = r;
+    out.s[31] = s;
+    return out;
+}
+
+test "isValidSignatureEncoding: BIP66 length rules at their edges" {
+    // minimal valid shapes: R = 0 and S = 0 are structurally fine (one byte each)
+    try testing.expect(isValidSignatureEncoding(&.{ 0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01, 0x01 }));
+    try testing.expect(isValidSignatureEncoding(&.{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x01 }));
+    // a 74-byte element (R 34 bytes, S 33 bytes, both validly padded) is one too long
+    var long: [74]u8 = undefined;
+    long[0] = 0x30;
+    long[1] = 71;
+    long[2] = 0x02;
+    long[3] = 34;
+    long[4] = 0x00;
+    long[5] = 0x80;
+    @memset(long[6..38], 0x11);
+    long[38] = 0x02;
+    long[39] = 33;
+    long[40] = 0x00;
+    long[41] = 0x80;
+    @memset(long[42..73], 0x22);
+    long[73] = 0x01;
+    try testing.expect(!isValidSignatureEncoding(&long));
+    // the DER total-length byte must match
+    var sig: [71]u8 = undefined;
+    sig[0] = 0x30;
+    sig[1] = 68;
+    sig[2] = 0x02;
+    sig[3] = 32;
+    @memset(sig[4..36], 0x11);
+    sig[36] = 0x02;
+    sig[37] = 32;
+    @memset(sig[38..70], 0x22);
+    sig[70] = 0x01;
+    try testing.expect(isValidSignatureEncoding(&sig));
+    sig[1] = 67;
+    try testing.expect(!isValidSignatureEncoding(&sig));
+    sig[1] = 68;
+    // a declared R length that runs to / past the end of the element
+    try testing.expect(!isValidSignatureEncoding(&.{ 0x30, 0x06, 0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 }));
+    try testing.expect(!isValidSignatureEncoding(&.{ 0x30, 0x07, 0x02, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 }));
+}
+
+test "parseDerLoose: Bitcoin Core's lax DER parser, rule by rule" {
+    const t = rsOf;
+    // canonical shape
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07 }).?);
+    // the sequence length byte is never checked: too long, too short, zero
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x7f, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07 }).?);
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x00, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07 }).?);
+    // a long-form sequence length: its bytes are skipped whatever they hold
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x81, 0xee, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07 }).?);
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x82, 0x01, 0x02, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07 }).?);
+    // ... but they must be present
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x84, 0x00, 0x00, 0x00 }));
+    // long-form integer lengths, with and without leading zero length bytes
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x0a, 0x02, 0x81, 0x01, 0x05, 0x02, 0x81, 0x01, 0x07 }).?);
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x0a, 0x02, 0x83, 0x00, 0x00, 0x01, 0x05, 0x02, 0x82, 0x00, 0x01, 0x07 }).?);
+    // a long-form length with 4 significant bytes is refused (Core: lenbyte >= 4), 3 are fine
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x0a, 0x02, 0x84, 0x01, 0x00, 0x00, 0x00, 0x05 }));
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x0a, 0x02, 0x01, 0x05, 0x02, 0x84, 0x01, 0x00, 0x00, 0x00, 0x07 }));
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x00, 0x02, 0x83, 0x00, 0x00, 0x01, 0x05, 0x02, 0x01, 0x07 }).?);
+    // a long-form length byte count that runs past the input
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x00, 0x02, 0x82, 0x01 }));
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x00, 0x02, 0x01, 0x05, 0x02, 0x82, 0x01 }));
+    // trailing bytes after S, leading zeros on either integer, no sign padding
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07, 0xde, 0xad }).?);
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x08, 0x02, 0x03, 0x00, 0x00, 0x05, 0x02, 0x02, 0x00, 0x07 }).?);
+    const hi = parseDerLoose(&.{ 0x30, 0x06, 0x02, 0x01, 0xff, 0x02, 0x01, 0x80 }).?; // "negative" values read as unsigned
+    try testing.expectEqual(@as(u8, 0xff), hi.r[31]);
+    try testing.expectEqual(@as(u8, 0x80), hi.s[31]);
+    // an empty R or S is the value zero
+    try testing.expectEqual(t(0, 7), parseDerLoose(&.{ 0x30, 0x04, 0x02, 0x00, 0x02, 0x01, 0x07 }).?);
+    // 32 significant bytes fit, 33 overflow
+    var buf: [6 + 33 + 3]u8 = undefined;
+    buf[0] = 0x30;
+    buf[1] = 0x00;
+    buf[2] = 0x02;
+    buf[3] = 33;
+    @memset(buf[4..37], 0x01);
+    buf[37] = 0x02;
+    buf[38] = 0x01;
+    buf[39] = 0x07;
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(buf[0..40]));
+    buf[3] = 32;
+    @memset(buf[4..36], 0x01);
+    buf[36] = 0x02;
+    buf[37] = 0x01;
+    buf[38] = 0x07;
+    try testing.expect(parseDerLoose(buf[0..39]) != null);
+    // wrong tags and every kind of truncation
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x31, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07 }));
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x06, 0x03, 0x01, 0x05, 0x02, 0x01, 0x07 }));
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x06, 0x02, 0x01, 0x05, 0x03, 0x01, 0x07 }));
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x06, 0x02, 0x09, 0x05, 0x02, 0x01, 0x07 })); // R overruns
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x09, 0x07 })); // S overruns
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x02, 0x07 })); // S one short
+    try testing.expectEqual(t(5, 7), parseDerLoose(&.{ 0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07 }).?);
+    const whole = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x07 };
+    var n: usize = 0;
+    while (n < whole.len) : (n += 1) try testing.expectEqual(@as(?RS, null), parseDerLoose(whole[0..n]));
+    // R exactly fills the input: no room for S
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x00, 0x02, 0x01, 0x05 }));
+}
+
+test "isLowS: lax parse, unparsable is not low, oversized integers are not low" {
+    var sig: [70]u8 = undefined;
+    sig[0] = 0x30;
+    sig[1] = 68;
+    sig[2] = 0x02;
+    sig[3] = 32;
+    @memset(sig[4..36], 0x01);
+    sig[36] = 0x02;
+    sig[37] = 32;
+    std.mem.writeInt(u256, sig[38..70], 5, .big);
+    try testing.expect(isLowS(&sig));
+    try testing.expect(!isLowS("abc"));
+    try testing.expect(!isLowS(&.{}));
+    // S with 33 significant bytes
+    var wide: [8 + 33]u8 = undefined;
+    @memcpy(wide[0..8], &[_]u8{ 0x30, 0x00, 0x02, 0x01, 0x01, 0x02, 33, 0x01 });
+    @memset(wide[7..], 0x01);
+    try testing.expect(!isLowS(&wide));
+}
+
+test "pubkey shape predicates reject over-long keys" {
+    var k66: [66]u8 = @splat(0x11);
+    k66[0] = 0x04;
+    try testing.expect(!isCompressedOrUncompressedPubkey(&k66));
+    var k34: [34]u8 = @splat(0x11);
+    k34[0] = 0x02;
+    try testing.expect(!isCompressedPubkey(&k34));
+    try testing.expect(!isCompressedOrUncompressedPubkey(&k34));
+}
+
+test "checkSignatureEncoding / checkPubkeyEncoding: each flag gates exactly its own rule" {
+    const garbage = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    // DER shape is demanded by dersig, low_s and strictenc each on its own
+    try testing.expectError(error.SigDer, checkSignatureEncoding(&garbage, garbage[0..11], 12, .{ .low_s = true }));
+    try testing.expectError(error.SigDer, checkSignatureEncoding(&garbage, garbage[0..11], 12, .{ .dersig = true }));
+    try testing.expectError(error.SigDer, checkSignatureEncoding(&garbage, garbage[0..11], 12, .{ .strictenc = true }));
+    try checkSignatureEncoding(&garbage, garbage[0..11], 12, .{});
+    // hashtype is only checked under strictenc
+    const der = [_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00 };
+    try checkSignatureEncoding(&der, der[0..8], 0x00, .{ .dersig = true });
+    try checkSignatureEncoding(&der, der[0..8], 0x00, .{});
+    try testing.expectError(error.SigHashtype, checkSignatureEncoding(&der, der[0..8], 0x00, .{ .strictenc = true }));
+    // an uncompressed key is fine under strictenc, and under the witness rule only in witness v0
+    var unc: [65]u8 = @splat(0x22);
+    unc[0] = 0x04;
+    try checkPubkeyEncoding(&unc, .base, .{ .strictenc = true });
+    try checkPubkeyEncoding(&unc, .base, .{ .witness_pubkeytype = true });
+    try testing.expectError(error.Pubkeytype, checkPubkeyEncoding(&unc, .witness_v0, .{ .witness_pubkeytype = true }));
+    try checkPubkeyEncoding(&unc, .witness_v0, .{});
+    var hybrid = unc;
+    hybrid[0] = 0x06;
+    try testing.expectError(error.Pubkeytype, checkPubkeyEncoding(&hybrid, .base, .{ .strictenc = true }));
+}
+
+test "parseDerLoose: long-form lengths at their exact fits and with 2- and 3-byte values" {
+    // the S length bytes are the last bytes of the input: a zero-length S, accepted by Core
+    try testing.expectEqual(rsOf(5, 0), parseDerLoose(&.{ 0x30, 0x00, 0x02, 0x01, 0x05, 0x02, 0x81, 0x00 }).?);
+    // the zero skip stops at the declared number of length bytes, not at the next non-zero byte
+    try testing.expectEqual(@as(?RS, null), parseDerLoose(&.{ 0x30, 0x00, 0x02, 0x81, 0x00, 0x00 }));
+    // multi-byte lengths are big-endian (0x0102 = 258, 0x010000 = 65536)
+    inline for (.{ .{ 258, &[_]u8{ 0x82, 0x01, 0x02 } }, .{ 65536, &[_]u8{ 0x83, 0x01, 0x00, 0x00 } } }) |c| {
+        const buf = try testing.allocator.alloc(u8, 3 + c[1].len + c[0] + 3);
+        defer testing.allocator.free(buf);
+        @memset(buf, 0);
+        @memcpy(buf[0..3], &[_]u8{ 0x30, 0x00, 0x02 });
+        @memcpy(buf[3..][0..c[1].len], c[1]);
+        @memcpy(buf[buf.len - 3 ..], &[_]u8{ 0x02, 0x01, 0x07 });
+        try testing.expectEqual(rsOf(0, 7), parseDerLoose(buf).?);
+    }
 }
