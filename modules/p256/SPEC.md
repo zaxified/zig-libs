@@ -381,7 +381,7 @@ there are no GLV constants to own here.
     § Constant-time contract note of 2026-11-18). The fix's delta mutants: 401/404
     (the keep bit ignoring the high word/carry) are killed by the portable tests,
     402 (the borrow without `blackBox`) brings the `jae` back (`secpt` +1 at
-    field.zig:263). 403 (`hi` without `blackBox`, not measured separately) and
+    field.zig:263). 403 (`hi` without `blackBox`; measured alone 2026-11-18 with CTGRIND_CPU=x86_64: secpt stays at 1, no context) and
     405/406 (`Fe.add`'s two flags) are unobservable: both together are the pre-fix
     `Fe.add`, which showed no context on the portable baseline.
   - The ctgrind kills: the comb gather turned into a branch, the windowed digit select
