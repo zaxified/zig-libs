@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Whole-module mutation of `src/root.zig` (368 mutants, 343 killed, 25 EQUIVALENT / UNOBSERVABLE, each argued in SPEC.md; card now carries whole-module counts). Tests only: the test response builder gained knobs (CertID hash, decoy entries, pluggable signer, raw single / status / responses, version / trailer / critical extension, signed identifier flips) and about 20 tests were added to `ocsp_test.zig` plus 2 private-function tests to `root.zig`. No behaviour change, no source change outside tests.
+
 - **2026-11-16** — ADDED (additive): `buildRequests` (one `OCSPRequest` with several `Request`s), `verifyMany` (several `CertPair`s looked up in one response; per pair a `CertOutcome`: `.verdict`, `.absent` or `.failed: VerifyError`; new `CertPair`, `CertOutcome`, `VerifyManyError`). `verify` / `buildRequest` behave and encode as before (`verify`'s steps are now shared private helpers).
 - **2026-11-16** — Ed25519 responder signatures (id-Ed25519, OID 1.3.101.112) for both the response signature and a delegated responder certificate's issuer signature; the responder key must be Ed25519 and the signature algorithm must agree, otherwise `UnsupportedSignatureAlgorithm`. Previously every Ed25519 response was `UnsupportedSignatureAlgorithm`. No external vector (round trips with in-test keys).
 

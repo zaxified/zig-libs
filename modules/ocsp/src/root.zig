@@ -1480,3 +1480,42 @@ test "derToRawN: P-384-sized encodings DER forbids are refused" {
     try std.testing.expect(p256.sign.derToRawN(48, &long_form) == null);
     inside[1] = 0; // silence "never mutated"
 }
+
+fn testUtc(s: []const u8) Malformed!i64 {
+    var buf: [32]u8 = undefined;
+    buf[0] = 0x17;
+    buf[1] = @intCast(s.len);
+    @memcpy(buf[2..][0..s.len], s);
+    const bytes = buf[0 .. 2 + s.len];
+    return parseCertTime(bytes, try el(bytes, 0));
+}
+
+test "time parsing: field order, the 1950..2049 window, the terminator, every digit" {
+    const eq = std.testing.expectEqual;
+    // 2025-02-15 13:45:27 UTC: every field different, none interchangeable.
+    try eq(@as(i64, 1739627127), try testUtc("250215134527Z"));
+    try eq(@as(i64, 1739627127), try parseGeneralizedTime("20250215134527Z"));
+    // The RFC 5280 window: 49 is 2049, 50 is 1950.
+    try eq(@as(i64, 2524607999), try testUtc("491231235959Z"));
+    try eq(@as(i64, -631152000), try testUtc("500101000000Z"));
+    // Digits 0 and 9 in every position are digits; ':' (the byte after '9') is not.
+    try eq(@as(i64, 1757408949), try parseGeneralizedTime("20250909090909Z"));
+    try std.testing.expectError(error.Malformed, parseGeneralizedTime("2025:215134527Z"));
+    try std.testing.expectError(error.Malformed, parseGeneralizedTime("2025021513452:Z"));
+    try std.testing.expectError(error.Malformed, parseGeneralizedTime("/0250215134527Z"));
+    // The terminator and the lengths.
+    try std.testing.expectError(error.Malformed, testUtc("250215134527X"));
+    try std.testing.expectError(error.Malformed, testUtc("25021513452Z"));
+    try std.testing.expectError(error.Malformed, parseGeneralizedTime("20250215134527X"));
+    try std.testing.expectError(error.Malformed, parseGeneralizedTime("2025021513452Z"));
+    // Not a time type at all.
+    const not_time = "\x04\x0d250215134527Z";
+    try std.testing.expectError(error.Malformed, parseCertTime(not_time, try el(not_time, 0)));
+}
+
+test "daysFromCivil: a month past 14 wraps within the year, as it always did" {
+    const eq = std.testing.expectEqual;
+    try eq(daysFromCivil(2025, 3, 1), daysFromCivil(2025, 15, 1));
+    try eq(daysFromCivil(2025, 12, 31) + 1, daysFromCivil(2026, 1, 1));
+    try eq(@as(i64, 1740787200), ymdhmsToUnix(2025, 3, 1, 0, 0, 0));
+}
