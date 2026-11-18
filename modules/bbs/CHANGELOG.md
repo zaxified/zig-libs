@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** `burn.WipeAllocator` is replaced by the shared `wipealloc` module's `WipingAllocator` (same code; new dependency `wipealloc`); the stack-burn helpers in `burn.zig` are unchanged. The moved code has its own whole-module mutation run (8/8 killed).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `strRepeat` helper is now `inline fn` (a non-inline call made the `++` result a dangling stack temporary).

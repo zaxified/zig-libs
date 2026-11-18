@@ -23,7 +23,7 @@ const linux = std.os.linux;
 const root = @import("root.zig");
 const conf = @import("conf.zig");
 const hs = @import("handshake.zig");
-const wipe = @import("wipe.zig");
+const wipealloc = @import("wipealloc");
 const burn = @import("burn.zig");
 
 const Allocator = std.mem.Allocator;
@@ -389,7 +389,7 @@ pub const Client = struct {
 
     fn setOverFd(c: *Client, fd: i32, cfg: *const Config, deadline: Deadline) ClientError!void {
         // The text holds the keys: built in blocks that are wiped when released.
-        var wa = wipe.WipingAllocator.init(c.gpa);
+        var wa = wipealloc.WipingAllocator.init(c.gpa);
         var text: std.Io.Writer.Allocating = .init(wa.allocator());
         defer text.deinit();
         writeSet(&text.writer, cfg) catch |err| return switch (err) {

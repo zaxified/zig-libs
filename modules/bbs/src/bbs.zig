@@ -46,6 +46,7 @@ const cs = @import("ciphersuite.zig");
 const keys = @import("keys.zig");
 const gate = @import("gate.zig");
 const burn = @import("burn.zig");
+const wipealloc = @import("wipealloc");
 const bls = @import("bls12_381");
 
 pub const G1 = cs.G1;
@@ -510,14 +511,14 @@ pub fn Scheme(comptime Suite: type) type {
         ///
         /// `sk` comes in by pointer. The body runs one frame down and the stack
         /// it dirtied (`SK`, the message scalars, `e`, `1/(SK+e)`) is zeroed
-        /// after it; the heap scratch goes through a `WipeAllocator`
+        /// after it; the heap scratch goes through a `wipealloc.WipingAllocator`
         /// (`burn.zig`).
         pub fn sign(allocator: std.mem.Allocator, sk: *const SecretKey, pk: PublicKey, header: []const u8, messages: []const []const u8) BbsError![Signature.encoded_bytes]u8 {
             return burn.run(burn.sign_burn, BbsError![Signature.encoded_bytes]u8, signBody, .{ allocator, sk, pk, header, messages });
         }
 
         fn signBody(backing: std.mem.Allocator, sk: *const SecretKey, pk: PublicKey, header: []const u8, messages: []const []const u8) BbsError![Signature.encoded_bytes]u8 {
-            var wipe: burn.WipeAllocator = .{ .child = backing };
+            var wipe: wipealloc.WipingAllocator = .{ .child = backing };
             const allocator = wipe.allocator();
             const message_scalars = try Suite.messagesToScalars(allocator, messages);
             defer allocator.free(message_scalars);
@@ -647,7 +648,7 @@ pub fn Scheme(comptime Suite: type) type {
         /// `random_scalars` is the caller's, who wipes it afterwards. The body
         /// runs one frame down and the stack it dirtied (the blinding scalars,
         /// `r3`, the undisclosed messages' scalars) is zeroed after it; the
-        /// heap scratch goes through a `WipeAllocator`, only the returned
+        /// heap scratch goes through a `wipealloc.WipingAllocator`, only the returned
         /// proof is allocated from `allocator` itself (`burn.zig`).
         pub fn proofGen(
             allocator: std.mem.Allocator,
@@ -672,7 +673,7 @@ pub fn Scheme(comptime Suite: type) type {
             disclosed_indexes: []const usize,
             random_scalars: []const Fr,
         ) BbsError![]u8 {
-            var wipe: burn.WipeAllocator = .{ .child = out_allocator };
+            var wipe: wipealloc.WipingAllocator = .{ .child = out_allocator };
             const allocator = wipe.allocator();
             if (disclosed_indexes.len > messages.len) return error.TooManyDisclosedIndexes;
             for (disclosed_indexes) |i| if (i >= messages.len) return error.DisclosedIndexOutOfRange;

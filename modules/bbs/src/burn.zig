@@ -10,8 +10,8 @@
 //!
 //! The heap that held secrets (the message scalars `sign` and `proofGen` map
 //! the messages to, the `SK || msgs` hash input as it grows) is handed a
-//! `WipeAllocator`: every buffer is zeroed before it goes back to the caller's
-//! allocator.
+//! `wipealloc.WipingAllocator`: every buffer is zeroed before it goes back to the
+//! caller's allocator.
 
 const std = @import("std");
 
@@ -39,45 +39,6 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     stack(n);
     return r;
 }
-
-/// An allocator that zeroes every buffer before giving it back to `child`.
-/// `resize`/`remap` refuse, so a buffer never moves or shrinks unwiped: the
-/// caller falls back to alloc + copy + free, and the old buffer is wiped by
-/// `free`. `sign` and `proofGen` only allocate and free (their `ArrayList`
-/// grows by alloc + copy + free).
-pub const WipeAllocator = struct {
-    child: std.mem.Allocator,
-
-    pub fn allocator(self: *WipeAllocator) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *WipeAllocator = @ptrCast(@alignCast(ctx));
-        return self.child.rawAlloc(len, alignment, ret_addr);
-    }
-
-    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
-        return false;
-    }
-
-    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
-        return null;
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *WipeAllocator = @ptrCast(@alignCast(ctx));
-        std.crypto.secureZero(u8, memory);
-        self.child.rawFree(memory, alignment, ret_addr);
-    }
-};
 
 // Sizes: the real depth of each body was measured with every burn at 1 KiB,
 // `verbose` on, in the probe (deepest residue hit, ReleaseFast, 2026-10-09);

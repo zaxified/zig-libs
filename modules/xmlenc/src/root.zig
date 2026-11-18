@@ -28,6 +28,7 @@
 const std = @import("std");
 const xml = @import("xml");
 const burn = @import("burn.zig");
+const WipingAllocator = @import("wipealloc").WipingAllocator; // wipes every block it frees (CONVENTIONS §2.1 Z1)
 const rsa = @import("rsa");
 const aescbc = @import("aescbc");
 const aeskw = @import("aeskw");
@@ -57,7 +58,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "W3C XML Encryption 1.1 (xmlenc-core-1), decryption side; RFC 8017 / RFC 3394 / NIST SP800-38A/D",
-    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm" }, // aes192: the AES-192 block cipher (std 0.16 has none); aesgcm: all AES-GCM sizes (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm", "wipealloc" }, // aes192: the AES-192 block cipher (std 0.16 has none); aesgcm: all AES-GCM sizes (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── namespace URIs ──────────────────────────────────────────────────────────
@@ -315,40 +316,6 @@ pub fn decryptDataToDocument(
     const doc = try xml.parse(wiper.allocator(), plain, .{ .id_attr_names = &.{"ID"}, .max_elements = options.max_elements });
     return .{ .doc = doc, .plaintext = plain, .wiper = wiper };
 }
-
-/// Forwards to `child` and wipes every block before it goes back (CONVENTIONS
-/// §2.1 Z1). `resize`/`remap` are refused, so a growing or shrinking buffer goes
-/// through alloc + copy + `free`, and that `free` is this one. ReleaseFast is the
-/// mode it matters in: there `Allocator.free`'s `@memset(undefined)` compiles
-/// away. Same shape as `xmldsig`'s and `wireguard`'s private adapters.
-const WipingAllocator = struct {
-    child: std.mem.Allocator,
-
-    fn allocator(self: *WipingAllocator) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{
-            .alloc = allocFn,
-            .resize = resizeFn,
-            .remap = remapFn,
-            .free = freeFn,
-        } };
-    }
-
-    fn allocFn(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *WipingAllocator = @ptrCast(@alignCast(ctx));
-        return self.child.rawAlloc(len, a, ra);
-    }
-    fn resizeFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
-        return false;
-    }
-    fn remapFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
-        return null;
-    }
-    fn freeFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
-        const self: *WipingAllocator = @ptrCast(@alignCast(ctx));
-        std.crypto.secureZero(u8, m);
-        self.child.rawFree(m, a, ra);
-    }
-};
 
 // ── content algorithm classification ────────────────────────────────────────
 

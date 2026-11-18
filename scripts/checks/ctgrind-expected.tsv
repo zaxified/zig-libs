@@ -1055,8 +1055,8 @@ spake2plus	ReleaseFast	verifierfinish	1	6	5fad515ff1d5c2b6	dbdff43379a90cf5
 # now), made affine (:632-634, :640) and encoded (:153 via :653) -- plus the
 # zero-check of the blinding scalar r1 (:617, next to r2.inv at :616). Every
 # context is on a value the proof publishes or on "is this random scalar 0".
-bbs	ReleaseFast	sign	1	3	89de490339e69511	0929643a5972b8ba
-bbs	ReleaseFast	proofgen	1	15	89de490339e69511	464ac571cf1943c2
+bbs	ReleaseFast	sign	1	3	c5e39a7435390cad	0929643a5972b8ba
+bbs	ReleaseFast	proofgen	1	15	c5e39a7435390cad	464ac571cf1943c2
 coconut	ReleaseFast	authority_sign	1	2	580bc6f94c4a7f19	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	21	06c770f681312a71	af24664cb307a403
 # Count 27 -> 26 on 2026-10-09 (dead-stack sweep: proveCredential's body runs one
@@ -1707,12 +1707,12 @@ aeskw	ReleaseFast	wrap	1	12	986ea45fe8c756da	23036d19c2656c6a
 # verdicts along a handshake and data, plus innerLength on the decrypted inner IP
 # header (version and length, the packet's, not a key's). No context on a key byte,
 # and no table load. Positive evidence is the witness: every row prints derived bytes.
-wireguard	ReleaseFast	keyb64	1	1	924becf0913ae3ab	bdb7682658e5959b
-wireguard	ReleaseFast	keyhex	1	1	924becf0913ae3ab	1e487ba1ad51a2cb
-wireguard	ReleaseFast	handshake	1	4	924becf0913ae3ab	40f18e84501394fa
-wireguard	ReleaseFast	transport	1	1	924becf0913ae3ab	fe029b53e647276b
-wireguard	ReleaseFast	cookie	1	0	924becf0913ae3ab	786bd5e71e9b6d06
-wireguard	ReleaseFast	tunnel	1	9	924becf0913ae3ab	8f458611fc103bea
+wireguard	ReleaseFast	keyb64	1	1	10ecf0e76d97528a	bdb7682658e5959b
+wireguard	ReleaseFast	keyhex	1	1	10ecf0e76d97528a	1e487ba1ad51a2cb
+wireguard	ReleaseFast	handshake	1	4	10ecf0e76d97528a	40f18e84501394fa
+wireguard	ReleaseFast	transport	1	1	10ecf0e76d97528a	fe029b53e647276b
+wireguard	ReleaseFast	cookie	1	0	10ecf0e76d97528a	786bd5e71e9b6d06
+wireguard	ReleaseFast	tunnel	1	9	10ecf0e76d97528a	8f458611fc103bea
 # aeadframe (2026-10-10) — chacha / aes: channel keys + plaintext tainted,
 # seal x3, rekeyInto, seal, open x4 + a tampered record. 5 each = the AEAD
 # tag-verify outcome of the opens (4 contexts) + rekey's NonceSpaceReuse
@@ -2085,9 +2085,9 @@ jwt	ReleaseFast	rsa	1	3	00249effc6238806	f2bee89c3c58cdaf
 #    → pcMul16 `rejectIdentity` and → `PublicKey.fromBytes`, and the
 #    `timing_safe.eql` verdict "derived public half == stored public half"
 #    (NonCanonical or not). `fromSecretKey` is no longer called.
-minisign	ReleaseFast	sign	1	2	81a53e65bb74db69	812c5ebd56623021
-minisign	ReleaseFast	seal	1	2	81a53e65bb74db69	d241260799cd24a3
-minisign	ReleaseFast	open	1	6	81a53e65bb74db69	1876f3ea9f53cddd
+minisign	ReleaseFast	sign	1	2	6b8a8eb128632bbf	812c5ebd56623021
+minisign	ReleaseFast	seal	1	2	6b8a8eb128632bbf	d241260799cd24a3
+minisign	ReleaseFast	open	1	6	6b8a8eb128632bbf	1876f3ea9f53cddd
 # aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
 # (tokens, API keys, Basic user:password), tainted in place; the presented value
 # is the client's own and the verdict is public. Each target verifies a good and
@@ -2286,10 +2286,10 @@ webhooksig	ReleaseFast	ed25519	1	30	691f63387d17ed1d	0ddab6b90956b2fe
 #            the masked extraction loop (`ctEqMaskUsize(s, sep_idx)`) was compiled to a branch on
 #            the separator position; an asm barrier (`blackBox`) fixed it, measured.
 #   kw 3     aeskw unwrapBody :171 (integrity-check verdict) + aesgcm tag verdict, accept and reject.
-xmlenc	ReleaseFast	oaep	1	3	11557c75cd215bf1	b6a414715b391ccc
-xmlenc	ReleaseFast	cbc	1	14	11557c75cd215bf1	cb2ee56c03b2b7a6
-xmlenc	ReleaseFast	rsa15	1	3	11557c75cd215bf1	fcf38565ab1ce414
-xmlenc	ReleaseFast	kw	1	3	11557c75cd215bf1	65e898b409f3bf26
+xmlenc	ReleaseFast	oaep	1	3	1a333eb9cac26850	b6a414715b391ccc
+xmlenc	ReleaseFast	cbc	1	14	1a333eb9cac26850	cb2ee56c03b2b7a6
+xmlenc	ReleaseFast	rsa15	1	3	1a333eb9cac26850	fcf38565ab1ce414
+xmlenc	ReleaseFast	kw	1	3	1a333eb9cac26850	65e898b409f3bf26
 # saml, 2026-11-13 (sweep hB): the SP's RSA private key signing a LogoutRequest and a redirect
 # query string (`sign_with` / `buildSignedRedirectQuery`).
 #   sign 45  1 = rsa privateOpCrtPtr:1286 (the F3 fault-check verdict, rsa's own row) + 44 =
@@ -2376,8 +2376,8 @@ jwe	ReleaseFast	pbes2	1	182	198f278acedab8ab	45882587fad30673	cpu=x86_64 control
 megolm	ReleaseFast	msg	1	138	4bcd2cc0b8d7321d	505eb3dc7b45f5cd	cpu=x86_64 control=1 trap=105
 megolm	ReleaseFast	skey	1	33	4bcd2cc0b8d7321d	a22db1b8b5220a74	cpu=x86_64
 megolm	ReleaseFast	pickle	1	28	4bcd2cc0b8d7321d	f06f4b1b938d2036	cpu=x86_64
-xmlenc	ReleaseFast	cbc	1	72	11557c75cd215bf1	cb2ee56c03b2b7a6	cpu=x86_64 control=16 trap=16
-xmlenc	ReleaseFast	kw	1	182	11557c75cd215bf1	65e898b409f3bf26	cpu=x86_64 control=5 trap=5
+xmlenc	ReleaseFast	cbc	1	72	1a333eb9cac26850	cb2ee56c03b2b7a6	cpu=x86_64 control=16 trap=16
+xmlenc	ReleaseFast	kw	1	182	1a333eb9cac26850	65e898b409f3bf26	cpu=x86_64 control=5 trap=5
 #
 # B --std X25519 identity check (curve25519.zig:77, public-point outcome), plus C (std mem.eql chunk
 # branch on a public key) for wireguard and tlsclient cv/mls/ssh pem. tlsclient kex also has A2 (std
@@ -2396,8 +2396,8 @@ tlsclient	ReleaseFast	cv	1	33	aac4ebb6ece329f8	a92e71f50313cf2b	cpu=x86_64
 tlsserver	ReleaseFast	hs	1	24	2f7e749c153bf15a	18b712e147be54c3	cpu=x86_64
 tlsserver	ReleaseFast	ech	1	368	2f7e749c153bf15a	c257fcbb1b68d8df	cpu=x86_64
 mls	ReleaseFast	priv	1	5	8eb897814c57e255	616cb338b933af50	cpu=x86_64
-wireguard	ReleaseFast	handshake	1	13	924becf0913ae3ab	40f18e84501394fa	cpu=x86_64
-wireguard	ReleaseFast	tunnel	1	14	924becf0913ae3ab	8f458611fc103bea	cpu=x86_64
+wireguard	ReleaseFast	handshake	1	13	10ecf0e76d97528a	40f18e84501394fa	cpu=x86_64
+wireguard	ReleaseFast	tunnel	1	14	10ecf0e76d97528a	8f458611fc103bea	cpu=x86_64
 tls13	ReleaseFast	x25519_shared	1	1	ed80464b8e0301c2	d94c3e5680258153	cpu=x86_64
 tls13	ReleaseFast	x25519_server	1	1	ed80464b8e0301c2	a919bb6546cae368	cpu=x86_64
 tls13	ReleaseFast	x25519mlkem768_shared	1	1	ed80464b8e0301c2	6b26c450a8a3715f	cpu=x86_64

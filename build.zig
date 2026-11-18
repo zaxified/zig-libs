@@ -261,6 +261,7 @@ pub const module_list = [_]Module{
     .{ .name = "pagecache", .libs = &.{"net"}, .deps = &.{ "kvtree", "ramcache" } },
     .{ .name = "tsdb", .libs = &.{"storage"}, .deps = &.{ "kvtree", "regex" }, .test_deps = &.{"testkit"} },
     .{ .name = "entropy", .libs = &.{ "crypto", "web" } },
+    .{ .name = "wipealloc", .libs = &.{"crypto"} },
     .{ .name = "hashdigest", .libs = &.{ "crypto", "storage" }, .deps = &.{"sha2"}, .test_deps = &.{"testkit"} },
     .{ .name = "sealedbox", .libs = &.{"crypto"}, .deps = &.{ "ct25519", "b64ct" }, .test_deps = &.{"testkit"} },
     .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{ "montint", "aescbc", "aes192", "b64ct", "keycodec" }, .test_deps = &.{"testkit"}, .heavy = true },
@@ -291,7 +292,7 @@ pub const module_list = [_]Module{
     .{ .name = "uci", .libs = &.{"os"}, .test_deps = &.{"testkit"}, .timing = true },
     .{ .name = "mqtt", .libs = &.{"net"}, .deps = &.{"b64ct"}, .test_deps = &.{ "testkit", "websocket", "http", "tlsclient" }, .loopback = true }, // websocket/http: the MQTT-over-WebSocket recipe test; tlsclient: the TLS case of tools/interop.zig
     .{ .name = "snmp", .libs = &.{"net"}, .deps = &.{"aes192"}, .test_deps = &.{"testkit"}, .loopback = true },
-    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct", "clock" }, .test_deps = &.{"testkit"}, .netns = true },
+    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct", "clock", "wipealloc" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true, .timing = true },
     .{ .name = "traceroute", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
     .{ .name = "probe", .libs = &.{"net"}, .deps = &.{ "netaddr", "latency-stats", "clock" }, .test_deps = &.{"testkit"}, .loopback = true },
@@ -301,9 +302,9 @@ pub const module_list = [_]Module{
     .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct", "sha2", "keycodec", "clock" }, .test_deps = &.{"testkit"}, .interop_deps = &.{"benchkit"}, .loopback = true },
     .{ .name = "rbac", .libs = &.{"web"} },
     .{ .name = "xml", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
-    .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256", "p384", "p521" }, .test_deps = &.{"testkit"} },
+    .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256", "p384", "p521", "wipealloc" }, .test_deps = &.{"testkit"} },
     .{ .name = "saml", .libs = &.{"web"}, .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true, .test_deps = &.{"testkit"} },
-    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm" }, .heavy = true, .test_deps = &.{"testkit"} },
+    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm", "wipealloc" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "aescbc", .libs = &.{ "web", "crypto" }, .test_deps = &.{ "testkit", "aes192" } }, // aes192: the AES-192 KAT/fuzz cases (the API is generic over the cipher type)
     .{ .name = "aeskw", .libs = &.{"web"}, .deps = &.{"aes192"}, .test_deps = &.{"testkit"} }, // aes192: the 24-byte KEK arm
     .{ .name = "aes192", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
@@ -397,12 +398,12 @@ pub const module_list = [_]Module{
     .{ .name = "opaque", .libs = &.{"crypto"}, .deps = &.{ "voprf", "ct25519" }, .test_deps = &.{"testkit"} },
     .{ .name = "bulletproofs", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .test_deps = &.{"testkit"} },
     .{ .name = "xmss", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
-    .{ .name = "minisign", .libs = &.{"crypto"}, .deps = &.{ "entropy", "b64ct" }, .heavy = true, .test_deps = &.{"testkit"} },
+    .{ .name = "minisign", .libs = &.{"crypto"}, .deps = &.{ "entropy", "b64ct", "wipealloc" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "otp", .libs = &.{"crypto"}, .deps = &.{"base32"}, .test_deps = &.{"testkit"} },
     .{ .name = "ctap2pin", .libs = &.{"crypto"}, .deps = &.{"p256"}, .test_deps = &.{"testkit"} },
     .{ .name = "ctap2", .libs = &.{"crypto"}, .deps = &.{ "cbor", "ctap2pin" }, .test_deps = &.{"testkit"} },
     .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{ "entropy", "montint" }, .test_deps = &.{"testkit"}, .heavy = true },
-    .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"testkit"} },
+    .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy", "wipealloc" }, .test_deps = &.{"testkit"} },
     .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "tlock", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy", "chachapoly" }, .test_deps = &.{"testkit"} },
     // `tlock` is a TEST-only dep: `ibe/src/kat_test.zig` drives `ibe`'s own

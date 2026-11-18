@@ -124,7 +124,7 @@ pub const meta = .{
     .role = .util, // no I/O, no wire framing beyond point/scalar (de)serialization
     .concurrency = .reentrant, // every type is a plain value; no globals
     .model_after = "draft-irtf-cfrg-bbs-signatures-12 (the BLS12-381-SHA-256 ciphersuite); test vectors from the draft's own §8.4 and Appendix D.2 (tools/gen_kat_vectors.py); bls12_381 (this repo) supplies the field/group/pairing/hash-to-curve primitives",
-    .deps = .{ "bls12_381", "entropy" }, // entropy: the blinding-scalar draw
+    .deps = .{ "bls12_381", "entropy", "wipealloc" }, // entropy: the blinding-scalar draw; wipealloc: the scratch heap is wiped on free
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -149,10 +149,11 @@ test "meta.model_after names the bbs-signatures draft" {
     try std.testing.expect(std.mem.find(u8, meta.model_after, "bbs-signatures-12") != null);
 }
 
-test "meta.deps is exactly {bls12_381, entropy}" {
-    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
+test "meta.deps is exactly {bls12_381, entropy, wipealloc}" {
+    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
     try std.testing.expectEqualStrings("bls12_381", meta.deps[0]);
     try std.testing.expectEqualStrings("entropy", meta.deps[1]);
+    try std.testing.expectEqualStrings("wipealloc", meta.deps[2]);
 }
 
 test "gate IS flipped (the four Fable cores are implemented)" {

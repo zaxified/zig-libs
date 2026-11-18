@@ -60,7 +60,7 @@ const codec = netlink.codec;
 const netaddr = @import("netaddr");
 const b64ct = @import("b64ct");
 const burn = @import("burn.zig");
-const wipe = @import("wipe.zig");
+const wipealloc = @import("wipealloc");
 // Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
 // helpers, in the format `std.testing.Smith` actually reads.
 const testkit = @import("testkit");
@@ -113,7 +113,7 @@ pub const meta = .{
     // netaddr: `AllowedIp.parse`'s CIDR-text parsing delegates to
     // `netaddr.parsePrefix`/`parseIp` rather than duplicating it.
     // ct25519: X25519 for the handshake (comb keygen, MULX/ADX ladder).
-    .deps = .{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct", "clock" },
+    .deps = .{ "netlink", "genetlink", "chachapoly", "ct25519", "entropy", "netaddr", "b64ct", "clock", "wipealloc" },
 };
 
 // ── kernel UAPI constants (uapi/wireguard.h) ────────────────────────────────
@@ -769,7 +769,7 @@ fn buildSetRequestsBody(
     max_msg_len: usize,
 ) BuildError!SetRequests {
     const cfg = cfg_ptr.*;
-    var wiper = wipe.WipingAllocator.init(child);
+    var wiper = wipealloc.WipingAllocator.init(child);
     const gpa = wiper.allocator();
     if (cfg.ifname.len == 0 and cfg.ifindex == 0) return error.InvalidConfig;
     if (cfg.ifname.len >= ifnamsiz) return error.InvalidConfig;
@@ -2697,21 +2697,6 @@ test "set builder: ip-less peers split by the ceiling; a new message is filled b
     var r3 = try buildSetRequests(gpa, 0x1c, 1, .{ .ifname = "wg0", .listen_port = 1 }, default_max_msg_len);
     defer r3.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), (try SetShape.walk(r3.buf)).peers_attrs);
-}
-
-test "WipingAllocator: no resize or remap, and a free zeroes the block first" {
-    var backing: [256]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&backing);
-    var wa = wipe.WipingAllocator.init(fba.allocator());
-    const a = wa.allocator();
-    const buf = try a.alloc(u8, 64);
-    @memset(buf, 0x5a);
-    try testing.expect(!a.resize(buf, 32));
-    try testing.expect(!a.resize(buf, 128));
-    try testing.expect(a.remap(buf, 128) == null);
-    const at = @intFromPtr(buf.ptr) - @intFromPtr(&backing);
-    a.free(buf);
-    for (backing[at..][0..64]) |x| try testing.expectEqual(@as(u8, 0), x);
 }
 
 test "DeviceParser: deinit, and finish, leave no key in the parser's bytes or its freed blocks" {

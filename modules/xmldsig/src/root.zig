@@ -64,7 +64,7 @@ pub const meta = .{
     .role = .util, // pure verification logic over a parsed tree — no I/O, no wire framing
     .concurrency = .reentrant,
     .model_after = "W3C XML Signature Syntax and Processing (xmldsig-core 1.1) + Exclusive/Canonical XML 1.0",
-    .deps = .{ "xml", "rsa", "p256", "p384", "p521" },
+    .deps = .{ "xml", "rsa", "p256", "p384", "p521", "wipealloc" },
 };
 
 // ── namespace + algorithm identifiers ───────────────────────────────────────
@@ -296,50 +296,10 @@ fn mapSig(uri: []const u8) ?SigAlg {
 
 // ── secret-scrubbing allocator (CONVENTIONS §2.1 Z1) ────────────────────────
 
-/// An allocator wrapper that `secureZero`s every block before handing it back to
-/// `child`. `verify()` backs its scratch arena with this, because the arena's
-/// blocks hold the canonical form of the very octets under verification — which,
-/// on `saml`'s encrypted-assertion path, is a decrypted SAML assertion.
-///
-/// `resize`/`remap` are deliberately refused rather than forwarded: both can end
-/// up releasing storage inside `child` (a shrink's tail, a moving remap's old
-/// block) without ever reaching `free`, so there is no hook left to scrub it.
-/// Refusing makes `Allocator.realloc` fall back to alloc + copy + free, and that
-/// `free` is ours. The arena only ever calls `alloc` and `free` on its child
-/// anyway, so this costs nothing today and stays correct if the arena goes away.
-///
-/// Note which build mode this is for: `Allocator.free` memsets the block to
-/// `undefined` before reaching the vtable, so in Debug/ReleaseSafe the block is
-/// already scrubbed to `0xaa`. In ReleaseFast that memset compiles away and this
-/// wipe is the only thing standing between a freed block and unrelated code.
-const WipingAllocator = struct {
-    child: std.mem.Allocator,
-
-    fn allocator(self: *WipingAllocator) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{
-            .alloc = allocFn,
-            .resize = resizeFn,
-            .remap = remapFn,
-            .free = freeFn,
-        } };
-    }
-
-    fn allocFn(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *WipingAllocator = @ptrCast(@alignCast(ctx));
-        return self.child.rawAlloc(len, a, ra);
-    }
-    fn resizeFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
-        return false;
-    }
-    fn remapFn(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
-        return null;
-    }
-    fn freeFn(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
-        const self: *WipingAllocator = @ptrCast(@alignCast(ctx));
-        std.crypto.secureZero(u8, m);
-        self.child.rawFree(m, a, ra);
-    }
-};
+/// `verify()` backs its scratch arena with `wipealloc.WipingAllocator`, because the
+/// arena's blocks hold the canonical form of the very octets under verification —
+/// which, on `saml`'s encrypted-assertion path, is a decrypted SAML assertion.
+const WipingAllocator = @import("wipealloc").WipingAllocator;
 
 /// Test-only: a pass-through allocator that records peak LIVE bytes. Used to
 /// pin the per-reference arena reset -- a cumulative counter (std's

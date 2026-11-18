@@ -6,7 +6,7 @@
 
 **Scope:** parity — configuration plane: wg(8) + wgctrl-go (netlink, the userspace protocol, the configuration file, listing); data plane: boringtun `noise::Tunn` / wireguard-go's per-peer state machine, sans-IO. The TUN + UDP daemon is deliberately not here (surveyed 2026-11-02)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-18 (656/764, 108 eq) · src 2bf77111244394c6
+**Audit:** review 2026-09-02 · mutation 2026-11-18 (656/764, 108 eq) · src 21fa1427124a207b
 
 **Hardening:** fuzz 2026-11-03 (`WIREGUARD_FUZZ=200000 scripts/modtest wireguard -Doptimize=ReleaseSafe`, clean over all seven harnesses incl. the new `wireguard-conf`, `wireguard-uapi` (200,000 each), `wireguard-tunnel` (÷32, mac1 computed, so `peekInitiation`, `acceptInitiation` and `consumeResponse` are reached: REACH peek_bad_static, accept_bad_timestamp, accept_ok, response_forged, data_forged) and `wireguard-tunnel-sim` (÷64)) · ct 2026-11-03 (`ctgrind.sh --check wireguard`: key base64 and hex codecs, the whole handshake, seal/open, cookies, `Tunnel`; 1/1/4/1/0/9 in-file, every one a verdict or the inner IP header, none on a key byte) · panic 2026-11-03 (the GR sweep of 2026-10-30, extended over `Tunnel`, `conf`, `uapi`, `peekInitiation`, `listDevices`; GR: sweep + 2 blind reviews: second deriveTransportKeys from the wiped chaining key (HIGH, public keys) and role mismatch → checked panics, replayed initiation on a used handshake → AlreadyStarted, CookieChecker.wipe zero-key cookies, response receiver index checked before DH, cookie reply replay, kernel reply loops bounded (TooManyMessages, interrupted dumps restarted), linear peer merge; delta audit 45/45 + 34/34)
 
@@ -437,7 +437,7 @@ only call these), `PeerCookie.consumeReply`, `keyFromBase64Into`, `buildSetReque
 `DeviceParser.feed`/`finishInto`. `Rm` goes in by `*const`, the checker and the cookie come out
 through `out` (see CHANGELOG). `PeerCookie.current`, `Handshake.computeMac2` and `createInitiation`
 with a cookie measured 0 before and are left as they were (cookie by value).
-Heap: `buildSetRequests` builds in a `WipingAllocator` (`src/wipe.zig`: `free` and every shrink zero
+Heap: `buildSetRequests` builds in a `wipealloc.WipingAllocator` (the shared `wipealloc` module: `free` and every shrink zero
 what they release, a growing `remap` is refused so the caller's alloc + copy + free path wipes the old
 block); `SetRequests.deinit` zeroes `buf` before freeing; `Device.deinit` and `DeviceParser.deinit`
 zero the peer table (pre-shared keys) and the device (private key); the parser's peer table grows and

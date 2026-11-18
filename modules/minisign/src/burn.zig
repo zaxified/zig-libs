@@ -9,7 +9,7 @@
 //! when a body outgrows its burn.
 //!
 //! scrypt's working memory (`xy`, `V`, `dk`) is HEAP, not stack: the seal/open
-//! bodies hand it a `WipeAllocator`, which zeroes every buffer before it goes
+//! bodies hand it a `wipealloc.WipingAllocator`, which zeroes every buffer before it goes
 //! back to the caller's allocator.
 
 const std = @import("std");
@@ -38,44 +38,6 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     stack(n);
     return r;
 }
-
-/// An allocator that zeroes every buffer before giving it back to `child`.
-/// `resize`/`remap` refuse, so a buffer never moves or shrinks unwiped: the
-/// caller falls back to alloc + copy + free, and the old buffer is wiped by
-/// `free`. scrypt only allocates and frees.
-pub const WipeAllocator = struct {
-    child: std.mem.Allocator,
-
-    pub fn allocator(self: *WipeAllocator) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *WipeAllocator = @ptrCast(@alignCast(ctx));
-        return self.child.rawAlloc(len, alignment, ret_addr);
-    }
-
-    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
-        return false;
-    }
-
-    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
-        return null;
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *WipeAllocator = @ptrCast(@alignCast(ctx));
-        std.crypto.secureZero(u8, memory);
-        self.child.rawFree(memory, alignment, ret_addr);
-    }
-};
 
 // Sizes: the body's real depth was measured with every burn at 1 KiB, `verbose`
 // on, in the probe (residue hits' depth, ReleaseFast, 2026-10-09); each constant
