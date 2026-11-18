@@ -2551,3 +2551,322 @@ test "live: probeHops over a forced RAW socket reaches loopback (skipped without
     try testing.expect(r.hops[0].is_destination and r.hops[0].proved);
     try testing.expect(!r.uncertain and !r.timed_out);
 }
+
+// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+
+const lo6 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+/// Asked of the kernel directly (a bind to ::1), never read off `query` or `probe`.
+fn v6LoopbackWorks() bool {
+    const rc = linux.socket(linux.AF.INET6, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    const sa: linux.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = lo6, .scope_id = 0 };
+    return linux.errno(linux.bind(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in6))) == .SUCCESS;
+}
+
+fn getOptInt(fd: i32, level: i32, opt: u32) ?u32 {
+    var v: u32 = 0;
+    var len: linux.socklen_t = @sizeOf(u32);
+    if (linux.errno(linux.getsockopt(fd, level, opt, @ptrCast(&v), &len)) != .SUCCESS) return null;
+    return v;
+}
+
+fn expectNotError(comptime bad: anyerror, res: anytype) !void {
+    if (res) |_| {} else |err| try testing.expect(err != bad);
+}
+
+/// A v6 ICMP error (no outer header) quoting an Echo Request `ident`/`seq` sent to `dst`.
+fn buildV6Error(buf: *[56]u8, typ: u8, ident: u16, seq: u16, dst: [16]u8) []u8 {
+    @memset(buf, 0);
+    buf[0] = typ;
+    buf[8 + 6] = 58;
+    @memcpy(buf[8 + 24 ..][0..16], &dst);
+    buf[8 + 40] = echo.v6.echo_request;
+    std.mem.writeInt(u16, buf[8 + 40 + 4 ..][0..2], ident, .big);
+    std.mem.writeInt(u16, buf[8 + 40 + 6 ..][0..2], seq, .big);
+    return buf;
+}
+
+test "stripIpv4: the IHL nibble alone sets the header length, and the bounds are exact" {
+    var p: [28]u8 = @splat(0xee);
+    p[0] = 0x45;
+    // A bare 20-byte header is an empty payload, not a refusal.
+    try testing.expectEqual(@as(usize, 0), stripIpv4(p[0..20]).?.len);
+    try testing.expect(stripIpv4(p[0..19]) == null);
+    // IHL 6: options are skipped; exactly the header length is an empty payload.
+    p[0] = 0x46;
+    try testing.expectEqual(@as(usize, 0), stripIpv4(p[0..24]).?.len);
+    try testing.expect(stripIpv4(p[0..23]) == null);
+    const s = stripIpv4(&p).?;
+    try testing.expectEqual(@as(usize, 4), s.len);
+    try testing.expect(s.ptr == p[24..].ptr);
+    // The version nibble is not read: its low bit must not leak into the length.
+    p[0] = 0x55;
+    try testing.expectEqual(@as(usize, 8), stripIpv4(&p).?.len);
+    // An IHL below 5 words is refused however long the packet is.
+    p[0] = 0x44;
+    try testing.expect(stripIpv4(&p) == null);
+}
+
+test "a raw v4 packet with no valid IP header is refused, never parsed as bare ICMP" {
+    var buf: [echo.echo_header_len]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &buf, 0x1234, 7);
+    buf[0] = echo.v4.echo_reply;
+    std.mem.writeInt(u16, buf[2..4], 0, .big);
+    std.mem.writeInt(u16, buf[2..4], echo.checksum(&buf), .big);
+    try testing.expectEqual(Classified.ok, classify(.v4, false, &buf, 0x1234, 7).?);
+    try testing.expect(classify(.v4, true, &buf, 0x1234, 7) == null);
+
+    var b: [36]u8 = undefined;
+    const dst = [4]u8{ 10, 9, 9, 9 };
+    const d: netaddr.Ip = .{ .v4 = dst };
+    const pkt = buildV4Error(&b, echo.v4.time_exceeded, 0, 1, 2, dst);
+    try testing.expect(isTimeExceeded(.v4, false, pkt, 1, 2, d));
+    try testing.expect(!isTimeExceeded(.v4, true, pkt, 1, 2, d));
+    try testing.expect(quotesDestination(.v4, false, pkt, d));
+    try testing.expect(!quotesDestination(.v4, true, pkt, d));
+}
+
+test "classify v4: an error of another kind with code 4 is not Fragmentation Needed" {
+    var b: [36]u8 = undefined;
+    for ([_]u8{ echo.v4.time_exceeded, echo.v4.source_quench }) |typ| {
+        const pkt = buildV4Error(&b, typ, v4_frag_needed_code, 7, 8, .{ 10, 9, 9, 9 });
+        try testing.expect(classify(.v4, false, pkt, 7, 8) == null);
+    }
+    const ok = buildV4Error(&b, echo.v4.dest_unreachable, v4_frag_needed_code, 7, 8, .{ 10, 9, 9, 9 });
+    try testing.expect(classify(.v4, false, ok, 7, 8) != null);
+}
+
+test "classify v6: ident and seq must both match, for an echo reply and for a quoted request" {
+    var er: [echo.echo_header_len]u8 = @splat(0);
+    er[0] = echo.v6.echo_reply;
+    std.mem.writeInt(u16, er[4..6], 0xbeef, .big);
+    std.mem.writeInt(u16, er[6..8], 9, .big);
+    try testing.expectEqual(Classified.ok, classify(.v6, false, &er, 0xbeef, 9).?);
+    try testing.expect(classify(.v6, false, &er, 0xbeee, 9) == null);
+    try testing.expect(classify(.v6, false, &er, 0xbeef, 8) == null);
+    try testing.expect(classify(.v6, false, &er, 0xbeee, 8) == null);
+
+    var b: [56]u8 = undefined;
+    const pkt = buildV6Error(&b, echo.v6.packet_too_big, 0xbeef, 9, lo6);
+    try testing.expect(classify(.v6, false, pkt, 0xbeef, 9) != null);
+    try testing.expect(classify(.v6, false, pkt, 0xbeee, 9) == null);
+    try testing.expect(classify(.v6, false, pkt, 0xbeef, 8) == null);
+}
+
+test "quotesDestination and isTimeExceeded on v6: the whole quoted destination is compared" {
+    var b: [56]u8 = undefined;
+    const pkt = buildV6Error(&b, echo.v6.time_exceeded, 5, 6, lo6);
+    try testing.expect(quotesDestination(.v6, false, pkt, .{ .v6 = lo6 }));
+    var other = lo6;
+    other[15] = 2; // the last byte differs
+    try testing.expect(!quotesDestination(.v6, false, pkt, .{ .v6 = other }));
+    other = lo6;
+    other[0] = 1; // the first byte differs
+    try testing.expect(!quotesDestination(.v6, false, pkt, .{ .v6 = other }));
+    try testing.expect(isTimeExceeded(.v6, false, pkt, 5, 6, .{ .v6 = lo6 }));
+    try testing.expect(!isTimeExceeded(.v6, false, pkt, 5, 6, .{ .v6 = other }));
+}
+
+test "preferHit: of two Time Exceeded the first stays" {
+    const a: ErrHit = .{ .kind = .time_exceeded, .from = ip4Test(1) };
+    const b: ErrHit = .{ .kind = .time_exceeded, .from = ip4Test(2) };
+    try testing.expect(preferHit(a, b).?.from.?.eql(ip4Test(1)));
+    try testing.expect(preferHit(b, a).?.from.?.eql(ip4Test(2)));
+}
+
+test "fromIs: only the same address, never an unknown source" {
+    try testing.expect(!fromIs(.none, ip4Test(1)));
+    try testing.expect(fromIs(sockAddr4(.{ 10, 0, 0, 1 }), ip4Test(1)));
+    try testing.expect(!fromIs(sockAddr4(.{ 10, 0, 0, 2 }), ip4Test(1)));
+    const s6: icmp.Socket.RecvInfo.SrcAddr = .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = lo6, .scope_id = 0 } };
+    try testing.expect(fromIs(s6, .{ .v6 = lo6 }));
+    try testing.expect(!fromIs(s6, ip4Test(1)));
+    try testing.expect(ipOf(.none) == null);
+    try testing.expect(ipOf(sockAddr4(.{ 10, 0, 0, 7 })).?.eql(ip4Test(7)));
+    try testing.expect(ipOf(s6).?.eql(.{ .v6 = lo6 }));
+}
+
+test "setOptInt: reports the kernel's answer" {
+    try testing.expect(!setOptInt(-1, linux.SOL.IP, linux.IP.TTL, 5));
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    try testing.expect(setOptInt(fd, linux.SOL.IP, linux.IP.TTL, 9));
+    try testing.expectEqual(@as(?u32, 9), getOptInt(fd, linux.SOL.IP, linux.IP.TTL));
+    try testing.expect(!setOptInt(fd, linux.SOL.IP, linux.IP.TTL, 0)); // the kernel refuses TTL 0
+}
+
+test "ifaceMtu: a name the kernel's 16-byte field cannot hold is refused, not copied" {
+    try testing.expectError(error.NoSuchInterface, ifaceMtu(""));
+    try testing.expectError(error.NoSuchInterface, ifaceMtu("0123456789abcdef0"));
+    try testing.expectError(error.NoSuchInterface, ifaceMtu("0123456789abcdef0123456789abcdef01234567"));
+    try testing.expectError(error.NoSuchInterface, ifaceMtu("no-such-if"));
+}
+
+test "live: query() reads the loopback MTU exactly, capped at the IP length field (v4)" {
+    if (!udpSocketsWork()) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
+    const lo = try ifaceMtu("lo");
+    const r = try query(netaddr.parseIp("127.0.0.1").?, .{});
+    try testing.expectEqual(@min(lo, std.math.maxInt(u16)), r.mtu);
+}
+
+test "live: query() against ::1 reads the loopback MTU through the v6 socket options" {
+    if (!v6LoopbackWorks()) return testkit.loopbackSkip("IPv6 loopback unavailable", .{});
+    const r = try query(.{ .v6 = lo6 }, .{ .iface = "lo" });
+    try testing.expectEqual(Source.cached, r.source);
+    // `IPV6_MTU` is not capped at 65535 the way `IP_MTU` is: it reads the interface MTU itself.
+    try testing.expectEqual(r.iface_mtu.?, r.mtu);
+}
+
+const AttemptLog = struct {
+    sizes: [64]u16 = undefined,
+    n: usize = 0,
+    fn onAttempt(ctx: *anyopaque, wire_size: u16, _: ProbeOutcome) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.n < self.sizes.len) self.sizes[self.n] = wire_size;
+        self.n += 1;
+    }
+};
+
+test "live: probe() starts at the family floor, takes its ceiling from Options.iface and reports the interface MTU" {
+    if (!icmpSocketsWork()) return error.SkipZigTest;
+    const lo = try ifaceMtu("lo");
+    var log: AttemptLog = .{};
+    const r = try probe(netaddr.parseIp("127.0.0.1").?, .{ .timeout_ms = 500, .iface = "lo", .on_attempt = .{ .ctx = &log, .onAttempt = AttemptLog.onAttempt } });
+    try testing.expectEqual(@as(u32, @min(lo, max_probe_mtu)), r.mtu);
+    try testing.expectEqual(@as(?u32, lo), r.iface_mtu);
+    try testing.expect(log.n >= 2);
+    try testing.expectEqual(min_mtu_v4, log.sizes[0]);
+    // Without an observer the same interface MTU is reported (a separate return path).
+    const plain = try probe(netaddr.parseIp("127.0.0.1").?, .{ .timeout_ms = 500, .iface = "lo" });
+    try testing.expectEqual(@as(?u32, lo), plain.iface_mtu);
+    try testing.expectEqual(r.mtu, plain.mtu);
+}
+
+test "live: probe() over ::1 starts at the v6 floor" {
+    if (!icmpSocketsWork() or !v6LoopbackWorks()) return error.SkipZigTest;
+    var log: AttemptLog = .{};
+    const r = probe(.{ .v6 = lo6 }, .{ .timeout_ms = 500, .retries = 1, .ceiling_mtu = 1500, .on_attempt = .{ .ctx = &log, .onAttempt = AttemptLog.onAttempt } }) catch |e| switch (e) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return e,
+    };
+    try testing.expectEqual(@as(u32, 1500), r.mtu);
+    try testing.expect(log.n >= 2);
+    try testing.expectEqual(min_mtu_v6, log.sizes[0]);
+}
+
+test "live: probeHops() takes its ceiling from Options.iface; an exhausted deadline_ms is reported as timed_out" {
+    if (!icmpSocketsWork()) return error.SkipZigTest;
+    const lo = try ifaceMtu("lo");
+    const dest: netaddr.Ip = .{ .v4 = .{ 127, 0, 0, 1 } };
+    var out: [4]Hop = undefined;
+    const r = try probeHops(dest, .{ .timeout_ms = 500, .retries = 1, .iface = "lo" }, &out);
+    try testing.expect(r.reached);
+    try testing.expect(!r.timed_out);
+    try testing.expectEqual(@as(u16, @intCast(@min(lo, max_probe_mtu))), r.mtu);
+    const r0 = try probeHops(dest, .{ .timeout_ms = 500, .retries = 1, .deadline_ms = 0 }, &out);
+    try testing.expect(r0.timed_out);
+    try testing.expect(!r0.reached);
+}
+
+test "live: the hop prober applies the TTL, remembers a TTL the kernel refuses, and drops an Echo Reply from another address" {
+    if (!icmpSocketsWork()) return error.SkipZigTest;
+    var sock = icmp.Socket.open(.v4, .auto, .{ .dont_fragment = true }) catch return error.SkipZigTest;
+    defer sock.close();
+    const lo4: netaddr.Ip = .{ .v4 = .{ 127, 0, 0, 1 } };
+    var lp: HopLiveProber = .{
+        .sock = &sock,
+        .family = .v4,
+        .ip_header_len = ipv4_header_len,
+        .strip_ip_header = false,
+        .dest = .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &lo4.v4) } },
+        .retries = 0,
+        .timeout_ms = 150,
+        .dest_ip = lo4,
+    };
+    var p = lp.hopProber();
+    const Tag = std.meta.Tag(HopOutcome);
+    try testing.expectEqual(Tag.echo_reply, std.meta.activeTag(p.probe(7, 100)));
+    try testing.expectEqual(@as(?u32, 7), getOptInt(sock.fd, linux.SOL.IP, linux.IP.TTL));
+    // A reply from an address that is not the destination is dropped: silence, not a wrong hop.
+    lp.dest_ip = .{ .v4 = .{ 10, 9, 9, 9 } };
+    try testing.expectEqual(Tag.no_reply, std.meta.activeTag(p.probe(7, 100)));
+    lp.dest_ip = lo4;
+    // The kernel refuses TTL 0: every answer would belong to the wrong hop, so it is remembered.
+    try testing.expectEqual(Tag.send_failed, std.meta.activeTag(p.probe(0, 100)));
+    try testing.expect(lp.ttl_failed);
+    try testing.expectEqual(Tag.send_failed, std.meta.activeTag(p.probe(1, 100)));
+    try testing.expectEqual(@as(?u32, 7), getOptInt(sock.fd, linux.SOL.IP, linux.IP.TTL));
+}
+
+test "live: the v6 hop prober applies the hop limit" {
+    if (!icmpSocketsWork() or !v6LoopbackWorks()) return error.SkipZigTest;
+    var sock = icmp.Socket.open(.v6, .auto, .{ .dont_fragment = true }) catch return error.SkipZigTest;
+    defer sock.close();
+    var lp: HopLiveProber = .{
+        .sock = &sock,
+        .family = .v6,
+        .ip_header_len = ipv6_header_len,
+        .strip_ip_header = false,
+        .dest = .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = lo6, .scope_id = 0 } },
+        .retries = 0,
+        .timeout_ms = 100,
+        .dest_ip = .{ .v6 = lo6 },
+    };
+    _ = lp.hopProber().probe(7, 1280);
+    try testing.expectEqual(@as(?u32, 7), getOptInt(sock.fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS));
+}
+
+test "noRoutePmtu: the search's own socket ignores the route's cached PMTU" {
+    if (!icmpSocketsWork()) return error.SkipZigTest;
+    var s4 = icmp.Socket.open(.v4, .auto, .{ .dont_fragment = true }) catch return error.SkipZigTest;
+    defer s4.close();
+    try testing.expectEqual(@as(?u32, linux.IP.PMTUDISC_DO), getOptInt(s4.fd, linux.SOL.IP, linux.IP.MTU_DISCOVER));
+    noRoutePmtu(&s4);
+    try testing.expectEqual(@as(?u32, linux.IP.PMTUDISC_PROBE), getOptInt(s4.fd, linux.SOL.IP, linux.IP.MTU_DISCOVER));
+    if (!v6LoopbackWorks()) return;
+    var s6 = icmp.Socket.open(.v6, .auto, .{ .dont_fragment = true }) catch return;
+    defer s6.close();
+    noRoutePmtu(&s6);
+    try testing.expectEqual(@as(?u32, linux.IPV6.PMTUDISC_PROBE), getOptInt(s6.fd, linux.SOL.IPV6, linux.IPV6.MTU_DISCOVER));
+}
+
+test "probe and probeHops decide ceiling, floor and walk bounds before opening any socket" {
+    // `.raw` cannot be opened unprivileged, so a check that moved behind the
+    // socket would answer PermissionDenied instead; on a privileged host the
+    // calls below are cheap loopback runs that give the same verdicts.
+    const lo4: netaddr.Ip = .{ .v4 = .{ 127, 0, 0, 1 } };
+    const lo6ip: netaddr.Ip = .{ .v6 = lo6 };
+    var out: [4]Hop = undefined;
+    const quick: Options = .{ .socket = .raw, .timeout_ms = 50, .retries = 0 };
+    var o = quick;
+
+    o.ceiling_mtu = min_mtu_v4;
+    try testing.expectError(error.CeilingTooLow, probe(lo4, o));
+    try testing.expectError(error.CeilingTooLow, probeHops(lo4, o, &out));
+    o.ceiling_mtu = min_mtu_v6;
+    try testing.expectError(error.CeilingTooLow, probe(lo6ip, o));
+    try testing.expectError(error.CeilingTooLow, probeHops(lo6ip, o, &out));
+    // The floors are per family: a ceiling of 1280 is fine for v4 (floor 68) and the end of the line for v6.
+    try expectNotError(error.CeilingTooLow, probe(lo4, o));
+    try expectNotError(error.CeilingTooLow, probeHops(lo4, o, &out));
+    o.ceiling_mtu = min_mtu_v4 + 1;
+    try expectNotError(error.CeilingTooLow, probe(lo4, o));
+    // The ceiling limit is `>`: the buffer size itself is accepted.
+    o.ceiling_mtu = max_probe_mtu;
+    try expectNotError(error.CeilingTooHigh, probe(lo4, o));
+    try expectNotError(error.CeilingTooHigh, probeHops(lo4, o, &out));
+    o.ceiling_mtu = max_probe_mtu + 1;
+    try testing.expectError(error.CeilingTooHigh, probe(lo4, o));
+    try testing.expectError(error.CeilingTooHigh, probeHops(lo4, o, &out));
+
+    var n = quick;
+    n.max_hops = 0;
+    try testing.expectError(error.NoHops, probeHops(lo4, n, &out));
+    try testing.expectError(error.NoHops, probeHops(lo4, quick, out[0..0]));
+    try testing.expectError(error.NoHops, probeHops(lo4, n, out[0..0]));
+}
