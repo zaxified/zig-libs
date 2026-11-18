@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (3 items marked done/obsolete).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the mtime narrowing is `std.math.cast(u32, t)` again; the i64 → u64 → u32 detour was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private civil-calendar helpers (`daysFromCivil`, `civilFromDays`, `daysInMonth`, `isLeap`) are gone; `DosDateTime` uses `datefmt` (new dependency).
