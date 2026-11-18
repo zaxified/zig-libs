@@ -3210,3 +3210,18 @@ test "a symlink at a blob path is not a blob: not present, not openable, even wh
     try t.expectError(error.NotRegularFile, store.open(other));
     try t.expectError(error.NotRegularFile, store.verify(other));
 }
+
+test "verify compares the whole digest: a copy stored under an id that shares the first 32 hex chars is corrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const data = "forged id, same prefix";
+    const d = try store.putBytes(data);
+    var forged_hex: [64]u8 = d.hex;
+    forged_hex[63] = if (forged_hex[63] == '0') '1' else '0';
+    var pb: [800]u8 = undefined;
+    try putTestFile(try store.casPath(&pb, &forged_hex), data);
+    try t.expect(try store.verify(d));
+    try t.expect(!(try store.verify(.{ .hex = forged_hex })));
+}

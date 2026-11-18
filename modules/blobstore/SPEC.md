@@ -6,7 +6,7 @@
 
 **Scope:** parity — ipfs/go-ds-flatfs v0.6.1 (the like-for-like file-backed block store), with the git object store, restic and cacache-rs as design yardsticks (surveyed 2026-11-02; every substantial feature closed, rejected with a reason or owned by a sibling, see Compared with and Backlog)
 
-**Audit:** review 2026-09-11 · mutation 2026-11-17 (251/282, 31 eq) · src 87c5379fd1af2590
+**Audit:** review 2026-09-11 · mutation 2026-11-17 (252/282, 30 eq) · src f309022c36481536
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — content-addressed blobs (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `uniqSafe` (temp name ≤ 255 B), fanout validated everywhere, put ≤ 64 MiB and exactly 64 MiB readable, gc mtime/keep casts; delta audit 23/25 + 2 eq)
 
@@ -285,7 +285,7 @@ boundary, skipped call and swapped argument of the hex/segment/uniq validation, 
 `gc` and its reapers, the hostile-store readers and `createUniqueTemp`), ReleaseSafe, one build per round, each mutant
 under `setsid -w timeout` and `ulimit -v`, baseline first. The `crash_test.zig` model and crash loops cost 48 s of a
 50 s suite, so mutants first ran against the fast tests only and the survivors then against `crash_test`. Round 1: 154
-killed, 3 hung (counted killed), 125 survived. 25 tests added (93 now): the characters just outside `[0-9a-f]` and
+killed, 3 hung (counted killed), 125 survived. 26 tests added (94 now): the characters just outside `[0-9a-f]` and
 lengths 63/65, the exact `segmentSafe`/`uniqSafe` limits, sidecar text (whitespace trimmed, 31 digits, garbage is
 `CorruptSidecar` and kept by `gc`, a trimmed `0` collectible), `casCommit` return values and a dedup onto a corrupt
 sidecar, a dedup put on a `refcount = false` store, the `putLimited` limit on the total across chunks, no file
@@ -293,9 +293,9 @@ descriptor left open by put/refused put/putNamed/names/gc, listings skipping dir
 two layers apart, ns and key validated at every raw/named entry point, scratch truncation, a second locker waiting for
 the first, `gc` reaping exactly its own temps and counting them, orphan and temp sidecars, per-blob size sums, a
 dangling symlink under an orphan check, 63 stale temp names, `casCommit` of a foreign temp onto a missing `cas/`, a
-symlink at a blob path, `putNamed`'s hidden `.part` temp. Final: 251 killed (7 of them by a hang), 31 equivalent or
-unobservable, 0 survivors; no hash check, path check or refcount survivor is left (the one hash-check mutant that
-lives, `verify` comparing only the first 32 of 64 hex characters, needs a SHA-256 prefix collision). The 31:
+symlink at a blob path, `putNamed`'s hidden `.part` temp. Final: 252 killed (7 of them by a hang), 30 equivalent or
+unobservable, 0 survivors (a `verify` that compared only the first 32 of 64 hex characters is killed by a copy stored under an id sharing that prefix).
+The 30:
 redundant guards that fire twice (`ensureCasDir`'s fan-out and hex checks, `casCommit`/`casDelete`'s first
 `requireCasHex`, `names`'s second kind test, `scratchCreate`'s lock-name test behind `segmentSafe`, the `age >= 0`
 conjunct of `oldEnough`), directory entries whose `deleteFile`/`openDir` fails and is skipped, and the ones that need

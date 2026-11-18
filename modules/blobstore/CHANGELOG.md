@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** one more test (`verify` compares the whole digest: a copy stored under an id that shares the first 32 hex chars is corrupt) kills the last hash-check mutant; whole-module mutation now 252/282 killed, 30 eq.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (282 mutants, 251 killed, 31 equivalent or unobservable, none surviving); 25 tests added, no source change; the card records `mutation 2026-11-17 (251/282, 31 eq)`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
