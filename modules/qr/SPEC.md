@@ -6,7 +6,7 @@
 
 **Scope:** core — libqrencode 4.1.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-09-11 · src ?
+**Audit:** review 2026-09-11 · mutation 2026-11-17 (458/490, 32 eq) · src 05e1c43e117fe5a6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, QR_FUZZ) · ct n/a — QR encoding (keyword review, 2026-10-07)
 
@@ -135,6 +135,10 @@ standard assigns M=00, L=01, H=10, Q=11. A symbol built with the enum order
 instead is well-formed in every other respect and rejected by every decoder,
 which reads as a masking bug; `Ecc.formatBits` is the one place that mapping
 lives.
+
+### Audit 2026-11-17 (whole-module mutation)
+
+Mutants: 490 over `root.zig` and `render.zig` non-test code (mode selection, version and capacity search, structured-append arithmetic, the mixed-mode planner, bit writer, block split and interleave, Reed-Solomon encode and decode, function patterns, the data walk, the eight masks and the four penalty rules, format and version information, the decoder's segment parser), schemata build in ReleaseSafe, one run per mutant, 458 killed, 32 equivalent (490). **Finding (fixed, behaviour change):** penalty rule 4 took the dark share as an integer percent first, so below 50% the deviation was overstated by up to one point (45.5% dark scored 10, the exact value is 0); ISO/IEC 18004 Table 11, ZXing, nayuki and segno all use the exact share. It is now `k = |dark*20 - total*10| / total`, `score += 10*k` (totals are odd squares, so floor and the ceil-minus-one form agree). The auto-selected mask can differ for some inputs; every symbol stays valid and the 51 segno goldens (40 spread, 8 masks, 3 modes) did not move. New tests: `penalty` against a naive ISO reference (all four rules, 400 random, striped and finder-planted grids), the first-lowest tie rule of `pickMask`, `planSegments` and `pickMixedVersion` against an exact dynamic-programming oracle (including three texts where unrounded sixth-of-a-bit costs lose one bit), exact-fit and one-bit-over capacity for every version selector, the 16-symbol and version-40 limits of `encodeSequence`, per-symbol version and mode of a sequence, each format-information copy alone and the BCH radius of exactly three, the first long block's extra codeword at full error budget, and `parseSegments` exact-fit buffers, group ranges and the reserved ECI prefix. Equivalent: tie-breaks between equal-cost segmentations, unreachable guards (a zero chunk, the count-field clamp: asserted by tests), module writes made twice (dark module, timing at the finder edge, the bit clear), cost-only code (clean-block RS), degree-bounded Reed-Solomon guards subsumed by the final syndrome re-check, and always-zero ECI prefix bits. One is UNOBSERVABLE: `rsDecode`'s `l > ec_len / 2` needs a received word whose locator splits completely and corrects to a codeword, which damaging a valid symbol does not produce.
 
 ## Threat model & out of scope
 

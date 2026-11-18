@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **Behaviour change:** `ckdPriv`, `ckdPrivWithParentPub`, `ckdPub` and `derivePath` return the new `error.MaximumDepthExceeded` for a parent at depth 255 instead of wrapping the child's depth to 0 (which produced a key `parseExtended` rejects); same as rust-bitcoin, bitcoinjs and btcd. `CkdError` grew by one member, so an exhaustive `switch` over it needs the new arm. Whole-module mutation (265 mutants, 242 killed, 23 equivalent) with 8 new tests; see SPEC "Audit 2026-11-17".
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE (ReleaseSmall dead-stack fix, partial):** the private `pubkeyFromPriv` takes the key by pointer; by value, with nothing inlined in ReleaseSmall, `neuter` left the master key in its own frame above every burn. ⚠ ReleaseSmall still reports the master CHAIN CODE once per `neuter`, 166 B below the call — the copy of the returned `ExtendedPubKey` (whose `chain_code` the caller receives anyway); open, see SPEC Backlog. ReleaseFast/ReleaseSafe/Debug unchanged and green.

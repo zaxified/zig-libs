@@ -1120,9 +1120,10 @@ fn penalty(m: *const Matrix) u32 {
         }
     }
     const total = @as(usize, side) * side;
-    const pct = dark * 100 / total;
-    const dev = if (pct > 50) pct - 50 else 50 - pct;
-    score += @intCast(dev / 5 * 10);
+    // k = floor(|dark/total - 1/2| * 20): steps of 5% of the EXACT deviation
+    // (ISO/IEC 18004 Table 11; ZXing, nayuki and segno agree).
+    const k = (if (dark * 20 > total * 10) dark * 20 - total * 10 else total * 10 - dark * 20) / total;
+    score += @intCast(k * 10);
 
     return score;
 }
@@ -3101,4 +3102,637 @@ test "mixed: random digit/upper/byte payloads round-trip, never a larger version
             } else |_| {}
         }
     }
+}
+
+// ── whole-module mutation tests (2026-11-17) ─────────────────────────────────
+
+fn sameMatrix(a: *const Matrix, b: *const Matrix) !void {
+    const t = std.testing;
+    try t.expectEqual(a.size, b.size);
+    try t.expectEqual(a.version, b.version);
+    try t.expectEqual(a.mask, b.mask);
+    for (0..a.size) |y| for (0..a.size) |x| {
+        if (a.isDark(@intCast(x), @intCast(y)) != b.isDark(@intCast(x), @intCast(y))) return error.MatrixMismatch;
+    };
+}
+
+test "mutation: encodeSequence refuses a bad version and more than sixteen symbols" {
+    const t = std.testing;
+    const out = try t.allocator.alloc(Matrix, 20);
+    defer t.allocator.free(out);
+    try t.expectError(Error.BadVersion, encodeSequence(out, "abc", .{ .version = 0 }));
+    try t.expectError(Error.BadVersion, encodeSequence(out, "abc", .{ .version = 41 }));
+    try t.expectError(Error.BadVersion, encode(&out[0], "abc", .{ .version = 0 }));
+    // 20 slots are offered but the standard counts to 16: a message that needs 17 symbols
+    // even at version 40 is refused, searched or forced.
+    const big = try t.allocator.alloc(u8, 17 * maxChunk(.byte, 40, .low, sequence_header_bits) - 16);
+    defer t.allocator.free(big);
+    @memset(big, 'x');
+    try t.expectError(Error.TooLong, encodeSequence(out, big, .{ .ecc = .low }));
+    try t.expectError(Error.TooLong, encodeSequence(out, big, .{ .ecc = .low, .version = 40 }));
+}
+
+test "mutation: a forced version holds exactly as many symbols as there are slots" {
+    const t = std.testing;
+    var out: [2]Matrix = undefined;
+    const chunk = maxChunk(.byte, 5, .medium, sequence_header_bits);
+    const text = try t.allocator.alloc(u8, 2 * chunk + 1);
+    defer t.allocator.free(text);
+    @memset(text, 'x');
+    const two = try encodeSequence(&out, text[0 .. 2 * chunk], .{ .ecc = .medium, .version = 5 });
+    try t.expectEqual(@as(usize, 2), two.len);
+    try t.expectError(Error.TooLong, encodeSequence(&out, text, .{ .ecc = .medium, .version = 5 }));
+}
+
+test "mutation: the largest symbol is reachable, one-symbol sequences included" {
+    const t = std.testing;
+    const text = try t.allocator.alloc(u8, 2900);
+    defer t.allocator.free(text);
+    @memset(text, 'x');
+    var m: Matrix = undefined;
+    try encode(&m, text, .{ .ecc = .low });
+    try t.expectEqual(@as(u6, 40), m.version);
+    var out: [1]Matrix = undefined;
+    const one = try encodeSequence(&out, text, .{ .ecc = .low });
+    try t.expectEqual(@as(usize, 1), one.len);
+    try t.expectEqual(@as(u6, 40), one[0].version);
+}
+
+test "mutation: every symbol of a sequence has the one chosen version and mode" {
+    const t = std.testing;
+    var text: [71]u8 = undefined;
+    text[0] = 'k';
+    for (text[1..], 0..) |*c, i| c.* = '0' + @as(u8, @intCast(i % 10));
+    var out: [4]Matrix = undefined;
+    const got = try encodeSequence(&out, &text, .{ .ecc = .low });
+    try t.expect(got.len >= 2);
+    const chunk = maxChunk(.byte, got[0].version, .low, sequence_header_bits);
+    var exp: Matrix = undefined;
+    for (got, 0..) |g, i| {
+        const start = i * chunk;
+        const end = @min(start + chunk, text.len);
+        try encodeOne(&exp, text[start..end], .{ .ecc = .low, .version = got[0].version, .mode = .byte }, .{
+            .index = @intCast(i),
+            .total = @intCast(got.len),
+            .parity = sequenceParity(&text),
+        });
+        try sameMatrix(&exp, &g);
+    }
+}
+
+test "mutation: optimize_segments is ignored by encodeSequence, and by empty text" {
+    const t = std.testing;
+    var text: [90]u8 = undefined;
+    for (&text, 0..) |*c, i| c.* = if (i % 9 < 5) '0' + @as(u8, @intCast(i % 10)) else 'a' + @as(u8, @intCast(i % 20));
+    var a: [4]Matrix = undefined;
+    var b: [4]Matrix = undefined;
+    const x = try encodeSequence(&a, &text, .{ .ecc = .low });
+    const y = try encodeSequence(&b, &text, .{ .ecc = .low, .optimize_segments = true });
+    try t.expectEqual(x.len, y.len);
+    for (x, y) |p, q| try sameMatrix(&p, &q);
+
+    var e1: Matrix = undefined;
+    var e2: Matrix = undefined;
+    try encode(&e1, "", .{});
+    try encode(&e2, "", .{ .optimize_segments = true });
+    try sameMatrix(&e1, &e2);
+}
+
+test "mutation: the longest mixed text fits, one more does not; version 0 is refused" {
+    const t = std.testing;
+    const digits = try t.allocator.alloc(u8, max_mixed + 1);
+    defer t.allocator.free(digits);
+    @memset(digits, '7');
+    var m: Matrix = undefined;
+    try encode(&m, digits[0..max_mixed], .{ .ecc = .low, .optimize_segments = true });
+    try t.expectEqual(@as(u6, 40), m.version);
+    try t.expectError(Error.TooLong, encode(&m, digits, .{ .ecc = .low, .optimize_segments = true }));
+    try t.expectError(Error.BadVersion, encode(&m, "1", .{ .optimize_segments = true, .version = 0 }));
+}
+
+test "mutation: an exact fit is accepted by every version selector" {
+    const t = std.testing;
+    const d27 = "012345678901234567890123456";
+    try t.expectEqual(dataCapacityBits(1, .quartile), dataBits(.numeric, 27, 1));
+    var m: Matrix = undefined;
+    try encode(&m, d27, .{ .ecc = .quartile, .version = 1 });
+    try encode(&m, d27, .{ .ecc = .quartile });
+    try t.expectEqual(@as(u6, 1), m.version);
+    try encode(&m, d27, .{ .ecc = .quartile, .version = 1, .optimize_segments = true });
+    try encode(&m, d27, .{ .ecc = .quartile, .optimize_segments = true });
+    try t.expectEqual(@as(u6, 1), m.version);
+    var buf: [max_mixed]u8 = undefined;
+    try t.expectEqual(@as(u6, 1), try pickMixedVersion(d27, .quartile, 1, &buf));
+    try t.expectEqual(@as(?u6, 1), pickVersion(.numeric, 27, .quartile, 0));
+    try t.expectEqual(@as(?u6, 2), pickVersion(.numeric, 28, .quartile, 0));
+}
+
+test "mutation: gf.inverse(0) is the documented 0" {
+    try std.testing.expectEqual(@as(u8, 0), gf.inverse(0));
+    try std.testing.expectEqual(@as(u8, 1), gf.mul(gf.inverse(2), 2));
+}
+
+test "mutation: a character-count field is never the binding limit (maxChunk)" {
+    // If this fails, `maxChunk`'s count_max clamp becomes live.
+    const t = std.testing;
+    for (1..41) |vv| {
+        const v: u6 = @intCast(vv);
+        for ([_]Ecc{ .low, .medium, .quartile, .high }) |ecc| {
+            for ([_]Mode{ .numeric, .alphanumeric, .byte }) |mode| {
+                const count_max = (@as(usize, 1) << countBits(mode, v)) - 1;
+                try t.expect(dataBits(mode, count_max + 1, v) > dataCapacityBits(v, ecc));
+            }
+        }
+    }
+    // And a header of at most 48 bits always leaves room for a character: chunk >= 1.
+    for ([_]Mode{ .numeric, .alphanumeric, .byte }) |mode| {
+        try t.expect(maxChunk(mode, 1, .high, sequence_header_bits + 28) >= 1);
+    }
+}
+
+/// Exact minimal bit count of `text` over every split into numeric / alphanumeric / byte
+/// segments, the character-count widths of version `v`. `maxInt` if none exists.
+fn oracleMixedBits(text: []const u8, v: u6) usize {
+    const inf = std.math.maxInt(usize);
+    var dp: [1300]usize = undefined;
+    dp[0] = 0;
+    for (1..text.len + 1) |i| {
+        dp[i] = inf;
+        var num_ok = true;
+        var an_ok = true;
+        var j: usize = i;
+        while (j > 0) {
+            j -= 1;
+            num_ok = num_ok and text[j] >= '0' and text[j] <= '9';
+            an_ok = an_ok and alnumValue(text[j]) != null;
+            if (dp[j] == inf) continue;
+            const len = i - j;
+            const modes = [3]Mode{ .numeric, .alphanumeric, .byte };
+            const ok = [3]bool{ num_ok, an_ok, true };
+            for (modes, ok) |mode, allowed| {
+                if (!allowed or len >= @as(usize, 1) << countBits(mode, v)) continue;
+                dp[i] = @min(dp[i], dp[j] + dataBits(mode, len, v));
+            }
+        }
+    }
+    return dp[text.len];
+}
+
+fn oracleMixedVersion(text: []const u8, ecc: Ecc) ?u6 {
+    const reps = [3]u6{ 1, 10, 27 }; // the count widths change at these versions only
+    var bits: [3]usize = undefined;
+    for (reps, 0..) |rv, i| bits[i] = oracleMixedBits(text, rv);
+    var v: u6 = 1;
+    while (v <= 40) : (v += 1) {
+        const b = bits[if (v <= 9) 0 else if (v <= 26) 1 else 2];
+        if (b != std.math.maxInt(usize) and b <= dataCapacityBits(v, ecc)) return v;
+    }
+    return null;
+}
+
+fn oracleText(buf: []u8, kind: u8, n: usize) []const u8 {
+    for (buf[0..n], 0..) |*c, i| c.* = switch (kind) {
+        0 => '0' + @as(u8, @intCast(i % 10)),
+        1 => "ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:0123456789"[i % 44],
+        2 => 'a' + @as(u8, @intCast(i % 26)),
+        3 => if ((i / 7) % 3 == 0) '0' + @as(u8, @intCast(i % 10)) else if ((i / 7) % 3 == 1) 'A' + @as(u8, @intCast(i % 26)) else 'a' + @as(u8, @intCast(i % 26)),
+        else => if ((i / 11) % 2 == 0) '5' else 'z',
+    };
+    return buf[0..n];
+}
+
+test "mutation: planSegments finds the exact minimum, pickMixedVersion the exact smallest version" {
+    const t = std.testing;
+    var text_buf: [1300]u8 = undefined;
+    var plan: [max_mixed]u8 = undefined;
+    var lens: [64]usize = undefined;
+    var nl: usize = 0;
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 10, 13, 17, 22, 31, 40, 55, 70, 95, 130, 180 }) |n| {
+        lens[nl] = n;
+        nl += 1;
+    }
+    var n: usize = 262;
+    while (n <= 276) : (n += 1) { // the 8-bit / 16-bit count boundary of the byte mode
+        lens[nl] = n;
+        nl += 1;
+    }
+    for ([_]usize{ 330, 1023, 1024 }) |nn| {
+        lens[nl] = nn;
+        nl += 1;
+    }
+    for (lens[0..nl]) |len| {
+        for (0..5) |kind| {
+            const text = oracleText(&text_buf, @intCast(kind), len);
+            for ([_]u6{ 1, 9, 10, 26, 27 }) |rep| {
+                const want = oracleMixedBits(text, rep);
+                const got = planSegments(text, rep, &plan);
+                // A run longer than the count field is not split by the planner, which is
+                // harmless: such a text cannot fit the group's largest symbol anyway.
+                const last: u6 = if (rep <= 9) 9 else if (rep <= 26) 26 else 40;
+                if (want > dataCapacityBits(last, .low)) {
+                    try t.expect(got == want or got == std.math.maxInt(usize));
+                } else {
+                    try t.expectEqual(want, got);
+                }
+            }
+            for ([_]Ecc{ .low, .quartile }) |ecc| {
+                const want = oracleMixedVersion(text, ecc);
+                if (pickMixedVersion(text, ecc, null, &plan)) |got| {
+                    try t.expectEqual(want.?, got);
+                } else |_| {
+                    try t.expectEqual(@as(?u6, null), want);
+                }
+            }
+        }
+    }
+}
+
+// ── penalty: differential test against a naive transcription of ISO/IEC 18004 §8.8.2 ──
+
+fn refPenalty(m: *const Matrix) u32 {
+    const side: usize = m.size;
+    var score: u32 = 0;
+    // N1: five or more in a row or column: 3 + (length - 5)
+    for (0..2) |dir| {
+        for (0..side) |a| {
+            var b: usize = 0;
+            while (b < side) {
+                const first = if (dir == 0) m.isDark(@intCast(b), @intCast(a)) else m.isDark(@intCast(a), @intCast(b));
+                var e = b + 1;
+                while (e < side) : (e += 1) {
+                    const v = if (dir == 0) m.isDark(@intCast(e), @intCast(a)) else m.isDark(@intCast(a), @intCast(e));
+                    if (v != first) break;
+                }
+                if (e - b >= 5) score += @intCast(3 + (e - b - 5));
+                b = e;
+            }
+        }
+    }
+    // N2: 2x2 blocks
+    for (0..side - 1) |y| for (0..side - 1) |x| {
+        const c = m.isDark(@intCast(x), @intCast(y));
+        if (m.isDark(@intCast(x + 1), @intCast(y)) == c and m.isDark(@intCast(x), @intCast(y + 1)) == c and m.isDark(@intCast(x + 1), @intCast(y + 1)) == c) score += 3;
+    };
+    // N3: 1011101 with four light modules before or after, every window counted
+    const dl = [_]u8{ 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0 };
+    const ld = [_]u8{ 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1 };
+    for (0..2) |dir| for (0..side) |a| {
+        if (side < 11) continue;
+        for (0..side - 10) |b| {
+            for ([_][11]u8{ dl, ld }) |pat| {
+                var hit = true;
+                for (0..11) |k| {
+                    const v = if (dir == 0) m.isDark(@intCast(b + k), @intCast(a)) else m.isDark(@intCast(a), @intCast(b + k));
+                    if (@intFromBool(v) != pat[k]) hit = false;
+                }
+                if (hit) score += 40;
+            }
+        }
+    };
+    // N4: 10 per started... full 5% step of the exact deviation from 50%
+    var dark: usize = 0;
+    for (0..side) |y| for (0..side) |x| {
+        if (m.isDark(@intCast(x), @intCast(y))) dark += 1;
+    };
+    const total = side * side;
+    const twice = dark * 2;
+    const dev = if (twice > total) twice - total else total - twice; // |2*dark - total|
+    score += @intCast(dev * 10 / total * 10);
+    return score;
+}
+
+test "mutation: penalty equals the ISO reference on random, striped and finder-like grids" {
+    const t = std.testing;
+    var prng = std.Random.DefaultPrng.init(0x51C0DE);
+    const rnd = prng.random();
+    var m: Matrix = undefined;
+    for (0..400) |round| {
+        const side: u16 = 21 + 4 * @as(u16, @intCast(round % 4));
+        m = .{ .size = side };
+        @memset(&m.bits, 0);
+        const densities = [_]u8{ 50, 20, 80, 10, 92 };
+        const density = densities[round % 5];
+        for (0..side) |y| for (0..side) |x| m.setDark(@intCast(x), @intCast(y), rnd.uintLessThan(u8, 100) < density);
+        if (round % 3 == 0) { // plant finder-like windows, both orientations and both layouts
+            for (0..6) |_| {
+                const a = rnd.uintLessThan(usize, side);
+                const b0 = rnd.uintLessThan(usize, side - 10);
+                const horiz = rnd.boolean();
+                const flip = rnd.boolean();
+                const pat = if (flip) [_]u8{ 0, 0, 0, 0, 1, 0, 1, 1, 1, 0, 1 } else [_]u8{ 1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0 };
+                for (0..11) |k| {
+                    if (horiz) m.setDark(@intCast(b0 + k), @intCast(a), pat[k] == 1) else m.setDark(@intCast(a), @intCast(b0 + k), pat[k] == 1);
+                }
+            }
+        }
+        if (round % 7 == 0) { // long runs and full blocks
+            for (0..side) |x| m.setDark(@intCast(x), 3, round % 2 == 0);
+            for (0..side) |y| m.setDark(5, @intCast(y), round % 2 == 1);
+        }
+        try t.expectEqual(refPenalty(&m), penalty(&m));
+    }
+}
+
+test "mutation: the auto mask is the lowest-numbered of equal minimum penalties" {
+    const t = std.testing;
+    var ties: usize = 0;
+    var text: [24]u8 = undefined;
+    var k: usize = 0;
+    while (k < 4000 and ties < 3) : (k += 1) {
+        const s = std.fmt.bufPrint(&text, "{d}", .{k * 7919 + 13}) catch unreachable;
+        var scores: [8]u32 = undefined;
+        var m: Matrix = undefined;
+        for (0..8) |p| {
+            try encode(&m, s, .{ .mask = @intCast(p) });
+            scores[p] = penalty(&m);
+        }
+        var best: usize = 0;
+        var n_best: usize = 0;
+        for (scores, 0..) |sc, p| {
+            if (sc < scores[best]) best = p;
+        }
+        for (scores) |sc| n_best += @intFromBool(sc == scores[best]);
+        try encode(&m, s, .{});
+        try t.expectEqual(@as(u3, @intCast(best)), m.mask);
+        if (n_best > 1) ties += 1;
+    }
+    try t.expect(ties >= 1);
+}
+
+// ── format information: each copy alone must be readable, and the BCH radius is exactly 3 ──
+
+fn formatPos(side: u16, copy: u1, k: u16) [2]u16 {
+    if (copy == 0) {
+        const x: u16 = if (k <= 7) 8 else if (k == 8) 7 else 14 - k;
+        const y: u16 = if (k <= 5) k else if (k == 6) 7 else if (k == 7) 8 else 8;
+        return .{ x, y };
+    }
+    return if (k < 8) .{ side - 1 - k, 8 } else .{ 8, side - 15 + k };
+}
+
+fn flipFormat(m: *Matrix, copy: u1, bits: u16) void {
+    for (0..15) |k| {
+        if ((bits >> @intCast(k)) & 1 == 1) {
+            const p = formatPos(m.size, copy, @intCast(k));
+            m.setDark(p[0], p[1], !m.isDark(p[0], p[1]));
+        }
+    }
+}
+
+/// A weight-4 error pattern no codeword of the format code is nearer to than 4: the same for
+/// every format value (the valid words are one coset of a linear code).
+fn farPattern() u16 {
+    const data: u32 = (@as(u32, Ecc.medium.formatBits()) << 3) | 5;
+    const word = ((data << 10) | bch(data, 0x537, 10)) ^ 0x5412;
+    var s: u16 = 0;
+    while (s < 0x8000) : (s += 1) {
+        if (@popCount(s) != 4) continue;
+        var nearest: u32 = 16;
+        for (0..32) |c| {
+            const cw = ((@as(u32, @intCast(c)) << 10) | bch(@intCast(c), 0x537, 10)) ^ 0x5412;
+            nearest = @min(nearest, @popCount(cw ^ word ^ s));
+        }
+        if (nearest == 4) return s;
+    }
+    unreachable;
+}
+
+test "mutation: format information is read from either copy alone, up to three errors each" {
+    const t = std.testing;
+    var out: [16]u8 = undefined;
+    var m: Matrix = undefined;
+    const far = farPattern();
+    for ([_]Ecc{ .low, .medium, .quartile, .high }) |ecc| {
+        for (0..8) |mask| {
+            try encode(&m, "1", .{ .ecc = ecc, .mask = @intCast(mask), .version = 1 });
+            // one copy unreadable (four errors), the other with three errors; both ways round
+            var a = m;
+            flipFormat(&a, 1, far);
+            flipFormat(&a, 0, 0b000000000000111);
+            try t.expectEqualStrings("1", try decode(&a, &out));
+            var b = m;
+            flipFormat(&b, 0, far);
+            flipFormat(&b, 1, 0b000000100100001);
+            try t.expectEqualStrings("1", try decode(&b, &out));
+            // both copies with exactly three errors
+            var c = m;
+            flipFormat(&c, 0, 0b000000100100010);
+            flipFormat(&c, 1, 0b100000001000100);
+            try t.expectEqualStrings("1", try decode(&c, &out));
+            // one copy unreadable, the other intact
+            var d = m;
+            flipFormat(&d, 0, far);
+            try t.expectEqualStrings("1", try decode(&d, &out));
+            var e = m;
+            flipFormat(&e, 1, far);
+            try t.expectEqualStrings("1", try decode(&e, &out));
+        }
+    }
+}
+
+test "mutation: four format errors in both copies are refused when no codeword is nearer than four" {
+    const t = std.testing;
+    var out: [16]u8 = undefined;
+    var m: Matrix = undefined;
+    try encode(&m, "1", .{ .ecc = .medium, .mask = 5, .version = 1 });
+    const far = farPattern();
+    flipFormat(&m, 0, far);
+    flipFormat(&m, 1, far);
+    try t.expectError(DecodeError.BadFormat, decode(&m, &out));
+}
+
+test "mutation: the first long block's last codeword is read in its own place" {
+    const t = std.testing;
+    var text: [40]u8 = undefined;
+    for (&text, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+    var m: Matrix = undefined;
+    try encode(&m, &text, .{ .version = 5, .ecc = .quartile, .mask = 2 });
+    const spec = ecSpec(5, .quartile);
+    const total = totalCodewords(5);
+    const data_len = total - @as(usize, spec.ec_per_block) * spec.blocks;
+    const short = data_len / spec.blocks;
+    const long = data_len % spec.blocks;
+    try t.expect(long > 0);
+    // damage 9 (= the level's capability) data codewords of each long block, short of the long block's
+    // extra last one: a reader that misplaces that one then has a tenth error and fails
+    var scratch: Matrix = .{ .size = m.size, .version = 5 };
+    @memset(&scratch.bits, 0);
+    var reserved: [(max_size * max_size + 7) / 8]u8 = undefined;
+    @memset(&reserved, 0);
+    drawFunctionPatterns(&scratch, &reserved);
+    var cw_of_bit: [max_codewords * 8][2]u16 = undefined;
+    var w = Walk.init(m.size, &reserved);
+    var nbits: usize = 0;
+    while (w.next()) |p| : (nbits += 1) cw_of_bit[nbits] = p;
+    for (spec.blocks - long..spec.blocks) |b| {
+        var d = m;
+        for (short - 9..short) |j| {
+            var idx: usize = 0;
+            for (0..j) |r| {
+                for (0..spec.blocks) |bb| {
+                    if (r < short + @as(usize, @intFromBool(bb >= spec.blocks - long))) idx += 1;
+                }
+            }
+            for (0..b) |bb| {
+                if (j < short + @as(usize, @intFromBool(bb >= spec.blocks - long))) idx += 1;
+            }
+            for (0..8) |bit| {
+                const p = cw_of_bit[idx * 8 + bit];
+                d.setDark(p[0], p[1], !d.isDark(p[0], p[1]));
+            }
+        }
+        var out: [64]u8 = undefined;
+        try t.expectEqualSlices(u8, &text, try decode(&d, &out));
+    }
+}
+
+fn segDecode(bits: *const TestBits, out: []u8) DecodeError![]u8 {
+    var seq: ?Sequence = null;
+    var eci: ?u32 = null;
+    return parseSegments(bits.bytes(), 1, out, &seq, &eci);
+}
+
+test "mutation: parseSegments guards, boundaries and exact-fit buffers" {
+    const t = std.testing;
+    var out: [16]u8 = undefined;
+    // a structured-append header is only legal as the first segment
+    var b1: TestBits = .{};
+    b1.put(0b0100, 4);
+    b1.put(1, 8);
+    b1.put('A', 8);
+    b1.put(0b0011, 4);
+    b1.put(0, 4);
+    b1.put(0, 4);
+    b1.put(0, 8);
+    try t.expectError(DecodeError.BadData, segDecode(&b1, &out));
+    // ECI designator 111xxxxx is reserved
+    var b2: TestBits = .{};
+    b2.put(0b0111, 4);
+    b2.put(0xE0, 8);
+    b2.put(0, 16);
+    try t.expectError(DecodeError.BadData, segDecode(&b2, &out));
+    // numeric: three digits, exact fit and one short
+    var n3: TestBits = .{};
+    n3.put(0b0001, 4);
+    n3.put(3, 10);
+    n3.put(123, 10);
+    try t.expectEqualStrings("123", try segDecode(&n3, out[0..3]));
+    try t.expectError(DecodeError.BufferTooSmall, segDecode(&n3, out[0..2]));
+    // numeric: one trailing digit, then two trailing digits
+    var n4: TestBits = .{};
+    n4.put(0b0001, 4);
+    n4.put(4, 10);
+    n4.put(123, 10);
+    n4.put(4, 4);
+    try t.expectEqualStrings("1234", try segDecode(&n4, out[0..4]));
+    try t.expectError(DecodeError.BufferTooSmall, segDecode(&n4, out[0..3]));
+    var n5: TestBits = .{};
+    n5.put(0b0001, 4);
+    n5.put(5, 10);
+    n5.put(123, 10);
+    n5.put(45, 7);
+    try t.expectEqualStrings("12345", try segDecode(&n5, out[0..5]));
+    try t.expectError(DecodeError.BufferTooSmall, segDecode(&n5, out[0..4]));
+    // numeric groups out of range: a single digit above 9, a pair above 99
+    var s10: TestBits = .{};
+    s10.put(0b0001, 4);
+    s10.put(1, 10);
+    s10.put(10, 4);
+    try t.expectError(DecodeError.BadData, segDecode(&s10, &out));
+    var p100: TestBits = .{};
+    p100.put(0b0001, 4);
+    p100.put(2, 10);
+    p100.put(100, 7);
+    try t.expectError(DecodeError.BadData, segDecode(&p100, &out));
+    // alphanumeric: a pair and a single, exact fit; single index 45 and 63 are refused
+    var a2: TestBits = .{};
+    a2.put(0b0010, 4);
+    a2.put(2, 9);
+    a2.put(0, 11);
+    try t.expectEqualStrings("00", try segDecode(&a2, out[0..2]));
+    try t.expectError(DecodeError.BufferTooSmall, segDecode(&a2, out[0..1]));
+    var a1: TestBits = .{};
+    a1.put(0b0010, 4);
+    a1.put(1, 9);
+    a1.put(44, 6);
+    try t.expectEqualStrings(":", try segDecode(&a1, out[0..1]));
+    try t.expectError(DecodeError.BufferTooSmall, segDecode(&a1, out[0..0]));
+    for ([_]u32{ 45, 63 }) |bad| {
+        var a: TestBits = .{};
+        a.put(0b0010, 4);
+        a.put(1, 9);
+        a.put(bad, 6);
+        try t.expectError(DecodeError.BadData, segDecode(&a, &out));
+    }
+    // byte: exact fit
+    var by: TestBits = .{};
+    by.put(0b0100, 4);
+    by.put(2, 8);
+    by.put('a', 8);
+    by.put('b', 8);
+    try t.expectEqualStrings("ab", try segDecode(&by, out[0..2]));
+    try t.expectError(DecodeError.BufferTooSmall, segDecode(&by, out[0..1]));
+}
+
+test "mutation: planSegments equals the exact optimum on random mixed texts" {
+    const t = std.testing;
+    var plan0: [max_mixed]u8 = undefined;
+    // found by a 20000-text search: without rounding a segment end up to a whole bit, the
+    // planner's sixth-of-a-bit costs pick a segmentation one bit longer than the optimum
+    const hard = [_]struct { text: []const u8, bits: usize }{
+        .{ .text = "/DR1149637643OSMhggj22dffcf1908779VR:9MLRNQ0ZL9223774OL8613", .bits = 390 },
+        .{ .text = "PRI4hiO6%3700814052ETRZA0-6ZdehgeM$", .bits = 262 },
+        .{ .text = "9029613833jdhG/ddgHO 7884627558CAFXH$HA67.VN8245fcjfjbbajcgg", .bits = 410 },
+    };
+    for (hard) |h| {
+        try t.expectEqual(h.bits, oracleMixedBits(h.text, 1));
+        try t.expectEqual(h.bits, planSegments(h.text, 1, &plan0));
+    }
+    var prng = std.Random.DefaultPrng.init(0xC057);
+    const rnd = prng.random();
+    var text: [120]u8 = undefined;
+    var plan: [max_mixed]u8 = undefined;
+    const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+    for (0..400) |_| {
+        const len = rnd.uintLessThan(usize, 100) + 1;
+        var i: usize = 0;
+        while (i < len) {
+            const run = @min(len - i, rnd.uintLessThan(usize, 12) + 1);
+            const kind = rnd.uintLessThan(u8, 3);
+            for (0..run) |k| text[i + k] = switch (kind) {
+                0 => '0' + rnd.uintLessThan(u8, 10),
+                1 => upper[rnd.uintLessThan(usize, upper.len)],
+                else => 'a' + rnd.uintLessThan(u8, 26),
+            };
+            i += run;
+        }
+        for ([_]u6{ 1, 10, 27 }) |rep| {
+            try t.expectEqual(oracleMixedBits(text[0..len], rep), planSegments(text[0..len], rep, &plan));
+        }
+    }
+}
+
+test "mutation: a forced version refuses text one bit over its capacity" {
+    const t = std.testing;
+    var m: Matrix = undefined;
+    var hits: usize = 0;
+    var buf: [300]u8 = undefined;
+    for (1..6) |vv| {
+        const v: u6 = @intCast(vv);
+        for ([_]Ecc{ .low, .medium, .quartile, .high }) |ecc| {
+            for (1..buf.len) |len| {
+                const bits = dataBits(.alphanumeric, len, v);
+                const cap = dataCapacityBits(v, ecc);
+                if (bits != cap + 1 and bits != cap) continue;
+                @memset(buf[0..len], 'A');
+                if (bits == cap) {
+                    try encode(&m, buf[0..len], .{ .version = v, .ecc = ecc, .mode = .alphanumeric });
+                } else {
+                    try t.expectError(Error.TooLong, encode(&m, buf[0..len], .{ .version = v, .ecc = ecc, .mode = .alphanumeric }));
+                    hits += 1;
+                }
+            }
+        }
+    }
+    try t.expect(hits >= 1);
 }

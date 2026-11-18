@@ -349,3 +349,27 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation tests (2026-11-17) ─────────────────────────────────
+
+test "mutation: SVG background covers the whole field, and ampersand and apostrophe are escaped" {
+    var m: Matrix = undefined;
+    try root.encode(&m, "1", .{ .version = 1 });
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeSvg(&aw.writer, &m, .{ .title = "a&b'c", .light = "#eee" });
+    const svg = aw.written();
+    try testing.expect(std.mem.find(u8, svg, "<rect width=\"29\" height=\"29\" fill=\"#eee\"/>") != null);
+    try testing.expect(std.mem.find(u8, svg, "<title>a&amp;b&apos;c</title>") != null);
+}
+
+test "mutation: the terminal output has one line per two rows, last odd row included" {
+    var m: Matrix = undefined;
+    try root.encode(&m, "1", .{ .version = 1 });
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeTerminal(&aw.writer, &m, .{});
+    // (21 + 2 * 4) = 29 rows: 15 lines, the last one with only a top half
+    try testing.expectEqual(@as(usize, 15), std.mem.count(u8, aw.written(), "\n"));
+}
