@@ -50,8 +50,9 @@
 //!   * **A rejecting sink costs liveness, not data.** A failed sink write is
 //!     returned to the WAL and retried forever by default, so the durability
 //!     guarantee above holds against a sink that is down, full, or refusing:
-//!     `flushAll` keeps retrying rather than returning, and the record survives
-//!     a crash either way. Only an explicit `max_flush_attempts` cap trades
+//!     `flushAll` keeps retrying until `Options.flush_timeout_ns` and then
+//!     reports `error.FlushIncomplete`, and the record survives a crash either
+//!     way. Only an explicit `max_flush_attempts` cap trades
 //!     that for dropping poison records, and a dropped record is counted
 //!     (`poisonedCount`) and inspectable (`poisoned`).
 //!
@@ -85,11 +86,11 @@
 //!
 //! `workerpool`'s lifecycle (`drain`/`deinit`) must not run concurrently with
 //! `submit`. The coordinator is the *only* submitter, and it submits only from
-//! the coordinator thread. `deinit` first runs `flushAll` (which blocks until
-//! every submitted flush has completed and been harvested — no jobs are in
-//! flight and none are about to be submitted), and only *then* calls
-//! `pool.drain()`. So producers are provably quiesced before the lifecycle
-//! call. `max_submitters = 0`: only the shared, spinlock-serialized `submit`
+//! the coordinator thread. `deinit` first runs `flushAll` and only *then*
+//! calls `pool.drain()`, both on the coordinator thread, so nothing can submit
+//! while the pool drains: producers are quiesced before the lifecycle call
+//! (when `flushAll` gave up at its deadline, `pool.drain()` waits for the
+//! flushes still running). `max_submitters = 0`: only the shared, spinlock-serialized `submit`
 //! path is used, never a `Submitter` handle.
 
 const std = @import("std");
@@ -325,14 +326,31 @@ pub const Options = struct {
     max_cache_entries: usize,
     /// Flush worker count. `null` ⇒ a cpu-derived default (min 1).
     n_workers: ?usize = null,
-    /// Requeue backoff after a *failed* sink write (wall ns). Default 0 = retry
-    /// on the next drain with no delay.
+    /// How long a key waits after a *failed* sink write before its record is
+    /// retried (ns on `wal_mono_clock`). Default 0 = retry on the next drain
+    /// with no delay. The wait is kept in memory per key, not in the WAL: the
+    /// record goes back to the WAL visible at once, so it stays the oldest of
+    /// its key and a newer write to that key cannot overtake it (a WAL-side
+    /// backoff hid it, the newer record flushed first and the retried older
+    /// one then overwrote it). The key's later records wait behind it. After a
+    /// restart the record is retried without delay (Kafka's `retry.backoff.ms`
+    /// is in-memory too).
     retry_backoff_ns: u64 = 0,
+    /// How long `flushAll` (and so `sync` and `deinit`) keeps waiting for
+    /// pending records -- in-flight flushes, retries after a rejection, a key's
+    /// `retry_backoff_ns` -- before it gives up with `error.FlushIncomplete`.
+    /// Default 120 s, Kafka's `delivery.timeout.ms` (the bound on how long
+    /// `producer.flush()` can wait for a record to be delivered or fail).
+    /// 0 = never wait: flush what can be flushed synchronously, then report.
+    /// `std.math.maxInt(u64)` = no limit. Records still pending when it gives
+    /// up stay durable in the WAL.
+    flush_timeout_ns: u64 = 120 * std.time.ns_per_s,
     /// Sink-write attempts before the WAL gives up on a record and dead-letters
     /// it. **0 (the default) = never give up**, which is what the durability
     /// guarantee above requires: an acknowledged `put` stays retryable until the
     /// sink accepts it, so a permanently-failing sink is a liveness problem
-    /// (`flushAll` keeps retrying at ~20 Hz) and never a data-loss one.
+    /// (`flushAll` keeps retrying until `flush_timeout_ns`, then returns
+    /// `error.FlushIncomplete`) and never a data-loss one.
     ///
     /// Set a finite cap only if you would rather drop a record the sink keeps
     /// rejecting — a "poison" record, e.g. a value that violates a sink-side
@@ -345,9 +363,9 @@ pub const Options = struct {
     /// SPEC promised the opposite.
     ///
     /// Note the shutdown consequence: `deinit` runs `flushAll`, so tearing down
-    /// while the sink is refusing blocks until it accepts. `deinitNoFlush`
-    /// is the bounded exit — it leaves the WAL durable for the next process's
-    /// `recover()`.
+    /// while the sink is refusing blocks for up to `flush_timeout_ns`.
+    /// `deinitNoFlush` is the immediate exit — it leaves the WAL durable for
+    /// the next process's `recover()`.
     max_flush_attempts: u32 = 0,
     /// High-water mark for back-pressure: the most acknowledged writes that may
     /// wait un-flushed (`pendingCount`) before `put`/`del` stop admitting more.
@@ -390,6 +408,14 @@ pub const GetError = error{SinkReadFailed} || Allocator.Error;
 
 pub const RecoverError = error{SinkWriteFailed};
 
+pub const FlushError = error{
+    /// `Options.flush_timeout_ns` passed with writes still pending
+    /// (`pendingCount() > 0`) or flushes still in flight. Nothing is lost:
+    /// every pending record is still in the WAL, retried by the next
+    /// `drain`/`flushAll` or replayed by `recover()` after a restart.
+    FlushIncomplete,
+};
+
 const Op = enum { put, del };
 
 /// One queued flush: an owned snapshot of a single WAL record plus the lease to
@@ -413,6 +439,10 @@ pub const Coordinator = struct {
     wal: jobqueue.Queue,
     cache: ramcache.Cache,
     retry_backoff_ns: u64,
+    /// `Options.flush_timeout_ns`.
+    flush_timeout_ns: u64,
+    /// `Options.wal_mono_clock`: the clock of the per-key retry wait.
+    mono: jobqueue.MonoClock,
     /// `jobqueue`'s `max_attempts` for every WAL record we enqueue; `maxInt`
     /// when `Options.max_flush_attempts` is 0 (the default), i.e. never
     /// dead-letter.
@@ -442,8 +472,9 @@ pub const Coordinator = struct {
     unflushed: usize = 0,
 
     /// Keys with a flush currently in flight (single-flight per key → per-key
-    /// ordering → LWW). Owns its key strings.
-    in_flight: std.StringHashMapUnmanaged(void) = .empty,
+    /// ordering → LWW), each with the task submitted for it (so a teardown
+    /// that drops queued jobs can free their tasks). Owns its key strings.
+    in_flight: std.StringHashMapUnmanaged(*FlushTask) = .empty,
     /// Dirty keys evicted from the cache before being flushed (the `on_evict`
     /// safety net): their WAL records are still durable, so the flusher must
     /// revisit them even though the cache no longer lists them dirty. Owns keys.
@@ -451,6 +482,12 @@ pub const Coordinator = struct {
     /// Keys deleted but possibly still cached — `get` returns `null` for these
     /// so a `del` is visible immediately. Cleared by a later `put`. Owns keys.
     tombstones: std.StringHashMapUnmanaged(void) = .empty,
+    /// Keys whose last flush failed, each with the `mono` time before which it
+    /// is not retried (`retry_backoff_ns`). Their record is back in the WAL and
+    /// visible; this is what holds them (and every later record of the key)
+    /// back. An entry past its time is dropped when the key is next selected.
+    /// Owns keys.
+    retry_at: std.StringHashMapUnmanaged(u64) = .empty,
     /// Scratch list of duped keys collected from `drainDirty`/`orphans`.
     /// The strings themselves are arena-allocated (`scratch_arena`) — every
     /// consumer of `scratch.items` (`startKey`/`addKeySet`/`startFlush`)
@@ -486,6 +523,8 @@ pub const Coordinator = struct {
             .wal = undefined,
             .cache = undefined,
             .retry_backoff_ns = options.retry_backoff_ns,
+            .flush_timeout_ns = options.flush_timeout_ns,
+            .mono = options.wal_mono_clock,
             .wal_max_attempts = if (options.max_flush_attempts == 0)
                 std.math.maxInt(u32)
             else
@@ -522,17 +561,22 @@ pub const Coordinator = struct {
 
     /// Graceful teardown: flush everything durably to the sink, quiesce the
     /// pool, and release all resources. Honors the pool producer-quiescence
-    /// contract (see the module doc). Blocks until the cache is clean.
+    /// contract (see the module doc). Blocks until the cache is clean or
+    /// `Options.flush_timeout_ns` passes (a sink that is down holds it that
+    /// long; `deinitNoFlush` exits at once). What is still pending then stays
+    /// durable in the WAL for the next process's `recover()`.
     pub fn deinit(self: *Coordinator) void {
-        self.flushAll(); // no jobs in flight and none about to be submitted after this
-        self.pool.drain(); // producers quiesced → safe lifecycle call
-        self.pump(); // harvest any final completions (none expected after flushAll)
+        // Gave up at the deadline: the rest stays in the WAL (see above).
+        self.flushAll() catch {};
+        self.pool.drain(); // producers quiesced → safe lifecycle call; waits for running flushes
+        self.pump(); // harvest the flushes that were still running (none after a complete flushAll)
         self.pool.deinit();
         self.wal.close();
         self.cache.deinit();
-        self.freeKeySet(&self.in_flight);
+        self.freeInFlight();
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
+        self.freeRetry();
         self.scratch.deinit(self.gpa);
         self.scratch_arena.deinit();
         const gpa = self.gpa;
@@ -546,16 +590,23 @@ pub const Coordinator = struct {
     /// caller still owns (and must close) the sink's storage.
     pub fn deinitNoFlush(self: *Coordinator) void {
         self.pool.shutdownNow();
-        self.pool.deinit();
-        // Free any un-harvested completion tasks (their sink writes ran but were
-        // never acked — the durable WAL still covers them for recovery).
-        self.pump(); // acks whatever completed; the rest are simply dropped
+        // Harvest the flushes that completed: ack them. This runs BEFORE
+        // `pool.deinit`, because acking a key can advance it to its next record
+        // and `startFlush` then calls `pool.submit` -- which a stopped pool
+        // refuses (the record goes back to the WAL), but a freed one would be a
+        // use-after-free.
+        self.pump();
         self.drainCompletionTasks();
+        self.pool.deinit();
         self.wal.close();
         self.cache.deinit();
-        self.freeKeySet(&self.in_flight);
+        // What is still in flight now is a job `shutdownNow` dropped unrun: its
+        // task was never handed back, so free it here (its WAL record stays
+        // durable for the next process's `recover()`).
+        self.freeInFlight();
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
+        self.freeRetry();
         self.scratch.deinit(self.gpa);
         self.scratch_arena.deinit();
         const gpa = self.gpa;
@@ -628,7 +679,7 @@ pub const Coordinator = struct {
             if (self.unflushed < self.max_unflushed) return;
             // Records not reachable through the cache: flush one synchronously,
             // as `flushAll` does, so waiting is never stuck on them.
-            if (self.in_flight.count() == 0 and self.flushOneSync()) continue;
+            if (self.in_flight.count() == 0 and !self.anyRetryWaiting() and self.flushOneSync()) continue;
             const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
             if (now >= deadline) return error.Backpressure;
             const wait_ms: i64 = @intCast(@min(@divTrunc(deadline - now + 999_999, 1_000_000), 20));
@@ -668,30 +719,60 @@ pub const Coordinator = struct {
 
     /// Block until the cache is fully clean: every acknowledged write is durable
     /// in the sink and nothing is in flight. Use for graceful shutdown / a
-    /// consistency barrier. Assumes the sink eventually accepts writes.
-    pub fn flushAll(self: *Coordinator) void {
+    /// consistency barrier. A rejected write does not end the wait: it is
+    /// retried (after `retry_backoff_ns`) like any other, and records whose
+    /// write was rejected on the synchronous path do not hold up the others.
+    /// The wait is bounded by `Options.flush_timeout_ns`; past it this returns
+    /// `error.FlushIncomplete` with the rest still pending in the WAL. Records
+    /// the WAL gives up on (a finite `max_flush_attempts`) are done, not
+    /// pending: they are counted by `poisonedCount` (Kafka's `flush()` likewise
+    /// waits until each record is delivered or has definitively failed).
+    pub fn flushAll(self: *Coordinator) FlushError!void {
+        const start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        const deadline = start +| @as(i96, self.flush_timeout_ns);
+        // Leases of synchronous writes the sink rejected in this pass: held
+        // (so the next synchronous flush moves on to the next record) and
+        // returned to the WAL once nothing else is visible.
+        var held: std.ArrayList(jobqueue.Lease) = .empty;
+        defer {
+            self.releaseHeld(&held);
+            held.deinit(self.gpa);
+        }
         self.drain();
         while (self.unflushed > 0 or self.in_flight.count() > 0) {
-            if (self.in_flight.count() == 0) {
+            if (self.in_flight.count() == 0 and !self.anyRetryWaiting()) {
                 // Records remain but nothing is in flight (e.g. WAL entries from
                 // a reopened log whose keys are not cache-dirty). Flush one
                 // synchronously to guarantee forward progress, then re-drain.
-                if (!self.flushOneSync()) break;
-                self.drain();
-                continue;
+                // Not while a key waits out its retry backoff: the global
+                // dequeue would hand that key's record over early.
+                switch (self.syncFlush(&held)) {
+                    .landed => {
+                        self.drain();
+                        continue;
+                    },
+                    .held => continue,
+                    .rejected, .none => {},
+                }
             }
+            // Nothing more to do now: give the rejected records back for a
+            // retry, and wait before trying them again.
+            self.releaseHeld(&held);
+            const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+            if (now >= deadline) return error.FlushIncomplete;
             // Park until a worker signals a completion (bounded), then re-drain.
+            const wait_ms: i64 = @intCast(@min(@divTrunc(deadline - now + 999_999, 1_000_000), 50));
             const gen = self.completion_gen.load(.acquire);
             self.io.futexWaitTimeout(u32, &self.completion_gen.raw, gen, .{ .duration = .{
-                .raw = .fromMilliseconds(50),
+                .raw = .fromMilliseconds(wait_ms),
                 .clock = .awake,
             } }) catch {};
             self.drain();
         }
     }
     /// Alias — a graceful-shutdown / barrier `sync`.
-    pub fn sync(self: *Coordinator) void {
-        self.flushAll();
+    pub fn sync(self: *Coordinator) FlushError!void {
+        return self.flushAll();
     }
 
     /// Replay every durable, un-acked WAL record to the sink in global enqueue
@@ -711,7 +792,12 @@ pub const Coordinator = struct {
                 self.wal.ack(lease) catch {};
                 if (self.unflushed > 0) self.unflushed -= 1;
             } else |_| {
-                self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
+                // Back to the WAL as any failed write is (a dead-lettered one
+                // is counted, a retried one waits `retry_backoff_ns`).
+                var key_buf: [jobqueue.max_field_len]u8 = undefined;
+                const key = key_buf[0..lease.partition.len];
+                @memcpy(key, lease.partition);
+                self.flushFailed(key, lease);
                 return error.SinkWriteFailed;
             }
         }
@@ -773,10 +859,11 @@ pub const Coordinator = struct {
     }
 
     fn finishTask(self: *Coordinator, t: *FlushTask) void {
-        self.removeKeySet(&self.in_flight, t.key);
+        self.clearInFlight(t.key);
         if (t.ok) {
             self.wal.ack(t.lease) catch {};
             if (self.unflushed > 0) self.unflushed -= 1;
+            self.clearRetry(t.key);
             // Advance this key: flush its next queued record, if any (keeps
             // per-key ordering). Otherwise the key is fully persisted.
             if (self.dequeueFor(t.key)) |lease2| {
@@ -802,40 +889,7 @@ pub const Coordinator = struct {
                 }
             }
         } else {
-            // Sink write failed: return the record to the WAL for retry. The key
-            // stays dirty/orphan and a later `drain` re-selects it.
-            //
-            // Unless the WAL gave up on it. `nack` dead-letters a record once it
-            // has burned `max_attempts`, and then nothing will ever redeliver
-            // it: leaving `unflushed` incremented would strand `flushAll` (it
-            // waits for a record that can no longer be dispatched) and leave the
-            // key dirty forever. Default config never reaches this — attempts
-            // are unlimited — so this runs only for a caller who asked for a
-            // finite cap, and it is counted so that choice is not silent.
-            const dead_before = self.wal.deadLetterCount();
-            self.wal.nack(t.lease, .{ .backoff_ns = self.retry_backoff_ns }) catch {};
-            if (self.wal.deadLetterCount() > dead_before) {
-                self.n_poisoned += 1;
-                if (self.unflushed > 0) self.unflushed -= 1;
-                // Same key-advance as the success path: a later record for this
-                // key is still good and must not be stranded behind the dropped
-                // one (it is also newer, so LWW is unaffected).
-                if (self.dequeueFor(t.key)) |lease2| {
-                    self.startFlush(t.key, lease2);
-                } else {
-                    _ = self.cache.markClean(t.key);
-                    self.removeKeySet(&self.orphans, t.key);
-                    // Deliberately NOT the F2 tombstone-GC step above: a
-                    // dead-lettered delete never actually reached the sink
-                    // (that is what `poisonedCount`/`n_poisoned` mean), so the
-                    // sink still holds the pre-delete value. Dropping the
-                    // tombstone here would let a later `get` read-through
-                    // straight to that stale value — the tombstone must
-                    // outlive a poisoned delete forever, which is the
-                    // conservative side of the data loss `poisonedCount`
-                    // already documents.
-                }
-            }
+            self.flushFailed(t.key, t.lease);
         }
         self.freeTask(t);
     }
@@ -876,6 +930,9 @@ pub const Coordinator = struct {
     /// record and submit it.
     fn startKey(self: *Coordinator, key: []const u8) void {
         if (self.in_flight.contains(key)) return;
+        // Waiting out a retry backoff: neither the failed record nor a newer
+        // one of this key may go yet. The key stays registered.
+        if (self.retryWaiting(key)) return;
         const lease = self.dequeueFor(key) orelse {
             // No WAL record for this key: reconcile stale bookkeeping.
             _ = self.cache.markClean(key);
@@ -883,6 +940,62 @@ pub const Coordinator = struct {
             return;
         };
         self.startFlush(key, lease);
+    }
+
+    /// A sink write of `lease` (a record of `key`) failed: return the record to
+    /// the WAL for a retry. The key is registered as an orphan, so a later
+    /// `drain` re-selects it however it was reached, and it waits
+    /// `retry_backoff_ns` first (`retry_at`).
+    ///
+    /// The record goes back with NO WAL-side backoff. `jobqueue` would move a
+    /// backed-off record to its schedule heap, out of its partition's FIFO, and
+    /// a newer record of the same key would then be dequeued first -- the
+    /// retried older value overwrote it (last-writer-wins broken, also across
+    /// a restart, because the WAL persists the backoff). Visible at once, the
+    /// record stays its key's oldest; the wait lives in `retry_at`.
+    ///
+    /// Unless the WAL gave up on it. `nack` dead-letters a record once it has
+    /// burned `max_attempts`, and then nothing will ever redeliver it: leaving
+    /// `unflushed` incremented would strand `flushAll` (it waits for a record
+    /// that can no longer be dispatched) and leave the key dirty forever.
+    /// Default config never reaches this — attempts are unlimited — so this
+    /// runs only for a caller who asked for a finite cap, and it is counted so
+    /// that choice is not silent.
+    fn flushFailed(self: *Coordinator, key: []const u8, lease: jobqueue.Lease) void {
+        const dead_before = self.wal.deadLetterCount();
+        self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
+        if (self.wal.deadLetterCount() > dead_before) {
+            self.n_poisoned += 1;
+            if (self.unflushed > 0) self.unflushed -= 1;
+            self.clearRetry(key);
+            // Same key-advance as the success path: a later record for this
+            // key is still good and must not be stranded behind the dropped
+            // one (it is also newer, so LWW is unaffected).
+            if (self.dequeueFor(key)) |lease2| {
+                self.startFlush(key, lease2);
+            } else {
+                _ = self.cache.markClean(key);
+                self.removeKeySet(&self.orphans, key);
+                // Deliberately NOT the F2 tombstone-GC step of `finishTask`: a
+                // dead-lettered delete never actually reached the sink (that is
+                // what `poisonedCount`/`n_poisoned` mean), so the sink still
+                // holds the pre-delete value. Dropping the tombstone here would
+                // let a later `get` read-through straight to that stale value —
+                // the tombstone must outlive a poisoned delete forever, which
+                // is the conservative side of the data loss `poisonedCount`
+                // already documents.
+            }
+            return;
+        }
+        // Can't fail the caller here: count a lost registration as `onEvict`
+        // does (the record is in the WAL; `flushAll` still reaches it).
+        self.addKeySet(&self.orphans, key) catch {
+            self.n_dropped_orphans += 1;
+        };
+        if (self.retry_backoff_ns > 0) {
+            // On OOM the key is simply retried without the wait.
+            self.setRetry(key, self.mono.now() +| self.retry_backoff_ns) catch {};
+        }
     }
 
     /// Snapshot `lease` into an owned `FlushTask`, mark the key in flight, and
@@ -908,13 +1021,13 @@ pub const Coordinator = struct {
             },
             .lease = lease,
         };
-        self.addKeySet(&self.in_flight, key) catch {
+        self.markInFlight(key, task) catch {
             self.freeTask(task);
             self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
             return;
         };
         self.pool.submit(.{ .func = flushEntry, .ctx = task }) catch {
-            self.removeKeySet(&self.in_flight, key);
+            self.clearInFlight(key);
             self.freeTask(task);
             self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
         };
@@ -922,22 +1035,43 @@ pub const Coordinator = struct {
 
     /// Synchronously flush the single oldest queued WAL record (any key) on the
     /// coordinator thread. A `flushAll` backstop for records not reachable via
-    /// the cache. Returns true if a record was flushed.
+    /// the cache. Returns true if a record was flushed; a rejected record goes
+    /// back to the WAL for a retry (`flushFailed`).
     fn flushOneSync(self: *Coordinator) bool {
+        return self.syncFlush(null) == .landed;
+    }
+
+    const SyncResult = enum {
+        /// A record was written and acked.
+        landed,
+        /// The sink rejected a record; its lease is in the caller's `hold`
+        /// list (not visible to the next dequeue until `releaseHeld`).
+        held,
+        /// The sink rejected a record; it went back to the WAL.
+        rejected,
+        /// No record is visible.
+        none,
+    };
+
+    /// `flushOneSync`'s body. With `hold`, a rejected record's lease is kept
+    /// there, so the caller's next call moves on to the next record instead
+    /// of retrying this one at once.
+    fn syncFlush(self: *Coordinator, hold: ?*std.ArrayList(jobqueue.Lease)) SyncResult {
         const lease = (self.wal.dequeue(.{ .visibility_timeout_ns = vis_timeout_ns }) catch null) orelse
-            return false;
+            return .none;
         const op: Op = if (std.mem.eql(u8, lease.job_type, "del")) .del else .put;
         const res = switch (op) {
             .put => self.sink.write(lease.partition, lease.payload),
             .del => self.sink.delete(lease.partition),
         };
+        // `ack`/`nack` may free the lease's borrowed fields: copy the key out first.
+        var key_buf: [jobqueue.max_field_len]u8 = undefined;
+        const key = key_buf[0..lease.partition.len];
+        @memcpy(key, lease.partition);
         if (res) |_| {
-            // `ack` frees the lease's borrowed fields: copy the key out first.
-            var key_buf: [jobqueue.max_field_len]u8 = undefined;
-            const key = key_buf[0..lease.partition.len];
-            @memcpy(key, lease.partition);
             self.wal.ack(lease) catch {};
             if (self.unflushed > 0) self.unflushed -= 1;
+            self.clearRetry(key);
             // Advance the key as `finishTask` does: its next record goes to the
             // pool. (Leasing it and dropping the lease hid it for the whole
             // visibility timeout, and `flushAll` stopped with it pending.)
@@ -947,11 +1081,63 @@ pub const Coordinator = struct {
                 _ = self.cache.markClean(key);
                 self.removeKeySet(&self.orphans, key);
             }
-            return true;
+            return .landed;
         } else |_| {
-            self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
-            return false;
+            if (hold) |h| {
+                if (h.append(self.gpa, lease)) |_| return .held else |_| {}
+            }
+            self.flushFailed(key, lease);
+            return .rejected;
         }
+    }
+
+    /// Return every lease `syncFlush` held to the WAL, as failed writes.
+    fn releaseHeld(self: *Coordinator, held: *std.ArrayList(jobqueue.Lease)) void {
+        for (held.items) |lease| {
+            var key_buf: [jobqueue.max_field_len]u8 = undefined;
+            const key = key_buf[0..lease.partition.len];
+            @memcpy(key, lease.partition);
+            self.flushFailed(key, lease);
+        }
+        held.clearRetainingCapacity();
+    }
+
+    /// True while `key` waits out its retry backoff; drops a lapsed entry.
+    fn retryWaiting(self: *Coordinator, key: []const u8) bool {
+        const at = self.retry_at.get(key) orelse return false;
+        if (self.mono.now() < at) return true;
+        self.clearRetry(key);
+        return false;
+    }
+
+    /// True while any key waits out its retry backoff.
+    fn anyRetryWaiting(self: *Coordinator) bool {
+        const now = self.mono.now();
+        var it = self.retry_at.valueIterator();
+        while (it.next()) |at| {
+            if (now < at.*) return true;
+        }
+        return false;
+    }
+
+    fn setRetry(self: *Coordinator, key: []const u8, at: u64) !void {
+        if (self.retry_at.getPtr(key)) |slot| {
+            slot.* = at;
+            return;
+        }
+        const dup = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(dup);
+        try self.retry_at.put(self.gpa, dup, at);
+    }
+
+    fn clearRetry(self: *Coordinator, key: []const u8) void {
+        if (self.retry_at.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+    }
+
+    fn freeRetry(self: *Coordinator) void {
+        var it = self.retry_at.keyIterator();
+        while (it.next()) |k| self.gpa.free(k.*);
+        self.retry_at.deinit(self.gpa);
     }
 
     fn dequeueFor(self: *Coordinator, key: []const u8) ?jobqueue.Lease {
@@ -983,6 +1169,28 @@ pub const Coordinator = struct {
         self.addKeySet(&self.orphans, key) catch {
             self.n_dropped_orphans += 1;
         };
+    }
+
+    /// Free the in-flight set: its keys and the task of every entry (a task
+    /// still listed here never reached the completion list).
+    fn freeInFlight(self: *Coordinator) void {
+        var it = self.in_flight.iterator();
+        while (it.next()) |e| {
+            self.freeTask(e.value_ptr.*);
+            self.gpa.free(e.key_ptr.*);
+        }
+        self.in_flight.deinit(self.gpa);
+    }
+
+    fn markInFlight(self: *Coordinator, key: []const u8, task: *FlushTask) !void {
+        std.debug.assert(!self.in_flight.contains(key));
+        const dup = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(dup);
+        try self.in_flight.put(self.gpa, dup, task);
+    }
+
+    fn clearInFlight(self: *Coordinator, key: []const u8) void {
+        if (self.in_flight.fetchRemove(key)) |kv| self.gpa.free(kv.key);
     }
 
     fn freeTask(self: *Coordinator, t: *FlushTask) void {
@@ -1122,7 +1330,7 @@ test "basic: put is readable from cache immediately; after flush the sink is con
     }
     try testing.expectEqual(@as(usize, n), c.pendingCount());
 
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqual(@as(usize, 0), c.inFlightCount());
 
@@ -1148,7 +1356,7 @@ test "last-writer-wins per key: overwrites coalesce to the latest value in the s
     try c.put("k", "v3");
     try testing.expectEqualStrings("v3", (try c.get("k")).?);
 
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqualStrings("v3", rig.sink.peek("k").?);
     try testing.expectEqual(@as(usize, 1), rig.sink.count());
 }
@@ -1162,12 +1370,12 @@ test "delete: get misses immediately; sink drops the key after flush" {
 
     try c.put("a", "1");
     try c.put("b", "2");
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 2), rig.sink.count());
 
     try c.del("a");
     try testing.expect((try c.get("a")) == null); // tombstone shadows the cache
-    c.flushAll();
+    try c.flushAll();
     try testing.expect(rig.sink.peek("a") == null); // gone from the sink
     try testing.expectEqualStrings("2", rig.sink.peek("b").?);
 
@@ -1284,7 +1492,7 @@ test "F2: a durably-flushed delete's tombstone is reclaimed, and the stale cache
     // A prior put, durably flushed — this is the stale cache entry that must
     // not resurface once the tombstone stops shadowing it.
     try c.put("k", "v1");
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqualStrings("v1", rig.sink.peek("k").?);
 
     try c.del("k");
@@ -1293,7 +1501,7 @@ test "F2: a durably-flushed delete's tombstone is reclaimed, and the stale cache
     try testing.expect(c.tombstones.contains("k"));
     try testing.expectEqual(@as(?[]const u8, null), try c.get("k"));
 
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqual(@as(usize, 0), rig.sink.count()); // sink applied the delete
 
@@ -1322,7 +1530,7 @@ test "F2: a poisoned (dead-lettered) delete keeps its tombstone forever, on purp
 
     try c.del("k");
     try testing.expect(c.tombstones.contains("k"));
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 1), c.poisonedCount());
     // The delete never landed in the sink — GC-ing the tombstone here would
     // let a later `get` read-through resurrect whatever the sink still has
@@ -1361,7 +1569,7 @@ test "F3: onEvict's dropped orphan registration is counted, not silently lost" {
 
     // Durability is unaffected: flushAll's WAL-rescan backstop (driven off
     // `unflushed`, not the orphan set) still reaches every record.
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqual(@as(usize, 3), rig.sink.count());
 }
@@ -1403,7 +1611,7 @@ test "on_evict safety net: a dirty entry evicted before flush is still persisted
 
     // Whichever entry was evicted fired on_evict(dirty) → orphan; its WAL record
     // is still durable. flushAll must persist all three, none silently dropped.
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqual(@as(usize, 3), rig.sink.count());
     try testing.expectEqualStrings("1", rig.sink.peek("a").?);
@@ -1543,7 +1751,7 @@ test "concurrency: many keys flush via the pool; drain-loop reaches a clean stat
         try c.put(k, "x");
         if (i % 64 == 0) c.drain(); // interleave flush passes with writes
     }
-    c.flushAll();
+    try c.flushAll();
 
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqual(@as(usize, 0), c.inFlightCount());
@@ -1638,7 +1846,7 @@ test "flushAll on a fresh reopened WAL drains pending records even without recov
     var c2 = try rig.open(2);
     defer c2.deinit();
     try testing.expectEqual(@as(usize, 2), c2.pendingCount());
-    c2.flushAll();
+    try c2.flushAll();
     try testing.expectEqual(@as(usize, 0), c2.pendingCount());
     try testing.expectEqualStrings("1", rig.sink.peek("p").?);
     try testing.expectEqualStrings("2", rig.sink.peek("q").?);
@@ -1773,7 +1981,7 @@ test "a sink that rejects more often than jobqueue's default cap still lands the
     defer c.deinit();
 
     try c.put("k", "v");
-    c.flushAll();
+    try c.flushAll();
 
     const landed = rig.sink.get("k");
     try testing.expect(landed != null); // the acked write reached the sink at all
@@ -1793,7 +2001,7 @@ test "an explicit attempt cap drops the record — counted, listed, and not stra
 
     try c.put("bad", "x");
     try c.put("good", "y");
-    c.flushAll();
+    try c.flushAll();
 
     // The poisoned key is dropped, and saying so is the whole point: an
     // acknowledged write did not reach the sink.
@@ -1824,7 +2032,7 @@ test "a second record for a poisoned key is not stranded behind it" {
 
     try c.put("bad", "x1");
     try c.put("bad", "x2");
-    c.flushAll();
+    try c.flushAll();
 
     // Both records for the key are dropped (the sink rejects the key itself),
     // and crucially the SECOND one was actually attempted rather than left
@@ -1925,7 +2133,7 @@ test "recover() applies a WAL delete as a delete" {
     {
         var c = try rig.open(2);
         try c.put("k", "v");
-        c.flushAll();
+        try c.flushAll();
         try testing.expectEqualStrings("v", rig.sink.peek("k").?);
         try c.del("k");
         c.deinitNoFlush(); // the delete is only in the WAL
@@ -1994,7 +2202,7 @@ test "one key never has two sink calls in flight (dirty AND orphan selects it tw
     defer c.deinit();
     try c.put("k", "v"); // dirty in the cache
     try c.del("k"); // and an orphan: kick() collects "k" from both sources
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(u32, 1), os.max_active.load(.acquire));
     try testing.expect(os.inner.peek("k") == null); // the delete landed last
 }
@@ -2018,7 +2226,7 @@ test "flushOneSync: a key's next record is flushed, not leased and dropped" {
     }
     var c2 = try rig.open(2);
     defer c2.deinit();
-    c2.flushAll();
+    try c2.flushAll();
     try testing.expectEqual(@as(usize, 0), c2.pendingCount());
     try testing.expectEqualStrings("new", rig.sink.peek(key).?);
 }
@@ -2097,7 +2305,7 @@ test "back-pressure: mark entries are admitted, mark+1 fails typed with nothing 
     c.put_block_ns = 30 * std.time.ns_per_s;
     try c.put("d", "4");
     try testing.expect(c.pendingCount() <= 3);
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqualStrings("4", rig.sink.get("d").?);
     try testing.expectEqualStrings("1", rig.sink.get("a").?);
@@ -2147,7 +2355,7 @@ test "back-pressure: records of a reopened WAL (not in the cache) are flushed sy
     try testing.expectEqual(@as(usize, 2), c2.pendingCount());
     try c2.put("r", "3");
     try testing.expect(c2.pendingCount() <= 2);
-    c2.flushAll();
+    try c2.flushAll();
     try testing.expectEqualStrings("1", rig.sink.get("p").?);
     try testing.expectEqualStrings("3", rig.sink.get("r").?);
 }
@@ -2286,11 +2494,11 @@ test "kvtree sink behind the pool: concurrent flushes and deletes land" {
         try c.put(try std.mem.print(&buf, "r{d}", .{i}), "val");
         if (i % 8 == 0) c.drain();
     }
-    c.flushAll();
+    try c.flushAll();
     for (0..n) |i| {
         if (i % 3 == 0) try c.del(try std.mem.print(&buf, "r{d}", .{i}));
     }
-    c.flushAll();
+    try c.flushAll();
     for (0..n) |i| {
         const k = try std.mem.print(&buf, "r{d}", .{i});
         const got = try db.get(testing.allocator, k);
@@ -2371,7 +2579,7 @@ test "every flush path acks its WAL record: a reopened WAL has nothing pending" 
         try c.put("a", "1");
         try c.put("b", "2");
         try c.del("b");
-        c.flushAll();
+        try c.flushAll();
         c.deinitNoFlush();
     }
     {
@@ -2389,7 +2597,7 @@ test "every flush path acks its WAL record: a reopened WAL has nothing pending" 
     {
         const c = try rig.open(2);
         try testing.expectEqual(@as(usize, 2), c.pendingCount());
-        c.flushAll();
+        try c.flushAll();
         c.deinitNoFlush();
     }
     {
@@ -2466,7 +2674,7 @@ test "flushOneSync: hands the key's next record to the pool and clears the key's
     try testing.expect(c.flushOneSync());
     // The second record of "k" is on the pool: in flight until pumped.
     try testing.expectEqual(@as(usize, 1), c.inFlightCount());
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqualStrings("new", rig.sink.get("k").?);
     try testing.expect(!c.flushOneSync()); // empty WAL: nothing flushed
 
@@ -2510,7 +2718,7 @@ test "startFlush: an allocation failure at any step returns the lease; the write
         c.gpa = fa.allocator();
         c.drain();
         c.gpa = testing.allocator;
-        c.flushAll();
+        try c.flushAll();
         try testing.expectEqual(@as(usize, 0), c.pendingCount());
         try testing.expectEqual(@as(usize, 0), c.inFlightCount());
         try testing.expectEqualStrings("v", rig.sink.peek("k").?);
@@ -2528,7 +2736,7 @@ test "startFlush: a refused pool submit returns the lease and clears the in-flig
     c.drain();
     try testing.expectEqual(@as(usize, 0), c.inFlightCount());
     try testing.expectEqual(@as(usize, 1), c.pendingCount());
-    c.flushAll(); // the synchronous backstop still lands it
+    try c.flushAll(); // the synchronous backstop still lands it
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqualStrings("v", rig.sink.peek("k").?);
 }
@@ -2594,7 +2802,7 @@ test "sync() is a flush barrier and cacheStats() reports the cache's counters" {
     try c.put("k", "v");
     _ = try c.get("k");
     try testing.expect(c.cacheStats().hits >= 1);
-    c.sync();
+    try c.sync();
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqualStrings("v", rig.sink.peek("k").?);
 }
@@ -2635,75 +2843,292 @@ test "init: the injected monotonic clock governs lease expiry" {
     try testing.expectEqual(@as(usize, 0), try c.wal.reapExpiredLeases());
     _ = clk.ns.fetchAdd(2 * hour, .monotonic);
     try testing.expectEqual(@as(usize, 1), try c.wal.reapExpiredLeases());
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqualStrings("v", rig.sink.peek("k").?);
 }
 
-test "retry_backoff_ns hides a failed record until the wall clock passes it (FINDING wbmut-1: flushAll returns early, drain does not retry)" {
-    var rig: FailRig = undefined;
-    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
-    defer rig.deinit();
-    var clk: FakeClock = .{};
-    const hour: u64 = 3600 * std.time.ns_per_s;
-    const c = try Coordinator.init(testing.allocator, .{
+/// Knobs for `openWith` (a `FailRig` coordinator with injected clocks).
+const OpenWith = struct {
+    cap: u32 = 0,
+    backoff_ns: u64 = 0,
+    flush_timeout_ns: u64 = 10 * std.time.ns_per_s,
+    n_workers: usize = 1,
+    max_unflushed: usize = 0,
+    put_block_ns: u64 = 60 * std.time.ns_per_s,
+};
+
+fn openWith(rig: *FailRig, clk: *FakeClock, o: OpenWith) !*Coordinator {
+    return Coordinator.init(testing.allocator, .{
         .io = rig.threaded.io(),
         .sink = rig.sink.sink(),
         .wal_store = rig.wal_sim.storage(),
         .wal_path = "wal.jq",
         .max_cache_bytes = 1 << 20,
         .max_cache_entries = 64,
-        .n_workers = 1,
-        .retry_backoff_ns = hour,
-        .wal_wall_clock = .{ .ctx = &clk, .nowFn = FakeClock.wall },
-        .wal_mono_clock = .{ .ctx = &clk, .nowFn = FakeClock.mono },
+        .n_workers = o.n_workers,
+        .max_flush_attempts = o.cap,
+        .retry_backoff_ns = o.backoff_ns,
+        .flush_timeout_ns = o.flush_timeout_ns,
+        .max_unflushed = o.max_unflushed,
+        .put_block_ns = o.put_block_ns,
+        .wal_wall_clock = .{ .ctx = clk, .nowFn = FakeClock.wall },
+        .wal_mono_clock = .{ .ctx = clk, .nowFn = FakeClock.mono },
     });
+}
+
+/// Harvest and re-drain until nothing is in flight (bounded).
+fn settle(c: *Coordinator) !void {
+    var spins: usize = 0;
+    while (true) : (spins += 1) {
+        c.drain();
+        if (c.inFlightCount() == 0) return;
+        if (spins > 2000) return error.Timeout;
+        c.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+}
+
+/// Advance `clk` by `by_ns` after `after_ms` of real time (a helper thread).
+fn advanceLater(clk: *FakeClock, io: std.Io, after_ms: i64, by_ns: u64) void {
+    io.sleep(.fromMilliseconds(after_ms), .awake) catch {};
+    _ = clk.ns.fetchAdd(by_ns, .monotonic);
+}
+
+test "retry_backoff_ns: a failed key waits out its backoff, then drain() alone retries it" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try openWith(&rig, &clk, .{ .backoff_ns = hour, .flush_timeout_ns = 100 * std.time.ns_per_ms });
     defer c.deinit();
     try c.put("k", "v");
     c.drain();
     try waitCompletion(c);
-    c.drain(); // harvest the failure: the record is nacked with a one-hour backoff
+    c.drain(); // harvest the failure: the key now waits for an hour
     try testing.expectEqual(@as(usize, 1), rig.sink.seen);
     try testing.expectEqual(@as(usize, 0), c.inFlightCount());
     try testing.expectEqual(@as(usize, 1), c.pendingCount());
-    // FINDING wbmut-1 (a): flushAll is documented to block until clean, but it
-    // returns with the record pending: flushOneSync sees nothing visible during
-    // the backoff and reports "no progress", which flushAll treats as the end.
-    c.flushAll();
+    // flushAll waits for it (and must not retry it early, not even through
+    // the synchronous path), then gives up at its deadline, typed.
+    try testing.expectError(error.FlushIncomplete, c.flushAll());
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen);
     try testing.expectEqual(@as(usize, 1), c.pendingCount());
-    // FINDING wbmut-1 (b): the drain that harvested the failure also ran kick,
-    // whose startKey found no visible record for the dirty key and reconciled
-    // it as clean; once the backoff has passed, drain() never selects it again.
-    try testing.expect(!c.cache.isDirty("k"));
+    // The key is still registered, so the periodic drain() retries it once
+    // the backoff has passed (it used to be reconciled clean and forgotten).
+    try testing.expect(c.orphans.contains("k"));
     _ = clk.ns.fetchAdd(hour + 1, .monotonic);
     c.drain();
-    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
-    try testing.expect(rig.sink.get("k") == null);
-    // Only a flushAll after the backoff lands it (through flushOneSync).
-    c.flushAll();
+    try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+    try waitCompletion(c);
+    c.drain();
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqualStrings("v", rig.sink.get("k").?);
+    try testing.expect(!c.orphans.contains("k"));
+    try testing.expectEqual(@as(usize, 0), c.retry_at.count());
 }
 
-test "flushAll over a reopened WAL stops at the first rejected synchronous write (FINDING wbmut-1)" {
+test "flushAll waits out a retry backoff instead of returning with the record pending (wbmut-1)" {
     var rig: FailRig = undefined;
     rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
     defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try openWith(&rig, &clk, .{ .backoff_ns = hour });
+    defer c.deinit();
+    try c.put("k", "v");
+    c.drain();
+    try waitCompletion(c);
+    c.drain();
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    // The hour passes (on the injected clock) while flushAll is waiting.
+    const t = try std.Thread.spawn(.{}, advanceLater, .{ &clk, rig.threaded.io(), 60, hour + 1 });
+    defer t.join();
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("v", rig.sink.get("k").?);
+    try testing.expectEqual(@as(usize, 2), rig.sink.seen);
+}
+
+test "flushAll over a reopened WAL: a rejected synchronous write does not end it, the others land first (wbmut-1)" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
     {
-        const c = try rig.open(0);
-        try c.put("k", "v");
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("a", "1");
+        try c.put("b", "2");
         c.deinitNoFlush();
     }
-    const c2 = try rig.open(0);
+    const c2 = try openWith(&rig, &clk, .{});
     defer c2.deinit();
-    c2.flushAll();
-    // FINDING wbmut-1 (c): one rejection ends flushAll with the record pending,
-    // whereas a rejection on the pool path is retried for as long as it takes.
-    try testing.expectEqual(@as(usize, 1), c2.pendingCount());
-    try testing.expectEqual(@as(usize, 1), rig.sink.seen);
-    c2.flushAll();
+    try testing.expectEqual(@as(usize, 2), c2.pendingCount());
+    // "a" (the oldest) is rejected once: "b" still lands, and "a" is retried.
+    try c2.flushAll();
     try testing.expectEqual(@as(usize, 0), c2.pendingCount());
-    try testing.expectEqualStrings("v", rig.sink.get("k").?);
+    try testing.expectEqualStrings("1", rig.sink.get("a").?);
+    try testing.expectEqualStrings("2", rig.sink.get("b").?);
+    try testing.expectEqual(@as(usize, 3), rig.sink.seen);
+}
+
+test "flushAll against a key the sink always rejects: the rest lands, then FlushIncomplete with it still pending" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .reject_key = "a" });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("a", "1");
+        try c.put("b", "2");
+        try c.put("c", "3");
+        c.deinitNoFlush();
+    }
+    {
+        const c = try openWith(&rig, &clk, .{ .flush_timeout_ns = 150 * std.time.ns_per_ms });
+        try testing.expectError(error.FlushIncomplete, c.flushAll());
+        try testing.expectEqual(@as(usize, 1), c.pendingCount());
+        try testing.expectEqualStrings("2", rig.sink.get("b").?);
+        try testing.expectEqualStrings("3", rig.sink.get("c").?);
+        // Teardown with the sink still refusing is bounded by the same
+        // deadline, and the record stays in the WAL.
+        c.deinit();
+    }
+    const c3 = try openWith(&rig, &clk, .{});
+    defer c3.deinitNoFlush();
+    try testing.expectEqual(@as(usize, 1), c3.pendingCount());
+    try testing.expect(rig.sink.get("a") == null);
+}
+
+test "flushAll with a zero timeout flushes synchronously what it can and reports the rest" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .reject_key = "a" });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("a", "1");
+        try c.put("b", "2");
+        c.deinitNoFlush();
+    }
+    const c = try openWith(&rig, &clk, .{ .flush_timeout_ns = 0 });
+    defer c.deinitNoFlush();
+    try testing.expectError(error.FlushIncomplete, c.flushAll());
+    try testing.expectEqualStrings("2", rig.sink.get("b").?);
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    try testing.expectEqual(@as(usize, 2), rig.sink.seen); // "a" tried once, not again
+}
+
+test "last-writer-wins survives a retry backoff: a newer write never lands before the failed older one" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try openWith(&rig, &clk, .{ .backoff_ns = hour });
+    defer c.deinit();
+    try c.put("k", "v1");
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // v1 rejected: back in the WAL, the key waits an hour
+    try c.put("k", "v2");
+    try settle(c); // v2 must wait behind v1, not overtake it
+    try testing.expect(rig.sink.get("k") == null);
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    try c.flushAll();
+    try testing.expectEqualStrings("v2", rig.sink.get("k").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "last-writer-wins survives a retry backoff across a restart (recover and flushAll)" {
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    var mode: usize = 0;
+    while (mode < 2) : (mode += 1) {
+        var rig: FailRig = undefined;
+        rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+        defer rig.deinit();
+        var clk: FakeClock = .{};
+        {
+            const c = try openWith(&rig, &clk, .{ .backoff_ns = hour });
+            try c.put("k", "v1");
+            c.drain();
+            try waitCompletion(c);
+            c.drain(); // v1 rejected and waiting
+            try c.put("k", "v2");
+            c.deinitNoFlush(); // crash with v1 still in its backoff
+        }
+        const c2 = try openWith(&rig, &clk, .{ .backoff_ns = hour });
+        defer c2.deinit();
+        // Both records are pending after the restart (the backoff is not
+        // persisted: v1 is retried at once, in its place before v2).
+        try testing.expectEqual(@as(usize, 2), c2.pendingCount());
+        if (mode == 0) try c2.recover() else try c2.flushAll();
+        _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+        try c2.flushAll();
+        try testing.expectEqualStrings("v2", rig.sink.get("k").?);
+        try testing.expectEqual(@as(usize, 0), c2.pendingCount());
+    }
+}
+
+test "the synchronous path counts a dead-lettered record and moves on" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .reject_key = "a" });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try openWith(&rig, &clk, .{ .cap = 1 });
+        try c.put("a", "1");
+        try c.put("b", "2");
+        c.deinitNoFlush();
+    }
+    const c = try openWith(&rig, &clk, .{ .cap = 1 });
+    defer c.deinit();
+    try c.flushAll(); // "a" is dead-lettered by its single rejection: done, not pending
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("2", rig.sink.get("b").?);
+}
+
+test "deinit after a timed-out flushAll waits for the running flush and acks it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var wal_sim = SimStorage.init(testing.allocator);
+    defer wal_sim.deinit();
+    var gs: GateSink = .{ .inner = MapSink.init(testing.allocator), .io = threaded.io() };
+    defer gs.inner.deinit();
+    {
+        const c = try Coordinator.init(testing.allocator, .{
+            .io = threaded.io(),
+            .sink = .{ .ptr = &gs, .vtable = &GateSink.vt },
+            .wal_store = wal_sim.storage(),
+            .wal_path = "wal.jq",
+            .max_cache_bytes = 1 << 20,
+            .max_cache_entries = 64,
+            .n_workers = 1,
+            .flush_timeout_ns = 20 * std.time.ns_per_ms,
+        });
+        try c.put("a", "1");
+        // The write blocks in the sink: flushAll gives up with it in flight.
+        try testing.expectError(error.FlushIncomplete, c.flushAll());
+        try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+        const t = try std.Thread.spawn(.{}, GateSink.openLater, .{&gs});
+        defer t.join();
+        c.deinit(); // its own flushAll times out too; pool.drain waits for the write
+    }
+    try testing.expectEqualStrings("1", gs.inner.peek("a").?);
+    var sink = MapSink.init(testing.allocator);
+    defer sink.deinit();
+    const c2 = try Coordinator.init(testing.allocator, .{
+        .io = threaded.io(),
+        .sink = sink.sink(),
+        .wal_store = wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 64,
+        .n_workers = 1,
+    });
+    defer c2.deinitNoFlush();
+    try testing.expectEqual(@as(usize, 0), c2.pendingCount()); // the harvest acked it
 }
 
 /// A sink that asks the WAL to reap expired leases from inside every write: a
@@ -2775,7 +3200,7 @@ test "every path holds its WAL lease for the visibility timeout while the sink i
         try testing.expect(c.flushOneSync());
         probe.coord = null;
         try testing.expectEqual(@as(usize, 0), probe.reaped);
-        c.flushAll();
+        try c.flushAll();
         c.deinitNoFlush();
     }
     // the pool path: a finished flush that has not been pumped still holds its lease
@@ -2796,14 +3221,14 @@ test "flushOneSync applies a WAL delete as a delete" {
     {
         const c = try rig.open(1);
         try c.put("k", "v");
-        c.flushAll();
+        try c.flushAll();
         try c.del("k");
         c.deinitNoFlush();
     }
     try testing.expectEqualStrings("v", rig.sink.peek("k").?);
     const c2 = try rig.open(1);
     defer c2.deinit();
-    c2.flushAll(); // the cache is empty: the delete goes through flushOneSync
+    try c2.flushAll(); // the cache is empty: the delete goes through flushOneSync
     try testing.expect(rig.sink.peek("k") == null);
 }
 
@@ -2827,7 +3252,7 @@ test "a delete honours max_flush_attempts: dead-lettered after exactly that many
     const c = try rig.open(2);
     defer c.deinit();
     try c.del("k");
-    c.flushAll();
+    try c.flushAll();
     try testing.expectEqual(@as(usize, 1), c.poisonedCount());
     const dead = try c.poisoned(testing.allocator);
     defer Coordinator.freePoisoned(testing.allocator, dead);
@@ -2931,11 +3356,10 @@ test "deinitNoFlush discards queued flush jobs: only the running write finishes"
     defer wal_sim.deinit();
     var gs: GateSink = .{ .inner = MapSink.init(testing.allocator), .io = threaded.io() };
     defer gs.inner.deinit();
-    // FINDING wbmut-2: `deinitNoFlush` frees the FlushTasks of completed flushes
-    // only; the tasks of jobs the pool drops unrun (task, key, value: three
-    // allocations each) are leaked. The test therefore runs on an allocator
-    // that does not report leaks; it asserts what `shutdownNow` guarantees.
-    const c = try Coordinator.init(std.heap.smp_allocator, .{
+    // wbmut-2 (fixed 2026-11-19): the tasks of the jobs the pool drops unrun
+    // (task, key, value: three allocations each) used to leak; the leak-checked
+    // allocator now proves `deinitNoFlush` frees them.
+    const c = try Coordinator.init(testing.allocator, .{
         .io = threaded.io(),
         .sink = .{ .ptr = &gs, .vtable = &GateSink.vt },
         .wal_store = wal_sim.storage(),
@@ -2957,4 +3381,130 @@ test "deinitNoFlush discards queued flush jobs: only the running write finishes"
     t.join();
     try testing.expectEqual(@as(u32, 1), gs.writes.load(.acquire));
     try testing.expectEqual(@as(usize, 1), gs.inner.count());
+}
+
+test "deinitNoFlush: a harvested flush that advances its key meets a stopped pool, not a freed one" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    {
+        const c = try rig.open(1);
+        try c.put("k", "old");
+        try c.put("k", "new");
+        c.drain(); // single flight per key: only "old" is submitted
+        try waitCompletion(c);
+        // The harvest inside deinitNoFlush acks "old" and hands "new" to
+        // startFlush, whose submit must find the pool stopped (and give the
+        // lease back), not already freed.
+        c.deinitNoFlush();
+    }
+    try testing.expectEqualStrings("old", rig.sink.peek("k").?);
+    const c2 = try rig.open(1);
+    defer c2.deinit();
+    try testing.expectEqual(@as(usize, 1), c2.pendingCount());
+    try c2.recover();
+    try testing.expectEqualStrings("new", rig.sink.peek("k").?);
+}
+
+test "a record in a persisted WAL backoff (a WAL from before 2026-11-19) is counted at reopen and flushed once visible" {
+    // Older versions nacked with a WAL-side backoff, which the WAL persists.
+    // Such a record is pending (`readyCount` includes records whose `run_at`
+    // lies ahead), so `pendingCount` reports it, `flushAll` waits for it, and
+    // it lands once its time has come -- through recover(), the synchronous
+    // path, or a pool flush started for its key.
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    var path: usize = 0;
+    while (path < 3) : (path += 1) {
+        var rig: FailRig = undefined;
+        rig.init(.{ .gpa = testing.allocator });
+        defer rig.deinit();
+        var clk: FakeClock = .{};
+        {
+            const c = try openWith(&rig, &clk, .{});
+            _ = try c.wal.enqueue("put", "v", .{ .partition = "k", .delay_ns = hour });
+            c.deinitNoFlush();
+        }
+        const c = try openWith(&rig, &clk, .{ .flush_timeout_ns = 30 * std.time.ns_per_ms });
+        defer c.deinit();
+        try testing.expectEqual(@as(usize, 1), c.pendingCount());
+        try testing.expectError(error.FlushIncomplete, c.flushAll()); // hidden: waited for, not dropped
+        try testing.expectEqual(@as(usize, 1), c.pendingCount());
+        _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+        switch (path) {
+            0 => try c.recover(),
+            1 => try testing.expect(c.flushOneSync()),
+            else => {
+                c.startKey("k");
+                try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+                try c.flushAll();
+            },
+        }
+        try testing.expectEqual(@as(usize, 0), c.pendingCount());
+        try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+        try testing.expectEqualStrings("v", rig.sink.get("k").?);
+    }
+}
+
+test "back-pressure does not retry a key early: its synchronous backstop waits for the retry backoff too" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try openWith(&rig, &clk, .{
+        .backoff_ns = hour,
+        .max_unflushed = 1,
+        .put_block_ns = 30 * std.time.ns_per_ms,
+    });
+    defer c.deinit();
+    try c.put("k", "v");
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // rejected: "k" waits an hour
+    try testing.expectError(error.Backpressure, c.put("x", "1"));
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen); // not retried early
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    try c.put("x", "1"); // the retry lands and makes room
+    try testing.expectEqualStrings("v", rig.sink.get("k").?);
+}
+
+test "the synchronous path keeps the per-key retry deadlines exact: cleared on landing and on dead-lettering, moved on a new rejection" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 3 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try openWith(&rig, &clk, .{ .backoff_ns = hour, .cap = 3 });
+    defer c.deinit();
+    try c.put("k", "v");
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // first rejection (pool path): "k" waits an hour
+    try testing.expect(c.anyRetryWaiting());
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    try testing.expect(!c.anyRetryWaiting());
+    // Second rejection, on the synchronous path: the lapsed deadline moves on.
+    try testing.expect(!c.flushOneSync());
+    try testing.expect(c.anyRetryWaiting());
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    // Third rejection dead-letters it (cap 3): nothing is left waiting.
+    try testing.expect(!c.flushOneSync());
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.retry_at.count());
+    // A landed record clears its key's lapsed deadline as well.
+    try c.put("j", "w");
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // fail_n is spent: "j" lands
+    try testing.expectEqualStrings("w", rig.sink.get("j").?);
+    try c.put("m", "1");
+    rig.sink.reject_key = "m";
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // "m" rejected: waits
+    rig.sink.reject_key = null;
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    try testing.expect(c.flushOneSync()); // lands through the synchronous path
+    try testing.expectEqual(@as(usize, 0), c.retry_at.count());
+    try testing.expectEqualStrings("1", rig.sink.get("m").?);
 }

@@ -75,15 +75,20 @@ try c.del("user:42");
 
 // Flush control.
 c.drain();        // one non-blocking flush pass (tick / threshold trigger)
-c.flushAll();     // block until the cache is clean (graceful barrier); alias: sync()
+try c.flushAll(); // block until the cache is clean (graceful barrier); alias: sync()
+                  // error.FlushIncomplete after Options.flush_timeout_ns (default 120 s)
 ```
 
 - `Sink` is a small vtable (`write` / `delete` / optional `read`); implement it
   to target any durable store. `KvtreeSink` (durable) and `MapSink` (in-memory)
   are provided. A SQL sink (DL6) slots in without touching this module.
 - **A sink that rejects writes costs liveness, not data.** Failed sink writes go
-  back to the WAL and are retried indefinitely, so `flushAll` against a
-  permanently-failing sink keeps retrying rather than returning. Set
+  back to the WAL and are retried indefinitely (each key after
+  `Options.retry_backoff_ns`), so `flushAll` against a permanently-failing sink
+  keeps retrying until `Options.flush_timeout_ns` (default 120 s, Kafka's
+  `delivery.timeout.ms`) and then returns `error.FlushIncomplete`, the records
+  still in the WAL. `deinit` flushes the same way, so a dead sink holds it up to
+  that long; `deinitNoFlush` exits at once. Set
   `max_flush_attempts` to a finite value to drop poison records instead; those
   are then counted by `poisonedCount()` and listed by `poisoned()` — never
   dropped silently.
