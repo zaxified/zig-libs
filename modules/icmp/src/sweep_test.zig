@@ -878,6 +878,39 @@ test "answered probes behind an unanswered head do not exhaust the id space (swe
     try std.testing.expectEqual(@as(u16, 0), held.probe);
 }
 
+test "more than 65536 answered probes in a row never exhaust the id space and never time out" {
+    // The fast, honest responder of the triage row: every probe is answered at
+    // once, the timeout is an hour away, `max_inflight` is far below the id
+    // space. Answered slots are recycled when the allocator reaches them, so
+    // 70 000 sends need no purge-on-reply and never fail.
+    var rig = try Rig.open();
+    defer rig.close();
+    var p = try Pinger.init(std.testing.allocator, .{
+        .mode = .loop,
+        .check_source = false,
+        .interval_ns = 0,
+        .perhost_interval_ns = 0,
+        .timeout_ns = 3600 * std.time.ns_per_s,
+        .max_inflight = 32,
+    });
+    defer p.deinit();
+    _ = try p.addTargetAddr(v4(rig.inj_port, 1));
+    p.sock4 = .{ .os = rig.socket() };
+    try p.prepare();
+
+    var rounds: usize = 0;
+    while (p.stats(0).sent < 70_000) : (rounds += 1) {
+        try std.testing.expect(rounds < 6000);
+        var s = p.seqmap.cursor;
+        _ = try p.step();
+        while (s != p.seqmap.cursor) : (s +%= 1) try rig.inject(&replyPacket(s));
+        _ = try p.step();
+    }
+    try std.testing.expect(p.stats(0).sent >= 70_000);
+    try std.testing.expectEqual(p.stats(0).sent, p.stats(0).recv);
+    try std.testing.expectEqual(@as(u32, 0), p.inflight);
+}
+
 test "a stale timeout event for a recycled slot neither fires nor drops the newer probe (sweep REV-seqmap-1)" {
     var p = try Pinger.init(std.testing.allocator, .{ .mode = .count, .count = 1 });
     defer p.deinit();

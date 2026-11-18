@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** security-triage row icmp:140 (sequence-slot exhaustion by a fast honest responder) re-checked: already fixed by the 2026-10-31 slot recycling, whose SPEC text was stale. SPEC corrected (reference behaviour of fping and iputils recorded; eager purge on reply not adopted because it would end duplicate-reply counting) and a test added: 70 000 probes all answered in a row neither exhaust the id space nor time out.
+
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the `quoted_proto` doc comment claimed the IPv4 value is always 1; `parseV4` does not check the quoted protocol (fping and iputils ping do not either), so the comment now says it can be any value and a test pins that an error quoting UDP reports 17.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (590 mutants over the five source files; 536 killed, 54 equivalent or unobservable, none surviving); 52 new tests (`audit_test.zig` for the engine on the loopback rig, in-file tests for `Socket`, `pinger`, `echo`, `checksum`, `IoSocket`), the send-errno table is now the pure `Socket.sendResult` (same mapping, so each errno is tested without provoking it), the rig helpers of `sweep_test.zig` are `pub` for the new file; the card records `mutation 2026-11-17 (536/590, 54 eq)`.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the stddev / jitter update is one function (`Stats.noteReply`) that the
