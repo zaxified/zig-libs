@@ -88,7 +88,9 @@ const found = try pathmtu.probe(dest, .{ .timeout_ms = 1000, .retries = 2 });
   `.interface`-labeled failure mode "Why two functions" describes above),
   `true` when it genuinely differs, `null` when there is nothing to compare
   against. A `false` reading is not proof of absence, the same asymmetric
-  signal `blackhole` already gives elsewhere in this module (A1 F6).
+  signal `blackhole` already gives elsewhere in this module (A1 F6). The
+  comparison caps the interface MTU at 65535 for IPv4 only (`IP_MTU` cannot
+  read more; `lo` is 65536), not for IPv6.
 
 `Options{ timeout_ms, retries, ceiling_mtu, iface, on_attempt, socket, max_hops,
 max_silent_hops, deadline_ms }` is shared by all three functions (matching

@@ -345,18 +345,28 @@ pub fn query(dest: netaddr.Ip, opts: Options) QueryError!Result {
     if (opts.iface) |name| {
         if (ifaceMtu(name) catch null) |im| {
             result.iface_mtu = im;
-            // A1 F6. `IP_MTU`/`IPV6_MTU` can never read back above 65535 --
-            // the IP total-length field is 16 bits -- even with no PMTU
-            // exception and an interface MTU that itself exceeds that (`lo`
-            // defaults to 65536). Measured: `query("127.0.0.1", .{.iface =
-            // "lo"})` reads `mtu = 65535` against `iface_mtu = 65536` with
-            // no exception in play at all. Comparing against the capped
-            // value avoids reading that artifact as a false exception.
-            const compare_mtu = @min(im, std.math.maxInt(u16));
-            result.cache_is_exception = (mtu != compare_mtu);
+            result.cache_is_exception = cacheIsException(family, mtu, im);
         }
     }
     return result;
+}
+
+/// A1 F6. Is the value `query` read back different from the interface MTU
+/// `im`, i.e. is a PMTU exception in play? `IP_MTU` can never read back above
+/// 65535 (the IPv4 total-length field is 16 bits) even with no exception and
+/// an interface whose MTU exceeds that (`lo` defaults to 65536), so the v4
+/// comparison is against the capped value; measured: `query("127.0.0.1",
+/// .{.iface = "lo"})` reads `mtu = 65535` against `iface_mtu = 65536`.
+/// `IPV6_MTU` has no such cap (the v6 link MTU is a 32-bit field, RFC 8200
+/// jumbograms): on `lo` it reads 65536, so the v6 comparison is uncapped
+/// (2026-11-17; the v4 cap was applied to v6 before and reported a false
+/// exception for `::1`).
+fn cacheIsException(family: icmp.Socket.Family, mtu: u32, im: u32) bool {
+    const compare_mtu: u32 = switch (family) {
+        .v4 => @min(im, std.math.maxInt(u16)),
+        .v6 => im,
+    };
+    return mtu != compare_mtu;
 }
 
 // ── probe: DF-bit binary search ─────────────────────────────────────────────
@@ -2720,6 +2730,26 @@ test "live: query() against ::1 reads the loopback MTU through the v6 socket opt
     try testing.expectEqual(Source.cached, r.source);
     // `IPV6_MTU` is not capped at 65535 the way `IP_MTU` is: it reads the interface MTU itself.
     try testing.expectEqual(r.iface_mtu.?, r.mtu);
+    // No exception on loopback: the comparison must not read the uncapped
+    // 65536 of `lo` as one (it did while the v4 cap was applied to v6).
+    try testing.expectEqual(@as(?bool, false), r.cache_is_exception);
+}
+
+test "cacheIsException: v4 compares against the 65535-capped interface MTU, v6 against the MTU itself" {
+    // v4: lo (65536) reads back 65535 -- not an exception; anything else is.
+    try testing.expect(!cacheIsException(.v4, 65535, 65536));
+    try testing.expect(cacheIsException(.v4, 65536, 65536));
+    try testing.expect(cacheIsException(.v4, 1400, 65536));
+    try testing.expect(!cacheIsException(.v4, 1500, 1500));
+    try testing.expect(cacheIsException(.v4, 1400, 1500));
+    try testing.expect(!cacheIsException(.v4, 65535, 65535));
+    // v6: lo reads back 65536 -- not an exception; the v4 cap value is one.
+    try testing.expect(!cacheIsException(.v6, 65536, 65536));
+    try testing.expect(cacheIsException(.v6, 65535, 65536));
+    try testing.expect(cacheIsException(.v6, 1280, 65536));
+    try testing.expect(!cacheIsException(.v6, 1500, 1500));
+    try testing.expect(cacheIsException(.v6, 1280, 1500));
+    try testing.expect(!cacheIsException(.v6, 4_000_000_000, 4_000_000_000));
 }
 
 const AttemptLog = struct {
