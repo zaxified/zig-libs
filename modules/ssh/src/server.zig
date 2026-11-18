@@ -3616,3 +3616,97 @@ test "ecdsa verify: an s longer than the curve order is refused even when its lo
     }
     return error.TestUnexpectedResult;
 }
+
+test "fromOpenSSH and the container parsers leave `out` zeroed on every error" {
+    const t = std.testing;
+    var hk: HostKey = undefined;
+    @memset(std.mem.asBytes(&hk), 0x5a);
+    try t.expectError(error.MissingPemBlock, HostKey.fromOpenSSH(&hk, "not a key", null));
+    try t.expect(std.mem.allEqual(u8, std.mem.asBytes(&hk), 0));
+
+    // The pub parsers, called directly on a container they refuse at once.
+    const junk = "openssh-key-v1\x00";
+    var ed: Ed25519.KeyPair = undefined;
+    @memset(std.mem.asBytes(&ed), 0x5a);
+    if (parseEd25519OpenSSH(&ed, junk, "")) |_| return error.TestUnexpectedResult else |_| {}
+    try t.expect(std.mem.allEqual(u8, std.mem.asBytes(&ed), 0));
+    var p256: EcdsaP256.KeyPair = undefined;
+    @memset(std.mem.asBytes(&p256), 0x5a);
+    if (parseEcdsaP256OpenSSH(&p256, junk, "")) |_| return error.TestUnexpectedResult else |_| {}
+    try t.expect(std.mem.allEqual(u8, std.mem.asBytes(&p256), 0));
+    var p384: EcdsaP384.KeyPair = undefined;
+    @memset(std.mem.asBytes(&p384), 0x5a);
+    if (parseEcdsaP384OpenSSH(&p384, junk, "")) |_| return error.TestUnexpectedResult else |_| {}
+    try t.expect(std.mem.allEqual(u8, std.mem.asBytes(&p384), 0));
+}
+
+test "parseEd25519Body: a pair refused after it was derived is zeroed in `out`" {
+    // As the seed/public mismatch test above: seed A, both public copies B.
+    // The pair is written to `out` before the compare refuses it.
+    const t = std.testing;
+    const kp_a = try Ed25519.KeyPair.generateDeterministic(@splat(0xa1));
+    const kp_b = try Ed25519.KeyPair.generateDeterministic(@splat(0xb2));
+    const pub_b = kp_b.public_key.toBytes();
+    var priv64: [64]u8 = undefined;
+    @memcpy(priv64[0..32], kp_a.secret_key.seed()[0..]);
+    @memcpy(priv64[32..], &pub_b);
+    var priv_buf: [256]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&priv_buf);
+    try pw.writeAll(&[_]u8{ 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11 });
+    try messages.writeString(&pw, "ssh-ed25519");
+    try messages.writeString(&pw, &pub_b);
+    try messages.writeString(&pw, &priv64);
+    try messages.writeString(&pw, "");
+    var i: u8 = 1;
+    while (pw.end % 8 != 0) : (i += 1) try pw.writeByte(i);
+    var bin: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&bin);
+    try w.writeAll("openssh-key-v1\x00");
+    try messages.writeString(&w, "none");
+    try messages.writeString(&w, "none");
+    try messages.writeString(&w, "");
+    try w.writeAll(&[_]u8{ 0, 0, 0, 1 });
+    try messages.writeString(&w, "");
+    try messages.writeString(&w, pw.buffered());
+
+    var kp: Ed25519.KeyPair = undefined;
+    @memset(std.mem.asBytes(&kp), 0x5a);
+    try t.expectError(error.InvalidPrivateKey, parseEd25519Body(&kp, w.buffered(), ""));
+    try t.expect(std.mem.allEqual(u8, std.mem.asBytes(&kp), 0));
+}
+
+// Dead-stack probe of the three container parsers as entry points of their
+// own (`pub`; `stackprobe_test.zig` reaches them only through
+// `HostKey.fromOpenSSH`, whose burn covers them there). Whole-module mutation
+// audit 2026-11-18.
+const load_probe = struct {
+    const sp = @import("testkit").stackprobe;
+    const P = sp.Probe(.{ .window = 256 * 1024 });
+    var bin_buf: [3][16 * 1024]u8 = undefined;
+    var bin: [3][]const u8 = undefined;
+    var ed: Ed25519.KeyPair = undefined;
+    var p256: EcdsaP256.KeyPair = undefined;
+    var p384: EcdsaP384.KeyPair = undefined;
+    fn ed25519() HostKey.FromOpenSSHError!void {
+        return parseEd25519OpenSSH(&ed, bin[0], "");
+    }
+    fn ecdsa256() HostKey.FromOpenSSHError!void {
+        return parseEcdsaP256OpenSSH(&p256, bin[1], "");
+    }
+    fn ecdsa384() HostKey.FromOpenSSHError!void {
+        return parseEcdsaP384OpenSSH(&p384, bin[2], "");
+    }
+};
+
+test "STACKPROBE: the container parsers, called directly, leave no key residue" {
+    try load_probe.sp.skipUnlessOptimized();
+    const texts = [_][]const u8{ vectors.ed25519_key, vectors.ecdsa_p256_key, vectors.ecdsa_p384_key };
+    for (texts, 0..) |text, i| load_probe.bin[i] = try pemDecodeOpensshBlock(text, &load_probe.bin_buf[i]);
+    // Positive control: each loads.
+    try load_probe.ed25519();
+    try load_probe.ecdsa256();
+    try load_probe.ecdsa384();
+    _ = try load_probe.P.run("parseEd25519OpenSSH", load_probe.ed25519, .{}, &.{&load_probe.ed.secret_key.bytes}, .{});
+    _ = try load_probe.P.run("parseEcdsaP256OpenSSH", load_probe.ecdsa256, .{}, &.{&load_probe.p256.secret_key.bytes}, .{});
+    _ = try load_probe.P.run("parseEcdsaP384OpenSSH", load_probe.ecdsa384, .{}, &.{&load_probe.p384.secret_key.bytes}, .{});
+}

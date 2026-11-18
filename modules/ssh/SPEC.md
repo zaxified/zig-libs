@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSH 10.x (client/server), Go `x/crypto/ssh` as library yardstick (surveyed 2026-09-30; re-assessed 2026-10-06)
 
-**Audit:** review 2026-10-06 · mutation 2026-08-22 · src ?
+**Audit:** review 2026-10-06 · mutation 2026-11-18 (869/1000, 131 eq) · src 2343acce5322655b
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SSH_FUZZ; ssh-pubkey added 2026-10-10) · ct 2026-10-18 (ctgrind; host-key PEM target `pem` added 2026-10-18)
 
@@ -419,25 +419,41 @@ environment with OpenSSH installed.
   listens, so a port collision can turn one live test into a skip on an individual run (observed
   once in ~10 runs); a run that reports no skips is the one that proves interop.
 
-- **Audit 2026-11-18 (whole-module mutation) — partial, not yet a card score.** 992 mutants
-  over the non-test code of `transport`, `server`, `userauth`, `connection`, `messages`, `keys`,
-  `knownhosts`: 905 N with the switch in the caller (10 hand-written for multi-line conditions)
-  and 87 W wipe/burn sites switched inside `burn.zig`, plus 7 constant-time mutants judged apart.
-  Three ReleaseSafe passes and one ReleaseFast pass for the W sites. So far: 706 killed (27 by
-  timeout), 50 equivalent, 5 unobservable, 11 excluded (comptime-only), 148 survived, 72 not run.
-  Every survivor examined was a missing test or an argued equivalent; no defect in a MAC,
-  signature, host-key, strict-KEX or userauth check. 105 killing tests were added (2026-11-17
-  changelog entry). Constant-time: the `dh` and `gex` ctgrind rows see an exponent whose leading
-  zero bytes are stripped (in-file 4 → 8 and 2 → 4); the `ecdh` row did NOT see an early-exit
-  zero test in `fromScalar` (22 → 22), so that row is blind to it; the packet-MAC compares have no
-  ctgrind target. Two LOW findings, left as they are: a userauth banner of exactly
-  `max_banner_len` (8 KiB) cannot be sent (`writePacket`'s 8 KiB frame refuses it with
-  `PacketTooLarge`; a test pins this), and `messages.NameList.iterator` yields one empty name for
-  an empty list although its doc comment promises none. Still open when the time budget ran out:
-  the server channel-request handlers (`pty-req`, `window-change`, `env`, `exec`/`subsystem`
-  replies) and most of `knownhosts` were not run; the newest killing tests (connection, `keys`,
-  `messages`) are not yet measured against their mutants; the 73 surviving W sites are not yet
-  argued one by one. The card keeps `mutation 2026-08-22 · src ?` until a run closes them.
+- **Audit 2026-11-18 (whole-module mutation).** 992 mutants over the non-test code of
+  `transport`, `server`, `userauth`, `connection`, `messages`, `keys`, `knownhosts`: 905 N with
+  the switch in the caller (10 hand-written for multi-line conditions) and 87 W wipe/burn sites
+  switched inside `burn.zig`, plus 8 constant-time mutants measured with ctgrind. Two passes
+  (2026-11-17/18): six ReleaseSafe and four ReleaseFast schemata builds; W sites in ReleaseFast
+  against the stack probes and the full suite. Result: **869 killed** (31 by timeout, 4 by
+  ctgrind), **131 equivalent or unobservable** (108 equivalent, 8 unobservable, 11 excluded as
+  comptime-only, 4 constant-time), 0 open. Every survivor became a killing test (about 160 over
+  both passes) or an argued verdict. No defect was found in a MAC, signature, host-key,
+  strict-KEX, userauth or `known_hosts` check.
+  W sites: 27 are killed by new tests. Those tests check that `out` is zeroed on every
+  `fromOpenSSH`/parser error, that the `zeroize` methods clear every byte, and that no secret is
+  left in freed client userauth buffers or in the keyboard-interactive scratch between rounds.
+  New ReleaseFast probes cover the three container parsers called directly, `writePacket` under
+  chacha20-poly1305 and AES-GCM, `deriveKeys`, the server's keyboard-interactive hook and the
+  client's prompted password. The remaining W sites are covered by another protection, and this
+  was measured: the site's bytes are probe needles and the probe stays clean with it skipped,
+  while the covering burn skipped alone is killed. Sites that cover each other were switched off
+  together (`SSH_WSET`): the client round burn with the install burn (the `connectInto` probe
+  finds the installed keys), the server gex burn with its `y`/`K` wipes, and the
+  keyboard-interactive burn with the reply's record burn.
+  Unobservable: the KEX-round heap scratch wipes (they protect channel data queued during a
+  re-exchange; nothing drives a scripted re-exchange) and the server round burn. With every burn
+  and wipe of the server round off, the server handshake probe stays clean; a residue-rule probe
+  of `serverHandshake` is still missing.
+  Constant time: `dh` and `gex` see an exponent stripped of its leading zero bytes. The `ecdh`
+  row was blind to an early-exit zero test in `fromScalar`: that branch replaced the one counted
+  context (memcheck put it on the loop instead of the `if`), so the count stayed 22.
+  `fromScalar` now declassifies only its zero verdict (`declassified`); the row is 20 (the three
+  zero-test contexts gone, P-256's public `rejectNonCanonical` verdict now counted apart) and the
+  early exit reads 22. The packet-MAC compares have no ctgrind target (unobservable). Two LOW
+  findings, left as they are: a userauth banner of exactly `max_banner_len` (8 KiB) cannot be
+  sent (`writePacket`'s 8 KiB frame), and `messages.NameList.iterator` yields one empty name
+  for an empty list although its doc comment promises none. Two kills first seen only in live
+  interop tests (889, 984) were re-measured without them and are killed by their own tests.
 
 ## Build options
 

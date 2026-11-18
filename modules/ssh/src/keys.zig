@@ -583,3 +583,38 @@ test "OptionIterator: an escaped quote does not end the quoted value" {
     try std.testing.expectEqualStrings("no-pty", it.next().?);
     try std.testing.expect(it.next() == null);
 }
+
+test "verify: a signature blob with trailing bytes is InvalidSignature" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var hk: server.HostKey = undefined;
+    try hk.fromOpenSSH(hv.ed25519_key, null);
+    const blob = try hk.publicBlob(gpa);
+    defer gpa.free(blob);
+    const key = try PublicKey.parse(blob);
+    const sig = try hk.sign(gpa, "data to sign");
+    defer gpa.free(sig);
+    try key.verify(sig, "data to sign");
+    const longer = try std.mem.concat(gpa, u8, &.{ sig, "\x00" });
+    defer gpa.free(longer);
+    try t.expectError(error.InvalidSignature, key.verify(longer, "data to sign"));
+}
+
+test "parseAuthorizedKeyLine: a blob buffer of exactly the blob's size is enough" {
+    const t = std.testing;
+    var buf: [51]u8 = undefined; // string "ssh-ed25519" (4 + 11) || string key (4 + 32)
+    const r = try parseAuthorizedKeyLine("ssh-ed25519 " ++ hv.ed25519_pub_b64, &buf);
+    try t.expectEqual(@as(usize, 51), r.key.blob.len);
+    var short: [50]u8 = undefined;
+    try t.expectError(error.NoSpaceLeft, parseAuthorizedKeyLine("ssh-ed25519 " ++ hv.ed25519_pub_b64, &short));
+}
+
+test "PublicKey.parse: a blob of exactly max_blob_len is parsed, one byte more is refused unread" {
+    const t = std.testing;
+    var buf: [max_blob_len + 1]u8 = @splat(0);
+    var w: std.Io.Writer = .fixed(&buf);
+    try messages.writeString(&w, "ssh-foo");
+    // At the bound the type is read (and is unknown); past it nothing is.
+    try t.expectError(error.UnsupportedKeyType, PublicKey.parse(buf[0..max_blob_len]));
+    try t.expectError(error.InvalidKey, PublicKey.parse(&buf));
+}
