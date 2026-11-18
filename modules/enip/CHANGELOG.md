@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** `Timeout.fromMilliseconds(0)` stays `null`; decided against the references (none converts milliseconds, they send fixed non-zero tick pairs or a raw pair from the caller), SPEC "`Timeout.fromMilliseconds(0)`, decided 2026-11-18". Backlog item closed; no code touched.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** reply matching decided against the references and left as is (SPEC, "Reply matching, decided 2026-11-18"): pycomm3 and EIPScanner compare neither the reply service nor the connected-address id, libplctag checks only its own typed services' reply service and logs the id; so `sendCip` / `sendConnectedCip` stay as they are. Backlog item closed; no code touched.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog records two reply-matching gaps and the zero-timeout semantics found by the mutation audit (no code change).
 - **2026-11-17** — Fix: `Client.sendConnectedCip` no longer consumes a sequence count for a request that cannot be framed (a request of 245-446 octets passed the margin guard, advanced `conn.sequence`, then failed `BufferTooSmall`); the count is committed after both encodes succeed (CIP Vol 2: sequence count per transmitted data packet). Behaviour change: the connection's `sequence` is unchanged after a `BufferTooSmall` from this call.
