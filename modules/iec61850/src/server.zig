@@ -3557,3 +3557,853 @@ test "client: a refused or rejecting association answer is not an association" {
         try testing.expect(!d.isConnected());
     }
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): server and wire pins ──
+
+/// Runs one request PDU through `Server.service` directly.
+fn askService(srv: *Server, pdu: []const u8, body: []u8) !mms.Pdu {
+    const req = (try mms.decode(pdu)).confirmed_request;
+    return mms.decode(try srv.service(req, body));
+}
+
+fn expectMissing(r: Server.Resolution) !void {
+    try testing.expect(std.meta.activeTag(r) == .missing);
+}
+
+fn emitInt(buf: []u8, v: i64) !usize {
+    var w = ber.Writer.init(buf);
+    try mmsdata.Emit.integer(&w, v);
+    const d = w.done();
+    std.mem.copyForwards(u8, buf[0..d.len], d);
+    return d.len;
+}
+
+test "a parked fragment is dropped by CR, DR and every SPDU that ends the association; CR records the TPDU size" {
+    var fx: Fixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    var out: [512]u8 = undefined;
+    var body: [64]u8 = undefined;
+    var tp: [128]u8 = undefined;
+    srv.reasm_len = 5;
+    const cr = try cotp.encodeConnect(.cr, 0, 1, .b1024, &[_]u8{ 0, 1 }, &[_]u8{ 0, 1 }, &body);
+    _ = try srv.handle(try tpkt.encode(cr, &tp), &out);
+    try testing.expectEqual(@as(usize, 0), srv.reasm_len);
+    try testing.expectEqual(@as(usize, 1024), srv.negotiated_tpdu_len);
+
+    srv.reasm_len = 5;
+    var dr_buf: [16]u8 = undefined;
+    const dr = try cotp.encodeDisconnect(1, 0, 0, &dr_buf);
+    try testing.expect((try srv.handle(try tpkt.encode(dr, &tp), &out)) == null);
+    try testing.expectEqual(@as(usize, 0), srv.reasm_len);
+
+    for ([_]session.Spdu{ .abort, .finish, .disconnect }) |kind| {
+        srv.reasm_len = 5;
+        const spdu = [_]u8{ @backingInt(kind), 0 };
+        try testing.expect((try srv.handleSpdu(&spdu, &out)) == null);
+        try testing.expectEqual(@as(usize, 0), srv.reasm_len);
+    }
+}
+
+test "releaseAssociationOf drops only that peer's parked fragment" {
+    var fx: Fixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    srv.reasm_len = 5;
+    srv.reasm_peer = 7;
+    srv.releaseAssociationOf(8);
+    try testing.expectEqual(@as(usize, 5), srv.reasm_len);
+    srv.releaseAssociationOf(7);
+    try testing.expectEqual(@as(usize, 0), srv.reasm_len);
+}
+
+test "reportSegmentBudget: the negotiated sizes bound a segment and zero means nothing was negotiated" {
+    var fx: Fixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    try testing.expectEqual(max_report_len, srv.reportSegmentBudget());
+    srv.negotiated_pdu_len = 4000;
+    try testing.expectEqual(@as(usize, 4000), srv.reportSegmentBudget());
+    // A TPDU no larger than the envelope leaves nothing to subtract from.
+    srv.negotiated_tpdu_len = envelope_overhead;
+    try testing.expectEqual(@as(usize, 4000), srv.reportSegmentBudget());
+    srv.negotiated_tpdu_len = 1024;
+    try testing.expectEqual(@as(usize, 1024 - envelope_overhead), srv.reportSegmentBudget());
+    srv.negotiated_pdu_len = 0;
+    try testing.expectEqual(@as(usize, 1024 - envelope_overhead), srv.reportSegmentBudget());
+    srv.negotiated_tpdu_len = 0;
+    try testing.expectEqual(max_report_len, srv.reportSegmentBudget());
+}
+
+test "the PDU size each side settles on: a non-positive localDetail means no limit" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var buf: [32768]u8 = undefined;
+    {
+        var srv = Server.init(.{}, model);
+        var paired = Paired{ .server = &srv };
+        var c = try client.Client.init(paired.seam(), &buf, .{ .local_detail = 0 });
+        try c.connect();
+        try testing.expectEqual(max_report_len, srv.negotiated_pdu_len);
+    }
+    {
+        var srv = Server.init(.{}, model);
+        var paired = Paired{ .server = &srv };
+        var c = try client.Client.init(paired.seam(), &buf, .{ .local_detail = 4000 });
+        try c.connect();
+        try testing.expectEqual(@as(usize, 4000), srv.negotiated_pdu_len);
+    }
+    for ([_]i32{ 0, -5 }) |detail| {
+        var srv = Server.init(.{ .local_detail = detail }, model);
+        var paired = Paired{ .server = &srv };
+        var c = try client.Client.init(paired.seam(), &buf, .{ .tpdu_size = .b1024 });
+        try c.connect();
+        try testing.expectEqual(@as(usize, 1024), c.max_pdu);
+        // A second association on the same client starts from clean contexts.
+        c.disconnect();
+        paired.queue_pos = paired.queue_len;
+        try c.connect();
+        try testing.expectEqual(@as(usize, 1024), c.max_pdu);
+    }
+    // A positive localDetail below the TPDU size is the tighter ceiling.
+    var srv = Server.init(.{ .local_detail = 500 }, model);
+    var paired = Paired{ .server = &srv };
+    var c = try client.Client.init(paired.seam(), &buf, .{ .tpdu_size = .b1024 });
+    try c.connect();
+    try testing.expectEqual(@as(usize, 500), c.max_pdu);
+}
+
+test "the report source and the variable index refuse every out-of-range index" {
+    var ind: [5][8]u8 = undefined;
+    var vars: [5]Variable = undefined;
+    for (0..5) |i| {
+        vars[i] = .{ .domain = domain, .item = "X", .storage = &ind[i], .len = try emitBool(&ind[i], true) };
+    }
+    // Member 3 is the first index past the three-variable table, 9 is far past it.
+    const members = [_]usize{ 0, 1, 3, 9 };
+    const sets = [_]DataSet{.{ .domain = domain, .item = "DS", .members = &members }};
+    var srv = Server.init(.{}, .{ .variables = vars[0..3], .data_sets = &sets, .domains = &.{} });
+    const ctx: *anyopaque = &srv;
+    var out: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), Server.sourceCount(ctx, 0));
+    try testing.expectEqual(@as(usize, 0), Server.sourceCount(ctx, 1));
+    try testing.expectEqual(@as(usize, 0), Server.sourceCount(ctx, 7));
+    try testing.expect(Server.sourceValue(ctx, 1, 0) == null);
+    try testing.expect(Server.sourceValue(ctx, 7, 0) == null);
+    try testing.expect(Server.sourceValue(ctx, 0, 4) == null);
+    try testing.expect(Server.sourceValue(ctx, 0, 9) == null);
+    try testing.expect(Server.sourceValue(ctx, 0, 2) == null);
+    try testing.expect(Server.sourceValue(ctx, 0, 3) == null);
+    try testing.expect(Server.sourceValue(ctx, 0, 1) != null);
+    try testing.expect(Server.sourceReference(ctx, 1, 0, &out) == null);
+    try testing.expect(Server.sourceReference(ctx, 7, 0, &out) == null);
+    try testing.expect(Server.sourceReference(ctx, 0, 4, &out) == null);
+    try testing.expect(Server.sourceReference(ctx, 0, 9, &out) == null);
+    try testing.expect(Server.sourceReference(ctx, 0, 2, &out) == null);
+    try testing.expect(Server.sourceReference(ctx, 0, 3, &out) == null);
+    try testing.expectEqualStrings("TESTLD/X", Server.sourceReference(ctx, 0, 1, &out).?);
+
+    // indexOfVariable: inside, one past the slice, and below it.
+    try testing.expectEqual(@as(?usize, 0), srv.indexOfVariable(&vars[0]));
+    try testing.expectEqual(@as(?usize, 2), srv.indexOfVariable(&vars[2]));
+    try testing.expectEqual(@as(?usize, null), srv.indexOfVariable(&vars[3]));
+    var shifted = Server.init(.{}, .{ .variables = vars[1..3], .domains = &.{} });
+    try testing.expectEqual(@as(?usize, null), shifted.indexOfVariable(&vars[0]));
+    try testing.expectEqual(@as(?usize, 0), shifted.indexOfVariable(&vars[1]));
+}
+
+test "sourceResolve honours the logical device of a data set" {
+    var fx: TwoDomains = .{};
+    var srv = Server.init(.{}, try fx.init());
+    const ctx: *anyopaque = &srv;
+    try testing.expectEqual(@as(?usize, 0), Server.sourceResolve(ctx, "LD1/LLN0$DS"));
+    try testing.expectEqual(@as(?usize, 1), Server.sourceResolve(ctx, "LD2/LLN0$DS"));
+    try testing.expectEqual(@as(?usize, 2), Server.sourceResolve(ctx, "LD2/LLN0$DS2"));
+    try testing.expectEqual(@as(?usize, null), Server.sourceResolve(ctx, "LD1/LLN0$DS2"));
+}
+
+test "GetNameList stops at 256 names for domains, variables and data sets alike" {
+    const a = testing.allocator;
+    const vars = try a.alloc(Variable, 300);
+    defer a.free(vars);
+    var one: [8]u8 = undefined;
+    const vlen = try emitBool(&one, true);
+    for (vars) |*v| v.* = .{ .domain = "LD", .item = "V", .storage = &one, .len = vlen };
+    const sets = try a.alloc(DataSet, 300);
+    defer a.free(sets);
+    for (sets) |*s| s.* = .{ .domain = "LD", .item = "S", .members = &[_]usize{0} };
+    const doms = try a.alloc([]const u8, 300);
+    defer a.free(doms);
+    for (doms) |*d| d.* = "LD";
+    var srv = Server.init(.{}, .{ .variables = vars, .data_sets = sets, .domains = doms });
+    var body: [16384]u8 = undefined;
+    var req: [128]u8 = undefined;
+    const Case = struct { class: mms.ObjectClass, scope: mms.Scope };
+    const cases = [_]Case{
+        .{ .class = .domain, .scope = .vmd },
+        .{ .class = .named_variable, .scope = .{ .domain = "LD" } },
+        .{ .class = .named_variable_list, .scope = .{ .domain = "LD" } },
+    };
+    for (cases) |cs| {
+        const pdu = try mms.encodeGetNameList(1, cs.class, cs.scope, null, &req);
+        const resp = try askService(&srv, pdu, &body);
+        var r = try mms.decodeGetNameListResponse(resp.confirmed_response.body);
+        var n: usize = 0;
+        while (try r.names.next()) |_| n += 1;
+        try testing.expectEqual(@as(usize, 256), n);
+    }
+}
+
+fn countReadResults(body: []const u8) !struct { ok: usize, bad: usize } {
+    var r = try mms.decodeReadResponse(body);
+    var ok: usize = 0;
+    var bad: usize = 0;
+    while (try r.results.next()) |a| switch (a) {
+        .success => ok += 1,
+        .failure => bad += 1,
+    };
+    return .{ .ok = ok, .bad = bad };
+}
+
+fn countWriteResults(body: []const u8, expect_first: mms.WriteResult) !usize {
+    var it = mms.decodeWriteResponse(body);
+    var n: usize = 0;
+    while (try it.next()) |r| : (n += 1) {
+        if (n == 0) try testing.expectEqual(expect_first, r);
+    }
+    return n;
+}
+
+test "data-set services skip members outside the variable table and cap at 64" {
+    var fx: ReportFixture = .{};
+    var model = try fx.init();
+    // 4 is the first index past the four variables, 99 is far past it.
+    const odd = [_]usize{ 0, 4, 99 };
+    const big: [70]usize = @splat(0);
+    const sets = [_]DataSet{
+        .{ .domain = domain, .item = "ODD", .members = &odd },
+        .{ .domain = domain, .item = "BIG", .members = &big },
+    };
+    model.data_sets = &sets;
+    model.report_controls = &.{};
+    model.logs = &.{};
+    var srv = Server.init(.{}, model);
+    const odd_name = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "ODD" } };
+    const big_name = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "BIG" } };
+    var req: [4096]u8 = undefined;
+    var body: [16384]u8 = undefined;
+
+    // GetNamedVariableListAttributes lists only the members that exist.
+    for ([_]struct { name: mms.ObjectName, want: usize }{
+        .{ .name = odd_name, .want = 1 },
+        .{ .name = big_name, .want = reporting.max_members },
+    }) |c| {
+        const resp = try askService(&srv, try mms.encodeGetNamedVariableListAttributes(1, c.name, &req), &body);
+        var attrs = try mms.decodeGetNamedVariableListAttributesResponse(resp.confirmed_response.body);
+        var n: usize = 0;
+        while (try attrs.variables.next()) |_| n += 1;
+        try testing.expectEqual(c.want, n);
+    }
+
+    // Reading the data set answers a failure per member that does not exist.
+    const rd = try askService(&srv, try mms.encodeRead(1, .{ .variable_list = odd_name }, false, &req), &body);
+    const counts = try countReadResults(rd.confirmed_response.body);
+    try testing.expectEqual(@as(usize, 1), counts.ok);
+    try testing.expectEqual(@as(usize, 2), counts.bad);
+
+    // Writing it: the member that exists is written, the others are non-existent.
+    var vb: [8]u8 = undefined;
+    const n = try emitBool(&vb, true);
+    const v1: []const u8 = vb[0..n];
+    const three = [_][]const u8{ v1, v1, v1 };
+    const wr = try askService(&srv, try mms.encodeWrite(1, .{ .variable_list = odd_name }, &three, &req), &body);
+    try testing.expectEqual(@as(usize, 3), try countWriteResults(wr.confirmed_response.body, .success));
+    // 70 members: the answer stops at 64.
+    const seventy: [70][]const u8 = @splat(v1);
+    const wb = try askService(&srv, try mms.encodeWrite(1, .{ .variable_list = big_name }, &seventy, &req), &body);
+    try testing.expectEqual(@as(usize, 64), try countWriteResults(wb.confirmed_response.body, .success));
+    // 70 names in one Write: also 64.
+    const name0 = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = ReportFixture.items[0] } };
+    const names70: [70]mms.ObjectName = @splat(name0);
+    const w70 = try askService(&srv, try mms.encodeWrite(1, .{ .variables = &names70 }, &seventy, &req), &body);
+    try testing.expectEqual(@as(usize, 64), try countWriteResults(w70.confirmed_response.body, .success));
+    // ...and in one Read.
+    const r70 = try askService(&srv, try mms.encodeRead(1, .{ .variables = &names70 }, false, &req), &body);
+    const c70 = try countReadResults(r70.confirmed_response.body);
+    try testing.expectEqual(@as(usize, 64), c70.ok);
+    try testing.expectEqual(@as(usize, 0), c70.bad);
+}
+
+test "a read of many SBO names stops selecting once the reference arena is full" {
+    // A 27-octet logical device and a 15-octet object prefix make every
+    // reference 43 octets: nine fit in the 516-octet arena with 129 to spare
+    // only at the tenth, and the eleventh does not.
+    const dom = "TESTLDxxxxxxxxxxxxxxxxxxxxx";
+    comptime std.debug.assert(dom.len == 27);
+    const letters = "abcdefghijk";
+    var items: [11][15]u8 = undefined;
+    var points: [11]ControlPoint = undefined;
+    var names: [11]mms.ObjectName = undefined;
+    var item_names: [11][19]u8 = undefined;
+    for (0..11) |i| {
+        @memcpy(items[i][0..14], "GGIO1$CO$SPCSO");
+        items[i][14] = letters[i];
+        points[i] = .{ .item = &items[i], .domain = dom, .ctl_model = .sbo_with_normal_security };
+        @memcpy(item_names[i][0..15], &items[i]);
+        @memcpy(item_names[i][15..19], "$SBO");
+        names[i] = .{ .domain_specific = .{ .domain = dom, .item = &item_names[i] } };
+    }
+    var store: [8]u8 = undefined;
+    var vars = [_]Variable{.{ .domain = dom, .item = "V", .storage = &store, .len = try emitBool(&store, false) }};
+    var srv = Server.init(.{}, .{ .variables = &vars, .controls = &points, .domains = &.{} });
+    var req: [1024]u8 = undefined;
+    var body: [4096]u8 = undefined;
+    const resp = try askService(&srv, try mms.encodeRead(1, .{ .variables = &names }, false, &req), &body);
+    var r = try mms.decodeReadResponse(resp.confirmed_response.body);
+    var i: usize = 0;
+    while (try r.results.next()) |a| : (i += 1) {
+        switch (a) {
+            .success => |d| {
+                try testing.expect(i < 10);
+                try testing.expectEqual(@as(usize, 43), (try d.visibleString()).len);
+            },
+            .failure => try testing.expect(i >= 10),
+        }
+    }
+    try testing.expectEqual(@as(usize, 11), i);
+}
+
+test "GetVariableAccessAttributes reads the object name only from the [0] element" {
+    var fx: ControlFixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    const name = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "GGIO1$CO$SPCSO1" } };
+    var req: [256]u8 = undefined;
+    const creq = (try mms.decode(try mms.encodeGetVariableAccessAttributes(1, name, &req))).confirmed_request;
+    var body: [1024]u8 = undefined;
+    const ok = try mms.decode(try srv.variableAccessAttributes(creq, &body));
+    try testing.expect(std.meta.activeTag(ok) == .confirmed_response);
+    // The same bytes under another context tag are not a name.
+    var moved: [256]u8 = undefined;
+    @memcpy(moved[0..creq.body.len], creq.body);
+    try testing.expectEqual(@as(u8, 0xA0), moved[0]);
+    moved[0] = 0xA1;
+    var body2: [1024]u8 = undefined;
+    const bad = try mms.decode(try srv.variableAccessAttributes(
+        .{ .invoke_id = 1, .service = creq.service, .body = moved[0..creq.body.len] },
+        &body2,
+    ));
+    try testing.expect(std.meta.activeTag(bad) == .confirmed_error);
+}
+
+test "block names resolve only in their own domain and on a '$' boundary; whole blocks refuse writes" {
+    var fx: SettingFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    const rcb = model.report_controls[0];
+    const lg = model.logs[0];
+    const sg = model.setting_groups.?;
+    for ([_][]const u8{ rcb.item, lg.item, sg.item }) |item| {
+        try expectMissing(srv.resolveRead(.{ .domain_specific = .{ .domain = "OTHERLD", .item = item } }));
+    }
+    try testing.expect(Server.matchBlock("LLN0$RP$EventsRCB01X", "LLN0$RP$EventsRCB01") == null);
+    try testing.expectEqualStrings("RptEna", Server.matchBlock("LLN0$RP$EventsRCB01$RptEna", "LLN0$RP$EventsRCB01").?);
+    try testing.expectEqual(@as(usize, 0), Server.matchBlock("LLN0$RP$EventsRCB01", "LLN0$RP$EventsRCB01").?.len);
+
+    var vb: [8]u8 = undefined;
+    const n = try emitBool(&vb, true);
+    for ([_][]const u8{ rcb.item, lg.item, sg.item }) |item| {
+        const whole = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = item } };
+        try testing.expectEqual(mms.WriteResult{ .failure = .object_access_denied }, srv.blockWrite(whole, vb[0..n]).?);
+    }
+
+    // The whole log and setting-group blocks read as structures over the wire.
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    for ([_][]const u8{ lg.item, sg.item }) |item| {
+        const d = try c.readName(.{ .domain_specific = .{ .domain = domain, .item = item } });
+        try testing.expect(d.kind.isConstructed());
+    }
+}
+
+test "a GI write sweeps once and clears itself; nothing else touches a pending GI" {
+    var fx: ReportFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [65536]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    var dummy: u8 = 0;
+    resetCounters();
+    c.setReportHandler(.{ .ctx = &dummy, .on_report = onReport });
+    const rcb_ref = domain ++ "/LLN0.EventsRCB01";
+    try c.enableReporting(rcb_ref, .unbuffered, .{ .data_change = true, .general_interrogation = true }, 0);
+    const cb = &srv.model.report_controls[0];
+
+    // GI false asks for nothing.
+    var vb: [8]u8 = undefined;
+    const nf = try emitBool(&vb, false);
+    try c.writeObject(rcb_ref ++ ".GI", .RP, vb[0..nf]);
+    try paired.drain();
+    try testing.expectEqual(@as(u64, 0), srv.reports_sent);
+
+    // GI true sweeps once and the block clears the flag itself.
+    try c.generalInterrogation(rcb_ref, .unbuffered);
+    try testing.expect(!cb.gi);
+    try drainReports(&paired, &c, 8);
+    try testing.expectEqual(@as(u64, 1), srv.reports_sent);
+    try testing.expectEqual(@as(u64, 1), c.reports_received);
+    try testing.expectEqual(@as(u64, 0), c.notifications_received);
+    try c.disableReporting(rcb_ref, .unbuffered);
+
+    // Another association holds the block: the write is refused and GI is left alone.
+    var tb: [8]u8 = undefined;
+    const nt = try emitBool(&tb, true);
+    const d_true = try mmsdata.Data.decode(tb[0..nt]);
+    cb.enable(7, 0);
+    cb.gi = true;
+    srv.peer = 1;
+    try testing.expectEqual(
+        mms.WriteResult{ .failure = .object_access_denied },
+        srv.writeRcb(.{ .index = 0, .attribute = "GI" }, d_true),
+    );
+    try testing.expect(cb.gi);
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+
+    // A write of another attribute does not complete a pending GI.
+    cb.disable();
+    cb.gi = true;
+    try testing.expectEqual(
+        mms.WriteResult.success,
+        srv.writeRcb(.{ .index = 0, .attribute = "RptEna" }, d_true),
+    );
+    try testing.expect(cb.gi);
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+}
+
+test "pendingNotification serves the report blocks round-robin" {
+    var fx: ReportFixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    for (srv.model.report_controls) |*cb| cb.enable(1, 0);
+    srv.signal(0, .data_change);
+    srv.signal(1, .data_change);
+    var out: [4096]u8 = undefined;
+    const first = try testing.allocator.dupe(u8, (try srv.pendingNotification(&out)).?);
+    defer testing.allocator.free(first);
+    try testing.expectEqual(@as(usize, 1), srv.report_cursor);
+    const second = (try srv.pendingNotification(&out)).?;
+    try testing.expect(!std.mem.eql(u8, first, second));
+    try testing.expectEqual(@as(usize, 0), srv.report_cursor);
+}
+
+test "journal services: a delete names the object it refuses, an unknown journal is another error" {
+    var fx: ReportFixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    var req: [256]u8 = undefined;
+    var body: [1024]u8 = undefined;
+    const known = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "LLN0$EventLog" } };
+    const r1 = try askService(&srv, try logging.encodeDeleteJournal(1, known, &req), &body);
+    try testing.expectEqual(mms.ErrorClass.access, r1.confirmed_error.error_class);
+    try testing.expectEqual(@as(i32, 3), r1.confirmed_error.code);
+    const unknown = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "NoSuchJournal" } };
+    const r2 = try askService(&srv, try logging.encodeDeleteJournal(1, unknown, &req), &body);
+    try testing.expectEqual(mms.ErrorClass.access, r2.confirmed_error.error_class);
+    try testing.expectEqual(@as(i32, 0), r2.confirmed_error.code);
+    // A journal is found in its own logical device only.
+    try testing.expect(srv.findJournal(known) != null);
+    try testing.expect(srv.findJournal(.{ .domain_specific = .{ .domain = "OTHERLD", .item = "LLN0$EventLog" } }) == null);
+}
+
+test "tick records the clock, completeControl ignores a bad index and an idle point, the queue is FIFO and bounded" {
+    var fx: ControlFixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    srv.tick(500);
+    try testing.expectEqual(@as(u64, 500), srv.now_ms);
+    srv.completeControl(4, null);
+    srv.completeControl(99, null);
+    srv.completeControl(0, null);
+    try testing.expectEqual(@as(usize, 0), srv.notify_count);
+
+    var out: [1024]u8 = undefined;
+    var refs: [8][1024]u8 = undefined;
+    var ref_lens: [8]usize = undefined;
+    for (1..7) |k| {
+        srv.queueLastApplError(0, .time_limit_over, @intCast(k), .{});
+        const f = (try srv.pendingNotification(&out)).?;
+        @memcpy(refs[k][0..f.len], f);
+        ref_lens[k] = f.len;
+    }
+    for (1..6) |k| {
+        try testing.expect(!std.mem.eql(u8, refs[k][0..ref_lens[k]], refs[k + 1][0..ref_lens[k + 1]]));
+    }
+    // Three at once come out in the order they went in.
+    for (1..4) |k| srv.queueLastApplError(0, .time_limit_over, @intCast(k), .{});
+    try testing.expectEqual(@as(usize, 3), srv.notify_count);
+    for (1..4) |k| {
+        const f = (try srv.pendingNotification(&out)).?;
+        try testing.expectEqualSlices(u8, refs[k][0..ref_lens[k]], f);
+    }
+    // The queue holds max_pending_notifications; the rest are dropped.
+    for (1..7) |k| srv.queueLastApplError(0, .time_limit_over, @intCast(k), .{});
+    try testing.expectEqual(max_pending_notifications, srv.notify_count);
+    for (1..5) |k| {
+        const f = (try srv.pendingNotification(&out)).?;
+        try testing.expectEqualSlices(u8, refs[k][0..ref_lens[k]], f);
+    }
+    try testing.expectEqual(@as(usize, 0), srv.notify_count);
+    // An origin identifier past 64 octets cannot be encoded: no slot is left half used.
+    const long_id: [100]u8 = @splat('x');
+    srv.queueLastApplError(0, .time_limit_over, 1, .{ .or_ident = &long_id });
+    try testing.expectEqual(@as(usize, 0), srv.notify_count);
+}
+
+test "applyControlValue and controlSelect: bounds, stored length, rejection count, SBO is read-only" {
+    var fx: ControlFixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    var p = fx.controls[0];
+    const t = mmsdata.UtcTime.fromMillis(1_700_000_000_000, 10);
+    const nine: [9]u8 = @splat(0xAA);
+    const eight: [8]u8 = @splat(0xBB);
+    const before = srv.model.variables[0].len;
+    p.st_val = 0;
+    srv.applyControlValue(&p, .{ .ctl_val = &nine, .t = t }); // does not fit the 8-octet storage
+    try testing.expectEqual(before, srv.model.variables[0].len);
+    srv.applyControlValue(&p, .{ .ctl_val = &eight, .t = t });
+    try testing.expectEqual(@as(usize, 8), srv.model.variables[0].len);
+    try testing.expectEqualSlices(u8, &eight, srv.model.variables[0].value());
+    // A status index at or past the table is ignored.
+    const keep = srv.model.variables[3].len;
+    for ([_]usize{ 4, 99 }) |bad| {
+        p.st_val = bad;
+        srv.applyControlValue(&p, .{ .ctl_val = &eight, .t = t });
+    }
+    try testing.expectEqual(keep, srv.model.variables[3].len);
+
+    const sbo = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "GGIO1$CO$SPCSO2$SBO" } };
+    var out1: [128]u8 = undefined;
+    var out2: [128]u8 = undefined;
+    srv.peer = 1;
+    try testing.expect(srv.controlSelect(sbo, &out1).?.len > 0);
+    srv.peer = 2;
+    try testing.expectEqual(@as(usize, 0), srv.controlSelect(sbo, &out2).?.len);
+    try testing.expectEqual(@as(u64, 1), srv.control_rejections);
+    var bb: [8]u8 = undefined;
+    const nb = try emitBool(&bb, true);
+    try testing.expectEqual(mms.WriteResult{ .failure = .object_access_denied }, srv.controlWrite(sbo, bb[0..nb]).?);
+}
+
+test "store accepts a value that exactly fills the variable and refuses one octet more" {
+    var fx: ReportFixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    var b8: [16]u8 = undefined;
+    var w8 = ber.Writer.init(&b8);
+    try mmsdata.Emit.octetString(&w8, &[_]u8{ 1, 2, 3, 4, 5, 6 }); // 2 + 6 = 8 octets
+    try testing.expectEqual(mms.WriteResult.success, srv.store(&fx.vars[0], w8.done()));
+    var b9: [16]u8 = undefined;
+    var w9 = ber.Writer.init(&b9);
+    try mmsdata.Emit.octetString(&w9, &[_]u8{ 1, 2, 3, 4, 5, 6, 7 });
+    try testing.expectEqual(mms.WriteResult{ .failure = .object_value_invalid }, srv.store(&fx.vars[0], w9.done()));
+}
+
+test "wrap: the largest TPKT goes out and one octet more is refused" {
+    var fx: Fixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    const out = try testing.allocator.alloc(u8, 70000);
+    defer testing.allocator.free(out);
+    const pdu = try testing.allocator.alloc(u8, 70000);
+    defer testing.allocator.free(pdu);
+    @memset(pdu, 0);
+    var l: usize = tpkt.max_length;
+    var got: usize = 0;
+    while (true) : (l -= 1) {
+        if (srv.wrap(pdu[0..l], srv.mms_context, out)) |f| {
+            got = f.len;
+            break;
+        } else |e| try testing.expect(e == error.BufferTooSmall);
+    }
+    try testing.expectEqual(@as(usize, tpkt.max_length), got);
+    try testing.expectError(error.BufferTooSmall, srv.wrap(pdu[0 .. l + 1], srv.mms_context, out));
+}
+
+// ── the client over the wire ────────────────────────────────────────────────
+
+var seen_notes: usize = 0;
+
+fn onNote(_: *anyopaque, _: control.Notification) void {
+    seen_notes += 1;
+}
+
+test "client: the control handler, notification resets and poll's answers" {
+    var fx: ControlFixture = .{};
+    var srv = Server.init(.{}, try fx.init());
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    var dummy: u8 = 0;
+    seen_notes = 0;
+    c.setControlHandler(.{ .ctx = &dummy, .on_notification = onNote });
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{
+        .ctl_val = vw.done(),
+        .ctl_num = 1,
+        .origin = .{ .or_cat = .station_control, .or_ident = "zig-libs" },
+        .t = mmsdata.UtcTime.fromMillis(1_700_000_000_000, 10),
+    };
+    // A refused operate: its LastApplError reaches the handler.
+    try testing.expectError(error.AccessFailed, c.operateObject("TESTLD/GGIO1.SPCSO2", cmd));
+    try testing.expectEqual(@as(usize, 1), seen_notes);
+    try testing.expectEqual(@as(u64, 1), c.notifications_received);
+
+    // Each of these starts by dropping a notification that is already stale.
+    const stale = control.Notification{ .kind = .command_termination_negative };
+    c.last_notification = stale;
+    try testing.expect(try c.selectObject("TESTLD/GGIO1.SPCSO2"));
+    try testing.expect(c.last_notification == null);
+    c.last_notification = stale;
+    try c.operateObject("TESTLD/GGIO1.SPCSO1", cmd);
+    if (c.last_notification) |n| try testing.expect(n.kind != .command_termination_negative);
+    c.last_notification = stale;
+    c.clearNotification();
+    try testing.expect(c.last_notification == null);
+
+    // poll: nothing pending is false, something dispatched is true.
+    try testing.expect(!try c.poll());
+    srv.queueTermination(0, null, 1);
+    try paired.drain();
+    try testing.expect(try c.poll());
+}
+
+/// `Paired`, plus the means to inject one negative CommandTermination right
+/// after the server has processed an operate.
+const InjectLink = struct {
+    paired: Paired,
+    inject: bool = false,
+
+    fn seam(self: *InjectLink) transport.Transport {
+        return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
+    }
+    fn readFn(ctx: *anyopaque, buf: []u8) transport.TransportError!usize {
+        const self: *InjectLink = @ptrCast(@alignCast(ctx));
+        return Paired.readFn(&self.paired, buf);
+    }
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) transport.TransportError!void {
+        const self: *InjectLink = @ptrCast(@alignCast(ctx));
+        try Paired.writeFn(&self.paired, bytes);
+        if (self.inject and self.paired.server.operates > 0) {
+            self.inject = false;
+            self.paired.server.queueTermination(3, .time_limit_over, 1);
+            try self.paired.drain();
+        }
+    }
+};
+
+test "executeControl: a refused select and a negative termination are both ControlRejected" {
+    var fx: ControlFixture = .{};
+    var srv = Server.init(.{ .auto_complete_control = false }, try fx.init());
+    var link = InjectLink{ .paired = .{ .server = &srv } };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(link.seam(), &buf, .{});
+    try c.connect();
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{
+        .ctl_val = vw.done(),
+        .origin = .{ .or_cat = .station_control, .or_ident = "zig-libs" },
+        .t = mmsdata.UtcTime.fromMillis(1_700_000_000_000, 10),
+    };
+    // Another association holds the select: ours is refused.
+    srv.peer = 0xBBBB;
+    try srv.markAssociated();
+    try testing.expect(try c.selectObject("TESTLD/GGIO1.SPCSO2"));
+    srv.peer = 0xAAAA;
+    try srv.markAssociated();
+    var m1 = control.Machine.init(.sbo_with_normal_security, 2000);
+    try testing.expectError(error.ControlRejected, c.executeControl(&m1, "TESTLD/GGIO1.SPCSO2", cmd, 1000));
+    // It was the select that was refused, not a later operate.
+    try testing.expectEqual(control.Stage.select, m1.failure.?.stage);
+
+    // The execution is accepted and then terminated negatively.
+    link.inject = true;
+    var m2 = control.Machine.init(.sbo_with_enhanced_security, 2000);
+    try testing.expectError(error.ControlRejected, c.executeControl(&m2, "TESTLD/GGIO1.SPCSO4", cmd, 1000));
+    try testing.expectEqual(control.State.failed, m2.state);
+}
+
+test "client: sboTimeout values, a malformed value and the write scratch limit" {
+    var s0: [16]u8 = undefined;
+    var s1: [16]u8 = undefined;
+    var s2: [16]u8 = undefined;
+    var s3: [16]u8 = undefined;
+    var s4: [1100]u8 = undefined;
+    s3[0] = 0x83;
+    s3[1] = 0x02;
+    s3[2] = 0x00;
+    s3[3] = 0x00;
+    var vars = [_]Variable{
+        .{ .domain = domain, .item = "GGIO1$CF$SPCSO2$sboTimeout", .storage = &s0, .len = try emitInt(&s0, 0) },
+        .{ .domain = domain, .item = "GGIO2$CF$SPCSO2$sboTimeout", .storage = &s1, .len = try emitInt(&s1, -1) },
+        .{ .domain = domain, .item = "GGIO3$CF$SPCSO2$sboTimeout", .storage = &s2, .len = try emitInt(&s2, 5000) },
+        .{ .domain = domain, .item = "BAD$ST$X$stVal", .storage = &s3, .len = 4 },
+        .{ .domain = domain, .item = "BIG$DC$X$x", .storage = &s4, .len = 3, .writable = true },
+    };
+    var srv = Server.init(.{}, .{ .variables = &vars, .domains = &.{} });
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    try testing.expectEqual(@as(?u32, 0), try c.readSboTimeout("TESTLD/GGIO1.SPCSO2"));
+    try testing.expectEqual(@as(?u32, null), try c.readSboTimeout("TESTLD/GGIO2.SPCSO2"));
+    try testing.expectEqual(@as(?u32, 5000), try c.readSboTimeout("TESTLD/GGIO3.SPCSO2"));
+    // A value that decodes but does not validate is not handed out.
+    const bad = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "BAD$ST$X$stVal" } };
+    if (c.readName(bad)) |_| return error.TestUnexpectedResult else |_| {}
+
+    // A 4096-octet client has a 1024-octet scratch: a value of 768 octets plus
+    // the 256 of request framing fits it exactly, 769 does not.
+    var small: [4096]u8 = undefined;
+    var c2 = try client.Client.init(paired.seam(), &small, .{});
+    paired.queue_pos = paired.queue_len;
+    try c2.connect();
+    const target = mms.ObjectName{ .domain_specific = .{ .domain = domain, .item = "BIG$DC$X$x" } };
+    var payload: [765]u8 = @splat(0x55);
+    var vbuf: [1100]u8 = undefined;
+    var w = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.octetString(&w, payload[0..764]);
+    try testing.expectEqual(@as(usize, 768), w.done().len);
+    try c2.writeName(target, w.done());
+    var w2 = ber.Writer.init(&vbuf);
+    try mmsdata.Emit.octetString(&w2, payload[0..765]);
+    try testing.expectEqual(@as(usize, 769), w2.done().len);
+    try testing.expectError(error.BufferTooSmall, c2.writeName(target, w2.done()));
+}
+
+const Page = struct { names: []const []const u8, more: bool };
+
+/// `Paired`, except that every `GetNameList` is answered from a script: the
+/// real `Server` never sets `moreFollows`, and the client's continuation
+/// logic cannot be reached without a peer that does.
+const PagedLink = struct {
+    paired: Paired,
+    pages: []const Page,
+    requests: usize = 0,
+    second_after: [32]u8 = undefined,
+    second_after_len: usize = 0,
+
+    fn seam(self: *PagedLink) transport.Transport {
+        return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
+    }
+    fn readFn(ctx: *anyopaque, buf: []u8) transport.TransportError!usize {
+        const self: *PagedLink = @ptrCast(@alignCast(ctx));
+        return Paired.readFn(&self.paired, buf);
+    }
+    fn nameListRequest(self: *PagedLink, bytes: []const u8) ?mms.ConfirmedRequest {
+        const srv = self.paired.server;
+        if (!srv.isAssociated()) return null;
+        const pkt = tpkt.decode(bytes) catch return null;
+        const dt = switch (cotp.decode(pkt.payload) catch return null) {
+            .dt => |d| d,
+            else => return null,
+        };
+        const ppdu = session.decodeDataTransfer(dt.payload) catch return null;
+        const pdv = presentation.decodeUserData(ppdu, &srv.contexts) catch return null;
+        const pdu = mms.decode(pdv.value) catch return null;
+        return switch (pdu) {
+            .confirmed_request => |r| if (r.service == .get_name_list) r else null,
+            else => null,
+        };
+    }
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) transport.TransportError!void {
+        const self: *PagedLink = @ptrCast(@alignCast(ctx));
+        const req = self.nameListRequest(bytes) orelse return Paired.writeFn(&self.paired, bytes);
+        const page = self.pages[@min(self.requests, self.pages.len - 1)];
+        self.requests += 1;
+        if (self.requests == 2) {
+            const q = mms.decodeGetNameListRequest(req.body) catch return error.WriteFailed;
+            if (q.continue_after) |ca| {
+                @memcpy(self.second_after[0..ca.len], ca);
+                self.second_after_len = ca.len;
+            }
+        }
+        var body: [2048]u8 = undefined;
+        const pdu = mms.encodeGetNameListResponse(req.invoke_id, page.names, page.more, &body) catch
+            return error.WriteFailed;
+        var out: [4096]u8 = undefined;
+        const srv = self.paired.server;
+        const frame = srv.wrap(pdu, srv.mms_context, &out) catch return error.WriteFailed;
+        try self.paired.enqueue(frame);
+    }
+};
+
+test "client getNameList follows moreFollows with the last name as continuation and stops where it should" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    const one = [_][]const u8{"a1"};
+    const two = [_][]const u8{"b1"};
+    const pair = [_][]const u8{ "x", "y" };
+    const none = [_][]const u8{};
+    var names: [4][]const u8 = undefined;
+    var cbuf: [32768]u8 = undefined;
+    // Two pages: the second request continues after the last name of the first.
+    {
+        var srv = Server.init(.{}, model);
+        const pages = [_]Page{ .{ .names = &one, .more = true }, .{ .names = &two, .more = false } };
+        var link = PagedLink{ .paired = .{ .server = &srv }, .pages = &pages };
+        var c = try client.Client.init(link.seam(), &cbuf, .{});
+        try c.connect();
+        const n = try c.getNameList(.named_variable, .{ .domain = domain }, &names);
+        try testing.expectEqual(@as(usize, 2), n);
+        // The names point into the client's reassembly buffer, which the second
+        // answer reuses; only the last one is still readable.
+        try testing.expectEqualStrings("b1", names[1]);
+        try testing.expectEqual(@as(usize, 2), link.requests);
+        try testing.expectEqualStrings("a1", link.second_after[0..link.second_after_len]);
+    }
+    // A peer that never stops: the client gives up after 256 rounds and keeps what fits.
+    {
+        var srv = Server.init(.{}, model);
+        const pages = [_]Page{.{ .names = &pair, .more = true }};
+        var link = PagedLink{ .paired = .{ .server = &srv }, .pages = &pages };
+        var c = try client.Client.init(link.seam(), &cbuf, .{});
+        try c.connect();
+        const n = try c.getNameList(.named_variable, .{ .domain = domain }, names[0..1]);
+        try testing.expectEqual(@as(usize, 1), n);
+        try testing.expectEqual(@as(usize, 256), link.requests);
+    }
+    // moreFollows with no names at all would loop: it ends the listing.
+    {
+        var srv = Server.init(.{}, model);
+        const pages = [_]Page{.{ .names = &none, .more = true }};
+        var link = PagedLink{ .paired = .{ .server = &srv }, .pages = &pages };
+        var c = try client.Client.init(link.seam(), &cbuf, .{});
+        try c.connect();
+        const n = try c.getNameList(.named_variable, .{ .domain = domain }, &names);
+        try testing.expectEqual(@as(usize, 0), n);
+        try testing.expectEqual(@as(usize, 1), link.requests);
+    }
+    // moreFollows on a page with no names, after one with names, also ends it
+    // (restarting from the top would never finish).
+    {
+        var srv = Server.init(.{}, model);
+        const pages = [_]Page{ .{ .names = &one, .more = true }, .{ .names = &none, .more = true } };
+        var link = PagedLink{ .paired = .{ .server = &srv }, .pages = &pages };
+        var c = try client.Client.init(link.seam(), &cbuf, .{});
+        try c.connect();
+        const n = try c.getNameList(.named_variable, .{ .domain = domain }, &names);
+        try testing.expectEqual(@as(usize, 1), n);
+        try testing.expectEqual(@as(usize, 2), link.requests);
+    }
+    // A caller buffer of no names at all still follows the listing to the bound.
+    {
+        var srv = Server.init(.{}, model);
+        const pages = [_]Page{.{ .names = &one, .more = true }};
+        var link = PagedLink{ .paired = .{ .server = &srv }, .pages = &pages };
+        var c = try client.Client.init(link.seam(), &cbuf, .{});
+        try c.connect();
+        const n = try c.getNameList(.named_variable, .{ .domain = domain }, names[0..0]);
+        try testing.expectEqual(@as(usize, 0), n);
+        try testing.expectEqual(@as(usize, 256), link.requests);
+    }
+}

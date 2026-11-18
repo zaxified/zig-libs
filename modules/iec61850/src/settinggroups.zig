@@ -896,3 +896,127 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): ownership and bounds pins ──
+
+fn uData(buf: []u8, v: u32) !mmsdata.Data {
+    var w = ber.Writer.init(buf);
+    try mmsdata.Emit.unsigned(&w, v);
+    return mmsdata.Data.decode(w.done());
+}
+
+test "Setting storage: a value of exactly one slot fits, one octet more does not; validate's floor" {
+    var fx: Fixture = .{};
+    _ = try fx.init();
+    const s = fx.settings[0];
+    const sixteen: [16]u8 = @splat(0x11);
+    try s.store(0, &sixteen);
+    const seventeen: [17]u8 = @splat(0x11);
+    try testing.expectError(error.ValueTooLarge, s.store(0, &seventeen));
+
+    var st4: [4]u8 = undefined;
+    var l4: [4]usize = @splat(0);
+    var one = [_]Setting{.{ .domain = "D", .ln = "L", .path = "p", .storage = &st4, .lens = &l4 }};
+    var cb = ControlBlock{ .domain = "D", .groups = 3, .settings = &one };
+    try cb.validate(); // one octet per slot is the floor
+    one[0].storage = st4[0..3];
+    try testing.expectError(error.SettingStorageTooSmall, cb.validate());
+}
+
+test "edit selection: ownership, release, group bounds, reset flags and index bounds" {
+    var fx: Fixture = .{};
+    var cb = try fx.init();
+    try cb.selectActiveSG(2, 5);
+    try testing.expectEqual(@as(u64, 1), cb.activations);
+
+    try cb.selectEditSG(1, 1);
+    try setEdit(&cb, 0, 1, 9.0);
+    try testing.expect(cb.edited);
+    // Another client can neither release, take over, edit nor confirm it.
+    try testing.expectError(error.EditGroupBusy, cb.selectEditSG(0, 2));
+    try testing.expectError(error.EditGroupBusy, cb.selectEditSG(2, 2));
+    try testing.expectError(error.EditGroupBusy, cb.setEditValue(0, 2, &[_]u8{1}));
+    try testing.expectError(error.EditGroupBusy, cb.confirmEdit(2));
+    try testing.expectError(error.BadGroup, cb.selectEditSG(4, 1));
+    // Selecting again clears the edited flag; a confirm clears it too.
+    try cb.selectEditSG(2, 1);
+    try testing.expect(!cb.edited);
+    try setEdit(&cb, 0, 1, 8.0);
+    try cb.confirmEdit(1);
+    try testing.expect(!cb.edited);
+    try testing.expectEqual(@as(u64, 1), cb.confirmations);
+    // The setting index is bounded by the table, in every accessor.
+    try testing.expectError(error.BadGroup, cb.setEditValue(2, 1, &[_]u8{1}));
+    try testing.expectError(error.BadGroup, cb.activeValue(2));
+    try testing.expectError(error.BadGroup, cb.editValue(2));
+    // The owner's release clears everything.
+    try setEdit(&cb, 0, 1, 7.0);
+    try cb.selectEditSG(0, 1);
+    try testing.expectEqual(@as(u8, 0), cb.edit_sg);
+    try testing.expectEqual(@as(?u32, null), cb.editor);
+    try testing.expect(!cb.edited);
+}
+
+test "an editor recorded without a selection does not lock anyone out" {
+    var fx: Fixture = .{};
+    var cb = try fx.init();
+    cb.editor = 5;
+    cb.edit_sg = 0;
+    try cb.selectEditSG(1, 6);
+    try testing.expectEqual(@as(?u32, 6), cb.editor);
+}
+
+test "the edit reservation arms only for a held selection with ResvTms > 0 and clears itself" {
+    var fx: Fixture = .{};
+    var cb = try fx.init();
+    cb.now_ms = 100;
+    try cb.selectEditSG(1, 1); // ResvTms 0: no timer
+    try testing.expectEqual(@as(u64, 0), cb.edit_deadline_ms);
+    cb.resv_tms = 2;
+    try cb.selectEditSG(2, 1);
+    try testing.expectEqual(@as(u64, 2100), cb.edit_deadline_ms);
+    try setEdit(&cb, 0, 1, 1.0);
+    try testing.expect(!cb.tick(2099));
+    try testing.expect(cb.tick(2100));
+    try testing.expectEqual(@as(u64, 0), cb.edit_deadline_ms);
+    try testing.expectEqual(@as(u8, 0), cb.edit_sg);
+    try testing.expectEqual(@as(?u32, null), cb.editor);
+    try testing.expect(!cb.edited);
+    try testing.expectEqual(@as(u64, 1), cb.expirations);
+
+    // ResvTms written with nothing selected arms nothing.
+    var bb: [8]u8 = undefined;
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("ResvTms", try uData(&bb, 5), 1, 2100));
+    try testing.expectEqual(@as(u64, 0), cb.edit_deadline_ms);
+
+    // Losing another association leaves a held edit alone; the holder's loss drops all of it.
+    cb.resv_tms = 2;
+    try cb.selectEditSG(1, 1);
+    try setEdit(&cb, 0, 1, 4.0);
+    cb.associationLost(2);
+    try testing.expectEqual(@as(u8, 1), cb.edit_sg);
+    cb.associationLost(1);
+    try testing.expectEqual(@as(u8, 0), cb.edit_sg);
+    try testing.expectEqual(@as(?u32, null), cb.editor);
+    try testing.expect(!cb.edited);
+    try testing.expectEqual(@as(u64, 0), cb.edit_deadline_ms);
+}
+
+test "find: the logical node has to match before the suffix is looked at" {
+    var fx: Fixture = .{};
+    const cb = try fx.init();
+    try testing.expect(cb.find("DEMOPROT", "PTOC2$SE$StrVal$setMag$f") == null);
+    try testing.expect(cb.find("DEMOPROT", "PTOC1$SE$StrVal$setMag$f") != null);
+}
+
+test "SGCB writes: ResvTms is bounded by i16, ActSG and EditSG by a byte" {
+    var fx: Fixture = .{};
+    var cb = try fx.init();
+    var bb: [8]u8 = undefined;
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("ResvTms", try uData(&bb, 32767), 1, 0));
+    try testing.expectEqual(@as(i16, 32767), cb.resv_tms);
+    try testing.expectEqual(WriteOutcome.invalid, cb.writeAttribute("ResvTms", try uData(&bb, 32768), 1, 0));
+    try testing.expectEqual(WriteOutcome.invalid, cb.writeAttribute("ResvTms", try uData(&bb, 40000), 1, 0));
+    try testing.expectEqual(WriteOutcome.invalid, cb.writeAttribute("ActSG", try uData(&bb, 256), 1, 0));
+    try testing.expectEqual(WriteOutcome.invalid, cb.writeAttribute("EditSG", try uData(&bb, 256), 1, 0));
+}

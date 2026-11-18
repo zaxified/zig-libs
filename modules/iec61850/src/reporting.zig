@@ -2893,3 +2893,540 @@ test "writes: RptID length bound, OptFlds and TrgOps take effect" {
     try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("TrgOps", try mmsdata.Data.decode(tw.done()), 1, 0));
     try testing.expect(!cb.trg_ops.data_change);
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): buffer and engine pins ──
+
+test "Entry.includes: the last member is bit 0 and nothing past the bit string is included" {
+    const e: Entry = .{ .inclusion = std.math.maxInt(u64) };
+    try testing.expect(e.includes(0));
+    try testing.expect(e.includes(max_members - 1));
+    try testing.expect(!e.includes(max_members));
+    try testing.expect(!e.includes(max_members + 7));
+}
+
+test "Buffer: slot floor, clear, a stale entry is reset on push, pop and the empty answers" {
+    var entries: [2]Entry = @splat(.{});
+    var arena: [16]u8 = undefined;
+    // 16 octets over two entries is a slot of exactly 8: enough. 15 is not.
+    _ = try Buffer.init(&entries, &arena);
+    try testing.expectError(error.ReportBufferTooSmall, Buffer.init(&entries, arena[0..15]));
+    try testing.expectError(error.ReportBufferTooSmall, Buffer.init(entries[0..0], &arena));
+    var none = Buffer.none;
+    try testing.expectError(error.ReportBufferTooSmall, none.push(1));
+
+    var b = try Buffer.init(&entries, &arena);
+    b.head = 1;
+    b.count = 2;
+    b.overflow = true;
+    b.clear();
+    try testing.expectEqual(@as(usize, 0), b.head);
+    try testing.expectEqual(@as(usize, 0), b.count);
+    try testing.expect(!b.overflow);
+
+    // `push` hands out a clean entry even where the slot held an old one.
+    entries[0] = .{ .inclusion = 0xFF, .used = 5, .entry_id = 9, .open = true };
+    const e0 = try b.push(1);
+    try testing.expectEqual(@as(u64, 0), e0.inclusion);
+    try testing.expectEqual(@as(u16, 0), e0.used);
+    try testing.expectEqual(@as(u64, 0), e0.entry_id);
+    try testing.expect(!e0.open);
+
+    // The empty answers.
+    var empty = try Buffer.init(&entries, &arena);
+    empty.popOldest();
+    try testing.expectEqual(@as(usize, 0), empty.count);
+    try testing.expectEqual(@as(?u64, null), empty.oldestEntryId());
+    try testing.expectEqual(@as(?u64, null), empty.newestEntryId());
+    try testing.expectEqual(@as(?usize, null), empty.openIndex());
+
+    // popOldest takes exactly one; `holds` looks only at live entries.
+    _ = try empty.push(1);
+    _ = try empty.push(1);
+    empty.at(0).entry_id = 5;
+    empty.at(1).entry_id = 6;
+    empty.popOldest();
+    try testing.expectEqual(@as(usize, 1), empty.count);
+    entries[0].entry_id = 77; // the dead slot, one past the live entry
+    try testing.expect(empty.holds(6));
+    try testing.expect(!empty.holds(5));
+    try testing.expect(!empty.holds(77));
+}
+
+test "enable and disable: a URCB starts from nothing and a disabled one keeps nothing" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    cb.next_entry_id = 7;
+    cb.send_cursor = 1;
+    cb.buffer.count = 2; // stale entries
+    cb.enable(1, 0);
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+    try testing.expectEqual(@as(u64, 7), cb.send_cursor);
+    cb.buffer.count = 3;
+    cb.gi = true;
+    cb.disable();
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+    try testing.expect(!cb.gi);
+}
+
+test "rptId falls back to the block's own item when none is configured" {
+    var h: Harness = .{};
+    var cb = h.block(.unbuffered);
+    cb.rpt_id = "";
+    try testing.expectEqualStrings(cb.item, cb.rptId());
+    cb.rpt_id = "RPT9";
+    try testing.expectEqualStrings("RPT9", cb.rptId());
+}
+
+/// A source that resolves every `DatSet` name to data set 2 and has no members.
+const AnySource = struct {
+    fn source(self: *AnySource) Source {
+        return .{ .ctx = self, .vtable = &.{
+            .count = countFn,
+            .value = valueFn,
+            .reference = referenceFn,
+            .resolve = resolveFn,
+        } };
+    }
+    fn countFn(_: *anyopaque, _: usize) usize {
+        return 0;
+    }
+    fn valueFn(_: *anyopaque, _: usize, _: usize) ?[]const u8 {
+        return null;
+    }
+    fn referenceFn(_: *anyopaque, _: usize, _: usize, _: []u8) ?[]const u8 {
+        return null;
+    }
+    fn resolveFn(_: *anyopaque, _: []const u8) ?usize {
+        return 2;
+    }
+};
+
+test "rebind: a reference of exactly max_reference_len is taken, one more is refused, the cursor moves" {
+    var h: Harness = .{};
+    var any: AnySource = .{};
+    var cb = h.block(.unbuffered);
+    cb.next_entry_id = 9;
+    cb.send_cursor = 1;
+    const exact: [max_reference_len]u8 = @splat('d');
+    try cb.rebind(any.source(), &exact);
+    try testing.expectEqual(@as(u8, max_reference_len), cb.dat_set_len);
+    try testing.expectEqual(@as(usize, 2), cb.data_set);
+    try testing.expectEqual(@as(u64, 9), cb.send_cursor);
+    const over: [max_reference_len + 1]u8 = @splat('e');
+    try testing.expectError(error.UnknownDataSet, cb.rebind(any.source(), &over));
+}
+
+test "resumeAfter and purge: kind, the empty case, a held id and the cursor" {
+    var h: Harness = .{};
+    try h.src.init();
+    var u = h.block(.unbuffered);
+    try testing.expectError(error.EntryIdNotFound, u.resumeAfter(0));
+
+    var b = h.block(.buffered);
+    b.next_entry_id = 5;
+    b.send_cursor = 1;
+    try b.resumeAfter(0); // nothing buffered: the next entry
+    try testing.expectEqual(@as(u64, 5), b.send_cursor);
+    b.enable(1, 0);
+    const src = h.src.source();
+    _ = try b.signal(src, 0, 0, .data_change, 0);
+    _ = try b.signal(src, 0, 1, .data_change, 1);
+    b.send_cursor = 99;
+    try b.resumeAfter(0); // everything still buffered
+    try testing.expectEqual(@as(u64, 5), b.send_cursor);
+    try b.resumeAfter(5);
+    try testing.expectEqual(@as(u64, 6), b.send_cursor);
+    b.purge();
+    try testing.expectEqual(@as(usize, 0), b.buffer.count);
+    try testing.expectEqual(@as(u64, 7), b.send_cursor);
+}
+
+test "signal: another data set, a member past the data set and the 64-member bound" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.buffered);
+    cb.enable(1, 0);
+    const src = h.src.source();
+    try testing.expect(!try cb.signal(src, 5, 0, .data_change, 0));
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+    try testing.expect(!try cb.signal(src, 0, 4, .data_change, 0)); // member == total
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+    try testing.expect(!try cb.signal(src, 0, 9, .data_change, 0));
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+    h.src.count_override = max_members;
+    try testing.expect(try cb.signal(src, 0, 0, .data_change, 0));
+    h.src.count_override = max_members + 1;
+    try testing.expectError(error.TooManyMembers, cb.signal(src, 0, 0, .data_change, 0));
+}
+
+test "signal: an entry left open by an earlier BufTm is closed once BufTm is zero" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.buffered);
+    cb.buf_tm_ms = 1000;
+    cb.enable(1, 0);
+    const src = h.src.source();
+    try testing.expect(try cb.signal(src, 0, 0, .data_change, 0));
+    try testing.expect(cb.buffer.at(0).open);
+    cb.buf_tm_ms = 0;
+    try testing.expect(try cb.signal(src, 0, 1, .data_change, 10));
+    try testing.expectEqual(@as(usize, 1), cb.buffer.count);
+    try testing.expect(!cb.buffer.at(0).open);
+}
+
+test "sweep: the TrgOps gate, the 64-member bound and exactly the data set's members" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.buffered);
+    cb.enable(1, 0);
+    const src = h.src.source();
+    cb.trg_ops.integrity = false;
+    try testing.expect(!try cb.sweep(src, .integrity, 0));
+    try testing.expectEqual(@as(usize, 0), cb.buffer.count);
+    cb.trg_ops.integrity = true;
+    h.src.count_override = max_members + 1;
+    try testing.expectError(error.TooManyMembers, cb.sweep(src, .integrity, 0));
+    h.src.count_override = max_members;
+    try testing.expect(try cb.sweep(src, .integrity, 0));
+    // Three members in the data set, though the source can still answer for a
+    // fourth: the sweep stops at the count.
+    h.src.count_override = 3;
+    cb.purge();
+    try testing.expect(try cb.sweep(src, .general_interrogation, 1));
+    try testing.expectEqual(@as(usize, 3), cb.buffer.at(cb.buffer.count - 1).memberCount());
+}
+
+test "tick: a reservation lapse clears itself, an open entry closes at its deadline, the integrity gate" {
+    var h: Harness = .{};
+    try h.src.init();
+    const src = h.src.source();
+
+    var br = h.block(.buffered);
+    br.resv_tms = 5;
+    br.owner = 1;
+    br.resv_deadline_ms = 100;
+    _ = try br.tick(src, 100);
+    try testing.expectEqual(@as(u64, 0), br.resv_deadline_ms);
+    try testing.expectEqual(@as(i16, 0), br.resv_tms);
+    try testing.expectEqual(@as(?u32, null), br.owner);
+
+    var cb = h.block(.buffered);
+    cb.buf_tm_ms = 100;
+    cb.enable(1, 0);
+    _ = try cb.signal(src, 0, 0, .data_change, 0);
+    try testing.expect(!try cb.tick(src, 99));
+    try testing.expect(cb.buffer.at(0).open);
+    try testing.expect(try cb.tick(src, 100));
+    try testing.expect(!cb.buffer.at(0).open);
+
+    // A disabled block does not sweep on its integrity period.
+    var d = h.block(.buffered);
+    d.intg_pd_ms = 100;
+    d.next_integrity_ms = 0;
+    try testing.expect(!try d.tick(src, 200));
+    try testing.expectEqual(@as(usize, 0), d.buffer.count);
+    // A block without the integrity trigger does not even re-arm.
+    var n = h.block(.buffered);
+    n.enable(1, 0);
+    n.intg_pd_ms = 100;
+    n.trg_ops.integrity = false;
+    n.next_integrity_ms = 0;
+    _ = try n.tick(src, 200);
+    try testing.expectEqual(@as(u64, 0), n.next_integrity_ms);
+}
+
+test "BufTm: a signal exactly at the deadline opens a new entry and closes the old one" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.buffered);
+    cb.buf_tm_ms = 100;
+    cb.enable(1, 0);
+    const src = h.src.source();
+    _ = try cb.signal(src, 0, 0, .data_change, 0);
+    _ = try cb.signal(src, 0, 1, .data_change, 100);
+    try testing.expectEqual(@as(usize, 2), cb.buffer.count);
+    try testing.expect(!cb.buffer.at(0).open);
+    try testing.expect(cb.buffer.at(1).open);
+}
+
+test "a full buffer evicts the oldest entry, counts what was unseen and moves the cursor" {
+    var h: Harness = .{};
+    try h.src.init();
+    var entries: [2]Entry = @splat(.{});
+    var arena: [2 * 128]u8 = undefined;
+    var cb = h.block(.buffered);
+    cb.buffer = testBuffer(&entries, &arena);
+    cb.enable(1, 0);
+    const src = h.src.source();
+    _ = try cb.signal(src, 0, 0, .data_change, 0);
+    try testing.expectEqual(@as(u64, 0), cb.entries_dropped);
+    _ = try cb.signal(src, 0, 1, .data_change, 1);
+    try testing.expectEqual(@as(u64, 0), cb.entries_dropped);
+    try testing.expectEqual(@as(u64, 1), cb.send_cursor);
+    _ = try cb.signal(src, 0, 2, .data_change, 2); // evicts entry 1, never delivered
+    try testing.expectEqual(@as(u64, 1), cb.entries_dropped);
+    try testing.expect(cb.buffer.overflow);
+    try testing.expectEqual(@as(u64, 2), cb.send_cursor);
+}
+
+test "capture: a value that exactly fills the slot is kept, one octet more is refused" {
+    var h: Harness = .{};
+    try h.src.init();
+    var entries: [2]Entry = @splat(.{});
+    var arena: [2 * 9]u8 = undefined; // slot of 9: three 3-octet booleans
+    var cb = h.block(.buffered);
+    cb.buffer = testBuffer(&entries, &arena);
+    cb.buf_tm_ms = 1000;
+    cb.enable(1, 0);
+    const src = h.src.source();
+    _ = try cb.signal(src, 0, 0, .data_change, 0);
+    _ = try cb.signal(src, 0, 1, .data_change, 0);
+    _ = try cb.signal(src, 0, 2, .data_change, 0);
+    try testing.expectEqual(@as(usize, 3), cb.buffer.at(0).memberCount());
+    try testing.expectEqual(@as(u16, 9), cb.buffer.at(0).used);
+    try testing.expectError(error.EntryTooLarge, cb.signal(src, 0, 3, .data_change, 0));
+}
+
+test "capture: 65535 octets is the largest value an entry can hold" {
+    const Big = struct {
+        var data: [70000]u8 = @splat(0);
+        var len: usize = 0;
+        var arena: [70000]u8 = undefined;
+        fn countFn(_: *anyopaque, _: usize) usize {
+            return 1;
+        }
+        fn valueFn(_: *anyopaque, _: usize, _: usize) ?[]const u8 {
+            return data[0..len];
+        }
+        fn referenceFn(_: *anyopaque, _: usize, _: usize, _: []u8) ?[]const u8 {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const src = Source{ .ctx = &dummy, .vtable = &.{
+        .count = Big.countFn,
+        .value = Big.valueFn,
+        .reference = Big.referenceFn,
+    } };
+    var h: Harness = .{};
+    var entries: [1]Entry = @splat(.{});
+    var cb = h.block(.buffered);
+    cb.buffer = testBuffer(&entries, &Big.arena);
+    cb.enable(1, 0);
+    Big.len = 65535;
+    try testing.expect(try cb.signal(src, 0, 0, .data_change, 0));
+    try testing.expectEqual(@as(u16, 65535), cb.buffer.at(0).used);
+    cb.purge();
+    Big.len = 65536;
+    try testing.expectError(error.EntryTooLarge, cb.signal(src, 0, 0, .data_change, 1));
+}
+
+test "emitNext: data references are carried per member, in order" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    cb.opt_flds.data_reference = true;
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 0);
+    const r = (try h.next(&cb)).?;
+    try testing.expectEqual(@as(u16, 4), r.entry_count);
+    for (r.included(), 0..) |e, i| {
+        try testing.expectEqualStrings(h.src.refs[i], e.reference.?);
+    }
+}
+
+test "emitNext: the reference scratch holds exactly 64 references of 64 octets" {
+    const Wide = struct {
+        var val: [8]u8 = undefined;
+        var vlen: usize = 0;
+        fn countFn(_: *anyopaque, _: usize) usize {
+            return max_members;
+        }
+        fn valueFn(_: *anyopaque, _: usize, _: usize) ?[]const u8 {
+            return val[0..vlen];
+        }
+        fn referenceFn(_: *anyopaque, _: usize, _: usize, out: []u8) ?[]const u8 {
+            @memset(out[0..64], 'a');
+            return out[0..64];
+        }
+    };
+    var w0 = ber.Writer.init(&Wide.val);
+    try mmsdata.Emit.boolean(&w0, true);
+    const d0 = w0.done();
+    std.mem.copyForwards(u8, Wide.val[0..d0.len], d0);
+    Wide.vlen = d0.len;
+    var dummy: u8 = 0;
+    const src = Source{ .ctx = &dummy, .vtable = &.{
+        .count = Wide.countFn,
+        .value = Wide.valueFn,
+        .reference = Wide.referenceFn,
+    } };
+    var h: Harness = .{};
+    var entries: [1]Entry = @splat(.{});
+    var arena: [512]u8 = undefined;
+    var cb = h.block(.unbuffered);
+    cb.buffer = testBuffer(&entries, &arena);
+    cb.opt_flds.data_reference = true;
+    cb.enable(1, 0);
+    try testing.expect(try cb.sweep(src, .general_interrogation, 0));
+    var out: [8192]u8 = undefined;
+    var w = ber.Writer.init(&out);
+    try testing.expect(try cb.emitNext(src, &w));
+    const pdu = try mms.decode(w.done());
+    var r: report.Report = undefined;
+    try report.decodeInformationReport(&r, pdu.unconfirmed.body);
+    try testing.expectEqual(@as(u16, max_members), r.entry_count);
+    for (r.included()) |e| try testing.expectEqual(@as(usize, 64), e.reference.?.len);
+}
+
+test "emitNext: a member count past the bit string is refused and leaves the segment state alone" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 0);
+    cb.seg_member = 3;
+    h.src.count_override = max_members + 1;
+    var w = ber.Writer.init(&h.out);
+    try testing.expectError(error.TooManyMembers, cb.emitNext(h.src.source(), &w));
+    try testing.expectEqual(@as(usize, 3), cb.seg_member);
+    // A data set that shrank after the entry was built: the entry's old
+    // member 3 is no longer reported.
+    cb.seg_member = 0;
+    h.src.count_override = 3;
+    const r = (try h.next(&cb)).?;
+    try testing.expectEqual(@as(u16, 3), r.entry_count);
+}
+
+test "emitNext: a URCB pops the oldest entry only when that is the one it sent" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    cb.enable(1, 0);
+    const src = h.src.source();
+    _ = try cb.signal(src, 0, 0, .data_change, 0);
+    _ = try cb.signal(src, 0, 1, .data_change, 1);
+    cb.send_cursor = 2; // the first entry has already gone out
+    _ = (try h.next(&cb)).?;
+    try testing.expectEqual(@as(usize, 2), cb.buffer.count);
+}
+
+test "emitNext: a SegmentTooSmall leaves the writer empty" {
+    var h: SegHarness = .{};
+    h.src.payload = 200;
+    try h.src.init();
+    var cb = h.block(80);
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 1000);
+    var w = ber.Writer.init(&h.out);
+    try testing.expectError(error.SegmentTooSmall, cb.emitNext(h.src.source(), &w));
+    try testing.expectEqual(@as(usize, 0), w.len());
+}
+
+test "emitNext: every segment counts as an emitted report and the last keeps the entry time" {
+    var h: SegHarness = .{};
+    try h.src.init();
+    var cb = h.block(200);
+    cb.enable(1, 0);
+    _ = try cb.sweep(h.src.source(), .general_interrogation, 1234);
+    var segs: u64 = 0;
+    while (cb.pending()) {
+        var w = ber.Writer.init(&h.out);
+        try testing.expect(try cb.emitNext(h.src.source(), &w));
+        segs += 1;
+    }
+    try testing.expect(segs >= 2);
+    try testing.expectEqual(segs, cb.reports_emitted);
+    try testing.expectEqual(@as(u64, 1234), cb.last_entry_time_ms);
+    try testing.expectEqual(@as(u32, 1), cb.sq_num);
+}
+
+test "emitNext: a stale segment cursor at or past the member count restarts the report" {
+    for ([_]usize{ 6, 9 }) |stale| {
+        var h: SegHarness = .{};
+        try h.src.init();
+        var cb = h.block(4000);
+        cb.enable(1, 0);
+        _ = try cb.sweep(h.src.source(), .general_interrogation, 1000);
+        cb.seg_member = stale;
+        var w = ber.Writer.init(&h.out);
+        try testing.expect(try cb.emitNext(h.src.source(), &w));
+        const pdu = try mms.decode(w.done());
+        var r: report.Report = undefined;
+        try report.decodeInformationReport(&r, pdu.unconfirmed.body);
+        try testing.expectEqual(@as(u16, 6), r.entry_count);
+        try testing.expectEqual(@as(u32, 0), r.sub_seq_num.?);
+    }
+}
+
+test "emitAttribute: both spellings of TimeOfEntry give the same octets" {
+    var h: Harness = .{};
+    var cb = h.block(.buffered);
+    cb.last_entry_time_ms = 86_400_000 + 12345;
+    var a: [32]u8 = undefined;
+    var b: [32]u8 = undefined;
+    var wa = ber.Writer.init(&a);
+    var wb = ber.Writer.init(&b);
+    try cb.emitAttribute("TimeOfEntry", &wa);
+    try cb.emitAttribute("TimeofEntry", &wb);
+    try testing.expectEqualSlices(u8, wa.done(), wb.done());
+}
+
+test "writes: RptEna needs a data set, PurgeBuf purges only on true, EntryID takes eight octets exactly" {
+    var h: Harness = .{};
+    try h.src.init();
+    var bb: [8]u8 = undefined;
+    var nb = h.block(.unbuffered);
+    nb.dat_set = "";
+    try testing.expectEqual(WriteOutcome.invalid, nb.writeAttribute("RptEna", try auditBool(&bb, true), 1, 0));
+    try testing.expect(!nb.rpt_ena);
+
+    var b = h.block(.buffered);
+    b.enable(1, 0);
+    const src = h.src.source();
+    _ = try b.signal(src, 0, 0, .data_change, 0);
+    try testing.expectEqual(WriteOutcome.ok, b.writeAttribute("PurgeBuf", try auditBool(&bb, false), 1, 0));
+    try testing.expectEqual(@as(usize, 1), b.buffer.count);
+    try testing.expectEqual(WriteOutcome.ok, b.writeAttribute("PurgeBuf", try auditBool(&bb, true), 1, 0));
+    try testing.expectEqual(@as(usize, 0), b.buffer.count);
+
+    _ = try b.signal(src, 0, 1, .data_change, 1);
+    const id = b.buffer.newestEntryId().?;
+    var raw8: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw8, id, .big);
+    var eb: [16]u8 = undefined;
+    var ew = ber.Writer.init(&eb);
+    try mmsdata.Emit.octetString(&ew, &raw8);
+    try testing.expectEqual(WriteOutcome.ok, b.writeAttribute("EntryID", try mmsdata.Data.decode(ew.done()), 1, 0));
+    try testing.expectEqual(id + 1, b.send_cursor);
+    // Nine octets whose low eight name a held entry are still refused.
+    var raw9: [9]u8 = undefined;
+    raw9[0] = 0xAA;
+    @memcpy(raw9[1..], &raw8);
+    var eb9: [16]u8 = undefined;
+    var ew9 = ber.Writer.init(&eb9);
+    try mmsdata.Emit.octetString(&ew9, &raw9);
+    try testing.expectEqual(WriteOutcome.invalid, b.writeAttribute("EntryID", try mmsdata.Data.decode(ew9.done()), 1, 0));
+}
+
+test "encode: member count, entry count and member index are each bounded" {
+    var buf: [512]u8 = undefined;
+    const f = Fields{ .rpt_id = "R", .opt_flds = .{} };
+    const v = [_]u8{ 0x83, 0x01, 0x00 };
+    const inc = [_]Included{
+        .{ .index = 0, .value = &v },
+        .{ .index = 1, .value = &v },
+        .{ .index = 1, .value = &v },
+    };
+    var w = ber.Writer.init(&buf);
+    try testing.expectError(error.TooManyMembers, encode(&w, f, max_members + 1, inc[0..1]));
+    w = ber.Writer.init(&buf);
+    try encode(&w, f, max_members, inc[0..1]);
+    // Three entries for two members, every index inside the data set.
+    w = ber.Writer.init(&buf);
+    try testing.expectError(error.TooManyEntries, encode(&w, f, 2, &inc));
+    // An index equal to the member count.
+    w = ber.Writer.init(&buf);
+    try testing.expectError(error.TooManyEntries, encode(&w, f, 4, &[_]Included{.{ .index = 4, .value = &v }}));
+}

@@ -983,3 +983,276 @@ test "a Log element survives the round trip and is emitted after the DOIs" {
 
     try roundTrip(src, "LOGIED");
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): the emitter, exactly ──
+
+fn has(hay: []const u8, needle: []const u8) bool {
+    return std.mem.find(u8, hay, needle) != null;
+}
+
+/// A hand-built document with every empty-element case, every default that must
+/// be left out and every flag that must be written.
+const hand_params = [_]scl.Param{.{ .type = "IP", .value = "1.2.3.4" }};
+const hand_gse = [_]scl.CbAddress{.{ .ld_inst = "L1", .cb_name = "g1", .min_time_ms = 10, .max_time_ms = 20 }};
+const hand_aps = [_]scl.ConnectedAp{
+    .{ .ied_name = "A", .ap_name = "p0" },
+    .{ .ied_name = "B", .ap_name = "p1", .gse = &hand_gse },
+    .{ .ied_name = "C", .ap_name = "p2", .address = .{ .params = &hand_params } },
+};
+const hand_subs = [_]scl.Subnetwork{
+    .{ .name = "empty" },
+    .{ .name = "n1", .type = "8-MMS", .aps = &hand_aps },
+};
+const hand_fcda = [_]scl.Fcda{.{ .ld_inst = "LD", .ln_class = "GGIO", .do_name = "Ind", .fc = .ST }};
+const hand_sets = [_]scl.DataSet{
+    .{ .name = "DS0" },
+    .{ .name = "DS1", .fcdas = &hand_fcda },
+};
+const hand_rcb = [_]scl.ReportControl{.{ .name = "R", .dat_set = "DS1", .conf_rev = 2, .buffered = true, .indexed = false }};
+const hand_lcb = [_]scl.LogControl{.{ .name = "L", .log_ena = false }};
+const hand_gcb = [_]scl.GseControl{
+    .{ .name = "g1" },
+    .{ .name = "g2", .type = "GSSE" },
+};
+const hand_dai_values = [_][]const u8{"1"};
+const hand_dais = [_]scl.Dai{
+    .{ .path = "a..b", .values = &hand_dai_values },
+    .{ .path = "", .values = &[_][]const u8{"ghost"} },
+    .{ .path = "c" },
+};
+const hand_dois = [_]scl.Doi{
+    .{ .name = "D0" },
+    .{ .name = "D1", .dais = &hand_dais },
+};
+const hand_lns = [_]scl.Ln{
+    .{ .ln_class = "GGIO", .ln_type = "TG", .inst = "1" },
+    .{
+        .ln_class = "LLN0",
+        .ln_type = "T0",
+        .is_ln0 = true,
+        .data_sets = &hand_sets,
+        .report_controls = &hand_rcb,
+        .log_controls = &hand_lcb,
+        .gse_controls = &hand_gcb,
+        .setting_control = .{},
+        .dois = &hand_dois,
+    },
+};
+const hand_lds = [_]scl.LDevice{
+    .{ .inst = "LNone" },
+    .{ .inst = "LFull", .lns = &hand_lns },
+};
+const hand_ied_aps = [_]scl.AccessPoint{
+    .{ .name = "apNo" },
+    .{ .name = "apLd", .devices = &hand_lds },
+};
+const hand_ieds = [_]scl.Ied{
+    .{ .name = "I0" },
+    .{ .name = "I1", .access_points = &hand_ied_aps },
+};
+const hand_dos = [_]scl.DoRef{.{ .name = "Beh", .type = "DO1", .transient = true }};
+const hand_ln_types = [_]scl.LNodeType{
+    .{ .id = "T0" },
+    .{ .id = "T1", .ln_class = "GGIO", .dos = &hand_dos },
+};
+const hand_sdos = [_]scl.SdoRef{
+    .{ .name = "s0", .type = "DO0" },
+    .{ .name = "s1", .type = "DO0", .count = 3 },
+};
+const hand_das = [_]scl.DaRef{.{ .name = "stVal", .fc = .ST, .b_type = .INT32, .dchg = true, .qchg = true, .dupd = true, .count = 4 }};
+const hand_do_types = [_]scl.DoType{
+    .{ .id = "DO0" },
+    .{ .id = "DO1", .cdc = "INS", .sdos = &hand_sdos },
+    .{ .id = "DO2", .das = &hand_das },
+};
+const hand_bdas = [_]scl.DaRef{.{ .name = "b", .b_type = .BOOLEAN }};
+const hand_da_types = [_]scl.DaType{
+    .{ .id = "DT0" },
+    .{ .id = "DT1", .bdas = &hand_bdas },
+};
+const hand_vals = [_]scl.EnumVal{.{ .ord = 1, .text = "one" }};
+const hand_enums = [_]scl.EnumType{
+    .{ .id = "E0" },
+    .{ .id = "E1", .vals = &hand_vals },
+};
+const hand_doc = Document{
+    .subnetworks = &hand_subs,
+    .ieds = &hand_ieds,
+    .templates = .{
+        .ln_types = &hand_ln_types,
+        .do_types = &hand_do_types,
+        .da_types = &hand_da_types,
+        .enum_types = &hand_enums,
+    },
+};
+
+test "emit: every element with no content is self-closing, every default is left out, every flag is written" {
+    const out = try emit(testing.allocator, hand_doc, .{ .indent = false });
+    defer testing.allocator.free(out);
+    // Empty containers.
+    try testing.expect(has(out, "<SubNetwork name=\"empty\"/>\n"));
+    try testing.expect(has(out, "<ConnectedAP iedName=\"A\" apName=\"p0\"/>\n"));
+    try testing.expect(has(out, "<IED name=\"I0\"/>\n"));
+    try testing.expect(has(out, "<AccessPoint name=\"apNo\"/>\n"));
+    try testing.expect(has(out, "<LDevice inst=\"LNone\"/>\n"));
+    try testing.expect(has(out, "<LN lnClass=\"GGIO\" inst=\"1\" lnType=\"TG\"/>\n"));
+    try testing.expect(has(out, "<DataSet name=\"DS0\"/>\n"));
+    try testing.expect(has(out, "<DOI name=\"D0\"/>\n"));
+    try testing.expect(has(out, "<LNodeType id=\"T0\"/>\n"));
+    try testing.expect(has(out, "<DOType id=\"DO0\"/>\n"));
+    try testing.expect(has(out, "<DAType id=\"DT0\"/>\n"));
+    try testing.expect(has(out, "<EnumType id=\"E0\"/>\n"));
+    // An address element only where there are parameters; the GSE is kept without one.
+    try testing.expect(!has(out, "<Address></Address>"));
+    try testing.expect(!has(out, "<Address>\n</Address>"));
+    try testing.expect(has(out, "<GSE ldInst=\"L1\" cbName=\"g1\"><MinTime>10</MinTime>\n<MaxTime>20</MaxTime>\n</GSE>\n"));
+    // LN0 is written before the LNs.
+    try testing.expect(std.mem.find(u8, out, "<LN0 ").? < std.mem.find(u8, out, "<LN lnClass=\"GGIO\"").?);
+    // Flags and counts that differ from the default are written, the others are not.
+    try testing.expect(has(out, "<ReportControl name=\"R\" datSet=\"DS1\" confRev=\"2\" buffered=\"true\" indexed=\"false\">"));
+    try testing.expect(has(out, "<LogControl name=\"L\" datSet=\"\" logName=\"\" logEna=\"false\">"));
+    try testing.expect(has(out, "<SettingControl/>\n"));
+    try testing.expect(has(out, "<GSEControl name=\"g1\"/>\n"));
+    try testing.expect(has(out, "<GSEControl name=\"g2\" type=\"GSSE\"/>\n"));
+    try testing.expect(has(out, "<DO name=\"Beh\" type=\"DO1\" transient=\"true\"/>\n"));
+    try testing.expect(has(out, "<SDO name=\"s0\" type=\"DO0\"/>\n"));
+    try testing.expect(has(out, "<SDO name=\"s1\" type=\"DO0\" count=\"3\"/>\n"));
+    try testing.expect(has(out, "<DA name=\"stVal\" fc=\"ST\" bType=\"INT32\" dchg=\"true\" qchg=\"true\" dupd=\"true\" count=\"4\"/>\n"));
+    // A DOType with only SDOs is not empty.
+    try testing.expect(has(out, "<DOType id=\"DO1\" cdc=\"INS\"><SDO "));
+    // DAI paths: empty components vanish, an empty path writes nothing.
+    try testing.expect(has(out, "<SDI name=\"a\"><DAI name=\"b\"><Val>1</Val>\n</DAI>\n</SDI>\n"));
+    try testing.expect(has(out, "<DAI name=\"c\"/>\n"));
+    try testing.expect(!has(out, "ghost"));
+    try testing.expect(!has(out, "name=\"\""));
+    // Defaults are not written.
+    try testing.expect(!has(out, "intgPd="));
+    try testing.expect(!has(out, "bufTime="));
+    try testing.expect(!has(out, "numOfSGs="));
+    try testing.expect(!has(out, "fixedOffs="));
+    try testing.expect(!has(out, "count=\"0\""));
+    try testing.expect(!has(out, "<Communication>\n</Communication>"));
+}
+
+test "emit: indentation follows the depth, and every end tag gives its level back" {
+    const out = try emit(testing.allocator, hand_doc, .{});
+    defer testing.allocator.free(out);
+    try testing.expect(has(out, "\n  <Header id=\"\"/>\n"));
+    // Communication > SubNetwork > ConnectedAP > Address > P: five levels below the root.
+    try testing.expect(has(out, "\n          <P type=\"IP\">1.2.3.4</P>\n"));
+    // The last section starts at the level of the first, however much came before it.
+    try testing.expect(has(out, "\n  <DataTypeTemplates>\n"));
+    try testing.expect(has(out, "\n    <EnumType id=\"E0\"/>\n"));
+    try testing.expect(has(out, "\n  </DataTypeTemplates>\n"));
+    try testing.expect(has(out, "\n  <IED name=\"I1\">\n"));
+    try testing.expect(has(out, "\n  </IED>\n"));
+    try testing.expect(std.mem.endsWith(u8, out, "\n</SCL>\n"));
+    // The same document without indentation has no leading blanks at all.
+    const flat = try emit(testing.allocator, hand_doc, .{ .indent = false });
+    defer testing.allocator.free(flat);
+    try testing.expect(!has(flat, "\n "));
+    try testing.expect(has(flat, "<IED name=\"I1\"><AccessPoint "));
+}
+
+test "emit with no subnetworks and no templates writes neither section" {
+    const out = try emit(testing.allocator, .{}, .{});
+    defer testing.allocator.free(out);
+    try testing.expect(!has(out, "Communication"));
+    try testing.expect(!has(out, "DataTypeTemplates"));
+}
+
+test "emitParsed takes the source namespace unless the caller names one" {
+    var s = try scl.parse(testing.allocator, scl.sample, .{});
+    defer s.deinit();
+    const a = try emitParsed(testing.allocator, &s, .{ .allow_lossy = true });
+    defer testing.allocator.free(a);
+    try testing.expect(has(a, "xmlns=\"http://www.iec.ch/61850/2003/SCL\""));
+    const b = try emitParsed(testing.allocator, &s, .{ .namespace = "urn:caller" });
+    defer testing.allocator.free(b);
+    try testing.expect(has(b, "xmlns=\"urn:caller\""));
+    try testing.expect(!has(b, "2003/SCL"));
+    // A source with no namespace is written in edition 2.
+    var bare = try scl.parse(testing.allocator, "<SCL><Header id=\"x\"/></SCL>", .{});
+    defer bare.deinit();
+    const c = try emitParsed(testing.allocator, &bare, .{});
+    defer testing.allocator.free(c);
+    try testing.expect(has(c, "xmlns=\"" ++ scl.ns_2007 ++ "\""));
+}
+
+/// A document whose only content is one DOI carrying a DAI of the given path.
+fn emitWithDaiPath(path: []const u8) Error![]u8 {
+    const dais = [_]scl.Dai{.{ .path = path }};
+    const dois = [_]scl.Doi{.{ .name = "D", .dais = &dais }};
+    const lns = [_]scl.Ln{.{ .ln_class = "GGIO", .ln_type = "T", .dois = &dois }};
+    const lds = [_]scl.LDevice{.{ .inst = "L", .lns = &lns }};
+    const aps = [_]scl.AccessPoint{.{ .name = "p", .devices = &lds }};
+    const ieds = [_]scl.Ied{.{ .name = "I", .access_points = &aps }};
+    return emit(testing.allocator, .{ .ieds = &ieds }, .{});
+}
+
+test "a DAI path of twelve components is written, thirteen are refused" {
+    const ok = try emitWithDaiPath("a.b.c.d.e.f.g.h.i.j.k.l");
+    defer testing.allocator.free(ok);
+    try testing.expect(has(ok, "<DAI name=\"l\"/>"));
+    try testing.expectError(error.CyclicType, emitWithDaiPath("a.b.c.d.e.f.g.h.i.j.k.l.m"));
+    // Nothing at all to write: no element.
+    const none = try emitWithDaiPath("..");
+    defer testing.allocator.free(none);
+    try testing.expect(!has(none, "<DAI"));
+}
+
+test "the type-graph bound is exact: twelve levels pass, thirteen are a cycle" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]usize{ max_type_depth, max_type_depth + 1 }) |levels| {
+        const do_types = try a.alloc(scl.DoType, levels);
+        const da_types = try a.alloc(scl.DaType, levels);
+        for (0..levels) |i| {
+            const next_do = try std.fmt.allocPrint(a, "D{d}", .{i + 1});
+            const next_da = try std.fmt.allocPrint(a, "T{d}", .{i + 1});
+            const sdos = try a.alloc(scl.SdoRef, if (i + 1 < levels) 1 else 0);
+            if (sdos.len == 1) sdos[0] = .{ .name = "s", .type = next_do };
+            do_types[i] = .{ .id = try std.fmt.allocPrint(a, "D{d}", .{i}), .sdos = sdos };
+            const bdas = try a.alloc(scl.DaRef, 1);
+            bdas[0] = if (i + 1 < levels)
+                .{ .name = "b", .b_type = .Struct, .type = next_da }
+            else
+                .{ .name = "b", .b_type = .BOOLEAN };
+            da_types[i] = .{ .id = try std.fmt.allocPrint(a, "T{d}", .{i}), .bdas = bdas };
+        }
+        // Each chain on its own, so the one under test is the only one deep enough.
+        const do_only = scl.Templates{ .do_types = do_types };
+        const da_only = scl.Templates{ .da_types = da_types };
+        if (levels <= max_type_depth) {
+            try checkTypeGraph(do_only);
+            try checkTypeGraph(da_only);
+        } else {
+            try testing.expectError(error.CyclicType, checkTypeGraph(do_only));
+            try testing.expectError(error.CyclicType, checkTypeGraph(da_only));
+        }
+    }
+}
+
+test "a data attribute that merely names a long structure type does not make the walk deeper" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Twelve structure levels are the deepest a walk from the root accepts.
+    const levels = max_type_depth;
+    const da_types = try a.alloc(scl.DaType, levels + 1);
+    for (0..levels) |i| {
+        const bdas = try a.alloc(scl.DaRef, 1);
+        bdas[0] = if (i + 1 < levels)
+            .{ .name = "b", .b_type = .Struct, .type = try std.fmt.allocPrint(a, "T{d}", .{i + 1}) }
+        else
+            .{ .name = "b", .b_type = .BOOLEAN };
+        da_types[i] = .{ .id = try std.fmt.allocPrint(a, "T{d}", .{i}), .bdas = bdas };
+    }
+    // One more type whose member is an Enum that happens to be spelled like the chain's head.
+    const enum_bda = [_]scl.DaRef{.{ .name = "e", .b_type = .Enum, .type = "T0" }};
+    da_types[levels] = .{ .id = "TX", .bdas = &enum_bda };
+    const enum_da = [_]scl.DaRef{.{ .name = "e", .fc = .ST, .b_type = .Enum, .type = "T0" }};
+    const do_types = [_]scl.DoType{.{ .id = "DX", .das = &enum_da }};
+    try checkTypeGraph(.{ .do_types = &do_types, .da_types = da_types });
+}

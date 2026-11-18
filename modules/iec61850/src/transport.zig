@@ -826,3 +826,77 @@ test "LoopLink: queue and frame-size limits are exact, pump moves each frame onc
     var small: [0]u8 = undefined;
     try testing.expectError(error.RecvFailed, b.link().recv(&small));
 }
+
+// ── whole-module mutation audit 2026-11-18 (second pass): socket and double pins ──
+
+test "TcpTransport.read: a buffer shorter than a TPKT header is refused, one of exactly four is not" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    fixture.tt.setReadTimeout(100);
+    var three: [3]u8 = undefined;
+    try testing.expectError(error.ReadFailed, fixture.tt.transport().read(&three));
+    // Four octets are a legal buffer: the silent peer is an idle round, not a failure.
+    var four: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try fixture.tt.transport().read(&four));
+}
+
+test "TcpTransport.read: a TPKT exactly as long as the caller's buffer is delivered" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    const frame = [_]u8{ tpkt.version, 0, 0, 8, 1, 2, 3, 4 };
+    _ = std.posix.system.write(fixture.peer.socket.handle, &frame, frame.len);
+    var exact: [8]u8 = undefined;
+    fixture.tt.setReadTimeout(500);
+    try testing.expectEqual(@as(usize, 8), try fixture.tt.transport().read(&exact));
+    try testing.expectEqualSlices(u8, &frame, &exact);
+}
+
+/// The write half of `readOnce`: pushes frames at a peer that never reads
+/// until the socket buffers are full and the write blocks.
+fn writeUntilBlocked(t: *TcpTransport) TransportError!void {
+    const chunk: [65536]u8 = @splat(0);
+    var i: usize = 0;
+    while (i < 4096) : (i += 1) try t.transport().write(&chunk);
+}
+
+test "a canceled blocking write surfaces Canceled, not WriteFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    var fut = try io.concurrent(writeUntilBlocked, .{&fixture.tt});
+    // Long enough that the kernel buffers are full and the write is parked.
+    try io.sleep(.fromMilliseconds(500), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "LoopTransport: clearSent forgets what was written, and the next write starts over" {
+    const lt = try testing.allocator.create(LoopTransport);
+    defer testing.allocator.destroy(lt);
+    lt.* = .{};
+    try lt.transport().write("abc");
+    try testing.expectEqualStrings("abc", lt.sent());
+    lt.clearSent();
+    try testing.expectEqual(@as(usize, 0), lt.sent().len);
+    try lt.transport().write("de");
+    try testing.expectEqualStrings("de", lt.sent());
+}
