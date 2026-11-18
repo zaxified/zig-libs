@@ -6,7 +6,7 @@
 
 **Scope:** core — LDK `lightning-invoice` + `offers` (BOLT#11 and BOLT#12) / lnd `zpay32` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (332/347, 15 eq) · src 07484061e954cc5e
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (336/352, 16 eq) · src 61f6155ab3ec7ed7
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean (`lninvoice-bolt11-sign` at its scale, 10,000), LNINVOICE_FUZZ) · ct n/a — the node key is only forwarded by pointer to `k256` (BOLT#11 ECDSA) and `bip340` (BOLT#12 Schnorr), which carry their own ctgrind rows; invoice fields, signatures and node ids are public (review, 2026-10-10)
 **Performance:** not measured
@@ -55,7 +55,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Fail-closed throughout, specific typed errors per rejection reason** — `bolt11.DecodeError` is
   a large union covering: bech32-layer failures (`MixedCase`/`NoSeparator`/`InvalidChecksum`/...,
   from `bech32_raw.DecodeError`), HRP parse (`UnknownPrefix`/`UnknownNetwork`), amount parse
-  (`InvalidAmountDigits`/`AmountLeadingZero`/`SubMilliSatoshiPrecision`/`AmountTooLarge`), tagged-
+  (`InvalidAmountDigits`/`SubMilliSatoshiPrecision`/`AmountTooLarge`), tagged-
   field structure (`TruncatedTaggedField`/`NonMinimalTaggedField`/`BadRouteHintLength`), required-
   field presence (`MissingPaymentHash`/`MissingPaymentSecret`/`MissingDescription`/
   `AmbiguousDescription`), and the signature (`InvalidRecoveryId`/`InvalidSignature`/
@@ -132,9 +132,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   LDK's `lightning-invoice` (`de.rs`, `RawHrp::from_str`) does `parts.1.parse::<u64>()` and only
   checks for overflow. A zero-amount invoice is therefore reported as `amount_msat == 0` (not
   `null`, which means "no amount"); a caller that pays must treat `0` as it sees fit. Note
-  the one place this module is stricter than both references: a leading zero on a non-zero amount
-  (`lnbc01u`) is refused as `AmountLeadingZero` (both references accept it through their integer
-  parsers; the spec only forbids it for writers).
+  that the module no longer refuses a leading zero on the amount (decision 2026-11-18, owner rule
+  "behave like the references"): `lnbc01u` reads as `lnbc1u` and `lnbc0001u` likewise, exactly as
+  lnd and LDK read them through their integer parsers; the spec only forbids leading zeros for
+  writers. `AmountLeadingZero` is gone from `AmountError`. The writer side is unchanged and
+  pinned: `formatAmount` never emits a leading zero (only the bare `0` of a zero amount). The
+  20-digit width guard counts significant digits (the zeros are skipped first).
 
 - **`f` (fallback address) and `r` (routing hint) are stored typed but NOT semantically
   interpreted beyond BOLT#11's own wire layout** — `Fallback{ version, program }` (raw witness-
@@ -365,6 +368,8 @@ NOT covered: the caller's own key storage (`SignInput.private_key`, the `bip340.
 heap (the encoders allocate only public TLV/bech32 buffers).
 
 **Audit 2026-11-17 (whole-module mutation).** 347 mutants over every runtime line of `bech32_raw.zig`, `bitpack.zig`, `bolt11.zig`, `bolt12.zig` and `burn.zig`: the HRP split and its case/range rules, the BCH checksum inputs and constant, `stripContinuation`'s state machine, every quintet/byte/feature-vector/base-32 conversion at its edges (padding bits, the 13-digit `u64` bound, the 9-field's slack bits), the HRP amount grammar (leading zero, 20 digits, each multiplier, the `p` sub-millisatoshi rule, the `u64` ceiling, shortest-form encoding case by case), the network prefixes both ways, the data-part length edges (111 quintets, a 3-quintet header at the signature), every tagged field (first-occurrence-wins, the exact fixed sizes of `p`/`s`/`h`/`n`, minimal `x`/`c`, empty `f`, hop size and every hop field and its byte order, required fields, `d` xor `h`), the preimage, the low-S rule, the declared-node verification and the recovery arguments, every field `decode` hands back, the encoder's tags, route-hint byte order, the all-zero `9` omission and the 1023-quintet cap, and on the BOLT#12 side the offer field checks, the Merkle tree (the 240..1000 exclusion range at its four edges, nonce base, leaf and nonce inputs, truncation), `verifyMerkle`'s error/false split, the minimal-padding rule for all three string kinds, every fixed field length, the signature slot, the refund classification and `invoice_error`. Round 1 (ReleaseSafe, one switch per mutant): 229 killed, 116 survived. The survivors were test gaps, not module defects: 29 tests were added (`bolt11.zig`, `bolt12.zig`, `bech32_raw.zig`, `bitpack.zig`; the BOLT#11 ones build well-signed invoices with arbitrary tagged-field layouts, so duplicates, wrong-size occurrences, stray quintets and missing fields reach the decoder) and killed 103 of them in round 2 (a flawed mutant of mine, leaf hash over the "type only", was in fact the identical expression and was replaced by leaf-over-length-and-value). 15 remain: EQUIVALENT (13) delayed emission in `quintetsToBytesPadded`/`bytesToQuintets` (the final flush emits the same bits), a consumed-then-restored trailing `+`, the redundant `v == 0` early return, exponent 11 (never passed), `msat == maxInt(u64)` (the grammar cannot produce it), 12-hop cap against `/50`, the duplicate-known-type guard in `decodeOffer` (`parseTlvStream` refuses duplicates first; pinned by a test), `nodes.len <= 1` and the swapped `branchHash` children (both unobservable by construction: the tree is never empty and the hash orders its children), a record of type 240 in `appendSignedStream`'s input (the signature slot itself, outside the contract), and types 1 and 79 in the refund classifier (unknown odd types are never returned by the parser); UNOBSERVABLE (2) in `burn.zig`'s `stack` (ReleaseFast stack probe, switch inside the callee: the baseline is clean, but the probe's needle is the private key, which `encode` only ever holds by pointer while `k256`'s `sign` burns its own frames, so neither a skipped nor a half-sized burn changes what the probe sees; it would need a needle that lives in `encode`'s own frames). Not mutated, because the value is a comptime constant: the tag, TLV-type and field-type constants, the `network_matches` table, `encode_burn`, the signature-tag strings. Counts on the card are whole-module.
+
+**Delta 2026-11-18 (leading zero in the HRP amount).** The amount parser now skips leading zeros (see the zero-amount decision above). 5 mutants over the new lines (the skip loop's bound and test, skipping it entirely, the 20-digit guard at `>=` and at `> 21`): 4 killed (`01u`/`00`/`000n`, 24 zeros then junk, 21 significant characters), 1 EQUIVALENT (bound `lead < digits.len` instead of `lead + 1 < digits.len`: it only strips the last `0` of an all-zero run, and an empty digit run reads as 0 msat all the same). The card counts are cumulative (old + delta).
 
 ## Status
 

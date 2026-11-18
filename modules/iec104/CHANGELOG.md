@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **Fix (behaviour change):** `P_ME_NC_1` (type 112) now has the standard element, an IEEE short float plus QPM (5 octets), as the new `ElementKind.parameter_float` / `Element.parameter_float = .{ .value, .qpm }`; before, it shared the 3-octet integer-parameter element, so a standard type-112 ASDU was refused as `ObjectCountMismatch` and a 3-octet one accepted. Additive API; 110/111 are unchanged. SPEC no longer claims protection-event types 17-19/38-40 are in the shape table (they decode as `UnsupportedTypeId`; Backlog).
+- **2026-11-17** — Whole-module mutation of `apci`, `asdu`, `info`, `state`, `client`, `outstation` and `transport` (896 mutants, 875 killed, 21 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). Tests added in `src/mutation_test.zig` and `src/transport.zig` (header and reserved-octet edges, `Config.validate` boundaries, timer re-arm/clear points, the whole shape table, element/time-tag bit positions, QOI group edges, cause/negative pairs, reply-queue exact fit and compaction, socket framing); no other behaviour change.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** test-only hex helper(s) replaced by `testkit.hex` (duplicate-code pass); no production code touched.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

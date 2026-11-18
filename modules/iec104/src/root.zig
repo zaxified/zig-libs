@@ -146,6 +146,7 @@ test {
     _ = client;
     _ = outstation;
     _ = goldens;
+    _ = @import("mutation_test.zig");
 }
 
 // ── tests: the whole stack, master against outstation ──────────────────────
