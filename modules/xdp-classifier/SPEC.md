@@ -410,7 +410,7 @@ Survey findings (survey 2026-09-30), ranked; all fit CONVENTIONS §2 and are alr
 1. ~~**VLAN tag skip (`vlan_depth`)**~~ (survey 2026-09-30) — DONE 2026-10-06.
 2. ~~**IPv6 classification**~~ (survey 2026-09-30) — DONE 2026-10-06.
 3. **IPv4 options (variable IHL)** (survey 2026-09-30) — rare in practice, verifier-hard. Effort: medium-large.
-4. **The `tc` half of the pipeline** (survey 2026-09-30) — xdp-cpumap-tc pairs the cpumap redirect with a TC BPF program that sets `queue_mapping` and the class handle; here that program is not generated (needs `tc` module support for `clsact` and a `bpf` classifier, see the `tc` backlog). Effort: medium.
+4. **The `tc` half of the pipeline** (survey 2026-09-30) — xdp-cpumap-tc pairs the cpumap redirect with a TC BPF program that sets `queue_mapping` and the class handle; here that program is not generated (needs `tc` module support for `clsact` and a `bpf` classifier, see the `tc` backlog). Effort: medium. PARTIAL (2026-11-18): `tc` has typed `ingress`/`clsact` qdiscs and a classic-bytecode `bpf` filter since 2026-11-17; attaching an eBPF-object classifier (the program this item wants generated) is still open in `tc`.
 
 ## Anchoring
 

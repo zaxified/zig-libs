@@ -260,7 +260,7 @@ after `kp.deinit` pins bip340's `deinit`, not this `defer`; see Backlog).
 
 ## Backlog / deferred
 
-- **Dead-stack residue of `tweakSecretKey`** (mutation run 2026-10-05): removing its
+- ✅ DONE 2026-10-08 (`f31cc18f8`: `tweakSecretKey` off the dead stack, measured by `src/stackprobe_test.zig`). **Dead-stack residue of `tweakSecretKey`** (mutation run 2026-10-05): removing its
   `kp.deinit()` or the `d` wipe changes nothing any test can see. `bip340` and `k256` measure
   this with a stackprobe (ReleaseFast) and burn the signing region; this module has neither, so
   whether the internal scalar survives the call is unmeasured. Effort S (copy `bip340`'s probe).

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: the RSA-PSS sign gap is not `rsaz_avx2` (measured: OpenSSL runs its MULX/ADX path here); what remains is mostly the per-call `.csprng` blinding; row re-measured (1.041× → 1.050×, within noise).
 

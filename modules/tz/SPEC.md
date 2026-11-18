@@ -132,7 +132,7 @@ eras, local→UTC with gaps/folds under each policy, `find`.
   Feb 29 exist. (Note: the *POSIX day-number* that lands on Feb 29 is 59, not 60 — Jn is 1-based so
   `J60`≡March 1 always, and the zero-based `n` only reaches Feb 29 at index 59; `n=60` is March 1 in a
   leap year too, so `59` is the number that actually demonstrates the divergence.)
-- **tzdata refresh cadence tooling:** the `tz-gen` generator lives in this repo at
+- ✅ DONE 2026-08-16 (`144823e48`: the `tz-gen` generator lives in this repo under `scripts/gen/tz-gen/`; see CHANGELOG 2026-08-16). **tzdata refresh cadence tooling:** the `tz-gen` generator lives in this repo at
   `scripts/gen/tz-gen/`, so the pinned release can be re-derived rather than only trusted. It stays out of
   `modules/` on purpose — it reads a compiled zoneinfo tree and is the sole user of `std.Tz`,
   both of which the module's no-filesystem/no-syscalls threat model above rules out — and `scripts/` is
@@ -153,7 +153,7 @@ eras, local→UTC with gaps/folds under each policy, `find`.
   regenerate. This module reads transitions, so a slim tree yields a different (smaller, and
   differently-behaved before the footer takes over) table from identical input data.
 - ~~**Local wall-clock to instant**~~ — DONE 2026-09-30 as `resolveLocal`/`localToUtc` (see the first item) *(survey 2026-09-30)*: `localToUnix(zone, y, m, d, hh, mm, ss, policy)` with an explicit policy for the DST gap (nonexistent time) and overlap (ambiguous time: earlier/later/error). Why: parsing "2026-03-29 02:30 Europe/Prague" is the commonest reason to load a zone at all; today the caller must probe `offsetAt` by hand and gets the gap/overlap cases wrong. Effort: small–medium (pure arithmetic over the existing `offsetAt`). Fits CONVENTIONS §2. Composes with `datefmt.partsToUnix`.
-- **Zone abbreviations** *(survey 2026-09-30)*: `Offset.abbr` (`CET`/`CEST`, `+05`). Why: log and report output shows `Europe/Prague` times as `CEST`; zeit's `%Z` and Go's `Zone()` provide it. Needs the generator to emit an abbreviation index per transition plus a string table (size cost to be measured); the footer already carries the names. Effort: medium (generator + data). Fits §2.
+- ✅ DONE 2026-10-20 (`0a750b739`: `abbrevAt(zone, unix)` returns the abbreviation, `<+05>` form for numeric ones; `root.zig`). **Zone abbreviations** *(survey 2026-09-30)*: `Offset.abbr` (`CET`/`CEST`, `+05`). Why: log and report output shows `Europe/Prague` times as `CEST`; zeit's `%Z` and Go's `Zone()` provide it. Needs the generator to emit an abbreviation index per transition plus a string table (size cost to be measured); the footer already carries the names. Effort: medium (generator + data). Fits §2.
 - ~~**Pre-1970 history**~~ — DONE 2026-10-20 as `tz.full` (R3; paid only by a program that references it) *(survey 2026-09-30; decided 2026-09-30)*: *not now*, for size. The
   table folds everything before 1970 into `init_off`, so a pre-1970 instant gets the 1970
   offset. The trim is deliberate: the tables cost the build-tool consumer +347 KB in ReleaseSmall (862 → 1209 KB,

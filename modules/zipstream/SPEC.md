@@ -280,12 +280,12 @@ two methods ordinary zip tools and Excel emit, no observed producer needs the re
   2026-09-30** (see "Design & invariants"); NTFS (0x000a), PKWARE Unix (0x000d) and `UX` (0x5855) mtimes
   read since 2026-10-05 (the Go oracle showed them). Not done: atime/ctime,
   and `ux`/`Ux` uid/gid — nothing asked.
-- **zip64 writing** *(survey 2026-09-30)*: already deferred above; Go and zip2 write it. Matters at
+- ✅ DONE 2026-10-20 (`a93a190be`: `ArchiveWriter` writes zip64 automatically, `force_zip64` / `allow_zip64`; see CHANGELOG, S2 batch). **zip64 writing** *(survey 2026-09-30)*: already deferred above; Go and zip2 write it. Matters at
   > 4 GiB or > 65535 entries. Effort M. Fits §2.
-- **Data-descriptor streaming writes** *(survey 2026-09-30)*: `addEntry` needs the whole payload up
+- ✅ DONE 2026-10-20 (`a93a190be`: streamed `beginEntry`/`endEntry` with a data descriptor). **Data-descriptor streaming writes** *(survey 2026-09-30)*: `addEntry` needs the whole payload up
   front and buffers its compressed copy; a producer with unknown size cannot stream in. Effort M.
   Fits §2.
-- **Zstandard (method 93) and other methods** *(survey 2026-09-30)*: zip2 reads/writes Zstandard, Bzip2,
+- ✅ DONE 2026-10-20 (`a93a190be`: `.zstd` (method 93) and `Codec` entries; zstd, bzip2 and LZMA/XZ come through `zstd_codec` & co., `root.zig` deps). **Zstandard (method 93) and other methods** *(survey 2026-09-30)*: zip2 reads/writes Zstandard, Bzip2,
   XZ; the sibling `zstd` module makes method 93 the cheapest addition. Effort M for zstd (glue
   over sibling `zstd`, adds a dependency); bzip2/LZMA/XZ Effort L each and only if a consumer
   asks. Fits §2.

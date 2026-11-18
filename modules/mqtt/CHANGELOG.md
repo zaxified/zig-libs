@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of the outbound Topic Alias code (38 mutants, 32 killed, 6 equivalent), one test added (a caller's own alias is kept while alias slots are free); the card's audit line and source hash recorded.
 - **2026-11-17** — **Added:** client automatic outbound Topic Aliases, opt-in via `Client.Buffers.out_aliases` (first use of a topic takes the next free alias up to the server's Topic Alias Maximum and sends the topic, repeats send an empty topic and the alias, no eviction, reset on `connect`; as paho.golang's `topicaliases` extension). Off unless slots are given; a publish with its own `topic_alias` is untouched.
 - **2026-11-17** — **Added (Behaviour change: a 5.0 subscriber that announces a Topic Alias Maximum now receives aliased PUBLISHes):** broker outbound Topic Aliases as Mosquitto does them (first use of a topic assigns the next free alias and sends the topic, repeats send an empty topic and the alias, no eviction, per connection), on every delivery path. `Config.outbound_topic_aliases` (default 16, 0 = off) caps the slots per connection; an aliased form over the client's Maximum Packet Size goes out plain.

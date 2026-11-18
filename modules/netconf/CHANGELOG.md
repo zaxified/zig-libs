@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: measured delta mutation (schemata, 9 mutants) of the `<data>` duplicate check replaces the earlier hand list: 8 killed, the `break` in `parseSchemaText` equivalent; card cumulative 84/87, 3 equivalent; hash re-taken.
 - **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: hand-list mutation of the `<data>` duplicate check (6 killed, 1 equivalent, cumulative 83/86) and one test (foreign-namespace `<data>` and a monitoring `<schemas>` next to a real `<data>` are not counted); card hash re-taken.
 - **2026-11-17** — Behaviour change: `parseReply` refuses two `<data>` elements in the `ietf-netconf-monitoring` namespace (or one there and one in the base namespace) with `error.AmbiguousReply`, as it already did for two in the base namespace; before, `parseSchemaText` took the first of two monitoring ones. RFC 6241 §4.2 allows one `<data>`; ncclient reads the first, libnetconf2/libyang refuses a repeated output leaf. Test flipped and extended for both namespaces and the mixed case.
