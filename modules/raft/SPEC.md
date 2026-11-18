@@ -6,7 +6,7 @@
 
 **Scope:** mvp — etcd-io/raft v3.7.0 (surveyed 2026-09-30; poc -> mvp 2026-10-04 after `Node` landed)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-18 (81/83, 2 eq) · src 44f2cbcfa761d016
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (124/126, 2 eq) · src b99a7e14a44c357c
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RAFT_FUZZ) · ct n/a — consensus, no crypto (keyword review, 2026-10-07)
 
@@ -466,6 +466,22 @@ CheckQuorum) the whole cluster is still in term 1 under the same leader; a
 leader cut into a minority steps down with CheckQuorum and stays leader
 without it. Plus a 150-seed fuzzed fault sweep with both on (all five
 invariants) and a quiet liveness run (one leader, ≥ 30 commits).
+
+Delta mutation 2026-11-18 (schemata, ReleaseSafe, the new non-test code in
+`node.zig` and `message.zig` only): 43 mutants, one per guard × class — the
+CheckQuorum tick (on/off, the counter, `>=` vs `>`, the counter reset, the
+quorum test, the step-down's leader clear and `return`, the per-period clear
+and the self flag), `quorumActive`'s `>=`, `becomeLeader`'s three resets, the
+`recent_active` mark, `preCampaign` (`max_term`, role, leader clear, timer,
+tally reset, self vote, majority, `term + 1`), `leaderLive`'s two clauses, the
+receiver's lease, `canVote` clauses, up-to-date and live-leader conjuncts,
+the reply term, `onPreVoteResp`'s adoption and its three filters, both decode
+tag splits, the tick's pre-vote switch. First run 35 killed, 8 survived — the
+step-down tick going on to send AppendEntries as a follower (no `return`),
+the pre-candidate keeping its leader, its timer not restarted, its tally not
+reset, `canVote`'s "no leader known" and "same term" clauses, and
+`becomeLeader` not clearing the activity flags or the check counter; each
+got a killing test; final 43/43. Added to the card's counts (cumulative).
 
 ## The positive control
 
