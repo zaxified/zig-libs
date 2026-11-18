@@ -473,12 +473,24 @@ directly-exposed parser.
 - **52 open test-gap candidates of the 2026-11-12 partial client-half run: decided 2026-11-13 — 19 killed, 33 equivalent, 0 findings.** Killed by new or already-present tests (16, proven by a schemata run: each mutant fails the new test): the stale-pooled-connection retry with TWO stale idle connections must dial fresh (`request` and `requestPlain`), `trailersTruncated` (head filling `max_head_bytes`, no trailer, dropped trailer line, non-chunked body, h2), `Member` flush and `drain` byte count, `initCompress` resetting a dirty `history_end_unhashed`, `PaddedSource` room checks, `conditional` list elements (a malformed element before a tag, the empty tag `""`), `redirectLocation` trailing slash and an empty path part, and the existing one-digit-port test for `client_proxy`; three more (`gzip.initCompress`'s comptime field check) are killed at compile time, since the mutant does not build. Equivalent, each with its invariant: `= undefined` poison writes (3), initial values always overwritten before a read (`reused` x2, `Gunzip` crc/size x4), `owned = false` before a `continue` with no fallible step (x2), a retry `h1_only` read only behind `take_idle` (x1), an unreachable `trailer_bytes_seen == 3`, a `Member.writer = .failing` that std's `Compress.finish` already implies, `decode_out_len`/`decode_in_len` +-1 (buffer granularity only, x4), `setEvalBranchQuota` headroom and the field-check's `@compileError` body (comptime, a std change is the needed injection), `conditional` callers' range guarantees (x3), and in `cleanPath` the skipped-slash and `..` bookkeeping variants (x9) plus `resolvePath`'s one-byte-path `trailing`. Table kept by the auditor; the next whole run needs none of these.
 
 - **No-panic sweep 2026-10-28 — deferred, none a panic or unbounded memory**:
-  - *Threaded h2 without `Dispatcher.io` yield-spins* (`Session.waitForPeer`): a handler waiting
-    for credit or body burns a core until the peer moves or the connection ends (bounded by the
-    connection's lifetime, up to `max_concurrent_handlers` per connection). Ideal: park on a futex
-    over `progress`, with a per-stream stall deadline.
-  - *1-byte DATA frames cost two WINDOW_UPDATEs each* (~2.6× output, `onData`/`grantJob`):
-    coalesce updates below half the window.
+  - **DONE 2026-11-18** *Threaded h2 without `Dispatcher.io` yield-spins* (`Session.waitForPeer`):
+    a waiting handler now parks its thread on a futex over `progress` (the OS futex through
+    `std.Io.Threaded.global_single_threaded`, the same choice as `zstd`'s pools; `announce` wakes
+    it, the `parked` count skips the syscall when nobody waits), and gives up after
+    `Dispatcher.stall_timeout_ms` (default 60 s; null = no deadline) without its stream moving: a
+    response write ends the stream with RST_STREAM(CANCEL), a body read fails — what a canceled
+    wait does with `io`. Reference: nginx's `send_timeout` / `client_body_timeout` (60 s, "between
+    two successive" operations, applied to its h2 streams too); Go's `x/net/http2` per-stream
+    write deadline resets with INTERNAL_ERROR, the module keeps its own CANCEL for every abandoned
+    wait. The connection task's final drain parks the same way. The `Dispatcher.io` path is
+    unchanged.
+  - **DONE 2026-11-18** *1-byte DATA frames cost two WINDOW_UPDATEs each* (`onData`/`grantJob`):
+    credit is coalesced per window (`Session.shouldSendCredit`): sent once it is at least half the
+    window (nghttp2 `nghttp2_should_send_window_update`, h2o's connection window) or at least the
+    peer's remaining room (Go `x/net/http2` `inflow.add`, h2o's stream window). Go's extra
+    4 KiB floor is not taken (nghttp2 and h2o have none). Unsent stream credit of a stream that
+    ended is dropped; unsent connection credit stays owed. 40 000 one-octet frames: 2 updates
+    instead of 80 000.
   - *~46 KiB per connection before the first byte*, no built-in connection cap (`on_connect` is the
     control) — a sentence for the README's posture section.
   - *Inbound gzip relies on std flate for crafted dynamic blocks*: truncation is guarded
@@ -783,7 +795,8 @@ balancer learns the real client only from the PROXY header the balancer prepends
 set, the session lock is a `std.Io.Mutex` and `waitForPeer`/the drain park on a `std.Io.Condition`
 (`Session.moved`) that `pump`, a retiring handler and the connection task's exit broadcast; a
 `progress` counter sampled under the lock makes the wait immune to a wakeup that lands between the
-caller's unlock and its wait. `null` keeps the yield-spin. Tested under `BatonIo` (OS threads, one
+caller's unlock and its wait. `null` parks OS threads on a futex over the same counter (since
+2026-11-18; it was a yield-spin), bounded by `Dispatcher.stall_timeout_ms`. Tested under `BatonIo` (OS threads, one
 runner at a time, the baton handed over only inside a blocking `Io` call = the fiber rule), because
 `std.Io.Evented` did not compile in Zig 0.16.0 (not re-checked on 0.17); without `io` the first such test hangs, and a `pump`
 that does not broadcast hangs the flow-control one (both measured).

@@ -401,6 +401,17 @@ HEADERS frame is materialized into it once the body ends.
   occupying us, so unread octets can never exceed the advertised window
   however slowly the handler reads. Either policy applied to the other
   surface is a bug.
+- **Credit is coalesced either way** (like nghttp2, h2o and Go's
+  `x/net/http2`): returned credit goes out as one WINDOW_UPDATE per window
+  once it reaches half the window or at least what the peer may still send,
+  so a peer sending 1-octet DATA frames gets O(bytes / 32 KiB) updates back,
+  not two per frame. Below that the peer still has over half a window to
+  send into.
+- **Concurrent handlers on OS threads (`h2_dispatcher` without `io`) park
+  while they wait** for credit or for request body, and give up after
+  `Dispatcher.stall_timeout_ms` (60 s, nginx's `send_timeout` /
+  `client_body_timeout`) without the stream moving: a response write ends
+  the stream with RST_STREAM(CANCEL), a body read fails.
 - **A handler that never reads the body cannot wedge the connection.** It
   gets no stream-level credit (it is not invited to send more), and when the
   response is done the stream is retired with RST_STREAM(NO_ERROR) — RFC
