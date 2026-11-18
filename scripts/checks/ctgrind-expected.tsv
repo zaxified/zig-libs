@@ -216,9 +216,9 @@ chachapoly	ReleaseSafe	xaead	1	>=1	e03959def8043984	b8e31007e13e23b8
 # `crypto.timing_safe.eql` two lines above it. Branching on the answer is the
 # API; the comparison that produced it is the constant-time one. It is here and
 # not in the other two because only `unprotect` verifies a tag.
-oscore	ReleaseFast	derive	1	0	23ccaa2a4630981c	2f7c17dad79da56d
-oscore	ReleaseFast	protect	1	0	23ccaa2a4630981c	6eac6a90e3479ab8
-oscore	ReleaseFast	unprotect	1	1	23ccaa2a4630981c	ed85db89e3d7e9fd
+oscore	ReleaseFast	derive	1	0	edd3b15d71f39582	2f7c17dad79da56d
+oscore	ReleaseFast	protect	1	0	edd3b15d71f39582	6eac6a90e3479ab8
+oscore	ReleaseFast	unprotect	1	1	edd3b15d71f39582	ed85db89e3d7e9fd
 # ssh dh / ffpow (2026-10-02). `dh`: the MODP DH secret x through
 # dhPowModPrime (montint powMont) in group14 and group16 — 0 contexts in
 # montint; the 4 in-file are stripLeadingZeros on e (public) and on K, twice:

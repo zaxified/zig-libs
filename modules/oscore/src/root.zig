@@ -1824,3 +1824,217 @@ test "ReplayWindow: oversized window_size (>64) + hostile diff/shift does not pa
     rw.update(270); // shift 70 >= effWindow(64) -> mask reset, must not panic
     try std.testing.expectEqual(@as(u64, 270), rw.highest_seen);
 }
+
+// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+
+test "ReplayWindow: a 64-wide window consults its oldest bit, and any wider setting clamps to 64" {
+    for ([_]u7{ 64, 100, 127 }) |size| {
+        var w: ReplayWindow = .{ .window_size = size };
+        w.update(100);
+        try std.testing.expect(w.check(36)); // diff 64: the oldest tracked slot, unseen
+        try std.testing.expect(!w.check(35)); // diff 65: fell off
+        w.update(36);
+        try std.testing.expect(!w.check(36));
+    }
+}
+
+test "ReplayWindow.update: the first update resets the mask, an equal seq changes nothing" {
+    var w: ReplayWindow = .{ .mask = 0xff };
+    w.update(5);
+    try std.testing.expectEqual(@as(u64, 0), w.mask);
+    try std.testing.expect(w.initialized);
+    const before = w;
+    w.update(5);
+    try std.testing.expectEqual(before, w);
+}
+
+test "ReplayWindow.update: sliding keeps what was seen, a far jump forgets it, the trailing edge is recorded" {
+    var w: ReplayWindow = .{};
+    w.update(10);
+    w.update(8);
+    w.update(12); // slides by 2: 10 and 8 stay seen
+    try std.testing.expect(!w.check(8));
+    try std.testing.expect(!w.check(10));
+    try std.testing.expect(!w.check(12));
+    try std.testing.expect(w.check(11));
+    try std.testing.expect(w.check(9));
+
+    var far: ReplayWindow = .{};
+    far.update(10);
+    far.update(5);
+    far.update(100); // jump beyond the window: nothing below 100 is seen
+    try std.testing.expectEqual(@as(u64, 0), far.mask);
+    try std.testing.expect(far.check(95));
+
+    var edge: ReplayWindow = .{};
+    edge.update(40);
+    edge.update(8); // diff 32 == window: still tracked
+    try std.testing.expect(!edge.check(8));
+}
+
+test "ReplayWindow.resumeAtLowerLimit: the limit and everything below it, to the oldest slot, is a replay" {
+    var w: ReplayWindow = .{ .window_size = 64 };
+    w.resumeAtLowerLimit(100);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), w.mask);
+    try std.testing.expect(!w.check(100));
+    try std.testing.expect(!w.check(36)); // diff 64: bit 63 is set
+    try std.testing.expect(w.check(101));
+}
+
+fn expectCborHead(got: []const u8, major: u8, arg: u64) !void {
+    const mt = major << 5;
+    if (arg < 24) {
+        try std.testing.expectEqual(mt | @as(u8, @intCast(arg)), got[0]);
+    } else if (arg <= 0xff) {
+        try std.testing.expectEqual(mt | 24, got[0]);
+        try std.testing.expectEqual(@as(u8, @intCast(arg)), got[1]);
+    } else if (arg <= 0xffff) {
+        try std.testing.expectEqual(mt | 25, got[0]);
+        try std.testing.expectEqual(@as(u16, @intCast(arg)), std.mem.readInt(u16, got[1..3], .big));
+    } else {
+        try std.testing.expectEqual(mt | 26, got[0]);
+        try std.testing.expectEqual(@as(u32, @intCast(arg)), std.mem.readInt(u32, got[1..5], .big));
+    }
+}
+
+test "encodeInfo: byte-string and length headers at every width up to 4 bytes" {
+    const gpa = std.testing.allocator;
+    const id_buf = try gpa.alloc(u8, 65536);
+    defer gpa.free(id_buf);
+    @memset(id_buf, 0x5a);
+    for ([_]usize{ 0, 23, 24, 255, 256, 65535, 65536 }) |len| {
+        const info = try encodeInfo(gpa, id_buf[0..len], null, .aes_ccm_16_64_128, .key, 16);
+        defer gpa.free(info);
+        try std.testing.expectEqual(@as(u8, 0x85), info[0]);
+        try expectCborHead(info[1..], 2, len);
+    }
+    for ([_]u16{ 0, 23, 24, 255, 256, 65535 }) |l| {
+        const info = try encodeInfo(gpa, &.{}, null, .aes_ccm_16_64_128, .iv, l);
+        defer gpa.free(info);
+        // [h'', null, 10, "IV", L]: 0x85 0x40 0xf6 0x0a 0x62 'I' 'V' then L
+        try std.testing.expectEqualSlices(u8, &.{ 0x85, 0x40, 0xf6, 0x0a, 0x62, 'I', 'V' }, info[0..7]);
+        try expectCborHead(info[7..], 0, l);
+    }
+    const k = try encodeInfo(gpa, &.{}, &.{ 1, 2 }, .aes_ccm_16_64_128, .key, 16);
+    defer gpa.free(k);
+    try std.testing.expectEqualSlices(u8, &.{ 0x85, 0x40, 0x42, 1, 2, 0x0a, 0x63, 'K', 'e', 'y', 0x10 }, k);
+}
+
+test "buildAad and buildAadLen agree with the allocating encoders at every header width, and fit exactly" {
+    const gpa = std.testing.allocator;
+    const big = try gpa.alloc(u8, 65536);
+    defer gpa.free(big);
+    @memset(big, 0x33);
+    for ([_]usize{ 0, 23, 24, 255, 256, 65535, 65536 }) |len| {
+        for ([_]u8{ 0, 1, 2 }) |which| {
+            var p: AadParams = .{ .request_kid = &.{0x01}, .request_piv = &.{0x05} };
+            const body = big[0..len];
+            switch (which) {
+                0 => p.request_kid = body,
+                1 => p.request_piv = body,
+                else => p.options = body,
+            }
+            const need = buildAadLen(p);
+            const buf = try gpa.alloc(u8, need);
+            defer gpa.free(buf);
+            const built = try buildAad(buf, p);
+            try std.testing.expectEqual(need, built.len);
+            const arr = try encodeAadArray(gpa, p);
+            defer gpa.free(arr);
+            const enc = try encodeEncStructure(gpa, arr);
+            defer gpa.free(enc);
+            try std.testing.expectEqualSlices(u8, enc, built);
+            // The external_aad bstr header sits after 0x83 0x68 "Encrypt0" 0x40.
+            try expectCborHead(built[11..], 2, arr.len);
+            if (len < 256) try std.testing.expectError(error.BufferTooSmall, buildAad(buf[0 .. need - 1], p));
+        }
+    }
+}
+
+test "OscoreOption.encode: Partial IV and kid context limits, and the empty option" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.PartialIvTooLarge, (OscoreOption{ .partial_iv = 1 << 40 }).encode(gpa));
+    const five = try (OscoreOption{ .partial_iv = (1 << 40) - 1 }).encode(gpa);
+    defer gpa.free(five);
+    try std.testing.expectEqualSlices(u8, &.{ 0x05, 0xff, 0xff, 0xff, 0xff, 0xff }, five);
+    var kc: [256]u8 = @splat(7);
+    const ok = try (OscoreOption{ .kid_context = kc[0..255] }).encode(gpa);
+    defer gpa.free(ok);
+    try std.testing.expectEqual(@as(usize, 1 + 1 + 255), ok.len);
+    try std.testing.expectError(error.KidContextTooLong, (OscoreOption{ .kid_context = kc[0..256] }).encode(gpa));
+    const empty = try (OscoreOption{}).encode(gpa);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "OscoreOption.decode: a kid alone carries no Partial IV, an empty kid context is present, exact fits are not truncated" {
+    const kid_only = try OscoreOption.decode(&.{ 0x08, 0xaa, 0xbb });
+    try std.testing.expect(kid_only.partial_iv == null);
+    try std.testing.expectEqualSlices(u8, &.{ 0xaa, 0xbb }, kid_only.kid.?);
+    const empty_ctx = try OscoreOption.decode(&.{ 0x10, 0x00 });
+    try std.testing.expect(empty_ctx.kid_context != null);
+    try std.testing.expectEqual(@as(usize, 0), empty_ctx.kid_context.?.len);
+    try std.testing.expect(empty_ctx.kid == null);
+    const exact = try OscoreOption.decode(&.{ 0x11, 0x07, 0x02, 0xcc, 0xdd });
+    try std.testing.expectEqual(@as(?u64, 7), exact.partial_iv);
+    try std.testing.expectEqualSlices(u8, &.{ 0xcc, 0xdd }, exact.kid_context.?);
+    try std.testing.expectError(error.Truncated, OscoreOption.decode(&.{ 0x11, 0x07, 0x02, 0xcc }));
+    try std.testing.expectError(error.Truncated, OscoreOption.decode(&.{0x10}));
+}
+
+fn testContexts(gpa: std.mem.Allocator, client: *SecurityContext, server: *SecurityContext) !void {
+    const secret = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const salt = [_]u8{ 0x9e, 0x7c, 0xa9, 0x22, 0x23, 0x78, 0x63, 0x40 };
+    client.* = try deriveContext(gpa, &secret, &salt, null, &.{0x01}, &.{0x02}, .aes_ccm_16_64_128);
+    server.* = try deriveContext(gpa, &secret, &salt, null, &.{0x02}, &.{0x01}, .aes_ccm_16_64_128);
+}
+
+test "deriveContextInto gives the same context as deriveContext, and zeroes its output on failure" {
+    const gpa = std.testing.allocator;
+    const secret = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6 };
+    const ctx = try deriveContext(gpa, &secret, "salt", &.{ 0xaa, 0xbb }, &.{ 1, 2, 3 }, &.{4}, .aes_ccm_16_64_128);
+    var into: SecurityContext = undefined;
+    try deriveContextInto(&into, gpa, &secret, "salt", &.{ 0xaa, 0xbb }, &.{ 1, 2, 3 }, &.{4}, .aes_ccm_16_64_128);
+    try std.testing.expectEqualSlices(u8, &ctx.sender.key, &into.sender.key);
+    try std.testing.expectEqualSlices(u8, &ctx.recipient.key, &into.recipient.key);
+    try std.testing.expectEqualSlices(u8, &ctx.common.common_iv, &into.common.common_iv);
+    try std.testing.expectEqualSlices(u8, ctx.sender.id, into.sender.id);
+    try std.testing.expectEqualSlices(u8, ctx.recipient.id, into.recipient.id);
+    // The three keys differ from each other (label and id both matter).
+    try std.testing.expect(!std.mem.eql(u8, &ctx.sender.key, &ctx.recipient.key));
+    try std.testing.expect(!std.mem.eql(u8, ctx.sender.key[0..13], &ctx.common.common_iv));
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var out: SecurityContext = undefined;
+    @memset(std.mem.asBytes(&out), 0xaa);
+    try std.testing.expectError(error.OutOfMemory, deriveContextInto(&out, failing.allocator(), &secret, "salt", null, &.{1}, &.{2}, .aes_ccm_16_64_128));
+    for (std.mem.asBytes(&out)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "protect and unprotect: an oversized AAD is AadTooLarge, a response is never replay-checked" {
+    const gpa = std.testing.allocator;
+    var client: SecurityContext = undefined;
+    var server: SecurityContext = undefined;
+    try testContexts(gpa, &client, &server);
+
+    const opts = try gpa.alloc(u8, max_aad_len + 8);
+    defer gpa.free(opts);
+    @memset(opts, 1);
+    const big_aad: AadParams = .{ .request_kid = &.{0x01}, .request_piv = &.{0}, .options = opts };
+    try std.testing.expectError(error.AadTooLarge, protect(gpa, &client, "x", big_aad, true, null));
+    try std.testing.expectEqual(@as(u64, 0), client.sender.sequence_number); // nothing burned
+
+    const aad: AadParams = .{ .request_kid = &.{0x01}, .request_piv = &.{0} };
+    const p = try protect(gpa, &client, "hello", aad, true, null);
+    defer gpa.free(p.ciphertext);
+    try std.testing.expectError(error.AadTooLarge, unprotect(gpa, &server, p.option, p.ciphertext, big_aad, null, true));
+
+    // A window that already saw far newer requests refuses this one as a replay...
+    server.recipient.replay_window.update(100);
+    try std.testing.expectError(error.Replayed, unprotect(gpa, &server, p.option, p.ciphertext, aad, null, true));
+    // ...but the same bytes as a RESPONSE are not replay-checked (§8.4), and leave the window alone.
+    const before = server.recipient.replay_window;
+    const pt = try unprotect(gpa, &server, p.option, p.ciphertext, aad, null, false);
+    defer gpa.free(pt);
+    try std.testing.expectEqualStrings("hello", pt);
+    try std.testing.expectEqual(before, server.recipient.replay_window);
+}
