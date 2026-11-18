@@ -6,7 +6,7 @@
 
 **Scope:** mvp — facebook/opaque-ke and bytemare/opaque (RFC 9807) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-15 · mutation 2026-11-17 (247/271, 24 eq) · src 7c7d73e9954eca6f
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget, clean; `opaque-login` at `.scale` 4 = 50,000 runs — a run is a registration plus a login — `opaque-hostile` 200,000, OPAQUE_FUZZ) · ct 2026-09-16 (ctgrind)
 
@@ -329,6 +329,8 @@ must never see a password, and `export_key` for client-side vault
 encryption. The wire structs all have fixed-size `toBytes`/
 `fromBytes`, so any transport (HTTP body, MCP, raw TCP) can carry
 them.
+
+**Audit 2026-11-17 (whole-module mutation).** 271 mutants over every runtime line of `src/protocol.zig` (the generic `Opaque(C)`, so each mutant runs against both the ristretto255 and the P-256 configuration) and `src/burn.zig`: every `toBytes`/`fromBytes` field and region, `expandMulti` (loop bound, chaining, counter, block length), `i2osp2`, `checkIdentities` at its edge, every KDF label and which inputs are mixed in, the envelope `auth_tag` inputs, the identity defaults on all four paths, the masking pad and XOR, every 3DH input (which key against which peer key, `ikm` order), the key schedule (each transcript piece, extract salt, each `Derive-Secret` label and context, which MAC key and message), the three MAC comparisons (never refused / last byte unchecked / first byte unchecked), the error codes and the fields each result carries. Round 1 (ReleaseSafe): 231 killed, 40 survived. Five tests were added (`src/mutation_test.zig`): every wire field read from, and written to, its own region with bytes that do not repeat inside a 320-byte message (the old round-trip pattern had period 256, so a `server_mac` read from 256 bytes too early looked right), for both configurations; `I2OSP(len, 2)` big-endian with the high byte; `checkIdentities` at 0xffff / 0x10000 / 0x10001 for client, server and context separately; `generateKE2` / `generateKE3` refusing an oversized server identity, `generateKE3` also client and context (before, KE3 skipping its own check went unseen); a malformed evaluated element is `InvalidMessage` on both client paths. Round 2 left only wipes and burns, 27 mutants. The ReleaseFast stack probe cannot take a runtime switch in the caller's frame (the baseline went red: the probe's frame depth moved), so wipe and burn mutants are switched INSIDE `burn.zig` (`stackAt`/`zeroAt`, a separate comptime id per site; audit scratch, not committed): baseline clean, the 3 burn mutants die (half the buffer, no stores, no burn: the burns are not over-provisioned), and 24 skipped wipes survive and are EQUIVALENT by measurement: the entry-point burn already zeroes the frame, the probe reads clean without the wipe. Not mutated, because the value is a comptime constant (a runtime switch cannot reach it; `src/root.zig` pins the sizes): `Nn`..`Noe`, `masked_response_length`, `encoded_length`s, the burn sizes, the `Opaque(C)` configurations in `root.zig`, and the `"OPAQUE-" ++ label` concatenation. One catch with no reachable mutant: `recover`'s `akeKeyPair(...) catch return error.EnvelopeRecovery` needs a failing `DeriveKeyPair` (probability ~2^-256); the injection would be a stubbed KDF. Counts on the card are whole-module.
 
 ## Backlog / deferred
 
