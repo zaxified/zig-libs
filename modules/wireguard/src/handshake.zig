@@ -1835,6 +1835,72 @@ test "call-order errors" {
     try testing.expectError(error.NoPendingInitiation, idle.consumeResponse(msg2));
 }
 
+test "consumeResponse: a replayed response to a completed handshake is NoPendingInitiation, state untouched" {
+    const io = std.testing.io;
+    var ini = kat.initiator();
+    var rsp = kat.responder();
+    const msg1 = try ini.createInitiation(io, kat.timestamp);
+    try rsp.consumeInitiation(msg1);
+    const msg2 = try rsp.createResponse(io);
+    try ini.consumeResponse(msg2);
+    // The initiator records the responder's ephemeral (Noise `re`).
+    try testing.expectEqual(rsp.local_ephemeral.?.public, ini.remote_ephemeral.?);
+    const ck = ini.chaining_key;
+    const h = ini.hash;
+    // Same bytes again: right type, right receiver index, valid mac1. Only
+    // the state says it is no longer awaited.
+    try testing.expectError(error.NoPendingInitiation, ini.consumeResponse(msg2));
+    try testing.expectEqual(ck, ini.chaining_key);
+    try testing.expectEqual(h, ini.hash);
+    try testing.expect(ini.state == .complete);
+}
+
+test "deriveTransportKeys leaves no hash, static-static or ephemeral key in the handshake's bytes" {
+    const io = std.testing.io;
+    var ini = kat.initiator();
+    var rsp = kat.responder();
+    try ini.precomputeStaticStatic();
+    const ss = ini.static_static.?;
+    const msg1 = try ini.createInitiation(io, kat.timestamp);
+    try rsp.consumeInitiation(msg1);
+    try ini.consumeResponse(try rsp.createResponse(io));
+    const h = ini.hash;
+    _ = dtk(&ini, true);
+    // Volatile: the bytes themselves, not what the compiler knows of the fields.
+    const vp: *volatile [@sizeOf(Handshake)]u8 = @ptrCast(&ini);
+    const after = vp.*;
+    try testing.expect(std.mem.indexOf(u8, &after, &ss) == null);
+    try testing.expect(std.mem.indexOf(u8, &after, &h) == null);
+    try testing.expect(std.mem.indexOf(u8, &after, &kat.ei_priv) == null);
+}
+
+test "InitiationPeek.wipe leaves no chaining key in the peek's bytes" {
+    const io = std.testing.io;
+    var ini = kat.initiator();
+    const rsp = kat.responder();
+    const msg1 = try ini.createInitiation(io, kat.timestamp);
+    var peek: InitiationPeek = undefined;
+    try peekInitiation(&rsp.static_keypair, &msg1, &peek);
+    const ck = peek.chaining_key;
+    peek.wipe();
+    const vp: *volatile [@sizeOf(InitiationPeek)]u8 = @ptrCast(&peek);
+    const after = vp.*;
+    try testing.expect(std.mem.indexOf(u8, &after, &ck) == null);
+}
+
+test "precomputeStaticStatic stores DH(static, remote static), and a low-order peer key is refused" {
+    var ini = kat.initiator();
+    try testing.expectEqual(@as(?[32]u8, null), ini.static_static);
+    try ini.precomputeStaticStatic();
+    const want = try noise.X25519.scalarmult(ini.static_keypair.private, ini.remote_static_public);
+    try testing.expectEqual(want, ini.static_static.?);
+
+    var bad = kat.initiator();
+    bad.remote_static_public = @splat(0); // the identity: a low-order point
+    try testing.expectError(error.InvalidPublicKey, bad.precomputeStaticStatic());
+    try testing.expectEqual(@as(?[32]u8, null), bad.static_static);
+}
+
 // ── cookie / mac2 KAT (independent reference for whitepaper 5.4.7) ─────────
 //
 // No official cookie test vector is published by the WireGuard project (the
@@ -2049,6 +2115,11 @@ test "cookie secret rotates after two minutes, on both sides of the exchange" {
     // wipe() ends the secret's life immediately.
     checker.wipe();
     try testing.expectEqual(@as([32]u8, @splat(0)), checker.secret);
+    // ... and the next use rolls a new one, even inside the old secret's
+    // lifetime (999 + 120 s): no cookie is ever issued under the zero key.
+    _ = ckFor(&checker, io, 1_000, &cookie_kat.addr);
+    try testing.expect(!std.mem.eql(u8, &@as([32]u8, @splat(0)), &checker.secret));
+    try testing.expectEqual(@as(u64, 1_000), checker.secret_born_s);
 
     // Initiator side: the same two minutes bound how long a cookie is stamped.
     var peer = PeerCookie.init(rpub);
@@ -2199,6 +2270,9 @@ test "macFields admits exactly the two handshake message shapes" {
 
     // Too short to even hold a type tag and an index.
     try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..7]));
+    // Shorter than the type tag itself: refused before the tag is read.
+    try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..3]));
+    try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..0]));
     // Right type, wrong length — both directions.
     @memcpy(buf[0..148], &kat.msg1);
     try testing.expectError(error.NotAHandshakeMessage, macFields(buf[0..147]));
