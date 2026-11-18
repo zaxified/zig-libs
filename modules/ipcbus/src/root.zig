@@ -324,17 +324,61 @@ pub const FdWriter = struct {
 
 // ── server ──────────────────────────────────────────────────────────────────
 
+/// Who may connect to a `Server`, judged by the kernel-recorded `SO_PEERCRED`
+/// uid of the peer. The check is made by `Server.acceptOne`; a refused peer's
+/// connection is closed and never reaches the caller.
+///
+/// Same rule as the D-Bus session bus, where the `EXTERNAL` SASL mechanism
+/// makes the identity "a Unix user" taken from kernel-passed credentials: by
+/// default only the server's own uid is admitted.
+pub const PeerPolicy = union(enum) {
+    /// Admit only peers whose uid equals the server's effective uid at
+    /// `Server.listen` time (default).
+    same_uid,
+    /// Admit only peers whose uid is in this list (the server's own uid is NOT
+    /// implied; list it too if it should connect). The slice must outlive the
+    /// server.
+    uids: []const u32,
+    /// Admit every peer that can reach the socket path (the pre-2026-11-18
+    /// behaviour: filesystem permissions are the only access control).
+    any,
+
+    /// Pure decision: does this policy admit a peer with credentials `cred`,
+    /// given the server's own uid?
+    pub fn allows(self: PeerPolicy, own_uid: u32, cred: PeerCred) bool {
+        return switch (self) {
+            .same_uid => cred.uid == own_uid,
+            .uids => |list| for (list) |u| {
+                if (u == cred.uid) break true;
+            } else false,
+            .any => true,
+        };
+    }
+};
+
 /// A single-owner request/reply server over a unix socket. The owning thread
 /// loops `acceptOne` → `handleOne`; there is no internal concurrency.
 pub const Server = struct {
     listen_fd: Fd,
     path: [:0]const u8,
+    /// Peer admission rule applied by `acceptOne` (default `.same_uid`).
+    policy: PeerPolicy = .same_uid,
+    /// The server's effective uid, taken at `listen` (what `.same_uid` compares to).
+    own_uid: u32 = 0,
+    /// Number of connections `acceptOne` has refused (and closed) so far.
+    refused: u64 = 0,
 
     /// Bind + listen at `path`, unlinking any stale socket left by a prior run.
+    /// Peers are admitted by `PeerPolicy.same_uid`; see `listenWithPolicy`.
     pub fn listen(path: [:0]const u8) TransportError!Server {
+        return listenWithPolicy(path, .same_uid);
+    }
+
+    /// `listen` with an explicit peer admission policy.
+    pub fn listenWithPolicy(path: [:0]const u8, policy: PeerPolicy) TransportError!Server {
         _ = linux.unlink(path.ptr);
         const fd = try listenUnix(path);
-        return .{ .listen_fd = fd, .path = path };
+        return .{ .listen_fd = fd, .path = path, .policy = policy, .own_uid = linux.geteuid() };
     }
 
     /// Close the listen socket and remove its path.
@@ -343,9 +387,8 @@ pub const Server = struct {
         _ = linux.unlink(self.path.ptr);
     }
 
-    /// Block until a client connects; returns the accepted (CLOEXEC) conn fd.
-    /// Caller owns the fd — pass it to `handleOne`, which closes it.
-    pub fn acceptOne(self: *Server) TransportError!Fd {
+    /// Accept one connection with no credential check (internal building block).
+    fn acceptRaw(self: *Server) TransportError!Fd {
         while (true) {
             const rc = linux.accept4(self.listen_fd, null, null, linux.SOCK.CLOEXEC);
             switch (linux.errno(rc)) {
@@ -353,6 +396,38 @@ pub const Server = struct {
                 .INTR, .AGAIN => continue,
                 else => return error.AcceptFailed,
             }
+        }
+    }
+
+    /// Apply `policy` to the accepted `fd`. A peer whose credentials cannot be
+    /// read, or that the policy refuses, has its fd closed and is counted in
+    /// `refused`. Returns whether the peer was admitted.
+    fn admit(self: *Server, fd: Fd) bool {
+        if (self.policy == .any) return true;
+        const cred = peerCred(fd) catch {
+            closeFd(fd);
+            self.refused +|= 1;
+            return false;
+        };
+        if (self.policy.allows(self.own_uid, cred)) return true;
+        closeFd(fd);
+        self.refused +|= 1;
+        return false;
+    }
+
+    /// Block until an admitted client connects; returns the accepted (CLOEXEC)
+    /// conn fd. Caller owns the fd — pass it to `handleOne`, which closes it.
+    ///
+    /// Behaviour change (2026-11-18): the peer's `SO_PEERCRED` uid is checked
+    /// against `policy` (default: the server's own uid). A refused peer is
+    /// closed silently and the loop keeps waiting, so a local user who is not
+    /// admitted can neither reach `dispatch` nor stop the accept loop; the
+    /// count is in `refused`. Use `listenWithPolicy(path, .any)` for the old
+    /// behaviour.
+    pub fn acceptOne(self: *Server) TransportError!Fd {
+        while (true) {
+            const fd = try self.acceptRaw();
+            if (self.admit(fd)) return fd;
         }
     }
 
@@ -389,8 +464,8 @@ pub const Server = struct {
     /// against one deadline started on entry); time spent inside `dispatch`
     /// is the callback's own business and is not interrupted.
     ///
-    /// To authenticate the caller, call `peerCred(conn_fd)` on the fd from
-    /// `acceptOne` before handing it to this function.
+    /// The caller's uid has already been checked by `acceptOne` against the
+    /// server's `PeerPolicy`; call `peerCred(conn_fd)` for finer decisions.
     pub fn handleOneWithOptions(
         conn_fd: Fd,
         ctx: anytype,
@@ -1007,4 +1082,99 @@ test "FdReader: small reads after the buffer filled are served from a refilled b
         if (fr.interface.bufferedLen() > 0) buffered += 1;
     }
     try testing.expect(buffered * 2 >= reads);
+}
+
+test "PeerPolicy.allows: same_uid, uids and any decide on the uid alone" {
+    const cred = PeerCred{ .pid = 1, .uid = 1000, .gid = 7 };
+    try testing.expect((PeerPolicy{ .same_uid = {} }).allows(1000, cred));
+    try testing.expect(!(PeerPolicy{ .same_uid = {} }).allows(1001, cred));
+    try testing.expect(!(PeerPolicy{ .same_uid = {} }).allows(0, cred)); // root server does not admit others
+    const list = [_]u32{ 5, 1000 };
+    try testing.expect((PeerPolicy{ .uids = &list }).allows(99, cred)); // own uid is not implied, listed one matches
+    try testing.expect(!(PeerPolicy{ .uids = &[_]u32{5} }).allows(1000, cred)); // own uid not implied
+    try testing.expect(!(PeerPolicy{ .uids = &.{} }).allows(1000, cred));
+    try testing.expect((PeerPolicy{ .any = {} }).allows(99, cred));
+}
+
+test "Server.listen defaults to same_uid: a same-uid peer is accepted" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    try testing.expect(srv.policy == .same_uid);
+    try testing.expectEqual(linux.geteuid(), srv.own_uid);
+    const c = try connectUnix(path);
+    defer closeFd(c);
+    const a = try srv.acceptOne(); // queued; does not block
+    defer closeFd(a);
+    try testing.expectEqual(@as(u64, 0), srv.refused);
+}
+
+test "Server.admit: a peer outside the policy is closed and counted (injected own uid)" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    const c = try connectUnix(path);
+    defer closeFd(c);
+    const a = try srv.acceptRaw();
+    srv.own_uid = linux.geteuid() +% 1; // pretend the server runs as someone else
+    try testing.expect(!srv.admit(a));
+    try testing.expectEqual(@as(u64, 1), srv.refused);
+    // the refused connection is closed: the client sees end of stream
+    var b: [1]u8 = undefined;
+    try testing.expectError(error.EndOfStream, readExact(c, &b));
+
+    // an explicit allowlist: refuses our uid when absent, admits it when listed
+    const c2 = try connectUnix(path);
+    defer closeFd(c2);
+    const a2 = try srv.acceptRaw();
+    srv.policy = .{ .uids = &[_]u32{linux.geteuid() +% 1} };
+    try testing.expect(!srv.admit(a2));
+    try testing.expectEqual(@as(u64, 2), srv.refused);
+    const c3 = try connectUnix(path);
+    defer closeFd(c3);
+    const a3 = try srv.acceptRaw();
+    defer closeFd(a3);
+    srv.policy = .{ .uids = &[_]u32{ 1, linux.geteuid() } };
+    try testing.expect(srv.admit(a3));
+    try testing.expectEqual(@as(u64, 2), srv.refused);
+}
+
+test "Server.admit: a non-socket fd (credentials unreadable) is refused" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listen(path);
+    defer srv.deinit();
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) == .SUCCESS);
+    defer closeFd(fds[1]);
+    try testing.expect(!srv.admit(fds[0])); // closes fds[0]
+    try testing.expectEqual(@as(u64, 1), srv.refused);
+}
+
+test "Server.listenWithPolicy(.any): admits regardless of own uid, no credential read" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    var srv = try Server.listenWithPolicy(path, .any);
+    defer srv.deinit();
+    srv.own_uid = linux.geteuid() +% 1;
+    const c = try connectUnix(path);
+    defer closeFd(c);
+    const a = try srv.acceptOne();
+    defer closeFd(a);
+    try testing.expectEqual(@as(u64, 0), srv.refused);
+}
+
+test "Server.acceptOne: an allowlist that names our uid admits us" {
+    var pbuf: [64]u8 = undefined;
+    const path = testSocketPath(&pbuf);
+    const me = linux.geteuid();
+    var srv = try Server.listenWithPolicy(path, .{ .uids = &[_]u32{me} });
+    defer srv.deinit();
+    const c = try connectUnix(path);
+    defer closeFd(c);
+    const a = try srv.acceptOne();
+    defer closeFd(a);
+    try testing.expectEqual(me, (try peerCred(a)).uid);
 }

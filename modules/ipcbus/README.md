@@ -53,7 +53,8 @@ const reply = try ipcbus.Client.request("/run/app.sock", req_bytes, &reply_buf, 
 // ── timeouts and peer credentials ──
 // error.Timeout instead of a hang on a silent/stalled peer (default: no timeout)
 const r2 = try ipcbus.Client.requestWithOptions(path, req_bytes, &reply_buf, .{}, .{ .timeout_ms = 2000 });
-// server: authenticate the caller, then serve with a budget
+// server: acceptOne only returns peers the PeerPolicy admits (default: our own uid, like the
+// D-Bus session bus); Server.listenWithPolicy(path, .{ .uids = &.{ 1000 } }) or .any to change it
 const pc = try ipcbus.peerCred(conn);                // .pid, .uid, .gid (SO_PEERCRED)
 try ipcbus.Server.handleOneWithOptions(conn, ctx, dispatch, arena.allocator(), .{}, .{ .timeout_ms = 2000 });
 
@@ -89,5 +90,6 @@ a socket fd are also exported for callers that need to build their own loop.
 - **Persistent / multiplexed connections.** One connection per request only.
 - **Multi-connection concurrency.** The server handles one connection at a
   time; no thread pool or event loop.
-- **Auth / permissions on the socket.** Access is whatever the filesystem
-  permissions on the socket path grant; no in-band authentication.
+- **In-band authentication.** Access is the socket path's filesystem
+  permissions plus the peer-uid check (`PeerPolicy`, default same uid); no
+  password/token layer.

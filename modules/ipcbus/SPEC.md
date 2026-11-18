@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [godbus/dbus](https://github.com/godbus/dbus) | Go | BSD-2-Clause | 1.2k | v5.2.2 (2025-12-29) | D-Bus client for Go: calls, signals, exported objects. |
 | Zig `std` / ecosystem | Zig | MIT (std) | — | Zig 0.16.0 | `std.Io.net` gives unix sockets (`std` checked only by name, *inferred*); no Zig request/reply bus found: the only `zig-ipc` hit (pseudocc/zig-ipc, MIT, 7 stars) is a shared-memory example. |
 
-**Where we are ahead:** small, libc-free (raw syscalls) and dependency-light (`framing` only); the frame length is checked before the body is read and the request buffer is sized to the announced length, so a peer cannot force a per-connection allocation; socket lifecycle (stale-socket unlink) handled; a scratch `Bus` with a change `version`. **Where we are behind:** no concurrency (one connection at a time), no persistent or multiplexed connections, no push/pub-sub, no peer credentials or in-band auth (filesystem permissions only), no timeouts *(searched `src/root.zig` for `timeout`/`SO_RCV`: none)*, Linux only, pathname sockets only (no abstract namespace).
+**Where we are ahead:** small, libc-free (raw syscalls) and dependency-light (`framing` only); the frame length is checked before the body is read and the request buffer is sized to the announced length, so a peer cannot force a per-connection allocation; socket lifecycle (stale-socket unlink) handled; a scratch `Bus` with a change `version`. **Where we are behind:** no concurrency (one connection at a time), no persistent or multiplexed connections, no push/pub-sub, no in-band auth (peer uid check only), no timeouts *(searched `src/root.zig` for `timeout`/`SO_RCV`: none)*, Linux only, pathname sockets only (no abstract namespace).
 
 ## Design & invariants
 
@@ -57,15 +57,16 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Threat model / out of scope
 
-Access control is entirely filesystem permissions on the socket path — there is no in-band
-authentication, and any process that can `connect()` to the socket can issue any `dispatch`
-command the app registers. The transport hardens the framing surface (oversize/garbage length
+Access control is the socket path's filesystem permissions plus the `SO_PEERCRED` uid check
+`Server.acceptOne` applies (`PeerPolicy`, default: only the server's own uid, as on the D-Bus
+session bus; `.any` opts out) — there is no in-band authentication, and any peer the policy admits
+can issue any `dispatch` command the app registers. The transport hardens the framing surface (oversize/garbage length
 rejected before reading a body, bounded per-request allocation via `limits.max_frame`) but performs
 no input validation of the request bytes themselves — that is the caller's `dispatch` function's
 job. Out of scope: real push/notify (this is poll-a-shared-map — subscribers poll the `Bus`
 `version`, no server-initiated push), persistent/multiplexed connections, multi-connection
 concurrency (no thread pool or event loop — one connection serviced at a time), and any
-auth/permissions layer on the socket.
+in-band (password/token) authentication layer.
 
 ## Verification
 
@@ -89,8 +90,11 @@ slices, splat and count; `handleOne` closing its fd; `clear` bumping `version`;
 - **Real push/notify** — no server-initiated push; subscribers must poll `Bus.version`.
 - **Persistent/multiplexed connections** — one connection per request only, by design.
 - **Multi-connection concurrency** — no thread pool or event loop; single-owner accept loop.
-- **Auth/permissions on the socket** — access is whatever filesystem permissions on the socket path
-  grant; no in-band authentication.
+- ✅ DONE 2026-11-18 **Auth/permissions on the socket** — `Server.acceptOne` checks the peer's
+  `SO_PEERCRED` uid against `PeerPolicy` (default: the server's own uid; `.uids` allowlist; `.any` opt-out).
+  Basis: the D-Bus session bus (`EXTERNAL` SASL: identity = Unix user from kernel credentials; the spec
+  recommends it wherever credentials travel out of band). A refused peer is closed and counted in
+  `Server.refused`; `acceptOne` never errors for it. No in-band/password authentication.
 
 - (survey 2026-09-30) **Publish/subscribe (server push)** — NNG, ZeroMQ and D-Bus users expect notifications; here subscribers poll `Bus.version`. Effort: medium-large (needs persistent connections and an event loop). Fits CONVENTIONS §2. Already listed as deferred above.
 - (survey 2026-09-30) **Concurrent connections** — a slow or stalled client blocks every other request (one connection at a time, no read timeout). Effort: medium (poll-based accept loop or `std.Io` group; per-connection deadline). Fits §2.

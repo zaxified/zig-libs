@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **Behaviour change:** `Server.acceptOne` now checks the peer's `SO_PEERCRED` uid against a `PeerPolicy`; the default (`Server.listen`) admits only the server's own effective uid, like the D-Bus session bus (`EXTERNAL` auth: the identity is a Unix user taken from kernel-passed credentials). A refused peer is closed silently, counted in `Server.refused`, and `acceptOne` keeps waiting (it never returns an error for a refused peer, so a non-admitted local user cannot stop an accept loop that ends on `catch return`). Added `PeerPolicy` (`.same_uid`, `.uids = &.{..}`, `.any`), `Server.listenWithPolicy`, `Server.policy`/`own_uid`/`refused`. Opt out of the check with `Server.listenWithPolicy(path, .any)` (the previous behaviour). Security-triage row ipcbus:92.
+
 - **2026-11-16** — **Added:** optional timeouts and peer credentials. `Options{ .timeout_ms }` with `Client.requestWithOptions` and `Server.handleOneWithOptions` (one monotonic deadline over the request/reply I/O, polled; a silent or stalled peer returns `error.Timeout`, never a hang; `request`/`handleOne` keep blocking forever). `peerCred(fd)` returns `PeerCred{pid,uid,gid}` (`SO_PEERCRED`); new `TransportError.Timeout` and `.PeerCredFailed`. `FdReader`/`FdWriter` gain deadline fields (default off). No behaviour change for existing callers.
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
