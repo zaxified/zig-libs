@@ -1150,6 +1150,7 @@ test "Server.admit: a non-socket fd (credentials unreadable) is refused" {
     try testing.expect(linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) == .SUCCESS);
     defer closeFd(fds[1]);
     try testing.expect(!srv.admit(fds[0])); // closes fds[0]
+    try testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(fds[0], linux.F.GETFD, 0)));
     try testing.expectEqual(@as(u64, 1), srv.refused);
 }
 

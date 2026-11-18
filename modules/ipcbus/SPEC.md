@@ -6,7 +6,7 @@
 
 **Scope:** mvp — NNG 1.12.3 (req/rep over `ipc://`) and D-Bus as the same-host control-plane yardsticks (surveyed 2026-09-30)
 
-**Audit:** review 2026-07-19 · mutation 2026-10-05 (25/25) · src ?
+**Audit:** review 2026-07-19 · mutation 2026-11-18 (40/40) · src cdcad99ce5bac75b
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — local IPC framing (keyword review, 2026-10-07)
 
@@ -84,6 +84,13 @@ on listen, connect and accepted fds; a stale socket path replaced and `deinit`
 unlinking; one-byte `writeAllFd`/`readExact` and `readExact`'s EOF; `drain`'s
 slices, splat and count; `handleOne` closing its fd; `clear` bumping `version`;
 `Bus.set` under every allocation failure). None equivalent.
+
+Delta mutation 2026-11-18 of the `PeerPolicy` / `Server.admit` / `acceptOne` code: 15 mutants
+(uid comparison flipped or forced, allowlist match flipped, `.any` inverted, own uid off by one,
+policy default, credential-read-failure and refusal paths dropping the close / the `refused`
+count / the refusal, `acceptOne` returning refused fds), 15 killed (4 by hang), 0 equivalent;
+one survivor (the close on the credential-read-failure path) got a killing test
+(`fcntl(F_GETFD)` is `EBADF` afterwards). Cumulative with the 2026-10-05 run: 40/40.
 
 ## Backlog / deferred
 
