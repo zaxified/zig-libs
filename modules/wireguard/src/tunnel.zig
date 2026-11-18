@@ -884,11 +884,14 @@ pub const Tunnel = struct {
             t.send_keepalive_at = null;
             const again = t.need_another_keepalive;
             t.need_another_keepalive = false;
-            if (t.hasSession(clock)) {
-                const o = try t.sealCurrent(clock, "", out);
-                if (again) t.send_keepalive_at = now +| keepalive_timeout_ms;
-                return o;
-            }
+            // As the kernel's `wg_expired_send_keepalive` → `wg_packet_send_keepalive`:
+            // with no session the keepalive is staged and a handshake starts.
+            const o = if (t.hasSession(clock))
+                try t.sealCurrent(clock, "", out)
+            else
+                try t.encapsulate(io, clock, "", out);
+            if (again) t.send_keepalive_at = now +| keepalive_timeout_ms;
+            if (o != .none) return o;
         }
         if (expired(t.new_handshake_at, now)) {
             t.new_handshake_at = null;
@@ -907,22 +910,19 @@ pub const Tunnel = struct {
         return if (deadline) |d| now >= d else false;
     }
 
-    /// The deadline for keys passed: the sessions go. An initiation in flight is
-    /// younger than that deadline (it dies by retries within 95 s), and it may be
-    /// the very thing that got this called late, so it stays, with what waits for it.
+    /// The deadline for keys passed: the sessions and the handshake go, nothing
+    /// else — as the kernel's `wg_queued_expired_zero_key_material`
+    /// (`wg_noise_handshake_clear` + `wg_noise_keypairs_clear`). Timers, a rekey
+    /// request and the staged packets are left as they are, so an armed
+    /// retransmit, keepalive or new-handshake deadline then starts a fresh
+    /// handshake exactly as it does there.
     fn expireKeys(t: *Tunnel, now: u64) void {
         if (!expired(t.zero_keys_at, now)) return;
         t.zero_keys_at = null;
         wipeSlot(&t.current);
         wipeSlot(&t.previous);
         wipeSlot(&t.next);
-        t.send_keepalive_at = null;
-        t.need_another_keepalive = false;
-        t.new_handshake_at = null;
-        if (t.pending == null) {
-            t.clearStage();
-            t.want_initiation = false;
-        }
+        t.wipePending();
     }
 };
 
@@ -2168,7 +2168,7 @@ test "Tunnel: an expired unconfirmed next is wiped from the tunnel's memory" {
     try expectAbsent(&p.b, sb);
 }
 
-test "Tunnel: an initiation in flight keeps the stage when the key deadline passes" {
+test "Tunnel: the key deadline clears an initiation in flight, keeps the stage, and the retransmit starts afresh (kernel)" {
     var p: Pair = undefined;
     try p.init(null, 0);
     defer p.a.wipe();
@@ -2184,11 +2184,23 @@ test "Tunnel: an initiation in flight keeps the stage when the key deadline pass
     try testing.expect((try p.a.encapsulate(testing.io, p.clock(), data, &buf)) == .network);
     try testing.expect(p.a.pending != null);
     try testing.expectEqual(data.len + 2, p.a.stage_tail - p.a.stage_head);
-    // The deadline passes without a poll in between; the poll takes the sessions only.
+    const old_index = p.a.pending.?.local_index;
+    try testing.expect(p.a.retransmit_at.? <= zero_at);
+    // The deadline passes without a poll in between: as the kernel
+    // (wg_noise_handshake_clear + wg_noise_keypairs_clear), the sessions and the
+    // handshake go; the staged packet and the retransmit deadline stay, and the
+    // retransmit, also due, sends a fresh initiation in the same poll.
     p.now = zero_at;
-    _ = try p.a.poll(testing.io, p.clock(), &buf);
+    var buf2: [2048]u8 = undefined;
+    var buf3: [2048]u8 = undefined;
+    const init_msg = (try p.a.poll(testing.io, p.clock(), &buf)).network;
     try testing.expect(p.a.current == null);
+    try testing.expect(p.a.pending != null and p.a.pending.?.local_index != old_index);
     try testing.expectEqual(data.len + 2, p.a.stage_tail - p.a.stage_head);
+    // The staged packet goes out once that handshake completes.
+    const resp = (try p.b.decapsulate(testing.io, p.clock(), init_msg, &buf2)).output.network;
+    const w = (try p.a.decapsulate(testing.io, p.clock(), resp, &buf3)).output.network;
+    try testing.expectEqualSlices(u8, data, (try p.b.decapsulate(testing.io, p.clock(), w, &buf2)).output.tunnel);
 }
 
 test "Tunnel: allowed_ips: a /32 and a /128 hold exactly one address" {
@@ -2607,7 +2619,7 @@ test "Tunnel: giving up leaves no retransmit armed and disarms the keepalive, no
     try testing.expect(p.a.need_another_keepalive);
 }
 
-test "Tunnel: a keepalive that comes due with no session to send it disarms itself" {
+test "Tunnel: a keepalive that comes due with no session to send it starts a handshake (kernel)" {
     var p: Pair = undefined;
     try p.init(null, 0);
     defer p.a.wipe();
@@ -2626,8 +2638,12 @@ test "Tunnel: a keepalive that comes due with no session to send it disarms itse
     p.a.current.?.session.send.seekUnsafeForTest(transport.reject_after_messages);
     try testing.expect(!p.a.hasSession(p.clock()));
     p.now += keepalive_timeout_ms;
-    _ = try p.a.poll(testing.io, p.clock(), &buf);
-    try testing.expect(p.a.send_keepalive_at == null);
+    // As wg_expired_send_keepalive → wg_packet_send_keepalive: the keepalive is
+    // staged and a handshake starts; the second-keepalive flag re-arms it once.
+    try testing.expect((try p.a.poll(testing.io, p.clock(), &buf)) == .network);
+    try testing.expect(p.a.pending != null);
+    try testing.expectEqual(@as(usize, 2), p.a.stage_tail - p.a.stage_head);
+    try testing.expect(p.a.send_keepalive_at != null);
     try testing.expect(!p.a.need_another_keepalive);
 }
 
@@ -2677,7 +2693,7 @@ test "Tunnel: a persistent keepalive held off by the 5 s gate is disarmed, not l
     try testing.expect(p.a.persistent_at == null);
 }
 
-test "Tunnel: the key deadline, reached by a datagram, disarms every timer and request" {
+test "Tunnel: the key deadline, reached by a datagram, leaves every timer and request armed (kernel)" {
     var pkt: [64]u8 = undefined;
     const data = ip4(&pkt, 4);
     var buf: [2048]u8 = undefined;
@@ -2698,10 +2714,11 @@ test "Tunnel: the key deadline, reached by a datagram, disarms every timer and r
         p.now = zero_at;
         try testing.expectError(error.InvalidPacket, p.a.decapsulate(testing.io, p.clock(), &junk, &buf));
         try testing.expect(p.a.current == null);
-        try testing.expect(!p.a.want_initiation);
-        try testing.expect(p.a.new_handshake_at == null);
-        try testing.expectEqual(@as(?u64, null), p.a.nextDeadline(p.clock()));
-        try testing.expectEqual(Output.none, try p.a.poll(testing.io, p.clock(), &buf));
+        try testing.expect(p.a.want_initiation);
+        try testing.expect(p.a.new_handshake_at != null);
+        // The rekey request still stands: the next poll starts a fresh handshake.
+        try testing.expect((try p.a.poll(testing.io, p.clock(), &buf)) == .network);
+        try testing.expect(p.a.pending != null);
     }
     // a receives twice: both keepalive flags, not polled.
     {
@@ -2719,13 +2736,46 @@ test "Tunnel: the key deadline, reached by a datagram, disarms every timer and r
         try testing.expect(p.a.send_keepalive_at != null and p.a.need_another_keepalive);
         p.now = zero_at;
         try testing.expectError(error.InvalidPacket, p.a.decapsulate(testing.io, p.clock(), &junk, &buf));
-        try testing.expect(p.a.send_keepalive_at == null);
-        try testing.expect(!p.a.need_another_keepalive);
-        try testing.expectEqual(@as(?u64, null), p.a.nextDeadline(p.clock()));
+        try testing.expect(p.a.current == null);
+        try testing.expect(p.a.send_keepalive_at != null and p.a.need_another_keepalive);
+        // The keepalive deadline still fires; with no session it is staged and a
+        // handshake starts (wg_packet_send_keepalive), and it re-arms once more.
+        p.now = @max(p.now, p.a.send_keepalive_at.?);
+        try testing.expect((try p.a.poll(testing.io, p.clock(), &buf)) == .network);
+        try testing.expect(p.a.pending != null);
+        try testing.expect(p.a.stage_head != p.a.stage_tail);
+        try testing.expect(p.a.send_keepalive_at != null and !p.a.need_another_keepalive);
     }
 }
 
-test "Tunnel: the key deadline drops what was staged with no handshake in flight" {
+test "Tunnel: the key deadline drops the handshake in flight: a late response to it is refused (kernel)" {
+    var p: Pair = undefined;
+    try p.init(null, 0);
+    defer p.a.wipe();
+    defer p.b.wipe();
+    try p.establish();
+    var pkt: [64]u8 = undefined;
+    const data = ip4(&pkt, 4);
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    const zero_at = p.a.zero_keys_at.?;
+    // An initiation goes out one second before the key deadline; its retransmit
+    // is due well after it.
+    p.now = zero_at - 1_000;
+    const init_msg = (try p.a.encapsulate(testing.io, p.clock(), data, &buf)).network;
+    try testing.expect(p.a.pending != null and p.a.retransmit_at.? > zero_at);
+    const resp = (try p.b.decapsulate(testing.io, p.clock(), init_msg, &buf2)).output.network;
+    // The deadline passes: wg_noise_handshake_clear — the initiation is gone,
+    // the retransmit deadline and the staged packet stay.
+    p.now = zero_at;
+    try testing.expectEqual(Output.none, try p.a.poll(testing.io, p.clock(), &buf));
+    try testing.expect(p.a.pending == null);
+    try testing.expect(p.a.retransmit_at != null);
+    try testing.expectEqual(data.len + 2, p.a.stage_tail - p.a.stage_head);
+    try testing.expectError(error.UnknownIndex, p.a.decapsulate(testing.io, p.clock(), resp, &buf));
+}
+
+test "Tunnel: the key deadline keeps what was staged with no handshake in flight (kernel)" {
     var p: Pair = undefined;
     try p.init(null, 0);
     defer p.a.wipe();
@@ -2739,10 +2789,12 @@ test "Tunnel: the key deadline drops what was staged with no handshake in flight
     try testing.expectEqual(Output.none, try p.b.encapsulate(testing.io, p.clock(), "\x45", &buf2));
     try testing.expect(p.b.pending == null);
     try testing.expect(p.b.stage_head != p.b.stage_tail);
+    const staged = p.b.stage_tail - p.b.stage_head;
     p.now = p.b.zero_keys_at.?;
     _ = try p.b.poll(testing.io, p.clock(), &buf2);
-    try testing.expectEqual(p.b.stage_head, p.b.stage_tail);
-    try testing.expectEqual(@as(u64, 1), p.b.stats().staged_dropped);
+    try testing.expect(p.b.current == null and p.b.next == null);
+    try testing.expectEqual(staged, p.b.stage_tail - p.b.stage_head);
+    try testing.expectEqual(@as(u64, 0), p.b.stats().staged_dropped);
 }
 
 /// The arbitrary-network harness and the simulated-loss model.

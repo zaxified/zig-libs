@@ -6,7 +6,7 @@
 
 **Scope:** parity — configuration plane: wg(8) + wgctrl-go (netlink, the userspace protocol, the configuration file, listing); data plane: boringtun `noise::Tunn` / wireguard-go's per-peer state machine, sans-IO. The TUN + UDP daemon is deliberately not here (surveyed 2026-11-02)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-18 (658/766, 108 eq) · src da738963ff855d3f
+**Audit:** review 2026-09-02 · mutation 2026-11-18 (656/764, 108 eq) · src 2bf77111244394c6
 
 **Hardening:** fuzz 2026-11-03 (`WIREGUARD_FUZZ=200000 scripts/modtest wireguard -Doptimize=ReleaseSafe`, clean over all seven harnesses incl. the new `wireguard-conf`, `wireguard-uapi` (200,000 each), `wireguard-tunnel` (÷32, mac1 computed, so `peekInitiation`, `acceptInitiation` and `consumeResponse` are reached: REACH peek_bad_static, accept_bad_timestamp, accept_ok, response_forged, data_forged) and `wireguard-tunnel-sim` (÷64)) · ct 2026-11-03 (`ctgrind.sh --check wireguard`: key base64 and hex codecs, the whole handshake, seal/open, cookies, `Tunnel`; 1/1/4/1/0/9 in-file, every one a verdict or the inner IP header, none on a key byte) · panic 2026-11-03 (the GR sweep of 2026-10-30, extended over `Tunnel`, `conf`, `uapi`, `peekInitiation`, `listDevices`; GR: sweep + 2 blind reviews: second deriveTransportKeys from the wiped chaining key (HIGH, public keys) and role mismatch → checked panics, replayed initiation on a used handshake → AlreadyStarted, CookieChecker.wipe zero-key cookies, response receiver index checked before DH, cookie reply replay, kernel reply loops bounded (TooManyMessages, interrupted dumps restarted), linear peer merge; delta audit 45/45 + 34/34)
 
@@ -184,16 +184,19 @@ random bits per session, redrawn on a clash; `Options.routed_id` gives `tunnelId
 pending index within 256 guesses at 2 X25519 each, and the handshake count on the wire. **A drop leaves no trace:** an
 error from `decapsulate` moves no counter, timer, window or index (tests). `previous` has no send key; `next` keeps
 its own, since it sends once confirmed. **A staged packet larger than `out`** is dropped and counted, so it cannot
-stop the timers behind it. **Differences on purpose:** a late key deadline does not
-take an initiation already in flight, and what waits for it stays (wireguard-go's timers fire on time, a
-polled deadline may not); an initiator's pending handshake survives a simultaneous initiation from the peer, both
-sessions work (tested). **The key deadline differs from both references, open for an owner decision
-(2026-11-18):** wireguard-go's `expiredZeroKeyMaterial` and the kernel's `wg_queued_expired_zero_key_material`
-wipe the keys (the kernel also clears the handshake) and touch no timer, so a keepalive or new-handshake timer
-still armed then fires and starts a fresh handshake. Here the deadline takes the sessions AND disarms the
-keepalive and new-handshake deadlines and drops a rekey request and, with no initiation in flight, the stage
-(tests "the key deadline, reached by a datagram, disarms every timer and request", "... drops what was staged").
-**The second keepalive flag** follows both references since 2026-11-18: a send and a give-up cancel the keepalive
+stop the timers behind it. **Differences on purpose:** an initiator's pending handshake survives a simultaneous initiation from the peer,
+both sessions work (tested). **The key deadline follows the kernel (owner decision 2026-11-18):** as
+`wg_queued_expired_zero_key_material` (`wg_noise_handshake_clear` + `wg_noise_keypairs_clear`) it wipes the
+sessions AND an initiation in flight, and touches no timer, no rekey request and no staged packet — so a
+retransmit, keepalive or new-handshake deadline still armed then starts a fresh handshake, and a late response to
+the cleared initiation is refused (`UnknownIndex`). A keepalive that comes due with no session to send under is
+staged and starts a handshake, as `wg_expired_send_keepalive` → `wg_packet_send_keepalive` (before 2026-11-18 the
+deadline also disarmed the timers and dropped the stage, and a session-less keepalive was dropped). Tests "the key
+deadline clears an initiation in flight …", "… leaves every timer and request armed", "… keeps what was staged …",
+"… drops the handshake in flight: a late response to it is refused", "a keepalive that comes due with no session to
+send it starts a handshake". wireguard-go's `expiredZeroKeyMaterial` (`ZeroAndFlushAll`) also flushes the staged
+packets; the kernel does not, and the kernel is the reference chosen here.
+*Delta mutation 2026-11-18 (key deadline as the kernel):* the 5 killed mutants on the removed `expireKeys` lines (ids 357-361) leave the count; 3 new mutants — `expireKeys` without `wipePending`, a session-less keepalive doing nothing, no re-arm — all killed (card 656/764, 108 eq). **The second keepalive flag** follows both references since 2026-11-18: a send and a give-up cancel the keepalive
 but keep the flag (`timersAnyAuthenticatedPacketSent`, `wg_timers_any_authenticated_packet_sent`,
 `expiredRetransmitHandshake`); only a keepalive going out clears it. **Multi-peer:** `ownsIndex`, or the device's own table, or `routed_id`. **Clock:** it must
 keep counting across suspend (CLOCK_BOOTTIME); time going backwards saturates, nothing wraps, but it extends the
