@@ -2854,6 +2854,8 @@ const OpenWith = struct {
     backoff_ns: u64 = 0,
     flush_timeout_ns: u64 = 10 * std.time.ns_per_s,
     n_workers: usize = 1,
+    max_unflushed: usize = 0,
+    put_block_ns: u64 = 60 * std.time.ns_per_s,
 };
 
 fn openWith(rig: *FailRig, clk: *FakeClock, o: OpenWith) !*Coordinator {
@@ -2868,6 +2870,8 @@ fn openWith(rig: *FailRig, clk: *FakeClock, o: OpenWith) !*Coordinator {
         .max_flush_attempts = o.cap,
         .retry_backoff_ns = o.backoff_ns,
         .flush_timeout_ns = o.flush_timeout_ns,
+        .max_unflushed = o.max_unflushed,
+        .put_block_ns = o.put_block_ns,
         .wal_wall_clock = .{ .ctx = clk, .nowFn = FakeClock.wall },
         .wal_mono_clock = .{ .ctx = clk, .nowFn = FakeClock.mono },
     });
@@ -3400,4 +3404,107 @@ test "deinitNoFlush: a harvested flush that advances its key meets a stopped poo
     try testing.expectEqual(@as(usize, 1), c2.pendingCount());
     try c2.recover();
     try testing.expectEqualStrings("new", rig.sink.peek("k").?);
+}
+
+test "a record in a persisted WAL backoff (a WAL from before 2026-11-19) is counted at reopen and flushed once visible" {
+    // Older versions nacked with a WAL-side backoff, which the WAL persists.
+    // Such a record is pending (`readyCount` includes records whose `run_at`
+    // lies ahead), so `pendingCount` reports it, `flushAll` waits for it, and
+    // it lands once its time has come -- through recover(), the synchronous
+    // path, or a pool flush started for its key.
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    var path: usize = 0;
+    while (path < 3) : (path += 1) {
+        var rig: FailRig = undefined;
+        rig.init(.{ .gpa = testing.allocator });
+        defer rig.deinit();
+        var clk: FakeClock = .{};
+        {
+            const c = try openWith(&rig, &clk, .{});
+            _ = try c.wal.enqueue("put", "v", .{ .partition = "k", .delay_ns = hour });
+            c.deinitNoFlush();
+        }
+        const c = try openWith(&rig, &clk, .{ .flush_timeout_ns = 30 * std.time.ns_per_ms });
+        defer c.deinit();
+        try testing.expectEqual(@as(usize, 1), c.pendingCount());
+        try testing.expectError(error.FlushIncomplete, c.flushAll()); // hidden: waited for, not dropped
+        try testing.expectEqual(@as(usize, 1), c.pendingCount());
+        _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+        switch (path) {
+            0 => try c.recover(),
+            1 => try testing.expect(c.flushOneSync()),
+            else => {
+                c.startKey("k");
+                try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+                try c.flushAll();
+            },
+        }
+        try testing.expectEqual(@as(usize, 0), c.pendingCount());
+        try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+        try testing.expectEqualStrings("v", rig.sink.get("k").?);
+    }
+}
+
+test "back-pressure does not retry a key early: its synchronous backstop waits for the retry backoff too" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try openWith(&rig, &clk, .{
+        .backoff_ns = hour,
+        .max_unflushed = 1,
+        .put_block_ns = 30 * std.time.ns_per_ms,
+    });
+    defer c.deinit();
+    try c.put("k", "v");
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // rejected: "k" waits an hour
+    try testing.expectError(error.Backpressure, c.put("x", "1"));
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen); // not retried early
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    try c.put("x", "1"); // the retry lands and makes room
+    try testing.expectEqualStrings("v", rig.sink.get("k").?);
+}
+
+test "the synchronous path keeps the per-key retry deadlines exact: cleared on landing and on dead-lettering, moved on a new rejection" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 3 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try openWith(&rig, &clk, .{ .backoff_ns = hour, .cap = 3 });
+    defer c.deinit();
+    try c.put("k", "v");
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // first rejection (pool path): "k" waits an hour
+    try testing.expect(c.anyRetryWaiting());
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    try testing.expect(!c.anyRetryWaiting());
+    // Second rejection, on the synchronous path: the lapsed deadline moves on.
+    try testing.expect(!c.flushOneSync());
+    try testing.expect(c.anyRetryWaiting());
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    // Third rejection dead-letters it (cap 3): nothing is left waiting.
+    try testing.expect(!c.flushOneSync());
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.retry_at.count());
+    // A landed record clears its key's lapsed deadline as well.
+    try c.put("j", "w");
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // fail_n is spent: "j" lands
+    try testing.expectEqualStrings("w", rig.sink.get("j").?);
+    try c.put("m", "1");
+    rig.sink.reject_key = "m";
+    c.drain();
+    try waitCompletion(c);
+    c.drain(); // "m" rejected: waits
+    rig.sink.reject_key = null;
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    try testing.expect(c.flushOneSync()); // lands through the synchronous path
+    try testing.expectEqual(@as(usize, 0), c.retry_at.count());
+    try testing.expectEqualStrings("1", rig.sink.get("m").?);
 }
