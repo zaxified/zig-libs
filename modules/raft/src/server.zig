@@ -91,6 +91,10 @@ pub const RaftConfig = struct {
     /// broadcast while holding committed entries to lose; `node.zig`'s H1
     /// test is what pins it.)
     drain_every_event: bool = true,
+    /// Passed to every node (`node.Config`): the byte cap per AppendEntries
+    /// and the per-follower in-flight window.
+    max_append_bytes: u32 = 1 << 20,
+    max_inflight_msgs: u32 = 512,
 };
 
 /// The command a leader proposes when its next entry will be `index` while
@@ -252,6 +256,8 @@ pub const RaftServer = struct {
             .election_jitter_ticks = 0,
             .heartbeat_ticks = hb,
             .max_append_entries = types.max_entries_per_msg,
+            .max_append_bytes = self.cfg.max_append_bytes,
+            .max_inflight_msgs = self.cfg.max_inflight_msgs,
             .seed = i,
         };
     }
@@ -1050,4 +1056,152 @@ test "real: a crashed server restarts from its disk alone and the cluster stays 
     try testing.expect(srv.node(0).term >= 2);
     try testing.expect(srv.node(0).lastIndex() + types.max_entries_per_msg >= srv.node(l).lastIndex());
     try testing.expect(srv.node(0).applied > 0);
+}
+
+// ── a hostile peer: oversized AppendEntries (SPEC Backlog 10) ───────────────
+//
+// One server of the cluster also sends, every `period`, an AppendEntries to
+// every peer whose entries exceed the cap — at its own current term, from
+// index 1, so a receiver that ACCEPTED one would adopt the term, truncate its
+// log and append the hostile entries (Log Matching / State Machine Safety
+// would trip). The receivers must drop every one (counted in
+// `malformedDropped`), and the cluster must stay safe and keep committing.
+
+const HostilePeer = struct {
+    srv: *RaftServer,
+    hostile: NodeId = CLUSTER_N - 1,
+    period: Time = 50,
+    /// Hostile frames that ARRIVED at a live receiver (the link may lose some).
+    received: u64 = 0,
+    epoch: u64 = 0,
+    frame: std.ArrayList(u8) = .empty,
+
+    /// Timer ids from here up are this wrapper's (the inner ones are small
+    /// epochs); the low bits carry `epoch`, so a chain from before a restart dies.
+    const TIMER_BASE: u64 = 1 << 62;
+    /// Over the 1024-byte cap the hostile tests set: 2 x (13 + 600).
+    const DATA_LEN = 600;
+
+    fn protocol(self: *HostilePeer) Protocol {
+        return .{
+            .ctx = self,
+            .onStartFn = onStart,
+            .onMessageFn = onMessage,
+            .onTimerFn = onTimer,
+            .checkFn = check,
+            .resetFn = reset,
+        };
+    }
+
+    fn cast(ctx: *anyopaque) *HostilePeer {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn deinit(self: *HostilePeer, gpa: Allocator) void {
+        self.frame.deinit(gpa);
+    }
+
+    fn reset(ctx: *anyopaque) void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        inner.resetFn(inner.ctx);
+        self.received = 0;
+        self.epoch = 0;
+    }
+
+    fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        try inner.onStartFn.?(inner.ctx, sim, node);
+        if (node == self.hostile) {
+            self.epoch += 1;
+            try sim.setTimer(node, self.period, TIMER_BASE + self.epoch);
+        }
+    }
+
+    fn onMessage(ctx: *anyopaque, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
+        const self = cast(ctx);
+        if (from == self.hostile and payload.len > self.srv.node(node).maxFrameLen()) self.received += 1;
+        const inner = self.srv.protocol();
+        try inner.onMessageFn(inner.ctx, sim, node, from, payload);
+    }
+
+    fn onTimer(ctx: *anyopaque, sim: *Sim, node: NodeId, timer_id: u64) anyerror!void {
+        const self = cast(ctx);
+        if (timer_id < TIMER_BASE) {
+            const inner = self.srv.protocol();
+            return inner.onTimerFn.?(inner.ctx, sim, node, timer_id);
+        }
+        if (timer_id - TIMER_BASE != self.epoch) return;
+        const gpa = self.srv.gpa;
+        const t = @max(1, self.srv.node(node).term);
+        const data: [DATA_LEN]u8 = @splat(0xAB);
+        const ents = [_]Entry{ .{ .index = 1, .term = t, .data = &data }, .{ .index = 2, .term = t, .data = &data } };
+        const m: Message = .{ .from = node, .to = 0, .body = .{ .append_req = .{
+            .term = t,
+            .prev_log_index = 0,
+            .prev_log_term = 0,
+            .leader_commit = 0,
+            .entries = &ents,
+        } } };
+        try self.frame.resize(gpa, m.encodedLen());
+        _ = m.encode(self.frame.items);
+        for (0..CLUSTER_N) |p| {
+            if (p == node) continue;
+            try sim.send(node, @intCast(p), self.frame.items);
+        }
+        try sim.setTimer(node, self.period, timer_id);
+    }
+
+    fn check(ctx: *anyopaque, sim: *const Sim) anyerror!void {
+        const self = cast(ctx);
+        const inner = self.srv.protocol();
+        try inner.checkFn.?(inner.ctx, sim);
+    }
+};
+
+/// Small enough that the hostile frames are over it and the honest batches
+/// (8 entries x 21 bytes) are not; a two-message window so the sweep's lost
+/// and duplicated messages exercise the window's freeing rules.
+const LIMITS_CFG = RaftConfig{ .max_append_bytes = 1024, .max_inflight_msgs = 2 };
+
+test "real: a hostile peer's oversized AppendEntries are all dropped, and the cluster stays safe and live" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, LIMITS_CFG);
+    defer srv.deinit(gpa);
+    var hp = HostilePeer{ .srv = &srv };
+    defer hp.deinit(gpa);
+    const case = netsim.Case{ .seed = 7, .scenario = scenario, .protocol = hp.protocol(), .until = UNTIL };
+    const r = try netsim.replay(gpa, case, &.{}, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    // Preconditions: the attack happened, at volume.
+    try testing.expect(hp.received >= 4 * 30);
+    // Every hostile frame was refused, and nothing honest was.
+    try testing.expectEqual(hp.received, srv.malformedDropped());
+    // …and the cluster kept committing through it.
+    try testing.expect(srv.applied_commands.count() >= 30);
+}
+
+test "real: a 100-seed fuzzed fault sweep with a hostile peer, a 1 KiB cap and a two-message window" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, LIMITS_CFG);
+    defer srv.deinit(gpa);
+    var hp = HostilePeer{ .srv = &srv };
+    defer hp.deinit(gpa);
+    const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = hp.protocol(), .until = UNTIL };
+
+    var seed: u64 = 1;
+    while (seed <= 100) : (seed += 1) {
+        var case = template;
+        case.seed = seed;
+        var gr = try netsim.run(gpa, case, .{});
+        defer gr.trace.deinit();
+        if (gr.result.outcome == .violated) {
+            std.debug.print("raft: hostile/limits sweep tripped a safety check at seed {}\n", .{seed});
+            return error.HardInvariantViolated;
+        }
+        try testing.expectEqual(hp.received, srv.malformedDropped());
+    }
 }

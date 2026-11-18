@@ -85,6 +85,30 @@ pub const Config = struct {
     /// Entries per AppendEntries, and the most `stepBytes` will decode — so
     /// every server must agree on it.
     max_append_entries: u32 = 64,
+    /// Byte cap per AppendEntries: the sum over its entries of
+    /// `message.Message.entry_header_len + data.len` (the frame minus its
+    /// fixed header — `maxFrameLen` is the whole frame). The leader batches up
+    /// to it (and to `max_append_entries`); a follower drops and counts an
+    /// AppendEntries above it before allocating anything for its entries;
+    /// `propose` refuses an entry that could not fit in one. Every server must
+    /// agree on it. etcd/raft's `MaxSizePerMsg`; the default is the etcd
+    /// server's (1 MiB). A log holding an entry larger than this (restored
+    /// from a node with a larger cap) cannot be replicated until it is raised.
+    max_append_bytes: u32 = 1 << 20,
+    /// Unacknowledged AppendEntries that carry entries, per follower (empty
+    /// ones — heartbeats — are not counted). When a follower's window is full
+    /// the leader sends it heartbeats only, until an acknowledgement frees a
+    /// slot: a success frees every message it covers, a success that covers
+    /// none of them frees the oldest (a lost message must not wedge the
+    /// window — etcd frees one on a heartbeat response), a rejection empties
+    /// it. Bounds what a slow or dead follower can pile up in the transport.
+    /// etcd/raft's `MaxInflightMsgs`; the default is the etcd server's
+    /// (4096 / 8 = 512). Must be > 0.
+    max_inflight_msgs: u32 = 512,
+    /// The same window in bytes (entry bytes as in `max_append_bytes`); 0 =
+    /// no byte bound (etcd/raft's `MaxInflightBytes`, also 0 by default).
+    /// When non-zero it must be >= `max_append_bytes`.
+    max_inflight_bytes: u64 = 0,
     /// Seeds the election-timeout jitter. Give every server a different one
     /// (two servers with the same seed time out in lockstep).
     seed: u64,
@@ -150,7 +174,9 @@ pub const InjectedBug = enum {
 pub const InitError = error{ InvalidConfig, InvalidRestore } || Allocator.Error;
 pub const ProposeError = error{ NotLeader, EntryTooLarge } || Allocator.Error;
 
-/// Largest `propose` payload: the wire carries an entry's length as a `u32`.
+/// Upper bound on any `propose` payload: the wire carries an entry's length
+/// as a `u32`. The effective bound is lower — `Config.max_append_bytes` minus
+/// `message.Message.entry_header_len`.
 pub const max_entry_len: usize = std.math.maxInt(u32);
 
 /// A 64-bit fingerprint of an entry — its position, term, kind and bytes.
@@ -195,6 +221,18 @@ pub const Node = struct {
     votes: []bool,
     next: []LogIndex,
     match: []LogIndex,
+    /// Per-follower in-flight window (`Config.max_inflight_msgs`): follower
+    /// p's ring is `infl_last/infl_size[p * cap ..][0..cap]`, oldest at
+    /// `infl_head[p]`. Each slot is one unacknowledged AppendEntries with
+    /// entries: the last index it carried and its entry bytes. Between two
+    /// resets the last indices never decrease (nextIndex only rises without a
+    /// rejection, and a leader's log only grows), so freeing "every message
+    /// an ack covers" pops from the front.
+    infl_last: []LogIndex,
+    infl_size: []u32,
+    infl_head: []u32,
+    infl_count: []u32,
+    infl_bytes: []u64,
 
     election_elapsed: u32 = 0,
     election_timeout: u32 = 0,
@@ -232,6 +270,10 @@ pub const Node = struct {
         if (cfg.election_ticks == 0 or cfg.heartbeat_ticks == 0 or cfg.max_append_entries == 0) return error.InvalidConfig;
         if (cfg.heartbeat_ticks >= cfg.election_ticks) return error.InvalidConfig;
         if (cfg.election_jitter_ticks > std.math.maxInt(u32) - cfg.election_ticks) return error.InvalidConfig;
+        // A no-op (an empty entry) must fit in one AppendEntries.
+        if (cfg.max_append_bytes < message.Message.entry_header_len) return error.InvalidConfig;
+        if (cfg.max_inflight_msgs == 0) return error.InvalidConfig;
+        if (cfg.max_inflight_bytes != 0 and cfg.max_inflight_bytes < cfg.max_append_bytes) return error.InvalidConfig;
         try validateRestore(cfg, restore);
 
         const n = cfg.cluster_size;
@@ -246,6 +288,11 @@ pub const Node = struct {
             .votes = &.{},
             .next = &.{},
             .match = &.{},
+            .infl_last = &.{},
+            .infl_size = &.{},
+            .infl_head = &.{},
+            .infl_count = &.{},
+            .infl_bytes = &.{},
             .prng = .init(cfg.seed),
             .out_arena = .init(gpa),
             .decode_buf = &.{},
@@ -255,6 +302,15 @@ pub const Node = struct {
         self.next = try gpa.alloc(LogIndex, n);
         self.match = try gpa.alloc(LogIndex, n);
         self.decode_buf = try gpa.alloc(Entry, cfg.max_append_entries);
+        const ring = std.math.mul(usize, n, cfg.max_inflight_msgs) catch return error.OutOfMemory;
+        self.infl_last = try gpa.alloc(LogIndex, ring);
+        self.infl_size = try gpa.alloc(u32, ring);
+        self.infl_head = try gpa.alloc(u32, n);
+        self.infl_count = try gpa.alloc(u32, n);
+        self.infl_bytes = try gpa.alloc(u64, n);
+        @memset(self.infl_head, 0);
+        @memset(self.infl_count, 0);
+        @memset(self.infl_bytes, 0);
         @memset(self.votes, false);
         @memset(self.next, 1);
         @memset(self.match, 0);
@@ -294,6 +350,11 @@ pub const Node = struct {
         gpa.free(self.votes);
         gpa.free(self.next);
         gpa.free(self.match);
+        gpa.free(self.infl_last);
+        gpa.free(self.infl_size);
+        gpa.free(self.infl_head);
+        gpa.free(self.infl_count);
+        gpa.free(self.infl_bytes);
         self.* = undefined;
     }
 
@@ -306,6 +367,13 @@ pub const Node = struct {
     pub fn entryAt(self: *const Node, i: LogIndex) ?Entry {
         const e = self.log.get(i) orelse return null;
         return .{ .index = i, .term = e.term, .kind = e.kind, .data = self.data.items[@intCast(i - 1)] };
+    }
+
+    /// The largest AppendEntries frame this node accepts (`max_append_bytes`
+    /// of entries plus the fixed header) — and so the largest frame of any
+    /// kind. A transport can refuse a longer frame before reading it.
+    pub fn maxFrameLen(self: *const Node) usize {
+        return message.Message.append_header_len + @as(usize, self.cfg.max_append_bytes);
     }
 
     fn majority(self: *const Node) usize {
@@ -338,7 +406,9 @@ pub const Node = struct {
     pub fn propose(self: *Node, bytes: []const u8) ProposeError!LogIndex {
         std.debug.assert(!self.in_ready);
         if (self.role != .leader) return error.NotLeader;
-        if (bytes.len > max_entry_len) return error.EntryTooLarge;
+        // Bounded by the per-message byte cap, not only by the wire's u32
+        // length: an entry no AppendEntries can carry would wedge replication.
+        if (bytes.len > self.cfg.max_append_bytes - message.Message.entry_header_len) return error.EntryTooLarge;
         const idx = try self.appendLocal(.command, bytes);
         self.bcast_pending = true;
         return idx;
@@ -357,6 +427,13 @@ pub const Node = struct {
     pub fn step(self: *Node, m: Message) Allocator.Error!void {
         std.debug.assert(!self.in_ready);
         if (m.to != self.cfg.id or m.from >= self.cfg.cluster_size or m.from == self.cfg.id) {
+            self.malformed_dropped += 1;
+            return;
+        }
+        if (m.body == .append_req and appendBytes(m.body.append_req.entries) > self.cfg.max_append_bytes) {
+            // A hostile or misconfigured leader: refused before anything is
+            // allocated for its entries. No reply (a drop is what Raft
+            // tolerates; see `malformed_dropped`).
             self.malformed_dropped += 1;
             return;
         }
@@ -471,6 +548,8 @@ pub const Node = struct {
         @memset(self.next, self.lastIndex() + 1);
         @memset(self.match, 0);
         self.match[self.cfg.id] = self.stable;
+        @memset(self.infl_count, 0);
+        @memset(self.infl_bytes, 0);
         // §8: a fresh leader commits a no-op of its own term, which is what
         // lets the Figure-8 rule pull earlier-term entries in behind it.
         _ = try self.appendLocal(.noop, "");
@@ -572,7 +651,19 @@ pub const Node = struct {
         const a = self.out_arena.allocator();
         const last = self.lastIndex();
         const prev = self.next[to] - 1;
-        const count: usize = @intCast(@min(last - prev, self.cfg.max_append_entries));
+        // A full window sends a heartbeat (no entries): it still carries the
+        // commit index and holds elections off, and its ack frees a slot.
+        const room: u64 = if (self.inflFull(to)) 0 else @min(last - prev, self.cfg.max_append_entries);
+        // etcd's `limitSize`: the longest prefix within the byte cap, but
+        // never empty — an entry above the cap goes alone (only a restored
+        // log can hold one: `propose` refuses it).
+        var count: usize = 0;
+        var size: u64 = 0;
+        while (count < room) : (count += 1) {
+            const es = message.Message.entry_header_len + self.data.items[@intCast(prev + count)].len;
+            if (count > 0 and size + es > self.cfg.max_append_bytes) break;
+            size += es;
+        }
         const entries = try a.alloc(Entry, count);
         for (entries, @as(usize, @intCast(prev + 1))..) |*e, i| {
             const src = self.entryAt(i).?;
@@ -581,6 +672,7 @@ pub const Node = struct {
             e.* = src;
             e.data = try a.dupe(u8, src.data);
         }
+        if (count > 0) self.inflAdd(to, prev + count, @intCast(@min(size, std.math.maxInt(u32))));
         try self.send(to, .{ .append_req = .{
             .term = self.term,
             .prev_log_index = prev,
@@ -683,6 +775,11 @@ pub const Node = struct {
             }
             const progressed = a.index > self.match[from];
             if (progressed) self.match[from] = a.index;
+            // Everything this ack covers has arrived. If it covered nothing
+            // and the window is still full, the oldest message is presumed
+            // lost (etcd: `FreeFirstOne` on a heartbeat response).
+            self.inflFreeLE(from, a.index);
+            if (!progressed and self.inflFull(from)) self.inflFreeFirst(from);
             self.next[from] = @max(self.next[from], self.match[from] + 1);
             self.maybeCommit();
             // Keep streaming only on PROGRESS: a duplicated or stale ack must
@@ -708,8 +805,45 @@ pub const Node = struct {
             // otherwise get the same batch back every round trip.
             const moved = next < self.next[from];
             self.next[from] = next;
+            // etcd: a rejection sends the follower back to probing and empties
+            // its window — the messages after the gap are useless.
+            self.infl_count[from] = 0;
+            self.infl_bytes[from] = 0;
             if (moved) try self.sendAppend(from);
         }
+    }
+
+    // ── the in-flight window (etcd/raft `tracker.Inflights`) ─────────────────
+
+    fn inflFull(self: *const Node, p: NodeId) bool {
+        if (self.infl_count[p] >= self.cfg.max_inflight_msgs) return true;
+        const cap = self.cfg.max_inflight_bytes;
+        return cap != 0 and self.infl_bytes[p] >= cap;
+    }
+
+    fn inflSlot(self: *const Node, p: NodeId, k: u32) usize {
+        const cap = self.cfg.max_inflight_msgs;
+        return @as(usize, p) * cap + (self.infl_head[p] + k) % cap;
+    }
+
+    fn inflAdd(self: *Node, p: NodeId, last: LogIndex, size: u32) void {
+        std.debug.assert(!self.inflFull(p));
+        const slot = self.inflSlot(p, self.infl_count[p]);
+        self.infl_last[slot] = last;
+        self.infl_size[slot] = size;
+        self.infl_count[p] += 1;
+        self.infl_bytes[p] += size;
+    }
+
+    fn inflFreeFirst(self: *Node, p: NodeId) void {
+        const slot = self.inflSlot(p, 0);
+        self.infl_bytes[p] -= self.infl_size[slot];
+        self.infl_head[p] = (self.infl_head[p] + 1) % self.cfg.max_inflight_msgs;
+        self.infl_count[p] -= 1;
+    }
+
+    fn inflFreeLE(self: *Node, p: NodeId, index: LogIndex) void {
+        while (self.infl_count[p] > 0 and self.infl_last[self.inflSlot(p, 0)] <= index) self.inflFreeFirst(p);
     }
 
     fn maybeCommit(self: *Node) void {
@@ -720,6 +854,13 @@ pub const Node = struct {
             // Followers learn it with the next AppendEntries.
             self.bcast_pending = true;
         }
+    }
+
+    /// An AppendEntries' entry bytes as `max_append_bytes` counts them.
+    fn appendBytes(entries: []const Entry) u64 {
+        var n: u64 = 0;
+        for (entries) |e| n += message.Message.entry_header_len + e.data.len;
+        return n;
     }
 
     fn send(self: *Node, to: NodeId, body: message.Body) Allocator.Error!void {
@@ -997,6 +1138,229 @@ fn testLeader(gpa: Allocator, extra: usize) !Node {
     _ = try node.ready();
     try node.advance();
     return node;
+}
+
+// ── hostile-peer limits: byte cap and in-flight window (SPEC Backlog 10) ────
+
+/// `testLeader` with a caller's config (id 0 of 3, term 1; `extra` one-byte
+/// commands after the no-op, all persisted).
+fn testLeaderCfg(gpa: Allocator, cfg: Config, extra: usize) !Node {
+    var node = try Node.init(gpa, cfg, .{});
+    errdefer node.deinit();
+    while (node.role != .candidate) try node.tick();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = node.term, .granted = true } } });
+    try testing.expectEqual(Role.leader, node.role);
+    for (0..extra) |_| _ = try node.propose("x");
+    _ = try node.ready();
+    try node.advance();
+    return node;
+}
+
+fn limitCfg() Config {
+    return .{ .id = 0, .cluster_size = 3, .election_ticks = 2, .election_jitter_ticks = 0, .seed = 0 };
+}
+
+/// Entry counts of the AppendEntries queued for `to` since `from_msg`.
+fn batchesTo(node: *const Node, to: NodeId, from_msg: usize, out: []usize) []usize {
+    var n: usize = 0;
+    for (node.msgs.items[from_msg..]) |m| {
+        if (m.to != to or m.body != .append_req) continue;
+        out[n] = m.body.append_req.entries.len;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "byte cap, follower: an AppendEntries AT the cap is applied, one byte over is dropped before any state moves" {
+    const gpa = testing.allocator;
+    const H = Message.entry_header_len;
+    var cfg: Config = .{ .id = 1, .cluster_size = 3, .seed = 1, .max_append_bytes = 2 * H + 10 };
+    var node = try Node.init(gpa, cfg, .{});
+    defer node.deinit();
+    try testing.expectEqual(Message.append_header_len + 2 * H + 10, node.maxFrameLen());
+
+    const over = [_]Entry{ .{ .index = 1, .term = 1, .data = "abcdef" }, .{ .index = 2, .term = 1, .data = "fghij" } };
+    const at = [_]Entry{ .{ .index = 1, .term = 1, .data = "abcde" }, .{ .index = 2, .term = 1, .data = "fghij" } };
+    var buf: [128]u8 = undefined;
+    // cap + 1, through the wire (the frame is maxFrameLen() + 1 and decodes fine).
+    const m_over: Message = .{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 1, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &over } } };
+    try testing.expectEqual(node.maxFrameLen() + 1, m_over.encodedLen());
+    try node.stepBytes(0, buf[0..m_over.encode(&buf)]);
+    try testing.expectEqual(@as(u64, 1), node.malformed_dropped);
+    try testing.expectEqual(@as(LogIndex, 0), node.lastIndex());
+    try testing.expectEqual(@as(Term, 0), node.term); // not even the term moved
+    try testing.expect(!node.hasReady()); // and no reply
+    // At the cap: accepted and acknowledged.
+    const m_at: Message = .{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 1, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &at } } };
+    try testing.expectEqual(node.maxFrameLen(), m_at.encodedLen());
+    try node.stepBytes(0, buf[0..m_at.encode(&buf)]);
+    try testing.expectEqual(@as(u64, 1), node.malformed_dropped);
+    try testing.expectEqual(@as(LogIndex, 2), node.lastIndex());
+    try testing.expect(node.msgs.items[0].body.append_resp.success);
+
+    // The default is etcd's server value.
+    cfg = .{ .id = 0, .cluster_size = 1, .seed = 0 };
+    try testing.expectEqual(@as(u32, 1 << 20), cfg.max_append_bytes);
+    try testing.expectEqual(@as(u32, 512), cfg.max_inflight_msgs);
+    try testing.expectEqual(@as(u64, 0), cfg.max_inflight_bytes);
+}
+
+test "byte cap, leader: batches stop at the cap, and an entry above it goes alone" {
+    const gpa = testing.allocator;
+    const H = Message.entry_header_len;
+    // Log: no-op (H bytes), then one-byte commands (H + 1 each).
+    for ([_]struct { cap: u32, want: usize }{
+        .{ .cap = 3 * H + 2, .want = 3 }, // exactly no-op + two commands
+        .{ .cap = 3 * H + 1, .want = 2 }, // one byte short of the third
+    }) |c| {
+        var cfg = limitCfg();
+        cfg.max_append_bytes = c.cap;
+        var node = try testLeaderCfg(gpa, cfg, 9);
+        defer node.deinit();
+        node.next[1] = 1;
+        node.infl_count[1] = 0;
+        node.infl_bytes[1] = 0;
+        const from = node.msgs.items.len;
+        try node.sendAppend(1);
+        var out: [4]usize = undefined;
+        try testing.expectEqualSlices(usize, &.{c.want}, batchesTo(&node, 1, from, &out));
+    }
+    // A restored entry larger than the cap is still sent, alone (etcd's
+    // `limitSize`), rather than never.
+    const big = "012345678901234567890123456789";
+    const ents = [_]Entry{ .{ .index = 1, .term = 1, .data = big }, .{ .index = 2, .term = 1, .data = "y" } };
+    var cfg = limitCfg();
+    cfg.max_append_bytes = H + 2;
+    var node = try Node.init(gpa, cfg, .{ .hard_state = .{ .term = 1 }, .entries = &ents });
+    defer node.deinit();
+    while (node.role != .candidate) try node.tick();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = node.term, .granted = true } } });
+    node.next[1] = 1;
+    const from = node.msgs.items.len;
+    try node.sendAppend(1);
+    var out: [4]usize = undefined;
+    try testing.expectEqualSlices(usize, &.{1}, batchesTo(&node, 1, from, &out));
+}
+
+test "byte cap, propose: the largest entry one AppendEntries can carry is accepted, one byte more refused" {
+    const gpa = testing.allocator;
+    var cfg = limitCfg();
+    cfg.max_append_bytes = Message.entry_header_len + 8;
+    var node = try testLeaderCfg(gpa, cfg, 0);
+    defer node.deinit();
+    _ = try node.propose("12345678");
+    try testing.expectError(error.EntryTooLarge, node.propose("123456789"));
+}
+
+test "limits: init refuses a cap no no-op fits in, an empty window, a byte window below one message" {
+    const gpa = testing.allocator;
+    const H = Message.entry_header_len;
+    var cfg = limitCfg();
+    cfg.max_append_bytes = H - 1;
+    try testing.expectError(error.InvalidConfig, Node.init(gpa, cfg, .{}));
+    cfg.max_append_bytes = H;
+    var ok = try Node.init(gpa, cfg, .{});
+    ok.deinit();
+    cfg = limitCfg();
+    cfg.max_inflight_msgs = 0;
+    try testing.expectError(error.InvalidConfig, Node.init(gpa, cfg, .{}));
+    cfg = limitCfg();
+    cfg.max_append_bytes = 100;
+    cfg.max_inflight_bytes = 99;
+    try testing.expectError(error.InvalidConfig, Node.init(gpa, cfg, .{}));
+    cfg.max_inflight_bytes = 100;
+    ok = try Node.init(gpa, cfg, .{});
+    ok.deinit();
+}
+
+test "in-flight window: at the cap the leader sends heartbeats only; acks free it, a rejection empties it" {
+    const gpa = testing.allocator;
+    var cfg = limitCfg();
+    cfg.max_inflight_msgs = 2;
+    cfg.max_append_entries = 4;
+    var node = try testLeaderCfg(gpa, cfg, 19); // log 1..20
+    defer node.deinit();
+    node.next[1] = 1;
+    node.infl_count[1] = 0;
+    node.infl_bytes[1] = 0;
+    var out: [8]usize = undefined;
+
+    // Two unacknowledged batches fill the window; the third send is a heartbeat.
+    var from = node.msgs.items.len;
+    for (0..3) |_| try node.sendAppend(1);
+    try testing.expectEqualSlices(usize, &.{ 4, 4, 0 }, batchesTo(&node, 1, from, &out));
+    // Heartbeats do not count: still exactly two in flight.
+    try testing.expectEqual(@as(u32, 2), node.infl_count[1]);
+
+    // An ack covering both (they carried 1..4) frees both, and the stream
+    // moves on with a full batch.
+    from = node.msgs.items.len;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 4 } } });
+    try testing.expectEqualSlices(usize, &.{4}, batchesTo(&node, 1, from, &out));
+    try testing.expectEqual(@as(u32, 1), node.infl_count[1]);
+
+    // Fill it again; an ack that covers NOTHING in flight (a heartbeat's)
+    // frees the oldest — a lost batch must not wedge the window — and sends
+    // nothing by itself.
+    try node.sendAppend(1);
+    try testing.expectEqual(@as(u32, 2), node.infl_count[1]);
+    from = node.msgs.items.len;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 4 } } });
+    try testing.expectEqual(@as(u32, 1), node.infl_count[1]);
+    try testing.expectEqual(@as(usize, 0), batchesTo(&node, 1, from, &out).len);
+    try node.sendAppend(1);
+    try testing.expectEqual(@as(u32, 2), node.infl_count[1]);
+
+    // A rejection empties it (the follower goes back to probing).
+    node.next[1] = 9;
+    from = node.msgs.items.len;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = false, .index = 6 } } });
+    try testing.expectEqualSlices(usize, &.{4}, batchesTo(&node, 1, from, &out)); // the retry
+    try testing.expectEqual(@as(u32, 1), node.infl_count[1]);
+}
+
+test "in-flight window in bytes: full at the cap, not one byte below it" {
+    const gpa = testing.allocator;
+    const H = Message.entry_header_len;
+    // Batch from index 1: the no-op and one command, 2H + 1 bytes.
+    const batch: u64 = 2 * H + 1;
+    for ([_]struct { cap: u64, third: usize }{
+        .{ .cap = 2 * batch, .third = 0 }, // two batches reach the cap: heartbeat
+        .{ .cap = 2 * batch + 1, .third = 2 }, // one byte of room left: a batch
+    }) |c| {
+        var cfg = limitCfg();
+        cfg.max_append_bytes = 2 * H + 1;
+        cfg.max_inflight_bytes = c.cap;
+        var node = try testLeaderCfg(gpa, cfg, 9);
+        defer node.deinit();
+        node.next[1] = 1;
+        node.infl_count[1] = 0;
+        node.infl_bytes[1] = 0;
+        const from = node.msgs.items.len;
+        for (0..3) |_| try node.sendAppend(1);
+        var out: [4]usize = undefined;
+        try testing.expectEqualSlices(usize, &.{ 2, 2, c.third }, batchesTo(&node, 1, from, &out));
+    }
+}
+
+test "a new leader starts every follower's window empty" {
+    const gpa = testing.allocator;
+    var cfg = limitCfg();
+    cfg.max_inflight_msgs = 1;
+    var node = try testLeaderCfg(gpa, cfg, 3);
+    defer node.deinit();
+    try testing.expectEqual(@as(u32, 1), node.infl_count[1]); // the election's first batch
+    // Deposed, then elected again in a later term.
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .vote_resp = .{ .term = 5, .granted = false } } });
+    while (node.role != .candidate) try node.tick();
+    node.infl_count[1] = 1; // a stale count from the earlier term must not survive
+    node.infl_bytes[1] = 77;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = node.term, .granted = true } } });
+    try testing.expectEqual(Role.leader, node.role);
+    // becomeLeader's broadcast found the window empty: it carried entries.
+    const last = node.msgs.items[node.msgs.items.len - 2]; // to 1, then to 2
+    try testing.expectEqual(@as(NodeId, 1), last.to);
+    try testing.expect(last.body.append_req.entries.len > 0);
 }
 
 test "a rejection's hint skips the follower's gap in one round trip, but never below its match" {
