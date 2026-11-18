@@ -260,6 +260,34 @@ test "lsdb auth: CSNP and PSNP are verified before they reconcile" {
     }
 }
 
+test "lsdb auth: auth_snp=false accepts unsigned and signed SNPs, default still refuses, LSPs unaffected" {
+    var buf: [256]u8 = undefined;
+    var c = cfg(&keys);
+    c.auth_snp = false;
+    inline for (.{ csnp, psnp }, .{ "csnp", "psnp" }) |build, kind| {
+        const reconcile = if (comptime std.mem.eql(u8, kind, "csnp")) Lsdb.reconcileCsnpBytes else Lsdb.reconcilePsnpBytes;
+        var off = Lsdb.init(testing.allocator, c);
+        defer off.deinit();
+        try reconcile(&off, try build(&buf, null), 0, 0);
+        try testing.expectEqual(@as(usize, 1), off.count());
+        var wrong = key;
+        wrong.secret = "nope";
+        var off2 = Lsdb.init(testing.allocator, c);
+        defer off2.deinit();
+        try reconcile(&off2, try build(&buf, wrong), 0, 0); // not verified at all
+        try testing.expectEqual(@as(usize, 1), off2.count());
+        // The default (true) with the same keys still refuses.
+        var on = Lsdb.init(testing.allocator, cfg(&keys));
+        defer on.deinit();
+        try testing.expectError(error.AuthMissing, reconcile(&on, try build(&buf, null), 0, 0));
+        try testing.expectEqual(@as(usize, 0), on.count());
+    }
+    // LSPs are still verified with auth_snp=false.
+    var db = Lsdb.init(testing.allocator, c);
+    defer db.deinit();
+    try testing.expectError(error.AuthMissing, db.insert(try lsp(&buf, null, 1, 10), 1, 0));
+}
+
 // -- delta mutation 2026-11-18 ------------------------------------------------
 
 test "lsdb auth: the purge TLV rule applies to purges only, a live LSP may carry any TLV" {

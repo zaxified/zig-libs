@@ -109,7 +109,8 @@ without a verifying #10 (`error.AuthMissing` / `error.AuthFailed`) and a purge
 carrying anything but #10/#13/#137 (`error.InvalidPurge`); verified purges are
 kept whole so they can be flooded on, an LSP aged out here becomes a purge
 signed with `auth_keys[0]`, and `reconcileCsnpBytes`/`reconcilePsnpBytes`
-verify SNPs before reconciling. Empty keys (the default) change nothing. See
+verify SNPs before reconciling (`Config.auth_snp = false` turns SNP
+verification off, as FRR's default does). Empty keys (the default) change nothing. See
 `SPEC.md` §8a.
 
 ## Capacity / DoS bound
