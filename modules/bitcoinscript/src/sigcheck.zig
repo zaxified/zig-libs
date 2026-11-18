@@ -305,7 +305,31 @@ pub fn checkEcdsaSig(
     var sig_rs: [64]u8 = undefined;
     sig_rs[0..32].* = rs.r;
     sig_rs[32..64].* = rs.s;
-    return k256.sign.ecdsaVerifyPrehashed(pubkey, sighash, sig_rs);
+    // Bitcoin Core verifies through libsecp256k1's `secp256k1_ec_pubkey_parse`,
+    // which also accepts X9.62 hybrid keys; `k256` refuses them by contract, so
+    // a valid hybrid key is rewritten to its `0x04` form here.
+    var uncompressed: [65]u8 = undefined;
+    const pk: []const u8 = if (hybridToUncompressed(pubkey, &uncompressed)) &uncompressed else pubkey;
+    return k256.sign.ecdsaVerifyPrehashed(pk, sighash, sig_rs);
+}
+
+/// Bitcoin Core `CPubKey::IsValid` (`GetLen`: tag 0x06/0x07 means a 65-byte
+/// key) followed by libsecp256k1 `secp256k1_ge_parse_with_hybrid65`: a hybrid
+/// key (`0x06` = even y, `0x07` = odd y) is accepted only if the parity of the
+/// y coordinate matches the tag. When `pubkey` is a 65-byte hybrid key whose tag
+/// matches the parity of y, writes the same point with the `0x04` tag into `out`
+/// and returns true; otherwise returns false and the caller passes `pubkey`
+/// through unchanged (a mismatching tag then stays a 65-byte key with an
+/// unknown tag, which `k256` refuses, i.e. verify=false, as Core). An x or y
+/// outside the field or a point off the curve is refused by `k256` as well.
+fn hybridToUncompressed(pubkey: []const u8, out: *[65]u8) bool {
+    if (pubkey.len != 65) return false;
+    if (pubkey[0] != 0x06 and pubkey[0] != 0x07) return false;
+    const y_odd = pubkey[64] & 1 == 1;
+    if (y_odd != (pubkey[0] == 0x07)) return false;
+    out.* = pubkey[0..65].*;
+    out[0] = 0x04;
+    return true;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -580,4 +604,43 @@ test "parseDerLoose: long-form lengths at their exact fits and with 2- and 3-byt
         @memcpy(buf[buf.len - 3 ..], &[_]u8{ 0x02, 0x01, 0x07 });
         try testing.expectEqual(rsOf(0, 7), parseDerLoose(buf).?);
     }
+}
+
+test "hybridToUncompressed maps only a 65-byte 06/07 key whose tag matches the parity of y" {
+    var key: [65]u8 = @splat(0x11);
+    var out: [65]u8 = undefined;
+    key[64] = 0x02; // even y
+    key[0] = 0x06;
+    try testing.expect(hybridToUncompressed(&key, &out));
+    try testing.expectEqual(@as(u8, 0x04), out[0]);
+    try testing.expectEqualSlices(u8, key[1..], out[1..]);
+    key[0] = 0x07;
+    try testing.expect(!hybridToUncompressed(&key, &out));
+    key[64] = 0x03; // odd y
+    try testing.expect(hybridToUncompressed(&key, &out));
+    key[0] = 0x06;
+    try testing.expect(!hybridToUncompressed(&key, &out));
+    key[0] = 0x04; // uncompressed passes through untouched
+    try testing.expect(!hybridToUncompressed(&key, &out));
+    for ([_]u8{ 0x00, 0x02, 0x03, 0x04, 0x05, 0x08 }) |tag| { // any other tag, either parity
+        key[0] = tag;
+        key[64] = 0x02;
+        try testing.expect(!hybridToUncompressed(&key, &out));
+        key[64] = 0x03;
+        try testing.expect(!hybridToUncompressed(&key, &out));
+    }
+    key[0] = 0x07;
+    key[64] = 0x03;
+    try testing.expect(!hybridToUncompressed(key[0..64], &out)); // wrong length
+    var long: [66]u8 = @splat(0x11);
+    long[0] = 0x06;
+    long[64] = 0x02;
+    try testing.expect(!hybridToUncompressed(&long, &out));
+    key[0] = 0x07;
+    key[63] = 0x03; // the parity is taken from byte 64 only, not the byte before it
+    key[64] = 0x12;
+    try testing.expect(!hybridToUncompressed(&key, &out));
+    key[0] = 0x06;
+    try testing.expect(hybridToUncompressed(&key, &out));
+    try testing.expect(!hybridToUncompressed(&.{ 0x06, 0x01 }, &out));
 }

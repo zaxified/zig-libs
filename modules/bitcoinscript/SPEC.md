@@ -6,7 +6,7 @@
 
 **Scope:** core — Bitcoin Core v31.1 `script/interpreter.cpp` (libbitcoinconsensus behaviour) + btcd `txscript` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-07 · mutation 2026-11-17 (646/675, 29 eq) · src 97de3e05c7f891ca
+**Audit:** review 2026-09-07 · mutation 2026-11-18 (661/690, 29 eq) · src abff56c3c6934a57
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BITCOINSCRIPT_FUZZ) · ct n/a — public script data (keyword review, 2026-10-07)
 
@@ -233,7 +233,7 @@ already transformed, so no legacy verdict here depends on it.
 
 ### script_tests.json coverage
 
-`script_tests_vectors.zig` pins 297 rows machine-filtered (not hand-picked) from Bitcoin Core's
+`script_tests_vectors.zig` pins 297 rows (plus, appended 2026-11-18, 29 rows of the current corpus admitted for signature/pubkey parsing without strict flags and five hand-built hybrid-key cases: 331 in all) machine-filtered (not hand-picked) from Bitcoin Core's
 official `src/test/data/script_tests.json` (fetched 2026-07 from the `bitcoin/bitcoin` `master`
 branch), then machine-transcribed verbatim via a one-off Python script — never hand-typed. The
 filter: keep only rows (a) with no witness field — **those now live in
@@ -250,7 +250,9 @@ Two further exclusions — (c) `OP_CODESEPARATOR` rows and (d) `CONST_SCRIPTCODE
 **removed on 2026-08-06** along with the `FindAndDelete(vchSig)` scope cut they existed to justify.
 Re-running the filter without them admits exactly **one** additional row (the 297th, appended at
 the end of the vectors file): `script_tests.json` contains a single `CODESEPARATOR` row in total
-and **zero** rows carrying the `CONST_SCRIPTCODE` flag. So this corpus was never able to exercise
+and **zero** rows carrying the `CONST_SCRIPTCODE` flag *at that time*. (Correction 2026-11-18:
+Core's current `script_tests.json` carries 3 non-witness `CONST_SCRIPTCODE` rows; they are pinned
+with the hybrid-key rows added that day.) So the 2026-08 corpus was never able to exercise
 `FindAndDelete(vchSig)`, with or without the filter — Core tests that behaviour elsewhere, and both
 places are now pinned here:
 
@@ -395,6 +397,24 @@ overflow, which Core turns into the all-zero signature and this module into "doe
 a consensus divergence for validation without `dersig`. High-`S` signatures verify (Core normalizes
 `S`); `low_s` rejects them first. The element's LAST byte is always the hashtype, so an `S` that ends
 in the sighash byte does not borrow it.
+
+### Hybrid public keys without STRICTENC
+
+With `strictenc` set a 65-byte `0x06`/`0x07` key is refused as `Pubkeytype` (Core `IsCompressedOrUncompressedPubKey`;
+pinned by the `script_tests.json` hybrid rows). Without it Core still verifies against such a key:
+`CPubKey::IsValid` accepts a 65-byte key with tag `4`, `6` or `7` (`src/pubkey.h` `GetLen`), and
+`CPubKey::Verify` parses it with libsecp256k1's `secp256k1_ec_pubkey_parse`, whose
+`secp256k1_ge_parse_with_hybrid65` (`src/group_impl.h`, MIT; both read 2026-11-18) accepts tag `0x06` only
+when y is even and `0x07` only when y is odd, with x and y below the field prime and the point on the
+curve; anything else is "does not verify". `sigcheck.hybridToUncompressed` reproduces the parity rule
+before calling `k256`, whose own `fromSec1` refuses hybrid keys by contract: a matching hybrid key is
+rewritten to its `0x04` form, a mismatching one is passed through unchanged and refused by `k256`
+(verify=false, never a script error). Before 2026-11-18 every hybrid key failed to verify without
+`strictenc`, a consensus divergence for validation without that flag (Core's `script_tests.json`: "1-of-2
+with the second 1 hybrid pubkey and no STRICTENC"). The pinned vectors carry that row, 28 more rows of the
+current corpus that exercise signature/pubkey parsing without `STRICTENC`/`DERSIG`/`LOW_S` and were dropped by
+the 2026-07 sampling, and five hand-built parity/off-curve cases. The delta mutation of this change: 15
+mutants, 15 killed (cumulative with the whole-module run: 661/690, 29 eq; card src hash abff56c3c6934a57).
 
 ## Flags
 
