@@ -2297,20 +2297,35 @@ cmd_ctgrind() {
 cmd_ctgrind_portable() {
     # The constant-time measurement on the PORTABLE code path (added 2026-11-18,
     # owner decision). `ctgrind` above builds the harnesses for skylake, so a
-    # module with an asm/portable split (ADX/BMI2 cores) is only ever measured on
-    # its asm path -- but aarch64 and baseline x86-64 run the portable one. On
-    # 2026-11-18 p256's portable `montReducePortable` compiled a `jae` on the
-    # REDC borrow in one inlined copy (a branch on secret-point data, ctgrind
+    # module with an asm/portable split (ADX/BMI2 cores, AES-NI) is only ever
+    # measured on its fast path -- but aarch64 and baseline x86-64 run the other
+    # one. On 2026-11-18 p256's portable `montReducePortable` compiled a `jae` on
+    # the REDC borrow in one inlined copy (a branch on secret-point data, ctgrind
     # `secpt` 2 instead of 1) and nothing in CI could see it.
     #
-    # Only modules whose portable counts were measured equal to the pinned
-    # (skylake) ones are listed: the expected table has one count per row, so a
-    # module whose portable code shape gives different counts needs its own pins
-    # before it can join. Extend the list after measuring
-    # `CTGRIND_CPU=x86_64 scripts/checks/ctgrind.sh --check <m>` green.
+    # EVERY module with a harness runs here, not only those with an explicit CPU
+    # switch: `-mcpu=x86_64` changes LLVM's code in every module (cmov vs branch,
+    # inlining, vector width), and the p256 leak was exactly such a code-shape
+    # effect. The first full portable sweep (2026-11-18) found two more the same
+    # way, in modules with no CPU switch at all: bfv's `csub`/`subMod` mask and
+    # bech32 base58's `digitChar`, each compiled to a jump on secret data.
+    # Where the portable code legitimately differs (std's soft AES, std's X25519,
+    # std's `mem.eql` chunking, code shape), the module has `cpu=x86_64` VARIANT
+    # rows in ctgrind-expected.tsv; ctgrind.sh falls back to the plain row
+    # everywhere else. Runs on tag/dispatch only, in its own job (~30 min).
+    #
+    # EXCLUDED, each with an open item in its SPEC Backlog: jwe, megolm and xmlenc
+    # report UNATTRIBUTED contexts in std soft-AES frames on x86_64, which no pin
+    # may absorb.
     set_extra_args "$@"
-    local mods=(p256)
-    echo "ctgrind-portable: CTGRIND_CPU=x86_64 (no ADX/BMI2) for: ${mods[*]}"
+    local skip=" jwe megolm xmlenc " mods=() m
+    for m in modules/*/src/ctgrind_harness.zig; do
+        [[ -e "$m" ]] || continue
+        m="${m#modules/}"; m="${m%%/*}"
+        [[ "$skip" == *" $m "* ]] && continue
+        mods+=("$m")
+    done
+    echo "ctgrind-portable: CTGRIND_CPU=x86_64 (no AES-NI/ADX/BMI2/AVX) for ${#mods[@]} modules (excluded:${skip% })"
     echo "  ⚠ needs valgrind (scripts/lib/ci-environment.sh ctgrind)"
     _ZL_KEEP_OUT="$(mktemp)"
     export CTGRIND_CPU=x86_64

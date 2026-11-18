@@ -1839,9 +1839,11 @@ if [[ "$DO_UPDATE_DIGESTS" == "1" ]]; then
         # pin of 20 of the 24 rows, and the only reason it was caught is that
         # `--check` refuses an empty pin instead of treating it as "not pinned
         # yet". A re-pin of one column must not destroy the other.
-        IFS=$'\t' read -r m mo t tm inf _ eout <<<"$ln"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "$mo" "$t" "$tm" "$inf" \
-            "$(src_digest "$m" "${PATTERN[$m/$t]:-}")" "$eout" >>"$tmp"
+        # The optional EIGHTH column (per-CPU variant options, 2026-11-18) is
+        # carried through the same way.
+        IFS=$'\t' read -r m mo t tm inf _ eout eextra <<<"$ln"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' "$m" "$mo" "$t" "$tm" "$inf" \
+            "$(src_digest "$m" "${PATTERN[$m/$t]:-}")" "$eout" "${eextra:+$'\t'$eextra}" >>"$tmp"
     done <"$EXPECTED_FILE"
     mv "$tmp" "$EXPECTED_FILE"
     echo "ctgrind: source digests rewritten in $EXPECTED_FILE"
@@ -2283,12 +2285,47 @@ out_digest() {
 # src_digest() is defined once, above the argument handling: --update-digests
 # and --verify-digests use it without building or measuring anything.
 
+# ── per-CPU variant rows (2026-11-18) ───────────────────────────────────────
+# A row whose optional EIGHTH column carries `cpu=<model>` applies only to a run
+# with that CTGRIND_CPU, and on such a run it REPLACES the plain row of the same
+# (module, mode, target). A native (skylake) run ignores every `cpu=` row; a
+# portable run falls back to the plain row wherever no variant exists. Why it
+# exists: `-mcpu=x86_64` changes the generated code (std's soft AES instead of
+# AES-NI, std's X25519 instead of the MULX ladder, cmov vs branch everywhere),
+# and the table has one count per row. The same column may pin the untainted
+# control and the no-`-fvalgrind` trap (`control=N trap=N`) where std code the
+# module cannot change reports contexts WITHOUT a taint (std's bitsliced soft
+# AES pads a partial batch with `undefined` lanes and memcheck carries that
+# into the real ones). Unattributed contexts stay unconditional: no option
+# exists for them. Format and every variant's cause: ctgrind-expected.tsv header.
+row_opt() {  # row_opt "<8th column>" <key> -> value or empty
+    local kv
+    for kv in $1; do
+        if [[ "$kv" == "$2="* ]]; then printf '%s' "${kv#*=}"; return 0; fi
+    done
+    return 0
+}
+declare -A VARIANT=() CTRL_EXP=() TRAP_EXP=()
+while IFS=$'\t' read -r vm vmo vt _ _ _ _ vextra; do
+    [[ "$vm" =~ ^# || -z "$vm" ]] && continue
+    [[ "$(row_opt "${vextra:-}" cpu)" == "$CTGRIND_CPU" ]] || continue
+    VARIANT["$vm/$vmo/$vt"]=1
+    CTRL_EXP["$vm/$vmo/$vt"]="$(row_opt "$vextra" control)"
+    TRAP_EXP["$vm/$vmo/$vt"]="$(row_opt "$vextra" trap)"
+done <"$EXPECTED_FILE"
+
 echo
 fail=0
 declare -A NEW_OUT=()
-while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout; do
+while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout eextra; do
     [[ "$em" =~ ^# ]] && continue
     [[ -z "$em" ]] && continue
+    ecpu="$(row_opt "${eextra:-}" cpu)"
+    if [[ -n "$ecpu" ]]; then
+        [[ "$ecpu" == "$CTGRIND_CPU" ]] || continue
+    elif [[ -n "${VARIANT[$em/$emode/$etarget]:-}" ]]; then
+        continue
+    fi
     line=$(awk -F'\t' -v m="$em" -v mo="$emode" -v t="$etarget" \
         '$1==m && $2==mo && $3=="true" && $4=="yes" && $5==t { print }' "$ACTUAL")
     if [[ -z "$line" ]]; then
@@ -2372,7 +2409,7 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout; do
             # declaration with a digest that will not hold on the next run.
             echo "SKIP $em/$emode/$etarget: row is declared RANDOMIZED; leaving it so." >&2
         else
-            NEW_OUT["$em/$emode/$etarget"]="$new_out"
+            NEW_OUT["$em/$emode/$etarget/$ecpu"]="$new_out"
         fi
     elif [[ -z "${eout:-}" ]]; then
         echo "FAIL $em/$emode/$etarget: no output digest in ctgrind-expected.tsv — run --update-outputs" >&2
@@ -2414,9 +2451,11 @@ if [[ "$DO_UPDATE_OUTPUTS" == "1" ]]; then
     tmp="$(mktemp)"
     while IFS= read -r ln; do
         if [[ "$ln" =~ ^# || -z "$ln" ]]; then printf '%s\n' "$ln" >>"$tmp"; continue; fi
-        IFS=$'\t' read -r m mo t tm inf sd od <<<"$ln"
-        nd="${NEW_OUT[$m/$mo/$t]:-${od:-}}"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "$mo" "$t" "$tm" "$inf" "$sd" "$nd" >>"$tmp"
+        IFS=$'\t' read -r m mo t tm inf sd od ox <<<"$ln"
+        # Keyed by the row's own `cpu=` (empty for a plain row), so a portable
+        # run re-pins the variant it measured and never the native row.
+        nd="${NEW_OUT[$m/$mo/$t/$(row_opt "${ox:-}" cpu)]:-${od:-}}"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' "$m" "$mo" "$t" "$tm" "$inf" "$sd" "$nd" "${ox:+$'\t'$ox}" >>"$tmp"
     done <"$EXPECTED_FILE"
     mv "$tmp" "$EXPECTED_FILE"
     echo "ctgrind: output digests rewritten in $EXPECTED_FILE"
@@ -2429,12 +2468,16 @@ fi
 # and the classify_contexts call below would search for a pattern that matches
 # nothing. A trailing column is only free when every reader is told about it.
 while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _ aun aacc _ alog apat asecs; do
-    if [[ "$ataint" == "no" && "$atotal" != "0" ]]; then
-        echo "FAIL $am/$amode/$atarget: untainted control reported $atotal contexts, expected 0" >&2
+    # 0 unless this CPU's variant row pins std's taint-free contexts (see
+    # "per-CPU variant rows" above).
+    exp_ctrl="${CTRL_EXP[$am/$amode/$atarget]:-}"; exp_ctrl="${exp_ctrl:-0}"
+    exp_trap="${TRAP_EXP[$am/$amode/$atarget]:-}"; exp_trap="${exp_trap:-0}"
+    if [[ "$ataint" == "no" && "$atotal" != "$exp_ctrl" ]]; then
+        echo "FAIL $am/$amode/$atarget: untainted control reported $atotal contexts, expected $exp_ctrl" >&2
         fail=1
     fi
-    if [[ "$avg" == "false" && "$atotal" != "0" ]]; then
-        echo "FAIL $am/$amode/$atarget: no-fvalgrind trap reported $atotal contexts, expected 0" >&2
+    if [[ "$avg" == "false" && "$atotal" != "$exp_trap" ]]; then
+        echo "FAIL $am/$amode/$atarget: no-fvalgrind trap reported $atotal contexts, expected $exp_trap" >&2
         fail=1
     fi
     # ── fail-closed: nothing is allowed to go uncounted ─────────────────────

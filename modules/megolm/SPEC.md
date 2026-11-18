@@ -419,6 +419,7 @@ decoders' scratch.
 
 ## Backlog / deferred
 
+- **Portable ctgrind (`CTGRIND_CPU=x86_64`)** *(2026-11-18)*: this module is EXCLUDED from `scripts/test.sh ctgrind-portable`, because on baseline x86-64 (std's soft AES, no AES-NI/AVX) memcheck reports UNATTRIBUTED contexts, which no pin may absorb. Measured: `msg` 138 in-file (native 16), control 1, trap 109 with 1 unattributed; `skey` 33 (native 25) and `pickle` 28 (26) differ too (std soft AES-CBC/CTR, cause A1/A2 in ctgrind-expected.tsv). To close: attribute the trap's unattributed context, then pin `cpu=x86_64` variants.
 - ~~Session state serialization for `OutboundSession` and `InboundGroupSession`~~ — done 2026-10-06 (`pickle.zig`; see "Session pickles" above).
 - **libolm / vodozemac pickle import** *(re-assessed 2026-10-06)*: a client migrating from libolm or vodozemac storage would need to read their pickle formats. Not readable here; migration means re-sharing or exporting sessions. Needs a published layout description or MIT source to implement from — not the Apache-2.0 code. Effort: medium.
 - **vodozemac experimental message version 4 (full MAC)** — deliberately out (not in the published spec; "Scope note" above).
