@@ -372,6 +372,101 @@ pub fn ethLinkAll(cfg: EthLinkConfig, buf: []u8) usize {
     return off;
 }
 
+// ── Assembly object (class 0x04, CIP Vol 1 ch. 5-5) ─────────────────────────
+
+/// Class revision the Assembly object reports. Vol 1 fixes it at `2`
+/// (OpENer: "according to the CIP spec currently this has to be 2").
+pub const assembly_revision: u16 = 2;
+/// Highest class attribute number reported (class attribute 6) and highest
+/// instance attribute number (class attribute 7), as OpENer's class object
+/// builds them for the Assembly class.
+pub const assembly_max_class_attribute: u16 = 7;
+pub const assembly_max_instance_attribute: u16 = 4;
+
+/// Instance attribute numbers (Vol 1 Table 5-5.2): 3 is the data (a byte
+/// array, `Get` and `Set`), 4 its size in octets (`UINT`, `Get` only).
+pub const AssemblyAttr = struct {
+    pub const data: u16 = 3;
+    pub const size: u16 = 4;
+};
+
+/// One Assembly instance, defined by the caller. The octets live in the
+/// caller's memory: a read answers with the buffer as it is, a successful
+/// `Set_Attribute_Single` overwrites it, so the application publishes its
+/// outputs and reads its inputs by touching the same bytes.
+pub const Assembly = struct {
+    /// Instance id, `1` to `65535` (`0` is the class itself and is never
+    /// served; a repeated id is answered from its first entry).
+    instance: u16,
+    /// Attribute 3. Its length is attribute 4 and the only size a
+    /// `Set_Attribute_Single` accepts. At most 65535 octets (the size is a
+    /// `UINT`); a longer buffer is not served.
+    data: []u8,
+    /// Whether `Set_Attribute_Single` may write attribute 3. A read-only
+    /// instance answers `attribute_not_settable`, like an input assembly.
+    writable: bool = false,
+    /// Handed back to both hooks.
+    ctx: ?*anyopaque = null,
+    /// Called before attribute 3 is read, so the application can refresh the
+    /// buffer (OpENer's `BeforeAssemblyDataSend`).
+    before_get: ?*const fn (ctx: ?*anyopaque, data: []u8) void = null,
+    /// Called after a `Set_Attribute_Single` has overwritten the buffer
+    /// (OpENer's `AfterAssemblyDataReceived`). Returning `false` answers
+    /// `invalid_attribute_value`; as in OpENer the octets are already stored.
+    after_set: ?*const fn (ctx: ?*anyopaque, data: []const u8) bool = null,
+};
+
+/// The served instance `id`, or `null` (instance 0, an unknown id, a buffer
+/// that does not fit the `UINT` size attribute).
+pub fn assemblyFind(list: []const Assembly, id: u32) ?*const Assembly {
+    if (id == 0 or id > std.math.maxInt(u16)) return null;
+    for (list) |*a| {
+        if (a.instance == id and a.data.len <= std.math.maxInt(u16)) return a;
+    }
+    return null;
+}
+
+/// Writes class attribute `attr` of the Assembly class (instance 0) into
+/// `buf`, or returns `null` when it is not served. As OpENer: 1 revision,
+/// 2 largest instance id, 3 number of instances, 6 highest class attribute,
+/// 7 highest instance attribute, all `UINT`; the optional-attribute lists (4,
+/// 5) are not readable singly.
+pub fn assemblyClassAttribute(list: []const Assembly, attr: u16, buf: []u8) ?usize {
+    var max: u16 = 0;
+    var count: u16 = 0;
+    for (list, 0..) |a, i| {
+        if (assemblyFind(list, a.instance) != &list[i]) continue;
+        count += 1;
+        max = @max(max, a.instance);
+    }
+    const v: u16 = switch (attr) {
+        1 => assembly_revision,
+        2 => max,
+        3 => count,
+        6 => assembly_max_class_attribute,
+        7 => assembly_max_instance_attribute,
+        else => return null,
+    };
+    putU16(buf, v);
+    return 2;
+}
+
+/// The general status of `Set_Attribute_Single` on attribute `attr` of `a`
+/// with `data`, storing the octets when it succeeds. The order is OpENer's:
+/// the attribute must exist (`0x14`), be settable (`0x0E`), then the length
+/// must match exactly (`0x13` too short, `0x15` too long), then the hook.
+pub fn assemblySet(a: *const Assembly, attr: u16, data: []const u8) cip.GeneralStatus {
+    if (attr != AssemblyAttr.data and attr != AssemblyAttr.size) return .attribute_not_supported;
+    if (attr == AssemblyAttr.size or !a.writable) return .attribute_not_settable;
+    if (data.len < a.data.len) return .not_enough_data;
+    if (data.len > a.data.len) return .too_much_data;
+    @memcpy(a.data, data);
+    if (a.after_set) |hook| {
+        if (!hook(a.ctx, a.data)) return .invalid_attribute_value;
+    }
+    return .success;
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -668,4 +763,52 @@ test "ethernet link attributes: encodings and the all-reply" {
     try testing.expectEqual(@as(u32, 100), d.interface_speed);
     try testing.expectEqual(@as(u32, 0x0F), d.interface_flags);
     try testing.expectEqual(@as(u8, 0x02), d.physical_address[0] & 0x03);
+}
+
+test "assemblySet: the refusal order and what is stored" {
+    var buf = [3]u8{ 1, 2, 3 };
+    var ro_buf = [3]u8{ 1, 2, 3 };
+    const w: Assembly = .{ .instance = 1, .data = &buf, .writable = true };
+    const r: Assembly = .{ .instance = 2, .data = &ro_buf };
+    // unknown attribute before anything else, even on a read-only instance
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, assemblySet(&r, 5, &.{}));
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, assemblySet(&w, 0, &.{ 1, 2, 3 }));
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, assemblySet(&w, 2, &.{ 1, 2, 3 }));
+    // not settable before the length is looked at
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_settable, assemblySet(&w, 4, &.{ 3, 0 }));
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_settable, assemblySet(&r, 3, &.{}));
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_settable, assemblySet(&r, 3, &.{ 9, 9, 9 }));
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, &ro_buf);
+    // exact length only
+    try testing.expectEqual(cip.GeneralStatus.not_enough_data, assemblySet(&w, 3, &.{ 7, 7 }));
+    try testing.expectEqual(cip.GeneralStatus.too_much_data, assemblySet(&w, 3, &.{ 7, 7, 7, 7 }));
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, &buf);
+    try testing.expectEqual(cip.GeneralStatus.success, assemblySet(&w, 3, &.{ 7, 8, 9 }));
+    try testing.expectEqualSlices(u8, &.{ 7, 8, 9 }, &buf);
+}
+
+test "assemblyFind and class attributes: instance 0, repeats and oversize buffers" {
+    var a = [1]u8{0};
+    var b = [2]u8{ 0, 0 };
+    const list = [_]Assembly{
+        .{ .instance = 0, .data = &a },
+        .{ .instance = 5, .data = &a },
+        .{ .instance = 5, .data = &b },
+        .{ .instance = 9, .data = &b },
+    };
+    try testing.expectEqual(@as(?*const Assembly, null), assemblyFind(&list, 0));
+    try testing.expectEqual(@as(?*const Assembly, null), assemblyFind(&list, 6));
+    try testing.expectEqual(@as(?*const Assembly, null), assemblyFind(&list, 0x10005));
+    // the largest id a UINT holds is served
+    const top = [_]Assembly{.{ .instance = 65535, .data = &a }};
+    try testing.expectEqual(@as(*const Assembly, &top[0]), assemblyFind(&top, 65535).?);
+    try testing.expectEqual(@as(*const Assembly, &list[1]), assemblyFind(&list, 5).?);
+    var o: [2]u8 = undefined;
+    try testing.expectEqual(@as(?usize, 2), assemblyClassAttribute(&list, 3, &o));
+    try testing.expectEqualSlices(u8, &.{ 2, 0 }, &o); // 5 and 9; instance 0 and the repeat are not counted
+    _ = assemblyClassAttribute(&list, 2, &o);
+    try testing.expectEqualSlices(u8, &.{ 9, 0 }, &o);
+    try testing.expectEqual(@as(?usize, null), assemblyClassAttribute(&list, 4, &o));
+    try testing.expectEqual(@as(?usize, 2), assemblyClassAttribute(&.{}, 2, &o));
+    try testing.expectEqualSlices(u8, &.{ 0, 0 }, &o);
 }

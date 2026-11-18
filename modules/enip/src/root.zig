@@ -1537,6 +1537,15 @@ test "live: a real EtherNet/IP client against our adapter" {
         live_cfg = tcpip_cfg;
         live_cfg.allow_tcpip_set = true;
     }
+    // ENIP_TEST_ASM=1 serves the Assembly instances the assembly goldens were
+    // captured against: 100 (4 octets, read-only), 150 (3 octets, writable).
+    var asm_in = [4]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var asm_out = [3]u8{ 0, 0, 0 };
+    const asm_list = [_]stdobj.Assembly{
+        .{ .instance = 100, .data = &asm_in },
+        .{ .instance = 150, .data = &asm_out, .writable = true },
+    };
+    if (envVar("ENIP_TEST_ASM") != null) live_cfg.assemblies = &asm_list;
     var target = Adapter.init(live_cfg, &tags);
 
     var in: [8192]u8 = undefined;
@@ -3114,4 +3123,275 @@ test "ethernet link object: the client reads it, next to the TCP/IP object that 
     // The physical link path the TCP/IP object reports names this very object.
     const path = try c.getAttributeSingle(@backingInt(ClassCode.tcp_ip_interface), 1, 4);
     try testing.expectEqualSlices(u8, &.{ 2, 0, 0x20, 0xF6, 0x24, 1 }, path);
+}
+
+// ── Assembly object (class 0x04) ────────────────────────────────────────────
+
+const AsmHooks = struct {
+    gets: usize = 0,
+    sets: usize = 0,
+    accept: bool = true,
+    last: [8]u8 = @splat(0),
+
+    fn before(ctx: ?*anyopaque, data: []u8) void {
+        const self: *AsmHooks = @ptrCast(@alignCast(ctx.?));
+        self.gets += 1;
+        data[0] = @intCast(self.gets); // the application refreshes its input
+    }
+
+    fn after(ctx: ?*anyopaque, data: []const u8) bool {
+        const self: *AsmHooks = @ptrCast(@alignCast(ctx.?));
+        self.sets += 1;
+        @memcpy(self.last[0..data.len], data);
+        return self.accept;
+    }
+};
+
+var asm_list_storage: [4]stdobj.Assembly = undefined;
+
+/// Instances 100 (read-only input, 4 octets), 150 (writable output, 3 octets,
+/// hooks), 7 (writable, empty) and a repeat of 100 that must be ignored.
+fn asmTarget(in: []u8, outp: []u8, hooks: *AsmHooks, empty: []u8, shadow: []u8) Adapter {
+    asm_list_storage = .{
+        .{ .instance = 100, .data = in },
+        .{ .instance = 150, .data = outp, .writable = true, .ctx = hooks, .before_get = AsmHooks.before, .after_set = AsmHooks.after },
+        .{ .instance = 7, .data = empty, .writable = true },
+        .{ .instance = 100, .data = shadow },
+    };
+    return Adapter.init(.{ .assemblies = &asm_list_storage }, &.{});
+}
+
+test "assembly object: octets both ways, class attributes and sizes" {
+    var in = [4]u8{ 1, 2, 3, 4 };
+    var outp = [3]u8{ 9, 9, 9 };
+    var empty: [0]u8 = .{};
+    var shadow = [4]u8{ 0xEE, 0xEE, 0xEE, 0xEE };
+    var hooks: AsmHooks = .{};
+    var target = asmTarget(&in, &outp, &hooks, &empty, &shadow);
+    var keep: [512]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    const class = @backingInt(ClassCode.assembly);
+
+    // Get_Attribute_Single data of 0x04 / 100 / 3, on the wire.
+    const get3 = try cip.getAttributeSingle(class, 100, 3, &rb);
+    try testing.expectEqualSlices(u8, &.{ 0x0E, 0x03, 0x20, 0x04, 0x24, 0x64, 0x30, 0x03 }, get3);
+    var out: [64]u8 = undefined;
+    const raw = try target.messageRouter(get3, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x8E, 0x00, 0x00, 0x00, 1, 2, 3, 4 }, raw);
+
+    // Size, as a UINT; the repeated instance id is answered from its first entry.
+    const s = try routed(&target, try cip.getAttributeSingle(class, 100, 4, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 4, 0 }, s.data);
+    const s2 = try routed(&target, try cip.getAttributeSingle(class, 150, 4, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 3, 0 }, s2.data);
+    const s0 = try routed(&target, try cip.getAttributeSingle(class, 7, 4, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 0, 0 }, s0.data);
+    const d0 = try routed(&target, try cip.getAttributeSingle(class, 7, 3, &rb), &keep);
+    try testing.expectEqual(cip.GeneralStatus.success, d0.general_status);
+    try testing.expectEqual(@as(usize, 0), d0.data.len);
+
+    // Class attributes: revision 2, max instance 150, 3 instances, 7, 4.
+    const want = [_]struct { a: u32, v: u16 }{ .{ .a = 1, .v = 2 }, .{ .a = 2, .v = 150 }, .{ .a = 3, .v = 3 }, .{ .a = 6, .v = 7 }, .{ .a = 7, .v = 4 } };
+    for (want) |w| {
+        const r = try routed(&target, try cip.getAttributeSingle(class, 0, w.a, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.success, r.general_status);
+        var exp: [2]u8 = undefined;
+        std.mem.writeInt(u16, &exp, w.v, .little);
+        try testing.expectEqualSlices(u8, &exp, r.data);
+    }
+    try testing.expectEqual(@as(usize, 0), hooks.gets);
+
+    // The read hook refreshes the buffer first (instance 150 byte 0 = call count).
+    const r150 = try routed(&target, try cip.getAttributeSingle(class, 150, 3, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 1, 9, 9 }, r150.data);
+    try testing.expectEqual(@as(usize, 1), hooks.gets);
+    // The size read does not touch the hook.
+    _ = try routed(&target, try cip.getAttributeSingle(class, 150, 4, &rb), &keep);
+    try testing.expectEqual(@as(usize, 1), hooks.gets);
+
+    // Set 0x04 / 150 / 3 on the wire; the stored octets and the hook agree.
+    const set3 = try cip.setAttributeSingle(class, 150, 3, &.{ 0xA1, 0xB2, 0xC3 }, &rb);
+    try testing.expectEqualSlices(u8, &.{ 0x10, 0x03, 0x20, 0x04, 0x24, 0x96, 0x30, 0x03, 0xA1, 0xB2, 0xC3 }, set3);
+    const raw2 = try target.messageRouter(set3, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x90, 0x00, 0x00, 0x00 }, raw2);
+    try testing.expectEqualSlices(u8, &.{ 0xA1, 0xB2, 0xC3 }, &outp);
+    try testing.expectEqual(@as(usize, 1), hooks.sets);
+    try testing.expectEqualSlices(u8, &.{ 0xA1, 0xB2, 0xC3 }, hooks.last[0..3]);
+    // The empty instance takes an empty Set.
+    const sete = try routed(&target, try cip.setAttributeSingle(class, 7, 3, &.{}, &rb), &keep);
+    try testing.expectEqual(cip.GeneralStatus.success, sete.general_status);
+    // The application's own writes come back through the buffer.
+    in[0] = 0x55;
+    const again = try routed(&target, try cip.getAttributeSingle(class, 100, 3, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 0x55, 2, 3, 4 }, again.data);
+    // None of it is an identity request.
+    try testing.expectEqual(@as(usize, 0), target.identity_requests);
+}
+
+test "assembly object: every refusal" {
+    var in = [4]u8{ 1, 2, 3, 4 };
+    var outp = [3]u8{ 9, 9, 9 };
+    var empty: [0]u8 = .{};
+    var shadow = [4]u8{ 0xEE, 0xEE, 0xEE, 0xEE };
+    var hooks: AsmHooks = .{};
+    var target = asmTarget(&in, &outp, &hooks, &empty, &shadow);
+    var keep: [512]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    var pb: [16]u8 = undefined;
+    var rq: [64]u8 = undefined;
+    const class = @backingInt(ClassCode.assembly);
+    const S = cip.GeneralStatus;
+
+    // Unknown instances (0x05), for Get and Set, including ids above 16 bits.
+    for ([_]u32{ 1, 99, 101, 255, 0x10064 }) |inst| {
+        const g = try routed(&target, try cip.getAttributeSingle(class, inst, 3, &rb), &keep);
+        try testing.expectEqual(S.path_destination_unknown, g.general_status);
+        try testing.expectEqual(@as(u8, 0x0E), g.service);
+        const t = try routed(&target, try cip.setAttributeSingle(class, inst, 3, &.{1}, &rb), &keep);
+        try testing.expectEqual(S.path_destination_unknown, t.general_status);
+        try testing.expectEqual(@as(u8, 0x10), t.service);
+    }
+    // Unknown attributes (0x14): 0, 1, 2, 5, 0x14, and ones past 16 bits.
+    for ([_]u32{ 0, 1, 2, 5, 0x14, 0x10003, 0x10004 }) |a| {
+        const g = try routed(&target, try cip.getAttributeSingle(class, 150, a, &rb), &keep);
+        try testing.expectEqual(S.attribute_not_supported, g.general_status);
+        const t = try routed(&target, try cip.setAttributeSingle(class, 150, a, &.{ 1, 2, 3 }, &rb), &keep);
+        try testing.expectEqual(S.attribute_not_supported, t.general_status);
+    }
+    // Class attributes not served: 0, 4 and 5 (optional lists), 8, 0x14.
+    for ([_]u32{ 0, 4, 5, 8, 0x14, 0x10001 }) |a| {
+        const g = try routed(&target, try cip.getAttributeSingle(class, 0, a, &rb), &keep);
+        try testing.expectEqual(S.attribute_not_supported, g.general_status);
+        try testing.expectEqual(@as(usize, 0), g.data.len);
+    }
+    // Set on the read-only instance (right size and wrong size alike), on the
+    // size attribute, and on the class.
+    const ro = try routed(&target, try cip.setAttributeSingle(class, 100, 3, &.{ 1, 2, 3, 4 }, &rb), &keep);
+    try testing.expectEqual(S.attribute_not_settable, ro.general_status);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &in);
+    const ro_len = try routed(&target, try cip.setAttributeSingle(class, 100, 3, &.{9}, &rb), &keep);
+    try testing.expectEqual(S.attribute_not_settable, ro_len.general_status);
+    const sz = try routed(&target, try cip.setAttributeSingle(class, 150, 4, &.{ 3, 0 }, &rb), &keep);
+    try testing.expectEqual(S.attribute_not_settable, sz.general_status);
+    const ro_size = try routed(&target, try cip.setAttributeSingle(class, 100, 4, &.{ 4, 0 }, &rb), &keep);
+    try testing.expectEqual(S.attribute_not_settable, ro_size.general_status);
+    for ([_]u32{ 1, 2, 3, 6, 7 }) |a| {
+        const c = try routed(&target, try cip.setAttributeSingle(class, 0, a, &.{ 1, 0 }, &rb), &keep);
+        try testing.expectEqual(S.service_not_supported, c.general_status);
+        try testing.expectEqual(@as(u8, 0x10), c.service);
+    }
+    // Wrong sizes on the writable one: 0x13 short, 0x15 long; nothing stored, no hook.
+    for ([_][]const u8{ &.{}, &.{1}, &.{ 1, 2 } }) |v| {
+        const r = try routed(&target, try cip.setAttributeSingle(class, 150, 3, v, &rb), &keep);
+        try testing.expectEqual(S.not_enough_data, r.general_status);
+    }
+    for ([_][]const u8{ &.{ 1, 2, 3, 4 }, &.{ 1, 2, 3, 4, 5, 6 } }) |v| {
+        const r = try routed(&target, try cip.setAttributeSingle(class, 150, 3, v, &rb), &keep);
+        try testing.expectEqual(S.too_much_data, r.general_status);
+    }
+    const long0 = try routed(&target, try cip.setAttributeSingle(class, 7, 3, &.{0}, &rb), &keep);
+    try testing.expectEqual(S.too_much_data, long0.general_status);
+    try testing.expectEqualSlices(u8, &.{ 9, 9, 9 }, &outp);
+    try testing.expectEqual(@as(usize, 0), hooks.sets);
+    // The application's hook can refuse: invalid_attribute_value, octets already stored (OpENer).
+    hooks.accept = false;
+    const bad = try routed(&target, try cip.setAttributeSingle(class, 150, 3, &.{ 4, 5, 6 }, &rb), &keep);
+    try testing.expectEqual(S.invalid_attribute_value, bad.general_status);
+    try testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, &outp);
+    try testing.expectEqual(@as(usize, 1), hooks.sets);
+    // Get_Attributes_All is a service this class does not have, on the class and on instances.
+    for ([_]u32{ 0, 100, 150, 9 }) |inst| {
+        const r = try routed(&target, try cip.getAttributesAll(class, inst, &rb), &keep);
+        try testing.expectEqual(S.service_not_supported, r.general_status);
+        try testing.expectEqual(@as(u8, 0x01), r.service);
+    }
+    // A missing attribute segment is a path segment error.
+    for ([_]u8{ 0x0E, 0x10 }) |svc| {
+        const q = try (cip.Request{ .service = svc, .path = (try epath.logicalPath(class, 100, null, &pb)), .data = &.{} }).encode(&rq);
+        try testing.expectEqual(S.path_segment_error, (try routed(&target, q, &keep)).general_status);
+    }
+    // A path with no instance segment addresses the class: its attribute is
+    // served, and Set is the service the class does not have.
+    const no_inst = [_]u8{ 0x20, 0x04, 0x30, 0x01 };
+    const cg = try (cip.Request{ .service = 0x0E, .path = &no_inst, .data = &.{} }).encode(&rq);
+    const cgr = try routed(&target, cg, &keep);
+    try testing.expectEqual(S.success, cgr.general_status);
+    try testing.expectEqualSlices(u8, &.{ 2, 0 }, cgr.data);
+    const cs = try (cip.Request{ .service = 0x10, .path = &no_inst, .data = &.{ 2, 0 } }).encode(&rq);
+    try testing.expectEqual(S.service_not_supported, (try routed(&target, cs, &keep)).general_status);
+    // Other services stay unsupported, as for every other class.
+    for ([_]u8{ 0x02, 0x03, 0x08, 0x09, 0x0B }) |svc| {
+        const q = try (cip.Request{ .service = svc, .path = (try epath.logicalPath(class, 100, 3, &pb)), .data = &.{} }).encode(&rq);
+        const r = try routed(&target, q, &keep);
+        try testing.expectEqual(S.service_not_supported, r.general_status);
+    }
+}
+
+test "assembly object: withheld without instances, and a buffer too big for the size attribute is not served" {
+    var target = Adapter.init(.{}, &.{});
+    var keep: [512]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    const class = @backingInt(ClassCode.assembly);
+    for ([_]u8{ 0x01, 0x0E }) |svc| {
+        var pb: [16]u8 = undefined;
+        var rq: [64]u8 = undefined;
+        const q = try (cip.Request{ .service = svc, .path = (try epath.logicalPath(class, 1, 3, &pb)), .data = &.{} }).encode(&rq);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, (try routed(&target, q, &keep)).general_status);
+    }
+    // The class itself is withheld too, not just its instances.
+    for ([_]u32{ 1, 2, 3 }) |a| {
+        const c = try routed(&target, try cip.getAttributeSingle(class, 0, a, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, c.general_status);
+    }
+    // Set stays "service not supported" when the class is not served.
+    const s = try routed(&target, try cip.setAttributeSingle(class, 1, 3, &.{1}, &rb), &keep);
+    try testing.expectEqual(cip.GeneralStatus.service_not_supported, s.general_status);
+
+    const big = try testing.allocator.alloc(u8, 65536);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    var ok: [2]u8 = .{ 5, 6 };
+    const list = [_]stdobj.Assembly{
+        .{ .instance = 1, .data = big },
+        .{ .instance = 2, .data = &ok },
+    };
+    var t2 = Adapter.init(.{ .assemblies = &list }, &.{});
+    const g1 = try routed(&t2, try cip.getAttributeSingle(class, 1, 4, &rb), &keep);
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, g1.general_status);
+    const c3 = try routed(&t2, try cip.getAttributeSingle(class, 0, 3, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 1, 0 }, c3.data);
+    const c2 = try routed(&t2, try cip.getAttributeSingle(class, 0, 2, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 2, 0 }, c2.data);
+    // The largest legal one (65535 octets) is served; its size is 0xFFFF.
+    const edge_list = [_]stdobj.Assembly{.{ .instance = 9, .data = big[0..65535] }};
+    var edge = Adapter.init(.{ .assemblies = &edge_list }, &.{});
+    var wide: [128]u8 = undefined;
+    const raw = try edge.messageRouter(try cip.getAttributeSingle(class, 9, 4, &rb), &wide);
+    try testing.expectEqualSlices(u8, &.{ 0x8E, 0, 0, 0, 0xFF, 0xFF }, raw);
+}
+
+test "assembly object: the client and the adapter, round trip" {
+    var in = [4]u8{ 1, 2, 3, 4 };
+    var outp = [3]u8{ 0, 0, 0 };
+    var empty: [0]u8 = .{};
+    var shadow: [1]u8 = .{0};
+    var hooks: AsmHooks = .{};
+    var target = asmTarget(&in, &outp, &hooks, &empty, &shadow);
+    var paired = PairedTransport{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    const class = @backingInt(ClassCode.assembly);
+
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, try c.getAttributeSingle(class, 100, 3));
+    try testing.expectEqualSlices(u8, &.{ 4, 0 }, try c.getAttributeSingle(class, 100, 4));
+    try c.setAttributeSingle(class, 150, 3, &.{ 7, 8, 9 });
+    try testing.expectEqualSlices(u8, &.{ 7, 8, 9 }, &outp);
+    // Read back through the wire (byte 0 is refreshed by the read hook).
+    try testing.expectEqualSlices(u8, &.{ 1, 8, 9 }, try c.getAttributeSingle(class, 150, 3));
+    try testing.expectError(error.CipError, c.setAttributeSingle(class, 100, 3, &.{ 0, 0, 0, 0 }));
+    try testing.expectError(error.CipError, c.setAttributeSingle(class, 150, 3, &.{ 0, 0 }));
+    try testing.expectError(error.CipError, c.getAttributeSingle(class, 151, 3));
+    try testing.expectError(error.CipError, c.getAttributesAll(class, 100));
+    try testing.expectEqualSlices(u8, &.{ 3, 0 }, try c.getAttributeSingle(class, 0, 3));
 }

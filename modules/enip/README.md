@@ -101,7 +101,13 @@ fleet-simulation target.
   apply. The **Ethernet Link object** (`0xF6`, instance 1) serves interface
   speed, interface flags and the MAC address (`Config.ethernet_link`, all
   caller-supplied, read-only); its optional counters answer
-  `attribute_not_supported`.
+  `attribute_not_supported`. The **Assembly object** (`0x04`) serves the
+  instances the caller defines in `Config.assemblies` (an id, a byte buffer,
+  a `writable` flag and optional before-read / after-write hooks): attribute 3
+  (the data) by `Get_Attribute_Single` and, on a writable instance, by
+  `Set_Attribute_Single` with the exact size, attribute 4 (the size) and the
+  class attributes. The buffers are the caller's, so the application and the
+  scanner meet in the same bytes.
 - Hostile input never panics anywhere: an encapsulation length disagreeing
   with the payload, a CPF item count that overruns, an item length pointing
   past the buffer, an EPATH segment running past the path, a symbolic segment

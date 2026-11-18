@@ -171,6 +171,13 @@ pub const Config = struct {
     /// (speed, flags, MAC address). Served by default; `null` withholds it.
     /// It is read-only: `Set_Attribute_Single` on it is `service_not_supported`.
     ethernet_link: ?stdobj.EthLinkConfig = .{},
+    /// The **Assembly** object (class 0x04): the instances a scanner reads
+    /// (and, where `writable`, writes) as raw octets. Empty by default, which
+    /// withholds the class (`path_destination_unknown`); with at least one
+    /// entry the class answers `Get_Attribute_Single` / `Set_Attribute_Single`
+    /// on attributes 3 (data) and 4 (size) and on its class attributes. The
+    /// buffers are the caller's and stay owned by it.
+    assemblies: []const stdobj.Assembly = &.{},
     /// What `ListIdentity` reports as its own socket address.
     socket_address: encap.SocketAddress = .{
         .port = encap.default_tcp_port,
@@ -396,6 +403,11 @@ pub const Adapter = struct {
             @backingInt(cip.Service.set_attribute_single) => {
                 if (class != null and class.? == @backingInt(cip.ClassCode.tcp_ip_interface)) {
                     return self.tcpipSet(req, out);
+                }
+                if (class != null and class.? == @backingInt(cip.ClassCode.assembly) and
+                    self.cfg.assemblies.len != 0)
+                {
+                    return self.assemblySetAttr(req, out);
                 }
                 return errorReply(req.service, .service_not_supported, out);
             },
@@ -625,6 +637,13 @@ pub const Adapter = struct {
         if (class != null and class.? == @backingInt(cip.ClassCode.ethernet_link)) {
             return self.ethLinkGet(req, null, out);
         }
+        // The Assembly class has no Get_Attributes_All service (OpENer
+        // registers only the single-attribute pair on it).
+        if (class != null and class.? == @backingInt(cip.ClassCode.assembly) and
+            self.cfg.assemblies.len != 0)
+        {
+            return errorReply(req.service, .service_not_supported, out);
+        }
         if (class == null or class.? != @backingInt(cip.ClassCode.identity)) {
             return errorReply(req.service, .path_destination_unknown, out);
         }
@@ -661,6 +680,11 @@ pub const Adapter = struct {
         }
         if (class != null and class.? == @backingInt(cip.ClassCode.ethernet_link)) {
             return self.ethLinkGet(req, (epath.findLogical(req.path, .attribute) catch null), out);
+        }
+        if (class != null and class.? == @backingInt(cip.ClassCode.assembly) and
+            self.cfg.assemblies.len != 0)
+        {
+            return self.assemblyGet(req, out);
         }
         if (class == null or class.? != @backingInt(cip.ClassCode.identity)) {
             return errorReply(req.service, .path_destination_unknown, out);
@@ -765,6 +789,58 @@ pub const Adapter = struct {
             .additional_status = &.{},
             .data = body[0..n],
         }).encode(out) catch error.BufferTooSmall;
+    }
+
+    /// The Assembly object (class 0x04): `Get_Attribute_Single` on the class
+    /// (instance 0) or on an instance (attributes 3 and 4).
+    fn assemblyGet(self: *Adapter, req: cip.Request, out: []u8) Error![]const u8 {
+        const instance = (epath.findLogical(req.path, .instance) catch null) orelse 0;
+        const attr = (epath.findLogical(req.path, .attribute) catch null) orelse
+            return errorReply(req.service, .path_segment_error, out);
+        if (instance == 0) {
+            var cb: [2]u8 = undefined;
+            const n = if (attr > std.math.maxInt(u16)) null else stdobj.assemblyClassAttribute(self.cfg.assemblies, @intCast(attr), &cb);
+            return (cip.Reply{
+                .service = req.service,
+                .general_status = if (n == null) .attribute_not_supported else .success,
+                .additional_status = &.{},
+                .data = if (n) |len| cb[0..len] else &.{},
+            }).encode(out) catch error.BufferTooSmall;
+        }
+        const a = stdobj.assemblyFind(self.cfg.assemblies, instance) orelse
+            return errorReply(req.service, .path_destination_unknown, out);
+        var size: [2]u8 = undefined;
+        const value: []const u8 = switch (attr) {
+            stdobj.AssemblyAttr.data => blk: {
+                if (a.before_get) |hook| hook(a.ctx, a.data);
+                break :blk a.data;
+            },
+            stdobj.AssemblyAttr.size => blk: {
+                std.mem.writeInt(u16, &size, @intCast(a.data.len), .little);
+                break :blk &size;
+            },
+            else => return errorReply(req.service, .attribute_not_supported, out),
+        };
+        return (cip.Reply{
+            .service = req.service,
+            .general_status = .success,
+            .additional_status = &.{},
+            .data = value,
+        }).encode(out) catch error.BufferTooSmall;
+    }
+
+    /// `Set_Attribute_Single` on the Assembly class: the class has no such
+    /// service (instance 0, `service_not_supported`); on an instance only
+    /// attribute 3 of a writable one is settable.
+    fn assemblySetAttr(self: *Adapter, req: cip.Request, out: []u8) Error![]const u8 {
+        const instance = (epath.findLogical(req.path, .instance) catch null) orelse 0;
+        if (instance == 0) return errorReply(req.service, .service_not_supported, out);
+        const a = stdobj.assemblyFind(self.cfg.assemblies, instance) orelse
+            return errorReply(req.service, .path_destination_unknown, out);
+        const attr = (epath.findLogical(req.path, .attribute) catch null) orelse
+            return errorReply(req.service, .path_segment_error, out);
+        if (attr > std.math.maxInt(u16)) return errorReply(req.service, .attribute_not_supported, out);
+        return errorReply(req.service, stdobj.assemblySet(a, @intCast(attr), req.data), out);
     }
 
     fn tcpipSet(self: *Adapter, req: cip.Request, out: []u8) Error![]const u8 {

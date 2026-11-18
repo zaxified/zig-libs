@@ -62,6 +62,7 @@ const epath = @import("epath.zig");
 const connmgr = @import("connmgr.zig");
 const types = @import("types.zig");
 const adapter_mod = @import("adapter.zig");
+const stdobj = @import("stdobj.zig");
 
 pub const Direction = enum { to_target, from_target };
 pub const Source = enum { cpppo, pycomm3 };
@@ -1271,6 +1272,56 @@ pub const stdobj_table = [_]DiscoveryGolden{
     .{ .name = "unregister session request", .dir = .to_adapter, .hex = "660000000100a5a5000000005f7079636f6d6d5f00000000" },
 };
 
+// ── Assembly object: a stock pycomm3 CIPDriver reading and writing class 0x04 ─
+//
+// Captured 2026-11-18 the same way as the table above: `pycomm3.CIPDriver.
+// generic_message` (pycomm3 1.2.16, MIT), unconnected and direct, through the
+// recording proxy against `root.zig`'s live test with `ENIP_TEST_ASM=1`
+// (instance 100: four octets `11 22 33 44`, read-only; instance 150: three
+// octets, writable, starting zero). Replies are OUR adapter's, as captured;
+// what pycomm3 anchors is that its own parsers accepted every one: the data
+// and size attributes, the class attributes, and the refusals by name
+// ("Attribute not settable", "Insufficient command data", "Too much data",
+// "Attribute not supported", "Service not supported"). No disagreement found.
+// pycomm3 words general status 0x05 "Destination unknown ... Extended status
+// out of memory (05, 00)": a quirk of its status text (it indexes an extended
+// status that the reply does not carry), not of the octets.
+pub const assembly_table = [_]DiscoveryGolden{
+    .{ .name = "register session request", .dir = .to_adapter, .hex = "6500040000000000000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "register session reply", .dir = .from_adapter, .hex = "650004000100a5a5000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "assembly get data 100 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424643003" },
+    .{ .name = "assembly get data 100 reply", .dir = .from_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008008e00000011223344" },
+    .{ .name = "assembly get size 100 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424643004" },
+    .{ .name = "assembly get size 100 reply", .dir = .from_adapter, .hex = "6f0016000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20006008e0000000400" },
+    .{ .name = "assembly get data 150 before set request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424963003" },
+    .{ .name = "assembly get data 150 before set reply", .dir = .from_adapter, .hex = "6f0017000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20007008e000000000000" },
+    .{ .name = "assembly set data 150 request", .dir = .to_adapter, .hex = "6f001b000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000b001003200424963003a1b2c3" },
+    .{ .name = "assembly set data 150 reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200040090000000" },
+    .{ .name = "assembly get data 150 after set request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424963003" },
+    .{ .name = "assembly get data 150 after set reply", .dir = .from_adapter, .hex = "6f0017000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20007008e000000a1b2c3" },
+    .{ .name = "assembly class revision (attribute 1) request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424003001" },
+    .{ .name = "assembly class revision (attribute 1) reply", .dir = .from_adapter, .hex = "6f0016000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20006008e0000000200" },
+    .{ .name = "assembly class max instance (attribute 2) request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424003002" },
+    .{ .name = "assembly class max instance (attribute 2) reply", .dir = .from_adapter, .hex = "6f0016000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20006008e0000009600" },
+    .{ .name = "assembly class instance count (attribute 3) request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424003003" },
+    .{ .name = "assembly class instance count (attribute 3) reply", .dir = .from_adapter, .hex = "6f0016000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20006008e0000000200" },
+    .{ .name = "assembly set data on a read-only instance (not settable) request", .dir = .to_adapter, .hex = "6f001c000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000c00100320042464300301020304" },
+    .{ .name = "assembly set data on a read-only instance (not settable) reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200040090000e00" },
+    .{ .name = "assembly set data too short (not enough data) request", .dir = .to_adapter, .hex = "6f001a000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000a0010032004249630030102" },
+    .{ .name = "assembly set data too short (not enough data) reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200040090001300" },
+    .{ .name = "assembly set data too long (too much data) request", .dir = .to_adapter, .hex = "6f001c000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000c00100320042496300301020304" },
+    .{ .name = "assembly set data too long (too much data) reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200040090001500" },
+    .{ .name = "assembly get data of an unknown instance request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424653003" },
+    .{ .name = "assembly get data of an unknown instance reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20004008e000500" },
+    .{ .name = "assembly get an unknown attribute request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e03200424643005" },
+    .{ .name = "assembly get an unknown attribute reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20004008e001400" },
+    .{ .name = "assembly set size (not settable) request", .dir = .to_adapter, .hex = "6f001a000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000a0010032004249630040300" },
+    .{ .name = "assembly set size (not settable) reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200040090000e00" },
+    .{ .name = "assembly get attributes all (service not supported) request", .dir = .to_adapter, .hex = "6f0016000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000600010220042464" },
+    .{ .name = "assembly get attributes all (service not supported) reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200040081000800" },
+    .{ .name = "unregister session request", .dir = .to_adapter, .hex = "660000000100a5a5000000005f7079636f6d6d5f00000000" },
+};
+
 /// `revision_major = 1`: symbolic addressing, no external-access attribute.
 pub const discovery_table = [_]DiscoveryGolden{
     .{ .name = "register session request", .dir = .to_adapter, .hex = "6500040000000000000000005f7079636f6d6d5f0000000001000000" },
@@ -1471,6 +1522,34 @@ test "every standard-object golden decodes at the encapsulation layer and re-enc
     var buf: [max_discovery_frame_len]u8 = undefined;
     var round: [max_discovery_frame_len]u8 = undefined;
     for (stdobj_table) |g| {
+        const wire = try bytesOfDiscovery(g, &buf);
+        const msg = try encap.decode(wire);
+        const again = try encap.encode(msg, &round);
+        try testing.expectEqualSlices(u8, wire, again);
+    }
+}
+
+test "a stock pycomm3 CIPDriver reading and writing the Assembly object replays byte-exact" {
+    var input = [4]u8{ 0x11, 0x22, 0x33, 0x44 };
+    var output = [3]u8{ 0, 0, 0 };
+    const list = [_]stdobj.Assembly{
+        .{ .instance = 100, .data = &input },
+        .{ .instance = 150, .data = &output, .writable = true },
+    };
+    var target = adapter_mod.Adapter.init(.{ .assemblies = &list }, &.{});
+
+    const checked = try replayDiscovery(&target, &assembly_table);
+    try testing.expectEqual(@as(usize, 16), checked);
+    try testing.expectEqual(@as(usize, 0), target.identity_requests);
+    // The captured Set landed; the refused ones changed nothing.
+    try testing.expectEqualSlices(u8, &.{ 0xA1, 0xB2, 0xC3 }, &output);
+    try testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0x33, 0x44 }, &input);
+}
+
+test "every Assembly golden decodes at the encapsulation layer and re-encodes exactly" {
+    var buf: [max_discovery_frame_len]u8 = undefined;
+    var round: [max_discovery_frame_len]u8 = undefined;
+    for (assembly_table) |g| {
         const wire = try bytesOfDiscovery(g, &buf);
         const msg = try encap.decode(wire);
         const again = try encap.encode(msg, &round);
