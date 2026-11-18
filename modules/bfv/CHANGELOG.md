@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** constant-time: on baseline x86-64 (`-mcpu=x86_64`) LLVM compiled the mask of `modarith.csub` and `subMod` into a branch (`cmp`/`jb` inside the Shoup NTT butterflies of `RnsPoly.mul`, on secret-key products). ctgrind `keygen` read 292 in-file and `decrypt` 194, against native bounds of 29 and 6; now 4 and 2. Both masks go through an asm `blackBox`, on every target. Results are bit-identical. Bench (`BFV_BENCH=1`, ReleaseFast, native, on a host shared with three other jobs, so noisy): Shoup mulmod 1.01-1.10x, NTT N=256 1.08x, full HomMul (BEHZ) the same or faster on every row; the `rescale/coeff` micro-row 1.25-2.2x slower (SPEC Backlog). ctgrind source digests re-pinned.
 - **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** `stackprobe_test.zig` probes NTT(s) instead of the ternary secret `s` (no 16-byte window of a ternary vector can be a needle) and replays the test PRNG to learn `s` for the sec-set key generation; tests only.
 - **2026-10-18** — Ported to Zig 0.17.0: `std.meta.Int` -> `@Int`; `Fn.params` -> `param_types` (test seam).
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** the stack probe now also runs the security-grade set

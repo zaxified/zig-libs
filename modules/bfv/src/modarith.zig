@@ -53,9 +53,24 @@ pub const max_prime_bits = 62;
 /// or `sbb`, but that is not contractual), and nothing here constrains the
 /// microarchitecture. It removes the *written* data-dependent control flow;
 /// it is not a verified-codegen guarantee.
+///
+/// The mask goes through `blackBox` (2026-11-18): on baseline x86-64
+/// (`-mcpu=x86_64`) LLVM did rematerialise it, as `cmp`/`jb` inside the Shoup
+/// NTT butterflies of `RnsPoly.mul` on the secret key (ctgrind `bfv keygen` 292
+/// in-file, `decrypt` 194). Unconditional, every target.
 pub inline fn csub(x: u64, q: u64) u64 {
-    const mask: u64 = 0 -% @as(u64, @intFromBool(x >= q));
+    const mask: u64 = blackBox(0 -% @as(u64, @intFromBool(x >= q)));
     return x -% (q & mask);
+}
+
+/// Optimization barrier: an empty inline asm, so LLVM loses what it knows
+/// about `x` and cannot turn a masked select back into a branch (the idiom of
+/// `fss/src/dpf.zig` and `hqc/src/reedsolomon.zig`). No-op at runtime.
+inline fn blackBox(x: u64) u64 {
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
 }
 
 pub fn addMod(a: u64, b: u64, q: u64) u64 {
@@ -65,7 +80,7 @@ pub fn addMod(a: u64, b: u64, q: u64) u64 {
 
 pub fn subMod(a: u64, b: u64, q: u64) u64 {
     const d = a -% b;
-    const mask: u64 = 0 -% @as(u64, @intFromBool(a < b));
+    const mask: u64 = blackBox(0 -% @as(u64, @intFromBool(a < b))); // see `csub`
     return d +% (q & mask);
 }
 

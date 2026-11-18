@@ -289,7 +289,7 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   selects the trit with an arithmetic mask, so neither the draw nor the store
   branches on the secret), and the word-arithmetic leaves every secret-bearing
   product routes through (`addMod`/`subMod`/`Modulus.mul`/`Shoup.mul` end in a
-  masked conditional subtract, `modarith.csub`, and the `%q` division that had
+  masked conditional subtract, `modarith.csub` — its mask, and `subMod`'s, laundered through an asm `blackBox` since 2026-11-18, because on baseline x86-64 (`-mcpu=x86_64`) LLVM compiled it to `cmp`/`jb` in the Shoup NTT butterflies on secret-key products: portable ctgrind `keygen` 292 -> 4 in-file, `decrypt` 194 -> 2; native unchanged — and the `%q` division that had
   data-dependent latency on some µarch is gone).
   What is NOT, and is not claimed to be: `powMod`/`invMod`/`primitive2NthRoot`/
   the auxiliary-prime search are public-data setup and remain variable-time;
@@ -343,8 +343,11 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 
 **How it got there.** No external oracle exists for what remains. SEAL/OpenFHE ciphertext layout is implementation-defined; no portable vector exists
 
+**Delta mutation 2026-11-18 (the `csub`/`subMod` barriers; not a whole-module score, the card's last run has no source hash):** 2 mutants, each removing one `blackBox`, i.e. the pre-fix code. Both were KILLED by the portable ctgrind run (`CTGRIND_CPU=x86_64`): `csub` +200 in-file at modarith.zig:58 and `subMod` +88 at :69 in `keygen`. The functional suite cannot see either (the values are identical), so ctgrind is the killing test.
+
 ## Backlog / deferred
 
+- **Rescale loop: restore vectorisation under the CT barrier (vector-select form)** *(2026-11-18)*: since `csub`/`subMod` launder their mask (constant-time fix, CHANGELOG 2026-11-18) the `rescale/coeff` BEHZ-RNS micro-row reads 59.1 -> 131.9 ns at log2 q=36 and 1.25-1.33x slower at q=120..300 (`BFV_BENCH=1`, ReleaseFast, on a shared, noisy host; end-to-end HomMul not slower). Not done: one primitive, always constant-time; a vector-select form would let LLVM vectorise again without a branch. Re-measure on a quiet host first.
 - **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `reduceWide` (per polynomial coefficient). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
