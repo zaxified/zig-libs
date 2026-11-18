@@ -1743,3 +1743,413 @@ test "fuzz: Participant.handle never panics, in any round" {
     }
     try std.testing.fuzz({}, fuzzParticipantSmith, .{ .corpus = seeds.items });
 }
+
+// ── whole-module mutation audit 2026-11-17: killing tests ───────────────
+
+test "initWithPolynomials refuses an invalid config, no honest majority, a bad index and wrong polynomial lengths" {
+    const allocator = testing.allocator;
+    const two = [_]Scalar{ Scalar.one, Scalar.one };
+    const three = [_]Scalar{ Scalar.one, Scalar.one, Scalar.one };
+    // t = 0 has a majority and matching (empty) polynomials: only `valid` refuses it.
+    try testing.expectError(error.InvalidConfig, Participant.initWithPolynomials(allocator, .{ .t = 0, .n = 3 }, 1, &.{}, &.{}));
+    try testing.expectError(error.NoHonestMajority, Participant.initWithPolynomials(allocator, .{ .t = 2, .n = 2 }, 1, &two, &two));
+    try testing.expectError(error.InvalidIndex, Participant.initWithPolynomials(allocator, .{ .t = 2, .n = 3 }, 0, &two, &two));
+    try testing.expectError(error.InvalidIndex, Participant.initWithPolynomials(allocator, .{ .t = 2, .n = 3 }, 4, &two, &two));
+    try testing.expectError(error.InvalidConfig, Participant.initWithPolynomials(allocator, .{ .t = 2, .n = 3 }, 1, &three, &two));
+    try testing.expectError(error.InvalidConfig, Participant.initWithPolynomials(allocator, .{ .t = 2, .n = 3 }, 1, &two, &three));
+    var p = try Participant.initWithPolynomials(allocator, .{ .t = 2, .n = 3 }, 3, &two, &two);
+    p.deinit();
+}
+
+test "start queues one Pedersen broadcast and a share for every other party, the last id included" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5747);
+    var p = try Participant.init(allocator, .{ .t = 2, .n = 4 }, 2, prng.random());
+    defer p.deinit();
+    try p.start();
+    const msgs = try p.takeOutgoing();
+    defer wire.freeOutgoing(allocator, msgs);
+    try testing.expectEqual(@as(usize, 4), msgs.len);
+    var seen: [5]bool = @splat(false);
+    var broadcasts: usize = 0;
+    for (msgs) |m| switch (m.to) {
+        .broadcast => broadcasts += 1,
+        .party => |j| seen[j] = true,
+    };
+    try testing.expectEqual(@as(usize, 1), broadcasts);
+    try testing.expect(seen[1] and !seen[2] and seen[3] and seen[4]);
+}
+
+/// Feeds `p` the frames in `msgs` (from `from`) addressed to it whose kind is `kind`.
+fn feedKind(p: *Participant, from: u32, msgs: []const Outgoing, kind: wire.Kind) !void {
+    for (msgs) |m| {
+        if (m.bytes[0] != @backingInt(kind)) continue;
+        switch (m.to) {
+            .broadcast => {},
+            .party => |j| if (j != p.id()) continue,
+        }
+        try p.handle(from, m.bytes);
+    }
+}
+
+test "allReceived in the shares round: every other dealer's broadcast AND share, the last dealer included" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa11);
+    var net = try TestNet.init(allocator, .{ .t = 2, .n = 4 }, prng.random());
+    defer net.deinit();
+    try net.startAll();
+    var out: [4][]Outgoing = undefined;
+    for (net.parties, &out) |*q, *o| o.* = try q.takeOutgoing();
+    defer for (out) |o| wire.freeOutgoing(allocator, o);
+    const p1 = &net.parties[0];
+    const p2 = &net.parties[1];
+    try testing.expect(!p1.allReceived());
+    // p1: dealers 2 and 3 complete, dealer 4 only its broadcast.
+    for ([_]u32{ 2, 3 }) |d| {
+        try feedKind(p1, d, out[d - 1], .pedersen_broadcast);
+        try feedKind(p1, d, out[d - 1], .share);
+    }
+    try feedKind(p1, 4, out[3], .pedersen_broadcast);
+    try testing.expect(!p1.allReceived());
+    try feedKind(p1, 4, out[3], .share);
+    try testing.expect(p1.allReceived());
+    // p2: dealers 1 and 3 complete, dealer 4 only its share.
+    for ([_]u32{ 1, 3 }) |d| {
+        try feedKind(p2, d, out[d - 1], .pedersen_broadcast);
+        try feedKind(p2, d, out[d - 1], .share);
+    }
+    try feedKind(p2, 4, out[3], .share);
+    try testing.expect(!p2.allReceived());
+    try feedKind(p2, 4, out[3], .pedersen_broadcast);
+    try testing.expect(p2.allReceived());
+}
+
+test "allReceived in the Feldman round: every qualified other dealer, the last one included; a disqualified one is not awaited" {
+    const allocator = testing.allocator;
+    // Party 4 crashed: it is not in QUAL, and its Feldman broadcast never comes.
+    {
+        var prng = std.Random.DefaultPrng.init(0xa12);
+        var net = try TestNet.init(allocator, .{ .t = 2, .n = 4 }, prng.random());
+        defer net.deinit();
+        net.crashed = &.{4};
+        try net.startAll();
+        var guard: usize = 0;
+        while (net.parties[0].phase() != .feldman) : (guard += 1) {
+            try testing.expect(guard < 4);
+            try net.deliverAll();
+            try net.advanceAll();
+        }
+        try testing.expect(!net.parties[0].qual().?[3]);
+        var out: [3][]Outgoing = undefined;
+        for (net.parties[0..3], &out) |*q, *o| o.* = try q.takeOutgoing();
+        defer for (out) |o| wire.freeOutgoing(allocator, o);
+        const p1 = &net.parties[0];
+        try testing.expect(!p1.allReceived());
+        try feedKind(p1, 2, out[1], .feldman_broadcast);
+        try testing.expect(!p1.allReceived());
+        try feedKind(p1, 3, out[2], .feldman_broadcast);
+        try testing.expect(p1.allReceived());
+        try testing.expectError(error.DuplicateMessage, feedKind(p1, 3, out[2], .feldman_broadcast));
+    }
+    // Everybody qualified: the last dealer (4) is awaited too.
+    {
+        var prng = std.Random.DefaultPrng.init(0xa13);
+        var net = try TestNet.init(allocator, .{ .t = 2, .n = 4 }, prng.random());
+        defer net.deinit();
+        try net.startAll();
+        var guard: usize = 0;
+        while (net.parties[0].phase() != .feldman) : (guard += 1) {
+            try testing.expect(guard < 4);
+            try net.deliverAll();
+            try net.advanceAll();
+        }
+        var out: [4][]Outgoing = undefined;
+        for (net.parties, &out) |*q, *o| o.* = try q.takeOutgoing();
+        defer for (out) |o| wire.freeOutgoing(allocator, o);
+        const p1 = &net.parties[0];
+        try feedKind(p1, 2, out[1], .feldman_broadcast);
+        try feedKind(p1, 3, out[2], .feldman_broadcast);
+        try testing.expect(!p1.allReceived());
+        try feedKind(p1, 4, out[3], .feldman_broadcast);
+        try testing.expect(p1.allReceived());
+    }
+}
+
+test "a Pedersen broadcast with t + 1 commitments (self-consistent length) is Malformed" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa14);
+    var p1 = try Participant.init(allocator, .{ .t = 2, .n = 3 }, 1, prng.random());
+    defer p1.deinit();
+    try p1.start();
+    wire.freeOutgoing(allocator, try p1.takeOutgoing());
+    const g = try commit.feldmanEvalShare(&Scalar.one);
+    var cs = [_]Element{ g, g, g };
+    const pb: types.PedersenBroadcast = .{ .dealer = 2, .commitments = &cs };
+    const body = try pb.toBytesAlloc(allocator);
+    defer allocator.free(body);
+    const fr = try wire.frame(allocator, .pedersen_broadcast, body);
+    defer allocator.free(fr);
+    try testing.expectError(error.Malformed, p1.handle(2, fr));
+    try testing.expect(p1.ped[1] == null);
+}
+
+test "a complaint naming dealer 0 is Malformed" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa15);
+    var net = try TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
+    defer net.deinit();
+    try net.startAll();
+    try net.deliverAll();
+    try net.advanceAll();
+    try testing.expectEqual(Phase.complaints, net.parties[0].phase());
+    const c: Complaint = .{ .complainant = 2, .accused = 0 };
+    var fr: [1 + Complaint.encoded_length]u8 = undefined;
+    fr[0] = @backingInt(wire.Kind.complaint);
+    fr[1..].* = c.toBytes();
+    try testing.expectError(error.Malformed, net.parties[0].handle(2, &fr));
+}
+
+test "complaints from one complainant about two dealers are two complaints; a defense naming complainant 0 is Malformed, a repeated one a duplicate" {
+    const allocator = testing.allocator;
+    {
+        var prng = std.Random.DefaultPrng.init(0xa16);
+        var net = try TestNet.init(allocator, .{ .t = 2, .n = 4 }, prng.random());
+        defer net.deinit();
+        try net.startAll();
+        try net.deliverAll();
+        try net.advanceAll();
+        const p1 = &net.parties[0];
+        try testing.expectEqual(Phase.complaints, p1.phase());
+        var fr: [1 + Complaint.encoded_length]u8 = undefined;
+        fr[0] = @backingInt(wire.Kind.complaint);
+        for ([_]u32{ 3, 4 }) |accused| {
+            const c: Complaint = .{ .complainant = 2, .accused = accused };
+            fr[1..].* = c.toBytes();
+            try p1.handle(2, &fr);
+        }
+        try testing.expectEqual(@as(usize, 2), p1.complaints.items.len);
+        try testing.expectError(error.DuplicateMessage, p1.handle(2, &fr));
+    }
+    var prng = std.Random.DefaultPrng.init(0xa17);
+    var net = try TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
+    defer net.deinit();
+    net.filter = tamperShare1to2;
+    try net.startAll();
+    try net.deliverAll();
+    try net.advanceAll();
+    try net.deliverAll();
+    try net.advanceAll();
+    const p3 = &net.parties[2];
+    try testing.expectEqual(Phase.defenses, p3.phase());
+    const msgs = try net.parties[0].takeOutgoing();
+    defer wire.freeOutgoing(allocator, msgs);
+    var defense: ?[]const u8 = null;
+    for (msgs) |m| if (m.bytes[0] == @backingInt(wire.Kind.defense)) {
+        defense = m.bytes;
+    };
+    const d = defense.?;
+    const zero = try allocator.dupe(u8, d);
+    defer allocator.free(zero);
+    std.mem.writeInt(u32, zero[1 + 4 ..][0..4], 0, .big);
+    try testing.expectError(error.Malformed, p3.handle(1, zero));
+    std.mem.writeInt(u32, zero[1 + 4 ..][0..4], 4, .big);
+    try testing.expectError(error.Malformed, p3.handle(1, zero));
+    // The body names dealer 2, the transport says dealer 1.
+    const other = try allocator.dupe(u8, d);
+    defer allocator.free(other);
+    std.mem.writeInt(u32, other[1..][0..4], 2, .big);
+    try testing.expectError(error.SenderMismatch, p3.handle(1, other));
+    try p3.handle(1, d);
+    try testing.expectError(error.DuplicateMessage, p3.handle(1, d));
+}
+
+/// Deliver and advance `net` until party 1 is in `want` (at most 6 rounds).
+fn driveTo(net: *TestNet, want: Phase) !void {
+    var guard: usize = 0;
+    while (net.parties[0].phase() != want) : (guard += 1) {
+        try testing.expect(guard < 6);
+        try net.deliverAll();
+        try net.advanceAll();
+    }
+}
+
+test "a Feldman complaint naming dealer 0 is Malformed" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa18);
+    var net = try TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
+    defer net.deinit();
+    try net.startAll();
+    try driveTo(&net, .feldman_complaints);
+    const p1 = &net.parties[0];
+    const m: types.ShareMsg = .{ .dealer = 0, .receiver = 2, .s = Scalar.one, .s_prime = Scalar.one };
+    var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
+    fr[0] = @backingInt(wire.Kind.feldman_complaint);
+    fr[1..].* = m.toBytes();
+    try testing.expectError(error.Malformed, p1.handle(2, &fr));
+}
+
+fn tamperFeldmanOf1(from: u32, _: u32, bytes: []u8) Action {
+    if (from == 1 and bytes[0] == @backingInt(wire.Kind.feldman_broadcast)) {
+        @memcpy(bytes[1 + 8 + Ne ..][0..Ne], bytes[1 + 8 ..][0..Ne]);
+    }
+    return .deliver;
+}
+
+test "dealer 1 (the lowest id) with wrong Feldman commitments is exposed and reconstructed too" {
+    const allocator = testing.allocator;
+    const cfg: Config = .{ .t = 2, .n = 3 };
+    const clean = try cleanOutputs(allocator, cfg, 19);
+    defer freeOutputs(allocator, clean);
+    var prng = std.Random.DefaultPrng.init(19);
+    var net = try TestNet.init(allocator, cfg, prng.random());
+    defer net.deinit();
+    net.filter = tamperFeldmanOf1;
+    try net.run();
+    for (net.parties) |*p| try testing.expectEqual(Phase.done, p.phase());
+    const outs = try net.outputs();
+    defer freeOutputs(allocator, outs);
+    try expectSameOutputs(clean, outs);
+    for ([_]usize{ 1, 2 }) |i| {
+        const ex = net.parties[i].exposedDealers().?;
+        try testing.expect(ex[0] and !ex[1] and !ex[2]);
+    }
+}
+
+fn tamperFeldmanOf2ToParty1(from: u32, to: u32, bytes: []u8) Action {
+    if (to == 1) return tamperFeldmanOf2(from, to, bytes);
+    return .deliver;
+}
+
+test "a party whose own Feldman check fails exposes the dealer itself (its complaint never comes back to it)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa19);
+    var net = try TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
+    defer net.deinit();
+    net.filter = tamperFeldmanOf2ToParty1;
+    try net.startAll();
+    try driveTo(&net, .feldman_complaints);
+    try testing.expect(net.parties[0].exposed[1]);
+    try testing.expect(!net.parties[2].exposed[1]);
+}
+
+/// Hands out every new allocation filled with 0xff (fresh pages are zero, so a
+/// field the code forgets to initialise would otherwise read as false / null).
+const DirtyAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *DirtyAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *DirtyAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ret) orelse return null;
+        @memset(p[0..len], 0xff);
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const self: *DirtyAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *DirtyAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret);
+    }
+};
+
+test "dirty allocations do not change a run with an absent dealer" {
+    const allocator = testing.allocator;
+    const cfg: Config = .{ .t = 2, .n = 4 };
+    var outs: [2][]DkgShareOutput = undefined;
+    for (&outs, 0..) |*o, k| {
+        var dirty: DirtyAllocator = .{ .child = allocator };
+        var prng = std.Random.DefaultPrng.init(0xa1a);
+        var net = try TestNet.init(if (k == 0) allocator else dirty.allocator(), cfg, prng.random());
+        defer net.deinit();
+        net.crashed = &.{4};
+        try net.run();
+        for (net.parties[0..3]) |*p| try testing.expectEqual(Phase.done, p.phase());
+        o.* = try net.outputs();
+    }
+    defer for (outs) |o| freeOutputs(allocator, o);
+    try expectSameOutputs(outs[0], outs[1]);
+}
+
+test "a party that finds itself exposed aborts naming itself" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa1b);
+    var net = try TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
+    defer net.deinit();
+    try net.startAll();
+    try driveTo(&net, .feldman_complaints);
+    const p1 = &net.parties[0];
+    // No valid complaint can name an honest dealer: poke the state.
+    p1.exposed[0] = true;
+    try testing.expectError(error.Inconsistent, p1.advance());
+    try testing.expectEqual(Phase.aborted, p1.phase());
+    try testing.expectEqual(@as(?u32, 1), p1.culprit());
+}
+
+test "reveals: one naming dealer 0 is Malformed; a reconstruction that misses our own share aborts" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa1c);
+    var net = try TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
+    defer net.deinit();
+    net.filter = tamperFeldmanOf2;
+    try net.startAll();
+    try driveTo(&net, .reveals);
+    const p1 = &net.parties[0];
+    const p3 = &net.parties[2];
+    var m: types.ShareMsg = .{ .dealer = 0, .receiver = 3, .s = Scalar.one, .s_prime = Scalar.one };
+    var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
+    fr[0] = @backingInt(wire.Kind.reveal);
+    fr[1..].* = m.toBytes();
+    try testing.expectError(error.Malformed, p1.handle(3, &fr));
+    m = .{ .dealer = 2, .receiver = 3, .s = p3.accepted[1].?, .s_prime = p3.accepted_sp[1].? };
+    fr[1..].* = m.toBytes();
+    try p1.handle(3, &fr);
+    // Binding makes this unreachable in a run: poke our own share.
+    p1.accepted[1] = p1.accepted[1].?.add(Scalar.one);
+    try testing.expectError(error.Inconsistent, p1.advance());
+    try testing.expectEqual(@as(?u32, 2), p1.culprit());
+}
+
+test "every other dealer absent and ourselves disqualified: EmptyQual" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa1d);
+    var p1 = try Participant.init(allocator, .{ .t = 1, .n = 3 }, 1, prng.random());
+    defer p1.deinit();
+    try p1.start();
+    try p1.advance();
+    try testing.expectEqual(Phase.complaints, p1.phase());
+    var fr: [1 + Complaint.encoded_length]u8 = undefined;
+    fr[0] = @backingInt(wire.Kind.complaint);
+    for ([_]u32{ 2, 3 }) |c| {
+        fr[1..].* = (Complaint{ .complainant = c, .accused = 1 }).toBytes();
+        try p1.handle(c, &fr);
+    }
+    try p1.advance();
+    try testing.expectError(error.EmptyQual, p1.advance());
+}
+
+fn dropFeldmanOf1To3(from: u32, to: u32, bytes: []u8) Action {
+    return if (from == 1 and to == 3 and bytes[0] == @backingInt(wire.Kind.feldman_broadcast)) .drop else .deliver;
+}
+
+test "a Feldman complaint against dealer 1 (the lowest id) is accepted" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xa1e);
+    var net = try TestNet.init(allocator, .{ .t = 2, .n = 3 }, prng.random());
+    defer net.deinit();
+    net.filter = dropFeldmanOf1To3;
+    try net.startAll();
+    try driveTo(&net, .feldman_complaints);
+    const p2 = &net.parties[1];
+    const p3 = &net.parties[2];
+    try testing.expectEqual(Phase.feldman_complaints, p3.phase());
+    const m: types.ShareMsg = .{ .dealer = 1, .receiver = 2, .s = p2.accepted[0].?, .s_prime = p2.accepted_sp[0].? };
+    var fr: [1 + types.ShareMsg.encoded_length]u8 = undefined;
+    fr[0] = @backingInt(wire.Kind.feldman_complaint);
+    fr[1..].* = m.toBytes();
+    try p3.handle(2, &fr);
+    try testing.expect(p3.exposed[0]);
+}

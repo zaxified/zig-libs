@@ -133,3 +133,11 @@ fn commitScalar(v: u32) Scalar {
 fn pointOf(s: Scalar) !Element {
     return Element.fromPoint(try Secp256k1.basePoint.mul(s.toBytes(.big), .big));
 }
+
+test "allSameQ: no outputs agree vacuously" {
+    try std.testing.expect(allSameQ(&.{}));
+}
+
+test "reconstructsToQ: no shares is false" {
+    try std.testing.expect(!try reconstructsToQ(std.testing.allocator, &.{}));
+}

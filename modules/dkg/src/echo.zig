@@ -255,3 +255,18 @@ test "echo: wraps the real DKG flow — round-1 frames agree at every party" {
     try echo[1].check(1, d0);
     try echo[2].check(1, d0);
 }
+
+test "echo: more than 2^32-1 participants is refused before any slot is touched" {
+    // Never dereferenced: init must refuse on the lengths alone.
+    const huge: usize = @as(usize, std.math.maxInt(u32)) + 1;
+    const ids: [*]const u32 = @ptrFromInt(0x1000);
+    const slots: [*]Slot = @ptrFromInt(0x1000);
+    try testing.expectError(error.BadParticipants, EchoBroadcast.init("r", ids[0..huge], slots[0..huge]));
+}
+
+test "echo: a round label longer than 2^32-1 is refused; exactly 2^32-1 is not" {
+    const label: [*]const u8 = @ptrFromInt(0x1000);
+    var slots: [1]Slot = undefined;
+    try testing.expectError(error.BadParticipants, EchoBroadcast.init(label[0 .. @as(usize, std.math.maxInt(u32)) + 1], &.{7}, &slots));
+    _ = try EchoBroadcast.init(label[0..std.math.maxInt(u32)], &.{7}, &slots);
+}

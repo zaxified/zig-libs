@@ -348,3 +348,48 @@ test "computeQual: undefended complaint, >t distinct complainers, dedup, EmptyQu
         .{ .complainant = 1, .accused = 4 },
     }, &.{ false, false, false, false }));
 }
+
+// Whole-module mutation audit 2026-11-17: the guards the drivers never reach.
+test "computeQual: an accused id outside 1..n is ignored, and dedup is per accused dealer" {
+    const testing = std.testing;
+    const cfg: Config = .{ .t = 2, .n = 4 };
+    var qual: [4]bool = undefined;
+    // Undefended complaints naming no dealer (0, n+1) disqualify nobody.
+    try computeQual(&qual, cfg, &.{
+        .{ .complainant = 1, .accused = 0 },
+        .{ .complainant = 2, .accused = 5 },
+    }, &.{ false, false });
+    for (qual) |q| try testing.expect(q);
+    // Complainant 1 complained about dealer 1 first; its complaint about
+    // dealer 2 is still a distinct one for dealer 2: three distinct
+    // complainers (> t) evict dealer 2.
+    try computeQual(&qual, cfg, &.{
+        .{ .complainant = 1, .accused = 1 },
+        .{ .complainant = 1, .accused = 2 },
+        .{ .complainant = 3, .accused = 2 },
+        .{ .complainant = 4, .accused = 2 },
+    }, &.{ true, true, true, true });
+    try testing.expect(qual[0]);
+    try testing.expect(!qual[1]);
+}
+
+test "deriveGroupPublicKey / combineKeyShare: length mismatches and an empty QUAL are errors" {
+    const testing = std.testing;
+    const g = try commit.feldmanEvalShare(&Scalar.one);
+    try testing.expectError(error.LengthMismatch, deriveGroupPublicKey(&.{ true, true }, &.{g}));
+    try testing.expectError(error.EmptyQual, deriveGroupPublicKey(&.{ false, false }, &.{ g, g }));
+    var out: Scalar = Scalar.one;
+    try testing.expectError(error.LengthMismatch, combineKeyShare(&.{ true, true }, &.{Scalar.one}, &out));
+    try testing.expectError(error.EmptyQual, combineKeyShare(&.{ false, false }, &.{ Scalar.one, Scalar.one }, &out));
+    try testing.expectError(error.LengthMismatch, combineKeyShare(&.{ true, false }, &.{ null, Scalar.one }, &out));
+    // Only QUAL dealers' shares are summed.
+    try combineKeyShare(&.{ true, false, true }, &.{ Scalar.one, Scalar.one, Scalar.one }, &out);
+    try testing.expectEqual(Scalar.one.add(Scalar.one).toBytes(.big), out.toBytes(.big));
+}
+
+test "verifyPedersenShare / verifyFeldmanShare: an empty commitment vector is a reject, not a panic" {
+    const testing = std.testing;
+    const s = Scalar.one;
+    try testing.expect(!verifyPedersenShare(&.{}, 1, &s, &s, commit.pedersenH()));
+    try testing.expect(!verifyFeldmanShare(&.{}, 1, &s));
+}

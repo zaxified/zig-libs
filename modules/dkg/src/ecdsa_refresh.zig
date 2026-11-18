@@ -72,6 +72,8 @@ const init_stack_burn = 192 * 1024;
 const start_stack_burn = 1984 * 1024;
 const handle_stack_burn = 768 * 1024;
 const advance_stack_burn = 1408 * 1024;
+// takeKeyShare: measured 367 B dirty in a mutation-schemata build (2026-11-17).
+const take_key_share_stack_burn = 2 * 1024;
 
 const aux_info = tecdsa.aux_info;
 const fac_proof = tecdsa.fac_proof;
@@ -277,6 +279,12 @@ pub const EcdsaRefresh = struct {
     /// this struct's memory. Out-param, not a return value: a `KeyShare`
     /// returned by value leaves a copy in the caller's frame.
     pub fn takeKeyShare(self: *EcdsaRefresh, out: *tecdsa.KeyShare) bool {
+        const result = takeKeyShareUnburned(self, out);
+        burn.stack(take_key_share_stack_burn);
+        return result;
+    }
+
+    noinline fn takeKeyShareUnburned(self: *EcdsaRefresh, out: *tecdsa.KeyShare) bool {
         if (self.phase_ != .done) return false;
         if (self.share == null) return false;
         out.* = self.share.?;
@@ -653,10 +661,35 @@ fn runAll(comptime P: type, allocator: std.mem.Allocator, parties: []P, drop: ?*
                 };
             };
         }
+        if (P == EcdsaRefresh) for (parties) |*p| if (p.phase() == .confirm) try confirmGuards(allocator, p, true);
         if (std.mem.eql(u8, @tagName(parties[0].phase()), "done")) break;
         for (parties) |*p| try p.advance();
+        // Nobody queues a frame for itself (a Πfac for its own modulus, say).
+        for (parties, 1..) |*p, me| for (p.outbox.items) |m| switch (m.to) {
+            .party => |to| try testing.expect(to != me),
+            .broadcast => {},
+        };
+        if (P == EcdsaRefresh) for (parties) |*p| if (p.phase() == .confirm) try confirmGuards(allocator, p, false);
     }
     return refused;
+}
+
+/// In the confirmation round every other round's frame is out of round; a
+/// confirmation of the wrong length is Malformed, a second one a duplicate
+/// (mutation audit 2026-11-17).
+fn confirmGuards(allocator: std.mem.Allocator, p: *EcdsaRefresh, peers_confirmed: bool) !void {
+    const peer: u32 = p.me % 3 + 1;
+    var list: std.ArrayList(Outgoing) = .empty;
+    defer {
+        for (list.items) |m| m.deinit(allocator);
+        list.deinit(allocator);
+    }
+    const kinds = [_]wire.Kind{ .ecdsa_announcement, .ecdsa_fac_proof, .reshare_broadcast, .reshare_share, .reshare_complaint, .reshare_defense };
+    for (kinds) |k| try ecdsa_keygen.pushTagged(&list, allocator, p.tag, .broadcast, k, "x");
+    for (list.items) |m| try testing.expectError(error.WrongRound, p.handle(peer, m.bytes));
+    const body: [33]u8 = @splat(0);
+    try ecdsa_keygen.pushTagged(&list, allocator, p.tag, .broadcast, .ecdsa_confirm, if (peers_confirmed) &body else body[0..2]);
+    try testing.expectError(if (peers_confirmed) error.DuplicateMessage else error.Malformed, p.handle(peer, list.items[kinds.len].bytes));
 }
 
 fn keygen(allocator: std.mem.Allocator, random: std.Random, locals: []aux_info.LocalAux, sid: []const u8) ![3]tecdsa.KeyShare {
@@ -687,7 +720,14 @@ fn refresh(allocator: std.mem.Allocator, random: std.Random, old: []const tecdsa
         if (excluded) |x| try testing.expect(std.mem.findScalar(u32, used, x) == null);
     }
     var out: [3]tecdsa.KeyShare = undefined;
-    for (&parties, &out) |*p, *s| try testing.expect(p.takeKeyShare(s));
+    for (&parties, &out) |*p, *s| {
+        try testing.expect(p.takeKeyShare(s));
+        // The party's own copy is wiped, not just set to null.
+        try testing.expect(std.mem.find(u8, std.mem.asBytes(&p.share), std.mem.asBytes(&s.secret_share)) == null);
+        try testing.expect(std.mem.find(u8, std.mem.asBytes(&p.share), &s.message_seed) == null);
+        var again: tecdsa.KeyShare = undefined;
+        try testing.expect(!p.takeKeyShare(&again));
+    }
     return out;
 }
 
@@ -855,8 +895,11 @@ test "refresh: a missing or replayed announcement aborts the round, naming the c
         defer wire.freeOutgoing(allocator, from3);
         try parties[2].handle(2, from1[0].bytes);
         try parties[2].handle(1, from1[0].bytes);
+        try testing.expectError(error.DuplicateMessage, parties[2].handle(1, from1[0].bytes));
         try testing.expectError(error.InvalidAnnouncement, parties[2].advance());
         try testing.expectEqual(@as(?u32, 2), parties[2].culprit());
+        try testing.expectEqual(Phase.aborted, parties[2].phase());
+        try testing.expectError(error.Aborted, parties[2].advance());
         try parties[0].handle(3, from3[0].bytes);
         try testing.expectError(error.MissingMessage, parties[0].advance());
         try testing.expectEqual(@as(?u32, 2), parties[0].culprit());
@@ -889,6 +932,16 @@ test "refresh: a lost or tampered Πfac proof aborts the round, naming the culpr
                 return true;
             }
         }.f);
+        {
+            // A second Πfac frame from party 2 is a duplicate, whatever it holds.
+            var list: std.ArrayList(Outgoing) = .empty;
+            defer {
+                for (list.items) |m| m.deinit(allocator);
+                list.deinit(allocator);
+            }
+            try ecdsa_keygen.pushTagged(&list, allocator, parties[2].tag, .broadcast, .ecdsa_fac_proof, "x");
+            try testing.expectError(error.DuplicateMessage, parties[2].handle(2, list.items[0].bytes));
+        }
         try testing.expectError(error.MissingMessage, parties[0].advance());
         try testing.expectEqual(@as(?u32, 2), parties[0].culprit());
         try testing.expectError(error.InvalidFactorProof, parties[2].advance());
@@ -1008,6 +1061,8 @@ test "refresh: parties that end with different key tables abort in the confirmat
         try testing.expect(!p.takeKeyShare(&scratch));
         if (e) |err| {
             if (err == error.ConfirmationMismatch) mismatches += 1;
+            // A missing or different confirmation names its party.
+            if (err == error.MissingMessage or err == error.ConfirmationMismatch) try testing.expect(p.culprit() != null);
         }
     }
     try testing.expect(mismatches >= 1);
@@ -1060,4 +1115,67 @@ test "refresh: aux material of the old table is refused, from this party and fro
         try testing.expectError(error.StaleAuxMaterial, p1.advance());
         try testing.expectEqual(@as(?u32, 2), p1.culprit());
     }
+}
+
+test "refresh: an empty session id, start twice, frames of other rounds, an empty frame and sender ids 0 / n+1 are refused (mutation audit)" {
+    const allocator = testing.allocator;
+    const f = try keygenFixture();
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0010);
+    const random = prng.random();
+    var local = try quickLocal(allocator, random);
+    defer local.deinit(allocator);
+    try testing.expectError(error.EmptySessionId, EcdsaRefresh.init(allocator, &f.old[0], "", &local, random));
+    var p = try EcdsaRefresh.init(allocator, &f.old[0], "guards", &local, random);
+    defer p.deinit();
+    var list: std.ArrayList(Outgoing) = .empty;
+    defer {
+        for (list.items) |m| m.deinit(allocator);
+        list.deinit(allocator);
+    }
+    const kinds = [_]wire.Kind{ .ecdsa_announcement, .ecdsa_fac_proof, .reshare_broadcast, .reshare_share, .reshare_complaint, .reshare_defense, .ecdsa_confirm };
+    for (kinds) |k| try ecdsa_keygen.pushTagged(&list, allocator, p.tag, .broadcast, k, "x");
+    try ecdsa_keygen.pushTagged(&list, allocator, p.tag, .broadcast, .ecdsa_announcement, "");
+    const empty = list.items[kinds.len].bytes[0..ecdsa_keygen.run_tag_len];
+    // Before start every frame is out of round.
+    try testing.expectError(error.WrongRound, p.handle(2, list.items[0].bytes));
+    try p.start();
+    try testing.expectError(error.WrongRound, p.start());
+    try testing.expectError(error.Malformed, p.handle(2, empty));
+    try testing.expectError(error.UnknownSender, p.handle(0, list.items[0].bytes));
+    try testing.expectError(error.UnknownSender, p.handle(4, list.items[0].bytes));
+    try testing.expectError(error.UnknownSender, p.handle(1, list.items[0].bytes)); // ourselves
+    // In the announce round, every other round's frame.
+    for (list.items[1..kinds.len]) |m| try testing.expectError(error.WrongRound, p.handle(2, m.bytes));
+}
+
+test "refresh: a confirmation that never arrives aborts the round, naming the silent party (mutation audit)" {
+    const allocator = testing.allocator;
+    const fx = try keygenFixture();
+    var prng = std.Random.DefaultPrng.init(0xEC_0EF5_0011);
+    const random = prng.random();
+    var locals: [3]aux_info.LocalAux = undefined;
+    var made: usize = 0;
+    defer for (locals[0..made]) |*l| l.deinit(allocator);
+    while (made < 3) : (made += 1) locals[made] = try quickLocal(allocator, random);
+    var parties: [3]EcdsaRefresh = undefined;
+    var inited: usize = 0;
+    defer for (parties[0..inited]) |*p| p.deinit();
+    while (inited < 3) : (inited += 1) parties[inited] = try EcdsaRefresh.init(allocator, &fx.old[inited], "refresh-silent-confirm", &locals[inited], random);
+    for (&parties) |*p| try p.start();
+    const drop3to1 = struct {
+        fn f(from: u32, to: u32, bytes: []u8) bool {
+            return !(from == 3 and to == 1 and bytes[ecdsa_keygen.run_tag_len] == @backingInt(wire.Kind.ecdsa_confirm));
+        }
+    }.f;
+    var rounds: usize = 0;
+    while (parties[0].phase() != .confirm) : (rounds += 1) {
+        try testing.expect(rounds < 8);
+        try deliverAll(allocator, &parties, drop3to1);
+        for (&parties) |*p| try p.advance();
+    }
+    try deliverAll(allocator, &parties, drop3to1);
+    try testing.expectError(error.MissingMessage, parties[0].advance());
+    try testing.expectEqual(@as(?u32, 3), parties[0].culprit());
+    try parties[1].advance();
+    try testing.expectEqual(Phase.done, parties[1].phase());
 }

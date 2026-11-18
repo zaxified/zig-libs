@@ -380,3 +380,25 @@ test {
     _ = snapshot;
     _ = @import("stackprobe_test.zig");
 }
+
+test "assembleKeyShares: a Paillier-key or message-seed list of the wrong length is LengthMismatch" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xD16_1006);
+    const outs = try Dkg.run(allocator, .{ .t = 2, .n = 3 }, .{}, prng.random());
+    defer {
+        for (outs) |*o| o.deinit();
+        allocator.free(outs);
+    }
+    // Never read: the lengths are checked first.
+    var keys: [3]paillier.KeyPair = undefined;
+    var aux: [3]tecdsa.AuxParams = undefined;
+    var seeds: [3][32]u8 = undefined;
+    try testing.expectError(error.LengthMismatch, assembleKeyShares(allocator, outs, 2, keys[0..2], &aux, &seeds));
+    try testing.expectError(error.LengthMismatch, assembleKeyShares(allocator, outs, 2, &keys, &aux, seeds[0..2]));
+    try testing.expectError(error.LengthMismatch, assembleKeyShares(allocator, outs, 2, &keys, aux[0..2], &seeds));
+    // Outputs out of index order.
+    @memset(std.mem.sliceAsBytes(&seeds), 0);
+    var swapped: [3]DkgShareOutput = .{ outs[1], outs[0], outs[2] };
+    try testing.expectError(error.IndexMismatch, assembleKeyShares(allocator, &swapped, 2, &keys, &aux, &seeds));
+}
