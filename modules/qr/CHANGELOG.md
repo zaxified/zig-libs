@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **Behaviour change:** the mask penalty's rule 4 uses the exact dark share (`k = |dark*20 - total*10| / total`) instead of an integer percent, which overstated the deviation below 50% by up to one point, so the automatically chosen mask can differ for some inputs (ISO/IEC 18004 Table 11, ZXing, nayuki and segno use the exact share). Symbols stay valid and decode the same; the segno goldens did not move. Whole-module mutation (490 mutants, 458 killed, 32 equivalent) with 17 new tests; see SPEC "Audit 2026-11-17".
+
 - **2026-11-16** — **Mixed-mode segments.** New opt-in `Options.optimize_segments` (default false: default output unchanged) splits the text into numeric / alphanumeric / byte segments by an exact dynamic program over the three modes (mode indicator, version-range character-count width, per-mode data bits), choosing the version like the single-mode loop; never a larger version than the default. Combined with a forced `mode` or `eci` it is `error.ModeMismatch` (no new error); `encodeSequence` ignores it; text over 7089 bytes is `TooLong`. The decoder already read segment lists. Tests: hand-counted bit length, version win, round trips for all ECC levels, only-fits-with-mixing payload. `buildCodewords` split into `putSegment` + `buildBlocks` (internal).
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the example names `error.BadEci` in its exhaustive error switch (it
   stopped compiling when ECI support added the error).
