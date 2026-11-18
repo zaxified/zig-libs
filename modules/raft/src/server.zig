@@ -1062,10 +1062,12 @@ test "real: a crashed server restarts from its disk alone and the cluster stays 
 //
 // One server of the cluster also sends, every `period`, an AppendEntries to
 // every peer whose entries exceed the cap — at its own current term, from
-// index 1, so a receiver that ACCEPTED one would adopt the term, truncate its
-// log and append the hostile entries (Log Matching / State Machine Safety
-// would trip). The receivers must drop every one (counted in
-// `malformedDropped`), and the cluster must stay safe and keep committing.
+// index 1. The receivers must drop every one (counted in `malformedDropped`),
+// and the cluster must stay safe and keep committing. What pins the refusal
+// is the COUNTER, not the invariants: measured 2026-11-18 (mutation run, the
+// follower's cap check removed), the accepted hostile entries were repaired
+// by the honest leader's walk-back before any of the five properties could
+// see them, and only `received == malformedDropped()` failed.
 
 const HostilePeer = struct {
     srv: *RaftServer,

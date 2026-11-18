@@ -1311,12 +1311,61 @@ test "in-flight window: at the cap the leader sends heartbeats only; acks free i
     try node.sendAppend(1);
     try testing.expectEqual(@as(u32, 2), node.infl_count[1]);
 
+    // An ack that PROGRESSES but covers none of the in-flight batches (they
+    // carry 5..8; it confirms 6) frees nothing: the window stays full and the
+    // stream continues with a heartbeat (etcd frees one slot only on a
+    // heartbeat response, never on an append progress).
+    from = node.msgs.items.len;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 6 } } });
+    try testing.expectEqual(@as(LogIndex, 6), node.match[1]);
+    try testing.expectEqual(@as(u32, 2), node.infl_count[1]);
+    try testing.expectEqualSlices(usize, &.{0}, batchesTo(&node, 1, from, &out));
+
     // A rejection empties it (the follower goes back to probing).
     node.next[1] = 9;
     from = node.msgs.items.len;
     try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = false, .index = 6 } } });
     try testing.expectEqualSlices(usize, &.{4}, batchesTo(&node, 1, from, &out)); // the retry
     try testing.expectEqual(@as(u32, 1), node.infl_count[1]);
+}
+
+test "in-flight window in bytes: acks and a rejection give the bytes back, not only the slots" {
+    const gpa = testing.allocator;
+    const H = Message.entry_header_len;
+    const batch: u64 = 2 * H + 1; // no-op + one command
+    var cfg = limitCfg();
+    cfg.max_append_bytes = 2 * H + 1;
+    cfg.max_inflight_bytes = 2 * batch;
+    var node = try testLeaderCfg(gpa, cfg, 9);
+    defer node.deinit();
+    var out: [4]usize = undefined;
+    const reset = struct {
+        fn f(nd: *Node) void {
+            nd.next[1] = 1;
+            nd.match[1] = 0;
+            nd.infl_count[1] = 0;
+            nd.infl_bytes[1] = 0;
+        }
+    }.f;
+
+    // Full by bytes; an ack covering both frees their bytes, so the stream
+    // goes on with a batch (one command: two would be over the cap), not a
+    // heartbeat.
+    reset(&node);
+    for (0..2) |_| try node.sendAppend(1);
+    try testing.expect(node.inflFull(1));
+    var from = node.msgs.items.len;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = true, .index = 2 } } });
+    try testing.expectEqualSlices(usize, &.{1}, batchesTo(&node, 1, from, &out));
+    try testing.expectEqual(@as(u64, H + 1), node.infl_bytes[1]);
+
+    // Full by bytes; a rejection empties the bytes too, so the retry carries entries.
+    reset(&node);
+    for (0..2) |_| try node.sendAppend(1);
+    node.next[1] = 3;
+    from = node.msgs.items.len;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = 1, .success = false, .index = 0 } } });
+    try testing.expectEqualSlices(usize, &.{2}, batchesTo(&node, 1, from, &out));
 }
 
 test "in-flight window in bytes: full at the cap, not one byte below it" {
@@ -1361,6 +1410,21 @@ test "a new leader starts every follower's window empty" {
     const last = node.msgs.items[node.msgs.items.len - 2]; // to 1, then to 2
     try testing.expectEqual(@as(NodeId, 1), last.to);
     try testing.expect(last.body.append_req.entries.len > 0);
+
+    // The same for the byte window: stale bytes alone would keep it full.
+    cfg = limitCfg();
+    cfg.max_append_bytes = 64;
+    cfg.max_inflight_bytes = 64;
+    var b = try testLeaderCfg(gpa, cfg, 0);
+    defer b.deinit();
+    try b.step(.{ .from = 2, .to = 0, .body = .{ .vote_resp = .{ .term = 5, .granted = false } } });
+    while (b.role != .candidate) try b.tick();
+    b.infl_count[1] = 0;
+    b.infl_bytes[1] = 64;
+    try b.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = b.term, .granted = true } } });
+    const first = b.msgs.items[b.msgs.items.len - 2];
+    try testing.expectEqual(@as(NodeId, 1), first.to);
+    try testing.expect(first.body.append_req.entries.len > 0);
 }
 
 test "a rejection's hint skips the follower's gap in one round trip, but never below its match" {

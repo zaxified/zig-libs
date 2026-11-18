@@ -6,7 +6,7 @@
 
 **Scope:** mvp — etcd-io/raft v3.7.0 (surveyed 2026-09-30; poc -> mvp 2026-10-04 after `Node` landed)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (51/53, 2 eq) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (81/83, 2 eq) · src 44f2cbcfa761d016
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RAFT_FUZZ) · ct n/a — consensus, no crypto (keyword review, 2026-10-07)
 
@@ -360,11 +360,23 @@ assumes non-Byzantine peers. So no bound was invented: the defence against a
 hostile term stays `types.max_term` (no overflow, no wrap; the cluster halts
 safely, § Malformed messages) plus an authenticated transport.
 
-The model-check exercises all three: `server.zig`'s hostile-peer runs (one
+The model-check exercises both limits: `server.zig`'s hostile-peer runs (one
 server also sends every peer an over-cap AppendEntries at its own term every 50
 time units; a 1 KiB cap and a two-message window) require every hostile frame
 to be dropped and counted, the five invariants to hold across a 100-seed fault
-sweep, and the cluster to keep committing.
+sweep, and the cluster to keep committing. The drop counter is what pins the
+refusal: with the follower's check removed, the accepted hostile entries were
+repaired by the honest leader's walk-back before any invariant saw them.
+
+Delta mutation 2026-11-18 (schemata, ReleaseSafe, the new `node.zig` code
+only): 30 mutants, one per guard × class — the three `init` checks,
+`maxFrameLen`, the `propose` and `step` caps, the batch loop, every window
+rule (full test by count and by bytes, add, free-covered, free-oldest, the
+rejection and new-leader resets, the ring index). First run 26 killed, 4
+survived — all four byte-window bookkeeping (`becomeLeader` and the rejection
+not resetting the bytes, `FreeFirstOne` not giving bytes back, the oldest freed
+on a PROGRESSING ack too); each got a killing test; final 30/30 killed. Added to
+the card's counts (cumulative).
 
 ## The positive control
 
