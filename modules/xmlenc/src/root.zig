@@ -363,8 +363,6 @@ fn classifyContent(alg: []const u8) Error!ContentAlg {
     // AES-192 since 2026-10-10: the `aes192` block cipher, `aesgcm`'s GCM.
     if (eq(alg, alg_aes192_cbc)) return .{ .mode = .cbc, .key_len = 24 };
     if (eq(alg, alg_aes192_gcm)) return .{ .mode = .gcm, .key_len = 24 };
-    // block cipher — surface it as unsupported, never a silent wrong result.
-    if (eq(alg, alg_aes192_cbc) or eq(alg, alg_aes192_gcm)) return error.UnsupportedAlgorithm;
     return error.UnsupportedAlgorithm;
 }
 
@@ -1731,6 +1729,54 @@ test "Z1: the plaintext discarded after a failed unwrap is wiped before it is fr
     defer doc.deinit();
     var watch = FreeWatch{ .child = a, .needle = needle };
     try testing.expectError(error.DecryptionError, decryptData(watch.allocator(), doc.root, &kp.secret_key, .{ .kek = &kek }));
+    try testing.expect(watch.seen > 0);
+    try testing.expect(!watch.leaked);
+}
+
+test "Z1: the plaintext of a document that fails to parse is wiped before it is freed" {
+    // ReleaseFast only, as the test above. The unwrap SUCCEEDS here, so the
+    // plaintext is the real one: `decryptDataToDocument` owns it and wipes it
+    // itself when the parse fails (the `errdefer` after `decryptData`).
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
+    const a = testing.allocator;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+    const kek_bytes: [32]u8 = @splat(0x5A);
+    const cek: [32]u8 = @splat(0x33);
+    var blob: [40]u8 = undefined;
+    _ = try aeskw.wrap(&kek_bytes, &cek, &blob);
+    const needle = "recovered plaintext of the failed parse";
+    const msg = "<<" ++ needle; // not well-formed XML
+    const nonce: [12]u8 = @splat(0x22);
+    var content: [12 + msg.len + 16]u8 = undefined;
+    @memcpy(content[0..12], &nonce);
+    var tag: [16]u8 = undefined;
+    Aes256Gcm.encrypt(content[12 .. 12 + msg.len], &tag, msg, "", nonce, cek);
+    @memcpy(content[12 + msg.len ..], &tag);
+    const enc = std.base64.standard.Encoder;
+    var key_b64: [enc.calcSize(blob.len)]u8 = undefined;
+    _ = enc.encode(&key_b64, &blob);
+    var content_b64: [enc.calcSize(content.len)]u8 = undefined;
+    _ = enc.encode(&content_b64, &content);
+    const src = try std.fmt.allocPrint(a,
+        \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}">
+        \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
+        \\  <ds:KeyInfo><xenc:EncryptedKey>
+        \\    <xenc:EncryptionMethod Algorithm="{s}kw-aes256"/>
+        \\    <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\  </xenc:EncryptedKey></ds:KeyInfo>
+        \\  <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\</xenc:EncryptedData>
+    , .{ xenc_ns, ds_ns, xenc11_ns, xenc_ns, &key_b64, &content_b64 });
+    defer a.free(src);
+    var doc = try xml.parse(a, src, .{});
+    defer doc.deinit();
+    var watch = FreeWatch{ .child = a, .needle = needle };
+    if (decryptDataToDocument(watch.allocator(), doc.root, &kp.secret_key, .{ .kek = &kek_bytes })) |d| {
+        var dd = d;
+        dd.deinit(watch.allocator());
+        return error.TestUnexpectedResult;
+    } else |_| {}
     try testing.expect(watch.seen > 0);
     try testing.expect(!watch.leaked);
 }
