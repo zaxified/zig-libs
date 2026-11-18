@@ -6,7 +6,7 @@
 
 **Scope:** parity — pion/stun v3.1.6 (client side: codec, Binding client with RFC 8489 retransmission, integrity incl. SHA-256, fingerprint, STUN/TURN URIs, RFC 5780/ICE/TURN attribute types, hostile-input rejects) (surveyed 2026-11-02, gaps closed 2026-11-03)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-18 (40/40) · src 54810b838fd2d5c2
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (512/522, 10 eq) · src a4fd709edc497420
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STUN_FUZZ) · ct 2026-11-03 (ctgrind: MESSAGE-INTEGRITY key, MESSAGE-INTEGRITY-SHA256 key and long-term password tainted, `mi` + `mi256` + `ltkey`, 0 in-file; `longTermKeySha256`, `userhash`, `bindingResponse` are not ctgrind targets) · panic 2026-10-31 (sweep + blind review: attribute value/region u16 guards, deadline clamp, RFC 8489 §14.5 covered region via `findCovered`; delta audit 21/22 + 1 eq)
 
@@ -128,6 +128,29 @@ answering (three requests seen, stray ignored), a stray-only server (reported as
 `TransactionMismatch`), an error response (`ErrorResponse`, one request), and a 100 ms cap on a
 10 s RTO window. Mutation 2026-10-04: 31 mutants, all killed (the cap-on-window one needed the
 last test).
+
+**Audit 2026-11-18 (whole-module mutation).** Every condition x class of the non-test code of
+`src/root.zig` (message type interleave, header validation, attribute iterator, address and
+ERROR-CODE decoding, MESSAGE-INTEGRITY / -SHA256 / FINGERPRINT build and verify, the Builder's
+capacity and 16-bit-region guards, key derivation, PASSWORD-ALGORITHM(S), `bindingResponse`
+including the 420 / 400 / 401 paths and the SHA-256 tag fallback, `parseUri`, address encode,
+`Schedule` and `worstCaseWaitMs`, `query`'s cap / stray / class filters): 522 mutants in one
+ReleaseSafe schemata build, run once per mutant. 408 + 1 (a hang) were killed by the earlier
+suite, 113 survived; the new `src/mutation_test.zig` killed 103 of them and 10 are EQUIVALENT:
+`addMessageIntegritySha256` / `verifyMessageIntegritySha256` lower bound 15 and upper bound 33
+(only 15 and 33 pass the shifted bound, and neither is a multiple of 4); the PASSWORD-ALGORITHM
+`params.len > 253` bound (253 bytes pad to 256 and the capacity check refuses it anyway) and
+the `4 + params.len > out.len` capacity check (`out.len` is always a multiple of 4, so it
+agrees with the padded form); `parseUri` `tail.len == 1` (`parseInt("")` fails either way);
+`regionFits` `<=` against `<` at 65535 (the attribute region is always a multiple of 4);
+`stunUnderstands` entries for MESSAGE-INTEGRITY and -SHA256 (its only caller stops at those
+types first); the tag fallback `t <= 32` against `t < 32` (32 falls back to 32). The burn
+(`burn.zig`) is exercised by the ReleaseFast stack probe and was not mutated here. The gaps the
+run found were all test gaps, none in the code: only method 1 was ever used (the interleave
+masks and shifts for methods above 0x7F were unobserved), the decode rejects had no test per
+check (`NotStun` bits, alignment, each cookie bit, the 19-byte case), no exact-fit buffer and
+no 16-bit boundary test, the error responses' padding, URI host characters, FINGERPRINT /
+MESSAGE-INTEGRITY values of a wrong length, and `query`'s send cap and reply filters.
 
 ## Backlog / deferred
 **Verdicts for everything the competition has that this module does not (survey 2026-11-02, revised 2026-11-03; nothing is merely "deferred"):**

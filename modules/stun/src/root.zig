@@ -2411,6 +2411,7 @@ test {
     _ = @import("stackprobe_test.zig");
     // No-panic sweep (wave GV).
     _ = @import("sweep_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 test "windowDeadline: a saturated schedule value does not trap (sweep ST-3)" {
