@@ -250,7 +250,9 @@ Two further exclusions — (c) `OP_CODESEPARATOR` rows and (d) `CONST_SCRIPTCODE
 **removed on 2026-08-06** along with the `FindAndDelete(vchSig)` scope cut they existed to justify.
 Re-running the filter without them admits exactly **one** additional row (the 297th, appended at
 the end of the vectors file): `script_tests.json` contains a single `CODESEPARATOR` row in total
-and **zero** rows carrying the `CONST_SCRIPTCODE` flag. So this corpus was never able to exercise
+and **zero** rows carrying the `CONST_SCRIPTCODE` flag *at that time*. (Correction 2026-11-18:
+Core's current `script_tests.json` carries 3 non-witness `CONST_SCRIPTCODE` rows; they are pinned
+with the hybrid-key rows added that day.) So the 2026-08 corpus was never able to exercise
 `FindAndDelete(vchSig)`, with or without the filter — Core tests that behaviour elsewhere, and both
 places are now pinned here:
 
