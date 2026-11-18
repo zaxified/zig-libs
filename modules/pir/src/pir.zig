@@ -154,7 +154,9 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
             // β = 1: the point function is a pure selector. Any other β would
             // scale the retrieved record by β in the ring, which is not what
             // retrieval means.
-            Dpf.genWithSeeds(@intCast(index), 1, s0, s1, out);
+            const alpha: Dpf.Index = @intCast(index);
+            const beta: Dpf.Elem = 1;
+            Dpf.genWithSeeds(&alpha, &beta, s0, s1, out);
         }
 
         // ── client: keyword lookup ────────────────────────────────────────
@@ -566,7 +568,7 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
                     // β = 1 for every point, for the single-index reason: any
                     // other value scales that block's record in the ring.
                     const betas: [k]Mul.Word = @splat(1);
-                    return Mpf.genWithSeeds(alphas, betas, s0, s1, out);
+                    return Mpf.genWithSeeds(&alphas, &betas, s0, s1, out);
                 }
 
                 /// Serialize a share. Fixed length, no header, no count.

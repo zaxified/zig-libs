@@ -15,7 +15,7 @@ design and threat model.
 |---|---|
 | `wordlist.zig` | The official 2048-word BIP-39 English wordlist |
 | `bip39.zig` | `entropyToMnemonic`, `mnemonicToEntropy`, `validateMnemonic`, `mnemonicToSeed` |
-| `bip32.zig` | `masterFromSeed`, `ckdPriv`/`ckdPub`, `neuter`, `serializePriv`/`serializePub`/`parseExtended`, `parsePath`/`derivePath` |
+| `bip32.zig` | `masterFromSeed`, `ckdPriv`/`ckdPub`, `neuter`/`neuterInto`, `serializePriv`/`serializePub`/`parseExtended`, `parsePath`/`derivePath` |
 | `bip32_vectors.zig` | BIP-32 official Test Vectors 1/2/3/4/5, embedded |
 | `bip39_vectors.zig` | BIP-39 official Trezor English test vectors, embedded |
 | `kat_test.zig` | Full KAT assertions across both specs, incl. the BIP-39→BIP-32 seed→master-xprv seam |
@@ -58,7 +58,7 @@ var normal_child: bip32.ExtendedPrivKey = undefined;
 try bip32.ckdPriv(&master, 5, &normal_child); // m/5
 defer normal_child.deinit();
 
-const pubkey_only = try bip32.neuter(&master); // drop the private key
+const pubkey_only = try bip32.neuter(&master); // drop the private key (`neuterInto(&master, &out)` leaves no by-value copy of the chain code behind)
 const via_pub = try bip32.ckdPub(pubkey_only, 5); // watch-only derivation, normal children only
 ```
 

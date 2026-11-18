@@ -61,7 +61,8 @@ address. Sits alongside the rest of the `netaddr`-based network family.
   interface. Retransmits per RFC 8489 §6.2.1 (`QueryOptions.rto_ms` 500 ms
   doubling, `max_requests` 7, then `last_wait_factor` × RTO — `Schedule`
   reproduces the RFC's 0…31500 ms / 39500 ms example); `timeout_ms` caps the
-  whole exchange. A datagram for another transaction or not STUN at all is
+  whole exchange, and options whose worst-case wait exceeds 120 s
+  (`max_worst_case_wait_ms`) are refused with `error.InvalidOptions`. A datagram for another transaction or not STUN at all is
   discarded and the wait continues; if only such strays came, the give-up error
   says so (`error.TransactionMismatch`, …) instead of `error.Timeout`; an error
   response ends it with `error.ErrorResponse`.

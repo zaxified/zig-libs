@@ -1131,7 +1131,7 @@ ctap2pin	ReleaseFast	one	1	5	1b2ea97a80cc47e9	12de2588e792c80e
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 ctap2pin	ReleaseFast	two	1	5	1b2ea97a80cc47e9	4f76909ff534c3cc
 ctap2pin	ReleaseFast	token	1	0	1b2ea97a80cc47e9	076a3a6729a924b0
-fss	ReleaseFast	gen	1	0	87070291f4d13650	b40b02f9cf423f05
+fss	ReleaseFast	gen	1	0	8c30650dd63a0532	b40b02f9cf423f05
 # Was `>=1` and a confirmed defect: `dpf.zig:326`'s xorMasked compiled to
 # `test $0x1,%r9b` / `je` on the secret control bit at THIS call site while
 # staying branch-free at genWithSeeds'. Fixed by laundering the mask through
@@ -1141,7 +1141,7 @@ fss	ReleaseFast	gen	1	0	87070291f4d13650	b40b02f9cf423f05
 # `key.cw_final & (0 -% @as(Elem, t))` (dpf.zig) compiled to `test $0x1,%r13b` / `je` over the
 # load of cw_final -- a jump on the secret final control bit. Every secret-bit mask over an `Elem`
 # now goes through `secretMask` (asm-laundered word, dpf.zig); back to 0.
-fss	ReleaseFast	eval	1	0	87070291f4d13650	da79011b1ab46d96
+fss	ReleaseFast	eval	1	0	8c30650dd63a0532	da79011b1ab46d96
 bfv	ReleaseFast	keygen	1	<=29	7f477b26c2558422	85d334608120f4fc
 bfv	ReleaseFast	encrypt	1	<=17	7f477b26c2558422	e4cdbb1aa2e9c9dc
 bfv	ReleaseFast	decrypt	1	<=6	7f477b26c2558422	51de1d1011ed3c4c
@@ -1297,8 +1297,8 @@ cookies	ReleaseFast	topen	1	2	a9d45c92961a35f5	c63e696876bcc630
 # SPEC.md says the soft fallback leaks the query index. A row whose colour
 # depends on the gate's CPU says nothing. ⛔ So a green `query` row is NOT a
 # claim about the default instantiation on a soft-AES target.
-pir	ReleaseFast	query	1	1	bc123de91257e28e	0dba0d89ed6fb4ab
-pir	ReleaseFast	reconstruct	1	1	0b3b9c0b14d4fedf	b6ecd96f96e9b339
+pir	ReleaseFast	query	1	1	a18d42a8600f58f9	0dba0d89ed6fb4ab
+pir	ReleaseFast	reconstruct	1	1	3002fadb4727b09e	b6ecd96f96e9b339
 # ── opaque and bip32: first harnesses, 2026-09-16 (A1 opaque M5, bip32 M6) ──
 # First pinned 2026-09-15. Each target taints ONE party's secrets, and the
 # other party runs untainted first, so nothing public on the wire counts as
@@ -1332,8 +1332,8 @@ opaque	ReleaseFast	serverke2	1	2	90c705417aff709e	4ef279b842b3cb55
 # checkEncodeSecret/checkDecodeSecret, parseExtendedBody declassifies the
 # public header and checks the scalar with a CT `scalarInRange`. master and
 # derive run none of that: same counts (2 / 25), same contexts, digest only.
-bip32	ReleaseFast	master	1	2	8ab8c55a864b7244	7e14466ed98567fa
-bip32	ReleaseFast	derive	1	20	8ab8c55a864b7244	8b410bdbd3955f08
+bip32	ReleaseFast	master	1	2	aee2f6749b1b920f	7e14466ed98567fa
+bip32	ReleaseFast	derive	1	20	aee2f6749b1b920f	8b410bdbd3955f08
 bip32	ReleaseFast	seed	1	0	ee9ed44855b9938d	9e74b23db4ad7bdc
 bip32	ReleaseFast	mnemonic	1	3	ee9ed44855b9938d	d42db8cf9cdc2200
 # bip32 xprv, new 2026-10-18: the master scalar tainted through serializePriv
@@ -1346,7 +1346,7 @@ bip32	ReleaseFast	mnemonic	1	3	ee9ed44855b9938d	d42db8cf9cdc2200
 # through the whole round trip). The source digest covers bip32.zig only
 # (base58.zig lives in modules/bech32): re-run `--check bip32` after a
 # bech32 edit.
-bip32	ReleaseFast	xprv	1	0	8ab8c55a864b7244	446d9a369af15cee
+bip32	ReleaseFast	xprv	1	0	aee2f6749b1b920f	446d9a369af15cee
 # btcaddr wif, new 2026-10-18: the private key tainted through wifEncode and
 # back through wifDecode (PATTERN base58.zig|root.zig). 0 in-file, witness 2.
 # Negative control the same day: btcaddr's old early-exit range check
@@ -1413,9 +1413,9 @@ b64ct	ReleaseFast	ignore	1	0	47aa1a1f41cbbd27	6dd74893330925a8
 # stun (2026-10-09; mi256 2026-11-03: the HMAC-SHA256 MAC, 32- and 16-byte tags, same shape) — mi: the MESSAGE-INTEGRITY HMAC-SHA1 key tainted through
 # Builder.addMessageIntegrity + verifyMessageIntegrity (valid and tampered);
 # ltkey: the password through longTermKey (MD5). All contexts are the witness.
-stun	ReleaseFast	mi	1	0	4b21727ff6b5e1af	9f2207d86c2e2592
-stun	ReleaseFast	mi256	1	0	4b21727ff6b5e1af	a0c120f33a01467e
-stun	ReleaseFast	ltkey	1	0	4b21727ff6b5e1af	f48e64fbf4283df1
+stun	ReleaseFast	mi	1	0	b99cc8a0fcd04c27	9f2207d86c2e2592
+stun	ReleaseFast	mi256	1	0	b99cc8a0fcd04c27	a0c120f33a01467e
+stun	ReleaseFast	ltkey	1	0	b99cc8a0fcd04c27	f48e64fbf4283df1
 # sessions (2026-10-09) — csrf: the CSRF key through Csrf.token + verify
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
@@ -2312,8 +2312,8 @@ saml	ReleaseFast	sign	1	45	1571b44e3ddde906	88075a41bcf0b2bb
 # -mcpu=x86_64.
 oscore	ReleaseFast	protect	1	80	edd3b15d71f39582	6eac6a90e3479ab8	cpu=x86_64 control=2 trap=2
 oscore	ReleaseFast	unprotect	1	81	edd3b15d71f39582	ed85db89e3d7e9fd	cpu=x86_64 control=1 trap=1
-fss	ReleaseFast	gen	1	0	87070291f4d13650	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
-fss	ReleaseFast	eval	1	0	87070291f4d13650	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
+fss	ReleaseFast	gen	1	0	8c30650dd63a0532	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
+fss	ReleaseFast	eval	1	0	8c30650dd63a0532	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
 aesgcm	ReleaseFast	generic	1	226	ca4cbdc7d714f5d8	b60805fea700d105	cpu=x86_64 control=8 trap=8
 dtls	ReleaseFast	hs	1	302	61d188b7e8d1387e	61a204df8edf79a0	cpu=x86_64 control=177 trap=179
 dtls	ReleaseFast	app	1	278	61d188b7e8d1387e	70da17057fd7a044	cpu=x86_64 control=279 trap=279

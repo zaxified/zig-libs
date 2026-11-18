@@ -186,7 +186,7 @@ fn runGen(taint: Taint) void {
     const beta: D.Elem = 0xDEADBEEF; // public payload; out of this harness's taint scope
 
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(alpha_r, beta, &s0_r, &s1_r, &keys);
+    D.genWithSeeds(&alpha_r, &beta, &s0_r, &s1_r, &keys);
 
     // Propagation proof: format (tainted-if-yes) output through a
     // non-constant-time path.
@@ -209,7 +209,7 @@ fn runEval(taint: Taint) void {
     const fixed_s0: fss.prg.Seed = @as([16]u8, @splat(0x11));
     const fixed_s1: fss.prg.Seed = @as([16]u8, @splat(0x22));
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(fixed_alpha, fixed_beta, &fixed_s0, &fixed_s1, &keys);
+    D.genWithSeeds(&fixed_alpha, &fixed_beta, &fixed_s0, &fixed_s1, &keys);
     var key = keys[0];
 
     if (taint == .yes) {

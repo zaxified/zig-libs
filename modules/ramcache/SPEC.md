@@ -367,7 +367,7 @@ every field, `rehashes` included, non-zero.
 ## Backlog / deferred
 
 - **(GQ review) sketch size clamp:** the frequency sketch is allocated and zeroed on first access, ~24 B x ceilPowerOfTwo(`max_entries`) (2^31 entries = 48 GiB). Documented on `Options.max_entries`; clamping would change admission for big caches, so left to the operator.
-- (GQ review) REV-SH-2: optional `getOrLoad` wait bound. It needs a clock, and the module takes none.
+- (GQ review) REV-SH-2: optional `getOrLoad` wait bound. It needs a clock, and the module takes none. **Decided 2026-11-18: no change.** Go `x/sync/singleflight` (`Do` blocks until the leader returns; cancellation is the caller's, via `DoChan` + its own select) and Caffeine (`LoadingCache.get` blocks on the in-flight load; `AsyncLoadingCache` leaves the timeout to the returned future) bound neither; a bound belongs in the loader, which owns the clock.
 - (GQ review) REV-SH-3: `drainDirty`/`on_evict` hold the shard lock across the callback; the lock is an unfair test-and-set. Candidates: `drainDirtyMax`/copy-out, a ticket lock.
 - (GQ review) REV-SH-5: AB/BA deadlock across shards from callbacks goes undetected. A "panic on any contended acquire inside a callback" guard was rejected: false positives on harmless contention.
 

@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — Go 1.26.8 `net/http` `ServeContent`, the reference, answers `Range: bytes=-0` (a zero suffix length, unsatisfiable per RFC 9110 §14.1.1) with a 206 carrying the invalid `Content-Range: bytes 100-99/100`; this module answers 416 (`src/go_oracle_vectors.zig` range shape `bytes=-0`, re-taken by `tools/interop.zig --check`) (measured 2026-10-24) · correctness — Go's `http.FileServer(http.Dir(root))` serves a file OUTSIDE the root through a symlink inside it, directly or through a symlinked directory; this module refuses it (403) by default and verifies containment when following (oracle cases p59, p60) (measured 2026-10-24) · feature — `Snapshot`/`Live` serve with zero syscalls per request from held descriptors and a strong SHA-256 content `ETag` (resumable `If-Range`), republished lock-free with bounded retirement; Go and nginx open, stat and read per request and tag by size+mtime (measured 2026-10-24) · speed — faster than every measured implementation: 0.11–0.55× Go `net/http` `FileServer`, the fastest measured (tower-http 0.7.1 `ServeDir` is slower than Go on every row) (`tools/bench.zig`, `tools/rust_fast_bench`) (measured 2026-10-24)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (35/44, 9 eq) · src 674b10ee7257c6a5
+**Audit:** review 2026-11-12 · mutation 2026-11-18 (39/49, 10 eq) · src a384c1bea5672a61
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STATICFILES_FUZZ) · ct n/a — static file serving (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point: unbounded fingerprint hashing, uncounted directories and unbounded listings capped, Live assert/wrap/intCast made checked)
 
@@ -156,7 +156,9 @@ Go's `net/http` `FileServer` and nginx make, not a gap specific to this module).
 
 ### Validators
 
-- **`Last-Modified`**: the file's mtime (`stat.mtime`), formatted as an IMF-fixdate.
+- **`Last-Modified`**: the file's mtime (`stat.mtime`), formatted as an IMF-fixdate. As an `If-Range` date it
+  counts only when strong (at least one second before the response's `Date`, RFC 9110 §8.8.2.2); a file
+  modified within the last second answers a date-conditioned `Range` with the full 200.
 - **`ETag`**: `"<size:hex>-<mtime_seconds:hex>"`, **weak** (`W/` prefix) by default since A1 F5
   (round-2 Q8, 2026-09-11) — `Options.strong_etag = true` reverts to the pre-fix strong form. Weak
   is the safe choice: `mtime`'s granularity is one SECOND, so a same-second, same-size edit (an
@@ -421,14 +423,16 @@ spread 13.7 % (Go's `large` row; the margin is 2×).
   `Snapshot.walk` still counts only directories and regular files, so a directory of millions of
   symlinks/sockets is read in full (time, no memory growth) before `open` returns.
 
-- **2026-10-24 (review L4) — `If-Range` by DATE authorizes a range across a same-second replace.**
-  `sendFileTagged` passes `last_modified = mtime_s` to `http.conditional.ifRangeAllows`; a date equal to
-  `Last-Modified` allows the 206 even with the default weak ETag, so the one-second splice the weak
-  default exists to close (§2 Validators) is still open through the date, and it bypasses the strong
-  content tag of `Snapshot`/`Live` too. RFC 9110 §13.1.5 accepts a date only when the Last-Modified was
-  strong (≥ 1 s before the response's `Date`), which a server cannot know for the client's copy. Go and
-  nginx behave the same. Options: drop the date branch when an ETag is sent (a client holding our
-  response holds the ETag too), or require `now - mtime ≥ 2 s`. Not decided: changes resume behaviour.
+- **FIXED 2026-11-18 (owner decision, RFC 9110 §13.1.5 / §8.8.2.2) — `If-Range` by DATE authorized a range across a same-second replace (review L4, 2026-10-24).**
+  The date branch of `If-Range` now counts only when the `Last-Modified` the server sends is STRONG: at
+  least one second older than the response's `Date` (the file's `mtime` against the real clock at full
+  timestamp precision; an `mtime` in the future is not strong). Otherwise the date validator is treated as
+  absent and the request gets the full 200; an entity tag (strong, `strong_etag` or a `Snapshot`/`Live`
+  content tag) still authorizes a range as before. The RFC makes this mandatory for a date comparison
+  (§13.1.5: the date matches only when the representation's `Last-Modified` is a strong validator by
+  §8.8.2.2's one-second rule), which beats the majority (Go `net/http` and nginx compare the date without it). The check is
+  `isStrongLastModified` and takes the clock from `io`; the exact one-second boundary cannot be pinned by a
+  test (no injectable clock), see the mutation note on the card.
 - **2026-10-24 (review L9) — `Snapshot.walk` skips entries whose `d_type` is DT_UNKNOWN** (some
   XFS/NFS/FUSE): such files are never served and such directories never walked. Fails closed. Fix:
   `fstatat` on `.unknown` and dispatch on the real kind; needs a filesystem that reports it to test.

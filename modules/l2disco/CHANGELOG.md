@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **API change (owner no-panic policy, security triage):** `dhcp.BuildError` gains `InvalidOptionCode` and `InvalidAddressList`. `dhcp.Builder.addOption` with code 0 or 255 and `addRouters`/`addDnsServers`/`addNtpServers` with an empty or non-multiple-of-4 list return them instead of a checked `@panic` (the builder is left untouched). A caller that matched `BuildError` exhaustively needs the two new arms. `Mac.format`, `Ip4List.at` and `Rdnss.at` keep their documented checked panics (accessors, see SPEC backlog). Delta mutation of the changed lines: 9 mutants, 9 killed. Card A1 again (cumulative 43/43).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `nd.checksum`, `cdp.compute` and `cdp.verify` (duplicate-code pass) use `icmp.checksum` instead of private sums; same results. New dependency: `icmp`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the hand-written hex-digit switch is replaced by `std.fmt.charToDigit(c, 16)` (same digits accepted, both cases, same results).

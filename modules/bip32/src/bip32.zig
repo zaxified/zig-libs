@@ -348,14 +348,31 @@ fn ckdPubFromIL(parent: ExtendedPubKey, index: u32, il: [32]u8, ir: [32]u8) CkdE
 
 /// "Neuter" an extended private key into its public counterpart (drops the
 /// private scalar, keeping depth/fingerprint/child-number/chain-code).
+///
+/// Returns the result by value, so the result (the chain code in particular,
+/// which is not the private key but is the ingredient that turns one leaked
+/// non-hardened child key into the parent key, see `ExtendedPubKey.deinit`)
+/// is copied through the return path: in a ReleaseSmall build a copy stays on
+/// the dead stack below the call (stack probe, 2026-10-19). A caller that
+/// wants no such residue uses `neuterInto`, which writes the caller's own
+/// storage and keeps no copy.
 pub fn neuter(priv: *const ExtendedPrivKey) std.crypto.errors.IdentityElementError!ExtendedPubKey {
-    return .{
-        .depth = priv.depth,
-        .parent_fingerprint = priv.parent_fingerprint,
-        .child_number = priv.child_number,
-        .chain_code = priv.chain_code,
-        .pubkey = try pubkeyFromPriv(&priv.privkey),
-    };
+    var out: ExtendedPubKey = undefined;
+    try neuterInto(priv, &out);
+    return out;
+}
+
+/// `neuter` into the caller's own storage: nothing is returned by value, so no
+/// copy of the chain code is left in a frame of this call. `out` is written
+/// only on success (an identity-element failure leaves it as it was) and may
+/// not alias `priv` (a different type). Zero it with `ExtendedPubKey.deinit`
+/// when done.
+pub fn neuterInto(priv: *const ExtendedPrivKey, out: *ExtendedPubKey) std.crypto.errors.IdentityElementError!void {
+    out.pubkey = try pubkeyFromPriv(&priv.privkey);
+    out.depth = priv.depth;
+    out.parent_fingerprint = priv.parent_fingerprint;
+    out.child_number = priv.child_number;
+    out.chain_code = priv.chain_code;
 }
 
 // ── serialization (Base58Check xprv/xpub) ───────────────────────────────
@@ -655,6 +672,40 @@ const testing = std.testing;
 /// Destination for calls a test expects to fail.
 var scratch_key: ExtendedPrivKey = undefined;
 var scratch_parsed: ParsedKey = undefined;
+
+test "neuterInto: same fields as neuter, out written only on success, no alias between the two entry points" {
+    const seed = @as([32]u8, @splat(0x07));
+    var master: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &master);
+    defer master.deinit();
+    var child: ExtendedPrivKey = undefined;
+    try ckdPriv(&master, hardened_offset + 3, &child); // non-zero depth, fingerprint, child number
+    defer child.deinit();
+
+    for ([_]*const ExtendedPrivKey{ &master, &child }) |k| {
+        const by_value = try neuter(k);
+        var into: ExtendedPubKey = undefined;
+        @memset(std.mem.asBytes(&into), 0xAA);
+        try neuterInto(k, &into);
+        try testing.expectEqual(by_value, into);
+        try testing.expectEqual(k.depth, into.depth);
+        try testing.expectEqual(k.parent_fingerprint, into.parent_fingerprint);
+        try testing.expectEqual(k.child_number, into.child_number);
+        try testing.expectEqual(k.chain_code, into.chain_code);
+        try testing.expectEqual(try pubkeyFromPriv(&k.privkey), into.pubkey);
+    }
+
+    // The zero scalar has no public key: the error comes back and `out` is
+    // exactly what it was.
+    var zero = child;
+    @memset(&zero.privkey, 0);
+    var kept: ExtendedPubKey = undefined;
+    @memset(std.mem.asBytes(&kept), 0x5C);
+    const before = kept;
+    try testing.expectError(error.IdentityElement, neuterInto(&zero, &kept));
+    try testing.expectEqual(before, kept);
+    try testing.expectError(error.IdentityElement, neuter(&zero));
+}
 
 test "masterFromSeed + serializePriv/serializePub round-trip via parseExtended" {
     const seed = @as([32]u8, @splat(0x01));
