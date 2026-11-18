@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSH 10.x (client/server), Go `x/crypto/ssh` as library yardstick (surveyed 2026-09-30; re-assessed 2026-10-06)
 
-**Audit:** review 2026-10-06 · mutation 2026-11-18 (869/1000, 131 eq) · src 2343acce5322655b
+**Audit:** review 2026-10-06 · mutation 2026-11-18 (876/1005, 129 eq) · src e618fadd8301aaa6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SSH_FUZZ; ssh-pubkey added 2026-10-10) · ct 2026-10-18 (ctgrind; host-key PEM target `pem` added 2026-10-18)
 
@@ -440,19 +440,43 @@ environment with OpenSSH installed.
   together (`SSH_WSET`): the client round burn with the install burn (the `connectInto` probe
   finds the installed keys), the server gex burn with its `y`/`K` wipes, and the
   keyboard-interactive burn with the reply's record burn.
-  Unobservable: the KEX-round heap scratch wipes (they protect channel data queued during a
-  re-exchange; nothing drives a scripted re-exchange) and the server round burn. With every burn
-  and wipe of the server round off, the server handshake probe stays clean; a residue-rule probe
-  of `serverHandshake` is still missing.
+  The KEX-round heap scratch wipes and the server round burn, unobservable at first, were
+  measured on 2026-11-18 (wave 6, residue follow-up) with a replay harness
+  (`stackprobe2_test.zig`): with deterministic entropy both sides of a handshake are pure
+  functions of what they read, so both transcripts are built by alternating single-threaded
+  passes and the measured side replays its peer's transcript from a fixed reader (no thread, no
+  blocking read; the earlier socketpair mirror of the `connectInto` probe deadlocked because its
+  peers stopped before the SERVICE_REQUEST `serverHandshake` waits for). The round scratch only
+  ever holds public KEX packets, except the packet a wrong `first_kex_packet_follows` guess makes
+  the round read and discard: each transcript ends with a re-exchange whose "guess" is
+  CHANNEL_DATA, and the receiving round's scratch must not keep it (both wipes killed; channel
+  data queued during a re-exchange goes through `Transport.rekey`'s own buffer, not this one).
+  The server round burn is covered by the install burn, as the client's is: skipped alone, the
+  new residue-rule probes of `serverHandshake` and of `serverKexRound` alone stay clean; skipped
+  with the install burn, the `serverKexRound` probe finds the installed keys (24 needles). The
+  `serverHandshake` probe stays clean even then: the record burns of the EXT_INFO and
+  SERVICE_ACCEPT packets sent after the round cover its frames too.
   Constant time: `dh` and `gex` see an exponent stripped of its leading zero bytes. The `ecdh`
   row was blind to an early-exit zero test in `fromScalar`: that branch replaced the one counted
   context (memcheck put it on the loop instead of the `if`), so the count stayed 22.
   `fromScalar` now declassifies only its zero verdict (`declassified`); the row is 20 (the three
   zero-test contexts gone, P-256's public `rejectNonCanonical` verdict now counted apart) and the
   early exit reads 22. The packet-MAC compares have no ctgrind target (unobservable). Two LOW
-  findings, left as they are: a userauth banner of exactly `max_banner_len` (8 KiB) cannot be
-  sent (`writePacket`'s 8 KiB frame), and `messages.NameList.iterator` yields one empty name
-  for an empty list although its doc comment promises none. Two kills first seen only in live
+  findings. A userauth banner of exactly `max_banner_len` (8 KiB) could not be sent
+  (`writePacket`'s 8 KiB frame: `PacketTooLarge`); fixed 2026-11-18. OpenSSH sends any banner a
+  packet holds (sshd reads a banner file of up to 1 MiB, `auth2_read_banner`) and Go's
+  `SendAuthBanner` checks no length; this module's send frame is 8 KiB by design
+  (`transport.write_frame_len`, under a 16 KiB record burn), so the server's bound is lowered to
+  what one packet carries under every cipher: `userauth.max_sent_banner_len` = 8098
+  (`transport.max_write_payload` 8107 less the message's 9 bytes), refused up front with
+  `NameTooLong`. A client still accepts banners up to `max_banner_len`. `messages.NameList.iterator`
+  yielded one empty name for an empty list although its doc comment promises none; fixed
+  2026-11-18 to yield nothing (RFC 4251 §5: "zero or more names", the empty list encoded as a
+  zero length; Go's `parseNameList` returns no names for it). Delta mutation of both fixes
+  (2026-11-18): 5 mutants (the empty-list guard dropped and its assignment skipped; the banner
+  bound `>=`, dropped, and back at `max_banner_len`), all killed; the two `pub const` bounds are
+  comptime (no runtime switch) and pinned by literal tests. The card counts these 5 and the
+  three re-measured W sites (two scratch wipes killed, the server round burn equivalent). Two kills first seen only in live
   interop tests (889, 984) were re-measured without them and are killed by their own tests.
 
 ## Build options
