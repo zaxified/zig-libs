@@ -99,19 +99,16 @@ pub const P256 = struct {
     }
 
     /// Build a point from affine coordinates, checking the curve equation
-    /// `y² = x³ − 3x + b`.
+    /// `y² = x³ − 3x + b`. Every pair off the curve is refused, the affine
+    /// identity marker `(0, 1)` included: it is not a curve point, and SEC 1
+    /// encodes the identity only as the single octet `00` (as std).
     pub fn fromAffineCoordinates(p: AffineCoordinates) EncodingError!P256 {
         const x = p.x;
         const y = p.y;
         const x3AxB = x.sq().mul(x).sub(x).sub(x).sub(x).add(B);
         const yy = y.sq();
-        const on_curve = @intFromBool(x3AxB.equivalent(yy));
-        const is_identity = @intFromBool(x.equivalent(AffineCoordinates.identityElement.x)) &
-            @intFromBool(y.equivalent(AffineCoordinates.identityElement.y));
-        if ((on_curve | is_identity) == 0) return error.InvalidEncoding;
-        var ret = P256{ .x = x, .y = y, .z = Fe.one };
-        ret.z.cMov(P256.identityElement.z, is_identity);
-        return ret;
+        if (!x3AxB.equivalent(yy)) return error.InvalidEncoding;
+        return .{ .x = x, .y = y, .z = Fe.one };
     }
 
     /// Build a point from serialized affine coordinates.
@@ -1801,4 +1798,17 @@ test "corpus: every SEC1 seed reaches fromSec1, and the points decoded are pinne
     try std.testing.expectEqual(@as(usize, 6), accepted);
     try std.testing.expectEqual(@as(usize, 5), non_identity);
     try std.testing.expectEqual(@as(usize, 5), on_curve);
+}
+
+test "the affine identity (0, 1) is not a curve point: refused as std and SEC 1 do (2026-11-18)" {
+    try std.testing.expectError(error.InvalidEncoding, P256.fromAffineCoordinates(AffineCoordinates.identityElement));
+    const StdAffine = @TypeOf(Std.basePoint.affineCoordinates());
+    try std.testing.expectError(error.InvalidEncoding, Std.fromAffineCoordinates(StdAffine.identityElement));
+    var enc: [65]u8 = @splat(0);
+    enc[0] = 4;
+    enc[64] = 1; // 04 || x = 0 || y = 1
+    try std.testing.expectError(error.InvalidEncoding, P256.fromSec1(&enc));
+    try std.testing.expectError(error.InvalidEncoding, Std.fromSec1(&enc));
+    // The one SEC 1 encoding of the identity still decodes.
+    try std.testing.expect((try P256.fromSec1(&.{0})).z.isZero());
 }

@@ -674,7 +674,7 @@ pub fn ecdsaVerify(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) boo
 pub fn ecdsaVerifyDigest(pubkey_sec1: []const u8, digest: []const u8, sig_rs: [64]u8) bool {
     if (digest.len == 0) return false;
     const Q = P256.fromSec1(pubkey_sec1) catch return false;
-    // `fromSec1` accepts the identity encodings (`00`, `04 00..00`); with Q = O
+    // `fromSec1` accepts the identity encoding (`00`); with Q = O
     // anyone can forge (pick s, r = x(e*s^-1 * G)), so refuse it here instead of
     // relying on `mulDoubleBasePublic` to do it.
     Q.rejectIdentity() catch return false;
