@@ -2302,7 +2302,7 @@ xmlenc	ReleaseFast	kw	1	3	11557c75cd215bf1	65e898b409f3bf26
 # The decryption path is deliberately not a row: see the harness header (the contexts there are
 # xml.parse on the recovered plaintext, which is the output, and the key-dependent work is
 # xmlenc's own rows).
-saml	ReleaseFast	sign	1	45	464b012eb2f6c84c	88075a41bcf0b2bb
+saml	ReleaseFast	sign	1	45	1571b44e3ddde906	88075a41bcf0b2bb
 
 # ── per-CPU variant rows: CTGRIND_CPU=x86_64 (scripts/test.sh ctgrind-portable), 2026-11-18 ──
 # Format and the cause tags: header above. Each group below names its cause.
