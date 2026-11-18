@@ -626,3 +626,13 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+
+test "readMpint: a lone zero byte is kept, only a sign-pad before more bytes is stripped" {
+    const gpa = std.testing.allocator;
+    var r: std.Io.Reader = .fixed("\x00\x00\x00\x01\x00");
+    const v = try readMpint(gpa, &r);
+    defer gpa.free(v);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0}, v);
+}
