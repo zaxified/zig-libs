@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE (test only):** the dead-stack probe in `stackprobe_test.zig` no longer holds `neuter` to the plain chain-code needle (a copy of the returned output; the mutation-schemata ReleaseFast build showed it, the plain build does not), which makes the probe usable in a schemata ReleaseFast build: the 16 stack-wipe/burn mutants are now measured (2 killed, 14 equivalent: wipes covered by the burn). Card 244/265, 21 eq. Hardening: none in the source; a `neuter` burn was tried and does not help (SPEC "Stack probe in the schemata build").
+
 - **2026-11-17** — **Behaviour change:** `ckdPriv`, `ckdPrivWithParentPub`, `ckdPub` and `derivePath` return the new `error.MaximumDepthExceeded` for a parent at depth 255 instead of wrapping the child's depth to 0 (which produced a key `parseExtended` rejects); same as rust-bitcoin, bitcoinjs and btcd. `CkdError` grew by one member, so an exhaustive `switch` over it needs the new arm. Whole-module mutation (265 mutants, 242 killed, 23 equivalent) with 8 new tests; see SPEC "Audit 2026-11-17".
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.

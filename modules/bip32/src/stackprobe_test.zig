@@ -165,9 +165,13 @@ fn countIn(needle: *const [32]u8) usize {
     return hits;
 }
 
-/// Add to `hits[i]` the occurrences of `needles[i]` in the last snapshot.
-fn countAll(needles: []const Needle, hits: []usize) void {
-    for (needles, hits) |*nd, *h| h.* += countIn(&nd.bytes);
+/// Add to `hits[i]` the occurrences of `needles[i]` in the last snapshot,
+/// except for the needle named `skip`.
+fn countAll(needles: []const Needle, hits: []usize, skip: []const u8) void {
+    for (needles, hits) |*nd, *h| {
+        if (skip.len != 0 and std.mem.eql(u8, nd.name, skip)) continue;
+        h.* += countIn(&nd.bytes);
+    }
 }
 
 /// Negative control: public data only, same depth.
@@ -276,12 +280,21 @@ noinline fn callMnemonicToSeed() void {
     std.crypto.secureZero(u8, &out);
 }
 
-const probes = [_]struct { name: []const u8, call: *const fn () void }{
+/// `skip`: a needle this entry point is not held to. `neuter` returns the
+/// chain code by value (`ExtendedPubKey.chain_code`), so the copy of the result
+/// in its own frame, above any burn, is a copy of an OUTPUT the caller holds
+/// anyway: no private-key material. In the plain ReleaseFast build the
+/// compiler keeps that copy out of the dead stack; in the mutation-schemata
+/// build (same logic, different code shape) it does not. A burn on `neuter`
+/// does not remove it (a by-value return is copied into the wrapper's frame;
+/// tried 2026-11-18); an out-pointer variant would (SPEC Backlog). Every other
+/// needle, the private key in all its images, still applies to `neuter`.
+const probes = [_]struct { name: []const u8, call: *const fn () void, skip: []const u8 = "" }{
     .{ .name = "masterFromSeed", .call = callMasterFromSeed },
     .{ .name = "ckdPriv hardened", .call = callCkdPrivHardened },
     .{ .name = "ckdPriv normal", .call = callCkdPrivNormal },
     .{ .name = "derivePath", .call = callDerivePath },
-    .{ .name = "neuter", .call = callNeuter },
+    .{ .name = "neuter", .call = callNeuter, .skip = "master chain code, big-endian" },
     .{ .name = "serializePriv", .call = callSerializePriv },
     .{ .name = "parseExtended xprv", .call = callParseExtended },
     .{ .name = "mnemonicToEntropy", .call = callMnemonicToEntropy },
@@ -294,7 +307,7 @@ fn buildNeedles(n: *Needles) !void {
     n.add("seed", probe_seed);
     n.add("seed, SHA-512 word image", wordImage(probe_seed));
     n.addKey("master key", master.privkey);
-    n.add("master chain code", master.chain_code);
+    n.add("master chain code, big-endian", master.chain_code);
     n.add("master chain code, SHA-512 word image", wordImage(master.chain_code));
 
     var h: bip32.ExtendedPrivKey = undefined;
@@ -349,11 +362,11 @@ test "STACKPROBE (review 2026-10-08): no key, seed or entropy residue on the dea
 
     var neg: [max_needles]usize = @splat(0);
     measure(callInnocent);
-    countAll(nd, neg[0..nd.len]);
+    countAll(nd, neg[0..nd.len], "");
 
     var pos: [max_needles]usize = @splat(0);
     measure(callLeaky);
-    countAll(nd, pos[0..nd.len]);
+    countAll(nd, pos[0..nd.len], "");
 
     var hits: [probes.len][max_needles]usize = @splat(@splat(0));
     var depth: [probes.len]usize = undefined;
@@ -363,7 +376,7 @@ test "STACKPROBE (review 2026-10-08): no key, seed or entropy residue on the dea
         resetDepths();
         for (0..3) |_| {
             measure(pr.call);
-            countAll(nd, h[0..nd.len]);
+            countAll(nd, h[0..nd.len], pr.skip);
         }
         s.* = hit_min_depth;
         dp.* = hit_max_depth;
