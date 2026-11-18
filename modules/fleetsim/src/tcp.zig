@@ -2213,3 +2213,20 @@ test "serveTcpMulti: unsolicited traffic reaches the peers of its own listener o
     try testing.expectEqual(@as(usize, 0), scripts[1].got);
     try testing.expectEqual(@as(usize, 2), rep.peers_accepted);
 }
+
+test "serveTcpMulti: a frame split across two reads is reassembled" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    const r1 = readReq(&b1, 1);
+    const steps = [_]ScriptStep{ .{ .bytes = r1[0..5], .gap_ms = 80 }, .{ .bytes = r1[5..] } };
+    var scripts = [_]Script{.{ .steps = &steps, .want_bytes = rep_len }};
+    const bindings = [_]Binding{.{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } }};
+    const rep = try runServeMulti(gpa, &rig.f, &bindings, .{ .idle_ms = 20, .max_peers = 1, .run_ms = 1500 }, &scripts, &.{0});
+    try testing.expectEqual(@as(usize, rep_len), scripts[0].got);
+    try testing.expectEqual(@as(usize, req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 2), rep.frames_in);
+    try testing.expectEqual(@as(usize, 1), rep.frames_out);
+}

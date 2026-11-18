@@ -671,18 +671,13 @@ pub const Fleet = struct {
         const e = &self.nodes.items[node];
         const framing = e.node.framing;
         var it = node_mod.FrameIterator.init(framing, bytes);
-        var any = false;
-        while (it.next()) |frame| {
-            any = true;
-            try self.sendFrame(t, node, frame);
-        }
-        if (it.bad or (!any and bytes.len != 0)) {
-            // The responder produced something its own framing cannot describe.
-            // Ship it whole rather than silently swallowing it — a fleet that
-            // hides a responder bug is worse than useless.
-            self.record(t, node, .bad_framing, bytes);
-            try self.sendFrame(t, node, bytes);
-        } else if (it.rest().len != 0) {
+        while (it.next()) |frame| try self.sendFrame(t, node, frame);
+        // Whatever the framing could not parse is the unconsumed remainder: the
+        // whole reply when nothing parsed, the tail after the frames already
+        // sent otherwise. Ship it rather than swallow it (a fleet that hides a
+        // responder bug is worse than useless), but never re-send frames that
+        // already went out.
+        if (it.rest().len != 0) {
             self.record(t, node, .bad_framing, it.rest());
             try self.sendFrame(t, node, it.rest());
         }
@@ -1590,14 +1585,22 @@ test "sendOut: a reply with a good frame and an unparseable or truncated tail" {
     try testing.expectEqual(@as(u32, 3), fleet.outbound()[1].len);
     try testing.expectEqual(@as(usize, 1), countKind(&fleet, .bad_framing));
 
-    // good frame + garbage head: shipped whole (documented: "ship it whole"), flagged once.
-    Reply.bytes = &.{ 0x68, 0x04, 0x0B, 0x00, 0x00, 0x00, 0x69, 0x04, 0x0B, 0x00 };
+    // nothing parseable at all (garbage head): shipped whole, flagged once more.
+    Reply.bytes = &.{ 0x69, 0x04, 0x0B, 0x00 };
     try fleet.submit(id, "x", 6);
     _ = try fleet.advance(10);
+    try testing.expectEqual(@as(usize, 1), fleet.outbound().len);
+    try testing.expectEqual(@as(u32, 4), fleet.outbound()[0].len);
+    try testing.expectEqual(@as(usize, 2), countKind(&fleet, .bad_framing));
+
+    // good frame + garbage head: the good frame goes out once, then only the remainder.
+    Reply.bytes = &.{ 0x68, 0x04, 0x0B, 0x00, 0x00, 0x00, 0x69, 0x04, 0x0B, 0x00 };
+    try fleet.submit(id, "x", 11);
+    _ = try fleet.advance(15);
     try testing.expectEqual(@as(usize, 2), fleet.outbound().len);
     try testing.expectEqual(@as(u32, 6), fleet.outbound()[0].len);
-    try testing.expectEqual(@as(u32, 10), fleet.outbound()[1].len);
-    try testing.expectEqual(@as(usize, 2), countKind(&fleet, .bad_framing));
+    try testing.expectEqual(@as(u32, 4), fleet.outbound()[1].len);
+    try testing.expectEqual(@as(usize, 3), countKind(&fleet, .bad_framing));
 }
 
 test "trace: payload offsets, ring wrap and the running total" {
