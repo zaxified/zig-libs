@@ -33,11 +33,15 @@ var node = try raft.Node.init(gpa, .{
     .election_ticks = 10, // × your tick period
     .heartbeat_ticks = 2,
     .seed = random_u64, // different on every server
+    // Hostile-peer limits (etcd/raft's defaults; the same on every server):
+    // .max_append_bytes = 1 << 20,  // per AppendEntries; also caps propose()
+    // .max_inflight_msgs = 512,     // unacknowledged batches per follower
 }, .{ .hard_state = persisted_hs, .entries = persisted_entries });
 defer node.deinit();
 
 // Feed it: node.tick() every tick period, node.stepBytes(from, frame) for every
-// frame from a peer, node.propose(bytes) for a client write on the leader.
+// frame from a peer (refuse frames above node.maxFrameLen() before reading
+// them), node.propose(bytes) for a client write on the leader.
 // After any of them:
 while (node.hasReady()) {
     const rd = try node.ready();
@@ -81,8 +85,12 @@ server from its persisted state alone; plus a quiet-network liveness run, a
 directed crash/restart run, and the step-down regressions. The positive
 controls MUST trip the checkers: `BrokenRaft` (Election Safety) and the
 index-only §5.4.1 rule injected into the real `Node` (Leader Completeness, on a
-directed schedule).
+directed schedule). A hostile peer sending over-cap AppendEntries (with a
+1 KiB cap and a two-message in-flight window) runs as a directed run and a
+100-seed fault sweep: every hostile frame dropped and counted, all invariants
+held, commits continuing.
 
 Provenance: clean-room from the Raft paper (a public spec — no third-party source
-ported or studied). VOPR-style model-checking methodology via `netsim`. No
+ported). The flow-control limits (byte cap, in-flight window) follow the
+documented semantics and defaults of etcd/raft (Apache-2.0); no code taken. VOPR-style model-checking methodology via `netsim`. No
 `NOTICE` entry required.

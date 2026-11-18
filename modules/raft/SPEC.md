@@ -6,7 +6,7 @@
 
 **Scope:** mvp — etcd-io/raft v3.7.0 (surveyed 2026-09-30; poc -> mvp 2026-10-04 after `Node` landed)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (51/53, 2 eq) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (81/83, 2 eq) · src 44f2cbcfa761d016
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RAFT_FUZZ) · ct n/a — consensus, no crypto (keyword review, 2026-10-07)
 
@@ -37,7 +37,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [LVala/zaft](https://github.com/LVala/zaft) | Zig | MIT | 24 | push 2024-08 (Zig 0.13) | The Zig alternative: a usable node (`Raft(UserData, Entry)` with send/apply/persist callbacks) for a fixed cluster; its README lists membership changes as not yet implemented. |
 | [canonical/raft](https://github.com/canonical/raft) | C | NOASSERTION (LGPL-3.0 with linking exception *inferred*) | 945 | v0.18.1 (2024-02), push 2024-03 | C library, listed for completeness. |
 
-**Where we are ahead:** the only one of these whose safety is model-checked by a deterministic fault simulator (`netsim`) against all five Figure 3 properties, with positive-control teeth tests — and since 2026-10-04 the model-check drives the SAME `Node` a deployment runs (restart from the persisted state only, Readys batched or not). The pure decision core and the invariant checkers are reusable on their own. **Where we are even:** a runnable server in the etcd-raft/raft-rs shape — `Node` as a pure state machine (`tick` / `step` / `propose` → `ready` / `advance`) over caller-owned transport, storage and clock, any cluster size, entries carrying arbitrary bytes, restart from persisted state; zaft's level of "a usable node for a fixed cluster", with the persistence contract enforced. **Where we are behind (→ Backlog, the gaps a user will hit):** no log compaction/snapshots (the whole log and every entry's bytes live in memory), no membership changes, no pre-vote / check-quorum / leadership transfer, no linearizable reads (ReadIndex / lease), no flow control beyond a per-message entry cap.
+**Where we are ahead:** the only one of these whose safety is model-checked by a deterministic fault simulator (`netsim`) against all five Figure 3 properties, with positive-control teeth tests — and since 2026-10-04 the model-check drives the SAME `Node` a deployment runs (restart from the persisted state only, Readys batched or not). The pure decision core and the invariant checkers are reusable on their own. **Where we are even:** a runnable server in the etcd-raft/raft-rs shape — `Node` as a pure state machine (`tick` / `step` / `propose` → `ready` / `advance`) over caller-owned transport, storage and clock, any cluster size, entries carrying arbitrary bytes, restart from persisted state; zaft's level of "a usable node for a fixed cluster", with the persistence contract enforced. **Where we are behind (→ Backlog, the gaps a user will hit):** no log compaction/snapshots (the whole log and every entry's bytes live in memory), no membership changes, no pre-vote / check-quorum / leadership transfer, no linearizable reads (ReadIndex / lease). (Flow control — a byte cap per AppendEntries and an in-flight window per follower, etcd's `MaxSizePerMsg` / `MaxInflightMsgs` — landed 2026-11-18; see § Flow control and hostile-peer limits.)
 
 ## Purpose
 
@@ -268,7 +268,8 @@ wrap. What remains is availability, not safety: one authenticated-but-hostile
 peer that sends `term = max_term` makes every node adopt it and then never
 campaign again — the cluster halts, safely, with no signal beyond the term
 itself (review 2026-10-04, M2). Raft assumes non-Byzantine peers; authenticate
-the transport (→ Backlog for a term-jump bound or counter).
+the transport. **Decision 2026-11-18: no term-jump bound** — neither reference
+has one; see § Flow control and hostile-peer limits.
 
 **Policy on a malformed message: drop it and count it** (`RaftServer.
 malformed_dropped`). Figure 2 defines no negative acknowledgement, so there is
@@ -289,6 +290,93 @@ that the condition is observable. In the harness every byte on the wire comes
 from our own `encode`, so `malformed_dropped` must stay 0; the model-check
 asserts exactly that across a seed sweep, which is what stops a fail-closed
 decoder from quietly hiding a real codec bug.
+
+## Flow control and hostile-peer limits
+
+Added 2026-11-18 (review 2026-10-04, M1/M2; Backlog 10). Three limits were
+asked for; two are implemented the way etcd/raft does them, the third is not
+implemented because no reference has it.
+
+**Byte cap per AppendEntries — `Config.max_append_bytes`, default 1 MiB.**
+The size counted is the frame's entry part: per entry
+`Message.entry_header_len + data.len`. *Leader side* — etcd/raft's
+`MaxSizePerMsg`, batched by its `limitSize` ("the longest prefix … whose total
+byte size does not exceed maxSize … if the size of the first entry exceeds
+maxSize, a non-empty slice with just this entry is returned"); `sendAppend`
+does exactly that, inside the existing `max_append_entries` cap (hashicorp/raft
+has only the count cap, `MaxAppendEntries`, default 64). The default is the
+etcd server's (`server/etcdserver/raft.go`: `maxSizePerMsg = 1 * 1024 * 1024`).
+*Proposal side* — `propose` refuses an entry larger than
+`max_append_bytes - entry_header_len` (`error.EntryTooLarge`): an entry no
+AppendEntries can carry would otherwise go alone and be refused by every
+follower forever. **Behaviour change:** proposals above ~1 MiB were accepted
+before (up to the wire's 4 GiB length field). *Follower side* — neither
+reference refuses an oversized AppendEntries in the consensus core (etcd's
+`stepFollower`/`handleAppendEntries` and hashicorp's `appendEntries` have no
+size check; a limit, if any, is the transport's). `Node` has no transport of its
+own, and its decoder already refuses an entry count above the cap, so it
+refuses bytes the same way: an AppendEntries whose entries exceed the cap is
+dropped and counted in `malformed_dropped` (the module's policy for a message
+no honest peer sends, § Malformed messages) in `step`, before anything is
+allocated for its entries and before its term is observed. `maxFrameLen()`
+gives a transport the largest frame to accept, so it can refuse longer ones
+before reading them. **Behaviour change:** a frame above the cap is dropped —
+every server must be given the same `max_append_bytes`, like
+`max_append_entries`.
+
+**In-flight window per follower — `Config.max_inflight_msgs`, default 512;
+`max_inflight_bytes`, default 0 = unbounded.** etcd/raft's `MaxInflightMsgs`
+("limits the max number of in-flight append messages during optimistic
+replication phase … to avoid overflowing [the transport's] sending buffer",
+must be > 0) and `MaxInflightBytes` (0 = no limit; otherwise
+`>= MaxSizePerMsg`, the same validation here); the default is the etcd
+server's (`maxInflightMsgs = 4096 / 8`, "never overflow the rafthttp buffer").
+hashicorp/raft bounds the same thing in its transport
+(`DefaultMaxRPCsInFlight = 2` pipelined AppendEntries). The rules follow
+etcd's `tracker.Inflights`: an AppendEntries carrying entries takes a slot
+(heartbeats — empty ones — do not); a success frees every slot whose last index
+it covers (`FreeLE`); a success that covers none while the window is full
+frees the oldest (`FreeFirstOne`, which etcd does on a heartbeat response — a
+lost message must not wedge the window); a rejection empties the window (etcd's
+`BecomeProbe` resets it); a new leader starts every window empty. A follower
+with a full window gets heartbeats only (they still carry the commit index and
+hold elections off). The window matters here because this leader re-sends from
+`nextIndex` on every heartbeat until an ack moves it: before the window a slow
+or dead follower was sent a full batch per heartbeat without bound.
+**Behaviour change** only past 512 unacknowledged batches to one follower.
+
+**Term-jump bound — not implemented (decision 2026-11-18, with the references).**
+Neither reference bounds a peer's term. etcd/raft's `Step` adopts any higher
+term from an AppendEntries/heartbeat (`becomeFollower(m.Term, m.From)`); the
+only exception is a RequestVote received inside a CheckQuorum lease
+(`inLease := r.checkQuorum && r.lead != None && r.electionElapsed <
+r.electionTimeout` → ignored), and PreVote (thesis §9.6) keeps a *partitioned
+honest* node from inflating its term in the first place. hashicorp/raft's
+`appendEntries` likewise adopts `a.Term` when higher, with no bound. Both
+mechanisms answer the honest-disruption case (a rejoining node deposing a
+healthy leader), which is Backlog 7 here (PreVote / CheckQuorum, not yet
+implemented); neither stops a peer that lies about its term, because Raft
+assumes non-Byzantine peers. So no bound was invented: the defence against a
+hostile term stays `types.max_term` (no overflow, no wrap; the cluster halts
+safely, § Malformed messages) plus an authenticated transport.
+
+The model-check exercises both limits: `server.zig`'s hostile-peer runs (one
+server also sends every peer an over-cap AppendEntries at its own term every 50
+time units; a 1 KiB cap and a two-message window) require every hostile frame
+to be dropped and counted, the five invariants to hold across a 100-seed fault
+sweep, and the cluster to keep committing. The drop counter is what pins the
+refusal: with the follower's check removed, the accepted hostile entries were
+repaired by the honest leader's walk-back before any invariant saw them.
+
+Delta mutation 2026-11-18 (schemata, ReleaseSafe, the new `node.zig` code
+only): 30 mutants, one per guard × class — the three `init` checks,
+`maxFrameLen`, the `propose` and `step` caps, the batch loop, every window
+rule (full test by count and by bytes, add, free-covered, free-oldest, the
+rejection and new-leader resets, the ring index). First run 26 killed, 4
+survived — all four byte-window bookkeeping (`becomeLeader` and the rejection
+not resetting the bytes, `FreeFirstOne` not giving bytes back, the oldest freed
+on a PROGRESSING ack too); each got a killing test; final 30/30 killed. Added to
+the card's counts (cumulative).
 
 ## The positive control
 
@@ -392,7 +480,7 @@ linearizable reads are the core items, still in the Backlog.
 8. (survey 2026-09-30) Linearizable reads (ReadIndex / lease): a user of a consensus library expects consistent reads without writing to the log. Effort: medium; fits §2.
 
 9. (review 2026-10-04, M3) A torn-Ready crash fault in the harness: crash a server after it persisted part of a Ready, or after it sent but before `advance`, so the sweep — not only the unit tests — checks the persist-before-send order. Effort: medium.
-10. (review 2026-10-04, M1/M2) Flow control and hostile-peer limits: a byte cap per AppendEntries (today an entry cap), an in-flight window, a term-jump bound or counter. Effort: medium.
+10. ✅ DONE 2026-11-18 (`Config.max_append_bytes` / `max_inflight_msgs` / `max_inflight_bytes`, `Node.maxFrameLen`; no term-jump bound — no reference has one, see § Flow control and hostile-peer limits) (review 2026-10-04, M1/M2) Flow control and hostile-peer limits: a byte cap per AppendEntries (today an entry cap), an in-flight window, a term-jump bound or counter. Effort: medium.
 11. ✅ DONE 2026-11-16 (`message.AppendResp.conflict_term/conflict_index`, optional 34-byte frame; `Node` follower fills it, leader uses it) (review 2026-10-04) A conflict-term hint (§5.3's optimization) so a follower with a long divergent tail costs O(terms) round trips, not O(tail). Effort: small.
 
 ## Anchoring
