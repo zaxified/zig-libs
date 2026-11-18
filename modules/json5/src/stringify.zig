@@ -55,6 +55,14 @@ pub const Options = struct {
     /// `std.json.Value` of any depth without recursing, so a hostile
     /// `[[[[…` that parses would otherwise overflow the stack here
     /// (review 2026-10-24).
+    ///
+    /// Size bound with `indent`: one line holds at most `max_depth * indent`
+    /// bytes of indent (10 000 at the defaults and `max_indent`), so output is
+    /// at most that per line, and a hostile `[[[…[],[],[]…]]]` of N bytes can
+    /// come out about `max_depth * indent / 2` times larger (measured in the
+    /// "indent bound" test). The writer streams to `w`: only a sink that
+    /// buffers pays for it. Like the reference, there is no total-size cap;
+    /// lower `max_depth` or `indent` to tighten it.
     max_depth: usize = 1000,
 };
 
@@ -669,4 +677,32 @@ test "a comptime float and the two kinds of enum" {
     const unnamed = try renderAny(@as(E, @fromBackingInt(@intCast(9))), .{});
     defer testing.allocator.free(unnamed);
     try testing.expectEqualStrings("9", unnamed);
+}
+
+test "indent bound: a line never carries more than max_depth * indent bytes of indent" {
+    const gpa = std.testing.allocator;
+    const root = @import("root.zig");
+    // 99 nested arrays holding 50 empty arrays at the bottom, written with the maximum indent.
+    const open_: [99]u8 = @splat('[');
+    const close_: [99]u8 = @splat(']');
+    var src_buf: std.ArrayList(u8) = .empty;
+    defer src_buf.deinit(gpa);
+    try src_buf.appendSlice(gpa, &open_);
+    for (0..50) |_| try src_buf.appendSlice(gpa, "[],");
+    try src_buf.appendSlice(gpa, &close_);
+    const src = src_buf.items;
+    const v = try root.parseFromSlice(std.json.Value, gpa, src, .{});
+    defer v.deinit();
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try writeValue(&aw.writer, v.value, .{ .indent = max_indent, .max_depth = 100 });
+    var longest: usize = 0;
+    var it = std.mem.splitScalar(u8, aw.written(), '\n');
+    while (it.next()) |line| longest = @max(longest, line.len);
+    // The bottom elements sit at level 99: 990 bytes of indent + `[],`.
+    try std.testing.expectEqual(@as(usize, 99 * max_indent + 3), longest);
+    try std.testing.expect(longest <= 100 * max_indent + 3);
+    // And the amplification this allows: 50 three-byte siblings became ~50 lines of ~990 bytes.
+    try std.testing.expect(aw.written().len > 50 * 99 * max_indent);
+    try std.testing.expect(aw.written().len < 50 * 100 * max_indent + 100 * (100 * max_indent));
 }
