@@ -73,6 +73,7 @@ const cip = @import("cip.zig");
 const epath = @import("epath.zig");
 const connmgr = @import("connmgr.zig");
 const types = @import("types.zig");
+const stdobj = @import("stdobj.zig");
 
 pub const Error = error{
     /// The request could not be parsed far enough to answer it at all.
@@ -154,6 +155,22 @@ pub const Config = struct {
     /// Name object genuinely says.
     program_name: []const u8 = "zig-enip",
     state: encap.DeviceState = .operational,
+    /// What the **TCP/IP Interface** object (class 0xF5, instance 1) reports.
+    /// Served by default (the values are the caller's, nothing is read from
+    /// the OS); `null` withholds the object, which then answers
+    /// `path_destination_unknown` like a device that has none.
+    tcpip: ?stdobj.TcpIpConfig = .{},
+    /// `Set_Attribute_Single` on the TCP/IP Interface object (attributes 3, 5
+    /// and 6: configuration control, interface configuration, host name)
+    /// changes what the adapter reports afterwards. Off by default: the
+    /// attributes are then refused `attribute_not_settable`, as on a device
+    /// whose network settings are fixed. The adapter only *records* the
+    /// values; applying them is the caller's business.
+    allow_tcpip_set: bool = false,
+    /// What the **Ethernet Link** object (class 0xF6, instance 1) reports
+    /// (speed, flags, MAC address). Served by default; `null` withholds it.
+    /// It is read-only: `Set_Attribute_Single` on it is `service_not_supported`.
+    ethernet_link: ?stdobj.EthLinkConfig = .{},
     /// What `ListIdentity` reports as its own socket address.
     socket_address: encap.SocketAddress = .{
         .port = encap.default_tcp_port,
@@ -190,6 +207,8 @@ pub const Adapter = struct {
     next_connection_id: u32 = 0x0100_0001,
     /// Set when a `Reset` was received and allowed, so a simulator can act.
     reset_requested: bool = false,
+    /// What `Set_Attribute_Single` changed on the TCP/IP Interface object.
+    tcpip_state: stdobj.TcpIpState = .{},
 
     pub fn init(cfg: Config, tags: []const TagBinding) Adapter {
         return .{ .cfg = cfg, .tags = tags };
@@ -374,6 +393,12 @@ pub const Adapter = struct {
             @backingInt(cip.Service.multiple_service_packet) => return self.multipleService(req, out, depth),
             @backingInt(cip.Service.get_attributes_all) => return self.getAttributesAll(req, class, out),
             @backingInt(cip.Service.get_attribute_single) => return self.getAttributeSingle(req, class, out),
+            @backingInt(cip.Service.set_attribute_single) => {
+                if (class != null and class.? == @backingInt(cip.ClassCode.tcp_ip_interface)) {
+                    return self.tcpipSet(req, out);
+                }
+                return errorReply(req.service, .service_not_supported, out);
+            },
             @backingInt(cip.Service.reset) => {
                 if (!self.cfg.allow_reset) return errorReply(req.service, .privilege_violation, out);
                 if (out.len < 4) return error.BufferTooSmall;
@@ -594,6 +619,12 @@ pub const Adapter = struct {
         if (class != null and class.? == @backingInt(cip.ClassCode.program_name)) {
             return self.programName(req, out);
         }
+        if (class != null and class.? == @backingInt(cip.ClassCode.tcp_ip_interface)) {
+            return self.tcpipGet(req, null, out);
+        }
+        if (class != null and class.? == @backingInt(cip.ClassCode.ethernet_link)) {
+            return self.ethLinkGet(req, null, out);
+        }
         if (class == null or class.? != @backingInt(cip.ClassCode.identity)) {
             return errorReply(req.service, .path_destination_unknown, out);
         }
@@ -625,6 +656,12 @@ pub const Adapter = struct {
         class: ?u32,
         out: []u8,
     ) Error![]const u8 {
+        if (class != null and class.? == @backingInt(cip.ClassCode.tcp_ip_interface)) {
+            return self.tcpipGet(req, (epath.findLogical(req.path, .attribute) catch null), out);
+        }
+        if (class != null and class.? == @backingInt(cip.ClassCode.ethernet_link)) {
+            return self.ethLinkGet(req, (epath.findLogical(req.path, .attribute) catch null), out);
+        }
         if (class == null or class.? != @backingInt(cip.ClassCode.identity)) {
             return errorReply(req.service, .path_destination_unknown, out);
         }
@@ -676,6 +713,70 @@ pub const Adapter = struct {
             .additional_status = &.{},
             .data = value,
         }).encode(out) catch error.BufferTooSmall;
+    }
+
+    /// The TCP/IP Interface object (class 0xF5, instance 1). `attr == null`
+    /// is `Get_Attributes_All`; a `Get_Attribute_Single` without an attribute
+    /// segment is told apart by the caller passing the service.
+    fn tcpipGet(self: *Adapter, req: cip.Request, attr: ?u32, out: []u8) Error![]const u8 {
+        const cfg = self.cfg.tcpip orelse
+            return errorReply(req.service, .path_destination_unknown, out);
+        const instance = (epath.findLogical(req.path, .instance) catch null) orelse 0;
+        if (instance != 1) return errorReply(req.service, .path_destination_unknown, out);
+        var body: [256]u8 = undefined;
+        const n: usize = blk: {
+            if (req.service == @backingInt(cip.Service.get_attributes_all)) {
+                break :blk stdobj.tcpipAll(cfg, &self.tcpip_state, self.cfg.allow_tcpip_set, &body) catch
+                    return error.BufferTooSmall;
+            }
+            const a = attr orelse return errorReply(req.service, .path_segment_error, out);
+            if (a > std.math.maxInt(u16)) return errorReply(req.service, .attribute_not_supported, out);
+            const got = stdobj.tcpipAttribute(cfg, &self.tcpip_state, self.cfg.allow_tcpip_set, @intCast(a), &body) catch
+                return error.BufferTooSmall;
+            break :blk got orelse return errorReply(req.service, .attribute_not_supported, out);
+        };
+        return (cip.Reply{
+            .service = req.service,
+            .general_status = .success,
+            .additional_status = &.{},
+            .data = body[0..n],
+        }).encode(out) catch error.BufferTooSmall;
+    }
+
+    /// The Ethernet Link object (class 0xF6, instance 1): attributes 1 to 3.
+    fn ethLinkGet(self: *Adapter, req: cip.Request, attr: ?u32, out: []u8) Error![]const u8 {
+        const cfg = self.cfg.ethernet_link orelse
+            return errorReply(req.service, .path_destination_unknown, out);
+        const instance = (epath.findLogical(req.path, .instance) catch null) orelse 0;
+        if (instance != 1) return errorReply(req.service, .path_destination_unknown, out);
+        var body: [16]u8 = undefined;
+        const n: usize = blk: {
+            if (req.service == @backingInt(cip.Service.get_attributes_all)) {
+                break :blk stdobj.ethLinkAll(cfg, &body);
+            }
+            const a = attr orelse return errorReply(req.service, .path_segment_error, out);
+            if (a > std.math.maxInt(u16)) return errorReply(req.service, .attribute_not_supported, out);
+            break :blk stdobj.ethLinkAttribute(cfg, @intCast(a), &body) orelse
+                return errorReply(req.service, .attribute_not_supported, out);
+        };
+        return (cip.Reply{
+            .service = req.service,
+            .general_status = .success,
+            .additional_status = &.{},
+            .data = body[0..n],
+        }).encode(out) catch error.BufferTooSmall;
+    }
+
+    fn tcpipSet(self: *Adapter, req: cip.Request, out: []u8) Error![]const u8 {
+        const cfg = self.cfg.tcpip orelse
+            return errorReply(req.service, .path_destination_unknown, out);
+        const instance = (epath.findLogical(req.path, .instance) catch null) orelse 0;
+        if (instance != 1) return errorReply(req.service, .path_destination_unknown, out);
+        const attr = (epath.findLogical(req.path, .attribute) catch null) orelse
+            return errorReply(req.service, .path_segment_error, out);
+        if (attr > std.math.maxInt(u16)) return errorReply(req.service, .attribute_not_supported, out);
+        const status = stdobj.tcpipSet(cfg, &self.tcpip_state, self.cfg.allow_tcpip_set, @intCast(attr), req.data);
+        return errorReply(req.service, status, out);
     }
 
     // ── discovery ──────────────────────────────────────────────────────────

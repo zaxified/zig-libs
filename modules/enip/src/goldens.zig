@@ -1211,6 +1211,66 @@ pub const DiscoveryGolden = struct {
 /// what `max_frame_len` was sized for.
 pub const max_discovery_frame_len: usize = 256;
 
+// ── standard objects: a stock pycomm3 CIPDriver reading the TCP/IP Interface and
+// Ethernet Link objects ────────────────────────────────────────────────────
+//
+// Captured 2026-11-18 with the same recording-proxy method as the tables
+// above: `pycomm3.CIPDriver.generic_message` (pycomm3 1.2.16, MIT) as the
+// client, unconnected and direct (no route path, no Unconnected_Send), against
+// the module's own adapter served by `root.zig`'s live test with
+// `ENIP_TEST_STDOBJ=1` (`root.zig`'s `tcpip_cfg` with `allow_tcpip_set`, the
+// default Ethernet Link). Replies are OUR adapter's, as captured; what pycomm3
+// anchors is that its own parsers accepted every one: the raw octets for
+// attributes 1-6 and the Ethernet Link's 1-3 are laid out as the client read
+// them, `STRING` attributes decode ("plc01", the odd-length string and its pad
+// octet), and the Ethernet Link speed decodes to 100 as `UDINT`. Requests
+// carry pycomm3's own framing of the services (`0x01`, `0x0E`, `0x10`).
+// pycomm3 has no typed view of these objects of its own; its `Struct`
+// decoding of the 6-octet physical link path and of the six-octet MAC array
+// failed on declarations we gave it, which is a limit of how those types were
+// declared in the probe, not of the replies (the same octets are the layout
+// OpENer builds). The Set entries capture a host-name write with a pad octet
+// and the refusal of a write to the read-only status attribute.
+pub const stdobj_table = [_]DiscoveryGolden{
+    .{ .name = "register session request", .dir = .to_adapter, .hex = "6500040000000000000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "register session reply", .dir = .from_adapter, .hex = "650004000100a5a5000000005f7079636f6d6d5f0000000001000000" },
+    .{ .name = "tcpip get attributes all request", .dir = .to_adapter, .hex = "6f0016000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000600010220f52401" },
+    .{ .name = "tcpip get attributes all reply", .dir = .from_adapter, .hex = "6f0048000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200380081000000010000001400000002000000020020f624010a01a8c000ffffff0101a8c0080808080000000003006c616e000500706c63303100" },
+    .{ .name = "tcpip get attribute single 1 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524013001" },
+    .{ .name = "tcpip get attribute single 1 reply", .dir = .from_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008008e00000001000000" },
+    .{ .name = "tcpip get attribute single 2 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524013002" },
+    .{ .name = "tcpip get attribute single 2 reply", .dir = .from_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008008e00000014000000" },
+    .{ .name = "tcpip get attribute single 3 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524013003" },
+    .{ .name = "tcpip get attribute single 3 reply", .dir = .from_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008008e00000002000000" },
+    .{ .name = "tcpip get attribute single 4 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524013004" },
+    .{ .name = "tcpip get attribute single 4 reply", .dir = .from_adapter, .hex = "6f001a000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000a008e000000020020f62401" },
+    .{ .name = "tcpip get attribute single 5 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524013005" },
+    .{ .name = "tcpip get attribute single 5 reply", .dir = .from_adapter, .hex = "6f002e000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2001e008e0000000a01a8c000ffffff0101a8c0080808080000000003006c616e00" },
+    .{ .name = "tcpip get attribute single 6 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524013006" },
+    .{ .name = "tcpip get attribute single 6 reply", .dir = .from_adapter, .hex = "6f001c000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000c008e0000000500706c63303100" },
+    .{ .name = "tcpip get attribute single 0x14 (unknown attribute) request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524013014" },
+    .{ .name = "tcpip get attribute single 0x14 (unknown attribute) reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20004008e001400" },
+    .{ .name = "tcpip get attribute single on instance 2 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524023001" },
+    .{ .name = "tcpip get attribute single on instance 2 reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20004008e000500" },
+    .{ .name = "ethernet link get attributes all request", .dir = .to_adapter, .hex = "6f0016000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000600010220f62401" },
+    .{ .name = "ethernet link get attributes all reply", .dir = .from_adapter, .hex = "6f0022000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200120081000000640000000f000000020000000001" },
+    .{ .name = "ethernet link get attribute single 1 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f624013001" },
+    .{ .name = "ethernet link get attribute single 1 reply", .dir = .from_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008008e00000064000000" },
+    .{ .name = "ethernet link get attribute single 2 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f624013002" },
+    .{ .name = "ethernet link get attribute single 2 reply", .dir = .from_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008008e0000000f000000" },
+    .{ .name = "ethernet link get attribute single 3 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f624013003" },
+    .{ .name = "ethernet link get attribute single 3 reply", .dir = .from_adapter, .hex = "6f001a000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000a008e000000020000000001" },
+    .{ .name = "ethernet link get attribute single 4 request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f624013004" },
+    .{ .name = "ethernet link get attribute single 4 reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20004008e001400" },
+    .{ .name = "tcpip set attribute single host name (odd length, padded) request", .dir = .to_adapter, .hex = "6f0020000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2001000100320f524013006050061622d313200" },
+    .{ .name = "tcpip set attribute single host name (odd length, padded) reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200040090000000" },
+    .{ .name = "tcpip get attribute single host name after the set request", .dir = .to_adapter, .hex = "6f0018000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b20008000e0320f524013006" },
+    .{ .name = "tcpip get attribute single host name after the set reply", .dir = .from_adapter, .hex = "6f001c000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000c008e000000050061622d313200" },
+    .{ .name = "tcpip set attribute single status (read-only) request", .dir = .to_adapter, .hex = "6f001c000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b2000c00100320f52401300100000000" },
+    .{ .name = "tcpip set attribute single status (read-only) reply", .dir = .from_adapter, .hex = "6f0014000100a5a5000000005f7079636f6d6d5f00000000000000000a00020000000000b200040090000e00" },
+    .{ .name = "unregister session request", .dir = .to_adapter, .hex = "660000000100a5a5000000005f7079636f6d6d5f00000000" },
+};
+
 /// `revision_major = 1`: symbolic addressing, no external-access attribute.
 pub const discovery_table = [_]DiscoveryGolden{
     .{ .name = "register session request", .dir = .to_adapter, .hex = "6500040000000000000000005f7079636f6d6d5f0000000001000000" },
@@ -1379,4 +1439,41 @@ test "a stock LogixDriver addressing tags by symbol instance id replays byte-exa
     try testing.expectEqual(@as(usize, 2), target.identity_requests);
     try testing.expectEqual(@as(i32, 4242), std.mem.readInt(i32, dint[4..8], .little));
     try testing.expectEqual(@as(i32, 7), std.mem.readInt(i32, dint[8..12], .little));
+}
+
+test "a stock pycomm3 CIPDriver reading the TCP/IP Interface and Ethernet Link objects replays byte-exact" {
+    var cfg: adapter_mod.Config = .{
+        .tcpip = .{
+            .status = 1,
+            .configuration_capability = 0x04,
+            .configuration_control = 0x02,
+            .ip_address = .{ 192, 168, 1, 10 },
+            .network_mask = .{ 255, 255, 255, 0 },
+            .gateway = .{ 192, 168, 1, 1 },
+            .name_server = .{ 8, 8, 8, 8 },
+            .domain_name = "lan",
+            .host_name = "plc01",
+        },
+    };
+    cfg.allow_tcpip_set = true;
+    var target = adapter_mod.Adapter.init(cfg, &.{});
+
+    const checked = try replayDiscovery(&target, &stdobj_table);
+    try testing.expectEqual(@as(usize, 18), checked);
+    // None of it counted as an identity request.
+    try testing.expectEqual(@as(usize, 0), target.identity_requests);
+    // The captured Set landed (host name "ab-12") and the read-only one did not
+    // change the status.
+    try testing.expectEqual(@as(usize, 5), target.tcpip_state.host_len);
+}
+
+test "every standard-object golden decodes at the encapsulation layer and re-encodes exactly" {
+    var buf: [max_discovery_frame_len]u8 = undefined;
+    var round: [max_discovery_frame_len]u8 = undefined;
+    for (stdobj_table) |g| {
+        const wire = try bytesOfDiscovery(g, &buf);
+        const msg = try encap.decode(wire);
+        const again = try encap.encode(msg, &round);
+        try testing.expectEqualSlices(u8, wire, again);
+    }
 }

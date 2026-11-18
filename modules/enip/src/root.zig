@@ -97,6 +97,8 @@ pub const connmgr = @import("connmgr.zig");
 pub const types = @import("types.zig");
 /// The symbolic tag path notation.
 pub const tagpath = @import("tagpath.zig");
+/// The standard objects the adapter serves (TCP/IP Interface, Ethernet Link).
+pub const stdobj = @import("stdobj.zig");
 /// The byte-stream seam and its adapters.
 pub const transport = @import("transport.zig");
 /// An EtherNet/IP client.
@@ -163,6 +165,7 @@ test {
     _ = connmgr;
     _ = types;
     _ = tagpath;
+    _ = stdobj;
     _ = transport;
     _ = client;
     _ = adapter;
@@ -1527,7 +1530,14 @@ test "live: a real EtherNet/IP client against our adapter" {
     std.mem.writeInt(i16, scada[0..2], 1, .little);
     std.mem.writeInt(i32, dint[0..4], 11, .little);
     var tags = testTags(&scada, &dint, &real);
-    var target = Adapter.init(.{}, &tags);
+    // ENIP_TEST_STDOBJ=1 serves the configuration the standard-object goldens
+    // were captured against (TCP/IP Interface values and Set enabled).
+    var live_cfg: AdapterConfig = .{};
+    if (envVar("ENIP_TEST_STDOBJ") != null) {
+        live_cfg = tcpip_cfg;
+        live_cfg.allow_tcpip_set = true;
+    }
+    var target = Adapter.init(live_cfg, &tags);
 
     var in: [8192]u8 = undefined;
     var out: [8192]u8 = undefined;
@@ -2805,4 +2815,303 @@ test "a connected request that overflows the envelope does not consume a sequenc
     var q: [32]u8 = undefined;
     _ = try c.sendConnectedCip(try cip.getAttributeSingle(1, 1, 1, &q));
     try testing.expectEqual(@as(u16, 1), c.connection.?.sequence);
+}
+
+// ── TCP/IP Interface object (class 0xF5) ────────────────────────────────────
+
+const tcpip_cfg: adapter.Config = .{
+    .tcpip = .{
+        .status = 1,
+        .configuration_capability = 0x04,
+        .configuration_control = 0x02,
+        .ip_address = .{ 192, 168, 1, 10 },
+        .network_mask = .{ 255, 255, 255, 0 },
+        .gateway = .{ 192, 168, 1, 1 },
+        .name_server = .{ 8, 8, 8, 8 },
+        .domain_name = "lan",
+        .host_name = "plc01",
+    },
+};
+
+/// One request through the Message Router; the reply is copied into `keep`.
+fn routed(target: *Adapter, req: []const u8, keep: []u8) !cip.Reply {
+    var out: [512]u8 = undefined;
+    const raw = try target.messageRouter(req, &out);
+    @memcpy(keep[0..raw.len], raw);
+    return cip.Reply.decode(keep[0..raw.len]);
+}
+
+test "tcpip object: Get_Attributes_All and every attribute, request octets to reply octets" {
+    var target = Adapter.init(tcpip_cfg, &.{});
+    var keep: [512]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    const class = @backingInt(ClassCode.tcp_ip_interface);
+
+    // 03 ... `01 02 20 F5 24 01` is Get_Attributes_All on 0xF5 / 1.
+    const all_req = try cip.getAttributesAll(class, 1, &rb);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x20, 0xF5, 0x24, 0x01 }, all_req);
+    const all = try routed(&target, all_req, &keep);
+    try testing.expectEqual(cip.GeneralStatus.success, all.general_status);
+    try testing.expectEqual(@as(u8, 0x01), all.service);
+    const expect_all = [_]u8{
+        1, 0, 0, 0, // status
+        4, 0, 0, 0, // capability
+        2, 0, 0, 0, // control
+        2, 0, 0x20, 0xF6, 0x24, 1, // physical link: 2 words, class F6, instance 1
+        10, 1, 0xA8, 0xC0, // 192.168.1.10
+        0, 255, 255, 255, // 255.255.255.0
+        1, 1, 0xA8, 0xC0, // 192.168.1.1
+        8, 8, 8, 8, // name server
+        0, 0, 0, 0, // name server 2
+        3, 0, 'l', 'a', 'n', 0, // domain name, padded
+        5, 0, 'p', 'l', 'c', '0', '1', 0, // host name, padded
+    };
+    try testing.expectEqualSlices(u8, &expect_all, all.data);
+
+    // The same octets, attribute by attribute, in order.
+    var off: usize = 0;
+    const widths = [_]usize{ 4, 4, 4, 6, 26, 8 };
+    for (widths, 1..) |w, a| {
+        const r = try routed(&target, try cip.getAttributeSingle(class, 1, @intCast(a), &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.success, r.general_status);
+        try testing.expectEqual(@as(u8, 0x0E), r.service);
+        try testing.expectEqualSlices(u8, expect_all[off..][0..w], r.data);
+        off += w;
+    }
+    try testing.expectEqual(expect_all.len, off);
+    // None of this counts as an identity request.
+    try testing.expectEqual(@as(usize, 0), target.identity_requests);
+}
+
+test "tcpip object: refusals" {
+    var target = Adapter.init(tcpip_cfg, &.{});
+    var keep: [512]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    const class = @backingInt(ClassCode.tcp_ip_interface);
+
+    // Unknown attributes: 0x14, including 0x14 itself and one past 16 bits.
+    for ([_]u32{ 0x14, 7, 0, 13, 0x10001, 0x1_0000 }) |a| {
+        const r = try routed(&target, try cip.getAttributeSingle(class, 1, a, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, r.general_status);
+        try testing.expectEqual(@as(usize, 0), r.data.len);
+        try testing.expectEqual(@as(u8, 0x0E), r.service);
+    }
+    // Unknown instances, for each service.
+    for ([_]u32{ 0, 2, 255 }) |inst| {
+        const g = try routed(&target, try cip.getAttributeSingle(class, inst, 1, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, g.general_status);
+        const ga = try routed(&target, try cip.getAttributesAll(class, inst, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, ga.general_status);
+        const s = try routed(&target, try cip.setAttributeSingle(class, inst, 6, &.{ 1, 0, 'a', 0 }, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, s.general_status);
+    }
+    // A path with no instance at all (`20 F5 30 06`).
+    var pb: [8]u8 = undefined;
+    var b = epath.Builder.init(&pb);
+    try b.class(class);
+    try b.attribute(6);
+    var rq: [32]u8 = undefined;
+    for ([_]u8{ 0x01, 0x0E, 0x10 }) |svc| {
+        const noinst = try (cip.Request{ .service = svc, .path = b.bytes(), .data = &.{ 1, 0, 'a', 0 } }).encode(&rq);
+        const r = try routed(&target, noinst, &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, r.general_status);
+        try testing.expectEqual(svc, r.service);
+    }
+    // Get_Attribute_Single and Set_Attribute_Single without an attribute segment.
+    var pb2: [8]u8 = undefined;
+    var b2 = epath.Builder.init(&pb2);
+    try b2.class(class);
+    try b2.instance(1);
+    for ([_]u8{ 0x0E, 0x10 }) |svc| {
+        const q = try (cip.Request{ .service = svc, .path = b2.bytes(), .data = &.{ 0, 0, 0, 0 } }).encode(&rq);
+        const r = try routed(&target, q, &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_segment_error, r.general_status);
+        try testing.expectEqual(svc, r.service);
+    }
+    // Services the object does not have: Create (0x08), Delete, Set_Attributes_All.
+    for ([_]u8{ 0x08, 0x09, 0x02, 0x03 }) |svc| {
+        const q = try (cip.Request{ .service = svc, .path = b2.bytes(), .data = &.{} }).encode(&rq);
+        const r = try routed(&target, q, &keep);
+        try testing.expectEqual(cip.GeneralStatus.service_not_supported, r.general_status);
+        try testing.expectEqual(svc, r.service);
+    }
+    // Set is refused by default: not settable, for every attribute it has,
+    // and the value is untouched afterwards.
+    for ([_]u32{ 1, 2, 3, 4, 5, 6 }) |a| {
+        const r = try routed(&target, try cip.setAttributeSingle(class, 1, a, &.{ 1, 0, 'a', 0 }, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.attribute_not_settable, r.general_status);
+        try testing.expectEqual(@as(u8, 0x10), r.service);
+    }
+    for ([_]u32{ 7, 0x14, 0x1_0006 }) |a| {
+        const r = try routed(&target, try cip.setAttributeSingle(class, 1, a, &.{ 1, 0, 'a', 0 }, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, r.general_status);
+    }
+    const host = try routed(&target, try cip.getAttributeSingle(class, 1, 6, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 5, 0, 'p', 'l', 'c', '0', '1', 0 }, host.data);
+    // Set_Attribute_Single stays unclaimed on every other class.
+    const id = try routed(&target, try cip.setAttributeSingle(@backingInt(ClassCode.identity), 1, 7, &.{ 0, 0 }, &rb), &keep);
+    try testing.expectEqual(cip.GeneralStatus.service_not_supported, id.general_status);
+    // Withheld: the class answers as before it existed.
+    var without = Adapter.init(.{ .tcpip = null }, &.{});
+    for ([_]u8{ 0x01, 0x0E, 0x10 }) |svc| {
+        const q = try (cip.Request{ .service = svc, .path = (try epath.logicalPath(class, 1, 1, &pb)), .data = &.{} }).encode(&rq);
+        const r = try routed(&without, q, &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, r.general_status);
+    }
+}
+
+test "tcpip object: round trip through the client with Set enabled" {
+    var cfg = tcpip_cfg;
+    cfg.allow_tcpip_set = true;
+    var target = Adapter.init(cfg, &.{});
+    var paired = PairedTransport{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    const class = @backingInt(ClassCode.tcp_ip_interface);
+
+    // Settable advertises itself in the capability word.
+    const caps = try c.getAttributeSingle(class, 1, 2);
+    try testing.expectEqualSlices(u8, &.{ 0x14, 0, 0, 0 }, caps);
+
+    // DHCP is configured, so an address is refused until the method is static.
+    var data: [64]u8 = undefined;
+    const words = [5]u32{ 0x0A000007, 0xFFFF0000, 0x0A000001, 0, 0 };
+    for (words, 0..) |w, i| std.mem.writeInt(u32, data[i * 4 ..][0..4], w, .little);
+    std.mem.writeInt(u16, data[20..22], 0, .little);
+    try testing.expectError(error.CipError, c.setAttributeSingle(class, 1, 5, data[0..22]));
+    try c.setAttributeSingle(class, 1, 3, &.{ 0, 0, 0, 0 });
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, try c.getAttributeSingle(class, 1, 3));
+    try c.setAttributeSingle(class, 1, 5, data[0..22]);
+    try testing.expectEqualSlices(u8, data[0..22], try c.getAttributeSingle(class, 1, 5));
+    try c.setAttributeSingle(class, 1, 6, &.{ 3, 0, 'p', 'l', 'c', 0 });
+    try testing.expectEqualSlices(u8, &.{ 3, 0, 'p', 'l', 'c', 0 }, try c.getAttributeSingle(class, 1, 6));
+    // A non-empty domain name is stored too (odd length, with its pad octet).
+    std.mem.writeInt(u16, data[20..22], 3, .little);
+    @memcpy(data[22..25], "lan");
+    data[25] = 0;
+    try c.setAttributeSingle(class, 1, 5, data[0..26]);
+    try testing.expectEqualSlices(u8, data[0..26], try c.getAttributeSingle(class, 1, 5));
+    std.mem.writeInt(u16, data[20..22], 0, .little);
+    try c.setAttributeSingle(class, 1, 5, data[0..22]);
+    // The pending bit shows in the status, and Get_Attributes_All sees all of it.
+    try testing.expectEqualSlices(u8, &.{ 0x11, 0, 0, 0 }, try c.getAttributeSingle(class, 1, 1));
+    const all = try c.getAttributesAll(class, 1);
+    try testing.expectEqual(@as(usize, 12 + 6 + 22 + 6), all.len);
+    try testing.expectEqualSlices(u8, data[0..22], all[18..40]);
+    // A bad value is refused and changes nothing.
+    try testing.expectError(error.CipError, c.setAttributeSingle(class, 1, 6, &.{ 1, 0, '-', 0 }));
+    try testing.expectEqualSlices(u8, &.{ 3, 0, 'p', 'l', 'c', 0 }, try c.getAttributeSingle(class, 1, 6));
+    // The status attribute stays read-only even with Set enabled.
+    try testing.expectError(error.CipError, c.setAttributeSingle(class, 1, 1, &.{ 0, 0, 0, 0 }));
+}
+
+// ── Ethernet Link object (class 0xF6) ───────────────────────────────────────
+
+test "ethernet link object: Get_Attributes_All and every attribute, request octets to reply octets" {
+    var target = Adapter.init(.{ .ethernet_link = .{
+        .interface_speed = 1000,
+        .interface_flags = 0x0F,
+        .physical_address = .{ 0x00, 0x1D, 0x9C, 0xAA, 0xBB, 0xCC },
+    } }, &.{});
+    var keep: [512]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    const class = @backingInt(ClassCode.ethernet_link);
+
+    const all_req = try cip.getAttributesAll(class, 1, &rb);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x20, 0xF6, 0x24, 0x01 }, all_req);
+    const all = try routed(&target, all_req, &keep);
+    try testing.expectEqual(cip.GeneralStatus.success, all.general_status);
+    try testing.expectEqual(@as(u8, 0x01), all.service);
+    const expect_all = [_]u8{ 0xE8, 3, 0, 0, 0x0F, 0, 0, 0, 0x00, 0x1D, 0x9C, 0xAA, 0xBB, 0xCC };
+    try testing.expectEqualSlices(u8, &expect_all, all.data);
+
+    var off: usize = 0;
+    for ([_]usize{ 4, 4, 6 }, 1..) |w, a| {
+        const r = try routed(&target, try cip.getAttributeSingle(class, 1, @intCast(a), &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.success, r.general_status);
+        try testing.expectEqual(@as(u8, 0x0E), r.service);
+        try testing.expectEqualSlices(u8, expect_all[off..][0..w], r.data);
+        off += w;
+    }
+    try testing.expectEqual(expect_all.len, off);
+    try testing.expectEqual(@as(usize, 0), target.identity_requests);
+
+    // The defaults are served when nothing is configured.
+    var dflt = Adapter.init(.{}, &.{});
+    const d = try routed(&dflt, try cip.getAttributesAll(class, 1, &rb), &keep);
+    try testing.expectEqualSlices(u8, &.{ 100, 0, 0, 0, 0x0F, 0, 0, 0, 0x02, 0, 0, 0, 0, 1 }, d.data);
+}
+
+test "ethernet link object: refusals" {
+    var target = Adapter.init(.{}, &.{});
+    var keep: [512]u8 = undefined;
+    var rb: [64]u8 = undefined;
+    const class = @backingInt(ClassCode.ethernet_link);
+
+    // Optional attributes (counters 4 and 5, interface control 6, ...) and
+    // anything else are not supported.
+    for ([_]u32{ 0x14, 4, 5, 6, 10, 0, 0x10001, 0x1_0000 }) |a| {
+        const r = try routed(&target, try cip.getAttributeSingle(class, 1, a, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, r.general_status);
+        try testing.expectEqual(@as(usize, 0), r.data.len);
+        try testing.expectEqual(@as(u8, 0x0E), r.service);
+    }
+    for ([_]u32{ 0, 2, 255 }) |inst| {
+        const g = try routed(&target, try cip.getAttributeSingle(class, inst, 1, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, g.general_status);
+        const ga = try routed(&target, try cip.getAttributesAll(class, inst, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, ga.general_status);
+    }
+    var pb: [8]u8 = undefined;
+    var b = epath.Builder.init(&pb);
+    try b.class(class);
+    try b.attribute(1);
+    var rq: [32]u8 = undefined;
+    for ([_]u8{ 0x01, 0x0E }) |svc| {
+        const noinst = try (cip.Request{ .service = svc, .path = b.bytes(), .data = &.{} }).encode(&rq);
+        const r = try routed(&target, noinst, &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, r.general_status);
+        try testing.expectEqual(svc, r.service);
+    }
+    var pb2: [8]u8 = undefined;
+    var b2 = epath.Builder.init(&pb2);
+    try b2.class(class);
+    try b2.instance(1);
+    const noattr = try (cip.Request{ .service = 0x0E, .path = b2.bytes(), .data = &.{} }).encode(&rq);
+    const na = try routed(&target, noattr, &keep);
+    try testing.expectEqual(cip.GeneralStatus.path_segment_error, na.general_status);
+    // Services the object does not have: Create (0x08), Delete, Set_Attribute_Single
+    // (the object is read-only here), Set_Attributes_All.
+    for ([_]u8{ 0x08, 0x09, 0x10, 0x02, 0x03 }) |svc| {
+        const q = try (cip.Request{ .service = svc, .path = b2.bytes(), .data = &.{ 0, 0, 0, 0 } }).encode(&rq);
+        const r = try routed(&target, q, &keep);
+        try testing.expectEqual(cip.GeneralStatus.service_not_supported, r.general_status);
+        try testing.expectEqual(svc, r.service);
+    }
+    // Withheld.
+    var without = Adapter.init(.{ .ethernet_link = null }, &.{});
+    for ([_]u8{ 0x01, 0x0E }) |svc| {
+        const q = try (cip.Request{ .service = svc, .path = (try epath.logicalPath(class, 1, 1, &pb)), .data = &.{} }).encode(&rq);
+        const r = try routed(&without, q, &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, r.general_status);
+    }
+}
+
+test "ethernet link object: the client reads it, next to the TCP/IP object that points at it" {
+    var target = Adapter.init(.{ .ethernet_link = .{ .interface_speed = 10, .interface_flags = 0x0E } }, &.{});
+    var paired = PairedTransport{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    const link = @backingInt(ClassCode.ethernet_link);
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0 }, try c.getAttributeSingle(link, 1, 1));
+    try testing.expectEqualSlices(u8, &.{ 0x0E, 0, 0, 0 }, try c.getAttributeSingle(link, 1, 2));
+    try testing.expectEqual(@as(usize, 6), (try c.getAttributeSingle(link, 1, 3)).len);
+    try testing.expectEqual(@as(usize, 14), (try c.getAttributesAll(link, 1)).len);
+    try testing.expectError(error.CipError, c.getAttributeSingle(link, 1, 4));
+    try testing.expectError(error.CipError, c.setAttributeSingle(link, 1, 1, &.{ 0, 0, 0, 0 }));
+    // The physical link path the TCP/IP object reports names this very object.
+    const path = try c.getAttributeSingle(@backingInt(ClassCode.tcp_ip_interface), 1, 4);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 0x20, 0xF6, 0x24, 1 }, path);
 }
