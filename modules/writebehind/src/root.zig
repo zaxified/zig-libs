@@ -349,6 +349,21 @@ pub const Options = struct {
     /// is the bounded exit — it leaves the WAL durable for the next process's
     /// `recover()`.
     max_flush_attempts: u32 = 0,
+    /// High-water mark for back-pressure: the most acknowledged writes that may
+    /// wait un-flushed (`pendingCount`) before `put`/`del` stop admitting more.
+    /// **0 (the default) = unbounded**, the behaviour before this option
+    /// existed. At the mark `put`/`del` drive the flush themselves and wait up
+    /// to `put_block_ns` for room, then fail with `error.Backpressure` having
+    /// written nothing (Ehcache write-behind `queueSize`: "pending write
+    /// operations before applying back pressure"; Kafka producer
+    /// `buffer.memory` + `max.block.ms`: block up to a deadline, then a typed
+    /// error). Counted in entries; the bytes behind a mark are bounded by
+    /// `max_unflushed` x the WAL payload cap.
+    max_unflushed: usize = 0,
+    /// How long `put`/`del` wait at the high-water mark before returning
+    /// `error.Backpressure`. 0 = never wait (one flush pass, then fail).
+    /// Default 60 s, Kafka's `max.block.ms`. Ignored while `max_unflushed` is 0.
+    put_block_ns: u64 = 60 * std.time.ns_per_s,
     /// WAL clocks (injectable for deterministic tests). Defaults use the OS
     /// clocks. Delivery visibility uses only `delay = 0`, so the wall clock
     /// merely needs to be non-decreasing.
@@ -366,6 +381,9 @@ pub const PutError = error{
     /// The durable WAL append failed (storage error) — the write was NOT
     /// acknowledged and nothing changed.
     WalWriteFailed,
+    /// `Options.max_unflushed` writes are pending and none was flushed within
+    /// `Options.put_block_ns`: nothing was written, retry once the sink drains.
+    Backpressure,
 } || Allocator.Error;
 
 pub const GetError = error{SinkReadFailed} || Allocator.Error;
@@ -399,6 +417,9 @@ pub const Coordinator = struct {
     /// when `Options.max_flush_attempts` is 0 (the default), i.e. never
     /// dead-letter.
     wal_max_attempts: u32,
+    /// `Options.max_unflushed` / `Options.put_block_ns`.
+    max_unflushed: usize,
+    put_block_ns: u64,
 
     /// Records the WAL gave up on (dead-lettered) because the sink kept
     /// rejecting them. Only ever non-zero when a finite `max_flush_attempts`
@@ -469,6 +490,8 @@ pub const Coordinator = struct {
                 std.math.maxInt(u32)
             else
                 options.max_flush_attempts,
+            .max_unflushed = options.max_unflushed,
+            .put_block_ns = options.put_block_ns,
             .scratch_arena = std.heap.ArenaAllocator.init(gpa),
         };
 
@@ -545,6 +568,8 @@ pub const Coordinator = struct {
     /// stage it in the cache (dirty), and return — the caller sees a fast ack.
     /// The value is durable when this returns.
     pub fn put(self: *Coordinator, key: []const u8, value: []const u8) PutError!void {
+        if (key.len > jobqueue.max_field_len) return error.KeyTooLarge; // before any wait
+        try self.awaitCapacity();
         // Durable WAL append FIRST — after this the write survives a crash.
         _ = self.wal.enqueue("put", value, .{
             .partition = key,
@@ -574,6 +599,8 @@ pub const Coordinator = struct {
     /// a `get` misses immediately. Eventually removed from the sink by the
     /// flusher / `recover`.
     pub fn del(self: *Coordinator, key: []const u8) PutError!void {
+        if (key.len > jobqueue.max_field_len) return error.KeyTooLarge; // before any wait
+        try self.awaitCapacity();
         _ = self.wal.enqueue("del", "", .{
             .partition = key,
             .max_attempts = self.wal_max_attempts,
@@ -588,6 +615,29 @@ pub const Coordinator = struct {
         // The key's WAL delete record is not tied to a cached dirty entry, so
         // register it as an orphan for the flusher to pick up.
         try self.addKeySet(&self.orphans, key);
+    }
+
+    /// Back-pressure: at `max_unflushed` pending writes, drive the flush on this
+    /// (the coordinator) thread until one lands or `put_block_ns` passes.
+    fn awaitCapacity(self: *Coordinator) PutError!void {
+        if (self.max_unflushed == 0 or self.unflushed < self.max_unflushed) return;
+        const start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        const deadline = start +| @as(i96, self.put_block_ns);
+        while (true) {
+            self.drain();
+            if (self.unflushed < self.max_unflushed) return;
+            // Records not reachable through the cache: flush one synchronously,
+            // as `flushAll` does, so waiting is never stuck on them.
+            if (self.in_flight.count() == 0 and self.flushOneSync()) continue;
+            const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+            if (now >= deadline) return error.Backpressure;
+            const wait_ms: i64 = @intCast(@min(@divTrunc(deadline - now + 999_999, 1_000_000), 20));
+            const gen = self.completion_gen.load(.acquire);
+            self.io.futexWaitTimeout(u32, &self.completion_gen.raw, gen, .{ .duration = .{
+                .raw = .fromMilliseconds(wait_ms),
+                .clock = .awake,
+            } }) catch {};
+        }
     }
 
     /// Read `key`: cache hit (fast), else — if the sink supports read-through —
@@ -1985,4 +2035,113 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── back-pressure (high-water mark) ──────────────────────────────────────────
+
+const BpRig = struct {
+    fn open(rig: *FailRig, mark: usize, block_ns: u64) !*Coordinator {
+        return Coordinator.init(testing.allocator, .{
+            .io = rig.threaded.io(),
+            .sink = rig.sink.sink(),
+            .wal_store = rig.wal_sim.storage(),
+            .wal_path = "wal.jq",
+            .max_cache_bytes = 1 << 20,
+            .max_cache_entries = 1024,
+            .n_workers = 2,
+            .max_unflushed = mark,
+            .put_block_ns = block_ns,
+        });
+    }
+    /// Let the sink accept writes again (`fail_n` is read under its lock).
+    fn unstall(rig: *FailRig) void {
+        rig.sink.lock.lock();
+        defer rig.sink.lock.unlock();
+        rig.sink.fail_n = 0;
+    }
+};
+
+test "back-pressure: mark entries are admitted, mark+1 fails typed with nothing written, recovery after the sink drains" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = std.math.maxInt(usize) }); // stalled sink
+    defer rig.deinit();
+    const c = try BpRig.open(&rig, 3, 0);
+    defer c.deinit();
+
+    try c.put("a", "1");
+    try c.put("b", "2");
+    try c.put("c", "3"); // exactly the mark: admitted
+    try testing.expectEqual(@as(usize, 3), c.pendingCount());
+    try testing.expectError(error.Backpressure, c.put("d", "4")); // mark + 1
+    try testing.expectError(error.Backpressure, c.del("a")); // del is a WAL write too
+    try testing.expectEqual(@as(usize, 3), c.pendingCount()); // nothing was written
+    try testing.expect((try c.get("d")) == null);
+    // A key too large is the caller's error even at the mark, and is not made to wait.
+    try testing.expectError(error.KeyTooLarge, c.put(strRepeat("x", jobqueue.max_field_len + 1), "v"));
+    try testing.expectError(error.KeyTooLarge, c.del(strRepeat("x", jobqueue.max_field_len + 1)));
+    // At the cap itself the key is admitted by the size check (then the mark speaks).
+    try testing.expectError(error.Backpressure, c.put(strRepeat("x", jobqueue.max_field_len), "v"));
+
+    // The sink drains: a put that may wait gets in once a record lands. The
+    // earlier flush attempts are in flight (failed, not yet harvested), so
+    // only the wait loop's own `drain` can move on.
+    c.drain();
+    try testing.expect(c.in_flight.count() > 0);
+    BpRig.unstall(&rig);
+    c.put_block_ns = 30 * std.time.ns_per_s;
+    try c.put("d", "4");
+    try testing.expect(c.pendingCount() <= 3);
+    c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("4", rig.sink.get("d").?);
+    try testing.expectEqualStrings("1", rig.sink.get("a").?);
+    try testing.expectEqual(@as(usize, 4), rig.sink.map.count());
+}
+
+test "back-pressure: a put waits at least put_block_ns at the mark, then fails" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = std.math.maxInt(usize) });
+    defer rig.deinit();
+    const c = try BpRig.open(&rig, 1, 60 * std.time.ns_per_ms);
+    defer c.deinit();
+    try c.put("a", "1");
+    const t0 = std.Io.Timestamp.now(c.io, .awake).nanoseconds;
+    try testing.expectError(error.Backpressure, c.put("b", "2"));
+    const waited = std.Io.Timestamp.now(c.io, .awake).nanoseconds - t0;
+    try testing.expect(waited >= 60 * std.time.ns_per_ms);
+    BpRig.unstall(&rig);
+}
+
+test "back-pressure: the default (mark 0) never blocks" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = std.math.maxInt(usize) });
+    defer rig.deinit();
+    const c = try BpRig.open(&rig, 0, 0);
+    defer c.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..50) |i| try c.put(try std.mem.print(&buf, "k{d}", .{i}), "v");
+    try testing.expectEqual(@as(usize, 50), c.pendingCount());
+    BpRig.unstall(&rig);
+}
+
+test "back-pressure: records of a reopened WAL (not in the cache) are flushed synchronously to make room" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    {
+        const c1 = try BpRig.open(&rig, 0, 0);
+        try c1.put("p", "1");
+        try c1.put("q", "2");
+        c1.deinitNoFlush(); // the WAL keeps both
+    }
+    // Two pending records, mark 2, nothing dirty in the new cache: only the
+    // synchronous backstop can free a slot.
+    const c2 = try BpRig.open(&rig, 2, 0); // never waits: the room must come from the sync flush
+    defer c2.deinit();
+    try testing.expectEqual(@as(usize, 2), c2.pendingCount());
+    try c2.put("r", "3");
+    try testing.expect(c2.pendingCount() <= 2);
+    c2.flushAll();
+    try testing.expectEqualStrings("1", rig.sink.get("p").?);
+    try testing.expectEqualStrings("3", rig.sink.get("r").?);
 }

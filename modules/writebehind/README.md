@@ -87,6 +87,11 @@ c.flushAll();     // block until the cache is clean (graceful barrier); alias: s
   `max_flush_attempts` to a finite value to drop poison records instead; those
   are then counted by `poisonedCount()` and listed by `poisoned()` — never
   dropped silently.
+- **Back-pressure (opt-in).** `Options.max_unflushed` (default 0 = unbounded, as
+  before) caps the acknowledged writes waiting for the sink. At the mark,
+  `put`/`del` run the flush themselves and wait up to `Options.put_block_ns`
+  (default 60 s) for a record to land, then fail with `error.Backpressure`
+  having written nothing; retry once the sink drains. Counted in entries.
 - `deinitNoFlush()` is an abrupt teardown that keeps the WAL durable and
   delegates durability to the next process's `recover()` (also the crash
   simulation used in tests).

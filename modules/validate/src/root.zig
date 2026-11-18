@@ -5204,6 +5204,8 @@ const TokenTap = struct {
 /// {...},"required":[...]}`.
 pub fn writeJsonSchema(rules: []const Rule, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var e: Export = .{ .s = .{ .writer = w } };
+    e.scanFields(rules, 0);
+    e.numberDefs();
     try schemaOfFields(&e, rules, true);
 }
 
@@ -5216,16 +5218,23 @@ pub fn writeJsonSchemaFor(comptime T: type, w: *std.Io.Writer) std.Io.Writer.Err
     // An array root (`[]const Item`): `{"type":"array","items":{...}}`.
     if (comptime @typeInfo(T) != .@"struct") {
         const root = comptime rootRuleFor(T);
+        e.scanRule(&root, 0);
+        e.numberDefs();
         try writeRuleSchema(&e, &root);
     } else if (@hasDecl(T, "validate_rules")) {
+        e.scanFields(comptime rulesFor(T), 0);
+        e.scanFields(T.validate_rules, 0);
+        e.numberDefs();
         try s.beginObject();
         try s.objectField("allOf");
         try s.beginArray();
         try schemaOfFields(&e, comptime rulesFor(T), true);
         try schemaOfFields(&e, T.validate_rules, false);
         try s.endArray();
-        try s.endObject();
+        try endObjectWithDefs(&e);
     } else {
+        e.scanFields(comptime rulesFor(T), 0);
+        e.numberDefs();
         try schemaOfFields(&e, comptime rulesFor(T), true);
     }
 }
@@ -5234,22 +5243,133 @@ pub fn writeJsonSchemaFor(comptime T: type, w: *std.Io.Writer) std.Io.Writer.Err
 /// array root is `{"type":"array","items":{...},"minItems":...}`.
 pub fn writeJsonSchemaRoot(root: *const Rule, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var e: Export = .{ .s = .{ .writer = w } };
+    e.scanRule(root, 0);
+    e.numberDefs();
     try writeRuleSchema(&e, root);
 }
 
 /// Most rules one export writes in full; past it, a rule is written as an
-/// `x-truncated` stub, like a rule nested too deep. Rules are inlined, so a
-/// graph that SHARES sub-rules (one rule reached along many paths) is
-/// exported once per path -- exponential in the sharing depth without this
-/// bound (no-panic sweep GJ F1). Generous: a hand-written rule set is
-/// orders of magnitude smaller.
+/// `x-truncated` stub, like a rule nested too deep. A rule reached along
+/// more than one path is written once, under `$defs` (below), so only a rule
+/// graph with this many DISTINCT rules reaches the bound (no-panic sweep GJ
+/// F1 made the export exponential in the sharing depth; the `$defs` export
+/// made it linear). Generous: a hand-written rule set is orders of magnitude
+/// smaller.
 pub const max_schema_rules = 65536;
 
-/// One export's output and how many rules it has written.
+// Shared sub-rules. A rule graph is a DAG (or has loops): one `Rule` reached
+// along several paths -- the same `items` pointer, the same `fields` or
+// `any_of` slice -- used to be written once per path. The export now scans the
+// graph first (by `*const Rule` identity) and writes every rule that has
+// children and is reached more than once ONCE, under `"$defs"` of the root
+// object, as `"rule<N>"`; each place that reaches it holds
+// `{"$ref":"#/$defs/rule<N>"}`. A loop (`.items = &self`) is a `$ref` to its
+// own definition. A rule without children (a leaf) is cheap and stays inline.
+// Same shape as pydantic, schemars and zod-to-json-schema for 2020-12: the
+// definitions sit in `$defs` at the root and `$ref` is the JSON Pointer
+// `#/$defs/<name>` (JSON Schema 2020-12 sections 8.2.4 and 8.2.3.1). The
+// scan has a fixed capacity; rules past it are not tracked and written
+// inline as before (still bounded by `max_schema_rules`).
+
+const scan_cap = 1024;
+const scan_slots = 2048;
+const scan_depth = 1024;
+
+/// One export's output, the shared-rule table and how many rules it has written.
 const Export = struct {
     s: std.json.Stringify,
     rules: usize = 0,
+    // Scan results. `order[i]` is the i-th distinct rule met, `refs[i]` how
+    // many edges reach it, `def_no[i]` its number under `$defs` (0: inline).
+    n: usize = 0,
+    scanned: usize = 0,
+    order: [scan_cap]*const Rule = undefined,
+    refs: [scan_cap]u16 = undefined,
+    def_no: [scan_cap]u16 = undefined,
+    slots: [scan_slots]u16 = @splat(0), // index + 1 into `order`; 0 empty
+    defs: u16 = 0,
+    defs_done: bool = false,
+    expanding: ?*const Rule = null,
+
+    fn hashSlot(r: *const Rule) usize {
+        const h = (@intFromPtr(r) >> 3) *% 0x9E3779B97F4A7C15;
+        return @intCast((h >> 40) % scan_slots);
+    }
+
+    /// Index of `r` in `order`, or null when it is not tracked.
+    fn find(e: *const Export, r: *const Rule) ?usize {
+        var i = hashSlot(r);
+        while (e.slots[i] != 0) : (i = (i + 1) % scan_slots) {
+            if (e.order[e.slots[i] - 1] == r) return e.slots[i] - 1;
+        }
+        return null;
+    }
+
+    fn scanFields(e: *Export, rules: []const Rule, depth: usize) void {
+        for (rules) |*r| e.scanRule(r, depth);
+    }
+
+    fn scanRule(e: *Export, r: *const Rule, depth: usize) void {
+        if (depth >= scan_depth or e.scanned >= max_schema_rules) return;
+        e.scanned += 1;
+        if (e.find(r)) |i| {
+            if (e.refs[i] < std.math.maxInt(u16)) e.refs[i] += 1;
+            return;
+        }
+        if (e.n < scan_cap) {
+            var i = hashSlot(r);
+            while (e.slots[i] != 0) i = (i + 1) % scan_slots;
+            e.order[e.n] = r;
+            e.refs[e.n] = 1;
+            e.slots[i] = @intCast(e.n + 1);
+            e.n += 1;
+        }
+        // The children the writer reaches (see `writeRuleSchema`).
+        for (r.any_of) |*alt| e.scanRule(alt, depth + 1);
+        if (r.kind == .object or r.kind == .any) if (r.fields) |f| e.scanFields(f, depth + 1);
+        if (r.kind == .array or r.kind == .any) if (r.items) |item| e.scanRule(item, depth + 1);
+    }
+
+    /// Number the tracked rules that are shared and have children.
+    fn numberDefs(e: *Export) void {
+        var k: u16 = 0;
+        for (0..e.n) |i| {
+            e.def_no[i] = 0;
+            if (e.refs[i] >= 2 and hasChildren(e.order[i])) {
+                k += 1;
+                e.def_no[i] = k;
+            }
+        }
+        e.defs = k;
+    }
 };
+
+fn hasChildren(r: *const Rule) bool {
+    if (r.any_of.len != 0) return true;
+    if (r.kind == .object or r.kind == .any) if (r.fields) |f| if (f.len != 0) return true;
+    if (r.kind == .array or r.kind == .any) if (r.items != null) return true;
+    return false;
+}
+
+/// `endObject` of an object that may be the root of the document: the
+/// root closes with `"$defs"` (the shared rules, each written in full) in it.
+fn endObjectWithDefs(e: *Export) std.Io.Writer.Error!void {
+    const s = &e.s;
+    if (e.defs != 0 and !e.defs_done and s.indent_level == 1) {
+        e.defs_done = true;
+        try s.objectField("$defs");
+        try s.beginObject();
+        for (0..e.n) |i| {
+            if (e.def_no[i] == 0) continue;
+            var buf: [16]u8 = undefined;
+            try s.objectField(std.fmt.bufPrint(&buf, "rule{d}", .{e.def_no[i]}) catch unreachable);
+            e.expanding = e.order[i];
+            try writeRuleSchema(e, e.order[i]);
+        }
+        try s.endObject();
+    }
+    try s.endObject();
+}
 
 fn schemaOfFields(e: *Export, rules: []const Rule, typed: bool) std.Io.Writer.Error!void {
     const s = &e.s;
@@ -5259,7 +5379,7 @@ fn schemaOfFields(e: *Export, rules: []const Rule, typed: bool) std.Io.Writer.Er
         try s.write("object");
     }
     try writeFieldsMembers(e, rules);
-    try s.endObject();
+    try endObjectWithDefs(e);
 }
 
 /// `properties` and `required` for a rule set, into an object already open.
@@ -5650,6 +5770,18 @@ const max_schema_nesting = 240;
 
 fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
     const s = &e.s;
+    // A shared rule is written once, under `$defs`; every other place that
+    // reaches it holds a `$ref` (the one being defined is written in full).
+    if (e.find(r)) |i| if (e.def_no[i] != 0) {
+        if (e.expanding != r) {
+            var buf: [32]u8 = undefined;
+            try s.beginObject();
+            try s.objectField("$ref");
+            try s.write(std.fmt.bufPrint(&buf, "#/$defs/rule{d}", .{e.def_no[i]}) catch unreachable);
+            return endObjectWithDefs(e);
+        }
+        e.expanding = null;
+    };
     // A rule graph that loops back on itself (`.items = &self`), is nested
     // past the output's limit or is too large in all: write the cut-off as a
     // schema that says so, never recurse without end (sweep V-4) or blow up
@@ -5665,7 +5797,7 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
         try s.beginObject();
         try s.objectField("x-truncated");
         try s.write(why);
-        return s.endObject();
+        return endObjectWithDefs(e);
     }
     e.rules += 1;
     if (r.omit_empty or r.omit_zero) return writeOmittingSchema(e, r);
@@ -5841,7 +5973,7 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
         try s.objectField("items");
         try writeRuleSchema(e, item);
     };
-    try s.endObject();
+    try endObjectWithDefs(e);
 }
 
 /// `omit_empty`/`omit_zero`: the empty values, or the rule without the flag.
@@ -5887,7 +6019,7 @@ fn writeOmittingSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
     inner.omit_zero = false;
     try writeRuleSchema(e, &inner);
     try s.endArray();
-    try s.endObject();
+    try endObjectWithDefs(e);
 }
 
 fn patternIsNegated(p: Pattern) bool {
@@ -11656,16 +11788,20 @@ test "unique: the hash scratch is not kept in the report (sweep V-3)" {
 const cyclic_items: Rule = .{ .field = "", .kind = .array, .items = &cyclic_items };
 const cyclic_fields: [1]Rule = .{.{ .field = "next", .kind = .object, .fields = &cyclic_fields }};
 
-test "exporting a rule graph that loops back on itself terminates (sweep V-4)" {
+test "exporting a rule graph that loops back on itself is a $ref to its own definition (sweep V-4)" {
     var w: std.Io.Writer.Allocating = .init(testing.allocator);
     defer w.deinit();
     try writeJsonSchemaRoot(&cyclic_items, &w.writer);
-    try testing.expect(std.mem.find(u8, w.written(), "x-truncated") != null);
+    try testing.expectEqualStrings(
+        \\{"$ref":"#/$defs/rule1","$defs":{"rule1":{"type":"array","items":{"$ref":"#/$defs/rule1"}}}}
+    , w.written());
 
     var w2: std.Io.Writer.Allocating = .init(testing.allocator);
     defer w2.deinit();
     try writeJsonSchema(&cyclic_fields, &w2.writer);
-    try testing.expect(std.mem.find(u8, w2.written(), "x-truncated") != null);
+    try testing.expectEqualStrings(
+        \\{"type":"object","properties":{"next":{"$ref":"#/$defs/rule1"}},"$defs":{"rule1":{"type":"object","properties":{"next":{"$ref":"#/$defs/rule1"}}}}}
+    , w2.written());
 
     // A rule set nested within the limit is written whole.
     const leaf: Rule = .{ .field = "", .kind = .string };
@@ -11687,19 +11823,196 @@ fn sharedRuleSet(comptime k: usize) []const Rule {
     }.v;
 }
 
-test "exporting a rule graph that shares sub-rules is bounded (sweep GJ F1)" {
-    // 2^19 - 2 rules along every path: ~20 MB inlined, cut at max_schema_rules.
+fn exportSharedLen(comptime k: usize) !usize {
     var w: std.Io.Writer.Allocating = .init(testing.allocator);
     defer w.deinit();
-    try writeJsonSchema(sharedRuleSet(17), &w.writer);
-    try testing.expect(std.mem.find(u8, w.written(), "rule graph too large to export") != null);
-    try testing.expect(w.written().len < 8 * 1024 * 1024);
+    try writeJsonSchema(sharedRuleSet(k), &w.writer);
+    try testing.expect(std.mem.find(u8, w.written(), "x-truncated") == null);
+    return w.written().len;
+}
 
-    // 2^15 - 2 rules: within the budget, written whole.
+test "exporting a rule graph that shares sub-rules writes each shared rule once, under $defs (sweep GJ F1)" {
+    // Two levels: the leaves are shared but have no children, stay inline.
+    var w0: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w0.deinit();
+    try writeJsonSchema(sharedRuleSet(1), &w0.writer);
+    try testing.expectEqualStrings(
+        \\{"type":"object","properties":{"a":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}},"b":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}}}
+    , w0.written());
+
+    // Three levels: the middle level is reached twice, written once each.
+    var w1: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w1.deinit();
+    try writeJsonSchema(sharedRuleSet(2), &w1.writer);
+    try testing.expectEqualStrings(
+        \\{"type":"object","properties":{"a":{"type":"object","properties":{"a":{"$ref":"#/$defs/rule1"},"b":{"$ref":"#/$defs/rule2"}}},"b":{"type":"object","properties":{"a":{"$ref":"#/$defs/rule1"},"b":{"$ref":"#/$defs/rule2"}}}},"$defs":{"rule1":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}},"rule2":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}}}
+    , w1.written());
+
+    // Sharing depth 20 was 2^22 - 2 rules inlined (cut at max_schema_rules,
+    // megabytes); now the size grows with the depth, not with 2^depth.
+    const l5 = try exportSharedLen(5);
+    const l10 = try exportSharedLen(10);
+    const l20 = try exportSharedLen(20);
+    try testing.expect(l20 < 3 * l10);
+    try testing.expect(l10 < 3 * l5);
+    try testing.expect(l20 < 8 * 1024);
+}
+
+test "more distinct rules than the scan table tracks are written inline, none lost" {
+    const n = scan_cap + 76;
+    const set = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        var rules: [n]Rule = undefined;
+        for (0..n) |i| rules[i] = .{
+            .field = std.fmt.comptimePrint("f{d}", .{i}),
+            .kind = .object,
+            .fields = &.{.{ .field = "x", .kind = .int }},
+        };
+        break :blk rules;
+    };
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try writeJsonSchema(&set, &w.writer);
+    try testing.expect(std.mem.find(u8, w.written(), "\"f1099\":{\"type\":\"object\"") != null);
+    try testing.expect(std.mem.find(u8, w.written(), "x-truncated") == null);
+    try testing.expect(std.mem.find(u8, w.written(), "$defs") == null);
+}
+
+const SharedDeep = struct { x: i64 };
+const SharedInner = struct { c: SharedDeep, d: SharedDeep };
+const SharedTyped = struct { a: SharedInner, b: SharedInner };
+const SharedTypedExtra = struct {
+    a: SharedInner,
+    b: SharedInner,
+    const shared_item: Rule = .{ .field = "", .kind = .object, .fields = &.{.{ .field = "k", .kind = .int }} };
+    pub const validate_rules: []const Rule = &.{
+        .{ .field = "p", .kind = .array, .items = &shared_item },
+        .{ .field = "q", .kind = .array, .items = &shared_item },
+    };
+};
+
+fn expectSharedDefsOnce(comptime T: type, defs: usize, refs: usize) !void {
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try writeJsonSchemaFor(T, &w.writer);
+    const out = w.written();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\"$defs\":{"));
+    try testing.expectEqual(defs, std.mem.count(u8, out, "\"rule"));
+    try testing.expectEqual(refs, std.mem.count(u8, out, "\"$ref\":\"#/$defs/rule"));
+    try testing.expect(std.mem.find(u8, out, "x-truncated") == null);
+    // The `$defs` member is on the root object, the last member of it.
+    try testing.expect(std.mem.find(u8, out, "\"$defs\":{") != null);
+    try testing.expect(out[out.len - 2] == '}' and out[out.len - 1] == '}');
+}
+
+test "writeJsonSchemaFor: shared sub-rules go under the root's $defs (struct, struct + validate_rules, array root)" {
+    // `SharedInner`'s two fields are each reached from `a` and from `b`.
+    try expectSharedDefsOnce(SharedTyped, 2, 4);
+    try expectSharedDefsOnce([]const SharedTyped, 2, 4);
+    // validate_rules: `shared_item` reached from `p` and `q`; the derived
+    // set shares `c` and `d` as above. 3 definitions, the root object is the
+    // `allOf` holder.
+    try expectSharedDefsOnce(SharedTypedExtra, 3, 6);
+}
+
+fn sharedBlock(comptime k: usize) []const Rule {
+    return &struct {
+        const v: [50]Rule = blk: {
+            @setEvalBranchQuota(100_000);
+            var rules: [50]Rule = undefined;
+            for (0..50) |j| rules[j] = .{
+                .field = std.fmt.comptimePrint("g{d}_{d}", .{ k, j }),
+                .kind = .object,
+                .fields = &.{.{ .field = "x", .kind = .int }},
+            };
+            break :blk rules;
+        };
+    }.v;
+}
+
+test "sharing past the scan table: tracked shared rules are definitions, the rest is bounded" {
+    // 400 distinct non-leaf rules in 8 separate arrays (so their addresses
+    // are not one arithmetic progression, which a multiplicative hash spreads
+    // without a single collision), each reached from both of two parents,
+    // among 2048 table slots: the lookup must find each after a collision.
+    const outer = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        var rules: [16]Rule = undefined;
+        for (0..8) |i| {
+            const block = sharedBlock(i);
+            rules[2 * i] = .{ .field = std.fmt.comptimePrint("a{d}", .{i}), .kind = .object, .fields = block };
+            rules[2 * i + 1] = .{ .field = std.fmt.comptimePrint("b{d}", .{i}), .kind = .object, .fields = block };
+        }
+        break :blk rules;
+    };
+    // The scan really collides here: shared rules sit off their home slot.
+    var probe: Export = .{ .s = undefined };
+    probe.scanFields(&outer, 0);
+    var displaced: usize = 0;
+    for (0..probe.n) |idx| {
+        if (probe.refs[idx] < 2) continue;
+        if (probe.slots[Export.hashSlot(probe.order[idx])] != idx + 1) displaced += 1;
+    }
+    try testing.expect(displaced > 0);
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try writeJsonSchema(&outer, &w.writer);
+    try testing.expectEqual(@as(usize, 400), std.mem.count(u8, w.written(), "\"rule"));
+    try testing.expectEqual(@as(usize, 800), std.mem.count(u8, w.written(), "\"$ref\":\"#/$defs/rule"));
+
+    // 1100 distinct rules fill the table; a graph with sharing at every level
+    // behind them is untracked, so it is scanned and written per path -- the
+    // scan budget and the rule budget stop it.
+    const big = comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        var rules: [scan_cap + 77]Rule = undefined;
+        for (0..scan_cap + 76) |i| rules[i] = .{
+            .field = std.fmt.comptimePrint("p{d}", .{i}),
+            .kind = .string,
+        };
+        rules[scan_cap + 76] = .{ .field = "s", .kind = .object, .fields = sharedRuleSet(30) };
+        break :blk rules;
+    };
     var w2: std.Io.Writer.Allocating = .init(testing.allocator);
     defer w2.deinit();
-    try writeJsonSchema(sharedRuleSet(13), &w2.writer);
-    try testing.expect(std.mem.find(u8, w2.written(), "x-truncated") == null);
+    try writeJsonSchema(&big, &w2.writer);
+    try testing.expect(std.mem.find(u8, w2.written(), "rule graph too large to export") != null);
+    try testing.expect(w2.written().len < 8 * 1024 * 1024);
+}
+
+test "a shared rule without children stays inline: empty fields, an array without items" {
+    const empty: Rule = .{ .field = "", .kind = .object, .fields = &.{} };
+    const bare: Rule = .{ .field = "", .kind = .array };
+    const rules = [_]Rule{
+        .{ .field = "p", .kind = .array, .items = &empty },
+        .{ .field = "q", .kind = .array, .items = &empty },
+        .{ .field = "r", .kind = .array, .items = &bare },
+        .{ .field = "t", .kind = .array, .items = &bare },
+    };
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try writeJsonSchema(&rules, &w.writer);
+    try testing.expect(std.mem.find(u8, w.written(), "$") == null);
+}
+
+test "a shared rule behind omit_empty, an array item and an any_of alternative is one definition each" {
+    const item: Rule = .{ .field = "", .kind = .object, .fields = &.{.{ .field = "x", .kind = .int, .required = true }} };
+    const alt: Rule = .{ .field = "", .kind = .array, .items = &item };
+    const rules = [_]Rule{
+        .{ .field = "p", .kind = .array, .items = &item },
+        .{ .field = "q", .kind = .array, .items = &item, .omit_empty = true },
+        .{ .field = "r", .any_of = &.{ alt, alt } },
+    };
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try writeJsonSchema(&rules, &w.writer);
+    const out = w.written();
+    // `item` is reached by pointer from p, q and both alternatives: one definition.
+    try testing.expect(std.mem.find(u8, out, "\"x-truncated\"") == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\"rule1\":{"));
+    try testing.expect(std.mem.find(u8, out, "\"rule3\":{") == null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\"required\":[\"x\"]"));
 }
 
 test "a float-spelled integer at the edge of a wide int is refused, not decoded by std's panic (sweep V-5)" {
@@ -12049,11 +12362,12 @@ test "any_of: a rule graph that loops ends in the error, a recursive shape works
     const tree = [_]Rule{.{ .field = "v", .any_of = any_recursive.any_of }};
     try expectBoth("{\"v\":[1,[2,[3,[4,[5,[6,[7]]]]]]]}", &tree, &.{});
     try expectBoth("{\"v\":[1,[2,[3,[\"x\"]]]]}", &tree, &.{.{ "v", "any_of" }});
-    // The export of the loop is capped as every rule graph is.
+    // The export of the loop is a `$ref` to the shared alternatives.
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try writeJsonSchema(&loop, &out.writer);
-    try testing.expect(std.mem.find(u8, out.written(), "x-truncated") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "\"$ref\":\"#/$defs/rule") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "x-truncated") == null);
 }
 
 const any_two: Rule = .{ .field = "", .any_of = &.{
