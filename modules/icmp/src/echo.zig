@@ -140,9 +140,12 @@ pub const Reply = union(enum) {
         quoted_src: [16]u8,
         quoted_dst: [16]u8,
         /// IPv4 protocol number / IPv6 next-header byte of the quoted
-        /// packet (always 1/ICMP or 58/ICMPv6 here, since only a quoted
-        /// echo/timestamp request is accepted -- kept for symmetry and so a
-        /// caller need not special-case the family).
+        /// packet. IPv6: always 58 (`parseV6` rejects any other next header).
+        /// IPv4: NOT checked by `parseV4` (fping and iputils ping do not
+        /// check it either, they test the quoted ICMP type, destination and
+        /// id), so it can be any value; an error quoting a UDP datagram whose
+        /// first payload byte is 8 is read as quoting an echo request. A
+        /// caller that cares compares this field with 1.
         quoted_proto: u8,
     },
     /// Anything else (not ours, malformed, uninteresting type).
@@ -364,6 +367,19 @@ test "echo reply v4 with raw IP header" {
     const parsed = parseV4(&pkt, true);
     try std.testing.expectEqual(@as(u16, 7), parsed.echo_reply.ident);
     try std.testing.expectEqual(@as(u16, 9), parsed.echo_reply.seq);
+}
+
+test "icmp v4 error quoting a non-ICMP datagram is not filtered on the protocol (as fping and iputils)" {
+    // The quoted protocol is reported, not checked: a UDP datagram whose
+    // first payload byte is 8 looks like an echo request at `orig`.
+    var pkt: [echo_header_len + 20 + echo_header_len]u8 = @splat(0);
+    pkt[0] = v4.dest_unreachable;
+    pkt[8] = 0x45;
+    pkt[8 + 9] = 17; // quoted protocol = UDP
+    pkt[8 + 20] = v4.echo_request; // first UDP payload byte (source port high byte)
+    std.mem.writeInt(u16, pkt[2..4], checksum(&pkt), .big);
+    const parsed = parseV4(&pkt, false);
+    try std.testing.expectEqual(@as(u8, 17), parsed.icmp_error.quoted_proto);
 }
 
 test "icmp v4 dest unreachable quoting our echo" {

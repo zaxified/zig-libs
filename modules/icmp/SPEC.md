@@ -6,7 +6,7 @@
 
 **Scope:** parity — fping v5.5 (Linux) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (536/590, 54 eq) · src 0fc8d9e08b619e90
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (536/590, 54 eq) · src cede50a4ebb1a432
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, ICMP_FUZZ) · ct n/a — ICMP ping/codec (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: max_inflight 0, ns saturation, bounded O(N log N) subnet pacing, callback re-entrancy, no spin under the in-flight cap, bounded step(), prepare reserves the queue; delta audit 65/68 + 3 eq)
 
@@ -118,10 +118,11 @@ Unobservable (17): needs `CAP_NET_RAW` / `CAP_NET_ADMIN` (RAW mode, the RAW iden
 read-back when the mark is settable), more than 1024 replies queued (the drain budget; the flood test is
 privileged-only and timing dependent), a refused `getrandom`, `MSG_NOSIGNAL` on a datagram socket, two simultaneous
 `Io` completions, an error path `commitProbe` cannot take, a 65 KiB ICMP message, a receive timestamp later than the
-read clock. Observation, no change: `parseV4` does not check the quoted IP protocol (the v6 parser checks the next
-header is 58), so `quoted_proto` is not always 1 as its comment says: an ICMP error quoting a UDP datagram whose first
-payload byte is 8 is read as quoting an echo request; fping's own `handle_random_icmp` does not check it either, and
-the engine's ident/slot/destination checks follow.
+read clock. Decision 2026-11-18, no behaviour change: `parseV4` does not check the quoted IP protocol (the v6 parser checks the next
+header is 58), so an ICMP error quoting a UDP datagram whose first payload byte is 8 is read as quoting an echo request and
+`quoted_proto` reports 17. fping's `handle_random_icmp` and iputils `ping4_parse_reply` (`ping/ping.c`: quoted type, destination
+and id only) do not check it, and Go `x/net/icmp` hands the quoted datagram back raw; the engine's ident/slot/destination checks
+follow. The `quoted_proto` comment now says so (it claimed "always 1"), and a test pins the reported value.
 
 ## Backlog / deferred
 None beyond the accepted Linux-only platform ceiling (raw-syscall nature, shared with rawsock/
