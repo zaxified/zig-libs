@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/root.zig` (108 mutants, 90 killed, 18 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 4 tests added in `src/mutation_test.zig` (the PSS salt-length gate, an over-long blinded message, `finalize` at the largest modulus, non-canonical `z` / `r_inv` as `SignatureVerificationFailed`). No source change, no behaviour change; the ctgrind source digests are unchanged.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind source digests of the `blindrsa` rows re-pinned (counts unchanged).
 - **2026-11-13** — **HARDENING (no API change):** `blindSign` with a `random` that never yields a usable blinding factor hung inside `rsa`; rsa's new `error.EntropyFailure` (error-set addition) maps to `error.SigningFailure`. Test `(rsa BRSA-3)`.
 - **2026-11-13** — **HARDENING (no-panic sweep, no API change):** `blindSign` with a `pk` that is not `sk`'s public half asserted (`std.debug.assert`: a panic in safe builds, nothing in ReleaseFast); it is `error.SigningFailure` in every build mode now. `blind` sampled `r` in an unbounded loop, so a `random` that only yields zeros hung it; it makes at most 128 draws (an honest generator misses with probability < 2^-128) and then returns `error.InvalidBlindingFactor`. Still open, in `rsa`: the base-blinding redraw of `blindSign` (Backlog). Tests `(sweep BRSA-1)`, `(sweep BRSA-2)`; probes fail without the fixes.

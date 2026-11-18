@@ -6,7 +6,7 @@
 
 **Scope:** core — BIP173/BIP350 reference codec + Bitcoin Core `base58.cpp` / rust-bitcoin `Address` layer (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-14 · mutation 2026-09-15 · src ?
+**Audit:** review 2026-09-14 · mutation 2026-11-17 (324/336, 12 eq) · src 952a8bf2d1bc2ff7
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BECH32_FUZZ) · ct 2026-09-06 (ctgrind)
 
@@ -172,6 +172,19 @@ Bitcoin address schemes) plus a single-bit-flipped-checksum positive control (bo
 segwit bech32m-variant path and for base58check). `segwit.zig` additionally covers the
 convertBits round-trip over all program lengths 2..40 and the oversized-data-section
 no-overflow case described above.
+
+## Audit 2026-11-17 (whole-module mutation)
+
+336 mutants over every non-test line of `src/bech32.zig`, `src/segwit.zig` and `src/base58.zig`: the BCH checksum (start value, shifts, masks, the five generator conditions and constants), HRP expansion, `toLower`, `charValue`, the encoding constants and their detection, every `decode` / `encode` guard (length, case mixing, separator, HRP length and byte range, data length, charset, the lowered HRP in the checksum), the 5/8-bit regrouping in both directions with its padding rules, every `decodeSegwit` / `encodeSegwit` check (HRP, empty data, version, variant, program range, the v0 20/32 rule), and in `base58`: both bignum loops, every length gate and exact-size buffer test, the Base58Check envelope and checksum compare, `maxEncodedLenFor`, the constant-time pair (`encodeSecret`, `checkEncodeSecret`, `checkDecodeSecret` and the mask helpers `geBit`, `inRange`, `isZeroBit`, `digitChar`, `charDigit`), and the P2PKH / P2WPKH helpers. One ReleaseSafe schemata build; two further compile-error attempts failed in under a second and are not counted as builds.
+
+300 mutants died on the existing suite (one as a hang), 36 survived the first round. 12 of them are argued below; for the other 24, `src/mutation_test.zig` (8 tests) and one test at the end of `src/base58.zig` were added, and with them every one dies: the single lowercase letter `a` / `z` against an uppercase one is `MixedCase`; HRP bytes 33 and 126 are accepted by `encode` and `decode` (the range ends); `encode` checksums the lowered HRP (`BC` equals `bc`); `encodeSegwit` refuses program lengths 0, 1, 41 and 42; exact-size output buffers work and one byte less is `BufferTooSmall` (`encode`, `decode`, `checkDecode`, `checkDecodeSecret`, `encodeSecret`); a 200-byte payload is `PayloadTooLarge` in `checkEncode` / `checkEncodeSecret` (without the guard it overflows the staging buffer); `encodeSecret` zeroes the bytes past the returned string and the barrel shift is exercised; `isZeroBit` is exactly 1 for 0 and 0 otherwise; `encodeP2PKH` of the compressed generator key gives the well-known address, with the version byte carried (the earlier test composed `checkEncode` by hand and never called it). No codec rule survives: no checksum constant, charset, length limit, case rule or witness-program rule can be changed unnoticed.
+
+12 do not die, none of them a defect:
+
+- 8 EQUIVALENT: `|` for `^` in `polymod` (`chk << 5` has its low five bits clear and `v` is a `u5`); leading zero bytes converted as digits in `base58.encode` (they meet `length == 0` and `carry == 0`, the loop body never runs); the `j > 0` bound of the carry loop in `encode` and `decode` (128 bytes need at most 175 of the 180 digits; n digits never hold more than n bytes); the `checkEncode` bound without the checksum (a payload of 125..128 bytes then fails inside `encode` with the same `PayloadTooLarge`); three constants of `maxEncodedLenFor` (ratio one lower, ratio one higher, bias one lower) that the exhaustive big-integer test over every accepted length 0..128 cannot tell apart (they differ only beyond the accepted range); `geBit` shifting by 14 instead of 15 (its argument `b - 1 - a` lies in -256..44, where bits 14 and 15 agree); `inRange` shifting by 7 instead of 8 (`charDigit` is compared with the table over all 256 inputs and the mutant passes: the masks truncate to the same byte).
+- 2 UNOBSERVABLE: the overflow flag of `checkDecodeSecret` (never recorded, or ignored): 58^180 < 256^132, so no string within the 180-character limit overflows the 132-byte accumulator; the injection would be a longer length limit.
+
+Not mutated: the comptime constants (`max_hrp_len`, `max_len`, `max_payload_len`, `max_encoded_len`, the generator table, the charset and alphabet strings, the `charset_rev` / `alphabet_rev` tables; a schemata switch cannot reach comptime values), pinned by the BIP173/BIP350 and Bitcoin Core vectors; the `std.debug.assert` in `quintetsToProgram` (it guards a slice index that safe builds check anyway); the `Z1` wipes of the scratch buffers (`secureZero` defers; the module has no stack-residue probe, so the wipes are unobservable in a test and stay as audited by the 2026-09-06 measurement); `public()` and `blackBox` (identity at runtime, ctgrind-only). Counts on the card are whole-module.
 
 ## Backlog / deferred
 

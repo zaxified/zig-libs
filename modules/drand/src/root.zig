@@ -94,6 +94,7 @@ test {
     _ = round;
     _ = verify;
     _ = @import("json_uint.zig");
+    _ = @import("mutation_test.zig");
 }
 
 test "meta.deps is exactly {bls12_381, tlock}" {

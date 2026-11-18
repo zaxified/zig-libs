@@ -6,7 +6,7 @@
 
 **Scope:** core — drand Go client (drand/drand v2.1.7) (surveyed 2026-09-30; mvp -> core after chained `pedersen-bls-chained` verification of the default network landed 2026-10-06)
 
-**Audit:** review 2026-09-16 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-16 · mutation 2026-11-17 (158/162, 4 eq) · src d3335129e45af8a6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; the two verify harnesses at scale 20 = 10,000 runs, DRAND_FUZZ) · ct n/a — public beacon verification (keyword review, 2026-10-07)
 
@@ -349,6 +349,19 @@ Go source) and reused here.
   out of scope by design (caller-supplied bytes).
 - **Group file / DKG / distributed-key parsing** (`/group`): not parsed;
   only `/info` and `/public/<round>`.
+
+## Audit 2026-11-17 (whole-module mutation)
+
+162 mutants over every non-test line of `src/json_uint.zig`, `src/round.zig`, `src/chaininfo.zig` and `src/verify.zig`: the Go-style `u64` reader (the negative refusal, the base, the error codes, the frees), `parseRound` and `parseInfo` (document size limit, the JSON options and the error mapping, every hex and length gate, both point decoders with the subgroup / encoding / identity codes and the kept points, the 32-bit period range, the beacon-id limit, every field of the result, the chain-hash check), the request paths and the chain-hash charset gate, `Scheme.fromId` / `isVerifiable`, `computeChainHash` (each hashed part and its endianness, the beacon-id rule), and in `verify`: the three messages (quicknet `beaconId`, the chained `SHA-256(previous ‖ round_be)`, the deprecated scheme's DST), the equation verdict and error code of each of the three scheme arms, the group-size and missing-point guards, the randomness check, and `expectedRound`. The pairing equation itself lives in `bls12_381.scheme` and is not mutated here. One ReleaseSafe schemata build, plus a second one that already carried the new tests.
+
+121 mutants died on the existing suite. 14 tests were added in `src/mutation_test.zig` (imported from `root.zig`) and with them 37 more die: a string token (also an escaped one) is `UnexpectedToken` and leaves nothing allocated; `signatureG2` of a G1 round is `InvalidPoint`; an empty signature is `InvalidHex`, and so is an odd-length one past the buffer (the even one is `InvalidLength`); documents of exactly `max_document_bytes` parse (both parsers); unknown fields are ignored (the Go reference ignores them); an allocation failure is `OutOfMemory`, not `MalformedJson`; a 48-byte signature that is no G1 encoding is `InvalidPoint` (not `SignatureNotInSubgroup`); 33-byte and non-hex `randomness` get their own codes; `Scheme.fromId` is an exact match and `isVerifiable` is true for exactly three schemes; `hash` / `groupHash` of the wrong width are `InvalidLength`, a non-hex one `InvalidHex`; an empty, odd, over-96-byte and point-less `public_key` (both groups) each get their own error; period 2^32 - 1 passes the range check while 2^32 is `NumberOutOfRange`; a 64-byte `beaconID` is kept, 65 is `InvalidLength`; and `verifyRound` of a hand-built quicknet or deprecated-scheme value reports `MissingPublicKey` / `MissingSignature` (only the chained arm was pinned). No verification check survives: the equation verdict, the message construction (all three schemes), the signature and key subgroup / identity guards, the randomness comparison and the round arithmetic are all killed.
+
+4 do not die, none of them a defect:
+
+- 2 EQUIVALENT: an empty beacon id folded into the chain hash is a zero-byte update; `expectedRound` special-casing `now == genesis_time` answers 1 either way.
+- 2 UNOBSERVABLE: the free of an `allocated_number` token in `json_uint` (only a streaming source that splits a number across a refill produces one; both parsers read a slice into an arena, the injection would be a chunked `std.json.Reader` over `Uint64`); the `catch false` of `verifyDeprecatedUnchainedPoints` (`coreAggregateVerify` errors only on an empty or length-mismatched set, and the call passes exactly one key and one message).
+
+Not mutated: the comptime constants (`max_document_bytes`, `max_beacon_id_bytes`, the key and signature widths, `default_beacon_id`), the `comptime` DST assertions, the `meta` block, `json_uint`'s token-type arms beyond their error codes, and `tools/` (the Go differential oracle). Counts on the card are whole-module.
 
 ## Backlog / deferred
 
