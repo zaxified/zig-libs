@@ -3926,3 +3926,226 @@ test "server channels: nothing is answered after our CLOSE; stdin collection is 
         try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_FAILURE), null, t.allocator));
     }
 }
+
+// ── whole-module mutation audit, second pass (2026-11-18) ─────────────────
+
+test "Connection: dropping a confirmed channel sends our CLOSE to the peer's id" {
+    const t = std.testing;
+    const conf = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 4, 0, 0, 0, 4, 0 };
+    var cc: CannedConn = .{};
+    var conn = try cc.init(&.{&conf});
+    defer conn.deinit();
+    const s = try conn.openSession(.{});
+    const before = cc.sink.buffered().len;
+    s.deinit();
+    var r: std.Io.Reader = .fixed(cc.sink.buffered()[before..]);
+    var c: transport.CipherState = .plaintext;
+    var buf: [256]u8 = undefined;
+    const p = try transport.readPacket(&r, &c, &buf);
+    try t.expectEqual(@as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE)), p.payload[0]);
+    try t.expectEqual(@as(u32, 9), std.mem.readInt(u32, p.payload[1..5], .big));
+}
+
+test "serveConnection: a client that hangs up before opening any channel is a clean end" {
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try serverRun(true, &.{}, &sink);
+}
+
+test "serveSession: once the channel is closed both ways nothing more is read" {
+    const t = std.testing;
+    var b: [2][96]u8 = undefined;
+    var exec_buf: [64]u8 = undefined;
+    var ew: std.Io.Writer = .fixed(&exec_buf);
+    try writeChannelHeader(&ew, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&ew, "exec");
+    try ew.writeByte(0);
+    try messages.writeString(&ew, "id");
+    var close_buf: [8]u8 = undefined;
+    var cw: std.Io.Writer = .fixed(&close_buf);
+    try writeChannelHeader(&cw, .SSH_MSG_CHANNEL_CLOSE, 0);
+    var sink_buf: [16 * 1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    // A second open after the first channel is done is never read, so it
+    // is never refused either.
+    try serverRun(false, &.{ openMsg(&b[0], 0), ew.buffered(), cw.buffered(), openMsg(&b[1], 1) }, &sink);
+    const refused = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_FAILURE);
+    try t.expectEqual(@as(usize, 0), try countPackets(sink.buffered(), refused, null, t.allocator));
+}
+
+test "serveSession: data after our CLOSE is dropped before any window accounting" {
+    // As the RFC 4254 §5.3 test above, with a server window too small for
+    // the late data: counted, it would be a window overrun.
+    const t = std.testing;
+    var b0: [64]u8 = undefined;
+    const open = try channelOpenPayload(&b0, 7, 1 << 20, 1 << 15);
+    var b1: [64]u8 = undefined;
+    const exec_req = SessionCorpus.execPayload(&b1, 0, "id");
+    var b3: [64]u8 = undefined;
+    const data = SessionCorpus.dataPayload(&b3, 0, "late data");
+    var xb: [64]u8 = undefined;
+    var xw: std.Io.Writer = .fixed(&xb);
+    try writeChannelHeader(&xw, .SSH_MSG_CHANNEL_EXTENDED_DATA, 0);
+    try writeU32(&xw, 1);
+    try messages.writeString(&xw, "late stderr");
+    var b5: [16]u8 = undefined;
+    const close = SessionCorpus.onePayload(&b5, .SSH_MSG_CHANNEL_CLOSE, 0);
+    for ([_][]const u8{ data, xw.buffered() }) |late| {
+        var wire: [1024]u8 = undefined;
+        const framed = try framePackets(&wire, &.{ open, exec_req, late, close });
+        var r: std.Io.Reader = .fixed(framed);
+        var sink_buf: [4096]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        try serveSession(&tr, t.allocator, .{ .exec = fuzz_label.handler(), .stdin_mode = .ignore, .window_size = 4 });
+    }
+}
+
+test "server channels: an allowed pty-req that wants a reply gets CHANNEL_SUCCESS" {
+    const t = std.testing;
+    var b: [2][64]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&b[1]);
+    try writeChannelHeader(&pw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&pw, "pty-req");
+    try pw.writeByte(1);
+    try messages.writeString(&pw, "xterm");
+    try pw.writeAll(&@as([16]u8, @splat(0)));
+    try messages.writeString(&pw, "");
+    const open = try channelOpenPayload(&b[0], 7, 1 << 20, 1 << 15);
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    _ = serveWith(.{ .exec = fuzz_label.handler(), .allow_pty = true }, &.{ open, pw.buffered() }, &sink) catch {};
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_SUCCESS), null, t.allocator));
+}
+
+test "server channels: pty-req and window-change reach the handler; a pty-req after exec is refused" {
+    const t = std.testing;
+    const Seen = struct {
+        var pty: ?PtyInfo = null;
+        fn run(_: *anyopaque, _: std.mem.Allocator, info: *const RequestInfo, _: []const u8, _: *std.ArrayList(u8), _: *std.ArrayList(u8)) CommandError!u32 {
+            pty = info.pty;
+            return 0;
+        }
+    };
+    var b: [8][96]u8 = undefined;
+    const open = try channelOpenPayload(&b[0], 7, 1 << 20, 1 << 15);
+    var pw: std.Io.Writer = .fixed(&b[1]);
+    try writeChannelHeader(&pw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&pw, "pty-req");
+    try pw.writeByte(1);
+    try messages.writeString(&pw, "xterm-256color");
+    for ([_]u32{ 80, 24, 640, 480 }) |v| try writeU32(&pw, v);
+    try messages.writeString(&pw, "");
+    var ww: std.Io.Writer = .fixed(&b[2]);
+    try writeChannelHeader(&ww, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&ww, "window-change");
+    try ww.writeByte(1);
+    for ([_]u32{ 100, 30, 800, 600 }) |v| try writeU32(&ww, v);
+    var ew: std.Io.Writer = .fixed(&b[3]);
+    try writeChannelHeader(&ew, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&ew, "exec");
+    try ew.writeByte(1);
+    try messages.writeString(&ew, "id");
+    var p2: std.Io.Writer = .fixed(&b[4]);
+    try writeChannelHeader(&p2, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&p2, "pty-req");
+    try p2.writeByte(1);
+    try messages.writeString(&p2, "vt100");
+    for ([_]u32{ 1, 2, 3, 4 }) |v| try writeU32(&p2, v);
+    try messages.writeString(&p2, "");
+    const eof = SessionCorpus.onePayload(&b[5], .SSH_MSG_CHANNEL_EOF, 0);
+    const close = SessionCorpus.onePayload(&b[6], .SSH_MSG_CHANNEL_CLOSE, 0);
+    // An env name not on `accept_env` (empty by default) and a shell with no
+    // shell handler: each answered FAILURE when a reply is wanted.
+    var envw: std.Io.Writer = .fixed(&b[7]);
+    try writeChannelHeader(&envw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&envw, "env");
+    try envw.writeByte(1);
+    try messages.writeString(&envw, "LANG");
+    try messages.writeString(&envw, "C");
+    var shb: [32]u8 = undefined;
+    var shw: std.Io.Writer = .fixed(&shb);
+    try writeChannelHeader(&shw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&shw, "shell");
+    try shw.writeByte(1);
+    var kab: [48]u8 = undefined;
+    var kaw: std.Io.Writer = .fixed(&kab);
+    try writeChannelHeader(&kaw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&kaw, "keepalive@openssh.com");
+    try kaw.writeByte(1);
+
+    var sink_buf: [16 * 1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    Seen.pty = null;
+    try serveWith(.{
+        .exec = .{ .runInfoFn = Seen.run },
+        .allow_pty = true,
+        .stdin_mode = .collect_until_eof,
+    }, &.{ open, pw.buffered(), ww.buffered(), envw.buffered(), shw.buffered(), kaw.buffered(), ew.buffered(), ew.buffered(), p2.buffered(), eof, close }, &sink);
+    const pty = Seen.pty orelse return error.TestExpectedPty;
+    try t.expectEqualStrings("xterm-256color", pty.term());
+    try t.expectEqual(@as(u32, 100), pty.cols);
+    try t.expectEqual(@as(u32, 30), pty.rows);
+    try t.expectEqual(@as(u32, 800), pty.width_px);
+    try t.expectEqual(@as(u32, 600), pty.height_px);
+    // pty-req, window-change, exec: SUCCESS; env, shell, keepalive, the
+    // second exec and the pty-req after exec: FAILURE.
+    try t.expectEqual(@as(usize, 3), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_SUCCESS), null, t.allocator));
+    try t.expectEqual(@as(usize, 5), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_FAILURE), null, t.allocator));
+}
+
+test "server channels: a client that closes while our output waits on a shut window is a clean end" {
+    // The client opens with a zero window, so the handler's output waits;
+    // its CLOSE then ends the wait (nothing more is read).
+    var b: [3][64]u8 = undefined;
+    const open = try channelOpenPayload(&b[0], 7, 0, 1 << 15);
+    const exec_req = SessionCorpus.execPayload(&b[1], 0, "id");
+    const close = SessionCorpus.onePayload(&b[2], .SSH_MSG_CHANNEL_CLOSE, 0);
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try serveWith(.{ .exec = fuzz_label.handler(), .stdin_mode = .ignore }, &.{ open, exec_req, close }, &sink);
+}
+
+test "envAccepted: an empty pattern is an exact name, never a prefix; `*` alone matches every name" {
+    try std.testing.expect(!envAccepted(&.{""}, "LANG"));
+    try std.testing.expect(envAccepted(&.{"*"}, "LANG"));
+    try std.testing.expect(envAccepted(&.{"LC_*"}, "LC_ALL"));
+    try std.testing.expect(!envAccepted(&.{"LC_*"}, "LANG"));
+}
+
+test "server channels: a DISCONNECT while our output waits on a shut window is ChannelClosed" {
+    const t = std.testing;
+    var b: [2][64]u8 = undefined;
+    const open = try channelOpenPayload(&b[0], 7, 0, 1 << 15);
+    const exec_req = SessionCorpus.execPayload(&b[1], 0, "id");
+    const disconnect = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_DISCONNECT), 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.ChannelClosed, serveWith(.{ .exec = fuzz_label.handler(), .stdin_mode = .ignore }, &.{ open, exec_req, &disconnect }, &sink));
+}
+
+test "serveConnection: max_sessions channels at once, the next open is refused" {
+    const t = std.testing;
+    var b: [3][96]u8 = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.EndOfStream, serveWith(.{ .exec = fuzz_label.handler(), .max_sessions = 2 }, &.{ openMsg(&b[0], 0), openMsg(&b[1], 1), openMsg(&b[2], 2) }, &sink));
+    try t.expectEqual(@as(usize, 2), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), null, t.allocator));
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_FAILURE), null, t.allocator));
+    try t.expect(std.mem.find(u8, sink.buffered(), "too many session channels") != null);
+}
+
+test "server channels: with no subsystem_names any subsystem name is served" {
+    const t = std.testing;
+    var b: [2][64]u8 = undefined;
+    const open = try channelOpenPayload(&b[0], 7, 1 << 20, 1 << 15);
+    var sw: std.Io.Writer = .fixed(&b[1]);
+    try writeChannelHeader(&sw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&sw, "subsystem");
+    try sw.writeByte(1);
+    try messages.writeString(&sw, "sftp");
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    _ = serveWith(.{ .subsystem = fuzz_label.handler(), .stdin_mode = .ignore }, &.{ open, sw.buffered() }, &sink) catch {};
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_SUCCESS), null, t.allocator));
+}

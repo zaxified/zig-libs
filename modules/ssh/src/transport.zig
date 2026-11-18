@@ -1774,15 +1774,15 @@ pub fn EcdhNistKeyPair(comptime c: EcdhNist) type {
         }
 
         /// The pair for `candidate`, or null when it is not a canonical
-        /// nonzero scalar (the caller draws again). Only that one bit of the
-        /// candidate is branched on: the zero test ORs every byte rather than
-        /// stopping at the first nonzero one (`ctgrind_harness.zig`'s `ecdh`).
+        /// nonzero scalar (the caller draws again). Only that one bit is
+        /// branched on: the zero test ORs every byte, and only its verdict is
+        /// declassified for ctgrind (`ctgrind_harness.zig`'s `ecdh`, 2026-11-18).
         pub fn fromScalar(candidate: [c.len()]u8) ?@This() {
             const C = c.Curve();
             C.scalar.rejectNonCanonical(candidate, .big) catch return null;
             var acc: u8 = 0;
             for (candidate) |b| acc |= b;
-            if (acc == 0) return null;
+            if (declassified(acc == 0)) return null;
             const point = C.basePoint.mul(candidate, .big) catch return null;
             return .{ .secret = candidate, .public = point.toUncompressedSec1() };
         }
@@ -3571,6 +3571,20 @@ pub fn connectInto(
     out.* = Transport.init(reader, writer);
     errdefer out.deinit();
     try out.clientHandshake(gpa, policy);
+}
+
+/// A secret-derived verdict that is public by design (a rejected ephemeral
+/// candidate is discarded and drawn again), marked defined for memcheck so
+/// ctgrind does not count the branch on it. A no-op outside a `-fvalgrind`
+/// build. Only the bool is declassified, never the bytes it was computed
+/// from: a branch on those (an early-exit zero test, say) stays visible
+/// (whole-module mutation audit 2026-11-18: before this, such an early exit
+/// moved the one counted context instead of adding one, and the `ecdh` row
+/// could not tell).
+fn declassified(verdict: bool) bool {
+    var v = verdict;
+    std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&v));
+    return v;
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -6615,4 +6629,141 @@ test "connectInto: builds the transport in the caller's slot, and cleans it up o
     try t.expectError(error.VersionExchangeFailed, connectInto(&tr, &r, &sink, t.allocator, unreachable_policy));
     try t.expectEqual(&r, tr.reader);
     try t.expect(tr.read_cipher == .none);
+}
+
+test "KexResult.zeroize and EcdhNistKeyPair.zeroize clear every secret byte" {
+    var r: KexResult = .{};
+    @memset(&r.shared_secret, 0x5a);
+    @memset(&r.k_enc, 0x5a);
+    r.zeroize();
+    try std.testing.expect(std.mem.allEqual(u8, &r.shared_secret, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &r.k_enc, 0));
+
+    const Kp = EcdhNistKeyPair(.p256);
+    var s: [32]u8 = @splat(0x11);
+    var kp = Kp.fromScalar(s) orelse return error.TestUnexpectedNull;
+    s = @splat(0);
+    kp.zeroize();
+    try std.testing.expect(std.mem.allEqual(u8, &kp.secret, 0));
+}
+
+test "Transport.deinit leaves no byte of either cipher state behind" {
+    var tr = Transport.init(undefined, undefined);
+    @memset(std.mem.asBytes(&tr.read_cipher), 0x5a);
+    @memset(std.mem.asBytes(&tr.write_cipher), 0x5a);
+    tr.deinit();
+    try std.testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, std.mem.asBytes(&tr.read_cipher), 0x5a));
+    try std.testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, std.mem.asBytes(&tr.write_cipher), 0x5a));
+}
+
+test "installCipher: the replaced state's key bytes do not survive in the slot" {
+    var tr = Transport.init(undefined, undefined);
+    var kr: KexResult = .{};
+    @memset(&kr.shared_secret, 0x31);
+    @memset(kr.exchange_hash[0..32], 0x32);
+    tr.session_id = SessionId.from(kr.hash());
+    // The largest state first (AES-256 key, IV and a 64-byte HMAC key),
+    // then the smallest: no 16-byte window of the old state may remain.
+    try tr.installCipher(.read, "aes256-ctr", "hmac-sha2-512", .s2c, &kr);
+    const old = tr.read_cipher;
+    const ob = std.mem.asBytes(&old);
+    @memset(&kr.shared_secret, 0x41);
+    try tr.installCipher(.read, "chacha20-poly1305@openssh.com", null, .s2c, &kr);
+    const nb = std.mem.asBytes(&tr.read_cipher);
+    var i: usize = 0;
+    while (i + 16 <= ob.len) : (i += 1) {
+        const w = ob[i..][0..16];
+        // Key material only: a window of fewer than 8 distinct bytes is a
+        // length, a tag or padding.
+        var seen: [256]bool = @splat(false);
+        var distinct: usize = 0;
+        for (w) |b| {
+            if (!seen[b]) distinct += 1;
+            seen[b] = true;
+        }
+        if (distinct < 8) continue;
+        if (std.mem.find(u8, nb, w)) |at| {
+            std.debug.print("old state bytes {d}.. found at {d}\n", .{ i, at });
+            return error.TestUnexpectedResidue;
+        }
+    }
+}
+
+test "rekey: what a re-exchange queues is bounded at max_pending_bytes and max_pending_packets, inclusive" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const close = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE), 0, 0, 0, 0 };
+    var wire: [128]u8 = undefined;
+    const framed = try framePlain(&wire, &.{&close}); // then end of input
+    var sink_buf: [4096]u8 = undefined;
+    // Bytes: exactly max_pending_bytes queued is fine, one more is refused.
+    for ([_]usize{ 5, 4 }) |room| {
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = Transport.init(&r, &sink);
+        tr.gpa = gpa;
+        defer tr.deinit();
+        tr.pending_bytes = max_pending_bytes - room;
+        if (room == 5) {
+            try t.expectError(error.EndOfStream, tr.rekey());
+            try t.expectEqual(@as(usize, 1), tr.pending.items.len);
+        } else {
+            try t.expectError(error.ProtocolError, tr.rekey());
+        }
+    }
+    // Packets: max_pending_packets - 1 waiting, one more is queued; with
+    // max_pending_packets waiting it is refused.
+    for ([_]usize{ max_pending_packets - 1, max_pending_packets }) |waiting| {
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = Transport.init(&r, &sink);
+        tr.gpa = gpa;
+        defer tr.deinit();
+        for (0..waiting) |_| try tr.pending.append(gpa, .{ .payload = @constCast(&[_]u8{}), .seq = 0 });
+        if (waiting < max_pending_packets) {
+            try t.expectError(error.EndOfStream, tr.rekey());
+            try t.expectEqual(waiting + 1, tr.pending.items.len);
+        } else {
+            try t.expectError(error.ProtocolError, tr.rekey());
+        }
+    }
+}
+
+// Dead-stack probes of two transport entry points no key-exchange probe
+// reaches with a secret (whole-module mutation audit 2026-11-18): the
+// handshake sends only plaintext packets (so `writePacket` never encrypts
+// under a probe there), and it derives through `buildCipher`, not the public
+// `deriveKeys`.
+const tp_probe = struct {
+    const sp = @import("testkit").stackprobe;
+    const P = sp.Probe(.{ .window = 128 * 1024 });
+    var cipher: CipherState = .plaintext;
+    var out: [4096]u8 = undefined;
+    var payload: [256]u8 = undefined;
+    var derived: DerivedKeys = undefined;
+    var k: [32]u8 = undefined;
+    var h: [32]u8 = undefined;
+    fn write() TransportError!void {
+        var w: std.Io.Writer = .fixed(&out);
+        return writePacket(&w, &cipher, .os, &payload);
+    }
+    fn derive() void {
+        deriveKeys(&derived, &k, &h, &h);
+    }
+};
+
+test "STACKPROBE: writePacket (chacha20-poly1305, aes256-gcm) and deriveKeys leave no key or plaintext residue" {
+    try tp_probe.sp.skipUnlessOptimized();
+    var kr: KexResult = .{};
+    std.crypto.hash.sha2.Sha256.hash("ssh probe K", &kr.shared_secret, .{});
+    std.crypto.hash.sha2.Sha256.hash("ssh probe H", kr.exchange_hash[0..32], .{});
+    std.crypto.hash.sha2.Sha512.hash("ssh probe payload", tp_probe.payload[0..64], .{});
+    for (1..4) |i| @memcpy(tp_probe.payload[i * 64 ..][0..64], tp_probe.payload[0..64]);
+    inline for (.{ "chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com" }) |name| {
+        tp_probe.cipher = try buildCipher(name, null, .c2s, &kr, kr.hash(), 0);
+        _ = try tp_probe.P.run("writePacket " ++ name, tp_probe.write, .{}, &.{ &tp_probe.payload, std.mem.asBytes(&tp_probe.cipher) }, .{});
+    }
+    tp_probe.k = kr.shared_secret;
+    tp_probe.h = kr.exchange_hash[0..32].*;
+    _ = try tp_probe.P.run("deriveKeys", tp_probe.derive, .{}, &.{ &tp_probe.k, std.mem.asBytes(&tp_probe.derived) }, .{});
 }

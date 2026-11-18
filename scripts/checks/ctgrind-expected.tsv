@@ -226,7 +226,7 @@ oscore	ReleaseFast	unprotect	1	1	edd3b15d71f39582	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	6a287e6d4bf9dcec	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	667da2130cd5d4f3	95639ff37028e502
 # Zig 0.17.0 (2026-10-18): ffpow 3 -> 17, still the positive control (>=1). 0.17 std ff pow's
 # table select is now `cmov(ct.eql(k, i+1))` (ff.zig:968/975 -> :359) and compiles to a jump per
 # table entry (16) instead of 2 `eql` jumps: std ff pow leaks the secret exponent's window values
@@ -235,7 +235,7 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # ssh ecdh (2026-10-10): ecdh-sha2-nistp256/384/521, the ephemeral scalar tainted
 # through fromScalar, ecdhNistShared and ecdhNistFinish, P-256, P-384, then P-521
 # (the p521 module, whose own API verdicts are declassified there). All
-# 22 (17 before P-521) are one-bit verdicts or K's length, none a scalar-dependent branch inside
+# 22 (17 before P-521; 20 since 2026-11-18, below) are one-bit verdicts or K's length, none a scalar-dependent branch inside
 # the multiply: fromScalar's accept/reject (rejectNonCanonical, the OR-ed zero
 # test, mul's identity error — the rejection-sampling outcome, public since a
 # rejected candidate is discarded); std's pcMul16 ending in `rejectIdentity`
@@ -243,12 +243,18 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # above it uses pcSelect and is clean); ecdhNistShared's identity catch; and
 # stripLeadingZeros + writeMpint on K (RFC 4251 §5, as `dh`). Witness 4 =
 # the printed exchange hash.
+# 2026-11-18: 22 -> 20. fromScalar's zero-test verdict is declassified at its source
+# (`declassified`): its context is gone for all three curves (--stacks: no :1784/:1785
+# frame left), and the P-256 rejectNonCanonical verdict (:1782, public as the rest)
+# now surfaces as a context of its own (-3 +1). While the zero test was counted, an
+# early-exit zero test (mutation c1) only MOVED that context from the `if` to the
+# loop and the row read 22 either way; with the early exit after the change: 22.
 # ssh gex (2026-10-10): the DH-GEX client exponent x through gexPow on
 # montint's DynModint (the server-chosen prime; group14 and group16 primes
 # here) — 0 contexts in dyn/montint/limbs; the 2 in-file are stripLeadingZeros
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
-ssh	ReleaseFast	gex	1	2	6a287e6d4bf9dcec	2d8d321e6c103efe
-ssh	ReleaseFast	ecdh	1	22	6a287e6d4bf9dcec	8683e4aaf784b64c
+ssh	ReleaseFast	gex	1	2	667da2130cd5d4f3	2d8d321e6c103efe
+ssh	ReleaseFast	ecdh	1	20	667da2130cd5d4f3	8683e4aaf784b64c
 # ssh pem / pemstd (2026-10-18): HostKey.fromOpenSSH on the ed25519 fixture with the base64
 # characters carrying only seed bits tainted (44 - 2 edge characters; the edges share bits with
 # the private string's 0x40 length and the public-key copy, and tainting them made every later
@@ -265,7 +271,7 @@ ssh	ReleaseFast	ecdh	1	22	6a287e6d4bf9dcec	8683e4aaf784b64c
 # replaced decoder (std.mem.indexOfPos = Boyer-Moore-Horspool + std.base64 table decode): 18 in
 # mem.zig/base64.zig on the first and second measurement. It must stay >= 1; no witness, since a
 # value loaded through a tainted table index reads as defined to memcheck.
-ssh	ReleaseFast	pem	1	3	9700fb71cc7b5a24	2ba7559fa99a2188
+ssh	ReleaseFast	pem	1	3	fd6a2bdd03bf50cf	2ba7559fa99a2188
 ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero

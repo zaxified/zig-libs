@@ -4018,3 +4018,147 @@ test "serveUserauth: a banner over max_banner_len is refused before anything is 
         }
     }
 }
+
+test "client userauth: the password and a keyboard-interactive answer do not survive in the freed request buffers" {
+    // The client side of the server test above: `passwordStep` and `kbdStep`
+    // encode the secret into a heap buffer and scrub it before freeing.
+    // Discriminating only in ReleaseFast/ReleaseSmall (`Allocator.free`
+    // paints the block 0xaa in Debug/ReleaseSafe); unconditional, as there.
+    const t = std.testing;
+    const secret = "client-s3cr3t-staple-horse";
+    const success = [_]u8{@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)};
+    var one_prompt: [32]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&one_prompt);
+    try ow.writeAll(&[_]u8{ messages.msg_userauth_info_request, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+    try messages.writeString(&ow, "p");
+    try ow.writeByte(0);
+
+    const backing = try t.allocator.alloc(u8, 256 * 1024);
+    defer t.allocator.free(backing);
+    var wire: [512]u8 = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    for (0..2) |case| {
+        @memset(backing, 0);
+        var fba = std.heap.FixedBufferAllocator.init(backing);
+        const framed = if (case == 0)
+            try framePackets(&wire, &.{&success})
+        else
+            try framePackets(&wire, &.{ ow.buffered(), &success });
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        if (case == 0) {
+            try authenticatePassword(&tr, fba.allocator(), "alice", secret, .{});
+        } else {
+            var ans: AnswerWith = .{ .answer = secret };
+            try authenticateKeyboardInteractive(&tr, fba.allocator(), "alice", .{ .ctx = &ans, .respondFn = AnswerWith.f }, .{});
+        }
+        // Positive control: the secret really went out.
+        try t.expect(std.mem.find(u8, sink.buffered(), secret) != null);
+        try t.expectEqual(@as(?usize, null), std.mem.find(u8, backing, secret));
+    }
+}
+
+// ── dead-stack probes for the two userauth secrets without a key-path probe
+// (whole-module mutation audit 2026-11-18): the server's keyboard-interactive
+// answers (`kbd_burn`) and the client's prompted password (`runMethod`'s
+// stack buffer). Needles only: neither entry point burns as a whole.
+
+const ua_probe = struct {
+    const sp = @import("testkit").stackprobe;
+    const P = sp.Probe(.{ .window = 128 * 1024 });
+    var secret: [32]u8 = undefined;
+    var wire: [4096]u8 = undefined;
+    var framed: []const u8 = &.{};
+    var sink_buf: [8192]u8 = undefined;
+    var heap: [256 * 1024]u8 = undefined;
+    var prompts = [_]KbdPrompt{.{ .text = "Code: ", .echo = false }};
+
+    var digest: [32]u8 = undefined;
+    // A hook that hashes the answer, as a real one would before comparing:
+    // the hash's block buffer holds the answer in the hook's own frames,
+    // which only the `kbd_burn` zeroes (a by-value compare stayed in
+    // registers and left the probe nothing to see).
+    fn check(_: *anyopaque, _: []const u8, answers: []const []const u8) bool {
+        if (answers.len != 1) return false;
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(answers[0], &h, .{});
+        return std.mem.eql(u8, &h, &digest); // a test hook: nothing secret is compared here
+    }
+    fn serveKbd() UserauthError!AuthResult {
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        var fba = std.heap.FixedBufferAllocator.init(&heap);
+        return serveUserauth(&tr, fba.allocator(), .{ .keyboard_interactive = .{ .prompts = &prompts, .checkFn = check } });
+    }
+    fn prompt(_: *anyopaque, _: []const u8, buf: []u8) ?usize {
+        @memcpy(buf[0..secret.len], &secret);
+        return secret.len;
+    }
+    fn clientPrompt() UserauthError!void {
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        var fba = std.heap.FixedBufferAllocator.init(&heap);
+        const methods = [_]ClientMethod{.{ .password_prompt = .{ .promptFn = prompt } }};
+        return authenticateWith(&tr, fba.allocator(), "alice", &methods, .{ .request_service = false });
+    }
+};
+
+test "STACKPROBE: no keyboard-interactive answer residue after serveUserauth" {
+    try ua_probe.sp.skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha256.hash("ssh probe kbd answer", &ua_probe.secret, .{});
+    std.crypto.hash.sha2.Sha256.hash(&ua_probe.secret, &ua_probe.digest, .{});
+    var m: [2]Msg = undefined;
+    ua_probe.framed = try framePackets(&ua_probe.wire, &.{ m[0].kbd("alice").bytes(), m[1].infoResponse(&ua_probe.secret).bytes() });
+    // Positive control: the dialogue authenticates.
+    try std.testing.expectEqual(AuthMethod.keyboard_interactive, (try ua_probe.serveKbd()).method);
+    _ = try ua_probe.P.run("serveUserauth keyboard-interactive", ua_probe.serveKbd, .{}, &.{&ua_probe.secret}, .{ .burn = false, .residue = false });
+}
+
+test "STACKPROBE: no prompted-password residue after authenticateWith" {
+    try ua_probe.sp.skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha256.hash("ssh probe client password", &ua_probe.secret, .{});
+    const success = [_]u8{@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)};
+    const fail_pw = failureWith("password");
+    ua_probe.framed = try framePackets(&ua_probe.wire, &.{ &fail_pw, &success });
+    try ua_probe.clientPrompt(); // positive control: it authenticates
+    _ = try ua_probe.P.run("authenticateWith password_prompt", ua_probe.clientPrompt, .{}, &.{&ua_probe.secret}, .{ .burn = false, .residue = false });
+}
+
+test "serveUserauth: a keyboard-interactive answer is scrubbed from the scratch before the next round is read" {
+    // Round one's answer is long, round two's short: without the scrub the
+    // tail of the first answer would still be in the packet scratch while
+    // the second round is decided.
+    const t = std.testing;
+    const S = struct {
+        var backing: [256 * 1024]u8 = undefined;
+        const first = "round-one-answer-0123456789abcdefghij";
+        var leaked: bool = true;
+        fn kbd(_: *anyopaque, _: *const AuthRequest, p: *KbdPrompter) Decision {
+            var a: [1][]const u8 = undefined;
+            if (!p.challenge("", "one", &.{.{ .text = "1: ", .echo = false }}, &a)) return .reject;
+            if (!std.mem.eql(u8, a[0], first)) return .reject;
+            if (!p.challenge("", "two", &.{.{ .text = "2: ", .echo = false }}, &a)) return .reject;
+            leaked = std.mem.find(u8, &backing, first[first.len - 16 ..]) != null;
+            return if (std.mem.eql(u8, a[0], "x")) Decision.accepted else .reject;
+        }
+    };
+    @memset(&S.backing, 0);
+    var fba = std.heap.FixedBufferAllocator.init(&S.backing);
+    var m: [3]Msg = undefined;
+    var wire: [4096]u8 = undefined;
+    const framed = try framePackets(&wire, &.{ m[0].kbd("alice").bytes(), m[1].infoResponse(S.first).bytes(), m[2].infoResponse("x").bytes() });
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+    tr.session_id = transport.SessionId.from("session");
+    const res = try serveUserauth(&tr, fba.allocator(), .{ .callbacks = .{ .keyboard_interactive = .{ .decideFn = S.kbd } } });
+    try t.expectEqual(AuthMethod.keyboard_interactive, res.method);
+    try t.expect(!S.leaked);
+}

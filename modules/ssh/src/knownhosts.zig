@@ -377,3 +377,97 @@ test "writeLine plain: port 22 bare, others bracketed, round-trips" {
     try tt.expectEqual(transport.HostKeyVerdict.accept, check(w.buffered(), "box.lan", 2222, key.blob));
     _ = &b2;
 }
+
+test "lookupName: empty and over-long hosts are refused; 253 is the longest, with any port" {
+    var out: [max_name_len]u8 = undefined;
+    try tt.expectEqual(@as(?[]const u8, null), lookupName(&out, "", 22));
+    try tt.expectEqual(@as(?[]const u8, null), lookupName(&out, "", 2222));
+    const long: [254]u8 = @splat('a');
+    try tt.expectEqual(@as(?[]const u8, null), lookupName(&out, &long, 22));
+    try tt.expectEqual(@as(?[]const u8, null), lookupName(&out, long[0..254], 2222));
+    // 253 bytes in the longest bracketed form fills the buffer exactly.
+    const n = lookupName(&out, long[0..253], 65535) orelse return error.TestUnexpectedNull;
+    try tt.expectEqual(max_name_len, n.len);
+    try tt.expect(std.mem.endsWith(u8, n, "]:65535"));
+    // An empty host never matches, not even `*`.
+    var b: [keys.max_blob_len]u8 = undefined;
+    const e = try parseLine("* ssh-ed25519 " ++ hv.ed25519_pub_b64, &b);
+    try tt.expect(!e.matches("", 22));
+    try tt.expect(e.matches("x", 22));
+}
+
+test "globMatch: a mismatch after `*` retries from the star, never before it" {
+    // The retry restarts one past the position the star was met at: the
+    // characters the pattern consumed before the star are not re-read.
+    try tt.expect(!globMatch("ab*bc", "abc"));
+    try tt.expect(globMatch("ab*bc", "abxbc"));
+    // ... and the pattern restarts right after the star, not where it failed.
+    try tt.expect(!globMatch("*ab", "aXb"));
+    try tt.expect(globMatch("*ab", "aXab"));
+}
+
+test "hashed entries: a salt up to 64 bytes is used, a longer one refused without reading past it" {
+    var b: [keys.max_blob_len]u8 = undefined;
+    inline for (.{ 64, 65 }) |n| {
+        var salt: [n]u8 = undefined;
+        for (&salt, 0..) |*c, i| c.* = @truncate(i *% 7 +% 1);
+        var mac: [HmacSha1.mac_length]u8 = undefined;
+        HmacSha1.create(&mac, "box.lan", &salt);
+        var se: [b64.Encoder.calcSize(n)]u8 = undefined;
+        var me: [28]u8 = undefined;
+        var line_buf: [512]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "|1|{s}|{s} ssh-ed25519 {s}", .{ b64.Encoder.encode(&se, &salt), b64.Encoder.encode(&me, &mac), hv.ed25519_pub_b64 });
+        const e = try parseLine(line, &b);
+        try tt.expectEqual(n == 64, e.matches("box.lan", 22));
+    }
+}
+
+test "parseLine: an empty or blank line is InvalidLine" {
+    var b: [keys.max_blob_len]u8 = undefined;
+    try tt.expectError(error.InvalidLine, parseLine("", &b));
+    try tt.expectError(error.InvalidLine, parseLine(" \t\r\n", &b));
+    // A commented-out entry stays a comment, even called directly.
+    try tt.expectError(error.InvalidLine, parseLine("# ssh-ed25519 " ++ hv.ed25519_pub_b64, &b));
+}
+
+test "Iterator: blank lines are skipped, line numbers counted, a last line without a newline read; options refused" {
+    var b: [keys.max_blob_len]u8 = undefined;
+    const text = "\n   \nbox.lan ssh-ed25519 " ++ hv.ed25519_pub_b64 ++ "\n\n" ++
+        "opt.lan command=\"x\" ssh-ed25519 " ++ hv.ed25519_pub_b64 ++ "\n" ++
+        "last.lan ssh-ed25519 " ++ hv.ed25519_pub_b64;
+    var it = Iterator.init(text);
+    const e1 = it.next(&b) orelse return error.TestExpectedEntry;
+    try tt.expectEqualStrings("box.lan", e1.patterns);
+    try tt.expectEqual(@as(usize, 3), it.line_number);
+    const e2 = it.next(&b) orelse return error.TestExpectedEntry;
+    try tt.expectEqualStrings("last.lan", e2.patterns);
+    try tt.expectEqual(@as(usize, 6), it.line_number);
+    try tt.expect(it.next(&b) == null);
+    // The options line is the one skipped.
+    try tt.expectEqual(@as(usize, 1), it.skipped);
+    try tt.expectError(error.InvalidLine, parseLine("opt.lan command=\"x\" ssh-ed25519 " ++ hv.ed25519_pub_b64, &b));
+}
+
+test "hashed entries: a hash field that is not exactly 20 bytes never matches" {
+    // A 19-byte prefix of the right MAC must not match, whatever the byte
+    // after it would have been: pick a salt whose MAC ends in 0xaa (the
+    // safe builds' fill for an undefined byte) so that a decode into a
+    // part-filled 20-byte buffer would compare equal.
+    var b: [keys.max_blob_len]u8 = undefined;
+    var salt: [salt_len]u8 = @splat(0);
+    var mac: [HmacSha1.mac_length]u8 = undefined;
+    var k: u32 = 0;
+    while (true) : (k += 1) {
+        std.mem.writeInt(u32, salt[0..4], k, .little);
+        HmacSha1.create(&mac, "box.lan", &salt);
+        if (mac[19] == 0xaa) break;
+    }
+    var se: [28]u8 = undefined;
+    var me: [28]u8 = undefined;
+    var line_buf: [256]u8 = undefined;
+    for ([_]usize{ 19, 20 }) |n| {
+        const line = try std.fmt.bufPrint(&line_buf, "|1|{s}|{s} ssh-ed25519 {s}", .{ b64.Encoder.encode(&se, &salt), b64.Encoder.encode(&me, mac[0..n]), hv.ed25519_pub_b64 });
+        const e = try parseLine(line, &b);
+        try tt.expectEqual(n == 20, e.matches("box.lan", 22));
+    }
+}

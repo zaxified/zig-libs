@@ -18,7 +18,10 @@
 //! * `ecdh` — `ecdh-sha2-nistp256` / `-nistp384` (2026-10-10): taints the
 //!   ephemeral scalar and runs our key-pair construction (`fromScalar`), the
 //!   shared secret against a peer point (`ecdhNistShared`, std's `mul`) and
-//!   `K`'s encoding plus the exchange hash (`ecdhNistFinish`).
+//!   `K`'s encoding plus the exchange hash (`ecdhNistFinish`). `fromScalar`'s
+//!   zero-test verdict is declassified at its source (2026-11-18): while it
+//!   was counted, an early-exit zero test moved that one context from the
+//!   `if` to the loop and the row read the same (mutation audit, c1).
 //! * `gex` — `diffie-hellman-group-exchange-sha256` client (2026-10-10): the
 //!   exponent `x` through `gexPow` on montint's run-time modulus (`DynModint`,
 //!   the server-chosen prime), for the group14 and group16 primes.
