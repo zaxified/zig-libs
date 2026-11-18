@@ -306,11 +306,18 @@ pub fn DpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// The keys are written through `out`, never returned: a returned
         /// `[2]Key` sits in the caller's result slot, out of reach of the burn
         /// (the stack probe found the root seeds there, 2026-10-09).
-        pub fn genWithSeeds(alpha: Index, beta: Elem, s0: *const Seed, s1: *const Seed, out: *[2]Key) void {
+        ///
+        /// `alpha` and `beta` come by pointer, like the seeds: the point `α` is
+        /// the secret this key hides, and a by-value argument would sit in
+        /// the entry frame's argument tuple, above the burn, as a dead-stack
+        /// copy (8 + up to 8·L bytes; SPEC Backlog, closed 2026-11-18).
+        pub fn genWithSeeds(alpha: *const Index, beta: *const Elem, s0: *const Seed, s1: *const Seed, out: *[2]Key) void {
             return burn.run(burn.gen_burn, void, genBody, .{ alpha, beta, s0, s1, out });
         }
 
-        fn genBody(alpha: Index, beta: Elem, s0p: *const Seed, s1p: *const Seed, out: *[2]Key) void {
+        fn genBody(alpha_p: *const Index, beta_p: *const Elem, s0p: *const Seed, s1p: *const Seed, out: *[2]Key) void {
+            const alpha = alpha_p.*;
+            const beta = beta_p.*;
             const s0 = s0p.*;
             const s1 = s1p.*;
             // PRG setup (AES key expansion) hoisted out of the level loop.
@@ -648,8 +655,8 @@ test "a key from the OTHER PRG is different bytes, and the tagged codec rejects 
 
     var pa: [2]A.Key = undefined;
     var ps: [2]S.Key = undefined;
-    A.genWithSeeds(37, 0xDEADBEEF, &s0, &s1, &pa);
-    S.genWithSeeds(37, 0xDEADBEEF, &s0, &s1, &ps);
+    A.genWithSeeds(&37, &0xDEADBEEF, &s0, &s1, &pa);
+    S.genWithSeeds(&37, &0xDEADBEEF, &s0, &s1, &ps);
     const ka = pa[0];
     const ks = ps[0];
 
@@ -694,7 +701,7 @@ test "both PRG instantiations are correct DPFs over the full domain" {
         for ([_]D.Index{ 0, 1, 63, 100, 127 }) |alpha| {
             const beta: D.Elem = 0x01020304;
             var keys: [2]D.Key = undefined;
-            D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
+            D.genWithSeeds(&alpha, &beta, &s0, &s1, &keys);
             var e0: [D.domain_size]D.Elem = undefined;
             var e1: [D.domain_size]D.Elem = undefined;
             D.evalAll(0, &keys[0], &e0);

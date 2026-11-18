@@ -1131,7 +1131,7 @@ ctap2pin	ReleaseFast	one	1	5	1b2ea97a80cc47e9	12de2588e792c80e
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 ctap2pin	ReleaseFast	two	1	5	1b2ea97a80cc47e9	4f76909ff534c3cc
 ctap2pin	ReleaseFast	token	1	0	1b2ea97a80cc47e9	076a3a6729a924b0
-fss	ReleaseFast	gen	1	0	87070291f4d13650	b40b02f9cf423f05
+fss	ReleaseFast	gen	1	0	8c30650dd63a0532	b40b02f9cf423f05
 # Was `>=1` and a confirmed defect: `dpf.zig:326`'s xorMasked compiled to
 # `test $0x1,%r9b` / `je` on the secret control bit at THIS call site while
 # staying branch-free at genWithSeeds'. Fixed by laundering the mask through
@@ -1141,7 +1141,7 @@ fss	ReleaseFast	gen	1	0	87070291f4d13650	b40b02f9cf423f05
 # `key.cw_final & (0 -% @as(Elem, t))` (dpf.zig) compiled to `test $0x1,%r13b` / `je` over the
 # load of cw_final -- a jump on the secret final control bit. Every secret-bit mask over an `Elem`
 # now goes through `secretMask` (asm-laundered word, dpf.zig); back to 0.
-fss	ReleaseFast	eval	1	0	87070291f4d13650	da79011b1ab46d96
+fss	ReleaseFast	eval	1	0	8c30650dd63a0532	da79011b1ab46d96
 bfv	ReleaseFast	keygen	1	<=29	7f477b26c2558422	85d334608120f4fc
 bfv	ReleaseFast	encrypt	1	<=17	7f477b26c2558422	e4cdbb1aa2e9c9dc
 bfv	ReleaseFast	decrypt	1	<=6	7f477b26c2558422	51de1d1011ed3c4c
@@ -2312,8 +2312,8 @@ saml	ReleaseFast	sign	1	45	1571b44e3ddde906	88075a41bcf0b2bb
 # -mcpu=x86_64.
 oscore	ReleaseFast	protect	1	80	edd3b15d71f39582	6eac6a90e3479ab8	cpu=x86_64 control=2 trap=2
 oscore	ReleaseFast	unprotect	1	81	edd3b15d71f39582	ed85db89e3d7e9fd	cpu=x86_64 control=1 trap=1
-fss	ReleaseFast	gen	1	0	87070291f4d13650	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
-fss	ReleaseFast	eval	1	0	87070291f4d13650	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
+fss	ReleaseFast	gen	1	0	8c30650dd63a0532	b40b02f9cf423f05	cpu=x86_64 control=4 trap=4
+fss	ReleaseFast	eval	1	0	8c30650dd63a0532	da79011b1ab46d96	cpu=x86_64 control=2 trap=2
 aesgcm	ReleaseFast	generic	1	226	ca4cbdc7d714f5d8	b60805fea700d105	cpu=x86_64 control=8 trap=8
 dtls	ReleaseFast	hs	1	302	61d188b7e8d1387e	61a204df8edf79a0	cpu=x86_64 control=177 trap=179
 dtls	ReleaseFast	app	1	278	61d188b7e8d1387e	70da17057fd7a044	cpu=x86_64 control=279 trap=279

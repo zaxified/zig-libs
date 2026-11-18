@@ -47,7 +47,7 @@ const D = fss.Dpf(8, 4); // domain {0,1}^8 = 256 points, output group Z_{2^32}
 // Caller supplies two independent, secret, cryptographically-random 16-byte
 // seeds (the DPF's only randomness — see Caveats). Same seeds ⇒ same keys.
 var keys: [2]D.Key = undefined;
-D.genWithSeeds(alpha, beta, &seed0, &seed1, &keys);
+D.genWithSeeds(&alpha, &beta, &seed0, &seed1, &keys);
 const k0 = keys[0];
 const k1 = keys[1];
 
@@ -100,7 +100,7 @@ const M = fss.Mpf(8, 4, 3); // 3 points over {0,1}^8, output group Z_{2^32}
 // 2k seeds: one INDEPENDENT pair per instance. Byte-identical seeds are
 // rejected with error.SeedReuse — see Caveats for why this one is enforced.
 var keys: [2]M.Key = undefined;
-try M.genWithSeeds(alphas, betas, &seeds0, &seeds1, &keys);
+try M.genWithSeeds(&alphas, &betas, &seeds0, &seeds1, &keys);
 
 // eval = the multi-point function itself (the k instances summed):
 const y = M.eval(0, &keys[0], x) +% M.eval(1, &keys[1], x); // == Σ_j β_j·1{x==α_j}

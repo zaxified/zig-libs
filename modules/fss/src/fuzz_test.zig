@@ -71,7 +71,7 @@ pub fn fuzzDpf(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         if (std.mem.eql(u8, &s0, &s1)) s1[0] ^= 1;
         const alpha: D.Index = src.value(u8);
         const beta: D.Elem = src.value(u32);
-        D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
+        D.genWithSeeds(&alpha, &beta, &s0, &s1, &keys);
         // Through the codec, both parties.
         var wire: [2][D.Key.serialized_len]u8 = undefined;
         keys[0].toBytes(&wire[0]);
@@ -144,7 +144,7 @@ pub fn fuzzMpf(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         for (&betas) |*b| b.* = src.value(u32);
         if (src.valueRangeAtMost(u8, 0, 3) == 0) alphas[1] = alphas[0]; // repeated point: sums
         var keys: [2]M.Key = undefined;
-        M.genWithSeeds(alphas, betas, &s0, &s1, &keys) catch |e| {
+        M.genWithSeeds(&alphas, &betas, &s0, &s1, &keys) catch |e| {
             if (e != error.SeedReuse) return error.UnexpectedError;
             MpfMark.mark(.seed_reuse_refused);
             return;

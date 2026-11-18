@@ -56,14 +56,14 @@ fn setup() void {
         seed(&ms1[j], &l);
     }
     var k: [2]D.Key = undefined;
-    D.genWithSeeds(333, 0x01020304, &s0, &s1, &k);
+    D.genWithSeeds(&333, &0x01020304, &s0, &s1, &k);
     key0 = k[0];
     key1 = k[1];
     var sk: [2]DS.Key = undefined;
-    DS.genWithSeeds(333, 0x01020304, &s0, &s1, &sk);
+    DS.genWithSeeds(&333, &0x01020304, &s0, &s1, &sk);
     skey = sk[0];
     var mk: [2]M.Key = undefined;
-    M.genWithSeeds(.{ 5, 77, 200 }, .{ 1, 2, 3 }, &ms0, &ms1, &mk) catch unreachable;
+    M.genWithSeeds(&.{ 5, 77, 200 }, &.{ 1, 2, 3 }, &ms0, &ms1, &mk) catch unreachable;
     mkey0 = mk[0];
     mkey1 = mk[1];
     key0.toBytes(&key_bytes);
@@ -105,8 +105,8 @@ test "STACKPROBE: no seed or key residue after any entry point" {
     const mseeds = &[_][]const u8{ &ms0[0], &ms0[1], &ms0[2], &ms1[0], &ms1[1], &ms1[2] };
     const mkb = &[_][]const u8{ &mkey_bytes, &mkey0.keys[0].seed, &mkey0.keys[1].seed, &mkey0.keys[2].seed };
 
-    _ = try P.run("Dpf.genWithSeeds", D.genWithSeeds, .{ 333, 0x01020304, &s0, &s1, &gen_out }, seeds, .{});
-    _ = try P.run("DpfSha.genWithSeeds", DS.genWithSeeds, .{ 333, 0x01020304, &s0, &s1, &sgen_out }, seeds, .{});
+    _ = try P.run("Dpf.genWithSeeds", D.genWithSeeds, .{ &@as(D.Index, 333), &@as(D.Elem, 0x01020304), &s0, &s1, &gen_out }, seeds, .{});
+    _ = try P.run("DpfSha.genWithSeeds", DS.genWithSeeds, .{ &@as(DS.Index, 333), &@as(DS.Elem, 0x01020304), &s0, &s1, &sgen_out }, seeds, .{});
     _ = try P.run("Dpf.eval", D.eval, .{ 0, &key0, 333 }, kb, .{});
     _ = try P.run("Dpf.eval party 1", D.eval, .{ 1, &key1, 12 }, &[_][]const u8{ &key_bytes1, &key1.seed }, .{});
     _ = try P.run("DpfSha.eval", DS.eval, .{ 0, &skey, 333 }, &[_][]const u8{&skey.seed}, .{});
@@ -122,7 +122,7 @@ test "STACKPROBE: no seed or key residue after any entry point" {
     try std.testing.expectEqualSlices(u8, &key0.seed, &decoded.seed);
     try std.testing.expectEqualSlices(u8, &key0.seed, &tagged_decoded.seed);
 
-    _ = try P.run("Mpf.genWithSeeds", M.genWithSeeds, .{ .{ 5, 77, 200 }, .{ 1, 2, 3 }, &ms0, &ms1, &mgen_out }, mseeds, .{});
+    _ = try P.run("Mpf.genWithSeeds", M.genWithSeeds, .{ &@as([3]M.Index, .{ 5, 77, 200 }), &@as([3]M.Elem, .{ 1, 2, 3 }), &ms0, &ms1, &mgen_out }, mseeds, .{});
     _ = try P.run("Mpf.eval", M.eval, .{ 0, &mkey0, 77 }, mkb, .{});
     var each: [3]M.Elem = undefined;
     _ = try P.run("Mpf.evalEach", M.evalEach, .{ 0, &mkey0, 77, &each }, mkb, .{});

@@ -53,7 +53,7 @@ pub fn main() !void {
     rand.bytes(&s1);
 
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
+    D.genWithSeeds(&alpha, &beta, &s0, &s1, &keys);
     const k0 = keys[0];
     const k1 = keys[1];
 
@@ -93,7 +93,7 @@ pub fn main() !void {
     // this is exactly what the format tag exists to catch.
     const DSha = fss.DpfWith(fss.prg.Sha256Prg, 8, 4);
     var sha_keys: [2]DSha.Key = undefined;
-    DSha.genWithSeeds(alpha, beta, &s0, &s1, &sha_keys);
+    DSha.genWithSeeds(&alpha, &beta, &s0, &s1, &sha_keys);
     var sha_buf: [DSha.Key.tagged_len]u8 = undefined;
     sha_keys[0].toBytesTagged(&sha_buf);
     // Same tagged length as the AES instantiation, so only the tag byte

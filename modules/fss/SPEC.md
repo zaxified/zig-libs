@@ -6,7 +6,7 @@
 
 **Scope:** mvp — google/distributed_point_functions and libfss (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-06 (39/40, 1 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-18 (43/44, 1 eq) · src 6488dc09720282d9
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, FSS_FUZZ) · ct 2026-09-09 (ctgrind)
 
@@ -558,7 +558,7 @@ PRG was kept.
 
 - **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `convert` (per DPF tree node), `fromBytesBody`, `serializeCwBody`. Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
 
-- **Dead stack: `alpha`/`beta` by value** *(2026-10-09, dead-stack sweep)*: the secret point and value enter `genWithSeeds` as plain integers, so `burn.run`'s argument tuple keeps a copy in the entry frame above the burn (8 + up to 8·L bytes). Seeds/keys are already by pointer and burned. A `*const` form is cheap but changes every call; deferred until a consumer cares.
+- **DONE 2026-11-18 (owner decision) — Dead stack: `alpha`/`beta` by value** *(2026-10-09, dead-stack sweep)*: `Dpf.genWithSeeds` and `Mpf.genWithSeeds` take the secret point and value by `*const` (like the seeds), and the body copies them inside its own burned frame, so `burn.run`'s argument tuple holds only pointers. Pre-1.0 API change; every call site updated. A caller's own temporaries (the local the pointer points at, a `@intCast` result) are the caller's to wipe: the module cannot reach them. The stack probe's needles are the seeds, so it does not observe α itself; the guarantee is by construction.
 - **Distributed comparison function (DCF) and interval functions** *(survey 2026-09-30)*: the module doc names `dcf.zig` as the reason it is called `fss` and not `dpf`. Google's tree has `dcf/`, libfss offers comparison; private analytics (thresholds, histograms), secure ReLU/comparison in MPC ML, and range queries need it. Medium (BCGIKRS21, one bit of extra state per level, reuses `prg` and `group`); fits §2.
 - **Incremental / hierarchical DPF (IDPF)** *(survey 2026-09-30)*: the headline feature of the reference library; private heavy hitters (Poplar, the VDAF `Poplar1` in DAP) is the main deployed use of DPFs. `evalFull` already walks prefixes internally but there is no per-level output/CW. Medium; fits §2.
 - **Non-`Z_{2^{8L}}` output groups** (`XOR`, `Z_N`, tuples/vectors of elements) *(survey 2026-09-30, inferred from Google's API)*: only the additive `Z_{2^{8L}}` group exists (`group.zig`); PIR-by-XOR and VDAF-style field elements need others. Small-medium; fits §2.

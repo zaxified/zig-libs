@@ -227,9 +227,12 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         /// consumer for which that is the wrong semantic (`pir`'s `k`-record
         /// retrieval is one — it wants `k` separate results) must use
         /// `evalEach`, where the instances never meet.
+        ///
+        /// `alphas` and `betas` come by pointer, like the seeds (see
+        /// `Dpf.genWithSeeds`: a by-value secret point is a dead-stack copy).
         pub fn genWithSeeds(
-            alphas: [k]Index,
-            betas: [k]Elem,
+            alphas: *const [k]Index,
+            betas: *const [k]Elem,
             s0: *const [k]Seed,
             s1: *const [k]Seed,
             out: *[2]Key,
@@ -238,8 +241,8 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
         }
 
         fn genBody(
-            alphas: [k]Index,
-            betas: [k]Elem,
+            alphas: *const [k]Index,
+            betas: *const [k]Elem,
             s0: *const [k]Seed,
             s1: *const [k]Seed,
             out: *[2]Key,
@@ -247,7 +250,7 @@ pub fn MpfWith(comptime P: type, comptime n_bits: usize, comptime out_bytes: usi
             try requireDistinctSeeds(s0, s1);
             for (0..k) |j| {
                 var pair: [2]Dpf.Key = undefined;
-                Dpf.genWithSeeds(alphas[j], betas[j], &s0[j], &s1[j], &pair);
+                Dpf.genWithSeeds(&alphas[j], &betas[j], &s0[j], &s1[j], &pair);
                 out[0].keys[j] = pair[0];
                 out[1].keys[j] = pair[1];
             }

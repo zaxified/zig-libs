@@ -36,7 +36,7 @@ fn benchCase(
     const s0 = @as([16]u8, @splat(0x3C));
     const s1 = @as([16]u8, @splat(0xC3));
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(alpha, 1, &s0, &s1, &keys);
+    D.genWithSeeds(&alpha, &1, &s0, &s1, &keys);
 
     // correctness first: both routes must agree, or the timing is of nothing
     for (0..prefix_len) |x| naive[x] = D.eval(0, &keys[0], @intCast(x));
@@ -95,7 +95,7 @@ fn benchMulti(
         s1[j] = @splat(@truncate(j * 2 + 128));
     }
     var keys: [2]M.Key = undefined;
-    try M.genWithSeeds(alphas, betas, &s0, &s1, &keys);
+    try M.genWithSeeds(&alphas, &betas, &s0, &s1, &keys);
 
     const Sink = struct {
         out: []M.Elem,
@@ -181,7 +181,7 @@ fn benchPrgPair(comptime n_bits: usize) !void {
             const a = nowNs();
             for (0..gens) |i| {
                 var keys: [2]D.Key = undefined;
-                D.genWithSeeds(@intCast(i % D.domain_size), 1, &s0, &s1, &keys);
+                D.genWithSeeds(&@intCast(i % D.domain_size), &1, &s0, &s1, &keys);
                 acc ^= keys[0].cw[0].s_cw[0];
             }
             const b = nowNs();
@@ -191,7 +191,7 @@ fn benchPrgPair(comptime n_bits: usize) !void {
         // (c) evalFull over the whole (small) domain
         var out: [1 << n_bits]D.Elem = undefined;
         var keys: [2]D.Key = undefined;
-        D.genWithSeeds(7, 1, &s0, &s1, &keys);
+        D.genWithSeeds(&7, &1, &s0, &s1, &keys);
         var t_eval: u64 = std.math.maxInt(u64);
         for (0..reps) |_| {
             const a = nowNs();

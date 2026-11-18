@@ -88,7 +88,7 @@ test "full-domain correctness: Gen+EvalAll reconstruct f_{α,β} exhaustively" {
             p1.* = @truncate(i * 17 + j * 5 + 200);
         }
         var keys: [2]D.Key = undefined;
-        D.genWithSeeds(c.a, c.b, &s0, &s1, &keys);
+        D.genWithSeeds(&c.a, &c.b, &s0, &s1, &keys);
         var b0: [D.domain_size]D.Elem = undefined;
         var b1: [D.domain_size]D.Elem = undefined;
         D.evalAll(0, &keys[0], &b0);
@@ -104,7 +104,7 @@ test "byte-exact KAT vs independent reference vectors (anti-self-consistency)" {
         const alpha: D.Index = @intCast(v.alpha);
         const beta: D.Elem = @intCast(v.beta);
         var keys: [2]D.Key = undefined;
-        D.genWithSeeds(alpha, beta, &v.seed0, &v.seed1, &keys);
+        D.genWithSeeds(&alpha, &beta, &v.seed0, &v.seed1, &keys);
         // Gen anchor: serialized CW portion must match byte-exact.
         var cw_buf: [D.Key.cw_serialized_len]u8 = undefined;
         keys[0].serializeCw(&cw_buf);
@@ -148,7 +148,7 @@ test "security smell test: a single key's EvalAll is ~uniform (heuristic)" {
     const s0 = @as([16]u8, @splat(0x5A));
     const s1 = @as([16]u8, @splat(0xA5));
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
+    D.genWithSeeds(&alpha, &beta, &s0, &s1, &keys);
     var b0: [D.domain_size]D.Elem = undefined;
     D.evalAll(0, &keys[0], &b0);
     // count distinct values — a pseudorandom share vector over 256 points
@@ -178,7 +178,7 @@ test "positive control (stronger, GATED): flipping one CW bit breaks reconstruct
     const s0 = @as([16]u8, @splat(0x11));
     const s1 = @as([16]u8, @splat(0x22));
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(alpha, beta, &s0, &s1, &keys);
+    D.genWithSeeds(&alpha, &beta, &s0, &s1, &keys);
     // sanity: unperturbed keys reconstruct
     var b0: [D.domain_size]D.Elem = undefined;
     var b1: [D.domain_size]D.Elem = undefined;
@@ -222,7 +222,7 @@ test "evalFull == evalAll element-for-element over the FULL domain (both parties
         for (alphas, betas, 0..) |alpha, beta, i| {
             const seeds = efSeeds(@intCast(i * 7 + D.n));
             var keys: [2]D.Key = undefined;
-            D.genWithSeeds(alpha, beta, &seeds[0], &seeds[1], &keys);
+            D.genWithSeeds(&alpha, &beta, &seeds[0], &seeds[1], &keys);
             inline for (.{ 0, 1 }) |b| {
                 var naive: [D.domain_size]D.Elem = undefined;
                 var fast: [D.domain_size]D.Elem = undefined;
@@ -247,7 +247,7 @@ test "evalFull over a PREFIX matches eval point-for-point (out.len far below 2^n
     for (alphas, 0..) |alpha, i| {
         const seeds = efSeeds(@intCast(100 + i));
         var keys: [2]D.Key = undefined;
-        D.genWithSeeds(alpha, 0xC0FFEE, &seeds[0], &seeds[1], &keys);
+        D.genWithSeeds(&alpha, &0xC0FFEE, &seeds[0], &seeds[1], &keys);
         inline for (.{ 0, 1 }) |b| {
             D.evalFull(b, &keys[b], &fast);
             for (0..prefix_len) |x| {
@@ -261,7 +261,7 @@ test "evalFull over a PREFIX matches eval point-for-point (out.len far below 2^n
         const seeds = efSeeds(200);
         const alpha: D.Index = 150;
         var keys: [2]D.Key = undefined;
-        D.genWithSeeds(alpha, 42, &seeds[0], &seeds[1], &keys);
+        D.genWithSeeds(&alpha, &42, &seeds[0], &seeds[1], &keys);
         var f0: [prefix_len]D.Elem = undefined;
         var f1: [prefix_len]D.Elem = undefined;
         D.evalFull(0, &keys[0], &f0);
@@ -278,7 +278,7 @@ test "evalFull prefix boundary cases: len 0, len 1, and a non-power-of-two strad
     const D = Dpf(10, 4);
     const seeds = efSeeds(50);
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(700, 9, &seeds[0], &seeds[1], &keys);
+    D.genWithSeeds(&700, &9, &seeds[0], &seeds[1], &keys);
     inline for (.{ 0, 1 }) |b| {
         // len 0: a defined no-op.
         var empty: [0]D.Elem = undefined;
@@ -301,7 +301,7 @@ test "evalFullWith streams the same values, each index exactly once, in order" {
     const D = Dpf(8, 4);
     const seeds = efSeeds(77);
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(33, 0xABCD, &seeds[0], &seeds[1], &keys);
+    D.genWithSeeds(&33, &0xABCD, &seeds[0], &seeds[1], &keys);
     const count = 100;
     const Ctx = struct {
         vals: *[count]D.Elem,
@@ -338,7 +338,7 @@ test "evalRangeWith(0, hi) reproduces evalFullWith(hi) — the lo=0 case is not 
     const D = Dpf(9, 4);
     const seeds = efSeeds(61);
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(200, 0x1357, &seeds[0], &seeds[1], &keys);
+    D.genWithSeeds(&200, &0x1357, &seeds[0], &seeds[1], &keys);
     const count = 300;
     inline for (.{ 0, 1 }) |b| {
         var full: [count]D.Elem = undefined;
@@ -363,7 +363,7 @@ test "evalRangeWith: disjoint shards sum to evalFull, over several shard counts 
     const D = Dpf(10, 4);
     const seeds = efSeeds(88);
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(137, 0xF00D, &seeds[0], &seeds[1], &keys);
+    D.genWithSeeds(&137, &0xF00D, &seeds[0], &seeds[1], &keys);
     const n = 200;
 
     var want: [n]D.Elem = undefined;
@@ -411,7 +411,7 @@ test "evalRangeWith: explicit len-0 and len-1 shards at the domain start, middle
     const D = Dpf(8, 4);
     const seeds = efSeeds(99);
     var keys: [2]D.Key = undefined;
-    D.genWithSeeds(0, 5, &seeds[0], &seeds[1], &keys); // α at the very first index
+    D.genWithSeeds(&0, &5, &seeds[0], &seeds[1], &keys); // α at the very first index
     const Ctx = struct {
         calls: *usize,
         last_x: *usize,
