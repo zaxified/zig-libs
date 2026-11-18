@@ -127,3 +127,60 @@ test "decode: records sharing one owner name share its decoded copy (sweep REV-d
     // (~13 MB). One MiB leaves room for allocator slack, not for per-record copies.
     try testing.expect(counting.allocated_bytes <= 1 << 20);
 }
+
+// ── 2026-11-18: the decoded-bytes cap (owner decision on DN-5) ──
+
+const goldens = @import("goldens.zig");
+
+/// One TXT record whose RDATA is `len` zero bytes: `len` empty strings, the
+/// largest decoded form per wire byte measured (44x at 64 KiB).
+fn emptyTxtFlood(buf: []u8, len: u16) []u8 {
+    @memcpy(buf[0..12], &[_]u8{ 0, 1, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0 });
+    const rr = [_]u8{ 0, 0, 16, 0, 1, 0, 0, 0, 0 }; // root owner, TXT, IN, ttl 0
+    @memcpy(buf[12..][0..rr.len], &rr);
+    std.mem.writeInt(u16, buf[12 + rr.len ..][0..2], len, .big);
+    const start = 12 + rr.len + 2;
+    @memset(buf[start..][0..len], 0);
+    return buf[0 .. start + len];
+}
+
+test "decodeWith: the cap admits exactly decoded_bytes and refuses one byte less (DN-5 cap)" {
+    var msg = try message.decode(testing.allocator, goldens.mx_iana_org);
+    const used = msg.decoded_bytes;
+    msg.deinit();
+    try testing.expect(used > 0);
+    var at = try message.decodeWith(testing.allocator, goldens.mx_iana_org, .{ .max_decoded_bytes = used });
+    try testing.expectEqual(used, at.decoded_bytes);
+    try testing.expectEqual(@as(usize, 4), at.answers.len);
+    at.deinit();
+    try testing.expectError(error.DecodedTooLarge, message.decodeWith(testing.allocator, goldens.mx_iana_org, .{ .max_decoded_bytes = used - 1 }));
+    try testing.expectError(error.DecodedTooLarge, message.decodeWith(testing.allocator, goldens.mx_iana_org, .{ .max_decoded_bytes = 0 }));
+}
+
+test "decode: the default cap takes the 64 KiB owner-pointer flood and refuses the 64 KiB empty-TXT flood (DN-5 cap)" {
+    var buf: [65_535]u8 = undefined;
+    // 5 439 records sharing one 127-label owner: 568 KB decoded, under 1 MiB.
+    var flood = try message.decode(testing.allocator, pointerFlood(&buf));
+    try testing.expect(flood.decoded_bytes <= message.default_max_decoded_bytes);
+    flood.deinit();
+
+    const wire = emptyTxtFlood(&buf, 65_535 - 23);
+    try testing.expectEqual(@as(usize, 65_535), wire.len);
+    try testing.expectError(error.DecodedTooLarge, message.decode(testing.allocator, wire));
+    // The same message with the cap lifted decodes, and shows why it was refused.
+    var lifted = try message.decodeWith(testing.allocator, wire, .{ .max_decoded_bytes = std.math.maxInt(usize) });
+    defer lifted.deinit();
+    try testing.expectEqual(@as(usize, 65_535 - 23), lifted.answers[0].data.txt.len);
+    try testing.expect(lifted.decoded_bytes > message.default_max_decoded_bytes);
+}
+
+test "decodeWith: a real allocation failure stays OutOfMemory, not DecodedTooLarge (DN-5 cap)" {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        if (message.decodeWith(failing.allocator(), goldens.mx_iana_org, .{})) |m| {
+            var mm = m;
+            mm.deinit();
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}
