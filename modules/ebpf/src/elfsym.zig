@@ -1660,3 +1660,725 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-18): header / table boundaries ───────────
+
+/// `SynthElf` image grown to `len` bytes (zero padded), for boundary tests.
+fn synthGrown(gpa: std.mem.Allocator, len: usize) ![]u8 {
+    const base = try SynthElf.build(gpa);
+    defer gpa.free(base);
+    const out = try gpa.alloc(u8, len);
+    @memset(out, 0);
+    @memcpy(out[0..base.len], base);
+    return out;
+}
+
+test "openImage: header checks each reject their own malformation" {
+    const gpa = testing.allocator;
+    const wr = SynthElf.wr;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+
+    // A bare 64-byte header with no section table opens (len == EHDR_SIZE).
+    {
+        const b = try gpa.dupe(u8, img[0..EHDR_SIZE]);
+        defer gpa.free(b);
+        wr(u64, b, ehdr_shoff, 0);
+        var im = try openImage(gpa, b, false);
+        defer im.deinit();
+        try testing.expectEqual(@as(usize, 0), im.sections.len);
+    }
+    // ... even though e_shnum says 4: shoff == 0 means "no table".
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u64, b, ehdr_shoff, 0);
+        var im = try openImage(gpa, b, false);
+        defer im.deinit();
+        try testing.expectEqual(@as(usize, 0), im.sections.len);
+    }
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        b[0] = 0;
+        try testing.expectError(error.NotAnElf, openImage(gpa, b, false));
+        b[0] = 0x7f;
+        b[elf.EI.CLASS] = @backingInt(elf.CLASS.@"32");
+        try testing.expectError(error.UnsupportedElf, openImage(gpa, b, false));
+        b[elf.EI.CLASS] = @backingInt(elf.CLASS.@"64");
+        b[elf.EI.DATA] = switch (native_endian) {
+            .little => @backingInt(elf.DATA.@"2MSB"),
+            .big => @backingInt(elf.DATA.@"2LSB"),
+        };
+        try testing.expectError(error.UnsupportedElf, openImage(gpa, b, false));
+        b[elf.EI.DATA] = switch (native_endian) {
+            .little => @backingInt(elf.DATA.@"2LSB"),
+            .big => @backingInt(elf.DATA.@"2MSB"),
+        };
+        wr(u16, b, ehdr_ehsize, EHDR_SIZE - 1);
+        try testing.expectError(error.MalformedElf, openImage(gpa, b, false));
+        // The same four refusals through the path-based resolver.
+        const path = try writeTempFile(gpa, "hdr", b);
+        defer {
+            _ = linux.unlink(path.ptr);
+            gpa.free(path);
+        }
+        try testing.expectError(error.MalformedElf, resolve(gpa, path, "flat_fn"));
+        wr(u16, b, ehdr_ehsize, EHDR_SIZE);
+        b[elf.EI.CLASS] = @backingInt(elf.CLASS.@"32");
+        const p2 = try writeTempFile(gpa, "hdr", b);
+        defer gpa.free(p2);
+        try testing.expectError(error.UnsupportedElf, resolve(gpa, p2, "flat_fn"));
+        b[elf.EI.CLASS] = @backingInt(elf.CLASS.@"64");
+        b[elf.EI.DATA] = switch (native_endian) {
+            .little => @backingInt(elf.DATA.@"2MSB"),
+            .big => @backingInt(elf.DATA.@"2LSB"),
+        };
+        const p3 = try writeTempFile(gpa, "hdr", b);
+        defer gpa.free(p3);
+        try testing.expectError(error.UnsupportedElf, resolve(gpa, p3, "flat_fn"));
+        b[0] = 0;
+        const p4 = try writeTempFile(gpa, "hdr", b);
+        defer gpa.free(p4);
+        try testing.expectError(error.NotAnElf, resolve(gpa, p4, "flat_fn"));
+        try testing.expectError(error.SymbolNotFound, resolve(gpa, p4, ""));
+    }
+    // shoff at / past the end of the file.
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u64, b, ehdr_shoff, b.len);
+        try testing.expectError(error.MalformedElf, openImage(gpa, b, false));
+    }
+}
+
+test "openImage: the >0xff00-sections escape reads section 0, and is bounded" {
+    const gpa = testing.allocator;
+    const wr = SynthElf.wr;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+
+    // e_shnum == 0 and e_shstrndx == SHN_XINDEX: both real values live in
+    // section 0 (sh_size = 4, sh_link = 1). sh_info is a decoy.
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        const s0 = SynthElf.shdr_off;
+        wr(u16, b, ehdr_shnum, 0);
+        wr(u16, b, ehdr_shstrndx, SHN_XINDEX);
+        wr(u64, b, s0 + shdr_size, 4);
+        wr(u32, b, s0 + shdr_link, 1);
+        wr(u32, b, s0 + shdr_info, 3);
+        // name section 2 "flat_fn" (strtab offset 1)
+        wr(u32, b, s0 + 2 * SHDR_SIZE + shdr_name, 1);
+        var im = try openImage(gpa, b, false);
+        defer im.deinit();
+        try testing.expectEqual(@as(usize, 4), im.sections.len);
+        try testing.expectEqualStrings("flat_fn", im.sectionName(2));
+    }
+    // Only the shnum half: shstrndx given directly.
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        const s0 = SynthElf.shdr_off;
+        wr(u16, b, ehdr_shnum, 0);
+        wr(u16, b, ehdr_shstrndx, 1);
+        wr(u64, b, s0 + shdr_size, 4);
+        wr(u32, b, s0 + shdr_link, 3); // must NOT be consulted
+        wr(u32, b, s0 + 2 * SHDR_SIZE + shdr_name, 1);
+        var im = try openImage(gpa, b, false);
+        defer im.deinit();
+        try testing.expectEqual(@as(usize, 4), im.sections.len);
+        try testing.expectEqualStrings("flat_fn", im.sectionName(2));
+    }
+    // Only the shstrndx half: e_shnum given directly (sh_size of 0 must not win).
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        const s0 = SynthElf.shdr_off;
+        wr(u16, b, ehdr_shstrndx, SHN_XINDEX);
+        wr(u32, b, s0 + shdr_link, 1);
+        wr(u64, b, s0 + shdr_size, 0);
+        wr(u32, b, s0 + 2 * SHDR_SIZE + shdr_name, 1);
+        var im = try openImage(gpa, b, false);
+        defer im.deinit();
+        try testing.expectEqual(@as(usize, 4), im.sections.len);
+        try testing.expectEqualStrings("flat_fn", im.sectionName(2));
+    }
+    // The escape's own header must fit: exactly fits / one short.
+    {
+        const b = try gpa.alloc(u8, 4096);
+        defer gpa.free(b);
+        @memset(b, 0);
+        @memcpy(b[0..EHDR_SIZE], img[0..EHDR_SIZE]);
+        wr(u16, b, ehdr_shnum, 0);
+        wr(u16, b, ehdr_shstrndx, 0);
+        wr(u64, b, ehdr_shoff, b.len - SHDR_SIZE);
+        var im = try openImage(gpa, b, false);
+        im.deinit();
+        wr(u64, b, ehdr_shoff, b.len - SHDR_SIZE + 1);
+        try testing.expectError(error.MalformedElf, openImage(gpa, b, false));
+    }
+    // max_sections: 65536 sections open, 65537 do not (zeroed table is fine).
+    {
+        const len = (max_sections + 1) * SHDR_SIZE + 0x1000;
+        const b = try synthGrown(gpa, len);
+        defer gpa.free(b);
+        wr(u64, b, ehdr_shoff, 0x1000);
+        wr(u16, b, ehdr_shnum, 0);
+        wr(u64, b, 0x1000 + shdr_size, max_sections);
+        var im = try openImage(gpa, b, false);
+        try testing.expectEqual(@as(usize, max_sections), im.sections.len);
+        im.deinit();
+        wr(u64, b, 0x1000 + shdr_size, max_sections + 1);
+        try testing.expectError(error.MalformedElf, openImage(gpa, b, false));
+        // and the path-based reader shares the ceiling
+        const path = try writeTempFile(gpa, "maxsec", b);
+        defer {
+            _ = linux.unlink(path.ptr);
+            gpa.free(path);
+        }
+        try testing.expectError(error.MalformedElf, resolve(gpa, path, "flat_fn"));
+        wr(u64, b, 0x1000 + shdr_size, max_sections);
+        const p2 = try writeTempFile(gpa, "maxsec", b);
+        defer gpa.free(p2);
+        try testing.expectError(error.SymbolNotFound, resolve(gpa, p2, "flat_fn"));
+    }
+}
+
+test "openImage: section stride is e_shentsize, not sizeof(Elf64_Shdr)" {
+    const gpa = testing.allocator;
+    const wr = SynthElf.wr;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+    const b = try synthGrown(gpa, 0x1800 + 0x400);
+    defer gpa.free(b);
+    // Re-lay the four headers at a stride of 80 at 0x1800.
+    for (0..4) |i| {
+        @memcpy(b[0x1800 + i * 80 ..][0..SHDR_SIZE], img[SynthElf.shdr_off + i * SHDR_SIZE ..][0..SHDR_SIZE]);
+    }
+    wr(u64, b, ehdr_shoff, 0x1800);
+    wr(u16, b, ehdr_shentsize, 80);
+    var im = try openImage(gpa, b, false);
+    defer im.deinit();
+    try testing.expectEqual(SHT_SYMTAB, im.sections[2].sh_type);
+    try testing.expectEqual(@as(u64, SynthElf.symtab_off), im.sections[2].sh_offset);
+    // The path-based resolver walks the same stride.
+    const path = try writeTempFile(gpa, "stride", b);
+    defer {
+        _ = linux.unlink(path.ptr);
+        gpa.free(path);
+    }
+    const s = try resolveFunc(gpa, path, "skewed_fn");
+    try testing.expectEqual(@as(u64, 0x1040), s.file_offset);
+}
+
+test "openImage: a bogus section-header string table costs the names, never the object" {
+    const gpa = testing.allocator;
+    const wr = SynthElf.wr;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+    const s = SynthElf.shdr_off;
+    const Case = struct { ndx: u16, ty: u32, off: u64, size: u64, names: bool };
+    const cases = [_]Case{
+        .{ .ndx = 1, .ty = SHT_STRTAB, .off = 0x100, .size = 0x40, .names = true }, // control
+        .{ .ndx = 0, .ty = SHT_STRTAB, .off = 0x100, .size = 0x40, .names = false }, // index 0 = none
+        .{ .ndx = 4, .ty = SHT_STRTAB, .off = 0x100, .size = 0x40, .names = false }, // == sections.len
+        .{ .ndx = 1, .ty = SHT_PROGBITS, .off = 0x100, .size = 0x40, .names = false }, // wrong type
+        .{ .ndx = 1, .ty = SHT_STRTAB, .off = 0x1800 + 10, .size = 0, .names = false }, // offset past EOF
+        .{ .ndx = 1, .ty = SHT_STRTAB, .off = 0x100, .size = 0x1800, .names = false }, // size past EOF
+    };
+    for (cases) |c| {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u16, b, ehdr_shstrndx, c.ndx);
+        if (c.ndx == 0) {
+            // section 0 itself is a (valid) string table: must still be ignored
+            wr(u32, b, s + shdr_type, c.ty);
+            wr(u64, b, s + shdr_offset, c.off);
+            wr(u64, b, s + shdr_size, c.size);
+        } else if (c.ndx < 4) {
+            wr(u32, b, s + c.ndx * SHDR_SIZE + shdr_type, c.ty);
+            wr(u64, b, s + c.ndx * SHDR_SIZE + shdr_offset, c.off);
+            wr(u64, b, s + c.ndx * SHDR_SIZE + shdr_size, c.size);
+        }
+        wr(u32, b, s + 2 * SHDR_SIZE + shdr_name, 1);
+        var im = try openImage(gpa, b, false);
+        defer im.deinit();
+        try testing.expectEqual(@as(usize, 4), im.sections.len);
+        try testing.expectEqualStrings(if (c.names) "flat_fn" else "", im.sectionName(2));
+    }
+}
+
+test "Image accessors: bounds, NOBITS, name lookup and the entry arithmetic" {
+    const gpa = testing.allocator;
+    const wr = SynthElf.wr;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+    const s = SynthElf.shdr_off;
+    const b = try gpa.dupe(u8, img);
+    defer gpa.free(b);
+    wr(u16, b, ehdr_shstrndx, 1);
+    wr(u32, b, s + 1 * SHDR_SIZE + shdr_type, SHT_STRTAB);
+    wr(u32, b, s + 2 * SHDR_SIZE + shdr_name, 1); // "flat_fn"
+    wr(u32, b, s + 3 * SHDR_SIZE + shdr_name, 9); // "skewed_fn"
+    var im = try openImage(gpa, b, false);
+    defer im.deinit();
+
+    // sectionName / findSection
+    try testing.expectEqualStrings("", im.sectionName(4)); // == len
+    try testing.expectEqualStrings("", im.sectionName(999));
+    try testing.expectEqual(@as(?usize, 2), im.findSection("flat_fn"));
+    try testing.expectEqual(@as(?usize, null), im.findSection("flat"));
+    try testing.expectEqual(@as(?usize, null), im.findSection("flat_fn_"));
+    // sectionData: index at len is an error; NOBITS is empty whatever its size.
+    try testing.expectError(error.MalformedElf, im.sectionData(4));
+    try testing.expectEqual(@as(usize, 5 * SYM_SIZE), (try im.sectionData(2)).len);
+    wr(u32, b, s + 3 * SHDR_SIZE + shdr_type, SHT_NOBITS);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_size, 0x10_0000);
+    var im2 = try openImage(gpa, b, false);
+    defer im2.deinit();
+    try testing.expectEqual(@as(usize, 0), (try im2.sectionData(3)).len);
+    // offset == len with size 0 is fine; offset == len with size 1 is not.
+    wr(u32, b, s + 3 * SHDR_SIZE + shdr_type, SHT_PROGBITS);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_offset, b.len);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_size, 0);
+    var im3 = try openImage(gpa, b, false);
+    defer im3.deinit();
+    try testing.expectEqual(@as(usize, 0), (try im3.sectionData(3)).len);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_size, 1);
+    var im4 = try openImage(gpa, b, false);
+    defer im4.deinit();
+    try testing.expectError(error.MalformedElf, im4.sectionData(3));
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_offset, b.len + 1);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_size, 0);
+    var im5 = try openImage(gpa, b, false);
+    defer im5.deinit();
+    try testing.expectError(error.MalformedElf, im5.sectionData(3));
+
+    // symtabIndex skips an EMPTY symtab section and finds the next one.
+    wr(u64, b, s + 2 * SHDR_SIZE + shdr_size, 0);
+    wr(u32, b, s + 3 * SHDR_SIZE + shdr_type, SHT_SYMTAB);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_offset, SynthElf.symtab_off);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_size, 5 * SYM_SIZE);
+    wr(u32, b, s + 3 * SHDR_SIZE + shdr_link, 1);
+    var im6 = try openImage(gpa, b, false);
+    defer im6.deinit();
+    try testing.expectEqual(@as(?usize, 3), im6.symtabIndex());
+}
+
+test "Image.symbol / relocation: entry size, counts, field decode, symbolName" {
+    const gpa = testing.allocator;
+    const wr = SynthElf.wr;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+    const s = SynthElf.shdr_off;
+    const b = try gpa.dupe(u8, img);
+    defer gpa.free(b);
+    // symbol 1: info 0x12 (GLOBAL|FUNC), other 0x55 (visible), shndx 1
+    b[SynthElf.symtab_off + SYM_SIZE + sym_other] = 0x55;
+    var im = try openImage(gpa, b, false);
+    defer im.deinit();
+    const sy = try im.symbol(2, 1);
+    try testing.expectEqual(@as(u32, 1), sy.index);
+    try testing.expectEqual(@as(u32, 1), sy.st_name);
+    try testing.expectEqual((@as(u8, 1) << 4) | @as(u8, STT_FUNC), sy.st_info);
+    try testing.expectEqual(@as(u8, 0x55), sy.st_other);
+    try testing.expectEqual(@as(u16, 1), sy.st_shndx);
+    try testing.expectEqual(@as(u64, SynthElf.flat_vaddr), sy.st_value);
+    try testing.expectEqual(@as(u64, 0x20), sy.st_size);
+    try testing.expectEqual(@as(u4, STT_FUNC), sy.kind());
+    try testing.expectEqual(@as(u4, 1), sy.bind());
+    try testing.expectEqualStrings("flat_fn", im.symbolName(2, sy));
+    try testing.expectEqualStrings("", im.symbolName(99, sy));
+    try testing.expectEqualStrings("", im.symbolName(2, .{ .index = 0, .st_name = 0x7fff, .st_info = 0, .st_other = 0, .st_shndx = 0, .st_value = 0, .st_size = 0 }));
+    // sh_link == sections.len -> "" (not an OOB index)
+    wr(u32, b, s + 2 * SHDR_SIZE + shdr_link, 4);
+    var im_l = try openImage(gpa, b, false);
+    defer im_l.deinit();
+    try testing.expectEqualStrings("", im_l.symbolName(2, sy));
+    wr(u32, b, s + 2 * SHDR_SIZE + shdr_link, 1);
+
+    // count: entsize defaulted when 0; stride read from sh_entsize otherwise
+    try testing.expectEqual(@as(u32, 5), try im.symbolCount(2));
+    wr(u64, b, s + 2 * SHDR_SIZE + shdr_entsize, 0);
+    var im0 = try openImage(gpa, b, false);
+    defer im0.deinit();
+    try testing.expectEqual(@as(u32, 5), try im0.symbolCount(2));
+    try testing.expectEqual(@as(u64, 0x20), (try im0.symbol(2, 1)).st_size);
+    // ent below the record size is refused by count and by decode
+    wr(u64, b, s + 2 * SHDR_SIZE + shdr_entsize, SYM_SIZE - 1);
+    var im_s = try openImage(gpa, b, false);
+    defer im_s.deinit();
+    try testing.expectError(error.MalformedElf, im_s.symbolCount(2));
+    try testing.expectError(error.MalformedElf, im_s.symbol(2, 0));
+    // ent == record size is fine
+    wr(u64, b, s + 2 * SHDR_SIZE + shdr_entsize, SYM_SIZE);
+    var im_e = try openImage(gpa, b, false);
+    defer im_e.deinit();
+    _ = try im_e.symbol(2, 4);
+    // the last entry is reachable, one past it is not
+    try testing.expectError(error.MalformedElf, im_e.symbol(2, 5));
+
+    // Relocation section: three REL entries at 0x600 (16 bytes each).
+    const rel_off = 0x600;
+    wr(u64, b, rel_off + 0, 0x1234);
+    wr(u64, b, rel_off + 8, (@as(u64, 7) << 32) | 0x0102);
+    wr(u64, b, rel_off + 16, 0x2000);
+    wr(u64, b, rel_off + 24, (@as(u64, 3) << 32) | 1);
+    wr(u32, b, s + 3 * SHDR_SIZE + shdr_type, SHT_REL);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_offset, rel_off);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_size, 3 * REL_SIZE);
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_entsize, 0);
+    var imr = try openImage(gpa, b, false);
+    defer imr.deinit();
+    try testing.expectEqual(@as(u32, 3), try imr.relocationCount(3));
+    const r0 = try imr.relocation(3, 0);
+    try testing.expectEqual(@as(u64, 0x1234), r0.r_offset);
+    try testing.expectEqual(@as(u32, 7), r0.sym);
+    try testing.expectEqual(@as(u32, 0x0102), r0.type);
+    const r1 = try imr.relocation(3, 1);
+    try testing.expectEqual(@as(u64, 0x2000), r1.r_offset);
+    try testing.expectEqual(@as(u32, 3), r1.sym);
+    try testing.expectEqual(@as(u32, 1), r1.type);
+    try testing.expectError(error.MalformedElf, imr.relocation(3, 3));
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_entsize, REL_SIZE - 1);
+    var imr2 = try openImage(gpa, b, false);
+    defer imr2.deinit();
+    try testing.expectError(error.MalformedElf, imr2.relocationCount(3));
+    try testing.expectError(error.MalformedElf, imr2.relocation(3, 0));
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_entsize, 24); // stride from sh_entsize
+    wr(u64, b, s + 3 * SHDR_SIZE + shdr_size, 3 * 24);
+    wr(u64, b, rel_off + 24, 0x3000);
+    wr(u64, b, rel_off + 32, (@as(u64, 9) << 32) | 2);
+    var imr3 = try openImage(gpa, b, false);
+    defer imr3.deinit();
+    try testing.expectEqual(@as(u32, 3), try imr3.relocationCount(3));
+    const rr = try imr3.relocation(3, 1);
+    try testing.expectEqual(@as(u64, 0x3000), rr.r_offset);
+    try testing.expectEqual(@as(u32, 9), rr.sym);
+}
+
+test "entryOffset: exact last entry, ent bounds, no wrap" {
+    // 3 entries of 16 in 48 bytes, record needs 16
+    try testing.expectEqual(@as(u64, 32), try entryOffset(48, 16, 2, 16));
+    try testing.expectError(error.MalformedElf, entryOffset(48, 16, 3, 16));
+    try testing.expectEqual(@as(u64, 0), try entryOffset(16, 16, 0, 16)); // ent == len
+    try testing.expectError(error.MalformedElf, entryOffset(16, 17, 0, 16)); // ent > len
+    try testing.expectEqual(@as(u64, 0), try entryOffset(16, 16, 0, 16)); // ent == min
+    try testing.expectError(error.MalformedElf, entryOffset(48, 15, 0, 16)); // ent < min
+    // ent larger than min: the record only needs `min` of the last stride
+    try testing.expectEqual(@as(u64, 24), try entryOffset(40, 24, 1, 16));
+    try testing.expectError(error.MalformedElf, entryOffset(40, 24, 2, 16));
+    try testing.expectError(error.MalformedElf, entryOffset(48, 16, std.math.maxInt(u32), 16));
+}
+
+test "cstr / nameMatches edge cases" {
+    try testing.expectEqualStrings("", cstr("abc", 3)); // off == len
+    try testing.expectEqualStrings("", cstr("abc", 4));
+    try testing.expectEqualStrings("bc", cstr("abc", 1)); // unterminated: to the end
+    try testing.expectEqualStrings("b", cstr("ab\x00c", 1));
+    // name with '@' but a different base must not match; a prefix must not match
+    try testing.expect(!nameMatches("mallocx@@V\x00", "malloc"));
+    try testing.expect(!nameMatches("mallo@V\x00", "malloc"));
+    try testing.expect(nameMatches("malloc@V\x00", "malloc"));
+    // no terminator: the whole slice is the name
+    try testing.expect(nameMatches("abc", "abc"));
+}
+
+test "resolve: table selection, undefined/ifunc/kind filters and bad link/entsize" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const wr = SynthElf.wr;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+    const s = SynthElf.shdr_off;
+    const symtab = SynthElf.symtab_off;
+
+    // helper: write bytes to a temp path, resolve, unlink
+    const Ctx = struct {
+        fn run(g: std.mem.Allocator, bytes: []const u8, name: []const u8, opts: Options) ResolveError!Symbol {
+            const p = writeTempFile(g, "tbl", bytes) catch return error.FileOpenFailed;
+            defer {
+                _ = linux.unlink(p.ptr);
+                g.free(p);
+            }
+            return resolveOpts(g, p, name, opts);
+        }
+    };
+
+    // symbol 4 -> STT_GNU_IFUNC, 3 -> undefined function, 2 -> STT_OBJECT
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        b[symtab + 4 * SYM_SIZE + sym_info] = (1 << 4) | @as(u8, STT_GNU_IFUNC);
+        const r = try Ctx.run(gpa, b, "a_data_sym", .{ .funcs_only = true });
+        try testing.expectEqual(Symbol.Kind.ifunc, r.kind);
+        const r2 = try Ctx.run(gpa, b, "a_data_sym", .{});
+        try testing.expectEqual(Symbol.Kind.ifunc, r2.kind);
+        // an OBJECT is refused by funcs_only, an IFUNC is not, an `other` is
+        b[symtab + 4 * SYM_SIZE + sym_info] = (1 << 4) | 3; // STT_SECTION
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "a_data_sym", .{ .funcs_only = true }));
+        const r3 = try Ctx.run(gpa, b, "a_data_sym", .{});
+        try testing.expectEqual(Symbol.Kind.other, r3.kind);
+    }
+    // an undefined (SHN_UNDEF) symbol is skipped, so a later one wins / not found
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u16, b, symtab + 1 * SYM_SIZE + sym_shndx, 0);
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "flat_fn", .{}));
+    }
+    // symtab first, dynsym second: both tables carry "flat_fn", at different vaddrs
+    {
+        const b = try synthGrown(gpa, 0x1800 + 0x400);
+        defer gpa.free(b);
+        // clone symtab as section 3 (SHT_DYNSYM), with flat_fn moved to skewed_vaddr
+        @memcpy(b[0x1800..][0 .. 5 * SYM_SIZE], b[symtab..][0 .. 5 * SYM_SIZE]);
+        wr(u64, b, 0x1800 + 1 * SYM_SIZE + sym_value, SynthElf.skewed_vaddr);
+        wr(u32, b, s + 3 * SHDR_SIZE + shdr_type, SHT_DYNSYM);
+        wr(u64, b, s + 3 * SHDR_SIZE + shdr_offset, 0x1800);
+        wr(u64, b, s + 3 * SHDR_SIZE + shdr_size, 5 * SYM_SIZE);
+        wr(u32, b, s + 3 * SHDR_SIZE + shdr_link, 1);
+        wr(u64, b, s + 3 * SHDR_SIZE + shdr_entsize, SYM_SIZE);
+        const any = try Ctx.run(gpa, b, "flat_fn", .{});
+        try testing.expectEqual(Table.symtab, any.table);
+        try testing.expectEqual(@as(u64, 0x400), any.file_offset);
+        const st = try Ctx.run(gpa, b, "flat_fn", .{ .table = .symtab });
+        try testing.expectEqual(Table.symtab, st.table);
+        const dy = try Ctx.run(gpa, b, "flat_fn", .{ .table = .dynsym });
+        try testing.expectEqual(Table.dynsym, dy.table);
+        try testing.expectEqual(@as(u64, 0x1040), dy.file_offset);
+        // symtab only misses a name that exists only in dynsym
+        wr(u32, b, s + 2 * SHDR_SIZE + shdr_type, @backingInt(elf.SHT.PROGBITS));
+        const fb = try Ctx.run(gpa, b, "flat_fn", .{});
+        try testing.expectEqual(Table.dynsym, fb.table);
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "flat_fn", .{ .table = .symtab }));
+    }
+    // sh_entsize 0 defaults to 24; < 24 is malformed
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u64, b, s + 2 * SHDR_SIZE + shdr_entsize, 0);
+        _ = try Ctx.run(gpa, b, "skewed_fn", .{});
+        wr(u64, b, s + 2 * SHDR_SIZE + shdr_entsize, SYM_SIZE - 1);
+        try testing.expectError(error.MalformedElf, Ctx.run(gpa, b, "skewed_fn", .{}));
+        wr(u64, b, s + 2 * SHDR_SIZE + shdr_entsize, SYM_SIZE);
+        // sh_link == sections.len
+        wr(u32, b, s + 2 * SHDR_SIZE + shdr_link, 4);
+        try testing.expectError(error.MalformedElf, Ctx.run(gpa, b, "skewed_fn", .{}));
+        wr(u32, b, s + 2 * SHDR_SIZE + shdr_link, 1);
+        // empty string table
+        wr(u64, b, s + 1 * SHDR_SIZE + shdr_size, 0);
+        try testing.expectError(error.MalformedElf, Ctx.run(gpa, b, "skewed_fn", .{}));
+    }
+    // st_name pointing at / past the string table end is skipped, not read
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        const names_len = 0x26;
+        wr(u64, b, s + 1 * SHDR_SIZE + shdr_size, names_len);
+        wr(u32, b, symtab + 2 * SYM_SIZE + sym_name, names_len);
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "skewed_fn", .{}));
+        // an empty-named (st_name -> NUL byte) symbol never matches an empty name request
+        wr(u32, b, symtab + 2 * SYM_SIZE + sym_name, 8);
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "", .{}));
+    }
+    // a PT_LOAD table: phnum 0 -> no segments (NoFileMapping), phentsize < 56 malformed
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u16, b, ehdr_phentsize, PHDR_SIZE - 1);
+        try testing.expectError(error.MalformedElf, Ctx.run(gpa, b, "flat_fn", .{}));
+        wr(u16, b, ehdr_phnum, 0);
+        wr(u16, b, ehdr_phentsize, 0);
+        try testing.expectError(error.NoFileMapping, Ctx.run(gpa, b, "flat_fn", .{}));
+    }
+    // phentsize larger than 56: the second header is at phoff + phentsize
+    {
+        const b = try synthGrown(gpa, 0x1800 + 0x100);
+        defer gpa.free(b);
+        // move PT_LOAD #1 to phoff + 80 and make #0 a non-LOAD (PT_NULL)
+        var tmp: [PHDR_SIZE]u8 = undefined;
+        @memcpy(&tmp, b[0x40 + PHDR_SIZE ..][0..PHDR_SIZE]);
+        @memset(b[0x40 + PHDR_SIZE ..][0..PHDR_SIZE], 0);
+        @memcpy(b[0x40 + 80 ..][0..PHDR_SIZE], &tmp);
+        wr(u16, b, ehdr_phentsize, 80);
+        wr(u32, b, 0x40 + phdr_type, 0); // PT_NULL: must not be kept as a segment
+        const r = try Ctx.run(gpa, b, "skewed_fn", .{});
+        try testing.expectEqual(@as(u64, 0x1040), r.file_offset);
+        // the dropped PT_NULL would have mapped flat_fn 1:1; with it gone
+        // flat_fn (vaddr 0x400) has no file mapping
+        try testing.expectError(error.NoFileMapping, Ctx.run(gpa, b, "flat_fn", .{}));
+    }
+    // phnum bound: 4096 program headers are accepted, 4097 are not
+    {
+        const b = try synthGrown(gpa, 0x2000 + (max_segments + 1) * PHDR_SIZE);
+        defer gpa.free(b);
+        @memcpy(b[0x2000..][0 .. 2 * PHDR_SIZE], img[0x40..][0 .. 2 * PHDR_SIZE]);
+        wr(u64, b, ehdr_phoff, 0x2000);
+        wr(u16, b, ehdr_phnum, max_segments);
+        const r = try Ctx.run(gpa, b, "skewed_fn", .{});
+        try testing.expectEqual(@as(u64, 0x1040), r.file_offset);
+        wr(u16, b, ehdr_phnum, max_segments + 1);
+        try testing.expectError(error.MalformedElf, Ctx.run(gpa, b, "skewed_fn", .{}));
+    }
+    // shoff == 0: no sections at all -> SymbolNotFound; shentsize < 64 malformed
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u16, b, ehdr_shentsize, SHDR_SIZE - 1);
+        try testing.expectError(error.MalformedElf, Ctx.run(gpa, b, "flat_fn", .{}));
+        wr(u16, b, ehdr_shentsize, SHDR_SIZE);
+        wr(u64, b, ehdr_shoff, 0);
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "flat_fn", .{}));
+    }
+    // huge phoff: refused as malformed, not a panic
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u64, b, ehdr_phoff, std.math.maxInt(u64) - 8);
+        try testing.expectError(error.MalformedElf, Ctx.run(gpa, b, "flat_fn", .{}));
+    }
+    // empty-section (sh_size 0) symtab is not "the" symtab
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u64, b, s + 2 * SHDR_SIZE + shdr_size, 0);
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "flat_fn", .{}));
+    }
+}
+
+test "readFileAlloc: the size ceiling is inclusive, and the table ceilings" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+    const path = try writeTempFile(gpa, "rfa", img);
+    defer {
+        _ = linux.unlink(path.ptr);
+        gpa.free(path);
+    }
+    const ok = try readFileAlloc(gpa, path, img.len);
+    gpa.free(ok);
+    try testing.expectError(error.FileTooLarge, readFileAlloc(gpa, path, img.len - 1));
+    try testing.expectError(error.FileOpenFailed, readFileAlloc(gpa, "/nonexistent/zl-ebpf", 10));
+    // empty file reads as an empty buffer
+    const e = try writeTempFile(gpa, "rfa-empty", "");
+    defer {
+        _ = linux.unlink(e.ptr);
+        gpa.free(e);
+    }
+    const eb = try readFileAlloc(gpa, e, 0);
+    defer gpa.free(eb);
+    try testing.expectEqual(@as(usize, 0), eb.len);
+}
+
+test "vaddrToFileOffset: segment edges" {
+    const seg = [_]Segment{.{ .p_offset = 0x100, .p_vaddr = 0x1000, .p_filesz = 0x10, .p_memsz = 0x40 }};
+    try testing.expectEqual(@as(?u64, 0x100), vaddrToFileOffset(&seg, 0x1000)); // first byte
+    try testing.expectEqual(@as(?u64, 0x10f), vaddrToFileOffset(&seg, 0x100f)); // last file byte
+    try testing.expectEqual(@as(?u64, null), vaddrToFileOffset(&seg, 0x1010)); // first .bss byte
+    try testing.expectEqual(@as(?u64, null), vaddrToFileOffset(&seg, 0x103f)); // inside memsz only
+    try testing.expectEqual(@as(?u64, null), vaddrToFileOffset(&seg, 0xfff));
+    // the first segment that covers it wins; offset base is p_offset, not p_vaddr
+    const two = [_]Segment{
+        .{ .p_offset = 0x0, .p_vaddr = 0x0, .p_filesz = 0x10, .p_memsz = 0x10 },
+        .{ .p_offset = 0x500, .p_vaddr = 0x8, .p_filesz = 0x20, .p_memsz = 0x20 },
+    };
+    try testing.expectEqual(@as(?u64, 0x9), vaddrToFileOffset(&two, 0x9));
+    try testing.expectEqual(@as(?u64, 0x510), vaddrToFileOffset(&two, 0x18));
+}
+
+test "round 3: every section-header field decodes from its own offset; symbol table edges" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const wr = SynthElf.wr;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+    const s = SynthElf.shdr_off + 3 * SHDR_SIZE;
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u32, b, s + shdr_name, 0x11);
+        wr(u32, b, s + shdr_type, 0x22);
+        wr(u64, b, s + shdr_flags, 0x33);
+        wr(u64, b, s + shdr_addr, 0x44);
+        wr(u64, b, s + shdr_offset, 0x55);
+        wr(u64, b, s + shdr_size, 0x66);
+        wr(u32, b, s + shdr_link, 0x77);
+        wr(u32, b, s + shdr_info, 0x88);
+        wr(u64, b, s + shdr_addralign, 0x99);
+        wr(u64, b, s + shdr_entsize, 0xaa);
+        var im = try openImage(gpa, b, false);
+        defer im.deinit();
+        const h = im.sections[3];
+        try testing.expectEqual(@as(u16, 3), h.index);
+        try testing.expectEqual(@as(u32, 0x11), h.sh_name);
+        try testing.expectEqual(@as(u32, 0x22), h.sh_type);
+        try testing.expectEqual(@as(u64, 0x33), h.sh_flags);
+        try testing.expectEqual(@as(u64, 0x44), h.sh_addr);
+        try testing.expectEqual(@as(u64, 0x55), h.sh_offset);
+        try testing.expectEqual(@as(u64, 0x66), h.sh_size);
+        try testing.expectEqual(@as(u32, 0x77), h.sh_link);
+        try testing.expectEqual(@as(u32, 0x88), h.sh_info);
+        try testing.expectEqual(@as(u64, 0x99), h.sh_addralign);
+        try testing.expectEqual(@as(u64, 0xaa), h.sh_entsize);
+    }
+    const Ctx = struct {
+        fn run(g: std.mem.Allocator, bytes: []const u8, name: []const u8, opts: Options) ResolveError!Symbol {
+            const p = writeTempFile(g, "r3", bytes) catch return error.FileOpenFailed;
+            defer {
+                _ = linux.unlink(p.ptr);
+                g.free(p);
+            }
+            return resolveOpts(g, p, name, opts);
+        }
+    };
+    const symtab = SynthElf.symtab_off;
+    // an EMPTY symtab section is skipped in favour of the next real one
+    {
+        const b = try synthGrown(gpa, 0x1800 + 0x400);
+        defer gpa.free(b);
+        @memcpy(b[0x1800..][0 .. 5 * SYM_SIZE], b[symtab..][0 .. 5 * SYM_SIZE]);
+        wr(u64, b, SynthElf.shdr_off + 2 * SHDR_SIZE + shdr_size, 0);
+        wr(u32, b, s + shdr_type, SHT_SYMTAB);
+        wr(u64, b, s + shdr_offset, 0x1800);
+        wr(u64, b, s + shdr_size, 5 * SYM_SIZE);
+        wr(u32, b, s + shdr_link, 1);
+        wr(u64, b, s + shdr_entsize, SYM_SIZE);
+        wr(u64, b, s + shdr_addralign, 0);
+        wr(u32, b, s + shdr_name, 0);
+        wr(u64, b, s + shdr_flags, 0);
+        wr(u64, b, s + shdr_addr, 0);
+        wr(u32, b, s + shdr_info, 0);
+        const r = try Ctx.run(gpa, b, "flat_fn", .{});
+        try testing.expectEqual(@as(u64, 0x400), r.file_offset);
+    }
+    // a symbol sitting one slot past the table's end is not part of the table
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        @memcpy(b[symtab + 5 * SYM_SIZE ..][0..SYM_SIZE], b[symtab + 4 * SYM_SIZE ..][0..SYM_SIZE]);
+        wr(u32, b, symtab + 4 * SYM_SIZE + sym_name, 0);
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "a_data_sym", .{}));
+    }
+    // sh_entsize is the stride (32): symbols re-laid at 32-byte steps
+    {
+        const b = try synthGrown(gpa, 0x1800 + 0x400);
+        defer gpa.free(b);
+        for ([_]usize{ 1, 2 }) |i| @memcpy(b[0x1800 + i * 32 ..][0..SYM_SIZE], b[symtab + i * SYM_SIZE ..][0..SYM_SIZE]);
+        wr(u64, b, SynthElf.shdr_off + 2 * SHDR_SIZE + shdr_offset, 0x1800);
+        wr(u64, b, SynthElf.shdr_off + 2 * SHDR_SIZE + shdr_entsize, 32);
+        wr(u64, b, SynthElf.shdr_off + 2 * SHDR_SIZE + shdr_size, 3 * 32);
+        const r = try Ctx.run(gpa, b, "skewed_fn", .{});
+        try testing.expectEqual(@as(u64, 0x1040), r.file_offset);
+    }
+    // a st_name far past the string table is skipped, not sliced
+    {
+        const b = try gpa.dupe(u8, img);
+        defer gpa.free(b);
+        wr(u32, b, symtab + 2 * SYM_SIZE + sym_name, 0x7000);
+        try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "skewed_fn", .{}));
+    }
+}

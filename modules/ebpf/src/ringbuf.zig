@@ -1495,3 +1495,89 @@ test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {
     try testing.expectEqual(rb.consumer_pos, @atomicLoad(u64, cons, .acquire));
     try testing.expect(rb.consumer_pos >= n * recordStride(record_size));
 }
+
+// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+
+fn testEpoll() linux.fd_t {
+    return @intCast(linux.epoll_create1(linux.EPOLL.CLOEXEC));
+}
+
+test "Reader: positions, the exact header edge, and what is committed to the kernel" {
+    const gpa = testing.allocator;
+    var fake = try FakeRing.init(gpa, 64);
+    defer fake.deinit();
+    var r = fake.reader();
+    // behind: producer < consumer is not "available"
+    r.consumer_pos = 16;
+    try testing.expect(!r.available());
+    r.consumer_pos = 0;
+    // a zero-length record is exactly one header: accepted
+    fake.append("", 0);
+    try testing.expect(r.available());
+    const rec = (try r.next()).?;
+    try testing.expectEqual(@as(usize, 0), rec.data.len);
+    r.advance();
+    try testing.expectEqual(@as(u64, 8), fake.kernelVisibleConsumerPos());
+    // a producer position with fewer than 8 unread bytes is corrupt
+    fake.producer_pos = fake.producer_pos + 4;
+    fake.publish();
+    try testing.expectError(error.CorruptRecord, r.next());
+    // advance with nothing held commits nothing (the cache is not the kernel's view)
+    r.consumer_pos = 40;
+    r.advance();
+    try testing.expectEqual(@as(u64, 8), fake.kernelVisibleConsumerPos());
+}
+
+test "Reader: a discarded record is released to the kernel immediately" {
+    const gpa = testing.allocator;
+    var fake = try FakeRing.init(gpa, 64);
+    defer fake.deinit();
+    var r = fake.reader();
+    fake.append("dropped", BPF_RINGBUF_DISCARD_BIT);
+    try testing.expectEqual(@as(?Record, null), try r.next());
+    try testing.expectEqual(@as(u64, 16), fake.kernelVisibleConsumerPos());
+    try testing.expectEqual(@as(u64, 16), r.consumer_pos);
+}
+
+test "Reader: pollFd, close of a hand-built ring, poll through a real epoll fd" {
+    const gpa = testing.allocator;
+    var fake = try FakeRing.init(gpa, 64);
+    defer fake.deinit();
+    var r = fake.reader();
+    r.map_fd = 77;
+    r.epoll_fd = 88;
+    try testing.expectEqual(@as(linux.fd_t, 77), r.pollFd());
+    // a hand-built ring owns no mapping: close must not unmap memory it never mapped
+    var r2 = fake.reader();
+    r2.close();
+    fake.data[fake.page] = 1; // still mapped and writable
+    // epoll: nothing registered -> a zero-timeout wait reports no data
+    var r3 = fake.reader();
+    r3.epoll_fd = testEpoll();
+    defer _ = linux.close(r3.epoll_fd);
+    try testing.expect(!(try r3.poll(0)));
+    try testing.expectEqual(@as(usize, 0), try r3.pollAndConsume(0, null, Collector.cb, 8));
+    fake.append("x", 0);
+    try testing.expect(try r3.poll(0));
+    var col: Collector = .{};
+    try testing.expectEqual(@as(usize, 1), try r3.pollAndConsume(0, &col, Collector.cb, 8));
+    // a bad epoll fd is EpollFailed, no epoll at all is NotPollable (empty ring)
+    var empty = try FakeRing.init(gpa, 64);
+    defer empty.deinit();
+    var r4 = empty.reader();
+    r4.epoll_fd = 9999;
+    try testing.expectError(error.EpollFailed, r4.poll(0));
+    var r5 = empty.reader();
+    try testing.expectError(error.NotPollable, r5.poll(0));
+}
+
+test "Reader.openWithRingSize: geometry is validated before any syscall" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const page: u32 = @intCast(std.heap.pageSize());
+    try testing.expectError(error.NotARingbufMap, Reader.openWithRingSize(-1, 0));
+    try testing.expectError(error.NotARingbufMap, Reader.openWithRingSize(-1, 3));
+    try testing.expectError(error.NotARingbufMap, Reader.openWithRingSize(-1, page / 2));
+    try testing.expectError(error.NotARingbufMap, Reader.openWithRingSize(-1, page * 3));
+    // a legal size reaches the mmap, which refuses fd -1
+    try testing.expectError(error.Unexpected, Reader.openWithRingSize(-1, page));
+}

@@ -728,3 +728,18 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
     try testing.expectEqual(@as(linux.fd_t, -1), link.fd);
     link.detach(); // idempotent
 }
+
+// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+
+test "LinkHandle.detach closes the fd once and forgets it" {
+    var h: LinkHandle = .{ .fd = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0)), .attach_type = .xdp };
+    const fd = h.fd;
+    h.detach();
+    try testing.expectEqual(@as(linux.fd_t, -1), h.fd);
+    try testing.expect(linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) != .SUCCESS);
+    h.detach();
+    var h2: LinkHandle = .{ .fd = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0)), .attach_type = .xdp };
+    const fd2 = h2.fd;
+    h2.close();
+    try testing.expect(linux.errno(linux.fcntl(fd2, linux.F.GETFD, 0)) != .SUCCESS);
+}

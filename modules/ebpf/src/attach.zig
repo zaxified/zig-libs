@@ -2616,3 +2616,114 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+
+fn devNullFd() linux.fd_t {
+    return @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+}
+
+fn fdIsOpen(fd: linux.fd_t) bool {
+    return linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) == .SUCCESS;
+}
+
+test "handles close what they own and forget it" {
+    // kprobe: both the link fd and the perf fd
+    {
+        var h: KprobeHandle = .{ .perf_fd = devNullFd(), .link_fd = devNullFd() };
+        const p = h.perf_fd;
+        const l = h.link_fd;
+        h.detach();
+        try testing.expect(!fdIsOpen(p) and !fdIsOpen(l));
+        try testing.expectEqual(@as(linux.fd_t, -1), h.perf_fd);
+        try testing.expectEqual(@as(linux.fd_t, -1), h.link_fd);
+        h.detach(); // idempotent
+    }
+    // perf event handle
+    {
+        var h: PerfEventHandle = .{ .perf_fd = devNullFd(), .link_fd = devNullFd(), .kind = .uprobe };
+        const p = h.perf_fd;
+        const l = h.link_fd;
+        h.detach();
+        try testing.expect(!fdIsOpen(p) and !fdIsOpen(l));
+        try testing.expectEqual(@as(linux.fd_t, -1), h.perf_fd);
+        try testing.expectEqual(@as(linux.fd_t, -1), h.link_fd);
+        h.detach();
+    }
+    // raw tracepoint handle
+    {
+        var h: RawTracepointHandle = .{ .fd = devNullFd() };
+        const f = h.fd;
+        h.detach();
+        try testing.expect(!fdIsOpen(f));
+        try testing.expectEqual(@as(linux.fd_t, -1), h.fd);
+    }
+    // the uniform Link detaches each kind (the fd kinds observably)
+    {
+        const f1 = devNullFd();
+        var l1 = Link{ .kprobe = .{ .perf_fd = f1 } };
+        try l1.detach();
+        try testing.expect(!fdIsOpen(f1));
+        const f2 = devNullFd();
+        var l2 = Link{ .perf_event = .{ .perf_fd = f2, .kind = .perf_event } };
+        try l2.detach();
+        try testing.expect(!fdIsOpen(f2));
+        const f3 = devNullFd();
+        var l3 = Link{ .raw_tracepoint = .{ .fd = f3 } };
+        try l3.detach();
+        try testing.expect(!fdIsOpen(f3));
+        const f4 = devNullFd();
+        var l4 = Link.fromBpfLink(.{ .fd = f4, .attach_type = .xdp });
+        try l4.detach();
+        try testing.expect(!fdIsOpen(f4));
+        // xdp / cgroup detach go to the kernel; an impossible interface / fd is an error, not a silent skip
+        var lx = Link{ .xdp = .{ .gpa = testing.allocator, .ifindex = 0x7fff_fff0, .flags = .{} } };
+        if (lx.detach()) |_| return error.TestExpectedError else |_| {}
+        var lc = Link{ .cgroup = .{ .cgroup_fd = -1, .prog_fd = -1, .attach_type = .cgroup_inet_ingress } };
+        if (lc.detach()) |_| return error.TestExpectedError else |_| {}
+    }
+}
+
+test "bindPerfEvent: cookie and preference refusals precede any perf ioctl" {
+    // legacy only: a cookie cannot be expressed, with or without a link attempt
+    try testing.expectError(error.LinkNotSupported, bindPerfEvent(-1, -1, .legacy_only, 1));
+    try testing.expectError(error.LinkNotSupported, bindPerfEvent(-1, -1, .legacy_only, 7));
+    // legacy without a cookie reaches the (bad-fd) ioctl: a generic failure
+    try testing.expectError(error.Unexpected, bindPerfEvent(-1, -1, .legacy_only, 0));
+}
+
+test "tracepoint names: exactly the documented alphabet and length" {
+    for ([_][]const u8{ "a", "z", "A", "Z", "0", "9", "_", "-", ".x", "a:b", "sched_switch", "a.b-c_d:e" }) |ok| {
+        try validateTracepointComponent(ok);
+    }
+    for ([_][]const u8{ "", ".", "..", "a/b", "a\x00b", "a b", "a`", "a{", "a@", "a[", "a/", "a;", "a~", "é" }) |bad| {
+        try testing.expectError(error.InvalidName, validateTracepointComponent(bad));
+    }
+    var long: [129]u8 = undefined;
+    @memset(&long, 'x');
+    try validateTracepointComponent(long[0..128]);
+    try testing.expectError(error.InvalidName, validateTracepointComponent(long[0..129]));
+    try testing.expectError(error.InvalidName, tracepointId("sched", "a/b"));
+    try testing.expectError(error.InvalidName, tracepointId("", "x"));
+    // raw tracepoint names: 128 reaches the kernel (any error but InvalidName), 129 does not
+    if (attachRawTracepoint(testing.allocator, long[0..128], -1)) |_| {} else |e| try testing.expect(e != error.InvalidName);
+    try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, long[0..129], -1));
+    try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, "", -1));
+    try testing.expectError(error.InvalidName, attachRawTracepoint(testing.allocator, "a\x00b", -1));
+}
+
+test "attachUprobe: a given offset needs no symbol; the Auto link-only refusal needs privilege to differ" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.NoProbeSite, attachUprobeOpts(gpa, "/bin/true", "", -1, .{}));
+    if (attachUprobeOpts(gpa, "/bin/true", "", -1, .{ .offset = 0x10 })) |h| {
+        var hh = h;
+        hh.detach();
+    } else |e| try testing.expect(e != error.NoProbeSite and e != error.InvalidPath);
+    try testing.expectError(error.InvalidPath, attachUprobeOpts(gpa, "", "main", -1, .{}));
+    try testing.expectError(error.InvalidPath, attachUprobeOpts(gpa, "/bin/tr\x00ue", "main", -1, .{}));
+    // a link-only preference with no flags attempts the link; its bad-fd refusal is surfaced
+    // (not replaced by a blanket "link not supported")
+    if (attachCgroupAuto(-1, -1, .cgroup_inet_ingress, .{}, .link_only)) |_| {
+        return error.TestExpectedError;
+    } else |e| try testing.expectEqual(error.InvalidTarget, e);
+}

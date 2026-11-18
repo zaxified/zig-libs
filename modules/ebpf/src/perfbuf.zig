@@ -1383,3 +1383,209 @@ test "LIVE: a real PERF_EVENT_ARRAY consumed end-to-end through a tracepoint" {
         try testing.expectEqual(r.tail, @atomicLoad(u64, t, .acquire));
     }
 }
+
+// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+
+fn perfEpoll() linux.fd_t {
+    return @intCast(linux.epoll_create1(linux.EPOLL.CLOEXEC));
+}
+
+test "Reader: header framing edges" {
+    const gpa = testing.allocator;
+    var fake = try FakePerfRing.init(gpa, 64);
+    defer fake.deinit();
+    var r = fake.reader();
+    // behind / equal are not available
+    try testing.expect(!r.available());
+    r.tail = 16;
+    try testing.expect(!r.available());
+    r.tail = 0;
+    // a header-only unknown record (size 8) is legal and counted
+    fake.appendOther(99, 0);
+    try testing.expectEqual(@as(?Event, null), try r.next());
+    try testing.expectEqual(@as(u64, 1), r.unknown_records);
+    try testing.expectEqual(@as(u64, 8), fake.kernelVisibleTail()); // committed
+    // fewer than 8 unread bytes
+    fake.head += 4;
+    fake.publish();
+    try testing.expectError(error.CorruptRecord, r.next());
+    fake.head -= 4;
+    fake.publish();
+    // a record exactly the size of the ring is accepted, one granule more is not
+    var f2 = try FakePerfRing.init(gpa, 64);
+    defer f2.deinit();
+    var r2 = f2.reader();
+    f2.writeHeader(0, 99, 0, 64);
+    f2.head = 64;
+    f2.publish();
+    try testing.expectEqual(@as(?Event, null), try r2.next());
+    var f3 = try FakePerfRing.init(gpa, 64);
+    defer f3.deinit();
+    var r3 = f3.reader();
+    f3.writeHeader(0, 99, 0, 72);
+    f3.head = 72;
+    f3.publish();
+    try testing.expectError(error.CorruptRecord, r3.next());
+    // a zero-size record is corrupt (it would never advance)
+    var f4 = try FakePerfRing.init(gpa, 64);
+    defer f4.deinit();
+    var r4 = f4.reader();
+    f4.writeHeader(0, 99, 0, 0);
+    f4.head = 16;
+    f4.publish();
+    try testing.expectError(error.CorruptRecord, r4.next());
+    // a SAMPLE whose raw length would eat its own size word (rec 16: room for 4 bytes)
+    var f5 = try FakePerfRing.init(gpa, 64);
+    defer f5.deinit();
+    var r5 = f5.reader();
+    f5.writeHeader(0, PERF_RECORD_SAMPLE, 0, 16);
+    f5.pokeU32(8, 5);
+    f5.head = 16;
+    f5.publish();
+    try testing.expectError(error.CorruptRecord, r5.next());
+    f5.pokeU32(8, 4);
+    const ev = (try r5.next()).?;
+    try testing.expectEqual(@as(usize, 4), ev.sample.len);
+    // advance with nothing held commits nothing
+    r5.advance();
+    const before = f5.kernelVisibleTail();
+    r5.tail = 40;
+    r5.advance();
+    try testing.expectEqual(@as(u64, 16), before);
+    try testing.expectEqual(@as(u64, 16), f5.kernelVisibleTail());
+}
+
+test "Reader: consume hands the reader's own cpu to both callbacks; wrap with a tight scratch" {
+    const gpa = testing.allocator;
+    var fake = try FakePerfRing.init(gpa, 64);
+    defer fake.deinit();
+    var r = fake.reader();
+    const S = struct {
+        var s_cpu: u32 = 0;
+        var l_cpu: u32 = 0;
+        fn onSample(_: ?*anyopaque, cpu: u32, _: []const u8) Action {
+            s_cpu = cpu;
+            return .proceed;
+        }
+        fn onLost(_: ?*anyopaque, cpu: u32, _: u64) Action {
+            l_cpu = cpu;
+            return .proceed;
+        }
+    };
+    fake.appendSample("abcd");
+    fake.appendLost(1, 5);
+    try testing.expectEqual(@as(usize, 2), try r.consume(null, S.onSample, S.onLost, 10));
+    try testing.expectEqual(@as(u32, 3), S.s_cpu);
+    try testing.expectEqual(@as(u32, 3), S.l_cpu);
+    try testing.expectEqual(@as(u64, 5), r.lost_records);
+    // a sample that wraps the ring end is reassembled; a scratch exactly its size suffices, one byte less does not
+    var f2 = try FakePerfRing.init(gpa, 64);
+    defer f2.deinit();
+    var r2 = f2.reader();
+    const Wrap = struct {
+        // Fill with 24-byte records until a 12-byte payload would straddle the ring end.
+        fn toWrap(f: *FakePerfRing, rd: *Reader) !void {
+            while (((f.head + 12) & 63) + 12 <= 64) {
+                f.appendSample("12345678");
+                _ = try rd.next();
+                rd.advance();
+            }
+        }
+    };
+    try Wrap.toWrap(&f2, &r2);
+    f2.appendSample("ABCDEFGHIJKL");
+    const ev = (try r2.next()).?;
+    try testing.expectEqualStrings("ABCDEFGHIJKL", ev.sample);
+    r2.advance();
+    // a scratch of exactly the sample's size suffices, one byte less does not
+    try Wrap.toWrap(&f2, &r2);
+    f2.appendSample("MNOPQRSTUVWX");
+    r2.scratch = f2.scratch[0..12];
+    const ev2 = (try r2.next()).?;
+    try testing.expectEqualStrings("MNOPQRSTUVWX", ev2.sample);
+    r2.advance();
+    try Wrap.toWrap(&f2, &r2);
+    f2.appendSample("YZ012345QRST");
+    r2.scratch = f2.scratch[0..11];
+    try testing.expectError(error.RecordTooLarge, r2.next());
+}
+
+test "Reader.close: hand-built readers keep their memory; mapped ones are released" {
+    const gpa = testing.allocator;
+    var fake = try FakePerfRing.init(gpa, 64);
+    defer fake.deinit();
+    var r = fake.reader();
+    r.perf_fd = @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+    const fd = r.perf_fd;
+    r.close();
+    try testing.expectEqual(@as(linux.fd_t, -1), r.perf_fd);
+    try testing.expect(linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) != .SUCCESS);
+    fake.buf[fake.page] = 1; // still ours
+    // an owned mapping is released and the flag cleared
+    const page = std.heap.pageSize();
+    const rc = linux.mmap(null, page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    const ptr: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(rc);
+    var r2 = fake.reader();
+    r2.base = ptr[0..page];
+    r2.owns_mapping = true;
+    r2.close();
+    try testing.expect(!r2.owns_mapping);
+}
+
+test "PerfBuffer: totals, drains every ring, polls through a real epoll fd" {
+    const gpa = testing.allocator;
+    var fa = try FakePerfRing.init(gpa, 64);
+    defer fa.deinit();
+    var fb = try FakePerfRing.init(gpa, 64);
+    defer fb.deinit();
+    var readers = [_]Reader{ fa.reader(), fb.reader() };
+    var pb: PerfBuffer = .{ .gpa = gpa, .map_fd = -1, .readers = &readers, .scratch = &.{}, .epoll_fd = -1 };
+    readers[0].lost_records = 3;
+    readers[1].lost_records = 4;
+    try testing.expectEqual(@as(u64, 7), pb.lostRecords());
+    try testing.expect(!pb.available());
+    try testing.expectError(error.NotPollable, pb.poll(0));
+    fa.appendSample("aaaa");
+    fb.appendSample("bbbb");
+    try testing.expect(pb.available());
+    try testing.expect(try pb.poll(0)); // data already pending: no epoll needed
+    var c: Collector = .{};
+    try testing.expectEqual(@as(usize, 2), try pb.consume(&c, Collector.onSample, null, 10));
+    try testing.expect(!pb.available());
+    // a real, empty epoll: the answer is re-derived from the positions
+    pb.epoll_fd = perfEpoll();
+    defer _ = linux.close(pb.epoll_fd);
+    try testing.expect(!(try pb.poll(0)));
+    try testing.expectEqual(@as(usize, 0), try pb.pollAndConsume(0, &c, Collector.onSample, null, 10));
+    fa.appendSample("cccc");
+    try testing.expectEqual(@as(usize, 1), try pb.pollAndConsume(0, &c, Collector.onSample, null, 10));
+    pb.epoll_fd = 9999;
+    try testing.expectError(error.EpollFailed, pb.poll(0));
+    pb.epoll_fd = -1;
+}
+
+test "PerfBuffer.open and the CPU lists: argument validation and range limits" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidPageCount, PerfBuffer.open(gpa, -1, .{ .pages = 0 }));
+    try testing.expectError(error.InvalidPageCount, PerfBuffer.open(gpa, -1, .{ .pages = 3 }));
+    try testing.expectError(error.CpuEnumerationFailed, PerfBuffer.open(gpa, -1, .{ .cpus = &.{} }));
+    try testing.expectEqual(@as(u32, 4096), try countCpuList("0-4095"));
+    try testing.expectError(error.CpuEnumerationFailed, countCpuList("0-4096"));
+    try testing.expectError(error.CpuEnumerationFailed, countCpuList("5-2"));
+    try testing.expectEqual(@as(u32, 1), try countCpuList("7-7"));
+    const all = try parseCpuList(gpa, "0-4095");
+    defer gpa.free(all);
+    try testing.expectEqual(@as(usize, 4096), all.len);
+    try testing.expectEqual(@as(u32, 4095), all[4095]);
+    try testing.expectError(error.CpuEnumerationFailed, parseCpuList(gpa, "0-4096"));
+    try testing.expectError(error.CpuEnumerationFailed, parseCpuList(gpa, "3-1"));
+    const one = try parseCpuList(gpa, "2-2,9");
+    defer gpa.free(one);
+    try testing.expectEqualSlices(u32, &.{ 2, 9 }, one);
+    // readSmallFile reads up to the buffer, exactly
+    var buf: [6]u8 = undefined;
+    const got = readSmallFile("/proc/sys/kernel/ostype", &buf).?;
+    try testing.expectEqualStrings("Linux\n", got);
+    var small: [5]u8 = undefined;
+    try testing.expectEqualStrings("Linux", readSmallFile("/proc/sys/kernel/ostype", &small).?);
+}
