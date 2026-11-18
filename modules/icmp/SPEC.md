@@ -6,7 +6,7 @@
 
 **Scope:** parity — fping v5.5 (Linux) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (536/590, 54 eq) · src 0fc8d9e08b619e90
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, ICMP_FUZZ) · ct n/a — ICMP ping/codec (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: max_inflight 0, ns saturation, bounded O(N log N) subnet pacing, callback re-entrancy, no spin under the in-flight cap, bounded step(), prepare reserves the queue; delta audit 65/68 + 3 eq)
 
@@ -90,6 +90,38 @@ emits the first three; the rest need a real forwarding router or path-MTU condit
 hand-computed from RFC 792/4443. Integration: pings `127.0.0.1` / `::1` end-to-end and
 asserts a correlated reply with plausible RTT, skipped via `error.SkipZigTest` when no ICMP socket
 can be opened. Run: `zig build test-icmp`.
+
+**Audit 2026-11-17 (whole-module mutation).** 590 schemata mutants (ReleaseSafe, one switch per mutant, run on the loopback
+network-namespace lane) over `checksum.zig` (13), `echo.zig` (106), `Socket.zig` (152), `IoSocket.zig` (10) and
+`pinger.zig` (309): every guard, boundary, field offset, arm of the type switches, option passed to `setsockopt`,
+cmsg walk, pacing/retry/duplicate/statistics step of the engine. Round 1 killed 320 and left 270, which showed the
+engine's tests only watched sends and timeouts, not what a reply is booked as: the ping socket's options and
+ancillary-data parsing were untested (`open` skipped on any refusal), and `Stats` totals, min/max, the per-probe
+callback, the retry timeline and the options handed to `Socket.open` were not asserted at all. Closed by 52 new tests:
+`audit_test.zig` (the engine on the UDP loopback rig of `sweep_test.zig`: the bytes on the wire and their checksum, a
+batch's distinct sequence numbers, replies/duplicates/RTT/min/max/jitter from the kernel timestamp, TTL/TOS, ICMP
+timestamp replies, RAW IP-header stripping, retry backoff timeline, count/loop modes, send failures, prepare's reset,
+jitter, pollFds, the error queue's ident/slot/family/source checks, v6 error destination, option plumbing read back
+with `getsockopt`, `Config.io` refusals and descriptor counts) and in-file tests for the private parts (`Socket`:
+option read-back, `buildPktinfo`, `parseControl`/`parseErrControl` byte layouts and bounds, a real loopback
+round trip through `recvMsg`/`recvBatch`/`sendMany`/pktinfo, the error queue; `pinger`: `Stats`, `Addr`, `eventOwns`,
+`handleTimeout`, `checkDone`, `sourceMatches`, `backoff`, `originateMsAt`, `ifNameToIndex`; `echo`/`checksum`/`IoSocket`
+boundary cases). The send-errno table became the pure function `Socket.sendResult` (same mapping) so each errno is
+tested without provoking it. Final: 536 killed (13 of them hangs), 54 equivalent or unobservable, none surviving.
+Equivalent (37): guards the next test subsumes (`parseV4` quote guards, `parseSrc` tiny `namelen`, a v6 `else` arm no
+input reaches), the family check before a `bind` the kernel refuses anyway, a pktinfo with ifindex 0, defensive
+clamps the kernel never needs, two clock readings equal to the nanosecond (three `>`/`>=` pairs), cost-only choices
+(busy loop vs wait, `sendmmsg` vs `sendto`, subnet-waiter compaction thresholds, one extra error-queue entry), state
+that another line sets to the same value, and `ifNameToIndex` on an empty or 16-byte name (the kernel NUL-terminates).
+Unobservable (17): needs `CAP_NET_RAW` / `CAP_NET_ADMIN` (RAW mode, the RAW ident, forging the pending ICMP error,
+`SO_MARK`: a privileged `unshare -rn` run kills them through the tests that skip unprivileged, or the new
+read-back when the mark is settable), more than 1024 replies queued (the drain budget; the flood test is
+privileged-only and timing dependent), a refused `getrandom`, `MSG_NOSIGNAL` on a datagram socket, two simultaneous
+`Io` completions, an error path `commitProbe` cannot take, a 65 KiB ICMP message, a receive timestamp later than the
+read clock. Observation, no change: `parseV4` does not check the quoted IP protocol (the v6 parser checks the next
+header is 58), so `quoted_proto` is not always 1 as its comment says: an ICMP error quoting a UDP datagram whose first
+payload byte is 8 is read as quoting an echo request; fping's own `handle_random_icmp` does not check it either, and
+the engine's ident/slot/destination checks follow.
 
 ## Backlog / deferred
 None beyond the accepted Linux-only platform ceiling (raw-syscall nature, shared with rawsock/
