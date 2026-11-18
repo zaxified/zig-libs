@@ -188,7 +188,7 @@ declare -A TARGETS=(
     [k256]="field mul comb sign ecdsa"
     [montint]="small portable asmcore field ffcontrol dyn"
     # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
-    [p256]="comb sign secpt"
+    [p256]="comb sign secpt ecdh"
     [rsa]="crt crtbl crtcache noncrt keygen oaepnf pemenc pemdec"
     [slhdsa]="seed prf"
     # ⚠ `falcon` is here against its own SPEC.md, which argued it should NOT
@@ -556,6 +556,7 @@ declare -A PATTERN=(
     # signer over THIS module's group, so attributing that arithmetic to
     # someone else would be the evasion this gate exists to refuse.
     [p256/secpt]='group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig'
+    [p256/ecdh]='ecdh[.]zig|group[.]zig|field[.]zig|modinv[.]zig|fast_core[.]zig|point_asm[.]zig'
     [p256/sign]='ecdsa[.]zig|common[.]zig|scalar[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|point_asm[.]zig'
     [rsa/crt]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [rsa/crtbl]='root[.]zig|ff[.]zig|dyn[.]zig|nt[.]zig|montint[.]zig|limbs[.]zig|asm_core[.]zig|safegcd[.]zig'
@@ -990,6 +991,7 @@ declare -A LABEL=(
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
     [p256/secpt]='p256 mulInto, SECRET POINT (isBasePointRepr)'
+    [p256/ecdh]='p256 ecdh, SECRET SCALAR (mulCtWindowed)'
     [rsa/crt]='rsa CRT p/q+std ff'
     [rsa/crtbl]='rsa CRT p/q, .csprng blinding'
     [rsa/crtcache]='rsa CRT p/q, .cached blinding x2'

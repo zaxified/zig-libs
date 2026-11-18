@@ -10,7 +10,7 @@
 //! valgrind's own output, not something a Zig test can assert on. `zig build
 //! check-ctgrind` compiles it so it cannot rot into an unbuildable recipe.
 //!
-//! ## The two targets
+//! ## The targets
 //!
 //! * `comb` — `group.P256.combMulBase`, the fixed-base constant-time multiply
 //!   `s·G`. This is the ONE structural speedup p256 has for a secret scalar
@@ -34,6 +34,12 @@
 //!   `null` noise is what makes the signature reproducible run to run, which
 //!   this harness relies on for nothing but is worth stating: it is not a
 //!   secret input either way.
+//! * `secpt` — `P256.mulInto` with a tainted POINT and a public scalar (the
+//!   `isBasePointRepr` fast-path test reads the point's coordinates).
+//! * `ecdh` — `p256.ecdh` with a tainted secret scalar against a public peer
+//!   point: the variable-base windowed multiply (`mulCtWindowed`) and the
+//!   affine conversion of the secret product. The `hpke` and `tls13`
+//!   P-256 rows reach the same code through their own harnesses.
 //!
 //! ## What is deliberately NOT a target
 //!
@@ -46,14 +52,9 @@
 //! oracle-only `std` target) all document by naming what they refuse to pin.
 //! There is no constant-time claim on the verify path to measure here.
 //!
-//! `P256.mul` (the general variable-base CT multiply for a non-fixed point)
-//! is also not a target: nothing in this module's own shipped API calls it
-//! with a secret scalar — every secret-scalar multiply that `EcdsaP256Sha256`
-//! performs is against the fixed base point and is redirected to
-//! `combMulBase` (`group.zig:290`–`312`, `isBasePointRepr`). A consumer
-//! reaching `P256.mul` with a secret scalar over an arbitrary point (e.g. an
-//! ECDH-style use from `jwe`) is a claim about `jwe`, not about `p256`, and
-//! belongs in that module's own harness if it exists.
+//! The general variable-base CT multiply (`mulCtWindowed`, behind `P256.mul`
+//! and `mulInto`) on a SECRET scalar is the `ecdh` target below: `ecdh` is
+//! this module's own API, so the claim is p256's.
 //!
 //! ## The two traps (see `ct25519`'s harness for the fuller writeup)
 //!
@@ -122,13 +123,14 @@ fn secretScalar(comptime domain: []const u8) [32]u8 {
     return s;
 }
 
-const Target = enum { comb, sign, secpt };
+const Target = enum { comb, sign, secpt, ecdh };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "comb")) return .comb;
     if (std.mem.eql(u8, s, "sign")) return .sign;
     if (std.mem.eql(u8, s, "secpt")) return .secpt;
+    if (std.mem.eql(u8, s, "ecdh")) return .ecdh;
     return error.UnknownTarget;
 }
 
@@ -186,6 +188,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("x={x}\n", .{q.x.toBytes(.big)});
             std.debug.print("y={x}\n", .{q.y.toBytes(.big)});
             std.debug.print("z={x}\n", .{q.z.toBytes(.big)});
+        },
+        .ecdh => {
+            // `p256.ecdh` with a SECRET scalar (the private key) against a
+            // PUBLIC peer point: the variable-base windowed multiply
+            // (`mulCtWindowed`: signed recoding, `gatherSigned` table
+            // lookups, the `started` blend) and the affine conversion of the
+            // secret product. Added 2026-11-18: no other row of this module
+            // fed `mulCtWindowed` a secret digit (`secpt` taints the point,
+            // with a public scalar).
+            var d = secretScalar("ctgrind-p256-harness-ecdh-scalar-v1");
+            taintIf(tainted, &d);
+            const s = reloadVolatile(32, &d);
+            const peer = P256.basePoint.dbl().add(P256.basePoint).toUncompressedSec1();
+            const shared = try root.ecdh(s, &peer);
+            std.debug.print("shared={x}\n", .{shared});
         },
         .sign => {
             // The SHIPPED path: a 32-byte seed feeds both the deterministic
