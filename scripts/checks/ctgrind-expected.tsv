@@ -2341,8 +2341,9 @@ aes192	ReleaseFast	bitsliced	1	128	ba4c8387c14267e7	5ea64f081b0ffcbb	cpu=x86_64
 # soft AES-GCM tag check, aes_gcm.zig:103; control/trap 1), and its printed flight differs: the
 # ClientHello's cipher-suite list is ordered by `aes.has_hardware_support` (tlsclient Client.zig
 # `cipher_suites`), so out_sha is its own.
-ssh	ReleaseFast	ecdh	1	23	6a287e6d4bf9dcec	8683e4aaf784b64c	cpu=x86_64
-ssh	ReleaseFast	pem	1	4	9700fb71cc7b5a24	2ba7559fa99a2188	cpu=x86_64
+# ssh ecdh: no variant since 2026-11-18 -- the fromScalar zero verdict is declassified (ssh audit c1),
+# and portable now reads 20, equal to the plain row.
+ssh	ReleaseFast	pem	1	4	fd6a2bdd03bf50cf	2ba7559fa99a2188	cpu=x86_64
 ct25519	ReleaseFast	x25519	1	1	74612f4e07854c4f	8af2fe8213b778aa	cpu=x86_64
 hpke	ReleaseFast	x25519_decap	1	1	d7d41000e29d1a86	c0cee0a8c6bf72c3	cpu=x86_64
 hpke	ReleaseFast	x25519_authdecap	1	2	d7d41000e29d1a86	05af25d1d0e3943d	cpu=x86_64
