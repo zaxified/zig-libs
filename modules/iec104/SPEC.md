@@ -390,6 +390,7 @@ is `pub const meta` in src/root.zig.
 
 ## Backlog / deferred
 
+- (2026-11-18) **Read (C_RD_NA_1, cause 5) of a protection-equipment point (types 17-19, 38-40)**: the type/cause table allows these types with cause 3 only, yet `onRead` answers such a point with cause 5 like any other. No reference behaviour to copy was found: lib60870-C's slave hands every read to the application's read handler (it only refuses a broadcast address, with cause 46, and a non-request cause, with cause 45) and checks no type; this outstation's own refusals are "wrong request cause" (45, negative) and "unknown IOA" (negative activation confirmation, then 47), and neither fits a point that exists but may not be read. Decide which refusal (if any) is right before changing it; a test with a protection point read is needed either way.
 - (survey 2026-09-30) **Redundancy groups (CS 104)**: lib60870 has them; utilities run dual-link 104 as standard; medium, fits §2 (state machine + arbitration, no I/O). Already listed as deferred; ranked first by this survey.
 - (survey 2026-09-30) **File transfer (type ids 120-127)**: lib60870 file service; needs variable-length elements outside the shape table; medium-large, fits §2.
 - (survey 2026-09-30) **IEC 101 serial link layer (FT1.2)**: the other half of lib60870's scope; medium; fits §2 (framing pure, port I/O is the caller's).
