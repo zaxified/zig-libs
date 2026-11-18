@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 RSA and Go `crypto/rsa` + the `crypto/x509` RSA key codecs: PKCS#1 v1.5 and PSS sign/verify (run-time hash, prehashed digests, PSS salt recovery, decoupled MGF1), OAEP, key generation, PKCS#1/PKCS#8/SPKI/PEM read and write including encrypted PKCS#8 (PBES2/PBKDF2/AES-CBC), OpenSSH private keys, moduli up to 8192 bits (surveyed 2026-09-30 and 2026-10-14, gaps closed 2026-10-14); RSAES-PKCS1-v1_5, multi-prime keys, scrypt/PBES1/legacy-PEM encryption and > 8192-bit moduli are out (see "What is deliberately not done")
 
-**Audit:** review 2026-11-13 · mutation 2026-11-17 (170/206, 36 eq) · src e2103435acf70176
+**Audit:** review 2026-11-13 · mutation 2026-11-18 (177/213, 36 eq) · src e71653ddac56729e
 
 *Delta mutation 2026-11-17:* the branch-free INTEGER trim in `marshal.zig` (private-key PEM ctgrind), 8/8 killed — see Backlog "Private-key PEM: a ctgrind target".
 
@@ -171,6 +171,28 @@ decrypt at all: RSAES-PKCS1-v1_5 is not offered). CRT fault injection is
 addressed by the F3 re-encrypt-and-compare check (see "Hardening" above). Minimum modulus-size /
 small-public-exponent sanity checks apply to parsed keys (`fromBytes`/`fromDer`/`fromPkcs8`/
 `fromOpenSSH`).
+
+**Private-key size floor (2026-11-18, owner decision on the 2026-10-30 sweep item REV-RS-2).**
+Every private key built from components or parsed — `SecretKey.fromPrimes`, `fromDer` (PKCS#1),
+`fromPkcs8`, `fromPem`, `fromPemEncrypted`, `fromPkcs8Encrypted`, `fromOpenSSH`, all of which end
+in the one derivation `fromPrimesImpl` — is refused (`error.InvalidPrivateKey`, the struct wiped)
+when its modulus has fewer than `min_private_modulus_bits` = 1024 bits. Basis: Go 1.24
+`crypto/rsa` refuses keys under 1024 bits (`GODEBUG=rsa1024min=0` the escape, documented for
+tests); OpenSSH 9.1+ refuses RSA keys under 1024 bits (`RequiredRSASize`). The testing-only escape
+is `SecretKey.fromPrimesWith(.., .{ .insecure_allow_small_modulus = true })` (the textbook
+p = 61, q = 53 test, the 512-bit KATs, the sweep tests on hand-made primes use it). Tests at 1023
+and 1024 bits (`sweep_test.zig`). Not (yet) applied: `generate` (still 512..8192; a generated key
+under 1024 bits does not load back through its own `toPkcs1Der` -> `fromDer`, documented on
+`generate`) and the public side (`PublicKey`/`VerifyKey`, still 512) — Backlog "Go-parity floor on
+generate + public keys".
+Delta mutation 2026-11-18: 7 schemata mutants (ReleaseSafe) over the floor check (dropped,
+`<=`), the floor `fromPrimesValue` passes (0), the escape in `fromPrimesWith` (never, always), the
+wipe on refusal, and `generate`'s escape (off: `generate(1022)` searches forever) — 6 killed, 1
+HANG (counted killed); 7/7. Not mutated: `fromPrimesWith`'s `burn.stack` (the same burn as
+`fromPrimes`; only a ReleaseFast stack probe of `fromPrimesWith` could observe it, none exists).
+ctgrind 2026-11-18: every rsa row's count unchanged (crt 1, noncrt 0, crtbl 2, crtcache 4, oaepnf 1,
+keygen 118 <= 173, pemenc 0, pemdec 2); only the source pins moved (the new branch on `n.bits()`, a
+public value), re-pinned.
 
 ## Verification
 
@@ -604,7 +626,21 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 - ~~**PSS verify with automatic salt length**~~ ✅ 2026-10-14 `verifyPssAuto` (+ `maxPssSaltLen`, decoupled MGF1 `signPssH`/`verifyPssH`). Original text *(survey 2026-09-30)*: `verifyPss` needs the salt length; JWT PS256 fixes it, but X.509/CMS signatures carry it in parameters and OpenSSL/Go can recover it. Effort: small. Fits §2.
 
 - **Caller-lowerable PBKDF2 iteration cap** (sweep GP review, 2026-10-30): `max_pbkdf2_iterations` (2^20, ~0.3-1 s per hostile encrypted key) is fixed; minisign's `SecretKeyLimits` / `openSecretKeyLimited` is the precedent for letting the caller pass a lower (or higher) cap.
-- **`fromPrimes` has no minimum modulus size** (sweep GP review REV-RS-2, 2026-10-30): `PublicKey`/`VerifyKey` enforce `min_modulus_bits`, `SecretKey.fromPrimes` does not (the textbook test p=61, q=53 relies on it). A floor would break that test, so none was added. Termination was checked in the GP delta audit (2026-10-30): p=3, q=5, e=3, `rsadpCrtBlinded(.csprng)` returns the right value over 300 seeds/ciphertexts; no hang.
+- ~~**`fromPrimes` has no minimum modulus size**~~ **DONE 2026-11-18** (private-key floor 1024, see "Threat model"). Original text (sweep GP review REV-RS-2, 2026-10-30): `PublicKey`/`VerifyKey` enforce `min_modulus_bits`, `SecretKey.fromPrimes` does not (the textbook test p=61, q=53 relies on it). A floor would break that test, so none was added. Termination was checked in the GP delta audit (2026-10-30): p=3, q=5, e=3, `rsadpCrtBlinded(.csprng)` returns the right value over 300 seeds/ciphertexts; no hang.
+- **(2) Go-parity floor on generate + public keys** (2026-11-18, left open by the private-key floor
+  above, to be scheduled as its own change): Go 1.24 also refuses to *generate* a key under 1024
+  bits and to *use* a public key that small (verify, encrypt). Here `generate` accepts 512..8192 and
+  `PublicKey`/`VerifyKey` 512 up (`min_modulus_bits`). Raising them breaks tests in other modules
+  that build small keys on purpose, all through `generate`: **opcua** ~29 sites — its own
+  `modulus_bits` option of the credential/certificate generator (a production knob; 512/768 in
+  stackprobe_test.zig, server.zig, root.zig, security.zig, server_interop.zig) and `rsa.generate(..,
+  512, ..)` in security.zig, plus peer certificates read through `rsa.PublicKey.fromDer`; **xmlenc**
+  10 `v15TestKey(512)` sites that need k = 64 deliberately (the PKCS#1 v1.5 PS-length boundary is
+  unreachable at k = 128) — they need an escape on generate (`generateWith(.., .{
+  .insecure_allow_small_modulus = true })`), not a bump; **webauthn** the F7 test (root.zig, a
+  512-bit key `rsa.PublicKey.fromBytes` must accept, so webauthn's own 2048 floor is what refuses
+  it) needs a rewrite at 1024. A public floor also changes what x509, ssh, tls*, jwt/jwe, saml/
+  xmldsig, dnssec accept from the wire (intended).
 
 ## Status
 

@@ -181,6 +181,15 @@ pub const max_modulus_len = max_modulus_bits / 8;
 /// 1999, this only ratchets in an obvious lower bound for untrusted keys.
 const min_modulus_bits = 512;
 
+/// Smallest modulus a PRIVATE key may have when it is built from components
+/// (`SecretKey.fromPrimes`) or parsed (`SecretKey.fromDer` / `fromPem` /
+/// `fromPemEncrypted`, `fromPkcs8`, `fromOpenSSH`), in bits: Go 1.24's
+/// `crypto/rsa` floor (`rsa1024min`). A smaller key is `InvalidPrivateKey`;
+/// `SecretKey.fromPrimesWith(.., .{ .insecure_allow_small_modulus = true })`
+/// is the testing-only way around it. Public keys and `generate` keep the
+/// 512-bit `min_modulus_bits` (SPEC Backlog).
+pub const min_private_modulus_bits = 1024;
+
 /// Modulus length in bytes for a modulus of `bit_count` bits.
 fn byteLen(bit_count: usize) usize {
     return bit_count / 8 + @intFromBool(bit_count % 8 != 0); // sweep REV-RS-3: no `+ 7` overflow
@@ -543,6 +552,10 @@ pub const SecretKey = struct {
     /// structure — oddness, p ≠ q, gcd(e, λ(n)) = 1, qInv·q ≡ 1 (mod p) —
     /// but performs no primality test; that is P5 territory).
     ///
+    /// A modulus below `min_private_modulus_bits` (1024) is
+    /// `error.InvalidPrivateKey` (Go 1.24's floor, 2026-11-18); see
+    /// `fromPrimesWith` for the testing-only escape.
+    ///
     /// Timing note (2026-10-03): the derivation is montint limb arithmetic,
     /// constant-time in the primes — `n` a limb product, `λ` from
     /// `montint.nt.lcm`, `d`/`dP`/`dQ` from `inverseOfModulus` (inverses
@@ -565,7 +578,30 @@ pub const SecretKey = struct {
     }
 
     fn fromPrimesValue(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!SecretKey {
-        return fromPrimesImpl(p_bytes, q_bytes, e_bytes) catch error.InvalidPrivateKey;
+        return fromPrimesImpl(p_bytes, q_bytes, e_bytes, min_private_modulus_bits) catch error.InvalidPrivateKey;
+    }
+
+    pub const FromPrimesOptions = struct {
+        /// TESTING ONLY: accept a modulus below `min_private_modulus_bits`
+        /// (textbook and 512-bit known-answer vectors, small keys that keep a
+        /// test fast). A key this small is factorable; never set it for a key
+        /// that protects anything.
+        insecure_allow_small_modulus: bool = false,
+    };
+
+    /// `fromPrimes` with options (the testing-only small-modulus escape).
+    pub fn fromPrimesWith(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8, options: FromPrimesOptions) FromPrimesError!void {
+        const r = fromPrimesWithUnburned(out, p_bytes, q_bytes, e_bytes, options);
+        burn.stack(burn.key_burn);
+        return r;
+    }
+
+    noinline fn fromPrimesWithUnburned(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8, options: FromPrimesOptions) FromPrimesError!void {
+        const min_bits: usize = if (options.insecure_allow_small_modulus) 0 else min_private_modulus_bits;
+        out.* = fromPrimesImpl(p_bytes, q_bytes, e_bytes, min_bits) catch {
+            std.crypto.secureZero(u8, std.mem.asBytes(out));
+            return error.InvalidPrivateKey;
+        };
     }
 
     pub const FromDerError = error{ InvalidDer, InvalidPrivateKey };
@@ -795,7 +831,7 @@ pub fn bigModInverse(gpa: std.mem.Allocator, e: *const BigInt, m: *const BigInt)
     return rem;
 }
 
-fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) !SecretKey {
+fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8, min_bits: usize) !SecretKey {
     const pb = std.mem.trimStart(u8, p_bytes, &.{0});
     const qb = std.mem.trimStart(u8, q_bytes, &.{0});
     const eb = std.mem.trimStart(u8, e_bytes, &.{0});
@@ -835,6 +871,9 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8)
     var n_buf: [max_modulus_len]u8 = undefined;
     limbsToBe(nprod[0..MontParams.max_limbs], &n_buf);
     const n = Modulus.fromBytes(&n_buf, .big) catch return error.InvalidPrivateKey;
+    // The size floor (`min_private_modulus_bits`, or 0 under the testing
+    // escape); n's size is public.
+    if (n.bits() < min_bits) return error.InvalidPrivateKey;
 
     // λ(n) = lcm(p−1, q−1) (p, q odd: p − 1 is p with bit 0 cleared).
     var p1 = pv;
@@ -3238,6 +3277,10 @@ pub const GenerateError = error{
 /// generator is acceptable only for tests. `bits` must be even, between 512
 /// and `max_modulus_bits`; expect roughly quadratic slowdown as `bits`
 /// grows (2048+ is noticeably slow in Debug builds).
+/// ⚠ A key under `min_private_modulus_bits` (1024) is generated, but this
+/// module's private-key parsers refuse it: its own `toPkcs1Der`/`toPem`
+/// output does not load back through `SecretKey.fromDer`/`fromPem` (Go 1.24
+/// refuses to generate it at all; SPEC Backlog).
 pub fn generate(out: *KeyPair, random: std.Random, bits: usize, e: u64) GenerateError!void {
     const r = generateUnburned(out, random, bits, e);
     burn.stack(burn.key_burn);
@@ -3280,8 +3323,11 @@ fn generateValue(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair 
         // positive slipped through (probability <= 2^-128 per prime) and
         // tripped its qInv self-check — restart the search instead of
         // surfacing an error for an input the caller never chose.
+        // `generate` keeps its own size range (`InvalidBits`, 512 up), so the
+        // private-key floor is not applied here (SPEC Backlog: Go-parity floor
+        // on generate + public keys).
         var sk: SecretKey = undefined;
-        SecretKey.fromPrimes(&sk, p_bytes, q_bytes, &e_bytes) catch continue;
+        SecretKey.fromPrimesWith(&sk, p_bytes, q_bytes, &e_bytes, .{ .insecure_allow_small_modulus = true }) catch continue;
         // FIPS 186-5 A.1.1 step 4.c (survey F2, 2026-10-14): d > 2^(nlen/2),
         // else start over with fresh primes. Practically never taken for a
         // random key; the verdict is the only branch on d.
@@ -3671,9 +3717,13 @@ const kat512 = struct {
     const n = hexLit("bd75f1797ee6d06063238fbe5109dd1f3845a4d1cbc138eb5d535c3391447fab5ff634bf7566df51327286a370bae5d4dcefcf914573cf4ba4d285a8d2610709");
 };
 
+/// Textbook and 512-bit known-answer keys: the testing-only escape from the
+/// 1024-bit private-key floor.
+const small_test_key: SecretKey.FromPrimesOptions = .{ .insecure_allow_small_modulus = true };
+
 test "fromPrimes derives textbook parameters (p=61, q=53, e=17)" {
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &.{61}, &.{53}, &.{17});
+    try SecretKey.fromPrimesWith(&sk, &.{61}, &.{53}, &.{17}, small_test_key);
     try testing.expectEqual(3233, try sk.n.v.toPrimitive(u32));
     try testing.expectEqual(413, try sk.d.toPrimitive(u32)); // e⁻¹ mod λ = e⁻¹ mod 780
     try testing.expectEqual(53, try sk.dp.toPrimitive(u32)); // 413 mod 60
@@ -3685,19 +3735,19 @@ test "fromPrimes derives textbook parameters (p=61, q=53, e=17)" {
 
 test "fromPrimes rejects invalid inputs" {
     // p == q
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{61}, &.{61}, &.{17}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &.{61}, &.{61}, &.{17}, small_test_key));
     // even e / e < 3
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{61}, &.{53}, &.{16}));
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{61}, &.{53}, &.{1}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &.{61}, &.{53}, &.{16}, small_test_key));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &.{61}, &.{53}, &.{1}, small_test_key));
     // gcd(e, λ) != 1: λ(61·53) = 780 = 2²·3·5·13 -> e = 13 shares a factor
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{61}, &.{53}, &.{13}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &.{61}, &.{53}, &.{13}, small_test_key));
     // even "prime"
-    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimes(&test_sk_out, &.{62}, &.{53}, &.{17}));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &.{62}, &.{53}, &.{17}, small_test_key));
 }
 
 test "SecretKey.deinit zeroes all key material (audit F4)" {
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &.{61}, &.{53}, &.{17});
+    try SecretKey.fromPrimesWith(&sk, &.{61}, &.{53}, &.{17}, small_test_key);
     const bytes = std.mem.asBytes(&sk);
     var any_nonzero = false;
     for (bytes) |b| {
@@ -3710,7 +3760,7 @@ test "SecretKey.deinit zeroes all key material (audit F4)" {
 
 test "rsaep/rsadp/rsadpCrt textbook KAT and round-trip" {
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &.{61}, &.{53}, &.{17});
+    try SecretKey.fromPrimesWith(&sk, &.{61}, &.{53}, &.{17}, small_test_key);
     const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 17), .n_mont = sk.n_mont };
 
     // 65^17 mod 3233 = 2790 (0x0ae6)
@@ -3730,7 +3780,7 @@ test "rsaep/rsadp/rsadpCrt textbook KAT and round-trip" {
 
 test "primitives reject representative >= n" {
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &.{61}, &.{53}, &.{17});
+    try SecretKey.fromPrimesWith(&sk, &.{61}, &.{53}, &.{17}, small_test_key);
     const pk = PublicKey{ .n = sk.n, .e = try Fe.fromPrimitive(u32, sk.n, 17), .n_mont = sk.n_mont };
     // n = 3233 = 0x0ca1
     try testing.expectError(error.MessageRepresentativeOutOfRange, rsaep(2, .{ 0x0c, 0xa1 }, pk));
@@ -3877,7 +3927,7 @@ test "rsadpCrt equals rsadp on the 2048-bit key" {
 // factoring-oracle value. RED if the F3 check is removed from `privateOpCrt`.
 test "privateOpCrt Bellcore check rejects a faulted CRT half (audit F3)" {
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &kat512.p, &kat512.q, &kat512.e);
+    try SecretKey.fromPrimesWith(&sk, &kat512.p, &kat512.q, &kat512.e, small_test_key);
     const k = byteLen(sk.n.bits());
 
     // A representative safely < n (top byte zero).
@@ -3918,7 +3968,7 @@ test "CRT base blinding round-trips and matches the unblinded result (audit F2)"
     const random = prng.random();
 
     var sk512: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk512, &kat512.p, &kat512.q, &kat512.e);
+    try SecretKey.fromPrimesWith(&sk512, &kat512.p, &kat512.q, &kat512.e, small_test_key);
     const sk2048 = try kat2048.secretKey();
     for ([_]SecretKey{ sk512, sk2048 }) |sk| {
         const k = byteLen(sk.n.bits());
@@ -3970,7 +4020,7 @@ test "Blinding: three arms, and the unblinded one is a name rather than a null" 
 // `r^e·(r⁻¹)^e ≡ 1` — fails as a different output or `error.FaultDetected`.
 test "Blinding.cached: equals the unblinded op across refreshes and key changes; draws only on refresh" {
     var sk512: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk512, &kat512.p, &kat512.q, &kat512.e);
+    try SecretKey.fromPrimesWith(&sk512, &kat512.p, &kat512.q, &kat512.e, small_test_key);
     const sk2048 = try kat2048.secretKey();
     var msg_rng = std.Random.DefaultPrng.init(0xb11d_cace_0001);
     var prng = std.Random.DefaultPrng.init(0xb11d_cace_0002);
@@ -4050,11 +4100,11 @@ test "Blinding.cached: equals the unblinded op across refreshes and key changes;
 // wrong `r^e` and fail as `error.FaultDetected` (mutation 2026-10-18).
 test "Blinding.cached: another exponent on the same modulus, or another modulus of the same width, draws afresh" {
     var sk_a: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk_a, &kat512.p, &kat512.q, &kat512.e);
+    try SecretKey.fromPrimesWith(&sk_a, &kat512.p, &kat512.q, &kat512.e, small_test_key);
     // Same primes, a different valid exponent (the first one coprime to λ).
     var sk_e: SecretKey = undefined;
     for ([_]u8{ 3, 5, 7, 11, 13, 17 }) |e| {
-        SecretKey.fromPrimes(&sk_e, &kat512.p, &kat512.q, &.{e}) catch continue;
+        SecretKey.fromPrimesWith(&sk_e, &kat512.p, &kat512.q, &.{e}, small_test_key) catch continue;
         break;
     } else return error.NoSecondExponent;
     // A different 512-bit modulus: same limb count as `sk_a`.
@@ -4241,7 +4291,7 @@ test "widening path: 2048-bit key through max_modulus_len primitives (writeMontR
 
 test "512-bit key: SHA-256 round-trips, SHA-512 encoding is too short" {
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &kat512.p, &kat512.q, &kat512.e);
+    try SecretKey.fromPrimesWith(&sk, &kat512.p, &kat512.q, &kat512.e, small_test_key);
     const pk = try PublicKey.fromBytes(&kat512.n, &kat512.e);
     var out: [max_modulus_len]u8 = undefined;
 
@@ -4567,7 +4617,7 @@ test "encryptOaep rejects oversize messages and undersized buffers/keys" {
 
     // SHA-1 on the 512-bit key fits up to 64 - 2*20 - 2 = 22 bytes.
     var sk512: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk512, &kat512.p, &kat512.q, &kat512.e);
+    try SecretKey.fromPrimesWith(&sk512, &kat512.p, &kat512.q, &kat512.e, small_test_key);
     var pt: [max_modulus_len]u8 = undefined;
     const c = try encryptOaep(pk512, std.crypto.hash.Sha1, random, "22-byte msg for sha1..", "", &ct);
     try testing.expectEqual(64, c.len);
@@ -4668,7 +4718,7 @@ test "signPss/verifyPss round-trip on the 512-bit key (top-bit clearing path)" {
     // of maskedDB is cleared/checked, exercising §9.1.1 step 11 / §9.1.2
     // step 6 with a nontrivial mask.
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &kat512.p, &kat512.q, &kat512.e);
+    try SecretKey.fromPrimesWith(&sk, &kat512.p, &kat512.q, &kat512.e, small_test_key);
     const pk = try PublicKey.fromBytes(&kat512.n, &kat512.e);
     var prng = std.Random.DefaultPrng.init(0x353132626974);
     const random = prng.random();
@@ -5680,7 +5730,7 @@ test "PSS: the smallest key a hash fits (emLen = hLen + 2) signs and verifies wi
     const p = comptime hexLit("3bed8e60ed84e75dfc365b");
     const q = comptime hexLit("33f4814871f502d278fec1");
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &p, &q, &.{ 0x01, 0x00, 0x01 });
+    try SecretKey.fromPrimesWith(&sk, &p, &q, &.{ 0x01, 0x00, 0x01 }, small_test_key);
     defer sk.deinit();
     const pk = sk.publicKey();
     try testing.expectEqual(172, pk.bits());
@@ -5822,7 +5872,9 @@ test "generate: FIPS 186-5 d > 2^(nlen/2) bound (F2)" {
 
 test "marshal: generated keys round-trip through every form" {
     var prng = std.Random.DefaultPrng.init(0x5eed_0014);
-    for ([_]usize{ 512, 1024 }) |bits| {
+    // 1024 up: a smaller generated key does not load back (private-key floor,
+    // sweep_test "private-key floor").
+    for ([_]usize{ 1024, 1040 }) |bits| {
         var kp: KeyPair = undefined;
         try generate(&kp, prng.random(), bits, 65537);
         defer kp.secret_key.deinit();
@@ -6815,7 +6867,7 @@ test "verifyPss refuses a representative wider than emLen when modBits ≡ 1 mod
     // rest is a perfectly valid encoding, as built here.
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var sk: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk, &kat521.p, &kat521.q, &kat521.e);
+    try SecretKey.fromPrimesWith(&sk, &kat521.p, &kat521.q, &kat521.e, small_test_key);
     const pk = try PublicKey.fromBytes(&kat521.n, &kat521.e);
     try testing.expectEqual(@as(usize, 521), pk.n.bits());
     const msg = "emLen = k - 1";
@@ -6951,7 +7003,7 @@ test "decryptOaepHNoFail: separator position, public guards and the raw block (m
 
     // k < 2 hLen + 2: a 512-bit key cannot carry SHA-256 OAEP at all.
     var sk512: SecretKey = undefined;
-    try SecretKey.fromPrimes(&sk512, &kat512.p, &kat512.q, &kat512.e);
+    try SecretKey.fromPrimesWith(&sk512, &kat512.p, &kat512.q, &kat512.e, small_test_key);
     defer sk512.deinit();
     const ct64: [64]u8 = @splat(0x11);
     try testing.expectError(error.DecryptionError, decryptOaepHNoFail(&sk512, Sha256, Sha256, .none, &ct64, "", 0, &out, &raw));
