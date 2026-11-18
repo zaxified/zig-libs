@@ -6,7 +6,7 @@
 
 **Scope:** mvp — no direct reference; FRR topotests / containerlab for the use case (surveyed 2026-09-30; poc -> mvp 2026-09-30 after lossy medium, aging and LAN circuits)
 
-**Audit:** review 2026-09-03 · mutation 2026-10-05 (38/40, 2 eq) · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-19 (57/59, 2 eq) · src ac16ab3f4cf74ed5
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — IS-IS simulation (keyword review, 2026-10-07)
 
@@ -36,7 +36,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) interop suite | Go | Apache-2.0 — README only | 0 | v0.9.0 (2026-09-25) | "Continuous interop against FRR" (README) — tests a real daemon against a real peer, not a model. |
 | [holo-routing/holo](https://github.com/holo-routing/holo) `holo-isis` tests | Rust | MIT | 541 | v0.9.0 | Packet-level and northbound conformance tests; no in-process multi-node simulator found *(inferred from the source listing)*. |
 
-**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, no adjacency FSM (a netsim link *is* the adjacency, and a LAN member's death is declared by a scheduled timer, not a hold timer — SPEC §8, §12), no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10), LSP aging, refresh and purge (SPEC §11) and LAN circuits with DIS election, pseudonode LSPs and CSNP/PSNP repair (SPEC §12) are in the run; what is still missing there is the *interaction* with a real adjacency layer (SPF routing *through* a pseudonode works since 2026-09-30, `isis-spf`'s `addLanArcs` — SPEC §12). It proves the composition works; it is not a lab a user configures.
+**Where we are ahead:** deterministic, in-process, seed-reproducible convergence of a real codec/LSDB/flood/SPF stack over `netsim` — no root, no containers, milliseconds per run; the quiescence/agreement invariants and the CSNP-resync measurement (1 of 4 vs 4 of 4 originators recovered) are things the daemon-based labs cannot observe. **Where we are behind:** fixed golden topologies of at most 6 nodes, no adjacency FSM (a netsim link *is* the adjacency, so a wrong key shows as refused LSPs/SNPs, not a refused hello — §13; and a LAN member's death is declared by a scheduled timer, not a hold timer — SPEC §8, §12), no fault fuzzing, no traffic (SPEC §8). Loss/duplication/reordering/jitter (SPEC §10), LSP aging, refresh and purge (SPEC §11) and LAN circuits with DIS election, pseudonode LSPs and CSNP/PSNP repair (SPEC §12) are in the run; what is still missing there is the *interaction* with a real adjacency layer (SPF routing *through* a pseudonode works since 2026-09-30, `isis-spf`'s `addLanArcs` — SPEC §12). It proves the composition works; it is not a lab a user configures.
+
+**Audit 2026-11-19 (delta mutation, `Options.auth`).** 19 mutants over the authentication code in `fabric.zig` (the placeholder and the signing in each LSP-making path, the per-node key choice and the wrong-key node, the signed-or-not LAN PSNP, the `auth_snp` plumbing into the LSDB and the scheduler, the three refusal counters), one schemata build, baseline first: 19 killed, 0 survivors. Two were first survivors (the LAN PSNP and the scheduler's `auth_snp` forwarded as "signed"): both are bytes a netsim receiver with `auth_snp` off accepts unchecked, so they needed a test that reads the queued payloads (`queuedAuth`); the scheduler one was re-run by hand-mutating the build tree and is killed by that test alone. The first-pass mutant `auth_snp` on the LSDB side, run with the wrong arm of the `if`, was a no-op (the `else` arm is reached only without keys) and was corrected. The 2026-10-05 line had counts, so the card is cumulative (38/40 + 19/19).
 
 ## 1. What this module is
 
@@ -473,6 +475,33 @@ pseudonode id is `lan + 1` for everyone; a new DIS gets no immediate CSNP (the
 periodic cadence of `isis-flood` covers it); a cold restart of a DIS re-asserts
 its pseudonode LSP from its old sequence counter; L1 only; one LSP fragment per
 pseudonode. A frame to a crashed member is counted in `net_dropped` like any drop.
+
+## 13. Authentication (`Options.auth`, 2026-11-19)
+
+`Options.auth = .{ .keys, .auth_snp = true, .mismatched = null }` keys the whole
+fabric with the RFC 5304/5310 machinery of the siblings; without it nothing
+changes (every older test and golden is untouched). Each node signs with
+`keys[0]` what it makes — its LSP, pseudonode LSPs and their purges, the extra
+fragments of the positive control, LAN PSNP requests — and its `isis-lsdb`
+(`auth_keys`, `auth_snp`) and `isis-flood` scheduler (same) sign the aged purges
+and CSNP/PSNPs and verify everything received (`insert`, `reconcileCsnpBytes`,
+`reconcilePsnpBytes`). A refused PDU is counted in `Stats.auth_refused` and
+dropped; the harness does not treat it as a failure.
+
+- **Keyed fabric:** converges, databases agree, nothing refused; with aging the
+  refreshes verify and a dead originator's purge (signed by `Lsdb`'s aging
+  path) floods and is removed (`auth_refused == 0` throughout); a keyed LAN
+  survives DIS preemption.
+- **Wrong key on one node** (`Auth.mismatched`): the node and its neighbour refuse
+  each other's PDUs, so it stays isolated — nobody holds its LSP, it holds nobody's,
+  SPF cannot reach it, while the correctly keyed nodes converge among themselves. With
+  no hello exchange here (§8) "adjacency refused" is "every PDU on that link
+  refused"; the count is exact (4 LSPs + 2 CSNPs on the 4-node line).
+- **Teeth:** the unkeyed fabric converges (the refusal is the keys'), the
+  keyed extra-fragment control still trips the count tripwire, and direct
+  injections show a CSNP/PSNP with no #10 or another key is refused and changes
+  nothing, the right key is accepted. `auth_snp = false` converges and its SNPs
+  really leave unsigned while LSPs stay signed.
 
 ## Backlog / deferred
 
