@@ -81,7 +81,6 @@ fn pow10(e: u8) u128 {
 
 pub const AmountError = error{
     InvalidAmountDigits,
-    AmountLeadingZero,
     SubMilliSatoshiPrecision,
     AmountTooLarge,
 };
@@ -98,7 +97,12 @@ fn parseAmountMsat(s: []const u8) AmountError!?u64 {
         digits = s[0 .. s.len - 1];
     }
     if (digits.len == 0) return error.InvalidAmountDigits;
-    if (digits.len > 1 and digits[0] == '0') return error.AmountLeadingZero;
+    // Leading zeros are accepted (`lnbc01u` = `lnbc1u`): BOLT#11 forbids them for
+    // WRITERS only, and lnd (zpay32) and LDK (lightning-invoice) parse the digits
+    // as an integer. Skip them so the width guard below counts significant digits.
+    var lead: usize = 0;
+    while (lead + 1 < digits.len and digits[lead] == '0') lead += 1;
+    digits = digits[lead..];
     if (digits.len > 20) return error.AmountTooLarge; // guards the u128 accumulation below
 
     var v: u128 = 0;
@@ -1748,7 +1752,20 @@ fn minimalBody(a: Allocator, body: *std.ArrayList(u5)) !void {
 
 test "mutation: HRP amount grammar at its edges" {
     try testing.expectError(error.InvalidAmountDigits, parseAmountMsat("m"));
-    try testing.expectError(error.AmountLeadingZero, parseAmountMsat("01"));
+    // Leading zeros are accepted (reference behaviour), also very many of them.
+    try testing.expectEqual(@as(?u64, 100_000_000_000), try parseAmountMsat("01"));
+    try testing.expectEqual(@as(?u64, 100_000), try parseAmountMsat("01u"));
+    try testing.expectEqual(@as(?u64, 0), try parseAmountMsat("00"));
+    try testing.expectEqual(@as(?u64, 0), try parseAmountMsat("000n"));
+    try testing.expectEqual(@as(?u64, 1), try parseAmountMsat("0000000000000000000000010p"));
+    try testing.expectError(error.InvalidAmountDigits, parseAmountMsat("0x1"));
+    try testing.expectError(error.InvalidAmountDigits, parseAmountMsat("00x"));
+    try testing.expectError(error.AmountTooLarge, parseAmountMsat("0123456789012345678901n"));
+    try testing.expectError(error.SubMilliSatoshiPrecision, parseAmountMsat("005p"));
+    // The width guard counts significant characters: the junk after 24 zeros is
+    // reported as junk, 21 significant characters (junk included) as too large.
+    try testing.expectError(error.InvalidAmountDigits, parseAmountMsat("000000000000000000000001x"));
+    try testing.expectError(error.AmountTooLarge, parseAmountMsat("012345678901234567890x"));
     try testing.expectEqual(@as(?u64, 0), try parseAmountMsat("0"));
     // 20 digits is the widest accepted run: 10^19 pico-bitcoin = 10^18 msat.
     try testing.expectEqual(@as(?u64, 1_000_000_000_000_000_000), try parseAmountMsat("10000000000000000000p"));
@@ -1761,6 +1778,18 @@ test "mutation: HRP amount grammar at its edges" {
     // u64 range edge: 184467440737095516 n = 18446744073709551600 msat fits, ...517 does not.
     try testing.expectEqual(@as(?u64, 18446744073709551600), try parseAmountMsat("184467440737095516n"));
     try testing.expectError(error.AmountTooLarge, parseAmountMsat("184467440737095517n"));
+}
+
+test "writer never emits a leading zero in the HRP amount" {
+    var buf: [32]u8 = undefined;
+    const samples = [_]u64{ 0, 1, 9, 10, 99, 100, 101, 999, 1000, 10_000, 12_345, 100_000, 1_000_000, 100_000_000, 123_456_789, 100_000_000_000, 250_000_000_000, 18446744073709551600 };
+    for (samples) |m| {
+        const s = formatAmount(m, &buf);
+        // "0" alone is the (non-positive) zero amount; any longer string never starts with 0.
+        if (s.len > 1) try testing.expect(s[0] != '0');
+        // The writer's output reads back to the same value.
+        try testing.expectEqual(@as(?u64, m), try parseAmountMsat(s));
+    }
 }
 
 test "mutation: every network writes its own prefix; each decodes back to itself" {
