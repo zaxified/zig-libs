@@ -264,6 +264,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("kat_p256_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 // ── constant-time regression: the 3DH multiply does not report `k` ───────

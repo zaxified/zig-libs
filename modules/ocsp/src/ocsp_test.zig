@@ -21,6 +21,8 @@ const ext = @import("x509").extensions;
 
 const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const Sha512 = std.crypto.hash.sha2.Sha512;
 
 // A fixed instant inside 2027 and the matching time strings.
 const now_2027 = 1_800_000_000; // ~2027-01-15
@@ -35,6 +37,15 @@ const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
 const oid_p256_curve = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
 const oid_sha256 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
 const oid_sha1 = [_]u8{ 0x2b, 0x0e, 0x03, 0x02, 0x1a };
+const oid_sha384 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
+const oid_sha512 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03 };
+const oid_sha224 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04 }; // no CertID hash this module knows
+const oid_sha1_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05 };
+const oid_sha384_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c };
+const oid_sha512_rsa = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d };
+const oid_ecdsa_sha384 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 };
+const oid_ecdsa_sha512 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04 };
+const oid_p384_curve = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 };
 const oid_ocsp_basic = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01 };
 const oid_ocsp_nonce = [_]u8{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02 };
 const oid_ext_key_usage = [_]u8{ 0x55, 0x1d, 0x25 }; // 2.5.29.37
@@ -197,20 +208,96 @@ const RespSpec = struct {
     /// longer matches the real issuer, leaving issuerNameHash and serial
     /// correct — isolates the key-hash comparison from the other two.
     corrupt_issuer_key_hash: bool = false,
+
+    // ── 2026-11-17 whole-module mutation: knobs for shapes the builder could not make ──
+    /// Hash of the matching SingleResponse's CertID.
+    cert_hash: CertHash = .sha256,
+    /// A non-matching SingleResponse ahead of the real one (`.sha1_zero`: SHA-1 CertID with zero
+    /// hashes; `.unknown_alg`: a hash OID this module does not know, but the SHA-1 digests and
+    /// serial of the real certificate, and status `revoked`).
+    decoy: Decoy = .none,
+    single_this_update: ?[]const u8 = null,
+    /// Raw bytes appended inside the matching SingleResponse.
+    single_trailer: ?[]const u8 = null,
+    /// A raw TLV used as the matching single's certStatus.
+    status_raw: ?[]const u8 = null,
+    /// Raw CONTENT of the `responses` SEQUENCE.
+    responses_raw: ?[]const u8 = null,
+    /// An explicit `[0] version` as the first element of ResponseData.
+    tbs_version: bool = false,
+    /// A raw element after `responses` in ResponseData (before the extensions).
+    tbs_trailer: ?[]const u8 = null,
+    /// responseExtensions carries a critical non-nonce extension first.
+    other_ext: bool = false,
+    /// XOR 0x40 into the identifier octet of the element at this child path of ResponseData
+    /// BEFORE signing (so the signature covers the damage and only the parser can object).
+    tbs_flip_path: ?[]const u8 = null,
+    /// Signs `tbsResponseData` and supplies the AlgorithmIdentifier and signature BIT STRING.
+    signer: ?Signer = null,
+};
+
+const CertHash = enum { sha1, sha256, sha384, sha512 };
+const Decoy = enum { none, sha1_zero, unknown_alg };
+const SigOut = struct { alg: []const u8, sigval: []const u8 };
+const Signer = struct {
+    ctx: *const anyopaque,
+    f: *const fn (ctx: *const anyopaque, b: der_writer.Builder, tbs: []const u8) anyerror!SigOut,
 };
 
 fn certIdDer(b: der_writer.Builder, spec: RespSpec) ![]const u8 {
     var nb: [64]u8 = undefined;
     var kb: [64]u8 = undefined;
-    Sha256.hash(spec.issuer.subject_name, nb[0..32], .{});
-    Sha256.hash(spec.issuer.key_bits, kb[0..32], .{});
+    var n: usize = 0;
+    var oid: []const u8 = undefined;
+    switch (spec.cert_hash) {
+        .sha1 => {
+            n = 20;
+            oid = &oid_sha1;
+            Sha1.hash(spec.issuer.subject_name, nb[0..20], .{});
+            Sha1.hash(spec.issuer.key_bits, kb[0..20], .{});
+        },
+        .sha256 => {
+            n = 32;
+            oid = &oid_sha256;
+            Sha256.hash(spec.issuer.subject_name, nb[0..32], .{});
+            Sha256.hash(spec.issuer.key_bits, kb[0..32], .{});
+        },
+        .sha384 => {
+            n = 48;
+            oid = &oid_sha384;
+            Sha384.hash(spec.issuer.subject_name, nb[0..48], .{});
+            Sha384.hash(spec.issuer.key_bits, kb[0..48], .{});
+        },
+        .sha512 => {
+            n = 64;
+            oid = &oid_sha512;
+            Sha512.hash(spec.issuer.subject_name, nb[0..64], .{});
+            Sha512.hash(spec.issuer.key_bits, kb[0..64], .{});
+        },
+    }
     if (spec.corrupt_issuer_name_hash) nb[0] ^= 0xff;
     if (spec.corrupt_issuer_key_hash) kb[0] ^= 0xff;
-    const alg = try b.seq(&.{ try b.oid(&oid_sha256), try b.null() });
+    const alg = try b.seq(&.{ try b.oid(oid), try b.null() });
     return b.seq(&.{
         alg,
-        try b.octetString(nb[0..32]),
-        try b.octetString(kb[0..32]),
+        try b.octetString(nb[0..n]),
+        try b.octetString(kb[0..n]),
+        try b.integerRaw(spec.subject_serial),
+    });
+}
+
+/// A CertID naming a hash this module does not know, but carrying the SHA-1 digests and the
+/// serial of the real certificate: a verifier that guessed SHA-1 (or accepted the entry
+/// unchecked) would match it.
+fn decoyUnknownAlgCertIdDer(b: der_writer.Builder, spec: RespSpec) ![]const u8 {
+    var nb: [20]u8 = undefined;
+    var kb: [20]u8 = undefined;
+    Sha1.hash(spec.issuer.subject_name, &nb, .{});
+    Sha1.hash(spec.issuer.key_bits, &kb, .{});
+    return b.seq(&.{
+        try b.seq(&.{ try b.oid(&oid_sha224), try b.null() }),
+        try b.octetString(&nb),
+        try b.octetString(&kb),
         try b.integerRaw(spec.subject_serial),
     });
 }
@@ -270,28 +357,29 @@ fn buildResponseWithSha1Decoy(gpa: std.mem.Allocator, spec: RespSpec) ![]u8 {
     return buildResponseImpl(gpa, spec, true);
 }
 
-fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) ![]u8 {
+fn buildResponseImpl(gpa: std.mem.Allocator, spec_in: RespSpec, with_decoy: bool) ![]u8 {
+    var spec = spec_in;
+    if (with_decoy and spec.decoy == .none) spec.decoy = .sha1_zero;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const b: der_writer.Builder = .{ .a = arena.allocator() };
 
     // SingleResponse
-    const single_parts_head = [_][]const u8{
-        try certIdDer(b, spec),
-        try statusDer(b, spec.status),
-        try b.generalizedTime(spec.this_update),
-    };
     var single_parts = std.ArrayList([]const u8).empty;
-    try single_parts.appendSlice(b.a, &single_parts_head);
+    try single_parts.append(b.a, try certIdDer(b, spec));
+    try single_parts.append(b.a, if (spec.status_raw) |raw| raw else try statusDer(b, spec.status));
+    try single_parts.append(b.a, try b.generalizedTime(spec.single_this_update orelse spec.this_update));
     if (spec.next_update) |nu| {
         try single_parts.append(b.a, try b.explicit(0, try b.generalizedTime(nu)));
     }
+    if (spec.single_trailer) |t| try single_parts.append(b.a, t);
     const single = try b.seq(single_parts.items);
-    const responses = if (with_decoy) blk: {
+    const responses = if (spec.responses_raw) |raw| try b.tlv(0x30, raw) else if (spec.decoy != .none) blk: {
         var decoy_parts = std.ArrayList([]const u8).empty;
+        const decoy_status: StatusKind = if (spec.decoy == .unknown_alg) .{ .revoked = .{ .time = "20260101000000Z", .reason = 1 } } else spec.status;
         try decoy_parts.appendSlice(b.a, &[_][]const u8{
-            try decoySha1CertIdDer(b),
-            try statusDer(b, spec.status),
+            if (spec.decoy == .unknown_alg) try decoyUnknownAlgCertIdDer(b, spec) else try decoySha1CertIdDer(b),
+            try statusDer(b, decoy_status),
             try b.generalizedTime(spec.this_update),
         });
         if (spec.next_update) |nu| {
@@ -317,7 +405,7 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
         break :blk try b.seq(all.items);
     } else try b.seq(&.{single});
 
-    // ResponseData (tbs): responderID byName [1] or byKey [2], producedAt, responses [, exts]
+    // ResponseData (tbs): [version,] responderID byName [1] or byKey [2], producedAt, responses [, trailer] [, exts]
     const responder_id = if (spec.responder_by_name) |name|
         try b.explicit(1, name)
     else if (spec.responder_by_key) |kh|
@@ -325,27 +413,50 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
     else
         return error.NoResponderId;
     var rd_parts = std.ArrayList([]const u8).empty;
+    if (spec.tbs_version) try rd_parts.append(b.a, try b.explicit(0, try b.integerU64(0)));
     try rd_parts.append(b.a, responder_id);
     try rd_parts.append(b.a, try b.generalizedTime(spec.this_update));
     try rd_parts.append(b.a, responses);
-    if (spec.nonce) |n| try rd_parts.append(b.a, try nonceExtsDer(b, n));
-    const tbs = try b.seq(rd_parts.items);
+    if (spec.tbs_trailer) |t| try rd_parts.append(b.a, t);
+    if (spec.nonce != null or spec.other_ext) {
+        var ext_items = std.ArrayList([]const u8).empty;
+        if (spec.other_ext) try ext_items.append(b.a, try b.seq(&.{
+            try b.oid(&[_]u8{ 0x2a, 0x03, 0x04 }),
+            try b.boolean(true),
+            try b.octetString("x"),
+        }));
+        if (spec.nonce) |n| try ext_items.append(b.a, try b.seq(&.{
+            try b.oid(&oid_ocsp_nonce),
+            try b.octetString(try b.octetString(n)),
+        }));
+        try rd_parts.append(b.a, try b.explicit(1, try b.seq(ext_items.items)));
+    }
+    var tbs = try b.seq(rd_parts.items);
+    if (spec.tbs_flip_path) |path| {
+        const mt = try b.a.dupe(u8, tbs);
+        mt[try tagOffsetAt(mt, 0, path)] ^= 0x40;
+        tbs = mt;
+    }
 
     // signatureAlgorithm + signature
     var sig_alg: []const u8 = undefined;
-    var signature: []const u8 = undefined;
-    if (spec.sign_rsa) |sk| {
+    var sigval: []const u8 = undefined;
+    if (spec.signer) |sg| {
+        const so = try sg.f(sg.ctx, b, tbs);
+        sig_alg = so.alg;
+        sigval = so.sigval;
+    } else if (spec.sign_rsa) |sk| {
         var out: [512]u8 = undefined;
-        signature = try rsa.signPkcs1v15(&sk, Sha256, tbs, &out);
-        signature = try b.a.dupe(u8, signature);
+        const signature = try rsa.signPkcs1v15(&sk, Sha256, tbs, &out);
+        sigval = try b.bitString(signature);
         sig_alg = try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() });
     } else if (spec.sign_ecdsa) |sk| {
         const rs = try p256.sign.ecdsaSign(&sk, tbs, &(@as([32]u8, @splat(0x2b))));
-        signature = try ecdsaRsToDer(b, rs);
+        sigval = try b.bitString(try ecdsaRsToDer(b, rs));
         sig_alg = try b.seq(&.{try b.oid(&oid_ecdsa_sha256)});
     } else if (spec.sign_ed25519) |seed| {
         const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
-        signature = try b.a.dupe(u8, &(try kp.sign(tbs, null)).toBytes());
+        sigval = try b.bitString(&(try kp.sign(tbs, null)).toBytes());
         sig_alg = try b.seq(&.{try b.oid(&oid_ed25519)});
     } else return error.NoSigner;
 
@@ -353,7 +464,7 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
     var bor_parts = std.ArrayList([]const u8).empty;
     try bor_parts.append(b.a, tbs);
     try bor_parts.append(b.a, sig_alg);
-    try bor_parts.append(b.a, try b.bitString(signature));
+    try bor_parts.append(b.a, sigval);
     if (spec.certs) |cert_tlv| {
         try bor_parts.append(b.a, try b.explicit(0, try b.seq(&.{cert_tlv})));
     }
@@ -365,6 +476,20 @@ fn buildResponseImpl(gpa: std.mem.Allocator, spec: RespSpec, with_decoy: bool) !
         try b.explicit(0, response_bytes),
     });
     return gpa.dupe(u8, ocsp_response);
+}
+
+/// The offset of the identifier octet of the element reached from the element at `start` by
+/// taking the `path[0]`-th child, then its `path[1]`-th child, and so on.
+fn tagOffsetAt(bytes: []const u8, start: u32, path: []const u8) !u32 {
+    var off = start;
+    for (path) |idx| {
+        const e = try elem(bytes, off);
+        var c: u32 = e.slice.start;
+        var k: u8 = 0;
+        while (k < idx) : (k += 1) c = (try elem(bytes, c)).slice.end;
+        off = c;
+    }
+    return off;
 }
 
 /// r||s (64) → DER `SEQUENCE { INTEGER r, INTEGER s }`.
@@ -393,7 +518,7 @@ fn derIntMagnitude(b: der_writer.Builder, raw: []const u8) ![]const u8 {
 /// interesting one: a cert that is well-formed, correctly signed by the
 /// issuer, valid at `now`, and names the responder — everything a responder
 /// needs EXCEPT the one purpose RFC 6960 §4.2.2.2 asks for.
-const DelegateEku = enum { none, ocsp_signing, any };
+const DelegateEku = enum { none, ocsp_signing, any, other };
 
 fn buildDelegateCert(
     gpa: std.mem.Allocator,
@@ -441,11 +566,18 @@ fn buildDelegateCertValidity(
     try tbs_parts.appendSlice(b.a, &[_][]const u8{
         version, serial, sig_alg, issuer_name, validity, delegate_name, delegate_spki,
     });
-    if (eku != .none) {
+    if (eku == .other) {
+        // An extensions block with one extension (basicConstraints) and NO extendedKeyUsage.
+        const bc_ext = try b.seq(&.{
+            try b.oid(&[_]u8{ 0x55, 0x1d, 0x13 }),
+            try b.octetString(try b.seq(&.{})),
+        });
+        try tbs_parts.append(b.a, try b.explicit(3, try b.seq(&.{bc_ext})));
+    } else if (eku != .none) {
         const purpose_oid = switch (eku) {
             .ocsp_signing => &oid_ocsp_signing,
             .any => &oid_any_extended_key_usage,
-            .none => unreachable,
+            .none, .other => unreachable,
         };
         const eku_ext = try b.seq(&.{
             try b.oid(&oid_ext_key_usage),
@@ -2199,5 +2331,1079 @@ test "verify: key/algorithm mismatch is refused (Ed25519 signature under a P-256
         const resp = try buildResponse(gpa, .{ .issuer = c.bits, .subject_serial = c.serial, .responder_by_name = c.bits.subject_name, .sign_rsa = c.rsa_fx.kp.secret_key });
         defer gpa.free(resp);
         try testing.expectError(error.UnsupportedSignatureAlgorithm, ocsp.verify(try ocsp.parseResponse(resp), c.issuer, c.leaf, defaultOpts()));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2026-11-17 whole-module mutation: tests added for the survivors of round 1
+// ════════════════════════════════════════════════════════════════════════════
+
+const oid_rsa_encryption = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+const t_now: i64 = 1_800_000_000; // 2027-01-15 08:00:00 UTC
+const t_stamp = "20270115080000Z";
+
+fn makeRsaFixtureWith(gpa: std.mem.Allocator, seed: u64, cn: []const u8, serial: []const u8) !RsaFixture {
+    var prng = std.Random.DefaultPrng.init(seed);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    const issuer = try rsa.selfSignedCert(gpa, &kp.secret_key, kp.public_key, Sha256, .{
+        .common_name = cn,
+        .serial = 1,
+        .not_before = "200101000000Z",
+        .not_after = "400101000000Z",
+        .is_ca = true,
+    });
+    errdefer gpa.free(issuer);
+    const issuer_bits = try extractBits(issuer);
+    const subject = try buildLeafCert(gpa, kp.secret_key, issuer_bits.subject_name, try spkiOf(issuer), "leaf2.example.com", serial);
+    return .{ .issuer_der = issuer, .subject_der = subject, .kp = kp };
+}
+
+// ── signer hooks ──
+
+fn rsaSigner(comptime H: type, comptime alg: []const u8) *const fn (*const anyopaque, der_writer.Builder, []const u8) anyerror!SigOut {
+    const S = struct {
+        fn f(ctx: *const anyopaque, b: der_writer.Builder, tbs: []const u8) anyerror!SigOut {
+            const sk: *const rsa.SecretKey = @ptrCast(@alignCast(ctx));
+            var out: [512]u8 = undefined;
+            const sig = try rsa.signPkcs1v15(sk, H, tbs, &out);
+            return .{ .alg = try b.seq(&.{ try b.oid(alg), try b.null() }), .sigval = try b.bitString(sig) };
+        }
+    };
+    return &S.f;
+}
+
+fn ecSigner(comptime E: type, comptime alg: []const u8) *const fn (*const anyopaque, der_writer.Builder, []const u8) anyerror!SigOut {
+    const S = struct {
+        fn f(ctx: *const anyopaque, b: der_writer.Builder, tbs: []const u8) anyerror!SigOut {
+            const kp: *const E.KeyPair = @ptrCast(@alignCast(ctx));
+            const sig = try kp.sign(tbs, null);
+            var buf: [E.Signature.der_encoded_length_max]u8 = undefined;
+            return .{ .alg = try b.seq(&.{try b.oid(alg)}), .sigval = try b.bitString(sig.toDer(&buf)) };
+        }
+    };
+    return &S.f;
+}
+
+const Params = enum { none, null_ok, null_with_content };
+/// A signer that writes exactly the AlgorithmIdentifier and BIT STRING it is told to.
+const RawSig = struct {
+    alg_oid: []const u8,
+    params: Params = .null_ok,
+    sigval: []const u8, // full BIT STRING TLV
+    fn f(ctx: *const anyopaque, b: der_writer.Builder, _: []const u8) anyerror!SigOut {
+        const self: *const RawSig = @ptrCast(@alignCast(ctx));
+        const alg = switch (self.params) {
+            .none => try b.seq(&.{try b.oid(self.alg_oid)}),
+            .null_ok => try b.seq(&.{ try b.oid(self.alg_oid), try b.null() }),
+            .null_with_content => try b.seq(&.{ try b.oid(self.alg_oid), try b.tlv(0x05, "\x00") }),
+        };
+        return .{ .alg = alg, .sigval = self.sigval };
+    }
+    fn signer(self: *const RawSig) Signer {
+        return .{ .ctx = self, .f = f };
+    }
+};
+
+fn baseSpec(fx: *const RsaFixture) !RespSpec {
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+    return .{ .issuer = issuer, .subject_serial = subject.serial, .responder_by_name = issuer.subject_name, .sign_rsa = fx.kp.secret_key };
+}
+
+fn verifyBytes(resp: []const u8, issuer: []const u8, subject: []const u8) !ocsp.Verdict {
+    return ocsp.verify(try ocsp.parseResponse(resp), issuer, subject, defaultOpts());
+}
+
+// ── certificate builders for odd keys ──
+
+fn spkiWith(b: der_writer.Builder, key_oid: []const u8, params: ?[]const u8, spk: []const u8) ![]const u8 {
+    const alg = if (params) |pr| try b.seq(&.{ try b.oid(key_oid), pr }) else try b.seq(&.{try b.oid(key_oid)});
+    return b.seq(&.{ alg, spk });
+}
+
+/// A certificate whose own signature nobody checks (an issuer): `name` (a Name TLV) as issuer and
+/// subject, the given SPKI, and `outer_sigval` (a BIT STRING TLV) or a dummy one.
+fn buildCertWith(gpa: std.mem.Allocator, name: []const u8, spki: []const u8, outer_sigval: ?[]const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    const version = try b.explicit(0, try b.integerU64(2));
+    const serial = try b.integerU64(3);
+    const sig_alg = try b.seq(&.{try b.oid(&oid_ecdsa_sha256)});
+    const validity = try b.seq(&.{ try b.tlv(0x17, "200101000000Z"), try b.tlv(0x17, "400101000000Z") });
+    const tbs = try b.seq(&.{ version, serial, sig_alg, name, validity, name, spki });
+    const cert = try b.seq(&.{ tbs, try b.seq(&.{try b.oid(&oid_ecdsa_sha256)}), outer_sigval orelse try b.bitString(&[_]u8{ 0xde, 0xad, 0xbe, 0xef }) });
+    return gpa.dupe(u8, cert);
+}
+
+fn leafFor(gpa: std.mem.Allocator, fx: *const RsaFixture, issuer_name: []const u8) ![]u8 {
+    const subject = try extractBits(fx.subject_der);
+    return buildLeafCert(gpa, fx.kp.secret_key, issuer_name, try spkiOf(fx.subject_der), "leaf.example.com", subject.serial);
+}
+
+// ── A. CertID hash algorithms, and a CertID whose hash we do not know ──
+
+test "verify: CertIDs hashed with SHA-1, SHA-384 and SHA-512 bind; so does SHA-256" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    inline for (.{ CertHash.sha1, CertHash.sha256, CertHash.sha384, CertHash.sha512 }) |h| {
+        var spec = try baseSpec(&fx);
+        spec.cert_hash = h;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        const v = try verifyBytes(resp, fx.issuer_der, fx.subject_der);
+        try testing.expect(v.status == .good);
+    }
+}
+
+test "verify: a CertID naming a hash this module does not know never matches, even with SHA-1's digests" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    var spec = try baseSpec(&fx);
+    spec.decoy = .unknown_alg;
+    const resp = try buildResponse(gpa, spec);
+    defer gpa.free(resp);
+    const v = try verifyBytes(resp, fx.issuer_der, fx.subject_der);
+    try testing.expect(v.status == .good); // the genuine entry, not the revoked decoy ahead of it
+}
+
+// ── B. responder signature schemes: every hash with every key type, accepted and refused ──
+
+test "verify: RSA responder signatures with SHA-1, SHA-384 and SHA-512" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    var sk = fx.kp.secret_key;
+    inline for (.{
+        .{ Sha1, &oid_sha1_rsa },
+        .{ Sha384, &oid_sha384_rsa },
+        .{ Sha512, &oid_sha512_rsa },
+    }) |c| {
+        var spec = try baseSpec(&fx);
+        spec.sign_rsa = null;
+        spec.signer = .{ .ctx = &sk, .f = rsaSigner(c[0], c[1]) };
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        const v = try verifyBytes(resp, fx.issuer_der, fx.subject_der);
+        try testing.expect(v.status == .good);
+    }
+}
+
+fn ecMatrixCase(gpa: std.mem.Allocator, fx: *const RsaFixture, comptime Curve: type, comptime Hash: type, comptime alg: []const u8, comptime curve_oid: []const u8) !void {
+    const E = std.crypto.sign.ecdsa.Ecdsa(Curve, Hash);
+    const kp = try E.KeyPair.generateDeterministic(@as([E.KeyPair.seed_length]u8, @splat(0x61)));
+    const sec1 = kp.public_key.toUncompressedSec1();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    const name = try buildName(b, "EC matrix CA");
+    const issuer = try buildCertWith(gpa, name, try spkiWith(b, &oid_ec_public_key, try b.oid(curve_oid), try b.bitString(&sec1)), null);
+    defer gpa.free(issuer);
+    const bits = try extractBits(issuer);
+    const leaf = try leafFor(gpa, fx, bits.subject_name);
+    defer gpa.free(leaf);
+    const subject = try extractBits(fx.subject_der);
+    const resp = try buildResponse(gpa, .{
+        .issuer = bits,
+        .subject_serial = subject.serial,
+        .responder_by_name = bits.subject_name,
+        .signer = .{ .ctx = &kp, .f = ecSigner(E, alg) },
+    });
+    defer gpa.free(resp);
+    const v = try verifyBytes(resp, issuer, leaf);
+    try testing.expect(v.status == .good);
+
+    // One bit of r flipped: a well-formed signature that does not verify.
+    const sig_at = @intFromPtr((try ocsp.parseResponse(resp)).basic.?.signature.ptr) - @intFromPtr(resp.ptr);
+    const bad = try gpa.dupe(u8, resp);
+    defer gpa.free(bad);
+    bad[sig_at + 8] ^= 0x01;
+    try testing.expectError(error.SignatureInvalid, verifyBytes(bad, issuer, leaf));
+    // Not an Ecdsa-Sig-Value at all.
+    bad[sig_at + 8] ^= 0x01;
+    bad[sig_at] = 0x31;
+    try testing.expectError(error.SignatureInvalid, verifyBytes(bad, issuer, leaf));
+}
+
+test "verify: ECDSA responder signatures, P-256 and P-384 with SHA-256, SHA-384 and SHA-512; a damaged one is SignatureInvalid" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const P256 = std.crypto.ecc.P256;
+    const P384 = std.crypto.ecc.P384;
+    inline for (.{
+        .{ P256, Sha256, &oid_ecdsa_sha256, &oid_p256_curve },
+        .{ P256, Sha384, &oid_ecdsa_sha384, &oid_p256_curve },
+        .{ P256, Sha512, &oid_ecdsa_sha512, &oid_p256_curve },
+        .{ P384, Sha256, &oid_ecdsa_sha256, &oid_p384_curve },
+        .{ P384, Sha384, &oid_ecdsa_sha384, &oid_p384_curve },
+        .{ P384, Sha512, &oid_ecdsa_sha512, &oid_p384_curve },
+    }) |c| try ecMatrixCase(gpa, &fx, c[0], c[1], c[2], c[3]);
+}
+
+test "verify: an unknown signature algorithm, and keys that cannot be loaded, have their own errors" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    const subject = try extractBits(fx.subject_der);
+    const issuer_bits = try extractBits(fx.issuer_der);
+
+    // (1) signatureAlgorithm OID this module does not know.
+    {
+        var raw: RawSig = .{ .alg_oid = &[_]u8{ 0x2a, 0x03, 0x04, 0x05 }, .sigval = try b.bitString("x") };
+        var spec = try baseSpec(&fx);
+        spec.signer = raw.signer();
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.UnsupportedSignatureAlgorithm, verifyBytes(resp, fx.issuer_der, fx.subject_der));
+    }
+    // (2) an issuer whose RSA key does not parse.
+    {
+        const name = try buildName(b, "garbage RSA key CA");
+        const spki = try spkiWith(b, &oid_rsa_encryption, try b.null(), try b.bitString(&[_]u8{ 0x00, 0x01, 0x02 }));
+        const issuer = try buildCertWith(gpa, name, spki, null);
+        defer gpa.free(issuer);
+        const leaf = try leafFor(gpa, &fx, name);
+        defer gpa.free(leaf);
+        const resp = try buildResponse(gpa, .{ .issuer = .{ .subject_name = name, .key_bits = "", .serial = subject.serial }, .subject_serial = subject.serial, .responder_by_name = name, .sign_rsa = fx.kp.secret_key });
+        defer gpa.free(resp);
+        try testing.expectError(error.InvalidResponderKey, verifyBytes(resp, issuer, leaf));
+    }
+    // (3) an issuer key of a type this module does not know, under an RSA signature.
+    {
+        const name = try buildName(b, "unknown key type CA");
+        const spki = try spkiWith(b, &[_]u8{ 0x2a, 0x03, 0x04 }, null, try b.bitString(&[_]u8{ 0x04, 0x01, 0x02 }));
+        const issuer = try buildCertWith(gpa, name, spki, null);
+        defer gpa.free(issuer);
+        const leaf = try leafFor(gpa, &fx, name);
+        defer gpa.free(leaf);
+        const resp = try buildResponse(gpa, .{ .issuer = .{ .subject_name = name, .key_bits = &[_]u8{ 0x04, 0x01, 0x02 }, .serial = subject.serial }, .subject_serial = subject.serial, .responder_by_name = name, .sign_rsa = fx.kp.secret_key });
+        defer gpa.free(resp);
+        try testing.expectError(error.UnsupportedSignatureAlgorithm, verifyBytes(resp, issuer, leaf));
+    }
+    // (4) an EC key with no named curve is not P-256 by default.
+    {
+        const kp = try p256.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x71)));
+        const sec1 = kp.public_key.toUncompressedSec1();
+        const name = try buildName(b, "no curve CA");
+        const spki = try spkiWith(b, &oid_ec_public_key, null, try b.bitString(&sec1));
+        const issuer = try buildCertWith(gpa, name, spki, null);
+        defer gpa.free(issuer);
+        const leaf = try leafFor(gpa, &fx, name);
+        defer gpa.free(leaf);
+        const resp = try buildResponse(gpa, .{ .issuer = .{ .subject_name = name, .key_bits = &sec1, .serial = subject.serial }, .subject_serial = subject.serial, .responder_by_name = name, .sign_ecdsa = kp.secret_key.bytes });
+        defer gpa.free(resp);
+        try testing.expectError(error.UnsupportedSignatureAlgorithm, verifyBytes(resp, issuer, leaf));
+    }
+    // (5) an EC key that is not a point, under the std ECDSA path (SHA-384).
+    {
+        const E = std.crypto.sign.ecdsa.Ecdsa(std.crypto.ecc.P256, Sha384);
+        const kp = try E.KeyPair.generateDeterministic(@as([32]u8, @splat(0x72)));
+        const bad_key = [_]u8{0x04} ++ @as([64]u8, @splat(0));
+        const name = try buildName(b, "bad EC key CA");
+        const spki = try spkiWith(b, &oid_ec_public_key, try b.oid(&oid_p256_curve), try b.bitString(&bad_key));
+        const issuer = try buildCertWith(gpa, name, spki, null);
+        defer gpa.free(issuer);
+        const leaf = try leafFor(gpa, &fx, name);
+        defer gpa.free(leaf);
+        const resp = try buildResponse(gpa, .{ .issuer = .{ .subject_name = name, .key_bits = &bad_key, .serial = subject.serial }, .subject_serial = subject.serial, .responder_by_name = name, .signer = .{ .ctx = &kp, .f = ecSigner(E, &oid_ecdsa_sha384) } });
+        defer gpa.free(resp);
+        try testing.expectError(error.InvalidResponderKey, verifyBytes(resp, issuer, leaf));
+    }
+    _ = issuer_bits;
+}
+
+test "verify: Ed25519 key and signature lengths, and a non-canonical key" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    const subject = try extractBits(fx.subject_der);
+    // A real Ed25519 issuer with a 63-byte signature.
+    {
+        var c = try makeEdCase(gpa);
+        defer c.deinit(gpa);
+        var raw: RawSig = .{ .alg_oid = &oid_ed25519, .params = .none, .sigval = try b.bitString(&@as([63]u8, @splat(1))) };
+        const resp = try buildResponse(gpa, .{ .issuer = c.bits, .subject_serial = c.serial, .responder_by_name = c.bits.subject_name, .signer = raw.signer() });
+        defer gpa.free(resp);
+        try testing.expectError(error.SignatureInvalid, verifyBytes(resp, c.issuer, c.leaf));
+    }
+    // Keys of 31 bytes and 32 non-canonical bytes.
+    const keys = [_][]const u8{ &@as([31]u8, @splat(7)), &@as([32]u8, @splat(0xff)) };
+    const expect = [_]anyerror{ error.SignatureInvalid, error.InvalidResponderKey };
+    for (keys, expect) |key, want| {
+        const name = try buildName(b, "odd Ed25519 CA");
+        const spki = try spkiWith(b, &oid_ed25519, null, try b.bitString(key));
+        const issuer = try buildCertWith(gpa, name, spki, null);
+        defer gpa.free(issuer);
+        const leaf = try leafFor(gpa, &fx, name);
+        defer gpa.free(leaf);
+        const resp = try buildResponse(gpa, .{ .issuer = .{ .subject_name = name, .key_bits = key, .serial = subject.serial }, .subject_serial = subject.serial, .responder_by_name = name, .sign_ed25519 = @as([32]u8, @splat(3)) });
+        defer gpa.free(resp);
+        try testing.expectError(want, verifyBytes(resp, issuer, leaf));
+    }
+}
+
+// ── C. delegated responders ──
+
+const Dlg = struct {
+    kp: rsa.KeyPair,
+    self: []u8,
+    bits: IssuerBits,
+    spki: []const u8,
+    fn deinit(d: *Dlg, gpa: std.mem.Allocator) void {
+        gpa.free(d.self);
+    }
+};
+
+fn mkDlg(gpa: std.mem.Allocator, seed: u64, cn: []const u8) !Dlg {
+    var prng = std.Random.DefaultPrng.init(seed);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    const self = try rsa.selfSignedCert(gpa, &kp.secret_key, kp.public_key, Sha256, .{
+        .common_name = cn,
+        .serial = 7,
+        .not_before = "200101000000Z",
+        .not_after = "400101000000Z",
+        .is_ca = false,
+    });
+    return .{ .kp = kp, .self = self, .bits = try extractBits(self), .spki = try spkiOf(self) };
+}
+
+test "verify: a delegated responder is found among decoys by name or by key; garbage or foreign certificates are refused" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    var real = try mkDlg(gpa, 0xde1e6a7e, "real responder");
+    defer real.deinit(gpa);
+    var decoy = try mkDlg(gpa, 0xdec0de01, "decoy responder");
+    defer decoy.deinit(gpa);
+    const real_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, real.spki, real.bits.subject_name, .ocsp_signing);
+    defer gpa.free(real_cert);
+    const decoy_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, decoy.spki, decoy.bits.subject_name, .ocsp_signing);
+    defer gpa.free(decoy_cert);
+    const both = try std.mem.concat(gpa, u8, &.{ decoy_cert, real_cert });
+    defer gpa.free(both);
+    var key_hash: [20]u8 = undefined;
+    Sha1.hash(real.bits.key_bits, &key_hash, .{});
+
+    var spec = try baseSpec(&fx);
+    spec.sign_rsa = real.kp.secret_key;
+    spec.certs = both;
+    // By name, then by key: the decoy comes first in `certs` and must be skipped.
+    for ([_]bool{ false, true }) |by_key| {
+        spec.responder_by_name = if (by_key) null else real.bits.subject_name;
+        spec.responder_by_key = if (by_key) &key_hash else null;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        const v = try verifyBytes(resp, fx.issuer_der, fx.subject_der);
+        try testing.expect(v.status == .good);
+        try testing.expect(v.delegated);
+    }
+    // Only a decoy: no certificate matches the ResponderID.
+    spec.responder_by_name = real.bits.subject_name;
+    spec.responder_by_key = null;
+    spec.certs = decoy_cert;
+    {
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.UntrustedResponder, verifyBytes(resp, fx.issuer_der, fx.subject_der));
+    }
+    // The matching certificate is signed by somebody else, not by the issuer.
+    const foreign = try buildDelegateCert(gpa, decoy.kp.secret_key, issuer.subject_name, real.spki, real.bits.subject_name, .ocsp_signing);
+    defer gpa.free(foreign);
+    spec.certs = foreign;
+    {
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.UntrustedResponder, verifyBytes(resp, fx.issuer_der, fx.subject_der));
+    }
+    // `certs` that is not a certificate list at all.
+    for ([_][]const u8{ "\x04\xff", "\x30\x00" }) |junk| {
+        spec.certs = junk;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.Malformed, verifyBytes(resp, fx.issuer_der, fx.subject_der));
+    }
+}
+
+test "verify: a delegate's validity window is closed at both ends; an extension block without extendedKeyUsage is not enough" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    var d = try mkDlg(gpa, 0xde1e6a7e, "window responder");
+    defer d.deinit(gpa);
+    var spec = try baseSpec(&fx);
+    spec.sign_rsa = d.kp.secret_key;
+    spec.responder_by_name = d.bits.subject_name;
+    spec.this_update = t_stamp;
+    spec.next_update = t_stamp;
+    const opts: ocsp.VerifyOptions = .{ .now_unix = t_now };
+
+    // notBefore == notAfter == now: accepted (the window is inclusive).
+    {
+        const cert = try buildDelegateCertValidity(gpa, fx.kp.secret_key, issuer.subject_name, d.spki, d.bits.subject_name, .ocsp_signing, "270115080000Z", "270115080000Z");
+        defer gpa.free(cert);
+        spec.certs = cert;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        const parsed = try ocsp.parseResponse(resp);
+        const v = try ocsp.verify(parsed, fx.issuer_der, fx.subject_der, opts);
+        try testing.expect(v.delegated);
+        // thisUpdate == nextUpdate == now: also accepted, and the times come back exactly.
+        try testing.expectEqual(t_now, v.this_update_unix);
+        try testing.expectEqual(@as(?i64, t_now), v.next_update_unix);
+        try testing.expectEqual(t_now, v.produced_at_unix);
+        try testing.expectEqual(t_now, parsed.basic.?.produced_at_unix);
+    }
+    // One second before notBefore: expired (not yet valid).
+    {
+        const cert = try buildDelegateCertValidity(gpa, fx.kp.secret_key, issuer.subject_name, d.spki, d.bits.subject_name, .ocsp_signing, "270115080001Z", "400101000000Z");
+        defer gpa.free(cert);
+        spec.certs = cert;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.ResponderCertExpired, ocsp.verify(try ocsp.parseResponse(resp), fx.issuer_der, fx.subject_der, opts));
+    }
+    // Extensions present, extendedKeyUsage absent.
+    {
+        const cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, d.spki, d.bits.subject_name, .other);
+        defer gpa.free(cert);
+        spec.certs = cert;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.ResponderMissingOcspSigning, ocsp.verify(try ocsp.parseResponse(resp), fx.issuer_der, fx.subject_der, opts));
+    }
+}
+
+test "verify: a delegate may use another key type than the issuer; its certificate is checked under ITS signature algorithm" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+
+    // (1) P-256 delegate under an RSA issuer.
+    {
+        const kp = try p256.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x55)));
+        const sec1 = kp.public_key.toUncompressedSec1();
+        const dname = try buildName(b, "EC responder");
+        const spki = try spkiWith(b, &oid_ec_public_key, try b.oid(&oid_p256_curve), try b.bitString(&sec1));
+        const cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, spki, dname, .ocsp_signing);
+        defer gpa.free(cert);
+        var spec = try baseSpec(&fx);
+        spec.sign_rsa = null;
+        spec.sign_ecdsa = kp.secret_key.bytes;
+        spec.responder_by_name = dname;
+        spec.certs = cert;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        const v = try verifyBytes(resp, fx.issuer_der, fx.subject_der);
+        try testing.expect(v.delegated);
+    }
+    // (2) the delegate certificate signed with sha384WithRSA while the issuer's own certificate says sha256WithRSA.
+    {
+        var d = try mkDlg(gpa, 0xde1e6a7e, "sha384 responder");
+        defer d.deinit(gpa);
+        const version = try b.explicit(0, try b.integerU64(2));
+        const sig_alg = try b.seq(&.{ try b.oid(&oid_sha384_rsa), try b.null() });
+        const validity = try b.seq(&.{ try b.tlv(0x17, "200101000000Z"), try b.tlv(0x17, "400101000000Z") });
+        const tbs = try b.seq(&.{ version, try b.integerU64(9), sig_alg, issuer.subject_name, validity, d.bits.subject_name, d.spki, try b.explicit(3, try b.seq(&.{try b.seq(&.{ try b.oid(&oid_ext_key_usage), try b.octetString(try b.seq(&.{try b.oid(&oid_ocsp_signing)})) })})) });
+        var out: [512]u8 = undefined;
+        const sig = try rsa.signPkcs1v15(&fx.kp.secret_key, Sha384, tbs, &out);
+        const cert = try b.seq(&.{ tbs, sig_alg, try b.bitString(sig) });
+        var spec = try baseSpec(&fx);
+        spec.sign_rsa = d.kp.secret_key;
+        spec.responder_by_name = d.bits.subject_name;
+        spec.certs = cert;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        const v = try verifyBytes(resp, fx.issuer_der, fx.subject_der);
+        try testing.expect(v.delegated);
+    }
+}
+
+// ── D. nonce, malformed inputs, verifyMany ──
+
+test "verify: a missing nonce, a nonce that differs in an early byte, and a 128-byte nonce" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    var spec = try baseSpec(&fx);
+    {
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.NonceMismatch, ocsp.verify(try ocsp.parseResponse(resp), fx.issuer_der, fx.subject_der, .{ .now_unix = now_2027, .expected_nonce = "abcd" }));
+    }
+    spec.nonce = "xbcd";
+    {
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.NonceMismatch, ocsp.verify(try ocsp.parseResponse(resp), fx.issuer_der, fx.subject_der, .{ .now_unix = now_2027, .expected_nonce = "abcd" }));
+        // a different length is refused too (and does not run the comparison off the end)
+        try testing.expectError(error.NonceMismatch, ocsp.verify(try ocsp.parseResponse(resp), fx.issuer_der, fx.subject_der, .{ .now_unix = now_2027, .expected_nonce = "xbc" }));
+    }
+    // DER's first long-form length: exactly 128 content bytes.
+    const long = @as([128]u8, @splat(0x5a));
+    spec.nonce = &long;
+    {
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        const v = try ocsp.verify(try ocsp.parseResponse(resp), fx.issuer_der, fx.subject_der, .{ .now_unix = now_2027, .expected_nonce = &long });
+        try testing.expect(v.status == .good);
+    }
+}
+
+test "verify and verifyMany: an unparsable issuer or subject is Malformed; an unauthorized responder is judged per issuer" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    var fx2 = try makeRsaFixtureWith(gpa, 0x5eed2222, "second test CA", &.{0x77});
+    defer fx2.deinit(gpa);
+    const spec = try baseSpec(&fx);
+    const resp = try buildResponse(gpa, spec);
+    defer gpa.free(resp);
+    const parsed = try ocsp.parseResponse(resp);
+    try testing.expectError(error.Malformed, ocsp.verify(parsed, "garbage", fx.subject_der, defaultOpts()));
+    try testing.expectError(error.Malformed, ocsp.verify(parsed, fx.issuer_der, "garbage", defaultOpts()));
+
+    var out: [3]ocsp.CertOutcome = undefined;
+    const queries = [_]ocsp.CertPair{
+        .{ .subject_cert_der = fx.subject_der, .issuer_cert_der = fx.issuer_der },
+        .{ .subject_cert_der = fx2.subject_der, .issuer_cert_der = fx2.issuer_der },
+        .{ .subject_cert_der = fx.subject_der, .issuer_cert_der = "garbage" },
+    };
+    try ocsp.verifyMany(parsed, &queries, &out, defaultOpts());
+    try testing.expect(out[0] == .verdict);
+    switch (out[1]) {
+        .failed => |e| try testing.expectEqual(error.UntrustedResponder, e),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (out[2]) {
+        .failed => |e| try testing.expectEqual(error.Malformed, e),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// ── E. structure: every container closes exactly, every identifier is the one DER gives it ──
+
+const RespOffsets = struct {
+    outer: u32,
+    rb_ctx: u32,
+    rb: u32,
+    resp_type: u32,
+    resp_octet: u32,
+    bor: u32,
+    tbs: u32,
+    sig_alg: u32,
+    sig_oid: u32,
+    sigval: u32,
+    certs_ctx: u32,
+    certs_seq: u32,
+    kh: u32,
+    responses_seq: u32,
+    exts_seq: u32,
+    extn: u32,
+    ext_oid: u32,
+    ext_octet: u32,
+    inner: u32,
+};
+
+/// The identifier offsets of a response built with a byKey responder, a nonce and `certs`.
+fn respOffsets(r: []const u8) !RespOffsets {
+    const outer = try elem(r, 0);
+    const status = try elem(r, outer.slice.start);
+    const rb_ctx_off = status.slice.end;
+    const rb_ctx = try elem(r, rb_ctx_off);
+    const rb_off = rb_ctx.slice.start;
+    const rb = try elem(r, rb_off);
+    const rt_off = rb.slice.start;
+    const rt = try elem(r, rt_off);
+    const ro_off = rt.slice.end;
+    const ro = try elem(r, ro_off);
+    const bor_off = ro.slice.start;
+    const bor = try elem(r, bor_off);
+    const tbs_off = bor.slice.start;
+    const tbs = try elem(r, tbs_off);
+    const sa_off = tbs.slice.end;
+    const sa = try elem(r, sa_off);
+    const sv_off = sa.slice.end;
+    const sv = try elem(r, sv_off);
+    const cc_off = sv.slice.end;
+    const cc = try elem(r, cc_off);
+    const rid = try elem(r, tbs.slice.start);
+    const prod = try elem(r, rid.slice.end);
+    const rs_off = prod.slice.end;
+    const rs = try elem(r, rs_off);
+    const ec_off = rs.slice.end;
+    const ec = try elem(r, ec_off);
+    const es = try elem(r, ec.slice.start);
+    const en = try elem(r, es.slice.start);
+    const eo = try elem(r, en.slice.start);
+    const ev = try elem(r, eo.slice.end);
+    return .{
+        .outer = 0,
+        .rb_ctx = rb_ctx_off,
+        .rb = rb_off,
+        .resp_type = rt_off,
+        .resp_octet = ro_off,
+        .bor = bor_off,
+        .tbs = tbs_off,
+        .sig_alg = sa_off,
+        .sig_oid = sa.slice.start,
+        .sigval = sv_off,
+        .certs_ctx = cc_off,
+        .certs_seq = cc.slice.start,
+        .kh = rid.slice.start,
+        .responses_seq = rs_off,
+        .exts_seq = ec.slice.start,
+        .extn = es.slice.start,
+        .ext_oid = en.slice.start,
+        .ext_octet = eo.slice.end,
+        .inner = ev.slice.start,
+    };
+}
+
+/// Insert one 0x00 byte at the END of the content of the last element named in `ancestors`
+/// (outermost first, each inside the one before), and widen every named element's length.
+fn growInside(gpa: std.mem.Allocator, bytes: []const u8, ancestors: []const u32) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    var from: u32 = 0;
+    for (ancestors) |off| {
+        const e = try elem(bytes, off);
+        try out.appendSlice(gpa, bytes[from..off]);
+        const n: usize = (e.slice.end - e.slice.start) + 1;
+        try out.append(gpa, bytes[off]);
+        if (n < 128) {
+            try out.append(gpa, @intCast(n));
+        } else if (n < 256) {
+            try out.appendSlice(gpa, &.{ 0x81, @intCast(n) });
+        } else {
+            try out.appendSlice(gpa, &.{ 0x82, @intCast(n >> 8), @intCast(n & 0xff) });
+        }
+        from = e.slice.start;
+    }
+    const last = try elem(bytes, ancestors[ancestors.len - 1]);
+    try out.appendSlice(gpa, bytes[from..last.slice.end]);
+    try out.append(gpa, 0x00);
+    try out.appendSlice(gpa, bytes[last.slice.end..]);
+    return out.toOwnedSlice(gpa);
+}
+
+fn structSpec(fx: *const RsaFixture, key_hash: *const [20]u8) !RespSpec {
+    var spec = try baseSpec(fx);
+    spec.responder_by_name = null;
+    spec.responder_by_key = key_hash;
+    spec.nonce = "n0nce";
+    spec.certs = fx.subject_der; // any certificate: `certs` is only walked for a delegate
+    return spec;
+}
+
+test "parseResponse: junk inside any container, after the response, or after a NULL, is Malformed" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    var kh: [20]u8 = undefined;
+    Sha1.hash(issuer.key_bits, &kh, .{});
+    const resp = try buildResponse(gpa, try structSpec(&fx, &kh));
+    defer gpa.free(resp);
+    _ = try ocsp.parseResponse(resp); // the unmodified response is fine
+    const o = try respOffsets(resp);
+
+    // trailing byte after the outer SEQUENCE
+    {
+        const longer = try gpa.alloc(u8, resp.len + 1);
+        defer gpa.free(longer);
+        @memcpy(longer[0..resp.len], resp);
+        longer[resp.len] = 0;
+        try testing.expectError(error.Malformed, ocsp.parseResponse(longer));
+    }
+    const chains = [_][]const u32{
+        &.{o.outer}, // after [0] EXPLICIT, inside the outer SEQUENCE
+        &.{ o.outer, o.rb_ctx },
+        &.{ o.outer, o.rb_ctx, o.rb },
+        &.{ o.outer, o.rb_ctx, o.rb, o.resp_octet },
+        &.{ o.outer, o.rb_ctx, o.rb, o.resp_octet, o.bor },
+        &.{ o.outer, o.rb_ctx, o.rb, o.resp_octet, o.bor, o.certs_ctx },
+        &.{ o.outer, o.rb_ctx, o.rb, o.resp_octet, o.bor, o.sig_alg }, // after the NULL parameters
+    };
+    for (chains) |chain| {
+        const grown = try growInside(gpa, resp, chain);
+        defer gpa.free(grown);
+        try testing.expectError(error.Malformed, ocsp.parseResponse(grown));
+    }
+}
+
+test "parseResponse: a wrong identifier octet (class bits) on any structural element is Malformed" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    var kh: [20]u8 = undefined;
+    Sha1.hash(issuer.key_bits, &kh, .{});
+    const resp = try buildResponse(gpa, try structSpec(&fx, &kh));
+    defer gpa.free(resp);
+    const o = try respOffsets(resp);
+    const offs = [_]u32{ o.outer, o.rb, o.resp_type, o.resp_octet, o.bor, o.tbs, o.sig_alg, o.sig_oid, o.sigval, o.certs_seq, o.kh, o.responses_seq, o.exts_seq, o.extn, o.ext_oid, o.ext_octet, o.inner };
+    const bad = try gpa.dupe(u8, resp);
+    defer gpa.free(bad);
+    for (offs) |off| {
+        bad[off] ^= 0x40;
+        try testing.expectError(error.Malformed, ocsp.parseResponse(bad));
+        bad[off] ^= 0x40;
+    }
+    _ = try ocsp.parseResponse(bad);
+}
+
+test "verify: a wrong identifier octet inside a SIGNED SingleResponse is Malformed, not a silent skip" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const paths = [_][]const u8{
+        &.{ 2, 0 }, // SingleResponse
+        &.{ 2, 0, 0 }, // CertID
+        &.{ 2, 0, 0, 0 }, // hashAlgorithm
+        &.{ 2, 0, 0, 0, 0 }, // its OID
+        &.{ 2, 0, 0, 1 }, // issuerNameHash
+        &.{ 2, 0, 0, 2 }, // issuerKeyHash
+        &.{ 2, 0, 0, 3 }, // serialNumber
+        &.{ 2, 0, 1 }, // certStatus
+    };
+    for (paths) |path| {
+        var spec = try baseSpec(&fx);
+        spec.tbs_flip_path = path;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.Malformed, verifyBytes(resp, fx.issuer_der, fx.subject_der));
+    }
+}
+
+test "verify: the certificates handed in are held to DER too (identifier octets, junk in the key algorithm, empty BIT STRINGs)" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const resp = try buildResponse(gpa, try baseSpec(&fx));
+    defer gpa.free(resp);
+    const parsed = try ocsp.parseResponse(resp);
+    const cert = fx.issuer_der;
+
+    // Offsets: certificate, tbsCertificate, its children, the key algorithm, the key, the outer algorithm and signature.
+    const tbs_off = try tagOffsetAt(cert, 0, &.{0});
+    const first = try elem(cert, try tagOffsetAt(cert, 0, &.{ 0, 0 }));
+    const base: u8 = if (@as(u8, @bitCast(first.identifier)) == 0xa0) 1 else 0;
+    const serial = try tagOffsetAt(cert, 0, &.{ 0, base });
+    const issuer_n = try tagOffsetAt(cert, 0, &.{ 0, base + 2 });
+    const validity = try tagOffsetAt(cert, 0, &.{ 0, base + 3 });
+    const subject_n = try tagOffsetAt(cert, 0, &.{ 0, base + 4 });
+    const spki = try tagOffsetAt(cert, 0, &.{ 0, base + 5 });
+    const alg_seq = try tagOffsetAt(cert, 0, &.{ 0, base + 5, 0 });
+    const alg_oid = try tagOffsetAt(cert, 0, &.{ 0, base + 5, 0, 0 });
+    const spk = try tagOffsetAt(cert, 0, &.{ 0, base + 5, 1 });
+    const outer_alg = try tagOffsetAt(cert, 0, &.{1});
+    const outer_oid = try tagOffsetAt(cert, 0, &.{ 1, 0 });
+    const offs = [_]u32{ 0, tbs_off, serial, issuer_n, validity, subject_n, spki, alg_seq, alg_oid, spk, outer_alg, outer_oid };
+    const bad = try gpa.dupe(u8, cert);
+    defer gpa.free(bad);
+    for (offs) |off| {
+        bad[off] ^= 0x40;
+        try testing.expectError(error.Malformed, ocsp.verify(parsed, bad, fx.subject_der, defaultOpts()));
+        bad[off] ^= 0x40;
+    }
+    // junk after the key algorithm's parameters
+    {
+        const grown = try growInside(gpa, cert, &.{ 0, tbs_off, spki, alg_seq });
+        defer gpa.free(grown);
+        try testing.expectError(error.Malformed, ocsp.verify(parsed, grown, fx.subject_der, defaultOpts()));
+    }
+    // empty BIT STRINGs: the key (nothing to read), the certificate's own signature (nobody checks it)
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    const issuer = try extractBits(cert);
+    const rsa_spki = try spkiOf(cert);
+    const empty_spk_cert = try buildCertWith(gpa, issuer.subject_name, try spkiWith(b, &oid_rsa_encryption, try b.null(), "\x03\x00"), null);
+    defer gpa.free(empty_spk_cert);
+    try testing.expectError(error.Malformed, ocsp.verify(parsed, empty_spk_cert, fx.subject_der, defaultOpts()));
+    const no_sig_bytes = try buildCertWith(gpa, issuer.subject_name, rsa_spki, "\x03\x00");
+    defer gpa.free(no_sig_bytes);
+    try testing.expectError(error.Malformed, ocsp.verify(parsed, no_sig_bytes, fx.subject_der, defaultOpts()));
+    // An empty signature value (just the unused-bits octet) is accepted: the issuer's own signature is not examined.
+    const empty_sig = try buildCertWith(gpa, issuer.subject_name, rsa_spki, "\x03\x01\x00");
+    defer gpa.free(empty_sig);
+    try testing.expect((try ocsp.verify(parsed, empty_sig, fx.subject_der, defaultOpts())).status == .good);
+    // An empty key (just the unused-bits octet) parses; there is then nothing to verify with.
+    const kp = try p256.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x71)));
+    const ec_issuer = try buildCertWith(gpa, issuer.subject_name, try spkiWith(b, &oid_ec_public_key, try b.oid(&oid_p256_curve), "\x03\x01\x00"), null);
+    defer gpa.free(ec_issuer);
+    var spec = try baseSpec(&fx);
+    spec.sign_rsa = null;
+    spec.sign_ecdsa = kp.secret_key.bytes;
+    const ec_resp = try buildResponse(gpa, spec);
+    defer gpa.free(ec_resp);
+    try testing.expectError(error.SignatureInvalid, verifyBytes(ec_resp, ec_issuer, fx.subject_der));
+}
+
+test "parseResponse: the response's own signature BIT STRING and algorithm parameters" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    // `03 00` (no unused-bits octet): Malformed.  `03 01 00` (empty signature): parses, then SignatureInvalid.
+    var raw: RawSig = .{ .alg_oid = &oid_sha256_rsa, .sigval = "\x03\x00" };
+    var spec = try baseSpec(&fx);
+    spec.signer = raw.signer();
+    {
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.Malformed, ocsp.parseResponse(resp));
+    }
+    raw.sigval = "\x03\x01\x00";
+    {
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.SignatureInvalid, verifyBytes(resp, fx.issuer_der, fx.subject_der));
+    }
+    // A NULL that is not empty.
+    raw.sigval = try b.bitString("x");
+    raw.params = .null_with_content;
+    {
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.Malformed, ocsp.parseResponse(resp));
+    }
+}
+
+test "parseResponse and verify: version, unknown trailing elements, extensions without a nonce, critical extensions" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    // An explicit [0] version, a trailing element that is not [1], and no nonce.
+    {
+        var spec = try baseSpec(&fx);
+        spec.tbs_version = true;
+        spec.tbs_trailer = "\xa5\x00";
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        const parsed = try ocsp.parseResponse(resp);
+        try testing.expect(parsed.basic.?.nonce == null);
+        try testing.expect((try ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts())).status == .good);
+    }
+    // A critical foreign extension: with no nonce (found nothing), and before the nonce.
+    {
+        var spec = try baseSpec(&fx);
+        spec.other_ext = true;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expect((try ocsp.parseResponse(resp)).basic.?.nonce == null);
+        spec.nonce = "the-nonce";
+        const resp2 = try buildResponse(gpa, spec);
+        defer gpa.free(resp2);
+        const parsed = try ocsp.parseResponse(resp2);
+        try testing.expectEqualStrings("the-nonce", parsed.basic.?.nonce.?);
+        try testing.expect((try ocsp.verify(parsed, fx.issuer_der, fx.subject_der, .{ .now_unix = now_2027, .expected_nonce = "the-nonce" })).status == .good);
+    }
+}
+
+// ── F. the tail of a SingleResponse ──
+
+test "verify: malformed or foreign elements inside a SingleResponse" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const t = "\x18\x0f20270101000000Z"; // a GeneralizedTime TLV
+    const Case = struct { spec_edit: *const fn (*RespSpec) void, want: ?anyerror, reason: ?u8 = null };
+    const edits = struct {
+        fn badThis(s: *RespSpec) void {
+            s.single_this_update = "2027";
+        }
+        fn trailerJunk(s: *RespSpec) void {
+            s.next_update = null;
+            s.this_update = t_stamp;
+            s.single_trailer = "\x04\xff";
+        }
+        fn trailerForeign(s: *RespSpec) void {
+            s.next_update = null;
+            s.this_update = t_stamp;
+            s.single_trailer = "\x30\x00";
+        }
+        fn trailerNextEmpty(s: *RespSpec) void {
+            s.next_update = null;
+            s.this_update = t_stamp;
+            s.single_trailer = "\xa0\x02\x04\xff";
+        }
+        fn trailerNextBadTime(s: *RespSpec) void {
+            s.next_update = null;
+            s.this_update = t_stamp;
+            s.single_trailer = "\xa0\x03\x18\x01\x31";
+        }
+        fn revokedJunk(s: *RespSpec) void {
+            s.status_raw = "\xa1\x02\x04\xff";
+        }
+        fn revokedBadTime(s: *RespSpec) void {
+            s.status_raw = "\xa1\x03\x18\x01\x31";
+        }
+        fn revokedAfterTimeJunk(s: *RespSpec) void {
+            s.status_raw = "\xa1\x13" ++ "\x18\x0f20270101000000Z" ++ "\x04\xff";
+        }
+        fn revokedForeign(s: *RespSpec) void {
+            s.status_raw = "\xa1\x15" ++ "\x18\x0f20270101000000Z" ++ "\x30\x02\x04\xff";
+        }
+        fn revokedReasonJunk(s: *RespSpec) void {
+            s.status_raw = "\xa1\x15" ++ "\x18\x0f20270101000000Z" ++ "\xa0\x02\x04\xff";
+        }
+        fn revokedReasonTwoBytes(s: *RespSpec) void {
+            s.status_raw = "\xa1\x17" ++ "\x18\x0f20270101000000Z" ++ "\xa0\x04\x0a\x02\x01\x02";
+        }
+        fn badStatusTag(s: *RespSpec) void {
+            s.status_raw = "\x83\x00";
+        }
+        fn responsesJunk(s: *RespSpec) void {
+            s.responses_raw = "\x04\xff";
+        }
+        fn singleJunk(s: *RespSpec) void {
+            s.responses_raw = "\x30\x02\x04\xff";
+        }
+    };
+    _ = t;
+    const cases = [_]Case{
+        .{ .spec_edit = edits.badThis, .want = error.Malformed },
+        .{ .spec_edit = edits.trailerJunk, .want = error.Malformed },
+        .{ .spec_edit = edits.trailerForeign, .want = null },
+        .{ .spec_edit = edits.trailerNextEmpty, .want = error.Malformed },
+        .{ .spec_edit = edits.trailerNextBadTime, .want = error.Malformed },
+        .{ .spec_edit = edits.revokedJunk, .want = error.Malformed },
+        .{ .spec_edit = edits.revokedBadTime, .want = error.Malformed },
+        .{ .spec_edit = edits.revokedAfterTimeJunk, .want = error.Malformed },
+        .{ .spec_edit = edits.revokedForeign, .want = null },
+        .{ .spec_edit = edits.revokedReasonJunk, .want = error.Malformed },
+        .{ .spec_edit = edits.revokedReasonTwoBytes, .want = null },
+        .{ .spec_edit = edits.badStatusTag, .want = error.Malformed },
+        .{ .spec_edit = edits.responsesJunk, .want = error.Malformed },
+        .{ .spec_edit = edits.singleJunk, .want = error.Malformed },
+    };
+    for (cases) |c| {
+        var spec = try baseSpec(&fx);
+        c.spec_edit(&spec);
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        if (c.want) |e| {
+            try testing.expectError(e, verifyBytes(resp, fx.issuer_der, fx.subject_der));
+        } else {
+            const v = try verifyBytes(resp, fx.issuer_der, fx.subject_der);
+            // a foreign trailing element is ignored; a two-byte reason is not a reason
+            switch (v.status) {
+                .good => {},
+                .revoked => |r| try testing.expectEqual(@as(?u8, null), r.reason),
+                .unknown => return error.TestUnexpectedResult,
+            }
+        }
+    }
+}
+
+// ── G. buildRequest: the exact bytes ──
+
+fn expectedRequest(b: der_writer.Builder, algo: ocsp.RequestHashAlgo, issuer: IssuerBits, subject: IssuerBits, nonce: ?[]const u8) ![]const u8 {
+    var nh: [32]u8 = undefined;
+    var kh: [32]u8 = undefined;
+    var n: usize = 20;
+    var oid: []const u8 = &oid_sha1;
+    switch (algo) {
+        .sha1 => {
+            Sha1.hash(issuer.subject_name, nh[0..20], .{});
+            Sha1.hash(issuer.key_bits, kh[0..20], .{});
+        },
+        .sha256 => {
+            n = 32;
+            oid = &oid_sha256;
+            Sha256.hash(issuer.subject_name, nh[0..32], .{});
+            Sha256.hash(issuer.key_bits, kh[0..32], .{});
+        },
+    }
+    const alg = try b.seq(&.{ try b.oid(oid), try b.null() });
+    const cert_id = try b.seq(&.{ alg, try b.octetString(nh[0..n]), try b.octetString(kh[0..n]), try b.integerRaw(subject.serial) });
+    const list = try b.seq(&.{try b.seq(&.{cert_id})});
+    const tbs = if (nonce) |nc| blk: {
+        const ext_ = try b.seq(&.{ try b.oid(&oid_ocsp_nonce), try b.octetString(try b.octetString(nc)) });
+        break :blk try b.seq(&.{ list, try b.explicit(2, try b.seq(&.{ext_})) });
+    } else try b.seq(&.{list});
+    return b.seq(&.{tbs});
+}
+
+test "buildRequest: the exact DER for SHA-1 and SHA-256, with and without a nonce" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    for ([_]ocsp.RequestHashAlgo{ .sha1, .sha256 }) |algo| {
+        for ([_]?[]const u8{ null, "request-nonce" }) |nonce| {
+            const want = try expectedRequest(b, algo, issuer, subject, nonce);
+            const got = try ocsp.buildRequest(gpa, fx.subject_der, fx.issuer_der, .{ .hash = algo, .nonce = nonce });
+            defer gpa.free(got);
+            try testing.expectEqualSlices(u8, want, got);
+        }
+    }
+    // the default is SHA-1
+    const dflt = try ocsp.buildRequest(gpa, fx.subject_der, fx.issuer_der, .{});
+    defer gpa.free(dflt);
+    try testing.expectEqualSlices(u8, try expectedRequest(b, .sha1, issuer, subject, null), dflt);
+}
+
+test "verify: a delegate certificate whose extension block cannot be walked is Malformed, at every level of the walk" {
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    var d = try mkDlg(gpa, 0xde1e6a7e, "broken extensions responder");
+    defer d.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const b: der_writer.Builder = .{ .a = arena.allocator() };
+    const bad_value = try b.tlv(0x30, "\x04\xff"); // a SEQUENCE whose first element has an impossible length
+    const eku_with = struct {
+        fn f(bb: der_writer.Builder, value: []const u8) ![]const u8 {
+            return bb.explicit(3, try bb.seq(&.{try bb.seq(&.{ try bb.oid(&oid_ext_key_usage), try bb.octetString(value) })}));
+        }
+    }.f;
+    const variants = [_][]const u8{
+        "\xa3\x02\x04\xff", // [3] holding an element that does not parse
+        "\xa3\x04\x30\x02\x04\xff", // [3] { SEQUENCE { junk } }: the first extension does not parse
+        try eku_with(b, "\x04\xff"), // extnValue is not an element
+        try eku_with(b, bad_value), // extendedKeyUsage whose purposes do not parse
+    };
+    for (variants) |ext_tlv| {
+        const version = try b.explicit(0, try b.integerU64(2));
+        const sig_alg = try b.seq(&.{ try b.oid(&oid_sha256_rsa), try b.null() });
+        const validity = try b.seq(&.{ try b.tlv(0x17, "200101000000Z"), try b.tlv(0x17, "400101000000Z") });
+        const tbs = try b.seq(&.{ version, try b.integerU64(9), sig_alg, issuer.subject_name, validity, d.bits.subject_name, d.spki, ext_tlv });
+        var out: [512]u8 = undefined;
+        const sig = try rsa.signPkcs1v15(&fx.kp.secret_key, Sha256, tbs, &out);
+        const cert = try b.seq(&.{ tbs, sig_alg, try b.bitString(sig) });
+        var spec = try baseSpec(&fx);
+        spec.sign_rsa = d.kp.secret_key;
+        spec.responder_by_name = d.bits.subject_name;
+        spec.certs = cert;
+        const resp = try buildResponse(gpa, spec);
+        defer gpa.free(resp);
+        try testing.expectError(error.Malformed, verifyBytes(resp, fx.issuer_der, fx.subject_der));
     }
 }
