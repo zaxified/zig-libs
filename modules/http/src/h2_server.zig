@@ -9377,7 +9377,9 @@ test "dispatcher (OS threads): credit a handler frees while it reads reaches the
     var rbuf: [4096]u8 = undefined;
     var sr: StagedReader = .init(io, &.{
         .{ .bytes = stage0 },
-        .{ .counter = &fw.wu_conn, .at_least = h2.default_initial_window_size / 2, .bytes = stage1 },
+        // The whole body arrives in one batch, so the credit goes out once
+        // it reaches the peer's remaining room (65 535 - 40 000).
+        .{ .counter = &fw.wu_conn, .at_least = h2.default_initial_window_size - coalesce_body_len, .bytes = stage1 },
         .{ .counter = &fw.data_bytes, .at_least = 1, .bytes = "" },
     }, &rbuf);
     var pd = try PoolDispatcher.init(gpa, io, 2, 8);
@@ -9395,7 +9397,7 @@ test "dispatcher (OS threads): credit a handler frees while it reads reaches the
         std.debug.print("unexpected body: '{s}'\n", .{c.body.items});
         return error.TestUnexpectedResult;
     }
-    try testing.expect(peer.wu_conn >= h2.default_initial_window_size / 2);
+    try testing.expect(peer.wu_conn >= h2.default_initial_window_size - coalesce_body_len);
 }
 
 test "dispatcher (OS threads): credit for a body a handler never read reaches the peer when the stream retires" {
@@ -9427,7 +9429,10 @@ test "dispatcher (OS threads): credit for a body a handler never read reaches th
     var wbuf: [4096]u8 = undefined;
     var fw: FrameWatcher = .init(gpa, &wbuf);
     defer fw.deinit();
-    var rbuf: [4096]u8 = undefined;
+    // Room for all of stage 0 in one read: every DATA frame is handled
+    // before the handler can retire the stream, so the whole 40 000 is
+    // owed -- and credited -- at retirement, not partly by later discards.
+    var rbuf: [64 * 1024]u8 = undefined;
     var sr: StagedReader = .init(io, &.{
         .{ .bytes = stage0 },
         .{ .counter = &fw.wu_conn, .at_least = coalesce_body_len, .bytes = stage1 },
@@ -9447,4 +9452,97 @@ test "dispatcher (OS threads): credit for a body a handler never read reaches th
     try testing.expectEqual(@as(u64, coalesce_body_len), peer.wu_conn);
     try testing.expectEqual(@as(u16, 200), peer.resp(sid2).status);
     try testing.expectEqualStrings("hello", peer.resp(sid2).body.items);
+}
+
+/// `/stream-hold` reads its whole body, then holds its response until
+/// `/hello` has been served on the same connection.
+const HoldProbe = struct {
+    io: std.Io,
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *HoldProbe = @ptrCast(@alignCast(req.context.?));
+        if (std.mem.eql(u8, req.path, "/stream-hold")) {
+            _ = try req.reader().discardRemaining();
+            try awaitFlag(p.io, &p.release);
+            try rw.writeAll("held");
+        } else {
+            p.release.store(true, .release);
+            try rw.writeAll("hello");
+        }
+    }
+};
+
+test "dispatcher (OS threads): connection credit a handler frees is flushed even while the handler keeps running" {
+    // The body (END_STREAM included) is all in before the handler reads, so
+    // what it consumes is credited on the connection window only (§6.9:
+    // the stream can receive no more). The handler then keeps the stream
+    // open; the peer sends its next request only once that credit arrived.
+    // Nothing else is written meanwhile, so the worker must flush it.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-hold"), false);
+    const body = try gpa.alloc(u8, coalesce_body_len);
+    defer gpa.free(body);
+    @memset(body, 'h');
+    try peer.conn.sendData(&peer.wire, sid, body, true);
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    const sid2 = try stageGet(&peer, "/hello");
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var rbuf: [64 * 1024]u8 = undefined; // all of stage 0 in one read
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .counter = &fw.wu_conn, .at_least = h2.default_initial_window_size - coalesce_body_len, .bytes = stage1 },
+        .{ .counter = &fw.data_bytes, .at_least = 9, .bytes = "" }, // "held" + "hello"
+    }, &rbuf);
+    var probe: HoldProbe = .{ .io = io };
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    serve(gpa, .{
+        .handler = HoldProbe.handler,
+        .context = &probe,
+        .stream_request = streamRoutes,
+        .dispatcher = pd.iface(2),
+    }, &sr.reader, &fw.writer);
+
+    try peer.feed(fw.buf.items);
+    try testing.expectEqualStrings("held", peer.resp(sid).body.items);
+    try testing.expectEqualStrings("hello", peer.resp(sid2).body.items);
+    try testing.expectEqual(@as(u64, 0), peer.streamCredit(sid));
+    try testing.expect(peer.wu_conn >= h2.default_initial_window_size - coalesce_body_len);
+}
+
+test "dispatcher (fibers): a handler waiting for credit is released when the connection task leaves" {
+    // The `Dispatcher.io` twin of the OS-thread test: window 0, the reader
+    // ends; the handler parked in `waitForPeer` must get `Closed` once the
+    // connection task has left, not loop on a wait that returns at once.
+    const gpa = testing.allocator;
+    var bio: BatonIo = undefined;
+    bio.init(gpa);
+    defer bio.deinit();
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = 0 });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/big");
+    var fd: BatonDispatcher = .{ .b = &bio };
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .dispatcher = fd.iface(2) }, &out_buf);
+    fd.join();
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqual(@as(usize, 0), c.body.items.len);
+    try testing.expect(!c.end);
 }
