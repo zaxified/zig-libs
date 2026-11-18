@@ -220,6 +220,20 @@ jumps and zero secret-indexed loads before the core is declared done.
   every point except the public constant, so a secret point reveals nothing unless
   it equals G (about 2^-256 for a hashed point). Row `secpt`: 2 in-file before the
   fix, 1 after (the product's `rejectIdentity` verdict, as in `comb`).
+  **Portable REDC, finding (2026-11-18):** the portable path (no ADX/BMI2: aarch64,
+  baseline x86-64) branched on a secret. With `CTGRIND_CPU=x86_64` the `secpt` row
+  gave 2 in-file where the native one gives 1. The extra context: `Conditional
+  jump` at `montReducePortable` (field.zig:258), under `montMulPortable` <
+  `Fe.mul` < `batchToAffineCt` (group.zig:1225) < `mulCtWindowed` (group.zig:531)
+  < `mulInto`. That is the table of multiples of a SECRET point. In the
+  disassembly, `keep_bit = d[1] & ~hi` was a `jae` on the borrow of the `lo − p`
+  subtract in that one inlined copy, and a `cmovae` in the 75 others; only the
+  combined bit went through `blackBox`. Fix: launder both flags before combining
+  them (`blackBox(d[1]) & ~blackBox(hi)`), and the same in the portable `Fe.add`,
+  which has the identical shape although no context was seen there. After the
+  fix the portable `secpt` is back to 1, the native rows are unchanged (`--check`
+  OK), and the native ADX path is untouched. CI measures ctgrind at
+  `CTGRIND_CPU=skylake` only, so nothing guards the portable path (Backlog 13).
 - **Scalar**: `mul`/`add`/`sub`/codecs are std's constant-time fiat field, wrapped;
   `invert` is this module's safegcd (`modinv.zig`, fixed 590 divsteps, every
   decision a `blackBox`-laundered mask), re-encoded through std's branch-free
@@ -660,6 +674,12 @@ Original proposals (2026-10-10, before the pass):
 10. ~~**Wycheproof ECDH (`ecdh_secp256r1_*`) vectors**~~ — **DONE 2026-10-13**: `ecdh`/`ecdhInto` (`src/ecdh.zig`, p384's shape) run against the 363 Wycheproof rows whose public key is a strict-DER SPKI naming secp256r1 (330 valid, 26 invalid, 7 acceptable; the 249 other rows test an ASN.1 parser) and the 25 CAVP CDH rows, and differentially against std on random and mutated SEC1 peers. Also done in the same pass: `Ecdsa(Hash)` with Wycheproof SHA-512 (DER + P1363) and SHA3-256 (DER) and CAVP SigVer/SigGen/KeyPair/PKV (`tools/gen_vectors.py`). *(Original note, survey 2026-09-30: variable-base `P256.mul` is what hpke/spake2plus/ctap2pin/jwe-ES use as ECDH, and only the ECDSA vectors were run; ECDH's invalid-curve and twist points are the classic P-256 failure.)*
 11. **aarch64 field core** *(survey 2026-09-30)*: the `MULX/ADX` core is amd64-only; ARM servers get the portable Solinas path, whose speed relative to `std`'s is unmeasured here. Effort: medium (a `umulh` product with the existing word-shuffle reduction). Fits §2.
 12. **Hash-to-curve (RFC 9380 P256_XMD:SHA-256_SSWU_RO_)** *(survey 2026-10-13, deferred)*: no module of the collection asks for it of P-256 today (hash-to-curve exists in `bls12_381` only), and a point-level `hashToCurve` is one more public surface to keep correct. Effort: medium (SSWU map, isogeny-free for P-256, plus the RFC's vectors).
+13. **ctgrind portable lane** *(2026-11-18, from the portable REDC finding)*: run
+    `scripts/checks/ctgrind.sh` also with `CTGRIND_CPU=x86_64` (no ADX/BMI2) for p256
+    and every other module with an asm/portable split, with its own expected counts.
+    The CI lane is skylake-only, so a secret-dependent branch on the portable path
+    (the path aarch64 runs) goes unseen. That is how the `montReducePortable` `jae`
+    survived.
 
 ## Anchoring
 

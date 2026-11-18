@@ -255,7 +255,12 @@ fn montReducePortable(wide: u512) [4]u64 {
     const hi: u64 = @truncate(t >> 256); // 0 or 1
     const d = @subWithOverflow(lo, field_order);
     // keep `lo` iff the true value `hi·2^256 + lo` is < p: no high bit AND a borrow.
-    const keep_bit: u64 = @as(u64, d[1]) & ~hi;
+    // Both flags are laundered BEFORE they are combined: with only the
+    // combined bit behind `blackBox`, LLVM 0.17.1 (ReleaseFast, -mcpu=x86_64)
+    // computed `d[1] & ~hi` with a `jae` on the subtract's borrow in one
+    // inlined copy (batchToAffineCt inside mulCtWindowed; ctgrind `secpt`,
+    // 2026-11-18) and a `cmovae` in the others.
+    const keep_bit: u64 = blackBox(@as(u64, d[1])) & ~blackBox(hi);
     const keep: u256 = @as(u256, 0) -% @as(u256, blackBox(keep_bit));
     return fromU256((lo & keep) | (d[0] & ~keep));
 }
@@ -460,7 +465,9 @@ pub const Fe = struct {
         const s = @addWithOverflow(a.value(), b.value());
         const d = @subWithOverflow(s[0], fe_order);
         // keep the sum iff no carry and a borrow (i.e. the true sum is < p).
-        const keep_bit: u64 = @as(u64, d[1]) & ~@as(u64, s[1]);
+        // Both flags laundered before they are combined, as in
+        // `montReducePortable` (a select on the borrow otherwise).
+        const keep_bit: u64 = blackBox(@as(u64, d[1])) & ~blackBox(@as(u64, s[1]));
         const keep: u256 = @as(u256, 0) -% @as(u256, blackBox(keep_bit));
         return .{ .limbs = fromU256((s[0] & keep) | (d[0] & ~keep)) };
     }
