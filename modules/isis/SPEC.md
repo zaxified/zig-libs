@@ -6,7 +6,7 @@
 
 **Scope:** mvp — holo-isis packet layer (holo v0.9.0), behaviour cross-checked against FRR isisd 10.7 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-14 · mutation 2026-11-18 (577/589, 12 eq) · src 9e437792bddf5252
+**Audit:** review 2026-09-14 · mutation 2026-11-18 (577/589, 12 eq) · src 284eb8a6ccafbbda
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_FUZZ) · ct 2026-11-19 (ctgrind; auth sign+verify HMAC-MD5 and HMAC-SHA-256 plain + strict, key tainted: 0 in-file)
 

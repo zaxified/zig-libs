@@ -6,7 +6,7 @@
 
 **Scope:** parity — fping v5.5 (Linux) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (536/590, 54 eq) · src cede50a4ebb1a432
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (536/590, 54 eq) · src 6d8f9dc7f1ead956
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, ICMP_FUZZ) · ct n/a — ICMP ping/codec (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: max_inflight 0, ns saturation, bounded O(N log N) subnet pacing, callback re-entrancy, no spin under the in-flight cap, bounded step(), prepare reserves the queue; delta audit 65/68 + 3 eq)
 
