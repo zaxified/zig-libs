@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [pjkundert/cpppo](https://github.com/pjkundert/cpppo) | Python | NOASSERTION per API (dual GPL/commercial, *inferred*) | 391 | push 2025-07-08 | Protocol/simulator toolkit; not read. |
 | Zig ecosystem | — | — | — | — | `gh search repos ethernet/ip --language=zig` found no library. |
 
-**Where we are ahead:** the only Zig EtherNet/IP; typed, allocation-free codec of the full explicit stack (encap, CPF, EPATH, Message Router, Connection Manager incl. Large Forward Open, Logix tag services, Multiple Service Packet) validated against three third-party stacks and Wireshark; a browsable, tag-list-uploadable adapter that OpENer-style stacks do not give in library form for simulation. **Where we are behind:** no implicit Class 0/1 I/O engine (no cyclic producer/RPI/watchdog), no Template Object/UDT member decoding, no CIP Safety/Sync/Security, no PCCC, no Assembly/Port/Connection objects on the adapter (→ Backlog items).
+**Where we are ahead:** the only Zig EtherNet/IP; typed, allocation-free codec of the full explicit stack (encap, CPF, EPATH, Message Router, Connection Manager incl. Large Forward Open, Logix tag services, Multiple Service Packet) validated against three third-party stacks and Wireshark; a browsable, tag-list-uploadable adapter that OpENer-style stacks do not give in library form for simulation. **Where we are behind:** no implicit Class 0/1 I/O engine (no cyclic producer/RPI/watchdog), no Template Object/UDT member decoding, no CIP Safety/Sync/Security, no PCCC, no Port/Connection objects on the adapter (→ Backlog items); the Assembly object is served for explicit messaging only (no implicit I/O).
 
 ## Design & invariants
 
@@ -275,6 +275,45 @@ layout never depends on Zig's bitfield-packing rules.
   declarations we tried for attributes 4 and 5 and its `Array(USINT, 6)` for the
   MAC did not decode, a property of those declarations, not a disagreement
   about the octets.
+
+  The **Assembly object** (class `0x04`, CIP Vol 1 ch. 5-5) is served from
+  `Config.assemblies`, a list of caller-defined instances (`stdobj.Assembly`:
+  instance id `1`-`65535`, the byte buffer, `writable`, a context pointer and
+  optional `before_get` / `after_set` hooks); an empty list withholds the class
+  as before (`path_destination_unknown`). Services as OpENer's
+  `cipassembly.c` registers them (BSD-style licence; source read for behaviour
+  only, nothing copied): `Get_Attribute_Single` and `Set_Attribute_Single`, and
+  nothing else, so `Get_Attributes_All` on the class or an instance is
+  `service_not_supported`. Instance attributes: 3 the data (octets as stored,
+  `Get`; `Set` only on a `writable` instance), 4 its length as a `UINT` (`Get`
+  only; a `Set` is `attribute_not_settable`); anything else `attribute_not_supported`.
+  Class attributes (instance 0, `UINT` each): 1 revision `2`, 2 largest instance
+  id, 3 number of instances, 6 highest class attribute (`7`), 7 highest instance
+  attribute (`4`); 4 and 5 (optional lists) and everything else
+  `attribute_not_supported`; `Set` on the class is `service_not_supported`.
+  Refusals: unknown instance `path_destination_unknown` (`0x05`), unknown
+  attribute `0x14`, `Set` on a non-writable instance `0x0E`, a `Set` whose length
+  is not the buffer's exactly `0x13` (too short) or `0x15` (too long), checked in
+  that order (attribute exists, settable, length). A missing attribute segment is
+  `path_segment_error` (`0x04`), as on the other standard objects. The `after_set`
+  hook runs after the octets are stored and a `false` answer is
+  `invalid_attribute_value` (`0x09`) with the octets already replaced, which is
+  what OpENer does (`AfterAssemblyDataReceived` after the `memcpy`); `before_get`
+  lets the application refresh an input buffer before it is read. Buffers over
+  65535 octets (the size is a `UINT`), instance 0 and a repeated id are not
+  served (the first entry for an id wins). Deviation: OpENer has no per-instance
+  writable flag (every instance is settable); the flag is this module's, so an
+  input assembly can be read-only, answering `0x0E` as OpENer does for a
+  non-settable attribute. The object is explicit messaging only: no implicit
+  (Class 1) I/O engine, so assemblies are read and written on request only,
+  not exchanged cyclically.
+
+  Anchored against a foreign client (2026-11-18): a stock `pycomm3`
+  `CIPDriver.generic_message` read both instances and the class attributes,
+  wrote the writable one and provoked every refusal over loopback against the
+  adapter; the capture is `goldens.assembly_table` (16 request/reply pairs,
+  replayed byte-exact). pycomm3 accepted every reply and named every refusal
+  correctly; no disagreement.
 
   It also answers enough for a browsing tool to **discover** its tags rather
   than be told them: the Program Name object (`0x64`, one `STRING`) and the
@@ -729,8 +768,9 @@ not:
   about.
 - **Object-model coverage beyond what is built.** The `Adapter` serves the
   Identity object (class 1), the Program Name object (`0x64`), the Symbol
-  Object (`0x6B`), the TCP/IP Interface object (`0xF5`) and the Ethernet Link
-  object (`0xF6`), and no other class. The Message Router, Assembly,
+  Object (`0x6B`), the TCP/IP Interface object (`0xF5`), the Ethernet Link
+  object (`0xF6`) and, when `Config.assemblies` is non-empty, the Assembly
+  object (`0x04`), and no other class. The Message Router,
   Connection, Port (`0xF4`) and Connection Configuration objects are named in
   `ClassCode` and not implemented on the target side; a *client* can of course address any of them
   with the generic attribute services.
@@ -783,6 +823,5 @@ src/root.zig.
 
 - (survey 2026-09-30) **Logix Template Object (0x6C) + UDT member decoding**: the first thing a pycomm3 user hits (structures read as named members); also lets the adapter advertise struct tags; medium, fits §2. (Already listed as deferred; this survey ranks it top.)
 - (survey 2026-09-30) **Implicit I/O connection engine (Class 1, UDP 2222)**: OpENer/EIPScanner users need cyclic I/O; large (cyclic scheduler, clock injected), fits §2 if kept clock-agnostic.
-- (survey 2026-09-30) **Assembly object (0x04) on the adapter**: scanners read it (the TCP/IP Interface and Ethernet Link objects of the same survey item are served since 2026-11-18); small, fits §2.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
