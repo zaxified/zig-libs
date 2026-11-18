@@ -685,3 +685,24 @@ test "populateRuleSet loads every rule in a small ruleset (needs CAP_BPF/root)" 
     try testing.expectEqual(@as(u32, 2), found_class);
     try testing.expectEqual(found_class, rules.lookupReference(&rule_list, .{ 10, 1, 2, 3 }, 0));
 }
+
+test "mapPopulateError keeps the three kernel-facing errors apart and folds everything else into Unexpected" {
+    try testing.expectEqual(PopulateError.BadFd, mapPopulateError(error.BadFd));
+    try testing.expectEqual(PopulateError.NotFound, mapPopulateError(error.NotFound));
+    try testing.expectEqual(PopulateError.PermissionDenied, mapPopulateError(error.PermissionDenied));
+    try testing.expectEqual(PopulateError.Unexpected, mapPopulateError(error.Unexpected));
+    try testing.expectEqual(PopulateError.Unexpected, mapPopulateError(error.OutOfMemory));
+}
+
+test "scratchTransferLen is exactly the rounded stride times the possible CPU count" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Unprivileged. 8 CPUs make a 4-byte stride (32 bytes) and a stride of 8
+    // both multiples of 8, so the divisibility test above cannot tell them
+    // apart; the count itself can.
+    const ncpu = ebpf.possibleCpuCount() catch |e| switch (e) {
+        error.CpuEnumerationFailed => return error.SkipZigTest,
+        else => return e,
+    };
+    const need = try scratchTransferLen();
+    try testing.expectEqual(@as(usize, 8) * ncpu, need);
+}

@@ -6,7 +6,7 @@
 
 **Scope:** core — LibreQoS / xdp-cpumap-tc data plane (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after VLAN tag skip (802.1Q/QinQ, vlan_depth 0..2) + IPv6 classification)
 
-**Audit:** review 2026-09-11 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-11 · mutation 2026-11-17 (301/330, 29 eq) · src 06d25001186cc76c
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XDP_FUZZ) · ct n/a — XDP classifier (keyword review, 2026-10-07)
 
@@ -355,6 +355,29 @@ pattern again, not a dynamic offset:
   in the kernel comparison fails it (`got 4, want 3`). On a host without
   CAP_BPF these SKIP — read such a run as "the kernel never judged this".
 - Green in Debug and `-Doptimize=ReleaseFast`.
+
+**Audit 2026-11-17 (whole-module mutation).** 330 schemata mutants over `src/classifier.zig`, `src/rules.zig` and
+`src/maps.zig` (every constant, operand, skipped emit, jump target and register of both program builders and of the
+shared parse/lookup emitter; the VLAN/IPv6 loop and dispatch bookkeeping; `VlanDepth`, the key-offset tables, the
+`Buf`/`MissJumps` patch machinery and the steer build errors; every guard, boundary, error value and sort key of
+`RuleSet`/`RuleSet6` validate and validateSorted, `isCanonical`/`hostBitsClear`, both LPM keys and both reference
+lookups; the BPF_MAP_CREATE attrs, `mapPopulateError` and the scratch-transfer arithmetic), ReleaseSafe, one build per
+round, each mutant under `setsid -w timeout` and `ulimit -v`, baseline first. `vm.zig` (the offline interpreter and the
+reference parser) is the test oracle, not a product source, and is not mutated; its differential sweeps, truncation
+sweeps and the golden vectors are what kill the emitter mutants (291 of 330 in round 1). Round 1: 291 killed, 39
+survived. Seven tests added (76 pass, 17 skip without CAP_BPF): a /128 IPv6 host rule and a case for it in the
+interpreter's fixtures (a lookup key carrying prefixlen 127 finds the covering /64 instead), `validate`/`validateSorted`
+accepting a /32 host rule, a /31 and the /0 default, a sort-key collision table (`(/2, 128.0.0.0)`, `(/3, 0.0.0.0)`,
+`(/2, 128.0.0.0)`: a shift of 31 hides the duplicate from `validateSorted`), `lookupReference` on a /32 host rule next to
+the covering /8, `LpmKey6.fromPrefix` carrying the address, `mapPopulateError` arm by arm, and `scratchTransferLen`
+against the possible-CPU count (8 CPUs make a 4-byte and an 8-byte stride equally divisible, so the old divisibility
+check could not tell them apart). Final: 301 killed, 29 equivalent or unobservable, none surviving. Equivalent (9): the
+`ld_map_fd2` high word of a non-negative fd (4); a descending sort order (3: it still groups equal keys); `isCanonical`
+at /32 (the mask is 0); `hostBitsClear` at `prefix_len == byte_start` (keep is 0 either way). Unobservable here (20): what
+`createLpmTrieMap`/`createLpm6TrieMap` hand to `bpf(2)`, what `populateRule`/`populateRuleSet`/`populateCpu`/the scratch
+read-write helpers put into or read from a kernel map, the 1024-CPU stack-buffer guard and the unreadable-sysfs error all
+need CAP_BPF or a host with more CPUs; the module's VM lane (`scripts/vm/run.sh xdp-classifier`) runs the round-trip tests
+that would see them, and was not run for this audit.
 
 ## Backlog / deliberately out of scope
 

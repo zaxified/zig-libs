@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (330 mutants over `classifier.zig`, `rules.zig`, `maps.zig`; 301 killed, 29 equivalent or unobservable without CAP_BPF, none surviving); seven tests added (a /128 IPv6 host rule in the interpreter fixtures, /32 and /31 validation, a sort-key collision table, `lookupReference` on a /32, `LpmKey6.fromPrefix`, `mapPopulateError`, `scratchTransferLen` against the CPU count), no source change; the card records `mutation 2026-11-17 (301/330, 29 eq)`.
 - **2026-10-10** — tests: deterministic fuzz driver `XDP_FUZZ` over the existing harnesses (validate, lookup, validateSorted-vs-validate differential, IPv6 table, emitted packet path vs reference over generated frames); reach labels count real outcomes. No code or API change.
 - **2026-10-06** — ADDED, **BEHAVIOURAL, not breaking:** VLAN tag skip and IPv6 classification; scope mvp -> core.
   `ClassifierOptions`/`CpumapSteerOptions` gain `vlan_depth: VlanDepth = .double` (skip 0..2
