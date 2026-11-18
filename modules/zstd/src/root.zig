@@ -735,6 +735,8 @@ test {
     _ = @import("seekable_test.zig");
     _ = @import("decoder_test.zig");
     _ = @import("dmut_test.zig");
+    _ = @import("dopen_test.zig");
+    _ = @import("dopen2_test.zig");
     _ = @import("decoder_dict_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("param_test.zig");
