@@ -2312,6 +2312,11 @@ aesgcm	ReleaseFast	generic	1	226	ca4cbdc7d714f5d8	b60805fea700d105	cpu=x86_64 co
 dtls	ReleaseFast	hs	1	302	61d188b7e8d1387e	61a204df8edf79a0	cpu=x86_64 control=177 trap=179
 dtls	ReleaseFast	app	1	278	61d188b7e8d1387e	70da17057fd7a044	cpu=x86_64 control=279 trap=279
 dtls	ReleaseFast	ku	1	296	61d188b7e8d1387e	505aa3fdd426f98d	cpu=x86_64 control=299 trap=299
+# dtls hs12 (+2, own --stacks diff portable vs native, 2026-11-18): +1 B (std X25519 curve25519.zig:77
+# via ct25519 root.zig:552) and +1 compiler_rt `shortMemset` (compiler_rt.zig:626) for
+# handshake.zig:258's `@memset(received[...][0..fragment_body.len])`. The branch is on the fragment
+# length of the decrypted handshake message, a framing value that the record length already shows on
+# the wire; native lowers that memset without the size dispatch.
 dtls	ReleaseFast	hs12	1	55	fec5ba1e4e81fc5f	d87712f4d6e60179	cpu=x86_64
 quic-crypto	ReleaseFast	aes	1	84	13687ce1a4c91aa7	4d96b4e7d3af1ed7	cpu=x86_64 control=3 trap=45
 aeskw	ReleaseFast	wrap	1	694	986ea45fe8c756da	23036d19c2656c6a	cpu=x86_64 control=8 trap=28
@@ -2354,6 +2359,14 @@ tls13	ReleaseFast	x25519mlkem768_server	1	1	ed80464b8e0301c2	3335c00d4dcdf9e5	cp
 # into the vartime addAffineVt (-2 at :746); coconut user_issue +6 at bls12_381 fp.zig:578 sqrt (a
 # site the native row already counts); tlsserver hs also has B.
 coconut	ReleaseFast	user_issue	1	27	06c770f681312a71	af24664cb307a403	cpu=x86_64
+# voprf p384-server (+4 at p384 field.zig:134, objdump of the x86_64 harness, 2026-11-18): all 4 are
+# `Use of uninitialised value of size 8` at 0x10d9c0d `mov (%rsi),%r12`, the first load of the out-of-
+# line `mulPortable` through a pointer to the wNAF table point. Callers: group.zig:749/750 addAffineVt
+# <- wnafMulVt <- mulPublic <- voprf protocol.zig:247 `computeCompositesFast`, i.e. `mulPublic(c_i,
+# d_i)` over the evaluated elements and their hash-derived d_i, values the server publishes, tainted
+# only as consequences of k. The secret `k` goes through `mulSecret` (protocol.zig:250), which is not
+# involved. On native the same table load is attributed to addAffineVt:746 (-2), because the asm field
+# mul is inlined there.
 voprf	ReleaseFast	p384-server	1	32	e1889b806fc20f54	5ed6c2e0c382fda2	cpu=x86_64
 acme	ReleaseFast	pem	1	43	5338dfdbd665eb9f	e3f3e71bec825dd7	cpu=x86_64
 acme	ReleaseFast	pem384	1	44	5338dfdbd665eb9f	5eb84a3bc4959381	cpu=x86_64
