@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go net resolver (reference) / c-ares / hickory-resolver / libunbound / dnspython / systemd-resolved / Node `dns` (surveyed 2026-11-15; parity -> core 2026-11-15 for the blocking-only API alone, core -> parity 2026-11-16: many lookups in flight through `std.Io` (`lookupIpMany`, `io.async` on the thread-safe `CachingResolver`), request coalescing and prefetch; what remains behind — failover memory, in-line DNSSEC, per-RRset cache TTLs — is in the Backlog with its reason, see "Where we are behind")
 
-**Audit:** review 2026-09-12 · mutation 2026-11-16 (381/403, 22 eq) · src 06a8cfdadf5338e9
+**Audit:** review 2026-09-12 · mutation 2026-11-18 (392/414, 22 eq) · src 88fb2c5b11788c06
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DNS_FUZZ); 2026-11-02 `dns-query-roundtrip` (random QueryOptions incl. DO/AD/CD and EDNS options → encode → decode equal, or the documented refusal; 200,000 driver runs clean, ReleaseSafe) · ct n/a — public DNS codec (keyword review, 2026-10-07); TSIG (2026-10-16): std HMAC, MAC compared with `timing_safe.eql`, secret frames burned (stack probe) · panic 2026-10-31 (sweep + blind review: `RequestTooLarge` for > 65535 B, TSIG length guards, spoofed/QR-clear/undecodable UDP replies dropped to the same deadline, DoH body ≤ 65535, owner-name sharing 17.8 → 0.85 MB on a pointer flood; delta audit 28/31 + 3 eq)
 
@@ -220,6 +220,39 @@ one question, our name (ASCII case-insensitive, RFC 4343), our type, class IN. A
 random source port), not authentication — use DoH (TLS to the resolver) when the path is
 untrusted. TLS/DoH transport security is the `http` client's concern, not this module's.
 
+**Decoded-bytes cap (2026-11-18, owner decision on DN-5; `DecodeOptions.max_decoded_bytes`,
+`decodeWith`, `error.DecodedTooLarge`, `Message.decoded_bytes`).** `decode` counts every byte it
+requests for the decoded form (names, label slices, record and question arrays, RDATA copies, the
+owner-sharing map — all through a counting allocator in front of the message arena; growth is
+charged, shrinking is not refunded) and stops with `error.DecodedTooLarge` past the cap; a real
+allocation failure stays `OutOfMemory`. Default `default_max_decoded_bytes` = 1 MiB. Measured
+2026-11-18 (ReleaseFast; "decoded" = bytes requested, "heap" = bytes the arena took from the
+allocator before the cap existed):
+
+| 65 535-byte message (or real capture) | decoded | heap | ratio (decoded) |
+|---|---|---|---|
+| the six captured replies in `goldens.zig` (61..137 bytes) | 617..958 B | 1.2..1.8 KB | 4.5..10.3x |
+| 4 094 A records, one compressed owner | 426 KB | 639 KB | 6.5x |
+| 2 339 AAAA records | 244 KB | 365 KB | 3.7x |
+| 245 TXT records, one 255-byte string each | 123 KB | 102 KB | 1.9x |
+| 2 848 MX records, exchange `mxNNNN` + pointer | 371 KB | 444 KB | 5.7x |
+| 2 426 SRV records, target compressed | 316 KB | 379 KB | 4.8x |
+| adversarial: 5 439 records sharing a 127-label owner (REV-dns-1) | 568 KB | 849 KB | 8.7x |
+| adversarial: 4 366 CAA records | 459 KB | 681 KB | 7.0x |
+| adversarial: 1 813 SOA, both names pointers to a 253-byte name | 1.10 MB | 1.36 MB | 16.8x |
+| adversarial: 5 038 TXT records of one empty string | 1.25 MB | 786 KB | 19.1x |
+| adversarial: 4 079 MX, exchange pointer to a 253-byte name | 1.45 MB | 1.60 MB | 22.1x |
+| adversarial: 4 662 CNAME, target pointer to a 253-byte name | 1.66 MB | 1.82 MB | 25.3x |
+| adversarial: one TXT record of 65 512 empty strings | 2.87 MB | 3.78 MB | 43.8x |
+
+So every legitimate-shaped message decodes to under 0.45 MB (2.4x headroom to the cap) and the
+worst adversarial 64 KiB one to 2.87 MB before / at most 1 MiB requested after; a DoH body over
+64 KiB (`max_doh_response` = 128 KiB, which no DNS message can legitimately exceed 64 KiB of) is
+held to the same 1 MiB instead of ~7.5 MB. `Resolver` and `update` use the default and report a
+refusal as `MalformedResponse`. Other resolvers bound the input (64 KiB) and decode lazily or into
+fixed records (Go `dnsmessage.Parser`, miekg/dns) rather than capping the decoded form; this
+module decodes eagerly into an arena, so the cap is its equivalent (security first, owner rule).
+
 TSIG (2026-10-16) authenticates an update and its reply with a shared secret; it does not
 encrypt them and there is no replay cache — a captured signed update can be replayed within
 its fudge (300 s), which RFC 8945 §5.2.3 accepts and which, for idempotent adds/deletes of
@@ -379,6 +412,14 @@ DoH client, so the Resolver holds nothing to free; needs a local lookup that all
 `payload != null` clause of the fresh-payload guard in `failed` (a payload-less entry always has
 `expires_s <= t` on a monotonic clock; needs a clock stepping back after the payload was dropped).
 
+**Audit 2026-11-18 (decoded-bytes cap delta).** 11 schemata mutants (ReleaseSafe, whole suite)
+over the non-test lines of the cap: the limit taken from the options, the error mapping (always
+`OutOfMemory`, always `DecodedTooLarge`), `decoded_bytes`, the budget's comparison (`>=`, never),
+the `exceeded` flag, the running total, and the charge on `alloc`, `resize` and `remap`. 9 killed
+on the first run; the `resize` and `remap` growth charges survived — `decode`'s own arena use never
+grows a block in place — and were killed by a unit test of the budget over a fixed buffer (second
+build). 11/11. Card: cumulative 381 + 11 / 403 + 11.
+
 **Audit 2026-11-16 (cache-gap delta).** 24 schemata mutants over the non-test lines of the
 `forget` / `forgetReverse` / `forgetSrv` / `Answer.stale_reason` / `resort_ip_hits` change in
 `src/CachingResolver.zig`: each arm of `forget`'s kind switch (swapped for another kind), the key
@@ -502,7 +543,7 @@ names over PTR, no DoH):
 - **Split DNS, DoQ / DoH3, parallel servers, answer filters, per-server metrics**: service-level (systemd-resolved per-link routing) or hickory feature flags; DoQ/DoH3 need a QUIC stack the collection does not have. Niche for a stub resolver.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- **2026-10-31 (no-panic sweep GV, DN-5) — `decode` memory amplification, a limit is a policy decision:** every record decodes into
+- ✅ **Closed 2026-11-18 (decoded-bytes cap, see "Threat model"; owner sharing of the decoded owner name had landed with REV-dns-1).** **2026-10-31 (no-panic sweep GV, DN-5) — `decode` memory amplification, a limit is a policy decision:** every record decodes into
   its own owner-name copy plus a `labels` slice (16 bytes per label), and a 12-byte record whose owner is a compression pointer to a
   127-label name costs about 2.4 KiB — roughly 200x its wire size. Linear in the input, so a 64 KiB TCP/UDP reply is bounded by
   about 13 MiB and a 128 KiB DoH body (`max_doh_response`) by about 26 MiB (estimated from the struct sizes, not measured). No

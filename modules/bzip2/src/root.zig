@@ -83,4 +83,5 @@ test {
     _ = @import("golden_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("sweep_test.zig");
+    _ = @import("worstcase_test.zig");
 }

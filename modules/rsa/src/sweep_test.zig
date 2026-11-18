@@ -4,6 +4,10 @@
 const std = @import("std");
 const rsa = @import("root.zig");
 
+/// The tests here run on 512-bit and smaller keys (`testKey`, hand-made primes):
+/// the testing-only escape from the 1024-bit private-key floor.
+const small: rsa.SecretKey.FromPrimesOptions = .{ .insecure_allow_small_modulus = true };
+
 fn testKey() !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(0x5eed_9b01);
     var kp: rsa.KeyPair = undefined;
@@ -98,9 +102,9 @@ test "fromPrimes and the DER parsers reject e >= 2^32 (sweep REV-RS-1)" {
     const q = primeBytes(kp.secret_key.q, &qb);
     const e5 = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x01 }; // 2^32 + 1: odd, > u32
     var sk: rsa.SecretKey = undefined;
-    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimes(&sk, p, q, &e5));
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimesWith(&sk, p, q, &e5, small));
     // Leading zeros do not make a small e big; 65537 with padding still works.
-    try rsa.SecretKey.fromPrimes(&sk, p, q, &.{ 0, 0, 0x01, 0x00, 0x01 });
+    try rsa.SecretKey.fromPrimesWith(&sk, p, q, &.{ 0, 0, 0x01, 0x00, 0x01 }, small);
     sk.deinit();
 
     // The same e inside a PKCS#1 RSAPrivateKey: the other fields only have to be INTEGERs.
@@ -136,7 +140,7 @@ test "fromPrimes accepts a four-byte public exponent below 2^32 (sweep audit GP-
         var eb: [4]u8 = undefined;
         std.mem.writeInt(u32, &eb, e, .big);
         var sk: rsa.SecretKey = undefined;
-        if (rsa.SecretKey.fromPrimes(&sk, p, q, &eb)) {
+        if (rsa.SecretKey.fromPrimesWith(&sk, p, q, &eb, small)) {
             accepted += 1;
             sk.deinit();
         } else |err| try std.testing.expectEqual(error.InvalidPrivateKey, err);
@@ -164,10 +168,10 @@ test "fromPrimes: empty, zero, one and even exponents, a composite p, p == q and
     const q = primeBytes(kp.secret_key.q, &qb);
     var sk: rsa.SecretKey = undefined;
     const bad_e = [_][]const u8{ &.{}, &.{0}, &.{ 0, 0 }, &.{1}, &.{ 0, 0, 1 }, &.{4}, &.{ 1, 0, 0 } };
-    for (bad_e) |e| try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimes(&sk, p, q, e));
+    for (bad_e) |e| try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimesWith(&sk, p, q, e, small));
     // 15 is not prime: only the final q * q^-1 = 1 (mod p) check sees it.
-    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimes(&sk, &.{15}, &.{7}, &.{5}));
-    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimes(&sk, p, p, &.{ 1, 0, 1 }));
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimesWith(&sk, &.{15}, &.{7}, &.{5}, small));
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimesWith(&sk, p, p, &.{ 1, 0, 1 }, small));
 
     // p * q past max_modulus_bits: q need not be prime for the derivation to run
     // on, so only the size check stops it (the product would be cut to 8192 bits).
@@ -176,7 +180,7 @@ test "fromPrimes: empty, zero, one and even exponents, a composite p, p == q and
     var tried: usize = 0;
     for ([_]u8{ 3, 5, 7, 11, 13, 17 }) |e| {
         tried += 1;
-        if (rsa.SecretKey.fromPrimes(&sk, p, &big_q, &.{e})) {
+        if (rsa.SecretKey.fromPrimesWith(&sk, p, &big_q, &.{e}, small)) {
             sk.deinit();
             return error.AcceptedAnOversizedModulus;
         } else |err| {
@@ -199,9 +203,9 @@ test "fromPrimes: leading zeros on p, q and e, however many, do not change the k
     @memcpy(pad_p[pad_p.len - p.len ..], p);
     @memcpy(pad_q[pad_q.len - q.len ..], q);
     var sk: rsa.SecretKey = undefined;
-    try rsa.SecretKey.fromPrimes(&sk, &pad_p, q, &.{ 1, 0, 1 });
+    try rsa.SecretKey.fromPrimesWith(&sk, &pad_p, q, &.{ 1, 0, 1 }, small);
     sk.deinit();
-    try rsa.SecretKey.fromPrimes(&sk, p, &pad_q, &.{ 1, 0, 1 });
+    try rsa.SecretKey.fromPrimesWith(&sk, p, &pad_q, &.{ 1, 0, 1 }, small);
     sk.deinit();
 }
 
@@ -267,11 +271,11 @@ test "BlindingCache: shared between keys that differ only in the second prime, o
     var ska: rsa.SecretKey = undefined; // (p, q)
     var skb: rsa.SecretKey = undefined; // (q, p)
     var skc: rsa.SecretKey = undefined; // (p, q2)
-    try rsa.SecretKey.fromPrimes(&ska, &pbuf[0], &pbuf[1], e);
+    try rsa.SecretKey.fromPrimesWith(&ska, &pbuf[0], &pbuf[1], e, small);
     defer ska.deinit();
-    try rsa.SecretKey.fromPrimes(&skb, &pbuf[1], &pbuf[0], e);
+    try rsa.SecretKey.fromPrimesWith(&skb, &pbuf[1], &pbuf[0], e, small);
     defer skb.deinit();
-    try rsa.SecretKey.fromPrimes(&skc, &pbuf[0], &pbuf[2], e);
+    try rsa.SecretKey.fromPrimesWith(&skc, &pbuf[0], &pbuf[2], e, small);
     defer skc.deinit();
 
     var m24: [24]u8 = @splat(0);
@@ -320,9 +324,9 @@ test "BlindingCache: a shorter key whose modulus equals the cached one in its lo
     const e: []const u8 = &.{ 1, 0, 1 };
     var skx: rsa.SecretKey = undefined;
     var skw: rsa.SecretKey = undefined;
-    try rsa.SecretKey.fromPrimes(&skx, &pb, &qb, e);
+    try rsa.SecretKey.fromPrimesWith(&skx, &pb, &qb, e, small);
     defer skx.deinit();
-    try rsa.SecretKey.fromPrimes(&skw, &pb, &q2b, e);
+    try rsa.SecretKey.fromPrimesWith(&skw, &pb, &q2b, e, small);
     defer skw.deinit();
 
     var m48: [48]u8 = @splat(0);
@@ -466,4 +470,55 @@ test "a failed draw does not make an exhausted BlindingCache pair look fresh: th
     _ = try rsa.rsadpCrtBlinded(k, c, sk, .{ .cached = &cache });
     // The exhausted pair must not be served again: a fresh draw happened.
     try std.testing.expect(sw.draws >= 1);
+}
+
+// ── 2026-11-18: the 1024-bit private-key floor (Go 1.24 `rsa1024min`) ──
+
+test "private-key floor: 1024 bits pass, 1023 are refused by fromPrimes and every parser; the escape admits them" {
+    var prng = std.Random.DefaultPrng.init(0x1024_f100);
+    var k1024: rsa.KeyPair = undefined;
+    try rsa.generate(&k1024, prng.random(), 1024, 65537); // two 512-bit primes, top two bits set
+    defer k1024.secret_key.deinit();
+    var k1022: rsa.KeyPair = undefined;
+    try rsa.generate(&k1022, prng.random(), 1022, 65537); // `generate` keeps its 512-bit range
+    defer k1022.secret_key.deinit();
+    var pb: [64]u8 = undefined;
+    var qb: [64]u8 = undefined;
+    var q2b: [64]u8 = undefined;
+    const p = primeBytes(k1024.secret_key.p, &pb);
+    const q = primeBytes(k1024.secret_key.q, &qb);
+    // A 512-bit and a 511-bit prime (both >= 0.75 * 2^bits): a 1023-bit modulus.
+    const q511 = primeBytes(k1022.secret_key.q, &q2b);
+    const e: []const u8 = &.{ 1, 0, 1 };
+
+    var sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimes(&sk, p, q, e);
+    try std.testing.expectEqual(@as(usize, 1024), sk.n.bits());
+    var der_buf: [rsa.max_pkcs8_der_len]u8 = undefined;
+    var back: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromDer(&back, try sk.toPkcs1Der(&der_buf));
+    back.deinit();
+    sk.deinit();
+
+    @memset(std.mem.asBytes(&sk), 0xaa);
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimes(&sk, p, q511, e));
+    for (std.mem.asBytes(&sk)) |b| try std.testing.expectEqual(@as(u8, 0), b); // wiped on refusal
+    @memset(std.mem.asBytes(&sk), 0xaa);
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPrimesWith(&sk, p, q511, e, .{}));
+    for (std.mem.asBytes(&sk)) |b| try std.testing.expectEqual(@as(u8, 0), b);
+
+    var small_sk: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimesWith(&small_sk, p, q511, e, small);
+    defer small_sk.deinit();
+    try std.testing.expectEqual(@as(usize, 1023), small_sk.n.bits());
+    // Its own encodings do not load back: every private-key parser holds the floor.
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromDer(&back, try small_sk.toPkcs1Der(&der_buf)));
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.fromPkcs8(&back, try small_sk.toPkcs8Der(&der_buf)));
+    var pem_buf: [rsa.max_private_pem_len]u8 = undefined;
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPem(&back, try small_sk.toPem(.pkcs1, &pem_buf)));
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPem(&back, try small_sk.toPem(.pkcs8, &pem_buf)));
+    try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPemEncrypted(&back, try small_sk.toPem(.pkcs1, &pem_buf), ""));
+    // The public half of the same key is still accepted (public floor: 512 bits).
+    const pk = small_sk.publicKey();
+    try std.testing.expectEqual(@as(usize, 1023), pk.bits());
 }

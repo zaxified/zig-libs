@@ -107,6 +107,9 @@ var buf: [dns.max_query_len]u8 = undefined;
 const packet = try dns.encodeQuery(&buf, "example.com", .a, .{ .id = 1 });
 var decoded = try dns.decode(gpa, response_bytes);
 defer decoded.deinit();
+// The decoded form is capped at 1 MiB (`error.DecodedTooLarge`; every
+// legitimate 64 KiB message stays under 0.45 MB); raise or lower it with
+// `dns.decodeWith(gpa, bytes, .{ .max_decoded_bytes = n })`.
 
 // RFC 2136 dynamic update, TSIG-signed (BIND: `key "acme." { algorithm
 // hmac-sha256; secret "..."; };`) -- e.g. publishing an ACME DNS-01 record:

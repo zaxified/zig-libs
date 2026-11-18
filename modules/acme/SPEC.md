@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — the reference documents "Multiple Managers can share the same Cache" but issues without a lock: two autocert v0.58.0 Managers on one `DirCache` given the first handshake for one name at the same moment placed 3 orders and got **2 certificates** from Pebble (each one counts against the CA's duplicate-certificate limit; `tools/autocert_lead/run.sh`, scenario `fleet`); here issuance runs under the storage lock and the second node adopts the first one's certificate — one issuance (test "fleet: two nodes on one storage due at once issue one certificate") (measured 2026-10-23) · correctness — autocert's `RenewBefore` is an absolute lead time that the certificate's lifetime does not bound: with `RenewBefore` = 720 h (its default until 2025, still the value most configurations spell out) and 24-hour certificates (step-ca's default lifetime) it re-issued **9 certificates in the 10 s** after the first and goes on until the CA refuses (scenario `renew`); here the window is a share of the lifetime (`renewal_window_pct` 1..99, default a third / half for ≤ 10 days), so a short certificate is renewed once, at half its life (tests "schedule: ten days or less renews at half the lifetime", "schedule: the largest renewal_window_pct still waits for 1% of a short lifetime") (measured 2026-10-23)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (582/648, 66 eq) · src 2380bcb2dfad9ab4
+**Audit:** review 2026-11-12 · mutation 2026-11-18 (606/673, 67 eq) · src 69607c00803e08ba
 
 Audit detail (2026-11-06): whole-module mutation run over every production file (`Client`, `jws`, `x509`, `Manager`, `storage`, `burn`, `root`), 623 mutant schemata in three passes (ReleaseSafe, burn and wipe mutants on ReleaseFast). 556 killed, 67 equivalent with the invariant named per id (tables and reports in the owner's session, `20261106-whole-mut/`). Fixed on the way: `Certificate.deinit` and `TlsAlpnCert.deinit` freed the key PEM unwiped; `verifyEab`'s expected MAC, the RSA PEM writer's frames (10775 B against an 8 KiB burn) and `Client.init`'s pair copy stayed on the dead stack; six pub functions panicked on a caller precondition and now return errors.
 
@@ -173,6 +173,30 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   serving either proof on an attacker-influenced host would mis-issue — the caller must only run this
   for domains it controls.
 - Replay-nonce handling follows the RFC; the CA enforces anti-replay.
+- **CA-URL policy (2026-11-18, owner decision on the 2026-10-28 sweep question; `Options.allow_cross_host_urls`,
+  `Options.extra_allowed_hosts`, `error.UrlNotAllowed`).** A hostile or compromised CA could aim the client's
+  signed POSTs and GETs at internal hosts (SSRF): every URL the client is handed by the CA used to be a request
+  target unexamined. Now every request to a CA-supplied URL — the directory's resources, `Location`, an order's
+  authorizations / finalize / certificate, a challenge, a `Link: rel="alternate"` chain, and what the caller
+  passes back to `fetchOrder` / `fetchAuthorization` / `acceptChallenge` / ... — is checked at the one place
+  it is sent (`postSignedAccept`; GET/HEAD through `http.Client`'s `redirect_filter`, every hop), before a
+  byte leaves: (1) **scheme** `https` (RFC 8555 §6.1: "ACME ... MUST be done over HTTPS"), or the scheme of
+  `directory_url` itself (a caller who configured an `http://` test CA chose it for all of its URLs — the
+  module's own mock CA and the Pebble replay do); (2) **no userinfo** (`http.Url.parse` refuses it);
+  (3) **origin** = host (ASCII case-insensitive) + effective port, in the allowed set: the directory URL's
+  origin, the origin of every resource URL the directory document lists, and `extra_allowed_hosts`
+  (`host` = port 443, `host:port`, `[v6]:port`). `allow_cross_host_urls = true` keeps only (1)+(2).
+  The directory's own resource URLs must pass (1) and may name any host. Why the directory's hosts count:
+  the public CAs' directories fetched 2026-11-18 — Let's Encrypt (production, staging), Google Trust
+  Services, DigiCert (`one.digicert.com`), SSL.com (RSA, ECC), HARICA: every resource on the directory's
+  host; **Sectigo** (`acme.sectigo.com`): `renewalInfo` on `ari.sectigo.com`; **ZeroSSL**
+  (`acme.zerossl.com`): `renewalInfo` on `ari.trust-provider.com` — another registrable domain, so neither
+  a same-host nor a registrable-domain rule (which would also need a Public Suffix List, which the
+  collection does not have) keeps ZeroSSL's ARI working; Buypass: directory gone (404, the service has
+  ended). The directory is the CA's own declaration of its endpoints, fetched over HTTPS from the URL the
+  caller configured, so its hosts are trusted; everything the CA says later must stay on them.
+  certbot, lego and acme.sh do no such check (they follow the CA wherever it points); this module is
+  stricter on purpose (security first, opt-out kept).
 - DNS-01 proves control of the domain's DNS zone, and a wildcard certificate covers every name under
   it: the publisher's DNS credentials are as sensitive as the account key, and they stay the caller's
   (the library never sees them). Out of scope: DNS provider integrations (beyond `acmedns`'s generic
@@ -288,11 +312,22 @@ verified, stored, ARI window from Pebble, renewal at the window with the clock m
 from storage, TLS-ALPN-01 answered from the manager's store, on-demand issued and refused — 12/12
 live (not in the replay transcript: `pebble.sh --check` only).
 
+**Audit 2026-11-18 (delta mutation, CA-URL policy).** 25 schemata mutants (ReleaseSafe, one build,
+`MUT_TESTS` on the policy tests, survivors re-run on the whole suite) over the non-test lines of the
+change: the three `redirect_filter` wirings (directory GET, newNonce HEAD, renewalInfo GET), the
+signed-POST gate, `RedirectRefused` -> `UrlNotAllowed`, the directory-resource checks, the scheme
+rule (https, the directory's own scheme, a directory URL that does not parse), the origin rule
+(directory origin, each directory-listed origin, `extra_allowed_hosts`, the final refusal, port and
+host case in `sameOrigin`), the opt-out, the `extra_allowed_hosts` entry parser (length bound, the
+`/?#@` refusal) and the filter. 24 killed (one, a junk `directory_url` with the opt-out admitting
+`http`, after a new assertion), 1 equivalent: the `entry.len == 0` guard (an empty entry fails
+`http.Url.parse`, no host) — removed. Card: cumulative 582 + 24 / 648 + 25, 66 + 1 eq.
+
 ## Backlog / deferred
 Reviewed 2026-07-10 (adversarial security pass) — clean: JWS/ES256/nonce/CSR construction and the
 ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual staging/production recipe
 (real domain, port 80) is documented in README but is out of CI scope by design.
-- **No-panic sweep 2026-10-28:** fixed A-1 (order list bound), A-2 (alternate chains capped at 8, bodies in short-lived arenas), A-4, A-5, A-6, A-7 (checked `@panic`, no signature change), A-9, A-10, doc comments for A-8 and A-11 (stack size is an estimate, "measured: no"); not fixed: A-3 (directory `meta` is parsed into a `std.json.Value`, at most ~30-50x the 1 MiB body, bounded and freed; typing it would also change the deliberate tolerance of a `meta` of any shape, so not a small change). Owner questions, not fixed: (1) every URL from the CA (authorization, challenge, order, finalize, certificate, alternate, `Location`) is used as a signed-POST target without a scheme/host check, so a hostile CA can aim the client at internal hosts; (2) with `distributed_challenges`, each unauthenticated challenge request costs one storage read.
+- **No-panic sweep 2026-10-28:** fixed A-1 (order list bound), A-2 (alternate chains capped at 8, bodies in short-lived arenas), A-4, A-5, A-6, A-7 (checked `@panic`, no signature change), A-9, A-10, doc comments for A-8 and A-11 (stack size is an estimate, "measured: no"); not fixed: A-3 (directory `meta` is parsed into a `std.json.Value`, at most ~30-50x the 1 MiB body, bounded and freed; typing it would also change the deliberate tolerance of a `meta` of any shape, so not a small change). Owner questions: ~~(1) every URL from the CA (authorization, challenge, order, finalize, certificate, alternate, `Location`) is used as a signed-POST target without a scheme/host check, so a hostile CA can aim the client at internal hosts~~ **DONE 2026-11-18** (CA-URL policy, see "Threat model"); (2) with `distributed_challenges`, each unauthenticated challenge request costs one storage read.
 - ~~**DNS-01 challenge (and thereby wildcard certificates)**~~ — **DONE 2026-09-30** (see "Design & invariants"). Not done with it: DNS provider publishers (by design the caller's; an RFC 2136 dynamic-update publisher would be the one generic candidate, it needs a DNS message encoder — `dnswire` is a sibling), and a propagation checker (querying the authoritative servers before returning from `present`).
 - ~~**External account binding (RFC 8555 §7.3.4)**~~ — **DONE 2026-10-13** (`Options.eab`, `jws.signEab`; mock CA verifies the MAC, a test recomputes it with std HMAC-SHA256). Not run against a real EAB CA.
 - ~~**Certificate revocation, account key rollover and deactivation**~~ — **DONE 2026-10-13** (`revoke`, `revokeWithCertKey`, `rolloverKey`, `updateContact`, `deactivate`; the mock CA verifies both rollover JWS layers and refuses the old key afterwards).

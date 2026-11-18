@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **BEHAVIOUR CHANGE:** `decode` caps the decoded form of a message at 1 MiB (`default_max_decoded_bytes`) and returns the new `error.DecodedTooLarge` (in `DecodeError`) past it. Measured: every legitimate-shaped 65 535-byte message decodes to under 0.45 MB; adversarial ones (compression pointers to a 253-byte name in every RDATA, a TXT record of 65 000 empty strings) reached 1.1..2.9 MB from 64 KiB, and a 128 KiB DoH body twice that. New `decodeWith(gpa, bytes, .{ .max_decoded_bytes = n })`, `DecodeOptions`, and `Message.decoded_bytes` (bytes requested for the decoded form). `Resolver` and `update` report a refusal as `MalformedResponse`.
 - **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the local-refusal refund, 4/4 killed (one after a
   new test: an `InvalidOptions` refusal takes no budget token either).
 - **2026-11-16** — `CachingResolver`: a lookup the Resolver refuses before sending anything (`BadName`, `NameTooLong`,

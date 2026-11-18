@@ -45,6 +45,17 @@ domain out of production quotas. Going live is a deliberate opt-in:
 .directory_url = acme.letsencrypt_production,
 ```
 
+## Where the client lets the CA send it
+
+Every URL the CA hands out (order, authorization, challenge, finalize,
+certificate, `Location`, alternate chains) must be `https` and on the
+directory URL's host and port, or on a host the directory document itself
+lists (ZeroSSL and Sectigo serve ARI from another host); anything else ends
+the call with `error.UrlNotAllowed` before a byte is sent. A CA that moves you
+elsewhere: add the origin to `Options.extra_allowed_hosts` (`"host"` or
+`"host:port"`), or set `Options.allow_cross_host_urls = true` (scheme rule
+only). A local test CA on `http://` gets `http` for its own URLs.
+
 ## Layout
 
 | File | Role |

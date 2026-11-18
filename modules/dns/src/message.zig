@@ -272,6 +272,9 @@ pub const Message = struct {
     answers: []const Record,
     authorities: []const Record,
     additionals: []const Record,
+    /// Bytes `decode` requested for this message's decoded form (the figure
+    /// `DecodeOptions.max_decoded_bytes` bounds); 0 for a hand-built one.
+    decoded_bytes: usize = 0,
 
     pub fn deinit(m: *Message) void {
         const arena = m.arena;
@@ -422,19 +425,104 @@ pub const DecodeError = error{
     /// RDATA inconsistent with its type/length (e.g. an A record whose
     /// RDLENGTH is not 4, or an rdata name running past RDLENGTH).
     BadRecord,
+    /// The decoded form would exceed `DecodeOptions.max_decoded_bytes`.
+    DecodedTooLarge,
     OutOfMemory,
+};
+
+/// Default `DecodeOptions.max_decoded_bytes`: 1 MiB. Measured 2026-11-18
+/// (SPEC "Decoded-bytes cap", ReleaseFast, bytes requested by `decode`):
+/// legitimate-shaped 65 535-byte messages decode to at most 426 KB (4 094
+/// A records of one owner, 6.5x); the six real captured replies in
+/// `goldens.zig` to under 1 KB each. Adversarial 65 535-byte messages: 1.66 MB
+/// (CNAME targets all pointing at one 253-byte name, 25x), 2.87 MB (one TXT
+/// record of 65 000 empty strings, 44x) — refused. A message over 64 KiB
+/// (a DoH body, up to `max_doh_response`) is held to the same bound.
+pub const default_max_decoded_bytes: usize = 1 << 20;
+
+pub const DecodeOptions = struct {
+    /// Upper bound on the bytes `decode` requests for the decoded message
+    /// (names, label slices, record arrays, RDATA copies — everything in the
+    /// message arena); past it, `error.DecodedTooLarge`.
+    max_decoded_bytes: usize = default_max_decoded_bytes,
 };
 
 /// Decode a whole DNS message (typically a response). The returned `Message`
 /// owns all of its slices; free with `Message.deinit`. Never panics on
-/// malformed input.
+/// malformed input. `decodeWith(gpa, bytes, .{})`.
 pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) DecodeError!Message {
+    return decodeWith(gpa, bytes, .{});
+}
+
+/// `decode` with options: the decoded form is capped at
+/// `options.max_decoded_bytes` (`error.DecodedTooLarge` past it).
+pub fn decodeWith(gpa: std.mem.Allocator, bytes: []const u8, options: DecodeOptions) DecodeError!Message {
     const arena_ptr = try gpa.create(std.heap.ArenaAllocator);
     errdefer gpa.destroy(arena_ptr);
     arena_ptr.* = std.heap.ArenaAllocator.init(gpa);
     errdefer arena_ptr.deinit();
-    const arena = arena_ptr.allocator();
+    var budget: Budget = .{ .child = arena_ptr.allocator(), .limit = options.max_decoded_bytes };
+    var msg = decodeInto(budget.allocator(), bytes) catch |err| switch (err) {
+        error.OutOfMemory => return if (budget.exceeded) error.DecodedTooLarge else error.OutOfMemory,
+        else => |e| return e,
+    };
+    msg.arena = arena_ptr;
+    msg.decoded_bytes = budget.used;
+    return msg;
+}
 
+/// Counts the bytes `decode` asks the message arena for and refuses a
+/// request that would take the total past `limit` (`exceeded` tells that
+/// refusal from a real out-of-memory). Growth is charged, shrinking and
+/// freeing are not refunded: the arena keeps what it handed out.
+const Budget = struct {
+    child: std.mem.Allocator,
+    limit: usize,
+    used: usize = 0,
+    exceeded: bool = false,
+
+    fn allocator(b: *Budget) std.mem.Allocator {
+        return .{ .ptr = b, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn charge(b: *Budget, n: usize) bool {
+        if (n > b.limit - b.used) {
+            b.exceeded = true;
+            return false;
+        }
+        b.used += n;
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        if (!b.charge(len)) return null;
+        return b.child.vtable.alloc(b.child.ptr, len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !b.charge(new_len - memory.len)) return false;
+        return b.child.vtable.resize(b.child.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !b.charge(new_len - memory.len)) return null;
+        return b.child.vtable.remap(b.child.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        b.child.vtable.free(b.child.ptr, memory, alignment, ret_addr);
+    }
+};
+
+/// The sections of `bytes`, allocated from `arena`; `arena` and
+/// `decoded_bytes` of the result are filled in by `decodeWith`.
+fn decodeInto(arena: std.mem.Allocator, bytes: []const u8) DecodeError!Message {
     var d: Decoder = .{ .bytes = bytes };
     const id = try d.takeInt(u16);
     const flags = try d.takeInt(u16);
@@ -462,7 +550,7 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) DecodeError!Message {
     const additionals = try takeRecords(&d, arena, arcount);
 
     return .{
-        .arena = arena_ptr,
+        .arena = undefined,
         .header = header,
         .questions = questions,
         .answers = answers,
@@ -748,6 +836,30 @@ fn takeRdataName(d: *Decoder, arena: std.mem.Allocator, rdata_end: usize) Decode
 // ── tests: encoding ─────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "decode budget: growth through resize and remap is charged, past the limit refused (DN-5 cap)" {
+    // `decode`'s own arena use never grows a block in place (measured: the
+    // mutation run of 2026-11-18), so the allocator is checked on its own.
+    var buf: [256]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var b: Budget = .{ .child = fba.allocator(), .limit = 64 };
+    const a = b.allocator();
+    const m = try a.alloc(u8, 16);
+    try testing.expectEqual(@as(usize, 16), b.used);
+    try testing.expect(a.resize(m, 32));
+    try testing.expectEqual(@as(usize, 32), b.used);
+    try testing.expect(!a.resize(m.ptr[0..32], 65)); // 32 + 33 > 64
+    try testing.expect(b.exceeded);
+    b.exceeded = false;
+    const r = a.remap(m.ptr[0..32], 48) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 48), b.used);
+    try testing.expect(a.remap(r[0..48], 65) == null); // 48 + 17 > 64
+    try testing.expect(b.exceeded);
+    // Shrinking is not refunded; freeing goes through.
+    try testing.expect(a.resize(r[0..48], 8));
+    try testing.expectEqual(@as(usize, 48), b.used);
+    a.free(r[0..8]);
+}
 
 test "encodeQuery: golden bytes, no EDNS" {
     var buf: [max_query_len]u8 = undefined;
