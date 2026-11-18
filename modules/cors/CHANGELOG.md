@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: one item marked done in place (verified in code): DONE 2026-10-29 (every owned value goes through `setHeaderStatic`/`setHeaderBorrowed`, modules/cors/src/root.zig:429-454, commit a318d6378).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE (browser oracle only):** `tools/browser_oracle.js` starts Chrome on DevTools port 0 and reads the port from `DevToolsActivePort`, with a fresh profile per run, a 60 s deadline instead of 10 s, and Chrome's exit code and stderr tail in the error. Scheduled full CI 42608874172 failed `interop-cors` with a bare "no answer from :18690" (a cold start had come close to 10 s in green runs); the failure path was checked with a Chrome that exits.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE (one test added):** Delta audit of the no-panic sweep: 14 mutants over the changed code (each lent value copied again, the echo catch propagated, `Vary` dropped on a failed echo); 11 killed on the first run, the 3 survivors (Allow-Methods and a configured Allow-Headers list copied) became one test: an outer middleware that leaves 20 bytes of the header-copy store still gets the whole grant on the gated and the wildcard paths. 14/14. Cumulative 69/70, 1 eq. Card A1 again.
