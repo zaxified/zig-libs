@@ -669,3 +669,133 @@ test "fuzz driver: COAP_FUZZ (fuzzLinkFormat)" {
 test "fuzz harness: fuzzLinkFormat, 600 seeds, reaches every outcome" {
     try fuzzMark.reach(fuzzLinkFormat, "coap-linkformat-parse", 600);
 }
+
+// ── whole-module mutation (2026-11-17): boundary and character-set tests ────
+
+test "writer: a failing resource() rolls back, title/extra attributes, URI and value validation, exact-fit buffer" {
+    var buf: [8]u8 = undefined;
+    var w = Writer.init(&buf);
+    try w.link("/a", &.{});
+    // ",</b>" fits, the first attribute does not: the document stays as it was.
+    try testing.expectError(error.BufferTooSmall, w.resource("/b", .{ .rt = "x" }));
+    try testing.expectEqualStrings("</a>", w.written());
+
+    var big: [128]u8 = undefined;
+    var w2 = Writer.init(&big);
+    try w2.resource("/t", .{ .title = "plain", .extra = &.{ .{ .name = "x", .value = "1" }, .{ .name = "flag" } } });
+    try testing.expectEqualStrings("</t>;title=\"plain\";x=1;flag", w2.written());
+    try testing.expectError(error.BadUri, w2.link("/a\x7fb", &.{}));
+    for ([_][]const u8{ "a\x1fb", "a\x7fb" }) |v| {
+        try testing.expectError(error.BadValue, w2.link("/x", &.{.{ .name = "n", .value = v }}));
+    }
+    try w2.link("/y", &.{.{ .name = "n", .value = "a\tb" }}); // a tab is allowed in a value
+
+    var exact: [3]u8 = undefined;
+    var w3 = Writer.init(&exact);
+    try w3.link("/", &.{});
+    try testing.expectEqualStrings("</>", w3.written());
+}
+
+test "writer and parser: attr-char and ptokenchar sets, byte by byte (independent oracle)" {
+    const alnum = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const attr_extra = "!#$&+-.^_`|~*";
+    const token_extra = "!#$%&'()*+-./:<=>?@[]^_`{|}~";
+    var buf: [64]u8 = undefined;
+    var want: [64]u8 = undefined;
+    for (0..256) |bi| {
+        const b: u8 = @intCast(bi);
+        var one = [1]u8{b};
+
+        // attribute names
+        const name_ok = std.mem.findScalar(u8, alnum, b) != null or std.mem.findScalar(u8, attr_extra, b) != null;
+        var nm = [2]u8{ 'a', b };
+        var w = Writer.init(&buf);
+        const attrs = [_]Attr{.{ .name = &nm }};
+        if (name_ok) {
+            try w.link("/x", &attrs);
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "</x>;a{c}", .{b}), w.written());
+        } else {
+            try testing.expectError(error.BadAttribute, w.link("/x", &attrs));
+        }
+
+        // attribute values: bare ptoken, quoted-string with escapes, or refused
+        const bare = std.mem.findScalar(u8, alnum, b) != null or std.mem.findScalar(u8, token_extra, b) != null;
+        const control = (b < 0x20 and b != '\t') or b == 0x7f;
+        var w2 = Writer.init(&buf);
+        const vattrs = [_]Attr{.{ .name = "a", .value = &one }};
+        if (control) {
+            try testing.expectError(error.BadValue, w2.link("/x", &vattrs));
+            continue;
+        }
+        try w2.link("/x", &vattrs);
+        const text = if (bare)
+            try std.fmt.bufPrint(&want, "</x>;a={c}", .{b})
+        else if (b == '"' or b == '\\')
+            try std.fmt.bufPrint(&want, "</x>;a=\"\\{c}\"", .{b})
+        else
+            try std.fmt.bufPrint(&want, "</x>;a=\"{c}\"", .{b});
+        try testing.expectEqualStrings(text, w2.written());
+        // ...and the parser reads back the same single octet
+        var p = Parser.init(w2.written());
+        const a = (try p.next()).?.attr("a").?;
+        try testing.expect(a.eql(&one));
+        try testing.expectEqual(!bare, a.quoted);
+    }
+}
+
+test "parser: tabs are blanks; blanks before a separator are not part of the link's attributes" {
+    var p = Parser.init("<a>\t,\t<b>;\tobs\t;\tct=40");
+    const a = (try p.next()).?;
+    try testing.expectEqualStrings("a", a.uri);
+    const b = (try p.next()).?;
+    try testing.expectEqualStrings("b", b.uri);
+    var it = b.attrs();
+    try testing.expectEqualStrings("obs", it.next().?.name);
+    try testing.expectEqualStrings("ct", it.next().?.name);
+    try testing.expect(it.next() == null);
+    try testing.expect((try p.next()) == null);
+
+    var q = Parser.init("<a>;obs ,<b>");
+    try testing.expectEqualStrings(";obs", (try q.next()).?.params);
+}
+
+test "parser: malformed octets and values" {
+    var p1 = Parser.init("<a>;t=\"x\x7fy\"");
+    try testing.expectError(error.Malformed, p1.next());
+    var p2 = Parser.init("<a>;a=,<b>"); // a bare value must not be empty
+    try testing.expectError(error.Malformed, p2.next());
+    var p3 = Parser.init("<a\x7fb>");
+    try testing.expectError(error.Malformed, p3.next());
+}
+
+test "ParsedAttr helpers: whole-value equality, token matching, unescape on hand-built attributes" {
+    const raw: ParsedAttr = .{ .name = "n", .value = "a\\b", .quoted = false };
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("a\\b", raw.unescape(&buf).?); // a backslash is data in a bare value
+    try testing.expect(raw.eql("a\\b"));
+    const q: ParsedAttr = .{ .name = "n", .value = "a\\b", .quoted = true };
+    try testing.expectEqualStrings("ab", q.unescape(&buf).?);
+    try testing.expect(q.eql("ab") and !q.eql("a\\b"));
+    const tail: ParsedAttr = .{ .name = "n", .value = "a\\", .quoted = true }; // a lone trailing backslash is data
+    try testing.expectEqualStrings("a\\", tail.unescape(&buf).?);
+    try testing.expect(tail.eql("a\\"));
+    // exact-fit output buffer
+    try testing.expectEqualStrings("ab", q.unescape(buf[0..2]).?);
+    try testing.expect(q.unescape(buf[0..1]) == null);
+
+    var p = Parser.init("<x>;rt=\"temp x\"");
+    const l = (try p.next()).?;
+    const rt = l.attr("rt").?;
+    try testing.expect(!rt.eql("tem") and !rt.hasToken("tem"));
+    try testing.expect(rt.hasToken("x") and rt.hasToken("temp"));
+}
+
+test "Filter: names compare case-insensitively; an empty value matches nothing" {
+    var p = Parser.init("</a/b>;rt=\"temp x\";obs");
+    const l = (try p.next()).?;
+    try testing.expect(Filter.parse("HREF=/a/b").?.matches(l));
+    try testing.expect(Filter.parse("RT=temp").?.matches(l));
+    try testing.expect(!Filter.parse("rt=").?.matches(l));
+    try testing.expect(!Filter.parse("rt=te").?.matches(l));
+    try testing.expect(Filter.parse("rt=te*").?.matches(l));
+}

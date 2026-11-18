@@ -622,3 +622,58 @@ test "fuzz driver: COAP_FUZZ (fuzzDispatch)" {
 test "fuzz harness: fuzzDispatch, 600 seeds, reaches every outcome" {
     try fuzzMark.reach(fuzzDispatch, "coap-resource-dispatch", 600);
 }
+
+// ── whole-module mutation (2026-11-17): method matrix, path rules, option buffers ──
+
+fn bothHandler(ctx: ?*anyopaque, req: coap.Message) Reply {
+    _ = ctx;
+    _ = req;
+    return .{ .code = .content, .content_format = 50, .max_age = 300, .payload = "x" };
+}
+
+test "Methods.allows: each flag opens exactly its own method, nothing else" {
+    const names = [_][]const u8{ "get", "post", "put", "delete", "fetch", "patch", "ipatch" };
+    const codes = [_]coap.Code{ .get, .post, .put, .delete, .fetch, .patch, .ipatch };
+    inline for (names, 0..) |nm, i| {
+        var m: Methods = .{};
+        @field(m, nm) = true;
+        for (codes, 0..) |c, j| try testing.expectEqual(i == j, m.allows(c));
+        try testing.expect(!m.allows(.content));
+        try testing.expect(!m.allows(.empty));
+    }
+    for (codes) |c| try testing.expect(Methods.all.allows(c));
+    try testing.expect(!Methods.all.allows(.content));
+}
+
+test "Registry.add: the path rules" {
+    var st: [8]Resource = undefined;
+    var reg = Registry.init(&st);
+    const bad = [_][]const u8{ "", "/", "ab", "a/b", "/a/", "//a", "/a//b", "/a b", "/a\x7fb", "/a>b", "/a?b", "/a#b", "/.well-known/core" };
+    for (bad) |p| try testing.expectError(error.BadPath, reg.add(.{ .path = p, .handler = tempHandler }));
+    try reg.add(.{ .path = "/a", .handler = tempHandler });
+    try reg.add(.{ .path = "/a/b", .handler = tempHandler });
+    try testing.expectEqual(@as(usize, 2), reg.items().len);
+}
+
+test "dispatch: Content-Format and Max-Age options keep their own value buffers" {
+    var st: [2]Resource = undefined;
+    var reg = Registry.init(&st);
+    try reg.add(.{ .path = "/b", .handler = bothHandler });
+    var rb: ReplyBuf = .{};
+    var opts: [4]coap.Option = undefined;
+    var doc: [64]u8 = undefined;
+    const resp = reg.dispatch(getReq(&.{"b"}, &.{}, &opts), &rb, &doc, .{}).?;
+    try testing.expectEqual(@as(?u16, 50), try options.contentFormat(resp));
+    try testing.expectEqual(@as(u64, 300), options.maxAge(resp));
+}
+
+test "discovery: a query parameter without '=' is skipped, the filters after it still apply" {
+    var store: [8]Resource = undefined;
+    var hits: usize = 0;
+    const reg = try fixture(&store, &hits);
+    var doc: [512]u8 = undefined;
+    var rb: ReplyBuf = .{};
+    const resp = discover(&reg, &.{ "flag", "rt=nomatch" }, .{}, &doc, &rb).?;
+    try testing.expectEqual(coap.Code.content, resp.code);
+    try testing.expectEqualStrings("", resp.payload);
+}

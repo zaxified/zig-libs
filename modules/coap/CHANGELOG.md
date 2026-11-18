@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — Whole-module mutation of all nine source files (644 mutants, 632 killed, 12 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 34 tests added (boundary and exact-fit buffers for `parse`/`serialize`/`encodedLen` and the extended token lengths, option-array and scratch capacity of `optionsFromUri`/`buildRequest`, the percent-encoding sets byte by byte, `Dedup` tie/compaction/slot eviction, `Assembler` gaps, Observe half-space edges and `cancel`, link-format writer/parser character sets, the method matrix and path rules of the resource registry); no behaviour change.
+
 - **2026-11-13** — scope S4 → S3: new `coap.linkformat` (RFC 6690 `Writer`/`Parser`/§4.1 `Filter`) and `coap.resource` (`Registry`, `Resource`, `Registry.dispatch`: routing by Uri-Path, 4.04/4.05, `/.well-known/core` discovery with `rt`/`if`/`ct`/`sz`/`obs`/`title` attributes and query filtering, RFC 7967 No-Response, multicast no-match silence). Named RFC extras: `Code.fetch/patch/ipatch/conflict/precondition_failed/unprocessable_entity` (RFC 8132), option numbers + typed accessors for Echo/Request-Tag (RFC 9175) and No-Response (RFC 7967), content formats 51/52, RFC 8974 extended tokens via the opt-in `parseExtended`/`serializeExtended`/`encodedLenExtended` (plain `parse`/`serialize` unchanged). Two new fuzz harnesses (`coap-linkformat-parse`, `coap-resource-dispatch`).
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
