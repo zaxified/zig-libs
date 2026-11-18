@@ -786,7 +786,7 @@ integer-equality path. All RSA keys in these tests are test material only.
 
 ## Backlog / deferred
 
-- **Pre-authentication canonical-output bound (sweep 2026-11-13).** `sigOptsFor` leaves `xmldsig.Options.max_c14n_output_len` at its 64 MiB default, so an unauthenticated Response can still make one reference canonicalize to ~64 MiB (arena growth ~3x) before the signature is checked, and `consumeArtifactResponseSoap` can return an enclosed message of that size. Bounded, no longer an OOM from ~160 KB of input; tightening it (a `Config` field, or a lower constant here) is a policy choice left open.
+- **Pre-authentication canonical-output bound (sweep 2026-11-13).** `sigOptsFor` leaves `xmldsig.Options.max_c14n_output_len` at its 64 MiB default, so an unauthenticated Response can still make one reference canonicalize to ~64 MiB (arena growth ~3x) before the signature is checked, and `consumeArtifactResponseSoap` can return an enclosed message of that size. Bounded, no longer an OOM from ~160 KB of input; tightening it (a `Config` field, or a lower constant here) is a policy choice left open. ✅ DONE 2026-11-13 (the text above is stale: `Config.max_c14n_output_len` exists, default `default_max_c14n_output_len` = 4 MiB, modules/saml/src/root.zig:301,352-356, commit 938edd5e1).
 - **ctgrind: decryption path not a row (2026-11-13).** Driven and measured (95 in-file, nearly all `xml.parse` on the recovered plaintext); deliberately not pinned, see `src/ctgrind_harness.zig`. The key-dependent work is `xmlenc`'s rows.
 
 Closed 2026-10-06 (were the three survey-2026-09-30 items): SP metadata generation
