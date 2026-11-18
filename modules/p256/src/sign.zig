@@ -1029,3 +1029,111 @@ test "Ecdsa(Hash): signatures are byte-identical to std's Ecdsa(P256, Hash) for 
         }
     }
 }
+
+test "ecdsaSign refuses a zero key and an s = 0 signature (mutation 2026-11-18)" {
+    const msg = "p256 s = 0 construction";
+    const zero: [32]u8 = @splat(0);
+    var k: [32]u8 = @splat(0);
+    k[31] = 7;
+    try std.testing.expectError(error.InvalidSecretKey, ecdsaSign(&zero, msg, &k));
+
+    // s = k⁻¹·(e + r·d) is zero for d = −e·r⁻¹: with the nonce fixed, that key
+    // can be computed, so the degenerate branch is reachable on purpose.
+    const R = try P256.combMulBase(k, .big);
+    const r = reduceToScalar(R.affineCoordinates().x.toBytes(.big));
+    var h: [32]u8 = undefined;
+    Sha256.hash(msg, &h, .{});
+    const e = reduceToScalar(h);
+    const d = e.neg().mul(r.invert()).toBytes(.big);
+    try std.testing.expectError(error.InvalidNonce, ecdsaSign(&d, msg, &k));
+}
+
+test "ecdsaVerifyDigest refuses e ≡ 0 (an all-zero digest), the R = u2·Q forgery (mutation 2026-11-18)" {
+    // With e = 0 the equation collapses to R = u2·Q: pick t, R = t·Q,
+    // r = x(R) mod n, s = r·t⁻¹ — a signature with no private key.
+    var db: [32]u8 = @splat(0);
+    db[31] = 0x5d;
+    const Q = try P256.combMulBase(db, .big);
+    var tb: [32]u8 = @splat(0);
+    tb[31] = 11;
+    const R = try Q.mulPublic(tb, .big);
+    const r = reduceToScalar(R.affineCoordinates().x.toBytes(.big));
+    const t = try Scalar.fromBytes(tb, .big);
+    const s = r.mul(t.invert());
+    const sig = r.toBytes(.big) ++ s.toBytes(.big);
+    const zero_digest: [32]u8 = @splat(0);
+    try std.testing.expect(!ecdsaVerifyDigest(&Q.toUncompressedSec1(), &zero_digest, sig));
+    // e = n (≡ 0) is the same forgery.
+    var n_digest: [32]u8 = undefined;
+    std.mem.writeInt(u256, &n_digest, scalarmod.field_order, .big);
+    try std.testing.expect(!ecdsaVerifyDigest(&Q.toUncompressedSec1(), &n_digest, sig));
+}
+
+test "derToRawN: long-form lengths (128-byte body, as a P-521 signature has) (mutation 2026-11-18)" {
+    // r and s: 62-byte magnitudes, so the SEQUENCE body is exactly 0x80 bytes,
+    // which DER must write in long form `81 80`.
+    var body: [128]u8 = undefined;
+    inline for (.{ 0, 64 }) |off| {
+        body[off] = 0x02;
+        body[off + 1] = 62;
+        for (body[off + 2 ..][0..62], 0..) |*x, i| x.* = @intCast(i + 1);
+    }
+    const good = [_]u8{ 0x30, 0x81, 0x80 } ++ body;
+    const raw = derToRawN(66, &good) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, body[2..64], raw[4..66]);
+    try std.testing.expectEqualSlices(u8, &@as([4]u8, @splat(0)), raw[0..4]);
+    try std.testing.expectEqualSlices(u8, body[66..128], raw[70..132]);
+    // 0x80 as a short-form length octet is BER's indefinite form.
+    try std.testing.expect(derToRawN(66, &([_]u8{ 0x30, 0x80 } ++ body)) == null);
+    // A long-form length with a leading zero octet is not minimal.
+    try std.testing.expect(derToRawN(66, &([_]u8{ 0x30, 0x82, 0x00, 0x80 } ++ body)) == null);
+}
+
+test "KeyPair.generateDeterministicInto and generateInto's rejection loop (mutation 2026-11-18)" {
+    const E = EcdsaP256Sha256;
+    const seed: [E.KeyPair.seed_length]u8 = @splat(0x42);
+    const a = try E.KeyPair.generateDeterministic(seed);
+    var b: E.KeyPair = undefined;
+    try E.KeyPair.generateDeterministicInto(&b, &seed);
+    try std.testing.expectEqualSlices(u8, &a.secret_key.bytes, &b.secret_key.bytes);
+    try std.testing.expectEqualSlices(u8, &a.public_key.toUncompressedSec1(), &b.public_key.toUncompressedSec1());
+
+    // An `Io` whose CSPRNG returns n + 1 (out of range, yet `(n+1)·G = G` is a
+    // valid point), then 0, then a usable scalar: only the last is kept.
+    const Script = struct {
+        draws: [3][32]u8,
+        next: usize = 0,
+        fn random(ud: ?*anyopaque, buf: []u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            @memcpy(buf, self.draws[self.next][0..buf.len]);
+            self.next += 1;
+        }
+    };
+    var script: Script = .{ .draws = undefined };
+    std.mem.writeInt(u256, &script.draws[0], scalarmod.field_order + 1, .big);
+    script.draws[1] = @splat(0);
+    script.draws[2] = @splat(0x24);
+    var vtable = std.Io.failing.vtable.*;
+    vtable.random = Script.random;
+    const io: std.Io = .{ .userdata = &script, .vtable = &vtable };
+    var kp: E.KeyPair = undefined;
+    E.KeyPair.generateInto(&kp, io);
+    try std.testing.expectEqual(@as(usize, 3), script.next);
+    try std.testing.expectEqualSlices(u8, &script.draws[2], &kp.secret_key.bytes);
+}
+
+test "fromSecretKeyInto zeroes its output on error; Signer.finalize wipes the signer (mutation 2026-11-18)" {
+    const E = EcdsaP256Sha256;
+    const good: E.SecretKey = .{ .bytes = @splat(0x24) };
+    var out: E.KeyPair = undefined;
+    try E.KeyPair.fromSecretKeyInto(&out, &good); // a populated pair, to be overwritten
+    const zero: E.SecretKey = .{ .bytes = @splat(0) };
+    try std.testing.expectError(error.IdentityElement, E.KeyPair.fromSecretKeyInto(&out, &zero));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&out), 0));
+
+    const kp = try E.KeyPair.fromSecretKey(good);
+    var signer = try kp.signer(null);
+    signer.update("p256 finalize wipe");
+    _ = try signer.finalize();
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&signer.inner), 0));
+}
