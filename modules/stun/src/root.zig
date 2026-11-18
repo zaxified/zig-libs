@@ -1130,6 +1130,11 @@ pub const QueryOptions = struct {
     /// silent server is `rto_ms * (2^(max_requests-1) - 1 + last_wait_factor)`
     /// ms (39.5 s with the defaults, but 255 requests is astronomically long).
     /// A caller that raises `max_requests` should set `timeout_ms`.
+    ///
+    /// Options whose effective worst case (`worstCaseWaitMs`: the schedule's
+    /// worst case, capped by `timeout_ms` when set) exceeds
+    /// `max_worst_case_wait_ms` are refused with `error.InvalidOptions`
+    /// before any socket is opened, so a typo cannot park a caller for hours.
     timeout_ms: u32 = 0,
     /// Initial retransmission timeout (RFC 8489 §6.2.1 RECOMMENDS 500 ms
     /// when nothing better is known); doubles after every send.
@@ -1176,6 +1181,30 @@ pub const Schedule = struct {
     }
 };
 
+/// The longest worst-case wait `query` accepts: 120 s, three times the 39.5 s
+/// of the RFC 8489 §6.2.1 defaults (Rc 7, Rm 16, RTO 500 ms, the RFC's own
+/// example). Options above it are refused with `error.InvalidOptions`;
+/// `timeout_ms` brings a long schedule back under it.
+pub const max_worst_case_wait_ms: u64 = 120_000;
+
+/// The longest `query` can wait against a silent server with `opts`: the
+/// last wait of the §6.2.1 schedule, capped by `timeout_ms` when it is set.
+/// Saturates at `u64` max.
+pub fn worstCaseWaitMs(opts: QueryOptions) u64 {
+    var sched = Schedule.init(opts);
+    while (sched.nextSend()) |_| {}
+    const last = sched.at_ms - (sched.rto_ms / 2);
+    var total = last +| @as(u64, opts.last_wait_factor) *| @as(u64, opts.rto_ms);
+    if (opts.timeout_ms != 0) total = @min(total, opts.timeout_ms);
+    return total;
+}
+
+/// `error.InvalidOptions` when `worstCaseWaitMs(opts)` is above
+/// `max_worst_case_wait_ms`.
+pub fn checkOptions(opts: QueryOptions) error{InvalidOptions}!void {
+    if (worstCaseWaitMs(opts) > max_worst_case_wait_ms) return error.InvalidOptions;
+}
+
 /// The absolute deadline `until_ms` after `start`. `until_ms` is the saturating
 /// schedule's value and may be up to u64 max; the `Io.Duration` constructor
 /// takes an i64, so clamp first (sweep ST-3: the plain `@intCast` trapped for a
@@ -1201,7 +1230,9 @@ fn windowDeadline(start: std.Io.Clock.Timestamp, until_ms: u64) std.Io.Timeout {
 /// and the wait goes on (§6.3.4); if nothing better arrives, the give-up error
 /// is that stray's (`TransactionMismatch`, `BadCookie`, …) instead of
 /// `error.Timeout`, the error a silent server earns. A STUN error response for
-/// our transaction stops the exchange with `error.ErrorResponse`.
+/// our transaction stops the exchange with `error.ErrorResponse`. Options
+/// whose worst-case wait exceeds `max_worst_case_wait_ms` are refused with
+/// `error.InvalidOptions` (see `QueryOptions.timeout_ms`).
 pub fn query(
     io: std.Io,
     server: std.Io.net.IpAddress,
@@ -1209,6 +1240,7 @@ pub fn query(
     buf: []u8,
     options: QueryOptions,
 ) !AddressPort {
+    try checkOptions(options);
     const IpAddress = std.Io.net.IpAddress;
     const local: IpAddress = switch (server) {
         .ip4 => try IpAddress.parse("0.0.0.0", 0),
@@ -2192,6 +2224,44 @@ test "query retransmits until answered and ignores a stray reply on the way (RFC
     try testing.expect(ap.ip.eql(netaddr.parseIp("203.0.113.9").?));
     try testing.expectEqual(@as(u16, 4989), ap.port);
     try testing.expectEqual(@as(usize, 3), r.seen);
+}
+
+test "worstCaseWaitMs / checkOptions: the RFC 8489 defaults are 39.5 s and pass; the bound is accepted, bound + 1 refused" {
+    try testing.expectEqual(@as(u64, 39_500), worstCaseWaitMs(.{}));
+    try checkOptions(.{});
+
+    // One send, Rm = 1: the worst case is exactly rto_ms.
+    const at: QueryOptions = .{ .max_requests = 1, .last_wait_factor = 1, .rto_ms = max_worst_case_wait_ms };
+    try testing.expectEqual(max_worst_case_wait_ms, worstCaseWaitMs(at));
+    try checkOptions(at);
+    var over = at;
+    over.rto_ms += 1;
+    try testing.expectEqual(max_worst_case_wait_ms + 1, worstCaseWaitMs(over));
+    try testing.expectError(error.InvalidOptions, checkOptions(over));
+
+    // The exponential growth that was the hazard: 20 requests at the default
+    // RTO is days, refused; 255 requests and the largest RTO saturate (no overflow trap).
+    try testing.expectError(error.InvalidOptions, checkOptions(.{ .max_requests = 20 }));
+    try testing.expect(worstCaseWaitMs(.{ .max_requests = 255, .rto_ms = std.math.maxInt(u32), .last_wait_factor = 255 }) > std.math.maxInt(u62));
+    try testing.expectError(error.InvalidOptions, checkOptions(.{ .max_requests = 255, .rto_ms = std.math.maxInt(u32) }));
+
+    // `timeout_ms` caps the worst case, so a long schedule under a cap is fine,
+    // and the cap itself is held to the bound.
+    try checkOptions(.{ .max_requests = 255, .timeout_ms = 5000 });
+    try testing.expectEqual(@as(u64, 5000), worstCaseWaitMs(.{ .max_requests = 255, .timeout_ms = 5000 }));
+    try testing.expectError(error.InvalidOptions, checkOptions(.{ .max_requests = 255, .timeout_ms = max_worst_case_wait_ms + 1 }));
+    try checkOptions(.{ .max_requests = 255, .timeout_ms = max_worst_case_wait_ms });
+
+    // max_requests = 0 behaves as 1 in the schedule, so in the check too.
+    try testing.expectEqual(worstCaseWaitMs(.{ .max_requests = 1 }), worstCaseWaitMs(.{ .max_requests = 0 }));
+}
+
+test "query: options above the worst-case bound are refused before any socket is opened" {
+    const io = testing.io;
+    var buf: [64]u8 = undefined;
+    const dst = try std.Io.net.IpAddress.parse("127.0.0.1", 9);
+    const bad: QueryOptions = .{ .max_requests = 1, .last_wait_factor = 1, .rto_ms = @intCast(max_worst_case_wait_ms + 1) };
+    try testing.expectError(error.InvalidOptions, query(io, dst, .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &buf, bad));
 }
 
 test "query: max_requests = 1 sends once (the old behaviour), and a lone stray is reported, not a Timeout" {

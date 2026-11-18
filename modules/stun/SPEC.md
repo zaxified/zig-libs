@@ -6,7 +6,7 @@
 
 **Scope:** parity — pion/stun v3.1.6 (client side: codec, Binding client with RFC 8489 retransmission, integrity incl. SHA-256, fingerprint, STUN/TURN URIs, RFC 5780/ICE/TURN attribute types, hostile-input rejects) (surveyed 2026-11-02, gaps closed 2026-11-03)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (31/31) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (40/40) · src 54810b838fd2d5c2
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STUN_FUZZ) · ct 2026-11-03 (ctgrind: MESSAGE-INTEGRITY key, MESSAGE-INTEGRITY-SHA256 key and long-term password tainted, `mi` + `mi256` + `ltkey`, 0 in-file; `longTermKeySha256`, `userhash`, `bindingResponse` are not ctgrind targets) · panic 2026-10-31 (sweep + blind review: attribute value/region u16 guards, deadline clamp, RFC 8489 §14.5 covered region via `findCovered`; delta audit 21/22 + 1 eq)
 
@@ -64,7 +64,8 @@ FINGERPRINT, in that order; the transaction id is the request's.
 
 **`query`** sends per `Schedule` (RFC 8489 §6.2.1) and waits each window against one clock
 (`Clock.awake`) from the first send, so `timeout_ms` caps every window, not only the start of
-the next. Discarding strays keeps a spoofed or late reply from ending the exchange; reporting the
+the next. Options whose worst-case wait is above `max_worst_case_wait_ms` (120 s; the defaults are 39.5 s)
+are refused with `error.InvalidOptions` (2026-11-18). Discarding strays keeps a spoofed or late reply from ending the exchange; reporting the
 last stray on give-up keeps every error name the old single-shot `query` returned.
 
 **`parseUri`** accepts exactly RFC 7064/7065: scheme (case-insensitive), host as reg-name,
@@ -148,10 +149,7 @@ Speed rows outside the bench (`longTermKey*`, URI parsing, `bindingResponse`) ar
 - **DONE 2026-10-04 — Server side (Binding responder)**, `bindingResponse` (survey 2026-09-30): `ztun` has one; needed for a self-hosted "what is my address" service. Effort: small for Binding only. Fits §2. (Currently listed as deferred, not as a deliberate refusal.)
 - **PARTLY DONE 2026-10-04 (`longTermKey`; see the bullet above for what stays deferred) — Long-term credential mechanism (RFC 8489 §9.2) + missing attribute types** (survey 2026-09-30): USERNAME/REALM/NONCE constants exist but no SASLprep/key derivation, PASSWORD-ALGORITHMS or USERHASH; ICE/TURN users (pion, coturn) need it. Effort: medium (SASLprep is the hard part, needs Unicode tables). Fits §2 (pure Zig).
 - **DONE 2026-10-04 — STUN URI parsing (RFC 7064)**, `parseUri` (survey 2026-09-30): pion offers `ParseURI`; trivial convenience. Effort: small. Fits §2.
-- **2026-10-31 (no-panic sweep GV, REV-stun-2) — `query`'s worst-case wait grows exponentially with `max_requests`:** with `timeout_ms = 0`
-  the only bound is the RFC 8489 §6.2.1 schedule, `rto_ms * (2^(max_requests-1) - 1 + last_wait_factor)` ms against a silent server
-  (39.5 s at the defaults, weeks at `max_requests` 255). Documented on `QueryOptions.timeout_ms`; capping `max_requests` or defaulting
-  `timeout_ms` would change documented option semantics, so it is the owner's call.
+- **DONE 2026-11-18 (owner decision, RFC 8489 §6.2.1; no-panic sweep GV, REV-stun-2) — `query`'s worst-case wait grew exponentially with `max_requests`:** the defaults already are the RFC's (Rc 7, Rm 16, RTO 500 ms, 39.5 s, the RFC's own example). `query` now computes the worst case (`worstCaseWaitMs`: the §6.2.1 schedule's last wait, capped by `timeout_ms` when set) and refuses options above `max_worst_case_wait_ms` (120 s, three times the RFC default) with `error.InvalidOptions` before it opens a socket. A long schedule under a `timeout_ms` cap is fine; `checkOptions` is public for a caller that wants to validate its own configuration. The RFC leaves Rc, Rm and RTO to the client (§6.2.1 "MAY"), so a bound is within the spec; a refusal instead of a silent clamp keeps the behaviour predictable. Behaviour change for a caller that set more than ~8 requests at the default RTO without `timeout_ms`.
 
 ## Status
 `gap · any (core pure; optional query helper does I/O) · codec · reentrant` + deps: `netaddr` —
