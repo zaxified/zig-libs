@@ -1101,11 +1101,11 @@ fss	ReleaseFast	eval	1	0	87070291f4d13650	da79011b1ab46d96
 bfv	ReleaseFast	keygen	1	<=29	ad0f69d92e1faff8	85d334608120f4fc
 bfv	ReleaseFast	encrypt	1	<=17	ad0f69d92e1faff8	e4cdbb1aa2e9c9dc
 bfv	ReleaseFast	decrypt	1	<=6	ad0f69d92e1faff8	51de1d1011ed3c4c
-tfhe	ReleaseFast	keygen	1	0	fa6a123b93890ef2	69d480284dbfd7e8
-tfhe	ReleaseFast	encrypt	1	0	fa6a123b93890ef2	01f895b45b944863
-tfhe	ReleaseFast	decrypt	1	0	8510bdf6aaf984e1	3d8c08984d3541f6
-tfhe	ReleaseFast	bootstrap	1	0	9f9a6e5e7fc598ac	88cf61492d6e15bc
-tfhe	ReleaseFast	noise	1	0	70ff09c65f907b6b	57f844d8aeb1660a
+tfhe	ReleaseFast	keygen	1	0	074fb27bd9d4c17a	69d480284dbfd7e8
+tfhe	ReleaseFast	encrypt	1	0	074fb27bd9d4c17a	01f895b45b944863
+tfhe	ReleaseFast	decrypt	1	0	6305ca81df2b3fbd	3d8c08984d3541f6
+tfhe	ReleaseFast	bootstrap	1	0	207468383a768c55	88cf61492d6e15bc
+tfhe	ReleaseFast	noise	1	0	a4fd14be123dc11c	57f844d8aeb1660a
 # dkg -- the module makes no constant-time claim (see its ctgrind_harness.zig);
 # these rows are measurements, kept so a change in them is seen. Re-measured
 # 2026-10-02 after the participant layer and GJKR step 4 (ba92d6fc, a528d9fa):
@@ -1796,7 +1796,7 @@ dnp3	ReleaseFast	mac	1	0	2ff4825a5c6f1f58	0dcd2c9e71d8d02f
 dnp3	ReleaseFast	keys	1	2	2ff4825a5c6f1f58	d2337903af778cbe
 # iec62351 (2026-10-10) — mac: GOOSE/SV MAC key through computeMac/verifyMac
 # for HMAC-SHA256-80/128/256 and AES-GMAC-64/128 (AES-128/256): 0.
-iec62351	ReleaseFast	mac	1	0	83c1663af025ecd2	760ede68c6c5b472
+iec62351	ReleaseFast	mac	1	0	ff413992e4aa0c2f	760ede68c6c5b472
 # opcua (2026-10-10, Basic256Sha256) — kdf: both channel nonces through
 # deriveKeys: 0. chunk: channel keys + body through symmetricSignAndEncrypt/
 # symmetricDecryptAndVerify (Sign, SignAndEncrypt, wrong-direction reject).

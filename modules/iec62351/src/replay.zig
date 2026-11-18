@@ -731,3 +731,108 @@ fn fuzzGoose(_: void, smith: *std.testing.Smith) !void {
         now += ns_per_ms;
     }
 }
+
+test "mutation: serialNewer at the half-space edge" {
+    try testing.expect(!serialNewer(u32, 0x8000_0000, 0));
+    try testing.expect(serialNewer(u32, 0x7FFF_FFFF, 0));
+    try testing.expect(!serialNewer(u16, 0x8000, 0));
+    try testing.expect(serialNewer(u16, 0x7FFF, 0));
+    try testing.expect(!serialNewer(u32, 5, 5));
+    try testing.expect(!serialNewer(u32, 4, 5));
+}
+
+test "mutation: GOOSE boundaries - future, stale, idle gap, strict counters, wrap flags" {
+    const base: GooseIdentity = .{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms };
+    {
+        // A first frame: t == now + skew is accepted, one ns more is "future".
+        const g: GooseGuard = .init(.{});
+        var id = base;
+        id.t_ns = t0 + g.options.max_skew_ns;
+        try testing.expectEqual(Verdict.accept_first, g.check(id, t0));
+        id.t_ns += 1;
+        try testing.expectEqual(Verdict.reject_future_timestamp, g.check(id, t0));
+        // The skew allowance is ADDED to local time.
+        id.t_ns = t0 + 1;
+        try testing.expectEqual(Verdict.accept_first, g.check(id, t0));
+    }
+    {
+        // A first frame: age == max_state_age_ns is accepted, one ns older is stale.
+        const g: GooseGuard = .init(.{});
+        var id = base;
+        id.t_ns = t0 - g.options.max_state_age_ns;
+        try testing.expectEqual(Verdict.accept_first, g.check(id, t0));
+        id.t_ns -= 1;
+        try testing.expectEqual(Verdict.reject_stale_timestamp, g.check(id, t0));
+    }
+    {
+        // max_idle_ns alone (TAL off): a gap of exactly max_idle_ns is fine.
+        var g: GooseGuard = .init(.{ .max_idle_ns = 5 * ns_per_s, .enforce_time_allowed_to_live = false });
+        _ = g.accept(base, t0);
+        var hb = base;
+        hb.sq_num = 1;
+        try testing.expectEqual(Verdict.accept_in_sequence, g.check(hb, t0 + 5 * ns_per_s));
+        try testing.expectEqual(Verdict.reject_idle_gap, g.check(hb, t0 + 5 * ns_per_s + 1));
+    }
+    {
+        // Strict sqNum ordering: equal is a replay, +1 is the next heartbeat.
+        var g: GooseGuard = .init(.{ .allow_sqnum_wrap = false });
+        var id = base;
+        id.sq_num = 3;
+        _ = g.accept(id, t0);
+        try testing.expectEqual(Verdict.reject_replay_sequence, g.check(id, t0));
+        id.sq_num = 4;
+        try testing.expectEqual(Verdict.accept_in_sequence, g.check(id, t0));
+    }
+    {
+        // stNum wrap: 0xFFFFFFFF -> 0 is newer with serial arithmetic, a rewind with strict `>`.
+        var wrap: GooseGuard = .init(.{});
+        var strict: GooseGuard = .init(.{ .allow_stnum_wrap = false });
+        var id = base;
+        id.st_num = 0xFFFF_FFFF;
+        _ = wrap.accept(id, t0);
+        _ = strict.accept(id, t0);
+        id.st_num = 0;
+        try testing.expectEqual(Verdict.accept_new_state, wrap.check(id, t0));
+        try testing.expectEqual(Verdict.reject_replay_state, strict.check(id, t0));
+    }
+    {
+        // A new state: age == max_state_age_ns accepted, one ns older stale.
+        var g: GooseGuard = .init(.{});
+        _ = g.accept(base, t0);
+        var id = base;
+        id.st_num = 6;
+        const now = t0 + 20 * ns_per_s;
+        id.t_ns = now - g.options.max_state_age_ns;
+        try testing.expectEqual(Verdict.accept_new_state, g.check(id, now));
+        id.t_ns -= 1;
+        try testing.expectEqual(Verdict.reject_stale_timestamp, g.check(id, now));
+    }
+}
+
+test "mutation: SV - local clock, idle bound, default counter wrap, stored state" {
+    {
+        var g: SvGuard = .init(.{ .require_synchronised = true });
+        try testing.expectEqual(Verdict.accept_first, g.accept(.{ .smp_cnt = 0, .smp_synch = 1 }, t0));
+        try testing.expectEqual(Verdict.accept_in_sequence, g.check(.{ .smp_cnt = 1, .smp_synch = 2 }, t0));
+        try testing.expectEqual(Verdict.reject_not_synchronised, g.check(.{ .smp_cnt = 1, .smp_synch = 0 }, t0));
+    }
+    {
+        // The state keeps the arrival time and confRev: a later frame with the
+        // same confRev inside max_idle_ns is accepted; the bound is inclusive.
+        var g: SvGuard = .init(.{ .max_idle_ns = 3 * ns_per_s });
+        _ = g.accept(.{ .smp_cnt = 0, .conf_rev = 7 }, t0);
+        try testing.expectEqual(Verdict.accept_in_sequence, g.check(.{ .smp_cnt = 1, .conf_rev = 7 }, t0 + ns_per_s));
+        try testing.expectEqual(Verdict.accept_in_sequence, g.check(.{ .smp_cnt = 1, .conf_rev = 7 }, t0 + 3 * ns_per_s));
+        try testing.expectEqual(Verdict.reject_idle_gap, g.check(.{ .smp_cnt = 1, .conf_rev = 7 }, t0 + 3 * ns_per_s + 1));
+    }
+    {
+        // smp_rate = 0: the counter wraps at 2^16 and ordinary frames are accepted.
+        var g: SvGuard = .init(.{});
+        _ = g.accept(.{ .smp_cnt = 65534, .conf_rev = 9 }, t0);
+        try testing.expectEqual(Verdict.accept_in_sequence, g.accept(.{ .smp_cnt = 65535, .conf_rev = 9 }, t0));
+        try testing.expectEqual(Verdict.accept_in_sequence, g.accept(.{ .smp_cnt = 0, .conf_rev = 9 }, t0));
+        try testing.expectEqual(Verdict.accept_in_sequence, g.accept(.{ .smp_cnt = 100, .conf_rev = 9 }, t0));
+        try testing.expectEqual(Verdict.reject_sample_out_of_window, g.check(.{ .smp_cnt = 201, .conf_rev = 9 }, t0));
+        try testing.expectEqual(Verdict.reject_replay_sequence, g.check(.{ .smp_cnt = 100, .conf_rev = 9 }, t0));
+    }
+}

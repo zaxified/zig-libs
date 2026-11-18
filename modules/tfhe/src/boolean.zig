@@ -287,3 +287,41 @@ test "a server key built from standard-domain keys evaluates the same" {
 test {
     _ = params;
 }
+
+test "mutation: ClientKey.deinit wipes both secret keys" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ck = Small.ClientKey.generate(io);
+    var lwe_ones: usize = 0;
+    for (ck.lwe.s) |x| lwe_ones += x;
+    var glwe_ones: usize = 0;
+    for (ck.glwe.s) |poly| for (poly.c) |x| {
+        glwe_ones += x;
+    };
+    // 16 and 128 fair bits: all-zero has probability 2^-144.
+    try testing.expect(lwe_ones != 0 and glwe_ones != 0);
+    ck.deinit();
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&ck.lwe), 0));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&ck.glwe), 0));
+}
+
+test "mutation: ServerKey.generate and fromKeys free everything when an allocation fails" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ck = Small.ClientKey.generate(io);
+    defer ck.deinit();
+    // generate: allocation 0 = the standard bootstrap key, 1 = the key-switch
+    // key, 2 = the prepared key. Failing the third must free the first two
+    // (the `defer` and the `errdefer`); `testing.allocator` reports a leak.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    try testing.expectError(error.OutOfMemory, Small.ServerKey.generate(fa.allocator(), &ck, io));
+
+    // fromKeys owns `ksk` on every path, including the failing one.
+    var bsk = try Small.bootstrapKeyGen(testing.allocator, &ck.lwe, &ck.glwe, io);
+    defer bsk.deinit(testing.allocator);
+    const ksk = try Small.keySwitchKeyGen(testing.allocator, &ck.glwe, &ck.lwe, io);
+    var fb = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, Small.ServerKey.fromKeys(fb.allocator(), &bsk, ksk));
+}

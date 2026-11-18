@@ -1249,3 +1249,159 @@ fn fuzzToken(_: void, smith: *std.testing.Smith) !void {
         .{},
     )));
 }
+
+/// `tag len body...` for a short-form element, into `out`.
+fn mutWrap(out: []u8, t: u8, parts: []const []const u8) []u8 {
+    var n: usize = 0;
+    for (parts) |p| {
+        @memcpy(out[2 + n ..][0..p.len], p);
+        n += p.len;
+    }
+    out[0] = t;
+    out[1] = @intCast(n);
+    return out[0 .. 2 + n];
+}
+
+test "mutation: ACSE-requirements bit string at its edges, exact encoding" {
+    try testing.expectError(error.InvalidBitString, AcseRequirements.parse(&.{ 8, 0x80 }));
+    _ = try AcseRequirements.parse(&.{ 7, 0x80 });
+    // Only the LAST octet may carry unused bits: with two octets, bit 1 of the
+    // first is a real bit even though the count says 7 unused.
+    const two = try AcseRequirements.parse(&.{ 7, 0xC0, 0x00 });
+    try testing.expect(two.authentication and two.application_context_negotiation);
+    // With one octet, bit 1 is among the 7 unused bits.
+    const one = try AcseRequirements.parse(&.{ 7, 0xC0 });
+    try testing.expect(one.authentication and !one.application_context_negotiation);
+    const none = try AcseRequirements.parse(&.{ 6, 0xC0 });
+    try testing.expect(none.authentication and none.application_context_negotiation);
+
+    var o: [2]u8 = undefined;
+    try testing.expectEqualSlices(u8, &.{ 7, 0x80 }, (AcseRequirements{ .authentication = true }).encode(&o));
+    try testing.expectEqualSlices(u8, &.{ 6, 0x40 }, (AcseRequirements{ .application_context_negotiation = true }).encode(&o));
+    try testing.expectEqualSlices(u8, &.{ 6, 0xC0 }, (AcseRequirements{ .authentication = true, .application_context_negotiation = true }).encode(&o));
+    try testing.expectEqualSlices(u8, &.{0}, (AcseRequirements{}).encode(&o));
+}
+
+test "mutation: findAuthFields reports each field's own slice and every duplicate" {
+    const a0 = [_]u8{ 0x80, 0x01, 0xAA };
+    const f10 = [_]u8{ 0x8a, 0x02, 0x07, 0x80 };
+    const f11 = [_]u8{ 0x8b, 0x03, 0x52, 0x03, 0x01 };
+    const f12 = [_]u8{ 0xac, 0x04, 0x80, 0x02, 'a', 'b' };
+    var buf: [64]u8 = undefined;
+    const pdu = mutWrap(&buf, tag.aarq, &.{ &a0, &f10, &f11, &f12 });
+    const f = try findAuthFields(pdu, .aarq);
+    try testing.expectEqualSlices(u8, &f10, f.requirements_slice.?);
+    try testing.expectEqualSlices(u8, &f11, f.mechanism_name_slice.?);
+    try testing.expectEqualSlices(u8, &f12, f.value_slice.?);
+    try testing.expect(f.assertsAuthentication());
+
+    const dup11 = mutWrap(&buf, tag.aarq, &.{ &f11, &f11 });
+    try testing.expectError(error.DuplicateField, findAuthFields(dup11, .aarq));
+    var buf2: [64]u8 = undefined;
+    const dup12 = mutWrap(&buf2, tag.aarq, &.{ &f12, &f12 });
+    try testing.expectError(error.DuplicateField, findAuthFields(dup12, .aarq));
+    var buf3: [64]u8 = undefined;
+    const dup10 = mutWrap(&buf3, tag.aarq, &.{ &f10, &f10 });
+    try testing.expectError(error.DuplicateField, findAuthFields(dup10, .aarq));
+}
+
+test "mutation: parseAuthValue refuses a primitive wrapper, an empty bit string and a malformed other" {
+    const E = ber.Element;
+    try testing.expectError(error.MalformedAuthenticationValue, parseAuthValue(E{ .tag = 0x8c, .content = &.{ 0x80, 0x01, 0x41 }, .encoded_len = 5 }));
+    try testing.expectError(error.MalformedAuthenticationValue, parseAuthValue(E{ .tag = 0xac, .content = &.{ 0x81, 0x00 }, .encoded_len = 4 }));
+    // `other` with an OID and nothing after it.
+    try testing.expectError(error.MalformedOtherMechanism, parseAuthValue(E{ .tag = 0xac, .content = &.{ 0xa3, 0x03, 0x06, 0x01, 0x2a }, .encoded_len = 7 }));
+    // `other` whose value element is followed by a stray octet.
+    try testing.expectError(error.MalformedOtherMechanism, parseAuthValue(E{ .tag = 0xac, .content = &.{ 0xa3, 0x07, 0x06, 0x01, 0x2a, 0x04, 0x01, 0x7f, 0x00 }, .encoded_len = 11 }));
+    // The well-formed one parses.
+    const ok = try parseAuthValue(E{ .tag = 0xac, .content = &.{ 0xa3, 0x06, 0x06, 0x01, 0x2a, 0x04, 0x01, 0x7f }, .encoded_len = 10 });
+    try testing.expectEqualSlices(u8, &.{0x2a}, ok.other.mechanism);
+}
+
+test "mutation: writeAuthValue accepts a 255-octet bit string and refuses 256" {
+    var out: [600]u8 = undefined;
+    const bits255: [255]u8 = @splat(0x55);
+    const w = try writeAuthValue(&out, .{ .bitstring = .{ .unused_bits = 3, .bits = &bits255 } });
+    try testing.expectEqual(@as(u8, 3), w[w.len - 256]); // the unused-bits octet precedes the bits
+    const bits256: [256]u8 = @splat(0x55);
+    try testing.expectError(error.BufferTooSmall, writeAuthValue(&out, .{ .bitstring = .{ .unused_bits = 0, .bits = &bits256 } }));
+}
+
+test "mutation: insertAuthFields - kind check, exact buffer, ordering around the auth tags" {
+    const a0 = [_]u8{ 0x80, 0x01, 0xAA };
+    const p12 = [_]u8{ 0x8c, 0x01, 0xBB }; // primitive [12]: not an auth element, sorts BEFORE the fields
+    const a13 = [_]u8{ 0xad, 0x01, 0xCC };
+    const a14 = [_]u8{ 0xae, 0x01, 0xDD };
+    var fb: [8]u8 = undefined;
+    const fields = try buildAuthFields(&fb, .{});
+    try testing.expectEqualSlices(u8, &.{ 0x8a, 0x02, 0x07, 0x80 }, fields);
+
+    var pb: [64]u8 = undefined;
+    const pdu = mutWrap(&pb, tag.aarq, &.{ &a0, &p12, &a13, &a14 });
+    var out: [64]u8 = undefined;
+    var wb: [64]u8 = undefined;
+    const want = mutWrap(&wb, tag.aarq, &.{ &a0, &p12, fields, &a13, &a14 });
+    try testing.expectEqual(@as(usize, 18), want.len);
+    const got = try insertAuthFields(&out, pdu, .aarq, fields);
+    try testing.expectEqualSlices(u8, want, got);
+    // The exact-size buffer works, one octet less does not.
+    var exact: [18]u8 = undefined;
+    try testing.expectEqualSlices(u8, want, try insertAuthFields(&exact, pdu, .aarq, fields));
+    try testing.expectError(error.BufferTooSmall, insertAuthFields(exact[0..17], pdu, .aarq, fields));
+    // A PDU of the wrong kind.
+    try testing.expectError(error.NotAnAssociationPdu, insertAuthFields(&out, pdu, .aare, fields));
+
+    // No child sorts after [12]: the fields go at the end.
+    var pb2: [16]u8 = undefined;
+    const pdu2 = mutWrap(&pb2, tag.aarq, &.{&a0});
+    var out2: [32]u8 = undefined;
+    var wb2: [32]u8 = undefined;
+    try testing.expectEqualSlices(u8, mutWrap(&wb2, tag.aarq, &.{ &a0, fields }), try insertAuthFields(&out2, pdu2, .aarq, fields));
+}
+
+test "mutation: signingInput is a fixed byte string; SignedToken.parse is strict" {
+    var out: [64]u8 = undefined;
+    const si = try SignedToken.signingInput(&out, 1, 0x0102030405060708, "ab");
+    try testing.expectEqualSlices(u8, &.{ 0x30, 0x11, 0x80, 0x01, 0x01, 0x81, 0x08, 1, 2, 3, 4, 5, 6, 7, 8, 0x82, 0x02, 'a', 'b' }, si);
+
+    const ver = [_]u8{ 0x80, 0x01, 0x01 };
+    const tm = [_]u8{ 0x81, 0x08, 0, 0, 0, 0, 0, 0, 0, 9 };
+    const id = [_]u8{ 0x82, 0x01, 'x' };
+    const sig = [_]u8{ 0x83, 0x02, 0xAA, 0xBB };
+    var b: [64]u8 = undefined;
+    const good = mutWrap(&b, tag.sequence, &.{ &ver, &tm, &id, &sig });
+    const t = try SignedToken.parse(good);
+    try testing.expectEqual(@as(u64, 9), t.time_s);
+
+    var b2: [64]u8 = undefined;
+    @memcpy(b2[0..good.len], good);
+    b2[good.len] = 0;
+    try testing.expectError(error.MalformedToken, SignedToken.parse(b2[0 .. good.len + 1]));
+
+    const ver2 = [_]u8{ 0x80, 0x02, 0x01, 0x01 };
+    const tm7 = [_]u8{ 0x81, 0x07, 0, 0, 0, 0, 0, 0, 9 };
+    const id_bad = [_]u8{ 0x84, 0x01, 'x' };
+    const sig0 = [_]u8{ 0x83, 0x00 };
+    const extra = [_]u8{ 0x05, 0x00 };
+    const bad = [_][]const []const u8{
+        &.{ &ver2, &tm, &id, &sig },
+        &.{ &ver, &tm7, &id, &sig },
+        &.{ &ver, &tm, &id_bad, &sig },
+        &.{ &ver, &tm, &id, &sig0 },
+        &.{ &ver, &tm, &id, &sig, &extra },
+    };
+    for (bad) |parts| {
+        var bb: [64]u8 = undefined;
+        try testing.expectError(error.MalformedToken, SignedToken.parse(mutWrap(&bb, tag.sequence, parts)));
+    }
+}
+
+test "mutation: verifyToken refuses an ECDSA signature of the wrong length" {
+    var kp: EcdsaP256.KeyPair = undefined;
+    testKeyPair(&kp, 0x21);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+    const sig63: [63]u8 = @splat(0x11);
+    var buf: [128]u8 = undefined;
+    const tok = try (SignedToken{ .time_s = test_now_s, .identity = "x", .signature = &sig63 }).encode(&buf);
+    try testing.expectError(error.SignatureInvalid, verifyToken(tok, .{ .ecdsa_p256_sha256 = kp.public_key }, test_now_s, .{}));
+}

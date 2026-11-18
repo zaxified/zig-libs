@@ -1035,3 +1035,193 @@ fn fuzzCorrupt(_: void, smith: *std.testing.Smith) !void {
     const facts = inspectCertificate(der, .client_auth) catch return;
     _ = Profile.iec62351_3.checkCertificateFacts(facts, inside_s);
 }
+
+test "mutation: a profile's switches, not the session's flags, decide; limits are inclusive and 0 disables" {
+    const base = Profile.iec62351_3;
+    var p = base;
+    var s = conforming_session;
+
+    p.forbid_compression = false;
+    s.compression = true;
+    try testing.expect(p.checkSession(s).ok());
+    p = base;
+    s = conforming_session;
+    p.require_secure_renegotiation = false;
+    s.secure_renegotiation = false;
+    try testing.expect(p.checkSession(s).ok());
+    p = base;
+    s = conforming_session;
+    p.require_mutual_authentication = false;
+    s.mutual_authentication = false;
+    try testing.expect(p.checkSession(s).ok());
+    p = base;
+    s = conforming_session;
+    p.require_chain_validation = false;
+    s.chain_validated = false;
+    try testing.expect(p.checkSession(s).ok());
+    p = base;
+    s = conforming_session;
+    p.require_revocation_check = false;
+    s.revocation_checked = false;
+    try testing.expect(p.checkSession(s).ok());
+
+    // Session age: the limit is inclusive; 0 disables.
+    p = base;
+    s = conforming_session;
+    p.max_session_age_s = 100;
+    s.age_s = 100;
+    try testing.expect(p.checkSession(s).ok());
+    s.age_s = 101;
+    try testing.expect(p.checkSession(s).has(.session_lifetime_exceeded));
+    p.max_session_age_s = 0;
+    s.age_s = 5;
+    try testing.expect(p.checkSession(s).ok());
+    // Data volume.
+    p = base;
+    s = conforming_session;
+    p.max_session_bytes = 1000;
+    s.bytes_transferred = 1000;
+    try testing.expect(p.checkSession(s).ok());
+    s.bytes_transferred = 1001;
+    try testing.expect(p.checkSession(s).has(.session_data_volume_exceeded));
+    p.max_session_bytes = 0;
+    s.bytes_transferred = 5;
+    try testing.expect(p.checkSession(s).ok());
+    // Resumption age.
+    p = base;
+    s = conforming_session;
+    s.resumed = true;
+    p.max_resumption_age_s = 100;
+    s.resumption_age_s = 100;
+    try testing.expect(p.checkSession(s).ok());
+    s.resumption_age_s = 101;
+    try testing.expect(p.checkSession(s).has(.resumption_ticket_too_old));
+    p.max_resumption_age_s = 0;
+    s.resumption_age_s = 5;
+    try testing.expect(p.checkSession(s).ok());
+
+    // One violation is not ok().
+    var r: Report = .{};
+    r.add(.compression_enabled);
+    try testing.expect(!r.ok());
+    try testing.expectEqual(@as(usize, 1), r.count());
+}
+
+test "mutation: certificate validity window ends are valid; 0 disables the length bound; empty kind list means any" {
+    const p = Profile.iec62351_3;
+    var f = good_facts;
+    f.not_before_s = 100;
+    f.not_after_s = 200;
+    try testing.expect(!p.checkCertificateFacts(f, 200).has(.certificate_expired));
+    try testing.expect(p.checkCertificateFacts(f, 201).has(.certificate_expired));
+    try testing.expect(!p.checkCertificateFacts(f, 100).has(.certificate_not_yet_valid));
+    try testing.expect(p.checkCertificateFacts(f, 99).has(.certificate_not_yet_valid));
+
+    var q = p;
+    q.max_certificate_validity_s = 0;
+    var long = good_facts;
+    long.not_before_s = 0;
+    long.not_after_s = 10 * year_s;
+    try testing.expect(!q.checkCertificateFacts(long, year_s).has(.certificate_validity_too_long));
+
+    q = p;
+    q.allowed_key_kinds = &.{};
+    var ed = good_facts;
+    ed.key_kind = .ed25519;
+    ed.key_bits = 255;
+    try testing.expect(!q.checkCertificateFacts(ed, year_s / 2).has(.certificate_key_algorithm_not_permitted));
+
+    // keyUsage criticality: the profile switch decides, and an absent keyUsage
+    // is "missing", not also "not critical".
+    q = p;
+    q.require_key_usage_critical = false;
+    var nc = good_facts;
+    nc.key_usage_critical = false;
+    try testing.expect(!q.checkCertificateFacts(nc, year_s / 2).has(.certificate_key_usage_not_critical));
+    var absent = good_facts;
+    absent.key_usage = null;
+    absent.key_usage_critical = false;
+    const rep = p.checkCertificateFacts(absent, year_s / 2);
+    try testing.expect(rep.has(.certificate_key_usage_missing));
+    try testing.expect(!rep.has(.certificate_key_usage_not_critical));
+}
+
+const ber = @import("ber.zig");
+
+/// `t len parts…` (any length) into `out`.
+fn derCat(out: []u8, t: u8, parts: []const []const u8) []u8 {
+    var body: [512]u8 = undefined;
+    var n: usize = 0;
+    for (parts) |part| {
+        @memcpy(body[n..][0..part.len], part);
+        n += part.len;
+    }
+    return ber.writeElement(out, t, body[0..n]) catch unreachable;
+}
+
+/// A syntactically valid, UNSIGNED v3 certificate around `spki` (the policy
+/// reads facts and never the signature). `eku` adds a clientAuth extension.
+fn mutCert(out: []u8, spki: []const u8, sig_alg: []const u8, eku: bool) []u8 {
+    var b: [8][400]u8 = undefined;
+    const ver = [_]u8{ 0xa0, 0x03, 0x02, 0x01, 0x02 };
+    const serial = [_]u8{ 0x02, 0x01, 0x01 };
+    const name = [_]u8{ 0x30, 0x0c, 0x31, 0x0a, 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x01, 0x78 };
+    const t1 = "\x17\x0d200101000000Z";
+    const t2 = "\x17\x0d210101000000Z";
+    const validity = derCat(&b[0], 0x30, &.{ t1, t2 });
+    var ext_wrapped: []const u8 = &.{};
+    if (eku) {
+        const client_auth = derCat(&b[1], 0x30, &.{&[_]u8{ 0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02 }});
+        const octets = derCat(&b[2], 0x04, &.{client_auth});
+        const ext = derCat(&b[3], 0x30, &.{ &[_]u8{ 0x06, 0x03, 0x55, 0x1d, 0x25 }, octets });
+        const exts = derCat(&b[4], 0x30, &.{ext});
+        ext_wrapped = derCat(&b[5], 0xa3, &.{exts});
+    }
+    const tbs = derCat(&b[6], 0x30, &.{ &ver, &serial, sig_alg, &name, validity, &name, spki, ext_wrapped });
+    const sig = [_]u8{ 0x03, 0x09, 0x00, 0, 0, 0, 0, 0, 0, 0, 0 };
+    return derCat(out, 0x30, &.{ tbs, sig_alg, &sig });
+}
+
+test "mutation: inspectCertificate reads EC and Ed25519 keys and extKeyUsage out of real DER" {
+    const ecdsa_sha256 = [_]u8{ 0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 };
+    const ec_oid = [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
+    const p256 = [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+    const p384 = [_]u8{ 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22 };
+    const p521 = [_]u8{ 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23 };
+    const cases = [_]struct { []const u8, usize, usize, Certificate.NamedCurve }{
+        .{ &p256, 65, 256, .X9_62_prime256v1 },
+        .{ &p384, 97, 384, .secp384r1 },
+        .{ &p521, 133, 521, .secp521r1 },
+    };
+    for (cases) |c| {
+        var point: [133]u8 = @splat(0);
+        point[0] = 4;
+        var bits_buf: [200]u8 = undefined;
+        const bit_string = derCat(&bits_buf, 0x03, &.{ &[_]u8{0x00}, point[0..c[1]] });
+        var alg_buf: [64]u8 = undefined;
+        const alg = derCat(&alg_buf, 0x30, &.{ &ec_oid, c[0] });
+        var spki_buf: [300]u8 = undefined;
+        const spki = derCat(&spki_buf, 0x30, &.{ alg, bit_string });
+        var cert_buf: [1500]u8 = undefined;
+        const der = mutCert(&cert_buf, spki, &ecdsa_sha256, true);
+        const f = try inspectCertificate(der, .client_auth);
+        try testing.expectEqual(KeyKind.ecdsa, f.key_kind);
+        try testing.expectEqual(c[2], f.key_bits);
+        try testing.expectEqual(c[3], f.named_curve.?);
+        // The extKeyUsage extension is present and lists clientAuth.
+        try testing.expect(f.ext_key_usage_present and f.has_required_purpose);
+        const none = mutCert(&cert_buf, spki, &ecdsa_sha256, false);
+        try testing.expect(!(try inspectCertificate(none, .client_auth)).ext_key_usage_present);
+    }
+    // Ed25519.
+    const ed_alg = [_]u8{ 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70 };
+    var key: [33]u8 = @splat(0);
+    var bs_buf: [64]u8 = undefined;
+    const bs = derCat(&bs_buf, 0x03, &.{&key});
+    var spki_buf: [128]u8 = undefined;
+    const spki = derCat(&spki_buf, 0x30, &.{ &ed_alg, bs });
+    var cert_buf: [1000]u8 = undefined;
+    const f = try inspectCertificate(mutCert(&cert_buf, spki, &ed_alg, false), .client_auth);
+    try testing.expectEqual(KeyKind.ed25519, f.key_kind);
+    try testing.expectEqual(@as(usize, 255), f.key_bits);
+}

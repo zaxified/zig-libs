@@ -1570,3 +1570,40 @@ test "encryptions carry the parameter set's error: right distribution, right wid
     try testing.expectApproxEqRel(params.toy.lwe_noise.stddev(), stats.sd(&errs), 0.05);
     for (errs) |e| try testing.expect(@abs(@as(i32, @bitCast(e))) <= toy_bound);
 }
+
+fn zeroFill(_: *anyopaque, buf: []u8) void {
+    @memset(buf, 0);
+}
+var zero_state: u8 = 0;
+
+test "mutation: lweEncrypt's error sign, mask draw and message space, pinned with an all-zero stream" {
+    const rnd: std.Random = .{ .ptr = &zero_state, .fillFn = zeroFill };
+    var key: Toy.LweKey(64) = undefined;
+    for (&key.s, 0..) |*s, i| s.* = @intCast(i & 1);
+    const mu: T = 0x1234_5678;
+    const ct = Toy.lweEncryptForTest(64, &key, mu, rnd);
+    // An all-zero stream: the mask is 0 and the uniform draw 0 maps to −B.
+    for (ct.a) |x| try testing.expectEqual(@as(T, 0), x);
+    try testing.expectEqual(mu -% toy_bound, ct.b);
+    try testing.expectEqual(mu -% toy_bound, Toy.lwePhase(64, &key, &ct));
+    // The message space is 2 bits (Δ = q/4): 2 and 3 must not fold onto 0 and 1.
+    for ([_]u32{ 0, 1, 2, 3 }) |msg| {
+        const c = Toy.lweEncryptForTest(64, &key, Toy.encodeBit(msg), rnd);
+        try testing.expectEqual(msg, Toy.lweDecryptBit(64, &key, &c));
+        try testing.expectEqual(msg, Toy.decodeBit(Toy.lwePhase(64, &key, &c)));
+    }
+}
+
+test "mutation: glweEncrypt's error sign and mask draw, pinned with an all-zero stream" {
+    const rnd: std.Random = .{ .ptr = &zero_state, .fillFn = zeroFill };
+    var key: Toy.GlweKey = undefined;
+    for (&key.s, 0..) |*sj, j| for (&sj.c, 0..) |*x, i| {
+        x.* = @intCast((i + j) & 1);
+    };
+    var msg = Toy.Poly.zero();
+    for (&msg.c, 0..) |*x, i| x.* = @intCast(i * 0x0100_0001);
+    const ct = Toy.glweEncryptForTest(&key, &msg, rnd);
+    for (ct.mask) |m| for (m.c) |x| try testing.expectEqual(@as(T, 0), x);
+    // Zero mask ⇒ body = msg + e, and the all-zero uniform draw is −B.
+    for (ct.body.c, msg.c) |got, want| try testing.expectEqual(want -% toy_bound, got);
+}

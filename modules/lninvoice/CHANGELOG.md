@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO BEHAVIOUR CHANGE (decision recorded):** a zero amount in the HRP (`lnbc0`, `lnbc0n`) stays accepted as `0` msat. BOLT#11 puts "positive, no leading 0s" on writers only; lnd (`zpay32`) and LDK (`lightning-invoice`) both accept zero through their integer parsers. SPEC records the sources and the one place the module is stricter than both (a leading zero on a non-zero amount is refused).
+
 - **2026-11-17** — Whole-module mutation of `bech32_raw`, `bitpack`, `bolt11`, `bolt12` and `burn` (347 mutants, 332 killed, 15 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 29 tests added (HRP and case edges, the HRP amount grammar, every network prefix, crafted well-signed invoices for tagged-field layouts, the 1023-quintet cap, BOLT#12 TLV-level lengths, padding, Merkle truncation and `verifyMerkle`'s error/false split); no behaviour change.
 
 - **2026-11-16** — **NEW API:** BOLT#12 `invoice_error` (`InvoiceError`, `decodeInvoiceError`, `encodeInvoiceError`; strict TLV types 1/3/5) and `invoiceRequestIsRefund` (classifies an offer-less `invoice_request`, i.e. a refund; the codec already handled them). No external vector; hand-built fixtures.

@@ -123,6 +123,19 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   requirement — verified byte-exact against three of the spec's own amount strings (`2500u`,
   `9678785340p`, `20m`).
 
+- **A zero amount (`lnbc0`, `lnbc0n`) is accepted as `0` msat (decision 2026-11-18, kept).**
+  BOLT#11's reader rules refuse only a non-digit, a trailing character that is not a multiplier,
+  and a `p` amount whose last decimal is not `0`; "positive, no leading 0s" is a *writer*
+  requirement ("MUST encode `amount` as a positive decimal integer with no leading 0s"). Both
+  permissive references accept zero: lnd's `zpay32` (`amountunits.go` `decodeAmount`) parses the
+  digits with `strconv.ParseUint` and `decode.go` stores the result without a zero check, and
+  LDK's `lightning-invoice` (`de.rs`, `RawHrp::from_str`) does `parts.1.parse::<u64>()` and only
+  checks for overflow. A zero-amount invoice is therefore reported as `amount_msat == 0` (not
+  `null`, which means "no amount"); a caller that pays must treat `0` as it sees fit. Note
+  the one place this module is stricter than both references: a leading zero on a non-zero amount
+  (`lnbc01u`) is refused as `AmountLeadingZero` (both references accept it through their integer
+  parsers; the spec only forbids it for writers).
+
 - **`f` (fallback address) and `r` (routing hint) are stored typed but NOT semantically
   interpreted beyond BOLT#11's own wire layout** — `Fallback{ version, program }` (raw witness-
   version quintet + raw program/hash bytes; Bitcoin address-format rendering — bech32 segwit vs.
