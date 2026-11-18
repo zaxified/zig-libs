@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of the codec (521 mutants, 509 killed, 12 EQUIVALENT; the card now carries whole-module counts and the source hash). `src/mutation_test.zig` (33 tests) pins exact-fit buffers, truncated bodies, the Length Indicator in both directions, Maximum Area Addresses, trailing bytes after the PDU Length, field byte orders and offsets, flag bits and masks, record counts at their limits and the level-2 dispatch arms. No source change.
 - **2026-10-10** — tests: deterministic fuzz driver `ISIS_FUZZ` over the decode harness (header/TLV/typed views/PDU bodies), now generic over its choice source, with reach labels per PDU kind and an LSP-checksum oracle (a stamped LSP grades good, one flipped bit in the checksummed region does not). No source change.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: ID length, Auth #10, MT and typed IP reachability in "Deliberately deferred" now read "not yet — see Backlog", matching the 2026-09-30 survey.
 - **2026-09-14** — **BREAKING (error set, enum) + BEHAVIOURAL:** audit F2/F3, round-2 decision Q5

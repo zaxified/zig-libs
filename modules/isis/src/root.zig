@@ -109,6 +109,7 @@ test {
     _ = @import("checksum.zig");
     _ = @import("goldens.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("mutation_test.zig");
 }
 
 test "meta is well-formed" {
