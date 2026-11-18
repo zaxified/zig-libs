@@ -55,6 +55,7 @@ pub const masterFromSeed = bip32_impl.masterFromSeed;
 pub const ckdPriv = bip32_impl.ckdPriv;
 pub const ckdPub = bip32_impl.ckdPub;
 pub const neuter = bip32_impl.neuter;
+pub const neuterInto = bip32_impl.neuterInto;
 pub const fingerprint = bip32_impl.fingerprint;
 pub const serializePriv = bip32_impl.serializePriv;
 pub const serializePub = bip32_impl.serializePub;

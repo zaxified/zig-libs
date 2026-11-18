@@ -245,6 +245,13 @@ noinline fn callNeuter() void {
     k.deinit();
 }
 
+var sink_pub: bip32.ExtendedPubKey = undefined;
+
+noinline fn callNeuterInto() void {
+    bip32.neuterInto(&master, &sink_pub) catch unreachable;
+    sink_pub.deinit();
+}
+
 noinline fn callSerializePriv() void {
     var out: [bip32.max_serialized_len]u8 = undefined;
     const s = bip32.serializePriv(&master, .mainnet, &out) catch unreachable;
@@ -287,7 +294,7 @@ noinline fn callMnemonicToSeed() void {
 /// compiler keeps that copy out of the dead stack; in the mutation-schemata
 /// build (same logic, different code shape) it does not. A burn on `neuter`
 /// does not remove it (a by-value return is copied into the wrapper's frame;
-/// tried 2026-11-18); an out-pointer variant would (SPEC Backlog). Every other
+/// tried 2026-11-18); `neuterInto` (out-pointer, since 2026-11-18) is the variant without it and is held to every needle. Every other
 /// needle, the private key in all its images, still applies to `neuter`.
 const probes = [_]struct { name: []const u8, call: *const fn () void, skip: []const u8 = "" }{
     .{ .name = "masterFromSeed", .call = callMasterFromSeed },
@@ -295,6 +302,7 @@ const probes = [_]struct { name: []const u8, call: *const fn () void, skip: []co
     .{ .name = "ckdPriv normal", .call = callCkdPrivNormal },
     .{ .name = "derivePath", .call = callDerivePath },
     .{ .name = "neuter", .call = callNeuter, .skip = "master chain code, big-endian" },
+    .{ .name = "neuterInto", .call = callNeuterInto },
     .{ .name = "serializePriv", .call = callSerializePriv },
     .{ .name = "parseExtended xprv", .call = callParseExtended },
     .{ .name = "mnemonicToEntropy", .call = callMnemonicToEntropy },
