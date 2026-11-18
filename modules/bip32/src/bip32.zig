@@ -198,6 +198,11 @@ pub const CkdError = error{
     /// `ckdPub` was asked to derive a hardened child — impossible without
     /// the private key (BIP-32's defining restriction on public derivation).
     HardenedRequiresPrivateKey,
+    /// The parent is already at depth 255 (the depth field is one byte), so no
+    /// child can be derived. rust-bitcoin (`MaximumDepthExceeded`), bitcoinjs
+    /// (`Depth too large!`) and btcd (`ErrDeriveBeyondMaxDepth`) refuse the same
+    /// way; this module used to wrap the depth to 0.
+    MaximumDepthExceeded,
 };
 
 /// Derive the compressed SEC1 pubkey `k·G` for a private scalar `k`.
@@ -287,12 +292,13 @@ noinline fn ckdPrivBody(parent: *const ExtendedPrivKey, known_pub: ?[33]u8, inde
 /// Not `pub` outside the module — call `ckdPriv`/`ckdPrivWithParentPub` for
 /// real derivation.
 fn ckdPrivFromIL(parent: *const ExtendedPrivKey, parent_pub: [33]u8, index: u32, il: [32]u8, ir: [32]u8) CkdError!ExtendedPrivKey {
+    const depth = std.math.add(u8, parent.depth, 1) catch return error.MaximumDepthExceeded;
     var child_priv = Secp256k1.scalar.add(parent.privkey, il, .big) catch return error.InvalidChildKey;
     defer std.crypto.secureZero(u8, &child_priv);
     if (std.mem.allEqual(u8, &child_priv, 0)) return error.InvalidChildKey;
 
     return .{
-        .depth = parent.depth +% 1,
+        .depth = depth,
         .parent_fingerprint = fingerprint(parent_pub),
         .child_number = index,
         .chain_code = ir,
@@ -324,6 +330,7 @@ pub fn ckdPub(parent: ExtendedPubKey, index: u32) CkdError!ExtendedPubKey {
 /// a test hand in a synthetic non-canonical `il` directly. Not `pub` outside
 /// the module — call `ckdPub` for real derivation.
 fn ckdPubFromIL(parent: ExtendedPubKey, index: u32, il: [32]u8, ir: [32]u8) CkdError!ExtendedPubKey {
+    const depth = std.math.add(u8, parent.depth, 1) catch return error.MaximumDepthExceeded;
     Secp256k1.scalar.rejectNonCanonical(il, .big) catch return error.InvalidChildKey;
     const il_point = Secp256k1.combMulBase(il, .big) catch return error.InvalidChildKey;
     const parent_point = Secp256k1.fromSec1(&parent.pubkey) catch return error.InvalidChildKey;
@@ -331,7 +338,7 @@ fn ckdPubFromIL(parent: ExtendedPubKey, index: u32, il: [32]u8, ir: [32]u8) CkdE
     child_point.rejectIdentity() catch return error.InvalidChildKey;
 
     return .{
-        .depth = parent.depth +% 1,
+        .depth = depth,
         .parent_fingerprint = fingerprint(parent.pubkey),
         .child_number = index,
         .chain_code = ir,
@@ -1293,4 +1300,164 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── whole-module mutation tests (2026-11-17) ─────────────────────────────
+
+fn mutTestMaster() !ExtendedPrivKey {
+    const seed = @as([32]u8, @splat(0x2b));
+    var m: ExtendedPrivKey = undefined;
+    try masterFromSeed(&seed, &m);
+    return m;
+}
+
+/// The 78-byte payload of `k` as `serializePriv` writes it.
+fn mutPayloadOf(k: *const ExtendedPrivKey) ![serialized_payload_len]u8 {
+    var sb: [max_serialized_len]u8 = undefined;
+    const s = try serializePriv(k, .mainnet, &sb);
+    var dec: [bech32.base58.max_payload_len]u8 = undefined;
+    const p = try bech32.base58.checkDecode(s, &dec);
+    return p[0..serialized_payload_len].*;
+}
+
+fn mutWith(p: [serialized_payload_len]u8, i: usize, v: u8) [serialized_payload_len]u8 {
+    var q = p;
+    q[i] = v;
+    return q;
+}
+
+/// `parseExtended(mainnet)` over a Base58Check string of `payload`.
+fn mutParse(payload: *const [serialized_payload_len]u8) ParseError!void {
+    var eb: [bech32.base58.max_encoded_len]u8 = undefined;
+    const s = bech32.base58.checkEncode(payload, &eb) catch unreachable;
+    return parseExtended(s, .mainnet, &scratch_parsed);
+}
+
+test "mutation: deinit zeroes the secret fields; isMaster checks all three header fields" {
+    var k = try mutTestMaster();
+    try testing.expect(k.isMaster());
+    var d1 = k;
+    d1.depth = 1;
+    try testing.expect(!d1.isMaster());
+    var d2 = k;
+    d2.parent_fingerprint[3] = 1;
+    try testing.expect(!d2.isMaster());
+    var d3 = k;
+    d3.child_number = 1;
+    try testing.expect(!d3.isMaster());
+
+    var pubk = try neuter(&k);
+    try testing.expect(!std.mem.allEqual(u8, &k.privkey, 0));
+    try testing.expect(!std.mem.allEqual(u8, &k.chain_code, 0));
+    try testing.expect(!std.mem.allEqual(u8, &pubk.chain_code, 0));
+    k.deinit();
+    pubk.deinit();
+    try testing.expect(std.mem.allEqual(u8, &k.privkey, 0));
+    try testing.expect(std.mem.allEqual(u8, &k.chain_code, 0));
+    try testing.expect(std.mem.allEqual(u8, &pubk.chain_code, 0));
+}
+
+test "mutation: parseExtended names each malformed header field with its own error" {
+    var k = try mutTestMaster();
+    defer k.deinit();
+    const p = try mutPayloadOf(&k);
+    try mutParse(&p);
+    scratch_parsed.private.deinit();
+
+    try testing.expectError(error.ZeroDepthNonZeroFingerprint, mutParse(&mutWith(p, 5, 1)));
+    try testing.expectError(error.ZeroDepthNonZeroIndex, mutParse(&mutWith(p, 12, 1)));
+    try testing.expectError(error.UnknownVersion, mutParse(&mutWith(p, 0, 0x01)));
+    try testing.expectError(error.InvalidPrivateKeyMarker, mutParse(&mutWith(p, 45, 0x01)));
+    try testing.expectError(error.InvalidPrivateKeyMarker, mutParse(&mutWith(p, 45, 0x02)));
+    // A non-zero depth lifts the zero-depth invariant: the same bytes parse.
+    try mutParse(&mutWith(mutWith(p, 4, 1), 5, 1));
+    scratch_parsed.private.deinit();
+}
+
+test "mutation: the *FromIL seams and a zero parent key report InvalidChildKey" {
+    var master = try mutTestMaster();
+    defer master.deinit();
+    const mp = try neuter(&master);
+    const ir = @as([32]u8, @splat(0x44));
+    try testing.expectError(error.InvalidChildKey, ckdPrivFromIL(&master, mp.pubkey, 0, order_be, ir));
+    try testing.expectError(error.InvalidChildKey, ckdPubFromIL(mp, 0, @as([32]u8, @splat(0)), ir));
+    var bad = mp;
+    bad.pubkey[0] = 0x05;
+    try testing.expectError(error.InvalidChildKey, ckdPubFromIL(bad, 0, @as([32]u8, @splat(1)), ir));
+    var zero = master;
+    zero.privkey = @as([32]u8, @splat(0));
+    try testing.expectError(error.InvalidChildKey, ckdPriv(&zero, 0, &scratch_key));
+}
+
+test "mutation: parsePath roots, separators, digits, leading zeros and the depth limits" {
+    var out: [64]u32 = undefined;
+    try testing.expectEqual(@as(usize, 2), (try parsePath("M/0'/9", &out)).len);
+    try testing.expectEqual(@as(u32, 19), (try parsePath("m/19", &out))[0]);
+    try testing.expectEqual(@as(u32, 9), (try parsePath("9", &out))[0]);
+    try testing.expectEqual(@as(usize, 0), (try parsePath("m", &out)).len);
+    try testing.expectError(error.InvalidPathSegment, parsePath("mx/0", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/m", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("0/M/1", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/07", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/00", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/+5", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/-5", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/5/", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/'", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/1.5", &out));
+    // A short `out` is PathTooDeep, never a write past its end.
+    var small: [2]u32 = undefined;
+    try testing.expectEqual(@as(usize, 2), (try parsePath("m/1/2", &small)).len);
+    try testing.expectError(error.PathTooDeep, parsePath("m/1/2/3", &small));
+    // `max_path_depth` segments fit, one more does not, whatever `out` holds.
+    var pbuf: [1 + 2 * 33]u8 = undefined;
+    pbuf[0] = 'm';
+    for (0..33) |i| @memcpy(pbuf[1 + 2 * i ..][0..2], "/1");
+    try testing.expectEqual(@as(usize, 32), (try parsePath(pbuf[0 .. 1 + 2 * 32], &out)).len);
+    try testing.expectError(error.PathTooDeep, parsePath(pbuf[0 .. 1 + 2 * 33], &out));
+    // Index limits: 2^31-1 fits, 2^31 does not (with and without the mark).
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), (try parsePath("2147483647'", &out))[0]);
+    try testing.expectError(error.IndexOutOfRange, parsePath("2147483648", &out));
+    try testing.expectError(error.IndexOutOfRange, parsePath("2147483648'", &out));
+}
+
+test "mutation: derivation refuses to go past depth 255 (MaximumDepthExceeded)" {
+    var master = try mutTestMaster();
+    defer master.deinit();
+    master.depth = 254;
+
+    var child: ExtendedPrivKey = undefined;
+    defer child.deinit();
+    try ckdPriv(&master, 7, &child);
+    try testing.expectEqual(@as(u8, 255), child.depth);
+    var sb: [max_serialized_len]u8 = undefined;
+    const s = try serializePriv(&child, .mainnet, &sb);
+    try parseExtended(s, .mainnet, &scratch_parsed);
+    try testing.expectEqual(@as(u8, 255), scratch_parsed.private.depth);
+    scratch_parsed.private.deinit();
+
+    const pub254 = try neuter(&master);
+    const pc = try ckdPub(pub254, 7);
+    try testing.expectEqual(@as(u8, 255), pc.depth);
+    var sbp: [max_serialized_len]u8 = undefined;
+    const sp = try serializePub(pc, .mainnet, &sbp);
+    try parseExtended(sp, .mainnet, &scratch_parsed);
+    try testing.expectEqual(@as(u8, 255), scratch_parsed.public.depth);
+
+    // From depth 255 every entry point refuses, and `out` stays untouched.
+    const pub255 = try neuter(&child);
+    var out = master;
+    defer out.deinit();
+    const before = out;
+    try testing.expectError(error.MaximumDepthExceeded, ckdPriv(&child, 0, &out));
+    try testing.expectError(error.MaximumDepthExceeded, ckdPriv(&child, hardened_offset, &out));
+    try testing.expectError(error.MaximumDepthExceeded, ckdPrivWithParentPub(&child, pub255.pubkey, 1, &out));
+    try testing.expectError(error.MaximumDepthExceeded, ckdPub(pub255, 0));
+    try testing.expectError(error.MaximumDepthExceeded, derivePath(&child, &.{0}, &out));
+    // A path that would cross 255 fails as a whole.
+    try testing.expectError(error.MaximumDepthExceeded, derivePath(&master, &.{ 0, 0 }, &out));
+    try testing.expectEqualDeep(before, out);
+    // ... while one that lands exactly on 255 works.
+    try derivePath(&master, &.{0}, &out);
+    try testing.expectEqual(@as(u8, 255), out.depth);
 }

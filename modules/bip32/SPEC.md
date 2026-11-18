@@ -6,7 +6,7 @@
 
 **Scope:** core — rust-bitcoin `bip32` + rust-bip39 / bitcoinjs `bip39`+`bip32` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (242/265, 23 eq) · src e0c2556ae09891de
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BIP32_FUZZ; derive at 1/2 of it) · ct 2026-09-16 (ctgrind)
 
@@ -89,6 +89,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   BIP-32-documented invalid-child case (`IL >= n` — caught by
   `k256.Secp256k1.scalar`'s canonical check on `add`/`rejectNonCanonical` —
   or the resulting scalar/point being zero/identity) as `error.InvalidChildKey`.
+  A parent at depth 255 (the depth field is one byte) yields
+  `error.MaximumDepthExceeded` from `ckdPriv`, `ckdPrivWithParentPub`, `ckdPub` and
+  `derivePath` (a path crossing 255 fails as a whole, `out` untouched) — the
+  behaviour of rust-bitcoin (`MaximumDepthExceeded`), bitcoinjs (`Depth too large!`)
+  and btcd (`ErrDeriveBeyondMaxDepth`); before 2026-11-17 the depth wrapped to 0.
   **One deliberate over-conservative deviation**: `IL ≡ 0 (mod n)` on the
   public-derivation path is treated as an `InvalidChildKey` rejection
   (because `combMulBase` errors on a zero scalar), whereas a strict reading
@@ -308,6 +313,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - A positive control (`bip39.zig`) tampers a mnemonic's checksum-carrying
   word and asserts `error.InvalidChecksum`, proving the checksum check has
   teeth rather than silently accepting any wordlist-valid phrase.
+
+### Audit 2026-11-17 (whole-module mutation)
+
+Mutants: 265 over `bip32.zig` and `bip39.zig` non-test code (BIP-32 derivation, serialization and parsing, `scalarInRange`, `parsePath`, BIP-39 encode/decode/checksum/seed, `wordIndex`, wipes, burns), schemata build in ReleaseSafe, one run per mutant. First pass: 203 of 263 killed, 60 survivors. **Finding (fixed, behaviour change):** `ckdPriv`/`ckdPub` wrapped the depth at 255 (`+%`) to a child with depth 0 and a non-zero parent fingerprint, which the module's own `parseExtended` refuses; rust-bitcoin, bitcoinjs and btcd all refuse the derivation, so it is now `error.MaximumDepthExceeded`. New tests: `deinit` wipes, every `isMaster` field, exact error codes of each malformed xprv header and of the `*FromIL` seams, `parsePath` roots/digits/leading zeros/`out`-length and `max_path_depth` limits, exact-fit buffers of `entropyToMnemonic`/`mnemonicToEntropy`, every single checksum bit for all five entropy lengths, a 256-byte passphrase, depth 254 to 255 round trip and refusal from 255. Final: **242 killed, 23 equivalent** (265). Equivalent: `checkEncodeSecret`/`checkDecodeSecret` against the variable-time forms (same output, constant-time only, ctgrind-covered); an empty path segment and a char below `'0'` (`std.fmt.parseUnsigned` refuses both with the same error); the word-loop bound `total_bits` and the checksum byte divisor in `readBits11` (same loop count and same byte for all five lengths). 16 are UNOBSERVABLE wipes and burns of dead stack (`masterFromSeed`, `ckdPriv`, `serializePriv`, `parseExtended`, `derivePath`, `validateMnemonic`, `mnemonicToSeed`, both `burnStack`): only `stackprobe_test.zig` sees them and it runs in ReleaseFast, where the schemata switch makes the baseline itself red (the `mut()` read inside `neuter`'s frame leaves the chain code). Their guard is that probe, run on the unmutated source.
 
 ## Anchoring
 

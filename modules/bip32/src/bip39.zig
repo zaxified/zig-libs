@@ -489,3 +489,68 @@ test "mnemonicToSeed rejects an over-long passphrase" {
     const too_long = @as([max_passphrase_len + 1]u8, @splat('x'));
     try testing.expectError(error.PassphraseTooLong, mnemonicToSeed("abandon", &too_long, &got));
 }
+
+// ── whole-module mutation tests (2026-11-17) ─────────────────────────────
+
+test "mutation: entropyToMnemonic fits exactly or reports BufferTooSmall at every size" {
+    inline for (.{ 16, 20, 32 }) |n| {
+        const entropy = @as([n]u8, @splat(0x5a));
+        var big: [max_mnemonic_len]u8 = undefined;
+        const full = try entropyToMnemonic(&entropy, &big);
+        var buf: [max_mnemonic_len]u8 = undefined;
+        for (0..full.len) |size| {
+            try testing.expectError(error.BufferTooSmall, entropyToMnemonic(&entropy, buf[0..size]));
+        }
+        const exact = try entropyToMnemonic(&entropy, buf[0..full.len]);
+        try testing.expectEqualStrings(full, exact);
+    }
+}
+
+test "mutation: mnemonicToEntropy needs exactly the entropy length in out" {
+    const mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    var out: [16]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, mnemonicToEntropy(mnemonic, out[0..15]));
+    try testing.expectError(error.BufferTooSmall, mnemonicToEntropy(mnemonic, out[0..0]));
+    try testing.expectEqual(@as(usize, 16), (try mnemonicToEntropy(mnemonic, &out)).len);
+}
+
+test "mutation: every single checksum bit is checked, for every entropy length" {
+    inline for (.{ 16, 20, 24, 28, 32 }) |n| {
+        const entropy = @as([n]u8, @splat(0x5a));
+        var text: [max_mnemonic_len]u8 = undefined;
+        const m = try entropyToMnemonic(&entropy, &text);
+        var out: [max_entropy_bytes]u8 = undefined;
+        try validateMnemonic(m);
+
+        var idxs: [max_words]u11 = undefined;
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, m, ' ');
+        while (it.next()) |w| : (count += 1) idxs[count] = wordIndex(w).?;
+        const cs_bits = n * 8 / 32;
+        for (0..cs_bits) |k| {
+            var flipped = idxs;
+            flipped[count - 1] ^= @as(u11, 1) << @intCast(k);
+            var buf: [max_mnemonic_len]u8 = undefined;
+            var len: usize = 0;
+            for (flipped[0..count], 0..) |ix, i| {
+                if (i != 0) {
+                    buf[len] = ' ';
+                    len += 1;
+                }
+                const w = wordlist.english[ix];
+                @memcpy(buf[len..][0..w.len], w);
+                len += w.len;
+            }
+            try testing.expectError(error.InvalidChecksum, mnemonicToEntropy(buf[0..len], &out));
+        }
+    }
+}
+
+test "mutation: a passphrase of exactly max_passphrase_len is accepted" {
+    var got: [64]u8 = undefined;
+    const pass = @as([max_passphrase_len]u8, @splat('p'));
+    try mnemonicToSeed("abandon", &pass, &got);
+    var want: [64]u8 = undefined;
+    try std.crypto.pwhash.pbkdf2(&want, "abandon", "mnemonic" ++ pass, 2048, std.crypto.auth.hmac.sha2.HmacSha512);
+    try testing.expectEqualSlices(u8, &want, &got);
+}
