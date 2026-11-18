@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-28** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep (and the speed work's memo): the sweep's independent review plus 28 mutants over the changed code, run against the whole test suite; 21 killed, 7 equivalent (the memo's guarded flag — cost only; u32 ceilings that need a > 4 GiB buffer; saturating counts capped long before they saturate). New tests: the policy work budget pinned to the exact cost of a path that reaches every scan (so dropping or re-pricing one charge moves it), `verifySignedBy` with an issuer std cannot read, an unreadable anchor past the full parse memo. Cumulative 121/133, 12 eq. Card A1 again.
 
