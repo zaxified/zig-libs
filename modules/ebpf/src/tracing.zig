@@ -945,3 +945,129 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+
+test "targetName: length ceilings count the prefix, and the caller's buffer" {
+    var buf: [200]u8 = undefined;
+    var name: [120]u8 = undefined;
+    @memset(&name, 'f');
+    try testing.expectEqual(@as(usize, 112), (try targetName(.fentry, name[0..112], &buf)).len);
+    try testing.expectError(error.InvalidName, targetName(.fentry, name[0..113], &buf));
+    // btf_trace_ (10) + 102 = 112 fits, + 103 does not
+    try testing.expectEqual(@as(usize, 112), (try targetName(.tp_btf, name[0..102], &buf)).len);
+    try testing.expectError(error.InvalidName, targetName(.tp_btf, name[0..103], &buf));
+    // the output buffer: an exact fit works, one byte short is refused
+    var small: [5]u8 = undefined;
+    try testing.expectEqualStrings("fffff", try targetName(.fentry, name[0..5], &small));
+    try testing.expectError(error.InvalidName, targetName(.fentry, name[0..6], &small));
+    var tiny: [12]u8 = undefined;
+    try testing.expectEqualStrings("bpf_lsm_ab", try targetName(.lsm, "ab", &tiny));
+    try testing.expectError(error.InvalidName, targetName(.lsm, "abc", &small));
+    try testing.expectError(error.InvalidName, targetName(.fentry, "a/b", &buf));
+    try testing.expectError(error.InvalidName, targetName(.fentry, "a\x00b", &buf));
+    try testing.expectError(error.InvalidName, targetName(.fentry, "", &buf));
+    // the name lands after the prefix
+    try testing.expectEqualStrings("btf_trace_sched", try targetName(.tp_btf, "sched", &buf));
+    try testing.expectEqualStrings("bpf_iter_task", try targetName(.iter, "task", &buf));
+}
+
+test "resolveAttachId: prefix and BTF kind both matter" {
+    const gpa = testing.allocator;
+    var bld = btf.Builder.init(gpa);
+    defer bld.deinit();
+    const int_id = try bld.addInt("int", 4, 32, 1);
+    const proto = try bld.addFuncProto(0, &.{});
+    const f_id = try bld.addFunc("foo", proto, .global);
+    const td_id = try bld.addTypedef("btf_trace_foo", int_id);
+    const lsm_id = try bld.addFunc("bpf_lsm_foo", proto, .global);
+    const bytes = try bld.finish();
+    defer gpa.free(bytes);
+    var b = try btf.parse(gpa, bytes, .{});
+    defer b.deinit();
+    try testing.expectEqual(f_id, try resolveAttachId(&b, .fentry, "foo"));
+    try testing.expectEqual(f_id, try resolveAttachId(&b, .fexit, "foo"));
+    try testing.expectEqual(td_id, try resolveAttachId(&b, .tp_btf, "foo"));
+    try testing.expectEqual(lsm_id, try resolveAttachId(&b, .lsm, "foo"));
+    // `foo` as a typedef is not an fentry target, and `btf_trace_foo` is not a bare func name
+    try testing.expectError(error.AttachTargetNotFound, resolveAttachId(&b, .fentry, "btf_trace_foo"));
+    try testing.expectError(error.AttachTargetNotFound, resolveAttachId(&b, .iter, "foo"));
+    try testing.expectError(error.AttachTargetNotFound, resolveAttachId(&b, .tp_btf, "bpf_lsm_foo"));
+}
+
+test "attachExt and loadProgram: local argument checks" {
+    try testing.expectError(error.InvalidTarget, attachExt(5, 0, 7, 0));
+    try testing.expectError(error.InvalidTarget, attachExt(5, 9, 0, 0));
+    const insns = [_]Insn{.{ .code = 0xb7, .dst = 0, .src = 0, .off = 0, .imm = 0 }};
+    var lic: [64]u8 = undefined;
+    @memset(&lic, 'G');
+    try testing.expectError(error.InvalidArgumentLocal, loadProgram(.socket_filter, &insns, .{ .license = lic[0..64] }));
+    try testing.expectError(error.InvalidArgumentLocal, loadProgram(.socket_filter, &insns, .{ .license = "GP\x00L" }));
+    if (loadProgram(.socket_filter, &insns, .{ .license = lic[0..63] })) |fd| {
+        _ = linux.close(fd);
+    } else |e| try testing.expect(e != error.InvalidArgumentLocal);
+    if (linux.geteuid() != 0) {
+        // a preset attach id is used as is (no kernel BTF lookup): the failure is the syscall's
+        try testing.expectError(error.PermissionDenied, loadTracing(testing.allocator, .fentry, "zl_no_such_function_xyz", &insns, .{ .attach_btf_id = 5 }));
+        // id 0 triggers the lookup, which cannot find that name
+        try testing.expectError(error.AttachTargetNotFound, loadTracing(testing.allocator, .fentry, "zl_no_such_function_xyz", &insns, .{}));
+    }
+    var lt: LoadedTracing = .{ .fd = devNull(), .attach_btf_id = 1, .kind = .fentry };
+    const fd = lt.fd;
+    lt.close();
+    try testing.expectEqual(@as(linux.fd_t, -1), lt.fd);
+    try testing.expect(linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) != .SUCCESS);
+    lt.close();
+}
+
+fn devNull() linux.fd_t {
+    return @intCast(linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0));
+}
+
+test "buildProgLoadAttr: every option reaches its field" {
+    const insns = [_]Insn{.{ .code = 0x95, .dst = 0, .src = 0, .off = 0, .imm = 0 }};
+    var lic = [_:0]u8{ 'G', 'P', 'L' };
+    var log: [32]u8 = undefined;
+    const fi = [_]btfext.FuncInfo{.{ .insn_off = 0, .type_id = 3 }};
+    const li = [_]btfext.LineInfo{.{ .insn_off = 0, .file_name_off = 1, .line_off = 2, .line_col = 3 }};
+    const a = try buildProgLoadAttr(.kprobe, &insns, &lic, .{
+        .kern_version = 0x050a0c,
+        .prog_flags = 0x10,
+        .expected_attach_type = .trace_fentry,
+        .attach_btf_id = 77,
+        .attach_btf_obj_fd = 9,
+        .prog_btf_fd = 4,
+        .prog_name = "123456789012345", // 15 chars: the longest the kernel takes
+        .func_info = &fi,
+        .line_info = &li,
+        .log = &log,
+        .log_level = 0,
+    });
+    try testing.expectEqual(@as(u32, 0x050a0c), a.kern_version);
+    try testing.expectEqual(@as(u32, 0x10), a.prog_flags);
+    try testing.expectEqual(@as(u32, 77), a.attach_btf_id);
+    try testing.expectEqual(@as(u32, 9), a.attach_btf_obj_fd);
+    try testing.expectEqual(@as(i32, 4), a.prog_btf_fd);
+    try testing.expectEqual(@as(u32, @backingInt(BPF.AttachType.trace_fentry)), a.expected_attach_type);
+    try testing.expectEqual(@as(u64, @intFromPtr(&log)), a.log_buf);
+    try testing.expectEqual(@as(u32, 32), a.log_size);
+    try testing.expectEqual(@as(u32, 1), a.log_level); // 0 means "the default level"
+    try testing.expectEqualStrings("123456789012345", a.prog_name[0..15]);
+    try testing.expectEqual(@as(u8, 0), a.prog_name[15]);
+    try testing.expectEqual(@as(u32, 1), a.func_info_cnt);
+    try testing.expectEqual(@as(u32, @sizeOf(btfext.FuncInfo)), a.func_info_rec_size);
+    try testing.expectEqual(@as(u64, @intFromPtr(&fi)), a.func_info);
+    try testing.expectEqual(@as(u32, 1), a.line_info_cnt);
+    try testing.expectEqual(@as(u32, @sizeOf(btfext.LineInfo)), a.line_info_rec_size);
+    try testing.expectEqual(@as(u64, @intFromPtr(&li)), a.line_info);
+    const b = try buildProgLoadAttr(.kprobe, &insns, &lic, .{ .log = &log, .log_level = 2 });
+    try testing.expectEqual(@as(u32, 2), b.log_level);
+    try testing.expectError(error.InvalidArgumentLocal, buildProgLoadAttr(.kprobe, &insns, &lic, .{ .prog_name = "1234567890123456" }));
+    // line info alone also needs a BTF fd
+    try testing.expectError(error.MissingProgBtf, buildProgLoadAttr(.kprobe, &insns, &lic, .{ .line_info = &li }));
+    try testing.expectError(error.MissingProgBtf, buildProgLoadAttr(.kprobe, &insns, &lic, .{ .func_info = &fi }));
+    // a single-element info array counts
+    const c = try buildProgLoadAttr(.kprobe, &insns, &lic, .{ .prog_btf_fd = 1, .func_info = &fi });
+    try testing.expectEqual(@as(u32, 1), c.func_info_cnt);
+    try testing.expectEqual(@as(u32, 0), c.line_info_cnt);
+}

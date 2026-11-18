@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** Whole-module mutation audit (SPEC "Audit 2026-11-18"): about 55 killing tests across `elfsym`, `object`, `btf`, `btfext`, `ringbuf`, `perfbuf`, `programs`, `tracing`, `bpflink` and `attach`, plus a test-only hand-assembled ELF builder. Test support: `btf.RawBtf` and its `K_*` kind constants are `pub` (no test-only namespace pattern exists in the repo) so the sibling test files can build hostile BTF; they are not re-exported from `root.zig` and nothing else outside test code changed. 1096 of 1233 mutants killed, 137 equivalent or unobservable without `CAP_BPF`.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.

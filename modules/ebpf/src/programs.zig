@@ -790,3 +790,47 @@ test "Program/Options structs have the shape the load/attach layers expect" {
     const ro: RingbufEmitOptions = .{ .ringbuf_map_fd = 3, .record_size = 16 };
     try testing.expectEqual(@as(u32, 16), ro.record_size);
 }
+
+// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+
+test "xdpFilter: the instruction budget and the offset ceiling are exact" {
+    // 15 fixed + 2 per key byte must fit the 64-slot buffer: 24 bytes do, 25 do not
+    const ok = try xdpFilter(.{ .block_map_fd = 3, .key_offset = 0, .key_size = 24 });
+    try testing.expectEqual(@as(usize, 15 + 48), ok.len);
+    try testing.expectError(error.KeyTooLarge, xdpFilter(.{ .block_map_fd = 3, .key_offset = 0, .key_size = 25 }));
+    try testing.expectError(error.KeyTooLarge, xdpFilter(.{ .block_map_fd = 3, .key_offset = 0, .key_size = 65535 }));
+    // offset + size may reach maxInt(i16) exactly, not beyond
+    _ = try xdpFilter(.{ .block_map_fd = 3, .key_offset = 32766, .key_size = 1 });
+    try testing.expectError(error.KeyOffsetTooLarge, xdpFilter(.{ .block_map_fd = 3, .key_offset = 32767, .key_size = 1 }));
+    try testing.expectError(error.KeyOffsetTooLarge, xdpFilter(.{ .block_map_fd = 3, .key_offset = 65535, .key_size = 1 }));
+}
+
+test "ringbufEmit: the instruction budget counts the byte tail; tails are stored bytewise" {
+    // 11 fixed + record_size/8 + record_size%8 must fit 128 slots
+    const full = try ringbufEmit(.{ .ringbuf_map_fd = 3, .record_size = 936 });
+    try testing.expectEqual(@as(usize, 128), full.len);
+    try testing.expectError(error.RecordTooLarge, ringbufEmit(.{ .ringbuf_map_fd = 3, .record_size = 944 }));
+    try testing.expectError(error.RecordTooLarge, ringbufEmit(.{ .ringbuf_map_fd = 3, .record_size = 895 }));
+    // a 7-byte record is seven BYTE stores (not one double word)
+    const seven = try ringbufEmit(.{ .ringbuf_map_fd = 3, .record_size = 7 });
+    try testing.expectEqual(@as(usize, 11 + 7), seven.len);
+    var bytes: usize = 0;
+    for (seven) |i| {
+        if (i.code == 0x72) bytes += 1; // ST | MEM | B
+        try testing.expect(i.code != 0x7a); // no ST | MEM | DW
+    }
+    try testing.expectEqual(@as(usize, 7), bytes);
+    // 16 bytes: exactly two double-word stores at 0 and 8, zero value
+    const sixteen = try ringbufEmit(.{ .ringbuf_map_fd = 3, .record_size = 16 });
+    try testing.expectEqual(@as(usize, 11 + 2), sixteen.len);
+    try testing.expectEqual(@as(u8, 0x7a), sixteen[6].code);
+    try testing.expectEqual(@as(i16, 0), sixteen[6].off);
+    try testing.expectEqual(@as(i16, 8), sixteen[7].off);
+    try testing.expectEqual(@as(i32, 0), sixteen[7].imm);
+    // 9 bytes: one double word then one byte store of zero
+    const nine = try ringbufEmit(.{ .ringbuf_map_fd = 3, .record_size = 9 });
+    try testing.expectEqual(@as(u8, 0x7a), nine[6].code);
+    try testing.expectEqual(@as(u8, 0x72), nine[7].code);
+    try testing.expectEqual(@as(i16, 8), nine[7].off);
+    try testing.expectEqual(@as(i32, 0), nine[7].imm);
+}

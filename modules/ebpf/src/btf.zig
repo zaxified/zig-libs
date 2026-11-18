@@ -2493,3 +2493,778 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-18): hand-assembled blobs ────────────────
+
+/// (`pub` only so the sibling `btfext.zig` tests can build hostile blobs; test-only, unreferenced otherwise.)
+/// A raw BTF assembler for the boundary tests: records are written exactly as
+/// given (no kind-specific validation), so a test can build what `Builder`
+/// never would — a `DATASEC`, an `ENUM64`, a `FWD`, a bad reference.
+pub const RawBtf = struct {
+    types: std.ArrayList(u8) = .empty,
+    strs: std.ArrayList(u8) = .empty,
+    count: u32 = 0,
+
+    pub fn init(gpa: std.mem.Allocator) !RawBtf {
+        var r: RawBtf = .{};
+        try r.strs.append(gpa, 0);
+        return r;
+    }
+    pub fn deinit(self: *RawBtf, gpa: std.mem.Allocator) void {
+        self.types.deinit(gpa);
+        self.strs.deinit(gpa);
+    }
+    pub fn str(self: *RawBtf, gpa: std.mem.Allocator, s: []const u8) !u32 {
+        const off: u32 = @intCast(self.strs.items.len);
+        try self.strs.appendSlice(gpa, s);
+        try self.strs.append(gpa, 0);
+        return off;
+    }
+    pub fn w32(self: *RawBtf, gpa: std.mem.Allocator, v: u32) !void {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, native_endian);
+        try self.types.appendSlice(gpa, &b);
+    }
+    /// One record; `extra` are the trailing u32 words. Returns the type id.
+    pub fn rec(self: *RawBtf, gpa: std.mem.Allocator, name_off: u32, kind: u5, vlen: u16, kflag: bool, size_type: u32, extra: []const u32) !u32 {
+        try self.w32(gpa, name_off);
+        try self.w32(gpa, @as(u32, vlen) | (@as(u32, kind) << 24) | (@as(u32, @intFromBool(kflag)) << 31));
+        try self.w32(gpa, size_type);
+        for (extra) |e| try self.w32(gpa, e);
+        self.count += 1;
+        return self.count;
+    }
+    /// Serialise with the strings last (as `Builder` does).
+    pub fn finish(self: *RawBtf, gpa: std.mem.Allocator) ![]u8 {
+        const total = header_size + self.types.items.len + self.strs.items.len;
+        const out = try gpa.alloc(u8, total);
+        @memset(out[0..header_size], 0);
+        std.mem.writeInt(u16, out[0..2], magic, native_endian);
+        out[2] = version;
+        std.mem.writeInt(u32, out[4..8], header_size, native_endian);
+        std.mem.writeInt(u32, out[12..16], @intCast(self.types.items.len), native_endian);
+        std.mem.writeInt(u32, out[16..20], @intCast(self.types.items.len), native_endian);
+        std.mem.writeInt(u32, out[20..24], @intCast(self.strs.items.len), native_endian);
+        @memcpy(out[header_size..][0..self.types.items.len], self.types.items);
+        @memcpy(out[header_size + self.types.items.len ..][0..self.strs.items.len], self.strs.items);
+        return out;
+    }
+};
+
+pub const K_INT: u5 = 1;
+pub const K_PTR: u5 = 2;
+pub const K_ARRAY: u5 = 3;
+pub const K_STRUCT: u5 = 4;
+pub const K_UNION: u5 = 5;
+pub const K_ENUM: u5 = 6;
+pub const K_FWD: u5 = 7;
+pub const K_TYPEDEF: u5 = 8;
+pub const K_FUNC: u5 = 12;
+pub const K_FUNC_PROTO: u5 = 13;
+pub const K_VAR: u5 = 14;
+pub const K_DATASEC: u5 = 15;
+pub const K_DECL_TAG: u5 = 17;
+pub const K_ENUM64: u5 = 19;
+
+fn mkType(kind: Kind, size_type: u32, extra: []const u8, vlen: u16, kflag: bool) Type {
+    return .{ .id = 1, .name_off = 0, .kind = kind, .vlen = vlen, .kind_flag = kflag, .size_type = size_type, .extra = extra };
+}
+
+test "Type / IntInfo predicates cover every kind and bit" {
+    try testing.expect(mkType(.float, 4, &.{}, 0, false).hasSize());
+    try testing.expect(mkType(.enum64, 8, &.{}, 0, false).hasSize());
+    try testing.expect(!mkType(.ptr, 0, &.{}, 0, false).hasSize());
+    try testing.expect(mkType(.fwd, 0, &.{}, 0, false).hasRef());
+    try testing.expect(mkType(.decl_tag, 0, &.{}, 0, false).hasRef());
+    try testing.expect(mkType(.type_tag, 0, &.{}, 0, false).hasRef());
+    try testing.expect(!mkType(.int, 0, &.{}, 0, false).hasRef());
+    try testing.expectEqual(@as(?u32, null), mkType(.ptr, 5, &.{}, 0, false).byteSize());
+    try testing.expectEqual(@as(?u32, 5), mkType(.int, 5, &.{}, 0, false).byteSize());
+    try testing.expectEqual(@as(?u32, 5), mkType(.ptr, 5, &.{}, 0, false).refType());
+    try testing.expectEqual(@as(?u32, null), mkType(.int, 5, &.{}, 0, false).refType());
+    try testing.expectEqual(@as(?FuncLinkage, FuncLinkage.global), mkType(.func, 0, &.{}, 1, false).funcLinkage());
+    try testing.expectEqual(@as(?FuncLinkage, null), mkType(.ptr, 0, &.{}, 1, false).funcLinkage());
+    for ([_]Kind{ .typedef, .@"volatile", .@"const", .restrict, .type_tag }) |k| {
+        try testing.expect(mkType(k, 0, &.{}, 0, false).isModifier());
+    }
+    for ([_]Kind{ .ptr, .int, .@"struct", .array }) |k| {
+        try testing.expect(!mkType(k, 0, &.{}, 0, false).isModifier());
+    }
+    try testing.expect(mkType(.@"struct", 0, &.{}, 0, false).isComposite());
+    try testing.expect(mkType(.@"union", 0, &.{}, 0, false).isComposite());
+    try testing.expect(!mkType(.int, 0, &.{}, 0, false).isComposite());
+    const only_signed: IntInfo = .{ .bits = 8, .offset = 0, .encoding = 0b001 };
+    try testing.expect(only_signed.isSigned() and !only_signed.isChar() and !only_signed.isBool());
+    const only_char: IntInfo = .{ .bits = 8, .offset = 0, .encoding = 0b010 };
+    try testing.expect(!only_char.isSigned() and only_char.isChar() and !only_char.isBool());
+    const only_bool: IntInfo = .{ .bits = 8, .offset = 0, .encoding = 0b100 };
+    try testing.expect(!only_bool.isSigned() and !only_bool.isChar() and only_bool.isBool());
+    const f: Field = .{ .bit_offset = 77, .type_id = 1, .bitfield_size = 0, .index = 0, .parent_type_id = 1 };
+    try testing.expectEqual(@as(u64, 9), f.byteOffset());
+}
+
+test "Btf: ids, strings and split bases at their exact edges" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_a = try r.str(gpa, "alpha");
+    _ = try r.rec(gpa, n_a, K_INT, 0, false, 4, &.{(0x0f << 24) | (0x12 << 16) | 32});
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    r.strs.items.len = r.strs.items.len; // keep r alive for strings
+    var b = try parse(gpa, bytes, .{});
+    defer b.deinit();
+
+    try testing.expectError(error.TypeIdOutOfRange, b.byId(0));
+    try testing.expectError(error.TypeIdOutOfRange, b.byId(2));
+    try testing.expect(!b.validId(0));
+    try testing.expect(b.validId(1));
+    try testing.expect(!b.validId(2));
+    try testing.expectEqual(@as(u32, 1), b.typeCount());
+    try testing.expectEqual(@as(u32, 2), b.endId());
+    try testing.expect(!b.isSplit());
+    // intInfo: every field from its own shift/mask
+    const ii = try b.intInfo(try b.byId(1));
+    try testing.expectEqual(@as(u8, 32), ii.bits);
+    try testing.expectEqual(@as(u8, 0x12), ii.offset);
+    try testing.expectEqual(@as(u4, 0xf), ii.encoding);
+    // strings: empty at 0, last byte exact, one past end is null
+    try testing.expectEqualStrings("", b.str(0).?);
+    try testing.expectEqualStrings("alpha", b.str(n_a).?);
+    try testing.expectEqual(@as(?[]const u8, null), b.str(@intCast(b.strings.len)));
+    try testing.expectEqual(@as(?[]const u8, null), b.str(@intCast(b.strings.len + 5)));
+    try testing.expectEqualStrings("lpha", b.str(n_a + 1).?);
+    // an unterminated tail reads as "no string"
+    var cut = b;
+    cut.strings = b.strings[0 .. b.strings.len - 1];
+    try testing.expectEqual(@as(?[]const u8, null), cut.str(n_a));
+    // an id/offset below start_* with no base is simply out of range
+    var shifted = b;
+    shifted.start_id = 5;
+    shifted.start_str_off = 5;
+    try testing.expect(!shifted.validId(3));
+    try testing.expectError(error.TypeIdOutOfRange, shifted.byId(3));
+    try testing.expectEqual(@as(?[]const u8, null), shifted.str(2));
+    // typeName: anonymous (offset 0) and bad offset both read as null
+    try testing.expectEqualStrings("alpha", b.typeName(1).?);
+    // decode failures after parse (truncated record area) are typed
+    var trunc = b;
+    trunc.types = b.types[0..5];
+    try testing.expectError(error.TypeIdOutOfRange, trunc.byId(1));
+    trunc.types = b.types[0..14]; // header present, INT's extra word cut short
+    try testing.expectError(error.TypeIdOutOfRange, trunc.byId(1));
+    trunc.types = b.types[0..16];
+    _ = try trunc.byId(1);
+    trunc.types = b.types[0..12];
+    try testing.expectError(error.TypeIdOutOfRange, trunc.byId(1));
+}
+
+test "parse: header and section boundaries" {
+    const gpa = testing.allocator;
+    const wr = std.mem.writeInt;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    _ = try r.rec(gpa, 0, K_PTR, 0, false, 0, &.{});
+    const good = try r.finish(gpa);
+    defer gpa.free(good);
+
+    // exactly 8 bytes with a good magic: malformed, not "not BTF"
+    try testing.expectError(error.MalformedBtf, parse(gpa, good[0..8], .{}));
+    try testing.expectError(error.NotBtf, parse(gpa, good[0..7], .{}));
+    // hdr_len < 24, > len
+    {
+        const b = try gpa.dupe(u8, good);
+        defer gpa.free(b);
+        wr(u32, b[4..8], 20, native_endian);
+        try testing.expectError(error.MalformedBtf, parse(gpa, b, .{}));
+        wr(u32, b[4..8], @intCast(b.len + 1), native_endian);
+        try testing.expectError(error.MalformedBtf, parse(gpa, b, .{}));
+        wr(u32, b[4..8], header_size, native_endian);
+        // flags survive
+        b[3] = 0x5a;
+        var p = try parse(gpa, b, .{});
+        defer p.deinit();
+        try testing.expectEqual(@as(u8, 0x5a), p.hdr.flags);
+        // type_off must be 4-aligned
+        wr(u32, b[8..12], 2, native_endian);
+        try testing.expectError(error.MalformedBtf, parse(gpa, b, .{}));
+        wr(u32, b[8..12], 0, native_endian);
+        // a type section whose last record is cut: header needs 12 bytes
+        wr(u32, b[12..16], 8, native_endian);
+        try testing.expectError(error.MalformedBtf, parse(gpa, b, .{}));
+    }
+    // a BASE blob needs a non-empty, NUL-led, NUL-terminated string section
+    {
+        var q = try RawBtf.init(gpa);
+        defer q.deinit(gpa);
+        const bytes = try q.finish(gpa);
+        defer gpa.free(bytes);
+        var ok = try parse(gpa, bytes, .{});
+        ok.deinit();
+        wr(u32, bytes[20..24], 0, native_endian);
+        try testing.expectError(error.MalformedBtf, parse(gpa, bytes, .{}));
+        wr(u32, bytes[20..24], 1, native_endian);
+        bytes[header_size] = 'x';
+        try testing.expectError(error.SplitBtfNeedsBase, parse(gpa, bytes, .{}));
+    }
+    // the type section may end exactly at EOF (strings placed first)
+    {
+        const b = try gpa.alloc(u8, header_size + 4 + 12);
+        defer gpa.free(b);
+        @memset(b, 0);
+        wr(u16, b[0..2], magic, native_endian);
+        b[2] = version;
+        wr(u32, b[4..8], header_size, native_endian);
+        wr(u32, b[8..12], 4, native_endian); // type_off
+        wr(u32, b[12..16], 12, native_endian); // type_len
+        wr(u32, b[16..20], 0, native_endian); // str_off
+        wr(u32, b[20..24], 4, native_endian); // str_len
+        wr(u32, b[header_size + 4 + 4 ..][0..4], @as(u32, K_PTR) << 24, native_endian);
+        var p = try parse(gpa, b, .{});
+        defer p.deinit();
+        try testing.expectEqual(@as(u32, 1), p.typeCount());
+        // a section one byte past the blob is refused
+        wr(u32, b[12..16], 13, native_endian);
+        try testing.expectError(error.MalformedBtf, parse(gpa, b, .{}));
+        wr(u32, b[12..16], 12, native_endian);
+        wr(u32, b[20..24], 17, native_endian);
+        try testing.expectError(error.MalformedBtf, parse(gpa, b, .{}));
+    }
+    // vlen uses all 16 bits: a FUNC_PROTO with 0x1000 params
+    {
+        var q = try RawBtf.init(gpa);
+        defer q.deinit(gpa);
+        _ = try q.rec(gpa, 0, K_FUNC_PROTO, 0x1000, false, 0, &@as([0x2000]u32, @splat(0)));
+        const bytes = try q.finish(gpa);
+        defer gpa.free(bytes);
+        var p = try parse(gpa, bytes, .{});
+        defer p.deinit();
+        try testing.expectEqual(@as(u32, 1), p.typeCount());
+    }
+    // bit 30 of the info word is not the kind_flag (bit 31 is)
+    {
+        var q = try RawBtf.init(gpa);
+        defer q.deinit(gpa);
+        _ = try q.rec(gpa, 0, K_STRUCT, 0, false, 4, &.{});
+        const bytes = try q.finish(gpa);
+        defer gpa.free(bytes);
+        wr(u32, bytes[header_size + 4 ..][0..4], (@as(u32, K_STRUCT) << 24) | (1 << 30), native_endian);
+        var p = try parse(gpa, bytes, .{});
+        defer p.deinit();
+        try testing.expect(!(try p.byId(1)).kind_flag);
+    }
+    // a kind above max_kind / kind 0
+    {
+        var q = try RawBtf.init(gpa);
+        defer q.deinit(gpa);
+        _ = try q.rec(gpa, 0, 0, 0, false, 0, &.{});
+        const b0 = try q.finish(gpa);
+        defer gpa.free(b0);
+        try testing.expectError(error.MalformedBtf, parse(gpa, b0, .{}));
+        wr(u32, b0[header_size + 4 ..][0..4], @as(u32, max_kind + 1) << 24, native_endian);
+        try testing.expectError(error.MalformedBtf, parse(gpa, b0, .{}));
+        wr(u32, b0[header_size + 4 ..][0..4], @as(u32, max_kind) << 24 | 0, native_endian);
+        // ENUM64 (the highest kind) with vlen 0 parses
+        var p = try parse(gpa, b0, .{});
+        p.deinit();
+    }
+}
+
+test "parse: max_type is inclusive and chained split bases keep their string offsets" {
+    const gpa = testing.allocator;
+    // 0xfffff pointer records fit, one more is TooManyTypes
+    {
+        const n: usize = max_type;
+        const b = try gpa.alloc(u8, header_size + (n + 1) * type_header_size + 1);
+        defer gpa.free(b);
+        @memset(b, 0);
+        std.mem.writeInt(u16, b[0..2], magic, native_endian);
+        b[2] = version;
+        std.mem.writeInt(u32, b[4..8], header_size, native_endian);
+        std.mem.writeInt(u32, b[12..16], @intCast(n * type_header_size), native_endian);
+        std.mem.writeInt(u32, b[16..20], @intCast(n * type_header_size), native_endian);
+        std.mem.writeInt(u32, b[20..24], 1, native_endian);
+        for (0..n + 1) |i| std.mem.writeInt(u32, b[header_size + i * 12 + 4 ..][0..4], @as(u32, K_PTR) << 24, native_endian);
+        var p = try parse(gpa, b, .{});
+        try testing.expectEqual(max_type, p.typeCount());
+        p.deinit();
+        // one more record
+        std.mem.writeInt(u32, b[12..16], @intCast((n + 1) * type_header_size), native_endian);
+        std.mem.writeInt(u32, b[16..20], @intCast((n + 1) * type_header_size), native_endian);
+        try testing.expectError(error.TooManyTypes, parse(gpa, b, .{}));
+    }
+    // base A ("\0a\0"), split B ("b\0"), split C ("c\0")
+    var ra = try RawBtf.init(gpa);
+    defer ra.deinit(gpa);
+    _ = try ra.str(gpa, "a");
+    _ = try ra.rec(gpa, 0, K_PTR, 0, false, 0, &.{});
+    const ba = try ra.finish(gpa);
+    defer gpa.free(ba);
+    var a = try parse(gpa, ba, .{});
+    defer a.deinit();
+    const mkSplit = struct {
+        fn f(g: std.mem.Allocator, s: []const u8, ty: []const u8) ![]u8 {
+            const out = try g.alloc(u8, header_size + ty.len + s.len);
+            @memset(out[0..header_size], 0);
+            std.mem.writeInt(u16, out[0..2], magic, native_endian);
+            out[2] = version;
+            std.mem.writeInt(u32, out[4..8], header_size, native_endian);
+            std.mem.writeInt(u32, out[12..16], @intCast(ty.len), native_endian);
+            std.mem.writeInt(u32, out[16..20], @intCast(ty.len), native_endian);
+            std.mem.writeInt(u32, out[20..24], @intCast(s.len), native_endian);
+            @memcpy(out[header_size..][0..ty.len], ty);
+            @memcpy(out[header_size + ty.len ..][0..s.len], s);
+            return out;
+        }
+    }.f;
+    var ptr_rec: [12]u8 = @splat(0);
+    std.mem.writeInt(u32, ptr_rec[4..8], @as(u32, K_PTR) << 24, native_endian);
+    // B: name_off 3 would be its first string ("b")
+    var b_rec = ptr_rec;
+    std.mem.writeInt(u32, b_rec[0..4], 3, native_endian);
+    const bb = try mkSplit(gpa, "b\x00", &b_rec);
+    defer gpa.free(bb);
+    var bsplit = try parse(gpa, bb, .{ .base = &a });
+    defer bsplit.deinit();
+    try testing.expectEqual(@as(u32, 3), bsplit.start_str_off);
+    try testing.expectEqual(@as(u32, 2), bsplit.start_id); // a has 1 type
+    try testing.expectEqualStrings("b", bsplit.str(3).?);
+    try testing.expectEqualStrings("a", bsplit.str(1).?);
+    try testing.expectEqualStrings("b", bsplit.typeName(2).?);
+    var c_rec = ptr_rec;
+    std.mem.writeInt(u32, c_rec[0..4], 5, native_endian);
+    const bc = try mkSplit(gpa, "c\x00", &c_rec);
+    defer gpa.free(bc);
+    var csplit = try parse(gpa, bc, .{ .base = &bsplit });
+    defer csplit.deinit();
+    try testing.expectEqual(@as(u32, 5), csplit.start_str_off);
+    try testing.expectEqualStrings("c", csplit.str(5).?);
+    try testing.expectEqualStrings("b", csplit.str(3).?);
+    try testing.expectEqualStrings("a", csplit.str(1).?);
+    try testing.expectEqual(@as(?[]const u8, null), csplit.str(7));
+    // a split blob with no strings and no types, exactly the header
+    const empty = try mkSplit(gpa, "", "");
+    defer gpa.free(empty);
+    var es = try parse(gpa, empty, .{ .base = &a });
+    defer es.deinit();
+    try testing.expectEqual(@as(u32, 0), es.typeCount());
+    // a split blob's strings must still be NUL terminated
+    const bad = try mkSplit(gpa, "xy", "");
+    defer gpa.free(bad);
+    try testing.expectError(error.MalformedBtf, parse(gpa, bad, .{ .base = &a }));
+    // an id below start_id resolves through the base
+    try testing.expectEqual(Kind.ptr, (try csplit.byId(1)).kind);
+    try testing.expect(csplit.validId(1));
+    try testing.expect(csplit.validId(2));
+    try testing.expectEqual(@as(u32, 2), csplit.findByNameKind("b", .ptr) orelse 1);
+}
+
+test "accessors: members, enums, params, datasec entries, decl tags" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_x = try r.str(gpa, "x");
+    const n_y = try r.str(gpa, "y");
+    const int4 = try r.rec(gpa, 0, K_INT, 0, false, 4, &.{32});
+    // 2: struct, no kflag: raw offset 0x12000034 is a plain bit offset
+    const s_plain = try r.rec(gpa, 0, K_STRUCT, 2, false, 16, &.{ n_x, int4, 0x12000034, n_y, int4, 64 });
+    // 3: struct with kflag: (size 5 << 24) | 0x00800001
+    const s_kflag = try r.rec(gpa, 0, K_STRUCT, 1, true, 16, &.{ n_x, int4, (5 << 24) | 0x00800001 });
+    // 4: enum unsigned / 5: enum signed, one value 0xffffffff
+    const e_u = try r.rec(gpa, 0, K_ENUM, 2, false, 4, &.{ n_x, 0xffffffff, n_y, 7 });
+    const e_s = try r.rec(gpa, 0, K_ENUM, 1, true, 4, &.{ n_x, 0xffffffff });
+    // 6: enum64 with two values, second = 0x1_0000_0002
+    const e64 = try r.rec(gpa, 0, K_ENUM64, 2, false, 8, &.{ n_x, 1, 0, n_y, 2, 1 });
+    const e64s = try r.rec(gpa, 0, K_ENUM64, 1, true, 8, &.{ n_x, 0xffffffff, 0xffffffff });
+    const proto = try r.rec(gpa, 0, K_FUNC_PROTO, 2, false, 0, &.{ n_x, int4, 0, 0 });
+    const vr = try r.rec(gpa, n_x, K_VAR, 0, false, int4, &.{1});
+    const ds = try r.rec(gpa, 0, K_DATASEC, 2, false, 8, &.{ vr, 4, 8, vr, 12, 16 });
+    const tag = try r.rec(gpa, 0, K_DECL_TAG, 0, false, int4, &.{0xffffffff});
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var b = try parse(gpa, bytes, .{});
+    defer b.deinit();
+
+    // member: plain
+    const t_plain = try b.byId(s_plain);
+    const m0 = try b.member(t_plain, 0);
+    try testing.expectEqual(@as(u32, 0x12000034), m0.bit_offset);
+    try testing.expectEqual(@as(u8, 0), m0.bitfield_size);
+    try testing.expectEqual(n_x, m0.name_off);
+    try testing.expectEqual(int4, m0.type_id);
+    const m1 = try b.member(t_plain, 1);
+    try testing.expectEqual(@as(u32, 64), m1.bit_offset);
+    try testing.expectEqual(n_y, m1.name_off);
+    try testing.expectError(error.WrongKind, b.member(t_plain, 2));
+    try testing.expectError(error.WrongKind, b.member(try b.byId(int4), 0));
+    // member: kflag
+    const mk = try b.member(try b.byId(s_kflag), 0);
+    try testing.expectEqual(@as(u32, 0x00800001), mk.bit_offset);
+    try testing.expectEqual(@as(u8, 5), mk.bitfield_size);
+    try testing.expectEqual((5 << 24) | 0x00800001, mk.raw_offset);
+    // enum
+    const tu = try b.byId(e_u);
+    try testing.expectEqual(@as(i64, 4294967295), (try b.enumValue(tu, 0)).value);
+    try testing.expectEqual(@as(i64, 7), (try b.enumValue(tu, 1)).value);
+    try testing.expectEqual(n_y, (try b.enumValue(tu, 1)).name_off);
+    try testing.expectError(error.WrongKind, b.enumValue(tu, 2));
+    try testing.expectEqual(@as(i64, -1), (try b.enumValue(try b.byId(e_s), 0)).value);
+    try testing.expectError(error.WrongKind, b.enumValue(try b.byId(int4), 0));
+    // enum64: stride 12, halves in order, signed flag irrelevant to bits
+    const t64 = try b.byId(e64);
+    try testing.expectEqual(@as(i64, 1), (try b.enumValue(t64, 0)).value);
+    try testing.expectEqual(@as(i64, 0x1_0000_0002), (try b.enumValue(t64, 1)).value);
+    try testing.expectEqual(n_y, (try b.enumValue(t64, 1)).name_off);
+    try testing.expectError(error.WrongKind, b.enumValue(t64, 2));
+    try testing.expectEqual(@as(i64, -1), (try b.enumValue(try b.byId(e64s), 0)).value);
+    // params
+    const tp = try b.byId(proto);
+    const p0 = try b.param(tp, 0);
+    try testing.expectEqual(n_x, p0.name_off);
+    try testing.expectEqual(int4, p0.type_id);
+    const p1 = try b.param(tp, 1);
+    try testing.expectEqual(@as(u32, 0), p1.type_id);
+    try testing.expectError(error.WrongKind, b.param(tp, 2));
+    try testing.expectError(error.WrongKind, b.param(try b.byId(int4), 0));
+    // var / datasec / decl tag
+    try testing.expectEqual(VarLinkage.global_allocated, try b.varLinkage(try b.byId(vr)));
+    try testing.expectError(error.WrongKind, b.varLinkage(try b.byId(int4)));
+    const td = try b.byId(ds);
+    const v1 = try b.varSecInfo(td, 1);
+    try testing.expectEqual(vr, v1.type_id);
+    try testing.expectEqual(@as(u32, 12), v1.offset);
+    try testing.expectEqual(@as(u32, 16), v1.size);
+    const v0 = try b.varSecInfo(td, 0);
+    try testing.expectEqual(@as(u32, 4), v0.offset);
+    try testing.expectEqual(@as(u32, 8), v0.size);
+    try testing.expectError(error.WrongKind, b.varSecInfo(td, 2));
+    try testing.expectError(error.WrongKind, b.varSecInfo(try b.byId(int4), 0));
+    try testing.expectEqual(@as(i32, -1), try b.declTagComponent(try b.byId(tag)));
+    try testing.expectError(error.WrongKind, b.declTagComponent(try b.byId(int4)));
+    try testing.expectError(error.WrongKind, b.arrayInfo(try b.byId(int4)));
+    try testing.expectError(error.WrongKind, b.intInfo(try b.byId(vr)));
+    // sizeOf on a DATASEC is its declared size; on a VAR / FWD / FUNC_PROTO there is none
+    try testing.expectEqual(@as(u64, 8), try b.sizeOf(ds));
+    try testing.expectError(error.NoSize, b.sizeOf(vr));
+    try testing.expectError(error.NoSize, b.sizeOf(proto));
+    try testing.expectEqual(@as(u64, 8), try b.sizeOf(e64));
+}
+
+test "chains: skipModifiers / sizeOf / findMember depth limits, array overflow, member budget" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const int4 = try r.rec(gpa, 0, K_INT, 0, false, 4, &.{32});
+    var last = int4;
+    var ids: [40]u32 = undefined;
+    for (0..40) |i| {
+        last = try r.rec(gpa, 0, K_TYPEDEF, 0, false, last, &.{});
+        ids[i] = last;
+    }
+    // an array whose extent overflows u64: elem = struct of size 2^32-1, nelems = 2^32-1 ... times 8
+    const big = try r.rec(gpa, 0, K_STRUCT, 0, false, 0xffff_ffff, &.{});
+    const idx = int4;
+    const arr = try r.rec(gpa, 0, K_ARRAY, 0, false, 0, &.{ big, idx, 0xffff_ffff });
+    const arr_ok = try r.rec(gpa, 0, K_ARRAY, 0, false, 0, &.{ int4, idx, 10 });
+    const arr2 = try r.rec(gpa, 0, K_ARRAY, 0, false, 0, &.{ arr, idx, 2 });
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var b = try parse(gpa, bytes, .{});
+    defer b.deinit();
+    // n typedefs over the int: the walk has n+1 steps (depth 0..n)
+    try testing.expectEqual(int4, try b.skipModifiers(ids[31])); // 32 typedefs
+    try testing.expectError(error.TypeChainTooDeep, b.skipModifiers(ids[32])); // 33
+    try testing.expectEqual(@as(u64, 4), try b.sizeOf(ids[31]));
+    try testing.expectError(error.TypeChainTooDeep, b.sizeOf(ids[32]));
+    // sizeOf follows modifiers through array elements (depth carries on)
+    try testing.expectEqual(@as(u64, 40), try b.sizeOf(arr_ok));
+    // 2^32-1 elements of 2^32-1 bytes: fits in u64 (3.4e19 > 1.8e19? no: 1.8e19) -> overflows
+    try testing.expectEqual(@as(u64, 0xffff_ffff) * 0xffff_ffff, try b.sizeOf(arr));
+    try testing.expectError(error.NoSize, b.sizeOf(arr2));
+    try testing.expectEqual(@as(u64, 4), (try b.resolve(ids[3])).size_type);
+}
+
+test "findMember / findPath: offsets, indices, anonymous descent, depth and visit budget" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_x = try r.str(gpa, "x");
+    const n_y = try r.str(gpa, "y");
+    const n_z = try r.str(gpa, "z");
+    const n_bad: u32 = 0x7000;
+    const int4 = try r.rec(gpa, 0, K_INT, 0, false, 4, &.{32});
+    // inner { int x @8 }, outer { int y @0; anon inner @64; }
+    const inner = try r.rec(gpa, 0, K_STRUCT, 1, false, 4, &.{ n_x, int4, 8 });
+    const outer = try r.rec(gpa, 0, K_STRUCT, 2, false, 16, &.{ n_y, int4, 0, 0, inner, 64 });
+    const td_outer = try r.rec(gpa, 0, K_TYPEDEF, 0, false, outer, &.{});
+    // mid { int z @32; anon outer @128 } ; top { mid m @256 }
+    const mid = try r.rec(gpa, 0, K_STRUCT, 2, false, 32, &.{ n_z, int4, 32, 0, outer, 128 });
+    const n_m = try r.str(gpa, "m");
+    const n_mid = try r.str(gpa, "mid");
+    const top = try r.rec(gpa, 0, K_STRUCT, 1, false, 64, &.{ n_m, mid, 256 });
+    // a struct with an unnamed non-composite member then a named one, and one with a bad name offset
+    const odd = try r.rec(gpa, 0, K_STRUCT, 2, false, 8, &.{ 0, int4, 0, n_y, int4, 32 });
+    const badname = try r.rec(gpa, 0, K_STRUCT, 1, false, 4, &.{ n_bad, int4, 0 });
+    _ = n_mid;
+    // anonymous nesting chain of 34 levels, innermost holds x
+    var lvl = try r.rec(gpa, 0, K_STRUCT, 1, false, 4, &.{ n_x, int4, 0 });
+    var chain: [40]u32 = undefined;
+    for (0..40) |i| {
+        lvl = try r.rec(gpa, 0, K_STRUCT, 1, false, 4, &.{ 0, lvl, 0 });
+        chain[i] = lvl;
+    }
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var b = try parse(gpa, bytes, .{});
+    defer b.deinit();
+
+    const fx = (try b.findMember(outer, "x")).?;
+    try testing.expectEqual(@as(u64, 72), fx.bit_offset); // 64 (anon hop) + 8
+    try testing.expectEqual(@as(u16, 0), fx.index); // index inside `inner`
+    try testing.expectEqual(inner, fx.parent_type_id);
+    const fy = (try b.findMember(td_outer, "y")).?;
+    try testing.expectEqual(outer, fy.parent_type_id); // the composite, not the typedef
+    try testing.expectEqual(@as(u64, 0), fy.bit_offset);
+    const fmid = (try b.findMember(mid, "x")).?;
+    try testing.expectEqual(@as(u64, 128 + 64 + 8), fmid.bit_offset);
+    try testing.expectEqual(@as(?Field, null), try b.findMember(outer, "nope"));
+    // member in second slot: index is its slot
+    try testing.expectEqual(@as(u16, 1), (try b.findMember(odd, "y")).?.index);
+    try testing.expectEqual(@as(u64, 32), (try b.findMember(odd, "y")).?.bit_offset);
+    // a bad name offset is not a match for any name
+    try testing.expectEqual(@as(?Field, null), try b.findMember(badname, "x"));
+    try testing.expectEqual(@as(?Field, null), try b.findMember(badname, ""));
+    try testing.expectError(error.WrongKind, b.findMember(int4, "x"));
+
+    // paths: offsets accumulate, the cursor follows each member's type
+    const p = (try b.findPath(top, &.{ "m", "z" })).?;
+    try testing.expectEqual(@as(u64, 256 + 32), p.bit_offset);
+    try testing.expectEqual(int4, p.type_id);
+    const p2 = (try b.findPath(top, &.{ "m", "x" })).?;
+    try testing.expectEqual(@as(u64, 256 + 128 + 64 + 8), p2.bit_offset);
+    try testing.expectEqual(@as(?Field, null), try b.findPath(top, &.{}));
+    try testing.expectEqual(@as(?Field, null), try b.findPath(top, &.{ "m", "nope" }));
+    try testing.expectEqual(@as(?Field, null), try b.findPath(top, &.{ "m", "z", "deeper" })); // through an int
+    try testing.expectEqual(@as(u64, 256), (try b.findPath(top, &.{"m"})).?.bit_offset);
+
+    // anonymous nesting depth: 32 hops are found, 33 are TypeChainTooDeep
+    try testing.expect((try b.findMember(chain[31], "x")) != null); // 32 levels over the innermost
+    try testing.expectError(error.TypeChainTooDeep, b.findMember(chain[32], "x"));
+}
+
+test "findMember: the visit budget is exactly max_member_visits" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_a = try r.str(gpa, "a");
+    const int4 = try r.rec(gpa, 0, K_INT, 0, false, 4, &.{32});
+    // inner: 65535 named members; outer: one anonymous member of inner plus
+    // enough named ones that a failed lookup visits exactly 100_000 members.
+    const inner_n: u16 = 0xffff;
+    var inner_extra = try gpa.alloc(u32, @as(usize, inner_n) * 3);
+    defer gpa.free(inner_extra);
+    for (0..inner_n) |i| {
+        inner_extra[i * 3] = n_a;
+        inner_extra[i * 3 + 1] = int4;
+        inner_extra[i * 3 + 2] = 0;
+    }
+    const inner = try r.rec(gpa, 0, K_STRUCT, inner_n, false, 4, inner_extra);
+    const named: u16 = @intCast(max_member_visits - 1 - inner_n); // + the anonymous slot + inner's members
+    var outer_extra = try gpa.alloc(u32, (@as(usize, named) + 1) * 3);
+    defer gpa.free(outer_extra);
+    outer_extra[0] = 0;
+    outer_extra[1] = inner;
+    outer_extra[2] = 0;
+    for (0..named) |i| {
+        outer_extra[3 + i * 3] = n_a;
+        outer_extra[3 + i * 3 + 1] = int4;
+        outer_extra[3 + i * 3 + 2] = 0;
+    }
+    const outer = try r.rec(gpa, 0, K_STRUCT, named + 1, false, 4, outer_extra);
+    // one more named member than the budget allows
+    var over_extra = try gpa.alloc(u32, (@as(usize, named) + 2) * 3);
+    defer gpa.free(over_extra);
+    @memcpy(over_extra[0..outer_extra.len], outer_extra);
+    over_extra[outer_extra.len] = n_a;
+    over_extra[outer_extra.len + 1] = int4;
+    over_extra[outer_extra.len + 2] = 0;
+    const over = try r.rec(gpa, 0, K_STRUCT, named + 2, false, 4, over_extra);
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var b = try parse(gpa, bytes, .{});
+    defer b.deinit();
+    try testing.expectEqual(@as(?Field, null), try b.findMember(outer, "absent"));
+    try testing.expectError(error.TypeSearchTooWide, b.findMember(over, "absent"));
+    // a path shares ONE budget across its segments
+    try testing.expectError(error.TypeSearchTooWide, b.findPath(over, &.{"absent"}));
+}
+
+test "validateReferences: every reference class, and the offending id" {
+    const gpa = testing.allocator;
+    const Case = struct { kind: u5, vlen: u16, kflag: bool, size_type: u32, extra: []const u32, name_off: u32 = 0 };
+    const int4_extra = [_]u32{32};
+    const cases = [_]Case{
+        .{ .kind = K_PTR, .vlen = 0, .kflag = false, .size_type = 99, .extra = &.{} }, // dangling
+        .{ .kind = K_FUNC, .vlen = 1, .kflag = false, .size_type = 0, .extra = &.{} }, // func -> void is illegal
+        .{ .kind = K_VAR, .vlen = 0, .kflag = false, .size_type = 99, .extra = &.{1} },
+        .{ .kind = K_DECL_TAG, .vlen = 0, .kflag = false, .size_type = 99, .extra = &.{0} },
+        .{ .kind = K_ARRAY, .vlen = 0, .kflag = false, .size_type = 0, .extra = &.{ 99, 1, 2 } }, // elem bad
+        .{ .kind = K_ARRAY, .vlen = 0, .kflag = false, .size_type = 0, .extra = &.{ 1, 99, 2 } }, // index bad
+        .{ .kind = K_STRUCT, .vlen = 1, .kflag = false, .size_type = 4, .extra = &.{ 0, 99, 0 } }, // member type
+        .{ .kind = K_STRUCT, .vlen = 1, .kflag = false, .size_type = 4, .extra = &.{ 0x7000, 1, 0 } }, // member name
+        .{ .kind = K_DATASEC, .vlen = 1, .kflag = false, .size_type = 4, .extra = &.{ 99, 0, 4 } },
+        .{ .kind = K_FUNC_PROTO, .vlen = 1, .kflag = false, .size_type = 0, .extra = &.{ 0, 99 } }, // param type
+        .{ .kind = K_FUNC_PROTO, .vlen = 1, .kflag = false, .size_type = 0, .extra = &.{ 0x7000, 1 } }, // param name
+        .{ .kind = K_INT, .vlen = 0, .kflag = false, .size_type = 4, .extra = &int4_extra, .name_off = 0x7000 }, // type name
+    };
+    for (cases, 0..) |c, ci| {
+        var r = try RawBtf.init(gpa);
+        defer r.deinit(gpa);
+        _ = try r.rec(gpa, 0, K_INT, 0, false, 4, &int4_extra); // id 1 (valid target)
+        const id = try r.rec(gpa, c.name_off, c.kind, c.vlen, c.kflag, c.size_type, c.extra); // id 2
+        const bytes = try r.finish(gpa);
+        defer gpa.free(bytes);
+        var b = try parse(gpa, bytes, .{});
+        defer b.deinit();
+        var bad: u32 = 0;
+        testing.expectError(error.TypeIdOutOfRange, b.validateReferences(&bad)) catch |e| {
+            std.debug.print("case {d} did not reject\n", .{ci});
+            return e;
+        };
+        try testing.expectEqual(id, bad);
+        try testing.expectError(error.TypeIdOutOfRange, b.validateReferences(null));
+    }
+    // the legal spellings: void references, varargs params, FUNC -> proto, named members
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_x = try r.str(gpa, "x");
+    const int4 = try r.rec(gpa, 0, K_INT, 0, false, 4, &int4_extra);
+    _ = try r.rec(gpa, 0, K_PTR, 0, false, 0, &.{}); // void*
+    _ = try r.rec(gpa, 0, K_FUNC_PROTO, 2, false, 0, &.{ n_x, int4, 0, 0 }); // (int x, ...)
+    _ = try r.rec(gpa, n_x, K_FUNC, 1, false, 3, &.{});
+    _ = try r.rec(gpa, 0, K_STRUCT, 1, false, 4, &.{ n_x, int4, 0 });
+    _ = try r.rec(gpa, 0, K_ARRAY, 0, false, 0, &.{ int4, int4, 3 });
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var b = try parse(gpa, bytes, .{});
+    defer b.deinit();
+    try b.validateReferences(null);
+}
+
+test "loadModule / loadFile / Builder: input limits" {
+    const gpa = testing.allocator;
+    var base_builder = Builder.init(gpa);
+    defer base_builder.deinit();
+    _ = try base_builder.addInt("int", 4, 32, 1);
+    const bb = try base_builder.finish();
+    defer gpa.free(bb);
+    var base = try parse(gpa, bb, .{});
+    defer base.deinit();
+
+    var mbuf: [97]u8 = undefined;
+    @memset(&mbuf, 'm');
+    const long97: []const u8 = mbuf[0..97];
+    const long96: []const u8 = mbuf[0..96];
+    try testing.expectError(error.InvalidModuleName, loadModule(gpa, "", &base));
+    try testing.expectError(error.InvalidModuleName, loadModule(gpa, long97, &base));
+    try testing.expectError(error.FileOpenFailed, loadModule(gpa, long96, &base));
+    try testing.expectError(error.InvalidModuleName, loadModule(gpa, "a/b", &base));
+    try testing.expectError(error.InvalidModuleName, loadModule(gpa, "a\x00b", &base));
+    try testing.expectError(error.InvalidModuleName, loadModule(gpa, ".", &base));
+    try testing.expectError(error.InvalidModuleName, loadModule(gpa, "..", &base));
+    try testing.expectError(error.FileOpenFailed, loadModule(gpa, "no_such_module_zl", &base));
+    const huge = try gpa.alloc(u8, 5000);
+    defer gpa.free(huge);
+    @memset(huge, 'p');
+    try testing.expectError(error.FileOpenFailed, loadFile(gpa, huge[0..4096], null));
+    try testing.expectError(error.FileOpenFailed, loadFile(gpa, huge[0..5000], null));
+    try testing.expectError(error.FileOpenFailed, loadFile(gpa, huge[0..4095], null));
+
+    // Builder
+    var bld = Builder.init(gpa);
+    defer bld.deinit();
+    try testing.expectEqual(@as(u32, 0), try bld.addString(""));
+    try testing.expectEqual(@as(u32, 1), try bld.addString("x"));
+    var empty = Builder.init(gpa);
+    defer empty.deinit();
+    const eb = try empty.finish();
+    defer gpa.free(eb);
+    var ep = try parse(gpa, eb, .{});
+    ep.deinit();
+    try testing.expectEqual(@as(usize, header_size + 1), eb.len);
+    // > 64 members is refused; bit offsets above 24 bits are masked into the kflag layout
+    var mem: [65]Builder.MemberSpec = undefined;
+    for (&mem) |*m| m.* = .{ .name = "f", .type_id = 1, .bit_offset = 0 };
+    try testing.expectError(error.TooManyMembers, bld.addComposite(.@"struct", "big", 8, &mem));
+    var one = Builder.init(gpa);
+    defer one.deinit();
+    const int_id = try one.addInt("int", 4, 32, 1);
+    const sid = try one.addComposite(.@"struct", "s", 8, &.{.{ .name = "f", .type_id = int_id, .bit_offset = 0x4000000, .bitfield_size = 3 }});
+    const ob = try one.finish();
+    defer gpa.free(ob);
+    var op = try parse(gpa, ob, .{});
+    defer op.deinit();
+    const m = try op.member(try op.byId(sid), 0);
+    try testing.expectEqual(@as(u32, 0), m.bit_offset);
+    try testing.expectEqual(@as(u8, 3), m.bitfield_size);
+}
+
+test "round 3: lookups by name are exact, and an unaligned type section is refused" {
+    const gpa = testing.allocator;
+    var bld = Builder.init(gpa);
+    defer bld.deinit();
+    const int_id = try bld.addInt("foo_extra", 4, 32, 1);
+    const td = try bld.addTypedef("foo", int_id);
+    const bytes = try bld.finish();
+    defer gpa.free(bytes);
+    var b = try parse(gpa, bytes, .{});
+    defer b.deinit();
+    try testing.expectEqual(@as(?u32, int_id), b.findByNameKind("foo_extra", null));
+    try testing.expectEqual(@as(?u32, td), b.findByNameKind("foo", null)); // not the longer name's prefix match
+    try testing.expectEqual(@as(?u32, null), b.findByNameKind("fo", null));
+    try testing.expectEqual(@as(?u32, null), b.findByNameKind("foo_extr", .int));
+    // findByName has no kind restriction
+    try testing.expectEqual(@as(?u32, td), b.findByName("foo"));
+    try testing.expectEqual(@as(?u32, int_id), b.findByName("foo_extra"));
+    try testing.expectEqual(@as(?u32, null), b.findByNameKind("foo", .int));
+    // type_off must be a multiple of 4 even when the record there is well-formed
+    const raw = try gpa.alloc(u8, header_size + 2 + 12 + 1);
+    defer gpa.free(raw);
+    @memset(raw, 0);
+    std.mem.writeInt(u16, raw[0..2], magic, native_endian);
+    raw[2] = version;
+    std.mem.writeInt(u32, raw[4..8], header_size, native_endian);
+    std.mem.writeInt(u32, raw[8..12], 2, native_endian); // type_off
+    std.mem.writeInt(u32, raw[12..16], 12, native_endian);
+    std.mem.writeInt(u32, raw[16..20], 14, native_endian); // str_off
+    std.mem.writeInt(u32, raw[20..24], 1, native_endian);
+    std.mem.writeInt(u32, raw[header_size + 2 + 4 ..][0..4], @as(u32, K_PTR) << 24, native_endian);
+    try testing.expectError(error.MalformedBtf, parse(gpa, raw, .{}));
+    std.mem.writeInt(u32, raw[8..12], 4, native_endian);
+    std.mem.writeInt(u32, raw[16..20], 16, native_endian);
+    var padded = try gpa.alloc(u8, raw.len + 2);
+    defer gpa.free(padded);
+    @memset(padded, 0);
+    @memcpy(padded[0..header_size], raw[0..header_size]);
+    std.mem.writeInt(u32, padded[8..12], 4, native_endian);
+    std.mem.writeInt(u32, padded[16..20], 16, native_endian);
+    std.mem.writeInt(u32, padded[header_size + 4 + 4 ..][0..4], @as(u32, K_PTR) << 24, native_endian);
+    var ok = try parse(gpa, padded, .{});
+    ok.deinit();
+}
+
+test "parse: hdr_len below the header size is refused even when the shifted layout would parse" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    _ = try r.rec(gpa, 0, K_PTR, 0, false, 0, &.{});
+    const good = try r.finish(gpa);
+    defer gpa.free(good);
+    // hdr_len 20: the type section starts at byte 20 + type_off, so type_off 4 lands on byte 24
+    const b = try gpa.dupe(u8, good);
+    defer gpa.free(b);
+    std.mem.writeInt(u32, b[4..8], 20, native_endian);
+    std.mem.writeInt(u32, b[8..12], 4, native_endian);
+    std.mem.writeInt(u32, b[16..20], 4 + 12, native_endian);
+    try testing.expectError(error.MalformedBtf, parse(gpa, b, .{}));
+}

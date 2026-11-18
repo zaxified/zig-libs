@@ -3065,3 +3065,1208 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation (2026-11-18): hand-assembled relocatable objects ──
+
+/// A tiny ET_REL assembler: sections, symbols and `.rel*` sections laid out
+/// exactly as asked, so a test can build the shapes clang never emits
+/// (zero-size functions, unnamed sections, hostile relocations).
+const ObjB = struct {
+    const SYMTAB_LINK: u32 = 0xffff_fff0;
+    const Sec = struct {
+        name: []const u8,
+        ty: u32,
+        flags: u64 = 0,
+        data: []const u8 = "",
+        link: u32 = 0,
+        info: u32 = 0,
+        entsize: u64 = 0,
+        /// `sh_size` when it must differ from `data.len` (NOBITS).
+        size: ?u64 = null,
+    };
+    const Sym = struct { name: []const u8, info: u8, shndx: u16, value: u64 = 0, size: u64 = 0 };
+    const EXEC: u64 = elfsym.SHF_ALLOC | elfsym.SHF_EXECINSTR;
+
+    gpa: std.mem.Allocator,
+    secs: std.ArrayList(Sec) = .empty,
+    syms: std.ArrayList(Sym) = .empty,
+    e_type: u16 = 1,
+    e_machine: u16 = 247,
+
+    fn init(gpa: std.mem.Allocator) ObjB {
+        return .{ .gpa = gpa };
+    }
+    fn deinit(self: *ObjB) void {
+        self.secs.deinit(self.gpa);
+        self.syms.deinit(self.gpa);
+    }
+    /// Returns the section index (1-based).
+    fn sec(self: *ObjB, s: Sec) !u16 {
+        try self.secs.append(self.gpa, s);
+        return @intCast(self.secs.items.len);
+    }
+    /// Returns the symbol index (1-based; 0 is the null symbol).
+    fn sym(self: *ObjB, s: Sym) !u32 {
+        try self.syms.append(self.gpa, s);
+        return @intCast(self.syms.items.len);
+    }
+    fn build(self: *ObjB) ![]u8 {
+        const gpa = self.gpa;
+        var shstr: std.ArrayList(u8) = .empty;
+        defer shstr.deinit(gpa);
+        try shstr.append(gpa, 0);
+        var strtab: std.ArrayList(u8) = .empty;
+        defer strtab.deinit(gpa);
+        try strtab.append(gpa, 0);
+        var symtab: std.ArrayList(u8) = .empty;
+        defer symtab.deinit(gpa);
+        try symtab.appendNTimes(gpa, 0, 24);
+        for (self.syms.items) |s| {
+            var rec: [24]u8 = @splat(0);
+            var no: u32 = 0;
+            if (s.name.len != 0) {
+                no = @intCast(strtab.items.len);
+                try strtab.appendSlice(gpa, s.name);
+                try strtab.append(gpa, 0);
+            }
+            std.mem.writeInt(u32, rec[0..4], no, .little);
+            rec[4] = s.info;
+            std.mem.writeInt(u16, rec[6..8], s.shndx, .little);
+            std.mem.writeInt(u64, rec[8..16], s.value, .little);
+            std.mem.writeInt(u64, rec[16..24], s.size, .little);
+            try symtab.appendSlice(gpa, &rec);
+        }
+        const n: u32 = @intCast(self.secs.items.len);
+        const symtab_idx = n + 1;
+        // body: ehdr + sections' data + symtab + strtab + shstrtab, 8-aligned
+        var body: std.ArrayList(u8) = .empty;
+        errdefer body.deinit(gpa);
+        try body.appendNTimes(gpa, 0, 64);
+        const Hdr = struct { name: u32, ty: u32, flags: u64, off: u64, size: u64, link: u32, info: u32, ent: u64 };
+        var hdrs: std.ArrayList(Hdr) = .empty;
+        defer hdrs.deinit(gpa);
+        try hdrs.append(gpa, std.mem.zeroes(Hdr));
+        const addName = struct {
+            fn f(g: std.mem.Allocator, st: *std.ArrayList(u8), nm: []const u8) !u32 {
+                if (nm.len == 0) return 0;
+                const o: u32 = @intCast(st.items.len);
+                try st.appendSlice(g, nm);
+                try st.append(g, 0);
+                return o;
+            }
+        }.f;
+        for (self.secs.items) |s| {
+            while (body.items.len % 8 != 0) try body.append(gpa, 0);
+            const off = body.items.len;
+            try body.appendSlice(gpa, s.data);
+            try hdrs.append(gpa, .{
+                .name = try addName(gpa, &shstr, s.name),
+                .ty = s.ty,
+                .flags = s.flags,
+                .off = off,
+                .size = s.size orelse s.data.len,
+                .link = if (s.link == SYMTAB_LINK) symtab_idx else s.link,
+                .info = s.info,
+                .ent = s.entsize,
+            });
+        }
+        const extra = [_]struct { nm: []const u8, ty: u32, data: []const u8, link: u32, ent: u64 }{
+            .{ .nm = ".symtab", .ty = 2, .data = symtab.items, .link = symtab_idx + 1, .ent = 24 },
+            .{ .nm = ".strtab", .ty = 3, .data = strtab.items, .link = 0, .ent = 0 },
+        };
+        for (extra) |e| {
+            while (body.items.len % 8 != 0) try body.append(gpa, 0);
+            const off = body.items.len;
+            try body.appendSlice(gpa, e.data);
+            try hdrs.append(gpa, .{ .name = try addName(gpa, &shstr, e.nm), .ty = e.ty, .flags = 0, .off = off, .size = e.data.len, .link = e.link, .info = 0, .ent = e.ent });
+        }
+        const shname = try addName(gpa, &shstr, ".shstrtab");
+        while (body.items.len % 8 != 0) try body.append(gpa, 0);
+        const sh_off = body.items.len;
+        try body.appendSlice(gpa, shstr.items);
+        try hdrs.append(gpa, .{ .name = shname, .ty = 3, .flags = 0, .off = sh_off, .size = shstr.items.len, .link = 0, .info = 0, .ent = 0 });
+        while (body.items.len % 8 != 0) try body.append(gpa, 0);
+        const table_off = body.items.len;
+        for (hdrs.items) |h| {
+            var rec: [64]u8 = @splat(0);
+            std.mem.writeInt(u32, rec[0..4], h.name, .little);
+            std.mem.writeInt(u32, rec[4..8], h.ty, .little);
+            std.mem.writeInt(u64, rec[8..16], h.flags, .little);
+            std.mem.writeInt(u64, rec[24..32], h.off, .little);
+            std.mem.writeInt(u64, rec[32..40], h.size, .little);
+            std.mem.writeInt(u32, rec[40..44], h.link, .little);
+            std.mem.writeInt(u32, rec[44..48], h.info, .little);
+            std.mem.writeInt(u64, rec[56..64], h.ent, .little);
+            try body.appendSlice(gpa, &rec);
+        }
+        const out = try body.toOwnedSlice(gpa);
+        @memcpy(out[0..4], "\x7fELF");
+        out[4] = 2;
+        out[5] = 1;
+        out[6] = 1;
+        std.mem.writeInt(u16, out[16..18], self.e_type, .little);
+        std.mem.writeInt(u16, out[18..20], self.e_machine, .little);
+        std.mem.writeInt(u64, out[40..48], table_off, .little);
+        std.mem.writeInt(u16, out[52..54], 64, .little);
+        std.mem.writeInt(u16, out[58..60], 64, .little);
+        std.mem.writeInt(u16, out[60..62], @intCast(hdrs.items.len), .little);
+        std.mem.writeInt(u16, out[62..64], @intCast(hdrs.items.len - 1), .little);
+        return out;
+    }
+};
+
+fn ins8(code: u8, regs: u8, off: i16, imm: i32) [8]u8 {
+    var b: [8]u8 = undefined;
+    b[0] = code;
+    b[1] = regs;
+    std.mem.writeInt(i16, b[2..4], off, .little);
+    std.mem.writeInt(i32, b[4..8], imm, .little);
+    return b;
+}
+const I_MOV0 = ins8(0xb7, 0, 0, 0);
+const I_EXIT = ins8(0x95, 0, 0, 0);
+const I_LD64 = ins8(0x18, 0, 0, 0);
+const I_LD64_HI = ins8(0x00, 0, 0, 0);
+const I_CALL = ins8(0x85, 0, 0, 1);
+const FUNC_SYM: u8 = (1 << 4) | 2;
+const OBJ_SYM: u8 = (1 << 4) | 1;
+const SEC_SYM: u8 = 3;
+
+fn flatIns(comptime n: usize, parts: [n][8]u8) [n * 8]u8 {
+    var out: [n * 8]u8 = undefined;
+    for (parts, 0..) |p, i| @memcpy(out[i * 8 ..][0..8], &p);
+    return out;
+}
+
+fn cat(comptime parts: anytype) [parts.len * 8]u8 {
+    var out: [parts.len * 8]u8 = undefined;
+    inline for (parts, 0..) |p, i| @memcpy(out[i * 8 ..][0..8], &p);
+    return out;
+}
+
+fn openObj(b: *ObjB, opts: OpenOptions) !Object {
+    const bytes = try b.build();
+    defer b.gpa.free(bytes);
+    return open(b.gpa, bytes, opts);
+}
+
+fn le32(vals: []const u32) [64]u8 {
+    var out: [64]u8 = @splat(0);
+    for (vals, 0..) |v, i| std.mem.writeInt(u32, out[i * 4 ..][0..4], v, .little);
+    return out;
+}
+
+test "open: header, section classification and the executable-section rules" {
+    const gpa = testing.allocator;
+    const code = cat(.{ I_MOV0, I_EXIT });
+    // e_type / e_machine
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        _ = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        b.e_type = 2;
+        try testing.expectError(error.NotABpfObject, openObj(&b, .{}));
+        b.e_type = 1;
+        b.e_machine = 0;
+        var o = try openObj(&b, .{});
+        o.deinit();
+        try testing.expectError(error.NotABpfObject, openObj(&b, .{ .require_bpf_machine = true }));
+        b.e_machine = elfsym.EM_BPF;
+        var o2 = try openObj(&b, .{ .require_bpf_machine = true });
+        o2.deinit();
+    }
+    // which executable sections are programs, unknown, or ignored
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        _ = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code }); // program
+        _ = try b.sec(.{ .name = ".text", .ty = 1, .flags = ObjB.EXEC, .data = &code }); // sub-programs: ignored
+        _ = try b.sec(.{ .name = "weird", .ty = 1, .flags = ObjB.EXEC, .data = &code }); // unknown
+        _ = try b.sec(.{ .name = "", .ty = 1, .flags = ObjB.EXEC, .data = &code }); // anonymous: skipped
+        _ = try b.sec(.{ .name = "noexec", .ty = 1, .flags = elfsym.SHF_ALLOC, .data = &code });
+        _ = try b.sec(.{ .name = "noalloc", .ty = 1, .flags = elfsym.SHF_EXECINSTR, .data = &code });
+        _ = try b.sec(.{ .name = "nobits", .ty = 8, .flags = ObjB.EXEC, .size = 16 });
+        _ = try b.sec(.{ .name = "kprobe/empty", .ty = 1, .flags = ObjB.EXEC, .data = "" });
+        _ = try b.sec(.{ .name = ".data", .ty = 1, .flags = 3, .data = "" }); // empty data section: no map
+        _ = try b.sec(.{ .name = ".bss.empty", .ty = 8, .flags = 3, .size = 0 });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 1), o.programs.len);
+        try testing.expectEqualStrings("xdp", o.programs[0].name);
+        try testing.expectEqual(@as(usize, 1), o.unknown_sections.len);
+        try testing.expectEqualStrings("weird", o.unknown_sections[0]);
+        try testing.expectEqual(@as(usize, 0), o.maps.len);
+    }
+    // license / version
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        _ = try b.sec(.{ .name = "license", .ty = 1, .flags = 3, .data = "GPL\x00junk" });
+        _ = try b.sec(.{ .name = "version", .ty = 1, .flags = 3, .data = &[_]u8{ 0x01, 0x02, 0x03, 0x04 } });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectEqualStrings("GPL", o.license);
+        try testing.expectEqual(@as(u32, 0x04030201), o.kern_version);
+    }
+    // a stripped object has no symbol table at all
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const bytes = try b.build();
+        defer gpa.free(bytes);
+        // turn .symtab into a plain strtab-typed section
+        var im = try elfsym.openImage(gpa, bytes, false);
+        defer im.deinit();
+        const si = im.symtabIndex().?;
+        const at = std.mem.readInt(u64, bytes[40..48], .little) + si * 64 + 4;
+        std.mem.writeInt(u32, bytes[@intCast(at)..][0..4], 3, .little);
+        try testing.expectError(error.NoSymbolTable, open(gpa, bytes, .{}));
+    }
+}
+
+test "isDataSectionName / ProgramSpec.kernelName / classifySection edges" {
+    try testing.expect(isDataSectionName(".rodata"));
+    try testing.expect(isDataSectionName(".rodata.str1.1"));
+    try testing.expect(isDataSectionName(".data"));
+    try testing.expect(isDataSectionName(".bss."));
+    try testing.expect(!isDataSectionName(".datax"));
+    try testing.expect(!isDataSectionName(".dat"));
+    try testing.expect(!isDataSectionName("data"));
+    try testing.expect(isRodataName(".rodata.cst8"));
+    try testing.expect(!isRodataName(".data"));
+    var p: ProgramSpec = undefined;
+    p.name = "0123456789abcde"; // 15
+    try testing.expectEqualStrings("0123456789abcde", p.kernelName());
+    p.name = "0123456789abcdef"; // 16
+    try testing.expectEqualStrings("0123456789abcde", p.kernelName());
+    p.name = "short";
+    try testing.expectEqualStrings("short", p.kernelName());
+    // longest prefix wins, and a bare prefix has an empty target
+    try testing.expectEqualStrings("a/b", classifySection("kprobe/a/b").?.target);
+    try testing.expectEqual(@as(?SectionKindInfo, null), classifySection("kprob"));
+    try testing.expectEqual(@as(?SectionKindInfo, null), classifySection("kprobex/y"));
+    try testing.expectEqual(@as(?SectionKindInfo, null), classifySection("kprobe.zz"));
+    try testing.expectEqual(BPF.AttachType.trace_kprobe_multi, classifySection("kprobe.multi/x").?.def.expected_attach_type.?);
+    try testing.expect(classifySection("uprobe.s/x").?.def.sleepable);
+    try testing.expect(!classifySection("uprobe/x").?.def.sleepable);
+}
+
+test "function splitting: ranges, zero sizes, ordering and bounds" {
+    const gpa = testing.allocator;
+    const code = cat(.{ I_MOV0, I_EXIT, I_MOV0, I_MOV0, I_MOV0, I_EXIT });
+    // no function symbol: one program named after the section; sleepable from the prefix
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        _ = try b.sec(.{ .name = "uprobe.s/x", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 1), o.programs.len);
+        try testing.expectEqualStrings("uprobe.s/x", o.programs[0].name);
+        try testing.expectEqual(@as(usize, 6), o.programs[0].insns.len);
+        try testing.expect(o.programs[0].sleepable);
+        try testing.expectEqualStrings("x", o.programs[0].attach_target);
+        try testing.expectEqual(BPF.ProgType.kprobe, o.programs[0].prog_type);
+        try testing.expectEqual(@as(u64, 0), o.programs[0].sec_byte_off);
+    }
+    // two functions given in reverse symbol order; the first has no size, the last neither
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const s = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        _ = try b.sym(.{ .name = "second", .info = FUNC_SYM, .shndx = s, .value = 16, .size = 0 });
+        _ = try b.sym(.{ .name = "first", .info = FUNC_SYM, .shndx = s, .value = 0, .size = 0 });
+        _ = try b.sym(.{ .name = "a_var", .info = OBJ_SYM, .shndx = s, .value = 8, .size = 8 }); // not a function
+        _ = try b.sym(.{ .name = "", .info = FUNC_SYM, .shndx = 99, .value = 8, .size = 8 }); // another section
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 2), o.programs.len);
+        try testing.expectEqualStrings("first", o.programs[0].name);
+        try testing.expectEqual(@as(usize, 2), o.programs[0].insns.len);
+        try testing.expectEqualStrings("second", o.programs[1].name);
+        try testing.expectEqual(@as(usize, 4), o.programs[1].insns.len);
+        try testing.expectEqual(@as(u64, 16), o.programs[1].sec_byte_off);
+        try testing.expectEqual(@as(u8, 0xb7), o.programs[1].insns[0].code);
+        try testing.expectEqual(@as(u8, 0x95), o.programs[1].insns[3].code);
+    }
+    // a function at value == len with size 0 yields nothing; at len+8 is malformed
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const s = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        _ = try b.sym(.{ .name = "f", .info = FUNC_SYM, .shndx = s, .value = 0, .size = 48 });
+        _ = try b.sym(.{ .name = "tail", .info = FUNC_SYM, .shndx = s, .value = 48, .size = 0 });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 1), o.programs.len); // exactly the whole section
+        b.syms.items[1].value = 56;
+        try testing.expectError(error.MalformedElf, openObj(&b, .{}));
+    }
+    // the size bounds: unaligned, past the end, wrapping
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const s = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        _ = try b.sym(.{ .name = "f", .info = FUNC_SYM, .shndx = s, .value = 0, .size = 12 });
+        try testing.expectError(error.UnalignedInstructionSection, openObj(&b, .{}));
+        b.syms.items[0].size = 56; // 8 past the end
+        try testing.expectError(error.MalformedElf, openObj(&b, .{}));
+        b.syms.items[0].value = 8;
+        b.syms.items[0].size = std.math.maxInt(u64) - 7; // multiple of 8 that wraps value+size to 0
+        try testing.expectError(error.MalformedElf, openObj(&b, .{}));
+        b.syms.items[0].value = 8;
+        b.syms.items[0].size = 48; // 8 + 48 > 48
+        try testing.expectError(error.MalformedElf, openObj(&b, .{}));
+        b.syms.items[0].size = 40; // exactly to the end
+        var o = try openObj(&b, .{});
+        o.deinit();
+    }
+    // an unaligned section size
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        _ = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = code[0..12] });
+        try testing.expectError(error.UnalignedInstructionSection, openObj(&b, .{}));
+    }
+}
+
+test "legacy maps: record layout, naming symbols and their guards" {
+    const gpa = testing.allocator;
+    var defs: [40]u8 = undefined;
+    @memcpy(defs[0..20], le32(&.{ 2, 4, 8, 16, 0x11 })[0..20]);
+    @memcpy(defs[20..40], le32(&.{ 1, 5, 9, 17, 0x22 })[0..20]);
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const m = try b.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+    const other = try b.sec(.{ .name = "other", .ty = 1, .flags = 3, .data = "x" });
+    _ = try b.sym(.{ .name = "foreign", .info = OBJ_SYM, .shndx = other, .value = 0 }); // wrong section
+    _ = try b.sym(.{ .name = "func", .info = FUNC_SYM, .shndx = m, .value = 0 }); // not an object
+    _ = try b.sym(.{ .name = "skewed", .info = OBJ_SYM, .shndx = m, .value = 4 }); // not 20-aligned
+    _ = try b.sym(.{ .name = "mapA", .info = OBJ_SYM, .shndx = m, .value = 0 });
+    _ = try b.sym(.{ .name = "dup", .info = OBJ_SYM, .shndx = m, .value = 0 }); // second claim: ignored
+    _ = try b.sym(.{ .name = "mapB", .info = OBJ_SYM, .shndx = m, .value = 20 });
+    var o = try openObj(&b, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 2), o.maps.len);
+    try testing.expectEqualStrings("mapA", o.maps[0].name);
+    try testing.expectEqual(@as(u32, 2), @backingInt(o.maps[0].map_type));
+    try testing.expectEqual(@as(u32, 4), o.maps[0].key_size);
+    try testing.expectEqual(@as(u32, 8), o.maps[0].value_size);
+    try testing.expectEqual(@as(u32, 16), o.maps[0].max_entries);
+    try testing.expectEqual(@as(u32, 0x11), o.maps[0].map_flags);
+    try testing.expectEqual(MapOrigin.legacy, o.maps[0].origin);
+    try testing.expectEqualStrings("mapB", o.maps[1].name);
+    try testing.expectEqual(@as(u32, 1), @backingInt(o.maps[1].map_type));
+    try testing.expectEqual(@as(u32, 5), o.maps[1].key_size);
+    try testing.expectEqual(@as(u32, 9), o.maps[1].value_size);
+    try testing.expectEqual(@as(u32, 17), o.maps[1].max_entries);
+    try testing.expectEqual(@as(u32, 0x22), o.maps[1].map_flags);
+    // a symbol naming a record that does not exist (index == count, far past) is ignored
+    _ = try b.sym(.{ .name = "ghost", .info = OBJ_SYM, .shndx = m, .value = 40 });
+    _ = try b.sym(.{ .name = "ghost2", .info = OBJ_SYM, .shndx = m, .value = 4000 });
+    var o2 = try openObj(&b, .{});
+    o2.deinit();
+    // a record with no symbol, and a ragged section, are refused
+    var b2 = ObjB.init(gpa);
+    defer b2.deinit();
+    const m2 = try b2.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+    _ = try b2.sym(.{ .name = "only", .info = OBJ_SYM, .shndx = m2, .value = 0 });
+    try testing.expectError(error.MalformedMapDefinition, openObj(&b2, .{}));
+    b2.secs.items[0].data = defs[0..30];
+    try testing.expectError(error.MalformedMapDefinition, openObj(&b2, .{}));
+    // duplicate map names across the object are refused
+    var b3 = ObjB.init(gpa);
+    defer b3.deinit();
+    const m3 = try b3.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+    _ = try b3.sym(.{ .name = "same", .info = OBJ_SYM, .shndx = m3, .value = 0 });
+    _ = try b3.sym(.{ .name = "same", .info = OBJ_SYM, .shndx = m3, .value = 20 });
+    try testing.expectError(error.DuplicateMap, openObj(&b3, .{}));
+}
+
+test "internal maps: sizes, flags, freeze and the 32-bit ceiling" {
+    const gpa = testing.allocator;
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    _ = try b.sec(.{ .name = ".rodata", .ty = 1, .flags = 2, .data = "0123456789abcdef" });
+    _ = try b.sec(.{ .name = ".data", .ty = 1, .flags = 3, .data = "abcd" });
+    _ = try b.sec(.{ .name = ".bss", .ty = 8, .flags = 3, .size = std.math.maxInt(u32) });
+    var o = try openObj(&b, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 3), o.maps.len);
+    const ro = o.findMap(".rodata").?;
+    try testing.expectEqual(@as(u32, 16), ro.value_size);
+    try testing.expectEqual(@as(u32, 1), ro.max_entries);
+    try testing.expectEqual(@as(u32, 4), ro.key_size);
+    try testing.expectEqual(BPF_F_RDONLY_PROG, ro.map_flags);
+    try testing.expect(ro.freeze);
+    try testing.expectEqual(MapOrigin.internal, ro.origin);
+    try testing.expectEqualStrings("0123456789abcdef", ro.initial_data);
+    const d = o.findMap(".data").?;
+    try testing.expectEqual(@as(u32, 0), d.map_flags);
+    try testing.expect(!d.freeze);
+    try testing.expectEqualStrings("abcd", d.initial_data);
+    const bss = o.findMap(".bss").?;
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), bss.value_size);
+    try testing.expectEqual(@as(usize, 0), bss.initial_data.len);
+    b.secs.items[2].size = @as(u64, std.math.maxInt(u32)) + 1;
+    try testing.expectError(error.MalformedElf, openObj(&b, .{}));
+}
+
+test "relocations: every refusal and the two accepted shapes" {
+    const gpa = testing.allocator;
+    const Case = struct { sym_shndx: ?u16 = null, rtype: u32 = 1, code: [4][8]u8, r_off: u64 = 0, sym_val: u64 = 0, sym_info: u8 = OBJ_SYM, sym_name: []const u8 = "m1", want: ?anyerror };
+    const ld = [4][8]u8{ I_LD64, I_LD64_HI, I_MOV0, I_EXIT };
+    const cases = [_]Case{
+        .{ .code = ld, .want = null }, // map_fd relocation
+        .{ .code = ld, .rtype = 10, .want = error.SubprogramCallsUnsupported },
+        .{ .code = ld, .rtype = 2, .want = error.UnsupportedRelocation },
+        .{ .code = ld, .sym_shndx = 0, .want = error.ExternSymbolUnsupported },
+        .{ .code = .{ I_CALL, I_LD64_HI, I_MOV0, I_EXIT }, .want = error.SubprogramCallsUnsupported },
+        .{ .code = .{ I_MOV0, I_LD64_HI, I_MOV0, I_EXIT }, .want = error.UnsupportedRelocation },
+        .{ .code = .{ I_MOV0, I_MOV0, I_MOV0, I_LD64 }, .r_off = 24, .want = error.RelocationOutOfRange }, // ldimm64 is last
+        .{ .code = ld, .r_off = 4, .want = error.RelocationOutOfRange }, // misaligned
+        .{ .code = ld, .r_off = 32, .want = null }, // at hi: another function's, ignored
+        .{ .code = ld, .sym_shndx = 40, .want = error.MalformedElf }, // section past the table
+        .{ .code = ld, .sym_name = "stray", .sym_val = 5, .want = error.UnresolvedRelocation },
+    };
+    for (cases, 0..) |c, ci| {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        var defs: [20]u8 = @splat(0);
+        std.mem.writeInt(u32, defs[0..4], 2, .little);
+        const code = flatIns(4, c.code);
+        const p = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        const m = try b.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+        _ = try b.sym(.{ .name = "m1", .info = OBJ_SYM, .shndx = m, .value = 0 });
+        const sidx = try b.sym(.{ .name = c.sym_name, .info = c.sym_info, .shndx = c.sym_shndx orelse m, .value = c.sym_val });
+        var rel: [16]u8 = undefined;
+        std.mem.writeInt(u64, rel[0..8], c.r_off, .little);
+        std.mem.writeInt(u64, rel[8..16], (@as(u64, sidx) << 32) | c.rtype, .little);
+        _ = try b.sec(.{ .name = ".relxdp", .ty = elfsym.SHT_REL, .data = &rel, .link = ObjB.SYMTAB_LINK, .info = p, .entsize = 16 });
+        if (c.want) |e| {
+            testing.expectError(e, openObj(&b, .{})) catch |err| {
+                std.debug.print("relocation case {d}\n", .{ci});
+                return err;
+            };
+        } else {
+            var o = try openObj(&b, .{});
+            o.deinit();
+        }
+    }
+    // accepted shapes: fields of the collected relocation
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        var defs: [20]u8 = @splat(0);
+        std.mem.writeInt(u32, defs[0..4], 2, .little);
+        const code = cat(.{ I_MOV0, I_LD64, I_LD64_HI, I_EXIT });
+        const p = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        const m = try b.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+        _ = try b.sym(.{ .name = "m1", .info = OBJ_SYM, .shndx = m, .value = 0 });
+        var rel: [16]u8 = undefined;
+        std.mem.writeInt(u64, rel[0..8], 8, .little);
+        std.mem.writeInt(u64, rel[8..16], (@as(u64, 1) << 32) | 1, .little);
+        _ = try b.sec(.{ .name = ".relxdp", .ty = elfsym.SHT_REL, .data = &rel, .link = ObjB.SYMTAB_LINK, .info = p, .entsize = 16 });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        const r = o.programs[0].relos;
+        try testing.expectEqual(@as(usize, 1), r.len);
+        try testing.expectEqual(ReloKind.map_fd, r[0].kind);
+        try testing.expectEqual(@as(u32, 1), r[0].insn_idx);
+        try testing.expectEqual(@as(usize, 0), r[0].map_idx);
+        try testing.expectEqualStrings("m1", r[0].sym_name);
+        // a relocation section for another section is not this program's
+        b.secs.items[2].info = m;
+        var o2 = try openObj(&b, .{});
+        defer o2.deinit();
+        try testing.expectEqual(@as(usize, 0), o2.programs[0].relos.len);
+    }
+}
+
+test "data-section relocations: symbol value + instruction addend, bounds, unresolved names" {
+    const gpa = testing.allocator;
+    const Case = struct { sym_info: u8, sym_val: u64, imm: i32, sec_name: []const u8 = ".rodata", sec_size: usize = 16, want_off: ?u64 };
+    const cases = [_]Case{
+        .{ .sym_info = SEC_SYM, .sym_val = 0, .imm = 8, .want_off = 8 }, // section symbol: addend carries it
+        .{ .sym_info = OBJ_SYM, .sym_val = 4, .imm = 4, .want_off = 8 }, // named: value + addend
+        .{ .sym_info = OBJ_SYM, .sym_val = 12, .imm = 3, .want_off = 15 }, // last byte
+        .{ .sym_info = OBJ_SYM, .sym_val = 12, .imm = 4, .want_off = null }, // == value_size
+        .{ .sym_info = OBJ_SYM, .sym_val = 0, .imm = 0, .sec_name = ".data", .sec_size = 0, .want_off = null }, // no such map
+    };
+    for (cases, 0..) |c, ci| {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const code = flatIns(3, .{ ins8(0x18, 0, 0, c.imm), I_LD64_HI, I_EXIT });
+        const p = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        const zeros: [16]u8 = @splat(0);
+        const d = try b.sec(.{ .name = c.sec_name, .ty = 1, .flags = 3, .data = zeros[0..c.sec_size] });
+        const sidx = try b.sym(.{ .name = if (c.sym_info == SEC_SYM) "" else "g", .info = c.sym_info, .shndx = d, .value = c.sym_val });
+        var rel: [16]u8 = undefined;
+        std.mem.writeInt(u64, rel[0..8], 0, .little);
+        std.mem.writeInt(u64, rel[8..16], (@as(u64, sidx) << 32) | 1, .little);
+        _ = try b.sec(.{ .name = ".relxdp", .ty = elfsym.SHT_REL, .data = &rel, .link = ObjB.SYMTAB_LINK, .info = p, .entsize = 16 });
+        if (c.want_off) |w| {
+            var o = try openObj(&b, .{});
+            defer o.deinit();
+            const r = o.programs[0].relos[0];
+            testing.expectEqual(ReloKind.map_value, r.kind) catch |e| {
+                std.debug.print("data case {d}\n", .{ci});
+                return e;
+            };
+            try testing.expectEqual(w, r.value_off);
+            try testing.expectEqualStrings(if (c.sym_info == SEC_SYM) ".rodata" else "g", r.sym_name);
+        } else {
+            const e: anyerror = if (c.sec_size == 0) error.UnresolvedRelocation else error.RelocationOutOfRange;
+            try testing.expectError(e, openObj(&b, .{}));
+        }
+    }
+    // a relocation against .text is a sub-program call, not "unsupported"
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const code = cat(.{ I_LD64, I_LD64_HI, I_EXIT });
+    const p = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+    const t = try b.sec(.{ .name = ".text", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+    const sidx = try b.sym(.{ .name = "sub", .info = FUNC_SYM, .shndx = t });
+    var rel: [16]u8 = undefined;
+    std.mem.writeInt(u64, rel[0..8], 0, .little);
+    std.mem.writeInt(u64, rel[8..16], (@as(u64, sidx) << 32) | 1, .little);
+    _ = try b.sec(.{ .name = ".relxdp", .ty = elfsym.SHT_REL, .data = &rel, .link = ObjB.SYMTAB_LINK, .info = p, .entsize = 16 });
+    try testing.expectError(error.SubprogramCallsUnsupported, openObj(&b, .{}));
+    // and against any other section it is "unsupported"
+    b.secs.items[1].name = "other";
+    try testing.expectError(error.UnsupportedRelocation, openObj(&b, .{}));
+}
+
+test "relocateProgram: bounds, fd 0, the two pseudo forms" {
+    var insns = [_]Insn{ @bitCast(I_LD64), @bitCast(I_LD64_HI), @bitCast(I_EXIT) };
+    var relos = [_]Relo{.{ .kind = .map_fd, .insn_idx = 0, .map_idx = 0, .sym_name = "m" }};
+    var prog: ProgramSpec = undefined;
+    prog.insns = &insns;
+    prog.relos = &relos;
+    const mk = struct {
+        fn m(fd: linux.fd_t) MapSpec {
+            return .{ .name = "m", .map_type = .array, .origin = .legacy, .sec_idx = 0, .fd = fd };
+        }
+    }.m;
+    // fd 0 is a valid fd
+    try relocateProgram(&prog, &.{mk(0)});
+    try testing.expectEqual(@as(u4, BPF_PSEUDO_MAP_FD), insns[0].src);
+    try testing.expectEqual(@as(i32, 0), insns[0].imm);
+    try relocateProgram(&prog, &.{mk(7)});
+    try testing.expectEqual(@as(i32, 7), insns[0].imm);
+    try testing.expectError(error.MapNotCreated, relocateProgram(&prog, &.{mk(-1)}));
+    // map index at maps.len
+    relos[0].map_idx = 1;
+    try testing.expectError(error.MapNotCreated, relocateProgram(&prog, &.{mk(7)}));
+    relos[0].map_idx = 9;
+    try testing.expectError(error.MapNotCreated, relocateProgram(&prog, &.{mk(7)}));
+    relos[0].map_idx = 0;
+    // insn index == len
+    relos[0].insn_idx = 3;
+    try testing.expectError(error.RelocationOutOfRange, relocateProgram(&prog, &.{mk(7)}));
+    // not an LD_IMM64
+    relos[0].insn_idx = 2;
+    try testing.expectError(error.NotAnImmediateLoad, relocateProgram(&prog, &.{mk(7)}));
+    // map_value: sets src=2, patches both halves; the last instruction has no second half
+    relos[0] = .{ .kind = .map_value, .insn_idx = 0, .map_idx = 0, .value_off = 24, .sym_name = "g" };
+    try relocateProgram(&prog, &.{mk(7)});
+    try testing.expectEqual(@as(u4, BPF_PSEUDO_MAP_VALUE), insns[0].src);
+    try testing.expectEqual(@as(i32, 7), insns[0].imm);
+    try testing.expectEqual(@as(i32, 24), insns[1].imm);
+    var tail = [_]Insn{ @bitCast(I_EXIT), @bitCast(I_LD64) };
+    prog.insns = &tail;
+    relos[0].insn_idx = 1;
+    try testing.expectError(error.RelocationOutOfRange, relocateProgram(&prog, &.{mk(7)}));
+}
+
+test "patchCoreInsn: ranges, classes, widths" {
+    var v = [_]Insn{ @bitCast(ins8(0x61, 0x21, 4, 0)), @bitCast(ins8(0x07, 0x01, 0, 5)), @bitCast(ins8(0x18, 0, 0, 0)), @bitCast(I_LD64_HI) };
+    // LDX: off is an i16
+    try patchCoreInsn(&v, 0, .field_byte_offset, 32767);
+    try testing.expectEqual(@as(i16, 32767), v[0].off);
+    try testing.expectError(error.CoreValueTooLarge, patchCoreInsn(&v, 0, .field_byte_offset, 32768));
+    // byte size rewrites the opcode size bits only
+    for ([_][2]u64{ .{ 1, 0x10 }, .{ 2, 0x08 }, .{ 4, 0x00 }, .{ 8, 0x18 } }) |c| {
+        v[0] = @bitCast(ins8(0x61, 0x21, 4, 0));
+        try patchCoreInsn(&v, 0, .field_byte_size, c[0]);
+        try testing.expectEqual(@as(u8, 0x61 & ~@as(u8, 0x18)) | @as(u8, @intCast(c[1])), v[0].code);
+        try testing.expectEqual(@as(i16, 4), v[0].off);
+    }
+    try testing.expectError(error.CoreValueTooLarge, patchCoreInsn(&v, 0, .field_byte_size, 3));
+    // ALU with an immediate: i32 range; with a register source it is refused
+    try patchCoreInsn(&v, 1, .field_byte_offset, std.math.maxInt(i32));
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), v[1].imm);
+    try testing.expectError(error.CoreValueTooLarge, patchCoreInsn(&v, 1, .field_byte_offset, @as(u64, std.math.maxInt(i32)) + 1));
+    v[1] = @bitCast(ins8(0x0f, 0x01, 0, 5));
+    try testing.expectError(error.UnsupportedCoreInsn, patchCoreInsn(&v, 1, .field_byte_offset, 1));
+    // LD_IMM64: both halves; the pair must fit; plain BPF_LD forms are refused
+    try patchCoreInsn(&v, 2, .field_byte_offset, 0x1122_3344_5566_7788);
+    try testing.expectEqual(@as(u32, 0x5566_7788), @as(u32, @bitCast(v[2].imm)));
+    try testing.expectEqual(@as(u32, 0x1122_3344), @as(u32, @bitCast(v[3].imm)));
+    var last = [_]Insn{@bitCast(I_LD64)};
+    try testing.expectError(error.RelocationOutOfRange, patchCoreInsn(&last, 0, .field_byte_offset, 1));
+    var abs = [_]Insn{ @bitCast(ins8(0x20, 0, 0, 0)), @bitCast(I_EXIT) };
+    try testing.expectError(error.UnsupportedCoreInsn, patchCoreInsn(&abs, 0, .field_byte_offset, 1));
+    // out of range / unsupported class
+    try testing.expectError(error.RelocationOutOfRange, patchCoreInsn(&v, 4, .field_byte_offset, 1));
+    var jmp = [_]Insn{@bitCast(ins8(0x05, 0, 0, 0))};
+    try testing.expectError(error.UnsupportedCoreInsn, patchCoreInsn(&jmp, 0, .field_byte_offset, 1));
+}
+
+test "load: refusals that need no privilege come before any syscall" {
+    const gpa = testing.allocator;
+    const code = cat(.{ I_MOV0, I_EXIT });
+    // an unknown executable section
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        _ = try b.sec(.{ .name = "weird", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectError(error.UnknownProgramSection, load(&o, .{ .load_btf = false }));
+        try load(&o, .{ .load_btf = false, .ignore_unknown_sections = true });
+    }
+    // pinning, zero entries, and the map types that legitimately have none
+    {
+        var defs: [20]u8 = @splat(0);
+        std.mem.writeInt(u32, defs[0..4], 2, .little); // array
+        std.mem.writeInt(u32, defs[4..8], 4, .little);
+        std.mem.writeInt(u32, defs[8..12], 4, .little);
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const m = try b.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+        _ = try b.sym(.{ .name = "m1", .info = OBJ_SYM, .shndx = m, .value = 0 });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectError(error.ZeroMaxEntries, load(&o, .{ .load_btf = false }));
+        o.maps[0].max_entries = 1;
+        o.maps[0].pinning = 1;
+        try testing.expectError(error.PinningUnsupported, load(&o, .{ .load_btf = false }));
+        o.maps[0].pinning = 0;
+        o.maps[0].max_entries = 0;
+        o.maps[0].map_type = .struct_ops;
+        if (load(&o, .{ .load_btf = false })) |_| {} else |e| try testing.expect(e != error.ZeroMaxEntries);
+        o.close();
+        o.maps[0].map_type = .sk_storage;
+        if (load(&o, .{ .load_btf = false })) |_| {} else |e| try testing.expect(e != error.ZeroMaxEntries);
+        o.close();
+    }
+    // a license that cannot fit the kernel-bound buffer
+    {
+        var lic: [64]u8 = undefined;
+        @memset(&lic, 'G');
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        _ = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        _ = try b.sec(.{ .name = "license", .ty = 1, .flags = 3, .data = lic[0..64] });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectError(error.InvalidArgument, load(&o, .{ .load_btf = false }));
+        o.license = lic[0..63];
+        if (load(&o, .{ .load_btf = false })) |_| {} else |e| try testing.expect(e != error.InvalidArgument);
+        o.close();
+    }
+}
+
+test "Object fds: close releases, take transfers, zero is a valid fd" {
+    const gpa = testing.allocator;
+    const code = cat(.{ I_MOV0, I_EXIT });
+    var defs: [20]u8 = @splat(0);
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    _ = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+    const m = try b.sec(.{ .name = "maps", .ty = 1, .flags = 3, .data = &defs });
+    _ = try b.sym(.{ .name = "m1", .info = OBJ_SYM, .shndx = m, .value = 0 });
+    var o = try openObj(&b, .{});
+    defer o.deinit();
+    const devnull = struct {
+        fn open() linux.fd_t {
+            const rc = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            return @intCast(rc);
+        }
+        fn isOpen(fd: linux.fd_t) bool {
+            return linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) == .SUCCESS;
+        }
+    };
+    // fd 0 reads as a live fd (never "absent")
+    o.programs[0].fd = 0;
+    o.maps[0].fd = 0;
+    try testing.expectEqual(@as(?linux.fd_t, 0), o.programFd("xdp"));
+    try testing.expectEqual(@as(?linux.fd_t, 0), o.mapFd("m1"));
+    try testing.expectEqual(@as(?linux.fd_t, 0), o.takeProgramFd("xdp"));
+    try testing.expectEqual(@as(linux.fd_t, -1), o.programs[0].fd);
+    try testing.expectEqual(@as(?linux.fd_t, null), o.takeProgramFd("xdp"));
+    try testing.expectEqual(@as(?linux.fd_t, 0), o.takeMapFd("m1"));
+    try testing.expectEqual(@as(linux.fd_t, -1), o.maps[0].fd);
+    try testing.expectEqual(@as(?linux.fd_t, null), o.takeMapFd("m1"));
+    try testing.expectEqual(@as(?linux.fd_t, null), o.programFd("nope"));
+    try testing.expectEqual(@as(?linux.fd_t, null), o.mapFd("nope"));
+    try testing.expectEqual(@as(?linux.fd_t, null), o.programFd("xdp"));
+    try testing.expectEqual(@as(?linux.fd_t, null), o.mapFd("m1"));
+    // lookups by C name first, then by section name
+    try testing.expect(o.findProgram("xdp") != null);
+    // close really closes all three kinds
+    const f1 = devnull.open();
+    const f2 = devnull.open();
+    const f3 = devnull.open();
+    o.programs[0].fd = f1;
+    o.maps[0].fd = f2;
+    o.btf_fd = f3;
+    o.close();
+    try testing.expect(!devnull.isOpen(f1) and !devnull.isOpen(f2) and !devnull.isOpen(f3));
+    try testing.expectEqual(@as(linux.fd_t, -1), o.programs[0].fd);
+    try testing.expectEqual(@as(linux.fd_t, -1), o.maps[0].fd);
+    try testing.expectEqual(@as(linux.fd_t, -1), o.btf_fd);
+}
+
+test "findProgram: name first, then section name" {
+    const gpa = testing.allocator;
+    const code = cat(.{ I_MOV0, I_EXIT });
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const s1 = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+    _ = try b.sym(.{ .name = "xdp/b", .info = FUNC_SYM, .shndx = s1 });
+    const s2 = try b.sec(.{ .name = "xdp/b", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+    _ = try b.sym(.{ .name = "other", .info = FUNC_SYM, .shndx = s2 });
+    var o = try openObj(&b, .{});
+    defer o.deinit();
+    // "xdp/b" is the C name of the first program and the section name of the second
+    try testing.expectEqualStrings("xdp", o.findProgram("xdp/b").?.sec_name);
+    try testing.expectEqualStrings("xdp/b", o.findProgram("other").?.sec_name);
+    try testing.expectEqual(@as(?*ProgramSpec, null), o.findProgram("nope"));
+}
+
+// ── whole-module mutation, round 3 ──────────────────────────────────────────
+
+const RawB = btf_mod.RawBtf;
+
+const MemKind = enum { uint, ptr_int, ptr_void, plain_int, ptr_plain };
+const MapMem = struct { name: []const u8, kind: MemKind, v: u32 = 0 };
+const Flavor = enum { ok, non_var, nameless, non_struct };
+
+/// An ET_REL whose `.maps` section is described by hand-made BTF.
+fn mapsObject(gpa: std.mem.Allocator, members: []const MapMem, flavor: Flavor) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const int4 = try r.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    var extra: std.ArrayList(u32) = .empty;
+    defer extra.deinit(gpa);
+    for (members) |m| {
+        const name_off = try r.str(gpa, m.name);
+        const ty: u32 = switch (m.kind) {
+            .uint => blk: {
+                const a = try r.rec(gpa, 0, btf_mod.K_ARRAY, 0, false, 0, &.{ int4, int4, m.v });
+                break :blk try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, a, &.{});
+            },
+            .ptr_int, .ptr_plain => try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, int4, &.{}),
+            .ptr_void => try r.rec(gpa, 0, btf_mod.K_PTR, 0, false, 0, &.{}),
+            .plain_int => int4,
+        };
+        try extra.appendSlice(gpa, &.{ name_off, ty, 0 });
+    }
+    const st = try r.rec(gpa, 0, btf_mod.K_STRUCT, @intCast(members.len), false, 8, extra.items);
+    const var_name = if (flavor == .nameless) 0 else try r.str(gpa, "m1");
+    const var_ty: u32 = if (flavor == .non_struct) int4 else st;
+    const v = try r.rec(gpa, var_name, btf_mod.K_VAR, 0, false, var_ty, &.{1});
+    const ds_name = try r.str(gpa, ".maps");
+    const entry: u32 = if (flavor == .non_var) int4 else v;
+    _ = try r.rec(gpa, ds_name, btf_mod.K_DATASEC, 1, false, 8, &.{ entry, 0, 8 });
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const zeros: [8]u8 = @splat(0);
+    _ = try b.sec(.{ .name = ".maps", .ty = 1, .flags = 3, .data = &zeros });
+    _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob });
+    return b.build();
+}
+
+test "BTF-defined maps: every member lands in its field; every malformation is typed" {
+    const gpa = testing.allocator;
+    const Case = struct { mem: []const MapMem, flavor: Flavor = .ok, want: ?anyerror = null };
+    const bad = [_]Case{
+        .{ .mem = &.{}, .flavor = .non_var, .want = error.MalformedMapDefinition },
+        .{ .mem = &.{}, .flavor = .nameless, .want = error.MalformedMapDefinition },
+        .{ .mem = &.{}, .flavor = .non_struct, .want = error.MalformedMapDefinition },
+        .{ .mem = &.{.{ .name = "foo", .kind = .uint, .v = 1 }}, .want = error.UnknownMapMember },
+        .{ .mem = &.{.{ .name = "values", .kind = .ptr_int }}, .want = error.MapInMapUnsupported },
+        .{ .mem = &.{.{ .name = "key", .kind = .plain_int }}, .want = error.MalformedMapDefinition },
+        .{ .mem = &.{.{ .name = "value", .kind = .ptr_void }}, .want = error.MalformedMapDefinition },
+        .{ .mem = &.{.{ .name = "max_entries", .kind = .ptr_plain }}, .want = error.MalformedMapDefinition },
+        .{ .mem = &.{.{ .name = "max_entries", .kind = .plain_int }}, .want = error.MalformedMapDefinition },
+        .{ .mem = &.{.{ .name = "map_extra", .kind = .uint, .v = 1 }}, .want = error.UnknownMapMember },
+    };
+    for (bad, 0..) |c, ci| {
+        const bytes = try mapsObject(gpa, c.mem, c.flavor);
+        defer gpa.free(bytes);
+        testing.expectError(c.want.?, open(gpa, bytes, .{})) catch |e| {
+            std.debug.print("maps case {d}\n", .{ci});
+            return e;
+        };
+    }
+    // no members: all defaults
+    {
+        const bytes = try mapsObject(gpa, &.{}, .ok);
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 1), o.maps.len);
+        try testing.expectEqual(BPF.MapType.unspec, o.maps[0].map_type);
+        try testing.expectEqual(@as(u32, 0), o.maps[0].max_entries);
+        try testing.expectEqual(MapOrigin.btf_defined, o.maps[0].origin);
+        try testing.expectEqualStrings("m1", o.maps[0].name);
+    }
+    // every member
+    {
+        const bytes = try mapsObject(gpa, &.{
+            .{ .name = "type", .kind = .uint, .v = 1 },
+            .{ .name = "max_entries", .kind = .uint, .v = 16 },
+            .{ .name = "map_flags", .kind = .uint, .v = 0x11 },
+            .{ .name = "key_size", .kind = .uint, .v = 5 },
+            .{ .name = "value_size", .kind = .uint, .v = 9 },
+            .{ .name = "numa_node", .kind = .uint, .v = 3 },
+            .{ .name = "pinning", .kind = .uint, .v = 1 },
+            .{ .name = "map_extra", .kind = .uint, .v = 0 },
+            .{ .name = "key", .kind = .ptr_int },
+            .{ .name = "value", .kind = .ptr_int },
+        }, .ok);
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        const m = o.maps[0];
+        try testing.expectEqual(BPF.MapType.hash, m.map_type);
+        try testing.expectEqual(@as(u32, 16), m.max_entries);
+        try testing.expectEqual(@as(u32, 0x11), m.map_flags);
+        // `key`/`value` come last and set the sizes from the pointee (4), after key_size/value_size
+        try testing.expectEqual(@as(u32, 4), m.key_size);
+        try testing.expectEqual(@as(u32, 4), m.value_size);
+        try testing.expectEqual(@as(?u32, 3), m.numa_node);
+        try testing.expectEqual(@as(u32, 1), m.pinning);
+        try testing.expectEqual(@as(u32, 1), m.btf_key_type_id);
+        try testing.expectEqual(@as(u32, 1), m.btf_value_type_id);
+    }
+    // explicit key_size / value_size alone
+    {
+        const bytes = try mapsObject(gpa, &.{
+            .{ .name = "key_size", .kind = .uint, .v = 5 },
+            .{ .name = "value_size", .kind = .uint, .v = 9 },
+        }, .ok);
+        defer gpa.free(bytes);
+        var o = try open(gpa, bytes, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(u32, 5), o.maps[0].key_size);
+        try testing.expectEqual(@as(u32, 9), o.maps[0].value_size);
+        try testing.expectEqual(@as(u32, 0), o.maps[0].btf_key_type_id);
+    }
+}
+
+test "small object edges: unnamed function symbol, non-REL sections, relocation target at the table end" {
+    const gpa = testing.allocator;
+    const code = cat(.{ I_MOV0, I_EXIT });
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const s = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        _ = try b.sym(.{ .name = "", .info = FUNC_SYM, .shndx = s, .value = 0, .size = 16 });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectEqualStrings("xdp", o.programs[0].name);
+    }
+    // a RELA-typed section naming the program is not a REL section: ignored
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const p = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+        var rel: [24]u8 = @splat(0xff);
+        std.mem.writeInt(u64, rel[0..8], 0, .little);
+        _ = try b.sec(.{ .name = ".relaxdp", .ty = 4, .data = &rel, .link = ObjB.SYMTAB_LINK, .info = p, .entsize = 24 });
+        var o = try openObj(&b, .{});
+        defer o.deinit();
+        try testing.expectEqual(@as(usize, 0), o.programs[0].relos.len);
+    }
+    // a relocation symbol whose section index equals the section count
+    {
+        var b = ObjB.init(gpa);
+        defer b.deinit();
+        const c2 = cat(.{ I_LD64, I_LD64_HI, I_EXIT });
+        const p = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &c2 });
+        const nsec: u16 = @intCast(b.secs.items.len + 1 + 3 + 1); // + rel section + symtab/strtab/shstrtab + null
+        const sidx = try b.sym(.{ .name = "z", .info = OBJ_SYM, .shndx = nsec });
+        var rel: [16]u8 = undefined;
+        std.mem.writeInt(u64, rel[0..8], 0, .little);
+        std.mem.writeInt(u64, rel[8..16], (@as(u64, sidx) << 32) | 1, .little);
+        _ = try b.sec(.{ .name = ".relxdp", .ty = elfsym.SHT_REL, .data = &rel, .link = ObjB.SYMTAB_LINK, .info = p, .entsize = 16 });
+        try testing.expectError(error.MalformedElf, openObj(&b, .{}));
+    }
+}
+
+/// `.BTF.ext` for one `xdp` section group (+ a decoy group), records at the given byte offsets.
+fn extBlob(gpa: std.mem.Allocator, name_off: u32, other_off: u32, per_kind: [3][]const u32) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const w = struct {
+        fn f(g: std.mem.Allocator, l: *std.ArrayList(u8), v: u32) !void {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b, v, .little);
+            try l.appendSlice(g, &b);
+        }
+    }.f;
+    // sub-sections: func (rec 8), line (rec 16), core (rec 16); each: rec_size + group(name, n, recs) + decoy group
+    var parts: [3]std.ArrayList(u8) = .{ .empty, .empty, .empty };
+    defer for (&parts) |*p| p.deinit(gpa);
+    const sizes = [_]u32{ 8, 16, 16 };
+    for (&parts, sizes, per_kind) |*p, rs, offs| {
+        try w(gpa, p, rs);
+        try w(gpa, p, name_off);
+        try w(gpa, p, @intCast(offs.len));
+        for (offs, 0..) |o, i| {
+            try w(gpa, p, o);
+            try w(gpa, p, 100 + @as(u32, @intCast(i))); // type id / file name off / ...
+            if (rs == 16) {
+                try w(gpa, p, 7);
+                try w(gpa, p, 0);
+            }
+        }
+        // decoy group for another section name
+        try w(gpa, p, other_off);
+        try w(gpa, p, 1);
+        try w(gpa, p, 0);
+        try w(gpa, p, 999);
+        if (rs == 16) {
+            try w(gpa, p, 7);
+            try w(gpa, p, 0);
+        }
+    }
+    var hdr: [32]u8 = @splat(0);
+    std.mem.writeInt(u16, hdr[0..2], 0xeb9f, .little);
+    hdr[2] = 1;
+    std.mem.writeInt(u32, hdr[4..8], 32, .little);
+    var off: u32 = 0;
+    for (parts, 0..) |p, i| {
+        std.mem.writeInt(u32, hdr[8 + i * 8 ..][0..4], off, .little);
+        std.mem.writeInt(u32, hdr[12 + i * 8 ..][0..4], @intCast(p.items.len), .little);
+        off += @intCast(p.items.len);
+    }
+    try out.appendSlice(gpa, &hdr);
+    for (parts) |p| try out.appendSlice(gpa, p.items);
+    return out.toOwnedSlice(gpa);
+}
+
+fn extObject(gpa: std.mem.Allocator, offs: []const u32) ![]u8 {
+    return extObject3(gpa, .{ offs, offs, offs });
+}
+
+fn extObject3(gpa: std.mem.Allocator, per_kind: [3][]const u32) ![]u8 {
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_xdp = try r.str(gpa, "xdp");
+    const n_other = try r.str(gpa, "other");
+    _ = try r.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    const ext = try extBlob(gpa, n_xdp, n_other, per_kind);
+    defer gpa.free(ext);
+    const code = cat(.{ I_MOV0, I_EXIT, I_MOV0, I_EXIT });
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const s = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+    _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob });
+    _ = try b.sec(.{ .name = ".BTF.ext", .ty = 1, .data = ext });
+    _ = try b.sym(.{ .name = "f1", .info = FUNC_SYM, .shndx = s, .value = 0, .size = 16 });
+    _ = try b.sym(.{ .name = "f2", .info = FUNC_SYM, .shndx = s, .value = 16, .size = 16 });
+    return b.build();
+}
+
+test ".BTF.ext records are split per program and rebased to instruction indices" {
+    const gpa = testing.allocator;
+    const bytes = try extObject(gpa, &.{ 0, 8, 16, 32 });
+    defer gpa.free(bytes);
+    var o = try open(gpa, bytes, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 2), o.programs.len);
+    const p0 = o.programs[0];
+    const p1 = o.programs[1];
+    // f1 covers bytes [0,16): records at 0 and 8; f2 covers [16,32): the record at 16 only; 32 is past it
+    try testing.expectEqual(@as(usize, 2), p0.func_info.len);
+    try testing.expectEqual(@as(u32, 0), p0.func_info[0].insn_off);
+    try testing.expectEqual(@as(u32, 1), p0.func_info[1].insn_off);
+    try testing.expectEqual(@as(u32, 101), p0.func_info[1].type_id);
+    try testing.expectEqual(@as(usize, 1), p1.func_info.len);
+    try testing.expectEqual(@as(u32, 0), p1.func_info[0].insn_off);
+    try testing.expectEqual(@as(u32, 102), p1.func_info[0].type_id);
+    try testing.expectEqual(@as(usize, 2), p0.line_info.len);
+    try testing.expectEqual(@as(usize, 1), p1.line_info.len);
+    try testing.expectEqual(@as(u32, 0), p1.line_info[0].insn_off);
+    try testing.expectEqual(@as(u32, 1), p0.line_info[1].insn_off);
+    try testing.expectEqual(@as(usize, 2), p0.core_relos.len);
+    try testing.expectEqual(@as(usize, 1), p1.core_relos.len);
+    try testing.expectEqual(@as(u32, 0), p1.core_relos[0].insn_off);
+    try testing.expectEqual(@as(u32, 1), p0.core_relos[1].insn_off);
+    // the decoy group (another section name, record at 0) was not attributed to anyone
+    for (p0.func_info) |f| try testing.expect(f.type_id != 999);
+    for (p0.core_relos) |c| try testing.expect(c.type_id != 999);
+    for (p0.line_info) |c| try testing.expect(c.file_name_off != 999);
+    // a record that is not 8-aligned inside a program is refused (each kind)
+    const bad = try extObject(gpa, &.{4});
+    defer gpa.free(bad);
+    try testing.expectError(error.RelocationOutOfRange, open(gpa, bad, .{}));
+    // ... and the same for the line_info and the core_relo records on their own
+    const ok_offs = [_]u32{ 0, 8 };
+    const bad_offs = [_]u32{4};
+    const bad_line = try extObject3(gpa, .{ &ok_offs, &bad_offs, &ok_offs });
+    defer gpa.free(bad_line);
+    try testing.expectError(error.RelocationOutOfRange, open(gpa, bad_line, .{}));
+    const bad_core = try extObject3(gpa, .{ &ok_offs, &ok_offs, &bad_offs });
+    defer gpa.free(bad_core);
+    try testing.expectError(error.RelocationOutOfRange, open(gpa, bad_core, .{}));
+}
+
+test "load: CO-RE relocations are applied before anything is created" {
+    const gpa = testing.allocator;
+    var r = try RawB.init(gpa);
+    defer r.deinit(gpa);
+    const n_s = try r.str(gpa, "S");
+    const n_x = try r.str(gpa, "x");
+    const acc = try r.str(gpa, "0:0");
+    const int4 = try r.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    const st = try r.rec(gpa, n_s, btf_mod.K_STRUCT, 1, false, 8, &.{ n_x, int4, 32 });
+    const blob = try r.finish(gpa);
+    defer gpa.free(blob);
+    // .BTF.ext with only a core_relo group: insn 0, type S, access "0:0", FIELD_BYTE_OFFSET
+    var ext: [32 + 4 + 8 + 16]u8 = @splat(0);
+    std.mem.writeInt(u16, ext[0..2], 0xeb9f, .little);
+    ext[2] = 1;
+    std.mem.writeInt(u32, ext[4..8], 32, .little);
+    std.mem.writeInt(u32, ext[24..28], 0, .little); // core_relo_off
+    std.mem.writeInt(u32, ext[28..32], 4 + 8 + 16, .little);
+    std.mem.writeInt(u32, ext[32..36], 16, .little); // rec_size
+    std.mem.writeInt(u32, ext[36..40], 0, .little); // sec_name_off: patched below
+    std.mem.writeInt(u32, ext[40..44], 1, .little); // one record
+    std.mem.writeInt(u32, ext[44..48], 0, .little); // insn_off
+    std.mem.writeInt(u32, ext[48..52], st, .little);
+    std.mem.writeInt(u32, ext[52..56], acc, .little);
+    std.mem.writeInt(u32, ext[56..60], 0, .little);
+    // the section-name string lives in the same BTF: "xdp" appended before finish would be
+    // cleaner, so look it up the way the loader does (offset of "S" is not it): add it now.
+    var r2 = try RawB.init(gpa);
+    defer r2.deinit(gpa);
+    _ = try r2.str(gpa, "S");
+    _ = try r2.str(gpa, "x");
+    _ = try r2.str(gpa, "0:0");
+    const xdp_off = try r2.str(gpa, "xdp");
+    _ = try r2.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    _ = try r2.rec(gpa, n_s, btf_mod.K_STRUCT, 1, false, 8, &.{ n_x, int4, 32 });
+    const blob2 = try r2.finish(gpa);
+    defer gpa.free(blob2);
+    std.mem.writeInt(u32, ext[36..40], xdp_off, .little);
+    var b = ObjB.init(gpa);
+    defer b.deinit();
+    const ins = ins8(0x61, 0x21, 77, 0);
+    const code = flatIns(2, .{ ins, I_EXIT });
+    _ = try b.sec(.{ .name = "xdp", .ty = 1, .flags = ObjB.EXEC, .data = &code });
+    _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob2 });
+    _ = try b.sec(.{ .name = ".BTF.ext", .ty = 1, .data = &ext });
+    var o = try openObj(&b, .{});
+    defer o.deinit();
+    try testing.expectEqual(@as(usize, 1), o.programs[0].core_relos.len);
+    try testing.expectEqual(@as(i16, 77), o.programs[0].insns[0].off);
+    // core on: the relocation is applied (and the load then fails at the first privileged step)
+    if (load(&o, .{ .load_btf = false, .target_btf = &o.btf.? })) |_| {} else |_| {}
+    try testing.expectEqual(@as(i16, 4), o.programs[0].insns[0].off);
+    o.close();
+}
+
+test "fixupDatasecs: sizes and offsets come from the ELF, entries end up sorted" {
+    const gpa = testing.allocator;
+    const mk = struct {
+        fn obj(g: std.mem.Allocator, g1_value: u64) ![]u8 {
+            var r = try RawB.init(g);
+            defer r.deinit(g);
+            const n_g1 = try r.str(g, "g1");
+            const n_g2 = try r.str(g, "g2");
+            const n_ds = try r.str(g, ".data");
+            const int4 = try r.rec(g, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+            const v1 = try r.rec(g, n_g1, btf_mod.K_VAR, 0, false, int4, &.{1});
+            const v2 = try r.rec(g, n_g2, btf_mod.K_VAR, 0, false, int4, &.{1});
+            _ = try r.rec(g, n_ds, btf_mod.K_DATASEC, 2, false, 0, &.{ v1, 0, 7, v2, 0, 7 });
+            const blob = try r.finish(g);
+            defer g.free(blob);
+            var b = ObjB.init(g);
+            defer b.deinit();
+            const zeros: [32]u8 = @splat(0);
+            const d = try b.sec(.{ .name = ".data", .ty = 1, .flags = 3, .data = &zeros });
+            const other = try b.sec(.{ .name = "other", .ty = 1, .flags = 3, .data = "x" });
+            _ = try b.sec(.{ .name = ".BTF", .ty = 1, .data = blob });
+            _ = try b.sym(.{ .name = "g1", .info = OBJ_SYM, .shndx = other, .value = 99, .size = 99 }); // decoy
+            _ = try b.sym(.{ .name = "g1", .info = OBJ_SYM, .shndx = d, .value = g1_value, .size = 8 });
+            _ = try b.sym(.{ .name = "g2", .info = OBJ_SYM, .shndx = d, .value = 4, .size = 0 });
+            return b.build();
+        }
+    }.obj;
+    const bytes = try mk(gpa, 16);
+    defer gpa.free(bytes);
+    var o = try open(gpa, bytes, .{});
+    defer o.deinit();
+    try fixupDatasecs(&o);
+    var b2 = try btf_mod.parse(gpa, o.btf_bytes.?, .{});
+    defer b2.deinit();
+    const ds = try b2.byId(4);
+    try testing.expectEqual(@as(u32, 32), ds.size_type);
+    const first = try b2.varSecInfo(ds, 0);
+    const second = try b2.varSecInfo(ds, 1);
+    try testing.expectEqual(@as(u32, 4), first.offset); // g2 sorted first
+    try testing.expectEqual(@as(u32, 7), first.size); // zero st_size leaves the size alone
+    try testing.expectEqual(@as(u32, 16), second.offset);
+    try testing.expectEqual(@as(u32, 8), second.size);
+    // idempotent
+    try fixupDatasecs(&o);
+    // st_value must fit a u32: the maximum does, one more does not
+    const edge = try mk(gpa, std.math.maxInt(u32));
+    defer gpa.free(edge);
+    var oe = try open(gpa, edge, .{});
+    defer oe.deinit();
+    try fixupDatasecs(&oe);
+    const over = try mk(gpa, @as(u64, std.math.maxInt(u32)) + 1);
+    defer gpa.free(over);
+    var oo = try open(gpa, over, .{});
+    defer oo.deinit();
+    try testing.expectError(error.MalformedElf, fixupDatasecs(&oo));
+}
+
+test "applyCoreRelos: a missing field is an error unless the relocation asks whether it exists" {
+    const gpa = testing.allocator;
+    var l = try RawB.init(gpa);
+    defer l.deinit(gpa);
+    const ln_s = try l.str(gpa, "S");
+    const ln_x = try l.str(gpa, "x");
+    const acc = try l.str(gpa, "0:0");
+    const li = try l.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    const ls = try l.rec(gpa, ln_s, btf_mod.K_STRUCT, 1, false, 8, &.{ ln_x, li, 32 });
+    const lb = try l.finish(gpa);
+    defer gpa.free(lb);
+    var local = try btf_mod.parse(gpa, lb, .{});
+    defer local.deinit();
+    var t = try RawB.init(gpa);
+    defer t.deinit(gpa);
+    const tn = try t.str(gpa, "S");
+    _ = try t.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    _ = try t.rec(gpa, tn, btf_mod.K_STRUCT, 0, false, 0, &.{});
+    const tb = try t.finish(gpa);
+    defer gpa.free(tb);
+    var target = try btf_mod.parse(gpa, tb, .{});
+    defer target.deinit();
+    var insns = [_]Insn{@bitCast(ins8(0x61, 0x21, 77, 0))};
+    var relos = [_]btfext.CoreRelo{.{ .insn_off = 0, .type_id = ls, .access_str_off = acc, .kind = 0 }};
+    var prog: ProgramSpec = undefined;
+    prog.insns = &insns;
+    prog.core_relos = &relos;
+    try testing.expectError(error.CoreFieldNotFound, applyCoreRelos(&prog, &local, &target));
+    try testing.expectEqual(@as(i16, 77), insns[0].off); // untouched
+    relos[0].kind = 2; // FIELD_EXISTS: 0, applied
+    try testing.expectEqual(@as(usize, 1), try applyCoreRelos(&prog, &local, &target));
+    try testing.expectEqual(@as(i16, 0), insns[0].off); // the "absent" value 0 is what gets written
+    // against itself: the offset is re-derived and written, the count is exact
+    relos[0].kind = 0;
+    try testing.expectEqual(@as(usize, 1), try applyCoreRelos(&prog, &local, &local));
+    try testing.expectEqual(@as(i16, 4), insns[0].off);
+}

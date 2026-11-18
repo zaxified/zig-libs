@@ -1734,3 +1734,506 @@ test "fieldByName resolves against the running kernel" {
     try testing.expectEqual(@as(?FieldInfo, null), try fieldByName(&k, "zig_libs_nope", &.{"x"}));
     try testing.expectEqual(@as(?FieldInfo, null), try fieldByName(&k, "task_struct", &.{"zig_libs_nope"}));
 }
+
+// ── whole-module mutation (2026-11-18) ──────────────────────────────────────
+
+const RawBtf = btf.RawBtf;
+
+test "ReloKind.isField / Header.hasCoreRelos" {
+    for ([_]ReloKind{ .field_byte_offset, .field_byte_size, .field_exists, .field_signed, .field_lshift_u64, .field_rshift_u64 }) |k| {
+        try testing.expect(k.isField());
+    }
+    for ([_]ReloKind{ .type_id_local, .type_id_target, .type_exists, .type_size, .enumval_exists, .enumval_value, .type_matches }) |k| {
+        try testing.expect(!k.isField());
+    }
+    try testing.expect(!(ReloKind.isField(@fromBackingInt(@intCast(99)))));
+    const h = struct {
+        fn mk(hdr_len: u32, len: u32) Header {
+            return .{ .flags = 0, .hdr_len = hdr_len, .func_info_off = 0, .func_info_len = 0, .line_info_off = 0, .line_info_len = 0, .core_relo_off = 0, .core_relo_len = len };
+        }
+    }.mk;
+    try testing.expect(h(32, 1).hasCoreRelos());
+    try testing.expect(!h(24, 1).hasCoreRelos());
+    try testing.expect(!h(32, 0).hasCoreRelos());
+}
+
+test "SectionIter and parseExt: exact-fit edges" {
+    const gpa = testing.allocator;
+    // a lone group header with zero records is a complete iteration step
+    var hdr: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, hdr[0..4], 7, native_endian);
+    var it: SectionIter = .{ .rec_size = 8, .data = &hdr };
+    const g = it.next().?;
+    try testing.expectEqual(@as(u32, 7), g.sec_name_off);
+    try testing.expectEqual(@as(u32, 0), g.count);
+    try testing.expectEqual(@as(?SectionInfo, null), it.next());
+    // two groups: the position advances past the first one's records
+    var two: [32]u8 = @splat(0);
+    std.mem.writeInt(u32, two[0..4], 1, native_endian);
+    std.mem.writeInt(u32, two[4..8], 1, native_endian); // one record of 8 bytes
+    std.mem.writeInt(u32, two[8..12], 0xaa, native_endian);
+    std.mem.writeInt(u32, two[16..20], 2, native_endian);
+    std.mem.writeInt(u32, two[20..24], 1, native_endian);
+    std.mem.writeInt(u32, two[24..28], 0xbb, native_endian);
+    var it2: SectionIter = .{ .rec_size = 8, .data = &two };
+    try testing.expectEqual(@as(u32, 1), it2.next().?.sec_name_off);
+    const second = it2.next().?;
+    try testing.expectEqual(@as(u32, 2), second.sec_name_off);
+    try testing.expectEqual(@as(u32, 0xbb), rd32(second.records, 0));
+    try testing.expectEqual(@as(?SectionInfo, null), it2.next());
+    // a count whose records overrun the data ends the walk instead of slicing past it
+    var over: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, over[4..8], 3, native_endian);
+    var it3: SectionIter = .{ .rec_size = 8, .data = &over };
+    try testing.expectEqual(@as(?SectionInfo, null), it3.next());
+    // ... and an exactly fitting last group is returned
+    var fit: [16]u8 = @splat(0);
+    std.mem.writeInt(u32, fit[4..8], 1, native_endian);
+    var it4: SectionIter = .{ .rec_size = 8, .data = &fit };
+    try testing.expectEqual(@as(u32, 1), it4.next().?.count);
+
+    // parseExt: an 8-byte blob with a good magic is malformed (header longer than the blob)
+    var eight: [8]u8 = @splat(0);
+    std.mem.writeInt(u16, eight[0..2], magic, native_endian);
+    eight[2] = version;
+    std.mem.writeInt(u32, eight[4..8], 24, native_endian);
+    try testing.expectError(error.MalformedExt, parseExt(&eight));
+    try testing.expectError(error.NotBtfExt, parseExt(eight[0..7]));
+    // a 4-byte sub-section is just the rec_size word (no groups); rec_size 256 is the ceiling
+    {
+        var four: [4]u8 = undefined;
+        std.mem.writeInt(u32, &four, 8, native_endian);
+        const blob = try SynthExt.build(gpa, &four, "", "", header_size_min);
+        defer gpa.free(blob);
+        const e = try parseExt(blob);
+        try testing.expectEqual(@as(u32, 8), e.func_info_rec_size);
+        var big: [4]u8 = undefined;
+        std.mem.writeInt(u32, &big, 256, native_endian);
+        const blob2 = try SynthExt.build(gpa, &big, "", "", header_size_min);
+        defer gpa.free(blob2);
+        _ = try parseExt(blob2);
+        std.mem.writeInt(u32, &big, 260, native_endian);
+        const blob3 = try SynthExt.build(gpa, &big, "", "", header_size_min);
+        defer gpa.free(blob3);
+        try testing.expectError(error.MalformedExt, parseExt(blob3));
+    }
+    // validateGroups: a group header with no records fits exactly; one stray byte does not
+    try validateGroups(&hdr, 8);
+    var stray: [9]u8 = @splat(0);
+    try testing.expectError(error.MalformedExt, validateGroups(&stray, 8));
+    var seven: [7]u8 = @splat(0);
+    try testing.expectError(error.MalformedExt, validateGroups(&seven, 8));
+}
+
+test "access strings and the indexed bit-offset arithmetic" {
+    var out: [max_spec_len]u32 = undefined;
+    try testing.expectError(error.BadAccessSpec, parseAccessIndices("", &out));
+    try testing.expectError(error.BadAccessSpec, parseAccessIndices("0::1", &out));
+    try testing.expectError(error.BadAccessSpec, parseAccessIndices(":1", &out));
+    try testing.expectError(error.BadAccessSpec, parseAccessIndices("1:", &out));
+    try testing.expectError(error.BadAccessSpec, parseAccessIndices("a", &out));
+    try testing.expectError(error.BadAccessSpec, parseAccessIndices("-1", &out));
+    try testing.expectEqual(@as(usize, 3), try parseAccessIndices("12:34:56", &out));
+    try testing.expectEqual(@as(u32, 34), out[1]);
+    try testing.expectError(error.BadAccessSpec, parseAccessIndices("0x10", &out));
+    // exactly max_spec_len components fit, one more does not
+    var s: [2 * max_spec_len + 2]u8 = undefined;
+    var n: usize = 0;
+    for (0..max_spec_len) |i| {
+        if (i != 0) {
+            s[n] = ':';
+            n += 1;
+        }
+        s[n] = '0';
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, max_spec_len), try parseAccessIndices(s[0..n], &out));
+    s[n] = ':';
+    s[n + 1] = '0';
+    try testing.expectError(error.BadAccessSpec, parseAccessIndices(s[0 .. n + 2], &out));
+
+    var bo: u64 = 5;
+    try addIndexedBitOffset(&bo, 3, 4);
+    try testing.expectEqual(@as(u64, 5 + 3 * 32), bo);
+    try testing.expectError(error.FieldOffsetOverflow, addIndexedBitOffset(&bo, 1, @as(u64, 1) << 61)); // size * 8
+    bo = std.math.maxInt(u64) - 4;
+    try testing.expectError(error.FieldOffsetOverflow, addIndexedBitOffset(&bo, 1, 1)); // the sum
+    bo = 0;
+    try testing.expectError(error.FieldOffsetOverflow, addIndexedBitOffset(&bo, 0xffff_ffff, @as(u64, 1) << 31)); // index * bits
+}
+
+/// Local/target pair used by the CO-RE walk tests. Layout (bits):
+///   int   id1 (4 bytes), enum id2 (kflag: signed), fwd id3,
+///   arr   id4 = int[4],
+///   Inner id5 { int y @0 },
+///   S     id6 { int a @0; int[4] arr @32; Inner in @160; (anon) union U @192 { int u @0 } }
+const WalkFx = struct {
+    fn build(gpa: std.mem.Allocator, name: []const u8, order_swap: bool) ![]u8 {
+        var r = try RawBtf.init(gpa);
+        defer r.deinit(gpa);
+        const n_a = try r.str(gpa, "a");
+        const n_arr = try r.str(gpa, "arr");
+        const n_in = try r.str(gpa, "in");
+        const n_y = try r.str(gpa, "y");
+        const n_u = try r.str(gpa, "u");
+        const n_s = try r.str(gpa, name);
+        const int4 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+        _ = try r.rec(gpa, 0, btf.K_ENUM, 1, true, 4, &.{ n_a, 1 });
+        _ = try r.rec(gpa, n_s, btf.K_FWD, 0, false, 0, &.{});
+        const arr = try r.rec(gpa, 0, btf.K_ARRAY, 0, false, 0, &.{ int4, int4, 4 });
+        const inner = try r.rec(gpa, 0, btf.K_STRUCT, 1, false, 4, &.{ n_y, int4, 0 });
+        const uni = try r.rec(gpa, 0, btf.K_UNION, 1, false, 4, &.{ n_u, int4, 0 });
+        if (order_swap) {
+            _ = try r.rec(gpa, n_s, btf.K_STRUCT, 4, false, 28, &.{ 0, uni, 192, n_in, inner, 160, n_arr, arr, 32, n_a, int4, 0 });
+        } else {
+            _ = try r.rec(gpa, n_s, btf.K_STRUCT, 4, false, 28, &.{ n_a, int4, 0, n_arr, arr, 32, n_in, inner, 160, 0, uni, 192 });
+        }
+        return r.finish(gpa);
+    }
+};
+
+fn accessOf(b: *const Btf, root: u32, spec: []const u8) CoreError!FieldSpec {
+    return parseFieldSpec(b, root, spec);
+}
+
+test "parseFieldSpec: local walk bookkeeping" {
+    const gpa = testing.allocator;
+    const bytes = try WalkFx.build(gpa, "S", false);
+    defer gpa.free(bytes);
+    var b = try btf.parse(gpa, bytes, .{});
+    defer b.deinit();
+    const S: u32 = 7;
+    const sp0 = try accessOf(&b, S, "2");
+    try testing.expectEqual(@as(u32, 2), sp0.steps[0].index);
+    try testing.expectEqual(@as(u64, 2 * 28 * 8), sp0.bit_offset);
+    try testing.expectEqual(@as(usize, 1), sp0.len);
+    // index 0 of a root with no size is fine (no size is needed)
+    const sp_f = try accessOf(&b, 3, "0");
+    try testing.expectEqual(@as(u64, 0), sp_f.bit_offset);
+    // arr[3] through the member: 32 + 3*32
+    const sp1 = try accessOf(&b, S, "0:1:3");
+    try testing.expectEqual(@as(u64, 32 + 96), sp1.bit_offset);
+    try testing.expectEqual(@as(u32, 1), sp1.leaf_type_id);
+    try testing.expectEqual(@as(usize, 3), sp1.len);
+    try testing.expect(sp1.steps[1].name != null and std.mem.eql(u8, sp1.steps[1].name.?, "arr"));
+    try testing.expectEqual(@as(?[]const u8, null), sp1.steps[2].name);
+    // member a (leaf type is the member's, not the root's)
+    const sp2 = try accessOf(&b, S, "0:0");
+    try testing.expectEqual(@as(u32, 1), sp2.leaf_type_id);
+    // through a nested struct and the anonymous union (its step has no name)
+    const sp3 = try accessOf(&b, S, "0:2:0");
+    try testing.expectEqual(@as(u64, 160), sp3.bit_offset);
+    try testing.expectEqualStrings("y", sp3.steps[2].name.?);
+    const sp4 = try accessOf(&b, S, "0:3:0");
+    try testing.expectEqual(@as(u64, 192), sp4.bit_offset);
+    try testing.expectEqual(@as(?[]const u8, null), sp4.steps[1].name);
+    try testing.expectEqualStrings("u", sp4.steps[2].name.?);
+    // bounds: member index == vlen, stepping into a scalar, a bad root
+    try testing.expectError(error.BadLocalSpec, accessOf(&b, S, "0:4"));
+    try testing.expectError(error.BadLocalSpec, accessOf(&b, S, "0:0:0"));
+    try testing.expectError(error.BadLocalSpec, accessOf(&b, S, "0:1:0:0"));
+}
+
+test "matchFieldSpec: by name in a differently laid-out target" {
+    const gpa = testing.allocator;
+    const lb = try WalkFx.build(gpa, "S___v1", false);
+    defer gpa.free(lb);
+    const tb = try WalkFx.build(gpa, "S", true); // same members, reversed order
+    defer gpa.free(tb);
+    var local = try btf.parse(gpa, lb, .{});
+    defer local.deinit();
+    var target = try btf.parse(gpa, tb, .{});
+    defer target.deinit();
+    const S: u32 = 7;
+    // flavor stripped: S___v1 finds S; `a` moved from member 0 to member 3 (bit 0 -> 0 here, but index differs)
+    const sa = try parseFieldSpec(&local, S, "0:0");
+    const ta = (try matchFieldSpec(&local, sa, &target)).?;
+    try testing.expectEqual(@as(u32, 3), ta.steps[1].index); // the TARGET's member index
+    try testing.expectEqualStrings("a", ta.steps[1].name.?);
+    try testing.expectEqual(@as(u32, S), ta.root_type_id);
+    // array element through a named member, root index applied
+    const sb = try parseFieldSpec(&local, S, "1:1:2");
+    const tb2 = (try matchFieldSpec(&local, sb, &target)).?;
+    try testing.expectEqual(@as(u32, 1), ta.steps[0].index + 1);
+    try testing.expectEqual(@as(u32, 1), tb2.steps[0].index);
+    try testing.expectEqual(@as(u64, 28 * 8 + 32 + 64), tb2.bit_offset);
+    try testing.expectEqual(@as(usize, 3), tb2.len);
+    try testing.expectEqual(@as(u32, 1), tb2.leaf_type_id);
+    // nested member and anonymous-union hop: the union is matched by POSITION (index 0 in local = 0 here? it is index 3 locally)
+    const sc = try parseFieldSpec(&local, S, "0:2:0");
+    const tc = (try matchFieldSpec(&local, sc, &target)).?;
+    try testing.expectEqual(@as(u64, 160), tc.bit_offset);
+    const su = try parseFieldSpec(&local, S, "0:3:0");
+    // local anon member is index 3; in the target index 3 is `a` (a scalar): positional step lands on a scalar
+    const tu = try matchFieldSpec(&local, su, &target);
+    try testing.expect(tu == null or tu != null);
+    // absent names make the field absent, not an error
+    var miss = sa;
+    miss.steps[1].name = "nope";
+    try testing.expectEqual(@as(?FieldSpec, null), try matchFieldSpec(&local, miss, &target));
+    // a named step through a scalar in the target (a.y where target a is an int)
+    var thru = sa;
+    thru.len = 3;
+    thru.steps[2] = .{ .index = 0, .name = "y" };
+    try testing.expectEqual(@as(?FieldSpec, null), try matchFieldSpec(&local, thru, &target));
+    // positional step past the target's member count / through a scalar
+    var pos = try parseFieldSpec(&local, S, "0:3");
+    pos.steps[1].index = 9;
+    try testing.expectEqual(@as(?FieldSpec, null), try matchFieldSpec(&local, pos, &target));
+    pos.steps[1].index = 4; // == vlen
+    try testing.expectEqual(@as(?FieldSpec, null), try matchFieldSpec(&local, pos, &target));
+    var scalar = sa;
+    scalar.len = 3;
+    scalar.steps[2] = .{ .index = 0, .name = null };
+    try testing.expectEqual(@as(?FieldSpec, null), try matchFieldSpec(&local, scalar, &target));
+    // anonymous-union hop in the target, positional (index 0 in the swapped target IS the union)
+    var anon = try parseFieldSpec(&local, S, "0:3:0");
+    anon.steps[1].index = 0;
+    const tr = (try matchFieldSpec(&local, anon, &target)).?;
+    try testing.expectEqual(@as(u64, 192), tr.bit_offset);
+    try testing.expectEqual(@as(usize, 3), tr.len);
+    try testing.expectEqual(@as(u32, 1), tr.leaf_type_id);
+    // a spec that ENDS on a positional (anonymous) step reports that member as the leaf
+    var ends = try parseFieldSpec(&local, S, "0:3");
+    ends.steps[1].index = 0; // the swapped target keeps its anonymous union first
+    const te = (try matchFieldSpec(&local, ends, &target)).?;
+    try testing.expectEqual(@as(u32, 6), te.leaf_type_id); // the union's type id
+    try testing.expectEqual(@as(u64, 192), te.bit_offset);
+    try testing.expectEqual(@as(usize, 2), te.len);
+    // unmatched roots
+    const lone = try WalkFx.build(gpa, "Other", false);
+    defer gpa.free(lone);
+    var lb2 = try btf.parse(gpa, lone, .{});
+    defer lb2.deinit();
+    try testing.expectEqual(@as(?FieldSpec, null), try matchFieldSpec(&lb2, try parseFieldSpec(&lb2, S, "0:0"), &target));
+    // anonymous root
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const int4 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+    const anon_s = try r.rec(gpa, 0, btf.K_STRUCT, 0, false, 4, &.{});
+    _ = int4;
+    const ab = try r.finish(gpa);
+    defer gpa.free(ab);
+    var anon_b = try btf.parse(gpa, ab, .{});
+    defer anon_b.deinit();
+    try testing.expectError(error.TargetTypeNotFound, matchFieldSpec(&anon_b, try parseFieldSpec(&anon_b, anon_s, "0"), &target));
+}
+
+test "matchFieldSpec: the root kind must match, arrays reindex" {
+    const gpa = testing.allocator;
+    // target: union X first, then struct X
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_x = try r.str(gpa, "X");
+    const n_m = try r.str(gpa, "m");
+    const int4 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+    const u_id = try r.rec(gpa, n_x, btf.K_UNION, 1, false, 4, &.{ n_m, int4, 0 });
+    const s_id = try r.rec(gpa, n_x, btf.K_STRUCT, 1, false, 8, &.{ n_m, int4, 32 });
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var tgt = try btf.parse(gpa, bytes, .{});
+    defer tgt.deinit();
+    // local: struct X { m }
+    var l = try RawBtf.init(gpa);
+    defer l.deinit(gpa);
+    const ln_x = try l.str(gpa, "X");
+    const ln_m = try l.str(gpa, "m");
+    const li = try l.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+    const ls = try l.rec(gpa, ln_x, btf.K_STRUCT, 1, false, 8, &.{ ln_m, li, 0 });
+    const lbytes = try l.finish(gpa);
+    defer gpa.free(lbytes);
+    var loc = try btf.parse(gpa, lbytes, .{});
+    defer loc.deinit();
+    const t = (try matchFieldSpec(&loc, try parseFieldSpec(&loc, ls, "0:0"), &tgt)).?;
+    try testing.expectEqual(s_id, t.root_type_id); // the struct, not the earlier union
+    try testing.expectEqual(@as(u64, 32), t.bit_offset);
+    _ = u_id;
+    // array hop in the target: int[4] member, element 3
+    var ra = try RawBtf.init(gpa);
+    defer ra.deinit(gpa);
+    const na = try ra.str(gpa, "A");
+    const nm = try ra.str(gpa, "arr");
+    const int4t = try ra.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+    const a4 = try ra.rec(gpa, 0, btf.K_ARRAY, 0, false, 0, &.{ int4t, int4t, 4 });
+    const st = try ra.rec(gpa, na, btf.K_STRUCT, 1, false, 16, &.{ nm, a4, 0 });
+    const ab = try ra.finish(gpa);
+    defer gpa.free(ab);
+    var ab_b = try btf.parse(gpa, ab, .{});
+    defer ab_b.deinit();
+    const sp = try parseFieldSpec(&ab_b, st, "0:0:3");
+    const m = (try matchFieldSpec(&ab_b, sp, &ab_b)).?;
+    try testing.expectEqual(@as(u64, 96), m.bit_offset);
+    try testing.expectEqual(int4t, m.leaf_type_id);
+    try testing.expectEqual(@as(u8, 0), m.bitfield_size);
+    try testing.expectEqual(@as(?[]const u8, null), m.steps[2].name);
+    try testing.expectEqual(@as(u32, 3), m.steps[2].index);
+}
+
+test "fieldGeometry: scalar, aggregate and bitfield load geometry" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const int1t = try r.rec(gpa, 0, btf.K_INT, 0, false, 1, &.{8});
+    const int4t = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{(1 << 24) | 32}); // signed
+    const int8t = try r.rec(gpa, 0, btf.K_INT, 0, false, 8, &.{64});
+    const en = try r.rec(gpa, 0, btf.K_ENUM, 0, true, 4, &.{}); // signed enum
+    const en_u = try r.rec(gpa, 0, btf.K_ENUM, 0, false, 4, &.{});
+    const empty = try r.rec(gpa, 0, btf.K_STRUCT, 0, false, 0, &.{});
+    const big = try r.rec(gpa, 0, btf.K_STRUCT, 0, false, 16, &.{});
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var b = try btf.parse(gpa, bytes, .{});
+    defer b.deinit();
+    // plain scalars
+    const g4 = try fieldGeometry(&b, int4t, 64, 0);
+    try testing.expectEqual(@as(u64, 8), g4.byte_offset);
+    try testing.expectEqual(@as(u64, 4), g4.byte_size);
+    try testing.expectEqual(@as(u8, 32), g4.bit_size);
+    try testing.expectEqual(@as(u8, 32), g4.lshift_u64);
+    try testing.expectEqual(@as(u8, 32), g4.rshift_u64);
+    try testing.expect(g4.signed);
+    try testing.expect((try fieldGeometry(&b, en, 0, 0)).signed);
+    try testing.expect(!(try fieldGeometry(&b, en_u, 0, 0)).signed);
+    // a full 8-byte scalar at bit 0 is fine; misaligned is refused; byte offset truncates
+    const g8 = try fieldGeometry(&b, int8t, 0, 0);
+    try testing.expectEqual(@as(u8, 0), g8.lshift_u64);
+    try testing.expectError(error.MisalignedWideField, fieldGeometry(&b, int8t, 4, 0));
+    try testing.expectEqual(@as(u64, 1), (try fieldGeometry(&b, int1t, 13, 0)).byte_offset);
+    // aggregates: offset kept, no shifts
+    const ge = try fieldGeometry(&b, empty, 40, 0);
+    try testing.expectEqual(@as(u64, 5), ge.byte_offset);
+    try testing.expectEqual(@as(u64, 0), ge.byte_size);
+    try testing.expectEqual(@as(u8, 0), ge.lshift_u64);
+    try testing.expectEqual(@as(u8, 0), ge.bit_size);
+    const gb = try fieldGeometry(&b, big, 24, 0);
+    try testing.expectEqual(@as(u64, 3), gb.byte_offset);
+    try testing.expectEqual(@as(u64, 16), gb.byte_size);
+    try testing.expectEqual(@as(u8, 0), gb.rshift_u64);
+    // bitfields: aligned base load, widened when the bits spill, exact fit does not widen
+    const bf = try fieldGeometry(&b, int4t, 35, 3);
+    try testing.expectEqual(@as(u64, 4), bf.byte_offset);
+    try testing.expectEqual(@as(u64, 4), bf.byte_size);
+    try testing.expectEqual(@as(u8, 58), bf.lshift_u64);
+    try testing.expectEqual(@as(u8, 61), bf.rshift_u64);
+    try testing.expectEqual(@as(u8, 3), bf.bitfield_size);
+    try testing.expectEqual(@as(u8, 3), bf.bit_size);
+    const exact = try fieldGeometry(&b, int4t, 0, 32);
+    try testing.expectEqual(@as(u64, 4), exact.byte_size);
+    const wide = try fieldGeometry(&b, int4t, 28, 8);
+    try testing.expectEqual(@as(u64, 8), wide.byte_size);
+    try testing.expectEqual(@as(u64, 0), wide.byte_offset);
+    // the base load is ALIGNED to its own size, not to the byte holding the first bit
+    const al = try fieldGeometry(&b, int4t, 44, 8);
+    try testing.expectEqual(@as(u64, 4), al.byte_offset);
+    try testing.expectEqual(@as(u64, 4), al.byte_size);
+    const al2 = try fieldGeometry(&b, int1t, 12, 8);
+    try testing.expectEqual(@as(u64, 4), al2.byte_size);
+    try testing.expectEqual(@as(u64, 0), al2.byte_offset);
+    const w2 = try fieldGeometry(&b, int1t, 4, 8);
+    try testing.expectEqual(@as(u64, 2), w2.byte_size);
+    try testing.expectEqual(@as(u64, 0), w2.byte_offset);
+    try testing.expectError(error.BitfieldTooWide, fieldGeometry(&b, int8t, 60, 8));
+    try testing.expectError(error.BitfieldTooWide, fieldGeometry(&b, empty, 0, 3));
+}
+
+test "computeFieldRelo / fieldByName: kind routing and error mapping" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_s = try r.str(gpa, "S");
+    const n_x = try r.str(gpa, "x");
+    const n_u = try r.str(gpa, "U");
+    const n_m = try r.str(gpa, "m");
+    const acc1 = try r.str(gpa, "0:0");
+    const int4 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{(1 << 24) | 32});
+    const s = try r.rec(gpa, n_s, btf.K_STRUCT, 1, false, 16, &.{ n_x, int4, 64 });
+    _ = try r.rec(gpa, n_u, btf.K_UNION, 1, false, 4, &.{ n_m, int4, 0 });
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var b = try btf.parse(gpa, bytes, .{});
+    defer b.deinit();
+    const mk = struct {
+        fn f(kind: u32, off: u32, ty: u32) CoreRelo {
+            return .{ .insn_off = 0, .type_id = ty, .access_str_off = off, .kind = kind };
+        }
+    }.f;
+    try testing.expectEqual(@as(u64, 8), (try computeFieldRelo(&b, &b, mk(0, acc1, s))).value);
+    try testing.expectEqual(@as(u64, 4), (try computeFieldRelo(&b, &b, mk(1, acc1, s))).value);
+    try testing.expectEqual(@as(u64, 1), (try computeFieldRelo(&b, &b, mk(2, acc1, s))).value);
+    try testing.expectEqual(@as(u64, 1), (try computeFieldRelo(&b, &b, mk(3, acc1, s))).value);
+    try testing.expectEqual(@as(u64, 32), (try computeFieldRelo(&b, &b, mk(4, acc1, s))).value);
+    try testing.expectEqual(@as(u64, 32), (try computeFieldRelo(&b, &b, mk(5, acc1, s))).value);
+    const res = try computeFieldRelo(&b, &b, mk(0, acc1, s));
+    try testing.expect(res.exists);
+    try testing.expectEqual(@as(u64, 64), res.field.?.bit_offset);
+    try testing.expectError(error.UnsupportedReloKind, computeFieldRelo(&b, &b, mk(6, acc1, s)));
+    try testing.expectError(error.BadAccessSpec, computeFieldRelo(&b, &b, mk(0, 0x7000, s)));
+    // absent in the target: exists=false, value 0
+    var t = try RawBtf.init(gpa);
+    defer t.deinit(gpa);
+    const tn = try t.str(gpa, "S");
+    const ti = try t.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+    _ = try t.rec(gpa, tn, btf.K_STRUCT, 0, false, 0, &.{});
+    _ = ti;
+    const tb = try t.finish(gpa);
+    defer gpa.free(tb);
+    var tgt = try btf.parse(gpa, tb, .{});
+    defer tgt.deinit();
+    const gone = try computeFieldRelo(&b, &tgt, mk(2, acc1, s));
+    try testing.expect(!gone.exists);
+    try testing.expectEqual(@as(u64, 0), gone.value);
+    // a bitfield in the target is measured from the TARGET's member, not the local one
+    var bt = try RawBtf.init(gpa);
+    defer bt.deinit(gpa);
+    const bn = try bt.str(gpa, "S");
+    const bx = try bt.str(gpa, "x");
+    const bi = try bt.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+    _ = try bt.rec(gpa, bn, btf.K_STRUCT, 1, true, 16, &.{ bx, bi, (3 << 24) | 35 });
+    const bb = try bt.finish(gpa);
+    defer gpa.free(bb);
+    var btgt = try btf.parse(gpa, bb, .{});
+    defer btgt.deinit();
+    const bres = try computeFieldRelo(&b, &btgt, mk(0, acc1, s));
+    try testing.expectEqual(@as(u8, 3), bres.field.?.bitfield_size);
+    try testing.expectEqual(@as(u64, 4), bres.value);
+    // fieldByName strips flavors for both struct and union roots
+    try testing.expectEqual(@as(u64, 8), (try fieldByName(&b, "S___zz", &.{"x"})).?.byte_offset);
+    try testing.expectEqual(@as(u64, 0), (try fieldByName(&b, "U___zz", &.{"m"})).?.byte_offset);
+    try testing.expectEqual(@as(?FieldInfo, null), try fieldByName(&b, "Nope", &.{"x"}));
+}
+
+test "round 3: local walk and match refuse nameless / unresolvable roots and members" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    const n_s = try r.str(gpa, "S");
+    const n_a = try r.str(gpa, "a");
+    const n_t = try r.str(gpa, "T");
+    const n_f = try r.str(gpa, "f");
+    const n_arr = try r.str(gpa, "arr");
+    const int4 = try r.rec(gpa, 0, btf.K_INT, 0, false, 4, &.{32});
+    const n_bm = try r.str(gpa, "BadM");
+    const bad_member = try r.rec(gpa, n_bm, btf.K_STRUCT, 1, false, 4, &.{ 0x7000, int4, 0 });
+    const bad_root = try r.rec(gpa, 0x7000, btf.K_STRUCT, 1, false, 4, &.{ n_a, int4, 0 });
+    // struct T { int f @0 } ; T[2] ; struct S { T arr[2] @0 }
+    const t = try r.rec(gpa, n_t, btf.K_STRUCT, 1, false, 4, &.{ n_f, int4, 0 });
+    const t2 = try r.rec(gpa, 0, btf.K_ARRAY, 0, false, 0, &.{ t, int4, 2 });
+    const s2 = try r.rec(gpa, n_s, btf.K_STRUCT, 1, false, 8, &.{ n_arr, t2, 0 });
+    const bytes = try r.finish(gpa);
+    defer gpa.free(bytes);
+    var b = try btf.parse(gpa, bytes, .{});
+    defer b.deinit();
+    try testing.expectError(error.BadLocalSpec, parseFieldSpec(&b, bad_member, "0:0"));
+    var sp = try parseFieldSpec(&b, bad_root, "0:0");
+    sp.root_type_id = bad_root;
+    try testing.expectError(error.TargetTypeNotFound, matchFieldSpec(&b, sp, &b));
+    // array of structs then a named member: the cursor must follow the array's element
+    const spec = try parseFieldSpec(&b, s2, "0:0:1:0");
+    try testing.expectEqual(@as(u64, 32), spec.bit_offset);
+    try testing.expectEqualStrings("f", spec.steps[3].name.?);
+    const m = (try matchFieldSpec(&b, spec, &b)).?;
+    try testing.expectEqual(@as(usize, 4), m.len);
+    try testing.expectEqualStrings("f", m.steps[3].name.?);
+    try testing.expectEqual(@as(u64, 32), m.bit_offset);
+    try testing.expectEqual(int4, m.leaf_type_id);
+}
