@@ -71,9 +71,22 @@ pub const UnixEntry = struct {
     }
 };
 
+/// Bounds for `parseUnix`/`readUnix`.
+pub const UnixOptions = struct {
+    /// The most rows kept. Default 524 288 (1 << 19) rows x 176 B = about 92 MB
+    /// live, the same order as `SocketOwnerOptions.max_owners` (1 Mi x 88 B).
+    /// A real host stays far below it (the 16 MiB read limit holds ~180 000
+    /// honest rows); only forged short rows inside socket names (about 17 B of
+    /// text per 176 B entry) can reach it. Rows past the cap are dropped and
+    /// `UnixTable.truncated` is set; exactly `max_entries` rows are not
+    /// truncated.
+    max_entries: usize = 1 << 19,
+};
+
 pub const UnixTable = struct {
     entries: []UnixEntry,
-    /// The file was longer than `read_limit`; `entries` is missing the tail.
+    /// `entries` is missing the tail: `readUnix` found the file longer than
+    /// `read_limit`, or more than `UnixOptions.max_entries` rows were present.
     truncated: bool,
 
     pub fn deinit(t: UnixTable, gpa: std.mem.Allocator) void {
@@ -143,16 +156,17 @@ fn parseRow(line: []const u8, has_inode: bool) ?UnixEntry {
 ///
 /// ⚠ Memory amplification: forged short rows inside socket names (see above)
 /// are about 17 bytes of text but a 176-byte `UnixEntry`, so hostile text can
-/// grow ~12× — up to ~185 MB live from the 16 MiB `readUnix` read limit.
-/// There is no entry cap (that needs a signature change; see the SPEC
-/// Backlog). Callers parsing text of their own should bound its length.
-pub fn parseUnix(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]UnixEntry {
+/// grow ~12× (~185 MB from the 16 MiB `readUnix` read limit). `opts.max_entries`
+/// (default 524 288 rows, about 92 MB) bounds the result; the first row past
+/// it stops the parse and sets `truncated`. Caller frees with `deinit`.
+pub fn parseUnix(gpa: std.mem.Allocator, text: []const u8, opts: UnixOptions) std.mem.Allocator.Error!UnixTable {
     var out: std.ArrayList(UnixEntry) = .empty;
     errdefer out.deinit(gpa);
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     var has_inode = true;
     var first = true;
+    var truncated = false;
     while (lines.next()) |line| {
         if (first) {
             first = false;
@@ -163,18 +177,25 @@ pub fn parseUnix(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Err
         }
         if (line.len == 0) continue;
         const e = parseRow(line, has_inode) orelse continue;
+        if (out.items.len >= opts.max_entries) {
+            truncated = true;
+            break;
+        }
         try out.append(gpa, e);
     }
-    return out.toOwnedSlice(gpa);
+    return .{ .entries = try out.toOwnedSlice(gpa), .truncated = truncated };
 }
 
 /// Read and parse the live `/proc/net/unix` (the caller's network namespace —
-/// unix sockets are per network namespace too). Empty when absent.
-pub fn readUnix(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!UnixTable {
+/// unix sockets are per network namespace too). Empty when absent. `truncated`
+/// is set when the read limit or `opts.max_entries` cut the table.
+pub fn readUnix(gpa: std.mem.Allocator, io: std.Io, opts: UnixOptions) std.mem.Allocator.Error!UnixTable {
     const f = procnet.readVirtualLinesReporting(gpa, io, "/proc/net/unix", read_limit) orelse
         return .{ .entries = try gpa.alloc(UnixEntry, 0), .truncated = false };
     defer gpa.free(f.bytes);
-    return .{ .entries = try parseUnix(gpa, f.bytes), .truncated = f.truncated };
+    var t = try parseUnix(gpa, f.bytes, opts);
+    t.truncated = t.truncated or f.truncated;
+    return t;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -185,8 +206,10 @@ const builtin = @import("builtin");
 const real_unix = @embedFile("testdata/unix.txt");
 
 test "parseUnix: real capture, every column" {
-    const rows = try parseUnix(testing.allocator, real_unix);
-    defer testing.allocator.free(rows);
+    const tab = try parseUnix(testing.allocator, real_unix, .{});
+    defer tab.deinit(testing.allocator);
+    try testing.expect(!tab.truncated);
+    const rows = tab.entries;
 
     var lines: usize = 0;
     var it = std.mem.splitScalar(u8, real_unix, '\n');
@@ -240,8 +263,9 @@ test "parseUnix: abstract names, spaces in paths, seqpacket, old kernels, junk" 
         "ffff8885: 00000002 00000000 00000000 0001 01\n" ++ // inode column missing in a has-inode table
         "ffff8886: 100000000 00000000 00000000 0001 01 5 /refs-overflow-u32\n" ++
         "\n";
-    const rows = try parseUnix(testing.allocator, t);
-    defer testing.allocator.free(rows);
+    const tab = try parseUnix(testing.allocator, t, .{});
+    defer tab.deinit(testing.allocator);
+    const rows = tab.entries;
     try testing.expectEqual(@as(usize, 4), rows.len);
     try testing.expectEqual(@as(u64, 0xffff8881), rows[0].kernel_ptr);
     try testing.expect(rows[0].isAbstract());
@@ -256,27 +280,30 @@ test "parseUnix: abstract names, spaces in paths, seqpacket, old kernels, junk" 
     try testing.expectEqualStrings("unknown", rows[3].stateName());
 
     // A header without Inode: rows have no inode column and the path starts one token earlier.
-    const old = try parseUnix(testing.allocator, "Num       RefCount Protocol Flags    Type St Path\nffff: 00000002 00000000 00000000 0001 01 /old/sock\n");
-    defer testing.allocator.free(old);
+    const old_t = try parseUnix(testing.allocator, "Num       RefCount Protocol Flags    Type St Path\nffff: 00000002 00000000 00000000 0001 01 /old/sock\n", .{});
+    defer old_t.deinit(testing.allocator);
+    const old = old_t.entries;
     try testing.expectEqual(@as(usize, 1), old.len);
     try testing.expectEqual(@as(u64, 0), old[0].inode);
     try testing.expectEqualStrings("/old/sock", old[0].path());
 
     // No header at all: the first line is a row.
-    const nh = try parseUnix(testing.allocator, "ffff: 00000002 00000000 00000000 0001 01 9 /x\n");
-    defer testing.allocator.free(nh);
+    const nh_t = try parseUnix(testing.allocator, "ffff: 00000002 00000000 00000000 0001 01 9 /x\n", .{});
+    defer nh_t.deinit(testing.allocator);
+    const nh = nh_t.entries;
     try testing.expectEqual(@as(usize, 1), nh.len);
     try testing.expectEqual(@as(u64, 9), nh[0].inode);
 
     // Overlong path is clamped, not dropped.
-    const long = try parseUnix(testing.allocator, "ffff: 00000002 00000000 00000000 0001 01 9 /" ++ strRepeat("p", 300) ++ "\n");
-    defer testing.allocator.free(long);
+    const long_t = try parseUnix(testing.allocator, "ffff: 00000002 00000000 00000000 0001 01 9 /" ++ strRepeat("p", 300) ++ "\n", .{});
+    defer long_t.deinit(testing.allocator);
+    const long = long_t.entries;
     try testing.expectEqual(@as(usize, 1), long.len);
     try testing.expectEqual(@as(usize, path_max), long[0].path().len);
 
-    const empty = try parseUnix(testing.allocator, "");
-    defer testing.allocator.free(empty);
-    try testing.expectEqual(@as(usize, 0), empty.len);
+    const empty = try parseUnix(testing.allocator, "", .{});
+    defer empty.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), empty.entries.len);
 }
 
 test "live: readUnix sees a listener this process binds" {
@@ -293,7 +320,7 @@ test "live: readUnix sees a listener this process binds" {
     var server = addr.listen(io, .{}) catch return error.SkipZigTest;
     defer server.deinit(io);
 
-    const t = try readUnix(testing.allocator, io);
+    const t = try readUnix(testing.allocator, io, .{});
     defer t.deinit(testing.allocator);
     if (t.entries.len == 0) return error.SkipZigTest; // no /proc/net/unix here
     try testing.expect(!t.truncated);
@@ -319,13 +346,69 @@ test "parseUnix: tabs and CRLF separate columns; 0x20000 is not the listening bi
     const gpa = testing.allocator;
     const text = "Num       RefCount Protocol Flags    Type St Inode Path\r\n" ++
         "0000000000000000:\t00000002\t00000000\t00020000\t0001\t01\t77\t/tmp/a b\r\n";
-    const es = try parseUnix(gpa, text);
-    defer gpa.free(es);
+    const es_t = try parseUnix(gpa, text, .{});
+    defer es_t.deinit(gpa);
+    const es = es_t.entries;
     try testing.expectEqual(@as(usize, 1), es.len);
     try testing.expectEqualStrings("/tmp/a b", es[0].path());
     try testing.expectEqual(@as(u64, 77), es[0].inode);
     try testing.expect(!es[0].isListening());
     try testing.expect(!es[0].isAbstract());
+}
+
+test "parseUnix: max_entries caps forged short rows; exactly the cap is not truncated, one more is" {
+    const gpa = testing.allocator;
+    const hdr = "Num       RefCount Protocol Flags    Type St Inode Path\n";
+    const row = "0: 00000002 00000000 00000000 0001 01 7\n"; // a short well-formed row
+    const n = 50;
+    const text = hdr ++ strRepeat(row, n);
+
+    const all = try parseUnix(gpa, text, .{ .max_entries = n });
+    defer all.deinit(gpa);
+    try testing.expectEqual(@as(usize, n), all.entries.len);
+    try testing.expect(!all.truncated);
+
+    const over = try parseUnix(gpa, text, .{ .max_entries = n - 1 });
+    defer over.deinit(gpa);
+    try testing.expectEqual(@as(usize, n - 1), over.entries.len);
+    try testing.expect(over.truncated);
+
+    // The default is far above this text; zero keeps nothing and flags any row.
+    const dflt = try parseUnix(gpa, text, .{});
+    defer dflt.deinit(gpa);
+    try testing.expectEqual(@as(usize, n), dflt.entries.len);
+    try testing.expect(!dflt.truncated);
+    const none = try parseUnix(gpa, text, .{ .max_entries = 0 });
+    defer none.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), none.entries.len);
+    try testing.expect(none.truncated);
+
+    // Junk rows past the cap are not rows: they must not set `truncated`.
+    const junk = try parseUnix(gpa, text ++ "short row\n\n", .{ .max_entries = n });
+    defer junk.deinit(gpa);
+    try testing.expect(!junk.truncated);
+}
+
+test "readUnix: max_entries cuts the live table and reports it; the default pins the documented bound" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    try testing.expectEqual(@as(usize, 524_288), (UnixOptions{}).max_entries);
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // A listener of our own guarantees at least one row on a host that has /proc/net/unix.
+    var name_buf: [64]u8 = undefined;
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    const name = std.mem.print(&name_buf, "\x00procnet-unix-cap-{d}", .{pid}) catch unreachable;
+    const addr = std.Io.net.UnixAddress.init(name) catch return error.SkipZigTest;
+    var server = addr.listen(io, .{}) catch return error.SkipZigTest;
+    defer server.deinit(io);
+    const full = try readUnix(testing.allocator, io, .{});
+    defer full.deinit(testing.allocator);
+    if (full.entries.len == 0) return error.SkipZigTest; // no /proc/net/unix here
+    const none = try readUnix(testing.allocator, io, .{ .max_entries = 0 });
+    defer none.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), none.entries.len);
+    try testing.expect(none.truncated);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

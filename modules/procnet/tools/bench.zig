@@ -100,7 +100,7 @@ fn once(io: std.Io, w: usize, pid: u64) u64 {
             return b2u(o.in > 0 and o.out > 0);
         },
         6 => {
-            const t = procnet.readUnix(gpa, io) catch return 0;
+            const t = procnet.readUnix(gpa, io, .{}) catch return 0;
             defer t.deinit(gpa);
             return b2u(t.entries.len > 0);
         },

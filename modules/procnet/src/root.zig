@@ -180,6 +180,7 @@ pub const readPidSnmp = pairs.readPidSnmp;
 
 pub const UnixEntry = unix.UnixEntry;
 pub const UnixTable = unix.UnixTable;
+pub const UnixOptions = unix.UnixOptions;
 pub const parseUnix = unix.parseUnix;
 pub const readUnix = unix.readUnix;
 
