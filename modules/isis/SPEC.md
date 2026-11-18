@@ -6,9 +6,9 @@
 
 **Scope:** mvp — holo-isis packet layer (holo v0.9.0), behaviour cross-checked against FRR isisd 10.7 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-14 · mutation 2026-11-17 (509/521, 12 eq) · src ee9c0d05fb11d149
+**Audit:** review 2026-09-14 · mutation 2026-11-18 (577/589, 12 eq) · src 9e437792bddf5252
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_FUZZ) · ct n/a — IS-IS codec, no auth (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_FUZZ) · ct none
 
 **Performance:** not measured
 
@@ -19,8 +19,9 @@
 Design + threat notes for auditors. Usage, API, and the module purpose: see
 [README.md](README.md) and the `src/*.zig` doc comments. Attribution/provenance:
 see the README "Provenance" note — no NOTICE entry required (clean-room from public specs: ISO/IEC 10589,
-RFC 1195/5301/5305, RFC 6329/6165; a public spec is not a copyrightable work,
-and no third-party IS-IS source or dissector was ported or studied).
+RFC 1195/5301/5305, RFC 6329/6165, RFC 5304/5310; a public spec is not a copyrightable work,
+and no third-party IS-IS source or dissector was ported; holo-isis `auth.rs`/`pdu.rs` (MIT) was read
+for the authentication behaviour only).
 
 ## Compared with
 
@@ -35,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [wireshark/wireshark](https://github.com/wireshark/wireshark) dissector | C | GPL-2.0 — used only as a black-box oracle (`sharkd`), source not read | 9.9k | pushed 2026-09-29 | Decodes everything, encodes nothing. Grades five of this module's PDU bodies and the Fletcher checksum. |
 | [openss7/pbbr](https://github.com/openss7/pbbr) | C | no LICENSE file in the repository (not readable; not read) | 36 | pushed 2019-04-18 | Claims IEEE 802.1aq SPBM for the Linux kernel; unmaintained since 2019. The only open SPB implementation found. |
 
-**Where we are ahead:** the only codec surveyed that types the SPB Instance sub-TLV (CIST root, bridge priority, SPSourceID, ECT-VID tuples) *and* the SPBM-SI with per-I-SID T/R bits (holo has SPBM-SI only — verified in `tlv.rs`; goisis/mdlayher do not mention SPB — *inferred*); zero-allocation bounded decode with a fuzz target that measurably reaches a PDU body; PDUs pinned against an independent dissector; LSP + CSNP + PSNP + both IIH variants in both directions (mdlayher covers the P2P hello only). **Where we are behind:** no typed IP/IPv6 reachability (#128/#130/#135/#232/#236) — what every IP IS-IS user carries; no Authentication TLV (#10) and no HMAC (RFC 5304/5310) compute/verify — holo and goisis have it; no MT-ISN #222 / #235 / #237; only 6-octet system-ids in typed bodies; no purge-originator (#13) or extended-sequence-number (#229) TLVs; no router-capability / SR TLVs. All are reachable byte-exact through the raw escape hatch (`rg 'ip_reach|ipv6|hmac|md5|purge_originator' isis/src` finds no typed decoder; only the `ip_interface_address`/`authentication` code constants exist) (→ Backlog).
+**Where we are ahead:** the only codec surveyed that types the SPB Instance sub-TLV (CIST root, bridge priority, SPSourceID, ECT-VID tuples) *and* the SPBM-SI with per-I-SID T/R bits (holo has SPBM-SI only — verified in `tlv.rs`; goisis/mdlayher do not mention SPB — *inferred*); zero-allocation bounded decode with a fuzz target that measurably reaches a PDU body; PDUs pinned against an independent dissector; LSP + CSNP + PSNP + both IIH variants in both directions (mdlayher covers the P2P hello only). **Where we are behind:** no typed IP/IPv6 reachability (#128/#130/#135/#232/#236) — what every IP IS-IS user carries; no MT-ISN #222 / #235 / #237; only 6-octet system-ids in typed bodies; no purge-originator (#13) or extended-sequence-number (#229) TLVs; no router-capability / SR TLVs. All are reachable byte-exact through the raw escape hatch (`rg 'ip_reach|ipv6|purge_originator' isis/src` finds no typed decoder; only the `ip_interface_address` code constant exists) (→ Backlog). Authentication (#10, RFC 5304/5310) is at parity with holo since 2026-11-18, plus FRR's opt-in `strict-rfc5310` keying and SHA-224, which holo does not configure.
 
 ## Scope
 
@@ -93,6 +94,7 @@ sources:
 | 2 | IS Neighbours (LSP, old-style) | ISO 10589 §9.8 |
 | 6 | IS Neighbours (IIH SNPAs) | ISO 10589 §9.5/9.7 |
 | 9 | LSP Entries (for CSNP/PSNP) | ISO 10589 §9.10 |
+| 10 | Authentication (cleartext / HMAC-MD5 / RFC 5310 crypto) | ISO 10589 §9.5, RFC 5304, RFC 5310 |
 | 22 | Extended IS Reachability (+ sub-TLVs) | RFC 5305 |
 | 129 | Protocols Supported | RFC 1195 |
 | 137 | Dynamic Hostname | RFC 5301 |
@@ -155,11 +157,80 @@ attacker who can inject frames). The central hazard of a TLV codec is an
   against them. The module used to reject the reserved PDU-type bits and accept
   Circuit Type 0, against that text.
 
-**Not an authentication boundary.** The Authentication TLV (#10) and IS-IS
-crypto-auth (RFC 5304/5310) are **not** implemented — this codec neither
-verifies nor produces an authentication TLV; it carries #10 as raw bytes. SPB
-integrity (RFC 6329 digest exchange) is likewise out of scope. A consumer that
-needs authenticated IS-IS must layer it above this codec.
+**Authentication (#10) — the codec signs and verifies, the policy is the caller's.**
+Since 2026-11-18 `auth` types the Authentication TLV and computes/verifies it
+over a whole PDU (`src/auth.zig`); decoding a PDU still does NOT verify
+anything — `decode` carries #10 like any TLV, and a PDU is authenticated only
+where a caller runs `auth.verify` on it (`isis-adj` for IIHs, `isis-lsdb` for
+LSPs and SNPs, each when a key is configured). SPB integrity (RFC 6329 digest
+exchange) stays out of scope. See § Authentication below.
+
+## Authentication (2026-11-18)
+
+**Wire.** Authentication Type octet, then: type 1 the cleartext password
+(ISO 10589 §9.5); type 54 a 16-octet HMAC-MD5, TLV length exactly 17 (RFC
+5304 §2); type 3 a 2-octet Key ID and an L-octet HMAC (RFC 5310 §3.1, SHA-1/
+224/256/384/512). Any other type is carried as `.other` and `verify` refuses it
+(`UnsupportedAuthType`).
+
+**What the digest covers.** `[0, PDU Length)` with the Authentication Value
+hashed as zeros (RFC 5304 §2) or as Apad = 0x878FE1F3 repeated L/4 times (RFC
+5310 §3.3, §3.5), and in an LSP Remaining Lifetime and Checksum hashed as zero
+(RFC 5304 §2; RFC 5310 §3.4/§3.5) — so an LSP can be aged in flight and its
+checksum, which covers the digest, is stamped after signing (`sign` re-stamps
+it). Octets beyond PDU Length are not covered. Hellos are signed as sent,
+padding included (RFC 5310 §3.2). holo-isis (`pdu.rs`
+`auth_compute_digest`) hashes the same segments.
+
+**Key preparation — the RFC and the routers disagree.** RFC 5310 §3.3 sets
+`Ko = H(K)` for a key longer than the hash OUTPUT length L; plain RFC 2104
+HMAC hashes only a key longer than the BLOCK size B. Survey (2026-11-18):
+holo-isis uses the `hmac` crate (plain RFC 2104); FRR pull request 23715
+("isisd: key chain authentication (RFC 5310)"; its author reports the commits merged through pull request 23969) defaults
+to plain HMAC and states that Cisco IOS XR, Arista EOS and holo "hash only
+keys longer than the block", with an IOS XR hello signed by a 22-octet
+HMAC-SHA-1 key that verified only with plain HMAC; FRR keeps the RFC rule as an
+opt-in `strict-rfc5310` keyword. The RFC 5709 (OSPF, identical text) erratum
+proposes the block-size reading. So the default here is plain RFC 2104 — the
+majority of deployed implementations, the interop that matters — and
+`Key.strict_rfc5310 = true` selects §3.3. The two agree for every key of at
+most L octets and for every key longer than B (both hash it); they differ only
+for L < |K| <= B (21..64 octets with SHA-1, 33..64 with SHA-256, 49..128 with
+SHA-384). HMAC-MD5 (RFC 5304) is RFC 2104 by definition and ignores the flag.
+
+**Receive.** The first #10 counts; a second one is hashed payload (holo skips
+duplicates the same way). RFC 5310 picks the key by Key ID (§3.5); HMAC-MD5 and
+cleartext try every configured key of that type (RFC 5304 §2: "MAY check a set
+of passwords"). Errors are distinct — `AuthMissing`, `KeyNotFound`,
+`UnsupportedAuthType`, `AuthFailed`, `MalformedAuth` (holo:
+`AuthTypeMismatch`, `AuthKeyNotFound`, `AuthError`) — and the siblings drop the
+PDU on every one. The compare is `std.crypto.timing_safe.eql` (HMAC-MD5) or a
+constant-time XOR fold (variable L, cleartext); lengths, the Key ID and which
+key is tried are public, and the boolean verdict is declassified for memcheck
+(it is observable anyway: the PDU is used or dropped). Cleartext is supported
+in both directions like holo and FRR, and is not authentication against
+anyone who can read the link. Neither RFC protects against replay (RFC 5310
+§4); purge rules (RFC 5304 §2, RFC 6233) are the update process's
+(`isis-lsdb`).
+
+**Key material.** `Key.secret` is caller-owned (CONVENTIONS §2.1 Z2); the
+only copy this module makes is the strict-mode `Ko = H(K)`, a local wiped by
+`defer`. The HMAC state is a transform's working state (Z3, not wiped, as in
+std).
+
+**Anchor.** `src/auth_kat_test.zig`: 13 KATs (every PDU kind, every algorithm,
+cleartext, a 22-octet SHA-1 and a 40-octet SHA-256 key in both key
+preparations, a 130-octet key longer than every block) produced by
+`tools/auth_kat.py`, an independent recipe: PDUs assembled field by field,
+Python `hmac`/`hashlib`, its own ISO 8473 checksum. The module's builders plus
+`sign` reproduce every byte. RFC 5304/5310 publish no vectors and holo-isis
+could not be run here, so the holo cross-check is by reading (same segments,
+same Apad, same plain keying), not by execution.
+
+**ctgrind.** A harness (MD5, SHA-256 plain and strict, cleartext; key
+tainted) was written but is not committed: wiring it needs entries in
+`scripts/checks/ctgrind.sh` that this change did not make. Until then the
+Hardening line says `ct none` (was `n/a — no auth` until the codec gained a key on 2026-11-18): by construction the key reaches only std HMAC and the constant-time compare, and the code branches only on public lengths and the declassified verdict — a claim from reading, not from memcheck.
 
 ## Verification
 
@@ -217,6 +288,12 @@ Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
 
 The 12 that do not die are not defects: 4 on the TLV helpers (an exact 255-octet scratch fit that no loop value can reach: 255 is not a multiple of 6 or 16; an area over 254 octets already fails the scratch bound, which makes two area-length tests redundant), 1 iterator end test (`>=` for `==` on a position that never exceeds the length), 4 PDU-length zeroing writes in the builders' `init` (`finish` always overwrites the field, an unfinished builder is not an output), 1 byte-order mutant on a value that is only compared with zero, 2 redundant guards in `encodeSpbInstance` (the builder repeats the buffer test with the same error; 255 tuples already exceed a TLV value). No survivor sits in the checksum arithmetic, `verify`, the zero-checksum test or any auth or length check: forcing `checkLspChecksum` to report every checksum good or every checksum bad is killed. Counts on the card are whole-module.
 
+## Audit 2026-11-18 (delta mutation, `src/auth.zig`)
+
+68 mutants over every non-test line of `src/auth.zig`, one per condition and class: each Authentication Type and digest length (each algorithm's L one off), the `parse` bounds (empty value, MD5 exactly 17, RFC 5310 at least type + Key ID), the placeholder (cleartext length limit and total, zero vs Apad fill, Key ID byte order, the 3-octet header), each PDU kind's fixed length and the LSP flag in `find`, the TLV-code test and the value/PDU-length offsets, the strict key preparation (`>` vs `>=` L, the flag, the RFC 5310-only gate), each zeroed LSP field and its bounds, the replacement block and the tail, `sign`'s key checks (algorithm, Key ID, length, cleartext password), the digest write and the checksum re-stamp, `verify`'s per-type key selection, the any-key verdict, each compare forced true and its offsets, and `ctEql`'s length test, fold and result. Not mutated: the comptime Apad table and `declassified` (a memcheck client request, no value change).
+
+63 died on the first run; the 5 survivors became 2 tests in `src/auth_kat_test.zig`: strict keying with a key of exactly L octets and with HMAC-MD5 must equal plain keying (the `>`/`>=` boundary and the RFC 5310-only gate), and a key of another algorithm is never used — an HMAC key whose secret equals a cleartext password, and an HMAC-MD5 key on an RFC 5310 TLV that happens to carry a 16-octet digest and Key ID 0 (in `sign` and in `verify`). 68/68 killed, 0 equivalent. The card adds them to the 2026-11-17 whole-module counts.
+
 ## Deliberately deferred (out of scope by design, not oversight)
 
 - **All protocol state**: adjacency FSM (up/init/down), the LSP database,
@@ -246,8 +323,9 @@ The 12 that do not die are not defects: 4 on the TLV helpers (an exact 255-octet
   not a decode/encode correctness gap. Full citation: `pdu.lsp_checksum_base`.
 - **Non-default ID lengths** in the typed bodies — not yet (only 6 is wired; the
   raw TLV walk is id-length-independent); see Backlog.
-- **Authentication TLV (#10)** and IS-IS crypto-auth (RFC 5304/5310) — not yet,
-  see Backlog; SPB digest (RFC 6329) integrity.
+- ~~**Authentication TLV (#10)** and IS-IS crypto-auth (RFC 5304/5310)~~ —
+  **implemented 2026-11-18** (§ Authentication). SPB digest (RFC 6329)
+  integrity stays out of scope.
 - **Multi-Topology topologies** beyond carrying the MT-ID — MT-ISN (#222), the
   MT-aware reachability set — not yet, see Backlog.
 - **The long tail of the IANA TLV registry** (IP reachability #128/#130/#135,
@@ -267,7 +345,7 @@ The 12 that do not die are not defects: 4 on the TLV helpers (an exact 255-octet
 Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
 
 - **Typed IP reachability TLVs** (#135 extended IPv4, #236 IPv6, legacy #128/#130, #132 address iterator, #232 IPv6 address) with prefix sub-TLVs (survey 2026-09-30). Why: the first thing an IP IS-IS user decodes from an LSP; holo/FRR/goisis all type them. Effort: ~2–3 days, same iterator shape as #22. Fits CONVENTIONS §2: yes (pure codec).
-- **Authentication TLV #10 with HMAC compute/verify (RFC 5304 HMAC-MD5, RFC 5310 HMAC-SHA family)** (survey 2026-09-30). Why: production IS-IS runs authenticated; holo (`auth.rs`) and goisis have it, and the siblings `isis-adj`/`isis-lsdb` list it as deferred because the codec has no primitive to call. Effort: ~3 days (`std.crypto.auth.hmac` exists; no dependency needed). Fits §2: yes.
+- ~~**Authentication TLV #10 with HMAC compute/verify (RFC 5304 HMAC-MD5, RFC 5310 HMAC-SHA family)**~~ — **closed 2026-11-18** (`auth`, § Authentication; security triage row isis:270 done). (survey 2026-09-30). Why: production IS-IS runs authenticated; holo (`auth.rs`) and goisis have it, and the siblings `isis-adj`/`isis-lsdb` list it as deferred because the codec has no primitive to call. Effort: ~3 days (`std.crypto.auth.hmac` exists; no dependency needed). Fits §2: yes.
 - **Purge Originator Identification (#13, RFC 6232) and Extended Sequence Number (#229, RFC 7602)** (survey 2026-09-30). Why: FRR and holo emit/consume them; a purge without #13 cannot be traced. Effort: ~1 day. Fits §2: yes.
 - **Non-default ID length in typed bodies (ISO 10589 ID Length 1–8)** (survey 2026-09-30). Why: interop with the rare non-6 deployment; the deferred list above points here. Effort: ~2 days, touches every fixed-offset read. Fits §2: yes. Priority low.
 - **MT TLVs #222 / #235 / #237** (survey 2026-09-30). Why: multi-topology IS-IS (RFC 5120) in FRR/holo; the MT-ID is already parsed in #143/#144. Effort: ~2 days. Fits §2: yes. Priority low.
@@ -283,4 +361,4 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 
 **What the tests actually contain.** Wireshark sharkd validated 5 PDU bodies + TLVs incl. L2 CSNP/PSNP (goldens.zig); long-tail raw-TLV escape hatch stays self-tested
 
-**How it got there.** The anchoring work landed. CLOSED 2026-08-05: L2 CSNP (25) and L2 PSNP (27) type codes driven through this module's own CsnpBuilder/PsnpBuilder and confirmed by sharkd (goldens 8-9, goldens.zig; mutation-tested). Remaining gap: the long-tail raw-TLV/sub-TLV escape hatch (Auth #10, IP-reach, unmodeled SPB sub-TLVs, non-default id-lengths) stays self-tested only — not modeled (IP-reach, Auth #10 and non-default id-lengths are Backlog items), so there is no typed content for Wireshark to validate
+**How it got there.** The anchoring work landed. CLOSED 2026-08-05: L2 CSNP (25) and L2 PSNP (27) type codes driven through this module's own CsnpBuilder/PsnpBuilder and confirmed by sharkd (goldens 8-9, goldens.zig; mutation-tested). Remaining gap: the long-tail raw-TLV/sub-TLV escape hatch (IP-reach, unmodeled SPB sub-TLVs, non-default id-lengths) stays self-tested only — not modeled (IP-reach and non-default id-lengths are Backlog items). Auth #10 (2026-11-18) is anchored on an independent Python recipe (`tools/auth_kat.py`, § Authentication), not on a dissector, so there is no typed content for Wireshark to validate

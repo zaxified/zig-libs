@@ -31,6 +31,7 @@ modules/hpke/src/schedule.zig	1
 modules/idempotency/src/root.zig	2
 modules/iec62351/src/acse.zig	1
 modules/iec62351/src/goose.zig	5
+modules/isis/src/auth.zig	1
 modules/jwe/src/enc.zig	1
 modules/jwt/src/cache.zig	1
 modules/jwt/src/pem.zig	1
