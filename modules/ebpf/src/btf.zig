@@ -3199,7 +3199,7 @@ test "loadModule / loadFile / Builder: input limits" {
     var one = Builder.init(gpa);
     defer one.deinit();
     const int_id = try one.addInt("int", 4, 32, 1);
-    const sid = try one.addComposite(.@"struct", "s", 8, &.{.{ .name = "f", .type_id = int_id, .bit_offset = 0x1000000, .bitfield_size = 3 }});
+    const sid = try one.addComposite(.@"struct", "s", 8, &.{.{ .name = "f", .type_id = int_id, .bit_offset = 0x4000000, .bitfield_size = 3 }});
     const ob = try one.finish();
     defer gpa.free(ob);
     var op = try parse(gpa, ob, .{});
@@ -3251,4 +3251,20 @@ test "round 3: lookups by name are exact, and an unaligned type section is refus
     std.mem.writeInt(u32, padded[header_size + 4 + 4 ..][0..4], @as(u32, K_PTR) << 24, native_endian);
     var ok = try parse(gpa, padded, .{});
     ok.deinit();
+}
+
+test "parse: hdr_len below the header size is refused even when the shifted layout would parse" {
+    const gpa = testing.allocator;
+    var r = try RawBtf.init(gpa);
+    defer r.deinit(gpa);
+    _ = try r.rec(gpa, 0, K_PTR, 0, false, 0, &.{});
+    const good = try r.finish(gpa);
+    defer gpa.free(good);
+    // hdr_len 20: the type section starts at byte 20 + type_off, so type_off 4 lands on byte 24
+    const b = try gpa.dupe(u8, good);
+    defer gpa.free(b);
+    std.mem.writeInt(u32, b[4..8], 20, native_endian);
+    std.mem.writeInt(u32, b[8..12], 4, native_endian);
+    std.mem.writeInt(u32, b[16..20], 4 + 12, native_endian);
+    try testing.expectError(error.MalformedBtf, parse(gpa, b, .{}));
 }

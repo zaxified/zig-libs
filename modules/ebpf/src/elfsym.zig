@@ -2382,3 +2382,18 @@ test "round 3: every section-header field decodes from its own offset; symbol ta
         try testing.expectError(error.SymbolNotFound, Ctx.run(gpa, b, "skewed_fn", .{}));
     }
 }
+
+test "resolve: no section table means shentsize is not consulted" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const img = try SynthElf.build(gpa);
+    defer gpa.free(img);
+    SynthElf.wr(u64, img, ehdr_shoff, 0);
+    SynthElf.wr(u16, img, ehdr_shentsize, 0);
+    const path = try writeTempFile(gpa, "noshdr", img);
+    defer {
+        _ = linux.unlink(path.ptr);
+        gpa.free(path);
+    }
+    try testing.expectError(error.SymbolNotFound, resolve(gpa, path, "flat_fn"));
+}
