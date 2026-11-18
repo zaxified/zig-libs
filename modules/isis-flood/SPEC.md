@@ -6,7 +6,9 @@
 
 **Scope:** mvp — FRR isisd flooding (10.7) and holo-isis flooding (v0.9.0), ISO 10589 §7.3.15/.16 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-17 (137/151, 14 eq) · src 16f1f20c43e240d9
+**Audit:** review 2026-09-03 · mutation 2026-11-19 (148/163, 15 eq) · src 6d1438c6c026fa43
+
+**Audit 2026-11-19 (delta mutation, SNP signing).** 12 mutants over the new signing code (`snp.zig`: the placeholder and the signing call in both builders, the key lookup, the signed-slice length, the sign-failure mapping; `scheduler.zig`: `snpKey` guards and index, the key handed to the PSNP and CSNP builders), one schemata build, baseline first: 11 killed, 1 EQUIVALENT (`signed` returning the unsigned bytes when `isis.auth.sign` fails: sign cannot fail on a PDU whose placeholder was just built for the same key). The card counts are cumulative with the 2026-11-17 whole-module run (137/151, 14 eq).
 
 **Audit 2026-11-17 (whole-module mutation).** 151 mutants over every non-test line of `src/snp.zig` and `src/scheduler.zig` (the LSP-ID successor / midpoint arithmetic, SNP entry sorting and PDU building with its error mapping, the SRM drain and retransmit pacing, the per-circuit burst cap, the Down-edge reset, PSNP chunking and the SSN drain, CSNP windows, chunk tiling and the series cursor, the wakeup and truncation bookkeeping), one schemata build per round, baseline first. Round 1: 105 killed, 46 survived. 18 tests were added (3 in `snp.zig`, 15 in `scheduler.zig`): successor carrying into the top octet and across 0xFE, midpoint symmetric in its operands, `ValueTooLong` above 15 entries and `BufferTooSmall` for every shorter scratch, last-sent pruning not resurrecting a stale victim, a Down circuit losing only its own pacing records, the burst cap, pacing measured from the real send time and the wakeup naming the retransmit, an unfinished series waking at `now`, PSNP and CSNP failures for lack of effect slots or scratch ending the pass, several PSNPs keeping their own bytes in ascending order, SNP lifetimes aged to the poll time, a window of exactly 256 entries versus one cut at the 256th id, an empty database, a CSNP that found no effect slot being retried, and a finished series restarting from the bottom of the ID space. Round 2 killed 32 of the 46; 14 do not die, all EQUIVALENT:
 - `sortEntries` `<=` for `<` (LSP-IDs in one database are distinct);
@@ -42,7 +44,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | Per-circuit SRM/SSN with LAN clear-on-send and p2p PSNP-driven retransmission (design doc §Flooding), LSP generation throttling. |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | No LSP flooding. |
 
-**Where we are ahead:** the transmit side as a pure, time-injected scheduler with a `next_wakeup` deadline, bounded state (last-sent map pruned every poll), and CSNP range tiling that claims coverage only over windows it enumerated in full; the 62x `summarise` regression is recorded and pinned. **Where we are behind:** point-to-point only — no broadcast circuits (SRM cleared on send, DIS-gated periodic CSNP; `rg -i broadcast isis-flood/src` finds only the deferral comment); SNPs carry one 15-entry #9 TLV per PDU rather than filling the MTU (SPEC §5, §8); no `partialSNPInterval` (PSNPs unpaced, SPEC §8); inter-LSP pacing approximated by a per-poll burst cap; no mesh-groups; no flooding reduction (→ Backlog).
+**Where we are ahead:** the transmit side as a pure, time-injected scheduler with a `next_wakeup` deadline, bounded state (last-sent map pruned every poll), and CSNP range tiling that claims coverage only over windows it enumerated in full; the 62x `summarise` regression is recorded and pinned. **Where we are behind:** point-to-point only — no broadcast circuits (SRM cleared on send, DIS-gated periodic CSNP; `rg -i broadcast isis-flood/src` finds only the deferral comment); SNPs carry one 15-entry #9 TLV per PDU rather than filling the MTU (SPEC §5, §8); no `partialSNPInterval` (PSNPs unpaced, SPEC §8); inter-LSP pacing approximated by a per-poll burst cap; no mesh-groups; no flooding reduction (→ Backlog); authentication is sender-side for SNPs only (§10): one key list for every circuit, `keys[0]` signs, and the module originates no LSP (it floods what the LSDB stores), so there is nothing else here for it to sign.
 
 ## 1. Scope
 
@@ -302,6 +304,45 @@ green; the sibling `isis` (46) and `isis-lsdb` (24) suites unaffected.
 Provenance: pure spec-only clean-room from ISO/IEC 10589 §7.3.15/.16 (a public
 spec — merger doctrine); no third-party implementation source consulted or ported.
 Like the sibling `isis` codec + `isis-adj` FSM it carries no `/NOTICE` entry.
+
+## 10. Authentication (sender side, `Config.auth_keys`, 2026-11-19)
+
+Without keys every PDU is byte-identical to before (the goldens are unchanged).
+`Config.auth_keys` takes the same slice as `isis-lsdb`'s `Config.auth_keys` and
+`Config.auth_snp` the same flag.
+
+- **CSNPs and PSNPs are signed** with `auth_keys[0]`: the Authentication TLV
+  (#10) is the first TLV (holo-isis and FRR put it first, and `isis.auth`
+  documents why), the digest covers the whole PDU (RFC 5304 §2, RFC 5310 §3),
+  every chunk of a multi-PDU series is signed on its own. `snp.buildCsnpSigned` /
+  `snp.buildPsnpSigned` take the key; `buildCsnp` / `buildPsnp` are the unsigned
+  forms. A key whose #10 cannot be built (a cleartext password over 254 octets)
+  is `error.ValueTooLong` / `error.BufferTooSmall`, and the scheduler reports it
+  as `truncated`, like any other build failure: it is a configuration error,
+  not a runtime condition.
+- **`auth_snp = false`** leaves SNPs unsigned (FRR isisd's default; Junos
+  `no-csnp-authentication` / `no-psnp-authentication`); the default `true` is what
+  holo-isis, Junos and IOS do. Set it equal to the peer's and to the `auth_snp` of
+  the `isis-lsdb` that receives, or the receiver refuses (or the peer does).
+- **LSPs are not touched.** This module originates no LSP: `poll` hands out the
+  LSDB's own stored bytes, zero-copy (§4). A flooded LSP therefore leaves with
+  its originator's #10 and digest, exactly as received. A forwarder must not
+  re-sign it: the digest is the originator's, and Remaining Lifetime and
+  Checksum are outside the digest (RFC 5304 §2: hashed as zero) so ageing in
+  transit needs no new signature. LSP signing (origination, refresh, the aging
+  purge) is done where the LSP is made: the generator's caller and `isis-lsdb`'s
+  `retainSignedPurge`.
+- **Not here:** hello signing (`isis-adj`); a key per circuit or per level
+  (one list for the instance; run one instance per level, as the siblings do);
+  key lifetimes and automatic rollover (the first key signs, the others only help
+  the receive side).
+
+Sources: RFC 5304 §2 and RFC 5310 §3 (what a signed PDU is); holo-isis
+(`packet/pdu.rs`: SNPs encoded and validated with the circuit key); FRR
+documentation (`isis password ... authenticate snp send/validate`: SNP
+authentication is opt-in there). Tests: `src/auth_test.zig` (every algorithm,
+verification by `isis.auth.verify` and by the real `isis-lsdb` receiver, wrong
+key, unsigned, chunked series, rollover order, forwarded LSP byte-identical).
 
 ## Backlog / deferred
 

@@ -88,25 +88,52 @@ pub fn sortEntries(entries: []LspEntry) void {
 }
 
 /// Build one PSNP carrying `entries` (an ack or a request set) into `scratch`.
-/// `entries.len` must be `<= max_entries_per_pdu`.
+/// `entries.len` must be `<= max_entries_per_pdu`. Unsigned; see `buildPsnpSigned`.
 pub fn buildPsnp(scratch: []u8, source_id: [7]u8, is_l2: bool, entries: []const LspEntry) BuildError![]const u8 {
+    return buildPsnpSigned(scratch, source_id, is_l2, entries, null);
+}
+
+/// `buildPsnp` that, given a `key`, puts an Authentication TLV (#10) first and
+/// signs the finished PDU (RFC 5304 §2 / RFC 5310 §3: a sender whose circuit
+/// is authenticated signs every IS-IS PDU, SNPs included). `null` = the
+/// unsigned PDU `buildPsnp` makes, byte for byte.
+pub fn buildPsnpSigned(scratch: []u8, source_id: [7]u8, is_l2: bool, entries: []const LspEntry, key: ?isis.auth.Key) BuildError![]const u8 {
     var b = isis.pdu.PsnpBuilder.init(scratch, .{ .source_id = source_id, .is_l2 = is_l2 }) catch return error.BufferTooSmall;
+    if (key) |k| isis.auth.addPlaceholder(&b.tlvs, k) catch |e| return mapBuildError(e);
     isis.tlvs.addLspEntries(&b.tlvs, entries) catch |e| return mapBuildError(e);
-    return b.finish();
+    return signed(scratch, b.finish(), key);
 }
 
 /// Build one CSNP summarising `entries` over the inclusive range `[start, end]`
 /// into `scratch`. `entries.len` must be `<= max_entries_per_pdu`; an empty
-/// `entries` is legal (a CSNP asserting "nothing in this range").
+/// `entries` is legal (a CSNP asserting "nothing in this range"). Unsigned; see
+/// `buildCsnpSigned`.
 pub fn buildCsnp(scratch: []u8, source_id: [7]u8, is_l2: bool, start: LspId, end: LspId, entries: []const LspEntry) BuildError![]const u8 {
+    return buildCsnpSigned(scratch, source_id, is_l2, start, end, entries, null);
+}
+
+/// `buildCsnp` that, given a `key`, adds and fills the Authentication TLV
+/// like `buildPsnpSigned`.
+pub fn buildCsnpSigned(scratch: []u8, source_id: [7]u8, is_l2: bool, start: LspId, end: LspId, entries: []const LspEntry, key: ?isis.auth.Key) BuildError![]const u8 {
     var b = isis.pdu.CsnpBuilder.init(scratch, .{
         .source_id = source_id,
         .is_l2 = is_l2,
         .start_lsp_id = start,
         .end_lsp_id = end,
     }) catch return error.BufferTooSmall;
+    if (key) |k| isis.auth.addPlaceholder(&b.tlvs, k) catch |e| return mapBuildError(e);
     if (entries.len > 0) isis.tlvs.addLspEntries(&b.tlvs, entries) catch |e| return mapBuildError(e);
-    return b.finish();
+    return signed(scratch, b.finish(), key);
+}
+
+/// Fill in the digest of a finished PDU that lives at the start of `scratch`.
+fn signed(scratch: []u8, wire: []const u8, key: ?isis.auth.Key) BuildError![]const u8 {
+    const k = key orelse return wire;
+    const out = scratch[0..wire.len];
+    // The only way `sign` can fail on a PDU this file just built is a key the
+    // placeholder could not describe; `addPlaceholder` already refused those.
+    isis.auth.sign(out, k) catch return error.ValueTooLong;
+    return out;
 }
 
 fn mapBuildError(e: anytype) BuildError {

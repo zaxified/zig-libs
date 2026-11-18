@@ -140,6 +140,22 @@ pub const Config = struct {
     /// module's **positive control**: a test flips it off to prove the pacing gate
     /// has teeth (without it the pace-boundary test would go RED).
     pace_lsp_retransmit: bool = true,
+    /// Authentication keys of the circuits (RFC 5304 / RFC 5310; same shape and
+    /// meaning as `isis-lsdb`'s `Config.auth_keys`, pass the same slice). When
+    /// non-empty, every CSNP and PSNP this scheduler generates is signed with
+    /// `auth_keys[0]` (`snp.buildCsnpSigned`); the rest are for the receive
+    /// side (rollover) and are not used here. LSPs are NOT touched: they are
+    /// flooded as stored, byte for byte, with their originator's #10 — a
+    /// forwarder never re-signs (RFC 5304 §2: the digest is the originator's;
+    /// lifetime and checksum are outside it so ageing needs no new signature).
+    /// Borrowed: must outlive the `Scheduler`. Empty = unauthenticated (the
+    /// default; output is byte-identical to a build without this field).
+    auth_keys: []const isis.auth.Key = &.{},
+    /// Whether SNPs are signed when `auth_keys` is set (default `true`: holo,
+    /// Junos and IOS sign SNPs). `false` = unsigned SNPs for a peer that does
+    /// not use SNP authentication (FRR isisd default); set it to the same value
+    /// as `isis-lsdb`'s `Config.auth_snp`. Ignored without `auth_keys`.
+    auth_snp: bool = true,
 };
 
 /// The per-`(lsp, iface)` key of the last-sent map.
@@ -184,6 +200,12 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler) void {
         self.last_sent.deinit(self.alloc);
         self.victims.deinit(self.alloc);
+    }
+
+    /// The key CSNPs/PSNPs are signed with, or null for unsigned SNPs.
+    fn snpKey(self: *const Scheduler) ?isis.auth.Key {
+        if (self.cfg.auth_keys.len == 0 or !self.cfg.auth_snp) return null;
+        return self.cfg.auth_keys[0];
     }
 
     fn sourceId(self: *const Scheduler) [7]u8 {
@@ -402,7 +424,7 @@ pub const Scheduler = struct {
         while (i < m) {
             const j = @min(i + per, m);
             if (n_eff.* >= out.len) return true;
-            const built = snp.buildPsnp(scratch[scratch_used.*..], src, self.cfg.is_l2, entries[i..j]) catch return true;
+            const built = snp.buildPsnpSigned(scratch[scratch_used.*..], src, self.cfg.is_l2, entries[i..j], self.snpKey()) catch return true;
 
             out[n_eff.*] = .{ .iface = iface, .kind = .psnp, .bytes = built };
             n_eff.* += 1;
@@ -520,7 +542,7 @@ pub const Scheduler = struct {
             // window's proven end — never at a value we did not enumerate.
             const chunk_start = if (i == 0) start else snp.successor(entries[i - 1].lsp_id);
             const chunk_end = if (j >= m) end else entries[j - 1].lsp_id;
-            const built = snp.buildCsnp(scratch[scratch_used.*..], src, self.cfg.is_l2, chunk_start, chunk_end, entries[i..j]) catch
+            const built = snp.buildCsnpSigned(scratch[scratch_used.*..], src, self.cfg.is_l2, chunk_start, chunk_end, entries[i..j], self.snpKey()) catch
                 return self.csnpDone(iface, advertised_to, true);
 
             out[n_eff.*] = .{ .iface = iface, .kind = .csnp, .bytes = built };
