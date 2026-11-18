@@ -1705,3 +1705,324 @@ test "teeth: OAEP-SHA-512 on a 1024-bit key (k < 2*hLen+2) -> DecryptionError, n
     defer doc.deinit();
     try std.testing.expectError(error.DecryptionError, xmlenc.decryptData(a, doc.root, &kp.secret_key, .{}));
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// whole-module mutation 2026-11-17: refusals and exact boundaries that the
+// earlier suites left unobserved (see SPEC.md "Audit 2026-11-17")
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Replace every occurrence of each `from` by its `to`, in order. Owned result.
+fn rewrite(a: std.mem.Allocator, src: []const u8, pairs: []const [2][]const u8) ![]u8 {
+    var cur = try a.dupe(u8, src);
+    for (pairs) |p| {
+        const next = try std.mem.replaceOwned(u8, a, cur, p[0], p[1]);
+        a.free(cur);
+        cur = next;
+    }
+    return cur;
+}
+
+/// Insert a rotating run of XML whitespace (space, tab, CR, LF) every three
+/// characters, and at both ends. Owned result.
+fn sprinkle(a: std.mem.Allocator, s: []const u8) ![]u8 {
+    const ws = [_][]const u8{ " ", "\t", "\r", "\n", " \t\r\n" };
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "\n  ");
+    var i: usize = 0;
+    var k: usize = 0;
+    while (i < s.len) : (i += 3) {
+        try out.appendSlice(a, s[i..@min(i + 3, s.len)]);
+        try out.appendSlice(a, ws[k % ws.len]);
+        k += 1;
+    }
+    try out.appendSlice(a, "\t\r\n");
+    return out.toOwnedSlice(a);
+}
+
+/// A genuine OAEP-mgf1p + AES-256-GCM EncryptedData for `plaintext_assertion`.
+fn genuineDoc(a: std.mem.Allocator, kp: rsa.KeyPair) ![]u8 {
+    const cek = @as([32]u8, @splat(0x3B));
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+    const cek_b64 = try b64(a, wrapped);
+    defer a.free(cek_b64);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    return buildEncryptedData(a, xenc11_ns ++ "aes256-gcm", xenc_ns ++ "rsa-oaep-mgf1p", cek_b64, content_b64);
+}
+
+test "decryptData refuses a root of another name or namespace and an EncryptedKey of another namespace" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const good = try genuineDoc(a, kp);
+    defer a.free(good);
+    {
+        var doc = try xml.parse(a, good, .{});
+        defer doc.deinit();
+        const out = try xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
+        defer a.free(out);
+        try std.testing.expectEqualStrings(plaintext_assertion, out);
+    }
+    const cases = [_][]const [2][]const u8{
+        &.{.{ "xenc:EncryptedData", "xenc:Other" }},
+        &.{ .{ "<xenc:EncryptedData ", "<ev:EncryptedData xmlns:ev=\"urn:evil\" " }, .{ "</xenc:EncryptedData>", "</ev:EncryptedData>" } },
+        &.{ .{ "<xenc:EncryptedKey>", "<ev:EncryptedKey xmlns:ev=\"urn:evil\">" }, .{ "</xenc:EncryptedKey>", "</ev:EncryptedKey>" } },
+        &.{ .{ "<ds:KeyInfo>", "<ev:KeyInfo xmlns:ev=\"urn:evil\">" }, .{ "</ds:KeyInfo>", "</ev:KeyInfo>" } },
+    };
+    for (cases) |pairs| {
+        const bad = try rewrite(a, good, pairs);
+        defer a.free(bad);
+        var doc = try xml.parse(a, bad, .{});
+        defer doc.deinit();
+        try std.testing.expectError(error.MalformedStructure, xmlenc.decryptData(a, doc.root, &kp.secret_key, .{}));
+    }
+}
+
+test "decryptAssertion refuses a wrapper that is not an EncryptedAssertion" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const good = try genuineDoc(a, kp);
+    defer a.free(good);
+    const saml = "xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\"";
+    const right = try std.fmt.allocPrint(a, "<saml:EncryptedAssertion {s}>{s}</saml:EncryptedAssertion>", .{ saml, good });
+    defer a.free(right);
+    const wrong = try std.fmt.allocPrint(a, "<saml:Assertion {s}>{s}</saml:Assertion>", .{ saml, good });
+    defer a.free(wrong);
+    {
+        var doc = try xml.parse(a, right, .{});
+        defer doc.deinit();
+        const out = try xmlenc.decryptAssertion(a, doc.root, &kp.secret_key, .{});
+        defer a.free(out);
+        try std.testing.expectEqualStrings(plaintext_assertion, out);
+    }
+    var doc = try xml.parse(a, wrong, .{});
+    defer doc.deinit();
+    try std.testing.expectError(error.MalformedStructure, xmlenc.decryptAssertion(a, doc.root, &kp.secret_key, .{}));
+}
+
+test "the content ciphertext cap and the EncryptedKey cap are exact" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x3B));
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+    const alg_c = xenc11_ns ++ "aes256-gcm";
+    const alg_k = xenc_ns ++ "rsa-oaep-mgf1p";
+
+    // Exactly as many octets as the cap: accepted. One more than the cap: refused.
+    const out = try roundTrip(a, alg_c, alg_k, wrapped, content, kp.secret_key, .{ .max_ciphertext_len = content.len });
+    defer a.free(out);
+    try std.testing.expectEqualStrings(plaintext_assertion, out);
+    try std.testing.expectError(error.CiphertextTooLarge, roundTrip(a, alg_c, alg_k, wrapped, content, kp.secret_key, .{ .max_ciphertext_len = content.len - 1 }));
+
+    // The EncryptedKey blob: 1024 octets reach the RSA length check, 1025 do not.
+    const k1024: [1024]u8 = @splat(0x11);
+    const k1025: [1025]u8 = @splat(0x11);
+    try std.testing.expectError(error.DecryptionError, roundTrip(a, alg_c, alg_k, &k1024, content, kp.secret_key, .{}));
+    try std.testing.expectError(error.CiphertextTooLarge, roundTrip(a, alg_c, alg_k, &k1025, content, kp.secret_key, .{}));
+}
+
+test "the character cap is cap = ceil(max/3)*4 + 4: past it CiphertextTooLarge, below it the base64 length decides" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const Case = struct { max: usize, text: []const u8, want: anyerror };
+    const cases = [_]Case{
+        // cap = 8: five characters are not a base64 length, nine are past the cap.
+        .{ .max = 3, .text = "AAAAA", .want = error.MalformedStructure },
+        .{ .max = 3, .text = "AAAAAAAAA", .want = error.CiphertextTooLarge },
+        // cap = 12 (4 octets round UP to two groups): nine characters are within it.
+        .{ .max = 4, .text = "AAAAAAAAA", .want = error.MalformedStructure },
+    };
+    for (cases) |c| {
+        const src = try buildEncryptedData(a, xenc11_ns ++ "aes256-gcm", xenc_ns ++ "rsa-oaep-mgf1p", "AAAA", c.text);
+        defer a.free(src);
+        var doc = try xml.parse(a, src, .{});
+        defer doc.deinit();
+        try std.testing.expectError(c.want, xmlenc.decryptData(a, doc.root, &kp.secret_key, .{ .max_ciphertext_len = c.max }));
+    }
+}
+
+test "every XML whitespace octet inside a CipherValue is skipped" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x3B));
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+    const cek_b64 = try b64(a, wrapped);
+    defer a.free(cek_b64);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    const cek_ws = try sprinkle(a, cek_b64);
+    defer a.free(cek_ws);
+    const content_ws = try sprinkle(a, content_b64);
+    defer a.free(content_ws);
+    const src = try buildEncryptedData(a, xenc11_ns ++ "aes256-gcm", xenc_ns ++ "rsa-oaep-mgf1p", cek_ws, content_ws);
+    defer a.free(src);
+    var doc = try xml.parse(a, src, .{});
+    defer doc.deinit();
+    const out = try xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
+    defer a.free(out);
+    try std.testing.expectEqualStrings(plaintext_assertion, out);
+}
+
+test "AES-GCM content: an empty plaintext decrypts, a 27-octet blob is refused" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x3B));
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const empty = try gcmEncrypt(a, Aes256Gcm, cek, "");
+    defer a.free(empty);
+    try std.testing.expectEqual(@as(usize, 28), empty.len);
+    const alg_c = xenc11_ns ++ "aes256-gcm";
+    const alg_k = xenc_ns ++ "rsa-oaep-mgf1p";
+    const out = try roundTrip(a, alg_c, alg_k, wrapped, empty, kp.secret_key, .{});
+    defer a.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+    const short: [27]u8 = @splat(7);
+    try std.testing.expectError(error.DecryptionError, roundTrip(a, alg_c, alg_k, wrapped, &short, kp.secret_key, .{}));
+}
+
+test "AES-CBC content: a one-block ciphertext (IV plus 16 octets) decrypts" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x3B));
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const content = try cbcEncrypt(a, aes.Aes256, cek, "short");
+    defer a.free(content);
+    try std.testing.expectEqual(@as(usize, 32), content.len);
+    const out = try roundTrip(a, xenc_ns ++ "aes256-cbc", xenc_ns ++ "rsa-oaep-mgf1p", wrapped, content, kp.secret_key, .{});
+    defer a.free(out);
+    try std.testing.expectEqualStrings("short", out);
+}
+
+test "key wrap: kw-aes128 round-trips and every kw algorithm refuses a KEK of another length" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const kek16 = @as([16]u8, @splat(0x5A));
+    const cek16 = @as([16]u8, @splat(0x99));
+    var w24: [24]u8 = undefined;
+    kwWrap(&kek16, &cek16, &w24);
+    const content = try gcmEncrypt(a, Aes128Gcm, cek16, plaintext_assertion);
+    defer a.free(content);
+    const out = try roundTrip(a, xenc11_ns ++ "aes128-gcm", xenc_ns ++ "kw-aes128", &w24, content, kp.secret_key, .{ .kek = &kek16 });
+    defer a.free(out);
+    try std.testing.expectEqualStrings(plaintext_assertion, out);
+
+    const k24: [24]u8 = @splat(0x5A);
+    const k32: [32]u8 = @splat(0x5A);
+    const blob: [40]u8 = @splat(0);
+    const Case = struct { alg: []const u8, kek: []const u8 };
+    const cases = [_]Case{
+        .{ .alg = "kw-aes128", .kek = &k24 },
+        .{ .alg = "kw-aes128", .kek = &k32 },
+        .{ .alg = "kw-aes192", .kek = &kek16 },
+        .{ .alg = "kw-aes192", .kek = &k32 },
+        .{ .alg = "kw-aes256", .kek = &kek16 },
+        .{ .alg = "kw-aes256", .kek = &k24 },
+    };
+    for (cases) |c| {
+        const alg = try std.fmt.allocPrint(a, "{s}{s}", .{ xenc_ns, c.alg });
+        defer a.free(alg);
+        try std.testing.expectError(error.UnsupportedAlgorithm, roundTrip(a, xenc11_ns ++ "aes256-gcm", alg, &blob, content, kp.secret_key, .{ .kek = c.kek }));
+    }
+}
+
+test "xenc11 rsa-oaep without DigestMethod and MGF means a SHA-256 digest with MGF1-SHA1" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = @as([32]u8, @splat(0x3B));
+    var prng = std.Random.DefaultPrng.init(0x0DEF_A017);
+    var ct_buf: [rsa.max_modulus_len]u8 = undefined;
+    const ct = try rsa.encryptOaepH(kp.public_key, Sha256, Sha1, prng.random(), &cek, "", &ct_buf);
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+    const out = try roundTrip(a, xenc11_ns ++ "aes256-gcm", xenc11_ns ++ "rsa-oaep", ct, content, kp.secret_key, .{});
+    defer a.free(out);
+    try std.testing.expectEqualStrings(plaintext_assertion, out);
+}
+
+fn labelDoc(a: std.mem.Allocator, label_text: []const u8, cek_b64: []const u8, content_b64: []const u8) ![]u8 {
+    return a.print(
+        \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}">
+        \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
+        \\  <ds:KeyInfo>
+        \\    <xenc:EncryptedKey>
+        \\      <xenc:EncryptionMethod Algorithm="{s}rsa-oaep-mgf1p"><xenc:OAEPparams>{s}</xenc:OAEPparams></xenc:EncryptionMethod>
+        \\      <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\    </xenc:EncryptedKey>
+        \\  </ds:KeyInfo>
+        \\  <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\</xenc:EncryptedData>
+    , .{ xenc_ns, ds_ns, xenc11_ns, xenc_ns, label_text, cek_b64, content_b64 });
+}
+
+/// Encrypt under `label`, publish `label_text` as the OAEPparams, decrypt.
+fn labelRoundTrip(a: std.mem.Allocator, kp: rsa.KeyPair, label: []const u8, label_text: []const u8) ![]u8 {
+    const cek = @as([32]u8, @splat(0x3B));
+    var prng = std.Random.DefaultPrng.init(0x1ABE1);
+    var ct_buf: [rsa.max_modulus_len]u8 = undefined;
+    const ct = try rsa.encryptOaepH(kp.public_key, Sha1, Sha1, prng.random(), &cek, label, &ct_buf);
+    const content = try gcmEncrypt(a, Aes256Gcm, cek, plaintext_assertion);
+    defer a.free(content);
+    const cek_b64 = try b64(a, ct);
+    defer a.free(cek_b64);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    const src = try labelDoc(a, label_text, cek_b64, content_b64);
+    defer a.free(src);
+    var doc = try xml.parse(a, src, .{});
+    defer doc.deinit();
+    return xmlenc.decryptData(a, doc.root, &kp.secret_key, .{});
+}
+
+test "rsa-oaep-mgf1p: OAEPparams is the OAEP label, decoded from base64 with any XML whitespace, up to what the scratch buffer holds" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+
+    const one = try labelRoundTrip(a, kp, "L", "TA==");
+    defer a.free(one);
+    try std.testing.expectEqualStrings(plaintext_assertion, one);
+    // A different published label is a different key transport.
+    try std.testing.expectError(error.DecryptionError, labelRoundTrip(a, kp, "L", "TQ=="));
+
+    // Whitespace of every kind inside the label text.
+    const ws = try labelRoundTrip(a, kp, "label", " bGFi\tZW\r\nw =");
+    defer a.free(ws);
+    try std.testing.expectEqualStrings(plaintext_assertion, ws);
+
+    // The label text is gathered in a 512-octet scratch buffer
+    // (`readBase64Text`), whose list growth admits fewer octets than the
+    // 256-octet decode buffer (measured: 64 octets pass, 128 do not): a long
+    // label is refused, never overrun. 64 are accepted, 256 are refused.
+    const l64: [64]u8 = @splat(0x4C);
+    const l256: [256]u8 = @splat(0x4C);
+    const t64 = try b64(a, &l64);
+    defer a.free(t64);
+    const t256 = try b64(a, &l256);
+    defer a.free(t256);
+    const big = try labelRoundTrip(a, kp, &l64, t64);
+    defer a.free(big);
+    try std.testing.expectEqualStrings(plaintext_assertion, big);
+    try std.testing.expectError(error.MalformedStructure, labelRoundTrip(a, kp, &l256, t256));
+}
+
+test "decryptDataToDocument: the recovered tree indexes ID attributes" {
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const src = try genuineDoc(a, kp);
+    defer a.free(src);
+    var outer = try xml.parse(a, src, .{});
+    defer outer.deinit();
+    var inner = try xmlenc.decryptDataToDocument(a, outer.root, &kp.secret_key, .{});
+    defer inner.deinit(a);
+    try std.testing.expect(inner.doc.getElementById("_a1b2") != null);
+}

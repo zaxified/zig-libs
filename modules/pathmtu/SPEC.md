@@ -6,7 +6,7 @@
 
 **Scope:** parity — iputils tracepath 20250605: destination PMTU (cache read and DF search), per-hop MTU (`probeHops`), black-hole detection, v4 and v6, unprivileged and RAW sockets (surveyed 2026-11-02, gaps closed 2026-11-03)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (347/394, 47 eq) · src 5d03a0d458e316bd
+**Audit:** review 2026-09-10 · mutation 2026-11-17 (349/396, 47 eq) · src 525ff811ef9a877a
 
 **Hardening:** fuzz 2026-11-03 (PATHMTU_FUZZ=200000, ReleaseSafe: classify, classify-mutated, hops, errq, all clean, every reach label hit) · ct n/a — PMTU probing (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: error-queue drain stops the POLLERR busy-spin, `retries = 255` no longer wraps; delta audit 9/9)
 
@@ -463,6 +463,8 @@ against a model of one.
 
 Not mutated: the comptime constants and `Options` defaults (a schemata switch cannot reach them), `meta`, the error-set mappings of `probe`/`probeHops` after the socket open (`PermissionDenied`, `AddressFamilyUnsupported`, the `hopsWith` error arms that the up-front checks make unreachable), formatting and doc comments. Counts on the card are whole-module.
 
+Delta, same day: the v6 cap defect (see Backlog, closed) was fixed. `query`'s comparison moved into `cacheIsException(family, mtu, im)`; the four old mutants on the two removed lines (cap dropped, cap 65536, assignment skipped, comparison inverted) were replaced by six on the new code (assignment skipped, family forced to v4, v4 cap dropped, v4 cap 65536, v6 capped, comparison inverted): all six killed by the new pure test and the live `::1` test. Card: 349/396 (394 - 4 + 6; 47 eq unchanged).
+
 ## Backlog / deferred
 - **Packetization-layer PMTUD (RFC 4821 / RFC 8899)**: REJECTED for this module (2026-11-03). It needs a cooperating transport (a peer that echoes UDP/QUIC probes); no sibling module is one (`ls modules`: `icmp`, `probe`, `traceroute`, `quic-crypto` only). `probe` detects the black hole (`blackhole = true`) and still finds a number. Revisit if a transport module appears.
 - **Next-hop MTU on the ping-socket (DGRAM) lane**: `icmp.Socket.ErrInfo` does not carry `sock_extended_err.ee_info`, which is the MTU a Fragmentation Needed reports. `probe` and `probeHops` read the error-queue entry (type, code, offender) and bisect without a hint, so results are exact but cost about 11 probes per narrowing. Needs an `ErrInfo.info` field in `icmp` (request in the report, not filed from here).
@@ -471,7 +473,7 @@ Not mutated: the comptime constants and `Options` defaults (a schemata switch ca
 - **Spoofed Fragmentation Needed and the route PMTU** *(2026-11-03, reproduced)*: a forged Frag-Needed / Packet-Too-Big quoting a live UDP socket's datagram lowers the kernel's cached PMTU for the destination for about 10 minutes (`ip route get` shows it), and a later socket to that destination inherits it. With `PMTUDISC_DO` later sends then fail locally with `EMSGSIZE`, which narrows the search with no router answering. Measured on a clean 1500 path, Linux 7.0, both socket kinds: with the protection removed `probe` and every hop read 1000 (v4) and 1300 (v6). `probe` and `probeHops` set `IP_PMTUDISC_PROBE` / `IPV6_PMTUDISC_PROBE` on their own socket, so the cached value is not consulted, and read 1500; `hops_oracle.py`, scenarios `*-forged-route-pmtu`, which refuse to run unless the forgery really lowered the route. `query` still reads the cached value: that is its job. The forgery needs the victim's 4-tuple; the scenario gives it to the forger. Forged ICMP that reaches the socket as a datagram or error-queue entry is still accepted on ident+seq (see the threat model).
 - **A multi-homed destination** *(2026-11-03)*: `probeHops` takes an Echo Reply only from the exact address it probed (anything else could be a spoof). A reply from another address of the same host is dropped; the caller sees silence at that hop, `reached == false`, and a walk ended by `max_silent_hops` or the deadline. Matching is not widened.
 - **Per-hop black-hole attribution**: the walk flags `blackhole` when a floor-sized probe is answered where a larger one is not, at any hop, and does not name the hop beyond its position in `hops`.
-- **`query` over IPv6 on a loopback with MTU above 65535** *(found 2026-11-17 by the whole-module mutation)*: `IPV6_MTU` reads the interface MTU uncapped (65536 on `lo`), but `query` compares it with `min(iface_mtu, 65535)` (the cap is `IP_MTU`'s), so `query(::1, .{ .iface = "lo" })` reports `cache_is_exception = true` with no exception in play. Only an interface above 65535 (loopback) shows it. Not changed here (behaviour); the live test pins `mtu == iface_mtu` for v6 only.
+- *(closed 2026-11-17)* **`query` over IPv6 on a loopback with MTU above 65535**: `IPV6_MTU` reads the interface MTU uncapped (65536 on `lo`) but `query` compared it with `min(iface_mtu, 65535)`, the cap of `IP_MTU`, so `query(::1, .{ .iface = "lo" })` reported `cache_is_exception = true` with no exception. Fixed: the comparison is capped for IPv4 only (`cacheIsException`); the IPv6 link MTU is a 32-bit quantity (RFC 8200 allows jumbograms), the kernel returns it as is. Pinned by a pure test of both families and by the live `::1` test.
 
 ## Open
 

@@ -6,7 +6,7 @@
 
 **Scope:** mvp — holo-isis packet layer (holo v0.9.0), behaviour cross-checked against FRR isisd 10.7 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-14 · mutation 2026-09-03 · src ?
+**Audit:** review 2026-09-14 · mutation 2026-11-17 (509/521, 12 eq) · src ee9c0d05fb11d149
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_FUZZ) · ct n/a — IS-IS codec, no auth (keyword review, 2026-10-07)
 
@@ -208,6 +208,14 @@ Offline only — pure codec, no live-interop surface in this environment.
 
 Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
 `zig build check-catalog` exit 0.
+
+## Audit 2026-11-17 (whole-module mutation)
+
+521 mutants over every non-test line of `src/checksum.zig`, `header.zig`, `tlv.zig`, `tlvs.zig`, `pdu.zig`, `spb.zig` and the dispatch in `root.zig`, one build with every mutant behind a runtime switch, run once per mutant (ReleaseSafe). One mutant per condition and class: each bound (`<`, `<=`, dropped), each length and offset (one octet early or late, the record size off by one), each endianness (every multi-byte read and write), each flag bit (wrong bit, inverted), each mask, each skipped write, each dispatch arm, each builder guard and backfill, the Fletcher arithmetic (moduli, signs, which accumulator, the fold of Y, the zero normalisation) and the receive-side grading (`checkLspChecksum`: zero test, `verify` forced true or false). Not mutated: the comptime constants, the `catch unreachable` after a checked length, formatting and doc comments.
+
+421 mutants died on the existing suite, 100 survived the first round, and `src/mutation_test.zig` (33 tests) kills 88 of them: exact-fit and one-short buffers for every builder and every `add*` TLV helper (the 255-octet TLV value limit reached from each side), the fixed-header decode at exactly its fixed length and one octet below (`TruncatedBody`, which differs from `BadPduLength`), the Length Indicator one below and one above, a non-default Maximum Area Addresses written by each builder and read back, bytes after the PDU Length field (not in the TLV region, not in the checksum region), the byte order of the LSP checksum, sequence and lifetime fields, `stampLspChecksum`'s return value, each `LspFlags` bit on its own, distinct metrics and ids in IS Neighbours, CSNP and SPB records (the old tests used symmetric values), each VID tuple flag and the 12/20-bit masks, the I-SID and tuple counts at their limit, partial trailing records fed straight to the two fixed-record iterators, the level-2 dispatch arms and `.other` keeping its bytes.
+
+The 12 that do not die are not defects: 4 on the TLV helpers (an exact 255-octet scratch fit that no loop value can reach: 255 is not a multiple of 6 or 16; an area over 254 octets already fails the scratch bound, which makes two area-length tests redundant), 1 iterator end test (`>=` for `==` on a position that never exceeds the length), 4 PDU-length zeroing writes in the builders' `init` (`finish` always overwrites the field, an unfinished builder is not an output), 1 byte-order mutant on a value that is only compared with zero, 2 redundant guards in `encodeSpbInstance` (the builder repeats the buffer test with the same error; 255 tuples already exceed a TLV value). No survivor sits in the checksum arithmetic, `verify`, the zero-checksum test or any auth or length check: forcing `checkLspChecksum` to report every checksum good or every checksum bad is killed. Counts on the card are whole-module.
 
 ## Deliberately deferred (out of scope by design, not oversight)
 
