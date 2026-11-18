@@ -895,6 +895,7 @@ const Echo = struct {
     fail: bool = false,
     restarts: usize = 0,
     trouble: bool = false,
+    trouble_offs: usize = 0,
 
     fn node(self: *Echo) Node {
         return .{
@@ -935,7 +936,10 @@ const Echo = struct {
         switch (op) {
             .restart => self.restarts += 1,
             .trouble_on => self.trouble = true,
-            .trouble_off => self.trouble = false,
+            .trouble_off => {
+                self.trouble = false;
+                self.trouble_offs += 1;
+            },
         }
         return true;
     }
@@ -1236,4 +1240,458 @@ test "netsim trace maps onto fleet faults and reports what it cannot map" {
     try testing.expectEqual(@as(usize, 0), fleet.outbound().len); // crashed
     _ = try fleet.advance(25);
     try testing.expectEqual(@as(usize, 1), echo.restarts);
+}
+
+// ── whole-module mutation audit 2026-11-18 ──────────────────────────────────
+//
+// Each test below pins one behaviour the audit found unobserved: stats
+// counters, boundary lengths, the one-outstanding-tick rule, heal clearing
+// every field, trace ring wrap, PRNG draw counts and slot-flag reuse.
+
+fn deliveredTimes(f: *const Fleet, out: []Time) []Time {
+    var buf: [64]TraceEntry = undefined;
+    var n: usize = 0;
+    for (f.traceInto(&buf)) |e| {
+        if (e.kind == .delivered and n < out.len) {
+            out[n] = e.time;
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+fn countKind(f: *const Fleet, kind: TraceKind) usize {
+    var buf: [256]TraceEntry = undefined;
+    var n: usize = 0;
+    for (f.traceInto(&buf)) |e| {
+        if (e.kind == kind) n += 1;
+    }
+    return n;
+}
+
+test "addNode: a tick is scheduled only for a node that has one AND a period" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    try testing.expectEqual(@as(?Time, null), fleet.nextEventTime());
+    _ = try fleet.addNode(.{ .node = echo.node(), .tick_period_ms = 0 }); // tick-capable, no period
+    try testing.expectEqual(@as(?Time, null), fleet.nextEventTime());
+
+    const Mute = struct {
+        fn deliverFn(_: *anyopaque, _: []const u8, _: []u8, _: Time) node_mod.NodeError!?[]const u8 {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const mute = try fleet.addNode(.{ .node = .{ .ctx = &dummy, .vtable = &.{ .deliver = Mute.deliverFn } }, .tick_period_ms = 100 });
+    try testing.expectEqual(@as(?Time, null), fleet.nextEventTime()); // a period without a tick fn schedules nothing
+    // A delivery to it must not conjure a tick either.
+    try fleet.submit(mute, "x", 0);
+    _ = try fleet.advance(500);
+    try testing.expectEqual(@as(u64, 0), fleet.stats(mute).ticks);
+}
+
+test "ticks: one outstanding tick per node, however many frames arrive" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node(), .tick_period_ms = 100 });
+    try testing.expectEqual(@as(?Time, 100), fleet.nextEventTime());
+    try fleet.submit(id, "a", 10); // before the first tick: the pending tick is reused
+    try fleet.submit(id, "b", 150); // between the 1st and 2nd tick
+    try fleet.submit(id, "c", 160);
+    const fired = try fleet.advance(300);
+    try testing.expectEqual(@as(u64, 3), fleet.stats(id).ticks); // 100, 200, 300 and no extras
+    try testing.expectEqual(@as(usize, 3), echo.ticks);
+    try testing.expectEqual(@as(usize, 3 + 3 * 2), fired); // 3 ticks + 3 deliveries + 3 emits
+    try testing.expectEqual(@as(u64, 3), fleet.stats(id).replied);
+    try testing.expectEqual(@as(u64, 3), fleet.stats(id).emitted);
+}
+
+test "ticks: unsolicited tick output is counted as a reply and emitted" {
+    var echo = Echo{ .tick_payload = "tick" };
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node(), .tick_period_ms = 100 });
+    _ = try fleet.advance(100);
+    try testing.expectEqual(@as(u64, 1), fleet.stats(id).ticks);
+    try testing.expectEqual(@as(u64, 1), fleet.stats(id).replied);
+    try testing.expectEqual(@as(u64, 1), fleet.stats(id).emitted);
+    try testing.expectEqual(@as(usize, 1), countKind(&fleet, .tick_replied));
+    try testing.expectEqualSlices(u8, "tick", fleet.frameBytes(fleet.outbound()[0]));
+}
+
+test "ticks: a tick exactly at the end of a silent window runs" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node(), .tick_period_ms = 100 });
+    try fleet.addFault(.{ .at_ms = 0, .node = id, .kind = .{ .silent = .{ .until_ms = 100 } } });
+    _ = try fleet.advance(100);
+    try testing.expectEqual(@as(usize, 1), echo.ticks); // t=100 >= silent_until=100
+}
+
+test "submit: a frame exactly max_frame_len long is carried; one more is refused" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{ .max_frame_len = 8 });
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.submit(id, "12345678", 0);
+    _ = try fleet.advance(10);
+    try testing.expectEqual(@as(usize, 1), fleet.outbound().len);
+    try testing.expectEqualSlices(u8, "12345678", fleet.frameBytes(fleet.outbound()[0]));
+    try testing.expectEqual(@as(usize, 0), fleet.capacity_losses);
+    try testing.expectError(error.FrameTooLarge, fleet.submit(id, "123456789", 0));
+}
+
+test "stats: dropped, duplicated, emitted and ticks are counted where they happen" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const a = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.addFault(.{ .at_ms = 0, .node = a, .kind = .{ .drop_next = .{ .count = 1 } } });
+    _ = try fleet.advance(1);
+    try fleet.submit(a, "x", 1);
+    try testing.expectEqual(@as(u64, 1), fleet.stats(a).dropped_in); // one-shot drop
+
+    var echo_b = Echo{};
+    const b = try fleet.addNode(.{ .node = echo_b.node(), .link = .{ .loss_permille = 1000 } });
+    try fleet.submit(b, "x", 1);
+    try testing.expectEqual(@as(u64, 1), fleet.stats(b).dropped_in); // link loss
+    _ = try fleet.advance(10);
+    try testing.expectEqual(@as(u64, 0), fleet.stats(b).delivered);
+
+    var echo_c = Echo{};
+    const c = try fleet.addNode(.{ .node = echo_c.node(), .link = .{ .dup_permille = 1000 } });
+    try fleet.submit(c, "x", 10);
+    _ = try fleet.advance(20);
+    // inbound duplicate +1, then each of the 2 replies is duplicated outbound +1 each
+    try testing.expectEqual(@as(u64, 3), fleet.stats(c).duplicated);
+    try testing.expectEqual(@as(u64, 2), fleet.stats(c).delivered);
+    try testing.expectEqual(@as(u64, 4), fleet.stats(c).emitted);
+}
+
+test "stats: loss on the way out is counted as dropped_out" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    // The fault event is queued first, so it runs before the delivery: the
+    // inbound roll (taken at submit) passes, the outbound roll bites.
+    try fleet.addFault(.{ .at_ms = 0, .node = id, .kind = .{ .link = .{ .loss_permille = 1000 } } });
+    try fleet.submit(id, "x", 0);
+    _ = try fleet.advance(10);
+    try testing.expectEqual(@as(u64, 1), fleet.stats(id).dropped_out);
+    try testing.expectEqual(@as(usize, 0), fleet.outbound().len);
+}
+
+test "faults: delay_next applies to exactly its count of frames" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.addFault(.{ .at_ms = 0, .node = id, .kind = .{ .delay_next = .{ .count = 1, .extra_ms = 7 } } });
+    _ = try fleet.advance(1);
+    try fleet.submit(id, "a", 1); // delayed to 8
+    try fleet.submit(id, "b", 1); // the count is spent: delivered at 1
+    _ = try fleet.advance(20);
+    var times: [4]Time = undefined;
+    try testing.expectEqualSlices(Time, &.{ 1, 8 }, deliveredTimes(&fleet, &times));
+}
+
+test "advance: the clock moves to the target even with no event, and a late submit is clamped to it" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try testing.expectEqual(@as(usize, 0), try fleet.advance(100));
+    try testing.expectEqual(@as(Time, 100), fleet.now);
+    try fleet.submit(id, "x", 50); // in the past: clamped to now
+    _ = try fleet.advance(200);
+    var times: [2]Time = undefined;
+    try testing.expectEqualSlices(Time, &.{100}, deliveredTimes(&fleet, &times));
+    try testing.expectEqual(@as(?Time, null), fleet.nextEventTime());
+}
+
+test "submitStream: an unknown node, a bad head and a partial tail" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    var n = echo.node();
+    n.framing = .iec104_apci;
+    const id = try fleet.addNode(.{ .node = n });
+    try testing.expectError(error.UnknownNode, fleet.submitStream(id + 1, "x", 0));
+
+    // A bad head is handed to the responder whole and counts as fully consumed.
+    const bad = [_]u8{ 0x69, 0x04, 0x07, 0x00 };
+    try testing.expectEqual(@as(usize, 4), try fleet.submitStream(id, &bad, 0));
+    _ = try fleet.advance(5);
+    try testing.expectEqual(@as(u64, 1), fleet.stats(id).delivered);
+
+    // One whole APDU and 3 bytes of the next: only the whole one is consumed.
+    const two = [_]u8{ 0x68, 0x04, 0x07, 0x00, 0x00, 0x00, 0x68, 0x04, 0x07 };
+    try testing.expectEqual(@as(usize, 6), try fleet.submitStream(id, &two, 5));
+}
+
+test "faults: a fault for a node that does not exist is ignored, not an out-of-range index" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.addFault(.{ .at_ms = 1, .node = id + 1, .kind = .heal }); // == node count
+    try fleet.addFault(.{ .at_ms = 1, .node = id + 40, .kind = .restart });
+    _ = try fleet.advance(5);
+    try testing.expectEqual(@as(usize, 0), echo.restarts);
+    try testing.expectEqual(@as(usize, 0), countKind(&fleet, .control_applied));
+}
+
+test "faults: control that the node honours is traced applied, and trouble/restart are counted" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.addFault(.{ .at_ms = 1, .node = id, .kind = .{ .trouble = .{ .on = true } } });
+    try fleet.addFault(.{ .at_ms = 2, .node = id, .kind = .restart });
+    _ = try fleet.advance(5);
+    try testing.expectEqual(@as(usize, 2), countKind(&fleet, .control_applied));
+    try testing.expectEqual(@as(usize, 0), countKind(&fleet, .control_unsupported));
+    try testing.expectEqual(@as(u64, 1), fleet.stats(id).restarts);
+    try testing.expect(echo.trouble);
+}
+
+test "faults: heal clears every behaviour fault, exactly once, and turns trouble off once" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.addFault(.{ .at_ms = 1, .node = id, .kind = .{ .silent = .{ .until_ms = 10_000 } } });
+    try fleet.addFault(.{ .at_ms = 1, .node = id, .kind = .{ .slow = .{ .extra_ms = 500, .until_ms = 10_000 } } });
+    try fleet.addFault(.{ .at_ms = 1, .node = id, .kind = .{ .drop_next = .{ .count = 3 } } });
+    try fleet.addFault(.{ .at_ms = 1, .node = id, .kind = .{ .dup_next = .{ .count = 3 } } });
+    try fleet.addFault(.{ .at_ms = 1, .node = id, .kind = .{ .delay_next = .{ .count = 3, .extra_ms = 300 } } });
+    try fleet.addFault(.{ .at_ms = 1, .node = id, .kind = .{ .trouble = .{ .on = true } } });
+    try fleet.addFault(.{ .at_ms = 5, .node = id, .kind = .heal });
+    _ = try fleet.advance(10);
+    try testing.expectEqual(@as(usize, 1), echo.trouble_offs); // heal switched trouble off
+    try testing.expect(!echo.trouble);
+    // Healed: the very next frame behaves like any other.
+    try fleet.submit(id, "a", 10);
+    _ = try fleet.advance(11);
+    try testing.expectEqual(@as(usize, 1), fleet.outbound().len);
+    var times: [2]Time = undefined;
+    try testing.expectEqualSlices(Time, &.{10}, deliveredTimes(&fleet, &times)); // not delayed, not dropped
+    try testing.expectEqual(@as(u64, 0), fleet.stats(id).silent_drops);
+    try testing.expectEqual(@as(usize, 0), countKind(&fleet, .delayed_in)); // neither slow nor delay_next survived the heal
+    // A second heal must not switch trouble off again: the flag was cleared.
+    try fleet.addFault(.{ .at_ms = 20, .node = id, .kind = .heal });
+    _ = try fleet.advance(30);
+    try testing.expectEqual(@as(usize, 1), echo.trouble_offs);
+}
+
+test "faults: a slow window ends exactly at until_ms, and a reused slot is delayed again" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.addFault(.{ .at_ms = 0, .node = id, .kind = .{ .slow = .{ .extra_ms = 50, .until_ms = 400 } } });
+    _ = try fleet.advance(1);
+    try fleet.submit(id, "a", 10); // delayed to 60
+    _ = try fleet.advance(70);
+    // The slot "a" used goes back to the pool and is the next one handed out:
+    // its `delayed` mark must have been reset, or this frame skips the window.
+    try fleet.submit(id, "b", 100); // still inside the window: delayed to 150
+    try fleet.submit(id, "c", 400); // exactly until_ms: not delayed
+    _ = try fleet.advance(500);
+    var times: [4]Time = undefined;
+    // trace is time-ordered because delivery events are: 60 (a), 150 (b), 400 (c)
+    try testing.expectEqualSlices(Time, &.{ 60, 150, 400 }, deliveredTimes(&fleet, &times));
+}
+
+test "partition heal: healing one partition id leaves the others cut" {
+    var echo0 = Echo{};
+    var echo1 = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const n0 = try fleet.addNode(.{ .node = echo0.node() });
+    const n1 = try fleet.addNode(.{ .node = echo1.node() });
+    const cut0 = [_]netsim.NodeId{0};
+    const cut1 = [_]netsim.NodeId{1};
+    const events = [_]netsim.FaultEvent{
+        .{ .time = 10, .kind = .{ .partition = .{ .id = 1, .cut = &cut0 } } },
+        .{ .time = 10, .kind = .{ .partition = .{ .id = 2, .cut = &cut1 } } },
+        .{ .time = 20, .kind = .{ .heal = .{ .id = 2 } } },
+    };
+    try testing.expectEqual(@as(usize, 0), try fleet.applyNetsimTrace(&events));
+    _ = try fleet.advance(25);
+    try fleet.submit(n0, "a", 30);
+    try fleet.submit(n1, "b", 30);
+    _ = try fleet.advance(40);
+    try testing.expectEqual(@as(u64, 1), fleet.stats(n0).silent_drops); // partition 1 still cut
+    try testing.expectEqual(@as(u64, 0), fleet.stats(n1).silent_drops); // partition 2 healed
+    try testing.expectEqual(@as(u64, 1), fleet.stats(n1).delivered);
+}
+
+test "freeSlot: the leak hook swallows exactly one slot" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{ .inflight_capacity = 8, .max_frame_len = 16 });
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    fleet.leak_slot_once = true;
+    try fleet.submit(id, "a", 0);
+    _ = try fleet.advance(5);
+    try testing.expect(!fleet.leak_slot_once);
+    try fleet.submit(id, "b", 6);
+    _ = try fleet.advance(10);
+    try testing.expectEqual(@as(usize, 7), fleet.free_count); // 8 minus the one leaked slot, not minus two
+}
+
+test "emit: the outbox accepts exactly its byte budget and loses the rest, counted" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{ .outbox_bytes = 8, .max_frame_len = 8 });
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.submit(id, "abcd", 0);
+    try fleet.submit(id, "efgh", 0); // 4 + 4 == 8: fits exactly
+    try fleet.submit(id, "i", 0); // 9 > 8: no room
+    _ = try fleet.advance(5);
+    try testing.expectEqual(@as(usize, 2), fleet.outbound().len);
+    try testing.expectEqualSlices(u8, "abcd", fleet.frameBytes(fleet.outbound()[0]));
+    try testing.expectEqualSlices(u8, "efgh", fleet.frameBytes(fleet.outbound()[1])); // the exact fit is kept, "i" is the one lost
+    try testing.expectEqual(@as(u64, 2), fleet.stats(id).emitted);
+    try testing.expectEqual(@as(u64, 1), fleet.capacity_losses);
+    try testing.expectEqual(@as(usize, 1), countKind(&fleet, .capacity_exhausted));
+    try testing.expectEqual(@as(usize, fleet.opts.inflight_capacity), fleet.free_count); // every slot came home
+}
+
+test "sendOut: a reply with a good frame and an unparseable or truncated tail" {
+    // A responder whose framing is IEC 104 APCI but whose reply is not clean.
+    const Reply = struct {
+        var bytes: []const u8 = &.{};
+        fn deliverFn(_: *anyopaque, _: []const u8, out: []u8, _: Time) node_mod.NodeError!?[]const u8 {
+            @memcpy(out[0..bytes.len], bytes);
+            return out[0..bytes.len];
+        }
+    };
+    var dummy: u8 = 0;
+    var fleet = try Fleet.init(testing.allocator, .{});
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = .{
+        .ctx = &dummy,
+        .framing = .iec104_apci,
+        .vtable = &.{ .deliver = Reply.deliverFn },
+    } });
+
+    // good frame + truncated third bytes: the whole frame goes, then the tail on its own.
+    Reply.bytes = &.{ 0x68, 0x04, 0x0B, 0x00, 0x00, 0x00, 0x68, 0x04, 0x0B };
+    try fleet.submit(id, "x", 0);
+    _ = try fleet.advance(5);
+    try testing.expectEqual(@as(usize, 2), fleet.outbound().len);
+    try testing.expectEqual(@as(u32, 6), fleet.outbound()[0].len);
+    try testing.expectEqual(@as(u32, 3), fleet.outbound()[1].len);
+    try testing.expectEqual(@as(usize, 1), countKind(&fleet, .bad_framing));
+
+    // good frame + garbage head: shipped whole (documented: "ship it whole"), flagged once.
+    Reply.bytes = &.{ 0x68, 0x04, 0x0B, 0x00, 0x00, 0x00, 0x69, 0x04, 0x0B, 0x00 };
+    try fleet.submit(id, "x", 6);
+    _ = try fleet.advance(10);
+    try testing.expectEqual(@as(usize, 2), fleet.outbound().len);
+    try testing.expectEqual(@as(u32, 6), fleet.outbound()[0].len);
+    try testing.expectEqual(@as(u32, 10), fleet.outbound()[1].len);
+    try testing.expectEqual(@as(usize, 2), countKind(&fleet, .bad_framing));
+}
+
+test "trace: payload offsets, ring wrap and the running total" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{ .trace_capacity = 4, .trace_bytes = 64 });
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    try fleet.submit(id, "abc", 0);
+    _ = try fleet.advance(1);
+    // delivered(abc), replied(abc), emitted(abc): payloads stored back to back
+    var buf: [8]TraceEntry = undefined;
+    const t = fleet.traceInto(&buf);
+    try testing.expectEqual(@as(usize, 3), t.len);
+    try testing.expectEqual(@as(u32, 0), t[0].off);
+    try testing.expectEqual(@as(u32, 3), t[1].off);
+    try testing.expectEqual(@as(u32, 6), t[2].off);
+    for (t) |e| {
+        try testing.expectEqual(@as(u32, 3), e.len);
+        try testing.expectEqualSlices(u8, "abc", fleet.traceBytes(e));
+    }
+    try testing.expectEqual(@as(usize, 9), fleet.trace_used);
+    try testing.expectEqual(@as(u64, 3), fleet.trace_total);
+
+    // Two more frames overflow the 4-entry ring: the OLDEST entries go, order is kept.
+    try fleet.submit(id, "de", 2);
+    try fleet.submit(id, "f", 3);
+    _ = try fleet.advance(10);
+    try testing.expectEqual(@as(u64, 9), fleet.trace_total);
+    try testing.expectEqual(@as(usize, 4), fleet.traceLen());
+    const t2 = fleet.traceInto(&buf);
+    try testing.expectEqual(@as(usize, 4), t2.len);
+    // The last four entries are: emitted(de)? order by time: de@2: delivered, replied, emitted; f@3: ...
+    try testing.expectEqual(TraceKind.emitted, t2[3].kind);
+    try testing.expectEqualSlices(u8, "f", fleet.traceBytes(t2[3]));
+    try testing.expectEqual(TraceKind.replied, t2[2].kind);
+    try testing.expectEqualSlices(u8, "f", fleet.traceBytes(t2[2]));
+    try testing.expectEqualSlices(u8, "f", fleet.traceBytes(t2[1]));
+    try testing.expect(t2[0].time <= t2[1].time);
+}
+
+test "trace: a fleet with no trace ring still fingerprints and runs" {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{ .trace_capacity = 0 });
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node() });
+    const before = fleet.fingerprint;
+    try fleet.submit(id, "abc", 0);
+    _ = try fleet.advance(5);
+    try testing.expect(fleet.fingerprint != before);
+    try testing.expectEqual(@as(usize, 0), fleet.traceLen());
+    try testing.expectEqual(@as(usize, 1), fleet.outbound().len);
+}
+
+/// Find a seed whose first two link-PRNG draws (in [0,1000)) satisfy `pred`.
+fn seedWhere(pred: *const fn (u16, u16) bool) u64 {
+    var seed: u64 = 1;
+    while (true) : (seed += 1) {
+        var p = std.Random.DefaultPrng.init(seed);
+        const r = p.random();
+        const a = r.uintLessThan(u16, 1000);
+        const b = r.uintLessThan(u16, 1000);
+        if (pred(a, b)) return seed;
+    }
+}
+
+fn dupFires(seed: u64, link: LinkFaults) !bool {
+    var echo = Echo{};
+    var fleet = try Fleet.init(testing.allocator, .{ .seed = seed });
+    defer fleet.deinit();
+    const id = try fleet.addNode(.{ .node = echo.node(), .link = link });
+    try fleet.submit(id, "x", 0);
+    return fleet.stats(id).duplicated != 0; // inbound duplicate decision only: nothing advanced yet
+}
+
+test "link PRNG: a rate of 1000 and a zero jitter span draw nothing; < is strict" {
+    const P = struct {
+        fn differ(a: u16, b: u16) bool {
+            return (a < 500) != (b < 500);
+        }
+        fn mid(a: u16, _: u16) bool {
+            return a >= 1 and a < 999;
+        }
+    };
+    const s = seedWhere(&P.differ);
+    var p = std.Random.DefaultPrng.init(s);
+    const first = p.random().uintLessThan(u16, 1000);
+    // reorder_permille = 1000 must not consume a draw: the dup roll then sees draw #1.
+    try testing.expectEqual(first < 500, try dupFires(s, .{ .reorder_permille = 1000, .dup_permille = 500 }));
+    // a zero jitter span must not consume a draw either.
+    try testing.expectEqual(first < 500, try dupFires(s, .{ .jitter_ms = 0, .dup_permille = 500 }));
+    // The roll is strictly less than the rate: rate == draw does not fire.
+    const s2 = seedWhere(&P.mid);
+    var p2 = std.Random.DefaultPrng.init(s2);
+    const d = p2.random().uintLessThan(u16, 1000);
+    try testing.expect(!try dupFires(s2, .{ .dup_permille = d }));
+    try testing.expect(try dupFires(s2, .{ .dup_permille = d + 1 }));
 }

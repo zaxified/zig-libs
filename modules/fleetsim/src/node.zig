@@ -328,3 +328,64 @@ test "Protocol: ports and datagram-ness" {
     try testing.expect(Protocol.bacnet.isDatagram());
     try testing.expect(!Protocol.modbus.isDatagram());
 }
+
+// Whole-module mutation audit 2026-11-18: every length rule pinned at both
+// sides of its boundary, because a frame length is the first thing computed
+// from untrusted bytes.
+test "frameLen: modbus_tcp body-length bounds (0 and > 254 are malformed)" {
+    const F = Framing.modbus_tcp;
+    try testing.expectEqual(@as(?usize, null), try F.frameLen(&.{ 0, 1, 0, 0, 0 }));
+    try testing.expectEqual(@as(?usize, 6 + 1), try F.frameLen(&.{ 0, 1, 0, 0, 0, 1 }));
+    try testing.expectEqual(@as(?usize, 6 + 254), try F.frameLen(&.{ 0, 1, 0, 0, 0, 254 }));
+    try testing.expectError(error.BadFrame, F.frameLen(&.{ 0, 1, 0, 0, 0, 255 }));
+    try testing.expectError(error.BadFrame, F.frameLen(&.{ 0, 1, 0, 0, 0, 0 }));
+}
+
+test "frameLen: dnp3_link header bytes and length-field bounds" {
+    const F = Framing.dnp3_link;
+    try testing.expectEqual(@as(?usize, null), try F.frameLen(&.{ 0x05, 0x64 }));
+    try testing.expectError(error.BadFrame, F.frameLen(&.{ 0x05, 0x00, 5 })); // second start byte
+    try testing.expectError(error.BadFrame, F.frameLen(&.{ 0x00, 0x64, 5 })); // first start byte
+    try testing.expectError(error.BadFrame, F.frameLen(&.{ 0x05, 0x64, 4 })); // below the 5 header octets
+    try testing.expectEqual(@as(?usize, 10), try F.frameLen(&.{ 0x05, 0x64, 5 })); // no user data, no blocks
+    try testing.expectEqual(@as(?usize, 10 + 1 + 2), try F.frameLen(&.{ 0x05, 0x64, 6 })); // 1 byte, 1 CRC block
+    try testing.expectEqual(@as(?usize, 10 + 16 + 2), try F.frameLen(&.{ 0x05, 0x64, 21 }));
+    try testing.expectEqual(@as(?usize, 10 + 17 + 4), try F.frameLen(&.{ 0x05, 0x64, 22 })); // 2 blocks
+    // The largest the length octet can say: 250 user bytes, 16 blocks.
+    try testing.expectEqual(@as(?usize, 10 + 250 + 16 * 2), try F.frameLen(&.{ 0x05, 0x64, 255 }));
+}
+
+test "frameLen: iec104_apci, tpkt, bacnet_bvll minimum lengths" {
+    try testing.expectEqual(@as(?usize, null), try Framing.iec104_apci.frameLen(&.{0x68}));
+    try testing.expectError(error.BadFrame, Framing.iec104_apci.frameLen(&.{ 0x68, 3 }));
+    try testing.expectEqual(@as(?usize, 6), try Framing.iec104_apci.frameLen(&.{ 0x68, 4 }));
+
+    try testing.expectEqual(@as(?usize, null), try Framing.tpkt.frameLen(&.{ 3, 0, 0 }));
+    try testing.expectError(error.BadFrame, Framing.tpkt.frameLen(&.{ 3, 0, 0, 3 }));
+    try testing.expectEqual(@as(?usize, 4), try Framing.tpkt.frameLen(&.{ 3, 0, 0, 4 }));
+    try testing.expectError(error.BadFrame, Framing.tpkt.frameLen(&.{ 4, 0, 0, 9 }));
+
+    try testing.expectEqual(@as(?usize, null), try Framing.bacnet_bvll.frameLen(&.{ 0x81, 0x0A, 0 }));
+    try testing.expectError(error.BadFrame, Framing.bacnet_bvll.frameLen(&.{ 0x81, 0x0A, 0, 3 }));
+    try testing.expectEqual(@as(?usize, 4), try Framing.bacnet_bvll.frameLen(&.{ 0x81, 0x0A, 0, 4 }));
+    try testing.expectError(error.BadFrame, Framing.bacnet_bvll.frameLen(&.{ 0x82, 0x0A, 0, 9 }));
+}
+
+test "frameLen: enip_encap and opcua_uatcp take a header exactly at their minimum" {
+    var enip: [24]u8 = @splat(0);
+    try testing.expectEqual(@as(?usize, null), try Framing.enip_encap.frameLen(enip[0..23]));
+    try testing.expectEqual(@as(?usize, 24), try Framing.enip_encap.frameLen(&enip));
+    enip[2] = 7; // little-endian body length
+    try testing.expectEqual(@as(?usize, 31), try Framing.enip_encap.frameLen(&enip));
+
+    var ua = [8]u8{ 'M', 'S', 'G', 'F', 8, 0, 0, 0 };
+    try testing.expectEqual(@as(?usize, null), try Framing.opcua_uatcp.frameLen(ua[0..7]));
+    try testing.expectEqual(@as(?usize, 8), try Framing.opcua_uatcp.frameLen(&ua));
+    ua[4] = 7;
+    try testing.expectError(error.BadFrame, Framing.opcua_uatcp.frameLen(&ua));
+}
+
+test "frameLen: opaque_whole of an empty buffer is 'need more', not a zero-length frame" {
+    try testing.expectEqual(@as(?usize, null), try Framing.opaque_whole.frameLen(&.{}));
+    try testing.expectEqual(@as(?usize, 3), try Framing.opaque_whole.frameLen(&.{ 1, 2, 3 }));
+}
