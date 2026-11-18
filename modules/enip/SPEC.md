@@ -6,7 +6,7 @@
 
 **Scope:** mvp — pycomm3 (client) and OpENer 2.3 (adapter) (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-06 · mutation 2026-11-18 (1468/1517, 49 eq) · src 554da63f430e9e55
+**Audit:** review 2026-10-06 · mutation 2026-11-18 (1468/1517, 49 eq) · src 1d3897137a5dde03
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ENIP_FUZZ) · ct n/a — industrial protocol, no auth (keyword review, 2026-10-07)
 
@@ -265,6 +265,16 @@ layout never depends on Zig's bitfield-packing rules.
   has no `Set_Attribute_Single` (`service_not_supported`), as OpENer builds it
   unless its interface-control option is on. Encodings as OpENer and the
   scanners (EIPScanner, pycomm3) read them.
+
+  Anchored against a foreign client (2026-11-18): a stock `pycomm3`
+  `CIPDriver.generic_message` read and wrote both objects over loopback against
+  the adapter; the capture is `goldens.stdobj_table` (18 request/reply pairs,
+  replayed byte-exact). pycomm3 accepted every reply and decoded the speed
+  (100), the host name `plc01` and the pad octet; the raw layouts match what
+  OpENer builds. pycomm3 has no typed view of these objects, and its `Struct`
+  declarations we tried for attributes 4 and 5 and its `Array(USINT, 6)` for the
+  MAC did not decode, a property of those declarations, not a disagreement
+  about the octets.
 
   It also answers enough for a browsing tool to **discover** its tags rather
   than be told them: the Program Name object (`0x64`, one `STRING`) and the

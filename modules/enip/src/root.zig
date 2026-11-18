@@ -1530,7 +1530,14 @@ test "live: a real EtherNet/IP client against our adapter" {
     std.mem.writeInt(i16, scada[0..2], 1, .little);
     std.mem.writeInt(i32, dint[0..4], 11, .little);
     var tags = testTags(&scada, &dint, &real);
-    var target = Adapter.init(.{}, &tags);
+    // ENIP_TEST_STDOBJ=1 serves the configuration the standard-object goldens
+    // were captured against (TCP/IP Interface values and Set enabled).
+    var live_cfg: AdapterConfig = .{};
+    if (envVar("ENIP_TEST_STDOBJ") != null) {
+        live_cfg = tcpip_cfg;
+        live_cfg.allow_tcpip_set = true;
+    }
+    var target = Adapter.init(live_cfg, &tags);
 
     var in: [8192]u8 = undefined;
     var out: [8192]u8 = undefined;
