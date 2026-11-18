@@ -772,3 +772,31 @@ test "the word-shuffle reduction agrees with the fold, bit for bit" {
         try std.testing.expectEqual(reduceWideFold(wide), reduceWideShuffle(wide));
     }
 }
+
+test "canonical boundary, isZero on every limb, normalize's second fold (mutation 2026-11-18)" {
+    // `rejectNonCanonical`: p itself and the all-ones value are refused, p − 1 is
+    // accepted (the `>=` boundary of both decoders).
+    var b: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b, field_order, .big);
+    try std.testing.expectError(error.NonCanonical, Fe.rejectNonCanonical(b, .big));
+    try std.testing.expectError(error.NonCanonical, Fe.fromBytes(b, .big));
+    std.mem.writeInt(u256, &b, std.math.maxInt(u256), .big);
+    try std.testing.expectError(error.NonCanonical, Fe.rejectNonCanonical(b, .big));
+    std.mem.writeInt(u256, &b, field_order - 1, .big);
+    try Fe.rejectNonCanonical(b, .big);
+    _ = try Fe.fromBytes(b, .big);
+
+    // `isZero` reads all four limbs: a canonical element with only one limb set
+    // (2^192 < p for the top one) is not zero.
+    inline for (0..4) |i| {
+        var l: [4]u64 = .{ 0, 0, 0, 0 };
+        l[i] = 1;
+        try std.testing.expect(!(Fe{ .limbs = l }).isZero());
+    }
+
+    // `normalize(2^256 − 1, 1)`: the first fold (+M) carries out of 2^256
+    // again, so the second fold is the one that lands it. Random products
+    // reach this with probability ~2^-32.
+    const v: u512 = (@as(u512, 1) << 257) - 1;
+    try std.testing.expectEqual(fromU256(@intCast(v % field_order)), normalize(std.math.maxInt(u256), 1));
+}

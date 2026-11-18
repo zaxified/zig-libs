@@ -147,13 +147,13 @@ test "ecdh: invalid peers are refused" {
     bad_tag[0] = 5;
     try testing.expectError(error.InvalidEncoding, ecdh(d, &bad_tag));
 
-    // (0, 0) is off the curve (std's and this module's affine identity is
-    // (0, 1), and that one decodes to the identity, which ecdh refuses).
+    // (0, 0) and the affine identity marker (0, 1) are both off the curve;
+    // SEC 1 encodes the identity only as the single octet 00 (above).
     var zeros: [65]u8 = @splat(0);
     zeros[0] = 4;
     try testing.expectError(error.InvalidEncoding, ecdh(d, &zeros));
     zeros[64] = 1;
-    try testing.expectError(error.IdentityElement, ecdh(d, &zeros));
+    try testing.expectError(error.InvalidEncoding, ecdh(d, &zeros));
 
     // Off the curve: y + 1.
     var off = g;

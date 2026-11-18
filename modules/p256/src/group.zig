@@ -99,19 +99,16 @@ pub const P256 = struct {
     }
 
     /// Build a point from affine coordinates, checking the curve equation
-    /// `y² = x³ − 3x + b`.
+    /// `y² = x³ − 3x + b`. Every pair off the curve is refused, the affine
+    /// identity marker `(0, 1)` included: it is not a curve point, and SEC 1
+    /// encodes the identity only as the single octet `00` (as std).
     pub fn fromAffineCoordinates(p: AffineCoordinates) EncodingError!P256 {
         const x = p.x;
         const y = p.y;
         const x3AxB = x.sq().mul(x).sub(x).sub(x).sub(x).add(B);
         const yy = y.sq();
-        const on_curve = @intFromBool(x3AxB.equivalent(yy));
-        const is_identity = @intFromBool(x.equivalent(AffineCoordinates.identityElement.x)) &
-            @intFromBool(y.equivalent(AffineCoordinates.identityElement.y));
-        if ((on_curve | is_identity) == 0) return error.InvalidEncoding;
-        var ret = P256{ .x = x, .y = y, .z = Fe.one };
-        ret.z.cMov(P256.identityElement.z, is_identity);
-        return ret;
+        if (!x3AxB.equivalent(yy)) return error.InvalidEncoding;
+        return .{ .x = x, .y = y, .z = Fe.one };
     }
 
     /// Build a point from serialized affine coordinates.
@@ -1801,4 +1798,107 @@ test "corpus: every SEC1 seed reaches fromSec1, and the points decoded are pinne
     try std.testing.expectEqual(@as(usize, 6), accepted);
     try std.testing.expectEqual(@as(usize, 5), non_identity);
     try std.testing.expectEqual(@as(usize, 5), on_curve);
+}
+
+test "the identity forms: rejectIdentity and affineCoordinates as std (mutation 2026-11-18)" {
+    // std's `rejectIdentity`/`affineCoordinates` treat `z = 0` and the two
+    // affine shapes a formula can leave, `(0, 0)` and `(0, 1)`, as the
+    // identity; every random point is far from all three.
+    const F = P256.Fe;
+    const forms = [_]P256{
+        P256.identityElement,
+        .{ .x = F.zero, .y = F.zero, .z = F.one },
+        .{ .x = F.zero, .y = F.one, .z = F.one },
+    };
+    const std_forms = [_]Std{
+        Std.identityElement,
+        .{ .x = Std.Fe.zero, .y = Std.Fe.zero, .z = Std.Fe.one },
+        .{ .x = Std.Fe.zero, .y = Std.Fe.one, .z = Std.Fe.one },
+    };
+    for (forms, std_forms) |p, sp| {
+        try std.testing.expectError(error.IdentityElement, p.rejectIdentity());
+        try std.testing.expectError(error.IdentityElement, sp.rejectIdentity());
+        const a = p.affineCoordinates();
+        const sa = sp.affineCoordinates();
+        try std.testing.expectEqualSlices(u8, &sa.x.toBytes(.big), &a.x.toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &sa.y.toBytes(.big), &a.y.toBytes(.big));
+    }
+}
+
+test "the affine identity (0, 1) is not a curve point: refused as std and SEC 1 do (2026-11-18)" {
+    try std.testing.expectError(error.InvalidEncoding, P256.fromAffineCoordinates(AffineCoordinates.identityElement));
+    const StdAffine = @TypeOf(Std.basePoint.affineCoordinates());
+    try std.testing.expectError(error.InvalidEncoding, Std.fromAffineCoordinates(StdAffine.identityElement));
+    var enc: [65]u8 = @splat(0);
+    enc[0] = 4;
+    enc[64] = 1; // 04 || x = 0 || y = 1
+    try std.testing.expectError(error.InvalidEncoding, P256.fromSec1(&enc));
+    try std.testing.expectError(error.InvalidEncoding, Std.fromSec1(&enc));
+    // The one SEC 1 encoding of the identity still decodes.
+    try std.testing.expect((try P256.fromSec1(&.{0})).z.isZero());
+}
+
+test "isBasePointRepr checks every coordinate (mutation 2026-11-18)" {
+    const G = P256.basePoint;
+    const one = P256.Fe.one;
+    const two = one.dbl();
+    try std.testing.expect(G.isBasePointRepr());
+    try std.testing.expect(!(P256{ .x = G.x.add(one), .y = G.y, .z = G.z }).isBasePointRepr());
+    try std.testing.expect(!(P256{ .x = G.x, .y = G.y.add(one), .z = G.z }).isBasePointRepr());
+    try std.testing.expect(!(P256{ .x = G.x, .y = G.y, .z = two }).isBasePointRepr());
+    // G in another projective representation is the same point, not the constant.
+    try std.testing.expect(!(P256{ .x = G.x.mul(two), .y = G.y.mul(two), .z = two }).isBasePointRepr());
+}
+
+test "every scalar multiply refuses an identity input (mutation 2026-11-18)" {
+    var k: [32]u8 = @splat(0);
+    k[31] = 7;
+    const Q = try P256.combMulBase(k, .big);
+    const O = P256.identityElement;
+    try std.testing.expectError(error.IdentityElement, O.mul(k, .big));
+    try std.testing.expectError(error.IdentityElement, O.mulCtWindowed(k, .big));
+    try std.testing.expectError(error.IdentityElement, O.mulPublic(k, .big));
+    try std.testing.expectError(error.IdentityElement, P256.mulDoubleBasePublic(O, k, Q, k, .big));
+    try std.testing.expectError(error.IdentityElement, P256.mulDoubleBasePublic(Q, k, O, k, .big));
+    try std.testing.expectError(error.IdentityElement, Std.identityElement.mulPublic(k, .big));
+}
+
+test "vartime paths at the exceptional additions: P = Q, P = −Q, a zero scalar (mutation 2026-11-18)" {
+    const n: u256 = Std.scalar.field_order;
+    var kb: [32]u8 = @splat(0);
+    kb[31] = 5;
+    var tb: [32]u8 = @splat(0);
+    tb[31] = 30;
+    const P = try P256.combMulBase(kb, .big); // 5·G, not G's representation
+    const SP = try Std.basePoint.mul(kb, .big);
+    var sb: [32]u8 = undefined;
+
+    // s = n: the last wNAF digit of n is −15, so the last mixed addition is
+    // 15·P + (−15·P) (`Jac.addMixed`, P = −Q). The fixed-base table path for
+    // G meets the same case in its top window.
+    std.mem.writeInt(u256, &sb, n, .big);
+    try std.testing.expectError(error.IdentityElement, P.mulPublic(sb, .big));
+    try std.testing.expectError(error.IdentityElement, P256.basePoint.mulPublic(sb, .big));
+
+    // s = n + 30: the last digit is +15, so the last addition is
+    // 15·P + 15·P (P = Q, the doubling branch): 30·P.
+    std.mem.writeInt(u256, &sb, n + 30, .big);
+    try eqAffine(try P.mulPublic(sb, .big), try SP.mulPublic(tb, .big));
+
+    // A zero scalar on either side: the double-base sum is the other side
+    // alone (`Jac.add` with an identity operand).
+    const zero: [32]u8 = @splat(0);
+    const Q = try P256.combMulBase(tb, .big);
+    const SQ = try Std.basePoint.mul(tb, .big);
+    try eqAffine(try P256.mulDoubleBasePublic(P256.basePoint, zero, Q, kb, .big), try SQ.mulPublic(kb, .big));
+    try eqAffine(try P256.mulDoubleBasePublic(P256.basePoint, kb, Q, zero, .big), try Std.basePoint.mulPublic(kb, .big));
+    try eqAffine(try P256.mulDoubleBasePublic(P, zero, Q, kb, .big), try SQ.mulPublic(kb, .big));
+}
+
+test "mulInto zeroes its output on error (mutation 2026-11-18)" {
+    var k: [32]u8 = @splat(0);
+    k[31] = 3;
+    var out = try P256.combMulBase(k, .big); // a non-zero point, to be overwritten
+    try std.testing.expectError(error.IdentityElement, P256.identityElement.mulInto(&out, &k, .big));
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&out), 0));
 }

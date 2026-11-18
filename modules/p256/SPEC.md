@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-13)
 
-**Audit:** review 2026-07-21 · mutation 2026-09-28 · src ?
+**Audit:** review 2026-07-21 · mutation 2026-11-18 (274/353, 79 eq) · src ae1a373972ecbe00
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind) · panic 2026-10-30 (sweep + blind review: own Signature type with a total toDer (std's indexes an empty slice for r/s = 0), explicit identity-key reject; delta audit 11/12 + 1 eq)
 
@@ -299,6 +299,52 @@ there are no GLV constants to own here.
   `2^256−17`, the top-window boundary); `mulDoubleBasePublic` with `G` in either
   slot, with a second representation of `G` (misses the redirect on purpose),
   and the Jacobian join's `P = ±Q` cases.
+- **Audit 2026-11-18 (whole-module mutation).** 353 schemata mutants over the non-test
+  code of `field`, `modinv`, `scalar`, `group`, `sign`, `ecdh`, `burn`. One mutant per
+  condition × class: guards, boundaries, skipped assignments, carries/folds/conditional
+  subtracts, masked selects, recoding, wipes. Out of scope: `fast_core.zig` (inline asm;
+  its Zig wrappers are comptime dispatch), `point_asm.zig` (comptime asm-text generator),
+  `gate.zig`/`root.zig` (no runtime code), `buildBaseTable` (comptime only), the
+  test-only `reduceWideFold` oracle and test instrumentation.
+  - Result: 274 killed, 79 equivalent/unobservable, 0 open. Card `(274/353, 79 eq)`.
+  - Killed: 271 by tests and 3 by ctgrind.
+    - Tests ran in three builds: native ReleaseSafe, a portable `-mcpu=x86_64`
+      ReleaseSafe build where the non-ADX field paths run, and the ReleaseFast stack
+      probe.
+    - 11 new test blocks cover the canonical boundary, `isZero` on each limb,
+      `normalize`'s second fold, the identity forms, `isBasePointRepr` per coordinate,
+      identity inputs, the vartime `P = ±Q` additions (`s = n`, `s = n + 30`) and a
+      zero scalar in the double-base sum. In `sign`: zero key, `s = 0` by
+      construction, the `e ≡ 0` forgery through `ecdsaVerifyDigest`, long-form DER
+      lengths at `n = 66`, `generateInto`'s rejection loop through a scripted `Io`,
+      and `*Into` zeroing on error.
+  - 40 equivalent: unreachable boundaries, cost-only redirects, and alternative
+    recodings that are equally valid. One is a loose comment: `reduceWideShuffle`'s
+    bias `5p` could be `4p`, since the exact minimum of the accumulator over all word
+    extremes is above `−4p`.
+  - 17 unobservable:
+    - `r = 0` would need a discrete log.
+    - Two safegcd range terms: no wrong inverse in 40 000 inputs of a Python port.
+    - 14 wipes: the probe stays clean because the caller's burn overlaps, there is no
+      needle for that secret (the HMAC-DRBG `K ⊕ pad`), or the error path is
+      unreachable.
+  - 22 constant-time mutants (blackBox dropped, or a select turned into a branch) are
+    unobservable to ctgrind. ctgrind saw no context on their line, so LLVM kept the
+    select branch-free here (or the context landed on line 0). Four of them are
+    portable-only.
+  - The ctgrind kills: the comb gather turned into a branch, the windowed digit select
+    turned into a branch (seen with the scalar also tainted, a scratch harness
+    variant), and `rejectIdentity`'s verdict without its barrier, which splits into
+    two jumps.
+  - Wipe mutants: the switch sits inside the burn, keyed by a comptime site id, so
+    the caller's frame stays unchanged.
+    - A switch at the burn site itself, in the caller, perturbed the wrapper frame.
+      The probe then found `k`/`d` above the burn in the schemata build, even for
+      the unmutated original.
+    - The plain build, and a schemata build without burn-site switches, are clean.
+      So this was no source finding, and no burn changed.
+  - Behaviour change from the audit: `fromAffineCoordinates` refuses `(0, 1)`
+    (std, SEC 1).
 
 ## Performance — `bench-p256` against OpenSSL (2026-10-10)
 
