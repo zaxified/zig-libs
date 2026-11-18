@@ -6,7 +6,7 @@
 
 **Scope:** core — OpenSSH 10.x (client/server), Go `x/crypto/ssh` as library yardstick (surveyed 2026-09-30; re-assessed 2026-10-06)
 
-**Audit:** review 2026-10-06 · mutation 2026-11-18 (869/1000, 131 eq) · src 2343acce5322655b
+**Audit:** review 2026-10-06 · mutation 2026-11-18 (876/1005, 129 eq) · src e618fadd8301aaa6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, SSH_FUZZ; ssh-pubkey added 2026-10-10) · ct 2026-10-18 (ctgrind; host-key PEM target `pem` added 2026-10-18)
 
@@ -470,7 +470,13 @@ environment with OpenSSH installed.
   what one packet carries under every cipher: `userauth.max_sent_banner_len` = 8098
   (`transport.max_write_payload` 8107 less the message's 9 bytes), refused up front with
   `NameTooLong`. A client still accepts banners up to `max_banner_len`. `messages.NameList.iterator`
-  yielded one empty name for an empty list although its doc comment promises none. Two kills first seen only in live
+  yielded one empty name for an empty list although its doc comment promises none; fixed
+  2026-11-18 to yield nothing (RFC 4251 §5: "zero or more names", the empty list encoded as a
+  zero length; Go's `parseNameList` returns no names for it). Delta mutation of both fixes
+  (2026-11-18): 5 mutants (the empty-list guard dropped and its assignment skipped; the banner
+  bound `>=`, dropped, and back at `max_banner_len`), all killed; the two `pub const` bounds are
+  comptime (no runtime switch) and pinned by literal tests. The card counts these 5 and the
+  three re-measured W sites (two scratch wipes killed, the server round burn equivalent). Two kills first seen only in live
   interop tests (889, 984) were re-measured without them and are killed by their own tests.
 
 ## Build options

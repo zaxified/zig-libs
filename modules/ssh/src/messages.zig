@@ -237,10 +237,15 @@ pub const NameList = struct {
         self.gpa.free(self.raw);
     }
 
-    /// Iterate the comma-separated names (empty list -> zero iterations).
+    /// Iterate the comma-separated names with `next`. An empty list has zero
+    /// names (RFC 4251 §5: "zero or more names", the empty list encoded as
+    /// a zero length; Go's `parseNameList` returns none), so it yields
+    /// nothing. Before 2026-11-18 it yielded one empty name, as
+    /// `std.mem.splitScalar` does on an empty buffer.
     pub fn iterator(self: *const NameList) std.mem.SplitIterator(u8, .scalar) {
-        if (self.raw.len == 0) return std.mem.splitScalar(u8, self.raw[0..0], ',');
-        return std.mem.splitScalar(u8, self.raw, ',');
+        var it = std.mem.splitScalar(u8, self.raw, ',');
+        if (self.raw.len == 0) it.index = null;
+        return it;
     }
 };
 
@@ -410,6 +415,27 @@ test "writeNameList/readNameList round-trip: empty list" {
     var list = try readNameList(t.allocator, &r);
     defer list.deinit();
     try t.expectEqual(@as(usize, 0), list.raw.len);
+    var it = list.iterator();
+    try t.expect(it.next() == null);
+}
+
+test "NameList.iterator: one name, and empty names inside a list are yielded as they are" {
+    // The iterator only splits; a list with an empty name ("a,,b") is not
+    // well formed (RFC 4251 §5: "A name MUST have a non-zero length") and is
+    // the caller's to refuse, so it sees all three.
+    const t = std.testing;
+    for ([_]struct { wire: []const u8, names: []const []const u8 }{
+        .{ .wire = "a", .names = &.{"a"} },
+        .{ .wire = "a,,b", .names = &.{ "a", "", "b" } },
+        .{ .wire = ",", .names = &.{ "", "" } },
+    }) |c| {
+        var raw: [8]u8 = undefined;
+        @memcpy(raw[0..c.wire.len], c.wire);
+        const list: NameList = .{ .raw = raw[0..c.wire.len], .gpa = t.allocator };
+        var it = list.iterator();
+        for (c.names) |want| try t.expectEqualStrings(want, it.next().?);
+        try t.expect(it.next() == null);
+    }
 }
 
 // ── fuzz: readString/readMpint off the wire, never panics ──────────────────
