@@ -90,6 +90,15 @@ fleet-simulation target.
   boundary is deliberate: no Template Object (`0x6C`), so struct-typed
   bindings stay out of the uploaded list (they remain readable by name), and
   there are no program-scoped tags. See SPEC.md.
+  It also serves the **TCP/IP Interface object** (`0xF5`, instance 1) scanners
+  and commissioning tools read: status, configuration capability and control,
+  the physical link path, the interface configuration (address, mask, gateway,
+  name servers, domain) and the host name, as `Get_Attributes_All` and
+  `Get_Attribute_Single`, with the values taken from `Config.tcpip` (no OS
+  call). `Set_Attribute_Single` is refused `attribute_not_settable` unless
+  `Config.allow_tcpip_set` is on, which records attributes 3, 5 and 6 (with
+  OpENer's value checks) for the adapter to report back and for the caller to
+  apply.
 - Hostile input never panics anywhere: an encapsulation length disagreeing
   with the payload, a CPF item count that overruns, an item length pointing
   past the buffer, an EPATH segment running past the path, a symbolic segment
