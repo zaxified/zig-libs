@@ -527,12 +527,17 @@ fn v6(comptime words: [8]u16) [16]u8 {
     return out;
 }
 
+/// A /128 host rule inside 2001:db8:1:2::/64: only a lookup key carrying
+/// prefixlen 128 can reach it (a 127 key finds the /64 instead).
+pub const addr_v6_host = v6(.{ 0x2001, 0xdb8, 1, 2, 0, 0, 0, 9 }); // -> 15
+
 /// No `::/0`, so IPv6 misses are exercised (fe80::/10 matches nothing).
 pub const fixed_ruleset6 = [_]rules.ClassifierRule6{
     .{ .prefix = .{ .addr = v6(.{ 0x2001, 0xdb8, 0, 0, 0, 0, 0, 0 }), .prefix_len = 32 }, .class = 11 },
     .{ .prefix = .{ .addr = v6(.{ 0x2001, 0xdb8, 1, 0, 0, 0, 0, 0 }), .prefix_len = 48 }, .class = 12 },
     .{ .prefix = .{ .addr = v6(.{ 0x2001, 0xdb8, 1, 2, 0, 0, 0, 0 }), .prefix_len = 64 }, .class = 13 },
     .{ .prefix = .{ .addr = v6(.{ 0xfd00, 0, 0, 0, 0, 0, 0, 0 }), .prefix_len = 8 }, .class = 14 },
+    .{ .prefix = .{ .addr = addr_v6_host, .prefix_len = 128 }, .class = 15 },
 };
 
 const fixed_store6 = blk: {
@@ -592,6 +597,7 @@ pub const cases = [_]Case{
     .{ .name = "802.1Q IPv6", .tags = &.{q100}, .l3 = v6_pair, .want_src = 13, .want_dst = 14 },
     .{ .name = "QinQ IPv6", .tags = &.{ ad10, q100 }, .l3 = v6_pair, .want_src = 13, .want_dst = 14 },
     .{ .name = "IPv6 + Hop-by-Hop header", .tags = &.{q100}, .l3 = .{ .v6 = .{ .src = addr_v6_sub64, .dst = addr_v6_ula, .hop_by_hop = true } }, .want_src = 13, .want_dst = 14 },
+    .{ .name = "IPv6 /128 host rule (src) and a neighbour inside the same /64 (dst)", .tags = &.{}, .l3 = .{ .v6 = .{ .src = addr_v6_host, .dst = addr_v6_sub64 } }, .want_src = 15, .want_dst = 13 },
     .{ .name = "IPv6 link-local src / doc dst", .tags = &.{}, .l3 = .{ .v6 = .{ .src = addr_v6_link, .dst = addr_v6_doc } }, .want_src = null, .want_dst = 11 },
     .{ .name = "86DD with version nibble 4", .tags = &.{}, .l3 = .{ .v6 = .{ .src = addr_v6_sub64, .dst = addr_v6_ula, .version = 4 } }, .want_src = null, .want_dst = null },
     .{ .name = "triple tag IPv6", .tags = &.{ ad10, q100, q100 }, .l3 = v6_pair, .want_src = null, .want_dst = null },

@@ -1138,3 +1138,59 @@ test "RuleSet6.validateSorted agrees with validate across a deterministic duplic
         }
     }
 }
+
+test "RuleSet validate and validateSorted accept a /32 host rule, a /31 and the /0 default" {
+    // The boundary a `prefix_len > 32` guard sits on: /32 is the longest legal
+    // prefix, so a rule at exactly 32 must load (a table of host routes is the
+    // common case).
+    var scratch: [4]usize = undefined;
+    const ok = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 192, 0, 2, 1 }, .prefix_len = 32 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 0, 0, 0, 0 }, .prefix_len = 0 }, .class = 2 },
+        .{ .prefix = .{ .addr = .{ 198, 51, 100, 2 }, .prefix_len = 31 }, .class = 3 },
+    };
+    try (RuleSet{ .rules = &ok }).validate(4);
+    try (RuleSet{ .rules = &ok }).validateSorted(4, &scratch);
+}
+
+test "validateSorted finds a duplicate even when another prefix has the same bit-packed sort key" {
+    // (/2, 128.0.0.0) and (/3, 0.0.0.0) are different rules, but a sort key
+    // that packs prefix_len too close to the address bits (a shift of 31
+    // instead of 32) gives both the key 0x1_8000_0000. The three-rule table
+    // below then sorts as it came (insertion sort is stable), the two real
+    // duplicates are not adjacent, and the O(n log n) check misses what
+    // `validate` reports.
+    var scratch: [3]usize = undefined;
+    const rs = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 128, 0, 0, 0 }, .prefix_len = 2 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 0, 0, 0, 0 }, .prefix_len = 3 }, .class = 2 },
+        .{ .prefix = .{ .addr = .{ 128, 0, 0, 0 }, .prefix_len = 2 }, .class = 3 },
+    };
+    try testing.expectError(RuleSetError.DuplicatePrefix, (RuleSet{ .rules = &rs }).validate(3));
+    try testing.expectError(RuleSetError.DuplicatePrefix, (RuleSet{ .rules = &rs }).validateSorted(3, &scratch));
+    // Without the repeat, the two distinct prefixes are both accepted.
+    try (RuleSet{ .rules = rs[0..2] }).validate(3);
+    try (RuleSet{ .rules = rs[0..2] }).validateSorted(3, &scratch);
+}
+
+test "lookupReference: a /32 host rule matches exactly that address and beats the covering /8" {
+    const rs = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 10, 1, 2, 3 }, .prefix_len = 32 }, .class = 5 },
+    };
+    try testing.expectEqual(@as(u32, 5), lookupReference(&rs, .{ 10, 1, 2, 3 }, 0));
+    try testing.expectEqual(@as(u32, 1), lookupReference(&rs, .{ 10, 1, 2, 4 }, 0));
+    try testing.expectEqual(@as(u32, 1), lookupReference(&rs, .{ 10, 1, 2, 2 }, 0));
+    try testing.expectEqual(@as(u32, 0), lookupReference(&rs, .{ 11, 1, 2, 3 }, 0));
+}
+
+test "LpmKey6.fromPrefix puts the prefix length and every address byte into the 20-byte key" {
+    var sub = doc_net;
+    sub[5] = 0x01;
+    sub[15] = 0x7f;
+    const k = LpmKey6.fromPrefix(.{ .addr = sub, .prefix_len = 128 }).toBytes();
+    try testing.expectEqual(@as(u32, 128), std.mem.readInt(u32, k[0..4], builtin.cpu.arch.endian()));
+    try testing.expectEqualSlices(u8, &sub, k[4..20]);
+    const k48 = LpmKey6.fromPrefix(.{ .addr = sub, .prefix_len = 48 }).toBytes();
+    try testing.expectEqual(@as(u32, 48), std.mem.readInt(u32, k48[0..4], builtin.cpu.arch.endian()));
+}

@@ -6,7 +6,7 @@
 
 **Scope:** core — vodozemac 0.11.0 Megolm (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after session pickling for both session types landed)
 
-**Audit:** review 2026-08-06 · mutation 2026-08-13 · src ?
+**Audit:** review 2026-08-06 · mutation 2026-11-17 (320/356, 36 eq) · src 17dc62fa5d2aa587
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MEGOLM_FUZZ) · ct 2026-10-17 (ctgrind: ratchet + signing key through encrypt/decrypt, session-key base64, sealed pickles; `msg` 16 / `skey` 23 / `pickle` 26 in-file, none a megolm branch on a key; `skey` was 40 before the private b64ct copy (2026-10-10), 26 with it, 23 with the `b64ct` module; 25 on Zig 0.17.0 (2026-10-18): std `Edwards25519.fromBytes` added RFC 8032 §5.1.3's `x = 0` + sign-bit refusal, 2 contexts over the session key's Ed25519 public key inside signature verification, public input)
 **Performance:** not measured
@@ -333,6 +333,40 @@ restoration verified by re-running the full suite green (39/39) —
 tracked now), so `git diff` had no tracked baseline to compare against; the restoration
 was confirmed by direct byte-for-byte comparison of the pre- and
 post-mutation source text instead.
+
+**Audit 2026-11-17 (whole-module mutation).** 356 schemata mutants over `ratchet.zig`, `cipher.zig`, `message.zig`,
+`session_key.zig`, `session.zig` and `pickle.zig` (313 functional: every guard, boundary, error value, offset, copy and
+skipped call of the ratchet advance and fast-forward, the key derivation and MAC, the message codec and varints, both
+session-key formats, session setup/encrypt/decrypt, `findRatchet`, `forgetBefore`, `exportAt`, the pickles and their
+frame checks; 43 stack-burn and wipe sites). The functional set ran in ReleaseSafe, the burn/wipe set in ReleaseFast
+against the stack probes with the switch moved into the burn itself (`burn.runAt`/`zeroAt`, so the probe's frame is the
+original one; mutant 0 passes the probe), one build per round, each mutant under `setsid -w timeout` and `ulimit -v`,
+baseline first. **No MAC, signature, replay or ratchet mutant survived**: dropping the signature check in `decrypt` or
+`SessionKey.decode`, dropping the MAC check, not advancing the ratchet after `encrypt`, a one-step or one-byte error in
+`advanceStep`/`advanceTo`, a wrong HKDF label or key split and every pickle consistency check are all killed. Round 1:
+277 killed, 1 hung (counted killed), 35 survived. Thirteen tests added in `audit_test.zig` and one stack probe
+(`Ratchet.advanceStep` and `InboundGroupSession.pickleSealed` measured on their own): `advanceTo` against repeated
+`advanceStep` for byte differences above 127 (a 7-bit step count passed every KAT), `secureZero` and every `deinit`
+(ratchet, signing key, derived keys) leaving zeros, empty and unaligned CBC input, the message-index limits
+(`0xFFFFFFFF` decodes, `2^32` is `VarintTooLong`), ten- and eleven-byte length varints, the missing-index and
+missing-ciphertext errors, `ExportedSessionKey.fromBase64`, a share key with a trailing byte, a flipped version byte and
+a non-canonical public key, `firstKnownIndex` after a later decrypt, `forgetBefore` at the first known index,
+`exportAt` below it, `InvalidPadding` from an authentic message (honest construction, as the `InvalidMac` test) and the
+pickle header order (magic, then kind, before length). Final: 320 killed, 36 equivalent or unobservable, none
+surviving. Equivalent (10): the `advanceStep` scan ending at part 3 either way; a one-byte zero HKDF salt equal to the
+empty one; an empty CBC ciphertext reaching `unpadPkcs7`; the `findRatchet` cache hit, restart and equal-index cases
+(the cache is an optimisation, correctness never depends on it); `exportAt` reporting the requested index; the
+`generateDeterministic` failure arm (identity public key, 2^-252). Stack burns and wipes (26 survivors, none a missing
+probe): each is either mutually covered by a second burn or wipe (the pairs and the triple `encrypt` burn +
+`advanceStep` burn, `encrypt` burn + its `keys.deinit`, `forgetBefore` + `advanceToUnchecked`, `pickleSealed` burn + the
+sealing function's plain-buffer wipe (outbound and inbound), `fromSealedPickle` + `openOutbound` + `openOutboundBody`'s
+plain wipe are each killed when removed together), covered by an inner burn that is itself required (`decodeOutbound`,
+`deriveKeys`, `OutboundSession.init`, `decrypt`), a token burn with nothing secret in the frame
+(`ExportedSessionKey.decode`/`fromBase64`, `fromSessionKey`, `fromExportedKey`), or a heap wipe right before `free`
+(unobservable: `free` poisons the bytes). One observation, not a defect of a supported path: the `pickle.*` codec
+functions that carry no burn of their own (`decodeInbound`, `sealOutbound`, `sealInbound`, `openInbound`) are public
+in the `pickle` namespace, and a probe of `decodeInbound` called directly finds ratchet copies 111..1519 B deep; the
+session wrappers' burns are what clear them, so these functions are internal by contract.
 
 [spec]: https://gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md
 
