@@ -6,7 +6,7 @@
 
 **Scope:** core — lib60870 v2.4.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-18 (935/956, 21 eq) · src d3e955ef9c1a18ae
+**Audit:** review 2026-09-10 · mutation 2026-11-18 (941/963, 22 eq) · src 55ca48a6517aecfe
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, IEC104_FUZZ) · ct n/a — no authentication (keyword review, 2026-10-07)
 
@@ -255,6 +255,8 @@ edge and on the far side of the wrap); and an I-frame while data transfer is sto
 
 **Delta mutation 2026-11-18 (protection-equipment events).** 60 mutants over the new runtime code only: the six shape rows (base kind and time tag of each), `Shape.size` for the three new kinds, the decode and encode offsets of every element octet and of each CP16Time2a, and every bit of `Sep`, `Spe`, `Oci` and `Qdp` in both directions with their reserved-bit masks. 58 killed at once; two survived on the first run and were test gaps (the OV bit leaking out of the SEP/QDP quality mask, which a state value of 1 hid in `Sep.toByte`, and `Qdp.fromByte` reading the reserved low bits as `quality.ov`); the assertions were added and both fell. 60/60 killed, none equivalent; the card counts are cumulative (875 + 60 killed of 896 + 60, 21 equivalent as before).
 
+**Delta mutation 2026-11-18 (spontaneous-only protection events).** 7 mutants over `isSpontaneousOnly` and the interrogated-cause guard of `emitPoint`: 6 killed; one EQUIVALENT, the upper bound 41 -> 36 of the guard, because the only emitters that reach it with a protection point are the station/group interrogation (causes 20..36) and the spontaneous report (3), while the counter interrogation (37) emits counters only. The card counts are cumulative: 941 killed + 22 equivalent of 963.
+
 **Defect found and fixed by the audit.** `P_ME_NC_1` (type 112, parameter of measured value, short float) was given the 3-octet element of the two integer parameter types, so a standard ASDU (R32 + QPM = 5 octets, IEC 60870-5-101 §7.3.5.3) was refused as `ObjectCountMismatch` and a 3-octet one accepted. It now has its own element kind `parameter_float` (`.{ .value = f32, .qpm = u8 }`); the integer types keep `parameter`. Tests carry hand-built standard octets in both directions and the refused old form. Also corrected: this SPEC claimed the protection-event types 17-19/38-40 were in the shape table; they are not (see Deferred).
 
 ## Threat model
@@ -299,8 +301,11 @@ Honest list of what a full IEC 60870-5-104 implementation has and this one does 
 - **Protection-equipment events** (17–19, 38–40, `M_EP_TA_1` … `M_EP_TF_1`) are modelled since
   2026-11-18, with this boundary: the decoder, builder and element accessors are complete; the
   outstation does not generate them on its own, and a point registered with one of these types is
-  reported by a general interrogation like any other monitoring point (the standard lists them as
-  spontaneous only; registering one is the caller's choice). Layout (IEC 60870-5-101 §7.3.1, one
+  never reported by a station, group or counter interrogation: the type/cause table of IEC 60870-5-101 / -104
+  allows them with cause 3 (spontaneous) only, so `emitPoint` drops any interrogated cause (20..41) for
+  them and `reportSpontaneous` still sends them (`TypeId.isSpontaneousOnly`; the table was read from a
+  vendor interoperability list that reproduces it, not from the standard text; lib60870-C's slave
+  was not checked). Layout (IEC 60870-5-101 §7.3.1, one
   object = base element with its CP16Time2a, then the tag): 17 `SEP`(1) + elapsed(2) + CP24 = 6
   octets (`protection_event`); 18 `SPE`(1) + `QDP`(1) + relay duration(2) + CP24 = 7
   (`protection_start`); 19 `OCI`(1) + `QDP`(1) + relay operating time(2) + CP24 = 7

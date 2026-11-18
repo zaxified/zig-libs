@@ -1199,3 +1199,38 @@ test "protection events: element bits outside the standard are masked, not echoe
     var small: [3]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, asdu.encodeElement(.{ .protection_start = .{ .start = .{}, .qdp = .{}, .duration = .{} } }, &small));
 }
+
+test "outstation: protection events are spontaneous only, never interrogated" {
+    var points = [_]outstation.Point{
+        .{ .ioa = 1, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } }, .group = 1 },
+        .{ .ioa = 2, .type_id = .m_ep_ta_1, .element = .{ .protection_event = .{ .event = .{ .state = .on }, .elapsed = .{ .milliseconds = 5 } } }, .time = .{ .cp24 = .{} }, .group = 1 },
+        .{ .ioa = 3, .type_id = .m_ep_te_1, .element = .{ .protection_start = .{ .start = .{ .gs = true }, .qdp = .{}, .duration = .{} } }, .time = .{ .cp56 = .{} }, .group = 1 },
+    };
+    var o = try outstation.Outstation.init(.{ .common_address = 47 }, &points);
+    var s = outstation.CollectSink{};
+    // station interrogation: con, the single-point, termination - nothing else
+    try o.handle(&hex("640106002f0000000014"), s.sink());
+    try testing.expectEqual(@as(usize, 3), s.count);
+    // group 1 interrogation (QOI 21)
+    s.reset();
+    try o.handle(&hex("640106002f0000000015"), s.sink());
+    try testing.expectEqual(@as(usize, 3), s.count);
+    for (0..s.count) |i| {
+        const a = try asdu.decode(s.get(i), asdu.default_params);
+        try testing.expect(!a.header.type_id.isSpontaneousOnly());
+    }
+    // spontaneously they are sent, with cause 3
+    s.reset();
+    try o.reportSpontaneous(2, s.sink());
+    try o.reportSpontaneous(3, s.sink());
+    try testing.expectEqual(@as(usize, 2), s.count);
+    const a = try asdu.decode(s.get(1), asdu.default_params);
+    try testing.expectEqual(asdu.TypeId.m_ep_te_1, a.header.type_id);
+    try testing.expectEqual(asdu.Cot.spontaneous, a.header.cause.cot);
+    // the predicate covers exactly the six ids
+    for (0..256) |id| {
+        const t: asdu.TypeId = @fromBackingInt(@intCast(id));
+        const want = (id >= 17 and id <= 19) or (id >= 38 and id <= 40);
+        try testing.expectEqual(want, t.isSpontaneousOnly());
+    }
+}

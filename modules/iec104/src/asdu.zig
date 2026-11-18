@@ -174,6 +174,16 @@ pub const TypeId = enum(u8) {
         return v >= 1 and v <= 40;
     }
 
+    /// True for the protection-equipment event types (17-19, 38-40): the
+    /// type/cause table of IEC 60870-5-101 / -104 allows only cause 3
+    /// (spontaneous) for them, never the interrogated causes 20..41.
+    pub fn isSpontaneousOnly(self: TypeId) bool {
+        return switch (self) {
+            .m_ep_ta_1, .m_ep_tb_1, .m_ep_tc_1, .m_ep_td_1, .m_ep_te_1, .m_ep_tf_1 => true,
+            else => false,
+        };
+    }
+
     /// True for the control-direction process-information types (45..69).
     pub fn isCommand(self: TypeId) bool {
         const v = @backingInt(self);
