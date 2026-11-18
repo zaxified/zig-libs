@@ -422,7 +422,7 @@ the client, the hybrid client-share length check removed (a panic).
 - **SHA-384 HMAC state caching in the key schedule:** 18 % of a `tlsserver`
   TLS_AES_256_GCM_SHA384 handshake is SHA-384 (profile 2026-10-21), mostly lone-block HMACs
   that recompute the ipad/opad blocks of the same secret; `sha2` does not help lone blocks.
-- **secp384r1 key exchange** (`kex`): the web-server consumer fork serves it by default; `tlsserver` M1 adds it
+- ✅ DONE 2026-10-20 (`2fae1fcf8`: `kex.zig` secp384r1 group 0x0018, `generate`/`sharedSecret`/`serverExchange`, `scalarLen`). **secp384r1 key exchange** (`kex`): the web-server consumer fork serves it by default; `tlsserver` M1 adds it
   (std `P384`, KAT against `cryptography`/OpenSSL) so a P-384-only client is not regressed.
 - **Certificate-authentication helpers** (`dtls/certauth.zig`): deferred to `tlsserver` M2
   (client auth), where the one-hop `verifyLeafAgainstAnchor` gives way to `x509.verifyChain`.
