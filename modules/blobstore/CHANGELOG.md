@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (282 mutants, 251 killed, 31 equivalent or unobservable, none surviving); 25 tests added, no source change; the card records `mutation 2026-11-17 (251/282, 31 eq)`.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-03** — **BREAKING (error set) + data-safety fixes (second review):** `casCreateTemp(uniq)` and `createTemp` create a new file on every call, the caller's name is only a label. Two uploads under one name used to share one file through truncation, and `casCommit`, which trusts the caller's hash, renamed the mixture. **CONSUMER-VISIBLE:** a crash's temp is no longer reused, so only `gc` frees it (`gc` on a `refcount = false` store reaps temps and nothing else). `Error` gains `CorruptSidecar` and `PathAlreadyExists`. A sidecar holding no count is `CorruptSidecar` from `delete` and `refcountOf` and is never written over; it used to read as 1, so `delete` wrote 0 and `gc` removed a blob with other referrers. Fixed an open temp left behind by `putNamed` on a base too long for its path buffer. SPEC states what directory durability does not cover and that no test observes an fsync.
