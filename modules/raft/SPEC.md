@@ -6,7 +6,7 @@
 
 **Scope:** mvp — etcd-io/raft v3.7.0 (surveyed 2026-09-30; poc -> mvp 2026-10-04 after `Node` landed)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-18 (81/83, 2 eq) · src 44f2cbcfa761d016
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (124/126, 2 eq) · src b99a7e14a44c357c
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RAFT_FUZZ) · ct n/a — consensus, no crypto (keyword review, 2026-10-07)
 
@@ -37,7 +37,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [LVala/zaft](https://github.com/LVala/zaft) | Zig | MIT | 24 | push 2024-08 (Zig 0.13) | The Zig alternative: a usable node (`Raft(UserData, Entry)` with send/apply/persist callbacks) for a fixed cluster; its README lists membership changes as not yet implemented. |
 | [canonical/raft](https://github.com/canonical/raft) | C | NOASSERTION (LGPL-3.0 with linking exception *inferred*) | 945 | v0.18.1 (2024-02), push 2024-03 | C library, listed for completeness. |
 
-**Where we are ahead:** the only one of these whose safety is model-checked by a deterministic fault simulator (`netsim`) against all five Figure 3 properties, with positive-control teeth tests — and since 2026-10-04 the model-check drives the SAME `Node` a deployment runs (restart from the persisted state only, Readys batched or not). The pure decision core and the invariant checkers are reusable on their own. **Where we are even:** a runnable server in the etcd-raft/raft-rs shape — `Node` as a pure state machine (`tick` / `step` / `propose` → `ready` / `advance`) over caller-owned transport, storage and clock, any cluster size, entries carrying arbitrary bytes, restart from persisted state; zaft's level of "a usable node for a fixed cluster", with the persistence contract enforced. **Where we are behind (→ Backlog, the gaps a user will hit):** no log compaction/snapshots (the whole log and every entry's bytes live in memory), no membership changes, no pre-vote / check-quorum / leadership transfer, no linearizable reads (ReadIndex / lease). (Flow control — a byte cap per AppendEntries and an in-flight window per follower, etcd's `MaxSizePerMsg` / `MaxInflightMsgs` — landed 2026-11-18; see § Flow control and hostile-peer limits.)
+**Where we are ahead:** the only one of these whose safety is model-checked by a deterministic fault simulator (`netsim`) against all five Figure 3 properties, with positive-control teeth tests — and since 2026-10-04 the model-check drives the SAME `Node` a deployment runs (restart from the persisted state only, Readys batched or not). The pure decision core and the invariant checkers are reusable on their own. **Where we are even:** a runnable server in the etcd-raft/raft-rs shape — `Node` as a pure state machine (`tick` / `step` / `propose` → `ready` / `advance`) over caller-owned transport, storage and clock, any cluster size, entries carrying arbitrary bytes, restart from persisted state; zaft's level of "a usable node for a fixed cluster", with the persistence contract enforced. **Where we are behind (→ Backlog, the gaps a user will hit):** no log compaction/snapshots (the whole log and every entry's bytes live in memory), no membership changes, no leadership transfer, no linearizable reads (ReadIndex / lease). (PreVote and CheckQuorum — etcd's `Config.PreVote` / `Config.CheckQuorum` — landed 2026-11-18, off by default as in etcd/raft; see § PreVote and CheckQuorum.) (Flow control — a byte cap per AppendEntries and an in-flight window per follower, etcd's `MaxSizePerMsg` / `MaxInflightMsgs` — landed 2026-11-18; see § Flow control and hostile-peer limits.)
 
 ## Purpose
 
@@ -354,8 +354,8 @@ r.electionTimeout` → ignored), and PreVote (thesis §9.6) keeps a *partitioned
 honest* node from inflating its term in the first place. hashicorp/raft's
 `appendEntries` likewise adopts `a.Term` when higher, with no bound. Both
 mechanisms answer the honest-disruption case (a rejoining node deposing a
-healthy leader), which is Backlog 7 here (PreVote / CheckQuorum, not yet
-implemented); neither stops a peer that lies about its term, because Raft
+healthy leader), which is Backlog 7 here (PreVote / CheckQuorum, implemented
+2026-11-18, § PreVote and CheckQuorum); neither stops a peer that lies about its term, because Raft
 assumes non-Byzantine peers. So no bound was invented: the defence against a
 hostile term stays `types.max_term` (no overflow, no wrap; the cluster halts
 safely, § Malformed messages) plus an authenticated transport.
@@ -377,6 +377,111 @@ survived — all four byte-window bookkeeping (`becomeLeader` and the rejection
 not resetting the bytes, `FreeFirstOne` not giving bytes back, the oldest freed
 on a PROGRESSING ack too); each got a killing test; final 30/30 killed. Added to
 the card's counts (cumulative).
+
+## PreVote and CheckQuorum
+
+Added 2026-11-18 (Backlog 7). Both follow etcd/raft (`raft.go`: `Config.PreVote`,
+`Config.CheckQuorum`, `Step`, `stepLeader`'s `MsgCheckQuorum`, `tickHeartbeat`)
+and the Raft thesis (Ongaro 2014, §9.6 PreVote, §4.2.3 disruptive servers);
+hashicorp/raft (`raft.go`: `requestPreVote`, `requestVote`, `checkLeaderLease`)
+was checked for every rule where the two could differ.
+
+**Defaults: both off** (`Node.Config.pre_vote = false`, `check_quorum = false`).
+etcd/raft's `Config` has both as plain `bool`s, i.e. off unless set (the etcd
+*server* turns both on; hashicorp/raft has PreVote on unless `PreVoteDisabled`
+and its leader lease always on). The module's reference is the etcd/raft
+library, and off keeps every existing cluster's behaviour unchanged; README
+shows how to switch them on. With both off only the codec (two new tags) and
+the `Role` enum changed.
+
+**PreVote (thesis §9.6).** On an election timeout a node with `pre_vote`
+becomes `Role.pre_candidate` (etcd's `StatePreCandidate`) and sends
+`pre_vote_req` with `term + 1` and its last log entry — WITHOUT changing its
+term, vote or hard state (nothing to persist). A majority of grants (itself
+included; a set, as for votes) starts the real election (`campaign`); a
+refusal carrying a higher term is adopted (etcd: the default branch of
+`Step`); a grant for any term other than `term + 1`, or arriving after the
+node left `pre_candidate`, is ignored. A node at `max_term` does not
+pre-campaign (there is no `term + 1`). The receiver never adopts the term,
+never records a vote and does not reset its election timer (etcd: "Only
+record real votes"); it grants iff
+
+- it may vote: the request's term is above its own, or equal with its vote
+  free and no leader known, or already cast for this sender (etcd's
+  `canVote`), AND
+- the candidate's log is at least as up to date (§5.4.1, the kernel's
+  `logIsAtLeastAsUpToDate`), AND
+- it has not heard from a live leader within its own `election_ticks`
+  (`leader` known and `election_elapsed < election_ticks`; a leader counts
+  itself). This is the thesis's second condition and hashicorp's "rejecting
+  pre-vote request since we have a leader". etcd/raft enforces it only
+  through CheckQuorum's lease; the module follows the thesis and hashicorp,
+  since without it a partitioned node whose log is still up to date (nothing
+  committed during the partition) would still depose the leader.
+
+A grant carries the request's term, a refusal the receiver's own (etcd does
+the same, so a stale asker catches up). Pre-votes are answered whatever the
+receiver's own `pre_vote` setting (etcd does the same).
+
+**CheckQuorum.** A leader with `check_quorum` records, per follower, whether
+an AppendEntries response of its term arrived (success or rejection — etcd's
+`RecentActive`, set on `MsgAppResp` / `MsgHeartbeatResp`); itself always
+counts. Every `election_ticks` ticks (the un-jittered timeout, etcd's
+`electionTimeout`) it checks: fewer than a majority active → step down to
+follower in the same term with no known leader (etcd: `becomeFollower(r.Term,
+None)`); then every follower's flag is cleared. **Lease:** a node with
+`check_quorum` that has heard from a leader within `election_ticks` (or is
+the leader) ignores a RequestVote or PreVote whose term is above its own —
+no term adoption, no reply (etcd's `inLease`). With the default
+`check_quorum = false` a RequestVote behaves as before; hashicorp rejects
+votes whenever it knows a leader, which would change existing behaviour, so
+the module follows etcd here.
+
+**Not taken from etcd:** etcd answers a lower-term AppendEntries with an
+`MsgAppResp` only when `checkQuorum || preVote` (so a node that inflated its
+term can still get the leader to adopt it); this `Node` already answers every
+stale AppendEntries with its term (Figure 2), so nothing was needed.
+Leadership transfer (`MsgTimeoutNow`, the `campaignTransfer` exemption from
+the lease) is not implemented — Backlog 7 stays open for it.
+
+**Wire.** Two new tags, `pre_vote_req = 0x14` and `pre_vote_resp = 0x15`,
+the same layouts as `vote_req` / `vote_resp` (the codec versions additions by
+tag or by an optional longer frame; it has no version byte). A decoder from
+before 2026-11-18 refuses them (undefined tag → dropped and counted), so a
+pre-candidate gets no answer from an old server: upgrade every server before
+setting `pre_vote`.
+
+**Tests.** `node.zig`: a timeout makes a pre-candidate and moves no term,
+vote or hard state; a majority of grants starts the election, stale grants
+and same-term refusals do not; a higher-term refusal is adopted; the
+single-node and `max_term` cases; the receiver grants only an up-to-date log
+with no live leader and moves nothing; a live leader refuses; CheckQuorum
+steps down at `election_ticks` ticks and not one before, one ack per period
+keeps it, the activity is reset each period; the lease ignores higher-term
+RequestVote and PreVote (and without `check_quorum` the vote is adopted as
+before). `server.zig` (netsim, directed): node 4 cut away for six of its
+election timeouts and healed — without PreVote it comes back with a higher
+term and the term-1 leader is deposed; with PreVote (alone, and with
+CheckQuorum) the whole cluster is still in term 1 under the same leader; a
+leader cut into a minority steps down with CheckQuorum and stays leader
+without it. Plus a 150-seed fuzzed fault sweep with both on (all five
+invariants) and a quiet liveness run (one leader, ≥ 30 commits).
+
+Delta mutation 2026-11-18 (schemata, ReleaseSafe, the new non-test code in
+`node.zig` and `message.zig` only): 43 mutants, one per guard × class — the
+CheckQuorum tick (on/off, the counter, `>=` vs `>`, the counter reset, the
+quorum test, the step-down's leader clear and `return`, the per-period clear
+and the self flag), `quorumActive`'s `>=`, `becomeLeader`'s three resets, the
+`recent_active` mark, `preCampaign` (`max_term`, role, leader clear, timer,
+tally reset, self vote, majority, `term + 1`), `leaderLive`'s two clauses, the
+receiver's lease, `canVote` clauses, up-to-date and live-leader conjuncts,
+the reply term, `onPreVoteResp`'s adoption and its three filters, both decode
+tag splits, the tick's pre-vote switch. First run 35 killed, 8 survived — the
+step-down tick going on to send AppendEntries as a follower (no `return`),
+the pre-candidate keeping its leader, its timer not restarted, its tally not
+reset, `canVote`'s "no leader known" and "same term" clauses, and
+`becomeLeader` not clearing the activity flags or the check counter; each
+got a killing test; final 43/43. Added to the card's counts (cumulative).
 
 ## The positive control
 
@@ -476,7 +581,7 @@ linearizable reads are the core items, still in the Backlog.
    is what gives `recordApply` a key that varies.
 5. Log compaction / snapshotting (§7) — out of current scope. (survey 2026-09-30) A user of hashicorp/raft or etcd/raft cannot run without it: the log grows without bound. Effort: large; fits §2.
 6. ~~(survey 2026-09-30) A runnable node outside `netsim`.~~ **Done 2026-10-04** — `Node` (`node.zig`); `example-apps/raft-kv` runs on it.
-7. (survey 2026-09-30) Pre-vote and leadership transfer (etcd/raft, openraft): a partitioned node rejoining must not depose a healthy leader. Effort: medium; fits §2.
+7. ◐ PARTIAL 2026-11-18 — PreVote and CheckQuorum done (`Config.pre_vote` / `check_quorum`, off by default as in etcd/raft; § PreVote and CheckQuorum); **leadership transfer still open** (etcd's `MsgTimeoutNow` plus the lease exemption for a transfer campaign). (survey 2026-09-30) Pre-vote and leadership transfer (etcd/raft, openraft): a partitioned node rejoining must not depose a healthy leader. Effort: medium; fits §2.
 8. (survey 2026-09-30) Linearizable reads (ReadIndex / lease): a user of a consensus library expects consistent reads without writing to the log. Effort: medium; fits §2.
 
 9. (review 2026-10-04, M3) A torn-Ready crash fault in the harness: crash a server after it persisted part of a Ready, or after it sent but before `advance`, so the sweep — not only the unit tests — checks the persist-before-send order. Effort: medium.

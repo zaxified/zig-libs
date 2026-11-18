@@ -102,6 +102,13 @@ pub const Tag = enum(u8) {
     vote_resp = 0x11,
     append_req = 0x12,
     append_resp = 0x13,
+    /// PreVote (Raft thesis §9.6; etcd/raft `MsgPreVote` / `MsgPreVoteResp`).
+    /// Added 2026-11-18 as new tags, the way this codec versions additions
+    /// (no version byte): an older decoder refuses them as an undefined tag
+    /// (dropped and counted), so `Config.pre_vote` must only be switched on
+    /// once every server runs a decoder that knows them.
+    pre_vote_req = 0x14,
+    pre_vote_resp = 0x15,
 };
 
 pub const Body = union(Tag) {
@@ -109,6 +116,12 @@ pub const Body = union(Tag) {
     vote_resp: VoteResp,
     append_req: AppendReq,
     append_resp: AppendResp,
+    /// Same layout as `vote_req`. `term` is the term the sender WOULD
+    /// campaign in (its own + 1); nobody adopts it.
+    pre_vote_req: VoteReq,
+    /// Same layout as `vote_resp`. A grant carries the request's term, a
+    /// refusal the responder's own (etcd/raft does the same).
+    pre_vote_resp: VoteResp,
 };
 
 pub const Message = struct {
@@ -128,8 +141,8 @@ pub const Message = struct {
     /// Exact size of `encode`'s output.
     pub fn encodedLen(self: Message) usize {
         return switch (self.body) {
-            .vote_req => vote_req_len,
-            .vote_resp => vote_resp_len,
+            .vote_req, .pre_vote_req => vote_req_len,
+            .vote_resp, .pre_vote_resp => vote_resp_len,
             .append_resp => |a| if (a.conflict_index != 0) append_resp_hint_len else append_resp_len,
             .append_req => |a| blk: {
                 var n: usize = append_header_len;
@@ -146,13 +159,13 @@ pub const Message = struct {
         std.debug.assert(buf.len >= self.encodedLen());
         buf[0] = @backingInt(std.meta.activeTag(self.body));
         switch (self.body) {
-            .vote_req => |v| {
+            .vote_req, .pre_vote_req => |v| {
                 std.mem.writeInt(u64, buf[1..9], v.term, .little);
                 std.mem.writeInt(u64, buf[9..17], v.last_log_index, .little);
                 std.mem.writeInt(u64, buf[17..25], v.last_log_term, .little);
                 return vote_req_len;
             },
-            .vote_resp => |v| {
+            .vote_resp, .pre_vote_resp => |v| {
                 std.mem.writeInt(u64, buf[1..9], v.term, .little);
                 buf[9] = @intFromBool(v.granted);
                 return vote_resp_len;
@@ -201,20 +214,22 @@ pub const Message = struct {
         if (bytes.len < 1) return error.Truncated;
         const tag = std.enums.fromInt(Tag, bytes[0]) orelse return error.InvalidEncoding;
         const body: Body = switch (tag) {
-            .vote_req => blk: {
+            .vote_req, .pre_vote_req => blk: {
                 try exactLen(bytes, vote_req_len);
-                break :blk .{ .vote_req = .{
+                const v: VoteReq = .{
                     .term = try requestTermAt(bytes, 1),
                     .last_log_index = std.mem.readInt(u64, bytes[9..17], .little),
                     .last_log_term = try termAt(bytes, 17),
-                } };
+                };
+                break :blk if (tag == .vote_req) .{ .vote_req = v } else .{ .pre_vote_req = v };
             },
-            .vote_resp => blk: {
+            .vote_resp, .pre_vote_resp => blk: {
                 try exactLen(bytes, vote_resp_len);
-                break :blk .{ .vote_resp = .{
+                const v: VoteResp = .{
                     .term = try termAt(bytes, 1),
                     .granted = try boolAt(bytes, 9),
-                } };
+                };
+                break :blk if (tag == .vote_resp) .{ .vote_resp = v } else .{ .pre_vote_resp = v };
             },
             .append_resp => blk: {
                 if (bytes.len < append_resp_len) return error.Truncated;
@@ -324,6 +339,8 @@ fn roundTrip(m: Message) !void {
     switch (m.body) {
         .vote_req => |v| try testing.expectEqual(v, d.body.vote_req),
         .vote_resp => |v| try testing.expectEqual(v, d.body.vote_resp),
+        .pre_vote_req => |v| try testing.expectEqual(v, d.body.pre_vote_req),
+        .pre_vote_resp => |v| try testing.expectEqual(v, d.body.pre_vote_resp),
         .append_resp => |v| try testing.expectEqual(v, d.body.append_resp),
         .append_req => |a| {
             const b = d.body.append_req;
@@ -345,6 +362,8 @@ fn roundTrip(m: Message) !void {
 test "every message kind round-trips, entries with their bytes" {
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .vote_req = .{ .term = 4, .last_log_index = 9, .last_log_term = 3 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .vote_resp = .{ .term = 4, .granted = true } } });
+    try roundTrip(.{ .from = 1, .to = 2, .body = .{ .pre_vote_req = .{ .term = 5, .last_log_index = 9, .last_log_term = 3 } } });
+    try roundTrip(.{ .from = 1, .to = 2, .body = .{ .pre_vote_resp = .{ .term = 5, .granted = false } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 3, .conflict_index = 9 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 0, .conflict_index = 18 } } });
@@ -433,7 +452,7 @@ test "decode refuses lying lengths, trailing bytes, bad tags, bools and terms" {
     // One byte left over.
     try testing.expectError(error.InvalidEncoding, Message.decode(buf[0 .. ok.len + 1], 0, 1, &scratch));
     // Undefined tag; the old format's tags; an empty frame.
-    try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x14}, 0, 1, &scratch));
+    try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x16}, 0, 1, &scratch));
     try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x02}, 0, 1, &scratch));
     try testing.expectError(error.Truncated, Message.decode(&.{}, 0, 1, &scratch));
 
@@ -461,6 +480,8 @@ const seed = testkit.fuzz.seedHex;
 const message_seeds = [_][]const u8{
     seed("10" ++ "0400000000000000" ++ "0900000000000000" ++ "0300000000000000"), // vote_req
     seed("11" ++ "0400000000000000" ++ "01"), // vote_resp
+    seed("14" ++ "0500000000000000" ++ "0900000000000000" ++ "0300000000000000"), // pre_vote_req
+    seed("15" ++ "0500000000000000" ++ "00"), // pre_vote_resp
     seed("13" ++ "0400000000000000" ++ "00" ++ "1100000000000000"), // append_resp (reject + hint)
     seed("12" ++ "0300000000000000" ++ "0500000000000000" ++ "0200000000000000" ++ "0500000000000000" ++ "00000000"), // heartbeat
     seed("12" ++ "0300000000000000" ++ "0500000000000000" ++ "0200000000000000" ++ "0500000000000000" ++ "02000000" ++
@@ -477,7 +498,7 @@ const message_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
-const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, refused });
+const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, pre_vote_req, pre_vote_resp, refused });
 
 test "fuzz: Message.decode never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &message_seeds });
@@ -510,6 +531,8 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         .vote_resp => MessageMark.mark(.vote_resp),
         .append_resp => MessageMark.mark(.append_resp),
         .append_req => MessageMark.mark(.append_req),
+        .pre_vote_req => MessageMark.mark(.pre_vote_req),
+        .pre_vote_resp => MessageMark.mark(.pre_vote_resp),
     }
     // Accepted ⇒ re-encodes to the same bytes (the codec has one encoding).
     var out: [160]u8 = undefined;
@@ -533,7 +556,7 @@ test "corpus: every message seed reaches the decoder, and what it accepted is pi
         if (m.body == .append_req) entries += m.body.append_req.entries.len;
     }
     try testing.expectEqual(message_seeds.len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 7), accepted);
     // The number a heartbeat-only corpus cannot produce.
     try testing.expectEqual(@as(usize, 2), entries);
 }

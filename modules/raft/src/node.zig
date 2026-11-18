@@ -42,8 +42,14 @@
 //! log than the leader has is dropped and counted, never clamped (`server.zig`
 //! has the reasoning).
 //!
+//! Opt-in election hardening (both off by default, as in etcd/raft):
+//! `Config.pre_vote` (Raft thesis §9.6 — a node asks whether it COULD win
+//! before it bumps its term) and `Config.check_quorum` (a leader that has not
+//! heard from a quorum for an election timeout steps down, and a follower
+//! that heard from a leader within one ignores higher-term vote requests).
+//!
 //! Not here yet (see SPEC.md § Backlog): snapshots / log compaction, membership
-//! change, pre-vote and leadership transfer, linearizable reads. The whole log
+//! change, leadership transfer, linearizable reads. The whole log
 //! lives in memory, and so does every entry's data.
 
 const std = @import("std");
@@ -64,7 +70,10 @@ const no_vote = types.no_vote;
 pub const Entry = message.Entry;
 pub const Message = message.Message;
 
-pub const Role = enum { follower, candidate, leader };
+/// `pre_candidate`: polling peers with PreVote before an election
+/// (`Config.pre_vote`; etcd/raft's `StatePreCandidate`) — its term and vote
+/// are still those of the follower it was.
+pub const Role = enum { follower, pre_candidate, candidate, leader };
 
 pub const Config = struct {
     /// This server. Voters are `0 .. cluster_size - 1`; every server in the
@@ -109,6 +118,28 @@ pub const Config = struct {
     /// no byte bound (etcd/raft's `MaxInflightBytes`, also 0 by default).
     /// When non-zero it must be >= `max_append_bytes`.
     max_inflight_bytes: u64 = 0,
+    /// PreVote (Raft thesis §9.6; etcd/raft `Config.PreVote`, hashicorp/raft
+    /// on unless `PreVoteDisabled`). On an election timeout the node first
+    /// becomes a `pre_candidate` and asks every peer whether it WOULD vote for
+    /// it in term + 1, without changing its own term or vote; only a majority
+    /// of yeses starts the real election. A peer says yes only if the
+    /// candidate's log is up to date (§5.4.1) and the peer has not heard from
+    /// a live leader within its own `election_ticks`. So a node cut off from
+    /// the cluster cannot inflate its term, and on rejoining cannot depose a
+    /// healthy leader. Off by default (etcd/raft's default; existing clusters
+    /// behave as before). Every server answers pre-votes whatever its own
+    /// setting, but servers whose decoder predates the PreVote tags drop
+    /// them — upgrade every server before switching it on.
+    pre_vote: bool = false,
+    /// CheckQuorum (etcd/raft `Config.CheckQuorum`; hashicorp/raft's leader
+    /// lease, always on there). A leader that has not had an AppendEntries
+    /// response from a majority (itself included) during the last
+    /// `election_ticks` ticks steps down to follower in the same term — so a
+    /// leader cut off into a minority stops acting as one. And a follower
+    /// that heard from a leader within `election_ticks` (the "lease") ignores
+    /// a RequestVote or PreVote carrying a higher term, without adopting that
+    /// term or replying. Off by default (etcd/raft's default).
+    check_quorum: bool = false,
     /// Seeds the election-timeout jitter. Give every server a different one
     /// (two servers with the same seed time out in lockstep).
     seed: u64,
@@ -233,7 +264,12 @@ pub const Node = struct {
     infl_head: []u32,
     infl_count: []u32,
     infl_bytes: []u64,
+    /// CheckQuorum: which followers sent an AppendEntries response since the
+    /// leader's last quorum check (etcd/raft `Progress.RecentActive`).
+    recent_active: []bool,
 
+    /// Ticks since this node last heard from a leader or granted a vote; on a
+    /// leader with `check_quorum`, ticks since the last quorum check.
     election_elapsed: u32 = 0,
     election_timeout: u32 = 0,
     heartbeat_elapsed: u32 = 0,
@@ -293,6 +329,7 @@ pub const Node = struct {
             .infl_head = &.{},
             .infl_count = &.{},
             .infl_bytes = &.{},
+            .recent_active = &.{},
             .prng = .init(cfg.seed),
             .out_arena = .init(gpa),
             .decode_buf = &.{},
@@ -308,6 +345,8 @@ pub const Node = struct {
         self.infl_head = try gpa.alloc(u32, n);
         self.infl_count = try gpa.alloc(u32, n);
         self.infl_bytes = try gpa.alloc(u64, n);
+        self.recent_active = try gpa.alloc(bool, n);
+        @memset(self.recent_active, false);
         @memset(self.infl_head, 0);
         @memset(self.infl_count, 0);
         @memset(self.infl_bytes, 0);
@@ -355,6 +394,7 @@ pub const Node = struct {
         gpa.free(self.infl_head);
         gpa.free(self.infl_count);
         gpa.free(self.infl_bytes);
+        gpa.free(self.recent_active);
         self.* = undefined;
     }
 
@@ -391,12 +431,29 @@ pub const Node = struct {
     pub fn tick(self: *Node) Allocator.Error!void {
         std.debug.assert(!self.in_ready);
         if (self.role == .leader) {
+            if (self.cfg.check_quorum) {
+                // etcd's `tickHeartbeat` → `MsgCheckQuorum`, once per
+                // (un-jittered) election timeout.
+                self.election_elapsed += 1;
+                if (self.election_elapsed >= self.cfg.election_ticks) {
+                    self.election_elapsed = 0;
+                    if (!self.quorumActive()) {
+                        self.becomeFollower(self.term);
+                        self.leader = no_vote;
+                        return;
+                    }
+                    @memset(self.recent_active, false);
+                    self.recent_active[self.cfg.id] = true;
+                }
+            }
             self.heartbeat_elapsed += 1;
             if (self.heartbeat_elapsed >= self.cfg.heartbeat_ticks) try self.bcastAppend();
             return;
         }
         self.election_elapsed += 1;
-        if (self.election_elapsed >= self.election_timeout) try self.campaign();
+        if (self.election_elapsed >= self.election_timeout) {
+            if (self.cfg.pre_vote) try self.preCampaign() else try self.campaign();
+        }
     }
 
     /// Append `bytes` as a command entry; returns its index. It is committed
@@ -442,6 +499,8 @@ pub const Node = struct {
             .vote_resp => |v| try self.onVoteResp(m.from, v),
             .append_req => |a| try self.onAppendReq(m.from, a),
             .append_resp => |a| try self.onAppendResp(m.from, a),
+            .pre_vote_req => |v| try self.onPreVoteReq(m.from, v),
+            .pre_vote_resp => |v| try self.onPreVoteResp(m.from, v),
         }
     }
 
@@ -534,6 +593,70 @@ pub const Node = struct {
         }
     }
 
+    /// PreVote (thesis §9.6): ask for votes in term + 1 without taking it.
+    /// Term, vote and hard state stay as they are; a majority of grants
+    /// (`onPreVoteResp`) starts the real `campaign`.
+    fn preCampaign(self: *Node) Allocator.Error!void {
+        // The real election would need term + 1; at the ceiling there is none.
+        if (self.term >= types.max_term) {
+            self.resetElectionTimer();
+            return;
+        }
+        self.role = .pre_candidate;
+        self.leader = no_vote;
+        self.resetElectionTimer();
+        @memset(self.votes, false);
+        self.votes[self.cfg.id] = true;
+        if (self.voteCount() >= self.majority()) return self.campaign();
+        const li = self.log.info();
+        for (0..self.cfg.cluster_size) |p| {
+            if (p == self.cfg.id) continue;
+            try self.send(@intCast(p), .{ .pre_vote_req = .{
+                .term = self.term + 1,
+                .last_log_index = li.last_index,
+                .last_log_term = li.last_term,
+            } });
+        }
+    }
+
+    /// Heard from a leader (or is one) within the last `election_ticks`
+    /// ticks. etcd/raft's `inLease` without the `checkQuorum` conjunct: a
+    /// PreVote is refused on it always (thesis §9.6, hashicorp/raft's "we
+    /// have a leader"); a RequestVote only under `check_quorum` (etcd/raft).
+    fn leaderLive(self: *const Node) bool {
+        return self.leader != no_vote and self.election_elapsed < self.cfg.election_ticks;
+    }
+
+    fn onPreVoteReq(self: *Node, from: NodeId, v: message.VoteReq) Allocator.Error!void {
+        // Never adopts `v.term` and never records a vote: a pre-vote moves no
+        // state on the receiver, only a reply leaves.
+        if (v.term > self.term and self.cfg.check_quorum and self.leaderLive()) return; // inside the lease: ignored (etcd)
+        // etcd's `canVote` for a pre-vote: a repeat of our vote, or no vote and
+        // no leader in this term, or a future term.
+        const can_vote = v.term > self.term or
+            (v.term == self.term and (self.voted_for == from or (self.voted_for == no_vote and self.leader == no_vote)));
+        const up_to_date = safety.logIsAtLeastAsUpToDate(.{ .last_index = v.last_log_index, .last_term = v.last_log_term }, self.log.info());
+        const grant = can_vote and up_to_date and !self.leaderLive();
+        // A grant carries the request's term (the asker ignores replies older
+        // than its own term), a refusal ours (so a stale asker catches up).
+        try self.send(from, .{ .pre_vote_resp = .{ .term = if (grant) v.term else self.term, .granted = grant } });
+    }
+
+    fn onPreVoteResp(self: *Node, from: NodeId, v: message.VoteResp) Allocator.Error!void {
+        // A refusal from a higher term: that term exists, adopt it (etcd).
+        // A grant carries OUR prospective term and is not adopted.
+        if (!v.granted and v.term > self.term) return self.becomeFollower(v.term);
+        if (self.role != .pre_candidate or !v.granted or v.term != self.term + 1) return;
+        self.votes[from] = true;
+        if (self.voteCount() >= self.majority()) try self.campaign();
+    }
+
+    fn quorumActive(self: *const Node) bool {
+        var n: usize = 0;
+        for (self.recent_active) |a| n += @intFromBool(a);
+        return n >= self.majority();
+    }
+
     fn voteCount(self: *const Node) usize {
         var n: usize = 0;
         for (self.votes) |v| n += @intFromBool(v);
@@ -550,6 +673,11 @@ pub const Node = struct {
         self.match[self.cfg.id] = self.stable;
         @memset(self.infl_count, 0);
         @memset(self.infl_bytes, 0);
+        // CheckQuorum: the leader is always active (etcd); the first check
+        // comes one election timeout from now.
+        @memset(self.recent_active, false);
+        self.recent_active[self.cfg.id] = true;
+        self.election_elapsed = 0;
         // §8: a fresh leader commits a no-op of its own term, which is what
         // lets the Figure-8 rule pull earlier-term entries in behind it.
         _ = try self.appendLocal(.noop, "");
@@ -574,6 +702,10 @@ pub const Node = struct {
     }
 
     fn onVoteReq(self: *Node, from: NodeId, v: message.VoteReq) Allocator.Error!void {
+        // CheckQuorum lease (etcd/raft `Step`, thesis §4.2.3): a node that
+        // heard from a leader within an election timeout neither adopts a
+        // higher term from a RequestVote nor answers it.
+        if (v.term > self.term and self.cfg.check_quorum and self.leaderLive()) return;
         const req: types.RequestVoteReq = .{
             .term = v.term,
             .candidate_id = from,
@@ -765,6 +897,7 @@ pub const Node = struct {
         const obs = safety.observeTerm(self.term, a.term);
         if (obs.term_advanced) return self.becomeFollower(obs.new_term);
         if (self.role != .leader or a.term != self.term) return;
+        self.recent_active[from] = true;
         if (a.success) {
             // Rejected, not clamped: a clamp would record the follower as
             // holding the WHOLE log, and `leaderCommitIndex` counts exactly
@@ -1427,6 +1560,269 @@ test "a new leader starts every follower's window empty" {
     try testing.expect(first.body.append_req.entries.len > 0);
 }
 
+// ── PreVote and CheckQuorum (SPEC Backlog 7) ────────────────────────────────
+
+fn pvCfg(id: NodeId) Config {
+    return .{ .id = id, .cluster_size = 3, .election_ticks = 4, .election_jitter_ticks = 0, .seed = id, .pre_vote = true };
+}
+
+/// The messages `node` queued since `from` with body tag `tag`.
+fn countTag(node: *const Node, from: usize, tag: message.Tag) usize {
+    var n: usize = 0;
+    for (node.msgs.items[from..]) |m| n += @intFromBool(m.body == tag);
+    return n;
+}
+
+test "PreVote: a timeout makes a pre-candidate — term, vote and hard state do not move" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, pvCfg(0), .{ .hard_state = .{ .term = 3, .voted_for = 2 } });
+    defer node.deinit();
+    for (0..3) |_| try node.tick();
+    try testing.expectEqual(Role.follower, node.role);
+    try node.tick();
+    try testing.expectEqual(Role.pre_candidate, node.role);
+    try testing.expectEqual(@as(Term, 3), node.term);
+    try testing.expectEqual(@as(NodeId, 2), node.voted_for);
+    const rd = try node.ready();
+    try testing.expect(rd.hard_state == null); // nothing to persist
+    try testing.expectEqual(@as(usize, 2), rd.messages.len);
+    for (rd.messages) |m| {
+        try testing.expectEqual(message.Tag.pre_vote_req, std.meta.activeTag(m.body));
+        try testing.expectEqual(@as(Term, 4), m.body.pre_vote_req.term); // the term it WOULD take
+    }
+    try node.advance();
+    // Without a majority it times out again — still a pre-candidate, still term 3.
+    for (0..4) |_| try node.tick();
+    try testing.expectEqual(Role.pre_candidate, node.role);
+    try testing.expectEqual(@as(Term, 3), node.term);
+
+    // Off (the default): the same timeout is a real election.
+    var plain = try Node.init(gpa, .{ .id = 0, .cluster_size = 3, .election_ticks = 4, .election_jitter_ticks = 0, .seed = 0 }, .{ .hard_state = .{ .term = 3 } });
+    defer plain.deinit();
+    try testing.expect(!plain.cfg.pre_vote and !plain.cfg.check_quorum);
+    for (0..4) |_| try plain.tick();
+    try testing.expectEqual(Role.candidate, plain.role);
+    try testing.expectEqual(@as(Term, 4), plain.term);
+}
+
+test "PreVote: a majority of grants starts the real election; stale grants and same-term refusals do not" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, pvCfg(0), .{ .hard_state = .{ .term = 3 } });
+    defer node.deinit();
+    for (0..4) |_| try node.tick();
+    try testing.expectEqual(Role.pre_candidate, node.role);
+    // A grant for another prospective term (an older pre-campaign's) counts nothing.
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .pre_vote_resp = .{ .term = 3, .granted = true } } });
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .pre_vote_resp = .{ .term = 5, .granted = true } } });
+    // A refusal at our own term moves nothing either.
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .pre_vote_resp = .{ .term = 3, .granted = false } } });
+    try testing.expectEqual(Role.pre_candidate, node.role);
+    try testing.expectEqual(@as(Term, 3), node.term);
+    // A real grant from node 1: two of three — the election proper starts.
+    const from = node.msgs.items.len;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .pre_vote_resp = .{ .term = 4, .granted = true } } });
+    try testing.expectEqual(Role.candidate, node.role);
+    try testing.expectEqual(@as(Term, 4), node.term);
+    try testing.expectEqual(@as(NodeId, 0), node.voted_for);
+    try testing.expectEqual(@as(usize, 2), countTag(&node, from, .vote_req));
+    // A pre-vote grant reaching a node that is no longer a pre-candidate is ignored.
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .pre_vote_resp = .{ .term = 5, .granted = true } } });
+    try testing.expectEqual(Role.candidate, node.role);
+    try testing.expectEqual(@as(Term, 4), node.term);
+}
+
+test "PreVote: a refusal from a higher term is adopted; a single-node cluster elects itself" {
+    const gpa = testing.allocator;
+    var node = try Node.init(gpa, pvCfg(0), .{ .hard_state = .{ .term = 3 } });
+    defer node.deinit();
+    for (0..4) |_| try node.tick();
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .pre_vote_resp = .{ .term = 9, .granted = false } } });
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expectEqual(@as(Term, 9), node.term);
+
+    var solo = try Node.init(gpa, .{ .id = 0, .cluster_size = 1, .election_ticks = 2, .election_jitter_ticks = 0, .seed = 0, .pre_vote = true }, .{});
+    defer solo.deinit();
+    for (0..2) |_| try solo.tick();
+    try testing.expectEqual(Role.leader, solo.role);
+    try testing.expectEqual(@as(Term, 1), solo.term);
+
+    // At max_term there is no term + 1 to ask for.
+    var top = try Node.init(gpa, pvCfg(0), .{ .hard_state = .{ .term = types.max_term } });
+    defer top.deinit();
+    for (0..8) |_| try top.tick();
+    try testing.expectEqual(Role.follower, top.role);
+    try testing.expect(!top.hasReady());
+}
+
+/// The single `pre_vote_resp` `node` queued since `from`.
+fn lastPreVoteResp(node: *const Node, from: usize) !message.VoteResp {
+    try testing.expectEqual(from + 1, node.msgs.items.len);
+    return node.msgs.items[from].body.pre_vote_resp;
+}
+
+test "PreVote receiver: grants only an up-to-date log with no live leader, and never moves its term, vote or timer" {
+    const gpa = testing.allocator;
+    const ents = [_]Entry{ .{ .index = 1, .term = 1 }, .{ .index = 2, .term = 2 } };
+    var f = try Node.init(gpa, pvCfg(1), .{ .hard_state = .{ .term = 2, .voted_for = 2 }, .entries = &ents });
+    defer f.deinit();
+    try f.tick();
+    try testing.expectEqual(@as(u32, 1), f.election_elapsed);
+
+    // Up to date (same last entry), future term: granted, with the request's term.
+    var from = f.msgs.items.len;
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .pre_vote_req = .{ .term = 3, .last_log_index = 2, .last_log_term = 2 } } });
+    var r = try lastPreVoteResp(&f, from);
+    try testing.expect(r.granted);
+    try testing.expectEqual(@as(Term, 3), r.term);
+    try testing.expectEqual(@as(Term, 2), f.term); // not adopted
+    try testing.expectEqual(@as(NodeId, 2), f.voted_for); // not recorded
+    try testing.expectEqual(@as(u32, 1), f.election_elapsed); // timer not reset
+    try testing.expect(!f.hs_dirty);
+
+    // One entry short: refused, with our term.
+    from = f.msgs.items.len;
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .pre_vote_req = .{ .term = 3, .last_log_index = 1, .last_log_term = 1 } } });
+    r = try lastPreVoteResp(&f, from);
+    try testing.expect(!r.granted);
+    try testing.expectEqual(@as(Term, 2), r.term);
+    // Longer but older last term: refused (§5.4.1, term first).
+    from = f.msgs.items.len;
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .pre_vote_req = .{ .term = 3, .last_log_index = 9, .last_log_term = 1 } } });
+    try testing.expect(!(try lastPreVoteResp(&f, from)).granted);
+    // Same term as ours, and we already voted for someone else: refused.
+    from = f.msgs.items.len;
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .pre_vote_req = .{ .term = 2, .last_log_index = 2, .last_log_term = 2 } } });
+    try testing.expect(!(try lastPreVoteResp(&f, from)).granted);
+    // …but a repeat from the node we voted for is granted (etcd's canVote).
+    from = f.msgs.items.len;
+    try f.step(.{ .from = 2, .to = 1, .body = .{ .pre_vote_req = .{ .term = 2, .last_log_index = 2, .last_log_term = 2 } } });
+    try testing.expect((try lastPreVoteResp(&f, from)).granted);
+    // An older term: refused.
+    from = f.msgs.items.len;
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .pre_vote_req = .{ .term = 1, .last_log_index = 2, .last_log_term = 2 } } });
+    try testing.expect(!(try lastPreVoteResp(&f, from)).granted);
+
+    // A leader of term 2 is heard from: it is live, so an up-to-date
+    // pre-vote is refused — until a full election_ticks pass without it.
+    try f.step(.{ .from = 2, .to = 1, .body = .{ .append_req = .{ .term = 2, .prev_log_index = 2, .prev_log_term = 2, .leader_commit = 0, .entries = &.{} } } });
+    try testing.expectEqual(@as(NodeId, 2), f.leader);
+    for (0..3) |_| try f.tick(); // 3 < election_ticks (4)
+    from = f.msgs.items.len;
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .pre_vote_req = .{ .term = 3, .last_log_index = 2, .last_log_term = 2 } } });
+    try testing.expect(!(try lastPreVoteResp(&f, from)).granted);
+    try testing.expectEqual(@as(Term, 2), f.term);
+    var off = f.cfg; // a node of a cluster without pre_vote answers the same way
+    off.pre_vote = false;
+    f.cfg = off;
+    f.election_elapsed = f.cfg.election_ticks; // the leader went quiet for a full timeout
+    from = f.msgs.items.len;
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .pre_vote_req = .{ .term = 3, .last_log_index = 2, .last_log_term = 2 } } });
+    try testing.expect((try lastPreVoteResp(&f, from)).granted);
+}
+
+test "PreVote receiver: a live leader refuses a pre-vote" {
+    const gpa = testing.allocator;
+    // (A pre-vote is answered the same whatever the receiver's own `pre_vote`.)
+    var node = try testLeaderCfg(gpa, limitCfg(), 0);
+    defer node.deinit();
+    for (0..10) |_| try node.tick(); // no CheckQuorum: leadership never lapses
+    const from = node.msgs.items.len;
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .pre_vote_req = .{ .term = node.term + 1, .last_log_index = 99, .last_log_term = node.term } } });
+    const r = node.msgs.items[node.msgs.items.len - 1].body.pre_vote_resp;
+    try testing.expect(node.msgs.items.len == from + 1);
+    try testing.expect(!r.granted);
+    try testing.expectEqual(Role.leader, node.role);
+}
+
+fn cqCfg() Config {
+    var c = limitCfg();
+    c.election_ticks = 4;
+    c.check_quorum = true;
+    return c;
+}
+
+test "CheckQuorum: a leader with no acks steps down at election_ticks, not one tick before" {
+    const gpa = testing.allocator;
+    var node = try testLeaderCfg(gpa, cqCfg(), 0);
+    defer node.deinit();
+    const term = node.term;
+    for (0..3) |_| try node.tick();
+    try testing.expectEqual(Role.leader, node.role);
+    try node.tick();
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expectEqual(term, node.term); // same term, nothing to persist
+    try testing.expectEqual(no_vote, node.leader);
+
+    // Off: the same silence never deposes it.
+    var plain = try testLeaderCfg(gpa, limitCfg(), 0);
+    defer plain.deinit();
+    for (0..40) |_| try plain.tick();
+    try testing.expectEqual(Role.leader, plain.role);
+}
+
+test "CheckQuorum: one ack per period keeps a 3-node leader; the activity is reset every period" {
+    const gpa = testing.allocator;
+    var node = try testLeaderCfg(gpa, cqCfg(), 0);
+    defer node.deinit();
+    const ack: Message = .{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = node.term, .success = true, .index = 1 } } };
+    for (0..5) |_| {
+        try node.step(ack); // node 1 + the leader = a majority of 3
+        for (0..4) |_| try node.tick();
+        try testing.expectEqual(Role.leader, node.role);
+    }
+    // A refusal is activity too (etcd: any MsgAppResp).
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .append_resp = .{ .term = node.term, .success = false, .index = 0 } } });
+    for (0..4) |_| try node.tick();
+    try testing.expectEqual(Role.leader, node.role);
+    // An ack from an older term is not.
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = node.term - 1, .success = true, .index = 1 } } });
+    // A period with no ack: the previous period's activity does not carry over.
+    for (0..3) |_| try node.tick();
+    try testing.expectEqual(Role.leader, node.role);
+    try node.tick();
+    try testing.expectEqual(Role.follower, node.role);
+}
+
+test "CheckQuorum lease: inside it a higher-term RequestVote or PreVote is ignored outright; after it, it is answered" {
+    const gpa = testing.allocator;
+    for ([_]bool{ true, false }) |cq| {
+        var cfg = limitCfg();
+        cfg.id = 1;
+        cfg.election_ticks = 4;
+        cfg.check_quorum = cq;
+        var f = try Node.init(gpa, cfg, .{ .hard_state = .{ .term = 2 } });
+        defer f.deinit();
+        try f.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 2, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{} } } });
+        _ = try f.ready();
+        try f.advance();
+        for (0..3) |_| try f.tick();
+        try f.step(.{ .from = 2, .to = 1, .body = .{ .vote_req = .{ .term = 7, .last_log_index = 5, .last_log_term = 2 } } });
+        if (cq) {
+            try testing.expectEqual(@as(Term, 2), f.term);
+            try testing.expectEqual(no_vote, f.voted_for);
+            try testing.expectEqual(@as(usize, 0), f.msgs.items.len); // no reply at all
+            try f.step(.{ .from = 2, .to = 1, .body = .{ .pre_vote_req = .{ .term = 7, .last_log_index = 5, .last_log_term = 2 } } });
+            try testing.expectEqual(@as(usize, 0), f.msgs.items.len);
+            // The lease ends with the election timeout: then the vote is granted.
+            f.election_elapsed = f.cfg.election_ticks;
+            try f.step(.{ .from = 2, .to = 1, .body = .{ .vote_req = .{ .term = 7, .last_log_index = 5, .last_log_term = 2 } } });
+            try testing.expectEqual(@as(Term, 7), f.term);
+            try testing.expectEqual(@as(NodeId, 2), f.voted_for);
+        } else {
+            // Without CheckQuorum (the default) Raft as before: adopted and granted.
+            try testing.expectEqual(@as(Term, 7), f.term);
+            try testing.expectEqual(@as(NodeId, 2), f.voted_for);
+        }
+    }
+    // A leader with CheckQuorum is inside its own lease.
+    var l = try testLeaderCfg(gpa, cqCfg(), 0);
+    defer l.deinit();
+    const before = l.msgs.items.len;
+    try l.step(.{ .from = 1, .to = 0, .body = .{ .vote_req = .{ .term = l.term + 5, .last_log_index = 99, .last_log_term = l.term } } });
+    try testing.expectEqual(Role.leader, l.role);
+    try testing.expectEqual(before, l.msgs.items.len);
+}
+
 test "a rejection's hint skips the follower's gap in one round trip, but never below its match" {
     const gpa = testing.allocator;
     var node = try testLeader(gpa, 19);
@@ -1761,4 +2157,94 @@ test "init refuses an inconsistent config or restore" {
     try testing.expectError(error.InvalidRestore, Node.init(gpa, .{ .id = 0, .cluster_size = 3, .seed = 0 }, .{ .hard_state = .{ .term = 1, .voted_for = 5 } }));
     // More applied than there are entries to have applied.
     try testing.expectError(error.InvalidRestore, Node.init(gpa, .{ .id = 0, .cluster_size = 3, .seed = 0 }, .{ .hard_state = .{ .term = 1 }, .applied = 1 }));
+}
+
+// ── PreVote / CheckQuorum: the bookkeeping the delta mutation run found unpinned ──
+
+test "CheckQuorum: the stepping-down tick sends no AppendEntries" {
+    const gpa = testing.allocator;
+    var node = try testLeaderCfg(gpa, cqCfg(), 0);
+    defer node.deinit();
+    for (0..3) |_| try node.tick();
+    const from = node.msgs.items.len;
+    try node.tick();
+    try testing.expectEqual(Role.follower, node.role);
+    try testing.expectEqual(@as(usize, 0), countTag(&node, from, .append_req));
+}
+
+test "CheckQuorum: a re-elected leader's first check counts only this term's acks, a full election_ticks after winning" {
+    const gpa = testing.allocator;
+    var node = try testLeaderCfg(gpa, cqCfg(), 0);
+    defer node.deinit();
+    // Node 1 acked in the first leadership…
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .append_resp = .{ .term = node.term, .success = true, .index = 1 } } });
+    // …which ends; node 0 becomes a candidate and ticks twice more before winning.
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .vote_resp = .{ .term = node.term + 1, .granted = false } } });
+    while (node.role != .candidate) try node.tick();
+    for (0..2) |_| try node.tick();
+    try testing.expectEqual(Role.candidate, node.role);
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .vote_resp = .{ .term = node.term, .granted = true } } });
+    try testing.expectEqual(Role.leader, node.role);
+    // The check is election_ticks after the win, not after the candidacy began…
+    for (0..3) |_| try node.tick();
+    try testing.expectEqual(Role.leader, node.role);
+    // …and the old term's ack does not count: no ack this term, so it steps down.
+    try node.tick();
+    try testing.expectEqual(Role.follower, node.role);
+}
+
+test "PreVote: a pre-candidate forgets its leader, so it grants a peer's pre-vote at once" {
+    const gpa = testing.allocator;
+    var f = try Node.init(gpa, pvCfg(1), .{ .hard_state = .{ .term = 2 } });
+    defer f.deinit();
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 2, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{} } } });
+    try testing.expectEqual(@as(NodeId, 0), f.leader);
+    for (0..4) |_| try f.tick();
+    try testing.expectEqual(Role.pre_candidate, f.role);
+    try testing.expectEqual(no_vote, f.leader); // etcd: `r.lead = None`
+    // Its timer restarted, so the leader would count as live again were it remembered.
+    try testing.expectEqual(@as(u32, 0), f.election_elapsed);
+    const from = f.msgs.items.len;
+    try f.step(.{ .from = 2, .to = 1, .body = .{ .pre_vote_req = .{ .term = 3, .last_log_index = 0, .last_log_term = 0 } } });
+    try testing.expect((try lastPreVoteResp(&f, from)).granted);
+}
+
+test "PreVote: the next pre-campaign waits a full timeout, and starts from a fresh tally" {
+    const gpa = testing.allocator;
+    var cfg = pvCfg(0);
+    cfg.cluster_size = 5; // a majority is 3
+    var node = try Node.init(gpa, cfg, .{ .hard_state = .{ .term = 3 } });
+    defer node.deinit();
+    for (0..4) |_| try node.tick();
+    try testing.expectEqual(Role.pre_candidate, node.role);
+    // One grant: 2 of 5.
+    try node.step(.{ .from = 1, .to = 0, .body = .{ .pre_vote_resp = .{ .term = 4, .granted = true } } });
+    _ = try node.ready();
+    try node.advance();
+    for (0..3) |_| try node.tick();
+    try testing.expect(!node.hasReady()); // no new pre-campaign before the timeout
+    try node.tick();
+    try testing.expectEqual(@as(usize, 4), countTag(&node, 0, .pre_vote_req));
+    // A new round: one grant is 2 of 5 again — node 1's grant from the last
+    // round must not be counted.
+    try node.step(.{ .from = 2, .to = 0, .body = .{ .pre_vote_resp = .{ .term = 4, .granted = true } } });
+    try testing.expectEqual(Role.pre_candidate, node.role);
+    try testing.expectEqual(@as(Term, 3), node.term);
+}
+
+test "PreVote receiver: same term with a known (lapsed) leader, or an older term from its own candidate, is refused" {
+    const gpa = testing.allocator;
+    var f = try Node.init(gpa, pvCfg(1), .{ .hard_state = .{ .term = 2 } });
+    defer f.deinit();
+    try f.step(.{ .from = 0, .to = 1, .body = .{ .append_req = .{ .term = 2, .prev_log_index = 0, .prev_log_term = 0, .leader_commit = 0, .entries = &.{} } } });
+    f.election_elapsed = f.cfg.election_ticks; // not live any more, but still known
+    var from = f.msgs.items.len;
+    try f.step(.{ .from = 2, .to = 1, .body = .{ .pre_vote_req = .{ .term = 2, .last_log_index = 0, .last_log_term = 0 } } });
+    try testing.expect(!(try lastPreVoteResp(&f, from)).granted); // etcd's canVote: r.lead != None
+
+    var g = try Node.init(gpa, pvCfg(1), .{ .hard_state = .{ .term = 2, .voted_for = 2 } });
+    defer g.deinit();
+    from = g.msgs.items.len;
+    try g.step(.{ .from = 2, .to = 1, .body = .{ .pre_vote_req = .{ .term = 1, .last_log_index = 0, .last_log_term = 0 } } });
+    try testing.expect(!(try lastPreVoteResp(&g, from)).granted);
 }

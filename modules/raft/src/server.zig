@@ -95,6 +95,10 @@ pub const RaftConfig = struct {
     /// and the per-follower in-flight window.
     max_append_bytes: u32 = 1 << 20,
     max_inflight_msgs: u32 = 512,
+    /// Passed to every node: PreVote and CheckQuorum (both off by default,
+    /// as in `node.Config`).
+    pre_vote: bool = false,
+    check_quorum: bool = false,
 };
 
 /// The command a leader proposes when its next entry will be `index` while
@@ -258,6 +262,8 @@ pub const RaftServer = struct {
             .max_append_entries = types.max_entries_per_msg,
             .max_append_bytes = self.cfg.max_append_bytes,
             .max_inflight_msgs = self.cfg.max_inflight_msgs,
+            .pre_vote = self.cfg.pre_vote,
+            .check_quorum = self.cfg.check_quorum,
             .seed = i,
         };
     }
@@ -1206,4 +1212,119 @@ test "real: a 100-seed fuzzed fault sweep with a hostile peer, a 1 KiB cap and a
         }
         try testing.expectEqual(hp.received, srv.malformedDropped());
     }
+}
+
+// ── PreVote and CheckQuorum in the model-check (SPEC Backlog 7) ─────────────
+
+/// Node 4 alone on the minority side (the rejoining node).
+const CUT4 = [_]NodeId{4};
+/// Node 0 alone (the first leader, cut away from its followers).
+const CUT0_LEADER = [_]NodeId{0};
+
+fn maxTerm(srv: *RaftServer) Term {
+    var t: Term = 0;
+    for (0..CLUSTER_N) |i| t = @max(t, srv.node(@intCast(i)).term);
+    return t;
+}
+
+test "real: a partitioned node rejoining deposes the healthy leader without PreVote, and does not with it" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Quiet network, seed 7: node 0 wins term 1 at ~t=100 (see the liveness
+    // test). Node 4 is cut away for 1000 time units — six of its election
+    // timeouts — and then rejoins.
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 400, .kind = .{ .partition = .{ .id = 1, .cut = &CUT4 } } },
+        .{ .time = 1400, .kind = .{ .heal = .{ .id = 1 } } },
+    };
+    const Want = struct { pre_vote: bool, check_quorum: bool, disrupted: bool };
+    for ([_]Want{
+        .{ .pre_vote = false, .check_quorum = false, .disrupted = true },
+        .{ .pre_vote = true, .check_quorum = false, .disrupted = false },
+        .{ .pre_vote = true, .check_quorum = true, .disrupted = false },
+    }) |w| {
+        var cfg = DEFAULT_CFG;
+        cfg.pre_vote = w.pre_vote;
+        cfg.check_quorum = w.check_quorum;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        const case = netsim.Case{ .seed = 7, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+        const r = try netsim.replay(gpa, case, &trace, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+        if (w.disrupted) {
+            // Without PreVote node 4 campaigned in its minority, so it comes
+            // back with a higher term, and the cluster had to adopt it: the
+            // term-1 leader was deposed.
+            try testing.expect(maxTerm(&srv) > 1);
+            try testing.expect(srv.node(0).term > 1);
+        } else {
+            // With PreVote node 4 never left term 1 (nobody answered its
+            // pre-votes), so the healthy leader kept its term and its seat.
+            try testing.expectEqual(@as(Term, 1), maxTerm(&srv));
+            try testing.expectEqual(Role.leader, srv.node(0).role);
+        }
+        // Either way node 4 caught up, and the cluster kept committing.
+        var l: ?NodeId = null;
+        for (0..CLUSTER_N) |i| {
+            if (srv.node(@intCast(i)).role == .leader) l = @intCast(i);
+        }
+        const leader = l orelse return error.NoLeader;
+        try testing.expect(srv.node(4).lastIndex() + types.max_entries_per_msg >= srv.node(leader).lastIndex());
+        try testing.expect(srv.applied_commands.count() >= 30);
+    }
+}
+
+test "real: with CheckQuorum a leader cut into a minority steps down; without it, it stays leader" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 400, .kind = .{ .partition = .{ .id = 1, .cut = &CUT0_LEADER } } },
+    };
+    for ([_]bool{ false, true }) |cq| {
+        var cfg = DEFAULT_CFG;
+        cfg.check_quorum = cq;
+        var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+        defer srv.deinit(gpa);
+        const case = netsim.Case{ .seed = 7, .scenario = scenario, .protocol = srv.protocol(), .until = 1000 };
+        const r = try netsim.replay(gpa, case, &trace, null);
+        try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+        // Precondition: node 0 led term 1 before the cut.
+        try testing.expectEqual(@as(?NodeId, 0), srv.checker.leaders.get(1));
+        if (cq) {
+            try testing.expect(srv.node(0).role != .leader);
+        } else {
+            try testing.expectEqual(Role.leader, srv.node(0).role);
+            try testing.expectEqual(@as(Term, 1), srv.node(0).term);
+        }
+        // The majority side elected a leader of its own either way.
+        var others: usize = 0;
+        for (1..CLUSTER_N) |i| others += @intFromBool(srv.node(@intCast(i)).role == .leader);
+        try testing.expectEqual(@as(usize, 1), others);
+    }
+}
+
+test "real: PreVote + CheckQuorum uphold all five invariants across a 150-seed fuzzed fault sweep, and stay live" {
+    if (!gate.fable_core_implemented) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var cfg = DEFAULT_CFG;
+    cfg.pre_vote = true;
+    cfg.check_quorum = true;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, cfg);
+    defer srv.deinit(gpa);
+    const template = netsim.Case{ .seed = 0, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL };
+
+    const failing = try netsim.findFailing(gpa, template, .{}, 1, 150);
+    if (failing) |*f| {
+        var mf = f.*;
+        defer mf.deinit();
+        std.debug.print("raft: pre-vote/check-quorum cluster tripped {} at seed {}\n", .{ mf.err, mf.case.seed });
+        return error.HardInvariantViolated;
+    }
+    // Quiet network: one leader, elected through pre-votes, keeps committing.
+    const r = try netsim.replay(gpa, .{ .seed = 7, .scenario = scenario, .protocol = srv.protocol(), .until = UNTIL }, &.{}, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+    var leaders: usize = 0;
+    for (0..CLUSTER_N) |i| leaders += @intFromBool(srv.node(@intCast(i)).role == .leader);
+    try testing.expectEqual(@as(usize, 1), leaders);
+    try testing.expect(srv.applied_commands.count() >= 30);
 }
