@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **ADDITIVE (enum + option):** IIH authentication. `Config.auth_keys` (default empty = unchanged behaviour, golden hellos byte-identical): `rxHelloBytes` verifies TLV #10 with `isis.auth.verify` before anything else and refuses with the new `RejectReason.auth_missing` / `.auth_failed`, state untouched (RFC 5304 §2, RFC 5310 §3.5; like holo-isis and FRR). `HelloFields.auth` carries `auth_keys[0]`, and `buildHello` puts #10 first and signs. 11 tests (every algorithm, rollover, wrong key/id/type, flipped octets, malformed #10, unsigned hello cannot refresh an Up hold); delta mutation 9/9 (card 49/53). Behaviour change only for a caller that sets keys; an exhaustive `switch` on `RejectReason` must add the two members.
 - **2026-10-10** — tests: deterministic fuzz driver `ISIS_ADJ_FUZZ`: `isis-adj-rx` (sequences of hostile hellos and ticks into one adjacency; a refused or soft-rejected PDU mutates nothing, a reported transition is the state reached) and `isis-adj-handshake` (two adjacencies exchanging the module's own hellos: genuine wire reaches Up on both sides and expires to Down on silence; a damaged frame never corrupts the FSM). No source change.
 - **2026-10-05** — Mutation run: 40 of 44 killed, 4 equivalent; 4 tests added (`encode`
   buffer one octet short; `tick` before `start`/after `stop` and while hunting; shared

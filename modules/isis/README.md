@@ -30,15 +30,16 @@ IANA IS-IS TLV/sub-TLV code-point registries cross-checked against RFC 6329.
 | `tlv` | The bounds-checked TLV core: zero-copy `TlvIterator` (top-level *and* sub-TLVs), the `RawTlv` escape hatch, `findFirst`/`count`, and a caller-buffer `Builder`. |
 | `tlvs` | Typed views of the common TLVs — Area Addresses (#1), IS Neighbours LSP (#2), IS Neighbours IIH SNPAs (#6), LSP Entries (#9), Extended IS Reachability (#22, with sub-TLVs), Protocols Supported (#129), Dynamic Hostname (#137). |
 | `pdu` | The IIH (LAN + P2P), LSP, CSNP, and PSNP bodies, each with a decoder and a `Builder` that backfills the PDU-Length field. |
+| `auth` | The **Authentication TLV (#10)**: cleartext (type 1), HMAC-MD5 (RFC 5304, type 54) and RFC 5310 generic crypto (type 3, Key ID + HMAC-SHA-1/224/256/384/512). `addPlaceholder` on a builder, `sign` over the finished PDU (re-stamps an LSP's checksum), `verify` against a key set with a constant-time compare. Plain RFC 2104 keying by default, like deployed routers; `Key.strict_rfc5310` for the RFC's own key preparation. |
 | `spb` | The SPB MT-Capability (#144, in LSPs) / MT-Port-Capability (#143, in IIH) container + the **SPB Instance** (sub-TLV 1) and **SPBM Service Identifier and Unicast Address** (sub-TLV 3 — B-MAC, Base VID, per-I-SID T/R bits) sub-TLVs. |
 
 ### Modeled vs raw-only
 
 **Modeled as typed structs:** PDU types 15/16/17/18/20/24/25/26/27; TLVs #1, #2,
-#6, #9, #22, #129, #137, #143, #144; SPB sub-TLVs 1 (SPB-Inst) and 3 (SPBM-SI).
+#6, #9, #10, #22, #129, #137, #143, #144; SPB sub-TLVs 1 (SPB-Inst) and 3 (SPBM-SI).
 
 **Raw-only** (reachable verbatim through `tlv.TlvIterator` / `RawTlv`, and they
-round-trip byte-exact): every other TLV code — Padding #8, Authentication #10,
+round-trip byte-exact): every other TLV code — Padding #8,
 IP Interface Address #132, Extended IP Reachability #135, IPv6 reachability,
 MT-ISN #222, …; the SPB sub-TLVs SPB-Inst-Opaque #2, SPBV #4 (in #144) and
 SPB-MCID #4 / SPB-Digest #5 / SPB-B-VID #6 (in #143). Modeling any of them later
@@ -105,7 +106,19 @@ var b = try isis.pdu.LspBuilder.init(&buf, .{ .remaining_lifetime = 1200,
     .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 } });
 try isis.tlvs.addHostname(&b.tlvs, "node-a");
 const wire = b.finish();                            // PDU-Length backfilled
+
+// Authenticate: placeholder first, sign the finished PDU, verify on receive.
+const key: isis.auth.Key = .{ .algorithm = .hmac_sha256, .id = 1, .secret = secret };
+var h = try isis.pdu.P2pHelloBuilder.init(&buf, .{ .source_id = sid, .holding_time = 30 });
+try isis.auth.addPlaceholder(&h.tlvs, key);
+const n = h.finish().len;
+try isis.auth.sign(buf[0..n], key);                 // LSP: also re-stamps the checksum
+_ = try isis.auth.verify(rx_bytes, &.{key});        // error.AuthMissing / AuthFailed / ...
 ```
+
+Cleartext (type 1) is supported because peers still offer it, but it is not
+authentication against anyone who can read the link. Neither RFC protects
+against replay.
 
 ## Test
 
@@ -115,10 +128,13 @@ zig build test-isis
 
 Golden P2P-IIH and SPB-carrying LSP PDUs pinned byte-for-byte (builder
 reproduces them, decoder recovers every field), encode↔decode round-trips
-including the raw escape hatch, per-TLV bounds-safety unit tests, and the
-`std.testing.fuzz` target. Green in Debug and ReleaseFast; `zig fmt` clean.
+including the raw escape hatch, per-TLV bounds-safety unit tests, the
+`std.testing.fuzz` target, and 13 authentication KATs computed by an
+independent Python recipe (`tools/auth_kat.py`, `hmac`/`hashlib`). Green in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from the public specifications above; no third-party
 IS-IS implementation or dissector (frrouting, Wireshark, tcpdump) source was
-ported or studied. No NOTICE entry is required (public specs, root `NOTICE` §0). License: MIT.
+ported. The authentication behaviour was checked against holo-isis
+(`auth.rs`/`pdu.rs`, MIT) and FRR documentation and pull-request text (no FRR
+source read). No NOTICE entry is required (public specs, root `NOTICE` §0). License: MIT.
  DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from ISO/IEC 10589 and RFC 6329 and then cross-checked by dissecting them with `sharkd`. They are this module's own construction validated against a third-party dissector's verdict, not bytes taken from anyone's corpus.

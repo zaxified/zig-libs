@@ -21,6 +21,9 @@
 //!   `pdu.{computeLspChecksum, checkLspChecksum, stampLspChecksum}` for ISO
 //!   10589 §7.3.11. The codec still *carries* the field verbatim on decode; the
 //!   §7.3.14.2 receive policy is the update process's (`isis-lsdb`).
+//! - `auth` — the Authentication TLV (#10): cleartext, HMAC-MD5 (RFC 5304)
+//!   and RFC 5310 HMAC-SHA-1/224/256/384/512 with Key ID; `addPlaceholder`,
+//!   `sign` and a constant-time `verify` over a whole PDU.
 //!
 //! ## Conventions (see SPEC.md for the rationale)
 //! - System ids are 6 octets (the default, MAC-sized id SPB uses); the typed
@@ -58,6 +61,7 @@ pub const tlvs = @import("tlvs.zig");
 pub const pdu = @import("pdu.zig");
 pub const spb = @import("spb.zig");
 pub const checksum = @import("checksum.zig");
+pub const auth = @import("auth.zig");
 
 // Convenience re-exports of the most-used surface.
 pub const PduType = header.PduType;
@@ -110,6 +114,8 @@ test {
     _ = @import("goldens.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("mutation_test.zig");
+    _ = @import("auth.zig");
+    _ = @import("auth_kat_test.zig");
 }
 
 test "meta is well-formed" {
@@ -169,6 +175,13 @@ fn within(sub: []const u8, input: []const u8) void {
 /// function on bytes, and the only question is whether it stays in bounds.
 fn driveTyped(value: []const u8, input: []const u8) void {
     var guard: usize = 0;
+
+    if (auth.parse(value)) |a| switch (a) {
+        .cleartext => |pw| within(pw, input),
+        .hmac_md5 => |d| within(d, input),
+        .crypto => |c| within(c.digest, input),
+        .other => |o| within(o.value, input),
+    } else |_| {}
 
     var areas = tlvs.AreaAddressIterator.init(value);
     while (true) {
@@ -422,6 +435,7 @@ fn driveInput(input: []const u8) !void {
         .other => return,
     };
     if (region.len != 0) DecodeMark.mark(.tlv_region);
+    try driveAuth(input);
     // The LSP checksum surface reads the SAME untrusted bytes, and
     // `isis-lsdb` calls `checkLspChecksum` on them straight off the wire.
     if (p == .lsp) {
@@ -448,6 +462,45 @@ fn driveInput(input: []const u8) !void {
         DecodeMark.mark(.flipped_not_good);
     }
     walkTlvs(region, input);
+}
+
+const fuzz_keys = [_]auth.Key{
+    .{ .algorithm = .hmac_md5, .secret = "fuzz" },
+    .{ .algorithm = .cleartext, .secret = "fuzz" },
+    .{ .algorithm = .hmac_sha256, .id = 0, .secret = "fuzz" },
+};
+
+/// The Authentication TLV surface over the same untrusted bytes: `verify`
+/// never panics, and when the PDU carries a TLV `sign` can fill, signing a
+/// copy with a key shaped like that TLV must make it verify (the oracle that
+/// ties `sign` and `verify` to the same octets).
+fn driveAuth(input: []const u8) !void {
+    _ = auth.verify(input, &fuzz_keys) catch {};
+    const loc = (auth.find(input) catch return) orelse return;
+    const key: auth.Key = switch (loc.tlv) {
+        .cleartext => |pw| .{ .algorithm = .cleartext, .secret = pw },
+        .hmac_md5 => .{ .algorithm = .hmac_md5, .secret = "fuzz" },
+        .crypto => |c| .{
+            .algorithm = switch (c.digest.len) {
+                20 => .hmac_sha1,
+                28 => .hmac_sha224,
+                32 => .hmac_sha256,
+                48 => .hmac_sha384,
+                64 => .hmac_sha512,
+                else => return,
+            },
+            .id = c.key_id,
+            .secret = "fuzz",
+        },
+        .other => return,
+    };
+    var copy: [512]u8 = undefined;
+    @memcpy(copy[0..input.len], input);
+    // A cleartext key's secret points into `input`; compare against the copy.
+    var k = key;
+    if (loc.tlv == .cleartext) k.secret = copy[loc.value_off + 1 ..][0..key.secret.len];
+    try auth.sign(copy[0..input.len], k);
+    if ((try auth.verify(copy[0..input.len], &.{k})) != 0) return error.SignedNotVerified;
 }
 
 test "corpus: every seed reaches the decoder, and the counts are pinned" {

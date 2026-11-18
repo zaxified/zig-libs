@@ -11,8 +11,15 @@ adjacency, tear it down.
 Status: **gap** — first increment. Implements the P2P three-way FSM + the
 hold/hello timing + TLV 240 (the RFC 5303 Three-Way Adjacency TLV, which `isis`
 does not model typed). LAN adjacency (the DIS election is the sibling
-`isis-dis`), authentication, graceful-restart, and area-address matching on
-L1/L2 circuits are deliberately deferred — see `SPEC.md`.
+`isis-dis`), graceful-restart, and area-address matching on L1/L2 circuits
+are deliberately deferred — see `SPEC.md`.
+
+**Authentication** (TLV #10, RFC 5304 HMAC-MD5, RFC 5310 HMAC-SHA family,
+cleartext): set `Config.auth_keys` and `rxHelloBytes` refuses an IIH without
+#10 (`rejected = .auth_missing`) or one that verifies against none of the keys
+(`.auth_failed`) before it touches the FSM; `buildHello` signs with
+`auth_keys[0]`. Empty (the default) checks and adds nothing. The keys are
+borrowed and caller-wiped (`isis.auth.Key`).
 
 Model after: **ISO/IEC 10589 §8.2** (the P2P adjacency lifecycle) and
 **RFC 5303** (Three-Way Handshake for IS-IS Point-to-Point Adjacencies).

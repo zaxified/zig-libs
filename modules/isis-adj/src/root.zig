@@ -498,4 +498,5 @@ test {
     _ = @import("three_way.zig");
     _ = @import("fsm.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("auth_test.zig");
 }
