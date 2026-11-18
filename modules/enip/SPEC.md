@@ -717,14 +717,10 @@ src/root.zig.
 
 **Fix found by the audit.** `Client.sendConnectedCip` advanced the connection's sequence count before it knew the envelope fitted: a request of 245 to 446 octets passed the 64-octet guard, consumed a count, and then failed `BufferTooSmall`. The count is now committed only after the whole frame is built (CIP Vol 2: the sequence count is per transmitted data packet).
 
+**Reply matching, decided 2026-11-18 (no change).** The whole-module mutation found that `Client.sendConnectedCip` does not compare the reply's connected-address item id with the connection's `t_to_o_id`, and `Client.sendCip` does not check that the reply service is the request's service | 0x80. Surveyed what the references do (docs and source read for behaviour only): pycomm3 (the reference client, MIT) parses the reply's service and status from fixed offsets and compares neither the service with the request's nor the connected-address id (`packets/ethernetip.py`, `SendRRDataResponsePacket`/`SendUnitDataResponsePacket`); EIPScanner (MIT) `MessageRouter::sendRequest` / `MessageRouterResponse::expand` read the reply service into the response without comparing it, and read no connection id on the explicit path; libplctag (MPL-2.0, source read for behaviour only) checks the reply service, but only inside each typed tag handler (read/write/RMW expect their own service | 0x80), and logs the connected-address id without comparing it (a request is tied to its reply by the sender context and the connection sequence count). cpppo is copyleft: not read. So: the connection id is compared by none of them and the service by one of three, hence no majority for either check; this client already ties a connected reply to its request by the CPF sequence count (`SequenceMismatch`) and every reply by the session handle (`SessionMismatch`) and the strict one-request-one-reply stream order, so the remaining stray-reply window is the same as the references'. Both checks were left out on purpose, and a check on `sendCip` would also have to special-case `Unconnected_Send`, whose success reply carries the *embedded* service. Revisit only if a consumer shows a target that answers out of order.
+
 ## Backlog / deferred
 
-- **Reply matching gaps** *(found 2026-11-18 by the whole-module mutation, not changed)*:
-  `Client.sendConnectedCip` does not compare the reply's connected-address item id with the
-  connection's `t_to_o_id`, and `Client.sendCip` does not check that the reply service is the
-  request's service with the reply bit set (CIP Vol 1: reply service = request | 0x80). A stray or
-  late reply from another connection / request would be taken as this one's. Decide against the
-  reference (and ODVA) whether to refuse such replies; each needs a test with a mismatching reply.
 - **`Timeout.fromMilliseconds(0)` returns null** (no deadline) — pinned by a test; confirm that a
   zero timeout should mean "no timeout" rather than "poll once".
 
