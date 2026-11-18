@@ -6,7 +6,7 @@
 
 **Scope:** mvp — etcd-io/raft v3.7.0 (surveyed 2026-09-30; poc -> mvp 2026-10-04 after `Node` landed)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-18 (124/126, 2 eq) · src b99a7e14a44c357c
+**Audit:** review 2026-10-04 · mutation 2026-11-18 (163/165, 2 eq) · src 98ffa870f4938061
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RAFT_FUZZ) · ct n/a — consensus, no crypto (keyword review, 2026-10-07)
 
@@ -564,6 +564,22 @@ time units (PreVote + CheckQuorum, ≥ 200 transfers) keeps all five
 invariants. raft-kv gained no command (a client-facing transfer needs a new
 client op and CLI verb — not trivial); its `propose` switch handles
 `error.ProposalDropped`.
+
+Delta mutation 2026-11-18 (schemata, ReleaseSafe, the new non-test code in
+`node.zig` and `message.zig` only): 39 mutants, one per guard × class — the
+leader's period counter (skip, `>=` vs `>`, the reset) and the transfer
+deadline, the ordinary election's flag, `propose`'s refusal,
+`transferLeadership`'s target bound (dropped, `>` vs `>=`), leader check,
+same-target no-op, previous-transfer clear, self-target cancel, the deadline
+reset, the transferee set and the caught-up test (never / always),
+`campaign`'s flag, `onTimeoutNow`'s flag, term adoption, stale-term and role
+filters, `sendTimeoutNow`'s term, the `becomeLeader` and `becomeFollower`
+clears, the lease bypass (always / never), the ack-side `progressed`,
+transferee and caught-up conjuncts; on the wire `encodedLen`'s flag, the
+encoder's pre-vote and flag clauses and flag byte, the `timeout_now` term
+write, the decoder's tag, length and flag-byte tests, `timeout_now`'s length
+check and its term-0 refusal. First run 39/39 killed (no survivor, no
+equivalent). Added to the card's counts (cumulative: 124/126 + 39/39).
 
 ## The positive control
 
