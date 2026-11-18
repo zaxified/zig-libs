@@ -1289,6 +1289,196 @@ test "encode limits: oversized name and attr are rejected" {
     try testing.expect(out.items.len == 0); // nothing partial appended
 }
 
+test "whole-module mutation: the encode limits are inclusive (one byte below the cap is accepted)" {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    // A name of exactly 65535 octets fits the u16 namelen.
+    const name = try gpa.alloc(u8, std.math.maxInt(u16));
+    defer gpa.free(name);
+    @memset(name, 'n');
+    try appendString(gpa, &out, name, "v");
+    try testing.expectEqual(@as(usize, 0), out.items.len % 4);
+    out.clearRetainingCapacity();
+
+    const big = try std.heap.page_allocator.alloc(u8, LEN_MASK);
+    defer std.heap.page_allocator.free(big);
+    // total == LEN_MASK is the largest attr the 24-bit length can carry.
+    try appendAttr(gpa, &out, ATTR.DATA, big[0 .. LEN_MASK - attr_header_len]);
+    try testing.expectEqual(@as(u32, 0x07000000 | LEN_MASK), std.mem.readInt(u32, out.items[0..4], .big));
+    out.clearRetainingCapacity();
+    try appendAttrString(gpa, &out, ATTR.OBJPATH, big[0 .. LEN_MASK - attr_header_len - 1]);
+    try testing.expectEqual(@as(u32, 0x02000000 | LEN_MASK), std.mem.readInt(u32, out.items[0..4], .big));
+    out.clearRetainingCapacity();
+    // the field header counts attr header 4 + blobmsg header 4 (empty name) + value.
+    try appendField(gpa, &out, BM.TABLE, "", big[0 .. LEN_MASK - 8]);
+    try testing.expectEqual(@as(u32, 0x80000000 | (BM.TABLE << 24) | LEN_MASK), std.mem.readInt(u32, out.items[0..4], .big));
+    out.clearRetainingCapacity();
+    const msg = try encodeMessage(gpa, MSG.DATA, 1, 2, big[0 .. LEN_MASK - attr_header_len]);
+    defer gpa.free(msg);
+    try testing.expectEqual(@as(usize, msghdr_len + LEN_MASK), msg.len);
+}
+
+test "whole-module mutation: idLen packs the largest id and length; parseMsgHeader reads every field" {
+    try testing.expectEqual(@as(u32, 0x7f000000 | LEN_MASK), idLen(127, false, LEN_MASK));
+    try testing.expectEqual(@as(u32, 0xffff_ffff), idLen(127, true, LEN_MASK));
+    // The version byte is reported as received (the caller decides what to do with it).
+    const h = parseMsgHeader(&.{ 1, MSG.INVOKE, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04 });
+    try testing.expectEqual(@as(u8, 1), h.version);
+    try testing.expectEqual(MSG.INVOKE, h.type);
+    try testing.expectEqual(@as(u16, 0x1234), h.seq);
+    try testing.expectEqual(@as(u32, 0x01020304), h.peer);
+}
+
+test "whole-module mutation: a stray byte after a valid attr is Truncated; the cursor stops at the end of a final unpadded attr" {
+    var it: AttrIterator = .{ .buf = &.{ 0x03, 0x00, 0x00, 0x04, 0x01 } };
+    _ = (try it.next()).?;
+    try testing.expectError(error.Truncated, it.next());
+    // 5-octet attr without its pad: the cursor is the buffer end, not the aligned 8.
+    it = .{ .buf = &.{ 0x03, 0x00, 0x00, 0x05, 0xaa } };
+    const a = (try it.next()).?;
+    try testing.expectEqualSlices(u8, &.{0xaa}, a.data);
+    try testing.expectEqual(@as(usize, 5), it.off);
+    try testing.expectEqual(@as(?Attr, null), try it.next());
+}
+
+test "whole-module mutation: scalar payloads too SHORT are BadLength; every non-zero INT8 is true; Field.type is the wire id" {
+    const gpa = testing.allocator;
+    const Case = struct { t: u32, len: usize };
+    const short = [_]Case{
+        .{ .t = BM.INT8, .len = 0 },
+        .{ .t = BM.INT16, .len = 1 },
+        .{ .t = BM.INT32, .len = 3 },
+        .{ .t = BM.INT64, .len = 7 },
+        .{ .t = BM.DOUBLE, .len = 7 },
+    };
+    const zeros: [8]u8 = @splat(0);
+    for (short) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try appendField(gpa, &buf, c.t, "n", zeros[0..c.len]);
+        var it = FieldIterator.init(buf.items);
+        try testing.expectError(error.BadLength, it.next());
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try appendField(gpa, &buf, BM.INT8, "a", &.{2});
+    try appendField(gpa, &buf, BM.INT8, "b", &.{0xff});
+    try appendField(gpa, &buf, BM.INT8, "c", &.{0});
+    try appendString(gpa, &buf, "d", "x");
+    try appendInt16(gpa, &buf, "e", -2);
+    try appendInt32(gpa, &buf, "f", -3);
+    try appendInt64(gpa, &buf, "g", -4);
+    try appendDouble(gpa, &buf, "h", 0.5);
+    try appendTable(gpa, &buf, "i", &.{});
+    try appendArray(gpa, &buf, "j", &.{});
+    var it = FieldIterator.init(buf.items);
+    const want = [_]u32{ BM.INT8, BM.INT8, BM.INT8, BM.STRING, BM.INT16, BM.INT32, BM.INT64, BM.DOUBLE, BM.TABLE, BM.ARRAY };
+    for (want, 0..) |t, i| {
+        const f = (try it.next()).?;
+        try testing.expectEqual(t, f.type);
+        if (i == 0 or i == 1) try testing.expect(f.value.boolean);
+        if (i == 2) try testing.expect(!f.value.boolean);
+    }
+    try testing.expectEqual(@as(?Field, null), try it.next());
+}
+
+test "whole-module mutation: DOUBLE text switches to scientific notation exactly at 1e16 and below 1e-5" {
+    const gpa = testing.allocator;
+    const Case = struct { v: f64, json: []const u8 };
+    const cases = [_]Case{
+        .{ .v = 0.0, .json = "{\"d\":0}" },
+        .{ .v = 1e16, .json = "{\"d\":1e16}" },
+        .{ .v = 9999999999999998.0, .json = "{\"d\":9999999999999998}" },
+        .{ .v = 5e16, .json = "{\"d\":5e16}" },
+        .{ .v = 1e-5, .json = "{\"d\":0.00001}" },
+        .{ .v = 5e-5, .json = "{\"d\":0.00005}" },
+        .{ .v = 9e-6, .json = "{\"d\":9e-6}" },
+        .{ .v = -1e16, .json = "{\"d\":-1e16}" },
+    };
+    for (cases) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try appendDouble(gpa, &buf, "d", c.v);
+        const json = try decodeToJsonAlloc(gpa, buf.items);
+        defer gpa.free(json);
+        try testing.expectEqualStrings(c.json, json);
+    }
+}
+
+/// `n` nested containers of one kind around one scalar, as the children of a top-level table.
+fn nestedChildren(gpa: std.mem.Allocator, kind: u32, n: usize) ![]u8 {
+    var cur: std.ArrayList(u8) = .empty;
+    errdefer cur.deinit(gpa);
+    try appendInt32(gpa, &cur, if (kind == BM.TABLE) "v" else "", 1);
+    for (0..n) |i| {
+        var outer: std.ArrayList(u8) = .empty;
+        errdefer outer.deinit(gpa);
+        // The outermost container sits in the top-level table, so it needs a name.
+        try appendField(gpa, &outer, kind, if (i == n - 1 or kind == BM.TABLE) "t" else "", cur.items);
+        cur.deinit(gpa);
+        cur = outer;
+    }
+    return cur.toOwnedSlice(gpa);
+}
+
+test "whole-module mutation: nesting of exactly max_depth containers decodes, one more is TooDeep (tables and arrays)" {
+    const gpa = testing.allocator;
+    for ([_]u32{ BM.TABLE, BM.ARRAY }) |kind| {
+        const ok = try nestedChildren(gpa, kind, max_depth);
+        defer gpa.free(ok);
+        const json = try decodeToJsonAlloc(gpa, ok);
+        gpa.free(json);
+        const deep = try nestedChildren(gpa, kind, max_depth + 1);
+        defer gpa.free(deep);
+        try testing.expectError(error.TooDeep, decodeToJsonAlloc(gpa, deep));
+    }
+}
+
+/// `{"a":` x `n` + `1` + `}` x `n`, or the same with arrays under the key.
+fn nestedJson(gpa: std.mem.Allocator, arrays: bool, n: usize) ![]u8 {
+    var s: std.ArrayList(u8) = .empty;
+    errdefer s.deinit(gpa);
+    if (arrays) {
+        try s.appendSlice(gpa, "{\"a\":");
+        for (0..n) |_| try s.append(gpa, '[');
+        try s.append(gpa, '1');
+        for (0..n) |_| try s.append(gpa, ']');
+        try s.append(gpa, '}');
+    } else {
+        for (0..n) |_| try s.appendSlice(gpa, "{\"a\":");
+        try s.append(gpa, '1');
+        for (0..n) |_| try s.append(gpa, '}');
+    }
+    return s.toOwnedSlice(gpa);
+}
+
+test "whole-module mutation: encodeArgs accepts a scalar at depth max_depth and refuses one at max_depth + 1" {
+    const gpa = testing.allocator;
+    // Objects: the args object is not a value; n objects put the scalar at depth n - 1.
+    // Arrays: n arrays under the key put the scalar at depth n.
+    const Case = struct { arrays: bool, n: usize, ok: bool };
+    const cases = [_]Case{
+        .{ .arrays = false, .n = max_depth + 1, .ok = true },
+        .{ .arrays = false, .n = max_depth + 2, .ok = false },
+        .{ .arrays = true, .n = max_depth, .ok = true },
+        .{ .arrays = true, .n = max_depth + 1, .ok = false },
+    };
+    for (cases) |c| {
+        const text = try nestedJson(gpa, c.arrays, c.n);
+        defer gpa.free(text);
+        var parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+        defer parsed.deinit();
+        if (c.ok) {
+            const body = try encodeArgs(gpa, parsed.value);
+            gpa.free(body);
+        } else {
+            try testing.expectError(error.TooDeep, encodeArgs(gpa, parsed.value));
+        }
+    }
+}
+
 // ⚠ Both harnesses below opened with `smith.bytes(&raw)` followed by
 // `smith.valueRangeAtMost(u16, 0, raw.len)`. `bytes` copies `min(raw.len,
 // in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
