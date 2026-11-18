@@ -601,6 +601,53 @@ test "a peer that sends one octet and stops also hits the read timeout" {
     if (elapsed > 2000) return error.ReadTimeoutNotEnforcedMidFrame;
 }
 
+/// A peer that sends `bytes` once, then stays silent; the read must fail.
+fn expectReadFailsOn(bytes: []const u8) !void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+    try fixture.tt.setReadTimeout(300);
+    _ = std.os.linux.write(fixture.peer.socket.handle, bytes.ptr, bytes.len);
+    var buf: [apci.max_apdu_len]u8 = undefined;
+    try testing.expectError(error.ReadFailed, readOnce(&fixture.tt, &buf));
+}
+
+test "a malformed header is refused, not read on" {
+    // Wrong start octet, with a complete-looking body behind it.
+    try expectReadFailsOn(&[_]u8{ 0x00, 0x04, 1, 2, 3, 4 });
+    // Length below the four control octets, then enough octets to be read as a frame.
+    try expectReadFailsOn(&[_]u8{ 0x68, 0x02, 0, 0 });
+    // Length above 253, followed by the 254 octets it promises.
+    var big: [256]u8 = @splat(0);
+    big[0] = 0x68;
+    big[1] = 0xFE;
+    try expectReadFailsOn(&big);
+}
+
+test "an idle link reads as zero, a small buffer and a closed peer are told apart" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+
+    try fixture.tt.setReadTimeout(100);
+    var buf: [apci.max_apdu_len]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try readOnce(&fixture.tt, &buf));
+    var small: [10]u8 = undefined;
+    try testing.expectError(error.ReadFailed, readOnce(&fixture.tt, &small));
+
+    // A clean close before the first octet is the end of the stream, not a failure.
+    fixture.peer.close(io);
+    try testing.expectError(error.EndOfStream, readOnce(&fixture.tt, &buf));
+    fixture.tt.close();
+}
+
 fn monoMs() u64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);

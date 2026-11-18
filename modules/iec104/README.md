@@ -50,7 +50,7 @@ doubles as a fleet-simulation target.
   one address per object, `SQ = 1` is one address followed by bare elements at
   consecutive addresses — and both are encoded and decoded. Type ids modelled:
   monitoring 1–16, 20, 21, 30–37; control 45–51 and 58–64; system 70 and
-  100–107; parameter 110–113 (recognised, elements passed through).
+  100–107; parameter 110–113 (recognised, qualifiers passed through as raw octets).
 - **Address sizing is per system, not per standard.** The information-object
   address (1–3 octets), the common address (1–2) and the originator octet are
   explicit `Params`, never baked-in constants. `default_params` is the

@@ -314,8 +314,11 @@ pub const ElementKind = enum {
     coi,
     /// Fixed test bit pattern / test sequence counter, two octets.
     fbp,
-    /// Parameter element: value(2 or 4) + QPM — recognised but not modelled.
+    /// Parameter element of `P_ME_NA_1`/`P_ME_NB_1`: value(2) + QPM — the
+    /// value is passed through as raw octets.
     parameter,
+    /// Parameter element of `P_ME_NC_1`: R32 short float(4) + QPM(1).
+    parameter_float,
 };
 
 /// Which time tag, if any, a type appends to its base element.
@@ -348,7 +351,7 @@ pub const Shape = struct {
             .step, .normalized_no_quality, .fbp => 2,
             .normalized, .scaled, .setpoint_normalized, .setpoint_scaled => 3,
             .bitstring_command => 4,
-            .bitstring, .short_float, .counter, .setpoint_float, .packed_single => 5,
+            .bitstring, .short_float, .counter, .setpoint_float, .packed_single, .parameter_float => 5,
             .parameter => 3,
         };
         return base + self.time.size();
@@ -411,7 +414,8 @@ pub fn shapeOf(t: TypeId) ?Shape {
         .c_ts_ta_1 => .{ .base = .fbp, .time = .cp56 },
         .c_rp_na_1 => .{ .base = .qrp, .time = .none },
         .c_cd_na_1 => .{ .base = .empty, .time = .cp16 },
-        .p_me_na_1, .p_me_nb_1, .p_me_nc_1 => .{ .base = .parameter, .time = .none },
+        .p_me_na_1, .p_me_nb_1 => .{ .base = .parameter, .time = .none },
+        .p_me_nc_1 => .{ .base = .parameter_float, .time = .none },
         .p_ac_na_1 => .{ .base = .qrp, .time = .none }, // QPA, same width
         else => null,
     };
@@ -452,6 +456,7 @@ pub const Element = union(ElementKind) {
     coi: info.Coi,
     fbp: u16,
     parameter: struct { raw: [2]u8, qpm: u8 },
+    parameter_float: struct { value: f32, qpm: u8 },
 
     /// The select/execute bit, for the command elements that carry one.
     /// Null for anything that is not a command.
@@ -707,6 +712,7 @@ pub fn decodeElement(kind: ElementKind, bytes: []const u8) Error!Element {
         .coi => .{ .coi = info.Coi.fromByte(bytes[0]) },
         .fbp => .{ .fbp = info.readU16(bytes[0..2]) },
         .parameter => .{ .parameter = .{ .raw = .{ bytes[0], bytes[1] }, .qpm = bytes[2] } },
+        .parameter_float => .{ .parameter_float = .{ .value = info.readF32(bytes[0..4]), .qpm = bytes[4] } },
     };
 }
 
@@ -770,6 +776,10 @@ pub fn encodeElement(element: Element, out: []u8) Error!usize {
             out[0] = v.raw[0];
             out[1] = v.raw[1];
             out[2] = v.qpm;
+        },
+        .parameter_float => |v| {
+            info.writeF32(out[0..4], v.value);
+            out[4] = v.qpm;
         },
     }
     return need;
@@ -1249,7 +1259,8 @@ test "normalized_no_quality and bitstring_command encode/decode against literal 
 }
 
 test "the parameter-loading types (P_ME/P_AC) round-trip too" {
-    // p_me_na_1/nb_1/nc_1 (-> .parameter, 3 octets) and p_ac_na_1 (-> .qrp,
+    // p_me_na_1/nb_1 (-> .parameter, 3 octets), p_me_nc_1 (-> .parameter_float,
+    // 5 octets: R32 + QPM) and p_ac_na_1 (-> .qrp,
     // "same width" per its comment) are the only four `shapeOf` rows neither
     // of the two tables above touches — "recognised, elements not modelled"
     // in the TypeId doc comment does not mean the codec path is untested,
@@ -1257,7 +1268,7 @@ test "the parameter-loading types (P_ME/P_AC) round-trip too" {
     // `.parameter` element or a P_AC_NA_1 ASDU.
     var buf: [64]u8 = undefined;
 
-    for ([_]TypeId{ .p_me_na_1, .p_me_nb_1, .p_me_nc_1 }) |t| {
+    for ([_]TypeId{ .p_me_na_1, .p_me_nb_1 }) |t| {
         try testing.expectEqual(@as(usize, 3), elementSize(t).?);
         const e: Element = .{ .parameter = .{ .raw = .{ 0xAB, 0xCD }, .qpm = 0x42 } };
         const enc = try buildSingle(&buf, default_params, t, .{ .cot = .activation }, 47, 9, e, .none);
@@ -1267,6 +1278,13 @@ test "the parameter-loading types (P_ME/P_AC) round-trip too" {
         try testing.expectEqual(@as(u32, 9), o.ioa);
         try testing.expectEqual(e, o.element);
     }
+
+    try testing.expectEqual(@as(usize, 5), elementSize(.p_me_nc_1).?);
+    const ef: Element = .{ .parameter_float = .{ .value = -2.5, .qpm = 0x42 } };
+    const encf = try buildSingle(&buf, default_params, .p_me_nc_1, .{ .cot = .activation }, 47, 9, ef, .none);
+    const decf = try decode(encf, default_params);
+    var itf = decf.objects();
+    try testing.expectEqual(ef, (try itf.next()).?.element);
 
     try testing.expectEqual(@as(usize, 1), elementSize(.p_ac_na_1).?);
     const e = Element{ .qrp = .general_reset };
