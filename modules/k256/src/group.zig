@@ -399,7 +399,10 @@ pub const Secp256k1 = struct {
             acc = acc.dbl().dbl().dbl().dbl();
             acc = acc.add(gatherSigned(tab, mags[i], negs[i]));
         }
-        try acc.rejectIdentity();
+        // One jump, as the comb's endpoint: with the plain form LLVM split the
+        // verdict into two jumps on `-mcpu=x86_64` (ctgrind `mul` 2 in-file
+        // instead of 1, 2026-11-18); the verdict itself is the public outcome.
+        try acc.rejectIdentityOneBranch();
         return acc;
     }
 

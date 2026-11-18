@@ -6,7 +6,7 @@
 
 **Scope:** core — libsecp256k1 v0.8.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-11-14 (372/408, 36 eq) · src 564b6e1439237dca
+**Audit:** review 2026-10-08 · mutation 2026-11-18 (373/409, 36 eq) · src ffd88ca82cda1dd9
 
 *Whole-module mutation run 2026-11-14* (the 2026-10 field/comb/GLV/ecmult rewrite had changed > 20 % of the production lines): 408 mutants over field.zig, group.zig, ecmult.zig and the guards of sign.zig / ecdsa_recover.zig (394 ReleaseSafe, 14 wipe/burn mutants in a ReleaseFast stack-probe binary); 338 killed first, 34 more by 13 new tests (normalize contract, lazy-reduce carry, isZero/equivalent per limb, updateDe range, divsteps59 against the textbook rule, identity encodings, mulInto zeroing on error, IdentityElement on zero products, G recognised by exact limbs, splitToSignedHalves bounds, sign refusing r = 0 / s = 0). 36 decided without a kill: variable-time safegcd round-count/limb-shrink mutants (result-preserving; 66/69 on an exhaustive port check, not a proof), four unobservable (CT safegcd zeta margin, an `inverse` exit never reached, r = 0 needing an unknown dlog, a zero DRBG candidate), recoding equivalents (|d| <= 32 either way), redundant identity guards, wipes of buffers the burn already covers. Not mutated: comptime table builders (covered by the std/BIP340 differentials and corrupted-table controls), the no-longer-dispatched asm core, unchanged scalar.zig.
 
@@ -611,6 +611,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
   is the PUBLIC loop counter).
 - **The signed-digit recoding is branch-free** (`setcc`/`cmov`/masks, no Jcc on
   the scalar), and the conditional point negation is a masked field-negate.
+- **`mulWithTable` ends in `rejectIdentityOneBranch`** (2026-11-18): on baseline x86-64 (`-mcpu=x86_64`, the portable ctgrind lane) the plain `rejectIdentity` compiled to two jumps (`mul` 2 in-file instead of 1), as the comb's had on 2026-11-13. The verdict is the public identity outcome; native counts are unchanged.
 - **The portable field `normalize`/`sub` selects are `blackBox`-laundered** too:
   without the barrier LLVM turned the `mask = 0 − carry` field-carry select into a
   data-dependent `test/jne` — a secret-dependent branch on the secret-scalar path.
