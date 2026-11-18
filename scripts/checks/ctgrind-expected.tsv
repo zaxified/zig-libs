@@ -1297,8 +1297,8 @@ cookies	ReleaseFast	topen	1	2	a9d45c92961a35f5	c63e696876bcc630
 # SPEC.md says the soft fallback leaks the query index. A row whose colour
 # depends on the gate's CPU says nothing. ⛔ So a green `query` row is NOT a
 # claim about the default instantiation on a soft-AES target.
-pir	ReleaseFast	query	1	1	bc123de91257e28e	0dba0d89ed6fb4ab
-pir	ReleaseFast	reconstruct	1	1	0b3b9c0b14d4fedf	b6ecd96f96e9b339
+pir	ReleaseFast	query	1	1	a18d42a8600f58f9	0dba0d89ed6fb4ab
+pir	ReleaseFast	reconstruct	1	1	3002fadb4727b09e	b6ecd96f96e9b339
 # ── opaque and bip32: first harnesses, 2026-09-16 (A1 opaque M5, bip32 M6) ──
 # First pinned 2026-09-15. Each target taints ONE party's secrets, and the
 # other party runs untainted first, so nothing public on the wire counts as

@@ -276,7 +276,8 @@ pub fn VerifiedWith(
             var m: TagWord = std.mem.readInt(TagWord, mac_rand, .little);
             m |= 1;
             var tag_keys: [2]TagDpf.Key = undefined;
-            TagDpf.genWithSeeds(@intCast(index), m, st0, st1, &tag_keys);
+            const tag_alpha: TagDpf.Index = @intCast(index);
+            TagDpf.genWithSeeds(&tag_alpha, &m, st0, st1, &tag_keys);
             out.* = .{
                 .shares = .{
                     .{ .value = value_shares[0], .tag = tag_keys[0] },
