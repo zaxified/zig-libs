@@ -517,3 +517,89 @@ test "corpus: every decode seed reaches the decoder, and the accepted count is p
     try testing.expectEqual(decode_seeds.len, nonempty);
     try testing.expectEqual(@as(usize, 3), accepted);
 }
+
+// ── whole-module mutation audit 2026-11-18: boundary pins ───────────────────
+
+test "TpduSize.octets: only the codes 0x07..0x0D carry a size" {
+    try testing.expectEqual(@as(usize, 0), @as(TpduSize, @fromBackingInt(0x06)).octets());
+    try testing.expectEqual(@as(usize, 128), TpduSize.b128.octets());
+    try testing.expectEqual(@as(usize, 8192), TpduSize.b8192.octets());
+    try testing.expectEqual(@as(usize, 0), @as(TpduSize, @fromBackingInt(0x0E)).octets());
+}
+
+test "decode: a CR shorter than its fixed part and an ER shorter than its own are refused" {
+    // CR with LI 5: one octet short of code + refs + class.
+    try testing.expectError(error.BadLengthIndicator, decode(&[_]u8{ 0x05, 0xE0, 0x00, 0x00, 0x00, 0x01 }));
+    // DR with LI 5 likewise.
+    try testing.expectError(error.BadLengthIndicator, decode(&[_]u8{ 0x05, 0x80, 0x00, 0x00, 0x00, 0x01 }));
+    // ER: LI 3 is short, LI 4 is the minimum.
+    try testing.expectError(error.BadLengthIndicator, decode(&[_]u8{ 0x03, 0x70, 0x00, 0x01 }));
+    const er = try decode(&[_]u8{ 0x04, 0x70, 0x00, 0x01, 0x02 });
+    try testing.expectEqual(@as(u8, 0x02), er.er.cause);
+    try testing.expectEqual(@as(usize, 0), er.er.variable_part.len);
+}
+
+test "ParamIterator: a zero-length parameter is two octets and is accepted" {
+    var it = ParamIterator{ .rest = &[_]u8{ 0xC4, 0x00 } };
+    const p = (try it.next()).?;
+    try testing.expectEqual(@as(u8, 0xC4), p.code);
+    try testing.expectEqual(@as(usize, 0), p.value.len);
+    try testing.expect((try it.next()) == null);
+    var short = ParamIterator{ .rest = &[_]u8{0xC4} };
+    try testing.expectError(error.BadParameter, short.next());
+}
+
+test "encodeConnect: LI 254 fits, 255 is refused, the buffer must hold LI + 1" {
+    const called = @as([200]u8, @splat(0x11));
+    const calling = @as([41]u8, @splat(0x22)); // 13 + 200 + 41 = 254
+    var buf: [255]u8 = undefined;
+    const out = try encodeConnect(.cr, 0, 1, .b1024, &called, &calling, &buf);
+    try testing.expectEqual(@as(usize, 255), out.len);
+    try testing.expectEqual(@as(u8, 254), out[0]);
+    const c = (try decode(out)).cr;
+    try testing.expectEqualSlices(u8, &calling, c.calling_tsap.?);
+    try testing.expectError(error.BufferTooSmall, encodeConnect(.cr, 0, 1, .b1024, &called, &calling, buf[0..254]));
+    const calling42 = @as([42]u8, @splat(0x22));
+    var big: [300]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encodeConnect(.cr, 0, 1, .b1024, &called, &calling42, &big));
+}
+
+test "encodeConnectVerbatim: LI 254 fits, 255 is refused, the buffer must hold LI + 1" {
+    const vp = [_]u8{ 0xC4, 246 } ++ @as([246]u8, @splat(0x33)); // 248 octets: LI 254
+    const c = Connect{ .code = .cc, .dst_ref = 1, .src_ref = 2, .class_option = 0, .variable_part = &vp };
+    var buf: [255]u8 = undefined;
+    const out = try encodeConnectVerbatim(c, &buf);
+    try testing.expectEqual(@as(usize, 255), out.len);
+    try testing.expectEqual(@as(u8, 254), out[0]);
+    try testing.expectError(error.BufferTooSmall, encodeConnectVerbatim(c, buf[0..254]));
+    const vp249 = [_]u8{ 0xC4, 247 } ++ @as([247]u8, @splat(0x33));
+    var c2 = c;
+    c2.variable_part = &vp249;
+    var big: [300]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encodeConnectVerbatim(c2, &big));
+}
+
+test "encodeData and encodeDisconnect: an exact buffer fits, one octet less is refused" {
+    const payload = [_]u8{ 0x01, 0x02, 0x03 };
+    var d: [6]u8 = undefined;
+    try testing.expectEqual(@as(usize, 6), (try encodeData(&payload, true, &d)).len);
+    try testing.expectError(error.BufferTooSmall, encodeData(&payload, true, d[0..5]));
+    var r: [7]u8 = undefined;
+    const dr = try encodeDisconnect(1, 2, 3, &r);
+    try testing.expectEqual(@as(u8, 3), (try decode(dr)).dr.reason);
+    try testing.expectError(error.BufferTooSmall, encodeDisconnect(1, 2, 3, r[0..6]));
+}
+
+test "Reassembler: reset, overflow and EOT each start the next SPDU from empty" {
+    var storage: [8]u8 = undefined;
+    var r = Reassembler.init(&storage);
+    try testing.expect((try r.push(.{ .number = 0, .eot = false, .payload = "ab" })) == null);
+    r.reset();
+    try testing.expectEqualStrings("cd", (try r.push(.{ .number = 0, .eot = true, .payload = "cd" })).?);
+    // After an EOT the next SPDU starts empty.
+    try testing.expectEqualStrings("ef", (try r.push(.{ .number = 0, .eot = true, .payload = "ef" })).?);
+    // An overflow drops what was gathered.
+    try testing.expect((try r.push(.{ .number = 0, .eot = false, .payload = "123456" })) == null);
+    try testing.expectError(error.ReassemblyOverflow, r.push(.{ .number = 0, .eot = false, .payload = "789" }));
+    try testing.expectEqualStrings("xy", (try r.push(.{ .number = 0, .eot = true, .payload = "xy" })).?);
+}

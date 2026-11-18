@@ -1311,3 +1311,73 @@ test "a reassembly that never completes is bounded, and the next report reclaims
     try testing.expectEqual(@as(u32, 1), a.segments);
     try testing.expect(!re.pending());
 }
+
+// ── whole-module mutation audit 2026-11-18: reassembly pins ─────────────────
+
+test "Reassembler: a later segment of another report, data set or SqNum is refused" {
+    var slots: [8]AssembledEntry = undefined;
+    var arena: [512]u8 = undefined;
+    var re = Reassembler.init(&slots, &arena);
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 9 };
+    var buf: [256]u8 = undefined;
+    var second: [256]u8 = undefined;
+    const r1 = try decodeSegment(try segmentFor(&second, 1, false, 4, &id, &.{1}, 2));
+
+    _ = try re.push(try decodeSegment(try segmentFor(&buf, 0, true, 4, &id, &.{0}, 2)));
+    var other = r1;
+    other.rpt_id = "OTHER";
+    try testing.expectError(error.SegmentMismatch, re.push(other));
+
+    _ = try re.push(try decodeSegment(try segmentFor(&buf, 0, true, 4, &id, &.{0}, 2)));
+    var ds = r1;
+    ds.dat_set = "LD/LLN0$Other";
+    try testing.expectError(error.SegmentMismatch, re.push(ds));
+
+    // The opening segment carried no SqNum; a later one that does is not it.
+    var first = try decodeSegment(try segmentFor(&buf, 0, true, 4, &id, &.{0}, 2));
+    first.sq_num = null;
+    _ = try re.push(first);
+    try testing.expectError(error.SegmentMismatch, re.push(r1));
+}
+
+test "Reassembler: the header fields come from the opening segment" {
+    var slots: [8]AssembledEntry = undefined;
+    var arena: [512]u8 = undefined;
+    var re = Reassembler.init(&slots, &arena);
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 9 };
+    var buf: [256]u8 = undefined;
+    var first = try decodeSegment(try segmentFor(&buf, 0, true, 4, &id, &.{0}, 2));
+    first.conf_rev = 77;
+    first.buf_ovfl = true;
+    first.time_of_entry = .{ .ms_since_midnight = 5, .days_since_1984 = 6 };
+    first.opt_flds.conf_revision = true;
+    _ = try re.push(first);
+    const a = (try re.push(try decodeSegment(try segmentFor(&buf, 1, false, 4, &id, &.{1}, 2)))).?;
+    try testing.expectEqual(@as(?u32, 77), a.conf_rev);
+    try testing.expectEqual(@as(?bool, true), a.buf_ovfl);
+    try testing.expectEqual(@as(u32, 5), a.time_of_entry.?.ms_since_midnight);
+    try testing.expect(a.opt_flds.conf_revision);
+}
+
+test "Reassembler: each fresh report reuses the arena; the header store is bounded" {
+    var slots: [8]AssembledEntry = undefined;
+    var arena: [64]u8 = undefined;
+    var re = Reassembler.init(&slots, &arena);
+    const id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 9 };
+    var buf: [256]u8 = undefined;
+    var k: usize = 0;
+    while (k < 40) : (k += 1) {
+        _ = (try re.push(try decodeSegment(try segmentFor(&buf, 0, false, 4, &id, &.{0}, 2)))).?;
+    }
+    var r = try decodeSegment(try segmentFor(&buf, 0, false, 4, &id, &.{0}, 2));
+    const room = 3 * 129 - r.dat_set.?.len - id.len;
+    const long: [3 * 129]u8 = @splat('R');
+    r.rpt_id = long[0..room];
+    _ = (try re.push(r)).?;
+    r.rpt_id = long[0 .. room + 1];
+    try testing.expectError(error.ReassemblyBufferTooSmall, re.push(r));
+}
+
+test "Reason.toInt places data-update at its own bit" {
+    try testing.expectEqual(@as(u64, 1) << (Reason.bit_count - 1 - 3), (Reason{ .data_update = true }).toInt());
+}

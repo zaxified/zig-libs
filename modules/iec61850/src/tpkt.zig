@@ -317,3 +317,103 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-18: boundary pins ───────────────────
+
+test "header: an empty payload is refused, the largest payload fits exactly" {
+    try testing.expectError(error.LengthTooSmall, header(0));
+    const h = try header(max_length - header_len);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x00, 0xFF, 0xFF }, &h);
+    try testing.expectError(error.PayloadTooLong, header(max_length - header_len + 1));
+}
+
+test "encode: an exact-size buffer fits, one octet less is refused" {
+    const payload = [_]u8{ 0x02, 0xF0, 0x80 };
+    var exact: [header_len + payload.len]u8 = undefined;
+    const frame = try encode(&payload, &exact);
+    try testing.expectEqual(exact.len, frame.len);
+    var short: [header_len + payload.len - 1]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encode(&payload, &short));
+}
+
+test "decode and peekLength accept the minimum length and refuse one less" {
+    const min = [_]u8{ 0x03, 0x00, 0x00, 0x05, 0x02 };
+    try testing.expectEqual(@as(usize, 5), (try decode(&min)).total_len);
+    try testing.expectEqual(@as(usize, 5), try peekLength(&min));
+    try testing.expectError(error.LengthTooSmall, peekLength(&[_]u8{ 0x03, 0x00, 0x00, 0x04 }));
+    try testing.expectError(error.ShortPacket, peekLength(&[_]u8{ 0x03, 0x00, 0x00 }));
+    // peekLength sees only the header: a long announced length is not an error.
+    try testing.expectEqual(@as(usize, 0x20), try peekLength(&[_]u8{ 0x03, 0x00, 0x00, 0x20 }));
+    try testing.expectError(error.BadVersion, peekLength(&[_]u8{ 0x04, 0x00, 0x00, 0x20 }));
+    try testing.expectError(error.ReservedNotZero, peekLength(&[_]u8{ 0x03, 0x01, 0x00, 0x20 }));
+}
+
+test "framer: a bad header is an error at once, not a wait for more octets" {
+    var storage: [256]u8 = undefined;
+    var f = Framer.init(&storage);
+    try f.feed(&[_]u8{ 0x04, 0x00, 0x00, 0x20 });
+    try testing.expectError(error.BadVersion, f.next());
+    f.reset();
+    try f.feed(&[_]u8{ 0x03, 0x07, 0x00, 0x20 });
+    try testing.expectError(error.ReservedNotZero, f.next());
+    f.reset();
+    try f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x04 });
+    try testing.expectError(error.LengthTooSmall, f.next());
+}
+
+test "framer: reset drops a partial packet, the next packet decodes cleanly" {
+    var storage: [16]u8 = undefined;
+    var f = Framer.init(&storage);
+    try f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x09, 0xAA });
+    try testing.expect((try f.next()) == null);
+    f.reset();
+    try testing.expectEqual(@as(usize, 0), f.pending());
+    try f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x07, 0x02, 0xF0, 0x80 });
+    const p = (try f.next()).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0xF0, 0x80 }, p.payload);
+    try testing.expectEqual(@as(usize, 0), f.pending());
+}
+
+test "framer: consumed octets are compacted away before the next feed" {
+    // Storage holds one packet plus three octets of the next: the rest of the
+    // second packet only fits once the first is moved out of the way.
+    var storage: [10]u8 = undefined;
+    var f = Framer.init(&storage);
+    try f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x07, 0x02, 0xF0, 0x80, 0x03, 0x00, 0x00 });
+    const a = (try f.next()).?;
+    try testing.expectEqual(@as(usize, 7), a.total_len);
+    try testing.expectEqual(@as(usize, 3), f.pending());
+    try testing.expect((try f.next()) == null);
+    try f.feed(&[_]u8{ 0x07, 0x02, 0xF0, 0x00 });
+    try testing.expectEqual(@as(usize, 7), f.pending());
+    const b = (try f.next()).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0xF0, 0x00 }, b.payload);
+    try testing.expectEqual(@as(usize, 0), f.pending());
+}
+
+test "framer: storage fills exactly, one octet more overflows" {
+    var storage: [7]u8 = undefined;
+    var f = Framer.init(&storage);
+    try f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x07, 0x02, 0xF0 });
+    try testing.expect((try f.next()) == null);
+    try testing.expectError(error.Overflow, f.feed(&[_]u8{ 0x80, 0x00 }));
+    try f.feed(&[_]u8{0x80});
+    // A packet exactly as large as the storage is accepted.
+    const p = (try f.next()).?;
+    try testing.expectEqual(@as(usize, 7), p.total_len);
+    var tiny: [6]u8 = undefined;
+    var g = Framer.init(&tiny);
+    try g.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x07 });
+    try testing.expectError(error.PayloadTooLong, g.next());
+}
+
+test "framer: reset after a consumed packet leaves nothing pending" {
+    var storage: [16]u8 = undefined;
+    var f = Framer.init(&storage);
+    try f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x07, 0x02, 0xF0, 0x80, 0x03 });
+    _ = (try f.next()).?;
+    f.reset();
+    try testing.expectEqual(@as(usize, 0), f.pending());
+    try f.feed(&[_]u8{ 0x03, 0x00, 0x00, 0x07, 0x02, 0xF0, 0x00 });
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0xF0, 0x00 }, (try f.next()).?.payload);
+}

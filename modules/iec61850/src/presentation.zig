@@ -665,3 +665,77 @@ test "corpus: every decode seed reaches the decoder, and the accepted count is p
     try testing.expectEqual(entries.len, nonempty);
     try testing.expectEqual(@as(usize, 2), accepted);
 }
+
+// ── whole-module mutation audit 2026-11-18: boundary and field pins ─────────
+
+test "ContextTable: a 16-octet abstract syntax fits, 17 is refused" {
+    var t = ContextTable{};
+    const s16: [16]u8 = @splat(0x01);
+    try t.define(1, &s16);
+    const s17: [17]u8 = @splat(0x01);
+    try testing.expectError(error.TooManyContexts, t.define(3, &s17));
+    try testing.expectEqualSlices(u8, &s16, t.abstractSyntax(1).?);
+}
+
+test "ContextTable: lookups stop at len, also on a full table" {
+    var t = ContextTable{};
+    // id 0 is never defined: the zeroed slot past len must not match it.
+    try t.define(5, &ber.oids.mms_abstract_syntax);
+    try testing.expectEqual(@as(?usize, null), t.index(0));
+    var full = ContextTable{};
+    var id: u16 = 1;
+    while (id <= max_contexts) : (id += 1) try full.define(id, &[_]u8{@intCast(id)});
+    try testing.expectError(error.TooManyContexts, full.define(99, &[_]u8{0x63}));
+    full.acceptAll();
+    try testing.expectEqual(@as(?usize, null), full.index(99));
+    try testing.expectEqual(@as(?u16, null), full.idFor(&[_]u8{0x63}));
+    try testing.expectEqual(@as(?u16, 8), full.idFor(&[_]u8{0x08}));
+}
+
+test "decodeCp reads the called selector, decodeCp of a CPA the responding selector and the results" {
+    var buf: [256]u8 = undefined;
+    const cp = try decodeCp(try encodeCp("\x05\x00", .{ .called_selector = &[_]u8{ 0x00, 0x00, 0x00, 0x09 } }, &buf));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x00, 0x00, 0x09 }, cp.called_selector.?);
+    var buf2: [256]u8 = undefined;
+    const cpa_bytes = try encodeCpa("\x05\x00", .{
+        .responding_selector = &[_]u8{ 0x00, 0x00, 0x00, 0x07 },
+        .results = &[_]Result{ .acceptance, .provider_rejection },
+    }, &buf2);
+    const cpa = try decodeCp(cpa_bytes);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x00, 0x00, 0x07 }, cpa.responding_selector.?);
+    try testing.expectEqualSlices(Result, &[_]Result{ .acceptance, .provider_rejection }, cpa.resultList());
+    // An accepted context names its transfer syntax ([1] 51 01); a rejected one does not.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, cpa_bytes, &[_]u8{ 0x81, 0x02, 0x51, 0x01 }));
+}
+
+test "decodeCp: a ninth context or result is refused, eight are accepted; a non-SEQUENCE entry is refused" {
+    var defs: [max_contexts + 1]ContextDefinition = undefined;
+    for (&defs, 0..) |*d, i| d.* = .{ .id = @intCast(2 * i + 1), .abstract_syntax = &ber.oids.mms_abstract_syntax, .transfer_syntax = &ber.oids.ber_transfer_syntax };
+    var buf: [1024]u8 = undefined;
+    const eight = try decodeCp(try encodeCp("\x05\x00", .{ .contexts = defs[0..max_contexts] }, &buf));
+    try testing.expectEqual(@as(usize, max_contexts), eight.definitions().len);
+    try testing.expectError(error.TooManyContexts, decodeCp(try encodeCp("\x05\x00", .{ .contexts = &defs }, &buf)));
+    const res9: [max_contexts + 1]Result = @splat(.acceptance);
+    const ok8 = try decodeCp(try encodeCpa("\x05\x00", .{ .results = res9[0..max_contexts] }, &buf));
+    try testing.expectEqual(@as(usize, max_contexts), ok8.resultList().len);
+    try testing.expectError(error.TooManyContexts, decodeCp(try encodeCpa("\x05\x00", .{ .results = &res9 }, &buf)));
+    // normal-mode [2] { context-list [4] { INTEGER 1 } }
+    const bad = [_]u8{ 0x31, 0x07, 0xA2, 0x05, 0xA4, 0x03, 0x02, 0x01, 0x01 };
+    try testing.expectError(error.UnexpectedTag, decodeCp(&bad));
+}
+
+test "PdvIterator: octet-aligned values are read, a non-SEQUENCE PDV list is refused" {
+    // SEQUENCE { INTEGER 3, [1] aa bb }
+    var it = PdvIterator.init(&[_]u8{ 0x30, 0x07, 0x02, 0x01, 0x03, 0x81, 0x02, 0xAA, 0xBB });
+    const p = (try it.next()).?;
+    try testing.expectEqual(@as(u16, 3), p.context_id);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB }, p.value);
+    var bad = PdvIterator.init(&[_]u8{ 0x31, 0x03, 0x02, 0x01, 0x03 });
+    try testing.expectError(error.UnexpectedTag, bad.next());
+}
+
+test "decodeCp: a non-SEQUENCE entry in the result list is refused" {
+    // normal-mode [2] { context-result-list [5] { INTEGER 1 } }
+    const bad = [_]u8{ 0x31, 0x07, 0xA2, 0x05, 0xA5, 0x03, 0x02, 0x01, 0x01 };
+    try testing.expectError(error.UnexpectedTag, decodeCp(&bad));
+}

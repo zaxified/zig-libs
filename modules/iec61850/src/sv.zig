@@ -576,3 +576,89 @@ test "corpus: every seed reaches the decoders, and the accepted counts are pinne
     try testing.expectEqual(@as(usize, 1), pdus);
     try testing.expectEqual(@as(usize, 1), frames);
 }
+
+// ── whole-module mutation audit 2026-11-18: boundary and field pins ─────────
+
+const audit_asdu = Asdu{ .sv_id = "sv1", .smp_cnt = 7, .conf_rev = 1, .seq_data = "\x00\x01", .smp_rate = 80, .smp_mod = 0 };
+
+/// `audit_asdu` emitted, with context field `skip` removed and `extra` appended.
+fn auditAsdu(skip: ?u32, extra: []const u8, out: []u8) ![]const u8 {
+    var tmp: [128]u8 = undefined;
+    var tw = ber.Writer.init(&tmp);
+    try audit_asdu.emit(&tw);
+    const outer = try ber.decode(tw.done());
+    var fields: [16]ber.Element = undefined;
+    var n: usize = 0;
+    var it = ber.Iterator.init(outer.content);
+    while (try it.next()) |e| : (n += 1) fields[n] = e;
+    var w = ber.Writer.init(out);
+    const m = w.mark();
+    try w.bytes(extra);
+    while (n > 0) {
+        n -= 1;
+        if (skip != null and fields[n].tag.number == skip.?) continue;
+        try w.bytes(fields[n].raw);
+    }
+    try w.header(outer.tag, m);
+    return w.done();
+}
+
+test "Asdu.decode: field-shape rules" {
+    var out: [128]u8 = undefined;
+    const a = try Asdu.decode(try auditAsdu(null, &.{}, &out));
+    try testing.expectEqual(@as(?u16, 0), a.smp_mod);
+    try testing.expectEqual(@as(?u16, 80), a.smp_rate);
+    try testing.expectError(error.UnexpectedTag, Asdu.decode(try auditAsdu(null, &[_]u8{ 0x02, 0x01, 0x05 }, &out)));
+    // security [12], constructed or not, is skipped.
+    _ = try Asdu.decode(try auditAsdu(null, &[_]u8{ 0xAC, 0x00 }, &out));
+    // A constructed smpMod [8] is malformed; a second one is a duplicate.
+    try testing.expectError(error.UnexpectedTag, Asdu.decode(try auditAsdu(8, &[_]u8{ 0xA8, 0x02, 0x00, 0x01 }, &out)));
+    try testing.expectError(error.DuplicateField, Asdu.decode(try auditAsdu(null, &[_]u8{ 0x88, 0x02, 0x00, 0x01 }, &out)));
+    // Fixed widths.
+    try testing.expectError(error.LengthMismatch, Asdu.decode(try auditAsdu(5, &[_]u8{ 0x85, 0x02, 0x00, 0x02 }, &out)));
+    try testing.expectError(error.LengthMismatch, Asdu.decode(try auditAsdu(6, &[_]u8{ 0x86, 0x01, 0x50 }, &out)));
+    try testing.expectError(error.LengthMismatch, Asdu.decode(try auditAsdu(8, &[_]u8{ 0x88, 0x01, 0x01 }, &out)));
+    // svID [0] and seqData [7] are mandatory.
+    try testing.expectError(error.MissingField, Asdu.decode(try auditAsdu(0, &.{}, &out)));
+    try testing.expectError(error.MissingField, Asdu.decode(try auditAsdu(7, &.{}, &out)));
+}
+
+test "SavPdu.decode: eight ASDUs are accepted, a ninth is refused" {
+    var out: [2048]u8 = undefined;
+    const nine: [max_asdus + 1]Asdu = @splat(audit_asdu);
+    const eight = try SavPdu.decode(try SavPdu.encode(nine[0..max_asdus], &out));
+    try testing.expectEqual(@as(usize, max_asdus), eight.list().len);
+    try testing.expectError(error.TooManyEntries, SavPdu.decode(try SavPdu.encode(&nine, &out)));
+}
+
+test "decodeFrame: the length checks sit exactly at their boundaries" {
+    var plain: [14]u8 = @splat(0);
+    plain[12] = 0x08;
+    try testing.expectError(error.NotGoose, decodeFrame(&plain));
+    var tagged: [20]u8 = @splat(0);
+    tagged[12] = 0x81;
+    tagged[16] = 0x08;
+    try testing.expectError(error.NotGoose, decodeFrame(&tagged));
+    try testing.expectError(error.ShortFrame, decodeFrame(tagged[0..19]));
+    // SV header with Length 8: an empty PDU is framed, Length 7 is refused.
+    var bare: [22]u8 = @splat(0);
+    bare[12] = 0x88;
+    bare[13] = 0xBA;
+    bare[17] = 0x08;
+    const f = try decodeFrame(&bare);
+    try testing.expectEqual(@as(usize, 0), f.pdu.len);
+    try testing.expectEqual(@as(usize, 22), f.total_len);
+    try testing.expectError(error.ShortFrame, decodeFrame(bare[0..21]));
+    bare[17] = 0x07;
+    try testing.expectError(error.LengthMismatch, decodeFrame(&bare));
+}
+
+test "encodeFrame: an exact buffer fits without a VLAN tag" {
+    const f = goose.Frame{ .dst = @splat(1), .src = @splat(2), .appid = 3, .pdu = &.{}, .total_len = 0 };
+    const pdu = [_]u8{ 0x60, 0x00 };
+    var exact: [14 + goose.header_len + 2]u8 = undefined;
+    const framed = try encodeFrame(f, &pdu, &exact);
+    try testing.expectEqual(exact.len, framed.len);
+    try testing.expectEqual(@as(usize, 0), (try decodeFrame(framed)).pdu.len - 2);
+    try testing.expectError(error.BufferTooSmall, encodeFrame(f, &pdu, exact[0 .. exact.len - 1]));
+}

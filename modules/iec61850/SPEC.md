@@ -881,6 +881,17 @@ at the server, an operate on an object another client holds, an `Oper` whose `ct
 the `SBOw`'s, a second operate while one is executing, a `Cancel` with nothing to cancel, an
 execution that never completes, and a state machine driven out of order.
 
+### Audit 2026-11-18 (whole-module mutation) — partial
+
+2151 schemata mutants generated over the non-test code of every source file except `goldens.zig`, `controlgoldens.zig`, `bench.zig` and `fuzz_test.zig` (one mutant per condition × class: guard drop per conjunct/disjunct, comparison boundary, skipped assignment or counter, flipped boolean return), run in risk order (decoders first) in five rounds, each mutant under the full ReleaseSafe suite before it was called a survivor. **Result: 1641 killed + 9 hung, 39 equivalent, 462 not yet closed.** The card keeps its earlier mutation entry because this run did not close the module.
+
+- **Closed (every mutant killed or argued equivalent):** `ber`, `tpkt`, `cotp`, `session`, `presentation`, `acse`, `mmsdata`, `mms`, `goose`, `sv`, `subscriber`, `acsi`, `control`, `publisher`.
+- **Partly closed:** `server` (86 open: report/log/setting-group routing, notification queue, report segment budget), `client` (39: GetNameList continuation, control helpers, read/write buffer limits), `transport` (12: the TCP adapter's cancel and short-buffer paths), `reporting` (73: buffer, integrity, segmentation, inclusion encoding), `report` (3: the `max_entries` bound and an exact arena fill).
+- **Not started:** `scl` (84), `sclwrite` (64), `logging` (68), `settinggroups` (33).
+- **Equivalent (39), each argued in the audit table:** among them the long-form tag's six-octet and add-overflow guards (subsumed by the multiply overflow), `0xFF` lengths (refused by the count check), the dead `Server.transport_up` field, deadlines cleared in states that never read them (`control.Machine`/`Point`), and `LastApplError` validation that `decode` already subsumes.
+- **No defect found.** Every survivor examined was a missing test or an equivalent. That includes the security checks: control ownership (`Point.operate`/`release`), the direct-model select refusal, the ctlNum-0 rule, the synchrocheck override, the AARQ application-context check, the per-domain lookups, association slots, client response matching and the AARE/REFUSE handling. Each is now pinned by a test. The new end-to-end test drives two associations against one server: one selects and the other's operate and cancel come back `Locked-by-other-client`, which shows the server passes the real association identity as the owner.
+- **Tests added:** 103 (457 → 560 pass, 38 skipped as before); none writes to stderr.
+
 ## Threat model
 
 IEC 61850 is **unauthenticated and unencrypted** by design, and its two halves fail differently:

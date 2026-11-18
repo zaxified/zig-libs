@@ -2774,3 +2774,122 @@ test "writing back the DatSet a client just read is a no-op, not a ConfRev bump"
     try cb.rebind(h.src.source(), "TESTLD/LLN0$Events");
     try testing.expectEqual(@as(u32, 4), cb.conf_rev);
 }
+
+// ── whole-module mutation audit 2026-11-18: ownership and write pins ────────
+
+fn auditBool(buf: []u8, v: bool) !mmsdata.Data {
+    var w = ber.Writer.init(buf);
+    try mmsdata.Emit.boolean(&w, v);
+    return mmsdata.Data.decode(w.done());
+}
+
+fn auditInt(buf: []u8, v: i64) !mmsdata.Data {
+    var w = ber.Writer.init(buf);
+    try mmsdata.Emit.integer(&w, v);
+    return mmsdata.Data.decode(w.done());
+}
+
+test "enable, disable and association loss: who owns the block afterwards" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    cb.enable(1, 0);
+    cb.enable(2, 0); // already enabled: the owner does not change
+    try testing.expectEqual(@as(?u32, 1), cb.owner);
+    cb.disable();
+    try testing.expectEqual(@as(?u32, null), cb.owner);
+
+    // Losing another association leaves the block alone.
+    cb.enable(1, 0);
+    cb.gi = true;
+    cb.associationLostBy(2, 0);
+    try testing.expect(cb.rpt_ena);
+    cb.associationLostBy(1, 0);
+    try testing.expect(!cb.rpt_ena);
+    try testing.expect(!cb.gi);
+    try testing.expectEqual(@as(?u32, null), cb.owner);
+
+    // Single-association loss clears everything on a reserved URCB.
+    var bb: [8]u8 = undefined;
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("Resv", try auditBool(&bb, true), 1, 0));
+    cb.enable(1, 0);
+    cb.gi = true;
+    cb.resv_deadline_ms = 77;
+    cb.associationLost();
+    try testing.expect(!cb.gi);
+    try testing.expect(!cb.resv);
+    try testing.expectEqual(@as(?u32, null), cb.owner);
+    try testing.expectEqual(@as(u64, 0), cb.resv_deadline_ms);
+
+    // A BRCB with ResvTms 0 is released at once when its holder goes.
+    var br = h.block(.buffered);
+    br.enable(1, 0);
+    br.resv_tms = 0;
+    br.associationLostBy(1, 0);
+    try testing.expectEqual(@as(?u32, null), br.owner);
+    try testing.expectEqual(@as(u64, 0), br.resv_deadline_ms);
+    // Enabling clears a pending timed reservation.
+    br.resv_deadline_ms = 5;
+    br.enable(1, 0);
+    try testing.expectEqual(@as(u64, 0), br.resv_deadline_ms);
+}
+
+test "writes: Resv while enabled, ResvTms 0, PurgeBuf and EntryID on the wrong kind" {
+    var h: Harness = .{};
+    try h.src.init();
+    var bb: [8]u8 = undefined;
+    var u = h.block(.unbuffered);
+    u.enable(1, 0);
+    try testing.expectEqual(WriteOutcome.denied, u.writeAttribute("Resv", try auditBool(&bb, true), 1, 0));
+    try testing.expectEqual(WriteOutcome.unknown, u.writeAttribute("PurgeBuf", try auditBool(&bb, true), 1, 0));
+    var ob: [16]u8 = undefined;
+    var ow = ber.Writer.init(&ob);
+    try mmsdata.Emit.octetString(&ow, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 });
+    try testing.expectEqual(WriteOutcome.unknown, u.writeAttribute("EntryID", try mmsdata.Data.decode(ow.done()), 1, 0));
+
+    var b = h.block(.buffered);
+    var ib: [8]u8 = undefined;
+    // ResvTms 5 then 0 while disabled: the owner goes.
+    try testing.expectEqual(WriteOutcome.ok, b.writeAttribute("ResvTms", try auditInt(&ib, 5), 1, 0));
+    try testing.expectEqual(@as(?u32, 1), b.owner);
+    b.resv_deadline_ms = 9;
+    try testing.expectEqual(WriteOutcome.ok, b.writeAttribute("ResvTms", try auditInt(&ib, 0), 1, 0));
+    try testing.expectEqual(@as(?u32, null), b.owner);
+    try testing.expectEqual(@as(u64, 0), b.resv_deadline_ms);
+    // ResvTms 0 while enabled keeps the enabling client.
+    b.enable(1, 0);
+    try testing.expectEqual(WriteOutcome.ok, b.writeAttribute("ResvTms", try auditInt(&ib, 0), 1, 0));
+    try testing.expectEqual(@as(?u32, 1), b.owner);
+    // A nine-octet EntryID is refused.
+    var ob9: [16]u8 = undefined;
+    var ow9 = ber.Writer.init(&ob9);
+    try mmsdata.Emit.octetString(&ow9, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+    try testing.expectEqual(WriteOutcome.invalid, b.writeAttribute("EntryID", try mmsdata.Data.decode(ow9.done()), 1, 0));
+}
+
+test "writes: RptID length bound, OptFlds and TrgOps take effect" {
+    var h: Harness = .{};
+    try h.src.init();
+    var cb = h.block(.unbuffered);
+    var sb: [256]u8 = undefined;
+    const s129: [max_reference_len]u8 = @splat('r');
+    var sw = ber.Writer.init(&sb);
+    try mmsdata.Emit.visibleString(&sw, &s129);
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("RptID", try mmsdata.Data.decode(sw.done()), 1, 0));
+    try testing.expectEqualStrings(&s129, cb.rptId());
+    const s130: [max_reference_len + 1]u8 = @splat('r');
+    var sw2 = ber.Writer.init(&sb);
+    try mmsdata.Emit.visibleString(&sw2, &s130);
+    try testing.expectEqual(WriteOutcome.invalid, cb.writeAttribute("RptID", try mmsdata.Data.decode(sw2.done()), 1, 0));
+
+    var bsb: [16]u8 = undefined;
+    var bw = ber.Writer.init(&bsb);
+    try mmsdata.Emit.bitString(&bw, 0, 10);
+    const zero = try mmsdata.Data.decode(bw.done());
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("OptFlds", zero, 1, 0));
+    try testing.expect(!cb.opt_flds.sequence_number);
+    var tw = ber.Writer.init(&bsb);
+    try mmsdata.Emit.bitString(&tw, 0, 6);
+    try testing.expectEqual(WriteOutcome.ok, cb.writeAttribute("TrgOps", try mmsdata.Data.decode(tw.done()), 1, 0));
+    try testing.expect(!cb.trg_ops.data_change);
+}

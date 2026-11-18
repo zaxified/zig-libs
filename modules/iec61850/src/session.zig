@@ -470,3 +470,102 @@ test "corpus: every decode seed reaches the decoder, and the accepted count is p
     try testing.expectEqual(decode_seeds.len, nonempty);
     try testing.expectEqual(@as(usize, 7), accepted);
 }
+
+// ── whole-module mutation audit 2026-11-18: boundary pins ───────────────────
+
+test "ParamIterator: a zero-length parameter and an escaped zero length are accepted" {
+    var a = ParamIterator{ .rest = &[_]u8{ 0x11, 0x00 } };
+    try testing.expectEqual(@as(usize, 0), (try a.next()).?.value.len);
+    try testing.expect((try a.next()) == null);
+    var b = ParamIterator{ .rest = &[_]u8{ 0x11, 0xFF, 0x00, 0x00 } };
+    try testing.expectEqual(@as(usize, 0), (try b.next()).?.value.len);
+    var c = ParamIterator{ .rest = &[_]u8{ 0x11, 0xFF, 0x00 } };
+    try testing.expectError(error.BadParameter, c.next());
+}
+
+test "decodeHeader: the 16-bit length escape needs four octets" {
+    try testing.expectError(error.ShortSpdu, decodeHeader(&[_]u8{ 0x0D, 0xFF, 0x00 }));
+    const h = try decodeHeader(&[_]u8{ 0x0D, 0xFF, 0x00, 0x00 });
+    try testing.expectEqual(@as(usize, 4), h.total_len);
+    try testing.expectEqual(@as(usize, 0), h.params.len);
+}
+
+test "encodeConnect carries the user requirements and both selectors" {
+    var out: [128]u8 = undefined;
+    const spdu = try encodeConnect("PP", .{
+        .session_user_requirements = 0x1234,
+        .calling_selector = &[_]u8{ 0x00, 0x07 },
+        .called_selector = &[_]u8{ 0x00, 0x09 },
+    }, &out);
+    const c = try decodeConnect(spdu);
+    try testing.expectEqual(@as(?u16, 0x1234), c.session_user_requirements);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x07 }, c.calling_selector.?);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x09 }, c.called_selector.?);
+    try testing.expectEqualStrings("PP", c.user_data);
+}
+
+test "assemble: 254 octets of user data keep the short form and round-trip" {
+    const ud: [254]u8 = @splat(0x5A);
+    var out: [600]u8 = undefined;
+    const spdu = try encodeConnect(&ud, .{}, &out);
+    const c = try decodeConnect(spdu);
+    try testing.expectEqualSlices(u8, &ud, c.user_data);
+    try testing.expectEqual(spdu.len, c.total_len);
+    // The user-data parameter header is two octets: 01 fe.
+    try testing.expectEqualSlices(u8, &[_]u8{ Pi.user_data, 254 }, spdu[spdu.len - 256 ..][0..2]);
+}
+
+test "assemble: a parameter body of exactly 254 octets keeps the two-octet SPDU header" {
+    // ABORT params are 3 octets; 3 + 2 + 249 = 254.
+    const ud: [249]u8 = @splat(0x11);
+    var out: [256]u8 = undefined;
+    const spdu = try encodeAbort(&ud, 0x0b, &out);
+    try testing.expectEqual(@as(usize, 256), spdu.len);
+    try testing.expectEqual(@as(u8, 254), spdu[1]);
+    try testing.expectError(error.BufferTooSmall, encodeAbort(&ud, 0x0b, out[0..255]));
+}
+
+test "assemble and putParam: exact buffers fit in both length forms" {
+    const short: [10]u8 = @splat(0x22);
+    var a: [2 + 3 + 2 + 10]u8 = undefined;
+    try testing.expectEqual(a.len, (try encodeAbort(&short, 1, &a)).len);
+    try testing.expectError(error.BufferTooSmall, encodeAbort(&short, 1, a[0 .. a.len - 1]));
+    const long: [300]u8 = @splat(0x33);
+    var b: [4 + 3 + 4 + 300]u8 = undefined;
+    const spdu = try encodeAbort(&long, 1, &b);
+    try testing.expectEqual(b.len, spdu.len);
+    try testing.expectError(error.BufferTooSmall, encodeAbort(&long, 1, b[0 .. b.len - 1]));
+}
+
+test "encodeConnect: selectors that overflow the parameter scratch are refused" {
+    var out: [2048]u8 = undefined;
+    const huge: [600]u8 = @splat(0x44);
+    try testing.expectError(error.BufferTooSmall, encodeConnect("x", .{ .calling_selector = &huge }, &out));
+    const long: [300]u8 = @splat(0x44);
+    const short: [254]u8 = @splat(0x55);
+    try testing.expectError(error.BufferTooSmall, encodeConnect("x", .{ .calling_selector = &long, .called_selector = &short }, &out));
+}
+
+test "data transfer: the bare prefix is an empty PDU; exact buffers fit" {
+    try testing.expectEqual(@as(usize, 0), (try decodeDataTransfer(&data_transfer_prefix)).len);
+    var out: [6]u8 = undefined;
+    try testing.expectEqual(@as(usize, 6), (try encodeDataTransfer("ab", &out)).len);
+    try testing.expectError(error.BufferTooSmall, encodeDataTransfer("ab", out[0..5]));
+}
+
+test "encodeAccept carries the user requirements and the called selector" {
+    var out: [128]u8 = undefined;
+    const spdu = try encodeAccept("PP", .{
+        .session_user_requirements = 0x0042,
+        .called_selector = &[_]u8{ 0x00, 0x05 },
+    }, &out);
+    const c = try decodeConnect(spdu);
+    try testing.expectEqual(Spdu.accept, c.spdu);
+    try testing.expectEqual(@as(?u16, 0x0042), c.session_user_requirements);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x05 }, c.called_selector.?);
+}
+
+test "assemble: a buffer shorter than the SPDU header and parameters is refused up front" {
+    var out: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encodeAbort("x", 1, &out));
+}

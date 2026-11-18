@@ -1320,3 +1320,130 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-18: boundary pins ───────────────────
+
+test "decodeTag: the largest u32 tag number decodes, one past it is refused" {
+    const t = try decodeTag(&[_]u8{ 0x1F, 0x8F, 0xFF, 0xFF, 0xFF, 0x7F });
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), t.tag.number);
+    try testing.expectEqual(@as(usize, 6), t.len);
+    try testing.expectError(error.BadTag, decodeTag(&[_]u8{ 0x1F, 0x90, 0xFF, 0xFF, 0xFF, 0x7F }));
+}
+
+test "encodeTag and encodeLength: an exact buffer fits, one octet less is refused" {
+    var one: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try encodeTag(Tag.ctx(3), &one));
+    try testing.expectError(error.BufferTooSmall, encodeTag(Tag.ctx(3), one[0..0]));
+    var three: [3]u8 = undefined; // [200] = bf 81 48
+    try testing.expectEqual(@as(usize, 3), try encodeTag(Tag.ctx(200), &three));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x9F, 0x81, 0x48 }, &three);
+    try testing.expectError(error.BufferTooSmall, encodeTag(Tag.ctx(200), three[0..2]));
+    var l3: [3]u8 = undefined;
+    try testing.expectEqual(@as(usize, 3), try encodeLength(0x1234, &l3));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x82, 0x12, 0x34 }, &l3);
+    try testing.expectError(error.BufferTooSmall, encodeLength(0x1234, l3[0..2]));
+}
+
+test "decodeDepth: a zero budget is TooDeep even for a definite element" {
+    try testing.expectError(error.TooDeep, decodeDepth(&[_]u8{ 0x04, 0x00 }, 0));
+    // Budget 1 admits the element itself but not the scan inside an
+    // indefinite one, even when that scan would end at once.
+    try testing.expectError(error.TooDeep, decodeDepth(&[_]u8{ 0x30, 0x80, 0x00, 0x00 }, 1));
+    const e = try decodeDepth(&[_]u8{ 0x30, 0x80, 0x00, 0x00 }, 2);
+    try testing.expectEqual(@as(usize, 4), e.total_len);
+}
+
+test "indefinite length: only a 00 00 pair ends the contents" {
+    // An empty OCTET STRING (04 00) and a tag-0 element (00 01 aa) both start
+    // or end with a zero octet but are not end-of-contents.
+    const a = try decode(&[_]u8{ 0x30, 0x80, 0x04, 0x00, 0x00, 0x00 });
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x04, 0x00 }, a.content);
+    try testing.expectEqual(@as(usize, 6), a.total_len);
+    const b = try decode(&[_]u8{ 0x30, 0x80, 0x00, 0x01, 0xAA, 0x00, 0x00 });
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x01, 0xAA }, b.content);
+    try testing.expectEqual(@as(usize, 7), b.total_len);
+}
+
+test "decodeInt: nine octets is the widest content accepted" {
+    // 00 80 .. : a minimal 9-octet positive value (leading zero needed).
+    const nine = [_]u8{ 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0x01 };
+    try testing.expectEqual(@as(i128, 0x80_0000_0000_0000_01), try decodeInt(i128, &nine));
+    const ten = [_]u8{ 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+    try testing.expectError(error.IntegerRange, decodeInt(i128, &ten));
+}
+
+test "encodeIntContent: an exact buffer fits, one octet less is refused" {
+    var two: [2]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), try encodeIntContent(0x1234, &two));
+    try testing.expectError(error.BufferTooSmall, encodeIntContent(0x1234, two[0..1]));
+}
+
+test "BitString: an empty body has no bits, the unused tail reads as false" {
+    const empty = BitString{ .unused = 3, .bytes = &.{} };
+    try testing.expectEqual(@as(usize, 0), empty.bitCount());
+    const b = BitString{ .unused = 1, .bytes = &[_]u8{0xFF} };
+    try testing.expectEqual(@as(usize, 7), b.bitCount());
+    try testing.expect(b.bit(6));
+    try testing.expect(!b.bit(7));
+}
+
+test "bitStringContent and Float.encode: an exact buffer fits, one octet less is refused" {
+    var two: [2]u8 = undefined;
+    const bs = try bitStringContent(0b101, 3, &two);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x05, 0xA0 }, bs);
+    try testing.expectError(error.BufferTooSmall, bitStringContent(0b101, 3, two[0..1]));
+    var f5: [5]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), (try (Float{ .single = 1.0 }).encode(&f5)).len);
+    try testing.expectError(error.BufferTooSmall, (Float{ .single = 1.0 }).encode(f5[0..4]));
+    var f9: [9]u8 = undefined;
+    try testing.expectEqual(@as(usize, 9), (try (Float{ .double = 1.0 }).encode(&f9)).len);
+    try testing.expectError(error.BufferTooSmall, (Float{ .double = 1.0 }).encode(f9[0..8]));
+}
+
+test "Float.parse: a double needs exponent width 11" {
+    const body = [_]u8{ 0x08, 0x3F, 0xF0, 0, 0, 0, 0, 0, 0 };
+    try testing.expectError(error.BadFloat, Float.parse(&body));
+    var ok = body;
+    ok[0] = 11;
+    try testing.expectEqual(@as(f64, 1.0), (try Float.parse(&ok)).value());
+}
+
+test "Oid.format: an empty OID is refused" {
+    var out: [16]u8 = undefined;
+    try testing.expectError(error.Truncated, (Oid{ .bytes = &.{} }).format(&out));
+}
+
+test "Writer: a one-octet buffer takes one byte; a refused header leaves the writer unchanged" {
+    var one: [1]u8 = undefined;
+    var w = Writer.init(&one);
+    try w.byte(0x42);
+    try testing.expectEqualSlices(u8, &[_]u8{0x42}, w.done());
+    try testing.expectError(error.BufferTooSmall, w.byte(0x43));
+
+    // Header fits exactly.
+    var three: [3]u8 = undefined;
+    var x = Writer.init(&three);
+    const m = x.mark();
+    try x.byte(0xAA);
+    try x.header(Tag.ctx(1), m);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x81, 0x01, 0xAA }, x.done());
+
+    // One octet short for tag + length: nothing of the header is written.
+    var two: [2]u8 = undefined;
+    var y = Writer.init(&two);
+    const my = y.mark();
+    try y.byte(0xAA);
+    try testing.expectError(error.BufferTooSmall, y.header(Tag.ctx(1), my));
+    try testing.expectEqual(@as(usize, 1), y.len());
+}
+
+test "Writer.unsigned: maxInt(i64) stays minimal, a u64 above it gets one leading zero" {
+    var buf: [16]u8 = undefined;
+    var w = Writer.init(&buf);
+    try w.unsigned(Tag.ctx(0), std.math.maxInt(i64));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x80, 0x08, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, w.done());
+    var buf2: [16]u8 = @splat(0xEE);
+    var v = Writer.init(&buf2);
+    try v.unsigned(Tag.ctx(0), std.math.maxInt(u64));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x80, 0x09, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, v.done());
+}

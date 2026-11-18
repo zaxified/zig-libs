@@ -779,3 +779,81 @@ test "corpus: every Data seed reaches the decoder, and the accepted count is pin
     // a corpus that decodes but never validates never reaches `members()`.
     try testing.expectEqual(@as(usize, 14), validated);
 }
+
+// ── whole-module mutation audit 2026-11-18: accessor and boundary pins ──────
+
+fn auditData(kind: Kind, content: []const u8) Data {
+    return .{ .kind = kind, .content = content, .raw = content };
+}
+
+test "validate: nesting is bounded by max_depth, and a constructed scalar member is refused" {
+    // max_depth nested structures, the innermost empty: accepted; one more is TooDeep.
+    var buf: [2 * (max_depth + 1)]u8 = undefined;
+    var i: usize = 0;
+    while (i <= max_depth) : (i += 1) {
+        buf[2 * i] = 0xA2;
+        buf[2 * i + 1] = @intCast(2 * (max_depth - i));
+    }
+    const deep = try Data.decode(&buf);
+    try testing.expectError(error.TooDeep, deep.validate());
+    const ok = try Data.decode(buf[2..]);
+    try ok.validate();
+    // structure { [5] constructed }: an integer cannot be constructed.
+    const bad = try Data.decode(&[_]u8{ 0xA2, 0x02, 0xA5, 0x00 });
+    try testing.expectError(error.WrongDataType, bad.validate());
+    var m = try bad.members();
+    try testing.expectError(error.WrongDataType, m.next());
+}
+
+test "Members.at returns the member at the index, not the first" {
+    const s = try Data.decode(&[_]u8{ 0xA2, 0x06, 0x85, 0x01, 0x07, 0x85, 0x01, 0x09 });
+    var m = try s.members();
+    try testing.expectEqual(@as(i64, 9), try (try m.at(1)).?.asInt());
+}
+
+test "accessors: each checks its kind, bcd and the string/bit aliases are accepted" {
+    try testing.expectError(error.BadForm, auditData(.boolean, &[_]u8{ 1, 1 }).boolean());
+    try testing.expectEqual(@as(i32, 7), try auditData(.bcd, &[_]u8{7}).integer(i32));
+    const int = auditData(.integer, &[_]u8{7});
+    try testing.expectError(error.WrongDataType, int.float());
+    try testing.expectError(error.WrongDataType, int.octetString());
+    try testing.expectError(error.WrongDataType, int.objId());
+    try testing.expectError(error.WrongDataType, int.utcTime());
+    try testing.expectError(error.WrongDataType, int.binaryTime());
+    try testing.expectError(error.WrongDataType, auditData(.integer, "2026111812").generalizedTime());
+    try testing.expectEqual(@as(usize, 7), (try auditData(.boolean_array, &[_]u8{ 1, 0xFE }).bitString()).bitCount());
+    try testing.expectEqualStrings("ab", try auditData(.mms_string, "ab").visibleString());
+}
+
+test "generalizedTime: ten characters is the minimum, other characters are refused" {
+    try testing.expectEqualStrings("2026111812", try auditData(.generalized_time, "2026111812").generalizedTime());
+    try testing.expectError(error.BadTime, auditData(.generalized_time, "202611181").generalizedTime());
+    try testing.expectError(error.BadTime, auditData(.generalized_time, "2026111812x").generalizedTime());
+}
+
+test "UtcTime.encode sets the leap-seconds-known bit" {
+    var out: [8]u8 = undefined;
+    var t = UtcTime.fromMillis(1000, 10);
+    t.leap_seconds_known = true;
+    t.encode(&out);
+    try testing.expectEqual(@as(u8, 0x80 | 10), out[7]);
+}
+
+test "BinaryTime: four- and six-octet forms, midnight is the exclusive bound on both sides" {
+    const four = try BinaryTime.parse(&[_]u8{ 0x00, 0x00, 0x00, 0x01 });
+    try testing.expectEqual(@as(?u16, null), four.days_since_1984);
+    var last: [4]u8 = undefined;
+    std.mem.writeInt(u32, &last, BinaryTime.ms_per_day - 1, .big);
+    _ = try BinaryTime.parse(&last);
+    std.mem.writeInt(u32, &last, BinaryTime.ms_per_day, .big);
+    try testing.expectError(error.BadTime, BinaryTime.parse(&last));
+
+    var out: [6]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), (try four.encode(&out)).len);
+    try testing.expectError(error.BufferTooSmall, four.encode(out[0..3]));
+    const six = BinaryTime{ .ms_since_midnight = BinaryTime.ms_per_day - 1, .days_since_1984 = 2 };
+    try testing.expectEqual(@as(usize, 6), (try six.encode(&out)).len);
+    try testing.expectError(error.BufferTooSmall, six.encode(out[0..5]));
+    const midnight = BinaryTime{ .ms_since_midnight = BinaryTime.ms_per_day, .days_since_1984 = null };
+    try testing.expectError(error.BadTime, midnight.encode(&out));
+}
