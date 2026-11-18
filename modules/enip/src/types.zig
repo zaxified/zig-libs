@@ -736,3 +736,177 @@ test "fuzz driver: ENIP_FUZZ (fuzzTypes)" {
 test "fuzz harness: fuzzTypes, 400 seeds, reaches every outcome" {
     try fuzzTypesMark.reach(fuzzTypes, "enip-types-types", 400);
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+
+test "element sizes: every sized type, and the types that have none" {
+    const Case = struct { t: DataType, n: ?usize };
+    const cases = [_]Case{
+        .{ .t = .bool, .n = 1 },            .{ .t = .sint, .n = 1 },                     .{ .t = .usint, .n = 1 },
+        .{ .t = .byte, .n = 1 },            .{ .t = .int, .n = 2 },                      .{ .t = .uint, .n = 2 },
+        .{ .t = .word, .n = 2 },            .{ .t = .itime, .n = 2 },                    .{ .t = .date, .n = 2 },
+        .{ .t = .dint, .n = 4 },            .{ .t = .udint, .n = 4 },                    .{ .t = .dword, .n = 4 },
+        .{ .t = .real, .n = 4 },            .{ .t = .stime, .n = 4 },                    .{ .t = .time_of_day, .n = 4 },
+        .{ .t = .ftime, .n = 4 },           .{ .t = .time, .n = 4 },                     .{ .t = .lint, .n = 8 },
+        .{ .t = .ulint, .n = 8 },           .{ .t = .lword, .n = 8 },                    .{ .t = .lreal, .n = 8 },
+        .{ .t = .ltime, .n = 8 },           .{ .t = .date_and_time, .n = null },         .{ .t = .string, .n = null },
+        .{ .t = .short_string, .n = null }, .{ .t = .string2, .n = null },               .{ .t = .stringn, .n = null },
+        .{ .t = .stringi, .n = null },      .{ .t = .epath, .n = null },                 .{ .t = .engunit, .n = null },
+        .{ .t = .structure, .n = null },    .{ .t = .abbreviated_structure, .n = null },
+    };
+    for (cases) |c| try testing.expectEqual(c.n, c.t.elementSize());
+    for ([_]DataType{ .string, .short_string, .string2, .stringn, .stringi }) |t| try testing.expect(t.isString());
+    for ([_]DataType{ .bool, .structure, .epath, .date_and_time }) |t| try testing.expect(!t.isString());
+    try testing.expect(DataType.structure.hasStructureHandle());
+    try testing.expect(DataType.abbreviated_structure.hasStructureHandle());
+    try testing.expect(!DataType.dint.hasStructureHandle());
+}
+
+test "Value.asInt and asFloat cover every integer variant and refuse what does not fit" {
+    const mx: u64 = std.math.maxInt(i64);
+    try testing.expectEqual(@as(?i64, 1), (Value{ .boolean = true }).asInt());
+    try testing.expectEqual(@as(?i64, 0), (Value{ .boolean = false }).asInt());
+    try testing.expectEqual(@as(?i64, -5), (Value{ .sint = -5 }).asInt());
+    try testing.expectEqual(@as(?i64, -300), (Value{ .int = -300 }).asInt());
+    try testing.expectEqual(@as(?i64, -70000), (Value{ .dint = -70000 }).asInt());
+    try testing.expectEqual(@as(?i64, -5_000_000_000), (Value{ .lint = -5_000_000_000 }).asInt());
+    try testing.expectEqual(@as(?i64, 200), (Value{ .usint = 200 }).asInt());
+    try testing.expectEqual(@as(?i64, 60000), (Value{ .uint = 60000 }).asInt());
+    try testing.expectEqual(@as(?i64, 4_000_000_000), (Value{ .udint = 4_000_000_000 }).asInt());
+    try testing.expectEqual(@as(?i64, @intCast(mx)), (Value{ .ulint = mx }).asInt());
+    try testing.expectEqual(@as(?i64, null), (Value{ .ulint = mx + 1 }).asInt());
+    try testing.expectEqual(@as(?i64, 7), (Value{ .byte = 7 }).asInt());
+    try testing.expectEqual(@as(?i64, 9), (Value{ .word = 9 }).asInt());
+    try testing.expectEqual(@as(?i64, 11), (Value{ .dword = 11 }).asInt());
+    try testing.expectEqual(@as(?i64, @intCast(mx)), (Value{ .lword = mx }).asInt());
+    try testing.expectEqual(@as(?i64, null), (Value{ .lword = mx + 1 }).asInt());
+    try testing.expectEqual(@as(?i64, null), (Value{ .string = "x" }).asInt());
+    try testing.expectEqual(@as(?f64, 2.5), (Value{ .lreal = 2.5 }).asFloat());
+    try testing.expectEqual(@as(?f64, 1.5), (Value{ .real = 1.5 }).asFloat());
+    try testing.expectEqual(@as(?f64, 3.0), (Value{ .int = 3 }).asFloat());
+    try testing.expectEqual(@as(?f64, null), (Value{ .raw = "x" }).asFloat());
+}
+
+test "multi-octet values decode little-endian, one type at a time" {
+    try testing.expectEqual(true, (try decodeValue(.bool, &.{1})).boolean);
+    try testing.expectEqual(false, (try decodeValue(.bool, &.{0})).boolean);
+    try testing.expectEqual(@as(u16, 0x1234), (try decodeValue(.uint, &.{ 0x34, 0x12 })).uint);
+    try testing.expectEqual(@as(u16, 0x1234), (try decodeValue(.date, &.{ 0x34, 0x12 })).uint);
+    try testing.expectEqual(@as(u16, 0x1234), (try decodeValue(.word, &.{ 0x34, 0x12 })).word);
+    try testing.expectEqual(@as(i16, 0x1234), (try decodeValue(.itime, &.{ 0x34, 0x12 })).int);
+    try testing.expectEqual(@as(u32, 0x01020304), (try decodeValue(.udint, &.{ 4, 3, 2, 1 })).udint);
+    try testing.expectEqual(@as(u32, 0x01020304), (try decodeValue(.time_of_day, &.{ 4, 3, 2, 1 })).udint);
+    try testing.expectEqual(@as(u32, 0x01020304), (try decodeValue(.dword, &.{ 4, 3, 2, 1 })).dword);
+    try testing.expectEqual(@as(i32, 0x01020304), (try decodeValue(.stime, &.{ 4, 3, 2, 1 })).dint);
+    const e8 = [_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 };
+    try testing.expectEqual(@as(i64, 0x0102030405060708), (try decodeValue(.lint, &e8)).lint);
+    try testing.expectEqual(@as(i64, 0x0102030405060708), (try decodeValue(.ltime, &e8)).lint);
+    try testing.expectEqual(@as(u64, 0x0102030405060708), (try decodeValue(.ulint, &e8)).ulint);
+    try testing.expectEqual(@as(u64, 0x0102030405060708), (try decodeValue(.lword, &e8)).lword);
+    var f: [8]u8 = undefined;
+    std.mem.writeInt(u64, &f, @bitCast(@as(f64, 2.5)), .little);
+    try testing.expectEqual(@as(f64, 2.5), (try decodeValue(.lreal, &f)).lreal);
+    // An empty SHORT_STRING has no length octet; an empty STRING is a zero 16-bit length.
+    try testing.expectError(error.Truncated, decodeValue(.short_string, &.{}));
+    try testing.expectEqual(@as(usize, 0), (try decodeValue(.string, &.{ 0, 0 })).string.len);
+    try testing.expectEqualStrings("x", (try decodeValue(.string, &.{ 1, 0, 'x' })).string);
+}
+
+fn expectEncoded(v: Value, want: []const u8) !void {
+    var buf: [16]u8 = undefined;
+    const w = try encodeValue(v, &buf);
+    try testing.expectEqualSlices(u8, want, w);
+    try testing.expectEqual(want.len, encodedValueLen(v));
+    // The exact-size buffer works.
+    _ = try encodeValue(v, buf[0..want.len]);
+}
+
+test "encoded value lengths and bytes: one variant at a time, little-endian" {
+    try expectEncoded(.{ .boolean = true }, &.{0xFF});
+    try expectEncoded(.{ .boolean = false }, &.{0x00});
+    try expectEncoded(.{ .sint = -1 }, &.{0xFF});
+    try expectEncoded(.{ .usint = 7 }, &.{7});
+    try expectEncoded(.{ .byte = 8 }, &.{8});
+    try expectEncoded(.{ .int = 0x0102 }, &.{ 2, 1 });
+    try expectEncoded(.{ .uint = 0x0102 }, &.{ 2, 1 });
+    try expectEncoded(.{ .word = 0x0102 }, &.{ 2, 1 });
+    try expectEncoded(.{ .dint = 0x01020304 }, &.{ 4, 3, 2, 1 });
+    try expectEncoded(.{ .udint = 0x01020304 }, &.{ 4, 3, 2, 1 });
+    try expectEncoded(.{ .dword = 0x01020304 }, &.{ 4, 3, 2, 1 });
+    try expectEncoded(.{ .real = 1.0 }, &.{ 0, 0, 0x80, 0x3F });
+    try expectEncoded(.{ .lint = 0x0102030405060708 }, &.{ 8, 7, 6, 5, 4, 3, 2, 1 });
+    try expectEncoded(.{ .ulint = 0x0102030405060708 }, &.{ 8, 7, 6, 5, 4, 3, 2, 1 });
+    try expectEncoded(.{ .lword = 0x0102030405060708 }, &.{ 8, 7, 6, 5, 4, 3, 2, 1 });
+    try expectEncoded(.{ .lreal = 1.0 }, &.{ 0, 0, 0, 0, 0, 0, 0xF0, 0x3F });
+    try expectEncoded(.{ .string = "ab" }, &.{ 2, 'a', 'b' });
+    try expectEncoded(.{ .raw = &.{ 9, 8, 7 } }, &.{ 9, 8, 7 });
+    var out: [300]u8 = undefined;
+    const s255: [255]u8 = @splat('s');
+    const s256: [256]u8 = @splat('s');
+    try testing.expectEqual(@as(usize, 256), (try encodeValue(.{ .string = &s255 }, &out)).len);
+    try testing.expectError(error.StringTooLong, encodeValue(.{ .string = &s256 }, &out));
+}
+
+test "TagData: a bare structure handle, a short buffer, string arrays and raw payloads" {
+    const st = try TagData.decode(&.{ 0xA0, 0x02, 0x34, 0x12 });
+    try testing.expectEqual(@as(?u16, 0x1234), st.structure_handle);
+    try testing.expectEqual(@as(usize, 0), st.data.len);
+    var out: [8]u8 = undefined;
+    const td = TagData{ .type = .dint, .data = &.{ 1, 2, 3, 4 } };
+    try testing.expectError(error.BufferTooSmall, td.encode(out[0..5]));
+    _ = try td.encode(out[0..6]);
+
+    // STRING elements are not equally wide: they are walked from the front.
+    const strs = TagData{ .type = .string, .data = &.{ 2, 0, 'a', 'b', 1, 0, 'c' } };
+    try testing.expectEqualStrings("ab", (try strs.at(0)).string);
+    try testing.expectEqualStrings("c", (try strs.at(1)).string);
+    try testing.expectError(error.OutOfRange, strs.at(2));
+    // Walking past the last element reports the decoder's own truncation, not a range error.
+    const one = TagData{ .type = .short_string, .data = &.{ 1, 'A' } };
+    try testing.expectError(error.Truncated, one.at(2));
+    try testing.expectError(error.OutOfRange, one.at(1));
+
+    const raw = TagData{ .type = .structure, .structure_handle = 1, .data = &.{ 1, 2 } };
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, (try raw.at(0)).raw);
+    try testing.expectError(error.OutOfRange, raw.at(1));
+
+    try (TagData{ .type = .dint, .data = &.{ 1, 2, 3, 4 } }).validate();
+    try testing.expectError(error.LengthNotAMultiple, (TagData{ .type = .dint, .data = &.{ 1, 2, 3, 4, 5 } }).validate());
+    try (TagData{ .type = .string, .data = &.{ 1, 2, 3 } }).validate();
+}
+
+test "tag request bodies: minimal lengths, structure handles and short buffers" {
+    const w = try WriteTagRequest.decode(&.{ 0xC3, 0, 1, 0 });
+    try testing.expectEqual(@as(usize, 0), w.values.len);
+    const ws = try WriteTagRequest.decode(&.{ 0xA0, 2, 0x34, 0x12, 3, 0 });
+    try testing.expectEqual(@as(?u16, 0x1234), ws.structure_handle);
+    try testing.expectEqual(@as(u16, 3), ws.count);
+    var out: [32]u8 = undefined;
+    const r = WriteTagRequest{ .type = .int, .count = 1, .values = &.{ 1, 2 } };
+    try testing.expectError(error.BufferTooSmall, r.encode(out[0..5]));
+    _ = try r.encode(out[0..6]);
+
+    const f = WriteTagFragmentedRequest{ .type = .structure, .structure_handle = 0x1234, .count = 3, .byte_offset = 0x01020304, .values = &.{9} };
+    try testing.expectEqual(@as(usize, 11), f.encodedLen());
+    const fw = try f.encode(&out);
+    try testing.expectEqualSlices(u8, &.{ 0xA0, 2, 0x34, 0x12, 3, 0, 4, 3, 2, 1, 9 }, fw);
+    const back = try WriteTagFragmentedRequest.decode(fw);
+    try testing.expectEqual(@as(?u16, 0x1234), back.structure_handle);
+    try testing.expectEqual(@as(u16, 3), back.count);
+    try testing.expectEqual(@as(u32, 0x01020304), back.byte_offset);
+    try testing.expectEqualSlices(u8, &.{9}, back.values);
+    try testing.expectError(error.BufferTooSmall, f.encode(out[0..10]));
+    _ = try f.encode(out[0..11]);
+    // The smallest bodies: eight octets plain, ten with a handle, no values.
+    const plain = try WriteTagFragmentedRequest.decode(&.{ 0xC3, 0, 1, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(usize, 0), plain.values.len);
+    const hd = try WriteTagFragmentedRequest.decode(&.{ 0xA0, 2, 1, 0, 1, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(?u16, 1), hd.structure_handle);
+    const p = WriteTagFragmentedRequest{ .type = .int, .values = &.{ 1, 2 } };
+    try testing.expectError(error.BufferTooSmall, p.encode(out[0..9]));
+}
+
+test "a structure body shorter than its handle is MissingStructureHandle, not a generic truncation" {
+    try testing.expectError(error.MissingStructureHandle, WriteTagFragmentedRequest.decode(&.{ 0xA0, 2, 1, 0, 1, 0, 0, 0 }));
+    try testing.expectError(error.MissingStructureHandle, WriteTagRequest.decode(&.{ 0xA0, 2, 1, 0 }));
+}

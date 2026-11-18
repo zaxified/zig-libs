@@ -859,3 +859,158 @@ test "fuzz driver: ENIP_FUZZ (fuzzItems)" {
 test "fuzz harness: fuzzItems, 400 seeds, reaches every outcome" {
     try fuzzItemsMark.reach(fuzzItems, "enip-encap-items", 400);
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+
+fn nopMessage(data: []const u8) Message {
+    return .{
+        .command = .nop,
+        .session_handle = 0,
+        .status = .success,
+        .sender_context = @splat(0),
+        .options = 0,
+        .data = data,
+        .total_len = 0,
+    };
+}
+
+test "which commands are known, and which are answered without a session" {
+    const known = [_]Command{ .nop, .list_services, .list_identity, .list_interfaces, .register_session, .unregister_session, .send_rr_data, .send_unit_data };
+    for (known) |c| try testing.expect(c.isKnown());
+    try testing.expect(!Command.indicate_status.isKnown());
+    try testing.expect(!Command.cancel.isKnown());
+    const unknown: Command = @fromBackingInt(0x1234);
+    try testing.expect(!unknown.isKnown());
+    const free = [_]Command{ .nop, .list_services, .list_identity, .list_interfaces, .register_session };
+    for (free) |c| try testing.expect(c.isSessionless());
+    const bound = [_]Command{ .unregister_session, .send_rr_data, .send_unit_data, .indicate_status, .cancel };
+    for (bound) |c| try testing.expect(!c.isSessionless());
+}
+
+test "a data portion of exactly max_data_len is accepted and one more is refused even before it arrives" {
+    const buf = try testing.allocator.alloc(u8, header_len + max_data_len + 1);
+    defer testing.allocator.free(buf);
+    @memset(buf, 0);
+    std.mem.writeInt(u16, buf[2..4], @intCast(max_data_len), .little);
+    const m = try decode(buf[0 .. header_len + max_data_len]);
+    try testing.expectEqual(max_data_len, m.data.len);
+    try testing.expectEqual(header_len + max_data_len, m.total_len);
+    std.mem.writeInt(u16, buf[2..4], @intCast(max_data_len + 1), .little);
+    try testing.expectError(error.TooLong, decode(buf));
+    // Announced only: no octets of the body are present, and the length alone is refused.
+    try testing.expectError(error.TooLong, decodePrefix(buf[0..header_len]));
+}
+
+test "encode refuses a data portion past max_data_len, fills an exact buffer, and writes options" {
+    const data = try testing.allocator.alloc(u8, max_data_len + 1);
+    defer testing.allocator.free(data);
+    @memset(data, 0xAB);
+    const out = try testing.allocator.alloc(u8, header_len + max_data_len + 8);
+    defer testing.allocator.free(out);
+    try testing.expectError(error.TooLong, encode(nopMessage(data), out));
+    const wire = try encode(nopMessage(data[0..max_data_len]), out[0 .. header_len + max_data_len]);
+    try testing.expectEqual(header_len + max_data_len, wire.len);
+    try testing.expectError(error.BufferTooSmall, encode(nopMessage(data[0..max_data_len]), out[0 .. header_len + max_data_len - 1]));
+    var m = nopMessage(&.{});
+    m.options = 7;
+    m.session_handle = 0x01020304;
+    m.status = .invalid_length;
+    m.sender_context = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const w2 = try encode(m, out);
+    try testing.expectEqual(@as(u8, 7), w2[20]);
+    try testing.expectEqualSlices(u8, &.{ 4, 3, 2, 1 }, w2[4..8]);
+    try testing.expectEqualSlices(u8, &.{ 0x65, 0, 0, 0 }, w2[8..12]);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, w2[12..20]);
+}
+
+test "Framer: exact storage, a short wait on tiny storage, an exact-fit message, and an oversize announcement" {
+    // Exactly the storage's size may be fed; one octet more overflows.
+    var st: [10]u8 = undefined;
+    var f = Framer.init(&st);
+    try f.feed(&@as([10]u8, @splat(0)));
+    try testing.expectError(error.Overflow, f.feed(&.{0}));
+    // Fewer than a header's octets and storage smaller than a header: still just "wait".
+    var tiny: [8]u8 = undefined;
+    var g = Framer.init(&tiny);
+    try g.feed(&.{ 1, 2, 3 });
+    try testing.expectEqual(@as(?Message, null), try g.next());
+    // A message that exactly fills the storage is delivered.
+    var wire: [28]u8 = undefined;
+    const w = try encode(nopMessage(&.{ 1, 2, 3, 4 }), &wire);
+    var exact: [28]u8 = undefined;
+    var h = Framer.init(&exact);
+    try h.feed(w);
+    const got = (try h.next()).?;
+    try testing.expectEqual(@as(usize, 28), got.total_len);
+    try testing.expectEqual(@as(usize, 0), h.len);
+    // A header announcing more than max_data_len is TooLong, not Overflow.
+    var small: [64]u8 = undefined;
+    var k = Framer.init(&small);
+    var head: [header_len]u8 = @splat(0);
+    std.mem.writeInt(u16, head[2..4], @intCast(max_data_len + 1), .little);
+    try k.feed(&head);
+    try testing.expectError(error.TooLong, k.next());
+    // Exactly max_data_len is a legitimate wait for the rest.
+    const big = try testing.allocator.alloc(u8, header_len + max_data_len + 16);
+    defer testing.allocator.free(big);
+    var bf = Framer.init(big);
+    std.mem.writeInt(u16, head[2..4], @intCast(max_data_len), .little);
+    try bf.feed(&head);
+    try testing.expectEqual(@as(?Message, null), try bf.next());
+}
+
+test "RegisterSession data: a long body is refused, flags are written, a short buffer is refused" {
+    try testing.expectError(error.LengthMismatch, RegisterSessionData.decode(&.{ 1, 0, 0, 0, 0 }));
+    var out: [4]u8 = undefined;
+    const w = try (RegisterSessionData{ .version = 1, .options_flags = 0x0506 }).encode(&out);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, 6, 5 }, w);
+    var three: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, (RegisterSessionData{}).encode(&three));
+}
+
+test "Identity: an empty name decodes, 255 octets fit and 256 do not, buffers are exact" {
+    const sa = SocketAddress{ .port = 44818, .addr = .{ 10, 0, 0, 1 } };
+    var id = Identity{ .socket_address = sa, .vendor_id = 1, .device_type = 2, .product_code = 3, .revision_major = 4, .revision_minor = 5, .status = 6, .serial_number = 7, .product_name = "", .state = .operational };
+    var buf: [Identity.fixed_len + 256]u8 = undefined;
+    const w = try id.encode(&buf);
+    try testing.expectEqual(Identity.fixed_len, w.len);
+    const back = try Identity.decode(w);
+    try testing.expectEqual(@as(usize, 0), back.product_name.len);
+    // Trailing octets after the state are a mismatch.
+    var trail: [Identity.fixed_len + 1]u8 = undefined;
+    @memcpy(trail[0..Identity.fixed_len], w);
+    trail[Identity.fixed_len] = 0;
+    try testing.expectError(error.LengthMismatch, Identity.decode(&trail));
+    // The exact-size buffer works, one octet less does not.
+    try testing.expectError(error.BufferTooSmall, id.encode(buf[0 .. Identity.fixed_len - 1]));
+    _ = try id.encode(buf[0..Identity.fixed_len]);
+    const name255: [255]u8 = @splat('n');
+    id.product_name = &name255;
+    const w255 = try id.encode(&buf);
+    try testing.expectEqual(Identity.fixed_len + 255, w255.len);
+    try testing.expectEqual(@as(usize, 255), (try Identity.decode(w255)).product_name.len);
+    const name256: [256]u8 = @splat('n');
+    id.product_name = &name256;
+    try testing.expectError(error.TooLong, id.encode(&buf));
+}
+
+test "SocketAddress and Service: short buffers, unmapped addresses, an empty service name" {
+    var four: [15]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, (SocketAddress{ .port = 1, .addr = .{ 1, 2, 3, 4 } }).encode(&four));
+    var ip6: [16]u8 = @splat(0);
+    ip6[10] = 0xFF;
+    ip6[11] = 0xFF;
+    ip6[12] = 1;
+    ip6[13] = 2;
+    ip6[14] = 3;
+    ip6[15] = 4;
+    const mapped = try SocketAddress.fromIp(.{ .v6 = ip6 }, 44818);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &mapped.addr);
+    try testing.expectEqual(@as(u16, 44818), mapped.port);
+    ip6[11] = 0;
+    try testing.expectError(error.TooLong, SocketAddress.fromIp(.{ .v6 = ip6 }, 1));
+    const s = try Service.decode(&.{ 1, 0, 0x20, 0 });
+    try testing.expectEqual(@as(usize, 0), s.name.len);
+    var out3: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, (Service{ .capability_flags = 0, .name = "" }).encode(&out3));
+}

@@ -1222,3 +1222,207 @@ test "fuzz driver: ENIP_FUZZ (fuzzConnMgr)" {
 test "fuzz harness: fuzzConnMgr, 400 seeds, reaches every outcome" {
     try fuzzConnMgrMark.reach(fuzzConnMgr, "enip-connmgr-connMgr", 400);
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+
+test "timeouts: the exponent is the low four bits and every encoding edge is found" {
+    try testing.expectEqual(@as(u32, 2048), (Timeout{ .priority_time_tick = 0xFA, .timeout_ticks = 2 }).milliseconds());
+    const T = Timeout;
+    try testing.expectEqual(@as(?T, .{ .priority_time_tick = 0, .timeout_ticks = 255 }), T.fromMilliseconds(255));
+    try testing.expectEqual(@as(?T, .{ .priority_time_tick = 1, .timeout_ticks = 128 }), T.fromMilliseconds(256));
+    try testing.expectEqual(@as(?T, .{ .priority_time_tick = 0, .timeout_ticks = 1 }), T.fromMilliseconds(1));
+    // Zero ticks is not a timeout, so no encoding exists for 0 ms.
+    try testing.expectEqual(@as(?T, null), T.fromMilliseconds(0));
+    // 255 ticks of 2^15 ms is the ceiling; one millisecond more has no encoding.
+    try testing.expectEqual(@as(?T, .{ .priority_time_tick = 15, .timeout_ticks = 255 }), T.fromMilliseconds(255 * 32768));
+    try testing.expectEqual(@as(?T, null), T.fromMilliseconds(255 * 32768 + 1));
+}
+
+test "Unconnected_Send: a missing route header, an empty route, the size and route limits" {
+    // The embedded message ends the buffer, so the route-size octet is missing.
+    try testing.expectError(error.Truncated, UnconnectedSend.decode(&[_]u8{ 5, 157, 2, 0, 0xAA, 0xBB }));
+    var small: [32]u8 = undefined;
+    const w = try (UnconnectedSend{ .embedded = &.{ 1, 2 }, .route_path = &.{} }).encode(&small);
+    try testing.expectEqual(@as(usize, 0), (try UnconnectedSend.decode(w)).route_path.len);
+
+    const big = try testing.allocator.alloc(u8, 0x10000);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    const out = try testing.allocator.alloc(u8, 0x10020);
+    defer testing.allocator.free(out);
+    try testing.expectError(error.TooLong, (UnconnectedSend{ .embedded = big, .route_path = &.{} }).encode(out));
+    const w2 = try (UnconnectedSend{ .embedded = big[0..0xFFFF], .route_path = &.{} }).encode(out);
+    try testing.expectEqual(@as(usize, 4 + 0xFFFF + 1 + 2), w2.len);
+
+    const r510: [510]u8 = @splat(0);
+    const r512: [512]u8 = @splat(0);
+    var mid: [600]u8 = undefined;
+    const w3 = try (UnconnectedSend{ .embedded = &.{}, .route_path = &r510 }).encode(&mid);
+    try testing.expectEqual(@as(u8, 255), w3[4]);
+    try testing.expectError(error.BadPath, (UnconnectedSend{ .embedded = &.{}, .route_path = &r512 }).encode(&mid));
+    try testing.expectError(error.BadPath, (UnconnectedSend{ .embedded = &.{}, .route_path = &.{1} }).encode(&mid));
+    const us = UnconnectedSend{ .embedded = &.{ 1, 2, 3 }, .route_path = &.{ 1, 0 } };
+    try testing.expectEqual(@as(usize, 12), us.encodedLen());
+    _ = try us.encode(mid[0..12]);
+    try testing.expectError(error.BufferTooSmall, us.encode(mid[0..11]));
+}
+
+test "Unconnected_Send wrap: the 1024-octet body ceiling, and an output that is too small" {
+    var out: [1200]u8 = undefined;
+    const e1016: [1016]u8 = @splat(0);
+    const e1017: [1017]u8 = @splat(0);
+    const ok = UnconnectedSend{ .embedded = &e1016, .route_path = &backplane_slot_0 };
+    try testing.expectEqual(@as(usize, 1024), ok.encodedLen());
+    _ = try ok.wrap(&out);
+    try testing.expectError(error.BufferTooSmall, (UnconnectedSend{ .embedded = &e1017, .route_path = &backplane_slot_0 }).wrap(&out));
+    var tiny: [10]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, (UnconnectedSend{ .embedded = &.{ 1, 2, 3, 4 }, .route_path = &backplane_slot_0 }).wrap(&tiny));
+    var r: [4]u8 = undefined;
+    try testing.expectEqualSlices(u8, &.{ 1, 3 }, try backplaneRoute(3, &r));
+}
+
+test "connection parameters: the size ceiling, reserved bits stay inside their masks, flags sit at their bits" {
+    const base = ConnectionParameters{ .size = 511, .variable = false, .connection_type = .null_connection };
+    try testing.expectEqual(@as(?u16, 511), base.toU16());
+    var over = base;
+    over.size = 512;
+    try testing.expectEqual(@as(?u16, null), over.toU16());
+    const rsv = ConnectionParameters{ .size = 1, .reserved = 0xFFFF_FFFF };
+    try testing.expectEqual(@as(?u16, 0x5201), rsv.toU16());
+    try testing.expectEqual(@as(u32, 0x1000), ConnectionParameters.fromU16(0xFFFF).reserved);
+    try testing.expectEqual(@as(u32, 0x53FF0001), rsv.toU32());
+    try testing.expectEqual(@as(u32, 0x11FF_0000), ConnectionParameters.fromU32(0xFFFF_FFFF).reserved);
+    const all = ConnectionParameters{ .size = 4002, .variable = true, .priority = .high, .connection_type = .point_to_point, .redundant_owner = true };
+    const want = @as(u32, 4002) | (@as(u32, 1) << 25) | (@as(u32, 1) << 26) | (@as(u32, 2) << 29) | (@as(u32, 1) << 31);
+    try testing.expectEqual(want, all.toU32());
+    const back = ConnectionParameters.fromU32(want);
+    try testing.expectEqual(@as(u16, 4002), back.size);
+    try testing.expectEqual(Priority.high, back.priority);
+    try testing.expect(back.redundant_owner);
+    const small = ConnectionParameters{ .size = 500, .priority = .urgent, .connection_type = .multicast, .redundant_owner = true };
+    const v = small.toU16().?;
+    try testing.expectEqual(@as(u16, 500 | (1 << 9) | (3 << 10) | (1 << 13) | (1 << 15)), v);
+}
+
+fn sampleOpen(path: []const u8, large: bool) ForwardOpen {
+    return .{
+        .o_to_t_connection_id = 0x11111111,
+        .t_to_o_connection_id = 0x22222222,
+        .connection_serial = 0x3333,
+        .originator_vendor_id = 0x4444,
+        .originator_serial = 0x55555555,
+        .o_to_t_rpi = 1000,
+        .o_to_t_params = .{ .size = 100 },
+        .t_to_o_rpi = 2000,
+        .t_to_o_params = .{ .size = 200 },
+        .connection_path = path,
+        .large = large,
+    };
+}
+
+test "Forward_Open: an empty path, the path limits, exact buffers and the wrap ceiling" {
+    var buf: [700]u8 = undefined;
+    for ([_]bool{ false, true }) |large| {
+        const fo = sampleOpen(&.{}, large);
+        const w = try fo.encode(&buf);
+        const back = try ForwardOpen.decode(w, large);
+        try testing.expectEqual(@as(usize, 0), back.connection_path.len);
+        try testing.expectEqual(@as(u32, 2000), back.t_to_o_rpi);
+        try testing.expectEqual(@as(u16, 200), back.t_to_o_params.size);
+        try testing.expectError(error.BufferTooSmall, fo.encode(buf[0 .. w.len - 1]));
+        _ = try fo.encode(buf[0..w.len]);
+    }
+    const p510: [510]u8 = @splat(0);
+    const p512: [512]u8 = @splat(0);
+    _ = try sampleOpen(&p510, false).encode(&buf);
+    try testing.expectError(error.BadPath, sampleOpen(&p512, false).encode(&buf));
+    try testing.expectError(error.BadPath, sampleOpen(&.{ 1, 2, 3 }, false).encode(&buf));
+    // wrap: a body of exactly 512 octets is allowed, a body of 514 is not.
+    const p476: [476]u8 = @splat(0);
+    const p478: [478]u8 = @splat(0);
+    try testing.expectEqual(@as(usize, 512), sampleOpen(&p476, false).encodedLen());
+    var out: [700]u8 = undefined;
+    _ = try sampleOpen(&p476, false).wrap(&out);
+    try testing.expectError(error.BufferTooSmall, sampleOpen(&p478, false).wrap(&out));
+}
+
+test "Forward_Open reply: every field at its own offset, words not octets, limits" {
+    const r = ForwardOpenReply{
+        .o_to_t_connection_id = 0x11111111,
+        .t_to_o_connection_id = 0x22222222,
+        .connection_serial = 0x3333,
+        .originator_vendor_id = 0x4444,
+        .originator_serial = 0x55555555,
+        .o_to_t_api = 0x66666666,
+        .t_to_o_api = 0x77777777,
+        .application_reply = &.{ 1, 2, 3, 4 },
+        .reserved = 9,
+    };
+    var buf: [64]u8 = undefined;
+    const w = try r.encode(&buf);
+    try testing.expectEqual(@as(usize, 30), w.len);
+    try testing.expectEqual(@as(u8, 2), w[24]);
+    try testing.expectEqual(@as(u8, 9), w[25]);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, w[26..30]);
+    const d = try ForwardOpenReply.decode(w);
+    try testing.expectEqual(r.o_to_t_connection_id, d.o_to_t_connection_id);
+    try testing.expectEqual(r.t_to_o_connection_id, d.t_to_o_connection_id);
+    try testing.expectEqual(r.connection_serial, d.connection_serial);
+    try testing.expectEqual(r.originator_vendor_id, d.originator_vendor_id);
+    try testing.expectEqual(r.originator_serial, d.originator_serial);
+    try testing.expectEqual(r.o_to_t_api, d.o_to_t_api);
+    try testing.expectEqual(r.t_to_o_api, d.t_to_o_api);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, d.application_reply);
+    try testing.expectEqual(@as(u8, 9), d.reserved);
+    var odd = r;
+    odd.application_reply = &.{ 1, 2, 3 };
+    try testing.expectError(error.BadPath, odd.encode(&buf));
+    try testing.expectError(error.BufferTooSmall, r.encode(buf[0..29]));
+    _ = try r.encode(buf[0..30]);
+}
+
+test "Forward_Close: an empty path, the limits, exact buffers and the wrap ceiling" {
+    var buf: [700]u8 = undefined;
+    const mk = struct {
+        fn f(path: []const u8) ForwardClose {
+            return .{ .connection_serial = 0x3333, .originator_vendor_id = 0x4444, .originator_serial = 0x55555555, .connection_path = path };
+        }
+    }.f;
+    const w = try mk(&.{}).encode(&buf);
+    try testing.expectEqual(@as(usize, 12), w.len);
+    const back = try ForwardClose.decode(w);
+    try testing.expectEqual(@as(u32, 0x55555555), back.originator_serial);
+    try testing.expectError(error.BufferTooSmall, mk(&.{ 1, 0 }).encode(buf[0..13]));
+    const p510: [510]u8 = @splat(0);
+    const p512: [512]u8 = @splat(0);
+    _ = try mk(&p510).encode(&buf);
+    try testing.expectError(error.BadPath, mk(&p512).encode(&buf));
+    try testing.expectError(error.BadPath, mk(&.{ 1, 2, 3 }).encode(&buf));
+    const p244: [244]u8 = @splat(0);
+    const p246: [246]u8 = @splat(0);
+    try testing.expectEqual(@as(usize, 256), mk(&p244).encodedLen());
+    var out: [400]u8 = undefined;
+    _ = try mk(&p244).wrap(&out);
+    try testing.expectError(error.BufferTooSmall, mk(&p246).wrap(&out));
+}
+
+test "Forward_Close reply: every field at its own offset, words not octets, limits" {
+    const r = ForwardCloseReply{ .connection_serial = 0x3333, .originator_vendor_id = 0x4444, .originator_serial = 0x55555555, .application_reply = &.{ 1, 2, 3, 4 }, .reserved = 9 };
+    var buf: [32]u8 = undefined;
+    const w = try r.encode(&buf);
+    try testing.expectEqual(@as(usize, 14), w.len);
+    try testing.expectEqual(@as(u8, 2), w[8]);
+    try testing.expectEqual(@as(u8, 9), w[9]);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, w[10..14]);
+    const d = try ForwardCloseReply.decode(w);
+    try testing.expectEqual(@as(u16, 0x3333), d.connection_serial);
+    try testing.expectEqual(@as(u16, 0x4444), d.originator_vendor_id);
+    try testing.expectEqual(@as(u32, 0x55555555), d.originator_serial);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, d.application_reply);
+    try testing.expectEqual(@as(u8, 9), d.reserved);
+    var odd = r;
+    odd.application_reply = &.{1};
+    try testing.expectError(error.BadPath, odd.encode(&buf));
+    try testing.expectError(error.BufferTooSmall, r.encode(buf[0..13]));
+    _ = try r.encode(buf[0..14]);
+}

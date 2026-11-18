@@ -415,3 +415,21 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+
+test "tag names: the edges of the letter and digit ranges" {
+    var st: [8]Component = undefined;
+    for ([_][]const u8{ "a", "z", "A", "Z", "_x", "x0", "x9", "a_b", "Program:Main.x" }) |ok| {
+        _ = try parse(ok, &st);
+    }
+    try testing.expectError(error.BadNameStart, parse("{a", &st));
+    try testing.expectError(error.BadNameStart, parse("@a", &st));
+    try testing.expectError(error.BadNameStart, parse("0a", &st));
+    try testing.expectError(error.BadNameCharacter, parse("a/", &st));
+    try testing.expectError(error.BadNameCharacter, parse("a:", &st));
+    try testing.expectError(error.EmptyComponent, parse("[1]", &st));
+    try testing.expectError(error.BadUnderscore, parse("__a", &st));
+    try testing.expectError(error.BadUnderscore, parse("a__b", &st));
+    try testing.expectError(error.BadUnderscore, parse("a_", &st));
+}

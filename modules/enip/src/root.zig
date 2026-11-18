@@ -1566,3 +1566,1243 @@ test "live: a real EtherNet/IP client against our adapter" {
     );
     try testing.expect(target.reads > 0);
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+//
+// A transport between a client and an adapter (or canned frames) that records
+// what the client wrote and can rewrite or trickle what it reads back.
+
+const Tap = struct {
+    target: ?*Adapter = null,
+    canned: []const []const u8 = &.{},
+    rewrite: ?*const fn (*Tap, []u8) []u8 = null,
+    trickle: usize = 0,
+    out: [8192]u8 = undefined,
+    scratch: [8192]u8 = undefined,
+    queue: [16384]u8 = undefined,
+    queue_len: usize = 0,
+    queue_pos: usize = 0,
+    last: [4096]u8 = undefined,
+    last_len: usize = 0,
+    lens: [32]usize = @splat(0),
+    writes: usize = 0,
+
+    fn seam(self: *Tap) Transport {
+        return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
+    }
+
+    fn lastFrame(self: *const Tap) []const u8 {
+        return self.last[0..self.last_len];
+    }
+
+    fn readFn(ctx: *anyopaque, buf: []u8) TransportError!usize {
+        const self: *Tap = @ptrCast(@alignCast(ctx));
+        const avail = self.queue_len - self.queue_pos;
+        if (avail == 0) return 0;
+        var n = @min(avail, buf.len);
+        if (self.trickle != 0) n = @min(n, self.trickle);
+        @memcpy(buf[0..n], self.queue[self.queue_pos..][0..n]);
+        self.queue_pos += n;
+        return n;
+    }
+
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
+        const self: *Tap = @ptrCast(@alignCast(ctx));
+        const n = @min(bytes.len, self.last.len);
+        @memcpy(self.last[0..n], bytes[0..n]);
+        self.last_len = n;
+        if (self.writes < self.lens.len) self.lens[self.writes] = bytes.len;
+        defer self.writes += 1;
+        var reply: ?[]const u8 = null;
+        if (self.target) |t| {
+            reply = t.handle(bytes, &self.out) catch null;
+        } else if (self.canned.len > 0) {
+            reply = self.canned[@min(self.writes, self.canned.len - 1)];
+        }
+        var r = reply orelse return;
+        if (self.rewrite) |f| {
+            @memcpy(self.scratch[0..r.len], r);
+            r = f(self, self.scratch[0..r.len]);
+        }
+        if (self.queue_len + r.len > self.queue.len) return error.WriteFailed;
+        @memcpy(self.queue[self.queue_len..][0..r.len], r);
+        self.queue_len += r.len;
+    }
+};
+
+fn tapFrame(cmd: encap.Command, session: u32, data: []const u8, out: []u8) []const u8 {
+    return encap.encode(.{
+        .command = cmd,
+        .session_handle = session,
+        .status = .success,
+        .sender_context = @splat(0),
+        .options = 0,
+        .data = data,
+        .total_len = 0,
+    }, out) catch unreachable;
+}
+
+fn cipReplyOf(service: u8, status: cip.GeneralStatus, data: []const u8, out: []u8) []const u8 {
+    return (cip.Reply{ .service = service, .general_status = status, .additional_status = &.{}, .data = data }).encode(out) catch unreachable;
+}
+
+fn rrItemsReply(session: u32, items: []const cpf.Item, out: []u8) []const u8 {
+    var env: [2048]u8 = undefined;
+    const e = cpf.encodeEnvelope(0, 0, items, &env) catch unreachable;
+    return tapFrame(.send_rr_data, session, e, out);
+}
+
+fn rrCanned(session: u32, cip_reply: []const u8, out: []u8) []const u8 {
+    const items = cpf.unconnectedItems(cip_reply);
+    return rrItemsReply(session, &items, out);
+}
+
+fn lastCip(t: *const Tap, storage: *[8]cpf.Item) !cip.Request {
+    const msg = try encap.decode(t.lastFrame());
+    const env = try cpf.decodeEnvelope(msg.data, storage);
+    return cip.Request.decode(env.list.dataItem().?.data);
+}
+
+fn cannedClient(tap: *Tap, buf: []u8) !Client {
+    var c = try Client.init(tap.seam(), buf, .{ .routing = .direct });
+    c.registered = true;
+    c.session_handle = 0x55;
+    return c;
+}
+
+fn rwCommand(_: *Tap, r: []u8) []u8 {
+    r[0] = 4;
+    r[1] = 0;
+    return r;
+}
+
+fn rwSession(_: *Tap, r: []u8) []u8 {
+    r[4] ^= 0x55;
+    return r;
+}
+
+fn rwVersion(_: *Tap, r: []u8) []u8 {
+    r[24] = 2;
+    return r;
+}
+
+fn rwHuge(_: *Tap, r: []u8) []u8 {
+    std.mem.writeInt(u16, r[2..4], 1001, .little);
+    return r[0..24];
+}
+
+fn rwHugeShort(_: *Tap, r: []u8) []u8 {
+    std.mem.writeInt(u16, r[2..4], 1001, .little);
+    return r[0..10];
+}
+
+fn rwExact(t: *Tap, r: []u8) []u8 {
+    _ = r;
+    @memset(t.scratch[24..1024], 0);
+    std.mem.writeInt(u16, t.scratch[2..4], 1000, .little);
+    return t.scratch[0..1024];
+}
+
+test "client init: the smallest accepted buffer and how it is split" {
+    var tap = Tap{};
+    var small: [2047]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, Client.init(tap.seam(), &small, .{}));
+    var exact: [2048]u8 = undefined;
+    const c = try Client.init(tap.seam(), &exact, .{});
+    try testing.expectEqual(@as(usize, 1024), c.tx.len);
+    try testing.expectEqual(@as(usize, 1024), c.rx.len);
+}
+
+test "client frames carry the context and the session, and unregister resets the client" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct, .sender_context = "ctx-test".*, .encapsulation_timeout = 7 });
+    try c.unregisterSession();
+    try testing.expectEqual(@as(usize, 0), tap.writes);
+    const h = try c.registerSession();
+    try testing.expectEqualSlices(u8, "ctx-test", tap.last[12..20]);
+    try c.nop();
+    const nopm = try encap.decode(tap.lastFrame());
+    try testing.expectEqual(Command.nop, nopm.command);
+    try testing.expectEqual(h, nopm.session_handle);
+    try testing.expectEqualSlices(u8, "ctx-test", &nopm.sender_context);
+    _ = try c.getAttributeSingle(1, 1, 1);
+    const rr = try encap.decode(tap.lastFrame());
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, rr.data[0..4], .little));
+    try testing.expectEqual(@as(u16, 7), std.mem.readInt(u16, rr.data[4..6], .little));
+    c.connection = .{ .o_to_t_id = 1, .t_to_o_id = 2, .serial = 3, .size = 4 };
+    try c.unregisterSession();
+    const un = try encap.decode(tap.lastFrame());
+    try testing.expectEqual(Command.unregister_session, un.command);
+    try testing.expectEqual(h, un.session_handle);
+    try testing.expectEqualSlices(u8, "ctx-test", &un.sender_context);
+    try testing.expect(!c.registered);
+    try testing.expectEqual(@as(u32, 0), c.session_handle);
+    try testing.expectEqual(@as(?Connection, null), c.connection);
+}
+
+test "client: a reply delivered a few octets at a time is reassembled" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target, .trickle = 5 };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    const id = try c.listIdentity();
+    try testing.expectEqualStrings("zig-enip adapter", id.product_name);
+}
+
+test "client: refusals at the encapsulation layer" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [2048]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    // The adapter answers a message in an unknown session with a header-only error reply.
+    const handle = target.session_handle;
+    target.session_handle = 0;
+    try testing.expectError(error.EncapsulationError, c.getAttributeSingle(1, 1, 1));
+    target.session_handle = handle;
+    tap.rewrite = rwCommand;
+    try testing.expectError(error.UnexpectedCommand, c.listIdentity());
+    tap.rewrite = rwSession;
+    try testing.expectError(error.SessionMismatch, c.getAttributeSingle(1, 1, 1));
+    // The list commands are sessionless: their reply's handle is not compared.
+    _ = try c.listIdentity();
+    tap.rewrite = rwHuge;
+    try testing.expectError(error.BufferTooSmall, c.listIdentity());
+    // Only ten octets of the header ever arrive: the message is never complete, whatever its length says.
+    tap.rewrite = rwHugeShort;
+    try testing.expectError(error.ReadFailed, c.listIdentity());
+    tap.rewrite = rwExact;
+    try testing.expectError(error.BadReply, c.listIdentity());
+    tap.rewrite = null;
+    var c2 = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    tap.rewrite = rwVersion;
+    try testing.expectError(error.BadReply, c2.registerSession());
+}
+
+test "client: ListInterfaces counts the items it was given" {
+    var cb: [64]u8 = undefined;
+    const two = [_]cpf.Item{ .{ .type_id = .null_address, .data = &.{} }, .{ .type_id = .null_address, .data = &.{} } };
+    const list = cpf.encode(&two, &cb) catch unreachable;
+    var fb: [128]u8 = undefined;
+    const reps = [_][]const u8{tapFrame(.list_interfaces, 0, list, &fb)};
+    var tap = Tap{ .canned = &reps };
+    var buf: [2048]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    try testing.expectEqual(@as(usize, 2), try c.listInterfaces());
+}
+
+fn unitReply(session: u32, seq: u16, first_unconnected: bool, out: []u8) []const u8 {
+    var rep: [32]u8 = undefined;
+    const cr = cipReplyOf(0x0E, .success, &.{ 1, 2 }, &rep);
+    var cd: [64]u8 = undefined;
+    const body = cpf.ConnectedData.encode(seq, cr, &cd) catch unreachable;
+    const id = [4]u8{ 0x22, 0, 0, 0 };
+    var items = cpf.connectedItems(&id, body);
+    if (first_unconnected) items[0] = .{ .type_id = .unconnected_data, .data = &.{} };
+    var env: [128]u8 = undefined;
+    const e = cpf.encodeEnvelope(0, 0, &items, &env) catch unreachable;
+    return tapFrame(.send_unit_data, session, e, out);
+}
+
+test "client: a connected reply is checked for order, sequence and session" {
+    const req = [_]u8{ 0x0E, 2, 0x20, 1, 0x24, 1 };
+    var f1: [256]u8 = undefined;
+    var f2: [256]u8 = undefined;
+    var f3: [256]u8 = undefined;
+    var f4: [256]u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    {
+        const reps = [_][]const u8{unitReply(0x55, 1, false, &f1)};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        c.connection = .{ .o_to_t_id = 0x11, .t_to_o_id = 0x22, .serial = 1, .size = 500 };
+        const r = try c.sendConnectedCip(&req);
+        try testing.expectEqualSlices(u8, &.{ 1, 2 }, r.data);
+        try testing.expectEqual(@as(u16, 1), c.connection.?.sequence);
+        // The frame went out with sequence count 1 on the originator-to-target id.
+        const msg = try encap.decode(tap.lastFrame());
+        var st: [8]cpf.Item = undefined;
+        const env = try cpf.decodeEnvelope(msg.data, &st);
+        try testing.expectEqual(@as(u32, 0x11), try cpf.connectionId(env.list.addressItem().?));
+        try testing.expectEqual(@as(u16, 1), (try cpf.ConnectedData.decode(env.list.dataItem().?)).sequence_count);
+    }
+    {
+        const reps = [_][]const u8{unitReply(0x55, 2, false, &f2)};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        c.connection = .{ .o_to_t_id = 0x11, .t_to_o_id = 0x22, .serial = 1, .size = 500 };
+        try testing.expectError(error.SequenceMismatch, c.sendConnectedCip(&req));
+    }
+    {
+        const reps = [_][]const u8{unitReply(0x55, 1, true, &f3)};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        c.connection = .{ .o_to_t_id = 0x11, .t_to_o_id = 0x22, .serial = 1, .size = 500 };
+        try testing.expectError(error.BadReply, c.sendConnectedCip(&req));
+    }
+    {
+        // Before RegisterSession there is no session to compare the reply's handle with.
+        const reps = [_][]const u8{unitReply(0x77, 1, false, &f4)};
+        var tap = Tap{ .canned = &reps };
+        var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+        c.connection = .{ .o_to_t_id = 0x11, .t_to_o_id = 0x22, .serial = 1, .size = 500 };
+        _ = try c.sendConnectedCip(&req);
+    }
+}
+
+test "client: an unconnected reply must be an address item then an unconnected data item" {
+    var rep: [32]u8 = undefined;
+    const cr = cipReplyOf(0x0E, .success, &.{ 1, 2 }, &rep);
+    const seq8: [8]u8 = @splat(0);
+    var f: [3][512]u8 = undefined;
+    const good = [_]cpf.Item{ .{ .type_id = .null_address, .data = &.{} }, .{ .type_id = .unconnected_data, .data = cr } };
+    const swapped = [_]cpf.Item{ .{ .type_id = .unconnected_data, .data = &.{} }, .{ .type_id = .unconnected_data, .data = cr } };
+    const wrong_type = [_]cpf.Item{ .{ .type_id = .sequenced_address, .data = &seq8 }, .{ .type_id = .connected_data, .data = cr } };
+    var buf: [2048]u8 = undefined;
+    const req = [_]u8{ 0x0E, 2, 0x20, 1, 0x24, 1 };
+    {
+        const reps = [_][]const u8{rrItemsReply(0x55, &good, &f[0])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        try testing.expectEqualSlices(u8, &.{ 1, 2 }, (try c.sendCip(&req)).data);
+    }
+    {
+        const reps = [_][]const u8{rrItemsReply(0x55, &swapped, &f[1])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        try testing.expectError(error.BadReply, c.sendCip(&req));
+    }
+    {
+        const reps = [_][]const u8{rrItemsReply(0x55, &wrong_type, &f[2])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        try testing.expectError(error.BadReply, c.sendCip(&req));
+    }
+}
+
+test "client: a direct request that cannot fit the transmit buffer is refused, a routed one is wrapped whole" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [2048]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    const big: [1100]u8 = @splat(0);
+    try testing.expectError(error.BufferTooSmall, c.sendCip(&big));
+
+    // Routed: a 300-octet embedded message makes a 314-octet wrapper, which needs the whole front half.
+    var c2 = try Client.init(tap.seam(), &buf, .{ .cm_timeout = .{ .priority_time_tick = 0x0A, .timeout_ticks = 3 } });
+    c2.registered = true;
+    c2.session_handle = c.session_handle;
+    const emb: [300]u8 = @splat(0);
+    const r = try c2.sendCip(&emb);
+    try testing.expectEqual(cip.GeneralStatus.service_not_supported, r.general_status);
+    var st: [8]cpf.Item = undefined;
+    const req = try lastCip(&tap, &st);
+    try testing.expectEqual(@as(u8, connmgr.Service.unconnected_send), req.service);
+    const us = try connmgr.UnconnectedSend.decode(req.data);
+    try testing.expectEqual(@as(u8, 0x0A), us.timeout.priority_time_tick);
+    try testing.expectEqual(@as(u8, 3), us.timeout.timeout_ticks);
+}
+
+test "client: a CIP error status is an error for every attribute service, and a partial read is not" {
+    var big: [5000]u8 = @splat(1);
+    var small: [16]u8 = @splat(0);
+    var one: [2]u8 = @splat(0);
+    var tags = [_]TagBinding{
+        .{ .name = "BIG", .type = .sint, .bytes = &big },
+        .{ .name = "SMALL", .type = .dint, .bytes = small[0..8] },
+        .{ .name = "STRUCT", .type = .structure, .bytes = &one },
+    };
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [16384]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    try testing.expectError(error.CipError, c.getAttributeSingle(1, 1, 99));
+    try testing.expectError(error.CipError, c.getAttributesAll(5, 1));
+    try testing.expectError(error.CipError, c.setAttributeSingle(1, 1, 1, &.{ 1, 0 }));
+    // A tag larger than one reply comes back partial, and a plain read accepts that.
+    const part = try c.readTag("BIG[0]", 5000);
+    try testing.expectEqual(@as(usize, 3992), part.data.len);
+    // The fragmented read of a missing tag is an error; of an existing one it reassembles.
+    var acc: [6000]u8 = undefined;
+    try testing.expectError(error.CipError, c.readTagFragmented("NOPE", 1, &acc));
+    const all = try c.readTagFragmented("BIG", 5000, &acc);
+    try testing.expectEqual(@as(usize, 5000), all.data.len);
+    // Writes: the count the caller gave is the count sent.
+    var vals: [6]u8 = @splat(0);
+    try c.writeTag("SMALL[0]", .dint, 3, vals[0..4]);
+    var st: [8]cpf.Item = undefined;
+    const req = try lastCip(&tap, &st);
+    try testing.expectEqual(@as(u16, 3), (try types.WriteTagRequest.decode(req.data)).count);
+    try testing.expectError(error.CipError, c.writeTag("SMALL[0]", .int, 1, vals[0..2]));
+}
+
+test "client: a fragmented write never splits an element and sends the last octet" {
+    var sints: [4]u8 = @splat(0);
+    var dints: [8]u8 = @splat(0);
+    var tags = [_]TagBinding{
+        .{ .name = "S", .type = .sint, .bytes = &sints },
+        .{ .name = "D", .type = .dint, .bytes = &dints },
+    };
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    const before = tap.writes;
+    try c.writeTagFragmented("S", .sint, 3, &.{ 1, 2, 3 }, 2);
+    try testing.expectEqual(@as(usize, 2), tap.writes - before);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0 }, &sints);
+    try testing.expect(tap.lens[before] == tap.lens[before + 1] + 1);
+    var st: [8]cpf.Item = undefined;
+    const req = try lastCip(&tap, &st);
+    try testing.expectEqual(@as(u16, 3), (try types.WriteTagFragmentedRequest.decode(req.data)).count);
+    // A chunk of six octets holds one whole DINT, so the fragments are four octets each.
+    const b2 = tap.writes;
+    try c.writeTagFragmented("D", .dint, 2, &.{ 1, 0, 0, 0, 2, 0, 0, 0 }, 6);
+    try testing.expectEqual(@as(usize, 2), tap.writes - b2);
+    try testing.expectEqual(tap.lens[b2], tap.lens[b2 + 1]);
+    // A chunk smaller than an element still moves one element at a time.
+    const b3 = tap.writes;
+    try c.writeTagFragmented("D", .dint, 2, &.{ 5, 0, 0, 0, 6, 0, 0, 0 }, 1);
+    try testing.expectEqual(@as(usize, 2), tap.writes - b3);
+    try testing.expectEqualSlices(u8, &.{ 5, 0, 0, 0, 6, 0, 0, 0 }, &dints);
+    try testing.expectError(error.MalformedReply, c.writeTagFragmented("D", .string, 1, &.{ 1, 2 }, 2));
+    try testing.expectError(error.CipError, c.writeTagFragmented("D", .int, 2, &.{ 1, 2, 3, 4 }, 4));
+}
+
+test "client: a fragmented read follows partial transfers and rejects what is inconsistent" {
+    var cb: [3][256]u8 = undefined;
+    var fb: [3][512]u8 = undefined;
+    var tdb: [64]u8 = undefined;
+    var out: [16]u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    // The type changes between fragments.
+    {
+        const a = (types.TagData{ .type = .dint, .data = &.{ 1, 2, 3, 4 } }).encode(&tdb) catch unreachable;
+        const ra = rrCanned(0x55, cipReplyOf(0x52, .partial_transfer, a, &cb[0]), &fb[0]);
+        var tdb2: [64]u8 = undefined;
+        const b = (types.TagData{ .type = .int, .data = &.{ 5, 6 } }).encode(&tdb2) catch unreachable;
+        const rb = rrCanned(0x55, cipReplyOf(0x52, .success, b, &cb[1]), &fb[1]);
+        const reps = [_][]const u8{ ra, rb };
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        try testing.expectError(error.MalformedReply, c.readTagFragmented("T", 4, &out));
+    }
+    // A fragment that does not fit the caller's buffer.
+    {
+        const a = (types.TagData{ .type = .dint, .data = &.{ 1, 2, 3, 4 } }).encode(&tdb) catch unreachable;
+        const reps = [_][]const u8{rrCanned(0x55, cipReplyOf(0x52, .success, a, &cb[0]), &fb[0])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        var three: [3]u8 = undefined;
+        try testing.expectError(error.BufferTooSmall, c.readTagFragmented("T", 1, &three));
+        var four: [4]u8 = undefined;
+        try testing.expectEqual(@as(usize, 4), (try c.readTagFragmented("T", 1, &four)).data.len);
+    }
+    // "More follows" with nothing in it must not loop.
+    {
+        const a = (types.TagData{ .type = .dint, .data = &.{} }).encode(&tdb) catch unreachable;
+        const reps = [_][]const u8{rrCanned(0x55, cipReplyOf(0x52, .partial_transfer, a, &cb[0]), &fb[0])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        try testing.expectError(error.MalformedReply, c.readTagFragmented("T", 1, &out));
+    }
+    // A structure's handle survives the reassembly.
+    {
+        const a = (types.TagData{ .type = .structure, .structure_handle = 0x1234, .data = &.{ 1, 2 } }).encode(&tdb) catch unreachable;
+        const reps = [_][]const u8{rrCanned(0x55, cipReplyOf(0x52, .success, a, &cb[0]), &fb[0])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        const r = try c.readTagFragmented("T", 1, &out);
+        try testing.expectEqual(@as(?u16, 0x1234), r.structure_handle);
+        try testing.expectEqual(DataType.structure, r.type);
+    }
+}
+
+test "client: batching refuses what cannot be answered and counts what it was given" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    var rq: [128]u8 = undefined;
+    const r1 = try client.encodeReadTag("SCADA[0]", 1, &rq);
+    var reps1: [1]cip.Reply = undefined;
+    try testing.expectError(error.BufferTooSmall, c.multipleServices(&.{ r1, r1 }, &reps1));
+    // The adapter refuses more than sixteen embedded requests; that outer failure is a CIP error.
+    var many: [17][]const u8 = undefined;
+    for (&many) |*m| m.* = r1;
+    var reps17: [17]cip.Reply = undefined;
+    try testing.expectError(error.CipError, c.multipleServices(&many, &reps17));
+    // readTags: result slots, the eight-name ceiling, and a count of one per tag.
+    const one_name = [_][]const u8{ "SCADA[0]", "SCADA[1]" };
+    var one_slot: [1]?TagData = undefined;
+    try testing.expectError(error.BufferTooSmall, c.readTags(&one_name, &one_slot));
+    const eight: [8][]const u8 = @splat("SCADA[0]");
+    var res8: [8]?TagData = undefined;
+    try testing.expectEqual(@as(usize, 8), try c.readTags(&eight, &res8));
+    try testing.expectEqual(@as(usize, 2), res8[0].?.data.len);
+    const nine: [9][]const u8 = @splat("SCADA[0]");
+    var res9: [9]?TagData = undefined;
+    try testing.expectError(error.BufferTooSmall, c.readTags(&nine, &res9));
+}
+
+test "client: batched replies are bounded by the request count, and a partial outer reply is data" {
+    var cb: [4][256]u8 = undefined;
+    var fb: [4][512]u8 = undefined;
+    var pb: [128]u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    const emb = cipReplyOf(0x0E, .success, &.{}, &cb[0]);
+    const req = [_]u8{ 0x0E, 2, 0x20, 1, 0x24, 1 };
+    // Three embedded replies for two requests: two are returned.
+    {
+        const payload = cip.MultipleService.encode(&.{ emb, emb, emb }, &pb) catch unreachable;
+        const reps = [_][]const u8{rrCanned(0x55, cipReplyOf(0x0A, .success, payload, &cb[1]), &fb[0])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        var out: [2]cip.Reply = undefined;
+        try testing.expectEqual(@as(usize, 2), try c.multipleServices(&.{ &req, &req }, &out));
+    }
+    // One embedded reply for two requests: one is returned, not an error for the missing second.
+    {
+        const payload = cip.MultipleService.encode(&.{emb}, &pb) catch unreachable;
+        const reps = [_][]const u8{rrCanned(0x55, cipReplyOf(0x0A, .success, payload, &cb[1]), &fb[1])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        var out: [2]cip.Reply = undefined;
+        try testing.expectEqual(@as(usize, 1), try c.multipleServices(&.{ &req, &req }, &out));
+    }
+    // A partial_transfer outer status still carries a table.
+    {
+        const payload = cip.MultipleService.encode(&.{}, &pb) catch unreachable;
+        const reps = [_][]const u8{rrCanned(0x55, cipReplyOf(0x0A, .partial_transfer, payload, &cb[1]), &fb[2])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        var out: [1]cip.Reply = undefined;
+        try testing.expectEqual(@as(usize, 0), try c.multipleServices(&.{}, out[0..0]));
+    }
+    // An embedded reply that failed is null even when it carries octets that would decode.
+    {
+        const bad = cipReplyOf(0x4C, .path_destination_unknown, &.{ 0xC3, 0, 1, 2 }, &cb[2]);
+        const payload = cip.MultipleService.encode(&.{bad}, &pb) catch unreachable;
+        const reps = [_][]const u8{rrCanned(0x55, cipReplyOf(0x0A, .success, payload, &cb[3]), &fb[3])};
+        var tap = Tap{ .canned = &reps };
+        var c = try cannedClient(&tap, &buf);
+        var res: [1]?TagData = undefined;
+        try testing.expectEqual(@as(usize, 1), try c.readTags(&.{"X"}, &res));
+        try testing.expectEqual(@as(?TagData, null), res[0]);
+    }
+}
+
+test "client: a read whose embedded reply is only partial still reports its type" {
+    var l: [8]u8 = @splat(0);
+    var tags = [_]TagBinding{.{ .name = "L", .type = .lint, .bytes = &l }};
+    var target = Adapter.init(.{ .max_reply = 14 }, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    var res: [1]?TagData = undefined;
+    try testing.expectEqual(@as(usize, 1), try c.readTags(&.{"L"}, &res));
+    try testing.expectEqual(DataType.lint, res[0].?.type);
+    try testing.expectEqual(@as(usize, 0), res[0].?.data.len);
+}
+
+test "forwardOpen sends the request it documents, and forwardClose closes by the same triple" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{
+        .originator_vendor_id = 0x4321,
+        .originator_serial = 0x01020304,
+        .cm_timeout = .{ .priority_time_tick = 0x0A, .timeout_ticks = 3 },
+    });
+    _ = try c.registerSession();
+    try testing.expectError(error.NoConnection, c.forwardClose());
+    const conn = try c.forwardOpen(.{ .size = 511, .rpi = 123456, .connection_serial = 0x1234 });
+    try testing.expectEqual(@as(u32, 0x01000001), conn.o_to_t_id);
+    try testing.expectEqual(@as(u32, 0x01000002), conn.t_to_o_id);
+    try testing.expectEqual(@as(u16, 0x1234), conn.serial);
+    try testing.expectEqual(@as(u16, 511), conn.size);
+    var st: [8]cpf.Item = undefined;
+    const req = try lastCip(&tap, &st);
+    // The Forward_Open itself is sent to the Connection Manager, not wrapped in an Unconnected_Send.
+    try testing.expectEqual(@as(u8, connmgr.Service.forward_open), req.service);
+    const fo = try connmgr.ForwardOpen.decode(req.data, false);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x20, 0x02, 0x24, 0x01 }, fo.connection_path);
+    try testing.expectEqual(@as(u32, 123456), fo.o_to_t_rpi);
+    try testing.expectEqual(@as(u32, 123456), fo.t_to_o_rpi);
+    try testing.expectEqual(@as(u16, 0x1234), fo.connection_serial);
+    try testing.expectEqual(@as(u16, 0x4321), fo.originator_vendor_id);
+    try testing.expectEqual(@as(u32, 0x01020304), fo.originator_serial);
+    try testing.expectEqual(@as(u16, 511), fo.o_to_t_params.size);
+    try testing.expect(fo.o_to_t_params.variable and fo.t_to_o_params.variable);
+    try testing.expect(!fo.large);
+    try testing.expectEqual(@as(u8, 0x0A), fo.timeout.priority_time_tick);
+    try testing.expectEqual(@as(u8, 3), fo.timeout.timeout_ticks);
+
+    // A connection past 511 octets needs the large form.
+    const big = try c.forwardOpen(.{ .size = 512, .connection_serial = 5 });
+    try testing.expectEqual(@as(u16, 512), big.size);
+    const lreq = try lastCip(&tap, &st);
+    try testing.expectEqual(@as(u8, connmgr.Service.large_forward_open), lreq.service);
+    try testing.expect((try connmgr.ForwardOpen.decode(lreq.data, true)).large);
+
+    // Close the second connection: the request carries the triple and the route.
+    try c.forwardClose();
+    const creq = try lastCip(&tap, &st);
+    try testing.expectEqual(@as(u8, connmgr.Service.forward_close), creq.service);
+    const fc = try connmgr.ForwardClose.decode(creq.data);
+    try testing.expectEqual(@as(u16, 5), fc.connection_serial);
+    try testing.expectEqual(@as(u16, 0x4321), fc.originator_vendor_id);
+    try testing.expectEqual(@as(u32, 0x01020304), fc.originator_serial);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x20, 0x02, 0x24, 0x01 }, fc.connection_path);
+    try testing.expectEqual(@as(?Connection, null), c.connection);
+
+    // The pool holds four; the fifth open is refused with a CIP error.
+    _ = try c.forwardOpen(.{ .connection_serial = 6 });
+    _ = try c.forwardOpen(.{ .connection_serial = 7 });
+    _ = try c.forwardOpen(.{ .connection_serial = 8 });
+    try testing.expectError(error.CipError, c.forwardOpen(.{ .connection_serial = 9 }));
+    // A close the target no longer recognises is a CIP error, and the client forgets the connection regardless.
+    for (&target.connections) |*k| k.in_use = false;
+    c.connection = .{ .o_to_t_id = 1, .t_to_o_id = 2, .serial = 77, .size = 500 };
+    try testing.expectError(error.CipError, c.forwardClose());
+    try testing.expectEqual(@as(?Connection, null), c.connection);
+}
+
+test "forwardOpen: the route, the connection path and their sizes" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [8192]u8 = undefined;
+    // A direct client has no route: the default path is just the Message Router.
+    var d = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try d.registerSession();
+    _ = try d.forwardOpen(.{});
+    var st: [8]cpf.Item = undefined;
+    const dreq = try lastCip(&tap, &st);
+    const dfo = try connmgr.ForwardOpen.decode(dreq.data, false);
+    try testing.expectEqualSlices(u8, &.{ 0x20, 0x02, 0x24, 0x01 }, dfo.connection_path);
+    // An explicit path is appended to the route: 2 + 62 octets fit the 64-octet scratch, 2 + 64 do not.
+    var r = try Client.init(tap.seam(), &buf, .{});
+    r.registered = true;
+    r.session_handle = d.session_handle;
+    var p62: [62]u8 = undefined;
+    for (&p62, 0..) |*b, i| b.* = @intCast(i);
+    _ = try r.forwardOpen(.{ .connection_path = &p62 });
+    const rreq = try lastCip(&tap, &st);
+    const rfo = try connmgr.ForwardOpen.decode(rreq.data, false);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x00 }, rfo.connection_path[0..2]);
+    try testing.expectEqualSlices(u8, &p62, rfo.connection_path[2..]);
+    const p64: [64]u8 = @splat(0);
+    try testing.expectError(error.BufferTooSmall, r.forwardOpen(.{ .connection_path = &p64 }));
+}
+
+test "a ListIdentity request carries the context it was given, and its reply is checked" {
+    var out: [encap.header_len]u8 = undefined;
+    const w = try client.encodeListIdentityRequest("ABCDEFGH".*, &out);
+    try testing.expectEqualSlices(u8, "ABCDEFGH", w[12..20]);
+    var fb: [128]u8 = undefined;
+    const e1 = tapFrame(.list_services, 0, &.{ 0, 0 }, &fb);
+    try testing.expectError(error.UnexpectedCommand, client.decodeListIdentityReply(e1));
+    var raw: [64]u8 = undefined;
+    const hdr = try encap.encode(.{ .command = .list_identity, .session_handle = 0, .status = .invalid_command, .sender_context = @splat(0), .options = 0, .data = &.{ 0, 0 }, .total_len = 0 }, &raw);
+    try testing.expectError(error.EncapsulationError, client.decodeListIdentityReply(hdr));
+}
+
+// ── adapter: whole-module mutation audit 2026-11-17 ────────────────────────
+
+fn cipGet(a: *Adapter, svc: u8, class: u32, inst: ?u32, attr: ?u32, out: []u8) ![]const u8 {
+    var pb: [16]u8 = undefined;
+    var b = epath.Builder.init(&pb);
+    try b.class(class);
+    if (inst) |i| try b.instance(i);
+    if (attr) |x| try b.attribute(x);
+    var rq: [32]u8 = undefined;
+    const req = try (cip.Request{ .service = svc, .path = b.bytes(), .data = &.{} }).encode(&rq);
+    return a.messageRouter(req, out);
+}
+
+fn unitFrame(session: u32, id: u32, seq: u16, cipreq: []const u8, out: []u8) []const u8 {
+    var idle: [4]u8 = undefined;
+    std.mem.writeInt(u32, &idle, id, .little);
+    var cd: [128]u8 = undefined;
+    const body = cpf.ConnectedData.encode(seq, cipreq, &cd) catch unreachable;
+    const items = cpf.connectedItems(&idle, body);
+    var env: [256]u8 = undefined;
+    const e = cpf.encodeEnvelope(0, 0, &items, &env) catch unreachable;
+    return tapFrame(.send_unit_data, session, e, out);
+}
+
+fn rrFrame(session: u32, cipreq: []const u8, out: []u8) []const u8 {
+    const items = cpf.unconnectedItems(cipreq);
+    var env: [512]u8 = undefined;
+    const e = cpf.encodeEnvelope(0, 0, &items, &env) catch unreachable;
+    return tapFrame(.send_rr_data, session, e, out);
+}
+
+fn foRequest(serial: u16, vendor: u16, orig: u32, o_rpi: u32, t_rpi: u32, out: []u8) []const u8 {
+    return (connmgr.ForwardOpen{
+        .o_to_t_connection_id = 0,
+        .t_to_o_connection_id = 0,
+        .connection_serial = serial,
+        .originator_vendor_id = vendor,
+        .originator_serial = orig,
+        .o_to_t_rpi = o_rpi,
+        .o_to_t_params = .{ .size = 100 },
+        .t_to_o_rpi = t_rpi,
+        .t_to_o_params = .{ .size = 100 },
+        .connection_path = &.{ 0x20, 2, 0x24, 1 },
+    }).wrap(out) catch unreachable;
+}
+
+fn fcRequest(serial: u16, vendor: u16, orig: u32, out: []u8) []const u8 {
+    return (connmgr.ForwardClose{
+        .connection_serial = serial,
+        .originator_vendor_id = vendor,
+        .originator_serial = orig,
+        .connection_path = &.{ 0x20, 2, 0x24, 1 },
+    }).wrap(out) catch unreachable;
+}
+
+fn expectAttr(a: *Adapter, attr: u32, want: []const u8) !void {
+    var out: [128]u8 = undefined;
+    const rep = try cip.Reply.decode(try cipGet(a, 0x0E, 1, 1, attr, &out));
+    try testing.expectEqual(cip.GeneralStatus.success, rep.general_status);
+    try testing.expectEqualSlices(u8, want, rep.data);
+}
+
+test "TagBinding: width, count, dimensions and the symbol type word" {
+    var b8: [8]u8 = undefined;
+    const arr = TagBinding{ .name = "A", .type = .dint, .bytes = &b8 };
+    try testing.expectEqual(@as(usize, 4), arr.elementSize());
+    try testing.expectEqual(@as(usize, 2), arr.elementCount());
+    try testing.expectEqual(@as(u2, 1), arr.dimensionCount());
+    try testing.expectEqual(@as(u16, 0x00C4 | (1 << 13)), arr.symbolType());
+    const scalar = TagBinding{ .name = "A", .type = .dint, .bytes = b8[0..4] };
+    try testing.expectEqual(@as(u2, 0), scalar.dimensionCount());
+    try testing.expectEqual(@as(u16, 0x00C4), scalar.symbolType());
+    const two = TagBinding{ .name = "T", .type = .int, .bytes = b8[0..4] };
+    try testing.expectEqual(@as(u2, 1), two.dimensionCount());
+    var b3: [3]u8 = undefined;
+    const st = TagBinding{ .name = "S", .type = .structure, .bytes = &b3 };
+    try testing.expectEqual(@as(usize, 1), st.elementSize());
+    try testing.expectEqual(@as(usize, 3), st.elementCount());
+    try testing.expectEqual(@as(u16, 0x00A0 | (1 << 13)), st.symbolType());
+    try testing.expect(!st.isEnumerable());
+}
+
+test "adapter handle: output limits, statuses and session bookkeeping" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{ .revision_minor = 7 }, &tags);
+    var rb: [256]u8 = undefined;
+    var ob: [512]u8 = undefined;
+    // Not even a header can be answered in ten octets, so a NOP is refused up front.
+    try testing.expectError(error.BufferTooSmall, target.handle(tapFrame(.nop, 0, &.{}, &rb), ob[0..10]));
+    // An unknown command is answered by a header alone, which fits 24 octets exactly.
+    const unk = (try target.handle(tapFrame(.cancel, 0, &.{}, &rb), ob[0..24])).?;
+    try testing.expectEqual(@as(usize, 24), unk.len);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, unk[8..12], .little));
+    // A protocol version other than 1 is refused and no session is opened.
+    var rd: [4]u8 = undefined;
+    const v2 = try (encap.RegisterSessionData{ .version = 2 }).encode(&rd);
+    const refused = (try target.handle(tapFrame(.register_session, 0, v2, &rb), &ob)).?;
+    try testing.expectEqual(@as(u32, 0x69), std.mem.readInt(u32, refused[8..12], .little));
+    try testing.expectEqual(@as(usize, 24), refused.len);
+    try testing.expectEqual(@as(u32, 0), target.session_handle);
+    const garbage = (try target.handle(tapFrame(.register_session, 0, &.{1}, &rb), &ob)).?;
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, garbage[8..12], .little));
+    const v1 = try (encap.RegisterSessionData{}).encode(&rd);
+    const ok = (try target.handle(tapFrame(.register_session, 0, v1, &rb), &ob)).?;
+    const h = std.mem.readInt(u32, ok[4..8], .little);
+    try testing.expectEqual(@as(u32, 0xA5A5_0001), h);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ok[8..12], .little));
+    // A message in another session is refused; one in this session whose envelope is garbage is incorrect data.
+    var q: [32]u8 = undefined;
+    const get = try cip.getAttributeSingle(1, 1, 1, &q);
+    const wrong = (try target.handle(rrFrame(h + 1, get, &rb), &ob)).?;
+    try testing.expectEqual(@as(u32, 0x64), std.mem.readInt(u32, wrong[8..12], .little));
+    const junk = (try target.handle(tapFrame(.send_rr_data, h, &.{ 1, 2, 3 }, &rb), &ob)).?;
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, junk[8..12], .little));
+    const good = (try target.handle(rrFrame(h, get, &rb), &ob)).?;
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, good[8..12], .little));
+    // ListIdentity reports the configured revision.
+    const li = (try target.handle(tapFrame(.list_identity, 0, &.{}, &rb), &ob)).?;
+    const msg = try encap.decode(li);
+    var st: [4]cpf.Item = undefined;
+    const list = try cpf.decode(msg.data, &st);
+    try testing.expectEqual(@as(u8, 7), (try encap.Identity.decode(list.items[0].data)).revision_minor);
+}
+
+test "adapter identity object: every attribute, the class check and the name limit" {
+    var target = Adapter.init(.{
+        .vendor_id = 0x1111,
+        .device_type = 0x0123,
+        .product_code = 0x3333,
+        .revision_major = 4,
+        .revision_minor = 5,
+        .identity_status = 0x4444,
+        .serial_number = 0x55667788,
+        .product_name = "abc",
+        .state = .standby,
+    }, &.{});
+    try expectAttr(&target, 1, &.{ 0x11, 0x11 });
+    try expectAttr(&target, 2, &.{ 0x23, 0x01 });
+    try expectAttr(&target, 3, &.{ 0x33, 0x33 });
+    try expectAttr(&target, 4, &.{ 4, 5 });
+    try expectAttr(&target, 5, &.{ 0x44, 0x44 });
+    try expectAttr(&target, 6, &.{ 0x88, 0x77, 0x66, 0x55 });
+    try expectAttr(&target, 7, &.{ 3, 'a', 'b', 'c' });
+    try expectAttr(&target, 8, &.{2});
+    var out: [512]u8 = undefined;
+    const all = try cip.Reply.decode(try cipGet(&target, 0x01, 1, 1, null, &out));
+    try testing.expectEqualSlices(u8, &.{ 0x11, 0x11, 0x23, 0x01, 0x33, 0x33, 4, 5, 0x44, 0x44, 0x88, 0x77, 0x66, 0x55, 3, 'a', 'b', 'c' }, all.data);
+    const unsupported = try cip.Reply.decode(try cipGet(&target, 0x0E, 1, 1, 9, &out));
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, unsupported.general_status);
+    const none = try cip.Reply.decode(try cipGet(&target, 0x0E, 1, 1, null, &out));
+    try testing.expectEqual(cip.GeneralStatus.path_segment_error, none.general_status);
+    // Another class is not the Identity object, for either service.
+    for ([_]u8{ 0x01, 0x0E }) |svc| {
+        const r = try cip.Reply.decode(try cipGet(&target, svc, 5, 1, 1, &out));
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, r.general_status);
+    }
+    // An unknown service is answered in its own reply code; a request that cannot be parsed in none.
+    const unk = try cipGet(&target, 0x7F, 1, 1, null, &out);
+    try testing.expectEqual(@as(u8, 0xFF), unk[0]);
+    try testing.expectEqual(cip.GeneralStatus.service_not_supported, (try cip.Reply.decode(unk)).general_status);
+    const mal = try cip.Reply.decode(try target.messageRouter(&.{0x0E}, &out));
+    try testing.expectEqual(@as(u8, 0), mal.service);
+    try testing.expectEqual(cip.GeneralStatus.message_format_error, mal.general_status);
+
+    // A 200-character name fits, 201 does not — in either reply and through the encapsulation layer.
+    const n200: [200]u8 = @splat('p');
+    const n201: [201]u8 = @splat('p');
+    var t200 = Adapter.init(.{ .product_name = &n200 }, &.{});
+    try testing.expectEqual(@as(usize, 215), (try cip.Reply.decode(try cipGet(&t200, 0x01, 1, 1, null, &out))).data.len);
+    try testing.expectEqual(@as(u8, 200), (try cip.Reply.decode(try cipGet(&t200, 0x0E, 1, 1, 7, &out))).data[0]);
+    var t201 = Adapter.init(.{ .product_name = &n201 }, &.{});
+    try testing.expectError(error.BufferTooSmall, cipGet(&t201, 0x01, 1, 1, null, &out));
+    try testing.expectError(error.BufferTooSmall, cipGet(&t201, 0x0E, 1, 1, 7, &out));
+    var rb: [256]u8 = undefined;
+    var ob: [512]u8 = undefined;
+    var rd: [4]u8 = undefined;
+    const reg = (try t201.handle(tapFrame(.register_session, 0, try (encap.RegisterSessionData{}).encode(&rd), &rb), &ob)).?;
+    const h = std.mem.readInt(u32, reg[4..8], .little);
+    var q: [32]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, t201.handle(rrFrame(h, try cip.getAttributesAll(1, 1, &q), &rb), &ob));
+}
+
+test "adapter Program Name object: instance 1 only, a missing instance is not instance 1, the name limit" {
+    const n256: [256]u8 = @splat('a');
+    const n257: [257]u8 = @splat('a');
+    var target = Adapter.init(.{ .program_name = &n256 }, &.{});
+    var out: [600]u8 = undefined;
+    const ok = try cip.Reply.decode(try cipGet(&target, 0x01, 0x64, 1, null, &out));
+    try testing.expectEqual(@as(usize, 258), ok.data.len);
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, (try cip.Reply.decode(try cipGet(&target, 0x01, 0x64, null, null, &out))).general_status);
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, (try cip.Reply.decode(try cipGet(&target, 0x01, 0x64, 2, null, &out))).general_status);
+    target.cfg.program_name = &n257;
+    try testing.expectError(error.BufferTooSmall, cipGet(&target, 0x01, 0x64, 1, null, &out));
+}
+
+test "adapter Forward_Open: room is checked before a slot is taken; ids, intervals and the slot's fields" {
+    var target = Adapter.init(.{}, &.{});
+    var rq: [256]u8 = undefined;
+    var out: [64]u8 = undefined;
+    const req = foRequest(7, 0x1234, 0x55, 1000, 2000, &rq);
+    try testing.expectError(error.BufferTooSmall, target.messageRouter(req, out[0..29]));
+    try testing.expect(!target.connections[0].in_use);
+    const ok = try target.messageRouter(req, out[0..30]);
+    try testing.expectEqual(@as(usize, 30), ok.len);
+    const fr = try connmgr.ForwardOpenReply.decode((try cip.Reply.decode(ok)).data);
+    try testing.expectEqual(@as(u32, 0x01000001), fr.o_to_t_connection_id);
+    try testing.expectEqual(@as(u32, 0x01000002), fr.t_to_o_connection_id);
+    try testing.expectEqual(@as(u32, 1000), fr.o_to_t_api);
+    try testing.expectEqual(@as(u32, 2000), fr.t_to_o_api);
+    try testing.expectEqual(@as(u16, 7), fr.connection_serial);
+    try testing.expectEqual(@as(u16, 0x1234), fr.originator_vendor_id);
+    try testing.expectEqual(@as(u32, 0x55), fr.originator_serial);
+    const slot = target.connections[0];
+    try testing.expect(slot.in_use);
+    try testing.expectEqual(@as(u32, 0x01000001), slot.o_to_t_id);
+    try testing.expectEqual(@as(u32, 0x01000002), slot.t_to_o_id);
+    try testing.expectEqual(@as(u16, 7), slot.serial);
+    try testing.expectEqual(@as(u16, 0x1234), slot.vendor);
+    try testing.expectEqual(@as(u32, 0x55), slot.originator_serial);
+    const second = try connmgr.ForwardOpenReply.decode((try cip.Reply.decode(try target.messageRouter(foRequest(8, 1, 2, 3, 4, &rq), &out))).data);
+    try testing.expectEqual(@as(u32, 0x01000003), second.o_to_t_connection_id);
+    try testing.expectEqual(@as(u32, 0x01000004), second.t_to_o_connection_id);
+}
+
+test "adapter Forward_Close: room first, the whole triple must match, an empty slot is no match" {
+    var target = Adapter.init(.{}, &.{});
+    var rq: [256]u8 = undefined;
+    var out: [64]u8 = undefined;
+    const nf = try target.messageRouter(fcRequest(0, 0, 0, &rq), &out);
+    const nfr = try cip.Reply.decode(nf);
+    try testing.expectEqual(cip.GeneralStatus.connection_failure, nfr.general_status);
+    try testing.expectEqualSlices(u8, &.{ 0x07, 0x01 }, nfr.additional_status);
+    try testing.expectEqual(@as(u8, 0xCE), nf[0]);
+    _ = try target.messageRouter(foRequest(7, 0x1234, 0x55, 1, 2, &rq), &out);
+    const wrong = [_][3]u32{ .{ 8, 0x1234, 0x55 }, .{ 7, 0x9999, 0x55 }, .{ 7, 0x1234, 0x56 } };
+    for (wrong) |t| {
+        const r = try cip.Reply.decode(try target.messageRouter(fcRequest(@intCast(t[0]), @intCast(t[1]), t[2], &rq), &out));
+        try testing.expectEqual(cip.GeneralStatus.connection_failure, r.general_status);
+        try testing.expect(target.connections[0].in_use);
+    }
+    try testing.expectError(error.BufferTooSmall, target.messageRouter(fcRequest(7, 0x1234, 0x55, &rq), out[0..13]));
+    try testing.expect(target.connections[0].in_use);
+    const done = try target.messageRouter(fcRequest(7, 0x1234, 0x55, &rq), out[0..14]);
+    try testing.expectEqual(@as(usize, 14), done.len);
+    try testing.expect(!target.connections[0].in_use);
+    const again = try cip.Reply.decode(try target.messageRouter(fcRequest(7, 0x1234, 0x55, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.connection_failure, again.general_status);
+}
+
+test "adapter unit data: only an open connection answers, and ending the session closes them all" {
+    var target = Adapter.init(.{}, &.{});
+    var rb: [512]u8 = undefined;
+    var ob: [512]u8 = undefined;
+    var rd: [4]u8 = undefined;
+    const reg = (try target.handle(tapFrame(.register_session, 0, try (encap.RegisterSessionData{}).encode(&rd), &rb), &ob)).?;
+    const h = std.mem.readInt(u32, reg[4..8], .little);
+    var rq: [256]u8 = undefined;
+    var out: [64]u8 = undefined;
+    _ = try target.messageRouter(foRequest(7, 0x1234, 0x55, 1, 2, &rq), &out);
+    var q: [32]u8 = undefined;
+    const get = try cip.getAttributeSingle(1, 1, 1, &q);
+    const ok = (try target.handle(unitFrame(h, 0x01000001, 9, get, &rb), &ob)).?;
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ok[8..12], .little));
+    var st: [8]cpf.Item = undefined;
+    const env = try cpf.decodeEnvelope((try encap.decode(ok)).data, &st);
+    try testing.expectEqual(@as(u16, 9), (try cpf.ConnectedData.decode(env.list.dataItem().?)).sequence_count);
+    const unknown = (try target.handle(unitFrame(h, 0x12345, 9, get, &rb), &ob)).?;
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, unknown[8..12], .little));
+    _ = try target.messageRouter(fcRequest(7, 0x1234, 0x55, &rq), &out);
+    const closed = (try target.handle(unitFrame(h, 0x01000001, 10, get, &rb), &ob)).?;
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, closed[8..12], .little));
+    _ = try target.messageRouter(foRequest(7, 0x1234, 0x55, 1, 2, &rq), &out);
+    try testing.expect(target.connections[0].in_use);
+    try testing.expectEqual(@as(?[]const u8, null), try target.handle(tapFrame(.unregister_session, h, &.{}, &rb), &ob));
+    try testing.expect(!target.connections[0].in_use);
+    try testing.expectEqual(@as(u32, 0), target.session_handle);
+}
+
+test "adapter: nesting is bounded for Unconnected_Send and for Multiple_Service_Packet" {
+    var target = Adapter.init(.{}, &.{});
+    var out: [4096]u8 = undefined;
+    var wb: [6][1200]u8 = undefined;
+    var inner: [32]u8 = undefined;
+    var cur: []const u8 = try cip.getAttributeSingle(1, 1, 1, &inner);
+    for (1..5) |k| cur = try (connmgr.UnconnectedSend{ .embedded = cur, .route_path = &connmgr.backplane_slot_0 }).wrap(&wb[k]);
+    const four = try cip.Reply.decode(try target.messageRouter(cur, &out));
+    try testing.expectEqual(cip.GeneralStatus.success, four.general_status);
+    try testing.expectEqual(@as(u8, 0x0E), four.service);
+    cur = try (connmgr.UnconnectedSend{ .embedded = cur, .route_path = &connmgr.backplane_slot_0 }).wrap(&wb[5]);
+    const five = try cip.Reply.decode(try target.messageRouter(cur, &out));
+    try testing.expectEqual(cip.GeneralStatus.resource_unavailable, five.general_status);
+    try testing.expectEqual(@as(u8, 0), five.service);
+
+    var rq: [32]u8 = undefined;
+    const unknown = try (cip.Request{ .service = 0x7F, .path = &.{ 0x20, 2, 0x24, 1 }, .data = &.{} }).encode(&rq);
+    var bufs: [6][512]u8 = undefined;
+    var pbs: [6][512]u8 = undefined;
+    var c2: []const u8 = unknown;
+    for (0..6) |k| c2 = try encodeBatch(&[_][]const u8{c2}, &pbs[k], &bufs[k]);
+    var rep = try cip.Reply.decode(try target.messageRouter(c2, &out));
+    for (0..5) |_| {
+        try testing.expectEqual(cip.GeneralStatus.success, rep.general_status);
+        const ms = try cip.MultipleService.decode(rep.data);
+        rep = try cip.Reply.decode(try ms.at(0));
+    }
+    try testing.expectEqual(cip.GeneralStatus.resource_unavailable, rep.general_status);
+}
+
+test "adapter Multiple_Service_Packet: the reply budget is exact at its edges" {
+    var target = Adapter.init(.{}, &.{});
+    var rq: [32]u8 = undefined;
+    const u = try (cip.Request{ .service = 0x7F, .path = &.{ 0x20, 2, 0x24, 1 }, .data = &.{} }).encode(&rq);
+    var pb: [64]u8 = undefined;
+    var bb: [128]u8 = undefined;
+    const msp = try encodeBatch(&[_][]const u8{ u, u }, &pb, &bb);
+    var out: [64]u8 = undefined;
+    const ok = try target.messageRouter(msp, out[0..18]);
+    try testing.expectEqual(@as(usize, 18), ok.len);
+    const okr = try cip.Reply.decode(ok);
+    try testing.expectEqual(cip.GeneralStatus.success, okr.general_status);
+    const ms = try cip.MultipleService.decode(okr.data);
+    try testing.expectEqual(@as(usize, 2), ms.count);
+    for (0..2) |i| {
+        const e = try cip.Reply.decode(try ms.at(i));
+        try testing.expectEqual(@as(u8, 0x7F), e.service);
+        try testing.expectEqual(cip.GeneralStatus.service_not_supported, e.general_status);
+    }
+    const no = try cip.Reply.decode(try target.messageRouter(msp, out[0..17]));
+    try testing.expectEqual(cip.GeneralStatus.reply_data_too_large, no.general_status);
+
+    var many: [17][]const u8 = @splat(u);
+    var pb2: [512]u8 = undefined;
+    var bb2: [512]u8 = undefined;
+    var big: [1024]u8 = undefined;
+    const m17 = try encodeBatch(&many, &pb2, &bb2);
+    try testing.expectEqual(cip.GeneralStatus.too_much_data, (try cip.Reply.decode(try target.messageRouter(m17, &big))).general_status);
+    const m16 = try encodeBatch(many[0..16], &pb2, &bb2);
+    try testing.expectEqual(cip.GeneralStatus.success, (try cip.Reply.decode(try target.messageRouter(m16, &big))).general_status);
+
+    // An embedded reply that cannot fit its share is answered as too large, in its own service code.
+    var t2 = Adapter.init(.{ .max_reply = 40 }, &.{});
+    var q2: [32]u8 = undefined;
+    const ga = try cip.getAttributesAll(1, 1, &q2);
+    const msp2 = try encodeBatch(&[_][]const u8{ ga, u }, &pb, &bb);
+    var out4: [4096]u8 = undefined;
+    const r2 = try cip.Reply.decode(try t2.messageRouter(msp2, &out4));
+    try testing.expectEqual(cip.GeneralStatus.success, r2.general_status);
+    const ms2 = try cip.MultipleService.decode(r2.data);
+    try testing.expectEqualSlices(u8, &.{ 0x81, 0, 0x11, 0 }, try ms2.at(0));
+}
+
+fn symReq(start: ?u32, attrs: []const u16, out: []u8) []const u8 {
+    var pb: [16]u8 = undefined;
+    var b = epath.Builder.init(&pb);
+    b.class(0x6B) catch unreachable;
+    if (start) |s| b.instance(s) catch unreachable;
+    var db: [64]u8 = undefined;
+    std.mem.writeInt(u16, db[0..2], @intCast(attrs.len), .little);
+    for (attrs, 0..) |a, i| std.mem.writeInt(u16, db[2 + i * 2 ..][0..2], a, .little);
+    return (cip.Request{ .service = 0x55, .path = b.bytes(), .data = db[0 .. 2 + attrs.len * 2] }).encode(out) catch unreachable;
+}
+
+test "symbol list: a record that exactly fills the room is delivered" {
+    var ib: [2]u8 = undefined;
+    const tags = [_]TagBinding{.{ .name = "A", .type = .int, .bytes = &ib }};
+    const Case = struct { attrs: []const u16, len: usize };
+    const cases = [_]Case{
+        .{ .attrs = &.{}, .len = 4 },
+        .{ .attrs = &.{1}, .len = 7 },
+        .{ .attrs = &.{2}, .len = 6 },
+        .{ .attrs = &.{3}, .len = 8 },
+        .{ .attrs = &.{5}, .len = 8 },
+        .{ .attrs = &.{6}, .len = 8 },
+        .{ .attrs = &.{8}, .len = 16 },
+        .{ .attrs = &.{10}, .len = 5 },
+    };
+    for (cases) |cs| {
+        var target = Adapter.init(.{ .max_reply = 8 + cs.len }, &tags);
+        var rq: [64]u8 = undefined;
+        var out: [128]u8 = undefined;
+        const rep = try cip.Reply.decode(try target.messageRouter(symReq(null, cs.attrs, &rq), &out));
+        try testing.expectEqual(cip.GeneralStatus.success, rep.general_status);
+        try testing.expectEqual(cs.len, rep.data.len);
+    }
+}
+
+test "symbol list: request validation, unsupported attributes and the caller's buffer" {
+    var ia: [2]u8 = undefined;
+    var ib: [2]u8 = undefined;
+    var ic: [2]u8 = undefined;
+    const tags = [_]TagBinding{
+        .{ .name = "A", .type = .int, .bytes = &ia },
+        .{ .name = "B", .type = .int, .bytes = &ib },
+        .{ .name = "C", .type = .int, .bytes = &ic },
+    };
+    var target = Adapter.init(.{}, &tags);
+    var rq: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const bad7 = try cip.Reply.decode(try target.messageRouter(symReq(null, &.{7}, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.attribute_not_supported, bad7.general_status);
+    var pb: [16]u8 = undefined;
+    var b = epath.Builder.init(&pb);
+    try b.class(0x6B);
+    const raw = [_]struct { data: []const u8, want: cip.GeneralStatus }{
+        .{ .data = &.{1}, .want = .not_enough_data },
+        .{ .data = &.{ 0, 0 }, .want = .success },
+        .{ .data = &.{ 3, 0, 1, 0, 2, 0 }, .want = .not_enough_data },
+    };
+    for (raw) |r| {
+        const req = try (cip.Request{ .service = 0x55, .path = b.bytes(), .data = r.data }).encode(&rq);
+        try testing.expectEqual(r.want, (try cip.Reply.decode(try target.messageRouter(req, &out))).general_status);
+    }
+    // A 20-octet buffer leaves room for one 7-octet record, not two: the rest is a continuation.
+    const part = try cip.Reply.decode(try target.messageRouter(symReq(null, &.{1}, &rq), out[0..20]));
+    try testing.expectEqual(cip.GeneralStatus.partial_transfer, part.general_status);
+    try testing.expectEqual(@as(usize, 7), part.data.len);
+    // The same list with room to spare is complete.
+    const full = try cip.Reply.decode(try target.messageRouter(symReq(null, &.{1}, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.success, full.general_status);
+    try testing.expectEqual(@as(usize, 21), full.data.len);
+}
+
+test "adapter tag lookup: names are exact; instance ids need the Symbol class and an enumerable tag" {
+    var s3: [3]u8 = @splat(1);
+    var iv: [4]u8 = @splat(2);
+    const tags = [_]TagBinding{
+        .{ .name = "S", .type = .structure, .bytes = &s3 },
+        .{ .name = "SCADA", .type = .int, .bytes = &iv },
+    };
+    var target = Adapter.init(.{}, &tags);
+    var rq: [128]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const lower = try client.encodeReadTag("scada[0]", 1, &rq);
+    try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, (try cip.Reply.decode(try target.messageRouter(lower, &out))).general_status);
+    const exact = try client.encodeReadTag("SCADA[0]", 1, &rq);
+    try testing.expectEqual(cip.GeneralStatus.success, (try cip.Reply.decode(try target.messageRouter(exact, &out))).general_status);
+    const byname = try client.encodeReadTag("S", 1, &rq);
+    try testing.expectEqual(cip.GeneralStatus.success, (try cip.Reply.decode(try target.messageRouter(byname, &out))).general_status);
+    const Case = struct { class: u32, inst: u32, want: cip.GeneralStatus };
+    const cases = [_]Case{
+        .{ .class = 0x6B, .inst = 2, .want = .success },
+        .{ .class = 0x6B, .inst = 1, .want = .path_destination_unknown },
+        .{ .class = 0x6B, .inst = 0, .want = .path_destination_unknown },
+        .{ .class = 0x6B, .inst = 3, .want = .path_destination_unknown },
+        .{ .class = 0x02, .inst = 2, .want = .path_destination_unknown },
+    };
+    for (cases) |cs| {
+        var pb: [16]u8 = undefined;
+        var b = epath.Builder.init(&pb);
+        try b.class(cs.class);
+        try b.instance(cs.inst);
+        const req = try (cip.Request{ .service = cip.LogixService.read_tag, .path = b.bytes(), .data = &.{ 1, 0 } }).encode(&rq);
+        try testing.expectEqual(cs.want, (try cip.Reply.decode(try target.messageRouter(req, &out))).general_status);
+    }
+}
+
+fn fragReadReq(name: []const u8, count: u16, offset: u32, out: []u8) []const u8 {
+    var pb: [64]u8 = undefined;
+    const path = tagpath.encodePath(name, &pb) catch unreachable;
+    var db: [6]u8 = undefined;
+    const data = (types.ReadTagFragmentedRequest{ .count = count, .byte_offset = offset }).encode(&db) catch unreachable;
+    return (cip.Request{ .service = cip.LogixService.read_tag_fragmented, .path = path, .data = data }).encode(out) catch unreachable;
+}
+
+fn writeReq(name: []const u8, t: DataType, count: u16, values: []const u8, out: []u8) []const u8 {
+    var pb: [64]u8 = undefined;
+    const path = tagpath.encodePath(name, &pb) catch unreachable;
+    var db: [256]u8 = undefined;
+    const data = (types.WriteTagRequest{ .type = t, .count = count, .values = values }).encode(&db) catch unreachable;
+    return (cip.Request{ .service = cip.LogixService.write_tag, .path = path, .data = data }).encode(out) catch unreachable;
+}
+
+test "adapter tag reads: offsets, counts, room and request validation" {
+    var d40: [40]u8 = @splat(7);
+    var sb: [100]u8 = @splat(1);
+    const tags = [_]TagBinding{
+        .{ .name = "D", .type = .dint, .bytes = &d40 },
+        .{ .name = "S", .type = .sint, .bytes = &sb },
+    };
+    var target = Adapter.init(.{}, &tags);
+    var rq: [128]u8 = undefined;
+    var out: [256]u8 = undefined;
+    // An offset equal to the tag's length is an empty read; one past it is out of range.
+    const at_end = try cip.Reply.decode(try target.messageRouter(fragReadReq("D", 1, 40, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.success, at_end.general_status);
+    try testing.expectEqual(@as(usize, 0), (try types.TagData.decode(at_end.data)).data.len);
+    const past = try cip.Reply.decode(try target.messageRouter(fragReadReq("D", 1, 41, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.invalid_parameter_value, past.general_status);
+    // A read larger than the caller's buffer is cut to it, with a partial_transfer.
+    const cut = try cip.Reply.decode(try target.messageRouter(try client.encodeReadTag("S", 100, &rq), out[0..60]));
+    try testing.expectEqual(cip.GeneralStatus.partial_transfer, cut.general_status);
+    try testing.expectEqual(@as(usize, 52), (try types.TagData.decode(cut.data)).data.len);
+    // Requests with a short body.
+    var pb: [64]u8 = undefined;
+    const path = try tagpath.encodePath("D", &pb);
+    const short_plain = try (cip.Request{ .service = cip.LogixService.read_tag, .path = path, .data = &.{} }).encode(&rq);
+    try testing.expectEqual(cip.GeneralStatus.not_enough_data, (try cip.Reply.decode(try target.messageRouter(short_plain, &out))).general_status);
+    const short_frag = try (cip.Request{ .service = cip.LogixService.read_tag_fragmented, .path = path, .data = &.{ 1, 0 } }).encode(&rq);
+    try testing.expectEqual(cip.GeneralStatus.not_enough_data, (try cip.Reply.decode(try target.messageRouter(short_frag, &out))).general_status);
+    const short_write = try (cip.Request{ .service = cip.LogixService.write_tag, .path = path, .data = &.{ 1, 0 } }).encode(&rq);
+    try testing.expectEqual(cip.GeneralStatus.not_enough_data, (try cip.Reply.decode(try target.messageRouter(short_write, &out))).general_status);
+}
+
+test "adapter tag writes: type, range, room and what is left untouched" {
+    var w: [200]u8 = @splat(0);
+    const tags = [_]TagBinding{.{ .name = "W", .type = .int, .bytes = &w }};
+    var target = Adapter.init(.{}, &tags);
+    var rq: [512]u8 = undefined;
+    var out: [64]u8 = undefined;
+    const wrong = try cip.Reply.decode(try target.messageRouter(writeReq("W[0]", .dint, 1, &.{ 1, 0, 0, 0 }, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.invalid_attribute_value, wrong.general_status);
+    // Element 99 is the last INT: two octets fit, four do not.
+    const over = try cip.Reply.decode(try target.messageRouter(writeReq("W[99]", .int, 2, &.{ 1, 0, 2, 0 }, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.too_much_data, over.general_status);
+    const last = try cip.Reply.decode(try target.messageRouter(writeReq("W[99]", .int, 1, &.{ 9, 0 }, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.success, last.general_status);
+    try testing.expectEqual(@as(u8, 9), w[198]);
+    // An empty write exactly at the end is still a write of nothing, not an error.
+    const empty = try cip.Reply.decode(try target.messageRouter(writeReq("W[100]", .int, 0, &.{}, &rq), &out));
+    try testing.expectEqual(cip.GeneralStatus.success, empty.general_status);
+    // Without room to answer, nothing changes.
+    try testing.expectError(error.BufferTooSmall, target.messageRouter(writeReq("W[0]", .int, 1, &.{ 5, 0 }, &rq), out[0..3]));
+    try testing.expectEqual(@as(u8, 0), w[0]);
+    _ = try target.messageRouter(writeReq("W[0]", .int, 1, &.{ 5, 0 }, &rq), out[0..4]);
+    try testing.expectEqual(@as(u8, 5), w[0]);
+}
+
+test "adapter Reset: refused with its own status, accepted into exactly four octets" {
+    var out: [16]u8 = undefined;
+    var refuse = Adapter.init(.{}, &.{});
+    const r = try cipGet(&refuse, 0x05, 1, 1, null, &out);
+    try testing.expectEqual(@as(u8, 0x85), r[0]);
+    try testing.expectEqual(cip.GeneralStatus.privilege_violation, (try cip.Reply.decode(r)).general_status);
+    var allow = Adapter.init(.{ .allow_reset = true }, &.{});
+    try testing.expectError(error.BufferTooSmall, cipGet(&allow, 0x05, 1, 1, null, out[0..3]));
+    try testing.expect(!allow.reset_requested);
+    const done = try cipGet(&allow, 0x05, 1, 1, null, out[0..4]);
+    try testing.expectEqual(@as(usize, 4), done.len);
+    try testing.expect(allow.reset_requested);
+}
+
+test "a connected request that overflows the envelope does not consume a sequence count" {
+    var scada: [64]u8 = @splat(0);
+    var dint: [8]u8 = @splat(0);
+    var real: [8]u8 = @splat(0);
+    var tags = testTags(&scada, &dint, &real);
+    var target = Adapter.init(.{}, &tags);
+    var tap = Tap{ .target = &target };
+    var buf: [2048]u8 = undefined;
+    var c = try Client.init(tap.seam(), &buf, .{ .routing = .direct });
+    _ = try c.registerSession();
+    _ = try c.forwardOpen(.{});
+    // 300 octets pass the 64-octet margin guard but cannot be framed in the 512-octet half.
+    const big: [300]u8 = @splat(0);
+    try testing.expectError(error.BufferTooSmall, c.sendConnectedCip(&big));
+    try testing.expectEqual(@as(u16, 0), c.connection.?.sequence);
+    var q: [32]u8 = undefined;
+    _ = try c.sendConnectedCip(try cip.getAttributeSingle(1, 1, 1, &q));
+    try testing.expectEqual(@as(u16, 1), c.connection.?.sequence);
+}

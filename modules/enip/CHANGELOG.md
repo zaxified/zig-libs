@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog records two reply-matching gaps and the zero-timeout semantics found by the mutation audit (no code change).
+- **2026-11-17** — Fix: `Client.sendConnectedCip` no longer consumes a sequence count for a request that cannot be framed (a request of 245-446 octets passed the margin guard, advanced `conn.sequence`, then failed `BufferTooSmall`); the count is committed after both encodes succeed (CIP Vol 2: sequence count per transmitted data packet). Behaviour change: the connection's `sequence` is unchanged after a `BufferTooSmall` from this call.
+- **2026-11-17** — Whole-module mutation audit (1391 mutants, 1349 killed, 42 argued equivalent/unobservable; card `mutation 2026-11-17 (1349/1391, 42 eq)`); about 90 boundary tests added next to the code (data-length ceilings, path limits, exact buffers, every CIP type's width and byte order, session and connection matching, reply budgets, TCP framing). NO CONSUMER-VISIBLE CHANGE besides the fix above.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
