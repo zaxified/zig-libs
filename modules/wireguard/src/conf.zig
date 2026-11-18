@@ -18,7 +18,7 @@
 const std = @import("std");
 const netaddr = @import("netaddr");
 const root = @import("root.zig");
-const wipe = @import("wipe.zig");
+const wipealloc = @import("wipealloc");
 const burn = @import("burn.zig");
 const uapi = @import("uapi.zig");
 
@@ -128,7 +128,7 @@ fn parseBody(gpa: Allocator, text: []const u8, opts_ptr: *const Options, diag: ?
     const opts = opts_ptr.*;
     // Peers carry pre-shared keys: the list wipes what it leaves behind when it
     // grows, and so does the line scratch, which sees every key.
-    var wa = wipe.WipingAllocator.init(gpa);
+    var wa = wipealloc.WipingAllocator.init(gpa);
     const a = wa.allocator();
     var peers: std.ArrayList(PeerConfig) = .empty;
     var ips: std.ArrayList(AllowedIp) = .empty;
@@ -423,7 +423,7 @@ pub fn sync(gpa: Allocator, current: *const Device, desired: *const Config, out:
 }
 
 fn syncBody(gpa: Allocator, current: *const Device, desired: *const Config, out: *ParsedConfig) error{OutOfMemory}!void {
-    var wa = wipe.WipingAllocator.init(gpa);
+    var wa = wipealloc.WipingAllocator.init(gpa);
     const a = wa.allocator();
     var delta: std.ArrayList(PeerConfig) = .empty;
     var done = false;

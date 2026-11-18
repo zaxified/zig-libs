@@ -274,7 +274,7 @@ bits, every target this module has). No defect found.
   held in the caller's storage; every API takes `*const` and results go through an out-param
   (zeroed on error). Generating, signing, sealing, opening and the secret-key file codec run one
   frame down and zero the stack they dirtied (`burn.zig`). scrypt's `xy`/`V`/`dk` are HEAP: the
-  seal/open bodies hand scrypt a zeroing allocator (`burn.WipeAllocator`), so nothing password
+  seal/open bodies hand scrypt a zeroing allocator (`wipealloc.WipingAllocator`), so nothing password
   derived goes back unwiped to the caller's allocator. `stackprobe_test.zig` (ReleaseFast) checks
   every path for 0 residue and 0 non-zero heap bytes. Out of reach: the `std.Io.Writer` buffer
   `writeSecretKeyFile` writes into (the caller's), and `sealSecretKey` panics inside std's

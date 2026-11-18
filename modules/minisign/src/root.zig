@@ -77,6 +77,7 @@ const std = @import("std");
 const entropy = @import("entropy");
 const b64ct = @import("b64ct").standard;
 const burn = @import("burn.zig");
+const wipealloc = @import("wipealloc");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -95,7 +96,7 @@ pub const meta = .{
     // module mints. b64ct: the base64 text of an unencrypted secret key IS the
     // key. Everything else is std: std.crypto.sign.Ed25519,
     // std.crypto.hash.blake2, std.crypto.pwhash.scrypt.
-    .deps = .{ "entropy", "b64ct" },
+    .deps = .{ "entropy", "b64ct", "wipealloc" },
 };
 
 // ── field sizes (all format facts from minisign.h) ──────────────────────────
@@ -710,7 +711,7 @@ fn sealSecretKeyBody(
     const params = std.crypto.pwhash.scrypt.Params.fromLimits(ops_limit, mem_limit);
     var stream: [encrypted_block_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &stream);
-    var wipe: burn.WipeAllocator = .{ .child = allocator };
+    var wipe: wipealloc.WipingAllocator = .{ .child = allocator };
     try std.crypto.pwhash.scrypt.kdf(wipe.allocator(), &stream, password, &salt, params);
 
     out.sig_alg = sig_alg_legacy;
@@ -843,7 +844,7 @@ fn openSecretKeyBody(
         const params = std.crypto.pwhash.scrypt.Params.fromLimits(raw.ops_limit, mem_limit);
         var stream: [encrypted_block_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &stream);
-        var wipe: burn.WipeAllocator = .{ .child = allocator };
+        var wipe: wipealloc.WipingAllocator = .{ .child = allocator };
         try std.crypto.pwhash.scrypt.kdf(wipe.allocator(), &stream, pw, &raw.salt, params);
 
         var plain_key_number: [key_number_length]u8 = undefined;

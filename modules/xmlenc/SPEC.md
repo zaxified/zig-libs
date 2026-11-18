@@ -6,7 +6,7 @@
 
 **Scope:** core — xmlsec 1.3.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-17 (181/208, 27 eq) · src 6b09fa4a84f2c52f
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (181/208, 27 eq) · src f2781c413f0a4928
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLENC_FUZZ) · ct 2026-11-13 (ctgrind: RSA secret members tainted for rsa-oaep-mgf1p + GCM / CBC and rsa-1_5 + GCM, KEK tainted for kw-aes256 + GCM; no xmlenc-own context except the CBC plaintext length; the rsa-1_5 extraction loop was compiled to a secret-dependent branch and is fixed; oaep 3 / cbc 14 / rsa15 3 / kw 3 in-file, itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-11-13 (sweep of every pub entry point: `decryptDataToDocument` use-after-free, its element cap, heap-stack CipherValue walk)
 
@@ -335,7 +335,7 @@ The 27 that do not die are not defects: 19 EQUIVALENT and 8 more equivalent thro
 - ✅ DONE 2026-11-18 (wave 6) ~~**Portable ctgrind (`CTGRIND_CPU=x86_64`)**~~ *(2026-11-18)*: xmlenc runs in `scripts/test.sh ctgrind-portable` with `cpu=x86_64` variant rows (cbc 72 with control/trap 16, kw 182 with control/trap 5; oaep and rsa15 equal their plain rows). `publish`'s copy was the HARNESS, not the module: compiler_rt's baseline memcpy dispatches on the size class of the CBC plaintext length (tainted in the claim, and left undefined untainted by std soft AES's `undefined` batch padding, cause A2), symbolised at line 0, so neither witness nor module. The harness now copies / prints the length of the plaintext it encrypted, checked against the returned one under `-fvalgrind`. The rest: +56 cbc / +180 kw std soft-AES key schedule (A1, loads at tainted indices), +2 the memcpy size classes of aesCbcDecrypt's copy of the documented plaintext length (S). No xmlenc branch on a key. Itemised in ctgrind-expected.tsv.
 - **OAEPparams label size** *(2026-11-17)*: `readBase64Text` gathers the label text in a 512-octet scratch buffer, and the list growth of `textContent` admits fewer base64 characters than the 256-octet decode buffer holds (measured: 64-octet labels pass, 128 do not). Labels of that size are refused with `MalformedStructure`. Not changed (rare, fail-closed); fix by decoding without `textContent` if a peer sends one.
 
-- 2026-11-14: `WipingAllocator` is a private copy in `xmlenc`, `xmldsig`, `wireguard` (and `bbs`'s `WipeAllocator`) -- the same adapter four times; a shared home (a small `wipe` module, or `testkit`-free public helper) is an owner decision.
+- ✅ DONE 2026-11-18 (owner decision, security triage): `WipingAllocator` was a private copy in `xmlenc`, `xmldsig`, `wireguard`, `bbs` and `minisign` -- the same adapter five times; all five now use the new `wipealloc` module (`mls` keeps its own `Wiper`, which forwards grow-in-place resizes, so it is not a copy).
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
 **Missing and it matters** *(survey 2026-09-30)*:

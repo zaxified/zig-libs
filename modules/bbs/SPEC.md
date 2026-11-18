@@ -133,7 +133,7 @@ by pointer and return one through an out-param (zeroed on error). Each body is
 a `never_inline` frame and the stack it dirtied is zeroed afterwards
 (`burn.zig`, sizes there with measured depths); `sign`/`proofGen` allocate their
 scratch (message scalars, the `SK || msgs` hash input) through a
-`WipeAllocator`, and only `proofGen`'s returned proof comes from the caller's
+`wipealloc.WipingAllocator` (the shared module), and only `proofGen`'s returned proof comes from the caller's
 allocator. `stackprobe_test.zig` is the gate: it goes red when a body outgrows
 its burn. The curve arithmetic in `bls12_381` keeps its value API (the burns
 cover its frames). `mockedRandomScalars` returns by value because its output is
