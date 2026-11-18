@@ -290,3 +290,19 @@ test "DatagramShim: a BACnet device answers a Who-Is through it" {
     try testing.expect(reply.len > 4);
     try testing.expectEqual(@as(u8, 0x81), reply[0]); // BVLC
 }
+
+test "Window: a datagram exactly as large as the receive buffer fits; a write exactly fills the output" {
+    var w = Window{};
+    var out: [4]u8 = undefined;
+    w.reset("abcd", &out);
+    var buf: [4]u8 = undefined;
+    try testing.expectEqualSlices(u8, "abcd", (try w.takeDatagram(&buf)).?);
+
+    w.reset(&.{}, &out);
+    try w.put("ab");
+    try w.put("cd"); // 4 of 4: fits, no overflow latch
+    try testing.expect(!w.overflow);
+    try testing.expectEqualSlices(u8, "abcd", w.written());
+    try testing.expectError(error.Overflow, w.put("e"));
+    try testing.expect(w.overflow);
+}

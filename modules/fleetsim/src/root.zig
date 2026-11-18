@@ -2957,6 +2957,33 @@ test "opcua adapter: trouble stamps BadDeviceFailure and moves ServerStatus.Stat
     try testing.expectEqual(OpcuaNode.status_bad_device_failure, dv.status.?);
 }
 
+test "opcua adapter: restart ends injected trouble; nothing to say is null, not an empty slice" {
+    const gpa = testing.allocator;
+    var fx: OpcuaFixture = undefined;
+    try fx.init(gpa, "opc.tcp://127.0.0.1:4840");
+    defer fx.deinit();
+    const n = fx.node.node();
+    var out: [4096]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), try n.tick(&out, 0));
+    try testing.expectEqual(@as(?[]const u8, null), try n.deliver(&.{}, &out, 0));
+
+    try testing.expect(n.control(.trouble_on, 1));
+    try testing.expect(fx.node.trouble);
+    try testing.expect(n.control(.restart, 2));
+    try testing.expect(!fx.node.trouble); // the flag goes with the power cycle …
+    try testing.expectEqual(@as(?opcua.encoding.StatusCode, 0), fx.measurementStatus()); // … and so does the Bad status
+    const state_id = opcua.encoding.NodeId{
+        .numeric = .{ .namespace = 0, .id = opcua.nodestore.id.server_status_state },
+    };
+    const state_node = fx.store.getNode(state_id).?;
+    try testing.expectEqual(@as(i32, 0), state_node.attributes.variable.value.value.?.scalar.int32);
+
+    // trouble_off after trouble_on undoes it too, and records that it did.
+    try testing.expect(n.control(.trouble_on, 3));
+    try testing.expect(n.control(.trouble_off, 4));
+    try testing.expect(!fx.node.trouble);
+}
+
 test {
     std.testing.refAllDecls(@This());
     _ = @import("node.zig");

@@ -397,3 +397,72 @@ test "saturation never wraps" {
     try testing.expectEqual(@as(i16, -32768), saturateI16(-1e30));
     try testing.expectEqual(@as(i16, 32767), saturateI16(1e30));
 }
+
+// Whole-module mutation audit 2026-11-18: the guards and boundaries of every
+// driver, each at the exact edge.
+test "ramp: a wrapping ramp at its exact maximum stays there; a zero span does not divide" {
+    var w = Driver{ .ramp = .{ .start = 0, .per_ms = 1, .min = 0, .max = 10, .wrap = true } };
+    try testing.expectEqual(@as(f64, 10), w.sample(10, noRandom())); // == max is not past max
+    try testing.expectEqual(@as(f64, 1), w.sample(11, noRandom())); // one past wraps round to min + 1
+    try testing.expectEqual(@as(f64, 0), w.sample(20, noRandom()));
+    var flat = Driver{ .ramp = .{ .start = 0, .per_ms = 1, .min = 5, .max = 5, .wrap = true } };
+    try testing.expectEqual(@as(f64, 5), flat.sample(9, noRandom())); // span 0: hold max, no mod by zero
+}
+
+test "sine: a zero period is the mean, not a division by zero" {
+    var s = Driver{ .sine = .{ .mean = 3, .amplitude = 9, .period_ms = 0 } };
+    try testing.expectEqual(@as(f64, 3), s.sample(1234, noRandom()));
+}
+
+test "replay: empty series, before the origin, at the origin, looping" {
+    var empty = Driver{ .replay = .{ .samples = &.{} } };
+    try testing.expectEqual(@as(f64, 0), empty.sample(5, noRandom()));
+
+    const series = [_]Sample{ .{ .at_ms = 10, .value = 1 }, .{ .at_ms = 20, .value = 2 }, .{ .at_ms = 20, .value = 3 } };
+    var r = Driver{ .replay = .{ .samples = &series, .origin_ms = 100 } };
+    try testing.expectEqual(@as(f64, 1), r.sample(50, noRandom())); // before the origin: the first sample, no underflow
+    try testing.expectEqual(@as(f64, 1), r.sample(100, noRandom()));
+    try testing.expectEqual(@as(f64, 1), r.sample(109, noRandom()));
+    try testing.expectEqual(@as(f64, 3), r.sample(120, noRandom())); // the later of two samples at one instant wins
+    try testing.expectEqual(@as(f64, 3), r.sample(100_000, noRandom())); // no loop: hold the last
+
+    var l = Driver{ .replay = .{ .samples = &series, .origin_ms = 100, .loop = true } };
+    try testing.expectEqual(@as(f64, 3), l.sample(120, noRandom()));
+    try testing.expectEqual(@as(f64, 1), l.sample(121, noRandom())); // span 21: t=21 wraps to 0
+    try testing.expectEqual(@as(f64, 3), l.sample(120 + 21 * 4, noRandom()));
+    // A series that starts at the origin instant itself.
+    const first_at_zero = [_]Sample{ .{ .at_ms = 0, .value = 7 }, .{ .at_ms = 0, .value = 8 } };
+    var z = Driver{ .replay = .{ .samples = &first_at_zero, .origin_ms = 5 } };
+    try testing.expectEqual(@as(f64, 8), z.sample(5, noRandom()));
+}
+
+test "Signal.fire records the last value" {
+    var cell: f64 = 0;
+    var c = Cell{ .cell = &cell };
+    const sinks = [_]Sink{c.sink()};
+    var sig = Signal{ .driver = .{ .constant = .{ .value = 4.5 } }, .sinks = &sinks };
+    try testing.expectEqual(@as(f64, 0), sig.last);
+    sig.fire(0, noRandom());
+    try testing.expectEqual(@as(f64, 4.5), sig.last);
+    try testing.expectEqual(@as(u64, 1), sig.fires);
+}
+
+test "FloatBytes: a float exactly fits at the end of the area; one byte short is ignored" {
+    var area: [6]u8 = @splat(0xEE);
+    var fb = FloatBytes{ .bytes = &area, .offset = 2 };
+    fb.sink().apply(1.5, 0);
+    try testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.5))), std.mem.readInt(u32, area[2..6], .big));
+    var short: [6]u8 = @splat(0xEE);
+    var fs = FloatBytes{ .bytes = &short, .offset = 3 };
+    fs.sink().apply(1.5, 0); // 3 + 4 > 6: nothing written, nothing out of bounds
+    try testing.expectEqualSlices(u8, &@as([6]u8, @splat(0xEE)), &short);
+}
+
+test "Threshold: a value exactly at the threshold is on" {
+    var on = false;
+    var t = Threshold{ .cell = &on, .on_at = 2.5 };
+    t.sink().apply(2.5, 0);
+    try testing.expect(on);
+    t.sink().apply(2.4999, 0);
+    try testing.expect(!on);
+}

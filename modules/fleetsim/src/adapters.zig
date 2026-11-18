@@ -1245,3 +1245,272 @@ test "bacnet adapter: trouble moves Reliability, StatusFlags and Out_Of_Service"
     try testing.expectEqual(reliability_no_fault, obj.find(.reliability).?.value.enumerated);
     try testing.expect(!obj.find(.out_of_service).?.value.boolean);
 }
+
+// ── whole-module mutation audit 2026-11-18 ──────────────────────────────────
+
+test "modbus adapter: restart clears trouble; a broadcast or a PDU-less frame gets no trouble reply" {
+    var holdings = [_]u16{ 0x1111, 0x2222, 0x3333, 0x4444 };
+    var slave = Modbus.init(
+        .{ .unit_id = 5, .framing = .tcp },
+        .{ .holding_registers = .{ .base = 0, .values = &holdings } },
+    );
+    const n = slave.node();
+    var req_buf: [modbus.tcp.max_adu_len]u8 = undefined;
+    var out: [modbus.tcp.max_adu_len]u8 = undefined;
+    const req = try modbus.tcp.encodeAdu(&req_buf, 0x1234, 5, &.{ 0x03, 0x00, 0x00, 0x00, 0x02 });
+
+    try testing.expect(n.control(.trouble_on, 0));
+    try testing.expect(slave.trouble);
+    // An MBAP header whose length covers the unit id only: no PDU to echo a function code of.
+    try testing.expectEqual(@as(?[]const u8, null), try n.deliver(&.{ 0, 1, 0, 0, 0, 1, 5 }, &out, 0));
+    try testing.expect(n.control(.restart, 0));
+    try testing.expect(!slave.trouble); // a power cycle ends the injected trouble
+    const ok = (try n.deliver(req, &out, 0)).?;
+    try testing.expectEqualSlices(u8, &.{ 0x03, 0x04, 0x11, 0x11, 0x22, 0x22 }, ok[7..]);
+
+    var rtu_slave = Modbus.init(
+        .{ .unit_id = 5, .framing = .rtu },
+        .{ .holding_registers = .{ .base = 0, .values = &holdings } },
+    );
+    const rn = rtu_slave.node();
+    var rbuf: [modbus.rtu.max_adu_len]u8 = undefined;
+    var rout: [modbus.rtu.max_adu_len]u8 = undefined;
+    try testing.expect(rn.control(.trouble_on, 0));
+    // Broadcast (unit 0) is never answered, trouble or not.
+    const bcast = try modbus.rtu.encodeAdu(&rbuf, 0, &.{ 0x03, 0x00, 0x00, 0x00, 0x02 });
+    try testing.expectEqual(@as(?[]const u8, null), try rn.deliver(bcast, &rout, 0));
+    // …while a real request is answered with the exception.
+    const real = try modbus.rtu.encodeAdu(&rbuf, 5, &.{ 0x03, 0x00, 0x00, 0x00, 0x02 });
+    const bad = (try rn.deliver(real, &rout, 0)).?;
+    try testing.expectEqual(@as(u8, 0x83), bad[1]);
+}
+
+test "iec104 adapter: movable, restart returns to as-built, silence is null, a tiny buffer is an error" {
+    var points = [_]iec104.Point{
+        .{ .ioa = 101, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } } },
+    };
+    var frame_buf: [512]u8 = undefined;
+    var queue_buf: [4096]u8 = undefined;
+    var a: Iec104 = undefined;
+    try a.init(.{ .common_address = 47 }, &points, &frame_buf, &queue_buf, .{});
+    // By-value move: the transport captured at init still points at `a.shim`;
+    // every entry point re-points it at the copy's own shim.
+    var b = a;
+    const n = b.node();
+    var out: [1024]u8 = undefined;
+    const startdt = [_]u8{ 0x68, 0x04, 0x07, 0x00, 0x00, 0x00 };
+    const con = (try n.deliver(&startdt, &out, 0)).?;
+    try testing.expectEqualSlices(u8, &.{ 0x68, 0x04, 0x0B, 0x00, 0x00, 0x00 }, con);
+    try testing.expect(b.server.isStarted());
+
+    // Nothing to say is `null`, not an empty slice.
+    try testing.expectEqual(@as(?[]const u8, null), try n.tick(&out, 1));
+
+    // A spontaneous report: moved once more first, so `reportSpontaneous` must re-point the transport itself.
+    var c = b;
+    try c.reportSpontaneous(101, 2);
+    b = c;
+    const spont = (try n.tick(&out, 2)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 0x68), spont[0]);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, spont[2..4], .little) >> 1); // first I-frame: N(S) = 0
+    c = b;
+    try c.reportSpontaneous(101, 3);
+    b = c;
+    const spont2 = (try n.tick(&out, 3)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, spont2[2..4], .little) >> 1); // second: N(S) = 1
+
+    // Restart: the connection is as-built again (not started), and works again.
+    try testing.expect(n.control(.restart, 3));
+    try testing.expect(!b.server.isStarted());
+    const con2 = (try n.deliver(&startdt, &out, 4)).?;
+    try testing.expectEqualSlices(u8, &.{ 0x68, 0x04, 0x0B, 0x00, 0x00, 0x00 }, con2);
+    // The send sequence number is back to 0 as well.
+    try b.reportSpontaneous(101, 5);
+    const spont3 = (try n.tick(&out, 5)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, spont3[2..4], .little) >> 1);
+
+    // The answer does not fit: a typed error, not a truncated frame.
+    var tiny: [2]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, n.deliver(&startdt, &tiny, 5));
+}
+
+fn bacnetFixture(props: []bacnet.Property, objects: *[1]bacnet.Object, dev: *DefaultBacnet) void {
+    objects.* = .{.{
+        .id = .{ .type = .analog_input, .instance = 1 },
+        .properties = props,
+    }};
+    dev.init(
+        .{ .instance = 260_001, .vendor_id = 999 },
+        objects,
+        .{ .ip = .{ 10, 0, 0, 2 }, .port = 47808 },
+        .{ .ip = .{ 10, 0, 0, 1 }, .port = 47808 },
+    );
+}
+
+test "bacnet adapter: movable, restart, silence is null, tiny buffer is an error" {
+    var props = [_]bacnet.Property{
+        .{ .id = .object_name, .value = .{ .string = "AI-1" } },
+        .{ .id = .present_value, .value = .{ .real = 21.5 }, .cov_reported = true },
+    };
+    var objects: [1]bacnet.Object = undefined;
+    var dev0: DefaultBacnet = undefined;
+    bacnetFixture(&props, &objects, &dev0);
+    var dev = dev0; // moved: `device.tp` must be re-pointed at the copy's shim
+    const n = dev.node();
+
+    const who_is = [_]u8{ 0x81, 0x0B, 0x00, 0x0C, 0x01, 0x20, 0xFF, 0xFF, 0x00, 0xFF, 0x10, 0x08 };
+    var out: [1024]u8 = undefined;
+    const reply = (try n.deliver(&who_is, &out, 0)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 0x81), reply[0]);
+
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, n.deliver(&who_is, &tiny, 0));
+
+    // Nothing to say, nothing returned.
+    try testing.expectEqual(@as(?[]const u8, null), try n.tick(&out, 1));
+    try testing.expectEqual(@as(?[]const u8, null), try dev.update(.{ .type = .analog_input, .instance = 1 }, .present_value, .{ .real = 1.0 }, 2, &out));
+
+    // Restart puts the whole device back as constructed.
+    dev.device.next_invoke = 9;
+    try testing.expect(n.control(.restart, 3));
+    try testing.expectEqual(@as(u8, 0), dev.device.next_invoke);
+    const again = (try n.deliver(&who_is, &out, 4)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 0x81), again[0]);
+}
+
+test "bacnet adapter: a COV subscriber hears about trouble on the next tick, once, and about updates" {
+    var props = [_]bacnet.Property{
+        .{ .id = .object_name, .value = .{ .string = "Zone-1-Temp" } },
+        .{ .id = .present_value, .value = .{ .real = 21.5 }, .cov_reported = true },
+        .{ .id = .status_flags, .value = .{ .bit_string = .{ .unused_bits = 4, .bytes = &status_flags_healthy } }, .cov_reported = true },
+        .{ .id = .reliability, .value = .{ .enumerated = reliability_no_fault } },
+        .{ .id = .out_of_service, .value = .{ .boolean = false }, .writable = true },
+    };
+    var objects: [1]bacnet.Object = undefined;
+    var dev0: DefaultBacnet = undefined;
+    bacnetFixture(&props, &objects, &dev0);
+    var dev = dev0;
+    const n = dev.node();
+    var out: [1024]u8 = undefined;
+    try testing.expect(!dev.trouble and !dev.cov_pending); // `init` replaces every field
+
+    // BVLC original-unicast, NPDU, ConfirmedRequest SubscribeCOV(process 1, analog-input 1,
+    // unconfirmed notifications, lifetime 60 s).
+    const subscribe = [_]u8{
+        0x81, 0x0A, 0x00, 0x15, 0x01, 0x04, 0x00, 0x05, 0x01, 0x05,
+        0x09, 0x01, 0x1C, 0x00, 0x00, 0x00, 0x01, 0x29, 0x00, 0x39,
+        0x3C,
+    };
+    const ack = (try n.deliver(&subscribe, &out, 0)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 0x81), ack[0]);
+
+    try testing.expect(n.control(.trouble_on, 1));
+    try testing.expect(dev.trouble);
+    try testing.expect(dev.cov_pending);
+    // A buffer that cannot hold the notification is an error, and the flag is still consumed.
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, n.tick(&tiny, 2));
+    try testing.expect(!dev.cov_pending);
+
+    try testing.expect(n.control(.trouble_off, 3));
+    try testing.expect(n.control(.trouble_on, 3));
+    // Move the adapter again: `tick` -> `notifyTrouble` and `update` must re-point the transport themselves.
+    var moved1 = dev;
+    const note = (try moved1.node().tick(&out, 4)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 0x81), note[0]);
+    // Consumed: the next tick has nothing to send.
+    try testing.expectEqual(@as(?[]const u8, null), try moved1.node().tick(&out, 5));
+
+    // An update of a COV-reported property is announced.
+    const id = bacnet.ObjectId{ .type = .analog_input, .instance = 1 };
+    var moved2 = moved1;
+    const upd = (try moved2.update(id, .present_value, .{ .real = 30.0 }, 6, &out)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 0x81), upd[0]);
+    dev = moved2;
+
+    // Restart undoes only the trouble this adapter injected, and forgets the pending notice.
+    try testing.expect(n.control(.trouble_on, 6));
+    try testing.expect(dev.cov_pending);
+    try testing.expectEqual(@as(usize, 3), dev.applyTrouble(true)); // reliability, status_flags, out_of_service
+    try testing.expect(n.control(.restart, 7));
+    try testing.expect(!dev.trouble);
+    try testing.expect(!dev.cov_pending);
+    try testing.expectEqual(reliability_no_fault, objects[0].find(.reliability).?.value.enumerated);
+    try testing.expect(!objects[0].find(.out_of_service).?.value.boolean);
+    try testing.expectEqualSlices(u8, &status_flags_healthy, objects[0].find(.status_flags).?.value.bit_string.bytes);
+}
+
+test "bacnet adapter: applyTrouble reports how many properties it touched" {
+    var props = [_]bacnet.Property{
+        .{ .id = .object_name, .value = .{ .string = "x" } },
+        .{ .id = .reliability, .value = .{ .enumerated = reliability_no_fault } },
+        .{ .id = .out_of_service, .value = .{ .boolean = false } },
+    };
+    var objects: [1]bacnet.Object = undefined;
+    var dev: DefaultBacnet = undefined;
+    bacnetFixture(&props, &objects, &dev);
+    try testing.expectEqual(@as(usize, 2), dev.applyTrouble(true)); // reliability + out_of_service, no status_flags
+    try testing.expectEqual(@as(usize, 2), dev.applyTrouble(false));
+    // Trouble with no COV-reported status_flags has nothing to announce: the tick is silent (null, not empty).
+    var quiet: [64]u8 = undefined;
+    try testing.expect(dev.node().control(.trouble_on, 0));
+    try testing.expectEqual(@as(?[]const u8, null), try dev.node().tick(&quiet, 1));
+    var bare = [_]bacnet.Property{.{ .id = .object_name, .value = .{ .string = "y" } }};
+    var objects2: [1]bacnet.Object = undefined;
+    var dev2: DefaultBacnet = undefined;
+    bacnetFixture(&bare, &objects2, &dev2);
+    try testing.expectEqual(@as(usize, 0), dev2.applyTrouble(true));
+    try testing.expect(!dev2.node().control(.trouble_off, 0)); // nothing to restore: refused honestly
+    try testing.expect(!dev2.trouble);
+}
+
+test "enip adapter: a connected request is refused with its sequence count echoed; trouble_off and restart restore as-built" {
+    var tag_bytes = @as([8]u8, @splat(0));
+    const tags = [_]enip.TagBinding{.{ .name = "Speed", .type = .dint, .bytes = &tag_bytes }};
+    var dev = Enip.init(.{}, &tags);
+    const n = dev.node();
+    const built_status = dev.adapter.cfg.identity_status;
+    const built_state = dev.adapter.cfg.state;
+
+    var cip_buf: [32]u8 = undefined;
+    const cip_req = try enip.cip.getAttributesAll(@backingInt(enip.cip.ClassCode.identity), 1, &cip_buf);
+    var cd_buf: [64]u8 = undefined;
+    const cd = try enip.cpf.ConnectedData.encode(0x1234, cip_req, &cd_buf);
+    const items = [2]enip.cpf.Item{
+        .{ .type_id = .connected_address, .data = &.{ 1, 2, 3, 4 } },
+        .{ .type_id = .connected_data, .data = cd },
+    };
+    var env_buf: [128]u8 = undefined;
+    const env = try enip.cpf.encodeEnvelope(0, 5, &items, &env_buf);
+    var rr_buf: [192]u8 = undefined;
+    const sud = try enip.encap.encode(.{
+        .command = .send_unit_data,
+        .session_handle = 7,
+        .status = .success,
+        .sender_context = @splat(0),
+        .options = 0,
+        .data = env,
+        .total_len = 0,
+    }, &rr_buf);
+
+    var out: [512]u8 = undefined;
+    try testing.expect(n.control(.trouble_on, 0));
+    const refused = (try n.deliver(sud, &out, 0)).?;
+    try testing.expectEqual(enip.cip.GeneralStatus.device_state_conflict, try cipStatusOf(refused));
+    const msg = try enip.encap.decode(refused);
+    var in_items: [4]enip.cpf.Item = undefined;
+    const renv = try enip.cpf.decodeEnvelope(msg.data, &in_items);
+    try testing.expectEqual(enip.cpf.ItemType.connected_data, renv.list.dataItem().?.type_id);
+    try testing.expectEqual(@as(u16, 0x1234), (try enip.cpf.ConnectedData.decode(renv.list.dataItem().?)).sequence_count);
+    try testing.expectEqual(enip.cpf.ItemType.connected_address, renv.list.addressItem().?.type_id);
+
+    try testing.expect(n.control(.trouble_off, 1));
+    try testing.expect(!dev.trouble);
+    try testing.expectEqual(built_status, dev.adapter.cfg.identity_status);
+    try testing.expectEqual(built_state, dev.adapter.cfg.state);
+
+    try testing.expect(n.control(.trouble_on, 2));
+    try testing.expect(n.control(.restart, 3));
+    try testing.expect(!dev.trouble); // restart ends injected trouble too
+    try testing.expectEqual(built_status, dev.adapter.cfg.identity_status);
+}

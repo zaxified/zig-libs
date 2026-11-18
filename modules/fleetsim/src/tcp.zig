@@ -1592,3 +1592,641 @@ test "a run_ms past 2^31 ms saturates the poll timeout instead of panicking" {
     try testing.expectEqual(@as(i32, std.math.maxInt(i32)), pollTimeout(3_000_000_000));
     try testing.expectEqual(@as(i32, std.math.maxInt(i32)), pollTimeout(std.math.maxInt(u32)));
 }
+
+// ── whole-module mutation audit 2026-11-18 ──────────────────────────────────
+//
+// Report counters, session limits, split-frame carry, the idle round and the
+// multi-peer routing, each pinned by exact numbers over a real loopback
+// socket. A scripted client sends fixed byte runs with fixed gaps, then reads
+// until it has seen `want_bytes` of replies (or the server hangs up).
+
+const ScriptStep = struct { bytes: []const u8, gap_ms: u64 = 0 };
+
+const Script = struct {
+    port: u16 = 0,
+    steps: []const ScriptStep = &.{},
+    want_bytes: usize = 0,
+    linger_ms: u64 = 0,
+    /// Connected but silent for this long before the first step.
+    start_delay_ms: u64 = 0,
+    got: usize = 0,
+    connected: bool = false,
+    ready: std.atomic.Value(bool) = .init(false),
+    /// When set, the client stays connected until the main thread clears it.
+    hold: ?*std.atomic.Value(bool) = null,
+};
+
+fn scriptClient(r: *Script) void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", r.port) catch return;
+    var stream: std.Io.net.Stream = undefined;
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        stream = addr.connect(io, .{ .mode = .stream }) catch {
+            if (tries > 200) return;
+            sleepMs(10);
+            continue;
+        };
+        break;
+    }
+    defer stream.close(io);
+    r.connected = true;
+    r.ready.store(true, .release);
+    if (r.start_delay_ms != 0) sleepMs(r.start_delay_ms);
+
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var writer = stream.writer(io, &wbuf);
+    for (r.steps) |st| {
+        writer.interface.writeAll(st.bytes) catch break;
+        writer.interface.flush() catch break;
+        if (st.gap_ms != 0) sleepMs(st.gap_ms);
+    }
+    while (r.got < r.want_bytes) {
+        var got: [512]u8 = undefined;
+        var vec: [1][]u8 = .{&got};
+        const n = reader.interface.readVec(&vec) catch break;
+        if (n == 0) break;
+        r.got += n;
+    }
+    if (r.linger_ms != 0) sleepMs(r.linger_ms);
+    if (r.hold) |h| while (h.load(.acquire)) sleepMs(5);
+}
+
+fn awaitReady(r: *const Script) bool {
+    const start = nowMs();
+    while (!r.ready.load(.acquire)) {
+        if (nowMs() - start > cue_watchdog_ms) return false;
+        sleepMs(1);
+    }
+    return true;
+}
+
+/// One Modbus-TCP read of four holding registers: 12 bytes out, 17 bytes back.
+const req_len = 12;
+const rep_len = 17;
+
+fn readReq(buf: *[req_len]u8, txid: u16) []const u8 {
+    return modbus.tcp.encodeAdu(buf, txid, 1, &.{ 0x03, 0, 0, 0, 4 }) catch unreachable;
+}
+
+const Rig = struct {
+    holdings: [4]u16 = .{ 1, 2, 3, 4 },
+    slave: @import("adapters.zig").Modbus = undefined,
+    f: Fleet,
+    node: NodeId = 0,
+
+    fn init(self: *Rig, gpa: std.mem.Allocator) !void {
+        self.holdings = .{ 1, 2, 3, 4 };
+        self.slave = @import("adapters.zig").Modbus.init(
+            .{ .unit_id = 1, .framing = .tcp },
+            .{ .holding_registers = .{ .base = 0, .values = &self.holdings } },
+        );
+        self.f = try Fleet.init(gpa, .{ .max_frame_len = 512, .outbox_bytes = 1 << 16 });
+        self.node = try self.f.addNode(.{ .node = self.slave.node(), .tag = 1 });
+    }
+
+    fn deinit(self: *Rig) void {
+        self.f.deinit();
+    }
+};
+
+/// Start `scripts` against a listener the test owns and serve them with `serveTcpOn`.
+fn serveOnWith(gpa: std.mem.Allocator, f: *Fleet, node: NodeId, opts: Options, scripts: []Script) !Report {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch return socketSkip("loopback listen failed");
+    defer listener.socket.close(io);
+    const port = listener.socket.address.getPort();
+    var threads: [4]?std.Thread = @splat(null);
+    for (scripts, 0..) |*s, i| {
+        s.port = port;
+        threads[i] = try std.Thread.spawn(.{}, scriptClient, .{s});
+    }
+    const res = serveTcpOn(gpa, io, f, node, &listener, opts);
+    for (threads) |t| if (t) |th| th.join();
+    return res;
+}
+
+test "serveTcpOn: the report counts exactly what crossed the wire; a split frame is reassembled" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    var b2: [req_len]u8 = undefined;
+    const r1 = readReq(&b1, 1);
+    const r2 = readReq(&b2, 2);
+    // request 1 and the first 5 bytes of request 2 in one write, the rest later
+    var first: [req_len + 5]u8 = undefined;
+    @memcpy(first[0..req_len], r1);
+    @memcpy(first[req_len..], r2[0..5]);
+    var scripts = [_]Script{.{
+        .steps = &.{ .{ .bytes = &first, .gap_ms = 60 }, .{ .bytes = r2[5..] } },
+        .want_bytes = 2 * rep_len,
+        .linger_ms = 50,
+    }};
+    const rep = try serveOnWith(gpa, &rig.f, rig.node, .{ .idle_ms = 20 }, &scripts);
+    try testing.expect(rep.connected);
+    try testing.expectEqual(@as(usize, 1), rep.sessions);
+    try testing.expectEqual(@as(usize, 2 * req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 2), rep.frames_in);
+    try testing.expectEqual(@as(usize, 2 * rep_len), rep.bytes_out);
+    try testing.expectEqual(@as(usize, 2), rep.frames_out);
+    try testing.expectEqual(@as(usize, 2 * rep_len), scripts[0].got);
+    // The session lasted at least the client's own gap and linger.
+    try testing.expect(rep.duration_ms >= 100);
+}
+
+test "serveTcpOn: a frame bigger than the read buffer is dropped and the session carries on" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    const r1 = readReq(&b1, 1);
+    var scripts = [_]Script{.{ .steps = &.{.{ .bytes = r1, .gap_ms = 60 }}, .linger_ms = 40 }};
+    const rep = try serveOnWith(gpa, &rig.f, rig.node, .{ .idle_ms = 20, .read_buf = 8 }, &scripts);
+    // 8 bytes fill the buffer with no complete frame in it (dropped), then the last 4 are read: two reads.
+    try testing.expectEqual(@as(usize, req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 2), rep.frames_in);
+    try testing.expectEqual(@as(usize, 0), rep.frames_out);
+}
+
+test "serveTcpOn: an idle round still advances the fleet, so unsolicited traffic goes out" {
+    const gpa = testing.allocator;
+    const Ticker = struct {
+        fn deliverFn(_: *anyopaque, _: []const u8, _: []u8, _: Time) node_mod.NodeError!?[]const u8 {
+            return null;
+        }
+        fn tickFn(_: *anyopaque, out: []u8, _: Time) node_mod.NodeError!?[]const u8 {
+            @memcpy(out[0..4], "TICK");
+            return out[0..4];
+        }
+    };
+    var dummy: u8 = 0;
+    var f = try Fleet.init(gpa, .{});
+    defer f.deinit();
+    const id = try f.addNode(.{
+        .node = .{ .ctx = &dummy, .vtable = &.{ .deliver = Ticker.deliverFn, .tick = Ticker.tickFn } },
+        .tick_period_ms = 30,
+    });
+    var scripts = [_]Script{.{ .want_bytes = 4 }};
+    const rep = try serveOnWith(gpa, &f, id, .{ .idle_ms = 20 }, &scripts);
+    try testing.expect(scripts[0].got >= 4);
+    try testing.expectEqual(@as(usize, 0), rep.bytes_in);
+    try testing.expect(rep.frames_out >= 1);
+    try testing.expect(rep.bytes_out >= 4);
+}
+
+/// Run `serveTcp` under `CueIo`, with every script queued in the backlog (in order) before the first accept.
+fn runServeTcp(gpa: std.mem.Allocator, f: *Fleet, node: NodeId, opts: Options, scripts: []Script) !Report {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var cue: CueIo = .init(io, .{ .hold_after_listens = 1 });
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fut = try io.concurrent(serveTcp, .{ gpa, cue.io(), f, node, addr, opts });
+    if (!awaitCue(&CueIo.listens, 1)) return neverListened(io, &fut, "serveTcp cannot bind 127.0.0.1");
+    var threads: [4]?std.Thread = @splat(null);
+    for (scripts, 0..) |*s, i| {
+        s.port = CueIo.port(0);
+        threads[i] = std.Thread.spawn(.{}, scriptClient, .{s}) catch |e| {
+            CueIo.go.store(1, .release);
+            cancelQuietly(io, &fut);
+            for (threads) |t| if (t) |th| th.join();
+            return e;
+        };
+        if (!awaitReady(s)) {
+            CueIo.go.store(1, .release);
+            cancelQuietly(io, &fut);
+            for (threads) |t| if (t) |th| th.join();
+            return error.TestUnexpectedResult;
+        }
+    }
+    CueIo.go.store(1, .release);
+    const res = fut.await(io);
+    for (threads) |t| if (t) |th| th.join();
+    return res catch |e| switch (e) {
+        error.BindFailed => socketSkip("serveTcp cannot bind 127.0.0.1"),
+        else => e,
+    };
+}
+
+test "serveTcp: max_sessions peers are served one after another, the next one is not" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    var b2: [req_len]u8 = undefined;
+    const r1 = readReq(&b1, 1);
+    const r2 = readReq(&b2, 2);
+    const two = [_]ScriptStep{ .{ .bytes = r1, .gap_ms = 30 }, .{ .bytes = r2 } };
+    var scripts = [_]Script{
+        .{ .steps = &two, .want_bytes = 2 * rep_len, .linger_ms = 30 },
+        .{ .steps = &.{.{ .bytes = r1 }}, .want_bytes = rep_len },
+        .{ .steps = &.{.{ .bytes = r2 }}, .want_bytes = rep_len }, // never served
+    };
+    const rep = try runServeTcp(gpa, &rig.f, rig.node, .{ .idle_ms = 20, .max_sessions = 2 }, &scripts);
+    try testing.expect(rep.connected);
+    try testing.expectEqual(@as(usize, 2), rep.sessions);
+    try testing.expectEqual(@as(usize, 3 * req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 3), rep.frames_in);
+    try testing.expectEqual(@as(usize, 3 * rep_len), rep.bytes_out);
+    try testing.expectEqual(@as(usize, 3), rep.frames_out);
+    try testing.expect(rep.duration_ms >= 30);
+    try testing.expectEqual(@as(usize, 2 * rep_len), scripts[0].got);
+    try testing.expectEqual(@as(usize, rep_len), scripts[1].got);
+    try testing.expectEqual(@as(usize, 0), scripts[2].got);
+}
+
+test "serveTcp: when run_ms runs out after a session, the report is returned, not NoPeer" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    var scripts = [_]Script{.{ .steps = &.{.{ .bytes = readReq(&b1, 1) }}, .want_bytes = rep_len }};
+    const rep = try runServeTcp(gpa, &rig.f, rig.node, .{ .idle_ms = 20, .max_sessions = 3, .run_ms = 700 }, &scripts);
+    try testing.expectEqual(@as(usize, 1), rep.sessions);
+    try testing.expect(rep.connected);
+    try testing.expectEqual(@as(usize, rep_len), scripts[0].got);
+}
+
+/// `serveTcpMulti` under `CueIo` with one listener per binding; scripts[i] goes to listener `port_of[i]`.
+fn runServeMulti(gpa: std.mem.Allocator, f: *Fleet, bindings: []const Binding, opts: MultiOptions, scripts: []Script, port_of: []const usize) !MultiReport {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var cue: CueIo = .init(io, .{ .hold_after_listens = @intCast(bindings.len) });
+    var fut = try io.concurrent(serveTcpMulti, .{ gpa, cue.io(), f, bindings, opts });
+    if (!awaitCue(&CueIo.listens, @intCast(bindings.len))) return neverListened(io, &fut, "serveTcpMulti cannot bind 127.0.0.1");
+    var threads: [4]?std.Thread = @splat(null);
+    for (scripts, 0..) |*s, i| {
+        s.port = CueIo.port(port_of[i]);
+        threads[i] = std.Thread.spawn(.{}, scriptClient, .{s}) catch |e| {
+            CueIo.go.store(1, .release);
+            cancelQuietly(io, &fut);
+            for (threads) |t| if (t) |th| th.join();
+            return e;
+        };
+        if (!awaitReady(s)) {
+            CueIo.go.store(1, .release);
+            cancelQuietly(io, &fut);
+            for (threads) |t| if (t) |th| th.join();
+            return error.TestUnexpectedResult;
+        }
+    }
+    CueIo.go.store(1, .release);
+    const res = fut.await(io);
+    for (threads) |t| if (t) |th| th.join();
+    return res catch |e| switch (e) {
+        error.BindFailed => socketSkip("serveTcpMulti cannot bind 127.0.0.1"),
+        else => e,
+    };
+}
+
+test "serveTcpMulti: exact counters, replies go to the asker only, and the run ends when every peer has left" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    var b2: [req_len]u8 = undefined;
+    const r1 = readReq(&b1, 1);
+    const r2 = readReq(&b2, 2);
+    // The two masters never speak in the same poll round (a reply goes to the
+    // peer that spoke last), so the routing under test is the asker's own.
+    const two = [_]ScriptStep{ .{ .bytes = r1, .gap_ms = 80 }, .{ .bytes = r2 } };
+    var scripts = [_]Script{
+        .{ .steps = &two, .want_bytes = 2 * rep_len, .linger_ms = 40 },
+        .{ .steps = &two, .want_bytes = 2 * rep_len, .linger_ms = 40, .start_delay_ms = 40 },
+    };
+    const bindings = [_]Binding{.{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } }};
+    // run_ms = 0: the loop ends by itself once both peers have hung up.
+    const rep = try runServeMulti(gpa, &rig.f, &bindings, .{ .idle_ms = 20, .max_peers = 2 }, &scripts, &.{ 0, 0 });
+    try testing.expectEqual(@as(usize, 2), rep.peers_accepted);
+    try testing.expectEqual(@as(usize, 0), rep.peers_refused);
+    try testing.expectEqual(@as(usize, 4 * req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 4), rep.frames_in);
+    // one reply per request, each to the peer that asked: not fanned out to both
+    try testing.expectEqual(@as(usize, 4 * rep_len), rep.bytes_out);
+    try testing.expectEqual(@as(usize, 4), rep.frames_out);
+    try testing.expectEqual(@as(usize, 2 * rep_len), scripts[0].got);
+    try testing.expectEqual(@as(usize, 2 * rep_len), scripts[1].got);
+    try testing.expect(rep.duration_ms >= 40);
+}
+
+test "serveTcpMulti: a connection beyond max_peers is refused when it is accepted, not before" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var rig2: Rig = undefined;
+    try rig2.init(gpa);
+    defer rig2.deinit();
+    // Two listeners ready in the same round, one slot: the first is served, the second is refused.
+    var b1: [req_len]u8 = undefined;
+    const r1 = readReq(&b1, 1);
+    var scripts = [_]Script{
+        .{ .steps = &.{.{ .bytes = r1 }}, .want_bytes = rep_len, .linger_ms = 30 },
+        .{ .steps = &.{.{ .bytes = r1 }}, .want_bytes = rep_len },
+    };
+    const f = &rig.f;
+    const n2 = try f.addNode(.{ .node = rig2.slave.node(), .tag = 2 });
+    const bindings = [_]Binding{
+        .{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } },
+        .{ .node = n2, .address = .{ .ip4 = .loopback(0) } },
+    };
+    const rep = try runServeMulti(gpa, f, &bindings, .{ .idle_ms = 20, .max_peers = 1 }, &scripts, &.{ 0, 1 });
+    try testing.expectEqual(@as(usize, 1), rep.peers_accepted);
+    try testing.expectEqual(@as(usize, 1), rep.peers_refused);
+    try testing.expectEqual(@as(usize, 1), rep.peak_concurrent);
+    try testing.expectEqual(@as(usize, rep_len), scripts[0].got);
+    try testing.expectEqual(@as(usize, 0), scripts[1].got);
+}
+
+test "serveTcpMulti: while every slot is taken the listener is not polled, so a waiting peer is served later, not refused" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    const r1 = readReq(&b1, 1);
+    // A holds the only slot for a while; B connects meanwhile and waits in the backlog.
+    var scripts = [_]Script{
+        .{ .steps = &.{.{ .bytes = r1 }}, .want_bytes = rep_len, .linger_ms = 250 },
+        .{ .steps = &.{.{ .bytes = r1 }}, .want_bytes = rep_len },
+    };
+    const bindings = [_]Binding{.{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } }};
+    const rep = try runServeMulti(gpa, &rig.f, &bindings, .{ .idle_ms = 20, .max_peers = 1, .run_ms = 1500 }, &scripts, &.{ 0, 0 });
+    try testing.expectEqual(@as(usize, 0), rep.peers_refused);
+    try testing.expectEqual(@as(usize, 2), rep.peers_accepted);
+    try testing.expectEqual(@as(usize, rep_len), scripts[1].got); // served once A had left
+    try testing.expectEqual(@as(usize, 1), rep.peak_concurrent);
+}
+
+const TickerNode = struct {
+    fn deliverFn(_: *anyopaque, _: []const u8, _: []u8, _: Time) node_mod.NodeError!?[]const u8 {
+        return null;
+    }
+    fn tickFn(_: *anyopaque, out: []u8, _: Time) node_mod.NodeError!?[]const u8 {
+        @memcpy(out[0..4], "TICK");
+        return out[0..4];
+    }
+};
+
+test "serveTcpOn: max_frames stops after exactly that many reads" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    var b2: [req_len]u8 = undefined;
+    var b3: [req_len]u8 = undefined;
+    const steps = [_]ScriptStep{
+        .{ .bytes = readReq(&b1, 1), .gap_ms = 40 },
+        .{ .bytes = readReq(&b2, 2), .gap_ms = 60 },
+        .{ .bytes = readReq(&b3, 3) },
+    };
+    var scripts = [_]Script{.{ .steps = &steps, .want_bytes = 2 * rep_len }};
+    const rep = try serveOnWith(gpa, &rig.f, rig.node, .{ .idle_ms = 20, .max_frames = 2 }, &scripts);
+    try testing.expectEqual(@as(usize, 2), rep.frames_in);
+    try testing.expectEqual(@as(usize, 2 * req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 2), rep.frames_out);
+}
+
+test "serveTcpOn: another node's unsolicited frames are not written to this peer" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var dummy: u8 = 0;
+    _ = try rig.f.addNode(.{
+        .node = .{ .ctx = &dummy, .vtable = &.{ .deliver = TickerNode.deliverFn, .tick = TickerNode.tickFn } },
+        .tick_period_ms = 30,
+    });
+    var b1: [req_len]u8 = undefined;
+    var scripts = [_]Script{.{ .steps = &.{.{ .bytes = readReq(&b1, 1) }}, .want_bytes = rep_len, .linger_ms = 200 }};
+    const rep = try serveOnWith(gpa, &rig.f, rig.node, .{ .idle_ms = 20 }, &scripts);
+    try testing.expectEqual(@as(usize, 1), rep.frames_out);
+    try testing.expectEqual(@as(usize, rep_len), rep.bytes_out);
+    try testing.expectEqual(@as(usize, rep_len), scripts[0].got);
+}
+
+const UdpClient = struct {
+    port: u16,
+    requests: []const []const u8,
+    replies: usize = 0,
+    reply_bytes: usize = 0,
+};
+
+fn udpClient(c: *UdpClient) void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var sock = (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).bind(io, .{ .mode = .dgram }) catch return;
+    defer sock.close(io);
+    const dest: std.Io.net.IpAddress = .{ .ip4 = .loopback(c.port) };
+    var buf: [256]u8 = undefined;
+    for (c.requests) |req| {
+        // The server may not have bound yet: resend until a reply comes.
+        var tries: usize = 0;
+        while (tries < 300) : (tries += 1) {
+            sock.send(io, &dest, req) catch return;
+            const msg = sock.receiveTimeout(io, &buf, .{ .duration = .{
+                .raw = .fromNanoseconds(@as(i96, 100) * 1_000_000),
+                .clock = .awake,
+            } }) catch {
+                // An ICMP refusal returns at once while the server is not bound yet: do not burn the tries.
+                sleepMs(10);
+                continue;
+            };
+            c.replies += 1;
+            c.reply_bytes += msg.data.len;
+            // A zero-length datagram, once the server is certainly bound: it is not a frame.
+            if (c.replies == 1) sock.send(io, &dest, &.{}) catch {};
+            break;
+        }
+        if (tries >= 300) {
+            // Gave up: feed the server enough datagrams to end its run, so the test fails instead of hanging.
+            for (0..4) |_| sock.send(io, &dest, req) catch {};
+            return;
+        }
+    }
+}
+
+test "serveUdp: the report counts datagrams and bytes both ways, and replies go back to the sender" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A free port: bind port 0, read it back, close.
+    var probe = (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).bind(io, .{ .mode = .dgram }) catch return socketSkip("loopback udp bind failed");
+    const port = probe.address.getPort();
+    probe.close(io);
+
+    var b1: [req_len]u8 = undefined;
+    var b2: [req_len]u8 = undefined;
+    const reqs = [_][]const u8{ readReq(&b1, 1), readReq(&b2, 2) };
+    var c = UdpClient{ .port = port, .requests = &reqs };
+    const th = try std.Thread.spawn(.{}, udpClient, .{&c});
+    const rep = serveUdp(gpa, io, &rig.f, rig.node, .{ .ip4 = .loopback(port) }, .{
+        .idle_ms = 20,
+        .max_frames = 2, // run_ms stays 0: the run ends by itself after two datagrams
+    }) catch |e| {
+        th.join();
+        return switch (e) {
+            error.BindFailed => socketSkip("serveUdp cannot bind 127.0.0.1"),
+            else => e,
+        };
+    };
+    th.join();
+    try testing.expect(rep.connected);
+    try testing.expectEqual(@as(usize, 2), rep.frames_in);
+    try testing.expectEqual(@as(usize, 2 * req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 2), rep.frames_out);
+    try testing.expectEqual(@as(usize, 2 * rep_len), rep.bytes_out);
+    try testing.expectEqual(@as(usize, 2), c.replies);
+    try testing.expectEqual(@as(usize, 2 * rep_len), c.reply_bytes);
+}
+
+test "serveUdp: another node's frames are not sent to this peer" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var dummy: u8 = 0;
+    _ = try rig.f.addNode(.{
+        .node = .{ .ctx = &dummy, .vtable = &.{ .deliver = TickerNode.deliverFn, .tick = TickerNode.tickFn } },
+        .tick_period_ms = 10,
+    });
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var probe = (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).bind(io, .{ .mode = .dgram }) catch return socketSkip("loopback udp bind failed");
+    const port = probe.address.getPort();
+    probe.close(io);
+    var b1: [req_len]u8 = undefined;
+    const reqs = [_][]const u8{readReq(&b1, 1)};
+    var c = UdpClient{ .port = port, .requests = &reqs };
+    const th = try std.Thread.spawn(.{}, udpClient, .{&c});
+    const rep = serveUdp(gpa, io, &rig.f, rig.node, .{ .ip4 = .loopback(port) }, .{
+        .idle_ms = 20,
+        .run_ms = 600,
+    }) catch |e| {
+        th.join();
+        return switch (e) {
+            error.BindFailed => socketSkip("serveUdp cannot bind 127.0.0.1"),
+            else => e,
+        };
+    };
+    th.join();
+    // The ticker emits every 10 ms for 600 ms; none of it is this node's.
+    try testing.expectEqual(@as(usize, 1), rep.frames_out);
+    try testing.expectEqual(@as(usize, rep_len), rep.bytes_out);
+    try testing.expect(rep.duration_ms >= 500);
+}
+
+test "serveTcpMulti: a frame bigger than the read buffer is dropped and the peer stays served" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    var scripts = [_]Script{.{ .steps = &.{.{ .bytes = readReq(&b1, 1), .gap_ms = 60 }}, .linger_ms = 40 }};
+    const bindings = [_]Binding{.{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } }};
+    const rep = try runServeMulti(gpa, &rig.f, &bindings, .{ .idle_ms = 20, .read_buf = 8, .max_peers = 1 }, &scripts, &.{0});
+    try testing.expectEqual(@as(usize, req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 2), rep.frames_in);
+    try testing.expectEqual(@as(usize, 0), rep.frames_out);
+}
+
+test "serveTcpMulti: max_frames stops after exactly that many reads" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    var b2: [req_len]u8 = undefined;
+    var b3: [req_len]u8 = undefined;
+    const steps = [_]ScriptStep{
+        .{ .bytes = readReq(&b1, 1), .gap_ms = 40 },
+        .{ .bytes = readReq(&b2, 2), .gap_ms = 60 },
+        .{ .bytes = readReq(&b3, 3) },
+    };
+    var scripts = [_]Script{.{ .steps = &steps, .want_bytes = 2 * rep_len }};
+    const bindings = [_]Binding{.{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } }};
+    const rep = try runServeMulti(gpa, &rig.f, &bindings, .{ .idle_ms = 20, .max_frames = 2, .run_ms = 3000 }, &scripts, &.{0});
+    try testing.expectEqual(@as(usize, 2), rep.frames_in);
+    try testing.expectEqual(@as(usize, 2), rep.frames_out);
+}
+
+test "serveTcpMulti: nobody connecting is NoPeer, and run_ms bounds the wait even with a long idle_ms" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bindings = [_]Binding{.{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } }};
+    const t0 = nowMs();
+    const res = serveTcpMulti(gpa, io, &rig.f, &bindings, .{ .idle_ms = 3000, .run_ms = 300 });
+    if (res) |_| return error.TestUnexpectedResult else |e| {
+        if (e == error.BindFailed) return socketSkip("serveTcpMulti cannot bind 127.0.0.1");
+        try testing.expectEqual(error.NoPeer, e);
+    }
+    try testing.expect(nowMs() - t0 < 2500); // not the 3000 ms idle round
+}
+
+test "serveTcpMulti: unsolicited traffic reaches the peers of its own listener only" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var dummy: u8 = 0;
+    const ticker = try rig.f.addNode(.{
+        .node = .{ .ctx = &dummy, .vtable = &.{ .deliver = TickerNode.deliverFn, .tick = TickerNode.tickFn } },
+        .tick_period_ms = 30,
+    });
+    const bindings = [_]Binding{
+        .{ .node = ticker, .address = .{ .ip4 = .loopback(0) } },
+        .{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } },
+    };
+    var scripts = [_]Script{
+        .{ .want_bytes = 4 }, // on the ticker's listener
+        .{ .want_bytes = 4 }, // on the Modbus listener: must never see a TICK; ends when the server hangs up
+    };
+    const rep = try runServeMulti(gpa, &rig.f, &bindings, .{ .idle_ms = 20, .max_peers = 3, .run_ms = 700 }, &scripts, &.{ 0, 1 });
+    try testing.expect(scripts[0].got >= 4);
+    try testing.expectEqual(@as(usize, 0), scripts[1].got);
+    try testing.expectEqual(@as(usize, 2), rep.peers_accepted);
+}
+
+test "serveTcpMulti: a frame split across two reads is reassembled" {
+    const gpa = testing.allocator;
+    var rig: Rig = undefined;
+    try rig.init(gpa);
+    defer rig.deinit();
+    var b1: [req_len]u8 = undefined;
+    const r1 = readReq(&b1, 1);
+    const steps = [_]ScriptStep{ .{ .bytes = r1[0..5], .gap_ms = 80 }, .{ .bytes = r1[5..] } };
+    var scripts = [_]Script{.{ .steps = &steps, .want_bytes = rep_len }};
+    const bindings = [_]Binding{.{ .node = rig.node, .address = .{ .ip4 = .loopback(0) } }};
+    const rep = try runServeMulti(gpa, &rig.f, &bindings, .{ .idle_ms = 20, .max_peers = 1, .run_ms = 1500 }, &scripts, &.{0});
+    try testing.expectEqual(@as(usize, rep_len), scripts[0].got);
+    try testing.expectEqual(@as(usize, req_len), rep.bytes_in);
+    try testing.expectEqual(@as(usize, 2), rep.frames_in);
+    try testing.expectEqual(@as(usize, 1), rep.frames_out);
+}

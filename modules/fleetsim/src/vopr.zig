@@ -994,4 +994,211 @@ test "vopr: the standalone pump() at the top of onTimer keeps a device's own clo
     // pump() riding the master's independent poll-timer chain (poll_period =
     // 20ms), not by anything network-shaped.
     try testing.expect(h.probeTicks() >= 30);
+    // …and at the configured pace, not once a millisecond.
+    try testing.expect(h.probeTicks() <= 45);
+}
+
+// ── whole-module mutation audit 2026-11-18 ──────────────────────────────────
+
+fn replyFrame(buf: []u8, txid: u16, unit: u8, fc: u8, regs: []const u16) []const u8 {
+    const bc: usize = regs.len * 2;
+    std.mem.writeInt(u16, buf[0..2], txid, .big);
+    std.mem.writeInt(u16, buf[2..4], 0, .big);
+    std.mem.writeInt(u16, buf[4..6], @intCast(3 + bc), .big);
+    buf[6] = unit;
+    buf[7] = fc;
+    buf[8] = @intCast(bc);
+    for (regs, 0..) |r, k| std.mem.writeInt(u16, buf[9 + 2 * k ..][0..2], r, .big);
+    return buf[0 .. 9 + bc];
+}
+
+test "oracle: onReply classifies each way a reply can be wrong, and a good one passes" {
+    var h = Harness.init(testing.allocator, .{});
+    defer h.deinit();
+    var buf: [64]u8 = undefined;
+    const ok_regs = [_]u16{ 500, 500, 500, 500 };
+
+    // A clean reply from device 1 (node 1, unit 1) for a transaction that was issued.
+    h.issued = .{ 3, 3 };
+    h.onReply(1, replyFrame(&buf, 2, 1, 0x03, &ok_regs));
+    try testing.expectEqual(@as(?anyerror, null), h.violation);
+    try testing.expectEqual(@as(u32, 1), h.replies[0]);
+
+    // Exception replies (9 bytes, fc 0x83) are legitimate.
+    var exc: [9]u8 = undefined;
+    std.mem.writeInt(u16, exc[0..2], 1, .big);
+    std.mem.writeInt(u16, exc[2..4], 0, .big);
+    std.mem.writeInt(u16, exc[4..6], 3, .big);
+    exc[6] = 2;
+    exc[7] = 0x83;
+    exc[8] = 0x04;
+    h.onReply(2, &exc);
+    try testing.expectEqual(@as(?anyerror, null), h.violation);
+
+    // The first violation sticks: a later, different one does not replace it.
+    h.onReply(1, replyFrame(&buf, 1, 9, 0x03, &ok_regs)); // wrong unit id
+    try testing.expectEqual(Violation.UnitIdMismatch, h.violation.?);
+    h.onReply(1, &.{ 1, 2, 3 }); // malformed
+    try testing.expectEqual(Violation.UnitIdMismatch, h.violation.?);
+}
+
+test "oracle: each violation kind, each at its own boundary" {
+    const Case = struct { from: usize, bytes: []const u8, want: ?anyerror };
+    var buf: [64]u8 = undefined;
+    const good = [_]u16{ 500, 500, 500, 500 };
+    const frame_wrong_fc = replyFrame(&buf, 1, 1, 0x04, &good);
+    var buf2: [64]u8 = undefined;
+    const low = replyFrame(&buf2, 1, 1, 0x03, &.{ 299, 500, 500, 500 });
+    var buf3: [64]u8 = undefined;
+    const below = replyFrame(&buf3, 1, 1, 0x03, &.{ 298, 500, 500, 500 });
+    var buf4: [64]u8 = undefined;
+    const high = replyFrame(&buf4, 1, 1, 0x03, &.{ 500, 500, 500, 701 });
+    var buf5: [64]u8 = undefined;
+    const above = replyFrame(&buf5, 1, 1, 0x03, &.{ 500, 500, 500, 702 });
+    var buf6: [64]u8 = undefined;
+    const wrong_unit = replyFrame(&buf6, 1, 2, 0x03, &good);
+    var buf7: [64]u8 = undefined;
+    const tx0 = replyFrame(&buf7, 0, 1, 0x03, &good);
+    var buf8: [64]u8 = undefined;
+    const tx_future = replyFrame(&buf8, 4, 1, 0x03, &good); // issued is 3
+    var buf9: [64]u8 = undefined;
+    const tx_last = replyFrame(&buf9, 3, 1, 0x03, &good);
+    // byte count says 8 but the frame carries only 6 data bytes (MBAP length agrees with the short frame).
+    var short: [15]u8 = undefined;
+    _ = replyFrame(&short, 1, 1, 0x03, &.{ 500, 500, 500 });
+    short[8] = 8;
+    // eight octets in total: consistent MBAP length but shorter than any reply
+    const tiny = [_]u8{ 0, 1, 0, 0, 0, 2, 1, 0x83 };
+    const cases = [_]Case{
+        .{ .from = 0, .bytes = &good_dummy, .want = Violation.UnitIdMismatch }, // from the master itself
+        .{ .from = 3, .bytes = &good_dummy, .want = Violation.UnitIdMismatch }, // from beyond the last device
+        .{ .from = 1, .bytes = &.{}, .want = Violation.MalformedReply }, // not a frame yet
+        .{ .from = 1, .bytes = &.{ 0, 1, 0, 0, 0, 0 }, .want = Violation.MalformedReply }, // bad frame head
+        .{ .from = 1, .bytes = &tiny, .want = Violation.MalformedReply }, // 8 bytes: complete but too short
+        .{ .from = 1, .bytes = &short, .want = Violation.MalformedReply }, // byte count disagrees with the frame
+        .{ .from = 1, .bytes = frame_wrong_fc, .want = Violation.MalformedReply },
+        .{ .from = 1, .bytes = wrong_unit, .want = Violation.UnitIdMismatch },
+        .{ .from = 1, .bytes = tx0, .want = Violation.UnknownTransaction },
+        .{ .from = 1, .bytes = tx_future, .want = Violation.UnknownTransaction },
+        .{ .from = 1, .bytes = tx_last, .want = null }, // exactly the last issued id is fine
+        .{ .from = 1, .bytes = low, .want = null }, // exactly value_lo
+        .{ .from = 1, .bytes = below, .want = Violation.ValueOutOfRange },
+        .{ .from = 1, .bytes = high, .want = null }, // exactly value_hi
+        .{ .from = 1, .bytes = above, .want = Violation.ValueOutOfRange },
+    };
+    for (cases, 0..) |c, i| {
+        var h = Harness.init(testing.allocator, .{});
+        defer h.deinit();
+        h.issued = .{ 3, 3 };
+        h.onReply(@intCast(c.from), c.bytes);
+        const got: ?anyerror = h.violation;
+        if (c.want) |w| {
+            if (got == null or got.? != w) {
+                std.debug.print("case {d}: expected {any}, got {any}\n", .{ i, w, got });
+                return error.TestUnexpectedResult;
+            }
+        } else if (got != null) {
+            std.debug.print("case {d}: expected no violation, got {any}\n", .{ i, got });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+const good_dummy = [_]u8{ 0, 1, 0, 0, 0, 3, 1, 0x83, 4 };
+
+test "protocol hooks: only the master arms the poll timer; a failed rebuild is reported, not hidden" {
+    const gpa = testing.allocator;
+    // A clean run: exactly one start of the master's timer chain.
+    var h = Harness.init(gpa, .{ .fleet_seed = 3 });
+    defer h.deinit();
+    const r1 = try netsim.replay(gpa, h.case(0, 400), &.{}, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r1.outcome);
+    try testing.expectEqual(@as(u64, 1), h.gen);
+    const polls1 = h.polls;
+    try testing.expect(polls1 > 5);
+    // A second run on the same harness starts from a clean slate (the shrinker relies on it).
+    const r2 = try netsim.replay(gpa, h.case(0, 400), &.{}, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r2.outcome);
+    try testing.expectEqual(polls1, h.polls);
+    try testing.expectEqual(@as(u64, 1), h.gen);
+
+    // A rebuild that fails is remembered and reported by `check`; handlers refuse to run on it.
+    var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = std.math.maxInt(usize) });
+    var f = Harness.init(fa.allocator(), .{});
+    defer f.deinit();
+    try f.rebuild();
+    try testing.expect(f.fleet_live);
+    fa.fail_index = fa.alloc_index; // the very next allocation fails
+    Harness.reset(&f);
+    try testing.expect(f.rebuild_err != null);
+    try testing.expect(!f.fleet_live); // the old fleet was torn down and is known to be gone
+    try testing.expectError(Violation.FleetRebuildFailed, Harness.check(&f, undefined));
+    // A later successful rebuild clears the error.
+    fa.fail_index = std.math.maxInt(usize);
+    Harness.reset(&f);
+    try testing.expectEqual(@as(?anyerror, null), f.rebuild_err);
+    try testing.expect(f.fleet_live);
+    try Harness.check(&f, undefined);
+
+    // With the error set, onMessage ignores everything, even a reply that would be a violation …
+    f.rebuild_err = error.OutOfMemory;
+    try Harness.onMessage(&f, undefined, master, 1, &.{ 1, 2, 3 });
+    try testing.expectEqual(@as(?anyerror, null), f.violation);
+    // … and the poll timer does not fire into a fleet that failed to rebuild.
+    try Harness.onTimer(&f, undefined, master, f.gen);
+    try testing.expectEqual(@as(u32, 0), f.polls);
+    // … and `check` reports the failed rebuild although the fleet itself is alive.
+    try testing.expectError(Violation.FleetRebuildFailed, Harness.check(&f, undefined));
+    f.rebuild_err = null;
+
+    // Fresh harness, never rebuilt: check refuses rather than reading an undefined fleet.
+    var fresh = Harness.init(gpa, .{});
+    defer fresh.deinit();
+    try testing.expectError(Violation.FleetRebuildFailed, Harness.check(&fresh, undefined));
+}
+
+test "BrokenDevice: request validation, exact fits and the invented-transaction counter" {
+    var values = [_]u16{ 10, 20, 30, 40 };
+    var d = BrokenDevice.init(5, &values, .invented_transaction);
+    const n = d.node();
+    var out: [64]u8 = undefined;
+
+    const req = struct {
+        fn make(b: *[12]u8, txid: u16, proto: u16, unit: u8, fc: u8, addr: u16, count: u16) []const u8 {
+            std.mem.writeInt(u16, b[0..2], txid, .big);
+            std.mem.writeInt(u16, b[2..4], proto, .big);
+            std.mem.writeInt(u16, b[4..6], 6, .big);
+            b[6] = unit;
+            b[7] = fc;
+            std.mem.writeInt(u16, b[8..10], addr, .big);
+            std.mem.writeInt(u16, b[10..12], count, .big);
+            return b;
+        }
+    };
+    var b: [12]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), try n.deliver(req.make(&b, 1, 0, 5, 3, 0, 1)[0..11], &out, 0)); // 11 bytes
+    try testing.expectEqual(@as(?[]const u8, null), try n.deliver(req.make(&b, 1, 1, 5, 3, 0, 1), &out, 0)); // protocol id
+    try testing.expectEqual(@as(?[]const u8, null), try n.deliver(req.make(&b, 1, 0, 6, 3, 0, 1), &out, 0)); // unit
+    try testing.expectEqual(@as(?[]const u8, null), try n.deliver(req.make(&b, 1, 0, 5, 4, 0, 1), &out, 0)); // function code
+    try testing.expectEqual(@as(?[]const u8, null), try n.deliver(req.make(&b, 1, 0, 5, 3, 0, 0), &out, 0)); // count 0
+    try testing.expectEqual(@as(?[]const u8, null), try n.deliver(req.make(&b, 1, 0, 5, 3, 3, 2), &out, 0)); // past the end
+    try testing.expect(!d.seen); // none of the refused requests counted
+
+    // addr + count == len exactly: answered.
+    const full = (try n.deliver(req.make(&b, 1, 0, 5, 3, 2, 2), &out, 0)).?;
+    try testing.expectEqual(@as(usize, 7 + 2 + 4), full.len);
+    try testing.expectEqual(@as(u16, 30), std.mem.readInt(u16, full[9..11], .big));
+    try testing.expectEqual(@as(u16, 1), d.counter);
+
+    // The same txid again is a "repeat": the invented transaction id comes from the counter (now 2).
+    const rep = (try n.deliver(req.make(&b, 1, 0, 5, 3, 2, 2), &out, 0)).?;
+    try testing.expectEqual(@as(u16, 0xF002), std.mem.readInt(u16, rep[0..2], .big));
+
+    // The output buffer must hold the whole reply: exactly enough works, one short is an error.
+    var exact: [11]u8 = undefined; // count 1 -> 7 + 2 + 2
+    var d2 = BrokenDevice.init(5, &values, .none);
+    const n2 = d2.node();
+    try testing.expectEqual(@as(usize, 11), (try n2.deliver(req.make(&b, 1, 0, 5, 3, 0, 1), &exact, 0)).?.len);
+    var short: [10]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, n2.deliver(req.make(&b, 2, 0, 5, 3, 0, 1), &short, 0));
 }
