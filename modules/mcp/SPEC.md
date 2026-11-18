@@ -519,7 +519,7 @@ worst row (0.46× Go); caching the compact text at `addTool` would cut it, no co
   answered here (below). The differential run against the TypeScript SDK client is still to do.
 - ~~**Held-open `subscriptions/listen`**~~ — **DONE 2026-10-20** (R12) in this module; `mcp-http` still answers it as before until its stream is wired.
 - ~~**Validate `x-mcp-header` at `addTool`**~~ — **done 2026-10-02** (`header_annotations.zig`): non-token or empty names, case-insensitive duplicates, a type other than `string`/`integer`/`boolean`, and annotations off a `properties`-only chain (or deeper than `max_chain` = 32, the depth `mcp-http` reads) are refused with `HeaderAnnotation*` errors. Rules read from the 2026-07-28 `server/tools.mdx` and `transports/streamable-http.mdx`.
-- **PLAN — spec revision 2026-07-28** (user 2026-09-30: "plan it"; read from the revision's own
+- ✅ DONE 2026-09-30 (`c391886b8`: M1–M4 in `mcp`; M5 is `mcp-http`'s stateless transport, same day, see its CHANGELOG). **PLAN — spec revision 2026-07-28** (user 2026-09-30: "plan it"; read from the revision's own
   `changelog.mdx` and `deprecated.mdx`, spec text only). The official SDKs all target it, and it is the
   largest break since the transport rewrite: **MCP becomes stateless**.
   - **What changes for this module** (a server core; `mcp-http` has its own list, below):

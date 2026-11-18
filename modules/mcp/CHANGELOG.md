@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the delta mutation run over the typed tools (97 mutants: 96 killed, 1 equivalent).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation run over the typed-tools decoder (`typed.zig` `parse`/`decode` every arm, `ToolCall.argsAs`/`writeJson`): 91 mutants, 90 killed, 1 equivalent (`bad` resetting a pointer `parse` already cleared). New tests: hostile floats (1e300, inf, NaN, -0.0, 2^63 edges), integer bound edges, wrong JSON types per arm, full JSON Pointer paths through arrays/structs, optional elements and `null` as absent with defaults, exact unknown-property matching and 64-byte truncation, failure-record reset, and OOM that fails one allocation only (pointer and message untouched, no "invalid arguments" text). No defect found.
