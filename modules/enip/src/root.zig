@@ -3310,6 +3310,15 @@ test "assembly object: every refusal" {
         const q = try (cip.Request{ .service = svc, .path = (try epath.logicalPath(class, 100, null, &pb)), .data = &.{} }).encode(&rq);
         try testing.expectEqual(S.path_segment_error, (try routed(&target, q, &keep)).general_status);
     }
+    // A path with no instance segment addresses the class: its attribute is
+    // served, and Set is the service the class does not have.
+    const no_inst = [_]u8{ 0x20, 0x04, 0x30, 0x01 };
+    const cg = try (cip.Request{ .service = 0x0E, .path = &no_inst, .data = &.{} }).encode(&rq);
+    const cgr = try routed(&target, cg, &keep);
+    try testing.expectEqual(S.success, cgr.general_status);
+    try testing.expectEqualSlices(u8, &.{ 2, 0 }, cgr.data);
+    const cs = try (cip.Request{ .service = 0x10, .path = &no_inst, .data = &.{ 2, 0 } }).encode(&rq);
+    try testing.expectEqual(S.service_not_supported, (try routed(&target, cs, &keep)).general_status);
     // Other services stay unsupported, as for every other class.
     for ([_]u8{ 0x02, 0x03, 0x08, 0x09, 0x0B }) |svc| {
         const q = try (cip.Request{ .service = svc, .path = (try epath.logicalPath(class, 100, 3, &pb)), .data = &.{} }).encode(&rq);
@@ -3328,6 +3337,11 @@ test "assembly object: withheld without instances, and a buffer too big for the 
         var rq: [64]u8 = undefined;
         const q = try (cip.Request{ .service = svc, .path = (try epath.logicalPath(class, 1, 3, &pb)), .data = &.{} }).encode(&rq);
         try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, (try routed(&target, q, &keep)).general_status);
+    }
+    // The class itself is withheld too, not just its instances.
+    for ([_]u32{ 1, 2, 3 }) |a| {
+        const c = try routed(&target, try cip.getAttributeSingle(class, 0, a, &rb), &keep);
+        try testing.expectEqual(cip.GeneralStatus.path_destination_unknown, c.general_status);
     }
     // Set stays "service not supported" when the class is not served.
     const s = try routed(&target, try cip.setAttributeSingle(class, 1, 3, &.{1}, &rb), &keep);

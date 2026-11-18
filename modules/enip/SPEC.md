@@ -6,7 +6,7 @@
 
 **Scope:** mvp — pycomm3 (client) and OpENer 2.3 (adapter) (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-06 · mutation 2026-11-18 (1468/1517, 49 eq) · src 1d3897137a5dde03
+**Audit:** review 2026-10-06 · mutation 2026-11-18 (1523/1575, 52 eq) · src 831c2eca7345bd73
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ENIP_FUZZ) · ct n/a — industrial protocol, no auth (keyword review, 2026-10-07)
 
@@ -812,6 +812,8 @@ src/root.zig.
 **Delta mutation 2026-11-18 (TCP/IP Interface object).** 111 mutants over `stdobj.zig` and the adapter's new routing, run against the object's own tests: 105 killed, 6 EQUIVALENT, none left open. Test additions during the run: the three edges of every alphanumeric range, the class D boundary (`224.0.0.0`), name-server and gateway class and loopback rules with no mask, an absent instance on all three services, and a non-empty domain stored and read back. EQUIVALENT: `validMask`'s `host_span != 0` (only called with a non-zero mask, so the span is never zero), its `mask != 0xFFFFFFFF` (a /32 mask makes every address its own network address, refused by `networkOrBroadcast` anyway), `ip == 0` (zero is the network address under any mask), `mask != 0` in the gateway reachability test (with no mask both sides are zero), and the two `> maxInt(u16)` attribute guards at `>=` (attribute 65535 is not served either way). Card counts are cumulative with the whole-module run above.
 
 **Delta mutation 2026-11-18 (Ethernet Link object).** 15 mutants over the object's encoders, the all-reply loop and the adapter's routing and attribute guards: 14 killed, 1 EQUIVALENT (the `>= maxInt(u16)` attribute guard, for the reason above). Card counts are cumulative (both delta runs: 126 mutants).
+
+**Delta mutation 2026-11-18 (Assembly object).** 58 mutants over `stdobj.zig` (`assemblyFind`, `assemblyClassAttribute`, `assemblySet`) and the adapter's Assembly routing (the class and non-empty-list guards on the three services, the class-versus-instance split, the attribute and size encoders, the status of each refusal), run against the object's own tests (root, `stdobj`, the pycomm3 goldens): 55 killed, 3 EQUIVALENT, none left open. Round 1 left 4 survivors: one test was added (the class attributes of a withheld class answer `path_destination_unknown`, killing the guard `len != 0` -> `true`), and a path without an instance segment (class addressing, Get and Set) and the largest `UINT` instance id were added before the build. The 3 EQUIVALENT: `id > maxInt(u16)` -> `false` in `assemblyFind` (the entries' `instance` is a `u16`, so no entry can equal an id above 16 bits and the lookup misses either way), and the two `attr > maxInt(u16)` guards at `>=` (attribute 65535 is unserved on both sides of the guard, as for the other standard objects). Not mutated: the config struct defaults and the hook-pointer plumbing beyond the `after_set` / `before_get` calls. The card counts are cumulative with the 2026-11-18 whole-module entry.
 
 **Fix found by the audit.** `Client.sendConnectedCip` advanced the connection's sequence count before it knew the envelope fitted: a request of 245 to 446 octets passed the 64-octet guard, consumed a count, and then failed `BufferTooSmall`. The count is now committed only after the whole frame is built (CIP Vol 2: the sequence count is per transmitted data packet).
 

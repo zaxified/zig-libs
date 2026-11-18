@@ -799,6 +799,9 @@ test "assemblyFind and class attributes: instance 0, repeats and oversize buffer
     try testing.expectEqual(@as(?*const Assembly, null), assemblyFind(&list, 0));
     try testing.expectEqual(@as(?*const Assembly, null), assemblyFind(&list, 6));
     try testing.expectEqual(@as(?*const Assembly, null), assemblyFind(&list, 0x10005));
+    // the largest id a UINT holds is served
+    const top = [_]Assembly{.{ .instance = 65535, .data = &a }};
+    try testing.expectEqual(@as(*const Assembly, &top[0]), assemblyFind(&top, 65535).?);
     try testing.expectEqual(@as(*const Assembly, &list[1]), assemblyFind(&list, 5).?);
     var o: [2]u8 = undefined;
     try testing.expectEqual(@as(?usize, 2), assemblyClassAttribute(&list, 3, &o));
