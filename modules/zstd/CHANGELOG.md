@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the 4 GiB `writeSkippableFrame` source test runs only where `usize` holds 2^32 (it failed to compile for the 32-bit portable target).
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of the decoder (1 359 mutants: bit reader, `readNCount`, Huffman and FSE table decoding, literals/sequence sections, sequence execution, frame headers and size queries, dictionary loading, seekable) with 1 051 killed, 111 equivalent, 7 unobservable and 190 open (ids in SPEC § Decoder); new tests `src/dmut_test.zig` and in `dbits.zig`, `dblock.zig`, `seekable.zig` (boundary tests, a frame-header model, Huffman round trips, an `execSequence` model); no source change. The encoder is not covered, so the card keeps no mutation counts.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GL sweep (34 mutants over the sweep diff, ReleaseSafe schemata): 31 killed, 3 equivalent (argued: `checkContinuity`'s `broken` guard is unreachable since the zero-byte-write fix; dictionary FSE table logs ≤ 9 keep `freqFromFse` within the scale); 5 new tests in `src/sweep_*_test.zig`, among them a deterministic dictionary with a 12-bit Huffman code compressed at levels 16/19/22. Not a whole-module mutation score.

@@ -910,8 +910,11 @@ test "writeSkippableFrame: the exact room, the largest variant, one past each li
     try std.testing.expectError(error.NoSpaceLeft, zstd.writeSkippableFrame(dst[0..10], "abc", 15));
     try std.testing.expectError(error.ParameterOutOfBound, zstd.writeSkippableFrame(&dst, "abc", 16));
     try std.testing.expectEqual(@as(usize, 8), try zstd.writeSkippableFrame(&dst, "", 0));
-    // a source of 4 GiB: refused before any byte is read or written (the slices are never dereferenced)
-    const p: [*]u8 = @ptrFromInt(4096);
-    const n: usize = @as(usize, std.math.maxInt(u32)) + 1;
-    try std.testing.expectError(error.SrcSizeWrong, zstd.writeSkippableFrame(p[0 .. n + 8], p[0..n], 0));
+    // a source of 4 GiB: refused before any byte is read or written (the slices are never dereferenced).
+    // Only where `usize` can hold it: on a 32-bit target such a slice cannot exist.
+    if (comptime @bitSizeOf(usize) > 32) {
+        const p: [*]u8 = @ptrFromInt(4096);
+        const n: usize = @as(usize, std.math.maxInt(u32)) + 1;
+        try std.testing.expectError(error.SrcSizeWrong, zstd.writeSkippableFrame(p[0 .. n + 8], p[0..n], 0));
+    }
 }
