@@ -234,6 +234,25 @@ pub const Options = struct {
     /// (back-off 1 s, 2 s, … or its `Retry-After` when that is at most 30 s;
     /// a longer one returns the problem with `retryAfter` set). 0 = never.
     max_unavailable_retries: u8 = 2,
+    /// The CA-URL policy (2026-11-18). Every URL the client sends a request to
+    /// that the CA supplied — the directory's resources, `Location`, an order's
+    /// authorizations / finalize / certificate, a challenge, a `Link`
+    /// alternate, and whatever the caller passes back to `fetchOrder` and
+    /// friends — must be `https` (or carry the scheme of `directory_url`
+    /// itself, which a caller who configured an `http://` test CA chose), must
+    /// not carry userinfo, and, by default, must be on an allowed origin
+    /// (host compared case-insensitively, plus the effective port): the
+    /// origin of `directory_url`, the origin of any resource URL the directory
+    /// document lists (the CA's own declaration — ZeroSSL's ARI lives on
+    /// another domain), or an `extra_allowed_hosts` entry. Anything else is
+    /// `error.UrlNotAllowed`, before a byte is sent, so a hostile or
+    /// compromised CA cannot aim signed POSTs at internal hosts. Redirects of
+    /// the client's GET/HEAD requests go through the same check. `true` keeps
+    /// only the scheme rule.
+    allow_cross_host_urls: bool = false,
+    /// Further origins a CA-supplied URL may point at: `host` (port 443) or
+    /// `host:port` (`[v6]:port` for an IPv6 literal). Caller-owned.
+    extra_allowed_hosts: []const []const u8 = &.{},
 };
 
 const max_unavailable_wait_ms = 30_000;
@@ -282,6 +301,10 @@ pub const Error = error{
     /// `revokeCert`, `renewalInfo`): this CA does not offer it. For ARI the
     /// caller falls back to `needsRenewal`.
     NotSupported,
+    /// A CA-supplied URL (or a redirect of one) failed the CA-URL policy:
+    /// not `https`, userinfo, or an origin outside the allowed set (see
+    /// `Options.allow_cross_host_urls`). Nothing was sent to it.
+    UrlNotAllowed,
 };
 
 const Directory = struct {
@@ -835,7 +858,7 @@ pub fn renewalInfo(c: *Client, cert_der: []const u8) Error!RenewalInfo {
     defer c.gpa.free(url);
 
     c.clearProblem();
-    var res = c.http_client.request(.get, url, .{}) catch |err| return mapHttpError(err);
+    var res = c.http_client.request(.get, url, .{ .redirect_filter = c.urlFilter() }) catch |err| return mapHttpError(err);
     defer res.deinit();
     try c.harvestNonce(&res);
     const body = try c.readBody(&res, c.gpa);
@@ -2103,7 +2126,7 @@ fn ensureDirectory(c: *Client) Error!void {
     if (c.dir != null) return;
     c.clearProblem();
 
-    var res = c.http_client.request(.get, c.options.directory_url, .{}) catch |err|
+    var res = c.http_client.request(.get, c.options.directory_url, .{ .redirect_filter = c.urlFilter() }) catch |err|
         return mapHttpError(err);
     defer res.deinit();
     try c.harvestNonce(&res);
@@ -2129,12 +2152,14 @@ fn ensureDirectory(c: *Client) Error!void {
         else => return error.MalformedResponse,
     };
     defer parsed.deinit();
+    // Every resource must be a URL whose scheme passes the CA-URL policy; its
+    // host may be any (the directory is the CA's declaration of its origins).
     inline for (.{ parsed.value.newNonce, parsed.value.newAccount, parsed.value.newOrder }) |url| {
-        _ = http.Url.parse(url) catch return error.MalformedResponse;
+        try c.checkDirectoryResource(url);
     }
     // The optional resources: absent is fine, present must be a URL.
     inline for (.{ parsed.value.keyChange, parsed.value.revokeCert, parsed.value.renewalInfo }) |opt| {
-        if (opt) |url| _ = http.Url.parse(url) catch return error.MalformedResponse;
+        if (opt) |url| try c.checkDirectoryResource(url);
     }
 
     const new_nonce = try c.gpa.dupe(u8, parsed.value.newNonce);
@@ -2169,6 +2194,88 @@ fn ensureDirectory(c: *Client) Error!void {
         .renewal_info = renewal_info,
         .profiles = offered,
     };
+}
+
+/// A directory resource: a parseable URL (else `MalformedResponse`) whose
+/// scheme passes `schemeAllowed` (else `UrlNotAllowed`). Any host.
+fn checkDirectoryResource(c: *Client, url: []const u8) Error!void {
+    const u = http.Url.parse(url) catch return error.MalformedResponse;
+    if (!c.schemeAllowed(u)) {
+        c.note("directory resource is not https");
+        return error.UrlNotAllowed;
+    }
+}
+
+/// RFC 8555 §6.1: ACME runs over HTTPS. The scheme of `directory_url` is
+/// admitted too: a caller who configured an `http://` CA (a local test CA)
+/// made that choice for every URL of it.
+fn schemeAllowed(c: *const Client, u: http.Url) bool {
+    if (u.scheme == .https) return true;
+    const dir_u = http.Url.parse(c.options.directory_url) catch return false;
+    return u.scheme == dir_u.scheme;
+}
+
+/// The CA-URL policy (see `Options.allow_cross_host_urls`). A URL that does
+/// not parse — userinfo included, which `http.Url.parse` refuses — fails.
+fn urlAllowed(c: *const Client, url: []const u8) bool {
+    const u = http.Url.parse(url) catch return false;
+    return c.parsedUrlAllowed(u);
+}
+
+fn parsedUrlAllowed(c: *const Client, u: http.Url) bool {
+    if (!c.schemeAllowed(u)) return false;
+    if (c.options.allow_cross_host_urls) return true;
+    if (http.Url.parse(c.options.directory_url)) |dir_u| {
+        if (sameOrigin(u, dir_u)) return true;
+    } else |_| {}
+    if (c.dir) |d| {
+        const listed = [_]?[]const u8{ d.new_nonce, d.new_account, d.new_order, d.key_change, d.revoke_cert, d.renewal_info };
+        for (listed) |opt| {
+            const s = opt orelse continue;
+            const du = http.Url.parse(s) catch continue;
+            if (sameOrigin(u, du)) return true;
+        }
+    }
+    for (c.options.extra_allowed_hosts) |entry| {
+        if (extraHostOrigin(entry)) |eu| if (sameOrigin(u, eu)) return true;
+    }
+    return false;
+}
+
+/// Same host (ASCII case-insensitive) and same effective port.
+fn sameOrigin(a: http.Url, b: http.Url) bool {
+    return a.port == b.port and std.ascii.eqlIgnoreCase(a.host, b.host);
+}
+
+/// An `extra_allowed_hosts` entry (`host`, `host:port`, `[v6]:port`) as an
+/// `https` URL; null when it is not one. `http.Url.parse` keeps slices of its
+/// input, which here is a stack buffer, so the host is re-pointed into
+/// `entry` (caller-owned) and path/query are constants.
+fn extraHostOrigin(entry: []const u8) ?http.Url {
+    var buf: [max_extra_host_len + "https:///".len]u8 = undefined;
+    if (entry.len > max_extra_host_len) return null; // "" fails the parse below (no host)
+    if (std.mem.findAny(u8, entry, "/?#@") != null) return null;
+    const text = std.mem.print(&buf, "https://{s}/", .{entry}) catch return null;
+    var u = http.Url.parse(text) catch return null;
+    const off = @intFromPtr(u.host.ptr) - @intFromPtr(text.ptr) - "https://".len;
+    u.host = entry[off..][0..u.host.len];
+    u.path = "/";
+    u.query = "";
+    return u;
+}
+
+const max_extra_host_len = 260;
+
+/// The `http.Client` destination gate for the client's GET/HEAD requests:
+/// every hop (the first dial included) must pass `parsedUrlAllowed`.
+fn urlFilter(c: *Client) http.Client.RedirectFilter {
+    return .{ .ctx = c, .allow = filterAllow };
+}
+
+fn filterAllow(ctx: ?*anyopaque, from: http.Url, to: http.Url) bool {
+    _ = from;
+    const c: *const Client = @ptrCast(@alignCast(ctx.?));
+    return c.parsedUrlAllowed(to);
 }
 
 fn dupeProfiles(gpa: Allocator, map: ?std.json.ArrayHashMap([]const u8)) Allocator.Error![]Profile {
@@ -2218,7 +2325,7 @@ fn takeNonce(c: *Client) Error![]u8 {
         }
     }
     const dir = c.dir orelse return error.NotRegistered;
-    var res = c.http_client.request(.head, dir.new_nonce, .{}) catch |err|
+    var res = c.http_client.request(.head, dir.new_nonce, .{ .redirect_filter = c.urlFilter() }) catch |err|
         return mapHttpError(err);
     defer res.deinit();
     const value = res.header("replay-nonce") orelse return error.MalformedResponse;
@@ -2266,6 +2373,10 @@ fn postSignedAccept(c: *Client, a: Allocator, url: []const u8, payload: []const 
     // must not be read as this one's (a renewal failing on a dropped
     // connection would otherwise inherit an old rateLimited's day-long wait).
     c.clearProblem();
+    if (!c.urlAllowed(url)) {
+        c.note("CA-supplied URL refused by the CA-URL policy (Options.allow_cross_host_urls)");
+        return error.UrlNotAllowed;
+    }
     const kid: ?[]const u8 = switch (mode) {
         .jwk => null,
         .kid => c.kid orelse return error.NotRegistered,
@@ -2399,6 +2510,8 @@ fn mapHttpError(err: anyerror) Error {
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled => error.Canceled,
         error.Timeout => error.Timeout,
+        // `urlFilter` refused a redirect hop (or http's own https -> http rule).
+        error.RedirectRefused => error.UrlNotAllowed,
         else => error.HttpFailed,
     };
 }
@@ -3254,6 +3367,11 @@ const MockCa = struct {
     /// The directory's `renewalInfo` ends in a slash; the endpoint answers `ari_status`.
     ari_trailing_slash: bool = false,
     ari_status: u16 = 200,
+    /// CA-URL policy (2026-11-18): the renewalInfo, directory and newNonce
+    /// endpoints answer 302 to these URLs.
+    ari_redirect: ?[]const u8 = null,
+    dir_redirect: ?[]const u8 = null,
+    nonce_redirect: ?[]const u8 = null,
     /// Order polls served, and the `Retry-After` they carry (null = none).
     order_polls: u32 = 0,
     poll_retry_after: ?[]const u8 = null,
@@ -3493,6 +3611,7 @@ fn mcRejected(ctx: *router.Ctx) !void {
 
 fn mcDirectory(ctx: *router.Ctx) anyerror!void {
     const m = MockCa.of(ctx);
+    if (m.dir_redirect) |to| return mcRedirect(ctx, to);
     if (m.dir_body) |body| return m.respondJson(ctx, m.dir_status, body);
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -3508,8 +3627,15 @@ fn mcDirectory(ctx: *router.Ctx) anyerror!void {
     try m.respondJson(ctx, m.dir_status, w.buffered());
 }
 
+fn mcRedirect(ctx: *router.Ctx, to: []const u8) anyerror!void {
+    ctx.res.setStatus(302);
+    try ctx.res.setHeader("Location", to);
+    try ctx.res.writeAll("");
+}
+
 fn mcNewNonce(ctx: *router.Ctx) anyerror!void {
     const m = MockCa.of(ctx);
+    if (m.nonce_redirect) |to| return mcRedirect(ctx, to);
     try m.stampNonce(ctx);
     ctx.res.setStatus(200);
 }
@@ -4187,6 +4313,7 @@ fn mcRenewalInfo(ctx: *router.Ctx) anyerror!void {
     @memcpy(m.ari_id[0..n], id[0..n]);
     m.ari_id_len = n;
     m.lock.unlock();
+    if (m.ari_redirect) |to| return mcRedirect(ctx, to);
     if (m.ari_status != 200) {
         ctx.res.setStatus(m.ari_status);
         try ctx.res.setHeader("Content-Type", "application/problem+json");
@@ -4807,6 +4934,190 @@ test "ARI (RFC 9773): the CertID on the wire, the window, Retry-After, explanati
     defer testing.allocator.free(no_aki);
     try testing.expectError(error.MalformedResponse, c.renewalInfo(no_aki));
     try testing.expectError(error.MalformedResponse, c.renewalInfo("junk"));
+}
+
+test "CA-URL policy: scheme, origin (host case, port), userinfo, directory-listed origins, extras, opt-out" {
+    // 2026-11-18 (SSRF decision): checked on a client that never touches the network.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var transport = http.Client.init(threaded.io(), testing.allocator, .{});
+    defer transport.deinit();
+    var account_key: jws.KeyPair = undefined;
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(131)));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = Client.init(threaded.io(), testing.allocator, &transport, &account_key, .{ .directory_url = "https://acme.ca.example/dir" });
+    defer c.deinit();
+
+    // The directory's own origin: host case-insensitive, port 443 explicit or implied.
+    try testing.expect(c.urlAllowed("https://acme.ca.example/order/1"));
+    try testing.expect(c.urlAllowed("https://ACME.Ca.Example:443/order/1"));
+    // RFC 8555 §6.1: an https CA cannot send the client to http, even on its own host.
+    try testing.expect(!c.urlAllowed("http://acme.ca.example/order/1"));
+    // Another port is another origin; userinfo is refused; junk is refused.
+    try testing.expect(!c.urlAllowed("https://acme.ca.example:8443/order/1"));
+    try testing.expect(!c.urlAllowed("https://user@acme.ca.example/order/1"));
+    try testing.expect(!c.urlAllowed("not a url"));
+    // A foreign host, an internal address, a sibling subdomain: refused.
+    try testing.expect(!c.urlAllowed("https://ari.other.example/renewalInfo"));
+    try testing.expect(!c.urlAllowed("https://127.0.0.1/admin"));
+    try testing.expect(!c.urlAllowed("https://ari.ca.example/renewalInfo"));
+    // The scheme rule for the directory's resources (any host).
+    try c.checkDirectoryResource("https://ari.other.example/renewalInfo");
+    try testing.expectError(error.UrlNotAllowed, c.checkDirectoryResource("http://acme.ca.example/new-nonce"));
+    try testing.expectError(error.MalformedResponse, c.checkDirectoryResource("::"));
+
+    // Origins the directory lists join the allowed set (ZeroSSL's ARI host).
+    c.dir = .{
+        .new_nonce = try testing.allocator.dupe(u8, "https://acme.ca.example/new-nonce"),
+        .new_account = try testing.allocator.dupe(u8, "https://acme.ca.example/new-account"),
+        .new_order = try testing.allocator.dupe(u8, "https://acme.ca.example/new-order"),
+        .key_change = try testing.allocator.dupe(u8, "https://keys.ca.example:9443/key-change"),
+        .revoke_cert = try testing.allocator.dupe(u8, "https://revoke.ca.example/revoke"),
+        .renewal_info = try testing.allocator.dupe(u8, "https://ari.other.example/renewalInfo"),
+    };
+    try testing.expect(c.urlAllowed("https://ari.other.example/renewalInfo/x.y"));
+    try testing.expect(c.urlAllowed("https://keys.ca.example:9443/other"));
+    try testing.expect(c.urlAllowed("https://revoke.ca.example/other"));
+    try testing.expect(!c.urlAllowed("https://keys.ca.example/other")); // listed with :9443 only
+    try testing.expect(!c.urlAllowed("http://ari.other.example/renewalInfo")); // still https only
+    try testing.expect(!c.urlAllowed("https://elsewhere.example/x"));
+
+    // extra_allowed_hosts: host (port 443), host:port, [v6]:port; malformed entries match nothing.
+    c.options.extra_allowed_hosts = &.{ "cdn.ca.example", "files.ca.example:8443", "[2001:db8::1]:9000", "", "x/y", "u@h" };
+    try testing.expect(c.urlAllowed("https://CDN.ca.example/cert/1"));
+    try testing.expect(!c.urlAllowed("https://cdn.ca.example:8443/cert/1"));
+    try testing.expect(c.urlAllowed("https://files.ca.example:8443/cert/1"));
+    try testing.expect(!c.urlAllowed("https://files.ca.example/cert/1"));
+    try testing.expect(c.urlAllowed("https://[2001:db8::1]:9000/cert/1"));
+    try testing.expect(!c.urlAllowed("https://[2001:db8::1]/cert/1"));
+    try testing.expect(!c.urlAllowed("https://h/cert/1"));
+    try testing.expect(!c.urlAllowed("https://x/cert/1"));
+    try testing.expect(extraHostOrigin(&@as([max_extra_host_len + 1]u8, @splat('a'))) == null);
+    try testing.expect(extraHostOrigin(&@as([max_extra_host_len]u8, @splat('a'))) != null);
+    try testing.expect(extraHostOrigin("") == null);
+
+    // Opt-out: any origin, but the scheme rule stays.
+    c.options.allow_cross_host_urls = true;
+    try testing.expect(c.urlAllowed("https://elsewhere.example/x"));
+    try testing.expect(!c.urlAllowed("http://elsewhere.example/x"));
+
+    // A directory URL that does not parse admits no http URL, even with the opt-out.
+    var junk = Client.init(threaded.io(), testing.allocator, &transport, &account_key, .{ .directory_url = "not a url", .allow_cross_host_urls = true });
+    defer junk.deinit();
+    try testing.expect(!junk.urlAllowed("http://elsewhere.example/x"));
+    try testing.expect(junk.urlAllowed("https://elsewhere.example/x"));
+
+    // An http:// directory (a local test CA) admits http for its URLs.
+    var t = Client.init(threaded.io(), testing.allocator, &transport, &account_key, .{ .directory_url = "http://127.0.0.1:14000/dir" });
+    defer t.deinit();
+    try testing.expect(t.urlAllowed("http://127.0.0.1:14000/order/1"));
+    try testing.expect(t.urlAllowed("https://127.0.0.1:14000/order/1"));
+    try testing.expect(!t.urlAllowed("http://127.0.0.1:14001/order/1"));
+    // The redirect gate applies the same policy to every hop.
+    const to = try http.Url.parse("http://127.0.0.1:14001/x");
+    const ok = try http.Url.parse("http://127.0.0.1:14000/x");
+    try testing.expect(!filterAllow(&t, ok, to));
+    try testing.expect(filterAllow(&t, to, ok));
+}
+
+/// Neither success nor a policy refusal can be told apart from the transport
+/// outcome here; what matters is that the policy let the request out.
+fn expectNotRefused(r: anytype) !void {
+    if (r) |v| {
+        var x = v;
+        x.deinit();
+    } else |err| try testing.expect(err != error.UrlNotAllowed);
+}
+
+test "CA-URL policy against the mock CA: foreign order URLs refused unsent, listed origins pass, GET redirects gated" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 132);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+    try c.register();
+    const port = lab.ca_server.boundAddress().getPort();
+
+    // An order whose authorization lives on another origin (port + 1, and a
+    // name for loopback): the flow stops there, nothing reaches that URL.
+    var b: [768]u8 = undefined;
+    var foreign_buf: [96]u8 = undefined;
+    const foreign = try std.mem.print(&foreign_buf, "http://127.0.0.1:{d}/authz/1", .{port +% 1});
+    lab.mock.new_order_body = try std.mem.print(
+        &b,
+        "{{\"status\":\"pending\",\"identifiers\":[{{\"type\":\"dns\",\"value\":\"{s}\"}}],\"authorizations\":[\"{s}\"],\"finalize\":\"{s}\"}}",
+        .{ MockCa.domain, foreign, lab.mock.finalize_url },
+    );
+    const polls_before = lab.mock.authz_polls;
+    try testing.expectError(error.UrlNotAllowed, c.obtain(&.{MockCa.domain}));
+    try testing.expectEqual(polls_before, lab.mock.authz_polls);
+    lab.mock.new_order_body = null;
+
+    var name_buf: [96]u8 = undefined;
+    const by_name = try std.mem.print(&name_buf, "http://localhost:{d}/order/1", .{port});
+    var cred_buf: [96]u8 = undefined;
+    const with_cred = try std.mem.print(&cred_buf, "http://u:p@127.0.0.1:{d}/order/1", .{port});
+    try testing.expectError(error.UrlNotAllowed, c.fetchOrder(by_name));
+    try testing.expectError(error.UrlNotAllowed, c.fetchOrder(with_cred));
+    try testing.expectError(error.UrlNotAllowed, c.fetchAuthorization(foreign));
+    try testing.expectError(error.UrlNotAllowed, c.acceptChallenge(foreign));
+    // The CA's own origin is fine.
+    var own = try c.fetchOrder(lab.mock.order_url);
+    own.deinit();
+
+    // A GET redirect off the allowed set is refused (renewalInfo -> 302).
+    lab.mock.ari_redirect = foreign;
+    try testing.expectError(error.UrlNotAllowed, c.renewalInfoPem(rfc9773_cert_pem));
+    lab.mock.ari_redirect = null;
+    // So is the newNonce HEAD's (the cached nonce is spent first).
+    lab.mock.nonce_redirect = foreign;
+    lab.mock.no_nonces = true;
+    var spent = try c.fetchOrder(lab.mock.order_url);
+    spent.deinit();
+    try testing.expectError(error.UrlNotAllowed, c.fetchOrder(lab.mock.order_url));
+    lab.mock.nonce_redirect = null;
+    lab.mock.no_nonces = false;
+    // And the directory GET's, on a client that has not loaded it yet.
+    lab.mock.dir_redirect = foreign;
+    var fresh = lab.client(&account_key, .{});
+    defer fresh.deinit();
+    try testing.expectError(error.UrlNotAllowed, fresh.register());
+    lab.mock.dir_redirect = null;
+
+    // extra_allowed_hosts and the opt-out let the same URL out.
+    var host_buf: [32]u8 = undefined;
+    const extra = [_][]const u8{try std.mem.print(&host_buf, "localhost:{d}", .{port})};
+    c.options.extra_allowed_hosts = &extra;
+    try expectNotRefused(c.fetchOrder(by_name));
+    c.options.extra_allowed_hosts = &.{};
+    c.options.allow_cross_host_urls = true;
+    try expectNotRefused(c.fetchOrder(by_name));
+    try testing.expectError(error.UrlNotAllowed, c.fetchOrder(with_cred)); // userinfo never passes
+}
+
+test "CA-URL policy: an origin the directory lists (ARI on another host) is allowed" {
+    var lab: Lab = undefined;
+    try lab.start(true);
+    defer lab.stop();
+    const port = lab.ca_server.boundAddress().getPort();
+    var dir_buf: [512]u8 = undefined;
+    lab.mock.dir_body = try std.mem.print(&dir_buf,
+        \\{{"newNonce":"{s}","newAccount":"{s}","newOrder":"{s}","renewalInfo":"http://localhost:{d}/ari"}}
+    , .{ lab.mock.new_nonce_url, lab.mock.new_account_url, lab.mock.new_order_url, port });
+    var account_key = labKey(jws.Es256, 133);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+    // The listed ARI origin passes (success, or a transport outcome if
+    // "localhost" does not reach the loopback listener here).
+    if (c.renewalInfoPem(rfc9773_cert_pem)) |info| {
+        var i = info;
+        i.deinit(testing.allocator);
+    } else |err| try testing.expect(err != error.UrlNotAllowed);
+    var name_buf: [96]u8 = undefined;
+    try expectNotRefused(c.fetchOrder(try std.mem.print(&name_buf, "http://localhost:{d}/order/1", .{port})));
 }
 
 test "parseRenewalInfo / parseRfc3339: offsets, fractions, leap days, and what is refused" {
@@ -6294,7 +6605,9 @@ test "downloadChain: an alternate that cannot be fetched, or answers non-200, ke
     defer c.deinit();
     const default_chain = x509.test_cert_pem ++ x509.test_root_cert_pem;
 
-    // The alternate's URL refuses connections (a transport failure, not a status).
+    // The alternate's URL refuses connections (a transport failure, not a
+    // status; its origin is allowed explicitly so the policy does not stop it first).
+    c.options.extra_allowed_hosts = &.{"127.0.0.1:1"};
     lab.mock.alt_link = "http://127.0.0.1:1/alt";
     var unreachable_alt = try c.obtainWith(&.{MockCa.domain}, .{ .preferred_chain = "acme-test-fixture" });
     defer unreachable_alt.deinit(testing.allocator);
