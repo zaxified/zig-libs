@@ -719,6 +719,15 @@ src/root.zig.
 
 ## Backlog / deferred
 
+- **Reply matching gaps** *(found 2026-11-18 by the whole-module mutation, not changed)*:
+  `Client.sendConnectedCip` does not compare the reply's connected-address item id with the
+  connection's `t_to_o_id`, and `Client.sendCip` does not check that the reply service is the
+  request's service with the reply bit set (CIP Vol 1: reply service = request | 0x80). A stray or
+  late reply from another connection / request would be taken as this one's. Decide against the
+  reference (and ODVA) whether to refuse such replies; each needs a test with a mismatching reply.
+- **`Timeout.fromMilliseconds(0)` returns null** (no deadline) — pinned by a test; confirm that a
+  zero timeout should mean "no timeout" rather than "poll once".
+
 - (survey 2026-09-30) **Logix Template Object (0x6C) + UDT member decoding**: the first thing a pycomm3 user hits (structures read as named members); also lets the adapter advertise struct tags; medium, fits §2. (Already listed as deferred; this survey ranks it top.)
 - (survey 2026-09-30) **Implicit I/O connection engine (Class 1, UDP 2222)**: OpENer/EIPScanner users need cyclic I/O; large (cyclic scheduler, clock injected), fits §2 if kept clock-agnostic.
 - (survey 2026-09-30) **Standard objects on the adapter (TCP/IP Interface 0xF5, Ethernet Link 0xF6, Assembly)**: scanners/commissioning tools read them; small each, fits §2.
