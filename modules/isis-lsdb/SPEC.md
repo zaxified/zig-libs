@@ -6,7 +6,7 @@
 
 **Scope:** mvp — FRR isisd update process (10.7, `isis_lsp.c` behaviour) and holo-isis `lsdb.rs` (v0.9.0), ISO 10589 §7.3; the update process is complete, including the RFC 5304/5310 authentication check (2026-11-18), but LSP generation and LSPDBOverload are missing (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-11 · mutation 2026-11-18 (67/72, 5 eq) · src 207b70a9ee036630
+**Audit:** review 2026-08-11 · mutation 2026-11-19 (72/77, 5 eq) · src ece2d0d488e414fd
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_LSDB_FUZZ) · ct n/a — LSP database (keyword review, 2026-10-07)
 
@@ -366,7 +366,15 @@ one level). Empty, the default, is the old behaviour byte for byte. Non-empty:
   holo-isis validates every SNP when a key is configured; **FRR does not by
   default** (`area-password … authenticate snp send-only|validate` makes it
   opt-in), so an FRR peer left at its default sends unauthenticated SNPs that
-  this store, like holo, refuses. Signing our own SNPs is the builder's job
+  this store, like holo, refuses **unless `Config.auth_snp = false`** (owner
+  decision 2026-11-19; default `true`): then SNPs are neither verified (an
+  unsigned one reconciles, a signed one is taken unchecked) nor, by the
+  caller, signed — FRR's default and Junos `no-csnp-authentication` /
+  `no-psnp-authentication`; IOS and holo behave as `true`. LSPs are
+  unaffected. isis-flood's `snp.buildCsnp`/`buildPsnp` never add a #10, so
+  nothing in the tree signs SNPs and needs the flag. Delta mutation
+  2026-11-19 (5 mutants: both `auth_snp` conditions dropped/negated, the
+  default flipped): see CHANGELOG. Signing our own SNPs is the builder's job
   (`isis.auth.addPlaceholder` + `sign`; `summarise` only supplies entries).
 - Several keys allow a rollover (each verifies; the first signs). Keys are
   borrowed and caller-wiped (`isis.auth.Key`). Replay is not prevented by

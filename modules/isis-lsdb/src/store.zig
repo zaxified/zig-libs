@@ -133,6 +133,16 @@ pub const Config = struct {
     /// Borrowed: the slice and every `secret` must outlive the `Lsdb`, and
     /// the caller wipes the secrets (`isis.auth.Key`).
     auth_keys: []const isis.auth.Key = &.{},
+    /// Whether CSNP/PSNP take part in authentication when `auth_keys` is set
+    /// (default `true`: holo-isis, Junos and IOS sign and verify SNPs with the
+    /// LSP keys). `false`: SNPs are neither signed nor verified — FRR isisd's
+    /// default (SNP authentication is opt-in there) and Junos
+    /// `no-csnp-authentication` / `no-psnp-authentication` — so
+    /// `reconcileCsnpBytes` / `reconcilePsnpBytes` accept an unsigned SNP (a
+    /// signed one is accepted unchecked) and a sender that builds SNPs for
+    /// this level must leave out the #10. LSPs are unaffected. Ignored
+    /// without `auth_keys`.
+    auth_snp: bool = true,
 };
 
 /// TLV codes a purge may carry when authentication is in use: Authentication
@@ -1090,20 +1100,20 @@ pub const Lsdb = struct {
     }
 
     /// Decode a received PSNP, verify its authentication when
-    /// `Config.auth_keys` is set (RFC 5304 §2 / RFC 5310 §3.5), then
+    /// `Config.auth_keys` is set and `Config.auth_snp` is true (RFC 5304 §2 / RFC 5310 §3.5), then
     /// `reconcilePsnp`. A refused SNP changes nothing.
     pub fn reconcilePsnpBytes(self: *Lsdb, bytes: []const u8, iface: u8, now: Time) SnpError!void {
         const psnp = try isis.Psnp.decode(bytes);
-        if (self.cfg.auth_keys.len != 0) try self.authenticate(bytes);
+        if (self.cfg.auth_keys.len != 0 and self.cfg.auth_snp) try self.authenticate(bytes);
         self.reconcilePsnp(psnp, iface, now);
     }
 
     /// Decode a received CSNP, verify its authentication when
-    /// `Config.auth_keys` is set, then `reconcileCsnp`. A refused SNP changes
+    /// `Config.auth_keys` is set and `Config.auth_snp` is true, then `reconcileCsnp`. A refused SNP changes
     /// nothing (no request placeholder, no completeness re-flood).
     pub fn reconcileCsnpBytes(self: *Lsdb, bytes: []const u8, iface: u8, now: Time) SnpError!void {
         const csnp = try isis.Csnp.decode(bytes);
-        if (self.cfg.auth_keys.len != 0) try self.authenticate(bytes);
+        if (self.cfg.auth_keys.len != 0 and self.cfg.auth_snp) try self.authenticate(bytes);
         self.reconcileCsnp(csnp, iface, now);
     }
 
