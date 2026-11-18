@@ -257,8 +257,20 @@ inline fn blackBox(x: u8) u8 {
 }
 
 /// 1 when `a >= b` (both < 2^15), else 0 — the borrow of `b - 1 - a`.
+/// Laundered through `blackBox16`: on baseline x86-64 (`-mcpu=x86_64`) LLVM
+/// recognised the borrow as `a >= b` and compiled `digitChar`'s `7 * geBit`
+/// and `6 * geBit` into `cmp`/`jae` on the secret digit (ctgrind `bip32 xprv`
+/// and `btcaddr wif`, 2 in-file each, 2026-11-18). Unconditional, every target.
 inline fn geBit(a: u16, comptime b: u16) u16 {
-    return ((b -% 1 -% a) >> 15) & 1;
+    return blackBox16(((b -% 1 -% a) >> 15) & 1);
+}
+
+/// `blackBox` for a `u16`.
+inline fn blackBox16(x: u16) u16 {
+    return asm volatile (""
+        : [ret] "=r" (-> u16),
+        : [x] "0" (x),
+    );
 }
 
 /// 0xff when `lo <= c <= hi`, else 0.
