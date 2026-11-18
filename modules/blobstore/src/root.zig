@@ -2634,3 +2634,594 @@ test "oldEnough: the wide signed comparison is exact at the boundary and beyond 
     try std.testing.expect(oldEnough(@as(i96, 1) << 70, std.math.maxInt(u64)));
     try std.testing.expect(oldEnough(@as(i96, 1) << 64, 1));
 }
+
+// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+
+fn openFdCount() !usize {
+    var dir = try std.Io.Dir.openDirAbsolute(t.io, "/proc/self/fd", .{ .iterate = true });
+    defer dir.close(t.io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(t.io)) |_| n += 1;
+    return n;
+}
+
+fn entryCount(path: []const u8) !usize {
+    var dir = try std.Io.Dir.cwd().openDir(t.io, path, .{ .iterate = true });
+    defer dir.close(t.io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(t.io)) |_| n += 1;
+    return n;
+}
+
+fn putTestFile(path: []const u8, data: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(t.io, .{ .sub_path = path, .data = data });
+}
+
+test "hex validation: the characters just outside [0-9a-f] and lengths 63/65 are refused, the edge characters accepted" {
+    const ok = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var pb: [768]u8 = undefined;
+    for ("/:`g@GF") |bad| {
+        for ([_]usize{ 0, 31, 63 }) |pos| {
+            var h: [64]u8 = ok.*;
+            h[pos] = bad;
+            try t.expectError(error.InvalidName, Digest.fromHex(&h));
+            try t.expectError(error.InvalidName, store.casPath(&pb, &h));
+        }
+    }
+    for ("09af") |good| {
+        for ([_]usize{ 0, 63 }) |pos| {
+            var h: [64]u8 = ok.*;
+            h[pos] = good;
+            _ = try Digest.fromHex(&h);
+            _ = try store.casPath(&pb, &h);
+        }
+    }
+    var long: [65]u8 = undefined;
+    @memcpy(long[0..64], ok);
+    long[64] = '0';
+    try t.expectError(error.InvalidName, Digest.fromHex(ok[0..63]));
+    try t.expectError(error.InvalidName, store.casPath(&pb, ok[0..63]));
+    try t.expectError(error.InvalidName, store.casPath(&pb, &long));
+}
+
+test "segmentSafe and uniqSafe: the length limits are exact" {
+    const a128 = strRepeat("a", 128);
+    const a129 = strRepeat("a", 129);
+    try t.expect(segmentSafe(a128));
+    try t.expect(!segmentSafe(a129));
+    // temp name: ".ingest-" + uniq + ".part" must fit NAME_MAX (255)
+    const ulen_ok = strRepeat("u", 242);
+    const ulen_bad = strRepeat("u", 243);
+    try t.expect(uniqSafe(ulen_ok));
+    try t.expect(!uniqSafe(ulen_bad));
+    try t.expect(!uniqSafe(""));
+    try t.expect(!uniqSafe(".x"));
+    try t.expect(!uniqSafe("a/b"));
+    try t.expect(!uniqSafe("a\x00b"));
+    try t.expect(uniqSafe("a.b-c"));
+}
+
+test "oldEnough: a negative age is never old, an age of zero is old for a zero threshold" {
+    try t.expect(!oldEnough(-1, 0));
+    try t.expect(oldEnough(0, 0));
+}
+
+test "sidecar text: whitespace trimmed, 31 digits parse, garbage is CorruptSidecar and kept by gc; a trimmed zero is collectible" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const body = "sidecar text blob";
+    const d = try store.putBytes(body);
+    var pb: [800]u8 = undefined;
+    const rc = try store.casRefPath(&pb, &d.hex);
+    try putTestFile(rc, " 7\r\n");
+    try t.expectEqual(@as(?u64, 7), try store.refcountOf(d));
+    try putTestFile(rc, strRepeat("0", 30) ++ "5");
+    try t.expectEqual(@as(?u64, 5), try store.refcountOf(d));
+    try putTestFile(rc, "abc");
+    try t.expectError(error.CorruptSidecar, store.refcountOf(d));
+    try t.expectError(error.CorruptSidecar, store.casRefRead(&d.hex, 1));
+    var stats = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+    try t.expect(store.has(d));
+    try putTestFile(rc, "0\n");
+    stats = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 1), stats.blobs_removed);
+    try t.expectEqual(@as(u64, body.len), stats.bytes_reclaimed);
+    try t.expect(!store.has(d));
+    try t.expectEqual(@as(?std.Io.File.Kind, null), try kindOf(t.io, rc)); // the sidecar went with the blob
+}
+
+test "casCommit: true for a new blob, false for a dedup; refcountOf: null when absent, 1 without a sidecar" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const data = "casCommit return values";
+    const hex = hashdigest.sha256HexBuf(data);
+    const d: Digest = .{ .hex = hex };
+    try t.expectEqual(@as(?u64, null), try store.refcountOf(d));
+    var tb: [768]u8 = undefined;
+    const tf = try store.casCreateTemp("a", &tb);
+    try tf.file.writeStreamingAll(t.io, data);
+    tf.file.close(t.io);
+    try t.expect(try store.casCommit(&hex, tf.tmp));
+    var tb2: [768]u8 = undefined;
+    const tf2 = try store.casCreateTemp("b", &tb2);
+    try tf2.file.writeStreamingAll(t.io, data);
+    tf2.file.close(t.io);
+    try t.expect(!(try store.casCommit(&hex, tf2.tmp)));
+    try t.expectEqual(@as(?u64, 2), try store.refcountOf(d));
+    var pb: [800]u8 = undefined;
+    try std.Io.Dir.cwd().deleteFile(t.io, try store.casRefPath(&pb, &hex));
+    try t.expectEqual(@as(?u64, 1), try store.refcountOf(d));
+    // a delete on the sidecar-less blob leaves it at zero, and a dedup put on it counts two
+    try t.expect(try store.delete(d));
+    try t.expectEqual(@as(?u64, 0), try store.refcountOf(d));
+}
+
+test "Options.refcount = false: a dedup put and a second put write no sidecar" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const base = try std.mem.print(&bb, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const store = try Store.initOptions(t.io, base, .{ .refcount = false });
+    const d = try store.putBytes("no bookkeeping");
+    _ = try store.putBytes("no bookkeeping");
+    var pb: [800]u8 = undefined;
+    try t.expectEqual(@as(?std.Io.File.Kind, null), try kindOf(t.io, try store.casRefPath(&pb, &d.hex)));
+    try t.expect(!(try store.hasAnyRcSidecar())); // the blob itself is not a sidecar
+    const stats = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+}
+
+test "putLimited: the limit is on the total, exclusive of nothing (exact fits, one less does not), across chunks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const gpa = std.testing.allocator;
+    const data = try gpa.alloc(u8, 40_000); // two reads: 32768 + 7232
+    defer gpa.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var r1: std.Io.Reader = .fixed(data);
+    _ = try store.putLimited(&r1, 40_000);
+    var r2: std.Io.Reader = .fixed(data);
+    try t.expectError(error.StreamTooLong, store.putLimited(&r2, 39_999));
+    var r3: std.Io.Reader = .fixed(data);
+    try t.expectError(error.StreamTooLong, store.putLimited(&r3, 33_000));
+}
+
+test "no file descriptor is left open by put, a refused put, putNamed, names or a locked section" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    // warm up: lazily created directories and the lock file
+    _ = try store.putBytes("warm");
+    try store.putNamed("ns", "warm", "w");
+    const before = try openFdCount();
+    _ = try store.putBytes("one more blob");
+    try t.expectEqual(before, try openFdCount());
+    var r: std.Io.Reader = .fixed("0123456789");
+    try t.expectError(error.StreamTooLong, store.putLimited(&r, 3));
+    try t.expectEqual(before, try openFdCount());
+    try store.putNamed("ns", "k", "v");
+    try t.expectEqual(before, try openFdCount());
+    var it = try store.names(.named, "ns");
+    while (try it.next()) |_| {}
+    it.deinit();
+    try t.expectEqual(before, try openFdCount());
+    _ = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(before, try openFdCount());
+}
+
+test "list, listNamed and names skip directories and hidden files, report sizes, and keep the two layers apart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tb: [768]u8 = undefined;
+    for ([_][]const u8{ "rk1", "rk2", "rk3" }) |k| {
+        const tf = try store.createTemp("ns", k, &tb);
+        try tf.file.writeStreamingAll(t.io, "four");
+        tf.file.close(t.io);
+        try store.commit("ns", k, tf.tmp);
+    }
+    try store.putNamed("ns", "nk", "ab");
+    var pb: [800]u8 = undefined;
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(t.io, try std.mem.print(&pb, "{s}/raw/ns/subdir", .{store.base}));
+    try putTestFile(try std.mem.print(&pb, "{s}/raw/ns/.hidden", .{store.base}), "h");
+    try cwd.createDirPath(t.io, try std.mem.print(&pb, "{s}/named/ns/subdir", .{store.base}));
+    try putTestFile(try std.mem.print(&pb, "{s}/named/ns/.hidden", .{store.base}), "h");
+
+    const raw = try store.list(arena, "ns");
+    try t.expectEqual(@as(usize, 3), raw.len);
+    for (raw) |e| try t.expectEqual(@as(u64, 4), e.bytes);
+    const named = try store.listNamed(arena, "ns");
+    try t.expectEqual(@as(usize, 1), named.len);
+    try t.expectEqualStrings("nk", named[0]);
+
+    var it = try store.names(.raw, "ns");
+    var n: usize = 0;
+    while (try it.next()) |e| {
+        try t.expect(std.mem.startsWith(u8, e.key, "rk"));
+        try t.expectEqual(@as(u64, 4), e.bytes);
+        n += 1;
+    }
+    it.deinit();
+    try t.expectEqual(@as(usize, 3), n);
+    var it2 = try store.names(.named, "ns");
+    const only = (try it2.next()).?;
+    try t.expectEqualStrings("nk", only.key);
+    try t.expectEqual(@as(u64, 2), only.bytes);
+    try t.expect((try it2.next()) == null);
+    it2.deinit();
+    try t.expectError(error.InvalidName, store.list(arena, "../x"));
+    try t.expectError(error.InvalidName, store.listNamed(arena, "../x"));
+}
+
+test "raw and named entry points validate both ns and key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var pb: [768]u8 = undefined;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    for ([_][2][]const u8{ .{ "../x", "k" }, .{ "ns", "../x" }, .{ "ns", ".k" }, .{ ".ns", "k" } }) |c| {
+        try t.expectError(error.InvalidName, store.blobPath(&pb, c[0], c[1]));
+        try t.expectError(error.InvalidName, store.createTemp(c[0], c[1], &pb));
+        try t.expectError(error.InvalidName, store.putNamed(c[0], c[1], "x"));
+        try t.expectError(error.InvalidName, store.readNamed(arena_state.allocator(), c[0], c[1]));
+    }
+}
+
+test "scratchCreate truncates an existing scratch file and refuses the lock's name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var pb: [768]u8 = undefined;
+    const s1 = try store.scratchCreate("scr", &pb);
+    try s1.file.writeStreamingAll(t.io, "long long long content");
+    s1.file.close(t.io);
+    var pb2: [768]u8 = undefined;
+    const s2 = try store.scratchCreate("scr", &pb2);
+    s2.file.close(t.io);
+    const st = try std.Io.Dir.cwd().statFile(t.io, s2.path, .{});
+    try t.expectEqual(@as(u64, 0), st.size);
+    store.discardTemp(s2.path);
+    try t.expectEqual(@as(?std.Io.File.Kind, null), try kindOf(t.io, s2.path));
+    try t.expectError(error.InvalidName, store.scratchCreate(ingest_lock_name, &pb));
+    try t.expectError(error.InvalidName, store.scratchCreate("../x", &pb));
+}
+
+fn lockThread(store: Store, got: *std.atomic.Value(u32)) void {
+    const f = store.lockIngest() catch return;
+    got.store(1, .release);
+    store.unlockIngest(f);
+}
+
+test "ingest lock: a second locker waits until the first lets go" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const f = try store.lockIngest();
+    var got = std.atomic.Value(u32).init(0);
+    const th = try std.Thread.spawn(.{}, lockThread, .{ store, &got });
+    try t.io.sleep(.fromMilliseconds(150), .awake);
+    const early = got.load(.acquire);
+    store.unlockIngest(f);
+    th.join();
+    try t.expectEqual(@as(u32, 0), early);
+    try t.expectEqual(@as(u32, 1), got.load(.acquire));
+}
+
+test "gc: reaps exactly its own temps, counts each, and leaves strangers, young temps and live files alone" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const cwd = std.Io.Dir.cwd();
+    var pb: [900]u8 = undefined;
+    const d = try store.putBytes("gc own temps");
+    try store.putNamed("ns", "rec", "x");
+    var tb: [768]u8 = undefined;
+    const rt = try store.createTemp("rns", "live", &tb);
+    rt.file.close(t.io);
+    try store.commit("rns", "live", rt.tmp);
+    // temps it owns
+    try putTestFile(try std.mem.print(&pb, "{s}/named/ns/.k.part", .{store.base}), "x");
+    try putTestFile(try std.mem.print(&pb, "{s}/raw/rns/.k.part", .{store.base}), "x");
+    try putTestFile(try std.mem.print(&pb, "{s}/cas/.ingest-9-9.part", .{store.base}), "x");
+    // names it must not touch
+    try putTestFile(try std.mem.print(&pb, "{s}/raw/rns/plain.part", .{store.base}), "x"); // a live key that ends in .part
+    try putTestFile(try std.mem.print(&pb, "{s}/raw/rns/.note", .{store.base}), "x"); // hidden, not a .part
+    try putTestFile(try std.mem.print(&pb, "{s}/named/ns/plain.part", .{store.base}), "x");
+    try putTestFile(try std.mem.print(&pb, "{s}/named/ns/.note", .{store.base}), "x");
+    try putTestFile(try std.mem.print(&pb, "{s}/cas/stranger", .{store.base}), "x");
+    var dbuf: [800]u8 = undefined;
+    const fan = try store.casDir(&dbuf, &d.hex);
+    var hb: [900]u8 = undefined;
+    const hidden = try std.mem.print(&hb, "{s}/.keepme", .{fan});
+    try putTestFile(hidden, "x");
+    // a fresh temp survives the default threshold
+    const young = try std.mem.print(&pb, "{s}/named/ns/.young.part", .{store.base});
+    try putTestFile(young, "x");
+    var stats = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.temps_removed);
+    try t.expect((try kindOf(t.io, young)) != null);
+    stats = try store.gc(t.allocator, &.{}, .{ .stale_after_ns = 1 });
+    try t.expectEqual(@as(u64, 4), stats.temps_removed); // named .k.part, named .young.part, raw .k.part, cas .ingest
+    for ([_][]const u8{ "raw/rns/plain.part", "raw/rns/.note", "named/ns/plain.part", "named/ns/.note", "cas/stranger" }) |rel| {
+        try t.expect((try kindOf(t.io, try std.mem.print(&pb, "{s}/{s}", .{ store.base, rel }))) != null);
+    }
+    try t.expect((try kindOf(t.io, hidden)) != null);
+    try t.expect(store.has(d));
+    _ = cwd;
+}
+
+test "gc: a sidecar temp and an orphan sidecar are reaped and counted; a live sidecar stays; each collected blob adds its size" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const live = try store.putBytes("live blob");
+    var dbuf: [800]u8 = undefined;
+    const fan = try store.casDir(&dbuf, &live.hex);
+    var pb: [900]u8 = undefined;
+    const tmp_rc = try std.mem.print(&pb, "{s}/.{s}.rc.tmp", .{ fan, live.hex });
+    try putTestFile(tmp_rc, "1");
+    var pb2: [900]u8 = undefined;
+    const other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const orphan = try std.mem.print(&pb2, "{s}/{s}.rc", .{ fan, other });
+    try putTestFile(orphan, "1");
+    var stats = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 2), stats.temps_removed);
+    try t.expectEqual(@as(?std.Io.File.Kind, null), try kindOf(t.io, tmp_rc));
+    try t.expectEqual(@as(?std.Io.File.Kind, null), try kindOf(t.io, orphan));
+    try t.expectEqual(@as(?u64, 1), try store.refcountOf(live));
+    // two collectible blobs: sizes add up
+    const a = try store.putBytes("ten bytes!");
+    const b = try store.putBytes("twenty bytes of data");
+    _ = try store.delete(a);
+    _ = try store.delete(b);
+    stats = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 2), stats.blobs_removed);
+    try t.expectEqual(@as(u64, 30), stats.bytes_reclaimed);
+    try t.expect(store.has(live));
+}
+
+test "hasAnyRcSidecar ignores strangers at the top of cas/ and directories named like a sidecar" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const base = try std.mem.print(&bb, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const store = try Store.initOptions(t.io, base, .{ .refcount = false });
+    const d = try store.putBytes("no sidecars here");
+    var pb: [900]u8 = undefined;
+    try putTestFile(try std.mem.print(&pb, "{s}/cas/stranger", .{base}), "x");
+    var dbuf: [800]u8 = undefined;
+    const fan = try store.casDir(&dbuf, &d.hex);
+    try std.Io.Dir.cwd().createDirPath(t.io, try std.mem.print(&pb, "{s}/looks.rc", .{fan}));
+    try t.expect(!(try store.hasAnyRcSidecar()));
+    try putTestFile(try std.mem.print(&pb, "{s}/real.rc", .{fan}), "1");
+    try t.expect(try store.hasAnyRcSidecar());
+}
+
+test "a store whose cas/ is not a directory reads as empty, not as an error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var pb: [900]u8 = undefined;
+    try putTestFile(try std.mem.print(&pb, "{s}/cas", .{store.base}), "not a directory");
+    const d = try Digest.fromHex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    try t.expect(!store.has(d));
+    try t.expect((try store.open(d)) == null);
+    try t.expectEqual(@as(?u64, null), try store.refcountOf(d));
+    try t.expectError(error.NotFound, store.verify(d));
+}
+
+test "putNamed onto a path that is a directory fails and leaves no temp behind" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var pb: [900]u8 = undefined;
+    try store.putNamed("ns", "other", "x");
+    try std.Io.Dir.cwd().createDirPath(t.io, try std.mem.print(&pb, "{s}/named/ns/key", .{store.base}));
+    const fds = try openFdCount();
+    if (store.putNamed("ns", "key", "y")) |_| return error.TestExpectedError else |_| {}
+    try t.expectEqual(fds, try openFdCount());
+    try t.expectEqual(@as(usize, 2), try entryCount(try std.mem.print(&pb, "{s}/named/ns", .{store.base}))); // "other" and the directory
+}
+
+test "a sidecar path that is a directory: the dedup bump fails and leaves no .rc.tmp behind" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const d = try store.putBytes("sidecar is a directory");
+    var rb: [800]u8 = undefined;
+    const rc = try store.casRefPath(&rb, &d.hex);
+    try std.Io.Dir.cwd().deleteFile(t.io, rc);
+    try std.Io.Dir.cwd().createDirPath(t.io, rc);
+    var dbuf: [800]u8 = undefined;
+    const fan = try store.casDir(&dbuf, &d.hex);
+    const before = try entryCount(fan);
+    if (store.casRefWrite(&d.hex, 2)) |_| return error.TestExpectedError else |_| {}
+    try t.expectEqual(before, try entryCount(fan));
+}
+
+test "Digest.fromHex: a 65-character string is refused" {
+    var long: [65]u8 = @splat('a');
+    try t.expectError(error.InvalidName, Digest.fromHex(&long));
+}
+
+test "casCommit creates cas/ and the fan-out directories for a temp that came from elsewhere" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const data = "committed from a scratch file";
+    const hex = hashdigest.sha256HexBuf(data);
+    var pb: [768]u8 = undefined;
+    const s = try store.scratchCreate("src", &pb);
+    try s.file.writeStreamingAll(t.io, data);
+    s.file.close(t.io);
+    var cb: [768]u8 = undefined;
+    try t.expectEqual(@as(?std.Io.File.Kind, null), try kindOf(t.io, try std.mem.print(&cb, "{s}/cas", .{store.base})));
+    try t.expect(try store.casCommit(&hex, s.path));
+    try t.expect(try store.verify(.{ .hex = hex }));
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    var bb2: [256]u8 = undefined;
+    const base2 = try std.mem.print(&bb2, ".zig-cache/tmp/{s}/store", .{&tmp2.sub_path});
+    const deep = try Store.initOptions(t.io, base2, .{ .fanout = 3 });
+    var pb2: [768]u8 = undefined;
+    const s2 = try deep.scratchCreate("src", &pb2);
+    try s2.file.writeStreamingAll(t.io, data);
+    s2.file.close(t.io);
+    try t.expect(try deep.casCommit(&hex, s2.path));
+    try t.expect(try deep.verify(.{ .hex = hex }));
+}
+
+test "gc keeps a sidecar whose blob name is a dangling symlink (the orphan check does not follow links)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const d = try store.putBytes("carrier");
+    var dbuf: [800]u8 = undefined;
+    const fan = try store.casDir(&dbuf, &d.hex);
+    const other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    var lb: [900]u8 = undefined;
+    const link = try std.mem.print(&lb, "{s}/{s}", .{ fan, other });
+    std.Io.Dir.cwd().symLink(t.io, "/nonexistent/target", link, .{}) catch return error.SkipZigTest;
+    var rb: [900]u8 = undefined;
+    const rc = try std.mem.print(&rb, "{s}/{s}.rc", .{ fan, other });
+    try putTestFile(rc, "1");
+    const stats = try store.gc(t.allocator, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.temps_removed);
+    try t.expect((try kindOf(t.io, rc)) != null);
+}
+
+test "put skips 63 stale temp names and still succeeds, leaving the stale files untouched" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    _ = try store.putBytes("warm up: creates cas/");
+    const next = crash_hook.nextCounter();
+    const pid: usize = @intCast(linux.getpid());
+    var i: usize = 0;
+    while (i < 63) : (i += 1) {
+        var nb: [400]u8 = undefined;
+        try putTestFile(try std.mem.print(&nb, "{s}/cas/.ingest-{d}-{d}.part", .{ store.base, pid, next + i }), "stale");
+    }
+    const d = try store.putBytes("lands on the 64th draw");
+    try t.expect(try store.verify(d));
+    i = 0;
+    while (i < 63) : (i += 1) {
+        var nb: [400]u8 = undefined;
+        var vb: [16]u8 = undefined;
+        const got = try std.Io.Dir.cwd().readFile(t.io, try std.mem.print(&nb, "{s}/cas/.ingest-{d}-{d}.part", .{ store.base, pid, next + i }), &vb);
+        try t.expectEqualStrings("stale", got);
+    }
+}
+
+test "a dedup put on a corrupt sidecar reports 'not newly stored' and leaves the sidecar as it was" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const data = "dedup onto a corrupt sidecar";
+    const d = try store.putBytes(data);
+    var rb: [800]u8 = undefined;
+    const rc = try store.casRefPath(&rb, &d.hex);
+    try putTestFile(rc, "abc");
+    var tb: [768]u8 = undefined;
+    const tf = try store.casCreateTemp("dup", &tb);
+    try tf.file.writeStreamingAll(t.io, data);
+    tf.file.close(t.io);
+    try t.expect(!(try store.casCommit(&d.hex, tf.tmp)));
+    var vb: [16]u8 = undefined;
+    try t.expectEqualStrings("abc", try std.Io.Dir.cwd().readFile(t.io, rc, &vb));
+}
+
+test "putNamed's temp is hidden and ends in .part: a crash mid-write leaves nothing listable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try store.putNamed("ns", "warm", "w"); // creates named/ and named/ns
+    crash_hook.arm(0); // the first crash point: temp written, not yet renamed
+    defer crash_hook.arm(null);
+    try t.expectError(error.SimulatedCrash, store.putNamed("ns", "crashed", "x"));
+    const keys = try store.listNamed(arena_state.allocator(), "ns");
+    try t.expectEqual(@as(usize, 1), keys.len);
+    try t.expectEqualStrings("warm", keys[0]);
+    var pb: [800]u8 = undefined;
+    var dir = try std.Io.Dir.cwd().openDir(t.io, try std.mem.print(&pb, "{s}/named/ns", .{store.base}), .{ .iterate = true });
+    defer dir.close(t.io);
+    var it = dir.iterate();
+    var temps: usize = 0;
+    while (try it.next(t.io)) |e| {
+        if (std.mem.eql(u8, e.name, "warm")) continue;
+        try t.expect(e.name[0] == '.' and std.mem.endsWith(u8, e.name, ".part"));
+        temps += 1;
+    }
+    try t.expectEqual(@as(usize, 1), temps);
+}
+
+test "a symlink at a blob path is not a blob: not present, not openable, even when it points at a regular file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const d = try store.putBytes("link target");
+    var other_hex: [64]u8 = d.hex;
+    other_hex[63] = if (other_hex[63] == '0') '1' else '0';
+    const other: Digest = .{ .hex = other_hex };
+    var target: [800]u8 = undefined;
+    const tgt = try store.casPath(&target, &d.hex);
+    var link: [800]u8 = undefined;
+    const lnk = try store.casPath(&link, &other.hex);
+    var abs_buf: [1024]u8 = undefined;
+    const abs_tgt = try std.mem.print(&abs_buf, "{s}", .{std.fs.path.basename(tgt)}); // relative to the link's directory
+    std.Io.Dir.cwd().symLink(t.io, abs_tgt, lnk, .{}) catch return error.SkipZigTest;
+    try t.expect(!store.has(other));
+    try t.expectError(error.NotRegularFile, store.open(other));
+    try t.expectError(error.NotRegularFile, store.verify(other));
+}
+
+test "verify compares the whole digest: a copy stored under an id that shares the first 32 hex chars is corrupt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    const data = "forged id, same prefix";
+    const d = try store.putBytes(data);
+    var forged_hex: [64]u8 = d.hex;
+    forged_hex[63] = if (forged_hex[63] == '0') '1' else '0';
+    var pb: [800]u8 = undefined;
+    try putTestFile(try store.casPath(&pb, &forged_hex), data);
+    try t.expect(try store.verify(d));
+    try t.expect(!(try store.verify(.{ .hex = forged_hex })));
+}

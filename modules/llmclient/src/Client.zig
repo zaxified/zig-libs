@@ -1262,6 +1262,183 @@ test "BoundedAllocator: refuses past the limit, credits frees back, and flags th
     try testing.expect(!b.exceeded);
 }
 
+// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+
+test "lastErrorBody / noteError: null when empty, kept truncated to the scratch size" {
+    var c: Client = .init(undefined, "k");
+    try testing.expect(c.lastErrorBody() == null);
+    c.noteError("");
+    try testing.expect(c.lastErrorBody() == null);
+    var big: [error_scratch_len + 88]u8 = @splat('z');
+    c.noteError(&big);
+    try testing.expectEqual(@as(usize, error_scratch_len), c.lastErrorBody().?.len);
+    c.noteError("short");
+    try testing.expectEqualStrings("short", c.lastErrorBody().?);
+}
+
+test "validBeta: the characters at the edge of each accepted range" {
+    for ("AZaz09._-") |ch| try testing.expect(validBeta(&.{ch}));
+    for ("@[`{/: ,\r\n!~") |ch| try testing.expect(!validBeta(&.{ch}));
+    try testing.expect(!validBeta(""));
+}
+
+test "mapHttpError: the distinguished transport errors keep their meaning, the rest are HttpFailed" {
+    try testing.expectEqual(@as(Error, error.OutOfMemory), mapHttpError(error.OutOfMemory));
+    try testing.expectEqual(@as(Error, error.Canceled), mapHttpError(error.Canceled));
+    try testing.expectEqual(@as(Error, error.Timeout), mapHttpError(error.Timeout));
+    try testing.expectEqual(@as(Error, error.ResponseTooLarge), mapHttpError(error.BodyTooLarge));
+    try testing.expectEqual(@as(Error, error.HttpFailed), mapHttpError(error.ReadFailed));
+}
+
+test "readDeadline: 0 is unbounded, anything else is a deadline" {
+    var hc = http.Client.init(testing.io, testing.allocator, .{});
+    defer hc.deinit();
+    var c: Client = .init(&hc, "k");
+    c.read_timeout_ms = 0;
+    try testing.expect(c.readDeadline() == null);
+    c.read_timeout_ms = 1000;
+    try testing.expect(c.readDeadline() != null);
+}
+
+test "BoundedAllocator: growth is charged, shrinks credited, refusals flagged, failed child calls not charged" {
+    var buf: [256]u8 align(16) = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var b: BoundedAllocator = .{ .child = fba.allocator(), .limit = 50 };
+    const a = b.allocator();
+    const x = try a.alloc(u8, 10);
+    try testing.expect(a.resize(x, 20));
+    try testing.expectEqual(@as(usize, 20), b.used);
+    try testing.expect(!a.resize(x.ptr[0..20], 60)); // 40 more than the 30 left
+    try testing.expect(b.exceeded);
+    try testing.expectEqual(@as(usize, 20), b.used);
+    b.exceeded = false;
+    try testing.expect(a.resize(x.ptr[0..20], 10)); // shrink in place
+    try testing.expectEqual(@as(usize, 10), b.used);
+    const y = try a.alloc(u8, 5); // x is no longer the last allocation: a grow must fail in the child
+    try testing.expectEqual(@as(usize, 15), b.used);
+    try testing.expect(!a.resize(x.ptr[0..10], 30));
+    try testing.expectEqual(@as(usize, 15), b.used); // the charge was rolled back
+    try testing.expect(!b.exceeded);
+    _ = y;
+}
+
+test "BoundedAllocator.remap: growth is charged, a refused or failed remap leaves the count alone, a shrink is credited" {
+    var buf: [256]u8 align(16) = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var b: BoundedAllocator = .{ .child = fba.allocator(), .limit = 50 };
+    const a = b.allocator();
+    const x = try a.alloc(u8, 10);
+    const x2 = a.remap(x, 20) orelse return error.SkipZigTest; // the child cannot remap in place
+    try testing.expectEqual(@as(usize, 20), b.used);
+    try testing.expect(a.remap(x2, 60) == null);
+    try testing.expect(b.exceeded);
+    try testing.expectEqual(@as(usize, 20), b.used);
+    b.exceeded = false;
+    const x3 = a.remap(x2, 10).?;
+    try testing.expectEqual(@as(usize, 10), b.used);
+    const y = try a.alloc(u8, 5);
+    try testing.expect(a.remap(x3, 30) == null); // not the last allocation
+    try testing.expectEqual(@as(usize, 15), b.used);
+    _ = y;
+}
+
+test "BoundedAllocator: a failed child allocation is not charged" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var b: BoundedAllocator = .{ .child = fa.allocator(), .limit = 100 };
+    try testing.expectError(error.OutOfMemory, b.allocator().alloc(u8, 10));
+    try testing.expectEqual(@as(usize, 0), b.used);
+    try testing.expect(!b.exceeded);
+}
+
+test "Client.stream: posts to /v1/messages; a clean end is null; an empty data event is skipped; read_timeout_ms = 0 is unbounded" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .sse_raw = "data:\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\n" }});
+    defer lb.finish();
+    var c = try lb.client();
+    c.read_timeout_ms = 0;
+    var it = try c.stream(testing.allocator, canned_request);
+    defer it.deinit();
+    try testing.expectEqualStrings("/v1/messages", lb.peer.lastTarget());
+    const ev = (try it.next()).?;
+    try testing.expect(ev == .ping);
+    try testing.expect((try it.next()) == null);
+}
+
+test "Client.create / stream: 299 is success, 300 is UnexpectedStatus" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{
+        .{ .status = .{ .code = 299, .body = "{\"id\":\"m\",\"model\":\"x\",\"role\":\"assistant\",\"content\":[],\"usage\":{}}" } },
+        .{ .status = .{ .code = 299, .body = "data: {\"type\":\"ping\"}\n\n" } },
+        .{ .status = .{ .code = 300, .body = "x" } },
+    });
+    defer lb.finish();
+    var c = try lb.client();
+    var parsed = try c.create(testing.allocator, canned_request);
+    parsed.deinit();
+    var it = try c.stream(testing.allocator, canned_request);
+    it.deinit();
+    try testing.expectError(error.UnexpectedStatus, c.stream(testing.allocator, canned_request));
+}
+
+test "Client.stream: max_event_bytes and max_parsed_bytes reach the iterator; a bound hit frees its buffers" {
+    const filler: [600]u8 = @splat('h'); // the first small allocations fit under the bound, the string does not
+    var lb: Loopback = undefined;
+    try lb.start(&.{
+        .{ .big_group = .{ .lines = 50, .width = 4000 } },
+        .{ .sse_raw = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" ++ &filler ++ "\"}}\n\n" },
+    });
+    defer lb.finish();
+    var c = try lb.client();
+    c.max_event_bytes = 64 << 10; // the default (1 MiB) would let these 200 KB through to a parse failure
+    {
+        var it = try c.stream(testing.allocator, canned_request);
+        defer it.deinit();
+        try testing.expectError(error.ResponseTooLarge, it.next());
+    }
+    c.max_parsed_bytes = 400;
+    var it = try c.stream(testing.allocator, canned_request);
+    defer it.deinit();
+    try testing.expectError(error.ResponseTooLarge, it.next());
+    try testing.expectEqual(@as(usize, 0), it.arena.queryCapacity());
+    try testing.expectEqual(@as(usize, 0), it.parser.data_buf.capacity);
+}
+
+test "EventIterator.next: read_timeout_ms = 0 never times out a slow peer" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .drip = 20 }});
+    defer lb.finish();
+    var c = try lb.client();
+    c.read_timeout_ms = 0;
+    var it = try c.stream(testing.allocator, canned_request);
+    defer it.deinit();
+    if (it.next()) |_| return error.TestUnexpectedResult else |e| try testing.expect(e != error.Timeout);
+}
+
+test "Client.countTokens: the parse is bounded by max_parsed_bytes" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{ .{ .blob = "{\"input_tokens\":5}" }, .{ .blob = "{\"input_tokens\":5}" } });
+    defer lb.finish();
+    var c = try lb.client();
+    c.max_parsed_bytes = 4;
+    try testing.expectError(error.ResponseTooLarge, c.countTokens(testing.allocator, .fromMessageRequest(canned_request)));
+    c.max_parsed_bytes = 64 << 20;
+    try testing.expectEqual(@as(u64, 5), (try c.countTokens(testing.allocator, .fromMessageRequest(canned_request))).input_tokens);
+}
+
+test "EventIterator.mapParserError: OutOfMemory stays, DataTooLarge frees the arena" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .sse_raw = "" }});
+    defer lb.finish();
+    var c = try lb.client();
+    var it = try c.stream(testing.allocator, canned_request);
+    defer it.deinit();
+    try testing.expectEqual(@as(Error, error.OutOfMemory), it.mapParserError(error.OutOfMemory));
+    _ = try it.arena.allocator().alloc(u8, 100);
+    try testing.expect(it.arena.queryCapacity() > 0);
+    try testing.expectEqual(@as(Error, error.ResponseTooLarge), it.mapParserError(error.DataTooLarge));
+    try testing.expectEqual(@as(usize, 0), it.arena.queryCapacity());
+}
+
 // Real network call against the live API — skipped unconditionally.
 //
 // This module is pure Zig (no libc), and `std.process.Environ` (the

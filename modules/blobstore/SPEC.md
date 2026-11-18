@@ -6,7 +6,7 @@
 
 **Scope:** parity — ipfs/go-ds-flatfs v0.6.1 (the like-for-like file-backed block store), with the git object store, restic and cacache-rs as design yardsticks (surveyed 2026-11-02; every substantial feature closed, rejected with a reason or owned by a sibling, see Compared with and Backlog)
 
-**Audit:** review 2026-09-11 · mutation 2026-09-01 · src ?
+**Audit:** review 2026-09-11 · mutation 2026-11-17 (252/282, 30 eq) · src f309022c36481536
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — content-addressed blobs (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `uniqSafe` (temp name ≤ 255 B), fanout validated everywhere, put ≤ 64 MiB and exactly 64 MiB readable, gc mtime/keep casts; delta audit 23/25 + 2 eq)
 
@@ -278,6 +278,32 @@ creation leaving `cas/`/`named/`/`tmp/` absent from a store that only ever wrote
 `refcount = true`, a blob deleted down to a zero sidecar `gc` has not yet swept, the same `base`
 reopened with `refcount = false`, `hasOrphanedRcSidecars` finding the stale sidecar, and `gc`
 confirming it is truthfully untouched (`blobs_removed == 0`).
+
+**Audit 2026-11-17 (whole-module mutation).** 282 schemata mutants over `src/root.zig` (every guard, comparison,
+boundary, skipped call and swapped argument of the hex/segment/uniq validation, sidecar read/write, `casCommit`,
+`casDelete`, `put`/`putLimited`, `verify`, the raw/named layers and listings, `names`, scratch files, the ingest lock,
+`gc` and its reapers, the hostile-store readers and `createUniqueTemp`), ReleaseSafe, one build per round, each mutant
+under `setsid -w timeout` and `ulimit -v`, baseline first. The `crash_test.zig` model and crash loops cost 48 s of a
+50 s suite, so mutants first ran against the fast tests only and the survivors then against `crash_test`. Round 1: 154
+killed, 3 hung (counted killed), 125 survived. 26 tests added (94 now): the characters just outside `[0-9a-f]` and
+lengths 63/65, the exact `segmentSafe`/`uniqSafe` limits, sidecar text (whitespace trimmed, 31 digits, garbage is
+`CorruptSidecar` and kept by `gc`, a trimmed `0` collectible), `casCommit` return values and a dedup onto a corrupt
+sidecar, a dedup put on a `refcount = false` store, the `putLimited` limit on the total across chunks, no file
+descriptor left open by put/refused put/putNamed/names/gc, listings skipping directories and hidden files with the
+two layers apart, ns and key validated at every raw/named entry point, scratch truncation, a second locker waiting for
+the first, `gc` reaping exactly its own temps and counting them, orphan and temp sidecars, per-blob size sums, a
+dangling symlink under an orphan check, 63 stale temp names, `casCommit` of a foreign temp onto a missing `cas/`, a
+symlink at a blob path, `putNamed`'s hidden `.part` temp. Final: 252 killed (7 of them by a hang), 30 equivalent or
+unobservable, 0 survivors (a `verify` that compared only the first 32 of 64 hex characters is killed by a copy stored under an id sharing that prefix).
+The 30:
+redundant guards that fire twice (`ensureCasDir`'s fan-out and hex checks, `casCommit`/`casDelete`'s first
+`requireCasHex`, `names`'s second kind test, `scratchCreate`'s lock-name test behind `segmentSafe`, the `age >= 0`
+conjunct of `oldEnough`), directory entries whose `deleteFile`/`openDir` fails and is skipped, and the ones that need
+what no test can inject: a missing `fsync` (5), a lock file replaced between `open` and `flock` (2), a swap or delete
+between `lstat` and `open` (3), an `open`/`write` fault (2), a legacy-blob default of 0 that ends at the same count as
+1. Not mutated: the crash-injection hooks (`crashPoint`, `crash_hook`), the comptime constants (`name_max`,
+`temp_label_max`, `lock_inode_retries`, `max_record_bytes`), which a switch cannot reach; the `Error`/`Options` value
+tests pin them.
 
 ## Backlog / deferred
 None outstanding from the original four-item backlog (garbage collection, reference counting,
