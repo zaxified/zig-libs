@@ -971,3 +971,165 @@ test "fuzz driver: ENIP_FUZZ (fuzzPath)" {
 test "fuzz harness: fuzzPath, 400 seeds, reaches every outcome" {
     try fuzzPathMark.reach(fuzzPath, "enip-epath-path", 400);
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+
+test "Logical.minimal picks the narrowest width at each edge" {
+    try testing.expectEqual(LogicalFormat.bits_8, Logical.minimal(.class, 0xFF).format);
+    try testing.expectEqual(LogicalFormat.bits_16, Logical.minimal(.class, 0x100).format);
+    try testing.expectEqual(LogicalFormat.bits_16, Logical.minimal(.class, 0xFFFF).format);
+    try testing.expectEqual(LogicalFormat.bits_32, Logical.minimal(.class, 0x10000).format);
+}
+
+test "iterator: long symbolic names, simple data, packed ports and the electronic key" {
+    var buf: [64]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.shortSymbol("ABCDEFGHIJKLMNOPQRST");
+    var it = Iterator.init(b.bytes());
+    try testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRST", (try it.next()).?.symbolic);
+    try testing.expectEqual(@as(?Segment, null), try it.next());
+
+    var sd = Iterator.init(&[_]u8{ 0x80, 1, 0xAA, 0xBB });
+    try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB }, (try sd.next()).?.simple_data);
+    try testing.expectEqual(@as(?Segment, null), try sd.next());
+
+    // A packed 16-bit logical segment is three octets, so the port segment after it starts at an odd offset.
+    var pk = Iterator.initPacked(&[_]u8{ 0x21, 0x34, 0x12, 0x01, 0x05 });
+    const l = (try pk.next()).?.logical;
+    try testing.expectEqual(@as(u32, 0x1234), l.value);
+    try testing.expectEqual(LogicalFormat.bits_16, l.format);
+    const p = (try pk.next()).?.port;
+    try testing.expectEqual(@as(u16, 1), p.port);
+    try testing.expectEqualSlices(u8, &.{5}, p.link);
+    try testing.expectEqual(@as(?Segment, null), try pk.next());
+
+    var kit = Iterator.init(&[_]u8{ 0x34, 0x04, 0x11, 0x00, 0x22, 0x00, 0x33, 0x00, 5, 6 });
+    const k = (try kit.next()).?.electronic_key;
+    try testing.expectEqual(@as(u16, 0x11), k.vendor_id);
+    try testing.expectEqual(@as(u16, 0x22), k.device_type);
+    try testing.expectEqual(@as(u16, 0x33), k.product_code);
+    try testing.expectEqual(@as(u8, 5), k.major_revision);
+    try testing.expectEqual(@as(u8, 6), k.minor_revision);
+}
+
+test "the electronic key must start 34 04, and carries its fields at fixed offsets" {
+    var key = [_]u8{ 0x34, 0x04, 0x11, 0x00, 0x22, 0x00, 0x33, 0x00, 5, 6 };
+    const ok = try decodeElectronicKey(&key);
+    try testing.expectEqual(@as(u16, 0x22), ok.device_type);
+    try testing.expectEqual(@as(u16, 0x33), ok.product_code);
+    key[0] = 0x35;
+    try testing.expectError(error.UnsupportedSegment, decodeElectronicKey(&key));
+    key[0] = 0x34;
+    key[1] = 0x05;
+    try testing.expectError(error.UnsupportedSegment, decodeElectronicKey(&key));
+    var out: [10]u8 = undefined;
+    var bb = Builder.init(&out);
+    try bb.electronicKey(.{ .vendor_id = 0x11, .device_type = 0x22, .product_code = 0x33, .major_revision = 5, .minor_revision = 6 });
+    try testing.expectEqualSlices(u8, &.{ 0x34, 0x04, 0x11, 0, 0x22, 0, 0x33, 0, 5, 6 }, bb.bytes());
+}
+
+test "Builder: word count limits, exact buffers and the packed forms" {
+    var big: [600]u8 = undefined;
+    var b = Builder.init(&big);
+    b.len = 510;
+    try testing.expectEqual(@as(u8, 255), try b.words());
+    b.len = 512;
+    try testing.expectError(error.PathTooLong, b.words());
+    b.len = 3;
+    try testing.expectError(error.OddPathLength, b.words());
+
+    var two: [2]u8 = undefined;
+    var t = Builder.init(&two);
+    try t.instance(1);
+    var one: [1]u8 = undefined;
+    var o = Builder.init(&one);
+    try testing.expectError(error.BufferTooSmall, o.instance(1));
+
+    var pb: [16]u8 = undefined;
+    var p32 = Builder.initPacked(&pb);
+    try p32.logical(.{ .what = .class, .value = 0x01020304, .format = .bits_32 });
+    try testing.expectEqualSlices(u8, &.{ 0x22, 4, 3, 2, 1 }, p32.bytes());
+    var p16 = Builder.initPacked(&pb);
+    try p16.logical(.{ .what = .class, .value = 0x1234, .format = .bits_16 });
+    // A port segment after an odd-length one is padded by its own length, not by the running offset.
+    try p16.port(1, &.{7});
+    try testing.expectEqualSlices(u8, &.{ 0x21, 0x34, 0x12, 0x01, 0x07 }, p16.bytes());
+
+    var cp = Builder.init(&pb);
+    try cp.connectionPoint(5);
+    try testing.expectEqualSlices(u8, &.{ 0x2C, 5 }, cp.bytes());
+}
+
+test "symbolic names: 255 and 31 octets fit, one more does not, empty names are refused" {
+    var big: [300]u8 = undefined;
+    const n255: [255]u8 = @splat('a');
+    const n256: [256]u8 = @splat('a');
+    var b = Builder.init(&big);
+    try b.symbol(&n255);
+    try testing.expectEqual(@as(usize, 258), b.bytes().len);
+    try testing.expectEqual(@as(u8, 255), b.bytes()[1]);
+    try testing.expectError(error.TooLong, b.symbol(&n256));
+    try testing.expectError(error.EmptySymbol, b.symbol(""));
+    var s = Builder.init(&big);
+    const n31: [31]u8 = @splat('b');
+    try s.shortSymbol(&n31);
+    try testing.expectEqual(@as(usize, 33), s.bytes().len);
+    const n32: [32]u8 = @splat('b');
+    try testing.expectError(error.TooLong, s.shortSymbol(&n32));
+    try testing.expectError(error.EmptySymbol, s.shortSymbol(""));
+}
+
+test "port segments: the explicit forms, and the limits on the link" {
+    var buf: [300]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.port(1, &.{ 0xAA, 0xBB });
+    try testing.expectEqualSlices(u8, &.{ 0x11, 0x02, 0xAA, 0xBB }, b.bytes());
+    // The extended-port escape is derived from the port number even when the flag was not carried.
+    var v = Builder.init(&buf);
+    try v.portVerbatim(.{ .port = 20, .link = &.{1}, .extended_port = false });
+    try testing.expectEqualSlices(u8, &.{ 0x0F, 20, 0, 1 }, v.bytes());
+    // A two-octet link needs the extended-size form even when the flag was not carried.
+    var w = Builder.init(&buf);
+    try w.portVerbatim(.{ .port = 1, .link = &.{ 0xAA, 0xBB } });
+    try testing.expectEqualSlices(u8, &.{ 0x11, 0x02, 0xAA, 0xBB }, w.bytes());
+    var e = Builder.init(&buf);
+    try testing.expectError(error.TooLong, e.portVerbatim(.{ .port = 1, .link = &.{} }));
+    const l255: [255]u8 = @splat(7);
+    var f = Builder.init(&buf);
+    try f.portVerbatim(.{ .port = 1, .link = &l255 });
+    try testing.expectEqual(@as(usize, 258), f.bytes().len);
+    try testing.expectEqual(@as(u8, 255), f.bytes()[1]);
+    try testing.expectEqual(@as(u8, 0), f.bytes()[257]);
+    const l256: [256]u8 = @splat(7);
+    var g = Builder.init(&buf);
+    try testing.expectError(error.TooLong, g.portVerbatim(.{ .port = 1, .link = &l256 }));
+}
+
+test "simple data: whole words only, 255 words at most, the count is in words" {
+    var buf: [600]u8 = undefined;
+    var b = Builder.init(&buf);
+    try testing.expectError(error.OddPathLength, b.simpleData(&.{ 1, 2, 3 }));
+    const d510: [510]u8 = @splat(0);
+    try b.simpleData(&d510);
+    try testing.expectEqual(@as(u8, 255), b.bytes()[1]);
+    const d512: [512]u8 = @splat(0);
+    var c = Builder.init(&buf);
+    try testing.expectError(error.TooLong, c.simpleData(&d512));
+    var d = Builder.init(&buf);
+    try d.simpleData(&.{ 1, 2, 3, 4 });
+    try testing.expectEqualSlices(u8, &.{ 0x80, 2, 1, 2, 3, 4 }, d.bytes());
+}
+
+test "network segments re-encode as they were: single-octet forms and the word-counted form" {
+    var buf: [16]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.segment(.{ .network = .{ .subtype = Network.schedule, .data = &.{9} } });
+    try testing.expectEqualSlices(u8, &.{ 0x41, 9 }, b.bytes());
+    var c = Builder.init(&buf);
+    try testing.expectError(error.BufferTooSmall, c.segment(.{ .network = .{ .subtype = Network.schedule, .data = &.{ 9, 9 } } }));
+    var d = Builder.init(&buf);
+    try d.segment(.{ .network = .{ .subtype = Network.extended_network, .data = &.{ 1, 2 } } });
+    try testing.expectEqualSlices(u8, &.{ 0x51, 1, 1, 2 }, d.bytes());
+    var e = Builder.init(&buf);
+    try testing.expectError(error.OddPathLength, e.segment(.{ .network = .{ .subtype = Network.extended_network, .data = &.{1} } }));
+}

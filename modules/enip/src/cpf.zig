@@ -618,3 +618,101 @@ fn arrRepeat(comptime T: type, comptime unit: []const T, comptime n: usize) [uni
     for (0..n) |i| @memcpy(buf[i * unit.len ..][0..unit.len], unit);
     return buf;
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+
+test "which item types fit the address slot and which the data slot" {
+    const all = [_]ItemType{ .null_address, .list_identity_response, .connected_address, .connected_data, .unconnected_data, .list_services_response, .sockaddr_info_o_to_t, .sockaddr_info_t_to_o, .sequenced_address };
+    for (all) |t| {
+        const want_addr = t == .null_address or t == .connected_address or t == .sequenced_address;
+        const want_data = t == .connected_data or t == .unconnected_data;
+        try testing.expectEqual(want_addr, t.isAddress());
+        try testing.expectEqual(want_data, t.isData());
+    }
+}
+
+test "ItemList: the data item is the second one, whatever follows" {
+    const three = [_]Item{
+        .{ .type_id = .null_address, .data = &.{} },
+        .{ .type_id = .unconnected_data, .data = &.{1} },
+        .{ .type_id = .sockaddr_info_o_to_t, .data = &.{2} },
+    };
+    const l3 = ItemList{ .items = &three, .encoded_len = 0 };
+    try testing.expectEqual(ItemType.unconnected_data, l3.dataItem().?.type_id);
+    try testing.expectEqual(ItemType.sockaddr_info_o_to_t, l3.find(.sockaddr_info_o_to_t).?.type_id);
+    try testing.expectEqual(@as(?Item, null), l3.find(.connected_data));
+    const l1 = ItemList{ .items = three[0..1], .encoded_len = 0 };
+    try testing.expectEqual(@as(?Item, null), l1.dataItem());
+    try testing.expectEqual(ItemType.null_address, l1.addressItem().?.type_id);
+}
+
+test "encode: bounds on the item count, the item length and the output buffer" {
+    const items = try testing.allocator.alloc(Item, 0x10000);
+    defer testing.allocator.free(items);
+    @memset(items, .{ .type_id = .null_address, .data = &.{} });
+    const out = try testing.allocator.alloc(u8, 2 + 4 * 0x10000);
+    defer testing.allocator.free(out);
+    const w = try encode(items[0..0xFFFF], out);
+    try testing.expectEqual(@as(usize, 2 + 4 * 0xFFFF), w.len);
+    try testing.expectError(error.TooLong, encode(items, out));
+    const data = try testing.allocator.alloc(u8, 0x10000);
+    defer testing.allocator.free(data);
+    @memset(data, 0);
+    const one = [_]Item{.{ .type_id = .unconnected_data, .data = data[0..0xFFFF] }};
+    const w1 = try encode(&one, out);
+    try testing.expectEqual(@as(usize, 6 + 0xFFFF), w1.len);
+    const too = [_]Item{.{ .type_id = .unconnected_data, .data = data }};
+    try testing.expectError(error.TooLong, encode(&too, out));
+    // An item of two octets needs 2 + 4 + 2; seven octets are too few, eight exact.
+    const two = [_]Item{.{ .type_id = .unconnected_data, .data = &.{ 1, 2 } }};
+    try testing.expectError(error.BufferTooSmall, encode(&two, out[0..7]));
+    try testing.expectEqual(@as(usize, 8), (try encode(&two, out[0..8])).len);
+}
+
+test "validateDataOrder: each slot is checked, and a sequenced address must be eight octets" {
+    const seq8: [8]u8 = @splat(0);
+    // First item is not an address.
+    const bad_first = [_]Item{ .{ .type_id = .unconnected_data, .data = &.{} }, .{ .type_id = .connected_data, .data = &.{} } };
+    try testing.expectError(error.BadItemOrder, validateDataOrder(.{ .items = &bad_first, .encoded_len = 0 }));
+    // Second item is not data (a sequenced address pairs with any data item, so only the slot rule catches this).
+    const bad_second = [_]Item{ .{ .type_id = .sequenced_address, .data = &seq8 }, .{ .type_id = .sockaddr_info_o_to_t, .data = &.{} } };
+    try testing.expectError(error.BadItemOrder, validateDataOrder(.{ .items = &bad_second, .encoded_len = 0 }));
+    const seq4 = [_]Item{ .{ .type_id = .sequenced_address, .data = seq8[0..4] }, .{ .type_id = .connected_data, .data = &.{} } };
+    try testing.expectError(error.BadItemLength, validateDataOrder(.{ .items = &seq4, .encoded_len = 0 }));
+    const ok = [_]Item{ .{ .type_id = .sequenced_address, .data = &seq8 }, .{ .type_id = .connected_data, .data = &.{} } };
+    try validateDataOrder(.{ .items = &ok, .encoded_len = 0 });
+}
+
+test "envelope: a three-octet output is refused, a typed address item checks its length and type" {
+    var out3: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, encodeEnvelope(0, 0, &.{}, &out3));
+    const id4 = [_]u8{ 1, 2, 3, 4 };
+    const mk = Item{ .type_id = .connected_address, .data = &id4 };
+    try testing.expectEqual(@as(u32, 0x04030201), try connectionId(mk));
+    try testing.expectError(error.BadItemLength, connectionId(.{ .type_id = .connected_address, .data = &.{ 1, 2, 3, 4, 5 } }));
+    try testing.expectError(error.BadItemLength, connectionId(.{ .type_id = .connected_address, .data = &.{ 1, 2, 3 } }));
+    try testing.expectError(error.BadItemOrder, connectionId(.{ .type_id = .null_address, .data = &id4 }));
+    const nine: [9]u8 = @splat(0);
+    try testing.expectError(error.BadItemLength, SequencedAddress.decode(.{ .type_id = .sequenced_address, .data = &nine }));
+    var small: [7]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, (SequencedAddress{ .connection_id = 1, .sequence_number = 2 }).encode(&small));
+}
+
+test "ConnectedData: type, minimum length and exact output" {
+    try testing.expectError(error.BadItemOrder, ConnectedData.decode(.{ .type_id = .unconnected_data, .data = &.{ 1, 0 } }));
+    const empty = try ConnectedData.decode(.{ .type_id = .connected_data, .data = &.{ 9, 0 } });
+    try testing.expectEqual(@as(u16, 9), empty.sequence_count);
+    try testing.expectEqual(@as(usize, 0), empty.payload.len);
+    var out: [5]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), (try ConnectedData.encode(1, &.{ 7, 8, 9 }, &out)).len);
+    try testing.expectError(error.BufferTooSmall, ConnectedData.encode(1, &.{ 7, 8, 9 }, out[0..4]));
+}
+
+test "sockaddr items: both directions are accepted, a long item or another type is not" {
+    const sa: [17]u8 = @splat(0);
+    _ = try socketAddress(.{ .type_id = .sockaddr_info_o_to_t, .data = sa[0..16] });
+    _ = try socketAddress(.{ .type_id = .sockaddr_info_t_to_o, .data = sa[0..16] });
+    try testing.expectError(error.BadItemLength, socketAddress(.{ .type_id = .sockaddr_info_o_to_t, .data = &sa }));
+    try testing.expectError(error.BadItemLength, socketAddress(.{ .type_id = .sockaddr_info_o_to_t, .data = sa[0..15] }));
+    try testing.expectError(error.BadItemOrder, socketAddress(.{ .type_id = .connected_address, .data = sa[0..16] }));
+}

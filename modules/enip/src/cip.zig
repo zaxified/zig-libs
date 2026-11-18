@@ -812,3 +812,106 @@ test "fuzz driver: ENIP_FUZZ (fuzzAttrList)" {
 test "fuzz harness: fuzzAttrList, 400 seeds, reaches every outcome" {
     try fuzzAttrListMark.reach(fuzzAttrList, "enip-cip-attrList", 400);
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+
+test "general status: what carries data" {
+    try testing.expect(GeneralStatus.success.isSuccess());
+    try testing.expect(!GeneralStatus.partial_transfer.isSuccess());
+    try testing.expect(GeneralStatus.success.hasData());
+    try testing.expect(GeneralStatus.partial_transfer.hasData());
+    try testing.expect(!GeneralStatus.path_segment_error.hasData());
+    try testing.expect(!GeneralStatus.connection_failure.hasData());
+}
+
+test "request encode: a reply service, the path word limit and the exact buffer" {
+    var out: [600]u8 = undefined;
+    const path510: [510]u8 = @splat(0);
+    const path512: [512]u8 = @splat(0);
+    try testing.expectError(error.BadPath, (Request{ .service = 0x8C, .path = &.{}, .data = &.{} }).encode(&out));
+    const ok = try (Request{ .service = 0x4C, .path = &path510, .data = &.{} }).encode(&out);
+    try testing.expectEqual(@as(u8, 255), ok[1]);
+    try testing.expectError(error.BadPath, (Request{ .service = 0x4C, .path = &path512, .data = &.{} }).encode(&out));
+    const r = Request{ .service = 0x4C, .path = &.{ 0x20, 1 }, .data = &.{ 7, 8 } };
+    try testing.expectEqual(@as(usize, 6), (try r.encode(out[0..6])).len);
+    try testing.expectError(error.BufferTooSmall, r.encode(out[0..5]));
+}
+
+test "reply encode: the word limit, the exact buffer and the reserved octet" {
+    var out: [600]u8 = undefined;
+    const a510: [510]u8 = @splat(0);
+    const a512: [512]u8 = @splat(0);
+    const w = try (Reply{ .service = 0x0E, .general_status = .success, .additional_status = &a510, .data = &.{} }).encode(&out);
+    try testing.expectEqual(@as(u8, 255), w[3]);
+    try testing.expectError(error.TooManyStatusWords, (Reply{ .service = 0x0E, .general_status = .success, .additional_status = &a512, .data = &.{} }).encode(&out));
+    const r = Reply{ .service = 0x0E, .reserved = 7, .general_status = .path_segment_error, .additional_status = &.{}, .data = &.{ 1, 2 } };
+    const e = try r.encode(out[0..6]);
+    try testing.expectEqual(@as(u8, 7), e[1]);
+    try testing.expectEqual(@as(u8, 0x04), e[2]);
+    try testing.expectError(error.BufferTooSmall, r.encode(out[0..5]));
+}
+
+test "Multiple_Service_Packet: empty and zero-length messages, table edges, exact buffers" {
+    const none = try MultipleService.decode(&.{ 0, 0 });
+    try testing.expectEqual(@as(usize, 0), none.count);
+    // One message whose offset is the payload's length: an empty embedded message.
+    const one = try MultipleService.decode(&.{ 1, 0, 4, 0 });
+    try testing.expectEqual(@as(usize, 0), (try one.at(0)).len);
+    try testing.expectError(error.BadOffsetTable, one.at(1));
+    try testing.expectError(error.BadOffsetTable, none.at(0));
+    // Two messages, the first empty (offset == next offset).
+    const two = try MultipleService.decode(&.{ 2, 0, 6, 0, 6, 0, 0xAA });
+    try testing.expectEqual(@as(usize, 0), (try two.at(0)).len);
+    try testing.expectEqualSlices(u8, &.{0xAA}, try two.at(1));
+    // The next offset may equal the payload length.
+    const edge = try MultipleService.decode(&.{ 2, 0, 6, 0, 7, 0, 0xAA });
+    try testing.expectEqualSlices(u8, &.{0xAA}, try edge.at(0));
+    try testing.expectEqual(@as(usize, 0), (try edge.at(1)).len);
+    // The table must fit the payload, exactly.
+    try testing.expectError(error.BadOffsetTable, MultipleService.decode(&.{ 2, 0, 6, 0 }));
+    try testing.expectEqual(@as(usize, 13), MultipleService.encodedLen(&.{ 3, 4 }));
+    const msgs = [_][]const u8{ &.{ 1, 2, 3 }, &.{ 4, 5, 6, 7 } };
+    var out: [13]u8 = undefined;
+    const w = try MultipleService.encode(&msgs, &out);
+    try testing.expectEqualSlices(u8, &.{ 2, 0, 6, 0, 9, 0, 1, 2, 3, 4, 5, 6, 7 }, w);
+    try testing.expectError(error.BufferTooSmall, MultipleService.encode(&msgs, out[0..12]));
+}
+
+test "Multiple_Service_Packet encode: the message count and the 16-bit total" {
+    const many = try testing.allocator.alloc([]const u8, 0x10000);
+    defer testing.allocator.free(many);
+    @memset(many, &.{});
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.TooManyMessages, MultipleService.encode(many, &tiny));
+    // 65535 messages are a legal count but their table alone is past the 16-bit total.
+    try testing.expectError(error.BufferTooSmall, MultipleService.encode(many[0..0xFFFF], &tiny));
+    const body = try testing.allocator.alloc(u8, 0x10000);
+    defer testing.allocator.free(body);
+    @memset(body, 0);
+    const out = try testing.allocator.alloc(u8, 0x10100);
+    defer testing.allocator.free(out);
+    // total = 2 + 2 + 65531 = 0xFFFF: fits; one more octet does not.
+    const fits = [_][]const u8{body[0 .. 0xFFFF - 4]};
+    try testing.expectEqual(@as(usize, 0xFFFF), (try MultipleService.encode(&fits, out)).len);
+    const over = [_][]const u8{body[0 .. 0x10000 - 4]};
+    try testing.expectError(error.BufferTooSmall, MultipleService.encode(&over, out));
+}
+
+test "attribute services: the request bytes and the list limit" {
+    var out: [128]u8 = undefined;
+    const w = try setAttributeSingle(1, 1, 1, &.{9}, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x10, 3, 0x20, 1, 0x24, 1, 0x30, 1, 9 }, w);
+    var attrs: [65]u16 = @splat(1);
+    var big: [300]u8 = undefined;
+    _ = try getAttributeList(1, 1, attrs[0..64], &big);
+    try testing.expectError(error.BufferTooSmall, getAttributeList(1, 1, &attrs, &big));
+}
+
+test "the attribute list iterator: an empty list, and an entry one octet short" {
+    var it = try AttributeListIterator.init(&.{ 0, 0 });
+    try testing.expectEqual(@as(?AttributeStatus, null), try it.next(0));
+    var one = try AttributeListIterator.init(&.{ 1, 0, 7, 0, 0 });
+    try testing.expectError(error.Truncated, one.next(0));
+    var full = try AttributeListIterator.init(&.{ 1, 0, 7, 0, 0, 0 });
+    try testing.expectEqual(@as(u16, 7), (try full.next(0)).?.id);
+}

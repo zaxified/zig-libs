@@ -657,3 +657,164 @@ fn sendLater(io: std.Io, w: *std.Io.Writer, bytes: []const u8, ms: i64) !void {
     try w.writeAll(bytes);
     try w.flush();
 }
+
+// ── whole-module mutation audit 2026-11-17: boundary tests ────────────────
+
+test "loop transport: short reads, ordered deliveries and cleared writes" {
+    var lt: LoopTransport = .{};
+    lt.deliver(&.{ 1, 2, 3, 4, 5 });
+    lt.deliver(&.{ 6, 7 });
+    var two: [2]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), try lt.transport().read(&two));
+    try testing.expectEqualSlices(u8, &.{ 1, 2 }, &two);
+    try testing.expectEqual(@as(usize, 2), try lt.transport().read(&two));
+    try testing.expectEqualSlices(u8, &.{ 3, 4 }, &two);
+    var big: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 3), try lt.transport().read(&big));
+    try testing.expectEqualSlices(u8, &.{ 5, 6, 7 }, big[0..3]);
+    try lt.transport().write(&.{9});
+    try testing.expectEqualSlices(u8, &.{9}, lt.sent());
+    lt.clearSent();
+    try testing.expectEqual(@as(usize, 0), lt.sent().len);
+}
+
+test "pump: both directions are delivered and both sides are cleared" {
+    var a: LoopTransport = .{};
+    var b: LoopTransport = .{};
+    try a.transport().write(&.{1});
+    try b.transport().write(&.{2});
+    pump(&a, &b);
+    try testing.expectEqual(@as(usize, 0), a.sent().len);
+    try testing.expectEqual(@as(usize, 0), b.sent().len);
+    var buf: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try b.transport().read(&buf));
+    try testing.expectEqual(@as(u8, 1), buf[0]);
+    try testing.expectEqual(@as(usize, 1), try a.transport().read(&buf));
+    try testing.expectEqual(@as(u8, 2), buf[0]);
+}
+
+test "tcp: back-to-back messages are read one at a time, into a buffer of exactly a header" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    var all: [3 * encap.header_len]u8 = undefined;
+    for (0..3) |i| {
+        var h = nopHeader(0);
+        h[12] = @intCast(i + 1);
+        @memcpy(all[i * encap.header_len ..][0..encap.header_len], &h);
+    }
+    var pw_buf: [128]u8 = undefined;
+    var pw = fixture.peer.writer(io, &pw_buf);
+    try pw.interface.writeAll(&all);
+    try pw.interface.flush();
+    fixture.tt.setReadTimeout(2000);
+    var buf: [encap.header_len]u8 = undefined;
+    for (0..3) |i| {
+        try testing.expectEqual(@as(usize, encap.header_len), try fixture.tt.transport().read(&buf));
+        try testing.expectEqual(@as(u8, @intCast(i + 1)), buf[12]);
+    }
+}
+
+test "tcp: a buffer smaller than a header, a message that exactly fits and one that does not" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    var small: [encap.header_len - 1]u8 = undefined;
+    try testing.expectError(error.ReadFailed, fixture.tt.transport().read(&small));
+
+    const body8: [8]u8 = @splat(1);
+    const msg = nopHeader(8) ++ body8;
+    var pw_buf: [128]u8 = undefined;
+    var pw = fixture.peer.writer(io, &pw_buf);
+    try pw.interface.writeAll(&msg);
+    try pw.interface.flush();
+    fixture.tt.setReadTimeout(2000);
+    var exact: [32]u8 = undefined;
+    try testing.expectEqual(@as(usize, 32), try fixture.tt.transport().read(&exact));
+
+    // A message one octet larger than the caller's buffer is a failure, not a truncation.
+    try pw.interface.writeAll(&msg);
+    try pw.interface.flush();
+    var short: [31]u8 = undefined;
+    try testing.expectError(error.ReadFailed, fixture.tt.transport().read(&short));
+}
+
+test "tcp: end of stream between messages is EndOfStream, inside one it is ReadFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    {
+        var fixture = try SilentPeer.open(io, &server);
+        defer fixture.close(io);
+        try fixture.peer.shutdown(io, .both);
+        var buf: [64]u8 = undefined;
+        try testing.expectError(error.EndOfStream, fixture.tt.transport().read(&buf));
+    }
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+    const h = nopHeader(8);
+    var pw_buf: [64]u8 = undefined;
+    var pw = fixture.peer.writer(io, &pw_buf);
+    try pw.interface.writeAll(&(h ++ [_]u8{ 1, 2, 3 }));
+    try pw.interface.flush();
+    try fixture.peer.shutdown(io, .both);
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.ReadFailed, fixture.tt.transport().read(&buf));
+}
+
+test "tcp: a write is flushed at once, and a write to a closed peer is WriteFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    try fixture.tt.transport().write(&.{ 1, 2, 3 });
+    var fds = [_]std.posix.pollfd{.{ .fd = fixture.peer.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    try testing.expect((try std.posix.poll(&fds, 2000)) != 0);
+    var rb: [16]u8 = undefined;
+    var pr = fixture.peer.reader(io, &rb);
+    var got: [3]u8 = undefined;
+    try pr.interface.readSliceAll(&got);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, &got);
+
+    try fixture.peer.shutdown(io, .both);
+    const chunk: [1024]u8 = @splat(0);
+    var failed = false;
+    for (0..100) |_| {
+        fixture.tt.transport().write(&chunk) catch |e| {
+            try testing.expectEqual(error.WriteFailed, e);
+            failed = true;
+            break;
+        };
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try testing.expect(failed);
+}
+
+test "udp: the receive timeout is in milliseconds" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var u = UdpDiscovery.open(io, .{}) catch |err| return testkit.loopbackSkip("udp open failed ({t})", .{err});
+    defer u.close();
+    u.setRecvTimeout(120);
+    var buf: [64]u8 = undefined;
+    const start = std.Io.Timestamp.now(io, .awake);
+    try testing.expectEqual(@as(?Datagram, null), try u.receive(&buf));
+    try testing.expect(start.untilNow(io, .awake).toMilliseconds() >= 60);
+}

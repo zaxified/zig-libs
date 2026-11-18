@@ -299,8 +299,10 @@ pub const Client = struct {
         const env_start = self.tx.len / 2;
         var body_buf = self.tx[env_start..];
         if (body_buf.len < 2 + request.len + 64) return error.BufferTooSmall;
-        conn.sequence +%= 1;
-        const sent_sequence = conn.sequence;
+        // The count is committed only once the whole frame is built: a message
+        // that never goes out must not consume one (CIP Vol 2, sequence count
+        // per transmitted data packet).
+        const sent_sequence = conn.sequence +% 1;
         const body = cpf.ConnectedData.encode(sent_sequence, request, body_buf) catch
             return error.BufferTooSmall;
         const items = cpf.connectedItems(&id_le, body);
@@ -310,6 +312,7 @@ pub const Client = struct {
             &items,
             body_buf[body.len..],
         ) catch return error.BufferTooSmall;
+        conn.sequence = sent_sequence;
         const reply = try self.exchange(.send_unit_data, env);
 
         var storage: [4]cpf.Item = undefined;
