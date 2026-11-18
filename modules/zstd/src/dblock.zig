@@ -1008,3 +1008,89 @@ test "default sequence tables match libzstd's literal tables" {
     try std.testing.expectEqual(SeqSymbol{ .next_state = 0, .nb_additional_bits = 0, .nb_bits = 6, .base_value = 3 }, ml_default.cells[0]);
     try std.testing.expectEqual(SeqSymbol{ .next_state = 0, .nb_additional_bits = 10, .nb_bits = 6, .base_value = 1027 }, ml_default.cells[63]);
 }
+
+test "execSequence agrees with a byte-by-byte model at every edge of the output, the literals and the history" {
+    var prng = std.Random.DefaultPrng.init(0xe5ec);
+    const rnd = prng.random();
+    var out: [700]u8 = undefined;
+    var shadow: [700]u8 = undefined;
+    var lit_buf: [200]u8 = undefined;
+    var ext_buf: [64]u8 = undefined;
+    var hist: [400]u8 = undefined;
+    var trial: usize = 0;
+    while (trial < 400_000) : (trial += 1) {
+        const prefix: usize = if (rnd.boolean()) 0 else rnd.uintLessThan(usize, 25);
+        const ext_len: usize = switch (rnd.uintLessThan(u32, 4)) {
+            0, 1 => 0,
+            2 => rnd.uintLessThan(usize, 8),
+            else => rnd.uintLessThan(usize, 64),
+        };
+        const done = rnd.uintLessThan(usize, 90); // frame output before this sequence
+        const op = prefix + done;
+        const room: usize = switch (rnd.uintLessThan(u32, 3)) {
+            0 => rnd.uintLessThan(usize, 140),
+            1 => 30 + rnd.uintLessThan(usize, 12), // around wildcopy_overlength
+            else => 60 + rnd.uintLessThan(usize, 80),
+        };
+        const oend = op + room;
+        const ll: usize = if (rnd.boolean()) rnd.uintLessThan(usize, 20) else rnd.uintLessThan(usize, 60);
+        const ml: usize = 3 + (if (rnd.boolean()) rnd.uintLessThan(usize, 20) else rnd.uintLessThan(usize, 70));
+        const hist_len = ext_len + done;
+        const offset: usize = switch (rnd.uintLessThan(u32, 4)) {
+            0 => 1 + rnd.uintLessThan(usize, 20),
+            1 => 1 + rnd.uintLessThan(usize, 40),
+            2 => @max(1, hist_len -| rnd.uintLessThan(usize, 3)),
+            else => 1 + rnd.uintLessThan(usize, hist_len + 3),
+        };
+        const lit_have = ll + switch (rnd.uintLessThan(u32, 4)) {
+            0 => @as(usize, 0),
+            1 => 1,
+            2 => 31 + rnd.uintLessThan(usize, 3),
+            else => rnd.uintLessThan(usize, 40),
+        } -| (if (rnd.uintLessThan(u32, 8) == 0 and ll > 0) @as(usize, 1) else 0);
+        rnd.bytes(&lit_buf);
+        rnd.bytes(&ext_buf);
+        rnd.bytes(&out);
+        // the bytes past oend must survive any amount of wild copying done right
+        @memset(out[oend..][0..32], 0xee);
+        shadow = out;
+
+        // the model
+        @memcpy(hist[0..ext_len], ext_buf[0..ext_len]);
+        @memcpy(hist[ext_len..][0..done], out[prefix..op]);
+        var want: error{ DstSizeTooSmall, CorruptionDetected }!usize = ll + ml;
+        var n = hist_len;
+        if (ll + ml > room) {
+            want = error.DstSizeTooSmall;
+        } else if (ll > lit_have) {
+            want = error.CorruptionDetected;
+        } else {
+            for (0..ll) |i| {
+                hist[n] = lit_buf[i];
+                n += 1;
+            }
+            if (offset > n) {
+                want = error.CorruptionDetected;
+            } else {
+                for (0..ml) |_| {
+                    hist[n] = hist[n - offset];
+                    n += 1;
+                }
+            }
+        }
+
+        const h: History = .{ .out = out[0..oend], .prefix = prefix, .ext = ext_buf[0..ext_len] };
+        var cur: LitCursor = .{ .src = lit_buf[0 .. lit_have + 32], .pos = 0, .end = lit_have };
+        const got = execSequence(&h, op, oend, .{ .lit_length = ll, .match_length = ml, .offset = offset }, &cur);
+        if (want) |w| {
+            try std.testing.expectEqual(w, try got);
+            try std.testing.expectEqualSlices(u8, hist[hist_len..][0..w], out[op..][0..w]);
+            try std.testing.expectEqual(ll, cur.pos);
+            try std.testing.expectEqualSlices(u8, shadow[0..op], out[0..op]);
+        } else |e| {
+            try std.testing.expectError(e, got);
+        }
+        // nothing at or past the end of the output was touched
+        try std.testing.expect(std.mem.allEqual(u8, out[oend..][0..32], 0xee));
+    }
+}

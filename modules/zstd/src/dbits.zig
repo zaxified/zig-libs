@@ -453,3 +453,161 @@ test "a zero last byte is not a stream" {
     try std.testing.expectError(error.Generic, DStream.init(&.{ 1, 2, 3, 4, 5, 6, 7, 0 }));
     try std.testing.expectError(error.SrcSizeWrong, DStream.init(&.{}));
 }
+
+test "bit reader: init on short streams, every byte count" {
+    // bytes 1..7: little-endian assembly of the container, the end mark's
+    // position, and the bits that lie before the stream start.
+    const src = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x04 };
+    var len: usize = 1;
+    while (len <= 7) : (len += 1) {
+        const d = try DStream.init(src[0..len]);
+        var want: u64 = 0;
+        for (src[0..len], 0..) |b, i| want |= @as(u64, b) << @intCast(8 * i);
+        try std.testing.expectEqual(want, d.container);
+        try std.testing.expectEqual(@as(usize, 0), d.ptr);
+        const last = src[len - 1];
+        try std.testing.expectEqual(8 - highbit32(last) + @as(u32, @intCast((8 - len) * 8)), d.bits_consumed);
+    }
+    try std.testing.expectError(error.SrcSizeWrong, DStream.init(src[0..0]));
+    try std.testing.expectError(error.CorruptionDetected, DStream.init(&[_]u8{ 1, 0 }));
+    try std.testing.expectError(error.Generic, DStream.init(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 0 }));
+    const d8 = try DStream.init(&[_]u8{ 1, 2, 3, 4, 5, 6, 7, 0x80 });
+    try std.testing.expectEqual(@as(u32, 1), d8.bits_consumed);
+    try std.testing.expectEqual(@as(usize, 0), d8.ptr);
+}
+
+test "bit reader: the reload state machine at its boundaries" {
+    var buf: [16]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @intCast(i + 1);
+    buf[15] = 0x80;
+    // reloadFast: refuses below start + 8, takes ptr == start + 8
+    {
+        var d = try DStream.init(buf[0..16]); // ptr == 8
+        d.bits_consumed = 24;
+        try std.testing.expectEqual(Status.unfinished, d.reloadFast());
+        try std.testing.expectEqual(@as(usize, 5), d.ptr);
+        try std.testing.expectEqual(@as(u32, 0), d.bits_consumed);
+        var d2 = try DStream.init(buf[0..15]); // ptr == 7
+        d2.bits_consumed = 24;
+        try std.testing.expectEqual(Status.overflow, d2.reloadFast());
+        try std.testing.expectEqual(@as(usize, 7), d2.ptr);
+    }
+    // an overflow sticks: reload() and reloadFast() both keep refusing
+    {
+        var d = try DStream.init(buf[0..16]);
+        d.bits_consumed = 70;
+        try std.testing.expectEqual(Status.overflow, d.reload());
+        try std.testing.expect(d.overflowed);
+        d.bits_consumed = 0;
+        try std.testing.expectEqual(Status.overflow, d.reload());
+        try std.testing.expectEqual(Status.overflow, d.reloadFast());
+        try std.testing.expect(!d.endOfStream());
+    }
+    // ptr == start: end_of_buffer below 64 consumed bits, completed at 64
+    {
+        var d = try DStream.init(buf[0..8]);
+        d.bits_consumed = 63;
+        try std.testing.expectEqual(Status.end_of_buffer, d.reload());
+        d.bits_consumed = 64;
+        try std.testing.expectEqual(Status.completed, d.reload());
+        try std.testing.expect(d.endOfStream());
+        d.bits_consumed = 65;
+        try std.testing.expect(!d.endOfStream());
+        try std.testing.expectEqual(Status.overflow, d.reload());
+    }
+    // 0 < ptr - start < 8: the slow path, exactly-enough bytes vs too few
+    {
+        var d = try DStream.init(buf[0..12]); // ptr == 4
+        d.bits_consumed = 32; // nb_bytes == ptr - start
+        try std.testing.expectEqual(Status.unfinished, d.reload());
+        try std.testing.expectEqual(@as(usize, 0), d.ptr);
+        try std.testing.expectEqual(@as(u32, 0), d.bits_consumed);
+        var e = try DStream.init(buf[0..12]);
+        e.bits_consumed = 40; // one byte more than there is
+        try std.testing.expectEqual(Status.end_of_buffer, e.reload());
+        try std.testing.expectEqual(@as(usize, 0), e.ptr);
+        try std.testing.expectEqual(@as(u32, 8), e.bits_consumed);
+        var f = try DStream.init(buf[0..12]);
+        f.bits_consumed = 16;
+        try std.testing.expectEqual(Status.unfinished, f.reload());
+        try std.testing.expectEqual(@as(usize, 2), f.ptr);
+    }
+}
+
+test "readNCount: random distributions, any trailing bytes, short and clamped buffers" {
+    const fse = @import("fse.zig");
+    var prng = std.Random.DefaultPrng.init(0x2c11);
+    const rnd = prng.random();
+    var trial: usize = 0;
+    while (trial < 4000) : (trial += 1) {
+        const tl: u32 = 5 + rnd.uintLessThan(u32, 8);
+        const total: i32 = @as(i32, 1) << @intCast(tl);
+        var norm: [256]i16 = @splat(0);
+        var remaining: i32 = total;
+        var n: u32 = 0;
+        const sparse = rnd.boolean();
+        while (remaining > 0) {
+            if (sparse and n < 150 and rnd.uintLessThan(u32, 6) == 0) {
+                n += 1 + rnd.uintLessThan(u32, 90);
+                continue;
+            }
+            var v: i32 = if (rnd.uintLessThan(u32, 4) == 0) -1 else blk: {
+                const a: i32 = 1 + @as(i32, @intCast(rnd.uintLessThan(u32, @intCast(remaining))));
+                const b: i32 = 1 + @as(i32, @intCast(rnd.uintLessThan(u32, @intCast(remaining))));
+                break :blk @min(a, b);
+            };
+            if (n >= 250) v = remaining;
+            if (v == total) v -= 1;
+            norm[n] = @intCast(v);
+            remaining -= if (v < 0) -v else v;
+            n += 1;
+        }
+        var wbuf: [600]u8 = undefined;
+        const len = try fse.writeNCount(&wbuf, &norm, n - 1, tl);
+        var pad: usize = 0;
+        while (pad < 10) : (pad += 1) {
+            @memset(wbuf[len..][0..pad], if (pad % 2 == 0) 0xff else 0);
+            var dn: [256]i16 = @splat(0x5a5a);
+            var msv: u32 = 255;
+            var tlog: u32 = undefined;
+            const sz = try readNCount(&dn, &msv, &tlog, wbuf[0 .. len + pad]);
+            try std.testing.expectEqual(len, sz);
+            try std.testing.expectEqual(n - 1, msv);
+            try std.testing.expectEqual(tl, tlog);
+            try std.testing.expectEqualSlices(i16, norm[0..n], dn[0..n]);
+        }
+        // a header cut by one byte never reports more than it was given
+        if (len > 1) {
+            var dn: [256]i16 = undefined;
+            var msv: u32 = 255;
+            var tlog: u32 = undefined;
+            if (readNCount(&dn, &msv, &tlog, wbuf[0 .. len - 1])) |sz| {
+                try std.testing.expect(sz <= len - 1);
+            } else |_| {}
+        }
+        // a maximum symbol below the last one is refused
+        if (n >= 2) {
+            var dn: [256]i16 = undefined;
+            var msv: u32 = n - 2;
+            var tlog: u32 = undefined;
+            if (readNCount(&dn, &msv, &tlog, wbuf[0 .. len + 8])) |_| {
+                return error.TestUnexpectedResult;
+            } else |_| {}
+        }
+    }
+}
+
+test "readNCount: the table log field" {
+    var dn: [256]i16 = undefined;
+    var tlog: u32 = undefined;
+    var msv: u32 = 255;
+    var h: [8]u8 = @splat(0);
+    h[0] = 11; // 11 + 5 = 16 > 15
+    try std.testing.expectError(error.TableLogTooLarge, readNCount(&dn, &msv, &tlog, &h));
+    h[0] = 10; // table log 15 is allowed (the zeros that follow are not a valid table)
+    msv = 255;
+    if (readNCount(&dn, &msv, &tlog, &h)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expect(err != error.TableLogTooLarge);
+    try std.testing.expectEqual(@as(u32, 15), tlog);
+}

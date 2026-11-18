@@ -606,3 +606,17 @@ pub const Seekable = struct {
         return s.decompress(dst[0..@intCast(size)], s.table.entries[index].d_offset);
     }
 };
+
+test "a byte source reads exactly up to its end and refuses beyond" {
+    const src: Source = .{ .bytes = "0123456789" };
+    var buf: [10]u8 = undefined;
+    try src.readAt(buf[0..10], 0);
+    try std.testing.expectEqualStrings("0123456789", &buf);
+    try src.readAt(buf[0..4], 6);
+    try std.testing.expectEqualStrings("6789", buf[0..4]);
+    try src.readAt(buf[0..0], 10); // the empty read at the end
+    try std.testing.expectError(error.ReadFailed, src.readAt(buf[0..1], 10));
+    try std.testing.expectError(error.ReadFailed, src.readAt(buf[0..5], 6));
+    try std.testing.expectError(error.ReadFailed, src.readAt(buf[0..0], 11));
+    try std.testing.expectEqual(@as(u64, 10), try src.length());
+}
