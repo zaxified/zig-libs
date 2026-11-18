@@ -95,10 +95,11 @@ How this module satisfies each:
 - **Single submitter, single thread.** The coordinator is the *only* thing that submits, and only
   from the coordinator thread, via the shared spinlock-serialized `pool.submit` — never a
   `Submitter` handle. So `max_submitters = 0` is correct and sufficient.
-- **Quiesce-before-lifecycle.** `deinit` runs `flushAll()` first. `flushAll` returns only when
-  `unflushed == 0` **and** `in_flight == 0` — i.e. every submitted flush has completed and been
-  harvested, and (because `deinit` is on the coordinator thread) no new `put`/`submit` can be racing
-  it. Only then does `deinit` call `pool.drain()`. Producers are provably quiesced.
+- **Quiesce-before-lifecycle.** `deinit` runs `flushAll()` first, then `pool.drain()`, both on the
+  coordinator thread, so no new `put`/`submit` can be racing the drain. A complete `flushAll` left
+  `unflushed == 0` **and** `in_flight == 0`; one that gave up at `flush_timeout_ns` may leave
+  flushes running, which `pool.drain()` waits for and the final `pump` harvests (acks). Producers
+  are quiesced either way.
 - **Thread-safe allocator.** `Options` documents (and the tests use) a thread-safe allocator; the
   pool allocates queue nodes/job boxes from worker threads, per its contract.
 
@@ -161,9 +162,11 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   is the authority. Regression test: *"over-budget value: acked write is reachable by drain() ALONE"*,
   which deliberately avoids `flushAll` because its `flushOneSync` backstop masks the hole.
 - **`flushAll` backstop.** If records remain but none are cache-dirty/orphan (e.g. a reopened WAL
-  the operator never `recover()`ed), `flushOneSync` drains them synchronously so `flushAll` always
-  terminates in a clean state. `deinit` calls `flushAll`, so even a forgotten `recover()` loses
-  nothing.
+  the operator never `recover()`ed), `flushOneSync` drains them synchronously. `deinit` calls
+  `flushAll`, so even a forgotten `recover()` loses nothing. A record the sink rejects on this path
+  is held (leased) for the rest of the pass so the next synchronous flush moves on to the next
+  record, then returned to the WAL for a retry. The synchronous path does not run while a key
+  waits out its retry backoff: the global dequeue would hand that key's record over early.
 
   Fixed 2026-10-05: after acking a record, `flushOneSync` looked up the key's next record through
   `lease.partition`, which `ack` had just freed, and then dropped the lease it got back — the next
@@ -171,11 +174,41 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   (with the real key bytes, as in ReleaseFast). It now copies the key before `ack` and hands the
   next record to `startFlush`, as `finishTask` does. Regression test: *"flushOneSync: a key's next
   record is flushed, not leased and dropped"*.
-- **Sink write failure** → the record is `nack`'d back to the WAL (with `retry_backoff_ns`) and the
-  key stays dirty/orphan; a later `drain` retries. Retries are **unbounded by default**
-  (`max_flush_attempts = 0`), so `flushAll` against a permanently-failing sink retries at ~20 Hz and
-  does not return — an operational fault, not a data-loss one, exactly as this line has always
-  claimed.
+- **Sink write failure** → the record is `nack`'d back to the WAL, visible at once, and the key is
+  registered as an orphan, so a later `drain` retries it; with `retry_backoff_ns > 0` the key (the
+  failed record and every later record of the key) waits that long first, an in-memory per-key
+  deadline (`retry_at`, on `wal_mono_clock`). Retries are **unbounded by default**
+  (`max_flush_attempts = 0`), so `flushAll` against a permanently-failing sink keeps retrying
+  (on every drain, spaced by `retry_backoff_ns`) until `flush_timeout_ns` (default 120 s) and then
+  returns `error.FlushIncomplete`, the record still in the WAL — an operational fault, not a
+  data-loss one. (Until 2026-11-19 this line said "retries at ~20 Hz and does not return"; with
+  the default zero backoff the pool path actually resubmitted on every completion.)
+
+  **Why the backoff is not in the WAL (fixed 2026-11-19).** It used to be: `nack` with
+  `retry_backoff_ns` makes `jobqueue` move the record to its schedule heap, out of its partition's
+  FIFO, so a newer record of the same key was dequeued and written first and the retried older
+  value then overwrote it — last-writer-wins broken, and across a restart too, since the WAL
+  persists the backoff (`recover`/`flushAll` applied v2, then v1 once the backoff ran out).
+  Reproduced on the old code by the two "last-writer-wins survives a retry backoff" tests (both
+  failed: in-process v2 reached the sink while v1 waited; after a restart v1 won). Now the record
+  goes back with no WAL-side backoff and stays its key's oldest; `startKey` skips a key while its
+  `retry_at` lies ahead. After a restart the record is retried without delay (Kafka's
+  `retry.backoff.ms` is an in-memory producer setting too). A WAL written before this change can
+  still hold a persisted backoff; such a record is counted as pending and flushed once visible.
+
+  **`flushAll` contract (fixed 2026-11-19, audit finding wbmut-1).** `flushAll` blocks until every
+  pending record has landed or been dead-lettered (a finite `max_flush_attempts`; counted by
+  `poisonedCount`), bounded by `Options.flush_timeout_ns`, then returns `error.FlushIncomplete`.
+  *Reference:* Kafka `KafkaProducer.flush()` "blocks on the completion of the requests associated
+  with these records … A request is considered completed when it is successfully acknowledged …
+  or else it results in an error", and each record's wait is bounded by `delivery.timeout.ms`
+  ("an upper bound on the time to report success or failure after a call to send() returns …
+  and the time allowed for retriable send failures", default 120 000 ms, from `ProducerConfig`).
+  Ehcache's writers page leaves retry to the writer and states no flush deadline. Hence: block,
+  retry, give up at 120 s with a typed error. 0 = no waiting (one synchronous pass), `maxInt` = no
+  limit. `deinit` uses the same bound (Kafka's `close()` blocks without one by default; here a
+  dead sink would otherwise hold teardown forever, and the WAL keeps the records, so bounding it
+  loses nothing; `deinitNoFlush` remains the immediate exit).
 
   It was not true until 2026-07-31. The WAL was enqueued at `jobqueue`'s default `max_attempts` of
   5, so the sixth rejection **dead-lettered an acknowledged write**: gone from the sink, gone from
@@ -293,7 +326,14 @@ the tests that depend on them, not mutated. Counts on the card are whole-module.
 
 **Findings of the audit** (no source change made; the owner decides):
 
-- *wbmut-1 — `flushAll` returns with records still pending.* `flushAll` stops as soon as the
+- *wbmut-1 — `flushAll` returns with records still pending.* **Fixed 2026-11-19** (see "Sink
+  write failure" above): `flushAll` waits out backoffs and rejections up to `flush_timeout_ns`,
+  then `error.FlushIncomplete`; the failure path keeps the key registered, so `drain()` retries
+  it; a rejected synchronous write no longer ends the flush; the synchronous path also counts a
+  dead-lettered record (it ignored dead-lettering and left `unflushed` stuck). Part (d) did not
+  hold: `jobqueue.readyCount()` counts ready records whatever their `run_at`, so a record in a
+  persisted backoff was already counted at reopen (now pinned by a test). The three FINDING tests
+  assert the fixed behaviour. Original text: `flushAll` stops as soon as the
   synchronous backstop (`flushOneSync`) reports no progress, which it also does while a record is
   merely hidden by its retry backoff or after one rejected synchronous write. With
   `retry_backoff_ns > 0` a failed pool flush therefore ends `flushAll` (and `deinit`'s flush)
