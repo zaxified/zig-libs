@@ -558,6 +558,11 @@ test "dealer-free keygen: 2-of-3 over frames -> KeyShares -> threshold sign -> s
     while (parties[0].phase() != .done) : (rounds += 1) {
         try testing.expect(rounds < 16);
         for (&parties) |*p| try p.advance();
+        // Nobody queues a frame for itself (a Πfac for its own modulus, say).
+        for (&parties, 1..) |*p, me| for (p.outbox.items) |m| switch (m.to) {
+            .party => |to| try testing.expect(to != me),
+            .broadcast => {},
+        };
         try rig.deliver(allocator, null);
     }
     try testing.expectEqual(@as(usize, 0), rig.refused);
@@ -758,4 +763,52 @@ test "keygen context: a raw 32-byte session id never equals a long session id's 
     // Same input, same context (every party derives the same one).
     var buf_c: [EcdsaKeygen.ctx_max]u8 = undefined;
     try std.testing.expectEqualSlices(u8, a, keygenContext(&buf_c, long_sid, 2, 3, 1));
+}
+
+test "dealer-free keygen: start twice, an announcement before start, a Πfac before its round, an empty frame and sender ids 0 / n+1 are refused (mutation audit)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xEC_D5A_0010);
+    const random = prng.random();
+    var local = try quickLocal(allocator, random);
+    defer local.deinit(allocator);
+    var p = try EcdsaKeygen.init(allocator, .{ .t = 2, .n = 3 }, 1, "s", &local, random);
+    defer p.deinit();
+    var list: std.ArrayList(Outgoing) = .empty;
+    defer {
+        for (list.items) |m| m.deinit(allocator);
+        list.deinit(allocator);
+    }
+    try pushTagged(&list, allocator, p.tag, .broadcast, .ecdsa_announcement, "x");
+    try pushTagged(&list, allocator, p.tag, .broadcast, .ecdsa_announcement, "");
+    try pushTagged(&list, allocator, p.tag, .broadcast, .ecdsa_fac_proof, "x");
+    try pushTagged(&list, allocator, p.tag, .broadcast, .reshare_broadcast, "x");
+    const ann = list.items[0].bytes;
+    const empty = list.items[1].bytes[0..run_tag_len];
+    try testing.expectError(error.WrongRound, p.handle(2, ann));
+    try p.start();
+    try testing.expectError(error.WrongRound, p.start());
+    try testing.expectError(error.WrongRound, p.handle(2, list.items[2].bytes));
+    // A frame for neither this round nor the DKG: still the round's refusal.
+    try testing.expectError(error.WrongRound, p.handle(2, list.items[3].bytes));
+    try testing.expectError(error.Malformed, p.handle(2, empty));
+    try testing.expectError(error.UnknownSender, p.handle(0, ann));
+    try testing.expectError(error.UnknownSender, p.handle(4, ann));
+}
+
+test "untag: a frame shorter than the run tag is Malformed, another run's tag WrongSession (mutation audit)" {
+    const tag: RunTag = @splat(7);
+    try testing.expectError(error.Malformed, untag(tag, "short"));
+    var other: [run_tag_len + 1]u8 = @splat(8);
+    try testing.expectError(error.WrongSession, untag(tag, &other));
+    other[0..run_tag_len].* = tag;
+    try testing.expectEqualSlices(u8, other[run_tag_len..], try untag(tag, &other));
+}
+
+test "keygenContext: a session id of up to 64 octets goes in verbatim with form 0, whatever the buffer held (mutation audit)" {
+    var buf: [EcdsaKeygen.ctx_max]u8 = @splat(0xff);
+    const sid: [64]u8 = @splat('s');
+    const c = keygenContext(&buf, &sid, 2, 3, 1);
+    try testing.expectEqual(@as(usize, 1 + 64 + 12), c.len);
+    try testing.expectEqual(@as(u8, 0), c[0]);
+    try testing.expectEqualSlices(u8, &sid, c[1..65]);
 }
