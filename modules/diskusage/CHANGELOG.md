@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `stat.zig`, `scan.zig` and `parallel.zig` (350 mutants, 312 killed, 38 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). Tests added at the end of each file: device/id key halves, `detect`, `mapErrno`, `clampNonNegative`, path beyond PATH_MAX, plain-file sink report, `currentPath`, a listed entry that vanishes before its `lstat`, each callback alone in a parallel scan, the one-filesystem boundary in parallel, descriptors closed, `mergeCounters` saturation, one-shot allocation failures for both walks, and a deterministic directory swap between `lstat` and open (identity re-check, `O_NOFOLLOW`). No source change, no behaviour change.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).

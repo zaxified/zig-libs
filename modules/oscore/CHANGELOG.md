@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `root.zig` (292 mutants, 269 killed, 23 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts, no replay or AEAD survivor). 9 tests added at the end of `src/root.zig`: replay window edges (oldest slot, clamp, first update, equal seq, slide, far jump, trailing edge, lower-limit resume), CBOR and AAD encoders at every header width with exact-size buffers, `OscoreOption` limits and decode edges, `deriveContextInto` against `deriveContext` and its zeroing on failure, `AadTooLarge`, and responses not replay-checked. ctgrind source digests refreshed (counts unchanged). No source change, no behaviour change.
 - **2026-10-10** — tests: deterministic fuzz driver `OSCORE_FUZZ` (testkit) over `OscoreOption.decode` (canonical re-encode) and a full protect/unprotect exchange (request and both response shapes accepted; a flipped ciphertext/tag bit, truncation, extra octet, changed AAD field or Partial IV, wrong key refused; replay refused). No change to the library code.
 - **2026-10-09** — Dead-stack sweep, part 2. `protect` and `unprotect` now run under a 4 KiB
   per-message burn (`burn.msg_burn`); new `deriveContextInto(out, …)` writes the context into

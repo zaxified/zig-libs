@@ -1001,3 +1001,412 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+
+/// The first `should_descend` call deletes every sibling directory but the one
+/// it is asked about. The siblings were listed already, so each one's `lstat`
+/// then fails with ENOENT, whatever order the listing came in.
+const Eater = struct {
+    dir: std.Io.Dir,
+    io: std.Io,
+    fired: bool = false,
+    const count = 12;
+
+    fn name(i: usize) [3]u8 {
+        var b: [3]u8 = undefined;
+        _ = std.mem.print(&b, "s{d:0>2}", .{i}) catch unreachable;
+        return b;
+    }
+
+    fn onDescend(ctx: ?*anyopaque, path: []const u8, _: u32) scan.Descend {
+        const self: *Eater = @ptrCast(@alignCast(ctx.?));
+        if (!self.fired) {
+            self.fired = true;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const n = name(i);
+                if (!std.mem.eql(u8, &n, path)) self.dir.deleteDir(self.io, &n) catch {};
+            }
+        }
+        return .yes;
+    }
+};
+
+test "an entry that vanishes after it was listed is counted, reported with its path, and stepped over" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    for ([_]u32{ 1, 2, 3 }) |n| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var i: usize = 0;
+        while (i < Eater.count) : (i += 1) try tmp.dir.createDirPath(io, &Eater.name(i));
+
+        var eater: Eater = .{ .dir = tmp.dir, .io = io };
+        var c: Collect = .{ .gpa = testing.allocator };
+        defer c.deinit();
+        const r = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{
+            .threads = n,
+            .on_error = .{ .context = &c, .func = Collect.onError },
+            .should_descend = .{ .context = &eater, .func = Eater.onDescend },
+        });
+        try testing.expect(eater.fired);
+        try testing.expectEqual(@as(u64, Eater.count - 1), r.errors);
+        try testing.expectEqual(@as(usize, Eater.count - 1), c.errors.items.len);
+        for (c.errors.items) |p| {
+            try testing.expectEqual(@as(usize, 3), p.len);
+            try testing.expectEqual(@as(u8, 's'), p[0]);
+        }
+        // The root and the one directory that was not deleted.
+        try testing.expectEqual(@as(u64, 2), r.directories);
+        try testing.expectEqual(@as(u64, 2), r.total.entries);
+    }
+}
+
+/// Appends "<path>:<depth>" for every directory asked about.
+const DepthLog = struct {
+    gpa: Allocator,
+    lines: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *DepthLog) void {
+        for (self.lines.items) |l| self.gpa.free(l);
+        self.lines.deinit(self.gpa);
+    }
+
+    fn onDescend(ctx: ?*anyopaque, path: []const u8, depth: u32) scan.Descend {
+        const self: *DepthLog = @ptrCast(@alignCast(ctx.?));
+        const line = self.gpa.print("{s}:{d}", .{ path, depth }) catch return .yes;
+        self.lines.append(self.gpa, line) catch self.gpa.free(line);
+        return .yes;
+    }
+
+    fn lessThan(_: void, a: []u8, b: []u8) bool {
+        return std.mem.lessThan(u8, a, b);
+    }
+};
+
+test "should_descend alone: it is handed root-relative paths and depths, sequential and parallel" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a/b");
+    try tmp.dir.createDirPath(io, "c");
+
+    for ([_]u32{ 1, 3 }) |n| {
+        var log: DepthLog = .{ .gpa = testing.allocator };
+        defer log.deinit();
+        _ = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{
+            .threads = n,
+            .should_descend = .{ .context = &log, .func = DepthLog.onDescend },
+        });
+        std.mem.sort([]u8, log.lines.items, {}, DepthLog.lessThan);
+        try testing.expectEqual(@as(usize, 3), log.lines.items.len);
+        try testing.expectEqualStrings("a/b:2", log.lines.items[0]);
+        try testing.expectEqualStrings("a:1", log.lines.items[1]);
+        try testing.expectEqualStrings("c:1", log.lines.items[2]);
+    }
+}
+
+test "parallel: on_directory alone, and should_descend alone, still see root-relative paths" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try buildTree(testing.allocator, io, tmp.dir, 7, false);
+
+    var want: Collect = .{ .gpa = testing.allocator };
+    defer want.deinit();
+    _ = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{
+        .threads = 1,
+        .on_directory = .{ .context = &want, .func = Collect.onDirectory },
+    });
+    var got: Collect = .{ .gpa = testing.allocator };
+    defer got.deinit();
+    _ = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{
+        .threads = 3,
+        .on_directory = .{ .context = &got, .func = Collect.onDirectory },
+    });
+    try expectSameDirs(&want, &got);
+
+    // The predicate matches by path: with no path it prunes nothing.
+    var ex: Collect = .{ .gpa = testing.allocator, .exclude_path = "wide/w3" };
+    defer ex.deinit();
+    const r = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{
+        .threads = 3,
+        .should_descend = .{ .context = &ex, .func = Collect.shouldDescend },
+    });
+    try testing.expectEqual(@as(u64, 1), r.directories_pruned);
+}
+
+test "parallel: on_error alone reports the path of a directory that cannot be opened" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "wide/locked");
+    if (linux.errno(linux.fchmodat(d.handle, "wide/locked", 0o000)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.fchmodat(d.handle, "wide/locked", 0o755);
+    if (d.openDir(io, "wide/locked", .{ .iterate = true })) |*probe| {
+        @constCast(probe).close(io);
+        return error.SkipZigTest; // running as root defeats the premise
+    } else |_| {}
+
+    var c: Collect = .{ .gpa = testing.allocator };
+    defer c.deinit();
+    const r = try scan.scanAt(testing.allocator, io, d, ".", .{
+        .threads = 3,
+        .on_error = .{ .context = &c, .func = Collect.onError },
+    });
+    try testing.expectEqual(@as(u64, 1), r.errors);
+    try testing.expectEqual(@as(usize, 1), c.errors.items.len);
+    try testing.expectEqualStrings("wide/locked", c.errors.items[0]);
+}
+
+test "one_file_system: the same boundary holds in a parallel scan" {
+    // Same precondition as the sequential test in scan.zig: established with
+    // `stat.lstatAt` directly, never read off the scan.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    const probe_root = "/sys/fs";
+    const backend = stat.detect();
+    const root_st = stat.lstatPath(backend, probe_root) catch return error.SkipZigTest;
+    var dir = std.Io.Dir.cwd().openDir(io, probe_root, .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close(io);
+    var boundary_children: u64 = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch return error.SkipZigTest) |entry| {
+        const name_z = std.posix.toPosixPath(entry.name) catch continue;
+        const st = stat.lstatAt(backend, dir.handle, &name_z) catch continue;
+        if (st.device() != root_st.device()) boundary_children += 1;
+    }
+    if (boundary_children == 0) return error.SkipZigTest;
+
+    const seq = scan.scanPath(testing.allocator, io, probe_root, .{ .one_file_system = true }) catch return error.SkipZigTest;
+    for ([_]u32{ 2, 3 }) |n| {
+        const plain = scan.scanPath(testing.allocator, io, probe_root, .{ .threads = n }) catch return error.SkipZigTest;
+        try testing.expectEqual(@as(u64, 0), plain.other_filesystems_skipped);
+        const bounded = try scan.scanPath(testing.allocator, io, probe_root, .{ .threads = n, .one_file_system = true });
+        try testing.expect(bounded.other_filesystems_skipped >= boundary_children);
+        try testing.expect(bounded.total.entries < plain.total.entries);
+        // Something on the root's own device is still counted.
+        try testing.expect(bounded.total.entries > 1);
+        try testing.expectEqual(seq.total.entries, bounded.total.entries);
+        try testing.expectEqual(seq.other_filesystems_skipped, bounded.other_filesystems_skipped);
+    }
+}
+
+fn openFdCount(io: std.Io) !usize {
+    var d = try std.Io.Dir.cwd().openDir(io, "/proc/self/fd", .{ .iterate = true });
+    defer d.close(io);
+    var n: usize = 0;
+    var it = d.iterate();
+    while (try it.next(io)) |_| n += 1;
+    return n;
+}
+
+test "parallel: every directory descriptor is closed when the scan is over" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try buildTree(testing.allocator, io, tmp.dir, 6, true);
+
+    // The first run may open descriptors of its own (the Io's); count after it.
+    _ = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{ .threads = 3 });
+    const before = openFdCount(io) catch return error.SkipZigTest;
+    for ([_]u32{ 2, 3, 8 }) |n| _ = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{ .threads = n });
+    try testing.expectEqual(before, try openFdCount(io));
+}
+
+test "mergeCounters: every counter saturates, the total is left alone" {
+    const max = std.math.maxInt(u64);
+    var dst: Report = .{ .errors = max, .directories = 5, .total = .{ .entries = 7 } };
+    const src: Report = .{ .errors = 3, .directories = 2, .regular_files = 1, .total = .{ .entries = 100 } };
+    mergeCounters(&dst, src);
+    try testing.expectEqual(max, dst.errors);
+    try testing.expectEqual(@as(u64, 7), dst.directories);
+    try testing.expectEqual(@as(u64, 1), dst.regular_files);
+    try testing.expectEqual(@as(u64, 7), dst.total.entries);
+}
+
+/// While `should_descend` is being asked about `victim`, renames it away and
+/// puts something else in its place (see the twin in scan.zig). In a parallel
+/// scan the directory is opened later, by whichever worker pops it.
+const Swapper = struct {
+    dir: std.Io.Dir,
+    io: std.Io,
+    symlink: bool,
+    fired: bool = false,
+
+    fn onDescend(ctx: ?*anyopaque, path: []const u8, _: u32) scan.Descend {
+        const self: *Swapper = @ptrCast(@alignCast(ctx.?));
+        if (!self.fired and std.mem.eql(u8, path, "victim")) {
+            self.fired = true;
+            self.dir.rename("victim", self.dir, "victim.old", self.io) catch return .yes;
+            if (self.symlink) {
+                self.dir.symLink(self.io, "other", "victim", .{}) catch {};
+            } else {
+                self.dir.createDirPath(self.io, "victim") catch {};
+                self.dir.writeFile(self.io, .{ .sub_path = "victim/marker", .data = "m" }) catch {};
+            }
+        }
+        return .yes;
+    }
+};
+
+const ErrLog = struct {
+    count: usize = 0,
+    last: ?anyerror = null,
+    path: [32]u8 = undefined,
+    path_len: usize = 0,
+
+    fn onError(ctx: ?*anyopaque, path: []const u8, err: anyerror) void {
+        const self: *ErrLog = @ptrCast(@alignCast(ctx.?));
+        self.count += 1;
+        self.last = err;
+        self.path_len = @min(path.len, self.path.len);
+        @memcpy(self.path[0..self.path_len], path[0..self.path_len]);
+    }
+};
+
+fn swapFixture(io: std.Io, tmp: *testing.TmpDir) !void {
+    try tmp.dir.createDirPath(io, "victim");
+    try tmp.dir.writeFile(io, .{ .sub_path = "victim/original", .data = "o" });
+    try tmp.dir.createDirPath(io, "other");
+    try tmp.dir.writeFile(io, .{ .sub_path = "other/file", .data = "f" });
+}
+
+test "parallel: a directory swapped between lstat and open is refused, and its descriptor is not leaked" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    // Warm up (the Io may open descriptors of its own on first use).
+    {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try swapFixture(io, &tmp);
+        _ = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{ .threads = 2 });
+    }
+    const fds_before = openFdCount(io) catch return error.SkipZigTest;
+
+    for ([_]u32{ 1, 2 }) |n| {
+        for ([_]bool{ false, true }) |symlink| {
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            try swapFixture(io, &tmp);
+
+            var swapper: Swapper = .{ .dir = tmp.dir, .io = io, .symlink = symlink };
+            var errs: ErrLog = .{};
+            var c: Collect = .{ .gpa = testing.allocator };
+            defer c.deinit();
+            const r = try scan.scanAt(testing.allocator, io, tmp.dir, ".", .{
+                .threads = n,
+                .on_error = .{ .context = &errs, .func = ErrLog.onError },
+                .on_directory = .{ .context = &c, .func = Collect.onDirectory },
+                .should_descend = .{ .context = &swapper, .func = Swapper.onDescend },
+            });
+            try testing.expect(swapper.fired);
+            try testing.expectEqual(@as(u64, 1), r.errors);
+            try testing.expectEqual(@as(usize, 1), errs.count);
+            try testing.expectEqualStrings("victim", errs.path[0..errs.path_len]);
+            if (symlink and n > 1) {
+                // The parallel walk opens with `O_NOFOLLOW`: the symlink is refused
+                // by the open itself, before the identity re-check has anything to say.
+                try testing.expect(errs.last.? != error.DirectoryChanged);
+            } else {
+                // The sequential walk (`threads = 1`) enters through std, which follows
+                // the symlink: it is the identity re-check that refuses it.
+                try testing.expectEqual(anyerror.DirectoryChanged, errs.last.?);
+            }
+            // Counted for its own size, reported, never read.
+            try testing.expectEqual(@as(u64, 1), (c.find("victim") orelse return error.TestUnexpectedResult).entries);
+            try testing.expectEqual(@as(u64, 3), r.directories);
+            try testing.expectEqual(@as(u64, 1), r.regular_files);
+            try testing.expectEqual(@as(u64, 4), r.total.entries);
+        }
+    }
+    try testing.expectEqual(fds_before, try openFdCount(io));
+}
+
+/// Fails exactly one allocation (the `fail_at`-th) and lets every other one
+/// through. `std.testing.FailingAllocator` keeps failing from its index on, so
+/// a site that swallows the first failure is still rescued by a later one.
+const OnceFailing = struct {
+    inner: Allocator,
+    fail_at: usize,
+    count: usize = 0,
+    failed: bool = false,
+
+    fn allocator(self: *OnceFailing) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *OnceFailing = @ptrCast(@alignCast(ctx));
+        if (self.count == self.fail_at and !self.failed) {
+            self.failed = true;
+            return null;
+        }
+        self.count += 1;
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *OnceFailing = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *OnceFailing = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *OnceFailing = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ra);
+    }
+};
+
+test "an induced allocation failure is always reported by a parallel scan, never swallowed" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    const io = testIo(&threaded);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "a/b/c");
+    try d.createDirPath(io, "a/x");
+    try d.createDirPath(io, "z");
+    try d.writeFile(io, .{ .sub_path = "a/b/f", .data = "f" });
+    try d.hardLink("a/b/f", d, "z/g", io, .{});
+
+    const opts: Options = .{ .threads = 3, .on_directory = .{ .func = ignoreDirectory } };
+    var counting: OnceFailing = .{ .inner = testing.allocator, .fail_at = std.math.maxInt(usize) };
+    _ = try scan.scanAt(counting.allocator(), io, d, ".", opts);
+    const total_allocations = counting.count;
+    try testing.expect(total_allocations > 0);
+
+    var i: usize = 0;
+    while (i < total_allocations) : (i += 1) {
+        var failing: OnceFailing = .{ .inner = testing.allocator, .fail_at = i };
+        const result = scan.scanAt(failing.allocator(), io, d, ".", opts);
+        try testing.expect(failing.failed);
+        try testing.expectError(error.OutOfMemory, result);
+    }
+}

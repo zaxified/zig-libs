@@ -545,3 +545,168 @@ test "hopsWith: a clean path claims no uncertainty; unproved hops say so" {
     const r3 = try hopsWith(.{ .ctx = &d, .probeFn = SF.f }, .{ .floor = 68, .ceiling = 1500 }, &out);
     try testing.expect(!r3.hops[0].proved);
 }
+
+// ── whole-module mutation tests (2026-11-17) ───────────────────────────────
+
+/// A scripted path with the knobs a real one has: per-router links, ICMP or
+/// silence above a link, silent routers, probes lost by call number, a local
+/// size limit (`local_reject`), a TTL whose sends fail. Router `i` is
+/// 10.0.0.(i+1), the destination 10.9.9.9.
+const ScriptPath = struct {
+    floor: u16,
+    ceiling: u16,
+    nr: usize,
+    links: [3]u16,
+    explicit: bool,
+    hint: bool,
+    silent: [3]bool,
+    /// Call numbers (1-based, over the whole walk) that get no answer; 0 = unused.
+    lose: [3]usize,
+    local: ?u16,
+    /// TTL whose sends all fail; 0 = none.
+    sendfail: u8,
+    /// Added to the link MTU in the reported hint.
+    hintoff: i32,
+    calls: usize = 0,
+
+    fn prober(self: *ScriptPath) HopProber {
+        return .{ .ctx = self, .probeFn = probeFn };
+    }
+
+    fn probeFn(ctx: *anyopaque, ttl: u8, size: u16) HopOutcome {
+        const s: *ScriptPath = @ptrCast(@alignCast(ctx));
+        s.calls += 1;
+        for (s.lose) |c| if (c == s.calls) return .no_reply;
+        if (s.sendfail == ttl) return .send_failed;
+        if (s.local) |l| if (size > l) return .local_reject;
+        var i: usize = 0;
+        while (i < ttl) : (i += 1) {
+            if (i >= s.nr) break;
+            const router = ip4(10, 0, 0, @intCast(i + 1));
+            if (i + 1 == ttl) return if (s.silent[i]) .no_reply else .{ .time_exceeded = router };
+            if (size > s.links[i]) {
+                if (!s.explicit or s.silent[i]) return .no_reply;
+                const h: ?u32 = if (s.hint) @intCast(@as(i32, s.links[i]) + s.hintoff) else null;
+                return .{ .frag_needed = .{ .hint = h, .from = router } };
+            }
+        }
+        return .{ .echo_reply = ip4(10, 9, 9, 9) };
+    }
+};
+
+/// 0: nobody, 1..3: router 0..2, 9: the destination.
+fn addrId(a: ?netaddr.Ip) u8 {
+    const ip = a orelse return 0;
+    return if (ip.v4[1] == 9) 9 else ip.v4[3];
+}
+
+const WantHop = struct { mtu: u16, proved: bool, narrowed: bool, sil: bool, dest: bool, addr: u8, by: u8 };
+
+const ScriptCase = struct {
+    script: ScriptPath,
+    max_silent: u8,
+    max_hops: u8,
+    hops: []const WantHop,
+    mtu: u16,
+    reached: bool,
+    blackhole: bool,
+    uncertain: bool,
+    calls: usize,
+};
+
+// Expected values come from an independent port of the walk (not from this
+// code); each case was picked because it tells the original from a set of
+// mutants (the `kills:` lists name them by mutant number of the audit).
+const script_cases = [_]ScriptCase{
+    .{
+        // kills: 272,305,307,310,311,312,313,321,322,335,336,350,353,359,360,361,362
+        .script = .{ .floor = 100, .ceiling = 115, .nr = 3, .links = .{ 112, 108, 98 }, .explicit = true, .hint = false, .silent = .{ false, false, false }, .lose = .{ 7, 0, 0 }, .local = 103, .sendfail = 2, .hintoff = 0 },
+        .max_silent = 4,
+        .max_hops = 5,
+        .hops = &.{ .{ .mtu = 103, .proved = true, .narrowed = false, .sil = false, .dest = false, .addr = 1, .by = 0 }, .{ .mtu = 103, .proved = false, .narrowed = false, .sil = false, .dest = false, .addr = 0, .by = 0 }, .{ .mtu = 103, .proved = true, .narrowed = false, .sil = true, .dest = false, .addr = 3, .by = 0 }, .{ .mtu = 100, .proved = false, .narrowed = true, .sil = false, .dest = false, .addr = 0, .by = 3 }, .{ .mtu = 100, .proved = false, .narrowed = true, .sil = false, .dest = false, .addr = 0, .by = 3 } },
+        .mtu = 100,
+        .reached = false,
+        .blackhole = true,
+        .uncertain = true,
+        .calls = 15,
+    },
+    .{
+        // kills: 272,273,322,323,324,329,331,341,350,353,360,361
+        .script = .{ .floor = 68, .ceiling = 71, .nr = 3, .links = .{ 68, 73, 69 }, .explicit = true, .hint = true, .silent = .{ false, false, false }, .lose = .{ 2, 5, 7 }, .local = 71, .sendfail = 1, .hintoff = 0 },
+        .max_silent = 4,
+        .max_hops = 5,
+        .hops = &.{ .{ .mtu = 71, .proved = false, .narrowed = false, .sil = false, .dest = false, .addr = 0, .by = 0 }, .{ .mtu = 68, .proved = true, .narrowed = true, .sil = true, .dest = false, .addr = 2, .by = 1 }, .{ .mtu = 68, .proved = false, .narrowed = false, .sil = false, .dest = false, .addr = 0, .by = 0 }, .{ .mtu = 68, .proved = true, .narrowed = false, .sil = false, .dest = true, .addr = 9, .by = 0 } },
+        .mtu = 68,
+        .reached = true,
+        .blackhole = true,
+        .uncertain = true,
+        .calls = 6,
+    },
+    .{
+        // kills: 272,273,282,305,313,342
+        .script = .{ .floor = 68, .ceiling = 70, .nr = 1, .links = .{ 69, 0, 0 }, .explicit = true, .hint = true, .silent = .{ false, false, false }, .lose = .{ 0, 0, 0 }, .local = 70, .sendfail = 0, .hintoff = 1 },
+        .max_silent = 0,
+        .max_hops = 3,
+        .hops = &.{ .{ .mtu = 70, .proved = true, .narrowed = false, .sil = false, .dest = false, .addr = 1, .by = 0 }, .{ .mtu = 69, .proved = true, .narrowed = true, .sil = false, .dest = true, .addr = 9, .by = 1 } },
+        .mtu = 69,
+        .reached = true,
+        .blackhole = false,
+        .uncertain = false,
+        .calls = 3,
+    },
+    .{
+        // kills: 272,273,322,380
+        .script = .{ .floor = 68, .ceiling = 84, .nr = 2, .links = .{ 85, 84, 0 }, .explicit = true, .hint = true, .silent = .{ true, false, false }, .lose = .{ 8, 0, 0 }, .local = null, .sendfail = 3, .hintoff = 0 },
+        .max_silent = 2,
+        .max_hops = 4,
+        .hops = &.{ .{ .mtu = 84, .proved = false, .narrowed = false, .sil = false, .dest = false, .addr = 0, .by = 0 }, .{ .mtu = 84, .proved = true, .narrowed = false, .sil = false, .dest = false, .addr = 2, .by = 0 }, .{ .mtu = 84, .proved = false, .narrowed = false, .sil = false, .dest = false, .addr = 0, .by = 0 }, .{ .mtu = 84, .proved = true, .narrowed = false, .sil = false, .dest = true, .addr = 9, .by = 0 } },
+        .mtu = 84,
+        .reached = true,
+        .blackhole = false,
+        .uncertain = false,
+        .calls = 5,
+    },
+};
+
+test "hopsWith: scripted paths give exact walks (probe count, who answered, silence, local rejects, send failures, edge hints)" {
+    for (script_cases, 0..) |c, k| {
+        var s = c.script;
+        var out: [8]Hop = undefined;
+        const r = try hopsWith(s.prober(), .{ .floor = s.floor, .ceiling = s.ceiling, .max_hops = c.max_hops, .max_silent_hops = c.max_silent }, &out);
+        errdefer std.debug.print("case {d}\n", .{k});
+        try testing.expectEqual(c.hops.len, r.hops.len);
+        for (c.hops, r.hops) |w, h| {
+            try testing.expectEqual(w.mtu, h.mtu);
+            try testing.expectEqual(w.proved, h.proved);
+            try testing.expectEqual(w.narrowed, h.narrowed);
+            try testing.expectEqual(w.sil, h.silence_narrowed);
+            try testing.expectEqual(w.dest, h.is_destination);
+            try testing.expectEqual(w.addr, addrId(h.addr));
+            try testing.expectEqual(w.by, addrId(h.narrowed_by));
+        }
+        try testing.expectEqual(c.mtu, r.mtu);
+        try testing.expectEqual(c.reached, r.reached);
+        try testing.expectEqual(c.blackhole, r.blackhole);
+        try testing.expectEqual(c.uncertain, r.uncertain);
+        try testing.expectEqual(c.calls, s.calls);
+    }
+}
+
+test "hopsWith: a prober that always lowers the hint by one costs exactly max_steps_per_hop probes per TTL" {
+    const Lower = struct {
+        calls: usize = 0,
+        fn f(ctx: *anyopaque, _: u8, size: u16) HopOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return .{ .frag_needed = .{ .hint = size - 1, .from = null } };
+        }
+    };
+    var l: Lower = .{};
+    var out: [8]Hop = undefined;
+    const r = try hopsWith(.{ .ctx = &l, .probeFn = Lower.f }, .{ .floor = 68, .ceiling = 9000, .max_hops = 5, .max_silent_hops = 255 }, &out);
+    try testing.expectEqual(@as(usize, 5), r.hops.len);
+    try testing.expectEqual(5 * @as(usize, max_steps_per_hop), l.calls);
+    // The estimate fell by one per probe and was never "proved".
+    try testing.expectEqual(@as(u16, 9000) - 5 * @as(u16, max_steps_per_hop), r.mtu);
+    for (r.hops) |h| try testing.expect(!h.proved and h.narrowed);
+}
