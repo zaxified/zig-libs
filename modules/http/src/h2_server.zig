@@ -159,9 +159,12 @@
 //! the task on a *different* thread (running it inline self-deadlocks) — or,
 //! with `Dispatcher.io` set, on a different fiber of the same thread.
 //!
-//! **Fibers (`Dispatcher.io`).** Without it the session lock and the waits
-//! yield-spin, which is right for OS threads and a deadlock for fibers that
-//! share one: a spinning fiber never hands the thread back to the fiber it is
+//! **Fibers (`Dispatcher.io`).** Without it the session lock yield-spins and
+//! a handler waiting for its peer (credit, request body) parks its OS thread
+//! on a futex over the connection's progress counter, for at most
+//! `Dispatcher.stall_timeout_ms` without progress; that is right for OS
+//! threads and a deadlock for fibers that share one: a spinning or
+//! thread-parking fiber never hands the thread back to the fiber it is
 //! waiting for. With it they park through that `Io` (`std.Io.Mutex` +
 //! `std.Io.Condition`), so an io_uring engine can dispatch each stream to a
 //! fiber of the connection's own thread.
@@ -180,8 +183,10 @@
 //! §8.3.1, flow control §5.2/§6.9, CONTINUATION/DoS considerations §10.5),
 //! RFC 7301 (ALPN — consumed, not implemented, see `serveStream`) and the
 //! public CVE-2023-44487 / CVE-2024-27316 advisories (behavior
-//! descriptions only); no HTTP/2 server implementation was consulted or
-//! copied.
+//! descriptions only); no HTTP/2 server implementation was copied. The
+//! WINDOW_UPDATE coalescing thresholds (`Session.shouldSendCredit`) follow
+//! the documented behaviour of nghttp2, h2o and Go's x/net/http2 (all
+//! permissively licensed); their code was read for the rule, not copied.
 
 const std = @import("std");
 const testkit = @import("testkit");
@@ -439,9 +444,12 @@ pub const Dispatcher = struct {
     /// ⚠ Calling `task.func` inline, on the caller's own stack, self-deadlocks
     /// in either mode: the caller holds the session lock, which the task needs.
     spawn: *const fn (ctx: ?*anyopaque, task: Task) bool,
-    /// How the session's waits block. Null (the default) is the historical
-    /// mode for tasks that are OS threads: the session lock and the two
-    /// "wait for the connection to move" loops yield-spin.
+    /// How the session's waits block. Null (the default) is the mode for
+    /// tasks that are OS threads: the session lock yield-spins (it is only
+    /// held briefly, or across a socket write) and the two "wait for the
+    /// connection to move" loops park the thread on a futex over the
+    /// session's progress counter (before 2026-11-18 they yield-spun and
+    /// burned a core per waiting handler), bounded by `stall_timeout_ms`.
     ///
     /// Set it when the tasks `spawn` starts are **fibers sharing a thread**
     /// (an io_uring engine, `std.Io.Evented`): a spinning fiber never gives
@@ -468,6 +476,20 @@ pub const Dispatcher = struct {
     /// cap waits in the (already bounded) jobs map and is dispatched the
     /// moment a slot frees — the same wait every stream does today.
     max_concurrent_handlers: u32 = 8,
+    /// Without `io` only: how long a handler may wait for its peer without
+    /// the stream moving -- for send credit (a WINDOW_UPDATE) while writing
+    /// the response, or for more request body while reading it -- before
+    /// the wait gives up. The clock restarts whenever the stream moves (a
+    /// chunk sent, a chunk read). On expiry a response write ends the stream
+    /// with RST_STREAM(CANCEL) and fails, a body read fails
+    /// (`error.ReadFailed`, the stream is then reset when the handler
+    /// returns) -- exactly what a canceled wait does with `io`. The
+    /// connection stays up. Default 60 s, nginx's `send_timeout` /
+    /// `client_body_timeout` (both "between two successive operations",
+    /// both applied to its HTTP/2 streams). Null = wait as long as the
+    /// connection lives. With `io` set this is ignored: the embedder's
+    /// cancelation of the handler is its deadline.
+    stall_timeout_ms: ?u32 = 60_000,
 };
 
 /// Predicate selecting the incremental request-body surface for one stream
@@ -624,6 +646,7 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
         .out = out,
         .threaded = opts.dispatcher != null,
         .io = if (opts.dispatcher) |d| d.io else null,
+        .stall_ms = if (opts.dispatcher) |d| d.stall_timeout_ms else null,
         .conn = .init(gpa, .server, connOptions(opts)),
     };
     defer s.deinit();
@@ -694,6 +717,9 @@ const Job = struct {
     /// yet. Exactly one place decrements it (`grantJob`), so credit can be
     /// returned neither twice nor never, whichever policy applies.
     owed: usize = 0,
+    /// Stream-level credit already taken off `owed` but not yet sent
+    /// (coalesced, `Session.shouldSendCredit`).
+    unsent: usize = 0,
     /// END_STREAM seen — the request is complete (body *and* trailers).
     complete: bool = false,
     /// Body crossed `max_body_bytes` (or memory ran out) → 413 + close.
@@ -769,6 +795,9 @@ const Session = struct {
     /// Outgoing wire bytes staged by the h2 layer; flushed to `out`.
     wire: std.ArrayList(u8) = .empty,
     events: std.ArrayList(h2.Event) = .empty,
+    /// Connection-level credit returned by the handlers/discards but not yet
+    /// sent as WINDOW_UPDATE(0) (coalesced, `shouldSendCredit`).
+    conn_unsent: usize = 0,
     /// Request streams in flight, in arrival order (served in that order).
     ///
     /// A job STAYS here while its handler runs — the streaming surfaces need
@@ -844,8 +873,19 @@ const Session = struct {
     io: ?std.Io = null,
     io_mu: std.Io.Mutex = .init,
     moved: std.Io.Condition = .init,
-    /// Bumped (under the lock) together with every `moved` broadcast.
-    progress: u32 = 0,
+    /// Bumped (under the lock) together with every `moved` broadcast, and
+    /// on the OS-thread path (no `io`) the futex word a waiter parks on.
+    /// Atomic because the kernel reads it outside the lock.
+    progress: std.atomic.Value(u32) = .init(0),
+    /// OS-thread path only: threads parked (or about to park) on
+    /// `progress`. Changed under the lock; `announce` skips the wake
+    /// syscall while it is zero. A waiter that registers after an
+    /// `announce` it missed still cannot sleep through it: the futex
+    /// compares `progress` against the value sampled before, and the
+    /// announce bumped it.
+    parked: u32 = 0,
+    /// `Dispatcher.stall_timeout_ms`, hoisted (OS-thread path only).
+    stall_ms: ?u32 = null,
 
     /// Take `mu` (no-op on the sequential path). Yield-spin: this lock is
     /// held across blocking writes, so a plain `spinLoopHint` spin could
@@ -865,12 +905,30 @@ const Session = struct {
     }
 
     /// Tell every parked waiter that the connection moved. **Caller holds
-    /// the lock.** No-op unless `Dispatcher.io` is set.
+    /// the lock.** No-op on the sequential path (nobody can be waiting).
     fn announce(s: *Session) void {
-        const io = s.io orelse return;
-        s.progress +%= 1;
-        s.moved.broadcast(io);
+        if (!s.threaded) return;
+        _ = s.progress.fetchAdd(1, .release);
+        if (s.io) |io| return s.moved.broadcast(io);
+        if (s.parked != 0) futexIo().futexWake(u32, &s.progress.raw, std.math.maxInt(u32));
     }
+
+    /// The `Io` the OS-thread path parks through. Its futex calls are the
+    /// plain OS futex (no scheduler, no state of the instance), so any
+    /// thread may use it -- the same choice as `zstd`'s worker pools. The
+    /// clock read for the stall deadline goes through it too.
+    fn futexIo() std.Io {
+        return std.Io.Threaded.global_single_threaded.io();
+    }
+
+    /// One handler wait's stall clock (`Dispatcher.stall_timeout_ms`): the
+    /// deadline is set by the first `waitForPeer` of a wait and kept by the
+    /// ones after it, so a connection that keeps moving for OTHER streams
+    /// cannot keep this one waiting forever. A caller declares a fresh one
+    /// whenever its own stream moved.
+    const Stall = struct {
+        deadline_ns: ?i96 = null,
+    };
 
     /// Wait for the connection task to make progress (a WINDOW_UPDATE, more
     /// DATA). **Must not be called holding `mu`.** `seen` is `s.progress` as
@@ -889,16 +947,53 @@ const Session = struct {
     /// embedder cancels it (a handler deadline), so a handler stuck on a peer
     /// that never grants credit or never sends the body is released. The
     /// lock itself stays uncancelable -- it is only ever held briefly.
-    fn waitForPeer(s: *Session, seen: u32) error{ Closed, Canceled }!void {
+    ///
+    /// Without `Dispatcher.io` (OS threads) the thread parks on a futex over
+    /// `progress` -- it used to yield-spin, one core per waiting handler,
+    /// for as long as the peer chose not to move (no-panic sweep
+    /// 2026-10-28). The park is bounded by `stall` (`error.Stalled` once its
+    /// deadline passed) and is a cancelation point of the calling thread
+    /// when that thread belongs to a `std.Io.Threaded` (`error.Canceled`).
+    fn waitForPeer(s: *Session, seen: u32, stall: *Stall) error{ Closed, Canceled, Stalled }!void {
         if (!s.threaded) return s.pump();
         if (s.io) |io| {
             s.io_mu.lockUncancelable(io);
             defer s.io_mu.unlock(io);
-            while (s.progress == seen and !s.gone.load(.acquire))
+            while (s.progress.load(.monotonic) == seen and !s.gone.load(.acquire))
                 try s.moved.wait(io, &s.io_mu);
+            if (s.gone.load(.acquire)) return error.Closed;
+            return;
         }
         if (s.gone.load(.acquire)) return error.Closed;
-        if (s.io == null) std.Thread.yield() catch std.atomic.spinLoopHint();
+        const fio = futexIo();
+        var timeout: std.Io.Timeout = .none;
+        if (s.stall_ms) |ms| {
+            const now = std.Io.Timestamp.now(fio, .awake).nanoseconds;
+            const deadline = stall.deadline_ns orelse blk: {
+                const d = now + @as(i96, ms) * std.time.ns_per_ms;
+                stall.deadline_ns = d;
+                break :blk d;
+            };
+            if (now >= deadline) return error.Stalled;
+            timeout = .{ .duration = .{
+                .raw = .fromNanoseconds(deadline - now),
+                .clock = .awake,
+            } };
+        }
+        s.lock();
+        s.parked += 1;
+        s.unlock();
+        defer {
+            s.lock();
+            s.parked -= 1;
+            s.unlock();
+        }
+        // Returns at once when `progress` already moved past `seen`; a
+        // spurious or timed-out wake just sends the caller round its loop,
+        // which re-checks its condition and comes back here (where the
+        // deadline is checked first).
+        try fio.futexWaitTimeout(u32, &s.progress.raw, seen, timeout);
+        if (s.gone.load(.acquire)) return error.Closed;
     }
 
     fn deinit(s: *Session) void {
@@ -937,12 +1032,21 @@ const Session = struct {
                 defer s.io_mu.unlock(io);
                 s.announce(); // wakes workers parked in `waitForPeer`
                 while (s.inflight != 0) s.moved.waitUncancelable(io, &s.io_mu);
-            } else while (true) {
+            } else {
+                // Parks like `waitForPeer` (a retiring handler announces),
+                // uncancelable: the Session must not be freed under a
+                // handler still running on it.
                 s.lock();
-                const busy = s.inflight != 0;
+                s.announce(); // wakes workers parked in `waitForPeer`
+                s.parked += 1;
+                while (s.inflight != 0) {
+                    const seen = s.progress.load(.monotonic);
+                    s.unlock();
+                    futexIo().futexWaitUncancelable(u32, &s.progress.raw, seen);
+                    s.lock();
+                }
+                s.parked -= 1;
                 s.unlock();
-                if (!busy) break;
-                std.Thread.yield() catch std.atomic.spinLoopHint();
             }
         };
         // §3.4 server preface: our SETTINGS, before anything else.
@@ -1394,8 +1498,7 @@ const Session = struct {
             // Not ours to hold — a stream we reset, refused or already
             // finished. §6.9.1: account for it now or the shared window
             // shrinks by that much for the rest of the connection.
-            s.grant(0, d.data.len);
-            s.flushWire() catch {};
+            if (s.creditConn(d.data.len)) s.flushWire() catch {};
             return;
         };
         job.owed += d.data.len;
@@ -1458,21 +1561,61 @@ const Session = struct {
 
     /// Return `n` octets of `id`'s outstanding credit (§6.9): the connection
     /// window always, the stream window only while the stream can still
-    /// receive. The single place `Job.owed` shrinks.
+    /// receive. The single place `Job.owed` shrinks. Both are coalesced
+    /// (`creditConn`, `shouldSendCredit`): returned credit is not sent until
+    /// it is worth a frame.
     fn grantJob(s: *Session, id: u31, n: usize) void {
         if (n == 0) return;
         const job = s.jobs.getPtr(id) orelse {
-            s.grant(0, n);
-            s.flushWire() catch {};
+            if (s.creditConn(n)) s.flushWire() catch {};
             return;
         };
         const take = @min(n, job.owed);
         if (take == 0) return;
         job.owed -= take;
-        const stream_open = !job.complete and !job.rst;
-        s.grant(0, take);
-        if (stream_open) s.grant(id, take);
-        s.stageWire() catch {};
+        var staged = s.creditConn(take);
+        if (!job.complete and !job.rst) {
+            job.unsent += take;
+            const avail: i64 = if (s.conn.stream(id)) |st| st.recv_window else 0;
+            if (shouldSendCredit(job.unsent, s.conn.local_settings.initial_window_size, avail)) {
+                s.grant(id, job.unsent);
+                job.unsent = 0;
+                staged = true;
+            }
+        }
+        // Unsent stream credit of a stream that ended is dropped with it:
+        // the peer can never send on it again (§6.9 "dead weight").
+        if (staged) s.stageWire() catch {};
+    }
+
+    /// Add `n` octets to the connection credit owed back and stage one
+    /// WINDOW_UPDATE(0) for all of it once `shouldSendCredit` says so.
+    /// Returns whether a frame was staged.
+    fn creditConn(s: *Session, n: usize) bool {
+        if (n == 0) return false;
+        s.conn_unsent += n;
+        if (!shouldSendCredit(s.conn_unsent, h2.default_initial_window_size, s.conn.conn_recv_window))
+            return false;
+        s.grant(0, s.conn_unsent);
+        s.conn_unsent = 0;
+        return true;
+    }
+
+    /// WINDOW_UPDATE coalescing (§6.9 leaves the timing to the receiver):
+    /// send the `unsent` credit once it is at least half the `window` the
+    /// receiver keeps (nghttp2 `nghttp2_should_send_window_update`, both
+    /// windows; h2o's connection window), or at least what the peer may
+    /// still send, `avail` -- i.e. the update would at least double the
+    /// peer's room (Go x/net/http2 `inflow.add`; h2o's stream window). Go
+    /// also sends from 4 KiB up; nghttp2 and h2o do not, and neither do we.
+    /// Below both the peer still has more than half a window to send into,
+    /// so holding the credit back can never stall it. Before 2026-11-18 every
+    /// DATA frame was answered at once by a WINDOW_UPDATE on each window: a
+    /// peer sending 1-octet frames got ~2.6x its bytes back as updates.
+    fn shouldSendCredit(unsent: usize, window: u32, avail: i64) bool {
+        if (unsent == 0) return false;
+        if (unsent >= window / 2) return true;
+        return avail <= 0 or unsent >= @as(u64, @intCast(avail));
     }
 
     /// Stage WINDOW_UPDATE(s) worth `n` octets for `id` (0 = connection).
@@ -1594,10 +1737,9 @@ const Session = struct {
             // i.e. the entire reason responses never coalesced with each
             // other. With nothing owed there is nothing to say, and what IS
             // owed can travel with the rest: `pump` flushes before it blocks.
-            if (job.owed != 0) {
-                s.grant(0, job.owed);
-                s.stageWire() catch {};
-            }
+            // (Since 2026-11-18 the credit is coalesced too, `creditConn`:
+            // a small owed amount usually stages nothing.)
+            if (s.creditConn(job.owed)) s.stageWire() catch {};
             job.deinit(s.gpa);
         }
     }
@@ -2593,13 +2735,14 @@ const Framer = struct {
     fn emit(f: *Framer, body: []const u8, end_stream: bool) Writer.Error!void {
         const s = f.s;
         var off: usize = 0;
+        var stall: Session.Stall = .{};
         while (off < body.len) {
             var n: usize = 0;
             var seen: u32 = undefined;
             const step: Step = blk: {
                 s.lock();
                 defer s.unlock();
-                seen = s.progress;
+                seen = s.progress.load(.monotonic);
                 if (s.jobs.getPtr(f.id)) |job| {
                     if (job.rst) break :blk .dead_keep;
                 }
@@ -2626,13 +2769,15 @@ const Framer = struct {
                 .sent => {
                     off += n;
                     f.data_sent = true;
+                    stall = .{}; // the stream moved: a new wait, a new clock
                 },
-                .wait => s.waitForPeer(seen) catch |err| switch (err) {
+                .wait => s.waitForPeer(seen, &stall) catch |err| switch (err) {
                     error.Closed => return f.die(.close),
-                    // The handler was canceled waiting for credit. Part of
-                    // the response is on the wire: end just this stream
+                    // The handler was canceled waiting for credit, or the
+                    // peer granted none for `stall_timeout_ms`. Part of the
+                    // response is on the wire: end just this stream
                     // (§5.4.2), the connection stays.
-                    error.Canceled => {
+                    error.Canceled, error.Stalled => {
                         s.lock();
                         defer s.unlock();
                         s.conn.sendRstStream(&s.wire, f.id, .cancel) catch {};
@@ -2772,6 +2917,9 @@ const StreamBody = struct {
 
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const b: *StreamBody = @alignCast(@fieldParentPtr("reader", r));
+        // Every call returns as soon as it copied something, so one call is
+        // one wait: its clock starts at the first `waitForPeer`.
+        var stall: Session.Stall = .{};
         while (true) {
             var n: usize = 0;
             var seen: u32 = undefined;
@@ -2782,7 +2930,7 @@ const StreamBody = struct {
             const step: Step = blk: {
                 b.s.lock();
                 defer b.s.unlock();
-                seen = b.s.progress;
+                seen = b.s.progress.load(.monotonic);
                 const job = b.s.jobs.getPtr(b.id) orelse break :blk .fail;
                 if (job.rst) break :blk .fail;
                 const src = limit.sliceConst(job.unread());
@@ -2820,9 +2968,10 @@ const StreamBody = struct {
                     return error.ReadFailed;
                 },
                 .eof => return error.EndOfStream,
-                // Canceled too: `Reader.Error` cannot carry it. The job's
-                // body is then unread, and `finishJob` resets the stream.
-                .wait => b.s.waitForPeer(seen) catch return error.ReadFailed,
+                // Canceled and Stalled too: `Reader.Error` cannot carry them.
+                // The job's body is then unread, and `finishJob` resets the
+                // stream.
+                .wait => b.s.waitForPeer(seen, &stall) catch return error.ReadFailed,
                 .copied => {
                     // Outside the lock on purpose: this write can re-enter
                     // the connection through `Framer` (see `scratch`), which
@@ -3205,6 +3354,16 @@ const TestPeer = struct {
     /// Total stream-level credit the server returned on `sid`.
     fn streamCredit(p: *const TestPeer, sid: u31) u64 {
         return p.wu_stream.get(sid) orelse 0;
+    }
+
+    /// WINDOW_UPDATE frames the server sent on `sid` (0 = connection).
+    fn windowUpdateFrames(p: *const TestPeer, sid: u31) usize {
+        var n: usize = 0;
+        for (p.log.items) |fr| switch (fr) {
+            .window_update => |wu| n += @intFromBool(wu.stream_id == sid),
+            else => {},
+        };
+        return n;
     }
 
     fn indexOfFirstHeaders(p: *const TestPeer, sid: u31) ?usize {
@@ -4774,6 +4933,11 @@ test "h2: a request trailer block with a §8.2.1-invalid field is dropped whole,
 // ── incremental request body (Options.stream_request) ───────────────────────
 
 /// The offline harness plus the streaming opt-in.
+/// A request body past half the default window (32 767) and inside it: big
+/// enough that the WINDOW_UPDATE coalescing (`Session.shouldSendCredit`) has
+/// to send what a test observes, small enough to need no credit to arrive.
+const coalesce_body_len = 40_000;
+
 fn streamOpts() Options {
     return .{ .handler = testHandler, .stream_request = streamRoutes };
 }
@@ -4821,20 +4985,28 @@ test "h2 streaming request: WINDOW_UPDATE follows consumption, not arrival" {
 
     try peer.conn.sendPreface(&peer.wire);
     const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-partial"), false);
-    try peer.conn.sendData(&peer.wire, sid, strRepeat("x", 100), false);
+    // Past half the window, so the coalescing (`shouldSendCredit`) cannot
+    // hide what an arrival-driven policy would send.
+    const body = try gpa.alloc(u8, coalesce_body_len);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    try peer.conn.sendData(&peer.wire, sid, body, false);
 
     var out_buf: [8192]u8 = undefined;
     try runOffline(&peer, streamOpts(), &out_buf);
 
     try testing.expectEqualStrings("took 10", peer.resp(sid).body.items);
-    // 100 octets arrived; the handler took 10. Stream-level credit is what
-    // says "send me 10 more on THIS stream", and only 10 were freed:
-    // arrival-driven crediting would say 100 here.
-    try testing.expectEqual(@as(u64, 10), peer.streamCredit(sid));
-    // The connection window gets all 100 back — 10 by consumption and the
-    // other 90 as discarded octets when the stream was released (§6.9.1:
-    // account for what you throw away, or the shared window leaks shut).
-    try testing.expectEqual(@as(u64, 100), peer.wu_conn);
+    // 40 000 octets arrived; the handler took 10. Stream-level credit is
+    // what says "send me more on THIS stream", and only 10 were freed --
+    // too little to be worth a frame: arrival-driven crediting would have
+    // sent at least half the window here.
+    try testing.expectEqual(@as(u64, 0), peer.streamCredit(sid));
+    // The connection window gets all of it back -- 10 by consumption and the
+    // rest as discarded octets when the stream was released (§6.9.1:
+    // account for what you throw away, or the shared window leaks shut) --
+    // in ONE frame, the 10 riding along with the discard.
+    try testing.expectEqual(@as(u64, coalesce_body_len), peer.wu_conn);
+    try testing.expectEqual(@as(usize, 1), peer.windowUpdateFrames(0));
     // §8.1: the response was complete while the request body was not, so the
     // peer is told to stop — with NO_ERROR, which is not a failure.
     try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.no_error), peer.resp(sid).rst);
@@ -4848,7 +5020,10 @@ test "h2 streaming request: a handler that never reads does not wedge the connec
 
     try peer.conn.sendPreface(&peer.wire);
     const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-ignore"), false);
-    try peer.conn.sendData(&peer.wire, sid, strRepeat("y", 500), false); // never ended
+    const body = try gpa.alloc(u8, coalesce_body_len); // past half the window
+    defer gpa.free(body);
+    @memset(body, 'y');
+    try peer.conn.sendData(&peer.wire, sid, body, false); // never ended
     // A second stream behind it must still be served.
     const sid2 = try peer.conn.startStream(&peer.wire, &get_fields, true);
 
@@ -4862,7 +5037,7 @@ test "h2 streaming request: a handler that never reads does not wedge the connec
     // reading. The connection window, which every other stream shares, is
     // made whole instead.
     try testing.expectEqual(@as(u64, 0), peer.streamCredit(sid));
-    try testing.expectEqual(@as(u64, 500), peer.wu_conn);
+    try testing.expectEqual(@as(u64, coalesce_body_len), peer.wu_conn);
     // …and that connection credit was returned AFTER the response, when the
     // octets were actually discarded. Arrival-driven crediting would have
     // put it before the response HEADERS.
@@ -4895,11 +5070,44 @@ test "h2 streaming request: trailers reach the same Request.trailer surface" {
     const c = peer.resp(sid);
     try testing.expectEqual(@as(u16, 200), c.status);
     try testing.expectEqualStrings("streamed 9 in 1 reads trailer=deadbeef", c.body.items);
-    // All 9 octets were consumed, so all 9 were credited back — connection
-    // window only: the trailer HEADERS carried END_STREAM, and stream-level
-    // credit on a stream that can never receive again is dead weight (the
-    // same corollary `h2_client.readBody` states).
-    try testing.expectEqual(@as(u64, 9), peer.wu_conn);
+    // All 9 octets were consumed, but 9 octets of credit are not worth a
+    // frame (`shouldSendCredit`): the peer still has nearly the whole window.
+    try testing.expectEqual(@as(u64, 0), peer.wu_conn);
+    try testing.expectEqual(@as(u64, 0), peer.streamCredit(sid));
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2 streaming request: credit for a body consumed after END_STREAM goes to the connection window only" {
+    // Every octet arrives (END_STREAM included) before the handler reads, so
+    // each consumed octet is credited on a stream that can never receive
+    // again: connection window only -- stream-level credit there is dead
+    // weight (the same corollary `h2_client.readBody` states). Past half the
+    // window, so the coalesced connection credit does go out.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-count"), false);
+    const body = try gpa.alloc(u8, coalesce_body_len);
+    defer gpa.free(body);
+    @memset(body, 'w');
+    try peer.conn.sendData(&peer.wire, sid, body, true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, streamOpts(), &out_buf);
+
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    if (!std.mem.startsWith(u8, c.body.items, "streamed 40000 in ")) {
+        std.debug.print("unexpected body: '{s}'\n", .{c.body.items});
+        return error.TestUnexpectedResult;
+    }
+    // The whole body is parsed in one batch here, so the update goes out
+    // once the consumed credit reaches the peer's remaining room (65 535 -
+    // 40 000); never more than was consumed.
+    try testing.expect(peer.wu_conn >= h2.default_initial_window_size - coalesce_body_len);
+    try testing.expect(peer.wu_conn <= coalesce_body_len);
     try testing.expectEqual(@as(u64, 0), peer.streamCredit(sid));
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
@@ -4976,10 +5184,14 @@ test "h2 streaming request: opting one route in leaves every other route buffere
         .{ .name = "content-length", .value = "99" },
     }, false);
     try peer.conn.sendData(&peer.wire, sid_bad, "four", true);
-    const sid_ok = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
-    // Two frames, so the credit for the first is observable while the body
-    // is still open.
-    try peer.conn.sendData(&peer.wire, sid_ok, "buffered", false);
+    const sid_ok = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
+    // Two parts, so the credit for the first is observable while the body
+    // is still open; the first is past half the window, so the coalescing
+    // (`shouldSendCredit`) sends it.
+    const first = try gpa.alloc(u8, coalesce_body_len);
+    defer gpa.free(first);
+    @memset(first, 'b');
+    try peer.conn.sendData(&peer.wire, sid_ok, first, false);
     try peer.conn.sendData(&peer.wire, sid_ok, " still", true);
 
     var out_buf: [8192]u8 = undefined;
@@ -4987,17 +5199,20 @@ test "h2 streaming request: opting one route in leaves every other route buffere
 
     try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_bad).rst);
     try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
-    try testing.expectEqualStrings("buffered still", peer.resp(sid_ok).body.items);
-    // A buffered body is still credited on ARRIVAL: 8 octets of stream
-    // credit were handed back while the request was still incomplete and
-    // no handler had run, so nothing had consumed them. It has to work this
-    // way — consumption-driven crediting here would withhold exactly the
-    // credit the peer needs to send the END_STREAM the dispatch waits for,
-    // and deadlock every upload above the initial window.
-    try testing.expectEqual(@as(u64, 8), peer.streamCredit(sid_ok));
-    // Every octet either stream got is back on the connection window: 14
-    // here plus the 4 the malformed stream sent before its reset.
-    try testing.expectEqual(@as(u64, 18), peer.wu_conn);
+    try testing.expectEqualStrings("drained 40006", peer.resp(sid_ok).body.items);
+    // A buffered body is still credited on ARRIVAL: stream credit was handed
+    // back while the request was still incomplete and no handler had run,
+    // so nothing had consumed it. It has to work this way --
+    // consumption-driven crediting here would withhold exactly the credit
+    // the peer needs to send the END_STREAM the dispatch waits for, and
+    // deadlock every upload above the initial window. (The frames are
+    // 16 384 octets, the default SETTINGS_MAX_FRAME_SIZE: the second one
+    // crosses half the window.)
+    try testing.expectEqual(@as(u64, 2 * 16_384), peer.streamCredit(sid_ok));
+    // The connection credit went out at the same crossing: the 4 octets the
+    // malformed stream sent before its reset plus the same two frames. The
+    // rest stays coalesced (below half the window).
+    try testing.expectEqual(@as(u64, 4 + 2 * 16_384), peer.wu_conn);
 }
 
 // ── incremental response body ───────────────────────────────────────────────
@@ -6043,6 +6258,8 @@ const StagedReader = struct {
         /// use: waiting on it parks the reading fiber, where the two gates
         /// above would spin the one thread every fiber shares.
         event: ?*std.Io.Event = null,
+        /// Then hold them this much longer (a slow peer).
+        delay_ms: u32 = 0,
         bytes: []const u8,
     };
 
@@ -6064,6 +6281,8 @@ const StagedReader = struct {
                 if (st.counter) |c|
                     awaitAtLeast(sr.io, c, st.at_least) catch return error.ReadFailed;
                 if (st.event) |e| e.waitUncancelable(sr.io);
+                if (st.delay_ms != 0)
+                    sr.io.sleep(.fromMilliseconds(st.delay_ms), .awake) catch return error.ReadFailed;
             }
             const src = limit.sliceConst(st.bytes[sr.off..]);
             if (src.len == 0) {
@@ -6095,6 +6314,10 @@ const FrameWatcher = struct {
     ping_ack: std.atomic.Value(bool) = .init(false),
     goaway: std.atomic.Value(bool) = .init(false),
     refused: std.atomic.Value(u32) = .init(0),
+    /// RST_STREAM frames of any code (`usize` for `awaitAtLeast`).
+    resets: std.atomic.Value(usize) = .init(0),
+    /// Connection-level credit returned (WINDOW_UPDATE on stream 0).
+    wu_conn: std.atomic.Value(usize) = .init(0),
     /// Total DATA payload octets written — i.e. exactly the send-window
     /// credit the server has spent. `usize`, not `u64`: this only ever counts
     /// bytes already sitting in `buf` (an in-memory `ArrayList`), so it can
@@ -6169,10 +6392,15 @@ const FrameWatcher = struct {
             switch (h[3]) {
                 0x0 => _ = fw.data_bytes.fetchAdd(len, .acq_rel), // DATA
                 0x3 => if (len >= 4) { // RST_STREAM
+                    _ = fw.resets.fetchAdd(1, .acq_rel);
                     const code = std.mem.readInt(u32, payload[0..4], .big);
                     if (code == 7) _ = fw.refused.fetchAdd(1, .acq_rel); // REFUSED_STREAM
                 },
                 0x6 => if (h[4] & 0x1 != 0) fw.ping_ack.store(true, .release), // PING ACK
+                0x8 => if (len == 4 and std.mem.readInt(u32, h[5..9], .big) & 0x7fff_ffff == 0) {
+                    const inc = std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff;
+                    _ = fw.wu_conn.fetchAdd(inc, .acq_rel); // WINDOW_UPDATE(0)
+                },
                 0x7 => fw.goaway.store(true, .release), // GOAWAY
                 else => {},
             }
@@ -8887,4 +9115,434 @@ test "h2 RewindableBody: a streamed request body (handler runs at HEADERS) re-re
     try testing.expectEqual(@as(u16, 200), peer.resp(small).status);
     try testing.expectEqualStrings(w_small, peer.resp(small).body.items);
     try testing.expectEqual(@as(u32, 1), rewind_spool.opens);
+}
+
+// ── 2026-11-18: OS-thread waits park; WINDOW_UPDATE coalescing ─────────────
+
+/// Handler for the stall tests: times its one blocking call (a response
+/// write the peer grants no credit for, or a body read the peer sends nothing
+/// for) in wall and in this thread's CPU time, and records how it ended.
+const StallProbe = struct {
+    io: std.Io,
+    wall_ns: std.atomic.Value(u64) = .init(0),
+    cpu_ns: std.atomic.Value(u64) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    body: [16 * 1024]u8 = @splat('s'),
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *StallProbe = @ptrCast(@alignCast(req.context.?));
+        const w0 = std.Io.Timestamp.now(p.io, .awake).nanoseconds;
+        const c0 = std.Io.Timestamp.now(p.io, .cpu_thread).nanoseconds;
+        const res: anyerror!void = if (std.mem.eql(u8, req.path, "/stall-write"))
+            rw.writeAll(&p.body)
+        else if (req.reader().discardRemaining()) |_| {} else |err| err;
+        const w1 = std.Io.Timestamp.now(p.io, .awake).nanoseconds;
+        const c1 = std.Io.Timestamp.now(p.io, .cpu_thread).nanoseconds;
+        p.wall_ns.store(@intCast(w1 - w0), .release);
+        p.cpu_ns.store(@intCast(c1 - c0), .release);
+        res catch |err| {
+            p.failed.store(true, .release);
+            return err;
+        };
+    }
+
+    fn streamRead(_: ?*anyopaque, preview: RequestPreview) bool {
+        return std.mem.eql(u8, preview.path(), "/stall-read");
+    }
+};
+
+const stall_test_ms = 300;
+
+/// Serve `stage0` under a `PoolDispatcher` with `stall_timeout_ms =
+/// stall_test_ms`, holding EOF back until the server reset a stream (so the
+/// reset cannot be the connection's exit), and fold the output into `peer`.
+fn runStall(peer: *TestPeer, probe: *StallProbe, io: std.Io) !void {
+    const gpa = testing.allocator;
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .counter = &fw.resets, .at_least = 1, .bytes = "" },
+    }, &rbuf);
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    var disp = pd.iface(2);
+    disp.stall_timeout_ms = stall_test_ms;
+    serve(gpa, .{
+        .handler = StallProbe.handler,
+        .context = probe,
+        .stream_request = StallProbe.streamRead,
+        .dispatcher = disp,
+    }, &sr.reader, &fw.writer);
+    try peer.feed(fw.buf.items);
+}
+
+fn expectParkedForStall(probe: *const StallProbe) !void {
+    try testing.expect(probe.failed.load(.acquire));
+    const wall = probe.wall_ns.load(.acquire);
+    const cpu = probe.cpu_ns.load(.acquire);
+    // The wait lasted the stall deadline...
+    try testing.expect(wall >= stall_test_ms * std.time.ns_per_ms);
+    // ...and the thread slept through it: the yield-spin this replaces
+    // spent the whole wait on the CPU (cpu ~ wall).
+    if (cpu * 4 >= wall) {
+        std.debug.print("waiting handler burned CPU: cpu {d} ns over wall {d} ns\n", .{ cpu, wall });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "dispatcher (OS threads): a handler waiting for credit parks, and the stall deadline resets its stream" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Window 0: the response head goes out, not one DATA octet ever can.
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = 0 });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/stall-write");
+    var probe: StallProbe = .{ .io = io };
+    try runStall(&peer, &probe, io);
+
+    try expectParkedForStall(&probe);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqual(@as(usize, 0), c.body.items.len);
+    // Ended the way a canceled wait ends it: RST_STREAM(CANCEL), only this
+    // stream, the connection stays.
+    try testing.expectEqual(@as(?h2.ErrorCode, .cancel), c.rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "dispatcher (OS threads): a handler waiting for request body parks, and the stall deadline fails the read" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    // HEADERS without END_STREAM, and no DATA ever.
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stall-read"), false);
+    var probe: StallProbe = .{ .io = io };
+    try runStall(&peer, &probe, io);
+
+    try expectParkedForStall(&probe);
+    const c = peer.resp(sid);
+    // The read failed before anything was sent: a status, then the unread
+    // request is retired with RST_STREAM(NO_ERROR) (§8.1).
+    try testing.expectEqual(@as(u16, 500), c.status);
+    try testing.expectEqual(@as(?h2.ErrorCode, .no_error), c.rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2: a flood of 1-octet DATA frames is answered by O(bytes / half-window) WINDOW_UPDATEs" {
+    // Before 2026-11-18 every DATA frame was credited back at once on both
+    // windows: 40 000 one-octet frames drew 80 000 WINDOW_UPDATEs (~1 MB,
+    // which would not even fit `out_buf`). Coalesced (nghttp2 / h2o / Go
+    // x/net/http2 all hold credit back until it is worth a frame), the
+    // first half window is one frame per window and the rest is held.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
+    for (0..coalesce_body_len) |i| try peer.conn.sendData(&peer.wire, sid, "f", i + 1 == coalesce_body_len);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+    try testing.expectEqualStrings("drained 40000", peer.resp(sid).body.items);
+    try testing.expectEqual(@as(usize, 1), peer.windowUpdateFrames(0));
+    try testing.expectEqual(@as(usize, 1), peer.windowUpdateFrames(sid));
+    // The whole flood is parsed in one batch here (the windows are charged
+    // as frames are parsed, the credit as their events are handled), so the
+    // update goes out where the credit reached the peer's remaining room,
+    // 65 535 - 40 000 -- on a socket, with smaller batches, up to half the
+    // window.
+    const room = h2.default_initial_window_size - coalesce_body_len;
+    try testing.expectEqual(@as(u64, room), peer.wu_conn);
+    try testing.expectEqual(@as(u64, room), peer.streamCredit(sid));
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2: shouldSendCredit -- half the window, or at least what the peer may still send" {
+    const f = Session.shouldSendCredit;
+    try testing.expect(!f(0, 65_535, 0)); // nothing to send
+    try testing.expect(!f(100, 65_535, 65_000));
+    try testing.expect(f(32_767, 65_535, 65_535)); // exactly half (floor)
+    try testing.expect(!f(32_766, 65_535, 65_535));
+    try testing.expect(f(10, 65_535, 10)); // doubles the peer's room
+    try testing.expect(!f(10, 65_535, 11));
+    try testing.expect(f(1, 65_535, 0)); // the peer has no room at all
+    try testing.expect(f(1, 65_535, -5)); // a SETTINGS shrink left it negative
+    try testing.expect(f(1, 1, 1_000)); // a 1-octet window: every octet
+}
+
+test "dispatcher (OS threads): the stall clock restarts whenever the stream moves" {
+    // Two credit waits of ~0.6 x the stall deadline each, one `emit` call:
+    // together longer than the deadline, each shorter. The response must
+    // complete -- a clock that kept running from the first wait would reset
+    // the stream during the second.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Stream windows wide open; the connection window (65 535) binds.
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = fc_stream_window });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/big/a");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    const step: u31 = 20_000; // 65 535 + 2 x 20 000 > fc_body_len (98 304)
+    var grants: [2][]u8 = undefined;
+    for (&grants) |*g| {
+        try peer.conn.sendWindowUpdate(&peer.wire, 0, step);
+        g.* = try gpa.dupe(u8, peer.wire.items);
+        peer.wire.clearRetainingCapacity();
+    }
+    defer for (grants) |g| gpa.free(g);
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    const gap = stall_test_ms * 3 / 5;
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .counter = &fw.data_bytes, .at_least = 65_535, .delay_ms = gap, .bytes = grants[0] },
+        .{ .counter = &fw.data_bytes, .at_least = 65_535 + step, .delay_ms = gap, .bytes = grants[1] },
+        .{ .counter = &fw.data_bytes, .at_least = fc_body_len, .bytes = "" },
+    }, &rbuf);
+
+    var probe: FlowProbe = .{};
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    var disp = pd.iface(2);
+    disp.stall_timeout_ms = stall_test_ms;
+    serve(gpa, .{
+        .handler = FlowProbe.handler,
+        .context = &probe,
+        // > body length: the whole response reaches `emit` as one slice.
+        .response_buffer_size = 128 * 1024,
+        .dispatcher = disp,
+    }, &sr.reader, &fw.writer);
+
+    try peer.feed(fw.buf.items);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), c.rst);
+    try testing.expect(c.end);
+    try testing.expectEqual(@as(usize, fc_body_len), c.body.items.len);
+}
+
+test "dispatcher (OS threads): credit a handler frees while it reads reaches the peer at once" {
+    // The peer sends END_STREAM only after the server returned the credit
+    // for what the handler consumed -- a peer whose window is spent does
+    // exactly that. The connection task is blocked reading meanwhile, so
+    // the worker that staged the WINDOW_UPDATE has to put it on the wire
+    // itself (`grantJob` -> `stageWire`).
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-count"), false);
+    const body = try gpa.alloc(u8, coalesce_body_len);
+    defer gpa.free(body);
+    @memset(body, 'u');
+    try peer.conn.sendData(&peer.wire, sid, body, false);
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendData(&peer.wire, sid, "", true);
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        // The whole body arrives in one batch, so the credit goes out once
+        // it reaches the peer's remaining room (65 535 - 40 000).
+        .{ .counter = &fw.wu_conn, .at_least = h2.default_initial_window_size - coalesce_body_len, .bytes = stage1 },
+        .{ .counter = &fw.data_bytes, .at_least = 1, .bytes = "" },
+    }, &rbuf);
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    serve(gpa, .{
+        .handler = testHandler,
+        .stream_request = streamRoutes,
+        .dispatcher = pd.iface(2),
+    }, &sr.reader, &fw.writer);
+
+    try peer.feed(fw.buf.items);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    if (!std.mem.startsWith(u8, c.body.items, "streamed 40000 in ")) {
+        std.debug.print("unexpected body: '{s}'\n", .{c.body.items});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(peer.wu_conn >= h2.default_initial_window_size - coalesce_body_len);
+}
+
+test "dispatcher (OS threads): credit for a body a handler never read reaches the peer when the stream retires" {
+    // The handler answers without reading 40 000 octets; retiring the stream
+    // returns their connection credit (§6.9.1). The peer waits for that
+    // credit before it sends its next request -- so the worker retiring the
+    // stream has to flush it (`removeJob` -> `stageWire`), the connection
+    // task being blocked reading.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-ignore"), false);
+    const body = try gpa.alloc(u8, coalesce_body_len);
+    defer gpa.free(body);
+    @memset(body, 'i');
+    try peer.conn.sendData(&peer.wire, sid, body, false); // never ended
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    const sid2 = try stageGet(&peer, "/hello");
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    // Room for all of stage 0 in one read: every DATA frame is handled
+    // before the handler can retire the stream, so the whole 40 000 is
+    // owed -- and credited -- at retirement, not partly by later discards.
+    var rbuf: [64 * 1024]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .counter = &fw.wu_conn, .at_least = coalesce_body_len, .bytes = stage1 },
+        // "ignored" + "hello": both responses are out before EOF.
+        .{ .counter = &fw.data_bytes, .at_least = 12, .bytes = "" },
+    }, &rbuf);
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    serve(gpa, .{
+        .handler = testHandler,
+        .stream_request = streamRoutes,
+        .dispatcher = pd.iface(2),
+    }, &sr.reader, &fw.writer);
+
+    try peer.feed(fw.buf.items);
+    try testing.expectEqualStrings("ignored", peer.resp(sid).body.items);
+    try testing.expectEqual(@as(u64, coalesce_body_len), peer.wu_conn);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid2).status);
+    try testing.expectEqualStrings("hello", peer.resp(sid2).body.items);
+}
+
+/// `/stream-hold` reads its whole body, then holds its response until
+/// `/hello` has been served on the same connection.
+const HoldProbe = struct {
+    io: std.Io,
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *HoldProbe = @ptrCast(@alignCast(req.context.?));
+        if (std.mem.eql(u8, req.path, "/stream-hold")) {
+            _ = try req.reader().discardRemaining();
+            try awaitFlag(p.io, &p.release);
+            try rw.writeAll("held");
+        } else {
+            p.release.store(true, .release);
+            try rw.writeAll("hello");
+        }
+    }
+};
+
+test "dispatcher (OS threads): connection credit a handler frees is flushed even while the handler keeps running" {
+    // The body (END_STREAM included) is all in before the handler reads, so
+    // what it consumes is credited on the connection window only (§6.9:
+    // the stream can receive no more). The handler then keeps the stream
+    // open; the peer sends its next request only once that credit arrived.
+    // Nothing else is written meanwhile, so the worker must flush it.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/stream-hold"), false);
+    const body = try gpa.alloc(u8, coalesce_body_len);
+    defer gpa.free(body);
+    @memset(body, 'h');
+    try peer.conn.sendData(&peer.wire, sid, body, true);
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    const sid2 = try stageGet(&peer, "/hello");
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    var rbuf: [64 * 1024]u8 = undefined; // all of stage 0 in one read
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .counter = &fw.wu_conn, .at_least = h2.default_initial_window_size - coalesce_body_len, .bytes = stage1 },
+        .{ .counter = &fw.data_bytes, .at_least = 9, .bytes = "" }, // "held" + "hello"
+    }, &rbuf);
+    var probe: HoldProbe = .{ .io = io };
+    var pd = try PoolDispatcher.init(gpa, io, 2, 8);
+    defer pd.deinit();
+    serve(gpa, .{
+        .handler = HoldProbe.handler,
+        .context = &probe,
+        .stream_request = streamRoutes,
+        .dispatcher = pd.iface(2),
+    }, &sr.reader, &fw.writer);
+
+    try peer.feed(fw.buf.items);
+    try testing.expectEqualStrings("held", peer.resp(sid).body.items);
+    try testing.expectEqualStrings("hello", peer.resp(sid2).body.items);
+    try testing.expectEqual(@as(u64, 0), peer.streamCredit(sid));
+    try testing.expect(peer.wu_conn >= h2.default_initial_window_size - coalesce_body_len);
+}
+
+test "dispatcher (fibers): a handler waiting for credit is released when the connection task leaves" {
+    // The `Dispatcher.io` twin of the OS-thread test: window 0, the reader
+    // ends; the handler parked in `waitForPeer` must get `Closed` once the
+    // connection task has left, not loop on a wait that returns at once.
+    const gpa = testing.allocator;
+    var bio: BatonIo = undefined;
+    bio.init(gpa);
+    defer bio.deinit();
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = 0 });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/big");
+    var fd: BatonDispatcher = .{ .b = &bio };
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .dispatcher = fd.iface(2) }, &out_buf);
+    fd.join();
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqual(@as(usize, 0), c.body.items.len);
+    try testing.expect(!c.end);
 }

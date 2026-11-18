@@ -8,7 +8,9 @@
 
 **Ahead:** speed — the HTTP/1.1 server codec is faster than every measured server on every workload of `zig build bench-http` (16 keep-alive requests per connection, socket-free: a browser-like GET, a 1 KiB POST, a chunked POST, a 64 KiB response, a 40-header proxied GET): 0.32–0.68× hyper 1.11.0 (Rust, the fastest measured, its `http1` server connection over the same wire in memory) and 0.12–0.27× Go 1.26 `net/http`'s request reader (`tools/rust_fast_bench`, `tools/go_bench`, 5 rounds) (measured 2026-10-25)
 
-**Audit:** review 2026-11-13 · mutation 2026-11-17 (182/190, 8 eq) · src b7615cef7e0010f5
+**Audit:** review 2026-11-13 · mutation 2026-11-18 (207/228, 21 eq) · src 4f1d17a55f150199
+
+**Audit 2026-11-18 (delta: h2 OS-thread wait parking + WINDOW_UPDATE coalescing).** 38 schemata mutants over the new code in `h2_server.zig` (ReleaseSafe, one build of the module with its tests, the `h2_server` tests per mutant through the kit's runner, `setsid -w timeout` 25 s, `ulimit -v`): `announce` (sequential guard, the progress bump, the wake guard forced off and on), `waitForPeer` (the io path's `Closed`, the OS path's leading and trailing `gone` checks, the deadline latch, `>=` dropped and `>`, `Stalled` as `Closed`, the timeout dropped, the futex replaced by a yield, the `parked` decrement), the connection task's drain (its announce, its `parked` registration, its futex), the hoisted `stall_ms`, `emit`'s clock restart, `grantJob` (staged ignored, the open-stream guard, `avail` forced 0, the window doubled, the reset of `unsent`, the flush), `creditConn` (the zero guard, the add, the send test forced, the window doubled, the reset), `shouldSendCredit` (all four comparisons), and the flushes after `creditConn` in `onData`, `grantJob`'s no-job path and `removeJob`. 25 killed (17 by the hang cap), 12 EQUIVALENT, 1 UNOBSERVABLE (counted with the equivalents above): cost-only — the wake forced on, `announce` in sequential mode, a `parked` left raised, the drain spinning instead of parking; redundant — the trailing `gone` check (the caller loops back to the leading one), `now > deadline` (at equality the next round, one zero-length futex wait later, stalls), `avail < 0` (at 0 the second rule's `unsent >= 0` holds), the zero guard in `creditConn` (a zero credit only re-tests the rule earlier), the doubled window at both call sites (the peer's-room rule subsumes the half-window one except at the floor, 32 767 against 32 768), the flush after a discard in `onData` (`pump` flushes after `processEvents`), `grantJob`'s no-job path (unreachable: both callers hold the job); UNOBSERVABLE — the drain's announce, needed only when a worker parks in the few instructions between `pump`'s last announce and `gone.store` (needs a scheduler hook). Tests added during the audit because the first pass left three alive: a fiber handler waiting for credit released when the connection task leaves (the io path's `Closed`), connection credit flushed by the worker while its handler keeps running (`grantJob`'s staged), and retirement credit flushed (made deterministic: in the first run it read in 4 KiB batches, so the handler could retire before every DATA frame had arrived, and the three hangs it produced were re-run after the fix: one stayed killed, two are the equivalents above). No defect.
 
 Audit detail (2026-11-13, client interceptors): a delta mutation run over every function commit `1a338774` touched — the dispatch at the top of `request`/`requestPlain`, `requestIntercepted`, `Chain.proceed`, `checkDeadline`, `totalDeadline` (schemata, ReleaseSafe, strict verdict): 29 mutants, 28 killed (6 by the hang cap), 1 equivalent (`checkDeadline`'s `<= 0` → `< 0`, different only at a remainder of exactly 0 ns — needs an injectable clock). Seven tests were added first, because the existing ones let mutants through: with a budget set, `runBounded` cancels a retrying chain before `Chain.proceed`'s own deadline check is ever needed, so that check is now pinned under `inline_blocking`, where it is the only bound; also method/url/options reaching the exchange incl. an interceptor rewriting them, an outer retry re-running inner interceptors, no budget keeping the chain on the caller's thread, `request` on the TLS-capable and `requestPlain` on the http-only exchange, invalid options refused before any interceptor runs, an interceptor's error crossing the bounded path. No defect. The 2026-11-13 HPACK delta and the 2026-11-12 halves below still cover the rest.
 
@@ -473,12 +475,24 @@ directly-exposed parser.
 - **52 open test-gap candidates of the 2026-11-12 partial client-half run: decided 2026-11-13 — 19 killed, 33 equivalent, 0 findings.** Killed by new or already-present tests (16, proven by a schemata run: each mutant fails the new test): the stale-pooled-connection retry with TWO stale idle connections must dial fresh (`request` and `requestPlain`), `trailersTruncated` (head filling `max_head_bytes`, no trailer, dropped trailer line, non-chunked body, h2), `Member` flush and `drain` byte count, `initCompress` resetting a dirty `history_end_unhashed`, `PaddedSource` room checks, `conditional` list elements (a malformed element before a tag, the empty tag `""`), `redirectLocation` trailing slash and an empty path part, and the existing one-digit-port test for `client_proxy`; three more (`gzip.initCompress`'s comptime field check) are killed at compile time, since the mutant does not build. Equivalent, each with its invariant: `= undefined` poison writes (3), initial values always overwritten before a read (`reused` x2, `Gunzip` crc/size x4), `owned = false` before a `continue` with no fallible step (x2), a retry `h1_only` read only behind `take_idle` (x1), an unreachable `trailer_bytes_seen == 3`, a `Member.writer = .failing` that std's `Compress.finish` already implies, `decode_out_len`/`decode_in_len` +-1 (buffer granularity only, x4), `setEvalBranchQuota` headroom and the field-check's `@compileError` body (comptime, a std change is the needed injection), `conditional` callers' range guarantees (x3), and in `cleanPath` the skipped-slash and `..` bookkeeping variants (x9) plus `resolvePath`'s one-byte-path `trailing`. Table kept by the auditor; the next whole run needs none of these.
 
 - **No-panic sweep 2026-10-28 — deferred, none a panic or unbounded memory**:
-  - *Threaded h2 without `Dispatcher.io` yield-spins* (`Session.waitForPeer`): a handler waiting
-    for credit or body burns a core until the peer moves or the connection ends (bounded by the
-    connection's lifetime, up to `max_concurrent_handlers` per connection). Ideal: park on a futex
-    over `progress`, with a per-stream stall deadline.
-  - *1-byte DATA frames cost two WINDOW_UPDATEs each* (~2.6× output, `onData`/`grantJob`):
-    coalesce updates below half the window.
+  - **DONE 2026-11-18** *Threaded h2 without `Dispatcher.io` yield-spins* (`Session.waitForPeer`):
+    a waiting handler now parks its thread on a futex over `progress` (the OS futex through
+    `std.Io.Threaded.global_single_threaded`, the same choice as `zstd`'s pools; `announce` wakes
+    it, the `parked` count skips the syscall when nobody waits), and gives up after
+    `Dispatcher.stall_timeout_ms` (default 60 s; null = no deadline) without its stream moving: a
+    response write ends the stream with RST_STREAM(CANCEL), a body read fails — what a canceled
+    wait does with `io`. Reference: nginx's `send_timeout` / `client_body_timeout` (60 s, "between
+    two successive" operations, applied to its h2 streams too); Go's `x/net/http2` per-stream
+    write deadline resets with INTERNAL_ERROR, the module keeps its own CANCEL for every abandoned
+    wait. The connection task's final drain parks the same way. The `Dispatcher.io` path is
+    unchanged.
+  - **DONE 2026-11-18** *1-byte DATA frames cost two WINDOW_UPDATEs each* (`onData`/`grantJob`):
+    credit is coalesced per window (`Session.shouldSendCredit`): sent once it is at least half the
+    window (nghttp2 `nghttp2_should_send_window_update`, h2o's connection window) or at least the
+    peer's remaining room (Go `x/net/http2` `inflow.add`, h2o's stream window). Go's extra
+    4 KiB floor is not taken (nghttp2 and h2o have none). Unsent stream credit of a stream that
+    ended is dropped; unsent connection credit stays owed. 40 000 one-octet frames: 2 updates
+    instead of 80 000.
   - *~46 KiB per connection before the first byte*, no built-in connection cap (`on_connect` is the
     control) — a sentence for the README's posture section.
   - *Inbound gzip relies on std flate for crafted dynamic blocks*: truncation is guarded
@@ -783,7 +797,8 @@ balancer learns the real client only from the PROXY header the balancer prepends
 set, the session lock is a `std.Io.Mutex` and `waitForPeer`/the drain park on a `std.Io.Condition`
 (`Session.moved`) that `pump`, a retiring handler and the connection task's exit broadcast; a
 `progress` counter sampled under the lock makes the wait immune to a wakeup that lands between the
-caller's unlock and its wait. `null` keeps the yield-spin. Tested under `BatonIo` (OS threads, one
+caller's unlock and its wait. `null` parks OS threads on a futex over the same counter (since
+2026-11-18; it was a yield-spin), bounded by `Dispatcher.stall_timeout_ms`. Tested under `BatonIo` (OS threads, one
 runner at a time, the baton handed over only inside a blocking `Io` call = the fiber rule), because
 `std.Io.Evented` did not compile in Zig 0.16.0 (not re-checked on 0.17); without `io` the first such test hangs, and a `pump`
 that does not broadcast hangs the flow-control one (both measured).
