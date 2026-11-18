@@ -118,3 +118,59 @@ killing test, an EQUIVALENT naming the invariant ("cost-only" for a speed-only
 mutant), an UNOBSERVABLE naming the injection it would need, or a finding.
 The card's `**Audit:**` line records `mutation <date> (<killed>/<total>, <n> eq)`
 with killed + eq + survivors = total.
+
+A card entry whose previous mutation run recorded no counts (`mutation <date> ·
+src ?`) does not take a delta run's counts: those would read as a whole-module
+score. Put the delta in a SPEC paragraph and run the whole module.
+
+## 5. Stack-burn and wipe sites
+
+A wipe (`secureZero`) or a stack burn is observable only to the module's
+ReleaseFast stack probe, so these mutants need a ReleaseFast schemata build.
+Two traps, both met on 2026-11-17/18 (dkg, bip32, p256, opaque):
+
+- **A switch at the burn site perturbs the frame the probe reads.**
+  `{ if (!mut(n)) burn.stack(X); }` adds a call and a load in the caller's own
+  frame, between the body and the burn; the probe's baseline (mutant 0) then
+  finds secrets above the burn although the plain ReleaseFast build is clean.
+  Do not record such mutants as UNOBSERVABLE and do not raise the burn: move
+  the switch INTO the callee. In the scratch copy, rewrite each site
+  `burn.stack(X);` → `burn.stackAt(X, ID);` and `std.crypto.secureZero(T, s);`
+  → `burn.zeroAt(T, s, ID);` with the mutant id as a comptime argument, and
+  append to the module's `burn.zig`:
+
+  ```zig
+  var w_id: u32 = 0;
+  var w_init: bool = false;
+  noinline fn wInit() void {
+      const v = std.testing.environ.getPosix("<ENV_NAME>") orelse "0";
+      w_id = std.fmt.parseInt(u32, v, 10) catch 0;
+      w_init = true;
+  }
+  inline fn wOn(comptime id: u32) bool {
+      if (!w_init) wInit();
+      return w_id == id;
+  }
+  pub noinline fn stackAt(comptime n: usize, comptime id: u32) void {
+      if (wOn(id)) return;
+      // the module's own burn body, e.g. a volatile zero-fill of n bytes
+  }
+  pub inline fn zeroAt(comptime T: type, s: []volatile T, comptime id: u32) void {
+      if (wOn(id)) return;
+      std.crypto.secureZero(T, s);
+  }
+  ```
+
+  With the switch off the caller's frame is the original one. Confirm with
+  mutant 0 (the probe must pass) before trusting any verdict.
+- **A red baseline with NO burn-site switch is a finding**, not an artefact:
+  the original logic leaves a secret under some code shape (dkg
+  `takeKeyShare`, 2026-11-17: an entry point without a burn). Fix the module
+  (a noinline `…Unburned` body plus a burn), then measure. A residue that is
+  a copy of the function's own by-value RESULT (bip32 `neuter`) sits in the
+  wrapper's frame above any burn; it is output the caller holds — exclude that
+  needle for that entry point with a comment, or offer an out-pointer variant.
+
+Heap wipes right before `free` are UNOBSERVABLE in safe builds
+(`Allocator.free` poisons the bytes first); a ReleaseFast test with a scanning
+allocator can kill them.
