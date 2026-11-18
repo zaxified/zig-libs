@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 //! message — what `Node` (node.zig) exchanges with its peers: log entries that
-//! carry the caller's bytes, the four Raft RPCs built on them, and their wire
-//! codec. MECHANICAL — no consensus decision lives here.
+//! carry the caller's bytes, the Raft RPCs built on them (Figure 2's two,
+//! PreVote, TimeoutNow), and their wire codec. MECHANICAL — no consensus
+//! decision lives here.
 //!
 //! Why not `types.zig`'s codecs. Those carry a `u64` command per entry, which
 //! is what the model-check needs and what a real state machine cannot use; a
@@ -48,6 +49,15 @@ pub const VoteReq = struct {
     term: Term,
     last_log_index: LogIndex,
     last_log_term: Term,
+    /// The election was asked for by the leader (leadership transfer,
+    /// `timeout_now`): receivers honour it inside a CheckQuorum lease
+    /// (etcd/raft's `campaignTransfer` context, hashicorp/raft's
+    /// `RequestVoteRequest.LeadershipTransfer`). Wire: an optional 26th byte
+    /// (= 1), present only when set, so a frame without it is the 25-byte
+    /// RequestVote of before 2026-11-18; an older decoder refuses the longer
+    /// frame. Never sent, and refused, on `pre_vote_req` (a transfer never
+    /// pre-votes).
+    transfer: bool = false,
 };
 
 pub const VoteResp = struct {
@@ -109,6 +119,17 @@ pub const Tag = enum(u8) {
     /// once every server runs a decoder that knows them.
     pre_vote_req = 0x14,
     pre_vote_resp = 0x15,
+    /// Leadership transfer (Raft thesis §3.10; etcd/raft `MsgTimeoutNow`,
+    /// hashicorp/raft `TimeoutNow`). Added 2026-11-18 as a new tag, same
+    /// caveat as PreVote: an older decoder drops it, so a transfer to a
+    /// server that predates it is abandoned after one election timeout.
+    timeout_now = 0x16,
+};
+
+/// The leader tells a caught-up follower to start an election now.
+pub const TimeoutNow = struct {
+    /// The leader's term.
+    term: Term,
 };
 
 pub const Body = union(Tag) {
@@ -122,6 +143,7 @@ pub const Body = union(Tag) {
     /// Same layout as `vote_resp`. A grant carries the request's term, a
     /// refusal the responder's own (etcd/raft does the same).
     pre_vote_resp: VoteResp,
+    timeout_now: TimeoutNow,
 };
 
 pub const Message = struct {
@@ -130,6 +152,9 @@ pub const Message = struct {
     body: Body,
 
     pub const vote_req_len = 1 + 8 + 8 + 8;
+    /// `vote_req_len` plus the transfer flag byte.
+    pub const vote_req_transfer_len = vote_req_len + 1;
+    pub const timeout_now_len = 1 + 8;
     pub const vote_resp_len = 1 + 8 + 1;
     pub const append_resp_len = 1 + 8 + 1 + 8;
     /// `append_resp_len` plus `conflict_term` and `conflict_index`.
@@ -141,8 +166,10 @@ pub const Message = struct {
     /// Exact size of `encode`'s output.
     pub fn encodedLen(self: Message) usize {
         return switch (self.body) {
-            .vote_req, .pre_vote_req => vote_req_len,
+            .vote_req => |v| if (v.transfer) vote_req_transfer_len else vote_req_len,
+            .pre_vote_req => vote_req_len,
             .vote_resp, .pre_vote_resp => vote_resp_len,
+            .timeout_now => timeout_now_len,
             .append_resp => |a| if (a.conflict_index != 0) append_resp_hint_len else append_resp_len,
             .append_req => |a| blk: {
                 var n: usize = append_header_len;
@@ -163,7 +190,13 @@ pub const Message = struct {
                 std.mem.writeInt(u64, buf[1..9], v.term, .little);
                 std.mem.writeInt(u64, buf[9..17], v.last_log_index, .little);
                 std.mem.writeInt(u64, buf[17..25], v.last_log_term, .little);
-                return vote_req_len;
+                if (self.body == .pre_vote_req or !v.transfer) return vote_req_len;
+                buf[vote_req_len] = 1;
+                return vote_req_transfer_len;
+            },
+            .timeout_now => |t| {
+                std.mem.writeInt(u64, buf[1..9], t.term, .little);
+                return timeout_now_len;
             },
             .vote_resp, .pre_vote_resp => |v| {
                 std.mem.writeInt(u64, buf[1..9], v.term, .little);
@@ -215,11 +248,18 @@ pub const Message = struct {
         const tag = std.enums.fromInt(Tag, bytes[0]) orelse return error.InvalidEncoding;
         const body: Body = switch (tag) {
             .vote_req, .pre_vote_req => blk: {
-                try exactLen(bytes, vote_req_len);
+                // The transfer flag: a 26th byte, only on vote_req, only 1
+                // (one encoding per message — a 0 byte would be a second
+                // spelling of the 25-byte frame).
+                const transfer = tag == .vote_req and bytes.len == vote_req_transfer_len;
+                if (transfer) {
+                    if (bytes[vote_req_len] != 1) return error.InvalidEncoding;
+                } else try exactLen(bytes, vote_req_len);
                 const v: VoteReq = .{
                     .term = try requestTermAt(bytes, 1),
                     .last_log_index = std.mem.readInt(u64, bytes[9..17], .little),
                     .last_log_term = try termAt(bytes, 17),
+                    .transfer = transfer,
                 };
                 break :blk if (tag == .vote_req) .{ .vote_req = v } else .{ .pre_vote_req = v };
             },
@@ -250,6 +290,10 @@ pub const Message = struct {
                 break :blk .{ .append_resp = r };
             },
             .append_req => .{ .append_req = try decodeAppend(bytes, entries_out) },
+            .timeout_now => blk: {
+                try exactLen(bytes, timeout_now_len);
+                break :blk .{ .timeout_now = .{ .term = try requestTermAt(bytes, 1) } };
+            },
         };
         return .{ .from = from, .to = to, .body = body };
     }
@@ -341,6 +385,7 @@ fn roundTrip(m: Message) !void {
         .vote_resp => |v| try testing.expectEqual(v, d.body.vote_resp),
         .pre_vote_req => |v| try testing.expectEqual(v, d.body.pre_vote_req),
         .pre_vote_resp => |v| try testing.expectEqual(v, d.body.pre_vote_resp),
+        .timeout_now => |v| try testing.expectEqual(v, d.body.timeout_now),
         .append_resp => |v| try testing.expectEqual(v, d.body.append_resp),
         .append_req => |a| {
             const b = d.body.append_req;
@@ -364,6 +409,8 @@ test "every message kind round-trips, entries with their bytes" {
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .vote_resp = .{ .term = 4, .granted = true } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .pre_vote_req = .{ .term = 5, .last_log_index = 9, .last_log_term = 3 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .pre_vote_resp = .{ .term = 5, .granted = false } } });
+    try roundTrip(.{ .from = 1, .to = 2, .body = .{ .vote_req = .{ .term = 4, .last_log_index = 9, .last_log_term = 3, .transfer = true } } });
+    try roundTrip(.{ .from = 0, .to = 2, .body = .{ .timeout_now = .{ .term = 7 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 3, .conflict_index = 9 } } });
     try roundTrip(.{ .from = 1, .to = 2, .body = .{ .append_resp = .{ .term = 4, .success = false, .index = 17, .conflict_term = 0, .conflict_index = 18 } } });
@@ -452,7 +499,7 @@ test "decode refuses lying lengths, trailing bytes, bad tags, bools and terms" {
     // One byte left over.
     try testing.expectError(error.InvalidEncoding, Message.decode(buf[0 .. ok.len + 1], 0, 1, &scratch));
     // Undefined tag; the old format's tags; an empty frame.
-    try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x16}, 0, 1, &scratch));
+    try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x17}, 0, 1, &scratch));
     try testing.expectError(error.InvalidEncoding, Message.decode(&.{0x02}, 0, 1, &scratch));
     try testing.expectError(error.Truncated, Message.decode(&.{}, 0, 1, &scratch));
 
@@ -482,6 +529,8 @@ const message_seeds = [_][]const u8{
     seed("11" ++ "0400000000000000" ++ "01"), // vote_resp
     seed("14" ++ "0500000000000000" ++ "0900000000000000" ++ "0300000000000000"), // pre_vote_req
     seed("15" ++ "0500000000000000" ++ "00"), // pre_vote_resp
+    seed("10" ++ "0500000000000000" ++ "0900000000000000" ++ "0300000000000000" ++ "01"), // vote_req, transfer
+    seed("16" ++ "0700000000000000"), // timeout_now
     seed("13" ++ "0400000000000000" ++ "00" ++ "1100000000000000"), // append_resp (reject + hint)
     seed("12" ++ "0300000000000000" ++ "0500000000000000" ++ "0200000000000000" ++ "0500000000000000" ++ "00000000"), // heartbeat
     seed("12" ++ "0300000000000000" ++ "0500000000000000" ++ "0200000000000000" ++ "0500000000000000" ++ "02000000" ++
@@ -498,7 +547,7 @@ const message_seeds = [_][]const u8{
 };
 
 const fz = @import("fuzz_test.zig");
-const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, pre_vote_req, pre_vote_resp, refused });
+const MessageMark = fz.Marker(enum { vote_req, vote_resp, append_resp, append_req, pre_vote_req, pre_vote_resp, timeout_now, refused });
 
 test "fuzz: Message.decode never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzDecodeSmith, .{ .corpus = &message_seeds });
@@ -533,6 +582,7 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         .append_req => MessageMark.mark(.append_req),
         .pre_vote_req => MessageMark.mark(.pre_vote_req),
         .pre_vote_resp => MessageMark.mark(.pre_vote_resp),
+        .timeout_now => MessageMark.mark(.timeout_now),
     }
     // Accepted ⇒ re-encodes to the same bytes (the codec has one encoding).
     var out: [160]u8 = undefined;
@@ -556,7 +606,7 @@ test "corpus: every message seed reaches the decoder, and what it accepted is pi
         if (m.body == .append_req) entries += m.body.append_req.entries.len;
     }
     try testing.expectEqual(message_seeds.len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 7), accepted);
+    try testing.expectEqual(@as(usize, 9), accepted);
     // The number a heartbeat-only corpus cannot produce.
     try testing.expectEqual(@as(usize, 2), entries);
 }
@@ -584,4 +634,46 @@ test "append_resp conflict hint: optional on the wire, legacy frames still decod
     bad = buf;
     std.mem.writeInt(u64, bad[18..26], types.max_term + 1, .little);
     try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..34], 1, 2, &scratch));
+}
+
+test "leadership transfer on the wire: the vote flag is an optional byte, timeout_now a new tag, both fail closed" {
+    var scratch: [1]Entry = undefined;
+    var buf: [32]u8 = undefined;
+    // Without the flag: the 25-byte RequestVote of before, decoding unflagged.
+    const plain: Message = .{ .from = 1, .to = 2, .body = .{ .vote_req = .{ .term = 4, .last_log_index = 9, .last_log_term = 3 } } };
+    try testing.expectEqual(Message.vote_req_len, plain.encode(&buf));
+    try testing.expect(!(try Message.decode(buf[0..Message.vote_req_len], 1, 2, &scratch)).body.vote_req.transfer);
+    // Flagged: 26 bytes, the last one 1.
+    const flagged: Message = .{ .from = 1, .to = 2, .body = .{ .vote_req = .{ .term = 4, .last_log_index = 9, .last_log_term = 3, .transfer = true } } };
+    try testing.expectEqual(Message.vote_req_transfer_len, flagged.encode(&buf));
+    try testing.expectEqual(@as(u8, 1), buf[Message.vote_req_len]);
+    try testing.expect((try Message.decode(buf[0..Message.vote_req_transfer_len], 1, 2, &scratch)).body.vote_req.transfer);
+    // A flag byte other than 1, a 27-byte frame, the flag on a pre-vote: refused.
+    var bad = buf;
+    bad[Message.vote_req_len] = 0;
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.vote_req_transfer_len], 1, 2, &scratch));
+    bad[Message.vote_req_len] = 2;
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.vote_req_transfer_len], 1, 2, &scratch));
+    try testing.expectError(error.InvalidEncoding, Message.decode(buf[0 .. Message.vote_req_transfer_len + 1], 1, 2, &scratch));
+    bad = buf;
+    bad[0] = @backingInt(Tag.pre_vote_req);
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.vote_req_transfer_len], 1, 2, &scratch));
+    // A pre-vote never carries it, even if the struct says so.
+    const pv: Message = .{ .from = 1, .to = 2, .body = .{ .pre_vote_req = .{ .term = 4, .last_log_index = 9, .last_log_term = 3, .transfer = true } } };
+    try testing.expectEqual(Message.vote_req_len, pv.encodedLen());
+    try testing.expectEqual(Message.vote_req_len, pv.encode(&buf));
+
+    // timeout_now: tag 0x16 and the leader's term, nothing else; term 0 and
+    // above max_term refused, as on every request.
+    const tn: Message = .{ .from = 0, .to = 1, .body = .{ .timeout_now = .{ .term = 3 } } };
+    try testing.expectEqual(Message.timeout_now_len, tn.encode(&buf));
+    try testing.expectEqual(@as(u8, 0x16), buf[0]);
+    try testing.expectEqual(@as(Term, 3), (try Message.decode(buf[0..Message.timeout_now_len], 0, 1, &scratch)).body.timeout_now.term);
+    try testing.expectError(error.Truncated, Message.decode(buf[0 .. Message.timeout_now_len - 1], 0, 1, &scratch));
+    try testing.expectError(error.InvalidEncoding, Message.decode(buf[0 .. Message.timeout_now_len + 1], 0, 1, &scratch));
+    bad = buf;
+    @memset(bad[1..9], 0);
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.timeout_now_len], 0, 1, &scratch));
+    std.mem.writeInt(u64, bad[1..9], types.max_term + 1, .little);
+    try testing.expectError(error.InvalidEncoding, Message.decode(bad[0..Message.timeout_now_len], 0, 1, &scratch));
 }

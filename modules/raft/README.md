@@ -19,9 +19,10 @@ Two ways in:
 
 > **Status — mvp.** Election, replication, the Figure-8 commit rule, restart
 > from persisted state. Not yet: snapshots / log compaction (the whole log is in
-> memory), membership changes (`jointMajority` exists, not wired), leadership
-> transfer, linearizable reads. PreVote and CheckQuorum are there, off by
-> default as in etcd/raft. See [`SPEC.md`](SPEC.md).
+> memory), membership changes (`jointMajority` exists, not wired),
+> linearizable reads. PreVote and CheckQuorum are there, off by default as in
+> etcd/raft, and so is leadership transfer (`node.transferLeadership(target)`).
+> See [`SPEC.md`](SPEC.md).
 
 ## Use
 
@@ -45,7 +46,10 @@ defer node.deinit();
 
 // Feed it: node.tick() every tick period, node.stepBytes(from, frame) for every
 // frame from a peer (refuse frames above node.maxFrameLen() before reading
-// them), node.propose(bytes) for a client write on the leader.
+// them), node.propose(bytes) for a client write on the leader
+// (error.ProposalDropped while node.transferLeadership(target) hands
+// leadership over — done when the target wins, abandoned after one election
+// timeout; upgrade every server first, see SPEC § Leadership transfer).
 // After any of them:
 while (node.hasReady()) {
     const rd = try node.ready();
