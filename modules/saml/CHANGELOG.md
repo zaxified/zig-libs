@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit of `root.zig` (438 mutants, 407 killed, 31 equivalent or unobservable, see SPEC "Audit 2026-11-18"): 61 tests in `test_mutants*.zig`; `test_hok_crossform.zig` exports its EC certificate and point for them. Pinned: `decodeRedirectField` refuses a stream that inflates to exactly `max_redirect_inflated` octets (the cap is exclusive).
 - **2026-11-16** — `buildSignedAuthnRequest(alloc, opts, key)`: an AuthnRequest with an enveloped RSA-SHA256 signature
   after `<Issuer>` for the HTTP-POST binding (`AuthnRequestsSigned`). `buildAuthnRequest` is unchanged (same bytes, same
   error set); both share one builder.

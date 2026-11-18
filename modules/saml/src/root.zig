@@ -4146,6 +4146,9 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("test_sweep.zig");
+    _ = @import("test_mutants.zig");
+    _ = @import("test_mutants_proto.zig");
+    _ = @import("test_mutants_enc.zig");
 }
 
 const testing = std.testing;
