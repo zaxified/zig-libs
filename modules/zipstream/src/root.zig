@@ -24,8 +24,8 @@
 //! extra field) — nothing in this module's read path is 32-bit-limited. The
 //! central directory is walked by this module (`findDirectory`, `parseExtra`),
 //! not `std.zip.Iterator`, whose strictness refused archives `unzip` and Go
-//! read (see `Archive.init`). `ArchiveWriter` (below) writes classic (non-zip64) archives
-//! only; see its doc comment.
+//! read (see `Archive.init`). `ArchiveWriter` (below) writes zip64 records when an entry or
+//! the archive outgrows the classic fields (`allow_zip64`, `force_zip64`); see its doc comment.
 //!
 //! Ceiling (documented, not a bug): no encrypted entries, no compression
 //! methods beyond Store/Deflate. See README.md.
@@ -98,8 +98,8 @@ pub const Error = error{
     ZipUnsafeEntryName,
     /// WRITE: an entry's size, or the archive's running offset/central-
     /// directory size/entry count, would overflow one of the classic
-    /// (non-zip64) 32/16-bit ZIP fields. `ArchiveWriter` doesn't emit zip64
-    /// records — see its doc comment.
+    /// (non-zip64) 32/16-bit ZIP fields while zip64 is not allowed
+    /// (`allow_zip64 = false`, or `force_zip64` refused) — see `ArchiveWriter`.
     ZipWriteTooLarge,
     /// READ: `EntryReader.init` on an entry whose encryption flag is set.
     ZipEncryptedEntry,
