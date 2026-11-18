@@ -7663,3 +7663,915 @@ test "fuzz harness: secure session, 150 seeds, runs clean" {
         };
     }
 }
+
+// ── whole-module mutation audit (2026-11-18): Hello parsing, limits, framing ──
+
+const HelloReply = struct {
+    ack: bool,
+    /// ACK: receive, send, max message, max chunks. ERR: code in [0].
+    limits: [4]u32 = @splat(0),
+    reason: [48]u8 = undefined,
+    reason_len: usize = 0,
+
+    fn reasonText(r: *const HelloReply) []const u8 {
+        return r.reason[0..r.reason_len];
+    }
+};
+
+const HelloSpec = struct {
+    version: u32 = 0,
+    receive: u32 = 65536,
+    send: u32 = 65536,
+    max_message: u32 = 0,
+    max_chunks: u32 = 0,
+    url_len_field: i32 = 0,
+    url: []const u8 = "",
+    /// Pad the body with zero bytes up to this length (0 = no padding).
+    pad_to: usize = 0,
+    /// Cut the body to this many bytes (null = whole).
+    cut: ?usize = null,
+    /// Override the header's size field (null = honest).
+    size_field: ?u32 = null,
+};
+
+fn helloReply(cfg: Config, spec: HelloSpec) !HelloReply {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, cfg);
+    defer rig.deinit();
+    var frame: [9000]u8 = @splat(0);
+    var w: std.Io.Writer = .fixed(frame[8..]);
+    try w.writeInt(u32, spec.version, .little);
+    try w.writeInt(u32, spec.receive, .little);
+    try w.writeInt(u32, spec.send, .little);
+    try w.writeInt(u32, spec.max_message, .little);
+    try w.writeInt(u32, spec.max_chunks, .little);
+    try w.writeInt(i32, spec.url_len_field, .little);
+    try w.writeAll(spec.url);
+    var body_len = w.end;
+    if (spec.pad_to > body_len) body_len = spec.pad_to;
+    if (spec.cut) |c| body_len = c;
+    frame[0..3].* = "HEL".*;
+    frame[3] = 'F';
+    std.mem.writeInt(u32, frame[4..8], spec.size_field orelse @as(u32, @intCast(8 + body_len)), .little);
+    try rig.conn.feed(frame[0 .. 8 + body_len], &rig.server_out.writer, 0);
+    const out = rig.server_out.written();
+    var reply: HelloReply = .{ .ack = false };
+    if (out.len == 0) return error.NoReply;
+    if (std.mem.eql(u8, out[0..3], "ACK")) {
+        reply.ack = true;
+        for (0..4) |i| reply.limits[i] = std.mem.readInt(u32, out[12 + i * 4 ..][0..4], .little);
+    } else {
+        try testing.expectEqualSlices(u8, "ERR", out[0..3]);
+        reply.limits[0] = std.mem.readInt(u32, out[8..12], .little);
+        const n: usize = @intCast(std.mem.readInt(i32, out[12..16], .little));
+        reply.reason_len = n;
+        @memcpy(reply.reason[0..n], out[16..][0..n]);
+    }
+    return reply;
+}
+
+test "Hello: every malformed field is refused with its own status, the limits are the minimum of both sides" {
+    const cfg = TestRig.defaultConfig();
+    const t = testing;
+    // the smallest legal Hello: exactly 24 body bytes, buffers exactly 8192
+    const ok = try helloReply(cfg, .{ .receive = 8192, .send = 8192 });
+    try t.expect(ok.ack);
+    try t.expectEqual(@as(u32, 8192), ok.limits[0]);
+    try t.expectEqual(@as(u32, 8192), ok.limits[1]);
+    // one byte below the minimum, on either side
+    for ([_]HelloSpec{ .{ .receive = 8191 }, .{ .send = 8191 } }) |spec| {
+        const r = try helloReply(cfg, spec);
+        try t.expect(!r.ack);
+        try t.expectEqual(status.bad_tcp_not_enough_resources, r.limits[0]);
+    }
+    // a body shorter than the fixed part
+    const trunc = try helloReply(cfg, .{ .cut = 23 });
+    try t.expectEqual(status.bad_tcp_internal_error, trunc.limits[0]);
+    try t.expectEqualStrings("truncated Hello", trunc.reasonText());
+    // a protocol version other than 0
+    try t.expectEqual(status.bad_protocol_version_unsupported, (try helloReply(cfg, .{ .version = 1 })).limits[0]);
+    // URL length field: null (-1) and empty are fine, below -1 is not
+    try t.expect((try helloReply(cfg, .{ .url_len_field = -1 })).ack);
+    try t.expectEqual(status.bad_tcp_endpoint_url_invalid, (try helloReply(cfg, .{ .url_len_field = -2 })).limits[0]);
+    // URL of exactly 4096 bytes is fine, 4097 is refused; a claim beyond the body is refused as "too long"
+    const url4096: [4096]u8 = @splat('u');
+    const url4097: [4097]u8 = @splat('u');
+    try t.expect((try helloReply(cfg, .{ .url_len_field = 4096, .url = &url4096 })).ack);
+    const too_long = try helloReply(cfg, .{ .url_len_field = 4097, .url = &url4097 });
+    try t.expectEqual(status.bad_tcp_endpoint_url_invalid, too_long.limits[0]);
+    const beyond = try helloReply(cfg, .{ .url_len_field = 10, .url = "short" });
+    try t.expectEqualStrings("endpoint URL too long", beyond.reasonText());
+    // a limit of 0 on either side means "the other side's"; otherwise the smaller wins
+    var small = cfg;
+    small.limits = .{ .receive_buffer_size = 16384, .send_buffer_size = 16384, .max_message_size = 0, .max_chunk_count = 7 };
+    const m1 = try helloReply(small, .{ .max_message = 1000, .max_chunks = 0 });
+    try t.expectEqual(@as(u32, 1000), m1.limits[2]);
+    try t.expectEqual(@as(u32, 7), m1.limits[3]);
+    const m2 = try helloReply(small, .{ .max_message = 0, .max_chunks = 3 });
+    try t.expectEqual(@as(u32, 0), m2.limits[2]);
+    try t.expectEqual(@as(u32, 3), m2.limits[3]);
+    const m3 = try helloReply(small, .{ .max_chunks = 9 });
+    try t.expectEqual(@as(u32, 7), m3.limits[3]);
+}
+
+test "framing: a header of size 7 and a size-8 Hello are refused differently; a chunk of exactly the buffer size is accepted" {
+    var cfg = TestRig.defaultConfig();
+    cfg.limits.receive_buffer_size = 8192;
+    const t = testing;
+    const small = try helloReply(cfg, .{ .cut = 0, .size_field = 7 });
+    try t.expectEqual(status.bad_tcp_message_type_invalid, small.limits[0]);
+    const empty = try helloReply(cfg, .{ .cut = 0 });
+    try t.expectEqual(status.bad_tcp_internal_error, empty.limits[0]);
+    // a Hello whose whole chunk is exactly receive_buffer_size bytes
+    const exact = try helloReply(cfg, .{ .receive = 8192, .send = 8192, .pad_to = 8192 - 8 });
+    try t.expect(exact.ack);
+    const over = try helloReply(cfg, .{ .receive = 8192, .send = 8192, .size_field = 8193, .pad_to = 8192 - 8 });
+    try t.expectEqual(status.bad_tcp_message_too_large, over.limits[0]);
+    // fewer than 8 bytes yet: nothing to say
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, cfg);
+    defer rig.deinit();
+    try rig.conn.feed("HEL", &rig.server_out.writer, 0);
+    try rig.conn.feed("FAAA", &rig.server_out.writer, 0);
+    try t.expectEqual(@as(usize, 0), rig.server_out.written().len);
+}
+
+test "Connection.init: both buffers are checked against their minimum" {
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    var big: [65536]u8 = undefined;
+    var msg: [8192]u8 = undefined;
+    var c = try Connection.init(&rig.srv, &big, &msg);
+    c.deinit();
+    try testing.expectError(error.BufferTooSmall, Connection.init(&rig.srv, big[0 .. 65536 - 1], &msg));
+    try testing.expectError(error.BufferTooSmall, Connection.init(&rig.srv, &big, msg[0..8191]));
+}
+
+/// The ERR the server wrote: its status code and reason text (empty if none).
+fn readErr(rig: *TestRig, reason_buf: []u8) !struct { code: u32, reason: []const u8 } {
+    rig.aimReader();
+    var buf: [512]u8 = undefined;
+    const chunk = try rig.client_conn.recvChunk(&buf);
+    try testing.expectEqual(transport.MessageType.error_msg, chunk.header.message_type);
+    var r: std.Io.Reader = .fixed(chunk.body);
+    const code = try r.takeInt(u32, .little);
+    const n: usize = @intCast(try r.takeInt(i32, .little));
+    @memcpy(reason_buf[0..n], try r.take(n));
+    rig.clearServerOut();
+    return .{ .code = code, .reason = reason_buf[0..n] };
+}
+
+/// One raw SecurityPolicy#None MSG chunk on the rig's open channel.
+fn feedMsgChunk(rig: *TestRig, chunk_type: u8, request_id: u32, payload_len: usize) !void {
+    var frame: [20000]u8 = @splat(0xab);
+    const size = 8 + 16 + payload_len;
+    frame[0..3].* = "MSG".*;
+    frame[3] = chunk_type;
+    std.mem.writeInt(u32, frame[4..8], @intCast(size), .little);
+    std.mem.writeInt(u32, frame[8..12], rig.conn.channel_id, .little);
+    std.mem.writeInt(u32, frame[12..16], rig.conn.token_id, .little);
+    std.mem.writeInt(u32, frame[16..20], 1, .little);
+    std.mem.writeInt(u32, frame[20..24], request_id, .little);
+    try rig.conn.feed(frame[0..size], &rig.server_out.writer, rig.now_ms);
+}
+
+test "reassembly limits: chunk count, buffer and negotiated message size are exact, and 0 means unlimited" {
+    const gpa = testing.allocator;
+    const t = testing;
+    var reason: [96]u8 = undefined;
+    // max_chunk_count 3: three intermediates are fine, the fourth is not
+    {
+        var cfg = TestRig.defaultConfig();
+        cfg.limits.max_chunk_count = 3;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, cfg);
+        defer rig.deinit();
+        try rig.connect();
+        for (0..3) |_| try feedMsgChunk(&rig, 'C', 7, 100);
+        try t.expectEqual(@as(usize, 0), rig.server_out.written().len);
+        try feedMsgChunk(&rig, 'C', 7, 100);
+        const e = try readErr(&rig, &reason);
+        try t.expectEqual(status.bad_tcp_message_too_large, e.code);
+        try t.expectEqualStrings("chunk count exceeds the negotiated maximum", e.reason);
+    }
+    // 0 = no limit on either count or message size
+    {
+        var cfg = TestRig.defaultConfig();
+        cfg.limits.max_chunk_count = 0;
+        cfg.limits.max_message_size = 0;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, cfg);
+        defer rig.deinit();
+        try rig.connect();
+        for (0..5) |_| try feedMsgChunk(&rig, 'C', 7, 100);
+        try t.expectEqual(@as(usize, 0), rig.server_out.written().len);
+    }
+    // negotiated max_message_size 10000: exactly 10000 bytes assemble, one more does not
+    {
+        var cfg = TestRig.defaultConfig();
+        cfg.limits.max_message_size = 10_000;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, cfg);
+        defer rig.deinit();
+        try rig.connect();
+        try feedMsgChunk(&rig, 'C', 7, 5000);
+        try feedMsgChunk(&rig, 'C', 7, 5000);
+        try t.expectEqual(@as(usize, 0), rig.server_out.written().len);
+        try feedMsgChunk(&rig, 'C', 7, 1);
+        const e = try readErr(&rig, &reason);
+        try t.expectEqualStrings("reassembled message exceeds the negotiated maximum", e.reason);
+    }
+    // the reassembly buffer itself: exactly its size fits, one more does not
+    {
+        var cfg = TestRig.defaultConfig();
+        cfg.limits.max_message_size = 0;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, cfg);
+        defer rig.deinit();
+        rig.conn.deinit();
+        var small_msg: [8192]u8 = undefined;
+        rig.conn = try Connection.init(&rig.srv, rig.recv_buf, &small_msg);
+        try rig.connect();
+        try feedMsgChunk(&rig, 'C', 7, 4096);
+        try feedMsgChunk(&rig, 'C', 7, 4096);
+        try t.expectEqual(@as(usize, 0), rig.server_out.written().len);
+        try feedMsgChunk(&rig, 'C', 7, 1);
+        const e = try readErr(&rig, &reason);
+        try t.expectEqualStrings("reassembled message exceeds the reassembly buffer", e.reason);
+    }
+    // chunks of one message must agree on the request id (the same runs of type are not interleaved)
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, TestRig.defaultConfig());
+        defer rig.deinit();
+        try rig.connect();
+        try feedMsgChunk(&rig, 'C', 7, 10);
+        try feedMsgChunk(&rig, 'C', 8, 10);
+        const e = try readErr(&rig, &reason);
+        try t.expectEqualStrings("interleaved chunk runs are not supported", e.reason);
+    }
+}
+
+test "secure: the previous token ends exactly at its deadline, an unknown token never rides on it" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x35)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var config = secureTestConfig(endpoints, pki);
+    config.security.?.token_renewal_overlap_ms = 5_000;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, config);
+    defer rig.deinit();
+    try rig.connectSecure(.sign, pki);
+    const first_token = rig.conn.token_id;
+    const first_keys = rig.conn.keys.?;
+    rig.now_ms = 1_000;
+    _ = try rig.openChannelSecure(.sign, .renew, 600_000);
+    var reason: [96]u8 = undefined;
+
+    const Probe = struct {
+        fn send(r: *TestRig, token: u32, keys: security.ChannelKeys, now: i64) !void {
+            const saved_token = r.channel.token_id;
+            const saved_keys = r.channel.security.?.keys;
+            defer {
+                r.channel.token_id = saved_token;
+                r.channel.security.?.keys = saved_keys;
+            }
+            r.channel.token_id = token;
+            r.channel.security.?.keys = keys;
+            r.now_ms = now;
+            r.channel.sendService(.message, services.type_id.read_request, services.ReadRequest, .{
+                .request_header = r.header(r.authToken()),
+                .max_age = 0,
+                .timestamps_to_return = .both,
+                .nodes_to_read = &[_]services.ReadValueId{.{
+                    .node_id = r.answer_id,
+                    .attribute_id = services.attribute_id.value,
+                    .index_range = null,
+                    .data_encoding = .{ .namespace_index = 0, .name = null },
+                }},
+            }, services.encodeReadRequest) catch unreachable;
+            try r.pump();
+        }
+    };
+    // exactly at the deadline (1000 + 5000) the old token still works
+    try Probe.send(&rig, first_token, first_keys, 6_000);
+    try testing.expect(!rig.conn.isClosed());
+    rig.clearServerOut();
+    // a token that is neither the current nor the previous one is refused inside the window,
+    // as an unknown token (not as "no keys")
+    try Probe.send(&rig, first_token +% 1000, first_keys, 4_000);
+    const e = try readErr(&rig, &reason);
+    try testing.expectEqual(status.bad_secure_channel_token_unknown, e.code);
+    try testing.expectEqualStrings("unknown or expired security token", e.reason);
+}
+
+test "secure: a renewal with another certificate, a #None renewal and an unknown policy are refused with their own reason" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x36)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var other: security.Credentials = undefined;
+    try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
+        .modulus_bits = 512,
+        .common_name = "another client",
+        .not_before = "190101000000Z",
+        .not_after = "300101000000Z",
+    }, &other);
+    defer other.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    const config = secureTestConfig(endpoints, pki);
+    var reason: [96]u8 = undefined;
+    var nonce: [32]u8 = @splat(9);
+
+    // renewal presenting a different certificate than the one that opened the channel
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, config);
+        defer rig.deinit();
+        try rig.connectSecure(.sign, pki);
+        rig.channel.security.?.credentials = other;
+        try rig.sendOpenSecure(.sign, .renew, &nonce);
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_certificate_invalid, e.code);
+        try testing.expect(std.mem.startsWith(u8, e.reason, "OpenSecureChannel certificate differs"));
+    }
+    // a SecurityPolicy#None renewal on a secured channel
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, config);
+        defer rig.deinit();
+        try rig.connectSecure(.sign, pki);
+        rig.channel.security = null;
+        rig.channel.sendService(.open_secure_channel, services.type_id.open_secure_channel_request, services.OpenSecureChannelRequest, .{
+            .request_header = rig.channel.nextRequestHeader(services.null_node_id, 10_000),
+            .client_protocol_version = 0,
+            .request_type = .renew,
+            .security_mode = .none,
+            .client_nonce = &.{},
+            .requested_lifetime = 600_000,
+        }, services.encodeOpenSecureChannelRequest) catch unreachable;
+        try rig.pump();
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_security_policy_rejected, e.code);
+        try testing.expect(std.mem.startsWith(u8, e.reason, "SecurityPolicy#None OPN on a secured channel"));
+    }
+    // an unknown policy URI is refused as such, before anything else about the message
+    {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, config);
+        defer rig.deinit();
+        try rig.handshake();
+        var frame: [64]u8 = @splat(0);
+        var w: std.Io.Writer = .fixed(frame[8..]);
+        try w.writeInt(u32, 0, .little);
+        const uri = "http://example.invalid/UnknownPolicy";
+        try w.writeInt(i32, uri.len, .little);
+        try w.writeAll(uri);
+        try w.writeInt(i32, -1, .little);
+        try w.writeInt(i32, -1, .little);
+        frame[0..3].* = "OPN".*;
+        frame[3] = 'F';
+        std.mem.writeInt(u32, frame[4..8], @intCast(8 + w.end), .little);
+        try rig.conn.feed(frame[0 .. 8 + w.end], &rig.server_out.writer, 0);
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_security_policy_rejected, e.code);
+        try testing.expectEqualStrings("unsupported SecurityPolicy", e.reason);
+    }
+    // max_certificate_len: exactly the certificate's size is accepted, one byte less is not
+    {
+        var cfg = config;
+        cfg.security.?.max_certificate_len = pki.client.certificate_der.len;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, cfg);
+        defer rig.deinit();
+        try rig.connectSecure(.sign, pki);
+    }
+    {
+        var cfg = config;
+        cfg.security.?.max_certificate_len = pki.client.certificate_der.len - 1;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, cfg);
+        defer rig.deinit();
+        try rig.handshake();
+        rig.armSecurity(.sign, pki.client, pki.server.certificate_der);
+        try rig.sendOpenSecure(.sign, .issue, &nonce);
+        const e = try readErr(&rig, &reason);
+        try testing.expectEqual(status.bad_certificate_invalid, e.code);
+        try testing.expect(std.mem.startsWith(u8, e.reason, "SenderCertificate exceeds"));
+    }
+}
+
+fn expectFault(rig: *TestRig, expected: encoding.StatusCode, result: anytype) !void {
+    if (result) |_| {
+        return error.TestExpectedServiceFault;
+    } else |err| {
+        try testing.expectEqual(error.ServiceFault, err);
+        try testing.expectEqual(expected, rig.channel.last_service_result);
+    }
+}
+
+test "services: empty and over-limit operation lists are refused, the limit itself is served, the handle is echoed" {
+    var cfg = TestRig.defaultConfig();
+    cfg.max_operations_per_request = 2;
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, cfg);
+    defer rig.deinit();
+    try rig.connect();
+    const t = testing;
+    const gpa = testing.allocator;
+    const val = services.attribute_id.value;
+    const no_enc: encoding.QualifiedName = .{ .namespace_index = 0, .name = null };
+
+    // Read
+    const read_ids = [_]services.ReadValueId{
+        .{ .node_id = rig.answer_id, .attribute_id = val, .index_range = null, .data_encoding = no_enc },
+        .{ .node_id = rig.answer_id, .attribute_id = 0, .index_range = null, .data_encoding = no_enc },
+        .{ .node_id = rig.answer_id, .attribute_id = 28, .index_range = null, .data_encoding = no_enc },
+    };
+    for ([_]usize{ 0, 1, 2, 3 }) |n| {
+        var h = rig.header(rig.authToken());
+        h.request_handle = 0xBEEF;
+        const res = rig.call(.message, services.type_id.read_request, services.ReadRequest, .{
+            .request_header = h,
+            .max_age = 0,
+            .timestamps_to_return = .both,
+            .nodes_to_read = read_ids[0..n],
+        }, services.encodeReadRequest, services.ReadResponse, services.type_id.read_response, services.decodeReadResponse, services.result_fns.read);
+        if (n == 0) {
+            try expectFault(&rig, status.bad_nothing_to_do, res);
+        } else if (n == 3) {
+            try expectFault(&rig, status.bad_too_many_operations, res);
+        } else {
+            const resp = try res;
+            defer services.freeReadResponse(gpa, resp);
+            try t.expectEqual(@as(u32, 0xBEEF), resp.response_header.request_handle);
+            try t.expectEqual(n, resp.results.?.len);
+            if (n == 2) try t.expectEqual(status.bad_attribute_id_invalid, resp.results.?[1].status.?);
+        }
+    }
+    // a ReadRequest with an invalid timestamps-to-return
+    {
+        const res = rig.call(.message, services.type_id.read_request, services.ReadRequest, .{
+            .request_header = rig.header(rig.authToken()),
+            .max_age = 0,
+            .timestamps_to_return = .invalid,
+            .nodes_to_read = read_ids[0..1],
+        }, services.encodeReadRequest, services.ReadResponse, services.type_id.read_response, services.decodeReadResponse, services.result_fns.read);
+        try expectFault(&rig, status.bad_timestamps_to_return_invalid, res);
+    }
+
+    // Write
+    const writes = [_]services.WriteValue{
+        .{ .node_id = rig.answer_id, .attribute_id = val, .index_range = null, .value = .{ .value = .{ .scalar = .{ .int32 = 5 } } } },
+        .{ .node_id = rig.answer_id, .attribute_id = 0, .index_range = null, .value = .{ .value = .{ .scalar = .{ .int32 = 5 } } } },
+        .{ .node_id = rig.answer_id, .attribute_id = val, .index_range = null, .value = .{ .value = .{ .scalar = .{ .int32 = 6 } } } },
+    };
+    for ([_]usize{ 0, 2, 3 }) |n| {
+        var h = rig.header(rig.authToken());
+        h.request_handle = 0xCAFE;
+        const res = rig.call(.message, services.type_id.write_request, services.WriteRequest, .{
+            .request_header = h,
+            .nodes_to_write = writes[0..n],
+        }, services.encodeWriteRequest, services.WriteResponse, services.type_id.write_response, services.decodeWriteResponse, services.result_fns.write);
+        if (n == 0) {
+            try expectFault(&rig, status.bad_nothing_to_do, res);
+        } else if (n == 3) {
+            try expectFault(&rig, status.bad_too_many_operations, res);
+        } else {
+            const resp = try res;
+            defer services.freeWriteResponse(gpa, resp);
+            try t.expectEqual(@as(u32, 0xCAFE), resp.response_header.request_handle);
+            try t.expectEqual(status.good, resp.results.?[0]);
+            try t.expectEqual(status.bad_attribute_id_invalid, resp.results.?[1]);
+        }
+    }
+
+    // Browse
+    const browse_one: services.BrowseDescription = .{
+        .node_id = nodestore.n0(nodestore.id.objects_folder),
+        .browse_direction = .forward,
+        .reference_type_id = services.null_node_id,
+        .include_subtypes = true,
+        .node_class_mask = 0,
+        .result_mask = 0x3f,
+    };
+    const browses = [_]services.BrowseDescription{ browse_one, browse_one, browse_one };
+    for ([_]usize{ 0, 2, 3 }) |n| {
+        var h = rig.header(rig.authToken());
+        h.request_handle = 0xF00D;
+        const res = rig.call(.message, services.type_id.browse_request, services.BrowseRequest, .{
+            .request_header = h,
+            .view = services.no_view,
+            .requested_max_references_per_node = 0,
+            .nodes_to_browse = browses[0..n],
+        }, services.encodeBrowseRequest, services.BrowseResponse, services.type_id.browse_response, services.decodeBrowseResponse, services.result_fns.browse);
+        if (n == 0) {
+            try expectFault(&rig, status.bad_nothing_to_do, res);
+        } else if (n == 3) {
+            try expectFault(&rig, status.bad_too_many_operations, res);
+        } else {
+            const resp = try res;
+            defer services.freeBrowseResponse(gpa, resp);
+            try t.expectEqual(@as(u32, 0xF00D), resp.response_header.request_handle);
+        }
+    }
+
+    // Call
+    const method_call: services.CallMethodRequest = .{ .object_id = rig.device_id, .method_id = rig.method_id, .input_arguments = &[_]encoding.Variant{.{ .scalar = .{ .int32 = 4 } }} };
+    const calls = [_]services.CallMethodRequest{ method_call, method_call, method_call };
+    for ([_]usize{ 0, 2, 3 }) |n| {
+        var h = rig.header(rig.authToken());
+        h.request_handle = 0xABBA;
+        const res = rig.call(.message, services.type_id.call_request, services.CallRequest, .{
+            .request_header = h,
+            .methods_to_call = calls[0..n],
+        }, services.encodeCallRequest, services.CallResponse, services.type_id.call_response, services.decodeCallResponse, services.result_fns.call);
+        if (n == 0) {
+            try expectFault(&rig, status.bad_nothing_to_do, res);
+        } else if (n == 3) {
+            try expectFault(&rig, status.bad_too_many_operations, res);
+        } else {
+            const resp = try res;
+            defer services.freeCallResponse(gpa, resp);
+            try t.expectEqual(@as(u32, 0xABBA), resp.response_header.request_handle);
+            try t.expectEqual(status.good, resp.results.?[0].status_code);
+        }
+    }
+}
+
+test "revision helpers: zero means the default, NaN and out-of-range requests are clamped" {
+    const t = testing;
+    const cfg = TestRig.defaultConfig();
+    // SecureChannel token lifetime
+    try t.expectEqual(@as(u32, 600_000), Connection.clampLifetime(0));
+    try t.expectEqual(@as(u32, 60_000), Connection.clampLifetime(1));
+    try t.expectEqual(@as(u32, 100_000), Connection.clampLifetime(100_000));
+    try t.expectEqual(@as(u32, 3_600_000), Connection.clampLifetime(std.math.maxInt(u32)));
+    try t.expectEqual(@as(u32, 5_000), Connection.clampLifetimeBand(0, 1_000, 5_000));
+    try t.expectEqual(@as(u32, 600_000), Connection.clampLifetimeBand(0, 1_000, 1_000_000));
+    try t.expectEqual(@as(u32, 10), Connection.clampLifetimeBand(3, 10, 20));
+    try t.expectEqual(@as(u32, 20), Connection.clampLifetimeBand(30, 10, 20));
+    try t.expectEqual(@as(u32, 20), Connection.clampLifetimeBand(7, 50, 20));
+    // subscription revisions
+    try t.expectEqual(cfg.min_publishing_interval_ms, Connection.reviseInterval(cfg, std.math.nan(f64)));
+    try t.expectEqual(cfg.min_publishing_interval_ms, Connection.reviseInterval(cfg, 0));
+    try t.expectEqual(cfg.min_publishing_interval_ms, Connection.reviseInterval(cfg, -5));
+    try t.expectEqual(@as(f64, 1000), Connection.reviseInterval(cfg, 1000));
+    try t.expectEqual(cfg.max_publishing_interval_ms, Connection.reviseInterval(cfg, 1e12));
+    try t.expectEqual(@as(u32, 10), Connection.reviseKeepAlive(0));
+    try t.expectEqual(@as(u32, 5), Connection.reviseKeepAlive(5));
+    try t.expectEqual(@as(u32, 1000), Connection.reviseKeepAlive(5000));
+    try t.expectEqual(@as(u32, 30), Connection.reviseLifetime(cfg, 0, 10));
+    try t.expectEqual(@as(u32, 30), Connection.reviseLifetime(cfg, 5, 10));
+    try t.expectEqual(@as(u32, 100), Connection.reviseLifetime(cfg, 100, 10));
+    try t.expectEqual(cfg.max_lifetime_count, Connection.reviseLifetime(cfg, std.math.maxInt(u32), 10));
+}
+
+test "limits: sessions, subscriptions, monitored items and continuation points stop exactly at their configured number" {
+    const gpa = testing.allocator;
+    const t = testing;
+    var cfg = TestRig.defaultConfig();
+    cfg.max_sessions = 1;
+    cfg.max_subscriptions_per_session = 1;
+    cfg.max_monitored_items_per_subscription = 1;
+    cfg.max_continuation_points = 1;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, cfg);
+    defer rig.deinit();
+    try rig.connect();
+
+    // a second session is refused
+    try t.expectError(error.ServiceFault, rig.createSessionNamed("second"));
+    try t.expectEqual(status.bad_too_many_sessions, rig.channel.last_service_result);
+
+    // one subscription, then BadTooManySubscriptions
+    const sub = try createSubscription(&rig, 1000, 10);
+    defer services.freeCreateSubscriptionResponse(gpa, sub);
+    try t.expectError(error.ServiceFault, createSubscription(&rig, 1000, 10));
+    try t.expectEqual(status.bad_too_many_subscriptions, rig.channel.last_service_result);
+
+    // one monitored item, then a per-item BadTooManyMonitoredItems
+    const first = try rigCreateMonitoredItem(&rig, sub.subscription_id, rig.answer_id, 1);
+    defer services.freeCreateMonitoredItemsResponse(gpa, first);
+    try t.expectEqual(status.good, first.results.?[0].status_code);
+    const second = try rigCreateMonitoredItem(&rig, sub.subscription_id, rig.answer_id, 2);
+    defer services.freeCreateMonitoredItemsResponse(gpa, second);
+    try t.expectEqual(status.bad_too_many_monitored_items, second.results.?[0].status_code);
+
+    // one continuation point, then a per-node BadNoContinuationPoints
+    const browse_objects = [_]services.BrowseDescription{.{
+        .node_id = nodestore.n0(nodestore.id.objects_folder),
+        .browse_direction = .forward,
+        .reference_type_id = services.null_node_id,
+        .include_subtypes = true,
+        .node_class_mask = 0,
+        .result_mask = 0x3f,
+    }};
+    var statuses: [2]encoding.StatusCode = undefined;
+    for (&statuses) |*s| {
+        const resp = try rig.call(.message, services.type_id.browse_request, services.BrowseRequest, .{
+            .request_header = rig.header(rig.authToken()),
+            .view = services.no_view,
+            .requested_max_references_per_node = 1,
+            .nodes_to_browse = &browse_objects,
+        }, services.encodeBrowseRequest, services.BrowseResponse, services.type_id.browse_response, services.decodeBrowseResponse, services.result_fns.browse);
+        defer services.freeBrowseResponse(gpa, resp);
+        s.* = resp.results.?[0].status_code;
+    }
+    try t.expectEqual(status.good, statuses[0]);
+    try t.expectEqual(status.bad_no_continuation_points, statuses[1]);
+}
+
+test "Server session table: lookup length, removal identity, channel release count and the exact expiry instant" {
+    const gpa = testing.allocator;
+    const t = testing;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    try rig.createSessionNamed("second");
+    try t.expectEqual(@as(usize, 2), rig.srv.sessions.items.len);
+    const first = rig.srv.sessions.items[0];
+    const second = rig.srv.sessions.items[1];
+
+    // the authentication token is exactly 32 bytes
+    var token: [33]u8 = undefined;
+    @memcpy(token[0..32], &first.auth_token);
+    token[32] = 0;
+    const exact: encoding.NodeId = .{ .byte_string = .{ .namespace = 0, .id = token[0..32] } };
+    const longer: encoding.NodeId = .{ .byte_string = .{ .namespace = 0, .id = token[0..33] } };
+    const shorter: encoding.NodeId = .{ .byte_string = .{ .namespace = 0, .id = token[0..31] } };
+    try t.expectEqual(@as(?*Session, first), rig.srv.findSession(exact));
+    try t.expectEqual(@as(?*Session, null), rig.srv.findSession(longer));
+    try t.expectEqual(@as(?*Session, null), rig.srv.findSession(shorter));
+
+    // channel 0 never matches anything; the rig's channel owns both sessions
+    try t.expectEqual(@as(usize, 0), rig.srv.closeChannelSessions(0));
+    try t.expectEqual(@as(usize, 2), rig.srv.sessionsOnChannel(rig.conn.channel_id));
+
+    // expiry: alive at exactly the timeout, gone one millisecond later
+    first.last_activity_ms = 0;
+    first.timeout_ms = 1000;
+    second.last_activity_ms = 10_000_000;
+    rig.srv.expireSessions(1000);
+    try t.expectEqual(@as(usize, 2), rig.srv.sessions.items.len);
+    rig.srv.expireSessions(1001);
+    try t.expectEqual(@as(usize, 1), rig.srv.sessions.items.len);
+    try t.expectEqual(second, rig.srv.sessions.items[0]);
+
+    // removing a session removes that one, not the first in the table
+    try rig.createSessionNamed("third");
+    const third = rig.srv.sessions.items[1];
+    rig.srv.removeSession(third);
+    try t.expectEqual(@as(usize, 1), rig.srv.sessions.items.len);
+    try t.expectEqual(second, rig.srv.sessions.items[0]);
+
+    // closing the channel frees what is left and says how many
+    try t.expectEqual(@as(usize, 1), rig.srv.closeChannelSessions(rig.conn.channel_id));
+    try t.expectEqual(@as(usize, 0), rig.srv.sessions.items.len);
+}
+
+test "Subscription sequence numbers wrap past 4294967295 to 1, never to 0" {
+    var sub: Subscription = undefined;
+    sub.next_sequence_number = std.math.maxInt(u32) - 1;
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32) - 1), sub.takeSequenceNumber());
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), sub.next_sequence_number);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), sub.takeSequenceNumber());
+    try testing.expectEqual(@as(u32, 1), sub.next_sequence_number);
+}
+
+test "identity: an absent or empty token is Anonymous, and only where anonymous access is allowed" {
+    const gpa = testing.allocator;
+    for ([_]bool{ true, false }) |allow| {
+        var cfg = TestRig.defaultConfig();
+        cfg.allow_anonymous = allow;
+        var rig: TestRig = undefined;
+        try rig.init(gpa, cfg);
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try rig.createSession();
+        var buf: [128]u8 = undefined;
+        const tokens = [_]encoding.ExtensionObject{
+            .{ .type_id = services.null_node_id, .encoding = .no_body },
+            .{ .type_id = services.null_node_id, .encoding = .byte_string, .body = "" },
+            try rig.anonymousToken(&buf),
+        };
+        for (tokens) |token| {
+            if (rig.activateSession(token)) |_| {
+                try testing.expect(allow);
+            } else |_| {
+                try testing.expect(!allow);
+                try testing.expectEqual(status.bad_identity_token_rejected, rig.channel.last_service_result);
+            }
+        }
+    }
+}
+
+test "secure CreateSession: the certificate must be the channel's and the nonce exactly 32 bytes" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x37)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var other: security.Credentials = undefined;
+    try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
+        .modulus_bits = 512,
+        .common_name = "session cert impostor",
+        .not_before = "190101000000Z",
+        .not_after = "300101000000Z",
+    }, &other);
+    defer other.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    try rig.handshake();
+    rig.armSecurity(.sign, pki.client, pki.server.certificate_der);
+    _ = try rig.openChannelSecure(.sign, .issue, 600_000);
+
+    const Try = struct {
+        fn create(r: *TestRig, cert: ?[]const u8, nonce: []const u8) !void {
+            const response = try r.call(
+                .message,
+                services.type_id.create_session_request,
+                services.CreateSessionRequest,
+                .{
+                    .request_header = r.header(services.null_node_id),
+                    .client_description = .{
+                        .application_uri = "urn:zig-libs:opcua:test-client",
+                        .product_uri = "urn:zig-libs:opcua",
+                        .application_name = .{ .locale = "en", .text = "t" },
+                        .application_type = .client,
+                        .gateway_server_uri = null,
+                        .discovery_profile_uri = null,
+                        .discovery_urls = null,
+                    },
+                    .server_uri = null,
+                    .endpoint_url = test_endpoint_url,
+                    .session_name = "s",
+                    .client_nonce = nonce,
+                    .client_certificate = cert,
+                    .requested_session_timeout = 120_000,
+                    .max_response_message_size = 0,
+                },
+                services.encodeCreateSessionRequest,
+                services.CreateSessionResponse,
+                services.type_id.create_session_response,
+                services.decodeCreateSessionResponse,
+                services.result_fns.create_session,
+            );
+            defer services.freeCreateSessionResponse(r.gpa, response);
+            encoding.freeNodeId(r.gpa, response.authentication_token);
+            encoding.freeNodeId(r.gpa, response.session_id);
+        }
+    };
+    const nonce33: [33]u8 = @splat(7);
+    try testing.expectError(error.ServiceFault, Try.create(&rig, null, nonce33[0..32]));
+    try testing.expectEqual(status.bad_certificate_invalid, rig.channel.last_service_result);
+    try testing.expectError(error.ServiceFault, Try.create(&rig, other.certificate_der, nonce33[0..32]));
+    try testing.expectEqual(status.bad_certificate_invalid, rig.channel.last_service_result);
+    try testing.expectError(error.ServiceFault, Try.create(&rig, pki.client.certificate_der, nonce33[0..31]));
+    try testing.expectEqual(status.bad_nonce_invalid, rig.channel.last_service_result);
+    try testing.expectError(error.ServiceFault, Try.create(&rig, pki.client.certificate_der, nonce33[0..33]));
+    try testing.expectEqual(status.bad_nonce_invalid, rig.channel.last_service_result);
+    try Try.create(&rig, pki.client.certificate_der, nonce33[0..32]);
+}
+
+fn browseDevice(rig: *TestRig, direction: services.BrowseDirection, ref_type: encoding.NodeId, subtypes: bool, class_mask: u32, result_mask: u32) !services.BrowseResponse {
+    const nodes = [_]services.BrowseDescription{.{
+        .node_id = rig.device_id,
+        .browse_direction = direction,
+        .reference_type_id = ref_type,
+        .include_subtypes = subtypes,
+        .node_class_mask = class_mask,
+        .result_mask = result_mask,
+    }};
+    return rig.call(.message, services.type_id.browse_request, services.BrowseRequest, .{
+        .request_header = rig.header(rig.authToken()),
+        .view = services.no_view,
+        .requested_max_references_per_node = 0,
+        .nodes_to_browse = &nodes,
+    }, services.encodeBrowseRequest, services.BrowseResponse, services.type_id.browse_response, services.decodeBrowseResponse, services.result_fns.browse);
+}
+
+test "browse: direction, reference type (with and without subtypes), node class mask and result mask each take effect" {
+    const gpa = testing.allocator;
+    const t = testing;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const n0 = nodestore.n0;
+    const ids = nodestore.id;
+    const Case = struct { dir: services.BrowseDirection, ref: encoding.NodeId, sub: bool, classes: u32, count: usize };
+    const cases = [_]Case{
+        .{ .dir = .forward, .ref = services.null_node_id, .sub = true, .classes = 0, .count = 3 },
+        .{ .dir = .inverse, .ref = services.null_node_id, .sub = true, .classes = 0, .count = 1 },
+        .{ .dir = .both, .ref = services.null_node_id, .sub = true, .classes = 0, .count = 4 },
+        .{ .dir = .forward, .ref = n0(ids.has_component), .sub = false, .classes = 0, .count = 2 },
+        .{ .dir = .forward, .ref = n0(ids.hierarchical_references), .sub = false, .classes = 0, .count = 0 },
+        .{ .dir = .forward, .ref = n0(ids.hierarchical_references), .sub = true, .classes = 0, .count = 2 },
+        .{ .dir = .forward, .ref = services.null_node_id, .sub = true, .classes = 2, .count = 1 }, // Variable
+        .{ .dir = .forward, .ref = services.null_node_id, .sub = true, .classes = 4, .count = 1 }, // Method
+        .{ .dir = .forward, .ref = services.null_node_id, .sub = true, .classes = 6, .count = 2 },
+    };
+    for (cases) |c| {
+        const resp = try browseDevice(&rig, c.dir, c.ref, c.sub, c.classes, nodestore.result_mask.all);
+        defer services.freeBrowseResponse(gpa, resp);
+        try t.expectEqual(status.good, resp.results.?[0].status_code);
+        try t.expectEqual(c.count, if (resp.results.?[0].references) |r| r.len else 0);
+    }
+
+    // result mask: each bit controls exactly its own field
+    const rm = nodestore.result_mask;
+    const bits = [_]u32{ rm.reference_type_id, rm.is_forward, rm.node_class, rm.browse_name, rm.display_name, rm.type_definition };
+    for (bits, 0..) |bit, which| {
+        const resp = try browseDevice(&rig, .forward, n0(ids.has_component), false, 0, bit);
+        defer services.freeBrowseResponse(gpa, resp);
+        const ref = resp.results.?[0].references.?[0];
+        try t.expectEqual(which == 0, !services.nodeIdEql(ref.reference_type_id, services.null_node_id));
+        try t.expectEqual(which == 1, ref.is_forward);
+        try t.expectEqual(which == 2, ref.node_class != .unspecified);
+        try t.expectEqual(which == 3, ref.browse_name.name != null);
+        try t.expectEqual(which == 4, ref.display_name.text != null);
+        try t.expectEqual(which == 5, !services.nodeIdEql(ref.type_definition.node_id, services.null_node_id));
+    }
+    // an unknown reference type is refused per node
+    const bad = try browseDevice(&rig, .forward, n0(999_999), true, 0, rm.all);
+    defer services.freeBrowseResponse(gpa, bad);
+    try t.expectEqual(status.bad_reference_type_id_invalid, bad.results.?[0].status_code);
+}
+
+test "subscriptions: Modify and SetPublishingMode change exactly the stored fields, echo the handle, and refuse unknown ids" {
+    const gpa = testing.allocator;
+    const t = testing;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const created = try createSubscription(&rig, 1000, 10);
+    defer services.freeCreateSubscriptionResponse(gpa, created);
+    const sub = rig.srv.sessions.items[0].subscriptions.items[0];
+
+    var h = rig.header(rig.authToken());
+    h.request_handle = 0x1234;
+    const mod = try rig.call(.message, services.type_id.modify_subscription_request, services.ModifySubscriptionRequest, .{
+        .request_header = h,
+        .subscription_id = created.subscription_id,
+        .requested_publishing_interval = 500,
+        .requested_lifetime_count = 100,
+        .requested_max_keep_alive_count = 7,
+        .max_notifications_per_publish = 5,
+        .priority = 9,
+    }, services.encodeModifySubscriptionRequest, services.ModifySubscriptionResponse, services.type_id.modify_subscription_response, services.decodeModifySubscriptionResponse, services.result_fns.modify_subscription);
+    defer services.freeModifySubscriptionResponse(gpa, mod);
+    try t.expectEqual(@as(u32, 0x1234), mod.response_header.request_handle);
+    try t.expectEqual(@as(f64, 500), mod.revised_publishing_interval);
+    try t.expectEqual(@as(f64, 500), sub.publishing_interval_ms);
+    try t.expectEqual(@as(u32, 7), sub.max_keep_alive_count);
+    try t.expectEqual(@as(u32, 100), sub.lifetime_count);
+    try t.expectEqual(@as(u32, 5), sub.max_notifications_per_publish);
+    try t.expectEqual(@as(u8, 9), sub.priority);
+    try t.expectEqual(rig.now_ms + 500, sub.next_publish_ms);
+
+    // 0 = the server's own cap
+    const mod0 = try rig.call(.message, services.type_id.modify_subscription_request, services.ModifySubscriptionRequest, .{
+        .request_header = rig.header(rig.authToken()),
+        .subscription_id = created.subscription_id,
+        .requested_publishing_interval = 500,
+        .requested_lifetime_count = 100,
+        .requested_max_keep_alive_count = 7,
+        .max_notifications_per_publish = 0,
+        .priority = 0,
+    }, services.encodeModifySubscriptionRequest, services.ModifySubscriptionResponse, services.type_id.modify_subscription_response, services.decodeModifySubscriptionResponse, services.result_fns.modify_subscription);
+    defer services.freeModifySubscriptionResponse(gpa, mod0);
+    try t.expectEqual(rig.srv.config.max_notifications_per_publish, sub.max_notifications_per_publish);
+
+    // SetPublishingMode: a known and an unknown id, then the same on an empty list
+    var h2 = rig.header(rig.authToken());
+    h2.request_handle = 0x4321;
+    const ids = [_]u32{ created.subscription_id, created.subscription_id + 1000 };
+    const set = try rig.call(.message, services.type_id.set_publishing_mode_request, services.SetPublishingModeRequest, .{
+        .request_header = h2,
+        .publishing_enabled = false,
+        .subscription_ids = &ids,
+    }, services.encodeSetPublishingModeRequest, services.SetPublishingModeResponse, services.type_id.set_publishing_mode_response, services.decodeSetPublishingModeResponse, services.result_fns.set_publishing_mode);
+    defer services.freeSetPublishingModeResponse(gpa, set);
+    try t.expectEqual(@as(u32, 0x4321), set.response_header.request_handle);
+    try t.expectEqual(status.good, set.results.?[0]);
+    try t.expectEqual(status.bad_subscription_id_invalid, set.results.?[1]);
+    try t.expect(!sub.publishing_enabled);
+    try t.expectError(error.ServiceFault, rig.call(.message, services.type_id.set_publishing_mode_request, services.SetPublishingModeRequest, .{
+        .request_header = rig.header(rig.authToken()),
+        .publishing_enabled = true,
+        .subscription_ids = &.{},
+    }, services.encodeSetPublishingModeRequest, services.SetPublishingModeResponse, services.type_id.set_publishing_mode_response, services.decodeSetPublishingModeResponse, services.result_fns.set_publishing_mode));
+    try t.expectEqual(status.bad_nothing_to_do, rig.channel.last_service_result);
+    try t.expect(!sub.publishing_enabled);
+}

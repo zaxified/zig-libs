@@ -2050,3 +2050,144 @@ test "DoS: huge Variant array length claim fails on EndOfStream, not OutOfMemory
     // ~2 GiB preallocation on the raw 0x7FFFFFFF claim.
     try testing.expectError(error.EndOfStream, d.decodeVariant());
 }
+
+// ── whole-module mutation audit (2026-11-18): refusals, mask bits, boundaries ──
+
+/// A slice whose length claims `n` elements without any backing memory; only
+/// for code paths that must refuse on the length alone, before touching it.
+fn claimedSlice(comptime T: type, n: usize) []const T {
+    return @as([*]const T, @ptrFromInt(@alignOf(T)))[0..n];
+}
+
+fn skipUnlessWide() !void {
+    if (@sizeOf(usize) < 8) return error.SkipZigTest;
+}
+
+fn noopItem(_: *Encoder, _: u8) EncodeError!void {}
+
+test "encoders refuse a length above Int32 before touching the data" {
+    try skipUnlessWide();
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = Encoder.init(&w);
+    const over: usize = @as(usize, std.math.maxInt(i32)) + 1;
+    try std.testing.expectError(error.ValueTooLarge, e.encodeString(claimedSlice(u8, over)));
+    try std.testing.expectError(error.ValueTooLarge, encodeVariantArraySlice(&e, u8, claimedSlice(u8, over), noopItem));
+    try std.testing.expectError(error.ValueTooLarge, e.encodeVariant(.{ .array = .{
+        .items = .{ .int32 = &.{} },
+        .dimensions = claimedSlice(i32, over),
+    } }));
+}
+
+test "NodeId numeric form boundaries: two-byte, four-byte and full forms" {
+    const cases = [_]struct { ns: u16, id: u32, len: usize }{
+        .{ .ns = 0, .id = 255, .len = 2 },
+        .{ .ns = 0, .id = 256, .len = 4 },
+        .{ .ns = 1, .id = 0, .len = 4 },
+        .{ .ns = 255, .id = 65535, .len = 4 },
+        .{ .ns = 255, .id = 65536, .len = 7 },
+        .{ .ns = 256, .id = 0, .len = 7 },
+        .{ .ns = 0, .id = 65536, .len = 7 },
+    };
+    for (cases) |c| {
+        var buf: [16]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var e = Encoder.init(&w);
+        try e.encodeNodeId(.{ .numeric = .{ .namespace = c.ns, .id = c.id } });
+        try std.testing.expectEqual(c.len, w.end);
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, std.testing.allocator);
+        const back = try d.decodeNodeId();
+        try std.testing.expectEqual(c.ns, back.numeric.namespace);
+        try std.testing.expectEqual(c.id, back.numeric.id);
+    }
+}
+
+test "DiagnosticInfo: every field has its own mask bit and round-trips alone and together" {
+    const gpa = std.testing.allocator;
+    const inner: DiagnosticInfo = .{ .symbolic_id = 9 };
+    var inner_copy = inner;
+    const variants = [_]DiagnosticInfo{
+        .{ .symbolic_id = 1 },
+        .{ .namespace_uri = 2 },
+        .{ .locale = 3 },
+        .{ .locale_specific_text = 4 },
+        .{ .additional_info = "info" },
+        .{ .inner_status_code = 0x80010000 },
+        .{ .inner_diagnostic_info = &inner_copy },
+        .{ .symbolic_id = 1, .namespace_uri = 2, .locale = 3, .locale_specific_text = 4, .additional_info = "info", .inner_status_code = 0x80010000, .inner_diagnostic_info = &inner_copy },
+    };
+    const masks = [_]u8{ 0x01, 0x02, 0x08, 0x04, 0x10, 0x20, 0x40, 0x7f };
+    for (variants, masks) |v, mask| {
+        var buf: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var e = Encoder.init(&w);
+        try e.encodeDiagnosticInfo(v);
+        try std.testing.expectEqual(mask, buf[0]);
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = Decoder.init(&r, gpa);
+        const back = try d.decodeDiagnosticInfo();
+        defer if (back.inner_diagnostic_info) |p| gpa.destroy(p);
+        defer if (back.additional_info) |s| gpa.free(s);
+        try std.testing.expectEqual(v.symbolic_id, back.symbolic_id);
+        try std.testing.expectEqual(v.namespace_uri, back.namespace_uri);
+        try std.testing.expectEqual(v.locale, back.locale);
+        try std.testing.expectEqual(v.locale_specific_text, back.locale_specific_text);
+        try std.testing.expectEqual(v.inner_status_code, back.inner_status_code);
+        try std.testing.expectEqual(v.inner_diagnostic_info != null, back.inner_diagnostic_info != null);
+        if (v.additional_info) |s| try std.testing.expectEqualStrings(s, back.additional_info.?);
+        // the whole encoding was consumed
+        try std.testing.expectError(error.EndOfStream, r.takeByte());
+    }
+}
+
+test "decoders refuse reserved mask bits and a length below -1" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const t = std.testing;
+    {
+        var r: std.Io.Reader = .fixed(&[_]u8{0x80});
+        var d = Decoder.init(&r, a);
+        try t.expectError(error.BadEncodingByte, d.decodeDiagnosticInfo());
+    }
+    for ([_]u8{ 0x40, 0x80 }) |m| {
+        var r: std.Io.Reader = .fixed(&[_]u8{m});
+        var d = Decoder.init(&r, a);
+        try t.expectError(error.BadEncodingByte, d.decodeDataValue());
+    }
+    {
+        var r: std.Io.Reader = .fixed(&[_]u8{0x04});
+        var d = Decoder.init(&r, a);
+        try t.expectError(error.BadEncodingByte, d.decodeLocalizedText());
+    }
+    {
+        var r: std.Io.Reader = .fixed(&[_]u8{ 0xfe, 0xff, 0xff, 0xff });
+        var d = Decoder.init(&r, a);
+        try t.expectError(error.BadLength, d.decodeString());
+    }
+    {
+        // Variant: Int32 array (7 | 0x80) with length -2
+        var r: std.Io.Reader = .fixed(&[_]u8{ 0x87, 0xfe, 0xff, 0xff, 0xff });
+        var d = Decoder.init(&r, a);
+        try t.expectError(error.BadLength, d.decodeVariant());
+    }
+}
+
+test "DiagnosticInfo nesting: a chain of 101 levels decodes, 102 is NestingTooDeep" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_]struct { levels: usize, ok: bool }{ .{ .levels = max_diagnostic_depth + 1, .ok = true }, .{ .levels = max_diagnostic_depth + 2, .ok = false } }) |c| {
+        const wire = try a.alloc(u8, c.levels);
+        @memset(wire[0 .. c.levels - 1], 0x40);
+        wire[c.levels - 1] = 0x00;
+        var r: std.Io.Reader = .fixed(wire);
+        var d = Decoder.init(&r, a);
+        if (c.ok) {
+            _ = try d.decodeDiagnosticInfo();
+        } else {
+            try std.testing.expectError(error.NestingTooDeep, d.decodeDiagnosticInfo());
+        }
+    }
+}

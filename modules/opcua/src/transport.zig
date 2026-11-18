@@ -500,3 +500,97 @@ test "negatives: truncated header surfaces EndOfStream, not a panic" {
     var body_buf: [8]u8 = undefined;
     try testing.expectError(error.EndOfStream, c.recvChunk(&body_buf));
 }
+
+// ── whole-module mutation audit (2026-11-18): boundary and refusal pins ──
+
+fn wireFrame(buf: []u8, code: []const u8, chunk_byte: u8, size: u32, body: []const u8) []const u8 {
+    @memcpy(buf[0..3], code);
+    buf[3] = chunk_byte;
+    std.mem.writeInt(u32, buf[4..8], size, .little);
+    @memcpy(buf[8..][0..body.len], body);
+    return buf[0 .. 8 + body.len];
+}
+
+fn helloAgainst(reply: []const u8) TransportError!Acknowledge {
+    var sink: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&sink);
+    var r: std.Io.Reader = .fixed(reply);
+    var c = Connection.init(&r, &w);
+    return c.hello(.{
+        .protocol_version = 0,
+        .receive_buffer_size = 8192,
+        .send_buffer_size = 8192,
+        .max_message_size = 0,
+        .max_chunk_count = 0,
+        .endpoint_url = "opc.tcp://h:1/",
+    });
+}
+
+fn ackBody(buf: *[24]u8, version: u32) []const u8 {
+    for (0..5) |i| std.mem.writeInt(u32, buf[i * 4 ..][0..4], if (i == 0) version else 8192, .little);
+    return buf[0..20];
+}
+
+test "MessageChunkAssembler: a message that exactly fills the buffer is accepted, one byte more is not" {
+    const testing = std.testing;
+    var store: [4]u8 = undefined;
+    var a = MessageChunkAssembler.init(&store);
+    try testing.expectEqual(@as(?[]const u8, null), try a.feed(.intermediate, "ab"));
+    const done = (try a.feed(.final, "cd")).?;
+    try testing.expectEqualSlices(u8, "abcd", done);
+    // reset after the final chunk: the next message starts at zero
+    try testing.expectEqual(@as(usize, 0), a.len);
+    try testing.expectEqualSlices(u8, "wxyz", (try a.feed(.final, "wxyz")).?);
+    try testing.expectError(error.MessageTooLarge, a.feed(.final, "12345"));
+    // an intermediate chunk fills it exactly too
+    try testing.expectEqual(@as(?[]const u8, null), try a.feed(.intermediate, "abcd"));
+    try testing.expectError(error.MessageTooLarge, a.feed(.intermediate, "e"));
+}
+
+test "Connection.hello: every malformed Acknowledge is refused with its own error" {
+    const testing = std.testing;
+    var fb: [64]u8 = undefined;
+    var bb: [24]u8 = undefined;
+    const body = ackBody(&bb, 0);
+    // the well-formed one first
+    const ok = try helloAgainst(wireFrame(&fb, "ACK", 'F', 8 + 20, body));
+    try testing.expectEqual(@as(u32, 8192), ok.receive_buffer_size);
+    // wrong message type, wrong chunk type, wrong body length (both sides of 20)
+    try testing.expectError(error.BadMessageType, helloAgainst(wireFrame(&fb, "MSG", 'F', 8 + 20, body)));
+    try testing.expectError(error.BadChunkType, helloAgainst(wireFrame(&fb, "ACK", 'C', 8 + 20, body)));
+    bb[20] = 0;
+    try testing.expectError(error.MessageTooLarge, helloAgainst(wireFrame(&fb, "ACK", 'F', 8 + 21, bb[0..21])));
+    try testing.expectError(error.MessageTooLarge, helloAgainst(wireFrame(&fb, "ACK", 'F', 8 + 19, bb[0..19])));
+    // a different protocol version than the one requested
+    const v1 = ackBody(&bb, 1);
+    try testing.expectError(error.ProtocolVersionMismatch, helloAgainst(wireFrame(&fb, "ACK", 'F', 8 + 20, v1)));
+    // an ERR reply is ServerError, not BadMessageType
+    try testing.expectError(error.ServerError, helloAgainst(wireFrame(&fb, "ERR", 'F', 8 + 20, body)));
+}
+
+test "Connection.recvChunk: size 8 is an empty body, size 7 is refused, a body exactly the buffer long fits" {
+    const testing = std.testing;
+    var fb: [64]u8 = undefined;
+    var body_buf: [4]u8 = undefined;
+    {
+        var r: std.Io.Reader = .fixed(wireFrame(&fb, "MSG", 'F', 8, ""));
+        var c = Connection.init(&r, undefined);
+        const chunk = try c.recvChunk(&body_buf);
+        try testing.expectEqual(@as(usize, 0), chunk.body.len);
+    }
+    {
+        var r: std.Io.Reader = .fixed(wireFrame(&fb, "MSG", 'F', 7, ""));
+        var c = Connection.init(&r, undefined);
+        try testing.expectError(error.BadMessageType, c.recvChunk(&body_buf));
+    }
+    {
+        var r: std.Io.Reader = .fixed(wireFrame(&fb, "MSG", 'F', 8 + 4, "abcd"));
+        var c = Connection.init(&r, undefined);
+        try testing.expectEqualSlices(u8, "abcd", (try c.recvChunk(&body_buf)).body);
+    }
+    {
+        var r: std.Io.Reader = .fixed(wireFrame(&fb, "MSG", 'F', 8 + 5, "abcde"));
+        var c = Connection.init(&r, undefined);
+        try testing.expectError(error.MessageTooLarge, c.recvChunk(&body_buf));
+    }
+}

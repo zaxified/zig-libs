@@ -1889,3 +1889,139 @@ test "addNode twice replaces attributes but keeps references" {
     try testing.expectEqual(refs_before, s.getNode(nid).?.references.items.len);
     try testing.expectEqual(@as(i32, 9), s.readAttribute(nid, services.attribute_id.value).value.?.scalar.int32);
 }
+
+// ── whole-module mutation audit (2026-11-18): hierarchy walks, equality, access ──
+
+fn dupOptStrArrayAndFree(a: std.mem.Allocator) !void {
+    const items = [_]?[]const u8{ "one", null, "three" };
+    const copy = (try dupOptStrArray(a, &items)).?;
+    for (copy) |s| if (s) |bytes| a.free(bytes);
+    a.free(copy);
+}
+
+test "dupOptStrArray leaks nothing when an allocation fails part-way" {
+    try testing.checkAllAllocationFailures(testing.allocator, dupOptStrArrayAndFree, .{});
+}
+
+test "isSubtypeOf follows at most max_subtype_depth levels and only HasSubtype" {
+    var s = try testStore();
+    defer s.deinit();
+    const ns = try s.addNamespace("urn:zig-libs:opcua:test");
+    const count = max_subtype_depth + 2;
+    var names: [count][16]u8 = undefined;
+    var ids: [count]encoding.NodeId = undefined;
+    for (0..count) |i| {
+        const nm = try std.fmt.bufPrint(&names[i], "chain{d}", .{i});
+        ids[i] = .{ .string = .{ .namespace = ns, .id = nm } };
+        try s.addFolder(.{ .node_id = ids[i], .parent_id = n0(id.objects_folder), .browse_name = .{ .namespace_index = ns, .name = nm } });
+    }
+    for (1..count) |i| try s.addReference(ids[i - 1], n0(id.has_subtype), ids[i]);
+    // distance exactly max_subtype_depth is found, one more is not
+    try testing.expect(s.isSubtypeOf(ids[max_subtype_depth], ids[0]));
+    try testing.expect(!s.isSubtypeOf(ids[max_subtype_depth + 1], ids[0]));
+    // an Organizes parent is not a supertype
+    try testing.expect(!s.isSubtypeOf(ids[0], n0(id.objects_folder)));
+}
+
+test "typeDefinition: only a forward HasTypeDefinition counts" {
+    var s = try testStore();
+    defer s.deinit();
+    const ns = try s.addNamespace("urn:zig-libs:opcua:test");
+    const var_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "v" } };
+    try s.addVariable(.{ .node_id = var_id, .parent_id = n0(id.objects_folder), .browse_name = .{ .namespace_index = ns, .name = "v" } });
+    try testing.expect(services.nodeIdEql(s.typeDefinition(var_id).?, n0(id.base_data_variable_type)));
+    // the type node only has the INVERSE half of that reference
+    try testing.expectEqual(@as(?encoding.NodeId, null), s.typeDefinition(n0(id.base_data_variable_type)));
+    // a method has no type definition even if it has other forward references
+    const m_id: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "m" } };
+    try s.addMethod(.{ .node_id = m_id, .parent_id = n0(id.objects_folder), .browse_name = .{ .namespace_index = ns, .name = "m" } });
+    try s.addReference(m_id, n0(id.has_component), var_id);
+    try testing.expectEqual(@as(?encoding.NodeId, null), s.typeDefinition(m_id));
+    // and addMethod without a DisplayName falls back to the browse name
+    const dn = s.readAttribute(m_id, services.attribute_id.display_name);
+    try testing.expectEqualStrings("m", dn.value.?.scalar.localized_text.text.?);
+}
+
+test "dataValueChanged: arrays, mixed shapes and element-wise equality" {
+    const DV = encoding.DataValue;
+    const arr = struct {
+        fn of(items: encoding.VariantArrayItems) DV {
+            return .{ .value = .{ .array = .{ .items = items } } };
+        }
+    }.of;
+    const strs_a = [_]?[]const u8{ "a", "b" };
+    const strs_b = [_]?[]const u8{ "a", "c" };
+    const strs_c = [_]?[]const u8{"a"};
+    try testing.expect(!dataValueChanged(arr(.{ .string = &strs_a }), arr(.{ .string = &strs_a })));
+    try testing.expect(dataValueChanged(arr(.{ .string = &strs_a }), arr(.{ .string = &strs_b })));
+    try testing.expect(dataValueChanged(arr(.{ .string = &strs_a }), arr(.{ .string = &strs_c })));
+    const nids_a = [_]encoding.NodeId{ n0(1), n0(2) };
+    const nids_b = [_]encoding.NodeId{ n0(1), n0(3) };
+    const nids_c = [_]encoding.NodeId{n0(1)};
+    try testing.expect(!dataValueChanged(arr(.{ .node_id = &nids_a }), arr(.{ .node_id = &nids_a })));
+    try testing.expect(dataValueChanged(arr(.{ .node_id = &nids_a }), arr(.{ .node_id = &nids_b })));
+    try testing.expect(dataValueChanged(arr(.{ .node_id = &nids_a }), arr(.{ .node_id = &nids_c })));
+    const g1: encoding.Guid = std.mem.zeroes(encoding.Guid);
+    var g2 = g1;
+    g2.data1 = 7;
+    const guids_a = [_]encoding.Guid{ g1, g1 };
+    const guids_b = [_]encoding.Guid{ g1, g2 };
+    const guids_c = [_]encoding.Guid{g1};
+    try testing.expect(!dataValueChanged(arr(.{ .guid = &guids_a }), arr(.{ .guid = &guids_a })));
+    try testing.expect(dataValueChanged(arr(.{ .guid = &guids_a }), arr(.{ .guid = &guids_b })));
+    try testing.expect(dataValueChanged(arr(.{ .guid = &guids_a }), arr(.{ .guid = &guids_c })));
+    // a different array element type, and an array against a scalar
+    const ints = [_]i32{1};
+    const uints = [_]u32{1};
+    try testing.expect(dataValueChanged(arr(.{ .int32 = &ints }), arr(.{ .uint32 = &uints })));
+    try testing.expect(dataValueChanged(arr(.{ .int32 = &ints }), .{ .value = .{ .scalar = .{ .int32 = 1 } } }));
+    try testing.expect(!dataValueChanged(arr(.{ .int32 = &ints }), arr(.{ .int32 = &ints })));
+}
+
+test "access rules: a write-only Variable is not readable; rank and built-in type are enforced on write" {
+    var s = try testStore();
+    defer s.deinit();
+    const ns = try s.addNamespace("urn:zig-libs:opcua:test");
+    const mk = struct {
+        fn add(st: *NodeStore, n: u16, name: []const u8, dt: u32, rank: i32, level: u8) !encoding.NodeId {
+            const nid: encoding.NodeId = .{ .string = .{ .namespace = n, .id = name } };
+            try st.addVariable(.{
+                .node_id = nid,
+                .parent_id = n0(id.objects_folder),
+                .browse_name = .{ .namespace_index = n, .name = name },
+                .value = .{ .scalar = .{ .int32 = 1 } },
+                .data_type = n0(dt),
+                .value_rank = rank,
+                .access_level = level,
+            });
+            return nid;
+        }
+    };
+    const val = services.attribute_id.value;
+    const wo = try mk.add(&s, ns, "wo", id.int32, value_rank.scalar, access_level.current_write);
+    try testing.expectEqual(status.bad_not_readable, s.readAttribute(wo, val).status.?);
+
+    const scalar_var = try mk.add(&s, ns, "sv", id.int32, value_rank.scalar, access_level.read_write);
+    const ints = [_]i32{ 1, 2 };
+    try testing.expectEqual(status.bad_type_mismatch, try s.writeAttribute(scalar_var, val, .{ .value = .{ .array = .{ .items = .{ .int32 = &ints } } } }, 1));
+    const array_var = try mk.add(&s, ns, "av", id.int32, 1, access_level.read_write);
+    try testing.expectEqual(status.bad_type_mismatch, try s.writeAttribute(array_var, val, .{ .value = .{ .scalar = .{ .int32 = 5 } } }, 1));
+    try testing.expectEqual(status.good, try s.writeAttribute(array_var, val, .{ .value = .{ .array = .{ .items = .{ .int32 = &ints } } } }, 1));
+
+    // DataType 0 and anything above the built-in range accept any value; 25 (DiagnosticInfo) is checked
+    const dt0 = try mk.add(&s, ns, "dt0", 0, value_rank.scalar, access_level.read_write);
+    const dt26 = try mk.add(&s, ns, "dt26", 26, value_rank.scalar, access_level.read_write);
+    const dt25 = try mk.add(&s, ns, "dt25", 25, value_rank.scalar, access_level.read_write);
+    const text: encoding.DataValue = .{ .value = .{ .scalar = .{ .string = "x" } } };
+    try testing.expectEqual(status.good, try s.writeAttribute(dt0, val, text, 1));
+    try testing.expectEqual(status.good, try s.writeAttribute(dt26, val, text, 1));
+    try testing.expectEqual(status.bad_type_mismatch, try s.writeAttribute(dt25, val, text, 1));
+}
+
+test "setValue on a VariableType node replaces its value" {
+    var s = try testStore();
+    defer s.deinit();
+    try testing.expectEqual(status.good, try s.setValue(n0(id.base_data_variable_type), .{ .scalar = .{ .int32 = 77 } }, 5));
+    const dv = s.readAttribute(n0(id.base_data_variable_type), services.attribute_id.value);
+    try testing.expectEqual(@as(i32, 77), dv.value.?.scalar.int32);
+}

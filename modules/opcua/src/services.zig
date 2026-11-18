@@ -4774,3 +4774,137 @@ test "hostile server: on a signed channel the response SequenceNumber must be th
         }
     }
 }
+
+// ── whole-module mutation audit (2026-11-18): frees, refusals, length checks ──
+
+fn owningExtensionObject() encoding.ExtensionObject {
+    return .{ .type_id = .{ .numeric = .{ .namespace = 0, .id = 1234 } }, .encoding = .byte_string, .body = "abc" };
+}
+
+fn noopArrayItem(_: *encoding.Encoder, _: u8) encoding.EncodeError!void {}
+
+test "free* releases an ExtensionObject body in headers, MonitoringParameters and results" {
+    const a = testing.allocator;
+    var buf: [256]u8 = undefined;
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        var e = encoding.Encoder.init(&w);
+        try encodeRequestHeader(&e, .{ .authentication_token = null_node_id, .timestamp = 0, .request_handle = 1, .return_diagnostics = 0, .audit_entry_id = null, .timeout_hint = 0, .additional_header = owningExtensionObject() });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = encoding.Decoder.init(&r, a);
+        freeRequestHeader(a, try decodeRequestHeader(&d));
+    }
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        var e = encoding.Encoder.init(&w);
+        try encodeResponseHeader(&e, .{ .timestamp = 0, .request_handle = 1, .service_result = 0, .service_diagnostics = .{}, .string_table = null, .additional_header = owningExtensionObject() });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = encoding.Decoder.init(&r, a);
+        freeResponseHeader(a, try decodeResponseHeader(&d));
+    }
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        var e = encoding.Encoder.init(&w);
+        try encodeMonitoringParameters(&e, .{ .client_handle = 1, .sampling_interval = 0, .filter = owningExtensionObject(), .queue_size = 1, .discard_oldest = true });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = encoding.Decoder.init(&r, a);
+        freeMonitoringParameters(a, try decodeMonitoringParameters(&d));
+    }
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        var e = encoding.Encoder.init(&w);
+        try encodeMonitoredItemCreateResult(&e, .{ .status_code = 0, .monitored_item_id = 1, .revised_sampling_interval = 0, .revised_queue_size = 1, .filter_result = owningExtensionObject() });
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var d = encoding.Decoder.init(&r, a);
+        freeMonitoredItemCreateResult(a, try decodeMonitoredItemCreateResult(&d));
+    }
+}
+
+test "freeDiagnosticInfo walks and frees a whole inner chain" {
+    const a = testing.allocator;
+    // three levels, each with additional_info: wire = mask 0x50 (info + inner) x2, then 0x10
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e = encoding.Encoder.init(&w);
+    for (0..2) |_| {
+        try w.writeByte(0x50);
+        try e.encodeString("lvl");
+    }
+    try w.writeByte(0x10);
+    try e.encodeString("end");
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, a);
+    freeDiagnosticInfo(a, try d.decodeDiagnosticInfo());
+}
+
+test "array helpers: a length below -1 is BadLength, -1 is null; an Int32-overflowing array is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    {
+        var r: std.Io.Reader = .fixed(&[_]u8{ 0xfe, 0xff, 0xff, 0xff });
+        var d = encoding.Decoder.init(&r, a);
+        try testing.expectError(error.BadLength, decodeArray(&d, ?[]const u8, decodeStringItem, freeOptStr));
+    }
+    {
+        var r: std.Io.Reader = .fixed(&[_]u8{ 0xff, 0xff, 0xff, 0xff });
+        var d = encoding.Decoder.init(&r, a);
+        try testing.expectEqual(@as(?[]?[]const u8, null), try decodeArray(&d, ?[]const u8, decodeStringItem, freeOptStr));
+    }
+    {
+        var r: std.Io.Reader = .fixed(&[_]u8{ 0xfe, 0xff, 0xff, 0xff });
+        try testing.expectError(error.BadLength, skipLengthPrefixed(&r));
+    }
+    {
+        var r: std.Io.Reader = .fixed(&[_]u8{ 0xff, 0xff, 0xff, 0xff });
+        try testing.expectEqual(@as(?[]const u8, null), try skipLengthPrefixed(&r));
+    }
+    if (@sizeOf(usize) >= 8) {
+        var buf: [16]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var e = encoding.Encoder.init(&w);
+        const over: usize = @as(usize, std.math.maxInt(i32)) + 1;
+        const huge = @as([*]const u8, @ptrFromInt(1))[0..over];
+        try testing.expectError(error.ValueTooLarge, encodeArray(&e, u8, huge, noopArrayItem));
+    }
+}
+
+/// recvService over one scripted chunk (SecurityMode None): the chunk's
+/// message type and RequestId are the caller's, the channel expects request id 1.
+fn scriptedRecv(wire_type: transport.MessageType, chunk_request_id: u32, payload: []const u8, ch_out: ?*Channel) ServiceError!ReadResponse {
+    var body_buf: [1024]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&body_buf);
+    bw.writeInt(u32, 7, .little) catch unreachable;
+    bw.writeInt(u32, 3, .little) catch unreachable;
+    bw.writeInt(u32, 1, .little) catch unreachable;
+    bw.writeInt(u32, chunk_request_id, .little) catch unreachable;
+    bw.writeAll(payload) catch unreachable;
+    const b = bw.buffered();
+    var chunk_buf: [1100]u8 = undefined;
+    var srv_w: std.Io.Writer = .fixed(&chunk_buf);
+    var srv_conn = transport.Connection.init(undefined, &srv_w);
+    srv_conn.sendChunk(.{ .message_type = wire_type, .chunk_type = .final, .message_size = 8 + @as(u32, @intCast(b.len)) }, b) catch unreachable;
+    var out_buf: [64]u8 = undefined;
+    var out_w: std.Io.Writer = .fixed(&out_buf);
+    var in_r: std.Io.Reader = .fixed(srv_w.buffered());
+    var conn = transport.Connection.init(&in_r, &out_w);
+    var ch: Channel = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3, .request_id = 1 };
+    defer if (ch_out) |o| {
+        o.last_service_result = ch.last_service_result;
+    };
+    return ch.recvService(.message, ReadResponse, type_id.read_response, decodeReadResponse, result_fns.read);
+}
+
+test "recvService: ERR, a foreign message type and a foreign RequestId are each refused; a Bad result is remembered" {
+    var buf: [512]u8 = undefined;
+    const good = hostile_response.readResponse(&buf, 0);
+    freeReadResponse(testing.allocator, try scriptedRecv(.message, 1, good, null));
+    try testing.expectError(error.ServerError, scriptedRecv(.error_msg, 1, good, null));
+    try testing.expectError(error.BadMessageType, scriptedRecv(.acknowledge, 1, good, null));
+    try testing.expectError(error.UnexpectedResponseType, scriptedRecv(.message, 2, good, null));
+    var seen: Channel = undefined;
+    seen.last_service_result = 0;
+    var bad_buf: [512]u8 = undefined;
+    try testing.expectError(error.BadServiceResult, scriptedRecv(.message, 1, hostile_response.readResponse(&bad_buf, 0x80390000), &seen));
+    try testing.expectEqual(@as(encoding.StatusCode, 0x80390000), seen.last_service_result);
+}

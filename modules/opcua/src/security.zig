@@ -2048,3 +2048,278 @@ test "corpus: every certificate seed reaches the parsers, and the counts are pin
     try testing.expectEqual(@as(usize, 1), parsed);
     try testing.expectEqual(@as(usize, 1), viewed);
 }
+
+// ── whole-module mutation audit (2026-11-18): forged messages and boundaries ──
+
+const OpnRig = struct {
+    random_state: std.Random.DefaultCsprng,
+    client: ClientCredentials,
+    other: ClientCredentials,
+    server: ClientCredentials,
+
+    fn init(rig: *OpnRig, server_bits: usize) !void {
+        rig.random_state = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x3c)));
+        const random = rig.random_state.random();
+        const opts = struct {
+            fn make(bits: usize, name: []const u8) ClientCredentials.GenerateSelfSignedOptions {
+                return .{ .modulus_bits = bits, .common_name = name, .not_before = "260101000000Z", .not_after = "270101000000Z" };
+            }
+        };
+        try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(512, "forge-client"), &rig.client);
+        errdefer rig.client.deinit(testing.allocator);
+        try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(512, "forge-other"), &rig.other);
+        errdefer rig.other.deinit(testing.allocator);
+        try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(server_bits, "forge-server"), &rig.server);
+    }
+
+    fn deinit(rig: *OpnRig) void {
+        rig.client.deinit(testing.allocator);
+        rig.other.deinit(testing.allocator);
+        rig.server.deinit(testing.allocator);
+    }
+
+    /// ChannelId + an AsymmetricAlgorithmSecurityHeader of three null fields.
+    const clear_part: [16]u8 = blk: {
+        var c: [16]u8 = @splat(0xff);
+        c[0] = 0;
+        c[1] = 0;
+        c[2] = 0;
+        c[3] = 0;
+        break :blk c;
+    };
+
+    /// A wire OPN whose encrypted region is exactly `tail` (SequenceHeader,
+    /// body and padding as the caller wants them) + a signature by `signer`.
+    fn forge(rig: *OpnRig, signer: *const ClientCredentials, tail: []const u8) ![]u8 {
+        const gpa = testing.allocator;
+        const random = rig.random_state.random();
+        const peer_pk = try certificatePublicKey(rig.server.certificate_der);
+        const k = modulusByteLen(peer_pk.n.bits());
+        const plain_block = k - oaep_sha1_overhead;
+        const sig_len = modulusByteLen(signer.private_key.n.bits());
+        const blocks = std.math.divCeil(usize, tail.len + sig_len, plain_block) catch unreachable;
+        const wire_len = 8 + clear_part.len + blocks * k;
+        const plain = try gpa.alloc(u8, 8 + clear_part.len + tail.len);
+        defer gpa.free(plain);
+        plain[0..3].* = "OPN".*;
+        plain[3] = 'F';
+        std.mem.writeInt(u32, plain[4..8], @intCast(wire_len), .little);
+        @memcpy(plain[8..][0..clear_part.len], &clear_part);
+        @memcpy(plain[8 + clear_part.len ..], tail);
+        const sig = try asymmetricSign(gpa, plain, &signer.private_key);
+        defer gpa.free(sig);
+        const region = try gpa.alloc(u8, tail.len + sig.len);
+        defer gpa.free(region);
+        @memcpy(region[0..tail.len], tail);
+        @memcpy(region[tail.len..], sig);
+        const enc = try asymmetricEncrypt(gpa, region, peer_pk, random);
+        defer gpa.free(enc);
+        const wire = try gpa.alloc(u8, wire_len);
+        @memcpy(wire[0 .. 8 + clear_part.len], plain[0 .. 8 + clear_part.len]);
+        @memcpy(wire[8 + clear_part.len ..], enc);
+        return wire;
+    }
+
+    fn open(rig: *OpnRig, wire: []const u8) ![]u8 {
+        return openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], &rig.server.private_key, rig.client.certificate_der);
+    }
+};
+
+test "openAsymmetricMessage: padding and length rules, checked on forged but signed messages" {
+    var rig: OpnRig = undefined;
+    try rig.init(768);
+    defer rig.deinit();
+    const gpa = testing.allocator;
+    const seq = [_]u8{ 1, 0, 0, 0, 1, 0, 0, 0 };
+
+    // the smallest legal message: SequenceHeader, no body, PaddingSize 0
+    {
+        const wire = try rig.forge(&rig.client, &(seq ++ [_]u8{0}));
+        defer gpa.free(wire);
+        const got = try rig.open(wire);
+        defer gpa.free(got);
+        try testing.expectEqual(@as(usize, OpnRig.clear_part.len + 8), got.len);
+    }
+    // a body with consistent padding (2 bytes of 0x02 + the size byte 0x02)
+    {
+        const wire = try rig.forge(&rig.client, &(seq ++ "abc".* ++ [_]u8{ 2, 2, 2 }));
+        defer gpa.free(wire);
+        const got = try rig.open(wire);
+        defer gpa.free(got);
+        try testing.expectEqualStrings("abc", got[got.len - 3 ..]);
+    }
+    // one padding byte differs from PaddingSize
+    {
+        const wire = try rig.forge(&rig.client, &(seq ++ "abc".* ++ [_]u8{ 2, 9, 2 }));
+        defer gpa.free(wire);
+        try testing.expectError(error.InvalidSecureMessage, rig.open(wire));
+    }
+    // PaddingSize claims more bytes than the message has
+    {
+        const wire = try rig.forge(&rig.client, &(seq ++ [_]u8{0xff}));
+        defer gpa.free(wire);
+        try testing.expectError(error.InvalidSecureMessage, rig.open(wire));
+    }
+    // too short for a SequenceHeader and a padding byte, and signed by the wrong key:
+    // the length rule must fire before the signature is judged
+    {
+        const wire = try rig.forge(&rig.other, &[_]u8{ 1, 2, 3 });
+        defer gpa.free(wire);
+        try testing.expectError(error.InvalidSecureMessage, rig.open(wire));
+    }
+    // an encrypted region that is not a whole number of RSA blocks, and none at all
+    {
+        const wire = try rig.forge(&rig.client, &(seq ++ [_]u8{0}));
+        defer gpa.free(wire);
+        try testing.expectError(error.InvalidSecureMessage, rig.open(wire[0 .. wire.len - 1]));
+        // a stray byte after the last whole block
+        const longer = try gpa.alloc(u8, wire.len + 1);
+        defer gpa.free(longer);
+        @memcpy(longer[0..wire.len], wire);
+        longer[wire.len] = 0;
+        try testing.expectError(error.InvalidSecureMessage, rig.open(longer));
+        // the last of the three header fields claims more bytes than the body holds
+        var cut2 = try gpa.dupe(u8, wire[0 .. 8 + OpnRig.clear_part.len]);
+        defer gpa.free(cut2);
+        std.mem.writeInt(i32, cut2[8 + 12 ..][0..4], 1000, .little);
+        try testing.expectError(error.InvalidSecureMessage, rig.open(cut2));
+        try testing.expectError(error.InvalidSecureMessage, rig.open(wire[0 .. 8 + OpnRig.clear_part.len]));
+        try testing.expectError(error.InvalidSecureMessage, rig.open(wire[0 .. 8 + 3]));
+        // a header whose fields run past the body
+        var cut = try gpa.dupe(u8, wire[0 .. 8 + OpnRig.clear_part.len]);
+        defer gpa.free(cut);
+        std.mem.writeInt(i32, cut[8 + 4 ..][0..4], 1000, .little);
+        try testing.expectError(error.InvalidSecureMessage, rig.open(cut));
+        // fields cut off before the third length prefix
+        try testing.expectError(error.InvalidSecureMessage, rig.open(wire[0 .. 8 + 4 + 4 + 4 + 2]));
+    }
+}
+
+test "seal/open with a receiver key over 2048 bits uses the two-byte padding footer; 2048 exactly uses one" {
+    const gpa = testing.allocator;
+    for ([_]usize{ 2048, 2304 }) |bits| {
+        var rig: OpnRig = undefined;
+        try rig.init(bits);
+        defer rig.deinit();
+        const random = rig.random_state.random();
+        var body: [OpnRig.clear_part.len + 8 + 100]u8 = undefined;
+        @memcpy(body[0..OpnRig.clear_part.len], &OpnRig.clear_part);
+        @memset(body[OpnRig.clear_part.len..], 0x5a);
+        const wire = try sealAsymmetricMessage(gpa, random, "OPN", &body, OpnRig.clear_part.len, &rig.client, rig.server.certificate_der);
+        defer gpa.free(wire);
+        const got = try rig.open(wire);
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, &body, got);
+    }
+}
+
+test "asymmetricDecrypt refuses an empty ciphertext; certificatePublicKey refuses a non-rsaEncryption key" {
+    var rig: OpnRig = undefined;
+    try rig.init(512);
+    defer rig.deinit();
+    try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, &.{}, &rig.server.private_key));
+    // same certificate, SPKI algorithm OID rsaEncryption (…01 01 01) rewritten to id-RSASSA-PSS (…01 01 0a)
+    const needle = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+    const cert = try testing.allocator.dupe(u8, rig.server.certificate_der);
+    defer testing.allocator.free(cert);
+    _ = try certificatePublicKey(cert);
+    const at = std.mem.find(u8, cert, &needle).?;
+    cert[at + needle.len - 1] = 0x0a;
+    try testing.expectError(error.InvalidCertificate, certificatePublicKey(cert));
+}
+
+test "decryptUserTokenSecret: length prefix rules on crafted plaintexts" {
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
+    const random = prng.random();
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, random, 512, 65537);
+    const gpa = testing.allocator;
+    const nonce = "nonce-0123456789";
+    const Case = struct { plain: []const u8, expect: ?anyerror };
+    const cases = [_]Case{
+        .{ .plain = &[_]u8{ 1, 0, 0 }, .expect = error.InvalidSecureMessage }, // shorter than the prefix
+        .{ .plain = &[_]u8{ 0, 0, 0, 0 }, .expect = error.InvalidSecureMessage }, // 0 < nonce length
+        .{ .plain = &[_]u8{ 2, 0, 0, 0, 'a', 'b' }, .expect = error.InvalidSecureMessage }, // 2 < nonce length
+        .{ .plain = &[_]u8{ 100, 0, 0, 0, 'a' }, .expect = error.InvalidSecureMessage }, // claims far more than there is
+    };
+    for (cases) |c| {
+        const blob = try asymmetricEncrypt(gpa, c.plain, kp.public_key, random);
+        defer gpa.free(blob);
+        try testing.expectError(c.expect.?, decryptUserTokenSecret(gpa, blob, &kp.secret_key, nonce));
+    }
+    // exactly the prefix, empty nonce expected: a legal empty secret
+    const blob = try asymmetricEncrypt(gpa, &[_]u8{ 0, 0, 0, 0 }, kp.public_key, random);
+    defer gpa.free(blob);
+    const got = try decryptUserTokenSecret(gpa, blob, &kp.secret_key, "");
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 0), got.len);
+}
+
+test "sequenceFollows window edges and modulusByteLen rounding" {
+    const max = std.math.maxInt(u32);
+    try testing.expect(sequenceFollows(5, 6));
+    try testing.expect(!sequenceFollows(5, 7));
+    try testing.expect(!sequenceFollows(max - 1024, 5));
+    try testing.expect(sequenceFollows(max - 1023, 5));
+    try testing.expect(sequenceFollows(max, 1023));
+    try testing.expect(!sequenceFollows(max, 1024));
+    try testing.expect(sequenceFollows(max, 0)); // plain wrap
+    try testing.expectEqual(@as(usize, 64), modulusByteLen(512));
+    try testing.expectEqual(@as(usize, 65), modulusByteLen(513));
+    try testing.expectEqual(@as(usize, 1), modulusByteLen(1));
+}
+
+test "symmetricDecryptAndVerify: exact minimum length and inconsistent padding with a valid MAC" {
+    const keys = deriveKeys("client-nonce-0123456789abcdefghi", "server-nonce-0123456789abcdefghi", .basic256sha256);
+    const gpa = testing.allocator;
+    // minimal Sign message: 16-byte body, nothing else
+    var body: [16]u8 = undefined;
+    const b = testChunkBody(&body, "");
+    const sealed = try symmetricSignAndEncrypt(gpa, "MSG", b, .sign, &keys, .client_to_server);
+    defer gpa.free(sealed);
+    const got = try symmetricDecryptAndVerify(gpa, sealed[0..8], sealed[8..], .sign, &keys, .client_to_server);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, b, got);
+
+    // SignAndEncrypt with a forged footer: right MAC, one padding byte wrong.
+    // 8 header + 16 body + 5 payload + 3 footer + 32 MAC = 64; bytes from 16 on are 48 = 3 blocks.
+    var full: [64]u8 = undefined;
+    @memcpy(full[0..3], "MSG");
+    full[3] = 'F';
+    std.mem.writeInt(u32, full[4..8], full.len, .little);
+    @memcpy(full[8..24], b);
+    @memcpy(full[24..29], "xyzab");
+    full[29] = 2;
+    full[30] = 9; // PaddingSize says 2, so this must be 2
+    full[31] = 2;
+    const dk = directionKeys(&keys, .client_to_server);
+    HmacSha256.create(full[32..][0..32], full[0..32], dk.signing_key);
+    aes256CbcEncrypt(dk.encrypting_key, dk.iv, full[16..]);
+    try testing.expectError(error.InvalidSecureMessage, symmetricDecryptAndVerify(gpa, full[0..8], full[8..], .sign_and_encrypt, &keys, .client_to_server));
+    // the same message with a consistent footer is accepted
+    aes256CbcDecrypt(dk.encrypting_key, dk.iv, full[16..]);
+    full[30] = 2;
+    HmacSha256.create(full[32..][0..32], full[0..32], dk.signing_key);
+    aes256CbcEncrypt(dk.encrypting_key, dk.iv, full[16..]);
+    const ok = try symmetricDecryptAndVerify(gpa, full[0..8], full[8..], .sign_and_encrypt, &keys, .client_to_server);
+    defer gpa.free(ok);
+    try testing.expectEqualStrings("xyzab", ok[16..]);
+}
+
+test "viewAsymmetricHeader: a field may be empty and may end exactly at the end of the body" {
+    // ChannelId, uri = "u" (1 byte), sender certificate = empty (0 bytes), thumbprint = "abc" ending the body
+    var buf: [4 + 5 + 4 + 7]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u32, 0, .little);
+    try w.writeInt(i32, 1, .little);
+    try w.writeAll("u");
+    try w.writeInt(i32, 0, .little);
+    try w.writeInt(i32, 3, .little);
+    try w.writeAll("abc");
+    const view = viewAsymmetricHeader(w.buffered()).?;
+    try testing.expectEqualStrings("u", view.security_policy_uri);
+    try testing.expectEqual(@as(usize, 0), view.sender_certificate.?.len);
+    try testing.expectEqualStrings("abc", view.receiver_certificate_thumbprint.?);
+    try testing.expectEqual(w.end, view.encrypted_region_offset);
+    try testing.expect(viewAsymmetricHeader(w.buffered()[0 .. w.end - 1]) == null);
+}
