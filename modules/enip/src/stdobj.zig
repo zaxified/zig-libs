@@ -2,7 +2,8 @@
 
 //! The standard CIP objects a scanner or commissioning tool reads off every
 //! EtherNet/IP device, as the adapter serves them: the **TCP/IP Interface**
-//! object (class `0xF5`, CIP Vol 2 ch. 5-4).
+//! object (class `0xF5`, CIP Vol 2 ch. 5-4) and the **Ethernet Link** object
+//! (class `0xF6`, ch. 5-5).
 //!
 //! Everything here is pure: the values come from the caller's configuration
 //! (no operating-system call, no clock, no socket) and the functions turn an
@@ -317,6 +318,60 @@ pub fn tcpipSet(
     }
 }
 
+/// Instance attribute numbers of the Ethernet Link object (Vol 2 ch. 5-5).
+pub const EthLinkAttr = struct {
+    pub const interface_speed: u16 = 1;
+    pub const interface_flags: u16 = 2;
+    pub const physical_address: u16 = 3;
+};
+
+/// What the Ethernet Link object (instance 1) reports: the three attributes
+/// Vol 2 marks required. The counters (4, 5), interface control (6) and the
+/// rest are optional and not served (`attribute_not_supported`). All values
+/// are the caller's; nothing is read from the operating system.
+pub const EthLinkConfig = struct {
+    /// Attribute 1, in Mbit/s (`0` when unknown or autonegotiating).
+    interface_speed: u32 = 100,
+    /// Attribute 2: bit 0 link active, bit 1 full duplex, bits 2-4 the
+    /// autonegotiation status (`3`: speed and duplex determined), bit 5
+    /// manual setting requires reset, bit 6 local hardware fault. Default
+    /// `0x0F`: link up, full duplex, autonegotiation succeeded.
+    interface_flags: u32 = 0x0000_000F,
+    /// Attribute 3, six octets in transmission order. The default is a
+    /// locally administered address, a placeholder to be set.
+    physical_address: [6]u8 = .{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 },
+};
+
+/// Writes attribute `attr` of the Ethernet Link object into `buf` and returns
+/// its length, or `null` when the attribute is not served.
+pub fn ethLinkAttribute(cfg: EthLinkConfig, attr: u16, buf: []u8) ?usize {
+    switch (attr) {
+        EthLinkAttr.interface_speed => {
+            putU32(buf, cfg.interface_speed);
+            return 4;
+        },
+        EthLinkAttr.interface_flags => {
+            putU32(buf, cfg.interface_flags);
+            return 4;
+        },
+        EthLinkAttr.physical_address => {
+            @memcpy(buf[0..6], &cfg.physical_address);
+            return 6;
+        },
+        else => return null,
+    }
+}
+
+/// `Get_Attributes_All`: attributes 1 to 3 in order.
+pub fn ethLinkAll(cfg: EthLinkConfig, buf: []u8) usize {
+    var off: usize = 0;
+    var attr: u16 = EthLinkAttr.interface_speed;
+    while (attr <= EthLinkAttr.physical_address) : (attr += 1) {
+        off += ethLinkAttribute(cfg, attr, buf[off..]).?;
+    }
+    return off;
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -593,4 +648,24 @@ test "tcpipSet attribute 6: host name length, label rule, and the status bit" {
     @memset(full[2..], 'z');
     try testing.expectEqual(cip.GeneralStatus.success, tcpipSet(cfg, &st, true, 6, &full));
     try testing.expectEqual(@as(usize, 64), st.host_len);
+}
+
+test "ethernet link attributes: encodings and the all-reply" {
+    const cfg: EthLinkConfig = .{
+        .interface_speed = 1000,
+        .interface_flags = 0x0000_0003,
+        .physical_address = .{ 0x00, 0x1D, 0x9C, 0xAA, 0xBB, 0xCC },
+    };
+    var b: [64]u8 = @splat(0xEE);
+    try testing.expectEqualSlices(u8, &.{ 0xE8, 3, 0, 0 }, b[0..ethLinkAttribute(cfg, 1, &b).?]);
+    try testing.expectEqualSlices(u8, &.{ 3, 0, 0, 0 }, b[0..ethLinkAttribute(cfg, 2, &b).?]);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x1D, 0x9C, 0xAA, 0xBB, 0xCC }, b[0..ethLinkAttribute(cfg, 3, &b).?]);
+    for ([_]u16{ 0, 4, 5, 6, 7, 10, 0x14 }) |a| try testing.expectEqual(@as(?usize, null), ethLinkAttribute(cfg, a, &b));
+    const n = ethLinkAll(cfg, &b);
+    try testing.expectEqualSlices(u8, &.{ 0xE8, 3, 0, 0, 3, 0, 0, 0, 0x00, 0x1D, 0x9C, 0xAA, 0xBB, 0xCC }, b[0..n]);
+    // the defaults: 100 Mbit/s, link up, full duplex, autonegotiated
+    const d: EthLinkConfig = .{};
+    try testing.expectEqual(@as(u32, 100), d.interface_speed);
+    try testing.expectEqual(@as(u32, 0x0F), d.interface_flags);
+    try testing.expectEqual(@as(u8, 0x02), d.physical_address[0] & 0x03);
 }

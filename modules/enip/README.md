@@ -98,7 +98,10 @@ fleet-simulation target.
   call). `Set_Attribute_Single` is refused `attribute_not_settable` unless
   `Config.allow_tcpip_set` is on, which records attributes 3, 5 and 6 (with
   OpENer's value checks) for the adapter to report back and for the caller to
-  apply.
+  apply. The **Ethernet Link object** (`0xF6`, instance 1) serves interface
+  speed, interface flags and the MAC address (`Config.ethernet_link`, all
+  caller-supplied, read-only); its optional counters answer
+  `attribute_not_supported`.
 - Hostile input never panics anywhere: an encapsulation length disagreeing
   with the payload, a CPF item count that overruns, an item length pointing
   past the buffer, an EPATH segment running past the path, a symbolic segment

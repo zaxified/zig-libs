@@ -167,6 +167,10 @@ pub const Config = struct {
     /// whose network settings are fixed. The adapter only *records* the
     /// values; applying them is the caller's business.
     allow_tcpip_set: bool = false,
+    /// What the **Ethernet Link** object (class 0xF6, instance 1) reports
+    /// (speed, flags, MAC address). Served by default; `null` withholds it.
+    /// It is read-only: `Set_Attribute_Single` on it is `service_not_supported`.
+    ethernet_link: ?stdobj.EthLinkConfig = .{},
     /// What `ListIdentity` reports as its own socket address.
     socket_address: encap.SocketAddress = .{
         .port = encap.default_tcp_port,
@@ -618,6 +622,9 @@ pub const Adapter = struct {
         if (class != null and class.? == @backingInt(cip.ClassCode.tcp_ip_interface)) {
             return self.tcpipGet(req, null, out);
         }
+        if (class != null and class.? == @backingInt(cip.ClassCode.ethernet_link)) {
+            return self.ethLinkGet(req, null, out);
+        }
         if (class == null or class.? != @backingInt(cip.ClassCode.identity)) {
             return errorReply(req.service, .path_destination_unknown, out);
         }
@@ -651,6 +658,9 @@ pub const Adapter = struct {
     ) Error![]const u8 {
         if (class != null and class.? == @backingInt(cip.ClassCode.tcp_ip_interface)) {
             return self.tcpipGet(req, (epath.findLogical(req.path, .attribute) catch null), out);
+        }
+        if (class != null and class.? == @backingInt(cip.ClassCode.ethernet_link)) {
+            return self.ethLinkGet(req, (epath.findLogical(req.path, .attribute) catch null), out);
         }
         if (class == null or class.? != @backingInt(cip.ClassCode.identity)) {
             return errorReply(req.service, .path_destination_unknown, out);
@@ -724,6 +734,30 @@ pub const Adapter = struct {
             const got = stdobj.tcpipAttribute(cfg, &self.tcpip_state, self.cfg.allow_tcpip_set, @intCast(a), &body) catch
                 return error.BufferTooSmall;
             break :blk got orelse return errorReply(req.service, .attribute_not_supported, out);
+        };
+        return (cip.Reply{
+            .service = req.service,
+            .general_status = .success,
+            .additional_status = &.{},
+            .data = body[0..n],
+        }).encode(out) catch error.BufferTooSmall;
+    }
+
+    /// The Ethernet Link object (class 0xF6, instance 1): attributes 1 to 3.
+    fn ethLinkGet(self: *Adapter, req: cip.Request, attr: ?u32, out: []u8) Error![]const u8 {
+        const cfg = self.cfg.ethernet_link orelse
+            return errorReply(req.service, .path_destination_unknown, out);
+        const instance = (epath.findLogical(req.path, .instance) catch null) orelse 0;
+        if (instance != 1) return errorReply(req.service, .path_destination_unknown, out);
+        var body: [16]u8 = undefined;
+        const n: usize = blk: {
+            if (req.service == @backingInt(cip.Service.get_attributes_all)) {
+                break :blk stdobj.ethLinkAll(cfg, &body);
+            }
+            const a = attr orelse return errorReply(req.service, .path_segment_error, out);
+            if (a > std.math.maxInt(u16)) return errorReply(req.service, .attribute_not_supported, out);
+            break :blk stdobj.ethLinkAttribute(cfg, @intCast(a), &body) orelse
+                return errorReply(req.service, .attribute_not_supported, out);
         };
         return (cip.Reply{
             .service = req.service,

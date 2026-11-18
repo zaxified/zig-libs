@@ -6,7 +6,7 @@
 
 **Scope:** mvp — pycomm3 (client) and OpENer 2.3 (adapter) (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-06 · mutation 2026-11-18 (1454/1502, 48 eq) · src 62c282f11c7a86b9
+**Audit:** review 2026-10-06 · mutation 2026-11-18 (1468/1517, 49 eq) · src 554da63f430e9e55
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ENIP_FUZZ) · ct n/a — industrial protocol, no auth (keyword review, 2026-10-07)
 
@@ -25,13 +25,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [ottowayi/pycomm3](https://github.com/ottowayi/pycomm3) — **reference** (client) | Python | MIT | 520 | push 2025-12-22 | The tool Logix users reach for: tag read/write by name, and structures/UDTs returned with named members *(inferred from its docs; not re-read this run)*. Here a structure read returns handle + raw octets. |
-| [EIPStackGroup/OpENer](https://github.com/EIPStackGroup/OpENer) — **reference** (adapter) | C | "OpENer" BSD-style custom licence, API: NOASSERTION; source not read | 863 | v2.3 (2019-03-25), push 2026-09-04 | Adapter stack for I/O devices with implicit (Class 1) messaging and the standard object set; this module serves explicit messaging only and the Identity, Program Name, Symbol and TCP/IP Interface objects. |
+| [EIPStackGroup/OpENer](https://github.com/EIPStackGroup/OpENer) — **reference** (adapter) | C | "OpENer" BSD-style custom licence, API: NOASSERTION; source not read | 863 | v2.3 (2019-03-25), push 2026-09-04 | Adapter stack for I/O devices with implicit (Class 1) messaging and the standard object set; this module serves explicit messaging only and the Identity, Program Name, Symbol, TCP/IP Interface and Ethernet Link objects. |
 | [nimbuscontrols/EIPScanner](https://github.com/nimbuscontrols/EIPScanner) | C++ | MIT | 319 | 1.3.0 (2021-06-25), push 2024-11-26 | Scanner: explicit + point-to-point implicit messaging, discovery, File/Parameter/Identity objects (its README). Implicit I/O is what we lack. |
 | [danomagnum/gologix](https://github.com/danomagnum/gologix) | Go | MIT | 73 | v0.42.0-beta (2026-09-17) | Go Logix client, beta. Not read. |
 | [pjkundert/cpppo](https://github.com/pjkundert/cpppo) | Python | NOASSERTION per API (dual GPL/commercial, *inferred*) | 391 | push 2025-07-08 | Protocol/simulator toolkit; not read. |
 | Zig ecosystem | — | — | — | — | `gh search repos ethernet/ip --language=zig` found no library. |
 
-**Where we are ahead:** the only Zig EtherNet/IP; typed, allocation-free codec of the full explicit stack (encap, CPF, EPATH, Message Router, Connection Manager incl. Large Forward Open, Logix tag services, Multiple Service Packet) validated against three third-party stacks and Wireshark; a browsable, tag-list-uploadable adapter that OpENer-style stacks do not give in library form for simulation. **Where we are behind:** no implicit Class 0/1 I/O engine (no cyclic producer/RPI/watchdog), no Template Object/UDT member decoding, no CIP Safety/Sync/Security, no PCCC, no Ethernet Link/Assembly/Port/Connection objects on the adapter (→ Backlog items).
+**Where we are ahead:** the only Zig EtherNet/IP; typed, allocation-free codec of the full explicit stack (encap, CPF, EPATH, Message Router, Connection Manager incl. Large Forward Open, Logix tag services, Multiple Service Packet) validated against three third-party stacks and Wireshark; a browsable, tag-list-uploadable adapter that OpENer-style stacks do not give in library form for simulation. **Where we are behind:** no implicit Class 0/1 I/O engine (no cyclic producer/RPI/watchdog), no Template Object/UDT member decoding, no CIP Safety/Sync/Security, no PCCC, no Assembly/Port/Connection objects on the adapter (→ Backlog items).
 
 ## Design & invariants
 
@@ -251,6 +251,20 @@ layout never depends on Zig's bitfield-packing rules.
   DNS-enable bit of attribute 3, Vol 2 allows it. Not served: the optional
   attributes 7 to 13 (safety network number, TTL, multicast, ACD, quick connect,
   encapsulation inactivity timeout).
+
+  The **Ethernet Link object** (class `0xF6`, instance 1; Vol 2 ch. 5-5)
+  serves the three required attributes, `Get_Attributes_All` (1 to 3 in
+  order) and `Get_Attribute_Single`: interface speed (`UDINT`, Mbit/s),
+  interface flags (`DWORD`: link active, full duplex, autonegotiation status,
+  hardware fault) and the physical address (six octets, no length prefix),
+  from `Config.ethernet_link` (defaults 100 Mbit/s, flags `0x0F`, a locally
+  administered placeholder MAC; `null` withholds the object). The optional
+  attributes (interface and media counters 4 and 5, interface control 6, type,
+  state, admin state, label) are `attribute_not_supported`; instance 0 and any
+  other instance `path_destination_unknown`. The object is read-only here and
+  has no `Set_Attribute_Single` (`service_not_supported`), as OpENer builds it
+  unless its interface-control option is on. Encodings as OpENer and the
+  scanners (EIPScanner, pycomm3) read them.
 
   It also answers enough for a browsing tool to **discover** its tags rather
   than be told them: the Program Name object (`0x64`, one `STRING`) and the
@@ -705,10 +719,10 @@ not:
   about.
 - **Object-model coverage beyond what is built.** The `Adapter` serves the
   Identity object (class 1), the Program Name object (`0x64`), the Symbol
-  Object (`0x6B`) and the TCP/IP Interface object (`0xF5`), and no other
-  class. The Message Router, Assembly, Connection, Ethernet Link (`0xF6`),
-  Port (`0xF4`) and Connection Configuration objects are named in `ClassCode`
-  and not implemented on the target side; a *client* can of course address any of them
+  Object (`0x6B`), the TCP/IP Interface object (`0xF5`) and the Ethernet Link
+  object (`0xF6`), and no other class. The Message Router, Assembly,
+  Connection, Port (`0xF4`) and Connection Configuration objects are named in
+  `ClassCode` and not implemented on the target side; a *client* can of course address any of them
   with the generic attribute services.
 - **Connection watchdogs and timeout supervision.** The
   `connection_timeout_multiplier` is carried on the wire and honoured by
@@ -747,6 +761,8 @@ src/root.zig.
 
 **Delta mutation 2026-11-18 (TCP/IP Interface object).** 111 mutants over `stdobj.zig` and the adapter's new routing, run against the object's own tests: 105 killed, 6 EQUIVALENT, none left open. Test additions during the run: the three edges of every alphanumeric range, the class D boundary (`224.0.0.0`), name-server and gateway class and loopback rules with no mask, an absent instance on all three services, and a non-empty domain stored and read back. EQUIVALENT: `validMask`'s `host_span != 0` (only called with a non-zero mask, so the span is never zero), its `mask != 0xFFFFFFFF` (a /32 mask makes every address its own network address, refused by `networkOrBroadcast` anyway), `ip == 0` (zero is the network address under any mask), `mask != 0` in the gateway reachability test (with no mask both sides are zero), and the two `> maxInt(u16)` attribute guards at `>=` (attribute 65535 is not served either way). Card counts are cumulative with the whole-module run above.
 
+**Delta mutation 2026-11-18 (Ethernet Link object).** 15 mutants over the object's encoders, the all-reply loop and the adapter's routing and attribute guards: 14 killed, 1 EQUIVALENT (the `>= maxInt(u16)` attribute guard, for the reason above). Card counts are cumulative (both delta runs: 126 mutants).
+
 **Fix found by the audit.** `Client.sendConnectedCip` advanced the connection's sequence count before it knew the envelope fitted: a request of 245 to 446 octets passed the 64-octet guard, consumed a count, and then failed `BufferTooSmall`. The count is now committed only after the whole frame is built (CIP Vol 2: the sequence count is per transmitted data packet).
 
 ## Backlog / deferred
@@ -762,6 +778,6 @@ src/root.zig.
 
 - (survey 2026-09-30) **Logix Template Object (0x6C) + UDT member decoding**: the first thing a pycomm3 user hits (structures read as named members); also lets the adapter advertise struct tags; medium, fits §2. (Already listed as deferred; this survey ranks it top.)
 - (survey 2026-09-30) **Implicit I/O connection engine (Class 1, UDP 2222)**: OpENer/EIPScanner users need cyclic I/O; large (cyclic scheduler, clock injected), fits §2 if kept clock-agnostic.
-- (survey 2026-09-30) **Standard objects on the adapter: Assembly** (the TCP/IP Interface object is served since 2026-11-18); scanners/commissioning tools read it; small, fits §2.
+- (survey 2026-09-30) **Assembly object (0x04) on the adapter**: scanners read it (the TCP/IP Interface and Ethernet Link objects of the same survey item are served since 2026-11-18); small, fits §2.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
