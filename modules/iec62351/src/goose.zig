@@ -1670,3 +1670,112 @@ fn fuzzExtension(_: void, smith: *std.testing.Smith) !void {
     try testing.expect(v.tag.len <= max_mac_len);
     try testing.expectEqual(expect_iv, v.iv != null);
 }
+
+fn zeroSeal(_: *anyopaque, _: []const u8, _: ?[12]u8, out: []u8) anyerror!void {
+    @memset(out, 0);
+}
+
+test "mutation: header reserved-field encoding at its edges, hasExtension, IV counter rekey" {
+    const ed = HeaderProfile.ed2020;
+    const r_max = try ed.encodeReserved(0, 0xffff);
+    try testing.expectEqual(@as(u16, 0x8000), r_max[0]);
+    try testing.expectEqual(@as(u16, 0xffff), r_max[1]);
+    try testing.expectError(error.ExtensionTooLong, ed.encodeReserved(0, 0x1_0000));
+    const r_one = try ed.encodeReserved(0, 1);
+    try testing.expectEqual(@as(u16, 0x8000), r_one[0]); // a 1-octet extension still sets the flag
+    try testing.expectEqual(@as(u16, 1), r_one[1]);
+    const r_none = try ed.encodeReserved(0x0001, 0);
+    try testing.expectEqual(@as(u16, 0x0001), r_none[0]); // no extension: no flag
+
+    const ts = HeaderProfile.ts2007;
+    const t_max = try ts.encodeReserved(0x0100, 0xff);
+    try testing.expectEqual(@as(u16, 0x01ff), t_max[0]);
+    try testing.expectEqual(@as(u16, 0), t_max[1]);
+    try testing.expectError(error.ExtensionTooLong, ts.encodeReserved(0, 0x100));
+    try testing.expectError(error.ReservedBitsConflict, ts.encodeReserved(0x0080, 5));
+    try testing.expectError(error.ReservedBitsConflict, ts.encodeReserved(0x0001, 5));
+    try testing.expectEqual(@as(u16, 0x0105), (try ts.encodeReserved(0x0100, 5))[0]);
+
+    var f = Frame{ .bytes = &.{}, .ether_type = 0, .appid = 0, .length = 0, .reserved1 = 0, .reserved2 = 0, .apdu = &.{}, .extension = &.{} };
+    try testing.expect(!f.hasExtension());
+    f.extension = &.{0xaa};
+    try testing.expect(f.hasExtension());
+
+    var c = IvCounter.init(0xAABBCCDD);
+    _ = try c.next();
+    _ = try c.next();
+    c.rekeyed();
+    const iv = try c.next();
+    try testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC, 0xDD, 0, 0, 0, 0, 0, 0, 0, 0 }, &iv);
+    try testing.expectEqual(@as(u64, 1), c.invocation);
+}
+
+test "mutation: the extension value rejects trailing bytes inside its sequence" {
+    var buf: [128]u8 = undefined;
+    const av: AuthenticationValue = .{ .tag = &.{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const ext = try av.encode(&buf);
+    // SEQUENCE { auth-value, NULL } : a well-formed extra element after the value.
+    var body: [64]u8 = undefined;
+    const inner = ext[2..];
+    @memcpy(body[0..inner.len], inner);
+    body[inner.len] = 0x05;
+    body[inner.len + 1] = 0x00;
+    var out: [80]u8 = undefined;
+    const e2 = try ber.writeElement(&out, extension_tag, body[0 .. inner.len + 2]);
+    try testing.expectError(error.MalformedExtension, AuthenticationValue.parse(e2, false, 32));
+    // The unmodified encoding parses.
+    _ = try AuthenticationValue.parse(ext, false, 32);
+}
+
+test "mutation: build refuses an empty tag, frames past 65535, and an exact buffer works" {
+    var out: [512]u8 = undefined;
+    try testing.expectError(error.UnsupportedAlgorithm, build(&out, .{ .appid = 1, .apdu = &sample_apdu }, .{ .mac = .{ .algorithm = .none, .key = &sample_key } }));
+
+    // Exact output buffer: len bytes suffice, len - 1 do not.
+    const frame = try buildSample(&out, .hmac_sha256_128, &sample_key);
+    const n = frame.len;
+    var exact: [512]u8 = undefined;
+    _ = try buildSample(exact[0..n], .hmac_sha256_128, &sample_key);
+    try testing.expectError(error.BufferTooSmall, buildSample(exact[0 .. n - 1], .hmac_sha256_128, &sample_key));
+
+    // Length counts the 8 header octets + APDU + the 31-octet HMAC-128 extension;
+    // 65535 is the largest u16 Length.
+    var apdu: [65497]u8 = @splat(0x42);
+    var big: [65600]u8 = undefined;
+    const sealer: Sealer = .{ .mac = .{ .algorithm = .hmac_sha256_128, .key = &sample_key } };
+    const ok = try build(&big, .{ .appid = 1, .apdu = apdu[0..65496] }, sealer);
+    try testing.expectEqual(@as(usize, 2 + 65535), ok.len);
+    try testing.expectError(error.FrameTooLong, build(&big, .{ .appid = 1, .apdu = apdu[0..65497] }, sealer));
+}
+
+test "mutation: verify bounds the tag by the verifier, and refuses a short ECDSA tag" {
+    var out: [512]u8 = undefined;
+    var dummy: u8 = 0;
+    // A raw sealer that writes an 11-octet tag: one more than HMAC-80 allows.
+    const sealer11: Sealer = .{ .raw = .{ .ctx = &dummy, .tag_len = 11, .sealFn = zeroSeal } };
+    const f11 = try build(&out, .{ .appid = 1, .apdu = &sample_apdu }, sealer11);
+    try testing.expectError(error.TagTooLong, verify(f11, .ed2020, .{ .mac = .{ .algorithm = .hmac_sha256_80, .key = &sample_key } }));
+
+    // A 63-octet tag handed to an ECDSA verifier is a failed check, not a
+    // slice past the tag.
+    const seed = @as([EcdsaP256.KeyPair.seed_length]u8, @splat(0x17));
+    var kp: EcdsaP256.KeyPair = undefined;
+    EcdsaP256.KeyPair.generateDeterministicInto(&kp, &seed) catch unreachable;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+    const sealer63: Sealer = .{ .raw = .{ .ctx = &dummy, .tag_len = 63, .sealFn = zeroSeal } };
+    const f63 = try build(&out, .{ .appid = 1, .apdu = &sample_apdu }, sealer63);
+    try testing.expectError(error.AuthenticationFailed, verify(f63, .ed2020, .{ .ecdsa_p256_sha256 = kp.public_key }));
+}
+
+test "mutation: RSA tag length rounds the modulus up to whole octets" {
+    const keys = @import("test_keys.zig");
+    var sk = try keys.rsa2047SecretKey();
+    defer sk.deinit();
+    const pk = try keys.rsa2047PublicKey();
+    try testing.expectEqual(@as(usize, 2047), pk.n.bits());
+    var prng = std.Random.DefaultPrng.init(1);
+    const s: Sealer = .{ .rsa_pss_sha256 = .{ .key = sk, .random = prng.random() } };
+    try testing.expectEqual(@as(usize, 256), s.tagLen());
+    const v: Verifier = .{ .rsa_pss_sha256 = pk };
+    try testing.expectEqual(@as(usize, 256), v.maxTagLen());
+}

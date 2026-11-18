@@ -293,3 +293,35 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "mutation: length-size edges, exact output buffers, 8- and 9-octet lengths" {
+    try testing.expectEqual(@as(usize, 1), lengthSize(0x7f));
+    try testing.expectEqual(@as(usize, 2), lengthSize(0x80));
+    try testing.expectEqual(@as(usize, 2), lengthSize(0xff));
+    try testing.expectEqual(@as(usize, 3), lengthSize(0x100));
+    try testing.expectEqual(@as(usize, 3), lengthSize(0xffff));
+    try testing.expectEqual(@as(usize, 4), lengthSize(0x1_0000));
+    try testing.expectEqual(@as(usize, 4), lengthSize(0xff_ffff));
+    try testing.expectEqual(@as(usize, 5), lengthSize(0x100_0000));
+
+    var h4: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), try writeHeader(&h4, 0x30, 0x1ff));
+    var h3: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, writeHeader(&h3, 0x30, 0x1ff));
+    var e5: [5]u8 = undefined;
+    try testing.expectEqualSlices(u8, "\x04\x03abc", try writeElement(&e5, 0x04, "abc"));
+    var e4: [4]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, writeElement(&e4, 0x04, "abc"));
+
+    // Eight length octets are legal on a 64-bit usize (this one says 2^56 and
+    // the buffer is short: Truncated, not InvalidLength) ...
+    const big8 = [_]u8{ 0x30, 0x88, 1, 0, 0, 0, 0, 0, 0, 0 };
+    try testing.expectError(error.Truncated, read(&big8));
+    // ... nine are not, even when the low eight octets would fit the buffer.
+    var nine: [2 + 9 + 0x90]u8 = @splat(0);
+    nine[0] = 0x30;
+    nine[1] = 0x89;
+    nine[2] = 1;
+    nine[10] = 0x90;
+    try testing.expectError(error.InvalidLength, read(&nine));
+}

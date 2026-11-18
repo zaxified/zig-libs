@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of the replay guards, BER, GOOSE/SV MAC and extension code, ACSE authentication fields and signed token, and the TLS profile (352 mutants, 338 killed, 14 EQUIVALENT; the card now carries whole-module counts). 19 tests added (replay boundaries incl. SV under default options, BER length edges, header/extension/IV/`build`/`verify` edges, ACSE field slices/duplicates/ordering, token strictness and signing-input bytes, every TLS-profile switch and boundary, EC/Ed25519/extKeyUsage certificate facts) and a 2047-bit RSA fixture in `test_keys.zig`. No module code changed. `SPEC.md` § Verification.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** GOOSE/SV GMAC now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
