@@ -116,6 +116,9 @@ pub const TypeId = enum(u8) {
     m_me_tc_1 = 14, // measured value, short float, with CP24Time2a
     m_it_na_1 = 15, // integrated totals
     m_it_ta_1 = 16, // integrated totals with CP24Time2a
+    m_ep_ta_1 = 17, // event of protection equipment with CP24Time2a
+    m_ep_tb_1 = 18, // packed start events of protection equipment with CP24Time2a
+    m_ep_tc_1 = 19, // packed output circuit information of protection equipment with CP24Time2a
     m_ps_na_1 = 20, // packed single-point with status change detection
     m_me_nd_1 = 21, // measured value, normalised, without quality
     m_sp_tb_1 = 30, // single-point with CP56Time2a
@@ -126,6 +129,9 @@ pub const TypeId = enum(u8) {
     m_me_te_1 = 35, // measured value, scaled, with CP56Time2a
     m_me_tf_1 = 36, // measured value, short float, with CP56Time2a
     m_it_tb_1 = 37, // integrated totals with CP56Time2a
+    m_ep_td_1 = 38, // event of protection equipment with CP56Time2a
+    m_ep_te_1 = 39, // packed start events of protection equipment with CP56Time2a
+    m_ep_tf_1 = 40, // packed output circuit information of protection equipment with CP56Time2a
 
     // control — process information in the control direction
     c_sc_na_1 = 45, // single command
@@ -319,6 +325,12 @@ pub const ElementKind = enum {
     parameter,
     /// Parameter element of `P_ME_NC_1`: R32 short float(4) + QPM(1).
     parameter_float,
+    /// SEP(1) + CP16Time2a elapsed time(2): M_EP_TA_1 / M_EP_TD_1.
+    protection_event,
+    /// SPE(1) + QDP(1) + CP16Time2a relay duration time(2): M_EP_TB_1 / M_EP_TE_1.
+    protection_start,
+    /// OCI(1) + QDP(1) + CP16Time2a relay operating time(2): M_EP_TC_1 / M_EP_TF_1.
+    protection_output,
 };
 
 /// Which time tag, if any, a type appends to its base element.
@@ -353,6 +365,8 @@ pub const Shape = struct {
             .bitstring_command => 4,
             .bitstring, .short_float, .counter, .setpoint_float, .packed_single, .parameter_float => 5,
             .parameter => 3,
+            .protection_event => 3,
+            .protection_start, .protection_output => 4,
         };
         return base + self.time.size();
     }
@@ -389,6 +403,12 @@ pub fn shapeOf(t: TypeId) ?Shape {
         .m_it_ta_1 => .{ .base = .counter, .time = .cp24 },
         .m_it_tb_1 => .{ .base = .counter, .time = .cp56 },
         .m_ps_na_1 => .{ .base = .packed_single, .time = .none },
+        .m_ep_ta_1 => .{ .base = .protection_event, .time = .cp24 },
+        .m_ep_tb_1 => .{ .base = .protection_start, .time = .cp24 },
+        .m_ep_tc_1 => .{ .base = .protection_output, .time = .cp24 },
+        .m_ep_td_1 => .{ .base = .protection_event, .time = .cp56 },
+        .m_ep_te_1 => .{ .base = .protection_start, .time = .cp56 },
+        .m_ep_tf_1 => .{ .base = .protection_output, .time = .cp56 },
 
         .c_sc_na_1 => .{ .base = .sco, .time = .none },
         .c_sc_ta_1 => .{ .base = .sco, .time = .cp56 },
@@ -457,6 +477,9 @@ pub const Element = union(ElementKind) {
     fbp: u16,
     parameter: struct { raw: [2]u8, qpm: u8 },
     parameter_float: struct { value: f32, qpm: u8 },
+    protection_event: struct { event: info.Sep, elapsed: info.CP16Time2a },
+    protection_start: struct { start: info.Spe, qdp: info.Qdp, duration: info.CP16Time2a },
+    protection_output: struct { output: info.Oci, qdp: info.Qdp, operating: info.CP16Time2a },
 
     /// The select/execute bit, for the command elements that carry one.
     /// Null for anything that is not a command.
@@ -713,6 +736,20 @@ pub fn decodeElement(kind: ElementKind, bytes: []const u8) Error!Element {
         .fbp => .{ .fbp = info.readU16(bytes[0..2]) },
         .parameter => .{ .parameter = .{ .raw = .{ bytes[0], bytes[1] }, .qpm = bytes[2] } },
         .parameter_float => .{ .parameter_float = .{ .value = info.readF32(bytes[0..4]), .qpm = bytes[4] } },
+        .protection_event => .{ .protection_event = .{
+            .event = info.Sep.fromByte(bytes[0]),
+            .elapsed = try info.CP16Time2a.decode(bytes[1..3]),
+        } },
+        .protection_start => .{ .protection_start = .{
+            .start = info.Spe.fromByte(bytes[0]),
+            .qdp = info.Qdp.fromByte(bytes[1]),
+            .duration = try info.CP16Time2a.decode(bytes[2..4]),
+        } },
+        .protection_output => .{ .protection_output = .{
+            .output = info.Oci.fromByte(bytes[0]),
+            .qdp = info.Qdp.fromByte(bytes[1]),
+            .operating = try info.CP16Time2a.decode(bytes[2..4]),
+        } },
     };
 }
 
@@ -780,6 +817,20 @@ pub fn encodeElement(element: Element, out: []u8) Error!usize {
         .parameter_float => |v| {
             info.writeF32(out[0..4], v.value);
             out[4] = v.qpm;
+        },
+        .protection_event => |v| {
+            out[0] = v.event.toByte();
+            _ = try v.elapsed.encode(out[1..3]);
+        },
+        .protection_start => |v| {
+            out[0] = v.start.toByte();
+            out[1] = v.qdp.toByte();
+            _ = try v.duration.encode(out[2..4]);
+        },
+        .protection_output => |v| {
+            out[0] = v.output.toByte();
+            out[1] = v.qdp.toByte();
+            _ = try v.operating.encode(out[2..4]);
         },
     }
     return need;
