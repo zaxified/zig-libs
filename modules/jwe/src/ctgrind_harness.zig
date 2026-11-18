@@ -122,11 +122,22 @@ fn drive(
     defer gpa.free(token);
     const pt_raw = try jwe.decryptCompact(gpa, dec_key, token, .{});
     // The plaintext LENGTH is public once the tag verified (a CBC unpad length
-    // is the sender's choice); memcheck cannot know, so declassify it here and
-    // let the harness's own copy / free / print run on a defined length. The
-    // module's own length-dependent branches stay in the count.
-    var n = pt_raw.len;
-    memcheck.makeMemDefined(std.mem.asBytes(&n));
+    // is the sender's choice), so the harness's own copy / free / print run on
+    // the length of the plaintext IT sent, never on the returned one. The
+    // module's own length-dependent branches stay in the count. Why not just
+    // declassify the returned length: on baseline x86-64 std's soft AES pads a
+    // partial bitsliced batch with `undefined` lanes (ctgrind-expected.tsv
+    // cause A2), memcheck then reports the CBC-HS unpad length as undefined
+    // even untainted, and in the no-`-fvalgrind` trap no client request can
+    // declassify it -- the harness's memcpy / free / munmap on it were 5
+    // UNATTRIBUTED contexts there. With valgrind support the returned length is
+    // declassified and checked against it, so a wrong length still fails.
+    const n = plaintext.len;
+    if (builtin.valgrind_support) {
+        var got = pt_raw.len;
+        memcheck.makeMemDefined(std.mem.asBytes(&got));
+        if (got != n) return error.PlaintextLength;
+    }
     const pt = pt_raw.ptr[0..n];
     defer gpa.free(pt);
     publish(label, pt);

@@ -106,7 +106,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 // So is the harness allocator's bump index, which moved by it:
                 // left tainted, every later allocation's ADDRESS is tainted.
                 std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&fba.end_index));
-                std.debug.print("ctgrind_result={x}\n", .{d.plaintext});
+                // The print runs on the length of the plaintext the harness
+                // SENT (public), checked against the returned one where it
+                // could be declassified above. On baseline x86-64 std's soft
+                // AES pads a partial bitsliced batch with `undefined` lanes
+                // (ctgrind-expected.tsv cause A2), so memcheck reports the
+                // unpad length as undefined even untainted, and the no-
+                // `-fvalgrind` trap cannot declassify it: printing over it was
+                // an UNATTRIBUTED context there.
+                if (builtin.valgrind_support and d.plaintext.len != pt.len) return error.PlaintextLength;
+                std.debug.print("ctgrind_result={x}\n", .{d.plaintext.ptr[0..pt.len]});
                 d.deinit(gpa);
                 m.deinit(gpa);
             }
