@@ -167,6 +167,7 @@ declare -A TARGETS=(
     # 2026-10-18: `pem` = HostKey.fromOpenSSH with the seed's base64 tainted,
     # `pemstd` its positive control (the replaced indexOfPos + std.base64 decoder).
     [ssh]="dh ffpow ecdh gex pem pemstd"
+    [isis]="md5 sha256"
     # `comb` (C3's fixed-base comb via `mulBase`), `ladderbase` (the pre-C3
     # window ladder over the comptime table, still reachable as
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
@@ -354,6 +355,7 @@ declare -A MODES=(
     [hqc]="ReleaseFast"
     [oscore]="ReleaseFast"
     [ssh]="ReleaseFast"
+    [isis]="ReleaseFast"
     [ct25519]="ReleaseFast"
     [mlkem]="ReleaseFast"
     [decaf448]="ReleaseFast"
@@ -491,6 +493,8 @@ declare -A PATTERN=(
     [ssh/gex]='transport[.]zig|dyn[.]zig|montint[.]zig|limbs[.]zig'
     [ssh/pem]='server[.]zig|burn[.]zig'
     [ssh/pemstd]='mem[.]zig|base64[.]zig'
+    [isis/md5]='auth[.]zig|hmac[.]zig|md5[.]zig|timing_safe[.]zig'
+    [isis/sha256]='auth[.]zig|hmac[.]zig|sha2[.]zig|timing_safe[.]zig'
     # The AEAD's own claim: the tag comparison and the cipher/MAC glue in
     # `root.zig`. Added 2026-09-02 -- the module was listed with the poly1305
     # target alone, so `SPEC.md`'s constant-time sentence about the tag
@@ -1014,6 +1018,8 @@ declare -A LABEL=(
     [oscore/derive]='oscore+std hkdf'
     [oscore/protect]='oscore+std ccm'
     [oscore/unprotect]='oscore+std ccm'
+    [isis/md5]='isis auth sign+verify HMAC-MD5 P2P IIH (key tainted)'
+    [isis/sha256]='isis auth sign+verify HMAC-SHA-256, plain and strict RFC 5310 key prep (key tainted)'
     [ssh/dh]='ssh MODP DH x (montint)'
     [ssh/ffpow]='ssh POSITIVE CONTROL: std ff pow on x'
     [ssh/ecdh]='ssh NIST ECDH scalar (P-256, P-384, P-521)'

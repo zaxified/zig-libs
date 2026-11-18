@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-14 · mutation 2026-11-18 (577/589, 12 eq) · src 9e437792bddf5252
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_FUZZ) · ct none
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ISIS_FUZZ) · ct 2026-11-19 (ctgrind; auth sign+verify HMAC-MD5 and HMAC-SHA-256 plain + strict, key tainted: 0 in-file)
 
 **Performance:** not measured
 
@@ -227,10 +227,13 @@ Python `hmac`/`hashlib`, its own ISO 8473 checksum. The module's builders plus
 could not be run here, so the holo cross-check is by reading (same segments,
 same Apad, same plain keying), not by execution.
 
-**ctgrind.** A harness (MD5, SHA-256 plain and strict, cleartext; key
-tainted) was written but is not committed: wiring it needs entries in
-`scripts/checks/ctgrind.sh` that this change did not make. Until then the
-Hardening line says `ct none` (was `n/a — no auth` until the codec gained a key on 2026-11-18): by construction the key reaches only std HMAC and the constant-time compare, and the code branches only on public lengths and the declassified verdict — a claim from reading, not from memcheck.
+**ctgrind.** `src/ctgrind_harness.zig`, targets `md5` and `sha256` (plain and
+strict RFC 5310 key preparation), key tainted, ReleaseFast: 0 contexts in module
+files on x86_64 native and on the portable `CTGRIND_CPU=x86_64` build
+(2026-11-19). The harness also has a `clear` arm (cleartext password), which is
+not a ctgrind target: its taint reaches no reported context (total 0, the
+witness does not fire), so a row would measure nothing, and a cleartext password
+travels in the PDU anyway.
 
 ## Verification
 
