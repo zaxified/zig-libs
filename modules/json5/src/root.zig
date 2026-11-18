@@ -73,6 +73,12 @@ pub const Options = struct {
     /// back into a source position (`SourceMap.sourceOffset`). `parseFromSlice`
     /// does this for you.
     source_map: ?*SourceMap = null,
+    /// `preprocessWithOptions` only (`preprocessAnnotated` never fails on the
+    /// input and ignores it): the deepest container nesting accepted; an
+    /// opening bracket that would be level `max_depth + 1` fails with
+    /// `error.NestingTooDeep` (and fills `diagnostic`). `null`: no limit.
+    /// `parseFromSlice` sets it from `ParseOptions.max_depth`.
+    max_depth: ?usize = null,
 };
 
 /// Output offset → source offset, recorded by `preprocessWithOptions` at the
@@ -136,9 +142,15 @@ pub const SourceMap = struct {
 /// How `parseFromSlice` reads the document: the JSON5 options (non-finite
 /// numbers) and the `std.json` ones (duplicate keys, unknown fields, the
 /// longest string or number via `max_value_len`), plus where to put a
-/// failure's position. There is no depth limit: into a `std.json.Value` the
-/// parse is iterative (std's and this module's alike), so depth costs heap,
-/// not stack.
+/// failure's position.
+///
+/// Depth: into a `std.json.Value` the parse is iterative (std's and this
+/// module's alike), so depth costs heap, not stack, and `max_depth` does not
+/// apply. Into any other `T` std's typed parser recurses once or twice per
+/// level, so a self-referential `T` (`struct { children: []@This() }`) fed
+/// nesting tens of thousands deep overflows the stack (measured 2026-11-18:
+/// SIGSEGV between 10 000 and 20 000 levels in ReleaseFast with the 8 MiB main
+/// stack, earlier in Debug); `max_depth` refuses such input first.
 pub const ParseOptions = struct {
     /// `json5.diagnostic` is used when `diagnostic` below is null;
     /// `json5.source_map` is filled when neither is set (with one,
@@ -151,6 +163,12 @@ pub const ParseOptions = struct {
     /// turns off the single-pass `std.json.Value` reader: positions come
     /// from the two-stage path.
     diagnostic: ?*Diagnostic = null,
+    /// Deepest container nesting accepted when `T` is not `std.json.Value`;
+    /// one level deeper is `error.NestingTooDeep`, before std recurses. The
+    /// default 128 is serde_json's recursion limit (the json5 crate sits on
+    /// serde); `null` lifts it, for a `T` whose own depth you bound. Ignored
+    /// for a `std.json.Value` target, which has no limit.
+    max_depth: ?usize = 128,
 };
 
 /// JSON5 text → `T` in one call: `preprocessWithOptions` then
@@ -175,6 +193,7 @@ pub fn parseFromSlice(comptime T: type, alloc: std.mem.Allocator, input: []const
     defer map.deinit(alloc);
     var o5 = opts.json5;
     o5.diagnostic = diagnostic;
+    if (T != std.json.Value) o5.max_depth = opts.max_depth;
     if (diagnostic != null) o5.source_map = &map;
     const text = try preprocessWithOptions(alloc, input, o5);
     defer alloc.free(text);
@@ -572,7 +591,8 @@ fn lineCol(input: []const u8, off: usize) struct { line: usize, col: usize } {
 /// Preprocess JSON5 source and return a new slice owned by alloc.
 /// Besides `error.OutOfMemory` it fails with `error.NonFiniteNumber`
 /// (`Infinity`/`NaN` under the default `.reject`) and `error.HexLiteralTooLarge`
-/// (a hex literal with more than `hex_digits_max` significant digits).
+/// (a hex literal with more than `hex_digits_max` significant digits), and,
+/// when `Options.max_depth` is set, `error.NestingTooDeep`.
 pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return preprocessWithOptions(alloc, input, .{});
 }
@@ -764,6 +784,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
         // ── structural tokens ────────────────────────────────────────────────
         switch (c) {
             '{' => {
+                if (options.max_depth) |m| if (nest.items.len >= m) return tooDeep(options.diagnostic, input, i, &lines);
                 try nest.append(alloc, '{');
                 key_pos = true;
                 try push(&out, alloc, c);
@@ -777,6 +798,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                 i += 1;
             },
             '[' => {
+                if (options.max_depth) |m| if (nest.items.len >= m) return tooDeep(options.diagnostic, input, i, &lines);
                 try nest.append(alloc, '[');
                 key_pos = false;
                 try push(&out, alloc, c);
@@ -1501,6 +1523,19 @@ fn lineOf(input: []const u8, pos: usize) usize {
         if (ch == '\n') line += 1;
     }
     return line;
+}
+
+/// `error.NestingTooDeep` for the bracket at `input[at]`, with its position.
+fn tooDeep(diagnostic: ?*Diagnostic, input: []const u8, at: usize, lines: *LineCounter) error{NestingTooDeep} {
+    if (diagnostic) |d| d.* = literalDiagnostic(
+        input,
+        lines,
+        at,
+        at + 1,
+        "containers are nested deeper than the allowed maximum",
+        "raise ParseOptions.max_depth (or Options.max_depth), or null for no limit",
+    );
+    return error.NestingTooDeep;
 }
 
 /// The `Diagnostic` for a refused literal at `input[start..end]`.
@@ -4517,4 +4552,125 @@ test "strings past one vector: a control byte inside the first vector" {
     const out = try preprocess(gpa, "'\x1f" ++ pad ++ "'");
     defer gpa.free(out);
     try std.testing.expectEqualStrings("\"\\u001f" ++ pad ++ "\"", out);
+}
+
+// ── nesting limit (wave 7, J-2) ────────────────────────────────────────────
+
+const DeepNode = struct { children: []const DeepNode = &.{} };
+
+/// `n` objects, each holding one array (the next object inside it), closed again: `2 * n` containers deep.
+fn deepDoc(gpa: std.mem.Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    for (0..n) |_| try buf.appendSlice(gpa, "{children:[");
+    for (0..n) |_| try buf.appendSlice(gpa, "]}");
+    return buf.toOwnedSlice(gpa);
+}
+
+test "max_depth: preprocess accepts exactly the limit, one more is NestingTooDeep" {
+    const gpa = std.testing.allocator;
+    var d: Diagnostic = .{};
+    // Arrays and objects each count one level.
+    const ok_arr = try preprocessWithOptions(gpa, "[[]]", .{ .max_depth = 2 });
+    gpa.free(ok_arr);
+    const ok_obj = try preprocessWithOptions(gpa, "{a:{}}", .{ .max_depth = 2 });
+    gpa.free(ok_obj);
+    try std.testing.expectError(error.NestingTooDeep, preprocessWithOptions(gpa, "[[[]]]", .{ .max_depth = 2 }));
+    try std.testing.expectError(error.NestingTooDeep, preprocessWithOptions(gpa, "{a:{b:{}}}", .{ .max_depth = 2 }));
+    try std.testing.expectError(error.NestingTooDeep, preprocessWithOptions(gpa, "{a:[{}]}", .{ .max_depth = 2 }));
+    // Siblings and closed containers do not accumulate.
+    const sib = try preprocessWithOptions(gpa, "[[],[],[[]]]", .{ .max_depth = 3 });
+    gpa.free(sib);
+    const seq = try preprocessWithOptions(gpa, "{a:[],b:{},c:[]}", .{ .max_depth = 2 });
+    gpa.free(seq);
+    // 0 refuses every container but takes a scalar; null is no limit.
+    try std.testing.expectError(error.NestingTooDeep, preprocessWithOptions(gpa, "[]", .{ .max_depth = 0 }));
+    try std.testing.expectError(error.NestingTooDeep, preprocessWithOptions(gpa, "{}", .{ .max_depth = 0 }));
+    const scalar = try preprocessWithOptions(gpa, "1", .{ .max_depth = 0 });
+    gpa.free(scalar);
+    const none = try preprocessWithOptions(gpa, "[[[[[[]]]]]]", .{});
+    gpa.free(none);
+    // The position is the first bracket over the limit.
+    try std.testing.expectError(error.NestingTooDeep, preprocessWithOptions(gpa, "[\n  [\n    [1]]]", .{ .max_depth = 2, .diagnostic = &d }));
+    try std.testing.expectEqual(@as(usize, 3), d.line);
+    try std.testing.expectEqual(@as(usize, 5), d.col);
+    try std.testing.expectEqual(@as(usize, 10), d.offset);
+    try std.testing.expectEqual(@as(usize, 1), d.len);
+    try std.testing.expect(d.message.len != 0);
+    try std.testing.expect(d.hint.len != 0);
+}
+
+test "max_depth: recovery does not slip a container past the limit" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.NestingTooDeep, preprocessWithOptions(gpa, "{a b: 1, c: [[1]]}", .{ .max_depth = 2 }));
+}
+
+test "max_depth: a typed parse stops at 128 levels by default, before std recurses" {
+    const gpa = std.testing.allocator;
+    // The default counts every container: n objects each holding one array.
+    const ok = try deepDoc(gpa, 64); // 128 containers
+    defer gpa.free(ok);
+    const p = try parseFromSlice(DeepNode, gpa, ok, .{});
+    p.deinit();
+    const over = try deepDoc(gpa, 65); // 130 containers; 129 is the first refused
+    defer gpa.free(over);
+    var d: Diagnostic = .{};
+    try std.testing.expectError(error.NestingTooDeep, parseFromSlice(DeepNode, gpa, over, .{ .diagnostic = &d }));
+    // Without a diagnostic too, and the offset is the 129th container, the 65th object (11 bytes per object+array pair).
+    try std.testing.expectError(error.NestingTooDeep, parseFromSlice(DeepNode, gpa, over, .{}));
+    try std.testing.expectEqual(@as(usize, 64 * 11), d.offset);
+    try std.testing.expectEqual(@as(usize, 1), d.line);
+    // `std.json`'s own errors keep their mapping.
+    try std.testing.expectError(error.SyntaxError, parseFromSlice(DeepNode, gpa, "{children:[}", .{}));
+}
+
+test "max_depth: hostile depth is refused fast, typed; a raised limit and null are honoured" {
+    const gpa = std.testing.allocator;
+    // 1e5 levels of a self-referential T used to overflow the stack (SIGSEGV).
+    const huge = try deepDoc(gpa, 100_000);
+    defer gpa.free(huge);
+    try std.testing.expectError(error.NestingTooDeep, parseFromSlice(DeepNode, gpa, huge, .{}));
+    // The limit is the caller's to raise...
+    const mid = try deepDoc(gpa, 200); // 400 containers
+    defer gpa.free(mid);
+    try std.testing.expectError(error.NestingTooDeep, parseFromSlice(DeepNode, gpa, mid, .{}));
+    const p = try parseFromSlice(DeepNode, gpa, mid, .{ .max_depth = 400 });
+    p.deinit();
+    try std.testing.expectError(error.NestingTooDeep, parseFromSlice(DeepNode, gpa, mid, .{ .max_depth = 399 }));
+    // ...or to lift.
+    const q = try parseFromSlice(DeepNode, gpa, mid, .{ .max_depth = null });
+    q.deinit();
+}
+
+test "max_depth: a std.json.Value target has no limit (iterative, heap only)" {
+    const gpa = std.testing.allocator;
+    const huge = try deepDoc(gpa, 20_000);
+    defer gpa.free(huge);
+    const v = try parseFromSlice(std.json.Value, gpa, huge, .{});
+    v.deinit();
+    // Both Value paths: the single-pass reader above, and the two-stage path a diagnostic selects.
+    var d: Diagnostic = .{};
+    const w = try parseFromSlice(std.json.Value, gpa, huge, .{ .diagnostic = &d });
+    w.deinit();
+}
+
+test "recovery expansion is linear: about 15 output bytes per input byte at most" {
+    // Measured 2026-11-18 over 10 000 malformed members of several shapes:
+    // 9.8 to 14.4 output bytes per input byte (one ~58-byte `$err_N` entry per
+    // ~4-byte member). There is no recovered-error cap: no reference bounds
+    // recovery (it is this module's own feature), the growth is linear, and a
+    // caller that cares limits the input length.
+    const gpa = std.testing.allocator;
+    const shapes = [_][]const u8{ "a b,", "a b:1,", "a b,c d,", "x y z,", "\xc3\xa9 b," };
+    for (shapes) |shape| {
+        var in: std.ArrayList(u8) = .empty;
+        defer in.deinit(gpa);
+        try in.append(gpa, '{');
+        for (0..2000) |_| try in.appendSlice(gpa, shape);
+        try in.append(gpa, '}');
+        const r = try preprocessAnnotated(gpa, in.items);
+        defer gpa.free(r.out);
+        try std.testing.expect(r.out.len <= 16 * in.items.len);
+        try std.testing.expect(r.out.len > in.items.len);
+    }
 }
