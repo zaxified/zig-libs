@@ -6,7 +6,7 @@
 
 **Scope:** core — Bitcoin Core v31.1 `script/interpreter.cpp` (libbitcoinconsensus behaviour) + btcd `txscript` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-07 · mutation 2026-09-02 · src ?
+**Audit:** review 2026-09-07 · mutation 2026-11-17 (646/675, 29 eq) · src 97de3e05c7f891ca
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BITCOINSCRIPT_FUZZ) · ct n/a — public script data (keyword review, 2026-10-07)
 
@@ -380,6 +380,22 @@ item count, an oversized P2WSH stack-seed item, an oversized P2WPKH witness item
 P2SH redeem script (bounded to `MAX_SCRIPT_ELEMENT_SIZE` as a *push*, independent of its own
 `MAX_SCRIPT_SIZE` ceiling once *executed*) round-trips correctly at the boundary.
 
+### Signature encoding: strict (BIP66) versus Core's lax parser
+
+With `dersig`, `low_s` or `strictenc` set, a signature element must pass `isValidSignatureEncoding`
+(BIP66, transcribed). Without them Core does NOT skip DER: `CPubKey::Verify` runs
+`ecdsa_signature_parse_der_lax` (`src/pubkey.cpp`, MIT; read 2026-11-17) and `sigcheck.parseDerLoose`
+reproduces its acceptance rules exactly: tag `0x30`; a sequence length that is short-form, or
+long-form whose length bytes are skipped, and is NEVER checked against the data; `R` and `S` as `0x02`
+integers whose length is short-form or long-form (leading zero length bytes skipped, at most three
+significant ones); the content must lie inside the input; leading zeros trimmed, no sign padding
+(values read as unsigned), trailing bytes after `S` ignored; more than 32 significant bytes is an
+overflow, which Core turns into the all-zero signature and this module into "does not verify". Before
+2026-11-17 the parser was stricter (long-form lengths and an over-long sequence length were refused),
+a consensus divergence for validation without `dersig`. High-`S` signatures verify (Core normalizes
+`S`); `low_s` rejects them first. The element's LAST byte is always the hashtype, so an `S` that ends
+in the sighash byte does not borrow it.
+
 ## Flags
 
 `ScriptFlags` mirrors Bitcoin Core's `SCRIPT_VERIFY_*` set field-for-field; every field's doc
@@ -394,6 +410,10 @@ rejects the two legacy scriptCode mutations — `FindAndDelete(vchSig)` removing
 `OP_CODESEPARATOR` appearing in a `SigVersion.base` script at all, executed branch or not. Both
 remain fully implemented at consensus level (flag off); the flag only makes them observable. It is
 `false` in `.none` and `true` in `.standard`, matching Core's `STANDARD_SCRIPT_VERIFY_FLAGS`.
+
+### Audit 2026-11-17 (whole-module mutation)
+
+**Audit 2026-11-17 (whole-module mutation).** 675 mutants over every non-test line of `opcodes.zig`, `number.zig`, `sigcheck.zig`, `interpreter.zig`, `tapscript.zig` and `verify.zig` (stack machine: every opcode's semantics and stack-depth guard, push decoding and minimal-push rules, `FindAndDelete` and the scriptCode builder, the condition stack, CLTV/CSV, CHECKSIG / CHECKMULTISIG including NULLFAIL/NULLDUMMY, tapscript budget and pubkey typing, BIP66 checks, the lax DER parser, the BIP341 commitment and signature rules, witness-program recognition, P2SH, every `verifyScript` limit and flag). `flags.zig`, `limits.zig`, `txctx.zig`, `root.zig` (constants and declarations, covered by their own tests) and every `*_test.zig` / `*_vectors.zig` / `asmparser.zig` (test support) were not mutated. Sighash computation itself lives in `bitcointx` and is out of this module's source. One schemata build per round, baseline first. Round 1 (before any change): 445 killed, 3 hung, 209 survived: the pinned `script_tests.json` subset leaves most stack opcodes without an exact-result check and most guards without an exactly-one-short case. About 30 tests (many table rows each) were added (`mutation_gap_test.zig`, plus tests in `interpreter.zig`, `sigcheck.zig`, `number.zig`): exact result stacks for every stack, arithmetic and hash opcode; every depth guard with one operand too few and exactly enough; shortest-push at every length boundary; the canonical push `FindAndDelete` searches for at all four shapes; PUSHDATA prefixes that are the last bytes of the script; the tapscript budget landing on zero, pubkey typing, codeseparator position, MINIMALIF; CLTV/CSV operand typing, policy NOPs, disable flags and the 16-bit mask; VERIF in an unexecuted branch; limits exactly at their bound; P2SH recognition (each of its three markers), the single-push rule, CLEANSTACK after a wrapped witness program; witness-program shapes; every taproot dispatch rule; the validation-weight budget to the byte (with and without annex); `checkSchnorrSig` sizes and hashtype; BIP66 length edges; flag-by-flag encoding checks; a CHECKMULTISIG signed over the post-codeseparator scriptCode; an `S` that ends in its own hashtype byte. **Finding fixed:** the loose DER parser was stricter than Bitcoin Core's lax parser (see "Signature encoding"); rewritten after `ecdsa_signature_parse_der_lax`, with a hand-built signature per lax rule, and its 31 delta mutants killed (two are equivalent, counted below). Round 2: 636 killed, 3 hung, 36 survived; 7 more were killed by three added tests, 29 do not die: 27 EQUIVALENT (an empty-data minimal push is covered by the generic `opcode == len` rule; the `OP_n` arm of the minimal-push check never fires because a data push opcode is `<= 0x4e`; a 76-byte push is `0x4c` either way; the `findAndDelete` end test duplicates `readInstruction`'s own bound; `ConditionStack` `>=` for `==` under `first_false <= size`; CHECKMULTISIG `len <= n_keys` fails with the same error one step later; the `key_i >= n_keys` guard under `sigs_remaining <= keys_remaining`; `instr.data == null` implied by `opcode > OP_16`; the MINIMALIF `top.len >= 1` arm under `top.len > 1`; BIP66 minimum length 8 under `len_r, len_s >= 1`; `isLowS` over the full element parses the same; an empty signature reaches `false` through the parser; a lax-parse long-form length with 4 significant bytes is at least 2^24 and cannot fit; the lax sequence-length bound when no byte can follow; `isExactPush`'s compare and undecodable arm, `0x50` as a version, 1- and 41-byte programs, the key-path `<= 1` arm and the initial-stack bound, which earlier checks make unreachable; the stack copy when `p2sh` is off is cost-only; an empty stack copy and CLEANSTACK `> 1` follow from a non-empty stack) and 2 UNOBSERVABLE (the BIP341 tweak `>=` order: a tagged hash landing on or above the group order is a 2^-128 event with no known preimage). Counts on the card are whole-module.
 
 ## Anchoring
 
