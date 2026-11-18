@@ -419,6 +419,20 @@ environment with OpenSSH installed.
   listens, so a port collision can turn one live test into a skip on an individual run (observed
   once in ~10 runs); a run that reports no skips is the one that proves interop.
 
+- **Audit 2026-11-18 (whole-module mutation) — partial, not yet a card score.** 905 generated
+  mutants over the non-test code of `transport`, `server`, `userauth`, `connection`, `messages`,
+  `keys`, `knownhosts` (818 N with the switch in the caller, 87 W wipe/burn sites switched inside
+  `burn.zig`), plus 7 constant-time mutants judged apart. Three ReleaseSafe passes; the stack-burn
+  sites in a ReleaseFast pass. Every survivor so far was a missing test or an argued equivalent;
+  no defect in a MAC, signature, host-key, strict-KEX or userauth check. About 120 killing tests
+  were added (see the 2026-11-17 changelog entry). One LOW finding left as it is: a userauth banner
+  of exactly `max_banner_len` (8 KiB) cannot be sent, because `writePacket`'s 8 KiB frame refuses
+  it with `PacketTooLarge` (the test pins this). Still open when the time budget ran out:
+  the server channel-request handlers (`pty-req`, `window-change`, `env`, `exec`/`subsystem`
+  replies) and most of `knownhosts` were not yet run, and the newest killing tests (connection,
+  `keys`, `messages`) were not yet measured against their mutants. The card keeps
+  `mutation 2026-08-22 · src ?` until a run closes them.
+
 ## Build options
 
 Consumer build options (CONVENTIONS §4.2), added 2026-10-18:

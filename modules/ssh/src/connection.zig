@@ -2521,23 +2521,16 @@ fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []cons
         try gpa.print("PubkeyAcceptedAlgorithms={s}", .{sshd_pubkey_algorithms});
     defer gpa.free(alg_opt);
 
+    // setpriv: the test sshd gets SIGKILL when this process dies, even by
+    // SIGKILL (a mutation run's timeout), so it is never left orphaned.
     var sshd = std.process.spawn(io, .{
         .argv = &.{
-            sshd_path,                         "-D",
-            "-e",                              "-f",
-            "/dev/null",                       "-h",
-            hk_path,                           "-o",
-            port_opt,                          "-o",
-            "ListenAddress=127.0.0.1",         "-o",
-            "UsePAM=no",                       "-o",
-            "StrictModes=no",                  "-o",
-            "PidFile=none",                    "-o",
-            "LogLevel=QUIET",                  "-o",
-            "PubkeyAuthentication=yes",        "-o",
-            "PasswordAuthentication=no",       "-o",
-            "KbdInteractiveAuthentication=no", "-o",
-            alg_opt,                           "-o",
-            ak_opt,
+            "/usr/bin/setpriv",         "--pdeathsig", "KILL",                      "--", sshd_path,                         "-D",
+            "-e",                       "-f",          "/dev/null",                 "-h", hk_path,                           "-o",
+            port_opt,                   "-o",          "ListenAddress=127.0.0.1",   "-o", "UsePAM=no",                       "-o",
+            "StrictModes=no",           "-o",          "PidFile=none",              "-o", "LogLevel=QUIET",                  "-o",
+            "PubkeyAuthentication=yes", "-o",          "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no", "-o",
+            alg_opt,                    "-o",          ak_opt,
         },
         .stdout = .ignore,
         .stderr = .ignore,
@@ -3358,4 +3351,578 @@ test "serveSession: messages the client sends after our CLOSE are dropped, not a
     var last: u8 = 0;
     while (transport.readPacket(&rr, &c, &pbuf)) |pkt| last = pkt.payload[0] else |_| {}
     try t.expectEqual(@as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE)), last);
+}
+
+// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+
+fn countPackets(wire: []const u8, msg: u8, sizes: ?*std.ArrayList(usize), gpa: std.mem.Allocator) !usize {
+    var r: std.Io.Reader = .fixed(wire);
+    var c: transport.CipherState = .plaintext;
+    var buf: [64 * 1024]u8 = undefined;
+    var n: usize = 0;
+    while (r.bufferedLen() > 0) {
+        const p = try transport.readPacket(&r, &c, &buf);
+        if (msgType(p) != msg) continue;
+        n += 1;
+        if (sizes) |s| try s.append(gpa, std.mem.readInt(u32, p.payload[5..9], .big));
+    }
+    return n;
+}
+
+/// A standalone Session opened against canned server packets (plaintext):
+/// OPEN_CONFIRMATION with `window`, then `rest`.
+const Canned = struct {
+    wire: [16 * 1024]u8 = undefined,
+    sink_buf: [64 * 1024]u8 = undefined,
+    r: std.Io.Reader = undefined,
+    sink: std.Io.Writer = undefined,
+    t: transport.Transport = undefined,
+
+    fn open(self: *Canned, window: u32, rest: []const []const u8) !Session {
+        return self.openWith(0, window, 32 * 1024, rest);
+    }
+
+    fn openWith(self: *Canned, recipient: u32, window: u32, max_packet: u32, rest: []const []const u8) !Session {
+        var w: std.Io.Writer = .fixed(&self.wire);
+        var none: transport.CipherState = .plaintext;
+        var conf: [17]u8 = undefined;
+        conf[0] = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
+        std.mem.writeInt(u32, conf[1..5], recipient, .big);
+        std.mem.writeInt(u32, conf[5..9], 7, .big);
+        std.mem.writeInt(u32, conf[9..13], window, .big);
+        std.mem.writeInt(u32, conf[13..17], max_packet, .big);
+        try transport.writePacket(&w, &none, .os, &conf);
+        for (rest) |p| try transport.writePacket(&w, &none, .os, p);
+        self.r = .fixed(w.buffered());
+        self.sink = .fixed(&self.sink_buf);
+        self.t = transport.Transport.init(&self.r, &self.sink);
+        return Session.open(&self.t, std.testing.allocator, .{});
+    }
+};
+
+test "connection msgType: an empty payload is message 0" {
+    try std.testing.expectEqual(@as(u8, 0), msgType(.{ .packet_length = 5, .padding_length = 4, .payload = "", .padding = "", .mac = "" }));
+}
+
+test "Session: requests and data on a channel that is closed in any way are ChannelClosed, nothing sent" {
+    const t = std.testing;
+    inline for (.{ "open", "sent_eof", "sent_close", "got_close" }) |field| {
+        var c: Canned = .{};
+        var s = try c.open(1024, &.{});
+        defer s.deinit();
+        if (comptime std.mem.eql(u8, field, "open")) s.ch.open = false else @field(s.ch, field) = true;
+        const before = c.sink.buffered().len;
+        try t.expectError(error.ChannelClosed, s.writeData("x"));
+        if (!comptime std.mem.eql(u8, field, "sent_eof")) try t.expectError(error.ChannelClosed, s.requestRaw("env", false, ""));
+        try t.expectEqual(before, c.sink.buffered().len);
+    }
+}
+
+test "Session.writeData: never more than the peer's window in flight; a close while waiting is ChannelClosed" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    {
+        var adj: [9]u8 = undefined;
+        adj[0] = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_WINDOW_ADJUST);
+        std.mem.writeInt(u32, adj[1..5], 0, .big);
+        std.mem.writeInt(u32, adj[5..9], 5, .big);
+        var c: Canned = .{};
+        var s = try c.open(5, &.{&adj});
+        defer s.deinit();
+        try s.writeData("0123456789");
+        var sizes: std.ArrayList(usize) = .empty;
+        defer sizes.deinit(gpa);
+        try t.expectEqual(@as(usize, 2), try countPackets(c.sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_DATA), &sizes, gpa));
+        try t.expectEqualSlices(usize, &.{ 5, 5 }, sizes.items);
+        try t.expectEqual(@as(u32, 0), s.ch.remote_window);
+    }
+    {
+        var close: [5]u8 = undefined;
+        close[0] = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE);
+        std.mem.writeInt(u32, close[1..5], 0, .big);
+        var c: Canned = .{};
+        var s = try c.open(0, &.{&close});
+        defer s.deinit();
+        try t.expectError(error.ChannelClosed, s.writeData("x"));
+    }
+}
+
+test "Session.signal: a name of 32 bytes is sent, 33 is refused" {
+    const t = std.testing;
+    const name: [33]u8 = @splat('S');
+    var c: Canned = .{};
+    var s = try c.open(1024, &.{});
+    defer s.deinit();
+    try s.signal(name[0..32]);
+    try t.expectError(error.ProtocolError, s.signal(&name));
+    try t.expectEqual(@as(usize, 1), try countPackets(c.sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_REQUEST), null, t.allocator));
+}
+
+test "maybeAdjustWindow: no adjust at exactly half consumed, one just past it; EOF is sent once and never after CLOSE" {
+    const t = std.testing;
+    var out: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&out);
+    var tr = transport.Transport.init(undefined, &sink);
+    var ch: ChannelState = .{ .local_id = 0, .remote_id = 7, .local_window = 50, .local_window_initial = 100, .local_max_packet = 1024 };
+    try maybeAdjustWindow(&tr, &ch);
+    try t.expectEqual(@as(usize, 0), sink.buffered().len);
+    ch.local_window = 49;
+    try maybeAdjustWindow(&tr, &ch);
+    try t.expectEqual(@as(u32, 100), ch.local_window);
+    const adjusted = sink.buffered().len;
+    try sendEofMsg(&tr, &ch);
+    try sendEofMsg(&tr, &ch);
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_EOF), null, t.allocator));
+    var ch2 = ch;
+    ch2.sent_eof = false;
+    ch2.sent_close = true;
+    const before = sink.buffered().len;
+    try sendEofMsg(&tr, &ch2);
+    try t.expectEqual(before, sink.buffered().len);
+    try t.expect(adjusted > 0);
+}
+
+test "Session.open: a confirmation for another channel, a second confirmation, or a zero maximum packet size is refused" {
+    const t = std.testing;
+    {
+        var c: Canned = .{};
+        try t.expectError(error.ProtocolError, c.openWith(5, 1024, 1024, &.{}));
+    }
+    {
+        var c: Canned = .{};
+        try t.expectError(error.ChannelOpenFailed, c.openWith(0, 1024, 0, &.{}));
+    }
+    {
+        var again: [17]u8 = @splat(0);
+        again[0] = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
+        again[16] = 1;
+        var c: Canned = .{};
+        var s = try c.open(1024, &.{&again});
+        defer s.deinit();
+        try t.expectError(error.ProtocolError, s.pumpOnce());
+    }
+}
+
+/// Test-only: a channel message `type ‖ recipient 0 ‖ rest` into `buf`.
+fn chMsg(buf: []u8, mt: messages.MessageType, rest: []const u8) []u8 {
+    buf[0] = @backingInt(mt);
+    @memset(buf[1..5], 0);
+    @memcpy(buf[5..][0..rest.len], rest);
+    return buf[0 .. 5 + rest.len];
+}
+
+test "Session.pumpOnce: open-failure checks, output caps, extended data codes, window saturation, exit reports" {
+    const t = std.testing;
+    var b: [8][128]u8 = undefined;
+    {
+        // OPEN_FAILURE for another channel, or for an open one.
+        var c: Canned = .{};
+        var other: [17]u8 = @splat(0);
+        other[0] = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_FAILURE);
+        other[4] = 5;
+        const mine = chMsg(&b[0], .SSH_MSG_CHANNEL_OPEN_FAILURE, &@as([12]u8, @splat(0)));
+        var s = try c.open(1024, &.{ &other, mine });
+        defer s.deinit();
+        s.ch.open = false;
+        try t.expectError(error.ProtocolError, s.pumpOnce());
+        s.ch.open = true;
+        try t.expectError(error.ProtocolError, s.pumpOnce());
+    }
+    {
+        // stdout/stderr up to max_output exactly; one byte over is refused.
+        const four = [_]u8{ 0, 0, 0, 4, 'a', 'b', 'c', 'd' };
+        const one = [_]u8{ 0, 0, 0, 1, 'e' };
+        var c: Canned = .{};
+        var s = try c.open(1024, &.{
+            chMsg(&b[0], .SSH_MSG_CHANNEL_DATA, &four),
+            chMsg(&b[1], .SSH_MSG_CHANNEL_DATA, &one),
+            chMsg(&b[2], .SSH_MSG_CHANNEL_EXTENDED_DATA, &([_]u8{ 0, 0, 0, 1 } ++ four)),
+            chMsg(&b[3], .SSH_MSG_CHANNEL_EXTENDED_DATA, &([_]u8{ 0, 0, 0, 2 } ++ one)), // unknown code: dropped
+            chMsg(&b[4], .SSH_MSG_CHANNEL_EXTENDED_DATA, &([_]u8{ 0, 0, 0, 1 } ++ one)),
+        });
+        defer s.deinit();
+        s.max_output = 4;
+        try t.expectEqual(Session.Event.data, try s.pumpOnce());
+        try t.expectError(error.OutputTooLarge, s.pumpOnce());
+        try t.expectEqual(Session.Event.extended_data, try s.pumpOnce());
+        try t.expectEqual(Session.Event.extended_data, try s.pumpOnce());
+        try t.expectEqualStrings("abcd", s.stderr.items);
+        try t.expectError(error.OutputTooLarge, s.pumpOnce());
+    }
+    {
+        // Window adjusts saturate; exit-status and exit-signal are recorded;
+        // an unknown request with want_reply is answered FAILURE.
+        var c: Canned = .{};
+        var s = try c.open(0xffff_fff0, &.{
+            chMsg(&b[0], .SSH_MSG_CHANNEL_WINDOW_ADJUST, &[_]u8{ 0, 0, 1, 0 }),
+            chMsg(&b[1], .SSH_MSG_CHANNEL_REQUEST, &([_]u8{ 0, 0, 0, 11 } ++ "exit-status".* ++ [_]u8{ 0, 0, 0, 0, 3 })),
+            chMsg(&b[2], .SSH_MSG_CHANNEL_REQUEST, &([_]u8{ 0, 0, 0, 11 } ++ "exit-signal".* ++ [_]u8{ 0, 0, 0, 0, 4 } ++ "TERM".* ++ [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0, 0 })),
+            chMsg(&b[3], .SSH_MSG_CHANNEL_REQUEST, &([_]u8{ 0, 0, 0, 3 } ++ "foo".* ++ [_]u8{1})),
+        });
+        defer s.deinit();
+        try t.expectEqual(Session.Event.window_adjust, try s.pumpOnce());
+        try t.expectEqual(@as(u32, 0xffff_ffff), s.ch.remote_window);
+        _ = try s.pumpOnce();
+        try t.expectEqual(@as(?u32, 3), s.exitStatus());
+        _ = try s.pumpOnce();
+        try t.expectEqualStrings("TERM", s.exit_signal.?.name());
+        try t.expect(s.exit_signal.?.core_dumped);
+        _ = try s.pumpOnce();
+        try t.expectEqual(@as(usize, 1), try countPackets(c.sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_FAILURE), null, t.allocator));
+    }
+}
+
+test "Session.pumpOnce: EOF, CLOSE, SUCCESS for another channel are refused; an unknown request without want_reply gets no answer" {
+    const t = std.testing;
+    var b: [128]u8 = undefined;
+    for ([_]messages.MessageType{ .SSH_MSG_CHANNEL_EOF, .SSH_MSG_CHANNEL_CLOSE, .SSH_MSG_CHANNEL_SUCCESS, .SSH_MSG_CHANNEL_FAILURE, .SSH_MSG_CHANNEL_DATA }) |mt| {
+        const msg = chMsg(&b, mt, &[_]u8{ 0, 0, 0, 0 });
+        msg[4] = 5; // recipient 5: not ours
+        var c: Canned = .{};
+        var s = try c.open(1024, &.{msg});
+        defer s.deinit();
+        try t.expectError(error.ChannelClosed, s.pumpOnce());
+        try t.expect(!s.ch.got_close and !s.ch.got_eof);
+    }
+    {
+        var c: Canned = .{};
+        var s = try c.open(1024, &.{chMsg(&b, .SSH_MSG_CHANNEL_REQUEST, &([_]u8{ 0, 0, 0, 3 } ++ "foo".* ++ [_]u8{0}))});
+        defer s.deinit();
+        try t.expectEqual(Session.Event.other, try s.pumpOnce());
+        try t.expectEqual(@as(usize, 0), try countPackets(c.sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_FAILURE), null, t.allocator));
+    }
+}
+
+test "Session.pumpOnce: data for our channel before it is open is refused; a global request is answered only when it wants a reply" {
+    const t = std.testing;
+    var b: [3][128]u8 = undefined;
+    {
+        var c: Canned = .{};
+        var s = try c.open(1024, &.{chMsg(&b[0], .SSH_MSG_CHANNEL_DATA, &[_]u8{ 0, 0, 0, 1, 'x' })});
+        defer s.deinit();
+        s.ch.open = false;
+        try t.expectError(error.ChannelClosed, s.pumpOnce());
+        try t.expectEqual(@as(usize, 0), s.stdout.items.len);
+    }
+    {
+        const gr = @backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST);
+        const no_reply = [_]u8{ gr, 0, 0, 0, 1, 'g', 0 };
+        const reply = [_]u8{ gr, 0, 0, 0, 1, 'g', 1 };
+        var c: Canned = .{};
+        var s = try c.open(1024, &.{ &no_reply, &reply });
+        defer s.deinit();
+        _ = try s.pumpOnce();
+        _ = try s.pumpOnce();
+        try t.expectEqual(@as(usize, 1), try countPackets(c.sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_REQUEST_FAILURE), null, t.allocator));
+    }
+}
+
+test "Connection: a channel that was never confirmed is dropped without a CLOSE" {
+    const t = std.testing;
+    var r: std.Io.Reader = .fixed("");
+    var out: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&out);
+    var tr = transport.Transport.init(&r, &sink);
+    var conn = try Connection.init(&tr, t.allocator);
+    defer conn.deinit();
+    const s = try conn.newChannel(.{});
+    s.deinit();
+    try t.expectEqual(@as(usize, 0), sink.buffered().len);
+}
+
+/// Test-only: a Connection over canned plaintext server packets.
+const CannedConn = struct {
+    wire: [8192]u8 = undefined,
+    sink_buf: [8192]u8 = undefined,
+    r: std.Io.Reader = undefined,
+    sink: std.Io.Writer = undefined,
+    t: transport.Transport = undefined,
+
+    fn init(self: *CannedConn, packets: []const []const u8) !Connection {
+        var w: std.Io.Writer = .fixed(&self.wire);
+        var none: transport.CipherState = .plaintext;
+        for (packets) |p| try transport.writePacket(&w, &none, .os, p);
+        self.r = .fixed(w.buffered());
+        self.sink = .fixed(&self.sink_buf);
+        self.t = transport.Transport.init(&self.r, &self.sink);
+        return Connection.init(&self.t, std.testing.allocator);
+    }
+};
+
+test "Connection global requests: success with and without a port, failure, and a stale reply never answers a new request" {
+    const t = std.testing;
+    const ok_port = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_REQUEST_SUCCESS), 0, 0, 0x10, 0x92 };
+    const ok = [_]u8{@backingInt(messages.MessageType.SSH_MSG_REQUEST_SUCCESS)};
+    const fail = [_]u8{@backingInt(messages.MessageType.SSH_MSG_REQUEST_FAILURE)};
+    var cc: CannedConn = .{};
+    var conn = try cc.init(&.{ &ok_port, &ok, &fail, &fail, &ok, &fail });
+    defer conn.deinit();
+    try t.expectEqual(@as(u32, 4242), try conn.requestRemoteForward("127.0.0.1", 0));
+    try t.expectEqual(@as(u32, 2222), try conn.requestRemoteForward("127.0.0.1", 2222));
+    try t.expectError(error.ChannelRequestFailed, conn.requestRemoteForward("127.0.0.1", 1));
+    try t.expectError(error.ChannelRequestFailed, conn.cancelRemoteForward("127.0.0.1", 2222));
+    // A stray SUCCESS read before the request is not its answer.
+    _ = try conn.pumpFor(null);
+    try t.expectError(error.ChannelRequestFailed, conn.requestRemoteForward("127.0.0.1", 1));
+}
+
+test "Connection: a forwarded channel that is dropped leaves the forwarded list" {
+    const t = std.testing;
+    var open: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&open);
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try messages.writeString(&w, "forwarded-tcpip");
+    try w.writeAll(&[_]u8{ 0, 0, 0, 9, 0, 0, 4, 0, 0, 0, 4, 0 });
+    try messages.writeString(&w, "127.0.0.1");
+    try w.writeAll(&[_]u8{ 0, 0, 0, 80 });
+    try messages.writeString(&w, "192.0.2.1");
+    try w.writeAll(&[_]u8{ 0, 0, 0x15, 0xb3 });
+    var cc: CannedConn = .{};
+    var conn = try cc.init(&.{w.buffered()});
+    defer conn.deinit();
+    conn.remote_forwards = 1;
+    _ = try conn.pumpFor(null);
+    try t.expectEqual(@as(usize, 1), conn.forwarded.items.len);
+    conn.forwarded.items[0].deinit();
+    try t.expectEqual(@as(usize, 0), conn.forwarded.items.len);
+}
+
+fn peerOpenMsg(buf: []u8, kind: []const u8, sender: u8, max_packet: u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try messages.writeString(&w, kind);
+    try w.writeAll(&[_]u8{ 0, 0, 0, sender, 0, 0, 4, 0, 0, 0, 0, max_packet });
+    try messages.writeString(&w, "127.0.0.1");
+    try w.writeAll(&[_]u8{ 0, 0, 0, 80 });
+    try messages.writeString(&w, "192.0.2.1");
+    try w.writeAll(&[_]u8{ 0, 0, 0x15, 0xb3 });
+    return w.buffered();
+}
+
+test "Connection: which peer-opened channels are accepted, and at most max_unaccepted_forwards of them" {
+    const t = std.testing;
+    const failure = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_FAILURE);
+    var b: [3][128]u8 = undefined;
+    {
+        var cc: CannedConn = .{};
+        var conn = try cc.init(&.{
+            try peerOpenMsg(&b[0], "x11", 1, 64),
+            try peerOpenMsg(&b[1], "forwarded-tcpip", 2, 0),
+        });
+        defer conn.deinit();
+        conn.remote_forwards = 1;
+        _ = try conn.pumpFor(null);
+        _ = try conn.pumpFor(null);
+        try t.expectEqual(@as(usize, 0), conn.forwarded.items.len);
+        try t.expectEqual(@as(usize, 2), try countPackets(cc.sink.buffered(), failure, null, t.allocator));
+    }
+    {
+        var cc: CannedConn = .{};
+        var conn = try cc.init(&.{try peerOpenMsg(&b[0], "forwarded-tcpip", 1, 64)});
+        defer conn.deinit();
+        _ = try conn.pumpFor(null); // no remote forward held
+        try t.expectEqual(@as(usize, 0), conn.forwarded.items.len);
+    }
+    {
+        var pk: [max_unaccepted_forwards + 1][]const u8 = undefined;
+        var bufs: [max_unaccepted_forwards + 1][128]u8 = undefined;
+        for (&pk, &bufs, 0..) |*p, *bb, i| p.* = try peerOpenMsg(bb, "forwarded-tcpip", @intCast(i), 64);
+        var cc: CannedConn = .{};
+        var conn = try cc.init(&pk);
+        defer conn.deinit();
+        conn.remote_forwards = 1;
+        for (pk) |_| _ = try conn.pumpFor(null);
+        try t.expectEqual(@as(usize, max_unaccepted_forwards), conn.forwarded.items.len);
+        try t.expectEqual(@as(usize, 1), try countPackets(cc.sink.buffered(), failure, null, t.allocator));
+    }
+}
+
+test "Connection: a late confirmation for a dropped channel is answered with CLOSE to the peer's id" {
+    const t = std.testing;
+    const conf = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), 0, 0, 0, 3, 0, 0, 0, 9, 0, 0, 4, 0, 0, 0, 4, 0 };
+    var cc: CannedConn = .{};
+    var conn = try cc.init(&.{&conf});
+    defer conn.deinit();
+    try conn.zombies.append(t.allocator, 3);
+    _ = try conn.pumpFor(null);
+    var r: std.Io.Reader = .fixed(cc.sink.buffered());
+    var c: transport.CipherState = .plaintext;
+    var buf: [256]u8 = undefined;
+    const p = try transport.readPacket(&r, &c, &buf);
+    try t.expectEqual(@as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE)), p.payload[0]);
+    try t.expectEqual(@as(u32, 9), std.mem.readInt(u32, p.payload[1..5], .big));
+}
+
+test "serveSession: one channel only — a second session open is refused while the first is up" {
+    const t = std.testing;
+    var b: [2][96]u8 = undefined;
+    var opens: [2][]const u8 = undefined;
+    for (&b, &opens, 0..) |*bb, *o, i| {
+        var ow: std.Io.Writer = .fixed(bb);
+        try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+        try messages.writeString(&ow, "session");
+        try writeU32(&ow, @intCast(i));
+        try writeU32(&ow, 4096);
+        try writeU32(&ow, 4096);
+        o.* = ow.buffered();
+    }
+    var wire: [1024]u8 = undefined;
+    const framed = try framePackets(&wire, &opens);
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [2048]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+    _ = serveSession(&tr, t.allocator, .{ .exec = fuzz_label.handler(), .max_sessions = 4 }) catch {};
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), null, t.allocator));
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_FAILURE), null, t.allocator));
+    try t.expect(std.mem.find(u8, sink.buffered(), "only one session channel is supported") != null);
+}
+
+test "serveConnection: a session open with a zero maximum packet size is refused" {
+    const t = std.testing;
+    var ob: [96]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&ob);
+    try ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try messages.writeString(&ow, "session");
+    try writeU32(&ow, 0);
+    try writeU32(&ow, 4096);
+    try writeU32(&ow, 0);
+    var sink_buf: [2048]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    serverRun(true, &.{ow.buffered()}, &sink) catch {};
+    try t.expectEqual(@as(usize, 0), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), null, t.allocator));
+    try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_FAILURE), null, t.allocator));
+}
+
+fn serverRun(comptime whole_connection: bool, payloads: []const []const u8, sink: *std.Io.Writer) ChannelError!void {
+    var wire: [4096]u8 = undefined;
+    const framed = framePackets(&wire, payloads) catch unreachable;
+    var r: std.Io.Reader = .fixed(framed);
+    var tr = transport.Transport.init(&r, sink);
+    const cfg: ServeConfig = .{ .exec = fuzz_label.handler() };
+    return if (whole_connection) serveConnection(&tr, std.testing.allocator, cfg) else serveSession(&tr, std.testing.allocator, cfg);
+}
+
+fn openMsg(buf: []u8, sender: u32) []const u8 {
+    var ow: std.Io.Writer = .fixed(buf);
+    ow.writeByte(@backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN)) catch unreachable;
+    messages.writeString(&ow, "session") catch unreachable;
+    writeU32(&ow, sender) catch unreachable;
+    writeU32(&ow, 64 * 1024) catch unreachable;
+    writeU32(&ow, 32 * 1024) catch unreachable;
+    return ow.buffered();
+}
+
+test "server loop: disconnect ends it; a hang-up with a channel still open, or a malformed packet, is an error; a finished channel frees its slot" {
+    const t = std.testing;
+    const confirm = @backingInt(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION);
+    var b: [4][96]u8 = undefined;
+    var sink_buf: [16 * 1024]u8 = undefined;
+    const disconnect = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_DISCONNECT), 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var exec_buf: [64]u8 = undefined;
+    var ew: std.Io.Writer = .fixed(&exec_buf);
+    try writeChannelHeader(&ew, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&ew, "exec");
+    try ew.writeByte(0);
+    try messages.writeString(&ew, "id");
+    var close_buf: [8]u8 = undefined;
+    var cw: std.Io.Writer = .fixed(&close_buf);
+    try writeChannelHeader(&cw, .SSH_MSG_CHANNEL_CLOSE, 0);
+    {
+        // Nothing after a DISCONNECT is read.
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try serverRun(true, &.{ &disconnect, openMsg(&b[0], 0) }, &sink);
+        try t.expectEqual(@as(usize, 0), try countPackets(sink.buffered(), confirm, null, t.allocator));
+    }
+    {
+        // The client hangs up with its channel open: an error, not a clean end.
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.EndOfStream, serverRun(true, &.{openMsg(&b[0], 0)}, &sink));
+    }
+    {
+        // A malformed packet is not a hang-up, even with nothing open.
+        var wire = [_]u8{ 0x7f, 0xff, 0xff, 0xff, 0, 0, 0, 0 };
+        var r: std.Io.Reader = .fixed(&wire);
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        try t.expectError(error.ProtocolError, serveConnection(&tr, t.allocator, .{ .exec = fuzz_label.handler() }));
+    }
+    {
+        // serveSession: one exec, closed both ways, ends cleanly.
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try serverRun(false, &.{ openMsg(&b[0], 0), ew.buffered(), cw.buffered() }, &sink);
+    }
+    {
+        // serveConnection: after one channel is done, the next is served.
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.EndOfStream, serverRun(true, &.{ openMsg(&b[0], 0), ew.buffered(), cw.buffered(), openMsg(&b[1], 1) }, &sink));
+        try t.expectEqual(@as(usize, 2), try countPackets(sink.buffered(), confirm, null, t.allocator));
+    }
+}
+
+fn serveWith(cfg: ServeConfig, payloads: []const []const u8, sink: *std.Io.Writer) ChannelError!void {
+    var wire: [32 * 1024]u8 = undefined;
+    const framed = framePackets(&wire, payloads) catch unreachable;
+    var r: std.Io.Reader = .fixed(framed);
+    var tr = transport.Transport.init(&r, sink);
+    return serveConnection(&tr, std.testing.allocator, cfg);
+}
+
+test "server channels: nothing is answered after our CLOSE; stdin collection is capped at max_input; pty-req refused unless allowed" {
+    const t = std.testing;
+    var b: [8][64]u8 = undefined;
+    const open = try channelOpenPayload(&b[0], 7, 64, 1 << 15);
+    const exec_req = SessionCorpus.execPayload(&b[1], 0, "id");
+    var big: [80]u8 = undefined;
+    var dw: std.Io.Writer = .fixed(&big);
+    try writeChannelHeader(&dw, .SSH_MSG_CHANNEL_DATA, 0);
+    try messages.writeString(&dw, &@as([40]u8, @splat('d')));
+    var xb: [84]u8 = undefined;
+    var xw: std.Io.Writer = .fixed(&xb);
+    try writeChannelHeader(&xw, .SSH_MSG_CHANNEL_EXTENDED_DATA, 0);
+    try writeU32(&xw, 1);
+    try messages.writeString(&xw, &@as([40]u8, @splat('e')));
+    var rw: std.Io.Writer = .fixed(&b[2]);
+    try writeChannelHeader(&rw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&rw, "env");
+    try rw.writeByte(1);
+    var cw: std.Io.Writer = .fixed(&b[3]);
+    try writeChannelHeader(&cw, .SSH_MSG_CHANNEL_CLOSE, 0);
+    var sink_buf: [16 * 1024]u8 = undefined;
+    {
+        // The handler runs at once and closes; the late request, data and
+        // extended data (each over half the 64-byte window) get no reply.
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try serveWith(.{ .exec = fuzz_label.handler(), .stdin_mode = .ignore }, &.{ open, exec_req, rw.buffered(), dw.buffered(), xw.buffered(), cw.buffered() }, &sink);
+        // Our CLOSE is the last thing sent.
+        var r: std.Io.Reader = .fixed(sink.buffered());
+        var pc: transport.CipherState = .plaintext;
+        var pbuf: [4096]u8 = undefined;
+        var last: u8 = 0;
+        while (r.bufferedLen() > 0) last = msgType(try transport.readPacket(&r, &pc, &pbuf));
+        try t.expectEqual(@as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE)), last);
+    }
+    {
+        // collect_until_eof: 40 bytes fit max_input = 40; 80 do not.
+        const big_open = try channelOpenPayload(&b[4], 7, 1 << 20, 1 << 15);
+        for ([_]usize{ 1, 2 }) |n| {
+            var sink: std.Io.Writer = .fixed(&sink_buf);
+            const data = dw.buffered();
+            const res = serveWith(.{ .exec = fuzz_label.handler(), .stdin_mode = .collect_until_eof, .max_input = 40 }, if (n == 1) &.{ big_open, exec_req, data } else &.{ big_open, exec_req, data, data }, &sink);
+            if (n == 1) try t.expectError(error.EndOfStream, res) else try t.expectError(error.OutputTooLarge, res);
+        }
+    }
+    {
+        var pw: std.Io.Writer = .fixed(&b[5]);
+        try writeChannelHeader(&pw, .SSH_MSG_CHANNEL_REQUEST, 0);
+        try messages.writeString(&pw, "pty-req");
+        try pw.writeByte(1);
+        try messages.writeString(&pw, "xterm");
+        try pw.writeAll(&@as([16]u8, @splat(0)));
+        try messages.writeString(&pw, "");
+        const big_open = try channelOpenPayload(&b[4], 7, 1 << 20, 1 << 15);
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        _ = serveWith(.{ .exec = fuzz_label.handler(), .allow_pty = false }, &.{ big_open, pw.buffered() }, &sink) catch {};
+        try t.expectEqual(@as(usize, 1), try countPackets(sink.buffered(), @backingInt(messages.MessageType.SSH_MSG_CHANNEL_FAILURE), null, t.allocator));
+    }
 }

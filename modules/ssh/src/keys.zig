@@ -518,3 +518,68 @@ test "AuthorizedKeysIterator skips what sshd skips and findAuthorizedKey matches
     var other: [max_blob_len]u8 = undefined;
     try t.expect(findAuthorizedKey(text, decodeB64(&other, hv.ecdsa_p384_pub_b64), &buf) == null);
 }
+
+// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+
+test "PublicKey.parse: an ed25519 key of 31 or 33 bytes is InvalidKey" {
+    var b: [64]u8 = undefined;
+    for ([_]usize{ 31, 33 }) |n| {
+        var w: std.Io.Writer = .fixed(&b);
+        try messages.writeString(&w, "ssh-ed25519");
+        const kp = try Ed25519.KeyPair.generateDeterministic(@splat(4));
+        const k = kp.public_key.toBytes() ++ [_]u8{1};
+        try messages.writeString(&w, k[0..n]);
+        try std.testing.expectError(error.InvalidKey, PublicKey.parse(w.buffered()));
+    }
+}
+
+test "PublicKey.parse: rsa e or n empty or negative, ecdsa Q empty, or trailing bytes are InvalidKey" {
+    const t = std.testing;
+    const vectors = @import("hostkey_vectors.zig");
+    var fb: [1024]u8 = undefined;
+    const good = fb[0..try std.base64.standard.Decoder.calcSizeForSlice(vectors.rsa_pub_b64)];
+    try std.base64.standard.Decoder.decode(good, vectors.rsa_pub_b64);
+    _ = try PublicKey.parse(good);
+    var c = Cursor{ .b = good };
+    _ = try c.string();
+    const e = try c.string();
+    const n = try c.string();
+    var b: [1100]u8 = undefined;
+    // n's sign pad stripped: the same modulus, read as negative.
+    try t.expect(n[0] == 0 and n[1] & 0x80 != 0);
+    for ([_][2][]const u8{ .{ "", n }, .{ e, "" }, .{ "\x81\x00\x01", n }, .{ e, n[1..] } }) |en| {
+        var w: std.Io.Writer = .fixed(&b);
+        try messages.writeString(&w, "ssh-rsa");
+        try messages.writeString(&w, en[0]);
+        try messages.writeString(&w, en[1]);
+        try t.expectError(error.InvalidKey, PublicKey.parse(w.buffered()));
+    }
+    {
+        var w: std.Io.Writer = .fixed(&b);
+        try w.writeAll(good);
+        try w.writeByte(0);
+        try t.expectError(error.InvalidKey, PublicKey.parse(w.buffered()));
+    }
+    {
+        var w: std.Io.Writer = .fixed(&b);
+        try messages.writeString(&w, "ecdsa-sha2-nistp256");
+        try messages.writeString(&w, "nistp256");
+        try messages.writeString(&w, "");
+        try t.expectError(error.InvalidKey, PublicKey.parse(w.buffered()));
+    }
+    {
+        // The one-byte SEC1 identity encoding is not a public key.
+        var w: std.Io.Writer = .fixed(&b);
+        try messages.writeString(&w, "ecdsa-sha2-nistp256");
+        try messages.writeString(&w, "nistp256");
+        try messages.writeString(&w, "\x00");
+        try t.expectError(error.InvalidKey, PublicKey.parse(w.buffered()));
+    }
+}
+
+test "OptionIterator: an escaped quote does not end the quoted value" {
+    var it: OptionIterator = .{ .rest = "command=\"a\\\",b\",no-pty" };
+    try std.testing.expectEqualStrings("command=\"a\\\",b\"", it.next().?);
+    try std.testing.expectEqualStrings("no-pty", it.next().?);
+    try std.testing.expect(it.next() == null);
+}

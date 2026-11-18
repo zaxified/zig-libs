@@ -5232,15 +5232,14 @@ fn liveInteropMac(kex_name: []const u8, cipher_name: []const u8, mac_name: []con
     defer gpa.free(macs_opt);
 
     // Start sshd (foreground master; all config via -o, no config file).
+    // setpriv: the test sshd gets SIGKILL when this process dies, even by
+    // SIGKILL (a mutation run's timeout), so it is never left orphaned.
     var sshd = std.process.spawn(io, .{
         .argv = &.{
-            sshd_path,      "-D", "-e",                      "-f",
-            "/dev/null",    "-h", hk_path,                   "-o",
-            port_opt,       "-o", "ListenAddress=127.0.0.1", "-o",
-            "UsePAM=no",    "-o", "StrictModes=no",          "-o",
-            "PidFile=none", "-o", "LogLevel=QUIET",          "-o",
-            kex_opt,        "-o", ciphers_opt,               "-o",
-            macs_opt,
+            "/usr/bin/setpriv", "--pdeathsig", "KILL",           "--", sshd_path,      "-D", "-e",                      "-f",
+            "/dev/null",        "-h",          hk_path,          "-o", port_opt,       "-o", "ListenAddress=127.0.0.1", "-o",
+            "UsePAM=no",        "-o",          "StrictModes=no", "-o", "PidFile=none", "-o", "LogLevel=QUIET",          "-o",
+            kex_opt,            "-o",          ciphers_opt,      "-o", macs_opt,
         },
         .stdout = .ignore,
         .stderr = .ignore,
@@ -5702,4 +5701,918 @@ test "a client re-exchange refuses a host key other than the one the first excha
     try t.expect(same == .accept);
     const other = sameHostKey(&tr, .{ .host = "", .port = 22, .key_type = "ssh-ed25519", .key_blob = "a different K_S" });
     try t.expectEqual(HostKeyVerdict{ .reject = .key_mismatch }, other);
+}
+
+// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+
+test "exchangeVersions: 63 pre-banner lines then the version is accepted, 64 are refused" {
+    // RFC 4253 §4.2 lets a server send other lines first; the loop bounds
+    // them at 64 lines in all, the version line included.
+    const t = std.testing;
+    var in: [64 * 8 + 32]u8 = undefined;
+    for (0..2) |case| {
+        const junk: usize = 63 + case;
+        var iw: std.Io.Writer = .fixed(&in);
+        for (0..junk) |_| try iw.writeAll("junk\r\n");
+        try iw.writeAll("SSH-2.0-peer\r\n");
+        var r: std.Io.Reader = .fixed(iw.buffered());
+        var out: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        const got = exchangeVersions(t.allocator, &r, &w, .{ .softwareversion = software_version });
+        if (case == 0) {
+            const v = try got;
+            defer t.allocator.free(v);
+            try t.expectEqualStrings("SSH-2.0-peer", v);
+        } else {
+            try t.expectError(error.VersionExchangeFailed, got);
+        }
+    }
+}
+
+test "exchangeVersions: a version line ended by LF alone keeps its last character" {
+    // Only a CR before the LF is dropped (OpenSSH accepts a bare LF too).
+    const t = std.testing;
+    var r: std.Io.Reader = .fixed("SSH-2.0-peer\n");
+    var out: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    const v = try exchangeVersions(t.allocator, &r, &w, .{ .softwareversion = software_version });
+    defer t.allocator.free(v);
+    try t.expectEqualStrings("SSH-2.0-peer", v);
+}
+
+test "KexInit.decode reads the reserved word" {
+    const t = std.testing;
+    const empty: []const []const u8 = &.{};
+    const none: []const []const u8 = &.{"none"};
+    const src = KexInit{
+        .cookie = @splat(7),
+        .kex_algorithms = none,
+        .server_host_key_algorithms = none,
+        .encryption_algorithms_client_to_server = none,
+        .encryption_algorithms_server_to_client = none,
+        .mac_algorithms_client_to_server = none,
+        .mac_algorithms_server_to_client = none,
+        .compression_algorithms_client_to_server = none,
+        .compression_algorithms_server_to_client = none,
+        .languages_client_to_server = empty,
+        .languages_server_to_client = empty,
+        .first_kex_packet_follows = true,
+        .reserved = 0x01020304,
+    };
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try src.encode(&w);
+    var r: std.Io.Reader = .fixed(w.buffered()[1..]);
+    var got = try KexInit.decode(t.allocator, &r);
+    defer got.deinit(t.allocator);
+    try t.expectEqual(@as(u32, 0x01020304), got.reserved);
+    try t.expect(got.first_kex_packet_follows);
+    try t.expectEqual(@as(usize, 0), r.bufferedLen());
+}
+
+test "exchangeVersions: an empty pre-banner line is skipped" {
+    const t = std.testing;
+    var r: std.Io.Reader = .fixed("\n\r\nSSH-2.0-peer\r\n");
+    var out: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    const v = try exchangeVersions(t.allocator, &r, &w, .{ .softwareversion = software_version });
+    defer t.allocator.free(v);
+    try t.expectEqualStrings("SSH-2.0-peer", v);
+}
+
+test "aesCtrXor: the 128-bit counter carries through every byte and wraps to zero" {
+    const t = std.testing;
+    const ctx = std.crypto.core.aes.Aes128.initEnc(@splat(1));
+    var counter: [16]u8 = @splat(0xff);
+    var data: [16]u8 = @splat(0);
+    aesCtrXor(ctx, &counter, &data);
+    try t.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &counter);
+    counter = @splat(0);
+    counter[15] = 0xff;
+    counter[14] = 0xff;
+    aesCtrXor(ctx, &counter, &data);
+    try t.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 }, &counter);
+}
+
+test "readPacket (none): the length bounds — maximum, exact buffer" {
+    const t = std.testing;
+    var rbuf: [512]u8 = undefined;
+    {
+        // A length at the wire maximum is legal but larger than the buffer.
+        var r: std.Io.Reader = .fixed(&[_]u8{ 0x00, 0x10, 0x00, 0x00 });
+        var rc: CipherState = .plaintext;
+        try t.expectError(error.PacketTooLarge, readPacket(&r, &rc, &rbuf));
+    }
+    {
+        // One over it is malformed, whatever the buffer.
+        var r: std.Io.Reader = .fixed(&[_]u8{ 0x00, 0x10, 0x00, 0x01 });
+        var rc: CipherState = .plaintext;
+        try t.expectError(error.ProtocolError, readPacket(&r, &rc, &rbuf));
+    }
+    {
+        // A buffer of exactly the packet's length is enough.
+        var out: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        var wc: CipherState = .plaintext;
+        try writePacket(&w, &wc, .os, "exact");
+        const wire = w.buffered();
+        const pkt_len = std.mem.readInt(u32, wire[0..4], .big);
+        var r: std.Io.Reader = .fixed(wire);
+        var rc: CipherState = .plaintext;
+        const pkt = try readPacket(&r, &rc, rbuf[0..pkt_len]);
+        try t.expectEqualStrings("exact", pkt.payload);
+    }
+}
+
+test "readPacket (chacha20-poly1305): the length is judged before the tag, and the bounds are exact" {
+    const t = std.testing;
+    const km: [32]u8 = @splat(3);
+    const kh: [32]u8 = @splat(4);
+    const seq: u32 = 5;
+    var rbuf: [512]u8 = undefined;
+    const cases = [_]struct { len: u32, err: TransportError }{
+        .{ .len = 0, .err = error.ProtocolError },
+        .{ .len = messages.max_wire_string_len + 1, .err = error.ProtocolError },
+        .{ .len = messages.max_wire_string_len, .err = error.PacketTooLarge },
+    };
+    for (cases) |c| {
+        // An encrypted length followed by zeros for the body and the tag: the
+        // tag is wrong, so only a length check made BEFORE it can answer.
+        var wire: [4 + 64]u8 = @splat(0);
+        var plain: [4]u8 = undefined;
+        std.mem.writeInt(u32, &plain, c.len, .big);
+        ChaCha.xor(wire[0..4], &plain, 0, kh, seqNonce(seq));
+        var r: std.Io.Reader = .fixed(&wire);
+        var rc: CipherState = .{ .chacha20_poly1305 = .{ .key_main = km, .key_header = kh, .sequence_number = seq } };
+        try t.expectError(c.err, readPacket(&r, &rc, &rbuf));
+    }
+    {
+        var wc: CipherState = .{ .chacha20_poly1305 = .{ .key_main = km, .key_header = kh, .sequence_number = seq } };
+        var out: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try writePacket(&w, &wc, .os, "exact");
+        const wire = w.buffered();
+        var r: std.Io.Reader = .fixed(wire);
+        var rc: CipherState = .{ .chacha20_poly1305 = .{ .key_main = km, .key_header = kh, .sequence_number = seq } };
+        const pkt = try readPacket(&r, &rc, rbuf[0..wire.len]);
+        try t.expectEqualStrings("exact", pkt.payload);
+    }
+}
+
+/// Test-only: seal a raw packet BODY (padding_length ‖ payload ‖ padding,
+/// `body.len` = packet_length, nothing checked) under a copy of `cs`, as the
+/// peer's `writePacket` would — so a test can hand `readPacket` a packet that
+/// authenticates but whose framing is wrong.
+fn sealBodyForTest(cs: CipherState, body: []const u8, out: []u8) []const u8 {
+    var c = cs;
+    const pkt_len: u32 = @intCast(body.len);
+    std.mem.writeInt(u32, out[0..4], pkt_len, .big);
+    @memcpy(out[4 .. 4 + body.len], body);
+    const total = 4 + body.len;
+    switch (c) {
+        .none => return out[0..total],
+        .chacha20_poly1305 => |*st| {
+            const nonce = seqNonce(st.sequence_number);
+            var lenbytes: [4]u8 = out[0..4].*;
+            ChaCha.xor(out[0..4], &lenbytes, 0, st.key_header, nonce);
+            ChaCha.xor(out[4..total], out[4..total], 1, st.key_main, nonce);
+            var polykey: [32]u8 = undefined;
+            ChaCha.stream(&polykey, 0, st.key_main, nonce);
+            var tag: [16]u8 = undefined;
+            Poly1305.create(&tag, out[0..total], &polykey);
+            @memcpy(out[total .. total + 16], &tag);
+            return out[0 .. total + 16];
+        },
+        .aes_ctr_hmac => |*st| {
+            var mac: [64]u8 = undefined;
+            if (st.etm) {
+                ctrXor(st, &st.enc_iv, out[4..total]);
+                packetMac(st, st.sequence_number, &.{out[0..total]}, &mac);
+            } else {
+                packetMac(st, st.sequence_number, &.{out[0..total]}, &mac);
+                ctrXor(st, &st.enc_iv, out[0..total]);
+            }
+            const mlen = st.macLen();
+            @memcpy(out[total .. total + mlen], mac[0..mlen]);
+            return out[0 .. total + mlen];
+        },
+        .aes_gcm => |*st| {
+            var nonce: [12]u8 = undefined;
+            @memcpy(nonce[0..4], &st.fixed_iv);
+            std.mem.writeInt(u64, nonce[4..12], st.invocation_counter, .big);
+            var tag: [16]u8 = undefined;
+            const pt = out[4..total];
+            switch (st.ctx) {
+                inline else => |*ctx| ctx.encrypt(pt, &tag, pt, out[0..4], nonce),
+            }
+            @memcpy(out[total .. total + 16], &tag);
+            return out[0 .. total + 16];
+        },
+    }
+}
+
+fn readSealedForTest(cs: CipherState, body: []const u8) TransportError![]const u8 {
+    const S = struct {
+        var wire: [256]u8 = undefined;
+        var rbuf: [256]u8 = undefined;
+    };
+    const w = sealBodyForTest(cs, body, &S.wire);
+    var r: std.Io.Reader = .fixed(w);
+    var rc = cs;
+    const pkt = try readPacket(&r, &rc, &S.rbuf);
+    return pkt.payload;
+}
+
+fn testCiphers() [5]CipherState {
+    return .{
+        .plaintext,
+        .{ .chacha20_poly1305 = .{ .key_main = @splat(3), .key_header = @splat(4), .sequence_number = 9 } },
+        .{ .aes_ctr_hmac = ctr_combos[0] }, // encrypt-and-MAC
+        .{ .aes_ctr_hmac = ctr_combos[1] }, // encrypt-then-MAC
+        .{ .aes_gcm = .{ .ctx = .{ .aes256 = Aes256Gcm.init(@splat(0x11)) }, .fixed_iv = .{ 1, 2, 3, 4 }, .invocation_counter = 5, .sequence_number = 3 } },
+    };
+}
+
+test "readPacket: RFC 4253 §6 padding bounds on an authenticated packet, every cipher" {
+    // "There MUST be at least four bytes of padding", and the padding cannot
+    // be longer than the packet. Each body here authenticates; only the
+    // framing inside it is wrong (or right at the edge).
+    const t = std.testing;
+    for (testCiphers()) |cs| {
+        // packet_length 28 keeps encrypt-and-MAC aligned (4 + 28 = 32), 16 the rest.
+        const n: usize = if (cs == .aes_ctr_hmac and !cs.aes_ctr_hmac.etm) 28 else 16;
+        var body: [28]u8 = @splat(0xab);
+        body[0] = 3; // three bytes of padding
+        try t.expectError(error.ProtocolError, readSealedForTest(cs, body[0..n]));
+        body[0] = 4; // four: the minimum
+        try t.expectEqual(n - 5, (try readSealedForTest(cs, body[0..n])).len);
+        body[0] = @intCast(n); // padding as long as the packet
+        try t.expectError(error.ProtocolError, readSealedForTest(cs, body[0..n]));
+        body[0] = @intCast(n - 1); // all padding, empty payload
+        try t.expectEqual(@as(usize, 0), (try readSealedForTest(cs, body[0..n])).len);
+    }
+}
+
+test "readPacket: packet_length bounds are judged before the MAC, and an exact buffer suffices" {
+    const t = std.testing;
+    const max = messages.max_wire_string_len;
+    // Encrypt-then-MAC and GCM send the length in clear: a length and a junk
+    // tail. Only a length check made before the MAC answers ProtocolError.
+    const clear = [_]CipherState{ testCiphers()[3], testCiphers()[4] };
+    for (clear) |cs| {
+        for ([_]u32{ 0, 17, max + 16 }) |len| {
+            var wire: [4 + 96]u8 = @splat(0x5a);
+            std.mem.writeInt(u32, wire[0..4], len, .big);
+            var r: std.Io.Reader = .fixed(&wire);
+            var rc = cs;
+            var rbuf: [256]u8 = undefined;
+            try t.expectError(error.ProtocolError, readPacket(&r, &rc, &rbuf));
+        }
+        {
+            // The maximum itself is legal, just larger than this buffer.
+            var wire: [4 + 96]u8 = @splat(0x5a);
+            std.mem.writeInt(u32, wire[0..4], max, .big);
+            var r: std.Io.Reader = .fixed(&wire);
+            var rc = cs;
+            var rbuf: [256]u8 = undefined;
+            try t.expectError(error.PacketTooLarge, readPacket(&r, &rc, &rbuf));
+        }
+    }
+    // Encrypt-and-MAC: the length is inside the first encrypted block.
+    {
+        const st = ctr_combos[0];
+        for ([_]struct { len: u32, err: TransportError }{
+            .{ .len = 20, .err = error.ProtocolError }, // 4 + 20 not block-aligned
+            .{ .len = max + 12, .err = error.ProtocolError }, // aligned, over the maximum
+            .{ .len = 236, .err = error.PacketTooLarge }, // aligned, over this buffer
+        }) |c| {
+            var wire: [4 + 96]u8 = @splat(0x5a);
+            std.mem.writeInt(u32, wire[0..4], c.len, .big);
+            var s = st;
+            ctrXor(&s, &s.enc_iv, wire[0..16]);
+            var r: std.Io.Reader = .fixed(&wire);
+            var rc: CipherState = .{ .aes_ctr_hmac = st };
+            var rbuf: [128]u8 = undefined;
+            try t.expectError(c.err, readPacket(&r, &rc, &rbuf));
+        }
+    }
+    // The smallest aligned lengths are legal: 12 (encrypt-and-MAC), 16 (EtM).
+    {
+        var body: [16]u8 = @splat(0);
+        body[0] = 4;
+        try t.expectEqual(@as(usize, 7), (try readSealedForTest(.{ .aes_ctr_hmac = ctr_combos[0] }, body[0..12])).len);
+        try t.expectEqual(@as(usize, 11), (try readSealedForTest(.{ .aes_ctr_hmac = ctr_combos[1] }, body[0..16])).len);
+    }
+    // A buffer of exactly length + MAC (+ length field) is enough; one less is not.
+    for (testCiphers()) |cs| {
+        var wc = cs;
+        var out: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try writePacket(&w, &wc, .os, "exact fit");
+        const wire = w.buffered();
+        var rbuf: [256]u8 = undefined;
+        {
+            var r: std.Io.Reader = .fixed(wire);
+            var rc = cs;
+            const pkt = try readPacket(&r, &rc, rbuf[0..wire.len]);
+            try t.expectEqualStrings("exact fit", pkt.payload);
+        }
+        {
+            var r: std.Io.Reader = .fixed(wire);
+            var rc = cs;
+            // `none` reads only the body into the buffer, the rest the whole wire.
+            const need = if (cs == .none) wire.len - 4 else wire.len;
+            try t.expectError(error.PacketTooLarge, readPacket(&r, &rc, rbuf[0 .. need - 1]));
+        }
+    }
+}
+
+test "writePacket: a packet fills the 8 KiB frame exactly, one byte more is PacketTooLarge" {
+    // RFC 4253 §6: padding to the cipher's block (8, or 16 for AES), at least
+    // four bytes; the frame is length ‖ packet ‖ MAC/tag.
+    const t = std.testing;
+    const frame = 8192;
+    var payload: [frame]u8 = @splat(0x61);
+    var out: [frame + 128]u8 = undefined;
+    for (testCiphers()) |cs| {
+        const block: usize = if (cs == .none or cs == .chacha20_poly1305) 8 else 16;
+        const len_aligned = cs == .none or (cs == .aes_ctr_hmac and !cs.aes_ctr_hmac.etm);
+        const tail: usize = switch (cs) {
+            .none => 0,
+            .aes_ctr_hmac => |st| st.macLen(),
+            else => 16,
+        };
+        var exact = false;
+        var l: usize = frame - 150;
+        while (l <= frame) : (l += 1) {
+            const aligned = (if (len_aligned) @as(usize, 4) else 0) + 1 + l;
+            var padlen = block - aligned % block;
+            if (padlen < 4) padlen += block;
+            const want = 4 + 1 + l + padlen + tail;
+            var wc = cs;
+            var w: std.Io.Writer = .fixed(&out);
+            if (writePacket(&w, &wc, .os, payload[0..l])) |_| {
+                try t.expectEqual(want, w.buffered().len);
+                try t.expect(want <= frame);
+                if (want == frame) exact = true;
+            } else |e| {
+                try t.expectEqual(error.PacketTooLarge, e);
+                try t.expect(want > frame);
+            }
+        }
+        // Only the none and encrypt-and-MAC framings can land on 8192 exactly.
+        try t.expectEqual(len_aligned, exact);
+    }
+}
+
+test "stripLeadingZeros: all zeros is empty, a nonzero byte stops it" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 0), stripLeadingZeros(&[_]u8{ 0, 0, 0 }).len);
+    try t.expectEqualSlices(u8, &[_]u8{ 1, 0 }, stripLeadingZeros(&[_]u8{ 0, 1, 0 }));
+}
+
+test "verifySignature: a raw signature of the wrong size is refused, not copied" {
+    const t = std.testing;
+    var kb: [256]u8 = undefined;
+    var sb: [256]u8 = undefined;
+    // ed25519: a 32-byte key with a 63- or 65-byte signature.
+    for ([_]usize{ 63, 65 }) |n| {
+        var kw: std.Io.Writer = .fixed(&kb);
+        try messages.writeString(&kw, "ssh-ed25519");
+        try messages.writeString(&kw, &@as([32]u8, @splat(9)));
+        var sw: std.Io.Writer = .fixed(&sb);
+        try messages.writeString(&sw, "ssh-ed25519");
+        var raw: [65]u8 = @splat(1);
+        try messages.writeString(&sw, raw[0..n]);
+        try t.expectError(error.HostKeyVerificationFailed, verifySignature("ssh-ed25519", kw.buffered(), sw.buffered(), "h"));
+    }
+    // ecdsa-sha2-nistp256: r or s one byte longer than the curve order.
+    for (0..2) |which| {
+        var kw: std.Io.Writer = .fixed(&kb);
+        try messages.writeString(&kw, "ecdsa-sha2-nistp256");
+        try messages.writeString(&kw, "nistp256");
+        try messages.writeString(&kw, &@as([65]u8, @splat(4)));
+        var inner: [128]u8 = undefined;
+        var iw: std.Io.Writer = .fixed(&inner);
+        const long: [33]u8 = @splat(0x7f);
+        try messages.writeString(&iw, if (which == 0) &long else "\x01");
+        try messages.writeString(&iw, if (which == 1) &long else "\x01");
+        var sw: std.Io.Writer = .fixed(&sb);
+        try messages.writeString(&sw, "ecdsa-sha2-nistp256");
+        try messages.writeString(&sw, iw.buffered());
+        try t.expectError(error.HostKeyVerificationFailed, verifySignature("ecdsa-sha2-nistp256", kw.buffered(), sw.buffered(), "h"));
+    }
+}
+
+test "curve25519Kex (client): a reply under another message number is KexFailed, even with a usable Q_S" {
+    var q_s: [32]u8 = @splat(0);
+    q_s[0] = 9; // the base point: a valid, non-degenerate public value
+    var payload_buf: [256]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&payload_buf);
+    try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT));
+    try messages.writeString(&pw, "not-a-real-host-key-blob");
+    try messages.writeString(&pw, &q_s);
+    try messages.writeString(&pw, "not-a-real-signature");
+    var none_w: CipherState = .plaintext;
+    var reply_buf: [1024]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&reply_buf);
+    try writePacket(&rw, &none_w, .os, pw.buffered());
+
+    var r: std.Io.Reader = .fixed(rw.buffered());
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .plaintext;
+    var kr: KexResult = .{};
+    try std.testing.expectError(
+        error.KexFailed,
+        curve25519Kex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+    );
+}
+
+test "gexRejectsPeerValue: a shorter value with a larger first byte is still smaller" {
+    // p = 0x80000003, p - 1 = 0x80000002: 0xff01 is far below it.
+    const p = [_]u8{ 0x80, 0x00, 0x00, 0x03 };
+    try std.testing.expect(!gexRejectsPeerValue(&p, &[_]u8{ 0xff, 0x01 }));
+    try std.testing.expect(gexRejectsPeerValue(&p, &[_]u8{ 0x80, 0x00, 0x00, 0x02 }));
+    try std.testing.expect(!gexRejectsPeerValue(&p, &[_]u8{ 0x80, 0x00, 0x00, 0x01 }));
+}
+
+test "beToLimbsCt: bytes above the limb capacity are dropped, not written past it" {
+    const v = beToLimbsCt(1, &[_]u8{ 0xaa, 1, 2, 3, 4, 5, 6, 7, 8 });
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), v[0]);
+}
+
+test "gexRejectsPeerValue: an empty value is refused; p = 0 does not run the borrow past the front" {
+    const t = std.testing;
+    try t.expect(gexRejectsPeerValue(&[_]u8{0x0b}, ""));
+    try t.expect(!gexRejectsPeerValue(&[_]u8{ 0x00, 0x00 }, &[_]u8{5}));
+}
+
+test "gexPow: an output buffer shorter than the result is KexFailed" {
+    const p = DhGroup.forName("diffie-hellman-group14-sha256").?.prime;
+    const m = try GexMod.fromBytesBE(p);
+    var x: [32]u8 = @splat(0x33);
+    var small: [16]u8 = undefined;
+    try std.testing.expectError(error.KexFailed, gexPow(&m, &[_]u8{2}, &x, &small));
+}
+
+test "dhGexKex (client): a group under another message number is KexFailed" {
+    const p = DhGroup.forName("diffie-hellman-group14-sha256").?.prime;
+    var payload_buf: [600]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&payload_buf);
+    try pw.writeByte(msg_kex_dh_gex_group + 1);
+    try messages.writeMpint(&pw, p);
+    try messages.writeMpint(&pw, &[_]u8{2});
+    var none_w: CipherState = .plaintext;
+    var reply_buf: [1024]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&reply_buf);
+    try writePacket(&rw, &none_w, .os, pw.buffered());
+
+    var r: std.Io.Reader = .fixed(rw.buffered());
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .plaintext;
+    var kr: KexResult = .{};
+    try std.testing.expectError(
+        error.KexFailed,
+        dhGexKex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+    );
+}
+
+fn zeroEntropyIo(vt: *std.Io.VTable) std.Io {
+    vt.* = std.Io.failing.vtable.*;
+    vt.randomSecure = struct {
+        fn f(_: ?*anyopaque, buf: []u8) std.Io.RandomSecureError!void {
+            @memset(buf, 0);
+        }
+    }.f;
+    return .{ .userdata = null, .vtable = vt };
+}
+
+test "dhGexKex (client): x is never zero, and a server f of 1 is refused" {
+    const t = std.testing;
+    const p = DhGroup.forName("diffie-hellman-group14-sha256").?.prime;
+    var in_buf: [2048]u8 = undefined;
+    var iw: std.Io.Writer = .fixed(&in_buf);
+    var none_w: CipherState = .plaintext;
+    {
+        var pb: [600]u8 = undefined;
+        var pw: std.Io.Writer = .fixed(&pb);
+        try pw.writeByte(msg_kex_dh_gex_group);
+        try messages.writeMpint(&pw, p);
+        try messages.writeMpint(&pw, &[_]u8{2});
+        try writePacket(&iw, &none_w, .os, pw.buffered());
+    }
+    {
+        var pb: [128]u8 = undefined;
+        var pw: std.Io.Writer = .fixed(&pb);
+        try pw.writeByte(msg_kex_dh_gex_reply);
+        try messages.writeString(&pw, "not-a-real-host-key-blob");
+        try messages.writeMpint(&pw, &[_]u8{1});
+        try messages.writeString(&pw, "not-a-real-signature");
+        try writePacket(&iw, &none_w, .os, pw.buffered());
+    }
+    var r: std.Io.Reader = .fixed(iw.buffered());
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .plaintext;
+    var kr: KexResult = .{};
+    var vt: std.Io.VTable = undefined;
+    try t.expectError(
+        error.KexFailed,
+        dhGexKex(&kr, &r, &w, .single(&none), .{ .io = zeroEntropyIo(&vt) }, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+    );
+    // With an all-zero entropy source x is 1, so e = g = 2 (never g^0 = 1).
+    var sent: std.Io.Reader = .fixed(w.buffered());
+    var rc: CipherState = .plaintext;
+    var rbuf: [1024]u8 = undefined;
+    _ = try readPacket(&sent, &rc, &rbuf); // GEX_REQUEST
+    const init_pkt = try readPacket(&sent, &rc, &rbuf);
+    try t.expectEqual(msg_kex_dh_gex_init, init_pkt.payload[0]);
+    try t.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 1, 2 }, init_pkt.payload[1..]);
+}
+
+test "mlkem768x25519Kex (client): a reply under another message number is KexFailed, even at the right length" {
+    var payload_buf: [mlkem_sreply_len + 128]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&payload_buf);
+    try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT));
+    try messages.writeString(&pw, "not-a-real-host-key-blob");
+    try messages.writeString(&pw, &@as([mlkem_sreply_len]u8, @splat(9)));
+    try messages.writeString(&pw, "not-a-real-signature");
+    var none_w: CipherState = .plaintext;
+    var reply_buf: [mlkem_sreply_len + 256]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&reply_buf);
+    try writePacket(&rw, &none_w, .os, pw.buffered());
+
+    var r: std.Io.Reader = .fixed(rw.buffered());
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .plaintext;
+    var kr: KexResult = .{};
+    try std.testing.expectError(
+        error.KexFailed,
+        mlkem768x25519Kex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+    );
+}
+
+test "deriveKeyBytes: past one hash block the key is extended by HASH(K || H || K1) (RFC 4253 §7.2)" {
+    const t = std.testing;
+    const k = "\x00\x00\x00\x01\x05";
+    const h: [32]u8 = @splat(0x21);
+    const sid: [32]u8 = @splat(0x43);
+    var long: [64]u8 = undefined;
+    deriveKeyBytes(&long, 'C', k, &h, &sid);
+    var k1: [32]u8 = undefined;
+    deriveKeyBytes(&k1, 'C', k, &h, &sid);
+    try t.expectEqualSlices(u8, &k1, long[0..32]);
+    var k2: [32]u8 = undefined;
+    var s = Sha256.init(.{});
+    s.update(k);
+    s.update(&h);
+    s.update(&k1);
+    s.final(&k2);
+    try t.expectEqualSlices(u8, &k2, long[32..64]);
+}
+
+test "IdString.set: 255 bytes fit, 256 are refused" {
+    var id: IdString = .{};
+    const s: [256]u8 = @splat('a');
+    try id.set(s[0..255]);
+    try std.testing.expectEqual(@as(usize, 255), id.slice().len);
+    try std.testing.expectError(error.VersionExchangeFailed, id.set(&s));
+}
+
+test "mlkem768x25519Kex (client): an S_REPLY one byte too long is KexFailed" {
+    var payload_buf: [mlkem_sreply_len + 128]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&payload_buf);
+    try pw.writeByte(@backingInt(messages.MessageType.SSH_MSG_KEXDH_REPLY));
+    try messages.writeString(&pw, "not-a-real-host-key-blob");
+    try messages.writeString(&pw, &@as([mlkem_sreply_len + 1]u8, @splat(9)));
+    try messages.writeString(&pw, "not-a-real-signature");
+    var none_w: CipherState = .plaintext;
+    var reply_buf: [mlkem_sreply_len + 256]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&reply_buf);
+    try writePacket(&rw, &none_w, .os, pw.buffered());
+
+    var r: std.Io.Reader = .fixed(rw.buffered());
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .plaintext;
+    var kr: KexResult = .{};
+    try std.testing.expectError(
+        error.KexFailed,
+        mlkem768x25519Kex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+    );
+}
+
+test "Transport.deinit is safe to call twice, with a half-read re-exchange queue" {
+    const gpa = std.testing.allocator;
+    var tr = Transport.init(undefined, undefined);
+    tr.gpa = gpa;
+    for (0..2) |_| {
+        const p = try gpa.dupe(u8, &[_]u8{ 94, 0, 0, 0, 0 });
+        try tr.pending.append(gpa, .{ .payload = p, .seq = 1 });
+        tr.pending_bytes += p.len;
+    }
+    // As popPending leaves it after the first of two: freed, head advanced.
+    gpa.free(tr.pending.items[0].payload);
+    tr.pending_bytes -= 5;
+    tr.pending_head = 1;
+    tr.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tr.pending_bytes);
+    tr.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tr.pending_head);
+}
+
+test "finishKex restarts the rekey counters" {
+    var tr = Transport.init(undefined, undefined);
+    tr.gpa = std.testing.allocator;
+    tr.rekey_limit_packets = 3;
+    tr.packets_since_kex = 5;
+    tr.bytes_since_kex = 5;
+    tr.finishKex();
+    try std.testing.expectEqual(@as(u32, 0), tr.packets_since_kex);
+    try std.testing.expectEqual(@as(u64, 0), tr.bytes_since_kex);
+    try std.testing.expect(!tr.wantsRekey());
+}
+
+test "rekey answers an unrecognized message with UNIMPLEMENTED instead of queueing it" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var wire: [128]u8 = undefined;
+    const framed = try framePlain(&wire, &.{&[_]u8{ 254, 1, 2, 3 }}); // then end of input
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = Transport.init(&r, &sink);
+    tr.gpa = gpa;
+    defer tr.deinit();
+    try t.expectError(error.EndOfStream, tr.rekey());
+    try t.expectEqual(@as(usize, 0), tr.pending.items.len);
+    // Our KEXINIT, then UNIMPLEMENTED naming sequence number 0.
+    var sr: std.Io.Reader = .fixed(sink.buffered());
+    var rc: CipherState = .plaintext;
+    var buf: [2048]u8 = undefined;
+    try t.expectEqual(@as(u8, @backingInt(messages.MessageType.SSH_MSG_KEXINIT)), (try readPacket(&sr, &rc, &buf)).payload[0]);
+    const un = try readPacket(&sr, &rc, &buf);
+    try t.expectEqualSlices(u8, &[_]u8{ @backingInt(messages.MessageType.SSH_MSG_UNIMPLEMENTED), 0, 0, 0, 0 }, un.payload);
+}
+
+test "msgType: an empty payload is message 0; magnitudeBits: an empty magnitude has 0 bits" {
+    try std.testing.expectEqual(@as(u8, 0), msgType(.{ .packet_length = 5, .padding_length = 4, .payload = "", .padding = "", .mac = "" }));
+    try std.testing.expectEqual(@as(usize, 0), magnitudeBits(""));
+}
+
+test "verifySignature: an ed25519 key blob of the wrong size is refused, not copied" {
+    var kb: [128]u8 = undefined;
+    var sb: [128]u8 = undefined;
+    for ([_]usize{ 31, 33 }) |n| {
+        var kw: std.Io.Writer = .fixed(&kb);
+        try messages.writeString(&kw, "ssh-ed25519");
+        const key: [33]u8 = @splat(9);
+        try messages.writeString(&kw, key[0..n]);
+        var sw: std.Io.Writer = .fixed(&sb);
+        try messages.writeString(&sw, "ssh-ed25519");
+        try messages.writeString(&sw, &@as([64]u8, @splat(1)));
+        try std.testing.expectError(error.HostKeyVerificationFailed, verifySignature("ssh-ed25519", kw.buffered(), sw.buffered(), "h"));
+    }
+}
+
+fn expectKexFailedOn(comptime method: enum { x25519, ecdh_p256, dh14 }, reply_payload: []const u8) !void {
+    var none_w: CipherState = .plaintext;
+    var reply_buf: [2048]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&reply_buf);
+    try writePacket(&rw, &none_w, .os, reply_payload);
+    var r: std.Io.Reader = .fixed(rw.buffered());
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .plaintext;
+    var kr: KexResult = .{};
+    const res = switch (method) {
+        .x25519 => curve25519Kex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+        .ecdh_p256 => ecdhNistKex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ecdh-sha2-nistp256", "ssh-ed25519"),
+        .dh14 => dhGroupKex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "diffie-hellman-group14-sha256", "ssh-ed25519"),
+    };
+    try std.testing.expectError(error.KexFailed, res);
+}
+
+test "KEX replies (client): a wrong message number or a wrong-size Q_S is KexFailed before any host-key work" {
+    var kp = try EcdhNistKeyPair(.p256).generate(.os);
+    defer kp.zeroize();
+    var q25519: [33]u8 = @splat(0);
+    q25519[0] = 9;
+    const cases = .{
+        .{ .x25519, @backingInt(messages.MessageType.SSH_MSG_KEXDH_REPLY), q25519[0..31], false },
+        .{ .ecdh_p256, @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT), kp.public[0..], false },
+        .{ .dh14, @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT), &[_]u8{2}, true },
+    };
+    inline for (cases) |c| {
+        var pb: [512]u8 = undefined;
+        var pw: std.Io.Writer = .fixed(&pb);
+        try pw.writeByte(c[1]);
+        try messages.writeString(&pw, "not-a-real-host-key-blob");
+        if (c[3]) try messages.writeMpint(&pw, c[2]) else try messages.writeString(&pw, c[2]);
+        try messages.writeString(&pw, "not-a-real-signature");
+        try expectKexFailedOn(c[0], pw.buffered());
+    }
+}
+
+test "dhPowModPrime: an exponent longer than the group or an output shorter than the result is KexFailed" {
+    const p = DhGroup.forName("diffie-hellman-group14-sha256").?.prime;
+    var big: [512]u8 = undefined;
+    const x: [257]u8 = @splat(0x11);
+    try std.testing.expectError(error.KexFailed, dhPowModPrime(p, &[_]u8{2}, &x, &big));
+    var small: [16]u8 = undefined;
+    try std.testing.expectError(error.KexFailed, dhPowModPrime(p, &[_]u8{2}, x[0..32], &small));
+}
+
+test "dhGexKex (client): a group below the bit range or with g = 1 is KexFailed" {
+    const p14 = DhGroup.forName("diffie-hellman-group14-sha256").?.prime;
+    var p1024: [128]u8 = p14[0..128].*;
+    p1024[127] |= 1;
+    for ([_][]const u8{ &p1024, p14 }, [_][]const u8{ &[_]u8{2}, &[_]u8{1} }) |p, g| {
+        var pb: [600]u8 = undefined;
+        var pw: std.Io.Writer = .fixed(&pb);
+        try pw.writeByte(msg_kex_dh_gex_group);
+        try messages.writeMpint(&pw, p);
+        try messages.writeMpint(&pw, g);
+        var none_w: CipherState = .plaintext;
+        var reply_buf: [1024]u8 = undefined;
+        var rw: std.Io.Writer = .fixed(&reply_buf);
+        try writePacket(&rw, &none_w, .os, pw.buffered());
+        var r: std.Io.Reader = .fixed(rw.buffered());
+        var out_scratch: [8192]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out_scratch);
+        var none: CipherState = .plaintext;
+        var kr: KexResult = .{};
+        try std.testing.expectError(
+            error.KexFailed,
+            dhGexKex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+        );
+    }
+}
+
+test "dhGexKex (client): a reply under another message number is KexFailed" {
+    const p = DhGroup.forName("diffie-hellman-group14-sha256").?.prime;
+    var in_buf: [2048]u8 = undefined;
+    var iw: std.Io.Writer = .fixed(&in_buf);
+    var none_w: CipherState = .plaintext;
+    {
+        var pb: [600]u8 = undefined;
+        var pw: std.Io.Writer = .fixed(&pb);
+        try pw.writeByte(msg_kex_dh_gex_group);
+        try messages.writeMpint(&pw, p);
+        try messages.writeMpint(&pw, &[_]u8{2});
+        try writePacket(&iw, &none_w, .os, pw.buffered());
+    }
+    {
+        var pb: [128]u8 = undefined;
+        var pw: std.Io.Writer = .fixed(&pb);
+        try pw.writeByte(msg_kex_dh_gex_reply + 1);
+        try messages.writeString(&pw, "not-a-real-host-key-blob");
+        try messages.writeMpint(&pw, &[_]u8{2});
+        try messages.writeString(&pw, "not-a-real-signature");
+        try writePacket(&iw, &none_w, .os, pw.buffered());
+    }
+    var r: std.Io.Reader = .fixed(iw.buffered());
+    var out_scratch: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_scratch);
+    var none: CipherState = .plaintext;
+    var kr: KexResult = .{};
+    try std.testing.expectError(
+        error.KexFailed,
+        dhGexKex(&kr, &r, &w, .single(&none), .os, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
+    );
+}
+
+test "rekey while an exchange runs is a no-op" {
+    var sink_buf: [64]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = Transport.init(undefined, &sink);
+    tr.gpa = std.testing.allocator;
+    tr.in_kex = true;
+    try tr.rekey();
+    try std.testing.expectEqual(@as(usize, 0), sink.buffered().len);
+}
+
+test "popPending: the queue compacts once drained; a payload exactly the buffer's size fits" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var tr = Transport.init(undefined, undefined);
+    tr.gpa = gpa;
+    defer tr.deinit();
+    for (0..2) |_| {
+        const p = try gpa.dupe(u8, &[_]u8{ 94, 0, 0, 0, 0 });
+        try tr.pending.append(gpa, .{ .payload = p, .seq = 1 });
+        tr.pending_bytes += p.len;
+    }
+    var buf: [5]u8 = undefined;
+    _ = try tr.recvPacket(&buf);
+    try t.expectEqual(@as(usize, 2), tr.pending.items.len);
+    _ = try tr.recvPacket(&buf);
+    try t.expectEqual(@as(usize, 0), tr.pending.items.len);
+    try t.expectEqual(@as(usize, 0), tr.pending_head);
+}
+
+test "buildKexInit: a re-exchange offers every configured method even without strict KEX" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var tr = Transport.init(undefined, undefined);
+    tr.offer_strict_kex = false;
+    const payload = try tr.buildKexInit(gpa, .rekey);
+    defer gpa.free(payload);
+    var r: std.Io.Reader = .fixed(payload[1..]);
+    var ki = try KexInit.decode(gpa, &r);
+    defer ki.deinit(gpa);
+    try t.expectEqual(tr.algorithms.kex.len, ki.kex_algorithms.len);
+}
+
+test "sendDisconnect: a description over 256 bytes is cut to 256" {
+    const t = std.testing;
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = Transport.init(undefined, &sink);
+    const long: [300]u8 = @splat('d');
+    try tr.sendDisconnect(std.enums.values(messages.DisconnectReason)[0], &long);
+    var r: std.Io.Reader = .fixed(sink.buffered());
+    var rc: CipherState = .plaintext;
+    var buf: [1024]u8 = undefined;
+    const pkt = try readPacket(&r, &rc, &buf);
+    try t.expectEqual(@as(u32, 256), std.mem.readInt(u32, pkt.payload[5..9], .big));
+}
+
+test "rekey: a key-exchange message before the peer's KEXINIT is a protocol error, not queued" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var wire: [128]u8 = undefined;
+    const framed = try framePlain(&wire, &.{&[_]u8{ @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT), 0, 0, 0, 0 }});
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = Transport.init(&r, &sink);
+    tr.gpa = gpa;
+    defer tr.deinit();
+    try t.expectError(error.ProtocolError, tr.rekey());
+    try t.expectEqual(@as(usize, 0), tr.pending.items.len);
+}
+
+test "popPending: a queued payload larger than the caller's buffer is PacketTooLarge" {
+    const gpa = std.testing.allocator;
+    var tr = Transport.init(undefined, undefined);
+    tr.gpa = gpa;
+    defer tr.deinit();
+    const p = try gpa.dupe(u8, &[_]u8{ 94, 0, 0, 0, 0 });
+    try tr.pending.append(gpa, .{ .payload = p, .seq = 1 });
+    tr.pending_bytes += p.len;
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.PacketTooLarge, tr.recvPacket(&buf));
+}
+
+test "buildKexInit refuses a bad configuration itself (a re-exchange never passed clientHandshake's check)" {
+    const gpa = std.testing.allocator;
+    var tr = Transport.init(undefined, undefined);
+    tr.algorithms.kex = &.{};
+    if (tr.buildKexInit(gpa, .rekey)) |p| {
+        gpa.free(p);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "clientHandshake: a first packet that is not KEXINIT is a protocol error, even when its body would parse as one" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var kb: [1024]u8 = undefined;
+    var kw: std.Io.Writer = .fixed(&kb);
+    const ki = kexInitFor(&compression_algorithms);
+    try ki.encode(&kw);
+    const body = kw.buffered();
+    body[0] = @backingInt(messages.MessageType.SSH_MSG_KEXDH_INIT);
+    var in: [2048]u8 = undefined;
+    var iw: std.Io.Writer = .fixed(&in);
+    try iw.writeAll("SSH-2.0-peer\r\n");
+    var none: CipherState = .plaintext;
+    try writePacket(&iw, &none, .os, body);
+    var r: std.Io.Reader = .fixed(iw.buffered());
+    var sink_buf: [8192]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = Transport.init(&r, &sink);
+    defer tr.deinit();
+    try t.expectError(error.ProtocolError, tr.clientHandshake(gpa, unreachable_policy));
+}
+
+test "isRecognized: the userauth method range is 60..79 inclusive" {
+    try std.testing.expect(isRecognized(79));
+    try std.testing.expect(!isRecognized(254));
+}
+
+test "connectInto: builds the transport in the caller's slot, and cleans it up on failure" {
+    const t = std.testing;
+    const flood: [300]u8 = @splat('A'); // an identification line over 255 bytes
+    var r: std.Io.Reader = .fixed(&flood);
+    var sink_buf: [512]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr: Transport = undefined;
+    try t.expectError(error.VersionExchangeFailed, connectInto(&tr, &r, &sink, t.allocator, unreachable_policy));
+    try t.expectEqual(&r, tr.reader);
+    try t.expect(tr.read_cipher == .none);
 }

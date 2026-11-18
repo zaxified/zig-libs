@@ -189,7 +189,9 @@ pub const Sshd = struct {
         try owned.append(gpa, ak_opt);
         const log_path = try gpa.print("{s}/sshd.log", .{dir_path});
         try owned.append(gpa, log_path);
-        try argv.appendSlice(gpa, &.{ sshd_path, "-D", "-E", log_path, "-f", "/dev/null", "-h", hk_path });
+        // setpriv: the test sshd gets SIGKILL when this process dies, even by
+        // SIGKILL (a mutation run's timeout), so it is never left orphaned.
+        try argv.appendSlice(gpa, &.{ "/usr/bin/setpriv", "--pdeathsig", "KILL", "--", sshd_path, "-D", "-E", log_path, "-f", "/dev/null", "-h", hk_path });
         const base = [_][]const u8{
             port_opt,                          "ListenAddress=127.0.0.1",
             "UsePAM=no",                       "StrictModes=no",

@@ -3327,3 +3327,694 @@ test "serveUserauth: the request that abandoned keyboard-interactive is dropped 
     }));
     try t.expectEqual(@as(usize, 0), accepting.calls);
 }
+
+// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+
+test "userauth msgType: an empty payload is message 0" {
+    try std.testing.expectEqual(@as(u8, 0), msgType(.{ .packet_length = 5, .padding_length = 4, .payload = "", .padding = "", .mac = "" }));
+}
+
+test "rsaHashFor: only an rsa key takes an rsa-sha2 variant from server-sig-algs" {
+    const ed: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(6)) };
+    var algs: transport.ServerSigAlgs = .{};
+    algs.accepted = @splat(true);
+    try std.testing.expect(rsaHashFor(&ed, algs) == null);
+}
+
+test "client userauth: a user name of 255 bytes and a service of 64 are sent, one more is NameTooLong" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(6)) };
+    const long: [256]u8 = @splat('u');
+    const Case = struct { user: usize, service: usize, password: bool, too_long: bool };
+    for ([_]Case{
+        .{ .user = 255, .service = 14, .password = false, .too_long = false },
+        .{ .user = 256, .service = 14, .password = false, .too_long = true },
+        .{ .user = 4, .service = 64, .password = false, .too_long = false },
+        .{ .user = 4, .service = 65, .password = false, .too_long = true },
+        .{ .user = 255, .service = 0, .password = true, .too_long = false },
+        .{ .user = 256, .service = 0, .password = true, .too_long = true },
+    }) |c| {
+        // No reply ever comes: an accepted name ends in EndOfStream after the
+        // request went out, a refused one before anything is written.
+        var r: std.Io.Reader = .fixed("");
+        var out: [2048]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var tr = transport.Transport.init(&r, &sink);
+        const res = if (c.password)
+            authenticatePassword(&tr, gpa, long[0..c.user], "pw", .{})
+        else
+            authenticatePublickeyBoundTo(&tr, gpa, long[0..c.user], &key, .{ .service = long[0..c.service] }, "sid");
+        if (c.too_long) {
+            try t.expectError(error.NameTooLong, res);
+            try t.expectEqual(@as(usize, 0), sink.buffered().len);
+        } else {
+            if (res) |_| return error.TestUnexpectedResult else |_| {}
+            try t.expect(sink.buffered().len > 0);
+        }
+    }
+}
+
+const answer_nothing: KbdResponder = .{ .respondFn = struct {
+    fn f(_: *anyopaque, _: *const KbdChallenge, _: [][]const u8) bool {
+        return true;
+    }
+}.f };
+
+test "client userauth: a FAILURE to a password is AuthenticationFailed, never success" {
+    var wire: [512]u8 = undefined;
+    const failure = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE), 0, 0, 0, 8 } ++ "password".* ++ [_]u8{0};
+    const framed = try framePackets(&wire, &.{&failure});
+    var r: std.Io.Reader = .fixed(framed);
+    var out: [2048]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&out);
+    var tr = transport.Transport.init(&r, &sink);
+    try std.testing.expectError(error.AuthenticationFailed, authenticatePassword(&tr, std.testing.allocator, "alice", "pw", .{}));
+}
+
+test "client userauth: a password of 1024 bytes is sent through authenticateWith, 1025 is NameTooLong" {
+    const t = std.testing;
+    const failure = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE), 0, 0, 0, 8 } ++ "password".* ++ [_]u8{0};
+    const pw: [max_password_len + 1]u8 = @splat('p');
+    for ([_]usize{ max_password_len, max_password_len + 1 }) |n| {
+        var out: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var progress: AuthProgress = .{};
+        const res = clientCanned(&.{&failure}, &sink, &.{.{ .password = pw[0..n] }}, &progress);
+        if (n > max_password_len) {
+            try t.expectError(error.NameTooLong, res);
+        } else {
+            try t.expectError(error.EndOfStream, res);
+        }
+    }
+}
+
+test "keyboard-interactive client: user name bound, and at most max_kbd_rounds INFO_REQUESTs" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    const long: [256]u8 = @splat('u');
+    for ([_]usize{ 255, 256 }) |n| {
+        var r: std.Io.Reader = .fixed("");
+        var out: [2048]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var tr = transport.Transport.init(&r, &sink);
+        const res = authenticateKeyboardInteractive(&tr, gpa, long[0..n], answer_nothing, .{});
+        if (n == 256) {
+            try t.expectError(error.NameTooLong, res);
+            try t.expectEqual(@as(usize, 0), sink.buffered().len);
+        } else {
+            try t.expectError(error.EndOfStream, res);
+        }
+    }
+    // max_kbd_rounds + 1 empty INFO_REQUESTs: the last is a protocol error.
+    const info = [_]u8{ messages.msg_userauth_info_request, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var payloads: [max_kbd_rounds + 1][]const u8 = undefined;
+    for (&payloads) |*p| p.* = &info;
+    var wire: [16 * 1024]u8 = undefined;
+    const framed = try framePackets(&wire, &payloads);
+    var r: std.Io.Reader = .fixed(framed);
+    var out: [16 * 1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&out);
+    var tr = transport.Transport.init(&r, &sink);
+    try t.expectError(error.ProtocolError, authenticateKeyboardInteractive(&tr, gpa, "alice", answer_nothing, .{}));
+}
+
+test "authenticatePassword: a password of exactly max_password_len is sent" {
+    const pw: [max_password_len]u8 = @splat('p');
+    var r: std.Io.Reader = .fixed("");
+    var out: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&out);
+    var tr = transport.Transport.init(&r, &sink);
+    try std.testing.expectError(error.EndOfStream, authenticatePassword(&tr, std.testing.allocator, "alice", &pw, .{}));
+    try std.testing.expect(sink.buffered().len > max_password_len);
+}
+
+fn kbdRun(payloads: []const []const u8, responder: KbdResponder) UserauthError!void {
+    const S = struct {
+        var wire: [64 * 1024]u8 = undefined;
+        var out: [64 * 1024]u8 = undefined;
+    };
+    const framed = framePackets(&S.wire, payloads) catch unreachable;
+    var r: std.Io.Reader = .fixed(framed);
+    var sink: std.Io.Writer = .fixed(&S.out);
+    var tr = transport.Transport.init(&r, &sink);
+    return authenticateKeyboardInteractive(&tr, std.testing.allocator, "alice", responder, .{});
+}
+
+const AnswerWith = struct {
+    answer: []const u8,
+    fn f(ctx: *anyopaque, _: *const KbdChallenge, answers: [][]const u8) bool {
+        const self: *const AnswerWith = @ptrCast(@alignCast(ctx));
+        for (answers) |*a| a.* = self.answer;
+        return true;
+    }
+};
+
+test "keyboard-interactive client: the round, prompt, answer and packet bounds are inclusive" {
+    const t = std.testing;
+    const success = [_]u8{@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)};
+    const empty_info = [_]u8{ messages.msg_userauth_info_request, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var payloads: [300][]const u8 = undefined;
+    // Exactly max_kbd_rounds rounds, then success.
+    for (payloads[0..max_kbd_rounds]) |*p| p.* = &empty_info;
+    payloads[max_kbd_rounds] = &success;
+    try kbdRun(payloads[0 .. max_kbd_rounds + 1], answer_nothing);
+    // One round with exactly max_kbd_prompts prompts, then success.
+    var big: [512]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&big);
+    try bw.writeAll(&empty_info);
+    std.mem.writeInt(u32, big[13..17], max_kbd_prompts, .big);
+    for (0..max_kbd_prompts) |_| {
+        try messages.writeString(&bw, "p");
+        try bw.writeByte(0);
+    }
+    try kbdRun(&.{ bw.buffered(), &success }, answer_nothing);
+    // An answer of max_password_len bytes is sent; one byte more is refused.
+    var one_prompt: [32]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&one_prompt);
+    try ow.writeAll(&empty_info);
+    std.mem.writeInt(u32, one_prompt[13..17], 1, .big);
+    try messages.writeString(&ow, "p");
+    try ow.writeByte(0);
+    const long: [max_password_len + 1]u8 = @splat('a');
+    var ok_ans: AnswerWith = .{ .answer = long[0..max_password_len] };
+    try kbdRun(&.{ ow.buffered(), &success }, .{ .ctx = &ok_ans, .respondFn = AnswerWith.f });
+    var bad_ans: AnswerWith = .{ .answer = &long };
+    try t.expectError(error.NameTooLong, kbdRun(&.{ ow.buffered(), &success }, .{ .ctx = &bad_ans, .respondFn = AnswerWith.f }));
+    // 256 packets that decide nothing end the exchange, even if a 257th would.
+    const banner = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER), 0, 0, 0, 1, 'b', 0, 0, 0, 0 };
+    for (payloads[0..256]) |*p| p.* = &banner;
+    payloads[256] = &success;
+    try t.expectError(error.ProtocolError, kbdRun(payloads[0..257], answer_nothing));
+}
+
+test "authenticateWith: a user name of 255 bytes is sent, 256 is NameTooLong" {
+    const t = std.testing;
+    const long: [256]u8 = @splat('u');
+    for ([_]usize{ 255, 256 }) |n| {
+        var r: std.Io.Reader = .fixed("");
+        var out: [2048]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("session");
+        const res = authenticateWith(&tr, t.allocator, long[0..n], &.{.{ .password = "pw" }}, .{ .request_service = false });
+        if (n == 256) try t.expectError(error.NameTooLong, res) else try t.expectError(error.EndOfStream, res);
+    }
+}
+
+fn failureWith(comptime names: []const u8) [1 + 4 + names.len + 1]u8 {
+    var b: [1 + 4 + names.len + 1]u8 = undefined;
+    b[0] = @backingInt(messages.MessageType.SSH_MSG_USERAUTH_FAILURE);
+    std.mem.writeInt(u32, b[1..5], names.len, .big);
+    @memcpy(b[5 .. 5 + names.len], names);
+    b[b.len - 1] = 0;
+    return b;
+}
+
+test "authenticateWith: steps are counted, and the step budget ends the run at exactly max_client_auth_steps" {
+    const t = std.testing;
+    const success = [_]u8{@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)};
+    const fail_pw = failureWith("password");
+    {
+        var out: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var progress: AuthProgress = .{};
+        try clientCanned(&.{ &fail_pw, &success }, &sink, &.{.{ .password = "pw" }}, &progress);
+        try t.expectEqual(@as(u32, 2), progress.steps);
+    }
+    {
+        // none (1) + 62 password tries (62) + keyboard-interactive (64): the
+        // budget is spent, publickey is never queried.
+        const fail_all = failureWith("publickey,password,keyboard-interactive");
+        var replies: [80][]const u8 = undefined;
+        for (&replies) |*r| r.* = &fail_all;
+        const pw: ClientMethod = .{ .password = "pw" };
+        const key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(6)) };
+        const keys = [_]*const AuthKey{&key};
+        var out: [64 * 1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.AuthenticationFailed, clientCanned(&replies, &sink, &.{
+            .{ .retryable = .{ .method = &pw, .max_tries = 62 } },
+            .{ .keyboard_interactive = answer_nothing },
+            .{ .publickey = &keys },
+        }, &progress));
+        try t.expectEqual(@as(u32, max_client_auth_steps), progress.steps);
+        var store: [80][512]u8 = undefined;
+        var names: [80][]const u8 = undefined;
+        const sent = try requestMethods(sink.buffered(), &store, &names);
+        try t.expectEqual(@as(usize, 64), sent.len);
+        try t.expectEqualStrings("keyboard-interactive", sent[63]);
+    }
+}
+
+test "authenticateWith: a method that ran into an unsupported reply is reported as such at the end" {
+    const fail_pw = failureWith("password");
+    const change_req = [_]u8{ 60, 0, 0, 0, 1, 'x', 0, 0, 0, 0 }; // PASSWD_CHANGEREQ
+    var out: [8192]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&out);
+    var progress: AuthProgress = .{};
+    try std.testing.expectError(error.UnsupportedAuthMethod, clientCanned(&.{ &fail_pw, &change_req }, &sink, &.{.{ .password = "pw" }}, &progress));
+}
+
+const PromptLen = struct {
+    n: usize,
+    fn f(ctx: *anyopaque, _: []const u8, buf: []u8) ?usize {
+        const self: *const PromptLen = @ptrCast(@alignCast(ctx));
+        @memset(buf, 'p');
+        return self.n;
+    }
+};
+
+test "authenticateWith: a password prompt may fill its whole buffer, not claim more" {
+    const t = std.testing;
+    const fail_pw = failureWith("password");
+    for ([_]usize{ max_password_len, max_password_len + 1 }) |n| {
+        var pl: PromptLen = .{ .n = n };
+        var out: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var progress: AuthProgress = .{};
+        const res = clientCanned(&.{&fail_pw}, &sink, &.{.{ .password_prompt = .{ .ctx = &pl, .promptFn = PromptLen.f } }}, &progress);
+        if (n > max_password_len) try t.expectError(error.NameTooLong, res) else try t.expectError(error.EndOfStream, res);
+    }
+}
+
+test "retryable: the step budget stops it at max_client_auth_steps; a server that drops the method stops it at once" {
+    const t = std.testing;
+    const pw: ClientMethod = .{ .password = "pw" };
+    var store: [80][512]u8 = undefined;
+    var names: [80][]const u8 = undefined;
+    {
+        const fail_pw = failureWith("password");
+        var replies: [80][]const u8 = undefined;
+        for (&replies) |*r| r.* = &fail_pw;
+        var out: [64 * 1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.AuthenticationFailed, clientCanned(&replies, &sink, &.{.{ .retryable = .{ .method = &pw, .max_tries = 0 } }}, &progress));
+        // none + 63 password tries = 64 steps.
+        try t.expectEqual(@as(usize, max_client_auth_steps), (try requestMethods(sink.buffered(), &store, &names)).len);
+    }
+    {
+        const fail_pw = failureWith("password");
+        const fail_pk = failureWith("publickey");
+        var out: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&out);
+        var progress: AuthProgress = .{};
+        try t.expectError(error.AuthenticationFailed, clientCanned(&.{ &fail_pw, &fail_pk, &fail_pk, &fail_pk }, &sink, &.{.{ .retryable = .{ .method = &pw, .max_tries = 3 } }}, &progress));
+        try t.expectEqual(@as(usize, 2), (try requestMethods(sink.buffered(), &store, &names)).len);
+    }
+}
+
+/// Test-only: a plaintext packet of any size (writePacket stops at 8 KiB).
+fn frameRaw(w: *std.Io.Writer, payload: []const u8) !void {
+    const padlen: usize = 8 - (5 + payload.len) % 8 + 8;
+    var lb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lb, @intCast(1 + payload.len + padlen), .big);
+    try w.writeAll(&lb);
+    try w.writeByte(@intCast(padlen));
+    try w.writeAll(payload);
+    for (0..padlen) |_| try w.writeByte(0);
+}
+
+test "client userauth: banner size bound, and at most 64 informational packets per reply" {
+    const t = std.testing;
+    const S = struct {
+        var wire: [64 * 1024]u8 = undefined;
+        var out: [8192]u8 = undefined;
+        var banner: [max_banner_len + 1 + 16]u8 = undefined;
+    };
+    const success = [_]u8{@backingInt(messages.MessageType.SSH_MSG_USERAUTH_SUCCESS)};
+    for ([_]usize{ max_banner_len, max_banner_len + 1 }) |n| {
+        var bw: std.Io.Writer = .fixed(&S.banner);
+        try bw.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER));
+        var lb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &lb, @intCast(n), .big);
+        try bw.writeAll(&lb);
+        for (0..n) |_| try bw.writeByte('b');
+        try bw.writeAll(&[_]u8{ 0, 0, 0, 0 });
+        var ww: std.Io.Writer = .fixed(&S.wire);
+        try frameRaw(&ww, bw.buffered());
+        try frameRaw(&ww, &success);
+        var r: std.Io.Reader = .fixed(ww.buffered());
+        var sink: std.Io.Writer = .fixed(&S.out);
+        var tr = transport.Transport.init(&r, &sink);
+        const res = authenticatePassword(&tr, t.allocator, "alice", "pw", .{});
+        if (n > max_banner_len) try t.expectError(error.NameTooLong, res) else try res;
+    }
+    {
+        const banner = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_USERAUTH_BANNER), 0, 0, 0, 1, 'b', 0, 0, 0, 0 };
+        var ww: std.Io.Writer = .fixed(&S.wire);
+        for (0..64) |_| try frameRaw(&ww, &banner);
+        try frameRaw(&ww, &success);
+        var r: std.Io.Reader = .fixed(ww.buffered());
+        var sink: std.Io.Writer = .fixed(&S.out);
+        var tr = transport.Transport.init(&r, &sink);
+        try t.expectError(error.ProtocolError, authenticatePassword(&tr, t.allocator, "alice", "pw", .{}));
+    }
+}
+
+test "KbdPrompter: after a failed round every further challenge is false, and nothing more is sent" {
+    const t = std.testing;
+    var r: std.Io.Reader = .fixed("");
+    var out: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&out);
+    var tr = transport.Transport.init(&r, &sink);
+    var scratch: [4096]u8 = undefined;
+    var p: KbdPrompter = .{ .t = &tr, .scratch = &scratch };
+    var answers: [1][]const u8 = undefined;
+    const prompts = [_]KbdPrompt{.{ .text = "code: ", .echo = false }};
+    try t.expect(!p.challenge("", "", &prompts, &answers));
+    const sent = sink.buffered().len;
+    try t.expect(sent > 0);
+    try t.expect(!p.challenge("", "", &prompts, &answers));
+    try t.expectEqual(sent, sink.buffered().len);
+    try t.expectEqual(error.EndOfStream, p.err);
+}
+
+test "KbdPrompter: prompt-count and answer-slot checks, max_kbd_rounds rounds, and the request size bound" {
+    const t = std.testing;
+    const S = struct {
+        var wire: [16 * 1024]u8 = undefined;
+        var out: [64 * 1024]u8 = undefined;
+        var scratch: [4096]u8 = undefined;
+    };
+    const resp = [_]u8{ messages.msg_userauth_info_response, 0, 0, 0, 1, 0, 0, 0, 1, 'x' };
+    var payloads: [max_kbd_rounds + 1][]const u8 = undefined;
+    for (&payloads) |*q| q.* = &resp;
+    const framed = try framePackets(&S.wire, &payloads);
+    const one = [_]KbdPrompt{.{ .text = "p", .echo = false }};
+    var answers: [max_kbd_prompts + 1][]const u8 = undefined;
+    {
+        // Too many prompts, or answer slots that do not match: a config
+        // error, nothing sent.
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&S.out);
+        var tr = transport.Transport.init(&r, &sink);
+        var p: KbdPrompter = .{ .t = &tr, .scratch = &S.scratch };
+        var many: [max_kbd_prompts + 1]KbdPrompt = @splat(.{ .text = "p", .echo = false });
+        try t.expect(!p.challenge("", "", &many, answers[0 .. max_kbd_prompts + 1]));
+        try t.expectEqual(error.InvalidAuthConfig, p.err);
+        var q: KbdPrompter = .{ .t = &tr, .scratch = &S.scratch };
+        try t.expect(!q.challenge("", "", &one, answers[0..2]));
+        try t.expectEqual(error.InvalidAuthConfig, q.err);
+        try t.expectEqual(@as(usize, 0), sink.buffered().len);
+        // Exactly max_kbd_prompts prompts are asked.
+        var z: KbdPrompter = .{ .t = &tr, .scratch = &S.scratch };
+        _ = z.challenge("", "", many[0..max_kbd_prompts], answers[0..max_kbd_prompts]);
+        try t.expect(sink.buffered().len > 0);
+    }
+    {
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&S.out);
+        var tr = transport.Transport.init(&r, &sink);
+        var p: KbdPrompter = .{ .t = &tr, .scratch = &S.scratch };
+        for (0..max_kbd_rounds) |_| {
+            try t.expect(p.challenge("", "", &one, answers[0..1]));
+            try t.expectEqualStrings("x", answers[0]);
+        }
+        const sent = sink.buffered().len;
+        try t.expect(!p.challenge("", "", &one, answers[0..1]));
+        try t.expectEqual(KbdPrompter.State.refused, p.state);
+        try t.expectEqual(sent, sink.buffered().len);
+    }
+    {
+        // The INFO_REQUEST estimate may reach the 8 KiB buffer exactly.
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&S.out);
+        var tr = transport.Transport.init(&r, &sink);
+        var p: KbdPrompter = .{ .t = &tr, .scratch = &S.scratch };
+        const name: [8192 - 64 - 9 + 1]u8 = @splat('n');
+        try t.expect(p.challenge(name[0 .. name.len - 1], "", &one, answers[0..1]));
+        var q: KbdPrompter = .{ .t = &tr, .scratch = &S.scratch };
+        try t.expect(!q.challenge(&name, "", &one, answers[0..1]));
+        try t.expectEqual(error.NameTooLong, q.err);
+    }
+}
+
+test "KbdPrompter: a response is refused for a wrong count, an oversized answer or trailing bytes; another request abandons" {
+    const t = std.testing;
+    const S = struct {
+        var wire: [8192]u8 = undefined;
+        var out: [8192]u8 = undefined;
+        var scratch: [4096]u8 = undefined;
+        var resp: [2048]u8 = undefined;
+    };
+    const one = [_]KbdPrompt{.{ .text = "p", .echo = false }};
+    const Case = struct { n: u32, answer_len: usize, trailing: bool, ok: bool };
+    for ([_]Case{
+        .{ .n = 0, .answer_len = 1, .trailing = false, .ok = false }, // count says 0, one answer follows
+        .{ .n = 1, .answer_len = max_password_len, .trailing = false, .ok = true },
+        .{ .n = 1, .answer_len = max_password_len + 1, .trailing = false, .ok = false },
+        .{ .n = 1, .answer_len = 1, .trailing = true, .ok = false },
+    }) |c| {
+        var rw: std.Io.Writer = .fixed(&S.resp);
+        try rw.writeByte(messages.msg_userauth_info_response);
+        var nb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &nb, c.n, .big);
+        try rw.writeAll(&nb);
+        std.mem.writeInt(u32, &nb, @intCast(c.answer_len), .big);
+        try rw.writeAll(&nb);
+        for (0..c.answer_len) |_| try rw.writeByte('a');
+        if (c.trailing) try rw.writeByte(0);
+        const framed = try framePackets(&S.wire, &.{rw.buffered()});
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&S.out);
+        var tr = transport.Transport.init(&r, &sink);
+        var p: KbdPrompter = .{ .t = &tr, .scratch = &S.scratch };
+        var answers: [1][]const u8 = undefined;
+        try t.expectEqual(c.ok, p.challenge("", "", &one, &answers));
+        try t.expectEqual(if (c.ok) KbdPrompter.State.ok else KbdPrompter.State.refused, p.state);
+    }
+    {
+        const req = [_]u8{ @backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST), 0, 0, 0, 0 };
+        const framed = try framePackets(&S.wire, &.{&req});
+        var r: std.Io.Reader = .fixed(framed);
+        var sink: std.Io.Writer = .fixed(&S.out);
+        var tr = transport.Transport.init(&r, &sink);
+        var p: KbdPrompter = .{ .t = &tr, .scratch = &S.scratch };
+        var answers: [1][]const u8 = undefined;
+        try t.expect(!p.challenge("", "", &one, &answers));
+        try t.expectEqual(KbdPrompter.State.abandoned, p.state);
+        try t.expect(p.pending != null);
+    }
+}
+
+test "serveUserauth: exactly max_auth_requests requests are served, the next is not" {
+    const t = std.testing;
+    const S = struct {
+        var m: [max_auth_requests + 1]Msg = undefined;
+        var p: [max_auth_requests + 1][]const u8 = undefined;
+        var sink_buf: [64 * 1024]u8 = undefined;
+    };
+    for (0..2) |extra| {
+        const n = max_auth_requests - 1 + extra; // unknown-method requests first
+        for (S.m[0..n], S.p[0..n]) |*m, *p| p.* = m.request("alice", "x-unknown").bytes();
+        S.p[n] = S.m[n].password("alice", "hunter2").bytes();
+        var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+        var sink: std.Io.Writer = .fixed(&S.sink_buf);
+        const res = serveCanned(S.p[0 .. n + 1], &sink, .{ .password = accepting.hook(), .max_attempts = 1000 });
+        if (extra == 0) {
+            try t.expectEqual(AuthMethod.password, (try res).method);
+        } else {
+            try t.expectError(error.AuthenticationFailed, res);
+        }
+    }
+}
+
+test "serveUserauth: a request that abandoned keyboard-interactive is served once, then the next is read" {
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    var m: [3]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    const res = try serveCanned(&.{
+        m[0].kbd("alice").bytes(),
+        m[1].password("alice", "wrong").bytes(),
+        m[2].password("alice", "hunter2").bytes(),
+    }, &sink, .{
+        .password = accepting.hook(),
+        .keyboard_interactive = .{ .prompts = &.{.{ .text = "Code: ", .echo = true }}, .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const []const u8) bool {
+                return true;
+            }
+        }.f },
+    });
+    try t.expectEqual(AuthMethod.password, res.method);
+    try t.expectEqual(@as(usize, 2), accepting.calls);
+}
+
+test "serveUserauth: user, service and password length bounds" {
+    const t = std.testing;
+    const S = struct {
+        var buf: [2048]u8 = undefined;
+        var sink_buf: [4096]u8 = undefined;
+    };
+    const long: [max_password_len + 1]u8 = @splat('z');
+    const Case = struct { user: usize, service: usize, pw: ?usize, too_long: bool };
+    for ([_]Case{
+        .{ .user = max_user_len, .service = 14, .pw = null, .too_long = false },
+        .{ .user = max_user_len + 1, .service = 14, .pw = null, .too_long = true },
+        .{ .user = 5, .service = max_service_len, .pw = null, .too_long = false },
+        .{ .user = 5, .service = max_service_len + 1, .pw = null, .too_long = true },
+        .{ .user = 5, .service = 0, .pw = max_password_len, .too_long = false },
+        .{ .user = 5, .service = 0, .pw = max_password_len + 1, .too_long = true },
+    }) |c| {
+        var w: std.Io.Writer = .fixed(&S.buf);
+        try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+        try messages.writeString(&w, long[0..c.user]);
+        try messages.writeString(&w, if (c.pw != null) connection_service else long[0..c.service]);
+        if (c.pw) |n| {
+            try messages.writeString(&w, "password");
+            try w.writeByte(0);
+            try messages.writeString(&w, long[0..n]);
+        } else try messages.writeString(&w, "none");
+        var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+        var sink: std.Io.Writer = .fixed(&S.sink_buf);
+        const res = serveCanned(&.{w.buffered()}, &sink, .{ .password = accepting.hook() });
+        if (c.too_long) try t.expectError(error.NameTooLong, res) else try t.expectError(error.EndOfStream, res);
+    }
+}
+
+test "serveUserauth: a password-change request is refused even with the right old password" {
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    var m: [1]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.EndOfStream, serveCanned(&.{
+        m[0].request("alice", "password").byte(1).str("hunter2").str("new-secret").bytes(),
+    }, &sink, .{ .password = accepting.hook() }));
+}
+
+test "serveUserauth: the free none probe is free only as the first failure" {
+    const t = std.testing;
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    var m: [3]Msg = undefined;
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    // wrong password (1), none (2 = max_attempts): the right password is never read.
+    try t.expectError(error.AuthenticationFailed, serveCanned(&.{
+        m[0].password("alice", "wrong").bytes(),
+        m[1].request("alice", "none").bytes(),
+        m[2].password("alice", "hunter2").bytes(),
+    }, &sink, .{ .password = accepting.hook(), .max_attempts = 2 }));
+}
+
+test "serveUserauth: keyboard-interactive with max_kbd_prompts prompts is served; a callback refusing without asking is a plain refusal" {
+    const t = std.testing;
+    var m: [1]Msg = undefined;
+    {
+        var prompts: [max_kbd_prompts]KbdPrompt = @splat(.{ .text = "p", .echo = false });
+        var sink_buf: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.EndOfStream, serveCanned(&.{m[0].kbd("alice").bytes()}, &sink, .{
+            .keyboard_interactive = .{ .prompts = &prompts, .checkFn = struct {
+                fn f(_: *anyopaque, _: []const u8, _: []const []const u8) bool {
+                    return true;
+                }
+            }.f },
+        }));
+    }
+    {
+        var sink_buf: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        try t.expectError(error.EndOfStream, serveCanned(&.{m[0].kbd("alice").bytes()}, &sink, .{
+            .callbacks = .{ .keyboard_interactive = .{ .decideFn = struct {
+                fn f(_: *anyopaque, _: *const AuthRequest, _: *KbdPrompter) Decision {
+                    return .reject;
+                }
+            }.f } },
+        }));
+    }
+}
+
+const any_key: AuthorizedKeyCheck = .{ .checkFn = struct {
+    fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+        return true;
+    }
+}.f };
+
+test "serveUserauth publickey: a signature made with another rsa-sha2 variant than the request names is refused (RFC 8332 §3)" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var key: AuthKey = undefined;
+    try AuthKey.fromOpenSSH(&key, @import("hostkey_vectors.zig").rsa_key, null);
+    key.rsa.hash = .sha2_256; // signs rsa-sha2-256 …
+    const blob = try key.publicBlob(gpa);
+    defer gpa.free(blob);
+    var sb: [8192]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sb);
+    try signedBlob(&sw, "session", "alice", connection_service, "rsa-sha2-512", blob); // … over a request for -512
+    const sig = try key.sign(gpa, sw.buffered());
+    defer gpa.free(sig);
+    var m: [1]Msg = undefined;
+    var big: [4096]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&big);
+    try bw.writeAll(m[0].request("alice", "publickey").byte(1).str("rsa-sha2-512").bytes());
+    try messages.writeString(&bw, blob);
+    try messages.writeString(&bw, sig);
+    var rec: RejectionRecorder = .{};
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    try t.expectError(error.EndOfStream, serveCanned(&.{bw.buffered()}, &sink, .{ .authorized_key = any_key, .on_rejected = rec.handler() }));
+    try t.expectEqual(AuthFailure.algorithm_mismatch, rec.last_reason.?);
+}
+
+test "serveUserauth publickey: key blob and signature length bounds" {
+    const t = std.testing;
+    const S = struct {
+        var buf: [8192]u8 = undefined;
+        var sink_buf: [16384]u8 = undefined;
+        var blob: [max_key_blob_len + 1]u8 = undefined;
+        var sig: [max_signature_len + 1]u8 = undefined;
+    };
+    const Case = struct { blob: usize, sig: ?usize, too_long: bool };
+    for ([_]Case{
+        .{ .blob = max_key_blob_len, .sig = null, .too_long = false },
+        .{ .blob = max_key_blob_len + 1, .sig = null, .too_long = true },
+        .{ .blob = 51, .sig = max_signature_len, .too_long = false },
+        .{ .blob = 51, .sig = max_signature_len + 1, .too_long = true },
+    }) |c| {
+        // An ssh-ed25519 blob, padded out with zeros to the case's length.
+        @memset(&S.blob, 0);
+        var kw: std.Io.Writer = .fixed(&S.blob);
+        try messages.writeString(&kw, "ssh-ed25519");
+        try messages.writeString(&kw, &@as([32]u8, @splat(9)));
+        @memset(&S.sig, 0);
+        var w: std.Io.Writer = .fixed(&S.buf);
+        try w.writeByte(@backingInt(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+        try messages.writeString(&w, "alice");
+        try messages.writeString(&w, connection_service);
+        try messages.writeString(&w, "publickey");
+        try w.writeByte(@intFromBool(c.sig != null));
+        try messages.writeString(&w, "ssh-ed25519");
+        try messages.writeString(&w, S.blob[0..c.blob]);
+        if (c.sig) |n| try messages.writeString(&w, S.sig[0..n]);
+        var sink: std.Io.Writer = .fixed(&S.sink_buf);
+        const res = serveCanned(&.{w.buffered()}, &sink, .{ .authorized_key = any_key });
+        if (c.too_long) try t.expectError(error.NameTooLong, res) else try t.expectError(error.EndOfStream, res);
+    }
+}
+
+test "serveUserauth: a banner over max_banner_len is refused before anything is sent" {
+    // A banner of max_banner_len itself does not fit the 8 KiB packet frame
+    // either (PacketTooLarge; reported in the 2026-11-18 audit); one near it does.
+    const t = std.testing;
+    const long: [max_banner_len + 1]u8 = @splat('b');
+    var m: [1]Msg = undefined;
+    for ([_]usize{ max_banner_len - 200, max_banner_len, max_banner_len + 1 }) |n| {
+        var sink_buf: [16384]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+        const res = serveCanned(&.{m[0].request("alice", "none").bytes()}, &sink, .{ .banner = long[0..n], .password = accepting.hook() });
+        switch (n) {
+            max_banner_len - 200 => try t.expectError(error.EndOfStream, res),
+            max_banner_len => try t.expectError(error.PacketTooLarge, res),
+            else => {
+                try t.expectError(error.NameTooLong, res);
+                try t.expectEqual(@as(usize, 0), sink.buffered().len);
+            },
+        }
+    }
+}
