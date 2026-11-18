@@ -1486,3 +1486,251 @@ test "constant-time mask helpers (exhaustive over u8, table over usize)" {
         }
     }
 }
+
+// ── whole-module mutation 2026-11-17 ─────────────────────────────────────────
+
+test "decoyCek: SHA-256 over the domain tag and the secret, truncated, zero-extended past 32 octets" {
+    var out: [64]u8 = @splat(0xAA);
+    const secret = "some secret material";
+    var want_digest: [32]u8 = undefined;
+    var h = Sha256.init(.{});
+    h.update("zig-libs/xmlenc decoy CEK v1");
+    h.update(secret);
+    h.final(&want_digest);
+    try testing.expectEqualSlices(u8, want_digest[0..16], decoyCek(secret, 16, &out));
+    try testing.expectEqualSlices(u8, &want_digest, decoyCek(secret, 32, &out));
+    out = @splat(0xAA);
+    const d48 = decoyCek(secret, 48, &out);
+    try testing.expectEqual(@as(usize, 48), d48.len);
+    try testing.expectEqualSlices(u8, &want_digest, d48[0..32]);
+    for (d48[32..]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "the unwrappers refuse a key length of 0 or above the CEK buffer" {
+    var kp = try v15TestKey(1024);
+    defer kp.secret_key.deinit();
+    var out: [64]u8 = undefined;
+    var doc = try oaepEncKeyEl();
+    defer doc.deinit();
+    const blob: [128]u8 = @splat(0x33);
+    for ([_]usize{ 0, 65 }) |want| {
+        try testing.expectError(error.DecryptionError, rsaOaepUnwrap(&kp.secret_key, .{ .digest = .sha1, .mgf = .sha1 }, doc.root, &blob, &out, want));
+        try testing.expectError(error.DecryptionError, rsaPkcs1v15Unwrap(&kp.secret_key, &blob, &out, want));
+    }
+}
+
+test "aesKwUnwrap: short blobs are refused, a 64-octet key is not an error, a wrong-length key is not ok" {
+    var out: [64]u8 = undefined;
+    const kek = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    const small: [23]u8 = @splat(1);
+    for ([_]usize{ 0, 8, 16, 23 }) |n| {
+        try testing.expectError(error.DecryptionError, aesKwUnwrap(&kek, small[0..n], &out, 16));
+    }
+    // A 64-octet recovered key fits the buffer: accepted by the size bound, but
+    // it is not the 32 octets the content algorithm wants, so it is a decoy.
+    const key64: [64]u8 = @splat(0x44);
+    var blob72: [72]u8 = undefined;
+    _ = try aeskw.wrap(&kek, &key64, &blob72);
+    const un64 = try aesKwUnwrap(&kek, &blob72, &out, 32);
+    try testing.expect(!un64.ok);
+    try testing.expectEqual(@as(usize, 32), un64.cek.len);
+    // A valid 16-octet key: ok for want 16, not ok for want 32.
+    const key16: [16]u8 = @splat(0x55);
+    var blob24: [24]u8 = undefined;
+    _ = try aeskw.wrap(&kek, &key16, &blob24);
+    const bad = try aesKwUnwrap(&kek, &blob24, &out, 32);
+    try testing.expect(!bad.ok);
+    try testing.expectEqual(@as(usize, 32), bad.cek.len);
+    const good = try aesKwUnwrap(&kek, &blob24, &out, 16);
+    try testing.expect(good.ok);
+    try testing.expectEqualSlices(u8, &key16, good.cek);
+}
+
+test "aesKwUnwrap: the decoy depends on every octet of the KEK and of the blob" {
+    var out: [64]u8 = undefined;
+    const kek_a: [32]u8 = @splat(0x61);
+    const blob_a: [40]u8 = @splat(0x62); // not an RFC 3394 blob under this KEK
+    const ref = try aesKwUnwrap(&kek_a, &blob_a, &out, 32);
+    try testing.expect(!ref.ok);
+    const d_ref: [32]u8 = ref.cek[0..32].*;
+    for ([_]usize{ 0, 7, 8, 31 }) |i| {
+        var kek_b = kek_a;
+        kek_b[i] ^= 1;
+        const k = try aesKwUnwrap(&kek_b, &blob_a, &out, 32);
+        try testing.expect(!k.ok);
+        try testing.expect(!std.mem.eql(u8, &d_ref, k.cek));
+    }
+    for ([_]usize{ 0, 7, 8, 39 }) |i| {
+        var blob_b = blob_a;
+        blob_b[i] ^= 1;
+        const b = try aesKwUnwrap(&kek_a, &blob_b, &out, 32);
+        try testing.expect(!b.ok);
+        try testing.expect(!std.mem.eql(u8, &d_ref, b.cek));
+    }
+}
+
+test "TEETH: PKCS#1 v1.5 unpadding: zero octets in the message, a zero as the first PS octet, nothing published on rejection" {
+    const k = 64;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+    var out: [64]u8 = undefined;
+
+    // The separator is the FIRST zero after PS; zeros inside the message do not move it.
+    var em = buildEm(k, 0x00, 0x02, 29, 32, true);
+    em[k - 32] = 0x00;
+    em[k - 20] = 0x00;
+    em[k - 1] = 0x00;
+    const rec = try unpadEm(k, em, kp, &out, 32);
+    try testing.expectEqualSlices(u8, em[k - 32 ..], rec);
+
+    // A zero as the very first PS octet puts the separator at index 2 (PS of
+    // length 0): rejected, although a later zero would make a plausible block.
+    var bad = buildEm(k, 0x00, 0x02, 29, 32, true);
+    bad[2] = 0x00;
+    try testing.expectError(error.DecryptionError, unpadEm(k, bad, kp, &out, 32));
+
+    // A conforming block of the wrong length is rejected, and nothing of its
+    // message survives in the CEK buffer beyond the decoy's `want` octets.
+    out = @splat(0xAA);
+    const wrong = buildEm(k, 0x00, 0x02, k - 3 - 32, 32, true);
+    const ct = try rsa.rsaep(k, wrong, kp.public_key);
+    const un = try rsaPkcs1v15Unwrap(&kp.secret_key, &ct, &out, 16);
+    try testing.expect(!un.ok);
+    for (out[16..]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "TEETH: PKCS#1 v1.5 unpadding on a modulus whose bit length is not a multiple of 8" {
+    // k = (bits + 7) / 8 rounds UP: a 1022-bit modulus is 128 octets.
+    const k = 128;
+    var kp = try v15TestKey(1022);
+    defer kp.secret_key.deinit();
+    var out: [64]u8 = undefined;
+    const em = buildEm(k, 0x00, 0x02, k - 3 - 32, 32, true);
+    const rec = try unpadEm(k, em, kp, &out, 32);
+    try testing.expectEqualSlices(u8, em[k - 32 ..], rec);
+}
+
+test "TEETH (F3 OAEP arm): rejected ciphertexts decoy to pairwise different keys (the decoy binds the whole block)" {
+    var kp = try v15TestKey(1024);
+    defer kp.secret_key.deinit();
+    var prng = std.Random.DefaultPrng.init(0x0A_E9_0A_EB);
+    var ct_buf: [rsa.max_modulus_len]u8 = undefined;
+    var out: [64]u8 = undefined;
+    var doc = try oaepEncKeyEl();
+    defer doc.deinit();
+    const msg: [32]u8 = @splat(0x5A);
+    const ct = try rsa.encryptOaepH(kp.public_key, Sha256, Sha256, prng.random(), &msg, "", &ct_buf);
+    var decoys: [64][32]u8 = undefined;
+    for (&decoys, 0..) |*d, i| {
+        var bad: [rsa.max_modulus_len]u8 = undefined;
+        @memcpy(bad[0..ct.len], ct);
+        // Low-order octets: the modified value stays below the modulus.
+        bad[ct.len - 1 - (i % 24)] ^= @intCast(1 + i);
+        const un = try rsaOaepUnwrap(&kp.secret_key, .{ .digest = .sha256, .mgf = .sha256 }, doc.root, bad[0..ct.len], &out, 32);
+        try testing.expect(!un.ok);
+        d.* = un.cek[0..32].*;
+    }
+    for (decoys[0..63], 0..) |a, i| {
+        for (decoys[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, &a, &b));
+    }
+}
+
+/// An EncryptedData whose key is a kw-aes256 blob that does NOT unwrap, and
+/// whose content is AES-256-GCM encrypted under the very DECOY key the failed
+/// unwrap derives. Owned result.
+fn decoyContentDoc(a: std.mem.Allocator, kek: []const u8, wrapped: []const u8, msg: []const u8) ![]u8 {
+    var out: [64]u8 = undefined;
+    const un = try aesKwUnwrap(kek, wrapped, &out, 32);
+    try testing.expect(!un.ok);
+    const decoy: [32]u8 = un.cek[0..32].*;
+    const nonce: [12]u8 = @splat(0x22);
+    const blob = try a.alloc(u8, 12 + msg.len + 16);
+    defer a.free(blob);
+    @memcpy(blob[0..12], &nonce);
+    var tag: [16]u8 = undefined;
+    Aes256Gcm.encrypt(blob[12 .. 12 + msg.len], &tag, msg, "", nonce, decoy);
+    @memcpy(blob[12 + msg.len ..], &tag);
+    const enc = std.base64.standard.Encoder;
+    const key_b64 = try a.alloc(u8, enc.calcSize(wrapped.len));
+    defer a.free(key_b64);
+    _ = enc.encode(key_b64, wrapped);
+    const content_b64 = try a.alloc(u8, enc.calcSize(blob.len));
+    defer a.free(content_b64);
+    _ = enc.encode(content_b64, blob);
+    return std.fmt.allocPrint(a,
+        \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}">
+        \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
+        \\  <ds:KeyInfo><xenc:EncryptedKey>
+        \\    <xenc:EncryptionMethod Algorithm="{s}kw-aes256"/>
+        \\    <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\  </xenc:EncryptedKey></ds:KeyInfo>
+        \\  <xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData>
+        \\</xenc:EncryptedData>
+    , .{ xenc_ns, ds_ns, xenc11_ns, xenc_ns, key_b64, content_b64 });
+}
+
+test "TEETH (F3): a content that authenticates under the DECOY key is still refused (the mask decides, not the AES pass)" {
+    const a = testing.allocator;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+    const kek: [32]u8 = @splat(0x5A);
+    const wrapped: [40]u8 = @splat(0x42);
+    const src = try decoyContentDoc(a, &kek, &wrapped, "the recovered assertion body");
+    defer a.free(src);
+    var doc = try xml.parse(a, src, .{});
+    defer doc.deinit();
+    try testing.expectError(error.DecryptionError, decryptData(a, doc.root, &kp.secret_key, .{ .kek = &kek }));
+}
+
+/// Watches every block released through it for `needle`.
+const FreeWatch = struct {
+    child: std.mem.Allocator,
+    needle: []const u8,
+    seen: usize = 0,
+    leaked: bool = false,
+
+    fn allocator(self: *FreeWatch) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn } };
+    }
+    fn allocFn(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FreeWatch = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, al, ra);
+    }
+    fn resizeFn(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *FreeWatch = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, al, n, ra);
+    }
+    fn remapFn(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *FreeWatch = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(m, al, n, ra);
+    }
+    fn freeFn(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *FreeWatch = @ptrCast(@alignCast(ctx));
+        if (m.len >= self.needle.len) {
+            self.seen += 1;
+            if (std.mem.find(u8, m, self.needle) != null) self.leaked = true;
+        }
+        self.child.rawFree(m, al, ra);
+    }
+};
+
+test "Z1: the plaintext discarded after a failed unwrap is wiped before it is freed" {
+    // ReleaseFast only: `Allocator.free` scrubs the block itself in the safe
+    // modes, so a scanner sees nothing whatever this module does (see the Z1
+    // tests in test_roundtrip.zig).
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
+    const a = testing.allocator;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+    const kek: [32]u8 = @splat(0x5A);
+    const wrapped: [40]u8 = @splat(0x42);
+    const needle = "the recovered assertion body";
+    const src = try decoyContentDoc(a, &kek, &wrapped, needle);
+    defer a.free(src);
+    var doc = try xml.parse(a, src, .{});
+    defer doc.deinit();
+    var watch = FreeWatch{ .child = a, .needle = needle };
+    try testing.expectError(error.DecryptionError, decryptData(watch.allocator(), doc.root, &kp.secret_key, .{ .kek = &kek }));
+    try testing.expect(watch.seen > 0);
+    try testing.expect(!watch.leaked);
+}
