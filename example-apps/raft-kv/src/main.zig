@@ -227,6 +227,7 @@ fn dump(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
     const role: []const u8 = switch (resp[1]) {
         'l' => "leader",
         'c' => "candidate",
+        'p' => "pre-candidate",
         else => "follower",
     };
     const term = std.mem.readInt(u64, resp[2..10], .little);
@@ -296,6 +297,7 @@ fn status(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) 
         const role: []const u8 = switch (resp[1]) {
             'l' => "leader",
             'c' => "candidate",
+            'p' => "pre-candidate",
             else => "follower",
         };
         try out.print("node {d}  {s}  {s}  term={d}  keys={d}\n", .{

@@ -19,8 +19,9 @@ Two ways in:
 
 > **Status — mvp.** Election, replication, the Figure-8 commit rule, restart
 > from persisted state. Not yet: snapshots / log compaction (the whole log is in
-> memory), membership changes (`jointMajority` exists, not wired), pre-vote and
-> leadership transfer, linearizable reads. See [`SPEC.md`](SPEC.md).
+> memory), membership changes (`jointMajority` exists, not wired), leadership
+> transfer, linearizable reads. PreVote and CheckQuorum are there, off by
+> default as in etcd/raft. See [`SPEC.md`](SPEC.md).
 
 ## Use
 
@@ -36,6 +37,9 @@ var node = try raft.Node.init(gpa, .{
     // Hostile-peer limits (etcd/raft's defaults; the same on every server):
     // .max_append_bytes = 1 << 20,  // per AppendEntries; also caps propose()
     // .max_inflight_msgs = 512,     // unacknowledged batches per follower
+    // Election hardening (etcd/raft's PreVote / CheckQuorum; off by default):
+    // .pre_vote = true,     // a rejoining node cannot depose a healthy leader
+    // .check_quorum = true, // a leader without a quorum steps down; lease
 }, .{ .hard_state = persisted_hs, .entries = persisted_entries });
 defer node.deinit();
 

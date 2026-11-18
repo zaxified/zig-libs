@@ -230,6 +230,7 @@ const Node = struct {
             self.seen_term = self.node.term;
             switch (self.node.role) {
                 .candidate => std.debug.print("raft-kv[{d}]: term={d} standing for election\n", .{ self.id, self.node.term }),
+                .pre_candidate => {},
                 .leader => std.debug.print("raft-kv[{d}]: term={d} LEADER\n", .{ self.id, self.node.term }),
                 .follower => {},
             }
@@ -515,6 +516,7 @@ const Node = struct {
             try body.append(self.gpa, switch (self.node.role) {
                 .follower => 'f',
                 .candidate => 'c',
+                .pre_candidate => 'p',
                 .leader => 'l',
             });
             var num: [8]u8 = undefined;
