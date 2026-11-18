@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** 2026-11-17: SPEC backlog: marked UTF-16 with BOM detection done (already implemented). No code change.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (19/21 killed + 2 eq). New test: a code point fed in three separate calls (F0 | 9F | 98 80) through the caller-buffer encoder.
