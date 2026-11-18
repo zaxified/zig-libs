@@ -220,6 +220,15 @@ inline fn measure(call: *const fn () void, n: *const Needles) Hits {
 }
 
 fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usize {
+    return runProbeResult(label, call, n, 0);
+}
+
+/// `result_depth`: for an entry point that RETURNS a secret-bearing value (the
+/// `pub` pickle decoders return the session by value), the copies of that
+/// result in the wrapper's and the caller's own frames are output the caller
+/// holds; hits no deeper than `result_depth` bytes below the region top are
+/// those and are not counted. 0 = every hit counts.
+fn runProbeResult(label: []const u8, call: *const fn () void, n: *const Needles, result_depth: usize) !usize {
     region_hi = stackHere() - PAD;
     region_lo = region_hi - WINDOW;
 
@@ -242,6 +251,7 @@ fn runProbe(label: []const u8, call: *const fn () void, n: *const Needles) !usiz
 
     var sum: usize = 0;
     for (total) |h| sum += h;
+    if (result_depth != 0 and deepest <= result_depth) sum = 0;
     var neg_sum: usize = 0;
     for (neg) |h| neg_sum += h;
     // Summed over every needle: images that share a window (a scalar and its
@@ -429,6 +439,21 @@ noinline fn callFromSealedOut() void {
 }
 noinline fn callFromSealedIn() void {
     InboundGroupSession.fromSealedPickle(&sealed_in, &pickle_key, &i_sink) catch unreachable;
+}
+// The `pub` pickle entry points called directly (no session wrapper).
+noinline fn callPickleDecodeInbound() void {
+    i_sink = megolm.pickle.decodeInbound(&plain_in) catch unreachable;
+}
+noinline fn callPickleSealOutbound() void {
+    rewind();
+    megolm.pickle.sealOutbound(rec_io, &out_pristine, &pickle_key, &sealed_out);
+}
+noinline fn callPickleSealInbound() void {
+    rewind();
+    megolm.pickle.sealInbound(rec_io, &in_pristine, &pickle_key, &sealed_in);
+}
+noinline fn callPickleOpenInbound() void {
+    i_sink = megolm.pickle.openInbound(&sealed_in, &pickle_key) catch unreachable;
 }
 noinline fn callDeriveKeys() void {
     megolm.cipher.deriveKeys(&out_pristine.ratchet.data, &keys_sink);
@@ -664,6 +689,33 @@ test "STACKPROBE: no ratchet, key or signing-key residue on the dead stack (mego
         n.addBytes("control", &leak_src);
         n.sort();
         bad += try runProbe("InboundGroupSession.fromSealedPickle", callFromSealedIn, &n);
+
+        // the `pub` pickle functions called directly. The two decoders return
+        // the session by value: its copies in the top frames (measured 135..683 B,
+        // ReleaseFast 2026-11-18; the unburned body left 111..1519 B) are the
+        // result, so only hits deeper than 1 KiB count.
+        const result_depth = 1024;
+        n = .{};
+        addRatchet(&n, "R0", r0);
+        addRatchet(&n, "Rt", &rt);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbeResult("pickle.decodeInbound", callPickleDecodeInbound, &n, result_depth);
+        n = .{};
+        addRatchet(&n, "R", r0);
+        addSigning(&n, &out_pristine);
+        n.addBytes("pickle key", &pickle_key);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("pickle.sealOutbound", callPickleSealOutbound, &n);
+        n = .{};
+        addRatchet(&n, "R0", r0);
+        addRatchet(&n, "Rt", &rt);
+        n.addBytes("pickle key", &pickle_key);
+        n.addBytes("control", &leak_src);
+        n.sort();
+        bad += try runProbe("pickle.sealInbound", callPickleSealInbound, &n);
+        bad += try runProbeResult("pickle.openInbound", callPickleOpenInbound, &n, result_depth);
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }

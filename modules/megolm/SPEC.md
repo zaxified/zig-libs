@@ -6,7 +6,7 @@
 
 **Scope:** core — vodozemac 0.11.0 Megolm (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after session pickling for both session types landed)
 
-**Audit:** review 2026-08-06 · mutation 2026-11-17 (320/356, 36 eq) · src 17dc62fa5d2aa587
+**Audit:** review 2026-08-06 · mutation 2026-11-17 (324/364, 40 eq) · src b169b87f456b3d87
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MEGOLM_FUZZ) · ct 2026-10-17 (ctgrind: ratchet + signing key through encrypt/decrypt, session-key base64, sealed pickles; `msg` 16 / `skey` 23 / `pickle` 26 in-file, none a megolm branch on a key; `skey` was 40 before the private b64ct copy (2026-10-10), 26 with it, 23 with the `b64ct` module; 25 on Zig 0.17.0 (2026-10-18): std `Edwards25519.fromBytes` added RFC 8032 §5.1.3's `x = 0` + sign-bit refusal, 2 contexts over the session key's Ed25519 public key inside signature verification, public input)
 **Performance:** not measured
@@ -363,10 +363,17 @@ sealing function's plain-buffer wipe (outbound and inbound), `fromSealedPickle` 
 plain wipe are each killed when removed together), covered by an inner burn that is itself required (`decodeOutbound`,
 `deriveKeys`, `OutboundSession.init`, `decrypt`), a token burn with nothing secret in the frame
 (`ExportedSessionKey.decode`/`fromBase64`, `fromSessionKey`, `fromExportedKey`), or a heap wipe right before `free`
-(unobservable: `free` poisons the bytes). One observation, not a defect of a supported path: the `pickle.*` codec
-functions that carry no burn of their own (`decodeInbound`, `sealOutbound`, `sealInbound`, `openInbound`) are public
-in the `pickle` namespace, and a probe of `decodeInbound` called directly finds ratchet copies 111..1519 B deep; the
-session wrappers' burns are what clear them, so these functions are internal by contract.
+(unobservable: `free` poisons the bytes). The `pickle.*` functions `decodeInbound`, `sealOutbound`,
+`sealInbound` and `openInbound` are public and, as first audited, carried no burn of their own (a direct
+`decodeInbound` call left ratchet copies 111..1519 B deep). Closed 2026-11-18: each runs a `noinline` `…Unburned` body
+under `burn.run` (`session_burn` for `decodeInbound`, `decrypt_burn` for the others), no API change, and the
+ReleaseFast probe has a row for each. The two decoders return the session by value; the copies of that result in the
+wrapper's and the caller's top frames (135..683 B) are the output the caller holds, so their rows count only hits
+deeper than 1 KiB. Delta mutation of the four burns (8 mutants: skipped, and shortened to 1/32): `decodeInbound` and
+`openInbound` skip and shortening killed (4); the same four mutants on `sealOutbound` and `sealInbound` survive and are
+equivalent: their unburned bodies leave no needle on the dead stack (the plain buffer is wiped, `encodeOutbound` burns
+itself, the AEAD leaves no key copy), so those two burns are defence in depth that the probe cannot see. Cumulative:
+324 killed of 364, 40 equivalent or unobservable.
 
 [spec]: https://gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md
 
