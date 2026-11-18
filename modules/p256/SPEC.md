@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-13)
 
-**Audit:** review 2026-07-21 · mutation 2026-11-18 (274/353, 79 eq) · src ae1a373972ecbe00
+**Audit:** review 2026-07-21 · mutation 2026-11-18 (282/359, 77 eq) · src cb8715133e291724
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind) · panic 2026-10-30 (sweep + blind review: own Signature type with a total toDer (std's indexes an empty slice for r/s = 0), explicit identity-key reject; delta audit 11/12 + 1 eq)
 
@@ -220,6 +220,12 @@ jumps and zero secret-indexed loads before the core is declared done.
   every point except the public constant, so a secret point reveals nothing unless
   it equals G (about 2^-256 for a hashed point). Row `secpt`: 2 in-file before the
   fix, 1 after (the product's `rejectIdentity` verdict, as in `comb`).
+  Secret SCALAR against an arbitrary point (2026-11-18, ctgrind row `ecdh`):
+  `p256.ecdh` with the private key tainted. No p256 row fed `mulCtWindowed` a
+  secret digit before; the hpke and tls13 P-256 rows reach it through their
+  consumers. 3 in-file, all verdicts: the two range checks on the secret
+  (ecdh.zig:55/:56, revealed by the error) and the product's `rejectIdentity`
+  (group.zig:585).
   **Portable REDC, finding (2026-11-18):** the portable path (no ADX/BMI2: aarch64,
   baseline x86-64) branched on a secret. With `CTGRIND_CPU=x86_64` the `secpt` row
   gave 2 in-file where the native one gives 1. The extra context: `Conditional
@@ -320,8 +326,9 @@ there are no GLV constants to own here.
   its Zig wrappers are comptime dispatch), `point_asm.zig` (comptime asm-text generator),
   `gate.zig`/`root.zig` (no runtime code), `buildBaseTable` (comptime only), the
   test-only `reduceWideFold` oracle and test instrumentation.
-  - Result: 274 killed, 79 equivalent/unobservable, 0 open. Card `(274/353, 79 eq)`.
-  - Killed: 271 by tests and 3 by ctgrind.
+  - Result: 282 killed, 77 equivalent/unobservable, 0 open. Card `(282/359, 77 eq)`
+    (353 whole-module + 6 delta mutants of the 2026-11-18 portable fix below).
+  - Killed: 273 by tests and 9 by ctgrind.
     - Tests ran in three builds: native ReleaseSafe, a portable `-mcpu=x86_64`
       ReleaseSafe build where the non-ADX field paths run, and the ReleaseFast stack
       probe.
@@ -342,10 +349,41 @@ there are no GLV constants to own here.
     - 14 wipes: the probe stays clean because the caller's burn overlaps, there is no
       needle for that secret (the HMAC-DRBG `K ⊕ pad`), or the error path is
       unreachable.
-  - 22 constant-time mutants (blackBox dropped, or a select turned into a branch) are
-    unobservable to ctgrind. ctgrind saw no context on their line, so LLVM kept the
-    select branch-free here (or the context landed on line 0). Four of them are
-    portable-only.
+  - Constant-time mutants (blackBox dropped, or a select turned into a branch), each
+    measured ALONE: the mutant forced on in a scratch copy, one `ctgrind.sh --stacks
+    p256` per mutant, its contexts diffed against an unmutated baseline. Native
+    (skylake) for the native paths; a secret scalar (the `ecdh` row) for the
+    windowed multiply; `CTGRIND_CPU=x86_64` for the portable field paths. A first
+    combined build had shown line-0 contexts that could not be attributed; every one
+    of them is now accounted for.
+    - `Fe.cMov` mask without `blackBox` (field.zig:441): `sign` +2. The identity
+      `cMov` in `affineCoordinates` (group.zig:339) becomes a branch on the
+      is-identity bit; the context is reported in the inlined `montMulRegs`
+      (`fast_core.zig:0`) under group.zig:338, for both R and the public key.
+    - Comb gather mask without `blackBox` (group.zig:681): `comb` +57, `sign` +100,
+      at `combMulBaseFastWithTable` (group.zig:0): the table scan branches on the
+      secret digit. The combined build hid it because the gather-to-branch mutant
+      had replaced the same select.
+    - Comb nonzero-digit mask without `blackBox` (group.zig:696): `comb` +1,
+      `sign` +2, at group.zig:0.
+    - `gatherSigned` match mask without `blackBox` (group.zig:1247): `ecdh` +4,
+      two branches at group.zig:563 and :575 and two loads indexed by the secret
+      digit (group.zig:0).
+    - Portable `montReducePortable` keep mask without `blackBox` (field.zig:259 before
+      the fix): `secpt` +1 at the select.
+    - 17 stay unobservable, now with that measurement as the reason: the second
+      `Fe.cMov` form, the seven safegcd masks, the comb recoding and sign masks,
+      the windowed recoding/nonzero/`started` masks and `gatherSigned`'s sign mask
+      (with a secret scalar), and the portable `normalize`/`Fe.add`/`Fe.sub`
+      masks. LLVM kept each of these branch-free without its barrier. The barriers
+      stay as defence against a future compiler.
+  - Finding, fixed the same day: the portable REDC branched on a secret (see the
+    § Constant-time contract note of 2026-11-18). The fix's delta mutants: 401/404
+    (the keep bit ignoring the high word/carry) are killed by the portable tests,
+    402 (the borrow without `blackBox`) brings the `jae` back (`secpt` +1 at
+    field.zig:263). 403 (`hi` without `blackBox`, not measured separately) and
+    405/406 (`Fe.add`'s two flags) are unobservable: both together are the pre-fix
+    `Fe.add`, which showed no context on the portable baseline.
   - The ctgrind kills: the comb gather turned into a branch, the windowed digit select
     turned into a branch (seen with the scalar also tainted, a scratch harness
     variant), and `rejectIdentity`'s verdict without its barrier, which splits into
