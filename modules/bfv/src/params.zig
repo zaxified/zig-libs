@@ -192,3 +192,12 @@ test "validate rejects malformed sets" {
     try testing.expectError(error.PlaintextModulusTooSmall, (Params{ .n = 8, .t = 1, .primes = &.{17} }).validate());
     try testing.expectError(error.DuplicatePrime, (Params{ .n = 8, .t = 4, .primes = &.{ 17, 17 } }).validate());
 }
+
+test "validate rejects n = 0, an empty chain, a prime >= 2^62 and a prime = 1 mod N only" {
+    // Audit 2026-11-18 (whole-module mutation): four refusals had no test.
+    try testing.expectError(error.DegreeNotPowerOfTwo, (Params{ .n = 0, .t = 4, .primes = &.{17} }).validate());
+    try testing.expectError(error.EmptyPrimeChain, (Params{ .n = 8, .t = 4, .primes = &.{} }).validate());
+    try testing.expectError(error.PrimeTooLarge, (Params{ .n = 8, .t = 4, .primes = &.{@as(u64, 1) << 62} }).validate());
+    // 41 - 1 = 40: divisible by N = 8, not by 2N = 16.
+    try testing.expectError(error.PrimeNotNttFriendly, (Params{ .n = 8, .t = 4, .primes = &.{41} }).validate());
+}

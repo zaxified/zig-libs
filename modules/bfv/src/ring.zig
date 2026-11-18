@@ -154,3 +154,16 @@ test "ring multiply via NTT == schoolbook per limb" {
         }
     }
 }
+
+test "fromCoeffs reduces every limb into [0, q_i); eql compares the domain tag" {
+    // Audit 2026-11-18 (whole-module mutation): neither the reduction nor the
+    // domain check of `eql` had a test of its own.
+    const R = RnsPoly(2, 2);
+    const ps = [_]u64{ 17, 97 };
+    const r = R.fromCoeffs(&ps, .{ .{ 17, 40 }, .{ 97, 200 } });
+    try testing.expectEqualSlices(u64, &.{ 0, 6 }, &r.limbs[0]);
+    try testing.expectEqualSlices(u64, &.{ 0, 6 }, &r.limbs[1]);
+    const zc = R.zero(.coeff);
+    try testing.expect(zc.eql(&R.zero(.coeff)));
+    try testing.expect(!zc.eql(&R.zero(.ntt)));
+}
