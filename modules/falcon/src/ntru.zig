@@ -1961,3 +1961,348 @@ test "NTRUSolve reproduces the Falcon-1024 KAT secret key's F byte-exact" {
     try std.testing.expect(solveNtru(10, &dsk.f, &dsk.g, &big_f, &big_g, 127, &pool, &primes));
     try std.testing.expectEqualSlices(i8, &dsk.big_f, &big_f);
 }
+
+test "isPrime31: primes, composites and strong pseudoprimes" {
+    for ([_]u32{ 2, 3, 5, 7, 11, 13, 1000003, 2147473409, 2147483647 }) |p| try std.testing.expect(isPrime31(p));
+    // 561 is a Carmichael number, 2047 a strong pseudoprime to base 2,
+    // 1373653 to bases 2 and 3, 25326001 to bases 2, 3 and 5.
+    for ([_]u32{ 0, 1, 4, 9, 15, 21, 25, 561, 2047, 29341, 1373653, 25326001, 2147483645 }) |c| try std.testing.expect(!isPrime31(c));
+}
+
+test "modpNorm centres at (p - 1) / 2" {
+    const p: u32 = 2147473409;
+    try std.testing.expectEqual(@as(i32, 0), modpNorm(0, p));
+    try std.testing.expectEqual(@as(i32, @intCast((p - 1) / 2)), modpNorm((p - 1) / 2, p));
+    try std.testing.expectEqual(-@as(i32, @intCast((p - 1) / 2)), modpNorm((p + 1) / 2, p));
+    try std.testing.expectEqual(@as(i32, -1), modpNorm(p - 1, p));
+}
+
+fn limBoundary(comptime logn: u5, comptime SK: type, vectors: anytype, neg_pos: *[2]bool) !void {
+    const n = @as(usize, 1) << logn;
+    const v = @import("kat_vectors.zig");
+    _ = v;
+    const gpa = std.testing.allocator;
+    const primes = computePrimes();
+    const pool = try gpa.alloc(u32, 8 * n + 64);
+    defer gpa.free(pool);
+    for (vectors) |vec| {
+        const sk = try gpa.alloc(u8, vec.sk.len / 2);
+        defer gpa.free(sk);
+        _ = try std.fmt.hexToBytes(sk, vec.sk);
+        var dsk: SK = undefined;
+        try SK.fromBytes(&dsk, sk[0..SK.encoded_length]);
+        var big_f: [n]i8 = undefined;
+        var big_g: [n]i8 = undefined;
+        try std.testing.expect(solveNtru(logn, &dsk.f, &dsk.g, &big_f, &big_g, 127, pool, &primes));
+        var m: i32 = 0;
+        for (big_f) |x| m = @max(m, @as(i32, @intCast(@abs(@as(i32, x)))));
+        for (big_g) |x| m = @max(m, @as(i32, @intCast(@abs(@as(i32, x)))));
+        for (big_f ++ big_g) |x| {
+            if (x == m) neg_pos[1] = true;
+            if (x == -m) neg_pos[0] = true;
+        }
+        var f2: [n]i8 = undefined;
+        var g2: [n]i8 = undefined;
+        try std.testing.expect(solveNtru(logn, &dsk.f, &dsk.g, &f2, &g2, m, pool, &primes));
+        try std.testing.expectEqualSlices(i8, &big_f, &f2);
+        try std.testing.expect(!solveNtru(logn, &dsk.f, &dsk.g, &f2, &g2, m - 1, pool, &primes));
+    }
+}
+
+test "solveNtru: the coefficient limit is inclusive on both signs and both outputs" {
+    const falcon = @import("root.zig");
+    const v = @import("kat_vectors.zig");
+    var np = [2]bool{ false, false };
+    try limBoundary(9, falcon.SecretKey, v.falcon512, &np);
+    try limBoundary(10, falcon.SecretKey1024, v.falcon1024, &np);
+    // the boundary was exercised on a negative and a positive extreme
+    try std.testing.expect(np[0] and np[1]);
+}
+
+// ---- big-integer primitives against a fixed-width model --------------------------------
+// Limbs are 31 bits, little-endian; the model holds a value in a u512 / i1024.
+
+fn limbsToU(limbs: []const u32) u512 {
+    var v: u512 = 0;
+    var i = limbs.len;
+    while (i > 0) {
+        i -= 1;
+        v = (v << 31) | limbs[i];
+    }
+    return v;
+}
+
+fn uToLimbs(v: u512, out: []u32) void {
+    var x = v;
+    for (out) |*l| {
+        l.* = @truncate(x & 0x7FFFFFFF);
+        x >>= 31;
+    }
+}
+
+fn limbsToSigned(limbs: []const u32) i1024 {
+    const u: i1024 = @intCast(limbsToU(limbs));
+    return if ((limbs[limbs.len - 1] >> 30) & 1 != 0) u - (@as(i1024, 1) << @intCast(31 * limbs.len)) else u;
+}
+
+fn randLimbs(random: std.Random, out: []u32) void {
+    for (out) |*l| l.* = random.uintLessThan(u32, 1 << 31);
+}
+
+test "zint primitives: sub, mulSmall, addMulSmall, negate against a fixed-width model" {
+    var prng = std.Random.DefaultPrng.init(0x21a7);
+    const random = prng.random();
+    for (0..400) |it| {
+        const len = 1 + it % 6;
+        const mod: u512 = @as(u512, 1) << @intCast(31 * len);
+        var a: [6]u32 = undefined;
+        var b: [6]u32 = undefined;
+        randLimbs(random, a[0..len]);
+        randLimbs(random, b[0..len]);
+        const av = limbsToU(a[0..len]);
+        const bv = limbsToU(b[0..len]);
+
+        // zintSub: borrow always reported, difference only with ctl = 1
+        for ([_]u32{ 0, 1 }) |ctl| {
+            var t = a;
+            const borrow = zintSub(t[0..len], b[0..len], ctl);
+            try std.testing.expectEqual(@as(u32, @intFromBool(av < bv)), borrow);
+            const want = if (ctl == 1) (av -% bv) % mod else av;
+            try std.testing.expectEqual(want, limbsToU(t[0..len]));
+        }
+        // zintMulSmall
+        const x = random.uintLessThan(u32, 1 << 31);
+        var m = a;
+        const carry = zintMulSmall(m[0..len], x);
+        const prod = av * x;
+        try std.testing.expectEqual(prod % mod, limbsToU(m[0..len]));
+        try std.testing.expectEqual(@as(u512, carry), prod >> @intCast(31 * len));
+        // zintAddMulSmall: x (len + 1 limbs) += y * s
+        var xs: [7]u32 = undefined;
+        randLimbs(random, xs[0 .. len + 1]);
+        const x0 = limbsToU(xs[0..len]);
+        zintAddMulSmall(xs[0 .. len + 1], b[0..len], x);
+        const sum = x0 + bv * x;
+        try std.testing.expectEqual(sum, limbsToU(xs[0 .. len + 1]));
+        // zintNegate
+        for ([_]u32{ 0, 1 }) |ctl| {
+            var t = a;
+            zintNegate(t[0..len], ctl);
+            const want = if (ctl == 1) (mod - av) % mod else av;
+            try std.testing.expectEqual(want, limbsToU(t[0..len]));
+        }
+    }
+}
+
+test "zint primitives: normZero, finishMod, oneToPlain" {
+    var prng = std.Random.DefaultPrng.init(0x21a8);
+    const random = prng.random();
+    for (0..400) |it| {
+        const len = 1 + it % 5;
+        const mod: u512 = @as(u512, 1) << @intCast(31 * len);
+        var p: [5]u32 = undefined;
+        randLimbs(random, p[0..len]);
+        p[0] |= 1;
+        p[len - 1] &= 0x3FFFFFFF;
+        if (p[len - 1] == 0) p[len - 1] = 1;
+        const pv = limbsToU(p[0..len]);
+        // zintNormZero: x < p, replace x by x - p when x > p / 2
+        var x: [5]u32 = undefined;
+        const xv = random.uintLessThan(u512, pv);
+        uToLimbs(xv, x[0..len]);
+        zintNormZero(x[0..len], p[0..len]);
+        const want = if (xv > pv / 2) (xv +% mod -% pv) % mod else xv;
+        try std.testing.expectEqual(want, limbsToU(x[0..len]));
+        // x == p / 2 and x == p / 2 + 1 exactly
+        for ([_]u512{ pv / 2, pv / 2 + 1 }) |edge| {
+            uToLimbs(edge, x[0..len]);
+            zintNormZero(x[0..len], p[0..len]);
+            const w2 = if (edge > pv / 2) (edge +% mod -% pv) % mod else edge;
+            try std.testing.expectEqual(w2, limbsToU(x[0..len]));
+        }
+        // zintFinishMod: 0 <= a < 2m (neg = 0) or -m <= a < 0 (neg = 1)
+        const av = random.uintLessThan(u512, 2 * pv);
+        uToLimbs(av, x[0..len]);
+        zintFinishMod(x[0..len], p[0..len], 0);
+        try std.testing.expectEqual(if (av >= pv) av - pv else av, limbsToU(x[0..len]));
+        const nv = 1 + random.uintLessThan(u512, pv); // a = -nv, nv in [1, m]
+        uToLimbs((mod - nv) % mod, x[0..len]);
+        zintFinishMod(x[0..len], p[0..len], 1);
+        const back = pv - nv;
+        try std.testing.expectEqual(if (back >= pv) back - pv else back, limbsToU(x[0..len]));
+    }
+    try std.testing.expectEqual(@as(i32, -(1 << 30)), zintOneToPlain(&[_]u32{0x40000000}));
+    try std.testing.expectEqual(@as(i32, (1 << 30) - 1), zintOneToPlain(&[_]u32{0x3FFFFFFF}));
+    try std.testing.expectEqual(@as(i32, -1), zintOneToPlain(&[_]u32{0x7FFFFFFF}));
+}
+
+test "zint primitives: coReduce and the scaled add / subtract" {
+    var prng = std.Random.DefaultPrng.init(0x21a9);
+    const random = prng.random();
+    for (0..400) |it| {
+        const len = 2 + it % 5;
+        const mod: u512 = @as(u512, 1) << @intCast(31 * len);
+        var a: [7]u32 = undefined;
+        var b: [7]u32 = undefined;
+        // a, b < 2^(31 len - 36): the result fits without sign trouble
+        randLimbs(random, a[0..len]);
+        randLimbs(random, b[0..len]);
+        a[len - 1] = 0;
+        b[len - 1] = 0;
+        if (len >= 3) {
+            a[len - 2] &= 0x3FF;
+            b[len - 2] &= 0x3FF;
+        }
+        const av: i1024 = @intCast(limbsToU(a[0..len]));
+        const bv: i1024 = @intCast(limbsToU(b[0..len]));
+        const xa: i64 = random.intRangeAtMost(i32, -(1 << 31) + 1, (1 << 31) - 1);
+        const xb: i64 = random.intRangeAtMost(i32, -(1 << 31) + 1, (1 << 31) - 1);
+        const ya: i64 = random.intRangeAtMost(i32, -(1 << 31) + 1, (1 << 31) - 1);
+        const yb: i64 = random.intRangeAtMost(i32, -(1 << 31) + 1, (1 << 31) - 1);
+        const ra = @divFloor(av * xa + bv * xb, @as(i1024, 1) << 31);
+        const rb = @divFloor(av * ya + bv * yb, @as(i1024, 1) << 31);
+        const flags = zintCoReduce(a[0..len], b[0..len], xa, xb, ya, yb);
+        try std.testing.expectEqual(@as(u32, @intFromBool(ra < 0)) | (@as(u32, @intFromBool(rb < 0)) << 1), flags);
+        try std.testing.expectEqual(@as(u512, @intCast(@abs(ra))), limbsToU(a[0..len]));
+        try std.testing.expectEqual(@as(u512, @intCast(@abs(rb))), limbsToU(b[0..len]));
+        _ = mod;
+    }
+    for (0..600) |it| {
+        const xlen = 2 + it % 5;
+        const ylen = 1 + it % 4;
+        const sch: u32 = @intCast(it % 3);
+        const scl: u5 = @intCast(random.uintLessThan(u32, 31));
+        var x: [8]u32 = undefined;
+        var y: [8]u32 = undefined;
+        randLimbs(random, x[0..xlen]);
+        randLimbs(random, y[0..ylen]);
+        if (it % 2 == 0) y[ylen - 1] |= 0x40000000 else y[ylen - 1] &= 0x3FFFFFFF;
+        const mod: i1024 = @as(i1024, 1) << @intCast(31 * xlen);
+        const x0: i1024 = @intCast(limbsToU(x[0..xlen]));
+        const yv = limbsToSigned(y[0..ylen]);
+        const sc: u10 = @intCast(31 * sch + scl);
+        const k: i32 = random.intRangeAtMost(i32, -(1 << 30), 1 << 30);
+        var x1 = x;
+        zintAddScaledMulSmall(x1[0..xlen], y[0..ylen], k, sch, scl);
+        const want_add = @mod(x0 + (yv * k) * (@as(i1024, 1) << sc), mod);
+        try std.testing.expectEqual(@as(u512, @intCast(want_add)), limbsToU(x1[0..xlen]));
+        var x2 = x;
+        zintSubScaled(x2[0..xlen], y[0..ylen], sch, scl);
+        const want_sub = @mod(x0 - yv * (@as(i1024, 1) << sc), mod);
+        try std.testing.expectEqual(@as(u512, @intCast(want_sub)), limbsToU(x2[0..xlen]));
+    }
+}
+
+test "zintModSmallUnsigned / Signed and zintRebuildCRT against the model" {
+    var prng = std.Random.DefaultPrng.init(0x21aa);
+    const random = prng.random();
+    const primes = computePrimes();
+    for (0..300) |it| {
+        const len = 1 + it % 6;
+        const p = primes[it % 8].p;
+        const p0i = modpNinv31(p);
+        const R2 = modpR2(p, p0i);
+        var d: [6]u32 = undefined;
+        randLimbs(random, d[0..len]);
+        if (it % 3 == 0) d[0] = 0x7FFFFFFF; // a limb above p
+        const v = limbsToU(d[0..len]);
+        try std.testing.expectEqual(@as(u32, @intCast(v % p)), zintModSmallUnsigned(d[0..len], p, p0i, R2));
+        const Rx = modpRx(@intCast(len), p, p0i, R2);
+        const s = limbsToSigned(d[0..len]);
+        try std.testing.expectEqual(@as(u32, @intCast(@mod(s, @as(i1024, p)))), zintModSmallSigned(d[0..len], p, p0i, R2, Rx));
+    }
+    for (0..200) |it| {
+        const xlen = 1 + it % 6;
+        const num = 3;
+        var prod: u512 = 1;
+        for (0..xlen) |u| prod *= primes[u].p;
+        var xx: [3 * 6]u32 = undefined;
+        var want: [3]u512 = undefined;
+        for (0..num) |k| {
+            const vv = random.uintLessThan(u512, prod);
+            want[k] = vv;
+            for (0..xlen) |u| xx[k * xlen + u] = @intCast(vv % primes[u].p);
+        }
+        const mod: u512 = @as(u512, 1) << @intCast(31 * xlen);
+        for ([_]bool{ false, true }) |normalize| {
+            var work = xx;
+            var tmp: [6]u32 = undefined;
+            zintRebuildCRT(work[0 .. num * xlen], xlen, xlen, num, &primes, normalize, &tmp);
+            try std.testing.expectEqual(prod, limbsToU(tmp[0..xlen]));
+            for (0..num) |k| {
+                const w = if (normalize and want[k] > prod / 2) (want[k] +% mod -% prod) % mod else want[k];
+                try std.testing.expectEqual(w, limbsToU(work[k * xlen ..][0..xlen]));
+            }
+        }
+    }
+}
+
+test "zintBezout: u*x - v*y = 1 within bounds for coprime odd inputs, false otherwise" {
+    var prng = std.Random.DefaultPrng.init(0x21ab);
+    const random = prng.random();
+    var coprime: usize = 0;
+    for (0..300) |it| {
+        const len = 1 + it % 4;
+        var xs: [4]u32 = undefined;
+        var ys: [4]u32 = undefined;
+        randLimbs(random, xs[0..len]);
+        randLimbs(random, ys[0..len]);
+        const mode = it % 5;
+        if (mode != 3) xs[0] |= 1; // mode 3: even x
+        if (mode != 4) ys[0] |= 1; // mode 4: even y
+        const xv = limbsToU(xs[0..len]);
+        const yv = limbsToU(ys[0..len]);
+        var g = xv;
+        var h = yv;
+        while (h != 0) {
+            const t = g % h;
+            g = h;
+            h = t;
+        }
+        var us: [4]u32 = undefined;
+        var vs: [4]u32 = undefined;
+        var tmp: [16]u32 = undefined;
+        const ok = zintBezout(us[0..len], vs[0..len], xs[0..len], ys[0..len], tmp[0 .. 4 * len]);
+        const expect_ok = g == 1 and xv & 1 == 1 and yv & 1 == 1;
+        try std.testing.expectEqual(expect_ok, ok);
+        if (ok) {
+            coprime += 1;
+            const uv = limbsToU(us[0..len]);
+            const vv = limbsToU(vs[0..len]);
+            try std.testing.expect(uv <= yv and vv <= xv);
+            try std.testing.expectEqual(@as(u1024, 1), @as(u1024, xv) * uv - @as(u1024, yv) * vv);
+        }
+    }
+    try std.testing.expect(coprime > 50);
+}
+
+test "zintBezout: a gcd whose low limb is 1 is not a gcd of 1" {
+    // g = 1 + 2^31 (limbs 1, 1), x = g * 3, y = g * 5: odd, gcd = g
+    var xs: [3]u32 = undefined;
+    var ys: [3]u32 = undefined;
+    const g: u512 = 1 + (@as(u512, 1) << 31);
+    uToLimbs(g * 3, &xs);
+    uToLimbs(g * 5, &ys);
+    var us: [3]u32 = undefined;
+    var vs: [3]u32 = undefined;
+    var tmp: [12]u32 = undefined;
+    try std.testing.expect(!zintBezout(&us, &vs, &xs, &ys, &tmp));
+}
+
+test "polyBigToFp converts two's-complement limbs, negative ones included" {
+    var prng = std.Random.DefaultPrng.init(0x7b1d);
+    const random = prng.random();
+    var limbs: [8]u32 = undefined;
+    var want: [4]i64 = undefined;
+    for (0..4) |i| {
+        want[i] = random.intRangeAtMost(i64, -(1 << 50), 1 << 50);
+        if (i == 0) want[i] = -5;
+        if (i == 1) want[i] = -(1 << 31); // negating limb 0 carries into bit 31
+        if (i == 2) want[i] = -(1 << 31) - 1;
+        const u: u512 = @intCast(@as(i128, want[i]) & ((@as(i128, 1) << 62) - 1));
+        uToLimbs(u, limbs[2 * i ..][0..2]);
+    }
+    var d: [4]f64 = undefined;
+    polyBigToFp(&d, &limbs, 2, 2, 2);
+    for (d, want) |got, w| try std.testing.expectEqual(@as(f64, @floatFromInt(w)), got);
+}

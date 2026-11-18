@@ -237,3 +237,85 @@ test "Prng: deterministic given the same seed" {
     try std.testing.expectEqual(a.getU64(), bb.getU64());
     try std.testing.expectEqual(a.getU8(), bb.getU8());
 }
+
+test "Prng: getU8 and getU64 refill at exactly the reference positions" {
+    var seed: [56]u8 = undefined;
+    for (&seed, 0..) |*x, i| x.* = @intCast((i * 13 + 5) & 0xff);
+    const block0 = Prng.init(&seed);
+    var block1 = block0;
+    block1.refill();
+    var block2 = block1;
+    block2.refill();
+
+    // getU8: 512 reads walk block 0, the refill happens on the 512th, and the next
+    // block is read from its first byte.
+    var p = Prng.init(&seed);
+    for (0..512) |i| try std.testing.expectEqual(block0.buf[i], p.getU8());
+    try std.testing.expectEqual(@as(usize, 0), p.ptr);
+    for (0..512) |i| try std.testing.expectEqual(block1.buf[i], p.getU8());
+    for (0..8) |i| try std.testing.expectEqual(block2.buf[i], p.getU8());
+
+    // getU64 from every start around the refill threshold (u >= len - 9 refills)
+    for ([_]usize{ 0, 1, 7, 500, 502, 503, 504, 511 }) |start| {
+        var q = Prng.init(&seed);
+        for (0..start) |_| _ = q.getU8();
+        const v = q.getU64();
+        if (start >= 503) {
+            try std.testing.expectEqual(std.mem.readInt(u64, block1.buf[0..8], .little), v);
+            try std.testing.expectEqual(@as(usize, 8), q.ptr);
+        } else {
+            try std.testing.expectEqual(std.mem.readInt(u64, block0.buf[start..][0..8], .little), v);
+            try std.testing.expectEqual(start + 8, q.ptr);
+        }
+    }
+}
+
+test "gaussian0 equals the exact 72-bit RCDT comparison, limb by limb" {
+    // The reference RCDT, most significant limb first (w2, w1, w0 per row).
+    const dist = [_]u32{
+        10745844, 3068844,  3741698,  5559083, 1580863,  8248194,  2260429, 13669192, 2736639,
+        708981,   4421575,  10046180, 169348,  7122675,  4136815,  30538,   13063405, 7650655,
+        4132,     14505003, 7826148,  417,     16768101, 11363290, 31,      8444042,  8086568,
+        1,        12844466, 265321,   0,       1232676,  13644283, 0,       38047,    9111839,
+        0,        870,      6138264,  0,       14,       12545723, 0,       0,        3104126,
+        0,        0,        28824,    0,       0,        198,      0,       0,        1,
+    };
+    const rows = dist.len / 3;
+    var probes: [rows * 9 + 2]u128 = undefined;
+    var np: usize = 0;
+    for (0..rows) |r| {
+        const w: u128 = (@as(u128, dist[3 * r]) << 48) | (@as(u128, dist[3 * r + 1]) << 24) | dist[3 * r + 2];
+        for ([_]i128{ -1, 0, 1, -(1 << 24), 1 << 24, -(1 << 48), 1 << 48, -(1 << 24) + 1, (1 << 24) - 1 }) |d| {
+            const v = @as(i128, @intCast(w)) + d;
+            probes[np] = if (v < 0) 0 else @intCast(v);
+            np += 1;
+        }
+    }
+    probes[np] = 0;
+    probes[np + 1] = (@as(u128, 1) << 72) - 1;
+    np += 2;
+    for (probes[0..np]) |vv| {
+        var p: Prng = .{};
+        std.mem.writeInt(u64, p.buf[0..8], @truncate(vv), .little);
+        p.buf[8] = @truncate(vv >> 64);
+        p.ptr = 0;
+        var want: i32 = 0;
+        for (0..rows) |r| {
+            const w: u128 = (@as(u128, dist[3 * r]) << 48) | (@as(u128, dist[3 * r + 1]) << 24) | dist[3 * r + 2];
+            if (vv < w) want += 1;
+        }
+        try std.testing.expectEqual(want, gaussian0(&p));
+        try std.testing.expectEqual(@as(usize, 9), p.ptr);
+    }
+}
+
+test "berExp: eight matching bytes stop at the last byte (no ninth read)" {
+    const ccs = fpr.mul(fpr.inv_sigma[9], fpr.sigma_min[9]);
+    const x = fpr.of(0); // s = 0, r = 0
+    const z: u64 = (fpr.expm_p63(fpr.of(0), ccs) << 1) -% 1;
+    var p: Prng = .{};
+    std.mem.writeInt(u64, p.buf[0..8], z, .big);
+    p.ptr = 0;
+    try std.testing.expect(!berExp(&p, x, ccs));
+    try std.testing.expectEqual(@as(usize, 8), p.ptr);
+}

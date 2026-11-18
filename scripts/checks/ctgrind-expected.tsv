@@ -564,7 +564,7 @@ slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
 # them only as the harness doc says (an honest consequence, not a secret the signature hides).
 # Signing is not constant-time hardened (SPEC.md); seed 4 SAME.
 slhdsa	ReleaseFast	prf	1	9	960caaf9efdcbd42	e0fdde7f5c62a2d6
-falcon	ReleaseFast	sign	1	<=133	bf8a648cee2e2f5f	3f5a6dbb61a76d9d
+falcon	ReleaseFast	sign	1	<=133	a1216bcad5cc8693	3f5a6dbb61a76d9d
 bls12_381	ReleaseFast	field	1	1	6718617f9f6e38c1	c1e8a3c184eada53
 # 2026-10-02 — Fr off std.crypto.ff, bls12_381 ctSelect + Fp2.isZero barriers.
 # `Fr` (bls12_381, bn254) is now `montint.Field`; ff branched on secrets in
