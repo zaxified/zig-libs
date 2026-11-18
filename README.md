@@ -17,7 +17,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 265 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 266 modules (Zig 0.17.1, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -291,7 +291,7 @@ those crypto and format modules are yours too without going looking.
 | `web` | 36 | [`netaddr`](modules/netaddr/README.md) (net) · [`zstd`](modules/zstd/README.md) (format) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`regex`](modules/regex/README.md) (format) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) · [`keycodec`](modules/keycodec/README.md) (crypto) |
 | `net` | 76 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`tlsclient`](modules/tlsclient/README.md) (crypto) · [`tlsserver`](modules/tlsserver/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) · [`aesgcm`](modules/aesgcm/README.md) (crypto) |
 | `storage` | 18 | [`lz4`](modules/lz4/README.md) (format) · [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
-| `crypto` | 89 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
+| `crypto` | 90 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 30 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
 | `os` | 16 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
@@ -303,7 +303,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 265 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 265 modules — a linux64-only module has nothing further to show here.
+Every one of the 266 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 266 modules — a linux64-only module has nothing further to show here.
 
 47 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 57 declared pairs, 56 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -638,6 +638,7 @@ Every one of the 265 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`vdf`](modules/vdf/README.md) | 4 (S,E) | Wesolowski Verifiable Delay Function over an RSA hidden-order group — sequential-squaring delay with prove/verify. A caller-supplied modulus needs a trusted setup. | any | montint |
 | [`voprf`](modules/voprf/README.md) | 2 (S,E,A,P) | (V)OPRF — Oblivious Pseudorandom Functions (RFC 9497), all five ciphersuites (ristretto255, decaf448, P-256, P-384, P-521): OPRF, verifiable, and partially-oblivious modes with batched DLEQ proofs. | any | ct25519, decaf448, p256, p384, p521 |
 | [`webauthn`](modules/webauthn/README.md) | 3 (S,H,P) | WebAuthn / FIDO2 Relying-Party **verifier** (W3C Level 3) — assertion + registration ceremony checks, plus attestation verification. Verification only. | any | cbor, rsa, p256, p384, p521, x509 |
+| [`wipealloc`](modules/wipealloc/README.md) | 4 (S)? | Allocator adapter that zeroes every block before it is freed and refuses resize/remap, so a growing secret-holding buffer never leaves an unwiped copy in the child allocator. | any | — |
 | [`x509`](modules/x509/README.md) | 1 | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates, plus CRL revocation checking (RFC 5280 §6.3). | any | rsa, slhdsa, p521, p256, netaddr |
 | [`xmss`](modules/xmss/README.md) | 4 (S) | XMSS (RFC 8391), single-tree SHA-256 — **stateful** hash-based signatures. Index reuse breaks the scheme; `sign` advances the index first. | any | — |
 

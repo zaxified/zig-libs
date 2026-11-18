@@ -261,6 +261,7 @@ pub const module_list = [_]Module{
     .{ .name = "pagecache", .libs = &.{"net"}, .deps = &.{ "kvtree", "ramcache" } },
     .{ .name = "tsdb", .libs = &.{"storage"}, .deps = &.{ "kvtree", "regex" }, .test_deps = &.{"testkit"} },
     .{ .name = "entropy", .libs = &.{ "crypto", "web" } },
+    .{ .name = "wipealloc", .libs = &.{"crypto"} },
     .{ .name = "hashdigest", .libs = &.{ "crypto", "storage" }, .deps = &.{"sha2"}, .test_deps = &.{"testkit"} },
     .{ .name = "sealedbox", .libs = &.{"crypto"}, .deps = &.{ "ct25519", "b64ct" }, .test_deps = &.{"testkit"} },
     .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{ "montint", "aescbc", "aes192", "b64ct", "keycodec" }, .test_deps = &.{"testkit"}, .heavy = true },
