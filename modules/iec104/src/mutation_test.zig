@@ -321,6 +321,9 @@ test "asdu: the shape table matches the standard, type by type" {
         .{ .id = 14, .base = .short_float, .time = .cp24, .size = 8 },
         .{ .id = 15, .base = .counter, .time = .none, .size = 5 },
         .{ .id = 16, .base = .counter, .time = .cp24, .size = 8 },
+        .{ .id = 17, .base = .protection_event, .time = .cp24, .size = 6 },
+        .{ .id = 18, .base = .protection_start, .time = .cp24, .size = 7 },
+        .{ .id = 19, .base = .protection_output, .time = .cp24, .size = 7 },
         .{ .id = 20, .base = .packed_single, .time = .none, .size = 5 },
         .{ .id = 21, .base = .normalized_no_quality, .time = .none, .size = 2 },
         .{ .id = 30, .base = .siq, .time = .cp56, .size = 8 },
@@ -331,6 +334,9 @@ test "asdu: the shape table matches the standard, type by type" {
         .{ .id = 35, .base = .scaled, .time = .cp56, .size = 10 },
         .{ .id = 36, .base = .short_float, .time = .cp56, .size = 12 },
         .{ .id = 37, .base = .counter, .time = .cp56, .size = 12 },
+        .{ .id = 38, .base = .protection_event, .time = .cp56, .size = 10 },
+        .{ .id = 39, .base = .protection_start, .time = .cp56, .size = 11 },
+        .{ .id = 40, .base = .protection_output, .time = .cp56, .size = 11 },
         .{ .id = 45, .base = .sco, .time = .none, .size = 1 },
         .{ .id = 46, .base = .dco, .time = .none, .size = 1 },
         .{ .id = 47, .base = .rco, .time = .none, .size = 1 },
@@ -367,8 +373,8 @@ test "asdu: the shape table matches the standard, type by type" {
         try testing.expectEqual(r.size, sh.size());
         try testing.expectEqual(@as(?usize, r.size), asdu.elementSize(t));
     }
-    // Not modelled: protection events, file transfer, the unused ids.
-    for ([_]u8{ 0, 17, 18, 19, 38, 39, 40, 120, 127, 200 }) |id| {
+    // Not modelled: file transfer, the unused ids.
+    for ([_]u8{ 0, 22, 29, 41, 120, 127, 200 }) |id| {
         try testing.expectEqual(@as(?asdu.Shape, null), asdu.shapeOf(@fromBackingInt(id)));
     }
 }
@@ -1015,4 +1021,216 @@ test "transport: the in-memory pipe takes exactly its capacity" {
     try t.write(&blob);
     try testing.expectEqual(@as(usize, 4096), loop.sent().len);
     try testing.expectError(error.WriteFailed, t.write(&[_]u8{1}));
+}
+
+// ── protection equipment events (types 17-19, 38-40) ───────────────────────
+//
+// Octet layouts from IEC 60870-5-101 §7.3.1 (cross-checked against the field
+// order and bit values of lib60870-C's headers): one
+// object is the base element with its CP16Time2a, then the CP24Time2a (17-19)
+// or CP56Time2a (38-40) tag.
+
+const ProtectionCase = struct {
+    type_id: asdu.TypeId,
+    /// the whole ASDU with one object at IOA 1, hand-built from the standard
+    wire: []const u8,
+};
+
+fn expectProtectionRoundTrip(c: ProtectionCase, want: asdu.Object) !void {
+    const a = try asdu.decode(c.wire, asdu.default_params);
+    try testing.expectEqual(c.type_id, a.header.type_id);
+    var it = a.objects();
+    const o = (try it.next()).?;
+    try testing.expectEqual(@as(?asdu.Object, null), try it.next());
+    try testing.expectEqual(want.ioa, o.ioa);
+    try testing.expectEqualDeep(want.element, o.element);
+    try testing.expectEqualDeep(want.time, o.time);
+    // and back to the very same octets
+    var buf: [64]u8 = undefined;
+    const built = try asdu.buildSingle(&buf, asdu.default_params, c.type_id, .{ .cot = .spontaneous }, 47, want.ioa, want.element, want.time);
+    try testing.expectEqualSlices(u8, c.wire, built);
+    // one octet short or long is a count mismatch, never a partial element
+    try testing.expectError(error.ObjectCountMismatch, asdu.decode(c.wire[0 .. c.wire.len - 1], asdu.default_params));
+    var longer: [64]u8 = undefined;
+    @memcpy(longer[0..c.wire.len], c.wire);
+    longer[c.wire.len] = 0;
+    try testing.expectError(error.ObjectCountMismatch, asdu.decode(longer[0 .. c.wire.len + 1], asdu.default_params));
+}
+
+test "protection events: M_EP_TA_1 (17) SEP + elapsed time + CP24" {
+    // SEP 0x9A = ES 2 (on) | EI | BL | IV; elapsed 0x1234 ms; CP24 5.000 s, minute 5, IV.
+    try expectProtectionRoundTrip(.{
+        .type_id = .m_ep_ta_1,
+        .wire = &hex("11010300" ++ "2f00" ++ "010000" ++ "9a" ++ "3412" ++ "8813" ++ "85"),
+    }, .{
+        .ioa = 1,
+        .element = .{ .protection_event = .{
+            .event = .{ .state = .on, .elapsed_invalid = true, .quality = .{ .bl = true, .iv = true } },
+            .elapsed = .{ .milliseconds = 0x1234 },
+        } },
+        .time = .{ .cp24 = .{ .second = 5, .minute = 5, .invalid = true } },
+    });
+}
+
+test "protection events: M_EP_TB_1 (18) SPE + QDP + duration + CP24" {
+    // SPE 0x25 = GS | SL2 | SRD; QDP 0x58 = EI | BL | NT; duration 0x0102 ms; CP24 0.001 s, minute 59.
+    try expectProtectionRoundTrip(.{
+        .type_id = .m_ep_tb_1,
+        .wire = &hex("12010300" ++ "2f00" ++ "010000" ++ "25" ++ "58" ++ "0201" ++ "0100" ++ "3b"),
+    }, .{
+        .ioa = 1,
+        .element = .{ .protection_start = .{
+            .start = .{ .gs = true, .sl2 = true, .srd = true },
+            .qdp = .{ .elapsed_invalid = true, .quality = .{ .bl = true, .nt = true } },
+            .duration = .{ .milliseconds = 0x0102 },
+        } },
+        .time = .{ .cp24 = .{ .millisecond = 1, .minute = 59 } },
+    });
+}
+
+test "protection events: M_EP_TC_1 (19) OCI + QDP + operating time + CP24" {
+    // OCI 0x0A = CL1 | CL3; QDP 0xA0 = SB | IV; operating time 0xFFFF ms; CP24 59.999 s, minute 0, substituted.
+    try expectProtectionRoundTrip(.{
+        .type_id = .m_ep_tc_1,
+        .wire = &hex("13010300" ++ "2f00" ++ "010000" ++ "0a" ++ "a0" ++ "ffff" ++ "5fea" ++ "40"),
+    }, .{
+        .ioa = 1,
+        .element = .{ .protection_output = .{
+            .output = .{ .cl1 = true, .cl3 = true },
+            .qdp = .{ .quality = .{ .sb = true, .iv = true } },
+            .operating = .{ .milliseconds = 0xFFFF },
+        } },
+        .time = .{ .cp24 = .{ .millisecond = 999, .second = 59, .substituted = true } },
+    });
+}
+
+test "protection events: M_EP_TD_1 (38) SEP + elapsed time + CP56" {
+    // SEP 0x41 = ES 1 (off) | NT; CP56 2025-12-31 23:59:59.999, minute 59, hour 23 + SU, Sunday.
+    try expectProtectionRoundTrip(.{
+        .type_id = .m_ep_td_1,
+        .wire = &hex("26010300" ++ "2f00" ++ "010000" ++ "41" ++ "0100" ++ "5fea" ++ "3b" ++ "97" ++ "ff" ++ "0c" ++ "63"),
+    }, .{
+        .ioa = 1,
+        .element = .{ .protection_event = .{
+            .event = .{ .state = .off, .quality = .{ .nt = true } },
+            .elapsed = .{ .milliseconds = 1 },
+        } },
+        .time = .{ .cp56 = .{ .millisecond = 999, .second = 59, .minute = 59, .hour = 23, .day = 31, .day_of_week = 7, .month = 12, .year = 99, .summer_time = true } },
+    });
+}
+
+test "protection events: M_EP_TE_1 (39) SPE + QDP + duration + CP56" {
+    // SPE 0x3F = every start bit; QDP 0x08 = EI only.
+    try expectProtectionRoundTrip(.{
+        .type_id = .m_ep_te_1,
+        .wire = &hex("27010300" ++ "2f00" ++ "010000" ++ "3f" ++ "08" ++ "e803" ++ "0000" ++ "00" ++ "00" ++ "01" ++ "01" ++ "00"),
+    }, .{
+        .ioa = 1,
+        .element = .{ .protection_start = .{
+            .start = .{ .gs = true, .sl1 = true, .sl2 = true, .sl3 = true, .sie = true, .srd = true },
+            .qdp = .{ .elapsed_invalid = true },
+            .duration = .{ .milliseconds = 1000 },
+        } },
+        .time = .{ .cp56 = .{} },
+    });
+}
+
+test "protection events: M_EP_TF_1 (40) OCI + QDP + operating time + CP56" {
+    // OCI 0x0F = every output bit; QDP 0xF8 = EI | BL | SB | NT | IV.
+    try expectProtectionRoundTrip(.{
+        .type_id = .m_ep_tf_1,
+        .wire = &hex("28010300" ++ "2f00" ++ "010000" ++ "0f" ++ "f8" ++ "0a00" ++ "1027" ++ "3b" ++ "17" ++ "11" ++ "06" ++ "19"),
+    }, .{
+        .ioa = 1,
+        .element = .{ .protection_output = .{
+            .output = .{ .gc = true, .cl1 = true, .cl2 = true, .cl3 = true },
+            .qdp = .{ .elapsed_invalid = true, .quality = .{ .bl = true, .sb = true, .nt = true, .iv = true } },
+            .operating = .{ .milliseconds = 10 },
+        } },
+        .time = .{ .cp56 = .{ .second = 10, .minute = 59, .hour = 23, .day = 17, .day_of_week = 0, .month = 6, .year = 25 } },
+    });
+}
+
+test "protection events: sequence of two objects and a bad time tag" {
+    // SQ = 1, IOA 7 and 8, M_EP_TA_1: the elements are 6 octets each.
+    const sq = hex("11820300" ++ "2f00" ++ "070000" ++ "01" ++ "0100" ++ "0000" ++ "00" ++ "02" ++ "0200" ++ "0000" ++ "00");
+    const a = try asdu.decode(&sq, asdu.default_params);
+    var it = a.objects();
+    const o1 = (try it.next()).?;
+    const o2 = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 7), o1.ioa);
+    try testing.expectEqual(@as(u32, 8), o2.ioa);
+    try testing.expectEqual(info.DoublePoint.off, o1.element.protection_event.event.state);
+    try testing.expectEqual(info.DoublePoint.on, o2.element.protection_event.event.state);
+    try testing.expectEqual(@as(u16, 2), o2.element.protection_event.elapsed.milliseconds);
+    // minute 60 in the CP24 tag is an impossible time, reported per object
+    const bad = hex("11010300" ++ "2f00" ++ "010000" ++ "01" ++ "0000" ++ "0000" ++ "3c");
+    const b = try asdu.decode(&bad, asdu.default_params);
+    var bit = b.objects();
+    try testing.expectError(error.ImpossibleTime, bit.next());
+}
+
+test "protection events: element bits outside the standard are masked, not echoed" {
+    // SEP bit 2 (reserved) and the bit shared with OV never come back.
+    try testing.expectEqual(@as(u8, 0x0A), (info.Sep{ .state = .on, .elapsed_invalid = true, .quality = .{ .ov = true } }).toByte());
+    // OV is not a field of SEP/QDP: the low bits never turn into `quality.ov`.
+    try testing.expect(!info.Sep.fromByte(0x01).quality.ov);
+    try testing.expect(!info.Qdp.fromByte(0x07).quality.ov);
+    try testing.expectEqual(info.DoublePoint.off, info.Sep.fromByte(0x01).state);
+    try testing.expectEqual(@as(u8, 0x01), info.Sep.fromByte(0x05).toByte());
+    // SPE bits 6..7, OCI bits 4..7 and QDP bits 0..2 are reserved.
+    try testing.expectEqual(@as(u8, 0x3F), info.Spe.fromByte(0xFF).toByte());
+    try testing.expectEqual(@as(u8, 0x0F), info.Oci.fromByte(0xFF).toByte());
+    try testing.expectEqual(@as(u8, 0xF8), info.Qdp.fromByte(0xFF).toByte());
+    try testing.expectEqual(@as(u8, 0xF0), (info.Qdp{ .quality = .{ .ov = true, .bl = true, .sb = true, .nt = true, .iv = true } }).toByte());
+    // every single bit lands in its own field
+    for (0..8) |bit| {
+        const b: u8 = @as(u8, 1) << @intCast(bit);
+        const sep = info.Sep.fromByte(b);
+        try testing.expectEqual(b & 0xF9 | (b & 0x02), sep.toByte());
+        try testing.expectEqual(b & 0x3F, info.Spe.fromByte(b).toByte());
+        try testing.expectEqual(b & 0x0F, info.Oci.fromByte(b).toByte());
+        try testing.expectEqual(b & 0xF8, info.Qdp.fromByte(b).toByte());
+    }
+    // a short element is refused by the element codec as well
+    try testing.expectError(error.ObjectCountMismatch, asdu.decodeElement(.protection_event, &hex("0000")));
+    try testing.expectError(error.ObjectCountMismatch, asdu.decodeElement(.protection_start, &hex("000000")));
+    try testing.expectError(error.ObjectCountMismatch, asdu.decodeElement(.protection_output, &hex("000000")));
+    var small: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, asdu.encodeElement(.{ .protection_start = .{ .start = .{}, .qdp = .{}, .duration = .{} } }, &small));
+}
+
+test "outstation: protection events are spontaneous only, never interrogated" {
+    var points = [_]outstation.Point{
+        .{ .ioa = 1, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } }, .group = 1 },
+        .{ .ioa = 2, .type_id = .m_ep_ta_1, .element = .{ .protection_event = .{ .event = .{ .state = .on }, .elapsed = .{ .milliseconds = 5 } } }, .time = .{ .cp24 = .{} }, .group = 1 },
+        .{ .ioa = 3, .type_id = .m_ep_te_1, .element = .{ .protection_start = .{ .start = .{ .gs = true }, .qdp = .{}, .duration = .{} } }, .time = .{ .cp56 = .{} }, .group = 1 },
+    };
+    var o = try outstation.Outstation.init(.{ .common_address = 47 }, &points);
+    var s = outstation.CollectSink{};
+    // station interrogation: con, the single-point, termination - nothing else
+    try o.handle(&hex("640106002f0000000014"), s.sink());
+    try testing.expectEqual(@as(usize, 3), s.count);
+    // group 1 interrogation (QOI 21)
+    s.reset();
+    try o.handle(&hex("640106002f0000000015"), s.sink());
+    try testing.expectEqual(@as(usize, 3), s.count);
+    for (0..s.count) |i| {
+        const a = try asdu.decode(s.get(i), asdu.default_params);
+        try testing.expect(!a.header.type_id.isSpontaneousOnly());
+    }
+    // spontaneously they are sent, with cause 3
+    s.reset();
+    try o.reportSpontaneous(2, s.sink());
+    try o.reportSpontaneous(3, s.sink());
+    try testing.expectEqual(@as(usize, 2), s.count);
+    const a = try asdu.decode(s.get(1), asdu.default_params);
+    try testing.expectEqual(asdu.TypeId.m_ep_te_1, a.header.type_id);
+    try testing.expectEqual(asdu.Cot.spontaneous, a.header.cause.cot);
+    // the predicate covers exactly the six ids
+    for (0..256) |id| {
+        const t: asdu.TypeId = @fromBackingInt(@intCast(id));
+        const want = (id >= 17 and id <= 19) or (id >= 38 and id <= 40);
+        try testing.expectEqual(want, t.isSpontaneousOnly());
+    }
 }

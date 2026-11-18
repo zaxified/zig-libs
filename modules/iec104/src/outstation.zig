@@ -396,6 +396,11 @@ pub const Outstation = struct {
     }
 
     fn emitPoint(self: *Outstation, p: *const Point, cause: asdu_mod.Cot, sink: Sink) Error!void {
+        // The type/cause table (IEC 60870-5-101 / -104) allows the protection
+        // equipment events only with cause 3: an interrogation (causes
+        // 20..41, station, group and counter) never reports them.
+        const c = @backingInt(cause);
+        if (p.type_id.isSpontaneousOnly() and c >= 20 and c <= 41) return;
         try self.emitPointWithLayout(p, cause, self.opts.interrogation_sq, sink);
     }
 

@@ -287,6 +287,111 @@ pub const Diq = struct {
     }
 };
 
+/// SEP — single event of protection equipment (IEC 60870-5-101 §7.2.6.10).
+/// Bits 0..1 are the event state ES (same coding as a double point: 1 = OFF,
+/// 2 = ON, 0 and 3 are the two indeterminate values), bit 2 is reserved, bit 3
+/// is EI ("elapsed time invalid") and bits 4..7 are BL/SB/NT/IV.
+pub const Sep = struct {
+    state: DoublePoint = .intermediate,
+    /// EI — the accompanying CP16Time2a elapsed time is not valid.
+    elapsed_invalid: bool = false,
+    /// Only `bl`, `sb`, `nt` and `iv` are on the wire; `ov` shares bit 0 with
+    /// the state and is never written.
+    quality: Quality = .{},
+
+    pub const ei_bit: u8 = 0x08;
+
+    pub fn toByte(self: Sep) u8 {
+        return @as(u8, @backingInt(self.state)) |
+            (if (self.elapsed_invalid) ei_bit else 0) |
+            (self.quality.toByte() & 0xF0);
+    }
+
+    pub fn fromByte(b: u8) Sep {
+        return .{
+            .state = @fromBackingInt(@intCast(@as(u2, @truncate(b)))),
+            .elapsed_invalid = b & ei_bit != 0,
+            .quality = Quality.fromByte(b & 0xF0),
+        };
+    }
+};
+
+/// SPE — start events of protection equipment (§7.2.6.11): one bit per start
+/// signal (GS general start, SL1..SL3 start of operation in phase L1..L3, SIE
+/// start of operation of the earth current, SRD start in reverse direction).
+/// Bits 6..7 are reserved and are neither read nor written.
+pub const Spe = struct {
+    gs: bool = false,
+    sl1: bool = false,
+    sl2: bool = false,
+    sl3: bool = false,
+    sie: bool = false,
+    srd: bool = false,
+
+    pub fn toByte(self: Spe) u8 {
+        return (if (self.gs) @as(u8, 0x01) else 0) |
+            (if (self.sl1) @as(u8, 0x02) else 0) |
+            (if (self.sl2) @as(u8, 0x04) else 0) |
+            (if (self.sl3) @as(u8, 0x08) else 0) |
+            (if (self.sie) @as(u8, 0x10) else 0) |
+            (if (self.srd) @as(u8, 0x20) else 0);
+    }
+
+    pub fn fromByte(b: u8) Spe {
+        return .{
+            .gs = b & 0x01 != 0,
+            .sl1 = b & 0x02 != 0,
+            .sl2 = b & 0x04 != 0,
+            .sl3 = b & 0x08 != 0,
+            .sie = b & 0x10 != 0,
+            .srd = b & 0x20 != 0,
+        };
+    }
+};
+
+/// OCI — output circuit information of protection equipment (§7.2.6.12): GC
+/// general command to the output circuit, CL1..CL3 command to the output
+/// circuit of phase L1..L3. Bits 4..7 are reserved and are neither read nor
+/// written.
+pub const Oci = struct {
+    gc: bool = false,
+    cl1: bool = false,
+    cl2: bool = false,
+    cl3: bool = false,
+
+    pub fn toByte(self: Oci) u8 {
+        return (if (self.gc) @as(u8, 0x01) else 0) |
+            (if (self.cl1) @as(u8, 0x02) else 0) |
+            (if (self.cl2) @as(u8, 0x04) else 0) |
+            (if (self.cl3) @as(u8, 0x08) else 0);
+    }
+
+    pub fn fromByte(b: u8) Oci {
+        return .{
+            .gc = b & 0x01 != 0,
+            .cl1 = b & 0x02 != 0,
+            .cl2 = b & 0x04 != 0,
+            .cl3 = b & 0x08 != 0,
+        };
+    }
+};
+
+/// QDP — quality descriptor for events of protection equipment (§7.2.6.4):
+/// bit 3 EI, bits 4..7 BL/SB/NT/IV; bits 0..2 are reserved (written as zero).
+pub const Qdp = struct {
+    /// EI — the accompanying CP16Time2a elapsed time is not valid.
+    elapsed_invalid: bool = false,
+    quality: Quality = .{},
+
+    pub fn toByte(self: Qdp) u8 {
+        return (if (self.elapsed_invalid) Sep.ei_bit else 0) | (self.quality.toByte() & 0xF0);
+    }
+
+    pub fn fromByte(b: u8) Qdp {
+        return .{ .elapsed_invalid = b & Sep.ei_bit != 0, .quality = Quality.fromByte(b & 0xF0) };
+    }
+};
+
 /// VTI — value with transient state indication (§7.2.6.5): a signed 7-bit
 /// step position plus a "transient" bit saying the step is still moving.
 pub const Vti = struct {
