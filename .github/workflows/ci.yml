@@ -901,11 +901,14 @@ jobs:
           # asm/portable split is measured on its asm path only — but aarch64 and
           # baseline x86-64 run the portable one, where p256's montReducePortable
           # compiled a branch on secret-point data (fixed 2026-11-18). This lane
-          # runs `ctgrind.sh --check` with CTGRIND_CPU=x86_64 for the modules
-          # whose portable counts are pinned equal to the asm ones (the list is in
-          # `cmd_ctgrind_portable`, scripts/test.sh). Same peer, no `args` (the
-          # row's optimize mode is the claim), not stamped (one module, minutes).
-          lanes+=('{"name":"ctgrind portable amd64","args":"","cmd":"ctgrind-portable","cachekey":"portable-ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":30,"skip_live":""}')
+          # runs `ctgrind.sh --check` with CTGRIND_CPU=x86_64 over every harness
+          # module (94 since 2026-11-18; rows whose portable counts differ carry
+          # a `cpu=x86_64` variant with its cause, see ctgrind-expected.tsv's
+          # header). Same peer, no `args` (the row's optimize mode is the claim),
+          # not stamped. Same scope as the lane above, so the same 90-minute
+          # bound (a local run of 91 modules took 20.5 min of measurement on a
+          # loaded host, harness builds not counted).
+          lanes+=('{"name":"ctgrind portable amd64","args":"","cmd":"ctgrind-portable","cachekey":"portable-ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":90,"skip_live":""}')
 
           # ⭐ INSTRUCTION COUNTS, added 2026-10-08 (scripts/count-insns, evaluated
           # in CML's maturity tasks § AE): every module with a
