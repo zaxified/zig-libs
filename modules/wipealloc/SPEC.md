@@ -4,19 +4,32 @@
 
 **Grade:** *(written by `zig build gen-catalog` — never by hand)*
 
-**Scope:** unsurveyed
+**Scope:** core — OpenSSL 4.1 `OPENSSL_clear_free` and libsodium 1.0.22 `sodium_free` (surveyed 2026-11-18)
 
 **Audit:** review none · mutation 2026-11-18 (8/8, 0 eq) · src 587079bec2c92279
 
-**Hardening:** fuzz n/a — no input parsing, nothing to fuzz · ct n/a — the wipe's data-independent loop is not a secret-dependent branch (keyword review, 2026-11-18)
+**Hardening:** fuzz n/a — no input parsing, nothing to fuzz · ct n/a — the wipe's data-independent loop is not a secret-dependent branch (keyword review, 2026-11-18) · panic 2026-11-18 (every pub entry point read: no `assert`, `unreachable`, `@panic` or `.?` in the module; every failure is the child's `null`)
 
 **Performance:** not measured
 
-**Evidence:** model — the contract is checkable by a spying child allocator (tests)
+**Evidence:** model — a spying child allocator observes every block the adapter hands back
+**Model:** src/root.zig:Spy
 
 **Known defects:** none recorded
 
 **Downstream consumer:** no
+
+## Compared with
+
+Surveyed 2026-11-18 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Docs and READMEs only; no source copied.
+
+| Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
+|---|---|---|--:|---|---|
+| [openssl/openssl](https://github.com/openssl/openssl) — **reference** | C | Apache-2.0 | 31.5k | 4.1.0 (push 2026-11-18) | `OPENSSL_clear_free` cleanses a block then frees it; `OPENSSL_secure_malloc` adds a locked, guard-paged secure heap. Same wipe-on-give-back, no allocator adapter: the caller frees by hand. |
+| [jedisct1/libsodium](https://github.com/jedisct1/libsodium) | C | ISC | 14.1k | 1.0.22 (2026-04-09) | `sodium_malloc`/`sodium_free`: guard pages, canary, `mlock`, wipe on free. More protection per block; no `realloc`, so a growing buffer is the caller's copy. |
+| [RustCrypto/utils](https://github.com/RustCrypto/utils) (`zeroize`) | Rust | Apache-2.0 OR MIT *(inferred)* | 0.7k | push 2026-11-17 | `Zeroizing<Vec<u8>>` wipes the vector's contents on drop *(inferred from the crate's docs)*; a wrapper type, not an allocator, so third-party containers do not benefit. |
+
+**Where we are ahead:** a drop-in `std.mem.Allocator`, so every std container and arena that takes an allocator wipes its growth copies without code changes. **Where we are behind:** no guard pages, no `mlock`, no canary (→ Backlog).
 
 ## What this module is, and what it is not
 
@@ -69,6 +82,11 @@ Our own reading of the contract.
   does these): this wipes on free and nothing else. **Never.**
 - **No in-place growth** (`mls`'s variant): **not now**; a second allocator type in
   this module if a second consumer needs it.
+
+## Backlog / deferred
+
+- (survey 2026-11-18) **Locked, guard-paged secure heap** (`sodium_malloc`, `OPENSSL_secure_malloc`) — **not now**, a separate allocator; effort medium; no consumer asks.
+- (survey 2026-11-18) **In-place growth variant** (what `mls`'s private `Wiper` does under its arena) — **not now**; see above.
 
 ## Open
 
