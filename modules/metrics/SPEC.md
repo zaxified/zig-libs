@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — six scrape-decided rows (label value with `"`, with a newline, with `\`; HELP with a newline; a negative histogram observation; a counter at 2^53 + 1), judged by the Prometheus server's own parser (model/textparse v0.315.0): this module 0 off, prometheus/client_golang v1.24.1 1 (the counter is exposed as a float, `9.007199254740992e+15`), VictoriaMetrics/metrics v1.44.1 1 (the negative observation is dropped), prometheus-client 0.25.1 3 (label value and HELP written unescaped: two scrapes fail, one HELP line is read as a sample) (test `lead: six scrape-decided rows, none off, where client_golang, VictoriaMetrics and client_rust are each off on at least one`; `tools/go_field_probe`) (measured 2026-10-25)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (1309/1457, 148 eq) · src 93f22de49088e9d0
+**Audit:** review 2026-11-12 · mutation 2026-11-19 (1323/1471, 148 eq) · src 1d4e641ba37ec18f
 
 **Hardening:** fuzz n/a — see `**Fuzz exemption:**` below · ct n/a — metric counters (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: peer `Content-Length` saturates in request size; bucket/snapshot accessors total; long-name collision scanned; exemplar label count refused before the duplicate scan)
 

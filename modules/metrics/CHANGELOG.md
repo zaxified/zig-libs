@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the day's change: 14 mutants over `derivedSuffixes`/`derivedCollision` (per-kind suffix set, length/prefix/suffix tests, both pair directions), 14 killed on the first run (unfiltered ReleaseSafe suite). Cumulative 1323/1471, 148 eq. Card A1 again.
 - **2026-11-19** — **Behaviour change (narrow):** `registerCollector` no longer refuses a family named `<summary>_bucket` beside a summary `<summary>` (it did, while `Registry.summary` always accepted it, and a summary writes no `_bucket` sample); registration and the collector now share one per-kind set of derived sample names (histogram `_bucket`/`_sum`/`_count`, summary `_sum`/`_count`), as client_golang's gather check does. Tests per kind and suffix on both paths.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).

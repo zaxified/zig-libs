@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — thirteen chains Go 1.26.8 accepts and this module refuses, each on an RFC 5280 rule: a subject DN or a SAN directoryName outside a permitted, or inside an excluded, directoryName subtree (§4.2.1.10, §6.1.3 (b)/(c); Go does not process directoryName constraints — OpenSSL does), and an empty extendedKeyUsage on the leaf or an intermediate (§4.2.1.12 `SIZE (1..MAX)`; Go reads it as no restriction); out of 1,939 cases `zig build interop-x509` judges against Go (395 corpus + 1,544 generated), the others agree (test `lead: directoryName constraints and an empty extendedKeyUsage …`, `src/data/s2/leads.bin`) (measured 2026-10-26) · feature — a critical nameConstraints with a directoryName subtree is processed; Go refuses every such chain as an unhandled critical extension (two rows of the same run) (measured 2026-10-26)
 
-**Audit:** review 2026-10-28 · mutation 2026-10-28 (121/133, 12 eq) · src 9c95133b7ce06005
+**Audit:** review 2026-10-28 · mutation 2026-11-19 (124/136, 12 eq) · src 80d8fb38e2cfce84
 
 **Hardening:** fuzz 2026-10-11 (200,000-run budget per harness clean, X509_FUZZ, incl. `x509-names` and `x509-policy`) · ct n/a — public certificate verification (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point: trust anchors and `verifySignedBy`'s issuer reached std's parser unvalidated (an RSA key header longer than the key read past it), now through `validateForStdParse`; the duplicate-extension check capped at `max_extensions` (128); `policyMappings` work charged to a new `max_steps`; >4 GiB buffers refused before std's u32 offsets; X509_FUZZ 200,000 runs clean after it)
 
