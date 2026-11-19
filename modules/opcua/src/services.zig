@@ -241,6 +241,7 @@ pub const status = struct {
     pub const bad_application_signature_invalid: encoding.StatusCode = 0x8058_0000;
     pub const bad_no_match: encoding.StatusCode = 0x806F_0000;
     pub const bad_write_not_supported: encoding.StatusCode = 0x8073_0000;
+    pub const bad_index_range_data_mismatch: encoding.StatusCode = 0x80EA_0000;
     pub const bad_type_mismatch: encoding.StatusCode = 0x8074_0000;
     pub const bad_method_invalid: encoding.StatusCode = 0x8075_0000;
     pub const bad_arguments_missing: encoding.StatusCode = 0x8076_0000;

@@ -21,15 +21,21 @@
 //!   - syntax error, `a >= b`, a number above 2^32-1 -> `IndexRangeInvalid`;
 //!   - the range's dimension count differs from the value's -> `NoData`;
 //!   - Read: a range reaching past the end is clipped to the array, a range
-//!     that starts past the end (or any range on an empty/null value, or on a
-//!     scalar other than String/ByteString/XmlElement) -> `NoData`;
+//!     that starts past the end (or any range on an empty/null value) ->
+//!     `NoData`;
 //!   - Write: the range must lie inside the stored array (a write never grows
 //!     it) -> else `NoData`; the new value must have exactly as many
-//!     elements as the range selects -> else `IndexRangeInvalid`; element type
-//!     must equal the stored one -> else `TypeMismatch`;
+//!     elements as the range selects -> else `IndexRangeDataMismatch`
+//!     (§5.11.4's "does not match the IndexRange"; open62541 says Invalid);
+//!     element type must equal the stored one -> else `TypeMismatch`;
 //!   - an array of Strings/ByteStrings takes one extra trailing dimension that
-//!     selects bytes inside each selected element (Read only; the matching
-//!     Write is `WriteNotSupported`).
+//!     selects bytes inside each selected element (§7.27: such arrays "are
+//!     treated as two dimensional arrays"); on Read an element with nothing
+//!     in the byte range is a null element and only "nothing at all" is
+//!     `NoData` (Table 166), on Write every selected element must hold the
+//!     range and the new value is one String per selected element;
+//!   - a scalar that is not String-like takes no range: it is not used
+//!     (`takesRange`) and the whole value is read or written.
 //!
 //! The range text is untrusted: it is capped at `max_text_len` bytes and
 //! `max_dims` dimensions, every index is a `u32`, all arithmetic is `u64`, and
@@ -122,7 +128,22 @@ pub fn parse(text: []const u8) ParseError!Range {
 }
 
 pub const ApplyError = error{ OutOfMemory, IndexRangeInvalid, IndexRangeNoData };
-pub const WriteError = ApplyError || error{ TypeMismatch, WriteNotSupported };
+pub const WriteError = ApplyError || error{ TypeMismatch, IndexRangeDataMismatch };
+
+/// Whether a stored value takes a range at all: arrays and the String-like
+/// scalars do; any other scalar does not (§7.28: the parameter "is null or
+/// empty if the specified Attribute is not an array", §5.11.4: it "is not
+/// used if the specified Attribute is not an array") and the caller reads or
+/// writes the whole value.
+pub fn takesRange(v: encoding.Variant) bool {
+    return switch (v) {
+        .scalar => |sc| switch (sc) {
+            .string, .byte_string, .xml_element => true,
+            else => false,
+        },
+        else => true,
+    };
+}
 
 /// The elements a range selects out of a (possibly multi-dimensional) array
 /// stored flat in row-major order, produced one flat index at a time.
@@ -228,7 +249,8 @@ pub fn readRange(arena: std.mem.Allocator, v: encoding.Variant, range: *const Ra
                 const sub = try subBytes(s, range.dims[0], .read);
                 return .{ .scalar = @unionInit(encoding.VariantScalar, @tagName(tag), sub) };
             },
-            else => return error.IndexRangeNoData,
+            // not an array: the range is not used, the whole value is returned
+            else => return v,
         },
         .array => |arr| switch (arr.items) {
             inline else => |maybe, tag| {
@@ -251,7 +273,14 @@ pub fn readRange(arena: std.mem.Allocator, v: encoding.Variant, range: *const Ra
                     out = try arena.alloc(Elem, @intCast(sel.total));
                     var k: usize = 0;
                     const last = range.dims[lens.len];
-                    while (sel.next()) |ix| : (k += 1) out[k] = try subBytes(src[ix], last, .read);
+                    // §7.27 Table 166: an element with nothing in the byte range
+                    // is a null element; NoData only when no element has data
+                    var any = false;
+                    while (sel.next()) |ix| : (k += 1) {
+                        out[k] = subBytes(src[ix], last, .read) catch null;
+                        if (out[k] != null) any = true;
+                    }
+                    if (!any) return error.IndexRangeNoData;
                     if (lens.len > 1) out_dims = try countsAsDims(arena, &sel);
                 } else return error.IndexRangeNoData;
                 return .{ .array = .{
@@ -289,8 +318,8 @@ pub fn writeRange(tmp: std.mem.Allocator, stored: encoding.Variant, incoming: en
                 const old = s orelse return error.IndexRangeNoData;
                 const d = range.dims[0];
                 if (d.max >= old.len) return error.IndexRangeNoData;
-                const new_bytes = inc orelse return error.IndexRangeInvalid;
-                if (new_bytes.len != @as(u64, d.max) - d.min + 1) return error.IndexRangeInvalid;
+                const new_bytes = inc orelse return error.IndexRangeDataMismatch;
+                if (new_bytes.len != @as(u64, d.max) - d.min + 1) return error.IndexRangeDataMismatch;
                 const buf = try tmp.dupe(u8, old);
                 @memcpy(buf[d.min..][0..new_bytes.len], new_bytes);
                 return .{ .scalar = @unionInit(encoding.VariantScalar, @tagName(tag), buf) };
@@ -304,7 +333,7 @@ pub fn writeRange(tmp: std.mem.Allocator, stored: encoding.Variant, incoming: en
                 const inc: []const Elem = switch (incoming) {
                     .empty => return error.TypeMismatch,
                     .array => |ia| if (std.meta.activeTag(ia.items) == tag)
-                        (@field(ia.items, @tagName(tag)) orelse return error.IndexRangeInvalid)
+                        (@field(ia.items, @tagName(tag)) orelse return error.IndexRangeDataMismatch)
                     else
                         return error.TypeMismatch,
                     .scalar => |isc| blk: {
@@ -318,12 +347,35 @@ pub fn writeRange(tmp: std.mem.Allocator, stored: encoding.Variant, incoming: en
                 const lens = arrayLens(arr, src.len, &lbuf);
                 if (range.n != lens.len) {
                     if (comptime isStringLike(tag)) {
-                        if (range.n == lens.len + 1) return error.WriteNotSupported;
+                        if (range.n == lens.len + 1) {
+                            // one more dimension: bytes inside each selected String
+                            const outer: Range = .{ .n = @intCast(lens.len), .dims = range.dims };
+                            var osel = try select(&outer, lens, .write);
+                            const last = range.dims[lens.len];
+                            const width = @as(u64, last.max) - last.min + 1;
+                            const strs = try tmp.dupe(Elem, src);
+                            var j: usize = 0;
+                            while (osel.next()) |ix| : (j += 1) {
+                                const old = src[ix] orelse return error.IndexRangeNoData;
+                                if (last.max >= old.len) return error.IndexRangeNoData;
+                                if (j >= inc.len) return error.IndexRangeDataMismatch;
+                                const nb = inc[j] orelse return error.IndexRangeDataMismatch;
+                                if (nb.len != width) return error.IndexRangeDataMismatch;
+                                const buf = try tmp.dupe(u8, old);
+                                @memcpy(buf[last.min..][0..nb.len], nb);
+                                strs[ix] = buf;
+                            }
+                            if (j != inc.len) return error.IndexRangeDataMismatch;
+                            return .{ .array = .{
+                                .items = @unionInit(encoding.VariantArrayItems, @tagName(tag), strs),
+                                .dimensions = arr.dimensions,
+                            } };
+                        }
                     }
                     return error.IndexRangeNoData;
                 }
                 var sel = try select(range, lens, .write);
-                if (inc.len != sel.total) return error.IndexRangeInvalid;
+                if (inc.len != sel.total) return error.IndexRangeDataMismatch;
                 const out = try tmp.dupe(Elem, src);
                 var k: usize = 0;
                 while (sel.next()) |ix| : (k += 1) out[ix] = inc[k];
@@ -480,8 +532,13 @@ test "readRange: strings, byte strings and scalars" {
     try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), .{ .scalar = .{ .string = null } }, &try parse("0")));
     const bs: encoding.Variant = .{ .scalar = .{ .byte_string = "\x00\x01\x02" } };
     try testing.expectEqualStrings("\x01\x02", (try readRange(a.allocator(), bs, &try parse("1:2"))).scalar.byte_string.?);
-    // other scalars carry no range
-    try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), .{ .scalar = .{ .int32 = 1 } }, &try parse("0")));
+    // other scalars take no range: it is not used and the value comes back whole
+    try testing.expectEqual(@as(i32, 1), (try readRange(a.allocator(), .{ .scalar = .{ .int32 = 1 } }, &try parse("0"))).scalar.int32);
+    try testing.expectEqual(@as(i32, 1), (try readRange(a.allocator(), .{ .scalar = .{ .int32 = 1 } }, &try parse("7:9,3"))).scalar.int32);
+    try testing.expect(!takesRange(.{ .scalar = .{ .int32 = 1 } }));
+    try testing.expect(takesRange(.{ .scalar = .{ .string = "x" } }));
+    try testing.expect(takesRange(.{ .scalar = .{ .byte_string = null } }));
+    try testing.expect(takesRange(.empty));
     // array of strings: one dimension selects elements, a second one the bytes
     const strs = arrOf("string", @as(?[]const ?[]const u8, &.{ "alpha", "beta", "gamma" }));
     const els = try readRange(a.allocator(), strs, &try parse("1:2"));
@@ -498,8 +555,25 @@ test "readRange: strings, byte strings and scalars" {
     try testing.expectEqualStrings("3", gs.array.items.string.?[0].?);
     try testing.expectEqualStrings("4", gs.array.items.string.?[1].?);
     try testing.expectEqualSlices(i32, &.{ 1, 2 }, gs.array.dimensions.?);
-    // a selected element too short for the byte range: no data for the whole request
-    try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), strs, &try parse("0:2,4")));
+    // a selected element too short for the byte range is a null element ...
+    const holes = try readRange(a.allocator(), strs, &try parse("0:2,4"));
+    try testing.expectEqualStrings("a", holes.array.items.string.?[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), holes.array.items.string.?[1]);
+    try testing.expectEqualStrings("a", holes.array.items.string.?[2].?);
+    // ... and only when no element has data is it NoData
+    try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), strs, &try parse("0:2,5")));
+    // §7.27 Table 166
+    const t166 = arrOf("string", @as(?[]const ?[]const u8, &.{ "TestString", "Test", "String" }));
+    const ing = try readRange(a.allocator(), t166, &try parse("0:1,7:9"));
+    try testing.expectEqual(@as(usize, 2), ing.array.items.string.?.len);
+    try testing.expectEqualStrings("ing", ing.array.items.string.?[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), ing.array.items.string.?[1]);
+    try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), t166, &try parse("0:1,10:15")));
+    // a null element counts as no data
+    const with_null = arrOf("string", @as(?[]const ?[]const u8, &.{ null, "abc" }));
+    const wn = try readRange(a.allocator(), with_null, &try parse("0:1,0"));
+    try testing.expectEqual(@as(?[]const u8, null), wn.array.items.string.?[0]);
+    try testing.expectEqualStrings("a", wn.array.items.string.?[1].?);
     try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), strs, &try parse("0,1,1")));
     // a 2-D array of non-string elements takes no third dimension
     const dims = [_]i32{ 1, 2 };
@@ -549,9 +623,9 @@ test "writeRange: 1-D array" {
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), stored, .{ .scalar = .{ .int32 = 1 } }, &try parse("5")));
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), stored, arrOf("int32", @as(?[]const i32, &.{ 1, 2 })), &try parse("4:5")));
     // element count differs from the range
-    try testing.expectError(error.IndexRangeInvalid, writeRange(a.allocator(), stored, arrOf("int32", @as(?[]const i32, &.{ 1, 2, 3 })), &try parse("1:2")));
-    try testing.expectError(error.IndexRangeInvalid, writeRange(a.allocator(), stored, arrOf("int32", @as(?[]const i32, &.{1})), &try parse("1:2")));
-    try testing.expectError(error.IndexRangeInvalid, writeRange(a.allocator(), stored, arrOf("int32", @as(?[]const i32, null)), &try parse("1")));
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), stored, arrOf("int32", @as(?[]const i32, &.{ 1, 2, 3 })), &try parse("1:2")));
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), stored, arrOf("int32", @as(?[]const i32, &.{1})), &try parse("1:2")));
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), stored, arrOf("int32", @as(?[]const i32, null)), &try parse("1")));
     // element type differs
     try testing.expectError(error.TypeMismatch, writeRange(a.allocator(), stored, .{ .scalar = .{ .uint32 = 1 } }, &try parse("1")));
     try testing.expectError(error.TypeMismatch, writeRange(a.allocator(), stored, arrOf("int16", @as(?[]const i16, &.{1})), &try parse("1")));
@@ -582,7 +656,7 @@ test "writeRange: strings" {
     const s: encoding.Variant = .{ .scalar = .{ .string = "abcdef" } };
     const w = try writeRange(a.allocator(), s, .{ .scalar = .{ .string = "XY" } }, &try parse("1:2"));
     try testing.expectEqualStrings("aXYdef", w.scalar.string.?);
-    try testing.expectError(error.IndexRangeInvalid, writeRange(a.allocator(), s, .{ .scalar = .{ .string = "X" } }, &try parse("1:2")));
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), s, .{ .scalar = .{ .string = "X" } }, &try parse("1:2")));
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), s, .{ .scalar = .{ .string = "XY" } }, &try parse("5:6")));
     try testing.expectError(error.TypeMismatch, writeRange(a.allocator(), s, .{ .scalar = .{ .byte_string = "XY" } }, &try parse("0:1")));
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), s, .{ .scalar = .{ .string = "XY" } }, &try parse("0,1")));
@@ -593,8 +667,22 @@ test "writeRange: strings" {
     const e = try writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "ZZ" } }, &try parse("1"));
     try testing.expectEqualStrings("alpha", e.array.items.string.?[0].?);
     try testing.expectEqualStrings("ZZ", e.array.items.string.?[1].?);
-    try testing.expectError(error.WriteNotSupported, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("1,0")));
+    const part = try writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("1,0"));
+    try testing.expectEqualStrings("alpha", part.array.items.string.?[0].?);
+    try testing.expectEqualStrings("Zeta", part.array.items.string.?[1].?);
+    // one new String per selected element, each as wide as the byte range
+    const two = arrOf("string", @as(?[]const ?[]const u8, &.{ "XY", "VW" }));
+    const both = try writeRange(a.allocator(), strs, two, &try parse("0:1,1:2"));
+    try testing.expectEqualStrings("aXYha", both.array.items.string.?[0].?);
+    try testing.expectEqualStrings("bVWa", both.array.items.string.?[1].?);
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), strs, two, &try parse("0,1:2"))); // two strings for one element
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("0:1,1:2"))); // one for two
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "ZZZ" } }, &try parse("0,1:2"))); // wrong width
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), strs, arrOf("string", @as(?[]const ?[]const u8, &.{null})), &try parse("0,0")));
+    try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("1,4"))); // past the end of "beta"
+    try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("2,0"))); // no such element
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("1,0,0")));
+    try testing.expectError(error.TypeMismatch, writeRange(a.allocator(), strs, .{ .scalar = .{ .int32 = 1 } }, &try parse("1,0")));
 }
 
 test "Selection visits row-major, once each" {

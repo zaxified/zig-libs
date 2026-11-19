@@ -7896,7 +7896,7 @@ fn rangeWrite(rig: *TestRig, node: encoding.NodeId, text: []const u8, v: encodin
 
 fn rangeStatusAllowed(sc: encoding.StatusCode) bool {
     return sc == status.good or sc == status.bad_index_range_invalid or sc == status.bad_index_range_no_data or
-        sc == status.bad_type_mismatch or sc == status.bad_write_not_supported;
+        sc == status.bad_type_mismatch or sc == status.bad_index_range_data_mismatch;
 }
 
 pub fn fuzzRange(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
@@ -7958,7 +7958,7 @@ pub fn fuzzRange(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
                             try testing.expectEqual(status.bad_index_range_no_data, sc);
                             RangeMark.mark(.write_no_data);
                         } else if (count != t.hi - t.lo + 1) {
-                            try testing.expectEqual(status.bad_index_range_invalid, sc);
+                            try testing.expectEqual(status.bad_index_range_data_mismatch, sc);
                             RangeMark.mark(.write_count);
                         } else {
                             try testing.expectEqual(status.good, sc);
@@ -9634,8 +9634,8 @@ test "read/write: the attribute id is checked before the node, malformed index r
     const res = r.results.?;
     try testing.expectEqual(status.bad_attribute_id_invalid, res[0].status.?);
     try testing.expectEqual(status.bad_attribute_id_invalid, res[1].status.?);
-    // a syntactically valid range on a scalar Int32: nothing to select
-    try testing.expectEqual(status.bad_index_range_no_data, res[2].status.?);
+    // a range on a scalar Int32 is not used: the whole value comes back
+    try testing.expectEqual(@as(i32, 42), res[2].value.?.scalar.int32);
     try testing.expect(res[3].value != null);
     try testing.expect(res[4].value != null);
     try testing.expect(res[5].value != null);
@@ -9653,12 +9653,12 @@ test "read/write: the attribute id is checked before the node, malformed index r
     defer services.freeWriteResponse(gpa, w);
     try testing.expectEqual(status.bad_attribute_id_invalid, w.results.?[0]);
     try testing.expectEqual(status.bad_attribute_id_invalid, w.results.?[1]);
-    try testing.expectEqual(status.bad_index_range_no_data, w.results.?[2]);
+    // a ranged write to a scalar Int32 is a plain write: the range is not used
+    try testing.expectEqual(status.good, w.results.?[2]);
     try testing.expectEqual(status.bad_node_id_unknown, w.results.?[3]);
-    // the refused ranged write did not touch the value
     const back = try readNodes(&rig, reads[3..4]);
     defer services.freeReadResponse(gpa, back);
-    try testing.expectEqual(@as(i32, 42), back.results.?[0].value.?.scalar.int32);
+    try testing.expectEqual(@as(i32, 5), back.results.?[0].value.?.scalar.int32);
 }
 
 test "applyTimestamps: each TimestampsToReturn keeps and clears exactly its fields" {
@@ -11219,6 +11219,9 @@ test "NumericRange: Read applies the range to arrays, 2-D arrays and strings, wi
         readValueId(ghostNode(), val, "x", null), // 16 syntax is checked first
         readValueId(ids.arr, val, "", null), // 17 empty = whole value
         readValueId(ids.ro, val, "0", null), // 18 readable
+        readValueId(ids.names, val, "0:2,4", null), // 19 element 1 ("beta") has no byte 4: a null element
+        readValueId(ids.names, val, "0:2,5", null), // 20 no element has a byte 5
+        readValueId(ids.text, services.attribute_id.node_id, "5", null), // 21 not the Value: NoData (open62541), whatever the attribute holds
     };
     const r = try readNodes(&rig, &reads);
     defer services.freeReadResponse(gpa, r);
@@ -11244,6 +11247,11 @@ test "NumericRange: Read applies the range to arrays, 2-D arrays and strings, wi
     try testing.expectEqual(status.bad_index_range_invalid, res[16].status.?);
     try testing.expectEqual(@as(usize, 5), res[17].value.?.array.items.int32.?.len);
     try testing.expectEqual(@as(i32, 1), res[18].value.?.array.items.int32.?[0]);
+    try testing.expectEqualStrings("a", res[19].value.?.array.items.string.?[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), res[19].value.?.array.items.string.?[1]);
+    try testing.expectEqualStrings("a", res[19].value.?.array.items.string.?[2].?);
+    try testing.expectEqual(status.bad_index_range_no_data, res[20].status.?);
+    try testing.expectEqual(status.bad_index_range_no_data, res[21].status.?);
 }
 
 fn ghostNode() encoding.NodeId {
@@ -11285,19 +11293,19 @@ test "NumericRange: Write replaces exactly the selected elements; every refusal 
     try testing.expectEqual(status.good, res[0]);
     try testing.expectEqual(status.good, res[1]);
     try testing.expectEqual(status.bad_index_range_no_data, res[2]);
-    try testing.expectEqual(status.bad_index_range_invalid, res[3]);
+    try testing.expectEqual(status.bad_index_range_data_mismatch, res[3]);
     try testing.expectEqual(status.bad_type_mismatch, res[4]);
     try testing.expectEqual(status.bad_index_range_invalid, res[5]);
     try testing.expectEqual(status.bad_index_range_no_data, res[6]);
     try testing.expectEqual(status.bad_type_mismatch, res[7]);
     try testing.expectEqual(status.bad_not_writable, res[8]);
-    try testing.expectEqual(status.bad_index_range_no_data, res[9]);
+    try testing.expectEqual(status.bad_not_writable, res[9]); // not the Value: the range is not used, DisplayName is read-only here
     try testing.expectEqual(status.bad_node_id_unknown, res[10]);
     try testing.expectEqual(status.good, res[11]);
     try testing.expectEqual(status.good, res[12]);
-    try testing.expectEqual(status.bad_index_range_invalid, res[13]);
+    try testing.expectEqual(status.bad_index_range_data_mismatch, res[13]);
     try testing.expectEqual(status.good, res[14]);
-    try testing.expectEqual(status.bad_write_not_supported, res[15]);
+    try testing.expectEqual(status.good, res[15]); // the first byte of one String element
 
     const reads = [_]services.ReadValueId{
         readValueId(ids.arr, val, null, null),
@@ -11313,7 +11321,7 @@ test "NumericRange: Write replaces exactly the selected elements; every refusal 
     try testing.expectEqualSlices(i32, &.{ 3, 4 }, got[1].value.?.array.dimensions.?);
     try testing.expectEqualStrings("aXYdef", got[2].value.?.scalar.string.?);
     try testing.expectEqualStrings("alpha", got[3].value.?.array.items.string.?[0].?);
-    try testing.expectEqualStrings("delta", got[3].value.?.array.items.string.?[2].?);
+    try testing.expectEqualStrings("Delta", got[3].value.?.array.items.string.?[2].?);
 }
 
 test "NumericRange: a Range built by the client formats to what the server parses" {

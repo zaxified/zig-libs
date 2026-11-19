@@ -940,12 +940,14 @@ pub const NodeStore = struct {
     }
 
     /// Write part of an attribute's value: the Write service with a non-empty
-    /// `IndexRange` (OPC 10000-4 §5.10.4, NumericRange §7.27 — see
-    /// `numeric_range.zig` for the exact rules). Only the Value of a Variable
-    /// holding an array (or a String/ByteString/XmlElement) can take a range;
-    /// everything else is `BadIndexRangeNoData`. The range syntax is checked
-    /// first (`BadIndexRangeInvalid`), then the node and its access levels
-    /// exactly as `writeAttribute` does.
+    /// `IndexRange` (OPC 10000-4 §5.11.4, NumericRange §7.27 — see
+    /// `numeric_range.zig` for the exact rules). The syntax is checked first
+    /// (`BadIndexRangeInvalid`). A range then applies only to the Value of a
+    /// Variable that holds an array or a String/ByteString/XmlElement; for any
+    /// other attribute and for any other scalar it is not used (§5.11.4: "not
+    /// used if the specified Attribute is not an array"; open62541 ignores it
+    /// on non-Value attributes too) and this is a plain `writeAttribute`. The
+    /// node and its access levels are judged exactly as `writeAttribute` does.
     pub fn writeAttributeRange(
         s: *NodeStore,
         node_id: encoding.NodeId,
@@ -957,11 +959,12 @@ pub const NodeStore = struct {
         if (index_range.len == 0) return s.writeAttribute(node_id, attribute, value, now);
         const range = numeric_range.parse(index_range) catch return status.bad_index_range_invalid;
         const node = s.nodes.getPtr(node_id) orelse return status.bad_node_id_unknown;
-        const probe = readNodeAttribute(node, attribute);
-        if (probe.status == status.bad_attribute_id_invalid) return status.bad_attribute_id_invalid;
-        if (attribute != services.attribute_id.value) return status.bad_index_range_no_data;
+        if (attribute != services.attribute_id.value) return s.writeAttribute(node_id, attribute, value, now);
         switch (node.attributes) {
             .variable => |*v| {
+                if (v.value.value) |st| {
+                    if (!numeric_range.takesRange(st)) return s.writeAttribute(node_id, attribute, value, now);
+                }
                 if (v.access_level & access_level.current_write == 0) return status.bad_not_writable;
                 if (v.user_access_level & access_level.current_write == 0) return status.bad_user_access_denied;
                 const incoming = value.value orelse return status.bad_type_mismatch;
@@ -973,7 +976,7 @@ pub const NodeStore = struct {
                     error.IndexRangeInvalid => return status.bad_index_range_invalid,
                     error.IndexRangeNoData => return status.bad_index_range_no_data,
                     error.TypeMismatch => return status.bad_type_mismatch,
-                    error.WriteNotSupported => return status.bad_write_not_supported,
+                    error.IndexRangeDataMismatch => return status.bad_index_range_data_mismatch,
                 };
                 const copy = try dupVariant(s.allocator, merged);
                 encoding.freeDataValue(s.allocator, v.value);
@@ -985,7 +988,7 @@ pub const NodeStore = struct {
                 };
                 return 0;
             },
-            else => return status.bad_not_writable,
+            else => return s.writeAttribute(node_id, attribute, value, now),
         }
     }
 

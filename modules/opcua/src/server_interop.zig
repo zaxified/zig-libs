@@ -1140,7 +1140,7 @@ test "LIVE loopback: this module's own client drives this module's own server ov
     defer encoding.freeDataValue(gpa, past);
     try testing.expectEqual(services.status.bad_index_range_no_data, past.status.?);
     try testing.expectEqual(services.status.bad_index_range_no_data, try session.writeValueRange(array_node, try root.numeric_range.parse("4:5"), .{ .array = .{ .items = .{ .int32 = &.{ 1, 2 } } } }));
-    try testing.expectEqual(services.status.bad_index_range_invalid, try session.writeValueRange(array_node, slice, .{ .array = .{ .items = .{ .int32 = &.{1} } } }));
+    try testing.expectEqual(services.status.bad_index_range_data_mismatch, try session.writeValueRange(array_node, slice, .{ .array = .{ .items = .{ .int32 = &.{1} } } }));
 
     // Call the method.
     const inputs = [_]encoding.Variant{.{ .scalar = .{ .string = "hello" } }};
