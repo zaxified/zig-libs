@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **New:** `Csrf.validate()` dry-runs the token cookie once and returns `error.InvalidCookieOptions` for a `cookie_name` a `Set-Cookie` may not carry, a name too long for the 256-byte line, or `same_site = .none` without `secure`; `Csrf.issue` is unchanged (best-effort, fails closed) but its doc now points at it. Closes the no-panic sweep 2026-10-28 item "`Csrf.issue` drops its cookie silently": `Csrf` has no `init`, so this is the opt-in check, as `Manager.init` does for its own cookie (Django checks cookie settings at startup the same way). Tests: accepted/refused options, name-length boundary, agreement with what `issue` emits.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** Backlog "skip the save of an unchanged session" closed as matching the reference (scs commits every loaded session when its idle timeout is on); no knob added. The README says that a `KvStore` pays one fsync for the `last_seen` roll of an unchanged session too.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).

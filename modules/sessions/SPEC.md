@@ -353,7 +353,7 @@ bump (the stale `persist` would succeed); `hash_id_in_store…RamcacheStore` if 
 
 ## Backlog / deferred
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed):** `Csrf.issue` drops its cookie silently on options `SetCookie.bufPrint` refuses, as `Manager` did before `init` checked them (Csrf has no init to check in); a stored record whose `created`/`last_seen` lies in the future never expires (only an attacker-writable store); `KvStore.iterate` lists every key in memory.
+- **No-panic sweep 2026-10-28 (LOW, not fixed):** ~~`Csrf.issue` drops its cookie silently on options `SetCookie.bufPrint` refuses~~ **DONE 2026-11-19**: `Csrf.validate()` is the startup check (Csrf has no `init`; `issue` stays best-effort and fails closed); a stored record whose `created`/`last_seen` lies in the future never expires (only an attacker-writable store); `KvStore.iterate` lists every key in memory.
 
 - **ct, not measured (2026-10-09 ct review):** a session is looked up by its secret id through the
   store (`m.store.get`, `root.zig` ~703 → ramcache `getImpl` / kv `KvStore.key`): hashing and

@@ -190,12 +190,10 @@ pub const Csrf = struct {
         return .{ .state = @constCast(c), .run = middlewareRun };
     }
 
-    /// Set a fresh token cookie on the response for `session_id` (JS-readable).
-    /// Best-effort (skipped if the head is already on the wire). Exposed so an
-    /// app can issue a token from a handler explicitly.
-    pub fn issue(c: *const Csrf, res: *http.Server.ResponseWriter, session_id: []const u8) void {
-        var hexbuf: [token_hex_len]u8 = undefined;
-        const tok = c.token(session_id, &hexbuf);
+    /// The token cookie's `Set-Cookie` line is formatted into a buffer this long.
+    const cookie_line_max = 256;
+
+    fn cookieLine(c: *const Csrf, tok: []const u8, buf: *[cookie_line_max]u8) cookies.WriteError![]const u8 {
         const sc: cookies.SetCookie = .{
             .name = c.cookie_name,
             .value = tok,
@@ -204,10 +202,33 @@ pub const Csrf = struct {
             .http_only = false, // the client's JS must read it to echo it
             .same_site = c.same_site,
         };
+        return sc.bufPrint(buf);
+    }
+
+    /// Dry-run the token cookie once: `error.InvalidCookieOptions` if
+    /// `cookie_name` holds a byte a `Set-Cookie` may not carry, the name is
+    /// too long for the 256-byte line, or `same_site = .none` is set without
+    /// `secure`. `issue` is best-effort and returns nothing, so such options
+    /// would otherwise drop every token cookie at request time and refuse
+    /// every guarded request; call this once at startup, as `Manager.init`
+    /// does for its own cookie. Pure; reads only the cookie options.
+    pub fn validate(c: *const Csrf) error{InvalidCookieOptions}!void {
+        const probe_tok: [token_hex_len]u8 = @splat('0');
+        var buf: [cookie_line_max]u8 = undefined;
+        _ = c.cookieLine(&probe_tok, &buf) catch return error.InvalidCookieOptions;
+    }
+
+    /// Set a fresh token cookie on the response for `session_id` (JS-readable).
+    /// Best-effort (skipped if the head is already on the wire, or if the
+    /// cookie options are invalid: see `validate`). Exposed so an
+    /// app can issue a token from a handler explicitly.
+    pub fn issue(c: *const Csrf, res: *http.Server.ResponseWriter, session_id: []const u8) void {
+        var hexbuf: [token_hex_len]u8 = undefined;
+        const tok = c.token(session_id, &hexbuf);
         // addSetCookie copies the bytes into the writer's own header_buf
         // before returning, so this local only has to outlive the call.
-        var cookie_buf: [256]u8 = undefined;
-        const v = sc.bufPrint(&cookie_buf) catch return;
+        var cookie_buf: [cookie_line_max]u8 = undefined;
+        const v = c.cookieLine(tok, &cookie_buf) catch return;
         // Best-effort across the whole of `SetHeaderError` (which now also
         // carries `HeaderBytesExhausted`), and it fails CLOSED: with no token
         // cookie the client cannot echo a token, so the guarded methods are
@@ -749,5 +770,41 @@ test "Csrf.presented: a bare parameter name, a name with a prefix, and parameter
         const req = try std.mem.print(&req_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{cs.target});
         var out: [4096]u8 = undefined;
         try testing.expect(std.mem.endsWith(u8, runWire(&r, req, &out), cs.want));
+    }
+}
+
+test "Csrf.validate: accepts the defaults, refuses options the token cookie cannot be written with" {
+    try (Csrf{ .key = @splat(0x34) }).validate();
+    try (Csrf{ .key = @splat(0x34), .same_site = .none, .secure = true }).validate();
+    try (Csrf{ .key = @splat(0x34), .cookie_name = "__Host-csrf" }).validate();
+    // A byte a Set-Cookie name may not carry.
+    try testing.expectError(error.InvalidCookieOptions, (Csrf{ .key = @splat(0x34), .cookie_name = "a b" }).validate());
+    try testing.expectError(error.InvalidCookieOptions, (Csrf{ .key = @splat(0x34), .cookie_name = "a;b" }).validate());
+    // SameSite=None needs Secure.
+    try testing.expectError(error.InvalidCookieOptions, (Csrf{ .key = @splat(0x34), .same_site = .none, .secure = false }).validate());
+    // A name too long for the 256-byte line (the 64-hex-digit token and the
+    // attributes take the rest): the longest name that fits, then one more.
+    var name: [256]u8 = @splat('n');
+    var fit: usize = 0;
+    while (fit < name.len) : (fit += 1) {
+        (Csrf{ .key = @splat(0x34), .cookie_name = name[0 .. fit + 1] }).validate() catch break;
+    }
+    try testing.expect(fit > 100 and fit < 192);
+    try (Csrf{ .key = @splat(0x34), .cookie_name = name[0..fit] }).validate();
+    try testing.expectError(error.InvalidCookieOptions, (Csrf{ .key = @splat(0x34), .cookie_name = name[0 .. fit + 1] }).validate());
+}
+
+test "Csrf.validate agrees with issue: options it accepts yield a Set-Cookie, options it refuses yield none" {
+    const good = Csrf{ .key = @splat(0x35), .cookie_name = "xsrf" };
+    const bad = Csrf{ .key = @splat(0x35), .cookie_name = "x srf" };
+    try good.validate();
+    try testing.expectError(error.InvalidCookieOptions, bad.validate());
+    for ([_]*const Csrf{ &good, &bad }) |c| {
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try makeRouter(&r, c);
+        var out: [4096]u8 = undefined;
+        const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session=abc\r\nConnection: close\r\n\r\n", &out);
+        try testing.expectEqual(c == &good, headerValue(got, "Set-Cookie") != null);
     }
 }
