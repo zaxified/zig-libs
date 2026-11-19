@@ -483,8 +483,9 @@ HEADERS frame is materialized into it once the body ends.
   request line → 414; oversized body → 413; unsupported HTTP version →
   505; missing Host on 1.1 → 400 (not for CONNECT, as Go);
   `Transfer-Encoding` without chunked → 400 (Go answers 501 here);
-  handler error → 500 when nothing was sent, otherwise the connection dies
-  mid-response. `Expect: 100-continue` is acknowledged on the handler's first body read
+  handler error → 500 when nothing was sent (413 when a body cap was the cause, 400 when
+  the request body's framing was broken; `Request.bodyOverCap` reports the 413 case),
+  otherwise the connection dies mid-response. `Expect: 100-continue` is acknowledged on the handler's first body read
   (`Request.reader`); a handler that answers without reading never invites
   the body, and the response then closes the connection. Absolute-
   form request targets are rejected (origin-form + `*` only).

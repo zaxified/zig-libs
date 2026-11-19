@@ -2843,6 +2843,13 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
             return respondError(opts, out, date, 413);
         if (decode_gzip and gunzip_body.exceeded)
             return respondError(opts, out, date, 413);
+        // A body whose FRAMING failed (a refused chunk line, a trailer
+        // section past its cap, a body cut short of its Content-Length or
+        // chunk) is the client's fault too: 400, as nginx answers a
+        // malformed chunked body. The decoder's failure is final and the
+        // connection closes either way.
+        if (bodyFramingFailed(&body))
+            return respondError(opts, out, date, 400);
         // `sent_head` was checked above, so this cannot fail; handled rather
         // than asserted so the guard survives ReleaseFast.
         fireError(opts.on_error, opts.on_error_ctx, .handler_failed, err, 500, opts.peer);
@@ -2911,6 +2918,17 @@ noinline fn requestEncodingOf(head: *const h1.RequestHead) gzip.RequestEncoding 
         if (lines > 1) return .unsupported;
     }
     return gzip.requestContentEncoding(first);
+}
+
+/// Did the request body's framing decoder refuse the wire bytes? Out of line:
+/// the serving frame is budgeted (`frame_probe`).
+noinline fn bodyFramingFailed(body: *const RequestBody) bool {
+    return switch (body.*) {
+        .chunked => |*c| c.fail_reason != null,
+        .capped => |*c| c.inner.fail_reason != null,
+        .limited => |*l| l.truncated,
+        .none, .external => false,
+    };
 }
 
 fn respondError(opts: StreamOptions, out: *Writer, date: ?[]const u8, status: u16) ConnDisposition {
@@ -6110,7 +6128,7 @@ test "serveStream: a bare LF cannot stand in for the head-terminating CRLF and s
 
 test "serveStream: a chunked body the decoder refused is not resumed by the drain, no request rides behind it (O1-1, O1-2)" {
     // `/echo` `try`s its body read, so a refused chunk makes it fail and the
-    // loop answers 500 -- and then drained the body for keep-alive. The drain
+    // loop answers 400 (500 before 2026-11-19) -- and then drained the body for keep-alive. The drain
     // resumed the decoder behind the refused line (`40 `), decoded the `0`
     // a front end saw as chunk data, and served `/hello` behind it. The
     // second wire ends its trailer section on a bare LF line, which a
@@ -6125,7 +6143,7 @@ test "serveStream: a chunked body the decoder refused is not resumed by the drai
             var hits: Hits = .init(0);
             var out_buf: [4096]u8 = undefined;
             const got = runStreamWith(.{ .max_body_bytes = cap }, &hits, wire, &out_buf);
-            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 Internal Server Error\r\n"));
+            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
             try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "HTTP/1.1"));
             try testing.expect(std.mem.find(u8, got, "hello") == null);
             try testing.expectEqual(@as(u32, 1), hits.load(.monotonic));
@@ -6159,6 +6177,37 @@ test "serveStream: protocol rejections (505, 400s, 431)" {
     try testing.expect(std.mem.find(u8, runStream(null, "POST /echo HTTP/1.0\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", &out_buf), "100 Continue") == null);
     const long_head = "GET / HTTP/1.1\r\nHost: t\r\nX-Big: " ++ (strRepeat("a", 2000)) ++ "\r\n\r\n";
     try testing.expect(std.mem.startsWith(u8, runStream(null, long_head, &out_buf), "HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+}
+
+test "serveStream: a body whose framing failed is the client's fault: 400, not 500; a handler's own failure stays 500" {
+    const wires = [_][]const u8{
+        // Content-Length cut short by the end of the stream.
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc",
+        // A chunk cut short, and a chunked body that just ends.
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabc",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+        // A refused chunk size and a missing CRLF after the chunk data.
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n",
+        // A trailer section past its cap (one line of 33 KiB).
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: " ++ strRepeat("a", 33 * 1024) ++ "\r\n\r\n",
+    };
+    for (wires) |wire| {
+        for ([_]?u64{ null, 1024 }) |cap| { // plain chunked and `Capped`
+            if (cap != null and std.mem.find(u8, wire, "chunked") == null) continue;
+            var out_buf: [4096]u8 = undefined;
+            const got = runStreamWith(.{ .max_body_bytes = cap }, null, wire, &out_buf);
+            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
+            try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
+        }
+    }
+    // Negative controls: the same bodies, well framed, are served; a handler
+    // that fails over a well-framed body is a 500.
+    var out_buf: [4096]u8 = undefined;
+    var got = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    got = runStream(null, "POST /overcap?x HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
 }
 
 test "serveStream: handler error → clean 500, keep-alive survives" {

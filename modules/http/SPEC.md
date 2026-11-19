@@ -518,7 +518,7 @@ directly-exposed parser.
   BYO reader without a timeout). Sequential mode returns at once. Fix: the worker shuts the socket
   down (`shutdown(RD)` or a cancel of the read) — the connection owns the socket, so this needs an
   ownership seam (a "wake" callback in the Dispatcher contract). No memory-safety effect.
-- **A body framing failure answers 400, not 500** *(audit 2026-10-19 O1, owner decision
+- **DONE 2026-11-19 — a body framing failure answers 400** (`bodyFramingFailed`: `ChunkedReader.fail_reason` set, or `ContentLengthReader.truncated`; checked after the 413 cases; nginx is the reference, Go leaves the status to the handler). Was: **A body framing failure answers 400, not 500** *(audit 2026-10-19 O1, owner decision
   2026-10-20: FIX — nginx answers 400 for a malformed chunked body; Go leaves the status to the
   handler)*. Since O1-1 a refused chunk line is final and the connection closes, but the status is
   the generic 500 for a handler error. Fix: when a handler fails while the request body reader
