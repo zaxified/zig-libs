@@ -5875,16 +5875,26 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
     // and a `literal` allow are stated as ONE `enum` that lists null too (the
     // type array alone would let `enum`/`const` refuse it): `one_of`, kept to
     // the literal when both are set.
-    const literal: ?[]const u8 = if (r.pattern) |p| (if (p == .literal) p.literal else null) else null;
+    //
+    // A `bool`, `array` or `object` rule ignores the string constraints in
+    // `checkRule`, and an `int`/`float` rule ignores the string patterns, so
+    // an `enum`/`const` for them would refuse what the module accepts; they
+    // are left out (the 2026-11-05 backlog item, same class for `one_of` and
+    // `none_of` on `bool`/`array`/`object`).
+    const strings_apply = r.kind == .string or r.kind == .any;
+    const literal: ?[]const u8 = if (strings_apply) (if (r.pattern) |p| (if (p == .literal) p.literal else null) else null) else null;
     // On an `.int`/`.float` rule the entries are numbers (`oneOfNumber`) and
     // are written as such; one that is not a JSON number matches nothing and
     // is left out.
     const numeric = r.kind == .int or r.kind == .float;
+    const lists_apply = strings_apply or numeric;
     // No 2020-12 keyword folds case: the lists go out as annotations, so a
     // schema validator is looser there, never stricter, as for the byte bounds.
     const folded = r.ignore_case and !numeric;
-    const one_of: ?[]const []const u8 = if (folded) null else r.one_of;
-    if (folded) {
+    const one_of: ?[]const []const u8 = if (folded or !lists_apply) null else r.one_of;
+    if (!lists_apply) {
+        // Nothing to state: the module ignores both lists on this kind.
+    } else if (folded) {
         if (r.one_of) |allowed| {
             try s.objectField("x-oneOfIgnoreCase");
             try s.write(allowed);
@@ -5925,21 +5935,23 @@ fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
     // A negated pattern needs `not`, which `none_of` may hold, and `patterns`
     // may repeat any keyword: those go out one `allOf` item each.
     const negated_alone = if (r.pattern) |p| patternIsNegated(p) else false;
-    if (r.pattern) |p| if (!negated_alone) {
+    if (r.pattern) |p| if (!negated_alone and exportsPattern(p, strings_apply)) {
         // Stated by the `enum` above under `allow_null`.
         if (!(p == .literal and r.allow_null)) try writePatternMembers(s, p, false);
     };
     // `fields` may write an `allOf` of its own for the presence ops: it moves
     // into an item here, or the object would hold the key twice and half the
     // constraints would be gone for most parsers.
-    const has_all_of = negated_alone or r.patterns.len != 0;
+    var extra_patterns = false;
+    for (r.patterns) |p| extra_patterns = extra_patterns or exportsPattern(p, strings_apply);
+    const has_all_of = negated_alone or extra_patterns;
     const fields_may_write = r.kind == .object or r.kind == .any;
     const fields_in_item = has_all_of and fields_may_write and r.fields != null and fieldsWriteAllOf(r.fields.?);
     if (has_all_of) {
         try s.objectField("allOf");
         try s.beginArray();
         if (negated_alone) try writePatternItem(s, r.pattern.?, r.allow_null);
-        for (r.patterns) |p| try writePatternItem(s, p, r.allow_null);
+        for (r.patterns) |p| if (exportsPattern(p, strings_apply)) try writePatternItem(s, p, r.allow_null);
         if (fields_in_item) {
             try s.beginObject();
             try writeFieldsMembers(e, r.fields.?);
@@ -6020,6 +6032,13 @@ fn writeOmittingSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
     try writeRuleSchema(e, &inner);
     try s.endArray();
     try endObjectWithDefs(e);
+}
+
+/// A `literal` is `const`, which refuses every other JSON type: stated only
+/// where the module itself refuses them (`.string`, `.any`). Every other
+/// pattern is a `pattern`/`not` over strings and says nothing to a non-string.
+fn exportsPattern(p: Pattern, strings_apply: bool) bool {
+    return strings_apply or p != .literal;
 }
 
 fn patternIsNegated(p: Pattern) bool {
@@ -10827,6 +10846,55 @@ fn expectExportHas(rules: []const Rule, needle: []const u8) !void {
         std.debug.print("\nexport lacks: {s}\nexport is:    {s}\n", .{ needle, aw.written() });
         return error.TestExpectedEqual;
     }
+}
+
+fn expectExportLacks(rules: []const Rule, needle: []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeJsonSchema(rules, &aw.writer);
+    if (std.mem.find(u8, aw.written(), needle) != null) {
+        std.debug.print("\nexport has: {s}\nexport is:  {s}\n", .{ needle, aw.written() });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "export: string lists and a literal pattern are stated only where the module enforces them (exportsPattern, lists_apply)" {
+    // The module ignores them on these kinds, so `const`/`enum` would refuse what it accepts.
+    const lit: Pattern = .{ .literal = "x" };
+    const ignored = [_]Kind{ .bool, .array, .object, .int, .float };
+    inline for (ignored) |k| {
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .pattern = lit }}, "\"const\"");
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .pattern = lit, .allow_null = true }}, "\"enum\"");
+        // `patterns` alone must not leave an empty `allOf` (invalid in 2020-12).
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .patterns = &.{lit} }}, "allOf");
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .patterns = &.{lit} }}, "\"const\"");
+    }
+    const bare = [_]Kind{ .bool, .array, .object };
+    inline for (bare) |k| {
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .one_of = &.{"a"} }}, "\"enum\"");
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .one_of = &.{"a"}, .allow_null = true }}, "\"enum\"");
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .none_of = &.{"a"} }}, "\"not\"");
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .one_of = &.{"a"}, .ignore_case = true }}, "x-oneOfIgnoreCase");
+        try expectExportLacks(&.{.{ .field = "f", .kind = k, .none_of = &.{"a"}, .ignore_case = true }}, "x-noneOfIgnoreCase");
+    }
+    // Kept where they are enforced.
+    try expectExportHas(&.{.{ .field = "f", .kind = .string, .pattern = lit }}, "\"const\":\"x\"");
+    try expectExportHas(&.{.{ .field = "f", .kind = .any, .pattern = lit }}, "\"const\":\"x\"");
+    try expectExportHas(&.{.{ .field = "f", .kind = .string, .patterns = &.{lit} }}, "\"allOf\":[{\"const\":\"x\"}]");
+    try expectExportHas(&.{.{ .field = "f", .kind = .string, .one_of = &.{"a"} }}, "\"enum\":[\"a\"]");
+    try expectExportHas(&.{.{ .field = "f", .kind = .int, .one_of = &.{"5"} }}, "\"enum\":[5]");
+    try expectExportHas(&.{.{ .field = "f", .kind = .int, .none_of = &.{"5"} }}, "\"not\":{\"enum\":[5]}");
+    // A non-literal pattern is a string keyword, harmless on any kind, and stays.
+    try expectExportHas(&.{.{ .field = "f", .kind = .int, .pattern = .{ .prefix = "a" } }}, "\"pattern\"");
+    try expectExportHas(&.{.{ .field = "f", .kind = .int, .pattern = lit, .patterns = &.{.{ .prefix = "a" }} }}, "\"allOf\":[{\"pattern\"");
+    // And the module really accepts those values (the exported schema must not be stricter).
+    var rep = try validateJson(testing.allocator, "{\"i\":5,\"b\":true,\"o\":{}}", &.{
+        .{ .field = "i", .kind = .int, .pattern = lit },
+        .{ .field = "b", .kind = .bool, .one_of = &.{"a"} },
+        .{ .field = "o", .kind = .object, .none_of = &.{"a"} },
+    });
+    defer rep.deinit();
+    try testing.expectEqual(@as(usize, 0), rep.errors.len);
 }
 
 test "export: a charset escapes '[' and ']' inside the class, and the end of text is the lookahead (writeRegex)" {
