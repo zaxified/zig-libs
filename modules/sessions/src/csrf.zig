@@ -789,7 +789,9 @@ test "Csrf.validate: accepts the defaults, refuses options the token cookie cann
     while (fit < name.len) : (fit += 1) {
         (Csrf{ .key = @splat(0x34), .cookie_name = name[0 .. fit + 1] }).validate() catch break;
     }
-    try testing.expect(fit > 100 and fit < 192);
+    // The line is `name=<64 hex>; Path=/; Secure; SameSite=Lax`: the cap is exactly the buffer.
+    const overhead = "=".len + token_hex_len + "; Path=/; Secure; SameSite=Lax".len;
+    try testing.expectEqual(Csrf.cookie_line_max, fit + overhead);
     try (Csrf{ .key = @splat(0x34), .cookie_name = name[0..fit] }).validate();
     try testing.expectError(error.InvalidCookieOptions, (Csrf{ .key = @splat(0x34), .cookie_name = name[0 .. fit + 1] }).validate());
 }
