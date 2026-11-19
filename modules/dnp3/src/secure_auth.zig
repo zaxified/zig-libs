@@ -577,7 +577,7 @@ fn authResponse(seq: u4, iin: Iin, variation: sa.ObjectVariation, data: []const 
 
 // ── tests ───────────────────────────────────────────────────────────────────
 //
-// No live peer with Secure Authentication exists (modern opendnp3 dropped
+// Recipe: tools/sa_outstation_kat.py. No live peer with Secure Authentication exists (modern opendnp3 dropped
 // SA), so the first test pins a whole exchange against vectors derived by
 // hand OUTSIDE this module: Python's `hmac`/`hashlib` for every MAC and the
 // `cryptography` package's RFC 3394 key wrap for the g120v6 payload, over the
