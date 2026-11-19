@@ -667,3 +667,154 @@ pub const StreamWriter = struct {
         return n + last.len * splat;
     }
 };
+
+// ── unit tests of the table-coding step ─────────────────────────────────
+
+/// Runs `sendMtfValues` on `n_mtf` symbols over the alphabet {RUNA, RUNB, 2, EOB = 3}
+/// (bytes 0 and 1 in use), the symbols taken from `pick(i)`, and returns the bytes written.
+fn sendSynthetic(gpa: std.mem.Allocator, n_mtf: u32, n_in_use: u32, comptime pick: fn (u32, u32) u32) ![]u8 {
+    var out: Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    var e = try Encoder.init(gpa, &out.writer, .{});
+    defer e.deinit();
+    for (0..n_in_use) |i| e.in_use[i] = true;
+    const alpha: u32 = n_in_use + 2;
+    e.arr1 = try gpa.alloc(u32, n_mtf / 2 + 2);
+    const mv = e.mtfv();
+    @memset(e.coding.mtf_freq[0..max_alpha], 0);
+    for (0..n_mtf) |i| {
+        const s = pick(@intCast(i), alpha);
+        mv[i] = @intCast(s);
+        e.coding.mtf_freq[s] += 1;
+    }
+    try e.sendMtfValues(n_mtf);
+    try e.bsFinish();
+    try e.flushObuf();
+    return out.toOwnedSlice();
+}
+
+fn cyc(i: u32, alpha: u32) u32 {
+    return i % alpha;
+}
+
+test "sendMtfValues uses 2, 3, 4, 5 or 6 tables below 200, 600, 1200, 2400 symbols" {
+    const gpa = std.testing.allocator;
+    const cases = [_][2]u32{
+        .{ 1, 2 },    .{ 199, 2 },  .{ 200, 3 },  .{ 599, 3 },  .{ 600, 4 },
+        .{ 1199, 4 }, .{ 1200, 5 }, .{ 2399, 5 }, .{ 2400, 6 }, .{ 5000, 6 },
+    };
+    for (cases) |c| {
+        const z = try sendSynthetic(gpa, c[0], 2, cyc);
+        defer gpa.free(z);
+        // 16 group flags + one group's 16 byte flags, then the 3-bit table count.
+        try std.testing.expectEqual(@as(u8, @intCast(c[1])), z[4] >> 5);
+        // The 15-bit selector count follows: one per 50 symbols.
+        const nsel: u32 = (@as(u32, z[4] & 0x1f) << 10) | (@as(u32, z[5]) << 2) | (z[6] >> 6);
+        try std.testing.expectEqual((c[0] + 49) / 50, nsel);
+    }
+}
+
+test "bsFinish flushes a full output buffer before it adds the last partial byte" {
+    const gpa = std.testing.allocator;
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var e = try Encoder.init(gpa, &out.writer, .{});
+    defer e.deinit();
+    @memset(&e.obuf, 0x5a);
+    e.olen = e.obuf.len;
+    e.bs_buff = 0b10110;
+    e.bs_live = 5;
+    try e.bsFinish();
+    try e.flushObuf();
+    const w = out.written();
+    try std.testing.expectEqual(@as(usize, e.obuf.len + 1), w.len);
+    try std.testing.expectEqual(@as(u8, 0x5a), w[e.obuf.len - 1]);
+    try std.testing.expectEqual(@as(u8, 0b10110_000), w[e.obuf.len]);
+}
+
+test "sendMtfValues limits the code lengths to 17 bits where the plain tree is deeper" {
+    const gpa = std.testing.allocator;
+    // Symbol frequencies 1, 1, 2, 3, 5, ... (Fibonacci) over 20 symbols: the
+    // unlimited Huffman tree is 19 deep. The symbols are shuffled so that every
+    // group of 50 sees the whole distribution.
+    const n_sym = 20;
+    const fib = comptime blk: {
+        var f: [n_sym]u32 = undefined;
+        f[0] = 1;
+        f[1] = 1;
+        for (2..n_sym) |i| f[i] = f[i - 1] + f[i - 2];
+        break :blk f;
+    };
+    const total = comptime blk: {
+        var t: u32 = 0;
+        for (fib) |x| t += x;
+        break :blk t;
+    };
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var e = try Encoder.init(gpa, &out.writer, .{});
+    defer e.deinit();
+    for (0..n_sym - 2) |i| e.in_use[i] = true;
+    e.arr1 = try gpa.alloc(u32, total / 2 + 2);
+    const mv = e.mtfv();
+    @memset(e.coding.mtf_freq[0..max_alpha], 0);
+    // Slot i of a shuffled order gets the symbol that owns position (i * 7919) mod total.
+    for (0..total) |i| {
+        var pos: u32 = @intCast((i * 7919) % total);
+        var s: u32 = 0;
+        while (pos >= fib[s]) : (s += 1) pos -= fib[s];
+        mv[i] = @intCast(s);
+        e.coding.mtf_freq[s] += 1;
+    }
+    try e.sendMtfValues(total);
+    var deepest_plain: u8 = 0;
+    for (0..6) |t| {
+        var plain: [max_alpha]u8 = undefined;
+        huffman.makeCodeLengths(&plain, &e.coding.rfreq[t], n_sym, 60);
+        for (plain[0..n_sym]) |l| deepest_plain = @max(deepest_plain, l);
+        for (e.coding.len[t][0..n_sym]) |l| try std.testing.expect(l >= 1 and l <= huffman.encode_max_len);
+    }
+    // The precondition: without the limit some table would have gone deeper.
+    try std.testing.expect(deepest_plain > huffman.encode_max_len);
+}
+
+test "init: the work factor defaults to 30 for 0, the block limit is 100 000 per level minus 19" {
+    const gpa = std.testing.allocator;
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    for ([_]struct { wf: u8, want: u32 }{ .{ .wf = 0, .want = 30 }, .{ .wf = 1, .want = 1 }, .{ .wf = 30, .want = 30 }, .{ .wf = 255, .want = 255 } }) |c| {
+        var e = try Encoder.init(gpa, &out.writer, .{ .level = 1, .work_factor = c.wf });
+        defer e.deinit();
+        try std.testing.expectEqual(c.want, e.work_factor);
+    }
+    for (1..10) |level| {
+        var e = try Encoder.init(gpa, &out.writer, .{ .level = @intCast(level) });
+        defer e.deinit();
+        try std.testing.expectEqual(@as(u32, @intCast(level * 100_000 - 19)), e.nblock_max);
+    }
+}
+
+test "growing the sort tables on a reused encoder frees the old ones, and survives a failed allocation" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(7);
+    const small = try gpa.alloc(u8, 3000);
+    defer gpa.free(small);
+    const big = try gpa.alloc(u8, 60_000);
+    defer gpa.free(big);
+    prng.random().bytes(small);
+    prng.random().bytes(big);
+    for (0..40) |fail_at| {
+        var fa = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        var out: Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var e = Encoder.init(fa.allocator(), &out.writer, .{ .level = 1 }) catch continue;
+        defer e.deinit();
+        // Small block: the arrays are sized for it; the second stream's block is
+        // larger, so arr1 and ftab are freed and allocated again.
+        e.write(small) catch continue;
+        e.finish() catch continue;
+        e.reset(&out.writer);
+        e.write(big) catch continue;
+        e.finish() catch continue;
+    }
+}

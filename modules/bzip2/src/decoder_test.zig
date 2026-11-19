@@ -286,6 +286,10 @@ const Block = struct {
     syms: []const u16 = &.{ 0, 2 },
     /// Stop right after the origin pointer.
     header_only: bool = false,
+    /// Stop right after the selector list (before the coding tables).
+    stop_after_sel: bool = false,
+    /// MTF-coded values (unary on the wire) of the first selectors; the rest are 0.
+    sel_vals: []const u8 = &.{},
 };
 
 fn putBlock(w: *BitWriter, b: Block) !void {
@@ -303,7 +307,16 @@ fn putBlock(w: *BitWriter, b: Block) !void {
 
     try w.put(b.ng, 3);
     try w.put(b.n_sel, 15);
-    for (0..b.n_sel) |_| try w.bit(0);
+    for (0..b.n_sel) |i| {
+        const v: usize = if (i < b.sel_vals.len) b.sel_vals[i] else 0;
+        for (0..v) |_| try w.bit(1);
+        try w.bit(0);
+    }
+    if (b.stop_after_sel) {
+        // A valid 5-bit start length (5) so that the first table is the next thing judged.
+        try w.put(5, 5);
+        return;
+    }
 
     for (0..b.ng) |_| {
         var curr: i32 = b.start orelse b.lens[0];
@@ -334,7 +347,7 @@ fn buildStream(gpa: std.mem.Allocator, level: u8, b: Block) ![]u8 {
     for ("BZh") |c| try w.put(c, 8);
     try w.put('0' + level, 8);
     try putBlock(&w, b);
-    if (!b.header_only) {
+    if (!b.header_only and !b.stop_after_sel) {
         try w.put(0x177245385090, 48);
         try w.put(b.crc, 32); // one block: the stream CRC is the block CRC
     }
@@ -527,4 +540,365 @@ test "DecompressReader: small reads after the buffer filled are served from a re
         if (d.reader.bufferedLen() > 0) buffered += 1;
     }
     try testing.expect(buffered * 2 >= reads);
+}
+
+test "hand-built: a zero selector count is judged before the tables are read" {
+    // With the stream cut right after the selector list, only the count check
+    // can say BadTables; one selector leaves the (missing) tables to read.
+    // 15 symbols in use: the first table's 17 length bits cannot fit in the padding.
+    try expectBlock(1, .{ .n_in_use = 15, .n_sel = 0, .stop_after_sel = true }, error.BadTables);
+    try expectBlock(1, .{ .n_in_use = 15, .n_sel = 1, .stop_after_sel = true }, error.TruncatedInput);
+}
+
+test "hand-built: a selector value is below the table count" {
+    const a = plainCrc("a");
+    try expectBlock(1, .{ .crc = a, .ng = 2, .sel_vals = &.{1} }, "a");
+    try expectBlock(1, .{ .crc = a, .ng = 2, .sel_vals = &.{2} }, error.BadTables);
+    try expectBlock(1, .{ .crc = a, .ng = 6, .sel_vals = &.{5} }, "a");
+    try expectBlock(1, .{ .crc = a, .ng = 6, .sel_vals = &.{6} }, error.BadTables);
+    try expectBlock(1, .{ .crc = a, .ng = 6, .sel_vals = &.{7} }, error.BadTables);
+    // Cut right after: the value check fires while the selectors are read.
+    try expectBlock(1, .{ .n_in_use = 15, .ng = 2, .sel_vals = &.{2}, .stop_after_sel = true }, error.BadTables);
+    try expectBlock(1, .{ .n_in_use = 15, .ng = 2, .sel_vals = &.{1}, .stop_after_sel = true }, error.TruncatedInput);
+}
+
+test "hand-built: more groups of symbols than selectors is BadTables, also inside a run" {
+    const gpa = testing.allocator;
+    var syms: std.ArrayList(u16) = .empty;
+    defer syms.deinit(gpa);
+    // 60 MTF symbols (position 1 of two bytes), EOB; one selector covers 50.
+    try syms.appendNTimes(gpa, 2, 60);
+    try syms.append(gpa, 3);
+    const two: Block = .{ .n_in_use = 2, .lens = &.{ 2, 2, 2, 2 }, .syms = syms.items };
+    try expectBlock(1, two, error.BadTables);
+    // 49 MTF symbols, then a run symbol that is the 50th, then its continuation
+    // is the first symbol of the missing second group.
+    syms.clearRetainingCapacity();
+    try syms.appendNTimes(gpa, 2, 49);
+    try syms.appendSlice(gpa, &.{ 0, 2, 3 });
+    try expectBlock(1, .{ .n_in_use = 2, .lens = &.{ 2, 2, 2, 2 }, .syms = syms.items }, error.BadTables);
+    // Two selectors cover 100 symbols: 99 + EOB passes the group check (then fails the CRC).
+    syms.clearRetainingCapacity();
+    try syms.appendNTimes(gpa, 2, 99);
+    try syms.append(gpa, 3);
+    try expectBlock(1, .{ .n_in_use = 2, .n_sel = 2, .lens = &.{ 2, 2, 2, 2 }, .syms = syms.items }, error.BlockCrcMismatch);
+}
+
+// ── whole-module mutation, 2026-11-19: tests for the survivors ──────────
+
+test "headers: each of the three magic letters is checked alone" {
+    const gpa = testing.allocator;
+    const tail = "\x17rE8P\x90\x00\x00\x00\x00";
+    try testing.expectError(error.BadMagic, bz.decompress(gpa, "XZh9" ++ tail, .{}));
+    try testing.expectError(error.BadMagic, bz.decompress(gpa, "BXh9" ++ tail, .{}));
+    try testing.expectError(error.BadMagic, bz.decompress(gpa, "BZx9" ++ tail, .{}));
+    const e = try bz.decompress(gpa, "BZh1" ++ tail, .{});
+    gpa.free(e);
+}
+
+test "Decoder.streams counts the streams read" {
+    const gpa = testing.allocator;
+    const a = try packed_(gpa, "one", 1);
+    defer gpa.free(a);
+    const joined = try std.mem.concat(gpa, u8, &.{ a, a, a });
+    defer gpa.free(joined);
+    var in: std.Io.Reader = .fixed(joined);
+    var d = try bz.Decoder.init(gpa, &in, .{});
+    defer d.deinit();
+    var out: [64]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try d.read(out[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    try testing.expectEqualStrings("oneoneone", out[0..total]);
+    try testing.expectEqual(@as(u32, 3), d.streams);
+}
+
+test "hand-built: a 20-bit code is decoded by the symbol loop as well as the run loop" {
+    // Symbols: 0 RUNA, 1 RUNB, 2 = 'b' (MTF position 1), 3 = EOB; lengths 2,2,2,20.
+    // The plain-symbol branch reads the 20-bit EOB itself here (the run loop
+    // reads it in "a 20-bit code" above).
+    const lens: []const u8 = &.{ 2, 2, 2, 20 };
+    try expectBlock(1, .{ .crc = plainCrc("b"), .n_in_use = 2, .lens = lens, .syms = &.{ 2, 3 } }, "b");
+    try expectBlock(1, .{ .crc = plainCrc("bb"), .n_in_use = 2, .lens = lens, .syms = &.{ 2, 0, 3 } }, "bb");
+}
+
+test "hand-built: a run after a symbol overflows the block as a whole" {
+    const gpa = testing.allocator;
+    var syms: std.ArrayList(u16) = .empty;
+    defer syms.deinit(gpa);
+    // One symbol, then a run that alone would fit but together with it does not.
+    try syms.append(gpa, 2);
+    try runSyms(gpa, &syms, 100_000);
+    try syms.append(gpa, 3);
+    try expectBlock(1, .{ .n_in_use = 2, .lens = &.{ 2, 2, 2, 2 }, .syms = syms.items }, error.BlockOverflow);
+}
+
+test "hand-built: blocks that end in one, two or three equal bytes" {
+    const gpa = testing.allocator;
+    var syms: std.ArrayList(u16) = .empty;
+    defer syms.deinit(gpa);
+    for ([_]usize{ 1, 2, 3 }) |n| {
+        syms.clearRetainingCapacity();
+        try runSyms(gpa, &syms, n);
+        try syms.append(gpa, 2);
+        const want = try gpa.alloc(u8, n);
+        defer gpa.free(want);
+        @memset(want, 'a');
+        try expectBlock(1, .{ .crc = plainCrc(want), .syms = syms.items }, want);
+    }
+}
+
+/// A counting allocator: the largest request and the number of allocations and resizes.
+const Counting = struct {
+    parent: std.mem.Allocator,
+    biggest: usize = 0,
+    calls: usize = 0,
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(c: *Counting) std.mem.Allocator {
+        return .{ .ptr = c, .vtable = &vtable };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        c.biggest = @max(c.biggest, len);
+        c.calls += 1;
+        return c.parent.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        c.biggest = @max(c.biggest, n);
+        c.calls += 1;
+        return c.parent.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        c.biggest = @max(c.biggest, n);
+        c.calls += 1;
+        return c.parent.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        c.parent.rawFree(m, a, ra);
+    }
+};
+
+test "the block buffer grows geometrically and never past the block size" {
+    // A full level-1 block: 100 000 symbols make the block buffer 4 * 100 000
+    // bytes, reached in a handful of steps (the growth doubles, capped at the
+    // block size).
+    const gpa = testing.allocator;
+    var syms: std.ArrayList(u16) = .empty;
+    defer syms.deinit(gpa);
+    try syms.appendNTimes(gpa, 2, 100_000);
+    try syms.append(gpa, 3);
+    const z = try buildStream(gpa, 1, .{ .n_in_use = 2, .n_sel = 2001, .lens = &.{ 2, 2, 2, 2 }, .syms = syms.items, .crc = 0 });
+    defer gpa.free(z);
+    var c: Counting = .{ .parent = gpa };
+    // The CRC is 0: the decode fails after the block is read, which is all that is measured.
+    var in: std.Io.Reader = .fixed(z);
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    try testing.expectError(error.BlockCrcMismatch, bz.decompressStream(c.allocator(), &in, &sink.writer, .{}));
+    if (c.biggest > 4 * 100_000 + 64 * 1024 or c.biggest < 4 * 100_000 or c.calls >= 40) {
+        std.debug.print("largest request {d}, {d} calls\n", .{ c.biggest, c.calls });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "Decoder.total_out stops one byte past max_output" {
+    const gpa = testing.allocator;
+    const plain = try shapeBytes(gpa, "zeros-2m", null);
+    defer gpa.free(plain);
+    const z = try packed_(gpa, plain, 9);
+    defer gpa.free(z);
+    for ([_]u64{ 20_000, 50_001, 1_000_000 }) |cap| {
+        var in: std.Io.Reader = .fixed(z);
+        var d = try bz.Decoder.init(gpa, &in, .{ .max_output = cap });
+        defer d.deinit();
+        var buf: [16 * 1024]u8 = undefined;
+        while (true) {
+            const n = d.read(&buf) catch |e| {
+                try testing.expectEqual(error.OutputTooLarge, e);
+                break;
+            };
+            try testing.expect(n > 0);
+        }
+        try testing.expectEqual(cap + 1, d.total_out);
+    }
+}
+
+/// A writer with no buffer of its own that collects what is drained into it.
+const Collect = struct {
+    w: std.Io.Writer = .{ .vtable = &vtable, .buffer = &.{} },
+    list: std.ArrayList(u8) = .empty,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const s: *Collect = @alignCast(@fieldParentPtr("w", w));
+        // What the writer has buffered goes first.
+        s.list.appendSlice(testing.allocator, w.buffer[0..w.end]) catch return error.WriteFailed;
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            s.list.appendSlice(testing.allocator, d) catch return error.WriteFailed;
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| s.list.appendSlice(testing.allocator, last) catch return error.WriteFailed;
+        return n + last.len * splat;
+    }
+};
+
+test "decompressStream returns the length, flushes a buffered writer, and takes an unbuffered one" {
+    const gpa = testing.allocator;
+    // 2 * 16 384 + 17 bytes: the last chunk handed to the writer is shorter than its buffer.
+    const plain = try shapeBytes(gpa, "text-150k", 2 * 16 * 1024 + 17);
+    defer gpa.free(plain);
+    const z = try packed_(gpa, plain, 3);
+    defer gpa.free(z);
+    // A writer with a buffer: the bytes must be out of it when the call returns.
+    {
+        var sink: Collect = .{};
+        defer sink.list.deinit(gpa);
+        var buf: [100]u8 = undefined;
+        sink.w.buffer = &buf;
+        var in: std.Io.Reader = .fixed(z);
+        const n = try bz.decompressStream(gpa, &in, &sink.w, .{});
+        try testing.expectEqual(@as(u64, plain.len), n);
+        try testing.expectEqualSlices(u8, plain, sink.list.items);
+    }
+    // Through the pull reader into a writer without a buffer (its own tmp path),
+    // and with `.nothing` as the limit (nothing is read, nothing is the end).
+    {
+        var sink: Collect = .{};
+        defer sink.list.deinit(gpa);
+        var in: std.Io.Reader = .fixed(z);
+        var r = try bz.DecompressReader.init(gpa, &in, &.{}, .{});
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 0), try r.reader.stream(&sink.w, .nothing));
+        _ = try r.reader.streamRemaining(&sink.w);
+        try testing.expectEqualSlices(u8, plain, sink.list.items);
+    }
+}
+
+test "decompress on a failing allocator is OutOfMemory or a result, never another error" {
+    const gpa = testing.allocator;
+    const plain = try shapeBytes(gpa, "text-150k", null);
+    defer gpa.free(plain);
+    const z = try packed_(gpa, plain, 1);
+    defer gpa.free(z);
+    var any_oom = false;
+    for (0..24) |i| {
+        var fa = testing.FailingAllocator.init(gpa, .{ .fail_index = i });
+        if (bz.decompress(fa.allocator(), z, .{})) |out| {
+            fa.allocator().free(out);
+        } else |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            any_oom = true;
+        }
+    }
+    try testing.expect(any_oom);
+}
+
+test "DecompressReader odd-sized reads keep the unread bytes of a refill" {
+    const gpa = testing.allocator;
+    var plain: [9000]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 131 +% i / 7);
+    const z = try packed_(gpa, &plain, 1);
+    defer gpa.free(z);
+    for ([_]usize{ 7, 13, 61 }) |step| {
+        var in: std.Io.Reader = .fixed(z);
+        var buf: [64]u8 = undefined;
+        var d = try bz.DecompressReader.init(gpa, &in, &buf, .{});
+        defer d.deinit();
+        var got: [61]u8 = undefined;
+        var off: usize = 0;
+        while (off + step <= plain.len) : (off += step) {
+            try d.reader.readSliceAll(got[0..step]);
+            try testing.expectEqualSlices(u8, plain[off..][0..step], got[0..step]);
+        }
+    }
+}
+
+test "an unbuffered input reader decodes many small streams (every bit alignment)" {
+    const gpa = testing.allocator;
+    var text: [80]u8 = undefined;
+    for (&text, 0..) |*b, i| b.* = @intCast('a' + (i * 7 + i / 3) % 23);
+    for (1..text.len) |len| {
+        const z = try packed_(gpa, text[0..len], 1);
+        defer gpa.free(z);
+        var calls: [1]std.testing.Reader.Call = .{.{ .buffer = z }};
+        var tr: std.testing.Reader = .init(&.{}, &calls);
+        tr.artificial_limit = .limited(3);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var r = try bz.DecompressReader.init(gpa, &tr.interface, &.{}, .{});
+        defer r.deinit();
+        _ = try r.reader.streamRemaining(&out.writer);
+        try testing.expectEqualSlices(u8, text[0..len], out.written());
+    }
+}
+
+test "randomised blocks: the flip table restarts with every block" {
+    const gpa = testing.allocator;
+    const plain = try shapeBytes(gpa, "text-1m", 250_000);
+    defer gpa.free(plain);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var enc = try bz.Encoder.init(gpa, &out.writer, .{ .level = 1 });
+    defer enc.deinit();
+    enc.randomise = true;
+    try enc.write(plain);
+    try enc.finish();
+    const back = try bz.decompress(gpa, out.written(), .{});
+    defer gpa.free(back);
+    try testing.expectEqualSlices(u8, plain, back);
+}
+
+test "DecompressReader: lines that cross the buffer end keep their unread head" {
+    // takeDelimiter needs more than what is buffered, so the refill must move the
+    // unread octets to the front of the buffer first.
+    const gpa = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (0..300) |i| try text.print(gpa, "line {d}: {d}\n", .{ i, i * 7919 % 10007 });
+    const z = try packed_(gpa, text.items, 1);
+    defer gpa.free(z);
+    var in: std.Io.Reader = .fixed(z);
+    var buf: [24]u8 = undefined;
+    var d = try bz.DecompressReader.init(gpa, &in, &buf, .{});
+    defer d.deinit();
+    for (0..300) |i| {
+        var want: [48]u8 = undefined;
+        const line = try std.fmt.bufPrint(&want, "line {d}: {d}", .{ i, i * 7919 % 10007 });
+        try testing.expectEqualStrings(line, (try d.reader.takeDelimiter('\n')).?);
+    }
+    try testing.expect((try d.reader.takeDelimiter('\n')) == null);
+}
+
+test "DecompressReader.readVec keeps the unread octets of the buffer it rebases" {
+    const gpa = testing.allocator;
+    var plain: [4000]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 31 +% i / 5);
+    const z = try packed_(gpa, &plain, 1);
+    defer gpa.free(z);
+    var in: std.Io.Reader = .fixed(z);
+    var buf: [64]u8 = undefined;
+    var d = try bz.DecompressReader.init(gpa, &in, &buf, .{});
+    defer d.deinit();
+    _ = try d.reader.peek(10);
+    d.reader.toss(3);
+    const live = d.reader.buffered().len;
+    try testing.expect(live >= 7);
+    var snapshot: [64]u8 = undefined;
+    @memcpy(snapshot[0..live], d.reader.buffered());
+    try testing.expectEqualSlices(u8, plain[3..][0..live], snapshot[0..live]);
+    var dest: [4]u8 = undefined;
+    var vec = [1][]u8{&dest};
+    _ = try d.reader.vtable.readVec(&d.reader, &vec);
+    try testing.expectEqualSlices(u8, snapshot[0..live], d.reader.buffered()[0..live]);
 }

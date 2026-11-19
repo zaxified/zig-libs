@@ -84,4 +84,5 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("sweep_test.zig");
     _ = @import("worstcase_test.zig");
+    _ = @import("tie_test.zig");
 }
