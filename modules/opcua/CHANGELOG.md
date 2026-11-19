@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the NumericRange code (72 mutants: 70 killed, 2 equivalent); the card counts are now 970/1049 (cumulative), `src` re-pinned.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** NumericRange tests added from the delta mutation run: a ranged write to a Variable with no stored value, a range on `ArrayDimensions` (an array, but not the Value), a String range ending at the length, a multi-dimensional String-array range, a two-dimension range on a String write.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** more NumericRange tests (write precedence: Object has no Value, user access denied, nothing stored; client status and server-stamped time kept by a ranged write; unusable `ArrayDimensions` fall back to a flat array without overflow; the 256-byte text cap), and the range fuzz harness's nested-String expectation follows the per-element clipping.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz harness `opcua-range` (`OPCUA_FUZZ`): a live session reads and writes ranged values with index ranges drawn from the grammar's corners and damaged by byte edits; a model of the Int32 array checks every status and element, reach is counted over 300 seeds.
