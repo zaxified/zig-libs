@@ -6,7 +6,7 @@
 
 **Scope:** core — rust-bitcoin `Transaction` + `SighashCache`, Bitcoin Core `CTransaction`/`SignatureHash` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-10-05 (32/34, 2 eq) · src ?
+**Audit:** review 2026-09-15 · mutation 2026-11-19 (82/85, 3 eq) · src 219a0471c20e88c4
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BITCOINTX_FUZZ) · ct n/a — public transaction data (keyword review, 2026-10-07)
 
@@ -259,6 +259,22 @@ Reference: Bitcoin Core (`GetTransactionWeight`, `GetVirtualTransactionSize`, `C
   height 484435) against the header's own Merkle root; three transactions (odd-weight segwit, 3-input
   segwit, 5-input legacy) against the explorer's reported size and weight. The streaming fold is also
   compared with a level-by-level reference for 0..70 leaves, plain and with every adjacent duplicate.
+
+### Delta mutation run 2026-11-19 (size/weight, `merkle.zig`)
+
+51 mutants over the new code (size arithmetic and every CompactSize width, ceil in `vsize`, the
+coinbase predicate per field, the stack fold, the `mutated` flag, header check order, commitment
+matching, nonce checks, the 6..38 payload slice), one schemata build, ReleaseSafe. **50 killed, 1
+equivalent, 0 survivors.** First pass: nothing survived once the width tests (253-entry counts,
+300-octet scripts and witness items) and the exhaustive 3-symbol fold test existed; they were added
+before the run because the obvious mutants (`compactSizeLen(n)` to `1`) are invisible to any realistic
+transaction.
+
+**Equivalent (1):** the equal-neighbour test inside `MerkleBuilder.finish`. A final-fold pair
+that is equal always contains, as its own children, an equal pair that was joined and flagged at
+`push` time (padding builds `H(g,g)`, whose children are equal; an unpadded top would already have
+been joined with its same-height neighbour). It is kept because it is Core's definition of the
+flag; every sequence over 3 symbols up to length 8 agrees with the level-by-level reference.
 
 ## Backlog / deferred
 

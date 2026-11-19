@@ -267,6 +267,29 @@ test "merkle: streaming fold equals the level-by-level reference for 0..70 leave
     }
 }
 
+test "merkle: every sequence over 3 symbols up to length 8 agrees with the reference, flag included" {
+    const a = testing.allocator;
+    const sym = [3]Hash{ @splat(1), @splat(2), @splat(3) };
+    var len: usize = 0;
+    while (len <= 8) : (len += 1) {
+        var total: usize = 1;
+        for (0..len) |_| total *= 3;
+        var code: usize = 0;
+        while (code < total) : (code += 1) {
+            var leaves: [8]Hash = undefined;
+            var c = code;
+            for (0..len) |k| {
+                leaves[k] = sym[c % 3];
+                c /= 3;
+            }
+            const g = rootOfHashes(leaves[0..len]);
+            const w = try referenceRoot(a, leaves[0..len]);
+            try testing.expectEqualSlices(u8, &w.root, &g.root);
+            try testing.expectEqual(w.mutated, g.mutated);
+        }
+    }
+}
+
 test "merkle: boundary shapes" {
     const x: Hash = @splat(1);
     const y: Hash = @splat(2);
@@ -436,6 +459,13 @@ test "block KAT: checkWitnessCommitment refusals" {
     stacks[0].items = &two_items;
     try testing.expectError(error.BadWitnessNonce, checkWitnessCommitment(a, txs_copy));
     stacks[0].items = &.{};
+    try testing.expectError(error.BadWitnessNonce, checkWitnessCommitment(a, txs_copy));
+    // No witness stack at all / two stacks for the one input.
+    txs_copy[0].witness = &.{};
+    try testing.expectError(error.BadWitnessNonce, checkWitnessCommitment(a, txs_copy));
+    var ok_item = [_][]const u8{&other};
+    var two_stacks = [_]tx_mod.Witness{ .{ .items = &ok_item }, .{ .items = &ok_item } };
+    txs_copy[0].witness = &two_stacks;
     try testing.expectError(error.BadWitnessNonce, checkWitnessCommitment(a, txs_copy));
 }
 

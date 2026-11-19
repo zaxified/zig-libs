@@ -169,3 +169,46 @@ test "isCoinbase: needs exactly one input with the null prevout" {
     id[0] = 1;
     try testing.expect(!mk(&buf, id, 0xffffffff, 1).isCoinbase()); // first octet
 }
+
+test "sizes agree with the serializers across every CompactSize width (253+ inputs, outputs, script and witness lengths)" {
+    const allocator = testing.allocator;
+    const big = try allocator.alloc(u8, 300);
+    defer allocator.free(big);
+    @memset(big, 0x5a);
+    const n_in: usize = 253;
+    const ins = try allocator.alloc(tx.TxIn, n_in);
+    defer allocator.free(ins);
+    for (ins, 0..) |*i, k| i.* = .{
+        .prevout = .{ .txid = @splat(@truncate(k + 1)), .vout = @truncate(k) },
+        .script_sig = big[0..if (k == 0) 300 else k % 3],
+        .sequence = 1,
+    };
+    const outs = try allocator.alloc(tx.TxOut, 253);
+    defer allocator.free(outs);
+    for (outs, 0..) |*o, k| o.* = .{ .value = 1, .script_pubkey = big[0..if (k == 0) 253 else 0] };
+    const stacks = try allocator.alloc(tx.Witness, n_in);
+    defer allocator.free(stacks);
+    const many = try allocator.alloc([]const u8, 253);
+    defer allocator.free(many);
+    for (many, 0..) |*m, k| m.* = big[0..if (k == 0) 300 else 0];
+    for (stacks, 0..) |*w, k| w.* = .{ .items = if (k == 0) many else many[0..1] };
+    var t: tx.Transaction = .{ .version = 1, .vin = ins, .vout = outs, .witness = stacks, .locktime = 0, .has_witness = true };
+    const legacy = try tx.serializeLegacy(allocator, t);
+    defer allocator.free(legacy);
+    const full = try tx.serializeSegwit(allocator, t);
+    defer allocator.free(full);
+    try testing.expectEqual(legacy.len, t.baseSize());
+    try testing.expectEqual(full.len, try t.totalSize());
+    try testing.expectEqual(legacy.len * 3 + full.len, try t.weight());
+    try testing.expectEqual((legacy.len * 3 + full.len + 3) / 4, try t.vsize());
+    // 252 / 253 boundaries of the three counts individually.
+    t.vin = ins[0..252];
+    t.vout = outs[0..252];
+    t.witness = stacks[0..252];
+    const l2 = try tx.serializeLegacy(allocator, t);
+    defer allocator.free(l2);
+    const f2 = try tx.serializeSegwit(allocator, t);
+    defer allocator.free(f2);
+    try testing.expectEqual(l2.len, t.baseSize());
+    try testing.expectEqual(f2.len, try t.totalSize());
+}
