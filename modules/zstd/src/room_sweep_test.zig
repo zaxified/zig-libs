@@ -173,7 +173,9 @@ fn run(row: goldens.Golden, t: *Transcript) !void {
 }
 
 test "every capacity gives libzstd's answer: block, buffer-less and sequence APIs" {
-    const dump = std.testing.environ.getPosix("ZSTD_ROOM_SWEEP_DUMP") != null;
+    // `getPosix` does not exist on Windows; the dump knob is a POSIX-host aid.
+    const dump = @import("builtin").target.os.tag != .windows and
+        std.testing.environ.getPosix("ZSTD_ROOM_SWEEP_DUMP") != null;
     var bad: usize = 0;
     for (goldens.rows) |row| {
         var t: Transcript = .{ .dump = dump };
