@@ -3061,6 +3061,32 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
     try testing.expectError(error.UnexpectedResponseType, session.readAttribute(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, services.attribute_id.value));
 }
 
+test "Subscription offline scripted: a ModifyMonitoredItems answer with more results than specs never indexes past the specs" {
+    const testing = std.testing;
+    var server_buf: [4096]u8 = undefined;
+    var server_w: std.Io.Writer = .fixed(&server_buf);
+    const good: services.MonitoredItemModifyResult = .{ .status_code = 0, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter };
+    const results = [_]services.MonitoredItemModifyResult{ good, good };
+    try renderFrame(&server_w, 1, services.ModifyMonitoredItemsResponse, .{ .response_header = scripted_header, .results = &results, .diagnostic_infos = null }, services.encodeModifyMonitoredItemsResponse, services.type_id.modify_monitored_items_response);
+
+    var client_out_buf: [4096]u8 = undefined;
+    var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
+    var client_in_r: std.Io.Reader = .fixed(server_w.buffered());
+    var conn = transport.Connection.init(&client_in_r, &client_out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3 } };
+    var session: Session = .{ .channel = &ch, .allocator = testing.allocator, .authentication_token = services.null_node_id };
+    var sub: Subscription = .{ .session = &session, .allocator = testing.allocator, .subscription_id = 1 };
+    defer sub.deinit();
+    try sub.monitored_items.append(testing.allocator, .{ .client_handle = 10, .monitored_item_id = 100 });
+
+    const specs = [_]Subscription.MonitoredItemModifySpec{.{ .monitored_item_id = 100, .client_handle = 20 }};
+    const response = try sub.modifyMonitoredItems(&specs, .both);
+    defer services.freeModifyMonitoredItemsResponse(testing.allocator, response);
+    try testing.expectEqual(@as(usize, 2), response.results.?.len);
+    try testing.expectEqual(@as(u32, 100), sub.findMonitoredItem(20).?);
+    try testing.expect(sub.findMonitoredItem(10) == null);
+}
+
 test "secure offline scripted: a secured OpenSecureChannel answer with an empty server nonce is refused" {
     const testing = std.testing;
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(43)));
