@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — Fix: under `-Dprofile=small` (RSA capacity 4096) a certificate with a key past 4096 bits was `InvalidCertificate` / `BadCertificateInvalid` instead of `KeyLengthOutOfPolicy` / `BadCertificateUseNotAllowed` (full CI `small` lane red). The key-length band is now checked on the modulus length read from the certificate structure before the key is parsed (`security.certificateKeyBits`, new), in `certificatePublicKeyForPolicy` and the server's peer-certificate check; same answer under every profile. Delta mutation 3/3 killed.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: the LIVE fixture's fixed container name and port make parallel test runs interfere.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the NumericRange reference alignment (23 mutants, all killed); the card counts are now 993/1072 (cumulative), `src` re-pinned.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** more NumericRange tests from the reference-alignment delta mutation run (a String write of one String for two elements, too narrow a String, an exact element range, a null element, a null String in a byte range).

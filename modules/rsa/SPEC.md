@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 4.0 RSA and Go `crypto/rsa` + the `crypto/x509` RSA key codecs: PKCS#1 v1.5 and PSS sign/verify (run-time hash, prehashed digests, PSS salt recovery, decoupled MGF1), OAEP, key generation, PKCS#1/PKCS#8/SPKI/PEM read and write including encrypted PKCS#8 (PBES2/PBKDF2/AES-CBC), OpenSSH private keys, moduli up to 8192 bits (surveyed 2026-09-30 and 2026-10-14, gaps closed 2026-10-14); RSAES-PKCS1-v1_5, multi-prime keys, scrypt/PBES1/legacy-PEM encryption and > 8192-bit moduli are out (see "What is deliberately not done")
 
-**Audit:** review 2026-11-13 · mutation 2026-11-19 (195/231, 36 eq) · src f5b77c13e455ccb0
+**Audit:** review 2026-11-13 · mutation 2026-11-19 (199/235, 36 eq) · src d375b8f1c35f9ba5
 
 *Delta mutation 2026-11-17:* the branch-free INTEGER trim in `marshal.zig` (private-key PEM ctgrind), 8/8 killed — see Backlog "Private-key PEM: a ctgrind target".
 
@@ -23,6 +23,8 @@
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see
 ./README.md "Provenance" + the module-local `NOTICE`.
 
+
+**Delta mutation, 2026-11-19 (`PublicKey.modulusBitsFromDer`).** 4 schemata mutants over the new function (the sign-bit check, the empty-modulus check, both terms of the bit count): 4 killed, after one killing test (an empty modulus INTEGER, which without the check indexes past an empty slice). The card counts are cumulative (195 + 4 of 231 + 4).
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
