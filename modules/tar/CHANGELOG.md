@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — New API, no break: `packDirOptions(io, gpa, roots, dst, PackOptions)` with `same_device` (a directory on another device than its root keeps its header and is not descended, as GNU tar `--one-file-system`), `max_entries` and `max_bytes` (`error.LimitExceeded` before the entry or file that would pass the limit); the defaults are `packDir`, which now calls it. Bounds a walk of `/`, `/proc` or a bind-mount loop that `packDir` cannot.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-04** — **behaviour:** a sparse member whose stored size differs from the sum of its map is `BadHeader` (was: unused bytes skipped; GNU tar 1.35 stops earlier, so `tar -x` created a member `checkArchive` never saw); under `-Dtar-sparse=false` a sparse member is `BadHeader` (was: read as `.other` or a plain file); `GNU.sparse.major` without a minor is `BadHeader`. `checkEntry`: a trailing `/` or `/.` on a symlink's path no longer adds a level.
 

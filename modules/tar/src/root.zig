@@ -1641,6 +1641,31 @@ pub const PackStats = struct {
 pub const PackDirError = error{ PathTooLong, NoEntries } ||
     Allocator.Error || std.Io.Writer.Error || std.Io.Reader.StreamError;
 
+/// Limits for `packDirOptions`. The defaults reproduce `packDir` exactly.
+pub const PackOptions = struct {
+    /// Do not descend into a directory on another device than the root it was
+    /// reached from (GNU tar `--one-file-system`): the mount point itself
+    /// keeps its directory header, its content is left out and is not counted
+    /// in `PackStats.skipped`. Guards a walk of `/` against `/proc`, `/sys`
+    /// and bind-mount loops.
+    same_device: bool = false,
+    /// Stop with `error.LimitExceeded` before the entry (file, directory or
+    /// symlink) that would be number `max_entries + 1`.
+    max_entries: ?u64 = null,
+    /// Stop with `error.LimitExceeded` before a regular file whose header
+    /// size would take `PackStats.bytes` over `max_bytes`.
+    max_bytes: ?u64 = null,
+};
+
+pub const PackDirOptionsError = PackDirError || error{LimitExceeded};
+
+/// Per-call walk state: the options and the device of the root being walked.
+const Walk = struct {
+    opts: PackOptions,
+    dev: u64 = 0,
+    have_dev: bool = false,
+};
+
 /// Walk `roots` (filesystem paths) and write a gzip-compressed tar to `dst`.
 /// Numeric attrs (mode/uid/gid/mtime) come from `statx`; symlinks are not
 /// followed. Unstatable/unreadable entries and non-regular/dir/symlink types
@@ -1656,8 +1681,20 @@ pub const PackDirError = error{ PathTooLong, NoEntries } ||
 /// Stored paths are the given paths with any leading '/' trimmed. Linux-only
 /// (raw `statx`/`readlink` syscalls); the codec above stays portable.
 pub fn packDir(io: std.Io, gpa: Allocator, roots: []const []const u8, dst: *std.Io.Writer) PackDirError!PackStats {
+    return packDirOptions(io, gpa, roots, dst, .{}) catch |e| switch (e) {
+        error.LimitExceeded => unreachable, // no limit is set
+        else => |x| return x,
+    };
+}
+
+/// `packDir` with `PackOptions`: a device boundary and entry / byte limits
+/// for walks of trees the caller does not control (`/`, `/proc`, bind-mount
+/// loops make a tree effectively infinite). A limit hit returns
+/// `error.LimitExceeded` and the destination holds an unfinished gzip stream,
+/// to be discarded. Everything else is documented at `packDir`.
+pub fn packDirOptions(io: std.Io, gpa: Allocator, roots: []const []const u8, dst: *std.Io.Writer, opts: PackOptions) PackDirOptionsError!PackStats {
     if (comptime builtin.os.tag != .linux)
-        @compileError("tar.packDir is Linux-only (statx numeric attrs)");
+        @compileError("tar.packDirOptions is Linux-only (statx numeric attrs)");
 
     const window = try gpa.alloc(u8, flate.max_window_len);
     defer gpa.free(window);
@@ -1667,11 +1704,13 @@ pub fn packDir(io: std.Io, gpa: Allocator, roots: []const []const u8, dst: *std.
     const tw = Writer.init(&comp.writer);
 
     var stats: PackStats = .{};
+    var walk: Walk = .{ .opts = opts };
     for (roots) |root| {
         if (root.len == 0) continue;
         const name = std.mem.trimStart(u8, root, "/");
         if (name.len == 0) continue;
-        try emitPath(io, gpa, tw, root, name, &stats);
+        walk.have_dev = false;
+        try emitPath(io, gpa, tw, root, name, &stats, &walk);
     }
     if (stats.files + stats.dirs + stats.symlinks == 0) return error.NoEntries;
 
@@ -1715,7 +1754,7 @@ const WalkFrame = struct {
 /// hundred levels deep (`a/a/a/...`, well inside PATH_MAX) overflowed the
 /// thread stack. Depth is still bounded by `max_path_bytes` (a longer child
 /// path is skipped), i.e. at most ~2k frames.
-fn emitPath(io: std.Io, gpa: Allocator, tw: Writer, fs_path: []const u8, tar_name: []const u8, stats: *PackStats) PackDirError!void {
+fn emitPath(io: std.Io, gpa: Allocator, tw: Writer, fs_path: []const u8, tar_name: []const u8, stats: *PackStats, walk: *Walk) PackDirOptionsError!void {
     var fs_buf: [std.fs.max_path_bytes]u8 = undefined;
     var tar_buf: [std.fs.max_path_bytes]u8 = undefined;
     // Room for the NUL terminator `statx` needs.
@@ -1729,7 +1768,7 @@ fn emitPath(io: std.Io, gpa: Allocator, tw: Writer, fs_path: []const u8, tar_nam
         stack.deinit(gpa);
     }
 
-    if (try emitNode(io, tw, &fs_buf, fs_path.len, tar_buf[0..tar_name.len], stats)) |dir| {
+    if (try emitNode(io, tw, &fs_buf, fs_path.len, tar_buf[0..tar_name.len], stats, walk)) |dir| {
         stack.append(gpa, .{ .dir = dir, .it = dir.iterate(), .fs_len = fs_path.len, .tar_len = tar_name.len }) catch |e| {
             dir.close(io);
             return e;
@@ -1753,7 +1792,7 @@ fn emitPath(io: std.Io, gpa: Allocator, tw: Writer, fs_path: []const u8, tar_nam
         @memcpy(tar_buf[tl + 1 ..][0..name.len], name);
         const cfl = fl + 1 + name.len;
         const ctl = tl + 1 + name.len;
-        if (try emitNode(io, tw, &fs_buf, cfl, tar_buf[0..ctl], stats)) |dir| {
+        if (try emitNode(io, tw, &fs_buf, cfl, tar_buf[0..ctl], stats, walk)) |dir| {
             stack.append(gpa, .{ .dir = dir, .it = dir.iterate(), .fs_len = cfl, .tar_len = ctl }) catch |e| {
                 dir.close(io);
                 return e;
@@ -1765,7 +1804,7 @@ fn emitPath(io: std.Io, gpa: Allocator, tw: Writer, fs_path: []const u8, tar_nam
 /// Emit one filesystem node (`fs_buf[0..fs_len]`, which must have room for a NUL
 /// at `fs_len`). Returns the opened directory when it is one and has to be
 /// descended into.
-fn emitNode(io: std.Io, tw: Writer, fs_buf: *[std.fs.max_path_bytes]u8, fs_len: usize, tar_name: []const u8, stats: *PackStats) PackDirError!?std.Io.Dir {
+fn emitNode(io: std.Io, tw: Writer, fs_buf: *[std.fs.max_path_bytes]u8, fs_len: usize, tar_name: []const u8, stats: *PackStats, walk: *Walk) PackDirOptionsError!?std.Io.Dir {
     const linux = std.os.linux;
     fs_buf[fs_len] = 0;
     const pz: [:0]const u8 = fs_buf[0..fs_len :0];
@@ -1778,12 +1817,24 @@ fn emitNode(io: std.Io, tw: Writer, fs_buf: *[std.fs.max_path_bytes]u8, fs_len: 
     const perm: u32 = stx.mode & 0o7777;
     const mtime: i64 = stx.mtime.sec;
 
+    if (walk.opts.max_entries) |m| {
+        if ((ifmt == linux.S.IFDIR or ifmt == linux.S.IFLNK or ifmt == linux.S.IFREG) and
+            stats.files + stats.dirs + stats.symlinks >= m) return error.LimitExceeded;
+    }
+
     if (ifmt == linux.S.IFDIR) {
         tw.writeHeader(.{ .path = tar_name, .kind = .dir, .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e| {
             try skipOrFail(e, stats);
             return null;
         };
         stats.dirs += 1;
+        if (walk.opts.same_device) {
+            const dev = (@as(u64, stx.dev_major) << 32) | stx.dev_minor;
+            if (!walk.have_dev) {
+                walk.dev = dev;
+                walk.have_dev = true;
+            } else if (dev != walk.dev) return null; // a mount point: header only
+        }
         return std.Io.Dir.cwd().openDir(io, fs_path, .{ .iterate = true }) catch null;
     } else if (ifmt == linux.S.IFLNK) {
         var lbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1795,6 +1846,9 @@ fn emitNode(io: std.Io, tw: Writer, fs_buf: *[std.fs.max_path_bytes]u8, fs_len: 
         };
         stats.symlinks += 1;
     } else if (ifmt == linux.S.IFREG) {
+        if (walk.opts.max_bytes) |m| {
+            if (stx.size > m or stats.bytes > m - stx.size) return error.LimitExceeded;
+        }
         // Open BEFORE the header: a file we cannot open is skipped (documented)
         // and counted, instead of an entry padded with `size` zero bytes -- a
         // mode-000 sparse file of terabytes would otherwise be written out as
@@ -2991,6 +3045,85 @@ test "packDir: statx numeric attrs survive the round-trip (Linux)" {
     try testing.expectEqual(@as(usize, 4), count);
     try testing.expect(seen_file);
     try testing.expect(seen_link);
+}
+
+fn tmpTreeRoot(io: std.Io, tmp: *testing.TmpDir, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
+    var rootbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(io, &rootbuf);
+    return std.mem.print(buf, "{s}/tree", .{rootbuf[0..tmp_len]});
+}
+
+test "packDirOptions: max_entries and max_bytes stop exactly one past the limit" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "tree/sub");
+    try tmp.dir.writeFile(io, .{ .sub_path = "tree/a.txt", .data = "0123456789" }); // 10
+    try tmp.dir.writeFile(io, .{ .sub_path = "tree/sub/b.txt", .data = "01234" }); // 5
+    try tmp.dir.symLink(io, "a.txt", "tree/sub/link", .{});
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try tmpTreeRoot(io, &tmp, &rb);
+
+    // 5 entries: tree, sub, a.txt, b.txt, link; 15 content bytes.
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    const full = try packDirOptions(io, gpa, &.{root_path}, &aw.writer, .{ .max_entries = 5, .max_bytes = 15 });
+    try testing.expectEqual(@as(usize, 2), full.files);
+    try testing.expectEqual(@as(usize, 2), full.dirs);
+    try testing.expectEqual(@as(usize, 1), full.symlinks);
+    try testing.expectEqual(@as(u64, 15), full.bytes);
+
+    var aw2: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw2.deinit();
+    try testing.expectError(error.LimitExceeded, packDirOptions(io, gpa, &.{root_path}, &aw2.writer, .{ .max_entries = 4 }));
+    try testing.expectError(error.LimitExceeded, packDirOptions(io, gpa, &.{root_path}, &aw2.writer, .{ .max_entries = 0 }));
+    try testing.expectError(error.LimitExceeded, packDirOptions(io, gpa, &.{root_path}, &aw2.writer, .{ .max_bytes = 14 }));
+    // A single file bigger than the whole limit, with nothing counted yet.
+    try testing.expectError(error.LimitExceeded, packDirOptions(io, gpa, &.{root_path}, &aw2.writer, .{ .max_bytes = 9 }));
+    // Defaults are packDir.
+    var aw3: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw3.deinit();
+    const d = try packDir(io, gpa, &.{root_path}, &aw3.writer);
+    try testing.expectEqual(full, d);
+}
+
+test "packDirOptions: same_device leaves a mount point as a bare directory" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // No mount can be made unprivileged: use a real boundary of the host,
+    // /dev and /dev/shm (tmpfs under devtmpfs), and skip when it is absent.
+    var a: linux.Statx = undefined;
+    var b: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "/dev", 0, linux.STATX.BASIC_STATS, &a)) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "/dev/shm", 0, linux.STATX.BASIC_STATS, &b)) != .SUCCESS) return error.SkipZigTest;
+    if (a.dev_major == b.dev_major and a.dev_minor == b.dev_minor) return error.SkipZigTest;
+    if (b.mode & linux.S.IFMT != linux.S.IFDIR) return error.SkipZigTest;
+
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    _ = try packDirOptions(io, gpa, &.{"/dev"}, &aw.writer, .{ .same_device = true });
+    try aw.writer.flush();
+
+    var src: std.Io.Reader = .fixed(aw.writer.buffered());
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    var decomp = flate.Decompress.init(&src, .gzip, window);
+    var tr = Reader.init(gpa, &decomp.reader);
+    defer tr.deinit();
+    var saw_shm = false;
+    while (try tr.next()) |e| {
+        if (std.mem.eql(u8, e.path, "dev/shm") or std.mem.eql(u8, e.path, "dev/shm/")) {
+            saw_shm = true;
+            try testing.expectEqual(Kind.dir, e.kind);
+        } else try testing.expect(!std.mem.startsWith(u8, e.path, "dev/shm/"));
+    }
+    try testing.expect(saw_shm);
 }
 
 test "packDirToPath: round-trips through the reader, same stats as packDir" {

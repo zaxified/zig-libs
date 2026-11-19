@@ -165,6 +165,7 @@ python3 -c "import tarfile; [print(len(m.name), m.uid, m.gid, m.mtime) for m in 
   copies both into a distinctly-typed `OwnedEntry` (its own `deinit`, unlike
   plain `Entry`, which never owns anything) for a caller that needs an entry
   to survive past the next iteration, e.g. building a manifest.
+- **`packDirOptions`** is `packDir` with `PackOptions`: `same_device` (do not descend into another device, GNU tar `--one-file-system`), `max_entries`, `max_bytes` (`error.LimitExceeded`, the output is then an unfinished stream to discard); use it for trees you do not control. The defaults equal `packDir`.
 - **`packDirToPath`** wraps `packDir` with the create-file/wrap-writer/flush
   steps every direct caller otherwise repeats; `packDir` itself still writes
   to a caller-owned `*std.Io.Writer` for callers who want to compose it
