@@ -6,7 +6,9 @@
 
 **Scope:** parity — Go `archive/tar` (Go 1.26.8) / tar-rs 0.4.46; GNU tar, busybox and pax archives read: pax `path`/`linkpath`/`size`/`uid`/`gid`/`uname`/`gname`/`mtime` incl. nanoseconds, sparse members (GNU old 'S', pax `GNU.sparse` 0.0/0.1/1.0; `-Dtar-sparse`), `checkPath`/`checkEntry`/`checkArchive` for extractors (surveyed 2026-11-04; consciously not done: pax 'g' application, arbitrary pax records, sparse writing, an extractor)
 
-**Audit:** review 2026-09-01 · mutation 2026-10-04 (51/53, 2 eq) · src ?
+**Audit:** review 2026-09-01 · mutation 2026-11-19 (66/68, 2 eq) · src d0d9dc0fda41cf7d
+
+Delta mutation 2026-11-19 (`packDirOptions`: `same_device`, `max_entries`, `max_bytes`, the device key): 15 mutants, 12 killed at once, 3 survived the first tests (the entry-count gate for directories and for symlinks, `same_device` re-reading the device per root) and got tests; 15 killed, 0 equivalent. The card counts are cumulative: the 2026-10-04 run (51/53, 2 eq) plus these 15.
 
 Delta audit 2026-11-04 (independent read of the 2026-11 production diff, 112 mutants: 103 killed, 37 of them by 18 tests it added, 9 decided). Proven against GNU tar 1.35 and fixed: an 'S' member whose `size` its map does not use let `tar -x` create a member `checkArchive` never saw, now `BadHeader` as in Go; a symlink at `a/b/` was counted one level too deep; `-Dtar-sparse=false` read sparse members as something else. `GNU.sparse.major` without a minor is now `BadHeader`. These fixes came after the mutant run: each has a test that went red first, no mutants. Not a whole-module score, so the Audit line stays as it is. Kept as policy: zero-length map entries are dropped unvalidated, an empty pax `uname`/`gname` leaves the ustar field.
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — Audit record: delta mutation of the `packDirOptions` code (15 mutants, all killed, 3 after new tests); card counts cumulative, 66/68 with 2 eq.
 - **2026-11-19** — Tests only: `packDirOptions` limits count directories and symlinks, `same_device` takes the device per root (mutation survivors).
 - **2026-11-19** — Tests only: `devKey` (the device identity `PackOptions.same_device` compares) is a function with its own test.
 - **2026-11-19** — New API, no break: `packDirOptions(io, gpa, roots, dst, PackOptions)` with `same_device` (a directory on another device than its root keeps its header and is not descended, as GNU tar `--one-file-system`), `max_entries` and `max_bytes` (`error.LimitExceeded` before the entry or file that would pass the limit); the defaults are `packDir`, which now calls it. Bounds a walk of `/`, `/proc` or a bind-mount loop that `packDir` cannot.
