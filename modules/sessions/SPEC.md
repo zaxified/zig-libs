@@ -134,9 +134,13 @@ Closed against scs v2.9.0 (cites are `~/go/pkg/mod/github.com/alexedwards/scs/v2
   (optional), `Store.iterate`, `Manager.iterate(gpa, ctx, f)` where `f` returns `IterateAction`
   (`keep`/`destroy`/`stop`); returns the number destroyed. Expired records (idle/absolute) are skipped. A
   `.destroy` goes through `Store.delete` (generation bump), so a request already holding that session cannot
-  resurrect it — the CAS guarantee is unchanged (tested). `KvStore` lists `db.keys(prefix)` (a snapshot) and
-  reads each key like `get`, skipping keys removed in between and non-records; its lock is taken per read,
-  never across the callback. `RamcacheStore` has no enumeration (`iterate = null`): `Manager.iterate`
+  resurrect it — the CAS guarantee is unchanged (tested). `KvStore` lists the keys under its prefix with
+  `db.scanKeys` a page of `KvStore.Config.iterate_page` (default 256) at a time — memory bounded by the
+  page, not the number of sessions (until 2026-11-19 one `db.keys` snapshot of every key) — and reads each
+  key like `get`, skipping keys removed in between and non-records; its lock is taken per read, never across
+  the callback. Between pages `kv`'s cursor rule holds (kv SPEC § "Paged key scan"): a session live for the
+  whole walk is shown exactly once, in key order; one created during the walk is shown iff its key sorts
+  after the page already listed (scs's `Iterate` over a store's `All` has no rule for that either). `RamcacheStore` has no enumeration (`iterate = null`): `Manager.iterate`
   returns `error.Unsupported`. Logout-everywhere for a user whose id the app stored via `putValue("uid", …)`
   is one pass; the test shows 3 sessions of A and 2 of B.
 - **`Options.hash_id_in_store`** (scs `HashTokenInStore`: data.go `hashToken` 627-630, applied in
@@ -353,7 +357,7 @@ bump (the stale `persist` would succeed); `hash_id_in_store…RamcacheStore` if 
 
 ## Backlog / deferred
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed):** ~~`Csrf.issue` drops its cookie silently on options `SetCookie.bufPrint` refuses~~ **DONE 2026-11-19**: `Csrf.validate()` is the startup check (Csrf has no `init`; `issue` stays best-effort and fails closed); ~~a stored record whose `created`/`last_seen` lies in the future never expires~~ **DONE 2026-11-19**: `decode` reads a future `created` as now (min with the clock), and the next save writes that back, so the absolute timeout runs from there; a future `last_seen` was already harmless (never past the idle window, restamped by the save). Chosen over "expire it" because a clock stepped back (NTP, documented at `Clock.realtime`) would otherwise log everybody out; scs/Django store a deadline, which a future-dated record defeats the same way, so there is no reference behaviour to follow and the safe, non-breaking clamp is used. `CookieManager` is unchanged: its timestamps are sealed by the server itself; `KvStore.iterate` lists every key in memory — **LARGE, left**: `kv` has only `keys`/`iterator`, both snapshot every key; a paged or streaming key scan is a `kv` change (outside this module).
+- **No-panic sweep 2026-10-28 (LOW, not fixed):** ~~`Csrf.issue` drops its cookie silently on options `SetCookie.bufPrint` refuses~~ **DONE 2026-11-19**: `Csrf.validate()` is the startup check (Csrf has no `init`; `issue` stays best-effort and fails closed); ~~a stored record whose `created`/`last_seen` lies in the future never expires~~ **DONE 2026-11-19**: `decode` reads a future `created` as now (min with the clock), and the next save writes that back, so the absolute timeout runs from there; a future `last_seen` was already harmless (never past the idle window, restamped by the save). Chosen over "expire it" because a clock stepped back (NTP, documented at `Clock.realtime`) would otherwise log everybody out; scs/Django store a deadline, which a future-dated record defeats the same way, so there is no reference behaviour to follow and the safe, non-breaking clamp is used. `CookieManager` is unchanged: its timestamps are sealed by the server itself; ~~`KvStore.iterate` lists every key in memory~~ **DONE 2026-11-19**: it walks `kv`'s new paged `Db.scanKeys` (`Config.iterate_page` keys per page).
 
 - **ct, not measured (2026-10-09 ct review):** a session is looked up by its secret id through the
   store (`m.store.get`, `root.zig` ~703 → ramcache `getImpl` / kv `KvStore.key`): hashing and
@@ -420,6 +424,10 @@ bump (the stale `persist` would succeed); `hash_id_in_store…RamcacheStore` if 
 - ~~**Hash the id in the store (scs `HashTokenInStore`)**~~ — **DONE 2026-10-11** (`Options.hash_id_in_store`).
 - **`RamcacheStore` iterate** — `Manager.iterate` returns `error.Unsupported` over it: needs a ramcache entry
   iterator (keys + values under the store's lock) that does not exist yet. `KvStore` supports it.
+  Re-checked 2026-11-19 and left: `ramcache` has only `drainDirty` (dirty entries, callback under the
+  cache's walk), and the vtable forbids holding the store lock across `visit`; a bounded walk would need a
+  resumable cursor over an evicting, unordered cache (expiry, reservations, the in-hook guard) — a new
+  `ramcache` API, not a small additive change.
 - **`MergeSession` / `SetDeadline`** (scs data.go 310, 584) — not built: rare helpers; with the values API and
   `iterate` a caller composes them.
 - **Shared `Store` (Redis/SQL)** — rejected: the `Store` vtable is the seam; zig-libs has no Redis/SQL client,

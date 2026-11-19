@@ -423,6 +423,8 @@ pub const KvStore = struct {
     prefix_buf: [max_prefix_len]u8 = undefined,
     prefix_len: usize = 0,
     ttl_ms: u64,
+    /// `Config.iterate_page`.
+    iterate_page: usize = 256,
     /// Held across `Db` writes (an `fsync` each): an `std.Io.Mutex` when the
     /// `Db`'s storage has an `Io`, so a waiting task yields instead of
     /// spinning (see `kv.Lock`).
@@ -438,11 +440,20 @@ pub const KvStore = struct {
         /// `kv` expiry per record, refreshed by every save. It should cover
         /// the longest a session may live (the absolute timeout); 0 = none.
         ttl_ms: u64 = @intCast(@divTrunc(default_absolute_timeout_ns, std.time.ns_per_ms)),
+        /// Keys listed per `kv` scan page by `iterate`: its memory is this
+        /// many key copies, whatever the number of sessions. 0 is taken as 1.
+        iterate_page: usize = 256,
     };
 
     pub fn init(db: *kv.Db, options: Config) error{PrefixTooLong}!KvStore {
         if (options.prefix.len > max_prefix_len) return error.PrefixTooLong;
-        var self: KvStore = .{ .db = db, .ttl_ms = options.ttl_ms, .prefix_len = options.prefix.len, .lock = .{ .io = db.store.io } };
+        var self: KvStore = .{
+            .db = db,
+            .ttl_ms = options.ttl_ms,
+            .iterate_page = options.iterate_page,
+            .prefix_len = options.prefix.len,
+            .lock = .{ .io = db.store.io },
+        };
         @memcpy(self.prefix_buf[0..options.prefix.len], options.prefix);
         return self;
     }
@@ -543,11 +554,15 @@ pub const KvStore = struct {
         self.db.delete(k) catch self.failed.store(true, .release);
     }
 
-    /// Every live session under this store's prefix: `db.keys` lists them
-    /// (a snapshot), then each is read like `get` does. A key removed between
-    /// the listing and its read, or not a framed record, is skipped. The lock
-    /// is taken per read, never across `visit`, so the callback may `delete`.
-    /// A closed (failed) store lists nothing.
+    /// Every live session under this store's prefix: `db.scanKeys` lists
+    /// them a page of `Config.iterate_page` keys at a time (memory bounded
+    /// by the page, not the store), then each is read like `get` does. A key
+    /// removed between the listing and its read, or not a framed record, is
+    /// skipped. The lock is taken per read, never across `visit`, so the
+    /// callback may `delete` (or save). Between pages the scan follows
+    /// `kv`'s cursor rule: a session live throughout is visited exactly
+    /// once; one created meanwhile is visited iff its key sorts after the
+    /// page already listed. A closed (failed) store lists nothing.
     fn iterateImpl(
         ptr: *anyopaque,
         gpa: Allocator,
@@ -556,13 +571,27 @@ pub const KvStore = struct {
     ) StoreError!void {
         const self: *KvStore = @ptrCast(@alignCast(ptr));
         if (self.hasFailed()) return;
-        const listing = try self.db.keys(gpa, self.prefix_buf[0..self.prefix_len]);
-        defer listing.deinit(gpa);
-        for (listing.keys) |k| {
-            const id = k[self.prefix_len..];
-            const loaded = (try getImpl(ptr, gpa, id)) orelse continue;
-            defer gpa.free(loaded.record);
-            if (!visit(ctx, id, loaded)) return;
+        const prefix = self.prefix_buf[0..self.prefix_len];
+        // The cursor: a copy of the last key of the previous page (a key,
+        // not a position, so deletes by `visit` cannot shift it).
+        var cursor: ?[]u8 = null;
+        defer if (cursor) |c| gpa.free(c);
+        while (true) {
+            const page = self.db.scanKeys(gpa, prefix, cursor, @max(self.iterate_page, 1)) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidLimit => unreachable, // the limit is >= 1
+            };
+            defer page.deinit(gpa);
+            for (page.keys) |k| {
+                const id = k[self.prefix_len..];
+                const loaded = (try getImpl(ptr, gpa, id)) orelse continue;
+                defer gpa.free(loaded.record);
+                if (!visit(ctx, id, loaded)) return;
+            }
+            if (!page.more) return;
+            const next = try gpa.dupe(u8, page.last().?);
+            if (cursor) |c| gpa.free(c);
+            cursor = next;
         }
     }
 };
@@ -3847,6 +3876,62 @@ test "Manager.iterate over KvStore: junk keys under the prefix are skipped, the 
     var ctx: Logout = .{ .uid = "A" };
     try testing.expectEqual(@as(usize, 3), try m.iterate(testing.allocator, &ctx, Logout.visit));
     try testing.expectEqual(@as(usize, 5), ctx.seen); // all five sessions, no junk key
+}
+
+// 2026-11-19: `iterateImpl` walks `kv.Db.scanKeys` pages instead of one `keys`
+// snapshot. A store several pages long, with the callback destroying sessions
+// and junk keys (one longer than any id) between them: every session is shown
+// exactly once, whatever the page size.
+test "Manager.iterate over KvStore: a store larger than one page, every page size" {
+    for ([_]usize{ 0, 1, 2, 3, 5, 7, 256 }) |page| {
+        var env: KvEnv = undefined;
+        try env.init();
+        defer env.deinit();
+        env.store.iterate_page = page; // 0 is taken as 1
+        var m = try env.manager();
+        var name: [300]u8 = undefined;
+        try env.db.put("session:", "xy");
+        try env.db.put(try std.mem.print(&name, "session:{s}", .{&@as([260]u8, @splat('8'))}), "xy");
+        var ids: [5][64]u8 = undefined;
+        try fiveUsers(&m, &ids);
+        var more_ids: [5][64]u8 = undefined;
+        try fiveUsers(&m, &more_ids);
+        for (0..4) |i| try env.db.put(try std.mem.print(&name, "session:{d}junk", .{i}), "xy");
+
+        var ctx: Logout = .{ .uid = "A" };
+        try testing.expectEqual(@as(usize, 6), try m.iterate(testing.allocator, &ctx, Logout.visit));
+        try testing.expectEqual(@as(usize, 10), ctx.seen);
+        ctx = .{ .uid = "A" };
+        try testing.expectEqual(@as(usize, 0), try m.iterate(testing.allocator, &ctx, Logout.visit));
+        try testing.expectEqual(@as(usize, 4), ctx.seen);
+        var l: Session = .{};
+        for ([_]*[5][64]u8{ &ids, &more_ids }) |set| {
+            for (set[0..3]) |*id| try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+            for (set[3..5]) |*id| try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+        }
+    }
+}
+
+test "Manager.iterate over KvStore: an allocation failure at any point is OutOfMemory, nothing leaks" {
+    var env: KvEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    env.store.iterate_page = 2;
+    var m = try env.manager();
+    var ids: [5][64]u8 = undefined;
+    try fiveUsers(&m, &ids);
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var ctx: Logout = .{ .uid = "nobody" };
+        if (m.iterate(fa.allocator(), &ctx, Logout.visit)) |n| {
+            try testing.expectEqual(@as(usize, 0), n);
+            try testing.expectEqual(@as(usize, 5), ctx.seen);
+            break;
+        } else |e| try testing.expectEqual(error.OutOfMemory, e);
+    }
+    // Three pages (2 + 2 + 1), each a heap, a key array and key copies.
+    try testing.expect(fail_index > 9);
 }
 
 fn sha256Of(id: []const u8) [32]u8 {

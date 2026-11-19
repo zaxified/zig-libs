@@ -91,7 +91,8 @@ const n = try mgr.iterate(gpa, &uid, ofUser); // number destroyed
 
 `iterate` visits every live (not expired) session; `.destroy` removes it through the store's
 delete, so a request that already holds the session cannot save it back. `KvStore` supports
-it; over `RamcacheStore` it returns `error.Unsupported`.
+it, listing `KvStore.Config.iterate_page` keys (default 256) per `kv` scan page, so its memory
+does not grow with the number of sessions; over `RamcacheStore` it returns `error.Unsupported`.
 
 A `RamcacheStore` keys the cache by the cookie value (or its hash) with no prefix: give it a
 `ramcache.Cache` of its own, never one shared with other data — a client chooses the key it
