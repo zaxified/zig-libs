@@ -1040,7 +1040,7 @@ pub const Handler = struct {
             // Defense against markup / log injection via crafted filenames;
             // `"` becomes `&#34;`, as in Go's FileServer listing.
             try http.writeHtmlEscaped(w, entry.name);
-            if (entry.kind == .directory) try w.writeAll("/");
+            if (Snapshot.realKind(h.io, dh.dir, entry.name, entry.kind) == .directory) try w.writeAll("/");
             try w.writeAll("</li>\n");
         }
         try w.writeAll("</ul>\n");
@@ -1608,11 +1608,23 @@ pub const Snapshot = struct {
         s.paths.putAssumeCapacity(rel, .{ .file = id });
     }
 
+    /// The kind of a directory entry. Some filesystems (XFS without ftype,
+    /// some NFS and FUSE mounts) report `d_type` DT_UNKNOWN, which `iterate`
+    /// surfaces as `.unknown`; those entries are classified by one no-follow
+    /// `fstatat`, as `find`/`ftw` do, instead of being skipped (a file never
+    /// served, a directory never walked). A failed stat leaves `.unknown`,
+    /// which the walk skips -- fails closed.
+    fn realKind(io: Io, dir: Dir, name: []const u8, kind: File.Kind) File.Kind {
+        if (kind != .unknown) return kind;
+        const st = dir.statFile(io, name, .{ .follow_symlinks = false }) catch return .unknown;
+        return st.kind;
+    }
+
     fn walk(s: *Snapshot, io: Io, root: Dir, dir: Dir, prefix: []const u8, depth: usize, prev: ?*Snapshot) SnapshotError!void {
         var it = dir.iterate();
         while (it.next(io) catch return error.IoError) |entry| {
             if (!s.options.serve.serve_dotfiles and entry.name.len != 0 and entry.name[0] == '.') continue;
-            switch (entry.kind) {
+            switch (realKind(io, dir, entry.name, entry.kind)) {
                 .file => {
                     if (s.files.items.len == s.options.max_files) return error.TooManyFiles;
                     const rel = try s.join(prefix, entry.name);
@@ -4264,6 +4276,25 @@ test "serve: a listing stops at max_listing_entries with a truncation line (swee
     const all = get(&h_all, "/many/", &out);
     try testing.expect(mem.find(u8, all, "[listing truncated]") == null);
     try testing.expect(mem.find(u8, all, "<li>f4.txt</li>") != null);
+}
+
+test "Snapshot.realKind: a DT_UNKNOWN entry is classified by a no-follow stat, a known kind is trusted (review 2026-10-24 L9)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "f.txt", .data = "x" });
+    _ = try root.createDirPathOpen(io, "d", .{});
+    try root.symLink(io, "f.txt", "l", .{});
+    try testing.expectEqual(File.Kind.file, Snapshot.realKind(io, root, "f.txt", .unknown));
+    try testing.expectEqual(File.Kind.directory, Snapshot.realKind(io, root, "d", .unknown));
+    // No-follow: a link stays a link, so the walk still never serves it.
+    try testing.expectEqual(File.Kind.sym_link, Snapshot.realKind(io, root, "l", .unknown));
+    // A vanished entry fails closed.
+    try testing.expectEqual(File.Kind.unknown, Snapshot.realKind(io, root, "gone", .unknown));
+    // A kind the filesystem did report is not re-stat'ed.
+    try testing.expectEqual(File.Kind.directory, Snapshot.realKind(io, root, "f.txt", .directory));
 }
 
 test "Snapshot: a file the walk cannot open is left out, not an error; deinit closes every descriptor" {

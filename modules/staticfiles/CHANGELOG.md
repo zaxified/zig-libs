@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **Fix (review 2026-10-24 L9):** `Snapshot` (and a `Handler` listing's trailing `/`) classifies an entry whose filesystem reports `d_type` DT_UNKNOWN (XFS without ftype, some NFS/FUSE) by one no-follow `fstatat` instead of skipping it, so such files are served and such directories walked, as with `find`/`ftw`; a failed stat still skips (fails closed). Symlinks stay unserved. Test: `Snapshot.realKind`.
 - **2026-11-18** — **Behaviour change (security triage, RFC 9110 §13.1.5):** an `If-Range` HTTP-date authorizes a `Range` only when the `Last-Modified` sent is strong, that is at least one second older than the response's `Date`; a file modified within the last second (or with an mtime in the future) answers with the full 200, which closes the same-second replace splice that the date branch left open. Entity tags are unaffected. Delta mutation of `isStrongLastModified` and its call site: 5 mutants, 4 killed, 1 unobservable (the `>=`/`>` edge at exactly one second needs an injectable clock). Card A1 again.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation run over `resolveForServe` after the test-only counter fix (44 mutants): 1 test added: a followed file link that leaves the root answers 403 and gives its descriptor back. No production code changed.
