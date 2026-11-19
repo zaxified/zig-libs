@@ -381,22 +381,32 @@ pub const SecureAuth = struct {
     }
 
     fn onReply(self: *SecureAuth, seq: u4, data: []const u8, peer: ?u16, now_ms: u64, iin: Iin, out: []u8) Error!Decision {
-        // The outstanding challenge is consumed by any reply, good or bad:
-        // a failed reply leaves nothing a second attempt could ride on.
         const p = self.pending orelse {
             self.stats.unexpected_messages += 1;
             return .silent;
         };
-        self.pending = null;
         const stored = self.pending_storage[0..p.request_len];
         const hdr = application.decodeRequestHeader(stored) catch unreachable; // validated when stored
-        const reply = sa.Reply.decode(data) catch return try self.fail(seq, 0, now_ms, iin, out);
-        // The challenge, the reply and the final response all carry the
-        // critical request's own application sequence number: the exchange
-        // consumes none, so a SELECT authenticated this way is still followed
-        // by an OPERATE with sequence + 1.
-        if (reply.challenge_seq_num != p.csq or seq != hdr.header.control.seq or !samePeer(peer, p.peer))
-            return try self.fail(seq, reply.user_number, now_ms, iin, out);
+        // A reply that does not name the outstanding exchange — another CSQ,
+        // another application sequence number (the challenge, the reply and
+        // the final response all carry the critical request's own, so a
+        // SELECT authenticated this way is still followed by an OPERATE with
+        // sequence + 1), another peer, or no decodable reply at all — is
+        // ignored and leaves the challenge in place: it is not an answer to
+        // it, and letting it cancel the exchange would hand any station a
+        // one-message veto (review MEDIUM-2). It cannot pass either, so no
+        // replay opens.
+        const reply = sa.Reply.decode(data) catch {
+            self.stats.unexpected_messages += 1;
+            return .silent;
+        };
+        if (reply.challenge_seq_num != p.csq or seq != hdr.header.control.seq or !samePeer(peer, p.peer)) {
+            self.stats.unexpected_messages += 1;
+            return .silent;
+        }
+        // A reply that does name it consumes it, good or bad: a failed MAC
+        // leaves nothing a second attempt could ride on.
+        self.pending = null;
         const user = self.keyedUser(reply.user_number, now_ms) orelse
             return try self.fail(seq, reply.user_number, now_ms, iin, out);
         if (!sa.verifyReplyMac(
@@ -805,10 +815,25 @@ test "SA: a reply with the wrong CSQ, sequence, peer, user or key never executes
             .no_peer => null,
             else => 1,
         };
-        const resp = (try rig.sendFrom(r, peer, 1)).?;
-        try testing.expect(isSaError(resp));
+        const answers = switch (case) {
+            .csq, .seq, .peer, .no_peer => false,
+            else => true,
+        };
+        const resp = try rig.sendFrom(r, peer, 1);
         try testing.expect(!rig.bouts[0].value);
-        try testing.expectEqual(@as(?SecureAuth.Pending, null), rig.auth.pending);
+        if (answers) {
+            // It answers the outstanding challenge and fails: consumed.
+            try testing.expect(isSaError(resp.?));
+            try testing.expectEqual(@as(?SecureAuth.Pending, null), rig.auth.pending);
+        } else {
+            // It does not answer it: ignored, and the master's genuine
+            // reply still goes through.
+            try testing.expectEqual(@as(?[]u8, null), resp);
+            try testing.expect(rig.auth.pending != null);
+            var good: [64]u8 = undefined;
+            _ = (try rig.send(try rig.reply(&good, 5, csq, 1, &kat_control_key), 2)).?;
+            try testing.expect(rig.bouts[0].value);
+        }
     }
 }
 
@@ -837,7 +862,7 @@ test "SA: a reply after the timeout, or to a replaced challenge, does not execut
     var req2: [32]u8 = undefined;
     const second = try challengeCsq((try rig.send(crobRequest(&req2, 4, .direct_operate, 1), 3001)).?);
     try testing.expectEqual(first +% 1, second);
-    try testing.expect(isSaError((try rig.send(old, 3002)).?));
+    try testing.expectEqual(@as(?[]u8, null), try rig.send(old, 3002));
     try testing.expect(!rig.bouts[0].value and !rig.bouts[1].value);
 }
 

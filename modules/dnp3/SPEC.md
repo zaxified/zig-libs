@@ -290,9 +290,10 @@ Behaviour, and why:
   sequence number, so an authenticated SELECT is still followed by an OPERATE with seq + 1), the
   peer is the one that sent the request, the user has installed and unexpired session keys, and
   `sa.verifyReplyMac` (constant time, control-direction key, MAC over `challenge message ‖
-  critical request`) passes. Any reply consumes the outstanding challenge first. A new critical
-  request replaces an outstanding challenge (one at a time), and a reply after `reply_timeout_ms`
-  (default 2 s) finds none.
+  critical request`) passes. A reply that names the outstanding exchange (its CSQ, sequence number
+  and peer) consumes it, whether its MAC verifies or not; one that does not is ignored and leaves
+  the challenge in place. A new critical request replaces an outstanding challenge (one at a
+  time), and a reply after `reply_timeout_ms` (default 2 s) finds none.
 - **No-ack critical requests** (DIRECT_OPERATE_NR, the *_NR freezes) cannot be challenged, because
   the master expects no answer. They are discarded unless sent in aggressive mode.
 - **Aggressive mode**: a request whose first object is g120v3 and whose last object is g120v9
@@ -317,6 +318,26 @@ Behaviour, and why:
   (AUTHENTICATE_REQUEST_NO_ACK) is counted and not answered. Unexpected or undecodable
   AUTHENTICATE_REQUESTs are counted and ignored.
 - **Statistics** (`Statistics`) count each of these events in memory.
+
+**Security notes** (from the independent review of 2026-11-19):
+
+- *Unauthenticated messages can disturb an exchange in flight (review MEDIUM-2).* SA cannot
+  stop a station from sending unauthenticated traffic. Each such message can cost the master one
+  exchange, and the master recovers with its next attempt:
+  - another critical request replaces the outstanding challenge;
+  - a reply with the right CSQ, sequence and peer but a bad MAC consumes it;
+  - a g120v4 or a junk g120v6 closes or replaces the key-change window;
+  - a critical request also advances the CSQ and the "last challenge" an aggressive-mode master
+    chains from.
+
+  An on-path attacker can do the same by dropping frames, and the link-layer source filter
+  (`require_master_source`, on by default) already keeps other stations' frames out. The one
+  cheap narrowing is in place: a reply that does not name the outstanding exchange (another CSQ,
+  sequence number or peer) is ignored without consuming it. It cannot pass, so ignoring it opens
+  no replay.
+- *Status requests do not enumerate users.* A g120v4 for an unknown user is answered like one for a
+  known user without keys (NOT_INIT), and that window refuses every key change. Timing still
+  differs (no MAC is computed for an unknown or unkeyed user); user numbers are not secret.
 
 **Anchoring.** No live SA peer exists, so the first `secure_auth` test pins a whole exchange
 against vectors **derived by hand outside the module**: Python's `hmac`/`hashlib` for every MAC

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — Behaviour change (review MEDIUM-2, `secure_auth`): a g120v2 reply that does not name the outstanding challenge (another CSQ, application sequence number or peer, or undecodable) is now ignored and counted, and leaves the challenge in place, so the master's genuine reply still goes through. Before, it consumed the challenge and was answered with g120v7. A reply that names the challenge still consumes it whether its MAC verifies or not. SPEC gains "Security notes" on what unauthenticated traffic can still disturb.
 - **2026-11-19** — Behaviour change (review LOW-3, `secure_auth`): a key change whose confirmation MAC cannot be computed (a non-HMAC `mac_algorithm`) is refused with g120v7 before any key is installed, instead of being confirmed with an empty MAC; `challenge_len` is clamped to 4..64 where it is used, not only in `init`; a g120v4 for an unknown user is answered with a g120v5 NOT_INIT like a known user without keys (and its key-change window refuses every change) instead of a g120v7, so the status request no longer reveals which users exist.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** card audit line takes the src hash after the last src edit (a comment).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/sa_outstation_kat.py`, the recipe (Python `hmac` + `cryptography`) that derived the Secure Authentication vectors the first `secure_auth` test pins; the test's comment names it.
