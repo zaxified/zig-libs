@@ -36,7 +36,7 @@ const transport = @import("transport.zig");
 const security = @import("security.zig");
 
 pub const ServiceError = encoding.EncodeError || encoding.DecodeError || transport.TransportError ||
-    security.SealAsymmetricError || security.OpenAsymmetricError || security.SymmetricDecryptAndVerifyError || error{
+    security.SealAsymmetricError || security.OpenAsymmetricError || security.KeyLengthError || security.SymmetricDecryptAndVerifyError || error{
     /// The peer answered with a ServiceFault instead of the expected
     /// response type. `Channel.last_service_result` holds the StatusCode
     /// from the fault's `ResponseHeader.service_result`.

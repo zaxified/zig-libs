@@ -173,6 +173,14 @@ pub const SecurityConfig = struct {
     /// `SenderCertificate` in that header is bounded separately, by
     /// `max_certificate_len`, and costs no private-key work.)
     max_opn_encrypted_len: usize = 4096,
+    /// Testing only: skip the OPC 10000-7 key-length band of the served
+    /// policy (`SecurityPolicy.allowsKeyBits`: 2048..4096 bits for
+    /// Basic256Sha256) for this server's own key and for peer
+    /// certificates. By default a secured OPN is refused when the server's
+    /// own key is out of band (`BadSecurityPolicyRejected`) or the
+    /// client certificate's is (`BadCertificateUseNotAllowed`, the status
+    /// open62541 answers).
+    insecure_allow_key_length_outside_policy: bool = false,
 };
 
 pub const Config = struct {
@@ -1270,6 +1278,14 @@ pub const Connection = struct {
             try c.fail(out, status.bad_security_policy_rejected, "this server is configured for SecurityPolicy#None only");
             return .failed;
         };
+        // Our own key must satisfy the policy's band, or this server cannot
+        // honestly offer the policy (OPC 10000-7).
+        if (!sec.insecure_allow_key_length_outside_policy and
+            !security.SecurityPolicy.basic256sha256.allowsKeyBits(sec.credentials.public_key.bits()))
+        {
+            try c.fail(out, status.bad_security_policy_rejected, "own RSA key length is outside the SecurityPolicy's band");
+            return .failed;
+        }
         // Bound the private-key work before doing any: each RSA-OAEP block of
         // the encrypted region is one private-key operation, all of them spent
         // before the signature can say who sent it (review 2026-10-06).
@@ -1417,7 +1433,11 @@ pub const Connection = struct {
     /// order. Returns `status.good` or the `Bad…` code to answer with.
     fn checkPeerCertificate(c: *Connection, sec: SecurityConfig, certificate_der: []const u8, now_ms: i64) encoding.StatusCode {
         // Must parse and carry an RSA key — everything downstream assumes it.
-        _ = security.certificatePublicKey(certificate_der) catch return status.bad_certificate_invalid;
+        const peer_pk = security.certificatePublicKey(certificate_der) catch return status.bad_certificate_invalid;
+        // OPC 10000-7 key-length band (2048..4096 bits for Basic256Sha256);
+        // open62541's `rsaNewChannelContext` answers the same status.
+        if (!sec.insecure_allow_key_length_outside_policy and !security.SecurityPolicy.basic256sha256.allowsKeyBits(peer_pk.bits()))
+            return status.bad_certificate_use_not_allowed;
 
         // notBefore/notAfter, against the wall clock the caller injected.
         // `wall_clock_epoch == 0` means no wall clock was injected at all
@@ -3592,6 +3612,7 @@ const TestPki = struct {
             random,
             .{
                 .modulus_bits = 1024,
+                .insecure_allow_key_length_outside_policy = true,
                 .common_name = "zig-libs opcua test client",
                 .not_before = opts.client_not_before,
                 .not_after = opts.client_not_after,
@@ -3606,6 +3627,7 @@ const TestPki = struct {
             random,
             .{
                 .modulus_bits = 1024,
+                .insecure_allow_key_length_outside_policy = true,
                 .common_name = "zig-libs opcua test server",
                 .not_before = opts.server_not_before,
                 .not_after = opts.server_not_after,
@@ -3636,7 +3658,7 @@ fn secureTestConfig(endpoints: []const services.EndpointDescription, pki: TestPk
     return .{
         .endpoints = endpoints,
         .users = &test_users,
-        .security = .{ .credentials = pki.server },
+        .security = .{ .credentials = pki.server, .insecure_allow_key_length_outside_policy = true },
     };
 }
 
@@ -3949,6 +3971,7 @@ const TestRig = struct {
     fn armSecurity(rig: *TestRig, mode: services.MessageSecurityMode, client: security.Credentials, server_certificate: []const u8) void {
         rig.channel.security = .{
             .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
             .mode = mode,
             .credentials = client,
             .server_certificate = server_certificate,
@@ -6860,7 +6883,7 @@ test "secure negatives: the OpenSecureChannel gate" {
     // (a) A mode no endpoint advertises. The server offers only None here.
     {
         var rig: TestRig = undefined;
-        try rig.init(gpa, .{ .endpoints = &test_endpoints, .security = .{ .credentials = pki.server } });
+        try rig.init(gpa, .{ .endpoints = &test_endpoints, .security = .{ .credentials = pki.server, .insecure_allow_key_length_outside_policy = true } });
         defer rig.deinit();
         try rig.handshake();
         rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
@@ -6892,6 +6915,7 @@ test "secure negatives: the OpenSecureChannel gate" {
             prng.random(),
             .{
                 .modulus_bits = 1024,
+                .insecure_allow_key_length_outside_policy = true,
                 .common_name = "a different server",
                 .not_before = "190101000000Z",
                 .not_after = "300101000000Z",
@@ -6981,6 +7005,61 @@ test "secure negatives: the OpenSecureChannel gate" {
     }
 }
 
+test "secure: peer certificate key length must fit the policy band (BadCertificateUseNotAllowed)" {
+    const gpa = testing.allocator;
+    const test_cert = @import("test_cert.zig");
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x78)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(endpoints, pki));
+    defer rig.deinit();
+    rig.srv.wall_clock_epoch = 0; // no wall clock: skip the validity window, this test is about key length
+
+    var strict = secureTestConfig(endpoints, pki).security.?;
+    strict.insecure_allow_key_length_outside_policy = false;
+    const lax = secureTestConfig(endpoints, pki).security.?;
+    const cases = [_]struct { bits: usize, ok: bool }{
+        .{ .bits = 1024, .ok = false },
+        .{ .bits = 2047, .ok = false },
+        .{ .bits = 2048, .ok = true },
+        .{ .bits = 4096, .ok = true },
+        .{ .bits = 4097, .ok = false },
+    };
+    var buf: [2048]u8 = undefined;
+    for (cases) |cs| {
+        const der = test_cert.withModulusBits(&buf, cs.bits);
+        const want = if (cs.ok) status.good else status.bad_certificate_use_not_allowed;
+        try testing.expectEqual(want, rig.conn.checkPeerCertificate(strict, der, 0));
+        // The testing escape lets every size through.
+        try testing.expectEqual(status.good, rig.conn.checkPeerCertificate(lax, der, 0));
+    }
+    // Garbage is still BadCertificateInvalid, not a key-length verdict.
+    try testing.expectEqual(status.bad_certificate_invalid, rig.conn.checkPeerCertificate(strict, "junk", 0));
+}
+
+test "secure: a server whose own key is outside the policy band refuses the OPN (BadSecurityPolicyRejected)" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x79)));
+    const pki = try TestPki.init(gpa, &prng, .{}); // 1024 / 1280-bit keys
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var config = secureTestConfig(endpoints, pki);
+    config.security.?.insecure_allow_key_length_outside_policy = false;
+
+    var rig: TestRig = undefined;
+    try rig.init(gpa, config);
+    defer rig.deinit();
+    try rig.handshake();
+    rig.armSecurity(.sign_and_encrypt, pki.client, pki.server.certificate_der);
+    var nonce: [32]u8 = @splat(0x5C);
+    try rig.sendOpenSecure(.sign_and_encrypt, .issue, &nonce);
+    try rig.expectTransportError(status.bad_security_policy_rejected);
+}
+
 test "secure: the session's ClientSignature must cover serverCertificate + serverNonce" {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
@@ -7034,6 +7113,7 @@ test "secure: the session's ClientSignature must cover serverCertificate + serve
             prng.random(),
             .{
                 .modulus_bits = 1024,
+                .insecure_allow_key_length_outside_policy = true,
                 .common_name = "impostor",
                 .not_before = "190101000000Z",
                 .not_after = "300101000000Z",
@@ -7065,6 +7145,7 @@ test "secure: the session's ClientSignature must cover serverCertificate + serve
             prng.random(),
             .{
                 .modulus_bits = 1024,
+                .insecure_allow_key_length_outside_policy = true,
                 .common_name = "other client",
                 .not_before = "190101000000Z",
                 .not_after = "300101000000Z",
@@ -7994,6 +8075,7 @@ test "secure: a renewal with another certificate, a #None renewal and an unknown
     var other: security.Credentials = undefined;
     try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
         .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
         .common_name = "another client",
         .not_before = "190101000000Z",
         .not_after = "300101000000Z",
@@ -8402,6 +8484,7 @@ test "secure CreateSession: the certificate must be the channel's and the nonce 
     var other: security.Credentials = undefined;
     try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
         .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
         .common_name = "session cert impostor",
         .not_before = "190101000000Z",
         .not_after = "300101000000Z",
@@ -10162,6 +10245,7 @@ test "root client over a pipe (SignAndEncrypt): the secure branches of open/crea
         .requested_lifetime_ms = 120_000,
         .security = .{
             .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
             .mode = .sign_and_encrypt,
             .credentials = pki.client,
             .server_certificate = pki.server.certificate_der,
@@ -10293,6 +10377,7 @@ test "root client over a pipe (Sign): a CreateSession answer signed with another
     var other: security.Credentials = undefined;
     try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
         .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
         .common_name = "impostor",
         .not_before = "190101000000Z",
         .not_after = "300101000000Z",
@@ -10312,6 +10397,7 @@ test "root client over a pipe (Sign): a CreateSession answer signed with another
     var channel: root.SecureChannel = undefined;
     try root.SecureChannel.open(&conn, gpa, .{ .security = .{
         .policy = .basic256sha256,
+        .insecure_allow_key_length_outside_policy = true,
         .mode = .sign,
         .credentials = pki.client,
         .server_certificate = pki.server.certificate_der,

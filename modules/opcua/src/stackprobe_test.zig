@@ -45,6 +45,7 @@ fn setup() !void {
     prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x42)));
     const opts = security.ClientCredentials.GenerateSelfSignedOptions{
         .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
         .common_name = "opcua-probe-client",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
@@ -108,6 +109,7 @@ test "STACKPROBE: no channel key, RSA key or password residue after any entry po
 
     const opts = security.ClientCredentials.GenerateSelfSignedOptions{
         .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
         .common_name = "opcua-probe-generated",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",

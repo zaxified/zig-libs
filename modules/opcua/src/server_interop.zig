@@ -2147,6 +2147,7 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
         rnd,
         .{
             .modulus_bits = 1024,
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "golden client",
             .not_before = "200101000000Z",
             .not_after = "350101000000Z",
@@ -2161,6 +2162,7 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
         rnd,
         .{
             .modulus_bits = 1024,
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "golden server",
             .not_before = "200101000000Z",
             .not_after = "350101000000Z",
