@@ -1659,6 +1659,18 @@ pub const PackOptions = struct {
 
 pub const PackDirOptionsError = PackDirError || error{LimitExceeded};
 
+/// One value per (major, minor) pair, so two devices compare equal only when both match.
+fn devKey(major: u32, minor: u32) u64 {
+    return (@as(u64, major) << 32) | minor;
+}
+
+test "devKey: major and minor both matter" {
+    try testing.expect(devKey(0, 1) != devKey(0, 2));
+    try testing.expect(devKey(1, 0) != devKey(2, 0));
+    try testing.expect(devKey(1, 2) != devKey(2, 1));
+    try testing.expectEqual(devKey(8, 17), devKey(8, 17));
+}
+
 /// Per-call walk state: the options and the device of the root being walked.
 const Walk = struct {
     opts: PackOptions,
@@ -1829,7 +1841,7 @@ fn emitNode(io: std.Io, tw: Writer, fs_buf: *[std.fs.max_path_bytes]u8, fs_len: 
         };
         stats.dirs += 1;
         if (walk.opts.same_device) {
-            const dev = (@as(u64, stx.dev_major) << 32) | stx.dev_minor;
+            const dev = devKey(stx.dev_major, stx.dev_minor);
             if (!walk.have_dev) {
                 walk.dev = dev;
                 walk.have_dev = true;
