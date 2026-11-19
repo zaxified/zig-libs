@@ -1244,7 +1244,7 @@ pub const Subscription = struct {
         );
         // One result per item, in order (§5.12.2.2); anything else cannot be
         // correlated, so the bookkeeping stays as it was.
-        if ((response.results orelse &.{}).len != specs.len) {
+        if ((if (response.results) |r| r.len else 0) != specs.len) {
             services.freeCreateMonitoredItemsResponse(sub.allocator, response);
             return error.ResultCountMismatch;
         }
@@ -1365,7 +1365,7 @@ pub const Subscription = struct {
         );
         // One result per item, in order (§5.12.3.2); anything else cannot be
         // correlated, so the handle table stays as it was.
-        if ((response.results orelse &.{}).len != specs.len) {
+        if ((if (response.results) |r| r.len else 0) != specs.len) {
             services.freeModifyMonitoredItemsResponse(sub.allocator, response);
             return error.ResultCountMismatch;
         }
