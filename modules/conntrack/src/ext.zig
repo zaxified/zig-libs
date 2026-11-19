@@ -701,3 +701,47 @@ test "decodeExpect: hostile names, lengths and truncations are errors, never a p
     var cut: usize = 0;
     while (cut <= p.len) : (cut += 1) _ = decodeExpect(p[0..cut]) catch {};
 }
+
+// ── whole-module mutation 2026-11-19: survivors of the first run ────────────
+
+test "DumpFilter.matches: a flow without a status never matches a status filter" {
+    const flt: DumpFilter = .{ .status = .{ .value = 2 } };
+    try testing.expect(!flt.matches(&Flow{}));
+    try testing.expect(flt.matches(&Flow{ .status = 2 }));
+}
+
+test "buildFlowDump: a zone filter pads to 4 bytes; a status filter with a mask sends STATUS then STATUS_MASK" {
+    const native = builtin.cpu.arch.endian();
+    const z = buildFlowDump(5, .{ .filter = .{ .zone = 7 } });
+    try testing.expectEqual(@as(usize, codec.header_len + wire.nfgenmsg_len + 8), z.bytes().len);
+    try testing.expectEqual(@as(u32, @intCast(z.bytes().len)), std.mem.readInt(u32, z.bytes()[0..4], native));
+    const s = buildFlowDump(5, .{ .filter = .{ .status = .{ .value = 0x8, .mask = 0xc } } });
+    var it: codec.AttrIterator = .{ .buf = s.bytes()[codec.header_len + wire.nfgenmsg_len ..] };
+    const a = (try it.next()).?;
+    try testing.expectEqual(CTA.STATUS, a.type);
+    try testing.expectEqual(@as(u32, 0x8), try a.asBe32());
+    const b = (try it.next()).?;
+    try testing.expectEqual(CTA.STATUS_MASK, b.type);
+    try testing.expectEqual(@as(u32, 0xc), try b.asBe32());
+    try testing.expect((try it.next()) == null);
+}
+
+test "the fixed stats and expectation requests carry the sequence number" {
+    const native = builtin.cpu.arch.endian();
+    try testing.expectEqual(@as(u32, 77), std.mem.readInt(u32, buildStatsCpuDump(77)[8..12], native));
+    try testing.expectEqual(@as(u32, 78), std.mem.readInt(u32, buildStatsGlobal(78)[8..12], native));
+    try testing.expectEqual(@as(u32, 79), std.mem.readInt(u32, buildExpectStatsDump(79)[8..12], native));
+}
+
+test "decodeExpect: fn_truncated says whether the expectation function name was cut" {
+    const gpa = testing.allocator;
+    inline for (.{ .{ "short\x00", false, 5 }, .{ "aaaaaaaaaaaaaaaaaaaa\x00", true, 15 } }) |c| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try wire.appendNfgenmsg(gpa, &list, .ipv4, 0);
+        try codec.appendAttr(gpa, &list, CTA_EXPECT.FN, c[0]);
+        const e = try decodeExpect(list.items);
+        try testing.expectEqual(@as(bool, c[1]), e.fn_truncated);
+        try testing.expectEqual(@as(usize, c[2]), e.fn_name.?.slice().len);
+    }
+}
