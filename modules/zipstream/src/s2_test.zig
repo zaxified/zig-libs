@@ -5,6 +5,7 @@
 //! symlink entries, the Info-ZIP Unicode Path field.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const zs = @import("root.zig");
 
@@ -501,4 +502,56 @@ test "LZMA (14) from Python zipfile reads; LZMA and XZ (95) round-trip, buffered
         try testing.expectEqualSlices(u8, d, got);
     }
     try testing.expect(archive.find("l.xml").?.flags & (1 << 1) != 0);
+}
+
+test "extractAll: windows_names refuses a device name or stream entry before writing anything" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // the writer itself refuses these names there
+    const a = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    try zw.addEntry("ok.txt", "x", .{});
+    try zw.addEntry("dir/NUL.txt", "y", .{});
+    try zw.addEntry("tt:1.log", "z", .{});
+    try zw.finish();
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(a, ms.source(), .{});
+    defer archive.deinit();
+
+    // POSIX default: ordinary names, extracted.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try zs.extractAll(&archive, testing.io, tmp.dir, .{});
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("y", try tmp.dir.readFile(testing.io, "dir/NUL.txt", &buf));
+    try testing.expectEqualStrings("z", try tmp.dir.readFile(testing.io, "tt:1.log", &buf));
+
+    // Opt in: the second entry is refused; the first (listed before it) was written, nothing after.
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try testing.expectError(error.ZipUnsafeEntryName, zs.extractAll(&archive, testing.io, tmp2.dir, .{ .windows_names = true }));
+    try testing.expectEqualStrings("x", try tmp2.dir.readFile(testing.io, "ok.txt", &buf));
+    try testing.expectError(error.FileNotFound, tmp2.dir.readFile(testing.io, "tt:1.log", &buf));
+}
+
+test "extractAll: windows_names applies to a symlink target too" {
+    const a = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    try zw.addSymlink("ln", "con.txt", .{});
+    try zw.finish();
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(a, ms.source(), .{});
+    defer archive.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectError(error.ZipUnsafeSymlink, zs.extractAll(&archive, testing.io, tmp.dir, .{ .symlinks = .create, .windows_names = true }));
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try zs.extractAll(&archive, testing.io, tmp2.dir, .{ .symlinks = .create, .windows_names = false });
 }

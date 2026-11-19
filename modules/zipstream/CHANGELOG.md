@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the Windows name rules (27 schemata mutants: 25 killed, 2 argued equivalent; two tests added); card counts cumulative.
+- **2026-11-19** — **BEHAVIOUR CHANGE (Windows builds only):** `isSafeEntryName`, `extractAll` and `ArchiveWriter` now also refuse a `:` anywhere in a name (NTFS alternate data stream) and DOS device names (`CON`, `NUL`, `COM1`..`COM9`, ... with any extension, case-insensitive), as Go's `filepath.IsLocal` does on Windows. On POSIX builds nothing changes by default. New: `isSafeEntryNameOpts(name, SafeNameOptions)` and `ExtractOptions.windows_names` to apply the Windows rules on any host.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** two doc comments (module header, `ZipWriteTooLarge`) still said `ArchiveWriter` writes classic archives only; it writes zip64 since 2026-10-20 (`allow_zip64`, `force_zip64`).
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (3 items marked done/obsolete).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).

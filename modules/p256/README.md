@@ -134,6 +134,22 @@ module's safegcd (`modinv.zig`) — the rest of the scalar field is a negligible
 slice of a signature's cost and has no special form worth accelerating; p256
 spends its complexity budget on the field, the inverses and the point multiply. See `SPEC.md §Scope`.
 
+## Stack use
+
+No allocation, no globals; the cost is stack. Every secret-scalar entry point
+(`P256.mul`, `ecdh`/`ecdhInto`, the ECDSA signers, key generation) runs its body
+one frame down and then zeroes the stack it dirtied (`burn.zig`: `mul_burn` 16 KiB,
+`affine_burn` 4 KiB, `sign_burn` 8 KiB), so the burn counts toward the need.
+Measured depth of the deepest call (2026-11-19, bytes dirtied below the caller,
+burn included): **22.9 KiB in Debug** (`ecdhInto`; `sign` 21.0, `verify` 19.1,
+`generate` 18.3, `mul` 16.5 KiB) and **17.5 KiB in ReleaseFast** (`sign`; `generate` 17.0,
+`ecdhInto` 16.5, `mul` 16.2, `verify` 9.0 KiB; the public-input `mulPublic` 1.5 KiB).
+**Give a thread that calls them at least 64 KiB of free stack**: about 2.8x the
+worst measured depth, which absorbs the caller's own frames and the build modes
+not measured here. Embedded or coroutine stacks smaller than that need a bigger one
+for these calls. A test (`stack use: ...` in `src/stackprobe2_test.zig`) pins the three
+burn sizes, runs seven entry points in a 64 KiB thread and fails if one needs more than 32 KiB.
+
 ## Verify
 
 ```

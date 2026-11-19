@@ -616,7 +616,7 @@ grew ~40 s → ~50 s (the comptime table build + one comptime batch inversion).
 
 ## Backlog
 
-- **Document a minimum stack size (review GP, 2026-10-30).** Every `mul`/`ecdh` burns 16 KiB of dead stack (`burn.mul_burn`) plus its frames (about 30 KiB for one ECDH), sign 8 KiB; no minimum is documented. Measure with the stackprobe tests and publish it in the README/`meta`.
+- ~~**Document a minimum stack size (review GP, 2026-10-30).**~~ **DONE 2026-11-19:** README "Stack use": measured worst depth 22.9 KiB (Debug, `ecdhInto`) / 17.5 KiB (ReleaseFast, `sign`), burn included; advice 64 KiB of free stack. Pinned by `stack use: ...` in `src/stackprobe2_test.zig` (a non-root test file, so the ctgrind source digests stay current): the three burn sizes, seven entry points in a 64 KiB thread, depth <= 32 KiB. The original estimate ("about 30 KiB for one ECDH") was too high; the affine-table multiply measured 16.5 KiB.
 
 - **Self-hosted Debug does not compile (found 2026-10-22 from the web-server consumer's test redesign).** `fast_core.zig:81`
   says "No `movabsq` (rejected by the self-hosted assembler)", but `fast_core.zig:560/712/921/924/974`

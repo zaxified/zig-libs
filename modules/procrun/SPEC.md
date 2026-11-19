@@ -6,7 +6,7 @@
 
 **Scope:** parity — Python `subprocess` (run/Popen) and Go `os/exec`: capture with caps, stdin bodies/pipes/files, stderr merge, env inherit/clear/merge, cwd, `pass_fds`, uid/gid, process groups with group kill, timeouts with TERM→KILL grace, a shared cancel token, rlimits, streaming, core flag + rusage; on Linux a vfork-style spawner whose cost does not grow with the parent's memory; deliberately not: setsid/umask/PDEATHSIG (no pre-exec hook in std), close_fds walk, pipelines, pty (surveyed 2026-10-20; raised from core)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-28 (3/3) · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-19 (20/20) · src 43a67972404e7abe
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — process runner (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: stream_permits 0/huge, rlimit overflow, invalid signal, deadline-bounded stdin writer, `Handle.wait` bounded against descendants holding the pipes; delta audit 32/38 + 6 eq)
 
@@ -266,7 +266,7 @@ Rust std::process as fastest; spawn+wait ×2000, 8 concurrent spawners, 100 MB c
 - REV-PR-1 (D7, caller contract, documented 2026-10-30): streaming `Handle.wait` does not close stdin or lift backpressure on entry (the build-tool consumer and the terminal-UI consumer call it on a waiter thread while another thread acks); a child that reads stdin to EOF needs `closeStdin` first, and the consumer must keep acking while `wait` runs.
 - REV-PR-2 (D8, 2026-10-30): `Handle.wait` observes the child's exit without reaping (`waitid WNOWAIT`, Linux), then readers stop once the pipe has been idle 250 ms (`default_pump_grace_ns`, not configurable; idle = inside `poll` only, never during callbacks or backpressure parking). Join-before-reap and `on_exit`-after-last-chunk unchanged. A descendant that keeps writing keeps the stream alive (remedy: `new_process_group` + `killGroup`). Before the exit the readers wait in 500 ms `poll` slices. Windows: unchanged.
 - **Refcounted `Handle` for watchdog threads** (D10): `Handle.kill`/`cancel`/`signal*`/`terminate` from another thread racing `Handle.wait` is a use-after-free of the context (`wait` frees it); documented as not allowed. A refcounted handle would lift that.
-- NUL bytes inside `argv`/`env` strings truncate the C string silently on the vfork path (`argv` is trusted-by-construction; use `runValidated` for untrusted input).
+- ~~NUL bytes inside `argv`/`env` strings truncate the C string silently on the vfork path~~ **DONE 2026-11-19:** `run`/`runTimeout`/`spawnStreaming` return `error.NulByte` before spawning for a NUL in any `argv` element, `cwd`, or (when `env_mode` uses `Spec.env`) an env value (`Environ.Map.put` already asserts on a NUL in a key). Decision rule: reference/majority and security agree (Go `os/exec`: `syscall.ByteSliceFromString` -> EINVAL; Rust `Command`: "nul byte found in provided data"; Python `subprocess`: `ValueError: embedded null byte`); a NUL cannot be passed to a child by any means, so no opt-out. `runValidated` still adds the `argsafe` discipline on top.
 - ~~**Stop-signal helper (consumer request 2026-11-15)**~~ — **moved to the new module `stopsignal`** (`StopSignals.init/wait/poll/fd/deinit`, 2026-11-15); nothing left here.
 - ~~**Reset the child's signal mask (found while writing `stopsignal`, 2026-11-15; effort S).** The vfork spawner restores the parent's CURRENT mask in the child before `execve` (`vfork_spawn.zig` `childMain`: `sigprocmask(SETMASK, &a.old_mask)`), and std's fork path leaves it alone too, so a child spawned by a program that holds blocked signals (a `stopsignal.StopSignals` in a daemon) starts with SIGTERM/SIGINT blocked: the `cancel_grace_ns` SIGTERM stays pending and only the SIGKILL works. Wanted: `Spec.reset_signal_mask: bool` (default `true`, as Go's `os/exec` and Rust's `Command` start children with an empty mask) applied in `childMain`, plus the same for the std fallback path if reachable. Default flip is consumer-visible, hence a decision for the owner.~~ **DONE 2026-11-15:** `Spec.reset_signal_mask` (default `true`, the Go/Rust behaviour; `false` keeps the inherited mask) on the vfork path; std's fallback spawn has no mask hook and still passes the mask on (documented on the field). Test `reset_signal_mask:` reads the child's `SigBlk`.
 
@@ -284,6 +284,11 @@ the empty set replaced by a full one. All 9 killed by the existing signal-mask t
 defaults (`Spec.reset_signal_mask = true` and the internal `Options` one) cannot sit behind a runtime switch: the
 `Spec` default is exercised by that same test (it runs a child without naming the field and expects an empty mask), but
 was not mutated by a run; the `Options` default is never relied on, since `procrun` always passes the field. 9/9.
+
+**Audit 2026-11-19 (delta mutation, `rejectNul`).** 8 schemata mutants over the NUL refusal in `spawnChild`, ReleaseSafe, one
+build: the argv check dropped and inverted, the `cwd` check dropped, the env-value check dropped and inverted, the
+`env_mode != .inherit` guard flipped and forced open, the `rejectNul` call skipped. All 8 killed by the test `NUL inside argv,
+cwd or env is refused before spawning`. 8/8. Card count cumulative: 3 (2026-09-28) + 9 (2026-11-15, above) + 8 = 20/20 over three different sources; a whole-module run is still outstanding.
 
 ## Anchoring
 
