@@ -2777,9 +2777,10 @@ test "isSafeEntryNameOpts: Windows rules refuse ADS and DOS device names; native
     const w: SafeNameOptions = .{ .windows = true };
     const p: SafeNameOptions = .{ .windows = false };
     const bad = [_][]const u8{
-        "ab:stream",    "dir/a:b",     "a.txt:Zone.Identifier", "CON",         "con",      "Nul.txt",
-        "dir/COM1.log", "x\\lpt9",     "aux:s",                 "PRN",         "conin$",   "CONOUT$",
-        "COM\u{b9}",    "lpt\u{b2}.x", "CON  ",                 "d/NUL/f.txt", "com5.a.b",
+        "ab:stream",    "dir/a:b",   "a.txt:Zone.Identifier", "CON",         "con",    "Nul.txt",
+        "dir/COM1.log", "x\\lpt9",   "aux:s",                 "PRN",         "conin$", "CONOUT$",
+        "AUX.c",        "COM\u{b3}", "COM\u{b9}",             "lpt\u{b2}.x", "CON  ",  "d/NUL/f.txt",
+        "com5.a.b",
     };
     for (bad) |n| {
         try testing.expect(!isSafeEntryNameOpts(n, w));

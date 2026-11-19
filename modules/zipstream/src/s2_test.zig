@@ -535,3 +535,23 @@ test "extractAll: windows_names refuses a device name or stream entry before wri
     try testing.expectEqualStrings("x", try tmp2.dir.readFile(testing.io, "ok.txt", &buf));
     try testing.expectError(error.FileNotFound, tmp2.dir.readFile(testing.io, "tt:1.log", &buf));
 }
+
+test "extractAll: windows_names applies to a symlink target too" {
+    const a = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    try zw.addSymlink("ln", "con.txt", .{});
+    try zw.finish();
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(a, ms.source(), .{});
+    defer archive.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectError(error.ZipUnsafeSymlink, zs.extractAll(&archive, testing.io, tmp.dir, .{ .symlinks = .create, .windows_names = true }));
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try zs.extractAll(&archive, testing.io, tmp2.dir, .{ .symlinks = .create, .windows_names = false });
+}
