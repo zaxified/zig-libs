@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **Behaviour change:** an OpenSecureChannel answer with `RevisedLifetime == 0` is refused (`error.InvalidTokenLifetime`, new member of `services.ServiceError`) before any channel state changes, for `open` and `renew`; and `renewalDue` is never true sooner than `SecureChannel.min_renewal_delay_ms` (default 50 ms) after the token arrived, so a server revising the lifetime to a few milliseconds cannot turn `renewIfDue` into one RSA operation per request. The floor follows node-opcua's client (`max(75 %, 50 ms)`); open62541 has none. Review finding MEDIUM-1.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the client-side renewal, ModifyMonitoredItems, SetMonitoringMode and TranslateBrowsePaths code (50 mutants: 48 killed, 2 unobservable stack-copy wipes); one more scripted-peer test; the card counts are now 886/962 (cumulative), `src` re-pinned.
 - **2026-11-19** — **New API (no behaviour change):** client-side SecureChannel renewal — `SecureChannel.renew`, `renewalDue` (75 % of the revised lifetime on the caller's clock) and `renewIfDue`, plus `OpenOptions.now_ms`, `SecureChannel.token_installed_ms` and `RenewOptions`. The OpenSecureChannel exchange of `open` and `renew` is one shared function; `open`'s wire behaviour is unchanged.
 - **2026-11-19** — **New API (no behaviour change):** `Subscription.setMonitoringMode` — client-side SetMonitoringMode (OPC 10000-4 §5.12.4), one status per item id.

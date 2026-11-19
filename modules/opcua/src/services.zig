@@ -54,6 +54,13 @@ pub const ServiceError = encoding.EncodeError || encoding.DecodeError || transpo
     /// §6.7.2.4): a replayed, reordered or dropped chunk. The channel can no
     /// longer be trusted and should be closed.
     SequenceNumberInvalid,
+    /// An OpenSecureChannel answer carried `RevisedLifetime == 0`: a token
+    /// that is already expired, which would leave the channel unrenewable.
+    InvalidTokenLifetime,
+    /// A CreateMonitoredItems/ModifyMonitoredItems answer carried a different
+    /// number of results than the request had items (OPC 10000-4 §5.12.2.2:
+    /// one result per item, in order).
+    ResultCountMismatch,
 };
 
 /// `SecurityPolicy#None`'s URI (OPC 10000-7 §6.2.1) — the SecurityPolicy the

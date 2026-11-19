@@ -121,6 +121,13 @@ pub const SecureChannel = struct {
     /// the last `renew`) when the current token arrived; `renewalDue` counts
     /// from it. Not a wire field.
     token_installed_ms: i64 = 0,
+    /// The renewal is never due sooner than this many milliseconds after the
+    /// token arrived, so a server that revises the lifetime down to a few
+    /// milliseconds cannot make `renewIfDue` cost an RSA operation per request.
+    /// node-opcua's client does the same (its renewal timer is
+    /// `max(75 % of the lifetime, 50 ms)`, `client_secure_channel_layer.ts`);
+    /// open62541 has no floor. Adjustable per channel, 50 ms by default.
+    min_renewal_delay_ms: u32 = 50,
 
     /// Renew at this share of the revised lifetime (OPC 10000-4 §5.5.2.1).
     pub const renewal_fraction_percent: i64 = 75;
@@ -187,7 +194,8 @@ pub const SecureChannel = struct {
     /// (`token_lifetime_ms == 0`) is never due.
     pub fn renewalDue(ch: *const SecureChannel, now_ms: i64) bool {
         if (ch.token_lifetime_ms == 0) return false;
-        return now_ms -| ch.token_installed_ms >= @divFloor(@as(i64, ch.token_lifetime_ms) * renewal_fraction_percent, 100);
+        const due_after = @max(@divFloor(@as(i64, ch.token_lifetime_ms) * renewal_fraction_percent, 100), @as(i64, ch.min_renewal_delay_ms));
+        return now_ms -| ch.token_installed_ms >= due_after;
     }
 
     pub const RenewOptions = struct {
@@ -272,6 +280,9 @@ pub const SecureChannel = struct {
         );
         defer services.freeOpenSecureChannelResponse(allocator, response);
 
+        // A token that is born expired is unusable and would make the channel
+        // unrenewable (`renewalDue` is never true without a lifetime).
+        if (response.security_token.revised_lifetime == 0) return error.InvalidTokenLifetime;
         // A renewal keeps the channel: an answer naming another one is not ours.
         if (request_type == .renew and response.security_token.channel_id != ch.io.channel_id) return error.InvalidSecureMessage;
         var derived: ?security.ChannelKeys = null;
@@ -3087,6 +3098,90 @@ test "Subscription offline scripted: a ModifyMonitoredItems answer with more res
     try testing.expect(sub.findMonitoredItem(10) == null);
 }
 
+test "secure offline scripted: open and renew refuse a zero lifetime and an empty server nonce, state untouched; a 1 ms lifetime is taken but renews no sooner than the floor" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(45)));
+    const random = prng.random();
+    var client_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "validate-client",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:client",
+    }, &client_creds);
+    defer client_creds.deinit(testing.allocator);
+    var server_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 1280,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "validate-server",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+    }, &server_creds);
+    defer server_creds.deinit(testing.allocator);
+
+    const old_keys = security.deriveKeys(&@as([32]u8, @splat(0xA1)), &@as([32]u8, @splat(0xB2)), .basic256sha256);
+    const nonce_buf: [33]u8 = @splat(0xC3);
+    const Case = struct { nonce_len: usize, lifetime: u32, err: ?anyerror };
+    const cases = [_]Case{
+        .{ .nonce_len = 32, .lifetime = 0, .err = error.InvalidTokenLifetime },
+        .{ .nonce_len = 0, .lifetime = 5_000, .err = error.InvalidSecureMessage },
+        .{ .nonce_len = 32, .lifetime = 1, .err = null },
+    };
+    for (cases) |c| {
+        const answer = try sealedOpnAnswer(testing.allocator, random, &server_creds, client_creds.certificate_der, 7, 4, nonce_buf[0..c.nonce_len], c.lifetime);
+        defer testing.allocator.free(answer);
+        const context: security.SecurityContext = .{
+            .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
+            .mode = .sign_and_encrypt,
+            .credentials = client_creds,
+            .server_certificate = server_creds.certificate_der,
+            .random = random,
+        };
+        // renew
+        {
+            var out_buf: [8192]u8 = undefined;
+            var out_w: std.Io.Writer = .fixed(&out_buf);
+            var in_r: std.Io.Reader = .fixed(answer);
+            var conn = transport.Connection.init(&in_r, &out_w);
+            var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3, .security = context }, .token_lifetime_ms = 9_000, .token_installed_ms = 100 };
+            ch.io.security.?.keys = old_keys;
+            if (c.err) |e| {
+                try testing.expectError(e, ch.renew(500, .{}));
+                try testing.expectEqual(@as(u32, 3), ch.io.token_id);
+                try testing.expectEqualSlices(u8, std.mem.asBytes(&old_keys), std.mem.asBytes(&ch.io.security.?.keys.?));
+                try testing.expectEqual(@as(u32, 9_000), ch.token_lifetime_ms);
+                try testing.expectEqual(@as(i64, 100), ch.token_installed_ms);
+            } else {
+                try ch.renew(500, .{});
+                try testing.expectEqual(@as(u32, 1), ch.token_lifetime_ms);
+                try testing.expect(!ch.renewalDue(549)); // 75 % of 1 ms is 0, the floor holds it back
+                try testing.expect(ch.renewalDue(550));
+                try testing.expect(!try ch.renewIfDue(549, .{}));
+            }
+        }
+        // open
+        {
+            var out_buf: [8192]u8 = undefined;
+            var out_w: std.Io.Writer = .fixed(&out_buf);
+            var in_r: std.Io.Reader = .fixed(answer);
+            var conn = transport.Connection.init(&in_r, &out_w);
+            var ch: SecureChannel = undefined;
+            if (c.err) |e| {
+                try testing.expectError(e, SecureChannel.open(&conn, testing.allocator, .{ .security = context }, &ch));
+            } else {
+                try SecureChannel.open(&conn, testing.allocator, .{ .security = context, .now_ms = 7 }, &ch);
+                try testing.expectEqual(@as(u32, 1), ch.token_lifetime_ms);
+                try testing.expect(!ch.renewalDue(56));
+                try testing.expect(ch.renewalDue(57));
+            }
+        }
+    }
+}
+
 test "secure offline scripted: a secured OpenSecureChannel answer with an empty server nonce is refused" {
     const testing = std.testing;
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(43)));
@@ -3170,10 +3265,22 @@ test "SecureChannel.renewalDue: 75 % of the revised lifetime on the caller's clo
     try testing.expect(ch.renewalDue(1_000_000));
     try testing.expect(!ch.renewalDue(1_000)); // the instant it arrived
     try testing.expect(!ch.renewalDue(-5_000)); // a clock before the install time
-    ch.token_lifetime_ms = 3; // 75 % of 3 ms is 2.25 ms, rounded down
+    ch.token_lifetime_ms = 3; // 75 % of 3 ms is 2.25 ms, rounded down; the 50 ms floor wins
     ch.token_installed_ms = 0;
-    try testing.expect(!ch.renewalDue(1));
-    try testing.expect(ch.renewalDue(2));
+    try testing.expect(!ch.renewalDue(2));
+    try testing.expect(!ch.renewalDue(49));
+    try testing.expect(ch.renewalDue(50));
+    // a 1 ms lifetime does not make every call a renewal
+    ch.token_lifetime_ms = 1;
+    try testing.expect(!ch.renewalDue(0));
+    try testing.expect(!ch.renewalDue(49));
+    try testing.expect(ch.renewalDue(50));
+    ch.min_renewal_delay_ms = 200; // the floor is adjustable
+    try testing.expect(!ch.renewalDue(199));
+    try testing.expect(ch.renewalDue(200));
+    ch.min_renewal_delay_ms = 0;
+    try testing.expect(ch.renewalDue(0)); // no floor: the 75 % point of 1 ms is 0
+    ch.min_renewal_delay_ms = 50;
     ch.token_lifetime_ms = 0;
     try testing.expect(!ch.renewalDue(std.math.maxInt(i64)));
     ch.token_lifetime_ms = std.math.maxInt(u32);
