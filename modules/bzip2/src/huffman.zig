@@ -197,3 +197,94 @@ test "length limit forces the halving retry" {
     makeCodeLengths(&len, &freq, 20, 5);
     for (len) |l| try std.testing.expect(l >= 1 and l <= 5);
 }
+
+test "a tree exactly as deep as the limit is kept; one level deeper is halved" {
+    // Frequencies 16, 8, 4, 2, 1, 1 give depths 1, 2, 3, 4, 5, 5.
+    var len: [6]u8 = undefined;
+    const freq = [_]u32{ 16, 8, 4, 2, 1, 1 };
+    makeCodeLengths(&len, &freq, 6, 5);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 5 }, &len);
+    makeCodeLengths(&len, &freq, 6, 4);
+    for (len) |l| try std.testing.expect(l >= 1 and l <= 4);
+    // A zero frequency counts as one: the same tree as for the ones.
+    const with_zero = [_]u32{ 16, 8, 4, 2, 0, 1 };
+    makeCodeLengths(&len, &with_zero, 6, 5);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 5 }, &len);
+}
+
+test "DecodeTable decodes the canonical code of a known length set" {
+    // Lengths 2, 1, 3, 3: canonical codes 1 -> 0, 0 -> 10, 2 -> 110, 3 -> 111.
+    var t: DecodeTable = undefined;
+    t.init(&.{ 2, 1, 3, 3 }, 4);
+    try std.testing.expectEqual(@as(u32, 1), t.min_len);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 0, 2, 3 }, t.perm[0..4]);
+    try std.testing.expectEqual(@as(i32, 0), t.limit[1]);
+    try std.testing.expectEqual(@as(i32, 2), t.limit[2]);
+    try std.testing.expectEqual(@as(i32, 7), t.limit[3]);
+    // base[len]: code value minus the index of its symbol in perm.
+    try std.testing.expectEqual(@as(i32, 0), t.base[1]);
+    try std.testing.expectEqual(@as(i32, 1), t.base[2]);
+    try std.testing.expectEqual(@as(i32, 4), t.base[3]);
+}
+
+test "assignCodes gives canonical codes shortest first" {
+    var code: [4]u32 = undefined;
+    assignCodes(&code, &.{ 2, 1, 3, 3 }, 1, 3, 4);
+    try std.testing.expectEqualSlices(u32, &.{ 0b10, 0b0, 0b110, 0b111 }, &code);
+}
+
+test "DecodeTable: the decoder's walk ends at a perm index inside the alphabet or runs off the length limit" {
+    // The decoder (decoder.zig, the code walk) refuses `idx < 0` and
+    // `idx >= max_alpha` as BadCode. For every table the length check lets
+    // through (1..20, incomplete or oversubscribed) the walk either breaks with
+    // an index that is a real perm slot, or runs past 20 bits: the two refusals
+    // are defence in depth. Checked over random tables and windows.
+    var prng = std.Random.DefaultPrng.init(0xb21b2);
+    const rnd = prng.random();
+    for (0..4000) |_| {
+        const alpha = rnd.intRangeAtMost(usize, 2, 40);
+        var len: [max_alpha_size]u8 = undefined;
+        const spread = rnd.intRangeAtMost(u8, 1, 20);
+        for (len[0..alpha]) |*l| l.* = rnd.intRangeAtMost(u8, 1, spread);
+        var t: DecodeTable = undefined;
+        t.init(&len, alpha);
+        for (0..64) |k| {
+            const win: u32 = switch (k) {
+                0 => 0,
+                1 => 0xf_ffff,
+                else => rnd.int(u32) & 0xf_ffff,
+            };
+            var zn: u32 = t.min_len;
+            var zvec: i32 = @intCast(win >> @intCast(20 - zn));
+            const idx: ?i32 = while (true) {
+                if (zvec <= t.limit[zn]) break zvec - t.base[zn];
+                zn += 1;
+                if (zn > decode_max_len) break null;
+                zvec = @intCast(win >> @intCast(20 - zn));
+            };
+            if (idx) |i| {
+                try std.testing.expect(i >= 0 and i < alpha);
+                try std.testing.expect(zn >= t.min_len and zn <= decode_max_len);
+            }
+        }
+    }
+}
+
+test "the halving retry gives libbzip2's lengths (pinned for two skewed frequency sets)" {
+    // Both sets are too deep for their limit, so the weights are halved
+    // (`1 + w / 2`) until the tree fits; the lengths below are what the
+    // halving produces, decision for decision (verified against an independent
+    // port of huffman.c's hbMakeCodeLengths).
+    var fib: [20]u32 = undefined;
+    fib[0] = 1;
+    fib[1] = 1;
+    for (2..20) |i| fib[i] = fib[i - 1] + fib[i - 2];
+    var len: [20]u8 = undefined;
+    makeCodeLengths(&len, &fib, 20, 5);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 5, 5, 4, 5, 5, 4, 4, 5, 5, 5, 5, 5, 4, 5, 5, 4, 4, 3, 3 }, &len);
+
+    const f26 = [_]u32{ 21, 21, 89, 13, 1000, 3, 1, 21, 0, 13, 13, 55, 1000, 1000, 0, 144, 21, 5, 144, 1000, 3, 55, 1, 8, 0, 0 };
+    var l26: [26]u8 = undefined;
+    makeCodeLengths(&l26, &f26, 26, 6);
+    try std.testing.expectEqualSlices(u8, &.{ 6, 6, 6, 5, 3, 5, 6, 6, 6, 6, 5, 5, 3, 3, 6, 5, 5, 5, 5, 3, 6, 5, 6, 5, 6, 6 }, &l26);
+}

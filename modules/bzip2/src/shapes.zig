@@ -108,6 +108,22 @@ pub const shapes = [_]Shape{
     .{ .name = "wf-b9999", .kind = .periodic, .len = 9_999, .param = 7 },
     .{ .name = "wf-b10000", .kind = .periodic, .len = 10_000, .param = 3 },
     .{ .name = "wf-b10001", .kind = .periodic, .len = 10_001, .param = 7 },
+    // Ties between equal rotations in classes of every size, so the order the
+    // fallback sort leaves them in (it decides the origin pointer) is pinned
+    // for the insertion-sort range (< 10 members), the quicksort range and the
+    // blocks the main sort gives up on (`wf-t*m`). Digests: libbzip2 1.0.8
+    // (bzip2 -9), work factor 30.
+    .{ .name = "wf-t2", .kind = .periodic, .len = 2_000, .param = 1000 },
+    .{ .name = "wf-t3", .kind = .periodic, .len = 3_000, .param = 1000 },
+    .{ .name = "wf-t5", .kind = .periodic, .len = 5_000, .param = 1000 },
+    .{ .name = "wf-t9", .kind = .periodic, .len = 9_000, .param = 1000 },
+    .{ .name = "wf-t11", .kind = .periodic, .len = 9_900, .param = 900 },
+    .{ .name = "wf-t20", .kind = .periodic, .len = 6_000, .param = 300 },
+    .{ .name = "wf-t60", .kind = .periodic, .len = 6_000, .param = 100 },
+    .{ .name = "wf-t100", .kind = .periodic, .len = 9_900, .param = 99 },
+    .{ .name = "wf-t12m", .kind = .periodic, .len = 24_000, .param = 2000 },
+    .{ .name = "wf-t30m", .kind = .periodic, .len = 15_000, .param = 500 },
+    .{ .name = "wf-t45m", .kind = .periodic, .len = 22_500, .param = 500 },
 };
 
 pub fn find(name: []const u8) ?Shape {
@@ -183,4 +199,34 @@ pub fn fill(out: []u8, s: Shape) void {
             }
         },
     }
+}
+
+/// Number of inputs of `tieInput`.
+pub const tie_inputs = 240;
+
+/// Inputs made of repeated units, for the order the fallback sort leaves equal
+/// rotations in (it decides the origin pointer): periodic blocks, two periodic
+/// segments, long runs of a short unit (the main sort gives up on them) and
+/// classes of 2..9 members (the insertion sort range). `tie_data.zig` holds
+/// libbzip2 1.0.8's digests (bzip2 -9, work factor 30) of every one.
+pub fn tieInput(gpa: std.mem.Allocator, i: u32) std.mem.Allocator.Error![]u8 {
+    var prng: std.Random.DefaultPrng = .init(0x7131e000 + @as(u64, i));
+    const r = prng.random();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const alphas = [_]u16{ 2, 3, 4, 26, 256 };
+    const alpha = alphas[r.uintLessThan(usize, alphas.len)];
+    const segments: u32 = if (i % 4 == 1) 2 else 1;
+    for (0..segments) |_| {
+        const p: usize, const m: usize = switch (i % 4) {
+            0 => .{ 2 + r.uintLessThan(usize, 299), 2 + r.uintLessThan(usize, 39) },
+            1 => .{ 2 + r.uintLessThan(usize, 99), 2 + r.uintLessThan(usize, 29) },
+            2 => .{ 2 + r.uintLessThan(usize, 59), 100 + r.uintLessThan(usize, 300) },
+            else => .{ 2 + r.uintLessThan(usize, 39), 2 + r.uintLessThan(usize, 8) },
+        };
+        var unit: [300]u8 = undefined;
+        for (unit[0..p]) |*b| b.* = @intCast(r.uintLessThan(u16, alpha));
+        for (0..m) |_| try out.appendSlice(gpa, unit[0..p]);
+    }
+    return out.toOwnedSlice(gpa);
 }

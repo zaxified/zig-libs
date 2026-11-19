@@ -107,3 +107,35 @@ test "compressInto and compressBound; bad levels" {
     defer gpa.free(zr);
     try testing.expect(zr.len <= bz.compressBound(rnd.len));
 }
+
+test "compressInto: a destination too small for a block that closes during write is OutputTooLarge" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(11);
+    const data = try gpa.alloc(u8, 250_000);
+    defer gpa.free(data);
+    prng.random().bytes(data);
+    var dest: [64]u8 = undefined;
+    // Level 1 closes a block (and writes it) well before the input ends.
+    try std.testing.expectError(error.OutputTooLarge, bz.compressInto(gpa, &dest, data, .{ .level = 1 }));
+}
+
+test "StreamWriter: vectors and splats count what they consumed" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var sw = try bz.StreamWriter.init(gpa, &out.writer, &.{}, .{ .level = 1 });
+    defer sw.deinit();
+    try sw.writer.writeVecAll(@constCast(&[_][]const u8{ "alpha ", "beta ", "gamma " }));
+    try sw.writer.splatByteAll('x', 700);
+    try sw.writer.writeSplatAll(@constCast(&[_][]const u8{ "ab", "cd" }), 5);
+    try sw.finish();
+    const back = try bz.decompress(gpa, out.written(), .{});
+    defer gpa.free(back);
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    try want.appendSlice(gpa, "alpha beta gamma ");
+    try want.appendNTimes(gpa, 'x', 700);
+    try want.appendSlice(gpa, "ab");
+    for (0..5) |_| try want.appendSlice(gpa, "cd");
+    try std.testing.expectEqualSlices(u8, want.items, back);
+}

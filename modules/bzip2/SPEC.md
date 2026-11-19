@@ -6,7 +6,7 @@
 
 **Scope:** parity — libbzip2 1.0.8 (surveyed 2026-10-20)
 
-**Audit:** review 2026-10-20 · mutation 2026-10-20 (56/94, 9 eq) · src ?
+**Audit:** review 2026-10-20 · mutation 2026-11-19 (699/820, 121 eq) · src cc565eac8a84aa39
 
 **Hardening:** fuzz 2026-10-20 (200,000 decoder runs + 33,333 round-trip runs clean, BZIP2_FUZZ, every reach label hit; arbitrary and mutated streams, synthetic blocks with well-formed tables, chunked and failing readers and sinks, failing allocator; 4,000 seeds in every test run) · ct n/a — compression only, no secret is processed (keyword review, 2026-10-20) · panic 2026-10-30 (sweep + blind review: default `max_output` 256 MiB (bomb guard), StreamWriter.finish idempotent + error cast total, Encoder error latch, zero-capacity reader path with a 64-empty-read bound; delta audit 21/22 + 1 NA)
 
@@ -142,20 +142,89 @@ None claimed: the data is public. There is no secret in this module.
   its rotations come out sorted; the same keys shuffled never reach it; a 4-letter random block sorted
   once without a bound and once with half of its costliest call's work as the bound stops mid-call
   with sub-ranges pending and still has every rotation in order; an adversarial block round-trips
-  through `compress`/`decompress`. Delta mutation 2026-11-18 (ReleaseSafe schemata, whole suite):
-  10 mutants over the bound (factor, `>`/`>=`, never/always, the work charge), the two bounded-tail
-  sorts and the stats; 8 killed, 1 equivalent (`work >= budget` for `work > budget`: the bound is a
-  heuristic threshold, the two differ only when a call's work lands exactly on it), 1 **OPEN**:
-  mutant 8, in `fallbackQSort3`'s bounded branch `sortRangeByKey(fmap, eclass, stack_lo[sp],
-  stack_hi[sp]);` -> `if (!mut(8)) sortRangeByKey(fmap, eclass, stack_lo[sp], stack_hi[sp]);` (the
-  pending sub-ranges left unsorted) survived the runs whose tests never had a pending range at the
-  bound; the mid-call block test above (asserts `pending_at_bound >= 1` and sorted rotations) was
-  added to kill it and passes on the original code, but no schemata build was left to run the
-  mutant against it — re-run it with the next bzip2 mutation run. Card `**Audit:**` left
-  as it was (its mutation entry has no src hash and its counts have no survivor list): a
-  whole-module run is due.
+  through `compress`/`decompress`. The bound's mutants
+  (factor, `>`/`>=`, never/always, the work charge, the two bounded-tail sorts, the stats) are part of
+  the whole-module run below: every one is killed except `work >= budget` for `work > budget`
+  (EQUIVALENT: a heuristic threshold, the two differ only when a call's work lands exactly on it).
 - Truncated input is `error.TruncatedInput`, never a short success; bytes after a complete stream
   that do not start another are `error.TrailingData` unless `ignore_trailing_garbage`.
+
+## Audit 2026-11-19 (whole-module mutation)
+
+820 schemata mutants over every non-test line, one per condition x class (strict, arid code skipped):
+`decoder.zig` 332 (bit input and EOF padding, stream header and level digit, block header and trailer
+magic, origin pointer, symbol map, selectors and their MTF, coding tables and the 1..20 length walk,
+the Huffman window walk in both its copies, run symbols and their 2^21 limit, block overflow and
+growth, T^-1, the randomised path, the unRLE state machine, `read`'s latch and `max_output`, the
+readers), `blocksort.zig` 242 (fallback sort, the B4 bound, main sort), `encoder.zig` 202 (block
+assembly, bit writer, MTF and zero runs, table partition and refinement, selectors, tables, the
+writers), `huffman.zig` 32, `crc.zig` 12; the 11 delta mutants of 2026-11-18 are in the list (mutant 8,
+the pending ranges left unsorted at the bound, is killed). One schemata build per round, tiered runs
+(the decoder tests first, then the rest of the suite for the survivors), baseline first, in a copy of
+the tree. **699 killed (31 of them by hang), 109 EQUIVALENT, 12 UNOBSERVABLE, 0 open;** the card counts
+are whole-module (`eq` = EQUIVALENT + UNOBSERVABLE).
+
+Added for the survivors: hand-built decoder streams (each of "B", "Z", "h" alone; a zero selector
+count judged before the tables; selector values at 0..ng-1, ng and past it; more groups of symbols than
+selectors, also inside a run; a 20-bit code decoded by the symbol loop as well as the run loop; a run
+after a symbol overflowing the block as a whole; blocks ending in 1, 2 or 3 equal bytes), the block
+buffer's geometric growth and its cap (counting allocator), `total_out` one byte past `max_output`,
+`decompressStream`'s length, flush and unbuffered writer, `.nothing` as the stream limit, OutOfMemory
+only from a failing allocator, odd-sized and line reads across a refill, `readVec` keeping the
+unread octets, many small streams through an unbuffered input, `Decoder.streams`, a randomised
+multi-block stream; for the encoder the table count at 200 / 600 / 1200 / 2400 symbols and the selector
+count, a full output buffer at `bsFinish`, the 17-bit code limit (a Fibonacci-skewed table whose plain
+tree is 19 deep), `init`'s work factor default and block limit, a failing allocator while the sort
+tables grow on a reused encoder, `compressInto`'s write-path `OutputTooLarge`, `StreamWriter` vectors
+and splats; `huffman.zig`: a tree exactly as deep as the limit, a known canonical table, the halving
+retry pinned for two skewed sets (checked against an independent port of `hbMakeCodeLengths`);
+`worstcase_test.zig`: the B4 counters of a fixed block pinned; goldens: 11 `wf-t*` periodic shapes
+(classes of 2..100 equal rotations, blocks the main sort gives up on) and 240 repeated-unit inputs
+(`shapes.tieInput`, `testdata/tie_data.zig`), all against libbzip2 1.0.8's `bzip2 -9` digests (work
+factor 30 only; `--capture` would add the other factors).
+
+EQUIVALENT, by group (every mutant has its own reason and guarding line in the audit table; the groups):
+
+- **Dead or defensive code in the decoder.** `idx < 0` and `idx >= max_alpha` after the Huffman walk
+  are unreachable (`base[min_len] = 0`; for longer codes `zvec >= 2 (limit[zn-1] + 1)`, so
+  `idx >= cum[zn-1]`; `idx <= cum[zn] - 1 <= alpha_size - 1`; a window that would reach a length
+  without symbols has `limit = 0` and would already have broken at `min_len`; the `huffman.zig` probe
+  checks 256 000 random tables x windows); the first-length test `zn > 20` (`min_len <= 20` by the
+  length check); `sym >= eob` (`sym <= eob`); `readInner`'s `used != nblock + 1 or out_len != 0` after a
+  zero-length read (`unRle` returns 0 only with a destination that has room, so `out_len == 0` and
+  `used == end`); the selector clamp at 18002 (a block has at most `nblock_max + 1` symbols = 18001
+  groups); `seq_to_unseq[n_in_use..]` (never read); `need`'s 20 / 24 / 32-bit refill thresholds (the
+  widest `bits` read is 16, the code window 20); dead stores (`out_len`, `out_ch`, `used` before they are
+  set again; `rand_to_go` / `rand_pos` for a plain block).
+- **Cost only.** Buffer growth at an exact fit, the unbuffered refill for a buffered reader, the
+  slice-by-8 start, flush timing in the bit writer, `bsW`'s `|` against `^`, the packed cost path
+  (`len_pack`), main-sort and insertion-sort bookkeeping that leaves the order alone.
+- **Main sort (`blocksort.zig` 324..659, 43 mutants that keep the order).** The main sort completes only
+  on blocks of distinct rotations: two equal rotations cost `n / 8` budget units per comparison, a block
+  with equal rotations has at least `n / 2` such comparisons against a budget of at most `33 n`, so it
+  always ends in the fallback sort, and distinct rotations have one sorted order whichever sorter
+  produced it. Everything that does not break the order (budget accounting, the work factor clamp and
+  scale, the 10 000-byte switch, bucket order, quadrant bookkeeping) therefore cannot change a byte of
+  output; the golden tier (every shape, level 1/5/9, 3 work factors) killed every mutant that does break
+  it.
+- **Encoder tables.** `ensureArr2` is asked for `nb + n_overshoot` words while the sort needs three
+  quarters of that; a partition end passing the alphabet is impossible (`t_freq <=` the remaining
+  frequency); the first part never takes the back-off (`ng - n_part = 0`); the EOB frequency reaches
+  the initial partition only through the last part; the lowest code length scan start (a full tree over
+  258 symbols has a minimum length <= 9).
+- **Fallback sort scans (`blocksort.zig` 255..316).** Word-skip patterns of the bit scans, `l` / `r`
+  against `nb`, singleton ranges, the class tracker's first value, `h == nb`, an extra round without
+  unsorted ranges, a non-negative count: each either does the same scan by another route or acts only
+  where the loop would end anyway.
+
+UNOBSERVABLE (12): the tie order inside the fallback sort for eight steps that no input of the 410
+libbzip2-checked ones (170 goldens + 240 repeated-unit inputs) reaches in a way that moves the origin
+pointer (a 5-element insertion range, the low / high partition scans stopping at equal keys, the
+crossing test, the sentinel clear bits, three bit-scan variants) — a differential search against
+libbzip2 over more periodic mixes would settle them; `randomise` clearing `in_use` (a test-only hook
+with no reference encoder to compare bytes with); `downHeap`'s `yy <= n_heap` (one stale heap slot; 3 000
+random frequency sets through an independent port showed no divergence); the encoder's run state after
+`finish` (never read; `reset` sets it). **No survivor is in a bounds or security check.**
 
 ## Anchoring
 
@@ -210,5 +279,5 @@ None claimed: the data is public. There is no secret in this module.
 - The encoder's `work_factor` budget and the sort order of equal rotations are verified against
   libbzip2 on the shapes above, not exhaustively: a periodic block whose rotation ties are broken
   differently by an input outside the shapes would show as a different origin pointer.
-- No mutation run over the tests (Audit line says so).
+- No mutation run over the tests.
 - Big-endian and 32-bit targets are not run; `meta.targets` is `linux64`.

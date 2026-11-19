@@ -311,3 +311,24 @@ test "B4: a block sorted with the bound hit mid-call (pending ranges) has every 
     defer gpa.free(back);
     try testing.expectEqualSlices(u8, block, back);
 }
+
+test "B4: the work counters of a fixed block are pinned (charge, size, bound, pending ranges)" {
+    // The same 4-letter block as above. `work` counts the elements scanned by
+    // every partition step, `peak_permille` is the costliest call's work over
+    // n * (log2 n + 1) in thousandths; the bounded run stops at half of it.
+    const gpa = testing.allocator;
+    const block = try gpa.alloc(u8, 20_000);
+    defer gpa.free(block);
+    var prng = std.Random.DefaultPrng.init(0xb4b4);
+    for (block) |*b| b.* = "acgt"[prng.random().uintLessThan(u8, 4)];
+    const fmap = try gpa.alloc(u32, block.len);
+    defer gpa.free(fmap);
+    const free = try sortStatsBudget(gpa, block, fmap, std.math.maxInt(u32));
+    const half = try sortStatsBudget(gpa, block, fmap, free.peak_permille / 2);
+    const got = [_]u64{ free.work, free.peak_permille, half.work, half.bounded, half.pending_at_bound, half.peak_permille };
+    const want = [_]u64{ 216331, 922, 194480, 257, 75, 577 };
+    if (!std.mem.eql(u64, &got, &want)) {
+        std.debug.print("work/peak/half.work/bounded/pending/half.peak = {any}\n", .{got});
+        return error.TestUnexpectedResult;
+    }
+}
