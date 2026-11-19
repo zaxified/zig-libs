@@ -165,14 +165,22 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   the operator never `recover()`ed), `flushOneSync` drains them synchronously. `deinit` calls
   `flushAll`, so even a forgotten `recover()` loses nothing. A record the sink rejects on this path
   is held (leased) for the rest of the pass so the next synchronous flush moves on to the next
-  record, then returned to the WAL for a retry. A key that waits out its retry backoff is passed
-  over, not written early: the synchronous path keeps the leases of its records (`skipped`) while
-  the global dequeue moves on to the next record of another key, and hands every one back with
-  `jobqueue`'s `release` (no attempt counted, the record keeps its place in the key's FIFO, nothing
-  written to storage) before it returns. A `release` that fails (an allocation failure inside
-  `jobqueue`) is held as `release_failed`, blocks its key like any held lease and is retried by
-  every `drain`. Until 2026-11-19 the synchronous path did not run at all while any key waited
-  (`anyRetryWaiting`), so one waiting key stalled `flushAll` and back-pressure for every key (F5b).
+  record, then returned to the WAL for a retry. A key that waits out its retry backoff is not
+  written early and does not stall the others: each synchronous pass reads the set of waiting keys
+  once, against one clock reading, and passes it to the WAL dequeue as `exclude`, so nothing of
+  those keys is leased; a key whose wait lapses during the pass waits for the next one. Until
+  2026-11-19 the synchronous path did not run at all while any key waited (`anyRetryWaiting`), so
+  one waiting key stalled `flushAll` and back-pressure for every key (F5b).
+
+  *An intermediate design (commit 73f0ee627, same day, never released) was wrong.* It leased the
+  records of waiting keys one by one, kept them, and handed them back with `jobqueue.release`
+  after the pass. It re-read the wait for every record, so a key whose wait lapsed between two
+  dequeues of one pass had its older record leased (kept aside) and its newer one written and
+  acked; the older one then went back to the WAL and the next pass wrote it over the newer value
+  (a lost write, and an ack out of WAL id order). This was found by review and reproduced by the
+  test *"F5b review: a key whose backoff lapses in the middle of a pass …"*, which failed on that
+  commit. It also cost O(records of the waiting keys) per pass. The exclusion leases nothing,
+  so that kind of failure cannot happen.
 
   **Held leases and the per-key ack order (2026-11-19, second review).** The coordinator keeps a
   list of leases it holds (`held`): synchronous rejections of the current pass, records whose
@@ -212,10 +220,14 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   nacked with backoff 0 gets `run_at = now`, so a wall clock stepping back can hide it behind a
   newer record of its key for that long. (F5) With the default `retry_backoff_ns = 0` a refusing
   sink is retried on every completion, a tight loop until `flush_timeout_ns`; (F5b, fixed
-  2026-11-19 with `jobqueue.release`, see above: one waiting key used to block the synchronous
-  backstop for all keys) each synchronous call dequeues and releases every record of the waiting
-  keys that sorts before the record it writes, so a waiting key with many records costs that many
-  in-memory dequeue/release pairs per call (no storage writes); the deadline after `FlushIncomplete` does not bound a
+  2026-11-19 with `jobqueue`'s dequeue `exclude`, see above) each synchronous call costs
+  O(waiting keys) to build the list plus O(partitions × waiting keys) in the dequeue, with no
+  leasing and no storage writes. That is linear in both, so a sink outage that puts thousands of
+  keys into backoff makes each pass (every 20–50 ms while `flushAll`/`put` wait) scan
+  thousands × thousands of strings. The scan was not replaced by a set because the intended case
+  is a few failing keys. A record whose `nack` (`nack_failed`) or `ack` (`ack_failed`) keeps failing
+  stalls its key (`heldFor`) for as long as the failure lasts; it stays counted in
+  `pendingCount`. The deadline after `FlushIncomplete` does not bound a
   sink call that never returns (`pool.drain` waits for it); `retry_at` follows the injected
   `wal_mono_clock` while the flush deadline follows the real clock; a WAL written before
   2026-11-19 can hold a record with a persisted future `run_at`, which `flushAll` waits for until
