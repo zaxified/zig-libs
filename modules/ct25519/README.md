@@ -46,7 +46,7 @@ stack (`msm_burn`; the body dirtied 28.5 KiB in ReleaseFast). `X25519.recoverPub
 /`recoverPublicKeyInto` burn 16 KiB, `X25519.scalarmult` 4 KiB; `mul`/`mulBase` need
 only a few KiB. **Give a thread that calls them at least 64 KiB of free stack**, which
 covers the 32 KiB burn plus the body's frames in the build `scripts/modtest` runs; a test
-(`stack use: ...` in `src/root.zig`) pins every figure above and runs the four
+(`stack use: ...` in `src/stackprobe2_test.zig`) pins every figure above and runs the four
 entry points in a 64 KiB thread. Embedded or coroutine stacks smaller than that need a
 bigger one for these calls (the Straus tables are not sized by `points.len`).
 

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the stack-use test moved from `src/root.zig` to `src/stackprobe2_test.zig` so the ctgrind source pins (which hash `root.zig`) stay current; the card's audit `src` hash is re-recorded.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** README "Stack use" (minimum 64 KiB free stack for `mulMulti*`, `recoverPublicKey`, `scalarmult`; table and burn sizes) and a test that pins those figures and runs the four entry points in a 64 KiB thread. No production line moved; the card's audit `src` hash is re-recorded over the new test.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
 - **2026-11-13** — **PERFORMANCE:** the X25519 shared secret is about 5 % faster on x86-64 with MULX/ADX: the ladder's conditional swap is asm with 64-bit loads (LLVM's vectorised swap could not be store-forwarded from the field blocks' 64-bit stores) and the three sum/difference pairs of a ladder step are one asm block each. Same results, same constant-time shape (ctgrind counts unchanged).
