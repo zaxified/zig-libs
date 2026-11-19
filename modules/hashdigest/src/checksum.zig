@@ -183,12 +183,19 @@ pub const Status = enum {
     unreadable,
     /// Absolute name or a `..` component, refused without touching the disk.
     unsafe_name,
+    /// The file is longer than `Options.max_file_bytes`; hashing stopped there.
+    too_large,
 };
 
 pub const Options = struct {
     /// Allow absolute names and `..` components. Off by default: the checksum
     /// file is untrusted text. Even on, only regular files are hashed.
     allow_unsafe_names: bool = false,
+    /// Longest file to hash, in bytes; null (the default, as `sha256sum -c`)
+    /// is unlimited. A longer file is `Status.too_large` after at most this
+    /// many bytes plus one read chunk. Set it when the checksum file or the
+    /// tree it points into is not yours.
+    max_file_bytes: ?u64 = null,
 };
 
 pub const VerifyError = error{
@@ -208,7 +215,7 @@ pub fn isUnsafeName(name: []const u8) bool {
 /// Hash the file `entry` names (relative to `dir`) and compare it with the
 /// digest on the line (hex case ignored). `default_algo` is used for GNU
 /// lines; a BSD tag's algorithm wins. Like `hashFile`, no size or time limit
-/// for a regular file; non-regular files are `unreadable`. See the file
+/// for a regular file unless `options.max_file_bytes` is set; non-regular files are `unreadable`. See the file
 /// header for the name rule and the confinement limit.
 pub fn verifyEntry(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, entry: Entry, options: Options) VerifyError!Status {
     const algo = entry.algo orelse default_algo;
@@ -222,7 +229,10 @@ pub fn verifyEntry(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, entry: 
     const st = dir.statFile(io, name, .{}) catch return .unreadable;
     if (st.kind != .file) return .unreadable;
     var out: [root.max_hex_len]u8 = undefined;
-    _ = (root.hashFileIn(algo, io, dir, name, &out) catch unreachable) orelse return .unreadable; // out is max_hex_len
+    _ = (root.hashFileInMax(algo, io, dir, name, &out, options.max_file_bytes) catch |e| switch (e) {
+        error.ShortBuffer => unreachable, // out is max_hex_len
+        error.FileTooLarge => return .too_large,
+    }) orelse return .unreadable;
     const hex = out[0..root.hexLength(algo)];
     return if (std.ascii.eqlIgnoreCase(hex, entry.digest)) .ok else .mismatch;
 }
@@ -232,13 +242,15 @@ pub const Summary = struct {
     mismatch: usize = 0,
     unreadable: usize = 0,
     unsafe_name: usize = 0,
+    /// Files over `Options.max_file_bytes`.
+    too_large: usize = 0,
     /// Lines that did not parse or whose digest/name were unusable.
     malformed: usize = 0,
 
     /// True iff at least one entry verified and nothing failed. An empty,
     /// comment-only or truncated-to-nothing file is NOT ok (as `sha256sum -c`).
     pub fn allOk(s: Summary) bool {
-        return s.ok > 0 and s.mismatch == 0 and s.unreadable == 0 and s.unsafe_name == 0 and s.malformed == 0;
+        return s.ok > 0 and s.mismatch == 0 and s.unreadable == 0 and s.unsafe_name == 0 and s.too_large == 0 and s.malformed == 0;
     }
 };
 
@@ -261,6 +273,7 @@ pub fn verifyAll(io: std.Io, dir: std.Io.Dir, default_algo: Algorithm, text: []c
             .mismatch => s.mismatch += 1,
             .unreadable => s.unreadable += 1,
             .unsafe_name => s.unsafe_name += 1,
+            .too_large => s.too_large += 1,
         }
     }
     return s;

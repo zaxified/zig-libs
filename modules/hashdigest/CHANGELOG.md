@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — Additive: bounded file hashing. `hashFileMax`, `hashFileInMax`, `sha256FileMax` take an optional `max_bytes` and return `error.FileTooLarge` past it; `checksum.Options.max_file_bytes` adds `Status.too_large` and `Summary.too_large` (a new enum member: an exhaustive `switch` over `Status` needs the arm; `Summary.allOk` counts it). Defaults stay unlimited, existing signatures unchanged.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-02** — **CONSUMER-VISIBLE (additive; the checksum API is new the same day and unreleased):** review round. `verifyEntry`/`verifyAll` take `Options` and refuse absolute and `..` names (`Status.unsafe_name`, `Summary.unsafe_name`) and non-regular files (`unreadable`); `Summary.allOk` needs at least one verified entry; `\r` is an accepted name escape; the BLAKE2b-512 tag is `UnknownTag` (use `b2sum -l 256`). Engines are chosen by target: `sha2` only on x86-64, the vectorised BLAKE2b only with AVX2, std elsewhere (MIPS32 and ARM32 tests pass under qemu). Burn raised to 16 KiB after a stack probe. Tests: official BLAKE3 vectors (hash, keyed, derive), GNU coreutils 9.7 next to uutils 0.10 in `sums.txt`, stack probe, fuzz escape round trip.
 
