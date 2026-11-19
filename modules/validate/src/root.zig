@@ -10901,13 +10901,19 @@ test "format truth table: html is go-playground's <[/]?([a-zA-Z]+).*?> unanchore
     try fmtBad(.html, many);
     // And exported by name.
     try expectExportHas(&.{.{ .field = "f", .kind = .string, .format = .html }}, "\"format\":\"html\"");
+    var rep = try validateJson(testing.allocator, "{\"f\":\"plain\"}", &.{.{ .field = "f", .kind = .string, .format = .html }});
+    defer rep.deinit();
+    try testing.expectEqual(@as(usize, 1), rep.errors.len);
+    try testing.expectEqualStrings("format", rep.errors[0].code);
+    try testing.expectEqualStrings("html", rep.errors[0].param);
+    try testing.expectEqualStrings("Input should contain an HTML tag", rep.errors[0].message);
 }
 
 test "uri: the port of a registered-name host is digits, as RFC 3986 and net/url (uriPortOk)" {
     const ok = [_][]const u8{
         "http://host:8080/", "http://host:/",    "http://host",       "http://u:p@host:80/x", "http://u:p@host",
         "//host:1",          "http://host/a:b",  "http://host?q=a:b", "http://host#a:b",      "urn:a:b",
-        "mailto:u@h:x",      "http://1.2.3.4:5", "http://[::1]:80/",
+        "mailto:u@h:x",      "http://1.2.3.4:5", "http://[::1]:80/",  "file:///etc/hosts",    "http://u@[::1]:80/",
     };
     for (ok) |u| {
         try testing.expect(isUri(u, false));
