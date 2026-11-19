@@ -98,7 +98,7 @@ pub const alg_rs256: i64 = -257;
 
 /// Minimum RS256 **credential** key modulus size this module accepts (W2
 /// `webauthn` F7). `rsa.PublicKey.fromBytes` alone only enforces its own
-/// generic `min_modulus_bits = 512` floor — a size chosen for RSA as a
+/// generic `min_modulus_bits = 1024` floor — a size chosen for RSA as a
 /// primitive in general, not for WebAuthn specifically. Every RS256 FIDO2/
 /// WebAuthn authenticator in practice generates 2048-bit keys (it is what
 /// the CTAP2/FIDO Alliance certification test suites require), so a
@@ -459,7 +459,7 @@ pub fn verifySignature(key: CoseKey, alg: i64, msg: []const u8, sig: []const u8)
             if (alg != alg_rs256) return error.UnsupportedAlgorithm;
             const pk = rsa.PublicKey.fromBytes(rk.n, rk.e) catch return error.InvalidKey;
             // W2 `webauthn` F7: WebAuthn RS256 credential keys are always
-            // 2048-bit in practice; `rsa`'s own floor (512) is a generic
+            // 2048-bit in practice; `rsa`'s own floor (1024) is a generic
             // primitive-level bound, not a WebAuthn policy. Reject a
             // credential key below the size every conforming authenticator
             // actually generates, rather than accept whatever `rsa` alone
@@ -1059,9 +1059,9 @@ test "smoke: module compiles and CoseKey.alg dispatch works" {
 
 // Regression (audit W2 `webauthn` F7): an RS256 CREDENTIAL key below the
 // 2048-bit floor every conforming WebAuthn/FIDO2 authenticator actually
-// generates must be rejected — `rsa.PublicKey.fromBytes`'s own floor (512)
+// generates must be rejected — `rsa.PublicKey.fromBytes`'s own floor (1024)
 // is a generic RSA-primitive bound, not a WebAuthn policy, so a genuinely
-// well-formed (real prime-product, real signature) 512-bit key must still be
+// well-formed (real prime-product, real signature) 1024-bit key must still be
 // refused HERE. Uses a real generated key + real signature — not a malformed
 // blob — so the rejection is specifically the modulus-size policy, not
 // `InvalidKey`/`BadSignature` for an unrelated reason.
@@ -1069,10 +1069,10 @@ test "F7: an RS256 credential key below 2048 bits is rejected, not merely small-
     var prng = std.Random.DefaultPrng.init(0x7732_5f66_375f_6b65); // "w2_f7_ke" tests only
     const random = prng.random();
 
-    // 512 bits: passes rsa's own floor (512) and is a completely valid,
+    // 1024 bits: passes rsa's own floor (1024) and is a completely valid,
     // freshly generated RSA key — the ONLY thing wrong with it is its size.
     var kp: rsa.KeyPair = undefined;
-    try rsa.generate(&kp, random, 512, 65537);
+    try rsa.generate(&kp, random, 1024, 65537);
     var n_buf: [rsa.max_modulus_len]u8 = undefined;
     kp.public_key.n.toBytes(&n_buf, .big) catch unreachable;
     var e_buf: [rsa.max_modulus_len]u8 = undefined;
@@ -1083,7 +1083,7 @@ test "F7: an RS256 credential key below 2048 bits is rejected, not merely small-
     const sig = try rsa.signPkcs1v15(&kp.secret_key, std.crypto.hash.sha2.Sha256, msg, &sig_buf);
 
     // Sanity: `rsa` itself is happy with this key (it is a real, valid
-    // 512-bit RSA key and a real signature) — proves the rejection below
+    // 1024-bit RSA key and a real signature) — proves the rejection below
     // comes from webauthn's OWN 2048-bit floor, not from `rsa` refusing a
     // malformed key.
     const pk = try rsa.PublicKey.fromBytes(&n_buf, &e_buf);
