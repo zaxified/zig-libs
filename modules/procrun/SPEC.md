@@ -6,7 +6,7 @@
 
 **Scope:** parity — Python `subprocess` (run/Popen) and Go `os/exec`: capture with caps, stdin bodies/pipes/files, stderr merge, env inherit/clear/merge, cwd, `pass_fds`, uid/gid, process groups with group kill, timeouts with TERM→KILL grace, a shared cancel token, rlimits, streaming, core flag + rusage; on Linux a vfork-style spawner whose cost does not grow with the parent's memory; deliberately not: setsid/umask/PDEATHSIG (no pre-exec hook in std), close_fds walk, pipelines, pty (surveyed 2026-10-20; raised from core)
 
-**Audit:** review 2026-09-10 · mutation 2026-09-28 (3/3) · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-19 (20/20) · src 43a67972404e7abe
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — process runner (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: stream_permits 0/huge, rlimit overflow, invalid signal, deadline-bounded stdin writer, `Handle.wait` bounded against descendants holding the pipes; delta audit 32/38 + 6 eq)
 
@@ -288,7 +288,7 @@ was not mutated by a run; the `Options` default is never relied on, since `procr
 **Audit 2026-11-19 (delta mutation, `rejectNul`).** 8 schemata mutants over the NUL refusal in `spawnChild`, ReleaseSafe, one
 build: the argv check dropped and inverted, the `cwd` check dropped, the env-value check dropped and inverted, the
 `env_mode != .inherit` guard flipped and forced open, the `rejectNul` call skipped. All 8 killed by the test `NUL inside argv,
-cwd or env is refused before spawning`. 8/8. The card's mutation entry carries no whole-module score, so it is left as it was.
+cwd or env is refused before spawning`. 8/8. Card count cumulative: 3 (2026-09-28) + 9 (2026-11-15, above) + 8 = 20/20 over three different sources; a whole-module run is still outstanding.
 
 ## Anchoring
 

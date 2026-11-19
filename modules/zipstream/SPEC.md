@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go archive/zip, zip2, Python zipfile, libzip, minizip-ng: read any positional source with independent entry cursors, zip64 read/write, streamed writes with data descriptors, Store/Deflate/Zstandard/bzip2/LZMA/XZ plus a codec registry, WinZip AES read/write and ZipCrypto read, comments, raw extra, directories, symlinks, Unicode Path and CP437 names, extraction with zip-slip and size guards; deliberately not: in-place editing (R11), multi-disk (R24), async (R25), ZipCrypto write, PPMd (R18); later: raw copy (R10), Deflate64 (R17), alignment (R22), integrity scan (R23) (surveyed 2026-10-20; raised from core)
 
-**Audit:** review 2026-08-11 · mutation 2026-10-04 (36/37, 1 eq) · src ?
+**Audit:** review 2026-08-11 · mutation 2026-11-19 (61/64, 3 eq) · src b405eeb2326b052d
 
 **Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, ZIPSTREAM_FUZZ; the mutated harness writes Store/Deflate/zstd, AES-encrypted and streamed members and opens them with the password) · ct n/a — archive streaming (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: zip64 locator and extra-field overflows refused, entry reservation capped at 4096, `Archive.Options.zstd_window_log_max` bounds zstd members; `extractAll` no longer restores setuid/setgid/sticky by default and removes a file whose extraction failed)
 
@@ -174,6 +174,8 @@ method refused at init, backslash normalisation, mode only from a Unix host with
 attributes, a `UT` record without the mtime flag, the cap at exactly `max_output`, deflate
 output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 / 2024-02-29,
 65 535 written entries with the 65 536th refused, and the writer masking type bits off `mode`.
+
+**Audit 2026-11-19 (delta mutation, Windows name rules).** 27 schemata mutants over `isSafeEntryNameOpts`/`isWindowsDeviceName` and the `extractAll` plumbing (each device name dropped, case-insensitivity, the `.`/`:` cut, trailing-space trim, COM/LPT prefix and digit range, the three superscript digits, both guards forced on/off, name and symlink-target plumbing of `windows_names`): 25 killed, 2 EQUIVALENT. Mutant 5 (cut at `.` only): a `:` in the name is refused by the colon rule anyway, so a device name behind a `:` is unreachable. Mutant 21 (`d[0] <= ':'` for `'9'`): the base is cut at `:`, so the digit byte can never be `:`. Two tests were added after the first run (`AUX.c`, `COM` + U+00B3, symlink target). Card count cumulative: 36/37 (1 eq) + 25/27 (2 eq) = 61/64, 3 eq.
 
 ## Build options
 
