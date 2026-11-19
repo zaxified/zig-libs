@@ -77,6 +77,13 @@ pub const security = @import("security.zig");
 /// `RootFolder` down to a user variable.
 pub const nodestore = @import("nodestore.zig");
 
+/// NumericRange (OPC 10000-4 §7.27): parse/format the `IndexRange` string of a
+/// Read/Write operand and apply it to array, String and ByteString values.
+/// The client sends one through `services.ReadValueId.index_range` /
+/// `WriteValue.index_range` (or `Session.readAttributeRange` /
+/// `Session.writeValueRange`); the server applies it in its Read/Write handlers.
+pub const numeric_range = @import("numeric_range.zig");
+
 /// The server (device) side of the protocol: the opc.tcp connection state
 /// machine (HEL/ACK negotiation, OPN/CLO, chunking with explicit limits),
 /// sessions, the service handlers over `nodestore`, and the time-injected
@@ -93,6 +100,7 @@ test {
     _ = services;
     _ = security;
     _ = nodestore;
+    _ = numeric_range;
     _ = server;
     _ = @import("server_interop.zig");
     _ = @import("asyncua_replay.zig");
@@ -637,10 +645,44 @@ pub const Session = struct {
     /// uses to keep `server_endpoints` while discarding the rest of
     /// `CreateSessionResponse`.
     pub fn readAttribute(session: *Session, node_id: encoding.NodeId, attribute_id: u32) services.ServiceError!encoding.DataValue {
+        return session.readAttributeText(node_id, attribute_id, null);
+    }
+
+    /// `readAttribute` for part of a Variable's value: `range` (NumericRange,
+    /// OPC 10000-4 §7.27) is sent as the operand's `IndexRange`. A server that
+    /// finds no data in the range answers `BadIndexRangeNoData` in the
+    /// `DataValue.status`; an invalid one `BadIndexRangeInvalid`.
+    pub fn readAttributeRange(session: *Session, node_id: encoding.NodeId, attribute_id: u32, range: numeric_range.Range) services.ServiceError!encoding.DataValue {
+        var buf: [numeric_range.max_format_len]u8 = undefined;
+        const text = range.format(&buf) catch unreachable; // max_format_len is the worst case
+        return session.readAttributeText(node_id, attribute_id, text);
+    }
+
+    /// Write `value` over the part of a Variable's Value that `range` selects
+    /// (Write with an `IndexRange`); returns the operation's `StatusCode`
+    /// (`BadIndexRangeNoData` outside the stored array, `BadIndexRangeInvalid`
+    /// when the element count differs from the range, ...).
+    pub fn writeValueRange(session: *Session, node_id: encoding.NodeId, range: numeric_range.Range, value: encoding.Variant) services.ServiceError!encoding.StatusCode {
+        var buf: [numeric_range.max_format_len]u8 = undefined;
+        const text = range.format(&buf) catch unreachable; // max_format_len is the worst case
+        const nodes = [_]services.WriteValue{.{
+            .node_id = node_id,
+            .attribute_id = services.attribute_id.value,
+            .index_range = text,
+            .value = .{ .value = value },
+        }};
+        const resp = try session.write(&nodes);
+        defer services.freeWriteResponse(session.allocator, resp);
+        const results = resp.results orelse &.{};
+        if (results.len != 1) return error.UnexpectedResponseType;
+        return results[0];
+    }
+
+    fn readAttributeText(session: *Session, node_id: encoding.NodeId, attribute_id: u32, index_range: ?[]const u8) services.ServiceError!encoding.DataValue {
         const nodes = [_]services.ReadValueId{.{
             .node_id = node_id,
             .attribute_id = attribute_id,
-            .index_range = null,
+            .index_range = index_range,
             .data_encoding = .{ .namespace_index = 0, .name = null },
         }};
         const resp = try session.read(&nodes, .{});
@@ -2431,6 +2473,112 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         }
     }
     try testing.expect(found_ua_ns);
+
+    // ── NumericRange against open62541 (OPC 10000-4 §7.27), server_ctt's Demo
+    // nodes (ns=1, ids 51016/51017/51018 are the Int32 scalar, Int32[10] and
+    // Int32[3][3]; see its examples/server_ctt.c). One table of everything
+    // open62541 answers, compared as a whole; lines marked KNOWN DIFFERENCE
+    // are where this module's server answers otherwise (SPEC "NumericRange").
+    {
+        var obs = std.Io.Writer.Allocating.init(gpa);
+        defer obs.deinit();
+        const w = &obs.writer;
+        const val = services.attribute_id.value;
+        const arr10: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 51017 } };
+        const mat: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 51018 } };
+        const scalar: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 51016 } };
+        const Op = struct {
+            fn read(sess: *Session, ww: *std.Io.Writer, label: []const u8, node: encoding.NodeId, range: []const u8) !void {
+                const nodes = [_]services.ReadValueId{.{ .node_id = node, .attribute_id = services.attribute_id.value, .index_range = range, .data_encoding = .{ .namespace_index = 0, .name = null } }};
+                const resp = try sess.read(&nodes, .{});
+                defer services.freeReadResponse(sess.allocator, resp);
+                const dv = resp.results.?[0];
+                try ww.print("{s}: status={x}", .{ label, dv.status orelse 0 });
+                if (dv.value) |v| switch (v) {
+                    .scalar => |sc| switch (sc) {
+                        .int32 => |x| try ww.print(" scalar {d}", .{x}),
+                        else => try ww.writeAll(" scalar ?"),
+                    },
+                    .array => |a| switch (a.items) {
+                        .int32 => |x| {
+                            try ww.writeAll(" [");
+                            for (x.?, 0..) |e, i| {
+                                if (i != 0) try ww.writeByte(',');
+                                try ww.print("{d}", .{e});
+                            }
+                            try ww.writeByte(']');
+                        },
+                        else => try ww.writeAll(" array ?"),
+                    },
+                    .empty => try ww.writeAll(" empty"),
+                };
+                try ww.writeByte('\n');
+            }
+            fn write(sess: *Session, ww: *std.Io.Writer, label: []const u8, node: encoding.NodeId, range: []const u8, v: encoding.Variant) !void {
+                const nodes = [_]services.WriteValue{.{ .node_id = node, .attribute_id = services.attribute_id.value, .index_range = range, .value = .{ .value = v } }};
+                const resp = try sess.write(&nodes);
+                defer services.freeWriteResponse(sess.allocator, resp);
+                try ww.print("{s}: status={x}\n", .{ label, resp.results.?[0] });
+            }
+        };
+        _ = val;
+        try Op.read(&session, w, "read 2:4 (zeros)", arr10, "2:4");
+        try Op.write(&session, w, "write 2:4 {7,8,9}", arr10, "2:4", .{ .array = .{ .items = .{ .int32 = &.{ 7, 8, 9 } } } });
+        try Op.read(&session, w, "read whole", arr10, "");
+        try Op.read(&session, w, "read 3:4", arr10, "3:4");
+        try Op.read(&session, w, "read 8:50 (clipped)", arr10, "8:50");
+        try Op.read(&session, w, "read 10 (past the end)", arr10, "10");
+        try Op.read(&session, w, "read 3:3 (syntax)", arr10, "3:3");
+        try Op.read(&session, w, "read 0,0 (dimension count)", arr10, "0,0");
+        try Op.write(&session, w, "KNOWN DIFFERENCE write 0:1 {1} (count)", arr10, "0:1", .{ .array = .{ .items = .{ .int32 = &.{1} } } });
+        try Op.write(&session, w, "KNOWN DIFFERENCE write 9:10 {1,2} (past the end)", arr10, "9:10", .{ .array = .{ .items = .{ .int32 = &.{ 1, 2 } } } });
+        try Op.write(&session, w, "write 0 scalar 5", arr10, "0", .{ .scalar = .{ .int32 = 5 } });
+        try Op.read(&session, w, "read whole", arr10, "");
+        try Op.write(&session, w, "write 1:2,1:2 {1,2,3,4}", mat, "1:2,1:2", .{ .array = .{ .items = .{ .int32 = &.{ 1, 2, 3, 4 } } } });
+        try Op.read(&session, w, "read matrix whole", mat, "");
+        try Op.read(&session, w, "read 1:2,1:2", mat, "1:2,1:2");
+        try Op.read(&session, w, "KNOWN DIFFERENCE read 0:1 on a 2-D array (dimension count)", mat, "0:1");
+        try Op.read(&session, w, "KNOWN DIFFERENCE scalar read 0", scalar, "0");
+        try Op.read(&session, w, "KNOWN DIFFERENCE scalar read 1", scalar, "1");
+        try Op.write(&session, w, "KNOWN DIFFERENCE scalar write 0 {5}", scalar, "0", .{ .scalar = .{ .int32 = 5 } });
+        try Op.write(&session, w, "KNOWN DIFFERENCE scalar write 1 {6}", scalar, "1", .{ .scalar = .{ .int32 = 6 } });
+        try Op.read(&session, w, "scalar whole", scalar, "");
+        // open62541 1.0.5 (the image's version). Differences, all on the spec's
+        // side here: element-count mismatch is BadIndexRangeInvalid there
+        // (this module: BadIndexRangeDataMismatch), a write past the end and a
+        // range with too few dimensions are BadIndexRangeInvalid there (here
+        // BadIndexRangeNoData, §7.27: "All other invalid requests with a valid
+        // syntax shall result in Bad_IndexRangeNoData"), and a range on a
+        // scalar is BadIndexRangeNoData there on Read and Write (here not
+        // used, §7.28/§5.11.4 and node-opcua).
+        const expected_table =
+            \\read 2:4 (zeros): status=0 [0,0,0]
+            \\write 2:4 {7,8,9}: status=0
+            \\read whole: status=0 [0,0,7,8,9,0,0,0,0,0]
+            \\read 3:4: status=0 [8,9]
+            \\read 8:50 (clipped): status=0 [0,0]
+            \\read 10 (past the end): status=80370000
+            \\read 3:3 (syntax): status=80360000
+            \\read 0,0 (dimension count): status=80370000
+            \\KNOWN DIFFERENCE write 0:1 {1} (count): status=80360000
+            \\KNOWN DIFFERENCE write 9:10 {1,2} (past the end): status=80360000
+            \\write 0 scalar 5: status=0
+            \\read whole: status=0 [5,0,7,8,9,0,0,0,0,0]
+            \\write 1:2,1:2 {1,2,3,4}: status=0
+            \\read matrix whole: status=0 [0,0,0,0,1,2,0,3,4]
+            \\read 1:2,1:2: status=0 [1,2,3,4]
+            \\KNOWN DIFFERENCE read 0:1 on a 2-D array (dimension count): status=80360000
+            \\KNOWN DIFFERENCE scalar read 0: status=80370000
+            \\KNOWN DIFFERENCE scalar read 1: status=80370000
+            \\KNOWN DIFFERENCE scalar write 0 {5}: status=80370000
+            \\KNOWN DIFFERENCE scalar write 1 {6}: status=80370000
+            \\scalar whole: status=0 scalar 0
+        ;
+        if (!std.mem.eql(u8, expected_table, std.mem.trimEnd(u8, obs.written(), "\n"))) {
+            std.debug.print("LIVE range table:\n{s}", .{obs.written()});
+            return error.TestUnexpectedResult;
+        }
+    }
 
     // ── Browse: the Objects folder (i=85) — expect "Server" among the refs.
     const browse_nodes = [_]services.BrowseDescription{.{

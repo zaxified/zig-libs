@@ -25,6 +25,7 @@
 const std = @import("std");
 const encoding = @import("encoding.zig");
 const services = @import("services.zig");
+const numeric_range = @import("numeric_range.zig");
 
 pub const StoreError = std.mem.Allocator.Error;
 
@@ -935,6 +936,59 @@ pub const NodeStore = struct {
                 return 0;
             },
             else => return status.bad_not_writable,
+        }
+    }
+
+    /// Write part of an attribute's value: the Write service with a non-empty
+    /// `IndexRange` (OPC 10000-4 §5.11.4, NumericRange §7.27 — see
+    /// `numeric_range.zig` for the exact rules). The syntax is checked first
+    /// (`BadIndexRangeInvalid`). A range then applies only to the Value of a
+    /// Variable that holds an array or a String/ByteString/XmlElement; for any
+    /// other attribute and for any other scalar it is not used (§5.11.4: "not
+    /// used if the specified Attribute is not an array"; open62541 ignores it
+    /// on non-Value attributes too) and this is a plain `writeAttribute`. The
+    /// node and its access levels are judged exactly as `writeAttribute` does.
+    pub fn writeAttributeRange(
+        s: *NodeStore,
+        node_id: encoding.NodeId,
+        attribute: u32,
+        value: encoding.DataValue,
+        now: encoding.DateTime,
+        index_range: []const u8,
+    ) StoreError!encoding.StatusCode {
+        if (index_range.len == 0) return s.writeAttribute(node_id, attribute, value, now);
+        const range = numeric_range.parse(index_range) catch return status.bad_index_range_invalid;
+        const node = s.nodes.getPtr(node_id) orelse return status.bad_node_id_unknown;
+        if (attribute != services.attribute_id.value) return s.writeAttribute(node_id, attribute, value, now);
+        switch (node.attributes) {
+            .variable => |*v| {
+                if (v.value.value) |st| {
+                    if (!numeric_range.takesRange(st)) return s.writeAttribute(node_id, attribute, value, now);
+                }
+                if (v.access_level & access_level.current_write == 0) return status.bad_not_writable;
+                if (v.user_access_level & access_level.current_write == 0) return status.bad_user_access_denied;
+                const incoming = value.value orelse return status.bad_type_mismatch;
+                const stored = v.value.value orelse return status.bad_index_range_invalid;
+                var tmp = std.heap.ArenaAllocator.init(s.allocator);
+                defer tmp.deinit();
+                const merged = numeric_range.writeRange(tmp.allocator(), stored, incoming, &range) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.IndexRangeInvalid => return status.bad_index_range_invalid,
+                    error.IndexRangeNoData => return status.bad_index_range_no_data,
+                    error.TypeMismatch => return status.bad_type_mismatch,
+                    error.IndexRangeDataMismatch => return status.bad_index_range_data_mismatch,
+                };
+                const copy = try dupVariant(s.allocator, merged);
+                encoding.freeDataValue(s.allocator, v.value);
+                v.value = .{
+                    .value = copy,
+                    .status = value.status orelse 0,
+                    .source_timestamp = value.source_timestamp orelse now,
+                    .server_timestamp = now,
+                };
+                return 0;
+            },
+            else => return s.writeAttribute(node_id, attribute, value, now),
         }
     }
 

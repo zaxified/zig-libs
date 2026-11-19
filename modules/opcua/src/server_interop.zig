@@ -60,6 +60,8 @@ const live_ns_uri = "urn:zig-libs:opcua:interop";
 /// "the.answer")`), so this server publishes exactly that NodeId in exactly
 /// that namespace index.
 const answer_node: encoding.NodeId = .{ .string = .{ .namespace = 1, .id = "the.answer" } };
+/// `Objects/the.array` — an Int32[5] the loopback test reads and writes by NumericRange.
+const array_node: encoding.NodeId = .{ .string = .{ .namespace = 1, .id = "the.array" } };
 /// `UA_NODEID_NUMERIC(1, 62541)` on the Objects folder — the method that
 /// example calls.
 const method_node: encoding.NodeId = .{ .numeric = .{ .namespace = 1, .id = 62_541 } };
@@ -223,6 +225,17 @@ const Driver = struct {
             .display_name = .{ .locale = "en", .text = "the answer" },
             .value = .{ .scalar = .{ .int32 = 42 } },
             .data_type = nodestore.n0(nodestore.id.int32),
+            .access_level = nodestore.access_level.read_write,
+            .timestamp = d.start_time,
+        });
+        try d.store.addVariable(.{
+            .node_id = array_node,
+            .parent_id = nodestore.n0(nodestore.id.objects_folder),
+            .reference_type_id = nodestore.n0(nodestore.id.organizes),
+            .browse_name = .{ .namespace_index = 1, .name = "the.array" },
+            .value = .{ .array = .{ .items = .{ .int32 = &.{ 10, 11, 12, 13, 14 } } } },
+            .data_type = nodestore.n0(nodestore.id.int32),
+            .value_rank = nodestore.value_rank.one_dimension,
             .access_level = nodestore.access_level.read_write,
             .timestamp = d.start_time,
         });
@@ -1112,6 +1125,22 @@ test "LIVE loopback: this module's own client drives this module's own server ov
     const after = try session.readAttribute(answer_node, services.attribute_id.value);
     defer encoding.freeDataValue(gpa, after);
     try testing.expectEqual(@as(i32, 4242), after.value.?.scalar.int32);
+
+    // NumericRange (OPC 10000-4 §7.27): read a slice, write a slice, read it back.
+    const slice = try root.numeric_range.parse("1:3");
+    const part = try session.readAttributeRange(array_node, services.attribute_id.value, slice);
+    defer encoding.freeDataValue(gpa, part);
+    try testing.expectEqualSlices(i32, &.{ 11, 12, 13 }, part.value.?.array.items.int32.?);
+    const ranged_write = try session.writeValueRange(array_node, slice, .{ .array = .{ .items = .{ .int32 = &.{ -1, -2, -3 } } } });
+    try testing.expectEqual(services.status.good, ranged_write);
+    const whole = try session.readAttribute(array_node, services.attribute_id.value);
+    defer encoding.freeDataValue(gpa, whole);
+    try testing.expectEqualSlices(i32, &.{ 10, -1, -2, -3, 14 }, whole.value.?.array.items.int32.?);
+    const past = try session.readAttributeRange(array_node, services.attribute_id.value, try root.numeric_range.parse("5:6"));
+    defer encoding.freeDataValue(gpa, past);
+    try testing.expectEqual(services.status.bad_index_range_no_data, past.status.?);
+    try testing.expectEqual(services.status.bad_index_range_no_data, try session.writeValueRange(array_node, try root.numeric_range.parse("4:5"), .{ .array = .{ .items = .{ .int32 = &.{ 1, 2 } } } }));
+    try testing.expectEqual(services.status.bad_index_range_data_mismatch, try session.writeValueRange(array_node, slice, .{ .array = .{ .items = .{ .int32 = &.{1} } } }));
 
     // Call the method.
     const inputs = [_]encoding.Variant{.{ .scalar = .{ .string = "hello" } }};
