@@ -116,3 +116,36 @@ test "isRemote: network type names, fuse subtypes, and the host:/ and // device 
     try testing.expect(!isRemote("ext4", "//"));
     try testing.expect(!isRemote("ext4", "none"));
 }
+
+test "every name of the three tables is classified (golden lists, written independently of the tables)" {
+    // Whole-module mutation 2026-11-19: dropping any single table entry other than the
+    // sixteen named above survived. These lists are the documented names
+    // (kernel docs, mount(8), filesystems(5)); a name added to a table later needs a line here.
+    const pseudo = [_][]const u8{
+        "proc",       "sysfs",      "devpts",  "cgroup",    "cgroup2",     "debugfs",         "tracefs",
+        "securityfs", "configfs",   "fusectl", "pstore",    "bpf",         "mqueue",          "binfmt_misc",
+        "autofs",     "rpc_pipefs", "nfsd",    "selinuxfs", "nsfs",        "devfs",           "cpuset",
+        "resctrl",    "functionfs", "binder",  "smackfs",   "sockfs",      "pipefs",          "anon_inodefs",
+        "rdtgroup",   "subfs",      "kernfs",  "ignore",    "fuse.portal", "fuse.gvfsd-fuse",
+    };
+    for (pseudo) |t| try testing.expect(isPseudo(t));
+    const remote = [_][]const u8{
+        "nfs",    "nfs4",  "cifs",   "smb3",     "smbfs", "ncpfs",
+        "ncp",    "afs",   "coda",   "9p",       "ceph",  "glusterfs",
+        "lustre", "panfs", "beegfs", "orangefs", "gpfs",
+    };
+    for (remote) |t| try testing.expect(isRemote(t, "x"));
+    const fuse_remote = [_][]const u8{
+        "sshfs",  "glusterfs", "cephfs", "davfs", "davfs2",   "s3fs", "gcsfuse",
+        "rclone", "curlftpfs", "nfs",    "cifs",  "smbnetfs", "mfs",  "moosefs",
+    };
+    for (fuse_remote) |s| {
+        var buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buf, "fuse.{s}", .{s});
+        try testing.expect(isRemote(name, "x"));
+        try testing.expect(!isPseudo(name));
+    }
+    // A remote type is not pseudo and a pseudo one is not remote.
+    for (remote) |t| try testing.expect(!isPseudo(t));
+    for (pseudo) |t| try testing.expect(!isRemote(t, "/dev/sda1"));
+}

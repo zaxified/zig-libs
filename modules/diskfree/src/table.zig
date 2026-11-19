@@ -380,3 +380,47 @@ test "collect over the real statfs: the root filesystem is listed with real numb
     try testing.expect(t.rows[0].usage.blocks_total > 0);
     try testing.expect(t.rows[0].usage.blocks_available <= t.rows[0].usage.blocks_total);
 }
+
+test "collectWith: a tree that is not entry-for-entry with the entries is ignored, never indexed (whole-module mutation 2026-11-19)" {
+    const g = testing.allocator;
+    const es = [_]mounts.MountEntry{
+        ent("r", "/", "ext4"),
+        ent("i", "/h/inner", "tmpfs"),
+        ent("h", "/h", "tmpfs"),
+        ent("a1", "/a", "tmpfs"),
+        ent("a2", "/a", "xfs"),
+    };
+    // Four tree rows for five entries: the tree is dropped, so the covered /h/inner is listed.
+    const info = try mountinfo.parseMountinfo(g, "1 0 0:1 / / rw - ext4 r rw\n2 1 0:2 / /h/inner rw - tmpfs i rw\n3 1 0:3 / /h rw - tmpfs h rw\n4 1 0:4 / /a rw - tmpfs a1 rw\n");
+    defer mountinfo.freeAll(g, info);
+    const t = try collectWith(g, &es, .{ .tree = info }, fakeQuery);
+    defer t.deinit(g);
+    try testing.expectEqual(@as(usize, 4), t.rows.len);
+    try testing.expectEqualStrings("/h/inner", t.rows[1].mount_point);
+    try testing.expectEqualStrings("a2", t.rows[3].device);
+}
+
+test "collectWith: skip_fs_types matches whole type names, not prefixes" {
+    const g = testing.allocator;
+    const es = [_]mounts.MountEntry{ ent("d", "/", "ext4"), ent("x", "/x", "ext4"), ent("e", "/e", "ext") };
+    const t = try collectWith(g, &es, .{ .skip_fs_types = &.{"ext"} }, fakeQuery);
+    defer t.deinit(g);
+    try testing.expectEqual(@as(usize, 2), t.rows.len);
+    try testing.expectEqualStrings("/", t.rows[0].mount_point);
+    try testing.expectEqualStrings("/x", t.rows[1].mount_point);
+}
+
+test "readTable: a row's device is the mount source of its mountinfo entry" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const o = (try readTable(testing.allocator, threaded.io(), .{})) orelse return error.SkipZigTest;
+    defer o.deinit(testing.allocator);
+    try testing.expect(o.table.rows.len > 0);
+    for (o.table.rows) |row| {
+        var want: ?[]const u8 = null;
+        for (o.infos) |inf| {
+            if (std.mem.eql(u8, inf.mount_point, row.mount_point)) want = inf.mount_source; // the last one wins
+        }
+        try testing.expectEqualStrings(want.?, row.device);
+    }
+}

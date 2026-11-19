@@ -961,3 +961,15 @@ test "df golden: Usage reproduces GNU df's columns from the same statfs numbers"
     }
     try testing.expectEqual(@as(usize, 12), rows);
 }
+
+test "mapErrno: each documented errno has its own error, everything else is Unexpected (whole-module mutation 2026-11-19)" {
+    try testing.expectEqual(error.FileNotFound, mapErrno(.NOENT));
+    try testing.expectEqual(error.AccessDenied, mapErrno(.ACCES));
+    try testing.expectEqual(error.AccessDenied, mapErrno(.PERM));
+    try testing.expectEqual(error.NotDir, mapErrno(.NOTDIR));
+    try testing.expectEqual(error.NameTooLong, mapErrno(.NAMETOOLONG));
+    try testing.expectEqual(error.TooManySymlinks, mapErrno(.LOOP));
+    try testing.expectEqual(error.IoError, mapErrno(.IO));
+    try testing.expectEqual(error.Unexpected, mapErrno(.NOMEM));
+    try testing.expectEqual(error.Unexpected, mapErrno(.FAULT));
+}

@@ -6,7 +6,7 @@
 
 **Scope:** parity — GNU coreutils df 9.12 (surveyed 2026-11-02)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-19 (24/26, 2 eq) · src a66cf50b39a17a3e
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (268/279, 10 eq) · src a183b8ff9610e746
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DISKFREE_FUZZ) · ct n/a — statvfs reporting (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: OutOfMemory propagates instead of "no data" / a short table; delta audit 14/14)
 
@@ -388,6 +388,10 @@ Previously (kept for the record — the evidence that made it REDERIVED):
   defect, and n32 (as opposed to o32, `.mips`/`.mipsel`, which build and
   analyze cleanly) is not the concrete target this module's requirements
   named.
+
+**Audit 2026-11-19 (whole-module mutation).** 279 schemata mutants over every non-test source file (`classify.zig`, `mounts.zig`, `mountinfo.zig`, `statfs.zig`, `lookup.zig`, `table.zig`; `root.zig` only re-exports): 214 over conditions and operators (dropped guards, off-by-one limits, swapped operands and fields, wrong errno class, skipped cleanups, inverted verdicts) plus 65 table-entry mutants (each name of the pseudo, remote and FUSE-remote tables dropped in turn). Result: 268 killed, 10 equivalent, 1 unobservable, 0 not run. The card's `268/279` replaces the earlier delta-only counts. Not mutated: the kernel-ABI struct declarations, their `comptime` size/offset assertions, the `St.*` constants and the `family` constant (compile-time, a runtime switch cannot reach them; the `familyFor` prongs and every `toUsage` arm ARE mutated and pinned by tests that run all families on any host), `tokenOffset`, the `|` joins of `unescapeOctal`'s three octal digits (disjoint bit fields, `+` is the same value) and printing. The first run left 61 survivors; tests added for them: digits without a backslash and `\018` stay literal in `unescapeOctal`, tab-separated and short rows in `parseMounts`, the `readMountsLimited` truncation flag and the exact limit boundary of `readVirtualFileCut`, a direct `mapErrno` test of every errno class, a root entry written as `//` for both lookup finders, a tree that is not entry-for-entry with the table, whole-name matching of `skip_fs_types`, the device of a `readTable` row, and golden lists of every name in the three classification tables (a name dropped from a table had survived for all but sixteen of them).
+
+Equivalent (10): the blank-line guards of both parsers (a blank line has no columns and is dropped by the column checks anyway); relaxing any one of the first three `orelse continue` columns of a mounts row (the next column's guard drops the same row, only the last column's guard is observable and is killed); the `pid == 0` guard of `readMountinfoOf` (`/proc/0/mountinfo` does not exist, the read is `null` either way); `unitBytes` `unit > 0` against `>= 0` (a 0 unit casts to 0); the `.ACCES, .PERM` switch label of `mapErrno` (a switch label is comptime, the mutant is inexpressible; the `.PERM` mapping itself is tested); the cycle detection of `Index` (cost-only: the walk is bounded by `entries.len` either way and the answer is identical); the `top == null` branch of `collectWith` (unreachable: a canonical mount point always covers itself). Unobservable (1): `readTable` passing no mount tree on (`o.tree = null`) differs only on a live table that contains a covered mount, and `readTable` reads `/proc/self/mountinfo` directly; an injectable source or a mount namespace would be needed. Observation, not pinned: `readVirtualFileCut` reports `cut = true` when `limit` equals the file length exactly (the reader stops at the limit before it sees EOF); the text is whole then, so the flag errs on the safe side.
 
 ## What is deliberately not done
 
