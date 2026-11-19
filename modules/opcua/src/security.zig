@@ -208,6 +208,11 @@ pub const ClientCredentials = struct {
         /// application-certificate size for Basic256Sha256 (what
         /// `SecurityLengths.basic256sha256` documents); other sizes work —
         /// all asymmetric lengths are computed from the actual modulus.
+        /// Below 1024 (`rsa.min_modulus_bits`) `generateSelfSigned` returns
+        /// `error.InvalidBits` (Go 1.24's floor, the same as the smallest
+        /// key length OPC UA 10000-7 lists for any RSA security policy);
+        /// 2048 is the policy minimum of Basic256Sha256 and the
+        /// Aes*_RsaOaep policies, and is the caller's to choose.
         modulus_bits: usize = 2048,
         public_exponent: u64 = 65537,
         /// Certificate `commonName` (`rsa.CertOptions.common_name`).
@@ -1304,7 +1309,7 @@ test "ClientCredentials.generateSelfSigned" {
         testing.allocator,
         random,
         .{
-            .modulus_bits = 512, // small, only to keep this test fast — see the option's own doc comment
+            .modulus_bits = 1024, // small, only to keep this test fast — see the option's own doc comment
             .common_name = "opcua-security-test",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1389,17 +1394,37 @@ test "deriveKeys: directions differ, deterministic, matches raw P-SHA256 layout"
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&wiped), 0));
 }
 
+test "generateSelfSigned: modulus_bits under 1024 is a typed error, 1024 works" {
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x11)));
+    var out: ClientCredentials = undefined;
+    const base: ClientCredentials.GenerateSelfSignedOptions = .{
+        .common_name = "floor",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+    };
+    for ([_]usize{ 0, 512, 768, 1022 }) |bits| {
+        var o = base;
+        o.modulus_bits = bits;
+        try testing.expectError(error.InvalidBits, ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), o, &out));
+    }
+    var o = base;
+    o.modulus_bits = 1024;
+    try ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), o, &out);
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1024), out.public_key.bits());
+}
+
 test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(7)));
     const random = prng.random();
     var kp: rsa.KeyPair = undefined;
-    try rsa.generate(&kp, random, 512, 65537); // k = 64, plain block = 22 -> multi-block fast
+    try rsa.generate(&kp, random, 1024, 65537); // k = 128, plain block = 86 -> multi-block fast
 
-    const msg = "a message noticeably longer than one 22-byte OAEP block, spanning several RSA blocks";
+    const msg = "a message noticeably longer than one 86-byte OAEP block, so that it spans several RSA blocks: this sentence keeps going to pass two";
     const ct = try asymmetricEncrypt(testing.allocator, msg, kp.public_key, random);
     defer testing.allocator.free(ct);
-    try testing.expectEqual(@as(usize, 0), ct.len % 64);
-    try testing.expect(ct.len / 64 == (msg.len + 21) / 22);
+    try testing.expectEqual(@as(usize, 0), ct.len % 128);
+    try testing.expect(ct.len / 128 == (msg.len + 85) / 86);
 
     const pt = try asymmetricDecrypt(testing.allocator, ct, &kp.secret_key);
     defer testing.allocator.free(pt);
@@ -1418,12 +1443,12 @@ test "asymmetricSign -> asymmetricVerify round-trip + tamper" {
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(9)));
     const random = prng.random();
     var kp: rsa.KeyPair = undefined;
-    try rsa.generate(&kp, random, 512, 65537);
+    try rsa.generate(&kp, random, 1024, 65537);
 
     const msg = "OPN message bytes to be signed";
     const sig = try asymmetricSign(testing.allocator, msg, &kp.secret_key);
     defer testing.allocator.free(sig);
-    try testing.expectEqual(@as(usize, 64), sig.len);
+    try testing.expectEqual(@as(usize, 128), sig.len);
     try asymmetricVerify(msg, sig, kp.public_key);
     try testing.expectError(error.SignatureVerificationFailed, asymmetricVerify("OPN message bytes to be signed!", sig, kp.public_key));
     sig[0] ^= 0x01;
@@ -1523,7 +1548,7 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
         testing.allocator,
         random,
         .{
-            .modulus_bits = 512,
+            .modulus_bits = 1024,
             .common_name = "seal-open-client",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1536,7 +1561,7 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
         testing.allocator,
         random,
         .{
-            .modulus_bits = 768, // deliberately a different size than the client's
+            .modulus_bits = 1280, // deliberately a different size than the client's
             .common_name = "seal-open-server",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1566,9 +1591,9 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
     try testing.expectEqualSlices(u8, "OPN", wire[0..3]);
     try testing.expectEqual(wire.len, std.mem.readInt(u32, wire[4..8], .little));
     // Clear part (up to the asym header's end) rides plaintext; the
-    // encrypted region is whole 96-byte (768-bit) RSA blocks.
+    // encrypted region is whole 160-byte (1280-bit) RSA blocks (the server key).
     try testing.expectEqualSlices(u8, body[0..enc_offset], wire[8..][0..enc_offset]);
-    try testing.expectEqual(@as(usize, 0), (wire.len - 8 - enc_offset) % 96);
+    try testing.expectEqual(@as(usize, 0), (wire.len - 8 - enc_offset) % 160);
 
     // Server side: decrypt with the server key, verify with the client cert.
     const recovered = try openAsymmetricMessage(testing.allocator, wire[0..8], wire[8..], &server.private_key, client.certificate_der);
@@ -1765,9 +1790,9 @@ test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong k
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x21)));
     const random = prng.random();
     var server_kp: rsa.KeyPair = undefined;
-    try rsa.generate(&server_kp, random, 512, 65537);
+    try rsa.generate(&server_kp, random, 1024, 65537);
     var other_kp: rsa.KeyPair = undefined;
-    try rsa.generate(&other_kp, random, 512, 65537);
+    try rsa.generate(&other_kp, random, 1024, 65537);
 
     const server_nonce = "server-nonce-0123456789abcdefghi"; // 32 bytes
     const password = "correct horse battery staple";
@@ -1775,7 +1800,7 @@ test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong k
     const blob = try encryptUserTokenSecret(testing.allocator, password, server_nonce, server_kp.public_key, random);
     defer testing.allocator.free(blob);
     // Whole RSA blocks, and nothing recognisable of the password in them.
-    try testing.expectEqual(@as(usize, 0), blob.len % 64);
+    try testing.expectEqual(@as(usize, 0), blob.len % 128);
     try testing.expect(std.mem.find(u8, blob, password) == null);
 
     const recovered = try decryptUserTokenSecret(testing.allocator, blob, &server_kp.secret_key, server_nonce);
@@ -1814,7 +1839,7 @@ test "certificateValidity: notBefore/notAfter come back out of a certificate we 
         testing.allocator,
         prng.random(),
         .{
-            .modulus_bits = 512,
+            .modulus_bits = 1024,
             .common_name = "validity-test",
             .not_before = "260101000000Z", // 2026-01-01T00:00:00Z
             .not_after = "270101000000Z", // 2027-01-01T00:00:00Z
@@ -1861,7 +1886,7 @@ test "hostile certificates: truncation, tampering and garbage are typed errors, 
         testing.allocator,
         prng.random(),
         .{
-            .modulus_bits = 512,
+            .modulus_bits = 1024,
             .common_name = "hostile-cert-test",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1970,11 +1995,11 @@ fn buildCertificateCorpus(
 }
 
 /// The credentials both the harness and its guard build their corpus from.
-/// Deterministic PRNG, 512-bit modulus: this is a fixture, not a key.
+/// Deterministic PRNG, 1024-bit modulus: this is a fixture, not a key.
 fn certificateCorpusCredentials(allocator: std.mem.Allocator, out: *ClientCredentials) !void {
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5A)));
     return ClientCredentials.generateSelfSigned(allocator, prng.random(), .{
-        .modulus_bits = 512,
+        .modulus_bits = 1024,
         .common_name = "fuzz-corpus",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
@@ -2065,9 +2090,9 @@ const OpnRig = struct {
                 return .{ .modulus_bits = bits, .common_name = name, .not_before = "260101000000Z", .not_after = "270101000000Z" };
             }
         };
-        try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(512, "forge-client"), &rig.client);
+        try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(1024, "forge-client"), &rig.client);
         errdefer rig.client.deinit(testing.allocator);
-        try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(512, "forge-other"), &rig.other);
+        try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(1024, "forge-other"), &rig.other);
         errdefer rig.other.deinit(testing.allocator);
         try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(server_bits, "forge-server"), &rig.server);
     }
@@ -2127,7 +2152,7 @@ const OpnRig = struct {
 
 test "openAsymmetricMessage: padding and length rules, checked on forged but signed messages" {
     var rig: OpnRig = undefined;
-    try rig.init(768);
+    try rig.init(1280);
     defer rig.deinit();
     const gpa = testing.allocator;
     const seq = [_]u8{ 1, 0, 0, 0, 1, 0, 0, 0 };
@@ -2215,7 +2240,7 @@ test "seal/open with a receiver key over 2048 bits uses the two-byte padding foo
 
 test "asymmetricDecrypt refuses an empty ciphertext; certificatePublicKey refuses a non-rsaEncryption key" {
     var rig: OpnRig = undefined;
-    try rig.init(512);
+    try rig.init(1024);
     defer rig.deinit();
     try testing.expectError(error.DecryptionError, asymmetricDecrypt(testing.allocator, &.{}, &rig.server.private_key));
     // same certificate, SPKI algorithm OID rsaEncryption (…01 01 01) rewritten to id-RSASSA-PSS (…01 01 0a)
@@ -2232,7 +2257,7 @@ test "decryptUserTokenSecret: length prefix rules on crafted plaintexts" {
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
     const random = prng.random();
     var kp: rsa.KeyPair = undefined;
-    try rsa.generate(&kp, random, 512, 65537);
+    try rsa.generate(&kp, random, 1024, 65537);
     const gpa = testing.allocator;
     const nonce = "nonce-0123456789";
     const Case = struct { plain: []const u8, expect: ?anyerror };

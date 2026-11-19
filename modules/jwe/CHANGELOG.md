@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **Behaviour change (via `rsa`):** an RSA public key under 1024 bits is refused (`rsa.PublicKey.fromBytes`). Test fixture modulus widened to 1024 bits.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** joined the portable ctgrind lane (`scripts/test.sh ctgrind-portable`, `cpu=x86_64` variant rows content 487 / kw 332 / ecdh 181 / pbes2 182). The unattributed trap contexts were the harness's own copy/free of the returned plaintext, whose length std soft AES's `undefined` batch padding leaves undefined; the harness now uses the length it sent (checked under `-fvalgrind`). Every other extra context is std's soft-AES key schedule or that padding; no jwe branch on a key. SPEC Backlog item closed.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: excluded from the portable ctgrind lane, because the x86_64 run reports unattributed contexts in std soft-AES frames (numbers in the item).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** constant-time evidence: `src/ctgrind_harness.zig` (decrypt side, tainted dir CEK / KW KEK / ECDH-ES key / PBES2 password / RSA-OAEP key), recorded in SPEC § Constant-time; no module code changed.

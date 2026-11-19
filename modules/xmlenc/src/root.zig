@@ -1042,12 +1042,14 @@ test "RFC 3394 §4.1 AES key unwrap (byte-exact)" {
 // 64-byte CEK buffer; with k = 128 a 7-octet PS implies a 118-byte "message"
 // and would be rejected by the length arm instead, so the PS test would pass
 // for the wrong reason. The over-long-message arm gets its own 1024-bit case.
+// `rsa.generate` refuses a modulus under 1024 bits (Go 1.24's floor), so the
+// deliberately small keys here go through the testing-only escape.
 
 /// Deterministic test keys (test-only use of a seeded PRNG, as elsewhere here).
 fn v15TestKey(comptime bits: usize) !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(0x15_C0_DE_15);
     var kp: rsa.KeyPair = undefined;
-    try rsa.generate(&kp, prng.random(), bits, 65537);
+    try rsa.generateWith(&kp, prng.random(), bits, 65537, .{ .insecure_allow_small_modulus = true });
     return kp;
 }
 

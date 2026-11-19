@@ -176,18 +176,41 @@ pub const Fe = Modulus.Fe;
 /// Largest supported modulus length in bytes (`k` in RFC 8017 terms).
 pub const max_modulus_len = max_modulus_bits / 8;
 
-/// Smallest modulus accepted by `PublicKey.fromBytes`, in bits. Matches the
-/// floor used by std's internal RSA verifier: 512-bit RSA was factored in
-/// 1999, this only ratchets in an obvious lower bound for untrusted keys.
-const min_modulus_bits = 512;
+/// Smallest modulus a PUBLIC key may have (`PublicKey`/`VerifyKey` from bytes,
+/// DER or PEM) and that `generate` produces, in bits: Go 1.24's `crypto/rsa`
+/// floor (`rsa1024min`; it refuses to generate, and to use, a smaller key).
+/// A smaller key is `InvalidPublicKey` / `InvalidBits`; the testing-only
+/// `insecure_allow_small_modulus` option on `PublicKey.fromBytesWith` & co.
+/// and on `generateWith` lowers the floor to `min_modulus_bits_insecure`.
+pub const min_modulus_bits = 1024;
+
+/// The hard floor under the testing-only escape: 512 bits (the floor std's
+/// internal RSA verifier uses; 512-bit RSA was factored in 1999). The
+/// montint slots and the prime search are built for moduli of at least this
+/// size, so the escape never goes lower for public keys or `generate` (the
+/// private-key escape, `SecretKey.fromPrimesWith`, has no floor of its own).
+pub const min_modulus_bits_insecure = 512;
+
+/// Options of the public-key constructors (`PublicKey.fromBytesWith`,
+/// `fromDerWith`, `fromPemWith`, `VerifyKey.fromBytesWith`, `fromDerWith`).
+pub const PublicKeyOptions = struct {
+    /// TESTING ONLY: accept a modulus of `min_modulus_bits_insecure` (512)
+    /// up instead of `min_modulus_bits` (1024) up. A key this small is
+    /// factorable; never set it for a key that protects anything.
+    insecure_allow_small_modulus: bool = false,
+
+    fn minBits(o: PublicKeyOptions) usize {
+        return if (o.insecure_allow_small_modulus) min_modulus_bits_insecure else min_modulus_bits;
+    }
+};
 
 /// Smallest modulus a PRIVATE key may have when it is built from components
 /// (`SecretKey.fromPrimes`) or parsed (`SecretKey.fromDer` / `fromPem` /
 /// `fromPemEncrypted`, `fromPkcs8`, `fromOpenSSH`), in bits: Go 1.24's
 /// `crypto/rsa` floor (`rsa1024min`). A smaller key is `InvalidPrivateKey`;
 /// `SecretKey.fromPrimesWith(.., .{ .insecure_allow_small_modulus = true })`
-/// is the testing-only way around it. Public keys and `generate` keep the
-/// 512-bit `min_modulus_bits` (SPEC Backlog).
+/// is the testing-only way around it. Public keys and `generate` have the
+/// same 1024-bit floor (`min_modulus_bits`).
 pub const min_private_modulus_bits = 1024;
 
 /// Modulus length in bytes for a modulus of `bit_count` bits.
@@ -293,13 +316,21 @@ pub const PublicKey = struct {
     /// strings (as extracted from a DER `RSAPublicKey` SEQUENCE, or supplied
     /// directly). Modeled after `std.crypto.Certificate.rsa.PublicKey.fromBytes`
     /// (which is not `pub`), generalized to be usable stand-alone.
+    ///
+    /// A modulus below `min_modulus_bits` (1024) is `error.InvalidPublicKey`
+    /// (Go 1.24's floor); `fromBytesWith` is the testing-only escape.
     pub fn fromBytes(modulus_bytes: []const u8, exponent_bytes: []const u8) FromBytesError!PublicKey {
+        return fromBytesWith(modulus_bytes, exponent_bytes, .{});
+    }
+
+    /// `fromBytes` with options (the testing-only small-modulus escape).
+    pub fn fromBytesWith(modulus_bytes: []const u8, exponent_bytes: []const u8, options: PublicKeyOptions) FromBytesError!PublicKey {
         // Leading-zero tolerant (DER integers are sign-prefixed).
         const n_bytes = std.mem.trimStart(u8, modulus_bytes, &.{0});
         if (n_bytes.len > max_modulus_len) return error.InvalidPublicKey;
         // `Modulus.fromBytes` also rejects even moduli (n = p*q is always odd).
         const n = Modulus.fromBytes(n_bytes, .big) catch return error.InvalidPublicKey;
-        if (n.bits() < min_modulus_bits) return error.InvalidPublicKey;
+        if (n.bits() < options.minBits()) return error.InvalidPublicKey;
 
         // Public exponent: odd, >= 3, and < 2^32. The 32-bit cap mitigates
         // DoS via attacker-supplied huge exponents and matches what other
@@ -319,7 +350,12 @@ pub const PublicKey = struct {
     /// Parse a public key from a DER-encoded `RSAPublicKey` (PKCS#1 Appendix
     /// A.1.1) or an X.509 `SubjectPublicKeyInfo` wrapping one.
     pub fn fromDer(bytes: []const u8) FromDerError!PublicKey {
-        return publicKeyFromDerImpl(bytes) catch error.InvalidDer;
+        return fromDerWith(bytes, .{});
+    }
+
+    /// `fromDer` with options (the testing-only small-modulus escape).
+    pub fn fromDerWith(bytes: []const u8, options: PublicKeyOptions) FromDerError!PublicKey {
+        return publicKeyFromDerImpl(bytes, options) catch error.InvalidDer;
     }
 
     /// Parse a public key from a PEM text block: `PUBLIC KEY` (X.509
@@ -328,13 +364,18 @@ pub const PublicKey = struct {
     /// labels (including OpenSSH `authorized_keys`-style or unrecognized
     /// blocks) are rejected with `error.UnsupportedPemLabel`.
     pub fn fromPem(text: []const u8) PemError!PublicKey {
+        return fromPemWith(text, .{});
+    }
+
+    /// `fromPem` with options (the testing-only small-modulus escape).
+    pub fn fromPemWith(text: []const u8, options: PublicKeyOptions) PemError!PublicKey {
         const block = try pemDecodeBody(text);
         if (!std.mem.eql(u8, block.label, "PUBLIC KEY") and
             !std.mem.eql(u8, block.label, "RSA PUBLIC KEY"))
         {
             return error.UnsupportedPemLabel;
         }
-        return try PublicKey.fromDer(block.der());
+        return try PublicKey.fromDerWith(block.der(), options);
     }
 
     /// The verify-only form of this key: same modulus, same exponent, no
@@ -413,7 +454,7 @@ pub const max_private_pem_len = marshal.max_private_pem_len;
 /// verify path never reads — for a 2048-bit key that construction cost
 /// several times the verification itself. This type keeps only the montint
 /// modulus and the exponent, with exactly `PublicKey.fromBytes`'s checks
-/// (size 512…8192 bits, odd `n`, odd `3 ≤ e < 2^32`), and verifies
+/// (size 1024…8192 bits, odd `n`, odd `3 ≤ e < 2^32`), and verifies
 /// identically. Hold a `PublicKey` when the key is kept and used for
 /// anything else; build this when it is parsed, used and dropped.
 pub const VerifyKey = struct {
@@ -426,11 +467,16 @@ pub const VerifyKey = struct {
     /// From raw big-endian modulus and exponent (leading zeros allowed), as
     /// `PublicKey.fromBytes`.
     pub fn fromBytes(modulus_bytes: []const u8, exponent_bytes: []const u8) FromBytesError!VerifyKey {
+        return fromBytesWith(modulus_bytes, exponent_bytes, .{});
+    }
+
+    /// `fromBytes` with options (the testing-only small-modulus escape).
+    pub fn fromBytesWith(modulus_bytes: []const u8, exponent_bytes: []const u8, options: PublicKeyOptions) FromBytesError!VerifyKey {
         const n_bytes = std.mem.trimStart(u8, modulus_bytes, &.{0});
         if (n_bytes.len > max_modulus_len) return error.InvalidPublicKey;
         // Rejects an even modulus and one below 3; the length is public.
         const mp = MontParams.fromBytesBEPublic(n_bytes) catch return error.InvalidPublicKey;
-        if (mp.bits() < min_modulus_bits) return error.InvalidPublicKey;
+        if (mp.bits() < options.minBits()) return error.InvalidPublicKey;
 
         const e_bytes = std.mem.trimStart(u8, exponent_bytes, &.{0});
         if (e_bytes.len == 0 or e_bytes.len > 4) return error.InvalidPublicKey;
@@ -445,8 +491,13 @@ pub const VerifyKey = struct {
     /// From a DER `RSAPublicKey` or an X.509 `SubjectPublicKeyInfo`
     /// wrapping one, as `PublicKey.fromDer`.
     pub fn fromDer(bytes: []const u8) FromDerError!VerifyKey {
+        return fromDerWith(bytes, .{});
+    }
+
+    /// `fromDer` with options (the testing-only small-modulus escape).
+    pub fn fromDerWith(bytes: []const u8, options: PublicKeyOptions) FromDerError!VerifyKey {
         const parts = publicKeyPartsFromDer(bytes) catch return error.InvalidDer;
-        return fromBytes(parts.n, parts.e) catch error.InvalidDer;
+        return fromBytesWith(parts.n, parts.e, options) catch error.InvalidDer;
     }
 
     /// Modulus length in bits.
@@ -2484,9 +2535,9 @@ fn derView(bytes: []const u8, e: Asn1.Element) []const u8 {
 /// `RSAPublicKey` (PKCS#1 Appendix A.1.1) or `SubjectPublicKeyInfo`
 /// (RFC 5280) — distinguished by the top SEQUENCE's first child: a bare
 /// INTEGER means PKCS#1, a nested SEQUENCE (AlgorithmIdentifier) means SPKI.
-fn publicKeyFromDerImpl(bytes: []const u8) !PublicKey {
+fn publicKeyFromDerImpl(bytes: []const u8, options: PublicKeyOptions) !PublicKey {
     const parts = try publicKeyPartsFromDer(bytes);
-    return PublicKey.fromBytes(parts.n, parts.e) catch error.InvalidDer;
+    return PublicKey.fromBytesWith(parts.n, parts.e, options) catch error.InvalidDer;
 }
 
 /// The modulus and exponent INTEGER contents of a DER `RSAPublicKey`, or of
@@ -3260,7 +3311,8 @@ pub const KeyPair = struct {
 };
 
 pub const GenerateError = error{
-    /// `bits` is below 512, above `max_modulus_bits`, or odd.
+    /// `bits` is below `min_modulus_bits` (1024; 512 under the testing-only
+    /// escape), above `max_modulus_bits`, or odd.
     InvalidBits,
     /// `e` is even, < 3, or >= 2^32 (the same public-exponent cap
     /// `PublicKey.fromBytes` enforces — a key this module's own parsers
@@ -3274,28 +3326,41 @@ pub const GenerateError = error{
 /// pass the conventional 65537 unless there is a specific reason not to.
 /// `random` MUST be a cryptographically secure generator for real keys
 /// (the two primes are drawn straight from it); a seeded deterministic
-/// generator is acceptable only for tests. `bits` must be even, between 512
+/// generator is acceptable only for tests. `bits` must be even, between 1024
 /// and `max_modulus_bits`; expect roughly quadratic slowdown as `bits`
 /// grows (2048+ is noticeably slow in Debug builds).
-/// ⚠ A key under `min_private_modulus_bits` (1024) is generated, but this
-/// module's private-key parsers refuse it: its own `toPkcs1Der`/`toPem`
-/// output does not load back through `SecretKey.fromDer`/`fromPem` (Go 1.24
-/// refuses to generate it at all; SPEC Backlog).
+/// `bits` under `min_modulus_bits` (1024) is `error.InvalidBits`, as Go
+/// 1.24's `GenerateKey` (`rsa1024min`); `generateWith` is the testing-only
+/// escape.
 pub fn generate(out: *KeyPair, random: std.Random, bits: usize, e: u64) GenerateError!void {
-    const r = generateUnburned(out, random, bits, e);
+    return generateWith(out, random, bits, e, .{});
+}
+
+/// Options of `generateWith`: the same testing-only escape as
+/// `PublicKeyOptions`.
+pub const GenerateOptions = PublicKeyOptions;
+
+/// `generate` with options. With `.insecure_allow_small_modulus` a modulus
+/// of 512 bits up is generated. ⚠ A key under `min_private_modulus_bits`
+/// (1024) is then generated, but this module's private-key parsers refuse
+/// it (its own `toPkcs1Der`/`toPem` output does not load back through
+/// `SecretKey.fromDer`/`fromPem`); the public half loads back only through
+/// the `..With` public constructors with the same option.
+pub fn generateWith(out: *KeyPair, random: std.Random, bits: usize, e: u64, options: GenerateOptions) GenerateError!void {
+    const r = generateUnburned(out, random, bits, e, options);
     burn.stack(burn.key_burn);
     return r;
 }
 
-noinline fn generateUnburned(out: *KeyPair, random: std.Random, bits: usize, e: u64) GenerateError!void {
-    out.* = generateValue(random, bits, e) catch |err| {
+noinline fn generateUnburned(out: *KeyPair, random: std.Random, bits: usize, e: u64, options: GenerateOptions) GenerateError!void {
+    out.* = generateValue(random, bits, e, options) catch |err| {
         std.crypto.secureZero(u8, std.mem.asBytes(out));
         return err;
     };
 }
 
-fn generateValue(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair {
-    if (bits < min_modulus_bits or bits > max_modulus_bits or bits % 2 != 0) return error.InvalidBits;
+fn generateValue(random: std.Random, bits: usize, e: u64, options: GenerateOptions) GenerateError!KeyPair {
+    if (bits < options.minBits() or bits > max_modulus_bits or bits % 2 != 0) return error.InvalidBits;
     if (e < 3 or e & 1 == 0 or e > std.math.maxInt(u32)) return error.InvalidExponent;
 
     const half = bits / 2;
@@ -3323,9 +3388,9 @@ fn generateValue(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair 
         // positive slipped through (probability <= 2^-128 per prime) and
         // tripped its qInv self-check — restart the search instead of
         // surfacing an error for an input the caller never chose.
-        // `generate` keeps its own size range (`InvalidBits`, 512 up), so the
-        // private-key floor is not applied here (SPEC Backlog: Go-parity floor
-        // on generate + public keys).
+        // `generateValue` checked the size range (`InvalidBits`) already, and
+        // under the escape a key below the private-key floor is wanted, so the
+        // private-key floor is not applied a second time here.
         var sk: SecretKey = undefined;
         SecretKey.fromPrimesWith(&sk, p_bytes, q_bytes, &e_bytes, .{ .insecure_allow_small_modulus = true }) catch continue;
         // FIPS 186-5 A.1.1 step 4.c (survey F2, 2026-10-14): d > 2^(nlen/2),
@@ -3343,7 +3408,7 @@ fn generateValue(random: std.Random, bits: usize, e: u64) GenerateError!KeyPair 
         var n_buf: [max_modulus_len]u8 = undefined;
         const n_len = byteLen(sk.n.bits());
         sk.n.toBytes(n_buf[0..n_len], .big) catch unreachable;
-        const pk = PublicKey.fromBytes(n_buf[0..n_len], &e_bytes) catch unreachable;
+        const pk = PublicKey.fromBytesWith(n_buf[0..n_len], &e_bytes, options) catch unreachable;
         return .{ .public_key = pk, .secret_key = sk };
     }
 }
@@ -3720,6 +3785,8 @@ const kat512 = struct {
 /// Textbook and 512-bit known-answer keys: the testing-only escape from the
 /// 1024-bit private-key floor.
 const small_test_key: SecretKey.FromPrimesOptions = .{ .insecure_allow_small_modulus = true };
+/// The same escape for the public side (`PublicKey.fromBytesWith`, `generateWith`).
+const small_pub: PublicKeyOptions = .{ .insecure_allow_small_modulus = true };
 
 test "fromPrimes derives textbook parameters (p=61, q=53, e=17)" {
     var sk: SecretKey = undefined;
@@ -4110,7 +4177,7 @@ test "Blinding.cached: another exponent on the same modulus, or another modulus 
     // A different 512-bit modulus: same limb count as `sk_a`.
     var key_rng = std.Random.DefaultPrng.init(0xb11d_cace_0003);
     var kp: KeyPair = undefined;
-    try generate(&kp, key_rng.random(), 512, 65537);
+    try generateWith(&kp, key_rng.random(), 512, 65537, small_pub);
     try testing.expectEqual(sk_a.n_mont.L, kp.secret_key.n_mont.L);
 
     var prng = std.Random.DefaultPrng.init(0xb11d_cace_0004);
@@ -4292,7 +4359,7 @@ test "widening path: 2048-bit key through max_modulus_len primitives (writeMontR
 test "512-bit key: SHA-256 round-trips, SHA-512 encoding is too short" {
     var sk: SecretKey = undefined;
     try SecretKey.fromPrimesWith(&sk, &kat512.p, &kat512.q, &kat512.e, small_test_key);
-    const pk = try PublicKey.fromBytes(&kat512.n, &kat512.e);
+    const pk = try PublicKey.fromBytesWith(&kat512.n, &kat512.e, small_pub);
     var out: [max_modulus_len]u8 = undefined;
 
     const sig = try signPkcs1v15(&sk, std.crypto.hash.sha2.Sha256, "small key", &out);
@@ -4612,7 +4679,7 @@ test "encryptOaep rejects oversize messages and undersized buffers/keys" {
     try testing.expectError(error.BufferTooSmall, encryptOaep(pk, Sha256, random, "m", "", &small_out));
 
     // 512-bit key: k = 64 < 2*32 + 2 = 66 -> SHA-256 OAEP can never fit.
-    const pk512 = try PublicKey.fromBytes(&kat512.n, &kat512.e);
+    const pk512 = try PublicKey.fromBytesWith(&kat512.n, &kat512.e, small_pub);
     try testing.expectError(error.MessageTooLong, encryptOaep(pk512, Sha256, random, "", "", &ct));
 
     // SHA-1 on the 512-bit key fits up to 64 - 2*20 - 2 = 22 bytes.
@@ -4643,9 +4710,10 @@ test "PublicKey.fromBytes accepts/rejects per RFC 8017 §3.1 sanity rules" {
     var even_n = kat2048.n;
     even_n[255] &= 0xfe;
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&even_n, &kat2048.e));
-    // Modulus below the 512-bit floor.
+    // Modulus below the 1024-bit floor (and, under the escape, the 512-bit one).
     const tiny_n = @as([32]u8, @splat(0xff));
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&tiny_n, &kat2048.e));
+    try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytesWith(&tiny_n, &kat2048.e, small_pub));
     // Modulus above max_modulus_bits.
     const huge_n = @as([max_modulus_len + 1]u8, @splat(0xff));
     try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&huge_n, &kat2048.e));
@@ -4719,7 +4787,7 @@ test "signPss/verifyPss round-trip on the 512-bit key (top-bit clearing path)" {
     // step 6 with a nontrivial mask.
     var sk: SecretKey = undefined;
     try SecretKey.fromPrimesWith(&sk, &kat512.p, &kat512.q, &kat512.e, small_test_key);
-    const pk = try PublicKey.fromBytes(&kat512.n, &kat512.e);
+    const pk = try PublicKey.fromBytesWith(&kat512.n, &kat512.e, small_pub);
     var prng = std.Random.DefaultPrng.init(0x353132626974);
     const random = prng.random();
     var out: [max_modulus_len]u8 = undefined;
@@ -5024,7 +5092,7 @@ test "VerifyKey: a representative s ≥ n is refused, s = n − 1 reaches the pa
 
 test "VerifyKey.fromBytes accepts and refuses exactly what PublicKey.fromBytes does" {
     // A seeded differential over the shapes the checks are about: modulus
-    // length around 512 and 4096 bits, even moduli, leading zeros; exponent
+    // length around 1024 and 4096 bits, even moduli, leading zeros; exponent
     // 0…5 bytes, even, 1, leading zeros. `PublicKey.fromBytes` validates
     // through `std.crypto.ff`, `VerifyKey.fromBytes` through montint.
     var prng = std.Random.DefaultPrng.init(0xD1FF_2026);
@@ -5033,7 +5101,7 @@ test "VerifyKey.fromBytes accepts and refuses exactly what PublicKey.fromBytes d
     var e_buf: [6]u8 = undefined;
     var accepted: usize = 0;
     var refused: usize = 0;
-    const n_lens = [_]usize{ 0, 1, 62, 63, 64, 65, 256, 511, 512, 513, 514 };
+    const n_lens = [_]usize{ 0, 1, 126, 127, 128, 129, 256, 511, 512, 513, 514 };
     for (0..1500) |i| {
         const n_len = n_lens[i % n_lens.len];
         const n = n_buf[0..n_len];
@@ -5062,6 +5130,10 @@ test "VerifyKey.fromBytes accepts and refuses exactly what PublicKey.fromBytes d
                 e[e_len - 1] |= 1;
             },
         }
+        // The testing-only escape too: both types move the floor to 512 bits together.
+        const want_small = PublicKey.fromBytesWith(n, e, small_pub);
+        const got_small = VerifyKey.fromBytesWith(n, e, small_pub);
+        try testing.expectEqual(std.meta.isError(want_small), std.meta.isError(got_small));
         const want = PublicKey.fromBytes(n, e);
         const got = VerifyKey.fromBytes(n, e);
         if (want) |w| {
@@ -6352,14 +6424,21 @@ test "generate: rejects invalid bits and exponents" {
     try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 256, 65537));
     try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 511, 65537));
     try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 513, 65537));
+    // The Go 1.24 floor: 1022 is even and in the old range, still refused; 1023 is odd.
+    try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 512, 65537));
+    try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 1022, 65537));
+    try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, 1023, 65537));
+    // The escape's own floor stays 512 (and even).
+    try testing.expectError(error.InvalidBits, generateWith(&test_kp_out, random, 510, 65537, small_pub));
+    try testing.expectError(error.InvalidBits, generateWith(&test_kp_out, random, 513, 65537, small_pub));
     try testing.expectError(error.InvalidBits, generate(&test_kp_out, random, max_modulus_bits + 2, 65537));
 
     // e must be odd, >= 3, and < 2^32 (the module-wide public-exponent cap).
-    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 0));
-    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 1));
-    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 2));
-    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 65536));
-    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 512, 1 << 33));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 1024, 0));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 1024, 1));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 1024, 2));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 1024, 65536));
+    try testing.expectError(error.InvalidExponent, generate(&test_kp_out, random, 1024, 1 << 33));
 }
 
 /// n == p·q cross-check via `std.math.big.int` (an arithmetic path fully
@@ -6394,7 +6473,7 @@ test "generate: 512-bit key structure (n exactly 512 bits, p/q prime, p != q, n 
     const random = prng.random();
 
     var kp: KeyPair = undefined;
-    try generate(&kp, random, 512, 65537);
+    try generateWith(&kp, random, 512, 65537, small_pub);
     const sk = kp.secret_key;
     const pk = kp.public_key;
 
@@ -6422,7 +6501,7 @@ test "generate: honors a non-default exponent (e = 3)" {
     const random = prng.random();
 
     var kp: KeyPair = undefined;
-    try generate(&kp, random, 512, 3);
+    try generateWith(&kp, random, 512, 3, small_pub);
     try testing.expectEqual(@as(u32, 3), try kp.public_key.e.toPrimitive(u32));
     try testing.expectEqual(@as(usize, 512), kp.secret_key.n.bits());
     try testing.expect(isProbablePrime(kp.secret_key.p, random));
@@ -6868,7 +6947,7 @@ test "verifyPss refuses a representative wider than emLen when modBits ≡ 1 mod
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var sk: SecretKey = undefined;
     try SecretKey.fromPrimesWith(&sk, &kat521.p, &kat521.q, &kat521.e, small_test_key);
-    const pk = try PublicKey.fromBytes(&kat521.n, &kat521.e);
+    const pk = try PublicKey.fromBytesWith(&kat521.n, &kat521.e, small_pub);
     try testing.expectEqual(@as(usize, 521), pk.n.bits());
     const msg = "emLen = k - 1";
     var x: [66]u8 = undefined;

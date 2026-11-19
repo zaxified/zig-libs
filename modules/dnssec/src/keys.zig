@@ -175,8 +175,8 @@ const fz = @import("fuzz_test.zig");
 test "decodeRsaKey: short exponent-length form" {
     // e_len=1(0x01), e=0x03, then a tiny (too-small-for-real-use but
     // structurally valid) modulus so PublicKey.fromBytes' min-bits floor
-    // isn't hit — use a 512-bit-plus modulus of all-0xff-ish bytes.
-    var public_key: [1 + 1 + 64]u8 = undefined;
+    // isn't hit — use a 1024-bit modulus of all-0xab bytes.
+    var public_key: [1 + 1 + 128]u8 = undefined;
     public_key[0] = 1;
     public_key[1] = 3;
     @memset(public_key[2..], 0xab);
@@ -185,7 +185,7 @@ test "decodeRsaKey: short exponent-length form" {
 }
 
 test "decodeRsaKey: long exponent-length form (e_len byte 0)" {
-    var public_key: [3 + 3 + 64]u8 = undefined;
+    var public_key: [3 + 3 + 128]u8 = undefined;
     public_key[0] = 0;
     std.mem.writeInt(u16, public_key[1..3], 3, .big);
     public_key[3] = 0;

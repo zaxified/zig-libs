@@ -2073,60 +2073,67 @@ test "golden (self-derived): symmetric MSG chunks at Sign and SignAndEncrypt" {
 const golden_key_seed = @as([32]u8, @splat(0xA5));
 const golden_seal_seed = @as([32]u8, @splat(0x5A));
 
-/// SELF-DERIVED. The 512-bit client application certificate `golden_key_seed`
+/// SELF-DERIVED. The 1024-bit client application certificate `golden_key_seed`
 /// produces (a small key so the golden stays readable; the live interop runs
 /// 2048-bit).
 const golden_client_cert_hex =
-    "3082016e30820118a003020102020101300d06092a864886f70d01010b050030183116301406035504030c" ++
+    "308201f33082015ca003020102020101300d06092a864886f70d01010b050030183116301406035504030c" ++
     "0d676f6c64656e20636c69656e74301e170d3230303130313030303030305a170d33353031303130303030" ++
-    "30305a30183116301406035504030c0d676f6c64656e20636c69656e74305c300d06092a864886f70d0101" ++
-    "010500034b003048024100d7799dbd7b2c062842b1ecb9e53996d4660f81031617cc626375bd29ca1caac4" ++
-    "8506c1601658698ad7c10e6a20e90fc495f0db2898490978e63f44aec033b05d0203010001a34d304b300c" ++
-    "0603551d130101ff04023000300e0603551d0f0101ff040403020780302b0603551d110424302286207572" ++
-    "6e3a7a69672d6c6962733a6f706375613a676f6c64656e2d636c69656e74300d06092a864886f70d01010b" ++
-    "05000341009aaf86aed9f4a0f8f06a2023ac54c11ddaa73ed66283f6bc8e85f5b259017b9a93e03b8b58b9" ++
-    "72d1aec2af287a7b2b5d27243b46f0e8992d836dc87f8b2f04c4";
+    "30305a30183116301406035504030c0d676f6c64656e20636c69656e7430819f300d06092a864886f70d01" ++
+    "0101050003818d0030818902818100da4b7d909f2e3aa5bace77433b8a8bda789256c4e98bbd9f4f8ab85b" ++
+    "c0783176e73861a6f480722ce88523d3909a77721183333a3a434a406ec8f8bb060b9125a94b1b94a27ec3" ++
+    "256fc100490ea547b1fe06a539ff8fe254699612d2ef7d9e3103042c3df1d0c25e1c69841fb46ca6e5a2e0" ++
+    "23fb52db22499aa667ed8ba420ab0203010001a34d304b300c0603551d130101ff04023000300e0603551d" ++
+    "0f0101ff040403020780302b0603551d1104243022862075726e3a7a69672d6c6962733a6f706375613a67" ++
+    "6f6c64656e2d636c69656e74300d06092a864886f70d01010b050003818100c4f9d8126e423b1ba4454ab7" ++
+    "bc853255a062be1d9dede61085efd16cdabdf0aee580172f53bbb1c86d1e5802da0a8500848c43624040b7" ++
+    "8f1497a0191159cd06985861019dc17814a64c1462a0fd9e7bf3e7c01d00af1e1e20b7625d12a725d54d5c" ++
+    "76b5e824ed149780587d7cc81400d9995a0809dc546ce25214786103352e";
 
 /// SELF-DERIVED. The server certificate from the same stream (generated
 /// second, hence a different key).
 const golden_server_cert_hex =
-    "3082016e30820118a003020102020101300d06092a864886f70d01010b050030183116301406035504030c" ++
+    "308201f33082015ca003020102020101300d06092a864886f70d01010b050030183116301406035504030c" ++
     "0d676f6c64656e20736572766572301e170d3230303130313030303030305a170d33353031303130303030" ++
-    "30305a30183116301406035504030c0d676f6c64656e20736572766572305c300d06092a864886f70d0101" ++
-    "010500034b0030480241009770f61161e7092062bf10c0ea5ef5c5108a083c231ec4ccfe7d0b2b8fd76753" ++
-    "c888fc16bdb84609b3a33d67756c23535a0ff0c78e4c3b03b858ad5a16e52cd70203010001a34d304b300c" ++
-    "0603551d130101ff04023000300e0603551d0f0101ff040403020780302b0603551d110424302286207572" ++
-    "6e3a7a69672d6c6962733a6f706375613a676f6c64656e2d736572766572300d06092a864886f70d01010b" ++
-    "0500034100741a99f3844e70d0e0d5328106fae8493d8ff51da6adf7dd12c0253531d08bedfa5af995b4b1" ++
-    "56d17884b3be7e5a90d61eca2bb1ad0a38fa7da85f2a3521bc6d";
+    "30305a30183116301406035504030c0d676f6c64656e2073657276657230819f300d06092a864886f70d01" ++
+    "0101050003818d0030818902818100d767916915ad01d03aad81c4b09d2a3a8e4f70df50a5d3997df0dcbd" ++
+    "51c15ec27d44328f07a3b56b71c653586c9d3e1c6f4f9e55191fe2b69c6cfad212e25a34153adafdd89e28" ++
+    "3b0a00e50ddea89e339f1868853ad90a91e4b3d9cf077406759c47e167c4fab2b8920564f1b15ca2ed2890" ++
+    "1c2fcc8ec111132e254c2d567e6d0203010001a34d304b300c0603551d130101ff04023000300e0603551d" ++
+    "0f0101ff040403020780302b0603551d1104243022862075726e3a7a69672d6c6962733a6f706375613a67" ++
+    "6f6c64656e2d736572766572300d06092a864886f70d01010b05000381810055a4cf940af9a0a6c4602d16" ++
+    "38f482475517f4b1951247dd25850b12fee542187d686bf362b6a454365aa7fdba9a32fd9f4cc22b066cf5" ++
+    "46a855129ed0051715e4603a765b253935765ebc5e08f8e021936fe91b14e8b1eea9d135257f46d6eb58e5" ++
+    "2f26de093d00ca9ee15c0a1e90bb59878ddbcf0e7f1be31728201d804aa8";
 
 /// SELF-DERIVED. A complete `OpenSecureChannel` message under
 /// Basic256Sha256: `OPNF` + size, SecureChannelId 0, the plaintext
 /// `AsymmetricAlgorithmSecurityHeader` (policy URI, the client certificate
 /// above, the SHA-1 thumbprint of the server certificate), then the
 /// SequenceHeader + payload + padding + RSA-PKCS1v1.5/SHA-256 signature,
-/// RSA-OAEP/SHA-1-encrypted to the server key in 64-byte blocks. 791 bytes:
-/// 8 header + 455 clear security header + 328 ciphertext.
+/// RSA-OAEP/SHA-1-encrypted to the server key in 128-byte blocks. 860 bytes:
+/// 8 header + 588 clear security header + 264 ciphertext.
 const golden_opn_hex =
-    "4f504e46170300000000000039000000687474703a2f2f6f7063666f756e646174696f6e2e6f72672f5541" ++
-    "2f5365637572697479506f6c696379234261736963323536536861323536720100003082016e30820118a0" ++
+    "4f504e465c0300000000000039000000687474703a2f2f6f7063666f756e646174696f6e2e6f72672f5541" ++
+    "2f5365637572697479506f6c696379234261736963323536536861323536f7010000308201f33082015ca0" ++
     "03020102020101300d06092a864886f70d01010b050030183116301406035504030c0d676f6c64656e2063" ++
     "6c69656e74301e170d3230303130313030303030305a170d3335303130313030303030305a301831163014" ++
-    "06035504030c0d676f6c64656e20636c69656e74305c300d06092a864886f70d0101010500034b00304802" ++
-    "4100d7799dbd7b2c062842b1ecb9e53996d4660f81031617cc626375bd29ca1caac48506c1601658698ad7" ++
-    "c10e6a20e90fc495f0db2898490978e63f44aec033b05d0203010001a34d304b300c0603551d130101ff04" ++
-    "023000300e0603551d0f0101ff040403020780302b0603551d1104243022862075726e3a7a69672d6c6962" ++
-    "733a6f706375613a676f6c64656e2d636c69656e74300d06092a864886f70d01010b05000341009aaf86ae" ++
-    "d9f4a0f8f06a2023ac54c11ddaa73ed66283f6bc8e85f5b259017b9a93e03b8b58b972d1aec2af287a7b2b" ++
-    "5d27243b46f0e8992d836dc87f8b2f04c4140000009836392593f9c0a2316ce516e97345c2d9c15ef305f7" ++
-    "43b8726ecc5507233a4f13a61315ef623889aecad5967294cef247eefe585e274c244b46dc4fbb532803fc" ++
-    "acbc7b05e7d7ccbdeb14964f53b0d0baba805862f7fccde5d6f14ed43041a692e0bfd372e306cc1a21d41b" ++
-    "a26e404709b2fe06fc6e66c4c1d9a3ea756b7327fcc873ec67f041bca3023f14fbf32988986e1813720fda" ++
-    "e2e8d51f27828210c6bd4c8ec5e49079f1311074a9903ead34f6d0125c5a2772180ee823bed6d61bb4092c" ++
-    "15435db4dd854e993eae56c43e373b0c074313c560bc758041535c07281fbac79cbf47e1bc22743e7a428f" ++
-    "545c920110280c54a5fda4569723b4faef3e0c3c947e1cdf2eeb3a5b1333cd05cb9b7dce0062e6630fdd65" ++
-    "8105739be2df8c09be492b67d2e11b46c4de821abf5655f41805fba3cfd989a9d1606af39755d946b24690" ++
-    "fe9a555cddfe56838d6a690894c1c81b09";
+    "06035504030c0d676f6c64656e20636c69656e7430819f300d06092a864886f70d010101050003818d0030" ++
+    "818902818100da4b7d909f2e3aa5bace77433b8a8bda789256c4e98bbd9f4f8ab85bc0783176e73861a6f4" ++
+    "80722ce88523d3909a77721183333a3a434a406ec8f8bb060b9125a94b1b94a27ec3256fc100490ea547b1" ++
+    "fe06a539ff8fe254699612d2ef7d9e3103042c3df1d0c25e1c69841fb46ca6e5a2e023fb52db22499aa667" ++
+    "ed8ba420ab0203010001a34d304b300c0603551d130101ff04023000300e0603551d0f0101ff0404030207" ++
+    "80302b0603551d1104243022862075726e3a7a69672d6c6962733a6f706375613a676f6c64656e2d636c69" ++
+    "656e74300d06092a864886f70d01010b050003818100c4f9d8126e423b1ba4454ab7bc853255a062be1d9d" ++
+    "ede61085efd16cdabdf0aee580172f53bbb1c86d1e5802da0a8500848c43624040b78f1497a0191159cd06" ++
+    "985861019dc17814a64c1462a0fd9e7bf3e7c01d00af1e1e20b7625d12a725d54d5c76b5e824ed14978058" ++
+    "7d7cc81400d9995a0809dc546ce25214786103352e140000008d2674ec3387c469244cf841c7ab808216c5" ++
+    "ff1c59614b58ba7749d5b53c925417642e8f838fd9df6eb701ce4dfb96e4b6e0f20adfc382ee37a3cb392b" ++
+    "ea0fd88b2a105af646d0e6a10a63b0e742615742b4f3b4e21b7ee9663875758eaa66f947736acbd40508ab" ++
+    "d5b7caf548cb94f52142942b7981034c30be9836619aeca0a8f8d80a0443e2a82f537e1647bfae77252338" ++
+    "3436b4ed4b9ba571912308863287bc4d7df3421bea9d9405e28f790f50abde62472899256a19586fe813bc" ++
+    "2af418eef64c306de518ac2233a98ece79d1f41af2d2e3986470102ccbfa786e03a51e05fbb3f279dcd5de" ++
+    "335d37e783879d822613c1657cdd5ae4ae8c9a0a36b497b88dc852202a32fb806d249bc9217e422f6d3c84";
 
 test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel handshake" {
     const gpa = testing.allocator;
@@ -2139,7 +2146,7 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
         gpa,
         rnd,
         .{
-            .modulus_bits = 512,
+            .modulus_bits = 1024,
             .common_name = "golden client",
             .not_before = "200101000000Z",
             .not_after = "350101000000Z",
@@ -2153,7 +2160,7 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
         gpa,
         rnd,
         .{
-            .modulus_bits = 512,
+            .modulus_bits = 1024,
             .common_name = "golden server",
             .not_before = "200101000000Z",
             .not_after = "350101000000Z",
@@ -2200,13 +2207,13 @@ test "golden (self-derived): the Basic256Sha256 asymmetric OpenSecureChannel han
     var expected_buf: [1024]u8 = undefined;
     const expected = try std.fmt.hexToBytes(&expected_buf, golden_opn_hex);
     try testing.expectEqualSlices(u8, expected, produced);
-    try testing.expectEqual(@as(usize, 791), expected.len);
+    try testing.expectEqual(@as(usize, 860), expected.len);
     try testing.expectEqual(expected.len, std.mem.readInt(u32, expected[4..8], .little));
     // The security header rides in the clear so a receiver can pick a key
     // before it can decrypt anything (§6.7.2.3).
     try testing.expectEqualSlices(u8, plain_body[0..encrypted_region_offset], expected[8..][0..encrypted_region_offset]);
-    // …and the encrypted region is a whole number of 64-byte RSA blocks.
-    try testing.expectEqual(@as(usize, 0), (expected.len - 8 - encrypted_region_offset) % 64);
+    // …and the encrypted region is a whole number of 128-byte RSA blocks.
+    try testing.expectEqual(@as(usize, 0), (expected.len - 8 - encrypted_region_offset) % 128);
 
     // 3. The receiving side: the frozen bytes must open back to exactly the
     //    plaintext body, verified against the sender certificate the header
@@ -2430,7 +2437,7 @@ test "golden (captured, live open62541 server_ctt): OpenSecureChannel request+re
         try testing.expectEqualSlices(u8, resp[8..][0..resp_view.encrypted_region_offset], bw.writer.buffered());
     }
 
-    // The encrypted region is a whole number of 64-byte RSA blocks either way.
+    // The encrypted region is a whole number of 128-byte RSA blocks either way.
     try testing.expectEqual(@as(usize, 0), (req.len - 8 - req_view.encrypted_region_offset) % 64);
     try testing.expectEqual(@as(usize, 0), (resp.len - 8 - resp_view.encrypted_region_offset) % 64);
 }

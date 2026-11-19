@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **Behaviour change (via `rsa`):** an RSA DNSKEY with a modulus under 1024 bits is refused (`InvalidKeyEncoding`), as `rsa.PublicKey.fromBytes` now enforces Go 1.24's floor (was 512). Tests use 1024-bit moduli.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit closed (299/324 killed, 25 equivalent); one more test (an NSEC next name equal to the wildcard is no cover). Card line and SPEC paragraph rewritten.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit, first round: 43 tests in `src/audit_test.zig` for what a 317-mutant run found unpinned (the RFC 8624 tables row by row, canonical AAAA/CNAME/TXT/SRV/CAA bytes and 255/65535 limits, the wildcard and root owners, `validate` and `chain` preconditions one at a time with real Ed25519 signatures, RSA under SHA-1/256/512 with a generated key, NSEC and NSEC3 closest-encloser, next-closer, record-filter and next-hash-length cases, the type bit map windows). No source change.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** SPEC records the delta-mutation result of the Ed448 code (7/7 killed); the card's Audit line is unchanged (no whole-module baseline).

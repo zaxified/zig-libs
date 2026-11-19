@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only: the deliberately small PKCS#1 v1.5 test keys (k = 64, 1022 bits) are generated through `rsa.generateWith(.., .{ .insecure_allow_small_modulus = true })` since `rsa.generate` now refuses under 1024 bits.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the private `WipingAllocator` is replaced by the shared `wipealloc` module (same code; new dependency `wipealloc`). Security-triage row xmlenc:338. The card's audit `src` hash is re-recorded over this mechanical move (the moved code has its own whole-module mutation run, 8/8 killed).
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** joined the portable ctgrind lane (`scripts/test.sh ctgrind-portable`, `cpu=x86_64` variant rows cbc 72 / kw 182). The 2 unattributed `cbc` contexts were the harness's own memcpy over the returned plaintext length (tainted, and undefined untainted through std soft AES's `undefined` batch padding); the harness now copies the length it encrypted (checked under `-fvalgrind`). The rest is std soft-AES key schedule and memcpy size classes of the documented plaintext-length copy; no xmlenc branch on a key. SPEC Backlog item closed.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: excluded from the portable ctgrind lane, because the x86_64 run reports 2 unattributed contexts in `cbc` (numbers in the item).

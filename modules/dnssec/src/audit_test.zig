@@ -192,7 +192,7 @@ test "rdata: NSEC3PARAM exact length, iterations and salt offsets" {
 
 // ── keys ────────────────────────────────────────────────────────────────────
 
-fn rsaWireKey(e_form_long: bool, buf: *[70]u8) []const u8 {
+fn rsaWireKey(e_form_long: bool, buf: *[134]u8) []const u8 {
     var n: usize = 0;
     if (e_form_long) {
         buf[0] = 0;
@@ -204,18 +204,18 @@ fn rsaWireKey(e_form_long: bool, buf: *[70]u8) []const u8 {
         buf[1] = 3;
         n = 2;
     }
-    @memset(buf[n .. n + 64], 0xab);
-    return buf[0 .. n + 64];
+    @memset(buf[n .. n + 128], 0xab); // a 1024-bit modulus: rsa's floor
+    return buf[0 .. n + 128];
 }
 
 test "keys: every RSA algorithm number decodes an RSA key, the long form keeps its exponent" {
-    var buf: [70]u8 = undefined;
+    var buf: [134]u8 = undefined;
     const short = rsaWireKey(false, &buf);
     for ([_]u8{ 5, 7, 8, 10 }) |a| {
         const k = try keys.decodePublicKey(a, short);
         try testing.expectEqual(@as(u32, 3), try k.rsa.e.toPrimitive(u32));
     }
-    var buf2: [70]u8 = undefined;
+    var buf2: [134]u8 = undefined;
     const long = rsaWireKey(true, &buf2);
     const lk = try keys.decodePublicKey(8, long);
     try testing.expectEqual(@as(u32, 257), try lk.rsa.e.toPrimitive(u32));
@@ -286,25 +286,25 @@ test "keys: ECDSA and Ed25519 error classes and signature lengths" {
 }
 
 test "keys: RSA PKCS#1 v1.5 under SHA-1, SHA-256 and SHA-512 (algorithms 5, 7, 8, 10)" {
-    // 768 bits: the smallest size that fits SHA-512's 83-octet DigestInfo.
+    // 1024 bits: the smallest size `rsa` accepts (it also fits SHA-512's 83-octet DigestInfo).
     const kp = try testing.allocator.create(rsa.KeyPair);
     defer {
         std.crypto.secureZero(u8, std.mem.asBytes(kp));
         testing.allocator.destroy(kp);
     }
     var prng = std.Random.DefaultPrng.init(0x5eed_d551);
-    try rsa.generate(kp, prng.random(), 768, 65537);
+    try rsa.generate(kp, prng.random(), 1024, 65537);
     const key: keys.DecodedKey = .{ .rsa = kp.public_key };
-    var out: [96]u8 = undefined;
+    var out: [128]u8 = undefined;
 
     const s1 = try rsa.signPkcs1v15(&kp.secret_key, std.crypto.hash.Sha1, "signed data", &out);
-    var sig1: [96]u8 = undefined;
+    var sig1: [128]u8 = undefined;
     @memcpy(sig1[0..s1.len], s1);
     const s256 = try rsa.signPkcs1v15(&kp.secret_key, std.crypto.hash.sha2.Sha256, "signed data", &out);
-    var sig256: [96]u8 = undefined;
+    var sig256: [128]u8 = undefined;
     @memcpy(sig256[0..s256.len], s256);
     const s512 = try rsa.signPkcs1v15(&kp.secret_key, std.crypto.hash.sha2.Sha512, "signed data", &out);
-    var sig512: [96]u8 = undefined;
+    var sig512: [128]u8 = undefined;
     @memcpy(sig512[0..s512.len], s512);
 
     for ([_]struct { u8, []const u8 }{ .{ 5, sig1[0..s1.len] }, .{ 7, sig1[0..s1.len] }, .{ 8, sig256[0..s256.len] }, .{ 10, sig512[0..s512.len] } }) |c| {

@@ -5,18 +5,22 @@ const std = @import("std");
 const rsa = @import("root.zig");
 
 /// The tests here run on 512-bit and smaller keys (`testKey`, hand-made primes):
-/// the testing-only escape from the 1024-bit private-key floor.
+/// the testing-only escape from the 1024-bit floors.
 const small: rsa.SecretKey.FromPrimesOptions = .{ .insecure_allow_small_modulus = true };
+const small_pub: rsa.PublicKeyOptions = .{ .insecure_allow_small_modulus = true };
 
 fn testKey() !rsa.KeyPair {
     var prng = std.Random.DefaultPrng.init(0x5eed_9b01);
     var kp: rsa.KeyPair = undefined;
-    try rsa.generate(&kp, prng.random(), 512, 65537);
+    try rsa.generateWith(&kp, prng.random(), 512, 65537, small_pub);
     return kp;
 }
 
 test "fromDer: a bare PKCS#1 key and a plain SPKI parse; an SPKI inside an SPKI is rejected, at any depth (sweep RS-1)" {
-    var kp = try testKey();
+    // 1024 bits: the smallest key the default constructors accept.
+    var prng0 = std.Random.DefaultPrng.init(0x5eed_9b02);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng0.random(), 1024, 65537);
     defer kp.secret_key.deinit();
     var b1: [rsa.max_pkcs1_public_der_len]u8 = undefined;
     var b2: [rsa.max_spki_der_len]u8 = undefined;
@@ -427,7 +431,7 @@ test "an honest generator never hits the draw bound, even for a modulus whose to
     // draws would fail about a third of the time.
     var prng = std.Random.DefaultPrng.init(0x5eed_514);
     var kp: rsa.KeyPair = undefined;
-    try rsa.generate(&kp, prng.random(), 514, 65537);
+    try rsa.generateWith(&kp, prng.random(), 514, 65537, small_pub);
     defer kp.secret_key.deinit();
     const sk = &kp.secret_key;
     const k = 65;
@@ -480,7 +484,7 @@ test "private-key floor: 1024 bits pass, 1023 are refused by fromPrimes and ever
     try rsa.generate(&k1024, prng.random(), 1024, 65537); // two 512-bit primes, top two bits set
     defer k1024.secret_key.deinit();
     var k1022: rsa.KeyPair = undefined;
-    try rsa.generate(&k1022, prng.random(), 1022, 65537); // `generate` keeps its 512-bit range
+    try rsa.generateWith(&k1022, prng.random(), 1022, 65537, small_pub); // below the floor: needs the escape
     defer k1022.secret_key.deinit();
     var pb: [64]u8 = undefined;
     var qb: [64]u8 = undefined;
@@ -518,7 +522,89 @@ test "private-key floor: 1024 bits pass, 1023 are refused by fromPrimes and ever
     try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPem(&back, try small_sk.toPem(.pkcs1, &pem_buf)));
     try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPem(&back, try small_sk.toPem(.pkcs8, &pem_buf)));
     try std.testing.expectError(error.InvalidPrivateKey, rsa.SecretKey.fromPemEncrypted(&back, try small_sk.toPem(.pkcs1, &pem_buf), ""));
-    // The public half of the same key is still accepted (public floor: 512 bits).
+    // The public half is a plain struct copy (no parse): it keeps its size.
     const pk = small_sk.publicKey();
     try std.testing.expectEqual(@as(usize, 1023), pk.bits());
+}
+
+// ── 2026-11-19: the 1024-bit floor on generate and public keys (Go 1.24) ──
+
+test "public-key floor: 1023 bits refused by every public constructor, 1024 accepted; the escape admits 512 up" {
+    var prng = std.Random.DefaultPrng.init(0x1024_f101);
+    var k1024: rsa.KeyPair = undefined;
+    try rsa.generate(&k1024, prng.random(), 1024, 65537);
+    defer k1024.secret_key.deinit();
+    var k1022: rsa.KeyPair = undefined;
+    try rsa.generateWith(&k1022, prng.random(), 1022, 65537, small_pub);
+    defer k1022.secret_key.deinit();
+    // A 1023-bit modulus: 512-bit p times 511-bit q.
+    var pb: [64]u8 = undefined;
+    var q2b: [64]u8 = undefined;
+    var sk23: rsa.SecretKey = undefined;
+    try rsa.SecretKey.fromPrimesWith(&sk23, primeBytes(k1024.secret_key.p, &pb), primeBytes(k1022.secret_key.q, &q2b), &.{ 1, 0, 1 }, small);
+    defer sk23.deinit();
+    const pk23 = sk23.publicKey();
+    try std.testing.expectEqual(@as(usize, 1023), pk23.bits());
+
+    var n23: [128]u8 = undefined;
+    var n24: [128]u8 = undefined;
+    try sk23.n.toBytes(&n23, .big);
+    try k1024.secret_key.n.toBytes(&n24, .big);
+    const e: []const u8 = &.{ 1, 0, 1 };
+
+    // 1024: every constructor, default options.
+    try std.testing.expectEqual(@as(usize, 1024), (try rsa.PublicKey.fromBytes(&n24, e)).bits());
+    try std.testing.expectEqual(@as(usize, 1024), (try rsa.VerifyKey.fromBytes(&n24, e)).bits());
+    var d1: [rsa.max_pkcs1_public_der_len]u8 = undefined;
+    var d2: [rsa.max_spki_der_len]u8 = undefined;
+    var pem: [rsa.max_public_pem_len]u8 = undefined;
+    _ = try rsa.PublicKey.fromDer(try k1024.public_key.toPkcs1Der(&d1));
+    _ = try rsa.PublicKey.fromDer(try k1024.public_key.toSpkiDer(&d2));
+    _ = try rsa.VerifyKey.fromDer(try k1024.public_key.toSpkiDer(&d2));
+    _ = try rsa.PublicKey.fromPem(try k1024.public_key.toPem(.spki, &pem));
+
+    // 1023: refused everywhere by default ...
+    try std.testing.expectError(error.InvalidPublicKey, rsa.PublicKey.fromBytes(&n23, e));
+    try std.testing.expectError(error.InvalidPublicKey, rsa.VerifyKey.fromBytes(&n23, e));
+    const der1 = try pk23.toPkcs1Der(&d1);
+    try std.testing.expectError(error.InvalidDer, rsa.PublicKey.fromDer(der1));
+    try std.testing.expectError(error.InvalidDer, rsa.VerifyKey.fromDer(der1));
+    try std.testing.expectError(error.InvalidDer, rsa.PublicKey.fromDer(try pk23.toSpkiDer(&d2)));
+    try std.testing.expectError(error.InvalidDer, rsa.VerifyKey.fromDer(try pk23.toSpkiDer(&d2)));
+    try std.testing.expectError(error.InvalidDer, rsa.PublicKey.fromPem(try pk23.toPem(.spki, &pem)));
+    try std.testing.expectError(error.InvalidDer, rsa.PublicKey.fromPem(try pk23.toPem(.pkcs1, &pem)));
+    // ... and admitted by the escape on each of them.
+    try std.testing.expectEqual(@as(usize, 1023), (try rsa.PublicKey.fromBytesWith(&n23, e, small_pub)).bits());
+    try std.testing.expectEqual(@as(usize, 1023), (try rsa.VerifyKey.fromBytesWith(&n23, e, small_pub)).bits());
+    try std.testing.expect((try rsa.PublicKey.fromDerWith(der1, small_pub)).equal(&pk23));
+    try std.testing.expectEqual(@as(usize, 1023), (try rsa.VerifyKey.fromDerWith(der1, small_pub)).bits());
+    try std.testing.expect((try rsa.PublicKey.fromPemWith(try pk23.toPem(.spki, &pem), small_pub)).equal(&pk23));
+
+    // The escape has its own floor: 511 bits stays refused.
+    var n511: [64]u8 = @splat(0xff);
+    n511[0] = 0x7f;
+    n511[63] = 0xfd;
+    try std.testing.expectError(error.InvalidPublicKey, rsa.PublicKey.fromBytesWith(&n511, e, small_pub));
+    try std.testing.expectError(error.InvalidPublicKey, rsa.VerifyKey.fromBytesWith(&n511, e, small_pub));
+}
+
+test "generate: below 1024 bits is InvalidBits, 1024 works, the escape generates 512 and its public half loads only through the escape" {
+    var prng = std.Random.DefaultPrng.init(0x1024_f102);
+    var kp: rsa.KeyPair = undefined;
+    try std.testing.expectError(error.InvalidBits, rsa.generate(&kp, prng.random(), 1022, 65537));
+    try std.testing.expectError(error.InvalidBits, rsa.generate(&kp, prng.random(), 512, 65537));
+    try std.testing.expectError(error.InvalidBits, rsa.generateWith(&kp, prng.random(), 510, 65537, small_pub));
+    for (std.mem.asBytes(&kp)) |b| try std.testing.expectEqual(@as(u8, 0), b); // wiped on refusal
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    kp.secret_key.deinit();
+    try rsa.generateWith(&kp, prng.random(), 1024, 65537, .{}); // the default options are `generate`
+    kp.secret_key.deinit();
+
+    try rsa.generateWith(&kp, prng.random(), 512, 65537, small_pub);
+    defer kp.secret_key.deinit();
+    try std.testing.expectEqual(@as(usize, 512), kp.public_key.bits());
+    var der: [rsa.max_spki_der_len]u8 = undefined;
+    const spki = try kp.public_key.toSpkiDer(&der);
+    try std.testing.expectError(error.InvalidDer, rsa.PublicKey.fromDer(spki));
+    try std.testing.expect((try rsa.PublicKey.fromDerWith(spki, small_pub)).equal(&kp.public_key));
 }
