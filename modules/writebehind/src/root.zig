@@ -1196,9 +1196,9 @@ pub const Coordinator = struct {
 
     /// Fill `waiting` with the keys whose retry deadline lies ahead, read
     /// against one clock reading. Borrows the keys from `retry_at`, which
-    /// nothing changes before the dequeue that uses the list.
+    /// nothing changes before the dequeue that uses the list. The list is
+    /// empty on entry (`syncFlush` clears it on every exit).
     fn collectWaiting(self: *Coordinator) Allocator.Error!void {
-        self.waiting.clearRetainingCapacity();
         if (self.retry_at.count() == 0) return;
         try self.waiting.ensureTotalCapacity(self.gpa, self.retry_at.count());
         const now = self.mono.now();
@@ -3715,8 +3715,10 @@ test "F5b: a key waiting out its retry backoff no longer stalls the synchronous 
     try testing.expectEqual(@as(usize, 0), c.wal.leasedCount());
     try testing.expectEqual(@as(usize, 0), c.held.items.len);
     try testing.expectEqual(@as(usize, 0), c.wal.deadLetterCount());
-    // Once the wait is over, "a" lands in WAL order: the newer value wins.
-    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+    // Once the wait is over (at its deadline exactly: `retry_at` is the
+    // first instant the key may go), "a" lands in WAL order: the newer
+    // value wins.
+    _ = clk.ns.fetchAdd(hour, .monotonic);
     try c.flushAll();
     try testing.expectEqualStrings("3", rig.sink.get("a").?);
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
@@ -3803,6 +3805,27 @@ test "F5b: back-pressure makes room through another key while one key waits out 
     try testing.expect(rig.sink.get("a") == null);
     try testing.expectEqual(@as(usize, 2), rig.sink.seen);
     _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+}
+
+test "F5b: the synchronous path reads the waiting keys afresh each pass and lets a key go at its deadline exactly" {
+    // Only the synchronous path here (no drain): the pool path's own
+    // `retryWaiting` would otherwise flush the key and hide a stale list.
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try reopenWithPuts(&rig, &clk, &.{.{ "a", "1" }}, .{ .backoff_ns = hour });
+    defer c.deinit();
+    rig.sink.reject_key = "a";
+    try testing.expect(!c.flushOneSync()); // "a" waits an hour
+    rig.sink.reject_key = null;
+    try testing.expect(!c.flushOneSync()); // excluded: nothing written
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen);
+    try testing.expectEqual(@as(usize, 0), c.waiting.items.len); // cleared on exit
+    _ = clk.ns.fetchAdd(hour, .monotonic); // the deadline itself: no longer waiting
+    try testing.expect(c.flushOneSync());
+    try testing.expectEqualStrings("1", rig.sink.get("a").?);
 }
 
 test "F5b: no room for the waiting-key list ends the synchronous pass with nothing leased" {

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the review fix (7 mutants: 6 killed, 1 equivalent); a test for the synchronous path alone at the retry deadline; card cumulative.
 - **2026-11-19** — Fix (review of the F5b change, unreleased): the synchronous backstop now excludes the keys waiting out a retry backoff from the WAL dequeue (`jobqueue` `DequeueOptions.exclude`, the set read once per pass) instead of leasing their records and handing them back with `release`. The lease-and-release version could write a key's newer record and then its older one over it when the key's wait lapsed in the middle of a pass. It also cost O(records of the waiting keys) per pass. The `release_failed` held kind is gone.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the F5b change (17/17 killed after round 2); the reopened-WAL test fixture now writes its records with the configured attempt cap, plus a test for a held release that fails again; card cumulative.
 - **2026-11-19** — Behaviour change: `flushAll`'s synchronous backstop (and back-pressure's) no longer stops while one key waits out its `retry_backoff_ns`: it passes that key's records over and hands their leases back with the new `jobqueue.release` (no attempt counted, FIFO place kept), so the other keys still land (F5b). The waiting key itself is still not retried early. A release that fails is held and retried by `drain`.

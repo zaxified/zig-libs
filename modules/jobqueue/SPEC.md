@@ -6,7 +6,7 @@
 
 **Scope:** core — Sidekiq (Ruby; lease/retry/dead-queue model) with Asynq as the closest embeddable peer (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-19 (32/33, 1 eq) · src ded528db3ea2f011
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (37/38, 1 eq) · src 2ed206e0e4beb128
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — job persistence (keyword review, 2026-10-07)
 
@@ -187,6 +187,10 @@ spare room away first), 1 EQUIVALENT: not bumping the epoch — `leased.remove` 
 the released lease stale (`validate` needs the id leased), and the next `dequeue` bumps the epoch
 itself before it hands out a new lease. Card cumulative: 23 + 10 mutants, 23 + 9 killed, 1
 equivalent.
+
+**Delta mutation 2026-11-19 (`DequeueOptions.exclude`).** 5 mutants: the exclusion of a filtered
+partition and of an unfiltered one dropped, the match never / always true, the list not passed
+to `bestReady`. 5/5 killed. Card cumulative: 33 + 5 mutants, 32 + 5 killed, 1 equivalent.
 
 ## Backlog / deferred
 
