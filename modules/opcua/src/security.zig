@@ -423,10 +423,26 @@ pub fn certificatePublicKey(certificate_der: []const u8) CertificatePublicKeyErr
 /// `Basic256Sha256`, or 4097 bits and up, is `error.KeyLengthOutOfPolicy`
 /// (OPC 10000-7 min 2048 / max 4096; open62541 refuses the same remote
 /// certificate with `BadCertificateUseNotAllowed`). `.none` has no band.
+///
+/// The band is checked on the certificate's modulus length before the key
+/// is parsed (`certificateKeyBits`), so a key longer than this build's RSA
+/// capacity (`-Dprofile=small` caps it at 4096 bits) is still
+/// `KeyLengthOutOfPolicy`, not `InvalidCertificate`: the answer does not
+/// depend on the build profile.
 pub fn certificatePublicKeyForPolicy(policy: SecurityPolicy, certificate_der: []const u8) (CertificatePublicKeyError || KeyLengthError)!rsa.PublicKey {
+    if (!policy.allowsKeyBits(try certificateKeyBits(certificate_der))) return error.KeyLengthOutOfPolicy;
     const pk = try certificatePublicKey(certificate_der);
     if (!policy.allowsKeyBits(pk.bits())) return error.KeyLengthOutOfPolicy;
     return pk;
+}
+
+/// The RSA modulus length of a DER certificate's key, read from the
+/// structure alone (no RSA capacity limit, no key checks). Not RSA, or not a
+/// parseable key structure, is `error.InvalidCertificate`.
+pub fn certificateKeyBits(certificate_der: []const u8) CertificatePublicKeyError!usize {
+    const spki = x509.spkiOf(certificate_der) catch return error.InvalidCertificate;
+    if (!spki.algorithmIs(&x509.safe.oid_rsa_encryption)) return error.InvalidCertificate;
+    return rsa.PublicKey.modulusBitsFromDer(spki.key_bits) catch error.InvalidCertificate;
 }
 
 /// A DER certificate's `notBefore`/`notAfter`, in Unix seconds.
@@ -1532,8 +1548,15 @@ test "certificatePublicKeyForPolicy: 1024 / 2047 / 2048 / 4096 / 4097 per policy
     for ([_]SecurityPolicy{ .basic256sha256, .aes256_sha256_rsapss }) |pol| {
         for (cases) |cs| {
             const der = test_cert.withModulusBits(&buf, cs.bits);
-            // the shell must be a parseable certificate of exactly that length
-            try testing.expectEqual(cs.bits, (try certificatePublicKey(der)).bits());
+            // the shell must be a certificate of exactly that length; it
+            // parses as a key only within this build's RSA capacity
+            // (profile=small: 4096), and the band answer is the same either way
+            try testing.expectEqual(cs.bits, try certificateKeyBits(der));
+            if (cs.bits <= rsa.max_modulus_bits) {
+                try testing.expectEqual(cs.bits, (try certificatePublicKey(der)).bits());
+            } else {
+                try testing.expectError(error.InvalidCertificate, certificatePublicKey(der));
+            }
             if (cs.ok) {
                 try testing.expectEqual(cs.bits, (try certificatePublicKeyForPolicy(pol, der)).bits());
             } else {
@@ -1545,6 +1568,17 @@ test "certificatePublicKeyForPolicy: 1024 / 2047 / 2048 / 4096 / 4097 per policy
     const small = test_cert.withModulusBits(&buf, 1024);
     _ = try certificatePublicKeyForPolicy(.none, small);
     try testing.expectError(error.InvalidCertificate, certificatePublicKeyForPolicy(.basic256sha256, "not a certificate"));
+    try testing.expectError(error.InvalidCertificate, certificateKeyBits("not a certificate"));
+    // An RSA key structure under another algorithm OID (here RSASSA-PSS,
+    // ...1.1.10) is not an rsaEncryption key: InvalidCertificate, not a band
+    // verdict.
+    var other: [2048]u8 = undefined;
+    const d = test_cert.withModulusBits(&buf, 1024);
+    @memcpy(other[0..d.len], d);
+    const at = std.mem.find(u8, other[0..d.len], "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01").?;
+    other[at + 8] = 0x0a;
+    try testing.expectError(error.InvalidCertificate, certificateKeyBits(other[0..d.len]));
+    try testing.expectError(error.InvalidCertificate, certificatePublicKeyForPolicy(.basic256sha256, other[0..d.len]));
 }
 
 test "checkContextKeyLengths: own key and server certificate, escape and .none skip it" {

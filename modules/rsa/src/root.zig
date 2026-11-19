@@ -358,6 +358,21 @@ pub const PublicKey = struct {
         return publicKeyFromDerImpl(bytes, options) catch error.InvalidDer;
     }
 
+    /// The bit length of the modulus in a DER `RSAPublicKey` or an X.509
+    /// `SubjectPublicKeyInfo` wrapping one, read from the structure alone:
+    /// no `max_modulus_bits` limit, no key checks. It lets a caller tell "a
+    /// key longer than this build supports" (`fromDer` says `InvalidDer` for
+    /// both) from malformed DER, e.g. to apply a key-length policy the same
+    /// way under every build profile. A non-positive modulus (empty, zero,
+    /// or the sign bit set) is `InvalidDer`.
+    pub fn modulusBitsFromDer(bytes: []const u8) FromDerError!usize {
+        const parts = publicKeyPartsFromDer(bytes) catch return error.InvalidDer;
+        const n = parts.n;
+        if (n.len == 0 or n[0] & 0x80 != 0) return error.InvalidDer;
+        const i = std.mem.findNone(u8, n, &.{0}) orelse return error.InvalidDer;
+        return (n.len - i - 1) * 8 + (8 - @as(usize, @clz(n[i])));
+    }
+
     /// Parse a public key from a PEM text block: `PUBLIC KEY` (X.509
     /// `SubjectPublicKeyInfo`) or `RSA PUBLIC KEY` (bare PKCS#1
     /// `RSAPublicKey`). The first matching block in `text` is used; other
@@ -5035,6 +5050,53 @@ test "PublicKey.fromDer parses SPKI and PKCS#1 DER, matches kat2048" {
     const from_pkcs1 = try PublicKey.fromDer(&kat2048_der.pub_pkcs1);
     try expectMatchesKat2048PublicKey(from_pkcs1);
     try verifyPkcs1v15(from_pkcs1, std.crypto.hash.sha2.Sha256, kat2048.msg, &kat2048.sig_sha256);
+}
+
+/// A PKCS#1 `RSAPublicKey` with a modulus of `n_len` octets whose first
+/// octet is `first` (the rest 0xFF), e = 65537, with a sign octet when
+/// `sign_octet`.
+fn testPkcs1Der(buf: []u8, first: u8, n_len: usize, sign_octet: bool) []const u8 {
+    const n_int = n_len + @intFromBool(sign_octet);
+    const body = 4 + n_int + 5;
+    buf[0] = 0x30;
+    buf[1] = 0x82;
+    std.mem.writeInt(u16, buf[2..4], @intCast(body), .big);
+    buf[4] = 0x02;
+    buf[5] = 0x82;
+    std.mem.writeInt(u16, buf[6..8], @intCast(n_int), .big);
+    var p: usize = 8;
+    if (sign_octet) {
+        buf[p] = 0;
+        p += 1;
+    }
+    buf[p] = first;
+    @memset(buf[p + 1 .. p + n_len], 0xFF);
+    p += n_len;
+    @memcpy(buf[p..][0..5], &[_]u8{ 0x02, 0x03, 0x01, 0x00, 0x01 });
+    return buf[0 .. p + 5];
+}
+
+test "PublicKey.modulusBitsFromDer: exact bit length, no capacity limit, non-positive refused" {
+    try testing.expectEqual(@as(usize, 2048), try PublicKey.modulusBitsFromDer(&kat2048_der.pub_spki));
+    try testing.expectEqual(@as(usize, 2048), try PublicKey.modulusBitsFromDer(&kat2048_der.pub_pkcs1));
+    var buf: [1100]u8 = undefined;
+    // 4096 (sign octet), 4097, 4095 and one bit past this build's capacity.
+    try testing.expectEqual(@as(usize, 4096), try PublicKey.modulusBitsFromDer(testPkcs1Der(&buf, 0x80, 512, true)));
+    try testing.expectEqual(@as(usize, 4097), try PublicKey.modulusBitsFromDer(testPkcs1Der(&buf, 0x01, 513, false)));
+    try testing.expectEqual(@as(usize, 4095), try PublicKey.modulusBitsFromDer(testPkcs1Der(&buf, 0x7F, 512, false)));
+    const over = max_modulus_bits + 1; // first octet 0x01, then whole octets
+    const der_over = testPkcs1Der(&buf, 0x01, 1 + (over - 1) / 8, false);
+    try testing.expectEqual(@as(usize, over), try PublicKey.modulusBitsFromDer(der_over));
+    try testing.expectError(error.InvalidDer, PublicKey.fromDer(der_over));
+    // Leading zero octets are not bits.
+    try testing.expectEqual(@as(usize, 4089), try PublicKey.modulusBitsFromDer(testPkcs1Der(&buf, 0x01, 512, true)));
+    // Sign bit set without a sign octet: negative. A zero modulus. Garbage.
+    try testing.expectError(error.InvalidDer, PublicKey.modulusBitsFromDer(testPkcs1Der(&buf, 0x80, 512, false)));
+    try testing.expectError(error.InvalidDer, PublicKey.modulusBitsFromDer(testPkcs1Der(&buf, 0x00, 1, false)));
+    try testing.expectError(error.InvalidDer, PublicKey.modulusBitsFromDer("junk"));
+    // An empty modulus INTEGER.
+    try testing.expectError(error.InvalidDer, PublicKey.modulusBitsFromDer(&[_]u8{ 0x30, 0x07, 0x02, 0x00, 0x02, 0x03, 0x01, 0x00, 0x01 }));
+    try testing.expectError(error.InvalidDer, PublicKey.modulusBitsFromDer(kat2048_der.pub_spki[0..100]));
 }
 
 test "VerifyKey: same accept/reject as PublicKey on the KATs, from bytes and from DER" {

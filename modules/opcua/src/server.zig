@@ -1433,12 +1433,15 @@ pub const Connection = struct {
     /// Structure + validity period + the caller's trust policy, in that
     /// order. Returns `status.good` or the `Bad…` code to answer with.
     fn checkPeerCertificate(c: *Connection, sec: SecurityConfig, certificate_der: []const u8, now_ms: i64) encoding.StatusCode {
-        // Must parse and carry an RSA key — everything downstream assumes it.
-        const peer_pk = security.certificatePublicKey(certificate_der) catch return status.bad_certificate_invalid;
         // OPC 10000-7 key-length band (2048..4096 bits for Basic256Sha256);
-        // open62541's `rsaNewChannelContext` answers the same status.
-        if (!sec.insecure_allow_key_length_outside_policy and !security.SecurityPolicy.basic256sha256.allowsKeyBits(peer_pk.bits()))
+        // open62541's `rsaNewChannelContext` answers the same status. Checked
+        // on the modulus length before the key is parsed, so a key past this
+        // build's RSA capacity (profile=small: 4096) gets the same answer.
+        const peer_bits = security.certificateKeyBits(certificate_der) catch return status.bad_certificate_invalid;
+        if (!sec.insecure_allow_key_length_outside_policy and !security.SecurityPolicy.basic256sha256.allowsKeyBits(peer_bits))
             return status.bad_certificate_use_not_allowed;
+        // Must parse and carry an RSA key — everything downstream assumes it.
+        _ = security.certificatePublicKey(certificate_der) catch return status.bad_certificate_invalid;
 
         // notBefore/notAfter, against the wall clock the caller injected.
         // `wall_clock_epoch == 0` means no wall clock was injected at all
@@ -7041,8 +7044,10 @@ test "secure: peer certificate key length must fit the policy band (BadCertifica
         const der = test_cert.withModulusBits(&buf, cs.bits);
         const want = if (cs.ok) status.good else status.bad_certificate_use_not_allowed;
         try testing.expectEqual(want, rig.conn.checkPeerCertificate(strict, der, 0));
-        // The testing escape lets every size through.
-        try testing.expectEqual(status.good, rig.conn.checkPeerCertificate(lax, der, 0));
+        // The testing escape lets every size through that this build's RSA
+        // can hold (profile=small: 4096); a longer key cannot be used at all.
+        const lax_want = if (cs.bits <= @import("rsa").max_modulus_bits) status.good else status.bad_certificate_invalid;
+        try testing.expectEqual(lax_want, rig.conn.checkPeerCertificate(lax, der, 0));
     }
     // Garbage is still BadCertificateInvalid, not a key-length verdict.
     try testing.expectEqual(status.bad_certificate_invalid, rig.conn.checkPeerCertificate(strict, "junk", 0));
