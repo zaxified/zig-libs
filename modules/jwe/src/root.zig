@@ -983,7 +983,7 @@ test "key-material confusion is rejected: dir token vs RSA key" {
     const token = try encryptCompact(std.testing.allocator, .dir, .A128GCM, .{ .symmetric = &key }, "hi", "", seededForTest(), .{});
     defer std.testing.allocator.free(token);
 
-    const bogus_rsa = rsa.PublicKey.fromBytes(&@as([64]u8, @splat(0xff)), &[_]u8{ 0x01, 0x00, 0x01 }) catch unreachable;
+    const bogus_rsa = rsa.PublicKey.fromBytes(&@as([128]u8, @splat(0xff)), &[_]u8{ 0x01, 0x00, 0x01 }) catch unreachable;
     try std.testing.expectError(error.KeyMaterialMismatch, decryptCompact(std.testing.allocator, .{ .rsa_public = bogus_rsa }, token, .{}));
 }
 
