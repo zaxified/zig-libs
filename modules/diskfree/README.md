@@ -125,6 +125,12 @@ const ans = try diskfree.lookup.locate(r.entries, r.truncated, "/var/log/syslog"
 if (ans.index) |i| std.log.info("on {s} (table cut: {})", .{ r.entries[i].mount_point, ans.table_truncated });
 ```
 
+`lookup.containing` scans the table once per tree step, which is fine for a table the
+kernel wrote. For an untrusted saved mountinfo table (a parent cycle costs O(n^2) there),
+build `var ix = try diskfree.lookup.Index.init(gpa, r.entries)` once and ask
+`lookup.containingIndexed(&ix, r.entries, path)` (same answer, O(n log n)); `readTable`
+does this itself.
+
 `classify.isPseudo(fs_type)` / `isRemote(fs_type, device)` decide by type NAME
 (no magic-number table); `Usage.flags`/`St.*` are the kernel's mount flags
 (read-only is `isReadOnly()`), `usePercentNearest()` is busybox's rounding.

@@ -21,6 +21,8 @@
 //!     directory (`/h/inner`, then `/h` over it: both are children of the same
 //!     parent, the later `/h` covers the path, `/h/inner` is never reached) right.
 //!     The walk is bounded by the table size, so a hostile parent cycle ends.
+//!     Each step scans the table (O(depth x n)); for an untrusted table use `Index` +
+//!     `containingIndexed`, which gives the same answer in O(n log n).
 //!     Without any entry on `/` (a chroot's table) it falls back to the flat rule.
 //!   * anything else (`mounts.MountEntry`, no ids): the longest covering mount
 //!     point, the last entry on a tie. A table sorted by kernel mount ID is NOT
@@ -140,6 +142,121 @@ pub fn containing(entries: anytype, path: []const u8) LookupError!?usize {
         return c;
     }
     return flatContaining(entries, p);
+}
+
+/// A prebuilt index over a mountinfo table for `containingIndexed`: the walk of
+/// `containing` with every step answered from a parent-id sorted index instead of
+/// a scan of the whole table, and a parent cycle resolved by remembering the
+/// visited entries instead of walking it `entries.len` times. Build it ONCE per
+/// table and query it many times (`table.collectWith` does); `containing` on a
+/// table the kernel wrote needs none of it, but on an untrusted saved table the
+/// scan costs O(n^2) per call (a cycle of n entries makes n steps of n compares).
+/// Results are identical to `containing` on every table, hostile ones included.
+/// Not thread-safe (queries reuse its scratch arrays).
+pub const Index = struct {
+    /// Entry indices sorted by (`parent_id`, index): the children of one mount are a
+    /// contiguous run, in table order.
+    by_parent: []usize,
+    /// Scratch: step at which an entry was first visited by the current query
+    /// (`unseen` otherwise) and the visit order; both are cleaned after a query.
+    seen: []usize,
+    order: []usize,
+    /// The last entry mounted on `/` (null: the flat rule applies).
+    root: ?usize,
+
+    const unseen = std.math.maxInt(usize);
+
+    /// Index `entries` (a slice of anything with `mount_id`, `parent_id`, `mount_point`).
+    pub fn init(gpa: std.mem.Allocator, entries: anytype) std.mem.Allocator.Error!Index {
+        const n = entries.len;
+        const by_parent = try gpa.alloc(usize, n);
+        errdefer gpa.free(by_parent);
+        const seen = try gpa.alloc(usize, n);
+        errdefer gpa.free(seen);
+        const order = try gpa.alloc(usize, n);
+        errdefer gpa.free(order);
+        var root: ?usize = null;
+        for (entries, 0..) |e, i| {
+            by_parent[i] = i;
+            seen[i] = unseen;
+            const mp: []const u8 = e.mount_point;
+            if (std.mem.eql(u8, trimmed(mp), "/")) root = i;
+        }
+        const Ctx = struct {
+            es: @TypeOf(entries),
+            fn lessThan(c: @This(), a: usize, b: usize) bool {
+                const pa = c.es[a].parent_id;
+                const pb = c.es[b].parent_id;
+                if (pa != pb) return pa < pb;
+                return a < b;
+            }
+        };
+        std.mem.sortUnstable(usize, by_parent, Ctx{ .es = entries }, Ctx.lessThan);
+        return .{ .by_parent = by_parent, .seen = seen, .order = order, .root = root };
+    }
+
+    pub fn deinit(ix: Index, gpa: std.mem.Allocator) void {
+        gpa.free(ix.by_parent);
+        gpa.free(ix.seen);
+        gpa.free(ix.order);
+    }
+};
+
+/// `containing` over a table indexed by `Index.init(gpa, entries)` (the SAME
+/// `entries`, unchanged): same answer, O(n log n) in the worst case instead of
+/// O(n^2). Only for mountinfo entries (the ones with ids).
+pub fn containingIndexed(ix: *Index, entries: anytype, path: []const u8) LookupError!?usize {
+    comptime std.debug.assert(@hasField(ElemOf(@TypeOf(entries)), "parent_id"));
+    std.debug.assert(entries.len == ix.by_parent.len);
+    var buf: [max_path]u8 = undefined;
+    const p = try normalize(path, &buf);
+    var c = ix.root orelse return flatContaining(entries, p);
+    const n = entries.len;
+    var steps: usize = 0;
+    var recorded: usize = 0;
+    var result: ?usize = null;
+    while (steps < n) : (steps += 1) {
+        if (ix.seen[c] != Index.unseen) {
+            // A cycle: positions repeat with period `len` from `first`; the original
+            // walk stops after `n` steps, at the entry in position `n`.
+            const first = ix.seen[c];
+            const len = steps - first;
+            result = ix.order[first + (n - steps) % len];
+            break;
+        }
+        ix.seen[c] = steps;
+        ix.order[steps] = c;
+        recorded = steps + 1;
+        c = indexNext(ix, entries, c, p) orelse {
+            result = c;
+            break;
+        };
+    }
+    for (ix.order[0..recorded]) |i| ix.seen[i] = Index.unseen;
+    return result orelse c;
+}
+
+/// The last child of entry `c` (an entry whose `parent_id` is `c`'s `mount_id`) whose mount point covers `p`.
+fn indexNext(ix: *const Index, entries: anytype, c: usize, p: []const u8) ?usize {
+    const want = entries[c].mount_id;
+    // First position whose parent_id >= want.
+    var lo: usize = 0;
+    var hi: usize = ix.by_parent.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (entries[ix.by_parent[mid]].parent_id < want) lo = mid + 1 else hi = mid;
+    }
+    var k = lo;
+    while (k < ix.by_parent.len and entries[ix.by_parent[k]].parent_id == want) k += 1;
+    // `lo..k` are the children, ascending by index: take the last covering one.
+    while (k > lo) {
+        k -= 1;
+        const i = ix.by_parent[k];
+        if (i == c) continue;
+        const mp: []const u8 = entries[i].mount_point;
+        if (covers(mp, p)) return i;
+    }
+    return null;
 }
 
 fn flatContaining(entries: anytype, p: []const u8) ?usize {
@@ -270,10 +387,87 @@ test "containing (mount tree): stacked, hidden under a later ancestor, root list
     try testing.expectEqual(@as(?usize, 1), try containing(&t, "/h"));
     try testing.expectEqual(@as(?usize, 3), try containing(&t, "/a/x")); // the upper of the stack
     try testing.expectEqual(@as(?usize, 4), try containing(&t, "/a/b/x"));
+    var ix = try Index.init(testing.allocator, &t);
+    defer ix.deinit(testing.allocator);
+    for ([_][]const u8{ "/etc", "/h/inner/f", "/h", "/a/x", "/a/b/x" }) |pp|
+        try testing.expectEqual(try containing(&t, pp), try containingIndexed(&ix, &t, pp));
     const cyc = [_]TFake{ .{ .mount_id = 1, .parent_id = 2, .mount_point = "/" }, .{ .mount_id = 2, .parent_id = 1, .mount_point = "/x" }, .{ .mount_id = 3, .parent_id = 3, .mount_point = "/x" } };
     _ = try containing(&cyc, "/x/y");
     const nr = [_]TFake{ .{ .mount_id = 1, .parent_id = 0, .mount_point = "/a" }, .{ .mount_id = 2, .parent_id = 1, .mount_point = "/a/b" } };
     try testing.expectEqual(@as(?usize, 1), try containing(&nr, "/a/b/c"));
+}
+
+test "containingIndexed: same answer as containing on random hostile tables (cycles, duplicate ids)" {
+    var prng = std.Random.DefaultPrng.init(0x6d6f756e74);
+    const r = prng.random();
+    const points = [_][]const u8{ "/", "/a", "/a/b", "/h", "/h/inner", "/a/", "rel", "" };
+    const paths = [_][]const u8{ "/", "/a", "/a/b/c", "/h/inner/f", "/zzz", "/a/b/../x" };
+    var tbl: [24]TFake = undefined;
+    var round: usize = 0;
+    while (round < 3000) : (round += 1) {
+        const n = r.intRangeAtMost(usize, 0, tbl.len);
+        const idr = r.intRangeAtMost(u32, 1, @intCast(n + 2));
+        for (tbl[0..n]) |*e| e.* = .{
+            .mount_id = r.intRangeAtMost(u32, 1, idr),
+            .parent_id = r.intRangeAtMost(u32, 0, idr),
+            .mount_point = points[r.uintLessThan(usize, points.len)],
+        };
+        const es = tbl[0..n];
+        var ix = try Index.init(testing.allocator, es);
+        defer ix.deinit(testing.allocator);
+        for (paths) |pp| {
+            try testing.expectEqual(try containing(es, pp), try containingIndexed(&ix, es, pp));
+            // The scratch is cleaned: a second query on the same index is unchanged.
+            try testing.expectEqual(try containing(es, pp), try containingIndexed(&ix, es, pp));
+        }
+        try testing.expectError(error.RelativePath, containingIndexed(&ix, es, "a"));
+    }
+}
+
+test "containingIndexed: a parent cycle through every entry of a large table is answered" {
+    // The root (index 0, id 1) is its own descendant: 1 -> 2 -> 3 -> ... -> n -> 1.
+    // `containing` would need n steps of n compares each (9e8 for this n); the index
+    // makes it n small steps. The walk stops after n steps, at position n = the root.
+    const gpa = testing.allocator;
+    const n: usize = 30000;
+    const es = try gpa.alloc(TFake, n);
+    defer gpa.free(es);
+    for (es, 0..) |*e, i| e.* = .{
+        .mount_id = @intCast(i + 1),
+        .parent_id = if (i == 0) @intCast(n) else @intCast(i),
+        .mount_point = if (i == 0) "/" else "/x",
+    };
+    var ix = try Index.init(gpa, es);
+    defer ix.deinit(gpa);
+    try testing.expectEqual(@as(?usize, 0), try containingIndexed(&ix, es, "/x/y"));
+    try testing.expectEqual(@as(?usize, 0), try containingIndexed(&ix, es, "/other"));
+    // The same table without the back edge: the deepest mount (the last entry) wins.
+    es[0].parent_id = 0;
+    ix.deinit(gpa);
+    ix = try Index.init(gpa, es);
+    try testing.expectEqual(@as(?usize, n - 1), try containingIndexed(&ix, es, "/x/y"));
+}
+
+test "containingIndexed: two entries that are each other's covering child, behind many non-covering children" {
+    // Entries 1..3 share mount id 2; 2 and 3 are children of id 2 (so of each other and
+    // of themselves): the walk alternates between them, and every step meets all the
+    // junk children of id 2 first. The index stops after the first repeat.
+    const gpa = testing.allocator;
+    for ([_]usize{ 0, 1, 2, 3, 7, 40, 20000 }) |junk| {
+        const es = try gpa.alloc(TFake, 4 + junk);
+        defer gpa.free(es);
+        es[0] = .{ .mount_id = 1, .parent_id = 0, .mount_point = "/" };
+        es[1] = .{ .mount_id = 2, .parent_id = 1, .mount_point = "/x" };
+        es[2] = .{ .mount_id = 2, .parent_id = 2, .mount_point = "/x" };
+        es[3] = .{ .mount_id = 2, .parent_id = 2, .mount_point = "/x" };
+        for (es[4..], 0..) |*e, k| e.* = .{ .mount_id = @intCast(100 + k), .parent_id = 2, .mount_point = "/zzz" };
+        var ix = try Index.init(gpa, es);
+        defer ix.deinit(gpa);
+        const got = try containingIndexed(&ix, es, "/x/y");
+        if (junk <= 40) try testing.expectEqual(try containing(es, "/x/y"), got);
+        try testing.expect(got.? >= 1 and got.? <= 3);
+        try testing.expectEqual(@as(?usize, 0), try containingIndexed(&ix, es, "/q")); // only the root covers
+    }
 }
 
 test "locate: carries the reader's truncation flag; a generated >1 MiB table is cut and says so" {
