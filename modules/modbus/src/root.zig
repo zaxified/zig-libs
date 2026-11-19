@@ -697,6 +697,183 @@ pub const device_id = struct {
     }
 };
 
+// ── RTU over TCP: stream reassembly ────────────────────────────────────────
+
+/// Reassembles RTU ADUs (address + PDU + CRC-16) from a byte stream that has
+/// no t3.5 silence to delimit them, which is what "RTU over TCP" (a serial
+/// gateway tunnelling RTU frames through a socket, no MBAP header) delivers:
+/// arbitrary chunks, several frames or half a frame per read.
+///
+/// The frame boundary comes from the function code (fixed length, or a byte
+/// count field inside the frame) and is confirmed by the CRC-16. This is the
+/// approach pymodbus's RTU framer takes (read 2026-11-19: it asks the decoder
+/// for the frame size from the function code, then checks the CRC, and
+/// hunts forward over garbage). Unlike pymodbus, a CRC failure here drops one
+/// byte and rescans, so a valid frame behind garbage or behind a corrupted
+/// frame is not lost.
+///
+/// The buffer is fixed (`rtu.max_adu_len`), so memory is bounded however much
+/// a peer sends. Which side's frames are expected matters because request and
+/// response layouts differ for the same function code: a server reads
+/// `.request`, a client reads `.response`.
+///
+/// Typical loop:
+///
+///     while (data.len > 0) {
+///         const n = stream.feed(data);
+///         data = data[n..];
+///         while (stream.next()) |frame| handle(frame);
+///     }
+///
+/// Limits: FC 0x08 is taken as the fixed 8-byte form (sub-function + one data
+/// word); an FC 0x2B request whose MEI type is not 0x0E, and any function
+/// code outside the table, cannot be sized, so such bytes are skipped as
+/// garbage.
+pub const RtuStream = struct {
+    role: Role,
+    buf: [rtu.max_adu_len]u8 = undefined,
+    len: usize = 0,
+    /// Length of the frame handed out by the previous `next`, removed lazily
+    /// so the returned slices stay valid until the next call.
+    consumed: usize = 0,
+    /// Bytes dropped while hunting for a frame start (garbage, failed CRC).
+    discarded: u64 = 0,
+
+    pub const Role = enum { request, response };
+
+    pub fn init(role: Role) RtuStream {
+        return .{ .role = role };
+    }
+
+    /// Drop everything buffered (a reconnect, or a caller's idle timeout).
+    pub fn reset(s: *RtuStream) void {
+        s.len = 0;
+        s.consumed = 0;
+    }
+
+    fn compact(s: *RtuStream) void {
+        if (s.consumed == 0) return;
+        std.mem.copyForwards(u8, s.buf[0 .. s.len - s.consumed], s.buf[s.consumed..s.len]);
+        s.len -= s.consumed;
+        s.consumed = 0;
+    }
+
+    /// Append up to the free space of `data`; returns how many bytes were
+    /// taken. A short return means the buffer holds an unresolved prefix:
+    /// call `next`, which always makes room.
+    pub fn feed(s: *RtuStream, data: []const u8) usize {
+        s.compact();
+        const n = @min(data.len, s.buf.len - s.len);
+        @memcpy(s.buf[s.len..][0..n], data[0..n]);
+        s.len += n;
+        return n;
+    }
+
+    /// The next complete, CRC-valid frame, or null when more bytes are
+    /// needed. The frame's `pdu` borrows the internal buffer and is valid
+    /// until the next `feed` or `next`.
+    pub fn next(s: *RtuStream) ?rtu.Frame {
+        s.compact();
+        while (s.len > 0) {
+            switch (expectedLen(s.role, s.buf[0..s.len])) {
+                .more => {
+                    // A full buffer that is still incomplete cannot happen
+                    // (every size is <= buf.len), but never stall on it.
+                    if (s.len < s.buf.len) return null;
+                    s.skip();
+                },
+                .bad => s.skip(),
+                .total => |total| {
+                    if (total > s.len) return null;
+                    const frame = rtu.decodeAdu(s.buf[0..total]) catch {
+                        s.skip();
+                        continue;
+                    };
+                    s.consumed = total;
+                    return frame;
+                },
+            }
+        }
+        return null;
+    }
+
+    fn skip(s: *RtuStream) void {
+        std.mem.copyForwards(u8, s.buf[0 .. s.len - 1], s.buf[1..s.len]);
+        s.len -= 1;
+        s.discarded += 1;
+    }
+
+    const Expect = union(enum) { total: usize, more, bad };
+
+    /// Total ADU length of the frame starting at `b[0]`, from the bytes seen
+    /// so far.
+    fn expectedLen(role: Role, b: []const u8) Expect {
+        if (b.len < 2) return .more;
+        const fc = b[1];
+        if (fc & 0x80 != 0) {
+            // Exception response (also: no request has the high bit set).
+            return if (role == .response) .{ .total = 5 } else .bad;
+        }
+        const resp = role == .response;
+        switch (fc) {
+            0x01, 0x02, 0x03, 0x04 => {
+                if (!resp) return .{ .total = 8 };
+                return counted(b, 2);
+            },
+            0x05, 0x06 => return .{ .total = 8 },
+            0x07 => return .{ .total = if (resp) 5 else 4 },
+            0x08 => return .{ .total = 8 },
+            0x0B => return .{ .total = if (resp) 8 else 4 },
+            0x0C => return if (resp) counted(b, 2) else .{ .total = 4 },
+            0x0F, 0x10 => {
+                if (resp) return .{ .total = 8 };
+                return counted(b, 6);
+            },
+            0x11 => return if (resp) counted(b, 2) else .{ .total = 4 },
+            0x14, 0x15 => return counted(b, 2), // request and response both carry a byte count first
+            0x16 => return .{ .total = 10 },
+            0x17 => {
+                if (resp) return counted(b, 2);
+                return counted(b, 10);
+            },
+            0x18 => {
+                if (!resp) return .{ .total = 6 };
+                // address, fc, byte count (u16), fifo count (u16), values
+                if (b.len < 4) return .more;
+                const n: usize = std.mem.readInt(u16, b[2..4], .big);
+                const total = 4 + n + 2;
+                return if (total > rtu.max_adu_len) .bad else .{ .total = total };
+            },
+            0x2B => {
+                if (b.len < 3) return .more;
+                if (b[2] != device_id.mei_type) return .bad;
+                if (!resp) return .{ .total = 7 };
+                // address, fc, MEI, code, conformity, more, next, count, then
+                // `count` (id, length, value) triples, then CRC.
+                if (b.len < 8) return .more;
+                var pos: usize = 8;
+                var i: usize = 0;
+                while (i < b[7]) : (i += 1) {
+                    if (pos + 2 > b.len) return .more;
+                    pos += 2 + @as(usize, b[pos + 1]);
+                    if (pos + 2 > rtu.max_adu_len) return .bad;
+                }
+                const total = pos + 2;
+                return if (total > rtu.max_adu_len) .bad else .{ .total = total };
+            },
+            else => return .bad,
+        }
+    }
+
+    /// A frame whose byte count sits at `b[count_at]`: address, header and
+    /// count byte, then that many bytes, then the 2-byte CRC.
+    fn counted(b: []const u8, count_at: usize) Expect {
+        if (b.len <= count_at) return .more;
+        const total = count_at + 1 + @as(usize, b[count_at]) + 2;
+        return if (total > rtu.max_adu_len) .bad else .{ .total = total };
+    }
+};
+
 // ── transport seam ──────────────────────────────────────────────────────────
 
 /// The I/O seam: one blocking round-trip — send a request ADU, receive one
@@ -2030,4 +2207,170 @@ test "device_id: parseResponse walks objects and rejects every inconsistency" {
     try testing.expectEqual(@as(u8, 0), empty.count);
     var eit = empty.objects();
     try testing.expectEqual(@as(?device_id.Object, null), eit.next());
+}
+
+// ── tests: RTU over TCP stream reassembly ──────────────────────────────────
+
+const stream_cases = [_]struct { role: RtuStream.Role, pdu: []const u8 }{
+    .{ .role = .request, .pdu = &.{ 0x03, 0x00, 0x6B, 0x00, 0x03 } },
+    .{ .role = .response, .pdu = &.{ 0x03, 0x06, 0x02, 0x2B, 0x00, 0x00, 0x00, 0x64 } },
+    .{ .role = .request, .pdu = &.{ 0x01, 0x00, 0x13, 0x00, 0x25 } },
+    .{ .role = .response, .pdu = &.{ 0x01, 0x02, 0xCD, 0x6B } },
+    .{ .role = .request, .pdu = &.{ 0x05, 0x00, 0xAC, 0xFF, 0x00 } },
+    .{ .role = .response, .pdu = &.{ 0x06, 0x00, 0x01, 0x00, 0x03 } },
+    .{ .role = .request, .pdu = &.{0x07} },
+    .{ .role = .response, .pdu = &.{ 0x07, 0x6D } },
+    .{ .role = .request, .pdu = &.{ 0x08, 0x00, 0x00, 0xA5, 0x37 } },
+    .{ .role = .response, .pdu = &.{ 0x08, 0x00, 0x00, 0xA5, 0x37 } },
+    .{ .role = .request, .pdu = &.{0x0B} },
+    .{ .role = .response, .pdu = &.{ 0x0B, 0x00, 0x00, 0x01, 0x08 } },
+    .{ .role = .request, .pdu = &.{0x0C} },
+    .{ .role = .response, .pdu = &.{ 0x0C, 0x03, 0x01, 0x02, 0x03 } },
+    .{ .role = .request, .pdu = &.{ 0x0F, 0x00, 0x13, 0x00, 0x0A, 0x02, 0xCD, 0x01 } },
+    .{ .role = .response, .pdu = &.{ 0x0F, 0x00, 0x13, 0x00, 0x0A } },
+    .{ .role = .request, .pdu = &.{ 0x10, 0x00, 0x01, 0x00, 0x02, 0x04, 0x00, 0x0A, 0x01, 0x02 } },
+    .{ .role = .response, .pdu = &.{ 0x10, 0x00, 0x01, 0x00, 0x02 } },
+    .{ .role = .request, .pdu = &.{0x11} },
+    .{ .role = .response, .pdu = &.{ 0x11, 0x03, 0x7A, 0xFF, 0x01 } },
+    .{ .role = .request, .pdu = &.{ 0x14, 0x07, 0x06, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02 } },
+    .{ .role = .response, .pdu = &.{ 0x14, 0x04, 0x03, 0x06, 0xAA, 0xBB } },
+    .{ .role = .request, .pdu = &.{ 0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25 } },
+    .{ .role = .response, .pdu = &.{ 0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25 } },
+    .{ .role = .request, .pdu = &.{ 0x17, 0x00, 0x03, 0x00, 0x06, 0x00, 0x0E, 0x00, 0x03, 0x06, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF } },
+    .{ .role = .response, .pdu = &.{ 0x17, 0x04, 0x00, 0xFE, 0x0A, 0xCD } },
+    .{ .role = .request, .pdu = &.{ 0x18, 0x04, 0xDE } },
+    .{ .role = .response, .pdu = &.{ 0x18, 0x00, 0x06, 0x00, 0x02, 0x01, 0xB8, 0x12, 0x84 } },
+    .{ .role = .request, .pdu = &.{ 0x2B, 0x0E, 0x01, 0x00 } },
+    .{ .role = .response, .pdu = &.{ 0x2B, 0x0E, 0x01, 0x83, 0x00, 0x00, 0x02, 0x00, 0x02, 'A', 'B', 0x01, 0x00 } },
+    .{ .role = .response, .pdu = &.{ 0x2B, 0x0E, 0x03, 0x83, 0x00, 0x00, 0x00 } },
+    .{ .role = .response, .pdu = &.{ 0x83, 0x02 } }, // exception
+    .{ .role = .response, .pdu = &.{ 0xAB, 0x01 } },
+};
+
+test "RtuStream: every function code in both roles, split at every byte position" {
+    for (stream_cases) |c| {
+        var adu_buf: [rtu.max_adu_len]u8 = undefined;
+        const adu = try rtu.encodeAdu(&adu_buf, 0x11, c.pdu);
+        for (0..adu.len + 1) |split| {
+            var s = RtuStream.init(c.role);
+            try testing.expectEqual(split, s.feed(adu[0..split]));
+            if (split < adu.len) {
+                try testing.expect(s.next() == null);
+                try testing.expectEqual(adu.len - split, s.feed(adu[split..]));
+            }
+            const f = s.next().?;
+            try testing.expectEqual(@as(u8, 0x11), f.unit);
+            try testing.expectEqualSlices(u8, c.pdu, f.pdu);
+            try testing.expect(s.next() == null);
+            try testing.expectEqual(@as(u64, 0), s.discarded);
+        }
+    }
+}
+
+test "RtuStream: several frames in one read, in order, none lost" {
+    var all: [rtu.max_adu_len * 4]u8 = undefined;
+    var n: usize = 0;
+    var cases: usize = 0;
+    for (stream_cases) |c| {
+        if (c.role != .request) continue;
+        const adu = try rtu.encodeAdu(all[n..], 0x01, c.pdu);
+        n += adu.len;
+        cases += 1;
+        if (n > all.len - rtu.max_adu_len) break;
+    }
+    var s = RtuStream.init(.request);
+    var got: usize = 0;
+    var data: []const u8 = all[0..n];
+    var idx: usize = 0;
+    while (data.len > 0) {
+        const taken = s.feed(data);
+        data = data[taken..];
+        while (s.next()) |f| {
+            while (stream_cases[idx].role != .request) idx += 1;
+            try testing.expectEqualSlices(u8, stream_cases[idx].pdu, f.pdu);
+            idx += 1;
+            got += 1;
+        }
+    }
+    try testing.expectEqual(cases, got);
+}
+
+test "RtuStream: leading garbage and a corrupted frame resync without losing the next frame" {
+    var a: [rtu.max_adu_len]u8 = undefined;
+    var b: [rtu.max_adu_len]u8 = undefined;
+    const good = try rtu.encodeAdu(&a, 0x01, &.{ 0x03, 0x00, 0x00, 0x00, 0x02 });
+    const other = try rtu.encodeAdu(&b, 0x02, &.{ 0x06, 0x00, 0x01, 0x00, 0x03 });
+
+    var s = RtuStream.init(.request);
+    var in: [64]u8 = undefined;
+    const garbage = [_]u8{ 0xFF, 0x00, 0x55, 0x99 };
+    @memcpy(in[0..4], &garbage);
+    @memcpy(in[4..][0..good.len], good);
+    try testing.expectEqual(4 + good.len, s.feed(in[0 .. 4 + good.len]));
+    const f = s.next().?;
+    try testing.expectEqualSlices(u8, good[1..6], f.pdu);
+    try testing.expect(s.discarded >= 4);
+
+    // corrupted frame (flip a CRC bit) followed by a good one
+    var bad: [rtu.max_adu_len]u8 = undefined;
+    @memcpy(bad[0..good.len], good);
+    bad[good.len - 1] ^= 0x01;
+    var s2 = RtuStream.init(.request);
+    var chunk: [64]u8 = undefined;
+    @memcpy(chunk[0..good.len], bad[0..good.len]);
+    @memcpy(chunk[good.len..][0..other.len], other);
+    const total = good.len + other.len;
+    try testing.expectEqual(total, s2.feed(chunk[0..total]));
+    const f2 = s2.next().?;
+    try testing.expectEqual(@as(u8, 0x02), f2.unit);
+    try testing.expectEqualSlices(u8, other[1..6], f2.pdu);
+    try testing.expect(s2.next() == null);
+}
+
+test "RtuStream: unknown function codes and bad lengths are skipped; memory stays bounded" {
+    var s = RtuStream.init(.request);
+    // An endless run of bytes that never form a frame: every feed makes
+    // progress and nothing grows past the fixed buffer.
+    var chunk: [97]u8 = undefined;
+    for (&chunk, 0..) |*b, i| b.* = @truncate(i * 7 + 0x40);
+    var fed: usize = 0;
+    for (0..50) |_| {
+        var data: []const u8 = &chunk;
+        while (data.len > 0) {
+            const n = s.feed(data);
+            data = data[n..];
+            fed += n;
+            while (s.next()) |_| {}
+            try testing.expect(s.len <= rtu.max_adu_len);
+        }
+    }
+    try testing.expectEqual(chunk.len * 50, fed);
+    // A byte count that would exceed the maximum ADU is not waited for.
+    s.reset();
+    _ = s.feed(&.{ 0x01, 0x10, 0x00, 0x00, 0x00, 0x7B, 0xFF });
+    try testing.expect(s.next() == null);
+    try testing.expect(s.len < 7);
+    // A valid frame right after is still found.
+    var a: [rtu.max_adu_len]u8 = undefined;
+    const good = try rtu.encodeAdu(&a, 0x09, &.{0x07});
+    _ = s.feed(good);
+    try testing.expectEqual(@as(u8, 0x09), s.next().?.unit);
+    // reset drops everything
+    _ = s.feed(&.{ 0x01, 0x03 });
+    s.reset();
+    try testing.expectEqual(@as(usize, 0), s.len);
+}
+
+test "RtuStream: a full buffer of one incomplete-looking frame still advances" {
+    var s = RtuStream.init(.response);
+    // FC 0x18 response with a 250-byte count: needs 256 bytes, CRC fails.
+    var buf: [rtu.max_adu_len]u8 = @splat(0xAA);
+    buf[0] = 0x01;
+    buf[1] = 0x18;
+    buf[2] = 0x00;
+    buf[3] = 0xFA;
+    try testing.expectEqual(buf.len, s.feed(&buf));
+    try testing.expect(s.next() == null);
+    try testing.expect(s.len < buf.len);
+    try testing.expect(s.discarded > 0);
 }

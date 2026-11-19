@@ -22,7 +22,10 @@ owned arrays into a simulated field device fleet.
     to a typed error set. Registers big-endian; coil bits LSB-first.
   - **Framing:** `tcp` (MBAP: transaction id, protocol id 0, length, unit)
     and `rtu` (address + PDU + CRC-16, poly 0xA001 reflected, low byte first).
-    ASCII framing is out of scope.
+    `RtuStream` reassembles RTU frames from a byte stream without t3.5
+    silences (RTU over TCP): frame boundary by function code + byte count,
+    confirmed by the CRC, bounded buffer, resync on garbage. ASCII framing is
+    out of scope.
   - **Client:** `Client` speaks through a `Transport` seam (one blocking
     "send request ADU, receive reply ADU" round-trip), so everything is
     offline-testable; `TcpTransport` is an optional real-socket adapter.
