@@ -1019,31 +1019,66 @@ pub const Handler = struct {
         // it — with attacker-influenced file names inside it.
         rw.setHeader("Content-Type", "text/html; charset=utf-8") catch
             return failUnsafeResponse(rw);
+        // Same two headers as a served file (the listing is HTML built from
+        // file names). `Cache-Control` is NOT best-effort -- the operator set
+        // it to say where this may be stored; `nosniff` is defense in depth.
+        if (h.options.cache_control) |cc|
+            rw.setHeader("Cache-Control", cc) catch return failUnsafeResponse(rw);
+        rw.setHeader("X-Content-Type-Options", "nosniff") catch {};
         if (req.method == .head) return;
 
         var it = dh.dir.iterate();
         // The first read before anything is written: a failing directory is
         // a 500, not an empty listing that looks like a real one.
-        var pending = it.next(h.io) catch return failUnsafeResponse(rw);
+        const first = it.next(h.io) catch return failUnsafeResponse(rw);
         const w = rw.writer();
         try w.writeAll("<!DOCTYPE html>\n<meta charset=\"utf-8\">\n<title>Index</title>\n<ul>\n");
+        try writeListingEntries(w, h.io, dh.dir, &it, first, h.options.serve_dotfiles, h.options.max_listing_entries);
+        try w.writeAll("</ul>\n");
+    }
+
+    /// The `<li>` rows of a listing: `first`, then `it.next(io)` until the end,
+    /// `max_entries` or an error. Each name is a relative link (percent-encoded
+    /// in the `href`, HTML-escaped as text, `/` after a directory), as Go's
+    /// `FileServer` and nginx's `autoindex` do. A read error after the first
+    /// entry cannot change the 200 already on the wire, so it ends the list
+    /// with a visible `[listing incomplete]` row instead of a silent cut.
+    fn writeListingEntries(w: *Writer, io: Io, dir: Dir, it: anytype, first: anytype, serve_dotfiles: bool, max_entries: usize) Writer.Error!void {
+        var pending = first;
         var visited: usize = 0;
-        // A later read error ends the listing where it is.
-        while (pending) |entry| : (pending = it.next(h.io) catch null) {
-            if (visited >= h.options.max_listing_entries) {
+        while (pending) |entry| {
+            if (visited >= max_entries) {
                 try w.writeAll("<li>[listing truncated]</li>\n");
                 break;
             }
             visited += 1;
-            if (!h.options.serve_dotfiles and entry.name.len != 0 and entry.name[0] == '.') continue;
-            try w.writeAll("<li>");
-            // Defense against markup / log injection via crafted filenames;
-            // `"` becomes `&#34;`, as in Go's FileServer listing.
-            try http.writeHtmlEscaped(w, entry.name);
-            if (entry.kind == .directory) try w.writeAll("/");
-            try w.writeAll("</li>\n");
+            if (serve_dotfiles or entry.name.len == 0 or entry.name[0] != '.') {
+                const is_dir = Snapshot.realKind(io, dir, entry.name, entry.kind) == .directory;
+                try w.writeAll("<li><a href=\"");
+                try writeHrefEscaped(w, entry.name);
+                if (is_dir) try w.writeAll("/");
+                try w.writeAll("\">");
+                // Defense against markup / log injection via crafted filenames;
+                // `"` becomes `&#34;`, as in Go's FileServer listing.
+                try http.writeHtmlEscaped(w, entry.name);
+                if (is_dir) try w.writeAll("/");
+                try w.writeAll("</a></li>\n");
+            }
+            pending = it.next(io) catch {
+                try w.writeAll("<li>[listing incomplete]</li>\n");
+                break;
+            };
         }
-        try w.writeAll("</ul>\n");
+    }
+
+    /// Percent-encode everything but RFC 3986 unreserved bytes, so a name is
+    /// one relative path segment whatever it holds (`:` cannot read as a
+    /// scheme, `?`/`#` cannot start a query, `"` cannot leave the attribute).
+    fn writeHrefEscaped(w: *Writer, name: []const u8) Writer.Error!void {
+        for (name) |c| switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => try w.writeByte(c),
+            else => try w.print("%{X:0>2}", .{c}),
+        };
     }
 
     const DirHandle = struct { dir: Dir, owned: bool };
@@ -1608,11 +1643,23 @@ pub const Snapshot = struct {
         s.paths.putAssumeCapacity(rel, .{ .file = id });
     }
 
+    /// The kind of a directory entry. Some filesystems (XFS without ftype,
+    /// some NFS and FUSE mounts) report `d_type` DT_UNKNOWN, which `iterate`
+    /// surfaces as `.unknown`; those entries are classified by one no-follow
+    /// `fstatat`, as `find`/`ftw` do, instead of being skipped (a file never
+    /// served, a directory never walked). A failed stat leaves `.unknown`,
+    /// which the walk skips -- fails closed.
+    fn realKind(io: Io, dir: Dir, name: []const u8, kind: File.Kind) File.Kind {
+        if (kind != .unknown) return kind;
+        const st = dir.statFile(io, name, .{ .follow_symlinks = false }) catch return .unknown;
+        return st.kind;
+    }
+
     fn walk(s: *Snapshot, io: Io, root: Dir, dir: Dir, prefix: []const u8, depth: usize, prev: ?*Snapshot) SnapshotError!void {
         var it = dir.iterate();
         while (it.next(io) catch return error.IoError) |entry| {
             if (!s.options.serve.serve_dotfiles and entry.name.len != 0 and entry.name[0] == '.') continue;
-            switch (entry.kind) {
+            switch (realKind(io, dir, entry.name, entry.kind)) {
                 .file => {
                     if (s.files.items.len == s.options.max_files) return error.TooManyFiles;
                     const rel = try s.join(prefix, entry.name);
@@ -2609,7 +2656,7 @@ test "serveDirectory: a listing that cannot be labelled text/html answers 500, n
     const ok = runVia(tablePressureHandler, &h, wire, &out);
     try testing.expectEqual(@as(u16, 200), statusOf(ok));
     try testing.expect(mem.find(u8, ok, "Content-Type: text/html; charset=utf-8\r\n") != null);
-    try testing.expect(mem.find(u8, ok, "<li>dir/</li>") != null);
+    try testing.expect(mem.find(u8, ok, "<li><a href=\"dir/\">dir/</a></li>") != null);
 
     // With the header table spent — and, unlike the 304 test above, WITHOUT
     // an upstream `Content-Type`, so this handler's own call needs a slot and
@@ -2960,7 +3007,7 @@ test "serve: a directory-listing request opens its target directory once, not tw
     // not F17's redirect — a bare "/sub/dir" would redirect first.
     const resp = get(&h, "/sub/dir/", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
-    try testing.expect(mem.find(u8, resp, "<li>file.txt</li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"file.txt\">file.txt</a></li>") != null);
     try testing.expectEqual(@as(usize, 1), test_f11_leaf_dir_opens);
 }
 
@@ -4240,6 +4287,98 @@ test "Snapshot: a file over max_fingerprint_bytes keeps the size+mtime tag, a sm
     try testing.expect(snap.tagOf(snap.paths.get("small.txt").?.file) != null);
 }
 
+test "serve: a listing carries Cache-Control and nosniff like a file, and links every entry with an escaped href (review 2026-10-24 L10)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const io = testing.io;
+    _ = try fx.root.createDirPathOpen(io, "lk/sub dir", .{});
+    try fx.root.writeFile(io, .{ .sub_path = "lk/a b:c#d\"e.txt", .data = "x" });
+    try fx.root.writeFile(io, .{ .sub_path = "lk/\xc3\xa9.txt", .data = "x" });
+    try fx.root.writeFile(io, .{ .sub_path = "lk/x-y_z~w.txt", .data = "x" });
+    try fx.root.writeFile(io, .{ .sub_path = "lk/AZaz09", .data = "x" });
+    try fx.root.writeFile(io, .{ .sub_path = "lk/t\tb.txt", .data = "x" });
+    var out: [8192]u8 = undefined;
+    var h = Handler.init(io, fx.root, .{ .directory_listing = true, .cache_control = "no-store" });
+    const resp = get(&h, "/lk/", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.find(u8, resp, "Cache-Control: no-store\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "X-Content-Type-Options: nosniff\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"a%20b%3Ac%23d%22e.txt\">a b:c#d&#34;e.txt</a></li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"sub%20dir/\">sub dir/</a></li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"%C3%A9.txt\">\xc3\xa9.txt</a></li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"AZaz09\">AZaz09</a></li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"x-y_z~w.txt\">x-y_z~w.txt</a></li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"t%09b.txt\">") != null);
+    // HEAD carries the same headers.
+    var out2: [4096]u8 = undefined;
+    const head = runRequest(&h, "HEAD /lk/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out2);
+    try testing.expect(mem.find(u8, head, "Cache-Control: no-store\r\n") != null);
+    try testing.expect(mem.find(u8, head, "X-Content-Type-Options: nosniff\r\n") != null);
+    // Without the option: no Cache-Control.
+    var h2 = Handler.init(io, fx.root, .{ .directory_listing = true });
+    try testing.expect(mem.find(u8, get(&h2, "/lk/", &out), "Cache-Control:") == null);
+}
+
+test "serveDirectory: a Cache-Control that cannot be set answers 500, never a listing outside the operator's cache policy (review 2026-10-24 L10)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{ .directory_listing = true, .cache_control = "no-store" });
+    const wire = "GET /sub/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    // `Content-Type` is preset, so its own `setHeader` is a replace that needs
+    // no slot and cannot stand in for the `Cache-Control` escalation.
+    test_preset_content_type = true;
+    test_fill_table = true;
+    defer {
+        test_preset_content_type = false;
+        test_fill_table = false;
+        test_fill_error = null;
+    }
+    var out: [8192]u8 = undefined;
+    const resp = runVia(tablePressureHandler, &h, wire, &out);
+    try testing.expectEqual(@as(anyerror, error.TooManyHeaders), test_fill_error.?);
+    try testing.expectEqual(@as(u16, 500), statusOf(resp));
+    try testing.expect(mem.find(u8, resp, "<li>") == null);
+}
+
+const FakeEntry = struct { name: []const u8, kind: File.Kind };
+const FakeIter = struct {
+    items: []const FakeEntry,
+    pos: usize = 0,
+    fail_at: ?usize = null,
+    fn next(f: *FakeIter, io: Io) error{Boom}!?FakeEntry {
+        _ = io;
+        if (f.fail_at) |at| if (f.pos == at) return error.Boom;
+        if (f.pos >= f.items.len) return null;
+        defer f.pos += 1;
+        return f.items[f.pos];
+    }
+};
+
+test "writeListingEntries: a read error after the first entry ends the list with a visible marker, a clean end does not (review 2026-10-24 L10)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const items = [_]FakeEntry{
+        .{ .name = "a", .kind = .file },
+        .{ .name = "b", .kind = .directory },
+        .{ .name = "c", .kind = .file },
+    };
+    var buf: [1024]u8 = undefined;
+    {
+        var w = Writer.fixed(&buf);
+        var it = FakeIter{ .items = &items, .pos = 1, .fail_at = 2 };
+        try Handler.writeListingEntries(&w, io, tmp.dir, &it, @as(?FakeEntry, items[0]), false, 100);
+        try testing.expectEqualStrings("<li><a href=\"a\">a</a></li>\n<li><a href=\"b/\">b/</a></li>\n<li>[listing incomplete]</li>\n", w.buffered());
+    }
+    {
+        var w = Writer.fixed(&buf);
+        var it = FakeIter{ .items = &items, .pos = 1 };
+        try Handler.writeListingEntries(&w, io, tmp.dir, &it, @as(?FakeEntry, items[0]), false, 100);
+        try testing.expect(mem.find(u8, w.buffered(), "incomplete") == null);
+        try testing.expect(mem.find(u8, w.buffered(), "href=\"c\"") != null);
+    }
+}
+
 test "serve: a listing stops at max_listing_entries with a truncation line (sweep 2026-10-28 F-3)" {
     var fx = try Fixture.init();
     defer fx.deinit();
@@ -4257,13 +4396,32 @@ test "serve: a listing stops at max_listing_entries with a truncation line (swee
     try testing.expect(mem.find(u8, resp, "[listing truncated]") != null);
     var n_li: usize = 0;
     var from: usize = 0;
-    while (mem.find(u8, resp[from..], "<li>f")) |i| : (from += i + 1) n_li += 1;
+    while (mem.find(u8, resp[from..], "<li><a href=\"f")) |i| : (from += i + 1) n_li += 1;
     try testing.expectEqual(@as(usize, 3), n_li);
 
     var h_all = Handler.init(io, fx.root, .{ .directory_listing = true });
     const all = get(&h_all, "/many/", &out);
     try testing.expect(mem.find(u8, all, "[listing truncated]") == null);
-    try testing.expect(mem.find(u8, all, "<li>f4.txt</li>") != null);
+    try testing.expect(mem.find(u8, all, "<li><a href=\"f4.txt\">f4.txt</a></li>") != null);
+}
+
+test "Snapshot.realKind: a DT_UNKNOWN entry is classified by a no-follow stat, a known kind is trusted (review 2026-10-24 L9)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "f.txt", .data = "x" });
+    _ = try root.createDirPathOpen(io, "d", .{});
+    try root.symLink(io, "f.txt", "l", .{});
+    try testing.expectEqual(File.Kind.file, Snapshot.realKind(io, root, "f.txt", .unknown));
+    try testing.expectEqual(File.Kind.directory, Snapshot.realKind(io, root, "d", .unknown));
+    // No-follow: a link stays a link, so the walk still never serves it.
+    try testing.expectEqual(File.Kind.sym_link, Snapshot.realKind(io, root, "l", .unknown));
+    // A vanished entry fails closed.
+    try testing.expectEqual(File.Kind.unknown, Snapshot.realKind(io, root, "gone", .unknown));
+    // A kind the filesystem did report is not re-stat'ed.
+    try testing.expectEqual(File.Kind.directory, Snapshot.realKind(io, root, "f.txt", .directory));
 }
 
 test "Snapshot: a file the walk cannot open is left out, not an error; deinit closes every descriptor" {

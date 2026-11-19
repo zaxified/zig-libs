@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — Go 1.26.8 `net/http` `ServeContent`, the reference, answers `Range: bytes=-0` (a zero suffix length, unsatisfiable per RFC 9110 §14.1.1) with a 206 carrying the invalid `Content-Range: bytes 100-99/100`; this module answers 416 (`src/go_oracle_vectors.zig` range shape `bytes=-0`, re-taken by `tools/interop.zig --check`) (measured 2026-10-24) · correctness — Go's `http.FileServer(http.Dir(root))` serves a file OUTSIDE the root through a symlink inside it, directly or through a symlinked directory; this module refuses it (403) by default and verifies containment when following (oracle cases p59, p60) (measured 2026-10-24) · feature — `Snapshot`/`Live` serve with zero syscalls per request from held descriptors and a strong SHA-256 content `ETag` (resumable `If-Range`), republished lock-free with bounded retirement; Go and nginx open, stat and read per request and tag by size+mtime (measured 2026-10-24) · speed — faster than every measured implementation: 0.11–0.55× Go `net/http` `FileServer`, the fastest measured (tower-http 0.7.1 `ServeDir` is slower than Go on every row) (`tools/bench.zig`, `tools/rust_fast_bench`) (measured 2026-10-24)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-18 (39/49, 10 eq) · src a384c1bea5672a61
+**Audit:** review 2026-11-12 · mutation 2026-11-19 (64/78, 14 eq) · src 7fc043c63946e2a3
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STATICFILES_FUZZ) · ct n/a — static file serving (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point: unbounded fingerprint hashing, uncounted directories and unbounded listings capped, Live assert/wrap/intCast made checked)
 
@@ -372,6 +372,8 @@ allocation on the serve path; the 64 KiB streaming buffer is stack-local per req
 
 **Delta mutation (2026-11-12, base `f3168d355`, the test-only F11 counter gate; whole-module run above):** the whole of `resolveForServe`, schemata in a detached copy, ReleaseSafe, strict verdict: 44 mutants, 35 killed, 5 equivalent (`sanitizePath` already refuses `..`; `isSymlinkComponent` on an over-long name fails its stat; one differs only through a race), 4 unobservable (an `Io` whose fstat of an opened file fails; a swap between `openServable`'s stat and open), 0 undecided. 1 new test: a followed file link that leaves the root answers 403 and closes its descriptor. The `is_test` gate is comptime in the test binary, so no mutant on it can differ.
 
+**Delta mutation (2026-11-19, base `04c1315c4`, the DT_UNKNOWN classification and the listing changes; cumulative on the card):** `Snapshot.realKind`, `writeListingEntries`, `writeHrefEscaped` and the `Cache-Control`/`nosniff` lines of `serveDirectory`, schemata in a detached copy, ReleaseSafe, strict verdict: 29 mutants, 25 killed, 4 equivalent or unobservable, 0 undecided. First run left 6 alive; two (`Z` and `0` as unreserved href characters) became a test name `AZaz09`, killed on rerun. Equivalent: the `.head` guard (the server drops a HEAD body, as in the whole-module run), `entry.name.len == 0` (an entry name is never empty, so the `[0]` read behind it is never reached). Unobservable without a filesystem that reports DT_UNKNOWN: the two mutants that bypass `realKind` at its call sites (`walk`, the listing slash); the helper itself is killed through three mutants. Not mutated: the `[listing incomplete]` `break` (a missing break loops forever on a failing iterator, i.e. is a hang the test would catch, no distinct class).
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -433,14 +435,11 @@ spread 13.7 % (Go's `large` row; the margin is 2×).
   §8.8.2.2's one-second rule), which beats the majority (Go `net/http` and nginx compare the date without it). The check is
   `isStrongLastModified` and takes the clock from `io`; the exact one-second boundary cannot be pinned by a
   test (no injectable clock), see the mutation note on the card.
-- **2026-10-24 (review L9) — `Snapshot.walk` skips entries whose `d_type` is DT_UNKNOWN** (some
-  XFS/NFS/FUSE): such files are never served and such directories never walked. Fails closed. Fix:
-  `fstatat` on `.unknown` and dispatch on the real kind; needs a filesystem that reports it to test.
-- **2026-10-24 (review L10) — smaller:** the directory listing ignores `cache_control` and sets no
-  `nosniff`; its entries are not links, and an iteration error truncates a 200 silently;
-  `max_depth * 256` reaches the 8 KiB request-path limit (a deep tree can be snapshotted but not asked
-  for); `TooDeep`/`TooManyFiles` abort the whole rescan, so one new deep directory keeps `Live` on the
-  old generation (reported as `failed`).
+- **DONE 2026-11-19 — 2026-10-24 (review L9) — `Snapshot.walk` skipped entries whose `d_type` is DT_UNKNOWN** (some
+  XFS/NFS/FUSE). Now classified by one no-follow `fstatat` (`Snapshot.realKind`; `find`/`ftw` do the same); a failed stat still skips, a symlink stays unserved. Tested on the helper (no filesystem here reports DT_UNKNOWN).
+- **2026-10-24 (review L10) — smaller, status 2026-11-19:**
+  DONE: the directory listing sets `Cache-Control` (when configured; failure is a 500 like for a file) and `nosniff`; its entries are links (`<a href>` percent-encoded, text HTML-escaped; Go `FileServer` and nginx `autoindex` do the same); an iteration error after the first entry ends the list with `[listing incomplete]` instead of silently shortening a 200 (the status is already sent).
+  Open, DECISION: `max_depth * 256` reaches the 8 KiB request-path limit (a deep tree can be snapshotted but not asked for): the fix is either a clamp of `max_depth` or skipping/refusing over-long paths at `open`, a new error or silent omission; `TooDeep`/`TooManyFiles` abort the whole rescan, so one new deep directory keeps `Live` on the old generation (reported as `failed`): the alternative (publish the partial tree, or skip the offending subtree) trades the fail-closed completeness guarantee for availability.
 
 - ~~**2026-10-19 (audit S15) — `Live` retired generations are unbounded while one request holds an old one.** `Live.reclaim` frees oldest first and stops at the first still-held generation (`src/root.zig` `reclaim`), so one slow download that holds generation N pins every later generation too; each holds a full copy of the path map and arrays plus the descriptors of the files it replaced. Growth is one generation per rescan that saw a change (operator-paced, default 2 s), and ends when the request does (the server's write timeout), so it is bounded in practice, not by the module. Proposed: a `max_retired` cap after which `rescan` returns a new `error.TooManyGenerations` (or skips publishing) until the oldest is released. Owner decision 2026-10-20: FIX (a bounded resource beats every competitor's posture — nginx/Go serve straight from disk and have no generations to pin); prefer "skip publishing + keep serving the current generation" over a new error so `rescan` callers need no change.~~ — done 2026-10-24 (`LiveOptions.max_retired`, `Outcome.held_back`; test "one held generation pins at most max_retired").
 - **2026-10-19 (audit S15) — precompressed siblings are not checked for staleness or size** (`Handler.openVariant`, `Snapshot.build`): a `.gz`/`.br` older than its source, or larger than it, is served as is. nginx `gzip_static` behaves the same; the deploy tool owns consistency. Recorded, not planned.
