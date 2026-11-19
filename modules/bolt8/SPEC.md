@@ -6,7 +6,7 @@
 
 **Scope:** parity — lnd `brontide` (lnd v0.21.3-beta) / LDK `PeerChannelEncryptor` (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-08 · mutation 2026-11-14 (131/137, 6 eq) · src 246bf192f9b13322
+**Audit:** review 2026-10-08 · mutation 2026-11-19 (134/140, 6 eq) · src 3bea2d1c9423e981
 
 *Whole-module mutation run 2026-11-14* (about 540 production lines touched since 2026-10-08): 137 mutants; 131 killed (4 after new tests: rejected seed zeroes `out`, a too-small `sendMessage` buffer spends no nonce, the sweep's hand-set-state paths end in `.failed`; burn/wipe mutants by the ReleaseFast stack probe). 5 equivalent (the `isZero` check before `combMulBase`, which errors on 0 anyway; the length frame's even nonce never reaches 1000 (2); `>=` at a counter that resets at exactly 1000; an oversized body caught by noise's own length check with the same error and state). 1 accepted: the `secureZero` of the seed copy in `dh.KeyPair.generateBody` is invisible to every test because `burn.run(ecc_burn)` zeroes that frame anyway (verified on a plain source copy with the wipe deleted, no mutant switch to distort the frame); kept as defence in depth.
 
@@ -496,9 +496,7 @@ measured run.
 
 ## Backlog / deferred
 
-- **`HandshakeResult` has no wipe helper (sweep 2026-11-14, LOW, additive).** It holds `sk`/`rk`/`ck` in the
-  caller's memory; `Transport.init` copies them, after which the result is dead but only a manual
-  `secureZero` clears it. A `HandshakeResult.deinit` would be additive; left out as an API decision.
+- **`HandshakeResult.wipe()` — DONE 2026-11-19 (additive).** Zeroes `sk`/`rk`/`ck` (`secureZero`, the module's own pattern); `handshake_hash` and `remote_static` are public and stay. Documented on the type: call it after `Transport.init`. Named `wipe`, not `deinit`: the struct owns no resources. Delta mutation 2026-11-19: 3 mutants (each of the three `secureZero` calls skipped), 3 killed by the new test; the card counts are cumulative (old + 3).
 - **Dead-stack copies — MEASURED AND FIXED 2026-10-08 (handshake HIGH, transport MEDIUM).**
   `src/stackprobe_test.zig` (ReleaseFast; needles: both static and both ephemeral keys, `es`/`ee`/
   `se` and their shared-point x, `ck` and the cipher key after each act, `sk`/`rk`; every step on
