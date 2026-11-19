@@ -100,7 +100,46 @@ pub const SecurityPolicy = enum {
             .aes256_sha256_rsapss => "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss",
         };
     }
+
+    /// OPC 10000-7 §6.6.x "MinAsymmetricKeyLength" (bits) of the policy's RSA
+    /// application-certificate key: 2048 for `Basic256Sha256` and
+    /// `Aes256_Sha256_RsaPss` (Aes128_Sha256_RsaOaep has the same row; it is
+    /// not an enum value here). `null` for `.none`. Basic128Rsa15 and
+    /// Basic256 (deprecated, 1024..2048) are not implemented by this module.
+    pub fn minAsymmetricKeyBits(self: SecurityPolicy) ?usize {
+        return switch (self) {
+            .none => null,
+            .basic256sha256, .aes256_sha256_rsapss => 2048,
+        };
+    }
+
+    /// OPC 10000-7 "MaxAsymmetricKeyLength" (bits): 4096 for the policies
+    /// above. `null` for `.none`.
+    pub fn maxAsymmetricKeyBits(self: SecurityPolicy) ?usize {
+        return switch (self) {
+            .none => null,
+            .basic256sha256, .aes256_sha256_rsapss => 4096,
+        };
+    }
+
+    /// Is an RSA modulus of `bits` within the policy's key-length band?
+    /// Always true for `.none`. The comparison is on the exact bit length
+    /// (the spec text: Part 7 lists the band in bits); open62541 compares
+    /// `(bits + 7) / 8` against 256..512 bytes, so it differs only on a
+    /// modulus that is not a whole number of bytes (2041..2047 bits: it
+    /// accepts, this refuses). Real CA/OpenSSL keys are byte-aligned.
+    pub fn allowsKeyBits(self: SecurityPolicy, bits: usize) bool {
+        const lo = self.minAsymmetricKeyBits() orelse return true;
+        const hi = self.maxAsymmetricKeyBits() orelse return true;
+        return bits >= lo and bits <= hi;
+    }
 };
+
+/// A key's length is outside the `SecurityPolicy`'s OPC 10000-7 band
+/// (`SecurityPolicy.minAsymmetricKeyBits` .. `maxAsymmetricKeyBits`). On the
+/// wire this is `BadCertificateUseNotAllowed` for a peer certificate (what
+/// open62541 answers: `rsaNewChannelContext`), never a panic.
+pub const KeyLengthError = error{KeyLengthOutOfPolicy};
 
 /// Basic256Sha256's *asymmetric signature* algorithm URI — the value that
 /// goes into a `SignatureData.Algorithm` field (`CreateSessionResponse.
@@ -208,12 +247,22 @@ pub const ClientCredentials = struct {
         /// application-certificate size for Basic256Sha256 (what
         /// `SecurityLengths.basic256sha256` documents); other sizes work —
         /// all asymmetric lengths are computed from the actual modulus.
-        /// Below 1024 (`rsa.min_modulus_bits`) `generateSelfSigned` returns
-        /// `error.InvalidBits` (Go 1.24's floor, the same as the smallest
-        /// key length OPC UA 10000-7 lists for any RSA security policy);
-        /// 2048 is the policy minimum of Basic256Sha256 and the
-        /// Aes*_RsaOaep policies, and is the caller's to choose.
+        /// Must fit `policy`'s OPC 10000-7 band (2048..4096 for
+        /// Basic256Sha256) or `generateSelfSigned` returns
+        /// `error.KeyLengthOutOfPolicy`; below 1024 (`rsa.min_modulus_bits`)
+        /// `rsa.generate` itself refuses (`error.InvalidBits`, Go 1.24's
+        /// floor) when the band check is skipped.
         modulus_bits: usize = 2048,
+        /// The policy whose key-length band `modulus_bits` must fit
+        /// (`SecurityPolicy.minAsymmetricKeyBits` .. `maxAsymmetricKeyBits`:
+        /// 2048..4096 for `Basic256Sha256`); outside it `generateSelfSigned`
+        /// returns `error.KeyLengthOutOfPolicy` before any prime search.
+        policy: SecurityPolicy = .basic256sha256,
+        /// Testing only (the `rsa` module's `insecure_allow_small_modulus`
+        /// counterpart): skip the policy band above, so a small, fast
+        /// 1024-bit key can drive a test. A peer still refuses such a
+        /// certificate unless it sets the same flag.
+        insecure_allow_key_length_outside_policy: bool = false,
         public_exponent: u64 = 65537,
         /// Certificate `commonName` (`rsa.CertOptions.common_name`).
         common_name: []const u8,
@@ -228,7 +277,7 @@ pub const ClientCredentials = struct {
         application_uri: ?[]const u8 = null,
     };
 
-    pub const GenerateSelfSignedError = rsa.GenerateError || rsa.SelfSignedCertError;
+    pub const GenerateSelfSignedError = rsa.GenerateError || rsa.SelfSignedCertError || KeyLengthError;
 
     /// Generate a fresh RSA key pair (`rsa.generate`) and wrap it in a
     /// self-signed X.509 v3 certificate (`rsa.selfSignedCert`, signed
@@ -257,6 +306,8 @@ pub const ClientCredentials = struct {
         options: GenerateSelfSignedOptions,
         out: *ClientCredentials,
     ) GenerateSelfSignedError!void {
+        if (!options.insecure_allow_key_length_outside_policy and !options.policy.allowsKeyBits(options.modulus_bits))
+            return error.KeyLengthOutOfPolicy;
         var kp: rsa.KeyPair = undefined;
         defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
         try rsa.generate(&kp, random, options.modulus_bits, options.public_exponent);
@@ -365,6 +416,17 @@ pub fn certificatePublicKey(certificate_der: []const u8) CertificatePublicKeyErr
     const spki = x509.spkiOf(certificate_der) catch return error.InvalidCertificate;
     if (!spki.algorithmIs(&x509.safe.oid_rsa_encryption)) return error.InvalidCertificate;
     return rsa.PublicKey.fromDer(spki.key_bits) catch error.InvalidCertificate;
+}
+
+/// `certificatePublicKey` plus the policy's key-length band
+/// (`SecurityPolicy.allowsKeyBits`): a key of 1024/1280 bits under
+/// `Basic256Sha256`, or 4097 bits and up, is `error.KeyLengthOutOfPolicy`
+/// (OPC 10000-7 min 2048 / max 4096; open62541 refuses the same remote
+/// certificate with `BadCertificateUseNotAllowed`). `.none` has no band.
+pub fn certificatePublicKeyForPolicy(policy: SecurityPolicy, certificate_der: []const u8) (CertificatePublicKeyError || KeyLengthError)!rsa.PublicKey {
+    const pk = try certificatePublicKey(certificate_der);
+    if (!policy.allowsKeyBits(pk.bits())) return error.KeyLengthOutOfPolicy;
+    return pk;
 }
 
 /// A DER certificate's `notBefore`/`notAfter`, in Unix seconds.
@@ -483,7 +545,24 @@ pub const SecurityContext = struct {
     /// Populated by `SecureChannel.open` (via `deriveKeys`) once the OPN
     /// client/server nonce exchange has happened; `null` until then.
     keys: ?ChannelKeys = null,
+    /// Testing only: accept own and server RSA keys outside the policy's
+    /// OPC 10000-7 band (`SecurityPolicy.allowsKeyBits`). Off by default:
+    /// `SecureChannel.open` otherwise returns `error.KeyLengthOutOfPolicy`.
+    insecure_allow_key_length_outside_policy: bool = false,
 };
+
+/// The client-side key-length gate, run by `SecureChannel.open` before any
+/// RSA work: this client's own key and the pinned server certificate's key
+/// must both fit `ctx.policy`'s band (open62541 checks the remote certificate
+/// in `rsaNewChannelContext`; own keys at policy creation). Skipped for
+/// `.none` and when `insecure_allow_key_length_outside_policy` is set.
+pub fn checkContextKeyLengths(ctx: SecurityContext) (CertificatePublicKeyError || KeyLengthError)!void {
+    if (ctx.insecure_allow_key_length_outside_policy or ctx.mode == .none) return;
+    if (ctx.credentials) |c| {
+        if (!ctx.policy.allowsKeyBits(c.public_key.bits())) return error.KeyLengthOutOfPolicy;
+    }
+    if (ctx.server_certificate) |cert| _ = try certificatePublicKeyForPolicy(ctx.policy, cert);
+}
 
 // ── Asymmetric (OPN) crypto primitives ───────────────────────────────────
 
@@ -1310,6 +1389,7 @@ test "ClientCredentials.generateSelfSigned" {
         random,
         .{
             .modulus_bits = 1024, // small, only to keep this test fast — see the option's own doc comment
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "opcua-security-test",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1394,7 +1474,7 @@ test "deriveKeys: directions differ, deterministic, matches raw P-SHA256 layout"
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&wiped), 0));
 }
 
-test "generateSelfSigned: modulus_bits under 1024 is a typed error, 1024 works" {
+test "generateSelfSigned: modulus_bits outside the policy band is a typed error; the escape falls back to rsa's 1024 floor" {
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x11)));
     var out: ClientCredentials = undefined;
     const base: ClientCredentials.GenerateSelfSignedOptions = .{
@@ -1402,16 +1482,93 @@ test "generateSelfSigned: modulus_bits under 1024 is a typed error, 1024 works" 
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
     };
+    // Basic256Sha256: 2048..4096 (OPC 10000-7); refused before any prime search.
+    for ([_]usize{ 0, 512, 1022, 1024, 1280, 2047, 4097, 8192 }) |bits| {
+        var o = base;
+        o.modulus_bits = bits;
+        try testing.expectError(error.KeyLengthOutOfPolicy, ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), o, &out));
+    }
+    // The testing escape skips the band; rsa's own 1024 floor still holds.
     for ([_]usize{ 0, 512, 768, 1022 }) |bits| {
         var o = base;
+        o.insecure_allow_key_length_outside_policy = true;
         o.modulus_bits = bits;
         try testing.expectError(error.InvalidBits, ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), o, &out));
     }
     var o = base;
+    o.insecure_allow_key_length_outside_policy = true;
     o.modulus_bits = 1024;
     try ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), o, &out);
     defer out.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1024), out.public_key.bits());
+}
+
+test "SecurityPolicy key-length band: 1024 / 2047 / 2048 / 4096 / 4097 for every RSA policy" {
+    for ([_]SecurityPolicy{ .basic256sha256, .aes256_sha256_rsapss }) |pol| {
+        try testing.expectEqual(@as(?usize, 2048), pol.minAsymmetricKeyBits());
+        try testing.expectEqual(@as(?usize, 4096), pol.maxAsymmetricKeyBits());
+        try testing.expect(!pol.allowsKeyBits(1024));
+        try testing.expect(!pol.allowsKeyBits(2047));
+        try testing.expect(pol.allowsKeyBits(2048));
+        try testing.expect(pol.allowsKeyBits(3072));
+        try testing.expect(pol.allowsKeyBits(4096));
+        try testing.expect(!pol.allowsKeyBits(4097));
+    }
+    try testing.expect(SecurityPolicy.none.allowsKeyBits(0));
+    try testing.expectEqual(@as(?usize, null), SecurityPolicy.none.minAsymmetricKeyBits());
+    try testing.expectEqual(@as(?usize, null), SecurityPolicy.none.maxAsymmetricKeyBits());
+}
+
+test "certificatePublicKeyForPolicy: 1024 / 2047 / 2048 / 4096 / 4097 per policy, typed error" {
+    const test_cert = @import("test_cert.zig");
+    var buf: [2048]u8 = undefined;
+    const cases = [_]struct { bits: usize, ok: bool }{
+        .{ .bits = 1024, .ok = false },
+        .{ .bits = 2047, .ok = false },
+        .{ .bits = 2048, .ok = true },
+        .{ .bits = 4096, .ok = true },
+        .{ .bits = 4097, .ok = false },
+    };
+    for ([_]SecurityPolicy{ .basic256sha256, .aes256_sha256_rsapss }) |pol| {
+        for (cases) |cs| {
+            const der = test_cert.withModulusBits(&buf, cs.bits);
+            // the shell must be a parseable certificate of exactly that length
+            try testing.expectEqual(cs.bits, (try certificatePublicKey(der)).bits());
+            if (cs.ok) {
+                try testing.expectEqual(cs.bits, (try certificatePublicKeyForPolicy(pol, der)).bits());
+            } else {
+                try testing.expectError(error.KeyLengthOutOfPolicy, certificatePublicKeyForPolicy(pol, der));
+            }
+        }
+    }
+    // `.none` has no band; garbage is still InvalidCertificate, not a band error.
+    const small = test_cert.withModulusBits(&buf, 1024);
+    _ = try certificatePublicKeyForPolicy(.none, small);
+    try testing.expectError(error.InvalidCertificate, certificatePublicKeyForPolicy(.basic256sha256, "not a certificate"));
+}
+
+test "checkContextKeyLengths: own key and server certificate, escape and .none skip it" {
+    const test_cert = @import("test_cert.zig");
+    var buf: [2048]u8 = undefined;
+    const good = test_cert.withModulusBits(&buf, 2048);
+    var buf2: [2048]u8 = undefined;
+    const small = test_cert.withModulusBits(&buf2, 1024);
+    var buf3: [2048]u8 = undefined;
+    const big = test_cert.withModulusBits(&buf3, 4097);
+    var ctx: SecurityContext = .{ .policy = .basic256sha256, .mode = .sign, .server_certificate = good };
+    try checkContextKeyLengths(ctx);
+    ctx.server_certificate = small;
+    try testing.expectError(error.KeyLengthOutOfPolicy, checkContextKeyLengths(ctx));
+    ctx.server_certificate = big;
+    try testing.expectError(error.KeyLengthOutOfPolicy, checkContextKeyLengths(ctx));
+    ctx.server_certificate = "junk";
+    try testing.expectError(error.InvalidCertificate, checkContextKeyLengths(ctx));
+    ctx.insecure_allow_key_length_outside_policy = true;
+    ctx.server_certificate = small;
+    try checkContextKeyLengths(ctx);
+    ctx.insecure_allow_key_length_outside_policy = false;
+    ctx.mode = .none;
+    try checkContextKeyLengths(ctx);
 }
 
 test "asymmetricEncrypt -> asymmetricDecrypt round-trip (multi-block)" {
@@ -1549,6 +1706,7 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
         random,
         .{
             .modulus_bits = 1024,
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "seal-open-client",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1562,6 +1720,7 @@ test "sealAsymmetricMessage -> openAsymmetricMessage round-trip (two key pairs)"
         random,
         .{
             .modulus_bits = 1280, // deliberately a different size than the client's
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "seal-open-server",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1840,6 +1999,7 @@ test "certificateValidity: notBefore/notAfter come back out of a certificate we 
         prng.random(),
         .{
             .modulus_bits = 1024,
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "validity-test",
             .not_before = "260101000000Z", // 2026-01-01T00:00:00Z
             .not_after = "270101000000Z", // 2027-01-01T00:00:00Z
@@ -1887,6 +2047,7 @@ test "hostile certificates: truncation, tampering and garbage are typed errors, 
         prng.random(),
         .{
             .modulus_bits = 1024,
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "hostile-cert-test",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -2000,6 +2161,7 @@ fn certificateCorpusCredentials(allocator: std.mem.Allocator, out: *ClientCreden
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5A)));
     return ClientCredentials.generateSelfSigned(allocator, prng.random(), .{
         .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
         .common_name = "fuzz-corpus",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
@@ -2087,7 +2249,7 @@ const OpnRig = struct {
         const random = rig.random_state.random();
         const opts = struct {
             fn make(bits: usize, name: []const u8) ClientCredentials.GenerateSelfSignedOptions {
-                return .{ .modulus_bits = bits, .common_name = name, .not_before = "260101000000Z", .not_after = "270101000000Z" };
+                return .{ .modulus_bits = bits, .insecure_allow_key_length_outside_policy = true, .common_name = name, .not_before = "260101000000Z", .not_after = "270101000000Z" };
             }
         };
         try ClientCredentials.generateSelfSigned(testing.allocator, random, opts.make(1024, "forge-client"), &rig.client);

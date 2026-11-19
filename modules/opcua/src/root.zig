@@ -153,6 +153,9 @@ pub const SecureChannel = struct {
 
         const security_mode: services.MessageSecurityMode = if (options.security) |sec| sec.mode else .none;
         const secure = security_mode != .none;
+        // OPC 10000-7 key-length band of the policy, own key and server
+        // certificate, before any nonce or RSA work.
+        if (options.security) |sec| try security.checkContextKeyLengths(sec);
 
         // OPC 10000-6 §6.7.5: the nonce length matches the symmetric key
         // length (32 for the Sha256-keyed profiles). It is key material —
@@ -1606,6 +1609,41 @@ test "Session.readAttribute: single-node/single-attribute ergonomic helper" {
     try testing.expectEqual(@as(f64, 21.5), dv.value.?.scalar.double);
 }
 
+test "SecureChannel.open refuses a server certificate or an own key outside the policy band, before any I/O" {
+    const testing = std.testing;
+    const test_cert = @import("test_cert.zig");
+    var conn: transport.Connection = undefined; // never touched: the gate runs first
+    var ch: SecureChannel = undefined;
+    var buf: [2048]u8 = undefined;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x21)));
+    for ([_]usize{ 1024, 2047, 4097 }) |bits| {
+        const der = test_cert.withModulusBits(&buf, bits);
+        try testing.expectError(error.KeyLengthOutOfPolicy, SecureChannel.open(&conn, testing.allocator, .{ .security = .{
+            .policy = .basic256sha256,
+            .mode = .sign_and_encrypt,
+            .server_certificate = der,
+            .random = prng.random(),
+        } }, &ch));
+    }
+    // An own key out of band is refused the same way (a 1024-bit client).
+    var creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, prng.random(), .{
+        .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "short-client",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+    }, &creds);
+    defer creds.deinit(testing.allocator);
+    try testing.expectError(error.KeyLengthOutOfPolicy, SecureChannel.open(&conn, testing.allocator, .{ .security = .{
+        .policy = .basic256sha256,
+        .mode = .sign,
+        .credentials = creds,
+        .server_certificate = test_cert.withModulusBits(&buf, 2048),
+        .random = prng.random(),
+    } }, &ch));
+}
+
 test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/SignAndEncrypt) -> derived keys agree -> symmetric MSG round-trip" {
     // Drives the REAL client code path (`SecureChannel.open` +
     // `Channel.call`) with SecurityMode=SignAndEncrypt against a
@@ -1626,6 +1664,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         random,
         .{
             .modulus_bits = 1024,
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "secure-selftest-client",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1640,6 +1679,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         random,
         .{
             .modulus_bits = 1280,
+            .insecure_allow_key_length_outside_policy = true,
             .common_name = "secure-selftest-server",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1700,6 +1740,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         .{
             .security = .{
                 .policy = .basic256sha256,
+                .insecure_allow_key_length_outside_policy = true,
                 .mode = .sign_and_encrypt,
                 .credentials = client_creds,
                 .server_certificate = server_creds.certificate_der,
@@ -2501,6 +2542,7 @@ fn liveSecureSequence(
         .{
             .security = .{
                 .policy = .basic256sha256,
+                .insecure_allow_key_length_outside_policy = true,
                 .mode = mode,
                 .credentials = credentials,
                 .server_certificate = server_certificate,
@@ -2767,6 +2809,7 @@ test "secure offline scripted: a secured OpenSecureChannel answer with an empty 
     var client_creds: security.ClientCredentials = undefined;
     try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
         .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
         .common_name = "empty-nonce-client",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
@@ -2776,6 +2819,7 @@ test "secure offline scripted: a secured OpenSecureChannel answer with an empty 
     var server_creds: security.ClientCredentials = undefined;
     try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
         .modulus_bits = 1280,
+        .insecure_allow_key_length_outside_policy = true,
         .common_name = "empty-nonce-server",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
@@ -2820,6 +2864,7 @@ test "secure offline scripted: a secured OpenSecureChannel answer with an empty 
     try testing.expectError(error.InvalidSecureMessage, SecureChannel.open(&conn, testing.allocator, .{
         .security = .{
             .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
             .mode = .sign_and_encrypt,
             .credentials = client_creds,
             .server_certificate = server_creds.certificate_der,

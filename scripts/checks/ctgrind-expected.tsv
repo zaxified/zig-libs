@@ -1850,8 +1850,8 @@ iec62351	ReleaseFast	mac	1	0	ff413992e4aa0c2f	760ede68c6c5b472
 # what follows it on the AUTHENTICATED plaintext: the padding-byte checks
 # (834-840) and the dupe/alloc/free of the unpadded body (its length). The
 # padding is checked only after the MAC, so it is no padding oracle.
-opcua	ReleaseFast	kdf	1	0	3090a3ee931d2e77	29be2a7621f75ceb
-opcua	ReleaseFast	chunk	1	14	3090a3ee931d2e77	17e08703a66ffe0f
+opcua	ReleaseFast	kdf	1	0	77b4ff42d2f268d8	29be2a7621f75ceb
+opcua	ReleaseFast	chunk	1	14	77b4ff42d2f268d8	17e08703a66ffe0f
 # sha2 (2026-10-10) — hash: the message tainted through hash/update/peek for
 # SHA-224/256/384/512 at 0..1000 bytes; hmac: std Hmac over sha2.Sha256/512
 # with key + message tainted. Both 0.
@@ -2332,7 +2332,7 @@ aeadframe	ReleaseFast	aes	1	157	35be1b2969cbd483	9e2cdfce46f95d92	cpu=x86_64 con
 ctap2	ReleaseFast	pin	1	100	aadf4e9173f1e8f9	01e08eb2902d2802	cpu=x86_64 control=6 trap=6
 ctap2	ReleaseFast	token	1	68	aadf4e9173f1e8f9	e927dca40cedb432	cpu=x86_64 control=4 trap=4
 dnp3	ReleaseFast	keys	1	121	2ff4825a5c6f1f58	d2337903af778cbe	cpu=x86_64 control=2 trap=6
-opcua	ReleaseFast	chunk	1	134	3090a3ee931d2e77	17e08703a66ffe0f	cpu=x86_64 control=2 trap=34
+opcua	ReleaseFast	chunk	1	134	77b4ff42d2f268d8	17e08703a66ffe0f	cpu=x86_64 control=2 trap=34
 snmp	ReleaseFast	aes	1	312	f7b2d59406205574	07f7c9867f83b17e	cpu=x86_64 control=12 trap=12
 aes192	ReleaseFast	enc	1	128	91e9bb5ec00b01a9	0c5f76d6ab016242	cpu=x86_64
 aes192	ReleaseFast	dec	1	304	91e9bb5ec00b01a9	68602ef849690825	cpu=x86_64
