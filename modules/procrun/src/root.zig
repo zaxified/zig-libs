@@ -118,6 +118,10 @@ pub const EnvMode = enum {
 /// environ_map`'s `PATH` is never consulted for this resolution) —
 /// including under `Spec.rlimit` (`resolveArgv0ForRlimit`; fixed 2026-09-10,
 /// see F2 in the audit record — it did not hold there before).
+///
+/// A NUL byte inside any `argv` element, `cwd`, or (when `env_mode` uses it)
+/// an `env` value is `error.NulByte`, returned before anything is
+/// spawned (Go `os/exec` and Rust `Command` refuse the same way).
 pub const Spec = struct {
     argv: []const []const u8,
     /// Overriding / explicit environment. Interpreted per `env_mode`.
@@ -661,7 +665,26 @@ fn toStdIo(m: StdioMode) std.process.SpawnOptions.StdIo {
     };
 }
 
+/// `error.NulByte` for an interior NUL in anything handed to the kernel as a C
+/// string: every `argv` element, `cwd`, and (unless `env_mode == .inherit`,
+/// which ignores `Spec.env`) every `env` value (`Environ.Map.put` already
+/// asserts a key has none). Go's `os/exec`
+/// (`syscall.ByteSliceFromString` -> EINVAL) and Rust's `Command` ("nul byte
+/// found in provided data") refuse these before spawning; truncating at the
+/// NUL would run a different program or argument than the caller wrote.
+fn rejectNul(spec: Spec) error{NulByte}!void {
+    for (spec.argv) |a| if (std.mem.findScalar(u8, a, 0) != null) return error.NulByte;
+    if (spec.cwd) |c| if (std.mem.findScalar(u8, c, 0) != null) return error.NulByte;
+    if (spec.env_mode != .inherit) if (spec.env) |m| {
+        var it = m.iterator();
+        while (it.next()) |e| {
+            if (std.mem.findScalar(u8, e.value_ptr.*, 0) != null) return error.NulByte;
+        }
+    };
+}
+
 fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child {
+    try rejectNul(spec);
     var env_holder: ?std.process.Environ.Map = null;
     defer if (env_holder) |*m| m.deinit();
 
@@ -2767,6 +2790,30 @@ test "stderr = .stdout is rejected where it has no meaning" {
         .argv = &.{"true"},
         .stdin = .stdout,
     }, ""));
+}
+
+test "NUL inside argv, cwd or env is refused before spawning (error.NulByte)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try testing.expectError(error.NulByte, run(testing.allocator, io, .{ .argv = &.{ "echo", "a\x00b" } }, ""));
+    try testing.expectError(error.NulByte, run(testing.allocator, io, .{ .argv = &.{"tr\x00ue"} }, ""));
+    try testing.expectError(error.NulByte, run(testing.allocator, io, .{ .argv = &.{"true"}, .cwd = "/\x00tmp" }, ""));
+
+    var m = std.process.Environ.Map.init(testing.allocator);
+    defer m.deinit();
+    try m.put("K", "v\x00w");
+    try testing.expectError(error.NulByte, run(testing.allocator, io, .{ .argv = &.{"true"}, .env = &m, .env_mode = .clear }, ""));
+    try testing.expectError(error.NulByte, run(testing.allocator, io, .{ .argv = &.{"true"}, .env = &m, .env_mode = .merge }, ""));
+    try testing.expectError(error.NulByte, spawnStreaming(testing.allocator, io, .{ .argv = &.{ "echo", "a\x00b" } }, .{}));
+
+    // `.inherit` ignores `Spec.env`, so a NUL there is not an error; clean input still runs.
+    var ok = try run(testing.allocator, io, .{ .argv = &.{ "echo", "ab" }, .env = &m, .env_mode = .inherit }, "");
+    defer ok.deinit(testing.allocator);
+    try testing.expectEqualStrings("ab\n", ok.stdout);
 }
 
 test ".ignore: stdout is discarded however much the child writes; stdin reads EOF at once" {
