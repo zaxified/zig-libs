@@ -10407,3 +10407,407 @@ test "root client over a pipe (Sign): a CreateSession answer signed with another
     rig.srv.config.security.?.credentials.private_key = other.private_key;
     try testing.expectError(error.InvalidSecureMessage, root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url }));
 }
+
+// ── opcua3: client-side TranslateBrowsePaths / ModifyMonitoredItems / SetMonitoringMode ──
+
+/// The request the client just sent (`PipeReader.last`, a `#None` chunk:
+/// 8-byte message header, 16 bytes of channel/token/sequence/request ids,
+/// the type id, the body), decoded with `decodeFn` into `arena`.
+fn lastRequest(pipe: *const PipeReader, arena: std.mem.Allocator, comptime Req: type, comptime decodeFn: fn (*encoding.Decoder) encoding.DecodeError!Req) !Req {
+    var r: std.Io.Reader = .fixed(pipe.last.items[8 + 16 ..]);
+    var d = encoding.Decoder.init(&r, arena);
+    _ = try d.decodeNodeId();
+    return decodeFn(&d);
+}
+
+/// The root client wired to a rig over `PipeReader` at SecurityPolicy#None,
+/// session activated: what the three client-service tests below share.
+const PipeClient = struct {
+    rig: TestRig,
+    rbuf: [4096]u8,
+    pipe: PipeReader,
+    conn: transport.Connection,
+    channel: @import("root.zig").SecureChannel,
+    session: @import("root.zig").Session,
+
+    fn start(pc: *PipeClient, gpa: std.mem.Allocator) !void {
+        const root = @import("root.zig");
+        try pc.rig.init(gpa, TestRig.defaultConfig());
+        errdefer pc.rig.deinit();
+        pc.pipe.setup(&pc.rig, &pc.rbuf);
+        pc.conn = transport.Connection.init(&pc.pipe.reader, &pc.rig.client_out.writer);
+        _ = try pc.conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+        try root.SecureChannel.open(&pc.conn, gpa, .{}, &pc.channel);
+        pc.session = try root.Session.create(&pc.channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url });
+        try pc.session.activate(null);
+    }
+
+    fn deinit(pc: *PipeClient) void {
+        pc.session.deinit();
+        pc.pipe.last.deinit(pc.rig.gpa);
+        pc.rig.deinit();
+    }
+};
+
+test "root client over a pipe: translateBrowsePaths resolves forward, inverse and failing paths per entry" {
+    const gpa = testing.allocator;
+    var pc: PipeClient = undefined;
+    try pc.start(gpa);
+    defer pc.deinit();
+
+    const forward = [_]services.RelativePathElement{
+        .{ .reference_type_id = nodestore.n0(nodestore.id.organizes), .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = "Objects" } },
+        .{ .reference_type_id = nodestore.n0(nodestore.id.organizes), .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 1, .name = "Device" } },
+        .{ .reference_type_id = nodestore.n0(nodestore.id.has_component), .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 1, .name = "the.answer" } },
+    };
+    const inverse = [_]services.RelativePathElement{
+        .{ .reference_type_id = nodestore.n0(nodestore.id.has_component), .is_inverse = true, .include_subtypes = false, .target_name = .{ .namespace_index = 1, .name = "Device" } },
+    };
+    const missing = [_]services.RelativePathElement{
+        .{ .reference_type_id = nodestore.n0(nodestore.id.organizes), .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = "NoSuchChild" } },
+    };
+    const root_folder = nodestore.n0(nodestore.id.root_folder);
+    const paths = [_]services.BrowsePath{
+        .{ .starting_node = root_folder, .relative_path = .{ .elements = &forward } },
+        .{ .starting_node = pc.rig.answer_id, .relative_path = .{ .elements = &inverse } },
+        .{ .starting_node = root_folder, .relative_path = .{ .elements = &missing } },
+        .{ .starting_node = nodestore.n0(999_999), .relative_path = .{ .elements = &forward } },
+        .{ .starting_node = root_folder, .relative_path = .{ .elements = &.{} } },
+    };
+    const response = try pc.session.translateBrowsePaths(&paths);
+    defer services.freeTranslateBrowsePathsToNodeIdsResponse(gpa, response);
+    {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const req = try lastRequest(&pc.pipe, arena.allocator(), services.TranslateBrowsePathsToNodeIdsRequest, services.decodeTranslateBrowsePathsToNodeIdsRequest);
+        try testing.expect(services.nodeIdEql(req.request_header.authentication_token, pc.session.authentication_token));
+        try testing.expectEqual(@as(usize, 5), req.browse_paths.?.len);
+        try testing.expectEqual(@as(usize, 3), req.browse_paths.?[0].relative_path.elements.?.len);
+    }
+    const results = response.results.?;
+    try testing.expectEqual(@as(usize, 5), results.len);
+    try testing.expectEqual(status.good, results[0].status_code);
+    try testing.expect(services.nodeIdEql(pc.rig.answer_id, results[0].targets.?[0].target_id.node_id));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), results[0].targets.?[0].remaining_path_index);
+    try testing.expectEqual(status.good, results[1].status_code);
+    try testing.expect(services.nodeIdEql(pc.rig.device_id, results[1].targets.?[0].target_id.node_id));
+    try testing.expectEqual(status.bad_no_match, results[2].status_code);
+    try testing.expect(results[2].targets == null);
+    try testing.expectEqual(status.bad_node_id_unknown, results[3].status_code);
+    try testing.expectEqual(status.bad_nothing_to_do, results[4].status_code);
+
+    // the resolved id is usable: read it back through the same session
+    const value = try pc.session.readAttribute(results[0].targets.?[0].target_id.node_id, services.attribute_id.value);
+    defer encoding.freeDataValue(gpa, value);
+    try testing.expectEqual(@as(i32, 42), value.value.?.scalar.int32);
+
+    // an empty request is a ServiceFault, with the server's status kept on the channel
+    try testing.expectError(error.ServiceFault, pc.session.translateBrowsePaths(&.{}));
+    try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
+}
+
+test "root client over a pipe: modifyMonitoredItems re-labels and re-tunes items; a Bad result leaves the bookkeeping alone" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var pc: PipeClient = undefined;
+    try pc.start(gpa);
+    defer pc.deinit();
+
+    var sub = try root.Subscription.create(&pc.session, gpa, .{ .requested_publishing_interval_ms = 100 });
+    defer sub.deinit();
+    const specs = [_]root.Subscription.MonitoredItemSpec{
+        .{ .node_id = pc.rig.answer_id, .client_handle = 10, .sampling_interval_ms = 1000, .queue_size = 1 },
+        .{ .node_id = pc.rig.answer_id, .client_handle = 11, .sampling_interval_ms = 1000, .queue_size = 1 },
+    };
+    const created = try sub.createMonitoredItems(&specs, .both);
+    defer services.freeCreateMonitoredItemsResponse(gpa, created);
+    const id10 = sub.findMonitoredItem(10).?;
+    const id11 = sub.findMonitoredItem(11).?;
+
+    // a good modify: parameters land on the server, the handle table follows the new ClientHandle
+    pc.rig.now_ms = 2_000;
+    const mods = [_]root.Subscription.MonitoredItemModifySpec{
+        .{ .monitored_item_id = id10, .client_handle = 77, .sampling_interval_ms = 250, .queue_size = 5, .discard_oldest = false },
+        .{ .monitored_item_id = 123_456, .client_handle = 55 },
+    };
+    {
+        const r = try sub.modifyMonitoredItems(&mods, .server);
+        defer services.freeModifyMonitoredItemsResponse(gpa, r);
+        // what went on the wire
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const req = try lastRequest(&pc.pipe, arena.allocator(), services.ModifyMonitoredItemsRequest, services.decodeModifyMonitoredItemsRequest);
+        try testing.expectEqual(sub.subscription_id, req.subscription_id);
+        try testing.expectEqual(services.TimestampsToReturn.server, req.timestamps_to_return);
+        try testing.expect(services.nodeIdEql(req.request_header.authentication_token, pc.session.authentication_token));
+        try testing.expectEqual(@as(usize, 2), req.items_to_modify.?.len);
+        try testing.expectEqual(id10, req.items_to_modify.?[0].monitored_item_id);
+        try testing.expectEqual(@as(u32, 123_456), req.items_to_modify.?[1].monitored_item_id);
+        const results = r.results.?;
+        try testing.expectEqual(@as(usize, 2), results.len);
+        try testing.expectEqual(status.good, results[0].status_code);
+        try testing.expectEqual(@as(f64, 250), results[0].revised_sampling_interval);
+        try testing.expectEqual(@as(u32, 5), results[0].revised_queue_size);
+        try testing.expectEqual(status.bad_monitored_item_id_invalid, results[1].status_code);
+    }
+    {
+        const it = mutSub(&pc.rig, 0).findItem(id10).?;
+        try testing.expectEqual(@as(u32, 77), it.client_handle);
+        try testing.expectEqual(@as(f64, 250), it.sampling_interval_ms);
+        try testing.expectEqual(@as(u32, 5), it.queue_size);
+        try testing.expect(!it.discard_oldest);
+    }
+    try testing.expectEqual(id10, sub.findMonitoredItem(77).?);
+    try testing.expect(sub.findMonitoredItem(10) == null);
+    try testing.expect(sub.findMonitoredItem(55) == null);
+    try testing.expectEqual(id11, sub.findMonitoredItem(11).?);
+    try testing.expectEqual(@as(usize, 2), sub.monitored_items.items.len);
+
+    // an item the server no longer has answers Bad: the client entry keeps its handle
+    {
+        var gone = mutSub(&pc.rig, 0).monitored_items.orderedRemove(1);
+        gone.deinit(gpa);
+    }
+    const stale = [_]root.Subscription.MonitoredItemModifySpec{.{ .monitored_item_id = id11, .client_handle = 99 }};
+    {
+        const r = try sub.modifyMonitoredItems(&stale, .both);
+        defer services.freeModifyMonitoredItemsResponse(gpa, r);
+        try testing.expectEqual(status.bad_monitored_item_id_invalid, r.results.?[0].status_code);
+    }
+    try testing.expectEqual(id11, sub.findMonitoredItem(11).?);
+    try testing.expect(sub.findMonitoredItem(99) == null);
+
+    // an empty list is a ServiceFault
+    try testing.expectError(error.ServiceFault, sub.modifyMonitoredItems(&.{}, .both));
+    try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
+}
+
+test "root client over a pipe: setMonitoringMode switches items between disabled, sampling and reporting" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var pc: PipeClient = undefined;
+    try pc.start(gpa);
+    defer pc.deinit();
+
+    var sub = try root.Subscription.create(&pc.session, gpa, .{ .requested_publishing_interval_ms = 100 });
+    defer sub.deinit();
+    const specs = [_]root.Subscription.MonitoredItemSpec{
+        .{ .node_id = pc.rig.answer_id, .client_handle = 10 },
+        .{ .node_id = pc.rig.answer_id, .client_handle = 11 },
+    };
+    const created = try sub.createMonitoredItems(&specs, .both);
+    defer services.freeCreateMonitoredItemsResponse(gpa, created);
+    const id10 = sub.findMonitoredItem(10).?;
+    const id11 = sub.findMonitoredItem(11).?;
+    const server_sub = mutSub(&pc.rig, 0);
+    try testing.expect(server_sub.findItem(id10).?.monitoring_mode == .reporting);
+
+    const modes = [_]services.MonitoringMode{ .sampling, .disabled, .reporting };
+    for (modes) |mode| {
+        const ids = [_]u32{ id10, 123_456, id11 };
+        const r = try sub.setMonitoringMode(mode, &ids);
+        defer services.freeSetMonitoringModeResponse(gpa, r);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const req = try lastRequest(&pc.pipe, arena.allocator(), services.SetMonitoringModeRequest, services.decodeSetMonitoringModeRequest);
+        try testing.expectEqual(sub.subscription_id, req.subscription_id);
+        try testing.expectEqual(mode, req.monitoring_mode);
+        try testing.expect(services.nodeIdEql(req.request_header.authentication_token, pc.session.authentication_token));
+        try testing.expectEqualSlices(u32, &ids, req.monitored_item_ids.?);
+        const results = r.results.?;
+        try testing.expectEqual(@as(usize, 3), results.len);
+        try testing.expectEqual(status.good, results[0]);
+        try testing.expectEqual(status.bad_monitored_item_id_invalid, results[1]);
+        try testing.expectEqual(status.good, results[2]);
+        try testing.expect(server_sub.findItem(id10).?.monitoring_mode == mode);
+        try testing.expect(server_sub.findItem(id11).?.monitoring_mode == mode);
+    }
+    // only the named item moves
+    {
+        const r = try sub.setMonitoringMode(.disabled, &.{id11});
+        defer services.freeSetMonitoringModeResponse(gpa, r);
+        try testing.expect(server_sub.findItem(id10).?.monitoring_mode == .reporting);
+        try testing.expect(server_sub.findItem(id11).?.monitoring_mode == .disabled);
+    }
+    try testing.expectError(error.ServiceFault, sub.setMonitoringMode(.reporting, &.{}));
+    try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
+}
+
+/// Send a Read of the answer variable through `ch`, which the caller has
+/// dressed in whatever token and keys it wants to test.
+fn sendReadAnswer(rig: *const TestRig, ch: *services.Channel, auth_token: encoding.NodeId) !void {
+    const nodes = [_]services.ReadValueId{.{
+        .node_id = rig.answer_id,
+        .attribute_id = services.attribute_id.value,
+        .index_range = null,
+        .data_encoding = .{ .namespace_index = 0, .name = null },
+    }};
+    try ch.sendService(.message, services.type_id.read_request, services.ReadRequest, .{
+        .request_header = ch.nextRequestHeader(auth_token, 10_000),
+        .max_age = 0,
+        .timestamps_to_return = .both,
+        .nodes_to_read = &nodes,
+    }, services.encodeReadRequest);
+}
+
+test "root client over a pipe (SignAndEncrypt): renewal timeline at 75 % of the lifetime, old token accepted through the overlap and not past it" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x73)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var config = secureTestConfig(endpoints, pki);
+    config.security.?.min_token_lifetime_ms = 1_000;
+    config.security.?.token_renewal_overlap_ms = 5_000;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, config);
+    defer rig.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var pipe: PipeReader = undefined;
+    pipe.setup(&rig, &rbuf);
+    defer pipe.last.deinit(gpa);
+    var conn = transport.Connection.init(&pipe.reader, &rig.client_out.writer);
+    _ = try conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+
+    // The injected clock is the rig's: the server reads `rig.now_ms`, the client is told it.
+    rig.now_ms = 0;
+    var channel: root.SecureChannel = undefined;
+    try root.SecureChannel.open(&conn, gpa, .{
+        .requested_lifetime_ms = 10_000,
+        .now_ms = 0,
+        .security = .{
+            .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
+            .mode = .sign_and_encrypt,
+            .credentials = pki.client,
+            .server_certificate = pki.server.certificate_der,
+            .random = rig.prng.random(),
+        },
+    }, &channel);
+    var session = try root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url });
+    defer session.deinit();
+    try session.activate(null);
+    const token1 = channel.io.token_id;
+    const keys1 = channel.io.security.?.keys.?;
+    try testing.expectEqual(@as(u32, 10_000), channel.token_lifetime_ms);
+
+    // not due before 7 500 ms, due from it; a call before that renews nothing
+    try testing.expect(!channel.renewalDue(7_499));
+    try testing.expect(channel.renewalDue(7_500));
+    rig.now_ms = 7_499;
+    try testing.expect(!try channel.renewIfDue(7_499, .{}));
+    try testing.expectEqual(token1, channel.io.token_id);
+
+    // renew at 7 500: new token and keys, same channel, same lifetime, the clock restarts
+    rig.now_ms = 7_500;
+    const channel_id = channel.io.channel_id;
+    try testing.expect(try channel.renewIfDue(7_500, .{}));
+    const token2 = channel.io.token_id;
+    try testing.expect(token2 != token1);
+    try testing.expectEqual(channel_id, channel.io.channel_id);
+    try testing.expectEqual(token1, rig.conn.prev_token_id);
+    try testing.expectEqual(token2, rig.conn.token_id);
+    try testing.expectEqual(@as(i64, 10_000), rig.conn.prev_token_valid_until_ms); // min(old expiry 10 000, 7 500 + 5 000)
+    try testing.expectEqual(@as(u32, 10_000), channel.token_lifetime_ms);
+    try testing.expectEqual(@as(i64, 7_500), channel.token_installed_ms);
+    try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&keys1), std.mem.asBytes(&channel.io.security.?.keys.?)));
+    try testing.expect(!channel.renewalDue(7_501));
+    try testing.expect(!channel.renewalDue(14_999));
+    try testing.expect(channel.renewalDue(15_000));
+
+    // the session carries on under the new token
+    rig.now_ms = 7_600;
+    {
+        const value = try session.readAttribute(rig.answer_id, services.attribute_id.value);
+        defer encoding.freeDataValue(gpa, value);
+        try testing.expectEqual(@as(i32, 42), value.value.?.scalar.int32);
+    }
+
+    // A message sealed under the OLD token and keys, sent at the last instant of the
+    // overlap, is served (the answer comes back under the new keys).
+    {
+        var forge = channel.io;
+        forge.token_id = token1;
+        forge.security.?.keys = keys1;
+        rig.now_ms = 10_000;
+        try sendReadAnswer(&rig, &forge, session.authentication_token);
+        channel.io.request_id = forge.request_id;
+        channel.io.sequence_number = forge.sequence_number;
+        const response = try channel.io.recvService(.message, services.ReadResponse, services.type_id.read_response, services.decodeReadResponse, services.result_fns.read);
+        defer services.freeReadResponse(gpa, response);
+        try testing.expectEqual(@as(i32, 42), response.results.?[0].value.?.scalar.int32);
+    }
+    // ... and one millisecond later the old token is gone (the connection is torn down)
+    {
+        var forge = channel.io;
+        forge.token_id = token1;
+        forge.security.?.keys = keys1;
+        rig.now_ms = 10_001;
+        try sendReadAnswer(&rig, &forge, session.authentication_token);
+        channel.io.request_id = forge.request_id;
+        channel.io.sequence_number = forge.sequence_number;
+        try testing.expectError(error.ServerError, channel.io.recvService(.message, services.ReadResponse, services.type_id.read_response, services.decodeReadResponse, services.result_fns.read));
+        try testing.expect(rig.conn.isClosed());
+    }
+}
+
+test "root client over a pipe (SignAndEncrypt): a second renewal chains, a requested lifetime is revised, a closed channel cannot renew" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x74)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var config = secureTestConfig(endpoints, pki);
+    config.security.?.min_token_lifetime_ms = 1_000;
+    config.security.?.max_token_lifetime_ms = 20_000;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, config);
+    defer rig.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var pipe: PipeReader = undefined;
+    pipe.setup(&rig, &rbuf);
+    defer pipe.last.deinit(gpa);
+    var conn = transport.Connection.init(&pipe.reader, &rig.client_out.writer);
+    _ = try conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+
+    var channel: root.SecureChannel = undefined;
+    try root.SecureChannel.open(&conn, gpa, .{
+        .requested_lifetime_ms = 8_000,
+        .now_ms = 1_000,
+        .security = .{
+            .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
+            .mode = .sign,
+            .credentials = pki.client,
+            .server_certificate = pki.server.certificate_der,
+            .random = rig.prng.random(),
+        },
+    }, &channel);
+    try testing.expectEqual(@as(i64, 1_000), channel.token_installed_ms);
+    // due at 1 000 + 6 000
+    try testing.expect(!channel.renewalDue(6_999));
+    try testing.expect(channel.renewalDue(7_000));
+
+    // two renewals in a row; the second asks for more than the server allows and is clamped
+    const t1 = channel.io.token_id;
+    rig.now_ms = 7_000;
+    try channel.renew(7_000, .{});
+    const t2 = channel.io.token_id;
+    try testing.expect(t2 != t1);
+    try testing.expectEqual(@as(u32, 8_000), channel.token_lifetime_ms); // null = the lifetime it has
+    rig.now_ms = 12_999;
+    try channel.renew(12_999, .{ .requested_lifetime_ms = 99_000 });
+    try testing.expect(channel.io.token_id != t2);
+    try testing.expectEqual(@as(u32, 20_000), channel.token_lifetime_ms);
+    try testing.expectEqual(@as(i64, 12_999), channel.token_installed_ms);
+
+    // the channel still works, and once closed (keys gone) a renewal is refused before any I/O
+    var session = try root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url });
+    defer session.deinit();
+    try channel.close();
+    try testing.expectError(error.InvalidSecureMessage, channel.renew(13_000, .{}));
+}

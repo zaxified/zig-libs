@@ -112,8 +112,25 @@ test {
 /// `sendAsymmetricOPNMessage`/`sendSymmetricMessage` split).
 pub const SecureChannel = struct {
     io: services.Channel,
+    /// The server's clock reading when it issued the current token
+    /// (`ChannelSecurityToken.CreatedAt`).
     token_created_at: encoding.DateTime = 0,
+    /// The server's revised token lifetime, milliseconds.
     token_lifetime_ms: u32 = 0,
+    /// The caller's own clock reading (`OpenOptions.now_ms` / the `now_ms` of
+    /// the last `renew`) when the current token arrived; `renewalDue` counts
+    /// from it. Not a wire field.
+    token_installed_ms: i64 = 0,
+    /// The renewal is never due sooner than this many milliseconds after the
+    /// token arrived, so a server that revises the lifetime down to a few
+    /// milliseconds cannot make `renewIfDue` cost an RSA operation per request.
+    /// node-opcua's client does the same (its renewal timer is
+    /// `max(75 % of the lifetime, 50 ms)`, `client_secure_channel_layer.ts`);
+    /// open62541 has no floor. Adjustable per channel, 50 ms by default.
+    min_renewal_delay_ms: u32 = 50,
+
+    /// Renew at this share of the revised lifetime (OPC 10000-4 §5.5.2.1).
+    pub const renewal_fraction_percent: i64 = 75;
 
     pub const OpenOptions = struct {
         /// `OpenSecureChannelRequest.RequestedLifetime`, milliseconds. The
@@ -133,10 +150,14 @@ pub const SecureChannel = struct {
         /// decrypted, and the exchanged nonces run through P-SHA256
         /// (`security.deriveKeys`) to key every subsequent MSG/CLO chunk.
         security: ?security.SecurityContext = null,
+        /// The caller's clock reading (any monotonic milliseconds) at the
+        /// moment of the call; the renewal timeline (`renewalDue`) counts from
+        /// it. The default 0 suits a caller that never renews.
+        now_ms: i64 = 0,
     };
 
-    /// Perform the OpenSecureChannel request/response (Issue, not Renew —
-    /// channel renewal is out of F2's scope) and return the opened channel.
+    /// Perform the OpenSecureChannel request/response (Issue; `renew` is the
+    /// Renew counterpart) and return the opened channel.
     /// `conn` must already have completed the Hello/Acknowledge handshake
     /// (`transport.connect`/`Connection.hello`).
     ///
@@ -151,11 +172,90 @@ pub const SecureChannel = struct {
     fn openBody(conn: *transport.Connection, allocator: std.mem.Allocator, options: OpenOptions, out: *SecureChannel) services.ServiceError!void {
         var ch: SecureChannel = .{ .io = .{ .conn = conn, .allocator = allocator, .security = options.security } };
 
-        const security_mode: services.MessageSecurityMode = if (options.security) |sec| sec.mode else .none;
-        const secure = security_mode != .none;
         // OPC 10000-7 key-length band of the policy, own key and server
         // certificate, before any nonce or RSA work.
         if (options.security) |sec| try security.checkContextKeyLengths(sec);
+
+        try ch.exchange(.issue, options.requested_lifetime_ms, options.timeout_hint_ms, options.now_ms);
+        out.* = ch;
+        // The local copy holds the derived keys: wipe it (the frame is burned
+        // too, but this is the copy we know about).
+        if (ch.io.security) |*sec| if (sec.keys) |*keys| keys.wipe();
+    }
+
+    /// True once `renewal_fraction_percent` (75 %, OPC 10000-4 §5.5.2.1 /
+    /// OPC 10000-6 §6.7.4; open62541's client and node-opcua's
+    /// `lifetime_75` use the same fraction) of the current token's revised
+    /// lifetime has elapsed on the caller's clock: `now_ms` and the
+    /// `now_ms` given to `open`/`renew` must come from the same clock
+    /// (any monotonic millisecond count; this module never reads one). The
+    /// *local* clock is used rather than `token_created_at`, which is the
+    /// server's clock and may be skewed. A channel with no lifetime
+    /// (`token_lifetime_ms == 0`) is never due.
+    pub fn renewalDue(ch: *const SecureChannel, now_ms: i64) bool {
+        if (ch.token_lifetime_ms == 0) return false;
+        const due_after = @max(@divFloor(@as(i64, ch.token_lifetime_ms) * renewal_fraction_percent, 100), @as(i64, ch.min_renewal_delay_ms));
+        return now_ms -| ch.token_installed_ms >= due_after;
+    }
+
+    pub const RenewOptions = struct {
+        /// `null` asks for the lifetime the channel currently has
+        /// (`token_lifetime_ms`, the server's last revision).
+        requested_lifetime_ms: ?u32 = null,
+        timeout_hint_ms: u32 = 10_000,
+    };
+
+    /// OpenSecureChannel with `RequestType = Renew` (OPC 10000-4 §5.5.2):
+    /// asks for a fresh `SecurityToken` on the open channel, before the
+    /// current one runs out. The channel id, the policy and the mode do not
+    /// change; at Sign/SignAndEncrypt fresh nonces are exchanged and the
+    /// symmetric keys are re-derived (old keys wiped). The new token and keys
+    /// take over the moment the answer is read, which is how every reference
+    /// client behaves; the server keeps accepting the old token for its
+    /// overlap window (`server.SecurityConfig.token_renewal_overlap_ms`), so
+    /// a message already on the wire under it is not lost. This client has one
+    /// request in flight at a time, so call `renew` between requests (it
+    /// reads the next chunk as its own answer).
+    ///
+    /// `now_ms` is the caller's clock reading (see `renewalDue`). On error
+    /// the channel keeps its old token and keys, but that does not make a
+    /// retry free of risk. When the server answered `Bad` (it refused the
+    /// renewal) the old token is untouched and the caller may retry. When the
+    /// client refused a well-formed answer (another channel id, a bad nonce
+    /// length, a zero lifetime, a transport or signature failure after the
+    /// server had processed the request) the server has already rotated to the
+    /// new token: the old one is accepted only for the server's overlap window
+    /// (`token_renewal_overlap_ms`, capped at its own expiry) and symmetric
+    /// messages sent after that fail. Only the retried OPN itself, which is
+    /// asymmetric and token-independent, is certain to work; treat a refused
+    /// renewal as "renew again at once, or give up the channel". `renewIfDue`
+    /// is the usual entry point.
+    pub fn renew(ch: *SecureChannel, now_ms: i64, options: RenewOptions) services.ServiceError!void {
+        return burn.run(burn.open_burn, services.ServiceError!void, renewBody, .{ ch, now_ms, options });
+    }
+
+    fn renewBody(ch: *SecureChannel, now_ms: i64, options: RenewOptions) services.ServiceError!void {
+        // Not opened yet, or closed (the keys are gone): nothing to renew.
+        if (ch.io.channel_id == 0) return error.InvalidSecureMessage;
+        if (ch.io.security) |sec| if (sec.mode != .none and sec.keys == null) return error.InvalidSecureMessage;
+        try ch.exchange(.renew, options.requested_lifetime_ms orelse ch.token_lifetime_ms, options.timeout_hint_ms, now_ms);
+    }
+
+    /// `renew` when `renewalDue(now_ms)`; returns whether it renewed.
+    pub fn renewIfDue(ch: *SecureChannel, now_ms: i64, options: RenewOptions) services.ServiceError!bool {
+        if (!ch.renewalDue(now_ms)) return false;
+        try ch.renew(now_ms, options);
+        return true;
+    }
+
+    /// The OPN round trip shared by `open` (`.issue`, `ch` a local the caller
+    /// publishes on success) and `renew` (`.renew`, `ch` the live channel:
+    /// nothing but the wire counters changes until the answer has been
+    /// checked and, when secured, the new keys derived).
+    fn exchange(ch: *SecureChannel, request_type: services.SecurityTokenRequestType, requested_lifetime_ms: u32, timeout_hint_ms: u32, now_ms: i64) services.ServiceError!void {
+        const allocator = ch.io.allocator;
+        const security_mode: services.MessageSecurityMode = if (ch.io.security) |sec| sec.mode else .none;
+        const secure = security_mode != .none;
 
         // OPC 10000-6 §6.7.5: the nonce length matches the symmetric key
         // length (32 for the Sha256-keyed profiles). It is key material —
@@ -163,17 +263,17 @@ pub const SecureChannel = struct {
         var client_nonce: [32]u8 = undefined;
         defer std.crypto.secureZero(u8, &client_nonce);
         if (secure) {
-            const random = options.security.?.random orelse @panic("opcua security: SecurityMode != none requires SecurityContext.random");
+            const random = ch.io.security.?.random orelse @panic("opcua security: SecurityMode != none requires SecurityContext.random");
             random.bytes(&client_nonce);
         }
 
         const request: services.OpenSecureChannelRequest = .{
-            .request_header = ch.io.nextRequestHeader(services.null_node_id, options.timeout_hint_ms),
+            .request_header = ch.io.nextRequestHeader(services.null_node_id, timeout_hint_ms),
             .client_protocol_version = 0,
-            .request_type = .issue,
+            .request_type = request_type,
             .security_mode = security_mode,
             .client_nonce = if (secure) &client_nonce else &.{}, // present-but-empty at SecurityMode=None
-            .requested_lifetime = options.requested_lifetime_ms,
+            .requested_lifetime = requested_lifetime_ms,
         };
         const response = try services.Channel.call(
             &ch.io,
@@ -188,24 +288,32 @@ pub const SecureChannel = struct {
             services.result_fns.open_secure_channel,
         );
         defer services.freeOpenSecureChannelResponse(allocator, response);
+        // The server nonce is key material: wiped on every way out, before the
+        // free above releases it (defers run last-in first-out).
+        defer if (response.server_nonce) |n| std.crypto.secureZero(u8, @constCast(n));
+
+        // A token that is born expired is unusable and would make the channel
+        // unrenewable (`renewalDue` is never true without a lifetime).
+        if (response.security_token.revised_lifetime == 0) return error.InvalidTokenLifetime;
+        // A renewal keeps the channel: an answer naming another one is not ours.
+        if (request_type == .renew and response.security_token.channel_id != ch.io.channel_id) return error.InvalidSecureMessage;
+        var derived: ?security.ChannelKeys = null;
+        defer if (derived) |*k| k.wipe();
+        if (secure) {
+            const server_nonce = response.server_nonce orelse return error.InvalidSecureMessage;
+            // OPC 10000-6 §6.7.5: the nonce is as long as the symmetric key (32
+            // bytes for Basic256Sha256), both ways; a shorter one would key the
+            // client-to-server direction from a few bytes of secret.
+            if (server_nonce.len != client_nonce.len) return error.InvalidSecureMessage;
+            derived = security.deriveKeys(&client_nonce, server_nonce, ch.io.security.?.policy);
+        }
 
         ch.io.channel_id = response.security_token.channel_id;
         ch.io.token_id = response.security_token.token_id;
         ch.token_created_at = response.security_token.created_at;
         ch.token_lifetime_ms = response.security_token.revised_lifetime;
-
-        if (secure) {
-            const server_nonce = response.server_nonce orelse return error.InvalidSecureMessage;
-            if (server_nonce.len == 0) return error.InvalidSecureMessage;
-            ch.io.security.?.keys = security.deriveKeys(&client_nonce, server_nonce, options.security.?.policy);
-            // The server nonce is key material too — wipe the decoded copy
-            // before the deferred free above releases it.
-            std.crypto.secureZero(u8, @constCast(server_nonce));
-        }
-        out.* = ch;
-        // The local copy holds the derived keys: wipe it (the frame is burned
-        // too, but this is the copy we know about).
-        if (ch.io.security) |*sec| if (sec.keys) |*keys| keys.wipe();
+        ch.token_installed_ms = now_ms;
+        if (derived) |k| ch.io.security.?.keys = k;
     }
 
     /// Send the CloseSecureChannel request in a CLO chunk. Per OPC 10000-6
@@ -639,6 +747,38 @@ pub const Session = struct {
             services.type_id.browse_next_response,
             services.decodeBrowseNextResponse,
             services.result_fns.browse_next,
+        );
+    }
+
+    /// The TranslateBrowsePathsToNodeIds service (OPC 10000-4 §5.8.4): resolve
+    /// each `BrowsePath` (a starting node plus a chain of `RelativePathElement`s)
+    /// to the node(s) it names. One `BrowsePathResult` per path, in order; a
+    /// path that matched nothing comes back as a Bad per-path `status_code`
+    /// (the call itself succeeds), and `BrowsePathTarget.remaining_path_index`
+    /// is `0xFFFF_FFFF` for a fully resolved target (§7.7). Same shape as
+    /// open62541's generated `UA_Client_Service_translateBrowsePathsToNodeIds`.
+    /// Caller frees the response with
+    /// `services.freeTranslateBrowsePathsToNodeIdsResponse`.
+    pub fn translateBrowsePaths(session: *Session, browse_paths: []const services.BrowsePath) services.ServiceError!services.TranslateBrowsePathsToNodeIdsResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.TranslateBrowsePathsToNodeIdsResponse, translateBrowsePathsBody, .{ session, browse_paths });
+    }
+
+    fn translateBrowsePathsBody(session: *Session, browse_paths: []const services.BrowsePath) services.ServiceError!services.TranslateBrowsePathsToNodeIdsResponse {
+        const request: services.TranslateBrowsePathsToNodeIdsRequest = .{
+            .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
+            .browse_paths = browse_paths,
+        };
+        return services.Channel.call(
+            &session.channel.io,
+            .message,
+            services.type_id.translate_browse_paths_to_node_ids_request,
+            services.TranslateBrowsePathsToNodeIdsRequest,
+            request,
+            services.encodeTranslateBrowsePathsToNodeIdsRequest,
+            services.TranslateBrowsePathsToNodeIdsResponse,
+            services.type_id.translate_browse_paths_to_node_ids_response,
+            services.decodeTranslateBrowsePathsToNodeIdsResponse,
+            services.result_fns.translate_browse_paths_to_node_ids,
         );
     }
 
@@ -1102,9 +1242,14 @@ pub const Subscription = struct {
             services.decodeCreateMonitoredItemsResponse,
             services.result_fns.create_monitored_items,
         );
+        // One result per item, in order (§5.12.2.2); anything else cannot be
+        // correlated, so the bookkeeping stays as it was.
+        if ((if (response.results) |r| r.len else 0) != specs.len) {
+            services.freeCreateMonitoredItemsResponse(sub.allocator, response);
+            return error.ResultCountMismatch;
+        }
         if (response.results) |results| {
             for (results, 0..) |r, i| {
-                if (i >= specs.len) break;
                 if (services.isBad(r.status_code)) continue;
                 try sub.monitored_items.append(sub.allocator, .{ .client_handle = specs[i].client_handle, .monitored_item_id = r.monitored_item_id });
             }
@@ -1158,6 +1303,110 @@ pub const Subscription = struct {
             }
         }
         return response;
+    }
+
+    pub const MonitoredItemModifySpec = struct {
+        monitored_item_id: u32,
+        /// The (possibly new) `ClientHandle`: OPC 10000-4 §5.12.3 carries it in
+        /// the modified parameters, so a modify may re-label an item. Pass the
+        /// current handle to keep it. Must stay unique within this `Subscription`:
+        /// this is NOT checked (a duplicate makes `findMonitoredItem` return the
+        /// first entry). open62541's client does not enforce it either: it
+        /// assigns the client handles itself (`ua_client_subscriptions.c`, "Set a
+        /// unique ClientHandle") and a caller-chosen one is simply stored.
+        client_handle: u32,
+        sampling_interval_ms: f64 = -1,
+        queue_size: u32 = 1,
+        discard_oldest: bool = true,
+    };
+
+    /// ModifyMonitoredItems (OPC 10000-4 §5.12.3), no filter. For every item
+    /// whose `MonitoredItemModifyResult.status_code` is not Bad the
+    /// `monitored_items` entry takes over the spec's `client_handle` (the server
+    /// stores it, so later notifications carry it); a Bad result leaves the
+    /// entry as it was. Caller frees the response with
+    /// `services.freeModifyMonitoredItemsResponse`.
+    pub fn modifyMonitoredItems(sub: *Subscription, specs: []const MonitoredItemModifySpec, timestamps_to_return: services.TimestampsToReturn) services.ServiceError!services.ModifyMonitoredItemsResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.ModifyMonitoredItemsResponse, modifyMonitoredItemsBody, .{ sub, specs, timestamps_to_return });
+    }
+
+    fn modifyMonitoredItemsBody(sub: *Subscription, specs: []const MonitoredItemModifySpec, timestamps_to_return: services.TimestampsToReturn) services.ServiceError!services.ModifyMonitoredItemsResponse {
+        var items = try std.ArrayList(services.MonitoredItemModifyRequest).initCapacity(sub.allocator, specs.len);
+        defer items.deinit(sub.allocator);
+        for (specs) |spec| {
+            items.appendAssumeCapacity(.{
+                .monitored_item_id = spec.monitored_item_id,
+                .requested_parameters = .{
+                    .client_handle = spec.client_handle,
+                    .sampling_interval = spec.sampling_interval_ms,
+                    .filter = services.no_filter,
+                    .queue_size = spec.queue_size,
+                    .discard_oldest = spec.discard_oldest,
+                },
+            });
+        }
+        const request: services.ModifyMonitoredItemsRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, 10_000),
+            .subscription_id = sub.subscription_id,
+            .timestamps_to_return = timestamps_to_return,
+            .items_to_modify = items.items,
+        };
+        const response = try services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.modify_monitored_items_request,
+            services.ModifyMonitoredItemsRequest,
+            request,
+            services.encodeModifyMonitoredItemsRequest,
+            services.ModifyMonitoredItemsResponse,
+            services.type_id.modify_monitored_items_response,
+            services.decodeModifyMonitoredItemsResponse,
+            services.result_fns.modify_monitored_items,
+        );
+        // One result per item, in order (§5.12.3.2); anything else cannot be
+        // correlated, so the handle table stays as it was.
+        if ((if (response.results) |r| r.len else 0) != specs.len) {
+            services.freeModifyMonitoredItemsResponse(sub.allocator, response);
+            return error.ResultCountMismatch;
+        }
+        if (response.results) |results| {
+            for (results, 0..) |r, i| {
+                if (services.isBad(r.status_code)) continue;
+                for (sub.monitored_items.items) |*h| {
+                    if (h.monitored_item_id == specs[i].monitored_item_id) h.client_handle = specs[i].client_handle;
+                }
+            }
+        }
+        return response;
+    }
+
+    /// SetMonitoringMode (OPC 10000-4 §5.12.4): switch the named items between
+    /// `disabled`, `sampling` and `reporting`. One `StatusCode` per id in the
+    /// response (a stale id is a Bad entry, not a failed call). Caller frees
+    /// the response with `services.freeSetMonitoringModeResponse`.
+    pub fn setMonitoringMode(sub: *Subscription, monitoring_mode: services.MonitoringMode, monitored_item_ids: []const u32) services.ServiceError!services.SetMonitoringModeResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.SetMonitoringModeResponse, setMonitoringModeBody, .{ sub, monitoring_mode, monitored_item_ids });
+    }
+
+    fn setMonitoringModeBody(sub: *Subscription, monitoring_mode: services.MonitoringMode, monitored_item_ids: []const u32) services.ServiceError!services.SetMonitoringModeResponse {
+        const request: services.SetMonitoringModeRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, 10_000),
+            .subscription_id = sub.subscription_id,
+            .monitoring_mode = monitoring_mode,
+            .monitored_item_ids = monitored_item_ids,
+        };
+        return services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.set_monitoring_mode_request,
+            services.SetMonitoringModeRequest,
+            request,
+            services.encodeSetMonitoringModeRequest,
+            services.SetMonitoringModeResponse,
+            services.type_id.set_monitoring_mode_response,
+            services.decodeSetMonitoringModeResponse,
+            services.result_fns.set_monitoring_mode,
+        );
     }
 
     /// Look up the `MonitoredItemId` a `MonitoredItemNotification.
@@ -2245,6 +2494,34 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         // the response are both "decoded cleanly, didn't crash" outcomes.
         try testing.expect(err == error.ServiceFault or err == error.BadServiceResult);
     }
+
+    // ── TranslateBrowsePathsToNodeIds: Root -> Objects -> Server ->
+    // ServerStatus -> CurrentTime resolves to i=2258, the node read above
+    // (a null ReferenceTypeId matches any reference type, §5.8.4).
+    const path_names = [_][]const u8{ "Objects", "Server", "ServerStatus", "CurrentTime" };
+    var path_elements: [path_names.len]services.RelativePathElement = undefined;
+    for (path_names, 0..) |name, i| {
+        path_elements[i] = .{ .reference_type_id = services.null_node_id, .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = name } };
+    }
+    const translate_paths = [_]services.BrowsePath{.{
+        .starting_node = .{ .numeric = .{ .namespace = 0, .id = 84 } }, // Root folder
+        .relative_path = .{ .elements = &path_elements },
+    }};
+    const translate_resp = try session.translateBrowsePaths(&translate_paths);
+    defer services.freeTranslateBrowsePathsToNodeIdsResponse(gpa, translate_resp);
+    try testing.expect(!services.isBad(translate_resp.results.?[0].status_code));
+    try testing.expect(services.nodeIdEql(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, translate_resp.results.?[0].targets.?[0].target_id.node_id));
+
+    // ── SecureChannel renewal (OpenSecureChannel, Renew): a fresh token on
+    // the same channel, and the session keeps working under it.
+    const token_before = ch.io.token_id;
+    const channel_before = ch.io.channel_id;
+    try ch.renew(1_000, .{});
+    try testing.expect(ch.io.token_id != token_before);
+    try testing.expectEqual(channel_before, ch.io.channel_id);
+    const after_renew = try session.readAttribute(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, services.attribute_id.value);
+    defer encoding.freeDataValue(gpa, after_renew);
+    try testing.expect(after_renew.value != null);
 }
 
 const live_subs_container_name = "opcua-zig-libs-live-test-subs";
@@ -2400,6 +2677,25 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
     defer freePublishResult(gpa, ack_pub_result);
     if (ack_pub_result.ack_results) |results| {
         for (results) |r| try testing.expect(!services.isBad(r));
+    }
+
+    // ── ModifyMonitoredItems (new ClientHandle, slower sampling), answered Good.
+    const modify_specs = [_]Subscription.MonitoredItemModifySpec{.{
+        .monitored_item_id = created_monitored_item_id,
+        .client_handle = 2,
+        .sampling_interval_ms = 500.0,
+        .queue_size = 5,
+    }};
+    const modify_resp = try sub.modifyMonitoredItems(&modify_specs, .both);
+    defer services.freeModifyMonitoredItemsResponse(gpa, modify_resp);
+    try testing.expect(!services.isBad(modify_resp.results.?[0].status_code));
+    try testing.expectEqual(created_monitored_item_id, sub.findMonitoredItem(2).?);
+    try testing.expect(sub.findMonitoredItem(monitor_client_handle) == null);
+    // ── SetMonitoringMode (sampling, then reporting again), answered Good.
+    for ([_]services.MonitoringMode{ .sampling, .reporting }) |mode| {
+        const mode_resp = try sub.setMonitoringMode(mode, &.{created_monitored_item_id});
+        defer services.freeSetMonitoringModeResponse(gpa, mode_resp);
+        try testing.expect(!services.isBad(mode_resp.results.?[0]));
     }
 
     // ── DeleteMonitoredItems + DeleteSubscriptions + session/channel teardown.
@@ -2727,15 +3023,16 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
     var server_buf: [8192]u8 = undefined;
     var server_w: std.Io.Writer = .fixed(&server_buf);
 
-    // 1: three results for two specs (the third is the server's mistake), the middle one failed
+    // 1: three results for two specs (the server's mistake): refused, table untouched; 2: the right two, the second one failed
     const results = [_]services.MonitoredItemCreateResult{
         .{ .status_code = 0, .monitored_item_id = 100, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter },
         .{ .status_code = services.status.bad_node_id_unknown, .monitored_item_id = 0, .revised_sampling_interval = 0, .revised_queue_size = 0, .filter_result = services.no_filter },
         .{ .status_code = 0, .monitored_item_id = 102, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter },
     };
     try renderFrame(&server_w, 1, services.CreateMonitoredItemsResponse, .{ .response_header = scripted_header, .results = &results, .diagnostic_infos = null }, services.encodeCreateMonitoredItemsResponse, services.type_id.create_monitored_items_response);
+    try renderFrame(&server_w, 2, services.CreateMonitoredItemsResponse, .{ .response_header = scripted_header, .results = results[0..2], .diagnostic_infos = null }, services.encodeCreateMonitoredItemsResponse, services.type_id.create_monitored_items_response);
 
-    // 2: a Publish answer carrying a status change, an event list, a data change and something unknown
+    // 3: a Publish answer carrying a status change, an event list, a data change and something unknown
     var sc_buf: [64]u8 = undefined;
     var sc_w: std.Io.Writer = .fixed(&sc_buf);
     var sc_e = encoding.Encoder.init(&sc_w);
@@ -2754,7 +3051,7 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
         .{ .type_id = services.type_id.data_change_notification, .encoding = .byte_string, .body = dc_w.buffered() },
         .{ .type_id = services.type_id.read_request, .encoding = .byte_string, .body = "" },
     };
-    try renderFrame(&server_w, 2, services.PublishResponse, .{
+    try renderFrame(&server_w, 3, services.PublishResponse, .{
         .response_header = scripted_header,
         .subscription_id = 1,
         .available_sequence_numbers = null,
@@ -2764,8 +3061,8 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
         .diagnostic_infos = null,
     }, services.encodePublishResponse, services.type_id.publish_response);
 
-    // 3: a Read answer without a single result
-    try renderFrame(&server_w, 3, services.ReadResponse, .{ .response_header = scripted_header, .results = &.{}, .diagnostic_infos = null }, services.encodeReadResponse, services.type_id.read_response);
+    // 4: a Read answer without a single result
+    try renderFrame(&server_w, 4, services.ReadResponse, .{ .response_header = scripted_header, .results = &.{}, .diagnostic_infos = null }, services.encodeReadResponse, services.type_id.read_response);
 
     var client_out_buf: [8192]u8 = undefined;
     var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
@@ -2780,6 +3077,8 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
         .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } }, .client_handle = 10 },
         .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2259 } }, .client_handle = 11 },
     };
+    try testing.expectError(error.ResultCountMismatch, sub.createMonitoredItems(&specs, .both));
+    try testing.expectEqual(@as(usize, 0), sub.monitored_items.items.len);
     const created = try sub.createMonitoredItems(&specs, .both);
     defer services.freeCreateMonitoredItemsResponse(testing.allocator, created);
     try testing.expectEqual(@as(usize, 1), sub.monitored_items.items.len);
@@ -2800,6 +3099,162 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
     try testing.expectEqual(@as(u32, 0xFFFF_FFFF), std.mem.readInt(u32, publish_request[publish_request.len - 4 ..][0..4], .little));
 
     try testing.expectError(error.UnexpectedResponseType, session.readAttribute(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, services.attribute_id.value));
+}
+
+test "Subscription offline scripted: a ModifyMonitoredItems answer whose result count differs from the request (short, long, null) is refused and the handle table stays; a matching one updates it" {
+    const testing = std.testing;
+    var server_buf: [8192]u8 = undefined;
+    var server_w: std.Io.Writer = .fixed(&server_buf);
+    const good: services.MonitoredItemModifyResult = .{ .status_code = 0, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter };
+    const two = [_]services.MonitoredItemModifyResult{ good, good };
+    const Resp = services.ModifyMonitoredItemsResponse;
+    const enc = services.encodeModifyMonitoredItemsResponse;
+    const tid = services.type_id.modify_monitored_items_response;
+    // 1: long (2 for 2 specs asked 1) 2: short (1 for 2) 3: null 4: matching
+    try renderFrame(&server_w, 1, Resp, .{ .response_header = scripted_header, .results = &two, .diagnostic_infos = null }, enc, tid);
+    try renderFrame(&server_w, 2, Resp, .{ .response_header = scripted_header, .results = two[0..1], .diagnostic_infos = null }, enc, tid);
+    try renderFrame(&server_w, 3, Resp, .{ .response_header = scripted_header, .results = null, .diagnostic_infos = null }, enc, tid);
+    try renderFrame(&server_w, 4, Resp, .{ .response_header = scripted_header, .results = two[0..1], .diagnostic_infos = null }, enc, tid);
+
+    var client_out_buf: [4096]u8 = undefined;
+    var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
+    var client_in_r: std.Io.Reader = .fixed(server_w.buffered());
+    var conn = transport.Connection.init(&client_in_r, &client_out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3 } };
+    var session: Session = .{ .channel = &ch, .allocator = testing.allocator, .authentication_token = services.null_node_id };
+    var sub: Subscription = .{ .session = &session, .allocator = testing.allocator, .subscription_id = 1 };
+    defer sub.deinit();
+    try sub.monitored_items.append(testing.allocator, .{ .client_handle = 10, .monitored_item_id = 100 });
+    try sub.monitored_items.append(testing.allocator, .{ .client_handle = 11, .monitored_item_id = 101 });
+
+    const one = [_]Subscription.MonitoredItemModifySpec{.{ .monitored_item_id = 100, .client_handle = 20 }};
+    const both = [_]Subscription.MonitoredItemModifySpec{ .{ .monitored_item_id = 100, .client_handle = 20 }, .{ .monitored_item_id = 101, .client_handle = 21 } };
+    try testing.expectError(error.ResultCountMismatch, sub.modifyMonitoredItems(&one, .both));
+    try testing.expectError(error.ResultCountMismatch, sub.modifyMonitoredItems(&both, .both));
+    try testing.expectError(error.ResultCountMismatch, sub.modifyMonitoredItems(&one, .both));
+    try testing.expectEqual(@as(u32, 100), sub.findMonitoredItem(10).?);
+    try testing.expectEqual(@as(u32, 101), sub.findMonitoredItem(11).?);
+    try testing.expect(sub.findMonitoredItem(20) == null);
+    const response = try sub.modifyMonitoredItems(&one, .both);
+    defer services.freeModifyMonitoredItemsResponse(testing.allocator, response);
+    try testing.expectEqual(@as(u32, 100), sub.findMonitoredItem(20).?);
+    try testing.expect(sub.findMonitoredItem(10) == null);
+}
+
+test "Subscription offline scripted: a CreateMonitoredItems answer with fewer results than items, or none, is refused and creates no bookkeeping" {
+    const testing = std.testing;
+    var server_buf: [8192]u8 = undefined;
+    var server_w: std.Io.Writer = .fixed(&server_buf);
+    const item: services.MonitoredItemCreateResult = .{ .status_code = 0, .monitored_item_id = 100, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter };
+    const Resp = services.CreateMonitoredItemsResponse;
+    const enc = services.encodeCreateMonitoredItemsResponse;
+    const tid = services.type_id.create_monitored_items_response;
+    const one = [_]services.MonitoredItemCreateResult{item};
+    try renderFrame(&server_w, 1, Resp, .{ .response_header = scripted_header, .results = &one, .diagnostic_infos = null }, enc, tid);
+    try renderFrame(&server_w, 2, Resp, .{ .response_header = scripted_header, .results = null, .diagnostic_infos = null }, enc, tid);
+
+    var client_out_buf: [4096]u8 = undefined;
+    var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
+    var client_in_r: std.Io.Reader = .fixed(server_w.buffered());
+    var conn = transport.Connection.init(&client_in_r, &client_out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3 } };
+    var session: Session = .{ .channel = &ch, .allocator = testing.allocator, .authentication_token = services.null_node_id };
+    var sub: Subscription = .{ .session = &session, .allocator = testing.allocator, .subscription_id = 1 };
+    defer sub.deinit();
+    const specs = [_]Subscription.MonitoredItemSpec{
+        .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } }, .client_handle = 10 },
+        .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2259 } }, .client_handle = 11 },
+    };
+    try testing.expectError(error.ResultCountMismatch, sub.createMonitoredItems(&specs, .both));
+    try testing.expectError(error.ResultCountMismatch, sub.createMonitoredItems(&specs, .both));
+    try testing.expectEqual(@as(usize, 0), sub.monitored_items.items.len);
+}
+
+test "secure offline scripted: open and renew refuse a zero lifetime and any server nonce that is not 32 bytes, state untouched; a 1 ms lifetime is taken but renews no sooner than the floor" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(45)));
+    const random = prng.random();
+    var client_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "validate-client",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:client",
+    }, &client_creds);
+    defer client_creds.deinit(testing.allocator);
+    var server_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 1280,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "validate-server",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+    }, &server_creds);
+    defer server_creds.deinit(testing.allocator);
+
+    const old_keys = security.deriveKeys(&@as([32]u8, @splat(0xA1)), &@as([32]u8, @splat(0xB2)), .basic256sha256);
+    const nonce_buf: [33]u8 = @splat(0xC3);
+    const Case = struct { nonce_len: usize, lifetime: u32, err: ?anyerror };
+    const cases = [_]Case{
+        .{ .nonce_len = 32, .lifetime = 0, .err = error.InvalidTokenLifetime },
+        .{ .nonce_len = 0, .lifetime = 5_000, .err = error.InvalidSecureMessage },
+        .{ .nonce_len = 1, .lifetime = 5_000, .err = error.InvalidSecureMessage },
+        .{ .nonce_len = 31, .lifetime = 5_000, .err = error.InvalidSecureMessage },
+        .{ .nonce_len = 33, .lifetime = 5_000, .err = error.InvalidSecureMessage },
+        .{ .nonce_len = 32, .lifetime = 1, .err = null },
+    };
+    for (cases) |c| {
+        const answer = try sealedOpnAnswer(testing.allocator, random, &server_creds, client_creds.certificate_der, 7, 4, nonce_buf[0..c.nonce_len], c.lifetime);
+        defer testing.allocator.free(answer);
+        const context: security.SecurityContext = .{
+            .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
+            .mode = .sign_and_encrypt,
+            .credentials = client_creds,
+            .server_certificate = server_creds.certificate_der,
+            .random = random,
+        };
+        // renew
+        {
+            var out_buf: [8192]u8 = undefined;
+            var out_w: std.Io.Writer = .fixed(&out_buf);
+            var in_r: std.Io.Reader = .fixed(answer);
+            var conn = transport.Connection.init(&in_r, &out_w);
+            var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3, .security = context }, .token_lifetime_ms = 9_000, .token_installed_ms = 100 };
+            ch.io.security.?.keys = old_keys;
+            if (c.err) |e| {
+                try testing.expectError(e, ch.renew(500, .{}));
+                try testing.expectEqual(@as(u32, 3), ch.io.token_id);
+                try testing.expectEqualSlices(u8, std.mem.asBytes(&old_keys), std.mem.asBytes(&ch.io.security.?.keys.?));
+                try testing.expectEqual(@as(u32, 9_000), ch.token_lifetime_ms);
+                try testing.expectEqual(@as(i64, 100), ch.token_installed_ms);
+            } else {
+                try ch.renew(500, .{});
+                try testing.expectEqual(@as(u32, 1), ch.token_lifetime_ms);
+                try testing.expect(!ch.renewalDue(549)); // 75 % of 1 ms is 0, the floor holds it back
+                try testing.expect(ch.renewalDue(550));
+                try testing.expect(!try ch.renewIfDue(549, .{}));
+            }
+        }
+        // open
+        {
+            var out_buf: [8192]u8 = undefined;
+            var out_w: std.Io.Writer = .fixed(&out_buf);
+            var in_r: std.Io.Reader = .fixed(answer);
+            var conn = transport.Connection.init(&in_r, &out_w);
+            var ch: SecureChannel = undefined;
+            if (c.err) |e| {
+                try testing.expectError(e, SecureChannel.open(&conn, testing.allocator, .{ .security = context }, &ch));
+            } else {
+                try SecureChannel.open(&conn, testing.allocator, .{ .security = context, .now_ms = 7 }, &ch);
+                try testing.expectEqual(@as(u32, 1), ch.token_lifetime_ms);
+                try testing.expect(!ch.renewalDue(56));
+                try testing.expect(ch.renewalDue(57));
+            }
+        }
+    }
 }
 
 test "secure offline scripted: a secured OpenSecureChannel answer with an empty server nonce is refused" {
@@ -2871,6 +3326,181 @@ test "secure offline scripted: a secured OpenSecureChannel answer with an empty 
             .random = random,
         },
     }, &ch));
+}
+
+test "SecureChannel.renewalDue: 75 % of the revised lifetime on the caller's clock, never without a lifetime, no overflow" {
+    const testing = std.testing;
+    var in_r: std.Io.Reader = .fixed("");
+    var out_buf: [8]u8 = undefined;
+    var out_w: std.Io.Writer = .fixed(&out_buf);
+    var conn = transport.Connection.init(&in_r, &out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator }, .token_lifetime_ms = 10_000, .token_installed_ms = 1_000 };
+    try testing.expect(!ch.renewalDue(8_499));
+    try testing.expect(ch.renewalDue(8_500));
+    try testing.expect(ch.renewalDue(1_000_000));
+    try testing.expect(!ch.renewalDue(1_000)); // the instant it arrived
+    try testing.expect(!ch.renewalDue(-5_000)); // a clock before the install time
+    ch.token_lifetime_ms = 3; // 75 % of 3 ms is 2.25 ms, rounded down; the 50 ms floor wins
+    ch.token_installed_ms = 0;
+    try testing.expect(!ch.renewalDue(2));
+    try testing.expect(!ch.renewalDue(49));
+    try testing.expect(ch.renewalDue(50));
+    // a 1 ms lifetime does not make every call a renewal
+    ch.token_lifetime_ms = 1;
+    try testing.expect(!ch.renewalDue(0));
+    try testing.expect(!ch.renewalDue(49));
+    try testing.expect(ch.renewalDue(50));
+    ch.min_renewal_delay_ms = 200; // the floor is adjustable
+    try testing.expect(!ch.renewalDue(199));
+    try testing.expect(ch.renewalDue(200));
+    ch.min_renewal_delay_ms = 0;
+    try testing.expect(ch.renewalDue(0)); // no floor: the 75 % point of 1 ms is 0
+    ch.min_renewal_delay_ms = 50;
+    ch.token_lifetime_ms = 0;
+    try testing.expect(!ch.renewalDue(std.math.maxInt(i64)));
+    ch.token_lifetime_ms = std.math.maxInt(u32);
+    ch.token_installed_ms = std.math.minInt(i64);
+    try testing.expect(ch.renewalDue(std.math.maxInt(i64)));
+    try testing.expect(!ch.renewalDue(std.math.minInt(i64)));
+    try testing.expectEqual(@as(i64, 75), SecureChannel.renewal_fraction_percent);
+}
+
+test "SecureChannel.renew: a channel that was never opened, or None-mode state without a channel id, is refused before any I/O" {
+    const testing = std.testing;
+    var in_r: std.Io.Reader = .fixed("");
+    var out_buf: [8]u8 = undefined;
+    var out_w: std.Io.Writer = .fixed(&out_buf);
+    var conn = transport.Connection.init(&in_r, &out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator } };
+    try testing.expectError(error.InvalidSecureMessage, ch.renew(0, .{}));
+    try testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    try testing.expect(!try ch.renewIfDue(1_000_000, .{})); // no lifetime: never due, nothing sent
+    try testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+}
+
+/// A sealed OpenSecureChannel answer for the renewal tests below: channel
+/// `channel_id`, token `token_id`, `server_nonce`, lifetime `lifetime_ms`.
+fn sealedOpnAnswer(
+    allocator: std.mem.Allocator,
+    random: std.Random,
+    server_creds: *const security.ClientCredentials,
+    client_cert: []const u8,
+    channel_id: u32,
+    token_id: u32,
+    server_nonce: []const u8,
+    lifetime_ms: u32,
+) ![]u8 {
+    var resp = std.Io.Writer.Allocating.init(allocator);
+    defer resp.deinit();
+    var e = encoding.Encoder.init(&resp.writer);
+    try e.writer.writeInt(u32, channel_id, .little);
+    try security.encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+        .security_policy_uri = security.SecurityPolicy.basic256sha256.uri(),
+        .sender_certificate = server_creds.certificate_der,
+        .receiver_certificate_thumbprint = &security.certificateThumbprint(client_cert),
+    });
+    const enc_offset = resp.writer.buffered().len;
+    try e.writer.writeInt(u32, 1, .little); // SequenceNumber
+    try e.writer.writeInt(u32, 1, .little); // RequestId
+    try e.encodeNodeId(services.type_id.open_secure_channel_response);
+    try services.encodeOpenSecureChannelResponse(&e, .{
+        .response_header = scripted_header,
+        .server_protocol_version = 0,
+        .security_token = .{ .channel_id = channel_id, .token_id = token_id, .created_at = 0, .revised_lifetime = lifetime_ms },
+        .server_nonce = server_nonce,
+    });
+    return security.sealAsymmetricMessage(
+        allocator,
+        random,
+        transport.MessageType.open_secure_channel.code(),
+        resp.writer.buffered(),
+        enc_offset,
+        server_creds,
+        client_cert,
+    );
+}
+
+test "secure offline scripted: a renewal answer for another channel, or without a server nonce, leaves the old token and keys; a good one swaps them" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(44)));
+    const random = prng.random();
+    var client_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "renew-client",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:client",
+    }, &client_creds);
+    defer client_creds.deinit(testing.allocator);
+    var server_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 1280,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "renew-server",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+    }, &server_creds);
+    defer server_creds.deinit(testing.allocator);
+
+    const nonce_a: [32]u8 = @splat(0xA1);
+    const nonce_b: [32]u8 = @splat(0xB2);
+    const old_keys = security.deriveKeys(&nonce_a, &nonce_b, .basic256sha256);
+    const server_nonce: [32]u8 = @splat(0xC3);
+
+    const wrong_channel = try sealedOpnAnswer(testing.allocator, random, &server_creds, client_creds.certificate_der, 8, 4, &server_nonce, 5_000);
+    defer testing.allocator.free(wrong_channel);
+    const no_nonce = try sealedOpnAnswer(testing.allocator, random, &server_creds, client_creds.certificate_der, 7, 4, "", 5_000);
+    defer testing.allocator.free(no_nonce);
+    const good = try sealedOpnAnswer(testing.allocator, random, &server_creds, client_creds.certificate_der, 7, 4, &server_nonce, 5_000);
+    defer testing.allocator.free(good);
+
+    inline for (.{ wrong_channel, no_nonce, good }, 0..) |answer, i| {
+        var out_buf: [8192]u8 = undefined;
+        var out_w: std.Io.Writer = .fixed(&out_buf);
+        var in_r: std.Io.Reader = .fixed(answer);
+        var conn = transport.Connection.init(&in_r, &out_w);
+        var ch: SecureChannel = .{
+            .io = .{
+                .conn = &conn,
+                .allocator = testing.allocator,
+                .channel_id = 7,
+                .token_id = 3,
+                .security = .{
+                    .policy = .basic256sha256,
+                    .insecure_allow_key_length_outside_policy = true,
+                    .mode = .sign_and_encrypt,
+                    .credentials = client_creds,
+                    .server_certificate = server_creds.certificate_der,
+                    .random = random,
+                    .keys = old_keys,
+                },
+            },
+            .token_lifetime_ms = 9_000,
+            .token_installed_ms = 100,
+        };
+        if (i < 2) {
+            try testing.expectError(error.InvalidSecureMessage, ch.renew(500, .{}));
+            // refused: the old token, keys, lifetime and clock stay
+            try testing.expectEqual(@as(u32, 3), ch.io.token_id);
+            try testing.expectEqual(@as(u32, 7), ch.io.channel_id);
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&old_keys), std.mem.asBytes(&ch.io.security.?.keys.?));
+            try testing.expectEqual(@as(u32, 9_000), ch.token_lifetime_ms);
+            try testing.expectEqual(@as(i64, 100), ch.token_installed_ms);
+        } else {
+            try ch.renew(500, .{});
+            try testing.expectEqual(@as(u32, 4), ch.io.token_id);
+            try testing.expectEqual(@as(u32, 7), ch.io.channel_id);
+            try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&old_keys), std.mem.asBytes(&ch.io.security.?.keys.?)));
+            try testing.expectEqual(@as(u32, 5_000), ch.token_lifetime_ms);
+            try testing.expectEqual(@as(i64, 500), ch.token_installed_ms);
+            // the request that went out was a Renew carrying a fresh 32-byte nonce under the channel's id
+            var req_r: std.Io.Reader = .fixed(out_w.buffered());
+            _ = try req_r.takeArray(8); // MessageHeader
+            try testing.expectEqual(@as(u32, 7), try req_r.takeInt(u32, .little));
+        }
+    }
 }
 
 /// `Session.create`'s error path: the whole response, including the two

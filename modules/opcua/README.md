@@ -8,8 +8,8 @@ module), and the Part-4 services on both sides of the wire — a client that
 drives a real server, and a server (device) a real client can drive.
 
 **Status: implemented, both roles, both secured.** Client: codec, transport,
-secure channel (`Basic256Sha256` Sign/SignAndEncrypt), session lifecycle,
-attribute/method services and subscriptions. Server: the opc.tcp connection
+secure channel (`Basic256Sha256` Sign/SignAndEncrypt, with client-side token renewal), session lifecycle,
+attribute/method/TranslateBrowsePaths services and subscriptions. Server: the opc.tcp connection
 state machine with explicit chunk limits, **the full server side of
 `Basic256Sha256`** (asymmetric OpenSecureChannel, P-SHA256 key derivation,
 per-chunk sign/encrypt, SecurityToken renewal with an overlap window, the
@@ -35,6 +35,7 @@ var channel: opcua.SecureChannel = undefined;
 try opcua.SecureChannel.open(&conn, gpa, .{}, &channel);
 var session = try opcua.Session.create(&channel, gpa, .{ .endpoint_url = url, ... });
 try session.activate(null);
+_ = try channel.renewIfDue(now_ms, .{}); // renews at 75 % of the token lifetime, on the caller's clock
 const value = try session.readAttribute(node_id, opcua.services.attribute_id.value);
 
 // ── server ────────────────────────────────────────────────────────────────

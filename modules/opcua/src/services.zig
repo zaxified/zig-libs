@@ -54,6 +54,13 @@ pub const ServiceError = encoding.EncodeError || encoding.DecodeError || transpo
     /// §6.7.2.4): a replayed, reordered or dropped chunk. The channel can no
     /// longer be trusted and should be closed.
     SequenceNumberInvalid,
+    /// An OpenSecureChannel answer carried `RevisedLifetime == 0`: a token
+    /// that is already expired, which would leave the channel unrenewable.
+    InvalidTokenLifetime,
+    /// A CreateMonitoredItems/ModifyMonitoredItems answer carried a different
+    /// number of results than the request had items (OPC 10000-4 §5.12.2.2:
+    /// one result per item, in order).
+    ResultCountMismatch,
 };
 
 /// `SecurityPolicy#None`'s URI (OPC 10000-7 §6.2.1) — the SecurityPolicy the
@@ -3416,6 +3423,12 @@ fn findServersResult(r: FindServersResponse) encoding.StatusCode {
 fn translateBrowsePathsResult(r: TranslateBrowsePathsToNodeIdsResponse) encoding.StatusCode {
     return r.response_header.service_result;
 }
+fn modifyMonitoredItemsResultFn(r: ModifyMonitoredItemsResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn setMonitoringModeResultFn(r: SetMonitoringModeResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
 
 pub const result_fns = struct {
     pub const open_secure_channel = openSecureChannelResult;
@@ -3438,11 +3451,24 @@ pub const result_fns = struct {
     pub const get_endpoints = getEndpointsResult;
     pub const find_servers = findServersResult;
     pub const translate_browse_paths_to_node_ids = translateBrowsePathsResult;
+    pub const modify_monitored_items = modifyMonitoredItemsResultFn;
+    pub const set_monitoring_mode = setMonitoringModeResultFn;
 };
 
 // ── tests ──
 
 const testing = std.testing;
+
+test "result_fns: ModifyMonitoredItems and SetMonitoringMode answers report the header's service result" {
+    const bad: encoding.StatusCode = 0x8001_0000;
+    const header: ResponseHeader = .{ .timestamp = 0, .request_handle = 0, .service_result = bad, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header };
+    try testing.expectEqual(bad, result_fns.modify_monitored_items(.{ .response_header = header, .results = null, .diagnostic_infos = null }));
+    try testing.expectEqual(bad, result_fns.set_monitoring_mode(.{ .response_header = header, .results = null, .diagnostic_infos = null }));
+    var good = header;
+    good.service_result = 0;
+    try testing.expectEqual(@as(encoding.StatusCode, 0), result_fns.modify_monitored_items(.{ .response_header = good, .results = null, .diagnostic_infos = null }));
+    try testing.expectEqual(@as(encoding.StatusCode, 0), result_fns.set_monitoring_mode(.{ .response_header = good, .results = null, .diagnostic_infos = null }));
+}
 
 test "RequestHeader / ResponseHeader round-trip" {
     var buf: [512]u8 = undefined;
