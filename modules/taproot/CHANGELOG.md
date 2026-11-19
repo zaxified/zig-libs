@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the ctgrind `secret` row re-pinned to the new source digest after the Huffman layout landed (counts unchanged, 8 contexts; the row measures `tweakSecretKey`, the layout code handles public data only).
 - **2026-11-19** — added `WeightedLeaf`, `huffmanLeaves` and `buildFromWeights`: Huffman tree layout from `(weight, script)` pairs, behaving as rust-bitcoin's `TaprootBuilder::with_huffman_tree` (two lowest weights joined, `u32` saturating sum, ties by larger node hash, empty input `EmptyTree`, depth > 128 `TreeTooDeep`). Additive; no behaviour change to existing functions.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** the KAT test and the example call `bip340.sign(…, .{})` for bip340's new trailing `SignOptions` argument.

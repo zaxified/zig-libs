@@ -1024,7 +1024,7 @@ musig2	ReleaseFast	sign	1	<=103	8c50aacfe75ce8bd	2a2f275cd0c5c7c5
 # Source pin moved 2026-10-02 after the BIP341 script trees (7a956ff7): --stacks
 # reads the same nine, at shifted lines -- group.zig:400 x2, taproot
 # root.zig:279/286 (the same two `Scalar.fromBytes` canonicality checks).
-taproot	ReleaseFast	secret	1	8	78d468970a2a3857	966e0c7b70c18936
+taproot	ReleaseFast	secret	1	8	223d5d70a31b0e56	966e0c7b70c18936
 # adaptor presign 2026-11-13 (k256 weak-field ecmult): reads 80, inside the <=90 bound (row not
 # changed). preSign's mandatory self-check runs preVerify -> k256 ecmult on values derived from the
 # tainted key (the published key and presignature): wNAF recoding / table-index / topDigit branches
