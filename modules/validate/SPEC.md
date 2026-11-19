@@ -258,7 +258,7 @@ line is cumulative (2479/2609 + 16/17, 130 + 1 eq).
 - **2026-10-24 (review, LOW)** — typed float fields accept inf/NaN (`1e400` → +inf, query `nan`)
   unless a bound is set, as pydantic's default; error paths are dotted (a field `a.b` reads as nested);
   `Pattern.matcher` is documented as whole-string while its exported `pattern` is a search; `isUri`
-  accepts a non-numeric port outside an IP-literal host (`[`/`]` anywhere and `isCased` = ASCII + Latin-1
+  accepted a non-numeric port outside an IP-literal host (fixed 2026-11-19, `uriPortOk`: RFC 3986 §3.2.3 `port = *DIGIT`, and Go's `net/url` refuses it too; `[`/`]` anywhere and `isCased` = ASCII + Latin-1
   fixed 2026-10-24, go format oracle); the default
   `max_total_nodes` (1M) exceeds what the 1 MiB body cap can hold. Recorded, not planned.
 Regex-backed `pattern` support is a tracked future ADOPT dependency (README TODO) — not implemented;

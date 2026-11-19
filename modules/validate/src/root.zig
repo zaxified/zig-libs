@@ -2412,7 +2412,24 @@ fn isUri(s: []const u8, require_scheme: bool) bool {
     }
     const scheme_len = uriSchemeLen(s);
     if (require_scheme and scheme_len == null) return false;
-    return uriBracketsOk(if (scheme_len) |n| s[n + 1 ..] else s);
+    const rest = if (scheme_len) |n| s[n + 1 ..] else s;
+    return uriBracketsOk(rest) and uriPortOk(rest);
+}
+
+/// RFC 3986 §3.2.2/§3.2.3: a `reg-name` holds no ':' and `port = *DIGIT`, so
+/// the host of an authority that is not an IP-literal ends in at most one
+/// `:` followed by digits (`http://host:abc/` is no URI; Go's `net/url`, the
+/// reference's parser, refuses it as an invalid port). `rest` is what follows
+/// the scheme; an IP-literal host is `uriBracketsOk`'s.
+fn uriPortOk(rest: []const u8) bool {
+    if (!std.mem.startsWith(u8, rest, "//")) return true;
+    const after = rest[2..];
+    const auth = after[0 .. std.mem.findAny(u8, after, "/?#") orelse after.len];
+    const host = auth[if (std.mem.findScalarLast(u8, auth, '@')) |at| at + 1 else 0..];
+    if (host.len != 0 and host[0] == '[') return true;
+    const colon = std.mem.findScalar(u8, host, ':') orelse return true;
+    for (host[colon + 1 ..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 /// Length of `s`'s scheme when it starts with `scheme ":"`, else null. The
@@ -10856,6 +10873,26 @@ fn expectExportLacks(rules: []const Rule, needle: []const u8) !void {
         std.debug.print("\nexport has: {s}\nexport is:  {s}\n", .{ needle, aw.written() });
         return error.TestExpectedEqual;
     }
+}
+
+test "uri: the port of a registered-name host is digits, as RFC 3986 and net/url (uriPortOk)" {
+    const ok = [_][]const u8{
+        "http://host:8080/", "http://host:/",    "http://host",       "http://u:p@host:80/x", "http://u:p@host",
+        "//host:1",          "http://host/a:b",  "http://host?q=a:b", "http://host#a:b",      "urn:a:b",
+        "mailto:u@h:x",      "http://1.2.3.4:5", "http://[::1]:80/",
+    };
+    for (ok) |u| {
+        try testing.expect(isUri(u, false));
+    }
+    const bad = [_][]const u8{
+        "http://host:abc/", "http://host:80a", "http://host:a",   "http://host:8:9", "http://u:p@host:x/", "//host:x",
+        "http://host::",    "http://host:-1/", "http://host:80 ", "ftp://u@h:p?x",
+    };
+    for (bad) |u| {
+        try testing.expect(!isUri(u, false));
+    }
+    // A scheme-less reference that merely has a colon later is not an authority.
+    try testing.expect(isUri("a/b://c:d", false));
 }
 
 test "export: string lists and a literal pattern are stated only where the module enforces them (exportsPattern, lists_apply)" {
