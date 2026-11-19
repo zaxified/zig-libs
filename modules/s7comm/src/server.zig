@@ -52,6 +52,20 @@ pub const Config = struct {
     /// instead of being obeyed. Off by default: a simulator that silently
     /// accepts a stop teaches its operator the wrong lesson.
     allow_plc_control: bool = false,
+    /// Time-of-day services (group 7). Null: the services are answered with
+    /// the same "not available" error as an unknown SZL. There is no system
+    /// time anywhere in this module; the caller supplies the clock.
+    clock: ?Clock = null,
+};
+
+/// A caller-supplied clock for the time-of-day services.
+pub const Clock = struct {
+    ctx: ?*anyopaque = null,
+    /// Current time; must return a valid `userdata.DateTime`.
+    now: *const fn (ctx: ?*anyopaque) userdata.DateTime,
+    /// Called with a validated date-time when a client sets the clock. Null:
+    /// the clock is read-only and a set request is refused with an error.
+    set: ?*const fn (ctx: ?*anyopaque, value: userdata.DateTime) void = null,
 };
 
 /// The length field a failed data item carries. It is meaningless — there is
@@ -282,6 +296,7 @@ pub const Responder = struct {
 
     fn handleUserdata(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
         const p = try userdata.Param.decode(pdu.parameters);
+        if (p.function_group == .time_functions) return self.handleTime(p, pdu, out);
         if (p.function_group != .cpu_functions or
             p.subfunction != @backingInt(userdata.CpuSubfunction.read_szl))
         {
@@ -334,6 +349,63 @@ pub const Responder = struct {
         else
             try userdata.DataBlock.encode(.object_does_not_exist, .null_size, &.{}, &data);
 
+        return self.frame(.userdata, pdu.header.pdu_reference, rp, db, out, false);
+    }
+
+    /// Group 7. Read clock answers with the 10-octet date-time; set clock
+    /// validates the request's date-time (BCD digits and ranges) and hands it to
+    /// the configured setter. Anything unavailable or invalid is a response with
+    /// an error code and a failing data return code, never a dropped reply.
+    fn handleTime(self: *Responder, p: userdata.Param, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        const sub: userdata.TimeSubfunction = @fromBackingInt(p.subfunction);
+        var ts: [userdata.DateTime.wire_len]u8 = undefined;
+        var result: ?[]const u8 = null; // payload for a successful answer
+        var rc: items.ReturnCode = .object_does_not_exist;
+        var ok = false;
+        if (self.config.clock) |clk| switch (sub) {
+            .read_clock, .read_clock_following => {
+                if (clk.now(clk.ctx).encode(&ts)) |enc| {
+                    result = enc;
+                    ok = true;
+                } else |_| {
+                    rc = .hardware_fault;
+                }
+            },
+            .set_clock, .set_clock_alt => {
+                const set = clk.set;
+                if (set == null) {
+                    rc = .access_denied;
+                } else if (userdata.DataBlock.decode(pdu.data)) |db| {
+                    if (!db.return_code.isSuccess()) {
+                        rc = .data_type_inconsistent;
+                    } else if (userdata.DateTime.decode(db.payload)) |dt| {
+                        set.?(clk.ctx, dt);
+                        result = &.{};
+                        ok = true;
+                    } else |_| {
+                        rc = .data_type_inconsistent;
+                    }
+                } else |_| {
+                    rc = .data_type_inconsistent;
+                }
+            },
+            else => {},
+        };
+
+        var params: [userdata.Param.response_len]u8 = undefined;
+        const rp = try (userdata.Param{
+            .message_type = .response,
+            .function_group = .time_functions,
+            .subfunction = p.subfunction,
+            .sequence = p.sequence,
+            .last_data_unit = .no_more,
+            .error_code = if (ok) 0 else 0xD401,
+        }).encodeResponse(&params);
+        var data: [4 + userdata.DateTime.wire_len]u8 = undefined;
+        const db = if (result) |r|
+            try userdata.DataBlock.encode(.success, .octet_string, r, &data)
+        else
+            try userdata.DataBlock.encode(rc, .null_size, &.{}, &data);
         return self.frame(.userdata, pdu.header.pdu_reference, rp, db, out, false);
     }
 
@@ -571,6 +643,100 @@ test "read SZL 0x0424 reflects the configured and the stopped state" {
     const pdu2 = try s7.decode((try cotp.decode((try tpkt.decode(rep2)).payload)).dt.payload);
     const resp2 = try userdata.SzlResponse.decode((try userdata.DataBlock.decode(pdu2.data)).payload);
     try testing.expectEqual(userdata.CpuStatus.stop, userdata.cpuStatusFrom(resp2).?);
+}
+
+const TestClock = struct {
+    now_value: userdata.DateTime = .{ .year = 2026, .month = 11, .day = 19, .hour = 13, .minute = 45, .second = 59, .millisecond = 987, .weekday = 5 },
+    sets: usize = 0,
+
+    fn now(ctx: ?*anyopaque) userdata.DateTime {
+        const self: *TestClock = @ptrCast(@alignCast(ctx.?));
+        return self.now_value;
+    }
+    fn set(ctx: ?*anyopaque, value: userdata.DateTime) void {
+        const self: *TestClock = @ptrCast(@alignCast(ctx.?));
+        self.now_value = value;
+        self.sets += 1;
+    }
+};
+
+const read_clock_req = "0300001d02f080320700000300000800040001120411470100" ++ "0a000000";
+const set_clock_req = "0300002702f0803207000004000008000e0001120411470200" ++ "ff09000a00202611191345599875";
+
+test "read clock answers the injected clock, byte for byte" {
+    var tc: TestClock = .{};
+    var r = Responder.init(.{ .clock = .{ .ctx = &tc, .now = TestClock.now } }, &.{});
+    var req: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const rep = (try r.handle(hex(read_clock_req, &req), &out)).?;
+    // Parameters: response head, type|group 0x87, subfunction 1, seq 0, last unit 0, no error.
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x01, 0x12, 0x08, 0x12, 0x87, 0x01, 0x00, 0, 0, 0, 0 }, rep[17..29]);
+    // Data: success, octet string, 10 octets, then the BCD date-time.
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0xFF, 0x09, 0x00, 0x0A, 0x00, 0x20, 0x26, 0x11, 0x19, 0x13, 0x45, 0x59, 0x98, 0x75,
+    }, rep[29..]);
+    // The following-variant (0x03) is answered the same way.
+    var req2: [64]u8 = undefined;
+    const rep2 = (try r.handle(hex("0300001d02f080320700000300000800040001120411470300" ++ "0a000000", &req2), &out)).?;
+    try testing.expectEqual(@as(u8, 0x03), rep2[23]);
+    try testing.expectEqual(@as(u8, 0xFF), rep2[29]);
+}
+
+test "set clock validates, stores through the setter, and answers empty success" {
+    var tc: TestClock = .{};
+    var r = Responder.init(.{ .clock = .{ .ctx = &tc, .now = TestClock.now, .set = TestClock.set } }, &.{});
+    var req: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const rep = (try r.handle(hex(set_clock_req, &req), &out)).?;
+    try testing.expectEqual(@as(usize, 1), tc.sets);
+    try testing.expectEqual(@as(u16, 2026), tc.now_value.year);
+    try testing.expectEqual(@as(u16, 987), tc.now_value.millisecond);
+    try testing.expectEqual(@as(u8, 5), tc.now_value.weekday);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x01, 0x12, 0x08, 0x12, 0x87, 0x02, 0x00, 0, 0, 0, 0 }, rep[17..29]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xFF, 0x09, 0x00, 0x00 }, rep[29..]);
+}
+
+test "clock services refuse politely: no clock, read-only clock, malformed date-time" {
+    var req: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    // No clock configured: read and set both get an error response.
+    var r0 = Responder.init(.{}, &.{});
+    const a = (try r0.handle(hex(read_clock_req, &req), &out)).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, a[27..29]);
+    try testing.expectEqual(@as(u8, 0x0A), a[29]);
+    const b = (try r0.handle(hex(set_clock_req, &req), &out)).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, b[27..29]);
+
+    // Read-only clock: set is refused, the clock is untouched.
+    var tc: TestClock = .{};
+    var r1 = Responder.init(.{ .clock = .{ .ctx = &tc, .now = TestClock.now } }, &.{});
+    const c = (try r1.handle(hex(set_clock_req, &req), &out)).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, c[27..29]);
+    try testing.expectEqual(@as(u8, 0x03), c[29]);
+    try testing.expectEqual(@as(usize, 0), tc.sets);
+
+    // A malformed date-time (month 13, BCD digit 0xA, short payload, wrong
+    // return code) is refused and never reaches the setter.
+    var r2 = Responder.init(.{ .clock = .{ .ctx = &tc, .now = TestClock.now, .set = TestClock.set } }, &.{});
+    const bad = [_][]const u8{
+        "0300002702f0803207000004000008000e0001120411470200" ++ "ff09000a00202613191345599875",
+        "0300002702f0803207000004000008000e0001120411470200" ++ "ff09000a0020261119134a599875",
+        "0300002702f0803207000004000008000e0001120411470200" ++ "ff09000a002026111913455998a5",
+        "0300002502f0803207000004000008000c0001120411470200" ++ "ff0900080020261119134559",
+        "0300002702f0803207000004000008000e0001120411470200" ++ "0a09000a00202611191345599875",
+    };
+    inline for (bad) |frame| {
+        var fb: [64]u8 = undefined;
+        const rep = (try r2.handle(hex(frame, &fb), &out)).?;
+        try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, rep[27..29]);
+        try testing.expectEqual(@as(u8, 0x07), rep[29]);
+    }
+    try testing.expectEqual(@as(usize, 0), tc.sets);
+
+    // An unknown time subfunction is answered with the error too.
+    var fb: [64]u8 = undefined;
+    const u = (try r2.handle(hex("0300001d02f080320700000300000800040001120411470900" ++ "0a000000", &fb), &out)).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, u[27..29]);
 }
 
 test "a Read Var item with count 0 on the bit path does not index past the area" {

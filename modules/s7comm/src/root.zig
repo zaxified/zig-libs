@@ -152,6 +152,8 @@ pub const Setup = s7.Setup;
 pub const SzlId = userdata.SzlId;
 pub const SzlResponse = userdata.SzlResponse;
 pub const CpuStatus = userdata.CpuStatus;
+pub const DateTime = userdata.DateTime;
+pub const Clock = server.Clock;
 
 // ── S7CommPlus top-level names (the 0x72 / S7-1200/1500 world) ──────────────
 pub const S7PlusClient = s7plus.client.Client;
@@ -293,6 +295,39 @@ test "round trip: client against responder over an in-memory wire" {
     c.disconnect();
     try testing.expect(!r.connected);
     try testing.expectEqual(@as(usize, 0), paired.failures);
+}
+
+test "round trip: read and set the CPU clock through the injected clock" {
+    const Ck = struct {
+        var value: DateTime = .{ .year = 2031, .month = 2, .day = 28, .hour = 23, .minute = 59, .second = 58, .millisecond = 5, .weekday = 2 };
+        fn now(_: ?*anyopaque) DateTime {
+            return value;
+        }
+        fn set(_: ?*anyopaque, v: DateTime) void {
+            value = v;
+        }
+    };
+    var r = Responder.init(.{ .clock = .{ .now = Ck.now, .set = Ck.set } }, &.{});
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    try testing.expectEqual(Ck.value, try c.readClock());
+    const t: DateTime = .{ .year = 1995, .month = 7, .day = 4, .hour = 1, .minute = 2, .second = 3, .millisecond = 456, .weekday = 3 };
+    try c.setClock(t);
+    try testing.expectEqual(t, Ck.value);
+    try testing.expectEqual(t, try c.readClock());
+    // An invalid value is refused before it is sent.
+    try testing.expectError(error.BadDateTime, c.setClock(.{ .year = 2026, .month = 2, .day = 30 }));
+    try testing.expectEqual(t, Ck.value);
+    // A responder without a clock answers; the client reports it as a PLC error.
+    var r2 = Responder.init(.{}, &.{});
+    var paired2 = PairedTransport{ .responder = &r2 };
+    var buf2: [1024]u8 = undefined;
+    var c2 = try Client.init(paired2.seam(), &buf2, .{});
+    try c2.connect();
+    try testing.expectError(error.PlcError, c2.readClock());
+    try testing.expectError(error.PlcError, c2.setClock(t));
 }
 
 test "round trip: an odd-length multi-item write pads the way the wire needs" {
