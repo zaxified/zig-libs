@@ -46,6 +46,9 @@ pub const Error = error{
     BadSzl,
     /// The caller's output buffer is too small.
     BufferTooSmall,
+    /// A date-time is not the 10-octet form, has a BCD digit above 9, or a
+    /// field outside its range (month, day of month, hour, ...).
+    BadDateTime,
 } || items.Error;
 
 /// High nibble of the `type|group` octet.
@@ -78,6 +81,16 @@ pub const CpuSubfunction = enum(u8) {
     message_service = 0x02,
     diagnostic_message = 0x03,
     alarm8_indication = 0x05,
+    _,
+};
+
+/// Subfunctions of `time_functions` (group 7). `0x03` and `0x04` are the
+/// variants some engineering tools use; the wire payload is the same.
+pub const TimeSubfunction = enum(u8) {
+    read_clock = 0x01,
+    set_clock = 0x02,
+    read_clock_following = 0x03,
+    set_clock_alt = 0x04,
     _,
 };
 
@@ -327,6 +340,117 @@ pub fn cpuStatusFrom(resp: SzlResponse) ?CpuStatus {
     return @fromBackingInt(@intCast(rec[cpu_status_offset]));
 }
 
+// ── Time of day ─────────────────────────────────────────────────────────────
+
+/// The S7 date-time of the time-of-day services, the 10-octet BCD form:
+///
+/// ```text
+/// reserved  year1  year2  month  day  hour  minute  second  ms(hundreds,tens)  ms(units)|weekday
+/// ```
+///
+/// Every octet is two BCD digits except the last, whose high nibble is the
+/// units digit of the milliseconds and whose low nibble is the weekday
+/// (1 = Sunday .. 7 = Saturday, 0 = undefined). `year1` is ignored on decode
+/// (some CPUs send `0x19` for 20xx) and `year2` 00-89 means 2000-2089, 90-99
+/// means 1990-1999. Layout after the Wireshark s7comm dissector (field layout
+/// only) and the 8-octet S7 DATE_AND_TIME helper of gos7 (BSD-3), which this
+/// form extends by the leading `reserved` and `year1` octets. Note: the
+/// pure-Python python-snap7 uses an 8-octet form without those two octets and
+/// Monday = 1; it is not a byte-layout oracle for this one.
+pub const DateTime = struct {
+    /// 1990..2089.
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8 = 0,
+    minute: u8 = 0,
+    second: u8 = 0,
+    millisecond: u16 = 0,
+    /// 1 = Sunday .. 7 = Saturday, 0 = undefined.
+    weekday: u8 = 0,
+
+    pub const wire_len: usize = 10;
+
+    /// Checks every field range, including the day of month for the month and
+    /// leap year.
+    pub fn validate(self: DateTime) Error!void {
+        if (self.year < 1990 or self.year > 2089) return error.BadDateTime;
+        if (self.month < 1 or self.month > 12) return error.BadDateTime;
+        if (self.day < 1 or self.day > daysInMonth(self.year, self.month)) return error.BadDateTime;
+        if (self.hour > 23 or self.minute > 59 or self.second > 59) return error.BadDateTime;
+        if (self.millisecond > 999 or self.weekday > 7) return error.BadDateTime;
+    }
+
+    pub fn encode(self: DateTime, out: []u8) Error![]u8 {
+        try self.validate();
+        if (out.len < wire_len) return error.BufferTooSmall;
+        const y: u8 = @intCast(self.year % 100);
+        out[0] = 0x00;
+        out[1] = if (self.year >= 2000) 0x20 else 0x19;
+        out[2] = bcd(y);
+        out[3] = bcd(self.month);
+        out[4] = bcd(self.day);
+        out[5] = bcd(self.hour);
+        out[6] = bcd(self.minute);
+        out[7] = bcd(self.second);
+        out[8] = bcd(@intCast(self.millisecond / 10));
+        out[9] = (@as(u8, @intCast(self.millisecond % 10)) << 4) | self.weekday;
+        return out[0..wire_len];
+    }
+
+    /// Decodes exactly ten octets; any other length, a BCD digit above 9 or a
+    /// field out of range is `BadDateTime`.
+    pub fn decode(bytes: []const u8) Error!DateTime {
+        if (bytes.len != wire_len) return error.BadDateTime;
+        const year2 = try unbcd(bytes[2]);
+        var ms: u16 = @as(u16, try unbcd(bytes[8])) * 10;
+        const units = bytes[9] >> 4;
+        if (units > 9) return error.BadDateTime;
+        ms += units;
+        const dt: DateTime = .{
+            .year = (if (year2 < 90) @as(u16, 2000) else 1900) + year2,
+            .month = try unbcd(bytes[3]),
+            .day = try unbcd(bytes[4]),
+            .hour = try unbcd(bytes[5]),
+            .minute = try unbcd(bytes[6]),
+            .second = try unbcd(bytes[7]),
+            .millisecond = ms,
+            .weekday = bytes[9] & 0x0F,
+        };
+        try dt.validate();
+        return dt;
+    }
+
+    /// Weekday (1 = Sunday .. 7 = Saturday) of the calendar date, for callers
+    /// that fill `weekday` from a clock.
+    pub fn weekdayOf(year: u16, month: u8, day: u8) u8 {
+        // Sakamoto's method: 0 = Sunday.
+        const t = [12]u16{ 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+        const y: u32 = if (month < 3) year - 1 else year;
+        const w = (y + y / 4 - y / 100 + y / 400 + t[month - 1] + day) % 7;
+        return @intCast(w + 1);
+    }
+};
+
+fn daysInMonth(year: u16, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        else => if ((year % 4 == 0 and year % 100 != 0) or year % 400 == 0) 29 else 28,
+    };
+}
+
+fn bcd(v: u8) u8 {
+    return ((v / 10) << 4) | (v % 10);
+}
+
+fn unbcd(b: u8) Error!u8 {
+    const hi = b >> 4;
+    const lo = b & 0x0F;
+    if (hi > 9 or lo > 9) return error.BadDateTime;
+    return hi * 10 + lo;
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -447,6 +571,94 @@ test "F9: a bit-counted length that is not a whole octet is refused, not floor-d
     try testing.expectEqual(@as(usize, 2), dec.payload.len);
 }
 
+test "date-time encodes to the 10-octet BCD form and back" {
+    var buf: [10]u8 = undefined;
+    const dt: DateTime = .{ .year = 2026, .month = 11, .day = 19, .hour = 13, .minute = 45, .second = 59, .millisecond = 987, .weekday = 5 };
+    const enc = try dt.encode(&buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x20, 0x26, 0x11, 0x19, 0x13, 0x45, 0x59, 0x98, 0x75 }, enc);
+    try testing.expectEqual(dt, try DateTime.decode(enc));
+    // 1990s: year2 90..99, century octet 0x19.
+    const old: DateTime = .{ .year = 1999, .month = 12, .day = 31 };
+    const e2 = try old.encode(&buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x19, 0x99, 0x12, 0x31, 0, 0, 0, 0, 0 }, e2);
+    try testing.expectEqual(@as(u16, 1999), (try DateTime.decode(e2)).year);
+    const y2000 = try (DateTime{ .year = 2000, .month = 1, .day = 1 }).encode(&buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x20, 0x00 }, y2000[0..3]);
+    // Boundaries of the year split: 89 -> 2089, 90 -> 1990.
+    try testing.expectEqual(@as(u16, 2089), (try DateTime.decode(&[_]u8{ 0, 0x20, 0x89, 1, 1, 0, 0, 0, 0, 0 })).year);
+    try testing.expectEqual(@as(u16, 1990), (try DateTime.decode(&[_]u8{ 0, 0x19, 0x90, 1, 1, 0, 0, 0, 0, 0 })).year);
+    // year1 and the reserved octet are ignored.
+    try testing.expectEqual(@as(u16, 2014), (try DateTime.decode(&[_]u8{ 0x07, 0x19, 0x14, 1, 1, 0, 0, 0, 0, 0 })).year);
+    try testing.expectError(error.BufferTooSmall, dt.encode(buf[0..9]));
+}
+
+test "date-time decode rejects bad BCD, ranges and lengths" {
+    const good = [_]u8{ 0x00, 0x20, 0x26, 0x02, 0x28, 0x23, 0x59, 0x59, 0x99, 0x97 };
+    _ = try DateTime.decode(&good);
+    try testing.expectError(error.BadDateTime, DateTime.decode(good[0..9]));
+    var long: [11]u8 = undefined;
+    @memcpy(long[0..10], &good);
+    long[10] = 0;
+    try testing.expectError(error.BadDateTime, DateTime.decode(&long));
+    // Every octet position: a high nibble above 9 and a low nibble above 9.
+    for ([_]usize{ 2, 3, 4, 5, 6, 7, 8 }) |i| {
+        var b = good;
+        b[i] = 0xA0 | (good[i] & 0x0F);
+        try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+        b = good;
+        b[i] = (good[i] & 0xF0) | 0x0A;
+        try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+    }
+    var b = good;
+    b[9] = 0xA7; // ms units digit 10
+    try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+    b = good;
+    b[9] = 0x98; // weekday 8
+    try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+    b[9] = 0x90; // weekday 0 (undefined) is allowed
+    _ = try DateTime.decode(&b);
+    // Ranges: month 0/13, day 0/32, hour 24, minute 60, second 60.
+    const cases = [_]struct { i: usize, v: u8 }{
+        .{ .i = 3, .v = 0x00 }, .{ .i = 3, .v = 0x13 }, .{ .i = 4, .v = 0x00 }, .{ .i = 4, .v = 0x32 },
+        .{ .i = 5, .v = 0x24 }, .{ .i = 6, .v = 0x60 }, .{ .i = 7, .v = 0x60 },
+    };
+    for (cases) |c| {
+        b = good;
+        b[c.i] = c.v;
+        try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+    }
+    // Day of month: 30 February, 29 February in a non-leap year, 31 April.
+    b = good;
+    b[3] = 0x02;
+    b[4] = 0x30;
+    try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+    b[4] = 0x29; // 2026 is not a leap year
+    try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+    b[2] = 0x24; // 2024 is
+    _ = try DateTime.decode(&b);
+    b[2] = 0x00; // 2000 is (divisible by 400)
+    _ = try DateTime.decode(&b);
+    b[2] = 0x99; // 1999 is not
+    try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+    b[3] = 0x04;
+    b[4] = 0x31;
+    b[2] = 0x26;
+    try testing.expectError(error.BadDateTime, DateTime.decode(&b));
+    // Encode refuses what decode refuses.
+    var out: [10]u8 = undefined;
+    try testing.expectError(error.BadDateTime, (DateTime{ .year = 1989, .month = 1, .day = 1 }).encode(&out));
+    try testing.expectError(error.BadDateTime, (DateTime{ .year = 2090, .month = 1, .day = 1 }).encode(&out));
+    try testing.expectError(error.BadDateTime, (DateTime{ .year = 2026, .month = 1, .day = 1, .millisecond = 1000 }).encode(&out));
+    try testing.expectError(error.BadDateTime, (DateTime{ .year = 2026, .month = 1, .day = 1, .weekday = 8 }).encode(&out));
+}
+
+test "weekdayOf: 1 = Sunday" {
+    try testing.expectEqual(@as(u8, 5), DateTime.weekdayOf(2026, 11, 19)); // Thursday
+    try testing.expectEqual(@as(u8, 7), DateTime.weekdayOf(2000, 1, 1)); // Saturday
+    try testing.expectEqual(@as(u8, 1), DateTime.weekdayOf(2024, 3, 3)); // Sunday, after a leap day
+    try testing.expectEqual(@as(u8, 5), DateTime.weekdayOf(2024, 2, 29)); // Thursday
+}
+
 test "cpu status is read from the 0x0424 record" {
     // The two records the same CPU returned while running and while stopped.
     const running = [_]u8{
@@ -498,14 +710,18 @@ const userdata_seeds = [_][]const u8{
     fuzzSeed("ff09"), // truncated inside the data block header
     fuzzSeed("ff090008001100010004000000010002"), // an SZL response with one record
     fuzzSeed("ff09000c00110002000400000001000200030004"), // two records
-    fuzzSeed("ff0900080011000400040000"), // a record count past the payload
+    fuzzSeed("00202611191345599875"), // a valid date-time, ten octets
+    fuzzSeed("00199912312359599997"), // 1999, the last millisecond digit 9
+    fuzzSeed("0020261319134a599875"), // month 13, minute BCD digit A
+    fuzzSeed("00201902291200000000"), // 29 February 2019
+    fuzzSeed("0020261119134599"), // a date-time two octets short
 };
 
 test "fuzz: userdata decoders never panic" {
     try std.testing.fuzz({}, fuzzUserdataSmith, .{ .corpus = &userdata_seeds });
 }
 
-const fuzzUserdataMark = fz.Marker(enum { ran, nonempty });
+const fuzzUserdataMark = fz.Marker(enum { ran, nonempty, clock_decoded, clock_rejected });
 
 fn fuzzUserdataSmith(_: void, smith: *std.testing.Smith) !void {
     try fuzzUserdata(std.testing.Smith, smith, std.testing.allocator);
@@ -528,6 +744,18 @@ fn fuzzUserdata(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     if (DataBlock.decode(buf[0..len])) |db| {
         try testing.expect(db.payload.len + 4 <= len);
     } else |_| {}
+    if (DateTime.decode(buf[0..len])) |dt| {
+        fuzzUserdataMark.mark(.clock_decoded);
+        // Whatever decoded re-encodes, and re-decodes to the same value.
+        var again: [DateTime.wire_len]u8 = undefined;
+        const back = try DateTime.decode(try dt.encode(&again));
+        try testing.expectEqual(dt, back);
+        // Canonical form: octets 2..9 re-encode to what was decoded (a nibble
+        // above 9 must never have been accepted); 0 and 1 are ignored on decode.
+        try testing.expectEqualSlices(u8, buf[2..DateTime.wire_len], again[2..DateTime.wire_len]);
+    } else |_| {
+        if (len == DateTime.wire_len) fuzzUserdataMark.mark(.clock_rejected);
+    }
     if (SzlResponse.decode(buf[0..len])) |r| {
         var i: usize = 0;
         while (i < 300) : (i += 1) {

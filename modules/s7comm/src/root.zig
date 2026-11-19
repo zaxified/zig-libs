@@ -152,6 +152,8 @@ pub const Setup = s7.Setup;
 pub const SzlId = userdata.SzlId;
 pub const SzlResponse = userdata.SzlResponse;
 pub const CpuStatus = userdata.CpuStatus;
+pub const DateTime = userdata.DateTime;
+pub const Clock = server.Clock;
 
 // ── S7CommPlus top-level names (the 0x72 / S7-1200/1500 world) ──────────────
 pub const S7PlusClient = s7plus.client.Client;
@@ -200,6 +202,12 @@ const PairedTransport = struct {
     queue_pos: usize = 0,
     /// Requests the responder refused, so a test can assert on them.
     failures: usize = 0,
+    /// Test hooks: copy of the last request, and one reply octet overwritten
+    /// after the responder produced it (offset into the reply TPKT).
+    last_req: [64]u8 = undefined,
+    last_req_len: usize = 0,
+    tamper_at: usize = 0,
+    tamper_val: ?u8 = null,
 
     fn seam(self: *PairedTransport) Transport {
         return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
@@ -217,6 +225,8 @@ const PairedTransport = struct {
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
         const self: *PairedTransport = @ptrCast(@alignCast(ctx));
+        self.last_req_len = @min(bytes.len, self.last_req.len);
+        @memcpy(self.last_req[0..self.last_req_len], bytes[0..self.last_req_len]);
         const reply = self.responder.handle(bytes, &self.out) catch {
             self.failures += 1;
             return;
@@ -224,6 +234,7 @@ const PairedTransport = struct {
         const r = reply orelse return;
         if (self.queue_len + r.len > self.queue.len) return error.WriteFailed;
         @memcpy(self.queue[self.queue_len..][0..r.len], r);
+        if (self.tamper_val) |v| self.queue[self.queue_len + self.tamper_at] = v;
         self.queue_len += r.len;
     }
 };
@@ -293,6 +304,201 @@ test "round trip: client against responder over an in-memory wire" {
     c.disconnect();
     try testing.expect(!r.connected);
     try testing.expectEqual(@as(usize, 0), paired.failures);
+}
+
+test "round trip: read and set the CPU clock through the injected clock" {
+    const Ck = struct {
+        var value: DateTime = .{ .year = 2031, .month = 2, .day = 28, .hour = 23, .minute = 59, .second = 58, .millisecond = 5, .weekday = 2 };
+        fn now(_: ?*anyopaque) DateTime {
+            return value;
+        }
+        fn set(_: ?*anyopaque, v: DateTime) void {
+            value = v;
+        }
+    };
+    var r = Responder.init(.{ .clock = .{ .now = Ck.now, .set = Ck.set } }, &.{});
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    try testing.expectEqual(Ck.value, try c.readClock());
+    const t: DateTime = .{ .year = 1995, .month = 7, .day = 4, .hour = 1, .minute = 2, .second = 3, .millisecond = 456, .weekday = 3 };
+    try c.setClock(t);
+    try testing.expectEqual(t, Ck.value);
+    try testing.expectEqual(t, try c.readClock());
+    // An invalid value is refused before it is sent.
+    try testing.expectError(error.BadDateTime, c.setClock(.{ .year = 2026, .month = 2, .day = 30 }));
+    try testing.expectEqual(t, Ck.value);
+    // A responder without a clock answers; the client reports it as a PLC error.
+    var r2 = Responder.init(.{}, &.{});
+    var paired2 = PairedTransport{ .responder = &r2 };
+    var buf2: [1024]u8 = undefined;
+    var c2 = try Client.init(paired2.seam(), &buf2, .{});
+    try c2.connect();
+    try testing.expectError(error.PlcError, c2.readClock());
+    try testing.expectError(error.PlcError, c2.setClock(t));
+}
+
+test "clock client: not connected, request bytes, and every reply-shape check" {
+    const Ck = struct {
+        fn now(_: ?*anyopaque) DateTime {
+            return .{ .year = 2026, .month = 11, .day = 19, .hour = 13, .minute = 45, .second = 59, .millisecond = 987, .weekday = 5 };
+        }
+        fn set(_: ?*anyopaque, _: DateTime) void {}
+    };
+    var r = Responder.init(.{ .clock = .{ .now = Ck.now, .set = Ck.set } }, &.{});
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    const t = Ck.now(null);
+    try testing.expectError(error.NotConnected, c.readClock());
+    try testing.expectError(error.NotConnected, c.setClock(t));
+    try c.connect();
+
+    // The requests, byte for byte (userdata group 7, subfunction 1 and 2).
+    _ = try c.readClock();
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0x00, 0x01, 0x12, 0x04, 0x11, 0x47, 0x01, 0x00, // parameters
+        0x0A, 0x00, 0x00, 0x00, // data: object does not exist, no payload
+    }, paired.last_req[17..29]);
+    try c.setClock(t);
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0x00, 0x01, 0x12, 0x04, 0x11, 0x47, 0x02, 0x00,
+        0xFF, 0x09, 0x00, 0x0A, 0x00, 0x20, 0x26, 0x11,
+        0x19, 0x13, 0x45, 0x59, 0x98, 0x75,
+    }, paired.last_req[17..39]);
+
+    // One reply octet damaged at a time (offsets into the reply TPKT: 8 = ROSCTR,
+    // 22 = type|group, 23 = subfunction, 29 = data return code).
+    const Case = struct { at: usize, val: u8 };
+    const bad = [_]Case{
+        .{ .at = 8, .val = 0x01 },
+        .{ .at = 22, .val = 0x47 }, // request, not response
+        .{ .at = 22, .val = 0x84 }, // another function group
+        .{ .at = 23, .val = 0x02 }, // another subfunction
+    };
+    for (bad) |cs| {
+        paired.tamper_at = cs.at;
+        paired.tamper_val = cs.val;
+        try testing.expectError(error.UnexpectedReply, c.readClock());
+    }
+    paired.tamper_at = 29;
+    paired.tamper_val = 0x0A;
+    try testing.expectError(error.ItemError, c.readClock());
+    try testing.expectError(error.ItemError, c.setClock(t));
+    paired.tamper_at = 22;
+    paired.tamper_val = 0x47;
+    try testing.expectError(error.UnexpectedReply, c.setClock(t));
+    paired.tamper_val = null;
+    // The error code of the parameters (octets 27, 28).
+    paired.tamper_at = 28;
+    paired.tamper_val = 0x01;
+    try testing.expectError(error.PlcError, c.readClock());
+    paired.tamper_val = null;
+    _ = try c.readClock();
+}
+
+// ── fuzz: the client parsing a damaged clock reply ──────────────────────────
+
+const fz = @import("fuzz_test.zig");
+const fuzzClockMark = fz.Marker(enum { ran, read_ok, read_err, set_ok, set_err });
+
+/// A wire whose replies are the responder's, damaged after the handshake:
+/// 0-3 octets anywhere, and in half the cases one more
+/// octet inside the parameters or the date-time, where the checks are.
+fn FuzzReplyWire(comptime S: type) type {
+    return struct {
+        const Self = @This();
+        responder: *Responder,
+        src: *S,
+        out: [4096]u8 = undefined,
+        queue: [4096]u8 = undefined,
+        queue_len: usize = 0,
+        queue_pos: usize = 0,
+        armed: bool = false,
+
+        fn seam(self: *Self) Transport {
+            return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
+        }
+
+        fn readFn(ctx: *anyopaque, buf: []u8) TransportError!usize {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const avail = self.queue_len - self.queue_pos;
+            if (avail == 0) return 0;
+            const n = @min(avail, buf.len);
+            @memcpy(buf[0..n], self.queue[self.queue_pos..][0..n]);
+            self.queue_pos += n;
+            return n;
+        }
+
+        fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const reply = (self.responder.handle(bytes, &self.out) catch return) orelse return;
+            self.queue_pos = 0;
+            if (!self.armed) {
+                @memcpy(self.queue[0..reply.len], reply);
+                self.queue_len = reply.len;
+                return;
+            }
+            // Every draw is a full-width `value(u64)` reduced here: a ranged or
+            // narrow draw collapses to its minimum under `Smith`.
+            var n = @min(reply.len, self.queue.len);
+            @memcpy(self.queue[0..n], reply[0..n]);
+            const hits = self.src.value(u64) % 4;
+            for (0..hits) |_| {
+                self.queue[self.src.value(u64) % n] = @truncate(self.src.value(u64));
+            }
+            // And one octet inside the parameters or the date-time, where the checks are.
+            if (self.src.value(u64) % 2 == 0 and n > 17) {
+                self.queue[17 + self.src.value(u64) % (n - 17)] = @truncate(self.src.value(u64));
+            }
+            // A truncated frame: the client must see a closed stream, not hang.
+            if (self.src.value(u64) % 6 == 0) n = @intCast(self.src.value(u64) % (n + 1));
+            self.queue_len = n;
+        }
+    };
+}
+
+fn fuzzClockClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    fuzzClockMark.mark(.ran);
+    const Ck = struct {
+        fn now(_: ?*anyopaque) DateTime {
+            return .{ .year = 2026, .month = 11, .day = 19, .hour = 13, .minute = 45, .second = 59, .millisecond = 987, .weekday = 5 };
+        }
+        fn set(_: ?*anyopaque, _: DateTime) void {}
+    };
+    var r = Responder.init(.{ .clock = .{ .now = Ck.now, .set = Ck.set } }, &.{});
+    var wire = FuzzReplyWire(S){ .responder = &r, .src = src };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(wire.seam(), &buf, .{});
+    try c.connect();
+    wire.armed = true;
+    if (src.value(u64) % 2 == 0) {
+        if (c.readClock()) |dt| {
+            // Whatever the client returns is a valid date-time.
+            try dt.validate();
+            fuzzClockMark.mark(.read_ok);
+        } else |_| fuzzClockMark.mark(.read_err);
+    } else {
+        if (c.setClock(Ck.now(null))) |_| fuzzClockMark.mark(.set_ok) else |_| fuzzClockMark.mark(.set_err);
+    }
+}
+
+fn fuzzClockClientSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzClockClient(std.testing.Smith, smith, std.testing.allocator);
+}
+
+test "fuzz: the clock client survives damaged replies" {
+    try std.testing.fuzz({}, fuzzClockClientSmith, .{});
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzClockClient)" {
+    try fz.fuzz_driver.run(fuzzClockClient, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-root-fuzzClockClient" });
+}
+
+test "fuzz harness: fuzzClockClient, 400 seeds, reaches every outcome" {
+    try fuzzClockMark.reach(fuzzClockClient, "s7comm-root-fuzzClockClient", 400);
 }
 
 test "round trip: an odd-length multi-item write pads the way the wire needs" {

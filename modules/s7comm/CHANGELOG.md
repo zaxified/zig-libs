@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** test only. The userdata fuzz harness checks that a decoded `DateTime` re-encodes to the same octets 2..9 (found necessary by a planted `unbcd` mutant).
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The fuzz harnesses now steer the time-of-day group: the responder harness sends group-7 requests (subfunctions 1-4, valid and damaged BCD date-times, short payloads, failing return codes) with a clock configured and asserts no invalid value reaches the setter; the userdata harness decodes and round-trips `DateTime`; a new harness (`fuzzClockClient`) damages the responder's replies and runs `readClock`/`setClock` on them.
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** SPEC scope line restored to the catalog format after the clock item.
+- **2026-11-19** — Delta mutation of the time-of-day code: 57 mutants, 12 survived and were killed by new tests (reply tampering via the paired-transport test hook, request bytes pinned, subfunction 0x04, sequence echo, invalid clock value); 57 of 57 killed. No library code changed.
+- **2026-11-19** — Time-of-day services (userdata group 7): `Client.readClock`/`setClock`, `userdata.DateTime` (10-octet BCD, every digit and range validated, `error.BadDateTime`), `userdata.TimeSubfunction`, responder `Config.clock` (`server.Clock`, caller-supplied `now`/optional `set`; no system time). Additive; no behaviour change for existing calls (a Userdata group-7 request used to be `error.Unsupported` from `handle`, now it is answered).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0. Test: `EnumSet(..).empty` for `initEmpty()`.
 - **2026-10-10** — tests: deterministic fuzz driver `S7COMM_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Fifteen harnesses (address, cotp, items item/dataItems, s7 decode, s7plus frame/object/path/value/var, server handle, tpkt decode/framer, userdata, vars). Verdict: 200,000 runs each, ReleaseSafe, clean.

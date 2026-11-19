@@ -516,6 +516,56 @@ pub const Client = struct {
         return userdata.cpuStatusFrom(r.response) orelse error.ShortReply;
     }
 
+    /// Reads the CPU clock (time functions, group 7, subfunction 1). The
+    /// request data block is `0a 00 00 00` (return code "object does not
+    /// exist", no payload), the shape every S7 driver sends for a read
+    /// request without arguments. Any malformed date-time in the reply is
+    /// `error.BadDateTime`.
+    pub fn readClock(self: *Client) Error!userdata.DateTime {
+        if (!self.connected) return error.NotConnected;
+        var params: [userdata.Param.request_len]u8 = undefined;
+        _ = try (userdata.Param{
+            .message_type = .request,
+            .function_group = .time_functions,
+            .subfunction = @backingInt(userdata.TimeSubfunction.read_clock),
+        }).encodeRequest(&params);
+        var data: [4]u8 = undefined;
+        const block = try userdata.DataBlock.encode(.object_does_not_exist, .null_size, &.{}, &data);
+        const pdu = try self.exchange(.userdata, &params, &[_][]const u8{block});
+        const db = try self.expectTimeReply(pdu, .read_clock);
+        if (!db.return_code.isSuccess()) return error.ItemError;
+        return userdata.DateTime.decode(db.payload);
+    }
+
+    /// Sets the CPU clock (time functions, group 7, subfunction 2). The
+    /// date-time is validated before anything is sent. Like the control calls
+    /// below this changes the process: only on equipment you own.
+    pub fn setClock(self: *Client, value: userdata.DateTime) Error!void {
+        if (!self.connected) return error.NotConnected;
+        var params: [userdata.Param.request_len]u8 = undefined;
+        _ = try (userdata.Param{
+            .message_type = .request,
+            .function_group = .time_functions,
+            .subfunction = @backingInt(userdata.TimeSubfunction.set_clock),
+        }).encodeRequest(&params);
+        var ts: [userdata.DateTime.wire_len]u8 = undefined;
+        const payload = try value.encode(&ts);
+        var data: [4 + userdata.DateTime.wire_len]u8 = undefined;
+        const block = try userdata.DataBlock.encode(.success, .octet_string, payload, &data);
+        const pdu = try self.exchange(.userdata, &params, &[_][]const u8{block});
+        const db = try self.expectTimeReply(pdu, .set_clock);
+        if (!db.return_code.isSuccess()) return error.ItemError;
+    }
+
+    fn expectTimeReply(_: *Client, pdu: s7.Pdu, sub: userdata.TimeSubfunction) Error!userdata.DataBlock {
+        if (pdu.header.rosctr != .userdata) return error.UnexpectedReply;
+        const rp = try userdata.Param.decode(pdu.parameters);
+        if (!rp.isResponse() or rp.function_group != .time_functions or
+            rp.subfunction != @backingInt(sub)) return error.UnexpectedReply;
+        if (rp.error_code != 0) return error.PlcError;
+        return userdata.DataBlock.decode(pdu.data);
+    }
+
     // ── PLC control — DANGEROUS ────────────────────────────────────────────
     //
     // These stop or restart a running machine. S7comm has no authentication:
