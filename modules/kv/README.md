@@ -77,6 +77,19 @@ const ks = try db.keys(gpa, "user:");
 defer ks.deinit(gpa);
 for (ks.keys) |k| _ = k;
 
+// Paged listing: at most 100 keys in memory per call, resumable from the last key.
+var after: ?[]u8 = null;
+defer if (after) |a| gpa.free(a);
+while (true) {
+    const page = try db.scanKeys(gpa, "user:", after, 100);
+    defer page.deinit(gpa);
+    for (page.keys) |k| _ = k;               // sorted; a key live throughout is listed once
+    if (!page.more) break;
+    const next = try gpa.dupe(u8, page.last().?);
+    if (after) |a| gpa.free(a);
+    after = next;
+}
+
 // Expiry (wall clock, ms since the Unix epoch — survives a restart):
 try db.putTtl("sess:ab12", "…", 30 * 60 * 1000);      // absent 30 min from now
 try db.putExpiring("otp:42", "…", deadline_ms);        // absent from deadline_ms on

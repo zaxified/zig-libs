@@ -287,6 +287,49 @@ a merge or compaction between the two calls can return values from different mom
   writer and a merger, 20 clean runs). Mutant: retirement ignoring pins — red (reads from closed
   handles, leaks).
 
+## Paged key scan
+
+`Db.scanKeys(gpa, prefix, after, limit)` → `ScanPage` (`keys`, `more`, `last()`, `deinit`) (2026-11-19,
+first user: `sessions`' `KvStore.iterate`, whose `keys` call held every session key in memory at once).
+The at most `limit` smallest live keys under `prefix` that sort strictly after `after` (null = from the
+start), sorted bytewise; resume with `after = page.last()` while `page.more`.
+
+- **Memory per call: `limit`, not the store.** One pass over the keydir under the shared keydir lock
+  keeps the `limit` smallest candidates in a bounded max-heap of borrowed keys (sized
+  `min(limit, keydir entries)`, so a huge `limit` costs nothing extra), then copies them out before the
+  lock is released. `more` = a candidate was turned away, so a full last page says `false` and needs no
+  extra call. `limit == 0` → `error.InvalidLimit` (new `ScanError = Allocator.Error || {InvalidLimit}`;
+  Redis refuses `COUNT 0` too).
+- **Time per call: one keydir pass** — the keydir is a hash map, so there is no ordered index to seek;
+  a full scan in pages of `limit` is `count / limit` passes. Ordered indexes stay out of scope (§ Threat
+  model); a caller that can afford the memory and wants one pass uses `keys` or `iterator`.
+- **Consistency model (stated in the doc comment):** each page is a snapshot of the keydir at its call;
+  nothing is held between calls (no lock, no pin). The cursor is a **key**, not a position, so across
+  pages — whatever writes, deletes, merges, compactions or a crash + reopen happen in between:
+  a key live for the whole scan is listed **exactly once**; no key is listed twice and keys come in
+  strictly ascending order; a key put between pages is listed iff it sorts after the cursor at the next
+  call; a key deleted or expired between pages is not listed if it sorts after the cursor, and stays
+  listed if an earlier page returned it (a `get` then answers null). Values are not read (`get` per key,
+  as for `keys`).
+- **Why this model (compared 2026-11-19):** Redis `SCAN` (redis.io/commands/scan, "Scan guarantees"):
+  a full iteration returns every element present from start to end, may return one **more than once**,
+  and elements added or removed meanwhile may or may not be returned — its cursor is a hash-table
+  position (reverse-binary, to survive a resize). etcd (`Range` with `limit`, paging by
+  `key = last + "\x00"`; consistent across pages only when the caller pins `revision`, MVCC that kv does
+  not have) and DynamoDB `Scan` (`ExclusiveStartKey`) page by **key**: no repeats, and the rest as here.
+  LevelDB/RocksDB iterators and bbolt cursors give a **snapshot** for the iterator's life — kv's
+  `iterator` already is that shape (memory O(keys)); resuming them across transactions is again a seek
+  to the last key. Bitcask's `fold`/`list_keys` freeze the keydir (multi-version entries) for the whole
+  walk. kv takes the key cursor: it is what the majority of paged scans without MVCC do, it is stronger
+  than Redis (no repeats, ordered) at the cost of one keydir pass per page, and a key survives every
+  change of the keydir's layout (rehash, merge, reopen), which a position would not.
+- **Tests:** page boundaries (page size 1, exactly full, one short, a `limit` of `maxInt(usize)`, empty
+  store, after the last key, `limit` 0); prefix, a cursor outside the prefix, a key that is a prefix of
+  the next, expired keys (never counted toward `more`); deletes and puts on both sides of the cursor
+  between pages, an overwrite, a delete of the page's own last key; a multi-file compaction and a crash +
+  reopen (`SimStorage`) between pages; 20 random stores (keys with `0x00`/`0xff` bytes) × random page
+  sizes against `keys`; an allocation-failure sweep (no leak, `OutOfMemory` only).
+
 ## Read-only open
 
 `Options.read_only` (2026-10-14, S2 survey R5b; Bitcask's read-only `open/1`) opens a store another
@@ -586,6 +629,7 @@ What moved it (2026-10-25): `FsStorage.initMmap` (reads lent from a mapping of t
 - **Hint files / fast open** *(survey 2026-09-30)* — `open` replays the whole log, so start time grows with store size; Bitcask's hint files exist for exactly this. Effort: medium (a second CRC'd file rewritten by `compact`, torn-hint fallback to replay, needs the VOPR sweep extended). Fits §2.
 - **Data-file rotation / multi-file log** *(survey 2026-09-30)* — one ever-growing file means compaction rewrites everything; Bitcask merges sealed files incrementally. Effort: large (format v2, manifest). Fits §2.
 - ~~**Atomic batch write**~~ *(survey 2026-09-30)* — **DONE 2026-11-15**, see § "Atomic batch".
+- ~~**Paged key scan with bounded memory**~~ *(asked for by `sessions`, whose `KvStore.iterate` listed every key at once)* — **DONE 2026-11-19**, see § "Paged key scan".
 - ~~**Per-key expiry (TTL)**~~ *(survey 2026-09-30)* — **DONE 2026-09-30**, see § "Key expiry". Not built: expiry in the background (a timer thread dropping keys) — `compact` is the caller's already, and an expired key costs only memory and disk until then.
 - ~~**Sync policy**~~ *(S2 survey 2026-10-14, R1)* — **DONE 2026-10-14**, see § "Sync policy".
 - ~~**Reader concurrency without a spinlock across fsync**~~ *(survey 2026-09-30)* — **DONE 2026-10-14 (in-process, S2 R5)**: writer mutex + keydir `RwLock`, exclusive only for the in-memory update. Tests: a reader answered (with the previous value) while a writer is parked inside fsync; readers alongside puts/deletes/compactions on the real filesystem, clean under ThreadSanitizer (`-fllvm -fsanitize-thread`; the self-hosted backend silently does not instrument — negative control needed it). Mutants: reader taking the writer lock (red), compaction swap without the exclusive lock (red + TSan races). Cross-process read-only open while a writer runs is the open half (S2 R5b).

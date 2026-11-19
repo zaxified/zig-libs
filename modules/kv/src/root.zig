@@ -2350,6 +2350,133 @@ pub const Db = struct {
         return .{ .keys = try out.toOwnedSlice(gpa) };
     }
 
+    /// One page of `scanKeys`: at most `limit` owned key copies, sorted
+    /// bytewise ascending.
+    pub const ScanPage = struct {
+        keys: [][]u8,
+        /// More live keys under the prefix sorted after the last one listed,
+        /// as of this call. False = the scan is complete.
+        more: bool,
+
+        /// The cursor for the next call: the last key listed, or null for an
+        /// empty page. Borrowed from the page — copy it before `deinit`.
+        pub fn last(p: ScanPage) ?[]const u8 {
+            return if (p.keys.len == 0) null else p.keys[p.keys.len - 1];
+        }
+
+        pub fn deinit(p: ScanPage, gpa: Allocator) void {
+            for (p.keys) |k| gpa.free(k);
+            gpa.free(p.keys);
+        }
+    };
+
+    pub const ScanError = Allocator.Error || error{
+        /// `limit` was 0.
+        InvalidLimit,
+    };
+
+    /// A paged scan of the live keys starting with `prefix` (`""` = all):
+    /// the at most `limit` smallest of those that sort strictly after
+    /// `after` (null = from the start), sorted bytewise ascending. Resume
+    /// with `after = page.last()` while `page.more`.
+    ///
+    /// Memory per call is bounded by `limit` (a heap of `limit` borrowed
+    /// keys, then `limit` copies), never by the store; the time is one pass
+    /// over the keydir under the shared keydir lock per page (no ordered
+    /// index), so a full scan in pages of `limit` costs `count / limit`
+    /// passes. No lock and nothing pinned between calls.
+    ///
+    /// Consistency: each page is a snapshot of the keydir at its call; the
+    /// cursor is a key, not a position, so across pages (writes, deletes,
+    /// merges, compactions, a reopen in between):
+    /// - a key live for the whole scan is listed exactly once;
+    /// - no key is listed twice and keys come in strictly ascending order;
+    /// - a key put between pages is listed iff it sorts after the cursor
+    ///   at the next call; a key deleted (or expired) between pages is not
+    ///   listed if it sorts after the cursor, and stays listed if an earlier
+    ///   page already returned it — read it with `get` to see it is gone.
+    /// Values are not read; use `get` per key (as for `keys`).
+    pub fn scanKeys(self: *Db, gpa: Allocator, prefix: []const u8, after: ?[]const u8, limit: usize) ScanError!ScanPage {
+        if (limit == 0) return error.InvalidLimit;
+        var n: usize = 0;
+        var more = false;
+        var out_buf: ?[][]u8 = null;
+        var copied: usize = 0;
+        errdefer if (out_buf) |out| {
+            for (out[0..copied]) |k| gpa.free(k);
+            gpa.free(out);
+        };
+        {
+            self.rw.lockShared();
+            defer self.rw.unlockShared();
+            const heap = try gpa.alloc(Scan.Slot, @min(limit, self.keydir.count()));
+            defer gpa.free(heap);
+            const now: i64 = if (self.expiring == 0) 0 else self.options.clock.now();
+            var it = self.keydir.iterator();
+            while (it.next()) |kv| {
+                const k = kv.key_ptr.*;
+                if (!std.mem.startsWith(u8, k, prefix)) continue;
+                if (after) |a| {
+                    if (!keyLess(a, k)) continue;
+                }
+                if (kv.value_ptr.expires() and !kv.value_ptr.liveAt(now)) continue;
+                // Keep the `limit` smallest in a max-heap (root = largest).
+                if (n < heap.len) {
+                    heap[n] = k;
+                    Scan.siftUp(heap, n);
+                    n += 1;
+                } else {
+                    // Full: every key from here on that is not kept is a
+                    // key after the page.
+                    more = true;
+                    if (keyLess(k, heap[0])) {
+                        heap[0] = k;
+                        Scan.siftDown(heap[0..n], 0);
+                    }
+                }
+            }
+            // Copied under the lock: the heap borrows the keydir's keys.
+            const out = try gpa.alloc([]u8, n);
+            out_buf = out;
+            while (copied < n) : (copied += 1) out[copied] = try gpa.dupe(u8, heap[copied]);
+        }
+        const out = out_buf.?;
+        std.sort.pdq([]u8, out, {}, struct {
+            fn lessThan(_: void, a: []u8, b: []u8) bool {
+                return keyLess(a, b);
+            }
+        }.lessThan);
+        return .{ .keys = out, .more = more };
+    }
+
+    /// The bounded max-heap `scanKeys` keeps its page in.
+    const Scan = struct {
+        const Slot = []const u8;
+
+        fn siftUp(h: []Slot, start: usize) void {
+            var i = start;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (!keyLess(h[parent], h[i])) break;
+                std.mem.swap(Slot, &h[parent], &h[i]);
+                i = parent;
+            }
+        }
+
+        fn siftDown(h: []Slot, start: usize) void {
+            var i = start;
+            while (true) {
+                const l = 2 * i + 1;
+                if (l >= h.len) break;
+                var big = l;
+                if (l + 1 < h.len and keyLess(h[l], h[l + 1])) big = l + 1;
+                if (!keyLess(h[i], h[big])) break;
+                std.mem.swap(Slot, &h[i], &h[big]);
+                i = big;
+            }
+        }
+    };
+
     /// A consistent snapshot of the live keys under a prefix and their
     /// values, in key order — Bitcask's `fold` / iterator. See `iterator`.
     pub const Iterator = struct {
@@ -4505,6 +4632,281 @@ test "iterator: expired keys are not listed" {
     var it = try db.iterator(testing.allocator, "");
     defer it.deinit();
     try expectPairs(&it, &.{.{ "live", "y" }});
+}
+
+/// Run a whole `scanKeys` scan in pages of `limit` and append every key to
+/// `out` (owned copies); checks each page's bound and order on the way.
+fn scanAll(db: *Db, prefix: []const u8, limit: usize, out: *std.ArrayList([]u8)) !void {
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |c| testing.allocator.free(c);
+    while (true) {
+        const page = try db.scanKeys(testing.allocator, prefix, cursor, limit);
+        defer page.deinit(testing.allocator);
+        try testing.expect(page.keys.len <= limit);
+        for (page.keys, 0..) |k, i| {
+            try testing.expect(std.mem.startsWith(u8, k, prefix));
+            if (i > 0) try testing.expect(keyLess(page.keys[i - 1], k));
+            if (cursor) |c| try testing.expect(keyLess(c, k));
+            try out.append(testing.allocator, try testing.allocator.dupe(u8, k));
+        }
+        // A page that says "more" is full; a full page may still be the last.
+        if (page.more) try testing.expectEqual(limit, page.keys.len);
+        if (!page.more) return;
+        const next = try testing.allocator.dupe(u8, page.last().?);
+        if (cursor) |c| testing.allocator.free(c);
+        cursor = next;
+    }
+}
+
+fn freeKeys(list: *std.ArrayList([]u8)) void {
+    for (list.items) |k| testing.allocator.free(k);
+    list.deinit(testing.allocator);
+}
+
+fn expectPage(page: Db.ScanPage, want: []const []const u8, more: bool) !void {
+    try testing.expectEqual(want.len, page.keys.len);
+    for (want, page.keys) |w, k| try testing.expectEqualStrings(w, k);
+    try testing.expectEqual(more, page.more);
+}
+
+test "scanKeys: page boundaries — size 1, exactly full, larger than the store, empty store" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+
+    // Empty store: an empty, final page; a 0 limit is refused.
+    {
+        const page = try db.scanKeys(testing.allocator, "", null, 1);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &.{}, false);
+        try testing.expectEqual(@as(?[]const u8, null), page.last());
+    }
+    try testing.expectError(error.InvalidLimit, db.scanKeys(testing.allocator, "", null, 0));
+
+    for ([_][]const u8{ "c", "a", "e", "b", "d" }) |k| try db.put(k, "v");
+    // Page size 1: one key per page, "more" until the last.
+    const want = [_][]const u8{ "a", "b", "c", "d", "e" };
+    for (want, 0..) |w, i| {
+        const after: ?[]const u8 = if (i == 0) null else want[i - 1];
+        const page = try db.scanKeys(testing.allocator, "", after, 1);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &.{w}, i + 1 < want.len);
+        try testing.expectEqualStrings(w, page.last().?);
+    }
+    // Exactly full: the page holds every key and nothing is left.
+    {
+        const page = try db.scanKeys(testing.allocator, "", null, 5);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &want, false);
+    }
+    // One short of full: "more", and the next page is the last key alone.
+    {
+        const page = try db.scanKeys(testing.allocator, "", null, 4);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, want[0..4], true);
+        const tail = try db.scanKeys(testing.allocator, "", page.last(), 4);
+        defer tail.deinit(testing.allocator);
+        try expectPage(tail, &.{"e"}, false);
+    }
+    // A limit far over the store (the heap is sized by the store, not it).
+    {
+        const page = try db.scanKeys(testing.allocator, "", null, std.math.maxInt(usize));
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &want, false);
+    }
+    // After the last key: empty and final.
+    {
+        const page = try db.scanKeys(testing.allocator, "", "e", 3);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &.{}, false);
+    }
+}
+
+test "scanKeys: prefix, a cursor outside the prefix, expired keys, prefix-of-key ordering" {
+    const Fake = struct {
+        var now: i64 = 1000;
+        fn read(_: ?*anyopaque) i64 {
+            return now;
+        }
+    };
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .clock = .{ .nowFn = Fake.read } });
+    defer db.close();
+    try db.put("s:ab", "1");
+    try db.put("s:a", "1");
+    try db.put("s:b", "1");
+    try db.putExpiring("s:c", "gone", 1000); // expired at the instant
+    try db.putExpiring("s:d", "live", 1001);
+    try db.put("t:x", "1");
+    try db.put("r:x", "1");
+    {
+        const page = try db.scanKeys(testing.allocator, "s:", null, 10);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &.{ "s:a", "s:ab", "s:b", "s:d" }, false);
+    }
+    {
+        // "s:a" is a prefix of "s:ab": strictly after it still lists "s:ab".
+        const page = try db.scanKeys(testing.allocator, "s:", "s:a", 2);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &.{ "s:ab", "s:b" }, true);
+    }
+    {
+        // A cursor sorting before the prefix lists from its start.
+        const page = try db.scanKeys(testing.allocator, "s:", "r:x", 1);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &.{"s:a"}, true);
+    }
+    {
+        // The expired key never counts toward "more": the page after
+        // "s:b" holds only "s:d".
+        const page = try db.scanKeys(testing.allocator, "s:", "s:b", 1);
+        defer page.deinit(testing.allocator);
+        try expectPage(page, &.{"s:d"}, false);
+    }
+    {
+        // Once "s:d" expires too, nothing is left after "s:b": an empty,
+        // final page.
+        Fake.now = 1001;
+        defer Fake.now = 1000;
+        const later = try db.scanKeys(testing.allocator, "s:", "s:b", 1);
+        defer later.deinit(testing.allocator);
+        try expectPage(later, &.{}, false);
+    }
+}
+
+test "scanKeys: writes and deletes between pages follow the cursor" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }) |k| try db.put(k, "v");
+    var seen: std.ArrayList([]u8) = .empty;
+    defer freeKeys(&seen);
+
+    const first = try db.scanKeys(testing.allocator, "", null, 2);
+    defer first.deinit(testing.allocator);
+    try expectPage(first, &.{ "a", "b" }, true);
+    // Between pages: delete a listed key and an unlisted one, put keys
+    // before and after the cursor, overwrite an unlisted key.
+    try db.delete("a"); // already listed: stays listed
+    try db.delete("c"); // after the cursor: never listed
+    try db.put("a0", "v"); // before the cursor: not listed
+    try db.put("bb", "v"); // after the cursor: listed
+    try db.put("d", "rewritten"); // listed once
+    try db.put("z", "v");
+    var cursor = try testing.allocator.dupe(u8, first.last().?);
+    defer testing.allocator.free(cursor);
+    while (true) {
+        const page = try db.scanKeys(testing.allocator, "", cursor, 2);
+        defer page.deinit(testing.allocator);
+        for (page.keys) |k| try seen.append(testing.allocator, try testing.allocator.dupe(u8, k));
+        if (!page.more) break;
+        // Deleted while its page was out: still listed (a later `get` sees
+        // it gone); and a key put right after it is listed by the next page.
+        if (std.mem.eql(u8, page.last().?, "d")) {
+            try db.delete("d");
+            try db.put("d0", "v");
+        }
+        testing.allocator.free(cursor);
+        cursor = try testing.allocator.dupe(u8, page.last().?);
+    }
+    const want = [_][]const u8{ "bb", "d", "d0", "e", "f", "z" };
+    try testing.expectEqual(want.len, seen.items.len);
+    for (want, seen.items) |w, k| try testing.expectEqualStrings(w, k);
+}
+
+test "scanKeys: a multi-file compaction and a crash + reopen between pages" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const options: Options = .{ .max_file_size = 64 };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    var keys_put: [12][2]u8 = undefined;
+    for (&keys_put, 0..) |*k, i| {
+        k.* = .{ 'k', 'a' + @as(u8, @intCast(i)) };
+        try db.put(k, "value-of-some-length");
+        if (i % 3 == 0) try db.put(k, "rewritten"); // dead bytes for the merge
+    }
+    try testing.expect(db.files.items.len > 2);
+
+    var cursor: [2]u8 = undefined;
+    var seen: usize = 0;
+    {
+        const page = try db.scanKeys(testing.allocator, "k", null, 3);
+        defer page.deinit(testing.allocator);
+        try testing.expect(page.more);
+        for (page.keys, 0..) |k, i| try testing.expectEqualSlices(u8, &keys_put[i], k);
+        seen += page.keys.len;
+        cursor = page.last().?[0..2].*;
+    }
+    try db.compact();
+    {
+        const page = try db.scanKeys(testing.allocator, "k", &cursor, 3);
+        defer page.deinit(testing.allocator);
+        for (page.keys, 0..) |k, i| try testing.expectEqualSlices(u8, &keys_put[seen + i], k);
+        seen += page.keys.len;
+        cursor = page.last().?[0..2].*;
+    }
+    // The cursor is a key, not a position: it survives a crash and reopen.
+    db = try crashAndReopen(&sim, &db, options);
+    defer db.close();
+    while (true) {
+        const page = try db.scanKeys(testing.allocator, "k", &cursor, 3);
+        defer page.deinit(testing.allocator);
+        for (page.keys, 0..) |k, i| try testing.expectEqualSlices(u8, &keys_put[seen + i], k);
+        seen += page.keys.len;
+        if (!page.more) break;
+        cursor = page.last().?[0..2].*;
+    }
+    try testing.expectEqual(keys_put.len, seen);
+}
+
+test "scanKeys: random stores and page sizes list exactly what keys() lists" {
+    var prng = std.Random.DefaultPrng.init(0x5ca9);
+    const rnd = prng.random();
+    var round: usize = 0;
+    while (round < 20) : (round += 1) {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .sync = .none });
+        defer db.close();
+        const n = rnd.uintLessThan(usize, 120);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var key: [4]u8 = undefined;
+            const len = 1 + rnd.uintLessThan(usize, key.len);
+            for (key[0..len]) |*b| b.* = "abc\x00\xff"[rnd.uintLessThan(usize, 5)];
+            if (rnd.uintLessThan(u8, 4) == 0) try db.delete(key[0..len]) else try db.put(key[0..len], "v");
+        }
+        const prefix: []const u8 = if (rnd.boolean()) "" else "a";
+        const all = try db.keys(testing.allocator, prefix);
+        defer all.deinit(testing.allocator);
+        var paged: std.ArrayList([]u8) = .empty;
+        defer freeKeys(&paged);
+        try scanAll(&db, prefix, 1 + rnd.uintLessThan(usize, 9), &paged);
+        try testing.expectEqual(all.keys.len, paged.items.len);
+        for (all.keys, paged.items) |a, p| try testing.expectEqualSlices(u8, a, p);
+    }
+}
+
+test "scanKeys: an allocation failure at any point leaks nothing" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
+    defer db.close();
+    for ([_][]const u8{ "a", "b", "c", "d" }) |k| try db.put(k, "v");
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        if (db.scanKeys(fa.allocator(), "", "a", 2)) |page| {
+            defer page.deinit(fa.allocator());
+            try expectPage(page, &.{ "b", "c" }, true);
+            break;
+        } else |e| try testing.expectEqual(error.OutOfMemory, e);
+    }
+    // heap, page array, two key copies.
+    try testing.expectEqual(@as(usize, 4), fail_index);
 }
 
 test "iterator: pinned files survive a merge and a compaction until deinit" {
