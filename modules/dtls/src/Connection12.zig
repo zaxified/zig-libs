@@ -1779,6 +1779,17 @@ test "epoch-0 replay window: only a record that advanced the handshake is record
     try std.testing.expect(c.recv_win[0].seen_any);
     try std.testing.expectEqual(@as(u48, 5), c.recv_win[0].high);
 
+    // A message that completes in one record with as many bytes as the
+    // previous one changes only `next_recv_seq`: recorded as well (this one
+    // is then refused by the handshake layer, which `handleFlight` rolls
+    // back, window included).
+    var m: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_finished, .next_recv_seq = 2, .rx_filled = 10 };
+    const whole = testFragment(2, 10, 10, &fb);
+    try std.testing.expectError(error.UnexpectedMessage, m.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = 6, .length = @intCast(whole.len) }, whole, ent, 0, &o));
+    try std.testing.expectEqual(@as(u16, 3), m.next_recv_seq);
+    try std.testing.expectEqual(@as(usize, 10), m.rx_filled);
+    try std.testing.expectEqual(@as(u48, 6), m.recv_win[0].high);
+
     // A genuine ChangeCipherSpec advances the read epoch: recorded too, so
     // its verbatim replay is dropped by the window instead of reaching the
     // handshake layer as a retransmission (which would resend our flight).
