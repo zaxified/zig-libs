@@ -3,8 +3,10 @@
 //! Dead-stack residue probe for every entry point that holds a Groth16 prover
 //! secret: `prover.setup` (the five toxic-waste scalars), `prover.prove` and
 //! `zkprove.prove` (witness, randomizers `r`/`s`, the QAP quotient),
-//! `phase2.contribute` (`x`, `s`) and `circom.parseWitness` (witness decoded
-//! from a `.wtns`). Kept in the module per `CONVENTIONS.md` §9.
+//! `phase2.contribute` (`x`, `s`), `circom.parseWitness` (witness decoded
+//! from a `.wtns`) and `Randomizers.randomInto` (which draws through
+//! `bn254.Fr.randomInto`; a fake `Io` replays known bytes so the draw is a
+//! needle). Kept in the module per `CONVENTIONS.md` §9.
 //!
 //! Method as `bls12_381`'s probe: paint a stack window below the probe, run the
 //! call `PAD` bytes deeper, snapshot the window and look for secrets. For
@@ -601,6 +603,29 @@ noinline fn callZkProveCt() void {
 noinline fn callContribute() void {
     apiContribute(std.testing.allocator, &cur_cz, &cur_x, &cur_s) catch unreachable;
 }
+/// An `Io` whose `random` replays the case's drawn bytes, so
+/// `Randomizers.randomInto` draws known values. Everything else is
+/// `std.Io.failing`'s.
+var fake_vtable: std.Io.VTable = undefined;
+var cur_draw: [64]u8 = undefined;
+var draw_pos: usize = 0;
+var rand_sink: prover.Randomizers = undefined;
+fn fakeRandom(_: ?*anyopaque, buffer: []u8) void {
+    for (buffer) |*b| {
+        b.* = cur_draw[draw_pos % cur_draw.len];
+        draw_pos += 1;
+    }
+}
+fn fakeIo() std.Io {
+    fake_vtable = std.Io.failing.vtable.*;
+    fake_vtable.random = fakeRandom;
+    return .{ .userdata = null, .vtable = &fake_vtable };
+}
+noinline fn callRandomizers() void {
+    draw_pos = 0;
+    prover.Randomizers.randomInto(&rand_sink, fakeIo());
+    std.mem.doNotOptimizeAway(&rand_sink);
+}
 noinline fn callParseWitness() void {
     const w = apiParseWitness(freshHeap(), cur_wtns[0..cur_wtns_len]) catch unreachable;
     std.mem.doNotOptimizeAway(w.ptr);
@@ -663,6 +688,22 @@ test "STACKPROBE: no prover-secret residue on the dead stack after setup, prove,
         nd.sort();
         leak_src = cur_x.toBytes();
         bad += try runProbe("phase2.contribute", callContribute, &nd);
+
+        // Randomizers.randomInto: the drawn bytes (r then s) and r, s, r*s. The
+        // sink is static (the caller's own storage); the probe looks below it.
+        cur_draw[0..32].* = cur_rand.r.toBytes();
+        cur_draw[32..64].* = cur_rand.s.toBytes();
+        nd.reset();
+        nd.addBoth("draw r", cur_draw[0..32]);
+        nd.addBoth("draw s", cur_draw[32..64]);
+        nd.addFr("r", cur_rand.r);
+        nd.addFr("s", cur_rand.s);
+        nd.addFr("r*s", cur_rand.r.mul(cur_rand.s));
+        nd.sort();
+        leak_src = cur_rand.r.toBytes();
+        callRandomizers();
+        try std.testing.expect(rand_sink.r.eql(cur_rand.r) and rand_sink.s.eql(cur_rand.s));
+        bad += try runProbe("Randomizers.randomInto", callRandomizers, &nd);
 
         // circom.parseWitness: the decoded witness.
         var aw: std.Io.Writer = .fixed(&cur_wtns);

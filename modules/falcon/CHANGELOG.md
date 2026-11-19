@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the stack probe now carries needles for NTRUSolve's top-level RNS limbs of f and g (residues modulo the first four small primes, plain and forward-NTT, for both degrees); none is found on the dead stack after `generateKeyPair`. `ntru.probe.rnsImage` is a test-build-only helper (an empty struct otherwise; public surface unchanged) and a unit test pins it to the pool's own `makeFg` output.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the portable ctgrind lane (`CTGRIND_CPU=x86_64`) measures `sign` at 222 in-file. It is pinned as a separate `cpu=x86_64` bound (`<=222`), linked in the SPEC Threat model to the existing open `fpr` question, which stays open.
 - **2026-11-17** — tests: whole-module mutation of falcon (1393 mutants, 1252 killed, 141 argued; SPEC "Audit 2026-11-17"). New `src/boundary_test.zig` plus unit tests in `gaussian.zig` and `ntru.zig` (exact-bound norm in verify and sign, hash-to-point model, codec edges, `fpr` against the hardware, general-input LDL, NTRU equation of generated keys, `zint*` primitives, `solveNtru` limit). No change in `src/` outside tests; no behaviour change.
 - **2026-11-10** — **NO CONSUMER-VISIBLE CHANGE** (Zig 0.17.1 migration): the `ntru` shift `scl` is a direct `@intCast(@rem(scale_k, 31))` again; the detour through u32 was the Zig 0.17.0 `trunc nsw` workaround (ziglang/zig#37131, fixed in 0.17.1; `build.zig` now refuses older compilers).

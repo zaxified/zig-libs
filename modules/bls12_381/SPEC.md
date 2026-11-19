@@ -1222,8 +1222,13 @@ equals `MinSigPop.sign` under the key reconstructed by Lagrange over
    value and `scalarMul`/`msm` take scalars by value: a consumer that draws a nonce or blinding
    factor and multiplies with it outside these entry points (bbs, coconut, ibe, tlock) leaves it
    in its own frames. Fixed per consumer in its sweep; an `Fr.randomInto(out, io)` twin is the
-   likely first need. ✅ 2026-11-16: `Fr.randomInto` exists (the drawn bytes wiped); the by-value
-   `scalarMul`/`msm` part stays open.
+   likely first need. ✅ 2026-11-16: `Fr.randomInto` exists (the drawn bytes wiped); ✅ 2026-11-19: its body
+   runs under `burn.run` (`random_burn`) and the stack probe has a `Fr.randomInto` case
+   (a fake `Io` replays known bytes; without the burn it finds the drawn bytes and the
+   scalar). The by-value `scalarMul`/`msm` part stays open: pointer-taking variants were
+   not added (the item asks only for the `randomInto` twin, and `scalarMul`/`msm` have
+   many call sites in `g1`/`g2`/`msm`/the scheme code; a consumer that must not leave the
+   scalar in its frame wraps the call in its own burned frame).
 1. **The Miller-loop sparse-multiplication optimization** — a freshly
    computed line value is structurally sparse (3 nonzero `Fp2`
    coefficients out of 6 — the "014" shape `lineValue` documents); the

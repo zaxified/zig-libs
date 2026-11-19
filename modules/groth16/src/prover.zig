@@ -75,7 +75,19 @@ pub const ProvingKey = struct {
 /// Zero-knowledge randomizers `r, s ∈ Fr` for a single proof. Distinct random
 /// draws per proof; fixing them (as a test may) makes `prove` deterministic —
 /// the hook for a future byte-exact snarkjs cross-check.
-pub const Randomizers = struct { r: Fr, s: Fr };
+pub const Randomizers = struct {
+    r: Fr,
+    s: Fr,
+
+    /// Draws a fresh pair straight into `out` (`Fr.randomInto` twice, the drawn
+    /// bytes wiped): the secret randomizers are never returned by value, so no
+    /// copy is left in the caller's frame. A caller that burns its own frames
+    /// has only `out` to wipe.
+    pub fn randomInto(out: *Randomizers, io: std.Io) void {
+        Fr.randomInto(&out.r, io);
+        Fr.randomInto(&out.s, io);
+    }
+};
 
 /// The five secret field elements of a Groth16 trusted setup — the "toxic
 /// waste". `tau` is the evaluation point, `alpha`/`beta` blind the A/B halves
@@ -533,4 +545,19 @@ test "ToxicWaste.deinit zeroes all five secret scalars" {
     try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&tw), 0));
     tw.deinit();
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&tw), 0));
+}
+
+test "Randomizers.randomInto fills both scalars in place, distinct and canonical" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var a: Randomizers = undefined;
+    var b: Randomizers = undefined;
+    Randomizers.randomInto(&a, io);
+    Randomizers.randomInto(&b, io);
+    _ = try Fr.fromBytes(a.r.toBytes());
+    _ = try Fr.fromBytes(a.s.toBytes());
+    try std.testing.expect(!a.r.eql(a.s));
+    try std.testing.expect(!a.r.eql(b.r));
+    try std.testing.expect(!a.s.eql(b.s));
 }

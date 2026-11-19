@@ -50,6 +50,7 @@
 const std = @import("std");
 const fpr = @import("fpr.zig");
 const fft = @import("fft.zig");
+const builtin = @import("builtin");
 
 // ---- fpr constants used only by keygen (exact reference fpr.h bits) ----
 
@@ -1885,6 +1886,28 @@ pub fn Ntru(comptime Ring: type) type {
     };
 }
 
+// ---- Test support for the dead-stack probe ----
+
+/// What `stackprobe_test.zig` needs from NTRUSolve's private RNS layer: the
+/// residues of a small polynomial (the secret f or g) modulo `primes[j]`, plain
+/// (the `modpSet` image `makeFg` stores) or forward-NTT'd (the form every
+/// solver level and the final check hold). Compiled in test builds only; the
+/// public surface of the module is unchanged.
+pub const probe = if (builtin.is_test) struct {
+    pub fn rnsImage(comptime logn: u5, src: *const [@as(usize, 1) << logn]i8, j: usize, ntt: bool, out: *[@as(usize, 1) << logn]u32) void {
+        const n = @as(usize, 1) << logn;
+        const primes = computePrimes();
+        const p = primes[j].p;
+        const p0i = modpNinv31(p);
+        for (0..n) |u| out[u] = modpSet(src[u], p);
+        if (!ntt) return;
+        var gm: [n]u32 = undefined;
+        var igm: [n]u32 = undefined;
+        modpMkgm2(&gm, &igm, logn, primes[j].g, p, p0i);
+        modpNTT2Ext(out, 1, &gm, logn, p, p0i);
+    }
+} else struct {};
+
 // ---- Tests ----
 
 test "Ntru(Ring) instantiates for both parameter sets" {
@@ -1941,6 +1964,27 @@ test "NTRUSolve reproduces the Falcon-512 KAT secret key's F byte-exact" {
     // The KAT sk's F field is the reference's own solve_NTRU output for
     // this (f, g) — a byte-exact NTRUSolve check isolated from NTRUGen.
     try std.testing.expectEqualSlices(i8, &dsk.big_f, &big_f);
+}
+
+test "probe.rnsImage equals the pool's top-level f, g residues (plain and NTT)" {
+    const logn = 9;
+    const n = 1 << logn;
+    const primes = computePrimes();
+    var f: [n]i8 = undefined;
+    var g: [n]i8 = undefined;
+    for (&f, &g, 0..) |*a, *b, i| {
+        a.* = @intCast(@as(i32, @intCast(i * 7 % 23)) - 11);
+        b.* = @intCast(@as(i32, @intCast(i * 5 % 19)) - 9);
+    }
+    var data: [4 * n]u32 = undefined;
+    var img: [n]u32 = undefined;
+    for ([_]bool{ false, true }) |ntt| {
+        makeFg(&data, &f, &g, logn, 0, ntt, &primes);
+        probe.rnsImage(logn, &f, 0, ntt, &img);
+        try std.testing.expectEqualSlices(u32, &img, data[0..n]);
+        probe.rnsImage(logn, &g, 0, ntt, &img);
+        try std.testing.expectEqualSlices(u32, &img, data[n .. 2 * n]);
+    }
 }
 
 test "NTRUSolve reproduces the Falcon-1024 KAT secret key's F byte-exact" {
