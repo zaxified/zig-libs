@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the seeded throttle hash (11 mutants: 9 killed, 2 equivalent/unobservable); one test added (an `io` draw does not read the clock). Card counts cumulative.
 - **2026-11-19** — The denied-request throttle map is hashed with a per-instance random seed (Wyhash keyed by a 64-bit seed drawn in `Gate.init`), so peer-influenced throttle keys (X-Forwarded-For) cannot be crafted to collide under the gate's spinlock. New `Options.io` (seed from `io.random`; null = address/counter/clock mix) and `Options.throttle_seed` (fixed seed). Behaviour change: the map's internal iteration/eviction hash differs per instance; throttle decisions (coalescing, folding, LRU cap) are unchanged.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: one item marked done in place (verified in code): DONE 2026-11-07 (contract errors `Gate.InitError.InvalidOptions` / `Gate.AddError.InvalidArgument` in modules/aaa-gate/src/root.zig:575-579, commit a46deb987).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).

@@ -2035,6 +2035,26 @@ test "throttle: the map hash is seeded per instance (fixed seed, io draw, and th
     for (seeds, 0..) |x, i| for (seeds[i + 1 ..]) |y| try testing.expect(x != y);
 }
 
+test "throttle: an io draw seeds without touching the clock; the io-less fallback reads it" {
+    const Counting = struct {
+        calls: usize = 0,
+        fn nowFn(ctx: ?*anyopaque) u64 {
+            const c: *@This() = @ptrCast(@alignCast(ctx.?));
+            c.calls += 1;
+            return 7;
+        }
+    };
+    var cc: Counting = .{};
+    const clk: Clock = .{ .ctx = &cc, .nowFn = Counting.nowFn };
+    var th: std.Io.Threaded = .init_single_threaded;
+    var with_io = try Gate.init(testing.allocator, .{ .token = "t", .io = th.io(), .clock = clk });
+    defer with_io.deinit();
+    try testing.expectEqual(@as(usize, 0), cc.calls);
+    var without = try Gate.init(testing.allocator, .{ .token = "t", .clock = clk });
+    defer without.deinit();
+    try testing.expectEqual(@as(usize, 1), cc.calls);
+}
+
 test "throttle: behaves the same under any seed (coalesce, fold, LRU cap)" {
     for ([_]u64{ 0, 1, 0xdeadbeefcafef00d }) |seed_v| {
         var tc: TestClock = .{};
