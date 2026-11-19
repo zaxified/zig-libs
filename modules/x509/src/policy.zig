@@ -310,12 +310,16 @@ fn decode(a: std.mem.Allocator, cert_der: []const u8) Error!CertPolicies {
     while (try it.next()) |e| {
         if (std.mem.eql(u8, e.oid, &oid_certificate_policies)) {
             var list: std.ArrayList([]const u8) = .empty;
+            // Duplicate check in O(1) per policy (`a` is the caller's arena,
+            // so the set needs no deinit): a linear `contains` was O(P²) in
+            // one certificate's policy count.
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
             var pit = try seqOf(e.value);
             while (try pit.next()) |info| {
                 // PolicyInformation ::= SEQUENCE { policyIdentifier OID, policyQualifiers … OPTIONAL }
                 if (info.tag != 0x30) return error.CertificatePolicyInvalid;
                 const oid = try firstOid(info.content);
-                if (contains(list.items, oid)) return error.CertificatePolicyInvalid;
+                if ((try seen.getOrPut(a, oid)).found_existing) return error.CertificatePolicyInvalid;
                 if (isAny(oid)) out.has_any = true;
                 try list.append(a, oid);
             }

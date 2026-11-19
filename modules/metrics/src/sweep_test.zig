@@ -183,3 +183,51 @@ test "a summary epsilon below min_epsilon is refused at registration (sweep revi
     const s = try reg.summary("s", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.99, .epsilon = metrics.min_epsilon }} });
     s.observe(1);
 }
+
+test "registration and collector refuse the same derived names, per suffix and per type (2026-11-19)" {
+    const cb: metrics.Collector = .{ .collect = struct {
+        fn f(_: ?*anyopaque, _: *metrics.Sink) anyerror!void {}
+    }.f };
+    const Case = struct { kind: metrics.Kind, suffix: []const u8, taken: bool };
+    const cases = [_]Case{
+        .{ .kind = .histogram, .suffix = "_bucket", .taken = true },
+        .{ .kind = .histogram, .suffix = "_sum", .taken = true },
+        .{ .kind = .histogram, .suffix = "_count", .taken = true },
+        .{ .kind = .summary, .suffix = "_bucket", .taken = false },
+        .{ .kind = .summary, .suffix = "_sum", .taken = true },
+        .{ .kind = .summary, .suffix = "_count", .taken = true },
+    };
+    for (cases) |c| {
+        // Collector descs in both orders.
+        var reg = metrics.Registry.init(testing.allocator);
+        defer reg.deinit();
+        var buf: [64]u8 = undefined;
+        const derived = try std.fmt.bufPrint(&buf, "m_{s}{s}", .{ @tagName(c.kind), c.suffix });
+        var base_buf: [64]u8 = undefined;
+        const base = try std.fmt.bufPrint(&base_buf, "m_{s}", .{@tagName(c.kind)});
+        const own: metrics.Desc = .{ .name = base, .help = "h", .kind = c.kind };
+        const other: metrics.Desc = .{ .name = derived, .help = "h", .kind = .gauge };
+        const r1 = reg.registerCollector(&.{ own, other }, cb);
+        if (c.taken) try testing.expectError(error.NameCollision, r1) else try r1;
+        var reg2 = metrics.Registry.init(testing.allocator);
+        defer reg2.deinit();
+        const r2 = reg2.registerCollector(&.{ other, own }, cb);
+        if (c.taken) try testing.expectError(error.NameCollision, r2) else try r2;
+        // A longer name that merely starts with the base and ends in the
+        // suffix is no derived name.
+        var longer_buf: [64]u8 = undefined;
+        const longer = try std.fmt.bufPrint(&longer_buf, "{s}_x{s}", .{ base, c.suffix });
+        var reg4 = metrics.Registry.init(testing.allocator);
+        defer reg4.deinit();
+        try reg4.registerCollector(&.{ own, .{ .name = longer, .help = "h", .kind = .gauge } }, cb);
+        // Registry path, derived name first and last.
+        var reg3 = metrics.Registry.init(testing.allocator);
+        defer reg3.deinit();
+        _ = try reg3.gauge(derived, "h", &.{});
+        if (c.kind == .histogram) {
+            if (c.taken) try testing.expectError(error.NameCollision, reg3.histogram(base, "h", &.{}, &.{1})) else _ = try reg3.histogram(base, "h", &.{}, &.{1});
+        } else {
+            if (c.taken) try testing.expectError(error.NameCollision, reg3.summary(base, "h", &.{}, .{})) else _ = try reg3.summary(base, "h", &.{}, .{});
+        }
+    }
+}

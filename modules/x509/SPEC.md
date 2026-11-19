@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — thirteen chains Go 1.26.8 accepts and this module refuses, each on an RFC 5280 rule: a subject DN or a SAN directoryName outside a permitted, or inside an excluded, directoryName subtree (§4.2.1.10, §6.1.3 (b)/(c); Go does not process directoryName constraints — OpenSSL does), and an empty extendedKeyUsage on the leaf or an intermediate (§4.2.1.12 `SIZE (1..MAX)`; Go reads it as no restriction); out of 1,939 cases `zig build interop-x509` judges against Go (395 corpus + 1,544 generated), the others agree (test `lead: directoryName constraints and an empty extendedKeyUsage …`, `src/data/s2/leads.bin`) (measured 2026-10-26) · feature — a critical nameConstraints with a directoryName subtree is processed; Go refuses every such chain as an unhandled critical extension (two rows of the same run) (measured 2026-10-26)
 
-**Audit:** review 2026-10-28 · mutation 2026-10-28 (121/133, 12 eq) · src 9c95133b7ce06005
+**Audit:** review 2026-10-28 · mutation 2026-11-19 (124/136, 12 eq) · src 80d8fb38e2cfce84
 
 **Hardening:** fuzz 2026-10-11 (200,000-run budget per harness clean, X509_FUZZ, incl. `x509-names` and `x509-policy`) · ct n/a — public certificate verification (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point: trust anchors and `verifySignedBy`'s issuer reached std's parser unvalidated (an RSA key header longer than the key read past it), now through `validateForStdParse`; the duplicate-extension check capped at `max_extensions` (128); `policyMappings` work charged to a new `max_steps`; >4 GiB buffers refused before std's u32 offsets; X509_FUZZ 200,000 runs clean after it)
 
@@ -609,15 +609,24 @@ matching rule fail closed (§ Threat model).
 ## Backlog / deferred
 
 - **Uncharged quadratic work left by the no-panic sweep (2026-10-28).** All bounded by certificate
-  size, none reachable without a CA the path already trusts, so not fixed in the sweep:
-  `checkOneName` charges only same-type (name, constraint) pairs and walks the other types free (Go
-  charges what it compares too, but keeps per-type lists; charging every visit would change the
-  `max_constraint_comparisons` count against Go), and `rdnEql` is n·m in one RDN's ATVs under one
-  charge; the public `checkNameConstraints` runs with no budget at all; `policy.decode`'s duplicate
-  check is O(P²) in one certificate's policies; every candidate attempt re-parses every CRL
-  (`crl.parse`, uncached; CRL size unbounded up to u32); past `Memo.cap` (12) certificates every
-  scan re-runs `parseShape` on each chain and anchor entry (`chain.len` uncapped). Also open: the
-  stack the ML-DSA-87 / SLH-DSA-256 verifiers need, not measured.
+  size, none reachable without a CA the path already trusts. Settled 2026-11-19, sub-bullet by
+  sub-bullet:
+  - `policy.decode`'s duplicate-policy check — **DONE** (linear: a hash set in the check's arena;
+    same accept/refuse set, test in `chain_test.zig`).
+  - `checkOneName` charging only same-type pairs — **kept**: Go keeps per-type lists and charges
+    what it compares, so charging every visit would move `max_constraint_comparisons` against Go
+    (the counts are the compatibility surface). The other-type walk is one tag compare per entry.
+  - `rdnEql` n·m in one RDN's ATVs — **kept**: one RDN's ATV count is bounded by the name's size,
+    real names have 1-2, and Go's `rdnEql` is the same nested loop; it runs under the pair's single charge.
+  - public `checkNameConstraints` without a budget — **kept**: the caller owns both inputs
+    (permitted/excluded blobs and the names), the function is the budgeted one's unlimited twin by
+    design, and a cap here would add an error to a signature that cannot fail that way today.
+  - `crl.parse` per candidate attempt, uncached — **left**: a parse cache keyed by CRL slice needs
+    an owner and an invalidation rule across candidates (a new API surface); the work is linear in
+    the CRL per attempt and attempts are budgeted. Revisit with a measured consumer need.
+  - `Memo` past 12 certificates re-running `parseShape` — **left**: a chain over 12 certificates is
+    not a Web PKI shape, and the cost is linear per scan; raising `cap` only moves the cliff.
+  - Still open: the stack the ML-DSA-87 / SLH-DSA-256 verifiers need, not measured.
 
 - **Build option: post-quantum signature verifiers in chain building** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). src/chain.zig:681-686 dispatches
   ML-DSA (3 sets) and SLH-DSA (12 sets, `inline else` over algorithm.zig:37-113) for every chain verifier. Measured (HTTPS sizeprobe,

@@ -1238,6 +1238,31 @@ test "no-panic sweep 2026-10-28 F5: thousands of policyMappings cost bounded wor
     try testing.expectError(error.PolicyGraphTooLarge, policy_mod.check(testing.allocator, &.{ ca, leaf }, .{ .max_steps = 100_000 }));
 }
 
+test "policy.decode: thousands of distinct policies pass, a repeated one is refused wherever it sits" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const k = certgen.key(0x61);
+    var oids: std.ArrayList([]const u8) = .empty;
+    for (0..3000) |i| {
+        try oids.append(g.a, try g.tlv(0x06, &.{&.{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x03, @intCast(0x80 | (i >> 7)), @intCast(i & 0x7f) }}));
+    }
+    var infos: std.ArrayList([]const u8) = .empty;
+    for (oids.items) |o| try infos.append(g.a, try g.seq(&.{o}));
+    const ok = try g.extension(&.{ 0x55, 0x1d, 0x20 }, false, try g.seq(infos.items));
+    const leaf = try g.cert(.{ .subject = try g.name("leaf"), .issuer = try g.name("Root"), .key = &k, .signer = &k, .exts = &.{ok} });
+    try policy_mod.check(testing.allocator, &.{leaf}, .{});
+    // The same OID again: adjacent to its first occurrence, and 3000 entries apart.
+    for ([_]usize{ 0, 1500, 2999 }) |at| {
+        var dup: std.ArrayList([]const u8) = .empty;
+        try dup.appendSlice(g.a, infos.items);
+        try dup.append(g.a, try g.seq(&.{oids.items[at]}));
+        const ext = try g.extension(&.{ 0x55, 0x1d, 0x20 }, false, try g.seq(dup.items));
+        const bad = try g.cert(.{ .subject = try g.name("leaf"), .issuer = try g.name("Root"), .key = &k, .signer = &k, .exts = &.{ext} });
+        try testing.expectError(error.CertificatePolicyInvalid, policy_mod.check(testing.allocator, &.{bad}, .{}));
+    }
+}
+
 test "re-audit 2026-10-28: the policy work budget is charged at every scan, max_steps is inclusive" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

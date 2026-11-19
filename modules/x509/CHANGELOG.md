@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the day's change: 3 mutants over `policy.decode`'s hash-set duplicate check (never refuse, always refuse, truncated key), 3 killed on the first run (unfiltered ReleaseSafe suite). Cumulative 124/136, 12 eq. Card A1 again.
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** `policy.decode`'s duplicate-policy check is linear in a certificate's policy count (was quadratic); the accepted and refused sets are unchanged (new test: 3000 distinct policies pass, a repeated one is refused anywhere). The other quadratic leftovers of the no-panic sweep are settled in the SPEC backlog (kept, with reasons).
 - **2026-11-19** — **Behaviour change (via `rsa`):** RSA public keys under 1024 bits are refused wherever x509 parses them through `rsa.PublicKey` (was 512). Test certificate key is 1024 bits.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
