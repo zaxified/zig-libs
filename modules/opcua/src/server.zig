@@ -10553,3 +10553,47 @@ test "root client over a pipe: modifyMonitoredItems re-labels and re-tunes items
     try testing.expectError(error.ServiceFault, sub.modifyMonitoredItems(&.{}, .both));
     try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
 }
+
+test "root client over a pipe: setMonitoringMode switches items between disabled, sampling and reporting" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var pc: PipeClient = undefined;
+    try pc.start(gpa);
+    defer pc.deinit();
+
+    var sub = try root.Subscription.create(&pc.session, gpa, .{ .requested_publishing_interval_ms = 100 });
+    defer sub.deinit();
+    const specs = [_]root.Subscription.MonitoredItemSpec{
+        .{ .node_id = pc.rig.answer_id, .client_handle = 10 },
+        .{ .node_id = pc.rig.answer_id, .client_handle = 11 },
+    };
+    const created = try sub.createMonitoredItems(&specs, .both);
+    defer services.freeCreateMonitoredItemsResponse(gpa, created);
+    const id10 = sub.findMonitoredItem(10).?;
+    const id11 = sub.findMonitoredItem(11).?;
+    const server_sub = mutSub(&pc.rig, 0);
+    try testing.expect(server_sub.findItem(id10).?.monitoring_mode == .reporting);
+
+    const modes = [_]services.MonitoringMode{ .sampling, .disabled, .reporting };
+    for (modes) |mode| {
+        const ids = [_]u32{ id10, 123_456, id11 };
+        const r = try sub.setMonitoringMode(mode, &ids);
+        defer services.freeSetMonitoringModeResponse(gpa, r);
+        const results = r.results.?;
+        try testing.expectEqual(@as(usize, 3), results.len);
+        try testing.expectEqual(status.good, results[0]);
+        try testing.expectEqual(status.bad_monitored_item_id_invalid, results[1]);
+        try testing.expectEqual(status.good, results[2]);
+        try testing.expect(server_sub.findItem(id10).?.monitoring_mode == mode);
+        try testing.expect(server_sub.findItem(id11).?.monitoring_mode == mode);
+    }
+    // only the named item moves
+    {
+        const r = try sub.setMonitoringMode(.disabled, &.{id11});
+        defer services.freeSetMonitoringModeResponse(gpa, r);
+        try testing.expect(server_sub.findItem(id10).?.monitoring_mode == .reporting);
+        try testing.expect(server_sub.findItem(id11).?.monitoring_mode == .disabled);
+    }
+    try testing.expectError(error.ServiceFault, sub.setMonitoringMode(.reporting, &.{}));
+    try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
+}

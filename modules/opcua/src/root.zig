@@ -1258,6 +1258,35 @@ pub const Subscription = struct {
         return response;
     }
 
+    /// SetMonitoringMode (OPC 10000-4 §5.12.4): switch the named items between
+    /// `disabled`, `sampling` and `reporting`. One `StatusCode` per id in the
+    /// response (a stale id is a Bad entry, not a failed call). Caller frees
+    /// the response with `services.freeSetMonitoringModeResponse`.
+    pub fn setMonitoringMode(sub: *Subscription, monitoring_mode: services.MonitoringMode, monitored_item_ids: []const u32) services.ServiceError!services.SetMonitoringModeResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.SetMonitoringModeResponse, setMonitoringModeBody, .{ sub, monitoring_mode, monitored_item_ids });
+    }
+
+    fn setMonitoringModeBody(sub: *Subscription, monitoring_mode: services.MonitoringMode, monitored_item_ids: []const u32) services.ServiceError!services.SetMonitoringModeResponse {
+        const request: services.SetMonitoringModeRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, 10_000),
+            .subscription_id = sub.subscription_id,
+            .monitoring_mode = monitoring_mode,
+            .monitored_item_ids = monitored_item_ids,
+        };
+        return services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.set_monitoring_mode_request,
+            services.SetMonitoringModeRequest,
+            request,
+            services.encodeSetMonitoringModeRequest,
+            services.SetMonitoringModeResponse,
+            services.type_id.set_monitoring_mode_response,
+            services.decodeSetMonitoringModeResponse,
+            services.result_fns.set_monitoring_mode,
+        );
+    }
+
     /// Look up the `MonitoredItemId` a `MonitoredItemNotification.
     /// client_handle` (from a decoded `.data_change` `Notification`)
     /// correlates to — the "which monitored item was this?" ergonomic helper
@@ -2529,6 +2558,13 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
     try testing.expect(!services.isBad(modify_resp.results.?[0].status_code));
     try testing.expectEqual(created_monitored_item_id, sub.findMonitoredItem(2).?);
     try testing.expect(sub.findMonitoredItem(monitor_client_handle) == null);
+    // ── SetMonitoringMode (sampling, then reporting again), answered Good.
+    for ([_]services.MonitoringMode{ .sampling, .reporting }) |mode| {
+        const mode_resp = try sub.setMonitoringMode(mode, &.{created_monitored_item_id});
+        defer services.freeSetMonitoringModeResponse(gpa, mode_resp);
+        try testing.expect(!services.isBad(mode_resp.results.?[0]));
+    }
+
     // ── DeleteMonitoredItems + DeleteSubscriptions + session/channel teardown.
     const del_mi_resp = try sub.deleteMonitoredItems(&.{created_monitored_item_id});
     defer services.freeDeleteMonitoredItemsResponse(gpa, del_mi_resp);
