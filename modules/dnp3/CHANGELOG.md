@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — Behaviour change (review LOW-3, `secure_auth`): a key change whose confirmation MAC cannot be computed (a non-HMAC `mac_algorithm`) is refused with g120v7 before any key is installed, instead of being confirmed with an empty MAC; `challenge_len` is clamped to 4..64 where it is used, not only in `init`; a g120v4 for an unknown user is answered with a g120v5 NOT_INIT like a known user without keys (and its key-change window refuses every change) instead of a g120v7, so the status request no longer reveals which users exist.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** card audit line takes the src hash after the last src edit (a comment).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/sa_outstation_kat.py`, the recipe (Python `hmac` + `cryptography`) that derived the Secure Authentication vectors the first `secure_auth` test pins; the test's comment names it.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Docs: SPEC gains a "Secure Authentication integration (outstation)" section (behaviour, anchoring on hand-derived vectors with no SA peer, open questions), the delta mutation paragraph and audit line, an open FINDING that `sa.ErrorCode` values past 1 may not match the standard (both tables listed); README documents `secure_auth`; `meta.doc` and the outstation doc comment no longer call SA unintegrated.

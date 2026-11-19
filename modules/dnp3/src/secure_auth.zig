@@ -238,9 +238,13 @@ pub const SecureAuth = struct {
     };
 
     pub fn init(config: Config, users: []User, random: RandomSource, pending_storage: []u8) SecureAuth {
-        var c = config;
-        c.challenge_len = std.math.clamp(c.challenge_len, 4, max_challenge_data);
-        return .{ .config = c, .users = users, .random = random, .pending_storage = pending_storage };
+        return .{ .config = config, .users = users, .random = random, .pending_storage = pending_storage };
+    }
+
+    /// `Config.challenge_len` clamped to 4..64 where it is used, so a
+    /// config changed after `init` cannot index past the scratch.
+    fn challengeLen(self: *const SecureAuth) usize {
+        return std.math.clamp(self.config.challenge_len, 4, max_challenge_data);
     }
 
     fn macLen(self: *const SecureAuth) usize {
@@ -337,7 +341,7 @@ pub const SecureAuth = struct {
         // is never more than one, and the old CSQ can no longer be answered.
         self.pending = null;
         var data: [max_challenge_data]u8 = undefined;
-        const cd = data[0..self.config.challenge_len];
+        const cd = data[0..self.challengeLen()];
         self.random.fill(self.random.ctx, cd);
         const csq = self.csq +% 1;
         var body: [sa.Challenge.min_len + max_challenge_data]u8 = undefined;
@@ -457,10 +461,14 @@ pub const SecureAuth = struct {
 
     fn onStatusRequest(self: *SecureAuth, seq: u4, data: []const u8, now_ms: u64, iin: Iin, out: []u8) Error!Decision {
         const req = sa.SessionKeyStatusRequest.decode(data) catch return try self.fail(seq, 0, now_ms, iin, out);
-        const user = self.findUser(req.user_number) orelse return try self.fail(seq, req.user_number, now_ms, iin, out);
-        self.expire(user, now_ms);
         self.stats.session_key_status_requests += 1;
-        return try self.keyStatus(seq, user, user.status, null, iin, out);
+        // An unknown user is answered like a known one without keys
+        // (NOT_INIT, a window that no key change can pass), so the status
+        // request does not tell an unauthenticated peer which users exist.
+        const user = self.findUser(req.user_number) orelse
+            return try self.keyStatus(seq, req.user_number, .not_init, &.{}, iin, out);
+        self.expire(user, now_ms);
+        return try self.keyStatus(seq, user.number, user.status, &.{}, iin, out);
     }
 
     fn onKeyChange(self: *SecureAuth, seq: u4, data: []const u8, now_ms: u64, iin: Iin, out: []u8) Error!Decision {
@@ -471,10 +479,13 @@ pub const SecureAuth = struct {
         };
         self.key_change = null;
         const kc = sa.SessionKeyChange.decode(data) catch return try self.fail(seq, 0, now_ms, iin, out);
-        const user = self.findUser(w.user) orelse return try self.fail(seq, w.user, now_ms, iin, out);
+        const user = self.findUser(w.user) orelse {
+            self.stats.failed_session_key_changes += 1;
+            return try self.keyStatus(seq, w.user, .auth_fail, &.{}, iin, out);
+        };
         if (kc.key_change_seq_num != w.ksq or kc.user_number != w.user) {
             self.stats.failed_session_key_changes += 1;
-            return try self.keyStatus(seq, user, .auth_fail, null, iin, out);
+            return try self.keyStatus(seq, w.user, .auth_fail, &.{}, iin, out);
         }
         const update_len: usize = switch (self.config.key_wrap_algorithm) {
             .aes_128 => 16,
@@ -491,7 +502,17 @@ pub const SecureAuth = struct {
             sa.unwrapSessionKeys(user.update_key, wrapped, key_len, &plain) catch null;
         const k = keys orelse {
             self.stats.failed_session_key_changes += 1;
-            return try self.keyStatus(seq, user, .auth_fail, null, iin, out);
+            return try self.keyStatus(seq, w.user, .auth_fail, &.{}, iin, out);
+        };
+        // The confirmation MAC (under the new monitoring key, over the
+        // received g120v6) is computed BEFORE anything is installed: an
+        // algorithm that cannot produce it refuses the change instead of
+        // confirming it with an empty MAC.
+        var mac_buf: [sa.mac.max_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &mac_buf);
+        const confirm_mac = sa.mac.compute(self.config.mac_algorithm, k.monitoring_key, data, null, &mac_buf) catch {
+            self.stats.failed_session_key_changes += 1;
+            return try self.fail(seq, w.user, now_ms, iin, out);
         };
         user.invalidate(.not_init);
         @memcpy(user.control_key[0..key_len], k.control_key);
@@ -501,27 +522,21 @@ pub const SecureAuth = struct {
         user.keys_set_at_ms = now_ms;
         self.stats.session_key_changes += 1;
         self.errors_sent = 0;
-        return try self.keyStatus(seq, user, .ok, data, iin, out);
+        return try self.keyStatus(seq, w.user, .ok, confirm_mac, iin, out);
     }
 
     /// Sends a g120v5 with a new KSQ and fresh challenge data, and opens the
-    /// key-change window for it. `confirm` is the g120v6 object just accepted:
-    /// its MAC under the new monitoring key goes into the status.
-    fn keyStatus(self: *SecureAuth, seq: u4, user: *User, status: sa.KeyStatus, confirm: ?[]const u8, iin: Iin, out: []u8) Error!Decision {
+    /// key-change window for it. `mac_value` is the confirmation MAC of an
+    /// accepted key change, empty otherwise.
+    fn keyStatus(self: *SecureAuth, seq: u4, user: u16, status: sa.KeyStatus, mac_value: []const u8, iin: Iin, out: []u8) Error!Decision {
         var data: [max_challenge_data]u8 = undefined;
-        const cd = data[0..self.config.challenge_len];
+        const cd = data[0..self.challengeLen()];
         self.random.fill(self.random.ctx, cd);
-        var mac_buf: [sa.mac.max_len]u8 = undefined;
-        const mac_value: []const u8 = if (confirm) |m|
-            sa.mac.compute(self.config.mac_algorithm, user.monitoring_key[0..user.key_len], m, null, &mac_buf) catch &.{}
-        else
-            &.{};
-        defer std.crypto.secureZero(u8, &mac_buf);
         const ksq = self.ksq +% 1;
         var body: [sa.SessionKeyStatus.fixed_len + max_challenge_data + sa.mac.max_len]u8 = undefined;
         const st = (sa.SessionKeyStatus{
             .key_change_seq_num = ksq,
-            .user_number = user.number,
+            .user_number = user,
             .key_wrap_algorithm = self.config.key_wrap_algorithm,
             .key_status = status,
             .mac_algorithm = self.config.mac_algorithm,
@@ -530,7 +545,7 @@ pub const SecureAuth = struct {
         }).encode(&body) catch unreachable;
         const frag = try authResponse(seq, iin, .session_key_status, st, out);
         self.ksq = ksq;
-        self.key_change = .{ .user = user.number, .ksq = ksq };
+        self.key_change = .{ .user = user, .ksq = ksq };
         return .{ .reply = frag };
     }
 
@@ -1069,8 +1084,25 @@ test "SA: unexpected or malformed AUTH requests are counted and ignored" {
     no_ack[1] = @backingInt(FunctionCode.auth_request_no_ack);
     try testing.expectEqual(@as(?[]u8, null), try rig.send(no_ack, 0));
     try testing.expectEqual(@as(u32, 1), rig.auth.stats.error_messages_received);
-    // A status request for an unknown user is an authentication failure.
-    try testing.expect(isSaError((try rig.send(try authRequest(&req, 3, .session_key_status_request, &.{ 9, 0 }), 0)).?));
+    // A status request for an unknown user looks like one for a known user
+    // without keys, and no key change can pass its window.
+    var known: Rig = .{};
+    known.setup(.{}, true);
+    const st_known = (try known.send(try authRequest(&req, 3, .session_key_status_request, &.{ 7, 0 }), 0)).?;
+    var known_copy: [64]u8 = undefined;
+    @memcpy(known_copy[0..st_known.len], st_known);
+    const st_unknown = (try rig.send(try authRequest(&req, 3, .session_key_status_request, &.{ 9, 0 }), 0)).?;
+    try testing.expectEqual(st_known.len, st_unknown.len);
+    try testing.expectEqualSlices(u8, known_copy[0..6], st_unknown[0..6]); // header + object header
+    const unknown_status = try sa.SessionKeyStatus.decode((try sa.decodeObject(st_unknown[4..])).data);
+    try testing.expectEqual(sa.KeyStatus.not_init, unknown_status.key_status);
+    try testing.expectEqual(@as(u16, 9), unknown_status.user_number);
+    var wrapped: [72]u8 = undefined;
+    var kc_body: [80]u8 = undefined;
+    var kc_req: [96]u8 = undefined;
+    const kc = try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 9, .wrapped_key_data = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&kc_body);
+    const refused = (try rig.send(try authRequest(&kc_req, 4, .session_key_change, kc), 0)).?;
+    try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(refused[4..])).data)).key_status);
     // A critical request too large to store is discarded, not challenged.
     var big: [300]u8 = undefined;
     @memset(&big, 0);
@@ -1118,6 +1150,11 @@ test "SA: challenge shapes: empty body, a leading g120 that is not v3, the stora
     wide.setup(.{ .challenge_len = 255 }, true);
     _ = try challengeCsq((try wide.send(&hex("c00d"), 0)).?);
     try testing.expectEqual(@as(usize, max_challenge_data), (try sa.Challenge.decode((try sa.decodeObject(wide.auth.challenge_buf[4..wide.auth.challenge_len])).data)).challenge_data.len);
+    // The clamp holds for a config changed after `init`, key status included.
+    wide.auth.config.challenge_len = 200;
+    _ = try challengeCsq((try wide.send(&hex("c10d"), 0)).?);
+    const st = (try wide.send(&hex("c22078045b0102000100"), 0)).?;
+    try testing.expectEqual(@as(usize, max_challenge_data), (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).challenge_data.len);
 }
 
 test "SA: a challenge that could not be sent leaves no older challenge answerable" {
@@ -1148,4 +1185,19 @@ test "SA: an accepted aggressive-mode request cancels the outstanding challenge"
     try testing.expect(rig.bouts[0].value);
     try testing.expectEqual(@as(?[]u8, null), try rig.send(pending_reply, 2));
     try testing.expect(!rig.bouts[1].value);
+}
+
+test "SA: a MAC algorithm that cannot confirm a key change refuses it" {
+    var rig: Rig = .{};
+    rig.setup(.{ .mac_algorithm = .aes_gmac_trunc_12 }, true); // needs an IV this module does not derive
+    var req: [96]u8 = undefined;
+    var wrapped: [72]u8 = undefined;
+    var body: [80]u8 = undefined;
+    _ = (try rig.send(try authRequest(&req, 0, .session_key_status_request, &.{ 1, 0 }), 0)).?;
+    const w = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
+    const r = (try rig.send(try authRequest(&req, 1, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = w }).encode(&body)), 0)).?;
+    try testing.expect(isSaError(r));
+    try testing.expectEqual(sa.KeyStatus.not_init, rig.users[0].status);
+    try testing.expectEqual(@as(u8, 0), rig.users[0].key_len);
+    try testing.expectEqual(@as(u32, 1), rig.auth.stats.failed_session_key_changes);
 }
