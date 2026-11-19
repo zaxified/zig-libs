@@ -79,6 +79,12 @@ pub const ChunkReader = struct {
     /// refill (a witness that a record growing over many refills is not
     /// rescanned quadratically, sweep CS-4).
     scanned: u64 = 0,
+    /// Lazy mode only: `buffer.items[0..clean]` is known to hold no `\n`, so a
+    /// refill searches the new bytes alone instead of the whole residual. True
+    /// for the residual after a cut (the cut is the LAST `\n`) and for every
+    /// buffer a search found no `\n` in. Unused in `.span` mode, whose scanner
+    /// restarts at the residual's first byte (quote state is not resumable).
+    clean: usize = 0,
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, chunk_size: usize) !ChunkReader {
         return initMax(io, alloc, file, chunk_size, 0);
@@ -143,8 +149,12 @@ pub const ChunkReader = struct {
     /// with the scanner, committing its state only for the records emitted.
     fn findCut(self: *ChunkReader) ?usize {
         var scanner = self.span orelse {
-            const b = findLastBoundary(self.buffer.items) orelse return null;
-            return b + 1;
+            const bytes = self.buffer.items;
+            const b = findLastBoundary(bytes[@min(self.clean, bytes.len)..]) orelse {
+                self.clean = bytes.len;
+                return null;
+            };
+            return self.clean + b + 1;
         };
         const bytes = self.buffer.items;
         // `StreamReader` strips a leading BOM before splitting the first
@@ -187,11 +197,13 @@ pub const ChunkReader = struct {
             // previously occupied by the dropped prefix.
             self.chunk_start_in_file += self.last_emit_len;
             self.last_emit_len = 0;
+            // The residual follows the last `\n` (lazy mode), so it has none.
+            self.clean = tail_len;
         }
         // Read-size multiplier for refills that found no cut (see below).
         var grow: usize = 1;
         while (true) {
-            self.scanned +|= self.buffer.items.len;
+            self.scanned +|= self.buffer.items.len - if (self.span == null) @min(self.clean, self.buffer.items.len) else 0;
             if (self.findCut()) |cut| {
                 self.last_emit_len = cut;
                 return self.buffer.items[0..self.last_emit_len];

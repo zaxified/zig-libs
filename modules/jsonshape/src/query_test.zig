@@ -219,3 +219,53 @@ test "review: `^` anchors only as a branch's first atom, `$` only as its last (M
     try testing.expectEqual(1, try e.count("[\"$$\",\"\"]", "$[?match(@,'$+')]"));
     try testing.expectEqual(1, try e.count("[\"^^\",\"\"]", "$[?match(@,'^{2}')]"));
 }
+
+test "strict: a wrong path is told apart from an empty result; off by default" {
+    var e = Env.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const cols = [_]js.JsonCol{.{ .name = "v", .key = "v", .type = .float }};
+    const doc = "{\"d\":{\"p\":[{\"v\":1}],\"e\":[],\"n\":null,\"s\":5},\"top\":[{\"v\":2}]}";
+    const S = struct {
+        fn run(al: std.mem.Allocator, d: []const u8, path: []const u8, strict: bool, c: []const js.JsonCol) js.ShapeError!usize {
+            return (try js.shape(al, d, .{ .path = path, .columns = c, .strict = strict })).len;
+        }
+    };
+    // Default: every miss is an empty frame, exactly as before.
+    for ([_][]const u8{ "d.zz", "d.n", "d.s", "d.p.q", "$.d.zz", "$.d.p[7]", "$.d[", "$..nothing", "$.d.p[?@.v>9]" }) |p| {
+        try testing.expectEqual(@as(usize, 0), try S.run(a, doc, p, false, &cols));
+    }
+    // Strict: the same inputs, told apart.
+    try testing.expectError(error.PathNotFound, S.run(a, doc, "d.zz", true, &cols));
+    try testing.expectError(error.PathNotFound, S.run(a, doc, "d.p.q", true, &cols)); // through an array
+    try testing.expectError(error.PathNotFound, S.run(a, doc, "$.d.zz", true, &cols));
+    try testing.expectError(error.PathNotFound, S.run(a, doc, "$.d.p[7]", true, &cols));
+    try testing.expectError(error.PathNotFound, S.run(a, doc, "$['d']['p'][-3]", true, &cols));
+    try testing.expectError(error.NotAnArray, S.run(a, doc, "d.n", true, &cols)); // exists, null
+    try testing.expectError(error.NotAnArray, S.run(a, doc, "d.s", true, &cols));
+    try testing.expectError(error.NotAnArray, S.run(a, doc, "", true, &cols)); // root is an object
+    try testing.expectError(error.PathSyntax, S.run(a, doc, "$.d[", true, &cols));
+    try testing.expectError(error.PathSyntax, S.run(a, doc, "$[?@.v >]", true, &cols));
+    // Strict does not turn an empty result into an error: an existing empty
+    // array, and an indefinite path that selects nothing.
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "d.e", true, &cols));
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.e", true, &cols));
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$..nothing", true, &cols));
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.p[?@.v>9]", true, &cols));
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.p[5:9]", true, &cols));
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.q[*]", true, &cols));
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.p[7,8]", true, &cols)); // two selectors: indefinite
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$['d']['zz','yy']", true, &cols));
+    // A legacy path with empty segments (leading or trailing dot) still finds its node.
+    try testing.expectEqual(@as(usize, 1), try S.run(a, doc, ".d.p", true, &cols));
+    try testing.expectEqual(@as(usize, 1), try S.run(a, doc, "d.p.", true, &cols));
+    // Hits behave the same in both modes; the root and a scalar match too.
+    for ([_]bool{ false, true }) |strict| {
+        try testing.expectEqual(@as(usize, 1), try S.run(a, doc, "d.p", strict, &cols));
+        try testing.expectEqual(@as(usize, 1), try S.run(a, doc, "$.d.p", strict, &cols));
+        try testing.expectEqual(@as(usize, 1), try S.run(a, doc, "$.top[0]", strict, &cols));
+        try testing.expectEqual(@as(usize, 1), try S.run(a, doc, "$.d.s", strict, &cols)); // a scalar match is one item
+        try testing.expectEqual(@as(usize, 1), try S.run(a, "[{\"v\":1}]", "", strict, &cols));
+        try testing.expectEqual(@as(usize, 1), try S.run(a, "[{\"v\":1}]", "$", strict, &cols));
+    }
+}

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of `strict` (13 mutants, all killed); tests added for multi-selector (indefinite) paths and empty dot-path segments. Card counts cumulative.
+- **2026-11-19** — New opt-in `ShapeSpec.strict` (default false: no behaviour change) with `ShapeError.PathSyntax`, `PathNotFound` and `NotAnArray`, so a wrong `path` is told apart from a genuinely empty result (Jayway JsonPath's definite/indefinite split; see SPEC § Backlog).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-10** — **CHANGED**: a column declared as dataframe's new fixed-size `.array` is refused with `error.UnsupportedColumnType`, as `.list` and `.struct` are (the conversion switch would otherwise reach `unreachable`).
 - **2026-11-10** — **ADDED**: a `.binary` column (dataframe's new Binary) reads a JSON string as base64, the form dataframe's writers emit (`dataframe.parseBinary`); anything else null.

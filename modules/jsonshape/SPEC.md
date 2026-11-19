@@ -6,7 +6,7 @@
 
 **Scope:** parity — RFC 9535 JSONPath complete (official compliance suite 715/715) with the query surface of theory/jsonpath v0.12.2 and serde_json_path 0.7.2: strict compile with the failure's offset, compile once and query many, Normalized Paths, `match()`/`search()` over RFC 9485 I-Regexp; jq's JSON-to-JSON language is another tool, refused below (surveyed 2026-11-02, gaps closed 2026-11-02)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (39/42, 2 eq) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (52/55, 2 eq) · src fd978eb3be01175b
 
 **Hardening:** fuzz 2026-11-02 (`JSONSHAPE_FUZZ=3000000`, 3M seeds clean after the review fixes, ReleaseSafe, every reach label hit) · ct n/a — JSON shape checks (keyword review, 2026-10-07) · panic 2026-11-02 (sweep tests over `compile`, `query`, `queryFirst`, `queryLocated`, `parseDocument`, hostile paths and patterns, OOM at every allocation; before it 2026-10-31, sweep + blind review: `max_work` budget over every step, comparison, conversion and output cell (`WorkLimit`), `max_depth` 512 pre-scan and path depth 64 → `DepthLimit`, iterative `||`/`&&`; delta audit 62/62)
 
@@ -208,6 +208,7 @@ is equivalent (the walk stops first); an uncharged evaluation step changes no an
 Run: `zig build test-jsonshape`.
 
 ## Backlog / deferred
+- **Delta mutation 2026-11-19 (`strict`,** 13 mutants over `resolveItems`' strict branches, `descendExact` and `isDefinite`, ReleaseSafe, strict verdict): 13 killed. A first run left the multi-selector guard and the empty-segment skip of `descendExact` to new assertions (`$.d.p[7,8]` is indefinite, `.d.p` / `d.p.` resolve). Counts on the card are cumulative with the 2026-10-04 run, whose one unexplained survivor remains.
 
 - **Declared `.list` / `.struct` columns — refused (`error.UnsupportedColumnType`).** `dataframe` exports no way to turn a parsed `std.json.Value` into a nested cell (its JSON reader works on bytes), so `shape` builds scalar cells only (`.categorical` is stored encoded, `.duration` parses like `.timestamp`). Wanted: a nested-cell builder from a JSON value in `dataframe`.
 - **Streaming/bounded-memory parse — deferred, not a modest addition.** The whole document is
@@ -227,7 +228,7 @@ Run: `zig build test-jsonshape`.
   transform.
 - **Schema inference** — no auto-sniff of the first object's keys to build `columns`; the caller
   always declares the spec.
-- **A `strict` mode for `shape`** — a wrong path and a genuinely-empty array/no-matches give zero
+- **A `strict` mode for `shape`** — ✅ DONE 2026-11-19: `ShapeSpec.strict` (default false, behaviour unchanged). On, for `path` only: a malformed path is `error.PathSyntax`; a definite path (member names and indices only, or a legacy dot-path) that selects nothing is `error.PathNotFound`; a legacy dot-path ending on a non-array, `null` included, is `error.NotAnArray`. An existing empty array and a wildcard / slice / filter / `..` that matches nothing stay an empty frame. Reference behaviour: Jayway JsonPath throws `PathNotFoundException` for a definite path with a missing leaf and returns an empty list for an indefinite one (`SUPPRESS_EXCEPTIONS` turns the first into null/empty; `REQUIRE_PROPERTIES` makes missing properties of indefinite paths errors too); jq answers a missing key with `null` and fails on iterating it (`.a[]` over null), `?` suppressing that. We follow Jayway's default split because an indefinite query selecting nothing is a legitimate answer. Not strict: column keys (still null on a missing key) and `parseDocument`/`query` (which already return what they select).
   rows both. A path can be proved well-formed first with `compile`; which case a run hit is not said.
 - **Speed: `eval_filter` against serde_json_path.** The one like-with-like row over 1.25× the fastest (see
   `**Performance:**`). A singular query in a comparison builds a sub-`Ctx` and walks through

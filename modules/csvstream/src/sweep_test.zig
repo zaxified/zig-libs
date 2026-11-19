@@ -49,6 +49,71 @@ test "a record growing over many refills is not rescanned quadratically (sweep C
     }
 }
 
+test "lazy mode searches each byte for a newline once: a record growing over refills, and records just over a chunk" {
+    // Before the resume, every refill that found no cut searched the whole
+    // residual again (the doubling reads bounded that to O(M log M)). Now the
+    // bytes known newline-free are skipped: the total is the bytes read.
+    const small = try growingRecordScanned(16 * 1024, false);
+    try t.expect(small <= 16 * 1024 + 64);
+    // 400 records of 100 bytes, 64-byte chunks: every record straddles a refill.
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: [400 * 100]u8 = undefined;
+    for (0..400) |i| {
+        @memset(data[i * 100 ..][0..99], 'a' + @as(u8, @intCast(i % 26)));
+        data[i * 100 + 99] = '\n';
+    }
+    var f = try writeAndOpen(&tmp, &data);
+    defer f.close(t.io);
+    var cr = try stream.ChunkReader.initMax(t.io, t.allocator, f, 64, 4096);
+    defer cr.deinit();
+    var seen: usize = 0;
+    while (try cr.nextChunk()) |c| {
+        try t.expectEqualSlices(u8, data[seen..][0..c.len], c);
+        try t.expectEqual(@as(u8, '\n'), c[c.len - 1]);
+        seen += c.len;
+    }
+    try t.expectEqual(data.len, seen);
+    try t.expect(cr.scanned <= data.len);
+}
+
+fn expectChunks(data: []const u8, chunk: usize, want: []const []const u8) !void {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var f = try writeAndOpen(&tmp, data);
+    defer f.close(t.io);
+    var cr = try stream.ChunkReader.initMax(t.io, t.allocator, f, chunk, 64);
+    defer cr.deinit();
+    for (want) |w| try t.expectEqualStrings(w, (try cr.nextChunk()).?);
+    try t.expect((try cr.nextChunk()) == null);
+}
+
+test "lazy mode cuts at a newline that is the first byte of a refill, or the byte after the residual (sweep CS-4 resume)" {
+    // The residual `c` is newline-free; the next read starts with the `\n`.
+    try expectChunks("ab\nc\nxy", 4, &.{ "ab\n", "c\n", "xy" });
+    // Nothing found in `abcd`; the next read starts with the `\n`.
+    try expectChunks("abcd\nxy", 4, &.{ "abcd\n", "xy" });
+    // Several refills without a newline, then two in one read.
+    try expectChunks("abcdefghij\nk\nl", 3, &.{ "abcdefghij\nk\n", "l" });
+}
+
+test "span mode still rescans its residual: `scanned` exceeds the bytes read (not resumable, SPEC)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: [400 * 100]u8 = undefined;
+    for (0..400) |i| {
+        @memset(data[i * 100 ..][0..99], 'a');
+        data[i * 100 + 99] = '\n';
+    }
+    var f = try writeAndOpen(&tmp, &data);
+    defer f.close(t.io);
+    var cr = try stream.ChunkReader.initMax(t.io, t.allocator, f, 64, 4096);
+    defer cr.deinit();
+    cr.setSpan('"', .{});
+    while (try cr.nextChunk()) |_| {}
+    try t.expect(cr.scanned > data.len);
+}
+
 test "SpanScanner.scan with a start past the end is an empty tail, not a slice panic (sweep CS-2)" {
     var sc = line.SpanScanner.init('"', .{ .field_check = .first_record });
     const r = sc.scan("abc", 10, true);
