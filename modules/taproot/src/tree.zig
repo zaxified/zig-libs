@@ -230,6 +230,153 @@ pub fn buildFromLeaves(allocator: Allocator, internal: bip340.XOnlyPublicKey, li
     return finish(internal, stack[0].hash, leaves, storage);
 }
 
+/// A script with its satisfaction weight (relative probability that this
+/// leaf is the one used), the input of the Huffman layout.
+pub const WeightedLeaf = struct {
+    weight: u32,
+    version: u8 = default_leaf_version,
+    script: []const u8,
+};
+
+pub const HuffmanError = TreeError || Allocator.Error || error{
+    /// No leaves: rust-bitcoin's `TaprootBuilder::with_huffman_tree` rejects an
+    /// empty weight list (`EmptyTree`) rather than returning a key-path-only
+    /// tree; a caller that wants one passes an empty list to `buildFromLeaves`.
+    EmptyTree,
+};
+
+/// Heap of node indices ordered by `Huffman.before`.
+const Huffman = struct {
+    weight: []const u32,
+    hash: []const [32]u8,
+    heap: []u32,
+    len: usize = 0,
+
+    /// `x` is taken from the heap before `y`: lower weight first; equal weights
+    /// the numerically LARGER node hash first (rust-bitcoin keeps a max-heap of
+    /// `(Reverse(weight), NodeInfo)` and `NodeInfo` orders by hash); equal
+    /// hashes (the same script twice) by input order, only to be total.
+    fn before(self: *const Huffman, x: u32, y: u32) bool {
+        if (self.weight[x] != self.weight[y]) return self.weight[x] < self.weight[y];
+        return switch (std.mem.order(u8, &self.hash[x], &self.hash[y])) {
+            .gt => true,
+            .lt => false,
+            .eq => x < y,
+        };
+    }
+
+    fn push(self: *Huffman, x: u32) void {
+        var i = self.len;
+        self.len += 1;
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (!self.before(x, self.heap[parent])) break;
+            self.heap[i] = self.heap[parent];
+            i = parent;
+        }
+        self.heap[i] = x;
+    }
+
+    fn pop(self: *Huffman) u32 {
+        const top = self.heap[0];
+        self.len -= 1;
+        if (self.len == 0) return top;
+        const x = self.heap[self.len];
+        var i: usize = 0;
+        while (true) {
+            var c = 2 * i + 1;
+            if (c >= self.len) break;
+            if (c + 1 < self.len and self.before(self.heap[c + 1], self.heap[c])) c += 1;
+            if (!self.before(self.heap[c], x)) break;
+            self.heap[i] = self.heap[c];
+            i = c;
+        }
+        self.heap[i] = x;
+        return top;
+    }
+};
+
+/// Lay `weighted` out as a Huffman tree and return it as a depth-first
+/// `DepthLeaf` list (free it with `allocator`), ready for `buildFromLeaves`.
+///
+/// Behaves as rust-bitcoin's `TaprootBuilder::with_huffman_tree` (the layout
+/// BIP341 recommends: expected spend cost is minimal when weights are the
+/// leaves' probabilities): repeatedly take the two lowest-weight nodes, join
+/// them into a node of the summed weight (`u32`, saturating), until one is
+/// left. Ties: of equal weights the node with the numerically larger hash is
+/// taken first, so the result is a function of the multiset of
+/// `(weight, version, script)` and not of input order. In the output the
+/// child with the smaller hash comes first (rust-bitcoin's leaf order). A leaf
+/// deeper than 128 is `TreeTooDeep` (rust-bitcoin: `InvalidMerkleTreeDepth`);
+/// no leaves is `EmptyTree`. The Merkle root does not depend on the child
+/// order; only the order of `SpendInfo.leaves` does. Bitcoin Core builds
+/// trees from an explicit shape and has no weight-driven constructor.
+pub fn huffmanLeaves(allocator: Allocator, weighted: []const WeightedLeaf) HuffmanError![]DepthLeaf {
+    const n = weighted.len;
+    if (n == 0) return error.EmptyTree;
+    for (weighted) |l| if (!validLeafVersion(l.version)) return error.InvalidLeafVersion;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const total = 2 * n - 1; // n leaves + (n - 1) joins
+    const weight = try arena.alloc(u32, total);
+    const hash = try arena.alloc([32]u8, total);
+    const child = try arena.alloc([2]u32, total);
+    var h: Huffman = .{ .weight = weight, .hash = hash, .heap = try arena.alloc(u32, n) };
+    for (weighted, 0..) |l, i| {
+        weight[i] = l.weight;
+        hash[i] = tapLeafHash(l.version, l.script);
+        h.push(@intCast(i));
+    }
+    var next: u32 = @intCast(n);
+    while (h.len > 1) : (next += 1) {
+        const a = h.pop();
+        const b = h.pop();
+        weight[next] = std.math.add(u32, weight[a], weight[b]) catch std.math.maxInt(u32);
+        hash[next] = tapBranchHash(hash[a], hash[b]);
+        child[next] = if (std.mem.lessThan(u8, &hash[a], &hash[b])) .{ a, b } else .{ b, a };
+        h.push(next);
+    }
+    const root_node = h.pop();
+
+    // Depth-first, left child first; the right child is pushed first so the
+    // left one is popped first.
+    const Frame = struct { node: u32, depth: usize };
+    const stack = try arena.alloc(Frame, total);
+    var sp: usize = 1;
+    stack[0] = .{ .node = root_node, .depth = 0 };
+    const out = try allocator.alloc(DepthLeaf, n);
+    errdefer allocator.free(out);
+    var k: usize = 0;
+    while (sp > 0) {
+        sp -= 1;
+        const f = stack[sp];
+        if (f.depth > max_path_len) return error.TreeTooDeep;
+        if (f.node < n) {
+            const l = weighted[f.node];
+            out[k] = .{ .depth = @intCast(f.depth), .version = l.version, .script = l.script };
+            k += 1;
+        } else {
+            const c = child[f.node];
+            stack[sp] = .{ .node = c[1], .depth = f.depth + 1 };
+            stack[sp + 1] = .{ .node = c[0], .depth = f.depth + 1 };
+            sp += 2;
+        }
+    }
+    std.debug.assert(k == n);
+    return out;
+}
+
+/// `huffmanLeaves` then `buildFromLeaves`: the output committing to a
+/// weight-driven tree. An empty list is `EmptyTree` (see `HuffmanError`).
+pub fn buildFromWeights(allocator: Allocator, internal: bip340.XOnlyPublicKey, weighted: []const WeightedLeaf) (BuildError || error{EmptyTree})!SpendInfo {
+    const list = try huffmanLeaves(allocator, weighted);
+    defer allocator.free(list);
+    return buildFromLeaves(allocator, internal, list);
+}
+
 /// Build from an explicit shape. `null` is the empty tree (key-path-only).
 pub fn buildFromTree(allocator: Allocator, internal: bip340.XOnlyPublicKey, tree: ?*const Node) BuildError!SpendInfo {
     const t = tree orelse return buildFromLeaves(allocator, internal, &.{});

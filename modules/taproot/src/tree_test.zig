@@ -127,6 +127,245 @@ test "leaf script longer than 252 bytes uses a multi-byte CompactSize" {
     try testing.expectEqualSlices(u8, &h.finalResult(), &tree.tapLeafHash(0xc0, &script));
 }
 
+// ── Huffman layout (`huffmanLeaves` / `buildFromWeights`) ─────────────────
+//
+// Reference: rust-bitcoin `TaprootBuilder::with_huffman_tree` (two lowest
+// weights joined, u32 saturating sum, ties by larger node hash, EmptyTree on
+// no input). The expected roots/orders below were computed by an independent
+// sort-based re-implementation of that algorithm (hashlib only, no heap);
+// rust-bitcoin's own `build_huffman_tree` test publishes only the depths
+// (51:3 52:2 53:2 54:2 55:3), which the first test also pins. Weights are
+// those of that test; the scripts' semantics do not matter.
+
+fn wl(weight: u32, byte: u8) tree.WeightedLeaf {
+    const S = struct {
+        const bytes = blk: {
+            var b: [256][1]u8 = undefined;
+            for (&b, 0..) |*x, i| x.* = .{@intCast(i)};
+            break :blk b;
+        };
+    };
+    return .{ .weight = weight, .script = &S.bytes[byte] };
+}
+
+/// Fold a leaf hash up its path to the Merkle root.
+fn rootFromPath(leaf_hash: [32]u8, path: []const [32]u8) [32]u8 {
+    var h = leaf_hash;
+    for (path) |p| h = tree.tapBranchHash(h, p);
+    return h;
+}
+
+fn expectHuffman(items: []const tree.WeightedLeaf, root_hex: []const u8, order: []const struct { u8, u8 }) !void {
+    const internal = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.rows[0].internal_pubkey));
+    const list = try tree.huffmanLeaves(ta, items);
+    defer ta.free(list);
+    try testing.expectEqual(order.len, list.len);
+    for (list, order) |l, o| {
+        try testing.expectEqual(o[0], l.depth);
+        try testing.expectEqual(o[1], l.script[0]);
+    }
+    var info = try tree.buildFromWeights(ta, internal, items);
+    defer info.deinit(ta);
+    try testing.expectEqualSlices(u8, &try hex32(root_hex), &info.merkle_root.?);
+    for (info.leaves) |leaf| {
+        try testing.expectEqualSlices(u8, &info.merkle_root.?, &rootFromPath(leaf.leaf_hash, leaf.path));
+    }
+}
+
+test "huffman: rust-bitcoin build_huffman_tree weights (depths) and root" {
+    try expectHuffman(
+        &.{ wl(10, 0x51), wl(20, 0x52), wl(20, 0x53), wl(30, 0x54), wl(19, 0x55) },
+        "ff1d976bc9fdc9340e74a03ba0a04b263adcd30a111da1fd57a83e0f7588274b",
+        &.{ .{ 3, 0x55 }, .{ 3, 0x51 }, .{ 2, 0x54 }, .{ 2, 0x53 }, .{ 2, 0x52 } },
+    );
+}
+
+test "huffman: equal weights are broken by node hash (larger hash joins first)" {
+    try expectHuffman(
+        &.{ wl(1, 0x51), wl(1, 0x52), wl(1, 0x53) },
+        "609f09890e4348cc5bcc26e51c432c7830162715d64aab7c306f853c9da06a7b",
+        &.{ .{ 2, 0x51 }, .{ 2, 0x52 }, .{ 1, 0x53 } },
+    );
+    try expectHuffman(
+        &.{ wl(5, 0x51), wl(5, 0x52), wl(5, 0x53), wl(5, 0x54), wl(5, 0x55), wl(5, 0x56), wl(5, 0x57) },
+        "398caf1fc88ca2cbd7017cc107c5ffeec24b95e25ba8747a5227bafd0958f38d",
+        &.{ .{ 3, 0x52 }, .{ 3, 0x56 }, .{ 3, 0x53 }, .{ 3, 0x51 }, .{ 2, 0x55 }, .{ 3, 0x57 }, .{ 3, 0x54 } },
+    );
+}
+
+test "huffman: weight sums saturate at u32 max instead of wrapping" {
+    // 1+1 = 2 joins first; 2 + max = saturated max, which then ties with the
+    // other max leaf. A wrapping sum (2^32+1 -> 1) would put that node first
+    // and give a different shape.
+    try expectHuffman(
+        &.{ wl(std.math.maxInt(u32), 0x51), wl(std.math.maxInt(u32), 0x52), wl(1, 0x53), wl(1, 0x54) },
+        "0af1dec028ec6503db9a2c0d93829ec399d2b5aa3bda59f9302d24d41ed8a7f7",
+        &.{ .{ 3, 0x54 }, .{ 3, 0x53 }, .{ 2, 0x52 }, .{ 1, 0x51 } },
+    );
+}
+
+test "huffman: single leaf is a depth-0 tree; empty and bad version are errors" {
+    try expectHuffman(&.{wl(7, 0x51)}, "a85b2107f791b26a84e7586c28cec7cb61202ed3d01944d832500f363782d675", &.{.{ 0, 0x51 }});
+    try testing.expectError(error.EmptyTree, tree.huffmanLeaves(ta, &.{}));
+    const k = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.rows[0].internal_pubkey));
+    try testing.expectError(error.EmptyTree, tree.buildFromWeights(ta, k, &.{}));
+    var bad = wl(1, 0x51);
+    bad.version = 0xc1;
+    try testing.expectError(error.InvalidLeafVersion, tree.huffmanLeaves(ta, &.{ wl(1, 0x52), bad }));
+    bad.version = 0x50;
+    try testing.expectError(error.InvalidLeafVersion, tree.huffmanLeaves(ta, &.{bad}));
+}
+
+test "huffman: per-leaf versions are hashed and carried into the depth list" {
+    var a = wl(10, 0x51);
+    a.version = 0xc2;
+    var c = wl(5, 0x53);
+    c.version = 0xc4;
+    const items = [_]tree.WeightedLeaf{ a, wl(20, 0x52), c };
+    const list = try tree.huffmanLeaves(ta, &items);
+    defer ta.free(list);
+    try testing.expectEqual(@as(usize, 3), list.len);
+    const want = [_]struct { u8, u8, u8 }{ .{ 2, 0x51, 0xc2 }, .{ 2, 0x53, 0xc4 }, .{ 1, 0x52, 0xc0 } };
+    for (list, want) |l, w| {
+        try testing.expectEqual(w[0], l.depth);
+        try testing.expectEqual(w[1], l.script[0]);
+        try testing.expectEqual(w[2], l.version);
+    }
+    const k = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.rows[0].internal_pubkey));
+    var info = try tree.buildFromWeights(ta, k, &items);
+    defer info.deinit(ta);
+    try testing.expectEqualSlices(u8, &try hex32("835e7467367afd2f1f460ea79ad03bccc184bc701534986b0f6e546a3f28adda"), &info.merkle_root.?);
+}
+
+/// Straight-line reference of the same rule, with no heap: repeatedly scan for
+/// the lowest weight (larger hash first on a tie), join, count depths.
+fn referenceHuffman(items: []const tree.WeightedLeaf, depths: []usize) [32]u8 {
+    const Node = struct { w: u32, h: [32]u8, first: usize };
+    var nodes: [80]Node = undefined;
+    var links: [80]?usize = undefined; // members of a node form a linked chain by leaf index
+    var live: [80]bool = undefined;
+    var count = items.len;
+    for (items, 0..) |l, i| {
+        nodes[i] = .{ .w = l.weight, .h = tree.tapLeafHash(l.version, l.script), .first = i };
+        links[i] = null;
+        live[i] = true;
+        depths[i] = 0;
+    }
+    var remaining = items.len;
+    while (remaining > 1) {
+        var picks: [2]usize = undefined;
+        for (&picks, 0..) |*pk, round| {
+            var best: ?usize = null;
+            for (0..count) |i| {
+                if (!live[i]) continue;
+                if (round == 1 and i == picks[0]) continue;
+                const b = best orelse {
+                    best = i;
+                    continue;
+                };
+                const better = nodes[i].w < nodes[b].w or
+                    (nodes[i].w == nodes[b].w and std.mem.order(u8, &nodes[i].h, &nodes[b].h) == .gt);
+                if (better) best = i;
+            }
+            pk.* = best.?;
+        }
+        const a = picks[0];
+        const b = picks[1];
+        // every member of a and b gets one level deeper; chain b after a
+        var m: ?usize = nodes[a].first;
+        var last: usize = nodes[a].first;
+        while (m) |x| : (m = links[x]) {
+            depths[x] += 1;
+            last = x;
+        }
+        links[last] = nodes[b].first;
+        m = nodes[b].first;
+        while (m) |x| : (m = links[x]) depths[x] += 1;
+        nodes[count] = .{
+            .w = @intCast(@min(@as(u64, nodes[a].w) + nodes[b].w, std.math.maxInt(u32))),
+            .h = tree.tapBranchHash(nodes[a].h, nodes[b].h),
+            .first = nodes[a].first,
+        };
+        live[a] = false;
+        live[b] = false;
+        live[count] = true;
+        count += 1;
+        remaining -= 1;
+    }
+    for (0..count) |i| if (live[i]) return nodes[i].h;
+    unreachable;
+}
+
+test "huffman: matches a straight-line reference on random weights (ties, zeros, saturation)" {
+    var prng = std.Random.DefaultPrng.init(0x7a9c_0de5);
+    const rnd = prng.random();
+    const k = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.rows[0].internal_pubkey));
+    const special = [_]u32{ 0, 1, 2, 3, 5, 1 << 31, std.math.maxInt(u32) - 1, std.math.maxInt(u32) };
+    for (0..200) |_| {
+        const n = 1 + rnd.uintLessThan(usize, 40);
+        var scripts: [40][2]u8 = undefined;
+        var items: [40]tree.WeightedLeaf = undefined;
+        const small = rnd.boolean();
+        for (0..n) |i| {
+            scripts[i] = .{ @intCast(i), rnd.int(u8) };
+            const w: u32 = if (small) rnd.uintLessThan(u32, 4) else special[rnd.uintLessThan(usize, special.len)];
+            items[i] = .{ .weight = w, .script = &scripts[i] };
+        }
+        var depths: [40]usize = undefined;
+        const want_root = referenceHuffman(items[0..n], &depths);
+        const list = try tree.huffmanLeaves(ta, items[0..n]);
+        defer ta.free(list);
+        try testing.expectEqual(n, list.len);
+        for (list) |l| try testing.expectEqual(depths[l.script[0]], @as(usize, l.depth));
+        var info = try tree.buildFromWeights(ta, k, items[0..n]);
+        defer info.deinit(ta);
+        try testing.expectEqualSlices(u8, &want_root, &info.merkle_root.?);
+    }
+}
+
+test "huffman: depth 128 is accepted, 129 is TreeTooDeep (reachable through hash ties at saturated weights)" {
+    // All weights u32 max (every sum saturates), every leaf hash starting with
+    // 0x00 (ground by scanning a counter) while the growing subtree's hash
+    // almost never does: each round then joins the subtree with the
+    // largest-hash remaining leaf, a chain of depth n - 1.
+    var scripts: [130][2]u8 = undefined;
+    var items: [130]tree.WeightedLeaf = undefined;
+    var found: usize = 0;
+    var c: u32 = 0;
+    while (found < 130) : (c += 1) {
+        const s = [2]u8{ @intCast(c >> 8), @intCast(c & 0xff) };
+        if (tree.tapLeafHash(tree.default_leaf_version, &s)[0] != 0) continue;
+        scripts[found] = s;
+        items[found] = .{ .weight = std.math.maxInt(u32), .script = &scripts[found] };
+        found += 1;
+    }
+    const ok = try tree.huffmanLeaves(ta, items[0..129]);
+    defer ta.free(ok);
+    var max_depth: u8 = 0;
+    for (ok) |l| max_depth = @max(max_depth, l.depth);
+    try testing.expectEqual(@as(u8, 128), max_depth);
+    try testing.expectError(error.TreeTooDeep, tree.huffmanLeaves(ta, items[0..130]));
+    const k = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.rows[0].internal_pubkey));
+    try testing.expectError(error.TreeTooDeep, tree.buildFromWeights(ta, k, items[0..130]));
+}
+
+test "huffman: the Merkle root does not depend on input order; weights matter" {
+    const k = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.rows[0].internal_pubkey));
+    const a = [_]tree.WeightedLeaf{ wl(10, 0x51), wl(20, 0x52), wl(20, 0x53), wl(30, 0x54), wl(19, 0x55) };
+    const b = [_]tree.WeightedLeaf{ wl(19, 0x55), wl(30, 0x54), wl(10, 0x51), wl(20, 0x53), wl(20, 0x52) };
+    var ia = try tree.buildFromWeights(ta, k, &a);
+    defer ia.deinit(ta);
+    var ib = try tree.buildFromWeights(ta, k, &b);
+    defer ib.deinit(ta);
+    try testing.expectEqualSlices(u8, &ia.merkle_root.?, &ib.merkle_root.?);
+    try testing.expectEqualSlices(u8, &ia.output.x, &ib.output.x);
+    // Different weights give a different shape, hence a different root.
+    const c = [_]tree.WeightedLeaf{ wl(100, 0x51), wl(20, 0x52), wl(20, 0x53), wl(30, 0x54), wl(19, 0x55) };
+    var ic = try tree.buildFromWeights(ta, k, &c);
+    defer ic.deinit(ta);
+    try testing.expect(!std.mem.eql(u8, &ia.merkle_root.?, &ic.merkle_root.?));
+}
+
 // Mutation run 2026-10-05: moving either CompactSize boundary by one left
 // the suite green (the test above sits at 300, far from both). Bitcoin's
 // CompactSize: n < 0xfd is one byte; 0xfd..0xffff is fd + u16 LE; above that

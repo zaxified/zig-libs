@@ -342,6 +342,9 @@ pub const DepthLeaf = tree.DepthLeaf;
 pub const SpendInfo = tree.SpendInfo;
 pub const buildFromTree = tree.buildFromTree;
 pub const buildFromLeaves = tree.buildFromLeaves;
+pub const WeightedLeaf = tree.WeightedLeaf;
+pub const huffmanLeaves = tree.huffmanLeaves;
+pub const buildFromWeights = tree.buildFromWeights;
 /// BIP341 wallet-vector script trees (test data, not API): exported so a
 /// sibling module's cross-check tests (`bitcoinscript`) can reuse them.
 /// Compiled only where referenced.
