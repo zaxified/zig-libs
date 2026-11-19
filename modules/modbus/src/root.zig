@@ -9,7 +9,8 @@
 //!   0x02 Read Discrete Inputs, 0x03 Read Holding Registers, 0x04 Read Input
 //!   Registers, 0x05 Write Single Coil, 0x06 Write Single Register,
 //!   0x0F Write Multiple Coils, 0x10 Write Multiple Registers,
-//!   0x16 Mask Write Register, 0x17 Read/Write Multiple Registers. Spec quantity limits are enforced
+//!   0x16 Mask Write Register, 0x17 Read/Write Multiple Registers and
+//!   0x2B/0x0E Read Device Identification (`device_id`). Spec quantity limits are enforced
 //!   as typed errors; exception responses (function | 0x80) map to a typed
 //!   error set. Registers are big-endian 16-bit; coil bits pack LSB-first.
 //! - **ADU framing**: `tcp` (MBAP header — transaction id, protocol id 0,
@@ -92,8 +93,9 @@ pub const limits = struct {
 
 /// Public function codes implemented by this module.
 ///
-/// The data-access codes and FC 0x16 Mask Write Register are spoken by both
-/// the `Client` (master) and the `Server` (slave). Three are server-side only: the
+/// The data-access codes, FC 0x16 Mask Write Register and FC 0x2B/0x0E Read
+/// Device Identification are spoken by both the `Client` (master) and the
+/// `Server` (slave). Three are server-side only: the
 /// `Server` answers them, the `Client` has no encoder for them (a master that
 /// wants them can build the 1-3 byte PDU by hand and use `Client`'s framing).
 pub const FunctionCode = enum(u8) {
@@ -110,6 +112,9 @@ pub const FunctionCode = enum(u8) {
     write_multiple_registers = 0x10,
     mask_write_register = 0x16,
     read_write_multiple_registers = 0x17,
+    /// Encapsulated Interface Transport; this module speaks only MEI type
+    /// 0x0E (Read Device Identification, see `device_id`).
+    encapsulated_interface = 0x2B,
 };
 
 /// Modbus exception codes (application spec section 7). Non-exhaustive:
@@ -536,6 +541,162 @@ pub const rtu = struct {
     }
 };
 
+// ── FC 0x2B / MEI 0x0E: Read Device Identification ─────────────────────────
+
+/// Read Device Identification (application spec V1.1b3 section 6.21, MEI
+/// type 0x0E): request encoding, response parsing and the object model the
+/// `server` side answers from.
+///
+/// Reference check: pymodbus `pdu/mei_message.py` (BSD-3, read 2026-11-19):
+/// request = MEI type, read code, object id (3 bytes); an invalid read code
+/// or object id is exception 0x03; an unknown object in individual access is
+/// exception 0x02; the response header is MEI, read code, conformity level,
+/// more-follows, next object id, object count, then (id, length, value)
+/// triples inside the 253-byte PDU budget. The category ranges and the
+/// conformity values below are from the spec text and are UNVERIFIED against
+/// the PDF (not reachable when this was written).
+pub const device_id = struct {
+    /// MEI type for Read Device Identification.
+    pub const mei_type = 0x0E;
+
+    /// "Read Device ID code" of the request.
+    pub const ReadCode = enum(u8) {
+        /// Stream access to the basic category (objects 0x00..0x02).
+        basic = 0x01,
+        /// Stream access to the regular category (objects 0x03..0x7F).
+        regular = 0x02,
+        /// Stream access to the extended category (objects 0x80..0xFF).
+        extended = 0x03,
+        /// One specific object.
+        individual = 0x04,
+    };
+
+    /// The read code for a request byte, or null when it is not 1..4.
+    pub fn readCodeFromByte(b: u8) ?ReadCode {
+        return switch (b) {
+            1 => .basic,
+            2 => .regular,
+            3 => .extended,
+            4 => .individual,
+            else => null,
+        };
+    }
+
+    /// Well-known object ids.
+    pub const ObjectId = struct {
+        pub const vendor_name = 0x00;
+        pub const product_code = 0x01;
+        pub const major_minor_revision = 0x02;
+        pub const vendor_url = 0x03;
+        pub const product_name = 0x04;
+        pub const model_name = 0x05;
+        pub const user_application_name = 0x06;
+    };
+
+    /// One identification object. `value` is at most 255 bytes on the wire.
+    pub const Object = struct {
+        id: u8,
+        value: []const u8,
+    };
+
+    /// First and last object id of the category a stream read code walks;
+    /// null for `individual`.
+    pub fn categoryRange(code: ReadCode) ?struct { first: u8, last: u8 } {
+        return switch (code) {
+            .basic => .{ .first = 0x00, .last = 0x02 },
+            .regular => .{ .first = 0x03, .last = 0x7F },
+            .extended => .{ .first = 0x80, .last = 0xFF },
+            .individual => null,
+        };
+    }
+
+    /// Conformity level byte: 0x01/0x02/0x03 = basic/regular/extended stream
+    /// access, plus 0x80 when individual access is supported too.
+    pub fn conformityLevel(highest: ReadCode, individual: bool) u8 {
+        const base: u8 = switch (highest) {
+            .basic => 0x01,
+            .regular => 0x02,
+            .extended, .individual => 0x03,
+        };
+        return if (individual) base | 0x80 else base;
+    }
+
+    /// Bytes of response header after the function code: MEI type, read
+    /// code, conformity, more follows, next object id, object count.
+    pub const response_header_len = 6;
+
+    /// Request PDU: 0x2B, 0x0E, read code, object id.
+    pub fn encodeRequest(buf: []u8, code: ReadCode, object_id: u8) EncodeError![]u8 {
+        if (buf.len < 4) return error.BufferTooSmall;
+        buf[0] = @backingInt(FunctionCode.encapsulated_interface);
+        buf[1] = mei_type;
+        buf[2] = @backingInt(code);
+        buf[3] = object_id;
+        return buf[0..4];
+    }
+
+    /// A validated response. Borrows the reply PDU it was parsed from.
+    pub const Response = struct {
+        read_code: ReadCode,
+        conformity: u8,
+        /// More objects follow: ask again starting at `next_object_id`.
+        more_follows: bool,
+        next_object_id: u8,
+        count: u8,
+        /// The packed (id, length, value) triples, exactly `count` of them.
+        data: []const u8,
+
+        pub const Iterator = struct {
+            data: []const u8,
+            pos: usize = 0,
+
+            pub fn next(it: *Iterator) ?Object {
+                if (it.pos + 2 > it.data.len) return null;
+                const len: usize = it.data[it.pos + 1];
+                if (it.pos + 2 + len > it.data.len) return null;
+                const o: Object = .{ .id = it.data[it.pos], .value = it.data[it.pos + 2 ..][0..len] };
+                it.pos += 2 + len;
+                return o;
+            }
+        };
+
+        pub fn objects(r: Response) Iterator {
+            return .{ .data = r.data };
+        }
+    };
+
+    /// Parse a reply PDU. Every length is checked against the bytes actually
+    /// present: the object count must match the triples, and the triples
+    /// must consume the PDU exactly. `expected` is the read code of the
+    /// request; a reply echoing a different one is `MalformedResponse`.
+    pub fn parseResponse(resp: []const u8, expected: ReadCode) (ParseError || ExceptionError)!Response {
+        const payload = try pdu.checkFunction(resp, .encapsulated_interface);
+        if (payload.len < response_header_len) return error.ShortFrame;
+        if (payload[0] != mei_type) return error.MalformedResponse;
+        if (payload[1] != @backingInt(expected)) return error.MalformedResponse;
+        const more = payload[3];
+        if (more != 0x00 and more != 0xFF) return error.MalformedResponse;
+        const count = payload[5];
+        const data = payload[response_header_len..];
+        var pos: usize = 0;
+        var seen: usize = 0;
+        while (seen < count) : (seen += 1) {
+            if (pos + 2 > data.len) return error.MalformedResponse;
+            pos += 2 + @as(usize, data[pos + 1]);
+            if (pos > data.len) return error.MalformedResponse;
+        }
+        if (pos != data.len) return error.MalformedResponse;
+        return .{
+            .read_code = expected,
+            .conformity = payload[2],
+            .more_follows = more == 0xFF,
+            .next_object_id = payload[4],
+            .count = count,
+            .data = data,
+        };
+    }
+};
+
 // ── transport seam ──────────────────────────────────────────────────────────
 
 /// The I/O seam: one blocking round-trip — send a request ADU, receive one
@@ -665,6 +826,22 @@ pub const Client = struct {
         var reply_buf: [tcp.max_adu_len]u8 = undefined;
         const resp = try c.exchangePdu(unit, req, &reply_buf);
         try pdu.parseMaskWriteResponse(resp, addr, and_mask, or_mask);
+    }
+
+    /// FC 0x2B / MEI 0x0E: one Read Device Identification round trip. The
+    /// returned `Response` borrows `reply_buf`. When `more_follows` is set,
+    /// call again with `object_id = next_object_id` (same `code`).
+    pub fn readDeviceIdentification(
+        c: *Client,
+        unit: u8,
+        code: device_id.ReadCode,
+        object_id: u8,
+        reply_buf: *[tcp.max_adu_len]u8,
+    ) Error!device_id.Response {
+        var req_buf: [4]u8 = undefined;
+        const req = try device_id.encodeRequest(&req_buf, code, object_id);
+        const resp = try c.exchangePdu(unit, req, reply_buf);
+        return device_id.parseResponse(resp, code);
     }
 
     fn readBits(c: *Client, fc: FunctionCode, unit: u8, addr: u16, out: []bool) Error!void {
@@ -1780,4 +1957,77 @@ test "client RTU round trip: mask write register" {
     var mock2 = MockTransport{ .reply = try rtu.encodeAdu(&reply_buf2, 0x11, &.{ 0x96, 0x02 }) };
     var client2 = Client.init(.rtu, mock2.transport());
     try testing.expectError(error.IllegalDataAddress, client2.maskWriteRegister(0x11, 4, 1, 2));
+}
+
+// ── tests: FC 0x2B/0x0E device identification (client side) ────────────────
+
+test "device_id: request encoding and read code mapping" {
+    var buf: [4]u8 = undefined;
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x01, 0x00 }, try device_id.encodeRequest(&buf, .basic, 0));
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x04, 0x86 }, try device_id.encodeRequest(&buf, .individual, 0x86));
+    try testing.expectError(error.BufferTooSmall, device_id.encodeRequest(buf[0..3], .basic, 0));
+    try testing.expectEqual(@as(?device_id.ReadCode, null), device_id.readCodeFromByte(0));
+    try testing.expectEqual(@as(?device_id.ReadCode, null), device_id.readCodeFromByte(5));
+    try testing.expectEqual(device_id.ReadCode.basic, device_id.readCodeFromByte(1).?);
+    try testing.expectEqual(device_id.ReadCode.regular, device_id.readCodeFromByte(2).?);
+    try testing.expectEqual(device_id.ReadCode.extended, device_id.readCodeFromByte(3).?);
+    try testing.expectEqual(device_id.ReadCode.individual, device_id.readCodeFromByte(4).?);
+    try testing.expectEqual(@as(u8, 0x01), device_id.conformityLevel(.basic, false));
+    try testing.expectEqual(@as(u8, 0x82), device_id.conformityLevel(.regular, true));
+    try testing.expectEqual(@as(u8, 0x03), device_id.conformityLevel(.extended, false));
+    try testing.expectEqual(@as(u8, 0x83), device_id.conformityLevel(.individual, true));
+}
+
+test "device_id: parseResponse walks objects and rejects every inconsistency" {
+    const good = [_]u8{ 0x2B, 0x0E, 0x01, 0x81, 0x00, 0x00, 0x02, 0x00, 0x02, 'A', 'B', 0x01, 0x01, 'C' };
+    const r = try device_id.parseResponse(&good, .basic);
+    try testing.expectEqual(@as(u8, 0x81), r.conformity);
+    try testing.expect(!r.more_follows);
+    try testing.expectEqual(@as(u8, 2), r.count);
+    var it = r.objects();
+    const o1 = it.next().?;
+    try testing.expectEqual(@as(u8, 0), o1.id);
+    try testing.expectEqualStrings("AB", o1.value);
+    const o2 = it.next().?;
+    try testing.expectEqual(@as(u8, 1), o2.id);
+    try testing.expectEqualStrings("C", o2.value);
+    try testing.expectEqual(@as(?device_id.Object, null), it.next());
+
+    // more follows
+    var more = good;
+    more[4] = 0xFF;
+    more[5] = 0x03;
+    const rm = try device_id.parseResponse(&more, .basic);
+    try testing.expect(rm.more_follows);
+    try testing.expectEqual(@as(u8, 3), rm.next_object_id);
+    more[4] = 0x01; // neither 0x00 nor 0xFF
+    try testing.expectError(error.MalformedResponse, device_id.parseResponse(&more, .basic));
+
+    try testing.expectError(error.MalformedResponse, device_id.parseResponse(&good, .regular)); // code echo
+    var bad_mei = good;
+    bad_mei[1] = 0x0D;
+    try testing.expectError(error.MalformedResponse, device_id.parseResponse(&bad_mei, .basic));
+    // count says 3, two present
+    var cnt = good;
+    cnt[6] = 3;
+    try testing.expectError(error.MalformedResponse, device_id.parseResponse(&cnt, .basic));
+    // count says 1, trailing bytes remain
+    cnt[6] = 1;
+    try testing.expectError(error.MalformedResponse, device_id.parseResponse(&cnt, .basic));
+    // an object length running past the end
+    var len = good;
+    len[8] = 200;
+    try testing.expectError(error.MalformedResponse, device_id.parseResponse(&len, .basic));
+    // object header cut after the id byte
+    try testing.expectError(error.MalformedResponse, device_id.parseResponse(good[0..9], .basic));
+    // short header, empty, exception
+    try testing.expectError(error.ShortFrame, device_id.parseResponse(good[0..6], .basic));
+    try testing.expectError(error.ShortFrame, device_id.parseResponse(&.{}, .basic));
+    try testing.expectError(error.IllegalDataAddress, device_id.parseResponse(&.{ 0xAB, 0x02 }, .individual));
+    try testing.expectError(error.IllegalFunction, device_id.parseResponse(&.{ 0xAB, 0x01 }, .basic));
+    // zero objects, nothing after the header: valid and empty
+    const empty = try device_id.parseResponse(&.{ 0x2B, 0x0E, 0x03, 0x01, 0x00, 0x00, 0x00 }, .extended);
+    try testing.expectEqual(@as(u8, 0), empty.count);
+    var eit = empty.objects();
+    try testing.expectEqual(@as(?device_id.Object, null), eit.next());
 }

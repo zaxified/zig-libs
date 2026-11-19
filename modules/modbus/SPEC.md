@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [pymodbus](https://github.com/pymodbus-dev/pymodbus) | Python | NOASSERTION per API (BSD-style, inferred) | 2.8k | v3.15.0 (2026-08-13) | Full-featured, incl. device identification; used here as the black-box interop peer (`goldens.zig`). Source not read. |
 | [just-some-entity/modbus-zig](https://github.com/just-some-entity/modbus-zig) | Zig | GPL-3.0 | 0 | push 2026-01-27 | The only Zig Modbus repository found by search; copyleft, no adoption. Source not read. |
 
-**Where we are ahead:** the only permissively licensed, allocation-free pure-Zig codec + master + slave in one package; no libc, no runtime; server side is a pure function over caller-owned storage (simulated fleets), byte-checked against a live pymodbus session and dissected with Wireshark. **Where we are behind:** FC 0x18/0x14/0x15 (FC 0x16 DONE 2026-11-19), FC 0x2B-0x0E, ASCII framing, TLS/UDP/RTU-over-TCP variants (→ Backlog items); a TCP accept loop is left to the caller by design.
+**Where we are ahead:** the only permissively licensed, allocation-free pure-Zig codec + master + slave in one package; no libc, no runtime; server side is a pure function over caller-owned storage (simulated fleets), byte-checked against a live pymodbus session and dissected with Wireshark. **Where we are behind:** FC 0x18/0x14/0x15 (FC 0x16 and 0x2B-0x0E DONE 2026-11-19), ASCII framing, TLS/UDP/RTU-over-TCP variants (→ Backlog items); a TCP accept loop is left to the caller by design.
 
 ## Design & invariants
 Four allocation-free layers, all offline-testable. `pdu` — transport-independent request encode /
@@ -75,7 +75,7 @@ resolve to typed errors, exception responses, or silence — never panics or out
 Specifically covered: a byte count that contradicts the quantity, a byte count that contradicts the
 actual PDU length, an MBAP length field that disagrees with the frame, a quantity past the spec
 limit, an address span that overflows the 16-bit space, a write value that is neither 0xFF00 nor
-0x0000, an empty PDU, and every unassigned function code. Out of scope: ASCII framing; FC 0x2B MEI;
+0x0000, an empty PDU, and every unassigned function code. Out of scope: ASCII framing; MEI types other than 0x0E;
 file-record and FIFO function codes; serial line timing (t1.5/t3.5).
 
 ## Verification
@@ -119,14 +119,14 @@ FC 07 status byte 0x5A, and the FC 11 Report Slave ID payload.
 Run: `zig build test-modbus` (and `-Doptimize=ReleaseFast`).
 
 ## Backlog / deferred
-ASCII framing — not planned. FC 0x2B/0x0E Read Device Identification, FC 0x14/0x15 file records,
-FC 0x18 read FIFO — not implemented (0x2B is answered `IllegalFunction`, as the
+ASCII framing — not planned. FC 0x14/0x15 file records,
+FC 0x18 read FIFO — not implemented (0x2B is answered `IllegalFunction` while no `device_objects` table is configured, as the
 captured pymodbus exchange shows). Serial-line t1.5/t3.5 timing is the transport's concern. No
 built-in TCP accept loop: `handleAdu` is a pure function and running it over a socket (or over a
 simulated fleet) is the caller's job.
 
 - (survey 2026-09-30) **FC 0x16 Mask Write Register** — **DONE 2026-11-19.** `pdu.encodeMaskWriteRegister` / `applyMask` / `parseMaskWriteResponse`, `Client.maskWriteRegister`, server handler. Result `(cur AND and) OR (or AND NOT and)`; the response echoes the request; a register outside the holding window is `IllegalDataAddress`, a PDU that is not 7 bytes is `IllegalDataValue`; `Config.mask_write_register = false` restores the old `IllegalFunction`. Behaviour change: it was unimplemented before. Reference: pymodbus `pdu/register_message.py` (BSD-3, read 2026-11-19): same layout and formula, same echo; libmodbus serves it too (docs only). Worked example from spec §6.16 (0x12 -> 0x17) is a KAT; the PDF itself was not reachable on 2026-11-19, so the layout is **UNVERIFIED against the spec text** (it matches the example and pymodbus).
-- (survey 2026-09-30) **FC 0x2B/0x0E Read Device Identification**: what commissioning tools query first; pymodbus answers it; small-medium, fits §2.
+- (survey 2026-09-30) **FC 0x2B/0x0E Read Device Identification** — **DONE 2026-11-19.** `device_id` (request encoder, `parseResponse` with a bounded object iterator, categories, conformity), `Client.readDeviceIdentification`, server handler over `Config.device_objects` (any order; `device_id_individual`). Rules implemented: read code 1/2/3 stream the basic (0x00-0x02) / regular (0x03-0x7F) / extended (0x80-0xFF) category, code 4 one object; invalid read code or individual access when disabled = `IllegalDataValue` (pymodbus: same), unknown object in individual access = `IllegalDataAddress` (pymodbus: same), a request body that is not exactly MEI+code+id = `IllegalDataValue`, another MEI type = `IllegalFunction`, an empty table = `IllegalFunction` (so the captured pymodbus golden stays). A stream request whose object id is not an object of the requested category restarts at that category's first object (spec: "restart"; UNVERIFIED wording). A category without objects answers an empty list (our choice; no reference found). Objects share the 253-byte PDU: when the next one does not fit, `more follows` = 0xFF and `next object id` names it; an object that can never fit (value over 244 bytes) is `ServerDeviceFailure`. Conformity byte derived from the table: 0x01/0x02/0x03 (highest category with an object) | 0x80 with individual access; pymodbus always sends 0x83. Reference: pymodbus `pdu/mei_message.py` (BSD-3, read 2026-11-19). **The spec PDF was not reachable; category ranges, conformity values and the restart rule are from memory of §6.21 and UNVERIFIED.**
 - (survey 2026-09-30) **RTU-over-TCP framing** (`rtu` codec exists; needs a stream-reassembly helper): common with serial gateways, small, fits §2.
 
 ## Status

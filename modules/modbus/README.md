@@ -15,7 +15,8 @@ owned arrays into a simulated field device fleet.
     0x01 Read Coils, 0x02 Read Discrete Inputs, 0x03 Read Holding Registers,
     0x04 Read Input Registers, 0x05 Write Single Coil, 0x06 Write Single
     Register, 0x0F Write Multiple Coils, 0x10 Write Multiple Registers,
-    0x16 Mask Write Register, 0x17 Read/Write Multiple Registers. Spec quantity limits (2000 bits /
+    0x16 Mask Write Register, 0x17 Read/Write Multiple Registers,
+    0x2B/0x0E Read Device Identification (`device_id`). Spec quantity limits (2000 bits /
     125 registers read, 1968 bits / 123 registers write, 125/121 for FC 17)
     are typed errors; exception responses (function | 0x80, codes 1–11) map
     to a typed error set. Registers big-endian; coil bits LSB-first.
@@ -34,7 +35,8 @@ owned arrays into a simulated field device fleet.
     plus 0x07 Read Exception Status, 0x08 Diagnostics (return-query-data,
     restart, listen-only, clear-counters and the five serial-line counters)
     0x11 Report Slave ID and 0x16 Mask Write Register (`Config.mask_write_register`,
-    on by default). Spec-correct exception responses
+    on by default) and 0x2B/0x0E Read Device Identification (basic, regular,
+    extended, individual; `Config.device_objects`, off while the table is empty). Spec-correct exception responses
     (`IllegalFunction` / `IllegalDataAddress` / `IllegalDataValue` /
     `ServerDeviceFailure`, function code with the high bit set), including
     the quantity limits — an over-large read is `IllegalDataValue`, not a
@@ -123,8 +125,6 @@ Honest list of what this module does **not** do:
 
 - **ASCII framing** (Modbus over Serial Line §2.5.2) — not planned; RTU and
   TCP cover every consumer we have.
-- **FC 0x2B/0x0E Read Device Identification** — answered `IllegalFunction`;
-  the captured pymodbus session shows exactly that.
 - **FC 0x14/0x15 file records, 0x18 read FIFO** — not implemented on
   either side.
 - **Modbus Security / TLS** — transport security is entirely the caller's;

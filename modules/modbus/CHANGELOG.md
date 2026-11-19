@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **Behaviour change:** FC 0x2B/0x0E Read Device Identification. New `device_id` namespace (`encodeRequest`, `parseResponse`, `Response.objects()`, `ReadCode`, `categoryRange`, `conformityLevel`), `Client.readDeviceIdentification`, `FunctionCode.encapsulated_interface`; the server serves it from `Config.device_objects` / `device_id_individual`. With no table configured the answer stays `IllegalFunction`. Tests: byte-exact responses, categories, restart rule, pagination, the 253-byte boundary, malformed requests and responses, client-vs-server loopback.
 - **2026-11-19** — **Behaviour change:** FC 0x16 Mask Write Register. New `pdu.encodeMaskWriteRegister` / `applyMask` / `parseMaskWriteResponse`, `Client.maskWriteRegister`, `FunctionCode.mask_write_register`; the server now serves it (was `IllegalFunction`; `Config.mask_write_register = false` restores that). Tests: spec §6.16 KAT, window edges, wrong lengths, write hook, client-vs-server loopback incl. RTU broadcast.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private CRC-16 table and byte loop are replaced by `std.hash.crc` (`CRC-16/DNP` resp. `CRC-16/MODBUS`); same checksums (reveng check values and the module vectors are unchanged).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
