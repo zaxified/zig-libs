@@ -227,7 +227,7 @@ Run: `zig build test-jsonshape`.
   transform.
 - **Schema inference** — no auto-sniff of the first object's keys to build `columns`; the caller
   always declares the spec.
-- **A `strict` mode for `shape`** — a wrong path and a genuinely-empty array/no-matches give zero
+- **A `strict` mode for `shape`** — ✅ DONE 2026-11-19: `ShapeSpec.strict` (default false, behaviour unchanged). On, for `path` only: a malformed path is `error.PathSyntax`; a definite path (member names and indices only, or a legacy dot-path) that selects nothing is `error.PathNotFound`; a legacy dot-path ending on a non-array, `null` included, is `error.NotAnArray`. An existing empty array and a wildcard / slice / filter / `..` that matches nothing stay an empty frame. Reference behaviour: Jayway JsonPath throws `PathNotFoundException` for a definite path with a missing leaf and returns an empty list for an indefinite one (`SUPPRESS_EXCEPTIONS` turns the first into null/empty; `REQUIRE_PROPERTIES` makes missing properties of indefinite paths errors too); jq answers a missing key with `null` and fails on iterating it (`.a[]` over null), `?` suppressing that. We follow Jayway's default split because an indefinite query selecting nothing is a legitimate answer. Not strict: column keys (still null on a missing key) and `parseDocument`/`query` (which already return what they select).
   rows both. A path can be proved well-formed first with `compile`; which case a run hit is not said.
 - **Speed: `eval_filter` against serde_json_path.** The one like-with-like row over 1.25× the fastest (see
   `**Performance:**`). A singular query in a comparison builds a sub-`Ctx` and walks through

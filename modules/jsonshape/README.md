@@ -94,6 +94,9 @@ honoring the column's declared `ColumnType`, including JSON's
   `OutOfMemory`, `TooManyMatches`, `WorkLimit` and `DepthLimit`; a declared `.list` or `.struct` column is `UnsupportedColumnType`. RFC-legal
   duplicate object keys are `BadJson` by default; `duplicate_keys = .last`
   takes the last value, as serde_json, Go and jq do.
+  `strict = true` (opt-in) tells a wrong `path` from an empty result: `PathSyntax`,
+  `PathNotFound` (a definite path selecting nothing) and `NotAnArray` (a dot-path
+  ending on a non-array); an existing empty array or an empty wildcard/filter is still an empty frame.
 - **Bounded recursion, and separately a bounded result.** Recursive descent
   (`..name`) and general path evaluation are capped at a fixed depth so a
   crafted path can't stack-overflow on a deeply-nested document; filter
@@ -134,7 +137,7 @@ honoring the column's declared `ColumnType`, including JSON's
 const jsonshape = @import("jsonshape");
 
 const JsonCol = jsonshape.JsonCol; // { name, key = "", type: ColumnType = .float }
-const ShapeSpec = jsonshape.ShapeSpec; // { path, columns, x, y, max_matches, max_work, max_depth, duplicate_keys }
+const ShapeSpec = jsonshape.ShapeSpec; // { path, columns, x, y, max_matches, max_work, max_depth, duplicate_keys, strict }
 const Error = jsonshape.Error; // error{ BadJson, OutOfMemory, TooManyMatches, WorkLimit }
 
 fn shape(a: Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame; // `ShapeError` = `Error` + `UnsupportedColumnType`; `shapeFrame` is a deprecated alias for one release

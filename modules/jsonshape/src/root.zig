@@ -74,6 +74,19 @@ pub const ShapeError = Error || error{
     /// A declared column is `.list` or `.@"struct"`: `shape` builds scalar cells only
     /// (SPEC § Backlog). Checked before any cell is read.
     UnsupportedColumnType,
+    /// `ShapeSpec.strict` only. The path text is not a well-formed path (the
+    /// engine otherwise degrades it to no rows).
+    PathSyntax,
+    /// `ShapeSpec.strict` only. A path that names its node exactly (member
+    /// names and indices only, or a legacy dot-path) selects nothing: a key or
+    /// index is missing, or a step goes through a scalar. A wildcard, slice,
+    /// filter or `..` that matches nothing is NOT this error: an empty result
+    /// is what those mean.
+    PathNotFound,
+    /// `ShapeSpec.strict` only. A legacy dot-path reached a node that is not an
+    /// array (`null` included): the path exists, but there is nothing to
+    /// iterate.
+    NotAnArray,
 };
 
 pub const JsonCol = struct {
@@ -120,6 +133,17 @@ pub const ShapeSpec = struct {
     /// safe reading: two parsers of one feed can disagree on it. `.last` keeps
     /// the last value, as serde_json, Go's `encoding/json` and jq do.
     duplicate_keys: DuplicateKeys = .reject,
+    /// Say which way a zero-row result came about, for `path` only (column
+    /// keys stay null-on-missing). Off (the default), a wrong path and a
+    /// genuinely empty array both give an empty frame. On: a malformed path is
+    /// `error.PathSyntax`, a definite path whose key/index does not exist is
+    /// `error.PathNotFound`, a legacy dot-path that ends on a non-array is
+    /// `error.NotAnArray`; an existing empty array, and a wildcard / slice /
+    /// filter / `..` that selects nothing, are still an empty frame. This is
+    /// Jayway JsonPath's split (a definite path throws `PathNotFoundException`,
+    /// an indefinite one returns an empty list) and jq's (`.a.b` on a missing
+    /// key is `null`, while `.a[]` over it fails to iterate).
+    strict: bool = false,
 };
 
 /// Same type as `dataframe.JsonDuplicateKeys` (`.reject` | `.last`).
@@ -165,7 +189,7 @@ fn checkDepth(bytes: []const u8, max: u32) Error!void {
 pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame {
     const root = try parseDocument(a, bytes, .{ .max_depth = spec.max_depth, .duplicate_keys = spec.duplicate_keys });
     var work: Work = .{ .limit = spec.max_work orelse 1_000_000 +| 16 *| bytes.len };
-    const items = try resolveItems(a, root, spec.path, spec.max_matches, &work);
+    const items = try resolveItems(a, root, spec.path, spec.max_matches, &work, spec.strict);
 
     if (spec.columns.len == 0) return shapeXY(a, root, items, spec, &work);
 
@@ -387,6 +411,31 @@ fn descend(root: std.json.Value, path: []const u8) std.json.Value {
         };
     }
     return node;
+}
+
+/// `descend` that keeps "no such key" apart from a `null` value: null when a
+/// key is missing or a step leaves an object.
+fn descendExact(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var node = root;
+    var it = std.mem.splitScalar(u8, path, '.');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        node = switch (node) {
+            .object => |o| o.get(seg) orelse return null,
+            else => return null,
+        };
+    }
+    return node;
+}
+
+/// A path that names exactly one node when it exists: child segments with one
+/// name or index selector each (the singular-query shape of RFC 9535 §2.3.5.1).
+fn isDefinite(segs: []const Seg) bool {
+    for (segs) |sg| switch (sg) {
+        .child => |sels| if (sels.len != 1 or (sels[0] != .name and sels[0] != .index)) return false,
+        else => return false,
+    };
+    return true;
 }
 
 // ── RFC 9535 engine (indices, wildcards, recursive descent, filters) ─────────
@@ -614,8 +663,15 @@ fn isLegacyPath(path: []const u8) bool {
 /// go through `descend` unchanged; anything else through the segment engine,
 /// flattening `.array` matches (their elements become items) and treating
 /// any other match as a single item itself.
-fn resolveItems(a: std.mem.Allocator, root: J, path: []const u8, limit: usize, work: *Work) Error![]const J {
+fn resolveItems(a: std.mem.Allocator, root: J, path: []const u8, limit: usize, work: *Work, strict: bool) ShapeError![]const J {
     if (isLegacyPath(path)) {
+        if (strict) {
+            // `descend` folds a missing key into `.null`; strict must tell them apart.
+            return switch (descendExact(root, path) orelse return error.PathNotFound) {
+                .array => |arr| arr.items,
+                else => error.NotAnArray,
+            };
+        }
         const node = descend(root, path);
         return switch (node) {
             .array => |arr| arr.items,
@@ -624,9 +680,12 @@ fn resolveItems(a: std.mem.Allocator, root: J, path: []const u8, limit: usize, w
     }
 
     const segs = try parsePath(a, path);
+    // `parsePath` answers a malformed path with this one marker segment.
+    if (strict and segs.len == 1 and segs[0] == .never) return error.PathSyntax;
     var matches: std.ArrayList(J) = .empty;
     var ctx: Ctx = .{ .a = a, .root = root, .out = &matches, .limit = limit, .work = work };
     try evalSegs(&ctx, root, segs, 0);
+    if (strict and matches.items.len == 0 and isDefinite(segs)) return error.PathNotFound;
 
     // ⚠ Bounding MATCHES is not bounding ITEMS, and items are what become
     // rows. A single match that is a ten-million-element array flattens into
