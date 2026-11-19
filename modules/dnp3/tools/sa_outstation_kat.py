@@ -17,7 +17,11 @@ U=bytes(range(0x00,0x10)); Kc=bytes(range(0x40,0x50)); Km=bytes(range(0x60,0x70)
 iin=H('8000')
 st1=H('01000000'+'0100'+'01'+'02'+'04'+'0400'+'01020304')
 print('status1', (H('C083')+iin+obj(5,st1)).hex())
-wrapped=aes_key_wrap(U,Kc+Km)
+# SAv5 key wrap: key length (u16 LE) || control || monitoring || the g120v5
+# body that opened the window (st1) || zero padding to a multiple of 8.
+plain=(16).to_bytes(2,'little')+Kc+Km+st1
+plain+=bytes(-len(plain)%8)
+wrapped=aes_key_wrap(U,plain)
 kc=H('01000000'+'0100')+wrapped
 print('keychange_req', (H('C120')+obj(6,kc)).hex())
 st2=H('02000000'+'0100'+'01'+'01'+'04'+'0400'+'05060708')+mac(Km,kc)

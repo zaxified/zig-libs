@@ -235,7 +235,22 @@ pub const SecureAuth = struct {
     pub const KeyChangeWindow = struct {
         user: u16,
         ksq: u32,
+        /// The g120v5 body that opened this window, exactly as sent. A key
+        /// change must carry it inside its wrapped data
+        /// (`sa.unwrapSessionKeysWithStatus`), which binds the change to
+        /// this status's fresh challenge data.
+        status: [max_status_body]u8,
+        status_len: usize,
     };
+
+    const max_status_body = sa.SessionKeyStatus.fixed_len + max_challenge_data + sa.mac.max_len;
+
+    /// The key-status message a key change must wrap now (empty when no
+    /// window is open). For a master-side caller and for tests.
+    pub fn lastStatus(self: *const SecureAuth) []const u8 {
+        const w = &(self.key_change orelse return &.{});
+        return w.status[0..w.status_len];
+    }
 
     pub fn init(config: Config, users: []User, random: RandomSource, pending_storage: []u8) SecureAuth {
         return .{ .config = config, .users = users, .random = random, .pending_storage = pending_storage };
@@ -502,14 +517,16 @@ pub const SecureAuth = struct {
             .aes_256 => 32,
             else => 0,
         };
-        const wrapped = kc.wrapped_key_data;
-        const key_len = if (wrapped.len >= 8) (wrapped.len - 8) / 2 else 0;
+        // The wrapped data must carry the very status that opened this window
+        // (review MEDIUM-1): the KSQ alone restarts at 0 with the outstation
+        // and any peer can step it with g120v4, so without the status's fresh
+        // challenge data a recorded g120v6 would replay after a restart.
         var plain: [64]u8 = undefined;
         defer std.crypto.secureZero(u8, &plain);
-        const keys = if (user.update_key.len != update_len or wrapped.len != 2 * key_len + 8)
+        const keys = if (user.update_key.len != update_len)
             null
         else
-            sa.unwrapSessionKeys(user.update_key, wrapped, key_len, &plain) catch null;
+            sa.unwrapSessionKeysWithStatus(user.update_key, kc.wrapped_key_data, w.status[0..w.status_len], &plain) catch null;
         const k = keys orelse {
             self.stats.failed_session_key_changes += 1;
             return try self.keyStatus(seq, w.user, .auth_fail, &.{}, iin, out);
@@ -524,6 +541,7 @@ pub const SecureAuth = struct {
             self.stats.failed_session_key_changes += 1;
             return try self.fail(seq, w.user, now_ms, iin, out);
         };
+        const key_len = k.control_key.len;
         user.invalidate(.not_init);
         @memcpy(user.control_key[0..key_len], k.control_key);
         @memcpy(user.monitoring_key[0..key_len], k.monitoring_key);
@@ -543,7 +561,7 @@ pub const SecureAuth = struct {
         const cd = data[0..self.challengeLen()];
         self.random.fill(self.random.ctx, cd);
         const ksq = self.ksq +% 1;
-        var body: [sa.SessionKeyStatus.fixed_len + max_challenge_data + sa.mac.max_len]u8 = undefined;
+        var body: [max_status_body]u8 = undefined;
         const st = (sa.SessionKeyStatus{
             .key_change_seq_num = ksq,
             .user_number = user,
@@ -555,7 +573,9 @@ pub const SecureAuth = struct {
         }).encode(&body) catch unreachable;
         const frag = try authResponse(seq, iin, .session_key_status, st, out);
         self.ksq = ksq;
-        self.key_change = .{ .user = user, .ksq = ksq };
+        var w: KeyChangeWindow = .{ .user = user, .ksq = ksq, .status = undefined, .status_len = st.len };
+        @memcpy(w.status[0..st.len], st);
+        self.key_change = w;
         return .{ .reply = frag };
     }
 
@@ -662,14 +682,20 @@ const Rig = struct {
         return r.fragment;
     }
 
+    /// Wraps the keys the SAv5 way, around the status that opened the
+    /// current key-change window.
+    fn wrap(self: *Rig, update_key: []const u8, control_key: []const u8, monitoring_key: []const u8, buf: []u8) ![]u8 {
+        return sa.wrapSessionKeysWithStatus(update_key, control_key, monitoring_key, self.auth.lastStatus(), buf);
+    }
+
     /// Installs session keys for `user` through the real status-request /
     /// key-change exchange.
     fn installKeys(self: *Rig, user: u16, now_ms: u64) !void {
-        var req: [64]u8 = undefined;
+        var req: [256]u8 = undefined;
         _ = (try self.send(try authRequest(&req, 0, .session_key_status_request, &.{ @truncate(user), @truncate(user >> 8) }), now_ms)).?;
-        var wrapped: [72]u8 = undefined;
-        const w = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
-        var body: [80]u8 = undefined;
+        var wrapped: [192]u8 = undefined;
+        const w = try self.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
+        var body: [200]u8 = undefined;
         const kc = try (sa.SessionKeyChange{ .key_change_seq_num = self.auth.ksq, .user_number = user, .wrapped_key_data = w }).encode(&body);
         const st = (try self.send(try authRequest(&req, 1, .session_key_change, kc), now_ms)).?;
         const status = try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data);
@@ -729,11 +755,15 @@ test "SA: key change, challenge, reply and aggressive mode match hand-derived ve
 
     // Key status for user 1 (NOT_INIT), KSQ 1, challenge data 01..04.
     try testing.expectEqualSlices(u8, &hex("c083800078055b010f00010000000100010204040001020304"), (try rig.send(&hex("c02078045b0102000100"), 0)).?);
-    // Key change wrapping control 40..4f + monitoring 60..6f under update
-    // key 00..0f; the confirmation carries KSQ 2, OK, fresh data 05..08 and
+    // Key change wrapping (SAv5 layout) key length 16, control 40..4f,
+    // monitoring 60..6f and the status above under update key 00..0f; the confirmation carries KSQ 2, OK, fresh data 05..08 and
     // HMAC-SHA-256/16 of the g120v6 object under the monitoring key.
-    try testing.expectEqualSlices(u8, &hex("c183800078055b011f000200000001000101040400050607080bf1d4bef0d9d9eacc5d02c3b2991f26"), (try rig.send(&hex("c12078065b012e00010000000100df423c1c49a9d7e7e8e4724fbd8eea4026bd8c69326e36644c558a38689b9899efc351b6bf5e7570"), 0)).?);
+    try testing.expectEqualSlices(u8, &hex("c183800078055b011f000200000001000101040400050607084bb1a3193de25290dc40b2e67d311ffb"), (try rig.send(&hex("c12078065b014600010000000100edddc550b51738bf1313e1a468c058816cbcbd43f1797572396cffe9ad5f7ea5d35c3ef0608455b72d3d56b77a2a661881d2f9cd995baaddce5142fe5013f2a1"), 0)).?);
     try testing.expectEqualSlices(u8, &kat_control_key, rig.users[0].control_key[0..16]);
+    // The same wrapped data from this module's own SAv5 wrap: the layout
+    // (length field, keys, status, ZERO padding) byte for byte.
+    var wbuf: [96]u8 = undefined;
+    try testing.expectEqualSlices(u8, &hex("edddc550b51738bf1313e1a468c058816cbcbd43f1797572396cffe9ad5f7ea5d35c3ef0608455b72d3d56b77a2a661881d2f9cd995baaddce5142fe5013f2a1"), try sa.wrapSessionKeysWithStatus(&kat_update_key, &kat_control_key, &kat_monitoring_key, &hex("010000000100010204040001020304"), &wbuf));
 
     // DIRECT_OPERATE is critical: challenged (CSQ 1, data 09..0c), not run.
     var req: [32]u8 = undefined;
@@ -830,6 +860,12 @@ test "SA: a reply with the wrong CSQ, sequence, peer, user or key never executes
             // reply still goes through.
             try testing.expectEqual(@as(?[]u8, null), resp);
             try testing.expect(rig.auth.pending != null);
+            try testing.expectEqual(@as(u32, 1), rig.auth.stats.unexpected_messages);
+            // An undecodable reply is ignored the same way.
+            var short: [16]u8 = undefined;
+            try testing.expectEqual(@as(?[]u8, null), try rig.send(try authRequest(&short, 5, .reply, &.{ 1, 2, 3 }), 1));
+            try testing.expect(rig.auth.pending != null);
+            try testing.expectEqual(@as(u32, 2), rig.auth.stats.unexpected_messages);
             var good: [64]u8 = undefined;
             _ = (try rig.send(try rig.reply(&good, 5, csq, 1, &kat_control_key), 2)).?;
             try testing.expect(rig.bouts[0].value);
@@ -969,11 +1005,11 @@ test "SA: aggressive mode refused without a challenge, when disabled, or with a 
 test "SA: key change refused for a wrong KSQ, a wrong update key, or without a status request" {
     var rig: Rig = .{};
     rig.setup(.{}, true);
-    var req: [96]u8 = undefined;
+    var req: [256]u8 = undefined;
     // No status request yet: there is no window.
-    var wrapped: [72]u8 = undefined;
-    const w = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
-    var body: [80]u8 = undefined;
+    var wrapped: [192]u8 = undefined;
+    const w = try rig.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
+    var body: [200]u8 = undefined;
     try testing.expectEqual(@as(?[]u8, null), try rig.send(try authRequest(&req, 0, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = 1, .user_number = 1, .wrapped_key_data = w }).encode(&body)), 0));
 
     // Status request, then a key change one KSQ off.
@@ -982,19 +1018,19 @@ test "SA: key change refused for a wrong KSQ, a wrong update key, or without a s
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
     // Wrapped under another update key.
     const other = hex("ff0102030405060708090a0b0c0d0e0f");
-    const w2 = try sa.wrapSessionKeys(&other, &kat_control_key, &kat_monitoring_key, &wrapped);
+    const w2 = try rig.wrap(&other, &kat_control_key, &kat_monitoring_key, &wrapped);
     st = (try rig.send(try authRequest(&req, 3, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = w2 }).encode(&body)), 0)).?;
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
     try testing.expectEqual(sa.KeyStatus.not_init, rig.users[0].status);
     // Another user's number inside the window.
-    st = (try rig.send(try authRequest(&req, 4, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 7, .wrapped_key_data = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&body)), 0)).?;
+    st = (try rig.send(try authRequest(&req, 4, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 7, .wrapped_key_data = try rig.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&body)), 0)).?;
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
     try testing.expectEqual(@as(u32, 3), rig.auth.stats.failed_session_key_changes);
 
     // A key change too short to decode closes the window it used.
     _ = (try rig.send(try authRequest(&req, 6, .session_key_status_request, &.{ 1, 0 }), 0)).?;
     try testing.expect(isSaError((try rig.send(try authRequest(&req, 7, .session_key_change, &.{ 1, 2, 3 }), 0)).?));
-    try testing.expectEqual(@as(?[]u8, null), try rig.send(try authRequest(&req, 8, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&body)), 0));
+    try testing.expectEqual(@as(?[]u8, null), try rig.send(try authRequest(&req, 8, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = try rig.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&body)), 0));
     // Wrapped data shorter than one AES-KW block.
     _ = (try rig.send(try authRequest(&req, 9, .session_key_status_request, &.{ 1, 0 }), 0)).?;
     st = (try rig.send(try authRequest(&req, 10, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = &.{ 1, 2, 3 } }).encode(&body)), 0)).?;
@@ -1003,7 +1039,7 @@ test "SA: key change refused for a wrong KSQ, a wrong update key, or without a s
 
     // A good change, then its replay: refused, keys kept.
     try rig.installKeys(1, 0);
-    st = (try rig.send(try authRequest(&req, 5, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq -% 1, .user_number = 1, .wrapped_key_data = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&body)), 0)).?;
+    st = (try rig.send(try authRequest(&req, 5, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq -% 1, .user_number = 1, .wrapped_key_data = try rig.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&body)), 0)).?;
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
     try testing.expectEqual(sa.KeyStatus.ok, rig.users[0].status);
 }
@@ -1011,13 +1047,13 @@ test "SA: key change refused for a wrong KSQ, a wrong update key, or without a s
 test "SA: a key change wipes the previous keys, including a longer pair" {
     var rig: Rig = .{};
     rig.setup(.{}, true);
-    var req: [96]u8 = undefined;
-    var wrapped: [72]u8 = undefined;
-    var body: [80]u8 = undefined;
+    var req: [256]u8 = undefined;
+    var wrapped: [192]u8 = undefined;
+    var body: [200]u8 = undefined;
     const long_c: [32]u8 = @splat(0xA5);
     const long_m: [32]u8 = @splat(0x5A);
     _ = (try rig.send(try authRequest(&req, 0, .session_key_status_request, &.{ 1, 0 }), 0)).?;
-    const w = try sa.wrapSessionKeys(&kat_update_key, &long_c, &long_m, &wrapped);
+    const w = try rig.wrap(&kat_update_key, &long_c, &long_m, &wrapped);
     _ = (try rig.send(try authRequest(&req, 1, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = w }).encode(&body)), 0)).?;
     try testing.expectEqual(@as(u8, 32), rig.users[0].key_len);
     try rig.installKeys(1, 0);
@@ -1122,10 +1158,10 @@ test "SA: unexpected or malformed AUTH requests are counted and ignored" {
     const unknown_status = try sa.SessionKeyStatus.decode((try sa.decodeObject(st_unknown[4..])).data);
     try testing.expectEqual(sa.KeyStatus.not_init, unknown_status.key_status);
     try testing.expectEqual(@as(u16, 9), unknown_status.user_number);
-    var wrapped: [72]u8 = undefined;
-    var kc_body: [80]u8 = undefined;
-    var kc_req: [96]u8 = undefined;
-    const kc = try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 9, .wrapped_key_data = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&kc_body);
+    var wrapped: [192]u8 = undefined;
+    var kc_body: [200]u8 = undefined;
+    var kc_req: [256]u8 = undefined;
+    const kc = try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 9, .wrapped_key_data = try rig.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&kc_body);
     const refused = (try rig.send(try authRequest(&kc_req, 4, .session_key_change, kc), 0)).?;
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(refused[4..])).data)).key_status);
     // A critical request too large to store is discarded, not challenged.
@@ -1140,11 +1176,11 @@ test "SA: unexpected or malformed AUTH requests are counted and ignored" {
 test "SA: an update key that does not fit the key-wrap algorithm is refused" {
     var rig: Rig = .{};
     rig.setup(.{ .key_wrap_algorithm = .aes_256 }, true); // needs a 32-octet update key
-    var req: [96]u8 = undefined;
-    var wrapped: [72]u8 = undefined;
-    var body: [80]u8 = undefined;
+    var req: [256]u8 = undefined;
+    var wrapped: [192]u8 = undefined;
+    var body: [200]u8 = undefined;
     _ = (try rig.send(try authRequest(&req, 0, .session_key_status_request, &.{ 1, 0 }), 0)).?;
-    const w = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
+    const w = try rig.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
     const st = (try rig.send(try authRequest(&req, 1, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = w }).encode(&body)), 0)).?;
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
     try testing.expectEqual(sa.KeyStatus.not_init, rig.users[0].status);
@@ -1215,11 +1251,11 @@ test "SA: an accepted aggressive-mode request cancels the outstanding challenge"
 test "SA: a MAC algorithm that cannot confirm a key change refuses it" {
     var rig: Rig = .{};
     rig.setup(.{ .mac_algorithm = .aes_gmac_trunc_12 }, true); // needs an IV this module does not derive
-    var req: [96]u8 = undefined;
-    var wrapped: [72]u8 = undefined;
-    var body: [80]u8 = undefined;
+    var req: [256]u8 = undefined;
+    var wrapped: [192]u8 = undefined;
+    var body: [200]u8 = undefined;
     _ = (try rig.send(try authRequest(&req, 0, .session_key_status_request, &.{ 1, 0 }), 0)).?;
-    const w = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
+    const w = try rig.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
     const r = (try rig.send(try authRequest(&req, 1, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = w }).encode(&body)), 0)).?;
     try testing.expect(isSaError(r));
     try testing.expectEqual(sa.KeyStatus.not_init, rig.users[0].status);
@@ -1247,4 +1283,35 @@ test "SA: a challenged request does not abandon the response awaiting its confir
     _ = (try rig.send(try rig.reply(&buf, 3, csq, 1, &kat_control_key), 4)).?;
     try testing.expect(!rig.station.awaiting_confirm);
     try testing.expectEqual(@as(?u4, 3), rig.station.last_request_seq);
+}
+
+test "SA: a recorded key change replayed after a restart is refused, however the KSQ is stepped" {
+    // Boot 1: a genuine key change, recorded.
+    var first: Rig = .{};
+    first.setup(.{}, true);
+    var req: [256]u8 = undefined;
+    _ = (try first.send(try authRequest(&req, 0, .session_key_status_request, &.{ 1, 0 }), 0)).?;
+    var wrapped: [192]u8 = undefined;
+    const w = try first.wrap(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
+    var body: [200]u8 = undefined;
+    const recorded_ksq = first.auth.ksq;
+    const recorded = try (sa.SessionKeyChange{ .key_change_seq_num = recorded_ksq, .user_number = 1, .wrapped_key_data = w }).encode(&body);
+    var recorded_req: [256]u8 = undefined;
+    const replay = try authRequest(&recorded_req, 1, .session_key_change, recorded);
+    _ = (try first.send(replay, 0)).?;
+    try testing.expectEqual(sa.KeyStatus.ok, first.users[0].status);
+
+    // Boot 2: the KSQ starts again at 0; an attacker steps it with g120v4
+    // until the window carries the recorded KSQ, then replays.
+    var second: Rig = .{};
+    second.setup(.{}, true);
+    second.counter = 100; // a real random source does not repeat after a restart
+    var i: u32 = 0;
+    while (second.auth.ksq != recorded_ksq) : (i += 1) {
+        _ = (try second.send(try authRequest(&req, @truncate(i), .session_key_status_request, &.{ 1, 0 }), 0)).?;
+    }
+    const st = (try second.send(replay, 0)).?;
+    try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
+    try testing.expectEqual(sa.KeyStatus.not_init, second.users[0].status);
+    try testing.expectEqual(@as(u8, 0), second.users[0].key_len);
 }

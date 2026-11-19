@@ -6,9 +6,9 @@
 
 **Scope:** mvp — opendnp3 3.1.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-19 (103/106, 3 eq) · src 55dd39d42e9ef0fd
+**Audit:** review 2026-09-02 · mutation 2026-11-19 (139/144, 5 eq) · src 055a0901b88ebd32
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DNP3_FUZZ: `dnp3-fragment` and `dnp3-session` over the structured hostile-field generator, plus damaged genuine reads and damaged link frames; `dnp3-sa` Secure Authentication wrap / MAC / g120 objects as an oracle) · ct 2026-10-10 (ctgrind: SA session key through every MAC + reply MAC 0; update/session keys through key wrap 2 = aeskw integrity verdict)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DNP3_FUZZ: `dnp3-fragment` and `dnp3-session` over the structured hostile-field generator, plus damaged genuine reads and damaged link frames; `dnp3-sa` Secure Authentication wrap / MAC / g120 objects as an oracle; 2026-11-19 `dnp3-sa` extended to the SAv5 status-bound wrap, 4 × 50,000 seeds clean) · ct 2026-11-19 (ctgrind: SA session key through every MAC + reply MAC 0; update/session keys through key wrap 2 = aeskw integrity verdict; SAv5 status-bound wrap `keys5` 6 = the same verdict per call site, see "Key-wrap layout")
 **Performance:** not measured
 
 **Known defects:** none recorded
@@ -304,8 +304,9 @@ Behaviour, and why:
 - **Session keys**: g120v4 is answered with g120v5 (KSQ = previous + 1, the user's key status,
   configured key-wrap and MAC algorithms, fresh challenge data, no MAC). Every g120v5 opens the
   single key-change window for that user and KSQ. g120v6 is accepted only inside it with the same
-  KSQ and user, an update key of the length the key-wrap algorithm requires, and AES-KW
-  (`sa.unwrapSessionKeys`) integrity. The new keys replace the old ones, which are wiped. The
+  KSQ and user, an update key of the length the key-wrap algorithm requires, AES-KW integrity, and
+  the SAv5 layout bound to that window's status (`sa.unwrapSessionKeysWithStatus`, see "Key-wrap
+  layout" below). The new keys replace the old ones, which are wiped. The
   confirmation is a g120v5 with status OK whose MAC is computed under the new monitoring-direction
   key over the received g120v6 object. A refused change is answered with a g120v5 with status
   AUTH_FAIL and leaves the user's existing keys as they were.
@@ -318,6 +319,62 @@ Behaviour, and why:
   (AUTHENTICATE_REQUEST_NO_ACK) is counted and not answered. Unexpected or undecodable
   AUTHENTICATE_REQUESTs are counted and ignored.
 - **Statistics** (`Statistics`) count each of these events in memory.
+
+**Key-wrap layout (open question (a), decided 2026-11-19).** The g120v6 wrapped data is
+AES-KW (RFC 3394) over: key length (u16 LE), control key, monitoring key, the key-status message,
+and zero padding to a multiple of 8. The key-status message is the g120v5 object body that opened
+the key-change window, exactly as sent: KSQ through the challenge data, plus its MAC when it had
+one, without the 6-octet g120 object header. `sa.wrapSessionKeysWithStatus` /
+`sa.unwrapSessionKeysWithStatus` implement it. The unwrap compares the embedded status in
+constant time (`ctEql` over exactly the expected status's length). Every wire-dependent failure
+returns the one error `Unauthentic`: integrity, length field, total length, or a different status.
+
+Why: the KSQ alone cannot stop a replay. It restarts at 0 with the outstation, and any peer can
+step it with unauthenticated g120v4s. Binding the change to the status's fresh random challenge
+data closes the replay of a recorded g120v6 after a restart (review MEDIUM-1, regression test in
+`secure_auth`). The layout is the one recalled for IEEE 1815-2012 SAv5 and opendnp3 2.x; it is
+**not checked against the standard's text** or a foreign implementation. Which bytes count as
+"the key-status message" (object body, whole object, or ASDU) and the padding byte are the
+uncertain parts.
+
+Padding contents are deliberately not checked, because another implementation may pad
+differently. The layout carries no status length of its own. So an expected status that is a
+strict prefix of the wrapped one, and pads to the same total, compares equal on the bytes it
+has. That is enough for the binding: the expected status is always the outstation's own, exact
+and fresh, so any extra bytes are padding to it.
+
+An expected status shorter than a minimal g120v5 body (`sa.min_wrapped_status_len` = 11-octet
+fixed part + 4 octets of challenge data) is refused with the same `Unauthentic`: it would bind
+the change to nothing.
+
+The older `sa.wrapSessionKeys` / `unwrapSessionKeys` pair stays as a public codec. Its keys-only
+layout is not what SAv5 outstations use.
+
+*Constant time (ctgrind target `keys5`).* After AES-KW has authenticated the plaintext, the unwrap
+declassifies exactly two public byte ranges (`makeMemDefined`, a no-op without `-fvalgrind`):
+- the 2-octet length field, `recovered[0..2]`;
+- the embedded status, `recovered[2+2·klen .. 2+2·klen+expected.len]`, which went out on the wire
+  as the g120v5.
+
+The keys stay tainted. Native (skylake), measured 2026-11-19:
+- tainted in-file 6. All six are `aeskw` root.zig:203, the timing-safe integrity verdict, once
+  per unwrap call site in the harness (genuine, tampered, other status) × 16/32-octet keys.
+- No context fires in `sa.zig` itself.
+- control 0; trap 0.
+
+x86_64 portable:
+- tainted in-file 121, identical to `keys`.
+- control 4: printing, Writer.zig:1943–1945.
+- trap 61, histogram:
+  - sa.zig:899 ×16 and sa.zig:73 ×8 (the status `ctEql`);
+  - sa.zig:896/897 ×4 each (the length checks);
+  - aeskw root.zig:203 ×6;
+  - Writer.zig ×12;
+  - memcpy.zig ×11.
+
+Nothing is tainted in the trap build. Those contexts are std's bitsliced soft AES padding a
+partial batch with `undefined` lanes, and that definedness reaching plaintext that is public
+after the verdict. The declassification above is compiled out in that build.
 
 **Security notes** (from the independent review of 2026-11-19):
 
@@ -377,7 +434,7 @@ round-trips for every implemented range shape (1/2/4-byte start-stop, all-values
 4-byte count), range/qualifier-mismatch and value-out-of-range errors, a short/garbage decode
 sweep, flags-byte round-trip, and an encode/decode round-trip for every core object
 (g1v1 packed bits, g1v2, g12v1 CROB, g20v1/v2, g30v1/v2, g40v1, g41v1/v2/v3, g50v1) plus a
-short-record error sweep; `sa` (20) — AES-KW RFC 3394 §4.1/§4.3/§4.6 vectors + wrong-KEK/corruption
+short-record error sweep; `sa` (21) — the SAv5 status-bound key wrap (round trip, every wire failure one error, length-field lies, the minimum status), AES-KW RFC 3394 §4.1/§4.3/§4.6 vectors + wrong-KEK/corruption
 reject + malformed-length errors (integration tests through the shared `modules/aeskw` module, which
 carries its own byte-exact KAT suite), HMAC-SHA-256 (RFC 4231) and HMAC-SHA-1 (RFC 2202) truncation KATs,
 AES-GMAC (McGrew GCM test case 1) + compute/verify, constant-time verify accept/tamper/wrong-length,
@@ -407,7 +464,7 @@ wildcard, a broadcast executed but unanswered, a request split across transport 
 out-of-order segments, bad CRC,
 `unsolicitedFrames` framing an outstation-initiated response and advancing `tx_seq`), hostile input
 (including a full-width command range and a point index past the 16-bit space), and four fuzz
-harnesses; `goldens` (5) — the captured-session replays; `secure_auth` (19) — the hand-derived
+harnesses; `goldens` (5) — the captured-session replays; `secure_auth` (22) — the hand-derived
 exchange vectors, bad reply MAC and its retry, a reply with the wrong CSQ / sequence / peer / no
 peer / unknown user / keyless user / empty key / wrong key, reply timeout and replaced
 challenges, SELECT+OPERATE each authenticated, non-critical requests byte-identical with and
@@ -415,7 +472,9 @@ without SA, the critical-set override, no-ack requests, aggressive-mode refusals
 refusals (KSQ, user, update key, short or undecodable data, replay), expiry by time / count /
 status request and a disabled axis, old keys wiped, the error budget, unexpected AUTH requests,
 challenge shapes and the storage boundary, a challenge that could not be sent, and aggressive
-mode cancelling an outstanding challenge.
+mode cancelling an outstanding challenge, a recorded key change replayed after a restart with the
+KSQ stepped to match, a key change whose confirmation MAC cannot be computed, and a challenged
+request leaving a response awaiting its confirm alone.
 
 **Interop (2026-07-23).** The captures in `src/goldens.zig` were taken against **opendnp3**
 (Apache-2.0, `release` branch, built from source in this sandbox) used strictly as a black-box
@@ -483,6 +542,16 @@ length either fails to decode or fails the length-checked constant-time compare.
 unwrapped-key scratch (observable only to a stack probe over a key change, which the module
 does not have yet) and of the confirmation-MAC buffer (that MAC goes on the wire).
 
+**Review-fix delta mutation 2026-11-19** (schemata, ReleaseSafe, 38 mutants over the review
+fixes: `secure_auth.zig`, the outstation hook, `sa.wrapSessionKeysWithStatus` /
+`unwrapSessionKeysWithStatus` and its minimum-status guard). Run 1 over 36: 30 killed. 4
+survivors got killing tests and were re-run killed: an ignored reply's count (two sites), the
+wrap's 16/32 key-length check, and klen ∈ {16, 32}, whose test had placed the status at the wrong
+offset. Two are equivalent. Dropping `wrapped.len - 8 > plain.len` is covered because aeskw
+refuses a short output buffer, which maps to `Unauthentic`. The `UnsupportedKeyLength → KeyLength`
+mapping is dead behind the update-key pre-check, which mutant 127 proves needed. The 2 guard
+mutants were run separately and killed. Result 36/38 killed, 2 eq.
+
 ## Backlog / deferred
 
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
@@ -498,6 +567,9 @@ does not have yet) and of the confirmation-MAC buffer (that MAC goes on the wire
   the wire (counted in memory only), authenticated responses in the monitoring direction,
   AES-GMAC as the challenge MAC (its IV derivation is out of scope in `sa.zig`), the master
   side, and a stack probe over the key-change path.
+- x86_64 portable ctgrind trap counts for `keys5` include std soft-AES pad-lane definedness
+  reaching post-verdict public plaintext (sa.zig:896-899); revisit if std stops padding with
+  undefined.
 - ⚠ **FINDING (2026-11-19, open): `sa.ErrorCode` values past 1 may be wrong.** `sa.zig` has
   1 authentication_failed, 2 unexpected_reply, 3 no_available_session_key, 4 unknown_user,
   5 unknown_association, 6 unknown_sequence_number, 7 unknown_key_change_method,
@@ -515,8 +587,8 @@ does not have yet) and of the confirmation-MAC buffer (that MAC goes on the wire
   Check against the standard's table, then renumber (a behaviour change of `sa.ErrorCode`).
 - **Open questions for the SA integration** (each needs the standard's text or a foreign
   implementation to settle):
-  (a) whether SAv5's g120v6 wrapped data also carries the last g120v5 message (`sa.zig`'s
-  `wrapSessionKeys` wraps the two keys only, and the outstation follows it);
+  (a) ~~whether the g120v6 wrapped data carries the last g120v5 message~~ — decided
+  2026-11-19, yes (see "Key-wrap layout"); the exact byte definition is still unverified;
   (b) what the g120v5 MAC covers (here: the received g120v6 object, under the new
   monitoring key, only in the confirmation);
   (c) the exact default critical-function table;

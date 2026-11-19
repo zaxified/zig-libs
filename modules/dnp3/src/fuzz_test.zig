@@ -78,6 +78,10 @@ const SaMark = Marker(enum {
     asdu_flip_refused,
     wrong_key_refused,
     short_mac_refused,
+    status_unwrapped,
+    status_wrap_flip_refused,
+    other_status_refused,
+    random_wrapped_refused,
     objects_roundtrip,
     objects_damaged,
 });
@@ -110,6 +114,41 @@ pub fn fuzzSa(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         flipBit(src, other[0..ulen]);
         if (sa.unwrapSessionKeys(other[0..ulen], wrapped, klen, &out_buf)) |_| return error.WrongUpdateKeyAccepted else |_| SaMark.mark(.wrong_update_key_refused);
         if (sa.unwrapSessionKeys(update[0..ulen], wrapped[0..src.index(wrapped.len)], klen, &out_buf)) |_| return error.TruncatedWrapAccepted else |_| SaMark.mark(.truncated_wrap_refused);
+    }
+
+    // SAv5 wrap bound to a key-status message: round trip, a flipped
+    // wrapped bit, another status, and random wrapped bytes.
+    {
+        var status: [sa.max_wrapped_status_len]u8 = undefined;
+        const sl = sa.min_wrapped_status_len + src.index(status.len - sa.min_wrapped_status_len + 1);
+        src.bytes(status[0..sl]);
+        var sw_buf: [256]u8 = undefined;
+        const sw = try sa.wrapSessionKeysWithStatus(update[0..ulen], control[0..klen], monitor[0..klen], status[0..sl], &sw_buf);
+        const k2 = try sa.unwrapSessionKeysWithStatus(update[0..ulen], sw, status[0..sl], &out_buf);
+        if (!std.mem.eql(u8, k2.control_key, control[0..klen]) or !std.mem.eql(u8, k2.monitoring_key, monitor[0..klen])) return error.StatusUnwrapChangedTheKeys;
+        SaMark.mark(.status_unwrapped);
+        var bad: [256]u8 = undefined;
+        @memcpy(bad[0..sw.len], sw);
+        flipBit(src, bad[0..sw.len]);
+        if (sa.unwrapSessionKeysWithStatus(update[0..ulen], bad[0..sw.len], status[0..sl], &out_buf)) |_| return error.FlippedStatusWrapAccepted else |_| SaMark.mark(.status_wrap_flip_refused);
+        var other_status = status;
+        const ol = src.index(status.len + 1);
+        if (ol == sl and sl > 0) flipBit(src, other_status[0..sl]) else src.bytes(other_status[0..ol]);
+        // The layout carries no status length: an expected status that is a
+        // strict prefix of the wrapped one and pads to the same length is
+        // accepted by design (the outstation's own status is exact and fresh;
+        // the extra bytes are padding to it). Every other status is refused.
+        const same_pad = std.mem.alignForward(usize, 2 + 2 * klen + ol, 8) == std.mem.alignForward(usize, 2 + 2 * klen + sl, 8);
+        // (Only for prefixes of at least the minimal status: a shorter
+        // expected status binds nothing and is always refused.)
+        const prefix = ol >= sa.min_wrapped_status_len and ol <= sl and same_pad and std.mem.eql(u8, other_status[0..ol], status[0..ol]);
+        if (!prefix) {
+            if (sa.unwrapSessionKeysWithStatus(update[0..ulen], sw, other_status[0..ol], &out_buf)) |_| return error.OtherStatusAccepted else |_| SaMark.mark(.other_status_refused);
+        }
+        var junk: [256]u8 = undefined;
+        const jl = src.index(junk.len + 1);
+        src.bytes(junk[0..jl]);
+        if (sa.unwrapSessionKeysWithStatus(update[0..ulen], junk[0..jl], status[0..sl], &out_buf)) |_| return error.RandomWrappedAccepted else |_| SaMark.mark(.random_wrapped_refused);
     }
 
     // Reply MAC over challenge message ++ ASDU.
