@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go `crypto/sha256` + `crypto/sha512` + `crypto/sha3` + `encoding/hex` and RustCrypto `sha2`/`sha3`/`blake2`/`digest` (surveyed 2026-11-02)
 
-**Audit:** review 2026-07-18 · mutation 2026-11-19 (18/20, 2 eq) · src ?
+**Audit:** review 2026-07-18 · mutation 2026-11-19 (123/130, 7 eq) · src 75fcec3d84f8edd3
 
 **Hardening:** fuzz 2026-11-02 (checksum-file parser: 3,000,000 runs clean in ReleaseSafe, `HASHDIGEST_FUZZ`, every reach label hit) · ct n/a — digests; `blake3Keyed`'s key goes only into std's BLAKE3 and is wiped after (not ctgrind-checked) · burn 2026-11-02 (stackprobe of `blake3Keyed`/`blake3DeriveKey` clean at 16 KiB; red at 8 KiB for derive and with the burn removed) · panic 2026-11-02 (sweep HD-3: new inputs; the 2026-10-30 sweep predates the new code and the vectorised BLAKE2b)
 
@@ -109,6 +109,10 @@ Official empty-string and `"abc"` known-answer vectors for all 9 algorithms; inc
 loop, the up-front buffer check) and the `ShortBuffer` checks of `hex` and
 `MultiHasher.finalHex`: 9 killed, 2 equivalent, 0 left alive. Equivalent: the
 `announced.len != …` guards in `matches` and `matchesAlgo`. The new code (`checksum`, `blake2b`, `xof`, keyed modes) has had **no mutation run**.
+
+**Audit 2026-11-19 (whole-module mutation).** 130 schemata mutants over `root.zig`, `checksum.zig` and `blake2b.zig`: hex case, the length and short-buffer checks, the file streaming loop and `max_bytes`, the XOF / keyed / derive selection, `finalHex` finalizing a copy; the whole checksum-file parser, verifier and summary; the BLAKE2b-256 streaming boundaries, counter, last-block flag, message schedule, diagonal shuffles, rotations and feed-forward. Five of them are burn-site mutants measured in a ReleaseFast schemata build with the switch inside the callee (the stack probe's baseline is clean). Result: 123 killed (4 by a hang), 7 equivalent, 0 open, 0 not run. The card's `123/130` replaces the earlier counts (`src ?`). Not mutated: the `sigma` and IV tables and the 12-round `inline for` bound (comptime; any change breaks the comparison against std), `nativeToLittle` (the identity on little-endian hosts), the `secureZero` of the state copy in `Hasher.finalHex` and `MultiHasher.finalHex` (public-digest states, no stack probe) and the body of `burnStack`. The first run left 28 survivors; tests added: `parseLine` on an empty line, an empty BSD name, an empty digest, a wrong separator and a wrong mode; the BSD binary flag; unescaped names keep their backslashes and fit an exact buffer; `isUnsafeName` on empty and `..x` names; every failure counter of `Summary.allOk`; a BSD tag overriding the default algorithm; case-insensitive digest comparison; a bad escape as `BadLine`; an unreadable regular file as `unreadable`; and `hashFileIn` one byte short.
+
+Equivalent (7): the length pre-checks of `matches` and `matchesAlgo` (`eql` compares lengths); in `parseLine` the guards `s.len < hex_end + 3` and `name.len == 0`, each redundant given the other (a name is at least one byte whenever the length guard passes); and the three wipes inside `blake3Keyed` / `blake3DeriveKey` (`secureZero` of the key copy and of the state, twice): the `defer burnStack()` that runs after them overwrites the same frame region, so the probe cannot see them go (dropping the burn itself is killed by the probe).
 
 ## Backlog / deferred
 - **`verifyEntry` stats, then opens (2026-11-03):** a name swapped for a FIFO between the two can still hang the call. The checksum's directory has to be one the attacker cannot write to; `std.Io.Dir` offers no non-blocking open or fd-based stat to close it here.

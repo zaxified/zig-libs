@@ -352,3 +352,82 @@ test "verify: one ok file and one too_large file is not allOk" {
     try testing.expect(!s.allOk());
     try testing.expect(ck.verifyAll(testing.io, tmp.dir, .sha256, text, .{ .max_file_bytes = 5 }).allOk());
 }
+
+// ── whole-module mutation 2026-11-19: survivors of the first run ────────────
+
+const abc256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+test "parseLine: an empty line, an empty BSD name, an empty or malformed GNU digest, separator or mode are BadLine" {
+    try testing.expectError(error.BadLine, ck.parseLine("", 1));
+    try testing.expectError(error.BadLine, ck.parseLine("SHA256 () = " ++ abc256, 1));
+    try testing.expectError(error.BadLine, ck.parseLine("  name", 1)); // no digest
+    try testing.expectError(error.BadLine, ck.parseLine("abcdg name", 1)); // 'g' is not the separator
+    try testing.expectError(error.BadLine, ck.parseLine("abcd xname", 1)); // mode is ' ' or '*'
+    try testing.expectError(error.BadLine, ck.parseLine("abcd  ", 1)); // no name
+    const gnu = try ck.parseLine("abcd *name", 3);
+    try testing.expect(gnu.binary);
+    const text = try ck.parseLine("abcd  name", 3);
+    try testing.expect(!text.binary);
+    const bsd = try ck.parseLine("SHA256 (f) = " ++ abc256, 4);
+    try testing.expect(bsd.binary); // BSD lines are binary
+    try testing.expectEqual(hd.Algorithm.sha256, bsd.algo.?);
+}
+
+test "unescapeName: an unescaped name keeps its backslashes and fits an exact buffer; isUnsafeName on odd names" {
+    const e = try ck.parseLine("abcd  a\\nb", 1); // no leading backslash: the name is literally a, backslash, n, b
+    var buf: [4]u8 = undefined; // exactly the name's length
+    try testing.expectEqualStrings("a\\nb", try e.unescapeName(&buf));
+    var small: [3]u8 = undefined;
+    try testing.expectError(error.ShortBuffer, e.unescapeName(&small));
+    try testing.expect(!ck.isUnsafeName(""));
+    try testing.expect(!ck.isUnsafeName("..hidden"));
+    try testing.expect(!ck.isUnsafeName("a/..x/b"));
+    try testing.expect(!ck.isUnsafeName("a...b"));
+    try testing.expect(ck.isUnsafeName("a/../b"));
+    try testing.expect(ck.isUnsafeName("/abs"));
+}
+
+test "Summary.allOk: every failure counter alone makes it false" {
+    try testing.expect((ck.Summary{ .ok = 1 }).allOk());
+    try testing.expect(!(ck.Summary{ .ok = 1, .mismatch = 1 }).allOk());
+    try testing.expect(!(ck.Summary{ .ok = 1, .unreadable = 1 }).allOk());
+    try testing.expect(!(ck.Summary{ .ok = 1, .unsafe_name = 1 }).allOk());
+    try testing.expect(!(ck.Summary{ .ok = 1, .too_large = 1 }).allOk());
+    try testing.expect(!(ck.Summary{ .ok = 1, .malformed = 1 }).allOk());
+    try testing.expect(!(ck.Summary{}).allOk());
+}
+
+test "verify: a BSD tag overrides the default algorithm, digest case is ignored, a bad escape is BadLine, an unreadable file is unreadable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "abc" });
+    const hex512 = hd.hexOf(.sha512, "abc");
+    var buf: [512]u8 = undefined;
+    const bsd = try std.fmt.bufPrint(&buf, "SHA512 (f) = {s}\n", .{&hex512});
+    try testing.expectEqual(@as(usize, 1), ck.verifyAll(testing.io, tmp.dir, .sha256, bsd, .{}).ok);
+
+    var upper: [abc256.len]u8 = undefined;
+    _ = std.ascii.upperString(&upper, abc256);
+    const up_line = try std.fmt.bufPrint(&buf, "{s}  f\n", .{&upper});
+    try testing.expectEqual(@as(usize, 1), ck.verifyAll(testing.io, tmp.dir, .sha256, up_line, .{}).ok);
+
+    const bad = try ck.parseLine("\\" ++ abc256 ++ "  a\\q", 1);
+    try testing.expectError(error.BadLine, ck.verifyEntry(testing.io, tmp.dir, .sha256, bad, .{}));
+
+    // A regular file the process may not read: hashed as `unreadable`, not as a mismatch.
+    if (std.os.linux.geteuid() != 0) {
+        try tmp.dir.setFilePermissions(testing.io, "f", .fromMode(0), .{});
+        defer tmp.dir.setFilePermissions(testing.io, "f", .fromMode(0o600), .{}) catch {};
+        const line = try std.fmt.bufPrint(&buf, "{s}  f\n", .{abc256});
+        try testing.expectEqual(@as(usize, 1), ck.verifyAll(testing.io, tmp.dir, .sha256, line, .{}).unreadable);
+    }
+}
+
+test "hashFileIn: an output buffer one byte short of the hex length is ShortBuffer" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "abc" });
+    var out: [hd.hex_len]u8 = undefined;
+    try testing.expectError(error.ShortBuffer, hd.hashFileIn(.sha256, testing.io, tmp.dir, "f", out[0 .. hd.hex_len - 1]));
+    try testing.expectEqual(@as(?u64, 3), try hd.hashFileIn(.sha256, testing.io, tmp.dir, "f", &out));
+}
