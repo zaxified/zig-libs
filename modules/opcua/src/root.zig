@@ -1242,9 +1242,14 @@ pub const Subscription = struct {
             services.decodeCreateMonitoredItemsResponse,
             services.result_fns.create_monitored_items,
         );
+        // One result per item, in order (§5.12.2.2); anything else cannot be
+        // correlated, so the bookkeeping stays as it was.
+        if ((response.results orelse &.{}).len != specs.len) {
+            services.freeCreateMonitoredItemsResponse(sub.allocator, response);
+            return error.ResultCountMismatch;
+        }
         if (response.results) |results| {
             for (results, 0..) |r, i| {
-                if (i >= specs.len) break;
                 if (services.isBad(r.status_code)) continue;
                 try sub.monitored_items.append(sub.allocator, .{ .client_handle = specs[i].client_handle, .monitored_item_id = r.monitored_item_id });
             }
@@ -1354,9 +1359,14 @@ pub const Subscription = struct {
             services.decodeModifyMonitoredItemsResponse,
             services.result_fns.modify_monitored_items,
         );
+        // One result per item, in order (§5.12.3.2); anything else cannot be
+        // correlated, so the handle table stays as it was.
+        if ((response.results orelse &.{}).len != specs.len) {
+            services.freeModifyMonitoredItemsResponse(sub.allocator, response);
+            return error.ResultCountMismatch;
+        }
         if (response.results) |results| {
             for (results, 0..) |r, i| {
-                if (i >= specs.len) break;
                 if (services.isBad(r.status_code)) continue;
                 for (sub.monitored_items.items) |*h| {
                     if (h.monitored_item_id == specs[i].monitored_item_id) h.client_handle = specs[i].client_handle;
@@ -3009,15 +3019,16 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
     var server_buf: [8192]u8 = undefined;
     var server_w: std.Io.Writer = .fixed(&server_buf);
 
-    // 1: three results for two specs (the third is the server's mistake), the middle one failed
+    // 1: three results for two specs (the server's mistake): refused, table untouched; 2: the right two, the second one failed
     const results = [_]services.MonitoredItemCreateResult{
         .{ .status_code = 0, .monitored_item_id = 100, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter },
         .{ .status_code = services.status.bad_node_id_unknown, .monitored_item_id = 0, .revised_sampling_interval = 0, .revised_queue_size = 0, .filter_result = services.no_filter },
         .{ .status_code = 0, .monitored_item_id = 102, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter },
     };
     try renderFrame(&server_w, 1, services.CreateMonitoredItemsResponse, .{ .response_header = scripted_header, .results = &results, .diagnostic_infos = null }, services.encodeCreateMonitoredItemsResponse, services.type_id.create_monitored_items_response);
+    try renderFrame(&server_w, 2, services.CreateMonitoredItemsResponse, .{ .response_header = scripted_header, .results = results[0..2], .diagnostic_infos = null }, services.encodeCreateMonitoredItemsResponse, services.type_id.create_monitored_items_response);
 
-    // 2: a Publish answer carrying a status change, an event list, a data change and something unknown
+    // 3: a Publish answer carrying a status change, an event list, a data change and something unknown
     var sc_buf: [64]u8 = undefined;
     var sc_w: std.Io.Writer = .fixed(&sc_buf);
     var sc_e = encoding.Encoder.init(&sc_w);
@@ -3036,7 +3047,7 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
         .{ .type_id = services.type_id.data_change_notification, .encoding = .byte_string, .body = dc_w.buffered() },
         .{ .type_id = services.type_id.read_request, .encoding = .byte_string, .body = "" },
     };
-    try renderFrame(&server_w, 2, services.PublishResponse, .{
+    try renderFrame(&server_w, 3, services.PublishResponse, .{
         .response_header = scripted_header,
         .subscription_id = 1,
         .available_sequence_numbers = null,
@@ -3046,8 +3057,8 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
         .diagnostic_infos = null,
     }, services.encodePublishResponse, services.type_id.publish_response);
 
-    // 3: a Read answer without a single result
-    try renderFrame(&server_w, 3, services.ReadResponse, .{ .response_header = scripted_header, .results = &.{}, .diagnostic_infos = null }, services.encodeReadResponse, services.type_id.read_response);
+    // 4: a Read answer without a single result
+    try renderFrame(&server_w, 4, services.ReadResponse, .{ .response_header = scripted_header, .results = &.{}, .diagnostic_infos = null }, services.encodeReadResponse, services.type_id.read_response);
 
     var client_out_buf: [8192]u8 = undefined;
     var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
@@ -3062,6 +3073,8 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
         .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } }, .client_handle = 10 },
         .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2259 } }, .client_handle = 11 },
     };
+    try testing.expectError(error.ResultCountMismatch, sub.createMonitoredItems(&specs, .both));
+    try testing.expectEqual(@as(usize, 0), sub.monitored_items.items.len);
     const created = try sub.createMonitoredItems(&specs, .both);
     defer services.freeCreateMonitoredItemsResponse(testing.allocator, created);
     try testing.expectEqual(@as(usize, 1), sub.monitored_items.items.len);
@@ -3084,13 +3097,20 @@ test "Subscription offline scripted: surplus and failed CreateMonitoredItems res
     try testing.expectError(error.UnexpectedResponseType, session.readAttribute(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, services.attribute_id.value));
 }
 
-test "Subscription offline scripted: a ModifyMonitoredItems answer with more results than specs never indexes past the specs" {
+test "Subscription offline scripted: a ModifyMonitoredItems answer whose result count differs from the request (short, long, null) is refused and the handle table stays; a matching one updates it" {
     const testing = std.testing;
-    var server_buf: [4096]u8 = undefined;
+    var server_buf: [8192]u8 = undefined;
     var server_w: std.Io.Writer = .fixed(&server_buf);
     const good: services.MonitoredItemModifyResult = .{ .status_code = 0, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter };
-    const results = [_]services.MonitoredItemModifyResult{ good, good };
-    try renderFrame(&server_w, 1, services.ModifyMonitoredItemsResponse, .{ .response_header = scripted_header, .results = &results, .diagnostic_infos = null }, services.encodeModifyMonitoredItemsResponse, services.type_id.modify_monitored_items_response);
+    const two = [_]services.MonitoredItemModifyResult{ good, good };
+    const Resp = services.ModifyMonitoredItemsResponse;
+    const enc = services.encodeModifyMonitoredItemsResponse;
+    const tid = services.type_id.modify_monitored_items_response;
+    // 1: long (2 for 2 specs asked 1) 2: short (1 for 2) 3: null 4: matching
+    try renderFrame(&server_w, 1, Resp, .{ .response_header = scripted_header, .results = &two, .diagnostic_infos = null }, enc, tid);
+    try renderFrame(&server_w, 2, Resp, .{ .response_header = scripted_header, .results = two[0..1], .diagnostic_infos = null }, enc, tid);
+    try renderFrame(&server_w, 3, Resp, .{ .response_header = scripted_header, .results = null, .diagnostic_infos = null }, enc, tid);
+    try renderFrame(&server_w, 4, Resp, .{ .response_header = scripted_header, .results = two[0..1], .diagnostic_infos = null }, enc, tid);
 
     var client_out_buf: [4096]u8 = undefined;
     var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
@@ -3101,11 +3121,18 @@ test "Subscription offline scripted: a ModifyMonitoredItems answer with more res
     var sub: Subscription = .{ .session = &session, .allocator = testing.allocator, .subscription_id = 1 };
     defer sub.deinit();
     try sub.monitored_items.append(testing.allocator, .{ .client_handle = 10, .monitored_item_id = 100 });
+    try sub.monitored_items.append(testing.allocator, .{ .client_handle = 11, .monitored_item_id = 101 });
 
-    const specs = [_]Subscription.MonitoredItemModifySpec{.{ .monitored_item_id = 100, .client_handle = 20 }};
-    const response = try sub.modifyMonitoredItems(&specs, .both);
+    const one = [_]Subscription.MonitoredItemModifySpec{.{ .monitored_item_id = 100, .client_handle = 20 }};
+    const both = [_]Subscription.MonitoredItemModifySpec{ .{ .monitored_item_id = 100, .client_handle = 20 }, .{ .monitored_item_id = 101, .client_handle = 21 } };
+    try testing.expectError(error.ResultCountMismatch, sub.modifyMonitoredItems(&one, .both));
+    try testing.expectError(error.ResultCountMismatch, sub.modifyMonitoredItems(&both, .both));
+    try testing.expectError(error.ResultCountMismatch, sub.modifyMonitoredItems(&one, .both));
+    try testing.expectEqual(@as(u32, 100), sub.findMonitoredItem(10).?);
+    try testing.expectEqual(@as(u32, 101), sub.findMonitoredItem(11).?);
+    try testing.expect(sub.findMonitoredItem(20) == null);
+    const response = try sub.modifyMonitoredItems(&one, .both);
     defer services.freeModifyMonitoredItemsResponse(testing.allocator, response);
-    try testing.expectEqual(@as(usize, 2), response.results.?.len);
     try testing.expectEqual(@as(u32, 100), sub.findMonitoredItem(20).?);
     try testing.expect(sub.findMonitoredItem(10) == null);
 }
