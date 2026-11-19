@@ -474,6 +474,7 @@ test "readRange: strings, byte strings and scalars" {
     try testing.expectEqualStrings("bcd", (try readRange(a.allocator(), s, &try parse("1:3"))).scalar.string.?);
     try testing.expectEqualStrings("f", (try readRange(a.allocator(), s, &try parse("5"))).scalar.string.?);
     try testing.expectEqualStrings("ef", (try readRange(a.allocator(), s, &try parse("4:50"))).scalar.string.?);
+    try testing.expectEqualStrings("ef", (try readRange(a.allocator(), s, &try parse("4:6"))).scalar.string.?); // end == length
     try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), s, &try parse("6")));
     try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), s, &try parse("0,0")));
     try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), .{ .scalar = .{ .string = null } }, &try parse("0")));
@@ -489,6 +490,14 @@ test "readRange: strings, byte strings and scalars" {
     const subs = try readRange(a.allocator(), strs, &try parse("0:1,1:2"));
     try testing.expectEqualStrings("lp", subs.array.items.string.?[0].?);
     try testing.expectEqualStrings("et", subs.array.items.string.?[1].?);
+    try testing.expectEqual(@as(?[]const i32, null), subs.array.dimensions); // a 1-D array reports no dimensions
+    // a 2-D array of Strings: two dimensions select elements, the third the bytes
+    const sdims = [_]i32{ 2, 2 };
+    const grid: encoding.Variant = .{ .array = .{ .items = .{ .string = &.{ "aa1", "bb2", "cc3", "dd4" } }, .dimensions = &sdims } };
+    const gs = try readRange(a.allocator(), grid, &try parse("1,0:1,2"));
+    try testing.expectEqualStrings("3", gs.array.items.string.?[0].?);
+    try testing.expectEqualStrings("4", gs.array.items.string.?[1].?);
+    try testing.expectEqualSlices(i32, &.{ 1, 2 }, gs.array.dimensions.?);
     // a selected element too short for the byte range: no data for the whole request
     try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), strs, &try parse("0:2,4")));
     try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), strs, &try parse("0,1,1")));
@@ -576,6 +585,7 @@ test "writeRange: strings" {
     try testing.expectError(error.IndexRangeInvalid, writeRange(a.allocator(), s, .{ .scalar = .{ .string = "X" } }, &try parse("1:2")));
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), s, .{ .scalar = .{ .string = "XY" } }, &try parse("5:6")));
     try testing.expectError(error.TypeMismatch, writeRange(a.allocator(), s, .{ .scalar = .{ .byte_string = "XY" } }, &try parse("0:1")));
+    try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), s, .{ .scalar = .{ .string = "XY" } }, &try parse("0,1")));
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), .{ .scalar = .{ .int32 = 1 } }, .{ .scalar = .{ .int32 = 1 } }, &try parse("0")));
     // an element of a string array is written as a whole element; a byte range
     // inside an element is a partial write this module does not support

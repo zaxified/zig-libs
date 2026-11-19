@@ -11361,6 +11361,19 @@ test "NumericRange: write precedence (object value, user access, empty value) an
         .value_rank = nodestore.value_rank.one_dimension,
         .access_level = nodestore.access_level.read_write,
     });
+    // a Variable whose DataValue carries no value at all, with ArrayDimensions
+    const raw: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "r.raw" } };
+    try rig.store.addNode(.{
+        .node_id = raw,
+        .browse_name = .{ .namespace_index = ns, .name = "r.raw" },
+        .attributes = .{ .variable = .{
+            .data_type = nodestore.n0(nodestore.id.int32),
+            .value_rank = nodestore.value_rank.one_dimension,
+            .array_dimensions = &.{3},
+            .access_level = nodestore.access_level.read_write,
+            .user_access_level = nodestore.access_level.read_write,
+        } },
+    });
     const one: encoding.DataValue = .{ .value = .{ .scalar = .{ .int32 = 9 } } };
     const stamped: encoding.DataValue = .{ .value = .{ .scalar = .{ .int32 = 77 } }, .status = 0x4000_0000 };
     rig.now_ms = 7000;
@@ -11369,6 +11382,7 @@ test "NumericRange: write precedence (object value, user access, empty value) an
         .{ .node_id = user_ro, .attribute_id = val, .index_range = "0", .value = one },
         .{ .node_id = bare, .attribute_id = val, .index_range = "0", .value = one }, // nothing stored yet
         .{ .node_id = ids.arr, .attribute_id = val, .index_range = "0", .value = stamped },
+        .{ .node_id = raw, .attribute_id = val, .index_range = "0", .value = one }, // no value stored at all
     };
     const w = try writeNodes(&rig, &writes);
     defer services.freeWriteResponse(gpa, w);
@@ -11376,12 +11390,15 @@ test "NumericRange: write precedence (object value, user access, empty value) an
     try testing.expectEqual(status.bad_user_access_denied, w.results.?[1]);
     try testing.expectEqual(status.bad_index_range_invalid, w.results.?[2]);
     try testing.expectEqual(status.good, w.results.?[3]);
+    try testing.expectEqual(status.bad_index_range_invalid, w.results.?[4]);
 
     // the status the client sent and a server-stamped time ride along
     const reads = [_]services.ReadValueId{
         readValueId(ids.arr, val, null, null),
         readValueId(nodestore.n0(nodestore.id.base_data_variable_type), val, "0", null),
         readValueId(rig.device_id, services.attribute_id.display_name, "0", null),
+        readValueId(raw, services.attribute_id.array_dimensions, "0", null), // an array, but not the Value
+        readValueId(raw, services.attribute_id.array_dimensions, null, null),
     };
     const r = try readNodes(&rig, &reads);
     defer services.freeReadResponse(gpa, r);
@@ -11393,4 +11410,6 @@ test "NumericRange: write precedence (object value, user access, empty value) an
     // a VariableType's (absent) value and a non-Value attribute carry no data
     try testing.expectEqual(status.bad_index_range_no_data, r.results.?[1].status.?);
     try testing.expectEqual(status.bad_index_range_no_data, r.results.?[2].status.?);
+    try testing.expectEqual(status.bad_index_range_no_data, r.results.?[3].status.?);
+    try testing.expectEqual(@as(u32, 3), r.results.?[4].value.?.array.items.uint32.?[0]);
 }
