@@ -1625,7 +1625,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         testing.allocator,
         random,
         .{
-            .modulus_bits = 512,
+            .modulus_bits = 1024,
             .common_name = "secure-selftest-client",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -1639,7 +1639,7 @@ test "secure offline self-consistency: sealed OPN handshake (Basic256Sha256/Sign
         testing.allocator,
         random,
         .{
-            .modulus_bits = 768,
+            .modulus_bits = 1280,
             .common_name = "secure-selftest-server",
             .not_before = "260101000000Z",
             .not_after = "270101000000Z",
@@ -2766,7 +2766,7 @@ test "secure offline scripted: a secured OpenSecureChannel answer with an empty 
     const random = prng.random();
     var client_creds: security.ClientCredentials = undefined;
     try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
-        .modulus_bits = 512,
+        .modulus_bits = 1024,
         .common_name = "empty-nonce-client",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
@@ -2775,7 +2775,7 @@ test "secure offline scripted: a secured OpenSecureChannel answer with an empty 
     defer client_creds.deinit(testing.allocator);
     var server_creds: security.ClientCredentials = undefined;
     try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
-        .modulus_bits = 768,
+        .modulus_bits = 1280,
         .common_name = "empty-nonce-server",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",

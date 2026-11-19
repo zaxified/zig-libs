@@ -3568,7 +3568,7 @@ fn testAnswerMethod(
 /// A throwaway client/server key pair + self-signed application certificate
 /// pair for the Basic256Sha256 tests. **Test material only** — generated
 /// fresh in-process from a seeded deterministic PRNG, never read from disk,
-/// never a real key. 512-bit moduli keep the suite fast; the live interop
+/// never a real key. 1024-bit moduli keep the suite fast; the live interop
 /// tests exercise real 2048-bit certificates against real third-party clients.
 const TestPki = struct {
     client: security.Credentials,
@@ -3591,7 +3591,7 @@ const TestPki = struct {
             gpa,
             random,
             .{
-                .modulus_bits = 512,
+                .modulus_bits = 1024,
                 .common_name = "zig-libs opcua test client",
                 .not_before = opts.client_not_before,
                 .not_after = opts.client_not_after,
@@ -3605,7 +3605,7 @@ const TestPki = struct {
             gpa,
             random,
             .{
-                .modulus_bits = 512,
+                .modulus_bits = 1024,
                 .common_name = "zig-libs opcua test server",
                 .not_before = opts.server_not_before,
                 .not_after = opts.server_not_after,
@@ -6577,7 +6577,7 @@ test "secure: a multi-chunk or oversize OPN is refused before any RSA operation 
     defer pki.deinit(gpa);
     var endpoint_buf: [3]services.EndpointDescription = undefined;
     const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
-    const k = 64; // the 512-bit test server key: one RSA-OAEP block
+    const k = 128; // the 1024-bit test server key: one RSA-OAEP block
 
     const Case = struct { chunk_type: u8, encrypted_len: usize, expected: encoding.StatusCode };
     const cases = [_]Case{
@@ -6891,7 +6891,7 @@ test "secure negatives: the OpenSecureChannel gate" {
             gpa,
             prng.random(),
             .{
-                .modulus_bits = 512,
+                .modulus_bits = 1024,
                 .common_name = "a different server",
                 .not_before = "190101000000Z",
                 .not_after = "300101000000Z",
@@ -7033,7 +7033,7 @@ test "secure: the session's ClientSignature must cover serverCertificate + serve
             gpa,
             prng.random(),
             .{
-                .modulus_bits = 512,
+                .modulus_bits = 1024,
                 .common_name = "impostor",
                 .not_before = "190101000000Z",
                 .not_after = "300101000000Z",
@@ -7064,7 +7064,7 @@ test "secure: the session's ClientSignature must cover serverCertificate + serve
             gpa,
             prng.random(),
             .{
-                .modulus_bits = 512,
+                .modulus_bits = 1024,
                 .common_name = "other client",
                 .not_before = "190101000000Z",
                 .not_after = "300101000000Z",
@@ -7993,7 +7993,7 @@ test "secure: a renewal with another certificate, a #None renewal and an unknown
     defer pki.deinit(gpa);
     var other: security.Credentials = undefined;
     try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
-        .modulus_bits = 512,
+        .modulus_bits = 1024,
         .common_name = "another client",
         .not_before = "190101000000Z",
         .not_after = "300101000000Z",
@@ -8401,7 +8401,7 @@ test "secure CreateSession: the certificate must be the channel's and the nonce 
     defer pki.deinit(gpa);
     var other: security.Credentials = undefined;
     try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
-        .modulus_bits = 512,
+        .modulus_bits = 1024,
         .common_name = "session cert impostor",
         .not_before = "190101000000Z",
         .not_after = "300101000000Z",
@@ -10292,7 +10292,7 @@ test "root client over a pipe (Sign): a CreateSession answer signed with another
     defer pki.deinit(gpa);
     var other: security.Credentials = undefined;
     try security.Credentials.generateSelfSigned(gpa, prng.random(), .{
-        .modulus_bits = 512,
+        .modulus_bits = 1024,
         .common_name = "impostor",
         .not_before = "190101000000Z",
         .not_after = "300101000000Z",

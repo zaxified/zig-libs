@@ -44,14 +44,14 @@ fn fill(out: []u8, label: []const u8) void {
 fn setup() !void {
     prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x42)));
     const opts = security.ClientCredentials.GenerateSelfSignedOptions{
-        .modulus_bits = 512,
+        .modulus_bits = 1024,
         .common_name = "opcua-probe-client",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
     };
     try security.ClientCredentials.generateSelfSigned(gpa, prng.random(), opts, &client);
     var sopts = opts;
-    sopts.modulus_bits = 768;
+    sopts.modulus_bits = 1280;
     sopts.common_name = "opcua-probe-server";
     try security.ClientCredentials.generateSelfSigned(gpa, prng.random(), sopts, &server);
     fill(&nonce, "opcua probe server nonce");
@@ -107,7 +107,7 @@ test "STACKPROBE: no channel key, RSA key or password residue after any entry po
     _ = try P.run("openAsymmetricMessage", security.openAsymmetricMessage, .{ gpa, opn_wire[0..8], opn_wire[8..], &server.private_key, client.certificate_der }, &[_][]const u8{rsa_sk}, .{});
 
     const opts = security.ClientCredentials.GenerateSelfSignedOptions{
-        .modulus_bits = 512,
+        .modulus_bits = 1024,
         .common_name = "opcua-probe-generated",
         .not_before = "260101000000Z",
         .not_after = "270101000000Z",
