@@ -4294,6 +4294,8 @@ test "serve: a listing carries Cache-Control and nosniff like a file, and links 
     _ = try fx.root.createDirPathOpen(io, "lk/sub dir", .{});
     try fx.root.writeFile(io, .{ .sub_path = "lk/a b:c#d\"e.txt", .data = "x" });
     try fx.root.writeFile(io, .{ .sub_path = "lk/\xc3\xa9.txt", .data = "x" });
+    try fx.root.writeFile(io, .{ .sub_path = "lk/x-y_z~w.txt", .data = "x" });
+    try fx.root.writeFile(io, .{ .sub_path = "lk/t\tb.txt", .data = "x" });
     var out: [8192]u8 = undefined;
     var h = Handler.init(io, fx.root, .{ .directory_listing = true, .cache_control = "no-store" });
     const resp = get(&h, "/lk/", &out);
@@ -4303,6 +4305,8 @@ test "serve: a listing carries Cache-Control and nosniff like a file, and links 
     try testing.expect(mem.find(u8, resp, "<li><a href=\"a%20b%3Ac%23d%22e.txt\">a b:c#d&#34;e.txt</a></li>") != null);
     try testing.expect(mem.find(u8, resp, "<li><a href=\"sub%20dir/\">sub dir/</a></li>") != null);
     try testing.expect(mem.find(u8, resp, "<li><a href=\"%C3%A9.txt\">\xc3\xa9.txt</a></li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"x-y_z~w.txt\">x-y_z~w.txt</a></li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"t%09b.txt\">") != null);
     // HEAD carries the same headers.
     var out2: [4096]u8 = undefined;
     const head = runRequest(&h, "HEAD /lk/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out2);
@@ -4311,6 +4315,27 @@ test "serve: a listing carries Cache-Control and nosniff like a file, and links 
     // Without the option: no Cache-Control.
     var h2 = Handler.init(io, fx.root, .{ .directory_listing = true });
     try testing.expect(mem.find(u8, get(&h2, "/lk/", &out), "Cache-Control:") == null);
+}
+
+test "serveDirectory: a Cache-Control that cannot be set answers 500, never a listing outside the operator's cache policy (review 2026-10-24 L10)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{ .directory_listing = true, .cache_control = "no-store" });
+    const wire = "GET /sub/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    // `Content-Type` is preset, so its own `setHeader` is a replace that needs
+    // no slot and cannot stand in for the `Cache-Control` escalation.
+    test_preset_content_type = true;
+    test_fill_table = true;
+    defer {
+        test_preset_content_type = false;
+        test_fill_table = false;
+        test_fill_error = null;
+    }
+    var out: [8192]u8 = undefined;
+    const resp = runVia(tablePressureHandler, &h, wire, &out);
+    try testing.expectEqual(@as(anyerror, error.TooManyHeaders), test_fill_error.?);
+    try testing.expectEqual(@as(u16, 500), statusOf(resp));
+    try testing.expect(mem.find(u8, resp, "<li>") == null);
 }
 
 const FakeEntry = struct { name: []const u8, kind: File.Kind };
