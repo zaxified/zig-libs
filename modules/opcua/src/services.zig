@@ -3416,6 +3416,12 @@ fn findServersResult(r: FindServersResponse) encoding.StatusCode {
 fn translateBrowsePathsResult(r: TranslateBrowsePathsToNodeIdsResponse) encoding.StatusCode {
     return r.response_header.service_result;
 }
+fn modifyMonitoredItemsResultFn(r: ModifyMonitoredItemsResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
+fn setMonitoringModeResultFn(r: SetMonitoringModeResponse) encoding.StatusCode {
+    return r.response_header.service_result;
+}
 
 pub const result_fns = struct {
     pub const open_secure_channel = openSecureChannelResult;
@@ -3438,6 +3444,8 @@ pub const result_fns = struct {
     pub const get_endpoints = getEndpointsResult;
     pub const find_servers = findServersResult;
     pub const translate_browse_paths_to_node_ids = translateBrowsePathsResult;
+    pub const modify_monitored_items = modifyMonitoredItemsResultFn;
+    pub const set_monitoring_mode = setMonitoringModeResultFn;
 };
 
 // ── tests ──

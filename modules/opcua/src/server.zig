@@ -10487,3 +10487,69 @@ test "root client over a pipe: translateBrowsePaths resolves forward, inverse an
     try testing.expectError(error.ServiceFault, pc.session.translateBrowsePaths(&.{}));
     try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
 }
+
+test "root client over a pipe: modifyMonitoredItems re-labels and re-tunes items; a Bad result leaves the bookkeeping alone" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var pc: PipeClient = undefined;
+    try pc.start(gpa);
+    defer pc.deinit();
+
+    var sub = try root.Subscription.create(&pc.session, gpa, .{ .requested_publishing_interval_ms = 100 });
+    defer sub.deinit();
+    const specs = [_]root.Subscription.MonitoredItemSpec{
+        .{ .node_id = pc.rig.answer_id, .client_handle = 10, .sampling_interval_ms = 1000, .queue_size = 1 },
+        .{ .node_id = pc.rig.answer_id, .client_handle = 11, .sampling_interval_ms = 1000, .queue_size = 1 },
+    };
+    const created = try sub.createMonitoredItems(&specs, .both);
+    defer services.freeCreateMonitoredItemsResponse(gpa, created);
+    const id10 = sub.findMonitoredItem(10).?;
+    const id11 = sub.findMonitoredItem(11).?;
+
+    // a good modify: parameters land on the server, the handle table follows the new ClientHandle
+    pc.rig.now_ms = 2_000;
+    const mods = [_]root.Subscription.MonitoredItemModifySpec{
+        .{ .monitored_item_id = id10, .client_handle = 77, .sampling_interval_ms = 250, .queue_size = 5, .discard_oldest = false },
+        .{ .monitored_item_id = 123_456, .client_handle = 55 },
+    };
+    {
+        const r = try sub.modifyMonitoredItems(&mods, .both);
+        defer services.freeModifyMonitoredItemsResponse(gpa, r);
+        const results = r.results.?;
+        try testing.expectEqual(@as(usize, 2), results.len);
+        try testing.expectEqual(status.good, results[0].status_code);
+        try testing.expectEqual(@as(f64, 250), results[0].revised_sampling_interval);
+        try testing.expectEqual(@as(u32, 5), results[0].revised_queue_size);
+        try testing.expectEqual(status.bad_monitored_item_id_invalid, results[1].status_code);
+    }
+    {
+        const it = mutSub(&pc.rig, 0).findItem(id10).?;
+        try testing.expectEqual(@as(u32, 77), it.client_handle);
+        try testing.expectEqual(@as(f64, 250), it.sampling_interval_ms);
+        try testing.expectEqual(@as(u32, 5), it.queue_size);
+        try testing.expect(!it.discard_oldest);
+    }
+    try testing.expectEqual(id10, sub.findMonitoredItem(77).?);
+    try testing.expect(sub.findMonitoredItem(10) == null);
+    try testing.expect(sub.findMonitoredItem(55) == null);
+    try testing.expectEqual(id11, sub.findMonitoredItem(11).?);
+    try testing.expectEqual(@as(usize, 2), sub.monitored_items.items.len);
+
+    // an item the server no longer has answers Bad: the client entry keeps its handle
+    {
+        var gone = mutSub(&pc.rig, 0).monitored_items.orderedRemove(1);
+        gone.deinit(gpa);
+    }
+    const stale = [_]root.Subscription.MonitoredItemModifySpec{.{ .monitored_item_id = id11, .client_handle = 99 }};
+    {
+        const r = try sub.modifyMonitoredItems(&stale, .both);
+        defer services.freeModifyMonitoredItemsResponse(gpa, r);
+        try testing.expectEqual(status.bad_monitored_item_id_invalid, r.results.?[0].status_code);
+    }
+    try testing.expectEqual(id11, sub.findMonitoredItem(11).?);
+    try testing.expect(sub.findMonitoredItem(99) == null);
+
+    // an empty list is a ServiceFault
+    try testing.expectError(error.ServiceFault, sub.modifyMonitoredItems(&.{}, .both));
+    try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
+}

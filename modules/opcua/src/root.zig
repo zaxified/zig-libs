@@ -1192,6 +1192,72 @@ pub const Subscription = struct {
         return response;
     }
 
+    pub const MonitoredItemModifySpec = struct {
+        monitored_item_id: u32,
+        /// The (possibly new) `ClientHandle`: OPC 10000-4 §5.12.3 carries it in
+        /// the modified parameters, so a modify may re-label an item. Pass the
+        /// current handle to keep it. Must stay unique within this `Subscription`.
+        client_handle: u32,
+        sampling_interval_ms: f64 = -1,
+        queue_size: u32 = 1,
+        discard_oldest: bool = true,
+    };
+
+    /// ModifyMonitoredItems (OPC 10000-4 §5.12.3), no filter. For every item
+    /// whose `MonitoredItemModifyResult.status_code` is not Bad the
+    /// `monitored_items` entry takes over the spec's `client_handle` (the server
+    /// stores it, so later notifications carry it); a Bad result leaves the
+    /// entry as it was. Caller frees the response with
+    /// `services.freeModifyMonitoredItemsResponse`.
+    pub fn modifyMonitoredItems(sub: *Subscription, specs: []const MonitoredItemModifySpec, timestamps_to_return: services.TimestampsToReturn) services.ServiceError!services.ModifyMonitoredItemsResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.ModifyMonitoredItemsResponse, modifyMonitoredItemsBody, .{ sub, specs, timestamps_to_return });
+    }
+
+    fn modifyMonitoredItemsBody(sub: *Subscription, specs: []const MonitoredItemModifySpec, timestamps_to_return: services.TimestampsToReturn) services.ServiceError!services.ModifyMonitoredItemsResponse {
+        var items = try std.ArrayList(services.MonitoredItemModifyRequest).initCapacity(sub.allocator, specs.len);
+        defer items.deinit(sub.allocator);
+        for (specs) |spec| {
+            items.appendAssumeCapacity(.{
+                .monitored_item_id = spec.monitored_item_id,
+                .requested_parameters = .{
+                    .client_handle = spec.client_handle,
+                    .sampling_interval = spec.sampling_interval_ms,
+                    .filter = services.no_filter,
+                    .queue_size = spec.queue_size,
+                    .discard_oldest = spec.discard_oldest,
+                },
+            });
+        }
+        const request: services.ModifyMonitoredItemsRequest = .{
+            .request_header = sub.session.channel.io.nextRequestHeader(sub.session.authentication_token, 10_000),
+            .subscription_id = sub.subscription_id,
+            .timestamps_to_return = timestamps_to_return,
+            .items_to_modify = items.items,
+        };
+        const response = try services.Channel.call(
+            &sub.session.channel.io,
+            .message,
+            services.type_id.modify_monitored_items_request,
+            services.ModifyMonitoredItemsRequest,
+            request,
+            services.encodeModifyMonitoredItemsRequest,
+            services.ModifyMonitoredItemsResponse,
+            services.type_id.modify_monitored_items_response,
+            services.decodeModifyMonitoredItemsResponse,
+            services.result_fns.modify_monitored_items,
+        );
+        if (response.results) |results| {
+            for (results, 0..) |r, i| {
+                if (i >= specs.len) break;
+                if (services.isBad(r.status_code)) continue;
+                for (sub.monitored_items.items) |*h| {
+                    if (h.monitored_item_id == specs[i].monitored_item_id) h.client_handle = specs[i].client_handle;
+                }
+            }
+        }
+        return response;
+    }
+
     /// Look up the `MonitoredItemId` a `MonitoredItemNotification.
     /// client_handle` (from a decoded `.data_change` `Notification`)
     /// correlates to — the "which monitored item was this?" ergonomic helper
@@ -2451,6 +2517,18 @@ test "LIVE open62541 interop: subscriptions -> CreateSubscription -> CreateMonit
         for (results) |r| try testing.expect(!services.isBad(r));
     }
 
+    // ── ModifyMonitoredItems (new ClientHandle, slower sampling), answered Good.
+    const modify_specs = [_]Subscription.MonitoredItemModifySpec{.{
+        .monitored_item_id = created_monitored_item_id,
+        .client_handle = 2,
+        .sampling_interval_ms = 500.0,
+        .queue_size = 5,
+    }};
+    const modify_resp = try sub.modifyMonitoredItems(&modify_specs, .both);
+    defer services.freeModifyMonitoredItemsResponse(gpa, modify_resp);
+    try testing.expect(!services.isBad(modify_resp.results.?[0].status_code));
+    try testing.expectEqual(created_monitored_item_id, sub.findMonitoredItem(2).?);
+    try testing.expect(sub.findMonitoredItem(monitor_client_handle) == null);
     // ── DeleteMonitoredItems + DeleteSubscriptions + session/channel teardown.
     const del_mi_resp = try sub.deleteMonitoredItems(&.{created_monitored_item_id});
     defer services.freeDeleteMonitoredItemsResponse(gpa, del_mi_resp);
