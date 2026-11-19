@@ -154,6 +154,13 @@ store); 0 surviving. The dependent `writebehind` passes its modtest.
 - **Exactly-once** — this is at-least-once; the idempotent consumer is the app's job.
 - **Rate-limited dispatch** — compose the `ratelimit` module later.
 - **Cron-expression schedules** — v1 has only `delay_ns`/`run_at`; no `* * * * *` parsing.
+- **Release a lease without counting an attempt** (2026-11-19, from writebehind) — `nack` always
+  increments `attempts` (and can dead-letter); there is no way to hand a lease back unchanged (Celery
+  `reject(requeue=True)`, SQS `ChangeMessageVisibility` to 0, BullMQ `moveToDelayed` without a failure).
+  writebehind needs it to let other keys use its synchronous backstop while one key waits out its
+  in-memory retry backoff (today one waiting key blocks the backstop for all; writebehind SPEC § known
+  limits F5b). Ideal API: `release(lease, .{ .delay_ns = 0 })` — no attempt, no dead-letter, partition
+  order kept.
 - **A background maintenance thread & compaction-trigger policy** — the visibility sweep
   (`reapExpiredLeases`) is caller-driven; `kv.compact` is the caller's to schedule.
 - **Fair-share / weighted dispatch across partitions** — dispatch is strict priority; there is no

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: lease release without counting an attempt (requested by writebehind).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** 2026-11-17: SPEC backlog: marked dead-letter requeue/cancel, lease extension, unique jobs done (already implemented). No code change.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private OS reads behind `WallClock.system` and `MonoClock.monotonic` (duplicate-code pass) now call `clock.realtimeNs()` / `clock.monotonicNs()`; the clock types are unchanged. New dependency: `clock`.
