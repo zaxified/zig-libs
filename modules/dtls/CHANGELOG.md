@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the epoch-0 window and flight-ACK changes (33/33 killed); card `**Audit:**` now `mutation 2026-11-19 (1175/1361, 186 eq)`; ctgrind digests of the dtls rows re-pinned (counts unchanged, native and x86_64).
 - **2026-11-19** — **Behaviour change (1.3 engine):** RFC 9147 §7.2 MUST — once an authenticated (epoch-2) ACK has named every record of the flight this side last sent, that flight is no longer retransmitted by `poll`. The cached flight's record numbers are kept (`flight_rns`); ACKs naming records not sent are ignored; epoch-0 ACKs are still only length-checked (unauthenticated). The ACK marks survive the incomplete-flight rollback.
 - **2026-11-19** — **Behaviour change / Security fix (1.2 engine):** the epoch-0 replay window is no longer advanced by unauthenticated records. A record is checked against the window and recorded only once it advanced the handshake (next message, bytes of the message in progress, or a ChangeCipherSpec), so an off-path sender can no longer make the genuine hellos look stale with a huge record number (RFC 6347 §4.1.2.6, RFC 9147 §4.5.1; pion/dtls does the same). The 1.3 engine keeps no epoch-0 window and is unchanged; a test pins it. Supersedes the 2026-11-18 "kept" decision.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** epoch-0 replay window decided: kept, like OpenSSL and wolfSSL (SPEC Backlog).
