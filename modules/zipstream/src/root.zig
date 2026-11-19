@@ -986,6 +986,10 @@ pub const ExtractOptions = struct {
     restore_special_bits: bool = false,
     restore_mtime: bool = true,
     password: ?[]const u8 = null,
+    /// Name rules for the zip-slip gate (see `isSafeEntryName`): Windows device
+    /// names and `:` are refused by default only on Windows; set `true` to
+    /// refuse them on any host.
+    windows_names: bool = builtin.os.tag == .windows,
 };
 
 pub const ExtractError = error{ ZipUnsafeSymlink, ZipExtractTooLarge };
@@ -1002,7 +1006,7 @@ pub fn extractAll(archive: *Archive, io: std.Io, dir: std.Io.Dir, opts: ExtractO
     const wbuf = try archive.alloc.alloc(u8, 64 * 1024);
     defer archive.alloc.free(wbuf);
     for (archive.entries.items) |*e| {
-        if (!isSafeEntryName(e.name)) return Error.ZipUnsafeEntryName;
+        if (!isSafeEntryNameOpts(e.name, .{ .windows = opts.windows_names })) return Error.ZipUnsafeEntryName;
         if (e.is_directory) {
             try dir.createDirPath(io, std.mem.trimEnd(u8, e.name, "/"));
             continue;
@@ -1021,7 +1025,7 @@ pub fn extractAll(archive: *Archive, io: std.Io, dir: std.Io.Dir, opts: ExtractO
             var tbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const n = try er.reader().readSliceShort(&tbuf);
             const target = tbuf[0..n];
-            if (!isSafeEntryName(target)) return ExtractError.ZipUnsafeSymlink;
+            if (!isSafeEntryNameOpts(target, .{ .windows = opts.windows_names })) return ExtractError.ZipUnsafeSymlink;
             try dir.symLink(io, target, e.name, .{});
             continue;
         }
@@ -1064,18 +1068,57 @@ pub fn extractAll(archive: *Archive, io: std.Io, dir: std.Io.Dir, opts: ExtractO
 /// paths (`a.csv`, `sub/b.csv`), including names that merely contain dots
 /// (`a..b`, `...`).
 ///
-/// Not checked (a Windows extractor must add them): NTFS alternate data
-/// streams (`a:stream`, only `X:` at the start is rejected) and reserved
-/// device names (`CON`, `NUL`, trailing dots/spaces).
+/// Windows name rules (`SafeNameOptions.windows`, on by default only when
+/// built for Windows, as Go's `filepath.IsLocal` is OS-dependent): also
+/// rejects a `:` anywhere (NTFS alternate data stream `a:stream`, as Go does)
+/// and any segment whose base name (before the first `.` or `:`, trailing
+/// spaces trimmed, ASCII case-insensitive) is a DOS device name: `CON`, `PRN`,
+/// `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9` (also with the superscript
+/// digits U+00B9, U+00B2, U+00B3), `CONIN$`, `CONOUT$` -- so `con`, `NUL.txt`,
+/// `dir/COM1.log` are refused. Off elsewhere, where `a:b` and `aux.c` are
+/// ordinary names (log files with timestamps, source trees); a caller that
+/// extracts on one OS for use on Windows passes `.{ .windows = true }` to
+/// `isSafeEntryNameOpts`. Trailing dots/spaces are not checked (Go does not).
 pub fn isSafeEntryName(name: []const u8) bool {
+    return isSafeEntryNameOpts(name, .{});
+}
+
+pub const SafeNameOptions = struct {
+    /// Apply the Windows rules (see `isSafeEntryName`). Default: only when
+    /// compiled for Windows.
+    windows: bool = builtin.os.tag == .windows,
+};
+
+/// `isSafeEntryName` with explicit rules.
+pub fn isSafeEntryNameOpts(name: []const u8, opts: SafeNameOptions) bool {
     if (name.len == 0) return false;
     if (name[0] == '/' or name[0] == '\\') return false; // absolute
     if (name.len >= 2 and name[1] == ':') return false; // "C:" drive / drive-relative
     var it = std.mem.splitAny(u8, name, "/\\");
     while (it.next()) |seg| {
         if (std.mem.eql(u8, seg, "..")) return false; // traversal segment
+        if (opts.windows and isWindowsDeviceName(seg)) return false;
     }
+    if (opts.windows and std.mem.findScalar(u8, name, ':') != null) return false; // NTFS stream
     return true;
+}
+
+/// Go's `isReservedName` base-name rule: cut at the first `.` or `:`, trim
+/// trailing spaces, match the DOS device names ASCII case-insensitively.
+fn isWindowsDeviceName(seg: []const u8) bool {
+    var base = seg;
+    if (std.mem.findAny(u8, base, ".:")) |i| base = base[0..i];
+    base = std.mem.trimEnd(u8, base, " ");
+    const eq = std.ascii.eqlIgnoreCase;
+    if (base.len == 3) return eq(base, "CON") or eq(base, "PRN") or eq(base, "AUX") or eq(base, "NUL");
+    if (base.len == 6) return eq(base, "CONIN$");
+    if (base.len == 7) return eq(base, "CONOUT$");
+    if (base.len >= 4 and (std.ascii.eqlIgnoreCase(base[0..3], "COM") or std.ascii.eqlIgnoreCase(base[0..3], "LPT"))) {
+        const d = base[3..];
+        if (d.len == 1) return d[0] >= '1' and d[0] <= '9';
+        return std.mem.eql(u8, d, "\u{b9}") or std.mem.eql(u8, d, "\u{b2}") or std.mem.eql(u8, d, "\u{b3}");
+    }
+    return false;
 }
 
 /// A streaming reader over one entry's decompressed bytes. Initialise in place
@@ -2728,6 +2771,28 @@ test "isSafeEntryName flags zip-slip names, accepts ordinary member paths" {
     try testing.expect(isSafeEntryName("a..b/c"));
     try testing.expect(isSafeEntryName("..."));
     try testing.expect(isSafeEntryName("deep/nested/dir/file.txt"));
+}
+
+test "isSafeEntryNameOpts: Windows rules refuse ADS and DOS device names; native default on a POSIX host keeps them" {
+    const w: SafeNameOptions = .{ .windows = true };
+    const p: SafeNameOptions = .{ .windows = false };
+    const bad = [_][]const u8{
+        "ab:stream",    "dir/a:b",     "a.txt:Zone.Identifier", "CON",         "con",      "Nul.txt",
+        "dir/COM1.log", "x\\lpt9",     "aux:s",                 "PRN",         "conin$",   "CONOUT$",
+        "COM\u{b9}",    "lpt\u{b2}.x", "CON  ",                 "d/NUL/f.txt", "com5.a.b",
+    };
+    for (bad) |n| {
+        try testing.expect(!isSafeEntryNameOpts(n, w));
+        try testing.expect(isSafeEntryNameOpts(n, p));
+    }
+    // Not device names: near misses stay valid under the Windows rules.
+    const ok = [_][]const u8{ "a.csv", "console.log", "com0", "com10", "lpt", "comx", "conx.txt", "dir/auxiliary", "nul_x", "COM", "sub/b.csv" };
+    for (ok) |n| try testing.expect(isSafeEntryNameOpts(n, w));
+    // The old rules are unchanged without the option.
+    try testing.expect(!isSafeEntryNameOpts("../x", w));
+    try testing.expect(!isSafeEntryNameOpts("C:/x", p));
+    try testing.expectEqual(builtin.os.tag == .windows, !isSafeEntryName("CON"));
+    try testing.expectEqual(builtin.os.tag == .windows, !isSafeEntryName("ab:stream"));
 }
 
 test "EntryReader: a decompression bomb (declared size over the cap) is refused, not read unbounded" {

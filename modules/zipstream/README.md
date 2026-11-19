@@ -103,7 +103,7 @@ else the DOS fields read as UTC; null for an invalid DOS date) and
 `ArchiveWriter` is not self-referential (unlike `Archive`/`EntryReader`) — it
 may be moved freely. Entry names are gated through `isSafeEntryName` on the
 way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at
-`addEntry` rather than written. Classic (non-zip64) format only — see
+`addEntry` rather than written. On Windows builds (or with `isSafeEntryNameOpts(.., .{ .windows = true })` / `ExtractOptions.windows_names`) names with a `:` (NTFS streams) and DOS device names (`CON`, `NUL.txt`, `COM1`) are refused too. Classic (non-zip64) format only — see
 "Ceiling" below.
 
 ## Design notes

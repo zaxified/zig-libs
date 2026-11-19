@@ -195,7 +195,7 @@ and Deflate and never writes):
 
 ## Backlog / deferred
 
-- (GM review R-ZS-8) `isSafeEntryName` does not reject Windows NTFS alternate data streams (`a:stream`) or reserved device names (`CON`, `NUL`); documented, a Windows extractor must add them. Low; extraction on Windows is untested here.
+- ~~(GM review R-ZS-8) `isSafeEntryName` does not reject Windows NTFS alternate data streams or reserved device names~~ **DONE 2026-11-19:** `isSafeEntryNameOpts(name, .{ .windows })` (and `ExtractOptions.windows_names`) refuse a `:` anywhere and any segment whose base name (cut at the first `.`/`:`, trailing spaces trimmed, ASCII case-insensitive) is `CON PRN AUX NUL COM1-9 LPT1-9` (+ superscript digits) `CONIN$ CONOUT$`. **Default: on only when built for Windows** (`isSafeEntryName` is `isSafeEntryNameOpts(name, .{})`). Decision rule: reference/majority. Go `filepath.IsLocal` (used by `archive/zip` ErrInsecurePath) is OS-dependent: on Windows it rejects any `:` and the reserved names above (read from `internal/filepathlite/path_windows.go`), on POSIX it does neither; Python `zipfile` and libarchive likewise sanitise only when extracting on Windows. Always-on would refuse ordinary POSIX names (`2026-11-19T10:00.log`, `aux.c`) that legitimate archives carry, so the stricter rules are opt-in elsewhere for an extractor targeting Windows. Trailing dots/spaces are not checked (Go does not). `ArchiveWriter` uses the native default.
 
 ### Scope parity gap list (S2 re-survey 2026-10-20)
 
