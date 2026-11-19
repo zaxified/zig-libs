@@ -6,7 +6,7 @@
 
 **Scope:** core — xmlsec 1.3.12 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-17 (181/208, 27 eq) · src f2781c413f0a4928
+**Audit:** review 2026-09-03 · mutation 2026-11-17 (181/208, 27 eq) · src 14a11b233a74fb2d
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, XMLENC_FUZZ) · ct 2026-11-13 (ctgrind: RSA secret members tainted for rsa-oaep-mgf1p + GCM / CBC and rsa-1_5 + GCM, KEK tainted for kw-aes256 + GCM; no xmlenc-own context except the CBC plaintext length; the rsa-1_5 extraction loop was compiled to a secret-dependent branch and is fixed; oaep 3 / cbc 14 / rsa15 3 / kw 3 in-file, itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-11-13 (sweep of every pub entry point: `decryptDataToDocument` use-after-free, its element cap, heap-stack CipherValue walk)
 
