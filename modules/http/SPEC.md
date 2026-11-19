@@ -504,7 +504,7 @@ directly-exposed parser.
     does and the proxy's `setHeader` refuses them (→ 502), but a direct `h2_client` user sees the
     raw bytes.
 
-- **A middleware cannot see that a gzip request body crossed `max_decompressed_request_bytes`**
+- **DONE 2026-11-19 — `Request.bodyOverCap() bool`** (h1 and h2; reads the `Capped`/`StreamBody`/`GunzipBody` `exceeded` flags through two pointers on `Request`). Was: **A middleware cannot see that a gzip request body crossed `max_decompressed_request_bytes`**
   *(2026-10-25, from the accesslog review)* — the serving loop answers that 413 from its own
   local `GunzipBody.exceeded` (`Request.decoded` points at its reader, the flag stays private), so `accesslog.Logger` logs 500
   for it (a chunked body over `max_body_bytes` it does read: `body.capped.exceeded`). Ideal API:

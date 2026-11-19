@@ -2782,6 +2782,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         gunzip_body.scratch = sc;
         if (opts.verify_inbound_trailer) gunzip_body.trailer_check = .{ .source = padded };
         req.decoded = &gunzip_body.reader;
+        req.decoded_exceeded = &gunzip_body.exceeded;
     }
     // Compression is considered only when configured AND the working
     // memory is there; the Accept-Encoding negotiation is per request.
@@ -3003,6 +3004,11 @@ pub const Request = struct {
     /// returns this decoded (e.g. gunzipped) stream instead of `body`'s raw
     /// framing reader. The framing `body` remains the drain source.
     decoded: ?*Reader = null,
+    /// Where the over-cap flags of the two bodies live, for `bodyOverCap`:
+    /// the decoder's `GunzipBody.exceeded`, and (h2 streaming, whose body is
+    /// `.external`) `StreamBody.exceeded`. Null when no such cap is in play.
+    decoded_exceeded: ?*const bool = null,
+    body_exceeded: ?*const bool = null,
     /// Trailer-source override: when set, `trailer`/`iterateTrailers`/
     /// `trailers` read this raw CRLF field block instead of the chunked
     /// body's captured one. The h2 path uses it — there is no chunked
@@ -3158,6 +3164,21 @@ pub const Request = struct {
             if (!rw.sent_head) sendContinue(rw.out);
         };
         return req.decoded orelse req.body.reader();
+    }
+
+    /// True once a body read of this request failed because the body crossed
+    /// a size cap the server enforces: a chunked or streamed body over
+    /// `max_body_bytes`, or a gzip body that inflated past
+    /// `max_decompressed_request_bytes`. These are the cases where a handler's
+    /// read fails and the serving loop answers 413 instead of the handler's
+    /// own error, so a middleware (an access log) that sees the handler fail
+    /// asks this to log what the server answers. Meaningful after the handler
+    /// returned (or after the failing read); false before any read hit a cap.
+    pub fn bodyOverCap(req: *const Request) bool {
+        if (req.body.* == .capped and req.body.capped.exceeded) return true;
+        if (req.body_exceeded) |f| if (f.*) return true;
+        if (req.decoded_exceeded) |f| if (f.*) return true;
+        return false;
     }
 
     /// Out of line: the serving frame is budgeted (`frame_probe`).
@@ -5528,6 +5549,9 @@ test "BodyLimit: a body ending exactly at the cap passes though the reader first
     try testing.expect(std.mem.endsWith(u8, got, "fits"));
 }
 
+/// What `/overcap` saw (`Request.bodyOverCap`); tests run one at a time.
+var over_cap_seen: ?bool = null;
+
 fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
     bumpHits(req);
     if (std.mem.eql(u8, req.path, "/method") or (req.method == .connect and req.path.len == 0)) {
@@ -5536,6 +5560,16 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         try rw.setHeader("Content-Type", "text/plain");
         if (req.query.len != 0) try rw.setHeader("X-Query", req.query);
         try rw.writeAll("hello");
+    } else if (std.mem.eql(u8, req.path, "/overcap")) {
+        // Drains the body, records `bodyOverCap` after the failing read (or
+        // the clean end), then fails on its own when the query says so.
+        _ = req.reader().discardRemaining() catch |e| {
+            over_cap_seen = req.bodyOverCap();
+            return e;
+        };
+        over_cap_seen = req.bodyOverCap();
+        if (req.query.len != 0) return error.HandlerOwnFailure;
+        try rw.writeAll("ok");
     } else if (std.mem.eql(u8, req.path, "/limit8")) {
         // Go `MaxBytesReader`: 8 octets, a 413 of the handler's own over it.
         var limit: BodyLimit = undefined;
@@ -8117,6 +8151,43 @@ test "serveStream: gzip request body over the decompressed cap → 413 (zip-bomb
     const got = runStreamWith(.{ .max_decompressed_request_bytes = 16 }, null, wire, &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 Content Too Large\r\n"));
     try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
+}
+
+test "Request.bodyOverCap: true exactly when the serving loop answers 413 for a body cap, false for any other failure" {
+    var out_buf: [4096]u8 = undefined;
+    const chunked = "POST /overcap HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    // A chunked body over `max_body_bytes`: 413, and the middleware's view agrees.
+    over_cap_seen = null;
+    var got = runStreamWith(.{ .max_body_bytes = 8 }, null, chunked ++ "14\r\n01234567890123456789\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 "));
+    try testing.expectEqual(@as(?bool, true), over_cap_seen);
+    // Exactly at the cap: fine, and not "over".
+    over_cap_seen = null;
+    got = runStreamWith(.{ .max_body_bytes = 8 }, null, chunked ++ "8\r\n01234567\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expectEqual(@as(?bool, false), over_cap_seen);
+    // A handler failure of its own on a within-cap body is 500, not over the cap.
+    over_cap_seen = null;
+    got = runStreamWith(.{ .max_body_bytes = 8 }, null, "POST /overcap?x HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
+    try testing.expectEqual(@as(?bool, false), over_cap_seen);
+    // A gzip body that inflates past the decompressed cap: 413, over the cap.
+    const plain = strRepeat("gzipped-body!", 4);
+    const compressed = try gzipAlloc(plain);
+    defer testing.allocator.free(compressed);
+    const wire = try gzipRequest("gzip", compressed);
+    defer testing.allocator.free(wire);
+    var wire_buf: [1024]u8 = undefined;
+    const over_path = try std.mem.print(&wire_buf, "POST /overcap{s}", .{wire["POST /echo".len..]});
+    over_cap_seen = null;
+    got = runStreamWith(.{ .max_decompressed_request_bytes = 16 }, null, over_path, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 "));
+    try testing.expectEqual(@as(?bool, true), over_cap_seen);
+    // The same body under a roomy cap: 200, not over.
+    over_cap_seen = null;
+    got = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, null, over_path, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
+    try testing.expectEqual(@as(?bool, false), over_cap_seen);
 }
 
 test "serveStream: a gzip request body cut short is refused, not a std flate panic" {
