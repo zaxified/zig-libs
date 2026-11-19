@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Test-only: a minimal DER certificate shell carrying an RSA public key of
 //! a chosen modulus size, for key-length checks that never look past the SPKI.
 
