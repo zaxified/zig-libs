@@ -7998,14 +7998,11 @@ pub fn fuzzRange(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
                 const stored = whole.results.?[0].value.?.array.items.string.?;
                 const r = try rangeRead(&rig, ids.names, "0:1,0:1");
                 defer services.freeReadResponse(gpa, r);
-                if (stored[0].?.len < 2 or stored[1].?.len < 2) {
-                    try testing.expectEqual(status.bad_index_range_no_data, r.results.?[0].status.?);
-                } else {
-                    const items = r.results.?[0].value.?.array.items.string.?;
-                    try testing.expectEqualStrings(stored[0].?[0..2], items[0].?);
-                    try testing.expectEqualStrings(stored[1].?[0..2], items[1].?);
-                    RangeMark.mark(.names_nested);
-                }
+                // each element is clipped to its own length
+                const items = r.results.?[0].value.?.array.items.string.?;
+                try testing.expectEqualStrings(stored[0].?[0..@min(2, stored[0].?.len)], items[0].?);
+                try testing.expectEqualStrings(stored[1].?[0..@min(2, stored[1].?.len)], items[1].?);
+                RangeMark.mark(.names_nested);
             },
             // the other variables: wrong dimension counts included
             else => {
@@ -11333,4 +11330,67 @@ test "NumericRange: a Range built by the client formats to what the server parse
     const r = try readNodes(&rig, &reads);
     defer services.freeReadResponse(gpa, r);
     try testing.expectEqualSlices(i32, &.{ 13, 23 }, r.results.?[0].value.?.array.items.int32.?);
+}
+
+test "NumericRange: write precedence (object value, user access, empty value) and what a ranged write stores" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const ids = try addRangeVars(&rig);
+    const ns = rig.answer_id.string.namespace;
+    const val = services.attribute_id.value;
+    const user_ro: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "r.user_ro" } };
+    const bare: encoding.NodeId = .{ .string = .{ .namespace = ns, .id = "r.bare" } };
+    try rig.store.addVariable(.{
+        .node_id = user_ro,
+        .parent_id = rig.device_id,
+        .browse_name = .{ .namespace_index = ns, .name = "r.user_ro" },
+        .value = .{ .array = .{ .items = .{ .int32 = &.{ 1, 2, 3 } } } },
+        .data_type = nodestore.n0(nodestore.id.int32),
+        .value_rank = nodestore.value_rank.one_dimension,
+        .access_level = nodestore.access_level.read_write,
+        .user_access_level = nodestore.access_level.current_read,
+    });
+    try rig.store.addVariable(.{
+        .node_id = bare,
+        .parent_id = rig.device_id,
+        .browse_name = .{ .namespace_index = ns, .name = "r.bare" },
+        .data_type = nodestore.n0(nodestore.id.int32),
+        .value_rank = nodestore.value_rank.one_dimension,
+        .access_level = nodestore.access_level.read_write,
+    });
+    const one: encoding.DataValue = .{ .value = .{ .scalar = .{ .int32 = 9 } } };
+    const stamped: encoding.DataValue = .{ .value = .{ .scalar = .{ .int32 = 77 } }, .status = 0x4000_0000 };
+    rig.now_ms = 7000;
+    const writes = [_]services.WriteValue{
+        .{ .node_id = rig.device_id, .attribute_id = val, .index_range = "0", .value = one }, // an Object has no Value
+        .{ .node_id = user_ro, .attribute_id = val, .index_range = "0", .value = one },
+        .{ .node_id = bare, .attribute_id = val, .index_range = "0", .value = one }, // nothing stored yet
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "0", .value = stamped },
+    };
+    const w = try writeNodes(&rig, &writes);
+    defer services.freeWriteResponse(gpa, w);
+    try testing.expectEqual(status.bad_attribute_id_invalid, w.results.?[0]);
+    try testing.expectEqual(status.bad_user_access_denied, w.results.?[1]);
+    try testing.expectEqual(status.bad_index_range_invalid, w.results.?[2]);
+    try testing.expectEqual(status.good, w.results.?[3]);
+
+    // the status the client sent and a server-stamped time ride along
+    const reads = [_]services.ReadValueId{
+        readValueId(ids.arr, val, null, null),
+        readValueId(nodestore.n0(nodestore.id.base_data_variable_type), val, "0", null),
+        readValueId(rig.device_id, services.attribute_id.display_name, "0", null),
+    };
+    const r = try readNodes(&rig, &reads);
+    defer services.freeReadResponse(gpa, r);
+    const dv = r.results.?[0];
+    try testing.expectEqual(@as(i32, 77), dv.value.?.array.items.int32.?[0]);
+    try testing.expectEqual(@as(encoding.StatusCode, 0x4000_0000), dv.status.?);
+    try testing.expect(dv.source_timestamp.? != TestRig.start_time);
+    try testing.expectEqual(dv.server_timestamp.?, dv.source_timestamp.?);
+    // a VariableType's (absent) value and a non-Value attribute carry no data
+    try testing.expectEqual(status.bad_index_range_no_data, r.results.?[1].status.?);
+    try testing.expectEqual(status.bad_index_range_no_data, r.results.?[2].status.?);
 }

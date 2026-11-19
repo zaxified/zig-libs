@@ -606,3 +606,33 @@ test "Selection visits row-major, once each" {
     }
     try testing.expectEqual(@as(usize, 16), n);
 }
+
+test "readRange: unusable dimensions fall back to a flat array without overflowing" {
+    var a = std.heap.ArenaAllocator.init(testing.allocator);
+    defer a.deinit();
+    const data = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    // product smaller than the length
+    const short = [_]i32{ 2, 3 };
+    const v1: encoding.Variant = .{ .array = .{ .items = .{ .int32 = &data }, .dimensions = &short } };
+    try testing.expectError(error.IndexRangeNoData, readRange(a.allocator(), v1, &try parse("0:1,0:2")));
+    try testing.expectEqualSlices(i32, &.{ 10, 11 }, (try readRange(a.allocator(), v1, &try parse("10:11"))).array.items.int32.?);
+    // a product that would overflow u64 if it were not cut short
+    const huge = [_]i32{ 1 << 30, 1 << 30, 1 << 30, 1 << 30 };
+    const v2: encoding.Variant = .{ .array = .{ .items = .{ .int32 = data[0..4] }, .dimensions = &huge } };
+    try testing.expectEqualSlices(i32, &.{ 1, 2 }, (try readRange(a.allocator(), v2, &try parse("1:2"))).array.items.int32.?);
+    // more dimensions than a range can have
+    const many: [max_dims + 1]i32 = @splat(1);
+    const v3: encoding.Variant = .{ .array = .{ .items = .{ .int32 = data[0..1] }, .dimensions = &many } };
+    try testing.expectEqualSlices(i32, &.{0}, (try readRange(a.allocator(), v3, &try parse("0"))).array.items.int32.?);
+    // negative and zero entries
+    const neg = [_]i32{ -3, -4 };
+    const v4: encoding.Variant = .{ .array = .{ .items = .{ .int32 = data[0..12] }, .dimensions = &neg } };
+    try testing.expectEqualSlices(i32, &.{ 3, 4 }, (try readRange(a.allocator(), v4, &try parse("3:4"))).array.items.int32.?);
+}
+
+test "parse: the length cap counts bytes, not digits' value" {
+    var buf: [max_text_len + 1]u8 = undefined;
+    @memset(&buf, '0');
+    try expectParse(buf[0..max_text_len], &.{.{ .min = 0, .max = 0 }});
+    try testing.expectError(error.IndexRangeInvalid, parse(buf[0 .. max_text_len + 1]));
+}
