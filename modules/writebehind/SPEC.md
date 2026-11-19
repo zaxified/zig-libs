@@ -165,8 +165,14 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   the operator never `recover()`ed), `flushOneSync` drains them synchronously. `deinit` calls
   `flushAll`, so even a forgotten `recover()` loses nothing. A record the sink rejects on this path
   is held (leased) for the rest of the pass so the next synchronous flush moves on to the next
-  record, then returned to the WAL for a retry. The synchronous path does not run while a key
-  waits out its retry backoff: the global dequeue would hand that key's record over early.
+  record, then returned to the WAL for a retry. A key that waits out its retry backoff is passed
+  over, not written early: the synchronous path keeps the leases of its records (`skipped`) while
+  the global dequeue moves on to the next record of another key, and hands every one back with
+  `jobqueue`'s `release` (no attempt counted, the record keeps its place in the key's FIFO, nothing
+  written to storage) before it returns. A `release` that fails (an allocation failure inside
+  `jobqueue`) is held as `release_failed`, blocks its key like any held lease and is retried by
+  every `drain`. Until 2026-11-19 the synchronous path did not run at all while any key waited
+  (`anyRetryWaiting`), so one waiting key stalled `flushAll` and back-pressure for every key (F5b).
 
   **Held leases and the per-key ack order (2026-11-19, second review).** The coordinator keeps a
   list of leases it holds (`held`): synchronous rejections of the current pass, records whose
@@ -205,10 +211,11 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   **Known limits (not fixed).** (F2) Visibility in `jobqueue` follows the wall clock: a record
   nacked with backoff 0 gets `run_at = now`, so a wall clock stepping back can hide it behind a
   newer record of its key for that long. (F5) With the default `retry_backoff_ns = 0` a refusing
-  sink is retried on every completion, a tight loop until `flush_timeout_ns`; one key waiting
-  out a backoff blocks the synchronous backstop for all keys (`anyRetryWaiting`), because the
-  global dequeue cannot skip a key without leasing its record, and `jobqueue` has no way to give
-  a lease back without counting an attempt; the deadline after `FlushIncomplete` does not bound a
+  sink is retried on every completion, a tight loop until `flush_timeout_ns`; (F5b, fixed
+  2026-11-19 with `jobqueue.release`, see above: one waiting key used to block the synchronous
+  backstop for all keys) each synchronous call dequeues and releases every record of the waiting
+  keys that sorts before the record it writes, so a waiting key with many records costs that many
+  in-memory dequeue/release pairs per call (no storage writes); the deadline after `FlushIncomplete` does not bound a
   sink call that never returns (`pool.drain` waits for it); `retry_at` follows the injected
   `wal_mono_clock` while the flush deadline follows the real clock; a WAL written before
   2026-11-19 can hold a record with a persisted future `run_at`, which `flushAll` waits for until
