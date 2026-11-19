@@ -967,7 +967,7 @@ shape of `scalarMulZeroing`); behaviour unchanged.
 
 ## Backlog
 
-- ✅ **DONE 2026-11-16 (`Fr.randomInto`, the drawn bytes wiped):** **`Fr.randomInto(out: *Fr, io)`** *(sweep 2026-10-09)*: `Fr.random` returns the
+- ✅ **DONE 2026-11-16, body burned 2026-11-19 (`Fr.randomInto`, the drawn bytes wiped):** the dead-stack probe added for it in `groth16` (`Randomizers.randomInto`, a fake `Io` replaying known bytes) found the by-value `fromBytes` argument and the scalar in the dead frame, so the body now runs under `burn.run` (`src/burn.zig`, `random_burn`; dirtied 0.4 KiB in ReleaseFast). Without the burn the probe finds both images (killed). **`Fr.randomInto`** **`Fr.randomInto(out: *Fr, io)`** *(sweep 2026-10-09)*: `Fr.random` returns the
   fresh scalar by value, so a prover's `r`/`s` or a key made from it is copied into the
   caller's frame. `bls12_381` has the same item (its backlog item 0). Effort: small.
 - Part 3 (`G1`/`G2` group arithmetic — Jacobian/affine points,

@@ -462,9 +462,12 @@ kept simple on purpose).
    that take a witness slice and run in the caller's frames — `r1cs.System.isSatisfied`/
    `evalConstraint`, `qap.checkDivisible`, `msm.msmG1/G2`, `circom.writeWitness` — are
    not burned (a consumer that calls them on a real witness should do its own
-   `burn.run`-style wrapper); `Fr.random` (bn254) returns the scalar by value, so
-   `Randomizers` built from it leave a copy in the caller's frame (bn254 backlog:
-   `Fr.randomInto(out, io)`); `phase2.newZkey` handles public data only.
+   `burn.run`-style wrapper); ✅ DONE 2026-11-19 for the `Fr.random` part:
+   `Randomizers.randomInto(out, io)` draws both scalars through `bn254.Fr.randomInto`
+   (burned body) so no copy stays in the caller's frame; the stack probe has a
+   `Randomizers.randomInto` case (fake `Io`, known draw). **Still open: the helper
+   wrapper part** (the witness-slice helpers above are not burned); `phase2.newZkey`
+   handles public data only.
 
 Re-ranked by the 2026-10-05 re-survey. Missing and it matters, most-hit first:
 
