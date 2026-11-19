@@ -9,7 +9,7 @@ drives a real server, and a server (device) a real client can drive.
 
 **Status: implemented, both roles, both secured.** Client: codec, transport,
 secure channel (`Basic256Sha256` Sign/SignAndEncrypt), session lifecycle,
-attribute/method services and subscriptions. Server: the opc.tcp connection
+attribute/method/TranslateBrowsePaths services and subscriptions. Server: the opc.tcp connection
 state machine with explicit chunk limits, **the full server side of
 `Basic256Sha256`** (asymmetric OpenSecureChannel, P-SHA256 key derivation,
 per-chunk sign/encrypt, SecurityToken renewal with an overlap window, the

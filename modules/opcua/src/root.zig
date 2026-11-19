@@ -642,6 +642,38 @@ pub const Session = struct {
         );
     }
 
+    /// The TranslateBrowsePathsToNodeIds service (OPC 10000-4 §5.8.4): resolve
+    /// each `BrowsePath` (a starting node plus a chain of `RelativePathElement`s)
+    /// to the node(s) it names. One `BrowsePathResult` per path, in order; a
+    /// path that matched nothing comes back as a Bad per-path `status_code`
+    /// (the call itself succeeds), and `BrowsePathTarget.remaining_path_index`
+    /// is `0xFFFF_FFFF` for a fully resolved target (§7.7). Same shape as
+    /// open62541's generated `UA_Client_Service_translateBrowsePathsToNodeIds`.
+    /// Caller frees the response with
+    /// `services.freeTranslateBrowsePathsToNodeIdsResponse`.
+    pub fn translateBrowsePaths(session: *Session, browse_paths: []const services.BrowsePath) services.ServiceError!services.TranslateBrowsePathsToNodeIdsResponse {
+        return burn.run(burn.req_burn, services.ServiceError!services.TranslateBrowsePathsToNodeIdsResponse, translateBrowsePathsBody, .{ session, browse_paths });
+    }
+
+    fn translateBrowsePathsBody(session: *Session, browse_paths: []const services.BrowsePath) services.ServiceError!services.TranslateBrowsePathsToNodeIdsResponse {
+        const request: services.TranslateBrowsePathsToNodeIdsRequest = .{
+            .request_header = session.channel.io.nextRequestHeader(session.authentication_token, 10_000),
+            .browse_paths = browse_paths,
+        };
+        return services.Channel.call(
+            &session.channel.io,
+            .message,
+            services.type_id.translate_browse_paths_to_node_ids_request,
+            services.TranslateBrowsePathsToNodeIdsRequest,
+            request,
+            services.encodeTranslateBrowsePathsToNodeIdsRequest,
+            services.TranslateBrowsePathsToNodeIdsResponse,
+            services.type_id.translate_browse_paths_to_node_ids_response,
+            services.decodeTranslateBrowsePathsToNodeIdsResponse,
+            services.result_fns.translate_browse_paths_to_node_ids,
+        );
+    }
+
     /// The Call service (OPC 10000-4 §5.11.2): invoke a method node.
     pub fn call(session: *Session, methods_to_call: []const services.CallMethodRequest) services.ServiceError!services.CallResponse {
         return burn.run(burn.req_burn, services.ServiceError!services.CallResponse, callBody, .{ session, methods_to_call });
@@ -2245,6 +2277,23 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
         // the response are both "decoded cleanly, didn't crash" outcomes.
         try testing.expect(err == error.ServiceFault or err == error.BadServiceResult);
     }
+
+    // ── TranslateBrowsePathsToNodeIds: Root -> Objects -> Server ->
+    // ServerStatus -> CurrentTime resolves to i=2258, the node read above
+    // (a null ReferenceTypeId matches any reference type, §5.8.4).
+    const path_names = [_][]const u8{ "Objects", "Server", "ServerStatus", "CurrentTime" };
+    var path_elements: [path_names.len]services.RelativePathElement = undefined;
+    for (path_names, 0..) |name, i| {
+        path_elements[i] = .{ .reference_type_id = services.null_node_id, .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = name } };
+    }
+    const translate_paths = [_]services.BrowsePath{.{
+        .starting_node = .{ .numeric = .{ .namespace = 0, .id = 84 } }, // Root folder
+        .relative_path = .{ .elements = &path_elements },
+    }};
+    const translate_resp = try session.translateBrowsePaths(&translate_paths);
+    defer services.freeTranslateBrowsePathsToNodeIdsResponse(gpa, translate_resp);
+    try testing.expect(!services.isBad(translate_resp.results.?[0].status_code));
+    try testing.expect(services.nodeIdEql(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, translate_resp.results.?[0].targets.?[0].target_id.node_id));
 }
 
 const live_subs_container_name = "opcua-zig-libs-live-test-subs";

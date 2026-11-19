@@ -10407,3 +10407,83 @@ test "root client over a pipe (Sign): a CreateSession answer signed with another
     rig.srv.config.security.?.credentials.private_key = other.private_key;
     try testing.expectError(error.InvalidSecureMessage, root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url }));
 }
+
+// ── opcua3: client-side TranslateBrowsePaths / ModifyMonitoredItems / SetMonitoringMode ──
+
+/// The root client wired to a rig over `PipeReader` at SecurityPolicy#None,
+/// session activated: what the three client-service tests below share.
+const PipeClient = struct {
+    rig: TestRig,
+    rbuf: [4096]u8,
+    pipe: PipeReader,
+    conn: transport.Connection,
+    channel: @import("root.zig").SecureChannel,
+    session: @import("root.zig").Session,
+
+    fn start(pc: *PipeClient, gpa: std.mem.Allocator) !void {
+        const root = @import("root.zig");
+        try pc.rig.init(gpa, TestRig.defaultConfig());
+        errdefer pc.rig.deinit();
+        pc.pipe.setup(&pc.rig, &pc.rbuf);
+        pc.conn = transport.Connection.init(&pc.pipe.reader, &pc.rig.client_out.writer);
+        _ = try pc.conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+        try root.SecureChannel.open(&pc.conn, gpa, .{}, &pc.channel);
+        pc.session = try root.Session.create(&pc.channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url });
+        try pc.session.activate(null);
+    }
+
+    fn deinit(pc: *PipeClient) void {
+        pc.session.deinit();
+        pc.pipe.last.deinit(pc.rig.gpa);
+        pc.rig.deinit();
+    }
+};
+
+test "root client over a pipe: translateBrowsePaths resolves forward, inverse and failing paths per entry" {
+    const gpa = testing.allocator;
+    var pc: PipeClient = undefined;
+    try pc.start(gpa);
+    defer pc.deinit();
+
+    const forward = [_]services.RelativePathElement{
+        .{ .reference_type_id = nodestore.n0(nodestore.id.organizes), .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = "Objects" } },
+        .{ .reference_type_id = nodestore.n0(nodestore.id.organizes), .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 1, .name = "Device" } },
+        .{ .reference_type_id = nodestore.n0(nodestore.id.has_component), .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 1, .name = "the.answer" } },
+    };
+    const inverse = [_]services.RelativePathElement{
+        .{ .reference_type_id = nodestore.n0(nodestore.id.has_component), .is_inverse = true, .include_subtypes = false, .target_name = .{ .namespace_index = 1, .name = "Device" } },
+    };
+    const missing = [_]services.RelativePathElement{
+        .{ .reference_type_id = nodestore.n0(nodestore.id.organizes), .is_inverse = false, .include_subtypes = true, .target_name = .{ .namespace_index = 0, .name = "NoSuchChild" } },
+    };
+    const root_folder = nodestore.n0(nodestore.id.root_folder);
+    const paths = [_]services.BrowsePath{
+        .{ .starting_node = root_folder, .relative_path = .{ .elements = &forward } },
+        .{ .starting_node = pc.rig.answer_id, .relative_path = .{ .elements = &inverse } },
+        .{ .starting_node = root_folder, .relative_path = .{ .elements = &missing } },
+        .{ .starting_node = nodestore.n0(999_999), .relative_path = .{ .elements = &forward } },
+        .{ .starting_node = root_folder, .relative_path = .{ .elements = &.{} } },
+    };
+    const response = try pc.session.translateBrowsePaths(&paths);
+    defer services.freeTranslateBrowsePathsToNodeIdsResponse(gpa, response);
+    const results = response.results.?;
+    try testing.expectEqual(@as(usize, 5), results.len);
+    try testing.expectEqual(status.good, results[0].status_code);
+    try testing.expect(services.nodeIdEql(pc.rig.answer_id, results[0].targets.?[0].target_id.node_id));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), results[0].targets.?[0].remaining_path_index);
+    try testing.expectEqual(status.good, results[1].status_code);
+    try testing.expect(services.nodeIdEql(pc.rig.device_id, results[1].targets.?[0].target_id.node_id));
+    try testing.expectEqual(status.bad_no_match, results[2].status_code);
+    try testing.expect(results[2].targets == null);
+    try testing.expectEqual(status.bad_node_id_unknown, results[3].status_code);
+    try testing.expectEqual(status.bad_nothing_to_do, results[4].status_code);
+
+    // the resolved id is usable: read it back through the same session
+    const value = try pc.session.readAttribute(results[0].targets.?[0].target_id.node_id, services.attribute_id.value);
+    defer encoding.freeDataValue(gpa, value);
+    try testing.expectEqual(@as(i32, 42), value.value.?.scalar.int32);
+
+    // an empty request is a ServiceFault, with the server's status kept on the channel
+    try testing.expectError(error.ServiceFault, pc.session.translateBrowsePaths(&.{}));
+    try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
+}
