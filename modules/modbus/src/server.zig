@@ -676,7 +676,8 @@ pub const Server = struct {
         if (code == .individual) {
             if (!self.config.device_id_individual) return .illegal_data_value;
             const o = self.findObject(req_id) orelse return .illegal_data_address;
-            if (pos + 2 + o.value.len > limit or o.value.len > 0xFF) return .server_device_failure;
+            // `limit` is below 255, so this also keeps the length byte honest.
+            if (pos + 2 + o.value.len > limit) return .server_device_failure;
             out[pos] = o.id;
             out[pos + 1] = @intCast(o.value.len);
             @memcpy(out[pos + 2 ..][0..o.value.len], o.value);

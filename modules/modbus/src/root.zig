@@ -2463,3 +2463,46 @@ test "RtuStream: a request with an unknown MEI type is garbage, not a frame; res
     _ = s.feed(try rtu.encodeAdu(&c, 0x01, &.{ 0x83, 0x02 }));
     try testing.expect(s.next() == null);
 }
+
+test "RtuStream: one stream carries many frames across separate feeds; feed takes exactly the free room" {
+    var s = RtuStream.init(.request);
+    var a: [rtu.max_adu_len]u8 = undefined;
+    for (0..5) |i| {
+        const f = try rtu.encodeAdu(&a, @intCast(i + 1), &.{ 0x06, 0x00, 0x01, 0x00, 0x03 });
+        try testing.expectEqual(f.len, s.feed(f));
+        try testing.expectEqual(@as(u8, @intCast(i + 1)), s.next().?.unit);
+        try testing.expect(s.next() == null);
+        try testing.expectEqual(@as(usize, 0), s.len);
+    }
+    // A frame prefix that announces a long body (FC 0x10, 240 data bytes)
+    // stays incomplete; further feeds take exactly what still fits.
+    var big: [300]u8 = @splat(0);
+    big[0] = 0x01;
+    big[1] = 0x10;
+    big[6] = 0xF0;
+    s.reset();
+    try testing.expectEqual(@as(usize, 200), s.feed(big[0..200]));
+    try testing.expect(s.next() == null);
+    try testing.expectEqual(@as(usize, 56), s.feed(big[200..300]));
+    try testing.expectEqual(@as(usize, rtu.max_adu_len), s.len);
+}
+
+test "RtuStream: file-record requests with several sub-requests are sized by their byte count" {
+    var a: [rtu.max_adu_len]u8 = undefined;
+    // FC 0x14 request, two 7-byte sub-requests (byte count 14).
+    const req = [_]u8{ 0x14, 14, 0x06, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x06, 0x00, 0x03, 0x00, 0x09, 0x00, 0x02 };
+    var s = RtuStream.init(.request);
+    _ = s.feed(try rtu.encodeAdu(&a, 0x01, &req));
+    try testing.expectEqualSlices(u8, &req, s.next().?.pdu);
+    // FC 0x15 response echoes such a request; same sizing.
+    var s2 = RtuStream.init(.response);
+    var echo = req;
+    echo[0] = 0x15;
+    _ = s2.feed(try rtu.encodeAdu(&a, 0x01, &echo));
+    try testing.expectEqual(@as(u8, 0x15), s2.next().?.pdu[0]);
+    // FC 0x14 response: data length 7 = two records (len 4, 3) -- response
+    // sub-record lengths must not be mistaken for the byte count.
+    const resp = [_]u8{ 0x14, 0x07, 0x04, 0x06, 0xAA, 0xBB, 0x03, 0x06, 0xCC };
+    _ = s2.feed(try rtu.encodeAdu(&a, 0x01, &resp));
+    try testing.expectEqualSlices(u8, &resp, s2.next().?.pdu);
+}
