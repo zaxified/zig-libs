@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the survivor of the review-fix mutation run (the `>` variant of the `createMonitoredItems` result-count check) is killed by the new short/absent-results test in a confirming run; SPEC wording only, card counts unchanged.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the review fixes (15 mutants: 14 killed, 1 unobservable heap-wipe), one more scripted-peer test (short and absent `CreateMonitoredItems` results); the card counts are now 900/977 (cumulative), `src` re-pinned.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the result-count check of `createMonitoredItems`/`modifyMonitoredItems` reads the count with an explicit `if` instead of `orelse &.{}` (same value; the `orelse` form does not survive a mutation switch around it).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the decoded server nonce of an OpenSecureChannel answer is now zeroed by a `defer` on every way out of the exchange (before, only on the success path; the wrong-channel-id and other early refusals freed it unwiped). The code change landed in the preceding LOW-1 documentation commit; this entry records it (review LOW-2).
