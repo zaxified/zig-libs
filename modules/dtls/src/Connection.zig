@@ -957,6 +957,21 @@ const max_send_epoch: u64 = (1 << 48) - 1;
 
 /// `Connection.ack_queue` capacity (post-handshake records owed an ACK).
 const max_ack_queue = 8;
+
+/// Whether a rolled-back parse left the cached flight's record table as
+/// it found it (see `keepFlightAcks`): the marks it collected are only
+/// meaningful against that table.
+fn sameFlightTable(now: *const Connection, before: *const Connection) bool {
+    const n = now.flight_rns_len;
+    if (n != before.flight_rns_len) return false;
+    return std.mem.eql(u8, std.mem.sliceAsBytes(now.flight_rns[0..n]), std.mem.sliceAsBytes(before.flight_rns[0..n]));
+}
+
+/// Records one cached flight may hold for ACK matching (`flight_rns`); the
+/// largest flight this engine sends, a certificate-mode server flight 2,
+/// has six (ServerHello, EncryptedExtensions, CertificateRequest,
+/// Certificate, CertificateVerify, Finished).
+const max_flight_records = 8;
 /// `Connection.ku_records` capacity (records that carried our KeyUpdate).
 const max_ku_records = 8;
 
@@ -1715,6 +1730,15 @@ pub const Connection = struct {
     last_flight: [max_flight_bytes]u8 = undefined,
     last_flight_len: usize = 0,
     retransmit_timer: flight.RetransmitTimer = flight.RetransmitTimer.init(1000, 60_000),
+    /// RFC 9147 §7.2: the (epoch, sequence_number) of each record of
+    /// `last_flight` (`recordFlightNumbers`) and which of them a peer ACK
+    /// has named (bit `i` for `flight_rns[i]`). Once every one has been
+    /// ACKed the flight's retransmission is cancelled (`noteFlightAck`).
+    /// Empty when the flight could not be described, which only means an
+    /// ACK can never cancel it.
+    flight_rns: [max_flight_records]flight.RecordNumber = undefined,
+    flight_rns_len: u8 = 0,
+    flight_rns_acked: u8 = 0,
 
     // ── incoming-flight accumulation (RFC 9147 §5.2 reassembly) ─────────
     /// Datagrams received for the flight currently being consumed,
@@ -1923,7 +1947,10 @@ pub const Connection = struct {
             .client => self.handleFlightClient(input, entropy, now_ms, out),
         } catch |err| switch (err) {
             error.FlightIncomplete => {
+                const acked = self.flight_rns_acked;
+                std.debug.assert(sameFlightTable(self, &saved));
                 self.* = saved;
+                self.keepFlightAcks(acked);
                 return .{ .out = out[0..0], .done = false, .need_more_data = true };
             },
             // A real protocol/crypto failure ends this flight: drop the
@@ -1949,7 +1976,10 @@ pub const Connection = struct {
             // preserving the association" — which means the association must
             // still be the one that existed before the record arrived.
             else => {
+                const acked = self.flight_rns_acked;
+                std.debug.assert(sameFlightTable(self, &saved));
                 self.* = saved;
+                self.keepFlightAcks(acked);
                 self.rx_flight_len = 0;
                 return err;
             },
@@ -3108,6 +3138,11 @@ pub const Connection = struct {
                     if (datagram.len < start + rec.length) return error.Malformed;
                     pos.* = start + rec.length;
                     if (rec.content_type == content_type_ack) {
+                        // Length-checked and skipped, never matched against
+                        // our flight: an epoch-0 ACK is unauthenticated, and
+                        // honouring it would let an off-path sender cancel
+                        // our retransmissions (RFC 9147 §7.2 cancels only on
+                        // ACKs; an ignored one leaves the conforming resend).
                         try checkAckBody(datagram[start..][0..rec.length]);
                         continue;
                     }
@@ -3120,6 +3155,7 @@ pub const Connection = struct {
                     pos.* += try recordWireLen(datagram[pos.*..]);
                     if (ctype == content_type_ack) {
                         try checkAckBody(f);
+                        self.noteFlightAck(f);
                         continue;
                     }
                     if (acks) |a| a.add(record_seq);
@@ -3169,8 +3205,87 @@ pub const Connection = struct {
         if (bytes.len > self.last_flight.len) return error.BufferTooShort;
         @memcpy(self.last_flight[0..bytes.len], bytes);
         self.last_flight_len = bytes.len;
+        self.recordFlightNumbers(bytes);
         self.retransmit_timer.reset();
         self.retransmit_timer.arm(now_ms);
+    }
+
+    /// Fills `flight_rns` with the record numbers of `bytes`, the flight
+    /// just cached. An epoch-0 record carries its number in the clear; the
+    /// epoch-2 records are sealed consecutively, so they are the last `n`
+    /// numbers `hs2.send_seq` handed out. Anything else — a record this
+    /// cannot read, an epoch other than 0/2, more than `max_flight_records`
+    /// records — leaves the table empty: such a flight is never cancelled
+    /// by an ACK and keeps its (conforming) timer-driven resend.
+    fn recordFlightNumbers(self: *Connection, bytes: []const u8) void {
+        self.flight_rns_len = 0;
+        self.flight_rns_acked = 0;
+        var rns: [max_flight_records]flight.RecordNumber = undefined;
+        var n: usize = 0;
+        var n2: u48 = 0;
+        var pos: usize = 0;
+        while (pos < bytes.len) : (n += 1) {
+            if (n == rns.len) return;
+            const rest = bytes[pos..];
+            if (rest[0] == content_type_handshake) {
+                const h = record.decodePlaintext(rest) catch return;
+                if (h.epoch != 0 or rest.len - record.plaintext_header_len < h.length) return;
+                rns[n] = .{ .epoch = 0, .sequence_number = h.sequence_number };
+                pos += record.plaintext_header_len + h.length;
+            } else {
+                const dec = record.decodeUnified(rest, 0) catch return;
+                if (dec.hdr.epoch_low != 2) return;
+                rns[n] = .{ .epoch = 2, .sequence_number = n2 };
+                n2 += 1;
+                pos += recordWireLen(rest) catch return;
+            }
+        }
+        if (n2 > self.hs2.send_seq) return;
+        const first2 = self.hs2.send_seq - n2;
+        for (rns[0..n]) |*rn| {
+            if (rn.epoch == 2) rn.sequence_number += first2;
+        }
+        @memcpy(self.flight_rns[0..n], rns[0..n]);
+        self.flight_rns_len = @intCast(n);
+    }
+
+    /// RFC 9147 §7.2, for an ACK that arrived in an AUTHENTICATED handshake
+    /// record (epoch 2; see `takeHandshakeMessage` for why epoch 0 is not
+    /// consulted): marks every record of the cached flight it names, and
+    /// once all of them are marked cancels the flight's retransmission
+    /// ("Once all the messages in a flight have been acknowledged, the
+    /// implementation MUST cancel all retransmissions of that flight").
+    /// Record numbers that are not in the table — unknown, another epoch,
+    /// an older flight — change nothing. `body` passed `checkAckBody`.
+    fn noteFlightAck(self: *Connection, body: []const u8) void {
+        var i: usize = 2;
+        while (i < body.len) : (i += flight.record_number_len) {
+            const rn = flight.decodeRecordNumber(body[i..][0..flight.record_number_len]);
+            for (self.flight_rns[0..self.flight_rns_len], 0..) |sent, k| {
+                if (sent.epoch == rn.epoch and sent.sequence_number == rn.sequence_number)
+                    self.flight_rns_acked |= @as(u8, 1) << @intCast(k);
+            }
+        }
+        self.keepFlightAcks(0);
+    }
+
+    /// Adds `acked` to the marks and cancels the retransmission when every
+    /// record of the flight is marked. `handleFlight` calls it with the
+    /// marks a rolled-back parse collected: an ACK is authenticated before
+    /// it is noted, and no handler caches a new flight and then fails, so
+    /// the marks still name the restored table.
+    ///
+    /// ⚠ That makes `cacheFlight` the LAST effectful step of every caller
+    /// (`startHandshake`, `serverProcessClientHello`,
+    /// `handleHelloRetryRequest`): a handler that cached a new flight and
+    /// then failed would hand back marks indexed against the NEW table, and
+    /// OR-ing them onto the restored old one could cancel the wrong flight.
+    /// `handleFlight` asserts the table is unchanged before it carries them.
+    fn keepFlightAcks(self: *Connection, acked: u8) void {
+        self.flight_rns_acked |= acked;
+        if (self.flight_rns_len == 0) return;
+        const all: u8 = @truncate((@as(u16, 1) << @intCast(self.flight_rns_len)) - 1);
+        if (self.flight_rns_acked == all) self.retransmit_timer.reset();
     }
 
     // ── certificate mode (RFC 8446 §4.4, layered on the psk_ke exchange) ──
@@ -9933,6 +10048,209 @@ test "handshake: ACKs between the records of the server's flight are skipped, th
     var wire: [128]u8 = undefined;
     var plain: [128]u8 = undefined;
     try testing.expectEqualStrings("up", try server.recv(try client.send("up", &wire), &plain));
+}
+
+test "handshake: an injected epoch-0 record with a huge record number does not make the genuine hellos stale" {
+    // The 1.3 engine keeps no epoch-0 replay window at all (`hs0` counts
+    // sends only): an epoch-0 duplicate is recognised by `message_seq`, so
+    // nothing an unauthenticated record says about its record number can
+    // shadow a genuine one. Pinned here for both hellos.
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try ackPair(&client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x35)));
+    const rnd = seededForTest(&csprng);
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var ab: [200]u8 = undefined;
+    const huge: u48 = std.math.maxInt(u48);
+
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    const s0 = try server.handleFlight(try ackRecordForTest(false, &server.hs_write_keys, huge, &.{}, &ab), rnd, 0, &b2);
+    try testing.expect(s0.need_more_data);
+    const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+    try testing.expect(f2.out.len > 0);
+    const c0 = try client.handleFlight(try ackRecordForTest(false, &client.hs_write_keys, huge, &.{}, &ab), rnd, 0, &b1);
+    try testing.expect(c0.need_more_data);
+    const cf = try client.handleFlight(f2.out, rnd, 0, &b1);
+    try testing.expect(cf.done);
+    try testing.expect((try server.handleFlight(cf.out, rnd, 0, &b2)).done);
+}
+
+test "handshake: the cached flight's record numbers — ServerHello in epoch 0, the rest in epoch 2" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try ackPair(&client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x36)));
+    const rnd = seededForTest(&csprng);
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    try testing.expectEqual(@as(u8, 1), client.flight_rns_len);
+    try testing.expectEqual(flight.RecordNumber{ .epoch = 0, .sequence_number = 0 }, client.flight_rns[0]);
+    // The epoch-2 numbers are the last ones `hs2.send_seq` handed out.
+    server.hs2.send_seq = 7;
+    _ = try server.handleFlight(ch, rnd, 0, &b2);
+    try testing.expectEqual(@as(u8, 3), server.flight_rns_len);
+    try testing.expectEqual(flight.RecordNumber{ .epoch = 0, .sequence_number = 0 }, server.flight_rns[0]);
+    try testing.expectEqual(flight.RecordNumber{ .epoch = 2, .sequence_number = 7 }, server.flight_rns[1]);
+    try testing.expectEqual(flight.RecordNumber{ .epoch = 2, .sequence_number = 8 }, server.flight_rns[2]);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_acked);
+    // A flight this cannot describe leaves the table empty.
+    var junk: [40]u8 = @splat(0x16);
+    try server.cacheFlight(&junk, 0);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
+    junk = @splat(0);
+    try server.cacheFlight(&junk, 0);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
+    // An epoch-0 header whose length runs past the flight.
+    var short: [record.plaintext_header_len + 8]u8 = @splat(0);
+    _ = try record.encodePlaintext(.{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = 1, .length = 8 }, &short);
+    try server.cacheFlight(short[0 .. short.len - 1], 0);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
+    try server.cacheFlight(&short, 0);
+    try testing.expectEqual(@as(u8, 1), server.flight_rns_len);
+    // An epoch-1 plaintext header is not one this engine sends.
+    _ = try record.encodePlaintext(.{ .content_type = content_type_handshake, .epoch = 1, .sequence_number = 1, .length = 0 }, &short);
+    try server.cacheFlight(short[0..record.plaintext_header_len], 0);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
+    // More records than the table holds.
+    var many: [(max_flight_records + 1) * record.plaintext_header_len]u8 = undefined;
+    for (0..max_flight_records + 1) |k|
+        _ = try record.encodePlaintext(.{ .content_type = content_type_handshake, .epoch = 0, .sequence_number = @intCast(k), .length = 0 }, many[k * record.plaintext_header_len ..]);
+    try server.cacheFlight(many[0 .. max_flight_records * record.plaintext_header_len], 0);
+    try testing.expectEqual(@as(u8, max_flight_records), server.flight_rns_len);
+    try server.cacheFlight(&many, 0);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
+    // Unified-header records: epoch 2 only, and no more of them than
+    // `hs2.send_seq` has handed out.
+    var uni: [40]u8 = @splat(0);
+    for ([_]u2{ 2, 3 }) |el| {
+        const h = try record.encodeUnified(.{ .epoch_low = el, .seq_len = .short, .seq_wire = 0, .cid = null, .length = 16 }, &uni);
+        const one = uni[0 .. h.len + 16];
+        server.hs2.send_seq = 1;
+        try server.cacheFlight(one, 0);
+        try testing.expectEqual(@as(u8, if (el == 2) 1 else 0), server.flight_rns_len);
+        server.hs2.send_seq = 0;
+        try server.cacheFlight(one, 0);
+        try testing.expectEqual(@as(u8, 0), server.flight_rns_len);
+    }
+    // A new flight starts with no record ACKed.
+    server.flight_rns_acked = 0xff;
+    try server.cacheFlight(&short, 0);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_acked);
+}
+
+/// The server's flight 2 sent and answered by nothing yet: `client` holds
+/// the handshake keys its ACKs are sealed under, `cf` its final flight.
+fn ackedFlightPair(seed: u8, client: *Connection, server: *Connection, b1: []u8, b2: []u8) ![]const u8 {
+    try ackPair(client, server);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(seed)));
+    const rnd = seededForTest(&csprng);
+    const ch = try client.startHandshake(rnd, 0, b1);
+    const f2 = try server.handleFlight(ch, rnd, 0, b2);
+    return (try client.handleFlight(f2.out, rnd, 0, b1)).out;
+}
+
+test "handshake: RFC 9147 §7.2 — a flight whose every record is ACKed is no longer retransmitted" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var ab: [200]u8 = undefined;
+    var pb: [3000]u8 = undefined;
+    const cf = try ackedFlightPair(0x37, &client, &server, &b1, &b2);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x37)));
+    const rnd = seededForTest(&csprng);
+    const rns = server.flight_rns[0..server.flight_rns_len];
+    try testing.expectEqual(@as(usize, 3), rns.len);
+
+    // Part of the flight ACKed (in two ACKs, out of order): still resent.
+    _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 50, rns[2..3], &ab), rnd, 0, &b2);
+    _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 51, rns[0..1], &ab), rnd, 0, &b2);
+    try testing.expectEqual(@as(u8, 0b101), server.flight_rns_acked);
+    try testing.expect((try server.poll(5000, &pb)) != null);
+    // The last record: the retransmission is cancelled, for good — even
+    // though each ACK-only datagram rolled the parse back.
+    const r = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 52, rns[1..2], &ab), rnd, 5000, &b2);
+    try testing.expect(r.need_more_data);
+    try testing.expectEqual(@as(u8, 0b111), server.flight_rns_acked);
+    try testing.expect(!server.retransmit_timer.isArmed());
+    try testing.expectEqual(@as(?[]const u8, null), try server.poll(1_000_000, &pb));
+    // The client's Finished still completes the handshake behind the ACKs.
+    const sf = try server.handleFlight(cf, rnd, 1_000_000, &b2);
+    try testing.expect(sf.done);
+}
+
+test "handshake: an ACK naming records we did not send, or arriving unauthenticated, cancels nothing" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var ab: [200]u8 = undefined;
+    var pb: [3000]u8 = undefined;
+    _ = try ackedFlightPair(0x38, &client, &server, &b1, &b2);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x38)));
+    const rnd = seededForTest(&csprng);
+    const rns = server.flight_rns[0..server.flight_rns_len];
+    const before = server.retransmit_timer;
+
+    // Right sequence numbers, wrong epochs; numbers past the flight; none.
+    const unknown = [_]flight.RecordNumber{
+        .{ .epoch = 2, .sequence_number = rns[2].sequence_number + 1 },
+        .{ .epoch = 1, .sequence_number = rns[1].sequence_number },
+        .{ .epoch = 3, .sequence_number = rns[2].sequence_number },
+        .{ .epoch = 0, .sequence_number = 1 },
+    };
+    _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 59, unknown[0..2], &ab), rnd, 0, &b2);
+    _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 60, unknown[2..4], &ab), rnd, 0, &b2);
+    _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 61, &.{}, &ab), rnd, 0, &b2);
+    try testing.expectEqual(@as(u8, 0), server.flight_rns_acked);
+    try testing.expectEqual(before, server.retransmit_timer);
+    try testing.expect((try server.poll(5000, &pb)) != null);
+    // A flight with no table is never "all ACKed".
+    server.flight_rns_len = 0;
+    _ = try server.handleFlight(try ackRecordForTest(true, &client.hs_write_keys, 62, &.{}, &ab), rnd, 5000, &b2);
+    try testing.expect(server.retransmit_timer.isArmed());
+    // The whole flight named, but in an epoch-0 (unauthenticated) ACK: the
+    // client's ClientHello, before any key exists.
+    var c2: Connection = undefined;
+    var s2: Connection = undefined;
+    try ackPair(&c2, &s2);
+    defer c2.deinit();
+    defer s2.deinit();
+    _ = try c2.startHandshake(rnd, 0, &b1);
+    const r = try c2.handleFlight(try ackRecordForTest(false, &client.hs_write_keys, 9, c2.flight_rns[0..c2.flight_rns_len], &ab), rnd, 0, &b1);
+    try testing.expect(r.need_more_data);
+    try testing.expect((try c2.poll(5000, &pb)) != null);
+}
+
+test "handshake: a full ACK that shares a datagram with a failing record still cancels" {
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var ab: [200]u8 = undefined;
+    var pb: [3000]u8 = undefined;
+    var dg: [400]u8 = undefined;
+    _ = try ackedFlightPair(0x39, &client, &server, &b1, &b2);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x39)));
+    const rnd = seededForTest(&csprng);
+    const a = try ackRecordForTest(true, &client.hs_write_keys, 70, server.flight_rns[0..server.flight_rns_len], &ab);
+    @memcpy(dg[0..a.len], a);
+    @memcpy(dg[a.len..][0..a.len], a); // its replay fails the parse
+    try testing.expectError(error.ReplayedRecord, server.handleFlight(dg[0 .. 2 * a.len], rnd, 0, &b2));
+    try testing.expectEqual(@as(?[]const u8, null), try server.poll(1_000_000, &pb));
 }
 
 test "handshake: an ACK ahead of the client's Finished is skipped by the server, and does not enter the ACK it owes" {
