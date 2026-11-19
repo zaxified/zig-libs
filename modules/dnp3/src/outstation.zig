@@ -71,6 +71,7 @@ const objects = @import("objects.zig");
 const records = @import("records.zig");
 const link = @import("link.zig");
 const transport = @import("transport.zig");
+const secure_auth = @import("secure_auth.zig");
 
 pub const Iin = application.Iin;
 pub const FunctionCode = application.FunctionCode;
@@ -513,6 +514,10 @@ pub const Outstation = struct {
     db: Database,
     events: EventBuffer,
     hook: ?CommandHook = null,
+    /// Secure Authentication, when attached (`setSecureAuth`). `null` — the
+    /// default — means no request is ever screened, and the outstation
+    /// behaves exactly as it did before SA existed.
+    secure_auth: ?*secure_auth.SecureAuth = null,
 
     // ── IIN state ──
     /// IIN1.7. Set at construction; only an explicit WRITE of g80v1 index 7
@@ -655,6 +660,14 @@ pub const Outstation = struct {
 
     pub fn setCommandHook(self: *Outstation, hook: ?CommandHook) void {
         self.hook = hook;
+    }
+
+    /// Attaches (or, with `null`, detaches) Secure Authentication: critical
+    /// requests are then challenged, aggressive-mode requests verified, and
+    /// AUTHENTICATE_REQUEST answered (see `secure_auth.zig`). The state is
+    /// caller-owned and must outlive the outstation.
+    pub fn setSecureAuth(self: *Outstation, auth: ?*secure_auth.SecureAuth) void {
+        self.secure_auth = auth;
     }
 
     // ── IIN ─────────────────────────────────────────────────────────────────
@@ -819,6 +832,26 @@ pub const Outstation = struct {
         self.awaiting_confirm = false;
         self.last_request_seq = seq;
 
+        if (self.secure_auth) |auth| {
+            switch (try auth.screen(request, function, seq, body, peer, now_ms, self.iin(), out)) {
+                .pass => {},
+                .silent => return null,
+                .reply => |fragment| return .{ .fragment = fragment, .confirm_requested = false, .more = false },
+                .execute => |e| return try self.dispatch(e.function, e.seq, e.body, peer, now_ms, out),
+            }
+        }
+        return try self.dispatch(function, seq, body, peer, now_ms, out);
+    }
+
+    fn dispatch(
+        self: *Outstation,
+        function: FunctionCode,
+        seq: u4,
+        body: []const u8,
+        peer: ?u16,
+        now_ms: u64,
+        out: []u8,
+    ) Error!?Reply {
         return switch (function) {
             .read => try self.doRead(seq, body, now_ms, out),
             .write => try self.doWrite(seq, body, now_ms, out),

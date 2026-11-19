@@ -111,6 +111,10 @@ pub const records = @import("records.zig");
 /// responder over a caller-owned point database, plus a `Session` that wires
 /// it to the link and transport layers.
 pub const outstation = @import("outstation.zig");
+/// Secure Authentication (SAv5 symmetric) for the outstation: challenge of
+/// critical requests, aggressive mode, session-key change. Opt-in through
+/// `outstation.Outstation.setSecureAuth`.
+pub const secure_auth = @import("secure_auth.zig");
 /// Byte-exact wire goldens for both roles, including frames captured from a
 /// live opendnp3 master driving `outstation.Outstation`.
 pub const goldens = @import("goldens.zig");
@@ -126,6 +130,7 @@ test {
     _ = sa;
     _ = records;
     _ = outstation;
+    _ = secure_auth;
     _ = goldens;
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
