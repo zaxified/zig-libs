@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the lazy newline-search resume (8 mutants: 5 killed, 3 equivalent/unobservable); tests for exact chunk lists around a refill-first newline. Card counts cumulative.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** `ChunkReader` in lazy mode no longer searches the whole unterminated residual for a newline after every refill: it remembers how many leading bytes are known newline-free and searches only the new ones (`scanned` is now the bytes read). Chunk boundaries and read sizes are byte-identical. `.span` mode still rescans (the scanner cannot resume mid-record; argued in SPEC § Backlog).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GN sweep (20 mutants over the sweep diff): 18 killed (3 by new tests: comment-line counter saturation, doubled read clamped to `max_record_len` and to the file's remainder), 2 equivalent (a capacity sum bounded by the stat remainder / 64 KiB probe; a u64 diagnostic sum). Not a whole-module mutation score.
