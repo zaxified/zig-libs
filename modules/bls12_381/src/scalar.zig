@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const entropy = @import("entropy");
+const burn = @import("burn.zig");
 const montint = @import("montint");
 
 /// Container width for `Fr`: 256 bits (32 bytes), the next byte-aligned
@@ -181,6 +182,13 @@ pub const Fr = struct {
     /// the caller's frame, so a consumer that burns its own frames has only
     /// `out` to wipe.
     pub fn randomInto(out: *Fr, io: std.Io) void {
+        burn.run(burn.random_burn, void, randomIntoBody, .{ out, io });
+    }
+
+    /// The body in a frame of its own, so `burn.run` zeroes what it dirtied
+    /// (the by-value `fromBytes` argument and the conversion temporaries,
+    /// which the `defer` over the scratch buffer does not reach).
+    fn randomIntoBody(out: *Fr, io: std.Io) void {
         var buf: [encoded_bytes]u8 = undefined;
         defer std.crypto.secureZero(u8, &buf);
         while (true) {

@@ -636,8 +636,8 @@ bls12_381	ReleaseFast	field	1	1	6718617f9f6e38c1	c1e8a3c184eada53
 # the authorities); ibe's Miller loop over `d_id` (the pairing makes no
 # constant-time claim — ibe SPEC); and the FO re-encryption compare in ibe/tlock
 # decrypt (`std.mem.eql`, accept/reject public by the code's own comment).
-bls12_381	ReleaseFast	g1_scalarmul	1	2	760482c9b858df5b	b53b0d7808e48c1c
-bls12_381	ReleaseFast	g2_scalarmul	1	2	edc612acc13033af	7f4e15a241002b3f
+bls12_381	ReleaseFast	g1_scalarmul	1	2	1ea39b43e23c4830	b53b0d7808e48c1c
+bls12_381	ReleaseFast	g2_scalarmul	1	2	6dd9c274d5a8ba4c	7f4e15a241002b3f
 # Re-pin 2026-09-15. Every moved bound below was diffed context-by-context
 # against a --stacks run of the tree at 0c0ef527:
 #   bip340 sign 79 -> 80   The F5 seam (f3c75612) moved sign's body into

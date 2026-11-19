@@ -440,6 +440,28 @@ noinline fn callPath() void {
     apiPath(&sk_sink, &cur_ikm, &probe_path);
     std.mem.doNotOptimizeAway(&sk_sink);
 }
+/// An `Io` whose secure random replays the case's drawn bytes, so
+/// `Fr.randomInto` draws a known scalar. Everything else is `std.Io.failing`'s
+/// (but a real `swapCancelProtection`, which `entropy.fill` calls).
+var fake_vtable: std.Io.VTable = undefined;
+var cur_draw: [32]u8 = undefined;
+var draw_sink: Fr = undefined;
+fn fakeRandomSecure(_: ?*anyopaque, buffer: []u8) std.Io.RandomSecureError!void {
+    @memcpy(buffer, cur_draw[0..buffer.len]);
+}
+fn fakeSwapCancelProtection(_: ?*anyopaque, _: std.Io.CancelProtection) std.Io.CancelProtection {
+    return .unblocked;
+}
+fn fakeIo() std.Io {
+    fake_vtable = std.Io.failing.vtable.*;
+    fake_vtable.randomSecure = fakeRandomSecure;
+    fake_vtable.swapCancelProtection = fakeSwapCancelProtection;
+    return .{ .userdata = null, .vtable = &fake_vtable };
+}
+noinline fn callRandomInto() void {
+    Fr.randomInto(&draw_sink, fakeIo());
+    std.mem.doNotOptimizeAway(&draw_sink);
+}
 noinline fn callSplit() void {
     heap_fba.reset();
     const r = apiSplit(heap_fba.allocator(), &cur_sk, &cur_coeffs);
@@ -494,6 +516,17 @@ test "STACKPROBE: no secret-key residue on the dead stack after BLS key generati
         bad += try runProbe("MinSigBasic.sign (G1)", CallSign(MinSigBasic).call, &nd);
         bad += try runProbe("MinPkAug.sign", CallSign(MinPkAug).call, &nd);
         bad += try runProbe("MinPkPop.popProve", callPopProve, &nd);
+
+        // Fr.randomInto: the drawn bytes and the scalar they make.
+        cur_draw = cur_sk.scalar.toBytes();
+        callRandomInto();
+        try std.testing.expect(draw_sink.eql(cur_sk.scalar));
+        nd.reset();
+        nd.addBoth("drawn bytes", &cur_draw);
+        nd.addFr("drawn", cur_sk.scalar);
+        nd.sort();
+        leak_src = cur_sk.scalar.toBytes();
+        bad += try runProbe("Fr.randomInto", callRandomInto, &nd);
 
         // EIP-2333.
         var master: SecretKey = undefined;

@@ -48,3 +48,8 @@ pub const sign_burn = 32 * 1024;
 /// EIP-2333: a child derivation holds two 8 KiB Lamport keys and their 16 KiB
 /// public key; it dirtied 35 KiB in ReleaseFast (2026-10-09).
 pub const derive_burn = 64 * 1024;
+
+/// `Fr.randomInto` (the drawn bytes, the by-value `fromBytes` argument and the
+/// Montgomery conversion temporaries; the fail-closed `entropy.fill` frames
+/// below it) -- sized with the `keygen_burn` margin (2026-11-19).
+pub const random_burn = 8 * 1024;
