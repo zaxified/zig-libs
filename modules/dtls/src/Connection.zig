@@ -958,6 +958,15 @@ const max_send_epoch: u64 = (1 << 48) - 1;
 /// `Connection.ack_queue` capacity (post-handshake records owed an ACK).
 const max_ack_queue = 8;
 
+/// Whether a rolled-back parse left the cached flight's record table as
+/// it found it (see `keepFlightAcks`): the marks it collected are only
+/// meaningful against that table.
+fn sameFlightTable(now: *const Connection, before: *const Connection) bool {
+    const n = now.flight_rns_len;
+    if (n != before.flight_rns_len) return false;
+    return std.mem.eql(u8, std.mem.sliceAsBytes(now.flight_rns[0..n]), std.mem.sliceAsBytes(before.flight_rns[0..n]));
+}
+
 /// Records one cached flight may hold for ACK matching (`flight_rns`); the
 /// largest flight this engine sends, a certificate-mode server flight 2,
 /// has six (ServerHello, EncryptedExtensions, CertificateRequest,
@@ -1939,6 +1948,7 @@ pub const Connection = struct {
         } catch |err| switch (err) {
             error.FlightIncomplete => {
                 const acked = self.flight_rns_acked;
+                std.debug.assert(sameFlightTable(self, &saved));
                 self.* = saved;
                 self.keepFlightAcks(acked);
                 return .{ .out = out[0..0], .done = false, .need_more_data = true };
@@ -1967,6 +1977,7 @@ pub const Connection = struct {
             // still be the one that existed before the record arrived.
             else => {
                 const acked = self.flight_rns_acked;
+                std.debug.assert(sameFlightTable(self, &saved));
                 self.* = saved;
                 self.keepFlightAcks(acked);
                 self.rx_flight_len = 0;
@@ -3263,6 +3274,13 @@ pub const Connection = struct {
     /// marks a rolled-back parse collected: an ACK is authenticated before
     /// it is noted, and no handler caches a new flight and then fails, so
     /// the marks still name the restored table.
+    ///
+    /// ⚠ That makes `cacheFlight` the LAST effectful step of every caller
+    /// (`startHandshake`, `serverProcessClientHello`,
+    /// `handleHelloRetryRequest`): a handler that cached a new flight and
+    /// then failed would hand back marks indexed against the NEW table, and
+    /// OR-ing them onto the restored old one could cancel the wrong flight.
+    /// `handleFlight` asserts the table is unchanged before it carries them.
     fn keepFlightAcks(self: *Connection, acked: u8) void {
         self.flight_rns_acked |= acked;
         if (self.flight_rns_len == 0) return;

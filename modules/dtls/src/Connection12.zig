@@ -158,12 +158,31 @@ const Window = struct {
         var w = self;
         return w.accept(seq);
     }
+
+    /// Records an UNAUTHENTICATED (epoch-0) `seq`, unless it lies more than
+    /// `epoch0_max_jump` past the highest recorded number (past 0 before
+    /// any): such a record is processed but not recorded, so a forged
+    /// record number near 2^48 can never become the window's high mark.
+    /// A genuine peer that lost many records keeps working (its records
+    /// are still ahead of the window, hence fresh); only their replay
+    /// protection lapses until one lands within reach.
+    fn recordUnauthenticated(self: *Window, seq: u48) void {
+        const base: u48 = if (self.seen_any) self.high else 0;
+        if (seq > base +| epoch0_max_jump) return;
+        _ = self.accept(seq);
+    }
 };
 
+/// How far one epoch-0 record may move the window's high mark: the window
+/// width (`replayCheckAndUpdate`'s 64-record bitmap).
+const epoch0_max_jump = 64;
+
 /// What an epoch-0 record has to change to count as having advanced the
-/// handshake (see `processRecord`): the next expected message, the bytes of
-/// the message in progress, or the read epoch (a ChangeCipherSpec).
-const Progress = struct { next_recv_seq: u16, rx_filled: usize, read_epoch: u16 };
+/// handshake (see `processRecord`): a COMPLETED message (the next expected
+/// one moves on) or an accepted ChangeCipherSpec (the read epoch moves on).
+/// New bytes of a message still in progress do not count: they are
+/// unauthenticated, and one forged byte would otherwise be enough.
+const Progress = struct { next_recv_seq: u16, read_epoch: u16 };
 
 const cookie_mac_label = "dtls 1.2 hello verify cookie v1";
 const cookie_len = 32;
@@ -366,7 +385,7 @@ pub const Connection12 = struct {
         self.processDatagram(datagram, entropy, now_ms, &o) catch |err| {
             const used_queue = self.queue_used or saved.rx_from_queue;
             self.* = saved;
-            if (!used_queue) return err;
+            if (!used_queue and !saved.rx_active) return err;
             // The queue is unauthenticated: a forged fragment of a later
             // message, queued earlier (and possibly already latched into the
             // message in progress by an earlier call), would otherwise fail
@@ -374,7 +393,16 @@ pub const Connection12 = struct {
             // live bytes alone (what the engine did before it queued
             // anything); the queue is lost, the peer's retransmission
             // refills it.
-            self.dropQueue();
+            //
+            // The message in progress from an EARLIER call is just as
+            // unauthenticated: one forged fragment latched there (a 1-byte
+            // ServerHello piece) would answer every genuine copy with
+            // `InconsistentLength`, for ever. Without the queue involved, the
+            // retry drops it, but its result is kept only if this datagram
+            // alone COMPLETES the message; otherwise the partial message
+            // stays and the error stands, so a forged fragment cannot evict
+            // a genuine partial message either.
+            if (used_queue) self.dropQueue() else self.rx_active = false;
             o.len = 0;
             self.saw_duplicate = false;
             self.stateless_reply = false;
@@ -382,6 +410,10 @@ pub const Connection12 = struct {
                 self.* = saved;
                 return err2;
             };
+            if (!used_queue and self.next_recv_seq == saved.next_recv_seq) {
+                self.* = saved;
+                return err;
+            }
         };
         if (self.stateless_reply) {
             // HelloVerifyRequest: the server keeps NOTHING (RFC 6347 §4.2.1).
@@ -520,8 +552,15 @@ pub const Connection12 = struct {
                 // every well-formed record let an off-path sender with a
                 // huge sequence number make the genuine records look stale
                 // (RFC 6347 §4.1.2.6 updates the window only after the MAC
-                // verified). A record that merely parses — a duplicate, a
-                // queued later message, a stray CCS — is not recorded.
+                // verified). Only a record that completed a message or was
+                // an accepted CCS is recorded, and never far ahead (see
+                // `Window.recordUnauthenticated`); one that merely parses —
+                // a duplicate, a partial fragment, a queued later message, a
+                // stray CCS — is not. Hence a verbatim replay of such a
+                // record is processed again: a replayed duplicate makes this
+                // side resend its flight once per replayed datagram, as a
+                // forged duplicate under a fresh number always could (no
+                // growth, same peer address).
                 if (!self.recv_win[0].fresh(hdr.sequence_number)) return; // duplicate record: drop
                 plain = frag;
             },
@@ -543,7 +582,7 @@ pub const Connection12 = struct {
         self.cur_record_seq = hdr.sequence_number;
         const before = self.progress();
         defer if (hdr.epoch == 0 and !std.meta.eql(before, self.progress())) {
-            _ = self.recv_win[0].accept(hdr.sequence_number);
+            self.recv_win[0].recordUnauthenticated(hdr.sequence_number);
         };
         switch (hdr.content_type) {
             content_handshake => try self.processHandshakeRecord(plain, hdr.epoch, entropy, now_ms, o),
@@ -569,7 +608,7 @@ pub const Connection12 = struct {
     }
 
     fn progress(self: *const Connection12) Progress {
-        return .{ .next_recv_seq = self.next_recv_seq, .rx_filled = self.rx_filled, .read_epoch = self.read_epoch };
+        return .{ .next_recv_seq = self.next_recv_seq, .read_epoch = self.read_epoch };
     }
 
     fn ccsExpected(self: *const Connection12) bool {
@@ -591,8 +630,17 @@ pub const Connection12 = struct {
             if (hh.length > max_message_len) return error.FlightTooLarge;
             // A stateless server (RFC 6347 §4.2.1) cannot know whether this
             // is ClientHello 0 or the post-cookie ClientHello 1.
-            if (self.role == .server and self.state == .start and !self.rx_active and hh.msg_type == m12.HandshakeType.client_hello)
+            // At `.start` nothing is committed yet, so a WHOLE ClientHello
+            // under another `message_seq` than the partial one in progress
+            // replaces it (a forged partial ClientHello must not make the
+            // genuine one look like an old duplicate); a mere fragment does
+            // not.
+            if (self.role == .server and self.state == .start and hh.msg_type == m12.HandshakeType.client_hello and
+                (!self.rx_active or (hh.message_seq != self.next_recv_seq and hh.fragment_offset == 0 and hh.fragment_length == hh.length)))
+            {
                 self.next_recv_seq = hh.message_seq;
+                self.rx_active = false;
+            }
             if (messageSeqBefore(hh.message_seq, self.next_recv_seq)) {
                 self.saw_duplicate = true;
                 continue;
@@ -1770,14 +1818,13 @@ test "epoch-0 replay window: only a record that advanced the handshake is record
     try c.processRecord(.{ .content_type = content_application_data, .epoch = 0, .sequence_number = huge - 3, .length = 1 }, &.{1}, ent, 0, &o);
     try std.testing.expect(!c.recv_win[0].seen_any);
 
-    // A fragment of the expected message, under a low record number, is
-    // taken and recorded ...
+    // A partial fragment of the expected message is taken but not recorded:
+    // its bytes are as unauthenticated as any (one forged byte with a huge
+    // record number would otherwise shadow every genuine record).
     const cur = testFragment(2, 40, 10, &fb);
-    const h5: record.PlaintextHeader = .{ .content_type = hs, .epoch = 0, .sequence_number = 5, .length = @intCast(cur.len) };
-    try c.processRecord(h5, cur, ent, 0, &o);
+    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = huge, .length = @intCast(cur.len) }, cur, ent, 0, &o);
     try std.testing.expectEqual(@as(usize, 10), c.rx_filled);
-    try std.testing.expect(c.recv_win[0].seen_any);
-    try std.testing.expectEqual(@as(u48, 5), c.recv_win[0].high);
+    try std.testing.expect(!c.recv_win[0].seen_any);
 
     // A message that completes in one record with as many bytes as the
     // previous one changes only `next_recv_seq`: recorded as well (this one
@@ -1804,6 +1851,23 @@ test "epoch-0 replay window: only a record that advanced the handshake is record
     try k.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 8, .length = 1 }, &.{1}, ent, 0, &o);
     try std.testing.expect(k.saw_duplicate);
     try std.testing.expectEqual(@as(u48, 7), k.recv_win[0].high);
+}
+
+test "epoch-0 replay window: an unauthenticated record moves the high mark at most one window width" {
+    var w: Window = .{};
+    w.recordUnauthenticated(epoch0_max_jump + 1);
+    try std.testing.expect(!w.seen_any);
+    w.recordUnauthenticated(epoch0_max_jump);
+    try std.testing.expectEqual(@as(u48, epoch0_max_jump), w.high);
+    w.recordUnauthenticated(3 * epoch0_max_jump + 1);
+    try std.testing.expectEqual(@as(u48, epoch0_max_jump), w.high);
+    w.recordUnauthenticated(2 * epoch0_max_jump);
+    try std.testing.expectEqual(@as(u48, 2 * epoch0_max_jump), w.high);
+    w.recordUnauthenticated(std.math.maxInt(u48));
+    try std.testing.expectEqual(@as(u48, 2 * epoch0_max_jump), w.high);
+    // Behind the high mark: recorded as usual (a duplicate is then refused).
+    w.recordUnauthenticated(2 * epoch0_max_jump - 5);
+    try std.testing.expect(!w.fresh(2 * epoch0_max_jump - 5));
 }
 
 test "audit: the future-message queue takes a fragment that fills it exactly" {
