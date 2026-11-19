@@ -285,6 +285,11 @@ defaults (`Spec.reset_signal_mask = true` and the internal `Options` one) cannot
 `Spec` default is exercised by that same test (it runs a child without naming the field and expects an empty mask), but
 was not mutated by a run; the `Options` default is never relied on, since `procrun` always passes the field. 9/9.
 
+**Audit 2026-11-19 (delta mutation, `rejectNul`).** 8 schemata mutants over the NUL refusal in `spawnChild`, ReleaseSafe, one
+build: the argv check dropped and inverted, the `cwd` check dropped, the env-value check dropped and inverted, the
+`env_mode != .inherit` guard flipped and forced open, the `rejectNul` call skipped. All 8 killed by the test `NUL inside argv,
+cwd or env is refused before spawning`. 8/8. The card's mutation entry carries no whole-module score, so it is left as it was.
+
 ## Anchoring
 
 **Anchor grade:** class C · oracle n/a

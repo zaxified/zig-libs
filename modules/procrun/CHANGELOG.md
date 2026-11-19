@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the NUL refusal (8 schemata mutants, all killed by the new test); SPEC paragraph, no card change.
 - **2026-11-19** — **BEHAVIOUR CHANGE:** a NUL byte inside an `argv` element, `cwd`, or an `env` value (when `env_mode` uses `Spec.env`) is now `error.NulByte`, returned before anything is spawned. Before, the vfork path silently truncated the C string at the NUL (a different argument or program than written). Same as Go `os/exec` (EINVAL), Rust `Command` ("nul byte found in provided data") and Python `subprocess` (`ValueError`).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of the `reset_signal_mask` path (9 schemata mutants, all killed by the existing test); no test change.
