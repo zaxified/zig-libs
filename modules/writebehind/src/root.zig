@@ -418,6 +418,24 @@ pub const FlushError = error{
 
 const Op = enum { put, del };
 
+/// See `Coordinator.held`.
+const Held = struct {
+    lease: jobqueue.Lease,
+    kind: enum {
+        /// A synchronous rejection, returned at the end of the `flushAll` pass.
+        rejected,
+        /// The `nack` that should have returned it failed: retried by every
+        /// `drain`.
+        nack_failed,
+        /// Written (or superseded by a newer record of the key that was), but
+        /// its ack failed or must wait for an older one of the key: the ack is
+        /// retried by every `drain`; it is never written again. A key's acks
+        /// go strictly oldest first, so a restart can never replay an older
+        /// record over a newer one that was already acked.
+        ack_failed,
+    },
+};
+
 /// One queued flush: an owned snapshot of a single WAL record plus the lease to
 /// ack once the sink write lands. Heap-allocated; the worker thread fills `ok`
 /// and links it onto the completion list; the coordinator thread acks + frees.
@@ -488,6 +506,15 @@ pub const Coordinator = struct {
     /// back. An entry past its time is dropped when the key is next selected.
     /// Owns keys.
     retry_at: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Leases this coordinator still holds (the records are leased, so
+    /// invisible to every dequeue): synchronous rejections kept for the rest
+    /// of a `flushAll` pass, records whose `nack` failed, and records whose
+    /// `ack` failed or waits for an older one. While a key has an entry here,
+    /// `startKey` leaves it alone; a newer record of it that the synchronous
+    /// path writes supersedes the held ones (they are acked, never retried
+    /// over it). Oldest first per key. Every entry is still counted in
+    /// `unflushed`.
+    held: std.ArrayList(Held) = .empty,
     /// Scratch list of duped keys collected from `drainDirty`/`orphans`.
     /// The strings themselves are arena-allocated (`scratch_arena`) — every
     /// consumer of `scratch.items` (`startKey`/`addKeySet`/`startFlush`)
@@ -577,6 +604,8 @@ pub const Coordinator = struct {
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
         self.freeRetry();
+        // Leases still held stay in the WAL (a lease is in-memory only).
+        self.held.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
         self.scratch_arena.deinit();
         const gpa = self.gpa;
@@ -607,6 +636,8 @@ pub const Coordinator = struct {
         self.freeKeySet(&self.orphans);
         self.freeKeySet(&self.tombstones);
         self.freeRetry();
+        // Leases still held stay in the WAL (a lease is in-memory only).
+        self.held.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
         self.scratch_arena.deinit();
         const gpa = self.gpa;
@@ -713,6 +744,9 @@ pub const Coordinator = struct {
     /// then submit new flush jobs for every dirty/orphan key not already in
     /// flight. Call periodically (a tick) or on a dirty-count threshold.
     pub fn drain(self: *Coordinator) void {
+        // Retry the nacks/acks of held leases first: those that fail in this
+        // drain's own harvest wait for the next one.
+        if (self.held.items.len > 0) self.releaseHeld(false);
         self.pump();
         self.kick();
     }
@@ -730,14 +764,9 @@ pub const Coordinator = struct {
     pub fn flushAll(self: *Coordinator) FlushError!void {
         const start = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
         const deadline = start +| @as(i96, self.flush_timeout_ns);
-        // Leases of synchronous writes the sink rejected in this pass: held
-        // (so the next synchronous flush moves on to the next record) and
-        // returned to the WAL once nothing else is visible.
-        var held: std.ArrayList(jobqueue.Lease) = .empty;
-        defer {
-            self.releaseHeld(&held);
-            held.deinit(self.gpa);
-        }
+        // Synchronous writes the sink rejects in this pass are held (so the
+        // next synchronous flush moves on to the next record) and returned to
+        // the WAL once nothing else is visible (`releaseHeld`).
         self.drain();
         while (self.unflushed > 0 or self.in_flight.count() > 0) {
             if (self.in_flight.count() == 0 and !self.anyRetryWaiting()) {
@@ -746,7 +775,7 @@ pub const Coordinator = struct {
                 // synchronously to guarantee forward progress, then re-drain.
                 // Not while a key waits out its retry backoff: the global
                 // dequeue would hand that key's record over early.
-                switch (self.syncFlush(&held)) {
+                switch (self.syncFlush(true)) {
                     .landed => {
                         self.drain();
                         continue;
@@ -757,7 +786,7 @@ pub const Coordinator = struct {
             }
             // Nothing more to do now: give the rejected records back for a
             // retry, and wait before trying them again.
-            self.releaseHeld(&held);
+            self.releaseHeld(true);
             const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
             if (now >= deadline) return error.FlushIncomplete;
             // Park until a worker signals a completion (bounded), then re-drain.
@@ -788,15 +817,14 @@ pub const Coordinator = struct {
                 .put => self.sink.write(lease.partition, lease.payload),
                 .del => self.sink.delete(lease.partition),
             };
+            var key_buf: [jobqueue.max_field_len]u8 = undefined;
+            const key = key_buf[0..lease.partition.len];
+            @memcpy(key, lease.partition);
             if (res) |_| {
-                self.wal.ack(lease) catch {};
-                if (self.unflushed > 0) self.unflushed -= 1;
+                _ = self.ackLanded(key, lease);
             } else |_| {
                 // Back to the WAL as any failed write is (a dead-lettered one
                 // is counted, a retried one waits `retry_backoff_ns`).
-                var key_buf: [jobqueue.max_field_len]u8 = undefined;
-                const key = key_buf[0..lease.partition.len];
-                @memcpy(key, lease.partition);
                 self.flushFailed(key, lease);
                 return error.SinkWriteFailed;
             }
@@ -861,8 +889,14 @@ pub const Coordinator = struct {
     fn finishTask(self: *Coordinator, t: *FlushTask) void {
         self.clearInFlight(t.key);
         if (t.ok) {
-            self.wal.ack(t.lease) catch {};
-            if (self.unflushed > 0) self.unflushed -= 1;
+            if (!self.ackLanded(t.key, t.lease)) {
+                // The ack is held for a later drain; the key moves on after it.
+                self.addKeySet(&self.orphans, t.key) catch {
+                    self.n_dropped_orphans += 1;
+                };
+                self.freeTask(t);
+                return;
+            }
             self.clearRetry(t.key);
             // Advance this key: flush its next queued record, if any (keeps
             // per-key ordering). Otherwise the key is fully persisted.
@@ -933,6 +967,9 @@ pub const Coordinator = struct {
         // Waiting out a retry backoff: neither the failed record nor a newer
         // one of this key may go yet. The key stays registered.
         if (self.retryWaiting(key)) return;
+        // A failed record of this key is held: it must go back before any
+        // newer one of the key can be dequeued.
+        if (self.heldFor(key)) return;
         const lease = self.dequeueFor(key) orelse {
             // No WAL record for this key: reconcile stale bookkeeping.
             _ = self.cache.markClean(key);
@@ -963,11 +1000,23 @@ pub const Coordinator = struct {
     /// that choice is not silent.
     fn flushFailed(self: *Coordinator, key: []const u8, lease: jobqueue.Lease) void {
         const dead_before = self.wal.deadLetterCount();
-        self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
+        self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {
+            // The record is still leased to us (a WAL storage or allocation
+            // failure). Hold it, so no newer record of the key is dequeued
+            // ahead of it, and nack it again on the next `drain`. Should even
+            // that list refuse to grow, the record is stranded until a restart
+            // (its lease is in-memory only). The nack that succeeds later
+            // registers the key again.
+            self.held.append(self.gpa, .{ .lease = lease, .kind = .nack_failed }) catch {};
+            return;
+        };
         if (self.wal.deadLetterCount() > dead_before) {
             self.n_poisoned += 1;
             if (self.unflushed > 0) self.unflushed -= 1;
             self.clearRetry(key);
+            // A held record of this key is older than anything `dequeueFor`
+            // would return: the key advances when that one is released.
+            if (self.heldFor(key)) return;
             // Same key-advance as the success path: a later record for this
             // key is still good and must not be stranded behind the dropped
             // one (it is also newer, so LWW is unaffected).
@@ -1001,8 +1050,12 @@ pub const Coordinator = struct {
     /// Snapshot `lease` into an owned `FlushTask`, mark the key in flight, and
     /// submit it to the pool. On any failure the lease is returned to the WAL.
     fn startFlush(self: *Coordinator, key: []const u8, lease: jobqueue.Lease) void {
+        // Every failure below returns the lease through `flushFailed`: the
+        // `nack` counts as an attempt, so with a finite `max_flush_attempts` it
+        // can dead-letter the record, which must be counted and the key
+        // advanced (a bare `nack` left `unflushed` waiting for it forever).
         const task = self.gpa.create(FlushTask) catch {
-            self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
+            self.flushFailed(key, lease);
             return;
         };
         task.* = .{
@@ -1010,26 +1063,26 @@ pub const Coordinator = struct {
             .op = if (std.mem.eql(u8, lease.job_type, "del")) .del else .put,
             .key = self.gpa.dupe(u8, key) catch {
                 self.gpa.destroy(task);
-                self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
+                self.flushFailed(key, lease);
                 return;
             },
             .value = self.gpa.dupe(u8, lease.payload) catch {
                 self.gpa.free(task.key);
                 self.gpa.destroy(task);
-                self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
+                self.flushFailed(key, lease);
                 return;
             },
             .lease = lease,
         };
         self.markInFlight(key, task) catch {
             self.freeTask(task);
-            self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
+            self.flushFailed(key, lease);
             return;
         };
         self.pool.submit(.{ .func = flushEntry, .ctx = task }) catch {
             self.clearInFlight(key);
             self.freeTask(task);
-            self.wal.nack(lease, .{ .backoff_ns = 0 }) catch {};
+            self.flushFailed(key, lease);
         };
     }
 
@@ -1038,14 +1091,14 @@ pub const Coordinator = struct {
     /// the cache. Returns true if a record was flushed; a rejected record goes
     /// back to the WAL for a retry (`flushFailed`).
     fn flushOneSync(self: *Coordinator) bool {
-        return self.syncFlush(null) == .landed;
+        return self.syncFlush(false) == .landed;
     }
 
     const SyncResult = enum {
         /// A record was written and acked.
         landed,
-        /// The sink rejected a record; its lease is in the caller's `hold`
-        /// list (not visible to the next dequeue until `releaseHeld`).
+        /// The sink rejected a record; its lease is in `held` (not visible to
+        /// the next dequeue until `releaseHeld`).
         held,
         /// The sink rejected a record; it went back to the WAL.
         rejected,
@@ -1053,10 +1106,10 @@ pub const Coordinator = struct {
         none,
     };
 
-    /// `flushOneSync`'s body. With `hold`, a rejected record's lease is kept
-    /// there, so the caller's next call moves on to the next record instead
+    /// `flushOneSync`'s body. With `hold`, a rejected record's lease is kept in
+    /// `held`, so the caller's next call moves on to the next record instead
     /// of retrying this one at once.
-    fn syncFlush(self: *Coordinator, hold: ?*std.ArrayList(jobqueue.Lease)) SyncResult {
+    fn syncFlush(self: *Coordinator, hold: bool) SyncResult {
         const lease = (self.wal.dequeue(.{ .visibility_timeout_ns = vis_timeout_ns }) catch null) orelse
             return .none;
         const op: Op = if (std.mem.eql(u8, lease.job_type, "del")) .del else .put;
@@ -1069,8 +1122,12 @@ pub const Coordinator = struct {
         const key = key_buf[0..lease.partition.len];
         @memcpy(key, lease.partition);
         if (res) |_| {
-            self.wal.ack(lease) catch {};
-            if (self.unflushed > 0) self.unflushed -= 1;
+            if (!self.ackLanded(key, lease)) {
+                self.addKeySet(&self.orphans, key) catch {
+                    self.n_dropped_orphans += 1;
+                };
+                return .landed;
+            }
             self.clearRetry(key);
             // Advance the key as `finishTask` does: its next record goes to the
             // pool. (Leasing it and dropping the lease hid it for the whole
@@ -1083,23 +1140,106 @@ pub const Coordinator = struct {
             }
             return .landed;
         } else |_| {
-            if (hold) |h| {
-                if (h.append(self.gpa, lease)) |_| return .held else |_| {}
+            if (hold) {
+                if (self.held.append(self.gpa, .{ .lease = lease, .kind = .rejected })) |_| return .held else |_| {}
             }
             self.flushFailed(key, lease);
             return .rejected;
         }
     }
 
-    /// Return every lease `syncFlush` held to the WAL, as failed writes.
-    fn releaseHeld(self: *Coordinator, held: *std.ArrayList(jobqueue.Lease)) void {
-        for (held.items) |lease| {
-            var key_buf: [jobqueue.max_field_len]u8 = undefined;
-            const key = key_buf[0..lease.partition.len];
-            @memcpy(key, lease.partition);
-            self.flushFailed(key, lease);
+    /// True while a lease of `key` is held.
+    fn heldFor(self: *const Coordinator, key: []const u8) bool {
+        for (self.held.items) |h| {
+            if (std.mem.eql(u8, h.lease.partition, key)) return true;
         }
-        held.clearRetainingCapacity();
+        return false;
+    }
+
+    /// The write of `lease` (a record of `key`) reached the sink: ack it, in
+    /// key order. Every held lease of the key is older (the key's records
+    /// dequeue oldest first) and now superseded: those are acked first, never
+    /// written again. When an ack fails, it and every later one of the key are
+    /// held as `ack_failed` and retried by `drain`, so the WAL never keeps an
+    /// older record of a key whose newer one it no longer has. Returns whether
+    /// `lease` was acked (otherwise the key must not advance yet).
+    fn ackLanded(self: *Coordinator, key: []const u8, lease: jobqueue.Lease) bool {
+        var blocked = false;
+        var i: usize = 0;
+        while (i < self.held.items.len) {
+            const h = &self.held.items[i];
+            if (!std.mem.eql(u8, h.lease.partition, key)) {
+                i += 1;
+                continue;
+            }
+            if (!blocked) {
+                if (self.wal.ack(h.lease)) |_| {
+                    _ = self.held.orderedRemove(i);
+                    if (self.unflushed > 0) self.unflushed -= 1;
+                    continue;
+                } else |_| blocked = true;
+            }
+            h.kind = .ack_failed;
+            i += 1;
+        }
+        if (!blocked) {
+            if (self.wal.ack(lease)) |_| {
+                if (self.unflushed > 0) self.unflushed -= 1;
+                return true;
+            } else |_| {}
+        }
+        // Should even the held list refuse to grow, the record stays leased
+        // until a restart replays it, together with any older one of the key.
+        self.held.append(self.gpa, .{ .lease = lease, .kind = .ack_failed }) catch {};
+        return false;
+    }
+
+    /// True when an entry before `i` holds a lease of `key` (an older record).
+    fn heldBefore(self: *const Coordinator, i: usize, key: []const u8) bool {
+        for (self.held.items[0..i]) |h| {
+            if (std.mem.eql(u8, h.lease.partition, key)) return true;
+        }
+        return false;
+    }
+
+    /// Resolve held leases: retry the failed nacks and acks, and with
+    /// `sync_too` return the synchronous rejections of a `flushAll` pass to the
+    /// WAL as failed writes. A key's held leases go back oldest first, and a
+    /// key still holding one is not advanced (`flushFailed`).
+    fn releaseHeld(self: *Coordinator, sync_too: bool) void {
+        // Visit only the entries present now: a `nack` that fails again
+        // appends its lease at the end, for the next call.
+        var remaining = self.held.items.len;
+        var i: usize = 0;
+        while (remaining > 0) : (remaining -= 1) {
+            const h = self.held.items[i];
+            switch (h.kind) {
+                .rejected => if (!sync_too) {
+                    i += 1;
+                    continue;
+                },
+                .nack_failed => {},
+                .ack_failed => {
+                    // Oldest first per key: wait for an older held one.
+                    if (self.heldBefore(i, h.lease.partition)) {
+                        i += 1;
+                        continue;
+                    }
+                    self.wal.ack(h.lease) catch {
+                        i += 1;
+                        continue;
+                    };
+                    _ = self.held.orderedRemove(i);
+                    if (self.unflushed > 0) self.unflushed -= 1;
+                    continue;
+                },
+            }
+            _ = self.held.orderedRemove(i);
+            var key_buf: [jobqueue.max_field_len]u8 = undefined;
+            const key = key_buf[0..h.lease.partition.len];
+            @memcpy(key, h.lease.partition);
+            self.flushFailed(key, h.lease);
+        }
     }
 
     /// True while `key` waits out its retry backoff; drops a lapsed entry.
@@ -3507,4 +3647,442 @@ test "the synchronous path keeps the per-key retry deadlines exact: cleared on l
     try testing.expect(c.flushOneSync()); // lands through the synchronous path
     try testing.expectEqual(@as(usize, 0), c.retry_at.count());
     try testing.expectEqualStrings("1", rig.sink.get("m").?);
+}
+
+test "last-writer-wins: a rejected synchronous write is never retried over a newer record of its key (review F1)" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("A", "v1");
+        try c.put("A", "v2");
+        try c.put("B", "b");
+        c.deinitNoFlush();
+    }
+    const c = try openWith(&rig, &clk, .{});
+    defer c.deinit();
+    // Synchronous path: A's first record is rejected; the newer one must win.
+    try c.flushAll();
+    try testing.expectEqualStrings("v2", rig.sink.get("A").?);
+    try testing.expectEqualStrings("b", rig.sink.get("B").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "a refused pool submit is counted when the WAL dead-letters it (review F4)" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const c = try openWith(&rig, &clk, .{ .cap = 1 });
+    defer c.deinitNoFlush();
+    try c.put("k", "v");
+    c.pool.shutdownNow(); // every submit fails
+    c.drain();
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "a dispatch that fails on allocation is counted when the WAL dead-letters it (review F4)" {
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        var rig: FailRig = undefined;
+        rig.init(.{ .gpa = testing.allocator });
+        defer rig.deinit();
+        var clk: FakeClock = .{};
+        const c = try openWith(&rig, &clk, .{ .cap = 1, .flush_timeout_ns = 200 * std.time.ns_per_ms });
+        defer c.deinit();
+        try c.put("k", "v");
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        c.gpa = fa.allocator();
+        c.drain();
+        c.gpa = testing.allocator;
+        // Either the flush went out, or its single attempt was burnt by the
+        // failed dispatch and the record is dead-lettered: never left pending.
+        try c.flushAll();
+        try testing.expectEqual(@as(usize, 0), c.pendingCount());
+        const landed: usize = if (rig.sink.get("k") != null) 1 else 0;
+        try testing.expectEqual(@as(usize, 1), landed + c.poisonedCount());
+    }
+}
+
+test "a failed nack keeps the record held: no newer record of its key overtakes it (review F3)" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const c = try openWith(&rig, &clk, .{ .flush_timeout_ns = 2 * std.time.ns_per_s });
+    defer c.deinit();
+    try c.put("k", "v1");
+    try c.put("k", "v2");
+    c.drain(); // v1 to the pool; the sink rejects it
+    try waitCompletion(c);
+    // The harvest's nack fails (the WAL's next allocation): v1 stays leased.
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const wal_gpa = c.wal.gpa;
+    c.wal.gpa = fa.allocator();
+    c.drain();
+    c.wal.gpa = wal_gpa;
+    try testing.expect(fa.has_induced_failure);
+    try testing.expectEqual(@as(usize, 1), c.held.items.len);
+    // The same drain's kick did not dequeue v2 past it.
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+    try testing.expect(rig.sink.get("k") == null);
+    // The next drain nacks it again and starts it (v1, not v2).
+    c.drain();
+    try testing.expectEqual(@as(usize, 0), c.held.items.len);
+    try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.held.items.len);
+    try testing.expectEqualStrings("v2", rig.sink.get("k").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "a key with a held synchronous rejection is not started by the pool path, and a newer landed record supersedes it" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("A", "v1");
+        try c.put("A", "v2");
+        c.deinitNoFlush();
+    }
+    const c = try openWith(&rig, &clk, .{});
+    defer c.deinit();
+    try testing.expectEqual(Coordinator.SyncResult.held, c.syncFlush(true)); // v1 rejected, held
+    try c.addKeySet(&c.orphans, "A");
+    c.drain();
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount()); // A is blocked
+    try testing.expectEqual(Coordinator.SyncResult.landed, c.syncFlush(true)); // v2 lands
+    try testing.expectEqual(@as(usize, 0), c.held.items.len); // v1 superseded (acked)
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try c.flushAll();
+    try testing.expectEqualStrings("v2", rig.sink.get("A").?);
+    try testing.expectEqual(@as(usize, 2), rig.sink.seen);
+}
+
+test "a record dead-lettered while an older one of its key is held does not advance the key past it" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 2 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const c = try openWith(&rig, &clk, .{ .cap = 1 });
+    defer c.deinit();
+    try c.put("k", "v1");
+    try c.put("k", "v2");
+    try c.put("k", "v3");
+    c.drain(); // v1 to the pool, rejected
+    try waitCompletion(c);
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const wal_gpa = c.wal.gpa;
+    c.wal.gpa = fa.allocator();
+    c.drain(); // its nack fails: v1 held
+    c.wal.gpa = wal_gpa;
+    try testing.expectEqual(@as(usize, 1), c.held.items.len);
+    // The synchronous path takes v2 (v1 is leased), the sink rejects it, and
+    // the cap of 1 dead-letters it: v3 must still wait behind v1.
+    try testing.expect(!c.flushOneSync());
+    try testing.expectEqual(@as(usize, 1), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+    try c.flushAll();
+    try testing.expectEqualStrings("v3", rig.sink.get("k").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "acks go oldest first per key: a crash after a failed ack of a superseded record replays it before the newer one (a)" {
+    // The WAL must never keep an older record of a key whose newer one it no
+    // longer has: a restart would replay the old value over the new one.
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("A", "v1");
+        try c.put("A", "v2");
+        c.deinitNoFlush();
+    }
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try testing.expectEqual(Coordinator.SyncResult.held, c.syncFlush(true)); // v1 rejected
+        // v2 lands; the store's allocations fail from the second one on (the
+        // allocator stays failed), so exactly one of the two acks succeeds.
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+        const db_gpa = c.wal.db.gpa;
+        c.wal.db.gpa = fa.allocator();
+        try testing.expectEqual(Coordinator.SyncResult.landed, c.syncFlush(true));
+        c.wal.db.gpa = db_gpa;
+        try testing.expect(fa.has_induced_failure);
+        try testing.expectEqualStrings("v2", rig.sink.get("A").?);
+        c.deinitNoFlush(); // crash before any retry
+    }
+    rig.sink.fail_n = 0;
+    const c = try openWith(&rig, &clk, .{});
+    defer c.deinit();
+    try c.recover();
+    try testing.expectEqualStrings("v2", rig.sink.get("A").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "acks go oldest first per key: a failed ack on the pool path blocks the key until it is retried (b)" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("k", "v1");
+        try c.put("k", "v2");
+        c.drain(); // v1 to the pool
+        try waitCompletion(c);
+        // The harvest's ack of v1 fails: v2 must not go (and be acked) first.
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        const db_gpa = c.wal.db.gpa;
+        c.wal.db.gpa = fa.allocator();
+        c.drain();
+        c.wal.db.gpa = db_gpa;
+        try testing.expect(fa.has_induced_failure);
+        try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+        try testing.expectEqual(@as(usize, 2), c.pendingCount());
+        try testing.expectEqualStrings("v1", rig.sink.get("k").?);
+        c.deinitNoFlush(); // crash: both records are still in the WAL
+    }
+    const c = try openWith(&rig, &clk, .{});
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 2), c.pendingCount());
+    try c.recover();
+    try testing.expectEqualStrings("v2", rig.sink.get("k").?);
+    // And without a crash the retried ack lets the key move on.
+    try c.put("j", "w1");
+    try c.put("j", "w2");
+    c.drain();
+    try waitCompletion(c);
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const db_gpa = c.wal.db.gpa;
+    c.wal.db.gpa = fa.allocator();
+    c.drain();
+    c.wal.db.gpa = db_gpa;
+    try c.flushAll();
+    try testing.expectEqualStrings("w2", rig.sink.get("j").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "an ack that keeps failing ends flushAll and deinit at the deadline, the record kept in the WAL" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try openWith(&rig, &clk, .{ .flush_timeout_ns = 60 * std.time.ns_per_ms });
+        try c.put("k", "v");
+        c.drain();
+        try waitCompletion(c);
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        const db_gpa = c.wal.db.gpa;
+        c.wal.db.gpa = fa.allocator(); // the store's writes fail from here on
+        try testing.expectError(error.FlushIncomplete, c.flushAll());
+        try testing.expectEqual(@as(usize, 1), c.pendingCount());
+        try testing.expectEqual(@as(usize, 1), c.held.items.len);
+        c.deinit(); // bounded by the same deadline
+        _ = db_gpa;
+    }
+    const c = try openWith(&rig, &clk, .{});
+    defer c.deinit();
+    try testing.expectEqual(@as(usize, 1), c.pendingCount());
+    try c.recover();
+    try testing.expectEqualStrings("v", rig.sink.get("k").?);
+}
+
+/// Fails exactly one allocation (the `skip`-th after arming, 0-based) and
+/// forwards every other one. `std.testing.FailingAllocator` keeps failing
+/// after its first failure; the ack-order tests need an older ack to fail
+/// while a newer one succeeds.
+const OneShotFail = struct {
+    child: Allocator,
+    skip: usize,
+    fired: bool = false,
+
+    fn allocator(self: *OneShotFail) Allocator {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+    const vt = Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        if (!self.fired) {
+            if (self.skip == 0) {
+                self.fired = true;
+                return null;
+            }
+            self.skip -= 1;
+        }
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *OneShotFail = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+/// A reopened WAL holding `vals` as the records of key "A", in order.
+fn reopenWithRecords(rig: *FailRig, clk: *FakeClock, vals: []const []const u8) !*Coordinator {
+    {
+        const c = try openWith(rig, clk, .{});
+        for (vals) |v| try c.put("A", v);
+        c.deinitNoFlush();
+    }
+    return openWith(rig, clk, .{});
+}
+
+test "ack order: the newest landed record is acked only after every older one of its key" {
+    // Older held records are superseded by v3 and must be acked; v1's ack
+    // fails once. v3 must then stay in the WAL (held) and the key must not
+    // advance, so a crash replays v1 .. v3 and ends at v3.
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 2 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try reopenWithRecords(&rig, &clk, &.{ "v1", "v2", "v3", "v4" });
+        try testing.expectEqual(Coordinator.SyncResult.held, c.syncFlush(true)); // v1
+        try testing.expectEqual(Coordinator.SyncResult.held, c.syncFlush(true)); // v2
+        var os: OneShotFail = .{ .child = c.wal.db.gpa, .skip = 0 };
+        const db_gpa = c.wal.db.gpa;
+        c.wal.db.gpa = os.allocator();
+        try testing.expectEqual(Coordinator.SyncResult.landed, c.syncFlush(true)); // v3
+        c.wal.db.gpa = db_gpa;
+        try testing.expect(os.fired);
+        try testing.expectEqualStrings("v3", rig.sink.get("A").?);
+        // Nothing of A goes on (v4 waits), and every held entry is an ack now.
+        try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+        for (c.held.items) |h| try testing.expect(h.kind == .ack_failed);
+        // The retry: v1's ack fails once more, v2 and v3 must wait for it.
+        var os2: OneShotFail = .{ .child = c.wal.db.gpa, .skip = 0 };
+        c.wal.db.gpa = os2.allocator();
+        c.releaseHeld(false);
+        c.wal.db.gpa = db_gpa;
+        try testing.expect(os2.fired);
+        c.deinitNoFlush(); // crash
+    }
+    const c = try openWith(&rig, &clk, .{});
+    defer c.deinit();
+    // No ack went through out of order: all four records are still there.
+    try testing.expectEqual(@as(usize, 4), c.pendingCount());
+    try c.recover();
+    try testing.expectEqualStrings("v4", rig.sink.get("A").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "ack order: a superseded record whose ack fails is never written again" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator, .fail_n = 1 });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const c = try reopenWithRecords(&rig, &clk, &.{ "v1", "v2" });
+    defer c.deinit();
+    try testing.expectEqual(Coordinator.SyncResult.held, c.syncFlush(true)); // v1 rejected
+    var os: OneShotFail = .{ .child = c.wal.db.gpa, .skip = 0 };
+    const db_gpa = c.wal.db.gpa;
+    c.wal.db.gpa = os.allocator();
+    try testing.expectEqual(Coordinator.SyncResult.landed, c.syncFlush(true)); // v2; v1's ack fails
+    c.wal.db.gpa = db_gpa;
+    try c.flushAll();
+    try testing.expectEqualStrings("v2", rig.sink.get("A").?);
+    try testing.expectEqual(@as(usize, 2), rig.sink.seen); // v1 never rewritten
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "ack order: a pool flush handed on by the synchronous path continues after its held ack" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const c = try reopenWithRecords(&rig, &clk, &.{ "v1", "v2", "v3" });
+    defer c.deinit();
+    try testing.expect(c.flushOneSync()); // v1; v2 goes to the pool
+    try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+    try waitCompletion(c);
+    var os: OneShotFail = .{ .child = c.wal.db.gpa, .skip = 0 };
+    const db_gpa = c.wal.db.gpa;
+    c.wal.db.gpa = os.allocator();
+    c.drain(); // v2's ack fails: held, the key waits
+    c.wal.db.gpa = db_gpa;
+    try testing.expect(os.fired);
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+    c.drain(); // the ack is retried and the key (not in the cache) moves on to v3
+    try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+    try c.flushAll();
+    try testing.expectEqualStrings("v3", rig.sink.get("A").?);
+}
+
+test "ack order: a synchronous landing whose ack is held lets drain() continue the key" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const c = try reopenWithRecords(&rig, &clk, &.{ "v1", "v2" });
+    defer c.deinit();
+    var os: OneShotFail = .{ .child = c.wal.db.gpa, .skip = 0 };
+    const db_gpa = c.wal.db.gpa;
+    c.wal.db.gpa = os.allocator();
+    try testing.expectEqual(Coordinator.SyncResult.landed, c.syncFlush(false)); // v1, ack held
+    c.wal.db.gpa = db_gpa;
+    try testing.expectEqual(@as(usize, 0), c.inFlightCount());
+    c.drain(); // ack retried; the key moves on to v2 through the pool
+    try testing.expectEqual(@as(usize, 1), c.inFlightCount());
+    try c.flushAll();
+    try testing.expectEqualStrings("v2", rig.sink.get("A").?);
+}
+
+test "ack order: recover() holds a failed ack instead of acking the newer record past it" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    {
+        const c = try reopenWithRecords(&rig, &clk, &.{ "v1", "v2" });
+        var os: OneShotFail = .{ .child = c.wal.db.gpa, .skip = 0 };
+        const db_gpa = c.wal.db.gpa;
+        c.wal.db.gpa = os.allocator();
+        try c.recover(); // v1's ack fails; v2 lands, its ack retries v1's first
+        c.wal.db.gpa = db_gpa;
+        try testing.expect(os.fired);
+        c.deinitNoFlush();
+    }
+    const c = try openWith(&rig, &clk, .{});
+    defer c.deinitNoFlush();
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqualStrings("v2", rig.sink.get("A").?);
+}
+
+test "a held ack is retried as an ack, never as a nack (no attempt burnt on a landed record)" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const c = try openWith(&rig, &clk, .{ .cap = 1 });
+    defer c.deinit();
+    try c.put("k", "v");
+    c.drain();
+    try waitCompletion(c);
+    var os: OneShotFail = .{ .child = c.wal.db.gpa, .skip = 0 };
+    const db_gpa = c.wal.db.gpa;
+    c.wal.db.gpa = os.allocator();
+    c.drain(); // the ack fails: held
+    c.wal.db.gpa = db_gpa;
+    try testing.expect(os.fired);
+    try c.flushAll();
+    try testing.expectEqual(@as(usize, 0), c.wal.deadLetterCount());
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen);
 }
