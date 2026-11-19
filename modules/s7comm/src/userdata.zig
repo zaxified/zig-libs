@@ -582,6 +582,8 @@ test "date-time encodes to the 10-octet BCD form and back" {
     const e2 = try old.encode(&buf);
     try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x19, 0x99, 0x12, 0x31, 0, 0, 0, 0, 0 }, e2);
     try testing.expectEqual(@as(u16, 1999), (try DateTime.decode(e2)).year);
+    const y2000 = try (DateTime{ .year = 2000, .month = 1, .day = 1 }).encode(&buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x20, 0x00 }, y2000[0..3]);
     // Boundaries of the year split: 89 -> 2089, 90 -> 1990.
     try testing.expectEqual(@as(u16, 2089), (try DateTime.decode(&[_]u8{ 0, 0x20, 0x89, 1, 1, 0, 0, 0, 0, 0 })).year);
     try testing.expectEqual(@as(u16, 1990), (try DateTime.decode(&[_]u8{ 0, 0x19, 0x90, 1, 1, 0, 0, 0, 0, 0 })).year);

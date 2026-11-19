@@ -202,6 +202,12 @@ const PairedTransport = struct {
     queue_pos: usize = 0,
     /// Requests the responder refused, so a test can assert on them.
     failures: usize = 0,
+    /// Test hooks: copy of the last request, and one reply octet overwritten
+    /// after the responder produced it (offset into the reply TPKT).
+    last_req: [64]u8 = undefined,
+    last_req_len: usize = 0,
+    tamper_at: usize = 0,
+    tamper_val: ?u8 = null,
 
     fn seam(self: *PairedTransport) Transport {
         return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
@@ -219,6 +225,8 @@ const PairedTransport = struct {
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
         const self: *PairedTransport = @ptrCast(@alignCast(ctx));
+        self.last_req_len = @min(bytes.len, self.last_req.len);
+        @memcpy(self.last_req[0..self.last_req_len], bytes[0..self.last_req_len]);
         const reply = self.responder.handle(bytes, &self.out) catch {
             self.failures += 1;
             return;
@@ -226,6 +234,7 @@ const PairedTransport = struct {
         const r = reply orelse return;
         if (self.queue_len + r.len > self.queue.len) return error.WriteFailed;
         @memcpy(self.queue[self.queue_len..][0..r.len], r);
+        if (self.tamper_val) |v| self.queue[self.queue_len + self.tamper_at] = v;
         self.queue_len += r.len;
     }
 };
@@ -328,6 +337,65 @@ test "round trip: read and set the CPU clock through the injected clock" {
     try c2.connect();
     try testing.expectError(error.PlcError, c2.readClock());
     try testing.expectError(error.PlcError, c2.setClock(t));
+}
+
+test "clock client: not connected, request bytes, and every reply-shape check" {
+    const Ck = struct {
+        fn now(_: ?*anyopaque) DateTime {
+            return .{ .year = 2026, .month = 11, .day = 19, .hour = 13, .minute = 45, .second = 59, .millisecond = 987, .weekday = 5 };
+        }
+        fn set(_: ?*anyopaque, _: DateTime) void {}
+    };
+    var r = Responder.init(.{ .clock = .{ .now = Ck.now, .set = Ck.set } }, &.{});
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    const t = Ck.now(null);
+    try testing.expectError(error.NotConnected, c.readClock());
+    try testing.expectError(error.NotConnected, c.setClock(t));
+    try c.connect();
+
+    // The requests, byte for byte (userdata group 7, subfunction 1 and 2).
+    _ = try c.readClock();
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0x00, 0x01, 0x12, 0x04, 0x11, 0x47, 0x01, 0x00, // parameters
+        0x0A, 0x00, 0x00, 0x00, // data: object does not exist, no payload
+    }, paired.last_req[17..29]);
+    try c.setClock(t);
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0x00, 0x01, 0x12, 0x04, 0x11, 0x47, 0x02, 0x00,
+        0xFF, 0x09, 0x00, 0x0A, 0x00, 0x20, 0x26, 0x11,
+        0x19, 0x13, 0x45, 0x59, 0x98, 0x75,
+    }, paired.last_req[17..39]);
+
+    // One reply octet damaged at a time (offsets into the reply TPKT: 8 = ROSCTR,
+    // 22 = type|group, 23 = subfunction, 29 = data return code).
+    const Case = struct { at: usize, val: u8 };
+    const bad = [_]Case{
+        .{ .at = 8, .val = 0x01 },
+        .{ .at = 22, .val = 0x47 }, // request, not response
+        .{ .at = 22, .val = 0x84 }, // another function group
+        .{ .at = 23, .val = 0x02 }, // another subfunction
+    };
+    for (bad) |cs| {
+        paired.tamper_at = cs.at;
+        paired.tamper_val = cs.val;
+        try testing.expectError(error.UnexpectedReply, c.readClock());
+    }
+    paired.tamper_at = 29;
+    paired.tamper_val = 0x0A;
+    try testing.expectError(error.ItemError, c.readClock());
+    try testing.expectError(error.ItemError, c.setClock(t));
+    paired.tamper_at = 22;
+    paired.tamper_val = 0x47;
+    try testing.expectError(error.UnexpectedReply, c.setClock(t));
+    paired.tamper_val = null;
+    // The error code of the parameters (octets 27, 28).
+    paired.tamper_at = 28;
+    paired.tamper_val = 0x01;
+    try testing.expectError(error.PlcError, c.readClock());
+    paired.tamper_val = null;
+    _ = try c.readClock();
 }
 
 test "round trip: an odd-length multi-item write pads the way the wire needs" {

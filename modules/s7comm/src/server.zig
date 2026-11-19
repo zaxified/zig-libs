@@ -739,6 +739,25 @@ test "clock services refuse politely: no clock, read-only clock, malformed date-
     try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, u[27..29]);
 }
 
+test "clock responder: alternate set subfunction, sequence echo, a clock that returns garbage" {
+    var tc: TestClock = .{};
+    var r = Responder.init(.{ .clock = .{ .ctx = &tc, .now = TestClock.now, .set = TestClock.set } }, &.{});
+    var req: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    // Subfunction 0x04 (set clock, alternate) with sequence number 7.
+    const rep = (try r.handle(hex("0300002702f0803207000004000008000e0001120411470407" ++ "ff09000a00202611191345599875", &req), &out)).?;
+    try testing.expectEqual(@as(usize, 1), tc.sets);
+    try testing.expectEqual(@as(u8, 0x04), rep[23]);
+    try testing.expectEqual(@as(u8, 0x07), rep[24]);
+    try testing.expectEqual(@as(u8, 0xFF), rep[29]);
+    // A clock callback that hands back an invalid date-time: error response,
+    // hardware fault return code, no panic.
+    tc.now_value.month = 13;
+    const bad = (try r.handle(hex(read_clock_req, &req), &out)).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, bad[27..29]);
+    try testing.expectEqual(@as(u8, 0x01), bad[29]);
+}
+
 test "a Read Var item with count 0 on the bit path does not index past the area" {
     // Regression, wave-2 W2-02. `payloadBytes()` returns `(count + 7) / 8`, so a
     // `.bit` item with `count == 0` wants ZERO octets and the guard
