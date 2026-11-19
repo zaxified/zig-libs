@@ -3141,6 +3141,35 @@ test "Subscription offline scripted: a ModifyMonitoredItems answer whose result 
     try testing.expect(sub.findMonitoredItem(10) == null);
 }
 
+test "Subscription offline scripted: a CreateMonitoredItems answer with fewer results than items, or none, is refused and creates no bookkeeping" {
+    const testing = std.testing;
+    var server_buf: [8192]u8 = undefined;
+    var server_w: std.Io.Writer = .fixed(&server_buf);
+    const item: services.MonitoredItemCreateResult = .{ .status_code = 0, .monitored_item_id = 100, .revised_sampling_interval = 1, .revised_queue_size = 1, .filter_result = services.no_filter };
+    const Resp = services.CreateMonitoredItemsResponse;
+    const enc = services.encodeCreateMonitoredItemsResponse;
+    const tid = services.type_id.create_monitored_items_response;
+    const one = [_]services.MonitoredItemCreateResult{item};
+    try renderFrame(&server_w, 1, Resp, .{ .response_header = scripted_header, .results = &one, .diagnostic_infos = null }, enc, tid);
+    try renderFrame(&server_w, 2, Resp, .{ .response_header = scripted_header, .results = null, .diagnostic_infos = null }, enc, tid);
+
+    var client_out_buf: [4096]u8 = undefined;
+    var client_out_w: std.Io.Writer = .fixed(&client_out_buf);
+    var client_in_r: std.Io.Reader = .fixed(server_w.buffered());
+    var conn = transport.Connection.init(&client_in_r, &client_out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator, .channel_id = 7, .token_id = 3 } };
+    var session: Session = .{ .channel = &ch, .allocator = testing.allocator, .authentication_token = services.null_node_id };
+    var sub: Subscription = .{ .session = &session, .allocator = testing.allocator, .subscription_id = 1 };
+    defer sub.deinit();
+    const specs = [_]Subscription.MonitoredItemSpec{
+        .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2258 } }, .client_handle = 10 },
+        .{ .node_id = .{ .numeric = .{ .namespace = 0, .id = 2259 } }, .client_handle = 11 },
+    };
+    try testing.expectError(error.ResultCountMismatch, sub.createMonitoredItems(&specs, .both));
+    try testing.expectError(error.ResultCountMismatch, sub.createMonitoredItems(&specs, .both));
+    try testing.expectEqual(@as(usize, 0), sub.monitored_items.items.len);
+}
+
 test "secure offline scripted: open and renew refuse a zero lifetime and any server nonce that is not 32 bytes, state untouched; a 1 ms lifetime is taken but renews no sooner than the floor" {
     const testing = std.testing;
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(45)));

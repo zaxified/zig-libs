@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the review fixes (15 mutants: 14 killed, 1 unobservable heap-wipe), one more scripted-peer test (short and absent `CreateMonitoredItems` results); the card counts are now 900/977 (cumulative), `src` re-pinned.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the result-count check of `createMonitoredItems`/`modifyMonitoredItems` reads the count with an explicit `if` instead of `orelse &.{}` (same value; the `orelse` form does not survive a mutation switch around it).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the decoded server nonce of an OpenSecureChannel answer is now zeroed by a `defer` on every way out of the exchange (before, only on the success path; the wrong-channel-id and other early refusals freed it unwiped). The code change landed in the preceding LOW-1 documentation commit; this entry records it (review LOW-2).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** documentation: `MonitoredItemModifySpec.client_handle` uniqueness stays the caller's duty and is not enforced (open62541's client assigns handles itself and does not enforce caller-chosen ones either). Review LOW-6.
