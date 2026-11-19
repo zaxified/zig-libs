@@ -198,11 +198,20 @@ existing NOTICE for the vendored documentation excerpt is unrelated and unaffect
   writes the exemplar the same way (measured 2026-10-18 with `tools/go_golden` plus such a
   counter); **L8** (`droppedInserts` under-reporting) — no longer true, it counts every value a
   stream lost; **L9** (a collector's error collapsed into `WriteFailed`) — `Registry.lastCollectorError()`.
-- **Registration's suffix guard is narrower than the collector's** *(found by the 2026-10-18 mutation
-  run)*: `checkSuffixCollisionLocked` guards only a histogram's `_bucket`/`_sum`/`_count`, while
-  `registerCollector`'s `derivedCollision` also guards a summary's `_sum`/`_count`. client_golang accepts
-  both; a summary `s` next to a family `s_count` gives a scrape Prometheus refuses. Make the two agree
-  (the stricter one). Effort S.
+- ~~**Registration's suffix guard is narrower than the collector's**~~ *(found by the 2026-10-18
+  mutation run)* — DONE 2026-11-19. The summary half was fixed 2026-10-25 (audit M1); what was
+  left was `registerCollector`'s own `derivedCollision`, which guarded `_bucket`/`_sum`/`_count`
+  for a summary too. Both paths now take the one per-kind set (`Registry.derivedSuffixes`:
+  histogram `_bucket`/`_sum`/`_count`, summary `_sum`/`_count`; counter and gauge derive nothing).
+  **Decision (owner rule, reference = client_golang):** the exact set of sample names a family
+  writes, not a stricter one — a summary writes no `_bucket`, so `s` beside `s_bucket` is
+  accepted on both paths (client_golang refuses only what `Gather` finds duplicated;
+  `go_register_test` pins it). Considered and rejected: a counter `x_total` vs a family `x`
+  (OpenMetrics announces the counter as family `x`): client_golang's registry accepts the pair
+  (`go_register_vectors`, histogram `h` + counter `h_total`) and so do we; client_python's
+  registry (`Counter._get_names`: `x`, `x_total`, `x_created`) would refuse it, the Go reference
+  wins. No `info` kind and no `_created` samples exist here. Tests: `sweep_test.zig`, every
+  kind x suffix on the collector and the registry path.
 - **Still open from that review's follow-ups:** `_created` samples (client_golang's default is
   none, so not a parity gap), VictoriaMetrics/metrics as the bench's `fastest`, a Go differential of
   the process collector's values.

@@ -1791,10 +1791,11 @@ pub const GaugeVec = Vec(.gauge);
 pub const HistogramVec = Vec(.histogram);
 pub const SummaryVec = Vec(.summary);
 
-/// Whether `h` (a histogram or summary) would emit a sample named like `x`.
+/// Whether `h` (a histogram or summary) would emit a sample named like `x`
+/// (the same exact set `Registry.checkSuffixCollisionLocked` guards: a
+/// histogram's `_bucket`/`_sum`/`_count`, a summary's `_sum`/`_count`).
 fn derivedCollision(h: Desc, x: Desc) bool {
-    if (h.kind != .histogram and h.kind != .summary) return false;
-    const suffixes = [_][]const u8{ "_bucket", "_sum", "_count" };
+    const suffixes = Registry.derivedSuffixes(h.kind) orelse return false;
     for (suffixes) |suf| {
         if (x.name.len == h.name.len + suf.len and std.mem.startsWith(u8, x.name, h.name) and std.mem.endsWith(u8, x.name, suf)) return true;
     }
