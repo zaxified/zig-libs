@@ -1832,6 +1832,8 @@ test "release: no attempt counted, never dead-letters, keeps its place in the pa
         // Still the partition's oldest, still its first attempt.
         try testing.expectEqual(a, l.id);
         try testing.expectEqual(@as(u32, 1), l.attempt);
+        // No spare room in the schedule heap: `release` must reserve it.
+        q.pending.items.clearAndFree(testing.allocator);
         try q.release(l, .{});
         try testing.expectEqual(@as(?Status, .ready), q.status(a));
         try testing.expectEqual(@as(usize, 2), q.readyCount());
@@ -1890,6 +1892,7 @@ test "release: a delay hides the job and survives a reopen; no delay writes noth
         const id = try q.enqueue("t", "x", .{ .unique_key = "u" });
         const before = (try q.db.get(testing.allocator, jobKey(&kb, @backingInt(id)))).?;
         defer testing.allocator.free(before);
+        h.wall.advance(one_ms); // a rewritten `run_at` would differ from the stored one
         try q.release((try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?, .{});
         const after = (try q.db.get(testing.allocator, jobKey(&kb, @backingInt(id)))).?;
         defer testing.allocator.free(after);
@@ -1919,6 +1922,10 @@ test "release: a delay hides the job and survives a reopen; no delay writes noth
         if (q.release(l, .{ .delay_ns = 5 * one_ms })) |_| return error.TestUnexpectedResult else |_| {}
         try testing.expectEqual(@as(?Status, .leased), q.status(id));
         try q.extendLease(l, one_ms); // still the current lease
+        // Its schedule was rolled back too: released without a delay (no
+        // storage write), it is visible at once.
+        try q.release(l, .{});
+        try testing.expectEqual(@as(?Status, .ready), q.status(id));
     }
     h.sim.reboot();
     var q = try h.openQueue();

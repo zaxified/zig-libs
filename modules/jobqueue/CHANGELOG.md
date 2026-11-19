@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of `release` (10 mutants: 9 killed, 1 equivalent); two release tests sharpened (a rewritten `run_at` and a skipped slot reservation are now observable); card cumulative.
 - **2026-11-19** — New: `Queue.release(lease, .{ .delay_ns })` (+ `ReleaseOptions`) hands a lease back without counting an attempt — the job keeps its attempts and its place in the partition FIFO, never dead-letters and keeps its unique key; a delay is persisted like a `nack` backoff, no delay writes nothing. A released, reaped, acked or forged lease is `error.StaleLease`, as for `ack`/`nack`. Additive; existing calls unchanged.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: lease release without counting an attempt (requested by writebehind).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** 2026-11-17: SPEC backlog: marked dead-letter requeue/cancel, lease extension, unique jobs done (already implemented). No code change.

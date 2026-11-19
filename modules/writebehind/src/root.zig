@@ -3698,10 +3698,12 @@ test "back-pressure does not retry a key early: its synchronous backstop waits f
 }
 
 /// A reopened WAL holding `puts` (key, value) in order: none of its keys is
-/// cache-dirty, so only the synchronous backstop reaches them.
+/// cache-dirty, so only the synchronous backstop reaches them. The records
+/// are written with `o.cap` (a record keeps the attempt cap it was enqueued
+/// with).
 fn reopenWithPuts(rig: *FailRig, clk: *FakeClock, puts: []const [2][]const u8, o: OpenWith) !*Coordinator {
     {
-        const c = try openWith(rig, clk, .{});
+        const c = try openWith(rig, clk, .{ .cap = o.cap });
         for (puts) |kvp| try c.put(kvp[0], kvp[1]);
         c.deinitNoFlush();
     }
@@ -3736,7 +3738,7 @@ test "F5b: a key waiting out its retry backoff no longer stalls the synchronous 
     try testing.expectEqual(@as(usize, 0), c.wal.leasedCount());
     try testing.expectEqual(@as(usize, 0), c.skipped.items.len);
     try testing.expectEqual(@as(usize, 0), c.held.items.len);
-    try testing.expectEqual(@as(usize, 0), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.wal.deadLetterCount());
     // Once the wait is over, "a" lands in WAL order: the newer value wins.
     _ = clk.ns.fetchAdd(hour + 1, .monotonic);
     try c.flushAll();
@@ -3795,7 +3797,38 @@ test "F5b: a pass-over whose release fails is held, blocks its key and is releas
     try testing.expectEqual(@as(usize, 0), c.wal.leasedCount());
     try c.flushAll();
     try testing.expectEqualStrings("1", rig.sink.get("a").?);
-    try testing.expectEqual(@as(usize, 0), c.poisonedCount());
+    try testing.expectEqual(@as(usize, 0), c.wal.deadLetterCount());
+}
+
+test "F5b: a held release that fails again does not hold up the held entries after it" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const c = try reopenWithPuts(&rig, &clk, &.{ .{ "a", "1" }, .{ "b", "2" } }, .{ .cap = 1 });
+    defer c.deinit();
+    const la = (try c.wal.dequeue(.{ .visibility_timeout_ns = std.time.ns_per_s })).?;
+    const lb = (try c.wal.dequeue(.{ .visibility_timeout_ns = std.time.ns_per_s })).?;
+    c.wal.pending.items.clearAndFree(c.wal.gpa);
+    const wal_gpa = c.wal.gpa;
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    c.wal.gpa = fa.allocator();
+    c.releaseOne(la);
+    c.releaseOne(lb);
+    c.wal.gpa = wal_gpa;
+    try testing.expectEqual(@as(usize, 2), c.held.items.len);
+    // "a"'s release fails once more; "b"'s, after it in the list, goes through.
+    var os: OneShotFail = .{ .child = wal_gpa, .skip = 0 };
+    c.wal.gpa = os.allocator();
+    c.releaseHeld(false);
+    c.wal.gpa = wal_gpa;
+    try testing.expect(os.fired);
+    try testing.expectEqual(@as(usize, 1), c.held.items.len);
+    try testing.expectEqualStrings("a", c.held.items[0].lease.partition);
+    try c.flushAll();
+    try testing.expectEqualStrings("1", rig.sink.get("a").?);
+    try testing.expectEqualStrings("2", rig.sink.get("b").?);
+    try testing.expectEqual(@as(usize, 0), c.wal.deadLetterCount());
 }
 
 test "F5b: no room to pass a waiting key over ends the synchronous pass with its lease returned" {

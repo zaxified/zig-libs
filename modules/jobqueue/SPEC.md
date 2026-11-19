@@ -6,7 +6,7 @@
 
 **Scope:** core — Sidekiq (Ruby; lease/retry/dead-queue model) with Asynq as the closest embeddable peer (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (23/23) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (32/33, 1 eq) · src ded528db3ea2f011
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — job persistence (keyword review, 2026-10-07)
 
@@ -163,6 +163,16 @@ with a random delay, which must never dead-letter). **Mutation 2026-10-04:** 23 
 (schemata, ReleaseSafe), 3 survived the first run, each killed by a crafted-record test with its
 reason (a keyless v2 record; a dead record with `max_attempts` 0; two live jobs with one key in a
 store); 0 surviving. The dependent `writebehind` passes its modtest.
+
+**Delta mutation 2026-11-19 (`release`).** 10 mutants over the new `release` (schemata, ReleaseSafe,
+baseline first): validation skipped, the ready-slot reservation skipped, the delay test forced
+true / false, the delay not added, the rollback of `run_at` and the error return after a failed
+persist skipped, the lease not removed, the epoch not bumped, the commit skipped. 9 killed (the
+reservation by `appendAssumeCapacity`'s assertion, with a test that takes the schedule heap's
+spare room away first), 1 EQUIVALENT: not bumping the epoch — `leased.remove` alone already makes
+the released lease stale (`validate` needs the id leased), and the next `dequeue` bumps the epoch
+itself before it hands out a new lease. Card cumulative: 23 + 10 mutants, 23 + 9 killed, 1
+equivalent.
 
 ## Backlog / deferred
 
