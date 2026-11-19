@@ -96,6 +96,29 @@ SAv5/SAv6 asymmetric update-key change (g120 v8/v10–v15: RSA/DSA +
 certificates) is out of scope — see `sa.zig`'s doc comment and SPEC.md for
 exactly what is implemented and validated against what.
 
+**Secure Authentication in the outstation — `secure_auth` (opt-in):** attach a
+caller-owned `SecureAuth` and the outstation challenges critical requests
+(g120v1), executes them only after a g120v2 reply whose MAC verifies in
+constant time, accepts aggressive mode (g120v3 … g120v9), answers session-key
+status requests and key changes (g120v4/v5/v6), and reports failures with
+g120v7. Without it nothing changes.
+
+```zig
+const dnp3 = @import("dnp3");
+const sa = dnp3.secure_auth;
+
+var users = [_]sa.User{.{ .number = 1, .update_key = &update_key }}; // 16 octets for AES-128 key wrap
+var pending: [2048]u8 = undefined; // holds a challenged request until its reply
+var auth = sa.SecureAuth.init(.{}, &users, .{ .ctx = &rng, .fill = fillRandom }, &pending);
+station.setSecureAuth(&auth); // station: dnp3.outstation.Outstation
+```
+
+`Config.critical` is the set of challenged function codes (default: every
+request that changes outputs, configuration or running state; `with`/`without`
+override it). Randomness for challenge data comes from the caller's
+`RandomSource`; time is the outstation's injected `now_ms`. Wire interop with a
+foreign SA master is unproven (no SA peer exists to test against); see SPEC.md.
+
 ## Deferred
 
 Honest list of what this module does **not** do:
@@ -105,9 +128,10 @@ Honest list of what this module does **not** do:
 - **File transfer (g70), data sets (g85–g88), device attributes (g0), octet
   strings (g110/g111), time-and-interval (g50v4), analog deadbands (g34),
   time-synchronisation with delay compensation (g50v2/g51).**
-- **Secure Authentication integration.** `sa.zig` is a complete SAv2
-  symmetric codec, but nothing in `outstation.zig` wraps a fragment in g120
-  objects yet.
+- **Secure Authentication: asymmetric update-key change (SAv5/SAv6), the
+  g121/g122 security-statistic objects on the wire, and authenticated
+  responses in the monitoring direction.** The outstation integration covers
+  the symmetric procedures only; statistics are counted in memory.
 - **Data-link confirmed user data.** The outstation answers RESET_LINK_STATES,
   TEST_LINK_STATES and REQUEST_LINK_STATUS, and accepts both confirmed and
   unconfirmed user data, but always sends its own frames as *unconfirmed*

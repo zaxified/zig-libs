@@ -6,7 +6,7 @@
 
 **Scope:** mvp — opendnp3 3.1.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-02 · mutation 2026-10-05 (37/38, 1 eq) · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-19 (103/106, 3 eq) · src ac00bcc8b5666066
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, DNP3_FUZZ: `dnp3-fragment` and `dnp3-session` over the structured hostile-field generator, plus damaged genuine reads and damaged link frames; `dnp3-sa` Secure Authentication wrap / MAC / g120 objects as an oracle) · ct 2026-10-10 (ctgrind: SA session key through every MAC + reply MAC 0; update/session keys through key wrap 2 = aeskw integrity verdict)
 **Performance:** not measured
@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [nblair2/go-dnp3](https://github.com/nblair2/go-dnp3) | Go | MPL-2.0 | 1 | push 2026-09-26 | Small Go library (red-team tooling context, *inferred*); not read. |
 | Zig ecosystem | — | — | — | — | `gh search repos dnp3 --language=zig` found nothing besides zig-libs itself. |
 
-**Where we are ahead:** the only permissively licensed (MIT), no-libc, allocation-free DNP3 that runs with no runtime: unlike opendnp3 (EOL) it is maintained, unlike stepfunc it can be used commercially; the only Zig implementation; SAv2 symmetric g120 codecs are present; outstation behaviour (SBO bound to the arming peer, event ring, fragmentation) is tested against opendnp3 demos. **Where we are behind:** no stateful master (poll scheduler, task queue, timeouts), no outstation-side SA integration, no file transfer/data sets/device attributes, no channel handling (TCP/serial/TLS is the caller's, by design) (→ Backlog items).
+**Where we are ahead:** the only permissively licensed (MIT), no-libc, allocation-free DNP3 that runs with no runtime: unlike opendnp3 (EOL) it is maintained, unlike stepfunc it can be used commercially; the only Zig implementation; SAv2 symmetric g120 codecs are present; outstation behaviour (SBO bound to the arming peer, event ring, fragmentation) is tested against opendnp3 demos. **Where we are behind:** no stateful master (poll scheduler, task queue, timeouts), Secure Authentication only symmetric and only in the outstation, no file transfer/data sets/device attributes, no channel handling (TCP/serial/TLS is the caller's, by design) (→ Backlog items).
 
 ## Design & invariants
 
@@ -81,6 +81,11 @@ Six allocation-free layers, all offline-testable, mirroring IEEE 1815-2012's own
   Everything time-dependent — the select-before-operate window, the confirm timeout — is driven by
   an injected `now_ms` or by an explicit `confirmTimedOut()` call; the module owns no clock and
   spawns no thread.
+- `secure_auth`: opt-in Secure Authentication for the outstation (see "Secure Authentication
+  integration" below). `Outstation.handleFrom` hands every request fragment to an attached
+  `SecureAuth` before dispatching it; the answer is `pass` (dispatch as before), `silent`, an
+  AUTHENTICATE_RESPONSE fragment, or `execute` (dispatch an authenticated request). With no
+  `SecureAuth` attached the hook is never entered.
 
 Concurrency: `.reentrant` for the codecs — every type (`Segmenter`, `Reassembler`,
 `FrameReceiver`, `records`) is caller-owned with no shared/global state; `Outstation`/`Session` are
@@ -190,6 +195,11 @@ authorising the peer remains the caller's job (or DNP3-SA's). Serving several ma
 means one `Outstation` per association over a shared point database, which is what both reference
 stacks do.
 
+With `secure_auth` attached, critical requests are authenticated before they run: a failed
+authentication never executes the request, the outstanding challenge is consumed by any reply
+(good or bad) so a failed attempt leaves nothing a replay could use, every MAC comparison is the
+constant-time one in `sa.mac`, and challenge / aggressive-mode sequence numbers only move forward.
+
 Four fuzz harnesses back this: two 20 000-iteration loops over uniformly random bytes (application
 fragments, link frames through a `Session`), and two over *structured* draws — function code,
 group/variation, qualifier, and range fields drawn from the boundary values of each field's
@@ -202,8 +212,8 @@ Out of scope: unsolicited *retry* policy (the fragment builder is here, the time
 file-transfer objects (g70), data-set objects (g85-g88), device attributes (g0), octet strings
 (g110/g111), time-and-interval (g50v4), analog deadbands (g34), data-link *confirmed* user data on
 the send path (the outstation always sends unconfirmed user data; the FCB/FCV toggle is decoded but
-not enforced), Secure Authentication integration into the outstation (`sa.zig` is a standalone
-codec), a stateful master session type, and any actual transport (TCP/serial) I/O — this module
+not enforced), Secure Authentication beyond the outstation's symmetric procedures (see its own
+section), a stateful master session type, and any actual transport (TCP/serial) I/O — this module
 hands the caller bytes to send/receive, nothing more.
 
 ## g120 Secure Authentication — SAv2 symmetric core
@@ -243,6 +253,77 @@ primitives underneath (AES-KW, HMAC truncation, GMAC) are KAT-exact.
 **Out of scope:** the SAv5/SAv6 asymmetric update-key change (g120 v8/v10–v15: RSA/DSA-signed
 remote update-key change, user certificates, user-status change), and the DNP3-specific AES-GMAC IV
 derivation (the GMAC primitive is provided and KAT-validated; the caller supplies the 12-octet IV).
+
+## Secure Authentication integration (outstation)
+
+`secure_auth.zig` drives the IEEE 1815-2012 §7 (SAv5) **symmetric** procedures on the outstation
+side over the `sa.zig` codecs. It is opt-in (`Outstation.setSecureAuth`) and holds bounded state
+only: one outstanding challenge, one key-change window, one stored critical request in
+caller-owned storage. It is clock-injected (the outstation's `now_ms`) and takes its challenge
+randomness from a caller `RandomSource`. It does no I/O and no allocation.
+
+**Reference check.** The owner rule asks for the reference's behaviour first. That check could
+not be made in this pass: the reference (opendnp3) dropped SA from its current releases, the
+older SA branch was not available locally, and the web lookup was refused by the agent's tooling.
+There is also no SA-capable peer in this repository. The behaviour below is therefore read from
+the standard's procedure as the `sa.zig` codecs encode it, and each choice that could differ
+from a foreign implementation is listed as an open question in the Backlog. Wire interop with a
+foreign SA master is **unproven**.
+
+Behaviour, and why:
+
+- **Critical requests** (`Config.critical`, a 256-bit `FunctionSet`; default
+  `FunctionSet.default_critical` = WRITE, SELECT, OPERATE, DIRECT_OPERATE(+NR), COLD/WARM_RESTART,
+  INITIALIZE_DATA/APPLICATION, START/STOP_APPLICATION, SAVE_CONFIGURATION, ENABLE/
+  DISABLE_UNSOLICITED, ASSIGN_CLASS, OPEN/CLOSE/DELETE_FILE, ACTIVATE_CONFIG). These are the
+  requests that change outputs, configuration or running state. READ, CONFIRM, the freezes,
+  DELAY_MEASURE and RECORD_CURRENT_TIME are left out, as the optional rows of the standard's
+  critical-function table. The caller overrides the set with `with`/`without`.
+- **Challenge**: a critical request is stored, not run. The answer is AUTHENTICATE_RESPONSE (0x83,
+  FIR+FIN, no CON) carrying g120v1: CSQ = previous + 1, user `Config.challenge_user` (default 1,
+  the standard's default user), the configured MAC algorithm (default HMAC-SHA-256/16, the
+  standard's default for networked links), reason CRITICAL, and `challenge_len` random octets
+  (default 4, the standard's minimum; clamped to 4..64). The whole fragment is kept as the
+  "challenge message".
+- **Reply** (AUTHENTICATE_REQUEST g120v2): accepted only if the CSQ is the outstanding one, the
+  application sequence number is the challenged request's own (the exchange consumes no
+  sequence number, so an authenticated SELECT is still followed by an OPERATE with seq + 1), the
+  peer is the one that sent the request, the user has installed and unexpired session keys, and
+  `sa.verifyReplyMac` (constant time, control-direction key, MAC over `challenge message ‖
+  critical request`) passes. Any reply consumes the outstanding challenge first. A new critical
+  request replaces an outstanding challenge (one at a time), and a reply after `reply_timeout_ms`
+  (default 2 s) finds none.
+- **No-ack critical requests** (DIRECT_OPERATE_NR, the *_NR freezes) cannot be challenged, because
+  the master expects no answer. They are discarded unless sent in aggressive mode.
+- **Aggressive mode**: a request whose first object is g120v3 and whose last object is g120v9
+  (its size fixed by the MAC algorithm) is verified in one step: CSQ = last CSQ + 1, a challenge
+  has been sent before, user keyed, MAC over `last challenge message ‖ request up to the g120v9
+  object` in constant time. Success executes the objects between them, advances the CSQ (so the
+  same message cannot pass twice) and cancels any outstanding challenge.
+- **Session keys**: g120v4 is answered with g120v5 (KSQ = previous + 1, the user's key status,
+  configured key-wrap and MAC algorithms, fresh challenge data, no MAC). Every g120v5 opens the
+  single key-change window for that user and KSQ. g120v6 is accepted only inside it with the same
+  KSQ and user, an update key of the length the key-wrap algorithm requires, and AES-KW
+  (`sa.unwrapSessionKeys`) integrity. The new keys replace the old ones, which are wiped. The
+  confirmation is a g120v5 with status OK whose MAC is computed under the new monitoring-direction
+  key over the received g120v6 object. A refused change is answered with a g120v5 with status
+  AUTH_FAIL and leaves the user's existing keys as they were.
+- **Expiry**: keys are invalidated (wiped, status COMM_FAIL) after `session_key_timeout_ms`
+  (default 30 min) or `session_key_max_messages` (default 2000). Both defaults are twice the
+  standard's expected change interval and count. A zero limit disables that axis.
+- **Errors**: every authentication failure is answered with a g120v7, code 1 (authentication
+  failed), until `max_error_messages` (default 2) have gone out. After that the outstation is
+  silent until a successful key change resets the budget. A master's own g120v7
+  (AUTHENTICATE_REQUEST_NO_ACK) is counted and not answered. Unexpected or undecodable
+  AUTHENTICATE_REQUESTs are counted and ignored.
+- **Statistics** (`Statistics`) count each of these events in memory.
+
+**Anchoring.** No live SA peer exists, so the first `secure_auth` test pins a whole exchange
+against vectors **derived by hand outside the module**: Python's `hmac`/`hashlib` for every MAC
+and the `cryptography` package's RFC 3394 wrap for the g120v6 payload, over the byte layouts
+above. The exchange is key status, key change and confirmation MAC, challenge, reply, then
+aggressive mode. These vectors prove the module computes what this section says, not that a
+foreign SA master computes the same.
 
 ## Verification
 
@@ -288,7 +369,15 @@ wildcard, a broadcast executed but unanswered, a request split across transport 
 out-of-order segments, bad CRC,
 `unsolicitedFrames` framing an outstation-initiated response and advancing `tx_seq`), hostile input
 (including a full-width command range and a point index past the 16-bit space), and four fuzz
-harnesses; `goldens` (5) — the captured-session replays.
+harnesses; `goldens` (5) — the captured-session replays; `secure_auth` (19) — the hand-derived
+exchange vectors, bad reply MAC and its retry, a reply with the wrong CSQ / sequence / peer / no
+peer / unknown user / keyless user / empty key / wrong key, reply timeout and replaced
+challenges, SELECT+OPERATE each authenticated, non-critical requests byte-identical with and
+without SA, the critical-set override, no-ack requests, aggressive-mode refusals, key-change
+refusals (KSQ, user, update key, short or undecodable data, replay), expiry by time / count /
+status request and a disabled axis, old keys wiped, the error budget, unexpected AUTH requests,
+challenge shapes and the storage boundary, a challenge that could not be sent, and aggressive
+mode cancelling an outstanding challenge.
 
 **Interop (2026-07-23).** The captures in `src/goldens.zig` were taken against **opendnp3**
 (Apache-2.0, `release` branch, built from source in this sandbox) used strictly as a black-box
@@ -344,6 +433,18 @@ read range and a freeze range ending one past the last point, `update`/
 `decodeFrame` (the length octet caps `user_len` at 255 − 5 = 250, which is the
 limit).
 
+**Delta mutation run 2026-11-19** (schemata, ReleaseSafe, 68 mutants over every decision in
+`secure_auth.zig` and the outstation hook): 50 killed first. Of the 18 survivors, 16 got
+killing tests. One of those gaps was in an authentication decision: no test had sent a reply
+MAC computed under the *empty* key of a user without session keys. The code refused it (the
+keyed-user check), but nothing proved that. Two survivors are equivalent. Dropping the
+`consumed == tail` test on the g120v9 object is covered because a size other than the MAC
+length either fails to decode or fails the length-checked constant-time compare. Dropping the
+`wrapped.len == 2·key_len + 8` test is covered because AES-KW rejects any such length. Result
+66/68 killed, 2 eq. Not mutated: the `secureZero` of the
+unwrapped-key scratch (observable only to a stack probe over a key change, which the module
+does not have yet) and of the confirmation-MAC buffer (that MAC goes on the wire).
+
 ## Backlog / deferred
 
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
@@ -354,8 +455,35 @@ limit).
 - **File transfer (g70), data sets (g85–g88), device attributes (g0), octet strings (g110/g111),
   time-and-interval (g50v4), analog deadbands (g34), time-sync with delay compensation
   (g50v2/g51).**
-- **Secure Authentication integration.** `sa.zig` is a complete SAv2 symmetric codec, but nothing
-  in `outstation.zig` wraps or unwraps a fragment in g120 objects yet.
+- **Secure Authentication, what the outstation integration leaves out:** the SAv5/SAv6
+  asymmetric update-key change (g120 v8/v10–v15), the g121/g122 security-statistic objects on
+  the wire (counted in memory only), authenticated responses in the monitoring direction,
+  AES-GMAC as the challenge MAC (its IV derivation is out of scope in `sa.zig`), the master
+  side, and a stack probe over the key-change path.
+- ⚠ **FINDING (2026-11-19, open): `sa.ErrorCode` values past 1 may be wrong.** `sa.zig` has
+  1 authentication_failed, 2 unexpected_reply, 3 no_available_session_key, 4 unknown_user,
+  5 unknown_association, 6 unknown_sequence_number, 7 unknown_key_change_method,
+  8 unsupported_security_algorithm, 9 unsupported_mac_algorithm, 10 mac_algorithm_not_permitted,
+  11 key_wrap_algorithm_not_permitted, 12 authentication_method_not_permitted,
+  13 key_status_not_ok, 14 no_available_configuration_signature, 15 invalid_certification_data,
+  16 invalid_signature, 17 message_swap_detected, 18 excessive_delay,
+  19 unexpected_key_change_sequence_number. The IEEE 1815-2012 table as recalled during the
+  integration (same names as opendnp3 2.x's `AuthErrorCode`) is 1 authentication failed,
+  2 unexpected response (deprecated), 3 no response, 4 aggressive mode not supported, 5 MAC
+  algorithm not supported, 6 key-wrap algorithm not supported, 7 authorization failed, 8
+  update-key change method not permitted, 9 invalid signature, 10 invalid certification data,
+  11 unknown user, 12 max session-key-status requests exceeded. Neither table has been checked
+  against the standard. The two agree only on code 1, so the outstation emits only code 1.
+  Check against the standard's table, then renumber (a behaviour change of `sa.ErrorCode`).
+- **Open questions for the SA integration** (each needs the standard's text or a foreign
+  implementation to settle):
+  (a) whether SAv5's g120v6 wrapped data also carries the last g120v5 message (`sa.zig`'s
+  `wrapSessionKeys` wraps the two keys only, and the outstation follows it);
+  (b) what the g120v5 MAC covers (here: the received g120v6 object, under the new
+  monitoring key, only in the confirmation);
+  (c) the exact default critical-function table;
+  (d) whether a reply may carry a sequence number other than the challenged request's;
+  (e) the aggressive-mode MAC input (here: last challenge message ‖ request up to g120v9).
 - **Data-link confirmed user data on the send path.** The outstation answers RESET_LINK_STATES,
   TEST_LINK_STATES and REQUEST_LINK_STATUS and accepts both confirmed and unconfirmed user data,
   but always *sends* unconfirmed user data; the FCB/FCV toggle is decoded, not enforced.
@@ -368,7 +496,7 @@ limit).
   used instead.
 
 - (survey 2026-09-30) **Stateful master session** (integrity/class polls, task queue, response timeout, unsolicited handling): opendnp3 and stepfunc both ship it and most DNP3 users are SCADA masters; already listed above as "A stateful master session type" — this survey raises it to the top gap; large (~1-2 weeks), fits §2 (clock-injected, no I/O).
-- (survey 2026-09-30) **Outstation SA integration** (wrap/unwrap fragments in g120): the codecs exist; medium, fits §2.
+- (survey 2026-09-30) ~~**Outstation SA integration**~~ — done 2026-11-19 (symmetric procedures, `secure_auth.zig`); the rest is listed above.
 - (survey 2026-09-30) **File transfer g70 and device attributes g0**: used by commissioning/config tools; medium, fits §2.
 
 ## Status

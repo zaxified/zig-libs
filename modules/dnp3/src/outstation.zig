@@ -56,9 +56,9 @@
 //! Deliberately not implemented — see README "Scope": unsolicited *retry*
 //! policy (the fragment builder is here, the retry timer is the caller's),
 //! file transfer (g70), data sets (g85-g88), device attributes (g0),
-//! octet strings (g110/g111), time-and-interval (g50v4), and Secure
-//! Authentication integration (`sa.zig` is a separate codec; nothing here
-//! wraps a fragment in g120 objects).
+//! octet strings (g110/g111) and time-and-interval (g50v4). Secure
+//! Authentication is opt-in through `setSecureAuth` (`secure_auth.zig`);
+//! without it no request is screened.
 //!
 //! Provenance: clean-room from IEEE 1815-2012. Behaviour cross-checked
 //! against opendnp3 (Apache-2.0) as a black-box peer only — its `master-demo`
