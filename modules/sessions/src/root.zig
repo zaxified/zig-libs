@@ -967,7 +967,14 @@ pub const Manager = struct {
         const rec = loaded.record;
         if (rec.len < record_header_len) return .absent; // corrupt
         const word = decodeCreated(std.mem.readInt(u64, rec[0..8], .little));
-        const created = word.created;
+        // A `created` in the future (a clock stepped back, or a record written
+        // by something else) is read as "created now". Left alone, `now -
+        // created` stays negative and the absolute timeout never fires; the
+        // clamped value is what the next save writes back, so the window
+        // starts then. A `last_seen` in the future needs no clamp: it is
+        // never past the idle window, and the save that follows a load
+        // stamps it with now.
+        const created = @min(word.created, now);
         const last_seen = std.mem.readInt(i64, rec[8..16], .little);
         const payload = rec[record_header_len..];
         if (payload.len > out.data_buf.len) return .absent; // corrupt / oversized
@@ -4302,6 +4309,42 @@ test "Manager.lookup: timeout arithmetic saturates (last_seen at i64 min; a cloc
     std.mem.writeInt(i64, rec[8..16], clk.now_ns, .little);
     try testing.expect(store.store().put("abs", &rec, 0) != null);
     try testing.expectEqual(Manager.LoadResult.expired, m.lookup("abs", &l));
+}
+
+test "Manager.lookup: a created in the future is read as now, so the absolute timeout still ends the session" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store: RamcacheStore = .{ .cache = &cache, .ttl_ns = 0 };
+    var clk: ManualClock = .{ .now_ns = 1000 };
+    const m = try Manager.init(testing.allocator, store.store(), .{ .io = testing.io, .clock = clk.clock(), .idle_timeout_ns = 0, .absolute_timeout_ns = 5000 });
+    // created far in the future (one ns past `now`, and the largest 63-bit time)
+    for ([_]i64{ 1001, created_max }) |future| {
+        var rec: [record_header_len]u8 = undefined;
+        std.mem.writeInt(u64, rec[0..8], encodeCreated(future, false), .little);
+        std.mem.writeInt(i64, rec[8..16], 1000, .little);
+        try testing.expect(store.store().put("fut", &rec, 0) != null);
+        clk.now_ns = 1000;
+        var l: Session = .{};
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup("fut", &l));
+        try testing.expectEqual(@as(i64, 1000), l.created_ns); // clamped, not the stored value
+        // The save that follows a load writes the clamped value back...
+        try testing.expect(m.persist(&l));
+        var l2: Session = .{};
+        clk.now_ns = 1000 + 5000; // exactly at the cap: still live (strict >)
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup("fut", &l2));
+        // ...so the window runs out 5000 ns after it, not never.
+        clk.now_ns = 1000 + 5001;
+        try testing.expectEqual(Manager.LoadResult.expired, m.lookup("fut", &l2));
+    }
+    // A created equal to now, and one in the past, are untouched.
+    var rec: [record_header_len]u8 = undefined;
+    std.mem.writeInt(u64, rec[0..8], encodeCreated(900, false), .little);
+    std.mem.writeInt(i64, rec[8..16], 1000, .little);
+    try testing.expect(store.store().put("past", &rec, 0) != null);
+    clk.now_ns = 1000;
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup("past", &l));
+    try testing.expectEqual(@as(i64, 900), l.created_ns);
 }
 
 const LongIdStore = struct {
