@@ -6,7 +6,7 @@
 
 **Scope:** core — Bitcoin Core v31.1 `script/interpreter.cpp` (libbitcoinconsensus behaviour) + btcd `txscript` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-07 · mutation 2026-11-18 (661/690, 29 eq) · src abff56c3c6934a57
+**Audit:** review 2026-09-07 · mutation 2026-11-19 (726/757, 31 eq) · src 8ccbd00295fb2509
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BITCOINSCRIPT_FUZZ) · ct n/a — public script data (keyword review, 2026-10-07)
 
@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [bitcoin-core/btcdeb](https://github.com/bitcoin-core/btcdeb) | C++ | MIT | 595 | push 2026-07-26 | Script debugger built on Core's interpreter — a step-through tool this module has no counterpart of. |
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | Script compile/decompile/toASM and payments; no consensus interpreter *(inferred)*. |
 
-**Where we are ahead:** the only consensus script interpreter in pure Zig (no libbitcoinconsensus link, unlike the Rust/JS ecosystems that bind it): all `SCRIPT_VERIFY_*` flags, BIP342 tapscript incl. `OP_SUCCESSx` and validation weight, a per-transaction sighash cache; Core's own FindAndDelete/tx_valid rows pinned. **Where we are behind:** no sigop counting, no script builder / disassembler exported (`asmparser.zig` exists but `root.zig` only pulls it into tests), no standardness check (basic template classification and destination extraction live in the sibling `btcaddr` module), and only part of `script_tests.json` (no `script_assets_test.json`).
+**Where we are ahead:** the only consensus script interpreter in pure Zig (no libbitcoinconsensus link, unlike the Rust/JS ecosystems that bind it): all `SCRIPT_VERIFY_*` flags, BIP342 tapscript incl. `OP_SUCCESSx` and validation weight, a per-transaction sighash cache; Core's own FindAndDelete/tx_valid rows pinned. **Where we are behind:** no sigop counting, no standardness check (basic template classification and destination extraction live in the sibling `btcaddr` module), and only part of `script_tests.json` (no `script_assets_test.json`).
 
 ## Design & invariants
 
@@ -435,6 +435,63 @@ remain fully implemented at consensus level (flag off); the flag only makes them
 
 **Audit 2026-11-17 (whole-module mutation).** 675 mutants over every non-test line of `opcodes.zig`, `number.zig`, `sigcheck.zig`, `interpreter.zig`, `tapscript.zig` and `verify.zig` (stack machine: every opcode's semantics and stack-depth guard, push decoding and minimal-push rules, `FindAndDelete` and the scriptCode builder, the condition stack, CLTV/CSV, CHECKSIG / CHECKMULTISIG including NULLFAIL/NULLDUMMY, tapscript budget and pubkey typing, BIP66 checks, the lax DER parser, the BIP341 commitment and signature rules, witness-program recognition, P2SH, every `verifyScript` limit and flag). `flags.zig`, `limits.zig`, `txctx.zig`, `root.zig` (constants and declarations, covered by their own tests) and every `*_test.zig` / `*_vectors.zig` / `asmparser.zig` (test support) were not mutated. Sighash computation itself lives in `bitcointx` and is out of this module's source. One schemata build per round, baseline first. Round 1 (before any change): 445 killed, 3 hung, 209 survived: the pinned `script_tests.json` subset leaves most stack opcodes without an exact-result check and most guards without an exactly-one-short case. About 30 tests (many table rows each) were added (`mutation_gap_test.zig`, plus tests in `interpreter.zig`, `sigcheck.zig`, `number.zig`): exact result stacks for every stack, arithmetic and hash opcode; every depth guard with one operand too few and exactly enough; shortest-push at every length boundary; the canonical push `FindAndDelete` searches for at all four shapes; PUSHDATA prefixes that are the last bytes of the script; the tapscript budget landing on zero, pubkey typing, codeseparator position, MINIMALIF; CLTV/CSV operand typing, policy NOPs, disable flags and the 16-bit mask; VERIF in an unexecuted branch; limits exactly at their bound; P2SH recognition (each of its three markers), the single-push rule, CLEANSTACK after a wrapped witness program; witness-program shapes; every taproot dispatch rule; the validation-weight budget to the byte (with and without annex); `checkSchnorrSig` sizes and hashtype; BIP66 length edges; flag-by-flag encoding checks; a CHECKMULTISIG signed over the post-codeseparator scriptCode; an `S` that ends in its own hashtype byte. **Finding fixed:** the loose DER parser was stricter than Bitcoin Core's lax parser (see "Signature encoding"); rewritten after `ecdsa_signature_parse_der_lax`, with a hand-built signature per lax rule, and its 31 delta mutants killed (two are equivalent, counted below). Round 2: 636 killed, 3 hung, 36 survived; 7 more were killed by three added tests, 29 do not die: 27 EQUIVALENT (an empty-data minimal push is covered by the generic `opcode == len` rule; the `OP_n` arm of the minimal-push check never fires because a data push opcode is `<= 0x4e`; a 76-byte push is `0x4c` either way; the `findAndDelete` end test duplicates `readInstruction`'s own bound; `ConditionStack` `>=` for `==` under `first_false <= size`; CHECKMULTISIG `len <= n_keys` fails with the same error one step later; the `key_i >= n_keys` guard under `sigs_remaining <= keys_remaining`; `instr.data == null` implied by `opcode > OP_16`; the MINIMALIF `top.len >= 1` arm under `top.len > 1`; BIP66 minimum length 8 under `len_r, len_s >= 1`; `isLowS` over the full element parses the same; an empty signature reaches `false` through the parser; a lax-parse long-form length with 4 significant bytes is at least 2^24 and cannot fit; the lax sequence-length bound when no byte can follow; `isExactPush`'s compare and undecodable arm, `0x50` as a version, 1- and 41-byte programs, the key-path `<= 1` arm and the initial-stack bound, which earlier checks make unreachable; the stack copy when `p2sh` is off is cost-only; an empty stack copy and CLEANSTACK `> 1` follow from a non-empty stack) and 2 UNOBSERVABLE (the BIP341 tweak `>=` order: a tagged hash landing on or above the group order is a 2^-128 event with no known preimage). Counts on the card are whole-module.
 
+### Script builder and disassembler (`script.zig`)
+
+Public API: `ScriptBuilder` (`pushOpcode`, `pushData`, `pushInt`, `bytes`, `toOwnedSlice`,
+`reset`), `toAsm` (writer-based) / `toAsmAlloc`, `opcodeName`, `AsmOptions`, `Limits`.
+Reference per the owner rule (behave like the reference): Bitcoin Core's `CScript::operator<<` /
+`CheckMinimalPush` and `ScriptToAsmStr` / `GetOpName` (behaviour only; this module stays
+clean-room), btcd's `txscript.ScriptBuilder` (source read 2026-11-19) for the bounds.
+
+- **Pushes are minimal in Core's `MINIMALDATA` sense.** Empty data is `OP_0`; one byte `1..16` is
+  `OP_1..OP_16`; the byte `0x81` is `OP_1NEGATE`; up to 75 bytes a direct push, then
+  `OP_PUSHDATA1/2/4` at the 76 / 256 / 65 536 boundaries. `pushInt` is `OP_0` / `OP_1NEGATE` /
+  `OP_1..OP_16` for those values, otherwise the minimal `CScriptNum` bytes as a data push (`i64`
+  extremes included; `number.encode` was made total for `minInt(i64)`).
+  *Differences from the references.* Core's `operator<<(vector)` is not minimal for the 0-byte and
+  special 1-byte cases (it writes `01 05` for `{5}`); a script built with it fails `MINIMALDATA`
+  policy, which is why Core's own code pushes numbers through the `int64_t` overload. We follow the
+  btcd / `CheckMinimalPush` shape. btcd's `AddData` also maps a single `0x00` byte to `OP_0`,
+  which pushes the empty string, a different stack element; we push `01 00` (what `CheckMinimalPush`
+  accepts for that data).
+- **Bounded.** The builder refuses to grow past `limits.max_script_size` (10 000,
+  `MAX_SCRIPT_SIZE`) and to push an element longer than `limits.max_script_element_size` (520,
+  `MAX_SCRIPT_ELEMENT_SIZE`), as btcd's `AddOp` / `AddData` / `AddInt64` do (`ErrScriptNotCanonical`
+  there; `error.ScriptTooLarge` / `error.PushTooLarge` here, script bound checked first as in btcd).
+  A refused push leaves the script unchanged. `Limits` raises the bounds (a tapscript leaf has no
+  script-size limit; its stack elements are still 520 bytes). A length beyond `OP_PUSHDATA4`'s
+  `u32` is `PushTooLarge` before any allocation.
+- **`toAsm` follows Core's `ScriptToAsmStr`.** Opcodes by their `GetOpName` name; `OP_0`,
+  `OP_1NEGATE`, `OP_1..OP_16` as `0`, `-1`, `1..16`; a data push of at most 4 bytes as the decimal
+  `CScriptNum` it encodes (non-minimal forms accepted, negative zero is `0`); a longer push as bare
+  lowercase hex; a script that ends inside a push or a length prefix as `[error]` after the
+  elements before it (separated by a space unless it is the first token, as btcd's `DisasmString`
+  also does). `AsmOptions.sighash_decode` is Core's `fAttemptSighashDecode` (off by default, as in
+  Core): a push of more than 4 bytes that is a strict-DER signature with a defined sighash type
+  becomes `<DER hex>[ALL]` (`NONE`, `SINGLE`, each also `|ANYONECANPAY`); not applied to a script
+  that starts with `OP_RETURN` or exceeds 10 000 bytes (`IsUnspendable`). Like Core's text, the
+  output is not injective: `01 05` and `OP_5` both read `5`, and a 5-byte push whose hex digits
+  are all decimal looks like a number. Core's parser for this text does not exist either (its
+  `ParseScript` reads the `script_tests.json` grammar, which `asmparser.zig` transcribes).
+  *btcd differences, not followed:* its `DisasmString` shows data pushes as hex without the
+  number reading of 1 to 4 bytes (source read 2026-11-19: `disasmOpcode` in compact mode
+  writes `OP_0`..`OP_16` and `OP_1NEGATE` as numbers and every data push as hex) and has no
+  sighash decoding.
+- **Verification.** `script.zig` unit tests (every push-length boundary, `pushInt` table, limits at
+  the byte, the 32-bit length ceiling, every opcode-name class, `[error]` for each truncation shape,
+  sighash decode on and off); `script_asm_test.zig`: `toAsm` over every pinned `script_tests.json`
+  script and over the same scripts cut short, exact byte round trip `toAsm` -> `asmparser.assemble`
+  for the scripts whose pushes are canonical (1 146 cases) and a fixed-point check for the rest
+  (the text of a re-assembled script equals the original text), a randomised
+  `ScriptBuilder` -> text -> bytes round trip (400 scripts), and builder output compared with the
+  parser's own quoted-string and decimal pushes.
+- **Delta mutation 2026-11-19** (new code: `script.zig` production lines, `number.encode`): 67
+  mutants (push-length classes and boundaries, both limits, every special-case arm of `pushData`
+  and `pushInt`, opcode-name ranges, sighash names, the decode gate, `[error]`, the 1-to-4-byte
+  number rule): 65 killed, 2 equivalent (the empty-data special case is covered by the generic
+  direct-push rule, which writes the same `00`; `n >= 1` against `n >= 0` in `pushInt`, `0` having
+  matched the first disjunct). One build, schemata, baseline first; the first run left 6 survivors, four of which died to a test added for them (pushes that exactly fill `max_script_size` at every length class) after the 2/4-byte length boundary, the 32-bit length ceiling (failing allocator) and the empty-script / 10 000-byte decode bound had been tested.
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -447,7 +504,7 @@ remain fully implemented at consensus level (flag off); the flag only makes them
 ## Backlog / deferred
 
 - **Sigop counting (legacy, P2SH, witness) — `GetLegacySigOpCount`/`GetTransactionSigOpCost` equivalents** (survey 2026-09-30) — block validation is impossible without it (block sigop cost limit) and btcd/Core expose it. `rg -i sigop src/` finds only the tapscript validation-weight budget. Effort M. Fits §2.
-- **Script builder + disassembler (`toAsm`) as public API** (survey 2026-09-30) — btcd has `ScriptBuilder`/`DisasmString`; here `asmparser.assemble` exists but is test-only and there is no inverse. Effort S. Fits §2.
+- **DONE 2026-11-19 — Script builder + disassembler (`toAsm`) as public API** (survey 2026-09-30) — `ScriptBuilder` and `toAsm` / `toAsmAlloc` in `script.zig`; see "Script builder and disassembler" above. `asmparser.assemble` (Core's `script_tests.json` text format) stays test-only.
 - **Template classification / destination extraction (Solver, IsStandard, ExtractDestination)** (survey 2026-09-30) — needed to tell a wallet what an output pays to; btcd `standard.go`, Core `solver.cpp`. Effort M. Fits §2. Partly covered since: `btcaddr.classify` / `btcaddr.toScriptPubKey` recognise the standard output templates and extract the payload; Solver-style standardness is still absent.
 - **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — 297 of ~1100 non-witness rows are a sample by design; from the BIP342 corpus (`script_assets_test.json`) only the 5-transaction slice in `consensus_kat_vectors.zig` is pinned. Effort M (vendoring size). Fits §2.
 
