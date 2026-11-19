@@ -739,6 +739,8 @@ test {
     _ = @import("dopen_test.zig");
     _ = @import("dopen2_test.zig");
     _ = @import("emut_test.zig");
+    _ = @import("entropy_kat_test.zig");
+    _ = @import("emut2_test.zig");
     _ = @import("decoder_dict_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("param_test.zig");
