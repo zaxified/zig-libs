@@ -90,6 +90,12 @@ try bitcoinscript.interpreter.eval(allocator, &stack, script_bytes, ctx, .base, 
 - `ScriptFlags` (`flags.zig`) — `.none`, `.standard` presets; every field individually documented.
 - `TxContext` / `SigVersion` (`txctx.zig`).
 - `Opcode` (`opcodes.zig`) — the byte/mnemonic table, for tooling that wants to name a byte.
+- `ScriptBuilder` (`script.zig`) — build a script: `pushOpcode`, `pushData` (shortest push, `OP_0` /
+  `OP_1..16` / `OP_1NEGATE` for the special values), `pushInt` (`CScriptNum`), bounded to 10 000 bytes
+  and 520-byte elements unless `Limits` says otherwise.
+- `toAsm(script, writer, .{})` / `toAsmAlloc` — Core-style disassembly (`OP_DUP OP_HASH160 <hex> …`,
+  small pushes as numbers, `[error]` for a truncated push; `.sighash_decode` shows `[ALL]` etc.);
+  `opcodeName(byte)`.
 - `EvalError` / `VerifyError` — typed error sets; every failure mode Bitcoin Core's
   `script_tests.json` names has a corresponding variant (see `SPEC.md` "script_tests.json
   coverage" for the exact name mapping).

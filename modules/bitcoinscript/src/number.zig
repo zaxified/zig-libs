@@ -78,9 +78,10 @@ pub fn encode(value: i64, out: *[9]u8) []u8 {
     if (value == 0) return out[0..0];
     const negative = value < 0;
     var abs_val: u64 = if (negative) blk: {
-        // Avoid overflow negating i64 min (not reachable for real script
-        // values given the 4/5-byte bound, but keep this total).
-        break :blk @as(u64, @bitCast(-value));
+        // Wrapping negate: `-%minInt(i64)` is `minInt(i64)`, whose bit
+        // pattern is the magnitude 2^63 (`ScriptBuilder.pushInt` takes any
+        // i64, so this must be total).
+        break :blk @as(u64, @bitCast(-%value));
     } else @intCast(value);
 
     var n: usize = 0;
@@ -178,4 +179,11 @@ test "decode: a single 0x00 or 0x80 byte is a non-minimal zero" {
     try testing.expectEqual(@as(i64, -0x0102), try decode(&.{ 0x02, 0x81 }, true, 4));
     try testing.expectEqual(@as(i64, 2147483647), try decode(&.{ 0xff, 0xff, 0xff, 0x7f }, true, 4));
     try testing.expectError(error.Overflow, decode(&.{ 0, 0, 0, 0, 1 }, true, 4));
+}
+
+test "encode is total: the i64 extremes have the 8/9-byte CScriptNum form" {
+    var buf: [9]u8 = undefined;
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0x80, 0x80 }, encode(std.math.minInt(i64), &buf));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f }, encode(std.math.maxInt(i64), &buf));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, encode(-std.math.maxInt(i64), &buf));
 }
