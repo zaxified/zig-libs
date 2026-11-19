@@ -247,7 +247,7 @@ pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, lim
 /// (W2 re-audit 2026-09-02, `procnet` F6/F8).
 pub const VirtualFile = struct {
     bytes: []u8,
-    /// The file was at least `limit` bytes and `bytes` is a prefix of it.
+    /// The file was LONGER than `limit` bytes and `bytes` is a prefix of it (a file of exactly `limit` bytes is complete and not flagged).
     truncated: bool,
 };
 
@@ -313,17 +313,25 @@ fn readImpl(
     var buf: [4096]u8 = undefined;
     var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
 
+    // Read ONE byte past `limit`: `appendRemaining(.limited(n))` reports
+    // `StreamTooLong` as soon as n bytes arrived, whether or not more follow,
+    // so a file of exactly `limit` bytes could not be told from a longer one.
+    // With `limit + 1` the extra byte is the evidence that the file is longer.
     var truncated = false;
     var list: std.ArrayList(u8) = .empty;
-    fr.interface.appendRemaining(gpa, &list, .limited(limit)) catch |err| switch (err) {
+    fr.interface.appendRemaining(gpa, &list, .limited(limit +| 1)) catch |err| switch (err) {
         // Everything read so far is already in `list` (documented contract
-        // of `appendRemaining`), and it is the bounded prefix we asked for.
+        // of `appendRemaining`): `limit + 1` bytes, so the file is longer.
         error.StreamTooLong => truncated = true,
         else => {
             list.deinit(gpa);
             return null;
         },
     };
+    if (list.items.len > limit) {
+        truncated = true;
+        list.shrinkRetainingCapacity(limit);
+    }
     if (truncated and whole_lines) list.shrinkRetainingCapacity(wholeLinesLen(list.items));
     const bytes = list.toOwnedSlice(gpa) catch {
         list.deinit(gpa);

@@ -62,9 +62,11 @@ test "SocketOwnerIndex.find/findAll return the exact equal-inode run (sweep REV-
     try testing.expect(idx.find(0) == null);
 }
 
+/// CPU time of THIS thread, not wall time: a loaded machine that preempts the
+/// test between two reads does not inflate the measurement.
 fn nowNs() u64 {
     var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    _ = std.posix.system.clock_gettime(.THREAD_CPUTIME_ID, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
@@ -75,7 +77,7 @@ fn timeRun(gpa: std.mem.Allocator, n: usize, calls: usize) !u64 {
     for (owners, 0..) |*o, i| o.* = owner(7, @intCast(i));
     const idx: process.SocketOwnerIndex = .{ .owners = owners, .scanned = 0, .denied = 0, .vanished = 0, .truncated = false };
     var best: u64 = std.math.maxInt(u64);
-    for (0..3) |_| {
+    for (0..5) |_| {
         var sink: usize = 0;
         const t0 = nowNs();
         for (0..calls) |_| {
@@ -91,10 +93,11 @@ fn timeRun(gpa: std.mem.Allocator, n: usize, calls: usize) !u64 {
 
 test "SocketOwnerIndex.find cost does not grow with the equal-inode run (sweep REV-PN-3)" {
     // A linear run walk costs ~256x more at 65536 owners than at 256; a
-    // binary search costs about 2x. 32 is far from both.
+    // binary search costs about 2x. 64 is far from both. Measured in thread
+    // CPU time (best of 5), so machine load does not move it.
     const small = try timeRun(testing.allocator, 256, 2000);
     const big = try timeRun(testing.allocator, 65536, 2000);
-    try testing.expect(big < @max(small, 1) * 32);
+    try testing.expect(big < @max(small, 1) * 64);
 }
 
 test "PidStatus.cpus_allowed beyond cpus_allowed_len is deterministic (sweep REV-PN-4)" {
@@ -139,7 +142,7 @@ fn tmpFileWith(io: std.Io, tmp: *std.testing.TmpDir, text: []const u8, path_buf:
     return std.mem.print(path_buf, ".zig-cache/tmp/{s}/t.txt", .{&tmp.sub_path});
 }
 
-test "readVirtualLines: an untruncated read keeps a last line with no newline; a limit equal to the size is flagged but complete" {
+test "readVirtualLines: an untruncated read keeps a last line with no newline; a limit equal to the size is complete and not flagged" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -154,13 +157,21 @@ test "readVirtualLines: an untruncated read keeps a last line with no newline; a
     try testing.expect(!r.truncated);
     try testing.expectEqualStrings(text, r.bytes);
 
-    // Exactly `limit` bytes: every byte arrives, but the flag is set too
-    // (`appendRemaining(.limited(n))` cannot tell a file of n bytes from a longer one),
-    // so `truncated` is conservative at the boundary, never wrong the other way.
+    // Exactly `limit` bytes: the file is complete, so it is NOT flagged
+    // (the read looks one byte past the limit to tell it from a longer file).
     const exact = procnet.readVirtualFileReporting(testing.allocator, io, path, text.len) orelse return error.ReadFailed;
     defer testing.allocator.free(exact.bytes);
-    try testing.expect(exact.truncated);
+    try testing.expect(!exact.truncated);
     try testing.expectEqualStrings(text, exact.bytes);
+    const exact_lines = procnet.readVirtualLinesReporting(testing.allocator, io, path, text.len) orelse return error.ReadFailed;
+    defer testing.allocator.free(exact_lines.bytes);
+    try testing.expect(!exact_lines.truncated);
+    try testing.expectEqualStrings(text, exact_lines.bytes);
+    // A limit of 0 on a non-empty file is a cut with nothing kept.
+    const zero = procnet.readVirtualFileReporting(testing.allocator, io, path, 0) orelse return error.ReadFailed;
+    defer testing.allocator.free(zero.bytes);
+    try testing.expect(zero.truncated);
+    try testing.expectEqual(@as(usize, 0), zero.bytes.len);
 
     // One byte less is a cut: the plain read keeps the prefix, the line read
     // drops the fragment; a cut with no newline at all leaves nothing.

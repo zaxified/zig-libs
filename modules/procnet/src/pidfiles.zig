@@ -512,6 +512,8 @@ pub const CgroupList = struct {
     entries: []CgroupEntry,
     /// Non-null when this list owns the bytes `entries` borrow from.
     text: ?[]u8 = null,
+    /// The file was longer than the read limit (64 KiB); the incomplete last line was dropped.
+    truncated: bool = false,
 
     pub fn deinit(l: CgroupList, gpa: std.mem.Allocator) void {
         gpa.free(l.entries);
@@ -545,10 +547,19 @@ pub fn parseCgroups(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.
 pub fn readPidCgroups(gpa: std.mem.Allocator, io: std.Io, ref: procnet.ProcRef) std.mem.Allocator.Error!?CgroupList {
     var pb: [64]u8 = undefined;
     const path = ref.path(&pb, "cgroup") orelse return null;
-    const text = procnet.readVirtualFile(gpa, io, path, 64 * 1024) orelse return null;
-    errdefer gpa.free(text);
-    var l = try parseCgroups(gpa, text);
-    l.text = text;
+    return readCgroupsAt(gpa, io, path, cgroup_read_limit);
+}
+
+const cgroup_read_limit: usize = 64 * 1024;
+
+// Line-oriented read: a limit that cuts the file drops the incomplete last line
+// instead of handing the parser a path cut short.
+fn readCgroupsAt(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!?CgroupList {
+    const f = procnet.readVirtualLinesReporting(gpa, io, path, limit) orelse return null;
+    errdefer gpa.free(f.bytes);
+    var l = try parseCgroups(gpa, f.bytes);
+    l.text = f.bytes;
+    l.truncated = f.truncated;
     return l;
 }
 
@@ -898,4 +909,35 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "readCgroupsAt: a limit cutting a path drops the line, never a shortened path" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "12:cpu:/a/b\n0::/user.slice/session-3.scope\n";
+    {
+        var f = try tmp.dir.createFile(io, "c.txt", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(text);
+        try w.interface.flush();
+    }
+    var pb: [128]u8 = undefined;
+    const path = try std.mem.print(&pb, ".zig-cache/tmp/{s}/c.txt", .{&tmp.sub_path});
+
+    const whole = (try readCgroupsAt(testing.allocator, io, path, text.len)).?;
+    defer whole.deinit(testing.allocator);
+    try testing.expect(!whole.truncated);
+    try testing.expectEqual(@as(usize, 2), whole.entries.len);
+    try testing.expectEqualStrings("/user.slice/session-3.scope", whole.entries[1].path);
+
+    const cut = (try readCgroupsAt(testing.allocator, io, path, text.len - 8)).?;
+    defer cut.deinit(testing.allocator);
+    try testing.expect(cut.truncated);
+    try testing.expectEqual(@as(usize, 1), cut.entries.len);
+    try testing.expectEqualStrings("/a/b", cut.entries[0].path);
 }

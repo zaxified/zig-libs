@@ -134,7 +134,13 @@ pub fn parsePairs(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Er
 }
 
 fn readTable(gpa: std.mem.Allocator, io: std.Io, path: []const u8) std.mem.Allocator.Error!PairTable {
-    const f = procnet.readVirtualFileReporting(gpa, io, path, read_limit) orelse
+    return readTableLimit(gpa, io, path, read_limit);
+}
+
+// Line-oriented read: a limit that cuts the file drops the incomplete last
+// line, so a counter cut inside its digits is never reported as a smaller one.
+fn readTableLimit(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!PairTable {
+    const f = procnet.readVirtualLinesReporting(gpa, io, path, limit) orelse
         return .{ .entries = try gpa.alloc(Pair, 0) };
     errdefer gpa.free(f.bytes);
     var t = try parsePairs(gpa, f.bytes);
@@ -336,4 +342,64 @@ test "parsePairs: an empty section name is no pair; ipExtOctets needs InOctets a
     const only_out = try parsePairs(gpa, "IpExt: OutOctets\nIpExt: 5\n");
     defer only_out.deinit(gpa);
     try testing.expect(only_out.ipExtOctets() == null);
+}
+
+test "readTableLimit: a limit cutting a value line drops the line, never a shortened counter" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "Ip: InReceives OutRequests\nIp: 1234567 89\nTcp: ActiveOpens\nTcp: 4242\n";
+    {
+        var f = try tmp.dir.createFile(io, "t.txt", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(text);
+        try w.interface.flush();
+    }
+    var pb: [128]u8 = undefined;
+    const path = try std.mem.print(&pb, ".zig-cache/tmp/{s}/t.txt", .{&tmp.sub_path});
+
+    const whole = try readTableLimit(testing.allocator, io, path, text.len);
+    defer whole.deinit(testing.allocator);
+    try testing.expect(!whole.truncated);
+    try testing.expectEqual(@as(?u64, 4242), whole.get("Tcp", "ActiveOpens"));
+
+    // Cut inside "4242": the Tcp pair loses its value line, the Ip pair is intact,
+    // and no counter reads as 42.
+    const cut = try readTableLimit(testing.allocator, io, path, text.len - 3);
+    defer cut.deinit(testing.allocator);
+    try testing.expect(cut.truncated);
+    try testing.expectEqual(@as(?u64, 1234567), cut.get("Ip", "InReceives"));
+    try testing.expectEqual(@as(?u64, 89), cut.get("Ip", "OutRequests"));
+    try testing.expectEqual(@as(?u64, null), cut.get("Tcp", "ActiveOpens"));
+
+    // Cut inside the Ip value line "1234567 89": the whole Ip pair is gone.
+    const cut2 = try readTableLimit(testing.allocator, io, path, 40);
+    defer cut2.deinit(testing.allocator);
+    try testing.expect(cut2.truncated);
+    try testing.expectEqual(@as(usize, 0), cut2.entries.len);
+}
+
+test "live: readSnmp/readNetstat return rows whenever an independent read finds the file (mutation: limit ignored)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const paths = [_][]const u8{ "/proc/net/snmp", "/proc/net/netstat" };
+    for (paths) |path| {
+        const raw = procnet.readVirtualFile(testing.allocator, io, path, read_limit) orelse continue;
+        defer testing.allocator.free(raw);
+        if (raw.len == 0) continue;
+        const t = if (std.mem.eql(u8, path, "/proc/net/snmp"))
+            try readSnmp(testing.allocator, io)
+        else
+            try readNetstat(testing.allocator, io);
+        defer t.deinit(testing.allocator);
+        try testing.expect(!t.truncated);
+        try testing.expect(t.entries.len > 0);
+    }
 }
