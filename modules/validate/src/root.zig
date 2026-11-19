@@ -264,6 +264,7 @@ pub const Matcher = struct {
 /// - `origin` — `http(s)://host[:port]`, nothing after the authority (`isOrigin`, 1567).
 /// - `urn_rfc2141` — `urn:` NID `:` NSS.
 /// - `urn_rfc8141` — `urn:` NID `:` NSS with optional r-, q- and f-components.
+/// - `html` — contains `<`, an optional `/`, a letter and a later `>` on one line (unanchored regex `<[/]?([a-zA-Z]+).*?>`, `hTMLRegexString`; `isHtml`).
 /// - `html_encoded` — contains `&gt` `&lt` `&quot` `&amp` or `&#` + two hex digits (unanchored regex, `hTMLEncodedRegexString`).
 /// - `url_encoded` — every `%` is followed by two hex digits (`uRLEncodedRegexString`).
 /// - `tcp4_addr` — SYNTAX ONLY: `a.b.c.d:port`; the rival resolves names, this does no I/O.
@@ -390,6 +391,8 @@ pub const Format = enum {
     ssn,
     ein,
     cron,
+    /// Contains an HTML tag (go-playground `html`): see `isHtml`.
+    html,
 };
 
 /// Caller-supplied predicate, run after all built-in checks pass the type
@@ -2253,6 +2256,7 @@ pub fn validateFormat(format: Format, s: []const u8) bool {
         .ssn => fmtx.isSsn(s),
         .ein => fmtx.isEin(s),
         .cron => fmtx.isCron(s),
+        .html => fmtx.isHtml(s),
     };
 }
 
@@ -2355,6 +2359,7 @@ fn formatMessage(format: Format) []const u8 {
         .ssn => "Input should be a valid US social security number",
         .ein => "Input should be a valid US employer identification number",
         .cron => "Input should be a valid cron expression",
+        .html => "Input should contain an HTML tag",
     };
 }
 
@@ -6320,6 +6325,7 @@ fn formatName(f: Format) []const u8 {
         .ssn => "ssn",
         .ein => "ein",
         .cron => "cron",
+        .html => "html",
     };
 }
 
@@ -9589,6 +9595,7 @@ const format_seeds = [_][]const u8{
     fuzzseed.seed("\x5d\x00" ++ "123-45-6789"), // ssn
     fuzzseed.seed("\x5e\x00" ++ "12-3456789"), // ein
     fuzzseed.seed("\x5f\x00" ++ "*/5 * * * *"), // cron
+    fuzzseed.seed("\x60\x00" ++ "a <b>bold</b> text"), // html
     fuzzseed.seed(""), // the empty seed: `.email` and the empty string, which is what this target ran
 };
 
@@ -9824,7 +9831,7 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
     // selects. All of them (34 since 2026-10-11), and the accepted count
     // beside it so a corpus of refusals only would be visible.
     const formats = std.enums.values(Format);
-    var seen = @as([96]bool, @splat(false));
+    var seen = @as([97]bool, @splat(false));
     var nonempty: usize = 0;
     var accepted: usize = 0;
     for (format_seeds) |sd| {
@@ -9837,14 +9844,14 @@ test "corpus: every Format is exercised, and the strings each accepts are pinned
         if (case[1].len != 0) nonempty += 1;
         if (validateFormat(case[0], case[1])) accepted += 1;
     }
-    try testing.expectEqual(@as(usize, 96), formats.len);
+    try testing.expectEqual(@as(usize, 97), formats.len);
     for (seen) |v| try testing.expect(v);
     // Measured 2026-09-07 (21 / 12; before: 1 format, 0 non-empty strings, 0
     // accepted). 2026-10-11: +24 seeds for the go-playground formats, 21 of
     // them valid by hand-check (uuid4-as-v1, https_url-on-http and the
     // one-character base64_raw_url are the refusals).
-    try testing.expectEqual(@as(usize, 107), nonempty);
-    try testing.expectEqual(@as(usize, 95), accepted);
+    try testing.expectEqual(@as(usize, 108), nonempty);
+    try testing.expectEqual(@as(usize, 96), accepted);
 }
 
 // ── external anchor: json-schema-org/JSON-Schema-Test-Suite (format) ───────
@@ -10873,6 +10880,27 @@ fn expectExportLacks(rules: []const Rule, needle: []const u8) !void {
         std.debug.print("\nexport has: {s}\nexport is:  {s}\n", .{ needle, aw.written() });
         return error.TestExpectedEqual;
     }
+}
+
+test "format truth table: html is go-playground's <[/]?([a-zA-Z]+).*?> unanchored, no newline in `.` (isHtml)" {
+    // Accepted: an opening or closing tag, a letter run any length, anywhere in the text.
+    for ([_][]const u8{ "<b>", "</b>", "x <a href=\"u\">y", "<a>", "<ab>", "<ab c>", "<a>>", "<<a>", "<1<a>", "</a<>", "<a\n<b>", "\n\n<i>\n" }) |s|
+        try fmtOk(.html, s);
+    // Refused: no letter right after `<` or `</`, no `>` after the letter on the same line, newline in between.
+    for ([_][]const u8{ "", "<", ">", "<>", "</>", "<1>", "</ a>", "< a>", "<a", "a>", ">a<", "<a\n>", "<\na>", "<//a>", "<a\n>\n<b", "&lt;b&gt;", "<\xc3\xa9>", "a < b > c" }) |s|
+        try fmtBad(.html, s);
+    // `>` must come after the first letter, not just after `<`.
+    try fmtBad(.html, "><a");
+    try fmtOk(.html, "><a>");
+    // The earliest opening decides: a later `<` on the line cannot do better.
+    try fmtOk(.html, "<1 <a b>");
+    // Linear on adversarial input: many openings with no `>`.
+    const many = try testing.allocator.alloc(u8, 200_000);
+    defer testing.allocator.free(many);
+    for (many, 0..) |*c, i| c.* = if (i % 2 == 0) '<' else 'a';
+    try fmtBad(.html, many);
+    // And exported by name.
+    try expectExportHas(&.{.{ .field = "f", .kind = .string, .format = .html }}, "\"format\":\"html\"");
 }
 
 test "uri: the port of a registered-name host is digits, as RFC 3986 and net/url (uriPortOk)" {
@@ -13173,6 +13201,7 @@ const format_name_table = [_]struct { Format, []const u8 }{
     .{ .ssn, "ssn" },
     .{ .ein, "ein" },
     .{ .cron, "cron" },
+    .{ .html, "html" },
 };
 
 test "a1 mutation: JSON Schema `format` name of every Format (the go-playground tag, or the JSON Schema name)" {
