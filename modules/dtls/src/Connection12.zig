@@ -1818,11 +1818,12 @@ test "epoch-0 replay window: only a record that advanced the handshake is record
     try c.processRecord(.{ .content_type = content_application_data, .epoch = 0, .sequence_number = huge - 3, .length = 1 }, &.{1}, ent, 0, &o);
     try std.testing.expect(!c.recv_win[0].seen_any);
 
-    // A partial fragment of the expected message is taken but not recorded:
-    // its bytes are as unauthenticated as any (one forged byte with a huge
-    // record number would otherwise shadow every genuine record).
+    // A partial fragment of the expected message is taken but not recorded,
+    // even under a low record number: its bytes are as unauthenticated as
+    // any (one forged byte with a huge record number would otherwise shadow
+    // every genuine record).
     const cur = testFragment(2, 40, 10, &fb);
-    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = huge, .length = @intCast(cur.len) }, cur, ent, 0, &o);
+    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = 5, .length = @intCast(cur.len) }, cur, ent, 0, &o);
     try std.testing.expectEqual(@as(usize, 10), c.rx_filled);
     try std.testing.expect(!c.recv_win[0].seen_any);
 
