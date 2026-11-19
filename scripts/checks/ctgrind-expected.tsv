@@ -1850,8 +1850,8 @@ iec62351	ReleaseFast	mac	1	0	ff413992e4aa0c2f	760ede68c6c5b472
 # what follows it on the AUTHENTICATED plaintext: the padding-byte checks
 # (834-840) and the dupe/alloc/free of the unpadded body (its length). The
 # padding is checked only after the MAC, so it is no padding oracle.
-opcua	ReleaseFast	kdf	1	0	44aff88bc2c6c933	29be2a7621f75ceb
-opcua	ReleaseFast	chunk	1	14	44aff88bc2c6c933	17e08703a66ffe0f
+opcua	ReleaseFast	kdf	1	0	3090a3ee931d2e77	29be2a7621f75ceb
+opcua	ReleaseFast	chunk	1	14	3090a3ee931d2e77	17e08703a66ffe0f
 # sha2 (2026-10-10) — hash: the message tainted through hash/update/peek for
 # SHA-224/256/384/512 at 0..1000 bytes; hmac: std Hmac over sha2.Sha256/512
 # with key + message tainted. Both 0.
@@ -2233,11 +2233,11 @@ keycodec	ReleaseFast	pem	1	3	01cf014117dc5d87	3727ff639b8dfcc7
 #   A valid-length message vs the decoy differ by a 32-byte copy vs one SHA-256, but
 #   a ciphertext that decodes validly is one the sender knew the CEK of (the public
 #   key makes any such ciphertext), so no oracle is opened.
-jwe	ReleaseFast	content	1	18	10d8c513ea326a08	5b95af95390d7044
-jwe	ReleaseFast	kw	1	5	198f278acedab8ab	29bdefbeeb697801
-jwe	ReleaseFast	ecdh	1	8	8e24d1f5528d947d	0e8a78e319485b8a
-jwe	ReleaseFast	pbes2	1	3	198f278acedab8ab	45882587fad30673
-jwe	ReleaseFast	rsa	1	20	198f278acedab8ab	043474d84426957a
+jwe	ReleaseFast	content	1	18	50bd8b49a59125d2	5b95af95390d7044
+jwe	ReleaseFast	kw	1	5	9e5b3c091662daae	29bdefbeeb697801
+jwe	ReleaseFast	ecdh	1	8	f69c3ecaeb92bff3	0e8a78e319485b8a
+jwe	ReleaseFast	pbes2	1	3	9e5b3c091662daae	45882587fad30673
+jwe	ReleaseFast	rsa	1	20	9e5b3c091662daae	043474d84426957a
 # webhooksig (2026-11-13) — the HMAC secrets, the signature comparison, the
 # `whsec_` / `whsk_` key text. Four targets; the harness taints only the secret
 # (the key text's prefix stays public) and prints hex of every witness.
@@ -2288,10 +2288,10 @@ webhooksig	ReleaseFast	ed25519	1	30	691f63387d17ed1d	0ddab6b90956b2fe
 #            the masked extraction loop (`ctEqMaskUsize(s, sep_idx)`) was compiled to a branch on
 #            the separator position; an asm barrier (`blackBox`) fixed it, measured.
 #   kw 3     aeskw unwrapBody :171 (integrity-check verdict) + aesgcm tag verdict, accept and reject.
-xmlenc	ReleaseFast	oaep	1	3	1a333eb9cac26850	b6a414715b391ccc
-xmlenc	ReleaseFast	cbc	1	14	1a333eb9cac26850	cb2ee56c03b2b7a6
-xmlenc	ReleaseFast	rsa15	1	3	1a333eb9cac26850	fcf38565ab1ce414
-xmlenc	ReleaseFast	kw	1	3	1a333eb9cac26850	65e898b409f3bf26
+xmlenc	ReleaseFast	oaep	1	3	a92b299b34fc708a	b6a414715b391ccc
+xmlenc	ReleaseFast	cbc	1	14	a92b299b34fc708a	cb2ee56c03b2b7a6
+xmlenc	ReleaseFast	rsa15	1	3	a92b299b34fc708a	fcf38565ab1ce414
+xmlenc	ReleaseFast	kw	1	3	a92b299b34fc708a	65e898b409f3bf26
 # saml, 2026-11-13 (sweep hB): the SP's RSA private key signing a LogoutRequest and a redirect
 # query string (`sign_with` / `buildSignedRedirectQuery`).
 #   sign 45  1 = rsa privateOpCrtPtr:1286 (the F3 fault-check verdict, rsa's own row) + 44 =
@@ -2332,7 +2332,7 @@ aeadframe	ReleaseFast	aes	1	157	35be1b2969cbd483	9e2cdfce46f95d92	cpu=x86_64 con
 ctap2	ReleaseFast	pin	1	100	aadf4e9173f1e8f9	01e08eb2902d2802	cpu=x86_64 control=6 trap=6
 ctap2	ReleaseFast	token	1	68	aadf4e9173f1e8f9	e927dca40cedb432	cpu=x86_64 control=4 trap=4
 dnp3	ReleaseFast	keys	1	121	2ff4825a5c6f1f58	d2337903af778cbe	cpu=x86_64 control=2 trap=6
-opcua	ReleaseFast	chunk	1	134	44aff88bc2c6c933	17e08703a66ffe0f	cpu=x86_64 control=2 trap=34
+opcua	ReleaseFast	chunk	1	134	3090a3ee931d2e77	17e08703a66ffe0f	cpu=x86_64 control=2 trap=34
 snmp	ReleaseFast	aes	1	312	f7b2d59406205574	07f7c9867f83b17e	cpu=x86_64 control=12 trap=12
 aes192	ReleaseFast	enc	1	128	91e9bb5ec00b01a9	0c5f76d6ab016242	cpu=x86_64
 aes192	ReleaseFast	dec	1	304	91e9bb5ec00b01a9	68602ef849690825	cpu=x86_64
@@ -2371,15 +2371,15 @@ aes192	ReleaseFast	bitsliced	1	128	ba4c8387c14267e7	5ea64f081b0ffcbb	cpu=x86_64
 #   (jwe content trap, megolm msg trap, xmlenc cbc claim+control+trap, compiler_rt memcpy symbolised
 #   at line 0). They now use the length of the plaintext they sent, checked against the returned one
 #   under -fvalgrind. jwe rsa, xmlenc oaep and xmlenc rsa15 match their plain rows (no variant).
-jwe	ReleaseFast	content	1	487	10d8c513ea326a08	5b95af95390d7044	cpu=x86_64 control=100 trap=100
-jwe	ReleaseFast	kw	1	332	198f278acedab8ab	29bdefbeeb697801	cpu=x86_64 control=55 trap=55
-jwe	ReleaseFast	ecdh	1	181	8e24d1f5528d947d	0e8a78e319485b8a	cpu=x86_64 control=51 trap=51
-jwe	ReleaseFast	pbes2	1	182	198f278acedab8ab	45882587fad30673	cpu=x86_64 control=29 trap=29
+jwe	ReleaseFast	content	1	487	50bd8b49a59125d2	5b95af95390d7044	cpu=x86_64 control=100 trap=100
+jwe	ReleaseFast	kw	1	332	9e5b3c091662daae	29bdefbeeb697801	cpu=x86_64 control=55 trap=55
+jwe	ReleaseFast	ecdh	1	181	f69c3ecaeb92bff3	0e8a78e319485b8a	cpu=x86_64 control=51 trap=51
+jwe	ReleaseFast	pbes2	1	182	9e5b3c091662daae	45882587fad30673	cpu=x86_64 control=29 trap=29
 megolm	ReleaseFast	msg	1	138	4bcd2cc0b8d7321d	505eb3dc7b45f5cd	cpu=x86_64 control=1 trap=105
 megolm	ReleaseFast	skey	1	33	4bcd2cc0b8d7321d	a22db1b8b5220a74	cpu=x86_64
 megolm	ReleaseFast	pickle	1	28	4bcd2cc0b8d7321d	f06f4b1b938d2036	cpu=x86_64
-xmlenc	ReleaseFast	cbc	1	72	1a333eb9cac26850	cb2ee56c03b2b7a6	cpu=x86_64 control=16 trap=16
-xmlenc	ReleaseFast	kw	1	182	1a333eb9cac26850	65e898b409f3bf26	cpu=x86_64 control=5 trap=5
+xmlenc	ReleaseFast	cbc	1	72	a92b299b34fc708a	cb2ee56c03b2b7a6	cpu=x86_64 control=16 trap=16
+xmlenc	ReleaseFast	kw	1	182	a92b299b34fc708a	65e898b409f3bf26	cpu=x86_64 control=5 trap=5
 #
 # B --std X25519 identity check (curve25519.zig:77, public-point outcome), plus C (std mem.eql chunk
 # branch on a public key) for wireguard and tlsclient cv/mls/ssh pem. tlsclient kex also has A2 (std
