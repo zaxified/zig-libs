@@ -74,6 +74,7 @@ test {
     _ = server;
     _ = goldens;
     _ = @import("audit_test.zig");
+    _ = @import("oracle_test.zig");
 }
 
 // ── wire constants ──────────────────────────────────────────────────────────
@@ -553,20 +554,24 @@ pub const rtu = struct {
 /// or object id is exception 0x03; an unknown object in individual access is
 /// exception 0x02; the response header is MEI, read code, conformity level,
 /// more-follows, next object id, object count, then (id, length, value)
-/// triples inside the 253-byte PDU budget. The category ranges and the
-/// conformity values below are from the spec text and are UNVERIFIED against
-/// the PDF (not reachable when this was written).
+/// triples inside the 253-byte PDU budget. The category ranges, the
+/// cumulative stream walk, the restart rule and the conformity values below
+/// were checked against the V1.1b3 PDF text (section 6.21) on 2026-11-19.
 pub const device_id = struct {
     /// MEI type for Read Device Identification.
     pub const mei_type = 0x0E;
 
-    /// "Read Device ID code" of the request.
+    /// "Read Device ID code" of the request. The categories are cumulative
+    /// (spec 6.21: regular is "in addition to Basic data objects", extended
+    /// "in addition to regular data objects"), so a stream read walks every
+    /// object up to its category's last id.
     pub const ReadCode = enum(u8) {
-        /// Stream access to the basic category (objects 0x00..0x02).
+        /// Stream access to the basic identification (objects 0x00..0x02).
         basic = 0x01,
-        /// Stream access to the regular category (objects 0x03..0x7F).
+        /// Stream access to the regular identification (objects 0x00..0x06).
         regular = 0x02,
-        /// Stream access to the extended category (objects 0x80..0xFF).
+        /// Stream access to the extended identification (objects 0x00..0x06
+        /// and 0x80..0xFF).
         extended = 0x03,
         /// One specific object.
         individual = 0x04,
@@ -600,15 +605,24 @@ pub const device_id = struct {
         value: []const u8,
     };
 
-    /// First and last object id of the category a stream read code walks;
-    /// null for `individual`.
+    /// First and last object id a stream read code walks; null for
+    /// `individual`. Behaviour change 2026-11-19: this used to return the
+    /// category alone (regular 0x03..0x7F, extended 0x80..0xFF); the spec's
+    /// categories are cumulative, so every walk starts at 0x00. Reserved ids
+    /// (`isReserved`) inside the range are skipped.
     pub fn categoryRange(code: ReadCode) ?struct { first: u8, last: u8 } {
         return switch (code) {
             .basic => .{ .first = 0x00, .last = 0x02 },
-            .regular => .{ .first = 0x03, .last = 0x7F },
-            .extended => .{ .first = 0x80, .last = 0xFF },
+            .regular => .{ .first = 0x00, .last = 0x06 },
+            .extended => .{ .first = 0x00, .last = 0xFF },
             .individual => null,
         };
+    }
+
+    /// Object ids 0x07..0x7F are "Reserved" in the spec's object table; a
+    /// server neither streams nor serves them (pymodbus: same).
+    pub fn isReserved(id: u8) bool {
+        return id >= 0x07 and id <= 0x7F;
     }
 
     /// Conformity level byte: 0x01/0x02/0x03 = basic/regular/extended stream
@@ -2387,17 +2401,22 @@ test "device_id: zero-length objects, and the last object may end exactly at the
     try testing.expectEqual(@as(u8, 8), b.id);
     try testing.expectEqual(@as(usize, 0), b.value.len);
     try testing.expectEqual(@as(?device_id.Object, null), it.next());
-    // The category bounds the server walks.
+    // The bounds the server walks: cumulative, all from 0 (spec 6.21).
     const basic = device_id.categoryRange(.basic).?;
     const regular = device_id.categoryRange(.regular).?;
     const extended = device_id.categoryRange(.extended).?;
     try testing.expectEqual(@as(u8, 0x00), basic.first);
     try testing.expectEqual(@as(u8, 0x02), basic.last);
-    try testing.expectEqual(@as(u8, 0x03), regular.first);
-    try testing.expectEqual(@as(u8, 0x7F), regular.last);
-    try testing.expectEqual(@as(u8, 0x80), extended.first);
+    try testing.expectEqual(@as(u8, 0x00), regular.first);
+    try testing.expectEqual(@as(u8, 0x06), regular.last);
+    try testing.expectEqual(@as(u8, 0x00), extended.first);
     try testing.expectEqual(@as(u8, 0xFF), extended.last);
     try testing.expectEqual(@as(?@TypeOf(basic), null), device_id.categoryRange(.individual));
+    // Reserved ids: exactly 0x07..0x7F.
+    try testing.expect(!device_id.isReserved(0x06));
+    try testing.expect(device_id.isReserved(0x07));
+    try testing.expect(device_id.isReserved(0x7F));
+    try testing.expect(!device_id.isReserved(0x80));
 }
 
 test "RtuStream: maximum-size frames (256 bytes) are accepted, in every role that can carry them" {
