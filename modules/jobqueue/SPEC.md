@@ -6,7 +6,7 @@
 
 **Scope:** core — Sidekiq (Ruby; lease/retry/dead-queue model) with Asynq as the closest embeddable peer (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (23/23) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (37/38, 1 eq) · src 2ed206e0e4beb128
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — job persistence (keyword review, 2026-10-07)
 
@@ -90,6 +90,36 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   persists the job as ready (attempts reset to 0, or kept one short of the limit) at `run_at`
   (default now) before touching the index. `extendLease(lease, t)` sets the monotonic deadline to
   `now + t` for the current lease only (`StaleLease` otherwise). `status(id)` reads the index.
+- **Lease release (2026-11-19).** `release(lease, .{ .delay_ns })` hands a lease back without
+  counting an attempt: the job returns to `pending` with its attempts, priority and id unchanged,
+  never dead-letters, and keeps its `unique_key`. With `delay_ns == 0` it rejoins its partition
+  heap at its old FIFO place at once; with a delay it is invisible until then, so newer jobs of the
+  same partition can be dispatched before it (when it is due it sorts by its old id again). With `delay_ns > 0` the new `run_at` is persisted before the index changes (a
+  storage error leaves the job leased and unchanged, as `expireLease` does); with 0 nothing is
+  written, because the stored record already says what a reopen must see (ready, same attempts)
+  and its `run_at` was due when it was dequeued. The lease epoch is bumped, so the released lease
+  is `StaleLease` for `ack`/`nack`/`extendLease`/`release`; `validate` is shared, so a stale,
+  reaped or forged lease gets the same error as everywhere else. *Reference survey (owner rule):*
+  beanstalkd `release <id> <pri> <delay>` ("puts a reserved job back into the ready queue … when
+  the job fails because of a transitory error"; counted in `releases`, not `timeouts`); River
+  `JobSnooze(d)` ("will not increment the job's Attempt count … can be repeatedly snoozed without
+  ever being discarded"); Celery `reject(requeue=True)`; BullMQ `moveToDelayed`; SQS
+  `ChangeMessageVisibility` to 0 (SQS is the outlier: its receive count still grows). Majority:
+  a (lease, delay) call that consumes no attempt; the name follows beanstalkd (and Laravel's
+  `release($delay)`). Sidekiq/Asynq have no worker-side equivalent (a job re-enqueues itself).
+- **Dequeue with exclusions (2026-11-19).** `DequeueOptions.exclude` lists partitions to pass
+  over: `bestReady` skips their heaps, so nothing of an excluded partition is leased, popped or
+  changed (a tombstone at its top stays until a dequeue that does not exclude it). A `partition`
+  filter that is excluded gives null. Empty = the plain dequeue (the loop over the list does not
+  run). Cost: a linear scan of the list per partition heap considered, O(partitions × excluded)
+  per dequeue, no allocation; a hash set was not worth it for the intended handful of keys. The
+  slice is borrowed for the call. Why: a caller that keeps a per-partition backoff of its own
+  (writebehind's retry wait) needs the best job of the OTHER partitions without leasing — and
+  then releasing — every job of the waiting ones (an earlier design did that; a key whose wait
+  lapsed between two of those dequeues was written past its own older, still-leased record).
+  Peers: BullMQ, Asynq and Sidekiq select by queue name lists (a worker's queue set) rather
+  than by exclusion; the closest is a consumer that subscribes to all queues but the paused ones
+  (BullMQ `pause` per queue, Asynq `Pause(queue)`), which is what this expresses per call.
 - **Unique jobs.** `EnqueueOptions.unique_key` (≤ `max_field_len`) is checked before anything is
   written; the key is held by the live job (ready, scheduled, leased, dead) and released by ack,
   cancel or `removeJob`. It is durable: a job with a key is written as a **version-2 record** (31
@@ -142,10 +172,26 @@ keeps the invariants, never a panic — measured 6 732 decoded (2 865 v2), 33 26
 **Seeded model sweep** (60 seeds × 250 ops: enqueue with keys/delays/priorities, dequeue, ack,
 nack, extend, reap with clock moves, cancel, requeueDead, crash-reopen) comparing every job's
 status and all four counts with a model after every step — measured 588 acks, 683 cancels, 53
-requeues, 1 212 refused duplicates, 1 226 crashes. **Mutation 2026-10-04:** 23 mutants
+requeues, 1 212 refused duplicates, 1 226 crashes (since 2026-11-19 the op mix also has `release`
+with a random delay, which must never dead-letter, and dequeues with an exclusion list: the
+only partition excluded must lease nothing, an unknown one changes nothing). **Mutation 2026-10-04:** 23 mutants
 (schemata, ReleaseSafe), 3 survived the first run, each killed by a crafted-record test with its
 reason (a keyless v2 record; a dead record with `max_attempts` 0; two live jobs with one key in a
 store); 0 surviving. The dependent `writebehind` passes its modtest.
+
+**Delta mutation 2026-11-19 (`release`).** 10 mutants over the new `release` (schemata, ReleaseSafe,
+baseline first): validation skipped, the ready-slot reservation skipped, the delay test forced
+true / false, the delay not added, the rollback of `run_at` and the error return after a failed
+persist skipped, the lease not removed, the epoch not bumped, the commit skipped. 9 killed (the
+reservation by `appendAssumeCapacity`'s assertion, with a test that takes the schedule heap's
+spare room away first), 1 EQUIVALENT: not bumping the epoch — `leased.remove` alone already makes
+the released lease stale (`validate` needs the id leased), and the next `dequeue` bumps the epoch
+itself before it hands out a new lease. Card cumulative: 23 + 10 mutants, 23 + 9 killed, 1
+equivalent.
+
+**Delta mutation 2026-11-19 (`DequeueOptions.exclude`).** 5 mutants: the exclusion of a filtered
+partition and of an unfiltered one dropped, the match never / always true, the list not passed
+to `bestReady`. 5/5 killed. Card cumulative: 33 + 5 mutants, 32 + 5 killed, 1 equivalent.
 
 ## Backlog / deferred
 
@@ -154,13 +200,8 @@ store); 0 surviving. The dependent `writebehind` passes its modtest.
 - **Exactly-once** — this is at-least-once; the idempotent consumer is the app's job.
 - **Rate-limited dispatch** — compose the `ratelimit` module later.
 - **Cron-expression schedules** — v1 has only `delay_ns`/`run_at`; no `* * * * *` parsing.
-- **Release a lease without counting an attempt** (2026-11-19, from writebehind) — `nack` always
-  increments `attempts` (and can dead-letter); there is no way to hand a lease back unchanged (Celery
-  `reject(requeue=True)`, SQS `ChangeMessageVisibility` to 0, BullMQ `moveToDelayed` without a failure).
-  writebehind needs it to let other keys use its synchronous backstop while one key waits out its
-  in-memory retry backoff (today one waiting key blocks the backstop for all; writebehind SPEC § known
-  limits F5b). Ideal API: `release(lease, .{ .delay_ns = 0 })` — no attempt, no dead-letter, partition
-  order kept.
+- ✅ (done 2026-11-19, see "Lease release" under Design) **Release a lease without counting an
+  attempt** (from writebehind, F5b).
 - **A background maintenance thread & compaction-trigger policy** — the visibility sweep
   (`reapExpiredLeases`) is caller-driven; `kv.compact` is the caller's to schedule.
 - **Fair-share / weighted dispatch across partitions** — dispatch is strict priority; there is no

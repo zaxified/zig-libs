@@ -113,6 +113,15 @@ _ = try q.cancel(dead[1].id);             // durable delete; also for ready/sche
 // A long job keeps its lease with a heartbeat:
 try q.extendLease(lease, 30 * std.time.ns_per_s);
 
+// Best job of every partition except some (e.g. ones your own code is
+// backing off from); nothing of those is leased:
+_ = try q.dequeue(.{ .visibility_timeout_ns = 30 * std.time.ns_per_s, .exclude = &.{ "tenant-7", "tenant-9" } });
+
+// Took a job it cannot run yet (a busy resource, a shutdown)? Hand it back
+// without counting an attempt; never dead-letters. With no delay it keeps its
+// place in its partition (with a delay, newer jobs may go first meanwhile).
+try q.release(lease, .{ .delay_ns = 0 });  // or a delay, persisted like a nack backoff
+
 // At most one live job per key (until acked or cancelled), durable:
 _ = q.enqueue("welcome_email", payload, .{ .unique_key = "welcome:42" }) catch |e| switch (e) {
     error.DuplicateJob => {}, // already queued
@@ -131,7 +140,8 @@ optional full jitter from an injected `random`).
 **At-least-once.** A lease is an *in-memory, single-process* reservation
 (`kv` has no cross-process lock); a crash re-exposes every un-acked job as
 ready on the next `open`. A stale lease (its timeout lapsed and the job was
-reaped/re-leased) cannot `ack`/`nack` — it gets `error.StaleLease`. Make your
+reaped/re-leased, or it was released) cannot `ack`/`nack`/`release` — it gets
+`error.StaleLease`. Make your
 consumer **idempotent**.
 
 ## Deferred (v1 non-goals)

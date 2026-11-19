@@ -164,7 +164,8 @@ pub const Status = enum {
 /// need them longer.
 pub const Lease = struct {
     id: JobId,
-    /// Delivery number: 1 on the first dispatch, incremented each redelivery.
+    /// Delivery number: 1 on the first dispatch, incremented by each `nack`
+    /// and each reaped lease (a `release` does not count).
     attempt: u32,
     job_type: []const u8,
     payload: []const u8,
@@ -221,12 +222,27 @@ pub const DequeueOptions = struct {
     /// How long (monotonic ns) the lease holds the job invisible before
     /// `reapExpiredLeases` may return it to the ready set.
     visibility_timeout_ns: u64,
+    /// Partitions to pass over: the best job of every OTHER partition is
+    /// returned, and nothing of an excluded one is leased or changed. Empty
+    /// (the default) = no exclusion, exactly the plain dequeue. A `partition`
+    /// filter that is itself excluded gives null. Borrowed for this call
+    /// only. Cost: a linear scan of this list per partition considered, so
+    /// O(partitions × excluded) on top of the dequeue; meant for a handful
+    /// of keys (e.g. those waiting out a caller-side backoff).
+    exclude: []const []const u8 = &.{},
 };
 
 pub const NackOptions = struct {
     /// Explicit requeue backoff (wall ns). null = the exponential policy
     /// (`Options.backoff_*`, optionally jittered by `Options.random`).
     backoff_ns: ?u64 = null,
+};
+
+/// `Queue.release` options.
+pub const ReleaseOptions = struct {
+    /// Wall-clock delay (ns) before the job is visible again. 0 = at once,
+    /// with its schedule unchanged (nothing is written to storage).
+    delay_ns: u64 = 0,
 };
 
 pub const Options = struct {
@@ -563,7 +579,7 @@ pub const Queue = struct {
         try self.migrateDue(wall_now);
 
         const id = id: while (true) {
-            const found = self.bestReady(opts.partition) orelse return null;
+            const found = self.bestReady(opts.partition, opts.exclude) orelse return null;
             const job = self.jobs.get(found.id) orelse {
                 // Cancelled while visible: its heap entry is a tombstone.
                 self.takeTop(found);
@@ -614,6 +630,40 @@ pub const Queue = struct {
         const job = self.jobs.get(id).?;
         const backoff = opts.backoff_ns orelse self.computeBackoff(job.attempts + 1);
         try self.expireLease(id, backoff);
+    }
+
+    /// Hand the lease back without counting an attempt: the job returns to
+    /// the ready set unchanged (same attempt count, priority and id), visible
+    /// again after `opts.delay_ns`. With no delay it keeps its place in its
+    /// partition's FIFO; with a delay, newer jobs of the partition that are
+    /// visible meanwhile are dispatched first (once due, it again sorts by
+    /// its old id). Never dead-letters, and its `unique_key` stays held.
+    /// For a worker that took a job it cannot run yet (a busy resource, a
+    /// shutdown) — beanstalkd `release`, Celery `reject(requeue=True)`, River
+    /// `JobSnooze`, SQS `ChangeMessageVisibility` to 0. A failure is `nack`.
+    ///
+    /// Durable as `nack`'s requeue is: with `delay_ns > 0` the new schedule
+    /// is persisted before the index changes (a storage error leaves the job
+    /// leased and unchanged); with 0 the stored record already says what a
+    /// reopen must see — ready, same attempts — so nothing is written. The
+    /// lease is consumed: it, `ack`, `nack` and `extendLease` on it are
+    /// `error.StaleLease` afterwards, as for any lease no longer current.
+    pub fn release(self: *Queue, lease: Lease, opts: ReleaseOptions) !void {
+        const id = try self.validate(lease);
+        const job = self.jobs.get(id).?;
+        // Reserved first, so the commit after the durable write cannot fail.
+        try self.reserveReady();
+        if (opts.delay_ns != 0) {
+            const saved_run_at = job.run_at_ns;
+            job.run_at_ns = addNs(self.wall.now(), opts.delay_ns);
+            self.persistJob(job) catch |e| {
+                job.run_at_ns = saved_run_at;
+                return e;
+            };
+        }
+        _ = self.leased.remove(id);
+        job.lease_epoch +%= 1; // invalidate the released lease
+        self.commitReady(job);
     }
 
     /// Heartbeat: push the lease's visibility deadline to `now +
@@ -810,8 +860,9 @@ pub const Queue = struct {
 
     /// Best visible job: the partition's heap top under a filter, else the best
     /// top across all partitions (same (priority, id) order as within one).
-    fn bestReady(self: *Queue, filter: ?[]const u8) ?Found {
+    fn bestReady(self: *Queue, filter: ?[]const u8, exclude: []const []const u8) ?Found {
         if (filter) |p| {
+            if (excluded(exclude, p)) return null;
             const e = self.parts.getEntry(p) orelse return null;
             const top = e.value_ptr.peek() orelse return null;
             return .{ .key = e.key_ptr.*, .heap = e.value_ptr, .id = top.id };
@@ -820,6 +871,7 @@ pub const Queue = struct {
         var best_entry: ReadyEntry = undefined;
         var it = self.parts.iterator();
         while (it.next()) |e| {
+            if (excluded(exclude, e.key_ptr.*)) continue;
             const top = e.value_ptr.peek() orelse continue;
             if (best == null or readyBefore(top, best_entry)) {
                 best_entry = top;
@@ -827,6 +879,13 @@ pub const Queue = struct {
             }
         }
         return best;
+    }
+
+    fn excluded(exclude: []const []const u8, partition: []const u8) bool {
+        for (exclude) |x| {
+            if (std.mem.eql(u8, x, partition)) return true;
+        }
+        return false;
     }
 
     /// Pop `found`'s top, reclaiming the partition entry once it runs dry.
@@ -1778,6 +1837,173 @@ test "status: scheduled, ready, leased, dead, gone" {
     try testing.expectEqual(@as(?Status, null), q.status(id));
 }
 
+test "release: no attempt counted, never dead-letters, keeps its place in the partition FIFO" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    // One attempt only: a single `nack` would dead-letter it.
+    const a = try q.enqueue("t", "a", .{ .partition = "p", .max_attempts = 1 });
+    _ = try q.enqueue("t", "b", .{ .partition = "p" });
+    for (0..10) |_| {
+        const l = (try q.dequeue(.{ .partition = "p", .visibility_timeout_ns = one_ms })).?;
+        // Still the partition's oldest, still its first attempt.
+        try testing.expectEqual(a, l.id);
+        try testing.expectEqual(@as(u32, 1), l.attempt);
+        // No spare room in the schedule heap: `release` must reserve it.
+        q.pending.items.clearAndFree(testing.allocator);
+        try q.release(l, .{});
+        try testing.expectEqual(@as(?Status, .ready), q.status(a));
+        try testing.expectEqual(@as(usize, 2), q.readyCount());
+        try testing.expectEqual(@as(usize, 0), q.leasedCount());
+        try testing.expectEqual(@as(usize, 0), q.deadLetterCount());
+    }
+    // An unfiltered dequeue agrees, and a real failure still counts.
+    const l = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqual(a, l.id);
+    try q.nack(l, .{ .backoff_ns = 0 });
+    try testing.expectEqual(@as(?Status, .dead), q.status(a));
+    try testing.expectEqualStrings("b", (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?.payload);
+}
+
+test "release: the released lease is stale; acked and forged leases are refused like ack/nack" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    _ = try q.enqueue("t", "x", .{});
+    const l1 = (try q.dequeue(.{ .visibility_timeout_ns = 10 * one_ms })).?;
+    try q.extendLease(l1, 100 * one_ms); // the heartbeat's deadline goes with the lease
+    try q.release(l1, .{});
+    try testing.expectError(Error.StaleLease, q.release(l1, .{}));
+    try testing.expectError(Error.StaleLease, q.ack(l1));
+    try testing.expectError(Error.StaleLease, q.nack(l1, .{}));
+    try testing.expectError(Error.StaleLease, q.extendLease(l1, one_ms));
+    h.mono.advance(200 * one_ms);
+    try testing.expectEqual(@as(usize, 0), try q.reapExpiredLeases()); // nothing leased, nothing reaped
+    // The next lease is current; one with a forged generation is not.
+    const l2 = (try q.dequeue(.{ .visibility_timeout_ns = 10 * one_ms })).?;
+    try testing.expectEqual(@as(u32, 1), l2.attempt);
+    var forged = l2;
+    forged.epoch +%= 1;
+    try testing.expectError(Error.StaleLease, q.release(forged, .{}));
+    try testing.expectEqual(@as(usize, 1), q.leasedCount());
+    // A reaped lease, then an acked one.
+    h.mono.advance(10 * one_ms);
+    try testing.expectEqual(@as(usize, 1), try q.reapExpiredLeases());
+    try testing.expectError(Error.StaleLease, q.release(l2, .{}));
+    const l3 = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqual(@as(u32, 2), l3.attempt); // the reap counted, the release did not
+    try q.ack(l3);
+    try testing.expectError(Error.StaleLease, q.release(l3, .{}));
+}
+
+test "release: a delay hides the job and survives a reopen; no delay writes nothing; the unique key stays held" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var kb: [24]u8 = undefined;
+    const id = id: {
+        var q = try h.openQueue();
+        defer q.close();
+        const id = try q.enqueue("t", "x", .{ .unique_key = "u" });
+        const before = (try q.db.get(testing.allocator, jobKey(&kb, @backingInt(id)))).?;
+        defer testing.allocator.free(before);
+        h.wall.advance(one_ms); // a rewritten `run_at` would differ from the stored one
+        try q.release((try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?, .{});
+        const after = (try q.db.get(testing.allocator, jobKey(&kb, @backingInt(id)))).?;
+        defer testing.allocator.free(after);
+        try testing.expectEqualSlices(u8, before, after); // delay 0: the record is untouched
+        try testing.expectEqual(@as(?JobId, id), q.findUnique("u"));
+        try testing.expectError(UniqueError.DuplicateJob, q.enqueue("t", "y", .{ .unique_key = "u" }));
+        // With a delay: scheduled, invisible until it has passed.
+        try q.release((try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?, .{ .delay_ns = 5 * one_ms });
+        try testing.expectEqual(@as(?Status, .scheduled), q.status(id));
+        try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+        try testing.expectError(UniqueError.DuplicateJob, q.enqueue("t", "y", .{ .unique_key = "u" }));
+        break :id id;
+    };
+    {
+        // Reopen: the persisted delay still holds, no attempt was counted.
+        var q = try h.openQueue();
+        defer q.close();
+        try testing.expectEqual(@as(?Status, .scheduled), q.status(id));
+        try testing.expectError(UniqueError.DuplicateJob, q.enqueue("t", "y", .{ .unique_key = "u" }));
+        h.wall.advance(5 * one_ms - 1);
+        try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null);
+        h.wall.advance(1);
+        const l = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+        try testing.expectEqual(@as(u32, 1), l.attempt);
+        // A storage failure on the delayed release leaves the lease in force.
+        h.sim.ops_until_crash = 0;
+        if (q.release(l, .{ .delay_ns = 5 * one_ms })) |_| return error.TestUnexpectedResult else |_| {}
+        try testing.expectEqual(@as(?Status, .leased), q.status(id));
+        try q.extendLease(l, one_ms); // still the current lease
+        // Its schedule was rolled back too: released without a delay (no
+        // storage write), it is visible at once.
+        try q.release(l, .{});
+        try testing.expectEqual(@as(?Status, .ready), q.status(id));
+    }
+    h.sim.reboot();
+    var q = try h.openQueue();
+    defer q.close();
+    // The failed release changed nothing durable: ready at once, first attempt.
+    const l = (try q.dequeue(.{ .visibility_timeout_ns = one_ms })).?;
+    try testing.expectEqual(id, l.id);
+    try testing.expectEqual(@as(u32, 1), l.attempt);
+}
+
+test "dequeue exclude: other partitions are served in order, an excluded one is untouched" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    const a1 = try q.enqueue("t", "a1", .{ .partition = "a" });
+    const b1 = try q.enqueue("t", "b1", .{ .partition = "b" });
+    const c1 = try q.enqueue("t", "c1", .{ .partition = "c", .priority = .high });
+    const b2 = try q.enqueue("t", "b2", .{ .partition = "b" });
+    const vt = one_ms;
+    // Excluding the best partition ("c", high) gives the best of the rest:
+    // FIFO by id across "a" and "b", "a" passed over too.
+    const l1 = (try q.dequeue(.{ .visibility_timeout_ns = vt, .exclude = &.{ "c", "a" } })).?;
+    try testing.expectEqual(b1, l1.id);
+    try testing.expectEqual(@as(?Status, .ready), q.status(a1));
+    try testing.expectEqual(@as(?Status, .ready), q.status(c1));
+    // A filter on an excluded partition is null; on another, normal.
+    try testing.expect((try q.dequeue(.{ .partition = "a", .visibility_timeout_ns = vt, .exclude = &.{"a"} })) == null);
+    const l2 = (try q.dequeue(.{ .partition = "b", .visibility_timeout_ns = vt, .exclude = &.{"a"} })).?;
+    try testing.expectEqual(b2, l2.id);
+    // Everything excluded: null, nothing leased or changed.
+    try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = vt, .exclude = &.{ "a", "c" } })) == null);
+    try testing.expectEqual(@as(usize, 2), q.leasedCount());
+    try testing.expectEqual(@as(usize, 2), q.readyCount());
+    // An exclusion that matches nothing is the plain dequeue: priority first.
+    const l3 = (try q.dequeue(.{ .visibility_timeout_ns = vt, .exclude = &.{"zz"} })).?;
+    try testing.expectEqual(c1, l3.id);
+    const l4 = (try q.dequeue(.{ .visibility_timeout_ns = vt })).?;
+    try testing.expectEqual(a1, l4.id);
+    try testing.expectEqual(@as(u32, 1), l4.attempt);
+}
+
+test "dequeue exclude: a scheduled job of a served partition still waits, and an excluded tombstone stays put" {
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    var q = try h.openQueue();
+    defer q.close();
+    const x = try q.enqueue("t", "x", .{ .partition = "a" });
+    _ = try q.enqueue("t", "y", .{ .partition = "b", .delay_ns = 5 });
+    try testing.expect(try q.cancel(x)); // a tombstone at "a"'s top
+    try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms, .exclude = &.{"a"} })) == null);
+    h.wall.advance(5);
+    const l = (try q.dequeue(.{ .visibility_timeout_ns = one_ms, .exclude = &.{"a"} })).?;
+    try testing.expectEqualStrings("y", l.payload);
+    try testing.expect((try q.dequeue(.{ .visibility_timeout_ns = one_ms })) == null); // tombstone dropped
+}
+
 // ── seeded corrupt-record sweep over `decodeJob` ────────────────────────────
 //
 // `kv` CRC-guards every record, so a damaged record reaches `decodeJob` only
@@ -1856,7 +2082,7 @@ test "sweep: damaged job records decode or refuse, never panic, never break an i
 
 test "sweep: random operations and crashes agree with a model" {
     const Model = struct { status: Status, key: ?u8, payload: u64 };
-    var reach = struct { acks: usize = 0, cancels: usize = 0, requeues: usize = 0, dups: usize = 0, reopens: usize = 0, dead: usize = 0 }{};
+    var reach = struct { acks: usize = 0, cancels: usize = 0, requeues: usize = 0, dups: usize = 0, reopens: usize = 0, dead: usize = 0, releases: usize = 0, excluded: usize = 0 }{};
     for (0..60) |seed| {
         var h: Harness = undefined;
         h.init();
@@ -1890,11 +2116,26 @@ test "sweep: random operations and crashes agree with a model" {
                     try testing.expect(!held_key);
                     try model.put(testing.allocator, @backingInt(id), .{ .status = .ready, .key = key, .payload = 0 });
                 },
-                3, 4 => if (try q.dequeue(.{ .visibility_timeout_ns = 5 })) |l| {
-                    const m = model.getPtr(@backingInt(l.id)).?;
-                    try testing.expect(m.status == .ready);
-                    m.status = .leased;
-                    try leases.append(testing.allocator, l);
+                3, 4 => {
+                    // Every job is in partition "": excluding it must lease
+                    // nothing; excluding another one is the plain dequeue.
+                    const pick = r.uintLessThan(u8, 4);
+                    const ex: []const []const u8 = switch (pick) {
+                        0 => &.{""},
+                        1 => &.{"zz"},
+                        else => &.{},
+                    };
+                    const got = try q.dequeue(.{ .visibility_timeout_ns = 5, .exclude = ex });
+                    if (pick == 0) {
+                        try testing.expect(got == null);
+                        reach.excluded += 1;
+                    }
+                    if (got) |l| {
+                        const m = model.getPtr(@backingInt(l.id)).?;
+                        try testing.expect(m.status == .ready);
+                        m.status = .leased;
+                        try leases.append(testing.allocator, l);
+                    }
                 },
                 5 => if (leases.items.len > 0) {
                     const l = leases.swapRemove(r.uintLessThan(usize, leases.items.len));
@@ -1957,6 +2198,15 @@ test "sweep: random operations and crashes agree with a model" {
                     };
                     reach.reopens += 1;
                 },
+                11 => if (leases.items.len > 0) {
+                    const l = leases.swapRemove(r.uintLessThan(usize, leases.items.len));
+                    if (q.release(l, .{ .delay_ns = r.uintAtMost(u64, 2) })) |_| {
+                        // Never dead-letters, whatever its attempts.
+                        try testing.expect(q.status(l.id).? != .dead);
+                        model.getPtr(@backingInt(l.id)).?.status = .ready;
+                        reach.releases += 1;
+                    } else |e| try testing.expectEqual(Error.StaleLease, e);
+                },
                 else => {},
             }
             // The model and the queue agree on every job and every count.
@@ -1985,7 +2235,8 @@ test "sweep: random operations and crashes agree with a model" {
             reach.dead += dead;
         }
     }
-    // Measured 2026-10-04: 588 acks, 683 cancels, 53 dead-letter requeues,
+    // Measured 2026-10-04 (before `release` and `exclude` joined the op mix, which shifts
+    // every later draw): 588 acks, 683 cancels, 53 dead-letter requeues,
     // 1 212 refused duplicates, 1 226 crashes, 15 439 dead job-steps.
     try testing.expect(reach.cancels > 300);
     try testing.expect(reach.acks > 300);
@@ -1993,6 +2244,8 @@ test "sweep: random operations and crashes agree with a model" {
     try testing.expect(reach.dups > 100);
     try testing.expect(reach.reopens > 500);
     try testing.expect(reach.dead > 1000);
+    try testing.expect(reach.releases > 100);
+    try testing.expect(reach.excluded > 300);
 }
 
 // ── tests added for mutation survivors (2026-10-04) ─────────────────────────

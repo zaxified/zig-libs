@@ -515,6 +515,10 @@ pub const Coordinator = struct {
     /// over it). Oldest first per key. Every entry is still counted in
     /// `unflushed`.
     held: std.ArrayList(Held) = .empty,
+    /// Scratch for `syncFlush`: the keys waiting out their retry backoff at
+    /// the start of the pass (borrowed from `retry_at`), passed to the WAL
+    /// dequeue as `exclude`. Empty outside `syncFlush`.
+    waiting: std.ArrayList([]const u8) = .empty,
     /// Set by `deinit`/`deinitNoFlush` before their last harvest: a key that
     /// the harvest advances is not dispatched any more. Its lease is simply
     /// left (in-memory only), so the record stays in the WAL with no attempt
@@ -614,6 +618,7 @@ pub const Coordinator = struct {
         self.freeRetry();
         // Leases still held stay in the WAL (a lease is in-memory only).
         self.held.deinit(self.gpa);
+        self.waiting.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
         self.scratch_arena.deinit();
         const gpa = self.gpa;
@@ -647,6 +652,7 @@ pub const Coordinator = struct {
         self.freeRetry();
         // Leases still held stay in the WAL (a lease is in-memory only).
         self.held.deinit(self.gpa);
+        self.waiting.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
         self.scratch_arena.deinit();
         const gpa = self.gpa;
@@ -719,7 +725,7 @@ pub const Coordinator = struct {
             if (self.unflushed < self.max_unflushed) return;
             // Records not reachable through the cache: flush one synchronously,
             // as `flushAll` does, so waiting is never stuck on them.
-            if (self.in_flight.count() == 0 and !self.anyRetryWaiting() and self.flushOneSync()) continue;
+            if (self.in_flight.count() == 0 and self.flushOneSync()) continue;
             const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
             if (now >= deadline) return error.Backpressure;
             const wait_ms: i64 = @intCast(@min(@divTrunc(deadline - now + 999_999, 1_000_000), 20));
@@ -778,12 +784,12 @@ pub const Coordinator = struct {
         // the WAL once nothing else is visible (`releaseHeld`).
         self.drain();
         while (self.unflushed > 0 or self.in_flight.count() > 0) {
-            if (self.in_flight.count() == 0 and !self.anyRetryWaiting()) {
+            if (self.in_flight.count() == 0) {
                 // Records remain but nothing is in flight (e.g. WAL entries from
                 // a reopened log whose keys are not cache-dirty). Flush one
                 // synchronously to guarantee forward progress, then re-drain.
-                // Not while a key waits out its retry backoff: the global
-                // dequeue would hand that key's record over early.
+                // A key waiting out its retry backoff is excluded from the
+                // dequeue (nothing of it is leased), so it delays only itself.
                 switch (self.syncFlush(true)) {
                     .landed => {
                         self.drain();
@@ -1134,9 +1140,24 @@ pub const Coordinator = struct {
     /// `flushOneSync`'s body. With `hold`, a rejected record's lease is kept in
     /// `held`, so the caller's next call moves on to the next record instead
     /// of retrying this one at once.
+    ///
+    /// A key that waits out its retry backoff (`retry_at`) is not written
+    /// early, and does not stall the other keys either (F5b): the set of
+    /// waiting keys is taken ONCE, at one `now`, before the dequeue, and
+    /// passed to it as `exclude`, so the WAL leases nothing of theirs. A key
+    /// whose wait lapses during the pass waits for the next pass. The record
+    /// returned is therefore the oldest of a non-waiting key that is still
+    /// visible (the dequeue is FIFO per key); an older one of its key can
+    /// only be leased in `held` (the pool path is idle: `in_flight == 0` at
+    /// both call sites), where `ackLanded` orders the acks by WAL id.
     fn syncFlush(self: *Coordinator, hold: bool) SyncResult {
-        const lease = (self.wal.dequeue(.{ .visibility_timeout_ns = vis_timeout_ns }) catch null) orelse
-            return .none;
+        defer self.waiting.clearRetainingCapacity();
+        // No room for the list: nothing is leased, the next pass retries.
+        self.collectWaiting() catch return .none;
+        const lease = (self.wal.dequeue(.{
+            .visibility_timeout_ns = vis_timeout_ns,
+            .exclude = self.waiting.items,
+        }) catch null) orelse return .none;
         const op: Op = if (std.mem.eql(u8, lease.job_type, "del")) .del else .put;
         const res = switch (op) {
             .put => self.sink.write(lease.partition, lease.payload),
@@ -1170,6 +1191,23 @@ pub const Coordinator = struct {
             }
             self.flushFailed(key, lease);
             return .rejected;
+        }
+    }
+
+    /// Fill `waiting` with the keys whose retry deadline lies ahead, read
+    /// against one clock reading. Borrows the keys from `retry_at`, which
+    /// nothing changes before the dequeue that uses the list. The list is
+    /// empty on entry (`syncFlush` clears it on every exit). Cost: the
+    /// dequeue scans this list once per WAL partition, O(partitions ×
+    /// waiting keys) per pass (SPEC known limits; large only when many keys
+    /// back off at once, e.g. a sink outage with `retry_backoff_ns > 0`).
+    fn collectWaiting(self: *Coordinator) Allocator.Error!void {
+        if (self.retry_at.count() == 0) return;
+        try self.waiting.ensureTotalCapacity(self.gpa, self.retry_at.count());
+        const now = self.mono.now();
+        var it = self.retry_at.iterator();
+        while (it.next()) |e| {
+            if (now < e.value_ptr.*) self.waiting.appendAssumeCapacity(e.key_ptr.*);
         }
     }
 
@@ -1288,16 +1326,6 @@ pub const Coordinator = struct {
         const at = self.retry_at.get(key) orelse return false;
         if (self.mono.now() < at) return true;
         self.clearRetry(key);
-        return false;
-    }
-
-    /// True while any key waits out its retry backoff.
-    fn anyRetryWaiting(self: *Coordinator) bool {
-        const now = self.mono.now();
-        var it = self.retry_at.valueIterator();
-        while (it.next()) |at| {
-            if (now < at.*) return true;
-        }
         return false;
     }
 
@@ -3649,6 +3677,243 @@ test "back-pressure does not retry a key early: its synchronous backstop waits f
     try testing.expectEqualStrings("v", rig.sink.get("k").?);
 }
 
+/// A reopened WAL holding `puts` (key, value) in order: none of its keys is
+/// cache-dirty, so only the synchronous backstop reaches them. The records
+/// are written with `o.cap` (a record keeps the attempt cap it was enqueued
+/// with).
+fn reopenWithPuts(rig: *FailRig, clk: *FakeClock, puts: []const [2][]const u8, o: OpenWith) !*Coordinator {
+    {
+        const c = try openWith(rig, clk, .{ .cap = o.cap });
+        for (puts) |kvp| try c.put(kvp[0], kvp[1]);
+        c.deinitNoFlush();
+    }
+    return openWith(rig, clk, o);
+}
+
+test "F5b: a key waiting out its retry backoff no longer stalls the synchronous backstop for the other keys" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    // cap 2: one attempt counted while "a" waits would dead-letter it.
+    const c = try reopenWithPuts(&rig, &clk, &.{ .{ "a", "1" }, .{ "b", "2" }, .{ "a", "3" } }, .{
+        .backoff_ns = hour,
+        .cap = 2,
+        .flush_timeout_ns = 100 * std.time.ns_per_ms,
+    });
+    defer c.deinit();
+    rig.sink.reject_key = "a";
+    try testing.expect(!c.flushOneSync()); // a's oldest is rejected: "a" waits an hour
+    try testing.expect(waitsNow(c, "a"));
+    rig.sink.reject_key = null;
+    // flushAll's backstop excludes "a" (both of its records) and lands "b";
+    // before 2026-11-19 it did not run at all while "a" waited.
+    try testing.expectError(error.FlushIncomplete, c.flushAll());
+    try testing.expectEqualStrings("2", rig.sink.get("b").?);
+    try testing.expect(rig.sink.get("a") == null); // not retried early
+    try testing.expectEqual(@as(usize, 2), rig.sink.seen);
+    try testing.expectEqual(@as(usize, 2), c.pendingCount());
+    // Nothing of "a" was leased, nothing counted.
+    try testing.expectEqual(@as(usize, 0), c.wal.leasedCount());
+    try testing.expectEqual(@as(usize, 0), c.held.items.len);
+    try testing.expectEqual(@as(usize, 0), c.wal.deadLetterCount());
+    // Once the wait is over (at its deadline exactly: `retry_at` is the
+    // first instant the key may go), "a" lands in WAL order: the newer
+    // value wins.
+    _ = clk.ns.fetchAdd(hour, .monotonic);
+    try c.flushAll();
+    try testing.expectEqualStrings("3", rig.sink.get("a").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+    try testing.expectEqual(@as(usize, 0), c.poisonedCount());
+}
+
+/// A monotonic clock that jumps forward once, at its `jump_at`-th reading:
+/// lets a test move time between two reads inside one call.
+const StepClock = struct {
+    ns: u64 = 0,
+    reads: u32 = 0,
+    jump_at: u32 = std.math.maxInt(u32),
+    jump_ns: u64 = 0,
+    fn mono(ctx: ?*anyopaque) u64 {
+        const s: *StepClock = @ptrCast(@alignCast(ctx.?));
+        s.reads += 1;
+        if (s.reads == s.jump_at) s.ns += s.jump_ns;
+        return s.ns;
+    }
+};
+
+test "F5b review: a key whose backoff lapses in the middle of a pass is not written past its own older record" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("a", "1");
+        try c.put("a", "3");
+        c.deinitNoFlush();
+    }
+    var step: StepClock = .{};
+    const c = try Coordinator.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .sink = rig.sink.sink(),
+        .wal_store = rig.wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 64,
+        .n_workers = 1,
+        .retry_backoff_ns = hour,
+        .wal_wall_clock = .{ .ctx = &clk, .nowFn = FakeClock.wall },
+        .wal_mono_clock = .{ .ctx = &step, .nowFn = StepClock.mono },
+    });
+    defer c.deinit();
+    rig.sink.reject_key = "a";
+    try testing.expect(!c.flushOneSync()); // "a"'s oldest rejected: "a" waits an hour
+    rig.sink.reject_key = null;
+    // The backoff lapses at the 4th clock reading from here. In the
+    // 2026-11-19 lease-and-release design that fell between the two dequeues
+    // of one pass (first record leased as waiting, second one written and
+    // acked, then the first released and written over it); now the waiting
+    // set is read once per pass, so wherever the jump falls the key's
+    // records go out oldest first.
+    step.reads = 0;
+    step.jump_at = 4;
+    step.jump_ns = 2 * hour;
+    _ = c.flushOneSync();
+    try c.flushAll();
+    // The newer value wins: the older record was never written over it.
+    try testing.expectEqualStrings("3", rig.sink.get("a").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "F5b review 2: the waiting set is fixed at the start of a synchronous pass, whatever the clock does during it" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    {
+        const c = try openWith(&rig, &clk, .{});
+        try c.put("a", "1");
+        try c.put("b", "2");
+        try c.put("a", "3");
+        c.deinitNoFlush();
+    }
+    var step: StepClock = .{};
+    const c = try Coordinator.init(testing.allocator, .{
+        .io = rig.threaded.io(),
+        .sink = rig.sink.sink(),
+        .wal_store = rig.wal_sim.storage(),
+        .wal_path = "wal.jq",
+        .max_cache_bytes = 1 << 20,
+        .max_cache_entries = 64,
+        .n_workers = 1,
+        .retry_backoff_ns = hour,
+        .wal_wall_clock = .{ .ctx = &clk, .nowFn = FakeClock.wall },
+        .wal_mono_clock = .{ .ctx = &step, .nowFn = StepClock.mono },
+    });
+    defer c.deinit();
+    rig.sink.reject_key = "a";
+    try testing.expectEqual(Coordinator.SyncResult.rejected, c.syncFlush(false)); // "a" waits an hour
+    rig.sink.reject_key = null;
+    // Inside the next pass: reading 1 is the waiting-set snapshot ("a"
+    // waits), reading 2 the WAL's lease deadline for the record it hands
+    // out; the backoff lapses there. The pass writes "b" and nothing of "a"
+    // (a design that re-checks the wait per dequeued record writes a1 here).
+    step.reads = 0;
+    step.jump_at = 2;
+    step.jump_ns = 2 * hour;
+    try testing.expectEqual(Coordinator.SyncResult.landed, c.syncFlush(false));
+    try testing.expectEqualStrings("2", rig.sink.get("b").?);
+    try testing.expect(rig.sink.get("a") == null);
+    try testing.expectEqual(@as(usize, 0), c.wal.leasedCount());
+    // The next pass sees the lapse: "a" goes oldest first, then its newer one.
+    try testing.expectEqual(Coordinator.SyncResult.landed, c.syncFlush(false));
+    try testing.expectEqualStrings("1", rig.sink.get("a").?);
+    try c.flushAll();
+    try testing.expectEqualStrings("3", rig.sink.get("a").?);
+    try testing.expectEqual(@as(usize, 0), c.pendingCount());
+}
+
+test "F5b: back-pressure makes room through another key while one key waits out its backoff" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try reopenWithPuts(&rig, &clk, &.{ .{ "a", "1" }, .{ "b", "2" } }, .{
+        .backoff_ns = hour,
+        .max_unflushed = 2,
+        .put_block_ns = 30 * std.time.ns_per_ms,
+    });
+    defer c.deinit();
+    rig.sink.reject_key = "a";
+    try testing.expect(!c.flushOneSync()); // "a" waits an hour
+    rig.sink.reject_key = null;
+    try c.put("x", "9"); // at the mark: "b" lands synchronously and makes room
+    try testing.expectEqualStrings("2", rig.sink.get("b").?);
+    try testing.expect(rig.sink.get("a") == null);
+    try testing.expectEqual(@as(usize, 2), rig.sink.seen);
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+}
+
+test "F5b: the synchronous path reads the waiting keys afresh each pass and lets a key go at its deadline exactly" {
+    // Only the synchronous path here (no drain): the pool path's own
+    // `retryWaiting` would otherwise flush the key and hide a stale list.
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try reopenWithPuts(&rig, &clk, &.{.{ "a", "1" }}, .{ .backoff_ns = hour });
+    defer c.deinit();
+    rig.sink.reject_key = "a";
+    try testing.expect(!c.flushOneSync()); // "a" waits an hour
+    rig.sink.reject_key = null;
+    try testing.expect(!c.flushOneSync()); // excluded: nothing written
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen);
+    try testing.expectEqual(@as(usize, 0), c.waiting.items.len); // cleared on exit
+    _ = clk.ns.fetchAdd(hour, .monotonic); // the deadline itself: no longer waiting
+    try testing.expect(c.flushOneSync());
+    try testing.expectEqualStrings("1", rig.sink.get("a").?);
+}
+
+test "F5b: no room for the waiting-key list ends the synchronous pass with nothing leased" {
+    var rig: FailRig = undefined;
+    rig.init(.{ .gpa = testing.allocator });
+    defer rig.deinit();
+    var clk: FakeClock = .{};
+    const hour: u64 = 3600 * std.time.ns_per_s;
+    const c = try reopenWithPuts(&rig, &clk, &.{ .{ "a", "1" }, .{ "b", "2" } }, .{ .backoff_ns = hour, .cap = 2 });
+    defer c.deinit();
+    rig.sink.reject_key = "a";
+    try testing.expect(!c.flushOneSync()); // "a" waits an hour
+    rig.sink.reject_key = null;
+    c.waiting.clearAndFree(c.gpa);
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const gpa = c.gpa;
+    c.gpa = fa.allocator();
+    const res = c.syncFlush(false);
+    c.gpa = gpa;
+    try testing.expect(fa.has_induced_failure);
+    try testing.expectEqual(Coordinator.SyncResult.none, res);
+    try testing.expectEqual(@as(usize, 0), c.wal.leasedCount());
+    try testing.expectEqual(@as(usize, 1), rig.sink.seen); // neither key written
+    try testing.expect(c.flushOneSync()); // the next pass lands "b", still not "a"
+    try testing.expectEqualStrings("2", rig.sink.get("b").?);
+    try testing.expect(rig.sink.get("a") == null);
+    _ = clk.ns.fetchAdd(hour + 1, .monotonic);
+}
+
+/// Whether `key` waits out a retry backoff now (read-only: unlike
+/// `retryWaiting`, a lapsed entry is left in place).
+fn waitsNow(c: *Coordinator, key: []const u8) bool {
+    const at = c.retry_at.get(key) orelse return false;
+    return c.mono.now() < at;
+}
+
 test "the synchronous path keeps the per-key retry deadlines exact: cleared on landing and on dead-lettering, moved on a new rejection" {
     var rig: FailRig = undefined;
     rig.init(.{ .gpa = testing.allocator, .fail_n = 3 });
@@ -3661,12 +3926,12 @@ test "the synchronous path keeps the per-key retry deadlines exact: cleared on l
     c.drain();
     try waitCompletion(c);
     c.drain(); // first rejection (pool path): "k" waits an hour
-    try testing.expect(c.anyRetryWaiting());
+    try testing.expect(waitsNow(c, "k"));
     _ = clk.ns.fetchAdd(hour + 1, .monotonic);
-    try testing.expect(!c.anyRetryWaiting());
+    try testing.expect(!waitsNow(c, "k"));
     // Second rejection, on the synchronous path: the lapsed deadline moves on.
     try testing.expect(!c.flushOneSync());
-    try testing.expect(c.anyRetryWaiting());
+    try testing.expect(waitsNow(c, "k"));
     _ = clk.ns.fetchAdd(hour + 1, .monotonic);
     // Third rejection dead-letters it (cap 3): nothing is left waiting.
     try testing.expect(!c.flushOneSync());
