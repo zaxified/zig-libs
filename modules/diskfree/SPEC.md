@@ -6,7 +6,7 @@
 
 **Scope:** parity — GNU coreutils df 9.12 (surveyed 2026-11-02)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (8/9, 1 eq) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-19 (24/26, 2 eq) · src a66cf50b39a17a3e
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DISKFREE_FUZZ) · ct n/a — statvfs reporting (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: OutOfMemory propagates instead of "no data" / a short table; delta audit 14/14)
 
@@ -443,7 +443,7 @@ with `procnet`'s, and this is a property of `Smith`, not of either module.
 
 ## Backlog / deferred
 
-- **`lookup.containing` on a hostile mountinfo snapshot** *(2026-11-03)*: a parent cycle ends, because the walk is bounded by the table size, but each step scans the table, so a cycle costs O(n²): by arithmetic about 1.7e10 comparisons for a 1 MiB table of 130k rows, not measured, and `collectWith` with `Options.tree` repeats it for up to `max_mounts` candidates. A table the kernel wrote has no cycle and depth is small. A step cap is not simple: stacks on one mount point are bounded only by `fs.mount-max`. Matters only for a caller passing an untrusted saved table.
+- ~~**`lookup.containing` on a hostile mountinfo snapshot**~~ **DONE 2026-11-19** *(2026-11-03)*: `lookup.Index` + `lookup.containingIndexed` answer from a parent-id sorted index (built once per table) and resolve a parent cycle by remembering the visited entries, so a cycle through every entry costs O(n) steps of O(log n + children) instead of n scans of the table; `table.collectWith` builds one `Index` for all its `Options.tree` candidates. The answer is identical to `containing` on every table (a randomized cross-check over 3000 hostile tables with cycles and duplicate ids; the walk still stops after `entries.len` steps, so the entry at that position of a cycle is returned). `containing` itself keeps its signature and stays non-allocating (O(depth x n) per call, fine on a kernel-written table); a caller with an untrusted saved table builds an `Index`. Delta mutation 2026-11-19: 17 mutants over `Index`/`containingIndexed`/`indexNext`, 16 killed, 1 EQUIVALENT (cost-only: disabling the cycle detection gives the same answer, because the walk is bounded by `entries.len` either way; the detection only avoids re-scanning non-covering children on every step of a hostile two-entry loop, a speed difference a test cannot assert on).
 
 Survey 2026-09-30 — missing and it matters (all pure Zig, fit CONVENTIONS §2; the module stays Linux-only by design):
 

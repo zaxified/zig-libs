@@ -124,6 +124,10 @@ pub fn collectWith(gpa: std.mem.Allocator, entries: []const mounts.MountEntry, o
     errdefer rows.deinit(gpa);
     var truncated = false;
     var candidates: usize = 0; // bounds the tree lookups to max_mounts of them
+    // One parent-id index for every candidate's lookup: a hostile saved table with a
+    // parent cycle would otherwise cost O(n^2) per candidate.
+    var index: ?lookup.Index = if (tree) |t| try lookup.Index.init(gpa, t) else null;
+    defer if (index) |ix| ix.deinit(gpa);
     for (kept.items) |i| {
         const e = entries[i];
         if (!opts.include_pseudo and classify.isPseudo(e.fs_type)) continue;
@@ -135,7 +139,7 @@ pub fn collectWith(gpa: std.mem.Allocator, entries: []const mounts.MountEntry, o
         }
         candidates += 1;
         if (tree) |t| {
-            const top = lookup.containing(t, e.mount_point) catch null;
+            const top = lookup.containingIndexed(&index.?, t, e.mount_point) catch null;
             if (top == null or top.? != i) continue; // covered by a later mount
         }
         const u = queryFn(e.mount_point) catch continue;

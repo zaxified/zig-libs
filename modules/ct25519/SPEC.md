@@ -6,7 +6,7 @@
 
 **Scope:** parity — curve25519-dalek 5.0 (secret-scalar group operations), not a full curve25519 library: point and scalar types are `std`'s (surveyed 2026-10-10)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-13 (117/126, 9 eq) · src b01eee5cb2431d7f
+**Audit:** review 2026-09-15 · mutation 2026-11-13 (117/126, 9 eq) · src 91dc4550dc67787a
 
 Audit detail: the 2026-11-01 mutation run (first scored run) covers the X25519 ladder and fe64 asm, the Edwards comb, Ed25519 verify, point decoding, wNAF/MSM and encodings: 11 survivors closed by new tests (the portable 4-bit comb was never executed on BMI2 hosts, a `mul121665` carry at ~2^-47, `combRecode5` digit range, `wipeState`, an identity-R forgery against `verifyEd25519Strict`); the last survivor — dropping `mul`'s scalar wipe, visible only to a ReleaseFast stack probe — was run on 2026-11-13 and is killed: `STACKPROBE: no scalar or shared-secret residue …` finds 2 images of the scalar after both `mul` and `mulRistretto` (M0 44/47 clean under the same `modtest -Doptimize=ReleaseFast`). Delta 2026-11-13 over P9 (`cswap_asm`, `addsub_asm`), one build per mutant: 10 mutants — the swap mask dropped, one side not swapped, the top limb not swapped; the sum's and the difference's first fold constant (38 → 37), second fold dropped, top carry/borrow ignored, the difference's top limb not stored — all killed; the two second-fold mutants survived the first run (no test drove both inputs near 2^256 through `addsub`) and are killed by `addsub` added to the `P6 fe64` edges × edges differential, every output aliasing. 2026-11-13: since that run the source changed only in test code (`fuzz_test.zig` and a test-only `hex32` helper in `root.zig` now come from `testkit.hex`, duplicate-code pass); no production line moved, so the run above still covers every guard and no delta mutants exist.
 
@@ -893,7 +893,7 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-17 at the router-tool 
 
 ## Backlog / deferred
 
-- **Document a minimum stack size (review GP, 2026-10-30).** `mulMulti*` reserves 8 x 16 `Edwards25519` (about 21.5 KiB) in `strausChunk` and burns `msm_burn` (32 KiB); `recoverPublicKey` burns 16 KiB. Publish a minimum stack in the README/`meta`; optionally size the Straus tables by `points.len`.
+- ~~**Document a minimum stack size (review GP, 2026-10-30).**~~ **DONE 2026-11-19** (README "Stack use": 64 KiB free stack; tables 21504 B, `msm_burn` 32 KiB, `x25519_base_burn` 16 KiB, `x25519_burn` 4 KiB; the test `stack use: ...` (`src/stackprobe2_test.zig`) pins the sizes and runs `mulMulti`, `mulMultiRistretto`, `recoverPublicKeyInto` and `scalarmultInto` in a 64 KiB thread). The module has no `meta` stack field, so none was added. Sizing the Straus tables by `points.len` stays dropped (the chunk is a stack bound, not a tuning knob).
 
 - ~~**Build option: `ct25519-base-comb`**~~ ✅ DONE 2026-10-17 (the router-tool consumer request) — see § Build options.
 - ~~**Performance: the X25519 shared secret, 1.09× libsodium / 1.21× OpenSSL**~~ — DONE 2026-10-31 (P7: 0.82× / 0.92×). *(bench

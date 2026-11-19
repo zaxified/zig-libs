@@ -38,6 +38,18 @@ torsion components included — std's `Edwards25519.mulMulti` is variable-time.
 **`X25519`** — `std.crypto.dh.X25519`'s shape (`KeyPair.generateDeterministic`/`generate`, `recoverPublicKey`, `scalarmult`, the lengths) with key generation on the comb plus the Edwards→Montgomery map, 2.36× std's ladder (21.8 vs 51.6 µs). Bit-exact with std (RFC 7748 §6.1 vectors, 512-seed differential); ctgrind target `x25519`. SPEC.md § "X25519 key generation on the comb".
 Since 2026-09-29 `scalarmult` (the shared secret) runs the RFC 7748 ladder on a 4×64-bit field in x86-64 `mulx` (BMI2) / `adcx`+`adox` (ADX) inline assembly when the build target has those features and the backend is LLVM — chosen at compile time, std's ladder otherwise — 1.16–1.23× std's ladder in ReleaseFast (≈ 44–47 vs 54–57 µs, both asm paths). Same signature and bytes as std's, `error.IdentityElement` included; held to std over RFC 7748 §5.2/§6.1, thousands of random and edge inputs per backend, and a field-level `u512` differential; the ctgrind `x25519` target now covers it (0 contexts in the module, positive controls fire). SPEC.md § P6.
 
+**Stack use.** No allocation, no globals; the cost is stack. `mulMulti` and
+`mulMultiRistretto` hold one Straus pass of up to 8 terms at a time: 8 x 16
+`Edwards25519` tables = 21504 B (21 KiB) in `strausChunk`, however many points
+you pass (more terms run in further passes); afterwards they burn 32 KiB of dead
+stack (`msm_burn`; the body dirtied 28.5 KiB in ReleaseFast). `X25519.recoverPublicKey`
+/`recoverPublicKeyInto` burn 16 KiB, `X25519.scalarmult` 4 KiB; `mul`/`mulBase` need
+only a few KiB. **Give a thread that calls them at least 64 KiB of free stack**, which
+covers the 32 KiB burn plus the body's frames in the build `scripts/modtest` runs; a test
+(`stack use: ...` in `src/stackprobe2_test.zig`) pins every figure above and runs the four
+entry points in a 64 KiB thread. Embedded or coroutine stacks smaller than that need a
+bigger one for these calls (the Straus tables are not sized by `points.len`).
+
 **`mulBase`/`mulRistrettoBase` are a fixed-base comb, not the ladder (since
 2026-09-16, audit C3).** The base point used to run the same 16-entry window
 ladder as any point, spending 71 % of its time in 252 doublings. It now uses

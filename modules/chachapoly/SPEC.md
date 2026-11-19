@@ -802,7 +802,7 @@ First pass: 15 survivors. Five were test gaps, now closed by three tests in
 
 - `final` dropping any of its four power-table wipes (or the whole block) stayed
   green — r^L, 5·r^L and both fold vectors are key-derived and outside std's own
-  wipe. Test: "final wipes the key-derived power table it built". ✅ DONE 2026-10-04 (test "final wipes the key-derived power table it built", modules/chachapoly/src/poly1305.zig, commit 721bad72e).
+  wipe. Test: "final wipes the key-derived power table it built". ✅ DONE 2026-10-04 (test "final wipes the key-derived power table it built", modules/chachapoly/src/poly1305.zig, commit 721bad72e). Re-checked 2026-11-19 against the current `final` (full and half tables): 12 mutants (each of the eight table wipes dropped, each `*_ready = false` dropped, each wipe guard dropped) all killed by that one test in a plain schemata build (the table fields are read after `final`, so no stack probe is needed); the wide-backlog line that still named this item as open was stale.
 - A partial-block top-up that over-filled (`leftover != 0` afterwards) kept every
   later bulk on the serial core, bytes unchanged. Test: "a partial block topped up
   by update still reaches the wide engine" (witness after a 1/5/15-byte head).
