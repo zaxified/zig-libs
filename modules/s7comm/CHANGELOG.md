@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** SPEC scope line restored to the catalog format after the clock item.
 - **2026-11-19** — Delta mutation of the time-of-day code: 57 mutants, 12 survived and were killed by new tests (reply tampering via the paired-transport test hook, request bytes pinned, subfunction 0x04, sequence echo, invalid clock value); 57 of 57 killed. No library code changed.
 - **2026-11-19** — Time-of-day services (userdata group 7): `Client.readClock`/`setClock`, `userdata.DateTime` (10-octet BCD, every digit and range validated, `error.BadDateTime`), `userdata.TimeSubfunction`, responder `Config.clock` (`server.Clock`, caller-supplied `now`/optional `set`; no system time). Additive; no behaviour change for existing calls (a Userdata group-7 request used to be `error.Unsupported` from `handle`, now it is answered).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
