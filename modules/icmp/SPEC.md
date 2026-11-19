@@ -6,7 +6,7 @@
 
 **Scope:** parity — fping v5.5 (Linux) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-17 (536/590, 54 eq) · src 6d8f9dc7f1ead956
+**Audit:** review 2026-09-10 · mutation 2026-11-19 (544/600, 56 eq) · src 0158e39e6fb1dca1
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, ICMP_FUZZ) · ct n/a — ICMP ping/codec (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: max_inflight 0, ns saturation, bounded O(N log N) subnet pacing, callback re-entrancy, no spin under the in-flight cap, bounded step(), prepare reserves the queue; delta audit 65/68 + 3 eq)
 
@@ -123,6 +123,8 @@ header is 58), so an ICMP error quoting a UDP datagram whose first payload byte 
 `quoted_proto` reports 17. fping's `handle_random_icmp` and iputils `ping4_parse_reply` (`ping/ping.c`: quoted type, destination
 and id only) do not check it, and Go `x/net/icmp` hands the quoted datagram back raw; the engine's ident/slot/destination checks
 follow. The `quoted_proto` comment now says so (it claimed "always 1"), and a test pins the reported value.
+
+**Delta mutation 2026-11-19 (wave-9 fixes: `ee_info`, checked cmsg walk, `nsToTimespec`).** 10 schemata mutants (ReleaseSafe, one switch per mutant): 8 killed, 2 equivalent. Killed: dropped `ee_info` assignment, `>` to `>=` and `<` to `<=` on the cmsg length guards, the dropped room check (panics on the lying-length test), the unclamped negative wait, the saturation arm (0 and max-1), and the nanosecond part. Equivalent: the walk's `step > control.len - off` check (dropped, or `>=`) is belt and braces, because the loop guard `off + hdr_len <= control.len` already ends the walk once `off` reaches the end and the length check bounds `step` far below overflow.
 
 ## Backlog / deferred
 None beyond the accepted Linux-only platform ceiling (raw-syscall nature, shared with rawsock/
