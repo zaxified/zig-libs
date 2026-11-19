@@ -1226,3 +1226,25 @@ test "SA: a MAC algorithm that cannot confirm a key change refuses it" {
     try testing.expectEqual(@as(u8, 0), rig.users[0].key_len);
     try testing.expectEqual(@as(u32, 1), rig.auth.stats.failed_session_key_changes);
 }
+
+test "SA: a challenged request does not abandon the response awaiting its confirm" {
+    var rig: Rig = .{};
+    rig.setup(.{}, true);
+    rig.bouts[0].class = .class1;
+    rig.station.update(.binary_output_status, 0, .{ .binary = true }, 0);
+    const events = (try rig.send(&hex("c1013c0206"), 0)).?; // READ class 1
+    try testing.expect(events[0] & 0x20 != 0); // CON
+    try testing.expect(rig.station.awaiting_confirm);
+    var req: [32]u8 = undefined;
+    _ = try challengeCsq((try rig.send(crobRequest(&req, 2, .direct_operate, 1), 1)).?);
+    try testing.expect(rig.station.awaiting_confirm);
+    try testing.expectEqual(@as(?u4, 1), rig.station.last_request_seq);
+    // SA's own exchanges do not either; an authenticated request does.
+    try rig.installKeys(1, 2);
+    try testing.expect(rig.station.awaiting_confirm);
+    const csq = try challengeCsq((try rig.send(crobRequest(&req, 3, .direct_operate, 1), 3)).?);
+    var buf: [64]u8 = undefined;
+    _ = (try rig.send(try rig.reply(&buf, 3, csq, 1, &kat_control_key), 4)).?;
+    try testing.expect(!rig.station.awaiting_confirm);
+    try testing.expectEqual(@as(?u4, 3), rig.station.last_request_seq);
+}

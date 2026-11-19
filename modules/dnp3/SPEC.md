@@ -339,6 +339,23 @@ Behaviour, and why:
   known user without keys (NOT_INIT), and that window refuses every key change. Timing still
   differs (no MAC is computed for an unknown or unkeyed user); user numbers are not secret.
 
+- *A request SA only challenges, refuses or ignores does not touch the outstation (review LOW-2).*
+  The screen runs before the outstation abandons a response series, clears the await-confirm
+  state or records the sequence number, so an unauthenticated critical request no longer aborts a
+  multi-fragment response or an event report awaiting its CONFIRM.
+- *Unauthenticated state changes that remain (review LOW-2, documented).* CONFIRM is not critical
+  (as in the standard), so a forged CONFIRM retires the events in flight. IMMEDIATE_FREEZE and
+  FREEZE_CLEAR are optional-critical and left out of the default set. A caller who needs them
+  authenticated adds them with `FunctionSet.with`. CONFIRM cannot usefully be challenged.
+- *Aggressive-mode age and online guessing (review LOW-1, documented).* An aggressive-mode request
+  stays valid until the CSQ or the last challenge moves on, or the keys expire, so a withheld
+  request can be delivered late. The standard has the same property and adds no timeout either.
+  There is also no per-user lockout after repeated MAC failures: the g120v7 replies stop after
+  `max_error_messages`, but verification continues. With the default 16-octet MAC that is moot.
+  With the 4- or 8-octet truncations it leaves online guessing unthrottled. Candidates: a
+  maximum age measured from the last challenge, and invalidating a user's keys after N failures
+  (the standard's maximum-authentication-failures statistic).
+
 **Anchoring.** No live SA peer exists, so the first `secure_auth` test pins a whole exchange
 against vectors **derived by hand outside the module**: Python's `hmac`/`hashlib` for every MAC
 and the `cryptography` package's RFC 3394 wrap for the g120v6 payload, over the byte layouts

@@ -827,20 +827,29 @@ pub const Outstation = struct {
             return try self.errorResponse(seq, .{ .parameter_error = true }, out);
         }
 
-        // Any new request abandons an unfinished multi-fragment response.
-        self.cursor = null;
-        self.awaiting_confirm = false;
-        self.last_request_seq = seq;
-
+        // Secure Authentication screens first: a request it only challenges,
+        // refuses or ignores is not yet a request the outstation acts on, so
+        // it must not abandon a response series in progress either.
         if (self.secure_auth) |auth| {
             switch (try auth.screen(request, function, seq, body, peer, now_ms, self.iin(), out)) {
                 .pass => {},
                 .silent => return null,
                 .reply => |fragment| return .{ .fragment = fragment, .confirm_requested = false, .more = false },
-                .execute => |e| return try self.dispatch(e.function, e.seq, e.body, peer, now_ms, out),
+                .execute => |e| {
+                    self.beginRequest(e.seq);
+                    return try self.dispatch(e.function, e.seq, e.body, peer, now_ms, out);
+                },
             }
         }
+        self.beginRequest(seq);
         return try self.dispatch(function, seq, body, peer, now_ms, out);
+    }
+
+    /// Any new request abandons an unfinished multi-fragment response.
+    fn beginRequest(self: *Outstation, seq: u4) void {
+        self.cursor = null;
+        self.awaiting_confirm = false;
+        self.last_request_seq = seq;
     }
 
     fn dispatch(
