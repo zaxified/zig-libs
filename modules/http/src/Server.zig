@@ -3493,6 +3493,12 @@ pub const GunzipBody = struct {
     /// has used a byte past the end of the body (a truncated stream -- see
     /// `gzip.PaddedSource`), and the bytes of that read are withheld.
     scratch: ?*const GunzipScratch = null,
+    /// How the decoded stream ended, latched: a reader may be polled again
+    /// after `EndOfStream` (std's `readVec` swallows the first one when it
+    /// already copied bytes, and `readSliceShort` then asks once more), and
+    /// the end check must not run twice -- the second `checkTrailer` read a
+    /// trailer that was already consumed and failed a valid body.
+    ended: enum { running, done, failed } = .running,
     reader: Reader,
 
     /// Running trailer-verification state (see `trailer_check`).
@@ -3524,6 +3530,11 @@ pub const GunzipBody = struct {
 
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const c: *GunzipBody = @alignCast(@fieldParentPtr("reader", r));
+        switch (c.ended) {
+            .running => {},
+            .done => return error.EndOfStream,
+            .failed => return error.ReadFailed,
+        }
         if (c.trailer_check) |*tc| {
             if (!tc.header_done) {
                 gzip.skipGzipHeader(tc.source) catch |err| switch (err) {
@@ -3583,11 +3594,13 @@ pub const GunzipBody = struct {
     /// The decoded stream ended: check the trailer when asked to, then that
     /// neither the stream nor its trailer ran past the end of the body.
     fn end(c: *GunzipBody) Reader.StreamError!usize {
+        c.ended = .failed;
         if (c.trailer_check) |*tc| {
             gzip.checkTrailer(tc.source, tc.crc, tc.size) catch
                 return error.ReadFailed;
         }
         try c.refuseTruncated();
+        c.ended = .done;
         return error.EndOfStream;
     }
 
@@ -5578,6 +5591,12 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         try rw.setHeader("Content-Type", "text/plain");
         if (req.query.len != 0) try rw.setHeader("X-Query", req.query);
         try rw.writeAll("hello");
+    } else if (std.mem.eql(u8, req.path, "/gzhash")) {
+        // The hash of the (decoded) body, for the gzip-body fuzz harness.
+        var buf: [512]u8 = undefined;
+        const n = try req.reader().readSliceShort(&buf);
+        var out: [24]u8 = undefined;
+        try rw.writeAll(try std.mem.print(&out, "h={x:0>16}", .{std.hash.Wyhash.hash(0, buf[0..n])}));
     } else if (std.mem.eql(u8, req.path, "/overcap")) {
         // Drains the body, records `bodyOverCap` after the failing read (or
         // the clean end), then fails on its own when the query says so.
@@ -11526,6 +11545,127 @@ test "fuzz driver: HTTP_FUZZ (server dispatch)" {
 
 test "fuzz harness: server dispatch, 300 seeds, reaches every outcome" {
     try DispatchMark.reach(fuzzDispatch, "http-server-dispatch", 300);
+}
+
+// ── fuzz: a gzip request body through the decoder and the serving loop ─────
+
+const GunzipMark = fz.Marker(enum { intact_served, damaged_refused });
+
+/// Compress a plaintext drawn from the source, damage the stream (flipped
+/// octets, a cut), and send it as a gzip request body with the trailer check
+/// on and off. Whatever std's flate does with a crafted stream, the loop must
+/// answer (never crash or hang), and with the check on a 200 must have handed
+/// the handler exactly the plaintext: the CRC-32 and ISIZE leave no other way
+/// for a damaged stream to be accepted.
+fn fuzzGzipBody(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var plain: [300]u8 = undefined;
+    const plen: usize = fz.drawInput(S, src, &plain, &.{});
+    // 0: as drawn (stored / fixed blocks); 1: a small alphabet (dynamic
+    // Huffman blocks); 2: the first 16 octets repeated (long matches).
+    switch (src.valueRangeAtMost(u8, 0, 2)) {
+        0 => {},
+        1 => for (plain[0..plen]) |*b| {
+            b.* = 'a' + (b.* & 3);
+        },
+        else => if (plen > 16) for (plain[16..plen], 0..) |*b, i| {
+            b.* = plain[i % 16];
+        },
+    }
+    const compressed = try gzipAlloc(plain[0..plen]);
+    defer gpa.free(compressed);
+    var damaged = false;
+    var n = compressed.len;
+    for (0..src.valueRangeAtMost(u8, 0, 3)) |_| {
+        const at = src.index(n);
+        const v = src.value(u8);
+        if (compressed[at] != v) damaged = true;
+        compressed[at] = v;
+    }
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+        const cut = src.index(n + 1);
+        if (cut != n) damaged = true;
+        n = cut;
+    }
+    const wire = try gpa.print("POST /gzhash HTTP/1.1\r\nHost: t\r\n" ++
+        "Content-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ n, compressed[0..n] });
+    defer gpa.free(wire);
+    var hash_buf: [24]u8 = undefined;
+    const want = try std.mem.print(&hash_buf, "h={x:0>16}", .{std.hash.Wyhash.hash(0, plain[0..plen])});
+
+    for ([_]bool{ true, false }) |verify| {
+        var out_buf: [1024]u8 = undefined;
+        const got = runStreamWith(.{ .max_decompressed_request_bytes = 400, .verify_inbound_trailer = verify }, null, wire, &out_buf);
+        if (!std.mem.startsWith(u8, got, "HTTP/1.1 ")) return error.NotAResponse;
+        const ok = std.mem.startsWith(u8, got, "HTTP/1.1 200 ");
+        if (!ok and !std.mem.startsWith(u8, got, "HTTP/1.1 413 ") and !std.mem.startsWith(u8, got, "HTTP/1.1 500 "))
+            return error.UnexpectedStatus;
+        if (ok and verify and !std.mem.endsWith(u8, got, want)) return error.CorruptBodyAccepted;
+        if (verify and !damaged and !ok) {
+            std.debug.print("intact gzip body of {d} octets refused: {s}\n", .{ plen, got[0..@min(got.len, 40)] });
+            return error.IntactBodyRefused;
+        }
+        if (verify and damaged and !ok) GunzipMark.mark(.damaged_refused);
+        if (verify and ok) GunzipMark.mark(.intact_served);
+    }
+}
+
+fn fuzzGzipBodySmith(_: void, smith: *std.testing.Smith) !void {
+    var script: [fz.script_cap]u8 = undefined;
+    const n = smith.slice(&script);
+    try fz.runFrom(fuzzGzipBody, smith, script[0..n]);
+}
+
+test "GunzipBody: a reader polled again after EndOfStream stays ended; readSliceShort reads a valid body at any size (verify_inbound_trailer on and off)" {
+    // std's `readVec` swallows the first EndOfStream when it already copied
+    // bytes and `readSliceShort` asks again: the second end check used to
+    // re-read the consumed trailer and fail a VALID body with ReadFailed.
+    var fails: usize = 0;
+    for ([_]bool{ true, false }) |verify| for ([_]u8{ 0, 1, 2 }) |mode| for (0..120) |len| {
+        var plain: [120]u8 = undefined;
+        var prng: std.Random.DefaultPrng = .init(len * 3 + mode);
+        prng.random().bytes(&plain);
+        switch (mode) {
+            0 => {},
+            1 => for (plain[0..len]) |*b| {
+                b.* = 'a' + (b.* & 3);
+            },
+            else => if (len > 16) for (plain[16..len], 0..) |*b, i| {
+                b.* = plain[i % 16];
+            },
+        }
+        const compressed = try gzipAlloc(plain[0..len]);
+        defer testing.allocator.free(compressed);
+        const wire = try testing.allocator.print("POST /gzhash HTTP/1.1\r\nHost: t\r\n" ++
+            "Content-Encoding: gzip\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ compressed.len, compressed });
+        defer testing.allocator.free(wire);
+        var out_buf: [1024]u8 = undefined;
+        const got = runStreamWith(.{ .max_decompressed_request_bytes = 400, .verify_inbound_trailer = verify }, null, wire, &out_buf);
+        var want_buf: [24]u8 = undefined;
+        const want = try std.mem.print(&want_buf, "h={x:0>16}", .{std.hash.Wyhash.hash(0, plain[0..len])});
+        if (!std.mem.startsWith(u8, got, "HTTP/1.1 200 ") or !std.mem.endsWith(u8, got, want)) fails += 1;
+    };
+    try testing.expectEqual(@as(usize, 0), fails);
+    // A body whose trailer is wrong stays refused on every later poll.
+    const compressed = try gzipAlloc("hello gzip");
+    defer testing.allocator.free(compressed);
+    compressed[compressed.len - 1] ^= 0xff; // ISIZE
+    const wire = try gzipRequest("gzip", compressed);
+    defer testing.allocator.free(wire);
+    var out_buf: [1024]u8 = undefined;
+    const got = runStreamWith(.{ .max_decompressed_request_bytes = 400, .verify_inbound_trailer = true }, null, wire, &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 "));
+}
+
+test "fuzz: a damaged gzip request body is refused or decodes to exactly the plaintext" {
+    try testing.fuzz({}, fuzzGzipBodySmith, .{});
+}
+
+test "fuzz driver: HTTP_FUZZ (gzip request body)" {
+    try fz.fuzz_driver.run(fuzzGzipBody, .{ .prefix = "HTTP_FUZZ", .name = "http-gzip-body" });
+}
+
+test "fuzz harness: gzip request body, 300 seeds, reaches every outcome" {
+    try GunzipMark.reach(fuzzGzipBody, "http-gzip-body", 300);
 }
 
 test "upgrade: a writer the h1 loop did not build refuses (h2, hand-built)" {

@@ -8177,6 +8177,31 @@ test "h2 Request.bodyOverCap: a streamed body over max_body_bytes and a gzip bod
     }
 }
 
+fn shortReadHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const n = try req.reader().readSliceShort(&buf);
+    var out: [16]u8 = undefined;
+    try rw.writeAll(try std.mem.print(&out, "n={d}", .{n}));
+}
+
+test "h2c serve: a valid gzip body read with readSliceShort is served with verify_inbound_trailer on and off (GunzipBody is polled again after EndOfStream)" {
+    const gpa = testing.allocator;
+    const compressed = try gzipOf(gz_plain);
+    defer gpa.free(compressed);
+    for ([_]bool{ true, false }) |verify| {
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const sid = try peer.conn.startStream(&peer.wire, &postEncoded("/echo", "gzip"), false);
+        try peer.conn.sendData(&peer.wire, sid, compressed, true);
+        var out_buf: [16384]u8 = undefined;
+        try runOffline(&peer, .{ .handler = shortReadHandler, .max_decompressed_request_bytes = 1 << 20, .verify_inbound_trailer = verify }, &out_buf);
+        try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+        var want: [16]u8 = undefined;
+        try testing.expectEqualStrings(try std.mem.print(&want, "n={d}", .{gz_plain.len}), peer.resp(sid).body.items);
+    }
+}
+
 fn closeHandler(_: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
     try rw.setHeader("Connection", "close");
     try rw.writeAll("bye");
