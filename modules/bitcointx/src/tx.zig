@@ -222,6 +222,63 @@ pub const Transaction = struct {
         defer allocator.free(ser);
         return hash256.sha256d(ser);
     }
+
+    /// Length of the non-witness serialization (`serializeLegacy(self).len`),
+    /// computed arithmetically -- no allocation. Bitcoin Core: `GetSerializeSize(
+    /// TX_NO_WITNESS(tx))`; rust-bitcoin: `Transaction::base_size`.
+    pub fn baseSize(self: Transaction) usize {
+        var n: usize = 4 + compactSizeLen(self.vin.len);
+        for (self.vin) |i| n += 32 + 4 + compactSizeLen(i.script_sig.len) + i.script_sig.len + 4;
+        n += compactSizeLen(self.vout.len);
+        for (self.vout) |o| n += 8 + compactSizeLen(o.script_pubkey.len) + o.script_pubkey.len;
+        return n + 4;
+    }
+
+    /// Length of the full serialization: the BIP144 form when the transaction
+    /// carries witness data (`hasWitnessData`, the same predicate `wtxid` uses),
+    /// else `baseSize()` -- exactly what Bitcoin Core's `GetSerializeSize(
+    /// TX_WITH_WITNESS(tx))` and rust-bitcoin's `Transaction::total_size` count.
+    /// No allocation. `error.WitnessCountMismatch` for a hand-built value whose
+    /// witness stacks do not match its inputs (what `serializeSegwit` refuses).
+    pub fn totalSize(self: Transaction) error{WitnessCountMismatch}!usize {
+        if (!self.hasWitnessData()) return self.baseSize();
+        if (self.witness.len != self.vin.len) return error.WitnessCountMismatch;
+        // marker + flag, then one stack per input.
+        var n: usize = self.baseSize() + 2;
+        for (self.witness) |w| {
+            n += compactSizeLen(w.items.len);
+            for (w.items) |item| n += compactSizeLen(item.len) + item.len;
+        }
+        return n;
+    }
+
+    /// BIP141 transaction weight: `3 * baseSize + totalSize`. Bitcoin Core:
+    /// `GetTransactionWeight`; rust-bitcoin: `Transaction::weight`. Saturates
+    /// instead of wrapping (unreachable for any buffer that fits in memory).
+    pub fn weight(self: Transaction) error{WitnessCountMismatch}!usize {
+        return self.baseSize() *| 3 +| try self.totalSize();
+    }
+
+    /// Virtual size, `ceil(weight / 4)`. Bitcoin Core's `GetVirtualTransactionSize`
+    /// WITHOUT its sigop-cost term (a policy input that needs the spent scripts;
+    /// callers who want it take `max(vsize, sigop_cost * bytes_per_sigop)`);
+    /// rust-bitcoin: `Transaction::vsize`.
+    pub fn vsize(self: Transaction) error{WitnessCountMismatch}!usize {
+        const wt = try self.weight();
+        return wt / 4 + @intFromBool(wt % 4 != 0);
+    }
+
+    /// True if this is a coinbase transaction: exactly one input whose prevout
+    /// is null (txid all zero, index `0xffffffff`). Bitcoin Core:
+    /// `CTransaction::IsCoinBase` (`vin.size() == 1 && vin[0].prevout.IsNull()`);
+    /// rust-bitcoin: `Transaction::is_coinbase`. No other field is consulted
+    /// (the scriptSig length rule of 2..100 octets is a block-validity rule,
+    /// not part of the definition).
+    pub fn isCoinbase(self: Transaction) bool {
+        if (self.vin.len != 1) return false;
+        const p = self.vin[0].prevout;
+        return p.vout == 0xffffffff and std.mem.allEqual(u8, &p.txid, 0);
+    }
 };
 
 // ── deserialize ──────────────────────────────────────────────────────────────
