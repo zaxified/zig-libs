@@ -1087,6 +1087,49 @@ fn fuzzEnvelope(rosctr: u8, params: []const u8, data: []const u8, out: []u8) ?[]
     return out[0..total];
 }
 
+/// A time-of-day request (group 7): subfunction 1-4 (sometimes anything), a
+/// date-time that is valid three times in four and otherwise raw octets, and a
+/// payload that is sometimes cut short or carries a failing return code.
+fn fuzzClockRequest(smith: anytype, out: []u8) ?[]const u8 {
+    var params: [userdata.Param.request_len]u8 = undefined;
+    const sub: u8 = if (drawOdds(smith, 7, 8)) @intCast(1 + drawBelow(smith, 4)) else drawWide(smith, u8);
+    const p = (userdata.Param{
+        .message_type = .request,
+        .function_group = .time_functions,
+        .subfunction = sub,
+        .sequence = drawWide(smith, u8),
+    }).encodeRequest(&params) catch return null;
+    var payload: [12]u8 = undefined;
+    var n: usize = userdata.DateTime.wire_len;
+    const dt: userdata.DateTime = .{
+        .year = @intCast(1990 + drawBelow(smith, 100)),
+        .month = @intCast(1 + drawBelow(smith, 12)),
+        .day = @intCast(1 + drawBelow(smith, 28)),
+        .hour = @intCast(drawBelow(smith, 24)),
+        .minute = @intCast(drawBelow(smith, 60)),
+        .second = @intCast(drawBelow(smith, 60)),
+        .millisecond = @intCast(drawBelow(smith, 1000)),
+        .weekday = @intCast(drawBelow(smith, 8)),
+    };
+    if (drawOdds(smith, 3, 4)) {
+        _ = dt.encode(&payload) catch return null;
+        // Maybe damage one octet: a BCD nibble above 9 is the interesting case.
+        if (drawOdds(smith, 1, 3)) payload[drawBelow(smith, 10)] = drawWide(smith, u8);
+    } else {
+        for (payload[0..10]) |*b| b.* = drawWide(smith, u8);
+    }
+    if (drawOdds(smith, 1, 5)) n = @intCast(drawBelow(smith, 13));
+    const rc: u8 = if (drawOdds(smith, 9, 10)) 0xFF else drawWide(smith, u8);
+    var data: [20]u8 = undefined;
+    const db = userdata.DataBlock.encode(
+        @fromBackingInt(@intCast(rc)),
+        @fromBackingInt(@intCast(0x09)),
+        payload[0..n],
+        &data,
+    ) catch return null;
+    return fuzzEnvelope(0x07, p, db, out);
+}
+
 /// Builds one request. Returns null when this draw could not be assembled, in
 /// which case the caller simply moves on.
 fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
@@ -1146,8 +1189,9 @@ fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
             smith.bytes(params[1..][0..tail]);
             plen = 1 + tail;
         },
-        // Userdata / Read SZL.
+        // Userdata: half of it is the time-of-day group (7), the rest Read SZL.
         else => {
+            if (drawOdds(smith, 1, 2)) return fuzzClockRequest(smith, out);
             rosctr = 0x07;
             const p = (userdata.Param{
                 .message_type = @fromBackingInt(@intCast(@as(u4, @truncate(if (drawOdds(smith, 7, 8)) @as(u8, 0) else drawWide(smith, u8))))),
@@ -1178,7 +1222,23 @@ fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
 }
 
 const fz = @import("fuzz_test.zig");
-const fuzzHandleMark = fz.Marker(enum { ran, request_built, replied });
+const fuzzHandleMark = fz.Marker(enum { ran, request_built, replied, clock_request, clock_read_ok, clock_set_applied, clock_refused });
+
+/// Clock callbacks for the harness: `set` counts the date-times that got
+/// through validation, and every such value must satisfy `validate`.
+const FuzzClock = struct {
+    var sets: usize = 0;
+    var bad_set: bool = false;
+    fn now(_: ?*anyopaque) userdata.DateTime {
+        return .{ .year = 2026, .month = 11, .day = 19, .hour = 13, .minute = 45, .second = 59, .millisecond = 987, .weekday = 5 };
+    }
+    fn set(_: ?*anyopaque, v: userdata.DateTime) void {
+        sets += 1;
+        v.validate() catch {
+            bad_set = true;
+        };
+    }
+};
 
 fn fuzzHandleSmith(_: void, smith: *std.testing.Smith) !void {
     try fuzzHandle(std.testing.Smith, smith, std.testing.allocator);
@@ -1202,7 +1262,7 @@ fn fuzzHandle(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     };
     var szl: [56]u8 = @splat(0x5A);
     var r = Responder.init(
-        .{ .allow_plc_control = true, .szl_0011 = &szl },
+        .{ .allow_plc_control = true, .szl_0011 = &szl, .clock = .{ .now = FuzzClock.now, .set = FuzzClock.set } },
         &areas,
     );
     var frame_buf: [1024]u8 = undefined;
@@ -1213,7 +1273,22 @@ fn fuzzHandle(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     while (n < 4) : (n += 1) {
         const frame = fuzzRequest(smith, &frame_buf) orelse continue;
         fuzzHandleMark.mark(.request_built);
+        const is_clock = frame.len >= 25 and frame[8] == 0x07 and frame[22] == 0x47;
+        if (is_clock) fuzzHandleMark.mark(.clock_request);
+        const sets_before = FuzzClock.sets;
         const reply = r.handle(frame, &out) catch continue;
         if (reply != null) fuzzHandleMark.mark(.replied);
+        if (is_clock) {
+            const rep = reply orelse continue;
+            // Never a value past validation, whatever the wire said.
+            try testing.expect(!FuzzClock.bad_set);
+            if (rep.len >= 29 and rep[27] == 0 and rep[28] == 0) {
+                if (FuzzClock.sets != sets_before) fuzzHandleMark.mark(.clock_set_applied) else fuzzHandleMark.mark(.clock_read_ok);
+            } else if (rep.len >= 29) {
+                fuzzHandleMark.mark(.clock_refused);
+                // A refusal must not have applied a set.
+                try testing.expectEqual(sets_before, FuzzClock.sets);
+            }
+        }
     }
 }

@@ -710,14 +710,18 @@ const userdata_seeds = [_][]const u8{
     fuzzSeed("ff09"), // truncated inside the data block header
     fuzzSeed("ff090008001100010004000000010002"), // an SZL response with one record
     fuzzSeed("ff09000c00110002000400000001000200030004"), // two records
-    fuzzSeed("ff0900080011000400040000"), // a record count past the payload
+    fuzzSeed("00202611191345599875"), // a valid date-time, ten octets
+    fuzzSeed("00199912312359599997"), // 1999, the last millisecond digit 9
+    fuzzSeed("0020261319134a599875"), // month 13, minute BCD digit A
+    fuzzSeed("00201902291200000000"), // 29 February 2019
+    fuzzSeed("0020261119134599"), // a date-time two octets short
 };
 
 test "fuzz: userdata decoders never panic" {
     try std.testing.fuzz({}, fuzzUserdataSmith, .{ .corpus = &userdata_seeds });
 }
 
-const fuzzUserdataMark = fz.Marker(enum { ran, nonempty });
+const fuzzUserdataMark = fz.Marker(enum { ran, nonempty, clock_decoded, clock_rejected });
 
 fn fuzzUserdataSmith(_: void, smith: *std.testing.Smith) !void {
     try fuzzUserdata(std.testing.Smith, smith, std.testing.allocator);
@@ -740,6 +744,15 @@ fn fuzzUserdata(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     if (DataBlock.decode(buf[0..len])) |db| {
         try testing.expect(db.payload.len + 4 <= len);
     } else |_| {}
+    if (DateTime.decode(buf[0..len])) |dt| {
+        fuzzUserdataMark.mark(.clock_decoded);
+        // Whatever decoded re-encodes, and re-decodes to the same value.
+        var again: [DateTime.wire_len]u8 = undefined;
+        const back = try DateTime.decode(try dt.encode(&again));
+        try testing.expectEqual(dt, back);
+    } else |_| {
+        if (len == DateTime.wire_len) fuzzUserdataMark.mark(.clock_rejected);
+    }
     if (SzlResponse.decode(buf[0..len])) |r| {
         var i: usize = 0;
         while (i < 300) : (i += 1) {

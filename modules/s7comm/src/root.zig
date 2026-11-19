@@ -398,6 +398,109 @@ test "clock client: not connected, request bytes, and every reply-shape check" {
     _ = try c.readClock();
 }
 
+// ── fuzz: the client parsing a damaged clock reply ──────────────────────────
+
+const fz = @import("fuzz_test.zig");
+const fuzzClockMark = fz.Marker(enum { ran, read_ok, read_err, set_ok, set_err });
+
+/// A wire whose replies are the responder's, damaged after the handshake:
+/// 0-3 octets anywhere, and in half the cases one more
+/// octet inside the parameters or the date-time, where the checks are.
+fn FuzzReplyWire(comptime S: type) type {
+    return struct {
+        const Self = @This();
+        responder: *Responder,
+        src: *S,
+        out: [4096]u8 = undefined,
+        queue: [4096]u8 = undefined,
+        queue_len: usize = 0,
+        queue_pos: usize = 0,
+        armed: bool = false,
+
+        fn seam(self: *Self) Transport {
+            return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
+        }
+
+        fn readFn(ctx: *anyopaque, buf: []u8) TransportError!usize {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const avail = self.queue_len - self.queue_pos;
+            if (avail == 0) return 0;
+            const n = @min(avail, buf.len);
+            @memcpy(buf[0..n], self.queue[self.queue_pos..][0..n]);
+            self.queue_pos += n;
+            return n;
+        }
+
+        fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const reply = (self.responder.handle(bytes, &self.out) catch return) orelse return;
+            self.queue_pos = 0;
+            if (!self.armed) {
+                @memcpy(self.queue[0..reply.len], reply);
+                self.queue_len = reply.len;
+                return;
+            }
+            // Every draw is a full-width `value(u64)` reduced here: a ranged or
+            // narrow draw collapses to its minimum under `Smith`.
+            var n = @min(reply.len, self.queue.len);
+            @memcpy(self.queue[0..n], reply[0..n]);
+            const hits = self.src.value(u64) % 4;
+            for (0..hits) |_| {
+                self.queue[self.src.value(u64) % n] = @truncate(self.src.value(u64));
+            }
+            // And one octet inside the parameters or the date-time, where the checks are.
+            if (self.src.value(u64) % 2 == 0 and n > 17) {
+                self.queue[17 + self.src.value(u64) % (n - 17)] = @truncate(self.src.value(u64));
+            }
+            // A truncated frame: the client must see a closed stream, not hang.
+            if (self.src.value(u64) % 6 == 0) n = @intCast(self.src.value(u64) % (n + 1));
+            self.queue_len = n;
+        }
+    };
+}
+
+fn fuzzClockClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    fuzzClockMark.mark(.ran);
+    const Ck = struct {
+        fn now(_: ?*anyopaque) DateTime {
+            return .{ .year = 2026, .month = 11, .day = 19, .hour = 13, .minute = 45, .second = 59, .millisecond = 987, .weekday = 5 };
+        }
+        fn set(_: ?*anyopaque, _: DateTime) void {}
+    };
+    var r = Responder.init(.{ .clock = .{ .now = Ck.now, .set = Ck.set } }, &.{});
+    var wire = FuzzReplyWire(S){ .responder = &r, .src = src };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(wire.seam(), &buf, .{});
+    try c.connect();
+    wire.armed = true;
+    if (src.value(u64) % 2 == 0) {
+        if (c.readClock()) |dt| {
+            // Whatever the client returns is a valid date-time.
+            try dt.validate();
+            fuzzClockMark.mark(.read_ok);
+        } else |_| fuzzClockMark.mark(.read_err);
+    } else {
+        if (c.setClock(Ck.now(null))) |_| fuzzClockMark.mark(.set_ok) else |_| fuzzClockMark.mark(.set_err);
+    }
+}
+
+fn fuzzClockClientSmith(_: void, smith: *std.testing.Smith) !void {
+    try fuzzClockClient(std.testing.Smith, smith, std.testing.allocator);
+}
+
+test "fuzz: the clock client survives damaged replies" {
+    try std.testing.fuzz({}, fuzzClockClientSmith, .{});
+}
+
+test "fuzz driver: S7COMM_FUZZ (fuzzClockClient)" {
+    try fz.fuzz_driver.run(fuzzClockClient, .{ .prefix = "S7COMM_FUZZ", .name = "s7comm-root-fuzzClockClient" });
+}
+
+test "fuzz harness: fuzzClockClient, 400 seeds, reaches every outcome" {
+    try fuzzClockMark.reach(fuzzClockClient, "s7comm-root-fuzzClockClient", 400);
+}
+
 test "round trip: an odd-length multi-item write pads the way the wire needs" {
     var db1: [64]u8 = @splat(0);
     var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db1 }};

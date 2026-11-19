@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Snap7 1.4.2; no block list or password, which Snap7 users call routinely (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-17 · mutation 2026-11-19 (99/100, 1 eq) · src 47ec566a35d88966
+**Audit:** review 2026-09-17 · mutation 2026-11-19 (99/100, 1 eq) · src 1a4a30958407aeb4
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, S7COMM_FUZZ) · ct n/a — PLC protocol, no auth in scope (keyword review, 2026-10-07)
 
