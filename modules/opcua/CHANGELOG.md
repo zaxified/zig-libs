@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **New API (no behaviour change):** client-side SecureChannel renewal — `SecureChannel.renew`, `renewalDue` (75 % of the revised lifetime on the caller's clock) and `renewIfDue`, plus `OpenOptions.now_ms`, `SecureChannel.token_installed_ms` and `RenewOptions`. The OpenSecureChannel exchange of `open` and `renew` is one shared function; `open`'s wire behaviour is unchanged.
 - **2026-11-19** — **New API (no behaviour change):** `Subscription.setMonitoringMode` — client-side SetMonitoringMode (OPC 10000-4 §5.12.4), one status per item id.
 - **2026-11-19** — **New API (no behaviour change):** `Subscription.modifyMonitoredItems` — client-side ModifyMonitoredItems (OPC 10000-4 §5.12.3); the handle table follows a changed `ClientHandle`. `services.result_fns` gained `modify_monitored_items` and `set_monitoring_mode`.
 - **2026-11-19** — **New API (no behaviour change):** `Session.translateBrowsePaths` — client-side TranslateBrowsePathsToNodeIds (OPC 10000-4 §5.8.4), the raw service like open62541's `UA_Client_Service_translateBrowsePathsToNodeIds`; tested against this module's own server over the in-memory pipe and, LIVE, against open62541.

@@ -10597,3 +10597,182 @@ test "root client over a pipe: setMonitoringMode switches items between disabled
     try testing.expectError(error.ServiceFault, sub.setMonitoringMode(.reporting, &.{}));
     try testing.expectEqual(status.bad_nothing_to_do, pc.channel.io.last_service_result);
 }
+
+/// Send a Read of the answer variable through `ch`, which the caller has
+/// dressed in whatever token and keys it wants to test.
+fn sendReadAnswer(rig: *const TestRig, ch: *services.Channel, auth_token: encoding.NodeId) !void {
+    const nodes = [_]services.ReadValueId{.{
+        .node_id = rig.answer_id,
+        .attribute_id = services.attribute_id.value,
+        .index_range = null,
+        .data_encoding = .{ .namespace_index = 0, .name = null },
+    }};
+    try ch.sendService(.message, services.type_id.read_request, services.ReadRequest, .{
+        .request_header = ch.nextRequestHeader(auth_token, 10_000),
+        .max_age = 0,
+        .timestamps_to_return = .both,
+        .nodes_to_read = &nodes,
+    }, services.encodeReadRequest);
+}
+
+test "root client over a pipe (SignAndEncrypt): renewal timeline at 75 % of the lifetime, old token accepted through the overlap and not past it" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x73)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var config = secureTestConfig(endpoints, pki);
+    config.security.?.min_token_lifetime_ms = 1_000;
+    config.security.?.token_renewal_overlap_ms = 5_000;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, config);
+    defer rig.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var pipe: PipeReader = undefined;
+    pipe.setup(&rig, &rbuf);
+    defer pipe.last.deinit(gpa);
+    var conn = transport.Connection.init(&pipe.reader, &rig.client_out.writer);
+    _ = try conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+
+    // The injected clock is the rig's: the server reads `rig.now_ms`, the client is told it.
+    rig.now_ms = 0;
+    var channel: root.SecureChannel = undefined;
+    try root.SecureChannel.open(&conn, gpa, .{
+        .requested_lifetime_ms = 10_000,
+        .now_ms = 0,
+        .security = .{
+            .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
+            .mode = .sign_and_encrypt,
+            .credentials = pki.client,
+            .server_certificate = pki.server.certificate_der,
+            .random = rig.prng.random(),
+        },
+    }, &channel);
+    var session = try root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url });
+    defer session.deinit();
+    try session.activate(null);
+    const token1 = channel.io.token_id;
+    const keys1 = channel.io.security.?.keys.?;
+    try testing.expectEqual(@as(u32, 10_000), channel.token_lifetime_ms);
+
+    // not due before 7 500 ms, due from it; a call before that renews nothing
+    try testing.expect(!channel.renewalDue(7_499));
+    try testing.expect(channel.renewalDue(7_500));
+    rig.now_ms = 7_499;
+    try testing.expect(!try channel.renewIfDue(7_499, .{}));
+    try testing.expectEqual(token1, channel.io.token_id);
+
+    // renew at 7 500: new token and keys, same channel, same lifetime, the clock restarts
+    rig.now_ms = 7_500;
+    const channel_id = channel.io.channel_id;
+    try testing.expect(try channel.renewIfDue(7_500, .{}));
+    const token2 = channel.io.token_id;
+    try testing.expect(token2 != token1);
+    try testing.expectEqual(channel_id, channel.io.channel_id);
+    try testing.expectEqual(token1, rig.conn.prev_token_id);
+    try testing.expectEqual(token2, rig.conn.token_id);
+    try testing.expectEqual(@as(i64, 10_000), rig.conn.prev_token_valid_until_ms); // min(old expiry 10 000, 7 500 + 5 000)
+    try testing.expectEqual(@as(u32, 10_000), channel.token_lifetime_ms);
+    try testing.expectEqual(@as(i64, 7_500), channel.token_installed_ms);
+    try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&keys1), std.mem.asBytes(&channel.io.security.?.keys.?)));
+    try testing.expect(!channel.renewalDue(7_501));
+    try testing.expect(!channel.renewalDue(14_999));
+    try testing.expect(channel.renewalDue(15_000));
+
+    // the session carries on under the new token
+    rig.now_ms = 7_600;
+    {
+        const value = try session.readAttribute(rig.answer_id, services.attribute_id.value);
+        defer encoding.freeDataValue(gpa, value);
+        try testing.expectEqual(@as(i32, 42), value.value.?.scalar.int32);
+    }
+
+    // A message sealed under the OLD token and keys, sent at the last instant of the
+    // overlap, is served (the answer comes back under the new keys).
+    {
+        var forge = channel.io;
+        forge.token_id = token1;
+        forge.security.?.keys = keys1;
+        rig.now_ms = 10_000;
+        try sendReadAnswer(&rig, &forge, session.authentication_token);
+        channel.io.request_id = forge.request_id;
+        channel.io.sequence_number = forge.sequence_number;
+        const response = try channel.io.recvService(.message, services.ReadResponse, services.type_id.read_response, services.decodeReadResponse, services.result_fns.read);
+        defer services.freeReadResponse(gpa, response);
+        try testing.expectEqual(@as(i32, 42), response.results.?[0].value.?.scalar.int32);
+    }
+    // ... and one millisecond later the old token is gone (the connection is torn down)
+    {
+        var forge = channel.io;
+        forge.token_id = token1;
+        forge.security.?.keys = keys1;
+        rig.now_ms = 10_001;
+        try sendReadAnswer(&rig, &forge, session.authentication_token);
+        channel.io.request_id = forge.request_id;
+        channel.io.sequence_number = forge.sequence_number;
+        try testing.expectError(error.ServerError, channel.io.recvService(.message, services.ReadResponse, services.type_id.read_response, services.decodeReadResponse, services.result_fns.read));
+        try testing.expect(rig.conn.isClosed());
+    }
+}
+
+test "root client over a pipe (SignAndEncrypt): a second renewal chains, a requested lifetime is revised, a closed channel cannot renew" {
+    const gpa = testing.allocator;
+    const root = @import("root.zig");
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x74)));
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const endpoints = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    var config = secureTestConfig(endpoints, pki);
+    config.security.?.min_token_lifetime_ms = 1_000;
+    config.security.?.max_token_lifetime_ms = 20_000;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, config);
+    defer rig.deinit();
+    var rbuf: [4096]u8 = undefined;
+    var pipe: PipeReader = undefined;
+    pipe.setup(&rig, &rbuf);
+    defer pipe.last.deinit(gpa);
+    var conn = transport.Connection.init(&pipe.reader, &rig.client_out.writer);
+    _ = try conn.hello(.{ .protocol_version = 0, .receive_buffer_size = 65536, .send_buffer_size = 65536, .max_message_size = 0, .max_chunk_count = 0, .endpoint_url = test_endpoint_url });
+
+    var channel: root.SecureChannel = undefined;
+    try root.SecureChannel.open(&conn, gpa, .{
+        .requested_lifetime_ms = 8_000,
+        .now_ms = 1_000,
+        .security = .{
+            .policy = .basic256sha256,
+            .insecure_allow_key_length_outside_policy = true,
+            .mode = .sign,
+            .credentials = pki.client,
+            .server_certificate = pki.server.certificate_der,
+            .random = rig.prng.random(),
+        },
+    }, &channel);
+    try testing.expectEqual(@as(i64, 1_000), channel.token_installed_ms);
+    // due at 1 000 + 6 000
+    try testing.expect(!channel.renewalDue(6_999));
+    try testing.expect(channel.renewalDue(7_000));
+
+    // two renewals in a row; the second asks for more than the server allows and is clamped
+    const t1 = channel.io.token_id;
+    rig.now_ms = 7_000;
+    try channel.renew(7_000, .{});
+    const t2 = channel.io.token_id;
+    try testing.expect(t2 != t1);
+    try testing.expectEqual(@as(u32, 8_000), channel.token_lifetime_ms); // null = the lifetime it has
+    rig.now_ms = 12_999;
+    try channel.renew(12_999, .{ .requested_lifetime_ms = 99_000 });
+    try testing.expect(channel.io.token_id != t2);
+    try testing.expectEqual(@as(u32, 20_000), channel.token_lifetime_ms);
+    try testing.expectEqual(@as(i64, 12_999), channel.token_installed_ms);
+
+    // the channel still works, and once closed (keys gone) a renewal is refused before any I/O
+    var session = try root.Session.create(&channel, gpa, .{ .client_description = client_description, .endpoint_url = test_endpoint_url });
+    defer session.deinit();
+    try channel.close();
+    try testing.expectError(error.InvalidSecureMessage, channel.renew(13_000, .{}));
+}

@@ -112,8 +112,18 @@ test {
 /// `sendAsymmetricOPNMessage`/`sendSymmetricMessage` split).
 pub const SecureChannel = struct {
     io: services.Channel,
+    /// The server's clock reading when it issued the current token
+    /// (`ChannelSecurityToken.CreatedAt`).
     token_created_at: encoding.DateTime = 0,
+    /// The server's revised token lifetime, milliseconds.
     token_lifetime_ms: u32 = 0,
+    /// The caller's own clock reading (`OpenOptions.now_ms` / the `now_ms` of
+    /// the last `renew`) when the current token arrived; `renewalDue` counts
+    /// from it. Not a wire field.
+    token_installed_ms: i64 = 0,
+
+    /// Renew at this share of the revised lifetime (OPC 10000-4 §5.5.2.1).
+    pub const renewal_fraction_percent: i64 = 75;
 
     pub const OpenOptions = struct {
         /// `OpenSecureChannelRequest.RequestedLifetime`, milliseconds. The
@@ -133,10 +143,14 @@ pub const SecureChannel = struct {
         /// decrypted, and the exchanged nonces run through P-SHA256
         /// (`security.deriveKeys`) to key every subsequent MSG/CLO chunk.
         security: ?security.SecurityContext = null,
+        /// The caller's clock reading (any monotonic milliseconds) at the
+        /// moment of the call; the renewal timeline (`renewalDue`) counts from
+        /// it. The default 0 suits a caller that never renews.
+        now_ms: i64 = 0,
     };
 
-    /// Perform the OpenSecureChannel request/response (Issue, not Renew —
-    /// channel renewal is out of F2's scope) and return the opened channel.
+    /// Perform the OpenSecureChannel request/response (Issue; `renew` is the
+    /// Renew counterpart) and return the opened channel.
     /// `conn` must already have completed the Hello/Acknowledge handshake
     /// (`transport.connect`/`Connection.hello`).
     ///
@@ -151,11 +165,80 @@ pub const SecureChannel = struct {
     fn openBody(conn: *transport.Connection, allocator: std.mem.Allocator, options: OpenOptions, out: *SecureChannel) services.ServiceError!void {
         var ch: SecureChannel = .{ .io = .{ .conn = conn, .allocator = allocator, .security = options.security } };
 
-        const security_mode: services.MessageSecurityMode = if (options.security) |sec| sec.mode else .none;
-        const secure = security_mode != .none;
         // OPC 10000-7 key-length band of the policy, own key and server
         // certificate, before any nonce or RSA work.
         if (options.security) |sec| try security.checkContextKeyLengths(sec);
+
+        try ch.exchange(.issue, options.requested_lifetime_ms, options.timeout_hint_ms, options.now_ms);
+        out.* = ch;
+        // The local copy holds the derived keys: wipe it (the frame is burned
+        // too, but this is the copy we know about).
+        if (ch.io.security) |*sec| if (sec.keys) |*keys| keys.wipe();
+    }
+
+    /// True once `renewal_fraction_percent` (75 %, OPC 10000-4 §5.5.2.1 /
+    /// OPC 10000-6 §6.7.4; open62541's client and node-opcua's
+    /// `lifetime_75` use the same fraction) of the current token's revised
+    /// lifetime has elapsed on the caller's clock: `now_ms` and the
+    /// `now_ms` given to `open`/`renew` must come from the same clock
+    /// (any monotonic millisecond count; this module never reads one). The
+    /// *local* clock is used rather than `token_created_at`, which is the
+    /// server's clock and may be skewed. A channel with no lifetime
+    /// (`token_lifetime_ms == 0`) is never due.
+    pub fn renewalDue(ch: *const SecureChannel, now_ms: i64) bool {
+        if (ch.token_lifetime_ms == 0) return false;
+        return now_ms -| ch.token_installed_ms >= @divFloor(@as(i64, ch.token_lifetime_ms) * renewal_fraction_percent, 100);
+    }
+
+    pub const RenewOptions = struct {
+        /// `null` asks for the lifetime the channel currently has
+        /// (`token_lifetime_ms`, the server's last revision).
+        requested_lifetime_ms: ?u32 = null,
+        timeout_hint_ms: u32 = 10_000,
+    };
+
+    /// OpenSecureChannel with `RequestType = Renew` (OPC 10000-4 §5.5.2):
+    /// asks for a fresh `SecurityToken` on the open channel, before the
+    /// current one runs out. The channel id, the policy and the mode do not
+    /// change; at Sign/SignAndEncrypt fresh nonces are exchanged and the
+    /// symmetric keys are re-derived (old keys wiped). The new token and keys
+    /// take over the moment the answer is read, which is how every reference
+    /// client behaves; the server keeps accepting the old token for its
+    /// overlap window (`server.SecurityConfig.token_renewal_overlap_ms`), so
+    /// a message already on the wire under it is not lost. This client has one
+    /// request in flight at a time, so call `renew` between requests (it
+    /// reads the next chunk as its own answer).
+    ///
+    /// `now_ms` is the caller's clock reading (see `renewalDue`). On error
+    /// the channel keeps its old token and keys; a `Bad` answer leaves the
+    /// old token valid for what remains of its lifetime, so the caller may
+    /// retry. `renewIfDue` is the usual entry point.
+    pub fn renew(ch: *SecureChannel, now_ms: i64, options: RenewOptions) services.ServiceError!void {
+        return burn.run(burn.open_burn, services.ServiceError!void, renewBody, .{ ch, now_ms, options });
+    }
+
+    fn renewBody(ch: *SecureChannel, now_ms: i64, options: RenewOptions) services.ServiceError!void {
+        // Not opened yet, or closed (the keys are gone): nothing to renew.
+        if (ch.io.channel_id == 0) return error.InvalidSecureMessage;
+        if (ch.io.security) |sec| if (sec.mode != .none and sec.keys == null) return error.InvalidSecureMessage;
+        try ch.exchange(.renew, options.requested_lifetime_ms orelse ch.token_lifetime_ms, options.timeout_hint_ms, now_ms);
+    }
+
+    /// `renew` when `renewalDue(now_ms)`; returns whether it renewed.
+    pub fn renewIfDue(ch: *SecureChannel, now_ms: i64, options: RenewOptions) services.ServiceError!bool {
+        if (!ch.renewalDue(now_ms)) return false;
+        try ch.renew(now_ms, options);
+        return true;
+    }
+
+    /// The OPN round trip shared by `open` (`.issue`, `ch` a local the caller
+    /// publishes on success) and `renew` (`.renew`, `ch` the live channel:
+    /// nothing but the wire counters changes until the answer has been
+    /// checked and, when secured, the new keys derived).
+    fn exchange(ch: *SecureChannel, request_type: services.SecurityTokenRequestType, requested_lifetime_ms: u32, timeout_hint_ms: u32, now_ms: i64) services.ServiceError!void {
+        const allocator = ch.io.allocator;
+        const security_mode: services.MessageSecurityMode = if (ch.io.security) |sec| sec.mode else .none;
+        const secure = security_mode != .none;
 
         // OPC 10000-6 §6.7.5: the nonce length matches the symmetric key
         // length (32 for the Sha256-keyed profiles). It is key material —
@@ -163,17 +246,17 @@ pub const SecureChannel = struct {
         var client_nonce: [32]u8 = undefined;
         defer std.crypto.secureZero(u8, &client_nonce);
         if (secure) {
-            const random = options.security.?.random orelse @panic("opcua security: SecurityMode != none requires SecurityContext.random");
+            const random = ch.io.security.?.random orelse @panic("opcua security: SecurityMode != none requires SecurityContext.random");
             random.bytes(&client_nonce);
         }
 
         const request: services.OpenSecureChannelRequest = .{
-            .request_header = ch.io.nextRequestHeader(services.null_node_id, options.timeout_hint_ms),
+            .request_header = ch.io.nextRequestHeader(services.null_node_id, timeout_hint_ms),
             .client_protocol_version = 0,
-            .request_type = .issue,
+            .request_type = request_type,
             .security_mode = security_mode,
             .client_nonce = if (secure) &client_nonce else &.{}, // present-but-empty at SecurityMode=None
-            .requested_lifetime = options.requested_lifetime_ms,
+            .requested_lifetime = requested_lifetime_ms,
         };
         const response = try services.Channel.call(
             &ch.io,
@@ -189,23 +272,25 @@ pub const SecureChannel = struct {
         );
         defer services.freeOpenSecureChannelResponse(allocator, response);
 
-        ch.io.channel_id = response.security_token.channel_id;
-        ch.io.token_id = response.security_token.token_id;
-        ch.token_created_at = response.security_token.created_at;
-        ch.token_lifetime_ms = response.security_token.revised_lifetime;
-
+        // A renewal keeps the channel: an answer naming another one is not ours.
+        if (request_type == .renew and response.security_token.channel_id != ch.io.channel_id) return error.InvalidSecureMessage;
+        var derived: ?security.ChannelKeys = null;
+        defer if (derived) |*k| k.wipe();
         if (secure) {
             const server_nonce = response.server_nonce orelse return error.InvalidSecureMessage;
             if (server_nonce.len == 0) return error.InvalidSecureMessage;
-            ch.io.security.?.keys = security.deriveKeys(&client_nonce, server_nonce, options.security.?.policy);
+            derived = security.deriveKeys(&client_nonce, server_nonce, ch.io.security.?.policy);
             // The server nonce is key material too — wipe the decoded copy
             // before the deferred free above releases it.
             std.crypto.secureZero(u8, @constCast(server_nonce));
         }
-        out.* = ch;
-        // The local copy holds the derived keys: wipe it (the frame is burned
-        // too, but this is the copy we know about).
-        if (ch.io.security) |*sec| if (sec.keys) |*keys| keys.wipe();
+
+        ch.io.channel_id = response.security_token.channel_id;
+        ch.io.token_id = response.security_token.token_id;
+        ch.token_created_at = response.security_token.created_at;
+        ch.token_lifetime_ms = response.security_token.revised_lifetime;
+        ch.token_installed_ms = now_ms;
+        if (derived) |k| ch.io.security.?.keys = k;
     }
 
     /// Send the CloseSecureChannel request in a CLO chunk. Per OPC 10000-6
@@ -2389,6 +2474,17 @@ test "LIVE open62541 interop: connect -> OPN(None) -> CreateSession -> ActivateS
     defer services.freeTranslateBrowsePathsToNodeIdsResponse(gpa, translate_resp);
     try testing.expect(!services.isBad(translate_resp.results.?[0].status_code));
     try testing.expect(services.nodeIdEql(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, translate_resp.results.?[0].targets.?[0].target_id.node_id));
+
+    // ── SecureChannel renewal (OpenSecureChannel, Renew): a fresh token on
+    // the same channel, and the session keeps working under it.
+    const token_before = ch.io.token_id;
+    const channel_before = ch.io.channel_id;
+    try ch.renew(1_000, .{});
+    try testing.expect(ch.io.token_id != token_before);
+    try testing.expectEqual(channel_before, ch.io.channel_id);
+    const after_renew = try session.readAttribute(.{ .numeric = .{ .namespace = 0, .id = 2258 } }, services.attribute_id.value);
+    defer encoding.freeDataValue(gpa, after_renew);
+    try testing.expect(after_renew.value != null);
 }
 
 const live_subs_container_name = "opcua-zig-libs-live-test-subs";
@@ -3034,6 +3130,169 @@ test "secure offline scripted: a secured OpenSecureChannel answer with an empty 
             .random = random,
         },
     }, &ch));
+}
+
+test "SecureChannel.renewalDue: 75 % of the revised lifetime on the caller's clock, never without a lifetime, no overflow" {
+    const testing = std.testing;
+    var in_r: std.Io.Reader = .fixed("");
+    var out_buf: [8]u8 = undefined;
+    var out_w: std.Io.Writer = .fixed(&out_buf);
+    var conn = transport.Connection.init(&in_r, &out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator }, .token_lifetime_ms = 10_000, .token_installed_ms = 1_000 };
+    try testing.expect(!ch.renewalDue(8_499));
+    try testing.expect(ch.renewalDue(8_500));
+    try testing.expect(ch.renewalDue(1_000_000));
+    try testing.expect(!ch.renewalDue(1_000)); // the instant it arrived
+    try testing.expect(!ch.renewalDue(-5_000)); // a clock before the install time
+    ch.token_lifetime_ms = 3; // 75 % of 3 ms is 2.25 ms, rounded down
+    ch.token_installed_ms = 0;
+    try testing.expect(!ch.renewalDue(1));
+    try testing.expect(ch.renewalDue(2));
+    ch.token_lifetime_ms = 0;
+    try testing.expect(!ch.renewalDue(std.math.maxInt(i64)));
+    ch.token_lifetime_ms = std.math.maxInt(u32);
+    ch.token_installed_ms = std.math.minInt(i64);
+    try testing.expect(ch.renewalDue(std.math.maxInt(i64)));
+    try testing.expect(!ch.renewalDue(std.math.minInt(i64)));
+    try testing.expectEqual(@as(i64, 75), SecureChannel.renewal_fraction_percent);
+}
+
+test "SecureChannel.renew: a channel that was never opened, or None-mode state without a channel id, is refused before any I/O" {
+    const testing = std.testing;
+    var in_r: std.Io.Reader = .fixed("");
+    var out_buf: [8]u8 = undefined;
+    var out_w: std.Io.Writer = .fixed(&out_buf);
+    var conn = transport.Connection.init(&in_r, &out_w);
+    var ch: SecureChannel = .{ .io = .{ .conn = &conn, .allocator = testing.allocator } };
+    try testing.expectError(error.InvalidSecureMessage, ch.renew(0, .{}));
+    try testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+    try testing.expect(!try ch.renewIfDue(1_000_000, .{})); // no lifetime: never due, nothing sent
+    try testing.expectEqual(@as(usize, 0), out_w.buffered().len);
+}
+
+/// A sealed OpenSecureChannel answer for the renewal tests below: channel
+/// `channel_id`, token `token_id`, `server_nonce`, lifetime `lifetime_ms`.
+fn sealedOpnAnswer(
+    allocator: std.mem.Allocator,
+    random: std.Random,
+    server_creds: *const security.ClientCredentials,
+    client_cert: []const u8,
+    channel_id: u32,
+    token_id: u32,
+    server_nonce: []const u8,
+    lifetime_ms: u32,
+) ![]u8 {
+    var resp = std.Io.Writer.Allocating.init(allocator);
+    defer resp.deinit();
+    var e = encoding.Encoder.init(&resp.writer);
+    try e.writer.writeInt(u32, channel_id, .little);
+    try security.encodeAsymmetricAlgorithmSecurityHeader(&e, .{
+        .security_policy_uri = security.SecurityPolicy.basic256sha256.uri(),
+        .sender_certificate = server_creds.certificate_der,
+        .receiver_certificate_thumbprint = &security.certificateThumbprint(client_cert),
+    });
+    const enc_offset = resp.writer.buffered().len;
+    try e.writer.writeInt(u32, 1, .little); // SequenceNumber
+    try e.writer.writeInt(u32, 1, .little); // RequestId
+    try e.encodeNodeId(services.type_id.open_secure_channel_response);
+    try services.encodeOpenSecureChannelResponse(&e, .{
+        .response_header = scripted_header,
+        .server_protocol_version = 0,
+        .security_token = .{ .channel_id = channel_id, .token_id = token_id, .created_at = 0, .revised_lifetime = lifetime_ms },
+        .server_nonce = server_nonce,
+    });
+    return security.sealAsymmetricMessage(
+        allocator,
+        random,
+        transport.MessageType.open_secure_channel.code(),
+        resp.writer.buffered(),
+        enc_offset,
+        server_creds,
+        client_cert,
+    );
+}
+
+test "secure offline scripted: a renewal answer for another channel, or without a server nonce, leaves the old token and keys; a good one swaps them" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(44)));
+    const random = prng.random();
+    var client_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 1024,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "renew-client",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:client",
+    }, &client_creds);
+    defer client_creds.deinit(testing.allocator);
+    var server_creds: security.ClientCredentials = undefined;
+    try security.ClientCredentials.generateSelfSigned(testing.allocator, random, .{
+        .modulus_bits = 1280,
+        .insecure_allow_key_length_outside_policy = true,
+        .common_name = "renew-server",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+    }, &server_creds);
+    defer server_creds.deinit(testing.allocator);
+
+    const nonce_a: [32]u8 = @splat(0xA1);
+    const nonce_b: [32]u8 = @splat(0xB2);
+    const old_keys = security.deriveKeys(&nonce_a, &nonce_b, .basic256sha256);
+    const server_nonce: [32]u8 = @splat(0xC3);
+
+    const wrong_channel = try sealedOpnAnswer(testing.allocator, random, &server_creds, client_creds.certificate_der, 8, 4, &server_nonce, 5_000);
+    defer testing.allocator.free(wrong_channel);
+    const no_nonce = try sealedOpnAnswer(testing.allocator, random, &server_creds, client_creds.certificate_der, 7, 4, "", 5_000);
+    defer testing.allocator.free(no_nonce);
+    const good = try sealedOpnAnswer(testing.allocator, random, &server_creds, client_creds.certificate_der, 7, 4, &server_nonce, 5_000);
+    defer testing.allocator.free(good);
+
+    inline for (.{ wrong_channel, no_nonce, good }, 0..) |answer, i| {
+        var out_buf: [8192]u8 = undefined;
+        var out_w: std.Io.Writer = .fixed(&out_buf);
+        var in_r: std.Io.Reader = .fixed(answer);
+        var conn = transport.Connection.init(&in_r, &out_w);
+        var ch: SecureChannel = .{
+            .io = .{
+                .conn = &conn,
+                .allocator = testing.allocator,
+                .channel_id = 7,
+                .token_id = 3,
+                .security = .{
+                    .policy = .basic256sha256,
+                    .insecure_allow_key_length_outside_policy = true,
+                    .mode = .sign_and_encrypt,
+                    .credentials = client_creds,
+                    .server_certificate = server_creds.certificate_der,
+                    .random = random,
+                    .keys = old_keys,
+                },
+            },
+            .token_lifetime_ms = 9_000,
+            .token_installed_ms = 100,
+        };
+        if (i < 2) {
+            try testing.expectError(error.InvalidSecureMessage, ch.renew(500, .{}));
+            // refused: the old token, keys, lifetime and clock stay
+            try testing.expectEqual(@as(u32, 3), ch.io.token_id);
+            try testing.expectEqual(@as(u32, 7), ch.io.channel_id);
+            try testing.expectEqualSlices(u8, std.mem.asBytes(&old_keys), std.mem.asBytes(&ch.io.security.?.keys.?));
+            try testing.expectEqual(@as(u32, 9_000), ch.token_lifetime_ms);
+            try testing.expectEqual(@as(i64, 100), ch.token_installed_ms);
+        } else {
+            try ch.renew(500, .{});
+            try testing.expectEqual(@as(u32, 4), ch.io.token_id);
+            try testing.expectEqual(@as(u32, 7), ch.io.channel_id);
+            try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&old_keys), std.mem.asBytes(&ch.io.security.?.keys.?)));
+            try testing.expectEqual(@as(u32, 5_000), ch.token_lifetime_ms);
+            try testing.expectEqual(@as(i64, 500), ch.token_installed_ms);
+            // the request that went out was a Renew carrying a fresh 32-byte nonce under the channel's id
+            var req_r: std.Io.Reader = .fixed(out_w.buffered());
+            _ = try req_r.takeArray(8); // MessageHeader
+            try testing.expectEqual(@as(u32, 7), try req_r.takeInt(u32, .little));
+        }
+    }
 }
 
 /// `Session.create`'s error path: the whole response, including the two
