@@ -77,6 +77,13 @@ pub const security = @import("security.zig");
 /// `RootFolder` down to a user variable.
 pub const nodestore = @import("nodestore.zig");
 
+/// NumericRange (OPC 10000-4 §7.27): parse/format the `IndexRange` string of a
+/// Read/Write operand and apply it to array, String and ByteString values.
+/// The client sends one through `services.ReadValueId.index_range` /
+/// `WriteValue.index_range` (or `Session.readAttributeRange` /
+/// `Session.writeValueRange`); the server applies it in its Read/Write handlers.
+pub const numeric_range = @import("numeric_range.zig");
+
 /// The server (device) side of the protocol: the opc.tcp connection state
 /// machine (HEL/ACK negotiation, OPN/CLO, chunking with explicit limits),
 /// sessions, the service handlers over `nodestore`, and the time-injected
@@ -93,6 +100,7 @@ test {
     _ = services;
     _ = security;
     _ = nodestore;
+    _ = numeric_range;
     _ = server;
     _ = @import("server_interop.zig");
     _ = @import("asyncua_replay.zig");
@@ -637,10 +645,44 @@ pub const Session = struct {
     /// uses to keep `server_endpoints` while discarding the rest of
     /// `CreateSessionResponse`.
     pub fn readAttribute(session: *Session, node_id: encoding.NodeId, attribute_id: u32) services.ServiceError!encoding.DataValue {
+        return session.readAttributeText(node_id, attribute_id, null);
+    }
+
+    /// `readAttribute` for part of a Variable's value: `range` (NumericRange,
+    /// OPC 10000-4 §7.27) is sent as the operand's `IndexRange`. A server that
+    /// finds no data in the range answers `BadIndexRangeNoData` in the
+    /// `DataValue.status`; an invalid one `BadIndexRangeInvalid`.
+    pub fn readAttributeRange(session: *Session, node_id: encoding.NodeId, attribute_id: u32, range: numeric_range.Range) services.ServiceError!encoding.DataValue {
+        var buf: [numeric_range.max_format_len]u8 = undefined;
+        const text = range.format(&buf) catch unreachable; // max_format_len is the worst case
+        return session.readAttributeText(node_id, attribute_id, text);
+    }
+
+    /// Write `value` over the part of a Variable's Value that `range` selects
+    /// (Write with an `IndexRange`); returns the operation's `StatusCode`
+    /// (`BadIndexRangeNoData` outside the stored array, `BadIndexRangeInvalid`
+    /// when the element count differs from the range, ...).
+    pub fn writeValueRange(session: *Session, node_id: encoding.NodeId, range: numeric_range.Range, value: encoding.Variant) services.ServiceError!encoding.StatusCode {
+        var buf: [numeric_range.max_format_len]u8 = undefined;
+        const text = range.format(&buf) catch unreachable; // max_format_len is the worst case
+        const nodes = [_]services.WriteValue{.{
+            .node_id = node_id,
+            .attribute_id = services.attribute_id.value,
+            .index_range = text,
+            .value = .{ .value = value },
+        }};
+        const resp = try session.write(&nodes);
+        defer services.freeWriteResponse(session.allocator, resp);
+        const results = resp.results orelse &.{};
+        if (results.len != 1) return error.UnexpectedResponseType;
+        return results[0];
+    }
+
+    fn readAttributeText(session: *Session, node_id: encoding.NodeId, attribute_id: u32, index_range: ?[]const u8) services.ServiceError!encoding.DataValue {
         const nodes = [_]services.ReadValueId{.{
             .node_id = node_id,
             .attribute_id = attribute_id,
-            .index_range = null,
+            .index_range = index_range,
             .data_encoding = .{ .namespace_index = 0, .name = null },
         }};
         const resp = try session.read(&nodes, .{});

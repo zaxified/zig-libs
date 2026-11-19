@@ -167,7 +167,10 @@ devices sharing one event loop.
   endpoint list.
 - **Services:** Read, Write (with StatusCode/SourceTimestamp/ServerTimestamp
   handling and the right `BadNodeIdUnknown`/`BadAttributeIdInvalid`/
-  `BadNotWritable`/`BadTypeMismatch` failures), Browse + BrowseNext with
+  `BadNotWritable`/`BadTypeMismatch` failures) including **NumericRange**
+  (`"1:3"`, `"0:1,2:3"`: array slices, multi-dimensional blocks and String/
+  ByteString substrings on Read and Write; `numeric_range.parse`,
+  `Session.readAttributeRange`/`writeValueRange`), Browse + BrowseNext with
   session-scoped continuation points, TranslateBrowsePathsToNodeIds, and Call.
 - **Subscriptions:** CreateSubscription/ModifySubscription/SetPublishingMode/
   DeleteSubscriptions, CreateMonitoredItems/ModifyMonitoredItems/

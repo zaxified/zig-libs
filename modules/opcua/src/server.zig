@@ -53,6 +53,7 @@ const encoding = @import("encoding.zig");
 const transport = @import("transport.zig");
 const services = @import("services.zig");
 const nodestore = @import("nodestore.zig");
+const numeric_range = @import("numeric_range.zig");
 const security = @import("security.zig");
 
 /// The StatusCode table (see `services.status`).
@@ -2326,15 +2327,28 @@ pub const Connection = struct {
 
     fn readOne(ctx: *Ctx, rv: services.ReadValueId, ttr: services.TimestampsToReturn) encoding.DataValue {
         if (rv.attribute_id == 0 or rv.attribute_id > 27) return .{ .status = status.bad_attribute_id_invalid };
-        if (rv.index_range) |range| {
-            // NumericRange (index-range) selection is not implemented — see
-            // SPEC.md's deferred list. Rejected rather than silently ignored.
-            if (range.len != 0) return .{ .status = status.bad_index_range_invalid };
+        // NumericRange (OPC 10000-4 §7.27): syntax is checked before anything
+        // else about the node, like the attribute id above.
+        var range: ?numeric_range.Range = null;
+        if (rv.index_range) |text| {
+            if (text.len != 0) range = numeric_range.parse(text) catch return .{ .status = status.bad_index_range_invalid };
         }
         if (rv.data_encoding.name) |name| {
             if (name.len != 0 and !std.mem.eql(u8, name, "Default Binary")) return .{ .status = status.bad_data_encoding_invalid };
         }
-        const dv = ctx.srv.store.readAttribute(rv.node_id, rv.attribute_id);
+        var dv = ctx.srv.store.readAttribute(rv.node_id, rv.attribute_id);
+        if (range) |*r| {
+            // A Bad read (unknown node, not readable, ...) is the answer as it
+            // is; a range on any attribute but Value has no data to select.
+            if (dv.status) |sc| if (sc & 0x8000_0000 != 0) return dv;
+            if (rv.attribute_id != services.attribute_id.value) return .{ .status = status.bad_index_range_no_data };
+            const whole = dv.value orelse return .{ .status = status.bad_index_range_no_data };
+            dv.value = numeric_range.readRange(ctx.arena, whole, r) catch |err| return .{ .status = switch (err) {
+                error.IndexRangeInvalid => status.bad_index_range_invalid,
+                error.IndexRangeNoData => status.bad_index_range_no_data,
+                error.OutOfMemory => status.bad_out_of_memory,
+            } };
+        }
         return applyTimestamps(dv, ttr, ctx.srv.dateTime(ctx.now_ms));
     }
 
@@ -2384,13 +2398,7 @@ pub const Connection = struct {
                 results[i] = status.bad_attribute_id_invalid;
                 continue;
             }
-            if (wv.index_range) |range| {
-                if (range.len != 0) {
-                    results[i] = status.bad_index_range_invalid;
-                    continue;
-                }
-            }
-            results[i] = try ctx.srv.store.writeAttribute(wv.node_id, wv.attribute_id, wv.value, now);
+            results[i] = try ctx.srv.store.writeAttributeRange(wv.node_id, wv.attribute_id, wv.value, now, wv.index_range orelse "");
         }
         try sendResponse(ctx, services.type_id.write_response, services.WriteResponse, .{
             .response_header = ctx.responseHeader(status.good),
@@ -9268,7 +9276,7 @@ fn noopMethod(
     return status.good;
 }
 
-test "read/write: the attribute id is checked before the node, index ranges and data encodings are refused by name" {
+test "read/write: the attribute id is checked before the node, malformed index ranges and data encodings are refused by name" {
     const gpa = testing.allocator;
     var rig: TestRig = undefined;
     try rig.init(gpa, TestRig.defaultConfig());
@@ -9292,7 +9300,8 @@ test "read/write: the attribute id is checked before the node, index ranges and 
     const res = r.results.?;
     try testing.expectEqual(status.bad_attribute_id_invalid, res[0].status.?);
     try testing.expectEqual(status.bad_attribute_id_invalid, res[1].status.?);
-    try testing.expectEqual(status.bad_index_range_invalid, res[2].status.?);
+    // a syntactically valid range on a scalar Int32: nothing to select
+    try testing.expectEqual(status.bad_index_range_no_data, res[2].status.?);
     try testing.expect(res[3].value != null);
     try testing.expect(res[4].value != null);
     try testing.expect(res[5].value != null);
@@ -9310,7 +9319,7 @@ test "read/write: the attribute id is checked before the node, index ranges and 
     defer services.freeWriteResponse(gpa, w);
     try testing.expectEqual(status.bad_attribute_id_invalid, w.results.?[0]);
     try testing.expectEqual(status.bad_attribute_id_invalid, w.results.?[1]);
-    try testing.expectEqual(status.bad_index_range_invalid, w.results.?[2]);
+    try testing.expectEqual(status.bad_index_range_no_data, w.results.?[2]);
     try testing.expectEqual(status.bad_node_id_unknown, w.results.?[3]);
     // the refused ranged write did not touch the value
     const back = try readNodes(&rig, reads[3..4]);
@@ -10810,4 +10819,181 @@ test "root client over a pipe (SignAndEncrypt): a second renewal chains, a reque
     defer session.deinit();
     try channel.close();
     try testing.expectError(error.InvalidSecureMessage, channel.renew(13_000, .{}));
+}
+
+const RangeIds = struct { arr: encoding.NodeId, grid: encoding.NodeId, text: encoding.NodeId, names: encoding.NodeId, ro: encoding.NodeId };
+
+fn addRangeVars(rig: *TestRig) !RangeIds {
+    const ns = rig.answer_id.string.namespace;
+    const ids: RangeIds = .{
+        .arr = encoding.NodeId{ .string = .{ .namespace = ns, .id = "r.arr" } },
+        .grid = encoding.NodeId{ .string = .{ .namespace = ns, .id = "r.grid" } },
+        .text = encoding.NodeId{ .string = .{ .namespace = ns, .id = "r.text" } },
+        .names = encoding.NodeId{ .string = .{ .namespace = ns, .id = "r.names" } },
+        .ro = encoding.NodeId{ .string = .{ .namespace = ns, .id = "r.ro" } },
+    };
+    const grid_dims = [_]i32{ 3, 4 };
+    const grid_data = [_]i32{ 0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23 };
+    const name_data = [_]?[]const u8{ "alpha", "beta", "gamma" };
+    const Spec = struct { id: encoding.NodeId, name: []const u8, v: encoding.Variant, dt: u32, rank: i32, level: u8 };
+    const specs = [_]Spec{
+        .{ .id = ids.arr, .name = "r.arr", .v = .{ .array = .{ .items = .{ .int32 = &.{ 10, 11, 12, 13, 14 } } } }, .dt = nodestore.id.int32, .rank = nodestore.value_rank.one_dimension, .level = nodestore.access_level.read_write },
+        .{ .id = ids.grid, .name = "r.grid", .v = .{ .array = .{ .items = .{ .int32 = &grid_data }, .dimensions = &grid_dims } }, .dt = nodestore.id.int32, .rank = 2, .level = nodestore.access_level.read_write },
+        .{ .id = ids.text, .name = "r.text", .v = .{ .scalar = .{ .string = "abcdef" } }, .dt = nodestore.id.string, .rank = nodestore.value_rank.scalar, .level = nodestore.access_level.read_write },
+        .{ .id = ids.names, .name = "r.names", .v = .{ .array = .{ .items = .{ .string = &name_data } } }, .dt = nodestore.id.string, .rank = nodestore.value_rank.one_dimension, .level = nodestore.access_level.read_write },
+        .{ .id = ids.ro, .name = "r.ro", .v = .{ .array = .{ .items = .{ .int32 = &.{ 1, 2, 3 } } } }, .dt = nodestore.id.int32, .rank = nodestore.value_rank.one_dimension, .level = nodestore.access_level.current_read },
+    };
+    for (specs) |sp| try rig.store.addVariable(.{
+        .node_id = sp.id,
+        .parent_id = rig.device_id,
+        .browse_name = .{ .namespace_index = ns, .name = sp.name },
+        .value = sp.v,
+        .data_type = nodestore.n0(sp.dt),
+        .value_rank = sp.rank,
+        .access_level = sp.level,
+        .timestamp = TestRig.start_time,
+    });
+    return ids;
+}
+
+test "NumericRange: Read applies the range to arrays, 2-D arrays and strings, with the spec's status codes" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const ids = try addRangeVars(&rig);
+    const val = services.attribute_id.value;
+
+    const reads = [_]services.ReadValueId{
+        readValueId(ids.arr, val, "1:3", null), // 0 slice
+        readValueId(ids.arr, val, "4", null), // 1 single element
+        readValueId(ids.arr, val, "3:99", null), // 2 clipped to the array
+        readValueId(ids.arr, val, "5", null), // 3 starts past the end
+        readValueId(ids.arr, val, "0,0", null), // 4 wrong dimension count
+        readValueId(ids.arr, val, "3:3", null), // 5 syntax: min >= max
+        readValueId(ids.arr, val, "-1", null), // 6 syntax
+        readValueId(ids.arr, val, "1:", null), // 7 syntax
+        readValueId(ids.arr, val, "4294967296", null), // 8 syntax: > u32
+        readValueId(ids.grid, val, "1:2,1:3", null), // 9 2-D block
+        readValueId(ids.grid, val, "0,4", null), // 10 column past the end
+        readValueId(ids.text, val, "1:3", null), // 11 substring
+        readValueId(ids.text, val, "6", null), // 12 past the end
+        readValueId(ids.names, val, "1:2,0:1", null), // 13 one more dimension: bytes in each string
+        readValueId(ids.arr, services.attribute_id.browse_name, "0", null), // 14 range on a non-Value attribute
+        readValueId(ghostNode(), val, "0", null), // 15 unknown node wins over a range
+        readValueId(ghostNode(), val, "x", null), // 16 syntax is checked first
+        readValueId(ids.arr, val, "", null), // 17 empty = whole value
+        readValueId(ids.ro, val, "0", null), // 18 readable
+    };
+    const r = try readNodes(&rig, &reads);
+    defer services.freeReadResponse(gpa, r);
+    const res = r.results.?;
+    try testing.expectEqualSlices(i32, &.{ 11, 12, 13 }, res[0].value.?.array.items.int32.?);
+    try testing.expectEqual(status.good, res[0].status.?);
+    try testing.expect(res[0].server_timestamp != null); // the DataValue keeps its timestamps
+    try testing.expect(res[0].source_timestamp != null);
+    try testing.expectEqualSlices(i32, &.{14}, res[1].value.?.array.items.int32.?);
+    try testing.expectEqualSlices(i32, &.{ 13, 14 }, res[2].value.?.array.items.int32.?);
+    try testing.expectEqual(status.bad_index_range_no_data, res[3].status.?);
+    try testing.expectEqual(status.bad_index_range_no_data, res[4].status.?);
+    for ([_]usize{ 5, 6, 7, 8 }) |i| try testing.expectEqual(status.bad_index_range_invalid, res[i].status.?);
+    try testing.expectEqualSlices(i32, &.{ 11, 12, 13, 21, 22, 23 }, res[9].value.?.array.items.int32.?);
+    try testing.expectEqualSlices(i32, &.{ 2, 3 }, res[9].value.?.array.dimensions.?);
+    try testing.expectEqual(status.bad_index_range_no_data, res[10].status.?);
+    try testing.expectEqualStrings("bcd", res[11].value.?.scalar.string.?);
+    try testing.expectEqual(status.bad_index_range_no_data, res[12].status.?);
+    try testing.expectEqualStrings("be", res[13].value.?.array.items.string.?[0].?);
+    try testing.expectEqualStrings("ga", res[13].value.?.array.items.string.?[1].?);
+    try testing.expectEqual(status.bad_index_range_no_data, res[14].status.?);
+    try testing.expectEqual(status.bad_node_id_unknown, res[15].status.?);
+    try testing.expectEqual(status.bad_index_range_invalid, res[16].status.?);
+    try testing.expectEqual(@as(usize, 5), res[17].value.?.array.items.int32.?.len);
+    try testing.expectEqual(@as(i32, 1), res[18].value.?.array.items.int32.?[0]);
+}
+
+fn ghostNode() encoding.NodeId {
+    return .{ .numeric = .{ .namespace = 1, .id = 99_999 } };
+}
+
+test "NumericRange: Write replaces exactly the selected elements; every refusal leaves the value alone" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const ids = try addRangeVars(&rig);
+    const val = services.attribute_id.value;
+    const two: encoding.DataValue = .{ .value = .{ .array = .{ .items = .{ .int32 = &.{ -1, -2 } } } } };
+    const one: encoding.DataValue = .{ .value = .{ .scalar = .{ .int32 = -9 } } };
+    const WV = services.WriteValue;
+    const writes = [_]WV{
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "1:2", .value = two }, // 0 ok
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "4", .value = one }, // 1 ok, scalar = one element
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "4:5", .value = two }, // 2 past the end
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "0:2", .value = two }, // 3 count differs
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "0", .value = .{ .value = .{ .scalar = .{ .uint32 = 1 } } } }, // 4 type
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "1:", .value = two }, // 5 syntax
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "0,0", .value = one }, // 6 dimensions
+        .{ .node_id = ids.arr, .attribute_id = val, .index_range = "0", .value = .{} }, // 7 no value
+        .{ .node_id = ids.ro, .attribute_id = val, .index_range = "0", .value = one }, // 8 not writable
+        .{ .node_id = ids.arr, .attribute_id = services.attribute_id.display_name, .index_range = "0", .value = one }, // 9 non-Value attribute
+        .{ .node_id = ghostNode(), .attribute_id = val, .index_range = "0", .value = one }, // 10
+        .{ .node_id = ids.grid, .attribute_id = val, .index_range = "1:2,1:2", .value = .{ .value = .{ .array = .{ .items = .{ .int32 = &.{ 1, 2, 3, 4 } } } } } }, // 11
+        .{ .node_id = ids.text, .attribute_id = val, .index_range = "1:2", .value = .{ .value = .{ .scalar = .{ .string = "XY" } } } }, // 12
+        .{ .node_id = ids.text, .attribute_id = val, .index_range = "1:2", .value = .{ .value = .{ .scalar = .{ .string = "X" } } } }, // 13
+        .{ .node_id = ids.names, .attribute_id = val, .index_range = "2", .value = .{ .value = .{ .scalar = .{ .string = "delta" } } } }, // 14
+        .{ .node_id = ids.names, .attribute_id = val, .index_range = "2,0", .value = .{ .value = .{ .scalar = .{ .string = "D" } } } }, // 15 partial write of an element
+    };
+    const w = try writeNodes(&rig, &writes);
+    defer services.freeWriteResponse(gpa, w);
+    const res = w.results.?;
+    try testing.expectEqual(status.good, res[0]);
+    try testing.expectEqual(status.good, res[1]);
+    try testing.expectEqual(status.bad_index_range_no_data, res[2]);
+    try testing.expectEqual(status.bad_index_range_invalid, res[3]);
+    try testing.expectEqual(status.bad_type_mismatch, res[4]);
+    try testing.expectEqual(status.bad_index_range_invalid, res[5]);
+    try testing.expectEqual(status.bad_index_range_no_data, res[6]);
+    try testing.expectEqual(status.bad_type_mismatch, res[7]);
+    try testing.expectEqual(status.bad_not_writable, res[8]);
+    try testing.expectEqual(status.bad_index_range_no_data, res[9]);
+    try testing.expectEqual(status.bad_node_id_unknown, res[10]);
+    try testing.expectEqual(status.good, res[11]);
+    try testing.expectEqual(status.good, res[12]);
+    try testing.expectEqual(status.bad_index_range_invalid, res[13]);
+    try testing.expectEqual(status.good, res[14]);
+    try testing.expectEqual(status.bad_write_not_supported, res[15]);
+
+    const reads = [_]services.ReadValueId{
+        readValueId(ids.arr, val, null, null),
+        readValueId(ids.grid, val, null, null),
+        readValueId(ids.text, val, null, null),
+        readValueId(ids.names, val, null, null),
+    };
+    const back = try readNodes(&rig, &reads);
+    defer services.freeReadResponse(gpa, back);
+    const got = back.results.?;
+    try testing.expectEqualSlices(i32, &.{ 10, -1, -2, 13, -9 }, got[0].value.?.array.items.int32.?);
+    try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 10, 1, 2, 13, 20, 3, 4, 23 }, got[1].value.?.array.items.int32.?);
+    try testing.expectEqualSlices(i32, &.{ 3, 4 }, got[1].value.?.array.dimensions.?);
+    try testing.expectEqualStrings("aXYdef", got[2].value.?.scalar.string.?);
+    try testing.expectEqualStrings("alpha", got[3].value.?.array.items.string.?[0].?);
+    try testing.expectEqualStrings("delta", got[3].value.?.array.items.string.?[2].?);
+}
+
+test "NumericRange: a Range built by the client formats to what the server parses" {
+    const gpa = testing.allocator;
+    var rig: TestRig = undefined;
+    try rig.init(gpa, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+    const ids = try addRangeVars(&rig);
+    var buf: [numeric_range.max_format_len]u8 = undefined;
+    const range = try numeric_range.Range.init(&.{ .{ .min = 1, .max = 2 }, .{ .min = 3, .max = 3 } });
+    const text = try range.format(&buf);
+    const reads = [_]services.ReadValueId{readValueId(ids.grid, services.attribute_id.value, text, null)};
+    const r = try readNodes(&rig, &reads);
+    defer services.freeReadResponse(gpa, r);
+    try testing.expectEqualSlices(i32, &.{ 13, 23 }, r.results.?[0].value.?.array.items.int32.?);
 }

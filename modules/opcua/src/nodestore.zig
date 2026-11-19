@@ -25,6 +25,7 @@
 const std = @import("std");
 const encoding = @import("encoding.zig");
 const services = @import("services.zig");
+const numeric_range = @import("numeric_range.zig");
 
 pub const StoreError = std.mem.Allocator.Error;
 
@@ -929,6 +930,56 @@ pub const NodeStore = struct {
                     // SourceTimestamp (it is the client's claim about when the
                     // value was produced) and always stamps ServerTimestamp
                     // itself.
+                    .source_timestamp = value.source_timestamp orelse now,
+                    .server_timestamp = now,
+                };
+                return 0;
+            },
+            else => return status.bad_not_writable,
+        }
+    }
+
+    /// Write part of an attribute's value: the Write service with a non-empty
+    /// `IndexRange` (OPC 10000-4 §5.10.4, NumericRange §7.27 — see
+    /// `numeric_range.zig` for the exact rules). Only the Value of a Variable
+    /// holding an array (or a String/ByteString/XmlElement) can take a range;
+    /// everything else is `BadIndexRangeNoData`. The range syntax is checked
+    /// first (`BadIndexRangeInvalid`), then the node and its access levels
+    /// exactly as `writeAttribute` does.
+    pub fn writeAttributeRange(
+        s: *NodeStore,
+        node_id: encoding.NodeId,
+        attribute: u32,
+        value: encoding.DataValue,
+        now: encoding.DateTime,
+        index_range: []const u8,
+    ) StoreError!encoding.StatusCode {
+        if (index_range.len == 0) return s.writeAttribute(node_id, attribute, value, now);
+        const range = numeric_range.parse(index_range) catch return status.bad_index_range_invalid;
+        const node = s.nodes.getPtr(node_id) orelse return status.bad_node_id_unknown;
+        const probe = readNodeAttribute(node, attribute);
+        if (probe.status == status.bad_attribute_id_invalid) return status.bad_attribute_id_invalid;
+        if (attribute != services.attribute_id.value) return status.bad_index_range_no_data;
+        switch (node.attributes) {
+            .variable => |*v| {
+                if (v.access_level & access_level.current_write == 0) return status.bad_not_writable;
+                if (v.user_access_level & access_level.current_write == 0) return status.bad_user_access_denied;
+                const incoming = value.value orelse return status.bad_type_mismatch;
+                const stored = v.value.value orelse return status.bad_index_range_invalid;
+                var tmp = std.heap.ArenaAllocator.init(s.allocator);
+                defer tmp.deinit();
+                const merged = numeric_range.writeRange(tmp.allocator(), stored, incoming, &range) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.IndexRangeInvalid => return status.bad_index_range_invalid,
+                    error.IndexRangeNoData => return status.bad_index_range_no_data,
+                    error.TypeMismatch => return status.bad_type_mismatch,
+                    error.WriteNotSupported => return status.bad_write_not_supported,
+                };
+                const copy = try dupVariant(s.allocator, merged);
+                encoding.freeDataValue(s.allocator, v.value);
+                v.value = .{
+                    .value = copy,
+                    .status = value.status orelse 0,
                     .source_timestamp = value.source_timestamp orelse now,
                     .server_timestamp = now,
                 };
