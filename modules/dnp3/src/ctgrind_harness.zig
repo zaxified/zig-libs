@@ -49,7 +49,14 @@ fn taintBytes(t: Taint, bytes: []u8) void {
 }
 
 fn verifyBoth(ok: bool, bad: bool) void {
-    std.debug.print("ctgrind_result={x}\n", .{[2]u8{ @intFromBool(ok), @intFromBool(bad) }});
+    // A verify verdict is public by design (it decides whether a message is
+    // accepted). It is declassified here instead of being left for the
+    // formatter to branch on: whether that branch lands in std's formatting
+    // frames (a witness) or on this line (unattributed) depends on how LLVM
+    // inlines `main`, and adding the `keys5` arm moved it here (2026-11-19).
+    var verdict = [2]u8{ @intFromBool(ok), @intFromBool(bad) };
+    std.valgrind.memcheck.makeMemDefined(&verdict);
+    std.debug.print("ctgrind_result={x}\n", .{verdict});
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
