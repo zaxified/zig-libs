@@ -308,13 +308,15 @@ it pins the trapdoor sampler and keygen sampling, whose failure mode is
   Gram matrix and LDL tree, and the integer-emulated FP is already ~5× slower than
   native. Moderate, pure Zig; worth it only for a signing-heavy consumer.
 
-- **Dead-stack probe of the internals below the public entry points** *(2026-10-09)*.
+- ✅ **DONE 2026-11-19 (needles for the top-level RNS limbs of f, g):** **Dead-stack probe of the internals below the public entry points** *(2026-10-09)*.
   The probe sees the entry points only; the FFT-domain scratch inside
   `ffsampling.sampleSignature` and NTRUSolve's RNS pool are wiped by their own
-  `defer`s and by the burns above them, but no needle covers NTRUSolve's
-  intermediate big-integer limbs (the F/G recursion levels). Add needles for
-  the RNS limbs of f, g at the top level if a consumer needs the claim.
-  Small.
+  `defer`s and by the burns above them. The keygen probe now also looks for the
+  residues of f and g modulo the first four small primes, plain and forward-NTT
+  (`ntru.probe.rnsImage`, test builds only, pinned to `makeFg`'s output by a unit
+  test), both degrees: none found. Still not covered: the intermediate big-integer
+  limbs of the F/G recursion levels (depth > 0), which have no independent model
+  short of re-running the descent.
 
 - **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 6 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
 

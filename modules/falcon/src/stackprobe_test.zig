@@ -40,6 +40,7 @@ const fpr = @import("fpr.zig");
 const gaussian = @import("gaussian.zig");
 const sign = @import("sign.zig");
 const codec = @import("codec.zig");
+const ntru = @import("ntru.zig");
 
 const Shake256 = std.crypto.hash.sha3.Shake256;
 
@@ -386,6 +387,21 @@ fn Suite(comptime is1024: bool) type {
             fftImage("G (fft)", &k.big_g, false);
         }
 
+        /// NTRUSolve's top-level RNS limbs of f and g: the residues modulo the
+        /// first small primes, plain and NTT'd, as the descent's pool holds them.
+        fn rnsNeedles(k: *const SigningKey) void {
+            const names = [_][]const u8{ "f (rns)", "g (rns)", "f (rns ntt)", "g (rns ntt)" };
+            for (0..4) |j| {
+                inline for (.{ &k.f, &k.g }, 0..) |src, i| {
+                    var img: [n]u32 = undefined;
+                    ntru.probe.rnsImage(logn, src, j, false, &img);
+                    needles.addImage(names[i], std.mem.sliceAsBytes(&img));
+                    ntru.probe.rnsImage(logn, src, j, true, &img);
+                    needles.addImage(names[2 + i], std.mem.sliceAsBytes(&img));
+                }
+            }
+        }
+
         fn rngNeedles(seed: *const [48]u8) void {
             needles.addImage("seed", seed);
             var r: sign.ShakePrng = undefined;
@@ -498,6 +514,7 @@ fn Suite(comptime is1024: bool) type {
                 needles.reset();
                 rngNeedles(&cur_seed);
                 keyNeedles(&cur_sk);
+                rnsNeedles(&cur_sk);
                 bad += try run("generateKeyPair" ++ tag, callKeygen);
             }
 
