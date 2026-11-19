@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — new `merkle` module file: `MerkleBuilder`/`rootOfHashes`/`txidRoot`/`wtxidRoot` (Bitcoin's duplicate-last-on-odd tree, allocation-free fold, Core's `mutated` flag for CVE-2012-2459), `checkMerkleRoot`, the BIP141 witness commitment (`witnessCommitmentIndex`, `witnessCommitment`, `checkWitnessCommitment`). KATs: genesis, block 170 and a real segwit block against their headers; streaming fold vs a level-by-level reference. Additive, no behaviour change.
 - **2026-11-19** — new `Transaction.baseSize()`/`totalSize()`/`weight()`/`vsize()`/`isCoinbase()` (Bitcoin Core `GetTransactionWeight`, `CTransaction::IsCoinBase`; rust-bitcoin equivalents). No allocation. KATs from real mainnet transactions (sizes/weights from a block explorer), `tools/gen_merkle_vectors.py`. Additive, no behaviour change.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the four private `append*` helpers copied into `tx.zig` and the three sighash files are now one set of `pub` functions in `tx.zig` (`tx.appendCompactSize`, `appendU32LE`, `appendI32LE`, `appendI64LE`) that the sighash files and the dependent modules call. Output bytes are identical.

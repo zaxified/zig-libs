@@ -224,7 +224,43 @@ of a scriptCode (its length octet read past the end). **Equivalent (2):** the pr
 caps on the input/output count and the witness item budget moved by one — the input is refused
 either way (`Truncated` instead of `TooManyItems`); the caps bound memory, not correctness.
 
+## Size, weight and block Merkle checks (2026-11-19)
+
+Reference: Bitcoin Core (`GetTransactionWeight`, `GetVirtualTransactionSize`, `CTransaction::IsCoinBase`,
+`ComputeMerkleRoot(hashes, &mutated)`, `BlockMerkleRoot`/`BlockWitnessMerkleRoot`, `CheckBlock`,
+`CheckWitnessCommitment`, `GetWitnessCommitmentIndex`) and rust-bitcoin (`Transaction::weight`/`vsize`/
+`base_size`/`total_size`/`is_coinbase`, `Block::check_merkle_root`/`check_witness_commitment`).
+
+- `Transaction.baseSize()` is the legacy serialization length, `totalSize()` the BIP144 length when the
+  transaction carries witness data (`hasWitnessData`, the same predicate as `wtxid`) and `baseSize()`
+  otherwise; `weight() = 3 * baseSize + totalSize`; `vsize() = ceil(weight / 4)`. All are arithmetic over
+  the model, no allocation, and agree with `serializeLegacy`/`serialize` (tested). `vsize` omits Core's
+  sigop-cost term: that policy input needs the spent scripts. `weight`/`vsize`/`totalSize` return
+  `error.WitnessCountMismatch` for a hand-built value that `serializeSegwit` would refuse; a decoded
+  transaction never does.
+- `isCoinbase()` is Core's definition: exactly one input whose prevout is null (txid zero, index
+  `0xffffffff`); the scriptSig-length rule is a block-validity rule and is not consulted.
+- `merkle.zig`: `MerkleBuilder` folds leaves with a 64-entry stack (binary counter), no allocation for
+  the tree; `rootOfHashes`, `txidRoot`, `wtxidRoot` (coinbase leaf = 0, BIP141) return root + `mutated`.
+  Empty list: zero root (Core). The `mutated` flag is Core's: two real equal neighbours at any level,
+  padding copies excluded (CVE-2012-2459: `[a,b,c]` and `[a,b,c,c]` share a root). `checkMerkleRoot`
+  refuses a wrong root and then a mutated list, in Core's `CheckBlock` order.
+  rust-bitcoin's `check_merkle_root` compares roots only; Core's stricter rule (reject the mutation) is
+  what a validator needs and is the reference here.
+- `checkWitnessCommitment` follows Core's `CheckWitnessCommitment`: the commitment is the LAST coinbase
+  output whose script starts `6a 24 aa21a9ed` and is at least 38 octets; the coinbase witness must be one
+  32-octet reserved value; `sha256d(witness root || reserved)` must equal the payload; with no
+  commitment output the block is accepted only if no transaction has witness data. rust-bitcoin returns
+  plain `false` for a missing commitment (`witnessCommitmentIndex` distinguishes the cases). The caller
+  decides whether segwit is active at the block's height. The witness root's `mutated` flag is ignored,
+  as Core does.
+- Evidence: real mainnet data (`tools/gen_merkle_vectors.py`, fetched from a public explorer API and
+  cross-checked in Python before emission): genesis, block 170, a segwit block with a commitment (8 txs,
+  height 484435) against the header's own Merkle root; three transactions (odd-weight segwit, 3-input
+  segwit, 5-input legacy) against the explorer's reported size and weight. The streaming fold is also
+  compared with a level-by-level reference for 0..70 leaves, plain and with every adjacent duplicate.
+
 ## Backlog / deferred
 
-- **`Transaction.weight()`/`vsize()`/`baseSize()`/`isCoinbase()`** (survey 2026-09-30) — every fee-estimating wallet needs vsize; all four competitors have it. Effort S. Fits §2.
-- **Merkle root over txids/wtxids (block header check, witness commitment)** (survey 2026-09-30) — `btcp2p.decodeBlock` returns transactions but nothing can confirm them against the header. Effort S. Fits §2.
+- **`Transaction.weight()`/`vsize()`/`baseSize()`/`isCoinbase()`** (survey 2026-09-30) — every fee-estimating wallet needs vsize; all four competitors have it. Effort S. Fits §2. **DONE 2026-11-19** (§ "Size, weight and block Merkle checks").
+- **Merkle root over txids/wtxids (block header check, witness commitment)** (survey 2026-09-30) — `btcp2p.decodeBlock` returns transactions but nothing can confirm them against the header. Effort S. Fits §2. **DONE 2026-11-19** (§ "Size, weight and block Merkle checks").

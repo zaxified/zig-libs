@@ -34,6 +34,12 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup:
   (untrusted bytes → typed errors, zero-copy: script/witness bytes are borrowed slices into the
   caller's buffer) and `serialize`/`serializeLegacy`/`serializeSegwit`. `Transaction.txid()`/
   `.wtxid()` per BIP141.
+  `.baseSize()`/`.totalSize()`/`.weight()`/`.vsize()` (Core's `GetTransactionWeight`; no allocation) and
+  `.isCoinbase()`.
+- **Block Merkle checks** (`merkle.zig`) — `txidRoot`/`wtxidRoot`/`rootOfHashes` with Core's `mutated` flag
+  (CVE-2012-2459 duplicate-tail), `checkMerkleRoot` against a header, the BIP141 witness commitment
+  (`witnessCommitmentIndex`, `witnessCommitment`, `checkWitnessCommitment`). Allocation-free fold; only
+  the per-transaction hashing uses the caller's allocator.
 - **Legacy sighash** (`sighash_legacy.zig`) — scriptCode substitution, ALL/NONE/SINGLE ×
   ANYONECANPAY, the historical SIGHASH_SINGLE `uint256(1)` bug, and Core's
   `SerializeScriptCode` (`OP_CODESEPARATOR` opcodes omitted, push payloads left alone).
@@ -81,6 +87,13 @@ const the_wtxid = try tx.wtxid(allocator); // sha256d of the full segwit seriali
 // -- re-serialize (dispatches on tx.has_witness) --
 const wire_bytes = try bitcointx.serialize(allocator, tx);
 defer allocator.free(wire_bytes);
+
+// -- fee-estimation numbers, no allocation --
+const vbytes = try tx.vsize(); // ceil(weight / 4); also tx.weight(), tx.baseSize(), tx.isCoinbase()
+
+// -- check a decoded block's transactions against its header and witness commitment --
+try bitcointx.merkle.checkMerkleRoot(allocator, block_txs, header_merkle_root);
+try bitcointx.merkle.checkWitnessCommitment(allocator, block_txs); // post-segwit blocks
 
 // -- legacy sighash (P2PKH/P2PK/bare-multisig/P2SH) --
 const legacy_sighash = try bitcointx.legacy.sighash(
