@@ -4295,6 +4295,7 @@ test "serve: a listing carries Cache-Control and nosniff like a file, and links 
     try fx.root.writeFile(io, .{ .sub_path = "lk/a b:c#d\"e.txt", .data = "x" });
     try fx.root.writeFile(io, .{ .sub_path = "lk/\xc3\xa9.txt", .data = "x" });
     try fx.root.writeFile(io, .{ .sub_path = "lk/x-y_z~w.txt", .data = "x" });
+    try fx.root.writeFile(io, .{ .sub_path = "lk/AZaz09", .data = "x" });
     try fx.root.writeFile(io, .{ .sub_path = "lk/t\tb.txt", .data = "x" });
     var out: [8192]u8 = undefined;
     var h = Handler.init(io, fx.root, .{ .directory_listing = true, .cache_control = "no-store" });
@@ -4305,6 +4306,7 @@ test "serve: a listing carries Cache-Control and nosniff like a file, and links 
     try testing.expect(mem.find(u8, resp, "<li><a href=\"a%20b%3Ac%23d%22e.txt\">a b:c#d&#34;e.txt</a></li>") != null);
     try testing.expect(mem.find(u8, resp, "<li><a href=\"sub%20dir/\">sub dir/</a></li>") != null);
     try testing.expect(mem.find(u8, resp, "<li><a href=\"%C3%A9.txt\">\xc3\xa9.txt</a></li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li><a href=\"AZaz09\">AZaz09</a></li>") != null);
     try testing.expect(mem.find(u8, resp, "<li><a href=\"x-y_z~w.txt\">x-y_z~w.txt</a></li>") != null);
     try testing.expect(mem.find(u8, resp, "<li><a href=\"t%09b.txt\">") != null);
     // HEAD carries the same headers.
