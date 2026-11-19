@@ -4,7 +4,7 @@
 //! sends back in `Cookie` (RFC 6265 §5.2 parsing, §5.3 storage, §5.4
 //! retrieval), with RFC 6265bis's two Secure rules (a `Secure` cookie only
 //! from an `https://` response, and a plain response cannot shadow a secure
-//! cookie). Plug it into `http.Client` with `jar.cookieJar()`.
+//! cookie) and its `__Secure-` / `__Host-` name prefixes (§4.1.3). Plug it into `http.Client` with `jar.cookieJar()`.
 //!
 //! **Which domains a response may set cookies for** is the Public Suffix
 //! List's call (`Options.psl`): `bank.co.uk` must not set one for `co.uk`.
@@ -107,6 +107,10 @@ pub const SetCookie = struct {
 };
 
 const wsp = " \t";
+
+fn startsWithIgnoreCase(s: []const u8, prefix: []const u8) bool {
+    return s.len >= prefix.len and std.ascii.eqlIgnoreCase(s[0..prefix.len], prefix);
+}
 
 /// RFC 6265bis §5.6: CTL other than HTAB makes the cookie ignored.
 fn hasControl(s: []const u8) bool {
@@ -313,6 +317,16 @@ pub const Jar = struct {
         // path from a longer request URL is refused too, so no stored cookie
         // costs more than the caps say (no-panic sweep 2026-10-28, C-3).
         if (path.len > max_attribute_bytes) return;
+        // 6265bis §4.1.3 / §5.7: the cookie name prefixes. `__Secure-` needs
+        // the Secure flag; `__Host-` needs Secure, host-only, and an explicit
+        // `Path=/` attribute. Matched without regard to case as browsers do
+        // and as `SetCookie.check` does (the draft text says case-sensitive;
+        // refusing more is the safe direction).
+        if (startsWithIgnoreCase(sc.name, "__Secure-") and !sc.secure) return;
+        if (startsWithIgnoreCase(sc.name, "__Host-")) {
+            const explicit_root = if (sc.path) |sp| std.mem.eql(u8, sp, "/") else false;
+            if (!sc.secure or !host_only or !explicit_root) return;
+        }
         // §5.3 step 3: Max-Age wins over Expires.
         const expiry: ?i64 = if (sc.max_age) |ma|
             (if (ma <= 0) std.math.minInt(i64) else std.math.add(i64, now, ma) catch std.math.maxInt(i64))
@@ -1192,4 +1206,47 @@ test "cookieJar: write_cookies reads the jar's clock, store stamps the expiry wi
     try testing.expectEqual(@as(usize, 1), j.count());
     const exp = j.entries.items[0].expiry.?;
     try testing.expect(exp >= before + 1000 and exp <= after + 1000);
+}
+
+test "name prefixes (6265bis 4.1.3): __Secure- needs Secure, __Host- needs Secure + host-only + explicit Path=/" {
+    var list = try PublicSuffixList.parse(testing.allocator, "com\n");
+    defer list.deinit();
+    var j = Jar.init(testing.allocator, undefined, .{ .psl = &list });
+    defer j.deinit();
+    const url = "https://www.example.com/";
+    // __Secure-: refused without Secure (an https origin does not help).
+    try j.setCookieAt(u(url), "__Secure-=1", t0); // the bare prefix is still a prefix
+    try j.setCookieAt(u(url), "__Host-=1; Path=/", t0);
+    try j.setCookieAt(u(url), "__Secure-a=1", t0);
+    try testing.expectEqual(@as(usize, 0), j.count());
+    try j.setCookieAt(u(url), "__Secure-a=1; Secure", t0);
+    try testing.expectEqual(@as(usize, 1), j.count());
+    // Case-insensitive, as browsers and `SetCookie.check` do; and a Domain
+    // cookie is fine for __Secure-.
+    try j.setCookieAt(u(url), "__SECURE-b=1", t0);
+    try j.setCookieAt(u(url), "__secure-c=1; Domain=example.com", t0);
+    try testing.expectEqual(@as(usize, 1), j.count());
+    try j.setCookieAt(u(url), "__secure-c=1; Domain=example.com; Secure", t0);
+    try testing.expectEqual(@as(usize, 2), j.count());
+    // __Host-: every one of the three conditions is needed.
+    try j.setCookieAt(u(url), "__Host-h=1; Path=/", t0); // no Secure
+    try j.setCookieAt(u(url), "__Host-h=1; Secure; Path=/; Domain=example.com", t0); // not host-only
+    try j.setCookieAt(u(url), "__Host-h=1; Secure; Path=/app", t0); // wrong path
+    try j.setCookieAt(u(url), "__Host-h=1; Secure", t0); // no Path attribute
+    try j.setCookieAt(u(url), "__Host-h=1; Secure; Path=rel", t0); // invalid Path = absent
+    try j.setCookieAt(u(url), "__HOST-h=1; Secure; Path=/app", t0);
+    try testing.expectEqual(@as(usize, 2), j.count());
+    try j.setCookieAt(u(url), "__Host-h=1; Secure; Path=/", t0);
+    try testing.expectEqual(@as(usize, 3), j.count());
+    // Any Domain the list lets through makes the cookie a domain cookie, the
+    // host's own name included.
+    try j.setCookieAt(u(url), "__Host-i=1; Secure; Path=/; Domain=www.example.com", t0);
+    try testing.expectEqual(@as(usize, 3), j.count());
+    // A refused prefixed Set-Cookie does not even delete (the cookie is ignored).
+    try j.setCookieAt(u(url), "__Host-h=; Path=/app; Max-Age=0", t0);
+    try testing.expectEqualStrings("__Secure-a=1; __secure-c=1; __Host-h=1", try header(&j, url, t0));
+    // A name that merely contains the prefix later is ordinary.
+    try j.setCookieAt(u(url), "x__Host-h=1", t0);
+    try j.setCookieAt(u(url), "_Host-h=1", t0);
+    try testing.expectEqual(@as(usize, 5), j.count());
 }

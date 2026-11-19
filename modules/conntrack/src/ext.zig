@@ -159,10 +159,13 @@ pub const FlowQuery = struct {
     family: Family = .unspec,
     kind: DumpKind = .table,
     filter: ?DumpFilter = null,
-    /// `dumpWith` only: at most this many flows are *returned*
+    /// `dumpWith`: at most this many flows are *returned*
     /// (`error.TooManyMessages` beyond it); null = the module's ceiling of
-    /// 1 Mi. Flows the client filter drops do not count against it; a
-    /// separate ceiling on the records the kernel produced stays at 1 Mi.
+    /// 1 Mi. `dumpEachWith`: at most this many flows are *delivered* to the
+    /// visitor, then `error.TooManyMessages` after the dump is drained; null
+    /// = no cap. Flows the client filter drops do not count against it; a
+    /// separate ceiling on the records the kernel produced stays at 1 Mi
+    /// (`dumpWith` only).
     max_flows: ?u32 = null,
 };
 

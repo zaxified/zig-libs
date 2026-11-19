@@ -125,7 +125,8 @@ pub const Hasher = struct {
 /// Memory is constant (two 64 KiB stack buffers), but the TIME is the file's:
 /// a path that never reaches EOF (`/dev/zero`, a FIFO whose writer stays open)
 /// blocks forever, and there is no size or time limit. Call it only on paths
-/// you trust to be regular files or finite virtual files. The stack use is
+/// you trust to be regular files or finite virtual files, or use
+/// `sha256FileMax`. The stack use is
 /// about 128 KiB (two 64 KiB buffers).
 pub fn sha256File(io: std.Io, path: []const u8, out: *[hex_len]u8) ?u64 {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
@@ -145,6 +146,14 @@ pub fn sha256File(io: std.Io, path: []const u8, out: *[hex_len]u8) ?u64 {
     h.final(&raw);
     out.* = std.fmt.bytesToHex(raw, .lower);
     return total;
+}
+
+/// `sha256File` with an optional size cap, see `hashFileMax`.
+pub fn sha256FileMax(io: std.Io, path: []const u8, out: *[hex_len]u8, max_bytes: ?u64) error{FileTooLarge}!?u64 {
+    return hashFileInMax(.sha256, io, std.Io.Dir.cwd(), path, out, max_bytes) catch |e| switch (e) {
+        error.ShortBuffer => unreachable, // out is hex_len
+        error.FileTooLarge => error.FileTooLarge,
+    };
 }
 
 // ── multi-algorithm layer ────────────────────────────────────────────────────
@@ -320,13 +329,33 @@ pub const MultiHasher = struct {
 /// virtual-file semantics as `sha256File`). Writes lowercase hex into `out`
 /// (>= `hexLength(algo)` bytes, checked — `error.ShortBuffer`, never panics).
 /// Returns the byte count, or `null` on open/read error. Like `sha256File`, it
-/// has no size or time limit: a path that never reaches EOF blocks forever.
+/// has no size or time limit: a path that never reaches EOF blocks forever
+/// (`hashFileMax` adds a size cap).
 pub fn hashFile(algo: Algorithm, io: std.Io, path: []const u8, out: []u8) error{ShortBuffer}!?u64 {
     return hashFileIn(algo, io, std.Io.Dir.cwd(), path, out);
 }
 
 /// `hashFile` with `path` relative to `dir` instead of the working directory.
 pub fn hashFileIn(algo: Algorithm, io: std.Io, dir: std.Io.Dir, path: []const u8, out: []u8) error{ShortBuffer}!?u64 {
+    return hashFileInMax(algo, io, dir, path, out, null) catch |e| switch (e) {
+        error.ShortBuffer => error.ShortBuffer,
+        error.FileTooLarge => unreachable, // no limit given
+    };
+}
+
+/// `hashFile` with an optional size cap: `max_bytes` null is unlimited (the
+/// default of every other entry point, as of `sha256sum` and `b3sum`); a
+/// number makes the call return `error.FileTooLarge` as soon as the file
+/// delivers more than that many bytes (a file of exactly `max_bytes` is fine),
+/// so a `/dev/zero`-like path or an unexpectedly huge file ends after at most
+/// `max_bytes` plus one read chunk. It bounds the BYTES, not the time: a FIFO
+/// whose writer stays open and silent still blocks.
+pub fn hashFileMax(algo: Algorithm, io: std.Io, path: []const u8, out: []u8, max_bytes: ?u64) error{ ShortBuffer, FileTooLarge }!?u64 {
+    return hashFileInMax(algo, io, std.Io.Dir.cwd(), path, out, max_bytes);
+}
+
+/// `hashFileMax` with `path` relative to `dir`.
+pub fn hashFileInMax(algo: Algorithm, io: std.Io, dir: std.Io.Dir, path: []const u8, out: []u8, max_bytes: ?u64) error{ ShortBuffer, FileTooLarge }!?u64 {
     if (out.len < hexLength(algo)) return error.ShortBuffer;
     var file = dir.openFile(io, path, .{}) catch return null;
     defer file.close(io);
@@ -338,6 +367,7 @@ pub fn hashFileIn(algo: Algorithm, io: std.Io, dir: std.Io.Dir, path: []const u8
     while (true) {
         const n = fr.interface.readSliceShort(&chunk) catch return null;
         if (n == 0) break;
+        if (max_bytes) |m| if (n > m - total) return error.FileTooLarge;
         h.update(chunk[0..n]);
         total += n;
     }
@@ -710,4 +740,48 @@ test "hashFile: missing file null; short buffer error; sha256 path matches sha25
         try std.testing.expectEqual(n1, n2);
         try std.testing.expectEqualStrings(&legacy, out[0..hex_len]);
     }
+}
+
+test "hashFileInMax / sha256FileMax: the cap is exact, over it is FileTooLarge, null is unlimited" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const big = try std.testing.allocator.alloc(u8, 64 * 1024 + 1); // one byte past a read chunk
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "abc", .data = "abc" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "big", .data = big });
+    var out: [max_hex_len]u8 = undefined;
+
+    // exactly at the cap, one under, zero cap on an empty file, unlimited
+    try std.testing.expectEqual(@as(?u64, 3), try hashFileInMax(.sha256, io, tmp.dir, "abc", &out, 3));
+    try std.testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", out[0..hex_len]);
+    try std.testing.expectError(error.FileTooLarge, hashFileInMax(.sha256, io, tmp.dir, "abc", &out, 2));
+    try std.testing.expectEqual(@as(?u64, 0), try hashFileInMax(.sha256, io, tmp.dir, "empty", &out, 0));
+    try std.testing.expectError(error.FileTooLarge, hashFileInMax(.sha256, io, tmp.dir, "abc", &out, 0));
+    try std.testing.expectEqual(@as(?u64, 3), try hashFileInMax(.sha256, io, tmp.dir, "abc", &out, null));
+    // across the 64 KiB read chunk
+    try std.testing.expectEqual(@as(?u64, big.len), try hashFileInMax(.blake3, io, tmp.dir, "big", &out, big.len));
+    try std.testing.expectError(error.FileTooLarge, hashFileInMax(.blake3, io, tmp.dir, "big", &out, big.len - 1));
+    try std.testing.expectError(error.FileTooLarge, hashFileInMax(.blake3, io, tmp.dir, "big", &out, 64 * 1024));
+    // missing file is still null, a short buffer still an error, and the cap does not hide either
+    try std.testing.expectEqual(@as(?u64, null), try hashFileInMax(.sha256, io, tmp.dir, "nope", &out, 1));
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.ShortBuffer, hashFileInMax(.sha256, io, tmp.dir, "abc", &tiny, 100));
+
+    // the cwd-relative and sha256 spellings
+    var path_buf: [128]u8 = undefined;
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/abc", .{&tmp.sub_path});
+    var hex256: [hex_len]u8 = undefined;
+    try std.testing.expectEqual(@as(?u64, 3), try sha256FileMax(io, path, &hex256, 3));
+    try std.testing.expectError(error.FileTooLarge, sha256FileMax(io, path, &hex256, 2));
+    try std.testing.expectEqual(@as(?u64, 3), try hashFileMax(.sha256, io, path, &out, 3));
+    try std.testing.expectError(error.FileTooLarge, hashFileMax(.sha256, io, path, &out, 2));
+}
+
+test "sha256FileMax: a path with no end stops at the cap (Linux /dev/zero)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var hex_out: [hex_len]u8 = undefined;
+    try std.testing.expectError(error.FileTooLarge, sha256FileMax(std.testing.io, "/dev/zero", &hex_out, 1 << 20));
 }

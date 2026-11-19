@@ -179,6 +179,17 @@ pub const HandshakeResult = struct {
     /// mentioned it. Purely additive field at the end of the struct
     /// (`DECISIONS.md` P3): no existing field changes shape or meaning.
     remote_static: [33]u8,
+
+    /// Zero the secret fields (`sk`, `rk`, `ck`). Call it once the result has
+    /// been handed to `Transport.init` (which copies the keys): the result is
+    /// dead from then on and nothing else clears it. `handshake_hash` and
+    /// `remote_static` are public values and are left alone. Additive method.
+    /// Does not reach copies a caller made of the struct by value.
+    pub fn wipe(self: *HandshakeResult) void {
+        std.crypto.secureZero(u8, &self.sk);
+        std.crypto.secureZero(u8, &self.rk);
+        std.crypto.secureZero(u8, &self.ck);
+    }
 };
 
 /// The initiator's side of `Noise_XK(s, rs)`. BOLT#8 requires the

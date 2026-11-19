@@ -377,3 +377,19 @@ test "F2: deinit zeroes the key material each object directly owns" {
     try testing.expect(std.mem.allEqual(u8, &t.rx.cipher.k, 0));
     try testing.expect(std.mem.allEqual(u8, &t.rx.chain, 0));
 }
+
+test "HandshakeResult.wipe zeroes sk/rk/ck and keeps the public fields" {
+    var r: handshake.HandshakeResult = .{
+        .sk = @splat(1),
+        .rk = @splat(2),
+        .ck = @splat(3),
+        .handshake_hash = @splat(4),
+        .remote_static = @splat(5),
+    };
+    r.wipe();
+    try testing.expectEqual(@as([32]u8, @splat(0)), r.sk);
+    try testing.expectEqual(@as([32]u8, @splat(0)), r.rk);
+    try testing.expectEqual(@as([32]u8, @splat(0)), r.ck);
+    try testing.expectEqual(@as([32]u8, @splat(4)), r.handshake_hash);
+    try testing.expectEqual(@as([33]u8, @splat(5)), r.remote_static);
+}

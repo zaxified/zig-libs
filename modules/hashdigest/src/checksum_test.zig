@@ -317,3 +317,38 @@ test "verify hashes regular files only: a FIFO, a directory and /dev/zero are un
     const s = ck.verifyAll(testing.io, tmp.dir, .sha256, t, .{ .allow_unsafe_names = true });
     try testing.expectEqual(@as(usize, 3), s.unreadable);
 }
+
+test "verify: Options.max_file_bytes makes a longer file too_large; the default is unlimited" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "abc" });
+    const good = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    var buf: [512]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "{s}  a\n", .{good});
+    const lim3 = ck.verifyAll(testing.io, tmp.dir, .sha256, line, .{ .max_file_bytes = 3 });
+    try testing.expectEqual(@as(usize, 1), lim3.ok);
+    try testing.expect(lim3.allOk());
+    const lim2 = ck.verifyAll(testing.io, tmp.dir, .sha256, line, .{ .max_file_bytes = 2 });
+    try testing.expectEqual(@as(usize, 1), lim2.too_large);
+    try testing.expectEqual(@as(usize, 0), lim2.ok + lim2.mismatch + lim2.unreadable);
+    try testing.expect(!lim2.allOk());
+    try testing.expect(ck.verifyAll(testing.io, tmp.dir, .sha256, line, .{}).allOk());
+    var it = ck.Iterator.init(line);
+    const e = (try it.next()).?;
+    try testing.expectEqual(ck.Status.too_large, try ck.verifyEntry(testing.io, tmp.dir, .sha256, e, .{ .max_file_bytes = 0 }));
+}
+
+test "verify: one ok file and one too_large file is not allOk" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "abc" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b", .data = "abcde" });
+    const text =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a\n" ++
+        "36bbe50ed96841d10443bcb670d6554f0a34b761be67ec9c4a8ad2c0c44ca42c  b\n";
+    const s = ck.verifyAll(testing.io, tmp.dir, .sha256, text, .{ .max_file_bytes = 3 });
+    try testing.expectEqual(@as(usize, 1), s.ok);
+    try testing.expectEqual(@as(usize, 1), s.too_large);
+    try testing.expect(!s.allOk());
+    try testing.expect(ck.verifyAll(testing.io, tmp.dir, .sha256, text, .{ .max_file_bytes = 5 }).allOk());
+}
