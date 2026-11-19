@@ -10410,6 +10410,16 @@ test "root client over a pipe (Sign): a CreateSession answer signed with another
 
 // ── opcua3: client-side TranslateBrowsePaths / ModifyMonitoredItems / SetMonitoringMode ──
 
+/// The request the client just sent (`PipeReader.last`, a `#None` chunk:
+/// 8-byte message header, 16 bytes of channel/token/sequence/request ids,
+/// the type id, the body), decoded with `decodeFn` into `arena`.
+fn lastRequest(pipe: *const PipeReader, arena: std.mem.Allocator, comptime Req: type, comptime decodeFn: fn (*encoding.Decoder) encoding.DecodeError!Req) !Req {
+    var r: std.Io.Reader = .fixed(pipe.last.items[8 + 16 ..]);
+    var d = encoding.Decoder.init(&r, arena);
+    _ = try d.decodeNodeId();
+    return decodeFn(&d);
+}
+
 /// The root client wired to a rig over `PipeReader` at SecurityPolicy#None,
 /// session activated: what the three client-service tests below share.
 const PipeClient = struct {
@@ -10466,6 +10476,14 @@ test "root client over a pipe: translateBrowsePaths resolves forward, inverse an
     };
     const response = try pc.session.translateBrowsePaths(&paths);
     defer services.freeTranslateBrowsePathsToNodeIdsResponse(gpa, response);
+    {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const req = try lastRequest(&pc.pipe, arena.allocator(), services.TranslateBrowsePathsToNodeIdsRequest, services.decodeTranslateBrowsePathsToNodeIdsRequest);
+        try testing.expect(services.nodeIdEql(req.request_header.authentication_token, pc.session.authentication_token));
+        try testing.expectEqual(@as(usize, 5), req.browse_paths.?.len);
+        try testing.expectEqual(@as(usize, 3), req.browse_paths.?[0].relative_path.elements.?.len);
+    }
     const results = response.results.?;
     try testing.expectEqual(@as(usize, 5), results.len);
     try testing.expectEqual(status.good, results[0].status_code);
@@ -10513,8 +10531,18 @@ test "root client over a pipe: modifyMonitoredItems re-labels and re-tunes items
         .{ .monitored_item_id = 123_456, .client_handle = 55 },
     };
     {
-        const r = try sub.modifyMonitoredItems(&mods, .both);
+        const r = try sub.modifyMonitoredItems(&mods, .server);
         defer services.freeModifyMonitoredItemsResponse(gpa, r);
+        // what went on the wire
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const req = try lastRequest(&pc.pipe, arena.allocator(), services.ModifyMonitoredItemsRequest, services.decodeModifyMonitoredItemsRequest);
+        try testing.expectEqual(sub.subscription_id, req.subscription_id);
+        try testing.expectEqual(services.TimestampsToReturn.server, req.timestamps_to_return);
+        try testing.expect(services.nodeIdEql(req.request_header.authentication_token, pc.session.authentication_token));
+        try testing.expectEqual(@as(usize, 2), req.items_to_modify.?.len);
+        try testing.expectEqual(id10, req.items_to_modify.?[0].monitored_item_id);
+        try testing.expectEqual(@as(u32, 123_456), req.items_to_modify.?[1].monitored_item_id);
         const results = r.results.?;
         try testing.expectEqual(@as(usize, 2), results.len);
         try testing.expectEqual(status.good, results[0].status_code);
@@ -10579,6 +10607,13 @@ test "root client over a pipe: setMonitoringMode switches items between disabled
         const ids = [_]u32{ id10, 123_456, id11 };
         const r = try sub.setMonitoringMode(mode, &ids);
         defer services.freeSetMonitoringModeResponse(gpa, r);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const req = try lastRequest(&pc.pipe, arena.allocator(), services.SetMonitoringModeRequest, services.decodeSetMonitoringModeRequest);
+        try testing.expectEqual(sub.subscription_id, req.subscription_id);
+        try testing.expectEqual(mode, req.monitoring_mode);
+        try testing.expect(services.nodeIdEql(req.request_header.authentication_token, pc.session.authentication_token));
+        try testing.expectEqualSlices(u32, &ids, req.monitored_item_ids.?);
         const results = r.results.?;
         try testing.expectEqual(@as(usize, 3), results.len);
         try testing.expectEqual(status.good, results[0]);

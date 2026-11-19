@@ -3452,6 +3452,17 @@ pub const result_fns = struct {
 
 const testing = std.testing;
 
+test "result_fns: ModifyMonitoredItems and SetMonitoringMode answers report the header's service result" {
+    const bad: encoding.StatusCode = 0x8001_0000;
+    const header: ResponseHeader = .{ .timestamp = 0, .request_handle = 0, .service_result = bad, .service_diagnostics = .{}, .string_table = null, .additional_header = no_additional_header };
+    try testing.expectEqual(bad, result_fns.modify_monitored_items(.{ .response_header = header, .results = null, .diagnostic_infos = null }));
+    try testing.expectEqual(bad, result_fns.set_monitoring_mode(.{ .response_header = header, .results = null, .diagnostic_infos = null }));
+    var good = header;
+    good.service_result = 0;
+    try testing.expectEqual(@as(encoding.StatusCode, 0), result_fns.modify_monitored_items(.{ .response_header = good, .results = null, .diagnostic_infos = null }));
+    try testing.expectEqual(@as(encoding.StatusCode, 0), result_fns.set_monitoring_mode(.{ .response_header = good, .results = null, .diagnostic_infos = null }));
+}
+
 test "RequestHeader / ResponseHeader round-trip" {
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
