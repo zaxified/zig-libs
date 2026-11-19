@@ -683,6 +683,13 @@ test "writeRange: strings" {
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("2,0"))); // no such element
     try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("1,0,0")));
     try testing.expectError(error.TypeMismatch, writeRange(a.allocator(), strs, .{ .scalar = .{ .int32 = 1 } }, &try parse("1,0")));
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "XY" } }, &try parse("0:1,1:2"))); // one String of the right width for two elements
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("0,1:2"))); // too narrow
+    try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), strs, .{ .scalar = .{ .string = "Z" } }, &try parse("1:5,0"))); // the element range is exact
+    const holey = arrOf("string", @as(?[]const ?[]const u8, &.{ null, "abc" }));
+    try testing.expectError(error.IndexRangeNoData, writeRange(a.allocator(), holey, .{ .scalar = .{ .string = "Z" } }, &try parse("0,0"))); // a null element holds no range
+    // a null String written into a byte range is a size mismatch, not a syntax error
+    try testing.expectError(error.IndexRangeDataMismatch, writeRange(a.allocator(), .{ .scalar = .{ .string = "abc" } }, .{ .scalar = .{ .string = null } }, &try parse("0")));
 }
 
 test "Selection visits row-major, once each" {
