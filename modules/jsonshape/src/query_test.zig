@@ -254,6 +254,11 @@ test "strict: a wrong path is told apart from an empty result; off by default" {
     try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.p[?@.v>9]", true, &cols));
     try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.p[5:9]", true, &cols));
     try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.q[*]", true, &cols));
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$.d.p[7,8]", true, &cols)); // two selectors: indefinite
+    try testing.expectEqual(@as(usize, 0), try S.run(a, doc, "$['d']['zz','yy']", true, &cols));
+    // A legacy path with empty segments (leading or trailing dot) still finds its node.
+    try testing.expectEqual(@as(usize, 1), try S.run(a, doc, ".d.p", true, &cols));
+    try testing.expectEqual(@as(usize, 1), try S.run(a, doc, "d.p.", true, &cols));
     // Hits behave the same in both modes; the root and a scalar match too.
     for ([_]bool{ false, true }) |strict| {
         try testing.expectEqual(@as(usize, 1), try S.run(a, doc, "d.p", strict, &cols));
