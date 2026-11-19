@@ -493,14 +493,14 @@ directly-exposed parser.
     4 KiB floor is not taken (nghttp2 and h2o have none). Unsent stream credit of a stream that
     ended is dropped; unsent connection credit stays owed. 40 000 one-octet frames: 2 updates
     instead of 80 000.
-  - *~46 KiB per connection before the first byte*, no built-in connection cap (`on_connect` is the
-    control) — a sentence for the README's posture section.
-  - *Inbound gzip relies on std flate for crafted dynamic blocks*: truncation is guarded
+  - **DONE 2026-11-19** *~46 KiB per connection before the first byte*, no built-in connection cap (`on_connect` is the
+    control) — now a paragraph in the README's posture section ("Memory per connection").
+  - **DONE 2026-11-19** *Inbound gzip relies on std flate for crafted dynamic blocks* (harness `http-gzip-body` in `Server.zig`: a drawn plaintext, three shapes, compressed, 0-3 octets flipped and maybe cut, served through the loop with the trailer check on and off; with it on, a 200 must carry exactly the plaintext). Was:: truncation is guarded
     (`PaddedSource`), but no http-level deterministic driver feeds random deflate streams through
     `GunzipBody`.
-  - *`multipart.StreamPart.body` has a zero-capacity reader*: `stream`/`readSliceShort`/`discard`
+  - **DONE 2026-11-19** *`multipart.StreamPart.body` has a zero-capacity reader* (it now has a `body_buf_len` = 64 octet buffer: `peek`/`take`/`takeByte`/`takeDelimiter` work up to that size; a longer `peek`/`take` is std's assert, as for any reader of that capacity). Was:: `stream`/`readSliceShort`/`discard`
     work, `peek`/`take` reach std's assert (documented). A small buffer would make it total.
-  - *`h2_client` does not validate response field names/values* (`processEvents`): `Client.h2glue`
+  - **DONE 2026-11-19** *`h2_client` does not validate response field names/values*: a final response head whose field has an uppercase or non-token name or a CR/LF/NUL value is a stream error (RST_STREAM PROTOCOL_ERROR, RFC 9113 §8.1.1/§8.2.1) and the waiting call fails `MalformedResponse`; an invalid trailer block is dropped like one with a pseudo-header. Was: (`processEvents`): `Client.h2glue`
     does and the proxy's `setHeader` refuses them (→ 502), but a direct `h2_client` user sees the
     raw bytes.
 

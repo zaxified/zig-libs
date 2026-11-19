@@ -592,6 +592,12 @@ status), a server-side failure (`server_failed`: 503 no working memory, 500
 broken framing) and `accept` errors (`accept_failed`) — h1 and h2 alike;
 success never calls it.
 
+**Memory per connection.** An idle admitted connection costs about 46 KiB
+before its first byte (its buffer slab and bookkeeping), and the server has
+no built-in connection cap: `Options.on_connect` is the admission control and
+`Server.activeConnections()` its input, so size `max connections x 46 KiB`
+into the process budget.
+
 **Size limits** (all configurable in `Options`):
 
 | Limit | Default | Response |
