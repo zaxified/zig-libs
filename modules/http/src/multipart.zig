@@ -291,9 +291,10 @@ pub const StreamPart = struct {
     /// The part's body bytes, verbatim, as they arrive; `error.EndOfStream`
     /// at the delimiter that closes the part. The reader has no buffer of its
     /// own: read it with `stream`, `streamRemaining`, `readSliceShort`,
-    /// `allocRemaining` or `discardRemaining`, not `peek`/`take`. A body that
-    /// breaks the grammar fails the read with `error.ReadFailed` and sets
-    /// `Reader.err`.
+    /// `allocRemaining` or `discardRemaining`; `peek`/`take` work up to
+    /// `body_buf_len` octets at a time (a longer request is std's assert, as
+    /// for any `std.Io.Reader` of that capacity). A body that breaks the
+    /// grammar fails the read with `error.ReadFailed` and sets `Reader.err`.
     body: *std.Io.Reader,
 
     /// First value of header `name` (case-insensitive), or null.
@@ -344,6 +345,14 @@ pub const Reader = struct {
     err: ?StreamError = null,
     /// The current part's body, handed out as `StreamPart.body`.
     body_reader: std.Io.Reader,
+    /// Its buffer, so `peek`/`take`/`takeByte`/`takeDelimiter` have room to
+    /// work in; octets in it were already taken off `in`, and are dropped
+    /// when `nextPart` moves on. Wired up by `nextPart` (the struct must not
+    /// move once a part was handed out, the same rule as `body_reader`).
+    body_buf: [body_buf_len]u8 = undefined,
+
+    /// Capacity of the part body reader's own buffer.
+    pub const body_buf_len = 64;
 
     const State = enum {
         /// Nothing read yet: the preamble comes first.
@@ -395,6 +404,11 @@ pub const Reader = struct {
     }
 
     fn advance(r: *Reader) StreamError!?StreamPart {
+        // Octets the previous part's reader buffered but nobody took belong to
+        // that part: gone with it, never the start of the next part's body.
+        r.body_reader.buffer = &r.body_buf;
+        r.body_reader.seek = 0;
+        r.body_reader.end = 0;
         switch (r.state) {
             .failed => return r.err.?,
             .done => return null,
@@ -1150,6 +1164,53 @@ test "Reader: nextPart skips an unread body, and a half-read one" {
     // A finished part's body keeps saying so.
     var one: [1]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), try c.body.readSliceShort(&one));
+}
+
+test "Reader: a part body supports peek and take up to body_buf_len; unread buffered octets die with the part" {
+    const src = db ++ crlf ++
+        "Content-Disposition: form-data; name=\"a\"" ++ crlf ++ crlf ++
+        "hello world, with a body well past the peek window of the reader" ++ crlf ++
+        db ++ crlf ++
+        "Content-Disposition: form-data; name=\"b\"" ++ crlf ++ crlf ++
+        "xyz" ++ crlf ++
+        db ++ "--" ++ crlf;
+    const a_body = "hello world, with a body well past the peek window of the reader";
+    // One octet per read through a delimiter-sized buffer: every held-back tail
+    // splits, and the part buffer is filled a byte at a time.
+    for ([_]usize{ 1, 3, 4096 }) |step| {
+        var in_buf: [test_boundary.len + 4]u8 = undefined;
+        var chunked: ChunkedReader = .init(src, step, &in_buf);
+        var hdr: [header_buf_len]u8 = undefined;
+        var mr = try Reader.init(&chunked.interface, test_boundary, &hdr, .{});
+
+        const a = (try mr.nextPart()).?;
+        try testing.expectEqualStrings("hello", try a.body.peek(5));
+        try testing.expectEqual(@as(u8, 'h'), try a.body.peekByte());
+        try testing.expectEqualStrings("hello", try a.body.take(5));
+        try testing.expectEqual(@as(u8, ' '), try a.body.takeByte());
+        try testing.expectEqualStrings("world,", (try a.body.takeDelimiter(' ')).?);
+        // A request the buffer cannot hold is not asked for here; one it can
+        // hold across the end of the body is `EndOfStream`, not a hang.
+        try testing.expectEqual(@as(usize, a_body.len - 13), try a.body.discardRemaining());
+        try testing.expectError(error.EndOfStream, a.body.takeByte());
+
+        // Half-taken: octets sit in the part's buffer when `nextPart` moves on.
+        const b = (try mr.nextPart()).?;
+        try testing.expectEqualStrings("b", b.name.?);
+        try testing.expectEqualStrings("x", try b.body.take(1));
+        try testing.expect((try mr.nextPart()) == null);
+        try testing.expectError(error.EndOfStream, b.body.takeByte());
+    }
+    // The buffered octets of an unfinished part are not the next part's start.
+    var in_buf: [test_boundary.len + 4]u8 = undefined;
+    var chunked: ChunkedReader = .init(src, 4096, &in_buf);
+    var hdr: [header_buf_len]u8 = undefined;
+    var mr = try Reader.init(&chunked.interface, test_boundary, &hdr, .{});
+    const a = (try mr.nextPart()).?;
+    try testing.expectEqualStrings("hel", try a.body.peek(3)); // buffers more than 3
+    const b = (try mr.nextPart()).?;
+    try testing.expectEqualStrings("xyz", try b.body.take(3));
+    try testing.expectError(error.EndOfStream, b.body.takeByte());
 }
 
 test "Reader: a failed underlying read is ReadFailed, sticky, and not a malformed body" {
