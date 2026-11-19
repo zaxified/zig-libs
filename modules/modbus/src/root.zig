@@ -73,6 +73,7 @@ pub const goldens = @import("goldens.zig");
 test {
     _ = server;
     _ = goldens;
+    _ = @import("audit_test.zig");
 }
 
 // ── wire constants ──────────────────────────────────────────────────────────
@@ -2505,4 +2506,158 @@ test "RtuStream: file-record requests with several sub-requests are sized by the
     const resp = [_]u8{ 0x14, 0x07, 0x04, 0x06, 0xAA, 0xBB, 0x03, 0x06, 0xCC };
     _ = s2.feed(try rtu.encodeAdu(&a, 0x01, &resp));
     try testing.expectEqualSlices(u8, &resp, s2.next().?.pdu);
+}
+
+// ── TcpTransport reply framing (audit 2026-11-19) ──────────────────────────
+
+/// A peer that accepts one connection, drains the request, writes `reply`
+/// and keeps the connection open for a while.
+const ScriptedPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    reply: []const u8,
+
+    fn run(p: *ScriptedPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [16]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        _ = sr.interface.readSliceShort(rbuf[0..2]) catch {};
+        var wbuf: [64]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll(p.reply) catch return;
+        sw.interface.flush() catch return;
+        p.io.sleep(.fromMilliseconds(300), .awake) catch return;
+    }
+};
+
+fn scriptedExchange(reply: []const u8, reply_buf: []u8) anyerror![]const u8 {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
+    };
+    defer srv.deinit(io);
+    var peer: ScriptedPeer = .{ .io = io, .listener = &srv, .reply = reply };
+    const th = try std.Thread.spawn(.{}, ScriptedPeer.run, .{&peer});
+    defer th.join();
+    var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    };
+    defer t.close();
+    return t.transport().exchange(&.{ 0x00, 0x01 }, reply_buf);
+}
+
+test "TcpTransport: the MBAP length field decides how much of the reply is read" {
+    var buf: [10]u8 = undefined;
+    // length field 0 and an over-long one are transport failures
+    try testing.expectError(error.TransportFailed, scriptedExchange(&.{ 0, 1, 0, 0, 0, 0, 1 }, &buf));
+    try testing.expectError(error.TransportFailed, scriptedExchange(&.{ 0, 1, 0, 0, 0, 5, 1, 2, 3, 4, 5 }, &buf));
+    // length field 1: unit byte only, the reply is the 7 header bytes
+    const one = try scriptedExchange(&.{ 0, 1, 0, 0, 0, 1, 9 }, &buf);
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0, 0, 1, 9 }, one);
+    // a reply that fills the buffer exactly is fine
+    const full = try scriptedExchange(&.{ 0, 1, 0, 0, 0, 4, 5, 6, 7, 8 }, &buf);
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0, 0, 4, 5, 6, 7, 8 }, full);
+    // a buffer that cannot even hold the header
+    var tiny: [3]u8 = undefined;
+    try testing.expectError(error.TransportFailed, scriptedExchange(&.{ 0, 1, 0, 0, 0, 1, 9 }, &tiny));
+}
+
+test "TcpTransport: a bounded exchange without a unit of concurrency is a transport failure, not a timeout" {
+    var limited = std.Io.Threaded.init(testing.allocator, .{ .concurrent_limit = .nothing });
+    defer limited.deinit();
+    var normal = std.Io.Threaded.init(testing.allocator, .{});
+    defer normal.deinit();
+    const io = normal.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
+    };
+    defer srv.deinit(io);
+    var peer: SilentPeer = .{ .io = io, .listener = &srv };
+    const th = try std.Thread.spawn(.{}, SilentPeer.run, .{&peer});
+    defer th.join();
+    var t = TcpTransport.connect(limited.io(), srv.socket.address) catch |err| {
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    };
+    defer t.close();
+    t.timeout_ms = 1000;
+    var reply_buf: [tcp.max_adu_len]u8 = undefined;
+    try testing.expectError(error.TransportFailed, t.transport().exchange(&.{ 0x00, 0x01 }, &reply_buf));
+}
+
+test "a canceled BOUNDED exchange surfaces Canceled, not Timeout or TransportFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
+    };
+    defer srv.deinit(io);
+
+    var accept_fut = try io.concurrent(acceptOne, .{ &srv, io });
+    var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
+        if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    };
+    defer t.close();
+    var peer = try accept_fut.await(io);
+    defer peer.close(io);
+
+    var reply_buf: [tcp.max_adu_len]u8 = undefined;
+    var cue: ReadCueIo = .init(io);
+    t.io = cue.io();
+    t.timeout_ms = 600_000; // far away: only the cancel can end the wait
+    var fut = try io.concurrent(exchangeOnce, .{ &t, &.{ 0x00, 0x01 }, &reply_buf });
+    const reached = ReadCueIo.awaitReads(io, 1);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
+}
+
+/// A real `std.Io` whose socket writes fail with `Canceled`.
+const WriteCancelIo = struct {
+    vtable: std.Io.VTable,
+    userdata: ?*anyopaque,
+
+    var inner_vtable: *const std.Io.VTable = undefined;
+
+    fn init(inner: std.Io) WriteCancelIo {
+        inner_vtable = inner.vtable;
+        var vt = inner.vtable.*;
+        vt.operate = operate;
+        return .{ .vtable = vt, .userdata = inner.userdata };
+    }
+
+    fn io(self: *const WriteCancelIo) std.Io {
+        return .{ .userdata = self.userdata, .vtable = &self.vtable };
+    }
+
+    fn operate(userdata: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        if (op == .net_write) return error.Canceled;
+        return inner_vtable.operate(userdata, op);
+    }
+};
+
+test "a canceled request write surfaces Canceled, not TransportFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        return testkit.loopbackSkip("loopback listen failed ({t})", .{err});
+    };
+    defer srv.deinit(io);
+    var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
+        return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    };
+    defer t.close();
+    var wc: WriteCancelIo = .init(io);
+    t.io = wc.io();
+    var reply_buf: [tcp.max_adu_len]u8 = undefined;
+    try testing.expectError(error.Canceled, t.transport().exchange(&.{ 0x00, 0x01 }, &reply_buf));
 }
