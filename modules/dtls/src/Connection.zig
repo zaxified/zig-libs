@@ -9935,6 +9935,35 @@ test "handshake: ACKs between the records of the server's flight are skipped, th
     try testing.expectEqualStrings("up", try server.recv(try client.send("up", &wire), &plain));
 }
 
+test "handshake: an injected epoch-0 record with a huge record number does not make the genuine hellos stale" {
+    // The 1.3 engine keeps no epoch-0 replay window at all (`hs0` counts
+    // sends only): an epoch-0 duplicate is recognised by `message_seq`, so
+    // nothing an unauthenticated record says about its record number can
+    // shadow a genuine one. Pinned here for both hellos.
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try ackPair(&client, &server);
+    defer client.deinit();
+    defer server.deinit();
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x35)));
+    const rnd = seededForTest(&csprng);
+    var b1: [1500]u8 = undefined;
+    var b2: [1500]u8 = undefined;
+    var ab: [200]u8 = undefined;
+    const huge: u48 = std.math.maxInt(u48);
+
+    const ch = try client.startHandshake(rnd, 0, &b1);
+    const s0 = try server.handleFlight(try ackRecordForTest(false, &server.hs_write_keys, huge, &.{}, &ab), rnd, 0, &b2);
+    try testing.expect(s0.need_more_data);
+    const f2 = try server.handleFlight(ch, rnd, 0, &b2);
+    try testing.expect(f2.out.len > 0);
+    const c0 = try client.handleFlight(try ackRecordForTest(false, &client.hs_write_keys, huge, &.{}, &ab), rnd, 0, &b1);
+    try testing.expect(c0.need_more_data);
+    const cf = try client.handleFlight(f2.out, rnd, 0, &b1);
+    try testing.expect(cf.done);
+    try testing.expect((try server.handleFlight(cf.out, rnd, 0, &b2)).done);
+}
+
 test "handshake: an ACK ahead of the client's Finished is skipped by the server, and does not enter the ACK it owes" {
     var client: Connection = undefined;
     var server: Connection = undefined;

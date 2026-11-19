@@ -841,9 +841,8 @@ test "dtls12: a flood of forged later-message fragments stays inside the queue b
 
     // The genuine flight still completes: the queued forgeries make the
     // first pass fail, and the datagram is retried from live bytes alone.
-    // (Its record numbers are put above the forged ones: the epoch-0 replay
-    // window is a separate matter from the queue.)
-    server.send_seq[0] = 1_000_000;
+    // Its record numbers (from 0) are far below the forged ones (from
+    // 1000): queued forgeries are not recorded in the epoch-0 window.
     const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
     const f5 = try client.handleFlight(f4.out, rnd, 0, &bufs.a);
     try testing.expectEqual(c12.State.wait_server_finished, client.state);
@@ -865,6 +864,34 @@ test "dtls12: a flood of forged later-message fragments stays inside the queue b
     defer s2.deinit();
     _ = try s2.handleFlight(forgedFragment(5, m12.HandshakeType.client_key_exchange, 3, 40, 40, 1, &rec_buf), rnd, 0, &bufs.b);
     try testing.expectEqual(@as(usize, 0), s2.rx_future_len);
+}
+
+test "dtls12: an injected epoch-0 record with a huge record number does not make the genuine flights stale" {
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(25)));
+    const rnd = seeded(&csprng);
+    var client = try Connection12.clientInit(ecdsaClientConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer client.deinit();
+    var server = try Connection12.serverInit(ecdsaServerConfig(&.{.ecdhe_ecdsa_with_aes_128_gcm_sha256}));
+    defer server.deinit();
+    var bufs: Bufs = .{};
+    var rec_buf: [512]u8 = undefined;
+    const huge: u48 = std.math.maxInt(u48);
+    const ccs = [_]u8{ 20, 0xfe, 0xfd, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 1, 1 };
+
+    const ch = try client.startHandshake(rnd, 0, &bufs.a);
+    // Off-path: a later message's fragment and a stray ChangeCipherSpec,
+    // both at the top of the sequence space, ahead of the server's flight.
+    _ = try client.handleFlight(forgedFragment(huge, m12.HandshakeType.certificate, 3, 900, 300, 1, &rec_buf), rnd, 0, &bufs.a);
+    _ = try client.handleFlight(&ccs, rnd, 0, &bufs.a);
+    const f4 = try server.handleFlight(ch, rnd, 0, &bufs.b);
+    const f5 = try client.handleFlight(f4.out, rnd, 0, &bufs.a);
+    try testing.expectEqual(c12.State.wait_server_finished, client.state);
+    // The same against the server, ahead of the client's second flight.
+    _ = try server.handleFlight(forgedFragment(huge, m12.HandshakeType.finished, 9, 12, 12, 1, &rec_buf), rnd, 0, &bufs.b);
+    _ = try server.handleFlight(&ccs, rnd, 0, &bufs.b);
+    const f6 = try server.handleFlight(f5.out, rnd, 0, &bufs.b);
+    try testing.expect((try client.handleFlight(f6.out, rnd, 0, &bufs.a)).done);
+    try exchangeData(&client, &server);
 }
 
 test "Config.validate: max_datagram_len below the floor" {

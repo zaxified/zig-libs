@@ -152,7 +152,18 @@ const Window = struct {
     fn accept(self: *Window, seq: u48) bool {
         return conn13.replayCheckAndUpdate(&self.seen_any, &self.high, &self.bits, seq);
     }
+
+    /// `accept` without the update: whether `seq` would be taken.
+    fn fresh(self: Window, seq: u48) bool {
+        var w = self;
+        return w.accept(seq);
+    }
 };
+
+/// What an epoch-0 record has to change to count as having advanced the
+/// handshake (see `processRecord`): the next expected message, the bytes of
+/// the message in progress, or the read epoch (a ChangeCipherSpec).
+const Progress = struct { next_recv_seq: u16, rx_filled: usize, read_epoch: u16 };
 
 const cookie_mac_label = "dtls 1.2 hello verify cookie v1";
 const cookie_len = 32;
@@ -504,7 +515,14 @@ pub const Connection12 = struct {
         var plain: []const u8 = undefined;
         switch (hdr.epoch) {
             0 => {
-                if (!self.recv_win[0].accept(hdr.sequence_number)) return; // duplicate record: drop
+                // Checked here, recorded only below, once the record has
+                // advanced the handshake. Epoch 0 has no MAC, so recording
+                // every well-formed record let an off-path sender with a
+                // huge sequence number make the genuine records look stale
+                // (RFC 6347 §4.1.2.6 updates the window only after the MAC
+                // verified). A record that merely parses — a duplicate, a
+                // queued later message, a stray CCS — is not recorded.
+                if (!self.recv_win[0].fresh(hdr.sequence_number)) return; // duplicate record: drop
                 plain = frag;
             },
             1 => {
@@ -523,6 +541,10 @@ pub const Connection12 = struct {
             else => return,
         }
         self.cur_record_seq = hdr.sequence_number;
+        const before = self.progress();
+        defer if (hdr.epoch == 0 and !std.meta.eql(before, self.progress())) {
+            _ = self.recv_win[0].accept(hdr.sequence_number);
+        };
         switch (hdr.content_type) {
             content_handshake => try self.processHandshakeRecord(plain, hdr.epoch, entropy, now_ms, o),
             content_change_cipher_spec => {
@@ -544,6 +566,10 @@ pub const Connection12 = struct {
             content_application_data => {}, // not before the handshake completes
             else => return error.Malformed,
         }
+    }
+
+    fn progress(self: *const Connection12) Progress {
+        return .{ .next_recv_seq = self.next_recv_seq, .rx_filled = self.rx_filled, .read_epoch = self.read_epoch };
     }
 
     fn ccsExpected(self: *const Connection12) bool {
@@ -1712,6 +1738,61 @@ test "audit: an early epoch-0 ChangeCipherSpec is dropped, not taken for a retra
     try std.testing.expectError(error.Malformed, c.processRecord(.{ .content_type = content_alert, .epoch = 0, .sequence_number = 2, .length = 1 }, &.{2}, ent, 0, &o));
     try std.testing.expectError(error.Malformed, c.processRecord(.{ .content_type = content_alert, .epoch = 0, .sequence_number = 3, .length = 3 }, &.{ 2, 40, 0 }, ent, 0, &o));
     try std.testing.expectEqual(@as(?[2]u8, null), c.peer_alert);
+}
+
+/// One handshake fragment: `body_len` bytes of a `total`-byte message.
+fn testFragment(message_seq: u16, total: u24, body_len: u24, out: []u8) []const u8 {
+    handshake.encodeHeader(.{ .msg_type = m12.HandshakeType.certificate, .length = total, .message_seq = message_seq, .fragment_offset = 0, .fragment_length = body_len }, out[0..handshake.header_len]);
+    @memset(out[handshake.header_len..][0..body_len], 0x5a);
+    return out[0 .. handshake.header_len + body_len];
+}
+
+test "epoch-0 replay window: only a record that advanced the handshake is recorded" {
+    var csprng = std.Random.DefaultCsprng.init(@splat(9));
+    const ent: Entropy = .{ .seeded_for_test = csprng.random() };
+    var c: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_hello_done, .next_recv_seq = 2 };
+    var ob: [256]u8 = undefined;
+    var o = Out{ .buf = &ob };
+    var fb: [64]u8 = undefined;
+    const huge: u48 = std.math.maxInt(u48);
+    const hs = content_handshake;
+
+    // Well-formed but advancing nothing: a later message (queued), an
+    // earlier one (a duplicate), an early ChangeCipherSpec, application
+    // data. None of them may move the window, whatever its record number.
+    const later = testFragment(3, 40, 10, &fb);
+    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = huge, .length = @intCast(later.len) }, later, ent, 0, &o);
+    try std.testing.expect(c.rx_future_len > 0);
+    const earlier = testFragment(1, 40, 40, &fb);
+    try c.processRecord(.{ .content_type = hs, .epoch = 0, .sequence_number = huge - 1, .length = @intCast(earlier.len) }, earlier, ent, 0, &o);
+    try std.testing.expect(c.saw_duplicate);
+    try c.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = huge - 2, .length = 1 }, &.{1}, ent, 0, &o);
+    try c.processRecord(.{ .content_type = content_application_data, .epoch = 0, .sequence_number = huge - 3, .length = 1 }, &.{1}, ent, 0, &o);
+    try std.testing.expect(!c.recv_win[0].seen_any);
+
+    // A fragment of the expected message, under a low record number, is
+    // taken and recorded ...
+    const cur = testFragment(2, 40, 10, &fb);
+    const h5: record.PlaintextHeader = .{ .content_type = hs, .epoch = 0, .sequence_number = 5, .length = @intCast(cur.len) };
+    try c.processRecord(h5, cur, ent, 0, &o);
+    try std.testing.expectEqual(@as(usize, 10), c.rx_filled);
+    try std.testing.expect(c.recv_win[0].seen_any);
+    try std.testing.expectEqual(@as(u48, 5), c.recv_win[0].high);
+
+    // A genuine ChangeCipherSpec advances the read epoch: recorded too, so
+    // its verbatim replay is dropped by the window instead of reaching the
+    // handshake layer as a retransmission (which would resend our flight).
+    var k: Connection12 = .{ .role = .client, .config = auditCfg(), .state = .wait_server_finished, .keys_live = true };
+    const ccs: record.PlaintextHeader = .{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 7, .length = 1 };
+    try k.processRecord(ccs, &.{1}, ent, 0, &o);
+    try std.testing.expectEqual(@as(u16, 1), k.read_epoch);
+    try std.testing.expectEqual(@as(u48, 7), k.recv_win[0].high);
+    try k.processRecord(ccs, &.{1}, ent, 0, &o);
+    try std.testing.expect(!k.saw_duplicate);
+    // The same ChangeCipherSpec under a new record number is a retransmission.
+    try k.processRecord(.{ .content_type = content_change_cipher_spec, .epoch = 0, .sequence_number = 8, .length = 1 }, &.{1}, ent, 0, &o);
+    try std.testing.expect(k.saw_duplicate);
+    try std.testing.expectEqual(@as(u48, 7), k.recv_win[0].high);
 }
 
 test "audit: the future-message queue takes a fragment that fills it exactly" {
