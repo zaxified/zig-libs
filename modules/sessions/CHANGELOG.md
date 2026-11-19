@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind source pins of the `csrf` and `newid` rows re-recorded (the counted sources changed; counts unchanged: 0 contexts, plain and `cpu=x86_64`).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation over the `Csrf.validate` and future-`created` changes: 10 mutants, 10 killed. Cumulative 494/538, 44 eq; card A1 re-recorded.
 - **2026-11-19** — **TEST:** `Csrf.validate` test pins the token-cookie line cap exactly (the longest accepted `cookie_name` plus the fixed line parts equal the 256-byte buffer), not a loose range.
 - **2026-11-19** — **Behaviour change:** a stored record whose `created` lies in the future is read as created now (`Manager.lookup`, `Manager.iterate`). Before, `now - created` stayed negative, so the absolute timeout never fired for it (a clock stepped back, or a store written by something else); now the clamped value is what the next save writes back and the window runs from there. A `last_seen` in the future needs no clamp (it is never past the idle window and the save after a load stamps it with now). Closes the no-panic sweep 2026-10-28 item "a stored record whose `created`/`last_seen` lies in the future never expires". Records with `created <= now`, the normal case, read exactly as before. Test: a one-ns and a 2^62 future, the persisted clamp, the strict boundary at the cap.
