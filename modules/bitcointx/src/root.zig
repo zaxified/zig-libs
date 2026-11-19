@@ -30,6 +30,9 @@
 //!   the above; compiles to nothing outside a test build. Re-exported as
 //!   `instrument` so a *consumer*'s tests can assert the same property at
 //!   their own call sites (audit BD-18).
+//! - `merkle.zig` — block Merkle roots over txids/wtxids (allocation-free
+//!   fold, CVE-2012-2459 `mutated` flag), `checkMerkleRoot`, the BIP141
+//!   witness commitment and `checkWitnessCommitment`.
 //! - `hash256.zig` — `sha256d` (Bitcoin's double-SHA256) and plain
 //!   `sha256` (what BIP341's commitment hashes use instead).
 //! - `*_kat_vectors.zig` / `*_kat_test.zig` — official test vectors
@@ -58,6 +61,7 @@ pub const meta = .{
 
 pub const tx = @import("tx.zig");
 pub const hash256 = @import("hash256.zig");
+pub const merkle = @import("merkle.zig");
 pub const hashtype = @import("hashtype.zig");
 pub const legacy = @import("sighash_legacy.zig");
 pub const bip143 = @import("sighash_bip143.zig");
@@ -103,6 +107,8 @@ pub const compactSizeLen = tx.compactSizeLen;
 test {
     _ = tx;
     _ = hash256;
+    _ = merkle;
+    _ = @import("merkle_kat_vectors.zig");
     _ = hashtype;
     _ = legacy;
     _ = bip143;
