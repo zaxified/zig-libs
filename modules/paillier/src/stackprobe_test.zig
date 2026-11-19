@@ -270,6 +270,9 @@ noinline fn callEncrypt() void {
 noinline fn callEncryptRandom() void {
     io.c2 = paillier.encryptRandom(io.kp.public, &io.m, recorder.random()) catch @panic("encryptRandom");
 }
+noinline fn callRerandomize() void {
+    io.c2 = paillier.rerandomize(io.kp.public, io.c, recorder.random());
+}
 noinline fn callDecrypt() void {
     paillier.decrypt(&io.kp.secret, io.c, &io.plain) catch @panic("decrypt");
 }
@@ -367,6 +370,7 @@ test "STACKPROBE: no Paillier secret on the dead stack after any entry point" {
     total += probeCall("SecretKey.fromBytes", callSecretFromBytes, F.back);
     total += probeCall("encrypt", callEncrypt, F.plain);
     total += probeCall("encryptRandom", callEncryptRandom, F.plain);
+    total += probeCall("rerandomize", callRerandomize, F.plain);
     total += probeCall("decrypt (CRT)", callDecrypt, F.plain);
     total += probeCall("decrypt (no CRT)", callDecryptNoCrt, F.back);
     total += probeCall("addPlaintext", callAddPlaintext, F.plain);

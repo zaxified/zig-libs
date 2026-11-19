@@ -65,6 +65,7 @@ const from_primes_stack_burn = 176 * 1024;
 const secret_key_from_bytes_stack_burn = 240 * 1024;
 const encrypt_stack_burn = 88 * 1024;
 const encrypt_random_stack_burn = 104 * 1024;
+const rerandomize_stack_burn = 104 * 1024;
 const decrypt_stack_burn = 120 * 1024;
 const add_plaintext_stack_burn = 72 * 1024;
 const mul_plaintext_stack_burn = 80 * 1024;
@@ -1325,6 +1326,49 @@ pub fn addCiphertexts(pk: PublicKey, c1: Ciphertext, c2: Ciphertext) Ciphertext 
     return .{ .c = elemToFe(pk.n_sq, &r) };
 }
 
+/// Re-randomise a ciphertext: `c' = c * r^n mod n²` with a fresh `r`
+/// uniform in `[1, pk.n)` (the same sampling as `encryptRandom`). `c'`
+/// decrypts to the same plaintext as `c` (`r^n` is an `n`-th power, so it is
+/// `E(0)` and drops out under `L`) but is unlinkable to it without the key:
+/// use it before re-sending a ciphertext or after homomorphic operations whose
+/// operand randomness the other party knows. This is `phe`'s `obfuscate` and
+/// `rust-paillier`'s `Rerandomize`, and equals
+/// `addCiphertexts(pk, c, encrypt(pk, 0, r))` for the same `r`.
+///
+/// Constant-time policy as `encrypt`: the blinding `r` is secret and goes
+/// through montint's constant-time multiply as the base of `powPublic` (the
+/// exponent `n` is public); `c` is treated like `addCiphertexts`' operands
+/// (possibly an unpublished intermediate), so no branch depends on it.
+/// `r` and every intermediate are wiped and the dead stack burnt. `c` must be
+/// a canonical ciphertext for `pk` (as `Ciphertext.fromBytes` yields); like
+/// `addCiphertexts`, nothing is checked and it cannot fail.
+pub fn rerandomize(pk: PublicKey, c: Ciphertext, random: std.Random) Ciphertext {
+    const result = rerandomizeUnburned(pk, c, random);
+    burn.stack(rerandomize_stack_burn);
+    return result;
+}
+
+noinline fn rerandomizeUnburned(pk: PublicKey, c: Ciphertext, random: std.Random) Ciphertext {
+    return rerandomizeByValue(pk, c, random);
+}
+
+fn rerandomizeByValue(pk: PublicKey, c: Ciphertext, random: std.Random) Ciphertext {
+    var r = sampleNonzeroLtN(pk, random);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
+    var n_be: [modulus_bytes]u8 = undefined;
+    const n_len = byteLen(pk.n.bits());
+    pk.n.toBytes(n_be[0..n_len], .big) catch unreachable; // exact-size buffer
+    var r_el = feToElem(&r);
+    defer std.crypto.secureZero(u64, &r_el);
+    var rn = pk.n_sq_mont.powPublic(&r_el, n_be[0..n_len]);
+    defer std.crypto.secureZero(u64, &rn);
+    var c_el = feToElem(&c.c);
+    defer std.crypto.secureZero(u64, &c_el);
+    var out = pk.n_sq_mont.mul(&c_el, &rn);
+    defer std.crypto.secureZero(u64, &out);
+    return .{ .c = elemToFe(pk.n_sq, &out) };
+}
+
 /// Plaintext addition: `E(m1 + m2 mod n) = E(m1) * g^m2 mod n²`. `m` must be
 /// canonical mod `pk.n_sq` (Fe construction contract, see module doc
 /// comment). The `g^m` term goes through `gPow` (binomial shortcut for the
@@ -2203,6 +2247,78 @@ test "homomorphic edge cases: m=0 operands, k=0/k=1 scaling, wrap-around mod n" 
     const c_zero = try encryptRandom(pk, &zero, random);
     try testing.expectEqual(@as(u32, 0), try (try decryptTest(&sk, c_zero)).toPrimitive(u32));
     try testing.expectEqual(@as(u32, 100), try (try decryptTest(&sk, addCiphertexts(pk, c1, c_zero))).toPrimitive(u32));
+}
+
+test "rerandomize: c' = c * r^n mod n² — toy-key KATs, same plaintext, new ciphertext" {
+    // n = 187. c = E(5; r = 3) = 28873; expected c' computed independently
+    // (Python pow): r = 2 -> 28531, r = 186 -> 6096; r = 1 leaves c unchanged
+    // (1^n = 1), which pins the formula rather than "something random".
+    const pk = try PublicKey.fromBytesImpl(&kat_n, null, .unchecked);
+    const sk = try SecretKey.fromBytesImpl(&kat_n, &kat_lambda, &kat_mu, .unchecked);
+    const c = try encrypt(pk, &(try Fe.fromPrimitive(u32, pk.n_sq, 5)), &(try Fe.fromPrimitive(u32, pk.n_sq, 3)));
+    try testing.expectEqual(@as(u32, 28873), try c.c.toPrimitive(u32));
+    const Case = struct { r: u8, want: u32 };
+    for ([_]Case{ .{ .r = 2, .want = 28531 }, .{ .r = 186, .want = 6096 }, .{ .r = 1, .want = 28873 } }) |k| {
+        var script: ScriptRandom = .{ .script = &[_]u8{k.r} };
+        const c2 = rerandomize(pk, c, script.random());
+        try testing.expectEqual(k.want, try c2.c.toPrimitive(u32));
+        try testing.expectEqual(@as(u32, 5), try (try decryptTest(&sk, c2)).toPrimitive(u32));
+    }
+}
+
+test "rerandomize equals addCiphertexts(c, encrypt(0, r)) for every unit r of the toy key" {
+    const pk = try PublicKey.fromBytesImpl(&kat_n, null, .unchecked);
+    const sk = try SecretKey.fromBytesImpl(&kat_n, &kat_lambda, &kat_mu, .unchecked);
+    const zero = try Fe.fromPrimitive(u32, pk.n_sq, 0);
+    const c = try encrypt(pk, &(try Fe.fromPrimitive(u32, pk.n_sq, 77)), &(try Fe.fromPrimitive(u32, pk.n_sq, 5)));
+    var changed: usize = 0;
+    var r: u8 = 1;
+    while (r < 187) : (r += 1) {
+        if (r % 11 == 0 or r % 17 == 0) continue; // not a unit mod n; a real n has none this small
+        var script: ScriptRandom = .{ .script = &[_]u8{r} };
+        const got = rerandomize(pk, c, script.random());
+        const rr = try Fe.fromPrimitive(u32, pk.n_sq, r);
+        const want = addCiphertexts(pk, c, try encrypt(pk, &zero, &rr));
+        try testing.expect(got.c.eql(want.c));
+        try testing.expectEqual(@as(u32, 77), try (try decryptTest(&sk, got)).toPrimitive(u32));
+        if (!got.c.eql(c.c)) changed += 1;
+    }
+    try testing.expect(changed > 100); // most r move the ciphertext (r^n = 1 only on a small subgroup)
+}
+
+test "rerandomize at 512 bits: decrypts unchanged, a fresh ciphertext every time, composes with addCiphertexts" {
+    var keygen_prng = std.Random.DefaultPrng.init(0x7e7a);
+    var kp: KeyPair = undefined;
+    defer kp.secret.deinit();
+    try generate(keygen_prng.random(), 512, &kp);
+    const pk = kp.public;
+    const m1 = try Fe.fromPrimitive(u64, pk.n_sq, 1_000_003);
+    const m2 = try Fe.fromPrimitive(u64, pk.n_sq, 999_999);
+    var prng = std.Random.DefaultPrng.init(0x0b5c);
+    const random = prng.random();
+    const c1 = try encryptRandom(pk, &m1, random);
+    const c2 = try encryptRandom(pk, &m2, random);
+
+    var seen = std.AutoHashMap([32]u8, void).init(testing.allocator);
+    defer seen.deinit();
+    var cur = c1;
+    var c_buf: [modulus_sq_bytes]u8 = undefined;
+    for (0..64) |_| {
+        const next = rerandomize(pk, cur, random);
+        try testing.expect(!next.c.eql(cur.c));
+        try testing.expect(!next.c.eql(c1.c));
+        try testing.expectEqual(@as(u64, 1_000_003), try (try decryptTest(&kp.secret, next)).toPrimitive(u64));
+        next.c.toBytes(&c_buf, .big) catch unreachable; // canonical, exact-size buffer
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&c_buf, &digest, .{});
+        try testing.expect(!(try seen.getOrPut(digest)).found_existing);
+        cur = next;
+    }
+    // Two rerandomisations of the same ciphertext differ from each other.
+    try testing.expect(!rerandomize(pk, c1, random).c.eql(rerandomize(pk, c1, random).c));
+    // Homomorphic: the sum of re-randomised operands, re-randomised again.
+    const sum = rerandomize(pk, addCiphertexts(pk, rerandomize(pk, c1, random), rerandomize(pk, c2, random)), random);
+    try testing.expectEqual(@as(u64, 2_000_002), try (try decryptTest(&kp.secret, sum)).toPrimitive(u64));
 }
 
 test "encryptRandom is genuinely fresh: repeated calls on the same key/message never collide (F7 m5)" {

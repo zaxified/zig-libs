@@ -6,7 +6,7 @@
 
 **Scope:** core — rust-bitcoin `taproot` (TaprootBuilder/TaprootSpendInfo), libsecp256k1 `xonly_pubkey_tweak_add` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-10-05 (21/29, 8 eq) · src ?
+**Audit:** review 2026-09-09 · mutation 2026-11-19 (46/58, 12 eq) · src d5922693fafbaad9
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, TAPROOT_FUZZ) · ct 2026-09-09 (ctgrind)
 
@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [btcsuite/btcd (`txscript/taproot.go`)](https://github.com/btcsuite/btcd/tree/master/txscript) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | `ComputeTaprootOutputKey`, `TapLeaf`, `AssembleTaprootScriptTree`, `ControlBlock` with inclusion proofs — the script-tree half this module lacks (file `taproot.go` present; contents *(inferred)*). |
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | `payments.p2tr` builds outputs from a script tree and computes control blocks *(inferred)*. |
 
-**Where we are ahead:** key-path tweaking with the `null` (no tree) vs zero-root distinction made explicit, pubkey and secret tweak byte-exact against all 7 BIP341 wallet vectors; the script-tree builder is byte-exact against all 12 published control blocks and is cross-checked against the consensus verifier in `bitcoinscript`. **Where we are behind** (2026-09-30, after the builder landed): no Huffman-weighted tree construction (`TaprootBuilder`-style weight-driven layout is left to the caller), no control-block *parse*/verify helper here (the verifier is `bitcoinscript.tapscript.verifyCommitment`; `taproot` deliberately does not depend on it), no BIP371 `PSBT_OUT_TAP_TREE` (de)serialization of the byte format (the depth-list *shape* is accepted), no address encoding (bech32m is `bech32`'s), no MuSig2 internal-key aggregation.
+**Where we are ahead:** key-path tweaking with the `null` (no tree) vs zero-root distinction made explicit, pubkey and secret tweak byte-exact against all 7 BIP341 wallet vectors; the script-tree builder is byte-exact against all 12 published control blocks and is cross-checked against the consensus verifier in `bitcoinscript`. **Where we are behind** (2026-09-30, after the builder landed): (the Huffman-weighted layout landed 2026-11-19), no control-block *parse*/verify helper here (the verifier is `bitcoinscript.tapscript.verifyCommitment`; `taproot` deliberately does not depend on it), no BIP371 `PSBT_OUT_TAP_TREE` (de)serialization of the byte format (the depth-list *shape* is accepted), no address encoding (bech32m is `bech32`'s), no MuSig2 internal-key aggregation.
 
 ## Design
 
@@ -96,8 +96,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (`33 + 32·depth` bytes). Ownership: the `SpendInfo` owns its leaf array and
   path storage (`deinit(allocator)`); leaf `script` slices BORROW the
   caller's input. `leaves` keeps the input's depth-first order.
-- **Not done:** Huffman construction from weights (BIP341 suggests it; a
-  layout policy, not a consensus rule — Backlog), and building a tree that
+- **Huffman layout (2026-11-19).** `huffmanLeaves(allocator, []WeightedLeaf)`
+  returns a depth-first `DepthLeaf` list; `buildFromWeights` feeds it to
+  `buildFromLeaves`. Reference: rust-bitcoin `TaprootBuilder::with_huffman_tree`
+  (checked against its master source): repeatedly take the two lowest-weight
+  nodes and join them, `u32` weights with a saturating sum. Tie-break (rust
+  keeps a max-heap of `(Reverse(weight), NodeInfo)`, `NodeInfo` ordered by
+  hash): among equal weights the numerically larger node hash is taken first,
+  so the result depends on the multiset of leaves, not the input order. Leaf
+  order: the child with the smaller hash first (rust-bitcoin's order; the
+  Merkle root is independent of it). Empty input is `EmptyTree` (rust-bitcoin
+  master; older releases returned an empty builder), a leaf deeper than 128 is
+  `TreeTooDeep` (rust: `InvalidMerkleTreeDepth`; practically unreachable with
+  `u32` weights, kept as a guard for the `u8` depth cast). Leaf version is
+  per-leaf (rust fixes 0xc0). Bitcoin Core's `taproot_construct` and
+  descriptors take explicit shapes and have no weight-driven constructor, so
+  nothing to compare there. KATs: roots and orders computed by an independent
+  sort-based re-implementation; rust-bitcoin's own test publishes only the
+  depths, which are pinned too.
+- **Delta mutation (2026-11-19, Huffman code only).** 29 mutants: 25 killed, 4 equivalent (equal-hash tie order of two identical entries; `pop`'s `len == 0` shortcut; the two off-by-one child-bound mutants, where the stale slot read is the sifted element itself). The card counts are cumulative (21/29 + 25/29, eq 8 + 4).
+- **Not done:** building a tree that
   hides the internal key (NUMS point) — the caller picks the internal key.
 
 ## Threat model / limits
@@ -265,7 +283,7 @@ after `kp.deinit` pins bip340's `deinit`, not this `defer`; see Backlog).
   this with a stackprobe (ReleaseFast) and burn the signing region; this module has neither, so
   whether the internal scalar survives the call is unmeasured. Effort S (copy `bip340`'s probe).
 - ~~Script-tree builder~~ — done 2026-09-30 (`src/tree.zig`).
-- **Huffman tree construction from `(weight, leaf)` pairs** (BIP341's suggested layout) — a policy on top of `buildFromLeaves`; needs a deterministic tie-break rule. Effort S.
+- ✅ DONE 2026-11-19 (`huffmanLeaves`/`buildFromWeights`, SPEC § Script trees). **Huffman tree construction from `(weight, leaf)` pairs** (BIP341's suggested layout).
 - **Control-block parse / `verifyCommitment` here** — today only `bitcoinscript` verifies; a wallet that only builds does not need it. Would duplicate consensus code or invert the dependency; decide with a consumer.
 - **BIP371 `PSBT_OUT_TAP_TREE` byte (de)serialization** — the depth-list shape is accepted; the wire encoding belongs with `psbt`.
 - **NUMS internal key helper** (BIP341's unspendable-key-path recommendation) — small; add when a consumer asks.

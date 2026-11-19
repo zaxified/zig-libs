@@ -15,9 +15,10 @@ design and threat model.
 |---|---|
 | `wordlist.zig` | The official 2048-word BIP-39 English wordlist |
 | `bip39.zig` | `entropyToMnemonic`, `mnemonicToEntropy`, `validateMnemonic`, `mnemonicToSeed` |
-| `bip32.zig` | `masterFromSeed`, `ckdPriv`/`ckdPub`, `neuter`/`neuterInto`, `serializePriv`/`serializePub`/`parseExtended`, `parsePath`/`derivePath` |
+| `bip32.zig` | `masterFromSeed`, `ckdPriv`/`ckdPub`, `neuter`/`neuterInto`, `serializePriv`/`serializePub`/`parseExtended` (+ SLIP-0132 `ypub`/`zpub`/…: `slip132_table`, `serializePrivSlip132`/`serializePubSlip132`/`parseSlip132`), `parsePath`/`derivePath` |
 | `bip32_vectors.zig` | BIP-32 official Test Vectors 1/2/3/4/5, embedded |
 | `bip39_vectors.zig` | BIP-39 official Trezor English test vectors, embedded |
+| `slip132_test.zig` | SLIP-0132 registry vectors and all ten version pairs |
 | `kat_test.zig` | Full KAT assertions across both specs, incl. the BIP-39→BIP-32 seed→master-xprv seam |
 
 ## Import
