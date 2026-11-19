@@ -290,6 +290,10 @@ const Pending = struct {
     rst: ?h2.ErrorCode = null,
     /// Marked unprocessed by a server GOAWAY (§6.8).
     refused: bool = false,
+    /// The final response head carried a field name or value that is not
+    /// valid (RFC 9113 §8.2.1): the stream was reset with PROTOCOL_ERROR and
+    /// the head dropped; the waiting call fails with `MalformedResponse`.
+    malformed: bool = false,
 
     /// Received but not yet consumed by the caller.
     fn unread(p: *const Pending) []const u8 {
@@ -759,6 +763,10 @@ pub const Session = struct {
     fn waitHead(s: *Session, sid: u31) Error!void {
         while (true) {
             const p = s.streams.getPtr(sid) orelse return error.UnknownStream;
+            if (p.malformed) {
+                s.dropStream(sid);
+                return error.MalformedResponse;
+            }
             if (p.rst) |code| {
                 s.last_reset_code = code;
                 s.dropStream(sid);
@@ -875,14 +883,31 @@ pub const Session = struct {
                         hd.headers.deinit(s.gpa); // collected/dropped stream
                         continue;
                     };
+                    if (p.malformed) {
+                        hd.headers.deinit(s.gpa); // the stream is already reset
+                        continue;
+                    }
                     if (p.headers == null) {
                         const st = statusOf(hd.headers) orelse 0;
                         if (st >= 100 and st < 200 and !hd.end_stream) {
                             hd.headers.deinit(s.gpa); // interim 1xx (§8.1): skip
+                        } else if (!fieldsValid(hd.headers)) {
+                            // §8.2.1/§8.1.1: a field name with an uppercase
+                            // letter or a byte outside a token, or a value
+                            // with CR/LF/NUL, makes the response malformed
+                            // -- a stream error. `Client` (`headFromFields`)
+                            // and the proxy's `setHeader` refuse the same
+                            // bytes; a direct user of this session must not
+                            // see them raw either. Same recovery as a
+                            // refused push: RST_STREAM, later DATA discarded.
+                            hd.headers.deinit(s.gpa);
+                            p.malformed = true;
+                            p.rst = .protocol_error;
+                            s.conn.sendRstStream(&s.wire, hd.stream_id, .protocol_error) catch {};
                         } else {
                             p.headers = hd.headers; // ownership moves
                         }
-                    } else if (p.trailers == null and hd.end_stream and !containsPseudoHeader(hd.headers)) {
+                    } else if (p.trailers == null and hd.end_stream and !containsPseudoHeader(hd.headers) and fieldsValid(hd.headers)) {
                         // The trailer section (§8.1). A trailer block that
                         // carries pseudo-header fields is malformed by the
                         // same section, and a `:status` arriving after the
@@ -895,7 +920,7 @@ pub const Session = struct {
                     } else {
                         hd.headers.deinit(s.gpa); // malformed or a third block
                     }
-                    if (hd.end_stream) p.end = true;
+                    if (hd.end_stream and !p.malformed) p.end = true;
                 },
                 .data => |d| {
                     // NO window replenishment here: arrival is not
@@ -980,6 +1005,18 @@ fn statusOf(list: hpack.HeaderList) ?u16 {
             return std.fmt.parseInt(u16, f.value, 10) catch null;
     }
     return null;
+}
+
+/// Are the regular (non-pseudo) fields of a decoded response block ones HTTP
+/// can carry? RFC 9113 §8.2.1: a lowercase token name and a value without
+/// CR, LF or NUL; the same rule `Client`'s h2 glue applies to a head.
+fn fieldsValid(list: hpack.HeaderList) bool {
+    for (list.fields) |f| {
+        if (f.name.len != 0 and f.name[0] == ':') continue;
+        if (!h1.isToken(f.name) or !h1.isValidFieldValue(f.value)) return false;
+        for (f.name) |b| if (std.ascii.isUpper(b)) return false;
+    }
+    return true;
 }
 
 /// Whether a decoded field block contains any pseudo-header field. RFC 9113
@@ -1256,6 +1293,96 @@ test "h2 client: a response without trailers reports none (offline)" {
     defer res.deinit(gpa);
     try testing.expect(res.trailers == null);
     try testing.expectEqual(@as(?[]const u8, null), res.trailer("x-checksum"));
+}
+
+test "h2 client: a response head with an invalid field name or value is MalformedResponse and a stream error, the connection lives on (§8.2.1)" {
+    const gpa = testing.allocator;
+    const bad = [_]hpack.Field{
+        .{ .name = "X-Upper", .value = "v" }, // an uppercase letter in a name
+        .{ .name = "x bad", .value = "v" }, // not a token
+        .{ .name = "x-ok", .value = "a\r\nInjected: 1" }, // CR/LF in a value
+        .{ .name = "x-ok", .value = "a\x00b" }, // NUL in a value
+    };
+    for (bad) |field| {
+        var in: Reader = .fixed("");
+        var out_buf: [8192]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var s: Session = try .init(gpa, &in, &out, .{});
+        defer s.deinit();
+        const sid_bad = try s.request(.get, "/bad", .{ .authority = "t" });
+        const sid_ok = try s.request(.get, "/ok", .{ .authority = "t" });
+        var srv: ScriptedServer = try .init(out.buffered());
+        defer srv.deinit();
+        try srv.conn.sendHeaders(&srv.wire, sid_bad, &.{ .{ .name = ":status", .value = "200" }, field }, false);
+        try srv.conn.sendData(&srv.wire, sid_bad, "late", true);
+        try srv.conn.sendHeaders(&srv.wire, sid_ok, &ok_fields, false);
+        try srv.conn.sendData(&srv.wire, sid_ok, "fine", true);
+        in = .fixed(srv.wire.items);
+        const before = out.buffered().len;
+
+        try testing.expectError(error.MalformedResponse, s.awaitHead(sid_bad));
+        // The stream is reset with PROTOCOL_ERROR (§8.1.1) and released.
+        const tail = out.buffered()[before..];
+        var code: ?u32 = null;
+        var pos: usize = 0;
+        while (pos + 9 <= tail.len) {
+            const len = std.mem.readInt(u24, tail[pos..][0..3], .big);
+            const sid = std.mem.readInt(u32, tail[pos + 5 ..][0..4], .big) & 0x7fff_ffff;
+            if (tail[pos + 3] == 3 and sid == sid_bad) code = std.mem.readInt(u32, tail[pos + 9 ..][0..4], .big);
+            pos += 9 + len;
+        }
+        try testing.expectEqual(@as(?u32, 1), code); // RST_STREAM(PROTOCOL_ERROR)
+        try testing.expectError(error.UnknownStream, s.awaitHead(sid_bad));
+        // The other stream on the connection is untouched.
+        var res = try s.awaitResponse(sid_ok);
+        defer res.deinit(gpa);
+        try testing.expectEqual(@as(u16, 200), res.status);
+        try testing.expectEqualStrings("fine", res.body);
+    }
+}
+
+test "h2 client: readBody on a stream whose head was invalid is MalformedResponse, never body octets" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/bad", .{ .authority = "t" });
+    var srv: ScriptedServer = try .init(out.buffered());
+    defer srv.deinit();
+    try srv.conn.sendHeaders(&srv.wire, sid, &.{ .{ .name = ":status", .value = "200" }, .{ .name = "X-Upper", .value = "v" } }, false);
+    try srv.conn.sendData(&srv.wire, sid, "leak", true);
+    in = .fixed(srv.wire.items);
+    var rbuf: [16]u8 = undefined;
+    try testing.expectError(error.MalformedResponse, s.readBody(sid, &rbuf));
+}
+
+test "h2 client: a trailer block with an invalid field is dropped like one with a pseudo-header; a valid one is kept" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { field: hpack.Field, kept: bool }{
+        .{ .field = .{ .name = "X-Upper", .value = "v" }, .kept = false },
+        .{ .field = .{ .name = "x-checksum", .value = "a\nb" }, .kept = false },
+        .{ .field = .{ .name = "x-checksum", .value = "deadbeef" }, .kept = true },
+    };
+    for (cases) |c| {
+        var in: Reader = .fixed("");
+        var out_buf: [8192]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var s: Session = try .init(gpa, &in, &out, .{});
+        defer s.deinit();
+        const sid = try s.request(.get, "/t", .{ .authority = "t" });
+        var srv: ScriptedServer = try .init(out.buffered());
+        defer srv.deinit();
+        try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
+        try srv.conn.sendData(&srv.wire, sid, "hello", false);
+        try srv.conn.sendHeaders(&srv.wire, sid, &.{c.field}, true);
+        in = .fixed(srv.wire.items);
+        var res = try s.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expectEqualStrings("hello", res.body);
+        try testing.expectEqual(c.kept, res.trailers != null);
+    }
 }
 
 test "h2 client: a trailer block carrying pseudo-headers is dropped (§8.1)" {
