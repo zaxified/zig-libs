@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Card: Audit line after the delta mutation over the paged `KvStore.iterate` (8 mutants, 8 killed; cumulative 502/546, 44 eq; SPEC § Verification); ctgrind source pins of the `csrf` and `newid` rows re-recorded (counted sources changed, counts unchanged: 0 contexts).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** test: the allocation-failure sweep over `Manager.iterate` builds its `KvStore` through `Config.iterate_page` and pins that two extra pages cost exactly their heap, key array and cursor copy.
 - **2026-11-19** — Behaviour change: `KvStore`'s `iterate` (behind `Manager.iterate`) walks `kv.Db.scanKeys` pages of the new `KvStore.Config.iterate_page` keys (default 256; 0 is taken as 1) instead of one `db.keys` snapshot of every session key, so its memory is bounded by the page. A session live for the whole walk is shown exactly once, as before; one created during the walk is now shown iff its key sorts after the page already listed (before: never). `RamcacheStore` still cannot enumerate (SPEC Backlog, re-checked). Tests: a store several pages long at page sizes 0-256 with destroys and junk keys between, an allocation-failure sweep.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind source pins of the `csrf` and `newid` rows re-recorded (the counted sources changed; counts unchanged: 0 contexts, plain and `cpu=x86_64`).
