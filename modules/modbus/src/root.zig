@@ -2374,3 +2374,92 @@ test "RtuStream: a full buffer of one incomplete-looking frame still advances" {
     try testing.expect(s.len < buf.len);
     try testing.expect(s.discarded > 0);
 }
+
+test "device_id: zero-length objects, and the last object may end exactly at the PDU end" {
+    // two objects: (0x07, "") and (0x08, "") -- headers only
+    const r = try device_id.parseResponse(&.{ 0x2B, 0x0E, 0x02, 0x82, 0x00, 0x00, 0x02, 0x07, 0x00, 0x08, 0x00 }, .regular);
+    var it = r.objects();
+    const a = it.next().?;
+    try testing.expectEqual(@as(u8, 7), a.id);
+    try testing.expectEqual(@as(usize, 0), a.value.len);
+    const b = it.next().?;
+    try testing.expectEqual(@as(u8, 8), b.id);
+    try testing.expectEqual(@as(usize, 0), b.value.len);
+    try testing.expectEqual(@as(?device_id.Object, null), it.next());
+    // The category bounds the server walks.
+    const basic = device_id.categoryRange(.basic).?;
+    const regular = device_id.categoryRange(.regular).?;
+    const extended = device_id.categoryRange(.extended).?;
+    try testing.expectEqual(@as(u8, 0x00), basic.first);
+    try testing.expectEqual(@as(u8, 0x02), basic.last);
+    try testing.expectEqual(@as(u8, 0x03), regular.first);
+    try testing.expectEqual(@as(u8, 0x7F), regular.last);
+    try testing.expectEqual(@as(u8, 0x80), extended.first);
+    try testing.expectEqual(@as(u8, 0xFF), extended.last);
+    try testing.expectEqual(@as(?@TypeOf(basic), null), device_id.categoryRange(.individual));
+}
+
+test "RtuStream: maximum-size frames (256 bytes) are accepted, in every role that can carry them" {
+    var pdu_buf: [max_pdu_len]u8 = @splat(0x5A);
+    var adu: [rtu.max_adu_len]u8 = undefined;
+
+    // FC 0x18 response: byte count 250 (u16) -> 4 + 250 + 2.
+    pdu_buf[0] = 0x18;
+    pdu_buf[1] = 0x00;
+    pdu_buf[2] = 0xFA;
+    var s = RtuStream.init(.response);
+    var frame = try rtu.encodeAdu(&adu, 0x01, pdu_buf[0..253]);
+    try testing.expectEqual(@as(usize, 256), frame.len);
+    _ = s.feed(frame);
+    try testing.expectEqualSlices(u8, pdu_buf[0..253], s.next().?.pdu);
+
+    // FC 0x14 response: byte count 251.
+    pdu_buf[0] = 0x14;
+    pdu_buf[1] = 251;
+    s = RtuStream.init(.response);
+    frame = try rtu.encodeAdu(&adu, 0x01, pdu_buf[0..253]);
+    _ = s.feed(frame);
+    try testing.expectEqualSlices(u8, pdu_buf[0..253], s.next().?.pdu);
+
+    // FC 0x2B response filling the PDU: header + one 244-byte object.
+    pdu_buf[0] = 0x2B;
+    pdu_buf[1] = 0x0E;
+    pdu_buf[2] = 0x01;
+    pdu_buf[3] = 0x81;
+    pdu_buf[4] = 0x00;
+    pdu_buf[5] = 0x00;
+    pdu_buf[6] = 0x01;
+    pdu_buf[7] = 0x00;
+    pdu_buf[8] = 244;
+    s = RtuStream.init(.response);
+    frame = try rtu.encodeAdu(&adu, 0x01, pdu_buf[0..253]);
+    _ = s.feed(frame);
+    try testing.expectEqualSlices(u8, pdu_buf[0..253], s.next().?.pdu);
+}
+
+test "RtuStream: a request with an unknown MEI type is garbage, not a frame; reset after a frame is clean" {
+    var a: [rtu.max_adu_len]u8 = undefined;
+    const odd = try rtu.encodeAdu(&a, 0x01, &.{ 0x2B, 0x0D, 0x01, 0x00 });
+    var s = RtuStream.init(.request);
+    _ = s.feed(odd);
+    try testing.expect(s.next() == null);
+    try testing.expect(s.discarded > 0);
+
+    var b: [rtu.max_adu_len]u8 = undefined;
+    const good = try rtu.encodeAdu(&b, 0x05, &.{ 0x03, 0x00, 0x00, 0x00, 0x01 });
+    s.reset();
+    _ = s.feed(good);
+    try testing.expectEqual(@as(u8, 0x05), s.next().?.unit);
+    // reset right after a frame was handed out (its bytes are still pending)
+    s.reset();
+    try testing.expectEqual(@as(usize, 0), s.len);
+    try testing.expectEqual(@as(usize, 0), s.consumed);
+    _ = s.feed(good);
+    try testing.expectEqual(good.len, s.len);
+    try testing.expectEqual(@as(u8, 0x05), s.next().?.unit);
+    // a request-role stream does not accept a high-bit function code
+    s.reset();
+    var c: [rtu.max_adu_len]u8 = undefined;
+    _ = s.feed(try rtu.encodeAdu(&c, 0x01, &.{ 0x83, 0x02 }));
+    try testing.expect(s.next() == null);
+}

@@ -2226,3 +2226,56 @@ test "FC 0x2B/0x0E end to end: Client reads the whole table over TCP framing" {
     try testing.expectEqualStrings("X-100", it3.next().?.value);
     try testing.expectError(error.IllegalDataAddress, client.readDeviceIdentification(5, .individual, 9, &reply));
 }
+
+test "FC 0x2B/0x0E: category edges 0x7F / 0xFF, conformity independent of table order" {
+    var fix = Fixture{};
+    const edges = [_]mb.device_id.Object{
+        .{ .id = 0x80, .value = "e" },
+        .{ .id = 0x03, .value = "r" },
+        .{ .id = 0x7F, .value = "R" },
+        .{ .id = 0xFF, .value = "E" },
+        .{ .id = 0x00, .value = "b" },
+    };
+    var server = idServer(&fix, &edges);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x03 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x02, 0x83, 0x00, 0x00, 0x02, 0x03, 0x01, 'r', 0x7F, 0x01, 'R' }, r);
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x03, 0x83, 0x00, 0x00, 0x02, 0x80, 0x01, 'e', 0xFF, 0x01, 'E' }, r);
+
+    // Only object 0x03 beyond basic: conformity is "regular".
+    const only3 = [_]mb.device_id.Object{ .{ .id = 0x00, .value = "b" }, .{ .id = 0x03, .value = "r" } };
+    server.config.device_objects = &only3;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0x82), r[3]);
+    // Extended listed first, a regular object after it: still "extended".
+    const ext_first = [_]mb.device_id.Object{ .{ .id = 0x80, .value = "e" }, .{ .id = 0x03, .value = "r" } };
+    server.config.device_objects = &ext_first;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0x83), r[3]);
+}
+
+test "FC 0x2B/0x0E: an unsendable object ends the stream with more-follows, later small ones wait" {
+    var fix = Fixture{};
+    const big = @as([100]u8, @splat('x'));
+    const huge = @as([300]u8, @splat('h'));
+    var out: [mb.max_pdu_len]u8 = undefined;
+    // after the page break the small object must NOT be squeezed in
+    const objs = [_]mb.device_id.Object{
+        .{ .id = 0x80, .value = &big },
+        .{ .id = 0x81, .value = &big },
+        .{ .id = 0x82, .value = &big },
+        .{ .id = 0x83, .value = "z" },
+    };
+    var server = idServer(&fix, &objs);
+    var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
+    try testing.expectEqual(@as(u8, 2), r[6]);
+    try testing.expectEqual(@as(u8, 0xFF), r[4]);
+    try testing.expectEqual(@as(u8, 0x82), r[5]);
+    // a value longer than a length byte, after a small object
+    const bad = [_]mb.device_id.Object{ .{ .id = 0x80, .value = "s" }, .{ .id = 0x81, .value = &huge } };
+    server.config.device_objects = &bad;
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out), 0x2B, .server_device_failure);
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x80 }, &out);
+    try testing.expectEqual(@as(u8, 1), r[6]);
+}
