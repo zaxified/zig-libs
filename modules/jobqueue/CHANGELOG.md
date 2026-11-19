@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** `release` docs: the FIFO place is kept only without a delay; with `delay_ns > 0` newer jobs of the partition may be dispatched first meanwhile (the behaviour was already so).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of `DequeueOptions.exclude` (5/5 killed); card cumulative.
 - **2026-11-19** — New: `DequeueOptions.exclude` — partitions a `dequeue` passes over (nothing of theirs is leased or changed; a filtered partition that is excluded gives null). Default empty = the plain dequeue. Additive.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of `release` (10 mutants: 9 killed, 1 equivalent); two release tests sharpened (a rewritten `run_at` and a skipped slot reservation are now observable); card cumulative.

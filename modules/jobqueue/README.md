@@ -118,7 +118,8 @@ try q.extendLease(lease, 30 * std.time.ns_per_s);
 _ = try q.dequeue(.{ .visibility_timeout_ns = 30 * std.time.ns_per_s, .exclude = &.{ "tenant-7", "tenant-9" } });
 
 // Took a job it cannot run yet (a busy resource, a shutdown)? Hand it back
-// without counting an attempt: same place in its partition, never dead-letters.
+// without counting an attempt; never dead-letters. With no delay it keeps its
+// place in its partition (with a delay, newer jobs may go first meanwhile).
 try q.release(lease, .{ .delay_ns = 0 });  // or a delay, persisted like a nack backoff
 
 // At most one live job per key (until acked or cancelled), durable:

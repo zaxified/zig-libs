@@ -633,9 +633,11 @@ pub const Queue = struct {
     }
 
     /// Hand the lease back without counting an attempt: the job returns to
-    /// the ready set unchanged (same attempt count, priority and id, so it
-    /// keeps its place in its partition's FIFO), visible again after
-    /// `opts.delay_ns`. Never dead-letters, and its `unique_key` stays held.
+    /// the ready set unchanged (same attempt count, priority and id), visible
+    /// again after `opts.delay_ns`. With no delay it keeps its place in its
+    /// partition's FIFO; with a delay, newer jobs of the partition that are
+    /// visible meanwhile are dispatched first (once due, it again sorts by
+    /// its old id). Never dead-letters, and its `unique_key` stays held.
     /// For a worker that took a job it cannot run yet (a busy resource, a
     /// shutdown) — beanstalkd `release`, Celery `reject(requeue=True)`, River
     /// `JobSnooze`, SQS `ChangeMessageVisibility` to 0. A failure is `nack`.

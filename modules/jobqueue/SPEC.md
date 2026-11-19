@@ -91,9 +91,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (default now) before touching the index. `extendLease(lease, t)` sets the monotonic deadline to
   `now + t` for the current lease only (`StaleLease` otherwise). `status(id)` reads the index.
 - **Lease release (2026-11-19).** `release(lease, .{ .delay_ns })` hands a lease back without
-  counting an attempt: the job returns to `pending` with its attempts, priority and id unchanged
-  (so it rejoins its partition heap at its old FIFO place), never dead-letters, and keeps its
-  `unique_key`. With `delay_ns > 0` the new `run_at` is persisted before the index changes (a
+  counting an attempt: the job returns to `pending` with its attempts, priority and id unchanged,
+  never dead-letters, and keeps its `unique_key`. With `delay_ns == 0` it rejoins its partition
+  heap at its old FIFO place at once; with a delay it is invisible until then, so newer jobs of the
+  same partition can be dispatched before it (when it is due it sorts by its old id again). With `delay_ns > 0` the new `run_at` is persisted before the index changes (a
   storage error leaves the job leased and unchanged, as `expireLease` does); with 0 nothing is
   written, because the stored record already says what a reopen must see (ready, same attempts)
   and its `run_at` was due when it was dequeued. The lease epoch is bumped, so the released lease
