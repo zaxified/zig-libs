@@ -3912,11 +3912,14 @@ test "Manager.iterate over KvStore: a store larger than one page, every page siz
     }
 }
 
-test "Manager.iterate over KvStore: an allocation failure at any point is OutOfMemory, nothing leaks" {
+/// Allocations one `Manager.iterate` over five sessions makes, with a
+/// `KvStore` built with `iterate_page = page`: every count below it fails
+/// with `OutOfMemory` and leaks nothing.
+fn iterateAllocations(page: usize) !usize {
     var env: KvEnv = undefined;
     try env.init();
     defer env.deinit();
-    env.store.iterate_page = 2;
+    env.store = try KvStore.init(&env.db, .{ .ttl_ms = 60_000, .iterate_page = page });
     var m = try env.manager();
     var ids: [5][64]u8 = undefined;
     try fiveUsers(&m, &ids);
@@ -3927,11 +3930,17 @@ test "Manager.iterate over KvStore: an allocation failure at any point is OutOfM
         if (m.iterate(fa.allocator(), &ctx, Logout.visit)) |n| {
             try testing.expectEqual(@as(usize, 0), n);
             try testing.expectEqual(@as(usize, 5), ctx.seen);
-            break;
+            return fail_index;
         } else |e| try testing.expectEqual(error.OutOfMemory, e);
     }
-    // Three pages (2 + 2 + 1), each a heap, a key array and key copies.
-    try testing.expect(fail_index > 9);
+}
+
+test "Manager.iterate over KvStore: an allocation failure at any point is OutOfMemory, nothing leaks; Config.iterate_page is the page" {
+    const one_page = try iterateAllocations(256);
+    const three_pages = try iterateAllocations(2); // 2 + 2 + 1
+    // Two more pages: a heap and a key array each, and two cursor copies.
+    // The same key copies and record reads either way.
+    try testing.expectEqual(one_page + 6, three_pages);
 }
 
 fn sha256Of(id: []const u8) [32]u8 {
