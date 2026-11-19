@@ -72,6 +72,77 @@ pub const Network = enum {
     }
 };
 
+/// The address encoding a SLIP-0132 version prefix announces (the registry's
+/// "Address Encoding" column). BIP-32 itself defines none: this is a
+/// convention between wallets that exchange keys as `ypub`/`zpub`/....
+pub const Slip132Script = enum {
+    /// `xpub`/`tpub`: P2PKH or P2SH (BIP-44 paths).
+    p2pkh_or_p2sh,
+    /// `ypub`/`upub`: P2WPKH nested in P2SH (BIP-49 paths).
+    p2wpkh_in_p2sh,
+    /// `zpub`/`vpub`: native P2WPKH (BIP-84 paths).
+    p2wpkh,
+    /// `Ypub`/`Upub`: multisig P2WSH nested in P2SH.
+    p2wsh_in_p2sh,
+    /// `Zpub`/`Vpub`: multisig native P2WSH.
+    p2wsh,
+};
+
+/// One row of the SLIP-0132 registry for Bitcoin: the version bytes of the
+/// public and the private serialization and their Base58 prefixes.
+pub const Slip132Entry = struct {
+    network: Network,
+    script: Slip132Script,
+    pub_version: u32,
+    priv_version: u32,
+    /// The first four characters every serialization with these version
+    /// bytes starts with (`"zpub"`, `"zprv"`, ...).
+    pub_prefix: *const [4]u8,
+    priv_prefix: *const [4]u8,
+};
+
+/// The Bitcoin rows of SLIP-0132 ("Registered HD version bytes for
+/// BIP-0032"): ten network x script pairs, the first of each network being
+/// BIP-32's own. Other coins' rows are not here (their version bytes collide
+/// with these: Groestlcoin and Syscoin reuse them, Vertcoin and Nexa share
+/// `xpub`'s).
+pub const slip132_table = [_]Slip132Entry{
+    .{ .network = .mainnet, .script = .p2pkh_or_p2sh, .pub_version = version_mainnet_pub, .priv_version = version_mainnet_priv, .pub_prefix = "xpub", .priv_prefix = "xprv" },
+    .{ .network = .mainnet, .script = .p2wpkh_in_p2sh, .pub_version = 0x049d7cb2, .priv_version = 0x049d7878, .pub_prefix = "ypub", .priv_prefix = "yprv" },
+    .{ .network = .mainnet, .script = .p2wpkh, .pub_version = 0x04b24746, .priv_version = 0x04b2430c, .pub_prefix = "zpub", .priv_prefix = "zprv" },
+    .{ .network = .mainnet, .script = .p2wsh_in_p2sh, .pub_version = 0x0295b43f, .priv_version = 0x0295b005, .pub_prefix = "Ypub", .priv_prefix = "Yprv" },
+    .{ .network = .mainnet, .script = .p2wsh, .pub_version = 0x02aa7ed3, .priv_version = 0x02aa7a99, .pub_prefix = "Zpub", .priv_prefix = "Zprv" },
+    .{ .network = .testnet, .script = .p2pkh_or_p2sh, .pub_version = version_testnet_pub, .priv_version = version_testnet_priv, .pub_prefix = "tpub", .priv_prefix = "tprv" },
+    .{ .network = .testnet, .script = .p2wpkh_in_p2sh, .pub_version = 0x044a5262, .priv_version = 0x044a4e28, .pub_prefix = "upub", .priv_prefix = "uprv" },
+    .{ .network = .testnet, .script = .p2wpkh, .pub_version = 0x045f1cf6, .priv_version = 0x045f18bc, .pub_prefix = "vpub", .priv_prefix = "vprv" },
+    .{ .network = .testnet, .script = .p2wsh_in_p2sh, .pub_version = 0x024289ef, .priv_version = 0x024285b5, .pub_prefix = "Upub", .priv_prefix = "Uprv" },
+    .{ .network = .testnet, .script = .p2wsh, .pub_version = 0x02575483, .priv_version = 0x02575048, .pub_prefix = "Vpub", .priv_prefix = "Vprv" },
+};
+
+/// The registry row for `network` and `script`.
+pub fn slip132Entry(network: Network, script: Slip132Script) Slip132Entry {
+    for (slip132_table) |e| {
+        if (e.network == network and e.script == script) return e;
+    }
+    unreachable; // the table holds every (network, script) pair
+}
+
+/// What a SLIP-0132 version word is: its registry row and whether it is the
+/// private or the public one.
+pub const Slip132Match = struct {
+    entry: Slip132Entry,
+    is_private: bool,
+};
+
+/// Look `version` up in `slip132_table`; `null` for any other value.
+pub fn slip132Find(version: u32) ?Slip132Match {
+    for (slip132_table) |e| {
+        if (version == e.pub_version) return .{ .entry = e, .is_private = false };
+        if (version == e.priv_version) return .{ .entry = e, .is_private = true };
+    }
+    return null;
+}
+
 /// Child indices `>= hardened_offset` (2^31) are hardened derivation.
 pub const hardened_offset: u32 = 0x8000_0000;
 
@@ -389,13 +460,21 @@ fn writeHeader(payload: *[serialized_payload_len]u8, version: u32, depth: u8, pa
 /// (testnet), Base58Check.
 pub fn serializePriv(k: *const ExtendedPrivKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
     defer burnStack();
-    return serializePrivBody(k, network, out);
+    return serializePrivBody(k, network.privVersion(), out);
 }
 
-noinline fn serializePrivBody(k: *const ExtendedPrivKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
+/// `serializePriv` with a SLIP-0132 prefix: `yprv`/`zprv`/`Yprv`/`Zprv` on
+/// mainnet, `uprv`/`vprv`/`Uprv`/`Vprv` on testnet (`.p2pkh_or_p2sh` is
+/// `xprv`/`tprv`, i.e. `serializePriv`).
+pub fn serializePrivSlip132(k: *const ExtendedPrivKey, network: Network, script: Slip132Script, out: []u8) bech32.base58.Error![]const u8 {
+    defer burnStack();
+    return serializePrivBody(k, slip132Entry(network, script).priv_version, out);
+}
+
+noinline fn serializePrivBody(k: *const ExtendedPrivKey, version: u32, out: []u8) bech32.base58.Error![]const u8 {
     var payload: [serialized_payload_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &payload); // carries the secret privkey
-    writeHeader(&payload, network.privVersion(), k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
+    writeHeader(&payload, version, k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
     payload[45] = 0x00;
     @memcpy(payload[46..78], &k.privkey);
     // Constant-time Base58Check (2026-10-18): the string is the key in
@@ -406,8 +485,19 @@ noinline fn serializePrivBody(k: *const ExtendedPrivKey, network: Network, out: 
 /// Serialize an extended public key as `xpub...` (mainnet) or `tpub...`
 /// (testnet), Base58Check.
 pub fn serializePub(k: ExtendedPubKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
+    return serializePubVersion(k, network.pubVersion(), out);
+}
+
+/// `serializePub` with a SLIP-0132 prefix: `ypub`/`zpub`/`Ypub`/`Zpub` on
+/// mainnet, `upub`/`vpub`/`Upub`/`Vpub` on testnet (`.p2pkh_or_p2sh` is
+/// `xpub`/`tpub`, i.e. `serializePub`).
+pub fn serializePubSlip132(k: ExtendedPubKey, network: Network, script: Slip132Script, out: []u8) bech32.base58.Error![]const u8 {
+    return serializePubVersion(k, slip132Entry(network, script).pub_version, out);
+}
+
+fn serializePubVersion(k: ExtendedPubKey, version: u32, out: []u8) bech32.base58.Error![]const u8 {
     var payload: [serialized_payload_len]u8 = undefined;
-    writeHeader(&payload, network.pubVersion(), k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
+    writeHeader(&payload, version, k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
     @memcpy(payload[45..78], &k.pubkey);
     return bech32.base58.checkEncode(&payload, out);
 }
@@ -446,8 +536,31 @@ pub const ParsedKey = union(enum) {
 /// the other network's are `error.WrongNetwork`.
 pub fn parseExtended(s: []const u8, network: Network, out: *ParsedKey) ParseError!void {
     defer burnStack();
-    return parseExtendedBody(s, network, out);
+    _ = try parseExtendedBody(s, .{ .network = network }, out);
 }
+
+/// Like `parseExtended`, but for the SLIP-0132 registry: accepts every
+/// version word of `slip132_table` (`xpub`, `ypub`, `zpub`, `Ypub`, `Zpub`,
+/// `tpub`, `upub`, `vpub`, `Upub`, `Vpub` and the matching private ones), on
+/// either network, and returns which one it was (its network, script type;
+/// whether the key is private is the tag of `out`). Every other version word
+/// is `error.UnknownVersion`; all other validation is `parseExtended`'s. The
+/// script type is a label the sender attached: the key is the same BIP-32 key
+/// whatever the prefix, nothing here derives an address from it.
+pub fn parseSlip132(s: []const u8, out: *ParsedKey) ParseError!Slip132Entry {
+    defer burnStack();
+    const version = try parseExtendedBody(s, .slip132, out);
+    // The body accepted `version`, so the lookup cannot miss.
+    return slip132Find(version).?.entry;
+}
+
+/// Which version words `parseExtendedBody` accepts.
+const VersionRule = union(enum) {
+    /// Exactly this network's BIP-32 pair; the other network's is `WrongNetwork`.
+    network: Network,
+    /// Every row of `slip132_table`.
+    slip132,
+};
 
 /// Tells memcheck that `bytes` (computed from a secret, public by contract)
 /// are defined, so a branch on them is not a ctgrind context. A no-op
@@ -482,7 +595,8 @@ fn scalarInRange(k: *const [32]u8) bool {
     return ok == 1;
 }
 
-noinline fn parseExtendedBody(s: []const u8, network: Network, out: *ParsedKey) ParseError!void {
+/// Returns the version word (public data) of the key it stored in `out`.
+noinline fn parseExtendedBody(s: []const u8, rule: VersionRule, out: *ParsedKey) ParseError!u32 {
     var buf: [bech32.base58.max_payload_len]u8 = undefined;
     // CONVENTIONS §2.1 Z1: for an xprv, `buf` holds the decoded private
     // scalar. The `defer` is registered *before* the fallible decode and
@@ -514,15 +628,20 @@ noinline fn parseExtendedBody(s: []const u8, network: Network, out: *ParsedKey) 
         if (child_number != 0) return error.ZeroDepthNonZeroIndex;
     }
 
-    const other = network.other();
-    const is_private = if (version == network.privVersion())
-        true
-    else if (version == network.pubVersion())
-        false
-    else if (version == other.privVersion() or version == other.pubVersion())
-        return error.WrongNetwork
-    else
-        return error.UnknownVersion;
+    const is_private = switch (rule) {
+        .network => |network| blk: {
+            const other = network.other();
+            break :blk if (version == network.privVersion())
+                true
+            else if (version == network.pubVersion())
+                false
+            else if (version == other.privVersion() or version == other.pubVersion())
+                return error.WrongNetwork
+            else
+                return error.UnknownVersion;
+        },
+        .slip132 => (slip132Find(version) orelse return error.UnknownVersion).is_private,
+    };
 
     if (is_private) {
         if (payload[45] != 0x00) return error.InvalidPrivateKeyMarker;
@@ -537,7 +656,7 @@ noinline fn parseExtendedBody(s: []const u8, network: Network, out: *ParsedKey) 
             .chain_code = chain_code,
             .privkey = priv,
         } };
-        return;
+        return version;
     }
     var pk: [33]u8 = undefined;
     @memcpy(&pk, payload[45..78]);
@@ -549,6 +668,7 @@ noinline fn parseExtendedBody(s: []const u8, network: Network, out: *ParsedKey) 
         .chain_code = chain_code,
         .pubkey = pk,
     } };
+    return version;
 }
 
 // ── derivation-path parsing (`m/44'/0'/0'/0/0`) ─────────────────────────

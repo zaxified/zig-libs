@@ -6,7 +6,7 @@
 
 **Scope:** core — rust-bitcoin `bip32` + rust-bip39 / bitcoinjs `bip39`+`bip32` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-18 (252/273, 21 eq) · src daa05326973ca12d
+**Audit:** review 2026-09-10 · mutation 2026-11-19 (266/287, 21 eq) · src 347ee7873ca59d7f
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, BIP32_FUZZ; derive at 1/2 of it) · ct 2026-09-16 (ctgrind)
 
@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [btcsuite/btcd (`btcutil/hdkeychain`)](https://github.com/btcsuite/btcd/tree/master/btcutil) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | HD keychain with network params; BIP39 lives in third-party `go-bip39` (not surveyed). |
 | [vrischmann/zig-bip39, loftafi/bip39](https://github.com/loftafi/bip39) | Zig | MIT | 0–1 | 2022-12 / 2025-04 | Mnemonic-only Zig packages, one push each and little activity. Zig `std` has neither BIP32 nor BIP39. |
 
-**Where we are ahead:** BIP32 and BIP39 in one pure-Zig, allocation-free module with all five BIP32 vector sets and the Trezor BIP39 corpus; ctgrind-measured wordlist lookup (`wordIndex` is a masked linear scan) and wiped scratch buffers — rust-bip39/bitcoinjs make no such statement. **Where we are behind:** English wordlist only, no NFKD normalisation of passphrase/mnemonic, no SLIP-132 (ypub/zpub) prefixes, no WIF export here (WIF lives in the sibling `btcaddr` module).
+**Where we are ahead:** BIP32 and BIP39 in one pure-Zig, allocation-free module with all five BIP32 vector sets and the Trezor BIP39 corpus; ctgrind-measured wordlist lookup (`wordIndex` is a masked linear scan) and wiped scratch buffers — rust-bip39/bitcoinjs make no such statement. **Where we are behind:** English wordlist only, no NFKD normalisation of passphrase/mnemonic, (SLIP-132 ypub/zpub prefixes added 2026-11-19), no WIF export here (WIF lives in the sibling `btcaddr` module).
 
 ## Design
 
@@ -283,6 +283,30 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   pre-normalize it themselves. Multi-language wordlists (BIP-39 defines ten)
   are out of scope entirely — English only.
 - **`parsePath` is not a BIP-44 purpose-field validator** — see above.
+- **SLIP-0132 prefixes (2026-11-19).** `slip132_table` holds the ten Bitcoin rows of
+  SLIP-0132 (`xpub/ypub/zpub/Ypub/Zpub`, `tpub/upub/vpub/Upub/Vpub` and the private
+  counterparts; version words and prefixes as published); `slip132Entry(network, script)`
+  and `slip132Find(version)` look them up. `serializePrivSlip132`/`serializePubSlip132`
+  write a chosen prefix; `parseSlip132` accepts every registered word on either network
+  and returns the row (network and script type; public/private is the tag of the
+  parsed key), any other word is `error.UnknownVersion`, every other check is
+  `parseExtended`'s. Reference behaviour: the SLIP-0132 registry itself; of the surveyed
+  libraries the reference (rust-bitcoin `Xpub::decode`) takes only the BIP-32 pair, while
+  bitcoinjs/bip32 (`fromBase58(str, network)`) and scure-bip32 (`fromExtendedKey(str,
+  versions)`) take the version words from the caller — so the default entry points,
+  `serializePriv`/`serializePub`/`parseExtended`, are unchanged (a `ypub` is still
+  `UnknownVersion` there) and SLIP-0132 is a separate pair of calls, never implied by a
+  network. The script type is a label the sender chose; the key bytes are an ordinary
+  BIP-32 key under any prefix and nothing here derives an address. Other coins'
+  rows of the registry are not included (their words collide with Bitcoin's).
+  KATs: the registry's own test vectors (mnemonic `abandon ... about`, accounts
+  `m/44'/0'/0'`, `m/49'/0'/0'`, `m/84'/0'/0'`, six strings derived and compared) and the
+  `m/84'/0'/0'` key under all ten pairs (the eighteen strings the registry does not
+  publish were made by an independent Base58Check implementation from the published
+  zpub/zprv by swapping the version word; each string's four-letter prefix is asserted
+  against the registry). Not covered: the new entry points are not in the ReleaseFast
+  stack probe (they share `serializePrivBody` / `parseExtendedBody` with the covered
+  `serializePriv` / `parseExtended`). Delta mutation 2026-11-19: 14 mutants, 14 killed.
 - **Network is explicit** (A1 L7, 2026-09-13): `serializePriv`/`serializePub`
   /`parseExtended` take a `Network` (`.mainnet` = `0x0488ADE4`/`0x0488B21E`,
   `.testnet` = `0x04358394`/`0x043587CF`, BIP-32 § "Serialization format").
@@ -338,4 +362,4 @@ Mutants: 265 over `bip32.zig` and `bip39.zig` non-test code (BIP-32 derivation, 
 - **DONE 2026-11-18 (owner decision) — ReleaseSmall: `neuter` leaves the master chain code on the dead stack** (2026-10-19, `stackprobe_test.zig`, ReleaseSmall only; ReleaseFast green) — once per call, 166 B below it: the copy of the returned `ExtendedPubKey` in `neuter`'s own frame, above every burn. The key itself no longer leaks (`pubkeyFromPriv` by pointer). The chain code is part of the value the caller receives, so this is a copy of an output, not of an input the caller did not get. A `noinline` body + `burnStack` did NOT remove it (tried 2026-10-19 and 2026-11-18). Resolution: the out-pointer `neuterInto(priv, *ExtendedPubKey)` is added (the probe holds it to every needle, ReleaseFast and ReleaseSmall green); `neuter` is a thin wrapper over it, documented as leaving a copy, and stays exempt from the chain-code needle in the probe. rust-bitcoin's `Xpub::from_xpriv` and bitcoinjs's `neutered()` return the public key by value, so the wrapper is the like-the-reference shape; the out-pointer is the security-first option beside it. ReleaseSmall tests run in no CI lane.
 - **BIP39 wordlists for the nine other languages** (survey 2026-09-30) — a user with a Japanese, Spanish, … seed cannot restore it; rust-bip39 and bitcoinjs both ship them. Effort S per language (2048 words data each, machine-transcribed from `bitcoin/bips`, embedded). Fits §2.
 - **NFKD normalisation of mnemonic and passphrase (BIP39)** (survey 2026-09-30) — a non-ASCII passphrase silently derives a different seed than every other wallet; today the caller must pre-normalise (see Threat model). Needs Unicode NFKD tables (`rg -i 'nfkd|unicode'` over `README.md` catalog finds no sibling). Effort M (generated tables + tests). Fits §2 if the tables are generated Zig data.
-- **SLIP-132 version prefixes (ypub/zpub/…)** (survey 2026-09-30) — wallets exchange keys in these; not a BIP, thus optional. Effort S. Fits §2.
+- ✅ DONE 2026-11-19 (`slip132_table`, `serializePrivSlip132`/`serializePubSlip132`/`parseSlip132`, SPEC § Serialization notes). **SLIP-132 version prefixes (ypub/zpub/…)** (survey 2026-09-30).
