@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** documentation: `MonitoredItemModifySpec.client_handle` uniqueness stays the caller's duty and is not enforced (open62541's client assigns handles itself and does not enforce caller-chosen ones either). Review LOW-6.
 - **2026-11-19** — **Behaviour change:** `Subscription.createMonitoredItems` and `modifyMonitoredItems` return `error.ResultCountMismatch` (new member of `services.ServiceError`) when the answer has a different number of results than the request had items (shorter, longer or absent; OPC 10000-4 one result per item, in order) and leave the handle table untouched; before, a surplus was ignored and a shortage silently left items uncorrelated. Review LOW-5.
 - **2026-11-19** — **Behaviour change:** an OpenSecureChannel answer whose server nonce is not exactly 32 bytes (the symmetric key length, OPC 10000-6 §6.7.5) is refused with `error.InvalidSecureMessage` at a secured policy, for `open` and `renew`; before, only an empty nonce was refused. Review LOW-3.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** documentation: `SecureChannel.renew` now says that after a client-side refusal of a renewal answer the server has already rotated to the new token, so the old one lives only for the overlap window (review LOW-1).

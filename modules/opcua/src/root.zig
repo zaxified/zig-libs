@@ -1309,7 +1309,11 @@ pub const Subscription = struct {
         monitored_item_id: u32,
         /// The (possibly new) `ClientHandle`: OPC 10000-4 §5.12.3 carries it in
         /// the modified parameters, so a modify may re-label an item. Pass the
-        /// current handle to keep it. Must stay unique within this `Subscription`.
+        /// current handle to keep it. Must stay unique within this `Subscription`:
+        /// this is NOT checked (a duplicate makes `findMonitoredItem` return the
+        /// first entry). open62541's client does not enforce it either: it
+        /// assigns the client handles itself (`ua_client_subscriptions.c`, "Set a
+        /// unique ClientHandle") and a caller-chosen one is simply stored.
         client_handle: u32,
         sampling_interval_ms: f64 = -1,
         queue_size: u32 = 1,
