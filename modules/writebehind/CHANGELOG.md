@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** audit-line src hash refreshed at the wave-8 merge (test/doc commits after the mutation run; counts unchanged).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** a test that pins the synchronous pass itself (the clock jumps between the waiting-set snapshot and the WAL lease, and the pass still writes nothing of the waiting key); the cost note at the waiting-set call site.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the review fix (7 mutants: 6 killed, 1 equivalent); a test for the synchronous path alone at the retry deadline; card cumulative.
 - **2026-11-19** — Fix (review of the F5b change, unreleased): the synchronous backstop now excludes the keys waiting out a retry backoff from the WAL dequeue (`jobqueue` `DequeueOptions.exclude`, the set read once per pass) instead of leasing their records and handing them back with `release`. The lease-and-release version could write a key's newer record and then its older one over it when the key's wait lapsed in the middle of a pass. It also cost O(records of the waiting keys) per pass. The `release_failed` held kind is gone.
