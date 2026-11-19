@@ -174,6 +174,22 @@ pub const Config = struct {
 
     /// FC 0x17 Read/Write Multiple Registers.
     read_write_registers: bool = true,
+
+    /// FC 0x16 Mask Write Register. Behaviour change 2026-11-19: it used to
+    /// be unimplemented (`IllegalFunction`); libmodbus and pymodbus both
+    /// serve it. Set false to restore the old answer.
+    mask_write_register: bool = true,
+
+    /// FC 0x2B/0x0E Read Device Identification: the object table, in any
+    /// order (ids unique; the first match of an id wins). Empty means the
+    /// function is not implemented and requests are answered
+    /// `IllegalFunction`. Values must fit one response (at most 244 bytes);
+    /// an object that cannot is answered `ServerDeviceFailure`. The
+    /// conformity level is derived from the table (see `device_id`).
+    device_objects: []const mb.device_id.Object = &.{},
+
+    /// Serve read code 4 (one specific object) in addition to stream access.
+    device_id_individual: bool = true,
 };
 
 /// The serial-line diagnostic counters (application spec §6.8 sub-functions
@@ -379,6 +395,8 @@ pub const Server = struct {
             @backingInt(FunctionCode.write_multiple_coils) => self.doWriteMultipleCoils(body, out),
             @backingInt(FunctionCode.write_multiple_registers) => self.doWriteMultipleRegisters(body, out),
             @backingInt(FunctionCode.read_write_multiple_registers) => self.doReadWriteRegisters(body, out),
+            @backingInt(FunctionCode.mask_write_register) => self.doMaskWrite(body, out),
+            @backingInt(FunctionCode.encapsulated_interface) => self.doDeviceId(body, out),
             @backingInt(FunctionCode.read_exception_status) => self.doReadExceptionStatus(body, out),
             @backingInt(FunctionCode.diagnostics) => self.doDiagnostics(body, out),
             @backingInt(FunctionCode.report_slave_id) => self.doReportSlaveId(body, out),
@@ -600,6 +618,97 @@ pub const Server = struct {
             std.mem.writeInt(u16, out[2 + 2 * i ..][0..2], self.db.holding_registers.values[read_start + i], .big);
         }
         self.reply_len = 2 + 2 * @as(usize, read_quantity);
+        return null;
+    }
+
+    // ── FC 0x16 ─────────────────────────────────────────────────────────────
+
+    fn doMaskWrite(self: *Server, body: []const u8, out: []u8) ?ExceptionCode {
+        if (!self.config.mask_write_register) return .illegal_function;
+        if (body.len != 6) return .illegal_data_value;
+        const addr = std.mem.readInt(u16, body[0..2], .big);
+        const and_mask = std.mem.readInt(u16, body[2..4], .big);
+        const or_mask = std.mem.readInt(u16, body[4..6], .big);
+        const idx = self.db.holding_registers.index(addr) orelse return .illegal_data_address;
+        const cur = self.db.holding_registers.values[idx];
+        self.db.holding_registers.values[idx] = mb.pdu.applyMask(cur, and_mask, or_mask);
+        if (self.hook) |h| h.notify(.{ .area = .holding_registers, .addr = addr, .count = 1 });
+
+        // The response is an exact echo of the request.
+        out[0] = @backingInt(FunctionCode.mask_write_register);
+        @memcpy(out[1..7], body[0..6]);
+        self.reply_len = 7;
+        return null;
+    }
+
+    // ── FC 0x2B / MEI 0x0E ──────────────────────────────────────────────────
+
+    fn findObject(self: *const Server, id: u8) ?mb.device_id.Object {
+        for (self.config.device_objects) |o| if (o.id == id) return o;
+        return null;
+    }
+
+    fn doDeviceId(self: *Server, body: []const u8, out: []u8) ?ExceptionCode {
+        const di = mb.device_id;
+        if (self.config.device_objects.len == 0) return .illegal_function;
+        if (body.len == 0) return .illegal_data_value;
+        if (body[0] != di.mei_type) return .illegal_function;
+        if (body.len != 3) return .illegal_data_value;
+        const code = di.readCodeFromByte(body[1]) orelse return .illegal_data_value;
+        const req_id = body[2];
+
+        // Conformity: highest category that has an object, + individual bit.
+        var highest: di.ReadCode = .basic;
+        for (self.config.device_objects) |o| {
+            if (o.id >= 0x80) highest = .extended else if (o.id >= 0x03 and highest == .basic) highest = .regular;
+        }
+        out[0] = @backingInt(FunctionCode.encapsulated_interface);
+        out[1] = di.mei_type;
+        out[2] = body[1];
+        out[3] = di.conformityLevel(highest, self.config.device_id_individual);
+        out[4] = 0x00; // more follows
+        out[5] = 0x00; // next object id
+        var count: u8 = 0;
+        var pos: usize = 1 + di.response_header_len; // function code + header
+        // Objects share the 253-byte PDU with the header.
+        const limit: usize = mb.max_pdu_len;
+
+        if (code == .individual) {
+            if (!self.config.device_id_individual) return .illegal_data_value;
+            const o = self.findObject(req_id) orelse return .illegal_data_address;
+            // `limit` is below 255, so this also keeps the length byte honest.
+            if (pos + 2 + o.value.len > limit) return .server_device_failure;
+            out[pos] = o.id;
+            out[pos + 1] = @intCast(o.value.len);
+            @memcpy(out[pos + 2 ..][0..o.value.len], o.value);
+            pos += 2 + o.value.len;
+            count = 1;
+        } else {
+            const range = di.categoryRange(code).?;
+            // Spec: an object id that is not a known object restarts at the
+            // beginning (here: of the requested category).
+            const in_cat = req_id >= range.first and req_id <= range.last;
+            var id: u16 = if (in_cat and self.findObject(req_id) != null) req_id else range.first;
+            while (id <= range.last) : (id += 1) {
+                const o = self.findObject(@intCast(id)) orelse continue;
+                if (o.value.len > 0xFF) return .server_device_failure;
+                if (pos + 2 + o.value.len > limit) {
+                    // The first object alone does not fit: no response can
+                    // ever carry it.
+                    if (count == 0) return .server_device_failure;
+                    out[4] = 0xFF;
+                    out[5] = o.id;
+                    break;
+                }
+                out[pos] = o.id;
+                out[pos + 1] = @intCast(o.value.len);
+                @memcpy(out[pos + 2 ..][0..o.value.len], o.value);
+                pos += 2 + o.value.len;
+                count += 1;
+            }
+        }
+        out[6] = count;
+        self.reply_len = pos;
         return null;
     }
 
@@ -1071,7 +1180,7 @@ test "hostile: an empty PDU and unknown function codes are IllegalFunction" {
     var out: [mb.max_pdu_len]u8 = undefined;
 
     try expectException(try server.handlePdu(&.{}, &out), 0x00, .illegal_function);
-    for ([_]u8{ 0x00, 0x09, 0x0B, 0x0C, 0x14, 0x15, 0x16, 0x18, 0x2B, 0x7F, 0x80, 0xFF }) |fc| {
+    for ([_]u8{ 0x00, 0x09, 0x0B, 0x0C, 0x14, 0x15, 0x18, 0x2B, 0x7F, 0x80, 0xFF }) |fc| {
         const reply = try server.handlePdu(&.{ fc, 0x00, 0x00 }, &out);
         try expectException(reply, fc, .illegal_function);
     }
@@ -1784,4 +1893,390 @@ test "FC 0x17: byte count and both address windows are checked, and nothing is w
     // §6.17 performs the write before the read, so a rejected frame must
     // leave the image alone — check it did.
     for (fix.holdings) |v| try testing.expectEqual(@as(u16, 0), v);
+}
+
+// ── FC 0x16 mask write ──────────────────────────────────────────────────────
+
+test "FC 0x16: the spec example, applied to a register, echoed" {
+    var fix = Fixture{};
+    fix.holdings[4] = 0x0012;
+    var server = fix.server(.tcp);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    const req = [_]u8{ 0x16, 0x00, 104, 0x00, 0xF2, 0x00, 0x25 };
+    const reply = try server.handlePdu(&req, &out);
+    try testing.expectEqualSlices(u8, &req, reply);
+    try testing.expectEqual(@as(u16, 0x0017), fix.holdings[4]);
+    // Neighbours are untouched.
+    try testing.expectEqual(@as(u16, 0), fix.holdings[3]);
+    try testing.expectEqual(@as(u16, 0), fix.holdings[5]);
+}
+
+test "FC 0x16: window edges, wrong lengths, and the config switch" {
+    var fix = Fixture{};
+    var server = fix.server(.tcp);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    // First and last register of the window (100..115) work.
+    _ = try server.handlePdu(&.{ 0x16, 0x00, 100, 0x00, 0x00, 0xAB, 0xCD }, &out);
+    _ = try server.handlePdu(&.{ 0x16, 0x00, 115, 0x00, 0x00, 0x12, 0x34 }, &out);
+    try testing.expectEqual(@as(u16, 0xABCD), fix.holdings[0]);
+    try testing.expectEqual(@as(u16, 0x1234), fix.holdings[15]);
+    // One below and one above the window.
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 99, 0, 0, 0, 1 }, &out), 0x16, .illegal_data_address);
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 116, 0, 0, 0, 1 }, &out), 0x16, .illegal_data_address);
+    // Wrong lengths: one byte short, one byte long, none.
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 100, 0, 0, 0 }, &out), 0x16, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 100, 0, 0, 0, 1, 0 }, &out), 0x16, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{0x16}, &out), 0x16, .illegal_data_value);
+    // Nothing was written by the failures.
+    try testing.expectEqual(@as(u16, 0xABCD), fix.holdings[0]);
+
+    server.config.mask_write_register = false;
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 100, 0, 0, 0, 1 }, &out), 0x16, .illegal_function);
+}
+
+test "FC 0x16: the write hook fires once with the register address" {
+    const Probe = struct {
+        n: u32 = 0,
+        last: WriteEvent = undefined,
+        fn on(ctx: *anyopaque, ev: WriteEvent) void {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            p.n += 1;
+            p.last = ev;
+        }
+    };
+    var probe = Probe{};
+    var fix = Fixture{};
+    var server = fix.server(.tcp);
+    server.setWriteHook(.{ .ctx = &probe, .onWriteFn = Probe.on });
+    var out: [mb.max_pdu_len]u8 = undefined;
+    _ = try server.handlePdu(&.{ 0x16, 0x00, 107, 0xFF, 0x00, 0x00, 0x05 }, &out);
+    try testing.expectEqual(@as(u32, 1), probe.n);
+    try testing.expectEqual(Area.holding_registers, probe.last.area);
+    try testing.expectEqual(@as(u16, 107), probe.last.addr);
+    try testing.expectEqual(@as(u16, 1), probe.last.count);
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 7, 0, 0, 0, 1 }, &out), 0x16, .illegal_data_address);
+    try testing.expectEqual(@as(u32, 1), probe.n);
+}
+
+test "FC 0x16 end to end: Client over RTU against Server, broadcast is silent but applied" {
+    var fix = Fixture{};
+    fix.holdings[2] = 0x00F0;
+    var server = fix.server(.rtu);
+    var lb = Loopback{ .server = &server };
+    var client = mb.Client.init(.rtu, lb.transport());
+    try client.maskWriteRegister(5, 102, 0xFF00, 0x000A);
+    try testing.expectEqual(@as(u16, 0x000A), fix.holdings[2]);
+    try testing.expectError(error.IllegalDataAddress, client.maskWriteRegister(5, 500, 0, 0));
+
+    // Broadcast (address 0): applied, no reply.
+    var adu: [mb.rtu.max_adu_len]u8 = undefined;
+    var out: [mb.tcp.max_adu_len]u8 = undefined;
+    const b = try mb.rtu.encodeAdu(&adu, 0, &.{ 0x16, 0x00, 102, 0x00, 0x00, 0x12, 0x34 });
+    try testing.expectEqual(@as(?[]u8, null), try server.handleAdu(b, &out));
+    try testing.expectEqual(@as(u16, 0x1234), fix.holdings[2]);
+}
+
+/// Client <-> Server in-process: the transport hands each request ADU to
+/// `Server.handleAdu`. No reply (silence) is a `Timeout`.
+const Loopback = struct {
+    server: *Server,
+
+    fn transport(l: *Loopback) mb.Transport {
+        return .{ .ctx = l, .exchangeFn = exchangeFn };
+    }
+
+    fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) mb.TransportError!usize {
+        const l: *Loopback = @ptrCast(@alignCast(ctx));
+        var out: [mb.tcp.max_adu_len]u8 = undefined;
+        const reply = (l.server.handleAdu(request, &out) catch return error.TransportFailed) orelse
+            return error.Timeout;
+        if (reply.len > reply_buf.len) return error.TransportFailed;
+        @memcpy(reply_buf[0..reply.len], reply);
+        return reply.len;
+    }
+};
+
+// ── FC 0x2B / MEI 0x0E device identification ───────────────────────────────
+
+const demo_objects = [_]mb.device_id.Object{
+    .{ .id = 0x00, .value = "Acme" },
+    .{ .id = 0x01, .value = "X-100" },
+    .{ .id = 0x02, .value = "V1.2" },
+    .{ .id = 0x03, .value = "http://acme.test" },
+    .{ .id = 0x04, .value = "Prod" },
+    .{ .id = 0x80, .value = "ext" },
+};
+
+fn idServer(fix: *Fixture, objects: []const mb.device_id.Object) Server {
+    var s = fix.server(.tcp);
+    s.config.device_objects = objects;
+    return s;
+}
+
+test "FC 0x2B/0x0E: basic stream, byte-exact" {
+    var fix = Fixture{};
+    var server = idServer(&fix, &demo_objects);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    const reply = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqualSlices(u8, &.{
+        0x2B, 0x0E, 0x01, 0x83, 0x00, 0x00, 0x03, // conformity 0x83: extended + individual
+        0x00, 0x04, 'A',  'c',  'm',  'e',  0x01,
+        0x05, 'X',  '-',  '1',  '0',  '0',  0x02,
+        0x04, 'V',  '1',  '.',  '2',
+    }, reply);
+}
+
+test "FC 0x2B/0x0E: regular, extended, individual, and the restart rule" {
+    var fix = Fixture{};
+    var server = idServer(&fix, &demo_objects);
+    var out: [mb.max_pdu_len]u8 = undefined;
+
+    // regular: only 0x03.. (object id 0 is below the category: start of category)
+    var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 2), r[6]);
+    try testing.expectEqual(@as(u8, 0x03), r[7]);
+    // regular starting at 0x04
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x04 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x02, 0x83, 0x00, 0x00, 0x01, 0x04, 0x04, 'P', 'r', 'o', 'd' }, r);
+    // an id that is no known object restarts at the category start
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x05 }, &out);
+    try testing.expectEqual(@as(u8, 2), r[6]);
+    try testing.expectEqual(@as(u8, 0x03), r[7]);
+    // basic with an id in a different category restarts at 0
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x04 }, &out);
+    try testing.expectEqual(@as(u8, 3), r[6]);
+    try testing.expectEqual(@as(u8, 0x00), r[7]);
+    // basic starting at 0x01
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x01 }, &out);
+    try testing.expectEqual(@as(u8, 2), r[6]);
+    try testing.expectEqual(@as(u8, 0x01), r[7]);
+    // extended
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x03, 0x83, 0x00, 0x00, 0x01, 0x80, 0x03, 'e', 'x', 't' }, r);
+    // individual
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x03 }, &out);
+    try testing.expectEqualSlices(u8, "\x2B\x0E\x04\x83\x00\x00\x01\x03\x10http://acme.test", r);
+    // individual access to an object that does not exist: IllegalDataAddress
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x10 }, &out), 0x2B, .illegal_data_address);
+    // individual access is the only place the id is not a restart
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x7F }, &out), 0x2B, .illegal_data_address);
+}
+
+test "FC 0x2B/0x0E: malformed requests, switches, conformity" {
+    var fix = Fixture{};
+    var server = idServer(&fix, &demo_objects);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    // invalid read codes
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x00, 0x00 }, &out), 0x2B, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x05, 0x00 }, &out), 0x2B, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0xFF, 0x00 }, &out), 0x2B, .illegal_data_value);
+    // wrong lengths
+    try expectException(try server.handlePdu(&.{0x2B}, &out), 0x2B, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E }, &out), 0x2B, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x01 }, &out), 0x2B, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00, 0x00 }, &out), 0x2B, .illegal_data_value);
+    // another MEI type (0x0D = CANopen general reference) is not served
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0D, 0x01, 0x00 }, &out), 0x2B, .illegal_function);
+
+    // individual access switched off: read code 4 is invalid, streams work
+    server.config.device_id_individual = false;
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x00 }, &out), 0x2B, .illegal_data_value);
+    var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0x03), r[3]);
+
+    // conformity from the table: basic only, regular
+    const basic = [_]mb.device_id.Object{.{ .id = 0, .value = "A" }};
+    server.config.device_objects = &basic;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0x01), r[3]);
+    server.config.device_id_individual = true;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0x81), r[3]);
+    const regular = [_]mb.device_id.Object{ .{ .id = 0, .value = "A" }, .{ .id = 0x06, .value = "B" } };
+    server.config.device_objects = &regular;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0x82), r[3]);
+    // a category with no objects answers an empty list, not an error
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x03, 0x82, 0x00, 0x00, 0x00 }, r);
+
+    // no table at all: not implemented
+    server.config.device_objects = &.{};
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out), 0x2B, .illegal_function);
+}
+
+test "FC 0x2B/0x0E: the object table needs no particular order" {
+    var fix = Fixture{};
+    const shuffled = [_]mb.device_id.Object{
+        .{ .id = 0x02, .value = "C" },
+        .{ .id = 0x00, .value = "A" },
+        .{ .id = 0x01, .value = "B" },
+    };
+    var server = idServer(&fix, &shuffled);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    const r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqualSlices(u8, &.{
+        0x2B, 0x0E, 0x01, 0x81, 0x00, 0x00, 0x03,
+        0x00, 0x01, 'A',  0x01, 0x01, 'B',  0x02,
+        0x01, 'C',
+    }, r);
+}
+
+test "FC 0x2B/0x0E: a stream that does not fit continues with more-follows and next id" {
+    var fix = Fixture{};
+    const big = @as([100]u8, @splat('x'));
+    const objs = [_]mb.device_id.Object{
+        .{ .id = 0x80, .value = &big },
+        .{ .id = 0x81, .value = &big },
+        .{ .id = 0x90, .value = &big },
+    };
+    var server = idServer(&fix, &objs);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
+    try testing.expectEqual(@as(usize, 7 + 2 * 102), r.len);
+    try testing.expectEqual(@as(u8, 0xFF), r[4]);
+    try testing.expectEqual(@as(u8, 0x90), r[5]);
+    try testing.expectEqual(@as(u8, 2), r[6]);
+    // follow the next id
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x90 }, &out);
+    try testing.expectEqual(@as(usize, 7 + 102), r.len);
+    try testing.expectEqual(@as(u8, 0x00), r[4]);
+    try testing.expectEqual(@as(u8, 0x00), r[5]);
+    try testing.expectEqual(@as(u8, 1), r[6]);
+}
+
+test "FC 0x2B/0x0E: the PDU size boundary is exact" {
+    var fix = Fixture{};
+    var out: [mb.max_pdu_len]u8 = undefined;
+    const fits = @as([244]u8, @splat('a')); // 7 + 2 + 244 == 253
+    var objs = [_]mb.device_id.Object{.{ .id = 0x00, .value = &fits }};
+    var server = idServer(&fix, &objs);
+    var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(usize, mb.max_pdu_len), r.len);
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x00 }, &out);
+    try testing.expectEqual(@as(usize, mb.max_pdu_len), r.len);
+
+    const too_big = @as([245]u8, @splat('a'));
+    objs[0].value = &too_big;
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out), 0x2B, .server_device_failure);
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x00 }, &out), 0x2B, .server_device_failure);
+    // longer than a length byte can carry
+    const huge = @as([300]u8, @splat('a'));
+    objs[0].value = &huge;
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out), 0x2B, .server_device_failure);
+
+    // two objects that together fill 246 bytes exactly: both are sent
+    const a = @as([120]u8, @splat('a')); // 122
+    const b = @as([122]u8, @splat('b')); // 124 -> 246 total
+    var two = [_]mb.device_id.Object{ .{ .id = 0x00, .value = &a }, .{ .id = 0x01, .value = &b } };
+    server.config.device_objects = &two;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(usize, mb.max_pdu_len), r.len);
+    try testing.expectEqual(@as(u8, 0x00), r[4]);
+    try testing.expectEqual(@as(u8, 2), r[6]);
+    // one byte more pushes the second to the next response
+    const b2 = @as([123]u8, @splat('b'));
+    two[1].value = &b2;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0xFF), r[4]);
+    try testing.expectEqual(@as(u8, 0x01), r[5]);
+    try testing.expectEqual(@as(u8, 1), r[6]);
+}
+
+test "FC 0x2B/0x0E end to end: Client reads the whole table over TCP framing" {
+    var fix = Fixture{};
+    const big = @as([100]u8, @splat('y'));
+    const objs = [_]mb.device_id.Object{
+        .{ .id = 0x00, .value = "Acme" },
+        .{ .id = 0x01, .value = "X-100" },
+        .{ .id = 0x02, .value = "V1.2" },
+        .{ .id = 0x80, .value = &big },
+        .{ .id = 0x81, .value = &big },
+        .{ .id = 0x82, .value = &big },
+    };
+    var server = idServer(&fix, &objs);
+    var lb = Loopback{ .server = &server };
+    var client = mb.Client.init(.tcp, lb.transport());
+    var reply: [mb.tcp.max_adu_len]u8 = undefined;
+
+    var r = try client.readDeviceIdentification(5, .basic, 0, &reply);
+    try testing.expectEqual(@as(u8, 0x83), r.conformity);
+    try testing.expectEqual(@as(u8, 3), r.count);
+    var it = r.objects();
+    try testing.expectEqualStrings("Acme", it.next().?.value);
+
+    var seen: usize = 0;
+    var next_id: u8 = 0x80;
+    var pages: usize = 0;
+    while (true) {
+        r = try client.readDeviceIdentification(5, .extended, next_id, &reply);
+        pages += 1;
+        var it2 = r.objects();
+        while (it2.next()) |o| {
+            try testing.expectEqual(@as(usize, 100), o.value.len);
+            seen += 1;
+        }
+        if (!r.more_follows) break;
+        next_id = r.next_object_id;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+    try testing.expectEqual(@as(usize, 2), pages);
+
+    const ind = try client.readDeviceIdentification(5, .individual, 1, &reply);
+    var it3 = ind.objects();
+    try testing.expectEqualStrings("X-100", it3.next().?.value);
+    try testing.expectError(error.IllegalDataAddress, client.readDeviceIdentification(5, .individual, 9, &reply));
+}
+
+test "FC 0x2B/0x0E: category edges 0x7F / 0xFF, conformity independent of table order" {
+    var fix = Fixture{};
+    const edges = [_]mb.device_id.Object{
+        .{ .id = 0x80, .value = "e" },
+        .{ .id = 0x03, .value = "r" },
+        .{ .id = 0x7F, .value = "R" },
+        .{ .id = 0xFF, .value = "E" },
+        .{ .id = 0x00, .value = "b" },
+    };
+    var server = idServer(&fix, &edges);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x03 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x02, 0x83, 0x00, 0x00, 0x02, 0x03, 0x01, 'r', 0x7F, 0x01, 'R' }, r);
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x03, 0x83, 0x00, 0x00, 0x02, 0x80, 0x01, 'e', 0xFF, 0x01, 'E' }, r);
+
+    // Only object 0x03 beyond basic: conformity is "regular".
+    const only3 = [_]mb.device_id.Object{ .{ .id = 0x00, .value = "b" }, .{ .id = 0x03, .value = "r" } };
+    server.config.device_objects = &only3;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0x82), r[3]);
+    // Extended listed first, a regular object after it: still "extended".
+    const ext_first = [_]mb.device_id.Object{ .{ .id = 0x80, .value = "e" }, .{ .id = 0x03, .value = "r" } };
+    server.config.device_objects = &ext_first;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 0x83), r[3]);
+}
+
+test "FC 0x2B/0x0E: an unsendable object ends the stream with more-follows, later small ones wait" {
+    var fix = Fixture{};
+    const big = @as([100]u8, @splat('x'));
+    const huge = @as([300]u8, @splat('h'));
+    var out: [mb.max_pdu_len]u8 = undefined;
+    // after the page break the small object must NOT be squeezed in
+    const objs = [_]mb.device_id.Object{
+        .{ .id = 0x80, .value = &big },
+        .{ .id = 0x81, .value = &big },
+        .{ .id = 0x82, .value = &big },
+        .{ .id = 0x83, .value = "z" },
+    };
+    var server = idServer(&fix, &objs);
+    var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
+    try testing.expectEqual(@as(u8, 2), r[6]);
+    try testing.expectEqual(@as(u8, 0xFF), r[4]);
+    try testing.expectEqual(@as(u8, 0x82), r[5]);
+    // a value longer than a length byte, after a small object
+    const bad = [_]mb.device_id.Object{ .{ .id = 0x80, .value = "s" }, .{ .id = 0x81, .value = &huge } };
+    server.config.device_objects = &bad;
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out), 0x2B, .server_device_failure);
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x80 }, &out);
+    try testing.expectEqual(@as(u8, 1), r[6]);
 }
