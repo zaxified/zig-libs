@@ -504,6 +504,10 @@ canonical source is `pub const meta` in src/root.zig.
 
 ## Backlog / deferred
 
+- **Per-policy RSA key-length minimum** (2026-11-19, wave-7 rsa floor follow-up) — rsa now refuses
+  < 1024 bits everywhere; OPC UA Part 7 security policies set their own minimum (Basic256Sha256 and the
+  Aes*_RsaOaep policies: 2048; the deprecated Basic128Rsa15/Basic256: 1024). Enforce the policy minimum on
+  the peer certificate key and on `modulus_bits` (typed error), check open62541/node-opcua behaviour first.
 - (2026-10-09, dead-stack sweep) **Burn depths of the live paths are unmeasured**: `SecureChannel.open` (32 KiB), every `Session`/`Subscription` method and `Connection.tick` (128 KiB) need a live peer, so `stackprobe_test.zig` does not reach them; the sizes are margins. Also `deriveKeys` still returns `ChannelKeys` by value and `services.zig`/`server.zig` copy `SecurityContext`/`ChannelKeys` by value (`ch.security.?`, `c.keys orelse`) inside those burned frames. Next: drive one Basic256Sha256 session over the loopback fixture under the probe, then move the copies to pointers.
 - (survey 2026-09-30) **Security policies `Aes128Sha256RsaOaep` / `Aes256Sha256RsaPss`**: `Basic256Sha256` is deprecated in OPC UA 1.05 and new servers may offer only the newer policies; medium, fits §2 (sibling `rsa` has PSS/OAEP *(inferred)*).
 - (survey 2026-09-30) **Monitored-item filters (deadband) and events/alarms & conditions**: nearly every open62541/node-opcua user subscribes with a deadband; events are the next request; medium (deadband) to large (A&C), fits §2.
