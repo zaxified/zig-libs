@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit of `root.zig` and `server.zig` (622 mutants, 606 killed, 16 argued equivalent or unobservable, none a finding) and the 22 tests it added (`src/audit_test.zig`, four `TcpTransport` tests in `src/root.zig`); SPEC "Audit 2026-11-19 (whole-module mutation)" and the card's mutation entry (606/622, 16 eq). Also `tools/oracle.py` and `tools/README.md`: a differential oracle driver for pymodbus 3.16.2 (FC 0x16, FC 0x2B/0x0E, RTU framing). **The driver has NOT been run yet**; its vectors and replay test do not exist, so FC 0x16, FC 0x2B/0x0E and `RtuStream` are still unverified against pymodbus bytes (see the UNVERIFIED notes).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** docs only: SPEC records the delta mutation run over the FC 0x16 / FC 0x2B/0x0E / `RtuStream` code (120 mutants, 117 killed, 3 argued equivalent).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only (`RtuStream` reuse across feeds, `feed` taking exactly the free room, file-record sizing by byte count); one redundant length clause removed from the individual-access branch of the device-identification handler (the 244-byte PDU limit already covers it).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only (device identification category edges, zero-length objects, page-break rules, 256-byte `RtuStream` frames, reset behaviour), added from the delta mutation run over the three new items.
