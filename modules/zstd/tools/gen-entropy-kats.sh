@@ -4,7 +4,8 @@
 # `src/entropy_kat_test.zig` pins against fse.zig and huf.zig.
 #
 # The counts were chosen (encoder mutation audit, 2026-11-19) to reach what
-# the byte-parity goldens never do: every branch of FSE_normalizeM2, zero
+# the byte-parity goldens never do: every branch of FSE_normalizeM2 (the
+# low-threshold one with useLowProbCount on and off), zero
 # runs of 24 and more in FSE_writeNCount, the least room FSE_writeNCount and
 # HUF_writeCTable accept, and histograms where HUF_optimalTableLog's
 # optimal-depth search stops on a size that grew before a smaller one. The
@@ -36,6 +37,8 @@ cc -O2 -DZSTD_DISABLE_ASM -I "$R/lib" -I "$R/lib/common" -o "$R/zentropy" "$here
 req="$R/entropy-req.txt"
 cat > "$req" <<'EOF'
 norm 6 0 28 1 3 425 2 3 384 0 1 534 380 1 2 3 2 1 1 553 562 0 3 2 3 6 3 1 3 0 493 584	m2-lowthr, m2-general
+norm 6 1 28 1 3 425 2 3 384 0 1 534 380 1 2 3 2 1 1 553 562 0 3 2 3 6 3 1 3 0 493 584	m2-lowthr with useLowProbCount
+norm 6 1 20 4 274 4 1 1363 78 377 1 791 1 3 661 1 523 1 0 3 4 3 0 942	m2-lowthr, a count at the low threshold, useLowProbCount
 norm 8 0 52 498 0 1 302 1 763 729 1 2 3 453 241 892 2 0 2 3 108 100 949 0 3 1 3 2 1 2 0 3 0 1 2 1 3 2 3 0 0 667 3 0 3 1 36 2 2 0 3 1 1 1 410 2	m2-lowone
 norm 6 0 28 1 1184 3 2 1 3 1126 3 3 188 2 2 1 96 2 430 3 3 1 2 0 1 3 3 3 978 3 1 1	m2-relow, m2-relow-assign
 norm 5 0 28 1 0 1 1 1 0 1 0 1 1 1 1 1 1 0 1 1 1 1 1 0 1 0 1 1 1 0 1 1	m2-total0

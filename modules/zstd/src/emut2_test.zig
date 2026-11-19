@@ -5,12 +5,18 @@
 //! `ZSTD_compressLiterals` (the one-byte `cLitSize` that is not a single
 //! symbol), `ZSTD_compressRleLiteralsBlock`, `ZSTD_minGain`, `ZSTD_storeSeq`
 //! (lengths of 0xFFFF and 0x10000 + MINMATCH - 1 are the last short ones),
-//! and RFC 8878 section 3.1.1.3.1 (literals section header sizes).
+//! RFC 8878 section 3.1.1.3.1 (literals section header sizes), and
+//! libzstd's own frames for superblocks of blocks without a sequence
+//! (`testdata/superblock_goldens.zig`, `tools/gen-superblock-goldens.sh`;
+//! follow-up of 2026-11-19).
 
 const std = @import("std");
 const zstd = @import("root.zig");
 const literals = @import("literals.zig");
 const huf = @import("huf.zig");
+const sequences = @import("sequences.zig");
+const param_test = @import("param_test.zig");
+const sb_goldens = @import("testdata/superblock_goldens.zig");
 
 const gpa = std.testing.allocator;
 
@@ -65,12 +71,14 @@ test "the minimum gain follows the strategy from btultra up (ZSTD_minGain)" {
 
 test "an RLE literals section of more than 4095 bytes has a 3-byte header" {
     // One block of sequences: 5000 literals of one byte, then a match of
-    // 100 over them. The literals compress to a single symbol.
+    // 100 over them, then 7 more literals of the same byte: 5007 literals,
+    // a single symbol (any other byte among them would make them Huffman
+    // coded). Being the frame's first block, it is not stored as an RLE
+    // block (ZSTD_compressSequences: `!cctx->isFirstBlock`).
     const lit_len = 5000;
     const src = try gpa.alloc(u8, lit_len + 100 + 7);
     defer gpa.free(src);
-    @memset(src[0 .. lit_len + 100], 'x');
-    @memcpy(src[lit_len + 100 ..], "tail!!!");
+    @memset(src, 'x');
     const seqs = [_]zstd.Sequence{
         .{ .offset = 1, .lit_length = lit_len, .match_length = 100 },
         .{ .offset = 0, .lit_length = 7, .match_length = 0 },
@@ -82,6 +90,44 @@ test "an RLE literals section of more than 4095 bytes has a 3-byte header" {
     defer c.deinit();
     const n = try c.compressSequences(dst, &seqs, src, .{ .level = 3, .advanced = .{ .block_delimiters = .explicit } });
     try decodes(dst[0..n], src);
+    // RFC 8878 section 3.1.1.3.1.1: Literals_Block_Type 1 (RLE),
+    // Size_Format 3, Regenerated_Size 5007 in 20 bits, then the byte, at
+    // the start of the one compressed block.
+    var blk_buf: [4][2]usize = undefined;
+    const blks = blocks(dst[0..n], &blk_buf);
+    try std.testing.expectEqual(@as(usize, 1), blks.len);
+    try std.testing.expectEqual(@as(u8, 2), (dst[blks[0][0]] >> 1) & 3); // Block_Type compressed
+    const lit_at = blks[0][0] + 3;
+    try std.testing.expectEqualSlices(u8, &.{ 1 | (3 << 2) | ((5007 & 0xF) << 4), (5007 >> 4) & 0xFF, 5007 >> 12, 'x' }, dst[lit_at..][0..4]);
+}
+
+test "an RLE literals section header in each of its three sizes (RFC 8878 section 3.1.1.3.1.1)" {
+    // ZSTD_compressRleLiteralsBlock: 1 byte up to 31 literals, 2 up to
+    // 4095, 3 above; the bytes are the header, then the literal.
+    const Case = struct { n: usize, hdr: []const u8 };
+    const cases = [_]Case{
+        .{ .n = 31, .hdr = &.{1 | (31 << 3)} },
+        .{ .n = 32, .hdr = &.{ 1 | (1 << 2) | ((32 & 0xF) << 4), 32 >> 4 } },
+        .{ .n = 4095, .hdr = &.{ 1 | (1 << 2) | ((4095 & 0xF) << 4), 4095 >> 4 } },
+        .{ .n = 4096, .hdr = &.{ 1 | (3 << 2) | ((4096 & 0xF) << 4), (4096 >> 4) & 0xFF, 4096 >> 12 } },
+        .{ .n = 5007, .hdr = &.{ 1 | (3 << 2) | ((5007 & 0xF) << 4), (5007 >> 4) & 0xFF, 5007 >> 12 } },
+    };
+    const src = try gpa.alloc(u8, 5007);
+    defer gpa.free(src);
+    @memset(src, 'r');
+    for (cases) |k| {
+        errdefer std.debug.print("{d} literals\n", .{k.n});
+        var dst: [8]u8 = @splat(0xAA);
+        // less room than the header and the byte: refused, nothing written
+        for (0..k.hdr.len + 1) |room| {
+            try std.testing.expectError(error.DstSizeTooSmall, literals.rle(dst[0..room], src[0..k.n]));
+            try std.testing.expect(std.mem.allEqual(u8, &dst, 0xAA));
+        }
+        const n = try literals.rle(dst[0 .. k.hdr.len + 1], src[0..k.n]);
+        try std.testing.expectEqual(k.hdr.len + 1, n);
+        try std.testing.expectEqualSlices(u8, k.hdr, dst[0..k.hdr.len]);
+        try std.testing.expectEqual(@as(u8, 'r'), dst[k.hdr.len]);
+    }
 }
 
 // ---------------------------------------------------------- long lengths
@@ -95,6 +141,29 @@ fn roundTripLevels(src: []const u8, levels: []const i32) !void {
         errdefer std.debug.print("level {d}\n", .{level});
         const n = try c.compress(dst, src, .{ .level = level });
         try decodes(dst[0..n], src);
+    }
+}
+
+test "ZSTD_storeSeq marks a length long only above 0xFFFF (literals) or 0xFFFF + MINMATCH (matches)" {
+    // The match finders store through `storeOnly`; the round trips below
+    // seldom land on these exact lengths, so the edges are met here.
+    var seqs: [1]sequences.SeqDef = undefined;
+    var none: [0]u8 = .{};
+    var ss: sequences.SeqStore = .{ .seqs = &seqs, .lits = &none, .ll_code = &none, .ml_code = &none, .of_code = &none };
+    const Case = struct { ll: usize, ml: usize, want: sequences.LongLengthType };
+    const cases = [_]Case{
+        .{ .ll = 0xFFFF, .ml = 3, .want = .none },
+        .{ .ll = 0x10000, .ml = 3, .want = .literal_length },
+        .{ .ll = 0, .ml = 0xFFFF + 3, .want = .none },
+        .{ .ll = 0, .ml = 0xFFFF + 4, .want = .match_length },
+    };
+    for (cases) |k| {
+        errdefer std.debug.print("lit {d} match {d}\n", .{ k.ll, k.ml });
+        ss.reset();
+        ss.storeOnly(k.ll, 1, k.ml);
+        try std.testing.expectEqual(k.want, ss.long_length_type);
+        try std.testing.expectEqual(@as(u16, @truncate(k.ll)), seqs[0].lit_length);
+        try std.testing.expectEqual(@as(u16, @truncate(k.ml - sequences.min_match)), seqs[0].ml_base);
     }
 }
 
@@ -211,6 +280,87 @@ test "superblocks into a stable output buffer: at every room near a sub-block's 
                 };
             }
         }
+    }
+}
+
+/// `tools/gen-superblock-goldens.sh`'s input: 1024 bytes per letter of
+/// `layout` (T text, N noise of 64 high byte values, R random, W words; a count
+/// before a letter or a parenthesized group repeats it).
+fn superblockInput(layout: []const u8) ![]u8 {
+    var kinds: std.ArrayList(u8) = .empty;
+    defer kinds.deinit(gpa);
+    var i: usize = 0;
+    while (i < layout.len) {
+        var n: usize = 0;
+        while (std.ascii.isDigit(layout[i])) : (i += 1) n = n * 10 + (layout[i] - '0');
+        var unit: []const u8 = layout[i..][0..1];
+        if (layout[i] == '(') {
+            const end = std.mem.indexOfScalarPos(u8, layout, i, ')').?;
+            unit = layout[i + 1 .. end];
+            i = end + 1;
+        } else i += 1;
+        for (0..@max(n, 1)) |_| try kinds.appendSlice(gpa, unit);
+    }
+    const text = "the quick brown fox jumps over the lazy dog; ";
+    const words = [_][]const u8{ "zero ", "one ", "two ", "three ", "four ", "five ", "six ", "seven " };
+    const buf = try gpa.alloc(u8, kinds.items.len * 1024);
+    var x: u32 = 2463534242;
+    var pending: []const u8 = "";
+    for (buf, 0..) |*b, at| {
+        const kind = kinds.items[at / 1024];
+        if (kind == 'T') {
+            b.* = text[(7 * at + (at >> 3)) % 44];
+            continue;
+        }
+        if (kind != 'W' or pending.len == 0) {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+        }
+        switch (kind) {
+            'W' => {
+                if (pending.len == 0) pending = words[x & 7];
+                b.* = pending[0];
+                pending = pending[1..];
+            },
+            'N' => b.* = 0x80 | @as(u8, @truncate(x & 63)),
+            else => b.* = @truncate(x),
+        }
+    }
+    return buf;
+}
+
+test "superblock goldens: blocks without a sequence, sub-blocks, raw tails, literal sampling and block splits are libzstd's" {
+    // ZSTD_compressSuperBlock. With 1024-byte blocks the noise blocks have
+    // no sequence: dummy sequence statistics (predefined tables, no repeat
+    // of the old ones for the next block), one sub-block of literals and a
+    // sequences section of 0 (the recipe checks libzstd's frames hold
+    // such blocks). With whole blocks, mixes of text and noise are cut
+    // into several sub-blocks, and what the last cannot compress (random
+    // bytes) is stored raw. Two rows without targetCBlockSize ("-"):
+    // HUF_compress's sampling of the first and last 4 KiB of literals
+    // suspected incompressible, at 40 KiB and with only the first sample
+    // looking incompressible; and the block splitter
+    // (splitAfterSequences=1) over long literal runs and mixes.
+    var c: zstd.Compressor = .init(gpa);
+    defer c.deinit();
+    for (sb_goldens.rows) |g| {
+        errdefer std.debug.print("layout {s} level {d}\n", .{ g.layout, g.level });
+        const src = try superblockInput(g.layout);
+        defer gpa.free(src);
+        const dst = try gpa.alloc(u8, zstd.compressBound(src.len));
+        defer gpa.free(dst);
+        var adv: zstd.Advanced = .{};
+        var hint: ?u32 = null;
+        var it = std.mem.tokenizeScalar(u8, g.params, ',');
+        if (!std.mem.eql(u8, g.params, "-")) while (it.next()) |tok| try std.testing.expect(try param_test.applyParam(&adv, &hint, tok));
+        const n = try c.compress(dst, src, .{ .level = g.level, .advanced = adv });
+        try std.testing.expectEqual(g.len, n);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(dst[0..n], &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        try std.testing.expectEqualStrings(g.sha256, &hex);
+        try decodes(dst[0..n], src);
     }
 }
 
