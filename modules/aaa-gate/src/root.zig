@@ -92,7 +92,8 @@
 //!   when a trusted proxy fronts the server), else `X-Real-IP`, else the
 //!   socket peer IP (port excluded, IPv4-mapped IPv6 unified with plain
 //!   IPv4), else one shared fallback key. The store is bounded
-//!   (`throttle_max_keys`, LRU eviction). The clock is injected
+//!   (`throttle_max_keys`, LRU eviction); its hash is seeded per instance (`Options.io` /
+//!   `Options.throttle_seed`) so crafted keys cannot collide on purpose. The clock is injected
 //!   (`Options.clock`) so tests are deterministic; only the default
 //!   `.monotonic` clock ever touches the OS.
 //! - **Rotation.** The token set = `Options.token` ∪
@@ -511,6 +512,16 @@ pub const Options = struct {
     /// Throttle-key extraction override; null = the forwarded-IP chain
     /// (`ratelimit`'s trust rule, see the module doc).
     throttle_key: ?KeyFn = null,
+    /// Entropy source for the throttle map's per-instance hash seed (one
+    /// 64-bit `io.random` draw in `init`; no secrecy is needed, the seed
+    /// only has to be unpredictable to a peer). Null = a seed mixed from
+    /// the instance address (ASLR), a process-wide counter and the clock —
+    /// still different per instance, weaker against a peer that can read
+    /// addresses. Ignored when `throttle_seed` is set.
+    io: ?std.Io = null,
+    /// Fixed hash seed for the throttle map (reproducible tests, bench);
+    /// null = draw one as described at `io`.
+    throttle_seed: ?u64 = null,
 };
 
 // ── the gate ────────────────────────────────────────────────────────────────
@@ -569,6 +580,9 @@ pub const Gate = struct {
     /// SHA-256 digests of the valid API keys (never the keys themselves).
     api_keys: std.ArrayList([Sha256.digest_length]u8) = .empty,
     throttle: Throttle = .{},
+    /// Seed source for `drawSeed` when neither `io` nor `throttle_seed` is
+    /// given: distinct per call within one process.
+    var seed_counter: std.atomic.Value(u64) = .init(0);
 
     /// `init`'s errors: `OutOfMemory`, or `InvalidOptions` for an option that
     /// breaks its documented contract (see `init`).
@@ -649,7 +663,27 @@ pub const Gate = struct {
             .basics = basics,
             .tokens = tokens,
             .api_keys = api_keys,
+            .throttle = .{ .seed = options.throttle_seed orelse drawSeed(options.io, options.clock) },
         };
+    }
+
+    /// The throttle map's hash seed (Go maps / Rust `RandomState`: keys are
+    /// peer-influenced, so the hash must not be predictable). With an `io`
+    /// one `io.random` draw (a seed needs no `randomSecure` syscall cost or
+    /// failure channel); without, address + counter + clock folded through
+    /// Wyhash.
+    fn drawSeed(io: ?std.Io, clk: Clock) u64 {
+        var b: [8]u8 = undefined;
+        if (io) |i| {
+            i.random(&b);
+            return std.mem.readInt(u64, &b, .little);
+        }
+        const mix = [3]u64{
+            @intFromPtr(&seed_counter),
+            seed_counter.fetchAdd(1, .monotonic),
+            clk.now(),
+        };
+        return std.hash.Wyhash.hash(0x9e3779b97f4a7c15, std.mem.asBytes(&mix));
     }
 
     pub fn deinit(g: *Gate) void {
@@ -1058,10 +1092,27 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 /// Per-key coalescing state (keyed + bounded).
 /// Guarded by the Gate's lock — no locking of its own.
 const Throttle = struct {
-    /// Keyed by `Entry.key` (gpa-owned copies).
-    map: std.StringHashMapUnmanaged(*Entry) = .empty,
+    /// Keyed by `Entry.key` (gpa-owned copies), hashed with `seed`.
+    map: std.HashMapUnmanaged([]const u8, *Entry, SeededContext, std.hash_map.default_max_load_percentage) = .empty,
+    /// Per-instance hash seed (see `Gate.drawSeed`); 0 only in direct tests.
+    seed: u64 = 0,
     /// Front = most recently seen; evictions pop the back.
     lru: std.DoublyLinkedList = .{},
+
+    /// `std.hash_map.StringContext` with a seed: Wyhash keyed per instance.
+    const SeededContext = struct {
+        seed: u64,
+        pub fn hash(c: @This(), k: []const u8) u64 {
+            return std.hash.Wyhash.hash(c.seed, k);
+        }
+        pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+    };
+
+    fn ctx(t: *const Throttle) SeededContext {
+        return .{ .seed = t.seed };
+    }
 
     const Entry = struct {
         node: std.DoublyLinkedList.Node = .{},
@@ -1085,7 +1136,7 @@ const Throttle = struct {
     /// See `Gate.deniedDecision`. `now_ns` non-decreasing (a backwards
     /// step counts as no time passing — suppresses, never underflows).
     fn decide(t: *Throttle, gpa: Allocator, key: []const u8, now_ns: u64, window_ns: u64, max_keys: usize) ?u64 {
-        if (t.map.get(key)) |e| {
+        if (t.map.getContext(key, t.ctx())) |e| {
             t.lru.remove(&e.node);
             t.lru.prepend(&e.node);
             if (window_ns != 0 and now_ns -| e.last_ns < window_ns) {
@@ -1142,12 +1193,12 @@ const Throttle = struct {
         errdefer gpa.destroy(e);
         e.* = .{ .key = try gpa.dupe(u8, key), .last_ns = now_ns, .suppressed = 0 };
         errdefer gpa.free(e.key);
-        try t.map.put(gpa, e.key, e);
+        try t.map.putContext(gpa, e.key, e, t.ctx());
         t.lru.prepend(&e.node);
     }
 
     fn removeEntry(t: *Throttle, gpa: Allocator, e: *Entry) void {
-        const removed = t.map.remove(e.key);
+        const removed = t.map.removeContext(e.key, t.ctx());
         std.debug.assert(removed);
         t.lru.remove(&e.node);
         gpa.free(e.key);
@@ -1954,6 +2005,60 @@ test "throttle: fail-open when the allocator is exhausted (audit not silenced)" 
     g.throttle.deinit(testing.allocator);
     g.tokens.deinit(testing.allocator);
     g.api_keys.deinit(testing.allocator);
+}
+
+test "throttle: the map hash is seeded per instance (fixed seed, io draw, and the io-less fallback)" {
+    var tc: TestClock = .{};
+    const k = "203.0.113.7";
+    // A fixed seed is reproducible; different seeds hash one key differently.
+    var a = try Gate.init(testing.allocator, .{ .token = "t", .throttle_seed = 1, .clock = tc.clock() });
+    defer a.deinit();
+    var b = try Gate.init(testing.allocator, .{ .token = "t", .throttle_seed = 1, .clock = tc.clock() });
+    defer b.deinit();
+    var c = try Gate.init(testing.allocator, .{ .token = "t", .throttle_seed = 2, .clock = tc.clock() });
+    defer c.deinit();
+    try testing.expectEqual(a.throttle.ctx().hash(k), b.throttle.ctx().hash(k));
+    try testing.expect(a.throttle.ctx().hash(k) != c.throttle.ctx().hash(k));
+    // The fixed seed wins over an `io`.
+    var th: std.Io.Threaded = .init_single_threaded;
+    var d = try Gate.init(testing.allocator, .{ .token = "t", .throttle_seed = 1, .io = th.io(), .clock = tc.clock() });
+    defer d.deinit();
+    try testing.expectEqual(@as(u64, 1), d.throttle.seed);
+    // Unseeded instances differ from one another, with and without an `io`
+    // (a 64-bit collision here is 2^-64 per pair).
+    var seeds: [4]u64 = undefined;
+    for (&seeds, 0..) |*sd, i| {
+        var g = try Gate.init(testing.allocator, .{ .token = "t", .io = if (i < 2) th.io() else null, .clock = tc.clock() });
+        defer g.deinit();
+        sd.* = g.throttle.seed;
+    }
+    for (seeds, 0..) |x, i| for (seeds[i + 1 ..]) |y| try testing.expect(x != y);
+}
+
+test "throttle: behaves the same under any seed (coalesce, fold, LRU cap)" {
+    for ([_]u64{ 0, 1, 0xdeadbeefcafef00d }) |seed_v| {
+        var tc: TestClock = .{};
+        var g = try Gate.init(testing.allocator, .{
+            .token = "t",
+            .throttle_seed = seed_v,
+            .throttle_window_ms = 1_000,
+            .throttle_max_keys = 2,
+            .clock = tc.clock(),
+        });
+        defer g.deinit();
+        try testing.expectEqual(@as(?u64, 0), g.deniedDecision("a"));
+        try testing.expectEqual(@as(?u64, null), g.deniedDecision("a"));
+        try testing.expectEqual(@as(?u64, null), g.deniedDecision("a"));
+        try testing.expectEqual(@as(?u64, 0), g.deniedDecision("b"));
+        try testing.expectEqual(@as(usize, 2), g.throttleKeyCount());
+        // "c" evicts the least recently seen key ("b" after the touch of "a").
+        try testing.expectEqual(@as(?u64, null), g.deniedDecision("a"));
+        try testing.expectEqual(@as(?u64, 0), g.deniedDecision("c"));
+        try testing.expectEqual(@as(usize, 2), g.throttleKeyCount());
+        // "a" survived with its pending count folded into the next window.
+        tc.advanceMs(1_000);
+        try testing.expectEqual(@as(?u64, 3), g.deniedDecision("a"));
+    }
 }
 
 // ── tests: API-key scheme (pure pieces) ─────────────────────────────────────

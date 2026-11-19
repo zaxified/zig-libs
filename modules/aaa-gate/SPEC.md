@@ -186,7 +186,7 @@ alg-confusion resistance, and JWKS-smuggling/rotation handling all confirmed cle
 amplification issue (HIGH) found in the pass was fixed.
 
 - **`identityOf` trusts `ctx.data`** *(sweep 2026-10-29, AAA-3, LOW c2)* — the cast assumes the slot holds this module's `Identity`; a different middleware storing another type there makes it UB. Cannot be made total without a tag in `router.Ctx` (public change); documented contract for now.
-- **Throttle map hash is unseeded** *(review R2-6, 2026-10-29)* — `std.StringHashMapUnmanaged` with the default hash; keys are peer-influenced (X-Forwarded-For, clamped to 48 bytes), so collisions can be crafted, but the store is capped by `throttle_max_keys` (default 1024), so the worst case is bounded linear probing under the gate's spinlock. A seeded hash would remove it; not done.
+- **Throttle map hash is unseeded** *(review R2-6, 2026-10-29)* — ✅ DONE 2026-11-19: the map hashes with Wyhash keyed by a per-instance 64-bit seed (`Options.io` draw via `io.random`; without an `io`, instance address + process counter + clock folded through Wyhash; `Options.throttle_seed` pins one). Same design as Go's per-map hash seed and Rust's `RandomState` (SipHash with random keys): hash-flooding resistance by an unpredictable per-table key; `throttle_max_keys` stays the memory cap. Behaviour is otherwise unchanged.
 - ~~HTTP Basic scheme~~ — done 2026-10-17 (`AuthMode.basic`/`.any`).
 - ~~Cookie / multi-source key lookup~~ — done 2026-10-17 (`Options.api_key_sources`).
 - **Form-field key lookup** *(DN, 2026-10-17)* — echo's `form:` source. Needs a rewindable / buffered request body in `http`; revisit if `Request` grows one.
