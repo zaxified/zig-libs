@@ -116,6 +116,8 @@ malformed or expert-error indications, and every field matched our decoder: tran
 expected places, register values (0x1000–0x1003, 0x2004/6/8, 0xBEEF, 0xAAAA/0x5555), coil bits, the
 FC 07 status byte 0x5A, and the FC 11 Report Slave ID payload.
 
+**Delta mutation, 2026-11-19 (new code only).** The code added for FC 0x16, FC 0x2B/0x0E and `RtuStream` was mutated with mutant schemata (ReleaseSafe, one build, one run per mutant, baseline first): 120 mutants, 117 killed (114 by a failing test or panic, 3 by hang), 3 survivors, all argued equivalent. `RtuStream.next`'s full-buffer `.more` guard cannot be reached: every size `expectedLen` returns or waits for is at most the buffer size, so `.more` never coexists with a full buffer. A `.more` instead of the decision at two bytes seen (`b.len < 2` widened to 3) or four bytes seen (FC 0x18 response) only delays the same decision by one byte: no frame, byte count or order differs once the frame is complete. Two mutants led to new tests (`RtuStream` state after a handed-out frame, `feed` taking exactly the free room, file-record sizing by the byte count), and one redundant clause was removed from the handler. This module's card still carries `mutation none`, so these counts are not a whole-module score and the card is left as it was; a whole-module mutation run is the open item.
+
 Run: `zig build test-modbus` (and `-Doptimize=ReleaseFast`).
 
 ## Backlog / deferred

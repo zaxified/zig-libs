@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** docs only: SPEC records the delta mutation run over the FC 0x16 / FC 0x2B/0x0E / `RtuStream` code (120 mutants, 117 killed, 3 argued equivalent).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only (`RtuStream` reuse across feeds, `feed` taking exactly the free room, file-record sizing by byte count); one redundant length clause removed from the individual-access branch of the device-identification handler (the 244-byte PDU limit already covers it).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only (device identification category edges, zero-length objects, page-break rules, 256-byte `RtuStream` frames, reset behaviour), added from the delta mutation run over the three new items.
 - **2026-11-19** — New `RtuStream`: RTU-over-TCP stream reassembly over the `rtu` codec (`feed` / `next` / `reset`, role request or response, fixed buffer, resync on garbage or a bad CRC by dropping one byte). Additive; nothing existing changes. Tests: every function code in both roles split at every byte, several frames per read, leading garbage and a corrupted frame, bounded buffer.
