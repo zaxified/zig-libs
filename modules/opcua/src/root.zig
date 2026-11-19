@@ -218,9 +218,18 @@ pub const SecureChannel = struct {
     /// reads the next chunk as its own answer).
     ///
     /// `now_ms` is the caller's clock reading (see `renewalDue`). On error
-    /// the channel keeps its old token and keys; a `Bad` answer leaves the
-    /// old token valid for what remains of its lifetime, so the caller may
-    /// retry. `renewIfDue` is the usual entry point.
+    /// the channel keeps its old token and keys, but that does not make a
+    /// retry free of risk. When the server answered `Bad` (it refused the
+    /// renewal) the old token is untouched and the caller may retry. When the
+    /// client refused a well-formed answer (another channel id, a bad nonce
+    /// length, a zero lifetime, a transport or signature failure after the
+    /// server had processed the request) the server has already rotated to the
+    /// new token: the old one is accepted only for the server's overlap window
+    /// (`token_renewal_overlap_ms`, capped at its own expiry) and symmetric
+    /// messages sent after that fail. Only the retried OPN itself, which is
+    /// asymmetric and token-independent, is certain to work; treat a refused
+    /// renewal as "renew again at once, or give up the channel". `renewIfDue`
+    /// is the usual entry point.
     pub fn renew(ch: *SecureChannel, now_ms: i64, options: RenewOptions) services.ServiceError!void {
         return burn.run(burn.open_burn, services.ServiceError!void, renewBody, .{ ch, now_ms, options });
     }
@@ -279,6 +288,9 @@ pub const SecureChannel = struct {
             services.result_fns.open_secure_channel,
         );
         defer services.freeOpenSecureChannelResponse(allocator, response);
+        // The server nonce is key material: wiped on every way out, before the
+        // free above releases it (defers run last-in first-out).
+        defer if (response.server_nonce) |n| std.crypto.secureZero(u8, @constCast(n));
 
         // A token that is born expired is unusable and would make the channel
         // unrenewable (`renewalDue` is never true without a lifetime).
@@ -291,9 +303,6 @@ pub const SecureChannel = struct {
             const server_nonce = response.server_nonce orelse return error.InvalidSecureMessage;
             if (server_nonce.len == 0) return error.InvalidSecureMessage;
             derived = security.deriveKeys(&client_nonce, server_nonce, ch.io.security.?.policy);
-            // The server nonce is key material too — wipe the decoded copy
-            // before the deferred free above releases it.
-            std.crypto.secureZero(u8, @constCast(server_nonce));
         }
 
         ch.io.channel_id = response.security_token.channel_id;
