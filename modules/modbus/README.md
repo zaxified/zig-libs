@@ -15,7 +15,7 @@ owned arrays into a simulated field device fleet.
     0x01 Read Coils, 0x02 Read Discrete Inputs, 0x03 Read Holding Registers,
     0x04 Read Input Registers, 0x05 Write Single Coil, 0x06 Write Single
     Register, 0x0F Write Multiple Coils, 0x10 Write Multiple Registers,
-    0x17 Read/Write Multiple Registers. Spec quantity limits (2000 bits /
+    0x16 Mask Write Register, 0x17 Read/Write Multiple Registers. Spec quantity limits (2000 bits /
     125 registers read, 1968 bits / 123 registers write, 125/121 for FC 17)
     are typed errors; exception responses (function | 0x80, codes 1–11) map
     to a typed error set. Registers big-endian; coil bits LSB-first.
@@ -33,7 +33,8 @@ owned arrays into a simulated field device fleet.
     rather than a silent wrap. Answers every function code the client speaks
     plus 0x07 Read Exception Status, 0x08 Diagnostics (return-query-data,
     restart, listen-only, clear-counters and the five serial-line counters)
-    and 0x11 Report Slave ID. Spec-correct exception responses
+    0x11 Report Slave ID and 0x16 Mask Write Register (`Config.mask_write_register`,
+    on by default). Spec-correct exception responses
     (`IllegalFunction` / `IllegalDataAddress` / `IllegalDataValue` /
     `ServerDeviceFailure`, function code with the high bit set), including
     the quantity limits — an over-large read is `IllegalDataValue`, not a
@@ -124,8 +125,8 @@ Honest list of what this module does **not** do:
   TCP cover every consumer we have.
 - **FC 0x2B/0x0E Read Device Identification** — answered `IllegalFunction`;
   the captured pymodbus session shows exactly that.
-- **FC 0x14/0x15 file records, 0x16 mask-write, 0x18 read FIFO** — not
-  implemented on either side.
+- **FC 0x14/0x15 file records, 0x18 read FIFO** — not implemented on
+  either side.
 - **Modbus Security / TLS** — transport security is entirely the caller's;
   this module never touches a socket except in the optional `TcpTransport`.
 - **Serial timing** — the RTU t1.5/t3.5 inter-character and inter-frame

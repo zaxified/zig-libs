@@ -9,7 +9,7 @@
 //!   0x02 Read Discrete Inputs, 0x03 Read Holding Registers, 0x04 Read Input
 //!   Registers, 0x05 Write Single Coil, 0x06 Write Single Register,
 //!   0x0F Write Multiple Coils, 0x10 Write Multiple Registers,
-//!   0x17 Read/Write Multiple Registers. Spec quantity limits are enforced
+//!   0x16 Mask Write Register, 0x17 Read/Write Multiple Registers. Spec quantity limits are enforced
 //!   as typed errors; exception responses (function | 0x80) map to a typed
 //!   error set. Registers are big-endian 16-bit; coil bits pack LSB-first.
 //! - **ADU framing**: `tcp` (MBAP header — transaction id, protocol id 0,
@@ -92,8 +92,8 @@ pub const limits = struct {
 
 /// Public function codes implemented by this module.
 ///
-/// The first nine are the data-access codes both the `Client` (master) and
-/// the `Server` (slave) speak. The last three are server-side only: the
+/// The data-access codes and FC 0x16 Mask Write Register are spoken by both
+/// the `Client` (master) and the `Server` (slave). Three are server-side only: the
 /// `Server` answers them, the `Client` has no encoder for them (a master that
 /// wants them can build the 1-3 byte PDU by hand and use `Client`'s framing).
 pub const FunctionCode = enum(u8) {
@@ -108,6 +108,7 @@ pub const FunctionCode = enum(u8) {
     report_slave_id = 0x11,
     write_multiple_coils = 0x0F,
     write_multiple_registers = 0x10,
+    mask_write_register = 0x16,
     read_write_multiple_registers = 0x17,
 };
 
@@ -357,6 +358,37 @@ pub const pdu = struct {
         buf[9] = @intCast(2 * write_values.len);
         for (write_values, 0..) |v, i| std.mem.writeInt(u16, buf[10 + 2 * i ..][0..2], v, .big);
         return buf[0..total];
+    }
+
+    /// FC 0x16 request: reference address, AND mask, OR mask (application
+    /// spec V1.1b3 section 6.16).
+    pub fn encodeMaskWriteRegister(buf: []u8, addr: u16, and_mask: u16, or_mask: u16) EncodeError![]u8 {
+        if (buf.len < 7) return error.BufferTooSmall;
+        buf[0] = @backingInt(FunctionCode.mask_write_register);
+        std.mem.writeInt(u16, buf[1..3], addr, .big);
+        std.mem.writeInt(u16, buf[3..5], and_mask, .big);
+        std.mem.writeInt(u16, buf[5..7], or_mask, .big);
+        return buf[0..7];
+    }
+
+    /// The FC 0x16 formula, section 6.16:
+    /// `(current AND and_mask) OR (or_mask AND (NOT and_mask))`.
+    pub fn applyMask(current: u16, and_mask: u16, or_mask: u16) u16 {
+        return (current & and_mask) | (or_mask & ~and_mask);
+    }
+
+    /// FC 0x16 response: exact echo of address, AND mask and OR mask.
+    pub fn parseMaskWriteResponse(
+        resp: []const u8,
+        addr: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) (ParseError || ExceptionError)!void {
+        const payload = try checkFunction(resp, .mask_write_register);
+        if (payload.len != 6) return error.MalformedResponse;
+        if (std.mem.readInt(u16, payload[0..2], .big) != addr) return error.MalformedResponse;
+        if (std.mem.readInt(u16, payload[2..4], .big) != and_mask) return error.MalformedResponse;
+        if (std.mem.readInt(u16, payload[4..6], .big) != or_mask) return error.MalformedResponse;
     }
 
     /// Validate the reply function code against the request. Returns the
@@ -623,6 +655,16 @@ pub const Client = struct {
         var reply_buf: [tcp.max_adu_len]u8 = undefined;
         const resp = try c.exchangePdu(unit, req, &reply_buf);
         try pdu.parseReadRegistersResponse(resp, .read_write_multiple_registers, out);
+    }
+
+    /// FC 0x16: set the holding register at `addr` to
+    /// `(current AND and_mask) OR (or_mask AND NOT and_mask)` (`pdu.applyMask`).
+    pub fn maskWriteRegister(c: *Client, unit: u8, addr: u16, and_mask: u16, or_mask: u16) Error!void {
+        var req_buf: [7]u8 = undefined;
+        const req = try pdu.encodeMaskWriteRegister(&req_buf, addr, and_mask, or_mask);
+        var reply_buf: [tcp.max_adu_len]u8 = undefined;
+        const resp = try c.exchangePdu(unit, req, &reply_buf);
+        try pdu.parseMaskWriteResponse(resp, addr, and_mask, or_mask);
     }
 
     fn readBits(c: *Client, fc: FunctionCode, unit: u8, addr: u16, out: []bool) Error!void {
@@ -1693,4 +1735,49 @@ test "fuzz harness: fuzzDecodeAdu, 400 seeds, reaches every outcome" {
 test "meta is well-formed" {
     try testing.expectEqual(.any, meta.platform);
     try testing.expectEqual(.both, meta.role);
+}
+
+// ── tests: FC 0x16 mask write ───────────────────────────────────────────────
+
+test "spec KAT: FC 0x16 mask write register 4, AND 0x00F2, OR 0x0025" {
+    // Application spec V1.1b3 section 6.16 worked example: the register
+    // holds 0x0012, the result is 0x0017; the response echoes the request.
+    var buf: [7]u8 = undefined;
+    const req = try pdu.encodeMaskWriteRegister(&buf, 4, 0x00F2, 0x0025);
+    try testing.expectEqualSlices(u8, &.{ 0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25 }, req);
+    try testing.expectEqual(@as(u16, 0x0017), pdu.applyMask(0x0012, 0x00F2, 0x0025));
+    try pdu.parseMaskWriteResponse(req, 4, 0x00F2, 0x0025);
+    // Degenerate masks: AND 0xFFFF keeps, AND 0x0000 loads the OR value.
+    try testing.expectEqual(@as(u16, 0x1234), pdu.applyMask(0x1234, 0xFFFF, 0xABCD));
+    try testing.expectEqual(@as(u16, 0xABCD), pdu.applyMask(0x1234, 0x0000, 0xABCD));
+    try testing.expectError(error.BufferTooSmall, pdu.encodeMaskWriteRegister(buf[0..6], 4, 1, 2));
+}
+
+test "FC 0x16 response parsing: echo mismatch, length, exception" {
+    const good = [_]u8{ 0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25 };
+    try testing.expectError(error.MalformedResponse, pdu.parseMaskWriteResponse(&good, 5, 0x00F2, 0x0025));
+    try testing.expectError(error.MalformedResponse, pdu.parseMaskWriteResponse(&good, 4, 0x00F3, 0x0025));
+    try testing.expectError(error.MalformedResponse, pdu.parseMaskWriteResponse(&good, 4, 0x00F2, 0x0026));
+    try testing.expectError(error.MalformedResponse, pdu.parseMaskWriteResponse(good[0..6], 4, 0x00F2, 0x0025));
+    try testing.expectError(error.IllegalDataAddress, pdu.parseMaskWriteResponse(&.{ 0x96, 0x02 }, 4, 1, 2));
+    try testing.expectError(error.FunctionMismatch, pdu.parseMaskWriteResponse(&.{ 0x06, 0, 0, 0, 0, 0, 0 }, 0, 0, 0));
+    try testing.expectError(error.ShortFrame, pdu.parseMaskWriteResponse(&.{}, 0, 0, 0));
+}
+
+test "client RTU round trip: mask write register" {
+    var reply_buf: [rtu.max_adu_len]u8 = undefined;
+    var mock = MockTransport{
+        .reply = try rtu.encodeAdu(&reply_buf, 0x11, &.{ 0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25 }),
+    };
+    var client = Client.init(.rtu, mock.transport());
+    try client.maskWriteRegister(0x11, 4, 0x00F2, 0x0025);
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25 },
+        (try rtu.decodeAdu(mock.gotBytes())).pdu,
+    );
+    var reply_buf2: [rtu.max_adu_len]u8 = undefined;
+    var mock2 = MockTransport{ .reply = try rtu.encodeAdu(&reply_buf2, 0x11, &.{ 0x96, 0x02 }) };
+    var client2 = Client.init(.rtu, mock2.transport());
+    try testing.expectError(error.IllegalDataAddress, client2.maskWriteRegister(0x11, 4, 1, 2));
 }

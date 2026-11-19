@@ -174,6 +174,11 @@ pub const Config = struct {
 
     /// FC 0x17 Read/Write Multiple Registers.
     read_write_registers: bool = true,
+
+    /// FC 0x16 Mask Write Register. Behaviour change 2026-11-19: it used to
+    /// be unimplemented (`IllegalFunction`); libmodbus and pymodbus both
+    /// serve it. Set false to restore the old answer.
+    mask_write_register: bool = true,
 };
 
 /// The serial-line diagnostic counters (application spec §6.8 sub-functions
@@ -379,6 +384,7 @@ pub const Server = struct {
             @backingInt(FunctionCode.write_multiple_coils) => self.doWriteMultipleCoils(body, out),
             @backingInt(FunctionCode.write_multiple_registers) => self.doWriteMultipleRegisters(body, out),
             @backingInt(FunctionCode.read_write_multiple_registers) => self.doReadWriteRegisters(body, out),
+            @backingInt(FunctionCode.mask_write_register) => self.doMaskWrite(body, out),
             @backingInt(FunctionCode.read_exception_status) => self.doReadExceptionStatus(body, out),
             @backingInt(FunctionCode.diagnostics) => self.doDiagnostics(body, out),
             @backingInt(FunctionCode.report_slave_id) => self.doReportSlaveId(body, out),
@@ -600,6 +606,26 @@ pub const Server = struct {
             std.mem.writeInt(u16, out[2 + 2 * i ..][0..2], self.db.holding_registers.values[read_start + i], .big);
         }
         self.reply_len = 2 + 2 * @as(usize, read_quantity);
+        return null;
+    }
+
+    // ── FC 0x16 ─────────────────────────────────────────────────────────────
+
+    fn doMaskWrite(self: *Server, body: []const u8, out: []u8) ?ExceptionCode {
+        if (!self.config.mask_write_register) return .illegal_function;
+        if (body.len != 6) return .illegal_data_value;
+        const addr = std.mem.readInt(u16, body[0..2], .big);
+        const and_mask = std.mem.readInt(u16, body[2..4], .big);
+        const or_mask = std.mem.readInt(u16, body[4..6], .big);
+        const idx = self.db.holding_registers.index(addr) orelse return .illegal_data_address;
+        const cur = self.db.holding_registers.values[idx];
+        self.db.holding_registers.values[idx] = mb.pdu.applyMask(cur, and_mask, or_mask);
+        if (self.hook) |h| h.notify(.{ .area = .holding_registers, .addr = addr, .count = 1 });
+
+        // The response is an exact echo of the request.
+        out[0] = @backingInt(FunctionCode.mask_write_register);
+        @memcpy(out[1..7], body[0..6]);
+        self.reply_len = 7;
         return null;
     }
 
@@ -1071,7 +1097,7 @@ test "hostile: an empty PDU and unknown function codes are IllegalFunction" {
     var out: [mb.max_pdu_len]u8 = undefined;
 
     try expectException(try server.handlePdu(&.{}, &out), 0x00, .illegal_function);
-    for ([_]u8{ 0x00, 0x09, 0x0B, 0x0C, 0x14, 0x15, 0x16, 0x18, 0x2B, 0x7F, 0x80, 0xFF }) |fc| {
+    for ([_]u8{ 0x00, 0x09, 0x0B, 0x0C, 0x14, 0x15, 0x18, 0x2B, 0x7F, 0x80, 0xFF }) |fc| {
         const reply = try server.handlePdu(&.{ fc, 0x00, 0x00 }, &out);
         try expectException(reply, fc, .illegal_function);
     }
@@ -1785,3 +1811,104 @@ test "FC 0x17: byte count and both address windows are checked, and nothing is w
     // leave the image alone — check it did.
     for (fix.holdings) |v| try testing.expectEqual(@as(u16, 0), v);
 }
+
+// ── FC 0x16 mask write ──────────────────────────────────────────────────────
+
+test "FC 0x16: the spec example, applied to a register, echoed" {
+    var fix = Fixture{};
+    fix.holdings[4] = 0x0012;
+    var server = fix.server(.tcp);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    const req = [_]u8{ 0x16, 0x00, 104, 0x00, 0xF2, 0x00, 0x25 };
+    const reply = try server.handlePdu(&req, &out);
+    try testing.expectEqualSlices(u8, &req, reply);
+    try testing.expectEqual(@as(u16, 0x0017), fix.holdings[4]);
+    // Neighbours are untouched.
+    try testing.expectEqual(@as(u16, 0), fix.holdings[3]);
+    try testing.expectEqual(@as(u16, 0), fix.holdings[5]);
+}
+
+test "FC 0x16: window edges, wrong lengths, and the config switch" {
+    var fix = Fixture{};
+    var server = fix.server(.tcp);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    // First and last register of the window (100..115) work.
+    _ = try server.handlePdu(&.{ 0x16, 0x00, 100, 0x00, 0x00, 0xAB, 0xCD }, &out);
+    _ = try server.handlePdu(&.{ 0x16, 0x00, 115, 0x00, 0x00, 0x12, 0x34 }, &out);
+    try testing.expectEqual(@as(u16, 0xABCD), fix.holdings[0]);
+    try testing.expectEqual(@as(u16, 0x1234), fix.holdings[15]);
+    // One below and one above the window.
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 99, 0, 0, 0, 1 }, &out), 0x16, .illegal_data_address);
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 116, 0, 0, 0, 1 }, &out), 0x16, .illegal_data_address);
+    // Wrong lengths: one byte short, one byte long, none.
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 100, 0, 0, 0 }, &out), 0x16, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 100, 0, 0, 0, 1, 0 }, &out), 0x16, .illegal_data_value);
+    try expectException(try server.handlePdu(&.{0x16}, &out), 0x16, .illegal_data_value);
+    // Nothing was written by the failures.
+    try testing.expectEqual(@as(u16, 0xABCD), fix.holdings[0]);
+
+    server.config.mask_write_register = false;
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 100, 0, 0, 0, 1 }, &out), 0x16, .illegal_function);
+}
+
+test "FC 0x16: the write hook fires once with the register address" {
+    const Probe = struct {
+        n: u32 = 0,
+        last: WriteEvent = undefined,
+        fn on(ctx: *anyopaque, ev: WriteEvent) void {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            p.n += 1;
+            p.last = ev;
+        }
+    };
+    var probe = Probe{};
+    var fix = Fixture{};
+    var server = fix.server(.tcp);
+    server.setWriteHook(.{ .ctx = &probe, .onWriteFn = Probe.on });
+    var out: [mb.max_pdu_len]u8 = undefined;
+    _ = try server.handlePdu(&.{ 0x16, 0x00, 107, 0xFF, 0x00, 0x00, 0x05 }, &out);
+    try testing.expectEqual(@as(u32, 1), probe.n);
+    try testing.expectEqual(Area.holding_registers, probe.last.area);
+    try testing.expectEqual(@as(u16, 107), probe.last.addr);
+    try testing.expectEqual(@as(u16, 1), probe.last.count);
+    try expectException(try server.handlePdu(&.{ 0x16, 0x00, 7, 0, 0, 0, 1 }, &out), 0x16, .illegal_data_address);
+    try testing.expectEqual(@as(u32, 1), probe.n);
+}
+
+test "FC 0x16 end to end: Client over RTU against Server, broadcast is silent but applied" {
+    var fix = Fixture{};
+    fix.holdings[2] = 0x00F0;
+    var server = fix.server(.rtu);
+    var lb = Loopback{ .server = &server };
+    var client = mb.Client.init(.rtu, lb.transport());
+    try client.maskWriteRegister(5, 102, 0xFF00, 0x000A);
+    try testing.expectEqual(@as(u16, 0x000A), fix.holdings[2]);
+    try testing.expectError(error.IllegalDataAddress, client.maskWriteRegister(5, 500, 0, 0));
+
+    // Broadcast (address 0): applied, no reply.
+    var adu: [mb.rtu.max_adu_len]u8 = undefined;
+    var out: [mb.tcp.max_adu_len]u8 = undefined;
+    const b = try mb.rtu.encodeAdu(&adu, 0, &.{ 0x16, 0x00, 102, 0x00, 0x00, 0x12, 0x34 });
+    try testing.expectEqual(@as(?[]u8, null), try server.handleAdu(b, &out));
+    try testing.expectEqual(@as(u16, 0x1234), fix.holdings[2]);
+}
+
+/// Client <-> Server in-process: the transport hands each request ADU to
+/// `Server.handleAdu`. No reply (silence) is a `Timeout`.
+const Loopback = struct {
+    server: *Server,
+
+    fn transport(l: *Loopback) mb.Transport {
+        return .{ .ctx = l, .exchangeFn = exchangeFn };
+    }
+
+    fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) mb.TransportError!usize {
+        const l: *Loopback = @ptrCast(@alignCast(ctx));
+        var out: [mb.tcp.max_adu_len]u8 = undefined;
+        const reply = (l.server.handleAdu(request, &out) catch return error.TransportFailed) orelse
+            return error.Timeout;
+        if (reply.len > reply_buf.len) return error.TransportFailed;
+        @memcpy(reply_buf[0..reply.len], reply);
+        return reply.len;
+    }
+};
