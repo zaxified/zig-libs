@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — alexedwards/scs v2.9.0 (with its memstore), the reference, has no cross-request guard: a request that loaded the session before a concurrent request logged it out (`Destroy`) or rotated it (`RenewToken`) re-commits it under the OLD token when it finishes (`LoadAndSave` commits every `Modified` session, `Load` marks every loaded session `Modified` once `IdleTimeout > 0`, `Commit` and `MemStore.Commit` are blind writes), so the logged-out or rotated-away cookie works again — with an idle timeout even after a read-only request (`tools/lead_probe`, 4 of 4 interleavings resurrect; the no-idle read-only control does not); here every save is a generation compare-and-swap and both are refused (tests "cross-request race: a stale save cannot resurrect a session destroyed by a concurrent request", "cross-request race: a logout after the live record was EVICTED still wins over a stale save", "cross-request race: a stale save cannot resurrect a session rotated by a concurrent regenerate") (measured 2026-10-24)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (484/528, 44 eq) · src 494749252606ed4b
+**Audit:** review 2026-11-12 · mutation 2026-11-19 (494/538, 44 eq) · src 3e6ed1f7b6a8378f
 
 Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
 
@@ -353,7 +353,7 @@ bump (the stale `persist` would succeed); `hash_id_in_store…RamcacheStore` if 
 
 ## Backlog / deferred
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed):** `Csrf.issue` drops its cookie silently on options `SetCookie.bufPrint` refuses, as `Manager` did before `init` checked them (Csrf has no init to check in); a stored record whose `created`/`last_seen` lies in the future never expires (only an attacker-writable store); `KvStore.iterate` lists every key in memory.
+- **No-panic sweep 2026-10-28 (LOW, not fixed):** ~~`Csrf.issue` drops its cookie silently on options `SetCookie.bufPrint` refuses~~ **DONE 2026-11-19**: `Csrf.validate()` is the startup check (Csrf has no `init`; `issue` stays best-effort and fails closed); ~~a stored record whose `created`/`last_seen` lies in the future never expires~~ **DONE 2026-11-19**: `decode` reads a future `created` as now (min with the clock), and the next save writes that back, so the absolute timeout runs from there; a future `last_seen` was already harmless (never past the idle window, restamped by the save). Chosen over "expire it" because a clock stepped back (NTP, documented at `Clock.realtime`) would otherwise log everybody out; scs/Django store a deadline, which a future-dated record defeats the same way, so there is no reference behaviour to follow and the safe, non-breaking clamp is used. `CookieManager` is unchanged: its timestamps are sealed by the server itself; `KvStore.iterate` lists every key in memory — **LARGE, left**: `kv` has only `keys`/`iterator`, both snapshot every key; a paged or streaming key scan is a `kv` change (outside this module).
 
 - **ct, not measured (2026-10-09 ct review):** a session is looked up by its secret id through the
   store (`m.store.get`, `root.zig` ~703 → ramcache `getImpl` / kv `KvStore.key`): hashing and

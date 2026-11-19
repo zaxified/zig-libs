@@ -175,6 +175,8 @@ never `std.mem.eql`). `Csrf.middleware` guards the unsafe methods
 `X-CSRF-Token` header, or a query-parameter fallback) matching its session id,
 else **403**; safe methods pass and receive a fresh JS-readable token cookie.
 
+`Csrf` has no `init`: call `csrf.validate()` once at startup. It returns `error.InvalidCookieOptions` for a token-cookie name or `SameSite=None` without `Secure` that could never be written (otherwise every token cookie is silently dropped and every guarded request is refused).
+
 Body form-field extraction is deliberately *not* done in the middleware: the
 handler owns the streamed request body, so a middleware that drained it to find
 a `csrf_token` field would steal it. An app that renders a classic hidden form
