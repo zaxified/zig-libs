@@ -184,8 +184,9 @@ pub const Config = struct {
     /// order (ids unique; the first match of an id wins). Empty means the
     /// function is not implemented and requests are answered
     /// `IllegalFunction`. Values must fit one response (at most 244 bytes);
-    /// an object that cannot is answered `ServerDeviceFailure`. The
-    /// conformity level is derived from the table (see `device_id`).
+    /// an object that cannot is answered `ServerDeviceFailure`. An object
+    /// with an empty value or a reserved id (0x07..0x7F) is not served. The
+    /// conformity level is derived from the served objects (see `device_id`).
     device_objects: []const mb.device_id.Object = &.{},
 
     /// Serve read code 4 (one specific object) in addition to stream access.
@@ -643,8 +644,14 @@ pub const Server = struct {
 
     // ── FC 0x2B / MEI 0x0E ──────────────────────────────────────────────────
 
+    /// The served object with this id. A reserved id (0x07..0x7F) or an
+    /// empty value is not served (pymodbus 3.16.2: same; the spec does not
+    /// say what an empty object means).
     fn findObject(self: *const Server, id: u8) ?mb.device_id.Object {
-        for (self.config.device_objects) |o| if (o.id == id) return o;
+        if (mb.device_id.isReserved(id)) return null;
+        for (self.config.device_objects) |o| if (o.id == id) {
+            return if (o.value.len == 0) null else o;
+        };
         return null;
     }
 
@@ -657,9 +664,12 @@ pub const Server = struct {
         const code = di.readCodeFromByte(body[1]) orelse return .illegal_data_value;
         const req_id = body[2];
 
-        // Conformity: highest category that has an object, + individual bit.
+        // Conformity: highest category that has a served object, + the
+        // individual bit (spec 6.21: the device's own level, so a read code
+        // above it is answered at that level).
         var highest: di.ReadCode = .basic;
         for (self.config.device_objects) |o| {
+            if (self.findObject(o.id) == null) continue;
             if (o.id >= 0x80) highest = .extended else if (o.id >= 0x03 and highest == .basic) highest = .regular;
         }
         out[0] = @backingInt(FunctionCode.encapsulated_interface);
@@ -685,10 +695,11 @@ pub const Server = struct {
             count = 1;
         } else {
             const range = di.categoryRange(code).?;
-            // Spec: an object id that is not a known object restarts at the
-            // beginning (here: of the requested category).
-            const in_cat = req_id >= range.first and req_id <= range.last;
-            var id: u16 = if (in_cat and self.findObject(req_id) != null) req_id else range.first;
+            // Spec 6.21: "If the Object Id does not match any known object,
+            // the server responds as if object 0 were pointed out (restart
+            // at the beginning)." Known = served and inside this walk.
+            const in_walk = req_id <= range.last;
+            var id: u16 = if (in_walk and self.findObject(req_id) != null) req_id else range.first;
             while (id <= range.last) : (id += 1) {
                 const o = self.findObject(@intCast(id)) orelse continue;
                 if (o.value.len > 0xFF) return .server_device_failure;
@@ -2031,17 +2042,25 @@ test "FC 0x2B/0x0E: regular, extended, individual, and the restart rule" {
     var server = idServer(&fix, &demo_objects);
     var out: [mb.max_pdu_len]u8 = undefined;
 
-    // regular: only 0x03.. (object id 0 is below the category: start of category)
+    // regular is cumulative (spec 6.21): basic + regular from object 0
     var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x00 }, &out);
-    try testing.expectEqual(@as(u8, 2), r[6]);
-    try testing.expectEqual(@as(u8, 0x03), r[7]);
+    try testing.expectEqual(@as(u8, 5), r[6]);
+    try testing.expectEqual(@as(u8, 0x00), r[7]);
     // regular starting at 0x04
     r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x04 }, &out);
     try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x02, 0x83, 0x00, 0x00, 0x01, 0x04, 0x04, 'P', 'r', 'o', 'd' }, r);
-    // an id that is no known object restarts at the category start
+    // an id that is no known object restarts at object 0
     r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x05 }, &out);
-    try testing.expectEqual(@as(u8, 2), r[6]);
-    try testing.expectEqual(@as(u8, 0x03), r[7]);
+    try testing.expectEqual(@as(u8, 5), r[6]);
+    try testing.expectEqual(@as(u8, 0x00), r[7]);
+    // an extended object is outside the regular walk: restart too
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x80 }, &out);
+    try testing.expectEqual(@as(u8, 5), r[6]);
+    try testing.expectEqual(@as(u8, 0x00), r[7]);
+    // extended from 0 walks everything served
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x00 }, &out);
+    try testing.expectEqual(@as(u8, 6), r[6]);
+    try testing.expectEqual(@as(u8, 0x00), r[7]);
     // basic with an id in a different category restarts at 0
     r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x04 }, &out);
     try testing.expectEqual(@as(u8, 3), r[6]);
@@ -2096,9 +2115,18 @@ test "FC 0x2B/0x0E: malformed requests, switches, conformity" {
     server.config.device_objects = &regular;
     r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x01, 0x00 }, &out);
     try testing.expectEqual(@as(u8, 0x82), r[3]);
-    // a category with no objects answers an empty list, not an error
+    // a read code above the device's level is answered at its level
+    // (spec 6.21): extended on a regular device gives the regular objects
     r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
-    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x03, 0x82, 0x00, 0x00, 0x00 }, r);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x03, 0x82, 0x00, 0x00, 0x02, 0x00, 0x01, 'A', 0x06, 0x01, 'B' }, r);
+    // reserved ids and empty values are not served (pymodbus: same) and
+    // do not raise the conformity level; with nothing served the list is empty
+    const unserved = [_]mb.device_id.Object{ .{ .id = 0x07, .value = "R" }, .{ .id = 0x7F, .value = "R" }, .{ .id = 0x80, .value = "" } };
+    server.config.device_objects = &unserved;
+    r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x00 }, &out);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x03, 0x81, 0x00, 0x00, 0x00 }, r);
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x07 }, &out), 0x2B, .illegal_data_address);
+    try expectException(try server.handlePdu(&.{ 0x2B, 0x0E, 0x04, 0x80 }, &out), 0x2B, .illegal_data_address);
 
     // no table at all: not implemented
     server.config.device_objects = &.{};
@@ -2239,8 +2267,9 @@ test "FC 0x2B/0x0E: category edges 0x7F / 0xFF, conformity independent of table 
     };
     var server = idServer(&fix, &edges);
     var out: [mb.max_pdu_len]u8 = undefined;
+    // 0x7F is reserved (spec 6.21 object table): the regular walk ends at 0x06
     var r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x02, 0x03 }, &out);
-    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x02, 0x83, 0x00, 0x00, 0x02, 0x03, 0x01, 'r', 0x7F, 0x01, 'R' }, r);
+    try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x02, 0x83, 0x00, 0x00, 0x01, 0x03, 0x01, 'r' }, r);
     r = try server.handlePdu(&.{ 0x2B, 0x0E, 0x03, 0x80 }, &out);
     try testing.expectEqualSlices(u8, &.{ 0x2B, 0x0E, 0x03, 0x83, 0x00, 0x00, 0x02, 0x80, 0x01, 'e', 0xFF, 0x01, 'E' }, r);
 

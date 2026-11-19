@@ -1,12 +1,12 @@
 # `modbus` verification instruments
 
-**STATUS: `oracle.py` has NOT YET BEEN RUN.** It was written against the pymodbus 3.16.2 source read as text; the wheel is not installed and nothing of pymodbus has executed (owner approval pending). Its API calls, the vectors file `src/oracle_vectors.zig` and the replay test `src/oracle_test.zig` do not exist yet, so nothing below counts as verification until a run has produced them.
+**Last run 2026-11-19** (pymodbus 3.16.2, offline under `unshare -rn`): 50 FC 0x16 cases, 618 FC 0x2B/0x0E cases over 8 object tables, 6 RTU streams; frozen in `src/oracle_vectors.zig`, replayed by `src/oracle_test.zig`.
 
 | tool | role |
 |---|---|
 | `oracle.py` | `python3 -I tools/oracle.py gen src/oracle_vectors.zig`: drives pymodbus 3.16.2 (BSD-3) IN PROCESS (its PDU encoders, its server-side `datastore_update` for FC 0x16 and FC 0x2B/0x0E, its RTU framer `buildFrame`) and writes what it says as Zig vectors. No socket, no server, no network. |
 
-Once run, `src/oracle_test.zig` (to be added) replays the frozen `src/oracle_vectors.zig` in the module's
+`src/oracle_test.zig` replays the frozen `src/oracle_vectors.zig` in the module's
 own lane with no Python (`CONVENTIONS.md` §9: the recipe for committed vectors and a
 differential oracle driving a foreign implementation). Every expected byte is
 pymodbus's; nothing is seeded from this module.
@@ -37,4 +37,9 @@ this tool never starts.
 
 ## What the replay holds
 
-Nothing yet (not run).
+- **FC 0x16:** every request, response and register value equals pymodbus's (spec 6.16 example plus edge and random masks; a register outside the window gives pymodbus's `IllegalDataAddress`).
+- **FC 0x2B/0x0E:** every response equals pymodbus's byte for byte, except three departures where pymodbus differs from the spec text (V1.1b3 6.21) and the module follows the spec. Each has its own exact count in the test, so a new difference fails it:
+  - the conformity byte: pymodbus always sends 0x83; the spec defines it as the device's own level, which the test computes from the table;
+  - restart (168 cases): a stream request whose object id is no known object of that walk restarts at object 0 (spec: "restart at the beginning"); pymodbus answers an empty list;
+  - an object longer than any response (3 cases): `ServerDeviceFailure`; pymodbus answers more-follows with the same object as next id and no objects, which a client follows forever.
+- **RtuStream:** pymodbus-built RTU frames for both roles, back to back, with garbage between and with a broken CRC, come out as the same unit + PDU sequence. The expected bytes are cut from the frame `buildFrame` returned: pymodbus 3.16.2's device-identification response adds to its object count on every `x_encode`, so encoding it a second time gives a wrong count.

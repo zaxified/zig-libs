@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""NOT YET RUN: written against the pymodbus 3.16.2 source read as text; nothing of
-pymodbus has executed, so its API calls are unverified (owner approval pending).
-
-Differential oracle: pymodbus (BSD-3) against the modbus module's FC 0x16,
+"""Differential oracle: pymodbus (BSD-3) against the modbus module's FC 0x16,
 FC 0x2B/0x0E and RTU-over-TCP framing.
 
     python3 -I tools/oracle.py gen <out.zig>
@@ -121,7 +118,7 @@ def mei_cases():
     out = []
     tabs = tables()
     for ti, tab in enumerate(tabs):
-        mei_message._MCB.Identity = ModbusDeviceIdentification(info=tab)
+        mei_message._MCB._identity = ModbusDeviceIdentification(info=tab)
         ids = sorted({0, 1, 2, 3, 6, 7, 0x50, 0x7F, 0x80, 0x81, 0x90, 0xFF} | set(tab))
         for code in (0, 1, 2, 3, 4, 5):
             for oid in ids:
@@ -176,11 +173,15 @@ def rtu_streams(rng):
         ]
     for ti in (0, 2, 3, 4):
         for code, oid in ((1, 0), (2, 3), (3, 0x80), (4, 1)):
-            mei_message._MCB.Identity = ModbusDeviceIdentification(info=tables()[ti])
+            mei_message._MCB._identity = ModbusDeviceIdentification(info=tables()[ti])
             q = ReadDeviceInformationRequest(read_code=code, object_id=oid)
             resps.append(run(q.datastore_update(None, 9)))
     def frame(fr, p):
-        return fr.buildFrame(p), p.dev_id, bytes([p.function_code]) + p.x_encode()
+        # The expected unit and PDU are cut from the frame pymodbus built, not
+        # re-encoded: pymodbus 3.16.2's ReadDeviceInformationResponse.x_encode
+        # adds to number_of_objects on every call, so a second encode lies.
+        f = fr.buildFrame(p)
+        return f, f[0], f[1:-2]
     def garbage(n):
         return bytes(rng.randrange(0xA0, 0x100) for _ in range(n))
     out = []
