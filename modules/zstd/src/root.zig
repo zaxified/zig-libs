@@ -724,6 +724,7 @@ test {
     _ = @import("zstdmt.zig");
     _ = @import("mt_test.zig");
     _ = @import("room_test.zig");
+    _ = @import("room_sweep_test.zig");
     _ = @import("dbits.zig");
     _ = @import("huf_dec.zig");
     _ = @import("dblock.zig");
