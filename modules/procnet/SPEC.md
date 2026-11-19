@@ -196,9 +196,7 @@ fail and a missing token is `""`, which the length checks already reject (3); no
 of another (1); the inner `max_owners` flag is re-set by the outer guard (1); `total_fds >=`/`>` needs control
 of `/proc`'s order (1, as in the sweep's delta); 11 that differ only for a `/proc` file past its fixed limit or
 absent (`/proc/stat` > 1 MiB, `/proc/net/unix` > 16 MiB, conntrack > 4 MiB or not loaded) or on a pid-exit race
-— the injection they need is a path/limit seam. Noted, not changed: a file of exactly `limit` bytes is flagged
-`truncated` though complete (`appendRemaining(.limited(n))` cannot tell it from a longer one; conservative,
-pinned by a test). Combined with the run above: 171/190, 19 equivalent.
+— the injection they need is a path/limit seam. Noted, fixed 2026-11-19: a file of exactly `limit` bytes used to be flagged `truncated` though complete; `readImpl` now reads `limit + 1` bytes, so the flag means "longer than `limit`" (reference: `head -c`-style bounded readers and Go's `io.LimitReader` + one-byte probe idiom report completeness the same way). Combined with the run above: 171/190, 19 equivalent.
 
 ### The hex address decode on a big-endian target — measured, and what is left
 

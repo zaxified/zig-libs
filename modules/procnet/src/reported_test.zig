@@ -39,10 +39,10 @@ pub fn expectReportedCut(comptime T: type, comptime readFrom: anytype, text: []c
     try testing.expect(cut.truncated);
     try testing.expectEqual(whole.entries.len - 1, cut.entries.len);
 
-    // A limit equal to the file size: every row arrives, the flag is conservative.
+    // A limit equal to the file size: every row arrives and the table is complete, not flagged.
     const exact: procnet.Reported(T) = try readFrom(testing.allocator, io, path, text.len);
     defer testing.allocator.free(exact.entries);
-    try testing.expect(exact.truncated);
+    try testing.expect(!exact.truncated);
     try testing.expectEqual(whole.entries.len, exact.entries.len);
 
     // A missing table is empty and not "truncated".

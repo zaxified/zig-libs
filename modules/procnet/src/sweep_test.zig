@@ -139,7 +139,7 @@ fn tmpFileWith(io: std.Io, tmp: *std.testing.TmpDir, text: []const u8, path_buf:
     return std.mem.print(path_buf, ".zig-cache/tmp/{s}/t.txt", .{&tmp.sub_path});
 }
 
-test "readVirtualLines: an untruncated read keeps a last line with no newline; a limit equal to the size is flagged but complete" {
+test "readVirtualLines: an untruncated read keeps a last line with no newline; a limit equal to the size is complete and not flagged" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -154,13 +154,21 @@ test "readVirtualLines: an untruncated read keeps a last line with no newline; a
     try testing.expect(!r.truncated);
     try testing.expectEqualStrings(text, r.bytes);
 
-    // Exactly `limit` bytes: every byte arrives, but the flag is set too
-    // (`appendRemaining(.limited(n))` cannot tell a file of n bytes from a longer one),
-    // so `truncated` is conservative at the boundary, never wrong the other way.
+    // Exactly `limit` bytes: the file is complete, so it is NOT flagged
+    // (the read looks one byte past the limit to tell it from a longer file).
     const exact = procnet.readVirtualFileReporting(testing.allocator, io, path, text.len) orelse return error.ReadFailed;
     defer testing.allocator.free(exact.bytes);
-    try testing.expect(exact.truncated);
+    try testing.expect(!exact.truncated);
     try testing.expectEqualStrings(text, exact.bytes);
+    const exact_lines = procnet.readVirtualLinesReporting(testing.allocator, io, path, text.len) orelse return error.ReadFailed;
+    defer testing.allocator.free(exact_lines.bytes);
+    try testing.expect(!exact_lines.truncated);
+    try testing.expectEqualStrings(text, exact_lines.bytes);
+    // A limit of 0 on a non-empty file is a cut with nothing kept.
+    const zero = procnet.readVirtualFileReporting(testing.allocator, io, path, 0) orelse return error.ReadFailed;
+    defer testing.allocator.free(zero.bytes);
+    try testing.expect(zero.truncated);
+    try testing.expectEqual(@as(usize, 0), zero.bytes.len);
 
     // One byte less is a cut: the plain read keeps the prefix, the line read
     // drops the fragment; a cut with no newline at all leaves nothing.
