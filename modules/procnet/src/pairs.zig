@@ -382,3 +382,24 @@ test "readTableLimit: a limit cutting a value line drops the line, never a short
     try testing.expect(cut2.truncated);
     try testing.expectEqual(@as(usize, 0), cut2.entries.len);
 }
+
+test "live: readSnmp/readNetstat return rows whenever an independent read finds the file (mutation: limit ignored)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const paths = [_][]const u8{ "/proc/net/snmp", "/proc/net/netstat" };
+    for (paths) |path| {
+        const raw = procnet.readVirtualFile(testing.allocator, io, path, read_limit) orelse continue;
+        defer testing.allocator.free(raw);
+        if (raw.len == 0) continue;
+        const t = if (std.mem.eql(u8, path, "/proc/net/snmp"))
+            try readSnmp(testing.allocator, io)
+        else
+            try readNetstat(testing.allocator, io);
+        defer t.deinit(testing.allocator);
+        try testing.expect(!t.truncated);
+        try testing.expect(t.entries.len > 0);
+    }
+}
