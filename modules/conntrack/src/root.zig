@@ -359,6 +359,7 @@ pub const Socket = struct {
     }
 
     /// Streaming `dumpWith`; the contract of `dumpEach` applies.
+    /// `q.max_flows` bounds the flows delivered to `visit` (see `dumpEachOver`).
     pub fn dumpEachWith(
         self: *Socket,
         q: ext.FlowQuery,
@@ -914,7 +915,11 @@ fn triage(m: codec.Message, portid: u32, seq: u32, interrupted: *bool) netlink.D
 /// whatever the caller needs to keep.
 ///
 /// **Bounds**: at most `max_dump_messages` (65536) DATAGRAMS per pass
-/// (`error.TooManyMessages`). There is no cap on flows as such and no state is
+/// (`error.TooManyMessages`). `dumpEachWith` also takes `FlowQuery.max_flows`:
+/// the flow after that many delivered ones is not visited, the dump is read
+/// to its DONE and `TooManyMessages` returned (the flows before it HAVE been
+/// visited; the visitor cannot un-see them). With no `max_flows` (the default,
+/// and always for `dumpEach`) there is no cap on flows as such and no state is
 /// kept per flow, but the datagram budget is a ceiling in disguise: how many
 /// flows fit one datagram depends on the kernel's dump buffer (roughly 10-100),
 /// so a table beyond that product is refused although it is valid. The callback
@@ -960,6 +965,14 @@ fn dumpEachGeneric(
     var msgs: u32 = 0;
     var interrupted = false;
     var bad_record = false; // see `dumpOver`
+    // `FlowQuery.max_flows` exceeded: the flow is not visited, the rest of
+    // the dump is read to its DONE (records discarded) and then
+    // `TooManyMessages` is returned, so the socket stays usable, as in
+    // `dumpGeneric`. The same precedence: interruption, then whichever of
+    // `bad_record` / `too_many` came first in wire order.
+    var too_many = false;
+    var delivered: u32 = 0;
+    const max_visits = request.maxKept(std.math.maxInt(u32));
     while (true) {
         if (msgs >= max_dump_messages) return error.TooManyMessages;
         const dgram = try transport.recvDatagram();
@@ -972,6 +985,7 @@ fn dumpEachGeneric(
                 .done => {
                     if (interrupted) return error.InconsistentDump;
                     if (bad_record) return error.MalformedReply;
+                    if (too_many) return error.TooManyMessages;
                     return;
                 },
                 .failed => |code| {
@@ -981,7 +995,7 @@ fn dumpEachGeneric(
                 .overrun => return error.Overrun,
                 .malformed => return error.MalformedReply,
                 .record => |rec| {
-                    if (interrupted or bad_record) continue; // discarded
+                    if (interrupted or bad_record or too_many) continue; // discarded
                     if (rec.type != rec_type) {
                         if (request.strictTypes()) bad_record = true;
                         continue;
@@ -993,6 +1007,11 @@ fn dumpEachGeneric(
                     if (T == Flow) {
                         if (request.filter()) |f| if (!f.matches(&item)) continue;
                     }
+                    if (delivered >= max_visits) {
+                        too_many = true;
+                        continue;
+                    }
+                    delivered += 1;
                     try visit(ctx, &item);
                 },
             }
@@ -2799,4 +2818,87 @@ test "ExpectEventIterator: new, update and destroy; a flow event in the datagram
     var bad: ExpectEventIterator = .{ .msgs = .{ .buf = &[_]u8{ 1, 2, 3 } } };
     try testing.expectError(error.Truncated, bad.next());
     try testing.expect((try bad.next()) == null);
+}
+
+test "dumpEachGeneric: max_flows caps the flows visited, drains to DONE, the socket stays usable" {
+    const gpa = testing.allocator;
+    const f = Fix.init();
+    const dg = try threeFlows(gpa, f);
+    defer gpa.free(dg);
+    const Each = struct {
+        fn run(t: anytype, q: ext.FlowQuery, v: *CollectingVisitor) anyerror!void {
+            return dumpEachGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, t, .{ .flow = q }, v, CollectingVisitor.visit);
+        }
+    };
+    { // 3 flows, bound 2: two visited, the third not, DONE consumed, a second dump works
+        var t = f.transport(&.{ dg, &f.done, dg, &f.done });
+        var v: CollectingVisitor = .{};
+        defer v.deinit();
+        try testing.expectError(error.TooManyMessages, Each.run(&t, .{ .max_flows = 2 }, &v));
+        try testing.expectEqual(@as(usize, 2), v.calls);
+        try testing.expectEqual(@as(usize, 2), t.recvs); // flows AND the DONE
+        var v2: CollectingVisitor = .{};
+        defer v2.deinit();
+        try Each.run(&t, .{ .max_flows = 3 }, &v2);
+        try testing.expectEqual(@as(usize, 3), v2.calls);
+    }
+    { // bound equal to the count, zero bound on none: fine; null is unlimited
+        var t = f.transport(&.{ dg, &f.done, dg, &f.done });
+        var v: CollectingVisitor = .{};
+        defer v.deinit();
+        try Each.run(&t, .{ .max_flows = 3 }, &v);
+        try testing.expectEqual(@as(usize, 3), v.calls);
+        var v2: CollectingVisitor = .{};
+        defer v2.deinit();
+        try Each.run(&t, .{}, &v2);
+        try testing.expectEqual(@as(usize, 3), v2.calls);
+    }
+    { // zero bound: nothing visited
+        var t = f.transport(&.{ dg, &f.done });
+        var v: CollectingVisitor = .{};
+        defer v.deinit();
+        try testing.expectError(error.TooManyMessages, Each.run(&t, .{ .max_flows = 0 }, &v));
+        try testing.expectEqual(@as(usize, 0), v.calls);
+    }
+    { // the filter drops two of three: bound 1 holds
+        var t = f.transport(&.{ dg, &f.done });
+        var v: CollectingVisitor = .{};
+        defer v.deinit();
+        try Each.run(&t, .{ .max_flows = 1, .filter = .{ .mark = .{ .value = 3 } } }, &v);
+        try testing.expectEqual(@as(usize, 1), v.calls);
+    }
+    { // the bound spread over datagrams: later records discarded
+        var t = f.transport(&.{ dg, dg, dg, &f.done });
+        var v: CollectingVisitor = .{};
+        defer v.deinit();
+        try testing.expectError(error.TooManyMessages, Each.run(&t, .{ .max_flows = 4 }, &v));
+        try testing.expectEqual(@as(usize, 4), v.calls);
+        try testing.expectEqual(@as(usize, 4), t.recvs);
+    }
+    { // an interruption beats the bound: InconsistentDump
+        var t = f.transport(&.{ dg, &f.intr_done });
+        var v: CollectingVisitor = .{};
+        defer v.deinit();
+        try testing.expectError(error.InconsistentDump, Each.run(&t, .{ .max_flows = 2 }, &v));
+    }
+}
+
+test "dumpEachGeneric: an overflow before a bad record wins, one after it loses (wire order)" {
+    const id = goldenDumpIdentity();
+    const bad = badRecordDatagram(id.pid, id.seq);
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    var t: ScriptedTransport = .{
+        .script = &.{ &goldens.dump_reply_three_flows, &bad, &done, &bad, &goldens.dump_reply_three_flows, &done },
+        .pid = id.pid,
+        .seq = id.seq,
+    };
+    var v: CollectingVisitor = .{};
+    defer v.deinit();
+    const q: ext.FlowQuery = .{ .max_flows = 2 };
+    try testing.expectError(error.TooManyMessages, dumpEachGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, &t, .{ .flow = q }, &v, CollectingVisitor.visit));
+    try testing.expectEqual(@as(usize, 2), v.calls);
+    try testing.expectEqual(@as(usize, 3), t.recvs);
+    try testing.expectError(error.MalformedReply, dumpEachGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, &t, .{ .flow = q }, &v, CollectingVisitor.visit));
+    try testing.expectEqual(@as(usize, 2), v.calls); // the bad record came first: nothing behind it was visited
+    try testing.expectEqual(@as(usize, 6), t.recvs);
 }

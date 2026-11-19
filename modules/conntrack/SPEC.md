@@ -6,7 +6,7 @@
 
 **Scope:** parity — conntrack-tools / libnetfilter_conntrack, ti-mo/conntrack v0.6.0, florianl/go-conntrack v0.7.0 (surveyed 2026-11-03; every substantial feature is built or rejected with a reason, see "Compared with"; the only open items are outside this module: `nfnetlink_cttimeout`/`cthelper`)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-04 (34/34) · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-19 (40/40) · src ?
 
 **Hardening:** fuzz 2026-11-03 (`CONNTRACK_FUZZ=200000` per harness, ReleaseSafe, 3 harnesses: decode, decode of damaged corpus entries, dump engine over every request kind; clean, every per-decoder and per-engine-path reach label hit, `fz.Seen`) · ct n/a — netlink conntrack decoding (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: `dump()` 1 Mi flow cap, DUMP_INTR and one-bad-record exits drain to DONE, `EventIterator` ends after a framing error; delta audit 21/21)
 
@@ -395,7 +395,7 @@ Scope choices, not oversights. None of them is load-bearing for a dump/get/delet
 ## Backlog / deferred
 
 - **Survey 2026-11-02 closed the items of the 2026-09-30 ranking** (event buffer, filtered dump, statistics and dying/unconfirmed, expectation table and events; NAT attributes, filtered flush, expectation writes and label writes rejected, see "Compared with"). Open: `nfnetlink_cttimeout` as its own module, and a **live-dump comparison row** against ti-mo/florianl in a netns (a kernel tie; needs thousands of inserted flows; not measured).
-- **`dumpEach` has no flow cap, only the datagram budget** *(no-panic sweep GX, 2026-10-31)*: no state per flow, but `max_dump_messages` (65536) datagrams x ~10-100 flows per datagram (kernel dump buffer, not measured) is an implicit ceiling; the visitor can stop the walk by returning an error. `dump()` is capped at `max_dump_flows` (1 Mi) -> `error.TooManyMessages`. If a consumer needs a streaming cap, add a `max_flows` option to `dumpEach`.
+- ~~**`dumpEach` has no flow cap, only the datagram budget** *(no-panic sweep GX, 2026-10-31)*~~ — **DONE 2026-11-19 (additive).** `FlowQuery.max_flows`, already the returned-flow bound of `dumpWith`, now also bounds the flows `dumpEachWith` delivers: the flow after `max_flows` delivered ones is not visited, the dump is read to its DONE and `error.TooManyMessages` is returned, so the socket stays usable (the style of `dumpWith`, same precedence: interruption, then whichever of malformed record / overflow came first). The flows before it have been visited. Default null = no cap (unchanged); plain `dumpEach(family)` keeps its signature, so a cap is set through `dumpEachWith(.{ .family = f, .max_flows = n })`. Basis: the module's own `dumpWith` contract; libnetfilter_conntrack's callback dump has no cap (a callback may return `NFCT_CB_STOP`, our visitor error), so there is no reference to follow beyond the module's style. The datagram budget stays the implicit ceiling when no cap is set. Delta mutation 2026-11-19: 6 mutants (cap comparison, counter, overflow flag, final error, discard of the rest, default bound), 6 killed (one after a new test: an overflow followed by a malformed record); the card counts are cumulative (old + 6); `src ?` stays, the earlier run's source is not recorded.
 
 ## Anchoring
 

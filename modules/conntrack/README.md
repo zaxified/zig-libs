@@ -87,7 +87,7 @@ while (true) {
   **applied again to every decoded flow**: a kernel too old for an attribute (mark 4.20, status
   5.15, zone 6.8) answers an unfiltered dump, and a caller who asked for one mark never gets all
   of them. Filtered *flush* is not offered (see SPEC "Compared with"). `.zero_counters` is never
-  retried and refused with a filter; `FlowQuery.max_flows` bounds the flows returned.
+  retried and refused with a filter; `FlowQuery.max_flows` bounds the flows returned (`dumpWith`) or delivered to the visitor (`dumpEachWith`, then `error.TooManyMessages` once the dump is drained).
 - `Socket.nextExpectEvents()` — `nextEvents` for `Group.CONNTRACK_EXP_*` (`ExpectEventIterator`).
 - `Socket.statsCpu()` / `.statsGlobal()` / `.statsExpect()` — `conntrack -S`, `-C`, `-S expect`.
 - `Socket.dumpExpect(family) DumpError![]Expect` — the expectation table (`conntrack -L expect`),
