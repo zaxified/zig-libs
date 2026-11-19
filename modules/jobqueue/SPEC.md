@@ -106,6 +106,19 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `ChangeMessageVisibility` to 0 (SQS is the outlier: its receive count still grows). Majority:
   a (lease, delay) call that consumes no attempt; the name follows beanstalkd (and Laravel's
   `release($delay)`). Sidekiq/Asynq have no worker-side equivalent (a job re-enqueues itself).
+- **Dequeue with exclusions (2026-11-19).** `DequeueOptions.exclude` lists partitions to pass
+  over: `bestReady` skips their heaps, so nothing of an excluded partition is leased, popped or
+  changed (a tombstone at its top stays until a dequeue that does not exclude it). A `partition`
+  filter that is excluded gives null. Empty = the plain dequeue (the loop over the list does not
+  run). Cost: a linear scan of the list per partition heap considered, O(partitions × excluded)
+  per dequeue, no allocation; a hash set was not worth it for the intended handful of keys. The
+  slice is borrowed for the call. Why: a caller that keeps a per-partition backoff of its own
+  (writebehind's retry wait) needs the best job of the OTHER partitions without leasing — and
+  then releasing — every job of the waiting ones (an earlier design did that; a key whose wait
+  lapsed between two of those dequeues was written past its own older, still-leased record).
+  Peers: BullMQ, Asynq and Sidekiq select by queue name lists (a worker's queue set) rather
+  than by exclusion; the closest is a consumer that subscribes to all queues but the paused ones
+  (BullMQ `pause` per queue, Asynq `Pause(queue)`), which is what this expresses per call.
 - **Unique jobs.** `EnqueueOptions.unique_key` (≤ `max_field_len`) is checked before anything is
   written; the key is held by the live job (ready, scheduled, leased, dead) and released by ack,
   cancel or `removeJob`. It is durable: a job with a key is written as a **version-2 record** (31
@@ -159,7 +172,8 @@ keeps the invariants, never a panic — measured 6 732 decoded (2 865 v2), 33 26
 nack, extend, reap with clock moves, cancel, requeueDead, crash-reopen) comparing every job's
 status and all four counts with a model after every step — measured 588 acks, 683 cancels, 53
 requeues, 1 212 refused duplicates, 1 226 crashes (since 2026-11-19 the op mix also has `release`
-with a random delay, which must never dead-letter). **Mutation 2026-10-04:** 23 mutants
+with a random delay, which must never dead-letter, and dequeues with an exclusion list: the
+only partition excluded must lease nothing, an unknown one changes nothing). **Mutation 2026-10-04:** 23 mutants
 (schemata, ReleaseSafe), 3 survived the first run, each killed by a crafted-record test with its
 reason (a keyless v2 record; a dead record with `max_attempts` 0; two live jobs with one key in a
 store); 0 surviving. The dependent `writebehind` passes its modtest.

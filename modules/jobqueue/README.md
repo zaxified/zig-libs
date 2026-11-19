@@ -113,6 +113,10 @@ _ = try q.cancel(dead[1].id);             // durable delete; also for ready/sche
 // A long job keeps its lease with a heartbeat:
 try q.extendLease(lease, 30 * std.time.ns_per_s);
 
+// Best job of every partition except some (e.g. ones your own code is
+// backing off from); nothing of those is leased:
+_ = try q.dequeue(.{ .visibility_timeout_ns = 30 * std.time.ns_per_s, .exclude = &.{ "tenant-7", "tenant-9" } });
+
 // Took a job it cannot run yet (a busy resource, a shutdown)? Hand it back
 // without counting an attempt: same place in its partition, never dead-letters.
 try q.release(lease, .{ .delay_ns = 0 });  // or a delay, persisted like a nack backoff
