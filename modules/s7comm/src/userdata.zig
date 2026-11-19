@@ -750,6 +750,9 @@ fn fuzzUserdata(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         var again: [DateTime.wire_len]u8 = undefined;
         const back = try DateTime.decode(try dt.encode(&again));
         try testing.expectEqual(dt, back);
+        // Canonical form: octets 2..9 re-encode to what was decoded (a nibble
+        // above 9 must never have been accepted); 0 and 1 are ignored on decode.
+        try testing.expectEqualSlices(u8, buf[2..DateTime.wire_len], again[2..DateTime.wire_len]);
     } else |_| {
         if (len == DateTime.wire_len) fuzzUserdataMark.mark(.clock_rejected);
     }

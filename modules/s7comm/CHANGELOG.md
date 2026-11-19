@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** test only. The userdata fuzz harness checks that a decoded `DateTime` re-encodes to the same octets 2..9 (found necessary by a planted `unbcd` mutant).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The fuzz harnesses now steer the time-of-day group: the responder harness sends group-7 requests (subfunctions 1-4, valid and damaged BCD date-times, short payloads, failing return codes) with a clock configured and asserts no invalid value reaches the setter; the userdata harness decodes and round-trips `DateTime`; a new harness (`fuzzClockClient`) damages the responder's replies and runs `readClock`/`setClock` on them.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** SPEC scope line restored to the catalog format after the clock item.
 - **2026-11-19** — Delta mutation of the time-of-day code: 57 mutants, 12 survived and were killed by new tests (reply tampering via the paired-transport test hook, request bytes pinned, subfunction 0x04, sequence echo, invalid clock value); 57 of 57 killed. No library code changed.
