@@ -6,7 +6,7 @@
 
 **Scope:** parity — libbzip2 1.0.8 (surveyed 2026-10-20)
 
-**Audit:** review 2026-10-20 · mutation 2026-11-19 (699/820, 121 eq) · src cc565eac8a84aa39
+**Audit:** review 2026-10-20 · mutation 2026-11-19 (699/820, 121 eq) · src 8c47f65d7dd72686
 
 **Hardening:** fuzz 2026-10-20 (200,000 decoder runs + 33,333 round-trip runs clean, BZIP2_FUZZ, every reach label hit; arbitrary and mutated streams, synthetic blocks with well-formed tables, chunked and failing readers and sinks, failing allocator; 4,000 seeds in every test run) · ct n/a — compression only, no secret is processed (keyword review, 2026-10-20) · panic 2026-10-30 (sweep + blind review: default `max_output` 256 MiB (bomb guard), StreamWriter.finish idempotent + error cast total, Encoder error latch, zero-capacity reader path with a 64-empty-read bound; delta audit 21/22 + 1 NA)
 

@@ -125,9 +125,14 @@ test "StreamWriter: vectors and splats count what they consumed" {
     defer out.deinit();
     var sw = try bz.StreamWriter.init(gpa, &out.writer, &.{}, .{ .level = 1 });
     defer sw.deinit();
-    try sw.writer.writeVecAll(@constCast(&[_][]const u8{ "alpha ", "beta ", "gamma " }));
+    // writeVecAll/writeSplatAll advance the slices in place: they must be
+    // mutable (a @constCast of a comptime literal is in read-only memory and
+    // crashed ReleaseFast with SEGV).
+    var vec = [_][]const u8{ "alpha ", "beta ", "gamma " };
+    try sw.writer.writeVecAll(&vec);
     try sw.writer.splatByteAll('x', 700);
-    try sw.writer.writeSplatAll(@constCast(&[_][]const u8{ "ab", "cd" }), 5);
+    var splat = [_][]const u8{ "ab", "cd" };
+    try sw.writer.writeSplatAll(&splat, 5);
     try sw.finish();
     const back = try bz.decompress(gpa, out.written(), .{});
     defer gpa.free(back);
