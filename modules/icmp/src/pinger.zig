@@ -1327,11 +1327,7 @@ pub const Pinger = struct {
     fn waitReadable(self: *Pinger, wait_ns: i64) void {
         var buf: [2]linux.pollfd = undefined;
         const fds = self.pollFds(&buf);
-        const clamped = @max(wait_ns, 0);
-        var ts: linux.timespec = .{
-            .sec = @intCast(@divTrunc(clamped, std.time.ns_per_s)),
-            .nsec = @intCast(@mod(clamped, std.time.ns_per_s)),
-        };
+        var ts = nsToTimespec(linux.timespec, wait_ns);
         _ = linux.ppoll(fds.ptr, fds.len, &ts, null);
     }
 
@@ -1421,6 +1417,39 @@ pub const Pinger = struct {
         }
     }
 };
+
+/// A non-negative nanosecond wait as a timespec-shaped `Ts` (`sec`, `nsec`).
+/// A negative wait is zero; seconds beyond the `sec` type (an i32 on 32-bit
+/// targets) saturate to its maximum instead of tripping a checked cast.
+fn nsToTimespec(comptime Ts: type, ns: i64) Ts {
+    const clamped = @max(ns, 0);
+    const secs = @divTrunc(clamped, std.time.ns_per_s);
+    const Sec = @TypeOf(@as(Ts, undefined).sec);
+    return .{
+        .sec = std.math.cast(Sec, secs) orelse std.math.maxInt(Sec),
+        .nsec = @intCast(@mod(clamped, std.time.ns_per_s)),
+    };
+}
+
+test "nsToTimespec saturates the seconds of a narrow sec type and clamps negatives" {
+    const Narrow = struct { sec: i32, nsec: i64 };
+    const big: i64 = (@as(i64, std.math.maxInt(i32)) + 1) * std.time.ns_per_s + 5;
+    const sat = nsToTimespec(Narrow, big);
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), sat.sec);
+    try std.testing.expectEqual(@as(i64, 5), sat.nsec);
+    // The largest representable second count is passed through exactly.
+    const edge = nsToTimespec(Narrow, @as(i64, std.math.maxInt(i32)) * std.time.ns_per_s + 7);
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), edge.sec);
+    try std.testing.expectEqual(@as(i64, 7), edge.nsec);
+    // i64::MAX on the real timespec: 292 years, no saturation needed.
+    const real = nsToTimespec(linux.timespec, std.math.maxInt(i64));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64) / std.time.ns_per_s), @as(i64, real.sec));
+    // Negative waits are zero.
+    const neg = nsToTimespec(Narrow, -5);
+    try std.testing.expectEqual(@as(i32, 0), neg.sec);
+    try std.testing.expectEqual(@as(i64, 0), neg.nsec);
+    try std.testing.expectEqual(@as(i32, 1), nsToTimespec(Narrow, std.time.ns_per_s).sec);
+}
 
 fn sourceMatches(src: Socket.RecvInfo.SrcAddr, target: Addr) bool {
     return switch (src) {
@@ -2172,7 +2201,9 @@ test "A1 F3: step() returns promptly even while its socket is being flooded" {
     try std.testing.expect(elapsed_ms < 1000);
 }
 
-test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket's own probes" {
+/// Forge a Time Exceeded about one probe on a DGRAM pinger (starting from
+/// `preset` already-counted errors) and return `icmp_errors` after the drain.
+fn errQueueRoundTrip(preset: u32) !u32 {
     // On the (default, preferred) DGRAM path the kernel never puts an ICMP
     // error about our own probe on the normal receive queue -- it can only
     // be read back via IP_RECVERR + MSG_ERRQUEUE. Verified live under
@@ -2188,6 +2219,7 @@ test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket
         error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
         else => return err,
     };
+    p.targets.items[id].stats.icmp_errors = preset;
     const sock4 = &(p.sock4.?);
     // This test is specifically about the DGRAM path (A1 F5's "always 0"
     // claim does not apply to RAW, which already saw ICMP errors before
@@ -2235,7 +2267,16 @@ test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket
     sleepMs(50);
 
     try p.drainReplies(); // exercises drainErrQueue (A1 F5) internally
-    try std.testing.expectEqual(@as(u32, 1), p.stats(id).icmp_errors);
+    return p.stats(id).icmp_errors;
+}
+
+test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket's own probes" {
+    try std.testing.expectEqual(@as(u32, 1), try errQueueRoundTrip(0));
+}
+
+test "drainErrQueue: icmp_errors saturates at maxInt(u32) on a real error-queue entry" {
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), try errQueueRoundTrip(std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), try errQueueRoundTrip(std.math.maxInt(u32) - 1));
 }
 
 // ── tests: integration (loopback; skipped without ICMP socket access) ───────

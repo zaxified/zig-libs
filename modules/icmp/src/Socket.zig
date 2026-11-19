@@ -504,6 +504,11 @@ pub const ErrInfo = struct {
     /// for a Time Exceeded, which is what a traceroute wants. `.none` when
     /// the kernel gave none (a local error).
     offender: RecvInfo.SrcAddr = .none,
+    /// `ee_info`: for a Fragmentation Needed (ICMPv4 type 3 code 4) and a
+    /// Packet Too Big (ICMPv6 type 2) the next-hop MTU; also the path MTU
+    /// of a local `EMSGSIZE`. Other errors leave it at whatever the kernel
+    /// put there (usually 0), so read it only for those types.
+    ee_info: u32 = 0,
 };
 
 /// `ee_origin` values (linux/errqueue.h).
@@ -565,6 +570,7 @@ fn parseErrControl(ctl: []const u8, info: *ErrInfo) void {
             info.err_type = ee.ee_type;
             info.err_code = ee.ee_code;
             info.origin = ee.ee_origin;
+            info.ee_info = ee.ee_info;
             info.offender = parseSrcSlice(data[@sizeOf(sock_extended_err)..]);
         }
 
@@ -635,13 +641,15 @@ fn parseControl(control: []const u8, info: *RecvInfo) void {
     const cmsg_align = @alignOf(linux.cmsghdr);
     var off: usize = 0;
     while (off + hdr_len <= control.len) {
-        const cmsg: *const linux.cmsghdr = @ptrCast(@alignCast(control.ptr + off));
-        if (cmsg.len < hdr_len or off + cmsg.len > control.len) break;
+        const cmsg = std.mem.bytesToValue(linux.cmsghdr, control[off..][0..hdr_len]);
+        // `cmsg.len` is untrusted: compare against the room left, never add
+        // it to `off` (wraps for a lying length).
+        if (cmsg.len < hdr_len or cmsg.len > control.len - off) break;
         const data = control[off + hdr_len .. off + cmsg.len];
 
         if (cmsg.level == linux.SOL.SOCKET and cmsg.type == linux.SO.TIMESTAMPNS_OLD) {
             if (data.len >= @sizeOf(linux.timespec)) {
-                const ts: *const linux.timespec = @ptrCast(@alignCast(data.ptr));
+                const ts = std.mem.bytesToValue(linux.timespec, data[0..@sizeOf(linux.timespec)]);
                 info.timestamp_real_ns = @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
             }
         } else if (cmsg.level == linux.SOL.IP and cmsg.type == linux.IP.TTL) {
@@ -654,8 +662,11 @@ fn parseControl(control: []const u8, info: *RecvInfo) void {
             if (data.len >= 4) info.tos = @truncate(std.mem.readInt(u32, data[0..4], .little));
         }
 
-        // CMSG_NXTHDR: advance by len rounded up to cmsghdr alignment.
-        off += std.mem.alignForward(usize, cmsg.len, cmsg_align);
+        // CMSG_NXTHDR: advance by len rounded up to cmsghdr alignment; a
+        // step past the end ends the walk.
+        const step = std.mem.alignForward(usize, cmsg.len, cmsg_align);
+        if (step > control.len - off) break;
+        off += step;
     }
 }
 
@@ -1260,6 +1271,75 @@ test "parseErrControl: both families, exact sizes, wrong levels and the aligned 
     end = putCmsg(&buf, end, linux.SOL.IP, linux.IP.RECVERR, std.mem.asBytes(&ee2));
     parseErrControl(buf[0..end], &info);
     try std.testing.expectEqual(@as(u8, 11), info.err_type);
+}
+
+test "parseControl: a lying cmsg_len after a good cmsg ends the walk without overflow" {
+    // `off + cmsg.len` wrapped for a huge length once `off > 0`; the length is
+    // now compared against the room left, as the kernel's CMSG_NXTHDR does.
+    var buf: [128]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    const hdr_len = @sizeOf(linux.cmsghdr);
+    const lies = [_]usize{
+        std.math.maxInt(usize), // off + len wraps to off - 1
+        std.math.maxInt(usize) - hdr_len, // off + len wraps past zero
+        std.math.maxInt(usize) - 2, // alignForward would wrap
+        std.math.maxInt(usize) / 2,
+        hdr_len - 1, // shorter than its own header
+    };
+    for (lies) |lie| {
+        buf = @splat(0);
+        var info: RecvInfo = .{ .packet = &.{} };
+        const off = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TTL, &u32le(7));
+        const bad: linux.cmsghdr = .{ .len = lie, .level = linux.SOL.IP, .type = linux.IP.TOS };
+        @memcpy(buf[off..][0..hdr_len], std.mem.asBytes(&bad));
+        // A valid TOS cmsg behind the lie must not be reached.
+        _ = putCmsg(&buf, off + hdr_len, linux.SOL.IP, linux.IP.TOS, &[_]u8{0x20});
+        parseControl(buf[0 .. off + 2 * hdr_len + 8], &info);
+        try std.testing.expectEqual(@as(?u8, 7), info.ttl);
+        try std.testing.expectEqual(@as(?u8, null), info.tos);
+    }
+}
+
+test "parseControl: a cmsg whose aligned step leaves the buffer ends the walk" {
+    // Declared length fits (data ends at the buffer end) but its aligned step
+    // does not; the walk ends, the cmsg itself is still read.
+    var buf: [64]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    var info: RecvInfo = .{ .packet = &.{} };
+    _ = putCmsg(&buf, 0, linux.SOL.IP, linux.IP.TOS, &[_]u8{0x10});
+    parseControl(buf[0 .. @sizeOf(linux.cmsghdr) + 1], &info);
+    try std.testing.expectEqual(@as(?u8, 0x10), info.tos);
+}
+
+test "parseErrControl: ee_info carries the next-hop MTU (v4 Frag Needed, v6 Packet Too Big)" {
+    var buf: [128]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    var ee: sock_extended_err = .{
+        .ee_errno = @backingInt(linux.E.MSGSIZE),
+        .ee_origin = origin_icmp,
+        .ee_type = 3, // Destination Unreachable
+        .ee_code = 4, // Fragmentation Needed
+        .ee_pad = 0,
+        .ee_info = 1400,
+        .ee_data = 0,
+    };
+    const router: linux.sockaddr.in = .{ .port = 0, .addr = 0x0100000a };
+    var info: ErrInfo = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    try std.testing.expectEqual(@as(u32, 0), info.ee_info);
+    parseErrControl(testErrCmsg(&buf, linux.SOL.IP, linux.IP.RECVERR, ee, std.mem.asBytes(&router)), &info);
+    try std.testing.expectEqual(@as(u32, 1400), info.ee_info);
+    try std.testing.expectEqual(@as(u8, 4), info.err_code);
+
+    ee.ee_origin = origin_icmp6;
+    ee.ee_type = 2; // Packet Too Big
+    ee.ee_code = 0;
+    ee.ee_info = 0xfedc_ba98; // all four bytes are kept
+    const router6: linux.sockaddr.in6 = .{ .port = 0, .flowinfo = 0, .addr = @splat(1), .scope_id = 0 };
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    parseErrControl(testErrCmsg(&buf, linux.SOL.IPV6, linux.IPV6.RECVERR, ee, std.mem.asBytes(&router6)), &info);
+    try std.testing.expectEqual(@as(u32, 0xfedc_ba98), info.ee_info);
+
+    // A cmsg of another level never touches it.
+    info = .{ .packet = &.{}, .err_type = 0, .err_code = 0 };
+    parseErrControl(testErrCmsg(&buf, linux.SOL.SOCKET, linux.IP.RECVERR, ee, &.{}), &info);
+    try std.testing.expectEqual(@as(u32, 0), info.ee_info);
 }
 
 test "parseSrc and parseSrcSlice: lengths decide, a long slice is clamped" {

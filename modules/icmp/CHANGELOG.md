@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NEW (additive):** `Socket.ErrInfo.ee_info` (`sock_extended_err.ee_info`: the next-hop MTU of an ICMPv4 Fragmentation Needed / ICMPv6 Packet Too Big, default 0). **Fix (no behaviour change for kernel-generated data):** `parseControl` compares a cmsg's length against the room left instead of adding it to the offset, so a lying `cmsg_len` ends the walk instead of wrapping; `waitReadable` saturates the timespec seconds instead of a checked cast (matters on 32-bit targets only). Tests: crafted control buffers, an i32-seconds boundary test, and `icmp_errors` saturation on a real error-queue entry (needs CAP_NET_RAW, skips otherwise).
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** security-triage row icmp:140 (sequence-slot exhaustion by a fast honest responder) re-checked: already fixed by the 2026-10-31 slot recycling, whose SPEC text was stale. SPEC corrected (reference behaviour of fping and iputils recorded; eager purge on reply not adopted because it would end duplicate-reply counting) and a test added: 70 000 probes all answered in a row neither exhaust the id space nor time out.
 
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the `quoted_proto` doc comment claimed the IPv4 value is always 1; `parseV4` does not check the quoted protocol (fping and iputils ping do not either), so the comment now says it can be any value and a test pins that an error quoting UDP reports 17.
