@@ -322,7 +322,7 @@ declare -A TARGETS=(
     # ── 2026-10-10: ct-wave: MCP session id ──
     [mcp-http]="sid"
     # ── 2026-10-10: ct-wave: DNP3 SA session/update keys ──
-    [dnp3]="mac keys"
+    [dnp3]="mac keys keys5"
     # ── 2026-10-10: ct-wave: SNMPv3 USM password, auth + priv keys ──
     [snmp]="kdf auth aes des"
     [aes192]="enc dec bitsliced"
@@ -839,6 +839,7 @@ declare -A PATTERN=(
     [mcp-http/sid]='sidhex[.]zig|root[.]zig'
     [dnp3/mac]='sa[.]zig|burn[.]zig'
     [dnp3/keys]='sa[.]zig|burn[.]zig'
+    [dnp3/keys5]='sa[.]zig|burn[.]zig'
     [snmp/kdf]='usm[.]zig|burn[.]zig'
     [snmp/auth]='usm[.]zig|burn[.]zig'
     [snmp/aes]='priv[.]zig|burn[.]zig'
@@ -1228,6 +1229,7 @@ declare -A LABEL=(
     [mcp-http/sid]='mcp-http session-id hex (id tainted)'
     [dnp3/mac]='dnp3 SA MAC compute/verify + reply MAC (session key tainted)'
     [dnp3/keys]='dnp3 SA session key wrap/unwrap (update+session keys tainted)'
+    [dnp3/keys5]='dnp3 SAv5 key wrap/unwrap bound to the key-status message (update+session keys tainted)'
     [snmp/kdf]='snmp passwordToUserKey+localizeKey (password tainted)'
     [snmp/auth]='snmp HMAC digests all protocols (auth key tainted)'
     [snmp/aes]='snmp AES-128-CFB priv round trip (key+PDU tainted)'

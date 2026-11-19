@@ -16,6 +16,10 @@
 //!  * `keys` — the update key and both session keys tainted through
 //!    `wrapSessionKeys` and `unwrapSessionKeys` (AES Key Wrap, via `aeskw`),
 //!    16- and 32-byte session keys, plus a tampered unwrap.
+//!  * `keys5` — the same keys through the SAv5 layout,
+//!    `wrapSessionKeysWithStatus` / `unwrapSessionKeysWithStatus` (key length
+//!    and key-status message inside the wrap), plus a tampered unwrap and an
+//!    unwrap against another status message.
 //!
 //! The rest of DNP3 (link, transport, application, objects) is framing with
 //! no key material.
@@ -31,7 +35,7 @@ const builtin = @import("builtin");
 const dnp3 = @import("root.zig");
 
 const sa = dnp3.sa;
-const Target = enum { mac, keys };
+const Target = enum { mac, keys, keys5 };
 const Taint = enum { yes, no };
 
 fn secretBytes(comptime n: usize, label: []const u8) [n]u8 {
@@ -45,7 +49,14 @@ fn taintBytes(t: Taint, bytes: []u8) void {
 }
 
 fn verifyBoth(ok: bool, bad: bool) void {
-    std.debug.print("ctgrind_result={x}\n", .{[2]u8{ @intFromBool(ok), @intFromBool(bad) }});
+    // A verify verdict is public by design (it decides whether a message is
+    // accepted). It is declassified here instead of being left for the
+    // formatter to branch on: whether that branch lands in std's formatting
+    // frames (a witness) or on this line (unattributed) depends on how LLVM
+    // inlines `main`, and adding the `keys5` arm moved it here (2026-11-19).
+    var verdict = [2]u8{ @intFromBool(ok), @intFromBool(bad) };
+    std.valgrind.memcheck.makeMemDefined(&verdict);
+    std.debug.print("ctgrind_result={x}\n", .{verdict});
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -105,6 +116,30 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 bad[9] ^= 1;
                 const rej = if (sa.unwrapSessionKeys(&update, bad[0..wrapped.len], kl, &out)) |_| false else |_| true;
                 std.debug.print("ctgrind_result={x}\n", .{[1]u8{@intFromBool(rej)}});
+            }
+        },
+        .keys5 => {
+            var update = secretBytes(32, "ctgrind-dnp3-update-key-v1");
+            var control = secretBytes(32, "ctgrind-dnp3-control-key-v1");
+            var monitor = secretBytes(32, "ctgrind-dnp3-monitor-key-v1");
+            taintBytes(taint, &update);
+            taintBytes(taint, &control);
+            taintBytes(taint, &monitor);
+            // A g120v5 body as sent: public.
+            const status = "\x01\x00\x00\x00\x01\x00\x01\x02\x04\x04\x00ctgr";
+            for ([_]usize{ 16, 32 }) |kl| {
+                var wrapped_buf: [160]u8 = undefined;
+                const wrapped = try sa.wrapSessionKeysWithStatus(&update, control[0..kl], monitor[0..kl], status, &wrapped_buf);
+                std.debug.print("ctgrind_result={x}\n", .{wrapped});
+                std.valgrind.memcheck.makeMemDefined(wrapped); // on the wire
+                var out: [64]u8 = undefined;
+                const got = try sa.unwrapSessionKeysWithStatus(&update, wrapped, status, &out);
+                std.debug.print("ctgrind_result={x}\n", .{got.control_key});
+                var bad = wrapped_buf;
+                bad[9] ^= 1;
+                const rej = if (sa.unwrapSessionKeysWithStatus(&update, bad[0..wrapped.len], status, &out)) |_| false else |_| true;
+                const other = if (sa.unwrapSessionKeysWithStatus(&update, wrapped, "\x02\x00\x00\x00\x01\x00\x01\x02\x04\x04\x00ctgr", &out)) |_| false else |_| true;
+                std.debug.print("ctgrind_result={x}\n", .{[2]u8{ @intFromBool(rej), @intFromBool(other) }});
             }
         },
     }

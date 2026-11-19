@@ -56,9 +56,9 @@
 //! Deliberately not implemented — see README "Scope": unsolicited *retry*
 //! policy (the fragment builder is here, the retry timer is the caller's),
 //! file transfer (g70), data sets (g85-g88), device attributes (g0),
-//! octet strings (g110/g111), time-and-interval (g50v4), and Secure
-//! Authentication integration (`sa.zig` is a separate codec; nothing here
-//! wraps a fragment in g120 objects).
+//! octet strings (g110/g111) and time-and-interval (g50v4). Secure
+//! Authentication is opt-in through `setSecureAuth` (`secure_auth.zig`);
+//! without it no request is screened.
 //!
 //! Provenance: clean-room from IEEE 1815-2012. Behaviour cross-checked
 //! against opendnp3 (Apache-2.0) as a black-box peer only — its `master-demo`
@@ -71,6 +71,7 @@ const objects = @import("objects.zig");
 const records = @import("records.zig");
 const link = @import("link.zig");
 const transport = @import("transport.zig");
+const secure_auth = @import("secure_auth.zig");
 
 pub const Iin = application.Iin;
 pub const FunctionCode = application.FunctionCode;
@@ -513,6 +514,10 @@ pub const Outstation = struct {
     db: Database,
     events: EventBuffer,
     hook: ?CommandHook = null,
+    /// Secure Authentication, when attached (`setSecureAuth`). `null` — the
+    /// default — means no request is ever screened, and the outstation
+    /// behaves exactly as it did before SA existed.
+    secure_auth: ?*secure_auth.SecureAuth = null,
 
     // ── IIN state ──
     /// IIN1.7. Set at construction; only an explicit WRITE of g80v1 index 7
@@ -655,6 +660,14 @@ pub const Outstation = struct {
 
     pub fn setCommandHook(self: *Outstation, hook: ?CommandHook) void {
         self.hook = hook;
+    }
+
+    /// Attaches (or, with `null`, detaches) Secure Authentication: critical
+    /// requests are then challenged, aggressive-mode requests verified, and
+    /// AUTHENTICATE_REQUEST answered (see `secure_auth.zig`). The state is
+    /// caller-owned and must outlive the outstation.
+    pub fn setSecureAuth(self: *Outstation, auth: ?*secure_auth.SecureAuth) void {
+        self.secure_auth = auth;
     }
 
     // ── IIN ─────────────────────────────────────────────────────────────────
@@ -814,11 +827,40 @@ pub const Outstation = struct {
             return try self.errorResponse(seq, .{ .parameter_error = true }, out);
         }
 
-        // Any new request abandons an unfinished multi-fragment response.
+        // Secure Authentication screens first: a request it only challenges,
+        // refuses or ignores is not yet a request the outstation acts on, so
+        // it must not abandon a response series in progress either.
+        if (self.secure_auth) |auth| {
+            switch (try auth.screen(request, function, seq, body, peer, now_ms, self.iin(), out)) {
+                .pass => {},
+                .silent => return null,
+                .reply => |fragment| return .{ .fragment = fragment, .confirm_requested = false, .more = false },
+                .execute => |e| {
+                    self.beginRequest(e.seq);
+                    return try self.dispatch(e.function, e.seq, e.body, peer, now_ms, out);
+                },
+            }
+        }
+        self.beginRequest(seq);
+        return try self.dispatch(function, seq, body, peer, now_ms, out);
+    }
+
+    /// Any new request abandons an unfinished multi-fragment response.
+    fn beginRequest(self: *Outstation, seq: u4) void {
         self.cursor = null;
         self.awaiting_confirm = false;
         self.last_request_seq = seq;
+    }
 
+    fn dispatch(
+        self: *Outstation,
+        function: FunctionCode,
+        seq: u4,
+        body: []const u8,
+        peer: ?u16,
+        now_ms: u64,
+        out: []u8,
+    ) Error!?Reply {
         return switch (function) {
             .read => try self.doRead(seq, body, now_ms, out),
             .write => try self.doWrite(seq, body, now_ms, out),

@@ -708,6 +708,10 @@ pub const SessionKeyError = error{
 /// Wraps the control- and monitoring-direction session keys under the update
 /// key using AES-KW (RFC 3394), producing the g120v6 `wrapped_key_data`. Both
 /// keys must be the same length (16 or 32). Output is `2*key_len + 8` bytes.
+///
+/// Keys-only layout, not what SAv5 outstations use: an SAv5 key change also
+/// wraps the key-status message, which binds it to the outstation's fresh
+/// challenge data — see `wrapSessionKeysWithStatus`.
 pub fn wrapSessionKeys(
     update_key: []const u8,
     control_key: []const u8,
@@ -749,6 +753,9 @@ pub const UnwrappedSessionKeys = struct {
     monitoring_key: []const u8,
 };
 
+/// Keys-only layout, not what SAv5 outstations use (see
+/// `unwrapSessionKeysWithStatus`).
+///
 /// Unwraps g120v6 `wrapped_key_data` back into the two direction keys, writing
 /// them into `out` and returning slices into it. `key_len` is the per-direction
 /// key length used at wrap time (16 or 32). The recovered keys live in the
@@ -784,6 +791,123 @@ fn unwrapSessionKeysBody(
     return .{
         .control_key = recovered[0..key_len],
         .monitoring_key = recovered[key_len .. 2 * key_len],
+    };
+}
+
+// ── SAv5 session-key wrap: keys bound to the key-status message ──────────────
+//
+// Plaintext: key length (u16 LE) ‖ control key ‖ monitoring key ‖ the
+// key-status message ‖ zero padding to a multiple of 8 (AES-KW, RFC 3394,
+// needs one). The key-status message is the g120v5 object body exactly as
+// the outstation sent it (KSQ through challenge data, and its MAC when it
+// had one), without the 6-octet g120 object header. Including
+// it binds the change to that status's fresh random challenge data, so a
+// recorded g120v6 cannot be replayed once the outstation has sent a
+// different status — after a restart included, when the KSQ starts again.
+// Layout as read from IEEE 1815-2012 SAv5 for this module; not checked
+// against the standard's text or a foreign implementation (see SPEC).
+
+/// Longest key-status message the SAv5 wrap carries (fixed part + 64 octets
+/// of challenge data + a 16-octet MAC, with room to spare).
+pub const max_wrapped_status_len: usize = 160;
+/// Shortest key-status message the SAv5 unwrap accepts as the binding: the
+/// g120v5 fixed part plus the standard's minimum of 4 octets of challenge
+/// data. A shorter expected status (an empty one above all) would bind the
+/// change to nothing.
+pub const min_wrapped_status_len: usize = SessionKeyStatus.fixed_len + 4;
+const max_status_plain: usize = std.mem.alignForward(usize, 2 + 64 + max_wrapped_status_len, 8);
+
+/// Wraps both direction keys and `status_message` under the update key (the
+/// SAv5 layout above). Both keys must be 16 or 32 octets and equally long.
+pub fn wrapSessionKeysWithStatus(
+    update_key: []const u8,
+    control_key: []const u8,
+    monitoring_key: []const u8,
+    status_message: []const u8,
+    out: []u8,
+) SessionKeyError![]u8 {
+    return burn.run(burn.key_burn, SessionKeyError![]u8, wrapSessionKeysWithStatusBody, .{ update_key, control_key, monitoring_key, status_message, out });
+}
+
+fn wrapSessionKeysWithStatusBody(
+    update_key: []const u8,
+    control_key: []const u8,
+    monitoring_key: []const u8,
+    status_message: []const u8,
+    out: []u8,
+) SessionKeyError![]u8 {
+    if (control_key.len != monitoring_key.len) return error.KeyLength;
+    if (control_key.len != 16 and control_key.len != 32) return error.KeyLength;
+    if (status_message.len > max_wrapped_status_len) return error.BufferTooSmall;
+    const klen = control_key.len;
+    const used = 2 + 2 * klen + status_message.len;
+    const padded = std.mem.alignForward(usize, used, 8);
+    var plain: [max_status_plain]u8 = undefined;
+    defer std.crypto.secureZero(u8, &plain);
+    std.mem.writeInt(u16, plain[0..2], @intCast(klen), .little);
+    @memcpy(plain[2..][0..klen], control_key);
+    @memcpy(plain[2 + klen ..][0..klen], monitoring_key);
+    @memcpy(plain[2 + 2 * klen ..][0..status_message.len], status_message);
+    @memset(plain[used..padded], 0);
+    return aeskw.wrap(update_key, plain[0..padded], out) catch |e| switch (e) {
+        error.BufferTooSmall => error.BufferTooSmall,
+        else => error.KeyLength,
+    };
+}
+
+/// Unwraps an SAv5 g120v6 `wrapped_key_data` and checks, in constant time,
+/// that it carries exactly `expected_status` (the key-status message this
+/// outstation sent). The keys are written into `out` (at least 64 octets);
+/// the caller MUST `secureZero` it once they are installed.
+///
+/// Every failure that depends on the wrapped bytes — AES-KW integrity, a
+/// length field other than 16/32, a total length that is not the padded
+/// layout, another status message — is the one `error.Unauthentic`, and so
+/// is an `expected_status` shorter than `min_wrapped_status_len`, so a
+/// peer learns nothing about which check failed. `KeyLength` is reserved
+/// for an update key AES-KW cannot use, `BufferTooSmall` for `out`.
+pub fn unwrapSessionKeysWithStatus(
+    update_key: []const u8,
+    wrapped: []const u8,
+    expected_status: []const u8,
+    out: []u8,
+) SessionKeyError!UnwrappedSessionKeys {
+    return burn.run(burn.key_burn, SessionKeyError!UnwrappedSessionKeys, unwrapSessionKeysWithStatusBody, .{ update_key, wrapped, expected_status, out });
+}
+
+fn unwrapSessionKeysWithStatusBody(
+    update_key: []const u8,
+    wrapped: []const u8,
+    expected_status: []const u8,
+    out: []u8,
+) SessionKeyError!UnwrappedSessionKeys {
+    if (out.len < 64) return error.BufferTooSmall;
+    if (update_key.len != 16 and update_key.len != 24 and update_key.len != 32) return error.KeyLength;
+    if (expected_status.len < min_wrapped_status_len) return error.Unauthentic;
+    var plain: [max_status_plain]u8 = undefined;
+    defer std.crypto.secureZero(u8, &plain);
+    if (wrapped.len < 8 or wrapped.len - 8 > plain.len) return error.Unauthentic;
+    const recovered = aeskw.unwrap(update_key, wrapped, &plain) catch |e| switch (e) {
+        error.UnsupportedKeyLength => return error.KeyLength,
+        else => return error.Unauthentic,
+    };
+    // (AES-KW never recovers fewer than 16 octets, so the length field is
+    // always there.) AES-KW has authenticated the plaintext. Its length field and the
+    // status message are public (the status went out on the wire), so they
+    // are declassified for ctgrind before they steer a branch or an index
+    // (a no-op without `-fvalgrind`); the keys stay secret.
+    std.valgrind.memcheck.makeMemDefined(recovered[0..2]);
+    const klen: usize = std.mem.readInt(u16, recovered[0..2], .little);
+    var ok = klen == 16 or klen == 32;
+    const used = 2 + 2 * klen + expected_status.len;
+    ok = ok and recovered.len == std.mem.alignForward(usize, used, 8);
+    if (!ok) return error.Unauthentic;
+    std.valgrind.memcheck.makeMemDefined(recovered[2 + 2 * klen .. used]);
+    if (!ctEql(recovered[2 + 2 * klen .. used], expected_status)) return error.Unauthentic;
+    @memcpy(out[0 .. 2 * klen], recovered[2 .. 2 + 2 * klen]);
+    return .{
+        .control_key = out[0..klen],
+        .monitoring_key = out[klen .. 2 * klen],
     };
 }
 
@@ -920,6 +1044,79 @@ test "AES-KW: malformed lengths are typed errors, never panic" {
     try testing.expectError(error.InvalidLength, aeskw.wrap(&kek, &.{ 1, 2, 3 }, &buf)); // not mult of 8
     try testing.expectError(error.InvalidLength, aeskw.wrap(&kek, &(hexToBytes("0011223344556677")), &buf)); // < 16
     try testing.expectError(error.InvalidLength, aeskw.unwrap(&kek, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &buf)); // < 24
+}
+
+test "SAv5 key wrap: keys bound to the status message, every wire failure is Unauthentic" {
+    const uk = hexToBytes("000102030405060708090a0b0c0d0e0f");
+    const kc = hexToBytes("404142434445464748494a4b4c4d4e4f");
+    const km = hexToBytes("606162636465666768696a6b6c6d6e6f");
+    const status = hexToBytes("01000000010001020404000102030405"); // 16 octets
+    var w: [256]u8 = undefined;
+    const wrapped = try wrapSessionKeysWithStatus(&uk, &kc, &km, &status, &w);
+    try testing.expectEqual(@as(usize, 64), wrapped.len); // 2+32+16 = 50 -> 56 padded, + 8
+    var out: [64]u8 = undefined;
+    const keys = try unwrapSessionKeysWithStatus(&uk, wrapped, &status, &out);
+    try testing.expectEqualSlices(u8, &kc, keys.control_key);
+    try testing.expectEqualSlices(u8, &km, keys.monitoring_key);
+    // Another status (one octet of challenge data), another update key, a
+    // flipped octet, a truncation, a status of another length: all the same error.
+    var other = status;
+    other[15] ^= 0x80;
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, wrapped, &other, &out));
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&hexToBytes("ff0102030405060708090a0b0c0d0e0f"), wrapped, &status, &out));
+    var bad: [64]u8 = undefined;
+    @memcpy(&bad, wrapped);
+    bad[20] ^= 1;
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, &bad, &status, &out));
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, wrapped[0..48], &status, &out));
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, wrapped[0..5], &status, &out));
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, wrapped, status[0..8], &out));
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, wrapped, &(status ++ status), &out));
+    // The layout carries no status length of its own: an expected status
+    // that is a strict prefix of the wrapped one and pads to the same length
+    // compares equal on the bytes it has. The expected status is always the
+    // outstation's own, exact and fresh, so this is what the binding needs;
+    // padding contents are deliberately not checked (another implementation
+    // may pad differently).
+    _ = try unwrapSessionKeysWithStatus(&uk, wrapped, status[0..15], &out);
+    // An expected status shorter than a minimal g120v5 body binds nothing
+    // and is refused outright, even for data wrapped around exactly it; one
+    // of exactly the minimum length is accepted.
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, try wrapSessionKeysWithStatus(&uk, &kc, &km, &.{}, &w), &.{}, &out));
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, try wrapSessionKeysWithStatus(&uk, &kc, &km, status[0 .. min_wrapped_status_len - 1], &w), status[0 .. min_wrapped_status_len - 1], &out));
+    _ = try unwrapSessionKeysWithStatus(&uk, try wrapSessionKeysWithStatus(&uk, &kc, &km, status[0..min_wrapped_status_len], &w), status[0..min_wrapped_status_len], &out);
+    // A keys-only wrap (no length field, no status) is refused too.
+    const keys_only = try wrapSessionKeys(&uk, &kc, &km, &w);
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, keys_only, &.{}, &out));
+    // Caller errors stay distinct.
+    try testing.expectError(error.KeyLength, unwrapSessionKeysWithStatus(uk[0..15], wrapped, &status, &out));
+    // …even when the wrapped data is malformed as well: a caller's update
+    // key is a configuration error, reported before anything on the wire.
+    try testing.expectError(error.KeyLength, unwrapSessionKeysWithStatus(uk[0..15], wrapped[0..5], &status, &out));
+    try testing.expectError(error.BufferTooSmall, unwrapSessionKeysWithStatus(&uk, wrapped, &status, out[0..63]));
+    try testing.expectError(error.KeyLength, wrapSessionKeysWithStatus(&uk, &kc, km[0..8], &status, &w));
+    try testing.expectError(error.KeyLength, wrapSessionKeysWithStatus(&uk, kc[0..8], km[0..8], &status, &w));
+    // 32-octet keys.
+    const kc32: [32]u8 = @splat(0x11);
+    const km32: [32]u8 = @splat(0x22);
+    const w32 = try wrapSessionKeysWithStatus(&uk, &kc32, &km32, &status, &w);
+    const k32 = try unwrapSessionKeysWithStatus(&uk, w32, &status, &out);
+    try testing.expectEqualSlices(u8, &km32, k32.monitoring_key);
+    // A length field that lies (16 over a 32-octet pair), or names a size
+    // that is neither 16 nor 32 but fits the total exactly.
+    var plain: [88]u8 = @splat(0);
+    std.mem.writeInt(u16, plain[0..2], 16, .little);
+    @memcpy(plain[2..34], &kc32);
+    @memcpy(plain[34..66], &km32);
+    @memcpy(plain[66..82], &status);
+    var lie: [96]u8 = undefined;
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, try aeskw.wrap(&uk, &plain, &lie), &status, &out));
+    std.mem.writeInt(u16, plain[0..2], 24, .little); // 2+48+16 = 66 -> 72
+    @memcpy(plain[50..66], &status); // the status where a 24-octet pair would put it
+    try testing.expectError(error.Unauthentic, unwrapSessionKeysWithStatus(&uk, try aeskw.wrap(&uk, plain[0..72], &lie), &status, &out));
+    // Status longer than the layout allows is a caller error on wrap.
+    const long: [max_wrapped_status_len + 1]u8 = @splat(0);
+    try testing.expectError(error.BufferTooSmall, wrapSessionKeysWithStatus(&uk, &kc, &km, &long, &w));
 }
 
 test "MAC: HMAC-SHA-256 KAT (RFC 4231 case 2) at 8- and 16-octet truncations" {

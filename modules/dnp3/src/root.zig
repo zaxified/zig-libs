@@ -74,7 +74,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "DNP3 (IEEE 1815) base protocol — data-link framing + CRC-16/DNP, application layer, core object library; master + outstation; Secure Authentication v2 symmetric core (g120), no SAv5/6 asymmetric key change",
+    .doc = "DNP3 (IEEE 1815) base protocol — data-link framing + CRC-16/DNP, application layer, core object library; master + outstation; Secure Authentication symmetric (g120 codecs + opt-in outstation challenge/aggressive mode/session-key change), no SAv5/6 asymmetric key change",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -111,6 +111,10 @@ pub const records = @import("records.zig");
 /// responder over a caller-owned point database, plus a `Session` that wires
 /// it to the link and transport layers.
 pub const outstation = @import("outstation.zig");
+/// Secure Authentication (SAv5 symmetric) for the outstation: challenge of
+/// critical requests, aggressive mode, session-key change. Opt-in through
+/// `outstation.Outstation.setSecureAuth`.
+pub const secure_auth = @import("secure_auth.zig");
 /// Byte-exact wire goldens for both roles, including frames captured from a
 /// live opendnp3 master driving `outstation.Outstation`.
 pub const goldens = @import("goldens.zig");
@@ -126,6 +130,7 @@ test {
     _ = sa;
     _ = records;
     _ = outstation;
+    _ = secure_auth;
     _ = goldens;
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
