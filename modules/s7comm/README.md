@@ -50,8 +50,10 @@ fleet-simulation target.
 - **`userdata`** — the second request shape (ROSCTR 7) with its own
   sub-header: `Read SZL` for the system status list, including `0x0011`
   (module identification), `0x001C` (component identification) and `0x0424`
-  (operating mode, i.e. run/stop), and the time-of-day services (read and
-  set the CPU clock, 10-octet BCD date-time).
+  (operating mode, i.e. run/stop) and `0x0232` (protection), the
+  time-of-day services (read and set the CPU clock, 10-octet BCD date-time)
+  and the security services (session password set/clear; obfuscated, not
+  encrypted).
 - **`address`** — the STEP 7 notation every S7 tool takes: `DB1.DBW20`,
   `DB1.DBX0.3`, `M10.2`, `MB10`, `I0.0`, `E0.7`, `QW4`, `AB4`, `T5`, `C3`,
   `Z3`, `PIW256`, `PQB8`. Malformed forms (`DB1.DBX0.8`, `M10.8`, `DB0.DBW0`,
@@ -138,6 +140,8 @@ for (try plc.readMulti(&list, &payloads, &results)) |r| {
 const szl = try plc.readSzl(s7comm.SzlId.module_identification, 0);
 const state = try plc.cpuStatus(); // .run / .stop
 const now = try plc.readClock(); // userdata group 7, 10-octet BCD date-time
+const prot = try plc.readProtection(); // SZL 0x0232 index 4
+try plc.setSessionPassword("secret"); // group 5; error.PasswordRejected on 0xD602
 
 // ── responder (fleet-simulation target) ─────────────────────────────────────
 var db1: [256]u8 = @splat(0);

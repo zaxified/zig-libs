@@ -340,6 +340,121 @@ pub fn cpuStatusFrom(resp: SzlResponse) ?CpuStatus {
     return @fromBackingInt(@intCast(rec[cpu_status_offset]));
 }
 
+// ── Security (group 5) ──────────────────────────────────────────────────────
+
+/// Subfunctions of `security` (group 5).
+pub const SecuritySubfunction = enum(u8) {
+    /// Legitimate the session with the CPU password (data: the 8 encoded
+    /// password octets as an octet string).
+    set_password = 0x01,
+    /// Withdraw the legitimation (data: `0a 00 00 00`, no payload).
+    clear_password = 0x02,
+    _,
+};
+
+/// Userdata response error codes (the parameter block's `error code` word)
+/// this module produces or recognises. Texts as python-snap7 3.1.0's
+/// `error.py` lists them.
+pub const ErrorCode = struct {
+    /// "Service is not available" style refusal the responder uses for an
+    /// SZL list, clock or service it does not serve.
+    pub const not_available: u16 = 0xD401;
+    /// "Incorrect password entered".
+    pub const incorrect_password: u16 = 0xD602;
+    /// "Legitimization not possible because password does not exist".
+    pub const no_password: u16 = 0xD605;
+};
+
+/// Octets of a session password on the wire. S7-300/400 passwords are at
+/// most eight characters; a shorter one is padded with spaces.
+pub const password_len: usize = 8;
+
+/// Encodes a session password the way the CPU expects it: padded with spaces
+/// to eight octets, then `e[0] = p[0] ^ 0x55`, `e[1] = p[1] ^ 0x55`,
+/// `e[i] = p[i] ^ 0x55 ^ e[i-2]` for `i` = 2..7. Characters past the eighth
+/// are ignored, as gos7 (BSD-3, `security.go` `SetSessionPassword`) and the
+/// Snap7 documentation describe; the CPU never stores more than eight. This
+/// is an obfuscation, not a protection: anyone on the wire can undo it
+/// (`decodePassword`).
+pub fn encodePassword(password: []const u8) [password_len]u8 {
+    var e: [password_len]u8 = @splat(' ');
+    const n = @min(password.len, password_len);
+    @memcpy(e[0..n], password[0..n]);
+    e[0] ^= 0x55;
+    e[1] ^= 0x55;
+    var i: usize = 2;
+    while (i < password_len) : (i += 1) e[i] = e[i] ^ 0x55 ^ e[i - 2];
+    return e;
+}
+
+/// Inverts `encodePassword`: the eight space-padded password octets (the
+/// padding is kept; `std.mem.trimEnd(u8, &p, " ")` gives the password).
+pub fn decodePassword(encoded: [password_len]u8) [password_len]u8 {
+    var p: [password_len]u8 = undefined;
+    p[0] = encoded[0] ^ 0x55;
+    p[1] = encoded[1] ^ 0x55;
+    var i: usize = 2;
+    while (i < password_len) : (i += 1) p[i] = encoded[i] ^ 0x55 ^ encoded[i - 2];
+    return p;
+}
+
+/// The protection record, SZL `0x0232` index `0x0004`: the record starts
+/// with its index word (`0x0004`), then five big-endian words. Layout after
+/// gos7 (BSD-3, `security.go` `GetProtection`, which reads index 4 and the
+/// words at record offsets 2, 4, 6, 8, 10) and the Snap7 documentation
+/// (`Cli_GetProtection`: "SZL ID 0x0232 index 0x0004"). Note: python-snap7
+/// 3.1.0 reads index 0 and takes the words from offset 0, and its emulator
+/// serves five words without the index word; it is not a layout oracle for
+/// this record. Field meanings are from the Siemens system-software manual
+/// as python-snap7 quotes it; the values are passed through, not judged.
+pub const Protection = struct {
+    /// How the protection level is set (1 = key switch / no password,
+    /// 2 = password level 1, 3 = password level 2, as python-snap7 lists it).
+    sch_schal: u16,
+    /// Protection level set by parameter.
+    sch_par: u16,
+    /// Protection level in effect for this CPU.
+    sch_rel: u16,
+    /// Position of the mode selector.
+    bart_sch: u16,
+    /// Position of the startup switch.
+    anl_sch: u16,
+
+    /// The record index the words sit behind.
+    pub const szl_index: u16 = 0x0004;
+    /// Octets the record needs: the index word and five words.
+    pub const min_record_len: usize = 12;
+
+    /// Encodes the 12-octet record (index word first).
+    pub fn encodeRecord(self: Protection, out: []u8) Error![]u8 {
+        if (out.len < min_record_len) return error.BufferTooSmall;
+        const words = [6]u16{ szl_index, self.sch_schal, self.sch_par, self.sch_rel, self.bart_sch, self.anl_sch };
+        for (words, 0..) |w, i| std.mem.writeInt(u16, out[i * 2 ..][0..2], w, .big);
+        return out[0..min_record_len];
+    }
+};
+
+/// Reads the protection words out of an SZL `0x0232` index `0x0004`
+/// response. Null when there is no record, it is shorter than 12 octets, or
+/// its index word is not `0x0004` (some other record of the list).
+pub fn protectionFrom(resp: SzlResponse) ?Protection {
+    const rec = resp.record(0) orelse return null;
+    if (rec.len < Protection.min_record_len) return null;
+    const w = struct {
+        fn at(r: []const u8, off: usize) u16 {
+            return std.mem.readInt(u16, r[off..][0..2], .big);
+        }
+    }.at;
+    if (w(rec, 0) != Protection.szl_index) return null;
+    return .{
+        .sch_schal = w(rec, 2),
+        .sch_par = w(rec, 4),
+        .sch_rel = w(rec, 6),
+        .bart_sch = w(rec, 8),
+        .anl_sch = w(rec, 10),
+    };
+}
+
 // ── Time of day ─────────────────────────────────────────────────────────────
 
 /// The S7 date-time of the time-of-day services, the 10-octet BCD form:
@@ -652,6 +767,59 @@ test "date-time decode rejects bad BCD, ranges and lengths" {
     try testing.expectError(error.BadDateTime, (DateTime{ .year = 2026, .month = 1, .day = 1, .weekday = 8 }).encode(&out));
 }
 
+test "session password encoding: gos7's wire bytes, the inverse, padding and truncation" {
+    // What gos7 (BSD-3, commit 153d631d8881) put on the wire for these
+    // passwords (tools/gos7_client_drive against the live responder).
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x26, 0x62, 0x1f, 0x5e, 0x3c, 0x6e, 0x49, 0x1b }, &encodePassword("s7live"));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x3b, 0x3a, 0x1e, 0x0a, 0x6b, 0x7f, 0x1e, 0x0a }, &encodePassword("nope"));
+    // Eight characters fill it; a ninth is ignored.
+    try testing.expectEqual(encodePassword("abcdefgh"), encodePassword("abcdefghXYZ"));
+    try testing.expect(!std.mem.eql(u8, &encodePassword("abcdefgh"), &encodePassword("abcdefgX")));
+    // Every position counts (the chain reaches back two octets).
+    var base = encodePassword("12345678");
+    for (0..password_len) |i| {
+        var pw = "12345678".*;
+        pw[i] = 'x';
+        try testing.expect(!std.mem.eql(u8, &base, &encodePassword(&pw)));
+    }
+    // The inverse gives the space-padded password back.
+    try testing.expectEqualSlices(u8, "s7live  ", &decodePassword(encodePassword("s7live")));
+    try testing.expectEqualSlices(u8, "        ", &decodePassword(encodePassword("")));
+    base = encodePassword("\xff\x00\x80\x7f\x01\xfe\x55\xaa");
+    try testing.expectEqualSlices(u8, "\xff\x00\x80\x7f\x01\xfe\x55\xaa", &decodePassword(base));
+}
+
+test "protection record: index word, five words, refusals" {
+    const p: Protection = .{ .sch_schal = 2, .sch_par = 3, .sch_rel = 1, .bart_sch = 3, .anl_sch = 0x1234 };
+    var rec: [16]u8 = undefined;
+    const enc = try p.encodeRecord(&rec);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 4, 0, 2, 0, 3, 0, 1, 0, 3, 0x12, 0x34 }, enc);
+    try testing.expectError(error.BufferTooSmall, p.encodeRecord(rec[0..11]));
+
+    var wire: [64]u8 = undefined;
+    const h: SzlHeader = .{ .id = SzlId.protection_status, .index = 4, .record_length = 12, .record_count = 1 };
+    try testing.expectEqual(p, protectionFrom(try SzlResponse.decode(try SzlResponse.encode(h, enc, &wire))).?);
+    // A real CPU's record is longer (reserved words behind); only the first 12 octets are read.
+    var long: [40]u8 = @splat(0xEE);
+    @memcpy(long[0..12], enc);
+    var hl = h;
+    hl.record_length = 40;
+    try testing.expectEqual(p, protectionFrom(try SzlResponse.decode(try SzlResponse.encode(hl, &long, &wire))).?);
+    // Too short, another index word, no record at all.
+    var hs = h;
+    hs.record_length = 11;
+    try testing.expect(protectionFrom(try SzlResponse.decode(try SzlResponse.encode(hs, enc[0..11], &wire))) == null);
+    var other = enc[0..12].*;
+    other[1] = 0x05;
+    try testing.expect(protectionFrom(try SzlResponse.decode(try SzlResponse.encode(h, &other, &wire))) == null);
+    other[0] = 0x01;
+    other[1] = 0x04;
+    try testing.expect(protectionFrom(try SzlResponse.decode(try SzlResponse.encode(h, &other, &wire))) == null);
+    var h0 = h;
+    h0.record_count = 0;
+    try testing.expect(protectionFrom(try SzlResponse.decode(try SzlResponse.encode(h0, &.{}, &wire))) == null);
+}
+
 test "weekdayOf: 1 = Sunday" {
     try testing.expectEqual(@as(u8, 5), DateTime.weekdayOf(2026, 11, 19)); // Thursday
     try testing.expectEqual(@as(u8, 7), DateTime.weekdayOf(2000, 1, 1)); // Saturday
@@ -715,13 +883,14 @@ const userdata_seeds = [_][]const u8{
     fuzzSeed("0020261319134a599875"), // month 13, minute BCD digit A
     fuzzSeed("00201902291200000000"), // 29 February 2019
     fuzzSeed("0020261119134599"), // a date-time two octets short
+    fuzzSeed("02320004000c0001000400020003000100030002"), // SZL 0x0232 index 4: a protection record
 };
 
 test "fuzz: userdata decoders never panic" {
     try std.testing.fuzz({}, fuzzUserdataSmith, .{ .corpus = &userdata_seeds });
 }
 
-const fuzzUserdataMark = fz.Marker(enum { ran, nonempty, clock_decoded, clock_rejected });
+const fuzzUserdataMark = fz.Marker(enum { ran, nonempty, clock_decoded, clock_rejected, protection_decoded });
 
 fn fuzzUserdataSmith(_: void, smith: *std.testing.Smith) !void {
     try fuzzUserdata(std.testing.Smith, smith, std.testing.allocator);
@@ -757,6 +926,12 @@ fn fuzzUserdata(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         if (len == DateTime.wire_len) fuzzUserdataMark.mark(.clock_rejected);
     }
     if (SzlResponse.decode(buf[0..len])) |r| {
+        if (protectionFrom(r)) |p| {
+            fuzzUserdataMark.mark(.protection_decoded);
+            // Whatever decoded re-encodes to the record's first 12 octets.
+            var again: [Protection.min_record_len]u8 = undefined;
+            try testing.expectEqualSlices(u8, r.record(0).?[0..Protection.min_record_len], try p.encodeRecord(&again));
+        }
         var i: usize = 0;
         while (i < 300) : (i += 1) {
             const rec = r.record(i) orelse break;

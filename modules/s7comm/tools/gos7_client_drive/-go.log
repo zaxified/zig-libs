@@ -1,0 +1,10 @@
+db read 1.0..8               err=<nil> ok=true
+db1                          a500000000000000
+db write 1.4..8              err=<nil> ok=true
+set password (wrong)         err=CPU : Invalid password ok=true
+set password (right)         err=<nil> ok=true
+set password (9 chars)       err=<nil> ok=true
+clear password               err=<nil> ok=true
+get protection               err=<nil> ok=true
+protection                   {schSchal:2 schPar:3 schRel:1 bartSch:3 anlSch:2}
+ALL OK

@@ -56,6 +56,16 @@ pub const Config = struct {
     /// the same "not available" error as an unknown SZL. There is no system
     /// time anywhere in this module; the caller supplies the clock.
     clock: ?Clock = null,
+    /// Security services (group 5): the CPU password a set-password request
+    /// is checked against (its first eight characters, as the CPU keeps).
+    /// Null: no password is configured and set/clear are both answered with
+    /// success, as python-snap7 3.1.0's emulator does. A correct password
+    /// sets `Responder.legitimated`; nothing in the responder is gated on
+    /// it (it enforces no access level, see SPEC "Threat model").
+    password: ?[]const u8 = null,
+    /// SZL `0x0232` index `0x0004` (protection). Null: the list is answered
+    /// "not available".
+    protection: ?userdata.Protection = null,
 };
 
 /// A caller-supplied clock for the time-of-day services.
@@ -84,6 +94,10 @@ pub const Responder = struct {
     connected: bool = false,
     /// Set by a PLC control request when `allow_plc_control` is on.
     stopped: bool = false,
+    /// The session presented the configured password (group 5); cleared by
+    /// a clear-password request, a failed set, and a COTP connect or
+    /// disconnect (a legitimation belongs to one connection).
+    legitimated: bool = false,
 
     pub fn init(config: Config, areas: []const AreaBinding) Responder {
         return .{ .config = config, .areas = areas };
@@ -105,6 +119,8 @@ pub const Responder = struct {
         switch (try cotp.decode(pkt.payload)) {
             .cr => |cr| {
                 self.connected = true;
+                // A legitimation belongs to one connection.
+                self.legitimated = false;
                 var body: [64]u8 = undefined;
                 // Echo the client's parameters back, which is what a real CPU
                 // does and what makes the rack/slot round trip visible.
@@ -121,6 +137,7 @@ pub const Responder = struct {
             },
             .dr, .dc => {
                 self.connected = false;
+                self.legitimated = false;
                 return null;
             },
             .dt => |dt| {
@@ -297,6 +314,7 @@ pub const Responder = struct {
     fn handleUserdata(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
         const p = try userdata.Param.decode(pdu.parameters);
         if (p.function_group == .time_functions) return self.handleTime(p, pdu, out);
+        if (p.function_group == .security) return self.handleSecurity(p, pdu, out);
         if (p.function_group != .cpu_functions or
             p.subfunction != @backingInt(userdata.CpuSubfunction.read_szl))
         {
@@ -327,6 +345,17 @@ pub const Responder = struct {
                 break :blk try userdata.SzlResponse.encode(
                     .{ .id = req.id, .index = req.index, .record_length = 20, .record_count = 1 },
                     &rec,
+                    &payload,
+                );
+            },
+            userdata.SzlId.protection_status => blk: {
+                const prot = self.config.protection orelse break :blk null;
+                if (req.index != userdata.Protection.szl_index) break :blk null;
+                var rec: [userdata.Protection.min_record_len]u8 = undefined;
+                const r = try prot.encodeRecord(&rec);
+                break :blk try userdata.SzlResponse.encode(
+                    .{ .id = req.id, .index = req.index, .record_length = @intCast(r.len), .record_count = 1 },
+                    r,
                     &payload,
                 );
             },
@@ -404,6 +433,70 @@ pub const Responder = struct {
         var data: [4 + userdata.DateTime.wire_len]u8 = undefined;
         const db = if (result) |r|
             try userdata.DataBlock.encode(.success, .octet_string, r, &data)
+        else
+            try userdata.DataBlock.encode(rc, .null_size, &.{}, &data);
+        return self.frame(.userdata, pdu.header.pdu_reference, rp, db, out, false);
+    }
+
+    /// Group 5. Set password: the data block must be an octet string of
+    /// exactly eight encoded octets; they are compared, in constant time,
+    /// with the configured password encoded the same way. A wrong password
+    /// is error code `0xD602`, a malformed request `0xD401`, an unknown
+    /// subfunction `0xD401`; each is a response, never a dropped reply.
+    /// Clear password always succeeds and drops the legitimation.
+    fn handleSecurity(self: *Responder, p: userdata.Param, pdu: s7.Pdu, out: []u8) Error![]u8 {
+        // Only a request is served; anything else is answered like an
+        // unknown subfunction and changes no state.
+        const sub: userdata.SecuritySubfunction = if (p.message_type == .request) @fromBackingInt(p.subfunction) else @fromBackingInt(0);
+        var code: u16 = userdata.ErrorCode.not_available;
+        var rc: items.ReturnCode = .object_does_not_exist;
+        switch (sub) {
+            .set_password => blk: {
+                // Any set that does not succeed leaves the session without
+                // a legitimation, whatever it had before.
+                self.legitimated = false;
+                const db = userdata.DataBlock.decode(pdu.data) catch {
+                    rc = .data_type_inconsistent;
+                    break :blk;
+                };
+                if (!db.return_code.isSuccess() or db.transport_size != .octet_string or
+                    db.payload.len != userdata.password_len)
+                {
+                    rc = .data_type_inconsistent;
+                    break :blk;
+                }
+                const want = self.config.password orelse {
+                    self.legitimated = true;
+                    code = 0;
+                    break :blk;
+                };
+                const enc = userdata.encodePassword(want);
+                if (std.crypto.timing_safe.eql([userdata.password_len]u8, enc, db.payload[0..userdata.password_len].*)) {
+                    self.legitimated = true;
+                    code = 0;
+                } else {
+                    code = userdata.ErrorCode.incorrect_password;
+                }
+            },
+            .clear_password => {
+                self.legitimated = false;
+                code = 0;
+            },
+            _ => {},
+        }
+
+        var params: [userdata.Param.response_len]u8 = undefined;
+        const rp = try (userdata.Param{
+            .message_type = .response,
+            .function_group = .security,
+            .subfunction = p.subfunction,
+            .sequence = p.sequence,
+            .last_data_unit = .no_more,
+            .error_code = code,
+        }).encodeResponse(&params);
+        var data: [4]u8 = undefined;
+        const db = if (code == 0)
+            try userdata.DataBlock.encode(.success, .octet_string, &.{}, &data)
         else
             try userdata.DataBlock.encode(rc, .null_size, &.{}, &data);
         return self.frame(.userdata, pdu.header.pdu_reference, rp, db, out, false);
@@ -737,6 +830,118 @@ test "clock services refuse politely: no clock, read-only clock, malformed date-
     var fb: [64]u8 = undefined;
     const u = (try r2.handle(hex("0300001d02f080320700000300000800040001120411470900" ++ "0a000000", &fb), &out)).?;
     try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, u[27..29]);
+}
+
+// gos7 (BSD-3, commit 153d631d8881) on the wire against the live responder
+// (tools/gos7_client_drive), password "s7live", and the replies gos7 accepted.
+const gos7_set_right = "0300002502f0803207000027000008000c0001120411450100" ++ "ff09000826621f5e3c6e491b";
+const gos7_set_wrong = "0300002502f0803207000027000008000c0001120411450100" ++ "ff0900083b3a1e0a6b7f1e0a";
+const gos7_clear = "0300001d02f0803207000029000008000400011204114502000a000000";
+
+test "security group 5: gos7's requests get the replies gos7 accepted" {
+    var r = Responder.init(.{ .password = "s7live" }, &.{});
+    var req: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    var want: [64]u8 = undefined;
+    var rep = (try r.handle(hex(gos7_set_wrong, &req), &out)).?;
+    try testing.expectEqualSlices(u8, hex("0300002102f080320700002700000c000400011208128501000000d6020a000000", &want), rep);
+    try testing.expect(!r.legitimated);
+    rep = (try r.handle(hex(gos7_set_right, &req), &out)).?;
+    try testing.expectEqualSlices(u8, hex("0300002102f080320700002700000c0004000112081285010000000000ff090000", &want), rep);
+    try testing.expect(r.legitimated);
+    // A wrong password after a right one withdraws the legitimation.
+    _ = (try r.handle(hex(gos7_set_wrong, &req), &out)).?;
+    try testing.expect(!r.legitimated);
+    _ = (try r.handle(hex(gos7_set_right, &req), &out)).?;
+    rep = (try r.handle(hex(gos7_clear, &req), &out)).?;
+    try testing.expectEqualSlices(u8, hex("0300002102f080320700002900000c0004000112081285020000000000ff090000", &want), rep);
+    try testing.expect(!r.legitimated);
+}
+
+test "security group 5: malformed and unknown requests are refused with a reply" {
+    var r = Responder.init(.{ .password = "s7live" }, &.{});
+    var out: [128]u8 = undefined;
+    // Seven octets, eight with a failing return code, a data block cut inside
+    // its header: 0xD401 + data_type_inconsistent, never a legitimation.
+    const bad = [_][]const u8{
+        "0300002402f0803207000027000008000b0001120411450100" ++ "ff09000726621f5e3c6e49",
+        "0300002502f0803207000027000008000c0001120411450100" ++ "0a09000826621f5e3c6e491b",
+        "0300001b02f080320700002700000800020001120411450100" ++ "ff09",
+        // nine octets: the right password plus one
+        "0300002602f0803207000027000008000d0001120411450100" ++ "ff09000926621f5e3c6e491b00",
+    };
+    inline for (bad) |frame| {
+        // Each refusal follows a successful login and withdraws it.
+        var fr: [64]u8 = undefined;
+        _ = (try r.handle(hex(gos7_set_right, &fr), &out)).?;
+        try testing.expect(r.legitimated);
+        var fb: [64]u8 = undefined;
+        const rep = (try r.handle(hex(frame, &fb), &out)).?;
+        try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, rep[27..29]);
+        try testing.expectEqual(@as(u8, 0x07), rep[29]);
+        try testing.expect(!r.legitimated);
+    }
+    // The right password as a bit string (transport size 3, 64 bits = 8
+    // octets) is a failed set: refused, and the legitimation is dropped.
+    // In a frame typed as a response it is refused and changes nothing.
+    const Odd = struct { frame: []const u8, keeps: bool };
+    inline for ([_]Odd{
+        .{ .frame = "0300002502f0803207000027000008000c0001120411450100" ++ "ff03004026621f5e3c6e491b", .keeps = false },
+        .{ .frame = "0300002502f0803207000027000008000c0001120411850100" ++ "ff09000826621f5e3c6e491b", .keeps = true },
+    }) |o| {
+        var fr: [64]u8 = undefined;
+        _ = (try r.handle(hex(gos7_set_right, &fr), &out)).?;
+        var fb2: [64]u8 = undefined;
+        const rep = (try r.handle(hex(o.frame, &fb2), &out)).?;
+        try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, rep[27..29]);
+        try testing.expectEqual(o.keeps, r.legitimated);
+    }
+    {
+        // ... and never legitimates on its own.
+        var fr: [64]u8 = undefined;
+        _ = (try r.handle(hex(gos7_set_wrong, &fr), &out)).?;
+        var fb2: [64]u8 = undefined;
+        _ = (try r.handle(hex("0300002502f0803207000027000008000c0001120411850100" ++ "ff09000826621f5e3c6e491b", &fb2), &out)).?;
+        try testing.expect(!r.legitimated);
+    }
+    // A legitimation belongs to one connection: a COTP disconnect or a new
+    // connect drops it.
+    {
+        var fr: [64]u8 = undefined;
+        _ = (try r.handle(hex(gos7_set_right, &fr), &out)).?;
+        try testing.expect(r.legitimated);
+        var dr: [16]u8 = undefined;
+        try testing.expect((try r.handle(hex("0300000b06800000000100", &dr), &out)) == null);
+        try testing.expect(!r.legitimated);
+        _ = (try r.handle(hex(gos7_set_right, &fr), &out)).?;
+        var cr: [32]u8 = undefined;
+        _ = (try r.handle(hex("0300001611e00000000100c0010ac1020100c2020122", &cr), &out)).?;
+        try testing.expect(!r.legitimated);
+    }
+    // An unknown security subfunction.
+    var fb: [64]u8 = undefined;
+    const u = (try r.handle(hex("0300001d02f0803207000029000008000400011204114503000a000000", &fb), &out)).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x85, 0x03 }, u[22..24]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, u[27..29]);
+    try testing.expectEqual(@as(u8, 0x0A), u[29]);
+}
+
+test "SZL 0x0232: index 4 only, and only when configured" {
+    const szl_0232 = "0300002102f080320700000001000800080001120411440100" ++ "ff09000402320004";
+    const szl_0232_idx0 = "0300002102f080320700000001000800080001120411440100" ++ "ff09000402320000";
+    var req: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    var want: [64]u8 = undefined;
+    var r = Responder.init(.{ .protection = .{ .sch_schal = 2, .sch_par = 3, .sch_rel = 1, .bart_sch = 3, .anl_sch = 2 } }, &.{});
+    // The reply gos7's GetProtection accepted (tools/gos7_client_drive).
+    const rep = (try r.handle(hex(szl_0232, &req), &out)).?;
+    try testing.expectEqualSlices(u8, hex("0300003502f080320700000001000c0018000112081284010000000000ff09001402320004000c0001000400020003000100030002", &want), rep);
+    // python-snap7 3.1.0 asks for index 0: not this record.
+    const r0 = (try r.handle(hex(szl_0232_idx0, &req), &out)).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, r0[27..29]);
+    var none = Responder.init(.{}, &.{});
+    const n = (try none.handle(hex(szl_0232, &req), &out)).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xD4, 0x01 }, n[27..29]);
 }
 
 test "clock responder: alternate set subfunction, sequence echo, a clock that returns garbage" {
@@ -1130,6 +1335,43 @@ fn fuzzClockRequest(smith: anytype, out: []u8) ?[]const u8 {
     return fuzzEnvelope(0x07, p, db, out);
 }
 
+/// A group-5 request: mostly a set-password with the harness's password
+/// (`fuzz_password`), maybe damaged or resized, sometimes a clear or an
+/// unknown subfunction.
+fn fuzzSecurityRequest(smith: anytype, out: []u8) ?[]const u8 {
+    var params: [userdata.Param.request_len]u8 = undefined;
+    const sub: u8 = if (drawOdds(smith, 7, 8)) @intCast(1 + drawBelow(smith, 2)) else drawWide(smith, u8);
+    const p = (userdata.Param{
+        .message_type = .request,
+        .function_group = .security,
+        .subfunction = sub,
+        .sequence = drawWide(smith, u8),
+    }).encodeRequest(&params) catch return null;
+    var payload: [12]u8 = undefined;
+    var n: usize = userdata.password_len;
+    if (drawOdds(smith, 1, 2)) {
+        payload[0..8].* = userdata.encodePassword(fuzz_password);
+        if (drawOdds(smith, 1, 3)) payload[drawBelow(smith, 8)] = drawWide(smith, u8);
+    } else {
+        for (payload[0..8]) |*b| b.* = drawWide(smith, u8);
+    }
+    if (drawOdds(smith, 1, 5)) {
+        n = @intCast(drawBelow(smith, 13));
+        for (payload[8..]) |*b| b.* = drawWide(smith, u8);
+    }
+    const rc: u8 = if (drawOdds(smith, 9, 10)) 0xFF else drawWide(smith, u8);
+    var data: [20]u8 = undefined;
+    const db = userdata.DataBlock.encode(
+        @fromBackingInt(@intCast(rc)),
+        @fromBackingInt(@intCast(0x09)),
+        payload[0..n],
+        &data,
+    ) catch return null;
+    return fuzzEnvelope(0x07, p, db, out);
+}
+
+const fuzz_password = "fz-pw";
+
 /// Builds one request. Returns null when this draw could not be assembled, in
 /// which case the caller simply moves on.
 fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
@@ -1189,9 +1431,11 @@ fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
             smith.bytes(params[1..][0..tail]);
             plen = 1 + tail;
         },
-        // Userdata: half of it is the time-of-day group (7), the rest Read SZL.
+        // Userdata: half of it is the time-of-day group (7), a sixth the
+        // security group (5), the rest Read SZL.
         else => {
             if (drawOdds(smith, 1, 2)) return fuzzClockRequest(smith, out);
+            if (drawOdds(smith, 1, 3)) return fuzzSecurityRequest(smith, out);
             rosctr = 0x07;
             const p = (userdata.Param{
                 .message_type = @fromBackingInt(@intCast(@as(u4, @truncate(if (drawOdds(smith, 7, 8)) @as(u8, 0) else drawWide(smith, u8))))),
@@ -1204,7 +1448,7 @@ fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
             smith.bytes(payload[0..n]);
             if (n >= 2 and drawOdds(smith, 3, 4)) {
                 // Steer the list id onto one the responder implements.
-                const known = [_]u16{ 0x0011, 0x0424 };
+                const known = [_]u16{ 0x0011, 0x0424, 0x0232 };
                 const id = known[@intCast(drawBelow(smith, known.len))];
                 payload[0] = @intCast(id >> 8);
                 payload[1] = @truncate(id);
@@ -1222,7 +1466,7 @@ fn fuzzRequest(smith: anytype, out: []u8) ?[]const u8 {
 }
 
 const fz = @import("fuzz_test.zig");
-const fuzzHandleMark = fz.Marker(enum { ran, request_built, replied, clock_request, clock_read_ok, clock_set_applied, clock_refused });
+const fuzzHandleMark = fz.Marker(enum { ran, request_built, replied, clock_request, clock_read_ok, clock_set_applied, clock_refused, password_accepted, password_refused });
 
 /// Clock callbacks for the harness: `set` counts the date-times that got
 /// through validation, and every such value must satisfy `validate`.
@@ -1262,7 +1506,13 @@ fn fuzzHandle(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     };
     var szl: [56]u8 = @splat(0x5A);
     var r = Responder.init(
-        .{ .allow_plc_control = true, .szl_0011 = &szl, .clock = .{ .now = FuzzClock.now, .set = FuzzClock.set } },
+        .{
+            .allow_plc_control = true,
+            .szl_0011 = &szl,
+            .clock = .{ .now = FuzzClock.now, .set = FuzzClock.set },
+            .password = fuzz_password,
+            .protection = .{ .sch_schal = 2, .sch_par = 1, .sch_rel = 1, .bart_sch = 1, .anl_sch = 0 },
+        },
         &areas,
     );
     var frame_buf: [1024]u8 = undefined;
@@ -1274,10 +1524,20 @@ fn fuzzHandle(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
         const frame = fuzzRequest(smith, &frame_buf) orelse continue;
         fuzzHandleMark.mark(.request_built);
         const is_clock = frame.len >= 25 and frame[8] == 0x07 and frame[22] == 0x47;
+        const is_set_pw = frame.len >= 25 and frame[8] == 0x07 and frame[22] == 0x45 and frame[23] == 0x01;
         if (is_clock) fuzzHandleMark.mark(.clock_request);
         const sets_before = FuzzClock.sets;
         const reply = r.handle(frame, &out) catch continue;
         if (reply != null) fuzzHandleMark.mark(.replied);
+        if (is_set_pw) {
+            // Legitimated exactly when the data block carried the encoded
+            // password: success, octet string, eight octets.
+            const want = userdata.encodePassword(fuzz_password);
+            const right = frame.len == 37 and frame[25] == 0xFF and frame[26] == 0x09 and
+                frame[27] == 0x00 and frame[28] == 0x08 and std.mem.eql(u8, frame[29..37], &want);
+            try testing.expectEqual(right, r.legitimated);
+            if (right) fuzzHandleMark.mark(.password_accepted) else fuzzHandleMark.mark(.password_refused);
+        }
         if (is_clock) {
             const rep = reply orelse continue;
             // Never a value past validation, whatever the wire said.

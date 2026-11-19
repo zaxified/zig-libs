@@ -154,6 +154,7 @@ pub const SzlResponse = userdata.SzlResponse;
 pub const CpuStatus = userdata.CpuStatus;
 pub const DateTime = userdata.DateTime;
 pub const Clock = server.Clock;
+pub const Protection = userdata.Protection;
 
 // ── S7CommPlus top-level names (the 0x72 / S7-1200/1500 world) ──────────────
 pub const S7PlusClient = s7plus.client.Client;
@@ -208,6 +209,10 @@ const PairedTransport = struct {
     last_req_len: usize = 0,
     tamper_at: usize = 0,
     tamper_val: ?u8 = null,
+    /// Test hook: rewrites the whole reply (into the given buffer) before it
+    /// is queued.
+    rewrite: ?*const fn (reply: []const u8, buf: []u8) []const u8 = null,
+    rewrite_buf: [256]u8 = undefined,
 
     fn seam(self: *PairedTransport) Transport {
         return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
@@ -231,7 +236,8 @@ const PairedTransport = struct {
             self.failures += 1;
             return;
         };
-        const r = reply orelse return;
+        const r0 = reply orelse return;
+        const r = if (self.rewrite) |f| f(r0, &self.rewrite_buf) else r0;
         if (self.queue_len + r.len > self.queue.len) return error.WriteFailed;
         @memcpy(self.queue[self.queue_len..][0..r.len], r);
         if (self.tamper_val) |v| self.queue[self.queue_len + self.tamper_at] = v;
@@ -396,6 +402,115 @@ test "clock client: not connected, request bytes, and every reply-shape check" {
     try testing.expectError(error.PlcError, c.readClock());
     paired.tamper_val = null;
     _ = try c.readClock();
+}
+
+test "session password and protection: request bytes are gos7's, and the responder answers them" {
+    const prot: Protection = .{ .sch_schal = 2, .sch_par = 3, .sch_rel = 1, .bart_sch = 3, .anl_sch = 2 };
+    var r = Responder.init(.{ .password = "s7live", .protection = prot }, &.{});
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    try testing.expectError(error.NotConnected, c.setSessionPassword("s7live"));
+    try testing.expectError(error.NotConnected, c.clearSessionPassword());
+    try testing.expectError(error.NotConnected, c.readProtection());
+    try c.connect();
+
+    // gos7 (BSD-3, commit 153d631d8881) sent these against the live responder
+    // (tools/gos7_client_drive); octets 11-12 are its PDU reference.
+    const gos7_wrong = "0300002502f0803207000027000008000c0001120411450100ff0900083b3a1e0a6b7f1e0a";
+    const gos7_right = "0300002502f0803207000027000008000c0001120411450100ff09000826621f5e3c6e491b";
+    const gos7_clear = "0300001d02f0803207000029000008000400011204114502000a000000";
+    var g: [64]u8 = undefined;
+
+    try testing.expectError(error.PasswordRejected, c.setSessionPassword("nope"));
+    try testing.expect(!r.legitimated);
+    var want = try std.fmt.hexToBytes(&g, gos7_wrong);
+    try testing.expectEqual(want.len, paired.last_req_len);
+    try testing.expectEqualSlices(u8, want[0..11], paired.last_req[0..11]);
+    try testing.expectEqualSlices(u8, want[13..], paired.last_req[13..want.len]);
+
+    try c.setSessionPassword("s7live");
+    try testing.expect(r.legitimated);
+    want = try std.fmt.hexToBytes(&g, gos7_right);
+    try testing.expectEqualSlices(u8, want[13..], paired.last_req[13..want.len]);
+    // Past the eighth character nothing counts: "s7live  " + anything.
+    try c.setSessionPassword("s7live  ignored");
+    try testing.expectEqualSlices(u8, want[13..], paired.last_req[13..want.len]);
+
+    try c.clearSessionPassword();
+    try testing.expect(!r.legitimated);
+    want = try std.fmt.hexToBytes(&g, gos7_clear);
+    try testing.expectEqual(want.len, paired.last_req_len);
+    try testing.expectEqualSlices(u8, want[0..11], paired.last_req[0..11]);
+    try testing.expectEqualSlices(u8, want[13..], paired.last_req[13..want.len]);
+
+    // The protection record, read from SZL 0x0232 index 4 (gos7 reads the same).
+    try testing.expectEqual(prot, try c.readProtection());
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xFF, 0x09, 0x00, 0x04, 0x02, 0x32, 0x00, 0x04 }, paired.last_req[25..33]);
+
+    // A responder without a password accepts any; without a protection
+    // record the SZL is "not available", which the client reports.
+    var r2 = Responder.init(.{}, &.{});
+    var paired2 = PairedTransport{ .responder = &r2 };
+    var buf2: [1024]u8 = undefined;
+    var c2 = try Client.init(paired2.seam(), &buf2, .{});
+    try c2.connect();
+    try c2.setSessionPassword("anything");
+    try testing.expect(r2.legitimated);
+    try c2.clearSessionPassword();
+    try testing.expect(!r2.legitimated);
+    try testing.expectError(error.PlcError, c2.readProtection());
+}
+
+test "session password client: every reply-shape check" {
+    var r = Responder.init(.{ .password = "pw" }, &.{});
+    var paired = PairedTransport{ .responder = &r };
+    var buf: [1024]u8 = undefined;
+    var c = try Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    // Offsets into the reply TPKT: 8 = ROSCTR, 22 = type|group, 23 = subfunction,
+    // 27/28 = the parameters' error code.
+    const Case = struct { at: usize, val: u8, want: anyerror };
+    const bad = [_]Case{
+        .{ .at = 8, .val = 0x01, .want = error.UnexpectedReply },
+        .{ .at = 22, .val = 0x45, .want = error.UnexpectedReply }, // request, not response
+        .{ .at = 22, .val = 0x87, .want = error.UnexpectedReply }, // another function group
+        .{ .at = 23, .val = 0x02, .want = error.UnexpectedReply }, // another subfunction
+        .{ .at = 28, .val = 0x05, .want = error.PlcError }, // 0x0005: not the password code
+    };
+    for (bad) |cs| {
+        paired.tamper_at = cs.at;
+        paired.tamper_val = cs.val;
+        try testing.expectError(cs.want, c.setSessionPassword("pw"));
+    }
+    // 0xD600: a 0xD6xx code other than 0xD602 is a PLC error, not a rejection.
+    paired.tamper_at = 27;
+    paired.tamper_val = 0xD6;
+    try testing.expectError(error.PlcError, c.clearSessionPassword());
+    paired.tamper_val = null;
+    try c.setSessionPassword("pw");
+    try c.clearSessionPassword();
+
+    // A reply with the short (request-shaped, 8-octet) sub-header carries no
+    // error word; it must not read as an accepted password.
+    const Short = struct {
+        fn f(reply: []const u8, b: []u8) []const u8 {
+            @memcpy(b[0..17], reply[0..17]); // TPKT, COTP, S7 header (PDU reference kept)
+            @memcpy(b[17..25], reply[17..25]);
+            b[20] = 0x04; // "length of what follows": the request form
+            @memcpy(b[25..29], &[_]u8{ 0xFF, 0x09, 0x00, 0x00 });
+            b[3] = 29; // TPKT length
+            b[13] = 0;
+            b[14] = 8; // parameter length
+            b[15] = 0;
+            b[16] = 4; // data length
+            return b[0..29];
+        }
+    };
+    paired.rewrite = Short.f;
+    try testing.expectError(error.UnexpectedReply, c.setSessionPassword("wrong"));
+    paired.rewrite = null;
+    try c.setSessionPassword("pw");
 }
 
 // ── fuzz: the client parsing a damaged clock reply ──────────────────────────
@@ -703,7 +818,11 @@ test "live: a real S7 client against our responder" {
         .{ .area = .db, .db_number = 1, .bytes = &db1 },
         .{ .area = .flags, .bytes = &flags },
     };
-    var r = Responder.init(.{}, &areas);
+    // Group 5 and SZL 0x0232 for tools/gos7_client_drive (password "s7live").
+    var r = Responder.init(.{
+        .password = "s7live",
+        .protection = .{ .sch_schal = 2, .sch_par = 3, .sch_rel = 1, .bart_sch = 3, .anl_sch = 2 },
+    }, &areas);
 
     var in: [2048]u8 = undefined;
     var out: [2048]u8 = undefined;
@@ -716,9 +835,11 @@ test "live: a real S7 client against our responder" {
         const n = t.read(&in) catch break;
         if (n == 0) continue;
         // Classify before answering, so the counters describe real requests.
-        classify(in[0..n], &reads, &writes, &userdata_requests);
+        const is_userdata = classify(in[0..n], &reads, &writes, &userdata_requests);
         const reply = r.handle(in[0..n], &out) catch continue;
         const rep = reply orelse break;
+        // The peer's userdata frames and our answers, for goldens.
+        if (is_userdata) std.debug.print("live S7 userdata: req {x} rep {x} legitimated={}\n", .{ in[0..n], rep, r.legitimated });
         t.write(rep) catch break;
     }
     std.debug.print(
@@ -729,19 +850,24 @@ test "live: a real S7 client against our responder" {
     try testing.expect(writes > 0);
 }
 
-fn classify(frame: []const u8, reads: *usize, writes: *usize, userdata_requests: *usize) void {
-    const pkt = tpkt.decode(frame) catch return;
-    const tp = cotp.decode(pkt.payload) catch return;
+/// Counts the request kinds; true for a userdata request.
+fn classify(frame: []const u8, reads: *usize, writes: *usize, userdata_requests: *usize) bool {
+    const pkt = tpkt.decode(frame) catch return false;
+    const tp = cotp.decode(pkt.payload) catch return false;
     const dt = switch (tp) {
         .dt => |d| d,
-        else => return,
+        else => return false,
     };
-    const pdu = s7.decode(dt.payload) catch return;
-    if (pdu.header.rosctr == .userdata) userdata_requests.* += 1;
-    if (pdu.header.rosctr != .job or pdu.parameters.len == 0) return;
+    const pdu = s7.decode(dt.payload) catch return false;
+    if (pdu.header.rosctr == .userdata) {
+        userdata_requests.* += 1;
+        return true;
+    }
+    if (pdu.header.rosctr != .job or pdu.parameters.len == 0) return false;
     switch (@as(Function, @fromBackingInt(@intCast(pdu.parameters[0])))) {
         .read_var => reads.* += 1,
         .write_var => writes.* += 1,
         else => {},
     }
+    return false;
 }

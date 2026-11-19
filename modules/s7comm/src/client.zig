@@ -37,6 +37,9 @@ pub const Error = error{
     PduReferenceMismatch,
     /// The peer's Ack-Data header reported an error class/code.
     PlcError,
+    /// `setSessionPassword`: the CPU answered "incorrect password" (userdata
+    /// error code `0xD602`).
+    PasswordRejected,
     /// A per-item return code was not `success`.
     ItemError,
     /// The COTP connection request was refused (DR/ER instead of CC).
@@ -564,6 +567,65 @@ pub const Client = struct {
             rp.subfunction != @backingInt(sub)) return error.UnexpectedReply;
         if (rp.error_code != 0) return error.PlcError;
         return userdata.DataBlock.decode(pdu.data);
+    }
+
+    // ── Security (group 5) ─────────────────────────────────────────────────
+
+    /// Legitimates the session with the CPU password (security, group 5,
+    /// subfunction 1): the password is space-padded to eight characters and
+    /// obfuscated (`userdata.encodePassword`; characters past the eighth are
+    /// ignored, as gos7 and Snap7 do). The obfuscation is reversible by
+    /// anyone on the wire: S7comm has no confidentiality, see SPEC "Threat
+    /// model". A CPU that refuses the password answers error code `0xD602`,
+    /// returned as `error.PasswordRejected`; any other error code is
+    /// `error.PlcError`. This is the S7-300/400 session password; S7-1200/
+    /// 1500 access protection runs over S7CommPlus and is not this call. The
+    /// encoded copies on the stack are wiped; the transmit buffer keeps the
+    /// frame until the next request overwrites it.
+    pub fn setSessionPassword(self: *Client, password: []const u8) Error!void {
+        if (!self.connected) return error.NotConnected;
+        var enc = userdata.encodePassword(password);
+        defer std.crypto.secureZero(u8, &enc);
+        var data: [4 + userdata.password_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &data);
+        const block = try userdata.DataBlock.encode(.success, .octet_string, &enc, &data);
+        try self.securityExchange(.set_password, block);
+    }
+
+    /// Withdraws the session's legitimation (security, group 5, subfunction
+    /// 2; data block `0a 00 00 00`, as gos7 sends it).
+    pub fn clearSessionPassword(self: *Client) Error!void {
+        if (!self.connected) return error.NotConnected;
+        var data: [4]u8 = undefined;
+        const block = try userdata.DataBlock.encode(.object_does_not_exist, .null_size, &.{}, &data);
+        try self.securityExchange(.clear_password, block);
+    }
+
+    fn securityExchange(self: *Client, sub: userdata.SecuritySubfunction, block: []const u8) Error!void {
+        var params: [userdata.Param.request_len]u8 = undefined;
+        _ = try (userdata.Param{
+            .message_type = .request,
+            .function_group = .security,
+            .subfunction = @backingInt(sub),
+        }).encodeRequest(&params);
+        const pdu = try self.exchange(.userdata, &params, &[_][]const u8{block});
+        if (pdu.header.rosctr != .userdata) return error.UnexpectedReply;
+        // The short (request-shaped) sub-header carries no error word, so it
+        // would read as success: a reply must have the full one.
+        if (pdu.parameters.len < userdata.Param.response_len) return error.UnexpectedReply;
+        const rp = try userdata.Param.decode(pdu.parameters);
+        if (!rp.isResponse() or rp.function_group != .security or
+            rp.subfunction != @backingInt(sub)) return error.UnexpectedReply;
+        if (rp.error_code == userdata.ErrorCode.incorrect_password) return error.PasswordRejected;
+        if (rp.error_code != 0) return error.PlcError;
+    }
+
+    /// The CPU's protection record, SZL `0x0232` index `0x0004`
+    /// (`userdata.Protection`). A reply without a well-formed record is
+    /// `error.ShortReply`.
+    pub fn readProtection(self: *Client) Error!userdata.Protection {
+        const r = try self.readSzl(userdata.SzlId.protection_status, userdata.Protection.szl_index);
+        return userdata.protectionFrom(r.response) orelse error.ShortReply;
     }
 
     // ── PLC control — DANGEROUS ────────────────────────────────────────────
