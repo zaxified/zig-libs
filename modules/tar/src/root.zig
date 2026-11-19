@@ -3102,6 +3102,76 @@ test "packDirOptions: max_entries and max_bytes stop exactly one past the limit"
     try testing.expectEqual(full, d);
 }
 
+test "packDirOptions: max_entries counts directories and symlinks as entries" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "tree/sub"); // the entry past the limit is a directory
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try tmpTreeRoot(io, &tmp, &rb);
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    try testing.expectError(error.LimitExceeded, packDirOptions(io, gpa, &.{root_path}, &aw.writer, .{ .max_entries = 1 }));
+    _ = try packDirOptions(io, gpa, &.{root_path}, &aw.writer, .{ .max_entries = 2 });
+
+    var tmp2 = testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try tmp2.dir.createDirPath(io, "tree");
+    try tmp2.dir.symLink(io, "nowhere", "tree/l", .{}); // ... a symlink
+    const root2 = try tmpTreeRoot(io, &tmp2, &rb);
+    var aw2: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw2.deinit();
+    try testing.expectError(error.LimitExceeded, packDirOptions(io, gpa, &.{root2}, &aw2.writer, .{ .max_entries = 1 }));
+    _ = try packDirOptions(io, gpa, &.{root2}, &aw2.writer, .{ .max_entries = 2 });
+}
+
+test "packDirOptions: same_device compares each root with its own device" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "tree");
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try tmpTreeRoot(io, &tmp, &rb);
+
+    var a: linux.Statx = undefined;
+    var b: linux.Statx = undefined;
+    var c: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "/dev", 0, linux.STATX.BASIC_STATS, &a)) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, "/dev/shm", 0, linux.STATX.BASIC_STATS, &b)) != .SUCCESS) return error.SkipZigTest;
+    var pz: [std.fs.max_path_bytes + 1]u8 = undefined;
+    @memcpy(pz[0..root_path.len], root_path);
+    pz[root_path.len] = 0;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, @ptrCast(&pz), 0, linux.STATX.BASIC_STATS, &c)) != .SUCCESS) return error.SkipZigTest;
+    // /dev must be a different device than the temp tree, and /dev/shm a directory in it.
+    if (devKey(a.dev_major, a.dev_minor) == devKey(c.dev_major, c.dev_minor)) return error.SkipZigTest;
+    if (b.mode & linux.S.IFMT != linux.S.IFDIR) return error.SkipZigTest;
+
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    defer aw.deinit();
+    _ = try packDirOptions(io, gpa, &.{ root_path, "/dev" }, &aw.writer, .{ .same_device = true });
+    try aw.writer.flush();
+
+    var src: std.Io.Reader = .fixed(aw.writer.buffered());
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    var decomp = flate.Decompress.init(&src, .gzip, window);
+    var tr = Reader.init(gpa, &decomp.reader);
+    defer tr.deinit();
+    var saw_shm = false;
+    while (try tr.next()) |e| {
+        if (std.mem.eql(u8, e.path, "dev/shm") or std.mem.eql(u8, e.path, "dev/shm/")) saw_shm = true;
+    }
+    // The second root is walked: its own device is its reference, not the first root's.
+    try testing.expect(saw_shm);
+}
+
 test "packDirOptions: same_device leaves a mount point as a bare directory" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
