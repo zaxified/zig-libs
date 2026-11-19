@@ -738,6 +738,7 @@ test "SA: key change, challenge, reply and aggressive mode match hand-derived ve
     try testing.expectEqual(@as(u8, 0), agg_resp[agg_resp.len - 1]);
     try testing.expect(rig.bouts[0].value);
     try testing.expectEqual(@as(u32, 2), rig.auth.csq);
+    try testing.expectEqual(@as(u32, 2), rig.users[0].messages);
 
     // The same aggressive message again carries a CSQ already used.
     rig.bouts[0].value = false;
@@ -766,7 +767,7 @@ test "SA: a bad reply MAC is refused with g120v7, and the challenge cannot be re
 }
 
 test "SA: a reply with the wrong CSQ, sequence, peer, user or key never executes" {
-    const Case = enum { csq, seq, peer, unknown_user, no_keys, wrong_key };
+    const Case = enum { csq, seq, peer, no_peer, unknown_user, no_keys, empty_key, wrong_key };
     for (std.enums.values(Case)) |case| {
         var rig: Rig = .{};
         rig.setup(.{}, true);
@@ -777,11 +778,18 @@ test "SA: a reply with the wrong CSQ, sequence, peer, user or key never executes
         const r = switch (case) {
             .csq => try rig.reply(&buf, 5, csq +% 1, 1, &kat_control_key),
             .seq => try rig.reply(&buf, 6, csq, 1, &kat_control_key),
-            .peer, .wrong_key => try rig.reply(&buf, 5, csq, 1, if (case == .wrong_key) &kat_monitoring_key else &kat_control_key),
+            .peer, .no_peer, .wrong_key => try rig.reply(&buf, 5, csq, 1, if (case == .wrong_key) &kat_monitoring_key else &kat_control_key),
+            // A user without session keys must not authenticate with the
+            // empty key its zeroed slot would give.
+            .empty_key => try rig.reply(&buf, 5, csq, 7, &.{}),
             .unknown_user => try rig.reply(&buf, 5, csq, 9, &kat_control_key),
             .no_keys => try rig.reply(&buf, 5, csq, 7, &kat_control_key),
         };
-        const peer: ?u16 = if (case == .peer) 2 else 1;
+        const peer: ?u16 = switch (case) {
+            .peer => 2,
+            .no_peer => null,
+            else => 1,
+        };
         const resp = (try rig.sendFrom(r, peer, 1)).?;
         try testing.expect(isSaError(resp));
         try testing.expect(!rig.bouts[0].value);
@@ -943,11 +951,39 @@ test "SA: key change refused for a wrong KSQ, a wrong update key, or without a s
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
     try testing.expectEqual(@as(u32, 3), rig.auth.stats.failed_session_key_changes);
 
+    // A key change too short to decode closes the window it used.
+    _ = (try rig.send(try authRequest(&req, 6, .session_key_status_request, &.{ 1, 0 }), 0)).?;
+    try testing.expect(isSaError((try rig.send(try authRequest(&req, 7, .session_key_change, &.{ 1, 2, 3 }), 0)).?));
+    try testing.expectEqual(@as(?[]u8, null), try rig.send(try authRequest(&req, 8, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&body)), 0));
+    // Wrapped data shorter than one AES-KW block.
+    _ = (try rig.send(try authRequest(&req, 9, .session_key_status_request, &.{ 1, 0 }), 0)).?;
+    st = (try rig.send(try authRequest(&req, 10, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = &.{ 1, 2, 3 } }).encode(&body)), 0)).?;
+    try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
+    try testing.expectEqual(sa.KeyStatus.not_init, rig.users[0].status);
+
     // A good change, then its replay: refused, keys kept.
     try rig.installKeys(1, 0);
     st = (try rig.send(try authRequest(&req, 5, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq -% 1, .user_number = 1, .wrapped_key_data = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped) }).encode(&body)), 0)).?;
     try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
     try testing.expectEqual(sa.KeyStatus.ok, rig.users[0].status);
+}
+
+test "SA: a key change wipes the previous keys, including a longer pair" {
+    var rig: Rig = .{};
+    rig.setup(.{}, true);
+    var req: [96]u8 = undefined;
+    var wrapped: [72]u8 = undefined;
+    var body: [80]u8 = undefined;
+    const long_c: [32]u8 = @splat(0xA5);
+    const long_m: [32]u8 = @splat(0x5A);
+    _ = (try rig.send(try authRequest(&req, 0, .session_key_status_request, &.{ 1, 0 }), 0)).?;
+    const w = try sa.wrapSessionKeys(&kat_update_key, &long_c, &long_m, &wrapped);
+    _ = (try rig.send(try authRequest(&req, 1, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = w }).encode(&body)), 0)).?;
+    try testing.expectEqual(@as(u8, 32), rig.users[0].key_len);
+    try rig.installKeys(1, 0);
+    try testing.expectEqual(@as(u8, 16), rig.users[0].key_len);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), rig.users[0].control_key[16..]);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), rig.users[0].monitoring_key[16..]);
 }
 
 test "SA: session keys expire by time and by message count" {
@@ -978,9 +1014,27 @@ test "SA: session keys expire by time and by message count" {
     try testing.expect(isSaError((try rig.send(try rig.reply(&buf, 4, csq, 1, &kat_control_key), 1100)).?));
     try testing.expect(!rig.bouts[0].value);
     try testing.expectEqual(@as(u32, 2), rig.auth.stats.session_keys_expired);
-    // A status request reports the expiry.
-    const st = (try rig.send(try authRequest(&req, 5, .session_key_status_request, &.{ 1, 0 }), 1101)).?;
+    // A status request reports the expiry, and finds nothing more to expire.
+    var st = (try rig.send(try authRequest(&req, 5, .session_key_status_request, &.{ 1, 0 }), 1101)).?;
     try testing.expectEqual(sa.KeyStatus.comm_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
+    try testing.expectEqual(@as(u32, 2), rig.auth.stats.session_keys_expired);
+
+    // A status request alone notices that the keys ran out of time.
+    try rig.installKeys(1, 5000);
+    st = (try rig.send(try authRequest(&req, 6, .session_key_status_request, &.{ 1, 0 }), 6000)).?;
+    try testing.expectEqual(sa.KeyStatus.comm_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
+    try testing.expectEqual(sa.KeyStatus.comm_fail, rig.users[0].status);
+}
+
+test "SA: a zero limit disables that expiry axis" {
+    var rig: Rig = .{};
+    rig.setup(.{ .session_key_timeout_ms = 0, .session_key_max_messages = 0 }, true);
+    try rig.installKeys(1, 0);
+    var req: [32]u8 = undefined;
+    var buf: [64]u8 = undefined;
+    const csq = try challengeCsq((try rig.send(crobRequest(&req, 1, .direct_operate, 0), std.math.maxInt(u32))).?);
+    _ = (try rig.send(try rig.reply(&buf, 1, csq, 1, &kat_control_key), std.math.maxInt(u32))).?;
+    try testing.expect(rig.bouts[0].value);
 }
 
 test "SA: error messages stop after the budget, and a key change restores it" {
@@ -1024,4 +1078,74 @@ test "SA: unexpected or malformed AUTH requests are counted and ignored" {
     big[1] = @backingInt(FunctionCode.write);
     try testing.expectEqual(@as(?[]u8, null), try rig.send(&big, 0));
     try testing.expectEqual(@as(u32, 1), rig.auth.stats.discarded_messages);
+}
+
+test "SA: an update key that does not fit the key-wrap algorithm is refused" {
+    var rig: Rig = .{};
+    rig.setup(.{ .key_wrap_algorithm = .aes_256 }, true); // needs a 32-octet update key
+    var req: [96]u8 = undefined;
+    var wrapped: [72]u8 = undefined;
+    var body: [80]u8 = undefined;
+    _ = (try rig.send(try authRequest(&req, 0, .session_key_status_request, &.{ 1, 0 }), 0)).?;
+    const w = try sa.wrapSessionKeys(&kat_update_key, &kat_control_key, &kat_monitoring_key, &wrapped);
+    const st = (try rig.send(try authRequest(&req, 1, .session_key_change, try (sa.SessionKeyChange{ .key_change_seq_num = rig.auth.ksq, .user_number = 1, .wrapped_key_data = w }).encode(&body)), 0)).?;
+    try testing.expectEqual(sa.KeyStatus.auth_fail, (try sa.SessionKeyStatus.decode((try sa.decodeObject(st[4..])).data)).key_status);
+    try testing.expectEqual(sa.KeyStatus.not_init, rig.users[0].status);
+}
+
+test "SA: challenge shapes: empty body, a leading g120 that is not v3, the storage boundary, clamped data" {
+    var rig: Rig = .{};
+    rig.setup(.{ .challenge_len = 0 }, true);
+    // COLD_RESTART has no objects at all; it is still challenged.
+    var csq = try challengeCsq((try rig.send(&hex("c00d"), 0)).?);
+    try testing.expectEqual(@as(u32, 1), csq);
+    // Challenge data is never shorter than the standard's 4 octets.
+    const ch = try sa.Challenge.decode((try sa.decodeObject(rig.auth.challenge_buf[4..rig.auth.challenge_len])).data);
+    try testing.expectEqual(@as(usize, 4), ch.challenge_data.len);
+    // A WRITE whose first object is g120v1 is challenged, not taken for
+    // aggressive mode.
+    csq = try challengeCsq((try rig.send(&hex("c10278015b0100000000"), 0)).?);
+    try testing.expectEqual(@as(u32, 2), csq);
+    // A request exactly as long as the storage is still stored.
+    var big: [256]u8 = undefined;
+    @memset(&big, 0);
+    big[0] = 0xC2;
+    big[1] = @backingInt(FunctionCode.write);
+    _ = try challengeCsq((try rig.send(&big, 0)).?);
+    try testing.expectEqual(@as(usize, 256), rig.auth.pending.?.request_len);
+
+    var wide: Rig = .{};
+    wide.setup(.{ .challenge_len = 255 }, true);
+    _ = try challengeCsq((try wide.send(&hex("c00d"), 0)).?);
+    try testing.expectEqual(@as(usize, max_challenge_data), (try sa.Challenge.decode((try sa.decodeObject(wide.auth.challenge_buf[4..wide.auth.challenge_len])).data)).challenge_data.len);
+}
+
+test "SA: a challenge that could not be sent leaves no older challenge answerable" {
+    var rig: Rig = .{};
+    rig.setup(.{}, true);
+    try rig.installKeys(1, 0);
+    var req: [32]u8 = undefined;
+    var buf: [64]u8 = undefined;
+    const csq = try challengeCsq((try rig.send(crobRequest(&req, 1, .direct_operate, 0), 0)).?);
+    const old = try rig.reply(&buf, 1, csq, 1, &kat_control_key);
+    var req2: [32]u8 = undefined;
+    var tiny: [12]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, rig.station.handleFrom(crobRequest(&req2, 2, .direct_operate, 1), 1, 1, &tiny));
+    try testing.expectEqual(@as(?[]u8, null), try rig.send(old, 2));
+    try testing.expect(!rig.bouts[0].value);
+}
+
+test "SA: an accepted aggressive-mode request cancels the outstanding challenge" {
+    var rig: Rig = .{};
+    rig.setup(.{}, true);
+    try rig.installKeys(1, 0);
+    var req: [32]u8 = undefined;
+    var buf: [64]u8 = undefined;
+    const csq = try challengeCsq((try rig.send(crobRequest(&req, 1, .direct_operate, 1), 0)).?);
+    const pending_reply = try rig.reply(&buf, 1, csq, 1, &kat_control_key);
+    var agg: [96]u8 = undefined;
+    _ = (try rig.send(try aggressiveRequest(&rig, &agg, 2, .direct_operate, csq +% 1, 1, &kat_control_key), 1)).?;
+    try testing.expect(rig.bouts[0].value);
+    try testing.expectEqual(@as(?[]u8, null), try rig.send(pending_reply, 2));
+    try testing.expect(!rig.bouts[1].value);
 }
