@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit over `wire.zig`, `ext.zig` and `root.zig` (361 mutants: 348 killed, 6 equivalent, 7 open). Tests added for the survivors (asymmetric 64-bit counters, timestamps, window scales and flags, malformed informational attributes, family cross-checks, ICMPv6 attribute numbers, the flush ACK flag, partial NEW specs, filter encoding, and engine tests for framing errors, overrun and header-only error records, extended-ACK capture and the sequence of fixed requests); no source behaviour changed.
+
 - **2026-11-19** — Additive: `FlowQuery.max_flows` also bounds `Socket.dumpEachWith`: after that many delivered flows the next is not visited, the dump is read to its DONE and `error.TooManyMessages` returned (socket usable). Null (default) and `dumpEach` are unchanged.
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-03** — Grade 2. Performance line in the card's format; `check-uapi` now also checks `src/ext.zig` (143 constants matched, 0 mismatches).

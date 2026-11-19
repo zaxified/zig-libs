@@ -2191,3 +2191,197 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere (decode
     try fz.checkReach("conntrack decode", .{ fuzzDecode, fuzzDecodeMutated }, 400);
     try fz.checkSeen("conntrack decode", .{ fuzzDecode, fuzzDecodeMutated }, &fz.decode_seen, 1500);
 }
+
+// ── whole-module mutation 2026-11-19: survivors of the first run ────────────
+
+test "Tuple: isComplete needs src, dst and proto each; family() prefers src; a missing proto is not ICMPv6 in invert()" {
+    const a4: netaddr.Ip = .{ .v4 = .{ 10, 0, 0, 1 } };
+    const a6: netaddr.Ip = .{ .v6 = @splat(1) };
+    try testing.expect(!(Tuple{ .dst = a4, .proto = 6 }).isComplete());
+    try testing.expect(!(Tuple{ .src = a4, .proto = 6 }).isComplete());
+    try testing.expect(!(Tuple{ .src = a4, .dst = a4 }).isComplete());
+    try testing.expect((Tuple{ .src = a4, .dst = a4, .proto = 6 }).isComplete());
+    try testing.expectEqual(Family.ipv4, (Tuple{ .src = a4, .dst = a6 }).family());
+    try testing.expectEqual(Family.ipv6, (Tuple{ .src = a6, .dst = a4 }).family());
+    try testing.expectEqual(Family.ipv6, (Tuple{ .dst = a6 }).family());
+    try testing.expectEqual(Family.unspec, (Tuple{}).family());
+    try testing.expectEqual(@as(?u8, 0), (Tuple{ .icmp_type = 8 }).invert().icmp_type);
+    try testing.expectEqual(@as(?u8, 128), (Tuple{ .icmp_type = 128 }).invert().icmp_type);
+}
+
+test "Name.prefixOf cuts at 15 bytes; Flow.hasStatus needs every bit and reads a missing status as 0" {
+    const lens = [_]usize{ 0, 14, 15, 16, 20 };
+    const cuts = [_]bool{ false, false, false, true, true };
+    const keeps = [_]usize{ 0, 14, 15, 15, 15 };
+    for (lens, cuts, keeps) |n, want_cut, want_len| {
+        const raw: [20]u8 = @splat('x');
+        const p = Name.prefixOf(raw[0..n]);
+        try testing.expectEqual(want_cut, p.cut);
+        try testing.expectEqual(want_len, p.name.slice().len);
+    }
+    const f: Flow = .{ .status = 0b0110 };
+    try testing.expect(f.hasStatus(0b0110));
+    try testing.expect(f.hasStatus(0b0010));
+    try testing.expect(!f.hasStatus(0b0011));
+    try testing.expect(!(Flow{}).hasStatus(1));
+    try testing.expect((Flow{}).hasStatus(0));
+}
+
+test "decodeFlow: asymmetric 64-bit counters, timestamps, TCP window scales and flags land in their own fields" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendNfgenmsg(gpa, &list, .ipv4, 0);
+    inline for (.{ .{ CTA.COUNTERS_ORIG, 0x0102_0304_0506_0708, 0x1112_1314_1516_1718 }, .{ CTA.COUNTERS_REPLY, 0x2122_2324_2526_2728, 0x3132_3334_3536_3738 } }) |c| {
+        const off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | c[0]);
+        try codec.appendAttrBe64(gpa, &list, CTA_COUNTERS.PACKETS, c[1]);
+        try codec.appendAttrBe64(gpa, &list, CTA_COUNTERS.BYTES, c[2]);
+        try codec.nestEnd(&list, off);
+    }
+    {
+        const off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.TIMESTAMP);
+        try codec.appendAttrBe64(gpa, &list, CTA_TIMESTAMP.START, 0x4142_4344_4546_4748);
+        try codec.appendAttrBe64(gpa, &list, CTA_TIMESTAMP.STOP, 0x5152_5354_5556_5758);
+        try codec.nestEnd(&list, off);
+    }
+    {
+        const pi = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.PROTOINFO);
+        const tcp = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA_PROTOINFO.TCP);
+        try codec.appendAttrU8(gpa, &list, CTA_PROTOINFO_TCP.STATE, 3);
+        try codec.appendAttrU8(gpa, &list, CTA_PROTOINFO_TCP.WSCALE_ORIGINAL, 7);
+        try codec.appendAttrU8(gpa, &list, CTA_PROTOINFO_TCP.WSCALE_REPLY, 9);
+        try codec.appendAttr(gpa, &list, CTA_PROTOINFO_TCP.FLAGS_ORIGINAL, &[_]u8{ 0x01, 0x02 });
+        try codec.appendAttr(gpa, &list, CTA_PROTOINFO_TCP.FLAGS_REPLY, &[_]u8{ 0x03, 0x04 });
+        try codec.nestEnd(&list, tcp);
+        try codec.nestEnd(&list, pi);
+    }
+    const f = try decodeFlow(list.items);
+    try testing.expectEqual(Counters{ .packets = 0x0102_0304_0506_0708, .bytes = 0x1112_1314_1516_1718 }, f.counters_orig.?);
+    try testing.expectEqual(Counters{ .packets = 0x2122_2324_2526_2728, .bytes = 0x3132_3334_3536_3738 }, f.counters_reply.?);
+    try testing.expectEqual(@as(?u64, 0x4142_4344_4546_4748), f.timestamp_start);
+    try testing.expectEqual(@as(?u64, 0x5152_5354_5556_5758), f.timestamp_stop);
+    try testing.expectEqual(@as(?u8, 7), f.tcp_wscale_orig);
+    try testing.expectEqual(@as(?u8, 9), f.tcp_wscale_reply);
+    try testing.expectEqual(TcpFlags{ .flags = 1, .mask = 2 }, f.tcp_flags_orig.?);
+    try testing.expectEqual(TcpFlags{ .flags = 3, .mask = 4 }, f.tcp_flags_reply.?);
+}
+
+test "decodeFlow: a one-byte TCP flags attribute is BadLength" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendNfgenmsg(gpa, &list, .ipv4, 0);
+    const pi = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.PROTOINFO);
+    const tcp = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA_PROTOINFO.TCP);
+    try codec.appendAttr(gpa, &list, CTA_PROTOINFO_TCP.FLAGS_ORIGINAL, &[_]u8{0x01});
+    try codec.nestEnd(&list, tcp);
+    try codec.nestEnd(&list, pi);
+    try testing.expectError(error.BadLength, decodeFlow(list.items));
+}
+
+test "decodeFlow: malformed SCTP, DCCP, seq-adjust, master-tuple and helper attributes leave their field null, the flow survives" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendNfgenmsg(gpa, &list, .ipv4, 0);
+    {
+        const pi = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.PROTOINFO);
+        const sc = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA_PROTOINFO.SCTP);
+        try codec.appendAttr(gpa, &list, CTA_PROTOINFO_SCTP.STATE, &[_]u8{ 1, 2 }); // asU8 wants one byte
+        try codec.nestEnd(&list, sc);
+        const dc = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA_PROTOINFO.DCCP);
+        try codec.appendAttr(gpa, &list, CTA_PROTOINFO_DCCP.STATE, &[_]u8{ 1, 2 });
+        try codec.nestEnd(&list, dc);
+        try codec.nestEnd(&list, pi);
+    }
+    {
+        const sa = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.SEQ_ADJ_ORIG);
+        try codec.appendAttr(gpa, &list, CTA_SEQADJ.CORRECTION_POS, &[_]u8{1}); // asBe32 wants four
+        try codec.nestEnd(&list, sa);
+    }
+    {
+        // A master tuple of mixed families: decodeTuple refuses it, the flow keeps going.
+        const tm = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.TUPLE_MASTER);
+        const ip = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA_TUPLE.IP);
+        try codec.appendAttr(gpa, &list, CTA_IP.V4_SRC, &[_]u8{ 1, 2, 3, 4 });
+        try codec.appendAttr(gpa, &list, CTA_IP.V6_DST, &(@as([16]u8, @splat(9))));
+        try codec.nestEnd(&list, ip);
+        try codec.nestEnd(&list, tm);
+    }
+    {
+        // A helper nest without a NAME attribute names nothing, whatever else it holds.
+        const h = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.HELP);
+        try codec.appendAttr(gpa, &list, CTA_HELP.INFO, "abc\x00");
+        try codec.nestEnd(&list, h);
+    }
+    {
+        const sa = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.SEQ_ADJ_REPLY);
+        try codec.appendAttr(gpa, &list, CTA_SEQADJ.OFFSET_AFTER, &[_]u8{1});
+        try codec.nestEnd(&list, sa);
+    }
+    try codec.appendAttrBe32(gpa, &list, CTA.MARK, 5);
+    const f = try decodeFlow(list.items);
+    try testing.expectEqual(@as(?u32, 5), f.mark);
+    try testing.expectEqual(@as(?SeqAdj, null), f.seq_adj_reply);
+    try testing.expectEqual(@as(?SctpInfo, null), f.sctp);
+    try testing.expectEqual(@as(?DccpInfo, null), f.dccp);
+    try testing.expectEqual(@as(?SeqAdj, null), f.seq_adj_orig);
+    try testing.expect(f.tuple_master == null);
+    try testing.expect(f.helper == null);
+}
+
+test "decodeFlow: the family cross-checks exempt an absent tuple and cover both address families of nfgen_family" {
+    const gpa = testing.allocator;
+    const t4: Tuple = .{ .src = .{ .v4 = .{ 10, 0, 0, 1 } }, .dst = .{ .v4 = .{ 10, 0, 0, 2 } }, .proto = IPPROTO.UDP };
+    // Only a reply tuple (the orig family is unspec): fine.
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try appendNfgenmsg(gpa, &list, .ipv4, 0);
+        try appendTuple(gpa, &list, CTA.TUPLE_REPLY, t4);
+        const f = try decodeFlow(list.items);
+        try testing.expect(f.reply.isComplete());
+    }
+    // nfgen_family AF_INET6 over IPv4 tuples: refused for either direction.
+    inline for (.{ CTA.TUPLE_ORIG, CTA.TUPLE_REPLY }) |which| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try appendNfgenmsg(gpa, &list, .ipv6, 0);
+        try appendTuple(gpa, &list, which, t4);
+        try testing.expectError(error.AddressFamilyMismatch, decodeFlow(list.items));
+    }
+}
+
+test "builders: ICMPv6 code and id use the ICMPV6 attribute numbers; flush asks for an ACK; a NEW spec carries a lone tcp_state or flags_reply" {
+    const gpa = testing.allocator;
+    const t6: Tuple = .{ .src = .{ .v6 = @splat(1) }, .dst = .{ .v6 = @splat(2) }, .proto = IPPROTO.ICMPV6, .icmp_type = 128, .icmp_code = 7, .icmp_id = 99 };
+    {
+        const req = try buildGetRequest(gpa, 1, .ipv6, .orig, t6);
+        defer gpa.free(req);
+        const f = try decodeFlow(req[codec.header_len..]);
+        try testing.expectEqual(@as(?u8, 128), f.orig.icmp_type);
+        try testing.expectEqual(@as(?u8, 7), f.orig.icmp_code);
+        try testing.expectEqual(@as(?u16, 99), f.orig.icmp_id);
+    }
+    {
+        const req = try buildFlushRequest(gpa, 1, .unspec);
+        defer gpa.free(req);
+        const flags = std.mem.readInt(u16, req[6..8], native_endian);
+        try testing.expect(flags & codec.NLM_F_ACK != 0);
+        try testing.expect(flags & codec.NLM_F_REQUEST != 0);
+    }
+    const t4: Tuple = .{ .src = .{ .v4 = .{ 10, 0, 0, 1 } }, .dst = .{ .v4 = .{ 10, 0, 0, 2 } }, .proto = IPPROTO.TCP, .src_port = 1, .dst_port = 2 };
+    {
+        const req = try buildNewRequest(gpa, 1, .ipv4, codec.NLM_F_REQUEST, .{ .orig = t4, .reply = t4.invert(), .tcp_state = .established });
+        defer gpa.free(req);
+        const f = try decodeFlow(req[codec.header_len..]);
+        try testing.expectEqual(TcpState.established, f.tcp_state.?);
+    }
+    {
+        const req = try buildNewRequest(gpa, 1, .ipv4, codec.NLM_F_REQUEST, .{ .orig = t4, .reply = t4.invert(), .tcp_flags_reply = .{ .flags = 0x12, .mask = 0x34 } });
+        defer gpa.free(req);
+        const f = try decodeFlow(req[codec.header_len..]);
+        try testing.expectEqual(TcpFlags{ .flags = 0x12, .mask = 0x34 }, f.tcp_flags_reply.?);
+        try testing.expect(f.tcp_flags_orig == null);
+    }
+}

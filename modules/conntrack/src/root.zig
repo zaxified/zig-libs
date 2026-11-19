@@ -2902,3 +2902,138 @@ test "dumpEachGeneric: an overflow before a bad record wins, one after it loses 
     try testing.expectEqual(@as(usize, 2), v.calls); // the bad record came first: nothing behind it was visited
     try testing.expectEqual(@as(usize, 6), t.recvs);
 }
+
+// ── whole-module mutation 2026-11-19: engine survivors of the first run ─────
+
+/// A header-only message of `ty` addressed to `(pid, seq)`.
+fn bareOf(pid: u32, seq: u32, ty: u16) [codec.header_len]u8 {
+    var b: [codec.header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, b[0..4], codec.header_len, native_endian);
+    std.mem.writeInt(u16, b[4..6], ty, native_endian);
+    std.mem.writeInt(u32, b[8..12], seq, native_endian);
+    std.mem.writeInt(u32, b[12..16], pid, native_endian);
+    return b;
+}
+
+fn errnoDatagram(pid: u32, seq: u32, code: i32) [codec.header_len + 4]u8 {
+    var d: [codec.header_len + 4]u8 = @splat(0);
+    std.mem.writeInt(u32, d[0..4], d.len, native_endian);
+    std.mem.writeInt(u16, d[4..6], codec.NLMSG_ERROR, native_endian);
+    std.mem.writeInt(u32, d[8..12], seq, native_endian);
+    std.mem.writeInt(u32, d[12..16], pid, native_endian);
+    std.mem.writeInt(i32, d[16..20], code, native_endian);
+    return d;
+}
+
+/// A scripted transport that also records the ext-ack captures and the last request sent.
+const ProbeTransport = struct {
+    base: ScriptedTransport,
+    acks: usize = 0,
+    sent: [ext.flow_dump_max_len]u8 = undefined,
+    sent_len: usize = 0,
+
+    fn nextSeq(self: *ProbeTransport) u32 {
+        return self.base.nextSeq();
+    }
+    fn portId(self: *const ProbeTransport) u32 {
+        return self.base.portId();
+    }
+    fn captureExtAck(self: *ProbeTransport, _: codec.Message) void {
+        self.acks += 1;
+    }
+    fn send(self: *ProbeTransport, bytes: []const u8) SendError!void {
+        @memcpy(self.sent[0..bytes.len], bytes);
+        self.sent_len = bytes.len;
+        return self.base.send(bytes);
+    }
+    fn recvDatagram(self: *ProbeTransport) RecvError![]const u8 {
+        return self.base.recvDatagram();
+    }
+};
+
+fn countVisit(ctx: ?*anyopaque, _: *const Flow) anyerror!void {
+    const n: *usize = @ptrCast(@alignCast(ctx.?));
+    n.* += 1;
+}
+
+test "engines: a framing error, an overrun record and a header-only error record each have their own error" {
+    if (native_endian != .little) return error.SkipZigTest; // goldenFirstMessage reads the LE golden
+    const id = goldenDumpIdentity();
+    const junk = [_]u8{ 1, 2, 3 }; // shorter than a netlink header
+    const overrun = bareOf(id.pid, id.seq, codec.NLMSG_OVERRUN);
+    const bare_err = bareOf(id.pid, id.seq, codec.NLMSG_ERROR); // no errno behind the header
+    var buf: [512]u8 = undefined;
+    const foreign = goldenFirstMessage(&buf, id.pid, id.seq, wire.msg_ct_get);
+
+    // awaitFlowOver
+    {
+        var t: ScriptedTransport = .{ .script = &.{&junk}, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.MalformedReply, awaitFlowOver(&t, id.seq));
+    }
+    {
+        var t: ScriptedTransport = .{ .script = &.{&bare_err}, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.MalformedReply, awaitFlowOver(&t, id.seq));
+    }
+    {
+        var t: ScriptedTransport = .{ .script = &.{&overrun}, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.Overrun, awaitFlowOver(&t, id.seq));
+    }
+    {
+        // A record of another message type is not the answer: skipped, then the script ends.
+        var t: ScriptedTransport = .{ .script = &.{foreign}, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.RecvFailed, awaitFlowOver(&t, id.seq));
+    }
+    // dumpOver
+    {
+        var t: ScriptedTransport = .{ .script = &.{&junk}, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.MalformedReply, dumpOver(testing.allocator, &t, .unspec));
+    }
+    {
+        var t: ScriptedTransport = .{ .script = &.{&overrun}, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.Overrun, dumpOver(testing.allocator, &t, .unspec));
+    }
+    {
+        var t: ScriptedTransport = .{ .script = &.{&bare_err}, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.MalformedReply, dumpOver(testing.allocator, &t, .unspec));
+    }
+    // dumpEachOver
+    var n: usize = 0;
+    {
+        var t: ScriptedTransport = .{ .script = &.{&junk}, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.MalformedReply, dumpEachOver(&t, .unspec, &n, countVisit));
+    }
+    {
+        const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+        var t: ScriptedTransport = .{ .script = &.{ foreign, &done }, .pid = id.pid, .seq = id.seq };
+        try dumpEachOver(&t, .unspec, &n, countVisit);
+        try testing.expectEqual(@as(usize, 0), n); // a foreign record type is skipped, not visited
+    }
+}
+
+test "engines: the extended ACK of a failed reply is captured; a filtered dump keeps non-EINVAL errnos; a fixed request carries the sequence" {
+    const pid: u32 = 4242;
+    const seq: u32 = 17;
+    const eperm = errnoDatagram(pid, seq, -@as(i32, @backingInt(linux.E.PERM)));
+    {
+        var p: ProbeTransport = .{ .base = .{ .script = &.{&eperm}, .pid = pid, .seq = seq } };
+        try testing.expectError(error.AccessDenied, awaitFlowOver(&p, seq));
+        try testing.expectEqual(@as(usize, 1), p.acks);
+    }
+    {
+        var p: ProbeTransport = .{ .base = .{ .script = &.{&eperm}, .pid = pid, .seq = seq } };
+        try testing.expectError(error.AccessDenied, dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, testing.allocator, &p, .{ .flow = .{} }, max_dump_flows));
+        try testing.expectEqual(@as(usize, 1), p.acks);
+    }
+    {
+        // With a filter, EPERM is still AccessDenied (only EINVAL stays InvalidRequest).
+        var p: ProbeTransport = .{ .base = .{ .script = &.{&eperm}, .pid = pid, .seq = seq } };
+        try testing.expectError(error.AccessDenied, dumpGeneric(Flow, wire.decodeFlow, wire.msg_ct_new, testing.allocator, &p, .{ .flow = .{ .filter = .{ .zone = 1 } } }, max_dump_flows));
+    }
+    {
+        const done = controlDatagram(pid, seq, codec.NLM_F_MULTI);
+        var p: ProbeTransport = .{ .base = .{ .script = &.{&done}, .pid = pid, .seq = seq } };
+        const stats = try dumpGeneric(CpuStats, ext.decodeCpuStats, ext.msg_ct_get_stats_cpu, testing.allocator, &p, .{ .fixed = ext.buildStatsCpuDump(0) }, max_dump_flows);
+        defer testing.allocator.free(stats);
+        try testing.expectEqual(seq, std.mem.readInt(u32, p.sent[8..12], native_endian));
+    }
+}

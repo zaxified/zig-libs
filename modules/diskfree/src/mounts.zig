@@ -661,3 +661,78 @@ fn shapeInput(raw: *const [fuzz_input_len]u8, buf: []u8) []const u8 {
     }
     return buf[0..len];
 }
+
+test "parseMounts: digits without a backslash stay literal, an out-of-octal digit ends an escape (whole-module mutation 2026-11-19)" {
+    // Three octal digits without a leading backslash are not an escape.
+    const e1 = try parseMounts(testing.allocator, "/dev/sda1 /mnt/d123 ext4 rw 0 0\n");
+    defer freeAll(testing.allocator, e1);
+    try testing.expectEqualStrings("/mnt/d123", e1[0].mount_point);
+    // `\018`: the 8 is not an octal digit, so the whole sequence is literal.
+    const a = try unescapeOctal(testing.allocator, "a\\018b");
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("a\\018b", a);
+    // `\0a0` and `\1`-prefixed short runs likewise.
+    const b = try unescapeOctal(testing.allocator, "\\0a0\\12");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("\\0a0\\12", b);
+    // The boundary digits do decode: `\000` and `\077` (`?`).
+    const c = try unescapeOctal(testing.allocator, "\\000\\077");
+    defer testing.allocator.free(c);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, '?' }, c);
+}
+
+test "parseMounts: tab-separated rows parse; rows with fewer than four columns and blank rows are skipped" {
+    const e = try parseMounts(testing.allocator, "dev\t/mnt\text4\trw\t0\t0\n \n\t\t\na\nb c\nd e f\n\n/dev/x /y xfs rw\n");
+    defer freeAll(testing.allocator, e);
+    try testing.expectEqual(@as(usize, 2), e.len);
+    try testing.expectEqualStrings("dev", e[0].device);
+    try testing.expectEqualStrings("/mnt", e[0].mount_point);
+    try testing.expectEqualStrings("ext4", e[0].fs_type);
+    try testing.expectEqualStrings("rw", e[0].options);
+    try testing.expectEqualStrings("/y", e[1].mount_point);
+}
+
+test "readMountsLimited and readVirtualFileCut: the truncated flag, and the exact boundary of the limit" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The live table: a limit far above it is not a cut, a tiny one is.
+    if (try readMountsLimited(testing.allocator, io, mount_table_read_limit)) |r| {
+        defer r.deinit(testing.allocator);
+        try testing.expect(!r.truncated);
+    }
+    if (try readMountsLimited(testing.allocator, io, 16)) |r| {
+        defer r.deinit(testing.allocator);
+        try testing.expect(r.truncated);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var payload: [1000]u8 = undefined; // 100 rows of 10 bytes
+    for (0..100) |i| _ = std.mem.print(payload[i * 10 ..][0..10], "row{d:0>6}\n", .{i}) catch unreachable;
+    {
+        var f = try tmp.dir.createFile(io, "edge.txt", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(&payload);
+        try w.interface.flush();
+    }
+    var path_buf: [128]u8 = undefined;
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/edge.txt", .{&tmp.sub_path});
+
+    var cut = true;
+    // One byte short of the file: a cut, and the partial last row is dropped.
+    const short = (try readVirtualFileCut(testing.allocator, io, path, 999, &cut)).?;
+    defer testing.allocator.free(short);
+    try testing.expect(cut);
+    try testing.expectEqual(@as(usize, 990), short.len);
+    // More than the file: complete, not a cut. (A limit EQUAL to the file length also
+    // reports a cut, because the reader stops at the limit before it sees EOF; the text
+    // is whole then, so that case is conservative and is not pinned here.)
+    const over = (try readVirtualFileCut(testing.allocator, io, path, 1001, &cut)).?;
+    defer testing.allocator.free(over);
+    try testing.expect(!cut);
+    try testing.expectEqual(@as(usize, 1000), over.len);
+}

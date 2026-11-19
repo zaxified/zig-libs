@@ -547,3 +547,18 @@ test "containing: works on the real parsers' entry types" {
     try testing.expectEqualStrings("/", info[j].mount_point);
     try testing.expect(try isMountPoint(info, "/"));
 }
+
+test "containing / containingIndexed: a root entry written with trailing slashes is the root (whole-module mutation 2026-11-19)" {
+    // The tree walk must start at this entry (a flat longest-prefix answer would name
+    // /h/inner for the first path): `trimmed` is what makes "//" the root in both finders.
+    const t = [_]TFake{
+        .{ .mount_id = 1, .parent_id = 0, .mount_point = "//" },
+        .{ .mount_id = 2, .parent_id = 1, .mount_point = "/h/inner" },
+        .{ .mount_id = 3, .parent_id = 1, .mount_point = "/h" }, // later, covers /h/inner
+    };
+    try testing.expectEqual(@as(?usize, 2), try containing(&t, "/h/inner/f"));
+    var ix = try Index.init(testing.allocator, &t);
+    defer ix.deinit(testing.allocator);
+    try testing.expectEqual(@as(?usize, 2), try containingIndexed(&ix, &t, "/h/inner/f"));
+    try testing.expectEqual(@as(?usize, 0), try containingIndexed(&ix, &t, "/etc"));
+}

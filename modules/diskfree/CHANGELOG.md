@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit over all six source files (279 mutants: 268 killed, 10 equivalent, 1 unobservable). Tests added for the survivors (octal escapes, tab-separated and short mounts rows, truncation flag and limit boundary, every `mapErrno` class, a `//` root entry in both lookup finders, a mismatched mount tree, whole-name `skip_fs_types`, the device of a `readTable` row, golden lists of every classification name); no source behaviour changed.
+
 - **2026-11-19** — **ADDED:** `lookup.Index` and `lookup.containingIndexed`: `containing` over mountinfo entries through a parent-id index built once, so a hostile saved table with a parent cycle costs O(n log n) instead of O(n^2) per lookup; `table.collectWith` with `Options.tree` uses one index for all candidates (previously up to `max_mounts` quadratic walks). Same answers as `containing` on every table; `containing` is unchanged. Delta mutation 16/17 killed, 1 equivalent (cost-only).
 
 - **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
