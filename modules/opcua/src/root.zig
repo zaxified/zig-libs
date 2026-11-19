@@ -301,7 +301,10 @@ pub const SecureChannel = struct {
         defer if (derived) |*k| k.wipe();
         if (secure) {
             const server_nonce = response.server_nonce orelse return error.InvalidSecureMessage;
-            if (server_nonce.len == 0) return error.InvalidSecureMessage;
+            // OPC 10000-6 §6.7.5: the nonce is as long as the symmetric key (32
+            // bytes for Basic256Sha256), both ways; a shorter one would key the
+            // client-to-server direction from a few bytes of secret.
+            if (server_nonce.len != client_nonce.len) return error.InvalidSecureMessage;
             derived = security.deriveKeys(&client_nonce, server_nonce, ch.io.security.?.policy);
         }
 
@@ -3107,7 +3110,7 @@ test "Subscription offline scripted: a ModifyMonitoredItems answer with more res
     try testing.expect(sub.findMonitoredItem(10) == null);
 }
 
-test "secure offline scripted: open and renew refuse a zero lifetime and an empty server nonce, state untouched; a 1 ms lifetime is taken but renews no sooner than the floor" {
+test "secure offline scripted: open and renew refuse a zero lifetime and any server nonce that is not 32 bytes, state untouched; a 1 ms lifetime is taken but renews no sooner than the floor" {
     const testing = std.testing;
     var prng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(45)));
     const random = prng.random();
@@ -3137,6 +3140,9 @@ test "secure offline scripted: open and renew refuse a zero lifetime and an empt
     const cases = [_]Case{
         .{ .nonce_len = 32, .lifetime = 0, .err = error.InvalidTokenLifetime },
         .{ .nonce_len = 0, .lifetime = 5_000, .err = error.InvalidSecureMessage },
+        .{ .nonce_len = 1, .lifetime = 5_000, .err = error.InvalidSecureMessage },
+        .{ .nonce_len = 31, .lifetime = 5_000, .err = error.InvalidSecureMessage },
+        .{ .nonce_len = 33, .lifetime = 5_000, .err = error.InvalidSecureMessage },
         .{ .nonce_len = 32, .lifetime = 1, .err = null },
     };
     for (cases) |c| {

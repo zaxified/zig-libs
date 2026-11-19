@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **Behaviour change:** an OpenSecureChannel answer whose server nonce is not exactly 32 bytes (the symmetric key length, OPC 10000-6 §6.7.5) is refused with `error.InvalidSecureMessage` at a secured policy, for `open` and `renew`; before, only an empty nonce was refused. Review LOW-3.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** documentation: `SecureChannel.renew` now says that after a client-side refusal of a renewal answer the server has already rotated to the new token, so the old one lives only for the overlap window (review LOW-1).
 - **2026-11-19** — **Behaviour change:** an OpenSecureChannel answer with `RevisedLifetime == 0` is refused (`error.InvalidTokenLifetime`, new member of `services.ServiceError`) before any channel state changes, for `open` and `renew`; and `renewalDue` is never true sooner than `SecureChannel.min_renewal_delay_ms` (default 50 ms) after the token arrived, so a server revising the lifetime to a few milliseconds cannot turn `renewIfDue` into one RSA operation per request. The floor follows node-opcua's client (`max(75 %, 50 ms)`); open62541 has none. Review finding MEDIUM-1.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the client-side renewal, ModifyMonitoredItems, SetMonitoringMode and TranslateBrowsePaths code (50 mutants: 48 killed, 2 unobservable stack-copy wipes); one more scripted-peer test; the card counts are now 886/962 (cumulative), `src` re-pinned.
