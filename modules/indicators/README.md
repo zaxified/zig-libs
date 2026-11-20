@@ -41,7 +41,7 @@ var bb = try ind.BbandsStream(f64).init(.{}, buf);
   period is a per-call option (`.bars = n`, `.auto4`, `.auto8` with TA-Lib's constants), not a
   process-global setting.
 - **Beyond TA-Lib:** `nan = .skip` on the recursive indicators (a NaN bar is ignored), `seed = .first`
-  for EMA-based ones (pandas `ewm(adjust=False)`), no global state, no allocation on the batch path.
+  for EMA-based ones (pandas `ewm(adjust=False)`), no global state, no allocation on most batch paths (the functions that need scratch take an allocator first; SPEC Limits).
 - **Wave I3, volume and statistics (50 more functions):** volume (AD, ADOSC, CMF, EFI, EMV, KVO, MARKETFI, NVI, OBV, PVI, PVO, PVT, RVOL, VWAP),
   volatility (ADR, BBW, CVI, MASSI, PERCENTB, ROGERSSATCHELL, RVI, RVIR), price transforms (AVGDEV, AVGPRICE, HA, MEDPRICE, TYPPRICE,
   WCLPRICE), statistics (BETA, CORREL, KURTOSIS, LINEARREG and its ANGLE / INTERCEPT / SLOPE, MEDIAN, PERCENTILE, PERCENTRANK, STDDEV, TSF,
@@ -56,7 +56,6 @@ var bb = try ind.BbandsStream(f64).init(.{}, buf);
 - **Candlestick patterns (61 functions, `ind.candles`):** every TA-Lib `CDL*` function: `ind.candles.cdldoji(f64, open, high, low, close, out, .{})` writes `i32` (0, +-100; +-80 and +-200 where TA-Lib does) and returns the lookback,
   `cdldojiLookback`, `CdldojiStream(f64)` (`update(o, h, l, c)`, ring buffer from the caller); TA-Lib's process-global candle settings are the `settings` field of every call's params (`.default` is TA-Lib's table), the seven
   penetration patterns also take `.penetration`. All 61 are bitwise equal to TA-Lib in the live oracle, with four settings presets and generated pattern-rich inputs. See SPEC.md.
-- **Not built yet:** nothing of TA-Lib's 237 functions; the deviations are MAVP without a streaming type, a 2-ULP / 1e-13 bound on the libm-dependent functions (LINEARREG_ANGLE, PSO, math transforms, Hilbert family, MAMA) and RSI answering NaN. See SPEC.md.
 - **Model after:** TA-Lib C 0.8.3 (`kand`, Rust, is the speed candidate for a later benchmark).
 - **Platform:** any (pure logic). **Role:** util. **Concurrency:** reentrant (no shared state).
 - **Depends on:** nothing. Math is f64 for both `f32` and `f64` input.
@@ -73,3 +72,10 @@ code is vendored or linked.
   VORTEX, MFI, ULTOSC, CMO, CMOU, CG, APO, PPO, TRIX, COPPOCK, ERI, DOSC, FISHER, PSO, SMI, TSI, WAVETREND, KST,
   KSTEXT, KDJ, STOCHRSI, CRSI, STC, SQZMOM (57 functions, same API conventions; multi-input streams take a struct,
   `update(.{ .high = h, .low = l, .close = c })`). All bitwise equal to TA-Lib 0.8.3 (PSO within 2 ULP of glibc's `tanh`).
+
+## Not provided
+
+A streaming MAVP; TA-Lib's `startIdx` / `endIdx` range arguments and in-place calls (`out` must not alias `in`); process-global
+settings (the unstable period and the candle settings are per call). The libm-dependent functions (LINEARREG_ANGLE, PSO, the
+math transforms, the Hilbert family, MAMA) carry a 2-ULP / 1e-13 bound against TA-Lib and RSI answers NaN where TA-Lib's
+poisoned state reads 50. See SPEC.md *What is deliberately not done* and *Backlog / deferred*.

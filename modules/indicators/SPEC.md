@@ -16,75 +16,6 @@
 
 **Downstream consumer:** no
 
-**Audit 2026-11-17 (delta mutation).** 114 schemata mutants over the non-test lines of the third P-gap round: CRSI's
-percent rank (`countBelow`: lane compare, tail compare, reduction, bound; the ring threshold, the divisor), the STOCH /
-STOCHF / KDJ batch (`kSeries`: NaN lead, its `min`, the automatons' start state, the first bar; `maStage`: lead, `min`,
-skip flag; the stage offsets, the f64 / f32 dispatch, the in-place swap and its blanking), STOCHRSI's three passes
-(dispatch, validation, length check, RSI lead, its `min`, the %K period, the %D offset, the swap), the ALMA 8-lane batch
-(dispatch, period-1 guard, lead, bound, seed, fused vs separate multiply-add, both stores, window offset),
-`VarCore.steadyStep` / `steady` / the step hand-off and the peak select, the BBANDS head / steady split, VAR / STDDEV
-`steady` / `steadyRun` (the `nbdev` arm, the write-back), MEDIAN / PERCENTILE (`countCmp` / `countBoth`: every compare,
-bound and reduction; `upperIdx`'s switch both ways, `sortedInsert` / `replaceAt` shifts, clamp and branch, the
-`clean` flag dropped and both ways at each switch, the empty-window guard, `computeAt`'s position), HMA (`flatRun`'s
-guard both bounds, the three re-anchor schedules and strides, the trailing re-reads, the ring slot, wrap and rebuild
-window, `wmaRebuild`'s weight, the write-backs), FRAMA (dispatch both ways, validation, length check, warm-up bounds
-and steps, the older pair's offset, the seed price, the NaN lead, the two-lane select, the range, the blend gate, the
-output gate) and MINMAX (block-scan dispatch, lookback, lead and its `min`, the sink, the returned lookback). First run:
-77 killed, 37 survived. New tests: MEDIAN / PERCENTILE against the binary searches they replaced (bit for bit, ties of
-signed zeros, NaN from a random bar on, every period 2..39 — the counts must answer the searches' bits and hand over to
-the searches for good once a NaN entered); MINMAX's shared block scan against two `extBatch` passes with NaN and
-signed-zero ties up to `block_cap`; STOCHRSI's f64 batch refusing a zero `fastk` and every short slice; VAR period 1
-with a huge first bar (the shift is that bar: 0, not inf - inf); ALMA over an all -0.0 window (+0.0, the stream's seed);
-FRAMA's f64 batch against the core with an inf or a NaN on every bar of the first windows, in both NaN modes, on
-quantized bars with NaN, and on a tie followed by a NaN on the trailing bar. Rerun: 14 more killed. The last survivor,
-the newer half-window extremes first stepped one bar late in FRAMA's warm-up, is not equivalent: traced by hand, the
-late automaton keeps the earliest of two tied highs, rescans one bar before the core does and starts that rescan on a
-NaN, answering NaN on the first output bar where the core answers the tie; the tie-then-NaN test above is that trace
-(written after the last schemata build, so checked against the original only). EQUIVALENT (19): the f64 fast-path
-switches of STOCHRSI, STOCHF, STOCH, ALMA and FRAMA and MINMAX's block-scan switch (each other path is the same bits —
-STOCH's f32 loop captures by value, MINMAX's by the new test); the searches in place of the counts on a NaN-free window
-(two mutants: the same positions on a sorted NaN-free slice); the vector loop bounds of `countCmp`, `countBelow` and
-`almaRun` one block early (the scalar tail runs the same compares and operations); `compute`'s `isNan(x)` (no element
-is `<=` a NaN, and `upperBound` answers 0 too); the empty-window guard (period >= 2); BBANDS' `mv == null` past the head
-(every average answers from its own lookback on, which is at most the bands'); STOCHRSI's NaN `memset` and `kSeries`'
-NaN lead (every caller blanks or skips those bars before reading them); `RWin` without the wrap (`at` folds one lap and
-`first <= s`); FRAMA's select as `>=` (a tie changes only the sign of a zero, and the blend needs `r > 0`) and
-`x - (-y)` as `x + y` (the same IEEE operation). UNOBSERVABLE (3): the write-backs of `VarianceCore.steadyRun` and
-`HmaCore.flatRun` (`since`, the outer `trailing`) — every caller discards the core after a batch; they need a caller that
-keeps stepping it. 114 of 114 resolved (92 killed, 19 equivalent, 3 unobservable).
-
-**Audit 2026-11-16 (delta mutation).** 174 schemata mutants over the non-test lines of the second P-gap round:
-`window.hiLoBlocks` / `hiLoBlocksFrom` (every guard and bound, the block start and stride, each suffix and prefix
-store, the join window, each strict compare as `>=` / `<=`), the MIDPOINT / MIDPRICE / WILLR / ICHIMOKU batches
-(validation, length check, fallback to the automaton, the NaN lead and its `min` against a short output, the returned
-lookback, the three ICHIMOKU periods and the mean of tenkan and kijun), MFI (`flowTp`'s vector selects, the epsilon
-compare and the money flag, `step` / `steadyStep` / `steady`, the batch's threshold, ring fill, slot walk and
-subtractions), STC (`BlockWin`: carve, `extremes` lanes, compare and sentinel index, `commit` rebuild; `stepImpl`'s
-counts, ranges and fractions, the committing flag, `peekStep`, the scratch size), HMA (`steady`, `steadyRun`'s guards,
-offsets, ring index and write-backs), `WmaCore.step` / `steadyStep` and the local copy in `vs_kit.run`. First run: 126
-killed (one by timeout), 48 survived. New tests: `hiLoBlocks` with 0.0 / -0.0 ties at every compare, its refusals
-(`per` 0, `from < per - 1`) and the longest period, unequal series lengths; the four block-scan batches on every input
-shorter than the lookback; WILLR and MFI refusing period 1; HMA on every length 0..59 against its stream; MFI around its
-ring threshold against its stream, a bar inside the epsilon carrying no flow, rounding residue wiped by `period`
-money-free bars, a NaN volume on a bar between two zero prices; `BlockWin` against a rescan; STC against the window
-rescan it replaced (walk, swapped periods, an all-zero start followed by a walk), `peekStep` leaving the core as it was,
-a scratch one value short. Rerun: 23 more killed, 25 survived. EQUIVALENT (24): `m > 1 or true` re-compares the same bar
-(window); a period of exactly 256 taking the automaton instead of the blocks, and `per >= mfi_ring_cap`, are path
-choices with the same values (the documented NaN / 0.0 tie difference aside); `lb < len + 1` only adds an empty loop;
-`down` as `<=` (a zero step is always inside the epsilon, which overrides the select); MFI's `validate` (both
-continuations validate the same period); `for (0..k)` in the ring fill (slot 0 is rewritten before it is read);
-`cc.n += 1` (the copy is discarded and `tail` takes `n` as an argument); the ring's initial zeros (every slot is written
-before it is read); the four tie compares of `BlockWin` (`>=` against `>` differ only on equal values, hence only in the
-sign of a zero, which no later comparison or output value sees); the rebuild stopping at slot 1 (suffix slot 0 is never
-read); `HmaCore.steady` with `p == 1` guarded away (`n >= 0` holds anyway) and one bar later (the step then does the
-same work); `WmaCore.step`'s `p != 1` guard (`n + 1 < 1` is false anyway); a committing `peekStep` (the real step
-rewrites the ring slot it touched and never reads the suffix slot a block-end commit rebuilds). UNOBSERVABLE: the
-write-backs of `HmaCore.steadyRun` and `vs_kit.run`'s local copy, and `HmaCore.n` (every caller discards the core; they
-need a caller that keeps stepping the same core after the loop). `r1 >= 0.0` in STC's first fraction (0 / 0 = NaN sticks
-in the smoothing when a flat start is followed by movement) is killed by the all-zero-start rescan test, checked by hand
-on the coordinator's run (the mutant applied to the source, `modtest indicators` failing on that test, reverted): 174 of
-174 resolved.
-
 ## Compared with
 
 Surveyed 2026-11-15 per `SURVEY-PLAYBOOK.md`; stars and activity were not fetched in this wave (no network), the reference's own release is the only date given.
@@ -94,7 +25,7 @@ Surveyed 2026-11-15 per `SURVEY-PLAYBOOK.md`; stars and activity were not fetche
 | [TA-Lib/ta-lib](https://github.com/TA-Lib/ta-lib) — **reference** | C | BSD-3-Clause | n/a | 0.8.3 (2026-10-25) | 237 functions, all of them here; process-global unstable period and candle settings, all functions batch plus a streaming API |
 | [kand](https://github.com/kand-ta/kand) | Rust | Apache-2.0 / MIT | n/a | not fetched | speed candidate for the benchmark wave (I4), not compared yet |
 
-**Where we are ahead:** nothing claimed yet · **Where we are behind:** batch speed against TA-Lib: 0.43–1.9×, 31 of 88 functions over 1.1× (→ Benchmark); no streaming MAVP (→ Backlog). **Ahead:** streaming updates 0.29–0.59× TA-Lib's `_Update` (not claimed on the card: the grade reads the worst batch row).
+**Where we are ahead:** nothing claimed yet · **Where we are behind:** batch speed against TA-Lib (figures on the card's `**Performance:**` line; → Performance, Backlog); no streaming MAVP (→ Backlog). **Ahead:** streaming updates against TA-Lib's `_Update` (figure on the same card line; not claimed for the grade, which reads the worst batch row).
 
 ## What this module is, and what it is not
 
@@ -107,8 +38,8 @@ VIDYA, VWMA, ZIGZAG, ZLEMA; wave I3, volume / volatility / price transform / sta
 EFI, EMV, KVO, MARKETFI, NVI, OBV, PVI, PVO, PVT, RVOL, VWAP, ADR, BBW, CVI, MASSI, PERCENTB, ROGERSSATCHELL, RVI, RVIR,
 AVGDEV, AVGPRICE, HA, MEDPRICE, TYPPRICE, WCLPRICE, BETA, CORREL, KURTOSIS, LINEARREG (+ANGLE / INTERCEPT / SLOPE), MEDIAN,
 PERCENTILE, PERCENTRANK, STDDEV, TSF, VAR, ADD, SUB, MULT, DIV, CUMSUM, MINMAX, MAXINDEX, MININDEX, MINMAXINDEX; wave I3, cycle: HT_DCPERIOD, HT_DCPHASE, HT_PHASOR, HT_SINE, HT_TRENDLINE, HT_TRENDMODE, MAMA, SWAK_BP, SWAK_HP, SWAK_2PHP, ACOS, ASIN, ATAN, CEIL, COS, COSH, EXP, FLOOR, LN, LOG10, SIN, SINH, SQRT, TAN, TANH. Every function has a batch form, a `Lookback` function and a
-streaming type (MAVP excepted, see Limits; MACDEXT, STOCH, STOCHF, CKSP and ALMA additionally take an allocator first, used only for `f32` input or scratch, see Limits); the batch and streaming forms run the same core step, so they agree to the bit
-(tested).
+streaming type (MAVP excepted, see Limits; the functions that need scratch take an allocator first, see Limits); the batch and streaming forms run the same core step, so they agree to the bit
+(tested). The momentum wave (57 functions) and the candlestick patterns (61) are listed in their own sections below.
 
 What a reader might expect and will not find: a streaming MAVP, TA-Lib's `startIdx`/`endIdx` range arguments (a batch call covers the whole slice;
 `out[0..lookback]` is NaN), in-place calls (`out` must not alias `in`; TA-Lib allows it, see Backlog), and an abstract/function-table
@@ -146,7 +77,7 @@ Per-function notes from the C source (each read before it was ported):
 - **MACDEXT**: swaps periods and types; period range of fast/slow 2.., signal 1..; every component is
   an `ma` (any supported type); line values before the signal's first bar are not reported.
 - **MACDFIX**: 12/26 with the fixed pair k = 0.15 / 0.075 (not 2/(p+1)), beta = 1-k, k = 1-beta, no
-  `beta < 0.5` swap; the fast EMA runs as many unstable bars as the slow one.
+  `beta < 0.5` swap; the fast EMA runs as many unstable bars as the slow one. The pair is built from typed `f64` constants (`src/macd.zig`): untyped float literals fold at more than double precision and make `1 - (1 - 0.15)` differ from TA-Lib's double-by-double value.
 - **RSI**: Wilder; one delta of lead, `p` deltas summed and divided for the seed; `100*g/(g+l)`, a
   window with neither gain nor loss answers 50 (0.8.x #480). Unstable lookback `p + u`, AUTO 10p / 19p.
 - **TRANGE**: lookback 1 (bar 0 only supplies the previous close). **ATR**: seed = mean of the first
@@ -302,7 +233,7 @@ Where this port differs from the C, and why:
   MAMA: alpha from the phase of `Q1 / I1`, `mama = fma(1 - a, mama, a x)`, `fama` from `a / 2`; limits [0.01, 0.99], fast default 0.5, slow 0.05.
   Unstable option and `nan` on all of them; no history buffer (the core keeps its two 50-slot rings, copy by value).
 - **MaType.mama** (TA_MA): period ignored (limits 0.5 / 0.05), the MAMA line is the output, lookback 32 + unstable (AUTO `80 + 50*4 + 40` / `80 + 50*8 + 76`); a period of 1 still copies. It works in
-  every slot that takes a `MaType` (MACDEXT, BBANDS, STOCH, STOCHF, MAVP, PVO, BBW, PERCENTB) and in the oracle's grids for them. `error.Unsupported` is no longer returned (kept in the error set).
+  every slot that takes a `MaType` (MACDEXT, BBANDS, STOCH, STOCHF, MAVP, PVO, BBW, PERCENTB) and in the oracle's grids for them. `error.Unsupported` is never returned (kept in the error set).
 - **SWAK_BP / SWAK_HP / SWAK_2PHP**: Ehlers' band-pass (period 5..2000, delta 0.05..0.5), one-pole high-pass (period 5..100000) and two-pole high-pass (period 2..10000) rows; the state starts in the
   steady state of a constant input equal to the first bar (a DC-gain-zero row answers 0 there, tested), lookback = the unstable count only (BP AUTO `ceil(11 p / 6 delta)` / `ceil(20 p / 6 delta)`,
   HP `(10p+5)/6` / `(19p+5)/6`, 2PHP as BUTTER), `a1*y1` is the outermost `fma` as the C comments insist. Bitwise equal to TA-Lib.
@@ -341,339 +272,7 @@ All 61 `CDL*` functions of TA-Lib 0.8.3 (Pattern Recognition), ported from each 
   long periods), every penetration value incl. out-of-range, lengths 1, 2, lookback-1 .. lookback+2, 40, 300, 3000, and a pattern-rich generator (single-bar shapes and multi-bar motifs, a 0.25 price grid for exact ties, a 1e-9 scale) that
   makes every pattern fire: the oracle reports, per function, how many compared values were nonzero (all 61 >= 20, smallest in the report).
 
-## Limits and refusals
-
-- Periods 1..100000 (2.. where TA-Lib requires it: MAX, MIN, SUM, RSI, MACD fast and slow, BBANDS);
-  `Unstable.bars <= 2^30`; BBANDS deviations within ±3e37 (TA-Lib's `TA_REAL_MAX`). Pinned by the
-  `BadParam` tests of each file.
-- Wave I3 ranges are TA-Lib's: DEMA/TEMA/TRIMA/KAMA/ZLEMA/RMA/HMA/VWMA/VIDYA period 1.., MIDPOINT/MIDPRICE/MCGD/DONCHIAN/ACCBANDS/KC/ICHIMOKU/CKSP/SUPERTREND 2.., SWAK 2..10000,
-  MAVP 1..10000 with `min <= max`, T3 vfactor [0,1], ALMA sigma [0.01, 3e37] offset [0,1], SAR/SAREXT parameters [0, 3e37] (start value ±3e37), ZIGZAG sensitivity [0,100], FRAMA even.
-- No streaming type for MAVP (a per-bar period needs one average per period: a bank of up to 10000 cores). Streams of CKSP take their scratch in the caller buffer;
-  `clone` of a stream re-binds it. CKSP and ALMA batch take an allocator first (CKSP: `2 * stop_period` f64 scratch, ALMA: the weight table above 64 weights; `MaCore`'s ALMA, which has no allocator, holds up to 64 inline and recomputes the weights per bar above that).
-- `nan = .skip` exists on the recursive functions that never read history (DEMA, TEMA, T3, RMA, MCGD, SWAK, SUPERTREND, KC); not on KAMA / ZLEMA / VIDYA (they read a window, as SMA).
-- Integer outputs (SUPERTREND `trend`, ZIGZAG `trend` and `pivot_idx`, HT_TRENDMODE `trend`) are integer slices, 0 in the lead.
-- Cycle wave ranges are TA-Lib's: the Hilbert family takes none, MAMA limits [0.01, 0.99] (NaN refused), SWAK_BP period 5..2000 and delta [0.05, 0.5], SWAK_HP 5..100000, SWAK_2PHP 2..10000. `nan = .skip` exists on all of them but the math transforms.
-- No allocation on the batch path except MACDEXT, STOCH and STOCHF with `f32` input; streaming types that keep a window take a caller buffer and refuse
-  a short one with `error.BadParam`. MACDEXT, STOCH and STOCHF keep their intermediate series (MACD line, raw %K, slow %K) in f64: with `f64` the output slices double as that scratch and nothing is allocated; with `f32` they allocate `n` (MACDEXT, STOCHF) or `2n` (STOCH) f64 from the `gpa` argument and free it before returning (`error.OutOfMemory`).
-- Deliberate differences from TA-Lib: per-call unstable period instead of a process-global one;
-  RSI answers NaN (not 50) when its internal state is NaN: TA-Lib tests `gain + loss > 0` and a NaN
-  fails that test, so a poisoned RSI would read as the neutral 50, which looks like a valid
-  reading, while NaN says "no value" (batch and stream agree). `nan = .skip` exists only here: a NaN
-  bar leaves the state untouched and the OUTPUT at that bar carries the previous output (NaN while
-  there is none), like pandas `ewm(ignore_na=True)`; the bar does not count towards the lookback.
-  For `f32` input all intermediate series are f64 (as in TA-Lib's `TA_S_*`) and the result is
-  rounded once on writing `out` (tested: f32 output == `@floatCast` of the f64 output for the
-  f32-rounded input).
-
-## Anchoring
-
-**External anchor, live:** `tools/interop.zig` drives TA-Lib C 0.8.3 (our own compile of its audited
-sources into a static archive, behind the C shim `tools/talib_oracle.c`; `zig build interop-indicators`)
-over 9861 records: every seed and wave-I3 function (94 in all), f64 input (`TA_<F>`) and f32 input (`TA_S_<F>`), seeded
-random-walk OHLC inputs (also flat-run and 1e-9-scaled kinds), a parameter grid with defaults, edges,
-swapped fast/slow, every `MaType` (MAMA from the cycle wave on) in every MA slot and out-of-range values, the unstable period at
-0, 3, AUTO4 and AUTO8 (`TA_SetUnstablePeriod`), and lengths 1, 2, period-1, period, period+1,
-lookback..lookback+2, 40, 300 and (first parameter set) 5000; VWMA and MAVP get a second generated series (volume with zero stretches; periods -1..15 with NaN), the integer outputs travel as doubles. It compares the return code (BadParam
-against `TA_BAD_PARAM`), the lookback against `TA_<F>_Lookback`, `outBegIdx == lookback` and
-`outNBElement == n - lookback`, the NaN lead, and every value. **Result (2026-11-15): all 2.2 million
-compared values are bitwise equal except LINEARREG_ANGLE's (ULP bound 2, see above), the per-function ULP bound is 0 for every other function incl. ALMA / FRAMA / SWAK (`exp`, `log`, `sin` from compiler-rt agree with the oracle's libm on every sampled input; not a guarantee for all inputs)** (TA-Lib 0.8.3,
-x86-64, our `cc` line). One disagreement was found on the first run and it was ours: `MACDFIX` built its
-0.15/0.075 pair from untyped float literals, which Zig folds at more than double precision, so
-`1 - (1 - 0.15)` differed from TA-Lib's double-by-double value by up to 6e7 ULP; fixed (typed `f64`
-constants), pinned by the oracle. Wave I3 brought one more, also ours (not TA-Lib's): BBANDS fed its moving average from the largest lookback, TA-Lib starts it at bar 0; the two agree unless the average's lookback is below the deviation's, which VIDYA is (see the BBANDS note); BBW and PERCENTB, which call BBANDS in TA-Lib, had inherited the same flaw and were fixed the same way when the merged oracle widened their MA grid to every type. The oracle found no defect in TA-Lib, so there is no "lead" to record.
-
-**External anchor, frozen:** `src/testdata/talib_vectors.zig` holds 1098 of those records (n = 40, the
-first parameter sets of each function, one f32 record per function, AUTO4 and bars unstable) as bit
-patterns of TA-Lib's answers; `src/oracle_test.zig` replays them in the ordinary test lane. Since the 2026-11-15
-mutation audit the file also freezes, from a seed space of their own (the earlier records keep their inputs), one
-flat-run record per function at its defaults (n = max(40, lookback + 16)), the math transforms inside their domains and
-over ten decades, CG over a 2^33..2^-60 span and near 2^-940, the Hilbert family over 3- to 5-bar cycles, and every
-unstable level (3 bars, AUTO4, AUTO8) where the n = 40 record of the first parameter set has no outputs, on the first set
-whose lookback leaves 12 outputs within 160 bars: those n = 40 records of a long lookback were all-NaN and AUTO8 was never
-frozen, so the ordinary lane did not see the AUTO constants or the stage alignment under an unstable period. The file is
-2.7 MB (was 1.9 MB): the audit's trim (shorter flat records, no duplicate unstable records, the candle price grid replaced
-by hand-built bars) kept every kill; going further would drop records that are the only killers of a mutant (the flat
-runs of BBANDS / AD / PERCENTRANK / CRSI, the unstable levels of T3 / DEMA / MCGD / SWAK / HT, CG, HT cycles). Regenerate
-with `zig build interop-indicators -- --emit-vectors modules/indicators/src/testdata/talib_vectors.zig`, then `zig fmt` it.
-
-Not covered by the oracle: `nan = .skip` and `seed = .first` (options TA-Lib does not have; tested against
-our own batch/stream definitions), the windowed functions with NaN input (TA-Lib's own behaviour is
-unspecified; pinned by tests), parameters beyond the grid, optimised modes, other libm implementations.
-
-**Anchor grade:** class B · oracle EXTERNAL
-
-**Mutation + review (2026-11-15, whole module, first audit;** production code at `a3eb6bd33`, schemata in a detached
-copy, ReleaseSafe, strict verdict against M0, `IND_MUT=n`; two rounds, the second for the first round's six survivors): 463
-mutants, 444 killed, 19 equivalent / unobservable, 0 undecided; no defect. **Cut:** the shared cores exhaustively — `core.zig`, the
-drivers and SMA / EMA / WMA / `MaCore` / `Stage` of `smooth.zig`, `window.zig` (SUM, the streaming extreme automaton,
-its register `Run`, TA-Lib's block scan), every core of `mavg.zig` (DEMA/TEMA/T3, TRIMA, KAMA incl. `steadyRun`, ZLEMA,
-RMA, VIDYA, HMA, ALMA, MCGD, SWAK), `xmath.zig` (the double-double kernels, the atan fast path and Ziv's rounding
-test, asin/acos, the large-argument exp, sinh/cosh/tanh), `macd.zig`, `range.zig`, `vs_kit.zig`, `hist.zig`, the
-candle engine of `candles_core.zig` (settings, ranges, averages, the period totals and pre-warm, ring / peek views,
-streams), and the steady-state loops added on 2026-11-15 (EMA / chain / KAMA `steadyRun`, ATR, MACD, TRIX, APO/PPO,
-TSI, MOM/ROC, MIDPOINT, CCI's contiguous windows); every other family sampled with one mutant per distinct formula
-branch / guard / lookback rule (RSI, BBANDS + VarCore, STOCH, SAR, channels, volume, volatility, cycle (Hilbert),
-price transforms, statistic, math operators, the ADX family, CG, the momentum composites, seven candle patterns);
-not mutated: test helpers, printing, the comptime tables themselves (their use sites are), the 54 untouched candle
-patterns (their conditions are the C's, transcribed; the engine they run on is covered). Kill sources: the frozen
-TA-Lib vectors (all lookback formulas, every value formula, the f32 path, unstable levels), batch == stream and
-`peek` == `update` (every ring / NaN-skip / steady-path mutant), the hand vectors, the fuzz harness's forced runs and
-the new `audit_test.zig`. **Equivalent / unobservable (19):** `Run.of` one index early (a rescan whose extreme is
-the window's first bar returns that element); `asin` |x| > 1 guard (the double-double path gives NaN through
-`0 * inf`); MACD's `0.0 + line` seed quirk (an SMA-seeded EMA never produces -0.0, so the line is never -0.0);
-MACDFIX's fast unstable count (it only gates the fast EMA's own output, read only once the slow one answers); the
-steady APO/PPO zero-run clamp (read only for the windowed MA types, which have no steady path); MAVP's `i >= lb`
-(each period's core answers null until `lb`); RSI's gain-NaN test (the gain only accumulates positive terms and
-positive scalings, an inf input poisons the loss first); BBANDS VarCore's seed peak (the next statement takes the
-max with the larger t2) and its `variance < 1e-12` clamp (unreachable after the two re-anchors: a window holding the
-anchor bar has variance >= t2 / p^2 unless it is exactly flat, which gives 0); SAR's clamp of the reversal value to
-the previous high (the extreme point already is the running maximum of the highs); the `peekRings` slot restore
-(the slot a peek clobbers holds bar n - len, which no step reads after pushing bar n); RISEFALL3METHODS'
-`color(4)` (equal to `color(0)` by the pattern's own conditions); HT's `re != 0` and `|imag| <= 0.01` branches (reachable only with an exactly zero
-component); and three precision-level choices of `xmath` (the e^-x term of the large-argument cosh/sinh below 45, the
-small-argument sinh and cosh formulas), which move a result by at most one ULP and are checked only by the live
-oracle under the math transforms' 2-ULP bound; and CG's `SCALE_CAP` on the two-limb scale (uncapped, that scale is
-inf, fails the fit test, and the window takes the three-limb scale, capped on its own line, whose sums are exact as
-well: the frozen record near 2^-940 agrees with TA-Lib bit for bit either way). **Second round:** the first round's
-six survivors are killed by hand-built inputs found by search or construction (KAMA's zero-change count of the first
-window: a change-sum residue of 2^-53 and a following move of 2^-50; MCGD's `r^2 * r^2`: an input pair where
-`((r*r)*r)*r` differs; ER's clamp: three prices whose rounded change sum is below the net change; HT's period floor:
-3- to 5.5-bar cycles never answer below 6; CG's `width3` cap: the frozen 2^33..2^-60 span record, which needs three
-limbs), and MASS's 0 / 0 = 1 and STC's seeded second stochastic, which the trimmed flat records no longer reached, by
-hand tests. **Review (same pass, adversarial):** no consumer-reachable panic, OOM or
-unbounded allocation found beyond what the 2026-11-15 sweep fixed (allocation is bounded by the input length or by
-`max_period`; streams take caller buffers); lookback sums stay below 2^32 even on 32-bit targets (at most three
-unstable counts of 2^30); batch and stream share every core. Notes (both closed in the same session, see below): `Stream1` had a NaN-skip branch that would answer null where every other wrapper answers the last output (dead: no ring stream's parameters have `nan`), and `MaCore.alma` (MA,
-MACDEXT, BBANDS, ... with `.alma`) recomputed the Gaussian weights per bar (`exp` per weight) where `alma()` uses a
-table — cost only. Not defects: MAVP keeps a 10001-entry index table on the stack (about 90 KB per call). **Third round (delta, 2026-11-15):** `Stream1`'s dead NaN-skip branch is deleted (and a `nan` parameter on a `Stream1` core is a compile error, so it cannot come back silently); `MaCore`'s ALMA variant (`AlmaTabCore`) keeps its weight table inline for periods up to 64 (a by-value union cannot hold a slice into itself; no allocator, bounded size) and recomputes above, bit for bit the same (measured `ma(.alma)` at 1e5 bars, 38x / 29x / 27x faster at periods 9 / 30 / 64; the table rows of the comparative benchmark do not use `.alma`). Six mutants on the changed lines: 3 killed (table not filled, the table/recompute switch flipped, the ring-slot count), 3 equivalent (the 64 bound off by one and the table bypass: the recompute gives the same bits, cost only; the period-1 table, never read because period 1 returns the input). New tests:
-`src/audit_test.zig` (signed-zero ties of the batch block scan and the streaming rescan, KAMA / VIDYA / CMOU / MFI flat
-rules on data with rounding residue, HMA as three public WMAs at odd periods, MCGD's drop of a non-finite update and
-its evaluation order, MACDEXT's swap of periods and types, ATR / KC NaN skip on the close and in `peek`, APO / AO
-swapped periods, PPO zero tails batch and stream, TSI / COPPOCK / ROCR100 / WILLR / VHF / VORTEX / DX / CHOP / CMF
-neutral answers, VWMA residue, ACCBANDS near-zero sums, +DM ties, BBW / PERCENTB against BBANDS' bands, the AUTO
-lookbacks of KAMA / RMA / VIDYA / PLUS_DI, FISHER's 0.999 clamp, WAVETREND's settled tail, KURTOSIS's 32p re-anchor,
-TANH = `xmath.tanh`, TRIX period 1, HIKKAKE's confirmation window and pre-warm, one load-bearing condition each of
-2CROWS / 3INSIDE / MORNINGSTAR / PIERCING / MATHOLD, the doji colour and the strict body gap; and from the second
-round KAMA's first-window count, MCGD's evaluation order on a crafted pair, ER's clamp, HT_DCPERIOD's floor, MASS on a
-flat market, STC's seed), EMA period 1 copies (-0.0, inf, unstable bars), the atan
-fast path's rounding test on arguments near a rounding boundary, sinh / cosh of NaN; and the extra frozen records
-above (`tools/interop.zig`).
-
-The volume / volatility / price-transform / statistic / math-operator functions use the same oracle with OHLCV series (volume 0..2000 with runs of zeros, zero on every flat
-bar; the open inside each bar), parameter grids of defaults, edges, every `MaType` wherever a function takes one (PVO, BBW, PERCENTB), out-of-range values (every one
-agrees on `TA_BAD_PARAM`), unstable 0 / 3 / AUTO4 / AUTO8 where it matters, and the lengths above; index outputs (MAXINDEX, MININDEX, MINMAXINDEX) are compared as integers.
-**Result: all compared values bitwise equal except LINEARREG_ANGLE (ULP bound 2, see above); no TA-Lib defect found.**
-Not covered: NaN inputs, other toolchains.
-
-**Cycle wave (same oracle, 11867 records and 2.98 million values in all with the 94 earlier functions; every MaType including MAMA now in every MA slot):** the Hilbert family and MAMA are run
-on 26 and 134 records (walk, flat-run and 1e-9-scaled inputs, lengths up to 5000, unstable 0 / 3 / AUTO4 / AUTO8 on lengths up to 700 so the AUTO warm-ups produce values, f32 via `TA_S_*`), the math transforms
-get inputs inside their domains (ACOS / ASIN on [-1.2, 1.2] behind a head of edge values: 0, -0, +-1, +-(1+eps), +-inf, NaN, 710, -745, 1e22, 1e-310) and over ten decades of both signs, 16 records each, n up to 5000.
-Result: SWAK_BP / HP / 2PHP, HT_TRENDLINE, HT_TRENDMODE, CEIL, FLOOR, SQRT, EXP, LN, LOG10, SIN, COS, TAN and every moving average / band / oscillator slot with MAMA (MA, MACDEXT, BBANDS, STOCH, STOCHF, MAVP, PVO, BBW) are bitwise
-equal; HT_DCPERIOD (297 of 12718 values), HT_DCPHASE, HT_PHASOR, HT_SINE, MAMA and PERCENTB with MAMA differ as described under the Hilbert allowance above (largest column-relative distance 1.0e-15),
-ACOS / ASIN / ATAN / COSH / SINH / TANH by at most 1 ULP (2 for SINH / TANH). `max/colmax` is printed by the oracle.
-
-**Candlestick patterns (same oracle, 47063 records in all with the other 176 functions; the 61 patterns: 28203 records, 3.60 million compared values, all bitwise equal, no TA-Lib defect found):** every pattern at TA-Lib's default settings over lengths 1, 2, lookback-1 .. lookback+2, 40, 300 and
-3000 (pattern-rich inputs, a 0.25 price grid for exact ties and a 1e-9 scale), f64 and `TA_S_*`; the seven penetration patterns at 0, 0.1, 0.3 / 0.5, 1, 3, 3e37 and the out-of-range / NaN values (BadParam on both sides); and four settings presets (every range type /
-period / factor moved, all periods 0, all periods 20 with doubled factors, rotated range types with 1-2 bar periods) driven into TA-Lib with `TA_SetCandleSettings` and into ours as `CandleSettings`, which shows each setting is honoured, not only
-the defaults. The oracle prints per pattern how many compared values had a nonzero TA-Lib answer: all 61 reach at least 29 (TRISTAR 29, KICKING 33, STICKSANDWICH 38, MATHOLD 46, ... CDLBELTHOLD about 16000), so no pattern is compared on zeros alone. Not covered: patterns on
-inputs with NaN or infinite bars, settings with factors above 2 or periods above 20, other toolchains.
-
-## What is deliberately not done
-
-- Not now: `nan = .skip` on the windowed indicators; a streaming MAVP.
-- Not now: SIMD fast paths that change the arithmetic (the vector code of the batch loops only runs bars or counts side
-  by side, every lane the scalar operations in their order), benchmark against `kand` (TA-Lib is measured, see Benchmark).
-- Never: process-global configuration (unstable period, candle settings) — options are per call.
-
-## Open
-
-- The Hilbert family and MAMA are within a column-relative 1e-13, not bitwise, because of the C library's `atan` rounding (see the cycle section); a port of glibc's `atan`
-  (IBM Accurate Mathematical Library tables, LGPL) would be needed to be bitwise, and is not done. Records with `MaType.mama` inherit it.
-- Bitwise agreement with TA-Lib is measured for one toolchain (x86-64, the coordinator's `cc` line); a
-  TA-Lib compiled with a different contraction policy could differ by an ULP where its C spells
-  `a*b - c*d` (BBANDS/VAR variance); we never contract. Re-run the oracle on aarch64 before claiming it there.
-- NaN semantics of the windowed indicators (SMA, WMA, SUM, BBANDS, STOCH): a NaN enters the running
-  sums and stays there until a re-anchor (WMA every 8p outputs, the variance every 32 windows)
-  rebuilds them; pinned by tests, equal to TA-Lib's C by reading, not by running. MAX/MIN/MINMAX batch: the block scan of
-  the C, so a NaN suffix of a block stays in the outputs that use it (pinned, by reading; the oracle has no NaN inputs);
-  streams: a NaN never wins a comparison and only shows when it opens a rescan; ties keep the OLDEST value on a rescan
-  (`>` / `<`) and the NEWEST on an incremental update (`>=` / `<=`) (pinned).
-
-## Benchmark
-
-`zig build bench-indicators` (`tools/bench.zig`, C side `tools/bench_talib.c` with the rows in `tools/bench_rows.h`; kept
-instrument kind 3, CONVENTIONS.md §9). Reference: TA-Lib C 0.8.3, the module's own model; no other candidate is timed yet
-(`kand`, the speed candidate, is not timed yet: see Compared with). Table measured 2026-11-16 on a quiet machine (one single-core mutation job beside it), after the second P-gap round;
-the rows of the third round (marked "3rd") re-measured the same day after it, under load average 3-4 (ratios by cycles, both sides in
-the same run); rows the P-gap work changed name their ratio before it.
-
-**Method.** Both sides run one BATCH call over the first n bars of the same seeded random-walk OHLCV series (f64, file
-`ohlcv.bin` written by the bench; close moves by up to 1 % a bar), into preallocated output buffers, one thread: ours
-`ind.<f>(f64, ...)` with `out.len == n` (so it also writes the NaN lead), TA-Lib `TA_<F>(0, n - 1, ...)` into compact buffers.
-Parameters are the same on both sides and are runtime values on ours (an opaque copy, so the optimizer cannot fold a period).
-Each side times itself as `benchkit` does (the batch doubles past 100 ms, best of five), the sides alternate for 3 rounds (the headline
-set was repeated with 4 and agrees with the 3-round run within 7 % on every row), and the ratio is ours / TA-Lib
-by user-mode cycles. Before anything is timed, every row is run once at n = 1000 on both sides and the output count and the sum of
-all finite outputs must agree (relative 1e-9): all 88 rows do. Rows are `<name>.<n>`: the 20 headline rows at 1e3 and 1e5 (six also at
-1e6), 68 screening rows (every other function with simple inputs, to find the slowest) at 1e5, and 3 streaming rows.
-
-**TA-Lib's build, and a trap.** The archive is OUR compile of the audited sources (`tools/README.md`): `-O2 -ffp-contract=off
--fno-math-errno`, generic x86-64, with TA-Lib's own `target_clones("default","fma")` (the official build's value flags; the fma
-clone is what a modern CPU runs). The C driver MUST be linked by the system `cc`: linked by `zig cc` the archive's `fma()` calls
-resolve to compiler-rt's software `fma` and TA-Lib is 5-20x slower on every function that fuses (EMA, ATR, MACD, T3, KAMA ... the
-first run of this bench showed ours at 0.04-0.1x on exactly those rows); `bench.zig` uses `cc` (env `CC`) for that reason. Ours is
-built ReleaseFast for the native CPU. A distribution's TA-Lib is the same C compiled `-O2` or `-O3` without `-ffp-contract=off`
-(contracting `a*b+c` everywhere), so its numbers can differ somewhat from this archive's. `-Djcc-safe` does not reach the C side.
-
-**Machine and load.** Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads, AVX2 + FMA, no AVX-512), Linux 7.0, gcc 15.2, Zig 0.17.1.
-Shared machine: load average 4-6 from other sessions' test runs during the runs; ratios are by user-mode cycles, so time-slicing
-does not enter, cache and SMT contention does (largest spread 63 % on one 100 000-bar NATR row of the 4-round repeat, typically 1-12 %;
-the table's spread is the larger of the two sides' best-to-worst over the rounds). Ratios under 1.0 are ours faster.
-
-**Result.** (2026-11-16, after the third P-gap round.) 114 batch workloads over 88 functions: ours / TA-Lib **0.43x to 1.9x**
-(after the second round 0.68x to 3.4x, 39 functions over 1.1x; 2026-11-15: 0.71x to 6.4x, 43; before the first round 23.0x, 53); 44
-workloads are at or under 1.0x, 31 of the 88 functions have a workload over 1.1x (the P2 line, `p2_ref_tolerance`). Worst: STC 1.9x,
-FRAMA 1.9x, RVI 1.8x, FISHER 1.8x, MAMA 1.8x, WAVETREND 1.6x, PPO 1.6x. Best: CRSI 0.43x, ALMA 0.48x, STDDEV 0.66-0.68x, ICHIMOKU
-0.68x, AROON 0.70x, MEDIAN 0.62x. The third round (2026-11-16) was profiled first (`perf`: cycles, instructions, branch misses per
-symbol) and kept every output bit for bit, NaN inputs included: CRSI counts its percent rank over the ring as one contiguous vector
-count; STOCH / STOCHF / KDJ run the extremum automatons as `ExtCore.Run` and each MA stage as one dispatch per call; STOCHRSI runs as
-three series passes; ALMA computes eight bars side by side as vector lanes (each lane the scalar dot product); PERCENTILE / MEDIAN
-find their sorted-window positions by vector counts while no NaN has entered (the binary searches mispredicted); HMA runs one loop
-with the three WMA states in locals (it had executed 2.4x TA-Lib's instructions); VAR / STDDEV / BBANDS step the variance window
-without warm-up tests; FRAMA runs its four automatons in registers; MINMAX shares one block scan. FRAMA and FISHER are left at
-1.8-1.9x by `exp` / `log` (Zig's per call 1.5-2.5x glibc's, which TA-Lib links; the results must stay the same bits). The second round (2026-11-16) ported TA-Lib's block scan of the window extremes (MIDPOINT, MIDPRICE, WILLR, ICHIMOKU and,
-online, STC's two stochastic windows), took MFI's leaving flow from a stack ring with branchless flow selects, and fused HMA's
-steady loop; it was profiled (`perf`, cycles / instructions / branch misses per symbol, PEBS for the branch sites): MFI's and STC's
-remaining gaps were branch mispredictions on LLVM-lowered ternaries (a random walk's step sign), fixed with vector selects. The first
-round (2026-11-15: `xmath.atan` fast path, `MaCore` dispatch hoisted, steady-state recurrence loops, contiguous CCI windows) took the
-Hilbert family from 14.7x to 1.4-1.5x, MAMA from 23.0x to 1.7x, APO / PPO / MA(EMA) from 11-18x to 1.0-1.6x. Every output on
-NaN-free data stayed bitwise what it was. Streaming (below) is ahead.
-
-Ratio per size (ours / TA-Lib), ns per bar at 1e5 for both, spread; bold = a workload over 1.1x, with its P-gap hypothesis. The
-hypotheses come from the numbers and from reading the structure (a batch function loops a generic per-bar `step` core that returns
-`?f64` and reads its history through a source adapter, unless it declares a steady-state path; TA-Lib has hand-written steady-state
-loops); the third-round rows were profiled. Rows marked "was" were changed by the P-gap work and name their ratio before it.
-
-| row | 1e3 | 1e5 | 1e6 | ours ns/bar (1e5) | TA-Lib ns/bar (1e5) | spread | P-gap hypothesis (unverified) |
-|---|--:|--:|--:|--:|--:|--:|---|
-| ACCBANDS | · | 0.99 | · | 6.71 | 6.90 | 4% |  |
-| AD | · | 0.99 | · | 1.64 | 1.66 | 22% |  |
-| ADOSC | · | 1.01 | · | 2.83 | 2.83 | 6% |  |
-| ADX | 0.77 | 0.78 | · | 6.73 | 8.65 | 3% |  |
-| ALMA | · | 0.48 | · | 1.10 | 2.28 | 6% | 3rd, was 2.54x: eight bars per step as two 4-lane accumulators, each lane the scalar dot product in its order |
-| APO | · | 1.02 | · | 1.36 | 1.33 | 2% | was 18.5x: the MA type is dispatched once per call (monomorphic loop), the EMA pair runs its bare recurrence after the warm-up |
-| AROON | · | 0.70 | · | 10.87 | 15.42 | 2% |  |
-| AROONOSC | · | 0.80 | · | 11.71 | 14.42 | 1% |  |
-| ATR | 0.99 | 0.95 | 0.94 | 1.30 | 1.36 | 7% | was 2.1x: true range + Wilder recurrence as one steady loop |
-| AVGDEV | · | 1.02 | · | 20.82 | 20.16 | 3% |  |
-| **BBANDS** | 1.41 | 1.28 | · | 6.53 | 5.11 | 11% | 3rd, was 2.19 / 1.99x: `VarCore.steadyStep` after the first output; left: the SMA middle's generic step, `sqrt`, three stores |
-| BETA | · | 0.88 | · | 9.56 | 11.01 | 8% |  |
-| BOP | · | 0.99 | · | 1.29 | 1.30 | 6% |  |
-| **CCI** | 1.42 | 1.41 | · | 38.89 | 27.70 | 3% | was 3.9x: f64 batch parks the typical prices in the output, then sums each window as two contiguous runs in TA-Lib's slot order (no index wrap, one `tp` per bar); f32 keeps the generic step |
-| CDL3WHITESOLDIERS | · | 0.95 | · | 21.82 | 22.91 | 2% |  |
-| CDLDOJI | · | 1.02 | · | 3.05 | 2.91 | 2% |  |
-| CDLENGULFING | 0.94 | 0.89 | · | 7.04 | 8.04 | 2% |  |
-| **CDLHAMMER** | · | 1.16 | · | 20.51 | 17.70 | 2% | 1.12x: the candle engine's range-average bookkeeping per bar (the other 5 patterns are 0.9-1.06x) |
-| CDLHIKKAKE | · | 0.93 | · | 7.22 | 7.67 | 2% |  |
-| CDLMORNINGSTAR | · | 1.02 | · | 8.84 | 8.66 | 3% |  |
-| **CHOP** | · | 1.45 | · | 67.37 | 46.33 | 2% | true-range sum plus extremum pair per bar, generic cores |
-| **CMF** | · | 1.23 | · | 5.03 | 4.06 | 5% | two windowed sums through the generic window source |
-| CMO | · | 0.92 | · | 3.65 | 3.99 | 1% |  |
-| CORREL | · | 0.93 | · | 8.54 | 9.13 | 3% |  |
-| CRSI | · | 0.43 | · | 36.35 | 96.91 | 2% | 3rd, was 3.36x: the percent rank counted over the ring buffer as one contiguous 8-lane compare (was a `%`-indexed `src.at` per value) |
-| DEMA | · | 0.99 | · | 1.48 | 1.52 | 1% | was 1.64x: steady loop |
-| **DONCHIAN** | · | 1.25 | · | 12.68 | 10.15 | 3% | two extremum scans per bar plus the midline |
-| DX | · | 0.75 | · | 5.69 | 7.50 | 4% |  |
-| **EFI** | · | 1.40 | · | 1.71 | 1.22 | 5% | unchanged code (1.06x before): 1.3 ns per bar, the load of the after run is the likely difference |
-| EMA | 1.03 | 1.00 | 1.02 | 1.18 | 1.18 | 1% | was 1.87x: the batch steps the warm-up, then a tight `fma` loop (`steadyRun`) |
-| **FISHER** | · | 1.81 | · | 36.25 | 20.03 | 5% | a window extremum pair plus `ln` per bar |
-| **FRAMA** | · | 1.88 | · | 61.11 | 33.27 | 6% | 3rd, was 1.97x: four `ExtCore.Run` automatons in registers (the older half is the newer one `half` bars later); left: `exp` + `log` per bar, Zig's `exp` ~2.5x glibc's cycles (profiled) |
-| HMA | · | 1.03 | · | 5.23 | 4.99 | 5% | 3rd, was 2.43x: one TA-Lib-shaped loop, the WMA states in locals, trailing values re-read, re-anchors due by bar number (profiled: 2.4x TA_HMA's instructions, spills) |
-| **HT_DCPERIOD** | 1.43 | 1.44 | 1.45 | 74.08 | 51.29 | 1% | was 14.7x with the double-double `xmath.atan` on every bar; the Ziv fast path (2026-11-15) leaves the generic `?HBar` step driver and a ~25-cycle correctly rounded atan |
-| HT_DCPHASE | · | 1.04 | · | 550.94 | 534.60 | 6% | (was 3.6x: `atan` fast path; the rest is `sin` / `cos` on both sides) |
-| **HT_PHASOR** | · | 1.45 | · | 73.08 | 50.81 | 1% | same Hilbert core as HT_DCPERIOD (was 14.7x) |
-| HT_SINE | · | 1.05 | · | 604.95 | 577.13 | 3% | (was 3.5x: `atan` fast path) |
-| **HT_TRENDLINE** | · | 1.40 | · | 142.80 | 103.49 | 8% | HT_DCPERIOD core inside plus the trailing weighted smoothing (was 8.1x) |
-| ICHIMOKU | · | 0.68 | · | 8.27 | 18.66 | 3% | was 3.1x: three block-scan midprices aligned on the common lookback, as TA_ICHIMOKU |
-| **KAMA** | 1.13 | 1.08 | · | 3.84 | 3.55 | 7% | was 3.2x: the sliding efficiency ratio as one steady loop over the input slice |
-| **KC** | · | 1.33 | · | 9.26 | 13.21 | 12% | EMA + ATR + band arithmetic, two stepped cores |
-| **KDJ** | · | 1.11 | · | 16.83 | 15.23 | 4% | 3rd, was 2.55x: as STOCH (RMA stages) |
-| KURTOSIS | · | 1.01 | · | 8.62 | 8.38 | 2% |  |
-| KVO | · | 1.03 | · | 9.70 | 9.32 | 2% |  |
-| **LINEARREG** | 1.26 | 1.27 | · | 4.49 | 3.51 | 6% | two sliding sums with a re-anchor every 32 periods (1.1-1.16x) |
-| MA_EMA | · | 1.00 | · | 1.17 | 1.18 | 0% | was 10.9x: one dispatch per call, then the EMA's steady loop |
-| **MACD** | 1.39 | 1.09 | · | 2.04 | 1.83 | 4% | was 3.5x: three EMAs in one steady loop after the warm-up; 1.8x at 1e3 is the stepped warm-up |
-| MACDEXT | · | 0.93 | · | 9.32 | 16.22 | 12% | was 3.88x: one dispatch per call when the three stages share an MA type (mixed types step the union) |
-| **MAMA** | · | 1.76 | · | 113.11 | 65.89 | 1% | Hilbert core plus MAMA's own phase `atan`, two fast-path atans per bar (was 23.0x) |
-| **MAX** | 0.90 | 1.25 | · | 2.27 | 1.78 | 5% | block scan with the NaN handling kept (1.2x at 1e5 only, 0.9x at 1e3) |
-| MEDIAN | · | 0.62 | · | 28.79 | 46.34 | 33% | 3rd, was 1.34x: sorted-window positions by vector counts while NaN-free, `@memmove` shifts |
-| **MFI** | 1.48 | 1.47 | · | 9.90 | 6.81 | 3% | was 3.3x: leaving flow from a stack ring, flows selected without branches (LLVM had emitted unpredictable branches: 65 % of the run's branch misses, profiled 2026-11-16); left: the generic `vs` per-bar driver |
-| MIDPOINT | · | 0.78 | · | 2.18 | 2.76 | 7% | was 3.5x: TA-Lib's block scan of the window extremes (`window.hiLoBlocks`), not the automaton with its rescans |
-| **MIN** | 1.00 | 1.28 | · | 2.25 | 1.80 | 4% | block scan with the NaN handling kept (1.2-1.3x at 1e5 only, 0.98x at 1e3: cache-visible) |
-| MINMAX | · | 0.81 | · | 2.34 | 2.93 | 5% | 3rd, was 1.59x: both extremes from one `hiLoBlocks` scan |
-| **MOM** | · | 1.11 | · | 0.61 | 0.55 | 1% | was 1.55x: a branch-free steady step after the warm-up (`vs.run`); 0.98x in the quieter phase-4 run, 0.6 ns per bar either way |
-| NATR | · | 1.01 | · | 2.24 | 2.20 | 122% | (steady loop as ATR) |
-| OBV | 1.00 | 0.99 | · | 5.14 | 5.12 | 2% |  |
-| **PERCENTILE** | · | 1.18 | · | 44.76 | 37.67 | 6% | 3rd, was 2.57x: sorted insertion (already), the two positions by one pass of vector counts while NaN-free (the binary searches mispredicted), `@memmove` shifts |
-| PERCENTRANK | · | 1.03 | · | 69.15 | 67.06 | 2% |  |
-| PLUS_DI | · | 1.00 | · | 4.92 | 4.90 | 4% |  |
-| **PPO** | · | 1.60 | · | 2.96 | 1.87 | 4% | was 15.9x, as APO; the rest is the per-bar division and the near-zero test |
-| ROC | · | 1.00 | · | 1.22 | 1.21 | 2% | (steady step as MOM) |
-| RSI | 1.05 | 1.04 | 1.05 | 4.10 | 3.96 | 2% |  |
-| **RVI** | · | 1.79 | · | 16.43 | 9.10 | 3% | two recurrences (std dev and Wilder smoothing) through generic cores |
-| SAR | · | 1.09 | · | 6.72 | 6.16 | 2% |  |
-| SMA | 1.02 | 1.03 | 1.01 | 2.41 | 2.33 | 1% |  |
-| **STC** | · | 1.91 | · | 17.90 | 9.63 | 3% | was 6.4x: TA-Lib's online block scan of both stochastic windows, branchless (no `%` ring reads, no rescans); the rest is state kept in memory across the per-bar `step` (profiled 2026-11-16) |
-| STDDEV | 0.68 | 0.66 | · | 3.56 | 5.27 | 13% | 3rd, was 1.42 / 1.40x: as VAR |
-| **STOCH** | 1.09 | 1.15 | · | 17.98 | 15.61 | 2% | 3rd, was 2.68 / 2.22x: raw %K by `ExtCore.Run` over the slices, each MA stage one dispatch per call (`maStage`) |
-| **STOCHF** | · | 1.17 | · | 15.91 | 13.63 | 17% | 3rd, was 1.73x: as STOCH |
-| STOCHRSI | · | 1.06 | · | 18.36 | 23.73 | 6% | 3rd, was 1.90x: three series passes (RSI, `kSeries`, `maStage`) instead of three cores per bar |
-| SUM | · | 1.00 | · | 2.33 | 2.33 | 0% |  |
-| SWAK_BUTTER | · | 0.85 | · | 1.28 | 1.49 | 4% |  |
-| T3 | 1.05 | 1.00 | 0.99 | 3.56 | 3.54 | 4% | was 2.8x: six EMA stages in one steady loop |
-| TEMA | · | 0.98 | · | 1.85 | 1.89 | 2% | was 3.76x: steady loop |
-| TRANGE | · | 0.82 | · | 1.14 | 1.35 | 8% |  |
-| TRIMA | · | 0.98 | · | 3.58 | 3.61 | 1% |  |
-| TRIX | · | 1.00 | · | 2.34 | 2.31 | 2% | was 1.75x: steady step of the three EMAs |
-| **TSF** | · | 1.31 | · | 4.66 | 3.49 | 9% | LINEARREG's sums with the re-anchor every 32 periods |
-| TSI | · | 0.99 | · | 2.36 | 2.40 | 2% | was 2.16x: steady step of the four EMAs |
-| **ULTOSC** | · | 1.41 | · | 11.95 | 8.69 | 10% | three windowed sums of buying pressure / true range, re-summed per bar |
-| VAR | · | 0.94 | · | 3.16 | 3.35 | 6% | 3rd, was 1.93x: `VarCore.steadyStep` (no warm-up tests, the peak update a vector select) in a `steadyRun` loop |
-| VIDYA | · | 1.02 | · | 5.48 | 5.35 | 2% |  |
-| VWAP | · | 0.94 | · | 2.77 | 3.00 | 5% |  |
-| **WAVETREND** | · | 1.63 | · | 11.61 | 7.02 | 4% | EMA / absolute-deviation / SMA chain of four stages, gpa scratch |
-| WILLR | · | 0.90 | · | 4.22 | 4.64 | 5% | was 2.2x: block scan (`window.hiLoBlocks`), as `ta_WILLR.c` |
-| WMA | 1.05 | 1.05 | · | 2.76 | 2.53 | 32% |  |
-
-Streaming, 99 900 updates after an `Open`/`init` over 100 bars (`EmaStream.update` against `TA_EMA_Update`, and the same for RSI and ATR),
-one op = the whole run:
-
-| stream | ours ns/update | TA-Lib ns/update | ours/TA-Lib | spread |
-|---|--:|--:|--:|--:|
-| EMA | 1.18 | 4.09 | 0.29 | 12% |
-| RSI | 3.86 | 6.62 | 0.59 | 10% |
-| ATR | 2.68 | 7.57 | 0.35 | 18% |
-
-Ours is 1.7-3.5x faster here (presumably: TA-Lib's `_Update` is an out-of-line call with an error-code return per bar, ours inlines into the caller's loop).
-(Before the P-gap work the batch EMA at 2.2 ns per bar was slower than `EmaStream.update` at 1.2 ns, the lead that the steady loops followed; it is 1.1 ns now.) A stream row needs the
-values consumed, or the optimizer folds the whole loop: the first version of `bench.zig` measured 2 ns for 100 000 updates.
-
-Caveats: f64 only (the module's f32 path converts to f64 and back; not timed); no NaN inputs; one parameter set per function (the defaults
-of TA-Lib where it has them); STOCH, STOCHF, STOCHRSI, MACDEXT, KDJ, MEDIAN, PERCENTILE, STC, ALMA, CRSI, WAVETREND take a `gpa` in this
-module's API for scratch (smp_allocator here, per call), which TA-Lib pays too (its internal `TA_Malloc`) but on a different allocator.
-Re-run: `zig build bench-indicators` (about 13 minutes at 3 rounds; `BENCH_ROUNDS`, filters as arguments, `BENCH_CHECK_ONLY=1` stops
-after the pre-check).
-
-## Backlog / deferred
-
-- P gaps left after the third 2026-11-16 round (see Benchmark): STC 1.9x (state kept in memory across the per-bar `step`), FRAMA 1.9x and FISHER 1.8x (`exp` / `log` per bar: Zig's are 1.5-2.5x glibc's per call and the bits must stay; FISHER's window rescan through vector selects, also as two chains, measured no faster, 2026-11-16), RVI 1.8x (two recurrences through generic cores), MAMA 1.8x and the Hilbert family 1.4x, WAVETREND 1.6x, PPO 1.6x, MFI 1.5x (the generic `vs` driver), CHOP 1.45x, ULTOSC / CCI 1.4x, BBANDS 1.3-1.4x (the SMA middle's generic step, `sqrt`, three stores), KC 1.3x, LINEARREG / TSF 1.3x, DONCHIAN 1.2x (TA-Lib runs the automaton too; a block scan would change NaN windows against the reference), MAX / MIN 1.2-1.3x at 1e5 (`hiLoBlocks` with its stack suffix arrays measured the same as `extBatch` on MINMAX, so the parked suffixes are not the cost), PERCENTILE 1.2x (the `@memmove` call per bar), STOCH / STOCHF / KDJ 1.1-1.2x. PSO and CKSP have no benchmark row. `kand` is not timed.
-
-- A streaming MAVP (bank of averages, caller buffer): TA-Lib 0.8 has a streaming API for every function, MAVP included, so this is a gap against the reference, not only a design choice.
-- In-place calls (`out` aliasing `in`): TA-Lib allows them, the batch functions here do not.
-- Streaming for the windowed indicators with a ring that is shared between components of one composite
-  (BBANDS keeps two rings of the same window for SMA).
-
-## Momentum group (wave ind-momentum)
+### Momentum group (wave ind-momentum)
 
 57 TA-Lib 0.8.3 momentum functions, each a core in the `vs_kit.zig` contract (input struct, `step(src, in)`,
 batch driver, streaming type with `update` / `peek` / `value`): ADX ADXR DX PLUS_DI MINUS_DI PLUS_DM MINUS_DM
@@ -707,17 +306,165 @@ TA-Lib quirks found in the C (all kept, each pinned by the oracle):
   **FOSC, CTI, CG** re-anchor their regression sums (32 periods, or on cancellation); **CG** keeps the window
   sums as 2 or 3 exactly-added integer limbs and re-derives the scale when a value no longer fits.
 - **CRSI** composes `statistic.PercentrankCore`, **SQZMOM** `bands.VarCore` (the variance core STDDEV and VAR
-  share), `overlap.MidpriceCore` and `statistic.LinearregCore`: the momentum wave's private copies are gone
-  (the oracle agreement is unchanged).
+  share), `overlap.MidpriceCore` and `statistic.LinearregCore`; no private copies.
 - **APO / PPO** default to EMA (not SMA); PPO answers 0 when the slow MA is ~0 and, for windowed MA types, when the
   whole slow window is exactly zero. **KDJ** defaults to RMA (type 13, as in TA-Lib), and APO, PPO, KSTEXT, KDJ and
   STOCHRSI accept every `MaType` (the overlap wave's types and MAMA included).
 - **PSO**: `tanh` is `xmath.tanh` (fdlibm's `expm1`-based form, as in glibc; Zig's `std.math.tanh` is musl's and
   differs by an ULP), the same function as the TANH transform. 16 of 20930 values differ from glibc by at most
   2 ULP (glibc's `expm1` against `std.math.expm1`): the ULP bound of PSO is 2, every other function is bitwise.
-  (The momentum wave's private copy of the same formula had no NaN branch and gave 1 for NaN; it measured the
-  same 16 / 2 on PSO and 31878 of 31883 bitwise on TANH against `xmath.tanh`'s 31880, so it was dropped.)
 - ASI / SI refuse a limit move outside `[1e-8, 3e37]` (NaN included).
 
 Anchoring: the live oracle covers all 57 (grid in `tools/interop.zig`: defaults, edges, swaps, every `MaType` where one is a parameter (APO, PPO, KSTEXT in both slots, KDJ, STOCHRSI: all bitwise, MAMA in the slot included), out-of-range values, unstable 0 / 3 / AUTO4 / AUTO8, lengths up to 5000,
 f64 and f32), frozen replay in `src/oracle_test.zig`. Not covered: NaN input, other toolchains.
+
+## Limits and refusals
+
+- Periods 1..100000 (2.. where TA-Lib requires it: MAX, MIN, SUM, RSI, MACD fast and slow, BBANDS);
+  `Unstable.bars <= 2^30`; BBANDS deviations within ±3e37 (TA-Lib's `TA_REAL_MAX`). Pinned by the
+  `BadParam` tests of each file.
+- Wave I3 ranges are TA-Lib's: DEMA/TEMA/TRIMA/KAMA/ZLEMA/RMA/HMA/VWMA/VIDYA period 1.., MIDPOINT/MIDPRICE/MCGD/DONCHIAN/ACCBANDS/KC/ICHIMOKU/CKSP/SUPERTREND 2.., SWAK 2..10000,
+  MAVP 1..10000 with `min <= max`, T3 vfactor [0,1], ALMA sigma [0.01, 3e37] offset [0,1], SAR/SAREXT parameters [0, 3e37] (start value ±3e37), ZIGZAG sensitivity [0,100], FRAMA even.
+- No streaming type for MAVP (a per-bar period needs one average per period: a bank of up to 10000 cores). Streams of CKSP take their scratch in the caller buffer;
+  `clone` of a stream re-binds it. CKSP and ALMA batch take an allocator first (CKSP: `2 * stop_period` f64 scratch, ALMA: the weight table above 64 weights; `MaCore`'s ALMA, which has no allocator, holds up to 64 inline and recomputes the weights per bar above that).
+- `nan = .skip` exists on the recursive functions that never read history (DEMA, TEMA, T3, RMA, MCGD, SWAK, SUPERTREND, KC); not on KAMA / ZLEMA / VIDYA (they read a window, as SMA).
+- Integer outputs (SUPERTREND `trend`, ZIGZAG `trend` and `pivot_idx`, HT_TRENDMODE `trend`) are integer slices, 0 in the lead.
+- Cycle wave ranges are TA-Lib's: the Hilbert family takes none, MAMA limits [0.01, 0.99] (NaN refused), SWAK_BP period 5..2000 and delta [0.05, 0.5], SWAK_HP 5..100000, SWAK_2PHP 2..10000. `nan = .skip` exists on all of them but the math transforms.
+- Most batch functions allocate nothing. The ones that take an allocator first (`gpa`) are ADXR, AC, FRACTAL, DOSC, WAVETREND, CKSP, KST, KSTEXT, KDJ, STOCHRSI, CRSI, STC, SQZMOM, MEDIAN, PERCENTILE, ALMA, STOCH, STOCHF and MACDEXT (scratch series, the sorted window, the weight table; `error.OutOfMemory`). Streaming types that keep a window take a caller buffer and refuse
+  a short one with `error.BadParam`. MACDEXT, STOCH and STOCHF keep their intermediate series (MACD line, raw %K, slow %K) in f64: with `f64` the output slices double as that scratch and nothing is allocated; with `f32` they allocate `n` (MACDEXT, STOCHF) or `2n` (STOCH) f64 from the `gpa` argument and free it before returning.
+- MAVP keeps a 10001-entry index table on the stack (about 90 KB per call; `src/overlap.zig`).
+- Deliberate differences from TA-Lib: per-call unstable period instead of a process-global one;
+  RSI answers NaN (not 50) when its internal state is NaN: TA-Lib tests `gain + loss > 0` and a NaN
+  fails that test, so a poisoned RSI would read as the neutral 50, which looks like a valid
+  reading, while NaN says "no value" (batch and stream agree). `nan = .skip` exists only here: a NaN
+  bar leaves the state untouched and the OUTPUT at that bar carries the previous output (NaN while
+  there is none), like pandas `ewm(ignore_na=True)`; the bar does not count towards the lookback.
+  For `f32` input all intermediate series are f64 (as in TA-Lib's `TA_S_*`) and the result is
+  rounded once on writing `out` (tested: f32 output == `@floatCast` of the f64 output for the
+  f32-rounded input).
+
+## Anchoring
+
+**External anchor, live:** `tools/interop.zig` drives TA-Lib C 0.8.3 (our own compile of its audited
+sources into a static archive, behind the C shim `tools/talib_oracle.c`; `zig build interop-indicators`)
+over 9861 records: every seed and wave-I3 function (94 in all), f64 input (`TA_<F>`) and f32 input (`TA_S_<F>`), seeded
+random-walk OHLC inputs (also flat-run and 1e-9-scaled kinds), a parameter grid with defaults, edges,
+swapped fast/slow, every `MaType` (MAMA from the cycle wave on) in every MA slot and out-of-range values, the unstable period at
+0, 3, AUTO4 and AUTO8 (`TA_SetUnstablePeriod`), and lengths 1, 2, period-1, period, period+1,
+lookback..lookback+2, 40, 300 and (first parameter set) 5000; VWMA and MAVP get a second generated series (volume with zero stretches; periods -1..15 with NaN), the integer outputs travel as doubles. It compares the return code (BadParam
+against `TA_BAD_PARAM`), the lookback against `TA_<F>_Lookback`, `outBegIdx == lookback` and
+`outNBElement == n - lookback`, the NaN lead, and every value. **Result: all 2.2 million
+compared values are bitwise equal except LINEARREG_ANGLE's (ULP bound 2, see above), the per-function ULP bound is 0 for every other function incl. ALMA / FRAMA / SWAK (`exp`, `log`, `sin` from compiler-rt agree with the oracle's libm on every sampled input; not a guarantee for all inputs)** (TA-Lib 0.8.3,
+x86-64, our `cc` line).
+
+**External anchor, frozen:** `src/testdata/talib_vectors.zig` holds 1098 of those records (n = 40, the
+first parameter sets of each function, one f32 record per function, AUTO4 and bars unstable) as bit
+patterns of TA-Lib's answers; `src/oracle_test.zig` replays them in the ordinary test lane. The file also freezes, from a seed space of their own (the first records keep their inputs), one
+flat-run record per function at its defaults (n = max(40, lookback + 16)), the math transforms inside their domains and
+over ten decades, CG over a 2^33..2^-60 span and near 2^-940, the Hilbert family over 3- to 5-bar cycles, and every
+unstable level (3 bars, AUTO4, AUTO8) where the n = 40 record of the first parameter set has no outputs, on the first set
+whose lookback leaves 12 outputs within 160 bars: those n = 40 records of a long lookback were all-NaN and AUTO8 was never
+frozen, so the ordinary lane would not see the AUTO constants or the stage alignment under an unstable period. The file is
+about 2.7 MB; it is trimmed (shorter flat records, no duplicate unstable records, the candle price grid replaced
+by hand-built bars) to the records that kill mutants; going further would drop records that are the only killers of a mutant (the flat
+runs of BBANDS / AD / PERCENTRANK / CRSI, the unstable levels of T3 / DEMA / MCGD / SWAK / HT, CG, HT cycles). Regenerate
+with `zig build interop-indicators -- --emit-vectors modules/indicators/src/testdata/talib_vectors.zig`, then `zig fmt` it.
+
+Not covered by the oracle: `nan = .skip` and `seed = .first` (options TA-Lib does not have; tested against
+our own batch/stream definitions), the windowed functions with NaN input (TA-Lib's own behaviour is
+unspecified; pinned by tests), parameters beyond the grid, optimised modes, other libm implementations.
+
+**Anchor grade:** class B · oracle EXTERNAL
+
+The volume / volatility / price-transform / statistic / math-operator functions use the same oracle with OHLCV series (volume 0..2000 with runs of zeros, zero on every flat
+bar; the open inside each bar), parameter grids of defaults, edges, every `MaType` wherever a function takes one (PVO, BBW, PERCENTB), out-of-range values (every one
+agrees on `TA_BAD_PARAM`), unstable 0 / 3 / AUTO4 / AUTO8 where it matters, and the lengths above; index outputs (MAXINDEX, MININDEX, MINMAXINDEX) are compared as integers.
+**Result: all compared values bitwise equal except LINEARREG_ANGLE (ULP bound 2, see above); no TA-Lib defect found.**
+Not covered: NaN inputs, other toolchains.
+
+**Cycle wave (same oracle, 11867 records and 2.98 million values in all with the 94 earlier functions; every MaType including MAMA now in every MA slot):** the Hilbert family and MAMA are run
+on 26 and 134 records (walk, flat-run and 1e-9-scaled inputs, lengths up to 5000, unstable 0 / 3 / AUTO4 / AUTO8 on lengths up to 700 so the AUTO warm-ups produce values, f32 via `TA_S_*`), the math transforms
+get inputs inside their domains (ACOS / ASIN on [-1.2, 1.2] behind a head of edge values: 0, -0, +-1, +-(1+eps), +-inf, NaN, 710, -745, 1e22, 1e-310) and over ten decades of both signs, 16 records each, n up to 5000.
+Result: SWAK_BP / HP / 2PHP, HT_TRENDLINE, HT_TRENDMODE, CEIL, FLOOR, SQRT, EXP, LN, LOG10, SIN, COS, TAN and every moving average / band / oscillator slot with MAMA (MA, MACDEXT, BBANDS, STOCH, STOCHF, MAVP, PVO, BBW) are bitwise
+equal; HT_DCPERIOD (297 of 12718 values), HT_DCPHASE, HT_PHASOR, HT_SINE, MAMA and PERCENTB with MAMA differ as described under the Hilbert allowance above (largest column-relative distance 1.0e-15),
+ACOS / ASIN / ATAN / COSH / SINH / TANH by at most 1 ULP (2 for SINH / TANH). `max/colmax` is printed by the oracle.
+
+**Candlestick patterns (same oracle, 47063 records in all with the other 176 functions; the 61 patterns: 28203 records, 3.60 million compared values, all bitwise equal, no TA-Lib defect found):** every pattern at TA-Lib's default settings over lengths 1, 2, lookback-1 .. lookback+2, 40, 300 and
+3000 (pattern-rich inputs, a 0.25 price grid for exact ties and a 1e-9 scale), f64 and `TA_S_*`; the seven penetration patterns at 0, 0.1, 0.3 / 0.5, 1, 3, 3e37 and the out-of-range / NaN values (BadParam on both sides); and four settings presets (every range type /
+period / factor moved, all periods 0, all periods 20 with doubled factors, rotated range types with 1-2 bar periods) driven into TA-Lib with `TA_SetCandleSettings` and into ours as `CandleSettings`, which shows each setting is honoured, not only
+the defaults. The oracle prints per pattern how many compared values had a nonzero TA-Lib answer: all 61 reach at least 29 (TRISTAR 29, KICKING 33, STICKSANDWICH 38, MATHOLD 46, ... CDLBELTHOLD about 16000), so no pattern is compared on zeros alone. Not covered: patterns on
+inputs with NaN or infinite bars, settings with factors above 2 or periods above 20, other toolchains.
+
+## Verification
+
+- **Run:** `scripts/modtest indicators`; the live oracle `zig build interop-indicators` (needs the TA-Lib 0.8.3 archive, `tools/README.md`); the comparative benchmark `zig build bench-indicators`.
+- **Oracle (external):** TA-Lib C 0.8.3 itself, live (`tools/interop.zig` + `tools/talib_oracle.c`) and frozen (`src/testdata/talib_vectors.zig`, replayed by `src/oracle_test.zig` in the ordinary test lane); every function, f64 and f32, with the grids, unstable levels and lengths described in *Anchoring*; regenerate the vectors with the `--emit-vectors` command given there.
+- **Unit tests** in every source file: the `BadParam` range of each function, batch == stream, `peek` == `update`, hand vectors; `src/overlap_test.zig` and `src/candles_test.zig` for those groups; `src/audit_test.zig` for the cases the mutation audits needed beyond the oracle (signed-zero ties of the block scan and the streaming rescan, the flat-window rules of KAMA / VIDYA / CMOU / MFI, MCGD's drop of a non-finite update, NaN skip in `peek`, the AUTO lookbacks, neutral answers of the momentum functions, and similar).
+- **Fuzz:** `INDICATORS_FUZZ=<runs>[,<seed>]` (testkit's deterministic driver, `src/fuzz_test.zig`; `INDICATORS_FUZZ_ENTRY=<name>,<f32|f64>,<seed>` replays one entry). Every function of the surface (all 237, f64 and f32, batch and stream) is driven under NaN / inf / -0 / denormal / huge data, lengths 0 .. 600, parameters at and beyond every range, mismatched slice lengths, short buffers, a failing allocator and in-place calls; the checks are batch == stream, `peek` == `update`, the NaN lead == the lookback and no unwritten output slot; forced runs for every function and a reach check are part of every test run.
+- **Constant time:** n/a, no secret enters an indicator.
+- **Mutation:** schemata over the shared cores exhaustively and the other families sampled; the survivors that stay are argued equivalent or unobservable (the card's `eq` count). The delta runs after a change follow the same method.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## What is deliberately not done
+
+- **SIMD fast paths that change the arithmetic.** The vector code of the batch loops only runs bars or counts side by side; every lane is the scalar operations in their order, so the results stay bit for bit TA-Lib's.
+- **Process-global configuration** (the unstable period, the candle settings): options are per call.
+
+## Open
+
+- The Hilbert family and MAMA are within a column-relative 1e-13, not bitwise, because of the C library's `atan` rounding (see the cycle section); a port of glibc's `atan`
+  (IBM Accurate Mathematical Library tables, LGPL) would be needed to be bitwise, and is not done. Records with `MaType.mama` inherit it.
+- Bitwise agreement with TA-Lib is measured for one toolchain (x86-64, the coordinator's `cc` line); a
+  TA-Lib compiled with a different contraction policy could differ by an ULP where its C spells
+  `a*b - c*d` (BBANDS/VAR variance); we never contract. Re-run the oracle on aarch64 before claiming it there.
+- NaN semantics of the windowed indicators (SMA, WMA, SUM, BBANDS, STOCH): a NaN enters the running
+  sums and stays there until a re-anchor (WMA every 8p outputs, the variance every 32 windows)
+  rebuilds them; pinned by tests, equal to TA-Lib's C by reading, not by running. MAX/MIN/MINMAX batch: the block scan of
+  the C, so a NaN suffix of a block stays in the outputs that use it (pinned, by reading; the oracle has no NaN inputs);
+  streams: a NaN never wins a comparison and only shows when it opens a rescan; ties keep the OLDEST value on a rescan
+  (`>` / `<`) and the NEWEST on an incremental update (`>=` / `<=`) (pinned).
+
+## Performance
+
+`zig build bench-indicators` (`tools/bench.zig`, C side `tools/bench_talib.c` with the rows in `tools/bench_rows.h`; kept
+instrument kind 3, CONVENTIONS.md §9). Reference: TA-Lib C 0.8.3, the module's own model; no other candidate is timed
+(`kand`, the speed candidate, is not: see Backlog). The figures are the card's `**Performance:**` line; this section
+holds only the method.
+
+**Method.** Both sides run one BATCH call over the first n bars of the same seeded random-walk OHLCV series (f64, file
+`ohlcv.bin` written by the bench; close moves by up to 1 % a bar), into preallocated output buffers, one thread: ours
+`ind.<f>(f64, ...)` with `out.len == n` (so it also writes the NaN lead), TA-Lib `TA_<F>(0, n - 1, ...)` into compact buffers.
+Parameters are the same on both sides and are runtime values on ours (an opaque copy, so the optimizer cannot fold a period).
+Each side times itself as `benchkit` does (the batch doubles past 100 ms, best of five), the sides alternate for 3 rounds,
+and the ratio is ours / TA-Lib by user-mode cycles. Before anything is timed, every row is run once at n = 1000 on both
+sides and the output count and the sum of all finite outputs must agree (relative 1e-9). Rows are `<name>.<n>`: headline
+rows at 1e3 and 1e5 (some also at 1e6), screening rows (every other function with simple inputs, to find the slowest) at
+1e5, and 3 streaming rows (`EmaStream.update`, RSI and ATR against `TA_<F>_Update`; a stream row needs the values
+consumed, or the optimizer folds the whole loop).
+
+**TA-Lib's build, and a trap.** The archive is OUR compile of the audited sources (`tools/README.md`): `-O2 -ffp-contract=off
+-fno-math-errno`, generic x86-64, with TA-Lib's own `target_clones("default","fma")` (the official build's value flags; the fma
+clone is what a modern CPU runs). The C driver MUST be linked by the system `cc`: linked by `zig cc` the archive's `fma()` calls
+resolve to compiler-rt's software `fma` and TA-Lib is 5-20x slower on every function that fuses (EMA, ATR, MACD, T3, KAMA ...);
+`bench.zig` uses `cc` (env `CC`) for that reason. Ours is
+built ReleaseFast for the native CPU. A distribution's TA-Lib is the same C compiled `-O2` or `-O3` without `-ffp-contract=off`
+(contracting `a*b+c` everywhere), so its numbers can differ somewhat from this archive's. `-Djcc-safe` does not reach the C side.
+
+**Machine.** Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads, AVX2 + FMA, no AVX-512), gcc 15.2, Zig 0.17.1. The
+machine is shared, so ratios are by user-mode cycles (time-slicing does not enter, cache and SMT contention does; the spread
+is the larger of the two sides' best-to-worst over the rounds). Ratios under 1.0 are ours faster.
+
+**Caveats.** f64 only (the module's f32 path converts to f64 and back; not timed); no NaN inputs; one parameter set per function (the defaults
+of TA-Lib where it has them); STOCH, STOCHF, STOCHRSI, MACDEXT, KDJ, MEDIAN, PERCENTILE, STC, ALMA, CRSI, WAVETREND take a `gpa` in this
+module's API for scratch (smp_allocator here, per call), which TA-Lib pays too (its internal `TA_Malloc`) but on a different allocator.
+Re-run: `zig build bench-indicators` (about 13 minutes at 3 rounds; `BENCH_ROUNDS`, filters as arguments, `BENCH_CHECK_ONLY=1` stops
+after the pre-check).
+
+## Backlog / deferred
+
+- **Batch speed gaps against TA-Lib** (the ratios are on the card; worst first). STC (state kept in memory across the per-bar `step`), FRAMA and FISHER (`exp` / `log` per bar: Zig's are 1.5-2.5x glibc's per call and the bits must stay; FISHER's window rescan through vector selects, also as two chains, measured no faster), RVI (two recurrences through generic cores), MAMA and the Hilbert family, WAVETREND, PPO, MFI (the generic `vs` driver), CHOP, ULTOSC and CCI, BBANDS (the SMA middle's generic step, `sqrt`, three stores), KC, LINEARREG / TSF, DONCHIAN (TA-Lib runs the automaton too; a block scan would change NaN windows against the reference), MAX / MIN at 1e5 (`hiLoBlocks` with its stack suffix arrays measured the same as `extBatch` on MINMAX, so the parked suffixes are not the cost), PERCENTILE (the `@memmove` call per bar), STOCH / STOCHF / KDJ.
+- **Benchmark rows for PSO and CKSP**, and a timing of `kand` (the speed candidate; TA-Lib is the only reference timed).
+- **A streaming MAVP** (bank of averages, caller buffer): TA-Lib 0.8 has a streaming API for every function, MAVP included, so this is a gap against the reference, not only a design choice.
+- **`nan = .skip` on the windowed indicators** (not offered on KAMA / ZLEMA / VIDYA or the windowed functions, which read a window).
+- **In-place calls** (`out` aliasing `in`): TA-Lib allows them, the batch functions here do not.
+- **Streaming for the windowed indicators with a ring shared between components of one composite** (BBANDS keeps two rings of the same window for SMA).
