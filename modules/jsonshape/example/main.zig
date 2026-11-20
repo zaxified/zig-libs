@@ -99,8 +99,8 @@ pub fn main() !void {
         // exists because the error is part of the published surface.
         error.TooManyMatches => return err,
         // Likewise: this fixed input is tiny and shallow, so neither the
-        // work budget nor the nesting cap can trip here.
-        error.WorkLimit, error.DepthLimit => return err,
+        // work budget, the nesting cap nor the (opt-in) node cap can trip here.
+        error.WorkLimit, error.DepthLimit, error.NodeLimit => return err,
         // Likewise: the columns here are scalar.
         error.UnsupportedColumnType => return err,
         // Strict-mode path errors: this call leaves `.strict` off, so none of

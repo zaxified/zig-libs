@@ -67,6 +67,9 @@ pub const Error = error{
     /// The document nests deeper than `ShapeSpec.max_depth`. The input is valid
     /// JSON, so this is not `BadJson`: the feed exceeds the caller's limit.
     DepthLimit,
+    /// The document holds more values than `max_nodes` allows (opt-in; see
+    /// `ShapeSpec.max_nodes`). Valid JSON, refused before it is parsed.
+    NodeLimit,
 };
 
 /// What `shape` returns: `Error`, and a refusal that only a column list can cause.
@@ -129,6 +132,14 @@ pub const ShapeSpec = struct {
     /// is parsed: `std.json.Value` parsing keeps one stack entry per open
     /// container, so a feed of 16 MiB of `[` otherwise costs gigabytes.
     max_depth: u32 = 512,
+    /// Opt-in ceiling on the number of JSON values, checked in the same
+    /// pre-scan as `max_depth` and before the parse (`error.NodeLimit`).
+    /// 0, the default, means none, as in Go's `encoding/json`, serde_json and
+    /// ajv, none of which bounds it: `std.json.Value` costs about 28-30x the
+    /// input bytes, so a caller taking feeds from untrusted sources sets it.
+    /// The scan counts containers opened plus `,` separators plus one, an
+    /// upper bound of the values within one of the number of empty containers.
+    max_nodes: u64 = 0,
     /// A document repeating an object key. `.reject` (`error.BadJson`) is the
     /// safe reading: two parsers of one feed can disagree on it. `.last` keeps
     /// the last value, as serde_json, Go's `encoding/json` and jq do.
@@ -170,6 +181,35 @@ fn checkDepth(bytes: []const u8, max: u32) Error!void {
     if (!jsontext.depthWithin(bytes, max)) return Error.DepthLimit;
 }
 
+/// Whether `bytes` holds at most `max` values (0 = no limit), counted as
+/// containers opened + `,` outside strings + 1; stops at the first excess.
+fn checkNodes(bytes: []const u8, max: u64) Error!void {
+    if (max == 0) return;
+    var n: u64 = 1;
+    var in_string = false;
+    var escaped = false;
+    for (bytes) |c| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else switch (c) {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                else => {},
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '[', '{', ',' => {
+                n += 1;
+                if (n > max) return Error.NodeLimit;
+            },
+            else => {},
+        }
+    }
+}
+
 /// Parse `bytes`, resolve `spec.path` to array item(s), project each item to a row.
 ///
 /// `spec.path` accepts two dialects:
@@ -187,7 +227,7 @@ fn checkDepth(bytes: []const u8, max: u32) Error!void {
 /// cells come out of more than one kind boxed, a `.categorical` column stored encoded.
 /// A `.list` or `.@"struct"` declared column is `error.UnsupportedColumnType`.
 pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) ShapeError!Frame {
-    const root = try parseDocument(a, bytes, .{ .max_depth = spec.max_depth, .duplicate_keys = spec.duplicate_keys });
+    const root = try parseDocument(a, bytes, .{ .max_depth = spec.max_depth, .max_nodes = spec.max_nodes, .duplicate_keys = spec.duplicate_keys });
     var work: Work = .{ .limit = spec.max_work orelse 1_000_000 +| 16 *| bytes.len };
     const items = try resolveItems(a, root, spec.path, spec.max_matches, &work, spec.strict);
 
@@ -241,6 +281,8 @@ fn encodeCategorical(a: std.mem.Allocator, f: Frame) Error!Frame {
 
 pub const DocumentOptions = struct {
     max_depth: u32 = 512,
+    /// Opt-in value ceiling; see `ShapeSpec.max_nodes`.
+    max_nodes: u64 = 0,
     duplicate_keys: DuplicateKeys = .reject,
 };
 
@@ -248,6 +290,7 @@ pub const DocumentOptions = struct {
 /// borrow `bytes`. `shape`'s own parse, with the same refusals.
 pub fn parseDocument(a: std.mem.Allocator, bytes: []const u8, opts: DocumentOptions) Error!std.json.Value {
     try checkDepth(bytes, opts.max_depth);
+    try checkNodes(bytes, opts.max_nodes);
     return std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{
         .duplicate_field_behavior = switch (opts.duplicate_keys) {
             .reject => .@"error",
@@ -2759,6 +2802,12 @@ test "shape: the cells `shape` gives, and its refusals" {
     try std.testing.expectError(error.BadJson, shape(a, "{", .{ .columns = cols }));
     try std.testing.expectError(error.DepthLimit, shape(a, "[[[[", .{ .columns = cols, .max_depth = 2 }));
     try std.testing.expectError(error.WorkLimit, shape(a, "[{},{},{}]", .{ .columns = cols, .max_work = 1 }));
+    // the opt-in value ceiling: "[{},{},{}]" counts 4 containers + 2 commas + 1 = 7; commas and
+    // brackets inside strings do not count
+    try std.testing.expectError(error.NodeLimit, shape(a, "[{},{},{}]", .{ .columns = cols, .max_nodes = 6 }));
+    _ = try shape(a, "[{},{},{}]", .{ .columns = cols, .max_nodes = 7 });
+    _ = try shape(a, "[{\"x\":\"[,[,\\\",\"}]", .{ .columns = cols, .max_nodes = 3 });
+    _ = try shape(a, "[{},{},{}]", .{ .columns = cols });
     try std.testing.expectError(error.TooManyMatches, shape(a, "[1,2,3]", .{ .path = "$[*]", .columns = cols, .max_matches = 1 }));
 }
 

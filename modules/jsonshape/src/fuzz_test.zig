@@ -132,7 +132,7 @@ fn checkPath(a: std.mem.Allocator, root: J, doc: []const u8, text: []const u8, w
     const opts: js.QueryOptions = .{ .max_work = work };
     const nodes = js.query(a, root, path, opts) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        error.WorkLimit, error.DepthLimit, error.TooManyMatches, error.BadJson => {
+        error.WorkLimit, error.DepthLimit, error.NodeLimit, error.TooManyMatches, error.BadJson => {
             mark(.query_limit);
             return;
         },

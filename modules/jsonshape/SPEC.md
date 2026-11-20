@@ -195,7 +195,7 @@ Residual risks a caller owns (not fixable here, or bounded by the caller's limit
 
 - **`std.json` amplification.** `std.json.Value` costs about 28-30x the input bytes (`[{},{},...]`: 40 B per
   3-byte element, plus arena growth that is never freed); `max_depth` caps nesting only, so the feed's byte
-  cap is the caller's. A node-count cap in `checkDepth`'s pre-scan would bound it (*Backlog / deferred*).
+  cap is the caller's, or `ShapeSpec.max_nodes` / `DocumentOptions.max_nodes` (default 0 = none, as in Go's `encoding/json`, serde_json and ajv, which bound no count): an opt-in ceiling on the values, counted in `checkDepth`'s pre-scan (containers opened + commas + 1) and refused as `error.NodeLimit` before the parse.
 - **Hash collisions.** `std.json` hashes object keys with a fixed-seed Wyhash, so a feed of colliding keys
   can make the parse quadratic before any limit of ours runs.
 - **Non-finite floats.** They can enter a `.float` column from a JSON string (`"nan"`, `"inf"`) or an
@@ -269,8 +269,6 @@ pattern precompiled here against a compile per node on the foreign sides, a desi
 - **Speed: `eval_filter` against serde_json_path.** The one like-with-like row over 1.25× the fastest (see the
   card's Performance line). A singular query in a comparison builds a sub-`Ctx` and walks through `evalSegs`; a
   direct walk for singular queries is the first thing to try, keeping the work charges the sweep tests pin.
-- **A node-count cap in `checkDepth`'s pre-scan** would bound `std.json.Value`'s ~28-30x amplification (see
-  *Threat model*); today the byte cap is the caller's.
 - **The card's one unexplained mutation survivor** (from the first whole-module run, which did not record which
   mutant it was): decide it as equivalent or kill it with a test at the next whole-module run.
 

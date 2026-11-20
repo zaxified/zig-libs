@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **Source-breaking (pub error set):** ADDED `Error.NodeLimit`, so an exhaustive `switch` over `jsonshape.Error` (and `ShapeError`) needs the new value. ADDED `ShapeSpec.max_nodes` and `DocumentOptions.max_nodes` (default 0 = no ceiling, behaviour unchanged): an opt-in cap on the number of JSON values, counted in the depth pre-scan and refused before the parse. Tests in `root.zig`.
 - **2026-11-20** — **SOURCE-BREAKING (correction of the 2026-11-19 entry):** the three new `ShapeError` values are added to the error set even with `strict` off, so a consumer's exhaustive `switch` over `shape`'s error fails to compile until it gains an arm for `PathSyntax`, `PathNotFound` and `NotAnArray` (runtime behaviour with `strict = false` is unchanged). The module's own example had exactly that break and now has the arm.
 - **2026-11-19** — New opt-in `ShapeSpec.strict` (default false: no behaviour change) with `ShapeError.PathSyntax`, `PathNotFound` and `NotAnArray`, so a wrong `path` is told apart from a genuinely empty result (Jayway JsonPath's definite/indefinite split; see SPEC § Backlog).
 - **2026-11-10** — **CHANGED**: a column declared as dataframe's new fixed-size `.array` is refused with `error.UnsupportedColumnType`, as `.list` and `.struct` are (the conversion switch would otherwise reach `unreachable`).
