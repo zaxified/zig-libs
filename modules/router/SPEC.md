@@ -185,7 +185,6 @@ The bench is `zig build bench-router` (`tools/bench.zig` against go-chi/chi in `
 
 - **`group("/x/*")` refused up front.** A group whose prefix ends in a wildcard can never register a route; the error comes at the first `add`. Refusing it in `group()` would move the error earlier (an API change) and let the dead wildcard branch of `prefixCovers` go.
 - **Runtime `Router` static children.** They are still a hash-map `get` per level; not tried, an idea if the runtime router's speed is ever needed (`Static` already walks comptime node functions).
-- **`Node.hasEndpoint` is dead code** (found by the whole-module mutation run); remove it at the next src change.
 
 ## Anchoring
 

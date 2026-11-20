@@ -2146,7 +2146,7 @@ const Node = struct {
     /// `allow`'s bitset twin -- see `rebuildAllow`.
     allow_bits: AllowSet = .empty,
     /// Fewest ADDITIONAL segments a query needs, from this node, to reach any
-    /// endpoint in this node's subtree (0 once `hasEndpoint()`). Maintained
+    /// endpoint in this node's subtree (0 once the node holds an endpoint). Maintained
     /// incrementally by `insert` (a route can only ever shrink an ancestor's
     /// value, never grow it, so `@min` on every insert along the new route's
     /// path keeps it correct without a separate rebuild pass). `maxInt` for a
@@ -2172,13 +2172,6 @@ const Node = struct {
 
     const Edge = struct { name: []const u8, node: *Node };
     const PatEdge = struct { text: []const u8, regexes: []const ?regex.Regex, node: *Node };
-
-    fn hasEndpoint(n: *const Node) bool {
-        for (n.endpoints) |ep| {
-            if (ep != null) return true;
-        }
-        return false;
-    }
 };
 
 const Endpoint = struct {
