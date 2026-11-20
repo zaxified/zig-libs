@@ -12,7 +12,7 @@ zero globals.
   `Limiter` is internally synchronized (a spinlock around a hash lookup and
   the bucket update; Zig 0.17 std has no io-less blocking mutex (`std.atomic.Mutex` is try-lock only, `Io.Mutex.lock` needs an `Io`) — this is the
   std `SmpAllocator` pattern). The bare `TokenBucket` is single-owner.
-- **Deps:** `router`, `http`, `netaddr` (peer-IP key formatting).
+- **Deps:** `router`, `http`, `netaddr` (peer-IP key formatting), `clock` (the injectable `Clock`).
 
 Provenance: clean-room (token-bucket + keyed store). Design references only, no
 source consulted or copied: `golang.org/x/time/rate` (BSD-3-Clause, The Go
@@ -117,16 +117,19 @@ address** when the server faces the internet directly. Resolution order
    always has a peer.
 
 **Caveat for direct exposure:** a directly-reachable client can send forged
-`X-Forwarded-For` / `X-Real-IP` headers and steps 1–2 will honor them. That
-still yields a per-client bucket (it is a key, not a bypass), but if you are
-*not* behind a proxy that always sets XFF, prefer a `KeySource.custom`
-extractor that goes straight to `req.peerAddress()`, or strip those headers
-at the edge. The extractor is handed a `*[peer_key_len_max]u8` scratch buffer
-to render the address into, so it needs no storage of its own — before that
-(2026-09-17) this advice pushed callers toward a `threadlocal` or a buffer
-shared across the server's connection threads. If you chain *multiple* trusted proxies, the rightmost entry is
-your outermost proxy's peer, not the client — supply a `KeySource.custom`
-extractor that walks the chain past your own hops.
+`X-Forwarded-For` / `X-Real-IP` headers and steps 1–2 will honor them. The
+client then chooses its own key, and a new forged value per request is a new
+full bucket, so the limiter is largely dodged. If you are
+*not* behind a proxy that always sets XFF, use `KeySource.forwarded_ip_trusted`
+(`TrustedProxies`: `.none`, `.loopback` or `.set = *const netaddr.IpSet`): the
+headers count only when the socket peer is a trusted proxy (`ratelimit.clientIp`,
+the Express `trust proxy` shape), a peer outside the set is the client whatever
+it sends, and a trusted peer's last `X-Forwarded-For` line is walked from the
+right past entries that are themselves trusted proxies, so a chain of your own
+hops is skipped. Or use a `KeySource.custom` extractor that goes straight to
+`req.peerAddress()`, or strip those headers at the edge. The extractor is
+handed a `*[peer_key_len_max]u8` scratch buffer to render the address into, so
+it needs no storage of its own.
 
 `KeySource.header` (API-key limiting) uses the named header's value as the
 key and falls back to the forwarded-IP chain when the header is absent.

@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-12 (244/263, 19 eq) · src 61758fc30593b9d0
 
-Audit detail: the 2026-11-01 delta (from eba301ce) covers `TrustedProxies`, `clientIp`, `forwardedEntryIp` and the `forwarded_ip_trusted` key arm in `root.zig`: 27 mutants, 26 killed, 1 equivalent (the `X-Real-IP` trim, the HTTP codec already trims header values); 2 new tests (XFF/X-Real-IP precedence, set membership of mapped peers and hops, padding, v6_key_bits and the no-peer fallback of the key arm); the totals add the delta to the 2026-10-29 run.
-
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — token-bucket rate limit (keyword review, 2026-10-07) · panic 2026-10-28 (coordinator sweep of every pub entry point: no data-reachable panic; `TokenBucket` config and a missing middleware/`on_connect` context are checked panics)
 
 **Performance:** ref 0.05–0.28× golang.org/x/time v0.15.0 rate · fastest 1.13× governor 0.10.4 (row `keyed`, its HashMap store behind a spinlock without a key cap or expiry; `bucket` 0.41×; `tools/rust_fast_bench`, clock injected on every side) (measured 2026-10-24)
@@ -23,7 +21,7 @@ Audit detail: the 2026-11-01 delta (from eba301ce) covers `TrustedProxies`, `cli
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -37,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [boinkor-net/governor](https://github.com/boinkor-net/governor) | Rust | MIT | 938 | v0.10.4 (2025-12-16) | GCRA keyed and direct limiters, async wait, jitter. *(inferred)* |
 | [minhqdao/zimit](https://github.com/minhqdao/zimit) | Zig | MIT | 6 | push 2026-08-05 | GCRA rate limiter, algorithm only, no HTTP or keyed store. *(inferred from description)* |
 
-**Where we are ahead:** the only Zig limiter here with a bounded, TTL-aged keyed store (second-chance eviction), an HTTP middleware (429, `Retry-After`, IETF `RateLimit-*`), a hardened client-key policy (rightmost `X-Forwarded-For`) and a per-user connection limiter at accept time with IPv4-mapped unification and eviction-proof configured users. · **Where we are behind:** nothing a user of x/time/rate would miss since 2026-10-11, except `rate.Inf`/a zero rate (a limiter that admits everything or nothing is better expressed by not installing one) and returning tokens when a `waitN` is cancelled (see Design). No shared backend (an explicit non-goal). We deliberately do NOT copy x/time/rate's double restore on a second `CancelAt`.
+**Where we are ahead:** the only Zig limiter here with a bounded, TTL-aged keyed store (second-chance eviction), an HTTP middleware (429, `Retry-After`, IETF `RateLimit-*`), a hardened client-key policy (rightmost `X-Forwarded-For`) and a per-user connection limiter at accept time with IPv4-mapped unification and eviction-proof configured users. · **Where we are behind:** nothing a user of x/time/rate would miss, except `rate.Inf`/a zero rate and returning tokens when a `waitN` is cancelled; no shared backend; no sliding-window mode (see *What is deliberately not done* and *Backlog / deferred*). We deliberately do NOT copy x/time/rate's double restore on a second `CancelAt`.
 
 ## Design & invariants
 
@@ -48,11 +46,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   since Zig 0.17 std has no io-less blocking mutex (`std.atomic.Mutex` is try-lock only; `Io.Mutex.lock` needs an `Io`)), clock injected via `Options.clock` (default OS
   `CLOCK_MONOTONIC`). `Limiter.middleware()` is the `router.Middleware`. Modeled after Go
   `golang.org/x/time/rate` (float balance, lazy refill, burst cap) + nginx `limit_req`'s keyed
-  store — design refs only, see NOTICE.
+  store — design refs only, see the README's `Provenance:` line.
 - **x/time/rate parity:** a fresh key's bucket starts full; refill is lazy and fractional
   (`tokens += elapsed * rate`, capped at `burst`); denials consume nothing; `retry_after_ms` rounds
   **up** so waiting exactly that long guarantees the next attempt passes.
-- **Weighted, reserved and reconfigured (x/time/rate parity, 2026-10-11):** `allowNAt` takes `n`
+- **Weighted, reserved and reconfigured (x/time/rate parity):** `allowNAt` takes `n`
   tokens or none (`n > burst` never passes). `reserveNAt` takes them now, letting the balance go
   negative, and returns the instant they are due; `max_wait_ns` refuses (taking nothing) a wait
   that is too long. `cancelAt` gives back what later events did not build on: `n` minus the
@@ -67,23 +65,32 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   cancelled through `io` keeps the tokens (under-admission only — the key's bucket may have been
   evicted and recreated meanwhile, so crediting "it" back could credit a stranger). The idle TTL
   measures from the later of the last update and a pending reservation's time to act.
-- **Eviction and expiry (2026-10-24):** at `max_keys` the store evicts by second chance (CLOCK):
+- **Eviction and expiry:** at `max_keys` the store evicts by second chance (CLOCK):
   a hit only sets the entry's `referenced` flag; the hand at the queue's end evicts the first entry
   not used since it last passed and rotates (unmarking) a used one to the front. Exact LRU relinked
-  three other entries per hit — ~20 % of a keyed decision, the gap to governor (bench, P axis).
+  three other entries per hit (~20 % of a keyed decision on the bench).
   Under a flood of never-reused keys the protection is LRU's: an active key used at least once per
   `max_keys` new keys survives. The idle TTL is raised to the refill time `burst / rate_per_s`, so a
-  key expires only when its bucket is full anyway — before, 5/hour with the 10-minute default TTL
-  handed an idle client a fresh burst every 10 minutes (review M1). The TTL sweep removes expired
+  key expires only when its bucket is full anyway (5/hour with the 10-minute default TTL stays
+  an hour, so an idle client is never handed a fresh burst early). The TTL sweep removes expired
   tails, rotates used live ones and stops at the first live unused one. IPv6 clients are keyed by
   their /64 (`v6_key_bits`, as `ConnectionLimiter`); every address key is canonical text, so
-  `::1` and `0:0:0:0:0:0:0:1`, or a v4-mapped spelling, share a bucket (review M2).
+  `::1` and `0:0:0:0:0:0:0:1`, or a v4-mapped spelling, share a bucket.
 - **Fail-open by design:** `allow` is infallible — on allocator exhaustion a *new* key is admitted
   untracked rather than rejected, so the limiter never turns OOM into an outage.
 - **Client-key trust policy:** default key resolution order — rightmost element of the last
   `X-Forwarded-For` (the one part of that header a client cannot forge, since every compliant proxy
   hop appends its own observed peer) → `X-Real-IP` → the socket peer address → a shared
   `fallback_key`. `KeySource.header` falls back to the same chain when the header is absent.
+  `KeySource.forwarded_ip_trusted` (`TrustedProxies`: `.none`, `.loopback`, or `.set` of a
+  `netaddr.IpSet`) honours the headers only when the socket peer is a trusted proxy (`clientIp`,
+  the Express `trust proxy` shape): any other peer is the client whatever headers it sends; for a
+  trusted peer the last `X-Forwarded-For` line is walked from the right past entries that are
+  themselves trusted, to the first that is not; an entry that is not an address (`unknown`, an
+  obfuscated id) stops the walk at the hop to its right; a `:port` is dropped; without XFF,
+  `X-Real-IP` from a trusted peer, else the peer. IPv4-mapped IPv6 is returned as IPv4; null
+  (key `fallback_key`) only without a socket peer. `Options.key` has no default, by design: either
+  default would silently misbehave for the other deployment shape.
 - **Concurrency:** `Limiter` threadsafe; the bare `TokenBucket` single-owner.
 - **`ConnectionLimiter` (conn.zig):** limits *new connections per user* from
   `http.Server.Options.on_connect` — on the accept loop, before a byte is read, so a refusal
@@ -97,7 +104,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   Spell v4 users in v4 CIDR: `::ffff:0:0/96` matches nothing, by construction. The converse is
   impossible (family-strict `contains`), and unmap merges only one host's two spellings.
   Per-user `rate_per_s`/`burst` overrides the defaults
-  (4/s, burst 8 — owner's ruling 2026-08-10). Unlisted addresses get those defaults **per
+  (4/s, burst 8 — owner's ruling). Unlisted addresses get those defaults **per
   address**, v6 keyed by /64.
 - **Eviction cannot reach a configured user.** Listed users' buckets are a fixed array
   allocated at `init`; only unlisted keys live in the bounded table. This is the whole
@@ -111,9 +118,11 @@ effective limit is N× the configured rate; a distributed limiter needs a shared
 does not provide. Fail-open is deliberate but means a determined allocator-exhaustion attack buys
 untracked (not unlimited) admits, never a hard block — document this tradeoff to operators. The
 XFF/`X-Real-IP` trust chain is only as trustworthy as the deployment: a directly-reachable client can
-forge both and land in a per-client-but-attacker-chosen bucket (a key, not a bypass) — behind
-multiple chained trusted proxies, or with no proxy at all, use `KeySource.custom` instead of the
-defaults. Not an authentication mechanism, and not a defense against connection-level abuse
+forge both: the client then chooses its own key, and a new forged value per request is a new full
+bucket, so the limiter is largely dodged (and the table can be flushed). Use
+`KeySource.forwarded_ip_trusted` when the server is reachable directly as well as through its
+proxy, or `KeySource.custom` with no proxy at all. `KeySource.header` is a key chosen by the
+client too: use it only behind something that rejects invalid values first. Not an authentication mechanism, and not a defense against connection-level abuse
 (`abuseguard` is the sibling for that; `ConnectionLimiter` covers only the *establishment rate*,
 not concurrency — a peer obeying 4/s holds 240 connections after a minute, so a concurrency cap
 must exist beside it, not instead of it).
@@ -129,70 +138,74 @@ coordination here either: N instances behind a load balancer admit N× the confi
 
 ## Verification
 
-Offline deterministic: bucket math, refill and `retry_after` exactness, per-key isolation,
-second-chance eviction + TTL sweep (model-fuzzed against an exact integer model), an 8-thread over-admission race check, fail-open OOM. Middleware goldens
-over the socket-free `http.Server.serveStream`: 429 wire bytes, XFF/`X-Real-IP`/API-key/custom key
-extraction, spoof resistance, peer-address fallback (port-insensitive, IPv4-mapped unified, headers
-win over peer). In-process integration (`router` + `http.Server` + `http.Client` over loopback):
-burst → 200s, then 429 + `Retry-After`, key isolation, XFF exercised, headerless requests keyed by
-the loopback peer — skips only when loopback binding is unavailable.
+Run: `scripts/modtest ratelimit` (`zig build test-ratelimit`). conn.zig's tests are pulled in by an
+explicit `test { _ = @import("conn.zig"); }` in root.zig; without it Zig never analyses the file and
+reports an all-green run with that suite missing. No interop step; the oracle is Go's
+`golang.org/x/time/rate`, driven once to produce frozen traces (recipes in `tools/`).
 
-`ConnectionLimiter`: shared bucket across two prefixes of one user (5th connection of a second
-refused from either address), per-user override honored while the default user is not, unlisted
-per-address isolation, /64 collapse under intra-/64 rotation, a 4096-/64 flood proving the table
-stays ≤ `max_unlisted_keys` while a listed user's drained bucket survives, first-match ordering,
-the `OnConnectFn` shape itself, and an 8-thread race admitting exactly `burst` — all on an
-injected clock (no wall-clock sleeps anywhere in this module's tests).
-
-The v4-mapped identity is asserted by **bucket identity, never by `.allowed`**: a fresh bucket
-admits a stranger too, so `expect(allowPeer(mapped).allowed)` passes whether or not the address
-matched a user. The tests drain the user over one spelling and require a **refusal** on the
-other (both directions), assert `unlistedKeyCount() == 0` so a demoted customer is caught, and
-repeat the whole thing through `onConnect` with an override (burst 6) larger than the unlisted
-default (burst 2) so a mapped peer that fails to match is refused three connections early.
-
-**x/time/rate operation sequences (2026-10-11).** `src/xrate_ops_vectors.zig`: 8 seeded random
-sequences (60–120 ops each; n in 0..burst+1; reservations into the future; cancels of due,
-already-cancelled, not-ok and built-upon reservations; rate and burst changes mid-flight) plus 2
-scripted ones (an admitted `AllowN` before an outstanding reservation's time to act, only reachable
-after a rate increase). Decision and reservation `ok` exact, delay within 1 ns, balance within
-1e-9; reach counters for every op class. Negative controls, each red: cancel without the
-later-reservation correction; `allowNAt` not recording `last_event_ns` (red only on the scripted
-case — the random ones never reached it); the burst cap applied only when time moved. Hand tests:
-`max_wait_ns` refusal and exact acceptance, double cancel is a no-op, `n > burst` → "never"; keyed
-`allowN`, `setRate`/`setBurst` with a test clock, `waitN` with real millisecond sleeps (over burst,
-over `max_wait_ns`, paced), and a pending reservation surviving the idle TTL (negative control:
-TTL from `updated_ns` alone admits).
-
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig` and `conn.zig`, schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 263 mutants, 244 killed, 19 equivalent, 0 undecided, no defect (the 2026-11-01 run had 27 mutants; this one left 69 alive at first). New tests: `TokenBucket.full` stamps its instant, `reserveNAt` saturates the due instant, `cancelAt` in every branch (not-ok, refill before restore, burst cap, `last_event` rewind, built-upon, no-op); `wholeTokens`/`durationNs`/`ceilMs` at NaN, negative, zero and exactly 2^64; the idle sweep at refill time + 1 ns; the smallest valid options; `waitN` fail-open, key truncation and its sleep request checked exactly through a recording `Io` (no wall-clock bound); the `insert` error path frees its entry; every public entry point takes the lock; `keyEql` on 2500 pairs per family; an empty header / `X-Real-IP` falls through to the next source; `.header` falling back to an IPv6 /64; `fallback_key` stored for `forwarded_ip` and `forwarded_ip_trusted`; `ipKey` on non-addresses; conn: a /128 option, the unlisted refill rate, `unlisted_v6_bits` 128 and 56, the unlisted TTL sweep, `canonicalPrefix` (/128 mapped; a plain v6 /112 must stay v6 — without the `isIpv4Mapped` guard it became a /16), `allowPeerAt` takes the lock. Equivalent: tokens ≤ burst after the advance cap, `durationNs(-0.0)`, an idempotent extra `advanceAt`, `+0.0` on zero elapsed, the 16-byte key compare via `mem.eql`, the idle reset writing the balance the lazy refill already gives, the sweep re-examining an unchanged tail, `insert` always followed by `advanceAt(now)`, a denied n=1 already ≥ 1 ms, the header-value trims (`http.h1` already trims), a full bucket re-capped at burst, the inner Limiter's unread clock, v4/v6 keys separated by length (5 vs 17 bytes), v4 prefix bits ≤ 32 < 96, `canonicalPrefix` on hand-built prefixes over /128 (invalid, never produced by `parsePrefix`). Cut: the checked `@panic`s of `checkConfig`/`Limiter.init`/null state/null context, constants and `Options` defaults, the `onConnect` v4/v6 arm swap (does not compile).
-
-Run: `zig build test-ratelimit`.
-
-⚠ conn.zig's tests are pulled in by an explicit `test { _ = @import("conn.zig"); }` in root.zig.
-Without it Zig never analyses the file and reports a confident all-green run with that entire
-suite missing — observed here as `18/18 tests passed` while 8 tests silently did not exist.
+- **Bucket and store:** bucket math, refill and `retry_after` exactness, per-key isolation,
+  second-chance eviction and the TTL sweep (model-fuzzed against an exact integer model), an
+  8-thread over-admission race check, fail-open under allocation failure. Tests run on an injected
+  clock; only `waitN` is exercised against real millisecond sleeps.
+- **Model-fuzz** (`src/model_fuzz_test.zig`): seeded random `allowNAt`/`setConfigAt` sequences over a
+  keyed store compared op by op with an exact integer model (decisions, remaining/retry/reset, key
+  count under eviction and the idle TTL).
+- **x/time/rate parity:** frozen traces captured from Go x/time/rate (`src/xrate_vectors.zig`,
+  `src/xrate_ops_vectors.zig`; producers `tools/xrate`): AllowN and AllowN/ReserveN/CancelAt/
+  SetLimitAt/SetBurstAt sequences (seeded random plus scripted ones, reservations into the future,
+  cancels of due, already-cancelled, not-ok and built-upon reservations, rate and burst changes
+  mid-flight), decision and `ok` exact, delay within 1 ns, balance within 1e-9, with reach counters
+  per op class. Hand tests: `max_wait_ns` refusal and exact acceptance, a double cancel is a no-op
+  (the deliberate divergence), `n > burst` is "never", `waitN` (over burst, over `max_wait_ns`,
+  paced), a pending reservation surviving the idle TTL.
+- **Middleware:** goldens over the socket-free `http.Server.serveStream` (429 wire bytes, XFF /
+  `X-Real-IP` / API-key / custom key extraction, spoof resistance, peer-address fallback,
+  port-insensitive, IPv4-mapped unified, headers win over peer); `clientIp` and
+  `forwarded_ip_trusted` (precedence, set membership of mapped peers and hops, padding,
+  `v6_key_bits`, the no-peer fallback); an in-process run (`router` + `http.Server` +
+  `http.Client` over loopback) that skips only when loopback binding is unavailable.
+- **`ConnectionLimiter`:** shared bucket across two prefixes of one user, per-user override honoured
+  while the default user is not, unlisted per-address isolation, /64 collapse under intra-/64
+  rotation, a 4096-/64 flood keeping the table within `max_unlisted_keys` while a listed user's
+  drained bucket survives, first-match ordering, the `OnConnectFn` shape, an 8-thread race
+  admitting exactly `burst`. The v4-mapped identity is asserted by **bucket identity, never by
+  `.allowed`**: a fresh bucket admits a stranger too, so the tests drain the user over one spelling
+  and require a refusal on the other (both directions), assert `unlistedKeyCount() == 0` so a
+  demoted customer is caught, and repeat it through `onConnect` with an override larger than the
+  unlisted default.
+- **Producers:** `tools/xrate` (the vectors); `tools/lead_probe` (the card's Ahead-line case against
+  Go).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ratelimit`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 3.6 %): ref 0.05–0.37×, against 0.08–0.38× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+`zig build bench-ratelimit` (`tools/bench.zig`, Go side `tools/go_bench`, Rust side
+`tools/rust_fast_bench`; `BENCH_ROUNDS`, `BENCH_FAST=0` skips governor) compares `bucket`
+(`TokenBucket.allowAt`) and `keyed` (`Limiter.allowAt`) with x/time/rate and governor on one request
+sequence with the clock injected on every side. The card's Performance line carries the figures.
+
+## What is deliberately not done
+
+- **Cross-instance / distributed limiting** — per-instance only; a shared backend is an explicit
+  non-goal (N instances behind a naive load balancer admit N× the rate).
+- **`rate.Inf` / a zero rate** — a limiter that admits everything or nothing is better expressed by
+  not installing one.
+- **Returning tokens when a `waitN` is cancelled** — a sleep cancelled through `io` keeps the tokens
+  (under-admission only: the key's bucket may have been evicted and recreated meanwhile).
+- **x/time/rate's double restore on a second `CancelAt`** — it admits beyond the limit; here a second
+  cancel is a no-op.
+- **Concurrency capping** — `ConnectionLimiter` limits the establishment rate only; the sibling
+  `abuseguard` covers connection-level abuse.
 
 ## Backlog / deferred
 
-None beyond the documented out-of-scope items above
-(distributed/cross-instance coordination is an explicit non-goal, not a v1 gap).
-
-- **`clientIp` option to ignore `X-Real-IP`** (the network-monitor consumer audit 2026-11-02) — with no `X-Forwarded-For` it falls back to `X-Real-IP`, so behind a proxy that sets neither, any client names its own address; a consumer that documents XFF only cannot turn the fallback off. Ideal: an `Options` field selecting the headers honoured, keeping today's behaviour as the default.
-- ~~**Weighted admission (`allowN`)**~~ — **DONE 2026-10-11**. Was: (survey 2026-09-30) — `TokenBucket`/`Limiter` take one token per call; x/time/rate `AllowN` charges a cost (bytes, expensive endpoints). Effort: small (the bucket already holds a float balance). Fits §2: yes.
-- ~~**Blocking `wait`/`reserve`**~~ — **DONE 2026-10-11** (`TokenBucket.reserveNAt`/`cancelAt`, `Limiter.waitN`). Was: (survey 2026-09-30) — x/time/rate's `Wait` for outgoing-call pacing (a client throttling itself). Effort: small-medium (needs an `Io` sleep seam). Fits §2: yes.
-- ~~**Run-time `setLimit`/`setBurst`**~~ — **DONE 2026-10-11** (`Limiter.setRate`/`setBurst`/`setConfigAt`, `TokenBucket.advanceAt`). Was: (survey 2026-09-30) — reconfigure without dropping every key's bucket. Effort: small.
-- **Sliding-window counter mode** — not a parity gap (the reference, x/time/rate, has none); httprate/ulule offer it (survey 2026-09-30); token bucket allows a `burst`-sized spike at any time. Effort: medium; unsure a typical user needs it.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · any · util · threadsafe` + deps: `router`, `http`, `netaddr` — canonical source is
-`pub const meta` in src/root.zig.
+- **`clientIp` option to ignore `X-Real-IP`** — with no `X-Forwarded-For` it falls back to
+  `X-Real-IP`, so behind a proxy that sets neither, any client names its own address; a consumer that
+  documents XFF only cannot turn the fallback off. Ideal: an `Options` field selecting the headers
+  honoured, keeping today's behaviour as the default.
+- **Sliding-window counter mode** — not a parity gap (the reference, x/time/rate, has none);
+  httprate/ulule offer it, and a token bucket allows a `burst`-sized spike at any time. Effort:
+  medium; unsure a typical user needs it.
 
 ## Anchoring
 
