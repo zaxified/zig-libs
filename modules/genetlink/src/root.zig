@@ -1047,7 +1047,7 @@ fn fuzzSplitPayload(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     // ⚠ One `slice` call, never `bytes` followed by a ranged length. `bytes`
     // takes `@min(buf.len, in.len)` octets and the ranged draw then finds
     // fewer than the eight it needs and returns the range MINIMUM, so `len`
-    // was 0 for every seed. Measured 2026-09-07 over the corpus above: **0 of
+    // was 0 for every seed. Measured over the corpus above: **0 of
     // 6 seeds non-empty and 0 accepted before, 6 of 6 non-empty and 4
     // accepted after.**
     const len: usize = fz.drawInput(S, src, &buf, entries);
@@ -1191,7 +1191,7 @@ fn fuzzFindMcastGroupIdSmith(_: void, smith: *std.testing.Smith) !void {
 fn fuzzFindMcastGroupId(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
     var want_buf: [16]u8 = undefined;
-    // ⚠ The bytes come FIRST, in one `slice` call each (see the 2026-09-07
+    // ⚠ The bytes come FIRST, in one `slice` call each (see the
     // measurement: a 1-bit draw up front made the raw branch dead and the
     // nest built identical for every seed). Both halves run on every seed,
     // from the same drawn octets.
@@ -1986,7 +1986,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -2320,7 +2320,7 @@ test "integration: listFamilies and getFamily against the live kernel" {
     try testing.expectError(error.NameTooLong, sock.getFamily("a-family-name-way-too-long"));
 }
 
-// ── whole-module mutation (2026-11-17): the tests its survivors asked for ──
+// ── whole-module mutation: the tests its survivors asked for ──
 
 fn expectWalkError(r: codec.Error!?u32) !void {
     if (r) |_| return error.TestUnexpectedResult else |_| {}
