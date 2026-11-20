@@ -95,7 +95,7 @@ pub fn intFromFloatChecked(f: f64) Error!i64 {
 /// `Undefined` and `StrictUndefined` alike (verified against live Jinja2
 /// 3.1.6) — and a silent `0` where a VLAN id or an MTU belonged is exactly
 /// the failure mode this module's undefined policy exists to prevent
-/// (W2 re-audit 2026-09-02, `jinja` F-C2).
+/// (W2 re-audit, `jinja` F-C2).
 fn intArg(v: Value, dflt: i64) Error!i64 {
     return switch (v) {
         .integer => |i| i,
@@ -536,7 +536,7 @@ fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
         // `rsplit` on a string with no space returns `[whole]` — so the whole
         // prefix is kept, not dropped. Emptying it silently truncated every
         // spaceless string to nothing: a URL, a hostname, an interface name,
-        // base64 (W2 re-audit 2026-09-02, `jinja` F-C1).
+        // base64 (W2 re-audit, `jinja` F-C1).
         if (std.mem.findScalarLast(u8, cut, ' ')) |sp| cut = cut[0..sp];
     }
     return .{ .string = .{ .bytes = try std.mem.concat(ctx.arena, u8, &.{ cut, end }), .safe = markup } };
@@ -546,7 +546,7 @@ fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
 /// `_word_re = re.compile(r"\w+")` — RUNS OF WORD CHARACTERS, not
 /// whitespace-separated tokens. Splitting on whitespace answered `1` for
 /// `a-b-c` where the reference answers `3`, and `1` for `<b>x</b>` where it
-/// answers `3` (W2 re-audit 2026-09-02, `jinja` F-D2).
+/// answers `3` (W2 re-audit, `jinja` F-D2).
 ///
 /// Bytes >= 0x80 count as word characters, which is right for letters
 /// (`ěščř` is one word in both) and wrong for non-ASCII punctuation — the
@@ -574,7 +574,7 @@ fn fStriptags(ctx: *Ctx, input: Value, args: Args) Error!Value {
             // An UNTERMINATED `<` is not a tag. `break` here dropped the whole
             // rest of the string — `'a<b'|striptags` answered `a` where the
             // reference answers `a<b`, silent data loss on ordinary text
-            // (W2 re-audit 2026-09-02, `jinja` F-D2).
+            // (W2 re-audit, `jinja` F-D2).
             if (std.mem.findScalarPos(u8, s, i, '>')) |close| {
                 i = close + 1;
                 continue;
@@ -672,7 +672,7 @@ fn fUrlencode(ctx: *Ctx, input: Value, args: Args) Error!Value {
         // `do_urlencode` accepts an ITERABLE OF PAIRS as well as a mapping —
         // `[('a', 'b c')]` is `a=b+c` there. This module rendered the Python
         // repr of the list and percent-encoded that
-        // (W2 re-audit 2026-09-02, `jinja` F-D2).
+        // (W2 re-audit, `jinja` F-D2).
         .list, .tuple => |items| {
             if (items.len != 0 and allPairs(items)) {
                 var out: std.ArrayList(u8) = .empty;
@@ -716,7 +716,7 @@ fn quoteInto(ctx: *Ctx, out: *std.ArrayList(u8), s: []const u8, extra_safe: []co
 
 /// `for_qs` is `url_quote(..., for_qs=True)`: inside a query string a space is
 /// `+`, not `%20`. `do_urlencode` uses the query-string form for a mapping and
-/// the plain form for a bare string (W2 re-audit 2026-09-02, `jinja` F-D2).
+/// the plain form for a bare string (W2 re-audit, `jinja` F-D2).
 fn quoteIntoQs(ctx: *Ctx, out: *std.ArrayList(u8), s: []const u8, extra_safe: []const u8, for_qs: bool) Error!void {
     for (s) |c| {
         if (for_qs and c == ' ') {
@@ -769,7 +769,7 @@ fn fXmlattr(ctx: *Ctx, input: Value, args: Args) Error!Value {
         // out of an autoescaped template with no `|safe` anywhere. The
         // reference refuses the key outright (`ValueError`), which is what
         // CVE-2024-22195 added; this module never got that half
-        // (W2 re-audit 2026-09-02, `jinja` F-A1).
+        // (W2 re-audit, `jinja` F-A1).
         if (invalidAttrKey(key)) return error.BadArgument;
         var aw: std.Io.Writer.Allocating = .init(ctx.arena);
         try value.escapeTo(&aw.writer, key);
@@ -825,7 +825,7 @@ fn fInt(ctx: *Ctx, input: Value, args: Args) Error!Value {
                 // itself, and the hand-rolled strip below removed the prefix
                 // FIRST, so base 0 saw a bare digit string — `'0b101'|int(0,0)`
                 // answered 101 where the reference answers 5, and `'0x1f'`
-                // answered the default (W2 re-audit 2026-09-02, `jinja` F-D1).
+                // answered the default (W2 re-audit, `jinja` F-D1).
                 const strip = b != 0 and b != 10 and t.len > 2 and t[0] == '0' and !std.ascii.isDigit(t[1]);
                 const stripped = if (strip) t[2..] else t;
                 if (std.fmt.parseInt(i64, stripped, b)) |v| break :blk .{ .integer = v } else |_| {}
@@ -1443,7 +1443,7 @@ fn fTojson(ctx: *Ctx, input: Value, args: Args) Error!Value {
 fn jsonWrite(ctx: *Ctx, w: *std.Io.Writer, v: Value, indent: ?usize, depth: usize) Error!void {
     // `depth` was carried for indentation only and checked against nothing:
     // 200 000 levels of nested list from context data was a SIGSEGV in
-    // ReleaseFast (W2 re-audit 2026-09-02, `jinja` F-A3).
+    // ReleaseFast (W2 re-audit, `jinja` F-A3).
     if (depth > value.max_value_depth) return error.OutOfRange;
     switch (v) {
         .undef => return error.UndefinedValue,
@@ -1799,7 +1799,7 @@ fn tDivisibleby(ctx: *Ctx, input: Value, args: Args) Error!bool {
     if (input != .integer or by != .integer) return error.TypeMismatch;
     if (by.integer == 0) return error.DivisionByZero;
     // `@mod(minInt(i64), -1)` traps — SIGFPE in ReleaseFast. Everything is
-    // divisible by -1 (W2 re-audit 2026-09-02, `jinja` F-A2).
+    // divisible by -1 (W2 re-audit, `jinja` F-A2).
     if (by.integer == -1) return true;
     return @mod(input.integer, by.integer) == 0;
 }

@@ -14,7 +14,7 @@
 //! zig build test-jinja --fuzz --release=safe
 //! ```
 //!
-//! Deterministic driver (added 2026-10-10): every harness body is generic over
+//! Deterministic driver: every harness body is generic over
 //! its source of choices, `fn(comptime S, *S, gpa)`; `testing.fuzz` hands it a
 //! `std.testing.Smith` (corpus seeds replay as before), the driver a
 //! `testkit.fuzz.driver.Rng`. `JINJA_FUZZ=<runs>[,<first seed>]` (`_ONLY`
@@ -556,7 +556,7 @@ fn fuzzAutoescapeInvariant(comptime S: type, smith: *S, gpa: std.mem.Allocator) 
 /// map KEY, which is the attacker-controlled half of `xmlattr`; and the oracle
 /// was `indexOfAny(out, "<>")`, while an attribute-context injection —
 /// `a onmouseover=alert(1) b` — contains neither character
-/// (W2 re-audit 2026-09-02, `jinja` F-D3).
+/// (W2 re-audit, `jinja` F-D3).
 ///
 /// The property here is the one an attribute context actually needs: whatever
 /// `xmlattr` emits must re-parse as a sequence of ` name="value"` with no
@@ -857,7 +857,7 @@ test "corpus: every template seed reaches the compiler, and what it rendered is 
         out_octets += out.len;
     }
     try std.testing.expectEqual(template_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 36 templates non-empty, 0 context data
+    // Measured: 0 of 36 templates non-empty, 0 context data
     // non-empty, and every one of the 36 "compiled" and "rendered" — because
     // the empty template does both, producing 0 octets. That is exactly why
     // the pinned number is octets: an acceptance count was already 36 of 36
@@ -895,7 +895,7 @@ test "corpus: every whitespace seed reaches the compiler, and what it rendered i
         out_octets += out.len;
     }
     try std.testing.expectEqual(whitespace_seeds.len, nonempty);
-    // Measured 2026-09-07: 0 of 17 seeds non-empty and 0 octets rendered
+    // Measured: 0 of 17 seeds non-empty and 0 octets rendered
     // before the draw was fixed; 17 / 15 / 1002072 after.
     try std.testing.expectEqual(@as(usize, 15), compiled);
     try std.testing.expectEqual(@as(usize, 1_002_072), out_octets);
@@ -927,7 +927,7 @@ test "corpus: every numeric seed carries a number, and the sites it reached are 
     // the exhausted draw produced, kept so the "before" input stays in the
     // corpus rather than being lost with the defect.
     try std.testing.expectEqual(numeric_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: the collapsed harness read one number (0) with the
+    // Measured: the collapsed harness read one number (0) with the
     // minimum exponent and rendered one site in one spelling — 1 of the 96
     // combinations, for every input it ever ran. 16 non-empty scripts and 999
     // site renders after.
@@ -974,7 +974,7 @@ test "corpus: every autoescape seed reaches every site, and the markup escaped i
     // `escape_seeds` deliberately keeps the empty datum — the value the
     // collapsed draw produced — so the "before" input stays in the corpus.
     try std.testing.expectEqual(escape_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 1 site of 32 reached with an EMPTY `e`, 0 markup
+    // Measured: 1 site of 32 reached with an EMPTY `e`, 0 markup
     // octets escaped. 20 non-empty data / 672 renders / 1978 escaped after.
     try std.testing.expectEqual(@as(usize, 672), renders);
     try std.testing.expectEqual(@as(usize, 1978), escaped);
@@ -1030,7 +1030,7 @@ test "corpus: every xmlattr seed carries a key and a value, and what rendered is
     // the "before" input stays in the corpus on both sides.
     try std.testing.expectEqual(xmlattr_seeds.len - 1, key_nonempty);
     try std.testing.expectEqual(xmlattr_seeds.len - 1, value_nonempty);
-    // Measured 2026-09-07: 0 of 20 keys and 0 of 20 values non-empty before
+    // Measured: 0 of 20 keys and 0 of 20 values non-empty before
     // the draw was fixed — one attribute whose name and value were both "" on
     // every run — and 0 attribute octets. 19 / 19 / 11 / 179 after.
     try std.testing.expectEqual(@as(usize, 11), renders);
@@ -1135,7 +1135,7 @@ test "fuzz: arithmetic agrees with the closed form" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

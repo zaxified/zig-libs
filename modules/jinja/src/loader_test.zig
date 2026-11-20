@@ -414,7 +414,7 @@ test "a regular file in the middle of a path is absence, a symlinked one is a re
 //
 // The bomb tests above run each cap at ten or a hundred times its value, which
 // proves only that something eventually stops: a cap moved one past its bound
-// passed all of them (mutation 2026-10-06). Each case below renders the
+// passed all of them (mutation). Each case below renders the
 // largest input the cap admits and then the same shape one step larger.
 
 fn renderCapped(opts: jinja.Options, templates: []const jinja.MapLoader.Entry, src: []const u8) ![]u8 {

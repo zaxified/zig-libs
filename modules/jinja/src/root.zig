@@ -138,7 +138,7 @@ pub const Options = struct {
     /// **zero bytes**, so `max_output_bytes` never saw one, and
     /// `{{ ('a' * 30000)|replace('', 'b' * 30000) }}` multiplied two 64 MiB
     /// caps together from a 53-byte template
-    /// (W2 re-audit 2026-09-02, `jinja` F-B1/F-B2).
+    /// (W2 re-audit, `jinja` F-B1/F-B2).
     max_render_bytes: usize = 256 << 20,
     /// Combined nesting bound for `{% extends %}`/`{% include %}`/
     /// `{% import %}`. An inheritance *cycle* is caught by name before this

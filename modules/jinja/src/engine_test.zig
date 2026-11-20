@@ -932,7 +932,7 @@ test "joiner: error paths" {
     try expectFails("{% set j = joiner() %}{{ j.next() }}");
 }
 
-// ── call-site *args / **kwargs: delta mutation audit 2026-11-17 ─────────────
+// ── call-site *args / **kwargs: delta mutation audit ─────────────
 // The reference goldens decide ok-versus-error; these pin what they cannot:
 // which error, which message, names used only inside a splat, an out-of-memory
 // that must stay out-of-memory, and the grammar cases where a wrongly accepted

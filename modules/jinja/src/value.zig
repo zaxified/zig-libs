@@ -328,7 +328,7 @@ pub fn strTo(writer: *std.Io.Writer, v: Value) Error!void {
 /// a caller can hand in as context (`fromJson` over nested JSON). These three
 /// walkers recursed over that depth with nothing stopping them: 70 000 levels
 /// was a **SIGSEGV** in ReleaseFast, from a 103-byte template
-/// (W2 re-audit 2026-09-02, `jinja` F-A3).
+/// (W2 re-audit, `jinja` F-A3).
 pub const max_value_depth: usize = 256;
 
 fn strToDepth(writer: *std.Io.Writer, v: Value, depth: usize) Error!void {
@@ -611,7 +611,7 @@ fn intOf(r: anytype) Error!Value {
 /// (`{{ a // b }}` with `a = -9223372036854775808, b = -1`). Their siblings
 /// `.add`/`.sub`/`.mul` went through `std.math` and reported `OutOfRange`
 /// from the start; these two were the ones left with a non-failing signature
-/// (W2 re-audit 2026-09-02, `jinja` F-A2).
+/// (W2 re-audit, `jinja` F-A2).
 fn pyFloorDiv(x: i64, y: i64) Error!Value {
     if (x == std.math.minInt(i64) and y == -1) return error.OutOfRange;
     const q = @divTrunc(x, y);

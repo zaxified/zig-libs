@@ -188,7 +188,7 @@ pub const DirLoader = struct {
                 // an escape attempt: `{% include 'regular/x' ignore missing %}`
                 // failed the render where it should have been ignored. Ask
                 // what the component actually is before deciding
-                // (W2 re-audit 2026-09-02, `jinja` F-E2).
+                // (W2 re-audit, `jinja` F-E2).
                 error.NotDir => {
                     const st = dir.statFile(self.io, pending, .{ .follow_symlinks = false }) catch
                         return error.LoaderFailed;
@@ -270,7 +270,7 @@ test "checkName rejects a NUL-truncation attempt" {
 
 test "checkName refuses a NUL byte on its own, not only beside a `..`" {
     // The NUL-truncation test above also carries `..`, which is refused by
-    // its own rule — so it never reached the NUL check (mutation 2026-10-06).
+    // its own rule — so it never reached the NUL check (mutation).
     try testing.expectError(error.EscapingName, checkName("safe\x00.j2"));
 }
 
@@ -310,7 +310,7 @@ test "MapLoader answers by exact name and null otherwise" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

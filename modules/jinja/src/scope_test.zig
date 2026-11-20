@@ -4,7 +4,7 @@
 //! Unicode case mapping. Expected values are the documented semantics of the
 //! reference (Jinja2 docs "List of Builtin Filters/Tests", the Jinja2 test
 //! suite examples, Python's `%` operator, `textwrap` and `str` methods); the
-//! test names cite the source. Since 2026-11-13 every filter here is also in the
+//! test names cite the source. Since every filter here is also in the
 //! oracle corpus (`s3_*` cases of `tools/corpus.zig`, replayed from golden.json).
 
 const std = @import("std");

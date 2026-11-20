@@ -14,7 +14,7 @@
 //! zig build interop-jinja                # re-run the peer, diff, no rewrite
 //! ```
 //!
-//! Until 2026-09-06 half of this ran here, spawning `python3` from inside
+//! Until half of this ran here, spawning `python3` from inside
 //! `zig build test-jinja` and skipping loudly without it. A skip is not an
 //! assertion, and CI's peer install is `continue-on-error`, so the live half
 //! could quietly assert nothing while every consumer of the library still
@@ -130,7 +130,7 @@ test "replay: every recorded case carries the inputs it was rendered from" {
     // The corners this corpus exists for have to be present in numbers, not in
     // principle: a transcript of 351 happy-path cases would satisfy every
     // assertion above and be worth much less. The floors are the counts at the
-    // 2026-09-06 capture (51 / 30 / 36), rounded down.
+    // capture (51 / 30 / 36), rounded down.
     try testing.expect(with_loader >= 50);
     try testing.expect(expecting_error >= 30);
     try testing.expect(autoescaped >= 35);
