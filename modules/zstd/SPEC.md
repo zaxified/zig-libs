@@ -31,14 +31,17 @@ Zig rows before std's were added 2026-10-07 (stars and pushes as of that date).
 | [gyscos/zstd-rs](https://github.com/gyscos/zstd-rs) (`zstd` crate) | Rust | BSD-3-Clause | 657 | v0.14.0 (2026-09-04) | Bindings to libzstd — full features, but links the C library. |
 | [DataDog/zstd](https://github.com/DataDog/zstd) | Go (cgo) | BSD-3-Clause | 806 | v1.5.7+patch2 (2026-04-21) | cgo bindings to libzstd — same trade-off as the Rust bindings. |
 | [muhammad-fiaz/zstd.zig](https://github.com/muhammad-fiaz/zstd.zig) | Zig | MIT | 14 | v0.0.4 (2026-10-04) | Pure Zig since v0.0.2 (v0.0.1 bound libzstd), needs Zig 0.17; its own encoder, not libzstd's bytes. Measured here 2026-10-07 on the Silesia corpus (`-mcpu=x86_64_v3`, ReleaseFast): ratio 1.53 at level 3 and 1.95 at 19 where libzstd and this module reach 3.21 and 4.01, compression in 4.6–12× and decoding (libzstd's frames) in 3.8–4.4× libzstd's time; its frames are valid (`zstd -t`, 84 of 84). Decodes the legacy v0.1–v0.5 frames. |
-| [c4milo/stdx](https://github.com/c4milo/stdx) `zstd` | Zig | none stated (no `LICENSE`, GitHub: none) | 1 | — (push 2026-10-05) | Decoder only, no compressor. Measured here 2026-10-07 (built and run sandboxed, its source not read: no licence): 0.84–0.92× libzstd's cycles decoding libzstd's Silesia frames, the 24 of levels 1 and 19 byte for byte; its own CI claims 1.18–1.32× libzstd's speed. Its docs credit hand-written assembly for sequence execution (see Z33). |
+| [c4milo/stdx](https://github.com/c4milo/stdx) `zstd` | Zig | none stated (no `LICENSE`, GitHub: none) | 1 | — (push 2026-10-05) | Decoder only, no compressor. Measured here 2026-10-07 (built and run sandboxed, its source not read: no licence): 0.84–0.92× libzstd's cycles decoding libzstd's Silesia frames, the 24 of levels 1 and 19 byte for byte; its own CI claims 1.18–1.32× libzstd's speed. Its docs credit hand-written assembly for sequence execution (this module's own: *Decoder*, "Sequence loops"). |
 | Zig `std.compress.zstd` | Zig | MIT | — | Zig 0.16.0 | Decoder only (`Decompress`; checked in 0.16.0's `lib/std/compress/`): no compressor, no dictionaries, no training. |
 
 **Where we are ahead:** of the implementations above that do not link libzstd, the only one
 that produces libzstd's bytes, at every level (1–22, negative, `--long`), and the only pure-Zig compressor;
 dictionaries, training, multithreading and the seekable format without linking C. **Where we
-are behind:** run-time CPU dispatch (Z22), the legacy formats (refused), and decoding
-speed: 1.0× libzstd's cycles at level 3 and 0.95× at level 19 (Z33, Z34), where stdx's decoder takes 0.84–0.92× at both.
+are behind:** run-time CPU dispatch (Z22) and the legacy formats (refused; *What is
+deliberately not done*). Decoding speed is at libzstd's (the card's Performance line; x86-64
+runs libzstd's assembly loops ported, `seq_fast.zig` and `huf_asm.zig`); stdx's decoder took
+0.84–0.92× libzstd's cycles at levels 3 and 19 when measured before those loops, and has not
+been measured against this one since (*Backlog / deferred*).
 
 ## What this module is, and what it is not
 
@@ -56,9 +59,9 @@ option `--long` is, at any level), and the entropy stage
 (literals via Huffman, sequences via FSE); see [NOTICE](NOTICE) for the
 file-by-file map.
 
-**Goal (2026-09-22): production quality — as close to libzstd's feature set
+**Goal: production quality — as close to libzstd's feature set
 and behaviour as possible, so that a Zig program never needs to link libzstd.**
-Reached (2026-09-30): beyond the compressor and the decoder, dictionaries
+Reached: beyond the compressor and the decoder, dictionaries
 (compressing and decompressing with one, and training with finalization),
 multithreading, the sequence-level API and the seekable format are here, each
 in its own section below. What libzstd has and this module does not is one
@@ -256,7 +259,7 @@ workspace leaves out the buffers the caller's stand in for, and
 `ZSTD_CCtx_reset` leaves the input a waiting frame held back on the
 context (the next frame would take it off its own input); `reset` drops it.
 
-**One-shot into any room** (Z29, 2026-09-28). `ZSTD_compress2` is
+**One-shot into any room** (Z29). `ZSTD_compress2` is
 `ZSTD_compressStream2(..., ZSTD_e_end)` with both buffers stable, so its
 single pass is `ZSTD_compressEnd` straight into the caller's destination
 at any capacity; `ZSTD_compress_usingDict` (and so `ZSTD_compressCCtx`)
@@ -451,7 +454,7 @@ value above `maxInt(i32)` takes the lower bound, as in libzstd), then
 `ZSTD_adjustCParams_internal` in `ZSTD_cpm_unknown` mode with the row match
 finder assumed; for both a size of 0 or null is unknown. A dictionary size
 near 2^64 wraps the window's sum in `ZSTD_dictAndWindowLog` as libzstd's
-unsigned arithmetic does. Pinned (2026-09-28) on 100 000 queries drawn
+unsigned arithmetic does. Pinned on 100 000 queries drawn
 around every bound and size class (`corpus.cparamsSample`, 3/4
 `adjustCParams`, 1/4 `getCParams`) answered by libzstd through
 `tools/zparams.c`: the answers' SHA-256 and the first 64 in full
@@ -461,7 +464,7 @@ around every bound and size class (`corpus.cparamsSample`, 3/4
 
 The five dictionary parameters are described in *Dictionaries*, the four
 sequence parameters in *Sequences*. `prefetchCDictTables`
-(`prefetch_cdict_tables`, 2026-09-26) prefetches an attached CDict's hash
+(`prefetch_cdict_tables`) prefetches an attached CDict's hash
 tables (`PREFETCH_AREA`, towards L2) at the start of each `fast` and `dfast`
 dictMatchState block, as libzstd does, for a cold dictionary; `.auto` is
 `.disable`, as in 1.5.7. It changes speed only: the bytes with it are the
@@ -502,7 +505,7 @@ The port keeps libzstd's policy for it:
   optimal parser's statistics and LDM's table and window start fresh.
 
 **The output of a reused context is the output of a fresh one.** This was
-measured before building on it (2026-09-24): libzstd 1.5.7 compressing with
+measured before building on it: libzstd 1.5.7 compressing with
 one reused `ZSTD_CCtx` and with a fresh one per frame, 1 960 frames —
 `ZSTD_compress2` and `ZSTD_compressStream2` (random chunking and flushes),
 levels −7…22, sizes 0 to 1.1 MB from a 12 MB mix, half of them with random
@@ -554,7 +557,7 @@ never freed or replaced, and a frame that needs more is
 size pledged, 3.7 MB for an unknown size; level 19 on 1 MB, 18 MB; the
 most any input needs at level 22, 740 MB one-shot and 874 MB streaming.
 
-**Buffer-less compression** (Z25, 2026-09-28). `Compressor.begin`
+**Buffer-less compression** (Z25). `Compressor.begin`
 (`zstd.Begin`: `.level` is `ZSTD_compressBegin_usingDict`, and
 `ZSTD_compressBegin` without a dictionary; `.advanced`
 `ZSTD_compressBegin_advanced`; `.cdict` `ZSTD_compressBegin_usingCDict_advanced`,
@@ -574,7 +577,7 @@ checked, `ZSTD_checkCParams`), every other parameter zero, i.e. its default
 does, by the size. A dictionary is loaded by reference (`ZSTD_dtlm_fast`
 on the caller's bytes).
 
-**Copies** (`ZSTD_copyCCtx`, Z25, 2026-09-28): `Compressor.copyFrom(prepared,
+**Copies** (`ZSTD_copyCCtx`, Z25): `Compressor.copyFrom(prepared,
 pledged_size)`, deprecated in libzstd as "misleading and [of] very limited
 utility" and ported to the letter, which is where its limits come from. The
 copy is reset (`ZSTD_resetCCtx_internal`, tables left dirty) with the
@@ -695,11 +698,11 @@ input alone. A `CDict`'s level, if it has one, replaces the context's. Then:
   `btultra`, `btultra2`), 16 KB (`dfast`) or 32 KB (the others) by the
   CDict's strategy, or of unknown size, or `force_attach_dict = .attach` —
   never with `.copy`, never with `force_max_window`. Ported for every
-  strategy now: `fast`/`dfast` (D1), `greedy`…`btlazy2` (D2, *Attach for
+  strategy: `fast`/`dfast` (D1), `greedy`…`btlazy2` (D2, *Attach for
   the lazy family*, below) and `btopt`/`btultra`/`btultra2` (D3, below) --
   the gate, `match.hasDictMatchStateVariant`, is exhaustively `true`, so
   `error.DictAttachUnsupported` (refusing before anything is written,
-  rather than copying, which would change the bytes) no longer has a
+  rather than copying, which would change the bytes) has no
   strategy left to name.
 
 `Options.dictionary` / `StreamOptions.dictionary` mirror libzstd's calls on
@@ -709,11 +712,11 @@ the frame's parameters (no level of its own, so copied or attached, never
 reloaded), for one call (`Compressor.compress`) or for every frame until
 `reset` (`Stream`); `.cdict` is `ZSTD_CCtx_refCDict`;
 `.prefix` is `ZSTD_CCtx_refPrefix_advanced` -- with the content type left
-at its default, raw, `ZSTD_CCtx_refPrefix` (until 2026-09-28 the default
-was `.auto`, shared with `.raw`: the same bytes single-threaded for any
-input without the dictionary magic, but with workers such a prefix became
-a `CDict` and never reached the long-distance matcher, so `zstd
---patch-from` with threads lost its long matches). `compressUsingCDict` is
+at its default, raw, `ZSTD_CCtx_refPrefix` (`.auto`, which `.raw` takes, would
+give the same bytes single-threaded for any input without the dictionary
+magic, but with workers such a prefix would become a `CDict` and never
+reach the long-distance matcher, so `zstd --patch-from` with threads would
+lose its long matches). `compressUsingCDict` is
 `ZSTD_compress_usingCDict_advanced`: the CDict's parameters (for inputs up
 to 128 KB or six times the dictionary, or a CDict without a level) with
 the window widened to the input up to 512 KB — the switches resolved
@@ -733,16 +736,15 @@ after them, in libzstd too (goldens `prefix-adjacent*`,
 `cdictref-adjacent-copy`). `.raw` is not: `ZSTD_CCtx_loadDictionary`
 copies the dictionary (`ZSTD_dlm_byCopy`) and digests the copy, so this
 port's context CDict is made with `CDict.initAdvanced` (a copy), never
-`initReference` — until 2026-09-25 it referenced the caller's bytes, and
-an input placed right after them gave other bytes than libzstd whenever
-the CDict was copied or loaded anew (goldens `load-adjacent-*`; a
-5 000-case random diff over every entry path, adjacent and not, 0
-mismatches). A CDict that owns its copy (`init`, `initAdvanced`) is
+`initReference`: a CDict that references the caller's bytes gives, for an
+input placed right after them, other bytes than libzstd whenever the CDict
+is copied or loaded anew (goldens `load-adjacent-*`; a 5 000-case random
+diff over every entry path, adjacent and not, found 0 mismatches). A CDict that owns its copy (`init`, `initAdvanced`) is
 placement-independent.
 
 **Reuse.** libzstd 1.5.7 gives a reused context the bytes of a fresh one
 with dictionaries too (1 500 frames, every way of using a dictionary,
-attach included, levels −3…22, measured 2026-09-24 with a probe like
+attach included, levels −3…22, measured with a probe like
 `tools/zreuse.c`): the dictionary is loaded above the last frame's
 indices, and the copy replaces the window and tables outright. The
 dictionary goldens run through one context and one stream.
@@ -791,7 +793,7 @@ ZSTD_cpm_attachDict)`) — D1 read it line by line against
 (not mutation-backed: D1's sweep targeted the new match finders, not
 this function specifically); D2 exercised it as it stands.
 
-**Attach for the lazy family** (D2, 2026-09-24; `lazy.zig`). Every
+**Attach for the lazy family** (D2; `lazy.zig`). Every
 function of the lazy finders takes libzstd's dictionary mode at compile
 time (`DictMode`: `no_dict`, `ext_dict`, `dict_match_state`), as libzstd's
 templates do, so the no-dictionary path compiles to what it was (same
@@ -897,7 +899,7 @@ equivalent, 4 open.**
   acceptance `match_idx_l3 >= prefix_lowest_index` vs `>`, the sibling of
   the now-killed `m22`/`m24`, just on the "+1" lookahead specifically).
 
-**The dedicated dictionary search (D4, 2026-09-25).**
+**The dedicated dictionary search (D4).**
 `Advanced.enable_dedicated_dict_search` (`ZSTD_c_enableDedicatedDictSearch`)
 acts on the `CDict`s made with those parameters (`CDict.initAdvanced`, and
 the context's own for `Dictionary.raw`, which libzstd makes from the
@@ -1086,13 +1088,13 @@ threads' and the posting mutex's -- goes through `io`'s futex. Without one
 `std.Thread`s and the futex is that of the process-global
 `std.Io.Threaded` instance, whose futex calls touch no state of the
 instance, so the module needs neither libc (zig-libs policy) nor an `Io`
-from its caller. (Decided 2026-09-26: the global futex, `io` when a caller
-asks; Z25 adds the `io` as the pool's, keeping the default.) Not
+from its caller. (The global futex is the default, `io` when a caller
+asks; Z25 adds the `io` as the pool's.) Not
 `workerpool`: it needs the caller's `Io`, boxes every job on the heap and
 queues without bound, where this needs a fixed set of threads each owning
 a context and at most one job each. A worker reads a posted job's pointer
 before claiming it: claimed first, its queue slot could be posted to again
-by the time it reads, once a later job finished first (fixed 2026-09-28).
+by the time it reads, once a later job finished first.
 With `builtin.single_threaded`, or the test seam `run_inline` (a context's
 own pool only), the jobs run on the calling thread when posted -- the same
 bytes. The large buffers (the round buffer, up to `max(window,
@@ -1408,7 +1410,11 @@ branch in `dstream.zig`'s header-consume step clears `prefix_once` too).
 frame's dictionary ID from a caller-given list, falling back to
 `Options.ddict`; the selection itself is a linear scan (last match wins on
 a duplicate ID) rather than a port of libzstd's open-addressing hash set,
-since only which `DDict` is picked is observable, not how. **Streaming**
+since only which `DDict` is picked is observable, not how. A frame with
+dictionary ID 0 is searched too, not exempt: libzstd's hash set uses ID 0
+both as its empty-slot marker and as a raw-content dictionary's ID, so such
+a frame matches whichever raw-content `DDict` was registered last
+(`selectDDict`; KAT `small_frame` in `testdata/dict_kats.zig`). **Streaming**
 selects fresh for every frame, matching libzstd's own early
 `ZSTD_DCtx_selectFrameDDict` call inside `ZSTD_decompressStream`.
 **One-shot is different, and was verified empirically, not just read from
@@ -1439,8 +1445,8 @@ already documented above, libzstd switches between a "short" and a
 "prefetching" sequence decoder per block (`usePrefetchDecoder`), defaulting
 to the prefetching one whenever `dctx->ddictIsCold` — true essentially every
 time a dictionary decode begins, since it means "this dctx has not already
-been decoding with this exact dictionary". Only the short decoder is
-ported. On a corrupted sequences section the two can disagree on which
+been decoding with this exact dictionary". That rule is
+not taken: this port's prefetching loop follows its own rule (above). On a corrupted sequences section the two can disagree on which
 check trips first — confirmed empirically here (`ERR 20`
 `corruption_detected` from libzstd vs `error.DstSizeTooSmall` from this
 port, both refusing the frame) — exactly the already-declared "on corrupt
@@ -1450,18 +1456,13 @@ path (13/4000 random single-byte-flip corruptions of dictionary-compressed
 frames in a throwaway differential run hit this; every other corrupted
 input and every valid one, output and error class alike, matched).
 
-Speed: 0.91–1.04× libzstd's cycles (2026-09-27, `zstd -dc` of
-`example-apps/zstd-cli` against `/usr/bin/zstd` 1.5.7, `-Dcpu=native`,
-pinned core, best of 3: Zig's std sources as a 20 MB and a 120 MB tar at
-levels 3 and 19 and `--long=27`, an RLE-heavy 20 MB, and 178 small frames
-with a dictionary; one-shot `-b -d` 0.97–1.02× the time). The 2026-09-26
-measurement (1.13–1.27×) had two causes, both fixed (Z16): the overlapping
-match copy went through `std.mem.copyForwards`, a byte loop where libzstd's
-`ZSTD_copy8` is one load and one store (the copies are at least 8 bytes
-apart once `overlapCopy8` has spread the offset), and the command copied
-each decoded buffer through its writer's buffer.
-std's decoder takes 30× libzstd's time on the same frames, which is why
-this is a port and not an extension of it.
+Speed is measured against libzstd by `zig build bench-zstd` (see *Speed*); the card's Performance line carries the figures. The overlapping match copy is one 8-byte load and one store, as libzstd's `ZSTD_copy8` (`copy8` and `overlapCopy8` in `dblock.zig`; `std.mem.copyForwards` would be a byte loop). std's decoder takes 30× libzstd's time on the same frames, which is why this is a port and not an extension of it.
+
+**Sequence loops.** A block's sequences run through one of three loops that give the same bytes and the same errors; `decoder_test.zig` forces each on and off over corpus frames at levels 1, 3 and 19 and over damaged copies of them, and compares them (`setPrefetchForTest`, `setFastSeqForTest`).
+
+- *The plain loop* (`decompressSequences`) keeps its cursors in locals, as libzstd keeps `litPtr`, `litEnd`, `op` and `prefixStart`: a `LitCursor` and a local copy of `History`, because a byte store into `out` may alias any field reached through a pointer and the compiler would reload them for every sequence. `execSequenceEnd` is `noinline`, as libzstd's is.
+- *The prefetching loop* (`decodeAhead`) runs libzstd's `ZSTD_decompressSequencesLong` schedule: decode 8 sequences ahead, prefetch each one's match source (2 cache lines), execute the oldest. It takes a block with more than 8 sequences whose offset table has at least 7 256ths of its cells at 22 extra bits or more (offsets from 4 MB; `usePrefetch`), never the predefined table. libzstd's rule (`ZSTD_getOffsetInfo`: more than 22 bits and over 16 MB of history, or a cold dictionary) never fires on a level-19 window of 8 MB, where most of the decoding cycles wait on the match copy's first load (memory, not code); the rule here was chosen on the Silesia frames (*What is deliberately not done* lists what was tried). The loop is `noinline` and takes and returns its state by value: handing it addresses put the cursors back in memory. The rule changes no output.
+- *The assembly loop* (`seq_fast.zig`, x86-64 with BMI2, LLVM builds only) runs on the blocks the prefetching loop does not take, when the output has the wildcopy margin. It decodes and executes sequences while every margin holds (the bitstream above its start, the literals, the output's wildcopy space, a match inside the prefix) and hands the rest to the Zig `execSequence`; the bit reads, repeat-offset updates and bytes are the Zig loop's, and its copies write at most 31 bytes past a sequence's end, inside the wildcopy margin. `rbp` is not used (the match length lives in `FastSeq.seq_ml`), so builds that keep a frame pointer are safe. The four-stream Huffman loops are libzstd's `huf_decompress_amd64.S` ported the same way (`huf_asm.zig`, called from `huf_dec.zig`). Both are compared with the Zig loops by those tests, with a count that the assembly ran. aarch64 has no assembly (*Backlog*).
 
 **Memory.** `Decompressor` holds the tables and a 128 KB literal buffer
 (159 888 bytes on x86-64, `estimateDecompressorSize`, libzstd's
@@ -1541,16 +1542,6 @@ struct up to the buffers, so a copy's table pointers still point into the
 source; here they point into the copy's own tables (a difference only if the
 source changes or goes away first), and the frame header buffer, which
 libzstd leaves out, is copied too.
-
-**Audit 2026-11-18 (whole-module mutation of the decoder; partial: the encoder is not covered).** 1 359 mutants over every non-test line of `dbits.zig` (bit reader, `FSE_readNCount`, the weight decoder), `dblock.zig` (literals and sequence sections, sequence execution), `huf_dec.zig`, `decompress.zig` (frame headers, size queries, the piecewise decoder), `dstream.zig`, `ddict.zig`, `seekable.zig` and the decoder entry points of `root.zig`; ReleaseSafe schemata, baseline first, one build per round (ids are per line and class: guard drop per disjunct/conjunct, boundary flips, skipped assignments and counters). Result after the second pass (see below): 1 178 killed (36 of them by timeout), 165 EQUIVALENT, 14 UNOBSERVABLE, 2 open. No defect was found: every survivor examined was a missing test or a variant that cannot change a byte or an error. Tests added (`src/dmut_test.zig`, plus tests in `dbits.zig`, `dblock.zig`, `seekable.zig`): the bit reader's init and reload state machine at every boundary; `readNCount` on 4 000 random distributions (table logs 5..12, long zero runs) at every trailing padding and cut; `decompressWeights` with low-probability symbols, the destination edge, table log 7 and a stream too short for its states; `readStats` (direct form, every refusal, log 12) and as the inverse of `writeCTable`; the raw, RLE, compressed and treeless literals headers in every size form and at the edges of the block (5-byte block, 1 KiB window block maximum, four-stream minimum of 6); the sequence count in all coding forms (1, 127, 128, 255, 256, 0x7EFF, 0x7F00) and a section cut anywhere in its header; frame reset (a new frame refuses the previous frame's table and repeat modes); a model of the frame header written from the format description against `getFrameHeader` for 60 000 random headers and every cut, in both formats; `isFrame`, `readSkippableFrame` (including the size wrap), `findFrameCompressedSize`, `findDecompressedSize`, `decompressBound`, `decompressionMargin`; Huffman round trips with both table kinds, one and four streams, the assembly switch on and off, short streams and the stream edges; `execSequence` against a byte-by-byte model over 400 000 random output/literal/history edges; a dictionary cut at every length; seek-table index edges and the byte source's end; `writeSkippableFrame`. Equivalent classes: the copy helpers' boundaries choose between two paths that write the same bytes (the wild copies write scratch inside the 32-byte margin), the batched four-stream Huffman loops and the sequence-loop selectors are cost-only (the per-stream tails redo what they skip), a handful of dead defensive checks as in libzstd (`op1 > os2`, `os4 > oend` with `dst.len >= 6`, `o_size >= 256`), `readNCount`'s two ways of advancing near the end of the buffer, resets that are rewritten before any read. UNOBSERVABLE: the mid-sequence reload (needs offset codes over 25 bits, a 32 MiB history), the comptime `supported` gates of the assembly loops, `DDict.deinit`'s poisoning, raw literals read in place vs copied (differs only in the output limit of malformed blocks over 128 KiB). Second pass (2026-11-18, `src/dopen_test.zig`, `src/dopen2_test.zig`): the 190 mutants left open were re-run, ReleaseSafe schemata, baseline first, per mutant under `setsid -w timeout`; 132 more were killed (including the 8 tests of the first pass that had not been measured), and the rest are argued per id: EQUIVALENT (dead as in libzstd or redundant with another check: `readNCount`'s `bit_count > 32` after the final reload; `HUF_rescaleStats` at scale 0; the fast loop's `a.op[s] > segment_end` and its stream-crossing breaks, which the `ip + 8 < iend` floor test refuses anyway; `rank_start0[max_w + 2]`, written and never read; the single-pass path's `out_end`; `decompressContinue` assignments the branch had already made; the self-copy of a context; a retry that cannot move; the dead `target` assignment before a `break`), cost-only (4 or 5 symbols per reload; the `seg <= dst.len - segment_end` arms give the same end), or UNOBSERVABLE (`deinit` poisoning, `max_frames` = 2^27 logged frames, a 4 GiB `writeSkippableFrame`, the comptime assembly gates). What the new tests pin: every piece of a frame through `decompressContinue` with the stage and the size asked for next; `begin`; the history cursors on forged state; raw dictionaries of 0 to 8 bytes and the pointers a loaded dictionary sets; a block with its own table after a `DDict` and the treeless block after it; magicless frames whose header reads as a skippable magic, in one-shot, piecewise and streamed decoding; stream resets with input loaded and output waiting; stable-output headers in two calls; skippable frames in both output modes; the 128-frame shrink of the stream's buffers and the allocation failure of the shrink; the sixteen-call no-progress count and its reset; `estimateSizeFromFrame` at the largest size; the `Reader` with a forced non-stable output, an error kept, no room, and an input that arrives a byte at a time; Huffman tables of every log (the log a header ends with, both limits, every cell of X1 and X2 against a model of the codes, nothing written past the table), tables of log 12 through all four decoders, one-bit streams built by hand for the four-stream fast path (eight-byte streams, a segment the loop fills exactly, streams read past their start by exactly eight bytes, one short stream among padded ones, output under 6), `HUF_selectDecoder` at its edges and the table it leaves; a dictionary with an offset table of log 9; the seek table (smallest source and table, wrong magic, 17 000 entries in several reads, with and without checksums); `SeekableStream` (largest frame size, reset in the middle of a big frame), the continuing read with a counting source, the forged-table read guard at its exact byte count, a custom source that serves bytes past its end, a read on into a frame whose checksum is wrong, the 16-empty-blocks threshold, a 128 KiB block, and a source that shrank. No source line changed. Still open: 741 and 742 (`h >= src.len` in `decompress4XTable`'s double-symbol branch: reached only by a section that is a table header of about 96 bytes or more and nothing else, with sizes that make `selectX2` choose that table; the test scans output sizes against a 256-symbol header but the header it builds is too short to reach it). The card keeps `mutation 2026-09-28 · src ?`: the encoder (~25 000 lines, byte-identical to libzstd by the golden corpus) has not been mutated, so there is no whole-module score yet.
-
-**Audit 2026-11-19 (whole-module mutation of the encoder, phase 1: group g1 only).** Generated 3 393 mutants over `frame.zig`, `stream.zig`, `stream_writer.zig`, `frame_writer.zig`, `literals.zig`, `sequences.zig`, `fse.zig`, `huf.zig`, `hist.zig`, `blocksplit.zig`, `presplit.zig`, `superblock.zig`, `match.zig`, `lazy.zig`, `opt.zig`, `ldm.zig`, `params.zig`, `cdict.zig`, `fill.zig` (same classes as the decoder run); 594 were dropped before running (8 that cannot take a runtime switch because their condition is comptime, the rest cost-only knobs, statistics and trace code, counter skips and non-bounds conditions in the match finders), leaving 2 799. Only group g1 was run: `frame.zig`, `stream.zig`, `stream_writer.zig`, `frame_writer.zig`, `fill.zig`, `params.zig`, `cdict.zig` (719 mutants, 3 of them in test-helper code that sits in the test region of a file, so 716 product mutants). Stage A (ReleaseSafe schemata, baseline first, the inline tests of those files, room, parameter, copy, sequence-API and fuzz tests, and the golden byte-parity test on a small subset: inputs up to 20 000 bytes at levels -5, 1, 3, 6, 9, 12, 16, 19, 22; the subset exists only in the scratch copy): 402 killed (16 by timeout), 317 survived. Targeted stage B on the survivors (stream group: the stream, stream-writer and frame-writer tests, 62 condition mutants, then the sweep, parameter, copy and sequence tests on what was left; frame group: the full golden test, context and dictionary tests, the first 58 of 140 condition mutants; the 115 survivors that are plain skips of an assignment were not run further) killed 46 more, and the new tests in `src/emut_test.zig` 12 more: 460 killed in all (20 by timeout), 7 EQUIVALENT (argued per id in the verdict list: `compressBound`'s margin is 0 at 128 KiB; `writeFrameHeader`'s size is 0 for an unknown content size; the `c_size == 0` test in `compressBlock` returns 0 either way; `stable_in_not_consumed` is 0 unless the input is stable; one more empty stream call per write; two empty-scratch checks that a later assert repeats), 3 not product code, 15 OPEN-CAPACITY and 234 OPEN. No defect was found; no source line changed. New tests (`src/emut_test.zig`, `src/dopen2_test.zig`): the sequence count in all three header forms at every edge (1, 2, 126..129, 254..257, 0x7EFE..0x7F01, 0x7FFF) through the caller's-sequences API; a short-room scan (every room below the frame, the same frame from the least room up, no stray byte past the room, RLE, raw and compressed blocks, small and 128 KiB-tail inputs); `compressStream2` with a position past either buffer and at its end; the `FrameWriter` level edge; a prefix dictionary serving one frame of a stream only; a held-back stable input resumed at the wrong position. Open capacity checks (a one-byte shift of the least room for an RLE block, a tail block or a split block is visible only against libzstd least-room goldens for those block kinds, which were not generated; the scan found no panic, no stray byte and no wrong error): `frame.zig` 219, 257, 273, 342, 347, 362, 1501, 1539, 1545, 1611, 1626. Open for lack of time (survived stage A and the new tests, not run further; ids and reasons in the audit's verdict list): `cdict.zig` 30 ids; `fill.zig` 8 ids; `frame.zig` 147 ids; `frame_writer.zig` 2 ids; `params.zig` 14 ids; `stream.zig` 42 ids; `stream_writer.zig` 6 ids; they are context-reuse bookkeeping, stream parameter-change and multithreaded switches (the multithreaded test file is too slow for a mutant run), dictionary attach/copy plumbing and fill/params conditions. **Not mutated in phase 1:** `literals.zig`, `sequences.zig`, `fse.zig`, `huf.zig`, `hist.zig`, `blocksplit.zig`, `presplit.zig`, `superblock.zig` (group g2), `match.zig`, `lazy.zig`, `opt.zig`, `ldm.zig` (group g3), and, by decision, `dict_builder.zig`, `zdict.zig`, `zstdmt.zig`, `seekable.zig`, `seqapi.zig`, `huf_asm.zig`. The decoder's two open ids 741 and 742 (`h >= src.len` after `readDTableX2` in `decompress4XTable`) stay open: a scan of header-only sources of up to 135 bytes against output sizes up to 2^18 found sizes where `selectX2` picks the double-symbol table, so the case is reachable in principle, but building the matching valid table header (the table must end exactly at the source) was not done. The card keeps `mutation 2026-09-28 · src ?`: the encoder is not mutated as a whole.
-
-**Audit 2026-11-19 (encoder whole-module mutation, phase 1: group g2).** The 777 mutants of `literals.zig`, `sequences.zig`, `fse.zig`, `huf.zig`, `hist.zig`, `blocksplit.zig`, `presplit.zig` and `superblock.zig` from the same generated list (ids unchanged, the files unchanged since). Stage A (ReleaseSafe schemata; the inline tests of those files, room, parameter, copy, sequence-API, fuzz and phase-1 tests, the golden byte-parity test on the small subset): 495 killed, 6 by timeout, 276 survived. Stage B on the survivors (the full golden test, the streaming, every-capacity, sweep, dictionary and sequence-API tests): 42 more. Stage C, new tests: 32 more (one by timeout). In all 575 killed, 96 EQUIVALENT, 106 OPEN; no defect found, no source line changed. New tests: `src/entropy_kat_test.zig` pins `fse.normalizeCount` (every branch of `FSE_normalizeM2`), `fse.writeNCount` (zero runs of 24 and more; every room below the least libzstd accepts is refused, the bytes there and with ample room), `huf.optimalTableLog` (with the optimal-depth search: histograms where the size grows by more than one and then shrinks) and `huf.writeCTable` against libzstd 1.5.7 (`testdata/entropy_kats.zig`, recipe `tools/gen-entropy-kats.sh` through `tools/zentropy.c`); `src/emut2_test.zig`: six literals coded in one byte by a reused table (not a single symbol) against six identical ones, `ZSTD_minGain` from btultra up, the edges of `HUF_compress_internal`'s decision to reuse the old table, superblocks into a stable output buffer at every room near each sub-block's edges (refused or a frame that decodes), and round trips at a literal run of 0xFFFF, a match of 0xFFFF + 3 and an RLE literals section past 4095 bytes. Facts learned: the `alldist` branch of `FSE_normalizeM2` is reached only when every count is 1 (n symbols with 2^tableLog / n in (1.451, 1.5]); `to_distribute == 0` there is unreachable (the minimum table log leaves more cells than symbols); at its least room `HUF_writeCTable` writes raw weights where ample room codes them with FSE, in libzstd as here (the FSE payload needs 8 bytes of slack); a one-shot frame never gives a superblock a short room (the frame is built in the context's own buffer below `compressBound`), so the superblock's room checks meet their room only through a stable output buffer, where libzstd writes past the end (see *Anchoring*) and gives no reference. EQUIVALENT (argued per id in the audit's verdict list): unreachable guards (RLE distributions never normalized, symbols past 52, stream sizes above 65 535 from 32 KiB segments), cost-only switches (the parallel histogram, the packed Huffman encoder, early or extra flushes, the 16-byte literal copy), boundaries where both sides give the same value (`llCode(63)`, `mlCode(127)`, the log bucket at 165), and checks a later check repeats. OPEN, by file: `superblock.zig` 50 (the room checks without a reference, a block without sequences, long lengths inside sub-blocks), `huf.zig` 7 (the suspect-incompressible sampling, raw weights above 128 symbols: no histogram found whose FSE-coded weights are not shorter), `blocksplit.zig` 23 (repcode resolution after raw or RLE partitions, long lengths at a split), `fse.zig` 12 (`FSE_normalizeM2`'s low-threshold branch with low-probability counts on, its re-assignment conditions; the unchecked-room `writeNCount` boundaries), `sequences.zig` 7 (offsets of 2^25 and more, a block's literals ending within 16 bytes of the literal buffer, the repeat mode after a predefined table), `literals.zig` 4, `presplit.zig` 3 (equal fingerprint distances, savings of exactly 3). Three targeted tests pass but did not reach their mutants (the RLE literals header past 4095 bytes, a literal run or match of exactly 0xFFFF through the match finders, `rle()` with less room than its header in a sub-block); they are listed open. The card stays `mutation 2026-09-28 · src ?` until group g3 (`match.zig`, `lazy.zig`, `opt.zig`, `ldm.zig`) is run. *Follow-up 2026-11-19.* The three tests that did not reach their mutants now do: the RLE-literals test's block is all one byte (its 7 trailing literals had been other bytes, so the literals were Huffman coded) and checks the 3-byte header (RFC 8878 section 3.1.1.3.1.1); `literals.rle` is pinned at every room below its header and the literal (in all three header sizes); the long-length edges are pinned on `SeqStore.storeOnly` itself (`ZSTD_storeSeq`: a literal run of 0xFFFF and a match of 0xFFFF + 3 stay short), since the match finders seldom land on exactly those lengths. Two KATs of `FSE_normalizeM2`'s low-threshold branch with useLowProbCount on, one with a count exactly at the threshold, join `testdata/entropy_kats.zig`. New goldens `testdata/superblock_goldens.zig` (recipe `tools/gen-superblock-goldens.sh`: libzstd 1.5.7's one-shot `ZSTD_compress2` through `tools/zref.c` on generated mixes of text, word salad, 64-value noise and random bytes; 42 frames): superblocks (`targetCBlockSize`) of blocks without a sequence (the recipe checks libzstd's frames hold such blocks; libzstd's `ZSTD_compressSequences` never builds superblocks, so they come from `ZSTD_compress2`), several sub-blocks, a literal run above 0xFFFF inside a superblock; `HUF_compress`'s sampling of literals suspected incompressible (exactly 40 KiB; only the first sample looking incompressible); and the block splitter (`splitAfterSequences`) over such inputs. Group g2: 575 killed, 96 EQUIVALENT, 106 OPEN before; 597 killed, 97 EQUIVALENT, 83 OPEN after (22 killed: `literals.zig` 630, 632-634; `sequences.zig` 681, 685; `fse.zig` 772, 773; `huf.zig` 1197, 1199; `blocksplit.zig` 1236, 1248, 1276; `superblock.zig` 1368, 1369, 1371-1373, 1377, 1401, 1503, 1509. EQUIVALENT 774: the main pass of `normalizeCount` has already stored the low-probability count for every count at or below the same threshold in the same array before `normalizeM2` runs, as in libzstd. Still OPEN among the targeted ones: 1361, `superblock.zig`'s literal-statistics error, reachable only if `HUF_writeCTable` can need raw weights for more than 128 symbols (open 1127, which libzstd calls "should not happen"); 1370, the match-length repeat mode after a block without sequences, which libzstd never repeated in these frames). Group g1 unchanged: 467 killed, 14 EQUIVALENT, 3 not product, 1 OPEN-CAPACITY, 234 OPEN; of its 15 OPEN-CAPACITY ids only 92 was left by the every-capacity paragraph below, and it stays open (no input found that gives a split partition 0..2 bytes of room).
-
-**Audit 2026-11-19 (encoder, the 15 OPEN-CAPACITY ids of phase 1).** A capacity scan of the original against each mutant (every room up to 64 bytes and a window around the frame for one-shot frames with 0 and 2 workers, every room for the block API, the buffer-less API and `compressSequences`, the rooms 0..2 past every block start of block-split frames) showed which of the 15 change any answer. New test `src/room_sweep_test.zig` with goldens from libzstd 1.5.7 (`tools/zroom.c`, `tools/gen-room-sweep-goldens.sh`: 236 runs, every capacity 0..maxcap of the block API, the buffer-less API and `ZSTD_compressSequences` on small generated inputs, compared by SHA-256 of the per-capacity answers) KILLS 7: ids 30 (`frame.zig` 219, the sequences header), 57 (273, the minimum block size), 332 (1501, a block start with less than a header and one byte), 352 and 353 (1545, the last empty block; 352 dropped the check and indexed past `dst`), 367 and 368 (1611, the sequence API's frame header; 367 dropped the check and indexed past `dst`). EQUIVALENT 7: 347 and 348 (1539, `writeEpilogue`'s empty-frame header) because every caller (`finishFrame`, `compressEnd`, `zstdmt`'s last job) runs `compressContinue` first, which writes the header, so the branch is dead; 370 and 371 (1626, the sequence API's empty frame) because 1611 already asks for 18 bytes and an empty frame's header takes at most 10, leaving at least 8 for the 4 the check wants; 88 and 89 (347, `emitBlock`'s RLE room) because an RLE block is emitted only after `entropyCompress` either succeeded (a body of at least 2 bytes, so at least 5 bytes of room) or returned 0 for `src.len <= out.len - 3` with `src.len >= 3` (a whole block passes 1501's 5 bytes; a split-block partition holds at least one sequence), and the sequence API checks 4 bytes itself (1666); 93 (362, `<=` for `<`) because at exactly 3 bytes the next `try entropyCompress` into an empty buffer fails with the same `error.DstSizeTooSmall`. OPEN 1: 92 (362, the check dropped) is reachable only by a split-block partition that starts with 0..2 bytes left, i.e. after a raw partition that ends 0..2 bytes before the room does (a compressed partition always leaves at least 7, the bitstream's slack); the mutant would index past `dst`; no input that makes such a raw partition was found (text, 400- and 1500-byte noise/text stretches, levels 16 and 19, `blockSplitterLevel` 6). Divergence by design, now pinned by the test: below 18 bytes libzstd's `ZSTD_compressSequences` ignores `ZSTD_writeFrameHeader`'s error and goes on at a wild position; this module refuses the room. No source change. Phase-1 g1 totals: 467 killed, 14 equivalent, 3 not product, 1 OPEN-CAPACITY (92), 234 OPEN.
-
-**Audit 2026-11-20 (whole-module mutation closed with open ids).** The decoder run (2026-11-18) and the encoder groups g1, g2 and g3 (2026-11-19/20) together make the module's mutation score: 4 155 mutants, 2 681 killed, 320 EQUIVALENT or UNOBSERVABLE, 1 154 OPEN. Per part: decoder 1 359 (1 178 killed, 165 EQUIVALENT, 14 UNOBSERVABLE, 2 OPEN: 741, 742); encoder g1 716 product mutants (485 killed, 14 EQUIVALENT, 217 OPEN: a second stage on the stream-side ids killed 18 more in `stream.zig` with the existing multithreaded tests; 216 open plus the capacity id 92); g2 777 (597 killed, 97 EQUIVALENT, 83 OPEN); g3 (`match.zig`, `lazy.zig`, `opt.zig`, `ldm.zig`) 1 303 (421 killed, one by timeout, 30 EQUIVALENT, 852 OPEN: 271 survived the first stage and were not analysed further, 581 were not run: `opt.zig` 257, `ldm.zig` 114, `lazy.zig` 203, `match.zig` 7). The g3 survivors examined sit on paths the first-stage tests do not reach (external dictionary, attached `CDict`, dedicated dictionary search, hash-chain search, window and overflow correction); in ReleaseSafe every match-finder read checks its window segment, so a mutant that reads outside it dies as a panic, and none of the survivors examined can make such a read. No defect was found in any part and no product line changed. The run was stopped by decision, not for a defect: the encoder is held byte-identical to libzstd 1.5.7 by the golden corpus, which already kills most behaviour mutants, and the remaining open ids are not a defect claim. The module is not rerun as a whole: later changes to the module are covered by delta mutation of the changed lines, and the OPEN ids are worked down in small batches (about 20 per batch, one schemata build each; the 581 never-run ids first get a single first-stage run), each batch updating the card's counts. Not mutated by decision: `dict_builder.zig`, `zdict.zig`, `zstdmt.zig`, `seekable.zig`, `seqapi.zig`, `huf_asm.zig`. Batch 1 (2026-11-20): the 581 never-run g3 ids got their first-stage run (the same test set as g3, golden byte parity filtered to the strategy the mutated function serves; `opt.zig` with the small golden subset after its first 8 ids), 388 killed (5 by timeout) and 193 survived it; a second stage on 20 `fastExtDictBlock` survivors (streaming and dictionary byte parity at the fast strategy) killed 11, found 2 EQUIVALENT (a select whose arms agree at equality; a forward count that re-counts the 4 bytes a repcode match already proved), and left 7 open (rep offsets at the extDict low end and the stale-offset bookkeeping across blocks need a new libzstd streaming golden); the score moved from 2 681 killed, 320 EQUIVALENT, 1 154 OPEN to 3 080 killed, 322 EQUIVALENT, 753 OPEN (none of them never-run). Batches 2 and 3 (2026-11-20), 20 ids each, one schemata build per batch: `cdict.zig` (g1) 16 killed (new tests: random dictionaries ending in a long zero run for table reach, a context loading more than 16 MiB, a fast CDict keeping the last 2^24 bytes, a greedy CDict past 16 MiB, long-distance matching with `force_max_window`) and 4 EQUIVALENT (a header cut where every repcode is refused alike; `highbit32` reaching the same fallback at the boundary; two slices that are the whole dictionary at `max_dict_size`); `superblock.zig` (g2) 8 killed (a producer-driven test of sub-block sequence counts and new libzstd v1.5.7 rows in `superblock_goldens.zig`, one with a least-room check), 5 EQUIVALENT (argued from callers and preconditions) and 7 left open (budget/room corners no libzstd frame was found to reach). Card 3080 -> 3104 killed, 322 -> 331 eq, 753 -> 720 open.
 
 ## Dictionary training
 
@@ -1667,9 +1658,9 @@ completion order instead). `train` is `ZDICT_trainFromBuffer`
 or compression error) is skipped, as libzstd's error selections never beat
 the best; none left is `error.NoCandidate` (libzstd `GENERIC`).
 
-**API choices (the user's, 2026-09-25).** `d` defaults to 8 (the CLI's);
+**API choices (the user's).** `d` defaults to 8 (the CLI's);
 k stays required for `trainCover` / `trainFastCover`; the optimizers keep
-libzstd's defaults. `memory_limit` stays 256 MiB and now bounds *all*
+libzstd's defaults. `memory_limit` is 256 MiB and bounds *all*
 working memory, the dictionary buffer excluded: the complete trainers run
 on a `LimitedAllocator` that refuses any allocation past it
 (`error.MemoryLimitExceeded`), so finalization's compressor and `CDict`,
@@ -1883,8 +1874,8 @@ that does change a verdict, on a forged table only: a frame must decode to
 exactly the size its table entry gives, else `CorruptionDetected`. The C
 restarts a frame that ends short of the offset its table promised — forever
 (no output-progress guard trips, since every pass has output) — and hands a
-frame's excess bytes out as the next frame's (found 2026-09-27 by seglog's
-fuzz driver: a reader stuck on one damaged `.zst`).
+frame's excess bytes out as the next frame's (found by seglog's fuzz
+driver: a reader stuck on one damaged `.zst`).
 
 ## Limits and refusals
 
@@ -1915,6 +1906,30 @@ end, `context_test.zig` the estimates and a static workspace's bound,
 `dctx_test.zig` the decoder's.
 `FrameWriter` takes a nonempty buffer and holds `compressBound(buffer.len)`
 of scratch and its context's workspace for its life.
+
+Caller contracts that cannot be checked (as in libzstd), and the panics that guard the rest:
+
+- `Compressor.compressContinue` and a `Stream` with `stable_in_buffer` take the caller's earlier input as the window: freeing, moving or overwriting it breaks a contract no check can see (a pointer and a `pos` are compared, not the bytes). A dictionary or prefix given by reference (`begin`, `CDict.initReference`) must outlive its frames.
+- The `cover` / `fastCover` trainers' run time is libzstd's (up to about `k / segment` passes over the d-mers per epoch) and bounded only by `memory_limit`, that is by the size of the samples.
+- `StreamWriter.initScratch` and `initStatic` panic (`zstd: StreamWriter scratch must not be empty`) on an empty scratch.
+- `Decompressor.decompress` panics (`zstd: decompress dst and src overlap (in-place decoding is not supported)`) when `dst` and `src` overlap: the raw-block `@memcpy` and the 16-byte literal copies would alias. `decompressionMargin` is computed as libzstd does but for sizing only; libzstd's one-shot decoder can decode in place (*Backlog*).
+
+## Verification
+
+How to run: `scripts/modtest zstd` (the module is `heavy`: its tests run at ReleaseSafe when Debug is asked for, `-Dstrict-debug` forces Debug). `zig build interop-zstd` re-takes the anchor against a libzstd 1.5.7 checkout, `zig build bench-zstd` measures speed (*Speed*), `zig build check-portable` compiles the module for `.linux32` and `.windows`. *Anchoring* below says what each sweep pins and why the corpora are shaped as they are; the recipe behind every committed golden is in `tools/README.md`.
+
+Test classes, by area:
+
+- **Byte parity with libzstd 1.5.7**, against committed goldens (length and SHA-256 of the frame libzstd produced): `golden_test.zig` (one-shot, every level), `stream_test.zig`, `param_test.zig` (advanced parameters), `dict_test.zig` and `dict_golden_test.zig` (compression with dictionaries, training content), `mt_test.zig`, `seq_test.zig`, `room_test.zig` and `room_sweep_test.zig` (every destination capacity), `copy_test.zig` (buffer-less API, `copyFrom`), `context_test.zig` (reuse equals fresh, estimates, static workspaces), `entropy_kat_test.zig`, `seekable_test.zig`.
+- **Decoder**: `decoder_test.zig`, `decoder_dict_test.zig`, `dstream_test.zig`, `dctx_test.zig`: valid frames libzstd made, frames no encoder writes (built byte by byte, `tools/crafted-frames.py`), damaged frames with libzstd's error class (platform-dependent where libzstd's is: `Kat.expect_no_fast_loop`), hostile call patterns for the streaming decoder, and the three sequence loops compared with each other.
+- **Mutation-derived tests** pin corners a mutant exposed that the goldens do not reach: `dmut_test.zig`, `dopen_test.zig`, `dopen2_test.zig` (decoder), `emut_test.zig`, `emut2_test.zig`, `cdict_open_test.zig` (encoder and dictionary loading). Their expectations are taken from libzstd or the RFC.
+- **No-panic sweep**: `sweep_dec_test.zig` and `sweep_enc_test.zig` hold regression tests that name their findings; caller-supplied sequences, stream buffers, dictionaries and low-level trainer calls end in an error or a result, never a panic. What stays a caller contract is in *Limits and refusals*.
+- **Fuzz**: `fuzz_test.zig`, the deterministic driver `ZSTD_FUZZ=<runs>[,<first seed>]` (`ZSTD_FUZZ_ONLY=<name>` picks a target) over six targets: `zstd-compress`, `zstd-stream`, `zstd-decode`, `zstd-decode-dict`, `zstd-decode-stream`, `zstd-seekable`. Each target checks the drawn bytes and then a seed from its own corpus with up to three octets changed (uniformly random bytes almost never form a valid frame); the seeds also run in every ordinary test run. Verdicts come from the driver, never from `zig build --fuzz`.
+- **Live oracle**: `tools/interop.zig` drives libzstd 1.5.7 itself over a pipe on inputs, parameters and schedules generated from a seed: one-shot compression (levels from −1000 to 22, checksum, a random subset of the advanced parameters, a loaded or prefix dictionary), streaming on random continue/flush/end schedules, valid and damaged frames through both decoders, and dictionary training. It lists one GAP: damaged frames with a dictionary, where both sides refuse but libzstd's prefetching loop (`ddictIsCold`) trips another check first.
+- **Portability**: `check-portable` is compile-only. Beyond it the test suite is executed under qemu (`zig build test-zstd -Dtarget=<t> -Doptimize=ReleaseSafe`) on `x86-linux-musl`, `arm-linux-musleabihf` and `s390x-linux-musl` (64-bit big-endian, to separate the two axes `.linux32` conflates) in full, and on `mips-linux-musl` with `-Dcpu=baseline+mips32+soft_float` (`.linux32` itself) with `mt_test` skipped and `context_test` / `stream_test` trimmed, because `qemu-mips` trips its own page-tracking assertion on their allocation churn. A differential run of libzstd itself (`tools/zref.c` built with `zig cc` for x86-64, i386 and mips) shows its output does not depend on word size or byte order for the corpus's inputs; this module compiled for i386 matches libzstd's i386 build; and a large input at levels 5, 17 and 19 differs between little- and big-endian libzstd exactly where the pre-splitter's cut moves (the decision under *Portability*).
+- **Constant time**: n/a, compression only (the card's Hardening line records the keyword review).
+- **Mutation**: the whole-module run (the decoder, then the encoder in groups) ended with open ids by decision; they are not a defect claim. They are worked down in batches of about 20 ids, one schemata build per batch, each batch updating the card's counts; later changes are covered by delta mutation of the changed lines, never a whole-module rerun. Not mutated by decision: `dict_builder.zig`, `zdict.zig`, `zstdmt.zig`, `seekable.zig`, `seqapi.zig`, `huf_asm.zig`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Anchoring
 
@@ -2076,7 +2091,7 @@ inputs, and the two LDM table mutations crash within a minute. None
 survives; a mutation of the correction's back-off only changes how often it
 runs, which no output can show.
 
-**Streaming** (2026-09-23) has its own goldens: `src/testdata/
+**Streaming** has its own goldens: `src/testdata/
 stream_goldens.zig` holds, for each of 62 `corpus.stream_cases` (a corpus
 input and a call schedule) × its levels (-5, -1 and 1–3 for 31 cases, 4–10
 for 7, 11–22 for 6, one level each for the 10 found by search, and the 8
@@ -2093,7 +2108,7 @@ extDict and was blind: with a window of 128 KB or less a full block reaches
 back exactly one window, the extDict is out of reach and the plain variant
 runs), and for `x` cases a nonzero correction count.
 
-**Stable buffers and `StreamWriter`** (Z1, 2026-09-26): 13 more
+**Stable buffers and `StreamWriter`** (Z1): 13 more
 `corpus.stream_cases` (78 rows) with `stableInBuffer`/`stableOutBuffer`
 through `tools/zstream.c`, which keeps libzstd's contract (one input buffer
 grown by each token, `pos` kept; one output buffer never drained, exit 9
@@ -2122,7 +2137,7 @@ refusal -- and 1 whose code went (`StreamWriter` sent `finish` as
 `continue` plus an empty `end` once anything had been written; the
 one-block scratch makes one `end` the same bytes).
 
-**Any room** (Z1d, 2026-09-26): libzstd's capacity checks in the frame
+**Any room** (Z1d): libzstd's capacity checks in the frame
 path, anchored at their edges. For 13 cases (plain, flushed,
 `targetCBlockSize`, `maxBlockSize`, the block splitter at 16 and 19, a
 stable input, an incompressible and an all-zero input, a 7-byte and an
@@ -2151,7 +2166,7 @@ reach it, and no case does) -- and 3 guards with no case found: a
 block-splitter partition, and a sub-block or its RLE literals, starting
 within 2 or 3 bytes of the end.
 
-**One-shot into any room** (Z29, 2026-09-28): 33 golden rows
+**One-shot into any room** (Z29): 33 golden rows
 (`corpus.room_cases`, `testdata/room_goldens.zig`) -- tiny, one-block and
 multi-block inputs at every level family, raw and RLE blocks, sub-blocks,
 both splitters, 4 KB blocks, a magicless frame without its size,
@@ -2262,7 +2277,7 @@ finder), 13 (`btlazy2`) and 16 (`btopt`, 36 min), identical to plain `zref`
 in ReleaseSafe, where an index overflow would have trapped.
 Those runs are not stored; the oracle is, and re-runs them on any input.
 
-**Decoder (2026-09-23).** The contract is correctness (see *Decoder*), so
+**Decoder.** The contract is correctness (see *Decoder*), so
 the anchor is libzstd's own decoder rather than digests: every golden and
 streaming frame above is decoded back to its input in the test suite, and
 off-line, through `tools/zdec.c`, 13 600 random valid frames from libzstd's
@@ -2305,7 +2320,7 @@ as libzstd does; a header test pins it now.) The rest survive:
 | Huffman fast-loop and X2 tail limits (`p_end - p > 3`, `op[3] >= oend`, `dtLog <= 11`, X2 level-2 fill rounding), `HUF_selectDecoder`'s weighting, raw literals read in place vs copied, `total_bits >= 31` reload, last-literals bound, the checksum computed when ignored, the frame-size precheck | equivalent: each changes only which of two equal paths runs |
 | 4 streams with exactly 6 literals refused (X1 and X2); an RLE table of the largest code refused; `nbSeq`'s 3-byte form off by one either way, or taken for `0xFE` | covered since 2026-09-26 by frames no encoder writes, built byte by byte in `decoder_test.zig` ("frames no encoder writes"): 4 one-byte Huffman streams of 2, 2, 2 and 0 symbols (X2 through a treeless block after one whose literals chose it), one sequence with RLE literal-length code 35 or match-length code 52, and 0x7EFF / 0x7F00 / 0x7F01 sequences of 1 literal and a 3-byte repeat match. libzstd decodes each (one-shot and both streamed plans of `zdec`); the test pins each frame's FNV-1a and libzstd's output. All 6 mutations killed |
 
-**Decoder fuzzing** (Z15, 2026-09-27). `fuzz_test.zig` has three decoder
+**Decoder fuzzing** (Z15). `fuzz_test.zig` has three decoder
 targets after libzstd's `tests/fuzz/`: arbitrary bytes one-shot
 (`simple_decompress`); through `DecompressStream` (`stream_decompress`),
 fed 1, 13, 4096 bytes or all at once into 7-, 997- or 16 384-byte output
@@ -2326,7 +2341,7 @@ goldens) inside a 300-second window and reported HANG — so the run was
 The sweep now builds only the harnesses (one `-Dtest-filter` per fuzz
 test), and `fuzz-sweep.sh zstd` works (2000/harness: 11 644 runs, 38 s).
 
-**Seekable format** (Z23, 2026-09-27): `testdata/seekable_goldens.zig`,
+**Seekable format** (Z23): `testdata/seekable_goldens.zig`,
 26 rows from `tools/gen-seekable-goldens.sh` (libzstd's
 `contrib/seekable_format` through `tools/zseekable.c`): 13 corpus cases,
 levels −5…19, with and without frame checksums, frames of 1 byte to the
@@ -2365,7 +2380,7 @@ once (three of them as hangs the tests cannot pass); the two survivors were
 gaps — `offsetToFrameIndex` past the end and a read starting past the end
 were never asked — and are now pinned in `readBack`; 14/14.
 
-**Streaming decoder (Z2b, 2026-09-23).** `dstream_test.zig` replays
+**Streaming decoder (Z2b).** `dstream_test.zig` replays
 libzstd's `ZSTD_decompressStream` call by call on the same frames — return
 hints (header in pieces, the next block header counted, the checksum read
 only after the output is flushed), how much input each call consumes, the
@@ -2390,7 +2405,7 @@ decoded) — all equivalent; and the literal-placement limit off by one
 (`+ 32` → `+ 33`), reachable only on damaged input, not found in 18 680
 damaged frames.
 
-**Advanced parameters** (2026-09-24) have their own goldens:
+**Advanced parameters** have their own goldens:
 `src/testdata/param_goldens.zig` holds, for each of 37 `corpus.param_cases`
 (a corpus input, a `name=value` list of libzstd parameters, levels), the
 length and SHA-256 of the frame `ZSTD_compress2` emits with the same
@@ -2415,7 +2430,7 @@ streaming decoder's single-pass shortcut sizing a magicless frame as a
 zstd1 one (it then finds no frame and decodes through the stream path, to
 the same bytes).
 
-**Context reuse** (2026-09-24) has no goldens of its own: libzstd gives a
+**Context reuse** has no goldens of its own: libzstd gives a
 reused context the bytes of a fresh one (measured, see *Contexts*), so the
 golden, parameter and stream goldens all run through one reused context
 each, and `context_test.zig` checks the policy and the sizes. 12 mutations
@@ -2435,7 +2450,7 @@ salt permutes rows and tags), and the stream's output buffer one byte
 short of libzstd's `compressBound(block) + 1` (the bound leaves 512 bytes
 over a block and its header, so the room never decides).
 
-**Dictionaries** (D0, 2026-09-24) have their own goldens:
+**Dictionaries** (D0) have their own goldens:
 `src/testdata/cdict_goldens.zig`, 326 frames and streams over 74
 `corpus.dict_cases` (every level −5…22 on the copy, load, prefix,
 `compressUsingDict` and reload paths; content types; IDs of 0–4 bytes;
@@ -2468,7 +2483,7 @@ prefix larger than the window within one small block, the post-splitter's
 exact power of two (the parameters differ, the frames do not on the one
 case), and the tagged-table cap at 2^24 (needs a 16 MB dictionary).
 
-**Attached, the optimal parsers** (D3, 2026-09-24): 118 more rows in
+**Attached, the optimal parsers** (D3): 118 more rows in
 `cdict_goldens.zig`, 26 cases in `corpus.dict_cases_attach_opt` (every
 optimal level on small inputs, `.cdict`, `.load`, `compressUsingCDict`
 and a full dictionary as raw; both sides of the 8 KB and 32 KB cutoffs;
@@ -2498,7 +2513,7 @@ past the CDict's end). **LDM entries from a raw dictionary**, D0's
 uncovered mutant, are now caught by `prefix-ldm-beyond-tables` (a
 dictionary its tables reach only the end of).
 
-**Attach for the lazy family** (D2, 2026-09-24): 141 more rows over 46
+**Attach for the lazy family** (D2): 141 more rows over 46
 `corpus.dict_cases_attach_lazy` cases (one-shot at the 32 KB cutoff and a
 byte above it, `.load` / `.cdict` / `compressUsingCDict`, unknown-size
 streams with flushes, a wrapping buffer and a size hint that sizes the
@@ -2526,7 +2541,7 @@ for `>` on the best length (a zero-length candidate re-pricing the
 offset; one random real-text input caught it, no generator input in
 29 000 tried).
 
-**Multithreading** (Z9a, 2026-09-25): `testdata/mt_goldens.zig`, 57 rows
+**Multithreading** (Z9a): `testdata/mt_goldens.zig`, 57 rows
 over 29 `corpus.mt_cases` (one-shot and streamed, 512 KB jobs over 1–3 MB
 inputs, every strategy family, every overlap from none to a window, the
 round buffer wrapping, LDM across jobs and its reach into a raw prefix,
@@ -2565,7 +2580,7 @@ in flight than threads, which could overwrite a queued job; the
 round-buffer in-use check skipped for one job too many, which could
 overwrite a running job's input).
 
-**`rsyncable`** (Z9b, 2026-09-25): 14 more `mt_cases` (32 rows) with
+**`rsyncable`** (Z9b): 14 more `mt_cases` (32 rows) with
 `rsyncable=1`, most on `rsync_marks` inputs -- words with a 32-byte
 trigger whose rolling hash has 30 low bits set placed at chosen offsets,
 and every other window that would hit a 19-bit mask edited away -- so the
@@ -2590,7 +2605,7 @@ equivalent: the "too little to hash" return (unreachable, see
 read); the missing `break` after a hit (the loop bound is the new
 `to_load`, so it ends anyway).
 
-**Level changes** (Z24, 2026-09-28): 8 more `mt_cases` whose schedules
+**Level changes** (Z24): 8 more `mt_cases` whose schedules
 change the level (`L#`, which `zstream.c` sends as
 `ZSTD_CCtx_setParameter` and `stream_test.zig` as `setLevel`; a schedule
 may now go on after `e`, into the next frame): after a completed flush,
@@ -2607,7 +2622,7 @@ for an unknown size differ outside the binary tree's equivalence -- level
 equivalent under a 2 MB window). Equivalent, not run: clearing the mark
 after the hand-over (handing over again gives the same parameters).
 
-**Decoder memory, `max_block_size`, `copyFrom`** (Z25, 2026-09-28): the
+**Decoder memory, `max_block_size`, `copyFrom`** (Z25): the
 estimates, static workspaces and `max_block_size` are pinned as *Decoder*
 describes (`dctx_test.zig`, `testdata/mbs_kats.zig`). Mutation sweep
 (mutant schemata, 46 mutants of `decompress.zig`, `dstream.zig` and
@@ -2629,7 +2644,7 @@ equivalent: the window raised to 1 KB in `estimateSizeFromFrame` -- a
 header declares less only for a single-segment frame, whose window is its
 content size, and the ring is capped at the content size either way.
 
-**Buffer-less compression and copies** (Z25, 2026-09-28):
+**Buffer-less compression and copies** (Z25):
 `testdata/copy_goldens.zig`, 37 call plans of `tools/zcopy.c` (recipe
 `tools/gen-copy-goldens.sh`), each a context begun one of the four ways,
 copied twice into one new context (each copy compressing the input in 1-3
@@ -2670,7 +2685,7 @@ one-shot window shrinks to the input, and a `begin` resolves it as the copy
 would) and the overflow-correction count (a context just begun has made
 none).
 
-**Shared thread pool** (Z25, 2026-09-28) has no goldens of its own: the
+**Shared thread pool** (Z25) has no goldens of its own: the
 bytes do not depend on the pool, so `mt_test.zig` runs every
 multithreaded golden row again on shared pools -- 2 threads for 3 workers,
 8 threads for 1 -- and on one pool of 3 threads that three threads post to
@@ -2695,7 +2710,7 @@ job in than there are threads (it overwrites a slot only if no worker read
 it yet), the posting lock, the atomics' orderings and the futex wake
 counts.
 
-**Parameter queries** (Z25, 2026-09-28): mutation sweep, 12 mutants of
+**Parameter queries** (Z25): mutation sweep, 12 mutants of
 `clampCParams` (each field left unclamped, compared unsigned),
 `adjustCParams` (no clamp, a size of 0 as known) and `dictAndWindowLog`'s
 wrapping sums: 11 caught by the 100 000 answers above and the clamping
@@ -2705,7 +2720,7 @@ agree, the wrapped 0 included. `chain_log_max`'s 32-bit value is not
 testable on the 64-bit test host (`check-portable` compiles 32-bit
 targets without running them).
 
-**Multithreaded optimizers** (Z9b, 2026-09-25): `dict_golden_test.zig`
+**Multithreaded optimizers** (Z9b): `dict_golden_test.zig`
 runs every optimizer row of the finished-dictionary goldens with 2, 3 and
 8 threads: libzstd's single-threaded dictionary, k and d each time; a
 unit test compares 0/2/3/4/8/64 threads against one with a scorer that
@@ -2732,7 +2747,7 @@ slots are idle with no result, so they compare as nothing until the
 count is back under the new one, and the reposted candidates follow them
 in grid order).
 
-**Sequences** (Z10, 2026-09-25): `testdata/seq_goldens.zig`, 172 rows
+**Sequences** (Z10): `testdata/seq_goldens.zig`, 172 rows
 over 118 `corpus.seq_cases` through `tools/zseq.c` — `generateSequences`
 over every strategy family, the post-splitter, LDM, a dictionary and its
 refusals; `mergeBlockDelimiters`; `compressSequences` with and without
@@ -2787,7 +2802,7 @@ literals). (A first hunt driver rejected `jobSize` on both sides and
 compared stale files; the finds above were each checked by hand against
 `zref`.)
 
-**Constructed boundaries** (Z25, 2026-09-28). The compressor's
+**Constructed boundaries** (Z25). The compressor's
 reachable boundaries that the seed searches above never hit got a case
 each, built rather than searched for: the input bytes, the parameters,
 and -- where statistics decide -- the exact sequences, handed over through
@@ -2850,7 +2865,7 @@ for 65 536, so a repcode after it is reported against the wrong history
 (offset 1 rather than 1000 in `ll-65536`), and the sequences no longer
 rebuild their input; `seq_test.zig` skips that check for this case.
 
-**Live oracle (2026-10-26).** `tools/interop.zig` (`zig build
+**Live oracle.** `tools/interop.zig` (`zig build
 interop-zstd`) re-takes the anchor against libzstd 1.5.7 itself: it builds
 the pinned checkout's `lib/` with `zig cc` (`-DZSTD_MULTITHREAD`) into
 `tools/c_oracle/zoracle.c`, one process answering over a pipe, and compares
@@ -2880,272 +2895,23 @@ libzstd reads 0 as "default" for the cParams, LDM, `targetCBlockSize` and
 
 ## Speed
 
-Speed changes no decision, so the goldens pin them like everything else.
-Measured against libzstd 1.5.7 (built `-O3` by its Makefile) on an
-i7-7920HQ, both compressing the same input in-process on a reused context,
-min of 3 runs on a pinned core, user-mode cycles and instructions
-(`perf stat`), ReleaseFast; inputs a 3.4 MB CSV, 12 MB of Zig source and
-12 MB of ELF binaries:
+Speed changes no decision, so the goldens pin it like everything else. `zig build bench-zstd` (`tools/bench.zig`, ReleaseFast; `ZSTD_BENCH_ROUNDS`, `ZSTD_BENCH_CORPUS`) times this module against the system libzstd 1.5.7 on four Silesia files (dickens, xml, x-ray, ooffice): compression at levels 1, 3 and 19 and decoding of the level-3 and level-19 frames, 20 workloads, one reused context per side, the sides alternating, the best of the rounds kept. A compressed size that differs from libzstd's by a byte fails the run. The card's Performance line carries the figures and is authoritative; this section says what the code does for them and where it is known to be slower. Other measurements (small frames, dictionaries, multithreading) were made with `perf stat` user-mode cycles and instructions on pinned cores, every frame byte-identical to libzstd's before it was timed.
 
-| | one-shot, levels −5…19 | streaming (128 KB chunks, unknown size), −5…12 |
-|---|---|---|
-| cycles | 0.87–1.15× (1.03–1.07× at 1–7 on a quieter run) | 0.99–1.10× |
-| instructions | 0.95–1.15× | 0.97–1.12× |
+What the speed rests on, all of it byte-neutral:
 
-Re-measured one-shot on 2026-09-26, after dictionaries, multithreading,
-the sequence API and Z1d had touched the match finders and the frame path
-(same method, same kinds of input, levels −5, 1, 3, 5, 7, 9, 12, 16, 19):
-cycles 0.77–1.13×, instructions 0.94–1.14× -- unchanged.
+- **Row match finder prefetch** (`ZSTD_row_prefetch`): the hash cache computes a hash 8 positions ahead and prefetches that hash's hash-table and tag-table rows; each candidate's bytes are prefetched as it is collected. The row search is specialised on the row log at compile time. At levels 5–12 this was memory latency, not instructions. `fast` and `dfast` prefetch 64 and 128 bytes ahead when their step grows, as libzstd does.
+- **The window's base in a register** (`match.Base`, libzstd's `window.base`): the match finders read the input as `base + index` through a local copy instead of `MatchState.src` / `src_base`, which the compiler had to reload after every table store (a store through a `u32` slice may alias them). Safe build modes still bounds-check every read.
+- **Repcode swaps without `std.mem.swap`**: swapping two hot `u32` locals through pointers made LLVM keep them in memory and reassemble them byte by byte; a plain temporary fixes it. (`a, b = .{ b, a }` is not a swap on Zig 0.16: the tuple is built in place, so `b` receives the new `a`; the goldens catch it. Not re-checked on 0.17.)
+- **Table clearing without `compiler_rt.memset`** (`fill.zig`): Zig 0.16 without libc stores byte by byte, and every block clears a few KB of tables (Huffman nodes, histograms, rank tables) and the decoder's RLE blocks expand into memory. `fill.zig` clears them in 32-byte stores, and the FSE spread writes 8 bytes at a time (libzstd's `FSE_buildCTable_wksp` / `FSE_buildDTable`). Per call rather than per block, Zig 0.16 lowers `var x: ?T = null` for a large `T`, and any `.{}` whose field defaults include an `undefined` or a zero array, to a `memset` of the whole value (checked in the generated code; an explicit `.{ .field = undefined }` is not cleared): `Compressor.compress` therefore keeps its local `CDict` slot in `frame.LocalCDict` (set `undefined`), and `huf.compressWeights` leaves its FSE table `undefined` (`build` sets every field it reads). Whether `fill.zig` still earns its place on 0.17 is a backlog item.
+- **Dictionary-side match lengths** are counted 8 bytes at a time like `count` (`match.countRuns`, shared by `countDict`, `countInDict`, `Base.count2Segments`, `lazy.countDms`, `countAcrossDict`, `opt.count2SegmentsDms`), reading no further than `ZSTD_count` does; `fillHashTableFor` and `fillDoubleHashTableFor` are specialised at compile time on `min_match`, `dtlm` and `tfp` and read through a `match.Base`; the copy path's tagged-table shift (`copyCDictTable`) is vectorised; `btultra2`'s first pass (`ZSTD_initStats_ultra`) moves the window's base as libzstd does instead of clearing the hash, tree and 3-byte tables on every frame whose first block is over 8 bytes; the decoder points its context at a `DDict`'s entropy tables instead of copying them each frame (*Decoder*, "Dictionaries").
+- **The decoder's sequence loops** (*Decoder*, "Sequence loops"): cursors in locals, a prefetching loop for blocks with long offsets, and x86-64 assembly for the sequence loop and the four-stream Huffman loops.
 
-Before Z11 (2026-09-24) the same measurement gave 1.2–1.4× at levels
-−5…3 and 1.3–2.0× at 5–12. What closed it:
+Where it is slower than libzstd, apart from the backlog's P1 item:
 
-- **Row match finder prefetch** (`ZSTD_row_prefetch`): the hash cache
-  computes a hash 8 positions ahead, and now also prefetches that hash's
-  hash-table and tag-table rows; each candidate's bytes are prefetched as
-  it is collected. The row search is specialised on the row log at
-  compile time. Levels 5–12 went from 1.3–2.0× to about 1.05×, with *more*
-  instructions — it was memory latency.
-- **The window's base in a register** (`match.Base`, libzstd's
-  `window.base`): the match finders read the input as `base + index`
-  through a local copy instead of `MatchState.src` / `src_base`, which the
-  compiler had to reload after every table store (a store through a `u32`
-  slice may alias them). The safe build modes still bounds-check every
-  read. −15–20 % instructions at the fast levels.
-- **Repcode swaps without `std.mem.swap`**: swapping two hot `u32` locals
-  through pointers made LLVM keep them in memory and reassemble them byte
-  by byte — 16 % of all instructions at level 1. A plain temporary fixes
-  it. (`a, b = .{ b, a }` is not a swap in Zig 0.16 (not re-checked on 0.17): the tuple is built in
-  place, so `b` receives the new `a`; the goldens caught it.)
-- `fast`/`dfast` prefetch 64 and 128 bytes ahead when their step grows, as
-  libzstd does.
-
-**Multithreaded** (Z9a; wall-clock and CPU seconds, 33.5 MB of Zig
-source and a mixed corpus, one-shot, ReleaseFast, 8 cores, not pinned):
-level 3, 1 worker 0.17–0.21 s wall (libzstd 0.15–0.21), 4 workers 0.09 s
-(libzstd 0.09–0.10); level 9, 0.57–0.63 (0.56–0.59) and 0.36–0.39
-(0.37–0.38); level 19 with 4 MB jobs, 1 worker 14.2 s (14.4), 4 workers
-5.1 s wall, 16.7 s CPU (4.8, 15.4). At level 19's default job size (32 MB)
-that input is one job and 4 workers gain nothing, as in libzstd.
-
-**Small frames** (Z21, 2026-09-26; the 20 MB tar of Zig's `lib/` cut
-into frames, level 3, one reused context each way, compress then decode,
-cycles, `-mcpu=native`): libzstd's glibc `memset` is vectorised, Zig 0.16's
-`compiler_rt.memset` without libc stores byte by byte (0.17.0's is vectorised, `compiler_rt.zig` `fastMemset`; these figures are 0.16), and every block
-clears a few KB of tables. `fill.zig` clears them, and the decoder's RLE
-blocks and literals, in 32-byte stores, and the FSE spread writes 8 bytes
-at a time (libzstd's `FSE_buildCTable_wksp` / `FSE_buildDTable`): 1 KB
-frames went from 1.50× to 1.27× libzstd's cycles, 4 KB from 1.33× to
-1.21× (64 KB: 1.13×, unchanged); decoding an RLE-heavy input −20 %. What is left at
-1 KB is the table building itself (`huf.buildCTable`, `fse.CTable.build`,
-`huf_dec.readDTableX1`). `fill.zig` goes when Zig's `memset` is
-vectorised (upstream, after 0.16 -- **triggered in 0.17.0**; re-measure, then decide).
-
-Z32 (2026-09-28) found more of the same, per call rather than per block:
-Zig 0.16 (codegen, not re-checked on 0.17) lowers `var x: ?T = null` for a large `T`, and any `.{}` whose
-field defaults include an `undefined` or a zero array, to a `memset` of the
-whole value -- checked in the generated code; an explicit
-`.{ .field = undefined }` is not cleared. `Compressor.compress` cleared its
-5.8 KB local-`CDict` slot on every call (`frame.LocalCDict` now), `begin`
-the `btopt` frequency tables (1.5 KB; `rescaleFreqs` writes them on the
-first block, as libzstd's), and every Huffman table header its FSE table
-(1.4 KB). With Z19's method (below: `oui.csv` and `validusage.json`
-records, one reused context, `Compressor.compress` against
-`ZSTD_compress2`, no dictionary), port ÷ libzstd cycles / instructions,
-before → after, ranges over the two inputs:
-
-| level | 100 B | 1 KB |
-|---|---|---|
-| 1 | 1.63–1.71 / 1.21–1.28 → 1.03–1.06 / 0.89–0.91 | 1.38–1.44 / 1.07–1.10 → 1.08–1.17 / 0.93 |
-| 3 | 1.65–1.78 / 1.19–1.24 → 1.06–1.11 / 0.88–0.90 | 1.44–1.55 / 1.03–1.06 → 1.15–1.33 / 0.91 |
-| 19 | 1.41–1.54 / 1.17–1.24 → 1.20–1.37 / 1.05–1.10 | 0.99–1.10 / 0.95–1.02 → 1.00–1.07 / 0.94–1.01 |
-
-1 MB records at levels 1, 3 and 19: the same instructions before and after
-(±0.1 %).
-
-What is left above 1.0×: a few percent of instructions in `fast`'s search
-loop and `btopt`'s (levels 13–16, 1.13–1.15× instructions at equal
-cycles). The entropy stage (literals, sequences) already costs what
-libzstd's does.
-
-**Dictionaries** (Z19, 2026-09-28, the same i7-7920HQ). Against libzstd
-1.5.7 as a static library built by its Makefile (`make libzstd.a-mt`:
-`-O3`, BMI2 picked at run time, the Huffman `asm`, gcc 15), both sides in-process on one reused context, the port
-`-OReleaseFast` for `-mcpu=native` and for baseline x86-64, allocator
-`std.heap.smp_allocator` (libzstd: glibc `malloc`). Inputs: `oui.csv` (the
-IEEE OUI registry, 3.4 MB) and the first 4 MB of Vulkan's `validusage.json`,
-each cut in half: the first half trains the dictionaries, the second is
-cut into records of 100 B, 1 KB, 4 KB and 16 KB. Dictionaries: raw
-content (the training half's last 110 KB) and trained (`ZDICT_trainFromBuffer`
-on 1 KB samples, 110 KB capacity: 110 KB for the CSV, 45 KB for the JSON).
-Each case runs as many records as take libzstd about 0.2 s, three passes
-(decoding: all records, passes for about 0.5 s);
-the metric is `perf stat` user-mode cycles and instructions of the whole
-process, min of 3 runs, pinned to one core (other sessions' jobs held 1–4
-of the machine's 4 build slots meanwhile). Every compressed frame of every
-case was byte-identical to libzstd's before it was timed (all 256
-compression cases, both builds), every decoded record equal to its
-input, every trained dictionary equal to libzstd's.
-
-Compression, port ÷ libzstd, cycles / instructions, native build; each
-cell the range over the two inputs and the two dictionaries (Z19's
-numbers; the forced copy and `.raw` after Z32 are under **Z32, clearing**
-below):
-
-| call, level | 100 B | 1 KB | 4 KB | 16 KB |
-|---|---|---|---|---|
-| `CDict` reused (`compressUsingCDict`), 1 † | 1.01–1.15 / 0.98–1.21 | 1.07–1.15 / 1.00–1.09 | 1.07–1.19 / 1.00–1.04 | 0.93–1.00 / 1.02–1.08 |
-| 3 † | 0.72–1.18 / 1.01–1.24 | 0.83–1.15 / 1.04–1.19 | 1.07–1.12 / 1.05–1.14 | 0.85–1.10 / 1.04–1.13 |
-| 9 † | 1.06–1.35 / 1.04–1.09 | 0.78–1.61 / 1.06–1.09 | 0.93–1.73 / 1.06–1.09 | 0.81–1.14 / 1.05–1.07 |
-| 19 † | 1.05–1.15 / 1.05–1.12 | 0.98–1.07 / 1.01–1.04 | 0.93–1.31 / 0.98–1.04 | 0.70–1.02 / 0.96–1.02 |
-| `CDict` forced copy (`.cdict`, `force_attach_dict = .copy`), 1 | 2.17–2.91 / 1.74–2.25 | 1.47–2.33 / 1.31–1.61 | 1.23–1.32 / 1.17–1.28 | 1.06–1.07 / 1.08–1.10 |
-| 3 | 2.06–2.17 / 2.17–2.25 | 1.81–1.92 / 1.87–2.11 | 1.35–1.66 / 1.57–1.88 | 1.01–1.34 / 1.27–1.50 |
-| 9 † | 1.23–1.29 / 2.53–2.74 | 1.11–1.17 / 1.34–1.43 | 0.96–1.24 / 1.21–1.26 | 1.00–1.09 / 1.17–1.19 |
-| 19 | 2.42–3.04 / 3.92–7.32 | 1.32–1.79 / 1.20–1.56 | 1.11–1.30 / 1.00–1.16 | 1.02–1.20 / 0.96–1.05 |
-| bytes each call (`compressUsingDict`), 1 † | 0.85–0.98 / 0.76–0.79 | 0.75–0.97 / 0.79–0.81 | 0.87–0.92 / 0.82–0.87 | 0.57–0.99 / 0.86–0.96 |
-| 3 | 0.95–1.11 / 1.14–1.18 | 0.95–1.09 / 1.13–1.17 | 0.96–1.07 / 1.12–1.17 | 0.96–1.03 / 1.08–1.14 |
-| 9 † | 0.98–1.27 / 1.05–1.14 | 0.73–1.21 / 1.06–1.15 | 1.03–1.38 / 1.08–1.15 | 0.71–1.09 / 1.10–1.15 |
-| 19 | 0.99–1.02 / 1.25–1.27 | 1.01–1.09 / 1.22–1.25 | 0.98–1.03 / 1.11–1.22 | 0.99–1.04 / 1.00–1.17 |
-| `.raw` each call (a `CDict` per call), 1 † | 0.92–1.04 / 0.85–0.88 | 1.04–1.07 / 0.86–0.88 | 1.05–1.11 / 0.87–0.89 | 0.98–1.03 / 0.90–0.95 |
-| 3 † | 1.17–1.84 / 0.92–1.27 | 1.03–1.86 / 0.92–1.27 | 0.87–1.89 / 0.93–1.26 | 0.85–1.27 / 0.93–1.23 |
-| 9 † | 1.44–2.12 / 1.41–1.97 | 1.40–2.35 / 1.37–1.84 | 0.95–2.09 / 1.31–1.64 | 1.35–1.67 / 1.19–1.38 |
-| 19 | 1.04–1.27 / 1.29–1.39 | 1.04–1.19 / 1.28–1.33 | 1.04–1.11 / 1.19–1.29 | 1.02–1.50 / 1.03–1.22 |
-
-† Re-measured 2026-09-28 after Z32's word-wise dictionary counts and
-specialised table fills, with the same method on a busier machine (2–4 of
-the build slots taken by other sessions' jobs): cycles then varied by up to
-±40 % between runs at equal instructions, so compare the instruction
-ratios. Before, in the same runs (instructions): reused `CDict` at level 9
-1.14–1.43×, forced copy at 9 1.23–2.81×, bytes each call at 1 1.20–1.55×,
-`.raw` at 1, 3 and 9 1.29–1.47×, 1.30–1.67× and 1.27–1.97×. Every frame of
-every re-measured case was byte-identical to libzstd's and to the build
-before.
-
-libzstd's calls: `ZSTD_compress_usingCDict` on a `ZSTD_createCDict`;
-`ZSTD_CCtx_refCDict` with `ZSTD_c_forceAttachDict = ZSTD_dictForceCopy`
-and `ZSTD_compress2`; `ZSTD_compress_usingDict`; `ZSTD_CCtx_loadDictionary`
-before every `ZSTD_compress2` (libzstd keeps a loaded dictionary's CDict
-for the frames after, so this is what `Options.dictionary = .raw`, "for
-one call", matches; a `CDict` or a `Stream` digests it once here). The
-reused `CDict` is attached at every size but 16 KB at levels 1 and 19
-(`fast` and `btultra2` attach up to 8 KB), where it is copied. The
-baseline build takes a median 1.04× the native build's cycles (0.97–1.12×
-for 90 % of the cases), the BMI2 gap of Z22.
-
-Decompression, the frames of the reused-`CDict` case at levels 3 and 19,
-cycles (min of two runs of 3; the decoder's cycles varied up to ±30 %
-between runs at equal instructions) / instructions, ranges over inputs and
-levels:
-
-| call | 100 B | 1 KB | 4 KB | 16 KB |
-|---|---|---|---|---|
-| `DDict` reused, raw content | 0.88–1.07 / 0.90–1.03 | 1.18–1.22 / 1.14–1.15 | 0.98–1.13 / 1.15–1.19 | 1.03–1.10 / 1.19–1.21 |
-| `DDict` reused, trained | 0.58–1.09 / 1.00–1.03 | 0.90–1.14 / 1.21–1.26 | 1.05–1.13 / 1.23–1.26 | 0.95–1.20 / 1.20–1.25 |
-| bytes each call, raw content | 0.81–1.20 / 0.91–1.04 | 1.13–1.69 / 1.15–1.16 | 1.07–1.56 / 1.15–1.19 | 1.00–1.35 / 1.19–1.21 |
-| bytes each call, trained | 0.79–1.21 / 1.13–1.14 | 1.02–1.58 / 1.14–1.16 | 0.72–1.05 / 1.16–1.19 | 1.08–1.22 / 1.17–1.20 |
-
-(`ZSTD_decompress_usingDDict` on a `ZSTD_createDDict`,
-`ZSTD_decompress_usingDict`; `Decompressor` with `.ddict` or
-`.dictionary`.) The two trained rows are Z32's (2026-09-28, the same
-method, the base build measured alongside): the context now points at a
-`DDict`'s entropy tables instead of copying them per frame, and an
-undigested dictionary's tables are read straight into the context's.
-Against the build before, instructions (the cycles moved by up to ±30 %
-at equal instructions again) for the reused trained `DDict`: −51–54 % at
-100 B (cycles 0.24–0.33×; before 2.29–3.32 / 2.08–2.19 against libzstd),
-−15–20 % at 1 KB, −4–9 % at 4 KB, −1–3 % at 16 KB; bytes each call,
-trained: −3–6 %. Raw-content dictionaries and decoding without one: the
-same instructions (±0.03 %).
-
-Training, 1 KB samples of the training halves (1.7 MB and 2 MB), cycles
-port ÷ libzstd (CSV, JSON), wall seconds libzstd → port: `train`
-(`ZDICT_trainFromBuffer`) 1.20, 1.20 (0.20 → 0.26 s); `trainFastCover`
-k 1024 d 8 1.42, 1.15; `trainCover` k 1024 d 8 0.87, 1.10;
-`optimizeFastCover` default grid 1.28, 1.10 (4.5 → 5.7 s), with 4 threads
-on 4 cores 1.16, 1.09 (1.5 → 1.7 s); `optimizeCover` default grid 1.05,
-1.23 (29.5 → 29.6 s), with 4 threads 1.10, 1.13 (9.1 → 10.4 s). The
-profiles have the same shape as libzstd's (segment selection 50–83 %, the
-scoring's compression the rest). With 4 threads libzstd's dictionary
-equalled its single-threaded one on these inputs too.
-
-**Where the gaps are** (`perf record`, the worst cases):
-
-- ~~**Match lengths into the dictionary are counted a byte at a time.**~~
-  Fixed 2026-09-28 (Z32): every count whose match side is the dictionary
-  -- extDict (`MatchState.countDict`, `countInDict`,
-  `Base.count2Segments`) and attached (`lazy.countDms`, `match.zig`'s
-  `countAcrossDict`, `opt.count2SegmentsDms`) -- went through
-  `std.mem.indexOfDiff`, a byte loop, where libzstd's
-  `ZSTD_count_2segments` runs `ZSTD_count`'s 8-byte compare. They now
-  share `match.countRuns`, the port's `count` over two runs, reading no
-  further than `ZSTD_count` does. The hottest loop of an attached `CDict`
-  at level 9 (`lazy.rowFindBestMatchT`) was that byte compare; its
-  instructions went from 1.14–1.43× libzstd's to 1.04–1.09× (cycles
-  below).
-- ~~**`Compressor.compress` clears 5.8 KB byte by byte on every call**~~
-  (closed by Z32, below): `var local: ?CDict = null`
-  (`frame.Compressor.compressFrame`, and `root.Compressor.compressMt`)
-  became a `compiler_rt.memset` of the whole optional (Z21's non-vectorised
-  `memset`), with a dictionary or without: 24–29 % of the cycles for 100 B
-  records through `.cdict`, and without any dictionary 100 B records at
-  level 1 took 1.59× libzstd's cycles (`ZSTD_compress2`),
-  `compiler_rt.memset` 36 % of them.
-- ~~**The copy path clears the 3-byte hash table with `@memset`**~~ (closed
-  by Z32): `resetByCopyingCDict`; `ZSTD_resetCCtx_byCopyingCDict` uses
-  `memset` too, but glibc's: 52–60 % of the cycles at level 19 for 100 B
-  (libzstd 9 %), the 7× instructions. Also closed: the tagged tables' `>> 8`
-  (`copyCDictTable`) ran scalar where gcc vectorises libzstd's loop -- 2×
-  libzstd's cycles for 100 B at levels 1–3. Copying the untagged tables is
-  still `compiler_rt.memcpy` against glibc's `rep movsb` (below).
-- ~~**A new `CDict` clears its tables with `@memset`**~~ (closed by Z32):
-  `CDict.create`, the row tag table on load, half of the cycles of `.raw`
-  each call at level 9 (libzstd: `memset` 6.5 %). libzstd clears the same
-  (`ZSTD_reset_matchState` with `ZSTDcrp_makeClean`, the tag table again in
-  `ZSTD_loadDictionaryContent`); the port now clears through `fill.zig`.
-  The wall time stays above the cycles: `smp_allocator` maps a CDict's
-  tables fresh on every call (page faults, kernel time), where glibc reuses
-  the freed block.
-- ~~**`fillHashTableFor`**~~ Fixed 2026-09-28 (Z32): a dictionary loaded
-  into the context at levels 1–2 (`compressUsingDict`: 88–94 % of the time
-  on both sides) ran ~1.8× libzstd's `ZSTD_fillHashTableForCCtx`:
-  `min_match` was switched through a jump table at every position, the
-  window's base reloaded from the `MatchState` after each table store
-  (Z11's aliasing), and the tagged/`dtlm` choices were run-time. It and
-  `fillDoubleHashTableFor` are now specialised at compile time on
-  `min_match`, `dtlm` and `tfp` and read through a `match.Base`: 0.76–0.96×
-  libzstd's instructions for `compressUsingDict` at level 1, a
-  `CDict` per call 0.85–0.95× at level 1 and 0.92–1.27× at level 3 (was
-  1.29–1.67×).
-- ~~**The decoder copies a `DDict`'s entropy tables into the context for
-  every frame**~~ (27 KB, 64 % of the cycles for 100 B frames with a
-  trained dictionary): closed by Z32, the context points at them as
-  libzstd's `ZSTD_copyDDictParameters` does (the table above).
-
-None of these changes a byte. Closing them is Z32.
-
-**Z32, clearing** (2026-09-28): the three struck items above, measured as
-Z19 but with the raw-content dictionary only (the training half's last
-110 KB), min of 7 runs interleaved with libzstd, every frame byte-identical
-to libzstd's before it was timed. Port ÷ libzstd cycles / instructions,
-before → after, ranges over the two inputs:
-
-| call, level | 100 B | 1 KB |
-|---|---|---|
-| `CDict` forced copy, 1 | 2.12–2.37 / 1.71–1.84 → 0.95–0.96 / 0.84 | |
-| 3 | 2.04–2.11 / 2.16–2.18 → 0.96–0.98 / 0.70 | |
-| 9 | 1.29–1.30 / 2.54–2.77 → 1.22 / 2.36–2.57 | |
-| 19 | 2.92–3.09 / 5.57–6.47 → 1.21 / 2.32–2.47 | 1.42–1.64 / 1.36–1.56 → 1.08–1.10 / 1.16–1.20 |
-| `.raw` each call, 1 | 1.60 / 1.46–1.48 → 1.37–1.46 / 1.40–1.41 | 1.67 / 1.43–1.46 → 1.42–1.43 / 1.37–1.40 |
-| 3 | 1.66–1.74 / 1.36–1.37 → 1.26–1.27 / 1.13–1.14 | |
-| 9 | 1.66–1.78 / 1.42 → 1.08–1.14 / 1.04–1.05 | |
-| 19 | 1.06–1.08 / 1.29–1.31 → 1.01–1.02 / 1.25 | |
-
-What is left there: the forced copy at levels 9 and 19 is the tables'
-copy (`compiler_rt.memcpy.memcpyFast`, 79 % at level 9, against glibc's
-`rep movsb`, 72 %: the instructions, not the cycles) and, at 19, clearing
-the 512 KB 3-byte hash table in 32-byte stores against glibc's `rep stosb`;
-`.raw` at levels 1–2 is `fillHashTableFor` (above), the rest page faults.
-The no-dictionary numbers are in *Small frames* above.
+- **Without BMI2 in the build.** libzstd dispatches at run time, this module does not (Z22). Build for the CPU you run on (`-Dcpu=x86_64_v3` or `native`).
+- **Small frames and dictionaries.** At 1–4 KB per frame the rest of the gap is table building (`huf.buildCTable`, `fse.CTable.build`, `huf_dec.readDTableX1`), not clearing. A `CDict` forced onto the copy path (`force_attach_dict = .copy`) at levels 9 and 19 spends its time in the tables' copy (`compiler_rt.memcpy` against glibc's `rep movsb`) and, at 19, in clearing the 512 KB 3-byte hash table in 32-byte stores against `rep stosb`; a `CDict` made per call costs page faults because `smp_allocator` maps its tables fresh each time where glibc reuses the freed block. Cycles on a busy machine move by tens of percent at equal instructions, so compare instruction counts there.
+- **Multithreaded** compression was measured once (33.5 MB of Zig source, outside `bench-zstd`) at libzstd's wall time and a few percent over its CPU time at the same worker count; at level 19's default job size (32 MB) an input of that size is one job and workers gain nothing, as in libzstd.
+- **Dictionary training** was measured once at about 0.9–1.4× libzstd's cycles on 1 KB samples (the profile has libzstd's shape: segment selection dominates, the scoring's compression the rest).
 
 ## Portability
 
@@ -3153,8 +2919,8 @@ The no-dictionary numbers are in *Small frames* above.
 (`check-portable`'s vocabulary, `build.zig`'s `PortableTarget` -- see its
 doc comments before adding a target here). Not `.wasm32`: `zstdmt.zig`'s
 worker pool uses `std.Thread.spawn`, unavailable in `wasm32-wasi`'s
-single-threaded build (`std/Thread.zig`'s `@compileError`) -- an open
-question, not decided here (below).
+single-threaded build (`std/Thread.zig`'s `@compileError`) -- undecided,
+see *Backlog / deferred*.
 
 `.linux32` is `mips-linux-musl`, `mips32,soft_float` -- 32-bit **and**
 big-endian at once, libzstd's actual combination on real hardware (an
@@ -3172,8 +2938,7 @@ declares, not the wider i386/arm/s390x sweep a first read of libzstd's
   `current_max`, past which `ZSTD_window_correctOverflow`'s C also runs on
   a 32-bit build), the second is the advanced-parameter bound and the
   decoder's hard frame-header cap (`params.window_log_max`,
-  `decompress.window_log_max`). Both were a bare `31` / `3500 << 20`
-  (the 64-bit value only) and are now `if (@sizeOf(usize) == 4) ... else
+  `decompress.window_log_max`). Both are `if (@sizeOf(usize) == 4) ... else
   ...` -- libzstd's own `sizeof(size_t) == 4` check, with a Zig
   cross-compile's `usize` standing in for the C `size_t`. A dedicated test
   next to each pins the selected constant against the literal libzstd
@@ -3197,16 +2962,16 @@ declares, not the wider i386/arm/s390x sweep a first read of libzstd's
   libzstd's 64-bit-little-endian fast Huffman decode loop, falling back to
   the reference decoder elsewhere -- a speed selection between two
   implementations proven to agree, not a value difference. `huf_dec.zig`
-  already had the equivalent gate (`@sizeOf(usize) != 8 or
+  has the equivalent gate (`@sizeOf(usize) != 8 or
   builtin.cpu.arch.endian() != .little`, `initFastDStream` and its
-  callers) before Z12; nothing to change.
+  callers).
 
 **Big-endian: the pre-splitter's hash** (`zstd_preSplit.c`'s `hash2`,
 `MEM_read16` -- native order on the build host). `presplit.zig`'s `hash2`
-already read the two bytes as **explicitly little-endian**
-(`std.mem.readInt(u16, p[0..2], .little)`), not native order, before Z12
--- a deliberate choice (its existing comment) rather than an oversight.
-**Decision, made explicit here: keep it.** This module's byte-identical
+reads the two bytes as **explicitly little-endian**
+(`std.mem.readInt(u16, p[0..2], .little)`), not native order -- a
+deliberate choice (its comment) rather than an oversight. **The decision:
+keep it.** This module's byte-identical
 claim is against libzstd's ordinary little-endian builds (amd64/arm64,
 the mandatory `.linux64`, and every real-world zstd installation a
 consumer's frames need to interoperate with) -- matching *this* build's
@@ -3215,7 +2980,7 @@ frames a little-endian libzstd decodes fine (the format is endianness-
 agnostic) but whose *bytes* differ from what every other zstd
 implementation in existence writes for the same input and level, which is
 a worse portability property than a deliberately fixed byte order. Checked
-against a genuinely big-endian libzstd build (below): the two disagree
+against a genuinely big-endian libzstd build (*Verification*): the two disagree
 exactly where the pre-splitter's cut points move because of it, nowhere
 else. Everywhere else in this port already reads and writes explicitly
 `.little` or `.big` (`rg` over `src/*.zig` for `readInt`/`writeInt` with
@@ -3227,194 +2992,44 @@ regardless of native order, unlike libzstd's C (`ZSTD_NbCommonBytes`,
 `bits.h`), which branches on `MEM_isLittleEndian()` to get the same
 answer from a native-order read.
 
-**The real bug: the row match finder's tag-match mask** (`lazy.zig`'s
-`matchMask`, `ZSTD_row_getMatchMask`). Its vector compare
-(`tag_row[0..entries] == splat(tag)`) is bitcast straight to an integer
-mask, bit `i` meaning "slot `i` matched" -- the convention `rotr` and
-every caller (`headGrouped + ZSTD_VecMask_next(matches)`) depend on, and
-the one libzstd's own SIMD paths *and* its portable SWAR fallback both
-preserve on purpose: the fallback's comment literally says "big endian:
-reverse bits during extraction", doing extra work so a big-endian host's
-`MEM_readST`-native-order read still lands bit `i` on slot `i`. This
-port's `@bitCast(@Vector(entries, bool))` does not carry that guarantee.
-Measured directly (a standalone comparison of the identical vector
-compare + bitcast on `x86_64-linux` vs. `mips-linux-musl`, 16-, 32- and
-64-lane, matching the three row widths this function is ever
-instantiated at): the big-endian result is the little-endian one with
-**every bit reversed end to end**, not a byte swap. This is not a compile
-failure `check-portable` (compile-only, see *Anchoring* below) could ever
-catch -- it produces a *valid*, decodable frame, just not libzstd's bytes
--- and it was found by actually running the test suite under `qemu-mips`
-(below), where `context_test.zig`'s "indexing restarts near the index
-limit, with the same bytes" (level 7, `lazy`, which crosses the 16 KB row
-threshold) failed reproducibly while every other test passed. Fixed with
-`@bitReverse` on a big-endian target only, a no-op branch removed at
-comptime elsewhere, so `.linux64`/`.windows` emit the exact same code as
-before.
+**The row match finder's tag-match mask** (`lazy.zig`'s `matchMask`,
+`ZSTD_row_getMatchMask`). Its vector compare is bitcast to an integer mask,
+bit `i` meaning "slot `i` matched" -- the convention `rotr` and every caller
+(`headGrouped + ZSTD_VecMask_next(matches)`) depend on, and the one
+libzstd's SIMD paths and its portable SWAR fallback both preserve on purpose
+(the fallback reverses bits on big-endian). On Zig 0.16 the `@bitCast` of a
+`@Vector(entries, bool)` gave the mask bit-reversed end to end (not a byte
+swap) on a big-endian target: a valid, decodable frame, but not libzstd's
+bytes, so a `@bitReverse` undid it there. On 0.17 `@bitCast` puts lane 0 in
+bit 0 on every target (a comptime probe for `mips-linux-musl` and
+`x86_64-linux` agrees) and the fix-up is gone, as the code's comment warns
+it must be. A compile-only gate cannot see this class: it compiles cleanly
+and only writes other bytes.
 
-**Four more bugs `check-portable -Dportable-measure-all` actually
-found**, all now fixed:
+**Width assumptions.** `check-portable` is compile-only (`addTest`, never
+run, on every cross-compiled target) and catches what a width does to the
+types: a `usize` shifted by a bare `u6` (`std.math.Log2Int(usize)` is `u5` on
+32 bits; `literals.zig`'s `minLiteralsToCompress` and `minGain` use it), a
+64-bit atomic on a target without them (`ThreadPool`'s `posted` and `taken`
+are `std.atomic.Value(u32)`, like libzstd's plain `unsigned` job ids; a wrap
+needs four billion jobs in one compression, and `ThreadPool.slot` casts where
+an id meets the queue length), and an alignment bound a target's ABI makes
+`@fieldParentPtr` compute (`@alignCast` in `frame_writer.zig`, where the
+field's actual offset is a multiple of 8). The advanced-parameter bounds
+follow the word size as libzstd's do: `window_log_max` 30, `search_log_max`
+29, `ldm_hash_rate_log_max` 24 and `chain_log_max` 29 on a 32-bit `usize`
+(31, 30, 25 and 30 on 64 bits); `hash_log_max` is 30 at either width.
+The sequence API's sums are `u64` and its bound check comes first, so
+lengths near 2^32 are refused on a 32-bit `usize` as on a 64-bit one.
 
-- `literals.zig`'s `minLiteralsToCompress`/`minGain` shifted a `usize`
-  value by a bare `u6` -- correct only when `usize` is 64-bit
-  (`Log2Int(usize)` is `u5` on 32-bit) -- the exact bug class
-  `build.zig`'s `check-portable` comment names (`qr`'s `BitWriter`). Now
-  `std.math.Log2Int(usize)`.
-- `zstdmt.zig`'s `Pool.posted`/`taken`/`finished` were
-  `std.atomic.Value(u64)`: `mips-linux-musl` has no native 64-bit atomic
-  ops, and `@atomicLoad`/`Store`/`Rmw` refuse to compile there for a
-  64-bit operand. Narrowed to `u32` -- which turns out to match libzstd's
-  own `nextJobID`/`doneJobID` (`zstdmt_compress.c`, plain `unsigned`) more
-  closely than the `u64` this port had; a `u32` job-sequence wrap needs
-  over four billion jobs in one compression, unreachable at any realistic
-  job size. `Pool.slot` centralises the `u32`/`usize` cast at the one
-  place indices meet the queue length.
-- `frame_writer.zig`'s `drain`/`flush` recover `*FrameWriter` from
-  `*Writer` with `@fieldParentPtr`; on `mips-linux-musl` alone the
-  compiler reports the result as only 2-aligned and refuses to widen it,
-  even though the field's actual offset is a multiple of 8 there
-  (`@offsetOf`, checked by hand) -- a conservative bound this target's
-  ABI makes `@fieldParentPtr` compute, not a real alignment hazard (`w`
-  only ever points at the `writer` field of an actual `FrameWriter`
-  value). `@alignCast` at both call sites, as the compiler's own error
-  suggests.
-- `testdata/corpus.zig` and `testdata/dict_samples.zig` (test-only, not
-  shipped): several `Rng.below(n: u64) u64` results indexed a slice
-  directly, which needs `usize` -- fine by implicit widening on a 64-bit
-  `usize` and a compile error on a 32-bit one. `@intCast` at each site.
-
-**Five more test-only bugs, found only by actually running the suite**
-(`check-portable` is compile-only and could not have caught any of
-these -- see *Anchoring*): `dict_builder.zig`'s "the memory ceiling
-refuses before allocating anything" hardcoded `(s.sizes.len + 1) * 8`
-where the code under test (`FastCoverContext.memory`) correctly uses
-`* @sizeOf(usize)` (libzstd's own `sizeof(size_t)`-sized per-sample
-entries) -- the estimate itself was already right for both widths, only
-the test's expectation assumed 64-bit; now `* @sizeOf(usize)`. And
-`param_test.zig`'s advanced-parameter bounds table hardcoded four
-64-bit-only edges as bare literals instead of the constants they check:
-`window_log` (`params.window_log_max`, 30 not 31), `search_log`
-(`params.search_log_max` = `ZSTD_SEARCHLOG_MAX` = `ZSTD_WINDOWLOG_MAX -
-1`, 29 not 30) and `ldm_hash_rate_log` (`params.ldm_hash_rate_log_max` =
-`ZSTD_LDM_HASHRATELOG_MAX` = `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`, 24
-not 25) -- all three confirmed against libzstd's own `zstd.h`.
-`hash_log`'s edges (30/31) needed no change: `ZSTD_HASHLOG_MAX` is 30 at
-either width. `chain_log`'s did, found only on 2026-09-28 (Z25's
-`adjustCParams` clamp): `ZSTD_CHAINLOG_MAX` is `ZSTD_CHAINLOG_MAX_32` = 29
-on a 32-bit `size_t`, not 30, so a 32-bit build accepted
-`chain_log = 30`, which libzstd refuses; now `params.chain_log_max`.
-
-**Anchoring.** `check-portable`'s own claim is compile-only
-(`build.zig`'s comment on why: `addTest`, never run, on every
-cross-compiled target) -- it caught the four compile-time bugs above but,
-by construction, never could have caught the row-match-finder bug, which
-compiles cleanly and only produces wrong bytes at runtime. The evidence
-below is this module's own, beyond that gate:
-
-- `zig build test-zstd -Dtarget=mips-linux-musl
-  -Dcpu=baseline+mips32+soft_float -Doptimize=ReleaseSafe`, actually
-  *executed* under `qemu-mips` (Zig's test runner picks it up from `PATH`
-  automatically for a foreign target): first run (before any Z12 fix)
-  179/193 passed, 11 failed, 3 crashed -- nearly all traced to the
-  row-match-finder mask (`context_test`'s reuse-equals-fresh checks and
-  `param_test`'s byte-identical-with-advanced-parameters check, every one
-  exercising `greedy`..`lazy2` above a 16 KB window) or the test-only
-  memory-ceiling literal above. One more pre-existing failure was fixed
-  alongside the others: `param_test.zig`'s bounds table hardcoded three
-  more 64-bit-only edges besides `window_log` -- `search_log`
-  (`ZSTD_SEARCHLOG_MAX = ZSTD_WINDOWLOG_MAX - 1`, 29 not 30 on 32-bit) and
-  `ldm_hash_rate_log` (`ZSTD_LDM_HASHRATELOG_MAX = ZSTD_WINDOWLOG_MAX -
-  ZSTD_HASHLOG_MIN`, 24 not 25) -- now `params.search_log_max` /
-  `params.ldm_hash_rate_log_max`, both real libzstd constants confirmed
-  in `zstd.h`.
-
-  **Full runs after every fix (2026-09-26, with Z9b and Z10 merged in),
-  ReleaseSafe under qemu:** `x86-linux-musl` (i386) 212/212 and
-  `arm-linux-musleabihf` 212/212, both with every sweep in full;
-  `s390x-linux-musl` (64-bit big-endian, used to separate the two axes)
-  211/212, the failing `seq_test` fixed and rerun alone, 6/6;
-  `mips-linux-musl` soft-float 211/212 with `mt_test` skipped (below).
-  Two bugs of the Z10 sequence API showed up only here:
-  `blockSizeExplicitDelimiter` and `fastSequenceLengthSum` summed `u32`
-  lengths into `usize`, and the validation's running position grew before
-  the block-bound check, so lengths near 2^32 -- refused on 64-bit --
-  overflowed a 32-bit `usize` (a panic in ReleaseSafe on i386); the sums
-  are `u64` and the bound is checked first (the same error class either
-  way). And `seq_test` read the little-endian sequence records it writes
-  for the goldens back as native `Sequence`s -- garbage on big-endian (a
-  test-only bug).
-
-  **qemu-mips crashes:** `qemu-mips: accel/tcg/user-exec.c:581:
-  page_find_range_empty: Assertion 'min <= max' failed` -- QEMU's own
-  page-tracking invariant, in tests that allocate and free many
-  differently-sized regions or thread pools in quick succession
-  (`stream_test`, `context_test`, `mt_test`). i386 and ARM (32-bit) and
-  s390x (big-endian) run all three in full, so both axes are covered;
-  on 32-bit MIPS only, `context_test` and `stream_test` run a trimmed
-  sweep and `mt_test` (whose load grew with Z9b's rsyncable cases until
-  even a trimmed run tripped qemu) is skipped.
-
-  **The damaged-frame KATs are libzstd's verdict per platform, not a
-  bug:** `decoder_test.zig`'s `c00743`, `c01822` and `d04112` (mutation-
-  sweep fixtures for fast Huffman loop decisions) give
-  `error.ChecksumWrong` on x86_64 and `error.CorruptionDetected` on every
-  target without the fast loop (not 64-bit little-endian). libzstd 1.5.7
-  itself does the same: `tools/zdec.c` built with `zig cc` for i386 and
-  s390x and run under qemu gives `corruption_detected` on all three,
-  x86_64 `checksum_wrong` -- libzstd's fast loop, like this port's, runs
-  on 64-bit little-endian only, and these frames decode differently
-  without it. The fixtures carry both verdicts
-  (`Kat.expect_no_fast_loop`).
-- A differential sweep of **libzstd itself** (not this port): `.linux32`'s
-  `mips-linux-musl` soft-float and, for comparison, plain 32-bit
-  little-endian (`x86-linux-musl`, `qemu-i386`) -- `zref.c` (this module's
-  own reference oracle, `tools/README.md`) built three ways with `zig cc`
-  straight from libzstd 1.5.7's sources (`-target x86_64-linux-musl` /
-  `x86-linux-musl` / `mips-linux-musleabi -mcpu=baseline+mips32+soft_float`,
-  no prebuilt static lib needed) -- native x86_64, `qemu-i386`, `qemu-mips`.
-  Every `(case, level, checksum, ldm, window_log)` combination the golden
-  tests themselves use (`tools/dump_corpus.zig`'s manifest, 2 011
-  non-`ocf` entries over 98 inputs) compressed natively; one in six also
-  compressed under both emulators and diffed by SHA-256 against the
-  native frame: **0 mismatches** (335 checked per emulator) -- real
-  libzstd's own output is unaffected by 32-bitness or big-endianness for
-  every case this corpus reaches (unsurprising: `ZSTD_CURRENT_MAX`/
-  `ZSTD_WINDOWLOG_MAX` need multi-gigabyte inputs to matter, and this
-  corpus is small by design).
-- **This port itself**, compiled for `x86-linux-musl` (a throwaway batch
-  driver over this module's `compressAlloc`, not committed) under
-  `qemu-i386`, against `zref-i386`, real libzstd built the same way: 249
-  `(case, level, checksum)` combinations (every eighth manifest entry,
-  spanning every strategy and level) -- **0 mismatches**. Independent of
-  the golden tests (which pin this port's output against goldens
-  generated on the native x86_64 host, not against a live i386 libzstd
-  run) and of the `qemu-mips` test-suite execution above (which pins
-  this port's 32-bit-big-endian output against those same goldens); this
-  is the one piece of evidence that compares this port's own 32-bit
-  *little-endian* bytes directly against a real 32-bit libzstd build's
-  bytes for the same input.
-- `s390x-linux-musl` (64-bit, big-endian -- not a declared `meta.targets`
-  member, since `PortableTarget` has no 64-bit-big-endian entry;
-  used here only to separate the two axes `.linux32` conflates): full
-  suite green except what the runs above record, *none* of `.linux32`'s
-  qemu crashes (confirming those are about a 32-bit
-  address space specifically, per their entry above) -- and, importantly,
-  every row-match-finder test that `.linux32` needed the `matchMask` fix
-  for also passes here, on a completely different big-endian QEMU
-  backend from `mips`, which is the strongest evidence available that
-  the fix is correct in general and not a MIPS-shaped coincidence.
-- The presplitter's endianness decision (above) checked directly, since
-  the manifest sweep above is all small inputs unlikely to reach a
-  presplit-changing threshold: a 1.96 MB mixed Zig-source file, `zref`
-  (real libzstd) natively vs. under `qemu-mips`, at levels 5/9/12/17/19
-  with checksums both off and on. Levels 5, 17 and 19 (`greedy` and
-  `btopt`/`btultra2`, presplitting active) **differ** between the two
-  builds, by tens of bytes out of ~350-410 KB each -- confirming the
-  documented decision above is a real, deliberate divergence from a
-  genuine big-endian libzstd build, not a hypothetical one. Levels 9 and
-  12 (`lazy2`/`btlazy2`) happened to agree for this input -- the
-  pre-splitter's cut decision is a threshold, not guaranteed to move for
-  every input just because presplitting runs.
+**Platform-dependent verdicts.** The damaged-frame KATs `decoder_test.zig`
+holds as mutation-sweep fixtures for the fast Huffman loop's decisions give
+`error.ChecksumWrong` on x86-64 and `error.CorruptionDetected` on every
+target without the fast loop (anything but 64-bit little-endian). libzstd
+1.5.7 does the same: its fast loop, like this port's, runs on 64-bit
+little-endian only, and those frames decode differently without it. The KATs
+carry both verdicts (`Kat.expect_no_fast_loop`). The runtime evidence for
+every target is under *Verification*.
 
 ## What is deliberately not done
 
@@ -3442,448 +3057,17 @@ below is this module's own, beyond that gate:
   `zstd-cli` refuses both by name. *Never*, both decided by the user
   2026-09-28.
 
-## Performance
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-zstd`, `BENCH_ROUNDS=5`, same host, ReleaseFast, Silesia from `tools/zstd-silesia`): ref 0.92–1.06× libzstd 1.5.7, against 0.90–1.04× on Zig 0.16.0. The card carries these figures; what follows is the earlier measurement.
+- **Leads tried on the speed gap and dropped.** (1) Prefetching the match sources of *every* block in the decoder costs 18 % at level 3, and a rule of 20 extra bits at 32/256, or of 22 bits with the predefined table included, costs 7–10 %; libzstd's own rule (more than 22 bits and over 16 MB of history) never fires on a level-19 window of 8 MB. The module's rule (*Decoder*, "Sequence loops") stays: a sweep of the share threshold (7, 12, 16, 24, 32 of 256) found nothing better than 7 that held across reruns, and the level-19 x-ray gap is not the prefetching loop (with it off, the decoder retires 4 % fewer instructions than libzstd, with the same L2 misses, and still takes about 1.02× its cycles). (2) `dfast`'s `ZSTD_selectAddr` (libzstd selects the candidate's address with an asm `cmova`, so the window test never branches) does not port: the same asm takes the branch mispredicts to libzstd's level but costs cycles on every other file, because the load now waits for the compare; a plain Zig select is 1.02–1.04× everywhere and a cmov on the long check only 1.00–1.02×. The branches stay. (3) Clearing `rescaleFreqs`' 1 KB `lit_freq` through `fill.zig` was tried and dropped: 0.1 % of the instructions on 1 KB frames at level 16, and the code it moved cost 7 % of the cycles at level 19 (equal instructions, a layout effect).
 
 ## Backlog / deferred
 
-- **Cover trainer run time on large `d` (blind review GL R-Z-6, 2026-10-29).** `cover`'s segment sort compares d-mers with a `d`-byte memcmp, so `d` near T/2 on repetitive samples costs O(T·d) compares that `memory_limit` does not bound (libzstd identical). A trainer is offline tooling over the caller's own samples; not capped. If a consumer trains on untrusted samples, cap `d` in `checkCoverParameters`.
-- **No-panic sweep, encoder side (wave GL, 2026-10-29): what stays a caller contract.** `Compressor.compressContinue` / `Stream` with `stable_in_buffer` take the caller's earlier input as the window: freeing, moving or overwriting it breaks a contract that cannot be checked (a pointer and a `pos` are compared, not the bytes), as in libzstd. A dictionary or prefix given by reference (`begin`, `CDict.initReference`) must outlive its frames. The `cover` / `fastCover` trainers' run time is libzstd's (up to ~`k / segment` passes over the d-mers per epoch) and bounded only by `memory_limit`, i.e. by the size of the samples. `StreamWriter.initScratch` / `initStatic` panic (`zstd: StreamWriter scratch must not be empty`) on an empty scratch.
-- **Build option: compressor feature set** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Compressor strategies, LDM, `dict_builder` and `huf_asm` sit beside
-  the decoder. As with brotli, check with `nm` whether a decode-only consumer links any of it before adding a knob; `.small` would cap the
-  strategy set (higher levels → an error). Unmeasured.
-- **Speed: 8 of 20 workloads at 1.006–1.045× libzstd** *(bench 2026-10-09, `ZSTD_BENCH_ROUNDS=5 zig build bench-zstd`, user-mode cycles, the sides alternating, best of 5; frames byte-identical)*: xml c1 1.033, c3 1.040, d3 1.028, d19 1.035; dickens c1 1.015, c19 1.045, d3 1.042; ooffice c1 1.006. Since 2026-10-09 P2 takes up to 1.1× (worst workload), so this grades P2; P1 needs every workload ≤ 1.0× and the fastest in the field measured within 1.25×. The run-to-run spread on this shared machine is about ±2–3 % even in cycles (libzstd's own cycles for one workload moved up to 30 % between runs), so a claim of ≤ 1.0 wants a margin. Where it was: 0.92–1.43× (2026-10-07), closed 2026-10-09 by the parallel histogram, the packed Huffman encoder, 16-byte literal copies, a specialised pre-splitter (`b704bed8`, `7a7443c8`) and Z35 (`7f14de43`). What is left, by `perf` against a symbolised libzstd 1.5.7: compression levels 1–3 on xml/dickens -- `fastBlock`/`dfastBlock` a few % over libzstd's match finders, LLVM spilling the table base in the search loop (gcc spills too; no single cause found); decoding of small, many-block frames (xml d3/d19, dickens d3) -- the sequence loop now equals libzstd's, the per-block table building (`readStats`, `readNCount`, `buildFseTable`, the frame driver) is ~0.14 of libzstd's decoding time against its ~0.09. The fastest decoder in the field is c4milo/stdx (0.84–0.92× libzstd, 2026-10-07), not re-measured against this one. **2026-10-26** (bench `ZSTD_BENCH_ROUNDS=5`, load ~2–3 from other sessions): ref 0.88–1.06×, 9 of 20 rows above 1.0 (dickens c1 1.015, c19 1.024, d3 1.056; xml c1 1.029, c3 1.051, d3 1.011, d19 1.041; x-ray d19 1.064; ooffice d19 1.019). The sequence loop's (`seq_fast.zig`) literal and match copies now run 32 bytes per round, as `ZSTD_wildcopy`: it had 17 % more branch mispredicts than libzstd on xml d3 (4.25M vs 3.63M, all in the copy loops' exits), now 3.61M; xml d3/d19 −4 % cycles in a one-binary A/B, the other rows unchanged; the loop's head is aligned to 64 bytes so its branches keep their place on the 32-byte grid (JCC erratum). Decode rows after: xml d3 0.97, d19 1.00, ooffice d19 0.98, dickens d3 1.03, x-ray d19 1.07. Open: (a) *closed 2026-10-27, see below*; (b) a standalone harness (per-decode min/median) put this decoder at 0.92× libzstd on x-ray d19 while the bench says 1.03–1.07×, and the same harness moved 28.9 → 16.3 ms between two runs: the d19 rows (8 MB window, memory-bound) are at the mercy of the other sessions' memory traffic here; P1 needs a quiet host. **2026-10-27, two leads tried, both negative** (one-binary A/Bs, min of 7–15 interleaved `perf stat` runs, frames byte-identical): (1) *Z34's prefetch rule stays.* Against "never" (= libzstd's rule here: it prefetches only past 16 MB of history): dickens d19 never/auto 1.078, x-ray d19 0.995, the other rows within ±1 %; a sweep of the share threshold (7, 12, 16, 24, 32 of 256) found nothing better than 7 that held across reruns (x-ray d19 moved 1.005 → 1.057 between two identical sweeps). The x-ray d19 gap is not the prefetching loop: with it off, this decoder retires 4 % fewer instructions than libzstd and has the same L2 misses, and is still 1.02× its cycles. (2) *dfast `ZSTD_selectAddr` (cmov) does not port.* xml c3 has 35 % more branch mispredicts than libzstd (13.6M vs 10.1M), all in `dfastBlock`'s two match checks, where libzstd selects the candidate's address with an asm `cmova` so that the window test never branches. The same asm in `dfastBlock` takes the mispredicts to libzstd's level but costs cycles on every other file (c3 cycles vs the branch: xml 0.97–0.99, dickens 1.01–1.02, x-ray 1.06–1.07, ooffice 1.04–1.05): the load now waits for the compare. A plain Zig select (LLVM's choice) is 1.02–1.04 everywhere, and cmov on the long check only is 1.00–1.02. Kept the branches. (3) The bench run against a libzstd built from the pinned source (`make`, gcc 15 -O3) instead of the distribution's `.so` gave the same picture, ref 0.92–1.08× (x-ray d19 1.08, xml c1 1.06, xml c3 1.05, ooffice c1 1.02, dickens c1 1.04, d3 1.04). A per-call harness with few repetitions inflates compression rows by 10–17 % (first-call page faults and cold tables), so read compression only from the bench or from ≥ 20 repetitions.
+The `Z` numbers cited through this document (`Z1` … `Z35`) are former backlog items; the finished ones are described in the section that carries the feature (streaming `Z1`: *Algorithm*; portability `Z12`: *Portability*; the decoder's sequence loops `Z33`–`Z35`: *Decoder*). Open items:
 
-Toward the goal above. "Session" ≈ one working session of the size of the
-level-22/LDM port (≈ 500 lines of Zig with its goldens, diff runs and
-mutation sweep). Every item that changes output is anchored the same way as
-today: byte-identical to libzstd 1.5.7 through `tools/zref.c`, extended for
-the API in question, plus goldens and a mutation sweep. Consumers as of
-2026-09-22: **the ingest daemon** compresses CSV backups (one-shot suffices today);
-**The web-server consumer** wants HTTP `Content-Encoding: zstd` (Z1a now, Z1 later);
-dictionaries are undecided.
-
-- ~~**Z1 — Streaming compression, byte-identical to `ZSTD_compressStream2`.**~~
-  Done 2026-09-26 (every part below; what Z1d left is Z29).
-  ~~**Z1a**~~ `FrameWriter`, done 2026-09-23. ~~**Z1-1**~~ done 2026-09-23:
-  `Stream` with `continue`/`flush`/`end` over buffered input and output,
-  pledged or unknown size, the window in two segments, and the extDict
-  variants of `fast` and `dfast` — so levels ≤ 3. Oracle `tools/zstream.c`
-  (a call schedule), goldens in `stream_goldens.zig`. Left:
-  - ~~**Z1b — lazy family.**~~ done 2026-09-23: the extDict parser and the
-    hash chain, row and DUBT searches in extDict mode; streams up to
-    level 10.
-  - ~~**Z1c — optimal parsers and LDM.**~~ done 2026-09-23: the binary
-    tree of the optimal parsers and the 3-byte hash across both segments,
-    and long-distance matching over its own two-segment window; streams at
-    every level.
-  - ~~**Stable buffers and a writer.**~~ done 2026-09-26: the stable-input
-    and stable-output modes (`ZSTD_c_stableInBuffer`,
-    `ZSTD_c_stableOutBuffer`) and `StreamWriter`, a `std.Io.Writer` over
-    `Stream` with libzstd's bytes; see *Algorithm*. (`ZSTD_CCtx_reset` and
-    frames after the first: done with Z13.)
-  - ~~**Z1d — compression into less room than `compressBound`.**~~ done
-    2026-09-26: libzstd's capacity checks in the frame path (header, each
-    block, the raw and RLE fallbacks, the epilogue); a stable output takes
-    any room, as libzstd's. The one-shot API below the bound followed
-    with Z29.
-- ~~**Z2 — Decoder.**~~ ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
-  checksum verification, concatenated and skippable frames and the frame
-  utilities, ported from libzstd (std's decoder takes 30× libzstd's time,
-  so it was not the base); see *Decoder*.
-  - ~~**Z2b — streaming**~~ done 2026-09-23: `DecompressStream`
-    (`ZSTD_decompressStream`), `decompressContinue`, `DecompressReader`.
-  - ~~**Z2c — dictionaries**~~ done 2026-09-24: raw-content and
-    zstd-format (`ZSTD_loadDEntropy`: entropy tables, repcodes, content as
-    history), a reusable `DDict`, and the multiple-dictionary table; see
-    *Decoder* (*Dictionaries*).
-  Legacy (pre-v0.8) formats: no. Magicless frames: done with Z6.
-- ~~**Z3 — Index overflow correction.**~~ Done 2026-09-23, see
-  *Algorithm*. (The row tag table needs no reduction: it holds tags and
-  in-row heads, not indices.)
-- ~~**Z4 — Compression with a dictionary.**~~ Done 2026-09-26 (every part
-  below). ~~**D0**~~ done 2026-09-24
-  (see *Dictionaries*): raw-content and full dictionaries, `CDict`, the
-  load / copy / reload paths and the attach decision, prefixes,
-  `compressUsingDict` / `compressUsingCDict`, the dictionary ID and its
-  flag, `forceAttachDict`, `deterministicRefPrefix`, `forceMaxWindow`;
-  attaching is refused for strategies without a `dictMatchState` variant
-  yet. Left:
-  - **D1–D3 — attach**: the `dictMatchState` variant of every match
-    finder — ~~D1 `fast`/`dfast`~~ (tagged CDict tables), ~~D2 hash chain /
-    row / DUBT~~ (*Attach for the lazy family*), ~~D3 the optimal parsers
-    (and LDM with a dictionary)~~ — all done 2026-09-24-2026-09-25, each
-    lifting the refusal for its strategies (*Dictionaries*, "Adding an
-    attach variant"); `hasDictMatchStateVariant` is exhaustively `true`.
-  - ~~**D4** dedicated dictionary search (`enableDedicatedDictSearch`)~~
-    done 2026-09-25 (*Dictionaries*, "The dedicated dictionary search").
-  - ~~`prefetchCDictTables`~~ done 2026-09-26 (*Advanced parameters*).
-- ~~**Z5 — Dictionary training.**~~ ~~**Z5a**~~ done 2026-09-24 (content
-  selection, the optimizers' grid, memory estimates and a ceiling);
-  ~~**Z5b**~~ done 2026-09-25: finalization, `COVER_selectDict` (with
-  shrinking) as the optimizers' score, the complete trainers and
-  `ZDICT_trainFromBuffer` (see *Dictionary training*). The legacy
-  divsufsort trainer: no. The multithreaded optimizers: Z9b.
-- ~~**Z6 — Advanced parameters.**~~ Done 2026-09-24, see *Advanced
-  parameters*: the explicit compression parameters with libzstd's bounds
-  and derivation, the content-size flag, magicless frames (both ways),
-  skippable frames, literal compression, the row match finder, both
-  splitters, the block size, the size hint. Moved out: the dictID flag
-  (Z4, it has no effect without a dictionary) and
-  `searchForExternalRepcodes` (Z10, it acts on external sequences only;
-  done there).
-- ~~**Z7 — Long-distance matching as an option.**~~ Done 2026-09-24, see
-  *Algorithm* and *Advanced parameters*: the switch and the four LDM
-  parameters, and the path below `btopt`.
-- ~~**Z8 — `targetCBlockSize`.**~~ Done 2026-09-24, see *Advanced
-  parameters*.
-- ~~**Z9 — Multithreaded compression**~~ (`zstdmt_compress.c`, ~1 900 lines).
-  Done 2026-09-25.
-  ~~**Z9a**~~ done 2026-09-25 (see *Multithreading*): jobs, overlap, the
-  round buffer, LDM and the checksum across jobs, flushing, dictionaries,
-  `ZSTD_compress2` and `ZSTD_compressStream2` with workers. ~~**Z9b**~~
-  done 2026-09-25: `rsyncable` (*Multithreading*) and the dictionary
-  trainers' multithreaded optimizers, deterministic: libzstd's
-  single-threaded winner for any thread count (*Dictionary training*).
-- ~~**Z10 — Sequence-level API.**~~ Done 2026-09-25, see *Sequences*:
-  `ZSTD_compressSequences` (both delimiter modes, validation, repcode
-  resolution), `ZSTD_compressSequencesAndLiterals`,
-  `ZSTD_generateSequences`, `ZSTD_sequenceBound`,
-  `ZSTD_mergeBlockDelimiters`, the block-level sequence producer with its
-  fallback.
-- ~~**Z11 — Speed parity.**~~ Done 2026-09-24, see *Speed*: within about
-  10 % of libzstd at every level (was 1.2–2.0×).
-- ~~**Z12 — Portability.**~~ Done 2026-09-25, see *Portability*: 32-bit
-  (`window_log_max`, `ZSTD_CURRENT_MAX`) and big-endian (`.linux32` is
-  libzstd's actual combination of both, `mips-linux-musl` soft-float); the
-  headline finding was a real correctness bug (the row match finder's
-  tag-match mask, big-endian-only, found by actually running the tests
-  under `qemu-mips` rather than by `check-portable`, which is compile-only
-  and did catch four smaller ones). Run in full under qemu on i386, ARM,
-  s390x and mips (2026-09-26); the 3 KAT differences off 64-bit
-  little-endian are libzstd's own (see *Portability*'s *Anchoring*).
-- ~~**Z13 — Context reuse and sizing.**~~ Done 2026-09-24, see *Contexts*.
-  Its premise was wrong: without a dictionary a reused libzstd context gives
-  the same bytes as a fresh one (measured), so reuse is for speed and
-  memory; libzstd's reuse policy is ported anyway. Also
-  `ZSTD_estimateCCtxSize*` (as this port's exact sizes), a caller's
-  workspace (`ZSTD_initStaticCCtx`), and a stream's later frames and
-  `ZSTD_CCtx_reset`. With dictionaries (Z4) reuse matters again: a
-  `CDict` attached or copied into a reused context.
-- ~~**Z14 — A `StreamWriter` that serves many frames without allocating.**~~
-  Done 2026-09-26 (found by the web-server consumer), see *Algorithm* (`StreamWriter`):
-  `StreamWriter.reset(output, opts)`, the caller's scratch
-  (`initScratch`) and no allocator at all (`initStatic`).
-
-Z1 through Z14 are done. Found by the post-port audit (2026-09-26), in the
-suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
-
-- ~~**Z15 — Coverage-guided fuzzing of the decoder.**~~ Done 2026-09-27,
-  see *Anchoring* (*Decoder fuzzing*): stream and dictionary targets after
-  libzstd's `tests/fuzz/`, 1.7 M runs, no finding.
-- ~~**Z16 — Decoder speed parity.**~~ Done 2026-09-27: 0.91–1.04× libzstd's
-  cycles, see *Decoder*. The gap measured 2026-09-26 (1.13–1.27×) was a
-  byte-by-byte overlapping match copy and, in the command, a copy through
-  the writer's buffer; neither the Huffman `asm` nor `memset` mattered.
-- ~~**Z17 — Document that `nb_workers > 0` needs a thread-safe allocator.**~~
-  Done 2026-09-27: `Advanced.nb_workers`, `zstdmt.zig` and
-  *Multithreading* say so.
-- ~~**Z18 — A case for a dictionary's repeat offsets in the decoder.**~~
-  Done 2026-09-27: a hand-built frame (`tools/crafted-frames.py`,
-  `dict_reps`) kills dropping `st.rep = e.rep` (see *Open*).
-- ~~**Z19 — Measure dictionary compression and training against libzstd.**~~
-  Done 2026-09-28, see *Speed* ("Dictionaries"): every byte equal;
-  1.0–1.6× libzstd's cycles for a reused `CDict`, up to 3.5× for 100 B
-  records on the copy path, a `CDict` per call or a trained `DDict`; the
-  causes are Z32.
-- ~~**Z20 — Stale text:**~~ Done 2026-09-27: Z2c struck, *Decoder*'s speed
-  paragraph carries the 2026-09-26 measurement (dictionary frames
-  included).
-
-From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
-`lib/`, pinned core, the same bytes at every level):
-
-- ~~**Z21 — Small frames: zero tables without byte-wise `memset`.**~~
-  Done 2026-09-26, see *Speed* ("Small frames"); the rest of the gap at
-  1 KB is the table building, not clearing. At 1–4 KB
-  per frame (level 3, reused context) compression runs at 0.74–0.79× and
-  decoding at 0.77× libzstd's speed. `compiler_rt.memset` is 11 % of the
-  profile there (libzstd's glibc `memset`: 1 %): Zig without libc clears
-  byte by byte, and every block clears small tables — `huf.buildCTable`
-  5.3 %, the sequence statistics, the FSE tables, `compressWeights`.
-- **Z22 — CPU features.** libzstd picks its BMI2 paths at run time; this
-  port gets them only from the build's target. Built for baseline x86-64,
-  compression takes 1.15–1.25× libzstd's cycles (1.05–1.09× with
-  `-mcpu=native`) and decoding 893 vs 1043 MB/s. Zig 0.16 has no
-  per-function target features (measured on 0.16, not re-checked on 0.17), so ~~say so in the README~~ (done
-  2026-09-27: *Speed* bullet, build with `-Dcpu=x86_64_v3` or `native`);
-  still open: revisit run-time dispatch when Zig can.
-- ~~**Z33 — Decoder: the sequence loop keeps its cursors in locals.**~~
-  Done 2026-10-07: 0.97–1.06× libzstd's cycles, 1.04–1.06× its
-  instructions, by the trial below (`LitCursor`, a local `History`,
-  `execSequenceEnd` out of line). Found
-  2026-10-07 while comparing Zig implementations. Decoding libzstd's Silesia
-  frames (`dickens`, `mozilla` at levels 3 and 19; `-mcpu=x86_64_v3`,
-  ReleaseFast, user cycles per decode, 5 interleaved rounds, median) takes
-  1.04–1.16× libzstd's cycles (Ubuntu's libzstd 1.5.7) and 1.13–1.20× its
-  instructions. Profile of `dickens` level 19: in both, about 40 % of the
-  cycles wait on the match copy's load (memory, not code). The rest is the
-  sequence loop: 121 hot instructions against libzstd's 63, and 20.5 % of
-  the samples on stack loads and stores against 8.9 %. Cause:
-  `execSequence` reads and writes `st.lit_pos`, `lit_end`, `lit_src` and
-  `h.out`, `h.prefix` through pointers, and a byte store into `out` may
-  alias any of them, so they are reloaded for every sequence; libzstd keeps
-  `litPtr`, `litEnd`, `op` and `prefixStart` in locals. Also
-  `execSequenceEnd` is inlined into the loop, where libzstd has it
-  `FORCE_NOINLINE`. Tried on a copy: a local literal cursor and a local copy
-  of `History` in `decompressSequences`, `execSequenceEnd` `noinline` —
-  1.01–1.05× libzstd's cycles and 1.04–1.06× its instructions, the 24
-  Silesia frames of levels 1 and 19 decoded byte for byte; `noinline`
-  alone gave 1.06–1.09×, inside the run-to-run spread (±4 %). The change
-  moves no decision (the same reads, the same order), so the decoder
-  goldens and fuzz stand as its anchor (`modtest zstd`, ReleaseSafe,
-  284/284). What remained went to Z34 (prefetching) and Z35 (assembly).
-  Beyond parity: c4milo/stdx decodes the same frames in 0.84–0.92×
-  libzstd's cycles (0.82–0.93× its instructions; same method, same run, the
-  trial above at 1.00–1.02×). Its design notes (`docs/decisions.md`,
-  2026-09-27) say its Zig sequence loop had stalled at 0.72–0.94× libzstd's
-  speed with 24–67 % more instructions — this port's symptom — and that
-  hand-written assembly for sequence execution (aarch64, then x86-64) is
-  what passed it. An assembly loop here would be a decision of its own
-  (portability, the 32-bit lanes, the mutation and fuzz anchors), not part
-  of Z33.
-- ~~**Z34 — Decoder: prefetch the match sources of blocks with long
-  offsets.**~~ Done 2026-10-07. About 40 % of the decoding cycles at level 3
-  and 63 % at level 19 went to the match copy's first load (`copy16`):
-  waiting on memory. `decodeAhead` runs libzstd's
-  `ZSTD_decompressSequencesLong` schedule -- decode 8 sequences ahead,
-  prefetch each one's match source (2 cache lines), execute the oldest --
-  for a block whose offset table has at least 7 256ths of its cells at 22
-  extra bits or more (offsets from 4 MB), never for the predefined table.
-  Silesia (`-mcpu=x86_64_v3`, ReleaseFast, user cycles per decode, 4
-  interleaved rounds, median): level 19 0.945× libzstd's cycles (was
-  1.027×; webster 0.76, osdb 0.85, dickens 0.88, the worst ooffice 1.06),
-  level 3 1.015× (unchanged). How the rule was chosen, on the same 24
-  frames: prefetching every block 1.18× at level 3; libzstd's rule (more
-  than 22 bits and over 16 MB of history) never fires on a level 19 window
-  of 8 MB; 20 bits at 32/256 and 22 bits with the predefined table
-  included both cost 7–10 % at level 3. Two traps measured on the way: a
-  second copy of the loop inside `decompressSequences` slowed the plain
-  loop by 14 % (inlining and registers), and handing it `&ss`, `&op`,
-  `&lit` put them back in memory (Z33's cause) -- it is `noinline` and
-  takes and returns them by value. Anchor: both loops forced on and off
-  over the corpus at levels 1, 3 and 19, with damaged copies, must give the
-  same bytes or the same error (`decoder_test.zig`); the rule itself
-  changes no output, so mutants of its thresholds are equivalent by
-  construction (what they change is measured above, not tested).
-- ~~**Z35 — Decoder: the sequence loop in assembly (x86-64, aarch64).**~~
-  Done 2026-10-09 for x86-64 (user, for the P3 → P2 push), together with
-  libzstd's Huffman four-stream loops (`src/huf_asm.zig`, a port of
-  `huf_decompress_amd64.S`): `src/seq_fast.zig` runs after Z34's
-  prefetching loop when that one does not take the block, LLVM builds with
-  BMI2 only; `rbp` is no longer used (the match length lives in
-  `FastSeq.seq_ml`), so builds that keep a frame pointer are safe. Both are
-  checked against the Zig loops on every corpus frame at levels 1, 3 and 19
-  and 8 damaged copies of each, equal bytes or equal errors
-  (`decoder_test.zig`), with a count that the assembly ran. Silesia
-  decoding after both, cycles: x-ray d3 1.066× → 0.94×, ooffice d3 1.04× →
-  0.96×, dickens d3 1.04× → 1.02×. aarch64 not written. History:
-  approved by the user 2026-10-07, then deferred by them in favour of Z34
-  after the numbers: a BMI2 x86-64 loop (decode with `shrx`/`bzhi`, no
-  branch per read; 32-byte literal copies; the Zig `execSequence` for
-  anything outside the margins) decoded the 36 Silesia frames of levels 1,
-  3 and 19 byte for byte and took 0.968× libzstd's cycles at level 3 (the
-  Zig loop 1.012×) and 1.001× at level 19 (1.005×), with 0.92× its
-  instructions. A first version shifting through `cl` was 1.12–1.29×; one
-  that loaded a match's second 16 bytes unconditionally was 1.33× on
-  dickens level 19 (a second cache line, a second miss). aarch64 not
-  written. Worth reopening only on top of Z34, against its numbers.
-- ~~**Z23 — Seekable format**~~ Done 2026-09-27 (asked for by seglog), see
-  *Seekable format*: `zstd.seekable`, the same bytes as libzstd's
-  `contrib/seekable_format`.
-- ~~**Z28 — `Seekable` over another source, keeping its buffers**~~ Done
-  2026-09-28 (asked for by seglog, 2026-09-27: `Seekable.init` allocated its
-  2 × 128 KiB buffers and a `DecompressStream` per open of a compressed
-  segment, most of a fuzz run's time): `Seekable.reset(src)`, see *Seekable
-  format*. seglog can keep closed readers and reset one on the next open
-  (the ingest daemon's `seglog/src/root.zig`, `SegStore.openZst`).
-- ~~**Z24 — Adaptive level**~~ Done 2026-09-28: the module's part is
-  `Stream.setLevel` (*Multithreading*, "The level changed during a
-  frame"); the adaptation itself -- `FIO_compressZstdFrame`'s statistics
-  over `frameProgression`/`toFlushNow` -- is `zstd-cli`'s `--adapt`, as it
-  is libzstd's command's.
-- ~~**Z25 — API gaps**~~ Done 2026-09-28, every part below (deferred 2026-09-26 for want of a consumer, not for
-  a reason against; the goal is libzstd's full API): a shared thread pool
-  (`ZSTD_CCtx_refThreadPool`), MT progress (`ZSTD_getFrameProgression`,
-  `ZSTD_toFlushNow`), the decoder in a caller's workspace with exact
-  estimates (`ZSTD_initStaticDCtx`, `ZSTD_estimateDCtxSize`,
-  `ZSTD_estimateDStreamSize*`, the `DDict` equivalents),
-  `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
-  `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28, the decoder
-  half (see *Decoder*, **Memory**): `Decompressor` / `DecompressStream` /
-  `DDict.initStatic`, the exact `estimateDecompressorSize`,
-  `estimateDecompressStreamSize[FromFrame]` and `DDict.estimateSize`,
-  `max_block_size` (`ZSTD_d_maxBlockSize`, 240 KATs from libzstd) and
-  `Decompressor.copyFrom` (`ZSTD_copyDCtx`). Done 2026-09-28 (compressor
-  side): `ZSTD_copyCCtx` (`Compressor.copyFrom`) with the buffer-less API
-  it needs (`Compressor.begin` / `compressContinue` / `compressEnd`, see
-  *Contexts*), and the shared thread pool (`ThreadPool`,
-  `Options.thread_pool`, `ZSTD_CCtx_refThreadPool`; see *Multithreading*),
-  which runs on a caller's `std.Io` when given one -- the 2026-09-26 MT
-  futex decision stands as the default. Done 2026-09-28: public
-  `adjustCParams` (`ZSTD_adjustCParams` with its clamp, pinned with
-  `getCParams` on 100 000 queries through `tools/zparams.c`, *Advanced
-  parameters*) and `version_number` / `version_string`. Done 2026-09-28 for `zstd-cli`:
-  `getCParams` (`ZSTD_getCParams`) and `limits` (`ZSTD_WINDOWLOG_MAX` and
-  the other bounds); `Stream.frameProgression` (`ZSTD_getFrameProgression`,
-  with and without workers) and `Stream.toFlushNow` (`ZSTD_toFlushNow`),
-  whose single-threaded numbers `zstd-cli -vvvv --progress` prints equal
-  to the C command's (its `smoke.sh` compares them).
-- ~~**Z26 — `example-apps/zstd-cli`: the `zstd` command at parity**~~
-  Done 2026-09-28 (what it refuses by name is Z31):
-  libzstd 1.5.7's `programs/` options, file handling and output, checked
-  against the real CLI. The module's contract stays the library API (*What
-  is deliberately not done*); the app is its first full consumer. Stage 1
-  done 2026-09-27: compress, decompress, `-t`, `-l`/`-lv`, `-D`, the stream
-  and MT options, overwrite/`--rm`/permissions/links, program names
-  (`unzstd`, `zstdcat`, `zstdmt`); 226 option/input combinations
-  byte-identical to `/usr/bin/zstd` 1.5.7 and 71 message scenarios equal,
-  `smoke.sh` re-checks a subset in CI when a 1.5.7 `zstd` is installed. It
-  asked the module for `DecompressStream.Options.max_window_size`
-  (`ZSTD_DCtx_setMaxWindowSize`, for `--memory=#`), added the same day.
-  Stage 2 done 2026-09-28: `--zstd=`, `--max`, `--show-default-cparams`,
-  `-r`, `--filelist`, `--output-dir-flat`/`-mirror`, `--patch-from`,
-  `--train`/`--train-cover`/`--train-fastcover` (asking the module for the
-  trainers' messages, *Dictionary training*), the progress counter,
-  `--fake-*-is-console`, `-b` without a file, `-p`; about 220 more
-  scenarios equal to the C command (the app's README). It found the
-  prefix's default content type (*Dictionaries*). `--adapt` done
-  2026-09-28 (Z24). Left (refused by name): `--train-legacy` (no legacy
-  trainer here), `--trace`.
-- ~~**Z29 — One-shot compression into less room than `compressBound`.**~~
-  Done 2026-09-28, see *Algorithm* ("One-shot into any room"):
-  `compress`, `Compressor.compress` (with workers too),
-  `compressUsingDict` and `compressUsingCDict` take any `dst`, with
-  libzstd's frame for that room or `error.DstSizeTooSmall` where libzstd
-  fails (`error.NoSpaceLeft` is gone from `zstd.Error`).
-- ~~**Z30 — Legacy frame formats (pre-v0.8).**~~ Decided 2026-09-28: no,
-  see *What is deliberately not done*.
-- ~~**Z31 — What `zstd-cli` refuses by name**~~ (`--train-legacy`,
-  `--trace`). Decided 2026-09-28: no, see *What is deliberately not done*.
-- ~~**Z32 — The speed gaps Z19 found**~~ Done 2026-09-28, every part below (*Speed*, "Dictionaries"; none
-  changes a byte): count dictionary-side match lengths 8 bytes at a time
-  like `count` (`countDict`, `countInDict`, `Base.count2Segments`,
-  `lazy.countDms`, `countAcrossDict`, `opt.count2SegmentsDms`);
-  ~~keep `Compressor.compress`'s local `?CDict` from being cleared on every
-  call (it costs small frames without a dictionary too); clear through
-  `fill.zig` what is still `@memset` per frame or per `CDict`
-  (`resetByCopyingCDict`'s 3-byte hash table, `CDict.create`'s tables and
-  tag table)~~ -- done 2026-09-28 (*Speed*, *Small frames* and **Z32,
-  clearing**), with the `btopt` frequency tables, the Huffman header's FSE
-  table and the copy path's tag shift (vectorised); left in `opt.zig`,
-  byte-wise per frame at `btopt` and up: `rescaleFreqs`' `@memset` of
-  `lit_freq` (1 KB) and `initStatsUltra`'s of the three tables (`btultra2`,
-  every frame's first block over 8 bytes; libzstd's `ZSTD_initStats_ultra`
-  moves the window instead of clearing -- both taken by the match finders'
-  part below); ~~`fillHashTableFor` specialised on `min_match` and the
-  table kind, on a `match.Base`~~; ~~the decoder pointing
-  at a `DDict`'s entropy tables instead of copying them each frame~~ (done
-  2026-09-28, *Speed*, "Dictionaries", and *Decoder*, "Dictionaries").
-  Re-measure with Z19's method.
-  Done 2026-09-28, the match finders' part (*Speed*, "Where the gaps
-  are"): the dictionary-side counts share `match.countRuns`, the fills are
-  specialised, and `btultra2`'s first pass (`ZSTD_initStats_ultra`) moves
-  the window's base as libzstd does instead of clearing the hash, tree and
-  3-byte tables (`@memset`, byte by byte) on every frame whose first block
-  is over 8 bytes: −0.6–1.9 % instructions, −1–3.5 % cycles at levels
-  16–22 without a dictionary. Clearing `rescaleFreqs`' `lit_freq` (1 KB per
-  frame at `btopt` and up) through `fill.zig` was tried and dropped: 0.1 %
-  of the instructions at level 16 on 1 KB frames, and the code it moved
-  cost 7 % of the cycles at level 19 (equal instructions, a layout effect).
-- ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
-  (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
-  command's blocks, timed runs and output, so `zstd -b` and
-  `zig-out/bin/zstd -b` print the same columns — equal sizes and ratios
-  (checked in `smoke.sh`, with dictionaries digested once per run as
-  `ZSTD_initLocalDict` does), the speeds being the comparison. `-b`
-  without a file (lorem ipsum / `-P#` synthetic data) followed with Z26's
-  stage 2.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 15 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Open
-
-- Dictionaries (Z2c mutation sweep, widened per the coordinator's request:
-  48 mutations across every bounds/length check and error branch of
-  `loadDEntropy` and its header parsing, the content-type dispatch, dictID
-  checks and selection, history/entropy setup in one-shot and streaming,
-  and `refPrefix`'s lifetime — 43 killed, 4 equivalent, 1 hunted and not
-  found). All three originally-uncovered cases the coordinator asked to be
-  hand-crafted byte by byte were, checked against libzstd through
-  `tools/zdec.c`, and turned into KATs (`testdata/dict_kats.zig`):
-  - A dictionary truncated to exactly its entropy header (content size 0,
-    `full_dict_zero_content`) — libzstd rejects it too
-    (`dictionary_corrupted`), and turned out to prove the repcode-room
-    check (`pos + 12 > dict.len`) **equivalent** to its `>=` mutant, not
-    merely uncovered: with content size 0, `rep == 0 or rep > 0` is a
-    tautology, so every valid repeat offset (always ≥ 1) fails the
-    *other* half of the same check regardless of the room check's
-    boundary — confirmed by running the mutant against this exact
-    dictionary, which still rejects it, same class.
-  - A dictionary with its first repeat offset patched to 0
-    (`full_dict_rep0_zero`, otherwise identical to `full_dict` so its
-    content size stays > 0) — kills the `rep == 0` half of that check
-    directly; libzstd rejects it too.
-  - Two small raw-content dictionaries (dictionary ID 0 by construction,
-    like every raw-content dictionary — `small_raw_a`/`small_raw_b`) in a
-    `ddicts` set, decoding a dictID-0 frame (`small_frame`): confirmed
-    against libzstd (`tools/zdec.c`, `refMultipleDDicts`) that a dictID-0
-    frame is *not* exempt from selection — libzstd's hash set uses
-    `currDictID == 0` as both its empty-slot sentinel and a real
-    raw-content dictionary's ID, so it genuinely matches whichever one
-    last landed at that bucket. This reversed the original guard
-    (`selectDDict` no longer special-cases `frame_dict_id == 0`) rather
-    than confirming it — the guard was a wrong, undisclosed simplification
-    from before this round, not a deliberate one.
-  Also hand-crafted, found by the widened sweep itself, each checked
-  against libzstd and turned into a KAT: a dictionary of exactly 8 bytes
-  (magic + dictID, no entropy header at all, `eight_byte_dict` — also
-  proved `dict.len <= 8` vs `< 8` **equivalent**: at exactly 8 bytes both
-  reach the same downstream Huffman-header failure); `raw_dict` requested
-  as `.full` (has no magic number, so `.full` must still refuse it);
-  `frame_raw_l5` (dictID 0) decoded with an unrelated nonzero-dictID
-  dictionary active, confirming libzstd's dictID check really does
-  short-circuit entirely at `fParams.dictID == 0` regardless of what
-  dictionary is configured; a frame whose literals reuse the dictionary's
-  Huffman table (`lit_repeat_frame`, found by hunting ~50 (input, level)
-  combinations — most frames here don't exercise this at all); and three
-  `refPrefix`-lifetime KATs (single-pass shortcut, the regular
-  block-by-block path, and an intervening skippable frame all correctly
-  drop the prefix after one frame, matching libzstd exactly per the
-  deviation-4 resolution above).
-
-  Two more equivalent, by the same kind of proof as the repcode-room
-  check: `readEntropyFse` building its table with the *declared* maximum
-  symbol value instead of the one `FSE_readNCount` actually read is
-  unobservable, because that value can only be smaller (the read loop is
-  bounded by the declared one), and every symbol between the two has
-  probability 0 in the returned table by construction, contributing no
-  cells to it either way. `setHistoryFrom`'s `content.len == 0` guard is
-  equivalent too: the address arithmetic it skips computes the same
-  `checkContinuity` outcome (an empty `ext`) either way, since
-  `prefix_addr == prev_end_addr` whenever `content.len == 0` regardless of
-  which address they hold.
-
-  Dropping `applyEntropy`'s `st.rep = e.rep` (since Z32 in
-  `applyDDictEntropy`; `applyRawDictionary` loads them) (the dictionary's repeat
-  offsets never reach the decoder) survived every encoder-made frame: a
-  dictionary with repeat offsets 50/60/70 in place of 1/4/8 decoded the
-  same under both across 5 corpus inputs × 5 levels and 150 more (input,
-  level) pairs, because no encoder opens a frame on a repeat code. It is
-  killed since 2026-09-27 (Z18) by a hand-built frame
-  (`tools/crafted-frames.py`, `dict_reps`): that dictionary and three
-  sequences at repeat codes 2, 3, 3, i.e. 60, 70 and 50 bytes back into the
-  dictionary's content; libzstd (`tools/zdec.c`, modes 0–2) gives the
-  12 bytes `decoder_dict_test.zig` pins, and 1/4/8 would give others.
-- **In-place decompression is advertised but not supported (no-panic sweep GL, ZD-6, 2026-10-29).** `decompressionMargin` documents a margin "for in-place decompression", while `Decompressor.decompress` says `dst` and `src` must not overlap; libzstd's one-shot decoder supports in-place (`ZSTD_memmove` for raw blocks, the `oBlockEnd` clamp). Here the raw-block `@memcpy` and the 16-byte literal copies would alias (a panic in safe builds, UB in ReleaseFast). **Decided (owner-delegated safe default, 10-29):** `decompress` checks for overlap up front and panics (`zstd: decompress dst and src overlap`), `decompressionMargin` is documented as sizing only; porting the in-place clamp + `@memmove` stays here until a consumer needs in-place decoding.
+- **Z22 — Run-time CPU dispatch.** libzstd picks its BMI2 paths at run time; this port gets them only from the build's target, so a baseline x86-64 build is slower than one made with `-Dcpu=x86_64_v3` or `native` (the README says so). Zig has no per-function target features (checked on 0.16, not re-checked on 0.17). Revisit when it has them.
+- **Z35 (aarch64) — the sequence loop in assembly.** x86-64 has it (`seq_fast.zig`, with the Huffman four-stream loops in `huf_asm.zig`); aarch64 has not. It is a decision of its own (portability, the 32-bit lanes, the mutation and fuzz anchors), worth reopening only on top of the prefetching loop and against its numbers.
+- **Speed: P1.** The card's Performance line is the current figure. P2 takes ref ≤ 1.1× (worst workload); P1 needs every workload ≤ 1.0× and the fastest implementation in the field within 1.25×. What is left, by `perf` against a symbolised libzstd 1.5.7: compression at levels 1–3 on text, where `fastBlock` / `dfastBlock` run a few percent over libzstd's match finders (LLVM spills the table base in the search loop; gcc spills too; no single cause found), and decoding of small, many-block frames, where the sequence loop equals libzstd's but the per-block table building (`readStats`, `readNCount`, `buildFseTable`, the frame driver) takes about 0.14 of the decoding time against libzstd's 0.09. The level-19 decode rows (an 8 MB window) are memory-bound and move with other load on the host, and the run-to-run spread is ±2–3 % even in cycles, so a claim of ≤ 1.0 wants a quiet host and a margin. The fastest decoder in the field (stdx, see *Compared with*) has not been measured against this one since the assembly loops. Leads tried without gain are in *What is deliberately not done*.
+- **`fill.zig` against a vectorised `memset`.** `fill.zig` clears small tables in 32-byte stores because Zig 0.16's `compiler_rt.memset` stores byte by byte. 0.17.0's is vectorised (`fastMemset`); re-measure, then decide whether `fill.zig` goes (its header says to delete it with a Zig whose `memset` is vectorised).
+- **Build option: compressor feature set** (mechanism and checklist in CONVENTIONS §4.2). Compressor strategies, long-distance matching, `dict_builder` and `huf_asm` sit beside the decoder. Measure first (an HTTPS size probe, or `nm -S --size-sort` on a consumer binary: does a decode-only consumer link any of it, as with brotli?) and add a knob only for a measured gain of roughly 100 KB or more, or a consumer request; `.small` would cap the strategy set (higher levels become an error). Unmeasured.
+- **Cover trainer run time on large `d`.** `cover`'s segment sort compares d-mers with a `d`-byte memcmp, so `d` near T/2 on repetitive samples costs O(T·d) compares that `memory_limit` does not bound (libzstd is identical). A trainer is offline tooling over the caller's own samples, so it is not capped; if a consumer trains on untrusted samples, cap `d` in `checkCoverParameters`.
+- **In-place decompression.** libzstd's one-shot decoder decodes in place (`ZSTD_memmove` for raw blocks, the `oBlockEnd` clamp). This one refuses overlapping `dst` and `src` with a checked panic (*Limits and refusals*). Porting the clamp and a `@memmove` for the raw-block copy and the 16-byte literal copies waits until a consumer needs in-place decoding.
+- **`.wasm32` target.** `meta.targets` omits it: `zstdmt.zig`'s worker pool uses `std.Thread.spawn`, which `wasm32-wasi`'s single-threaded build does not have (`std/Thread.zig`'s `@compileError`). Whether to gate the pool there (with `builtin.single_threaded` the jobs already run on the calling thread) is undecided and unverified.

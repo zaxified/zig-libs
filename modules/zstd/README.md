@@ -3,12 +3,12 @@
 **Zstandard (RFC 8878) compressor** for every level — 1–22 and the negative
 ("fast") levels — emitting **exactly the bytes libzstd 1.5.7 emits** for the same input
 and level, and a **decoder** ported from libzstd's, one-shot and streaming (also as a
-`std.Io.Reader`): 0.93–1.04× its CPU cycles on the Silesia corpus at levels
-3 and 19 (`zig build bench-zstd`, 2026-10-09; SPEC.md, Z33–Z35), checksums verified,
-concatenated and skippable frames, the frame size queries. std's `std.compress.zstd.Decompress` takes 30× libzstd's time,
+`std.Io.Reader`): about its speed, 0.92–1.06× its CPU cycles on the Silesia
+corpus (`zig build bench-zstd`; SPEC.md's card has the current figure),
+checksums verified, concatenated and skippable frames, the frame size queries. std's `std.compress.zstd.Decompress` takes 30× libzstd's time,
 leaves checksum verification as a TODO panic and defaults to an 8 MB window.
 
-A full replacement for linking libzstd (the goal, reached 2026-09-30): one-shot
+A full replacement for linking libzstd (the goal, reached): one-shot
 compression is complete, streaming (`Stream`, `ZSTD_compressStream2`'s bytes
 for the same calls, buffered or with the caller's stable buffers) covers
 every level too, `StreamWriter` is a `std.Io.Writer` with those bytes and
@@ -63,14 +63,12 @@ libc.
   out by hand for one compressor boundary each: 2038 frames), and against
   libzstd at level 22 on 64–140 MB inputs and on a 4.4 GB input past the
   3500 MiB index limit.
-- **Speed:** within about 5 % of libzstd at every level: on the Silesia
-  corpus 0.90–1.04× its CPU cycles compressing at levels 1, 3 and 19 and
-  decoding (`zig build bench-zstd`, 2026-10-09; x86-64 decoding runs
-  libzstd's assembly loops, Z35). Earlier, one-shot and
-  streaming: 0.87–1.15× its CPU cycles (min of 3 runs on a pinned core,
-  ReleaseFast, 3–12 MB text/CSV/ELF inputs, levels −5…19; the upper end on
-  a loaded machine, 1.03–1.07× on a quieter one) and 0.95–1.15× its
-  instructions (see SPEC.md, *Speed*). **Build for the CPU you run on**
+- **Speed:** about libzstd's, 0.92–1.06× its CPU cycles on the Silesia
+  corpus compressing at levels 1, 3 and 19 and decoding (`zig build
+  bench-zstd`; x86-64 decoding runs libzstd's assembly loops). The card in
+  SPEC.md has the current figure; SPEC.md, *Speed* says how it is measured
+  and where the module is slower (small frames, dictionaries, builds without
+  BMI2). **Build for the CPU you run on**
   (`-Dcpu=x86_64_v3` or `native`): libzstd picks its BMI2 paths at run time,
   this port only at compile time, so a baseline x86-64 build compresses in
   1.15–1.25× libzstd's cycles and decodes at 893 MB/s where a `native` one
@@ -82,7 +80,7 @@ libc.
   long-distance table at level 22 on inputs over 64 MB (about 820 MB peak on
   a 70 MB input, as libzstd) — plus about 0.8 MiB of block buffers and parser
   state.
-- **Platform:** any (no OS calls). **Role:** codec. **Concurrency:** reentrant.
+- **Platform:** any (no libc; worker threads only with `nb_workers` above 0). **Role:** codec. **Concurrency:** reentrant.
 
 A whole program on it: [`example-apps/zstd-cli`](../../example-apps/zstd-cli/),
 the `zstd` command ported from libzstd's `programs/`, whose frames and
@@ -145,9 +143,9 @@ const len = try dec.decompress(out, frame); // error.DictionaryWrong if frame/di
 dictionary's or a frame's dictionary ID without decoding (see SPEC.md, §
 Decoder, for exactly what a dictionary's content covers as history — a
 digested `DDict`'s whole buffer, an undigested `.dictionary`'s only the
-part past its entropy header). This module's own **compressor** does not
-support dictionaries yet (Z4); the frames these decode were produced by
-libzstd itself.
+part past its entropy header). Compressing with a dictionary is described
+below; a frame made by this module or by libzstd decodes with the same
+dictionary.
 
 Streaming decompression, from any `std.Io.Reader` (a file, a socket):
 
@@ -394,7 +392,7 @@ leaves it out); a decoder needs the same dictionary. `StreamOptions` takes
 the same `dictionary` (a `.prefix` for its first frame only). For small
 inputs — up to 8, 16 or 32 KB by strategy — and streams of unknown size,
 libzstd attaches a `CDict` instead of copying it and searches it in
-place, for every strategy now (`fast`, `dfast`; `greedy`, `lazy`, `lazy2`,
+place, for every strategy (`fast`, `dfast`; `greedy`, `lazy`, `lazy2`,
 `btlazy2`; the optimal parsers `btopt`, `btultra`, `btultra2`) --
 `advanced.force_attach_dict = .copy` still gets libzstd's bytes for the
 copy instead, on any strategy. `CDict.initAdvanced` takes a content type
@@ -453,8 +451,9 @@ memory, and so does its `compressBound`).
 
 ### Dictionary training (`zstd.dict_builder`)
 
-libzstd's trainers (`zdict.h`), single-threaded, giving the same finished
-zstd dictionaries byte for byte: `train` is `ZDICT_trainFromBuffer` (what
+libzstd's trainers (`zdict.h`; the optimizers may use several threads, with
+the single-threaded result), giving the same finished zstd dictionaries byte
+for byte: `train` is `ZDICT_trainFromBuffer` (what
 `zstd --train` does: fastCover, d = 8, k tried in 4 steps from 50 to 2000,
 level 3).
 
@@ -529,6 +528,13 @@ frame queries (`numFrames`, `frameCompressedOffset`, `offsetToFrameIndex`,
 (no seek table), `CorruptionDetected` (reserved bits, or a frame whose
 content does not match its checksum), `FrameIndexTooLarge`,
 `DstSizeTooSmall`, and the decoder's.
+
+## Not provided
+
+Run-time CPU dispatch (build for the target CPU instead), libzstd's legacy
+v0.5–v0.7 frame decoders, its legacy dictionary trainer and `--trace`, and
+`.wasm32` builds. SPEC.md, *What is deliberately not done* gives the reasons
+and *Backlog / deferred* what is open.
 
 ## Tests
 

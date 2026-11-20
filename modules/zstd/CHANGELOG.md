@@ -5,22 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-20** — **NO CONSUMER-VISIBLE CHANGE:** the whole-module mutation audit is closed with open ids: card `mutation 2026-11-20 (2681/4155, 320 eq)` over decoder + encoder groups g1-g3 (1 154 OPEN, 581 of them not run; no defect, no product line changed); later changes get delta mutation only (SPEC, "Audit 2026-11-20").
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** test only: follow-up on the encoder's open g2 mutants. New goldens `src/testdata/superblock_goldens.zig` (recipe `tools/gen-superblock-goldens.sh`, libzstd 1.5.7 through `zref`): superblocks of blocks without a sequence, several sub-blocks, a literal run above 0xFFFF, literal sampling and the block splitter; two `FSE_normalizeM2` KATs with useLowProbCount on; `src/emut2_test.zig` now reaches the RLE literals header past 4095 bytes, `literals.rle`'s room check and `ZSTD_storeSeq`'s long-length edges. Group g2: 575/96/106 (killed/equivalent/open) -> 597/97/83; g1 unchanged. No source change.
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** encoder mutation audit, phase 1, group g2 (`literals.zig`, `sequences.zig`, `fse.zig`, `huf.zig`, `hist.zig`, `blocksplit.zig`, `presplit.zig`, `superblock.zig`): 777 mutants, 575 killed, 96 equivalent, 106 open; no defect found, no source change. New tests: `src/entropy_kat_test.zig` (FSE normalization incl. every `FSE_normalizeM2` branch, `FSE_writeNCount` and `HUF_writeCTable` at every room up to libzstd's least, `HUF_optimalTableLog`'s optimal-depth search, against libzstd 1.5.7 KATs from the new recipe `tools/gen-entropy-kats.sh` / `tools/zentropy.c`) and `src/emut2_test.zig`. SPEC § Decoder, "Audit 2026-11-19 (… group g2)".
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** test only: the every-capacity test reads its dump knob only off Windows (`Environ.getPosix` does not exist there; `check-portable` caught the Windows compile failure).
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the encoder's 15 open capacity-check mutants of phase 1 settled: new test `src/room_sweep_test.zig` compares every destination capacity of the block API, the buffer-less API and `compressSequences` with libzstd 1.5.7 (goldens from the new `tools/zroom.c` / `tools/gen-room-sweep-goldens.sh`, 236 runs) and kills 7 (two of them dropped checks that indexed past `dst`); 7 argued equivalent, 1 open (a split-block partition starting with under 3 bytes left, no input found). Below 18 bytes `compressSequences` refuses the room where libzstd ignores its frame header's error; the test pins it. Details in SPEC § Audit 2026-11-19. No source change; the card is unchanged.
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** encoder mutation audit, phase 1, group g1 only (`frame.zig`, `stream.zig`, `stream_writer.zig`, `frame_writer.zig`, `fill.zig`, `params.zig`, `cdict.zig`): 716 product mutants, 460 killed, 7 equivalent, 249 open (listed in SPEC § Audit 2026-11-19); new tests in `src/emut_test.zig` (sequence-count header forms, short-room scan, stream buffer positions, prefix dictionary, `FrameWriter` level edge); the decoder's open ids 741/742 stay open. The rest of the encoder is not mutated; no source change; the card is unchanged.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** second pass over the decoder mutants left open (190): 132 more killed by new tests (`src/dopen_test.zig`, `src/dopen2_test.zig`: the piecewise decoder's stages, `begin`, raw dictionaries, stream resets and buffer shrinking, the `Reader`, Huffman tables of every log with a cell model, hand-built one-bit streams for the four-stream fast path, the seek table and `Seekable` guards), the rest argued; decoder totals 1 178 killed, 165 equivalent, 14 unobservable, 2 open (741, 742). No source change; the card is unchanged (the encoder is not mutated).
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the 4 GiB `writeSkippableFrame` source test runs only where `usize` holds 2^32 (it failed to compile for the 32-bit portable target).
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of the decoder (1 359 mutants: bit reader, `readNCount`, Huffman and FSE table decoding, literals/sequence sections, sequence execution, frame headers and size queries, dictionary loading, seekable) with 1 051 killed, 111 equivalent, 7 unobservable and 190 open (ids in SPEC § Decoder); new tests `src/dmut_test.zig` and in `dbits.zig`, `dblock.zig`, `seekable.zig` (boundary tests, a frame-header model, Huffman round trips, an `execSequence` model); no source change. The encoder is not covered, so the card keeps no mutation counts.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GL sweep (34 mutants over the sweep diff, ReleaseSafe schemata): 31 killed, 3 equivalent (argued: `checkContinuity`'s `broken` guard is unreachable since the zero-byte-write fix; dictionary FSE table logs ≤ 9 keep `freqFromFse` within the scale); 5 new tests in `src/sweep_*_test.zig`, among them a deterministic dictionary with a 12-bit Huffman code compressed at levels 16/19/22. Not a whole-module mutation score.
 - **2026-10-29** — **Behaviour change (fix):** no-panic sweep + blind review (§ GL). `Decompressor.decompress` with overlapping `dst`/`src` is a checked panic (was an aliased copy; in-place decoding is not supported, `decompressionMargin` is sizing only). `FrameWriter` / `StreamWriter` with an empty buffer work (unbuffered / own 128 KiB buffer) instead of an assert. Inputs that crashed now return existing errors: caller sequences with offset 2^32-3 (`ExternalSequencesInvalid`), `stable_in_buffer` with `pos` below the held-back input (`StabilityConditionNotRespected`), `compressSequencesAndLiterals` literals over the block size (`CannotProduceUncompressedBlock` earlier than libzstd), `copyFrom` onto itself (`StageWrong`), `decompressContinue` with an empty src after a frame (`SrcSizeWrong`), `SeekableStream.compressStream` with `pos` past `src` (`InvalidBuffer`), zdict content ≥ 4 GiB − 128 KiB (`DictionaryCreationFailed`). Fixed: a corrupt offset after the `DecompressStream` ring wraps (aliased `@memcpy`); a crafted full dictionary crashing the optimal parser (levels 16+); a zero-byte `decompressContinue` write moving the history (later blocks read bytes outside `dst`); dictionary trainer helpers dividing by zero; optimizer threads capped at 256; overflow guards in `readNCount`, zstdmt sizing (32-bit), seekable frame sizes. Output bytes unchanged for valid input.
 - **2026-10-27** — **Docs:** two speed leads measured and dropped (the prefetching sequence loop's rule re-measured over the assembly loop; libzstd's cmov address select in the double-fast match finder): findings in SPEC.md. No code change.
 - **2026-10-26** — **Performance:** the assembly sequence loop copies literals and matches 32 bytes per round (libzstd's `ZSTD_wildcopy`), and its head is 64-byte aligned: branch mispredicts on xml now equal libzstd's, xml decoding −4 % cycles. Same bytes, same errors; no API change.
 
-- **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** live oracle `tools/interop.zig` (`zig build interop-zstd`): libzstd 1.5.7 built from the pinned checkout, in-process behind `tools/c_oracle/zoracle.c`, compared with this module on generated inputs — one-shot and streaming compression (same bytes), valid and damaged frames through both decoders (same output or same error code), dictionary training. Seeds 1–5 agree; the only listed divergence is the documented error-code choice on damaged frames with a dictionary.
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
@@ -35,7 +23,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `error.FrameParameterWindowTooLarge` from `DecompressStream`, `estimateDecompressStreamSize` and
   `estimateDecompressStreamSizeFromFrame`. No change below those sizes.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: 'no per-function target features' and codegen notes labelled as 0.16 measurements, not re-checked on 0.17; std CRC/memset facts updated for 0.17.0.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0: `std.meta.Int` -> `@Int`; lazy.zig `matchMask`: removed the big-endian `@bitReverse` (0.17 vector-of-bool `@bitCast` puts lane 0 in bit 0 on every target, checked for mips); test `parts` comptime; `strRepeat` branch quota scaled with length.
@@ -93,11 +80,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   output. The `DDict` value itself (not only its content) must now stay
   alive and unmoved while a frame that uses it decodes; a
   `Decompressor.copyFrom` taken inside such a frame reads the same `DDict`.
-- **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** tests only -- 9 more
-  `ZSTD_copyCCtx` goldens (`testdata/copy_goldens.zig` gains a `params`
-  column for zcopy's new mode `F`), decoder-copy and shared-pool tests, from
-  a mutation sweep of the Z25/Z29 additions; no code under `src/` beyond
-  tests and test data changed.
 - **2026-09-28** — Faster small frames and dictionary set-up (Z32, the
   same bytes): `Compressor.compress` no longer clears 5.8 KB per call, nor
   `begin` the `btopt` statistics, nor each Huffman header its FSE table;
@@ -242,10 +224,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   power of two such as the `zstd` command's `--memory=#`; wins over
   `window_log_max`. First consumer: `example-apps/zstd-cli`, the `zstd`
   command ported onto this module (SPEC backlog Z26).
-- **2026-09-27** — **NO CONSUMER-VISIBLE CHANGE:** two decoder fuzz
-  targets in `src/fuzz_test.zig` (streamed, and with a dictionary /
-  `DDict.init` on arbitrary bytes, magicless too; SPEC backlog Z15) — test
-  code only; 1.7 M coverage-guided runs found nothing to fix.
 - **2026-09-26** — Small frames faster (SPEC backlog Z21): the tables
   cleared for every block (Huffman nodes and code table, histograms, FSE
   normalized counts) and the decoder's RLE blocks and literals no longer
@@ -416,18 +394,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   too); `tools/zref.c` gained the `loadadj`, `cdictref` and `cdictrefadj`
   modes. The context's CDict costs one copy of the dictionary more.
 
-- **2026-09-25** — **NO CONSUMER-VISIBLE CHANGE:** `cdict_goldens.zig`
-  regenerated after rebasing D1 onto D2 and Z2c's merges; +141 rows
-  (D2's own cases), the rest byte-identical.
 
-- **2026-09-25** — **NO CONSUMER-VISIBLE CHANGE:** D1's random diff loop
-  (≥3000 cases vs libzstd, fast/dfast attach) and mutation-sweep hunt
-  added 8 golden cases (`attach-dfast-cross-end`, `surv-m12-fast`,
-  `surv-m17-fast`, `surv-m22-dfast`, `surv-m23-dfast`, `surv-m24-dfast`,
-  `surv-m25-dfast`, `surv-m27-dfast`) and a `DictDef.Source.literal`
-  variant (test-only, `pub` so `dump_corpus.zig` can read it) for exact
-  hunted byte sequences a generator would not reproduce; no behaviour
-  change outside the test corpus.
 
 - **2026-09-25** — **BEHAVIOURAL, not breaking:** two Z2c corners now match
   libzstd exactly instead of an earlier, unverified reading of it (both
@@ -485,10 +452,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   dictionary goldens gain a `slice` dictionary source (a piece of an
   input).
 
-- **2026-09-24** — **NO CONSUMER-VISIBLE CHANGE:** `corpus.dict_cases_attach_fast`,
-  a test-only corpus array (`pub` only so `tools/dump_corpus.zig` can read
-  it) for the previous entry's attach goldens; nothing a consumer of the
-  module observes.
 
 - **2026-09-24** — Compression with a dictionary, attach for `fast` and
   `dfast` (SPEC backlog Z4, part D1): where libzstd would attach a `CDict`
@@ -531,12 +494,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   deliberate refusals apart); a 92-mutation sweep: 84 caught, 8
   equivalent (SPEC.md).
 
-- **2026-09-24** — **NO CONSUMER-VISIBLE CHANGE:** dictionary decoder test
-  fixtures (`src/testdata/dict_kats.zig`, generated by
-  `tools/gen-dict-testdata.sh`) and `tools/zdec.c` dict-spec arguments,
-  landed as their own commit alongside the Z2c entry below; `pub` on the
-  fixture file's byte-array constants is an artifact of it living under
-  `src/`, not a public API.
 
 - **2026-09-24** — Decoding with a dictionary (SPEC backlog Z2c): raw-content
   and zstd-format dictionaries, a digested `DDict` (`zstd.DDict.init` /
