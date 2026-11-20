@@ -338,3 +338,141 @@ test "KAT: h=2 sequential stateful walk byte-exact vs reference (leaves 0-2), ex
     // Distinct indexes produce distinct signatures over the same message.
     try std.testing.expect(!std.mem.eql(u8, &sigs[0], &sigs[1]));
 }
+
+test "Adrs: every setter writes its RFC 8391 section 2.5 word, setType clears the type-specific words, toBytes is big-endian" {
+    const Adrs = xmss.Adrs;
+    var a: Adrs = .{};
+    a.setLayerAddress(0x01020304);
+    a.setTreeAddress(0x1112131415161718);
+    a.setType(Adrs.type_hashtree);
+    a.setTreeHeight(0x31323334);
+    a.setTreeIndex(0x41424344);
+    a.setKeyAndMask(0x51525354);
+    try std.testing.expectEqualSlices(u32, &.{ 0x01020304, 0x11121314, 0x15161718, 2, 0, 0x31323334, 0x41424344, 0x51525354 }, &a.words);
+    try std.testing.expectEqual(@as(u32, 0x41424344), a.getTreeIndex());
+
+    const bytes = a.toBytes();
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 }, bytes[0..12]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x42, 0x43, 0x44, 0x51, 0x52, 0x53, 0x54 }, bytes[24..32]);
+
+    // The type word changes, everything after it resets; layer and tree stay.
+    a.setType(Adrs.type_ots);
+    try std.testing.expectEqualSlices(u32, &.{ 0x01020304, 0x11121314, 0x15161718, 0, 0, 0, 0, 0 }, &a.words);
+    a.setOtsAddress(7);
+    a.setChainAddress(8);
+    a.setHashAddress(9);
+    a.setKeyAndMask(10);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 8, 9, 10 }, a.words[4..8]);
+    a.setType(Adrs.type_ltree);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0, 0, 0, 0 }, a.words[3..8]);
+    a.setLtreeAddress(11);
+    try std.testing.expectEqual(@as(u32, 11), a.words[4]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0 }, a.words[5..8]);
+}
+
+test "ltree: starts from tree height 0 whatever the caller's address held" {
+    const seeds = refSeeds();
+    var pk_a: [xmss.wots_len][n]u8 = undefined;
+    for (&pk_a, 0..) |*node, i| {
+        for (node, 0..) |*b, j| b.* = @truncate(i * 31 + j * 7 + 3);
+    }
+    var pk_b = pk_a;
+    var fresh: xmss.Adrs = .{};
+    fresh.setType(xmss.Adrs.type_ltree);
+    fresh.setLtreeAddress(3);
+    var dirty = fresh;
+    dirty.setTreeHeight(9);
+    dirty.setTreeIndex(5);
+    dirty.setKeyAndMask(2);
+    const a = xmss.ltree(&pk_a, &seeds.pub_seed, &fresh);
+    const b = xmss.ltree(&pk_b, &seeds.pub_seed, &dirty);
+    try std.testing.expectEqualSlices(u8, &a, &b);
+}
+
+test "keyGen initialises the whole BDS state: nothing of the caller's memory survives in the key" {
+    const X = Xmss4;
+    const seeds = refSeeds();
+    var kp_a: X.KeyPair = undefined;
+    @memset(std.mem.asBytes(&kp_a), 0xAA);
+    var kp_b: X.KeyPair = undefined;
+    @memset(std.mem.asBytes(&kp_b), 0x00);
+    X.keyGen(&kp_a, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
+    X.keyGen(&kp_b, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
+    const a = &kp_a.sk.bds;
+    const b = &kp_b.sk.bds;
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a.stack), std.mem.asBytes(&b.stack));
+    try std.testing.expectEqualSlices(u5, &a.stacklevels, &b.stacklevels);
+    try std.testing.expectEqual(b.stackoffset, a.stackoffset);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a.auth), std.mem.asBytes(&b.auth));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&a.keep), std.mem.asBytes(&b.keep));
+    try std.testing.expectEqual(b.covered_idx, a.covered_idx);
+    for (a.treehash, b.treehash) |ta, tb| {
+        try std.testing.expectEqualSlices(u8, &tb.node, &ta.node);
+        try std.testing.expectEqual(tb.next_idx, ta.next_idx);
+        try std.testing.expectEqual(tb.target_h, ta.target_h);
+        try std.testing.expectEqual(tb.stackusage, ta.stackusage);
+        try std.testing.expectEqual(tb.completed, ta.completed);
+    }
+}
+
+/// Sign every leaf of `X` in order; each signature verifies, carries its index and
+/// matches the from-scratch auth path (at every leaf with `check_all`, else only at `check_idx`).
+fn sweepTree(comptime X: type, comptime check_all: bool, check_idx: []const u32) !void {
+    var sk_seed: [n]u8 = undefined;
+    var sk_prf: [n]u8 = undefined;
+    var pub_seed: [n]u8 = undefined;
+    for (&sk_seed, &sk_prf, &pub_seed, 0..) |*a, *b, *c, i| {
+        a.* = @truncate(29 * i + 3);
+        b.* = @truncate(37 * i + 5);
+        c.* = @truncate(43 * i + 9);
+    }
+    var kp: X.KeyPair = undefined;
+    X.keyGen(&kp, &sk_seed, &sk_prf, &pub_seed);
+    var sig: [X.signature_length]u8 = undefined;
+    var idx: u32 = 0;
+    while (idx < X.max_signatures) : (idx += 1) {
+        try X.sign(&kp.sk, &sig, "sweep");
+        try std.testing.expectEqual(idx, std.mem.readInt(u32, sig[0..4], .big));
+        try std.testing.expect(X.verify(kp.pk, "sweep", &sig));
+        const check = check_all or std.mem.indexOfScalar(u32, check_idx, idx) != null;
+        if (check) try expectAuthMatchesFromScratch(X, &sk_seed, &pub_seed, idx, &sig);
+    }
+    try std.testing.expectError(error.KeyExhausted, X.sign(&kp.sk, &sig, "one too many"));
+}
+
+test "BDS: odd heights h=3 and h=5 (keep array of floor(h/2) slots) sweep every leaf against the from-scratch path" {
+    try sweepTree(xmss.XmssSha2(3, 0xF0000003), true, &.{});
+    try sweepTree(xmss.XmssSha2(5, 0xF0000005), true, &.{});
+}
+
+test "BDS: h=8 sweep verifies every leaf; from-scratch differential around the half-way and last leaves" {
+    try sweepTree(xmss.XmssSha2(8, 0xF0000008), false, &.{ 0, 1, 2, 3, 126, 127, 128, 129, 252, 253, 254, 255 });
+}
+
+test "BDS: an out-of-band jump after real signing rebuilds from a clean traversal state" {
+    // The jump tests above start from a key that has never signed (stack empty).
+    // After a run of signs the shared treehash stack holds entries; the rebuild
+    // has to start from an empty one or the replayed state is not the state a
+    // key at that leaf would have.
+    const X = Xmss6;
+    const seeds = refSeeds();
+    var kp_a: X.KeyPair = undefined;
+    X.keyGen(&kp_a, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
+    var kp_b: X.KeyPair = undefined;
+    X.keyGen(&kp_b, &seeds.sk_seed, &seeds.sk_prf, &seeds.pub_seed);
+    var sig_a: [X.signature_length]u8 = undefined;
+    var sig_b: [X.signature_length]u8 = undefined;
+    var used: u32 = 0;
+    while (used < 11) : (used += 1) try X.sign(&kp_a.sk, &sig_a, "warm up");
+    kp_a.sk.bds.stackoffset = X.h; // a stack base left over from the signing above
+    kp_a.sk.idx = 37; // out-of-band jump on a key whose stack is in use
+    kp_b.sk.idx = 37; // the same jump on a key that never signed
+    var k: u32 = 0;
+    while (k < 6) : (k += 1) {
+        try X.sign(&kp_a.sk, &sig_a, "after jump");
+        try X.sign(&kp_b.sk, &sig_b, "after jump");
+        try std.testing.expectEqualSlices(u8, &sig_b, &sig_a);
+        try std.testing.expect(X.verify(kp_a.pk, "after jump", &sig_a));
+        try expectAuthMatchesFromScratch(X, &seeds.sk_seed, &seeds.pub_seed, 37 + k, &sig_a);
+    }
+}

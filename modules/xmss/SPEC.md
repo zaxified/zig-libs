@@ -6,7 +6,7 @@
 
 **Scope:** mvp — xmss-reference (RFC 8391 reference code), go-xmssmt (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-11 · mutation 2026-10-05 (23/24, 1 eq) · src ?
+**Audit:** review 2026-09-11 · mutation 2026-11-20 (190/202, 12 eq) · src e24d7cfc25f4561b
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `xmss-sign-verify` at scale 200 = 1,000 runs, each a real signature, XMSS_FUZZ) · ct 2026-10-10 (ctgrind: SK_SEED/SK_PRF through keyGen + 5 signs at h=4; 2 in-file = WOTS chain lengths from H_msg over the PUBLISHED r, an artefact)
 **Performance:** not measured
@@ -248,7 +248,20 @@ scheme's security argument collapses per-index, not per-signature.
   `SK_PRF` tainted through `keyGen` and five signs at h = 4; the 2 in-file contexts are WOTS chain lengths derived by
   `H_msg` over the PUBLISHED randomizer, an artefact.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
-  and the delta runs after it.
+  and the delta runs after it. The whole-module run (202 mutants over `root.zig`) covered
+  the ADRS words and their big-endian layout, the keyed hashes, the chain and RAND_HASH masks, base_w and the checksum,
+  the L-tree, the BDS traversal (init, treehash updates, rounds, the resync rebuild), `keyGen`, `sign` (both
+  exhaustion checks, the index advance, the resync trigger), `SigningKey` (copy guard, both locks, persist order and
+  failure), the public-key codec and every check of `verify`. 190 killed, 12 equivalent: the three `setType(type_ots)`
+  calls on a fresh address (type 0 is the all-zero default), the two `- 1` in `(odd - 1) / 2` (`treeHash`,
+  `rootFromSig`), `target_h` reassigned to the value it holds, `stackusage = 0` on a restarted instance (an instance
+  has returned its stack share before it restarts), `covered_idx = target` in `rebuildStateTo` (`signInner`
+  overwrites it), the guard `startidx < 2^h` as `<=` and as `true` (an instance for a subtree wholly past the last leaf
+  is never read; exhaustive sweeps at h = 2, 3, 4, 5, 6 and 8 agree), and `verify`'s `idx >= 2^h` (an index past the
+  tree fails the root comparison anyway, because the OTS address and H_msg both bind it). Not mutated: the stack
+  burns and `padPrefix` (comptime). Tests added in `src/kat_test.zig`: the ADRS setters and `setType`'s clearing,
+  `ltree` from a dirty address, `keyGen` over a filled `KeyPair`, odd heights h = 3 and 5, an h = 8 sweep, and a jump
+  after real signing from a corrupted stack base.
 
 ## Open
 
