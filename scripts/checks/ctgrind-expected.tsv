@@ -453,10 +453,10 @@ ed448	ReleaseFast	ladder	1	0	4cff9e0393290913	43db8426e0d6c6e7
 # context would go and the timing signal would stay -- a prettier measurement of
 # the same defect. See SPEC.md.
 # ⭐ encaps' 0 means something only because the row carries an output pin.
-hqc	ReleaseFast	decaps	1	2	b911a7c4468420c5	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	b911a7c4468420c5	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	0	b911a7c4468420c5	e91a390cf03fd6ad
-hqc	ReleaseFast	sampler	1	2	abc152dae0e59b20	b93fa60c89578576
+hqc	ReleaseFast	decaps	1	2	34d8928218541b91	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	34d8928218541b91	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	0	34d8928218541b91	e91a390cf03fd6ad
+hqc	ReleaseFast	sampler	1	2	55410fae6c5fae11	b93fa60c89578576
 # k256 2026-11-13: source pins re-pinned for field.zig (reduceLimbs split into foldLimbs + finish,
 # same computation; new mulWeak/sqWeak used only by the public ecmult) and ecmult.zig (weak field
 # form). --check k256 measured every count unchanged before re-pinning.
@@ -2239,11 +2239,11 @@ keycodec	ReleaseFast	pem	1	3	01cf014117dc5d87	3727ff639b8dfcc7
 #   A valid-length message vs the decoy differ by a 32-byte copy vs one SHA-256, but
 #   a ciphertext that decodes validly is one the sender knew the CEK of (the public
 #   key makes any such ciphertext), so no oracle is opened.
-jwe	ReleaseFast	content	1	18	50bd8b49a59125d2	5b95af95390d7044
-jwe	ReleaseFast	kw	1	5	9e5b3c091662daae	29bdefbeeb697801
-jwe	ReleaseFast	ecdh	1	8	f69c3ecaeb92bff3	0e8a78e319485b8a
-jwe	ReleaseFast	pbes2	1	3	9e5b3c091662daae	45882587fad30673
-jwe	ReleaseFast	rsa	1	20	9e5b3c091662daae	043474d84426957a
+jwe	ReleaseFast	content	1	18	44c08863762f6b88	5b95af95390d7044
+jwe	ReleaseFast	kw	1	5	878e24b05da43e38	29bdefbeeb697801
+jwe	ReleaseFast	ecdh	1	8	4bdc60d2b29b5ff4	0e8a78e319485b8a
+jwe	ReleaseFast	pbes2	1	3	878e24b05da43e38	45882587fad30673
+jwe	ReleaseFast	rsa	1	20	878e24b05da43e38	043474d84426957a
 # webhooksig (2026-11-13) — the HMAC secrets, the signature comparison, the
 # `whsec_` / `whsk_` key text. Four targets; the harness taints only the secret
 # (the key text's prefix stays public) and prints hex of every witness.
@@ -2405,10 +2405,10 @@ aes192	ReleaseFast	bitsliced	1	128	ba4c8387c14267e7	5ea64f081b0ffcbb	cpu=x86_64
 #   (jwe content trap, megolm msg trap, xmlenc cbc claim+control+trap, compiler_rt memcpy symbolised
 #   at line 0). They now use the length of the plaintext they sent, checked against the returned one
 #   under -fvalgrind. jwe rsa, xmlenc oaep and xmlenc rsa15 match their plain rows (no variant).
-jwe	ReleaseFast	content	1	487	50bd8b49a59125d2	5b95af95390d7044	cpu=x86_64 control=100 trap=100
-jwe	ReleaseFast	kw	1	332	9e5b3c091662daae	29bdefbeeb697801	cpu=x86_64 control=55 trap=55
-jwe	ReleaseFast	ecdh	1	181	f69c3ecaeb92bff3	0e8a78e319485b8a	cpu=x86_64 control=51 trap=51
-jwe	ReleaseFast	pbes2	1	182	9e5b3c091662daae	45882587fad30673	cpu=x86_64 control=29 trap=29
+jwe	ReleaseFast	content	1	487	44c08863762f6b88	5b95af95390d7044	cpu=x86_64 control=100 trap=100
+jwe	ReleaseFast	kw	1	332	878e24b05da43e38	29bdefbeeb697801	cpu=x86_64 control=55 trap=55
+jwe	ReleaseFast	ecdh	1	181	4bdc60d2b29b5ff4	0e8a78e319485b8a	cpu=x86_64 control=51 trap=51
+jwe	ReleaseFast	pbes2	1	182	878e24b05da43e38	45882587fad30673	cpu=x86_64 control=29 trap=29
 megolm	ReleaseFast	msg	1	138	4bcd2cc0b8d7321d	505eb3dc7b45f5cd	cpu=x86_64 control=1 trap=105
 megolm	ReleaseFast	skey	1	33	4bcd2cc0b8d7321d	a22db1b8b5220a74	cpu=x86_64
 megolm	ReleaseFast	pickle	1	28	4bcd2cc0b8d7321d	f06f4b1b938d2036	cpu=x86_64

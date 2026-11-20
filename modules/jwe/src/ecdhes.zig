@@ -479,3 +479,31 @@ test "PrivateKey.wipe zeroes the scalar" {
     kp.private.wipe();
     try testing.expect(std.mem.allEqual(u8, &kp.private.p256, 0));
 }
+
+test "fromCoordinates: coordinate lengths are exact, and a P-256 epk without y is refused even where (x, x) is on the curve" {
+    const long = @as([coordinate_len + 1]u8, @splat(0x01));
+    var g_x: [coordinate_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&g_x, "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296");
+    var g_y: [coordinate_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&g_y, "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
+    _ = try PublicKey.fromCoordinates(.p256, &g_x, &g_y);
+    // A valid point's coordinates with one extra octet appended: truncating would accept them.
+    const long_x = g_x ++ [_]u8{0};
+    const long_y = g_y ++ [_]u8{0};
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &long_x, &g_y));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &g_x, &long_y));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &long, &g_y));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &g_x, &long));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, g_x[0 .. coordinate_len - 1], &g_y));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &g_x, null));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.x25519, &long, null));
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.x25519, &g_x, &g_y));
+    _ = try PublicKey.fromCoordinates(.x25519, &g_x, null);
+
+    // x = 0x42cb78..add6 is a root of x^3 - x^2 - 3x + b over the P-256 field, so (x, x) IS a curve point:
+    // a parser that fell back to y = x for a missing y would accept it.
+    var r: [coordinate_len]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&r, "42cb78973c13c3e56f2d30d6d6bddf2d873b67137693d7ee5a57ccaf85a0add6");
+    _ = try PublicKey.fromCoordinates(.p256, &r, &r);
+    try testing.expectError(error.InvalidKey, PublicKey.fromCoordinates(.p256, &r, null));
+}

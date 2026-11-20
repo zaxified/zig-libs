@@ -348,3 +348,51 @@ test "aeskw (A128KW/A256KW core) re-export is live — RFC 3394 §4.1 through al
     var back: [16]u8 = undefined;
     try std.testing.expectEqualSlices(u8, &key_data, try aeskw.unwrap(&kek, ct, &back));
 }
+
+test "dirCek: a longer shared key is refused, an output of exactly cek_len suffices, a shorter one is BufferTooSmall" {
+    const shared = @as([32]u8, @splat(0xab));
+    var out: [32]u8 = undefined;
+    try std.testing.expectError(error.InvalidKey, dirCek(&shared, 16, &out));
+    var short: [15]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, dirCek(shared[0..16], 16, &short));
+    var exact: [16]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, shared[0..16], try dirCek(shared[0..16], 16, &exact));
+}
+
+test "gcmkw: an output buffer exactly as long as the key is enough, one octet less is BufferTooSmall (wrap and unwrap)" {
+    const kek = @as([16]u8, @splat(0x55));
+    const cek = @as([16]u8, @splat(0x99));
+    const iv = @as([12]u8, @splat(0x11));
+    var ct: [16]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    var short: [15]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, gcmkwWrap(&kek, iv, &cek, &short, &tag));
+    _ = try gcmkwWrap(&kek, iv, &cek, &ct, &tag);
+    try std.testing.expectError(error.BufferTooSmall, gcmkwUnwrap(&kek, iv, tag, &ct, &short));
+    var exact: [16]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &cek, try gcmkwUnwrap(&kek, iv, tag, &ct, &exact));
+}
+
+test "pbes2DeriveKek: output and salt buffers are bounded exactly (BufferTooSmall one past, accepted at the edge)" {
+    var kek_buf: [32]u8 = undefined;
+    var short: [15]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, pbes2DeriveKek(.hs256_a128kw, "pw", "12345678", 1, &short));
+    // "PBES2-HS256+A128KW" is 18 octets: 18 + 1 + 109 = 128 = max_pbes2_salt_value_len.
+    const salt = @as([109]u8, @splat(0x33));
+    try std.testing.expectEqual(@as(usize, 16), (try pbes2DeriveKek(.hs256_a128kw, "pw", &salt, 1, &kek_buf)).len);
+    try std.testing.expectError(error.BufferTooSmall, pbes2DeriveKek(.hs256_a128kw, "pw", &(salt ++ [_]u8{0x33}), 1, &kek_buf));
+}
+
+test "KAT: PBES2-HS384 and PBES2-HS512 KEKs against PBKDF2-HMAC-SHA-384/512 (independent oracle: Python hashlib.pbkdf2_hmac)" {
+    // A round trip agrees with any PRF; RFC 7517 Appendix C covers HS256 only. Vectors:
+    //   hashlib.pbkdf2_hmac("sha384", pw, b"PBES2-HS384+A192KW\x00" + p2s, 2048, 24)  (and sha512 / 32)
+    const p2s = [_]u8{ 217, 96, 147, 112, 150, 117, 70, 247, 127, 8, 155, 137, 174, 42, 80, 215 };
+    const password = "Thus from my lips, by yours, my sin is purged.";
+    const want384 = [_]u8{ 70, 140, 132, 112, 137, 245, 37, 27, 124, 246, 120, 23, 190, 113, 113, 233, 161, 38, 10, 126, 110, 243, 180, 244 };
+    const want512 = [_]u8{ 208, 113, 177, 4, 102, 56, 219, 147, 195, 248, 107, 219, 236, 209, 195, 162, 110, 255, 139, 105, 240, 26, 15, 46, 215, 54, 87, 68, 91, 214, 133, 244 };
+    const want256 = [_]u8{ 9, 201, 59, 189, 116, 27, 168, 77, 179, 70, 64, 49, 38, 85, 210, 222 };
+    var kek_buf: [32]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &want384, try pbes2DeriveKek(.hs384_a192kw, password, &p2s, 2048, &kek_buf));
+    try std.testing.expectEqualSlices(u8, &want512, try pbes2DeriveKek(.hs512_a256kw, password, &p2s, 2048, &kek_buf));
+    try std.testing.expectEqualSlices(u8, &want256, try pbes2DeriveKek(.hs256_a128kw, password, &p2s, 2048, &kek_buf));
+}

@@ -576,3 +576,80 @@ test "hashI output length and determinism" {
     hashI(&out2, "seed two");
     try t.expect(!std.mem.eql(u8, &out1, &out2));
 }
+
+test "hashJ equals SHA3-256(H(ek) || sigma || c || 0x03) (spec composition, independent oracle: Python hashlib)" {
+    // `hashJ` feeds the implicit-rejection key; the NIST KAT only holds valid ciphertexts, so nothing else pinned its
+    // inputs (h_ek, the domain byte) numerically.
+    //   hashlib.sha3_256(h_ek + sigma + c + b"\x03") with h_ek = 0..31, sigma = 100..115, c[i] = 7i + 3 (mod 256), 40 octets
+    var h_ek: [32]u8 = undefined;
+    for (&h_ek, 0..) |*b, i| b.* = @intCast(i);
+    var sigma: [16]u8 = undefined;
+    for (&sigma, 0..) |*b, i| b.* = @intCast(100 + i);
+    var c: [40]u8 = undefined;
+    for (&c, 0..) |*b, i| b.* = @intCast((i * 7 + 3) & 255);
+    const want = [32]u8{ 22, 121, 98, 220, 79, 233, 252, 7, 122, 236, 203, 169, 2, 163, 103, 239, 190, 198, 137, 75, 146, 183, 45, 1, 32, 147, 192, 59, 67, 58, 54, 45 };
+    var got: [32]u8 = undefined;
+    hashJ(&got, &h_ek, &sigma, &c);
+    try std.testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "sampleVect clears every word it is handed, also the ones past ceil(n/64)" {
+    const t = std.testing;
+    const P = params.hqc128;
+    var xof = Xof.init("sample vect long buffer");
+    var out = @as([P.words() + 2]u64, @splat(~@as(u64, 0)));
+    sampleVect(&xof, P.n, &out);
+    try t.expectEqual(@as(u64, 0), out[P.words()]);
+    try t.expectEqual(@as(u64, 0), out[P.words() + 1]);
+    var i: u32 = P.n;
+    while (i < P.words() * 64) : (i += 1) {
+        try t.expectEqual(@as(u64, 0), (out[i / 64] >> @intCast(i % 64)) & 1);
+    }
+}
+
+test "writeSupportToVector ORs into the output (the reference's `v[i] |= val`), it does not toggle" {
+    const t = std.testing;
+    var out = @as([3]u64, @splat(0));
+    out[0] = (@as(u64, 1) << 5) | (@as(u64, 1) << 9);
+    out[1] = 1;
+    const support = [_]u32{ 5, 64 };
+    writeSupportToVector(2, &support, &out);
+    try t.expectEqual((@as(u64, 1) << 5) | (@as(u64, 1) << 9), out[0]);
+    try t.expectEqual(@as(u64, 1), out[1]);
+    try t.expectEqual(@as(u64, 0), out[2]);
+}
+
+test "sampleFixedWeightBiased: no duplicate and in range over thousands of streams (a duplicate involving position 0 is rare)" {
+    // The de-duplication pass runs from the second-to-last entry down to the FIRST; a duplicate of support[0] occurs
+    // in roughly 0.4% of the streams, so one stream says nothing about that last step.
+    const t = std.testing;
+    inline for (.{ params.hqc128, params.hqc256 }) |P| {
+        var seed: [32]u8 = @splat(0);
+        var dup_with_first: usize = 0;
+        for (0..6000) |i| {
+            std.mem.writeInt(u64, seed[0..8], i, .little);
+            var xof = Xof.init(&seed);
+            var support: [P.omega_r]u32 = undefined;
+            // The raw draw, before the repair pass, to count how often the first entry needed repair.
+            var raw_xof = Xof.init(&seed);
+            var raw: [4 * P.omega_r]u8 = undefined;
+            raw_xof.getBytes(&raw);
+            const r0 = std.mem.readInt(u32, raw[0..4], .little);
+            const first: u32 = @intCast((@as(u64, r0) * P.n) >> 32);
+            sampleFixedWeightBiased(&xof, P.n, P.omega_r, &support);
+            for (support, 0..) |s, k| {
+                try t.expect(s < P.n);
+                for (support[k + 1 ..]) |s2| try t.expect(s != s2);
+            }
+            for (1..P.omega_r) |k| {
+                const rk = std.mem.readInt(u32, raw[4 * k ..][0..4], .little);
+                if (k + ((@as(u64, rk) * (P.n - k)) >> 32) == first) {
+                    dup_with_first += 1;
+                    break;
+                }
+            }
+        }
+        // The check has teeth only if streams with a duplicate of the first entry were in the sample.
+        try t.expect(dup_with_first > 0);
+    }
+}

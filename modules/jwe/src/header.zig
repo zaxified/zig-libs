@@ -648,3 +648,66 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "parse: a member of the wrong JSON type is refused, never read as absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":5,\"enc\":\"A128GCM\"}"));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":\"dir\",\"enc\":[]}"));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":\"dir\",\"enc\":\"A128GCM\",\"kid\":5}"));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":\"dir\",\"enc\":\"A128GCM\",\"cty\":{}}"));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, "{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":7}"));
+}
+
+test "parse: p2c is an unsigned 32-bit integer or the token is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fmt = "{{\"alg\":\"PBES2-HS256+A128KW\",\"enc\":\"A128GCM\",\"p2c\":{s}}}";
+    const top = try parse(a, try a.print(fmt, .{"4294967295"}));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), top.p2c);
+    for ([_][]const u8{ "4294967296", "-1", "1.5", "\"1000\"", "true", "[]", "1e3" }) |bad| {
+        try std.testing.expectError(error.InvalidHeaderField, parse(a, try a.print(fmt, .{bad})));
+    }
+}
+
+test "parse: a base64url member of impossible length or alphabet is refused, never read as absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fmt = "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\"}}";
+    // One character is no base64url string at all (length 1 mod 4).
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, try a.print(fmt, .{"A"})));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, try a.print(fmt, .{"AAAAA"})));
+    // Standard-alphabet and padding characters are not base64url without padding.
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, try a.print(fmt, .{"AA+/"})));
+    try std.testing.expectError(error.InvalidHeaderField, parse(a, try a.print(fmt, .{"AAA="})));
+}
+
+test "encode: epk coordinates and members of exactly max_member_len octets are written, one more is refused" {
+    var buf: [max_header_json_len]u8 = undefined;
+    const full = @as([max_member_len]u8, @splat(0x42));
+    const over = @as([max_member_len + 1]u8, @splat(0x42));
+    const json = try encode(&buf, .{ .alg = "ECDH-ES", .enc = "A128GCM", .epk = .{ .kty = "EC", .crv = "P-256", .x = &full, .y = &full }, .apu = &full, .apv = &full });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parse(arena.allocator(), json);
+    try std.testing.expectEqualSlices(u8, &full, parsed.epk.?.x);
+    try std.testing.expectEqualSlices(u8, &full, parsed.epk.?.y.?);
+    try std.testing.expectEqualSlices(u8, &full, parsed.apu.?);
+    try std.testing.expectEqualSlices(u8, &full, parsed.apv.?);
+    try std.testing.expectError(error.BufferTooSmall, encode(&buf, .{ .alg = "ECDH-ES", .enc = "A128GCM", .epk = .{ .kty = "EC", .crv = "P-256", .x = &over } }));
+    try std.testing.expectError(error.BufferTooSmall, encode(&buf, .{ .alg = "ECDH-ES", .enc = "A128GCM", .epk = .{ .kty = "EC", .crv = "P-256", .x = &full, .y = &over } }));
+}
+
+test "encode: a buffer too small for the header is BufferTooSmall, never a truncated header; cty round-trips" {
+    var small: [10]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, encode(&small, .{ .alg = "dir", .enc = "A128GCM" }));
+    var buf: [max_header_json_len]u8 = undefined;
+    const json = try encode(&buf, .{ .alg = "dir", .enc = "A128GCM", .cty = "jwk+json" });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parse(arena.allocator(), json);
+    try std.testing.expectEqualStrings("jwk+json", parsed.cty.?);
+}

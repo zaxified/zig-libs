@@ -533,3 +533,138 @@ test "RS corrector anchor: beyond-capacity (delta+1 errors) is deterministic and
     const got2 = RS128.decode(recv);
     try testing.expectEqualSlices(u8, &got1, &got2); // deterministic, no trap
 }
+
+/// Bare Reed-Solomon decoding for EVERY error count from 0 to delta (the tests above use exactly delta): random
+/// positions, random non-zero values, and the first and last codeword position forced in turn.
+fn rsCorrectsEveryErrorCount(comptime RSt: type, seed: u64) !void {
+    const delta = RSt.delta;
+    var rng = std.Random.DefaultPrng.init(seed);
+    const random = rng.random();
+    var w: usize = 0;
+    while (w <= delta) : (w += 1) {
+        for (0..10) |trial| {
+            var msg: RSt.Message = undefined;
+            random.bytes(&msg);
+            var cdw = RSt.encode(msg);
+            var positions: [delta]usize = undefined;
+            var count: usize = 0;
+            if (w > 0 and trial == 0) {
+                positions[0] = 0;
+                count = 1;
+            } else if (w > 0 and trial == 1) {
+                positions[0] = RSt.n1 - 1;
+                count = 1;
+            }
+            while (count < w) {
+                const pos = random.uintLessThan(usize, RSt.n1);
+                if (std.mem.findScalar(usize, positions[0..count], pos) != null) continue;
+                positions[count] = pos;
+                count += 1;
+            }
+            for (positions[0..w]) |pos| {
+                var e: u8 = 0;
+                while (e == 0) e = random.int(u8);
+                cdw[pos] ^= e;
+            }
+            const got = RSt.decode(cdw);
+            try testing.expectEqualSlices(u8, &msg, &got);
+        }
+    }
+}
+
+test "gated: RS128 corrects every error count 0..delta" {
+    if (!gate.decoder_core_implemented) return error.SkipZigTest;
+    try rsCorrectsEveryErrorCount(RS128, 11);
+}
+
+test "gated: RS192 corrects every error count 0..delta" {
+    if (!gate.decoder_core_implemented) return error.SkipZigTest;
+    try rsCorrectsEveryErrorCount(RS192, 12);
+}
+
+test "gated: RS256 corrects every error count 0..delta" {
+    if (!gate.decoder_core_implemented) return error.SkipZigTest;
+    try rsCorrectsEveryErrorCount(RS256, 13);
+}
+
+fn alphaPow(k: usize) u8 {
+    return @intCast(gf.exp[k % 255]);
+}
+
+/// Correctable error patterns whose first `lead` syndromes S_0..S_{lead-1} are all ZERO. A random pattern has S_0 = 0 with
+/// probability 1/256 only, and the Berlekamp-Massey start-up differs when the first discrepancy is zero (the initial
+/// `X_sigma_p[1] = 1` and the `mu + 1` term of the locator update only matter then). The last `lead` error values are
+/// solved from the others so that S_0 = 0 (lead 1) or S_0 = S_1 = 0 (lead 2); S_i = sum_j e_j * alpha^((i+1) j).
+fn rsCorrectsZeroLeadingSyndromes(comptime RSt: type, seed: u64, comptime lead: usize) !void {
+    const delta = RSt.delta;
+    var rng = std.Random.DefaultPrng.init(seed);
+    const random = rng.random();
+    var w: usize = lead + 1;
+    while (w <= delta) : (w += 1) {
+        var done: usize = 0;
+        while (done < 3) {
+            var positions: [delta]usize = undefined;
+            var values: [delta]u8 = undefined;
+            var count: usize = 0;
+            while (count < w) {
+                const pos = random.uintLessThan(usize, RSt.n1);
+                if (std.mem.findScalar(usize, positions[0..count], pos) != null) continue;
+                positions[count] = pos;
+                count += 1;
+            }
+            for (values[0 .. w - lead]) |*v| {
+                v.* = 0;
+                while (v.* == 0) v.* = random.int(u8);
+            }
+            // The partial syndromes of the free values, then the solve for the last `lead` ones.
+            var r0: u8 = 0;
+            var r1: u8 = 0;
+            for (positions[0 .. w - lead], values[0 .. w - lead]) |p, e| {
+                r0 ^= gf.mul(e, alphaPow(p));
+                r1 ^= gf.mul(e, alphaPow(2 * p));
+            }
+            if (lead == 1) {
+                const p = positions[w - 1];
+                values[w - 1] = gf.mul(r0, gf.inverse(alphaPow(p)));
+            } else {
+                const pa = positions[w - 2];
+                const pb = positions[w - 1];
+                const a1 = alphaPow(pa);
+                const b1 = alphaPow(pb);
+                const a2 = alphaPow(2 * pa);
+                const b2 = alphaPow(2 * pb);
+                const det_inv = gf.inverse(gf.mul(a1, b2) ^ gf.mul(b1, a2));
+                values[w - 2] = gf.mul(gf.mul(r0, b2) ^ gf.mul(b1, r1), det_inv);
+                values[w - 1] = gf.mul(gf.mul(a1, r1) ^ gf.mul(a2, r0), det_inv);
+            }
+            var all_nonzero = true;
+            for (values[0..w]) |v| {
+                if (v == 0) all_nonzero = false;
+            }
+            if (!all_nonzero) continue;
+            // The construction really zeroes the leading syndromes.
+            for (0..lead) |s| {
+                var syn: u8 = 0;
+                for (positions[0..w], values[0..w]) |p, e| syn ^= gf.mul(e, alphaPow((s + 1) * p));
+                try testing.expectEqual(@as(u8, 0), syn);
+            }
+            var msg: RSt.Message = undefined;
+            random.bytes(&msg);
+            var cdw = RSt.encode(msg);
+            for (positions[0..w], values[0..w]) |p, e| cdw[p] ^= e;
+            const got = RSt.decode(cdw);
+            try testing.expectEqualSlices(u8, &msg, &got);
+            done += 1;
+        }
+    }
+}
+
+test "gated: RS decoding with S_0 = 0 and with S_0 = S_1 = 0 (Berlekamp-Massey start-up), all three parameter sets" {
+    if (!gate.decoder_core_implemented) return error.SkipZigTest;
+    try rsCorrectsZeroLeadingSyndromes(RS128, 21, 1);
+    try rsCorrectsZeroLeadingSyndromes(RS128, 22, 2);
+    try rsCorrectsZeroLeadingSyndromes(RS192, 23, 1);
+    try rsCorrectsZeroLeadingSyndromes(RS192, 24, 2);
+    try rsCorrectsZeroLeadingSyndromes(RS256, 25, 1);
+    try rsCorrectsZeroLeadingSyndromes(RS256, 26, 2);
+}

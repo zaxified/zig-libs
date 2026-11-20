@@ -1919,3 +1919,197 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run (2026-11): behaviours no earlier test held ──────────────────────
+
+test "encryptCompact draws the CEK, the wrap IV and the PBES2 salt from the entropy, in that order" {
+    // Dropping a `random.bytes(cek)` still round-trips (the wrapped CEK is whatever the stack held) and is
+    // invisible to every round-trip test; only the content key reveals it: it must be the stream's first octets.
+    const gpa = std.testing.allocator;
+    const seed: u8 = 0x5c;
+    var prng = std.Random.DefaultPrng.init(0x6a77_655f_6d75_7421);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    const kek16 = @as([16]u8, @splat(0x77));
+
+    const Case = struct { key_alg: Alg, key: KeyMaterial };
+    const cases = [_]Case{
+        .{ .key_alg = .@"RSA-OAEP", .key = .{ .rsa_public = kp.public_key } },
+        .{ .key_alg = .@"RSA-OAEP-256", .key = .{ .rsa_public = kp.public_key } },
+        .{ .key_alg = .A128KW, .key = .{ .symmetric = &kek16 } },
+        .{ .key_alg = .A128GCMKW, .key = .{ .symmetric = &kek16 } },
+        .{ .key_alg = .@"PBES2-HS256+A128KW", .key = .{ .password = "pw" } },
+    };
+    for (cases) |c| {
+        var gen = std.Random.DefaultCsprng.init(@as([32]u8, @splat(seed)));
+        const token = try encryptCompact(gpa, c.key_alg, .A128GCM, c.key, "entropy order", "", .{ .fixed_for_test = gen.random() }, .{ .pbes2_iterations = 1000 });
+        defer gpa.free(token);
+
+        var it = std.mem.splitScalar(u8, token, '.');
+        const header_b64 = it.next().?;
+        _ = it.next().?; // encrypted key
+        var iv: [12]u8 = undefined;
+        try test_b64.Decoder.decode(&iv, it.next().?);
+        const ct_b64 = it.next().?;
+        var ct: [13]u8 = undefined;
+        try test_b64.Decoder.decode(&ct, ct_b64);
+        var tag: [16]u8 = undefined;
+        try test_b64.Decoder.decode(&tag, it.next().?);
+
+        // The same generator, asked in the same chunk sizes: the CEK first, then the wrap IV / the salt.
+        var expect = std.Random.DefaultCsprng.init(@as([32]u8, @splat(seed)));
+        var cek: [16]u8 = undefined;
+        expect.random().bytes(&cek);
+        var back: [13]u8 = undefined;
+        _ = try enc.decrypt(.A128GCM, &cek, &iv, header_b64, &ct, &tag, &back);
+        try std.testing.expectEqualStrings("entropy order", &back);
+
+        var hdr: [header.max_header_json_len]u8 = undefined;
+        const hn = try test_b64.Decoder.calcSizeForSlice(header_b64);
+        try test_b64.Decoder.decode(hdr[0..hn], header_b64);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const parsed = try header.parse(arena.allocator(), hdr[0..hn]);
+        if (c.key_alg == .A128GCMKW) {
+            var want_iv: [12]u8 = undefined;
+            expect.random().bytes(&want_iv);
+            try std.testing.expectEqualSlices(u8, &want_iv, parsed.iv.?);
+        }
+        if (c.key_alg == .@"PBES2-HS256+A128KW") {
+            var want_salt: [16]u8 = undefined;
+            expect.random().bytes(&want_salt);
+            try std.testing.expectEqualSlices(u8, &want_salt, parsed.p2s.?);
+        }
+    }
+}
+
+test "RSA-OAEP and RSA-OAEP-256 round-trip through encryptCompact/decryptCompact, each with its own hash" {
+    // The RFC 7516 A.1 KAT only decrypts RSA-OAEP (SHA-1); with the hash choice swapped on the encrypt side,
+    // or for RSA-OAEP-256 on the decrypt side, every other test stayed green.
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6a77_655f_6d75_7421);
+    var kp: rsa.KeyPair = undefined;
+    try rsa.generate(&kp, prng.random(), 1024, 65537);
+    for ([_]Alg{ .@"RSA-OAEP", .@"RSA-OAEP-256" }) |a| {
+        for ([_]Enc{ .A128GCM, .@"A128CBC-HS256" }) |e| {
+            const token = try encryptCompact(gpa, a, e, .{ .rsa_public = kp.public_key }, "rsa", "", seededForTest(), .{});
+            defer gpa.free(token);
+            const back = try decryptCompact(gpa, .{ .rsa_private = &kp.secret_key }, token, .{ .expect_alg = a, .expect_enc = e });
+            defer gpa.free(back);
+            try std.testing.expectEqualStrings("rsa", back);
+        }
+    }
+}
+
+test "PBES2-HS384 and PBES2-HS512 round-trip end to end (each variant maps to its own KDF and key wrap)" {
+    const gpa = std.testing.allocator;
+    for ([_]Alg{ .@"PBES2-HS256+A128KW", .@"PBES2-HS384+A192KW", .@"PBES2-HS512+A256KW" }) |a| {
+        const token = try encryptCompact(gpa, a, .A128GCM, .{ .password = "pw" }, "pbes2", "", seededForTest(), .{ .pbes2_iterations = 1000, .pbes2_salt_len = 8 });
+        defer gpa.free(token);
+        const back = try decryptCompact(gpa, .{ .password = "pw" }, token, .{ .expect_alg = a });
+        defer gpa.free(back);
+        try std.testing.expectEqualStrings("pbes2", back);
+        // The salt length option is honoured, not clamped to a default.
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var hdr: [header.max_header_json_len]u8 = undefined;
+        const header_b64 = token[0..std.mem.findScalar(u8, token, '.').?];
+        const hn = try test_b64.Decoder.calcSizeForSlice(header_b64);
+        try test_b64.Decoder.decode(hdr[0..hn], header_b64);
+        const parsed = try header.parse(arena.allocator(), hdr[0..hn]);
+        try std.testing.expectEqual(@as(usize, 8), parsed.p2s.?.len);
+        try std.testing.expectEqual(@as(?u32, 1000), parsed.p2c);
+    }
+}
+
+/// SHA-256(domain || extra...) truncated to a 16-octet CEK — what a forger who does NOT hold the key can compute.
+fn forgedDecoy(parts: []const []const u8) [16]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("zig-libs/jwe decoy CEK v1");
+    for (parts) |p| h.update(p);
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return digest[0..16].*;
+}
+
+test "the decoy CEK is keyed: a token sealed under the key-less hash of its Encrypted Key does not open" {
+    // RFC 7516 §11.5's decoy replaces the CEK after a failed unwrap. If the key were not mixed in, anyone could
+    // compute it from the token alone and forge a token that "decrypts" through a deliberately broken unwrap.
+    const gpa = std.testing.allocator;
+    const bad_ek = @as([24]u8, @splat(0x01));
+    const kek = @as([16]u8, @splat(0x77));
+    const forged_sym = try tokenWithCek(gpa, "{\"alg\":\"A128KW\",\"enc\":\"A128GCM\"}", &bad_ek, forgedDecoy(&.{&bad_ek}), "forged");
+    defer gpa.free(forged_sym);
+    try std.testing.expectError(error.AuthenticationFailed, decryptCompact(gpa, .{ .symmetric = &kek }, forged_sym, .{}));
+
+    const hdr = "{\"alg\":\"PBES2-HS256+A128KW\",\"enc\":\"A128GCM\",\"p2s\":\"AQIDBAUGBwg\",\"p2c\":10}";
+    const forged_pw = try tokenWithCek(gpa, hdr, &bad_ek, forgedDecoy(&.{&bad_ek}), "forged");
+    defer gpa.free(forged_pw);
+    try std.testing.expectError(error.AuthenticationFailed, decryptCompact(gpa, .{ .password = "pw" }, forged_pw, .{}));
+}
+
+test "PBES2 without p2s or without p2c is refused, not decrypted under made-up defaults" {
+    const gpa = std.testing.allocator;
+    var kek_buf: [32]u8 = undefined;
+    // What a lenient parser would derive if it defaulted the missing member.
+    const kek = try alg.pbes2DeriveKek(.hs256_a128kw, "pw", "12345678", 1000, &kek_buf);
+    const cek = @as([16]u8, @splat(0x5a));
+    var ek: [24]u8 = undefined;
+    _ = try aeskw.wrap(kek, &cek, &ek);
+    for ([_][]const u8{
+        "{\"alg\":\"PBES2-HS256+A128KW\",\"enc\":\"A128GCM\",\"p2c\":1000}",
+        "{\"alg\":\"PBES2-HS256+A128KW\",\"enc\":\"A128GCM\",\"p2s\":\"MTIzNDU2Nzg\"}",
+    }) |hdr| {
+        const token = try tokenWithCek(gpa, hdr, &ek, cek, "forged");
+        defer gpa.free(token);
+        try std.testing.expectError(error.AuthenticationFailed, decryptCompact(gpa, .{ .password = "pw" }, token, .{}));
+    }
+}
+
+test "ECDH-ES: a missing epk, an unknown curve and a cross-curve epk are typed errors" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const z = @as([16]u8, @splat(0));
+    var x_b64: [43]u8 = undefined;
+    _ = test_b64.Encoder.encode(&x_b64, &@as([32]u8, @splat(9)));
+    const x25519_sk = ecdhes.PrivateKey{ .x25519 = @as([32]u8, @splat(0x33)) };
+
+    const no_epk = try buildCompact(a, "{\"alg\":\"ECDH-ES\",\"enc\":\"A128GCM\"}", "", &z, &z, &z);
+    try std.testing.expectError(error.MalformedToken, decryptCompact(gpa, .{ .ec_private = &x25519_sk }, no_epk, .{}));
+
+    const p384 = try buildCompact(a, try a.print("{{\"alg\":\"ECDH-ES\",\"enc\":\"A128GCM\",\"epk\":{{\"kty\":\"EC\",\"crv\":\"P-384\",\"x\":\"{s}\",\"y\":\"{s}\"}}}}", .{ x_b64, x_b64 }), "", &z, &z, &z);
+    try std.testing.expectError(error.CurveMismatch, decryptCompact(gpa, .{ .ec_private = &x25519_sk }, p384, .{}));
+
+    // A P-256 epk (without its y, i.e. not even decodable as a P-256 point) against an X25519 recipient is a
+    // curve mismatch BEFORE any point decoding — not an InvalidKey from the decoder.
+    const p256_no_y = try buildCompact(a, try a.print("{{\"alg\":\"ECDH-ES\",\"enc\":\"A128GCM\",\"epk\":{{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{s}\"}}}}", .{x_b64}), "", &z, &z, &z);
+    try std.testing.expectError(error.CurveMismatch, decryptCompact(gpa, .{ .ec_private = &x25519_sk }, p256_no_y, .{}));
+}
+
+test "an unknown enc is UnsupportedEnc even when the caller pinned another alg or enc" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key = @as([16]u8, @splat(0x2b));
+    const z = @as([16]u8, @splat(0));
+    const bad_enc = try buildCompact(a, "{\"alg\":\"dir\",\"enc\":\"XYZ\"}", "", &z, &z, &z);
+    try std.testing.expectError(error.UnsupportedEnc, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, bad_enc, .{ .expect_enc = .A256GCM }));
+    try std.testing.expectError(error.UnsupportedEnc, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, bad_enc, .{ .expect_alg = .A128KW }));
+}
+
+test "a GCMKW key of an impossible length is UnsupportedKeyLength, a configuration error, not folded into the decoy path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const kek20 = @as([20]u8, @splat(0x77));
+    const iv = @as([12]u8, @splat(0x31));
+    const tag = @as([16]u8, @splat(0x32));
+    var ivb: [16]u8 = undefined;
+    var tb: [22]u8 = undefined;
+    const hdr = try a.print("{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, &iv), test_b64.Encoder.encode(&tb, &tag) });
+    const z = @as([16]u8, @splat(0));
+    const token = try buildCompact(a, hdr, &z, &z, &z, &z);
+    try std.testing.expectError(error.UnsupportedKeyLength, decryptCompact(std.testing.allocator, .{ .symmetric = &kek20 }, token, .{}));
+}

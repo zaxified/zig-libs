@@ -6,7 +6,7 @@
 
 **Scope:** parity — HQC reference v5.0.0 (spec of 2025-08-22), as packaged in liboqs 0.16.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-04 (26/29, 3 eq) · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-21 (256/275, 19 eq) · src b0c9e1401a6c0e29
 
 **Hardening:** fuzz 2026-10-07 (100,000 runs clean, HQC_FUZZ, roundtrip and implicit reject) · ct 2026-09-09 (ctgrind) · panic 2026-10-30 (sweep + blind review: Ring/sampleVect caller asserts → checked panics, comptime parameter guards, `stack_bytes` documented; delta audit 12/13 + 1 eq)
 
@@ -399,6 +399,7 @@ transcription); the first three `count`s per parameter set are embedded in `kat_
 `seed_kem` then `coins` off that one continuing stream, and asserts `keypair`'s `(ek, dk)`, `encaps`'s `(ct, ss)` and
 `decaps(dk, ct)`'s recovered `ss` are all byte-exact against the vector — the end-to-end check for the whole module.
 
+- **Mutation.** A whole-module strict schemata run: 275 mutants over `kem.zig` (the re-encryption compare in every region, the implicit-rejection key inputs, the select, the key and ciphertext layouts), `pke.zig`, `prng.zig` (domain bytes, both samplers, the Barrett reduction, `sampleVect`, `writeSupportToVector`), `gf2x.zig`, `gf256.zig`, `reedmuller.zig`, `reedsolomon.zig` (syndromes, each Berlekamp-Massey step, the additive FFT, the Forney values) and `code.zig`. 256 are killed and 19 equivalent. The run found gaps that are now closed by tests: `hashJ` pinned against an independent SHA3 composition (its `h_ek` and domain byte were free), the de-duplication of the biased sampler's first entry (6000 streams per set), `sampleVect` clearing the whole output, `writeSupportToVector` ORing into its output, `weight`, the partial-word branch of `truncate`, and Reed-Solomon decoding at every error count from 0 to delta (the older tests used exactly delta) and with `S_0 = 0` / `S_0 = S_1 = 0`. Equivalent: the salt octets of the FO compare (the re-encrypted ciphertext copies the received salt), `truncate` in `truncatedBytes` (n1n2 is a multiple of 8, the cut bits are never copied), `|` for `^` on disjoint masks in the select, the `t == 0` sign mask of the RM decoder, the unreachable `radixConv(1)` arm, the cost-only polynomial-size hints of the FFT, `w[0]` (always `sigma(0) = 1`), the never-read `z[0]`, the unused-slot masks and the degree masks of the Z polynomial (they differ only on uncorrectable words, whose result decaps discards: `m' != m` makes `ct' != ct`), and two Berlekamp-Massey start-up details (`X_sigma_p[1]` and the `mu + 1` term: the algorithm converges on the unique minimal locator for at most delta errors, checked with leading-zero-syndrome patterns). Parameter tables are comptime and not mutated; neither is the constant-time asm barrier.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
 

@@ -6,7 +6,7 @@
 
 **Scope:** core — go-jose v4.1.5 / panva jose (JWE compact) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-10-05 (32/35, 3 eq) · src ?
+**Audit:** review 2026-09-03 · mutation 2026-11-21 (172/178, 6 eq) · src 59f481e58c37917b
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWE_FUZZ) · ct 2026-11-13 (ctgrind, decrypt side, tainted key per kind: dir CEK 18, AxxxKW/GCMKW KEK 5, ECDH-ES static key 8, PBES2 password 3, RSA-OAEP key 20 in-file, unattributed 0; every context is a designed public verdict, itemised under Constant-time; the encrypt side draws its secrets internally and emits only public ciphertext, so it takes no tainted input) · panic 2026-11-13 (sweep of every pub entry point: an `apu`/`apv`/`iv`/`tag`/`p2s`/`epk` member over 128 bytes overran the header encoder's base64 scratch, now `HeaderTooLarge`/`BufferTooSmall`; the Concat KDF accepts an empty output and panics with a checked message beyond its 32-bit fields; a GCM plaintext past 2^36 - 32 bytes is `BufferTooSmall`)
 
@@ -250,6 +250,7 @@ Run: `scripts/modtest jwe`. Tests sit beside the code (`src/root.zig`, `enc.zig`
   parser.
 - **Constant time:** the ctgrind harness (`src/ctgrind_harness.zig`) and its pinned table, see
   *Constant-time (ctgrind)*.
+- **Mutation.** A whole-module strict schemata run over `header.zig`, `root.zig`, `alg.zig`, `enc.zig` and `ecdhes.zig`: 178 mutants on the header parse (member type, base64url length and alphabet, `p2c` range, member caps at `max_member_len`, `zip`/`crit`) and encode caps, the `p2c` bound and `p2s` minimum, the RFC 7516 section 11.5 collapse (each error class kept apart) and the decoy CEK, the `alg`/`enc` dispatch (RSA-OAEP hash, PBES2 variant and PRF, KEK sizes, AlgorithmID, entropy draws), the empty-Encrypted-Key rules, every length check of the GCM and CBC-HMAC primitives and their tag compares, the ECDH-ES curve and coordinate checks and the Concat KDF. 172 are killed and 6 equivalent. 64 survived the first pass and are now killed by tests: the CEK, wrap IV and PBES2 salt coming from the entropy in order, RSA-OAEP and RSA-OAEP-256 and all three PBES2 variants end to end, the decoy being keyed (a token sealed under the key-less hash of its Encrypted Key does not open), a missing `p2s` or `p2c` refused, the ECDH-ES typed errors, PBES2-HS384/HS512 key derivation against an independent PBKDF2 oracle, exact length edges of every primitive, and a P-256 `epk` without `y` where `(x, x)` is a curve point. Equivalent: `encryptCompact`'s unknown-`enc` check (the next line returns the same error), the CBC-HMAC empty-ciphertext check (unpadding refuses it with the same error), `OutOfMemory` kept out of the collapse (`unwrapCek` never allocates), and three decoy details only a holder of the key can observe (domain string, binding to the Encrypted Key, the tail beyond the digest of a 64-octet CEK). Not mutated: the point arithmetic (owned by `p256`) and the dead-stack burns.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
   mutation run and the delta runs after it.
 

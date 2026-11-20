@@ -663,3 +663,96 @@ test "std-only sanity oracle: reproduces RFC 7518 B.1 E and T from std.crypto al
     mac.final(&full_tag);
     try std.testing.expectEqualSlices(u8, &b1.t, full_tag[0..16]);
 }
+
+test "gcm: every length the caller hands in is checked, exactly (key, iv, output, tag)" {
+    const pt = @as([16]u8, @splat(0x61));
+    const aad = "header";
+    inline for (.{ .{ Enc.A128GCM, 16 }, .{ Enc.A192GCM, 24 }, .{ Enc.A256GCM, 32 } }) |c| {
+        const e: Enc = c[0];
+        const kl: usize = c[1];
+        const key = @as([kl + 1]u8, @splat(0x2b));
+        const iv = @as([13]u8, @splat(0x24));
+        var ct: [16]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        const n = try encrypt(e, key[0..kl], iv[0..12], aad, &pt, &ct, &tag);
+        try std.testing.expectEqual(@as(usize, 16), n);
+        // encrypt
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, key[0 .. kl + 1], iv[0..12], aad, &pt, &ct, &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, key[0 .. kl - 1], iv[0..12], aad, &pt, &ct, &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, key[0..kl], iv[0..13], aad, &pt, &ct, &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, key[0..kl], iv[0..11], aad, &pt, &ct, &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, key[0..kl], iv[0..12], aad, &pt, ct[0..15], &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, key[0..kl], iv[0..12], aad, &pt, &ct, tag[0..15]));
+        // decrypt
+        var back: [16]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 16), try decrypt(e, key[0..kl], iv[0..12], aad, &ct, &tag, &back));
+        try std.testing.expectEqualSlices(u8, &pt, &back);
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, key[0 .. kl + 1], iv[0..12], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, key[0 .. kl - 1], iv[0..12], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, key[0..kl], iv[0..13], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, key[0..kl], iv[0..11], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, key[0..kl], iv[0..12], aad, &ct, &tag, back[0..15]));
+        var tag17: [17]u8 = undefined;
+        @memcpy(tag17[0..16], &tag);
+        tag17[16] = 0;
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, key[0..kl], iv[0..12], aad, &ct, &tag17, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, key[0..kl], iv[0..12], aad, &ct, tag17[0..15], &back));
+    }
+}
+
+test "cbc-hmac: every length the caller hands in is checked, exactly (cek, iv, output, tag)" {
+    const pt = @as([16]u8, @splat(0x61));
+    const aad = "header";
+    inline for (.{ .{ Enc.@"A128CBC-HS256", 32, 16 }, .{ Enc.@"A192CBC-HS384", 48, 24 }, .{ Enc.@"A256CBC-HS512", 64, 32 } }) |c| {
+        const e: Enc = c[0];
+        const cl: usize = c[1];
+        const tl: usize = c[2];
+        const cek = @as([cl + 1]u8, @splat(0x2b));
+        const iv = @as([17]u8, @splat(0x24));
+        var ct: [32]u8 = undefined; // a whole extra pad block
+        var tag: [tl]u8 = undefined;
+        const n = try encrypt(e, cek[0..cl], iv[0..16], aad, &pt, &ct, &tag);
+        try std.testing.expectEqual(@as(usize, 32), n);
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, cek[0 .. cl + 1], iv[0..16], aad, &pt, &ct, &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, cek[0 .. cl - 1], iv[0..16], aad, &pt, &ct, &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, cek[0..cl], iv[0..17], aad, &pt, &ct, &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, cek[0..cl], iv[0..15], aad, &pt, &ct, &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, cek[0..cl], iv[0..16], aad, &pt, ct[0..31], &tag));
+        try std.testing.expectError(error.BufferTooSmall, encrypt(e, cek[0..cl], iv[0..16], aad, &pt, &ct, tag[0 .. tl - 1]));
+
+        var back: [32]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 16), try decrypt(e, cek[0..cl], iv[0..16], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, cek[0 .. cl + 1], iv[0..16], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, cek[0 .. cl - 1], iv[0..16], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, cek[0..cl], iv[0..17], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, cek[0..cl], iv[0..15], aad, &ct, &tag, &back));
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, cek[0..cl], iv[0..16], aad, &ct, tag[0 .. tl - 1], &back));
+        // The output-size check comes BEFORE the tag is looked at: a short buffer with a bad tag is a caller error, not an auth failure.
+        var bad_tag = tag;
+        bad_tag[0] ^= 1;
+        try std.testing.expectError(error.BufferTooSmall, decrypt(e, cek[0..cl], iv[0..16], aad, &ct, &bad_tag, back[0..31]));
+    }
+}
+
+test "cbc-hmac decrypt: a ciphertext that is empty or not block-aligned is AuthenticationFailed even under a VALID tag (no panic)" {
+    // The sender holds the key, so it can MAC any bytes it likes; the receiver must still refuse
+    // them cleanly rather than reach the block-aligned decrypt.
+    const Hmac = cbc_hmac.hmac.HmacSha256;
+    const cek = @as([32]u8, @splat(0x2b));
+    const iv = @as([16]u8, @splat(0x24));
+    const aad = "header";
+    var al: [8]u8 = undefined;
+    std.mem.writeInt(u64, &al, aad.len * 8, .big);
+    for ([_]usize{ 0, 1, 15, 17, 31 }) |n| {
+        const ct = @as([31]u8, @splat(0x7e));
+        var full: [32]u8 = undefined;
+        var mac = Hmac.init(cek[0..16]);
+        mac.update(aad);
+        mac.update(&iv);
+        mac.update(ct[0..n]);
+        mac.update(&al);
+        mac.final(&full);
+        var out: [32]u8 = undefined;
+        try std.testing.expectError(error.AuthenticationFailed, decrypt(.@"A128CBC-HS256", &cek, &iv, aad, ct[0..n], full[0..16], &out));
+    }
+}

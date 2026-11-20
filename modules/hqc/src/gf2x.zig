@@ -729,3 +729,39 @@ test "truncate zeroes bits >= n1n2, keeps bits below" {
     try t.expectEqual(@as(u1, 0), R128.getBit(v, P.n1n2()));
     try t.expectEqual(@as(u1, 0), R128.getBit(v, P.n - 1));
 }
+
+test "weight counts every set bit of every word" {
+    const t = std.testing;
+    try t.expectEqual(@as(u32, 0), R128.weight(R128.zero));
+    var v = R128.zero;
+    R128.setBit(&v, 0);
+    R128.setBit(&v, 63);
+    R128.setBit(&v, 64);
+    R128.setBit(&v, params.hqc128.n - 1);
+    try t.expectEqual(@as(u32, 4), R128.weight(v));
+    var full: R192.Elem = @as([R192.words]u64, @splat(~@as(u64, 0)));
+    R192.maskTop(&full);
+    try t.expectEqual(params.hqc192.n, R192.weight(full));
+}
+
+test "truncate at a bit count that is not a multiple of 64 keeps exactly the low bits (partial-word branch)" {
+    // The three parameter sets all truncate at a multiple of 64, so only this test reaches the partial-word mask.
+    const t = std.testing;
+    inline for (.{ R128, R192, R256 }) |R| {
+        for ([_]u32{ 1, 7, 63, 65, 100, 127, 129, R.bit_len - 1 }) |keep| {
+            var full: R.Elem = @as([R.words]u64, @splat(~@as(u64, 0)));
+            R.maskTop(&full);
+            R.truncate(&full, keep);
+            try t.expectEqual(keep, R.weight(full));
+            var i: u32 = 0;
+            while (i < R.bit_len) : (i += 1) {
+                try t.expectEqual(@as(u1, @intFromBool(i < keep)), R.getBit(full, i));
+            }
+        }
+        // At or beyond n nothing is cleared.
+        var all: R.Elem = @as([R.words]u64, @splat(~@as(u64, 0)));
+        R.maskTop(&all);
+        R.truncate(&all, R.bit_len);
+        try t.expectEqual(@as(u32, R.bit_len), R.weight(all));
+    }
+}
