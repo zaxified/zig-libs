@@ -18,15 +18,12 @@ CIDR/prefix math, and the Go `net/netip` + `go4.org/netipx` surface (zones,
   a slice of prefixes and take an allocator to build it. The bound is
   `2·width − 2` prefixes for a single range (62 for IPv4, 254 for IPv6),
   which is the standard result for a range-to-prefix decomposition.
-  Corrected 2026-09-04 — it said "none, anywhere".
 
 Provenance: clean-room from RFC 6724 and RFC 5952; cross-checked against Go
 `net/addrselect` (BSD-3-Clause, The Go Authors) and the glibc `getaddrinfo`
 algorithm. The CIDR/prefix operations (`Prefix`, `summarize`, `mergePrefixes`)
 model after Go `net/netip.Prefix` (BSD-3-Clause) and `go4.org/netipx`
-(BSD-3-Clause) — behavior only, clean-room, no source consulted or copied. No
-fping code is involved — an earlier note claiming otherwise was a bookkeeping
-error. DATA: `src/rfc6724_vectors.zig` holds the destination orders glibc 2.43
+(BSD-3-Clause) — behavior only, clean-room, no source consulted or copied. DATA: `src/rfc6724_vectors.zig` holds the destination orders glibc 2.43
 `getaddrinfo` and the IPv6 sources Linux 7.0 chose on this machine, and
 `src/parse_vectors.zig` the verdicts and texts of glibc `inet_pton`/`inet_ntop`
 and Python 3.14 `ipaddress`, `src/netip_vectors.zig` the answers of Go 1.26
@@ -121,3 +118,9 @@ _ = try set.removeFreePrefix(gpa, 24);                     // removeFreePrefix
   accumulating errors; `removeFreePrefix` only picks a prefix whose family can
   hold the requested length (netipx can pick a v4 one for `/64` and return an
   invalid prefix with ok = true) and returns null for a length past 128.
+
+## Not provided
+
+Resolving a zone name to an interface, DNS, connecting, and the RFC 6724 rules that need per-interface OS
+state; longest-prefix match with values and an opt-in strict-zone parse are open: see SPEC.md *What is
+deliberately not done* and *Backlog / deferred*.

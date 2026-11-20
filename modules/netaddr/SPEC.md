@@ -18,7 +18,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: the README's `Provenance:` line.
 
 ## Compared with
 
@@ -36,6 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** of every Zig alternative by a wide margin — CIDR ops, range↔prefix summarization, and RFC 6724 destination/source selection, which even Go's `netip` does not expose; parse/format checked against glibc `inet_pton` and Python `ipaddress` on millions of inputs (Anchoring section). **Where we are behind:** nothing the grade probe 2026-11-05 marked core: masks and mask-to-length (`Prefix.netmask`/`hostmask`/`fromNetmask`, `maskToPrefixLen`) and ipnet's `subnets(new_len)` (`Prefix.subnets`, a lazy `SubnetIterator` with a saturating `count`) were added that day. The netip helpers, zones, `AddrPort` and netipx's `IPRange`/`IPSet` were added 2026-10-07. Deliberate differences, none of them a missing capability: a zone is capped at 31 bytes (Go: any length); `parseAddrPort` refuses a port with a leading zero (the module's F8 rule; Go takes `:080`); set-builder errors are returned at the call rather than accumulated; `removeFreePrefix` never returns netipx's invalid-prefix-with-ok answer (Anchoring).
 
 ## Design & invariants
+
 Allocation model: none in the scalar API — parse/format work on caller buffers
 (`max_ip_text_len`/`max_prefix_text_len`), `sortDestinations` uses a fixed `max_sort_candidates`
 stack array; only `summarize`/`mergePrefixes`, `IpRange.prefixes` and the `IpSet`/`IpSetBuilder` family allocate, via a caller allocator (a slice is returned as an owned
@@ -45,12 +46,12 @@ family distinction: an IPv4-mapped v6 address stays `.v6`; a v4 `Prefix` never c
 address — mixing requires explicit `Ip.unmap`. All prefix bit math runs on the address as a
 big-endian unsigned int, so numeric order equals address order for both families. RFC 6724
 destination-rule coverage matches Go: rules 1/2/5/6/8/9 (rule 9 IPv6-only, per Go issues
-13283/18518); source rules 1/2/6/8. Rules needing OS state (deprecated/home/interface/transport)
+13283/18518); source rules 1/2/6/8. Rules needing OS state (deprecated, home address, interface, transport)
 are skipped, as glibc and Go document. Sorts are stable (rule 10) via insertion sort. `Scope` is a
 numeric-backed non-exhaustive enum so unnamed multicast scopes order correctly. The RFC 6724
 selection logic is clean-room from the RFC, covering the full rule
 set and cross-checked row-for-row against Go `net/addrselect.go` + glibc getaddrinfo; CIDR/prefix
-ops model after Go `net/netip.Prefix` + `go4.org/netipx` (behavior only, clean-room) — see NOTICE.
+ops model after Go `net/netip.Prefix` + `go4.org/netipx` (behavior only, clean-room) — see the README's `Provenance:` line.
 
 Zones: `Ip` stays zone-less — about twenty modules switch on its two
 variants, and a zone inside it would make every value carry 32 more bytes and
@@ -67,95 +68,96 @@ O(n log n)) only when a removal, `complement`, `intersect` or `toSet` needs
 the current membership, which keeps netipx's rule that a removal affects only
 earlier adds. `complement` is over both families.
 
-## Threat model / out of scope
-Not security-sensitive; pure logic. `systemSource` is the only impure, Linux-only surface — a
-UDP-`connect` route probe (no packet sent) + `getsockname` to learn the OS-chosen source (the
-glibc trick); needs no privileges, returns `null` on an unreachable destination. Out of scope: DNS
-resolution, actually connecting, resolving a zone name to an interface (zones are carried as
-opaque text by `ZonedIp`/`AddrPort`, rejected by the zone-less `parseIp*`, passed through
-untouched by `parseHostPort`), and the RFC 6724 rules that require per-interface OS state.
+Integer form: `ipToInt`/`ipFromInt` move a v6 address through two `u64` halves rather than one
+`u128` `readInt`/`writeInt`, because Zig 0.17 lowers the wide form to a per-byte loop (#36256,
+about 8x the instructions on every compare, contains and set operation).
+
+`Ip.key(v6_bits)` returns a fixed-size `[16]u8` map key for per-client state (rate limits,
+per-viewer maps): IPv4 is its 4 bytes followed by 12 zero bytes (the bits argument is ignored); IPv6
+is masked to its first `v6_bits` bits, clamped to 128 (no error path, no panic; the clamp
+`Prefix.masked` also applies). It is a convenience over `prefix(bits).?.network()` that needs no
+family branch at the call site. It does not unmap: `::ffff:a.b.c.d` keys as a v6 address, and an IPv6
+`a.b.c.d::` collides with IPv4 `a.b.c.d` (documented on the function); call `unmap()` first if the two
+spellings of one client must share a key.
+
+The module is the shared address substrate for `http`, `dns`, `icmp`, `probe` and `procnet`.
+
+## Threat model / limits
+
+Not security-sensitive; pure logic. Parsing and formatting never panic (`parseIp*`/`parsePrefix`/
+`parseHostPort` return `null`); `Zone.slice` and `AddrIterator.next` are total, and `IpSet.rangeAt`
+past `rangeCount()` is a checked panic in every build mode. `IpSetBuilder` alternation of
+adds and removals is O(n log n). A parsed zone keeps any byte (CR, LF, NUL, `]`) and formatting writes
+it back, as Go does (documented on `Zone`): a caller that puts a zone into a log line or a header must
+sanitise it. `systemSource` is the only impure, Linux-only surface: a UDP-`connect` route probe (no
+packet sent) + `getsockname` to learn the OS-chosen source (the glibc trick); it needs no privileges
+and returns `null` on an unreachable destination. `Builder`/`IpSet` errors for a malformed `IpRange`
+are returned at the call. Out of scope: see *What is deliberately not done*.
 
 ## Verification
-Unit tests only (the core needs no network): strict parse accept/reject tables for
-v4/v6/prefix/host:port, RFC 5952 canonical-format round-trips (zero-compression edge cases, mixed
-mapped-v4 notation), the RFC 6724 §2.1 policy table + §2.2 `commonPrefixLen` + §10.2 worked
-pairwise-ordering examples, source-selection rules, the RFC 6724 oracle replay (glibc destination
-order, kernel IPv6 source choice — Anchoring), the frozen parse/format/prefix oracle (glibc
-`inet_pton`/`inet_ntop`, Python `ipaddress` — Anchoring), CIDR ops (contains/overlaps/first-last-host/
-broadcast/supernet/iterator), `summarize`/`mergePrefixes` minimal-covering checks, the Go
-parity surface by name (`src/netip_api_test.zig`, including the set algebra against a brute-force
-bitmap model) and replayed against Go (`src/netip_oracle_test.zig`). One Linux-only
-live test exercises `systemSource` against loopback. Run: `zig build test-netaddr`.
 
-**Mutation + review (2026-10-25,** after the `u64`-halves and `octetAt` parser changes).
-477 schemata mutants over all non-test code of `src/root.zig` (parse/format, `Prefix`
-arithmetic, ranges, `IpSet`/`IpSetBuilder`, RFC 6724 scope/label/precedence and both
-selections): 452 killed, 25 argued equivalent (among them: the fast path off, a second `:`
-in `host:port` that `parsePort` refuses anyway, `x|h == (x&m)|h`, a mask for `fec0::/10` once `fe80::/10`
-is taken out earlier, rule 1 for the second source when it equals the destination), 0 alive.
-The first run left 80; `src/audit_test.zig` (9 tests: family-aware set queries, builder
-removal order and clone state, supernet and host edges, `IpRange.eql`, RFC 6724 corners) kills
-the 55 that were not equivalent. Review of the whole file: no defect.
+Run: `scripts/modtest netaddr`; the oracles are re-taken by `zig build interop-netaddr [-- --check]`
+(see *Anchoring*). The core needs no network.
+
+- Strict parse accept/reject tables for v4/v6/prefix/host:port, RFC 5952 canonical-format round-trips
+  (zero-compression edge cases, mixed mapped-v4 notation), the RFC 6724 §2.1 policy table + §2.2
+  `commonPrefixLen` + §10.2 worked pairwise-ordering examples, source-selection rules, CIDR ops
+  (contains/overlaps/first-last-host/broadcast/supernet/iterator), `summarize`/`mergePrefixes`
+  minimal-covering checks, `Ip.key` against `prefix(bits).?.network()` for every width 0..128.
+- Oracles (`src/rfc6724_oracle_test.zig`, `src/parse_oracle_test.zig`, `src/netip_oracle_test.zig`;
+  producers `tools/rfc6724_oracle.py`, `tools/parse_oracle.py`, `tools/go_netip_oracle`; see *Anchoring*).
+- The Go parity surface by name (`src/netip_api_test.zig`, including the set algebra against a
+  brute-force bitmap model) and edge cases pinned by mutation survivors (`src/audit_test.zig`).
+- One Linux-only live test exercises `systemSource` against loopback.
+- Fuzz: `src/fuzz_test.zig`, deterministic driver `NETADDR_FUZZ=<runs>[,<first seed>]` (testkit's fuzz
+  driver), a round-trip oracle.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Performance
 
-**The field, 2026-10-25** (`zig build bench-netaddr`, `BENCH_ROUNDS=5`): ref 0.24–0.89× Go; against the fastest of Rust std, ipnet 2.12.1, glibc and Go every row is 0.24–1.05× except `sort_mixed`, 2.21× Rust `sort_unstable` (1.89× in an earlier run the same day; the std sort, see Backlog). The card carries these figures.
+`zig build bench-netaddr` (`BENCH_ROUNDS`, ReleaseFast; `tools/bench.zig`, with Go, Rust and glibc
+comparison programs under `tools/`). The card's `**Performance:**` line carries the figures. The
+bench's `sort_mixed` row sorts with zig-libs `sort` (ipnsort, a bench-only dep), the sort a Zig user
+would reach for; `IpSetBuilder` keeps `std.sort.pdq` so that `sort` does not become a production
+dependency of a widely consumed module (`set_build` is already well below Go).
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-netaddr`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions): ref 0.27–0.95×, against 0.24–0.88× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side).
+## What is deliberately not done
 
-**Mutation + review (2026-11-12, whole module,** production part of `root.zig` (lines 1–2190; the 2026-11-07 list remapped to the current source — 10 rows replaced where the code moved, e.g. the binary search that became `endsBefore` + `std.sort.partitionPoint` — plus 34 mutants on lines that carried none: `isV4Mapped`, `netMask`/`maskToPrefixLen` arithmetic, `rangeBlockBits`, `resolveLog`, `normalizeSpans`, `systemSource` socket type/flags/close, format and slice lengths; the 27 RFC 6724 policy rows applied at lookup), schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 824 mutants, 783 killed (3 by timeout), 38 equivalent + 3 unobservable, 0 undecided, no defect. New tests: `IpSet` lookups stay monotone when v6 spans end below a v4 query (the old three-span probe sequence never reached the v6 span; a mutant comparing across families made `contains(1.2.3.4)` false), `systemSource` closes its probe socket (lowest free fd before and after six calls). Equivalent: the 2026-11-07 arguments re-checked (redundant parse guards, mask identities `(x&m)|h == x|h`, `@min` clamps, the family re-check in `containsPrefix`, order-insensitive tie-breaks, builder routing, idempotent `normalizeSpans`, `scopeOf` branches handled earlier, rule 9 after rule 1, `sourceBefore`'s `sb.eql(dst)`), plus `normalizeSpans` starting at `items[0]` (merges the first span with itself). Unobservable: dropping `SOCK.CLOEXEC` on the probe socket (matters only to a child exec'd by another thread meanwhile), `socket(2)` failure, `IpSet.rangeAt` past the end (traps either way).
-
-**Mutation (2026-11-07, whole module,** production part of `root.zig` (lines 1–2186; the 27 RFC 6724 policy-row mutants applied at lookup in `policyOf`), schemata in a detached copy, ReleaseSafe, strict verdict): 780 mutants, 741 killed (incl. 317 after the fix below), 37 equivalent + 2 unobservable, 0 undecided. New tests (audit_test.zig): multicast scopes 9/10, `ZonedIp.eql`, zone-less v6 `AddrPort.toStd` and zones starting with 9 or holding 0, `hostCount(::/1)`, `containsPrefix` with a shorter prefix, `mergePrefixes` with a /32 on a block's last address, a v4 span before a small v6 span, policy rows ending exactly at their prefix, `systemSource` (TEST-NET not loopback, mapped loopback stays mapped). Equivalent: redundant parse guards (`g != 8`, first-iteration `n == 0`, `parsePort` non-digits), mask drops where `(x&m)|h == x|h` (`broadcast`, `lastHost`, `firstHost`), the family re-check in `containsPrefix`, order-insensitive tie-breaks, perf-only state, `scopeOf` branches handled earlier, `destinationBefore` rule 9 after rule 1, `sourceBefore` `sb.eql(dst)`. Unobservable: 484 (`IpSet.rangeAt` traps either way, message only), 753 (`systemSource` socket failure). **Finding (LOW, fixed):** `SubnetIterator.next` ended only on `cur == last` — a hand-built iterator (pub fields) past its end wrapped `cur += step`; now `cur >= last` or a step past `last` ends it, pinned.
+- **Resolving a zone name to an interface** (zones are carried as opaque text by `ZonedIp`/`AddrPort`,
+  rejected by the zone-less `parseIp*`, passed through untouched by `parseHostPort`; `AddrPort.toStd`
+  maps a numeric zone only and refuses a name with `ZoneNotNumeric`), **DNS resolution** and
+  **actually connecting.**
+- **The RFC 6724 rules that need per-interface OS state** (destination rules 3, 4, 7; source rules
+  3, 4, 5, 7), skipped as glibc and Go document.
+- **IPv4 source selection by RFC 6724** (`selectSource`'s v4 path): no implementation does it; the
+  kernel takes the interface's primary address.
 
 ## Backlog / deferred
 
-- **No-panic sweep 2026-10-28 (not fixed):** a parsed zone keeps any byte (CR, LF, NUL, `]`) and formatting writes it back, as Go does — documented on `Zone`; an opt-in strict-zone parse is the open option (N-5). Fixed in the sweep: `IpSetBuilder` alternation is O(n log n) (was O(n) per add/remove switch, N-4), `Zone.slice`/`AddrIterator.next`/`IpSet.rangeAt` total or checked (N-1..N-3).
-- ~~**P1 waits for a fast sort**~~ *(closed 2026-10-25)* — `sort_mixed` was `std.mem.sort` 2.21× Rust `sort_unstable`; the bench now sorts with zig-libs `sort` (ipnsort port, `.bench_deps`), 0.88×. `IpSetBuilder` still uses `std.sort.pdq` (`set_build` is 0.34× Go already; switching would make `sort` a production dep of a consumed module).
-- ✅ 2026-10-25: **Zig 0.17 wide `@bitCast`** (#36256, per-byte `u128` loop) — `ipToInt`/`ipFromInt` go through two `u64` halves: sort 1.05→0.63× Go, contains 0.84→0.48×.
-
-Out of scope by design (see above): resolving zone names, OS-state-dependent
-RFC 6724 rules. Consumed downstream by `http`/`dns`/`icmp`/`probe`/`procnet` as the shared address
-substrate.
-- ✅ 2026-10-07: the three survey items (Ip ordering/next/prev, the remaining predicates, a
-  queryable `IpSet`) are done, together with zones, `AddrPort`, `IpRange` and std conversion.
-- **Longest-prefix match with values** (the 2026-09-30 item asked for it beside `IPSet`): netipx
-  has none — a set answers membership, not "which entry". A prefix → value table belongs to a
-  routing-table type; not started, no consumer has asked.
-- **Consumers converting `std.Io.net.IpAddress` by hand** (abuseguard, enip, http/proxy, probe,
-  ratelimit, … — `rg '\.ip4 => \|a\| \.\{ \.v4 = a\.bytes'`): can switch to `Ip.fromStd` /
-  `AddrPort.fromStd`. Cosmetic; do it when touching those modules.
-- ~~**`Ip.key(v6_bits)` (consumer request 2026-11-15; effort S, low priority).** Rate-limit and per-viewer maps key IPv6 clients by their /64; `ip.prefix(64).?.network()` already works (`Ip.prefix` `src/root.zig`, `Prefix.network`) but call sites spell it differently and handle the v4 case separately. Expected: Go `netip.Prefix.Masked`. Proposed: `netaddr.Ip.key(self, v6_bits: u8) [16]u8` returning the v4-mapped/plain 4-byte form zero-padded for IPv4 and the masked first `v6_bits` for IPv6; as a pure convenience over `prefix().network()`, it may be rejected if the owner prefers no second spelling.~~ **Done 2026-11-15:** `Ip.key(self, v6_bits: u8) [16]u8`: IPv4 = its 4 bytes + 12 zero bytes (the bits argument is ignored); IPv6 masked to the first `v6_bits` bits. `v6_bits > 128` is clamped to 128 (the clamp `Prefix.masked` already uses), so there is no error path and no panic. Not unmapped: `::ffff:a.b.c.d` keys as a v6 address; an IPv6 `a.b.c.d::` collides with IPv4 `a.b.c.d`, documented on the function. Tested against `prefix(bits).?.network()` for every width 0..128.
-
-## Status
-`extract · any · util · reentrant` + deps: none (std only; `systemSource` Linux-only) — canonical
-source is `pub const meta` in src/root.zig.
-
-**Audit 2026-11-15 (delta mutation).** 14 schemata mutants over `Ip.key`, ReleaseSafe, one build, each mutant
-under `setsid -w timeout` and `ulimit -v`: the IPv4 padding (non-zero, dropped), the clamp of `v6_bits` (dropped,
-127 instead of 128), the whole-byte count and the bit remainder (off by one), the `whole < 16` guard (widened, dropped),
-the mask (inverted, assignment skipped), the tail wipe (skipped, started one byte early, filled with 1) and the IPv6
-return value. 12 killed in the first run; 2 survived. Equivalent: dropping the clamp of `v6_bits`, because any width
-of 128 or more gives `whole >= 16`, which the `whole < 16` guard already turns into "return the address
-unchanged" (the clamp only documents the contract). The other, the clamp at 127, survived because the test address
-ended in an even byte, so clearing its last bit changed nothing; a test with an odd final byte (`key(128)` and
-`key(200)` keep it, `key(127)` clears it) killed it. 13/14, 1 equivalent.
+- **Opt-in strict-zone parse** (reject CR/LF/NUL/`]` and other control bytes in a zone): today a zone
+  keeps any byte, as Go does.
+- **Longest-prefix match with values.** netipx has none: a set answers membership, not "which entry".
+  A prefix → value table belongs to a routing-table type; not started, no consumer has asked.
+- **Consumers converting `std.Io.net.IpAddress` by hand** (abuseguard, http/proxy, probe, ratelimit,
+  whois: `rg '\.ip4 => \|a\| \.\{ \.v4 = a\.bytes'`): can switch to `Ip.fromStd` / `AddrPort.fromStd`.
+  Cosmetic; do it when touching those modules.
 
 ## Anchoring
 
 **Anchor grade:** class B · oracle EXTERNAL
 
-**On CI since 2026-10-07.** `tools/interop.zig` (`zig build interop-netaddr
+**On CI.** `tools/interop.zig` (`zig build interop-netaddr
 [-- --check]`) re-takes all three oracles below — parse (glibc + Python),
 RFC 6724 (glibc + kernel, in its own `unshare -rnm`) and Go netip/netipx —
 and the interop lane runs it with `--check` at every tag / dispatch. The
 Python checks compare everything but the provenance lines (the `// GENERATED
 …` header and the `glibc_version`/`kernel_release`/`python_version`
 constants), so a runner with another kernel or Python build passes exactly
-when every verdict agrees — the first CI run (Linux 7.0.0-1012-azure) agreed
-on every RFC 6724 verdict and differed only in `kernel_release`. Teeth: one flipped verdict in each vectors file fails all
+when every verdict agrees. Teeth: one flipped verdict in each vectors file fails all
 three.
 
-**Go netip/netipx oracle 2026-10-07.** `tools/go_netip_oracle` (Go 1.26.0,
+**Go netip/netipx oracle.** `tools/go_netip_oracle` (Go 1.26.0,
 `go4.org/netipx` pinned by go.mod/go.sum) drives the reference through its
 public API as a black box over our own crafted and seeded random cases and
 freezes the answers into `src/netip_vectors.zig`; `src/netip_oracle_test.zig`
@@ -166,33 +168,21 @@ ParseAddrPort, Addr.Prefix + PrefixLastIP, ParsePrefixOrAddr, ParseIPRange
 included), and 120 random IPSetBuilder op sequences (add/remove
 addr/prefix/range, complement, intersect) with their Prefixes, Ranges,
 probes, RemoveFreePrefix at 8 lengths, and pairwise Overlaps/Equal. `-check`
-re-takes and compares byte for byte. Found: one gap in our own first draft
-(ParsePrefixOrAddr takes a zone — fixed before commit), and one defect in
+re-takes and compares byte for byte. Found: one defect in
 netipx: `RemoveFreePrefix` takes the tightest prefix of either family, so for
 a length past 32 it can choose a v4 prefix and answer ok with an invalid
 prefix (227 cases, counted; ours picks among families that can hold the
 length and is checked against the contract instead). Listed divergences,
-counted: a zone over 31 bytes, a leading-zero port. (`IsPrivate` on
-`fc00::/7` was a third until the same day: `isPrivate` now matches Go.) Teeth: 20 schema mutants over the new code, 19 killed; the
-survivor (which side of an equal end the intersect walk advances) is
-equivalent. The ranges/sets half has no third implementation as a
+counted: a zone over 31 bytes, a leading-zero port. The ranges/sets half has no third implementation as a
 tiebreaker; the brute-force bitmap model in `netip_api_test.zig` stands in
 for one.
-Review 2026-10-07 (independent reviewer, new surface): no HIGH/MED; four
-LOW fixed in the same commit — `AddrPort.toStd` took `+5`/`007`/`0` as
-interface indexes (now only canonical decimal), and three doc gaps
-(builder cost when alternating add/remove, `Prefix.compare` clamping,
-`asSlice` borrowing).
-
-EXTERNAL for both halves since 2026-10-05: the parse/format/prefix core (below)
+EXTERNAL for both halves: the parse/format/prefix core (below)
 and the RFC 6724 half, which was self-tested until then. Self only:
 `selectSource`'s IPv4 path (no implementation selects IPv4 sources by RFC 6724
 -- the kernel takes the interface's primary address) and `systemSource` (the
 kernel is its truth by construction).
 
-⚠ Corrected 2026-09-04. This said "class C · oracle n/a",
-and that was true when written and false by the time it was read: the core is
-now checked against three independent outside implementations, all agreeing —
+**Probe runs (not frozen).** The core was also checked against three independent outside implementations, all agreeing —
 glibc's `inet_pton` (2,100,000 generated literals, **0 disagreements**),
 Python's `ipaddress` (same corpus, 0 outside the documented zone-ID rejection,
 plus RFC 5952 canonical form byte-identical over 400,000 random and 80,000
@@ -201,9 +191,8 @@ special forms), and `summarize`/`mergePrefixes` against
 60,000 prefix sets, 0 disagreements). `formatIp` round-trips 8,000,000 random
 addresses with 0 failures.
 
-**Frozen parse oracle 2026-10-05.** Those runs were measured and their probes
-deleted (`28047b79`), so the tests carried none of it. `tools/parse_oracle.py`
-now freezes a corpus into `src/parse_vectors.zig`, replayed by
+**Frozen parse oracle.** `tools/parse_oracle.py`
+freezes a corpus into `src/parse_vectors.zig`, replayed by
 `src/parse_oracle_test.zig`: 2364 literals (a crafted hostile table, random
 addresses in every spelling, single-character mutations) with glibc 2.43
 `inet_pton` as the verdict, glibc `inet_ntop` as the canonical text and Python
@@ -214,10 +203,9 @@ summarize/merge agree everywhere. Listed: glibc prints IPv4-compatible `::/96`
 dotted (`::1.2.3.4`) where Python, Go and we print hex (RFC 4291 deprecated
 the form; RFC 5952 §5); nine prefix texts Python accepts as extensions (bare
 address, leading-zero length, netmask/hostmask, zone) that Go's
-`netip.ParsePrefix` refuses with us. Four sanity mutants (rule 8 order, source
-rule 6, single-group `::`, IPv4 leading zero) were each caught.
+`netip.ParsePrefix` refuses with us.
 
-**RFC 6724 oracle 2026-10-05.** `tools/rfc6724_oracle.py` takes two black boxes
+**RFC 6724 oracle.** `tools/rfc6724_oracle.py` takes two black boxes
 that are not this half's model (Go's addrselect.go is), inside `unshare -rnm`
 (own dummy interface, routes, /etc/hosts, /etc/gai.conf): glibc 2.43
 `getaddrinfo` for destination order, with gai.conf holding exactly the RFC 6724
