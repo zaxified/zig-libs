@@ -818,11 +818,12 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                 var enb: [4][20]u8 = undefined;
                 var evb: [4][72]u8 = undefined;
                 const ne = d.below(5);
-                for (exl[0..ne], enb[0..ne], evb[0..ne]) |*l, *nb, *vb| {
+                const estart = d.below(pool_labels.len);
+                for (exl[0..ne], enb[0..ne], evb[0..ne], 0..) |*l, *nb, *vb, ek| {
                     // Some values run to the rune cap (128 runes in all) or past it.
                     const long = d.byte() < 110;
                     l.* = .{
-                        .name = if (d.byte() < 180) pool_labels[d.below(pool_labels.len)] else d.str(nb, &name_vocab),
+                        .name = if (d.byte() < 235) pool_labels[(estart + ek) % pool_labels.len] else d.str(nb, &name_vocab),
                         .value = if (long) blk: {
                             const k = 20 + d.below(vb.len - 20);
                             @memset(vb[0..k], 'x');
@@ -880,10 +881,26 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                     l.* = .{ .name = if (d.byte() < 235) pool_labels[(start + k) % pool_labels.len] else d.str(nb, &name_vocab), .value = d.str(vb, &label_vocab) };
                 }
                 const bk = drawBuckets(&d, &buckets);
-                switch (d.below(3)) {
-                    0 => if (reg.counter(name, "plain", lbs[0..nl])) |c| c.inc() else |_| {},
-                    1 => if (reg.gauge(name, "plain", lbs[0..nl])) |g| g.set(d.f64v()) else |_| {},
-                    else => if (reg.histogram(name, "plain", lbs[0..nl], bk)) |h| h.observe(d.f64v()) else |_| {},
+                const ok = switch (d.below(3)) {
+                    0 => if (reg.counter(name, "plain", lbs[0..nl])) |c| blk: {
+                        c.inc();
+                        break :blk true;
+                    } else |_| false,
+                    1 => if (reg.gauge(name, "plain", lbs[0..nl])) |g| blk: {
+                        g.set(d.f64v());
+                        break :blk true;
+                    } else |_| false,
+                    else => if (reg.histogram(name, "plain", lbs[0..nl], bk)) |h| blk: {
+                        h.observe(d.f64v());
+                        break :blk true;
+                    } else |_| false,
+                };
+                if (ok) {
+                    hit("plain-registered");
+                    for (lbs[0..nl]) |l| {
+                        if (l.value.len > reg.max_label_value_len) return error.LongValueAccepted;
+                        if (!std.unicode.utf8ValidateSlice(l.value)) return error.InvalidUtf8Accepted;
+                    }
                 }
             },
             14 => { // callback series (counterFunc / gaugeFunc) with labels
@@ -899,7 +916,13 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                 }
                 fval = d.f64v();
                 const r = if (d.byte() & 1 == 0) reg.counterFunc(name, "fn", lbs[0..nl], &fval, readF) else reg.gaugeFunc(name, "fn", lbs[0..nl], &fval, readF);
-                if (r) |_| hit("func-ok") else |_| {}
+                if (r) |_| {
+                    hit("func-ok");
+                    for (lbs[0..nl]) |l| {
+                        if (l.value.len > reg.max_label_value_len) return error.LongValueAccepted;
+                        if (!std.unicode.utf8ValidateSlice(l.value)) return error.InvalidUtf8Accepted;
+                    }
+                } else |_| {}
             },
             else => try scrapeChecked(gpa, &reg, if (d.byte() & 1 == 0) .text else .openmetrics), // a scrape mid-way
         }
