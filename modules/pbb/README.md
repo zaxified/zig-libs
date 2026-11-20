@@ -9,8 +9,7 @@ real-Ethernet SPB (802.1aq) data-plane encapsulation. Pure, bounds-checked decod
 of untrusted link bytes; no network, no clock, and no allocation on the decode
 path.
 
-**Status:** codec complete · offline golden/property/fuzz verified · FCS,
-stacked I-TAGs, and customer-tag parsing deferred (see SPEC).
+**Status:** codec complete · offline golden/property/fuzz verified.
 
 Derived metadata (canonical source: `pub const meta` in `src/root.zig`):
 `any · codec · reentrant` · model-after IEEE 802.1ah (802.1Q-2014 clause 9.7 /
@@ -69,7 +68,8 @@ error.
 
 `decode` consumes bytes straight off an untrusted link. Every field is
 bounds-checked before it is read, and it allocates nothing (the `customer_data`
-result is a subslice of the input). A truncated frame → `Truncated`; a
+result is a subslice of the input). Input longer than `max_frame_len` (65535) →
+`FrameTooLarge` (`encode` refuses the same ceiling). A truncated frame → `Truncated`; a
 tag-region EtherType that is neither the B-Tag TPID nor the I-TAG EtherType →
 `UnexpectedEtherType`; a B-Tag not followed by the I-TAG EtherType →
 `MissingITag`. Reserved I-TCI bits are **ignored** on receipt (the IEEE format
@@ -112,6 +112,12 @@ _ = pbb.peekCustomerTags(dec.customer_data); // ?CustomerTags: read-only outer/i
 `Fields` exposes the I-SID, UCA, and all four MACs as public fields (idiomatic
 Zig accessors); `bvid()` and `hasBTag()` flatten the optional B-Tag.
 `encodedLen(fields, len)` / `headerLen(has_btag)` size a buffer.
+
+## Not provided
+
+FCS, stacked I-TAGs, full customer-tag parsing (only the read-only `peekCustomerTags`),
+OUI-scoped TLVs and forwarding/learning state are out of scope; the reasons are in
+SPEC.md *What is deliberately not done*, the one open idea in *Backlog / deferred*.
 
 ## Verify
 

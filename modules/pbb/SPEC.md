@@ -18,7 +18,7 @@
 
 Design + threat notes for auditors. Usage, API and the field-by-field wire
 diagram: see [README.md](README.md) and the `src/root.zig` doc comments.
-Attribution/provenance: see `/NOTICE` — none needed here (clean-room from the
+Attribution/provenance: see the README's `Provenance:` line — none needed here (clean-room from the
 public IEEE 802.1ah / 802.1Q-2014 standard; a public spec is not a copyrightable
 work, and no third-party source was ported into this codec — the Wireshark
 cross-check below is a behaviour comparison against `encode()`'s own output,
@@ -43,7 +43,7 @@ world: the one we already diff against.
 GPL dissector: a bounds-checked decode that allocates nothing, exact I-TCI/B-TCI bit order confirmed
 by a foreign implementation, and a companion forwarding table (`l2forward`). **Where we are behind:** nothing
 in a framing codec's normal use; stacked I-TAGs, customer-tag parsing, FCS and OUI-scoped TLVs are deferred
-by design (SPEC), and the primary text of 802.1Q-2014 clause 9.7 was paywalled and not read.
+by design (*What is deliberately not done*; only a read-only `peekCustomerTags` looks at the customer tags), and the primary text of 802.1Q-2014 clause 9.7 was paywalled and not read.
 
 ## What it is
 
@@ -52,7 +52,9 @@ encapsulation — the real-Ethernet counterpart to the lean over-WireGuard
 [`l2encap`](README.md#contrast-with-l2encap). No I/O, no clock, and **no
 allocation on the decode path**: `decode` returns the customer bytes as a
 subslice of the input, so it cannot, by construction, allocate more than its
-input. Concurrency `.reentrant` (no shared state).
+input. Concurrency `.reentrant` (no shared state). Forwarding state lives in
+`l2forward`; loop-free BUM-tree reconvergence and designated-forwarder election
+live in `loopfree-reconv` / `df-elect`, which this codec feeds.
 
 ## Frame format (verified against the standard)
 
@@ -130,6 +132,29 @@ receiver prepends them to `customer_data` to rebuild it.
 - **I-SID width = `u24`.** Matches the standard's 24-bit I-SID and `l2encap`'s
   I-SID, so the type makes an out-of-range value unpresentable and the two
   encapsulations map 1:1.
+- **`UCA` kept, not Wireshark's `NCA`.** Wireshark's dissector names I-TCI bit 27
+  `NCA` ("No Customer Addresses") where this module says `uca` ("Use Customer
+  Addresses"). A golden with only that bit forced to 1 shows that `ieee8021ah.nca == 1`
+  for the same raw value this module reads as `uca == true`: the two names claim
+  opposite things about one wire state, and the bit position and encoding are not in
+  question. The module keeps `uca` because it matches the struct's 802.1Q/802.1ah
+  vocabulary (I-PCP, I-DEI, I-SID) and independent vendor documentation (Nokia SR OS
+  PBB) also says "UCA"; the primary text that would adjudicate the direction, IEEE
+  802.1Q-2014 clause 9.7, is paywalled and was not read. The resolution is also on
+  the `Fields.uca` doc comment.
+- **Frame ceiling `max_frame_len` = 65535.** `encode` returns `FrameTooLarge` when
+  the total would exceed it, and `decode` returns `FrameTooLarge` for input longer
+  than it. No standard fixes one number (802.1ah leaves the size to the backbone
+  port's MTU), so the module mirrors the sibling `ethfrag` rather than inventing a
+  third convention; the value is not verified against an external standard, only the
+  existence of some ceiling is.
+- **`peekCustomerTags`: a read-only peek, not a parser.** `peekCustomerTags(customer_data)
+  ?CustomerTags` reports the outer tag and, if a second tag follows, the inner one
+  (`CustomerTag`: TPID, PCP, DEI, VID; `isSTag()`; TPIDs `ctag_tpid` 0x8100 and
+  `b_tpid` 0x88A8; VID 0 is a priority-tagged frame). It looks at most two tags deep,
+  returns null for an untagged customer frame or a tag cut short (refused, not
+  half-reported), never copies, modifies or allocates, and does not change the opaque
+  `customer_data` contract.
 - **Accessors.** The I-SID, UCA and all four MACs are public `Fields` (idiomatic
   Zig, as in `l2encap`); `bvid()` and `hasBTag()` are added only where they earn
   their keep by flattening the optional B-Tag.
@@ -144,6 +169,7 @@ decoder fails closed on structural errors:
   EtherType (14), then (if B-Tagged) the B-TCI + next EtherType, then the full
   I-TAG (EtherType + I-TCI + C-DA + C-SA). Any shortfall → `Truncated`. Tested at
   **every** length below a full untagged frame and below a full B-Tagged frame.
+- **Oversize input:** more than `max_frame_len` bytes → `FrameTooLarge`, before anything is read.
 - **Wrong tag-region EtherType:** neither `0x88A8` nor `0x88E7` after the B-MACs
   → `UnexpectedEtherType`.
 - **B-Tag without an I-TAG:** a `0x88A8` B-Tag not followed by `0x88E7` →
@@ -154,7 +180,7 @@ decoder fails closed on structural errors:
   buffer — a malformed frame is rejected cheaply.
 - **Reserved bits:** ignored (see above) — not a rejection surface, per spec.
 
-The standing regression is the `std.testing.fuzz` target over `decode`
+The standing regression is the fuzz harness over `decode` (`std.testing.fuzz` and the `PBB_FUZZ` driver)
 (truncated, wrong-EtherType, B-Tag with/without a following I-TAG, arbitrary
 length and bytes), asserting only never-panic + customer-slice-within-input.
 
@@ -163,14 +189,14 @@ backbone; PBB itself provides no per-frame crypto. Any such protection is a
 separate layer (802.1AE MACsec on the backbone, or the WireGuard tunnel in the
 `l2encap` variant) — this codec does not add, and does not claim, authentication.
 
-## Deliberately deferred (out of scope by design, not oversight)
+## What is deliberately not done
 
 - **FCS** — the frame-level CRC trailer is added/checked by the MAC/NIC layer,
   not this codec.
 - **Multiple stacked I-TAGs** — one I-TAG per frame; nested backbone service
   layering is out of scope.
 - **Customer-tag parsing (C-VLAN / S-VLAN inside `customer_data`)** — the carried
-  customer bytes stay opaque (only the read-only `peekCustomerTags` looks at them); mapping a customer 802.1Q VID to an I-SID is a
+  customer bytes stay opaque (only the read-only `peekCustomerTags` looks at them, two tags deep); mapping a customer 802.1Q VID to an I-SID is a
   provisioning decision above this codec.
 - **802.1ah management / OUI-scoped TLVs** and any control-plane signalling.
 - **Forwarding / FDB / MAC learning** — backbone next-hop selection and the
@@ -181,81 +207,47 @@ separate layer (802.1AE MACsec on the backbone, or the WireGuard tunnel in the
 
 ## Verification
 
-Offline only — no live-interop surface (no packet capture was available). Two
-byte-exact golden KATs (full B-Tagged frame + untagged-B-VLAN variant) are
-hand-assembled field-by-field per the IEEE spec; a third golden is externally
-anchored: `encode()`'s own output for a frame whose encapsulated customer frame
-carries its own 802.1Q C-VLAN tag was fed through Wireshark 4.6.4's real IEEE
-802.1ah dissector offline (`scripts/gen/dissect.py`, sharkd — no capture, no
-network), and the frozen bytes plus the quoted Wireshark output live in
-`src/root.zig`. Wireshark independently confirmed the B-TCI and I-TCI bit
-order (including bit 27), the 24-bit I-SID window, C-DA/C-SA placement, the
-0x88E7 ethertype, and — the sharpest check of the encapsulation boundary —
-that its own dissector recurses cleanly through B-Tag → I-Tag → the
-encapsulated frame's own tag → IPv4 → data, which only works if
-`customer_data` starts exactly where this codec says it does. The one
-disagreement that turned up is **not merely cosmetic**: Wireshark's dissector
-names the same bit `NCA` ("No Customer Addresses") where this module calls it
-`uca` ("Use Customer Addresses"), and a second golden — the identical frame
-with only that bit forced to 1 — proves Wireshark's `nca` tracks the *same*
-raw polarity as this module's `uca`, not its logical inverse (`ieee8021ah.nca
-== 1` for the same bit value this module reads as `uca == true`). So the two
-names make opposite claims about the identical wire state, not just different
-spellings of one claim. This module keeps `uca`: it matches the rest of the
-struct's 802.1Q/802.1ah vocabulary and an independent vendor (Nokia SR OS's
-PBB docs also say "UCA"), and the primary text that would adjudicate which
-side is right — IEEE 802.1Q-2014 clause 9.7 itself — is paywalled and was not
-available here. See the naming note on `Fields.uca` in `src/root.zig` for the
-full resolution and the pinned bit=1 golden that proves the conflict is real.
+Offline only: there is no live-interop surface (no packet capture was available).
+Run `scripts/modtest pbb` (Debug), `-Doptimize=ReleaseFast`, and `zig fmt --check modules/pbb`.
 
-`zig build test-pbb`: the three goldens above; an isolated I-TCI-octet
-bit-field test; two permanent positive-control tests (UCA↔DEI swap,
-wrong-3-byte I-SID); a 500-iteration seeded encode→decode property test (I-SID
-incl. 0 and `max_isid`, B-Tag present/absent, UCA 0/1, empty..4 KiB customer
-data); truncation-at-every-length for both frame shapes; wrong-EtherType and
-B-Tag-without-I-TAG rejection; reserved-bit ignore-on-receipt; I-SID
-tenant-isolation; encode buffer-too-small and caller-buffer≡alloc equivalence;
-and the `std.testing.fuzz` target. Green in Debug and
-`-Doptimize=ReleaseFast`; `zig fmt --check` clean.
-
-## Mutation run 2026-10-04
-
-First mutation-schemata run (one ReleaseSafe test binary, 44 mutants behind a
-runtime switch, baseline first): 44 mutants, 44 killed, 0 equivalent. Covered:
-B-TCI and I-TCI shifts and masks on encode and decode (PCP, DEI, UCA, reserved
-bit, 24-bit I-SID), `headerLen`, the `max_frame_len` and buffer-size comparisons
-in `encode`, `encodeAlloc` and `decode`, MAC field order (B-DA/B-SA, C-DA/C-SA)
-on both sides, the TPID / I-TAG EtherType written, every `Truncated`
-boundary and the `MissingITag` / `UnexpectedEtherType` checks on decode,
-the customer-data offset, and `hasBTag` / `bvid`.
-
-Two mutants survived the existing tests (the `<=` form of the 14-byte
-minimum-length check and of the B-Tag + next-EtherType truncation check): at
-those exact lengths the tests did not distinguish `Truncated` from the
-field-specific error. Both were killed by one new test; expected errors follow
-the `DecodeError` docs ("Truncated: fewer bytes than the field being read
-requires" - at 14 and 18 bytes the EtherType field is complete, so a wrong
-value is `UnexpectedEtherType` / `MissingITag`, one byte less is `Truncated`).
-No source defects found.
+- **Goldens.** Two byte-exact frames (full B-Tagged and untagged-B-VLAN) hand-assembled
+  field by field from the IEEE text; a third, externally anchored: `encode()`'s output for
+  a customer frame that carries its own 802.1Q C-tag was fed through Wireshark 4.6.4's
+  IEEE 802.1ah dissector offline (`scripts/gen/dissect.py`, sharkd; no capture, no network)
+  and the frozen bytes plus the quoted dissector output live in `src/root.zig`. Wireshark
+  confirmed the B-TCI and I-TCI bit order (including bit 27), the 24-bit I-SID window, the
+  C-DA/C-SA placement, the 0x88E7 EtherType and, as the sharpest check of the
+  encapsulation boundary, that its dissector recurses B-Tag → I-TAG → the customer's own
+  tag → IPv4 → data, which only works if `customer_data` starts exactly where this codec
+  says. A fourth golden (the same frame with only bit 27 forced to 1) pins the UCA/NCA
+  polarity (see *Design decisions*).
+- **Bit fields and positive controls.** An isolated I-TCI-octet bit-field test, a B-TCI
+  top-of-range golden (PCP 7, DEI 1, VID 4095), and two permanent positive controls: a
+  UCA↔DEI swap and an I-SID read from the wrong three bytes both turn a test red.
+- **Properties.** A seeded encode→decode round trip (I-SID including 0 and `max_isid`,
+  B-Tag present/absent, UCA 0/1, empty to 4 KiB customer data); `encodedLen`/`headerLen`
+  agree with what `encode` writes; the caller-buffer and `encodeAlloc` paths agree;
+  `max_frame_len` accepted and one byte more refused, on both sides; I-SID tenant isolation.
+- **Decode refusals.** Truncation at every length below a full untagged and a full
+  B-Tagged frame; the error class at the exact boundary lengths; wrong tag-region
+  EtherType; B-Tag without an I-TAG; reserved I-TCI bits ignored on receipt; encode with a
+  too-small buffer never partially writes.
+- **`peekCustomerTags`.** Untagged, single C-tag, QinQ, truncated at every cut, and
+  priority-tagged cases, plus a never-panics sweep over every short tag-like prefix.
+- **Fuzz.** The `PBB_FUZZ` deterministic driver (`PBB_FUZZ=<runs>[,<first seed>]`)
+  and the `std.testing.fuzz` target run the same decode harness: it draws the tag region
+  (biased toward valid EtherTypes) and a size class up to a jumbo frame, and asserts
+  never-panic and that `customer_data` stays a subslice of the input at the exact header
+  offset. A reach test pins that every outcome (refused, accepted, B-tagged) is hit, and a
+  corpus test pins that every seed reaches the decoder.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-No Fable-tier piece was needed: the frame is a clean-room layout from a published
-standard and the codec is total over its decoded field space. The hard fabric
-problems (loop-free BUM-tree reconvergence, designated-forwarder election) live in
-the `loopfree-reconv` / `df-elect` modules, which this codec feeds; forwarding
-state lives in `l2forward`.
-
-Survey 2026-09-30 found no capability of the reference dissector or of other packet libraries that this codec lacks and
-that SPEC "Deliberately deferred" has not already refused. Optional, low priority (both fit CONVENTIONS §2):
-
-- **C-VLAN/S-VLAN peek helper (survey 2026-09-30)** — ✅ DONE 2026-11-16 (`peekCustomerTags(customer_data) ?CustomerTags`: outer + optional inner tag, TPID 0x8100/0x88A8, PCP/DEI/VID; null when untagged or a tag is truncated; read-only, no copy). Original text: a read-only accessor that reports the customer tag's VID without changing the opaque `customer_data` contract. Effort: small.
-- **I-SID to group B-MAC helper (survey 2026-09-30)** — the 01-1E-83 + I-SID derivation used for SPB multicast B-DAs *(inferred from vendor practice, unverified)*; SPEC currently calls it a provisioning concern. Ask before adding. Effort: small.
-
-## Status
-
-`any · codec · reentrant` · deps: none (std only) — canonical source is
-`pub const meta` in `src/root.zig`.
+- **I-SID to group B-MAC helper.** The 01-1E-83 + I-SID derivation used for SPB
+  multicast B-DAs *(inferred from vendor practice, unverified)*; this SPEC currently
+  calls it a provisioning concern. Ask before adding. Effort: small. Fits CONVENTIONS §2.
 
 ## Anchoring
 
@@ -265,5 +257,3 @@ that SPEC "Deliberately deferred" has not already refused. Optional, low priorit
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** Wireshark sharkd validated encode() B-Tag/I-TAG/B-TCI/relocation/ethertype/recursion; no wire bug; UCA/NCA naming resolved 2026-08-06 (kept uca, documented — see the anchor record in SPEC.md)
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-06 (naming, not a wire bug — the bit position/encoding were already correct): Wireshark calls I-TCI bit 27 "NCA" (No Customer Addresses) where this module calls it "uca" (Use Customer Addresses). Forced the bit to 1 through sharkd (new golden, decode never previously exercised bit=1 against Wireshark) and found `ieee8021ah.nca == 1` for the SAME raw bit this module reads as `uca == true` — the two names are opposite claims about one wire state, not a spelling variant; confirmed via `strings` on libwireshark.so that the dissector's own field-name string for that state is literally "No Customer Addresses". Decision: kept `uca` (matches this struct's 802.1Q/802.1ah vocabulary — I-PCP/I-DEI/I-SID/B-TCI — and independent Nokia SR OS PBB docs, which also say "UCA"; the primary 802.1Q-2014 text that would adjudicate the semantic direction is paywalled and unavailable here); no public API change; no in-tree consumer of `.uca` exists. Documented the resolution (not "left open") on Fields.uca's doc comment, SPEC.md and README.md. Mutation-tested the new golden (wrong bit mask -> 1/19 tests fail, exit 1; reverted, git diff -U0 shows only the intended addition). FCS, stacked I-TAGs, and customer-tag parsing remain out of scope by design (SPEC) so were not and cannot be wire-validated.
