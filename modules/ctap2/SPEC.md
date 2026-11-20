@@ -59,6 +59,11 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
   encoding and decoding are `cbor`'s. Requests are encoded with `canonical = true`;
   every key set used is small unsigned integers (and -1..-3 in the COSE key), for
   which RFC 8949 bytewise key order and CTAP2's "shortest first" order coincide.
+- **`ctaphid.Channel`.** `open` sends `CTAPHID_INIT` on the broadcast CID and skips an INIT response that carries
+  another client's nonce (§11.2.3: the client ignores it and keeps reading); a device that allocates CID 0 (reserved)
+  or the broadcast CID, or that lacks the CBOR capability, is `TransportFailed`. A transaction skips keep-alives,
+  giving up (`TransportFailed`) after `max_keepalives` of them; a `CTAPHID_ERROR` answer is `TransportFailed` with
+  `last_hid_error` set.
 - **Randomness** is a caller-supplied `std.Random` (ECDH scalar; protocol-Two IVs),
   drawn in a fixed order per call: scalar, then for `changePin` the `pinHashEnc` IV,
   then the `newPinEnc` IV (the order python-fido2 draws in, which the oracle test
@@ -76,6 +81,9 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
   points; at most 63 bytes; padded to 64. The current PIN is only length-capped (an
   older PIN may be shorter than today's policy). All of it is checked before the
   first byte is sent.
+- **Kept strict or lenient on purpose.** The authenticator's COSE_Key must carry `alg` -25 (the spec says MUST;
+  python-fido2 does not check it, so an authenticator that omits it works there but not here). `rp_id` is not
+  enforced client-side for `mc`/`ga` permissions; the authenticator answers `MissingParameter`.
 - **`getInfo.Info` owns nothing:** version strings are folded into flags, the aaguid is
   copied, `pinUvAuthProtocols` keeps the protocols this module speaks in the
   authenticator's order (a list that is absent means CTAP 2.0, protocol One).
@@ -103,8 +111,9 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
 - **Weak or reused randomness** breaks the protocol (predictable ECDH scalar): pass
   a CSPRNG.
 
-## Validation
+## Verification
 
+- **Run:** `scripts/modtest ctap2`.
 - `oracle_test.zig` runs its cases against `fido2_vectors.zig` (captured from
   python-fido2 2.2.1, black-box, by `tools/gen_fido2_vectors.py`): getPINRetries,
   getUVRetries, setPIN (ASCII and multi-byte PIN), changePIN, getPinToken (legacy),
@@ -117,47 +126,14 @@ are absent), no NFC/BLE framing, and no device transport at all (by design).
   key-agreement variants (kty, crv, alg, coordinate length, off-curve, identity,
   duplicate label), token length rules, validation-before-I/O, transport failure.
 - `ctaphid.zig`: framing at every boundary length, sequence errors, INIT, and a
-  loopback `Channel` with keep-alives and foreign traffic.
-- A `std.testing.fuzz` harness over every response parser and a client run.
-
-### Audit 2026-10-03
-
-Reviewed: all of `src/` (CTAPHID framing against §11.2, CBOR response parsing, PIN
-handling and wiping, key-agreement validation, GetInfo). `cbor` and `ctap2pin` are
-out of scope and were read only to understand the calls.
-
-**Mutation run** (schemata, ReleaseSafe, one binary, 87 mutants): 83 killed by an
-assertion or panic, 1 killed by hang (mutant 94, the keep-alive cap removed: a device
-that only sends keep-alives is then waited on forever), 3 survivors, all equivalent
-as far as a test can see:
-
-- `setPin`/`changePin` skipping the wipe of the padded PIN block, `tokenWithPin`
-  skipping the wipe of the PIN hash (3 mutants): the program's visible behaviour is
-  identical, the wipe only changes stack bytes after return; checked by reading the
-  `defer`s, not by a test.
-
-The first pass left 20 further mutants alive; each now has a test (`ctaphid.zig`,
-`client_test.zig`, `getinfo.zig`, `framing.zig` tail tests): transport claiming more
-bytes than the buffer, 17-byte aaguid, duplicate option id, the four version strings,
-`supportsPinWithPermissions`/`supportsUvWithPermissions` needing both options,
-protocol-One `Token.authenticate` over a 32-byte token, `Token.deinit` zeroing the
-length, a 31-byte `y`, exactly 8 scalar draws, `maxMsgSize` clamped from below, the
-`max_payload` bound with a large buffer, two messages on one `Assembler`, a buffer of
-exactly the message size, INIT response field offsets, keep-alive cap, a response to
-another command, an empty CTAPHID_ERROR, a stale `last_hid_error`.
-
-**Findings:**
-
-| Sev | Where | Finding | Status |
-|---|---|---|---|
-| LOW | `ctaphid.zig` `Channel.open` | A device could answer INIT with CID 0 (reserved) or `0xFFFFFFFF` (broadcast); the channel then used it for every CBOR transaction. | Fixed: `TransportFailed`; test `Channel.open: a device that allocates CID 0 ...` |
-| INFO | `ctaphid.zig` `Channel.open` | An INIT response with a different nonce (another application's INIT on the broadcast CID) fails with `TransportFailed`; §11.2.3 tells the host to ignore it and keep reading. | Backlog |
-| INFO | `ctaphid.zig` `Assembler.feed` | A stray continuation packet on our CID with nothing in progress (leftover of a timed-out response) is `UnexpectedContinuation`, hence `TransportFailed`; it could be ignored. | Backlog |
-| INFO | `ctaphid.zig` `exchange` | The read loop has no bound on foreign-channel or stray packets; termination relies on the `ReportDevice` timing out (documented under Backlog). | Documented |
-| INFO | `clientpin.zig` `Token.authenticate` | On a default-constructed or `deinit`ed protocol-One `Token` (`len == 0`) the `catch unreachable` is reached: a panic in safe builds, UB in ReleaseFast. Tokens returned by this module are never empty. | Backlog |
-| INFO | `clientpin.zig` `parseKeyAgreementResponse` | `alg` -25 is required, as the spec says; python-fido2 does not check it, so an authenticator that omits it works there but not here. | Kept (spec) |
-| INFO | `clientpin.zig` | `rp_id` is not enforced client-side for `mc`/`ga` permissions; the authenticator answers `MissingParameter`. | Kept |
-| INFO | `status.zig` | The table lists the codes the author could verify; spec codes 0x16, 0x20, 0x29, 0x2A (obsolete or removed in 2.1) are `UnknownStatus`. Not checked against the spec text in this audit. | Unverified |
+  loopback `Channel` with keep-alives and foreign traffic (another client's INIT
+  answer, a reserved or broadcast CID, the keep-alive cap).
+- **Fuzz:** `CTAP2_FUZZ` (testkit's deterministic driver, `src/fuzz_test.zig`): harnesses `ctap2-responses` (every
+  parser of authenticator bytes and `Client.getPinToken`), `ctap2-ctaphid`, `ctap2-pintoken`.
+- **Constant time:** `scripts/checks/ctgrind.sh ctap2` (`src/ctgrind_harness.zig`), rows `pin` (the PIN and the shared
+  secret through the PIN rules, padding, hashing, encrypt/MAC) and `token` (token decrypt and MAC).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
 ## Non-goals
 
@@ -181,20 +157,24 @@ protocols are foreign (python-fido2); the response parsers are checked against
 python-composed responses plus hand-built hostile ones; the CTAPHID codec is checked
 against the spec's layouts and by round trip (no external CTAPHID capture).
 
+## Open
+
+- `status.zig` lists the status codes the author could verify; spec codes 0x16, 0x20, 0x29 and 0x2A (obsolete or
+  removed in CTAP 2.1) are `UnknownStatus`. Not checked against the spec text.
+
 ## Backlog / deferred
 
-- **Audit 2026-10-03 leftovers (INFO):** ~~`Channel.open` should skip an INIT response with
-  a foreign nonce instead of failing~~ (done the same day: §11.2.3, another client's INIT
-  answer on the broadcast channel is skipped); `Assembler`/`Channel` could ignore a stray
-  continuation packet; `Token.authenticate` on an empty protocol-One token should return
-  an error or be made impossible (`catch unreachable` today); a bound on packets read
-  without progress in `Channel.exchange`.
-- **Unicode NFC normalization for PINs** (zig-libs request: no module and no `std`
-  facility normalizes to Form C; CTAP 2.1 §6.5.5.5 requires the platform to collect
-  the PIN in NFC). Workaround today: the caller normalizes; this module validates
-  UTF-8 and counts code points. Wanted: a `unicode` module with `normalize(nfc)`.
-- Further CTAP2 commands on the same `Transport` (getAssertion / makeCredential) if a
-  consumer appears.
-- Keep-alive status surfacing (`CTAPHID_KEEPALIVE` UPNEEDED vs PROCESSING) to the
-  caller for UI; `Channel` currently discards keep-alives.
+- `Assembler` / `Channel` could ignore a stray continuation packet (a leftover of a timed-out response): today it is
+  `UnexpectedContinuation`, hence `TransportFailed`.
+- `Token.authenticate` on an empty protocol-One token (a default-constructed or `deinit`ed `Token`, `len == 0`)
+  reaches a `catch unreachable`: a panic in safe builds, UB in ReleaseFast. It should return an error or be made
+  impossible; tokens this module returns are never empty.
+- A bound on foreign-channel and stray packets read without progress in `Channel.exchange` (keep-alives are capped by
+  `max_keepalives`); termination otherwise relies on the `ReportDevice` timing out.
+- **Unicode NFC normalization for PINs** (CTAP 2.1 §6.5.5.5 requires the platform to collect the PIN in NFC). This
+  module validates UTF-8 and counts code points and the caller normalizes. The sibling `unitext` module now has
+  `normalize` (NFC); using it here would add a dependency, which is undecided.
+- Further CTAP2 commands on the same `Transport` (getAssertion / makeCredential) if a consumer appears.
+- Keep-alive status surfacing (`CTAPHID_KEEPALIVE` UPNEEDED vs PROCESSING) to the caller for UI; `Channel` currently
+  discards keep-alives.
 - Cancel (`CTAPHID_CANCEL`) and timeouts are the `ReportDevice`'s business today.

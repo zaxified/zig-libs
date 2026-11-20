@@ -51,7 +51,7 @@ the padded PIN and the PIN hash before it returns; a `Token` is wiped by `deinit
 The random source must be cryptographically secure (ECDH scalar, protocol-Two IVs).
 The PIN must arrive in Unicode Normalization Form C: there is no normalizer in
 `std`, so this module validates UTF-8 and counts code points but does not normalize
-(SPEC.md, Backlog). A wrong PIN costs a retry on the device: `error.PinInvalid`
+(the sibling `unitext` has `normalize`; SPEC.md, Backlog). A wrong PIN costs a retry on the device: `error.PinInvalid`
 means "ask again", and after a `PinAuthBlocked` the authenticator needs a power
 cycle.
 
