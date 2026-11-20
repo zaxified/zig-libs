@@ -6,7 +6,7 @@
 //! ## What is anchored externally, and what cannot be
 //!
 //! This module's scheme is `ibe.Scheme(ciphersuite)`: an ASSEMBLY (which
-//! hash output feeds which XOR, the FO consistency check, the `fp12Pow`
+//! hash output feeds which XOR, the FO consistency check, the `Fp12.pow`
 //! construction, where `U`/`V`/`W` land in the wire encoding) driven by
 //! a set of PARAMETERS (this module's own hash tags, its own
 //! hash-to-curve DST, its 32-byte block width, and the canonical
@@ -21,7 +21,7 @@
 //!   the sibling `tlock` module, `tlock/NOTICE` for its provenance
 //!   chain): it can fail regardless of what anyone here believed while
 //!   writing `ibe.zig`. It is THIS module's code doing the work — the
-//!   same `encrypt`/`decrypt`/`fp12Pow`/`Ciphertext` bodies the default
+//!   same `encrypt`/`decrypt`/`Fp12.pow`/`Ciphertext` bodies the default
 //!   instantiation uses, not a copy of them and not a re-derivation of
 //!   them in another language, which would be a sibling and would prove
 //!   nothing.
@@ -37,7 +37,7 @@
 //!   pinned by sections 1-4's self-consistency tests and by nothing
 //!   else, and that is the end state, not a to-do.
 //!
-//! Sections 1-4 (round-trip, pairing consistency, `fp12Pow` laws,
+//! Sections 1-4 (round-trip, pairing consistency, `Fp12.pow` laws,
 //! soundness/CCA) remain what they were and are still the only check on
 //! the parameter choices; section 5 is what stops a systematic assembly
 //! error from hiding behind them.
@@ -210,7 +210,7 @@ test "encrypt is deterministic given fixed (mpk, id, message, sigma)" {
 
 // ── 2. Pairing consistency (the core BF-IBE identity, checked directly) ─
 
-test "pairing consistency: e(d_id, U) == fp12Pow(Gid, r) directly, on a known case" {
+test "pairing consistency: e(d_id, U) == Gid.pow(&r) directly, on a known case" {
     var threaded = testIo();
     defer threaded.deinit();
     var kp: ibe.KeyPair = undefined;
@@ -229,7 +229,7 @@ test "pairing consistency: e(d_id, U) == fp12Pow(Gid, r) directly, on a known ca
     const u = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r).toAffine();
 
     const lhs = pairing.pairing(d_id, u); // decrypt's side: one pairing call
-    const rhs = ibe.testing_fp12Pow(gid, r); // encrypt's side: explicit Gt exponentiation
+    const rhs = gid.pow(&r); // encrypt's side: explicit Gt exponentiation
     try std.testing.expect(lhs.eql(rhs));
 
     // Sanity: this identity is exactly what encrypt/decrypt rely on —
@@ -263,9 +263,9 @@ test "pairing consistency: e(d_id, G2gen) == e(H1(id), mpk) — the Extract corr
     }));
 }
 
-// ── 3. fp12Pow KAT (bilinearity cross-check) ─────────────────────────
+// ── 3. Fp12.pow KAT (bilinearity cross-check) ─────────────────────────
 
-test "fp12Pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q) (KAT, module-exposed helper)" {
+test "Fp12.pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q) (KAT, module-exposed helper)" {
     var r_bytes = @as([32]u8, @splat(0));
     r_bytes[20] = 0x9c;
     r_bytes[27] = 0x02;
@@ -273,7 +273,7 @@ test "fp12Pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q) (KAT, module-expo
     const r = try Fr.fromBytes(r_bytes);
 
     const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-    const lhs = ibe.testing_fp12Pow(gt, r);
+    const lhs = gt.pow(&r);
 
     const rp = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(r).toAffine();
     const rhs = pairing.pairing(rp, g2.Affine.generator);
@@ -399,7 +399,7 @@ test "soundness: a different PKG's msk (different setup) cannot extract a workin
 // This section closes that. `ibe.Scheme` is instantiated with DRAND's
 // parameters instead of this module's own, and the resulting scheme is
 // required to reproduce, byte for byte, a real ciphertext that drand's
-// own Go `tle` CLI produced. `ibe.zig`'s `encrypt`/`decrypt`/`fp12Pow`/
+// own Go `tle` CLI produced. `ibe.zig`'s `encrypt`/`decrypt`/`Fp12.pow`/
 // `Ciphertext` bodies do the work unchanged — only the ciphersuite
 // differs — so a byte-exact match is a statement about THIS module's
 // assembly, made by an artifact nobody here authored.
@@ -603,7 +603,7 @@ test "drand anchor: the genuine fixture is rejected under a wrong private key (F
 // `Ciphertext` from an arbitrary sender and must reduce any 160 bytes to
 // `g2.G2Error`/`DecryptError` alone — never panic, never read out of
 // bounds. `d_id` is a fixed, self-issued PKG key (`msk` a small canonical
-// scalar, matching `fp12Pow`'s own test convention above); a real
+// scalar, matching `Fp12.pow`'s own test convention above); a real
 // ciphertext for that identity is built once and its bytes corrupted, so
 // the fuzzer is biased toward the `U` point's compressed-encoding
 // boundary and the FO consistency check rather than being rejected by

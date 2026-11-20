@@ -31,8 +31,8 @@
 //!      secret scalar `r` (NOT a pairing call — `encrypt` has no
 //!      private key to fold `r` into one of the pairing's own
 //!      arguments the way `decrypt` does, so it must exponentiate the
-//!      already-computed `Gid` directly, via the private `fp12Pow`
-//!      below).
+//!      already-computed `Gid` directly, via `bls12_381`'s
+//!      constant-time `Fp12.pow`).
 //!   7. `V = sigma XOR H2(gid_r)`.
 //!   8. `W = message XOR H4(sigma)`.
 //!   9. return `Ciphertext{ .u = U, .v = V, .w = W }`.
@@ -81,7 +81,7 @@
 //! serialization"). `ibe` has **no external deployment whose bytes it
 //! must match** — it is this repo's OWN scheme, not a specialization of
 //! anyone else's. `encrypt` and `decrypt` both call
-//! `bls12_381.pairing.pairing`/the shared `fp12Pow` and feed
+//! `bls12_381.pairing.pairing`/`Fp12.pow` and feed
 //! `ciphersuite.h2` the SAME (canonical, uncubed) `Fp12` representation
 //! on both sides, so correctness only requires INTERNAL consistency —
 //! which the pairing identity `e(d_id,U) == Gid^r` (proved above)
@@ -94,7 +94,7 @@
 //! ## The ciphersuite seam, and what it anchors
 //!
 //! Everything above splits cleanly in two: an ASSEMBLY (which hash
-//! output feeds which XOR, the FO consistency check, where `fp12Pow`
+//! output feeds which XOR, the FO consistency check, where `Fp12.pow`
 //! sits, where `U`/`V`/`W` land in the encoding) and a set of
 //! PARAMETERS (hash tags, hash-to-curve DST, block width, `Gt`
 //! representation). `Scheme` below makes that split explicit: the
@@ -170,107 +170,10 @@ fn setupBody(out: *KeyPair, io: std.Io) void {
 
 // `extract`, `Ciphertext`, `encrypt` and `decrypt` are the four
 // declarations that actually CONSUME a ciphersuite, so they live inside
-// `Scheme` (below the `fp12Pow` helper) rather than at file scope; the
+// `Scheme` rather than at file scope; the
 // default instantiation is re-exported at the bottom of this file, so
 // `ibe.extract`/`ibe.Ciphertext`/`ibe.encrypt`/`ibe.decrypt` mean exactly
 // what they always did.
-
-// ── private helpers: Gt (Fp12) exponentiation ───────────────────────
-//
-// Adapted from tlock.zig's fp12Pow (same construction, same rationale
-// — see that file for the full derivation this doc comment summarizes).
-
-/// Constant-time select over `Fp12`: component-wise `Fp2.ctSelect`
-/// lifted through the `Fp6` tower level. Private helper for `fp12Pow`
-/// — `bls12_381.Fp12` exports no select of its own.
-fn fp12CtSelect(cond: bool, on_true: Fp12, on_false: Fp12) Fp12 {
-    return .{
-        .c0 = fp6CtSelect(cond, on_true.c0, on_false.c0),
-        .c1 = fp6CtSelect(cond, on_true.c1, on_false.c1),
-    };
-}
-
-fn fp6CtSelect(cond: bool, on_true: Fp6, on_false: Fp6) Fp6 {
-    return .{
-        .c0 = Fp2.ctSelect(cond, on_true.c0, on_false.c0),
-        .c1 = Fp2.ctSelect(cond, on_true.c1, on_false.c1),
-        .c2 = Fp2.ctSelect(cond, on_true.c2, on_false.c2),
-    };
-}
-
-/// Window width for `fp12Pow`, in bits, and the resulting table size. 4 bits
-/// divides 8 exactly (two windows per byte, no ragged final window) and puts
-/// the constant-time table at 16 `Fp12` elements = 9 KiB of stack — the point
-/// where the saved multiplications still dominate the cost of scanning it.
-const fp12_window_bits = 4;
-const fp12_window_size = 1 << fp12_window_bits;
-
-/// `base^exp` in `Gt`/`Fp12` — the `Gid^r` primitive `encrypt` needs
-/// and `bls12_381.Fp12` does not export.
-///
-/// Construction: big-endian FIXED-WINDOW (4-bit) exponentiation over
-/// `exp`'s canonical 32-byte encoding. Every window costs the same
-/// four squarings + one multiplication, and the window's digit
-/// selects a precomputed power through a full 16-entry
-/// `fp12CtSelect` scan — never a `table[idx]` index — so there is no
-/// secret-dependent branch and no secret-dependent memory access.
-/// `r = H3(sigma, M)` is secret-derived (leaking it leaks `sigma`,
-/// hence the message), so the exponent must be treated exactly like a
-/// secret scalar even though this is "just" encryption-side
-/// randomness.
-///
-/// Why windowed and not the older square-and-multiply-ALWAYS loop
-/// (which did one `square` + one `mul` + one select for each of the
-/// 256 bits): same 256 squarings, but 64 + 15 multiplications instead
-/// of 256. **Measured** on this host, ReleaseFast, 30 exponentiations
-/// of a real pairing output: 3.40 ms → 2.03 ms per exponentiation,
-/// **1.68x**. The 1024 extra `fp12CtSelect` merges the constant-time
-/// table scan costs are a small fraction of the ~177 `Fp12`
-/// multiplications saved — that ratio is the whole reason this is
-/// worth doing, and it is why the naive `table[idx]` (which would
-/// have been faster still) is not: correctness of the timing profile
-/// outranks the constant factor. Audit `tlock` F3 / `ibe` F4.
-fn fp12Pow(base: Fp12, exp: Fr) Fp12 {
-    // The table holds `base^0 … base^15`. `base` is PUBLIC (it is `Gid`, a
-    // pairing of public points), so building the table needs no protection at
-    // all — it is only the INDEX that is secret, which is why the lookup below
-    // touches every entry.
-    var table: [fp12_window_size]Fp12 = undefined;
-    table[0] = Fp12.one;
-    for (1..fp12_window_size) |i| table[i] = table[i - 1].mul(base);
-
-    var acc = Fp12.one;
-    for (exp.toBytes()) |byte| {
-        // Two 4-bit windows per byte, high nibble first. Every window costs
-        // exactly four squarings and one multiplication, unconditionally —
-        // there is no leading-zero skip, which would leak the exponent's bit
-        // length.
-        inline for ([_]u3{ 4, 0 }) |shift| {
-            acc = acc.square();
-            acc = acc.square();
-            acc = acc.square();
-            acc = acc.square();
-            const idx: u4 = @truncate(byte >> shift);
-            // THE CONSTANT-TIME LOOKUP. A plain `table[idx]` would be a
-            // secret-indexed memory access — a cache-timing oracle on the
-            // exponent, i.e. strictly worse than the square-and-multiply-always
-            // loop this replaces. Instead every one of the 16 entries is read
-            // and merged with the same `fp12CtSelect` mask-merge the previous
-            // construction used, so the access pattern is identical for every
-            // possible window value.
-            var sel = table[0];
-            for (1..fp12_window_size) |i| {
-                sel = fp12CtSelect(@as(u4, @intCast(i)) == idx, table[i], sel);
-            }
-            acc = acc.mul(sel);
-        }
-    }
-    return acc;
-}
-
-// ── internal test hook: expose fp12Pow to kat_test.zig ──────────────
-
-pub const testing_fp12Pow = fp12Pow;
 
 // ── Scheme: the ciphersuite seam ────────────────────────────────────
 
@@ -292,7 +195,7 @@ pub const DecryptError = error{
 /// The four declarations below (`extract`, `Ciphertext`, `encrypt`,
 /// `decrypt`) are the module's ASSEMBLY: which hash output feeds which
 /// XOR, in what order the FO consistency check recomputes and compares,
-/// where `fp12Pow` sits, and where `U`/`V`/`W` land in the wire
+/// where `Fp12.pow` sits, and where `U`/`V`/`W` land in the wire
 /// encoding. That assembly is *independent* of which hash tags,
 /// which hash-to-curve DST, which block width and which `Gt`
 /// representation the scheme is instantiated with — those are the
@@ -450,12 +353,12 @@ pub fn Scheme(comptime cs: type) type {
             // Step 5: U = r * G2_generator (constant-time scalarMul).
             const u = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r).toAffine();
 
-            // Step 6: gid_r = Gid^r — Gt exponentiation (see fp12Pow
+            // Step 6: gid_r = Gid^r — Gt exponentiation (see Fp12.pow
             // above). Handed to `h2` in `bls12_381.pairing`'s CANONICAL
             // representation; a ciphersuite needing another one (drand's
             // cube) adapts inside its own `h2`. See this file's module
             // doc comment, "No drand-style cube".
-            const gid_r = fp12Pow(gid, r);
+            const gid_r = gid.pow(&r);
 
             // Step 7: V = sigma XOR H2(gid_r).
             var v = cs.h2(gid_r);
@@ -670,92 +573,6 @@ test "extract yields a point on-curve and in the order-r G1 subgroup" {
     const d_id = testExtract(Default, kp.msk, "alice@example.com");
     try std.testing.expect(g1.Jacobian.fromAffine(d_id).isOnCurve());
     try std.testing.expect(g1.Jacobian.fromAffine(d_id).subgroupCheck());
-}
-
-// ── tests: fp12Pow (private helper — algebraic self-consistency) ────
-
-/// Independent oracle for `fp12Pow`: a plain bit-by-bit square-and-multiply,
-/// deliberately written in a DIFFERENT shape from the production windowed loop
-/// (branching on the bit, no table, no select) so a windowing bug — wrong digit
-/// order, wrong shift, an off-by-one in the squarings per window — cannot agree
-/// with it by construction. Not constant-time; a test oracle only.
-fn refFp12Pow(base: Fp12, exp: Fr) Fp12 {
-    var acc = Fp12.one;
-    for (exp.toBytes()) |byte| {
-        var bit: u3 = 7;
-        while (true) : (bit -= 1) {
-            acc = acc.square();
-            if ((byte >> bit) & 1 == 1) acc = acc.mul(base);
-            if (bit == 0) break;
-        }
-    }
-    return acc;
-}
-
-test "fp12Pow: windowed result equals a bitwise reference for every window digit" {
-    const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-
-    // Exponents chosen so that, between them, every 4-bit digit 0x0..0xf
-    // appears — and appears in both the high and the low nibble of a byte, so
-    // the two windows per byte cannot be swapped without a mismatch.
-    var e1 = @as([32]u8, @splat(0));
-    for (&e1, 0..) |*b, i| b.* = @truncate((i *% 0x1f) ^ 0x5a);
-    e1[0] = 0x00; // keep it below r
-    var e2 = @as([32]u8, @splat(0));
-    for (&e2, 0..) |*b, i| b.* = @truncate(i *% 0x11); // nibbles walk 0..f
-    e2[0] = 0x00;
-    var e3 = @as([32]u8, @splat(0));
-    e3[31] = 0x0f; // a single low window
-    var e4 = @as([32]u8, @splat(0));
-    e4[31] = 0xf0; // a single high window
-    var e5 = @as([32]u8, @splat(0));
-    e5[30] = 0x01; // window digit 1, one byte up
-
-    for ([_][32]u8{ e1, e2, e3, e4, e5 }) |bytes| {
-        const r = Fr.fromBytes(bytes) catch continue;
-        try std.testing.expect(fp12Pow(gt, r).eql(refFp12Pow(gt, r)));
-    }
-
-    // …and the two agree on the degenerate exponents too.
-    try std.testing.expect(fp12Pow(gt, Fr.zero).eql(refFp12Pow(gt, Fr.zero)));
-    try std.testing.expect(fp12Pow(gt, Fr.one).eql(refFp12Pow(gt, Fr.one)));
-}
-
-test "fp12Pow: base^0 = 1, base^1 = base" {
-    const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-    try std.testing.expect(fp12Pow(gt, Fr.zero).eql(Fp12.one));
-    try std.testing.expect(fp12Pow(gt, Fr.one).eql(gt));
-}
-
-test "fp12Pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q)" {
-    var r_bytes = @as([32]u8, @splat(0));
-    r_bytes[28] = 0x01;
-    r_bytes[29] = 0xf3;
-    r_bytes[30] = 0x5a;
-    r_bytes[31] = 0x8d;
-    const r = Fr.fromBytes(r_bytes) catch unreachable;
-
-    const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-    const lhs = fp12Pow(gt, r);
-
-    const rp = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(r).toAffine();
-    const rhs = pairing.pairing(rp, g2.Affine.generator);
-    try std.testing.expect(lhs.eql(rhs));
-}
-
-test "fp12Pow is multiplicative in the exponent: base^a * base^b == base^(a+b)" {
-    var a_bytes = @as([32]u8, @splat(0));
-    a_bytes[31] = 0x07;
-    var b_bytes = @as([32]u8, @splat(0));
-    b_bytes[31] = 0x0b;
-    var ab_bytes = @as([32]u8, @splat(0));
-    ab_bytes[31] = 0x12; // 7 + 11 = 18
-    const a = Fr.fromBytes(a_bytes) catch unreachable;
-    const b = Fr.fromBytes(b_bytes) catch unreachable;
-    const ab = Fr.fromBytes(ab_bytes) catch unreachable;
-
-    const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-    try std.testing.expect(fp12Pow(gt, a).mul(fp12Pow(gt, b)).eql(fp12Pow(gt, ab)));
 }
 
 // Test helpers over the pointer/out-param API: tests compare values, library

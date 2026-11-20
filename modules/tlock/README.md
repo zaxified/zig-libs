@@ -18,7 +18,7 @@ pairing sanity check against a GENUINE, live-fetched quicknet round
 signature (see [SPEC.md](SPEC.md)'s "Known answers"). The two irreducible
 cryptographic cores, `encrypt`/`decrypt` (the BF-IBE FullIdent
 assembly + the Fiat-Shamir-Okamoto CCA consistency check + a
-module-local constant-time `fp12Pow`), are implemented behind
+`bls12_381`'s constant-time `Fp12.pow`), are implemented behind
 `gate.core_implemented = true` and byte-exact-verified IN BOTH
 DIRECTIONS against a genuine ciphertext produced by drand's own Go
 `tle` CLI (`kat_test.zig`'s interop vector — which caught a real
@@ -30,7 +30,7 @@ drand/kilic hashes the canonical pairing value's CUBE; see
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
 | `ciphersuite.zig` | **REAL.** `beaconId` (drand's unchained beacon digest / IBE identity), `h1` (identity -> `G1`), `h2`/`h3`/`h4` (drand/kyber's SHA-256 constructions), `randomSigma` |
-| `tlock.zig` | `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec (**REAL**); **FABLE CORE (REAL):** `encrypt`/`decrypt` + the private `fp12Pow`/`gtToDrandRepr` Gt helpers |
+| `tlock.zig` | `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec (**REAL**); **FABLE CORE (REAL):** `encrypt`/`decrypt` + the private `gtToDrandRepr` Gt helper (exponentiation: `bls12_381`'s `Fp12.pow`) |
 | `age.zig` | The age v1 envelope `tle` writes: `tlock` stanza, header MAC, ChaCha20-Poly1305 STREAM payload, ASCII armor — files of any length |
 | `gate.zig` | The single switch (`core_implemented`, now `true`) gating `encrypt`/`decrypt`'s KAT tests |
 | `kat_test.zig` | The KAT harness — real ungated hash/pairing-sanity tests (against live quicknet data), gated round-trip/tamper-rejection tests, and the byte-exact drand interop vector (decrypt + re-encrypt) |
@@ -158,7 +158,7 @@ zig fmt --check modules/tlock/
 
 With `gate.core_implemented = true`: all tests PASS,
 no skips — the ciphersuite/hash/pairing-sanity/`Ciphertext`-codec tests,
-the `fp12Pow` algebraic-law tests, the gated `encrypt`/`decrypt`
+the `Fp12.pow` algebraic-law tests, the gated `encrypt`/`decrypt`
 round-trip and tamper/FO-rejection tests, and the byte-exact drand
 interop vector (decrypt + re-encrypt). This holds in Debug and
 ReleaseFast.

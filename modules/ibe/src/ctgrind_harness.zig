@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! ctgrind_harness — the constant-time evidence for the reasoning
-//! `ibe.zig`'s `fp12Pow` doc comment already carries ("no secret-dependent
+//! `ibe.zig`'s `Fp12.pow` doc comment already carries ("no secret-dependent
 //! branch and no secret-dependent memory access", citing audit finding "ibe
 //! F4"), as an actual committed program instead of an unmeasured paragraph.
 //! Run it through `../../../scripts/checks/ctgrind.sh ibe` (its expected rows
@@ -33,35 +33,22 @@
 //!   own, plus this module's own `h2`/`h3`/`h4` tag-hashing and the FO
 //!   consistency compare, none of which the triage flagged.
 //! - `encrypt(mpk, id, message, sigma)` is what "tips the whole module to
-//!   NEEDS": it calls a module-LOCAL `fp12Pow(gid, r)` — "adapted from
-//!   `tlock.zig`'s `fp12Pow`" per `ibe.zig`'s own doc comment — with
-//!   detailed inline constant-time reasoning (4-bit windowed
-//!   exponentiation, `fp12CtSelect`/`fp6CtSelect` full-table scan, no
-//!   leading-zero skip) but, until this file, zero empirical measurement.
+//!   NEEDS": it computes `gid.pow(&r)` (`bls12_381`'s `Fp12.pow`, shared
+//!   with `tlock`) — 4-bit windowed exponentiation, `ctSelect` full-table
+//!   scan, no leading-zero skip — whose constant-time claim this harness
+//!   measures.
 //!
 //! So this harness does not drive `encrypt` end to end (that would also
 //! taint `message`/`sigma`, which are NOT the master secret key or the
 //! per-identity private key this module's threat model protects — they are
 //! the sender's own plaintext and randomness, out of scope for "WHAT TO
-//! TAINT" here). Instead the THIRD target calls `fp12Pow` directly through
-//! `ibe.zig`'s own `testing_fp12Pow` test hook, tainting only the EXPONENT
-//! — the one operand `fp12Pow`'s own doc comment argues must be "treated
+//! TAINT" here). Instead the THIRD target calls `Fp12.pow` directly,
+//! tainting only the EXPONENT — the one operand that must be "treated
 //! exactly like a secret scalar" (`r = H3(sigma, M)` is secret-derived: it
 //! leaks `sigma`, hence the message, if it leaks). The base (`Gid`, a real
 //! pairing of two public points) is left clean, mirroring `bls12_381`'s own
 //! `g1_scalarmul`/`g2_scalarmul` targets tainting only the scalar and never
 //! the point being multiplied.
-//!
-//! ## Verified before relying on it
-//!
-//! Per the campaign's own two prior false headlines, `fp12Pow`'s existence
-//! and shape were confirmed by reading `ibe.zig` directly before writing
-//! this file, not taken from the triage note: it is real (`ibe.zig` lines
-//! ~226-262), a 4-bit fixed-window exponentiation over `Fp12`, using
-//! `fp12CtSelect`/`fp6CtSelect` (full 16-entry scans, never `table[idx]`)
-//! and exported as `pub const testing_fp12Pow = fp12Pow;` specifically so a
-//! test/harness file can reach it without widening the module's real public
-//! API.
 //!
 //! ## What is tainted, and what deliberately is not
 //!
@@ -69,10 +56,10 @@
 //! (`msk`, entering `extract`) and the identity-based private key (`d_id`,
 //! entering `decrypt`) — never the identity string, the ciphertext, or the
 //! master PUBLIC key (`mpk`), all public by construction. The third target
-//! taints `fp12Pow`'s exponent for the reason given above (the module's own
+//! taints `Fp12.pow`'s exponent for the reason given above (the module's own
 //! doc comment treats it as secret-equivalent even though it is
 //! encryption-side, not key material) — this is evidence for `ibe.zig`'s
-//! own claim about `fp12Pow`, not a re-statement of the msk/d_id rule.
+//! own claim about `Fp12.pow`, not a re-statement of the msk/d_id rule.
 //!
 //! - `.extract` — taints `msk` (an `Fr` scalar). `id` is a fixed public
 //!   string, never tainted.
@@ -272,7 +259,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("message={x}\n", .{message});
         },
         .fp12pow => {
-            // `fp12Pow`'s exponent `r` — secret-derived in the real
+            // `Fp12.pow`'s exponent `r` — secret-derived in the real
             // `encrypt` path (`r = H3(sigma, message)`) and treated by
             // `ibe.zig`'s own doc comment as "exactly like a secret
             // scalar". The base `Gid` is a real pairing of two PUBLIC
@@ -280,7 +267,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // `scalarmul` targets never tainting the point.
             const gid = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
             const r = try secretFr("ctgrind-ibe-harness-fp12pow-exponent-v1", taint);
-            const result = ibe_mod.testing_fp12Pow(gid, r);
+            const result = gid.pow(&r);
 
             // Propagation proof.
             std.debug.print("result={x}\n", .{result.toBytes()});

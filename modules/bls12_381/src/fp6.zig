@@ -73,6 +73,16 @@ pub const Fp6 = struct {
         return a.c0.eql(b.c0) and a.c1.eql(b.c1) and a.c2.eql(b.c2);
     }
 
+    /// Constant-time select: `on_true` if `cond`, else `on_false`, by the
+    /// component-wise `Fp2.ctSelect` mask merge (no branch on `cond`).
+    pub fn ctSelect(cond: bool, on_true: Fp6, on_false: Fp6) Fp6 {
+        return .{
+            .c0 = Fp2.ctSelect(cond, on_true.c0, on_false.c0),
+            .c1 = Fp2.ctSelect(cond, on_true.c1, on_false.c1),
+            .c2 = Fp2.ctSelect(cond, on_true.c2, on_false.c2),
+        };
+    }
+
     // ── field arithmetic ────────────────────────────────────────────────
 
     /// Component-wise `Fp2.add` (`c0`, `c1`, `c2` independently).

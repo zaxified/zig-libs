@@ -31,7 +31,7 @@
 //!
 //! This is now `true`: `tlock.zig`'s `encrypt`/`decrypt` are REAL —
 //! implemented (BF-IBE FullIdent assembly + the FO consistency check +
-//! a module-local constant-time `fp12Pow`) and byte-exact-verified
+//! a `bls12_381`'s constant-time `Fp12.pow`) and byte-exact-verified
 //! against a GENUINE drand-Go-produced interop ciphertext
 //! (`kat_test.zig`'s "drand interop vector" section: a `tle`-encrypted
 //! fixture from `drand/tlock`'s own `testdata/`, decrypted with the

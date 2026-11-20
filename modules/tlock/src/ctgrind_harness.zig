@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! ctgrind_harness — empirical evidence for `tlock.zig`'s `fp12Pow`
+//! ctgrind_harness — empirical evidence for `tlock.zig`'s `Fp12.pow`
 //! (audit finding "tlock F3"), the module's own
 //! hand-rolled constant-time `Gt` exponentiation — plus, at the task's
 //! explicit request, the recipient-private-key path through `decrypt`.
@@ -14,35 +14,29 @@
 //! A triage pass (the audit ctgrind triage notes)
 //! reported "`tlock`/`ibe` both hand-roll a constant-time `Gt`
 //! exponentiation with careful reasoning but no empirical measurement".
-//! Checked directly against this tree: TRUE. `tlock.zig`'s private
-//! `fp12Pow` is a real, committed 4-bit fixed-window
-//! square-and-select-always loop over `Fp12.square`/`.mul`, with a
-//! `fp12CtSelect` table scan (never `table[idx]`) exactly as its own doc
-//! comment (lines 198-272) describes, and the doc comment cites this
-//! exact finding by name ("Audit `tlock` F3 / `ibe` F4"). The
+//! The exponentiation is `bls12_381`'s `Fp12.pow` (shared with `ibe`):
+//! a 4-bit fixed-window square-and-select-always loop over
+//! `Fp12.square`/`.mul`, with a `Fp12.ctSelect` table scan (never
+//! `table[idx]`), as its doc comment describes. The
 //! same triage file's row on `tlock` ALSO says, in its own "Notes"
 //! column: "`decrypt` only takes the ALREADY-PUBLISHED `round_signature`,
 //! which is public by the time decrypt can run — fine on its own." That
 //! second sentence matters for how the `decrypt` target below is read —
 //! see "Target 2" below.
 //!
-//! `fp12Pow` is `fn`, not `pub fn` — private to `tlock.zig`, and Zig's
-//! privacy is per-file, so this sibling harness file cannot call it
-//! directly without editing `tlock.zig` (out of scope: the task
-//! forbids editing `modules/tlock/src/*.zig`). Both targets below
-//! therefore drive it through the REAL public API (`tlock.encrypt`),
-//! which is arguably more faithful than a synthetic direct call anyway:
-//! it is the exact code path a real caller exercises.
+//! Both targets drive it through the REAL public API (`tlock.encrypt`):
+//! the exact code path a real caller exercises (`ibe`'s harness taints
+//! `Fp12.pow`'s exponent directly).
 //!
 //! ## Target 1: `fp12pow` — the F3 lead itself
 //!
-//! `tlock.encrypt`'s step 7 computes `gid_r = fp12Pow(Gid, r)` where
+//! `tlock.encrypt`'s step 7 computes `gid_r = Gid.pow(&r)` where
 //! `r = ciphersuite.h3(sigma, message)`. `Gid` (`= pairing(Qid, p_pub)`)
 //! is PUBLIC — a pairing of two public points — so only `sigma` and
 //! `message` are tainted here; `p_pub` is the (public) `G2` generator
 //! and `round` a fixed public constant, both chosen only to give
 //! `encrypt` a valid, self-consistent call, carrying no meaning of
-//! their own. `fp12Pow`'s own doc comment states the reasoning this
+//! their own. `Fp12.pow`'s own doc comment states the reasoning this
 //! target exists to check empirically: "`r = H3(sigma, M)` is
 //! secret-derived (leaking it leaks `sigma`, hence the message), so the
 //! exponent must be treated exactly like a secret scalar even though

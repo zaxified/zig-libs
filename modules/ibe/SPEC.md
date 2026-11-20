@@ -48,7 +48,7 @@ encrypt(mpk, id, &M, &sigma):
   Gid   = pairing(Qid, mpk) ∈ Gt
   r     = H3(sigma, M) ∈ Fr
   U     = r · G2_generator ∈ G2
-  gid_r = Gid^r ∈ Gt                      (Gt SCALAR EXPONENTIATION — fp12Pow)
+  gid_r = Gid^r ∈ Gt                      (Gt SCALAR EXPONENTIATION — Fp12.pow)
   V     = sigma XOR H2(gid_r)
   W     = M XOR H4(sigma)
   return (U, V, W)
@@ -87,20 +87,18 @@ e(d_id, U) = e(msk·Qid, r·G2gen)
 
 `kat_test.zig`'s "pairing consistency" test checks this identity
 DIRECTLY (recomputing `Gid`/`r`/`U` and comparing `pairing(d_id, U)`
-against `fp12Pow(Gid, r)`), not merely inferring it from a successful
+against `Gid.pow(&r)`), not merely inferring it from a successful
 round trip.
 
 ## `Gt` (`Fp12`) scalar exponentiation
 
-`encrypt` needs `Gid^r`; `bls12_381.Fp12` exports no `pow`. Same
-resolution `tlock` already took (`tlock/SPEC.md`'s "Known gap", option
-1): a module-local `fp12Pow` in `ibe.zig`, the same construction as `tlock.zig`'s: a fixed 4-bit window over the
+`encrypt` needs `Gid^r`: `Gid.pow(&r)`, `bls12_381`'s `Fp12.pow`, shared with `tlock`: a fixed 4-bit window over the
 exponent's 32 bytes (four squarings and one multiplication per window, no leading-zero skip) whose table lookup reads
-every one of the 16 entries and merges them with a component-wise `Fp2.ctSelect` lift (`fp12CtSelect`), so
+every one of the 16 entries and merges them with `Fp12.ctSelect` (a component-wise `Fp2.ctSelect` lift), so
 neither a branch nor a memory address depends on the exponent. `r = H3(sigma, M)` is secret-derived in both modules,
 so the exponent is treated like a secret scalar in both; the base `Gid` is a pairing of public points. The
-exponentiation law is pinned ungated against pairing bilinearity (`e(P,Q)^r == e(rP,Q)`) in both `ibe.zig`'s own
-tests and `kat_test.zig`, and the windowed result against a bitwise reference for every window digit.
+exponentiation law is pinned against pairing bilinearity (`e(P,Q)^r == e(rP,Q)`) in `kat_test.zig`, and the
+windowed result against a bitwise reference for every window digit in `bls12_381`'s `fp12.zig` tests.
 
 ## No drand-style cube
 
@@ -116,7 +114,7 @@ serialization" section for the full derivation.
 specialization of any external system — there is no third party's
 `GT.ToBytes`/final-exponentiation convention to match. `encrypt` and
 `decrypt` both call `bls12_381.pairing.pairing` (and the shared
-`fp12Pow`) directly and feed `ciphersuite.h2` the CANONICAL,
+`Fp12.pow`) directly and feed `ciphersuite.h2` the CANONICAL,
 un-cubed `Fp12` representation on both sides. Correctness only requires
 that both sides agree — which the bilinearity identity above already
 guarantees regardless of which final-exponentiation convention
@@ -131,12 +129,12 @@ reason to add the extra `Fp12.square`+`Fp12.mul` per call when nothing
 external constrains the representation. `kat_test.zig`'s "pairing
 consistency" test pins this directly by comparing the canonical,
 un-cubed `pairing(d_id, U)` against the canonical, un-cubed
-`fp12Pow(Gid, r)`.
+`Gid.pow(&r)`.
 
 ## KAT plan — the assembly is anchored, the parameters cannot be
 
 This module splits into an **assembly** (which hash output feeds which
-XOR, the FO consistency check, where `fp12Pow` sits, where `U`/`V`/`W`
+XOR, the FO consistency check, where `Fp12.pow` sits, where `U`/`V`/`W`
 land in the wire encoding) and a set of **parameters** (`ciphersuite.
 zig`'s hash tags, its `dst_g1`, the 32-byte block width, and the
 canonical un-cubed `Gt` representation). `ibe.Scheme` makes the split
@@ -153,7 +151,7 @@ adapter `kilic/bls12-381`'s final exponentiation requires — and
 requires the result to reproduce, byte for byte, a genuine ciphertext
 produced by drand's own Go `tle` CLI (the fixture frozen in
 `modules/tlock/src/kat_test.zig` section 3; provenance in
-`tlock/NOTICE`). It is `ibe.zig`'s own `encrypt`/`decrypt`/`fp12Pow`/
+`tlock/NOTICE`). It is `ibe.zig`'s own `encrypt`/`decrypt`/`Fp12.pow`/
 `Ciphertext` bodies doing the work — the same ones the default
 instantiation uses, not a copy and not a re-derivation in another
 language, either of which would be a sibling implementation and would
@@ -180,13 +178,13 @@ What `kat_test.zig` verifies on the parameter side:
   policy-string identity; a second test uses `ciphersuite.randomSigma`
   (the production entropy path, not a fixed KAT sigma); a third
   confirms `encrypt` is deterministic given fixed inputs.
-- **Pairing consistency**: `e(d_id, U) == fp12Pow(Gid, r)`
+- **Pairing consistency**: `e(d_id, U) == Gid.pow(&r)`
   checked directly on a known case (see "Correctness identity" above),
   plus the `Extract`-correctness identity `e(d_id, G2gen) ==
   e(H1(id), mpk)` a caller crossing a trust boundary would check (the
   same idiom `tlock`'s own pairing-sanity test uses for a beacon round
   signature).
-- **`fp12Pow` law**: `base^0`/`base^1`, exponent additivity, and
+- **`Fp12.pow` law**: `base^0`/`base^1`, exponent additivity, and
   the bilinearity cross-check `e(P,Q)^r == e(rP,Q)` — pinned in both
   `ibe.zig`'s own tests (mirroring `tlock.zig`'s identical tests) and
   `kat_test.zig`.
@@ -234,8 +232,8 @@ are pinned in `scripts/checks/ctgrind-expected.tsv`.
 | `fp12pow` | `sigma`, `message` | 0 | none |
 
 ⛔ Not a constant-time claim about the pairing — `bls12_381/src/pairing.zig`
-makes none. What is pinned is this module's own `fp12Pow` (the same windowed
-construction `tlock` uses) and the shape of `decrypt` around it. The decrypt
+makes none. What is pinned is `Fp12.pow` (shared with `tlock`; the row's source
+pattern includes `fp12.zig`) and the shape of `decrypt` around it. The decrypt
 contexts are `toAffine`/`inv` and the compression sort bit on output points, `Fr`'s
 canonical accept/reject, and `decrypt`'s FO re-encryption compare (`std.mem.eql`;
 accept/reject is public, per the code). Read with `--stacks`. A count moves when the
@@ -248,11 +246,11 @@ prints a real recovered plaintext) before re-pinning.
 Run: `scripts/modtest ibe` (the whole module is `heavy`); `IBE_FUZZ=<runs>` for the fuzz driver;
 `scripts/checks/ctgrind.sh ibe` for the constant-time rows.
 
-- **KAT plan above** (`src/kat_test.zig`): round trips, entropy seam, determinism, pairing consistency, `fp12Pow` law,
+- **KAT plan above** (`src/kat_test.zig`): round trips, entropy seam, determinism, pairing consistency, `Fp12.pow` law,
   soundness/CCA rejection, and the drand-parameterised interop anchor.
 - **Unit tests** (`src/ibe.zig`, `src/ciphersuite.zig`): the `Ciphertext` codec and its malformed-G2 rejection,
   `setup`/`extract` properties (`mpk = msk * G2gen`, determinism, on-curve and subgroup membership, distinct keys),
-  `KeyPair.deinit` and a failed `decrypt` zeroing their outputs, the windowed `fp12Pow` against a bitwise reference,
+  `KeyPair.deinit` and a failed `decrypt` zeroing their outputs, the windowed `Fp12.pow` against a bitwise reference,
   and the hash constructions (`h1` on-curve and in the subgroup, `h2`/`h4` domain-separated and exactly one block
   wide, `h3` a canonical scalar).
 - **Fuzz** (`src/kat_test.zig`, `src/fuzz_test.zig`): `Ciphertext.fromBytes` and `decrypt` on corrupted ciphertext
@@ -268,7 +266,7 @@ Run: `scripts/modtest ibe` (the whole module is `heavy`); `IBE_FUZZ=<runs>` for 
   lane of the block.
 - **Mutation:** one whole-module run over `ibe.zig` and `ciphersuite.zig` (`root.zig` carries no logic; `burn.zig` is
   covered through its call sites): 68 mutants, 63 killed, 5 equivalent, 0 open. 59 ran as ReleaseSafe schemata over
-  `fp12CtSelect`/`fp6CtSelect`, the windowed `fp12Pow` (table, digit order, squarings, select scan, byte order),
+  `Fp12.ctSelect`/`Fp6.ctSelect`, the windowed `Fp12.pow` (table, digit order, squarings, select scan, byte order),
   `setup`/`extract`/`encrypt`/`decrypt` (every hash argument, every XOR, the FO compare and its operands), the
   `Ciphertext` codec (slot swaps, the unchecked G2 decoder), `KeyPair.deinit`, and every `ciphersuite` tag, DST,
   hash input and the `randomSigma` draw (dropped, half-filled). Nine ran as ReleaseFast against the stack probe: the

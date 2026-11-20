@@ -11,7 +11,7 @@ extracted.
 **How it is anchored.** The encrypt/decrypt *assembly* is checked
 against a foreign artifact: `ibe.Scheme` is a `comptime` seam over the
 ciphersuite, and the tests instantiate this module's own
-`encrypt`/`decrypt`/`fp12Pow`/`Ciphertext` code with **drand's**
+`encrypt`/`decrypt`/`Fp12.pow`/`Ciphertext` code with **drand's**
 parameters and require it to reproduce a genuine ciphertext produced by
 drand's own Go `tle` CLI, byte for byte. This module's own *parameters*
 — its DSTs and hash tags, and the one deliberate divergence from
@@ -32,7 +32,7 @@ at any time.
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
 | `ciphersuite.zig` | `h1` (identity -> `G1`), `h2`/`h3`/`h4` (this module's own domain-separated hash constructions), `randomSigma` |
-| `ibe.zig` | `KeyPair`, `setup`/`extract` (the PKG API), `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec, `encrypt`/`decrypt` + the private `fp12Pow` `Gt`-exponentiation helper |
+| `ibe.zig` | `KeyPair`, `setup`/`extract` (the PKG API), `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec, `encrypt`/`decrypt` (`Gt` exponentiation: `bls12_381`'s `Fp12.pow`) |
 | `burn.zig` | Dead-stack burn wrapper run around every secret-holding entry point (`setup`, `extract`, `encrypt`, `decrypt`, `randomSigma`) |
 | `fuzz_test.zig`, `stackprobe_test.zig`, `ctgrind_harness.zig` | The `IBE_FUZZ` driver plumbing, the dead-stack probe, and the constant-time harness (run by `scripts/checks/ctgrind.sh ibe`, not by `test-ibe`) |
 | `kat_test.zig` | Round-trip, pairing-consistency and soundness (tamper/wrong-key rejection) KATs, plus the drand-parameterised interop anchor (test-only `tlock` import) |
@@ -118,7 +118,7 @@ zig fmt --check modules/ibe/
 
 All tests PASS in both Debug and ReleaseFast — ciphersuite hash
 tests, `Ciphertext` codec tests, `setup`/`extract` tests, the private
-`fp12Pow` algebraic-law tests, and `kat_test.zig`'s round-trip,
+`Fp12.pow` algebraic-law tests, and `kat_test.zig`'s round-trip,
 pairing-consistency, soundness/CCA-rejection and drand-anchor KATs.
 
 Provenance: see [NOTICE](NOTICE).

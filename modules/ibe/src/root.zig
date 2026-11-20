@@ -45,8 +45,8 @@
 //!   parameter).
 //! - `ibe.zig` — `KeyPair`, `setup`/`extract` (the PKG API),
 //!   `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec, `encrypt`/
-//!   `decrypt` (the BF-IBE FullIdent core) + the private `fp12Pow` `Gt`
-//!   exponentiation helper.
+//!   `decrypt` (the BF-IBE FullIdent core); `Gt` exponentiation is
+//!   `bls12_381`'s `Fp12.pow`.
 //! - `kat_test.zig` — round-trip, pairing-consistency and soundness
 //!   (tamper/wrong-key rejection) KATs, plus the **drand-parameterised
 //!   interop anchor**: `ibe.Scheme` instantiated with drand's

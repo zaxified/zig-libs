@@ -42,11 +42,8 @@
 //!      scalar `r` (NOT a pairing call — encrypt has no private
 //!      "secret" to fold `r` into one of the pairing's own arguments
 //!      the way `decrypt` does; it must exponentiate the already-
-//!      computed `Gid` directly). `bls12_381.Fp12` exports no generic
-//!      `pow`, so this file carries a private `fp12Pow` — a constant-
-//!      time square-and-multiply-always loop over `Fp12.square`/`.mul`
-//!      (option 1 of `SPEC.md`'s "Known gap", recorded there; no
-//!      `bls12_381` change).
+//!      computed `Gid` directly) — `Gid.pow(&r)`, `bls12_381`'s
+//!      constant-time fixed-window `Fp12.pow` (shared with `ibe`).
 //!   8. `V = sigma XOR ciphersuite.h2(block_bytes, gid_r)`.
 //!   9. `W = message XOR ciphersuite.h4(block_bytes, &sigma)`.
 //!   10. return `Ciphertext{ .u = U, .v = V, .w = W }`.
@@ -163,106 +160,6 @@ pub const Ciphertext = struct {
     }
 };
 
-// ── private helpers: Gt (Fp12) exponentiation ───────────────────────
-
-/// Constant-time select over `Fp12`: component-wise `Fp2.ctSelect`
-/// (the same byte-mask merge `g1`/`g2`'s branchless point arithmetic
-/// is built on) lifted through the `Fp6` tower level. Private helper
-/// for `fp12Pow` — `bls12_381.Fp12` exports no select of its own, and
-/// per this module's layering decision (`SPEC.md`'s "Known gap",
-/// option 1 taken) the exponentiation machinery stays module-local
-/// rather than reaching into the sibling.
-fn fp12CtSelect(cond: bool, on_true: Fp12, on_false: Fp12) Fp12 {
-    return .{
-        .c0 = fp6CtSelect(cond, on_true.c0, on_false.c0),
-        .c1 = fp6CtSelect(cond, on_true.c1, on_false.c1),
-    };
-}
-
-fn fp6CtSelect(cond: bool, on_true: Fp6, on_false: Fp6) Fp6 {
-    return .{
-        .c0 = Fp2.ctSelect(cond, on_true.c0, on_false.c0),
-        .c1 = Fp2.ctSelect(cond, on_true.c1, on_false.c1),
-        .c2 = Fp2.ctSelect(cond, on_true.c2, on_false.c2),
-    };
-}
-
-/// Window width for `fp12Pow`, in bits, and the resulting table size. 4 bits
-/// divides 8 exactly (two windows per byte, no ragged final window) and puts
-/// the constant-time table at 16 `Fp12` elements = 9 KiB of stack — the point
-/// where the saved multiplications still dominate the cost of scanning it.
-const fp12_window_bits = 4;
-const fp12_window_size = 1 << fp12_window_bits;
-
-/// `base^exp` in `Gt`/`Fp12` — the `Gid^r` primitive `encrypt`'s step
-/// 7 needs and `bls12_381.Fp12` does not export (`SPEC.md`'s "Known
-/// gap"; option 1 — a module-local loop — taken, recorded there).
-///
-/// Construction: big-endian FIXED-WINDOW (4-bit) exponentiation over
-/// `exp`'s canonical 32-byte encoding. Every window costs the same
-/// four squarings + one multiplication, and the window's digit
-/// selects a precomputed power through a full 16-entry
-/// `fp12CtSelect` scan — never a `table[idx]` index — so there is no
-/// secret-dependent branch and no secret-dependent memory access.
-/// `r = H3(sigma, M)` is secret-derived (leaking it leaks `sigma`,
-/// hence the message), so the exponent must be treated exactly like a
-/// secret scalar even though this is "just" encryption-side
-/// randomness.
-///
-/// Why windowed and not the older square-and-multiply-ALWAYS loop
-/// (which did one `square` + one `mul` + one select for each of the
-/// 256 bits): same 256 squarings, but 64 + 15 multiplications instead
-/// of 256. **Measured** on this host, ReleaseFast, 30 exponentiations
-/// of a real pairing output: 3.40 ms → 2.03 ms per exponentiation,
-/// **1.68x**. The 1024 extra `fp12CtSelect` merges the constant-time
-/// table scan costs are a small fraction of the ~177 `Fp12`
-/// multiplications saved — that ratio is the whole reason this is
-/// worth doing, and it is why the naive `table[idx]` (which would
-/// have been faster still) is not: correctness of the timing profile
-/// outranks the constant factor. Audit `tlock` F3 / `ibe` F4.
-///
-/// Correctness note: `exp` is a canonical `Fr` (< r, the order of the
-/// `Gt` subgroup), so no reduction subtleties arise; `base` is always
-/// a pairing output (an r-th-root-of-unity subgroup element), but the
-/// loop is generic over any `Fp12` and never relies on that.
-fn fp12Pow(base: Fp12, exp: Fr) Fp12 {
-    // The table holds `base^0 … base^15`. `base` is PUBLIC (it is `Gid`, a
-    // pairing of public points), so building the table needs no protection at
-    // all — it is only the INDEX that is secret, which is why the lookup below
-    // touches every entry.
-    var table: [fp12_window_size]Fp12 = undefined;
-    table[0] = Fp12.one;
-    for (1..fp12_window_size) |i| table[i] = table[i - 1].mul(base);
-
-    var acc = Fp12.one;
-    for (exp.toBytes()) |byte| {
-        // Two 4-bit windows per byte, high nibble first. Every window costs
-        // exactly four squarings and one multiplication, unconditionally —
-        // there is no leading-zero skip, which would leak the exponent's bit
-        // length.
-        inline for ([_]u3{ 4, 0 }) |shift| {
-            acc = acc.square();
-            acc = acc.square();
-            acc = acc.square();
-            acc = acc.square();
-            const idx: u4 = @truncate(byte >> shift);
-            // THE CONSTANT-TIME LOOKUP. A plain `table[idx]` would be a
-            // secret-indexed memory access — a cache-timing oracle on the
-            // exponent, i.e. strictly worse than the square-and-multiply-always
-            // loop this replaces. Instead every one of the 16 entries is read
-            // and merged with the same `fp12CtSelect` mask-merge the previous
-            // construction used, so the access pattern is identical for every
-            // possible window value.
-            var sel = table[0];
-            for (1..fp12_window_size) |i| {
-                sel = fp12CtSelect(@as(u4, @intCast(i)) == idx, table[i], sel);
-            }
-            acc = acc.mul(sel);
-        }
-    }
-    return acc;
-}
-
 /// Converts a `Gt` element from this module's CANONICAL pairing value
 /// to the representation drand actually hashes — the element's CUBE.
 ///
@@ -294,7 +191,7 @@ fn fp12Pow(base: Fp12, exp: Fr) Fp12 {
 /// without it).
 ///
 /// Bilinearity commutes with the cube, so applying it AFTER
-/// `fp12Pow`/`pairing` is exactly drand's `(Gid_kilic)^r`:
+/// `Fp12.pow`/`pairing` is exactly drand's `(Gid_kilic)^r`:
 /// `(gid^r)^3 = (gid^3)^r`.
 fn gtToDrandRepr(gt: Fp12) Fp12 {
     return gt.square().mul(gt);
@@ -360,8 +257,8 @@ fn encryptBody(p_pub: g2.Affine, round: u64, message: *const [block_bytes]u8, si
     // Step 6: U = r * G2_generator (constant-time scalarMul).
     const u = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(r).toAffine();
 
-    // Step 7: gid_r = Gid^r — Gt exponentiation (see fp12Pow above).
-    const gid_r = fp12Pow(gid, r);
+    // Step 7: gid_r = Gid^r — Gt exponentiation (bls12_381's constant-time Fp12.pow).
+    const gid_r = gid.pow(&r);
 
     // Step 8: V = sigma XOR H2(gid_r) — hashed in drand's Gt
     // representation (the canonical value's cube; see gtToDrandRepr).
@@ -483,98 +380,4 @@ test "Ciphertext.fromBytes rejects a malformed G2 encoding (V/W untouched, U cor
     // that is not a valid flag combination.
     bytes[0] = 0xFF;
     try std.testing.expectError(error.InvalidEncoding, Ciphertext.fromBytes(bytes));
-}
-
-// ── tests: fp12Pow (private helper — algebraic self-consistency) ────
-//
-// encrypt/decrypt themselves are exercised by kat_test.zig (round-trip,
-// tamper rejection, and the byte-exact drand interop vector — the
-// arbiter for the Gt serialization). These tests pin fp12Pow's
-// exponentiation LAW independently, against pairing bilinearity: the
-// same identity encrypt/decrypt's correctness rests on.
-
-/// Independent oracle for `fp12Pow`: a plain bit-by-bit square-and-multiply,
-/// deliberately written in a DIFFERENT shape from the production windowed loop
-/// (branching on the bit, no table, no select) so a windowing bug — wrong digit
-/// order, wrong shift, an off-by-one in the squarings per window — cannot agree
-/// with it by construction. Not constant-time; a test oracle only.
-fn refFp12Pow(base: Fp12, exp: Fr) Fp12 {
-    var acc = Fp12.one;
-    for (exp.toBytes()) |byte| {
-        var bit: u3 = 7;
-        while (true) : (bit -= 1) {
-            acc = acc.square();
-            if ((byte >> bit) & 1 == 1) acc = acc.mul(base);
-            if (bit == 0) break;
-        }
-    }
-    return acc;
-}
-
-test "fp12Pow: windowed result equals a bitwise reference for every window digit" {
-    const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-
-    // Exponents chosen so that, between them, every 4-bit digit 0x0..0xf
-    // appears — and appears in both the high and the low nibble of a byte, so
-    // the two windows per byte cannot be swapped without a mismatch.
-    var e1 = @as([32]u8, @splat(0));
-    for (&e1, 0..) |*b, i| b.* = @truncate((i *% 0x1f) ^ 0x5a);
-    e1[0] = 0x00; // keep it below r
-    var e2 = @as([32]u8, @splat(0));
-    for (&e2, 0..) |*b, i| b.* = @truncate(i *% 0x11); // nibbles walk 0..f
-    e2[0] = 0x00;
-    var e3 = @as([32]u8, @splat(0));
-    e3[31] = 0x0f; // a single low window
-    var e4 = @as([32]u8, @splat(0));
-    e4[31] = 0xf0; // a single high window
-    var e5 = @as([32]u8, @splat(0));
-    e5[30] = 0x01; // window digit 1, one byte up
-
-    for ([_][32]u8{ e1, e2, e3, e4, e5 }) |bytes| {
-        const r = Fr.fromBytes(bytes) catch continue;
-        try std.testing.expect(fp12Pow(gt, r).eql(refFp12Pow(gt, r)));
-    }
-
-    // …and the two agree on the degenerate exponents too.
-    try std.testing.expect(fp12Pow(gt, Fr.zero).eql(refFp12Pow(gt, Fr.zero)));
-    try std.testing.expect(fp12Pow(gt, Fr.one).eql(refFp12Pow(gt, Fr.one)));
-}
-
-test "fp12Pow: base^0 = 1, base^1 = base" {
-    const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-    try std.testing.expect(fp12Pow(gt, bls12_381.Fr.zero).eql(Fp12.one));
-    try std.testing.expect(fp12Pow(gt, bls12_381.Fr.one).eql(gt));
-}
-
-test "fp12Pow matches pairing bilinearity: e(P,Q)^r == e(rP,Q)" {
-    // r = an arbitrary multi-bit scalar (exercises both set and unset
-    // bits across several bytes of the big-endian encoding).
-    var r_bytes = @as([32]u8, @splat(0));
-    r_bytes[28] = 0x01;
-    r_bytes[29] = 0xf3;
-    r_bytes[30] = 0x5a;
-    r_bytes[31] = 0x8d;
-    const r = Fr.fromBytes(r_bytes) catch unreachable;
-
-    const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-    const lhs = fp12Pow(gt, r);
-
-    const rp = g1.Jacobian.fromAffine(g1.Affine.generator).scalarMul(r).toAffine();
-    const rhs = pairing.pairing(rp, g2.Affine.generator);
-    try std.testing.expect(lhs.eql(rhs));
-}
-
-test "fp12Pow is multiplicative in the exponent: base^a * base^b == base^(a+b)" {
-    var a_bytes = @as([32]u8, @splat(0));
-    a_bytes[31] = 0x07;
-    var b_bytes = @as([32]u8, @splat(0));
-    b_bytes[31] = 0x0b;
-    var ab_bytes = @as([32]u8, @splat(0));
-    ab_bytes[31] = 0x12; // 7 + 11 = 18
-    const a = Fr.fromBytes(a_bytes) catch unreachable;
-    const b = Fr.fromBytes(b_bytes) catch unreachable;
-    const ab = Fr.fromBytes(ab_bytes) catch unreachable;
-
-    const gt = pairing.pairing(g1.Affine.generator, g2.Affine.generator);
-    try std.testing.expect(fp12Pow(gt, a).mul(fp12Pow(gt, b)).eql(fp12Pow(gt, ab)));
 }

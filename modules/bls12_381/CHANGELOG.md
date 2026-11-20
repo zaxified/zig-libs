@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **New:** `Fp12.pow(exp: *const Fr)` — constant-time `Gt` exponentiation for a secret exponent (4-bit fixed window, full-table `ctSelect` scan), moved here from `tlock` and `ibe`, which each carried a copy; plus `Fp12.ctSelect` and `Fp6.ctSelect`. Tests: bitwise reference for every window digit, `base^0`/`base^1`, exponent additivity, pairing bilinearity.
 - **2026-11-19** — **BEHAVIOURAL, not breaking:** `Fr.randomInto` runs its body in a burned frame (`burn.random_burn`, 8 KiB): the by-value `fromBytes` argument and the conversion temporaries it left on the dead stack (the drawn bytes and the scalar) are zeroed before it returns. New stack-probe case `Fr.randomInto` (a fake `Io` replays known bytes); without the burn it finds both images. Same values drawn.
 - **2026-11-17** — `threshold.Threshold(variant, scheme)`: trusted-dealer threshold BLS for min-sig too (`threshold.MinSig`, keys and Feldman commitments in `G2`, partial and combined signatures in `G1`), Basic or ProofOfPossession; MessageAugmentation is a compile error (a share would sign its own key's bytes). The file-level `threshold.*` names are the unchanged min-pk POP instance `threshold.MinPk`. A combined min-sig signature equals `MinSigPop.sign` under the reconstructed key.
 - **2026-11-16** — `keyGen` / `keyGenV4` take a `key_info` of any length: HKDF-Expand is written out so `key_info`

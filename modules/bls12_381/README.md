@@ -92,6 +92,7 @@ const ok = pk.subgroupCheck();           // decoders do this; REQUIRED for point
 
 // The pairing (Part 2 — subgroup inputs required, see SPEC.md):
 const gt = bls12_381.pairing.pairing(g1_gen, g2_gen); // e(G1, G2) ∈ Gt (== Fp12)
+const gt_r = gt.pow(&r);                 // Gt^r, constant-time in the secret exponent r
 const ok2 = bls12_381.pairing.pairingCheck(&.{
     .{ .p = g1_gen, .q = g2_gen },
     // ... more (P, Q) pairs — one shared Miller loop + one final

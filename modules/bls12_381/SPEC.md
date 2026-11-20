@@ -660,6 +660,13 @@ design" below.
     `Fr.inv` is Fermat with the public exponent `r-2`. `Fp` is this
     module's own field (`fp.zig`); `Fp.inv`/`Fp.sqrt` use fixed public
     exponents and are constant-time in the BASE.
+  - `Fp12.pow(&exp)` is the secret-exponent `Gt` exponentiation (`ibe` and
+    `tlock` encrypt with it: `Gid^r`): big-endian 4-bit fixed window over the
+    32-byte `Fr` encoding, four squarings and one multiplication per window
+    with no leading-zero skip, and the digit's table entry chosen by a full
+    16-entry `Fp12.ctSelect` scan, never `table[idx]`. The base is treated as
+    public. Measured by `ibe`'s ctgrind `fp12pow` row (exponent tainted, 0
+    in-file contexts; its pattern includes `fp12.zig`) and `tlock`'s.
   - `Fp2.pow` (and the test-local `Fp6`/`Fp12` pows) are square-and-
     multiply, VARIABLE-TIME in the exponent bits — used exclusively
     with fixed public exponents (sqrt exponents, Frobenius-coefficient

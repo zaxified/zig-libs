@@ -483,7 +483,7 @@ test "drand interop: the fixture rejects under a mismatched round signature (FO 
 // `g2.G2Error`/`DecryptError` alone — never panic, never read out of
 // bounds. `p_pub`/`round_signature` are a fixed, self-consistent
 // beacon-shaped keypair (a small canonical `Fr` scalar, matching this
-// file's own `fp12Pow` test convention above — no live network fetch
+// file's own `Fp12.pow` test convention above — no live network fetch
 // needed for a fuzz harness); a real ciphertext for that round is built
 // once and its bytes corrupted, so the fuzzer is biased toward the `U`
 // point's compressed-encoding boundary and the FO consistency check

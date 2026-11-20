@@ -17,7 +17,7 @@
 //! `h1`/`h2`/`h3`/`h4`/`randomSigma`), `tlock.zig`'s `Ciphertext`
 //! struct + byte codec, AND the two cryptographic cores `encrypt`/
 //! `decrypt` (the BF-IBE FullIdent assembly + Fiat-Shamir-Okamoto CCA
-//! consistency check + a module-local constant-time `fp12Pow`) are all
+//! consistency check + `bls12_381`'s constant-time `Fp12.pow`) are all
 //! implemented (`gate.core_implemented = true`) — derived from the
 //! published scheme in the byte layout of drand's production deployment
 //! (design references read: `drand/drand`'s
@@ -40,7 +40,7 @@
 //! - `tlock.zig` — `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec
 //!   (128 bytes, byte-for-byte drand's own wire format); the two
 //!   **FABLE CORE** functions `encrypt`/`decrypt` (REAL) + the private
-//!   `fp12Pow`/`gtToDrandRepr` Gt helpers.
+//!   `Fp12.pow`/`gtToDrandRepr` Gt helpers.
 //! - `age.zig` — the age v1 envelope `tle` writes: `tlock` stanza,
 //!   HKDF/HMAC header MAC, ChaCha20-Poly1305 STREAM payload in 64 KiB
 //!   chunks, ASCII armor — arbitrary-length files.
