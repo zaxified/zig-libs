@@ -200,9 +200,17 @@ not, and this matters:
   *choreography* is a self-consistent model, **not** a validated S7-1200 driver.
   Treat the responder as a fleet-simulation target, like the classic one.
 
-See SPEC.md, "S7CommPlus", for the field-by-field breakdown and the honest
-remaining list (encryption, the newest-firmware integrity cryptography,
-subscriptions, symbolic sub-path resolution, block up/download).
+See SPEC.md, "S7CommPlus", for the field-by-field breakdown; what is missing
+(encryption, the newest-firmware integrity cryptography, subscriptions, symbolic
+sub-path resolution, block up/download) is under "Not provided" below.
+
+## Not provided
+
+Block services (list, info, upload, download), fragmented SZL continuation,
+cyclic subscriptions, symbolic (`0xB2`) addressing over classic S7comm (use
+`s7plus`), retry/reconnect/keepalive, concurrent outstanding requests, and
+S7CommPlus encryption are not implemented. SPEC.md "What is deliberately not
+done" gives the reasons, "Backlog / deferred" what may still come.
 
 ## Verify
 
@@ -211,6 +219,9 @@ zig build test-s7comm                          # Debug
 zig build test-s7comm -Doptimize=ReleaseFast
 zig fmt --check modules/s7comm
 ```
+
+Fuzzing is the deterministic driver `S7COMM_FUZZ=<runs>[,<first seed>]` (header of
+`src/fuzz_test.zig`), not `zig build ... --fuzz`.
 
 Fully offline (the classic suite plus the S7CommPlus codec, framing, path,
 session/integrity and client↔responder round trips), except for two live
@@ -244,6 +255,5 @@ layouts, and — for S7CommPlus — from the documented / reverse-engineered
 `s7comm-plus` wire layout (the Wireshark dissector's published field structure).
 No third-party *source* was consulted as a design reference; a third-party stack
 was used as a black-box test oracle and a live peer for classic S7comm, and
-`rawshark` as a black-box envelope check for S7CommPlus. See SPEC.md and
-`/NOTICE`.
+`rawshark` as a black-box envelope check for S7CommPlus. See SPEC.md.
  DATA: `src/goldens.zig` and `src/s7plus_goldens.zig` hold frames captured through a TPKT-aware proxy from real traffic between third-party S7 stacks acting as our peers. Observed behaviour, exempt per root `NOTICE` §0; no upstream corpus is reproduced.

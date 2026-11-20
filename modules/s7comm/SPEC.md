@@ -16,7 +16,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -68,7 +68,7 @@ rules.
   that in class 0 all four "are always zero and have no meaning". Bits 2 and
   1 are modelled and round-trip; bits 4 and 3 had nowhere to go, so four
   octets decoded as one and `encodeConnectVerbatim` emitted the one. They are
-  now `UnsupportedClass`, which makes the decode of that octet a bijection.
+  `UnsupportedClass`, which makes the decode of that octet a bijection.
 
   Unknown variable-part
   parameters survive a decode (the raw `variable_part` is kept), which is what makes
@@ -146,7 +146,96 @@ Error policy: every decode entry point (`tpkt.decode`, `tpkt.Framer.next`, `cotp
 `address.parse`, `Responder.handle`) returns a typed error on malformed input. Nothing panics,
 allocates or loops unboundedly.
 
+## Time-of-day services (function group 7)
+
+`Client.readClock()` and `Client.setClock(DateTime)`; the responder answers them from a
+caller-supplied `Config.clock` (`now`, optional `set`; there is no system time anywhere in the
+module, and a responder without a clock answers with the same error response as an unknown SZL).
+
+* **Parameters.** The ordinary Userdata sub-header with function group 7: subfunction `0x01`
+  read clock, `0x02` set clock, `0x03` read clock (following), `0x04` set clock (alt.). The
+  client sends 1 and 2; the responder answers all four.
+* **Date-time (10 octets):** `reserved, year1, year2, month, day, hour, minute, second,
+  ms(hundreds+tens), ms(units)<<4 | weekday`, all BCD. `year1` and `reserved` are ignored on
+  decode (some CPUs send `0x19` for 20xx; Wireshark's own comment); `year2` 00-89 is 2000-2089,
+  90-99 is 1990-1999 (gos7's `GetDateTimeAt` splits at 90; the Wireshark dissector's `< 89` is
+  an off-by-one for 2089 that no one meets). Weekday 1 = Sunday .. 7 = Saturday, 0 = undefined.
+  The encoder writes `0x20`/`0x19` into `year1`.
+* **Validation.** Decode takes exactly ten octets, rejects every BCD nibble above 9 and every
+  field out of range (month 1-12, day 1-days-in-month with leap years, hour < 24, minute and
+  second < 60, weekday <= 7) as `error.BadDateTime`; the encoder refuses the same. The responder
+  never passes an unvalidated value to the setter: a malformed set request gets an error
+  response (`0xD401`, data return code `data_type_inconsistent`), a read-only clock
+  `access_denied`, a missing clock `object_does_not_exist`.
+* **Sources.** Layout and subfunction numbers: Wireshark `packet-s7comm.c` (GPL, field layout
+  only, no code); the 8-octet DATE_AND_TIME of gos7 `helper.go` (BSD-3) which the 10-octet form
+  extends by the two leading octets; Snap7 is LGPL and was not read. The request data block of a
+  read (`0a 00 00 00`: return code "object does not exist", no payload) and the empty success
+  data block of a set response (`ff 09 00 00`) are **self-derived** conventions, not verified
+  against a third party; a real CPU's set-clock reply bytes may differ, and the client accepts
+  any reply whose data return code is `success`.
+* **Not an oracle.** The local python-snap7 3.1.0 is a pure-Python reimplementation that uses an
+  8-octet form (no `reserved`/`year1`, Monday = 1); it says nothing about this byte layout, and
+  no Snap7 C live peer test of the clock was run. Real-CPU and live-Snap7 behaviour is unverified.
+
+## Security services (function group 5)
+
+`Client.setSessionPassword(password)`, `Client.clearSessionPassword()` and
+`Client.readProtection()`; the responder checks a configured `Config.password` and serves
+`Config.protection`.
+
+* **Parameters.** The Userdata sub-header with function group 5: subfunction `0x01` set
+  password, `0x02` clear password.
+* **Set password data:** an octet string of exactly 8 octets: the password space-padded to 8
+  characters (characters past the eighth are ignored, as gos7 and the Snap7 documentation do; an
+  S7-300/400 password has at most 8), then `e[0] = p[0]^0x55`, `e[1] = p[1]^0x55`,
+  `e[i] = p[i]^0x55^e[i-2]`. This is obfuscation, not protection: anyone who sees the frame
+  recovers the password (`userdata.decodePassword`). **Clear password data:** `0a 00 00 00`.
+* **Replies.** The client requires the full 12-octet response sub-header (the short form has no
+  error word and would read as success), then response type, group 5 and the echoed subfunction; error code
+  `0xD602` ("incorrect password") is `error.PasswordRejected`, any other non-zero code
+  `error.PlcError`.
+* **Protection record:** SZL `0x0232` index `0x0004`, record = index word `0x0004` then five
+  big-endian words `sch_schal`, `sch_par`, `sch_rel`, `bart_sch`, `anl_sch` (passed through, not
+  judged). A record shorter than 12 octets or with another index word is refused
+  (`error.ShortReply`); a longer one (real CPUs pad with reserved words) is read from its first
+  12 octets.
+* **Responder.** With `Config.password` set, a set request whose 8 octets equal the encoded
+  password (compared in constant time) gets success and sets `Responder.legitimated`; a wrong
+  password gets `0xD602` with data `0a 00 00 00`; a malformed one (not success / octet string,
+  not exactly 8 octets) `0xD401` with `data_type_inconsistent`; an unknown subfunction, or a
+  group-5 frame not typed as a request, `0xD401` (the latter changes no state). Any set that does
+  not succeed clears `legitimated`, and so do clear password and a COTP connect or disconnect (a
+  legitimation belongs to one connection). With no
+  password configured both requests succeed (python-snap7 3.1.0's emulator: same). Nothing in the
+  responder is gated on `legitimated` (it enforces no access level). SZL `0x0232` is answered
+  only for index 4 and only when `Config.protection` is set.
+* **Sources and oracle.** Request layout, the encoding and the protection offsets: gos7
+  `security.go` / `telegram.go` (BSD-3). gos7 itself (commit `153d631d8881`, 2026-10-30) was run
+  against the responder (`tools/gos7_client_drive`): wrong password refused as "CPU : Invalid
+  password", right password, 9-character password, clear and `GetProtection` all as configured;
+  its request bytes are the goldens in `src/root.zig`/`src/server.zig`, and the module's client
+  emits them byte for byte (PDU reference aside). python-snap7 3.1.0 is no oracle here: its
+  client keeps the password locally and sends nothing, and it reads SZL `0x0232` at index 0
+  without the index word. Snap7 (LGPL) was not read. A real CPU was not available: its reply
+  bytes for set/clear and its behaviour without a configured password are unverified.
+* **Decisions kept.** Characters past the eighth are ignored (gos7 and Snap7 do the same; the CPU
+  stores eight). `protectionFrom` requires the index word `0x0004` (gos7 does not check it; the
+  record layout puts the index first). The responder answers success without a configured password
+  (python-snap7's emulator does the same; a real CPU may answer `0xD605`, which the client reports
+  as `PlcError`). The responder requires transport size octet string and a request-typed frame for a
+  set, the client refuses a reply without the full sub-header and wipes its stack copies of the
+  encoded password (`client.zig:583-590`).
+
 ## Verification
+
+- **Run:** `zig build test-s7comm` (offline: the classic suite, the S7CommPlus codec, framing, path,
+  session/integrity and client-responder round trips, deterministic fuzz seeds); the two live tests
+  below are opt-in. `S7COMM_FUZZ=<runs>[,<first seed>]` is the deterministic fuzz driver (header of
+  `src/fuzz_test.zig`; harness names `s7comm-<file>-<function>`, `S7COMM_FUZZ_ONLY` selects one).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **S7CommPlus** has its own, lower bar, stated in *S7CommPlus: What is validated* below.
 
 ### What is third-party-validated
 
@@ -169,7 +258,7 @@ it needs no `/NOTICE` entry — the same status as diffing against `tar` or `nft
 
 Concretely:
 
-1. **113 byte-exact captured goldens** (`goldens.zig`). A snap7 client was pointed at a snap7
+1. **Byte-exact captured goldens** (`goldens.zig`). A snap7 client was pointed at a snap7
    server through a TPKT-aware recording TCP proxy, and every packet that crossed the wire was
    logged as hex. Four assertions run over the whole table:
    - every packet decodes (TPKT, COTP, and for a `DT` also the S7 PDU, with the parameter and data
@@ -199,26 +288,21 @@ Concretely:
    not exist, and a read past the end of a DB that does.
 
 3. **Live round trip, our client → a real snap7 server** (`root.zig`, gated on `S7COMM_TEST_SERVER`).
-   Against a live snap7 virtual CPU on `127.0.0.1:1602`, rack 0 slot 1, the run performed: COTP
-   connect and Setup (negotiated PDU 480); an 8-octet DB write and read-back compared byte for byte;
-   a single-bit write and read-back in both polarities; a **600-octet write and read-back that
-   crossed the PDU boundary in both directions**; a two-item multi-var read in one PDU where the
-   second item named a DB that does not exist and came back with a real per-item
-   `object_does_not_exist`; `Read SZL 0x0011` returning 4 records; and `cpuStatus()` returning
-   `run`. Printed output:
-   `live S7: pdu=480 rack=0 slot=1 db_rw=ok bit_rw=ok multi_item_err=object_does_not_exist
-   split=true szl0011_records=4 cpu=run`
+   Against a live snap7 virtual CPU (rack and slot from `S7COMM_TEST_RACK` / `S7COMM_TEST_SLOT`,
+   default 0 / 1), the test performs: COTP connect and Setup (negotiated PDU 480); an 8-octet DB
+   write and read-back compared byte for byte; a single-bit write and read-back in both polarities;
+   a **600-octet write and read-back that crossed the PDU boundary in both directions**; a two-item
+   multi-var read in one PDU where the second item named a DB that does not exist and came back
+   with a real per-item `object_does_not_exist`; `Read SZL 0x0011` returning records; and
+   `cpuStatus()` returning `run`.
 
 4. **Live round trip, a real snap7 client → our responder** (`root.zig`, gated on
-   `S7COMM_TEST_LISTEN`). A live snap7 client connected to our `Responder` on `127.0.0.1:1702`,
-   negotiated a 480-octet PDU, wrote and read back `11223344` in DB1, wrote and read back `beef` in
-   the M area, ran a two-item multi-var read that returned both values correctly, read the CPU
-   state (`S7CpuStatusRun`, i.e. our synthesised SZL `0x0424` was accepted by a third-party
-   decoder), and got a correct `CPU : Item not available` for DB 77. Our side printed
-   `live S7 responder: reads=5 writes=2 userdata=1 db1[0]=0xA5`.
+   `S7COMM_TEST_LISTEN`). A live snap7 client connects to our `Responder`, negotiates a 480-octet
+   PDU, writes and reads back a value in DB1 and in the M area, runs a two-item multi-var read,
+   reads the CPU state (our synthesised SZL `0x0424` is accepted by a third-party decoder), and gets
+   a correct `CPU : Item not available` for a missing DB.
 
-Both live tests passed in Debug and in `--release=fast`, and both print `SKIPPED: …` and pass when
-no peer is present.
+Both live tests print `SKIPPED: …` and pass when no peer is present.
 
 ### What is self-derived
 
@@ -237,10 +321,6 @@ no peer is present.
   but no such peer was available; only the rack/slot form was exercised live.
 - **The COTP `ER` TPDU and non-zero TPDU numbers.** Neither oracle emitted an `ER` or a `DT` with
   the EOT bit clear; both are decoded from the documented layout and unit-tested, not captured.
-- **`tshark` is not installed in this environment**, so the `s7comm` dissector cross-check named in
-  the task was not run. It was not needed: the goldens came from a real capture between two
-  independent stacks rather than being hand-derived, and the coverage assertion pins what they
-  contain.
 - **The oracle is a *virtual* CPU, not real hardware.** No S7-300/400/1200/1500 was available. The
   snap7 server implements the same wire protocol and reports itself as a `CPU 315-2 PN/DP`, but
   quirks specific to real firmware (S7-1500 access levels, optimised-block symbolic addressing,
@@ -252,8 +332,8 @@ length of 1..8 for a single-bit transfer — and this module emits **1**, matchi
 
 ### Fuzz + hostile input
 
-`std.testing.fuzz` sweeps, all asserting "typed error or valid result, never a panic and never a
-hang":
+The harnesses (run through the deterministic driver above, and as `std.testing.fuzz` sweeps) all
+assert "typed error or valid result, never a panic and never a hang":
 
 - `tpkt.decode` over arbitrary bytes — anything that decodes must re-encode to the identical octets
   and its `total_len` must not exceed the input.
@@ -298,117 +378,11 @@ length that runs past its block and a truncated item header; a **read reply whos
 code is an error while data is present** (the data must not be handed back), a mismatched PDU
 reference, and a PLC-level error class; plus roughly thirty malformed address strings.
 
-**Mutation run 2026-10-05** (in-place, Debug, 43 mutants over the TPKT codec
-and framer, COTP decode/encode, the S7 header and Setup, item address and
-data-length checks, the responder's area lookup and read/write bounds, the
-S7CommPlus frame trailer/integrity checks and the VLQ decoders): 25 killed.
-Seventeen survivors were missing tests, now added — almost all of them the
-exact one-past boundary of a check whose gross violation was already tested:
-a TPKT total of 65536, a length one octet past the buffer, a framer feed past
-its storage and a packet one octet short, a COTP parameter and an `LI` one
-octet long, an 11-octet Ack-Data, an element address of 2^24, an item one
-octet short, `decodeLength(.bit, 9)`, a write one octet past the area, a
-write shorter than its item and a bit write past the area, an S7CommPlus V3
-frame with an empty integrity part and a connect frame with a trailing octet,
-a sixth VLQ octet completing a small value, and −129 for an `i8`. 42 of 43
-killed after. Equivalent: `li > 254` → `li > 255` in `encodeConnect` (its
-variable part is at most 3 + 4 + 4 octets, so `li` never exceeds 17).
-
-### Time-of-day services (function group 7, 2026-11-19)
-
-`Client.readClock()` and `Client.setClock(DateTime)`; the responder answers them from a
-caller-supplied `Config.clock` (`now`, optional `set`; there is no system time anywhere in the
-module, and a responder without a clock answers with the same error response as an unknown SZL).
-
-* **Parameters.** The ordinary Userdata sub-header with function group 7: subfunction `0x01`
-  read clock, `0x02` set clock, `0x03` read clock (following), `0x04` set clock (alt.). The
-  client sends 1 and 2; the responder answers all four.
-* **Date-time (10 octets):** `reserved, year1, year2, month, day, hour, minute, second,
-  ms(hundreds+tens), ms(units)<<4 | weekday`, all BCD. `year1` and `reserved` are ignored on
-  decode (some CPUs send `0x19` for 20xx; Wireshark's own comment); `year2` 00-89 is 2000-2089,
-  90-99 is 1990-1999 (gos7's `GetDateTimeAt` splits at 90; the Wireshark dissector's `< 89` is
-  an off-by-one for 2089 that no one meets). Weekday 1 = Sunday .. 7 = Saturday, 0 = undefined.
-  The encoder writes `0x20`/`0x19` into `year1`.
-* **Validation.** Decode takes exactly ten octets, rejects every BCD nibble above 9 and every
-  field out of range (month 1-12, day 1-days-in-month with leap years, hour < 24, minute and
-  second < 60, weekday <= 7) as `error.BadDateTime`; the encoder refuses the same. The responder
-  never passes an unvalidated value to the setter: a malformed set request gets an error
-  response (`0xD401`, data return code `data_type_inconsistent`), a read-only clock
-  `access_denied`, a missing clock `object_does_not_exist`.
-* **Sources.** Layout and subfunction numbers: Wireshark `packet-s7comm.c` (GPL, field layout
-  only, no code); the 8-octet DATE_AND_TIME of gos7 `helper.go` (BSD-3) which the 10-octet form
-  extends by the two leading octets; Snap7 is LGPL and was not read. The request data block of a
-  read (`0a 00 00 00`: return code "object does not exist", no payload) and the empty success
-  data block of a set response (`ff 09 00 00`) are **self-derived** conventions, not verified
-  against a third party; a real CPU's set-clock reply bytes may differ, and the client accepts
-  any reply whose data return code is `success`.
-* **Not an oracle.** The local python-snap7 3.1.0 is a pure-Python reimplementation that uses an
-  8-octet form (no `reserved`/`year1`, Monday = 1); it says nothing about this byte layout, and
-  no Snap7 C live peer test of the clock was run. Real-CPU and live-Snap7 behaviour is unverified.
-* **Delta mutation (2026-11-19):** the new code (`DateTime`, `Client.readClock`/`setClock`, `Responder.handleTime`) was mutated with a schemata build: 57 mutants (every range guard and its boundary, BCD digit checks, the year split at 89/90, leap-year terms, weekday and millisecond packing, each client reply-shape check, each responder arm), 12 survived the first run and were killed by new tests (year1 of year 2000, `NotConnected`, the request bytes, a tampered reply per shape check, subfunction 0x04, a sequence echo, an invalid clock value), final 57 of 57 killed, 0 equivalent. The card counts are cumulative with the earlier run (42 of 43 killed, 1 equivalent).
-
-### Security services (function group 5, 2026-11-19)
-
-`Client.setSessionPassword(password)`, `Client.clearSessionPassword()` and
-`Client.readProtection()`; the responder checks a configured `Config.password` and serves
-`Config.protection`.
-
-* **Parameters.** The Userdata sub-header with function group 5: subfunction `0x01` set
-  password, `0x02` clear password.
-* **Set password data:** an octet string of exactly 8 octets: the password space-padded to 8
-  characters (characters past the eighth are ignored, as gos7 and the Snap7 documentation do; an
-  S7-300/400 password has at most 8), then `e[0] = p[0]^0x55`, `e[1] = p[1]^0x55`,
-  `e[i] = p[i]^0x55^e[i-2]`. This is obfuscation, not protection: anyone who sees the frame
-  recovers the password (`userdata.decodePassword`). **Clear password data:** `0a 00 00 00`.
-* **Replies.** The client requires the full 12-octet response sub-header (the short form has no
-  error word and would read as success), then response type, group 5 and the echoed subfunction; error code
-  `0xD602` ("incorrect password") is `error.PasswordRejected`, any other non-zero code
-  `error.PlcError`.
-* **Protection record:** SZL `0x0232` index `0x0004`, record = index word `0x0004` then five
-  big-endian words `sch_schal`, `sch_par`, `sch_rel`, `bart_sch`, `anl_sch` (passed through, not
-  judged). A record shorter than 12 octets or with another index word is refused
-  (`error.ShortReply`); a longer one (real CPUs pad with reserved words) is read from its first
-  12 octets.
-* **Responder.** With `Config.password` set, a set request whose 8 octets equal the encoded
-  password (compared in constant time) gets success and sets `Responder.legitimated`; a wrong
-  password gets `0xD602` with data `0a 00 00 00`; a malformed one (not success / octet string,
-  not exactly 8 octets) `0xD401` with `data_type_inconsistent`; an unknown subfunction, or a
-  group-5 frame not typed as a request, `0xD401` (the latter changes no state). Any set that does
-  not succeed clears `legitimated`, and so do clear password and a COTP connect or disconnect (a
-  legitimation belongs to one connection). With no
-  password configured both requests succeed (python-snap7 3.1.0's emulator: same). Nothing in the
-  responder is gated on `legitimated` (it enforces no access level). SZL `0x0232` is answered
-  only for index 4 and only when `Config.protection` is set.
-* **Sources and oracle.** Request layout, the encoding and the protection offsets: gos7
-  `security.go` / `telegram.go` (BSD-3). gos7 itself (commit `153d631d8881`, 2026-10-30) was run
-  against the responder (`tools/gos7_client_drive`): wrong password refused as "CPU : Invalid
-  password", right password, 9-character password, clear and `GetProtection` all as configured;
-  its request bytes are the goldens in `src/root.zig`/`src/server.zig`, and the module's client
-  emits them byte for byte (PDU reference aside). python-snap7 3.1.0 is no oracle here: its
-  client keeps the password locally and sends nothing, and it reads SZL `0x0232` at index 0
-  without the index word. Snap7 (LGPL) was not read. A real CPU was not available: its reply
-  bytes for set/clear and its behaviour without a configured password are unverified.
-* **Fuzz.** The userdata harness decodes protection records (seeded); the responder harness
-  sends group-5 requests (the right password, damaged, resized, another return code, other
-  subfunctions) down one connection and checks that `legitimated` is set exactly after a set
-  request carrying the encoded password. 200,000 runs each clean (2026-11-19); the first run
-  found that a malformed set after a successful one left `legitimated` set (fixed: any failed
-  set clears it).
-* **Review (2026-11-19, independent, read-only):** no HIGH; fixed from it: the legitimation now
-  ends with the connection (it survived a disconnect and a new connect on the same responder),
-  the responder requires transport size octet string and a request-typed frame, the client
-  refuses a reply without the full sub-header, and the client wipes its stack copies of the
-  encoded password. Kept as is, with reasons: characters past the eighth are ignored (gos7 and
-  Snap7 do the same; the CPU stores eight); `protectionFrom` requires the index word `0x0004`
-  (gos7 does not check it; the record layout puts the index first); the responder answers
-  success without a configured password (python-snap7's emulator; a real CPU may answer
-  `0xD605`, which the client reports as `PlcError`).
-* **Delta mutation (2026-11-19):** 33 mutants over the new code (each step of the encoding and
-  its inverse, the record bounds and index check, each word offset, the responder's dispatch,
-  index check, every legitimation store including connect/disconnect, the length, transport-size,
-  return-code and message-type checks, the comparison, the reply data block, each client
-  reply-shape check including the sub-header length, the `0xD602` mapping, the SZL index), 33 of
-  33 killed. The card counts are cumulative (99 + 33 of 100 + 33).
+- The userdata harness also decodes protection records (seeded) and `DateTime` values (a decoded
+  value must re-encode to the same octets); the responder harness sends group-7 requests and
+  group-5 requests (the right password, damaged, resized, another return code, other subfunctions)
+  down one connection and checks that `legitimated` is set exactly after a set request carrying
+  the encoded password.
 
 ## S7CommPlus
 
@@ -506,21 +480,6 @@ disagrees, a TLV value whose length runs past the buffer, a struct nested past t
 array count that overruns and one that is absurdly large, a datatype-flags octet with a reserved bit,
 an integrity id that does not progress, and a symbolic path that does not resolve.
 
-### Deferred (S7CommPlus)
-
-- **Encryption / the newest-firmware integrity cryptography.** The keyed digest and the TLS-style
-  session-key exchange the latest S7-1500 firmware layers on top are **out of scope**; only the
-  integrity id's progression is modelled. This is stated plainly rather than half-implemented.
-- **Cyclic subscriptions / notifications.** The `notification` opcode (`0x33`) is modelled in the
-  header; the subscription machinery (SetVarSubStreamed and the unsolicited push flow) is not.
-- **Symbolic sub-path resolution beyond the root.** `s7plus_path` resolves the root object id and
-  carries the member/index steps verbatim; mapping a member *name* to its numeric id needs the
-  object's browsed schema, which is not implemented (the client reads the root object).
-- **Block upload / download, program transfer, and the `Explore` browse walk.** Function codes are
-  named; the flows are not built.
-- **Multi-variable batching** (`GetMultiVariables` / `SetMultiVariables`), keep-alive timers, and
-  PDU-level retry / reconnection — as with the classic client, one request/reply per call, no timers.
-
 ## Threat model
 
 S7comm is an **unauthenticated, unencrypted** protocol by design: anyone with a path to TCP port
@@ -550,42 +509,60 @@ robustness and containment, not confidentiality or integrity against an active a
 - The responder is a **simulator, not a PLC**: it executes no program and enforces no access level.
   Do not put it on a network where something might mistake it for real equipment.
 
-## Deferred
+## What is deliberately not done
 
-Honest list of what a full S7 implementation has and this one does not:
+- **Symbolic addressing over *classic* S7comm** (syntax id `0xB2`). In the `0x32` protocol only
+  `S7ANY` (`0x10`) is built and decoded; a `0xB2` item is `error.UnsupportedSyntaxId`
+  (`items.zig:275`). The S7-1200/1500 symbolic world is handled by the **S7CommPlus** (`0x72`)
+  layer — see *S7CommPlus* — which is the protocol those CPUs actually speak for optimised-block
+  access.
+- **PDU-level retry, reconnection and keepalive** (classic client and S7CommPlus alike). The client
+  performs one request/reply exchange per call and surfaces a transport failure; a production
+  deployment wires reconnection into its own supervisor. There is no timer anywhere in this module.
+- **Multiple concurrent outstanding requests.** `Setup communication` negotiates `max AmQ` in both
+  directions and this client always uses 1 (`Config.max_amq_calling` / `max_amq_called` default 1,
+  `client.zig:86-87`), which is what every S7 driver in practice does; the PDU reference is
+  incremented per request and the reply must echo it.
+- **`ISO-on-TCP` over anything but TCP** (MPI, Profibus, the `libnodave` serial paths). Out of scope.
+- **S7CommPlus encryption and the newest-firmware integrity cryptography.** The keyed digest and the
+  TLS-style session-key exchange the latest S7-1500 firmware layers on top are out of scope; only the
+  integrity id's progression is modelled. This is stated plainly rather than half-implemented.
 
+## Open
+
+- **No `tshark` cross-check.** Wireshark's `s7comm` dissector was never run over the classic
+  goldens (no `tshark` was available where they were captured). The goldens come from a real
+  capture between two independent stacks rather than being hand-derived, and the coverage
+  assertion pins what they contain, so this is an extra check, not a missing one.
+
+## Backlog / deferred
+
+- **Block listing and block info (function group 3: `ListBlocks`, `ListBlocksOfType`,
+  `GetBlockInfo`).** What inventory tools use; Snap7 users call it routinely and the card's scope
+  line names the gap. Medium effort, fits the module's scope.
+- **Fragmented (multi-PDU) SZL responses.** `readSzl` returns the first PDU and reports
+  `partial = true` when the CPU said more follow (`client.zig:484,512`); the continuation exchange
+  is not implemented, because no oracle here would produce one and guessing the sequencing would be
+  worse than saying so.
+- **Cyclic services** (function group 2: subscribe to a variable and receive unsolicited push
+  PDUs). The Userdata sub-header models the `push` message type, but there is no subscription
+  machinery.
 - **Block upload and download** (functions `0x1A`–`0x1F`: request download, download block, download
   ended, start upload, upload, end upload). Not implemented at all — the function codes are named in
   `s7.Function` and nothing more. These are the genuinely dangerous ones (they replace the program a
   machine is running) and they need a block-format model (MC7 headers, block types OB/FB/FC/DB/SDB)
-  that is a project of its own.
-- **Symbolic addressing over *classic* S7comm** (syntax id `0xB2`). In the `0x32` protocol only
-  `S7ANY` (`0x10`) is built and decoded; a `0xB2` item is `error.UnsupportedSyntaxId`. The
-  S7-1200/1500 symbolic world is instead handled by the **S7CommPlus** (`0x72`) layer — see
-  "S7CommPlus" below — which is the protocol those CPUs actually speak for optimised-block access.
-- **Fragmented (multi-PDU) SZL responses.** `readSzl` returns the first PDU and reports
-  `partial = true` when the CPU said more follow; the continuation exchange is not implemented,
-  because no oracle here would produce one and guessing the sequencing would be worse than saying so.
-- **Cyclic services** (function group 2: subscribe to a variable and receive unsolicited push PDUs).
-  The Userdata sub-header models the `push` message type, but there is no subscription machinery.
-- ~~**Security / protection level** (function group 5): password login (`SetSessionPassword`), reading
-  the protection level from SZL `0x0232`.~~ **DONE 2026-11-19** (see "Security services" above).
-- ~~**Time-of-day services** (function group 7): read and set the CPU clock.~~ **DONE 2026-11-19** (see "Time-of-day services" below).
-- **Block listing and block info** (function group 3: `ListBlocks`, `ListBlocksOfType`, `GetBlockInfo`).
-- **PDU-level retry, reconnection and keepalive.** The client performs one request/reply exchange per
-  call and surfaces a transport failure; a production deployment wires reconnection into its own
-  supervisor. There is no timer anywhere in this module.
-- **Multiple concurrent outstanding requests.** `Setup communication` negotiates `max AmQ` in both
-  directions and this client always uses 1, which is what every S7 driver in practice does; the PDU
-  reference is incremented per request and the reply must echo it.
-- **`ISO-on-TCP` over anything but TCP** (MPI, Profibus, the `libnodave` serial paths). Out of scope.
-- **`tshark` cross-check** — not run (no `tshark` in this environment); see "What is self-derived".
-
-## Status
-
-`gap · any (pure codecs + client logic + responder; only the optional TcpTransport touches
-std.Io.net) · both (client + responder) · single_owner` + deps: none (std only) — canonical source
-is `pub const meta` in src/root.zig.
+  that is a project of its own. Snap7 has it. A question for the owner whether that is "never" or
+  "not now".
+- **S7CommPlus: cyclic subscriptions / notifications.** The `notification` opcode (`0x33`) is
+  modelled in the header; the subscription machinery (SetVarSubStreamed and the unsolicited push
+  flow) is not.
+- **S7CommPlus: symbolic sub-path resolution beyond the root.** `s7plus_path` resolves the root
+  object id and carries the member/index steps verbatim; mapping a member *name* to its numeric id
+  needs the object's browsed schema, which is not implemented (the client reads the root object).
+- **S7CommPlus: block upload / download, program transfer, and the `Explore` browse walk.**
+  Function codes are named; the flows are not built.
+- **S7CommPlus: multi-variable batching** (`GetMultiVariables` / `SetMultiVariables`); one
+  request/reply per call.
 
 ## Anchoring
 
@@ -597,10 +574,3 @@ is `pub const meta` in src/root.zig.
 **What the tests actually contain.** classic goldens from snap7 live peer; S7CommPlus body self, rawshark envelope only
 
 **How it got there.** No external oracle exists for what remains. no Wireshark dissector for S7CommPlus, no S7-1200/1500 hardware
-
-## Backlog / deferred
-
-- (survey 2026-09-30) **Time-of-day services (group 7: read/set PLC clock)**: **DONE 2026-11-19** (client `readClock`/`setClock`, responder `Config.clock`).
-- (survey 2026-09-30) **Block listing / block info (group 3) and fragmented SZL continuation**: what inventory tools use; medium, fits §2 (needs an oracle for the continuation, see Deferred).
-- (survey 2026-09-30) **Security group 5 (password, protection level via SZL 0x0232)**: **DONE 2026-11-19** (client `setSessionPassword`/`clearSessionPassword`/`readProtection`, responder `Config.password`/`protection`).
-- (survey 2026-09-30) **Block upload/download**: Snap7 has it; dangerous and a block-format project of its own; SPEC already explains why it is not done — a question for the owner whether that is "never" or "not now".

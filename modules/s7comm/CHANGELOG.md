@@ -6,9 +6,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-19** — Security services (userdata group 5): `Client.setSessionPassword` / `clearSessionPassword` (new `error.PasswordRejected` for error code `0xD602`), `Client.readProtection` (SZL `0x0232` index 4), `userdata.SecuritySubfunction`, `ErrorCode`, `encodePassword` / `decodePassword`, `Protection` + `protectionFrom`, root `Protection`. Responder: `Config.password` (checked in constant time, `Responder.legitimated`) and `Config.protection`; with neither set nothing changes for existing users except that group-5 requests, previously `error.Unsupported`, are now answered. Request bytes match gos7 (BSD-3) and gos7 was run against the responder (`tools/gos7_client_drive`). Tests: gos7 goldens, malformed and unknown requests, reply-shape checks, protection record bounds; fuzz harnesses extended (200,000 runs clean); independent review (fixes: legitimation per connection, octet-string and request-type checks, full reply sub-header required, stack copies of the encoded password wiped); delta mutation 33/33 killed.
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** test only. The userdata fuzz harness checks that a decoded `DateTime` re-encodes to the same octets 2..9 (found necessary by a planted `unbcd` mutant).
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The fuzz harnesses now steer the time-of-day group: the responder harness sends group-7 requests (subfunctions 1-4, valid and damaged BCD date-times, short payloads, failing return codes) with a clock configured and asserts no invalid value reaches the setter; the userdata harness decodes and round-trips `DateTime`; a new harness (`fuzzClockClient`) damages the responder's replies and runs `readClock`/`setClock` on them.
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** SPEC scope line restored to the catalog format after the clock item.
 - **2026-11-19** — Delta mutation of the time-of-day code: 57 mutants, 12 survived and were killed by new tests (reply tampering via the paired-transport test hook, request bytes pinned, subfunction 0x04, sequence echo, invalid clock value); 57 of 57 killed. No library code changed.
 - **2026-11-19** — Time-of-day services (userdata group 7): `Client.readClock`/`setClock`, `userdata.DateTime` (10-octet BCD, every digit and range validated, `error.BadDateTime`), `userdata.TimeSubfunction`, responder `Config.clock` (`server.Clock`, caller-supplied `now`/optional `set`; no system time). Additive; no behaviour change for existing calls (a Userdata group-7 request used to be `error.Unsupported` from `handle`, now it is answered).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
@@ -22,13 +19,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   than their item, an empty V3 integrity part, a connect frame's trailing
   octet, an over-long VLQ with a small value, an `i8` below its minimum). 42
   of 43 killed after. No library code changed.
-- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** test only (audit F15). The F6 element budget
-  is now pinned across a nested object too, not only across two attributes of one object.
 
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The F2 test ("a peer that sends
-  the header and then goes silent") slept a fixed 2000 ms and then canceled. On a loaded machine
-  a correct read could still be on its way back, a false red. The test now waits for the read to
-  return on its own, with a 20 s watchdog.
 
 - **2026-09-10** — **BREAKING** for `s7plus_value.skipValue`/`skipBody` (new
   required `budget: *u32` parameter; `skipValueDefaultBudget` added for the
@@ -49,40 +40,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   silently floor-dividing it (F9); `tpkt.Framer.feed` no longer recompacts its
   buffer on every call (F10, perf only). Full detail and RED->GREEN.
 
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
-  `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
-  helper existed **33 times across 12 modules in three shapes**, each carrying its
-  own note about the same trap (the returned array has to be container-level or
-  the slice dangles with the right length and garbage behind it). Proved
-  byte-identical to the copies it replaces before they were deleted, and the
-  comparison test was itself broken on purpose first to show it was not vacuous.
-  `testkit` added to this module's `test_deps`; test-only, nothing a consumer
-  imports changed.
 
-- **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** every one of this module's 15
-  fuzz harnesses was replaying a single empty input. Fourteen drew their frame
-  as `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(...)`, and a
-  `Smith` ranged draw returns the range MINIMUM unless the eight octets it reads
-  as a little-endian u64 already lie inside the range — `bytes` had just eaten
-  the seed, so the length was 0 every time. They now draw with
-  `smith.slice(&buf)` and each carries a corpus of real wire frames, address
-  literals or symbolic paths taken from the tests beside it. Measured over those
-  corpora, non-empty inputs / inputs the decoder accepts: TPKT 0 -> 11/4, the
-  TPKT framer 0 -> 5 fed and 4 packets out, COTP 0 -> 15/6, S7 0 -> 13/4, items
-  0 -> 15/12, the data-item iterator 1 -> 6 distinct (block, count) pairs,
-  Read/Write Var parameters 0 -> 9/4, userdata 0 -> 12/5, addresses 0 -> 25/19,
-  S7CommPlus frames 0 -> 11/3, objects 0 -> 5/2, values 0 -> 6/4, varints
-  0 -> 11/8, symbolic paths 0 -> 13/5.
-- **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** `server.zig`'s responder
-  fuzz harness builds a well-formed S7 envelope and spends its entropy on the
-  item descriptors, but every knob it drew was a ranged `Smith` draw and so
-  returned its minimum: over eight seeds and four requests each it built **32
-  requests, 1 distinct, and `Responder.handle` accepted none of them** — so
-  `doRead`, `doWrite`, `applyWrite` and `handleUserdata` had no fuzz coverage at
-  all, which is the exact hole that harness's own header says it exists to
-  close. The knobs are now `value(u64)` reduced locally (`drawBelow`,
-  `drawOdds`, `drawWide`) and the test carries a fixed-PRNG seed corpus: **32
-  built, 32 distinct, 25 accepted with a reply.** No responder logic changed.
 
 - **2026-08-22** — `TcpTransport` now surfaces `error.Canceled` (a new
   `TransportError` variant) instead of `error.ReadFailed`/`error.WriteFailed`
