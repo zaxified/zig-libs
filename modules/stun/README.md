@@ -77,11 +77,11 @@ the §2.1 password) and FINGERPRINT verify; the responses decode to
 flip a covered byte and assert both checks fail. `zig build test-stun` passes in
 Debug and `-Doptimize=ReleaseFast`.
 
-## Not here (decided, with reasons in SPEC.md)
+## Not provided
 
 OpaqueString/SASLprep (Unicode tables; callers pass prepared strings) · the nonce/realm challenge
 flow of a long-term *server* · ICE · TURN · TCP/TLS/DTLS transport · a multiplexing client agent ·
-the RFC 5780 NAT-behaviour procedure (the attributes are here) · automatic 300 redirects.
+the RFC 5780 NAT-behaviour procedure (the attributes are here) · automatic 300 redirects. Reasons: SPEC *What is deliberately not done*.
 
 ## Which accessor after verifying a MAC
 

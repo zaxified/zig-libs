@@ -30,7 +30,7 @@ Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`; stars and pushes as read from the 
 | [webrtc-rs/webrtc](https://github.com/webrtc-rs/webrtc) (`stun` crate) | Rust | Apache-2.0 per repo (source not read) | 5.2k (2026-09-30) | v0.21.0 (2026-09-19) | The Rust WebRTC stack's STUN crate [I]. Not built: the crate pulls the whole webrtc dependency tree, which was not worth auditing for one more Go-shaped row. |
 | [coturn/coturn](https://github.com/coturn/coturn) | C | NOASSERTION per API (BSD-3-Clause per its README; source not read) | 14.4k (2026-09-30) | docker/4.18.0-r0 (2026-09-08) | Production STUN/TURN **server** and test clients (RFC 5780 behaviour discovery, long-term credentials, TLS/DTLS) [I]. Black-box only. |
 
-**Where we are ahead:** MESSAGE-INTEGRITY-SHA256 (neither pion nor gortc has the HMAC [V]: gortc's source carries only the attribute constant and its name, pion's `Decode` only an ordering rule), allocation-free over caller buffers (pion `Build`/`Decode` into a reused `Message`, still allocating `[]RawAttribute`, `net.IP` and boxed setters), 0.47-0.55x pion's time on the encode and decode paths and two orders of magnitude on rejects of hostile datagrams (Go formats an error string per reject) [V, bench], the §14.5 covered-region rule in `findCovered`, constant-time MAC compare with a dead-stack burn, `randomTransactionId` failing closed. **Where we are behind or by choice different:** no multiplexing `Agent`/`Client`, no TCP/TLS/DTLS, no SASLprep, no RFC 5780 procedure, no automatic 300 redirect: each a conscious rejection with its reason under "Backlog / deferred".
+**Where we are ahead:** MESSAGE-INTEGRITY-SHA256 (neither pion nor gortc has the HMAC [V]: gortc's source carries only the attribute constant and its name, pion's `Decode` only an ordering rule), allocation-free over caller buffers (pion `Build`/`Decode` into a reused `Message`, still allocating `[]RawAttribute`, `net.IP` and boxed setters), 0.47-0.55x pion's time on the encode and decode paths and two orders of magnitude on rejects of hostile datagrams (Go formats an error string per reject) [V, bench], the §14.5 covered-region rule in `findCovered`, constant-time MAC compare with a dead-stack burn, `randomTransactionId` failing closed. **Where we are behind or by choice different:** no multiplexing `Agent`/`Client`, no TCP/TLS/DTLS, no SASLprep, no RFC 5780 procedure, no automatic 300 redirect: each a conscious rejection with its reason under *What is deliberately not done*.
 
 ## Design & invariants
 Pure codec (RFC 8489 client side): header is a 16-bit type (2-bit class + 12-bit method interleaved
@@ -43,16 +43,16 @@ XOR-MAPPED-ADDRESS/MAPPED-ADDRESS → `AddressPort` (`netaddr.Ip` + port; XOR fo
 FINGERPRINT (CRC-32 ⊕ `0x5354554E`, `verifyFingerprint`), MESSAGE-INTEGRITY (HMAC-SHA1-20 over the
 message with the length field adjusted to include the attribute, `verifyMessageIntegrity` via
 constant-time compare), ERROR-CODE → `{ code, reason }`. No allocation in the core — everything is
-over caller buffers. `query` (optional) sends one Binding request over `std.Io.net` UDP; a
-convenience only, not the interface. `QueryOptions.timeout_ms` bounds the wait for a reply (`0` =
-wait indefinitely, the default, matching `query`'s original unbounded behavior); on expiry it
+over caller buffers. `query` (optional) runs one Binding transaction over `std.Io.net` UDP
+(retransmission below); a convenience only, not the interface. `QueryOptions.timeout_ms` caps the
+whole exchange (`0` = only the retransmission schedule bounds it, the default); on expiry it
 returns `error.Timeout`. Shape mirrors `sntp.QueryOptions`/`sntp.query`'s identical UDP
 request/response bound — same field name, unit and error name — since sntp already establishes the
 in-repo pattern for exactly this problem. Reentrant — no shared state; every call is over caller buffers.
 Clean-room from RFC 8489; attribute TLV (de)serialization structure modeled after Corendos/ztun
 (design reference only, no source copied) — see README "Provenance"; no NOTICE entry needed.
 
-## Server, retransmission, URIs, long-term key (2026-10-04)
+## Server, retransmission, URIs, long-term key
 
 **`bindingResponse`** answers only Binding requests (anything else is `NotBindingRequest`: drop
 it, §6.3). Order of checks, as §6.3.1 prescribes: unknown comprehension-required attributes
@@ -65,7 +65,11 @@ FINGERPRINT, in that order; the transaction id is the request's.
 **`query`** sends per `Schedule` (RFC 8489 §6.2.1) and waits each window against one clock
 (`Clock.awake`) from the first send, so `timeout_ms` caps every window, not only the start of
 the next. Options whose worst-case wait is above `max_worst_case_wait_ms` (120 s; the defaults are 39.5 s)
-are refused with `error.InvalidOptions` (2026-11-18). Discarding strays keeps a spoofed or late reply from ending the exchange; reporting the
+are refused with `error.InvalidOptions` before a socket is opened (`worstCaseWaitMs`: the §6.2.1
+schedule's last wait, capped by `timeout_ms` when set; `checkOptions` is public for a caller that
+validates its own configuration). The RFC leaves Rc, Rm and RTO to the client (§6.2.1 "MAY"), so a
+bound is within the spec, and a refusal instead of a silent clamp keeps the behaviour predictable:
+more than 8 requests at the default RTO without `timeout_ms` is refused. Discarding strays keeps a spoofed or late reply from ending the exchange; reporting the
 last stray on give-up keeps every error name the old single-shot `query` returned.
 
 **`parseUri`** accepts exactly RFC 7064/7065: scheme (case-insensitive), host as reg-name,
@@ -74,7 +78,7 @@ Userinfo, paths, fragments and other queries are refused. **`longTermKey`** is M
 `user:realm:password` as given; the RFC 5769 §2.4 test shows the prepared password verifies and
 the raw one does not.
 
-## Attribute types, MESSAGE-INTEGRITY-SHA256, demux (2026-11-02)
+## Attribute types, MESSAGE-INTEGRITY-SHA256, demux
 
 `AttributeType` names the RFC 5780 (CHANGE-REQUEST, OTHER-ADDRESS, RESPONSE-ORIGIN, RESPONSE-PORT,
 PADDING, CACHE-TIMEOUT, and the RFC 3489 SOURCE-/CHANGED-ADDRESS), RFC 8445 (PRIORITY,
@@ -102,60 +106,70 @@ timing to forge a valid MAC; FINGERPRINT lets a caller distinguish STUN traffic 
 sharing a port. The server side answers unauthenticated requests by design (a Binding
 server reflects addresses); `bindingResponse` allocates nothing and bounds its own work (one pass
 over the request's attributes, 32 unknown types). Explicitly out of scope, with reasons in
-"Backlog / deferred": SASLprep, the long-term nonce/realm challenge flow on the server, ICE
+*What is deliberately not done*: SASLprep, the long-term nonce/realm challenge flow on the server, ICE
 integration, TURN, TCP/TLS/DTLS transport. A reader that acts on a value after verifying the MAC
 uses the `...Covered` accessors: `find`-based ones also see attributes an on-path attacker appended
 behind the MAC (the MAC and FINGERPRINT still verify).
 
 ## Verification
-The RFC 5769 test vectors are the oracle — the exact sample byte sequences from §2.1 (request), §2.2
-(IPv4 response), §2.3 (IPv6 response) are used as fixtures (not invented ones): the sample request
-decodes and its MESSAGE-INTEGRITY (with the §2.1 password) and FINGERPRINT verify; the responses
-decode to `192.0.2.1:32853` and the IPv6 equivalent; tamper tests flip a covered byte and assert both
-checks fail. `query`'s bounded wait is covered by two loopback-only tests (no live network needed): a
-"dark server" — a UDP socket this process binds and never answers from — proves `timeout_ms` yields
-`error.Timeout` rather than hanging (itself wrapped in a watchdog thread so a regression to unbounded
-`receive` fails the test loudly instead of hanging the suite), and a second test runs a one-shot fake
-STUN server on loopback to prove the answered path is unaffected by the option's addition. Run:
-`zig build test-stun` (Debug and `-Doptimize=ReleaseFast`).
 
-**2026-10-04:** `bindingResponse` rebuilds RFC 5769 §2.2 and §2.3 byte for byte from the §2.1
-request (with the RFC's 0x20 padding); 420/400/401 paths decoded back; `longTermKey` verifies RFC
-5769 §2.4's sample request (and the unprepared password does not); `Schedule` reproduces RFC 8489
-§6.2.1's own timeline; `parseUri` against RFC 7064/7065's examples and a list of malformed ones.
-Loopback: a server that drops two requests and sends a foreign-transaction stray before
-answering (three requests seen, stray ignored), a stray-only server (reported as
-`TransactionMismatch`), an error response (`ErrorResponse`, one request), and a 100 ms cap on a
-10 s RTO window. Mutation 2026-10-04: 31 mutants, all killed (the cap-on-window one needed the
-last test).
+Run: `scripts/modtest stun` (`zig build test-stun`). Interop evidence: the RFC 5769 vectors and the
+two Go libraries' byte agreement in the bench (`tools/README.md`); no oracle server is kept.
 
-**Audit 2026-11-18 (whole-module mutation).** Every condition x class of the non-test code of
-`src/root.zig` (message type interleave, header validation, attribute iterator, address and
-ERROR-CODE decoding, MESSAGE-INTEGRITY / -SHA256 / FINGERPRINT build and verify, the Builder's
-capacity and 16-bit-region guards, key derivation, PASSWORD-ALGORITHM(S), `bindingResponse`
-including the 420 / 400 / 401 paths and the SHA-256 tag fallback, `parseUri`, address encode,
-`Schedule` and `worstCaseWaitMs`, `query`'s cap / stray / class filters): 522 mutants in one
-ReleaseSafe schemata build, run once per mutant. 408 + 1 (a hang) were killed by the earlier
-suite, 113 survived; the new `src/mutation_test.zig` killed 103 of them and 10 are EQUIVALENT:
-`addMessageIntegritySha256` / `verifyMessageIntegritySha256` lower bound 15 and upper bound 33
-(only 15 and 33 pass the shifted bound, and neither is a multiple of 4); the PASSWORD-ALGORITHM
-`params.len > 253` bound (253 bytes pad to 256 and the capacity check refuses it anyway) and
-the `4 + params.len > out.len` capacity check (`out.len` is always a multiple of 4, so it
-agrees with the padded form); `parseUri` `tail.len == 1` (`parseInt("")` fails either way);
-`regionFits` `<=` against `<` at 65535 (the attribute region is always a multiple of 4);
-`stunUnderstands` entries for MESSAGE-INTEGRITY and -SHA256 (its only caller stops at those
-types first); the tag fallback `t <= 32` against `t < 32` (32 falls back to 32). The burn
-(`burn.zig`) is exercised by the ReleaseFast stack probe and was not mutated here. The gaps the
-run found were all test gaps, none in the code: only method 1 was ever used (the interleave
-masks and shifts for methods above 0x7F were unobserved), the decode rejects had no test per
-check (`NotStun` bits, alignment, each cookie bit, the 19-byte case), no exact-fit buffer and
-no 16-bit boundary test, the error responses' padding, URI host characters, FINGERPRINT /
-MESSAGE-INTEGRITY values of a wrong length, and `query`'s send cap and reply filters.
+- **RFC 5769 vectors** (the oracle): the exact sample byte sequences of §2.1 (request), §2.2 (IPv4
+  response) and §2.3 (IPv6 response) are fixtures, not invented ones. The sample request decodes
+  and its MESSAGE-INTEGRITY (with the §2.1 password) and FINGERPRINT verify; the responses decode
+  to `192.0.2.1:32853` and the IPv6 equivalent; tamper tests flip a covered byte and assert both
+  checks fail. `bindingResponse` rebuilds §2.2 and §2.3 byte for byte from the §2.1 request (with
+  the RFC's 0x20 padding); the 420/400/401 paths are decoded back; `longTermKey` verifies §2.4's
+  sample request (and the unprepared password does not).
+- **Codec classes:** header interleave for several methods, every decode reject (non-STUN bits,
+  alignment, each cookie bit, truncation, length near u16 max), attribute iteration, address /
+  ERROR-CODE / FINGERPRINT / MESSAGE-INTEGRITY decoding including values of the wrong length, the
+  Builder's capacity and 16-bit-region guards, the covered accessors (an on-path attacker's
+  appended attributes behind the MAC), `parseUri` against RFC 7064/7065 examples and malformed
+  ones. `src/mutation_test.zig` holds the tests the whole-module mutation run asked for;
+  `src/sweep_test.zig` the no-panic sweep cases.
+- **MESSAGE-INTEGRITY-SHA256 and the RFC 8489 additions:** round trip at every legal tag length,
+  an independent HMAC-SHA256 recomputation over a hand-built message, Python `hmac`/`hashlib`
+  goldens (32- and 16-byte tags, USERHASH, the SHA-256 long-term key; no Go library implements
+  them), `bindingResponse` with the SHA-256 credential alone and with SHA-1.
+- **`query` / `Schedule`:** `Schedule` reproduces the RFC 8489 §6.2.1 timeline (0, 500, 1500, ...,
+  31500, give up at 39500) and saturates at 255 requests; loopback tests (no live network): a
+  "dark server" proves `timeout_ms` yields `error.Timeout` (wrapped in a watchdog thread so a
+  regression to an unbounded `receive` fails loudly), a one-shot fake server proves the answered
+  path, a server that drops two requests and sends a foreign-transaction stray before answering,
+  a stray-only server (reported as `TransactionMismatch`), an error response (`ErrorResponse`,
+  one request), a 100 ms cap on a 10 s RTO window, `max_requests = 1` sending once, and the
+  worst-case bound (defaults pass, the bound is accepted, bound + 1 is refused before any socket
+  is opened).
+- **Fuzz:** three harnesses run by the deterministic driver: `decode` + every accessor
+  (`STUN_FUZZ`), the mutating `Builder` API (`STUN_FUZZ_BUILD`) and `bindingResponse`
+  (`STUN_FUZZ_RESPOND`: requests with and without USERNAME, either MAC or both, attributes in
+  front of and behind the MAC, server keys right and wrong, any tag, any buffer; the expected
+  status is computed in the harness from what the request was built with); each has reach
+  counters and an in-suite corpus check. `_ONLY`, `_MS`, `_SEEDFILE` as testkit documents.
+- **Constant time and dead stack:** ctgrind rows `mi`, `mi256` and `ltkey` (the MAC keys and the
+  long-term password tainted; `scripts/checks/ctgrind.sh stun`, harness `src/ctgrind_harness.zig`,
+  not run by `test-stun`); `longTermKeySha256`, `userhash` and `bindingResponse` are not ctgrind
+  targets. `burn.zig` zeroes each credential entry point's dead stack and `src/stackprobe_test.zig`
+  goes red when a body outgrows its burn.
+- **Bench oracle:** `zig build bench-stun` (`tools/bench.zig`) checks byte sums and decode results
+  against pion/stun v3.1.6 and gortc.io/stun v1.23.0 and refuses to report when they differ.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-## Backlog / deferred
-**Verdicts for everything the competition has that this module does not (survey 2026-11-02, revised 2026-11-03; nothing is merely "deferred"):**
-done: RFC 5780/ICE/TURN attribute types and typed address/uint32 accessors, covered-region variants of them, MESSAGE-INTEGRITY-SHA256 (build, verify, and in `bindingResponse`), `longTermKeySha256`, USERHASH, PASSWORD-ALGORITHM(S) codec, `looksLikeStun`, `randomTransactionId`.
-Rejected, each with its reason:
+## Performance
+
+`zig build bench-stun` (`tools/bench.zig`, Go sides `tools/go_bench` for pion and `tools/go_bench_gortc`
+for gortc): 64-message batches of `enc_req`, `dec_resp` and `dec_garbage` against both Go libraries.
+The card's Performance line carries the figures. Speed of `longTermKey*`, `parseUri` and
+`bindingResponse` is outside the bench (see *Backlog / deferred*).
+
+## What is deliberately not done
+
+Everything the competition has that this module does not, each with its reason; what was worth
+building is built and described above.
+
 - *Multiplexing `Agent`/`Client`* (pion): it owns timers, a socket and a goroutine per transaction, which is the caller's event-loop policy; this module is reentrant, so a caller runs one `query` or its own `Schedule` per transaction.
 - *TCP/TLS/DTLS transport*: a transport layer above a transport-agnostic codec; `tlsclient` and `dtls` are the modules that carry bytes, and `decode` already takes one framed message (RFC 8489 §6.2.2 framing is "20-byte header, then `length`"). `query` stays UDP because the router-tool consumer's one-shot needs nothing else.
 - *SASLprep / OpaqueString (RFC 8265)*: needs the Unicode PRECIS property tables (hundreds of KB, paid by every consumer on an 8 MB-flash target) and belongs to a PRECIS module that does not exist in `ls modules`; credentials are ASCII in practice, and the `longTermKey*` / `userhash` doc comments state the precondition. Filing: a `precis` module is the owner of this gap (not scheduled).
@@ -163,20 +177,11 @@ Rejected, each with its reason:
 - *ICE and TURN*: separate protocols layered on STUN messages; the attribute types are named, the rest is their module (`turn`, `ice` do not exist and are not part of NAT discovery).
 - *RFC 5780 NAT-behaviour procedure*: an application (pion ships it as `cmd/stun-nat-behaviour`); the attributes it needs are here.
 - *Automatic ALTERNATE-SERVER (300) following in `query`*: RFC 8489 §6.3.4 allows a Binding server to redirect only when overloaded and `query` is a one-shot; `Message.alternateServer` exposes the target and the caller decides.
-Speed rows outside the bench (`longTermKey*`, URI parsing, `bindingResponse`) are unmeasured.
-- **2026-10-04:** retransmission, the Binding server and STUN URI parsing are **done**; the
-  long-term mechanism is done as far as the key (`longTermKey`) — SASLprep (Unicode tables),
-  SHA-256/PASSWORD-ALGORITHMS/USERHASH and a server-side nonce flow stayed deferred then (superseded by the 2026-11-03 verdicts above) until a TURN
-  consumer exists (the router-tool consumer only asks a server for its address).
-- **DONE 2026-10-04 — UDP retransmission in `query`** (survey 2026-09-30): RFC 8489 §6.2.1 has the client resend with RTO doubling; `pion/stun`'s Client does; here one datagram is sent and a lost packet is a `Timeout` (rg `retrans|rto|retry` over `src/root.zig` finds nothing). A user on a lossy link gets false failures. Effort: small. Fits CONVENTIONS §2.
-- **DONE 2026-10-04 — Server side (Binding responder)**, `bindingResponse` (survey 2026-09-30): `ztun` has one; needed for a self-hosted "what is my address" service. Effort: small for Binding only. Fits §2. (Currently listed as deferred, not as a deliberate refusal.)
-- **PARTLY DONE 2026-10-04 (`longTermKey`; see the bullet above for what stays deferred) — Long-term credential mechanism (RFC 8489 §9.2) + missing attribute types** (survey 2026-09-30): USERNAME/REALM/NONCE constants exist but no SASLprep/key derivation, PASSWORD-ALGORITHMS or USERHASH; ICE/TURN users (pion, coturn) need it. Effort: medium (SASLprep is the hard part, needs Unicode tables). Fits §2 (pure Zig).
-- **DONE 2026-10-04 — STUN URI parsing (RFC 7064)**, `parseUri` (survey 2026-09-30): pion offers `ParseURI`; trivial convenience. Effort: small. Fits §2.
-- **DONE 2026-11-18 (owner decision, RFC 8489 §6.2.1; no-panic sweep GV, REV-stun-2) — `query`'s worst-case wait grew exponentially with `max_requests`:** the defaults already are the RFC's (Rc 7, Rm 16, RTO 500 ms, 39.5 s, the RFC's own example). `query` now computes the worst case (`worstCaseWaitMs`: the §6.2.1 schedule's last wait, capped by `timeout_ms` when set) and refuses options above `max_worst_case_wait_ms` (120 s, three times the RFC default) with `error.InvalidOptions` before it opens a socket. A long schedule under a `timeout_ms` cap is fine; `checkOptions` is public for a caller that wants to validate its own configuration. The RFC leaves Rc, Rm and RTO to the client (§6.2.1 "MAY"), so a bound is within the spec; a refusal instead of a silent clamp keeps the behaviour predictable. Behaviour change for a caller that set more than ~8 requests at the default RTO without `timeout_ms`.
 
-## Status
-`gap · any (core pure; optional query helper does I/O) · codec · reentrant` + deps: `netaddr` —
-canonical source is `pub const meta` in src/root.zig.
+## Backlog / deferred
+
+- **Speed rows outside the bench** — `longTermKey*`, URI parsing and `bindingResponse` are
+  unmeasured. Effort: small.
 
 ## Anchoring
 
