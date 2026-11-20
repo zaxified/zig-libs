@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [cloudflare/circl](https://github.com/cloudflare/circl) `sign/slhdsa` | Go | BSD-3-Clause (`LICENSE`); API: NOASSERTION | 1.7k | v1.6.5 (2026-08-05) | Deterministic and randomized signing with a context; exports a pre-hash error, so pre-hash is presumably supported *(inferred from an exported error name)*. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | ML-DSA and ML-KEM only; no SLH-DSA (per this module's README, not re-checked in `lib/std`). |
 
-**Where we are ahead:** the only SLH-DSA in pure Zig with no C; all twelve sets byte-exact against NIST ACVP (keyGen and sigGen for every set); the SHA-2 midstate and SHAKE sponge-copy optimisation; typed errors instead of panics on malformed input. **Where we are behind:** no key/signature PKCS#8 / OID layer; signing is not constant-time hardened and has no SIMD (→ Backlog items).
+**Where we are ahead:** the only SLH-DSA in pure Zig with no C; all twelve sets byte-exact against NIST ACVP (keyGen and sigGen for every set); the SHA-2 midstate and SHAKE sponge-copy optimisation; typed errors instead of panics on malformed input. **Where we are behind:** no key/signature PKCS#8 / OID layer; signing is not constant-time hardened (see *Threat model / out of scope*) and has no SIMD.
 
 ## Design & invariants
 
@@ -64,8 +64,8 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
   case (seeds → pk/sk) and one deterministic internal sigGen case
   (sk + message → full signature, then verified); for SHA2-128f
   additionally a hedged internal case (explicit additionalRandomness) and
-  a pure external case with a 110-byte context. Pre-hash (retrieved
-  2026-10-11): `preHash` groups of sigGen (every one of the twelve PH
+  a pure external case with a 110-byte context. Pre-hash:
+  `preHash` groups of sigGen (every one of the twelve PH
   functions once, plus a hedged case, on SHA2-128f and SHAKE-128f) and sigVer
   (valid signature; modified message, R and SIGFORS). A single wrong bit
   anywhere in the ADRS handling, hash instantiation (incl. the SHA-256 vs
@@ -83,7 +83,7 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
   midstate copied per hash call (for SHAKE the sponge state after
   absorbing PK.seed is copied the same way) — an implementation of the
   same function, covered by the KATs.
-- **HashSLH-DSA pre-hash (2026-10-11, §10.2.2, Algorithms 23/25).**
+- **HashSLH-DSA pre-hash (§10.2.2, Algorithms 23/25).**
   `M' = 0x01 ‖ len(ctx) ‖ ctx ‖ OID ‖ PH(M)` goes into the same internal
   sign/verify as the pure `M'` (prefix octet 0x00); `src/prehash.zig` holds the
   `PreHash` enum (the twelve approved PH functions, SHAKE128 → 32 B, SHAKE256 →
@@ -120,7 +120,7 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
   no systematic side-channel review was done. Secret keys are not zeroized
   on drop — callers with a real key-hygiene requirement must
   `std.crypto.secureZero` their copies.
-- **Dead stack (2026-10-09):** secrets cross the API by pointer (`*const SecretKey`,
+- **Dead stack:** secrets cross the API by pointer (`*const SecretKey`,
   `*const [n]u8` seeds) and results come back through `out` parameters, so the library
   makes no by-value copy of SK.seed / SK.prf; `keyGenFromSeed`, `signInternal` and `sign`
   run their body one frame down and zero the stack it dirtied (`src/burn.zig`).
@@ -133,9 +133,8 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
   signing where randomness is available (fault-attack + multi-target
   resistance); callers supply the n random bytes — this module never
   reaches for OS entropy itself.
-- **Out of scope this pass:** streaming/incremental signing APIs (the pre-hash
-  entry points are the answer for digests computed elsewhere). The `keyGen`/`sign` seeds/randomness
-  are caller-supplied by design (std removed `std.crypto.random` in 0.16; still absent in 0.17).
+- **Randomness is the caller's.** The `keyGen`/`sign` seeds and `addrnd` are caller-supplied by design (std removed
+  `std.crypto.random` in 0.16; still absent in 0.17).
 - **Signature size is inherent:** 7 856 B (128s) up to 49 856 B (256f) per
   signature — see the size table in README.md. Protocol designs that
   cannot carry that should pick a different scheme; within SLH-DSA the
@@ -143,45 +142,51 @@ WOTS+/XMSS/hypertree/FORS code serves all twelve sets.
 
 ## Verification
 
-- `zig build test-slhdsa`: NIST ACVP KATs for all twelve
-  parameter sets (keyGen + deterministic-internal sigGen each, byte-exact;
-  128f also hedged-internal + pure-with-context), WOTS+/XMSS/FORS
-  component round-trips (SHA2 cat-1 + SHAKE + SHA2 cat-3 hashes),
-  base_2b/ADRS bit-layout unit tests (incl. the 12/14-bit FORS digits),
-  Table 2 derived-length checks for every set, keygen→sign→verify
-  round-trips (SHA2 + SHAKE), tamper battery (bit flips in R/FORS/HT
-  regions, wrong message, wrong context, wrong key, wrong lengths,
-  oversized context), hedged ≠ deterministic. Green in Debug and
-  ReleaseFast.
-- Oracle: NIST ACVP gen-val vectors (github.com/usnistgov/ACVP-Server,
-  `gen-val/json-files/`, retrieved 2026-07-11) — the same corpus NIST uses
-  for FIPS 205 validation testing.
+Run: `scripts/modtest slhdsa`; fuzz: `SLHDSA_FUZZ=<runs>[,<first seed>]`
+(testkit's deterministic driver, harnesses `slhdsa-sha2-128f-verify` and `slhdsa-shake-128f-verify`; never
+`zig build --fuzz`); constant time: `scripts/checks/ctgrind.sh slhdsa`.
 
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, 33 tests, `setsid -w timeout -s
-KILL 30` per mutant): **11 mutants, all killed, no new test needed**. Points chosen where the
-byte-exact KATs might not reach: the exact signature length, the 255-octet context bound on
-both sides, the pure-mode prefix octet and the context length in it, the context in the
-verify message, `addrnd`, both `idx_tree` masks, the randomizer `R` in `H_msg`, and the final
-root comparison. The arithmetic core (WOTS+, XMSS, FORS, hypertree, address layout) is pinned
-byte-exact by the FIPS 205 / ACVP vectors and was not re-mutated here.
+- **NIST ACVP known-answer tests** (`src/kat_test.zig`, vectors in `src/kat_vectors.zig`): for each of the twelve sets
+  one keyGen case and one deterministic internal sigGen case, byte-exact; SHA2-128f also a hedged internal case and a
+  pure case with a 110-byte context; pre-hash sigGen on SHA2-128f and SHAKE-128f (every one of the twelve PH
+  functions, deterministic and hedged) and sigVer (valid; modified message, R and SIGFORS).
+- **Components** (`src/engine.zig`, `src/address.zig`, `src/params.zig`, `src/prehash.zig`): WOTS+, XMSS and FORS
+  round-trips (SHA2 category 1, SHAKE, SHA2 category 3), `base_2b` and ADRS bit layouts (including the 12/14-bit FORS
+  digits), Table 2 derived lengths for every set, PH OID encodings and digest lengths, key serialization.
+- **Round trips and tamper:** keygen, sign, verify (SHA2 and SHAKE, with context); bit flips in R / FORS / hypertree
+  regions, wrong message, context, key and lengths, an oversized context; hedged differs from deterministic; the
+  digest pre-hash entry points check lengths and `sign(digest)` equals `sign(message)`.
+- **No-panic sweep** (`src/sweep_test.zig`): every wrong signature length, a full-length garbage signature, all-ones
+  and all-zero keys, a 256-byte context and wrong digest lengths are `false` or a typed error.
+- **Fuzz:** both verify harnesses at `.scale` 10 (a run is up to five verifications of a 17 KiB signature), with
+  reach checks.
+- **Constant time:** `src/ctgrind_harness.zig` (`SK.seed` and `SK.prf` tainted); the verdicts are the card's
+  Hardening line.
+- **Dead stack:** `src/stackprobe_test.zig`, ReleaseFast only.
+- **Oracle:** NIST ACVP gen-val vectors (`SLH-DSA-keyGen-FIPS205`, `SLH-DSA-sigGen-FIPS205`,
+  `SLH-DSA-sigVer-FIPS205`, `internalProjection.json` from the ACVP-Server repository), the corpus NIST uses for
+  FIPS 205 validation testing; frozen vectors only, no interop program.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-slhdsa`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 3.5 %): ref 0.57–0.89×, against 0.59–0.88× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
+`zig build bench-slhdsa` (`tools/bench.zig`, ReleaseFast, `BENCH_ROUNDS=5`) against the SLH-DSA of the system
+OpenSSL (`tools/c_bench/foreign_bench.c`, built with `zig cc`), sign / verify / keygen over six sets; the card's
+`**Performance:**` line carries the figures and their date. liboqs, the card's named reference, is foreign code not
+pinned in this tree.
+
+## What is deliberately not done
+
+- **Streaming / incremental signing APIs** — the pre-hash entry points (`signPrehashDigest` /
+  `verifyPrehashDigest`) are the answer for digests computed elsewhere.
 
 ## Backlog / deferred
 
-- ~~**HashSLH-DSA pre-hash variants (FIPS 205 §10.2.2, Algorithms 23/25)**~~ **DONE 2026-10-11**
-  *(survey 2026-09-30)*. `signPrehash`/`verifyPrehash` (module hashes the message) and
-  `signPrehashDigest`/`verifyPrehashDigest` (caller-supplied digest) over the twelve approved
-  PH functions; ACVP pre-hash sigGen/sigVer vectors; see *Design & invariants*.
-- **Stack probe does not recompute FORS leaf secrets** *(2026-10-09)*. They sit at a
-  message-dependent address (the tree and leaf come out of H_msg), which the probe would
-  have to reimplement. The probe's SK.seed windows and the WOTS+ chain-start secrets
-  (same `F(PK.seed, ADRS, SK.seed)` step) cover the inputs and the same code path; a
-  differential needle would need H_msg exposed to tests.
+- **Stack probe does not recompute FORS leaf secrets.** They sit at a message-dependent address (the tree and leaf come
+  out of H_msg), which the probe would have to reimplement. The probe's SK.seed windows and the WOTS+ chain-start
+  secrets (same `F(PK.seed, ADRS, SK.seed)` step) cover the inputs and the same code path; a differential needle
+  would need H_msg exposed to tests.
 
 ## Anchoring
 

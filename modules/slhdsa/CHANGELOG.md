@@ -5,9 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GT) found nothing to fix (every `verify*` is total; argued in the sweep report); pin tests in `src/sweep_test.zig`.
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).
 
 - **2026-10-18** — Ported to Zig 0.17.0: tests: `EnumSet.empty`, enum iteration via `field_values`.
 - **2026-10-11** — **HashSLH-DSA pre-hash (FIPS 205 §10.2.2, Algorithms 23/25):** `signPrehash`, `signPrehashDigest`, `verifyPrehash`, `verifyPrehashDigest` and the `PreHash` enum (`src/prehash.zig`, re-exported as `slhdsa.prehash`; SHA-2 ×6, SHA3 ×4, SHAKE128/256 with their DER OIDs). Additive, no change to existing entry points. Tests: NIST ACVP pre-hash sigGen (all twelve PH functions, deterministic + hedged, SHA2-128f and SHAKE-128f) and sigVer (valid, modified message/R/SIGFORS) vectors, digest-length and context-bound checks; the verify fuzz harnesses also feed the pure-signature fixture to the pre-hash verifiers. Scope core → parity.
@@ -43,7 +40,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-05** — Audit: first dated mutation run (11 mutants, all killed; `SPEC.md` § "Mutation
   run 2026-10-05"). No code or test change.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, taking `SK.seed` and `SK.prf` separately through `SlhDsaSha2_128f.sign()`. Measured ReleaseFast: **4 in-file contexts for `seed`, 8 for `prf`**, untainted control 0 and no-`-fvalgrind` trap 0 in every row. ⭐ Non-zero, and it does NOT contradict `SPEC.md:69-72`'s "chain lengths derive from the public digest" carve-out: every context is a branch over a WOTS+ chain length (`engine.zig:296`) or an auth-path index parity bit (`engine.zig:424`, `:539`), i.e. over values a verifier recomputes from the published signature. A binary taint cannot tell those apart from a branch on a secret byte, which is why the per-line attribution — not the total — is what this row is for.
 
 - **2026-09-09** — The module has a `NOTICE` for the first time. `src/kat_vectors.zig` carries
   NIST's ACVP known-answer vectors for all twelve SLH-DSA parameter sets, and the provenance

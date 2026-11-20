@@ -49,6 +49,7 @@ bytes — bring your own CSPRNG.
 | `src/address.zig` | §4.2 ADRS (32-byte hash addresses) + SHA2 compressed form | real, tested |
 | `src/engine.zig` | generic `SlhDsa(Params)`: §11.1 SHAKE + §11.2 SHA2 hashes, WOTS+, XMSS, hypertree, FORS, keygen/sign/verify | real, KAT-verified |
 | `src/prehash.zig` | `PreHash` enum (FIPS 205 §10.2.2 approved PH set) with DER OIDs and `hash` | real, tested |
+| `src/burn.zig` | dead-stack burn run around the secret-touching entry points (`keyGenFromSeed`, `signInternal`, `sign`) | real, probed |
 | `src/root.zig` | `meta`, re-exports, the twelve ready-to-use instantiations | real, tested |
 | `src/kat_vectors.zig` / `src/kat_test.zig` | NIST ACVP vectors (all 12 sets) + the KAT/tamper battery | test-only |
 
