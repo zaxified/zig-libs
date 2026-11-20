@@ -717,6 +717,7 @@ test {
     _ = @import("testdata/seqgen.zig");
     _ = @import("cdict.zig");
     _ = @import("dict_test.zig");
+    _ = @import("cdict_open_test.zig");
     _ = @import("frame_writer.zig");
     _ = @import("stream_writer.zig");
     _ = @import("stream.zig");

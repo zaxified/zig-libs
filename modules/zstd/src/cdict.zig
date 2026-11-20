@@ -744,3 +744,64 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+fn poisonTables(bs: *frame.BlockState, v: u8) void {
+    inline for (.{ &bs.fse.of, &bs.fse.ml, &bs.fse.ll }) |t| {
+        @memset(&t.state_table, @as(u16, v) * 0x101);
+        @memset(&t.symbol_tt, .{ .delta_find_state = v, .delta_nb_bits = v });
+    }
+}
+
+test "loading a full dictionary zeroes the FSE tables first, whatever they held" {
+    var buf: [2048]u8 = undefined;
+    var counts: [256]u32 = undefined;
+    for (&counts, 0..) |*c, i| c.* = 1 + @as(u32, @intCast(i % 7));
+    // offset codes up to 20 only: the entries past them are not built
+    const n = try testDictionary(&buf, &counts, 255, 20, strRepeat("0123456789abcdef", 4));
+    var a: frame.BlockState = .{};
+    var b: frame.BlockState = .{};
+    poisonTables(&a, 0);
+    poisonTables(&b, 0x7f);
+    _ = try loadCEntropy(&a, buf[0..n]);
+    _ = try loadCEntropy(&b, buf[0..n]);
+    inline for (.{ "of", "ml", "ll" }) |name| {
+        const x = &@field(a.fse, name);
+        const y = &@field(b.fse, name);
+        try std.testing.expectEqualSlices(u16, &x.state_table, &y.state_table);
+        for (x.symbol_tt, y.symbol_tt) |p, q| try std.testing.expect(std.meta.eql(p, q));
+    }
+}
+
+test "a full dictionary cut inside its repcodes is corrupted" {
+    var buf: [2048]u8 = undefined;
+    var counts: [256]u32 = undefined;
+    for (&counts, 0..) |*c, i| c.* = 1 + @as(u32, @intCast(i % 7));
+    const content = "0123456789abcdef";
+    const n = try testDictionary(&buf, &counts, 255, sequences.max_off, content);
+    const reps = n - content.len - 12;
+    var bs: frame.BlockState = .{};
+    var k: usize = 0;
+    while (k < 12) : (k += 1) {
+        try std.testing.expectError(error.DictionaryCorrupted, loadCEntropy(&bs, buf[0 .. reps + k]));
+    }
+}
+
+test "force_max_window leaves the loaded dictionary end 0; deterministic_ref_prefix keeps the window apart" {
+    const gpa = std.testing.allocator;
+    const dict = "0123456789abcdef0123456789abcdef";
+    var plain = try CDict.initAdvanced(gpa, dict, .{ .level = 3 });
+    defer plain.deinit();
+    try std.testing.expect(plain.ms.loaded_dict_end != 0);
+    try std.testing.expect(!plain.ms.force_non_contiguous);
+    var forced = try CDict.initAdvanced(gpa, dict, .{ .level = 3, .advanced = .{ .force_max_window = true, .deterministic_ref_prefix = true } });
+    defer forced.deinit();
+    try std.testing.expectEqual(@as(u32, 0), forced.ms.loaded_dict_end);
+    try std.testing.expect(forced.ms.force_non_contiguous);
+}
+
+test "a dictionary of exactly 8 bytes inserts nothing (next_to_update stays at its start)" {
+    const gpa = std.testing.allocator;
+    var cd = try CDict.init(gpa, "12345678", 3);
+    defer cd.deinit();
+    try std.testing.expectEqual(@as(u32, match.window_start), cd.ms.next_to_update);
+}
