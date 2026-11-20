@@ -68,8 +68,7 @@
 //! modules in this tree (`bip340`, `k256`, `blindrsa`, `rsa`, …) — see
 //! `scripts/checks/ctgrind.sh`'s `blindrsa` comment for the exact trap. It is a
 //! live risk here only in principle: `round1Commit`/`round2Sign` never call
-//! into `bip340` (the module doc comment: "no function in this module
-//! currently calls into bip340"), so no `bip340/root.zig` frame should ever
+//! into `bip340` (frost does not depend on it), so no `bip340/root.zig` frame should ever
 //! appear in either target's stack — but the coordinator should re-verify
 //! this by qualified symbol name (`root.round1Commit` vs `root.blindSign`
 //! vs `root.something_bip340`), not by trusting the regex, exactly as the

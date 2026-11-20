@@ -6,11 +6,8 @@
 //! two-element `(R, z)` Schnorr signature verifiable under one group
 //! public key, with no interaction required from a full n-of-n set —
 //! only any `MIN_PARTICIPANTS`-sized subset. Builds on the sibling
-//! `bip340` module... in name only for now: **this ciphersuite's
-//! aggregate signature is NOT a BIP340 signature** — see the "BIP340
-//! compatibility" finding below. `bip340` is listed as a dependency by
-//! the orchestrator for a future cross-module comparison/test, not
-//! because `verify` here calls into it.
+//! `k256` curve group; **this ciphersuite's aggregate signature is NOT a
+//! BIP340 signature** — see the "BIP340 compatibility" finding below.
 //!
 //! **Status: complete** — all ten threshold cores implemented and
 //! KAT-validated (Debug + ReleaseFast). Wire codecs
@@ -141,7 +138,6 @@
 //! sizes) and is explicitly out of scope for this pass.
 
 const std = @import("std");
-const bip340 = @import("bip340");
 
 /// Re-exported for callers (and `kat_test.zig`) that need to construct a
 /// raw curve point directly (e.g. deriving a `VerifyingShare` from a
@@ -170,7 +166,7 @@ pub const meta = .{
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; all types are plain values
     .model_after = "RFC 9591 (\"The Flexible Round-Optimized Schnorr Threshold (FROST) Protocol for Two-Round Schnorr Signatures\"), §6.5 secp256k1/SHA-256 ciphersuite; RFC 9380 (hash-to-curve) §5.3/§5.4.1 expand_message_xmd/hash_to_field for H1-H3; the k256 module supplies the curve group (byte-exact to std.crypto.ecc.Secp256k1)",
-    .deps = .{ "bip340", "k256" }, // bip340 orchestrator-registered (NOT used by verify); k256 curve group
+    .deps = .{"k256"}, // the curve group
 };
 
 // ── ciphersuite constants (RFC 9591 §6.5) ───────────────────────────────
@@ -1524,7 +1520,7 @@ test {
 
 test "meta.model_after names RFC 9591 and the secp256k1 ciphersuite" {
     try std.testing.expect(std.mem.find(u8, meta.model_after, "RFC 9591") != null);
-    try std.testing.expectEqualStrings("bip340", meta.deps[0]);
+    try std.testing.expectEqualStrings("k256", meta.deps[0]);
 }
 
 test "context_string matches RFC 9591 §6.5 exactly" {

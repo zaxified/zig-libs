@@ -82,8 +82,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   BIP340's. `verify` in this module implements RFC 9591 Appendix B's
   `prime_order_verify` directly; it does not call `bip340.verify`, and no
   amount of encode/decode glue bridges the two (the challenge hash
-  itself is different, not just the wire format). The `bip340` build
-  dependency is declared but no function in this module calls into `bip340`.
+  itself is different, not just the wire format). The module does not
+  depend on `bip340`.
 - **Type design — wire types vs. raw `Scalar`**: values that flow "over
   the wire" between participants/the Coordinator (`Identifier`,
   `SigningShare`, `VerifyingShare`/`GroupPublicKey`/`NonceCommitment`
