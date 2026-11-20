@@ -18,8 +18,6 @@
 
 **Downstream consumer:** yes
 
-Audit history (every review and mutation run, the equivalent-mutant arguments, the defects fixed): [`AUDIT.md`](AUDIT.md).
-
 Design + threat notes for auditors. Usage: see ./README.md. Provenance and design references: the module's [`NOTICE`](NOTICE) (a provenance note).
 
 ## Compared with
@@ -185,7 +183,7 @@ security boundary.
 ## Design notes by feature
 
 What each feature is and the decisions behind it. When each landed is in `CHANGELOG.md`; how it was verified is in
-*Verification* and `AUDIT.md`.
+*Verification*.
 
 **Server lifecycle, timeouts, hooks (Go `net/http` parity, the S2 survey's R1, R2, R5).**
 - *Graceful lifecycle:* `shutdownGraceful(timeout_ms)`, `close`, `isDraining`, `setKeepAlivesEnabled`,
@@ -196,10 +194,10 @@ What each feature is and the decisions behind it. When each landed is in `CHANGE
   decided when the head is written, as Go does.
 - *Timeouts:* `read_header_timeout_ms`, `idle_timeout_ms`, `response_timeout_ms` are ABSOLUTE phase deadlines (a
   peer dribbling one byte per period defeats an inactivity timer); `Request.setReadDeadline` / `setWriteDeadline`
-  (Go `ResponseController`). The connection's phase (idle → head → body) lives in `TimeoutReader`, moved by
-  `StreamOptions.deadlines`. `request_timeout_ms` starts at the request's first byte, as Go's `ReadTimeout`.
+  (Go `ResponseController`). The connection's phase (idle → head → body) lives in `TimeoutReader`, moved through
+  `StreamOptions.control` (`ConnControl`, whose `tr` is the connection's `TimeoutReader`). `request_timeout_ms` starts at the request's first byte, as Go's `ReadTimeout`.
 - *`on_error`* (Go `ErrorLog`) on `Options`/`StreamOptions`/`h2_server.Options`, `ErrorKind` {handler_failed,
-  request_refused, server_failed, accept_failed}; fired through one `noinline` call so the serving frame stays
+  request_refused, server_failed, accept_failed, timed_out} (`timed_out` from `reportTimeout`); fired through one `noinline` call so the serving frame stays
   inside its stack budget.
 - *Connection summary:* `Options.on_conn_closed(ctx, ConnSummary{peer, requests, duration_ns, end, timeout_phase})`,
   `ConnEnd = normal | timed_out | errored | refused`, fired once per admitted connection from `connMain` after
@@ -221,7 +219,8 @@ What each feature is and the decisions behind it. When each landed is in `CHANGE
   multipart, missing boundary) are errors, not Go's half-filled form; no temp files (the whole multipart body
   must fit `max_multipart_bytes`); a `;` stays a byte and quoted-printable parts are not decoded.
 - *Every method token reaches the handler:* `Method` has `.connect`, `.trace`, `.other` (`Request.method_token` /
-  `methodName()`), `Method.fromToken`; no 501 for an unknown method on h1 or h2. h1 CONNECT is authority-form
+  `methodName()`), `Method.fromToken`; no 501 for an unknown method on h1 or h2. The exception is h2 CONNECT, answered 501 per stream
+  before a handler runs (*Backlog*: h2 CONNECT). h1 CONNECT is authority-form
   (RFC 9112 §3.2.3, `*` refused), needs no Host, `req.path` empty; `ResponseWriter.tunnel(2xx)` answers without
   framing (RFC 9110 §9.3.6) and hands the connection over through `Request.upgraded`. Client:
   `RequestOptions.method_token` for `.other` (a 301-303 rewrites it to GET, as Go), `.connect` refused. The
@@ -249,7 +248,9 @@ What each feature is and the decisions behind it. When each landed is in `CHANGE
   `sniff.detectContentType` (Go `DetectContentType`; WHATWG MIME Sniffing tables, clean-room from the standard),
   `serveContent` (Go `ServeContent` for an in-memory representation: `conditional` + `range` + `sniff`, with a
   range set bounded by the representation's size), `CrossOriginProtection` (Go 1.25; bypass patterns are a
-  predicate, routing being `router`'s).
+  predicate, routing being `router`'s). Trusted-origin validation is Go's `AddTrustedOrigin` (scheme and host, no
+  path/query/fragment; user info passes), and an `Origin` is compared by the host Go's `url.Parse` gives it, with
+  percent-escapes decoded (`src/crossorigin.zig`).
 - *URL components:* `http.url` — `param`/`paramRaw` (first match, keys compared decoded, `+` → space),
   `QueryIterator`, `decodeComponent`, and a strict `decodePath` that refuses a decoded `/` or NUL and any
   malformed escape, so an encoded separator can never reach a router. A malformed escape is refused in a query
@@ -519,8 +520,8 @@ under *Anchoring*.
 - **Constant time:** n/a on the card (an HTTP codec; credentials pass through). The h1 field-value check is
   vector/SWAR (no table indexed by header bytes) and the HPACK encoder never indexes or Huffman-codes credentials
   (*Threat model*).
-- **Audit:** the card's `**Audit:**` line is the current, cumulative score; the review and mutation record — every
-  run, the equivalent-mutant arguments, the defects found and fixed — is [`AUDIT.md`](AUDIT.md).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it; the grade line names what still caps it.
 
 ## Hardening: ReleaseSafe vs ReleaseFast for the exposed binary (HD7)
 This module's entire job is turning fully attacker-controlled bytes (request line, headers, chunked
@@ -529,14 +530,13 @@ handler sees them. **Recommendation: build the internet-facing binary `ReleaseSa
 `ReleaseFast`.** ReleaseSafe keeps bounds/overflow/UB checks live, so a parser bug that would
 otherwise be silent, exploitable undefined behavior in `ReleaseFast` instead becomes a controlled
 panic — a crash-and-restart under a process supervisor, not a memory-safety break. The fuzz harnesses
-above (this module, `jwt`, `x509`) are the safety net that makes this a defense-in-depth choice rather
-than a crutch: they already prove "no panic on arbitrary input" for every *fuzzed* code path in both
-Debug and ReleaseFast, so ReleaseSafe's checks are there for what fuzzing has NOT reached yet
+above (the `HTTP_FUZZ` driver; the certificate and token parsers an HTTPS/JWT stack adds have their own,
+`X509_FUZZ` and `JWT_FUZZ`) are the safety net that makes this a defense-in-depth choice rather than a
+crutch: they show "no panic on arbitrary input" for every *fuzzed* code path, so ReleaseSafe's checks are there for what fuzzing has NOT reached yet
 (untested branches, and the explicitly deferred `std`-parser call sites above) — not a substitute for
 fuzzing, and not the other way around. If a deployment genuinely needs `ReleaseFast`'s throughput for
-this binary, treat a `-Doptimize=ReleaseSafe` fuzz/CI lane (`zig build test-http --fuzz`, ditto
-`test-jwt`/`test-x509`) as a *mandatory*, continuously-running gate on that decision, not an optional
-extra — the perf gap being traded away is small next to what a missed bounds check costs on a
+this binary, treat a ReleaseSafe run of the deterministic fuzz drivers (`HTTP_FUZZ`, and `X509_FUZZ`/`JWT_FUZZ`
+where those modules are linked) as a *mandatory* gate on that decision, not an optional extra — the perf gap being traded away is small next to what a missed bounds check costs on a
 directly-exposed parser.
 
 ## Performance
