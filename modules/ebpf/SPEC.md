@@ -71,7 +71,7 @@ criteria are:
    return-value note in `programs.zig` — an unenforced ABI convention, not
    a verifier check).
 
-Since `object.zig` landed there is also a **conventional** untrusted-input
+`object.zig` also has a **conventional** untrusted-input
 surface: a `.o` handed to `openFile`/`open` is arbitrary bytes. Every count
 read out of it (`e_shnum`, `sh_size`, `sh_entsize`, a symbol index, a
 relocation's `r_offset`, a `DATASEC`'s `vlen`) is bounded before use, a
@@ -99,8 +99,7 @@ eBPF: the golden vector doesn't come from a spec document (there is no eBPF
 "RFC"), it comes from a REFERENCE COMPILER — clang's BPF backend, whose
 output the real in-kernel verifier is known to accept for equivalent C.
 
-To obtain a golden vector for one of the three programs once its builder is
-implemented:
+To obtain (or regenerate) a golden vector for one of the three programs:
 
 1. Write the equivalent program in C using the same helper calls the Zig
    builder targets, e.g. for `kprobe-counter`:
@@ -132,14 +131,11 @@ implemented:
    module's own gated tests.
 5. Paste the transcribed instructions into `programs.zig`'s
    `golden_kprobe_counter`/`golden_xdp_filter`/`golden_ringbuf_emit`
-   placeholder constants and un-skip the corresponding
-   `test "golden: ..."` (remove the `return error.SkipZigTest;` and call the
-   now-implemented builder for the comparison — see each test's inline
-   comment for the exact replacement body). From then on, `zig build
-   test-ebpf` catches any REGRESSION in the encoder's output byte-for-byte,
-   without needing `CAP_BPF` in CI — only obtaining the vector the first
-   time needs a privileged/kernel environment; verifying it thereafter does
-   not.
+   constants; the `test "golden: ..."` next to each compares the builder's
+   output with them. From then on, `zig build test-ebpf` catches any
+   REGRESSION in the encoder's output byte-for-byte, without needing
+   `CAP_BPF` in CI — only obtaining the vector the first time needs a
+   privileged/kernel environment; verifying it thereafter does not.
 
 Note the two validation questions this answers are DIFFERENT and both
 matter: the golden-byte test proves the Zig encoder is DETERMINISTIC and
@@ -619,7 +615,7 @@ field offsets.
 
 `object.zig`. A `clang -target bpf` object is a relocatable ELF64
 (`ET_REL`, `EM_BPF`, no program headers) whose meaning is entirely in
-**section names** — which is why `elfsym.zig` grew `e_shstrndx` handling and
+**section names** — which is why `elfsym.zig` has `e_shstrndx` handling and
 an in-memory `Image`; the uprobe path it was originally written for walks
 section *types* and never needed a name.
 
@@ -705,9 +701,14 @@ Every one is a typed error naming the symbol or section:
 `error.UnknownProgramSection` (an executable section matching no prefix —
 `load` refuses unless `ignore_unknown_sections`).
 
-## Validation layering (privilege-aware)
+## Verification
 
-Two layers, deliberately split so a CI run without `CAP_BPF` still asserts
+Run: `scripts/modtest ebpf` (the unprivileged layer; `zig build test-ebpf`) and `scripts/vm/run.sh ebpf debian` (the
+privileged layer, see below). Fuzz: the deterministic driver `EBPF_FUZZ=<runs>[,<first seed>]` runs six harnesses
+(`ebpf-elf`, `ebpf-btf`, `ebpf-btfext`, `ebpf-ringbuf`, `ebpf-object`, `ebpf-config-shift`) from seeds in the ordinary test
+binary; `zig build --fuzz` is not used.
+
+Validation is layered by privilege. Two layers, deliberately split so a CI run without `CAP_BPF` still asserts
 something real:
 
 1. **Unprivileged, always run.** The exact bytes and struct fields each path
@@ -829,8 +830,7 @@ something real:
    legacy path; a **raw tracepoint** on `sys_enter`; a **perf buffer** across
    every online CPU fed by a tracepoint program; and cgroup attach via both
    `BPF_PROG_ATTACH` and `BPF_LINK_CREATE`, including `BPF_LINK_UPDATE`
-   (plain and `BPF_F_REPLACE`) and `BPF_LINK_GET_FD_BY_ID`. Since BTF
-   landed, also: `BPF_BTF_LOAD` of a blob this module's `Builder` produced
+   (plain and `BPF_F_REPLACE`) and `BPF_LINK_GET_FD_BY_ID`. Also: `BPF_BTF_LOAD` of a blob this module's `Builder` produced
    (plus a deliberately invalid one the kernel must reject), an **`fentry`
    program loaded with a resolved `attach_btf_id` and attached by name**
    (asserting the link reports `LinkType.tracing` and that the id the attach
@@ -839,20 +839,13 @@ something real:
    set — see `testkit`) and returns `error.SkipZigTest` when the capability
    is missing, mirroring the `opcua` module's podman-gated live tests — a
    sandboxed run can never be mistaken for "verified", but it also never
-   fails for lack of privilege. **This is load-bearing, not cosmetic**: an
-   audit of this module (2026-08-05) found every one of these guards
-   written as `catch { print SKIPPED; return; }` — a bare `return`, which
-   reports as a PASS in `zig build test`'s summary, not a skip. On a normal
-   host that meant the entire privileged surface (kprobe/uprobe/tracepoint/
-   raw-tracepoint/cgroup attach, BTF load, fentry/tp_btf) could silently
-   never execute a single kernel syscall while `zig build test-ebpf`
-   reported all-green — exactly the "skip that looks like coverage"
-   failure mode this repo has been burned by before. Fixed to
-   `catch { return testkit.skip(...); }` (or the equivalent explicit
-   `return error.SkipZigTest;`) throughout: **on this dev host (no
-   CAP_BPF), `scripts/lib/capped zig build test-ebpf` now reports "N skipped"
-   in the summary line** — currently 21 of 149 — instead of hiding them
-   inside the pass count. See "How to tell whether the privileged lane
+   fails for lack of privilege. **This is load-bearing, not cosmetic**: a guard written as
+   `catch { print SKIPPED; return; }` is a bare `return`, which reports as a PASS in `zig build test`'s
+   summary, so the entire privileged surface (kprobe/uprobe/tracepoint/raw-tracepoint/cgroup attach, BTF load,
+   fentry/tp_btf) could silently never execute a kernel syscall while the run reported all-green. Every guard is
+   therefore `return testkit.skip(...)` or `return error.SkipZigTest;`, and on a host without CAP_BPF
+   `scripts/lib/capped zig build test-ebpf` reports "N skipped" in the summary line instead of hiding them inside the
+   pass count. See "How to tell whether the privileged lane
    actually ran" below for the authoritative way to confirm real kernel
    execution. Note that `unshare -r` is NOT sufficient: `geteuid() == 0`
    inside a user namespace is not `CAP_BPF` in the init user namespace, so
@@ -865,7 +858,7 @@ something real:
 line ending in `N passed; M skipped; K failed` (the VM lane) or
 `X/Y tests passed (M skipped)` (the plain build summary). **M is the
 number that matters** — every CAP_BPF/CAP_PERFMON-gated test in this
-module now returns `error.SkipZigTest` rather than a silent pass when it
+module returns `error.SkipZigTest` rather than a silent pass when it
 cannot reach the kernel, so M > 0 on an ordinary dev host is expected and
 correct, not a problem to chase away. Set `ZIG_LIBS_VERBOSE_SKIP=1` to get
 a `SKIPPED: ...` line naming exactly which precondition was missing for
@@ -874,10 +867,8 @@ each one (`testkit.verboseSkip`/`testkit.skip`).
 The only environment that runs this module's privileged surface for real
 is `scripts/vm/run.sh ebpf` (`scripts/vm/README.md`'s routing table routes
 `ebpf` to the Debian guest, which boots as real root with a real kernel —
-verified end-to-end 2026-08-05: 147/149 passed, 2 skipped for genuine
-environmental reasons unrelated to privilege — no BTF kernel module
-loadable for the split-BTF test, and the perfbuf CPU-array test's own
-gate — 0 failed). A bare `zig build test-ebpf` on a normal workstation
+its skips are environmental, unrelated to
+privilege: no BTF kernel module loadable for the split-BTF test, and the perfbuf CPU-array test's own gate). A bare `zig build test-ebpf` on a normal workstation
 will never exercise `BPF_PROG_LOAD`'s real verifier accept/reject path;
 only the VM lane does, and only its own run's `M skipped` count (not the
 workstation's) is evidence the verifier ran.
@@ -890,131 +881,93 @@ parsing vmlinux and resolving an `attach_btf_id` need no capability at all —
 which is why the BTF tests are in the unprivileged layer and only the
 attach that follows them is gated.
 
-### Audit 2026-11-18 (whole-module mutation)
+### What the mutation score cannot see
 
-1233 mutants over every non-test file (`elfsym`, `object`, `btf`, `btfext`, `ringbuf`, `perfbuf`, `programs`, `bpflink`, `tracing`, `attach`; `root.zig` and `load.zig` only re-export / forward and were not mutated), one schemata build per round, baseline first. Round 1 (the suite as it stood): 675 killed + 4 hung, 554 survived. Four rounds of new tests (about 55, in the files they test: ELF header / section / segment boundaries and every `Elf64_Shdr` field, `entryOffset`, symbol-table selection and filters; BTF parse boundaries, split-BTF string offsets, `max_type`, every accessor, the `findMember` depth and visit budget, `validateReferences`; `.BTF.ext` iterator / header edges, the local spec walk, `matchFieldSpec`, `fieldGeometry`; a hand-assembled relocatable-object builder (`ObjB`) driving section classification, function splitting, legacy and BTF-defined maps, relocation refusals, data-section addends, `relocateProgram`, `patchCoreInsn`, `applyCoreRelos`, `fixupDatasecs`, `.BTF.ext` slicing and the privilege-free refusals in `load`; ring / perf buffer framing edges and `PerfBuffer`; handle `detach`; tracepoint names; builder budgets) left 1096 killed (5 by hang), 57 EQUIVALENT and 80 UNOBSERVABLE. The card counts UNOBSERVABLE as equivalent (137 eq).
+The card's equivalent count includes mutants the unprivileged suite cannot observe: arguments of kernel calls it cannot
+see without `CAP_BPF` or perf privilege (`BPF_LINK_CREATE` / `BPF_PROG_ATTACH` / `BPF_MAP_CREATE` argument composition,
+the `perf_event_open` pid/cpu/flags, the ring-buffer mmap layout and `BPF_OBJ_GET_INFO_BY_FD`, the xdp netlink mode bits
+and the errno-to-error mapping of the privileged calls), file-size ceilings (64 MiB string table, 256 MiB blob), `fd == 0`
+guards, and bitfield-of-array members clang never emits. The privileged lane (the `LIVE:` tests) is where they belong.
 
-- **UNOBSERVABLE (80).** Arguments of kernel calls the suite cannot see without `CAP_BPF` or perf privilege (`BPF_LINK_CREATE` / `BPF_PROG_ATTACH` / `BPF_MAP_CREATE` argument composition, the `perf_event_open` pid/cpu/flags, the ring-buffer mmap layout and `BPF_OBJ_GET_INFO_BY_FD`, the xdp netlink mode bits and the errno-to-error mapping of the privileged calls), file-size ceilings (64 MiB string table, 256 MiB blob), `fd == 0` guards, and bitfield-of-array members clang never emits. The privileged lane (`LIVE:` tests) is where they belong.
-- **EQUIVALENT (57).** A later check returns the same error (`btfmaps` guards, `parse` truncated header, ring / perf partial header), `strings[len..]` is a valid empty slice, a power-of-two 8-aligned ring never splits a header word, record sizes are multiples of 8, no two `section_defs` prefixes of equal length can both match, and one inert mutant (the generator anchored a comment).
-- **Last round.** The `Builder.addComposite` survivor was the test's own choice of bit offset: `0x1000000` is already a bit of `3 << 24`, so OR-ing it changed nothing (now `0x4000000`). `shoff == 0` with `e_shentsize == 0` and `hdr_len < 24` with a layout that parses once shifted each got a test.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-## Backlog / deliberately out of scope
+## What is deliberately not done
 
-Implemented since the first cut (moved out of this list): the perf-buffer
-consumer, uprobe/uretprobe, tracepoint, raw tracepoint,
-`BPF_LINK_CREATE`/`_UPDATE`/`_DETACH`/`_GET_FD_BY_ID`/`_GET_NEXT_ID`, and —
-most recently — **BTF**: the parser (`btf.zig`), kernel and split module
-BTF, `attach_btf_id` resolution, attach-by-name for
-`fentry`/`fexit`/`fmod_ret`/`tp_btf`/LSM (`tracing.zig`), `BPF_BTF_LOAD`
-plus the extended `BPF_PROG_LOAD` carrying `prog_btf_fd`/`func_info`/
-`line_info`, and the field-offset slice of CO-RE (`btfext.zig`).
+- **A name index over kernel BTF.** `findByNameKind` is a linear scan of ~170 000 types. One lookup is microseconds;
+  thousands would want a hash built once. Not built: it would allocate proportional to the blob for every caller,
+  including those doing a single attach.
+- **32-bit and cross-endian ELF** in `elfsym`: refused with `error.UnsupportedElf` rather than mis-parsed. A uprobe is
+  registered against a file the host can execute, so a foreign-class object is a caller mistake.
+- **Symbol demangling and DWARF line lookup**: `elfsym` resolves names as they appear in the symbol table; probing
+  "file:line" or a C++ source name needs debug info this module does not read.
+- **AUX/ITRACE perf areas**: the perf-buffer consumer reads the data area only; `aux_head`/`aux_tail` (Intel PT and
+  friends) are a different consumer entirely.
+- **A fourth *program* builder**: the builder surface is exactly `kprobe-counter` / `xdp-filter` / `ringbuf-emit`;
+  tc/classifier programs remain additive rather than a redesign. The live perf-buffer test's `bpf_perf_event_output`
+  producer is test-local for the same reason: a public builder would need its own clang-derived golden vector.
 
-Implemented since then (also moved out of this list): **BPF-object ELF
-loading** (`object.zig` + `elfsym.Image`), **BTF-typed map definitions**,
-and **CO-RE instruction patching**.
+## Backlog / deferred
 
-Still deferred, honestly:
+The object loader's gaps (CO-RE kinds, sub-program calls, externs, map-in-map, pinning) are typed errors naming the
+symbol, never a mis-load; the attach and API gaps are simply absent.
 
-- **The rest of CO-RE** — multi-candidate matching and ambiguity detection,
-  and the non-field relocation kinds. See the "CO-RE: what is implemented,
-  and what is not" section above for the exact line; the container, the
-  field-offset relocation and the instruction patching ARE done, the rest is
-  not, and `error.UnsupportedReloKind` is how a caller finds out rather than
-  getting a wrong number.
-- **Sub-program (`.text`) call linking.** A program calling a non-inlined
-  helper function of its own compiles to an `R_BPF_64_32` call relocation
-  into `.text`; loading it means concatenating the callee's instructions
-  onto the caller's, fixing the call's relative offset, merging
-  `func_info`/`line_info` and re-running the callee's own relocations.
-  Refused with `error.SubprogramCallsUnsupported` — never emitted broken.
-- **kfuncs / externs / ksyms.** An `SHN_UNDEF` symbol is
-  `error.ExternSymbolUnsupported`. Real support needs `BPF_PSEUDO_KFUNC_CALL`
-  with the kfunc's BTF id resolved out of vmlinux (and out of module BTF,
-  which the split-BTF parser can already read) plus an `fd_array` of module
-  BTF fds, and — for extern variables — a synthesized `.kconfig` map.
-- **Map-in-map and `prog_array` population** (a `values` member in a `.maps`
-  struct): `error.MapInMapUnsupported`. Needs a two-phase create (inner map
-  first, `inner_map_fd` on the outer) and a post-load
-  `BPF_MAP_UPDATE_ELEM` pass filling the array with fds.
-- **bpffs pinning** (`__uint(pinning, LIBBPF_PIN_BY_NAME)`): parsed and
-  reported, then `error.PinningUnsupported`. Needs `BPF_OBJ_PIN`/`_GET` and
-  a pin-path policy.
-- **`mmap`-able global-data maps and a generated skeleton.** libbpf sets
-  `BPF_F_MMAPABLE` on internal maps and hands userspace a struct pointer
-  into them; here they are ordinary arrays seeded through
-  `BPF_MAP_UPDATE_ELEM`, so a caller sets `const volatile` config by
-  editing `MapSpec.initial_data` before `load`, not by writing through a
-  mapped struct.
-- **`struct_ops` maps** — the section is classified, but populating a
-  `struct_ops` value (function pointers resolved to program fds) is not
-  implemented.
-- **`.BTF` sanitization for older kernels.** libbpf downgrades `FLOAT`,
-  `DECL_TAG`, `TYPE_TAG`, `ENUM64` etc. when the running kernel's BTF
-  verifier predates them. Here `BPF_BTF_LOAD` simply fails and
-  `LoadOptions.load_btf = false` is the escape hatch.
-- **`BPF_BTF_GET_FD_BY_ID` / `BPF_BTF_GET_NEXT_ID`** — reading back the BTF
-  a loaded program or map carries (what `bpftool btf dump id N` does).
-  `BPF_BTF_LOAD` is implemented; the retrieval side is not.
-- **A name index over kernel BTF.** `findByNameKind` is a linear scan of
-  ~170 000 types. One lookup is microseconds; thousands would want a hash
-  built once. Deliberately not built (it would allocate proportional to the
-  blob for every caller, including those doing a single attach).
-- **`kprobe_multi` / `uprobe_multi`** (`bpf(BPF_LINK_CREATE)` with the
-  `kprobe_multi`/`uprobe_multi` union arms) — attaching one program to
-  thousands of symbols in a single call, the mechanism behind `retsnoop`'s
-  and `bpftrace`'s fast mass-attach. The attr arms are declared in
-  `bpflink.CreateExtra`; the symbol/address array marshalling and the
-  kallsyms-glob resolution are not.
-- **`tcx` / `netkit` attach** — declared in `CreateExtra` (including the
-  `relative_fd`/`expected_revision` ordering fields) but not driven by an
-  entry point; needs 6.6+/6.7+ and has no consumer here yet.
-- **USDT probe discovery.** `UprobeOptions.ref_ctr_offset` carries the
-  semaphore a USDT probe needs, but finding it means parsing the
-  `.note.stapsdt` ELF notes (provider/name/location/base/semaphore, plus the
-  argument descriptor string) — a separate parser on top of `elfsym`.
-- **32-bit and cross-endian ELF** in `elfsym` — refused with
-  `error.UnsupportedElf` rather than mis-parsed. A uprobe is registered
-  against a file the host can execute, so a foreign-class object is a caller
-  mistake.
-- **Symbol demangling and DWARF line lookup** — `elfsym` resolves names as
-  they appear in the symbol table; probing "file:line" or a C++ source name
-  needs debug info this module does not read.
-- **`bpf(BPF_PROG_QUERY)`** — enumerating what is already attached to a
-  cgroup or interface; useful for a "detach whatever is there" tool.
-  (`bpflink.linkNextId` covers the link half of that question.)
-- **cpumap/devmap attach** (`BPF_XDP_CPUMAP`/`BPF_XDP_DEVMAP` programs
-  attached via map entries rather than to an interface).
-- **AUX/ITRACE perf areas** — the perf-buffer consumer reads the data area
-  only; `aux_head`/`aux_tail` (Intel PT and friends) are a different
-  consumer entirely.
-- A fourth *program* kind was intentionally NOT added, to keep the builder
-  surface to exactly `kprobe-counter` / `xdp-filter` / `ringbuf-emit`. (BTF/CO-RE
-  and ELF loading, once listed here as out of scope, have since landed as
-  `btf.zig`/`btfext.zig` and `object.zig`/`load.zig`; tc/classifier programs
-  remain additive rather than a redesign.) The live
-  perf-buffer test's `bpf_perf_event_output` producer is deliberately
-  test-local for the same reason: a public builder would need its own
-  clang-derived golden vector.
+- **The rest of CO-RE**: multi-candidate matching and ambiguity detection, and the non-field relocation kinds. See "CO-RE:
+  what is implemented, and what is not" above for the exact line; `error.UnsupportedReloKind` is how a caller finds out
+  rather than getting a wrong number.
+- **Sub-program (`.text`) call linking.** A program calling a non-inlined helper function of its own compiles to an
+  `R_BPF_64_32` call relocation into `.text`; loading it means concatenating the callee's instructions onto the caller's,
+  fixing the call's relative offset, merging `func_info`/`line_info` and re-running the callee's own relocations. Refused
+  with `error.SubprogramCallsUnsupported`.
+- **kfuncs / externs / ksyms.** An `SHN_UNDEF` symbol is `error.ExternSymbolUnsupported`. Real support needs
+  `BPF_PSEUDO_KFUNC_CALL` with the kfunc's BTF id resolved out of vmlinux (and out of module BTF, which the split-BTF
+  parser can already read) plus an `fd_array` of module BTF fds, and, for extern variables, a synthesized `.kconfig` map.
+- **Map-in-map and `prog_array` population** (a `values` member in a `.maps` struct): `error.MapInMapUnsupported`. Needs a
+  two-phase create (inner map first, `inner_map_fd` on the outer) and a post-load `BPF_MAP_UPDATE_ELEM` pass filling the
+  array with fds.
+- **bpffs pinning** (`__uint(pinning, LIBBPF_PIN_BY_NAME)`): parsed and reported, then `error.PinningUnsupported`. Needs
+  `BPF_OBJ_PIN`/`_GET` and a pin-path policy.
+- **`mmap`-able global-data maps and a generated skeleton.** libbpf sets `BPF_F_MMAPABLE` on internal maps and hands
+  userspace a struct pointer into them; here they are ordinary arrays seeded through `BPF_MAP_UPDATE_ELEM`, so a caller
+  sets `const volatile` config by editing `MapSpec.initial_data` before `load`, not by writing through a mapped struct.
+- **`struct_ops` maps**: the section is classified, but populating a `struct_ops` value (function pointers resolved to
+  program fds) is not implemented.
+- **`.BTF` sanitization for older kernels.** libbpf downgrades `FLOAT`, `DECL_TAG`, `TYPE_TAG`, `ENUM64` etc. when the
+  running kernel's BTF verifier predates them. Here `BPF_BTF_LOAD` simply fails and `LoadOptions.load_btf = false` is the
+  escape hatch.
+- **`BPF_BTF_GET_FD_BY_ID` / `BPF_BTF_GET_NEXT_ID`**: reading back the BTF a loaded program or map carries (what
+  `bpftool btf dump id N` does). `BPF_BTF_LOAD` is implemented; the retrieval side is not.
+- **`kprobe_multi` / `uprobe_multi`** (`bpf(BPF_LINK_CREATE)` with the `kprobe_multi`/`uprobe_multi` union arms):
+  attaching one program to thousands of symbols in a single call. The attr arms are declared in `bpflink.CreateExtra`; the
+  symbol/address array marshalling and the kallsyms-glob resolution are not.
+- **`tcx` / `netkit` attach**: declared in `CreateExtra` (including the `relative_fd`/`expected_revision` ordering fields)
+  but not driven by an entry point; needs 6.6+/6.7+ and has no consumer here yet.
+- **USDT probe discovery.** `UprobeOptions.ref_ctr_offset` carries the semaphore a USDT probe needs, but finding it means
+  parsing the `.note.stapsdt` ELF notes (provider/name/location/base/semaphore, plus the argument descriptor string), a
+  separate parser on top of `elfsym`.
+- **`bpf(BPF_PROG_QUERY)`**: enumerating what is already attached to a cgroup or interface; useful for a "detach whatever
+  is there" tool. (`bpflink.linkNextId` covers the link half of that question.)
+- **cpumap/devmap attach** (`BPF_XDP_CPUMAP`/`BPF_XDP_DEVMAP` programs attached via map entries rather than to an
+  interface).
+- **Typed map wrapper**: std has fd-based lookup/update/delete/next-key only; batch operations (`BPF_MAP_*_BATCH`) and
+  per-CPU value stride handling are absent.
 
-### Survey findings (survey 2026-09-30)
+### Priority order
 
-Ranked by how soon a libbpf/cilium-ebpf user meets the gap. The detailed bullets above stay
-authoritative for effort. All fit CONVENTIONS §2 (pure Zig, no libc).
+Ranked by how soon a libbpf/cilium-ebpf user meets the gap. The detailed bullets above stay authoritative for effort. All
+fit CONVENTIONS §2 (pure Zig, no libc).
 
-1. **Sub-program (`.text`) call linking** (survey 2026-09-30) — any C program with a non-inlined helper or a
-   `__noinline` global function (very common in real programs) is refused with `SubprogramCallsUnsupported`.
-   Effort: medium.
-2. **bpffs pinning** (survey 2026-09-30) — pinned maps/programs/links are how a loader hands state to another
-   process; cilium/ebpf and aya both do it. Effort: small-medium (`BPF_OBJ_PIN`/`_GET` plus path policy).
-3. **kfuncs / externs / ksyms / `.kconfig`** (survey 2026-09-30) — modern tracing and networking programs use kfuncs.
-   Effort: large.
-4. **Map-in-map and `prog_array` population** (survey 2026-09-30) — tail calls and per-CPU-config maps. Effort: medium.
-5. **Typed map wrapper** (survey 2026-09-30) — std has fd-based lookup/update/delete/next-key only; batch
-   operations (`BPF_MAP_*_BATCH`) and per-CPU value stride handling are absent. Effort: small-medium.
-6. **`tcx`/`netkit` attach and `BPF_PROG_QUERY`** (survey 2026-09-30) — the tc/classifier program type is not
-   driveable from an object today. Effort: medium.
-7. **Non-field CO-RE relocation kinds and multi-candidate matching** (survey 2026-09-30) — the rest of libbpf's CO-RE. Effort: medium.
-8. **`kprobe_multi`/`uprobe_multi`, USDT discovery, struct_ops, mmap'd global data** (survey 2026-09-30) — see bullets above. Effort: medium each.
+1. **Sub-program (`.text`) call linking**: any C program with a non-inlined helper or a `__noinline` global function (very
+   common in real programs) is refused with `SubprogramCallsUnsupported`. Effort: medium.
+2. **bpffs pinning**: pinned maps/programs/links are how a loader hands state to another process; cilium/ebpf and aya both
+   do it. Effort: small-medium (`BPF_OBJ_PIN`/`_GET` plus path policy).
+3. **kfuncs / externs / ksyms / `.kconfig`**: modern tracing and networking programs use kfuncs. Effort: large.
+4. **Map-in-map and `prog_array` population**: tail calls and per-CPU-config maps. Effort: medium.
+5. **Typed map wrapper**: see the bullet above. Effort: small-medium.
+6. **`tcx`/`netkit` attach and `BPF_PROG_QUERY`**: the tc/classifier program type is not driveable from an object. Effort:
+   medium.
+7. **Non-field CO-RE relocation kinds and multi-candidate matching**: the rest of libbpf's CO-RE. Effort: medium.
+8. **`kprobe_multi`/`uprobe_multi`, USDT discovery, struct_ops, mmap'd global data**: see the bullets above. Effort: medium
+   each.
 
 ## Anchoring
 

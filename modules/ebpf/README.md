@@ -76,12 +76,13 @@ it declares their own program GPL to the verifier. That is the useful default
 (most tracing programs need it), but it is a declaration about your program, so
 set it deliberately.
 
-## Status: complete
+## Components
 
-All parts are implemented — see `modules/ebpf/src/*.zig` doc comments for
-the authoritative, per-function constraint lists and `SPEC.md` for the
-attach lifetime rules, the uprobe offset trap, and both consumers' barrier
-discipline.
+See `modules/ebpf/src/*.zig` doc comments for the authoritative, per-function
+constraint lists and `SPEC.md` for the attach lifetime rules, the uprobe offset
+trap, and both consumers' barrier discipline. What the module does not do yet
+(the rest of CO-RE, sub-program calls, kfuncs/externs, map-in-map, pinning, ...)
+is under *Not provided* below.
 
 | File | Tier | Status |
 |---|---|---|
@@ -346,8 +347,8 @@ matching with `___flavor` suffixes stripped and anonymous-member descent,
 and all six `BPF_CORE_FIELD_*` values including the bitfield load-widening
 that makes `LSHIFT_U64`/`RSHIFT_U64` correct.
 
-**Instruction patching is now real too** (`src/object.zig`): the value is no
-longer merely returned, it is written back into the instruction — the `off`
+**Instruction patching** (`src/object.zig`) writes the value back into the
+instruction — the `off`
 field of an `LDX`/`ST`/`STX`, the `imm` of an `ALU`/`ALU64`, both halves of
 an `LD_IMM64` pair, and for `FIELD_BYTE_SIZE` the **size bits of the
 opcode** itself.
@@ -518,11 +519,11 @@ pointers. This module deliberately does NOT use that route: it would need a
 second compilation unit (a different target triple than the rest of this
 repo) and a per-object build step. The other half of that objection —
 "an ELF object parser to pull the resulting `.text`/maps sections back out,
-plus BTF handling for modern map definitions" — **no longer applies**:
-`src/object.zig` is exactly that loader, so a Zig-source BPF program would
-now only need the second compilation unit, not the loading machinery. Still
-not worth a second target triple for three fixed programs; worth revisiting
-if this module ever needs to generate large or many programs.
+plus BTF handling for modern map definitions" — does not apply: `src/object.zig`
+is exactly that loader, so a Zig-source BPF program would only need the second
+compilation unit, not the loading machinery. Still not worth a second target
+triple for three fixed programs; worth revisiting if this module ever needs to
+generate large or many programs.
 
 ## Design notes
 
@@ -558,8 +559,8 @@ if this module ever needs to generate large or many programs.
   than a dropped cookie.
 - **`elfsym` is a uprobe helper plus a BPF-object reader, not an ELF
   library.** It reads what a probe needs (`.symtab`/`.dynsym` + `PT_LOAD`),
-  and — since the object loader landed — what a relocatable `.o` needs
-  (section names via `e_shstrndx`, symbols, `SHT_REL` entries). It still
+  and what a relocatable `.o` needs
+  (section names via `e_shstrndx`, symbols, `SHT_REL` entries). It
   refuses everything else (32-bit, foreign-endian) rather than guessing.
   There is **one** ELF decoder shared by both, not two: the section-header
   decode and the field-offset constants are the same code.
@@ -586,16 +587,15 @@ if this module ever needs to generate large or many programs.
   error message and for reporting*, and `loadTracing` is the call that
   actually targets the program. Anything else would look like it worked and
   attach nowhere.
-- **Out of scope (deliberate)**: the rest of CO-RE —
-  multi-candidate/ambiguity matching and the non-field relocation kinds (see
-  "How much of CO-RE is real" above; **instruction patching moved OUT of
-  this list**) — plus, inside the object loader, sub-program (`.text`) call
-  linking, kfunc/extern/ksym resolution, `struct_ops` map value population,
-  map-in-map (`values`) initialization, bpffs pinning, and `mmap`-able
-  global-data maps with a generated skeleton struct. Outside it:
-  `kprobe_multi`/`uprobe_multi` mass-attach, USDT `.note.stapsdt` discovery,
-  `tcx`/`netkit` attach entry points, `BPF_PROG_QUERY`, cpumap/devmap
-  attach, perf AUX/ITRACE areas, DWARF/line and symbol demangling, and
-  tc/classifier program builders. Every one of the loader's gaps is a typed
-  error naming the symbol, not a silent mis-load. `SPEC.md`'s backlog
-  section says what each deferred item would actually take.
+
+## Not provided
+
+The rest of CO-RE (multi-candidate matching, the non-field relocation kinds), and in
+the object loader sub-program (`.text`) call linking, kfunc/extern/ksym resolution,
+`struct_ops` values, map-in-map initialization, bpffs pinning and mmap-able
+global-data maps with a skeleton; `kprobe_multi`/`uprobe_multi`, USDT discovery,
+`tcx`/`netkit` entry points, `BPF_PROG_QUERY`, cpumap/devmap attach; perf AUX/ITRACE
+areas, DWARF/line lookup and symbol demangling, and tc/classifier program builders.
+Every one of the loader's gaps is a typed error naming the symbol, not a silent
+mis-load. `SPEC.md` *Backlog / deferred* says what each item would take and *What is
+deliberately not done* why the rest is left out.
