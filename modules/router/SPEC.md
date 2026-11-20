@@ -18,7 +18,8 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: the README's `Provenance:` line (no NOTICE of its own).
 
 ## Compared with
 
@@ -34,7 +35,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [karlseguin/http.zig](https://github.com/karlseguin/http.zig) router | Zig | MIT | 1.6k | no release (push 2026-08-26) | `:param` and `*` routes, per-route middleware lists with a `replace`/`append` strategy, per-route config; welded to httpz's server. |
 | [lalinsky/dusty](https://github.com/lalinsky/dusty) router | Zig | MIT (LICENSE text) | 133 | v0.3.1 (2026-09-21) | "Router with support for parameters and wildcards" *(README)*; welded to dusty. Source not read. |
 
-**Where we are ahead:** method-aware backtracking with a correct `Allow` union on 405 (RFC 9110 §15.5.6; chi/httprouter answer per node *(inferred)*), fallbacks (404/405/auto-OPTIONS/redirect) that run the matching group's middleware, dot-segment posture (`normalize_path`), registration-time refusal of duplicate capture names and empty segments, allocation-free lock-free dispatch, route introspection with docs for `openapi`, and a comptime `Static` table with the same answers (differentially tested); audited (review 2026-09-11, findings F1–F11 fixed). **On par since 2026-10-07:** chi's `{name}` captures, whole and inside a segment (`{name}.{ext}`), a bare `*`, `With` (inline per-route middleware), `Mount` of a built router (with its groups, docs and 404/405 overrides), `Handle` for every method (`any`), sub-router `NotFound`/`MethodNotAllowed` (`Group.not_found`/`method_not_allowed`), host routing (`HostRouter`, chi's separate `hostrouter`). Regexp constraints (`{id:[0-9]+}`, via the sibling `regex` module, RE2 syntax, anchored properly) since 2026-10-07 too. **Where we are behind:** nothing a chi user would notice missing in the router itself; chi's `middleware` package is a separate package whose pieces live in sibling modules (`ratelimit`, `throttle`, `cors`, `requestid`, `accesslog`, `security-headers`, `metrics`, …). Deliberate divergences, documented and pinned by the oracle: no empty capture, whole-literal split, a 405 `Allow` that is the union over candidates.
+
+**Where we are ahead:** method-aware backtracking with a correct `Allow` union on 405 (RFC 9110 §15.5.6; chi/httprouter answer per node *(inferred)*), fallbacks (404/405/auto-OPTIONS/redirect) that run the matching group's middleware, dot-segment posture (`normalize_path`), registration-time refusal of duplicate capture names and empty segments, allocation-free lock-free dispatch, route introspection with docs for `openapi`, and a comptime `Static` table with the same answers (differentially tested); audited (reviews and mutation runs: the card's Audit line). **On par:** chi's `{name}` captures, whole and inside a segment (`{name}.{ext}`), a bare `*`, `With` (inline per-route middleware), `Mount` of a built router (with its groups, docs and 404/405 overrides), `Handle` for every method (`any`), sub-router `NotFound`/`MethodNotAllowed` (`Group.not_found`/`method_not_allowed`), host routing (`HostRouter`, chi's separate `hostrouter`). Regexp constraints (`{id:[0-9]+}`, via the sibling `regex` module, RE2 syntax, anchored properly) too. **Where we are behind:** nothing a chi user would notice missing in the router itself; chi's `middleware` package is a separate package whose pieces live in sibling modules (`ratelimit`, `throttle`, `cors`, `requestid`, `accesslog`, `security-headers`, `metrics`, …). Deliberate divergences, documented and pinned by the oracle: no empty capture, whole-literal split, a 405 `Allow` that is the union over candidates.
 
 ## Design & invariants
 
@@ -43,7 +45,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   — one built `Router` safely serves all of `http.Server`'s connection threads at once. Original
   work of the zig-libs authors (MIT); the trie matcher and middleware chain are clean-room, modeled
   after Go `chi` / `julienschmidt/httprouter` (segment trie, deterministic precedence, 404/405 +
-  `Allow`, trailing-slash redirect) — see NOTICE.
+  `Allow`, trailing-slash redirect) — see the README's `Provenance:` line.
 - **Frozen middleware chains:** outer→inner = registration order (router `use` → group → nested
   group → handler), computed per route at `add` time. `use` after any route has been registered is
   `error.RoutesAlreadyRegistered` (chi's rule, surfaced as a typed error, not a footgun). A fallback
@@ -51,11 +53,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   the middleware chain of whichever group's prefix the request path falls under (`Router.groupFor`,
   cached per group the first time a route anywhere under it registers — see "Fallback middleware
   scoping" below), router-level `use` alone when it falls under none. So `group("/api").use(gate)`
-  wraps every response for `/api`, not only the ones a route actually served (audit findings
-  router-F1/F2: before this, a 405/auto-`OPTIONS`/404 inside a group skipped the group's own
-  middleware entirely, and a trailing-slash redirect skipped the FULL chain including router-level
-  `use` — answered straight from `dispatch`, letting an unauthenticated caller enumerate the route
-  table via the 301-vs-404 difference).
+  wraps every response for `/api`, not only the ones a route actually served; in particular a
+  trailing-slash redirect runs the FULL chain including router-level `use`, so an unauthenticated
+  caller cannot enumerate the route table via the 301-vs-404 difference.
 - **Deterministic precedence:** static > in-segment pattern (`{name}.{ext}`; longer literal prefix, then more literal bytes, then registration order) > `:param`/`{name}` > `*wildcard` per segment, with chi-style
   backtracking (an endpoint-less static prefix falls back to a param sibling). Raw byte matching —
   no percent-decoding, no case folding; `:param` never matches empty, `*wildcard` must be last and
@@ -63,35 +63,49 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Method precedence (`method_precedence`, default `.backtrack`):** when more than one candidate
   produces the same path shape and they serve different methods, the matcher keeps trying siblings
   (static, then `:param`, then `*wildcard`, at every level) until one serves the request's method,
-  instead of committing to the first candidate with ANY endpoint (audit finding router-F5 — before
-  this, registering `POST /users/new` could silently turn a working `GET /users/new` — served by
-  `GET /users/:id` — into a 405, because `new` (static) matches before `:id` (param) regardless of
-  method). `Allow` on a genuine 405 is the union of every candidate the search actually visited
+  instead of committing to the first candidate with ANY endpoint (so registering `POST /users/new`
+  does not turn a working `GET /users/new` — served by `GET /users/:id` — into a 405). `Allow` on a
+  genuine 405 is the union of every candidate the search actually visited
   (RFC 9110 §15.5.6: the header must list every method the *target resource* — the path, not one
   particular trie node — supports), tracked via a per-node method bitset (`Node.allow_bits`) unioned
   at request time; `min_reach` still prunes subtrees that cannot reach ANY endpoint, but not by
-  method, so an adversarial table (`Node.min_reach`'s own doc comment, audit finding router-F4) can
-  make a 405 visit every same-shaped candidate. `method_precedence = .first_match` restores the pre-2026-09-11 behavior (and its
-  performance characteristics) verbatim, including that a root wildcard never backtracks into a
-  node some OTHER method already claimed — see README's two worked examples.
+  method, so an adversarial table (`Node.min_reach`'s own doc comment) can
+  make a 405 visit every same-shaped candidate. `method_precedence = .first_match` restores the
+  earlier first-candidate behavior (and its performance characteristics) verbatim, including that a
+  root wildcard never backtracks into a node some OTHER method already claimed — see README's two
+  worked examples.
 - **Registration-time pattern validation:** a pattern must not reuse the same `:name`/`*name`
-  capture at two different positions (`error.DuplicateParamName` — audit finding router-F8; before
-  this, `/:a/:a` was accepted and `params.get("a")` silently returned only the first value forever)
-  and must not contain an empty segment anywhere but a single trailing one (`error.InvalidPattern`
-  — audit finding router-F11; before this, `//evil.example/x` was accepted, and a trailing-slash
-  redirect under it emitted a protocol-relative `Location` a browser reads as
-  `http://evil.example/x`, an open redirect). A single trailing empty segment — `/x/` — is still the
-  documented, distinct trailing-slash route.
+  capture at two different positions (`error.DuplicateParamName`; otherwise `/:a/:a` would be
+  accepted and `params.get("a")` silently return only the first value) and must not contain an
+  empty segment anywhere but a single trailing one (`error.InvalidPattern`; otherwise
+  `//evil.example/x` would be accepted, and a trailing-slash redirect under it would emit a
+  protocol-relative `Location` a browser reads as `http://evil.example/x`, an open redirect). A
+  pattern deeper than `max_path_segments` is `error.InvalidPattern` too (a compile error in `Static`).
+  A single trailing empty segment — `/x/` — is the documented, distinct trailing-slash route.
 - **Documented edge policies:** HEAD auto-routes to GET when no explicit HEAD exists; 405 sets
   `Allow` (registered methods in `http.Method` order, HEAD implied by GET) before the handler runs;
   trailing slash is `.redirect` (default: 301 GET/HEAD, 308 otherwise, query preserved) or `.strict`
   (404) — `/x` and `/x/` are always independently registrable; auto-`OPTIONS` is opt-in.
 - **Concurrency:** building (`add`/`use`/`group`) is single-owner; a built `Router` is immutable —
-  reentrant. `Ctx.params` is a pointer into the dispatching call's own stack frame (audit finding
-  router-F6, alongside halving `max_params` 16 → 8 — together these roughly halve the per-dispatch
-  stack cost of `Params`/`Ctx`), valid strictly for that call, same as the `[]const u8` values it
-  hands out; `tryRedirect` is `noinline` so its 4 KiB `Location` buffer is no longer part of every
-  dispatch's stack frame regardless of whether a redirect is ever attempted.
+  reentrant. `Ctx.params` is a pointer into the dispatching call's own stack frame, valid strictly
+  for that call, same as the `[]const u8` values it hands out; `max_params` is 8, and
+  `tryRedirect` is `noinline` so its 4 KiB `Location` buffer is not part of every dispatch's stack
+  frame regardless of whether a redirect is ever attempted. The regex VM's stack scratch (~6 KiB)
+  is kept out of the recursive matcher the same way (`constraintHolds` is `noinline`).
+- **One matcher, two trees (speed).** `matchStep` is the single matcher, generic over how a tree
+  stores its nodes: the runtime `Router` uses a heap `Node` with a hash map of static children;
+  `Static` builds the table at compile time and `StaticTree` turns every node into its own
+  function (`matchAt`), so static siblings are an unrolled length + literal compare and absent
+  edges vanish. `Scan` builds a '/' bitmask of the first 64 bytes of the path in one pass
+  (overlapping vector compares, no byte loop) and the segment count, so each level finds its
+  segment end with one `@ctz`. The comptime tree's `Ref` is a node pointer, not an index: a
+  `?u32` came back through memory and caused a store-forwarding stall after every level. The
+  figures are on the card's Performance and Ahead lines (`zig build bench-router`: go-chi/chi, plus
+  `tools/go_fast_bench` and `tools/rust_fast_bench` for the field).
+- **Mounting, `HostRouter`.** `mount` takes a snapshot of a built router (every string and chain is copied; routes added to `sub` afterwards are not served; its groups, docs and 404/405 overrides land on a group, `Group.not_found`/`method_not_allowed`); `sub`'s dispatch-wide settings (`state`, `trailing_slash`, `normalize_path`, `method_precedence`, `auto_options`, `bad_request`) do not travel, this router's apply. `HostRouter` ignores ASCII case, a
+  numeric port and one trailing dot; only a numeric port is cut, so `a.example.com:xyz` and
+  `[::1]evil` match no mapping; `[::1]` keeps its brackets; a malformed `x..example.com` reaches
+  `*.example.com` (a malformed Host lands on the wildcard site, no privilege change).
 
 ## Threat model / out of scope
 
@@ -111,12 +125,10 @@ postures implementable entirely inside `router`, correct for a caller driving `R
 `.remove_dot_segments` (default) recomputes `rawPath(req.target)` and, using `http.Server`'s own
 `checkOriginPath`/`pathHasDotSegments`/`normalizePathInto` (the same building blocks `serveOne`
 itself uses), rewrites `req.path` to the canonical form before matching — redundant work when
-`http.Server` already did this (the result is byte-identical), but no longer a no-op for a direct
-caller, which it silently was before (audit finding router-F3: the option's name and doc promised
-this, `remove_dot_segments => {}` did not deliver it). `.reject_non_canonical` runs the same
+`http.Server` already did this (the result is byte-identical), and the real normalization for a direct
+caller. `.reject_non_canonical` runs the same
 `checkOriginPath`/`pathHasDotSegments` check directly against `rawPath(req.target)` and 400s before
-`matchRec` ever runs when it finds a dot segment — no longer a byte-comparison against `req.path`
-(which, for that same direct caller, started out equal to the raw target and so never fired at all).
+`matchRec` ever runs when it finds a dot segment.
 `.off` overwrites `req.path` with that same raw recomputation before matching, so both the matcher
 and the handler see the un-rewritten bytes. None of this reaches into `http`'s private state — the
 three helpers it calls are already `pub`, used the same way `serveOne` uses them, and it is otherwise
@@ -125,10 +137,12 @@ all a consequence of `req.target`/`req.path` already being two separate, mutable
 
 **Match depth is bounded by this module.** `matchRec` descends one frame per path segment, and
 `max_path_segments` (256) refuses anything deeper — a 404, since nothing that deep is routable.
-The bound used to be inherited from the server's own path-length cap (2 KiB, i.e. ~1024 frames for
-`/a/a/…`): safe on a default stack, but by an argument living in another module, and not applying
-at all to a caller driving `Router` directly, which is a supported use. The regression test goes at
-`matchRec` rather than through the wire for exactly that reason.
+The bound is this module's own rather than inherited from the server's path-length cap (2 KiB, i.e.
+~1024 frames for `/a/a/…`): that argument lives in another module and does not apply at all to a
+caller driving `Router` directly, which is a supported use. The regression test goes at `matchRec`
+rather than through the wire for exactly that reason. The virtual trailing-slash segment the redirect
+probe appends costs no depth, so a legal 256-segment route keeps its redirect (in `Router` and in
+`Static.trailingSlashVariant`).
 
 **Fallback middleware scoping (`Router.groupFor`/`fallbackChain`).** Every `Group` a route is ever
 registered under (directly, or via a nested subgroup) gets its own chain — router-level `use` plus
@@ -141,167 +155,43 @@ of the request path (`"/api"` matches `"/api/x"` and itself, not `"/apix"`) and 
 cached chain, or router-level `use` alone when the path falls under no group. All of this happens at
 registration time, not per request — `dispatch` remains allocation-free and lock-free.
 
+**Residual risks and known edges.**
+- `any` and a failed `mount` are not atomic: a failing registration leaves what was inserted before it registered; treat them as startup failures, like every `add` error.
+- Regex constraint work is not pruned by `min_reach`: linear time, a constant factor.
+- `group("/x/*")` is not refused by `group()`: such a group can never register a route, the error comes at the first `add` (*Backlog / deferred*).
+
 ## Verification
 
-Offline: the full matrix (matching, precedence, backtracking, params, 404/405 + `Allow`,
-HEAD→GET, both trailing-slash policies, middleware order/short-circuit/state, groups, keep-alive)
-driven through the socket-free `http.Server.serveStream`. In-process integration: `http.Server` +
-this router on `127.0.0.1:0`, exercised with the Phase-1 `http.Client` (dispatch, params, middleware
-header, 404/405 + `Allow` over a real TCP connection). Run: `zig build test-router`.
-
-**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 32
-mutants — the origin-form check, both normalizing postures' `checkOriginPath` and dot-segment
-handling, 405/`Allow` in both method postures, auto-OPTIONS, the trailing-slash policy, every
-`tryRedirect` guard (root path, method on both variants, query, 301/308), `groupFor`'s segment
-boundary and deepest choice, the empty param name, both `ParamNameConflict`s, `DuplicateRoute`,
-the `min_reach` distance, HEAD→GET, the F7 capture restore, empty-segment params, the wildcard's
-endpoint and method checks, the leaf `Allow` union, `Params.get`'s name match, HEAD in `Allow`,
-`rawPath` and `segmentsRemaining`. First run: 24 killed, 8 alive; five tests added (a direct
-caller's `%00` path is a 400 in both normalizing postures; no redirect from `/` or toward a
-variant without the method; fallbacks run the deepest group's middleware; a param branch that is
-entered and abandoned drops its capture; `Params.get` matches the whole name); rerun: 31 killed,
-1 equivalent — the first-match wildcard's `bits.count() != 0` (a wildcard node is created only by
-an insert that gives it an endpoint in the same call, so it always has one). Test-quality finding:
-the existing F7 test ("backtracking never leaves a failed param branch's capture") had become
-vacuous when F4's `min_reach` pruning landed — its param branch is pruned by length and never
-entered; the new test reaches it. No code defect found.
-
-**Mutation (2026-10-07,** schemata over a copy, one ReleaseSafe build, the whole suite incl. the
-chi replay) over the code added for chi parity: 35 mutants — the in-segment split (never-empty
-check, literal search start, suffix rule, lead literal, final remainder), the constraint check,
-capture grammar (adjacent captures, constrained whole segment, brace escape, name/constraint
-split, bare `*`), shape conflict and constraint comparison, sibling rank (lead, constrained,
-order), the capture restore on a failed pattern, inline-group fallback scoping and the parent
-walk for overrides, `mount` (override copy ×2, `use` copy, nested-group parent, self-mount,
-root mount, the relative pattern), `any`, `HostRouter` (port, trailing dot, wildcard label,
-longest suffix, `:` outside a literal), `PatternCaptures`, `InvalidConstraint`. First run: 28
-killed, 7 alive; five tests added (a capture starting with its own delimiter, the lead literal
-beating more literal bytes, `\}` in a constraint, a nested group in a mounted router, a Host that
-is the wildcard's suffix itself); rerun: 33 killed, 2 equivalent — the suffix check and the final
-remainder comparison of `matchSegPattern` each cover the other. No code defect found.
-
-**Review (2026-10-07,** an independent adversarial read of the chi-parity code; earlier review
-2026-09-11, findings F1–F11): 0 HIGH, 3 MEDIUM, 4 LOW, 6 INFO. Fixed, each with a test that fails
-on the old code: **M1** — `groupFor` broke a tie on equal prefix length toward the EARLIER group,
-so `api.mount("/", &sub)` (or a mount at an existing group's prefix) never ran the mounted
-router's middleware or overrides on a 404/405/redirect: `GET /api/secret` was answered 301 toward
-`/api/secret/` without the sub's auth — the F2 route-enumeration leak, again. Ties now go to the
-more deeply nested group, then the later one. **M2** — `groupFor` compared the prefix TEXT, so a
-prefix with a capture (`group("/t/:id")`, `mount("/t/{tenant}")`) never scoped a fallback (true
-before today for `:id` too); prefixes now compare segment by segment, a capture taking any
-non-empty segment (a constraint unchecked there: more gating, never less). **M3** — the regex VM
-could be inlined into the recursive `matchIn` (~6 KiB per level); the constraint check and the
-VM entry are `noinline`. **L2** — a pattern deeper than `max_path_segments` was accepted by `add`
-(and an out-of-bounds compile error in `Static`); now `error.InvalidPattern`. **L3** — `HostRouter`
-cut anything after `]` and any `:suffix`: `[::1]evil` and `a.example.com:xyz` routed as `[::1]` and
-`a.example.com`; now only a numeric port is cut and anything else matches no mapping. **L1** (`any`
-not atomic) documented as a startup failure like every `add` error; **L4** (regex work not pruned
-by `min_reach`) accepted — linear time, a constant.
-
-**Mutation + review (2026-10-25,** after the matcher was restructured for speed — `matchStep`
-shared by `RuntimeTree` and the comptime `StaticTree`, `Scan`): 249 schemata mutants (238 at run
-time over one ReleaseSafe build: `Scan`, `matchStep`, the accessors, `Static`, dispatch, `groupFor`,
-`tryRedirect`, registration, mount/with, `HostRouter`, the pattern grammar; 11 comptime mutants of
-`buildStatic` in a second binary). First run 183/238 killed; 11 tests added; rerun: 227 killed, 21
-equivalent, 1 mutant dropped as
-inert (its construction never applied it). Finding (LOW, fixed): the `extra` virtual
-trailing-slash segment was charged one level of `max_path_segments`, so a legal 256-segment route
-lost its redirect in `Router` and in `Static.trailingSlashVariant` (test "extra: the virtual
-trailing-slash segment costs no depth …"). New differential: `Static` against `Router` on paths
-around and past the 64-byte `Scan` window (6000 paths × 5 methods × 2 postures). Note, not
-changed: `prefixCovers`' wildcard branch is dead (a group with a wildcard prefix can never
-register a route) — Backlog.
-
-**Mutation (2026-11-07,** whole module after `http.Server.normalizePathInto` became an error union; schemata over a copy, ReleaseSafe, the whole suite): 389 mutants over `root.zig` 141–2470, 355 killed, 34 equivalent, none undecided. 15 new tests (direct-caller targets, `groupFor` rank, mount 404/405 inheritance, `HostRouter.map` refusals and wildcard order, OOM sweep over constraint compile, 256-segment depth bound, hostile targets and captures). Equivalents: the `normalizePathInto` error arm is unreachable (`checkOriginPath` caps at 2048 = `normalize_buf_len`); `groupFor` ties cannot occur (unique `g.index`); `validatePattern` repeats `addRoute`/`insert` checks; `min_reach` only prunes and `Scan` only accelerates (neither moves a slash or a match); `matchSegPattern` remainder checks covered by the next line. `buildStatic` (comptime) not re-mutated: its source is unchanged since the 2026-10-28 run killed its 11 comptime mutants. INFO, no change: `HostRouter.routerFor` lets `x..example.com` reach `*.example.com` (a malformed Host lands on the wildcard site, no privilege change); `Node.hasEndpoint` is dead code.
-
-**Fuzz (2026-10-07):** `src/fuzz_test.zig` — random route tables (static, `:p`/`{p}`, in-segment
-shapes, constraints, wildcards, trailing slashes) registered directly, via a group, an inline group
-and a mounted sub-router, and requests through `serveStream`; oracles: allowed statuses only, the
-matched pattern with its captures substituted rebuilds the request path exactly, no empty capture
-but a wildcard's, constraints hold, a 405's `Allow` never names the request's method, a redirect is
-the slash variant. Deterministic driver (`ROUTER_FUZZ`, testkit): 200,000 runs clean, every label
-reached (routed, 404, 405, redirect, constrained, mounted, grouped). Planted mutants: caught — a
-dropped literal check, a skipped constraint, a stale capture, an empty capture; not seen (no
-completeness reference) — a missed match, which the unit tests and the chi oracle kill.
+- **Run:** `scripts/modtest router` (`zig build test-router`).
+- **Offline matrix:** matching, precedence, backtracking, params, 404/405 + `Allow`, HEAD→GET, both trailing-slash policies, middleware order/short-circuit/state, groups, keep-alive, driven through the socket-free `http.Server.serveStream`. In-process integration: `http.Server` + this router on `127.0.0.1:0` with the `http.Client` (dispatch, params, middleware header, 404/405 + `Allow` over a real TCP connection).
+- **Targeted regressions:** a direct caller's `%00` path is a 400 in both normalizing postures; no redirect from `/` or toward a variant without the method; fallbacks run the deepest group's middleware (also for a mount at an existing group's prefix, and for a group prefix with a capture); a param branch entered and abandoned drops its capture; `Params.get` matches the whole name; a capture starting with its own delimiter; the lead literal beating more literal bytes; `\}` in a constraint; a nested group in a mounted router; a Host that is the wildcard's suffix itself; OOM sweep over constraint compile; the 256-segment depth bound; hostile targets and captures; the virtual trailing-slash segment costing no depth.
+- **Oracle (go-chi/chi v5.3.2):** `tools/go_chi_oracle` (black box through chi's public API, pinned by go.mod/go.sum) produces `src/chi_vectors.zig`; `src/chi_oracle_test.zig` replays seeded route tables and requests (regexp constraints included): status, matched pattern and every capture as chi answers (chi's `RoutePattern()` drops a trailing slash; that alone is normalized), chi's 405 `Allow` a subset of ours. The generated requests stay in the domain where both semantics coincide; the documented divergences (EMPTY: chi accepts an empty capture; SPLIT: chi ends a capture at the first byte of the next literal; ANCHOR: chi's pasted `^…$` splits a top-level alternation) are a crafted table whose answers are pinned both ways. The vectors are re-taken by `zig build interop-router [-- --check]` and the interop lane runs it with `--check` (it ignores only the `// GENERATED …` line); no Go at test time. Still self-graded: the composition layer (`group`/`with`/`mount`, fallback scoping, `HostRouter`) and `Static`, which the differential test holds to `Router`.
+- **`Static` vs `Router`:** a differential test over generated tables and over paths around and past the 64-byte `Scan` window, for several methods and postures.
+- **Fuzz:** `src/fuzz_test.zig`, deterministic driver `ROUTER_FUZZ=<runs>[,<seed>]` (testkit). Random route tables (static, `:p`/`{p}`, in-segment shapes, constraints, wildcards, trailing slashes) registered directly, via a group, an inline group and a mounted sub-router, requests through `serveStream`; oracles: allowed statuses only, the matched pattern with its captures substituted rebuilds the request path exactly, no empty capture but a wildcard's, constraints hold, a 405's `Allow` never names the request's method, a redirect is the slash variant. It has no completeness reference, so a missed match is killed by the unit tests and the chi oracle instead.
+- **ctgrind:** n/a, HTTP routing.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-router`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions): ref 0.19–0.55×, against 0.17–0.54× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+The bench is `zig build bench-router` (`tools/bench.zig` against go-chi/chi in `tools/go_bench`; `tools/go_fast_bench` and `tools/rust_fast_bench` for httprouter, echo, bunrouter and matchit, `BENCH_FAST=0` skips them). Every side runs `lookup` over the plain subset of the table (no regexp constraint, no in-segment capture, which the other routers cannot express) with matching counts, and `serve` (request bytes to response bytes) against chi. The card's Performance and Ahead lines carry the figures. Where the structure comes from: *One matcher, two trees* above.
 
-**Fastest in the field, 2026-10-23** (`zig build bench-router`, which now also runs
-`tools/go_fast_bench` — julienschmidt/httprouter v1.3.0, labstack/echo v4.16.2,
-uptrace/bunrouter v1.0.23 — and `tools/rust_fast_bench`, ibraheemdev/matchit 0.9.2,
-the router under axum). They cannot express a regexp constraint or a capture inside
-a segment, so every side, ours included, runs `lookup` over the PLAIN subset of the
-table (20 of 25 routes, the 27 of 32 requests whose outcome the dropped routes do
-not decide); all agree on 21 matches. ns per op (27 requests): ours 1 605,
-httprouter 1 819, bunrouter 1 841, echo 1 846, **matchit 745**. Ours is ahead of
-every Go router and 2.15× behind matchit (P1 needs ≤ 1.25×). matchit answers the
-path only (methods via a mask after the match, the axum way, which the Rust side
-does too); bunrouter is timed through `ServeHTTPError` (it has no public lookup),
-so its figure is an upper bound. `Static` walked a comptime table at run time —
-static children by a linear `mem.eql` scan, backtracking for chi's precedence —
-where matchit is a radix tree over bytes.
+## What is deliberately not done
 
-**Fastest in the field, 2026-10-25 — ahead of matchit.** Four changes,
-each measured with `bench-router -- --plain-only` (our loop alone, the one put
-under `perf`), the same matcher for `Router` and `Static` (`matchStep`):
-(1) `Static` generates one function per table node (`StaticTree`, `matchAt`):
-the node is comptime-known, so the static siblings are an unrolled length +
-literal compare and the absent edges vanish — 1 730 → 1 254 ns; (2) `routeFor`
-read the node's route array by value (a 184-byte copy per call) and the segment
-count scanned the path byte by byte — 1 024 ns; (3) `Scan`: one pass builds a
-'/' bitmask of the first 64 bytes (overlapping 16/8/4-byte vector compares,
-no byte loop) and the count, each level finds its segment end with one `@ctz`
-— 869 ns; (4) the comptime tree's `Ref` became a node pointer instead of an
-index: `?u32` came back through memory, two narrow stores read as one wide
-load — a store-forwarding stall after every level, 19 % of the cycles —
-`?*const` comes back in a register — 605 ns. Full bench the same day: ours
-579.6 ns, matchit 709.6 ns (0.82×), echo 1 837, bunrouter 1 902, httprouter
-2 497; chi lookup 0.28×, serve 0.16× (the runtime `Router` gained from (3) too).
+- **Percent-decoding and case folding in the matcher:** never, whatever `normalize_path` says (*Threat model*).
+- **A `middleware` package:** chi's pieces live in sibling modules (`ratelimit`, `throttle`, `cors`, `requestid`, `accesslog`, `security-headers`, `metrics`).
+- **Authentication or error classification:** the router attaches no identity and does not catch handler errors (`http.Server` answers a plain 500).
 
 ## Backlog / deferred
 
-- ~~**`Static` lookup within 1.25× matchit**~~ — DONE 2026-10-25 (0.82×; comptime
-  node functions, `Scan`, pointer `Ref` — Performance above). Not tried, if it is
-  ever needed: the runtime `Router`'s static children are still a hash-map
-  `get` per level.
-
-- **`group("/x/*")` refused up front** (2026-10-25 audit note): a group whose prefix ends in a
-  wildcard can never register a route — the error comes at the first `add`. Refusing it in
-  `group()` would move the error earlier (an API change); `prefixCovers`' wildcard branch is dead
-  until then.
-
-- ~~**Regexp constraints (`{id:[0-9]+}`)**~~ — DONE 2026-10-07 (the new `regex` module; `error.InvalidConstraint`).
-- ~~**Mid-segment params**~~ — DONE 2026-10-07 (chi's `{name}` inside a segment; semantics in README "Patterns inside a segment").
-- ~~**Per-route inline middleware (`With`)**~~ — DONE 2026-10-07 (`with`, inline groups).
-- ~~**Sub-router `Mount`**~~ — DONE 2026-10-07 (a copy of a built router; `Group.not_found`/`method_not_allowed` carry its fallbacks).
-- ~~**Host-based routing**~~ — DONE 2026-10-07 (`HostRouter`).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`extract · any · server · reentrant` + deps: `http`, `regex` — canonical source is `pub const meta` in
-src/root.zig.
+- **`group("/x/*")` refused up front.** A group whose prefix ends in a wildcard can never register a route; the error comes at the first `add`. Refusing it in `group()` would move the error earlier (an API change) and let the dead wildcard branch of `prefixCovers` go.
+- **Runtime `Router` static children.** They are still a hash-map `get` per level; not tried, an idea if the runtime router's speed is ever needed (`Static` already walks comptime node functions).
+- **`Node.hasEndpoint` is dead code** (found by the whole-module mutation run); remove it at the next src change.
 
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL
 
-- **Class A** — wire/interop format — other implementations must byte-agree with it. Since 2026-10-07 the pattern language is go-chi/chi's (`{name}`, in-segment captures, `*`), so a chi route table must route the same here, up to the documented divergences.
+- **Class A** — wire/interop format — other implementations must byte-agree with it. The pattern language is go-chi/chi's (`{name}`, in-segment captures, `*`), so a chi route table must route the same here, up to the documented divergences.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**On CI since 2026-10-07.** `tools/interop.zig` (`zig build interop-router [-- --check]`)
-re-takes `tools/go_chi_oracle` (Go 1.26.0, go-chi/chi v5.3.2 pinned by go.mod/go.sum, black box
-through its public API) and the interop lane runs it with `--check`; the check ignores only the
-`// GENERATED …` line. `src/chi_oracle_test.zig` replays `src/chi_vectors.zig`: 60 seeded tables,
-3,600 requests (regexp constraints included) — status, matched pattern and every capture as chi answers (chi's `RoutePattern()`
-drops a trailing slash; that alone is normalized), chi's 405 `Allow` a subset of ours. The
-generated requests stay in the domain where both semantics coincide; the documented divergences
-(EMPTY: chi accepts an empty capture; SPLIT: chi ends a capture at the first byte of the next
-literal; ANCHOR: chi's pasted `^…$` splits a top-level alternation) are a crafted table whose
-answers are pinned both ways. Teeth: inverting sibling-pattern precedence fails 14 generated
-requests, skipping the constraint check 411, a flipped vector fails `--check`. Still self-graded: the
-composition layer (`group`/`with`/`mount`, fallback scoping, `HostRouter`) and `Static`, which the
-differential test holds to `Router`.
+**On CI.** The chi oracle is re-taken by the interop lane (`zig build interop-router -- --check`, Go 1.26.0, go-chi/chi v5.3.2 pinned by go.mod/go.sum); see *Verification*.

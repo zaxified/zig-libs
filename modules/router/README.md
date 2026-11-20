@@ -95,7 +95,7 @@ OpenAPI 3.1 document.
 | Matching | raw bytes — no percent-decoding, no case folding |
 | Middleware | outer→inner = registration order: router `use` → group → nested group → handler; chains are frozen into routes at add time, so `use` after any route ⇒ `error.RoutesAlreadyRegistered`; a fallback (404/405/auto-OPTIONS/redirect — see below) runs the chain of whichever group's prefix the request path falls under, router-level `use` alone when it falls under none — a `group("/api").use(requireAuth)` gate sees every response for `/api`, not only the ones a route actually served |
 | 404 / 405 | overridable `not_found` / `method_not_allowed` handlers; on 405 the router sets `Allow` (registered methods in `http.Method` order, HEAD implied by GET) before the handler runs. `Allow` lists every method the *path shape* supports (RFC 9110 §15.5.6), not just whichever candidate the matcher tried first — see `method_precedence` below |
-| Method precedence | `method_precedence` (default `.backtrack`): when more than one registered pattern can produce the same path shape and they serve different methods, the matcher keeps trying siblings (static, then `:param`, then `*wildcard`) until one serves the request's method, instead of committing to the first one with ANY endpoint. `.first_match` restores the old (pre-2026-09-11) shadowing behavior verbatim — see the worked example below |
+| Method precedence | `method_precedence` (default `.backtrack`): when more than one registered pattern can produce the same path shape and they serve different methods, the matcher keeps trying siblings (static, then `:param`, then `*wildcard`) until one serves the request's method, instead of committing to the first one with ANY endpoint. `.first_match` restores the earlier shadowing behavior verbatim — see the worked example below |
 | HEAD | auto-routes to GET when no explicit HEAD route (the `ResponseWriter` suppresses the body and keeps GET framing) |
 | Trailing slash | `.redirect` (default, httprouter): 301 for GET/HEAD, 308 otherwise, toward the slash variant that has the route, query preserved, run through the matched path's middleware chain (a gate registered there can deny it) — `.strict` (chi): 404. `/x` and `/x/` are always registrable as two distinct routes |
 | Path normalization | `normalize_path`, see below. Default `.remove_dot_segments`: normalizes the target itself now, so it holds for a caller driving `Router` directly too, not only behind `http.Server` |
@@ -104,8 +104,8 @@ OpenAPI 3.1 document.
 
 ## Method precedence — a worked example
 
-Registering an unrelated route for a *different* method used to be able to
-silently break dispatch for an *existing* route on a path shape it never
+Under `method_precedence = .first_match`, registering an unrelated route for a
+*different* method can silently break dispatch for an *existing* route on a path shape it never
 touched:
 
 ```zig
@@ -119,13 +119,12 @@ try r.post("/users/new", createUser); // added later, unrelated to getUser
 //                       this path shape could have reached)
 ```
 
-Before this (`method_precedence = .first_match`, still available):
-`matchRec` found `/users/new` via its static child ("new"), which already
-had a POST endpoint — so it returned that node immediately, *without ever
-looking at the request's method*, and `GET /users/new` turned into a 405
-the moment the unrelated `POST /users/new` route was registered, with
-nothing in that diff mentioning `/users/:id` at all (audit finding
-router-F5). The default now keeps trying `:id` (and, if that also doesn't
+With `.first_match`, `matchRec` finds `/users/new` via its static child ("new"), which already
+has a POST endpoint — so it returns that node immediately, *without ever
+looking at the request's method*, and `GET /users/new` turns into a 405
+the moment the unrelated `POST /users/new` route is registered, with
+nothing in that diff mentioning `/users/:id` at all. The default
+(`.backtrack`) keeps trying `:id` (and, if that also doesn't
 serve the method, `*wildcard`) until one does.
 
 Cost: `.backtrack` can visit more of the trie on a genuine method miss than
@@ -150,7 +149,7 @@ try r.options("/*catchall", corsPreflight); // "catch every OPTIONS"
 // OPTIONS /nope/at/all -> corsPreflight runs (no other route exists there)
 ```
 
-Under `method_precedence = .first_match` (the pre-2026-09-11 behavior), the
+Under `method_precedence = .first_match` (the earlier behavior), the
 first line above answers 405 instead: `matchRec` finds `/thing` via its
 static child, which already has a GET endpoint, and returns that node
 immediately without ever looking at the request's method — the wildcard
@@ -275,8 +274,8 @@ For a server whose routes are known when it is built, `router.Static(routes, .{}
 same trie at compile time and answers with a route index instead of running a handler: no
 allocator, no hash map, no `Ctx`, no middleware. The matcher is the one `Router` uses (`matchStep`,
 generic over how a node is stored; for `Static` every node becomes its own function with its
-literals compared in place, the fastest lookup measured in the field — see SPEC § Performance), so precedence, backtracking, HEAD→GET, the F4 pruning and the
-F5 `Allow` union are identical — a differential test holds the two to the same answers on
+literals compared in place, the fastest lookup measured in the field — see SPEC § Performance), so precedence, backtracking, HEAD→GET, the `min_reach` pruning and the
+`Allow` union are identical — a differential test holds the two to the same answers on
 generated tables. Every error `Router.add` returns at startup is a `@compileError` here.
 
 ```zig
@@ -308,7 +307,7 @@ that rewrite). `router.validatePattern` is the per-pattern grammar both share.
   order/short-circuit/state, groups, keep-alive) driven through the
   socket-free `http.Server.serveStream` — no sockets, golden responses.
 - go-chi/chi v5.3.2 as a differential oracle (`tools/go_chi_oracle`, replayed by
-  `src/chi_oracle_test.zig`): 3,600 requests over 60 seeded route tables (regexp constraints
+  `src/chi_oracle_test.zig`): seeded route tables and their requests (regexp constraints
   included) route as chi routes them — status, pattern, captures — with the divergences above
   pinned.
 - In-process integration: `http.Server` + this router on `127.0.0.1:0`,
