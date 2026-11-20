@@ -10,7 +10,7 @@ verdict on an input is taken once, at the end.
 The four RFC 4648 variants (`standard`, `standard_no_pad`, `url_safe`,
 `url_safe_no_pad`), with libsodium's decoder contract — the same strictness,
 an ignore set, a prefix mode — plus PEM/MIME line wrapping, allocating
-helpers and in-place decoding. 3–17× faster than libsodium's constant-time
+helpers and in-place decoding. 3.6–20× faster than libsodium's constant-time
 codec on x86-64 (16 characters per step on the decode side).
 
 - **Model after:** libsodium `sodium_bin2base64` / `sodium_base642bin` (C, the

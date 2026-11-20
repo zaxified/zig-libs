@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-30 · mutation 2026-10-30 (51/52, 1 eq) · src 6d4570e2169d9d05
 
-*Source moved without a production-logic change (2026-11-14):* since the recorded run only the `meta` target list (`.linux32` added), `eqMask` turning `pub` with a doc comment (body byte-identical) and a test-file header comment changed — no mutant applies; `eqMask` is exercised again through keycodec's 2026-11-14 delta run.
-
 **Hardening:** fuzz 2026-10-17 (1,000,000 runs clean, B64CT_FUZZ, every reach label hit) · ct 2026-10-17 (ctgrind: octets tainted for `encode`, text for `decode`/`ignore`, 0 in-file; positive controls 204/69/46) · panic 2026-10-30 (sweep + blind review: `encodedLen`/`encodedWrappedLen` saturate; delta audit 6/7 + 1 eq)
 
 **Performance:** ref 0.05–0.28× libsodium 1.0.22 · fastest ? (measured 2026-10-20)
@@ -17,18 +15,6 @@
 **Known defects:** none recorded
 
 **Downstream consumer:** no
-
-Audit 2026-10-17: an independent read-only review (findings and verdict kept
-outside the repo): no HIGH; MEDIUM 1 —
-`encode`/`encodeWrapped` checked `out` and `line_len` only with asserts (gone
-in ReleaseFast; `line_len` 1–3 looped writing past `out`) → runtime panic and
-comptime `line_len`; LOW/INFO 2–7 → `encodedLen` without `n + 2`, wipe tests for
-every error path, fuzz checks `out` is zero after a rejection, doc fixes; what
-stayed open is under Open. Mutation: 45 schemata mutants over `root.zig`
-(ReleaseSafe, unit tests + the 2000-seed fuzz test), all killed after five
-tests were added for the first run's survivors (16-lane path per lane,
-an ignored character off a quantum boundary, `maxDecodedLen`, two wipe paths)
-and two equivalent redundancies were removed from the code.
 
 ## Compared with
 
@@ -42,7 +28,7 @@ Surveyed 2026-10-17 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Go `encoding/base64` | Go | BSD-3-Clause | 139k | Go 1.26 | Table-driven, not constant-time; `Strict` mode for canonical input; skips `\r` `\n` always. |
 | Zig `std.base64` | Zig | MIT | — | Zig 0.16.0 | Table-driven (secret-indexed loads); `Base64DecoderWithIgnore`. The four variants here are byte-identical to its encoders and agree with its decoders on every accept/reject (tests + fuzz). |
 
-**Where we are ahead:** 3.7–17× libsodium's speed with the same contract; line-wrapped encoding (PEM/MIME) and in-place decoding, which libsodium lacks; every decoding error leaves no secret in the output buffer. **Where we are behind:** base64ct's streaming encoder/decoder and its password-hash alphabets (→ Open); base64ct is not measured.
+**Where we are ahead:** 3.6–20× libsodium's speed with the same contract (the card's Performance line); line-wrapped encoding (PEM/MIME) and in-place decoding, which libsodium lacks; every decoding error leaves no secret in the output buffer. **Where we are behind:** base64ct's streaming encoder/decoder and its password-hash alphabets (→ *What is deliberately not done*); base64ct is not measured.
 
 ## What this module is, and what it is not
 
@@ -168,10 +154,6 @@ non-LLVM backends and on the error paths, which ctgrind has not measured.
 
 ## What is deliberately not done
 
-- **A shared module for the four copies — superseded.** Until 2026-10-17
-  acme, dns, smtp and megolm each carried a `b64ct.zig` ("a copy rather than a
-  shared module, as with every other small helper"); the cross-module dedupe
-  audit (owner notes § DB) made this the module they use instead.
 - **Streaming encoder/decoder** (base64ct's `Encoder`/`Decoder`) — not now:
   every consumer encodes a key or a credential in one piece.
 - **Password-hash alphabets** (bcrypt `./A–Za–z0–9`, crypt, sha-crypt) — not
@@ -182,8 +164,6 @@ non-LLVM backends and on the error paths, which ctgrind has not measured.
 
 ## Open
 
-- Encoding is scalar (3.7× libsodium already); a 12→16 vector step like the
-  decoder's would roughly quadruple it. Not needed by any consumer.
 - RustCrypto `base64ct` not measured; the fastest in the field is therefore
   unrecorded.
 - ctgrind has measured x86-64 ReleaseFast only, accepted inputs only.
@@ -192,6 +172,30 @@ non-LLVM backends and on the error paths, which ctgrind has not measured.
 - The libsodium differential (`interop-b64ct`) runs in no gate; the fuzz
   oracle for `decodePrefix` is self-consistency, with `pem_whitespace` only.
 
+## Verification
+
+- **Tests** (`src/root.zig`): RFC 4648 §10 vectors for every variant and §5's alphabet difference; `std.base64` as a
+  live oracle (encode byte-identical for every length 0..300 and byte value; decode accept/reject and bytes, every
+  character in every final-quantum position, the exhaustive tail test for the unpadded error); the 16-lane path per
+  lane; `decodeIgnoring` / `decodePrefix` (an ignored character anywhere, alphabet and `=` in the ignore set as
+  libsodium reads them, `NoSpaceLeft`); in-place decoding; `encodeWrapped` PEM/MIME layouts; wiping on every error
+  path; `maxDecodedLen` / `decodedLen`; allocating helpers. `src/sweep_test.zig` holds the no-panic sweep
+  (saturating `encodedLen` / `encodedWrappedLen`).
+- **Fuzz:** one harness (`src/fuzz.zig`) run by testkit's deterministic driver as `B64CT_FUZZ`, with a fixed seed loop
+  and reach labels checked in every test run.
+- **Interop:** `zig build interop-b64ct` (`tools/interop.zig`) against libsodium 1.0.22's `codecs.c`: encode, whole
+  decode with and without an ignore set, prefix decode, 300 000 cases from a fixed seed (see *Anchoring*).
+- **Constant time:** `scripts/checks/ctgrind.sh b64ct` (see *Constant-time contract*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
+- **Run:** `scripts/modtest b64ct`.
+
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-b64ct`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.05–0.28×, against 0.06–0.27× before. The card carries these figures.
+Bench: `zig build bench-b64ct` (`tools/bench.zig`, `BENCH_ROUNDS=5`, ReleaseFast) against libsodium 1.0.22's
+`codecs.c`; the card's Performance line carries the figures.
+
+## Backlog / deferred
+
+- **Vector encode step.** Encoding is scalar; a 12→16 vector step like the decoder's would roughly quadruple it. No
+  consumer needs it, so it is deferred.
