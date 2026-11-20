@@ -36,8 +36,6 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [xacrimon/dashmap](https://github.com/xacrimon/dashmap) | Rust | MIT | 4.1k | v6.2.1 (2026-05-17) | Sharded concurrent hash map *(inferred: README not read)*; in-memory, thread-safe on every method, with iteration across shards. |
 | Zig ecosystem | Zig | — | — | — | Nothing comparable found (`gh search repos 'sharded kv store' --language zig`: no result). |
 
-Re-assessed 2026-10-06 (no new survey; the table above is unchanged). Cross-shard iteration landed as a merge-sorted scan (`Store.scan`, "Merge-sorted scan" below), which was the gap a user of any sharded map hits first — dashmap and concurrent-map iterate across shards, and this module now does too, *ordered* and with range bounds, which neither in-memory map offers. The cross-process lock entry was already corrected in the docs earlier the same day. **Even** on the main use cases (routed put/get/delete, durable per-shard storage, parallel writers, whole-store and range iteration); **behind** on online resharding only, which is Backlog-grade for an embedded library with a documented migration path.
-
 **Where we are ahead:** durable and crash-safe per shard (each shard is a `kvtree` file) with parallel writers; a global **ordered** scan with inclusive/exclusive range bounds, a limit and both directions, reading every shard at a pinned version (the in-memory maps iterate unordered and without a snapshot); a manifest that refuses to open a shard set with a different `n_shards`; a store-wide advisory lock so a second live `Store` over the same paths gets `error.Locked` (advisory, local POSIX filesystems only — "What it does NOT guarantee"); and a checked owner-thread contract (`OwnerError.NotOwningThread`). **Where we are behind:** no online resharding or hash slots (fixed `n_shards`; growing it means migrating the data — → Backlog). By design rather than behind: no cross-shard atomicity (a refusal, "What it does NOT guarantee"), and a single-owner contract per shard where dashmap/concurrent-map are safe from any thread — the point of this module is that each shard is a single-writer `kvtree`.
 
 ## Problem
@@ -92,15 +90,12 @@ magic + `n_shards` as u64 LE. It is written once when the store is created and
 verified (then closed again, before any shard is opened) on every later `init`.
 
 **Why it exists — `n_shards` is part of the data's identity.** Routing is
-`hash % n_shards`, so a different shard count re-routes essentially every key.
-The old behaviour was the bad kind of wrong: `init` succeeded, and the router
-then looked for existing keys in the wrong files. Measured on a 200-key store
-created with 4 shards, reopening it with 8 found 98/200 and with 2 found 88/200
-— the rest read as *absent*, indistinguishable from never having been written,
-after nothing worse than an operator editing a config value. That is silent
-partial data loss, so it now fails closed with `error.ShardCountMismatch`.
-A file under the manifest name that is not ours (bad magic, or shorter than one
-record) is refused with `error.CorruptManifest` rather than overwritten.
+`hash % n_shards`, so a different shard count re-routes essentially every key. Without the check `init` would
+succeed and the router would look for existing keys in the wrong files: a 200-key store created with 4 shards
+found 98/200 reopened with 8 and 88/200 with 2, the rest reading as *absent*, indistinguishable from never
+having been written — silent partial data loss after an operator edited a config value. So a different count
+fails closed with `error.ShardCountMismatch`. A file under the manifest name that is not ours (bad magic, or
+shorter than one record) is refused with `error.CorruptManifest` rather than overwritten.
 
 Two limits, stated rather than papered over: a store created before manifests
 existed has none, so the first `init` that touches it adopts whatever count it
@@ -184,16 +179,16 @@ allocated once and never resized — so it introduces **no** synchronization and
   safe. The caller MUST serialize same-shard writers (or a future latch layer
   will). `shardFor` is public precisely so a caller can partition work up front
   and guarantee one writer per shard.
-- **…and every word above is conditional on the backend.** This is the part that
-  used to be missing. The router and the `Db`s hold no shared mutable state, but
-  each operation ends in the injected `Storage`, and that is where two shards'
+- **…and every word above is conditional on the backend.** The router and the `Db`s hold no shared mutable
+  state, but each operation ends in the injected `Storage`, and that is where two shards'
   operations meet. Cross-shard parallelism is therefore real only over a backend
   that is itself safe for concurrent operations on **distinct handles**.
   `FsStorage` is: every operation is a positional `pread`/`pwrite` on its own
   `std.Io.File`, and the only shared field — the handle table — is written solely
   by `open`/`close`, which happen single-threaded in `init`/`deinit`.
   `SimStorage` is **not**: plain `StringHashMapUnmanaged`/`ArrayListUnmanaged`
-  state and a non-atomic `ops_seen`.
+  state and a non-atomic `ops_seen` (four threads through one `SimStorage` lost an increment: serial
+  `ops_seen` 33006 against 33005 parallel, so a test over it could not certify "no contention").
 
   `Options.storage_concurrency` makes that precondition part of the API, and it
   is **enforced**, not merely documented:
@@ -211,13 +206,6 @@ allocated once and never resized — so it introduces **no** synchronization and
     concurrent. Routed operations then take no latch and no owner check, and
     threads on distinct shards genuinely run in parallel. The same-shard rule
     above still applies.
-
-  **This is what the wave-2 F1 finding was about.** The module's headline test
-  drove four threads through one `SimStorage`; the audit measured a lost
-  increment (serial `ops_seen` 33006 vs parallel 33005), so the test certifying
-  "no contention" was itself a data race, and the claim had never run on a
-  backend that could carry it. The claim was not wrong — the composition it was
-  demonstrated over was.
 
 This module claims **no more** safety than `kvtree` provides. `kvtree` is
 `single_owner` (one thread/loop owns a `Db`'s mutation state, lock-free); a
@@ -250,7 +238,7 @@ parallel — no more, no less.
   the lock is taken, so a second opener with a different `n_shards` sees
   `error.ShardCountMismatch` rather than `error.Locked`.
 - **No rebalancing / resharding.** `n_shards` is fixed for the lifetime of the
-  on-disk set — now enforced by the manifest rather than merely assumed. Growing
+  on-disk set — enforced by the manifest. Growing
   it means migrating the data (read every key through a `Store` opened with the
   old count, write it through one opened with the new). Incremental resharding —
   Redis Cluster's 16 384 fixed hash slots mapped to shards, or a consistent-
@@ -264,87 +252,63 @@ parallel — no more, no less.
 
 ## Verification
 
-Tests (Debug + ReleaseSafe, both green, 27/27; `zig fmt` clean, no leaks):
-
-- **deterministic routing** — same key → same shard repeatedly, and identical
-  routing across two `Store` instances with the same `n_shards`;
-- **distribution** — a 2000-key histogram over 8 shards hits every shard well
-  above the mean's lower bound (no stuck router);
-- **round-trip** — put→get across all shards, then delete half and confirm the
-  survivors (on other shards) are untouched;
-- **multi-core write parallelism (headline)** — over `FsStorage` in a
-  `std.testing.tmpDir`, declared `.parallel_per_handle`. Keys are bucketed by
-  owning shard and one writer thread per shard writes its disjoint, single-shard
-  range concurrently; after join, every write is present and reads back
-  byte-exact, over three rounds.
-
-  Crucially it does not stop there, because *correct data is exactly what a
-  fully serialized run would also produce* — which is how the original claim
-  went unexamined for so long. A pass-through `Storage` shim rendezvouses the
-  first backend write of each thread: the barrier opens only once all four
-  threads are inside the backend simultaneously, on four distinct shards, and
-  each arriving thread blocks until then. Serialize the routed path and the
-  barrier is never met, the shim reports `timed_out`, and the test fails — a
-  deterministic consequence of serialization rather than a race one hopes to
-  observe. (Verified: adding a global latch to `put` turns this red at exactly
-  the `!timed_out` assertion.)
-- **the unsafe shape is refused** — several threads over a `.single_thread`
-  (`SimStorage`) store get `error.NotOwningThread` from `put`/`get`/`delete`,
-  and nothing they attempted reaches the backend; a companion test covers the
-  explicit `adoptOwner()` hand-off. Deterministic, so unlike a concurrency test
-  it cannot pass by luck.
-- **shard-count manifest** — a store created with 4 shards refuses to reopen
-  with 8 or with 2 (`error.ShardCountMismatch`) while reopening with 4 finds all
-  200 keys; a foreign or truncated file under the manifest name is refused with
-  `error.CorruptManifest` instead of being overwritten;
-- **persistence** — write over `FsStorage` in a `std.testing.tmpDir`, drop the
-  `Store`, reopen a fresh one over the same dir/paths, and read everything back
-  (durability delegated to `kvtree`);
-- **non-power-of-two** — `n_shards = 5` exercises the modulo routing path and
-  round-trips.
-- **merge-sorted scan** (anchor SELF-DERIVED: a brute-force sorted reference
-  list, compared entry for entry with the slice the options select) — random
-  binary keys over 1, 3 and 8 shards, both directions; every combination of
-  unbounded/inclusive/exclusive start and end over nine probe keys (below all,
+- **Run:** `scripts/modtest shardstore` (all tests are in `src/root.zig`).
+- **deterministic routing** — same key → same shard repeatedly, identical routing across two `Store` instances
+  with the same `n_shards`, and known keys pinned to known shards (a hash-seed change would pass every
+  round-trip test);
+- **distribution** — a key histogram over 8 shards hits every shard (no stuck router);
+- **round-trip** — put→get across all shards, then delete half and confirm the survivors (on other shards) are
+  untouched; a non-power-of-two `n_shards` exercises the modulo path;
+- **multi-core write parallelism (headline)** — over `FsStorage` in a `std.testing.tmpDir`, declared
+  `.parallel_per_handle`. Keys are bucketed by owning shard and one writer thread per shard writes its
+  disjoint, single-shard range concurrently; after join, every write is present and reads back byte-exact,
+  over several rounds. Correct data alone is what a fully serialized run would also produce, so a
+  pass-through `Storage` shim rendezvouses the first backend write of each thread: the barrier opens only once
+  every writer thread is inside the backend simultaneously, on distinct shards, and each arriving thread blocks
+  until then. Serialize the routed path and the barrier is never met, the shim reports `timed_out`, and the test
+  fails — a deterministic consequence of serialization rather than a race one hopes to observe;
+- **the unsafe shape is refused** — several threads over a `.single_thread` (`SimStorage`) store get
+  `error.NotOwningThread` from `put`/`get`/`delete`, and nothing they attempted reaches the backend; a companion
+  test covers the explicit `adoptOwner()` hand-off;
+- **shard-count manifest** — a store created with 4 shards refuses to reopen with 8 or with 2
+  (`error.ShardCountMismatch`) while reopening with 4 finds all 200 keys; a foreign or truncated file under the
+  manifest name is refused with `error.CorruptManifest` instead of being overwritten;
+- **store-wide lock and init failures** — a second live `Store` gets `error.Locked`; a failed shard open
+  releases the lock and the shards already opened; name validation formats the highest shard index
+  (`ops_until_crash = 0` makes a failure there fast instead of opening 100 000 shards); a too-long
+  `name_prefix` is refused before any backend I/O;
+- **persistence** — write over `FsStorage` in a `std.testing.tmpDir`, drop the `Store`, reopen a fresh one over
+  the same dir/paths, and read everything back (durability delegated to `kvtree`);
+- **merge-sorted scan** (anchor SELF-DERIVED: a brute-force sorted reference list, compared entry for entry with
+  the slice the options select) — random binary keys over 1, 3 and 8 shards, both directions; every combination
+  of unbounded/inclusive/exclusive start and end over nine probe keys (below all,
   first, absent, present, last, above all, prefixes of every key, `""`) in both
   directions, plus hand-checked edges (`[x, x]` is one key, `[x, x)` none,
   start above end empty); an empty store and a 16-shard store with 13+ empty
   shards; a key planted in non-owning shards is yielded once, with the owning
   shard's value, matching `get`; limits 0, 1, partial, exact and beyond, with
-  bounds and in reverse; a property test of six rounds of 600 random
-  puts/overwrites/deletes (some values large enough for overflow pages) over 7
-  shards, with 60 random range/limit/direction queries per round; consistency —
+  bounds and in reverse; a property test of random puts/overwrites/deletes (some values large enough for
+  overflow pages) over 7 shards, with random range/limit/direction queries per round; consistency —
   the owner overwrites, deletes and inserts keys ahead of an open scan on every
   shard, the scan still yields exactly the opening state and a fresh scan the
   new one; a foreign thread's `scan`/`next` is refused without disturbing the
   owner's scan; and every allocation failure point of a scan with overflow
   values returns `error.OutOfMemory`, stays sticky, and leaks nothing.
-  Hand-checked mutants (flipped heap order, flipped stop comparison, dropped
-  owner filter) each turn the suite red.
-
-**Mutation run 2026-10-05** (in-place, Debug, 27 mutants over `init`, the
-name check, the manifest, the store-wide lock, routing and the owner check):
-25 killed. The first pass left 7; four tests were added — a second live
-`Store` gets `error.Locked`, routing is pinned to known shards (a seed change
-passed every round-trip test), a failed shard open releases the lock and the
-shards already opened, and name validation formats the highest index (with
-`ops_until_crash = 0`, so the mutant fails fast instead of opening 100 000
-shards). Equivalent: dropping the `size < manifest_len` check (`preadFull`
-reports the short read as `error.Corrupt`, mapped to the same
-`CorruptManifest`), and dropping that mapping (unreachable once the size check
-has run).
+- **Model:** the card's `**Model:**` is `RefModel` (`src/root.zig`), a sorted reference list the scan tests
+  compare against.
+- **Fuzz:** none under check-fuzz (the property test above is its own seeded loop).
+- **ctgrind:** not applicable (no secret).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. The mutation run covered `init`, the name check, the manifest, the store-wide lock,
+  routing and the owner check; the equivalent mutants are the `size < manifest_len` check (`preadFull` reports the
+  short read as `error.Corrupt`, mapped to the same `CorruptManifest`) and that mapping itself (unreachable once
+  the size check has run).
 
 ## Backlog / deferred
 
-Refusals stay in "What it does NOT guarantee". Survey additions:
+Refusals stay in "What it does NOT guarantee".
 
 - (survey 2026-09-30) Fixed hash-slot indirection (slots -> shards) so `n_shards` can grow without rehashing every key, as Redis Cluster and Vitess do. Effort: large (migration protocol, manifest change); fits §2.
-
-## Status line
-
-`any · both · single_owner` + dep `kvtree`, model_after "consistent
-key-sharding over N single-writer stores (Redis Cluster / Dynamo partitioning
-idea)" — canonical source is `pub const meta` in src/root.zig.
 
 ## Anchoring
 

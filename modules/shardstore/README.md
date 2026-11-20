@@ -73,8 +73,8 @@ var db = store.shardAt(0);
 **`n_shards` is immutable for the life of the data.** Routing is
 `hash % n_shards`, so a different count re-routes every key. The manifest records
 the count at creation and a mismatched reopen fails with
-`error.ShardCountMismatch` — previously it succeeded and silently read *absent*
-for most keys (measured: a 200-key 4-shard store reopened with 8 found 98/200).
+`error.ShardCountMismatch` (without the check most keys would read *absent*: a 200-key 4-shard store
+reopened with 8 found 98/200).
 Changing the count means migrating the data; there is no incremental resharding.
 
 ## Merge-sorted scan
