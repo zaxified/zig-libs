@@ -10,7 +10,6 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-12 (517/556, 39 eq) · src 2d3ce9f6468e1217
 
-Audit detail: the review is an independent read-only pass over poly, sample, keccak4 and kem against FIPS 203 (bounds, Montgomery bookkeeping, constant time, conformance, zeroisation, API hazards; 0 HIGH, its MEDIUMs fixed the same day); the mutation run is 148 schemata mutants over the four library files, 138 killed (3 by tests it added), 10 argued equivalent (redundant `reduce` before a bounded consumer, Compress₁ symmetry, masks wider than their operand). Delta 2026-11-01 (src 07ad2d26a5d63cc5 → 49cdfb6cd1eb88d2): `Poly.v` gained `align(32)` and a comment — a layout attribute, no operator or branch for a mutant to change; it fixes the aarch64 error-union bug in the CHANGELOG, whose four failing tests (`SecretKey.fromBytes` hash check, ACVP and Wycheproof `dkchk`, the fuzz harness's dk re-serialisation) are the kill evidence; arm64 under qemu 26/26, ctgrind re-checked.
 
 **Hardening:** fuzz 2026-11-01 (960,000 runs clean, MLKEM_FUZZ, 8 jobs × 40,000 × 3 sets, every reach label hit; std as the differential oracle) · ct 2026-11-01 (ctgrind keygen/encaps/decaps × 3 sets: d‖z, m, dk and the ciphertext tainted, 0 in-file; ρ declassified as public) · panic 2026-11-01 (blind review of every pub entry point: no arithmetic or index panic reachable; the entropy abort of std's infallible `generate`/`encaps` shape has `tryGenerate`/`tryEncaps` twins; keccak4's length asserts moved to comptime)
 
@@ -51,7 +50,7 @@ consistency test. Pure Zig; allocation-free.
 
 Not here: Kyber round 3 / draft00 (refused — superseded; std still has `d00` if anyone needs it);
 hybrid combiners and X-Wing (they live in `hpke` and `tls13`, which depend on this module, not the
-other way round); ASN.1 / PKCS#8 / SPKI encodings of ML-KEM keys (the `keycodec` module, type-agnostic: it hands over the seed or the expanded key, which go to `KeyPair.generateDeterministic` / `SecretKey.fromBytes`; `keycodec/src/mlkem_test.zig` loads every OpenSSL 3.5.5 ML-KEM key into this module and writes it back byte for byte). This module stays dependency-free.
+other way round); ASN.1 / PKCS#8 / SPKI encodings of ML-KEM keys (the `keycodec` module, type-agnostic: it hands over the seed or the expanded key, which go to `KeyPair.generateDeterministic` / `SecretKey.fromBytes`; `keycodec/src/mlkem_test.zig` loads every OpenSSL 3.5.5 ML-KEM key into this module and writes it back byte for byte). This module's only dependency is `entropy`.
 
 ## Algorithm
 
@@ -124,7 +123,37 @@ input. `decaps` cannot fail (implicit rejection).
 
 **Anchor grade:** class A · oracle EXTERNAL
 
-**Mutation + review (2026-11-12, whole module,** production code of `poly.zig`, `kem.zig`, `sample.zig`, `keccak4.zig` (`root.zig` holds only `meta` and re-exports); comptime tables and constants evaluated in a Python model instead (the `zetas` generator, `lowZetas`/`base_zetas` index arithmetic, `Params` sizes, `xof_first_blocks`, Keccak constants); schemata in a detached copy, ReleaseSafe, strict verdict, then ctgrind on single-mutation ReleaseFast builds for the timing-only mutants): 556 mutants, 517 killed (6 by hang; 2 by ctgrind), 39 decided without a kill, 0 undecided, no defect. The 2026-11-01 run (148 mutants) had called `barrett_v` 20158 equivalent ("still in [0, q]"); with 20158 or 20160 `barrett` returns −1 or 3330 for some `i16` inputs — the new exhaustive test kills both and holds the doc comment's "[0, q]". New tests (12): the full `zetas` table entry by entry, `barrett` and `normalize` over every `i16`, `csubq` over [0, 2q), `reduce` = `barrett`, `fromNttBytes` at the q boundary in each of the 256 slots, `fromMsg`/`toMsg` per bit, Compress₁ symmetry, the `baseMulAcc` bound for four calls; decaps equals J(z‖c) for a flip in every ciphertext byte and an all-different ciphertext (all three sets), an imported dk with coefficients ≥ q against std, the generate/encaps entry points never repeat, the FIPS 203 Table 2/3 constants. ctgrind gained `fromBytes512/768/1024` rows (s and z tainted; ek and H(ek) public): the decaps select written as `if` raises decaps in-file contexts 0 → 1 (killed); dropping `makeMemDefined(&pk.rho)` raises keygen in-file contexts to 15/36/60 (killed — rho is public via ek, so the declassification is what keeps keygen at 0). Equivalent in the shipped binary (ctgrind ReleaseFast x86_64 shows no secret-dependent branch; the source form is defence in depth, arm64 not measured): `fromNttBytes`' branchless `bad` accumulation written as `if (a >= 3329) bad |= 1` (two mutants) and dropping the `asm volatile` barrier in decaps. Equivalent: `|`/`^` on disjoint bit ranges, the redundant `reduce` before `invNtt`/`toMont` (bounds now a test), `v − w` vs `w − v` under Compress₁ (now exhaustive), `csubq` `>>14`/`>>15` on its domain, `bad` is 0 or 1, cbd η=3 fields ≤ 3, the `compressCoeff` multiplier, Keccak `r` even, a zeroed block, dummy lanes never read, a discarded key on failure, the `diff` predicate, `seed` gated by `has_seed`, the transpose diagonal, the pairwise check (observable only under a hardware fault). Unobservable: `secureZero` of dead stack locals in kem/sample/keccak (no probe).
+## Verification
+
+`scripts/modtest mlkem` (or `zig build test-mlkem`). Test classes by area:
+
+- **Vectors:** NIST ACVP-Server keyGen / encapDecap / key-check, Wycheproof
+  (rejection-heavy matrices, malleable ciphertexts, key corruption) and the C2SP
+  CCTV modulus vectors (see *Anchoring*).
+- **Differential against std:** byte identity on random seeds, an accumulated stream
+  (`MLKEM_ACCUM=N`), an imported decapsulation key with coefficients ≥ q.
+- **Arithmetic:** the full `zetas` table entry by entry; `barrett`, `normalize` over
+  every `i16`; `csubq` over [0, 2q); the NTT against a scalar transcription and
+  against schoolbook multiplication; exhaustive compression rounding; the
+  `baseMulAcc` bound for four calls; 4-way Keccak against std's.
+- **Decaps:** equals J(z ‖ c) for a flip in every ciphertext byte and for an
+  all-different ciphertext, on all three sets; the generate/encaps entry points never
+  repeat; the FIPS 203 Table 2/3 constants.
+- **Fuzz:** `MLKEM_FUZZ=<runs>[,<seed>]` (testkit's deterministic driver, on the
+  ReleaseSafe test binary), one harness per parameter set with modes roundtrip,
+  arbitrary ciphertext, damaged encapsulation key, damaged decapsulation key, std as
+  the oracle; a reach test requires every label.
+- **ctgrind:** `scripts/checks/ctgrind.sh mlkem` (see *Constant-time contract*); the
+  `fromBytes` rows taint the secret part of a valid decapsulation key. Without the
+  `makeMemDefined` of ρ in KeyGen the keygen rows go non-zero, and the decaps
+  select written as `if` raises decaps to 1 in-file context.
+- **Live oracle / bench:** `zig build interop-mlkem` (OpenSSL 3.5),
+  `zig build bench-mlkem` (ours, std, OpenSSL, aws-lc-rs); the figures are on the
+  card's `**Performance:**` line.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it. Not mutated:
+  comptime tables and constants (checked against a Python model), and dead-stack
+  `secureZero` of locals (no probe).
 
 ## What is deliberately not done
 
@@ -141,7 +170,7 @@ input. `decaps` cannot fail (implicit rejection).
 
 ## Backlog / deferred
 
-- A faster scalar Keccak (H(ek) and J(z ‖ c) are 12 serial permutations for ML-KEM-1024 and now the
-  largest single cost); std's is used.
-- Consumers: switch `tls13`, `hpke`, `dtls`, `tlsclient` from std `ml_kem` to this module (each
-  needs its own delta audit afterwards).
+- A faster scalar Keccak (H(ek) and J(z ‖ c) are 12 serial permutations for ML-KEM-1024 and
+  the largest single cost); std's is used.
+- Consumers still on std `ml_kem`: `ssh` (`src/server.zig`, `mlkem768x25519-sha256`) should switch to
+  this module (needs its own delta audit afterwards).
