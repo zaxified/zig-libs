@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Card: Audit line after the delta mutation over the review fixes (2 mutants, 2 killed; cumulative 504/548, 44 eq); ctgrind source pins of `csrf`/`newid` re-recorded (digests only; the root.zig change is the iterate doc and page loop, outside the measured code).
 - **2026-11-19** — From the independent review of the paged `KvStore.iterate`: `KvStore.Config.iterate_page` defaults to 4096 (was 256: each page is a full `kv` keydir pass under its shared lock, so a walk costs N / page passes, quadratic in N — now documented at `Config.iterate_page`, `Manager.iterate` and `Store.VTable.iterate`, with "not one snapshot"); a store that fails during the walk stops it at the next page; the doc says a session created during the last page is missed. Tests: mid-walk failure stops after one page (allocation count), the default page.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Card: Audit line after the delta mutation over the paged `KvStore.iterate` (8 mutants, 8 killed; cumulative 502/546, 44 eq; SPEC § Verification); ctgrind source pins of the `csrf` and `newid` rows re-recorded (counted sources changed, counts unchanged: 0 contexts).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** test: the allocation-failure sweep over `Manager.iterate` builds its `KvStore` through `Config.iterate_page` and pins that two extra pages cost exactly their heap, key array and cursor copy.

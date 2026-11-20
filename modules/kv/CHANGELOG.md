@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Card: src hash refreshed after the review fixes (test and comment only; mutation counts unchanged).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** from the independent review of `scanKeys`: the ThreadSanitizer stress test's readers also run a paged scan (pages of 1-2) racing puts, deletes, compactions and merges, checking every key is well-formed and strictly ascending; a comment at the copy loop names the "copy before `unlockShared`" invariant and that test.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** Card: Audit line after the delta mutation over `scanKeys` (26 mutants, 26 killed; cumulative 98/101, 3 eq; SPEC § Verification).
 - **2026-11-19** — `Db.scanKeys(gpa, prefix, after, limit)` → `ScanPage` (`keys`, `more`, `last()`, `deinit`), new `ScanError`: a paged key listing whose memory per call is bounded by `limit`, resumable from the last key listed. The cursor is a key, so across pages a key live throughout is listed exactly once, in ascending order, never twice; keys put or deleted between pages follow the cursor (SPEC § "Paged key scan", compared with Redis `SCAN`, etcd/DynamoDB key paging, LevelDB/bbolt snapshots). Additive; `keys` and `iterator` unchanged. Tests: page boundaries, prefix/expiry, writes and deletes between pages, a compaction and a crash + reopen between pages, random stores against `keys`, an allocation-failure sweep.
