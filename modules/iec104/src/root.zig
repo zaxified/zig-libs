@@ -578,7 +578,7 @@ test "a frame split across TCP segments survives a frame_buf at the documented m
     // framer holding a partial frame, `pending + chunk` used to exceed a
     // buffer sized at `max_apdu_len` and `feed` returned `BufferTooSmall` —
     // an error whose own doc said it could not happen
-    // (W2 re-audit 2026-09-02, `iec104` F5).
+    // (W2 re-audit, `iec104` F5).
     var loop = transport.LoopTransport{};
     var frame_buf: [apci.max_apdu_len]u8 = undefined; // the documented minimum
     var c = try Client.init(loop.transport(), &frame_buf, .{});

@@ -263,7 +263,7 @@ pub const Client = struct {
         // "can only happen if the caller supplied a smaller one". `TcpTransport`
         // happens to deliver exactly one whole APDU per read and so hides it;
         // `LoopTransport` and any caller-supplied adapter do not
-        // (W2 re-audit 2026-09-02, `iec104` F5).
+        // (W2 re-audit, `iec104` F5).
         const room = self.framer.capacity() - self.framer.pending();
         if (room < apci.min_length) return error.ReadFailed;
         const n = try self.transport.read(self.rx_chunk[0..@min(self.rx_chunk.len, room)]);

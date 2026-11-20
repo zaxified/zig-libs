@@ -128,7 +128,7 @@ pub const Outstation = struct {
         // operated the point. The behaviour was even pinned as intended by a
         // test whose fixture uses `C_IC_NA_1` only, so it could not see that
         // the command case went with it
-        // (W2 re-audit 2026-09-02, `iec104` F4).
+        // (W2 re-audit, `iec104` F4).
         if (opts.common_address == opts.params.broadcastCa()) return error.AddressOutOfRange;
         if (opts.common_address > opts.params.maxCa()) return error.AddressOutOfRange;
         return .{ .opts = opts, .points = points };
@@ -356,7 +356,7 @@ pub const Outstation = struct {
         // and the error tore the connection down, so it was never told later
         // either. The HMI keeps showing the pre-command state while the field
         // device has moved, which is the SCADA-specific hazard
-        // (W2 re-audit 2026-09-02, `iec104` F2).
+        // (W2 re-audit, `iec104` F2).
         try self.echoDecoded(a, .activation_con, false, sink);
         p.element = o.element;
         p.time = o.time;
@@ -582,7 +582,7 @@ pub const Server = struct {
         // "can only happen if the caller supplied a smaller one". `TcpTransport`
         // happens to deliver exactly one whole APDU per read and so hides it;
         // `LoopTransport` and any caller-supplied adapter do not
-        // (W2 re-audit 2026-09-02, `iec104` F5).
+        // (W2 re-audit, `iec104` F5).
         const room = self.framer.capacity() - self.framer.pending();
         if (room < apci.min_length) return error.ReadFailed;
         const n = try self.transport.read(self.rx_chunk[0..@min(self.rx_chunk.len, room)]);
@@ -644,7 +644,7 @@ pub const Server = struct {
             // unbounded factor for a master that pipelines interrogations,
             // which it is entitled to do. The outcome was `error.SinkFull`
             // out of `poll`, i.e. a dropped connection rather than
-            // backpressure (W2 re-audit 2026-09-02, `iec104` F6).
+            // backpressure (W2 re-audit, `iec104` F6).
             if (s.queue_used + 2 + bytes.len > s.queue.len and s.queue_read > 0) {
                 const live = s.queue_used - s.queue_read;
                 std.mem.copyForwards(u8, s.queue[0..live], s.queue[s.queue_read..s.queue_used]);
@@ -1105,7 +1105,7 @@ test "a station cannot be configured as the reserved broadcast address" {
     // §7.2.4 guard disappears, and the exact octets the regression test below
     // proves are dropped will operate the point. The old test's fixture used
     // `C_IC_NA_1` only, so it could not see that the command case went with
-    // it (W2 re-audit 2026-09-02, `iec104` F4).
+    // it (W2 re-audit, `iec104` F4).
     var points = demoPoints();
     try testing.expectError(
         error.AddressOutOfRange,
@@ -1304,7 +1304,7 @@ fn fuzzHandle(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // so `len` was 0 for every seed and `handle` was called with an empty ASDU,
     // which it refuses on its first line. The whole request dispatcher, the
     // select/execute state machine and every reply path were unreachable from
-    // this harness. Measured 2026-09-07 over the corpus above: **0 of 15 seeds
+    // this harness. Measured over the corpus above: **0 of 15 seeds
     // non-empty, 0 handled and 0 replies emitted before; 15 of 15 non-empty,
     // 11 handled and 19 replies after.**
     const len: usize = fz.drawInput(S, src, &buf, &handle_seeds);

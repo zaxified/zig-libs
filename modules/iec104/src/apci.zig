@@ -166,7 +166,7 @@ pub fn decode(bytes: []const u8) DecodeError!Apdu {
         // after `state.onFrame` had counted it and advanced `recv_seq`, and
         // the cost is the connection. The other two formats already reject a
         // body they do not expect; this makes the third symmetric
-        // (W2 re-audit 2026-09-02, `iec104` F7).
+        // (W2 re-audit, `iec104` F7).
         if (body.len == 0) return error.ReservedBitsSet;
         const ns: Seq = @intCast((@as(u16, c1) | (@as(u16, c2) << 8)) >> 1);
         const nr: Seq = @intCast((@as(u16, c3) | (@as(u16, c4) << 8)) >> 1);
@@ -268,7 +268,7 @@ pub const FramerError = DecodeError || error{
     /// TCP segmentation (200 octets of a 255-octet frame, then the rest with a
     /// second frame coalesced behind it) overflows it. `Client.poll` and
     /// `Server.poll` now cap each read at `capacity() - pending()`
-    /// (W2 re-audit 2026-09-02, `iec104` F5).
+    /// (W2 re-audit, `iec104` F5).
     BufferTooSmall,
 };
 
@@ -525,7 +525,7 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM —
     // so `len` was 0 for every seed and `decode` was handed `buf[0..0]` every
-    // time, with the frame sitting unread in `buf`. Measured 2026-09-07 over
+    // time, with the frame sitting unread in `buf`. Measured over
     // the corpus above: **0 of 19 non-empty and 0 decoded before, 19 of 19
     // non-empty and 6 decoded after.**
     const len: usize = fz.drawInput(S, src, &buf, &decode_seeds);
@@ -601,7 +601,7 @@ fn fuzzFramer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // buffer at all — it was the bound of the loop that feeds it. `len` was 0,
     // so `while (off < len)` never ran and this harness fed the framer
     // NOTHING, while its name promised a framer that never hangs.
-    // `check-fuzz-reach` only learned to see that shape on 2026-09-07.
+    // `check-fuzz-reach` only learned to see that shape later.
     // Measured over the corpus above: **0 of 8 seeds reached `feed` and 0
     // frames were yielded before, 8 of 8 and 13 frames after.**
     const len: usize = fz.drawInput(S, src, &input, &framer_seeds);
@@ -673,7 +673,7 @@ test "an I-format APDU with no ASDU is refused by the framer, not by the state m
     // here and rejected downstream — but only after `state.onFrame` had
     // counted it and advanced `recv_seq`, and the cost is the connection. The
     // other two formats already reject a body they do not expect
-    // (W2 re-audit 2026-09-02, `iec104` F7).
+    // (W2 re-audit, `iec104` F7).
     const empty_i = [_]u8{ 0x68, 0x04, 0x00, 0x00, 0x00, 0x00 };
     try std.testing.expectError(error.ReservedBitsSet, decode(&empty_i));
 
@@ -688,7 +688,7 @@ test "an I-format APDU with no ASDU is refused by the framer, not by the state m
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

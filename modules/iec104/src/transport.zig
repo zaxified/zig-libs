@@ -225,7 +225,7 @@ pub const TcpTransport = struct {
         // `transport.read` synchronously and `conn.tick` never runs again.
         // Cost to the attacker: one connection and one octet. Measured: still
         // parked at 10x the configured timeout
-        // (W2 re-audit 2026-09-02, `iec104` F1).
+        // (W2 re-audit, `iec104` F1).
         const deadline_ms = self.read_timeout_ms;
         try self.readAllBounded(r, buf[0..2], deadline_ms, error.EndOfStream);
         if (buf[0] != apci.start_byte) return error.ReadFailed;
@@ -564,7 +564,7 @@ test "a peer that stops MID-FRAME hits the read timeout, not an unbounded park" 
     // The old code polled once, saw these two bytes, and then blocked in
     // `readSliceAll` with no deadline at all: still parked at 10x the
     // timeout, with every t1/t2/t3 timer frozen behind it
-    // (W2 re-audit 2026-09-02, `iec104` F1).
+    // (W2 re-audit, `iec104` F1).
     _ = std.os.linux.write(fixture.peer.socket.handle, &[_]u8{ 0x68, 0xFD }, 2);
 
     var buf: [apci.max_apdu_len]u8 = undefined;

@@ -340,7 +340,7 @@ test "goldens: monitoring values decode to the values the RTU was set to" {
 test "goldens: the CP56Time2a-tagged monitoring types carry a decodable tag" {
     var buf: [apci.max_apdu_len]u8 = undefined;
     // Every time-tagged golden in the capture carries the same instant:
-    // 2026-07-23 03:18:38.135 local time.
+    // 03:18:38.135 local time.
     const want = info.CP56Time2a{
         .millisecond = 135,
         .second = 38,
@@ -589,7 +589,7 @@ test "goldens: the capture covers the type ids this module claims to support" {
 // SPEC.md itself calls the wrap "the part of the protocol that is actually
 // hard", and no third-party stack had ever been driven through it.
 //
-// Captured 2026-08-08 with a real `c104` 2.2.1 (Fraunhofer FIT's Python
+// Captured with a real `c104` 2.2.1 (Fraunhofer FIT's Python
 // binding over `lib60870-C`, the reference C stack) outstation, paced to
 // avoid overrunning its internal send queue:
 //
@@ -823,7 +823,7 @@ test "a real outstation's session replays byte-exact through this module's own C
 // expiry — the t1/t2/t3 behaviour was validated only between two instances of
 // this module with an injected clock, i.e. against our own reading of §5.5.
 //
-// Method (2026-08-09): the third-party stack is the ACTIVE side and WE are a
+// Method: the third-party stack is the ACTIVE side and WE are a
 // deliberately silent APCI endpoint — a bare TCP socket that acknowledges
 // nothing. A conforming controlling station must give up after t1. Two runs,
 // with `c104` 2.2.1 (Fraunhofer FIT's binding over `lib60870-C`) as the
@@ -928,7 +928,7 @@ test "live-derived: the frames a real controlling station sent before its t1 fir
 
 // ── the global (broadcast) common address 0xFFFF, captured live ─────────────
 //
-// Provenance, 2026-08-09. A `c104` 2.2.1 **controlling** station was pointed at
+// Provenance,. A `c104` 2.2.1 **controlling** station was pointed at
 // a `c104` 2.2.1 **controlled** station through the same recording TCP proxy as
 // the table at the top of this file. Neither endpoint is this module. The
 // controlled station's points are the ones `outstation.zig`'s `demoPoints()`

@@ -944,7 +944,7 @@ fn fuzzTime(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 // is what "an implementation could stop masking (or start rejecting) and
 // still round-trip against itself" looks like closed.
 test "CP56Time2a masks reserved bits (hour 5-6, month 4-7, year 7) rather than rejecting them" {
-    // Base: 2026-07-23 03:18:38.135, no flags — same fixture as the
+    // Base: 03:18:38.135, no flags — same fixture as the
     // "milliseconds and seconds share one field" test above, bytes verified
     // there: F7 94 12 03 17 07 1A.
     const base = [_]u8{ 0xF7, 0x94, 0x12, 0x03, 0x17, 0x07, 0x1A };

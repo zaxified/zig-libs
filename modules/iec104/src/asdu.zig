@@ -681,7 +681,7 @@ pub fn decode(bytes: []const u8, params: Params) Error!Asdu {
     // legal 17-octet APDU took the whole connection down through every
     // confirmation path. Refuse it here, before any handler acts on it — a
     // frame the decoder accepts must be one the encoder can echo
-    // (W2 re-audit 2026-09-02, `iec104` F3).
+    // (W2 re-audit, `iec104` F3).
     if (header.vsq.sq and n > 0) {
         const base = readAddress(body[0..isz]);
         const last = @as(u64, base) + @as(u64, n) - 1;
@@ -1509,7 +1509,7 @@ fn fuzzAsdu(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
     // then finds fewer than the eight it needs and returns the range MINIMUM —
     // so `len` was 0 for every seed and `decode` was handed `buf[0..0]`, with
-    // the frame sitting unread in `buf`. Measured 2026-09-07 over the corpus
+    // the frame sitting unread in `buf`. Measured over the corpus
     // above: **0 of 12 seeds non-empty, 0 decoded and 0 objects walked before;
     // 12 of 12 non-empty, 7 decoded and 134 objects walked after.**
     const len: usize = fz.drawInput(S, src, &buf, (try corpus.build()));
@@ -1578,7 +1578,7 @@ test "SQ=1 cannot synthesise an address past the configured ceiling" {
     // this module's own encoder then refuses with `AddressOutOfRange`, on the
     // reply path of essentially every request type — so one legal 11-octet
     // ASDU took the whole connection down. A frame the decoder accepts must
-    // be one the encoder can echo (W2 re-audit 2026-09-02, `iec104` F3).
+    // be one the encoder can echo (W2 re-audit, `iec104` F3).
     var frame: [11]u8 = undefined;
     _ = try std.fmt.hexToBytes(&frame, "648206002f00ffffff1414");
     try testing.expectError(error.AddressOutOfRange, decode(&frame, default_params));

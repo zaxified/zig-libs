@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Tests added by the whole-module mutation audit (2026-11-17): each one pins a
+//! Tests added by the whole-module mutation audit: each one pins a
 //! boundary or a side effect that the original suite could not see. Public API
 //! only; the file is part of the test binary through root.zig.
 
