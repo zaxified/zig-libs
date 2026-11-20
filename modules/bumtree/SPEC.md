@@ -18,7 +18,7 @@
 
 Design + threat notes for auditors. Usage, API and the per-node output contract:
 see [README.md](README.md) and the `src/root.zig` doc comments.
-Attribution/provenance: see `/NOTICE` — none needed here (clean-room from the
+Attribution/provenance: see the README's `Provenance:` line — none needed here (clean-room from the
 public IEEE 802.1aq standard; a public spec is not a copyrightable work, and no
 third-party source or implementation was ported or studied).
 
@@ -85,6 +85,15 @@ replication targets ≤ `node_count − 1`), plus `O(node_count)` transient scra
 arrays are deterministic. `BumTree.deinit` frees `nodes` + `backing`; the
 per-node `replicate_to` slices borrow from `backing`.
 
+## Accessors
+
+`plan`, `rpfIngress`, `rpfCheck`, `replicateTo`, `isMember` and `deliversLocally` are bounds-safe: an out-of-range
+`NodeId` reads as `null` / empty / `false`. `isMember` says only that the id was in the member set; an in-range
+member unreachable from the source is `isMember` yet never receives the frame, so a forwarder asks
+`deliversLocally` (member AND (source OR has an SPT predecessor)) for "will this node deliver locally".
+`Options.prune = false` (the permanent positive control) puts every SPT child into `replicate_to`; it is wrong on
+purpose. `Options.mark_steps` is test-only instrumentation (counts the member-marking walk's steps).
+
 ## Loop-freedom & congruency argument
 
 - **Acyclicity ⇒ terminating, single-touch tree flood.** The SPT is a tree;
@@ -124,62 +133,44 @@ modes are all bounded and defined, never a panic:
 
 ## Verification
 
-Offline only — pure logic, no live-interop surface; the RFC 6329 example (Anchoring) is the one external check. `zig build test-bumtree`
-(Debug + `-Doptimize=ReleaseFast`):
+Offline only — pure logic, no live-interop surface; the RFC 6329 example (Anchoring) is the one external check.
+`scripts/modtest bumtree` (Debug and ReleaseFast):
 
-- **Golden topology** — a 7-node tree with one deliberately member-less branch
-  (node 6); asserts the exact per-node `replicate_to`, `rpf_ingress`, and
-  `is_member` against a hand computation.
-- **Member pruning** — the member-less branch is absent from the parent's
-  `replicate_to`; adding a member on it makes it appear (sorted). The key pruning
-  proof.
-- **RPF correctness** — for every reachable node, `rpfCheck` is true for exactly
-  the predecessor ingress and false for every other neighbour (and false at the
-  source).
-- **Loop-freedom (tree flood)** — flooding down `replicate_to` delivers to each
-  member exactly once, touches no node twice, and never reaches the member-less
-  branch.
-- **RPF backstop (reconvergence flood) + positive control** — on a *meshed*
-  graph, a worst-case flood where every accepting node re-floods to all
-  neighbours yields exactly-once acceptance *with* RPF; **without** RPF the same
-  flood duplicates over the redundant edges (`max acceptance > 1`). Permanent
-  positive control that RPF is load-bearing.
-- **Pruning positive control** — `prune = false` puts the member-less branch back
-  into `replicate_to` and the tree flood then reaches it; proves the prune flag
-  actually gates the branch.
-- **Congruency/determinism** — identical result across scrambled edge-insertion
-  order and repeated rebuilds; an equal-cost diamond resolves to one stable
-  source-rooted parent.
-- **Degenerate cases** — source not in graph, no members, single member == source,
-  isolated source, unreachable member.
-- A `testing.allocator` run leak-checks that `deinit` frees `nodes` + `backing`.
-- **Mutation run 2026-10-05** (in-place, Debug, 24 mutants over the
-  accessors' bounds, `rpfCheck`, `deliversLocally`, the source-range guard,
-  membership marking, the count/fill loops, `included` and the defaulted
-  options): 24 killed. The first pass left 4; one test added (source id ==
-  `node_count`, `deliversLocally` of a reachable non-member, `prune = false`
-  past an unreachable node). Equivalent: none.
+- **Golden topology** — a 7-node tree with one deliberately member-less branch; asserts the exact per-node
+  `replicate_to`, `rpf_ingress` and `is_member` against a hand computation.
+- **Member pruning** — the member-less branch is absent from the parent's `replicate_to`; adding a member on it
+  makes it appear (sorted).
+- **RPF correctness** — for every reachable node, `rpfCheck` is true for exactly the predecessor ingress and false
+  for every other neighbour (and false at the source).
+- **Loop-freedom (tree flood)** — flooding down `replicate_to` delivers to each member exactly once, touches no node
+  twice, and never reaches the member-less branch.
+- **RPF backstop + positive control** — on a meshed graph, a worst-case flood where every accepting node re-floods
+  to all neighbours yields exactly-once acceptance with RPF; without RPF the same flood duplicates over the
+  redundant edges. Permanent positive control that RPF is load-bearing.
+- **Pruning positive control** — `prune = false` puts the member-less branch back into `replicate_to`.
+- **Congruency/determinism** — identical result across scrambled edge-insertion order and repeated rebuilds; an
+  equal-cost diamond resolves to one stable source-rooted parent.
+- **Degenerate cases and boundaries** — source not in graph or equal to `node_count`, no members, single member ==
+  source, isolated source, unreachable member (`deliversLocally`), `prune = false` past an unreachable node.
+- **Leaks** — a `testing.allocator` run checks that `deinit` frees `nodes` + `backing`.
+- **Oracle:** the RFC 6329 §5/§6 worked example, `src/rfc6329_example_test.zig` (Anchoring). No fuzz: no parser, no
+  untrusted input (the card's Hardening line).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
-`zig fmt --check` clean; `zig build check-catalog` green.
+## What is deliberately not done
 
-## Deliberately deferred (out of scope by design, not oversight)
-
-- **All-source trees in one pass** — not yet: the caller loops over sources; no
-  batched multi-source build. See Backlog (`buildAll`) — not deferred by design.
 - **FIB installation** — a plan is returned, not programmed forwarding state.
-- **The 16 SPB ECT algorithm variants / equal-cost multiple trees** — not yet:
-  one congruent tree from `spf-ect`'s single deterministic tie-break. See Backlog
-  (ECT-mask tie-break) — not deferred by design.
-- **Replication I/O** — encap, TTL, and sending the copies are `l2encap` /
-  `l2forward`.
+- **Replication I/O** — encap, TTL, and sending the copies are `l2encap` / `l2forward`.
 - **Designated-forwarder election** — the separate `df-elect` module.
-- **Topology extraction** — building the `spf-ect.Graph` from an LSDB is the
-  upstream `isis-spf`'s job.
+- **Topology extraction** — building the `spf-ect.Graph` from an LSDB is the upstream `isis-spf`'s job.
+
+(The all-sources batch and the 802.1aq ECT-mask variants are not refused: see *Backlog / deferred*.)
 
 ## Backlog / deferred
 
 - **802.1aq ECT-mask tie-break in `spf-ect` (or a variant hook in `bumtree.build`)** (survey 2026-09-30): two SPB bridges only agree on the tree if they run the same ECT algorithm; a network with a non-Zig bridge needs the standard's, not ours. Effort M (needs the standard's algorithm text; no public vectors, see Anchoring). Fits CONVENTIONS §2 (pure Zig).
-- **All-sources / all-I-SIDs batch (`buildAll`)** (survey 2026-09-30): what an SPB node actually computes on a topology change is the state for every (source, I-SID) pair; today the caller loops over `build`. Effort S. Fits §2. (Filed by the survey because the reference simulator does it in one pass; the entry above now points here.)
+- **All-sources / all-I-SIDs batch (`buildAll`)** (survey 2026-09-30): what an SPB node actually computes on a topology change is the state for every (source, I-SID) pair; today the caller loops over `build`. Effort S. Fits §2. The reference simulator does it in one pass.
 
 ## Anchoring
 
@@ -211,5 +202,3 @@ Offline only — pure logic, no live-interop surface; the RFC 6329 example (Anch
 - **Node :1's rows for the other sources in Figure 3** — the RFC prints none (not transit); the corresponding leaf behaviour is asserted from the text instead.
 - **Nodes other than :1 and :2** — the RFC prints no FDB for them.
 - The RFC's ECT tie-break (fewest hops between fork/join, then lower BridgeID) is *not* `spf-ect`'s (a reversal-invariant sorted-node-multiset order). They agree on every tie in this network; the general equivalence, and the other 15 ECT-MASK algorithms, are not shown (Backlog: 802.1aq ECT-mask tie-break).
-
-**How it got there.** Transcribed by hand from `rfc6329.txt` (RFC Editor, April 2012) §5-§6, Figures 2-7; every row agreed with the module on the first run, so nothing had to be reconciled.

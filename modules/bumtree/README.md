@@ -13,7 +13,8 @@ node `N`, the two outputs a forwarder needs:
    replicate a BUM-from-`S` frame to = `N`'s children in `S`'s SPT (nodes whose
    SPT predecessor is `N`), pruned to only children whose subtree holds at least
    one member, so BUM is never flooded down a member-less branch. Sorted
-   ascending, deterministic. If `N` is itself a member (`isMember(N)`) it also
+   ascending, deterministic. If `N` is itself a member that is reachable from `S`
+   (`deliversLocally(N)`; `isMember(N)` alone is also true for a member partitioned away from `S`) it also
    delivers the frame locally.
 2. **RPF ingress** (`rpfIngress(N)` / `rpfCheck(N, ingress)`) — the single
    neighbour a BUM-from-`S` frame may legally arrive on = `N`'s SPT predecessor
@@ -25,8 +26,7 @@ Path Forwarding Check (RPFC). Clean-room from the public standard.
 
 **Status:** `any · util · single_owner` · deps: `spf-ect` (which owns Dijkstra +
 the ECT tie-break) — canonical metadata is `pub const meta` in `src/root.zig`.
-Scope is one source per call (the caller iterates sources); see the deferred list
-below.
+Scope is one source per call (the caller iterates sources); see *Not provided* below.
 
 ## Why (the gap this closes)
 
@@ -76,7 +76,7 @@ defer tree.deinit();
 
 // At node N, replicate a BUM-from-source frame to these neighbours:
 for (tree.replicateTo(n)) |next_hop| { /* … */ }
-if (tree.isMember(n)) { /* local delivery */ }
+if (tree.deliversLocally(n)) { /* local delivery */ }
 
 // On receiving a BUM-from-source frame on edge `ingress` at node N:
 if (!tree.rpfCheck(n, ingress)) { /* drop — failed RPF */ }
@@ -92,17 +92,11 @@ which turns a synchronised link-state database (`isis-lsdb`) into an `spf-ect`
 graph the same way and consumes the resolved tree; this module never parses an
 LSDB itself.
 
-## Deferred (see `SPEC.md`; all-source builds and the ECT variants are Backlog, not out of scope by design)
+## Not provided
 
-- **All-source trees in one pass** — the caller loops over sources; there is no
-  batched multi-source build here.
-- **FIB installation** — this returns a plan (per-node replication set + RPF
-  ingress), not programmed forwarding state.
-- **The 16 SPB ECT algorithm variants / equal-cost multiple trees** — one
-  congruent tree from `spf-ect`'s single deterministic tie-break.
-- **The replication I/O itself** — encap, TTL, and actually sending copies are
-  `l2encap` / `l2forward`.
-- **Designated-forwarder election** — the separate `df-elect` module.
+FIB installation, the replication I/O, designated-forwarder election and topology extraction belong to other
+modules or to the caller; all-source batches and the 802.1aq ECT-mask tie-break variants are not built yet. See
+`SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify
 
@@ -112,5 +106,4 @@ zig build test-bumtree -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
 Provenance: clean-room from the IEEE 802.1aq standard; no third-party source or
-implementation ported or studied — no `NOTICE` entry (see `/NOTICE` and
-`CONVENTIONS.md` §5).
+implementation ported or studied — no `NOTICE` entry (`CONVENTIONS.md` §5).
