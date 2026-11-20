@@ -34,7 +34,8 @@
 //! mismatch) and truncates there. For a genuine torn tail this is exact
 //! recovery; for mid-file media corruption it also discards every later
 //! record — v0 trades that (rare, media-level) case for a simple, provable
-//! invariant: **everything reachable after `open` is CRC-valid**.
+//! invariant: **every record `open` replays is CRC-valid** (a hinted merge
+//! output is not replayed: its records are checked when read instead).
 //!
 //! **Concurrency:** writers are serialized by one lock (`Db.lock`) held for
 //! their whole duration, fsync included; readers take a read-write lock
@@ -1353,7 +1354,7 @@ pub const Db = struct {
         }
 
         fn liveAt(e: Entry, now: i64) bool {
-            return now < e.expires_at;
+            return !e.expires() or now < e.expires_at;
         }
     };
 
@@ -1496,7 +1497,6 @@ pub const Db = struct {
             }
             try self.adoptFile(legacy_id, h, version_plain);
             h_owned = false;
-            self.active().size = header_len;
         } else {
             var hdr: [header_len]u8 = undefined;
             try store.preadFull(h, &hdr, 0);
@@ -8777,6 +8777,13 @@ test "expiry: a clock at the end of i64 time hides the expiring keys and only th
     try testing.expectEqual(@as(usize, 1), it.remaining());
     try testing.expect(db.exists("a"));
     try testing.expect(!db.exists("b"));
+    // count, deadBytes and fileStats agree: the non-expiring key stays live.
+    try testing.expectEqual(@as(usize, 1), db.count());
+    try testing.expectEqual(recordLenExp(true, 1, 1), db.deadBytes());
+    const stats = try db.fileStats(testing.allocator);
+    defer testing.allocator.free(stats);
+    try testing.expectEqual(@as(u64, 1), stats[0].live_keys);
+    try testing.expectEqual(@as(u64, 1), stats[0].dead_keys);
 }
 
 test "FileStat and fileStats: fragmentation of an empty file, the single file's id, expired keys" {

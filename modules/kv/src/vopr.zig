@@ -46,9 +46,8 @@
 //! Provenance: the VOPR approach — deterministic storage simulation, fault
 //! injection at I/O granularity, model-checked crash recovery, reproduction
 //! from a seed — is modeled after TigerBeetle's VOPR (Apache-2.0; design
-//! reference only, no TigerBeetle code consulted or copied; credited in the
-//! repository NOTICE). The splitmix64 mixer is the public-domain algorithm
-//! by Sebastiano Vigna. Implementation is clean-room on top of this module's
+//! reference only, no TigerBeetle code consulted or copied). The splitmix64
+//! mixer is the public-domain algorithm by Sebastiano Vigna. Implementation is clean-room on top of this module's
 //! own `SimStorage`.
 
 const std = @import("std");

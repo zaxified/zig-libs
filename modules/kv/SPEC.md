@@ -648,7 +648,6 @@ Boundaries no test reaches because they need an input too large to build:
 
 ## Backlog / deferred
 
-- **LOW: `count()`, `deadBytes()` and `fileStats()` use `liveAt(now)` without the `expires()` guard** `get`/`keys`/`iterator` have — with an injected clock at exactly `maxInt(i64)` they drop non-expiring keys (the real clock cannot reach it). Also two redundant size assignments around `adoptFile`. With the next kv source change.
 - **Speed: `put_sync` is fsync-bound** — every durable put is write + `fsync` on both sides. Path to a lead there: preallocate the active file (`Storage.allocate`, size extended) and `syncData` appends into the reserved space (§ "Optional preallocation": 800–910 syncs/s against ~305/s growing the file). Costs: replay must stop at the reserved zeros (it does: a zero record fails its CRC, so a writer cuts them and a reader stops), rotation must trim before sealing, crash sweeps over reserved space. Effort: medium.
 - **Incremental tail replay for `Db.refresh`.** A refresh is a full open (hints make merged files cheap; the active file and unmerged sealed files are replayed). Worth doing if a caller refreshes often. Idea.
 - **On-disk ordered index / MVCC / transactions** (deferred, see *What is deliberately not done*). When greenlit: steal patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC over kv's existing atomic-swap seam) and TigerBeetle's VOPR methodology (not code); phased: ordered-scan B-tree → MVCC snapshot reads → secondary indexes. Bitcask kv is enough until then.
