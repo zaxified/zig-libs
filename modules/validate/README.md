@@ -230,7 +230,16 @@ var report = try validate.validateJsonRoot(gpa, body, &root, .{});   // errors a
 `ipv6` `hostname` `date` `time` `date_time` `duration` `json_pointer`. go-playground's (each cites its
 baked-in in the `Format` doc): `uuid3` `uuid4` `uuid5` (lowercase, version + variant) `uuid7`
 `uuid_rfc4122` `http_url` `https_url` `base64` `base64_url` `base64_raw_url` `hex` `e164` `alpha`
-`alphanumeric` `numeric` `ascii` `lowercase` `uppercase` `jwt` `semver` `cidr` `mac`. All pure, no
+`alphanumeric` `numeric` `ascii` `lowercase` `uppercase` `jwt` `semver` `cidr` `mac`; and the second wave:
+colours (`hexcolor` `rgb` `rgba` `hsl` `hsla` `cmyk`), `isbn` `isbn10` `isbn13` `issn`, crypto addresses
+(`eth_addr` `eth_addr_checksum` `btc_addr` `btc_addr_bech32`), `uuid3_rfc4122` `uuid4_rfc4122` `uuid5_rfc4122`,
+`ulid` `base32` `multibyte` `datauri` `alphaunicode` `alphanumunicode` `non_control_character` `cidrv4` `cidrv6`,
+hostnames and origins (`fqdn` `dns_rfc1035_label` `hostname_rfc952` `hostname_port` `origin`), `urn_rfc2141`
+`urn_rfc8141` `html_encoded` `url_encoded` `html`, socket addresses (`tcp4_addr` `tcp6_addr` `tcp_addr` `udp4_addr`
+`udp6_addr` `udp_addr` `ip4_addr` `ip6_addr` `ip_addr`, literal IPs only), ISO code sets (`iso3166_1_alpha2`
+`iso3166_1_alpha2_eu` `iso3166_1_alpha3` `iso3166_1_alpha3_eu` `iso3166_1_alpha_numeric`
+`iso3166_1_alpha_numeric_eu` `iso4217` `iso4217_numeric`), `bcp47_language_tag` `bcp47_strict_language_tag`,
+`bic_iso_9362_2014` `bic`, `credit_card` `luhn_checksum`, `cve` `ssn` `ein` `cron`. All pure, no
 allocation, never a panic.
 
 ## Semantics (pydantic / JSON Schema alignment)
@@ -255,13 +264,13 @@ allocation, never a panic.
   policy). `array`/`object` kinds are not representable in a query string.
 - **Bounds compare as f64** — exact for integers up to 2^53.
 
-Known limits: `pattern` is literal/prefix/suffix/charset only — **regex is
-out of scope** (a future ADOPT dependency; TODO in the module doc; use
-`Pattern.matcher`). A JSON array root needs `validateJsonRoot` or a
+Known limits: `pattern` is literal/prefix/suffix/charset and the other string
+shapes only — **there is no regex engine in this module** (pass the caller's
+as `Pattern.matcher`; the repo's `regex` module is not a dependency yet). A JSON array root needs `validateJsonRoot` or a
 `[]const T` body (the field-rule schema describes objects). The go-playground
 tag list (~170) is not matched one-for-one — see SPEC *Where we are behind*.
 `min`/`max` are f64, so a bound past 2^53 is the nearest double (`maxInt(i64)` is 2^63); an
-integer VALUE is compared with it exactly (since 2026-10-24). A duplicate JSON object key, at
+integer VALUE is compared with it exactly. A duplicate JSON object key, at
 any depth, refuses the whole body (`json_invalid`) on both paths -- never "last wins".
 
 ## Verification
