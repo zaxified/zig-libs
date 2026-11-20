@@ -84,7 +84,9 @@ a curve point, or judge standardness. A script outside the templates is
 ## Limits and refusals
 
 Script <= 42 bytes; address <= 90 characters (`bech32.max_len`); WIF <= 52 characters
-(`max_wif_len`); redeem script 520, witness script 10000. Untrusted address lengths are bounded
+(`max_wif_len`); redeem script 520, witness script 10000. `wifEncode` needs the encoded length in `out` (51 bytes for an
+uncompressed key, 52 compressed: `base58.maxEncodedLenFor`; `max_wif_len` is always enough). `Decoded.script_buf` and
+`Address.buf` are undefined past their `len`: use `script()` / `slice()`. Untrusted address lengths are bounded
 before any O(n²) work by `bech32.base58` (`InputTooLong` / `BufferTooSmall`, mapped to
 `InvalidPayloadLength` here).
 
@@ -99,8 +101,8 @@ scratch in `wifDecode` are wiped with `std.crypto.secureZero` on every exit (CON
 the compiler may still keep copies in registers or spill slots — the caveat of §2.1 applies).
 `wifDecode(out, s)` writes the key only into the caller's `*Wif` (never returned by value; `out.key` zeroed on error) and runs under a dead-stack burn, like `wifEncode`.
 What is left to the caller: `Wif.key` (`Wif.wipe()`) and the `out` buffer given to `wifEncode`.
-`base58` is **not constant-time** in the secret (it inherits `bech32.base58`'s documented limit,
-`alphabet[d]` indexed by payload digits); this module makes no constant-time claim. The address
+The WIF paths go through `bech32.base58`'s constant-time `checkEncodeSecret` / `checkDecodeSecret`, and the
+scalar range check (`keyInRange`) is a constant-time borrow-and-mask with one declassified verdict. The address
 side has no secrets.
 
 ## Verification
@@ -116,33 +118,14 @@ sets, BIP173/BIP350 examples (P2WPKH, P2WSH, P2TR, v16), BIP143's P2SH-P2WPKH sc
 `1` WIF strings (mainnet/compressed/uncompressed/signet), helper limits, and the P2SH / P2WSH
 helper results, whose expected values were derived independently with Python `hashlib`.
 
-### Audit 2026-10-03
-
-Review of `src/root.zig` (templates, both decode paths, WIF, helpers) against Bitcoin Core's
-`key_io.cpp` behaviour and BIP16/141/143/173/350, plus the `bech32.base58` bounds it relies on. No
-HIGH/MED/LOW defect found: every rejection path returns a typed error, scratch is wiped on every
-exit, no input-controlled index or allocation exists. INFO only: (1) `keyInRange` (`root.zig`,
-`std.mem.eql`/`order`) is not constant-time in the key; the module makes no such claim and the
-check compares against a public constant, but a caller who needs it must not rely on this function.
-(2) `wifEncode` needs only the encoded length in `out`, not `max_wif_len` as its doc says (a
-10-byte buffer gives `BufferTooSmall`, a 51-byte one suffices for an uncompressed key).
-**Update 2026-10-18:** (1) is fixed — `keyInRange` is now a constant-time borrow-and-mask
-comparison with one declassified verdict — and the WIF paths use `bech32`'s constant-time
-`checkEncodeSecret`/`checkDecodeSecret`; (2) still holds (51 / 52 bytes, the CT encoder's
-`maxEncodedLenFor` bound, which is every WIF's actual length). ctgrind target `wif`
-(`src/ctgrind_harness.zig`, 2026-10-18): the key through `wifEncode` and back through `wifDecode`,
-0 in-file contexts, witness 2; the old early-exit range check measured 6 in-file (negative
-control), so the row guards `keyInRange` as well as the base58 path `bip32`'s `xprv` row covers.
-(3) `Decoded.script_buf` / `Address.buf` bytes past `len` are undefined; use `script()` / `slice()`.
-
-Mutation run (schemata, ReleaseSafe, one binary, 53 mutants on the template bytes, version-opcode
-range, network versions / HRP / sets, decode path selection, WIF length / flag / key range, helper
-bounds): 53 killed, 0 equivalent. The first pass left 11 alive: each fixed byte of the P2PKH and
-P2SH templates (8 mutants: no test altered a single template byte), the witness-version range
-edges `0x50` / `0x61` (OP_RESERVED / OP_NOP would have been read as v0 / v17), "any version with a
-32-byte program is P2TR", and the `0x04` prefix check of 65-byte keys (hybrid `06`/`07`). Three
-tests added in `src/unit_test.zig` (`classify: every byte ...`, `classify: the witness version
-opcode ...`, `helpers: a 65-byte key must start with 0x04`); the 11 mutants were rerun and die.
+- **Fuzz:** `BTCADDR_FUZZ` (testkit's deterministic driver, `src/fuzz_test.zig`): `btcaddr-decode`, `btcaddr-roundtrip`.
+- **Stack hygiene:** `src/stackprobe_test.zig` checks that no private-key residue is left after `wifEncode`.
+- **Constant time:** ctgrind row `wif` (`scripts/checks/ctgrind.sh btcaddr`, `src/ctgrind_harness.zig`): the key through
+  `wifEncode` and back through `wifDecode`; it guards `keyInRange` as well as the base58 path. A test holds
+  `keyInRange` to the byte-order comparison it replaced.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it (template bytes, version-opcode range, network versions / HRP / sets, decode path
+  selection, WIF length / flag / key range, helper bounds).
 
 ## Backlog / deferred
 
@@ -152,11 +135,6 @@ opcode ...`, `helpers: a 65-byte key must start with 0x04`); the 11 mutants were
 - **Non-standard-script hints** (P2PK, bare multisig, `OP_RETURN` data) as a typed `ScriptKind` instead of `UnsupportedScript` — never for addresses (they have none); maybe as `classify` extension if a consumer asks.
 - **Public-key validation** via `k256` (point on curve) in the key helpers — not now: would add a dependency for a check most callers already made.
 - **`witness_unknown` constructor** (`scriptWitness(version, program)`) — not now; `fromScriptPubKey` on hand-built bytes covers it.
-
-## Status
-
-`extract · any · codec · reentrant` + deps: `bech32`, `ripemd160` — canonical source is `pub const meta` in
-src/root.zig.
 
 ## Anchoring
 
