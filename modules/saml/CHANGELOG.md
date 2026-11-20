@@ -5,8 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog: one item marked done in place (verified in code): DONE 2026-11-13 (the text above is stale: `Config.max_c14n_output_len` exists, default `default_max_c14n_output_len` = 4 MiB, modules/saml/src/root.zig:301,352-356, commit 938edd5e1).
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit of `root.zig` (438 mutants, 407 killed, 31 equivalent or unobservable, see SPEC "Audit 2026-11-18"): 61 tests in `test_mutants*.zig`; `test_hok_crossform.zig` exports its EC certificate and point for them. Pinned: `decodeRedirectField` refuses a stream that inflates to exactly `max_redirect_inflated` octets (the cap is exclusive).
 - **2026-11-16** — `buildSignedAuthnRequest(alloc, opts, key)`: an AuthnRequest with an enveloped RSA-SHA256 signature
   after `<Issuer>` for the HTTP-POST binding (`AuthnRequestsSigned`). `buildAuthnRequest` is unchanged (same bytes, same
   error set); both share one builder.
@@ -22,11 +20,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE** (compile follow-up to `xmldsig`'s new `error.OutputTooLarge`): the three exhaustive `xmldsig.c14n.canonicalize` error switches map it (`SigningAssemblyFailed` when signing, `MalformedSoap` for an inbound `ArtifactResponse`); an oversized canonical form in `verify` already folded into `SignatureInvalid`.
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `stripLeadingZeros` helper is gone; its call sites use `std.mem.trimStart(u8, bytes, &.{0})` (same result, including the empty result for all-zero input).
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std's unchecked DER reader (`Certificate.parse`) re-read against the 0.17.0 std (unchanged); 0.16-only measurements are labelled as such.
 
 - **2026-10-18** — Ported to Zig 0.17.0 (no source change needed).
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** consume burn 128 → 256 KiB, probe window 256 → 512 KiB: `consumeResponseXml` reached the 256 KiB window at CI's `-Dcpu` (the larger rsa capacity).

@@ -6,7 +6,8 @@ Consumes an IdP's `<samlp:Response>`, defends against XML-Signature-Wrapping
 clock, and returns a trusted `AuthnResult`.
 
 Top of the SAML cluster: `xml` → `xmldsig` → **`saml`** (plus `xmlenc` + `rsa`
-for the optional encrypted-assertion path). See `SPEC.md` for the full profile,
+for the optional encrypted-assertion path and the SP's own RSA signatures, `x509` for the
+Holder-of-Key cross-form match, `datefmt` for xsd:dateTime). See `SPEC.md` for the full profile,
 the XSW defense model, and fixture provenance.
 
 Security posture in one breath: the IdP key (or, for certificate rollover, the
@@ -39,8 +40,7 @@ sender-vouches trust assumption, and the LoA semantics.
 
 Provenance: clean-room from OASIS SAML 2.0 (SAMLCore / SAMLProf), a public
 specification, hardened per the published *On Breaking SAML* signature-wrapping
-analysis. No third-party SAML implementation was consulted, so no `NOTICE`
-entry is required (root [`NOTICE`](../../NOTICE) §0). Per-fixture provenance —
+analysis. No third-party SAML implementation was consulted (no `NOTICE`: clean-room). Per-fixture provenance —
 which vectors are captured and which are constructed — is in `SPEC.md`.
 
 ## Worked example — verify a POST-binding Response
@@ -181,6 +181,13 @@ The same field is on `LogoutRequestConfig`, `LogoutResponseConfig` and
   `consumeResponseXml(alloc, xml_bytes, config)` skips the decode.
 - **Redirect**: `decodeRedirectField(alloc, field)` does base64 → raw DEFLATE
   (you URL-decode first); mostly relevant for requests.
+
+## Not provided
+
+The IdP side (issuing Responses, building `ArtifactResponse`), performing the Artifact back-channel HTTP call,
+verifying metadata signatures, and ECDSA for the SP's own signatures; see SPEC "What is deliberately not done" and
+"Backlog / deferred". Single Logout, the Artifact binding's message layer and `parseIdpMetadata` /
+`parseIdpMetadataFor` are described in SPEC.
 
 ## Tests
 

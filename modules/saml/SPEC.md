@@ -23,7 +23,7 @@ SP (relying-party) side is compared: the IdP side is out of scope for this modul
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [SAML-Toolkits/python3-saml](https://github.com/SAML-Toolkits/python3-saml) — **reference** (the OneLogin toolkit family: also `java-saml`, `php-saml`) | Python | MIT | 757 | v1.16.0 (2023-10-09; push 2026-01) | README (read): SSO and SLO (SP- and IdP-initiated), assertion and NameID encryption, signed AuthnRequests/metadata, **publishing SP metadata** (with `sp_new` cert for key rollover), fingerprint or cert pinning, replay guidance. Here (re-assessed 2026-10-06): SP metadata (`buildSpMetadata`, optionally signed), several IdP keys (`additional_idp_keys`) and the common AuthnRequest knobs are now even; python3-saml still signs a POST-binding AuthnRequest and the SP with ECDSA, this module does not. |
+| [SAML-Toolkits/python3-saml](https://github.com/SAML-Toolkits/python3-saml) — **reference** (the OneLogin toolkit family: also `java-saml`, `php-saml`) | Python | MIT | 757 | v1.16.0 (2023-10-09; push 2026-01) | README (read): SSO and SLO (SP- and IdP-initiated), assertion and NameID encryption, signed AuthnRequests/metadata, **publishing SP metadata** (with `sp_new` cert for key rollover), fingerprint or cert pinning, replay guidance. Here (re-assessed 2026-10-06): SP metadata (`buildSpMetadata`, optionally signed), several IdP keys (`additional_idp_keys`) and the common AuthnRequest knobs are now even; python3-saml also signs the SP's messages with ECDSA, this module signs RSA-SHA256 only. |
 | [crewjam/saml](https://github.com/crewjam/saml) | Go | BSD-2-Clause | 1.1k | push 2026-01-29 (no GitHub releases) | SP **and IdP**, SP metadata, middleware for `net/http` *(inferred)*. |
 | [russellhaering/gosaml2](https://github.com/russellhaering/gosaml2) | Go | Apache-2.0 | 370 | v0.12.0 (2026-08-05) | SP-only Go library, metadata, encrypted assertions, SLO *(inferred)*. |
 | [node-saml/node-saml](https://github.com/node-saml/node-saml) | TypeScript | MIT | 135 | v5.1.0 (2025-07-21; push 2026-09) | SP-only core of passport-saml: AuthnRequest, response validation, SP metadata generation, multiple IdP certs *(inferred)*. |
@@ -35,15 +35,14 @@ SP (relying-party) side is compared: the IdP side is out of scope for this modul
 node-identity proof, not by convention (`test_xsw.zig` fixtures); Holder-of-Key and
 sender-vouches confirmation, eIDAS encrypted-assertion profile with an external anchor, Level of
 Assurance, Artifact binding message layer, signed Redirect SLO; never reads the clock or an RNG.
-**Even (since 2026-10-06):** SP metadata generation (`buildSpMetadata` — ACS/SLO endpoints,
+**Even:** SP metadata generation (`buildSpMetadata` — ACS/SLO endpoints,
 signing/encryption `KeyDescriptor`s, NameIDFormats, AttributeConsumingService, Organization,
 ContactPerson, optionally signed), IdP certificate rollover (`additional_idp_keys` on every
 verifying config), and the AuthnRequest options `ForceAuthn`, `IsPassive`,
-`RequestedAuthnContext`, `AttributeConsumingServiceIndex`, `ProtocolBinding`.
-**Where we are behind:** an embedded signature on a POST-binding AuthnRequest (Redirect-binding
-signing exists), ECDSA for the SP's own signatures, no IdP side (→ Backlog).
-**Re-assessed 2026-10-06** against the same reference (python3-saml v1.16.0) after the three
-survey gaps landed; no new web survey — the table above is a week old.
+`RequestedAuthnContext`, `AttributeConsumingServiceIndex`, `ProtocolBinding`, and an embedded
+signature on a POST-binding AuthnRequest (`buildSignedAuthnRequest`).
+**Where we are behind:** ECDSA for the SP's own signatures (→ *Backlog / deferred*), no IdP side
+(→ *What is deliberately not done*).
 
 Layer 3 (top) of the SAML cluster: **`xml`** (hardened, namespace-aware,
 C14N-ready parser) → **`xmldsig`** (Exclusive/Canonical C14N + XML-Signature
@@ -57,7 +56,7 @@ returns a trusted `AuthnResult`, or a typed error.
   see their own sections below. The IdP side is out of scope throughout.
 - **HTTP-POST binding** for the Response (base64 of the XML) is the priority.
   A **HTTP-Redirect** codec (`decodeRedirectField` / `encodeRedirectField`:
-  base64 ↔ raw DEFLATE, capped at 1 MiB on decode) is provided; URL-encoding
+  base64 ↔ raw DEFLATE, capped at `max_redirect_inflated`, 64 KiB, on decode) is provided; URL-encoding
   is the caller's job. SLO messages fully support Redirect, including the
   query-string signing scheme (`buildSignedRedirectQuery` /
   `verifyRedirectSignature`) — see "Single Logout" below.
@@ -106,6 +105,14 @@ returns a trusted `AuthnResult`, or a typed error.
 - Adversarial DER is never parsed here. `parseIdpMetadata` hands back raw
   certificate DER for the caller to parse/pin — it does **not** feed it to
   `std.crypto.Certificate` (which is not panic-safe on hostile DER in Zig 0.16; its unchecked DER reader is unchanged in 0.17.0).
+- **Pre-authentication work is bounded.** Verification runs on an unauthenticated message. The parse is
+  capped at `max_untrusted_elements` (8192) elements, and every `xmldsig.verify` gets
+  `max_c14n_output_len` (a field of `Config`, `LogoutRequestConfig`, `LogoutResponseConfig` and
+  `ArtifactResponseConfig`; default `default_max_c14n_output_len`, 4 MiB) as the cap on the canonical form it may build
+  for `<SignedInfo>` and every referenced subtree; a document over the cap fails the signature
+  (`SignatureInvalid`). Raise it only for responses that carry big inline text. Residual: a Response can still
+  make one reference canonicalize to up to the cap (arena growth several times that) before the signature is
+  checked, and `consumeArtifactResponseSoap` can return an enclosed message of that size.
 
 ## The XML-Signature-Wrapping (XSW) defense (the headline property)
 
@@ -281,13 +288,13 @@ TLS client certificate) and/or as a bare public key
   malformed DER, an algorithm outside RSA/P-256, an EC key without a
   `namedCurve`, a non-P-256 curve — is **incomparable**, which is a rejection,
   never a match.
-- **Remaining same-form limitations (unchanged).** Same-form certificate
+- **Same-form limitations.** Same-form certificate
   matching is still DER byte-equality, so a re-encoded but equivalent
   certificate does not match it; same-form `<ECKeyValue>` matching is still
   point-byte equality against the caller's opaque `.ec_sec1` blob. Both are
   deliberately left as they were: the cross-form path is where curve context
   exists on both sides, so it is the one that canonicalizes. In practice a
-  re-encoded certificate now still matches *via* the cross-form key comparison
+  re-encoded certificate still matches *via* the cross-form key comparison
   whenever the caller also supplies `presented_holder_key`.
 - **HoK vs Bearer checks.** The HoK key check **replaces** the Bearer `Recipient`
   check. Per the SAML HoK Web-SSO profile, `Recipient` / `InResponseTo` MAY be
@@ -298,9 +305,7 @@ TLS client certificate) and/or as a bare public key
   presented cert nor presented key configured → `error.PresentedKeyMissing`. At
   least one comparison ran to a verdict and none matched →
   `error.HolderOfKeyMismatch`. Key material was named but NONE of it could be
-  reduced to a comparable key → `error.HolderOfKeyCrossFormUnsupported` (kept,
-  with its meaning narrowed from "cross-form is not implemented" to "nothing
-  here could be compared"). Defaults keep the Bearer path byte-for-byte
+  reduced to a comparable key → `error.HolderOfKeyCrossFormUnsupported` (nothing here could be compared). Defaults keep the Bearer path byte-for-byte
   unchanged.
 
 ## Sender-vouches subject confirmation
@@ -344,16 +349,12 @@ also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
   name `sp_entity_id` (multiple restrictions are ANDed; fail-closed if none) →
   `AudienceMismatch`. `<OneTimeUse>` presence is flagged (`AuthnResult.one_time_use`).
   **A `<saml:Condition>` extension element is a hard reject**
-  (`error.ConditionNotUnderstood`, A1 audit F13, closed 2026-09-11): this
+  (`error.ConditionNotUnderstood`): this
   module implements no extension condition types, and SAMLCore §2.5.1.1
   rule 3 is explicit that an unrecognized `<Conditions>` sub-element makes
   the assertion's condition validity Indeterminate, which "MUST be
   rejected by a relying party" — the same fate as Invalid, not a
-  downgrade to "valid minus one condition". BEHAVIOURAL: an assertion
-  carrying a `<saml:Condition>` this module previously accepted (silently
-  ignoring the condition) is now rejected. No consumer of this module
-  exists in this repository (Q1: follow the norm even where it tightens
-  today's accepted input).
+  downgrade to "valid minus one condition".
 - **`<SubjectConfirmation>`** (see the two sections above for the method policy):
   Bearer (Web SSO default) requires `Recipient` == `acs_url` (`RecipientMismatch`),
   `NotOnOrAfter` enforced, and `InResponseTo` == `expected_in_response_to` (or
@@ -368,9 +369,7 @@ also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
   later, invalid `<SubjectConfirmation>` (e.g. a Bearer confirmation with
   a wrong `Recipient`) present alongside an earlier valid one (e.g.
   sender-vouches under `.either`) does not and must not undo the earlier
-  success — investigated as an open audit question, closed 2026-09-11 as
-  NOT A DEFECT once the actual spec text was read (`QUESTIONS-ROUND-2.md`
-  Q5: "where the norm isn't silent, follow it").
+  success.
 - **Assertion `<Issuer>`: REQUIRED, and it must equal `idp_entity_id`** →
   `IssuerMissing` / `IssuerMismatch`. See the next section for why absence is an
   error rather than a skipped check.
@@ -381,12 +380,10 @@ also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
 
 ## `<Issuer>` enforcement fails closed
 
-`Config.idp_entity_id` used to be enforced only by `if (element present) then
-compare`, and the assertion's own `<Issuer>` was not read at all. Deleting one
-element therefore skipped the check entirely on every message type — an
-authentication bypass in the SP, not a hygiene gap. Enforcement is now presence
-+ value wherever the profile mandates the element, with the one documented
-exception below. Regression tests: `src/test_issuer.zig`.
+`Config.idp_entity_id` is enforced as presence + value wherever the profile mandates
+the element, with the one documented exception below: deleting a mandatory
+element must never skip the check (an `if (element present) then compare` would be
+an authentication bypass in the SP, not a hygiene gap). Tests: `src/test_issuer.zig`.
 
 | Consumer | `<Issuer>` | Authority (verbatim) |
 |---|---|---|
@@ -413,21 +410,35 @@ Documents read: `saml-core-2.0-os` and `saml-profiles-2.0-os` (OASIS Standard,
 
 - **`buildAuthnRequest`** (SP-initiated SSO): emits a `<samlp:AuthnRequest>` with
   a **caller-supplied** ID and IssueInstant (no RNG, no clock in the module),
-  `AssertionConsumerServiceURL`, `Issuer`, optional `NameIDPolicy`, and (since
-  2026-10-06) `ForceAuthn`, `IsPassive`, `ProtocolBinding` (`ResponseBinding`
+  `AssertionConsumerServiceURL`, `Issuer`, optional `NameIDPolicy`, `ForceAuthn`,
+  `IsPassive`, `ProtocolBinding` (`ResponseBinding`
   enum: HTTP-POST or HTTP-Artifact — HTTP-Redirect is unrepresentable because
   SAMLProf §4.1.2 forbids it for the Response), `AttributeConsumingServiceIndex`
   and `<RequestedAuthnContext Comparison>` with a list of
   `AuthnContextClassRef`s (an empty list omits the element: the schema requires
-  at least one). Default options emit the same bytes as before. The caller
+  at least one). Options left at their defaults are not emitted. The caller
   applies the binding (deflate+base64+URL-encode for Redirect). An IdP may
   answer with a different context than requested; enforce it on the way back
   with `Config.required_loa`.
+- **`buildSignedAuthnRequest(alloc, opts, key)`**: the same options and the same builder, with an
+  enveloped RSA-SHA256 / exclusive-C14N `<ds:Signature>` right after `<Issuer>`, referencing `opts.id`
+  (which must be an NCName) — what an IdP with `AuthnRequestsSigned="true"` expects over the HTTP-POST binding.
+  A separate function, so `buildAuthnRequest`'s error set (`std.mem.Allocator.Error`) does not widen; it
+  signs through `signProtocolMessage` (see "SP-side signing"). For the Redirect binding build the unsigned
+  request and sign the query with `buildSignedRedirectQuery`.
 - **`buildSpMetadata`** — see "SP metadata" below.
 - **`parseIdpMetadata`**: `<md:EntityDescriptor>` → entityID, SSO endpoints, and
   `<md:KeyDescriptor use="signing">` certificate **DER** (raw bytes only, for the
-  caller to parse/pin), plus `mdui:UIInfo` display data. `parseIdpMetadataFor` does the same
-  for one entity of an `<md:EntitiesDescriptor>` aggregate (2026-11-16).
+  caller to parse/pin), plus `mdui:UIInfo` display data (`IdpMetadata.ui_info`: `DisplayName`,
+  `Description`, `Logo` with `xml:lang`; at most `max_ui_entries` (64) per list, the rest ignored).
+- **`parseIdpMetadataFor(alloc, xml, entity_id, AggregateOptions)`**: the same for one entity of an
+  `<md:EntitiesDescriptor>` aggregate (a federation's metadata file), through nested groups; a plain
+  `EntityDescriptor` root is accepted when its `entityID` matches. Bounded by `AggregateOptions`
+  (`max_elements` 2^20, `max_nesting` 8, `max_entities` 100,000: exceeding one is `MalformedMetadata`); no
+  descriptor with that `entityID` is `EntityNotFound`, two or more `AmbiguousEntity` (none is chosen). **No
+  metadata signature is verified** by either function (nor `validUntil`): fetch the aggregate over a channel you
+  trust or verify its `<ds:Signature>` with `xmldsig` first. Entity attributes and `md:EncryptionMethod` are not
+  read (Backlog).
 
 ## SP metadata (`buildSpMetadata`)
 
@@ -468,12 +479,11 @@ the document is signed by the same `signProtocolMessage` the SLO builders use, t
 
 ## SP-side signing (`SigningKey`) — the one departure from "verify-only"
 
-Every capability above this point (and everything before this section was
-added) is pure verification — this module checks an IdP's signature, never
-produces one, mirroring `xmldsig`'s own stated scope. Single Logout and the
-Artifact binding both require the SP to sign its own OUTGOING message (a
-`LogoutRequest`/`LogoutResponse` it sends, or the `ArtifactResolve`
-back-channel call), so a small signing primitive was added for exactly that:
+The Response path above is pure verification — this module checks an IdP's signature there, never
+produces one, mirroring `xmldsig`'s own stated scope. Single Logout, the
+Artifact binding, signed SP metadata and a POST-binding AuthnRequest all require the SP to sign its own
+OUTGOING message (a `LogoutRequest`/`LogoutResponse` it sends, the `ArtifactResolve`
+back-channel call, `buildSpMetadata` with `sign_with`, `buildSignedAuthnRequest`), so a small signing primitive exists for exactly that:
 
 - **RSA-SHA256 / exclusive C14N only.** This is already the primary algorithm
   everywhere else in this module. ECDSA-P256 signing is deliberately **not**
@@ -484,8 +494,8 @@ back-channel call), so a small signing primitive was added for exactly that:
   **Verifying** the IdP's own signatures is entirely unaffected and still
   accepts RSA-SHA256/384/512 and ECDSA-P256 via `xmldsig.verify`.
 - `signProtocolMessage` (private) is the shared two-pass signer
-  (`buildLogoutRequest`, `buildLogoutResponse`, `buildArtifactResolveSoap` all
-  call it): assemble with a placeholder digest → canonicalize the whole
+  (`buildLogoutRequest`, `buildLogoutResponse`, `buildArtifactResolveSoap`, `buildSignedAuthnRequest` and
+  `buildSpMetadata` with `sign_with` all call it): assemble with a placeholder digest → canonicalize the whole
   element minus the (still-placeholder) `<ds:Signature>` (enveloped transform +
   exclusive C14N) → hash → splice the digest in → canonicalize the now-real
   `<ds:SignedInfo>` → RSA-sign → splice the `<ds:SignatureValue>` in. Same
@@ -530,8 +540,7 @@ Redirect bindings.
   same as e.g. `Config.allow_idp_initiated`'s trust-the-caller precedent
   elsewhere in this module.
 - **Redirect query-string signing (`buildSignedRedirectQuery` /
-  `verifyRedirectSignature`, SAML Bindings §3.4.4.1)** — did not exist in this
-  module before. The SigningInput is the exact percent-encoded
+  `verifyRedirectSignature`, SAML Bindings §3.4.4.1)** — the SigningInput is the exact percent-encoded
   `SAMLRequest=`/`SAMLResponse=` value, then (if present) `&RelayState=`
   value, then `&SigAlg=` value, in that fixed order, nothing else.
   `appendPercentEncoded` is RFC 3986 percent-encoding (unreserved
@@ -618,21 +627,58 @@ MessageHandle, all big-endian/raw, base64'd for transport) and the
 - **The IdP side (building `ArtifactResponse`, consuming `ArtifactResolve`) is
   out of scope**, unchanged from every other message type in this module.
 
-## Deferred / out of scope
+## What is deliberately not done
 
-- **Holder-of-Key cross-form match (cert ↔ `<ds:KeyValue>`)** — **DONE**, over
-  `x509.spkiOf` (the defensive DER→SubjectPublicKeyInfo extractor this was
-  waiting on). Only RSA and EC P-256 keys are comparable, matching what
-  `PresentedKey` can express; anything else is
-  `error.HolderOfKeyCrossFormUnsupported`. See "Holder-of-Key".
-- **Single Logout (SLO)** — **DONE**, see above.
-- **Artifact binding** — **DONE** (message layer; the back-channel HTTP round
-  trip is explicitly the caller's job), see above.
-- **The IdP side** — still not implemented, and not planned: this module is
-  the SP (relying-party) side only, as stated in its header.
-- **ECDSA-P256 for the SP's OWN outgoing signatures** (`SigningKey` is
-  RSA-SHA256 only) — see "SP-side signing" above. Verifying the IdP's
-  signatures is unaffected.
+- **The IdP side** — this module is the SP (relying-party) side only: it issues no `<samlp:Response>`, builds no
+  `ArtifactResponse` and consumes no `ArtifactResolve`. Refused by design, throughout.
+- **Performing the Artifact back-channel call** — it is an HTTP round trip (typically over mutual TLS) and this is a
+  library, not an HTTP client: `buildArtifactResolveSoap` builds the bytes, the caller sends them.
+- **Verifying metadata signatures** — `parseIdpMetadata` and `parseIdpMetadataFor` do not check a `<ds:Signature>` or
+  `validUntil`; the caller verifies with `xmldsig` before trusting the document.
+- **Parsing a certificate** — certificate DER is handed back or compared as bytes / reduced with `x509.spkiOf`, never fed to
+  `std.crypto.Certificate.parse`.
+- **A ctgrind row for the decryption path** — driven and measured, deliberately not pinned: the in-file contexts are
+  `xml.parse` and the extraction branching on the recovered plaintext (tainted because it derives from the key, but the
+  operation's own output), so such a row would measure the XML parser, not a key dependence. The key-dependent work is
+  `xmlenc`'s rows; see the header of `src/ctgrind_harness.zig`.
+- **An RNG or a clock** — IDs, `IssueInstant`, `MessageHandle` and validity strings are the caller's.
+
+## Verification
+
+Run with `scripts/modtest saml` (`zig build test-saml`, also in ReleaseFast).
+
+- **External anchors** (details under *Fixture provenance*): the signed Response fixture made by openssl + libxml2
+  (`test_fixture.zig`, used by `test_xsw.zig`, `test_multikey.zig` and the rest); an xmlsec1 `EncryptedAssertion`
+  (`test_encrypted_external.zig`); an openssl-signed Redirect SigningInput (`test_redirect_binding.zig`); the C14N attribute
+  sort key on this module's own product surface (`test_multins.zig`); real certificates for Holder-of-Key cross-form matching
+  (`test_hok_crossform.zig`). `tools/saml_oracle.py` (python3-saml 1.16.0, lxml/libxml2 + xmlsec1) validates the pinned
+  SP-metadata and AuthnRequest bytes of `test_metadata.zig` against the OASIS schemas, verifies the signed metadata under xmlsec1 and
+  compares the element set with python3-saml's own builder (`tools/README.md`).
+- **Security batteries:** the full XSW attack set with a passing control (`test_xsw.zig`), Response-level signatures
+  (`test_response_sig.zig`), `<Issuer>` presence and value for every message type (`test_issuer.zig`), IdP key rollover
+  (`test_multikey.zig`), and the conditions / subject / status teeth in `root.zig`, each beside a positive control.
+- **Constructed suites** (signed assertions minted by `test_sign.zig`): EncryptedAssertion / EncryptedID /
+  EncryptedAttribute (`test_encrypted.zig`, `test_encrypted_id_attr.zig`, `test_encutil.zig`), Holder-of-Key, sender-vouches
+  and Level of Assurance (`test_hok.zig`, `test_hok_keyvalue.zig`, `test_eidas.zig`), Single Logout (`test_slo.zig`), the
+  Artifact layer (`test_artifact.zig`), SP metadata and IdP aggregates (`test_metadata.zig`, `test_metadata_aggregate.zig`).
+- **Regression and mutation-driven tests:** `test_sweep.zig` (the no-panic sweep of every public entry point) and
+  `test_mutants.zig`, `test_mutants_proto.zig`, `test_mutants_enc.zig` (killing tests for the whole-module mutation run:
+  signature-location policy, key rollover indices, SHA-1 and id-attribute options reaching the verifier, RSA-1_5 and
+  `kw-aes256` on all three decrypt paths, the edges of every time window with skew, the SubjectConfirmation policy matrix,
+  Holder-of-Key pairings, eIDAS rank edges, builder escaping and validation limits, percent-encoding, the Redirect inflate cap,
+  Logout/Artifact checks, IdP metadata bounds). `decodeRedirectField` refuses a stream that inflates to exactly
+  `max_redirect_inflated` octets: the bound is exclusive (`Reader.appendRemaining(.limited(n))` cannot tell "exactly n" from "more").
+- **Fuzz:** `SAML_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver; `_ONLY` picks a harness: `fields`, `idp`,
+  `consume`; never `zig build --fuzz`). `consume` runs `consumeResponseXml` over the genuinely signed fixture: the genuine
+  document is accepted, a flipped one refused. `src/fuzz_test.zig` holds the shared plumbing; `fields` and `idp` live in `root.zig`.
+- **Dead-stack probes:** `stackprobe_test.zig` (the signing paths: `buildLogoutRequest` with `sign_with`,
+  `buildSignedRedirectQuery`; scans for the SP RSA key's `p`, `q`, `d`, `dP`, `dQ`, `qInv`) and `stackprobe2_test.zig` (the four consume entry
+  points over an encrypted assertion and an `EncryptedID`); ReleaseFast / ReleaseSmall only.
+- **ctgrind:** `scripts/checks/ctgrind.sh saml` runs `src/ctgrind_harness.zig` over the one secret the module holds, the SP RSA key
+  used for signing (`sign` row: `buildLogoutRequest` with `sign_with` and `buildSignedRedirectQuery`); the in-file
+  contexts are one `rsa` verdict plus the base64 of the public signature. The decryption path is `xmlenc`'s row.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
 ## Fixture provenance (be honest about interop)
 
@@ -663,7 +709,7 @@ keypair, producing a real `<xenc:EncryptedData>`/`<xenc:EncryptedKey>`
 (RSA-OAEP-mgf1p + AES-256-GCM) committed verbatim. `xmlsec1 --decrypt`
 independently confirmed, offline, that it recovers the exact self-contained
 signed assertion byte-for-byte before this fixture was pasted in — so
-decrypt → verify → extract through the full `saml` pipeline is now anchored
+decrypt → verify → extract through the full `saml` pipeline is anchored
 against a real external ciphertext, not merely `xmlenc`'s decrypt primitive in
 isolation. A paired negative (one base64 character flipped in the content
 `CipherValue` — a tamper `xmlsec1 --decrypt` itself was confirmed to refuse)
@@ -699,24 +745,17 @@ integer-equality path. All RSA keys in these tests are test material only.
   the module's own `signProtocolMessage`) and the module's own
   `consumeLogoutRequestXml`/`consumeLogoutResponseXml` verify. There is no
   OASIS-published byte-exact `LogoutRequest`/`LogoutResponse` fixture to anchor
-  against, so this follows the SAME precedent `test_sign.zig` already set for
-  the EncryptedID/HoK suites: the underlying RSA-SHA256/exclusive-C14N
-  enveloped-signature PRIMITIVE is already externally anchored elsewhere in
+  against, so this follows the SAME precedent `test_sign.zig` sets
+  for the EncryptedID/HoK suites: the underlying RSA-SHA256/exclusive-C14N
+  enveloped-signature PRIMITIVE is externally anchored elsewhere in
   this module (`test_fixture.zig`, openssl+lxml, byte-exact; the W3C C14N
-  vectors in `xmldsig`) — what these tests newly prove is the ORCHESTRATION on
-  top: schema assembly, NameID/SessionIndex/status extraction, and — the part
-  that most needed re-proving rather than assuming — that the
-  mandatory-signature and XSW pointer-pin defenses are actually wired in for
-  this NEW message type. That last property is proven by MUTATION, not merely
-  by a positive test: with `consumeLogoutRequestXml`'s signature check
-  temporarily reduced to `.embedded => {}` (an actual edit made and reverted
-  during development, not a hypothetical), the "unsigned rejected", "flipped
-  SignatureValue", and "XSW moved-signature" tests all genuinely FAILED —
-  including the XSW case, which the mutation caused to return the
-  attacker-forged `NameID` as if it were the victim's. That confirms the tests
-  fail for the reason they claim, not for some unrelated defect.
+  vectors in `xmldsig`) — what these tests prove is the ORCHESTRATION on
+  top: schema assembly, NameID/SessionIndex/status extraction, and that the
+  mandatory-signature and XSW pointer-pin defenses are wired in for
+  this message type (an unsigned message, a flipped SignatureValue and an XSW
+  moved signature each have a test that must be refused).
 - **`test_redirect_binding.zig`** (HTTP-Redirect query-string signing) carries
-  the one genuine EXTERNAL anchor this task added:
+  the genuine EXTERNAL anchor of this mechanism:
   `verifyRedirectSignature: EXTERNAL anchor` signs a fixed 120-byte
   SigningInput (chosen to exercise `+`, `/`, `=`, space, `&`, `:`, `#`
   percent-encoding all at once) OFFLINE with `openssl dgst -sha256 -sign`
@@ -733,8 +772,7 @@ integer-equality path. All RSA keys in these tests are test material only.
   round-trips, the flipped-signature/wrong-key/tampered-message negative
   tests, the end-to-end Redirect-binding `LogoutRequest` test) is explicitly a
   CONSTRUCTED self round-trip — this module's own signer feeding its own
-  verifier — because there was, before this task, no prior anchor for this
-  mechanism to reuse; anchoring it externally once (above) and self-testing
+  verifier — because anchoring it externally once (above) and self-testing
   the rest is the same posture `test_sign.zig` takes for minted assertion
   fixtures.
 - **`test_artifact.zig`**: `Artifact` encode/decode is pure bit-twiddling
@@ -753,23 +791,17 @@ integer-equality path. All RSA keys in these tests are test material only.
   (`SignatureMissing` vs `SignatureInvalid`) proving the rejection reasons are
   distinct, not merely "some check failed".
 
-## DRY / hazard follow-ups
+## Implementation notes
 
-- **xsd:dateTime parsing** is delegated to the `datefmt` module (`datefmt.parseXsdDateTime`),
-  shared with the Single-Logout/Artifact code; it no longer carries a private copy.
+- **xsd:dateTime parsing** is delegated to the `datefmt` module (`datefmt.parseXsdDateTime`), shared with the
+  Single-Logout/Artifact code.
 - **`std.crypto.Certificate.parse`** is avoided on adversarial DER (metadata /
   KeyInfo certs handed back as raw bytes) — the caller pins.
-- **Signature-algorithm URI string constants** (`sig_alg_rsa_sha256`,
-  `dig_alg_sha256`, `alg_enveloped_sig`) are duplicated from `xmldsig`'s own
-  (private, unexported) equivalents, for the same reason the xsd:dateTime
-  parsing is duplicated: `saml` depends on `xmldsig` but these URI strings are
-  not part of its public API. If `xmldsig` ever exports them, `signProtocolMessage`
-  and the Redirect-signing code should switch to the shared constants.
-- **`decryptWrappedElement`** is now generic over the caller's error-set type
-  (`comptime E: type`) instead of hardcoding `ConsumeError`, and takes
-  `sp_decrypt_key`/`allow_weak_rsa15`/`decrypt_kek` directly instead of a whole
-  `Config` — this is what let the Single-Logout `EncryptedID` path reuse it
-  without duplicating the decrypt-then-reparse logic a third time.
+- **`decryptWrappedElement`** is generic over the caller's error-set type
+  (`comptime E: type`) and takes `sp_decrypt_key`/`allow_weak_rsa15`/`decrypt_kek` directly instead of a whole
+  `Config`, so the Single-Logout `EncryptedID` path reuses it without duplicating the decrypt-then-reparse logic.
+- **Signature-algorithm URI constants** (`sig_alg_rsa_sha256`, `dig_alg_sha256`, `alg_enveloped_sig`) are
+  private copies in `root.zig`, because `xmldsig`'s equivalents are not part of its public API (Backlog).
 
 ## Anchoring
 
@@ -780,27 +812,12 @@ integer-equality path. All RSA keys in these tests are test material only.
 
 **What the tests actually contain.** core sig/C14N anchored via openssl+libxml2 fixture; SLO/HoK/artifact self round-trips; SP metadata + AuthnRequest bytes pinned after OASIS-XSD validation and xmlsec1 signature verification (`tools/saml_oracle.py`, python3-saml 1.16.0); multi-key rollover over the openssl/lxml and xmlsec1 fixtures
 
-**How it got there.** The anchoring work landed. DONE 9f9d238: genuine xmlsec1 EncryptedAssertion over the already-anchored signed one
-
-**Audit 2026-11-18 (whole-module mutation).** 438 mutants over every non-test line of `src/root.zig`: the Response pipeline (structure, Issuer, Destination, assertion count, signature location policy, XSW pointer pins for the assertion, the Response and the decrypted assertion, key-set rollover, algorithm and id-attribute options), the decryption paths (EncryptedAssertion / EncryptedID / EncryptedAttribute, `allow_weak_rsa15`, `decrypt_kek`), Conditions / Audience / every SubjectConfirmation method (time windows with skew, policy, error precedence, Recipient / InResponseTo), Holder-of-Key matching in all pairings, Level of Assurance, attribute extraction, the AuthnRequest and SP-metadata builders (escaping, validation limits, NCName, XML Char ranges), IdP metadata and aggregates (selection, budgets, UIInfo), the Redirect codec (inflate, percent-encoding, signature verdicts), Single Logout, the Artifact layer and the shared helpers; one schemata build per round, baseline first. 407 killed (2 of them by a hang in the Redirect reader), 31 not killed: 22 EQUIVALENT (digests-ok / key-loop shortcuts that only save work, defence-in-depth pins that `xmldsig` or the element selection already make unreachable, `trim` before a whitespace-tolerant base64 decode, a decided-flag that an earlier pairing has already set, P-256 point validation making the curve-OID check redundant, a rank of 0 never meeting a requirement, U+007F being a valid XML Char) and 9 UNOBSERVABLE (heap wipes right before `free` need the ReleaseFast scanning allocator that `test_encrypted` / `test_slo` already carry; `ZeroPadded.stream` is never reached by the flate reader; three allocation-failure-only branches; a certificate whose RSA modulus is not a whole number of bytes; a dangling pointer no error path reads). Tests added (`test_mutants.zig`, `test_mutants_proto.zig`, `test_mutants_enc.zig`, 61 in total): the signature-location policy and the certificate / key index that come from each of the three signature positions, SHA-1 and id-attribute options reaching the verifier, RSA-1_5 and `kw-aes256` key transport on all three decrypt paths, the exact edges of every time window with the clock skew, SubjectConfirmation policy matrix and first-error precedence, bearer and Holder-of-Key Recipient / InResponseTo rules, Holder-of-Key pairings (decided mismatch against incomparable, whitespace around the curve URI, a sign byte on the modulus, an exponent that differs, an EC certificate against an RSA key), eIDAS rank edges, trimming of every extracted value, every XML Char boundary and every escaped character of the builders, the SP-metadata validation limits and NCName class, the percent-encoding of all 256 bytes, the Redirect inflate cap and truncated streams, Logout request / response and ArtifactResponse root, Issuer, Destination, expiry, wrapping and extraction checks, the Artifact wire layout, and IdP metadata selection, budgets and UIInfo caps. No behaviour changed. Observation: `decodeRedirectField` refuses a stream that inflates to exactly `max_redirect_inflated` octets (the bound is exclusive: `Reader.appendRemaining(.limited(n))` cannot tell "exactly n" from "more"); the new test pins max-1 accepted, max refused. Counts on the card are whole-module.
-
 ## Backlog / deferred
 
-- **Pre-authentication canonical-output bound (sweep 2026-11-13).** `sigOptsFor` leaves `xmldsig.Options.max_c14n_output_len` at its 64 MiB default, so an unauthenticated Response can still make one reference canonicalize to ~64 MiB (arena growth ~3x) before the signature is checked, and `consumeArtifactResponseSoap` can return an enclosed message of that size. Bounded, no longer an OOM from ~160 KB of input; tightening it (a `Config` field, or a lower constant here) is a policy choice left open. ✅ DONE 2026-11-13 (the text above is stale: `Config.max_c14n_output_len` exists, default `default_max_c14n_output_len` = 4 MiB, modules/saml/src/root.zig:301,352-356, commit 938edd5e1).
-- **ctgrind: decryption path not a row (2026-11-13).** Driven and measured (95 in-file, nearly all `xml.parse` on the recovered plaintext); deliberately not pinned, see `src/ctgrind_harness.zig`. The key-dependent work is `xmlenc`'s rows.
-
-Closed 2026-10-06 (were the three survey-2026-09-30 items): SP metadata generation
-(`buildSpMetadata`), more than one IdP verification key (`additional_idp_keys`), and the
-AuthnRequest options `ForceAuthn`/`IsPassive`/`RequestedAuthnContext`/
-`AttributeConsumingServiceIndex`/`ProtocolBinding` (HTTP-Artifact; HTTP-Redirect is
-forbidden for the Response by SAMLProf §4.1.2, so it is deliberately not offered).
-
-- ✅ **DONE 2026-11-16 (`buildSignedAuthnRequest(alloc, opts, key)`, a separate function so `buildAuthnRequest`'s error set does not widen):** **Embedded signature on a POST-binding AuthnRequest** (`AuthnRequestsSigned` over POST).
-  Redirect-binding requests are already signable via `buildSignedRedirectQuery`; the POST
-  form needs `sign_with` on `AuthnRequestOptions`, which widens `buildAuthnRequest`'s error
-  set (BREAKING for exhaustive switches). Effort: small. Fits §2: yes.
-- **ECDSA for the SP's own signatures** — already listed under *Deferred / out of scope*; small.
-- ✅ DONE 2026-11-16 for `mdui:UIInfo` (DisplayName/Description/Logo with `xml:lang` → `IdpMetadata.ui_info`) and `<md:EntitiesDescriptor>` aggregates (`parseIdpMetadataFor(alloc, xml, entity_id, AggregateOptions)`: nested groups, bounded depth/count/elements, `EntityNotFound`/`AmbiguousEntity`; `parseIdpMetadata` itself unchanged). STILL OPEN: entity attributes and `md:EncryptionMethod` (not trivial: need a `saml:Attribute` reader and a policy for the algorithm list). No metadata-signature verification exists in this module, so an aggregate's top-level `ds:Signature` is not checked (documented; caller verifies with `xmldsig`). **Metadata extensions** (`mdui:UIInfo`, entity attributes, `md:EncryptionMethod` under the
-  encryption KeyDescriptor) and **`<md:EntitiesDescriptor>` aggregates** in
-  `parseIdpMetadata`. Effort: small each. Fits §2: yes.
-- **IdP side** — refused by design (see *Deferred / out of scope*).
+- **ECDSA for the SP's own signatures** (`SigningKey` is RSA-SHA256 only; small) — XML-DSig ECDSA needs a fresh per-signature nonce
+  and the module's rule is no RNG, no clock, so it needs a safe nonce-supplying API (see "SP-side signing"). Verifying an IdP's
+  ECDSA-P256 signatures is unaffected.
+- **Metadata extensions: entity attributes and `md:EncryptionMethod`** (under the encryption `KeyDescriptor`) in
+  `parseIdpMetadata` — not trivial: they need a `saml:Attribute` reader and a policy for the algorithm list.
+- **Share `xmldsig`'s signature-algorithm URI constants** — `sig_alg_rsa_sha256`, `dig_alg_sha256`, `alg_enveloped_sig` are copies in
+  `root.zig`; if `xmldsig` exports its own, `signProtocolMessage` and the Redirect-signing code should switch to them.
