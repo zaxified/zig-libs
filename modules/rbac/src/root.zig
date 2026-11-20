@@ -1867,7 +1867,7 @@ test "Decision.isPermit collapses non-permit results" {
     try testing.expect(!(Decision{ .result = .deny, .reason = "x" }).isPermit());
 }
 
-// -- mutation-run additions (2026-10-04) --------------------------------------
+// -- mutation-run additions --------------------------------------
 
 test "abac: eq/ne across kinds is TypeMismatch, never a silent true/false" {
     // Documented: equality is type-checked ("comparing a string to an int is
