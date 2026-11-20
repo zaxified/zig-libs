@@ -30,13 +30,12 @@ union std's rejection would force on the caller, not raw speed.
 `mulRistrettoBase(s)` on `Ristretto255`, and `mulMultiRistretto(scalars,
 points)` — `Σ s_i·P_i` for secret scalars by Straus's interleaving: one shared
 chain of doublings instead of one ladder per term, constant-time in every
-scalar, the same group element as summing `mulRistretto` (since 2026-09-16,
-audit `bulletproofs` B9; SPEC.md § B9). `mulMulti(scalars, points)` is the same
-on raw `Edwards25519` points (since 2026-10-10), equal to summing `mul`,
+scalar, the same group element as summing `mulRistretto` (SPEC.md § B9).
+`mulMulti(scalars, points)` is the same on raw `Edwards25519` points, equal to summing `mul`,
 torsion components included — std's `Edwards25519.mulMulti` is variable-time.
 
 **`X25519`** — `std.crypto.dh.X25519`'s shape (`KeyPair.generateDeterministic`/`generate`, `recoverPublicKey`, `scalarmult`, the lengths) with key generation on the comb plus the Edwards→Montgomery map, 2.36× std's ladder (21.8 vs 51.6 µs). Bit-exact with std (RFC 7748 §6.1 vectors, 512-seed differential); ctgrind target `x25519`. SPEC.md § "X25519 key generation on the comb".
-Since 2026-09-29 `scalarmult` (the shared secret) runs the RFC 7748 ladder on a 4×64-bit field in x86-64 `mulx` (BMI2) / `adcx`+`adox` (ADX) inline assembly when the build target has those features and the backend is LLVM — chosen at compile time, std's ladder otherwise — 1.16–1.23× std's ladder in ReleaseFast (≈ 44–47 vs 54–57 µs, both asm paths). Same signature and bytes as std's, `error.IdentityElement` included; held to std over RFC 7748 §5.2/§6.1, thousands of random and edge inputs per backend, and a field-level `u512` differential; the ctgrind `x25519` target now covers it (0 contexts in the module, positive controls fire). SPEC.md § P6.
+`scalarmult` (the shared secret) runs the RFC 7748 ladder on a 4×64-bit field in x86-64 `mulx` (BMI2) / `adcx`+`adox` (ADX) inline assembly when the build target has those features and the backend is LLVM — chosen at compile time, std's ladder otherwise — faster than std's ladder in ReleaseFast on both asm paths (the card's Performance line and SPEC.md *Performance* carry the figures against libsodium and OpenSSL). The ladder step is ordered for overlap and the ADX squaring is ported from OpenSSL (see *Provenance* and `NOTICE`). Same signature and bytes as std's, `error.IdentityElement` included; held to std over RFC 7748 §5.2/§6.1, thousands of random and edge inputs per backend, and a field-level `u512` differential; the ctgrind `x25519` target covers it (0 contexts in the module, positive controls fire). SPEC.md § P6, § P7, § P9.
 
 **Stack use.** No allocation, no globals; the cost is stack. `mulMulti` and
 `mulMultiRistretto` hold one Straus pass of up to 8 terms at a time: 8 x 16
@@ -50,22 +49,22 @@ covers the 32 KiB burn plus the body's frames in the build `scripts/modtest` run
 entry points in a 64 KiB thread. Embedded or coroutine stacks smaller than that need a
 bigger one for these calls (the Straus tables are not sized by `points.len`).
 
-**`mulBase`/`mulRistrettoBase` are a fixed-base comb, not the ladder (since
-2026-09-16, audit C3).** The base point used to run the same 16-entry window
-ladder as any point, spending 71 % of its time in 252 doublings. It now uses
-the signed-radix-16 comb of Bernstein et al., "High-speed high-security
-signatures" §4 (ref10's `ge_scalarmult_base`): a comptime 32×8 table, 64
-additions and 4 doublings. It is still constant-time in `s`, still reads all
-256 bits and is still total — one extra always-performed add of `2^256·B`
-covers the recoding carry that ref10 avoids by requiring `s < 2^255`. This is
-a deliberate exception to "never a new algorithm", taken
-on evidence: four pieces of it are in [SPEC.md](SPEC.md) § C3.
+**`mulBase`/`mulRistrettoBase` are a fixed-base comb, not the ladder.**
+The base point would otherwise run the same 16-entry window ladder as any
+point, spending 71 % of its time in 252 doublings. It uses the signed-radix-16
+comb of Bernstein et al., "High-speed high-security signatures" §4 (ref10's
+`ge_scalarmult_base`): a comptime 32×8 table, 64 additions and 4 doublings. On
+x86-64 with BMI2 and the LLVM backend the comb runs on the 4×64 field with
+signed radix-32 digits instead (26×16 affine table, 52 mixed additions and 5
+doublings; SPEC.md § P8), and the build option `ct25519-base-comb=false` drops
+the comb for `mul`'s ladder over the base table (SPEC.md § Build options). Every
+variant is constant-time in `s`, reads all 256 bits and is total — one extra
+always-performed add of `2^256·B` covers the recoding carry that ref10 avoids by
+requiring `s < 2^255`. This is a deliberate exception to "never a new
+algorithm", taken on evidence: four pieces of it are in [SPEC.md](SPEC.md) § C3.
 `mul(Edwards25519.basePoint, s)` stays on the ladder and is the reference the
-comb is tested against. Measured ReleaseFast A/B, same process, 9
-interleaved rounds: `mulBase` 56.3 → 21.5 µs (2.62×), `mulRistrettoBase`
-55.8 → 21.8 µs (2.56×), `ecvrf`'s `KeyPair.prove` 193.8 → 160.3 µs;
-`src/bench.zig` re-runs the pairs (`CT25519_BENCH=1 scripts/modtest ct25519
--Doptimize=ReleaseFast`).
+comb is tested against. `src/bench.zig` re-runs the comb-against-ladder pairs
+(`CT25519_BENCH=1 scripts/modtest ct25519 -Doptimize=ReleaseFast`).
 
 **`s` is used as-is: all 256 bits are read, not just the low 253.** There is
 no clamping and no reduction mod the group order `L`, exactly like std's own
@@ -114,12 +113,14 @@ scalar multiplication. The fixed-base comb follows the published description
 in Bernstein, Duif, Lange, Schwabe, Yang, "High-speed high-security
 signatures" (J. Cryptogr. Eng. 2012) §4; its table is generated at comptime
 from std's point operations, not copied from any implementation's table. The
-X25519 shared-secret field core (P6) is written from RFC 7748 §5 and the
+X25519 shared-secret field core is written from RFC 7748 §5 and the
 published 4×64-bit representation (Oliveira et al., "How to (pre-)compute a
-ladder", SAC 2017; Nath & Sarkar, IACR ePrint 2018/985); no implementation's
-source — OpenSSL, BoringSSL/fiat-crypto, the Linux kernel, libsodium or any
-other — was read or transcribed for it. No third-party source ported, so no
-`NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0). The benchmark driver
+ladder", SAC 2017; Nath & Sarkar, IACR ePrint 2018/985). **One exception:**
+the ADX squaring `fe64.sq_adx` is ported from OpenSSL 3.5.5's
+`x25519_fe64_sqr`, and the order of the field operations in one ladder step
+follows OpenSSL's `x25519_scalar_mulx` (Apache-2.0); `NOTICE` carries the
+licence condition and the upstream notice. No other third-party source was
+ported. The benchmark driver
 `tools/c_bench/foreign_bench.c` is generated by our own tooling: our own code
 that runs libsodium and OpenSSL as black-box oracles for timing; no third-party
 code or data is reproduced.
