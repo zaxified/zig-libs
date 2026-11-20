@@ -22,22 +22,6 @@ X3DH (signal.org/docs/specifications/x3dh) + XEdDSA
 (signal.org/docs/specifications/pqxdh); see [README.md](README.md)
 for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: Part 1 + Part 2 + Part 3 complete** (A1 F7: this line said "Part 1
-+ Part 2" after PQXDH/Part 3 landed — the "PQXDH (Part 3, `pqxdh.zig`)"
-section further down this same file was already accurate). `x3dh.zig`'s
-DH+HKDF agreement, both wire codecs, and `xeddsa.zig`'s `sign`/`verify`
-(spec variant, with the Montgomery->Edwards sign-0 recovery,
-`edwardsFromMontgomery`) PLUS `xeddsa.libsignal.sign`/`verify`
-(deployed-libsignal variant, for interop with real Signal), plus
-`ratchet.zig`'s full Double Ratchet (`State` + `initAlice`/`initBob`/
-`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`, the DH + symmetric-key ratchets,
-`max_skip`-bounded out-of-order handling, transactional fail-closed
-`decrypt`), plus `pqxdh.zig`'s four-DH + ML-KEM-1024 + HKDF agreement
-(`initiateUnverified`/`respond`, fail-closed `initiate`, `generateKemPreKey`)
-are implemented and tested — green in Debug and ReleaseFast, including a
-libsignal known-answer vector pinned against BOTH XEdDSA variants; see
-"Verification" below.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
@@ -50,9 +34,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [matrix-org/vodozemac](https://github.com/matrix-org/vodozemac) (Olm) | Rust | Apache-2.0 | 404 | 0.11.0 (2026-09-11) | Not Signal: Matrix's own Double-Ratchet variant (Olm, AES-CBC + HMAC). Named because it is the maintained permissive Rust double ratchet; a different wire format. |
 | Zig ecosystem | Zig | — | — | — | Nothing found on GitHub for a Signal or Double Ratchet implementation in Zig (searched `signal double ratchet` language:zig). `std.crypto` has the primitives, including `ml_kem` and X25519, no protocol. |
 
-**Where we are ahead:** the only Zig Signal-protocol core; the three public specs (X3DH, XEdDSA, Double Ratchet) plus PQXDH with FIPS 203 ML-KEM-1024 (the spec text still names Kyber; deployments use ML-KEM), both XEdDSA variants selectable at the call site with libsignal's own vector pinned against each, a transactional fail-closed `decrypt`, bounded skipped-key store, and the ratchet's `KDF_CK` ladders cross-checked byte for byte with libsignal (`KDF_RK`'s `info` is application-defined). **Where we are behind:** everything above the specs that a libsignal user builds on — wire compatibility with Signal (protobuf messages, libsignal's AEAD and `info` strings; SPEC: "not claimed"), sealed sender, sender-key groups, Sesame session management, safety numbers, header encryption, SPQR, a PQXDH wire codec (done 2026-11-16) and persistence that other implementations can read (→ Backlog).
+**Where we are ahead:** the only Zig Signal-protocol core; the three public specs (X3DH, XEdDSA, Double Ratchet) plus PQXDH with FIPS 203 ML-KEM-1024 (the spec text still names Kyber; deployments use ML-KEM), both XEdDSA variants selectable at the call site with libsignal's own vector pinned against each, a transactional fail-closed `decrypt`, bounded skipped-key store, and the ratchet's `KDF_CK` ladders cross-checked byte for byte with libsignal (`KDF_RK`'s `info` is application-defined). **Where we are behind:** everything above the specs that a libsignal user builds on — wire compatibility with Signal (protobuf messages, libsignal's AEAD and `info` strings; SPEC: "not claimed"), sealed sender, sender-key groups, Sesame session management, safety numbers, header encryption, SPQR, and persistence that other implementations can read (→ Backlog).
 
 ## Design
+
+Implemented and tested: `x3dh.zig`'s DH+HKDF agreement and both wire codecs;
+`xeddsa.zig`'s `sign`/`verify` (spec variant, with the Montgomery->Edwards sign-0
+recovery `edwardsFromMontgomery`) and `xeddsa.libsignal.sign`/`verify` (the
+deployed-libsignal variant, for interop with real Signal); `ratchet.zig`'s full
+Double Ratchet (`State`, `initAlice`/`initBob`/`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`,
+the DH and symmetric-key ratchets, `max_skip`-bounded out-of-order handling, a
+transactional fail-closed `decrypt`, a versioned state codec); and `pqxdh.zig`'s
+four-DH + ML-KEM-1024 + HKDF agreement (`initiateUnverified`/`respond`, fail-closed
+`initiate`, `generateKemPreKey`, wire codecs). A libsignal known-answer vector is
+pinned against both XEdDSA variants.
 
 - **Source of truth**: the public X3DH and XEdDSA specification texts
   (Signal Foundation). Both are self-contained: X3DH depends only on a DH
@@ -81,8 +76,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   because `X25519.scalarmult(a_priv, b_pub) == X25519.scalarmult(b_priv,
   a_pub)` (ordinary DH commutativity) — there is no separate "Bob's KDF"
   code path to accidentally drift from Alice's.
-- **The initial ciphertext is sealed and opened here** (A1 `signal` F6,
-  2026-09-13). Both specs require it: Alice encrypts the initial message "with
+- **The initial ciphertext is sealed and opened here.** Both specs require it: Alice encrypts the initial message "with
   some AEAD encryption scheme using AD as associated data and using an
   encryption key which is either SK or the output from some cryptographic PRF
   keyed by SK", and Bob, if it "fails to decrypt, aborts the protocol and
@@ -92,10 +86,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   key itself, and each `SK` seals exactly one message) with the handshake's
   FULL `AD`; `respond` opens it, zeroes `SK` and returns
   `error.InitialMessageAuthenticationFailed` when it does not authenticate.
-  Before, `initiate` took an opaque ciphertext before `SK` existed — no caller
-  could satisfy the spec — and `respond` succeeded whatever the message carried,
-  so PQXDH's `Encode(PQPKB)` term authenticated nothing. Shared code:
-  `initial_message.zig`, used by `x3dh.zig` and `pqxdh.zig`.
+  PQXDH's `Encode(PQPKB)` term is authenticated by exactly this open. Shared
+  code: `initial_message.zig` (`info`, line 22), used by `x3dh.zig` and `pqxdh.zig`.
 - **`PreKeyBundle`/`InitialMessage` codecs** (`x3dh.zig`): plain
   fixed-header byte layouts (169 bytes / 77-byte-header +
   variable-length ciphertext) — REAL, no crypto judgment beyond `has_opk`
@@ -177,15 +169,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   secret-dependent branching of its own in the DH/HKDF path.
   `xeddsa.sign` handles the secret scalar with `Edwards25519.scalar`'s
   constant-time ops, **`ct25519.mulBase`** and a BRANCHLESS
-  masked select for the negate-if-sign-1 step. This line used to read
-  "a constant-time `basePoint.mul`", meaning std's; std's ladder is
-  constant-time and then ends with `try q.rejectIdentity()`, a branch on
-  a scalar-derived value, which forced a `catch @panic(...)` on both of
-  this module's secret base multiplications (the key scalar `a` and the
-  nonce `r`). `ct25519.mulBase` is that ladder without the tail. Neither
-  panic could ever fire — a clamped seed lies in `[2^254, 2^255)` and is
+  masked select for the negate-if-sign-1 step. It does not use std's
+  `basePoint.mul`: std's ladder is constant-time but ends with
+  `try q.rejectIdentity()`, a branch on a scalar-derived value, which would
+  force a `catch @panic(...)` on both of this module's secret base
+  multiplications (the key scalar `a` and the nonce `r`).
+  `ct25519.mulBase` is that ladder without the tail. Neither
+  panic could fire — a clamped seed lies in `[2^254, 2^255)` and is
   divisible by 8, and the smallest multiple of `L` that is divisible by 8
-  is `8L > 2^255` (pinned by a test) — so the reachable defect was the
+  is `8L > 2^255` (pinned by a test) — so the reachable defect would have been the
   leak, not the abort. (The sign bit itself is public-equivalent — it is
   a deterministic function of the public key pair `±A`, and deployed
   libsignal transmits it in every signature.) Signing
@@ -239,8 +231,8 @@ the same `edwardsFromMontgomery` conversion:
 Test-vector status: the XEdDSA spec text publishes no numeric vector.
 `src/kat_test.zig` uses `src/xeddsa_kat_vector.zig`, generated by
 `tools/gen_xeddsa_kat.py` over our own key, message and nonce (an
-independent Edwards25519 implementation in plain Python; until 2026-10-26
-this was libsignal's own GPLv3 test vector, see `NOTICE`), as an EXTERNAL
+independent Edwards25519 implementation in plain Python; libsignal's own GPLv3
+test vector is deliberately not embedded, see `NOTICE`), as an EXTERNAL
 ANCHOR exercised against BOTH variants: both signers must reproduce the
 oracle's signatures byte for byte, the module's shipped
 `xeddsa.libsignal.verify` must accept the deployed-variant one
@@ -313,7 +305,7 @@ exact bytes and that nonce isn't published).
   `MessageKeyNotAvailable` (replay of a consumed in-order message, or a
   message before its chain exists), `KeyAgreementFailed` (pathological
   low-order ratchet key), plus `Allocator.Error`.
-- **Session persistence (2026-11-17).** `State.toBytes(out)` /
+- **Session persistence.** `State.toBytes(out)` /
   `State.fromBytes(allocator, bytes, &out)` — a versioned layout of this
   module (`State.format_version` = 1, `State.max_encoded_length`), NOT
   libsignal's `SessionStructure` protobuf: `version(1) || flags(1) ||
@@ -346,12 +338,11 @@ exact bytes and that nonce isn't published).
   libsignal-only fields (identities, registration ids, pending prekey) —
   those belong to the session layer above the ratchet, which this module does
   not have.
-- **Not yet — see Backlog**: header encryption (spec §4 — headers here are
+- **Not provided — see Backlog**: header encryption (spec §4 — headers here are
   cleartext, so the ratchet public key + counters are observable) and
-  interop of the persisted state with other implementations. PQXDH seeding was in this list until 2026-08-22;
-  it is now Part 3 (`pqxdh.zig`), and the ratchet is seeded from
-  `pqxdh.Agreement.ratchetAssociatedData()` rather than the full AD — see
-  below.
+  interop of the persisted state with other implementations. Under PQXDH the
+  ratchet is seeded from `pqxdh.Agreement.ratchetAssociatedData()` rather than
+  the full AD — see below.
 
 ## PQXDH (Part 3, `pqxdh.zig`)
 
@@ -383,6 +374,13 @@ exact bytes and that nonce isn't published).
   (the initial message does not open), never as a `decaps` error. The
   absence of an error here is deliberate and tested, so it does not read as a
   missing check.
+- **Wire codecs.** `pqxdh.PreKeyBundle.toBytes`/`fromBytes` (`encoded_length` 1805:
+  x3dh's 169-byte bundle `|| kem_prekey(1568) || kem_prekey_id(4 LE) ||
+  kem_prekey_signature(64)`; `src/pqxdh.zig:163`, error `InvalidPreKeyBundle`) and
+  `pqxdh.InitialMessage.toBytes`/`fromBytes` (`header_length` 1649: x3dh's header
+  with `kem_prekey_id(4 LE) || kem_ciphertext(1568)` before the ciphertext length;
+  `src/pqxdh.zig:248`, error `InvalidInitialMessage`). This module's own layouts —
+  Signal's protobufs are not reproduced.
 - **Not claimed**: byte-compatibility with Signal's own servers. Like
   `x3dh.zig`, this file uses its own `info` string — the spec leaves `info`
   application-specific — so a session opened here will not interoperate with
@@ -390,38 +388,47 @@ exact bytes and that nonce isn't published).
 
 ## Verification
 
-- `zig build test-signal`: **all pass**, Debug AND
-  `-Doptimize=ReleaseFast`, zero panics. `zig fmt --check
-  modules/signal/` clean.
-- Double Ratchet coverage: full interleaved Alice<->Bob session seeded
-  from a live `x3dh.initiateUnverified`/`respond`, forcing repeated DH
-  ratchets, every message round-tripping; out-of-order delivery within a
-  chain AND across a DH-ratchet boundary (skipped-key store drains back to
-  empty); `MAX_SKIP` giant-`N` rejection with state untouched and no OOM;
-  tamper battery (flipped ciphertext / wrong `AD` / truncated buffer all
-  fail closed, genuine message still decrypts afterward); replay of a
-  consumed in-order message rejected; header codec round-trip + wrong-
-  length rejection; `KDF_CK` 0x01/0x02 constant distinctness. No numeric
-  reference vector exists (see below), so this is self-consistency +
-  spec-adherence — the same footing as Part 1's X3DH agreement.
-- **Mutation run 2026-10-05** (in-place, Debug, 30 mutants over the
-  ratchet's chain-key and counter advancement, skipped-key handling and
-  both DoS caps, the DH-ratchet step and root composition, `KDF_CK`, the
-  AEAD's associated data, header decoding, XEdDSA's key conversion and
-  verify refusals, the X3DH/PQXDH signature gates, codecs and KDF input,
-  and the initial-message open): 29 killed. The first pass left 9; tests
-  were added for the store holding exactly `max_skip_store` keys and
-  refusing key 2001, a message under a ratchet key with no receiving chain
-  (decrypting it under a zero chain key went unnoticed), a rewritten
-  header PN in the same chain (only the AEAD's associated data can see
-  it), XEdDSA's `s + L`, an order-2 key with a signature that satisfies the
-  equation and a 2048-try partial-`R` match, a trailing byte after an
-  initial message, a ciphertext one byte shorter than the tag, and DH4
-  reaching `SK`. One mutant that failed to compile was rewritten until it
-  built. Equivalent: dropping `verify`'s `rejectLowOrder` (std's
-  `mulDoubleBasePublic` refuses a low-order point itself: its `x(4A) == 0`
-  test catches the order-2 point `4A` of an order-8 key too; an order-8 key
-  whose equation holds is pinned by a test, 2026-10-06).
+- **Run:** `scripts/modtest signal` (Debug, LLVM); `zig fmt --check modules/signal/`.
+  Interop lane: `zig build interop-signal` (runs `tools/pqxdh-kdf-check.py --check`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+- **Double Ratchet** (`src/ratchet.zig`, `src/kat_test.zig`): a full interleaved Alice<->Bob session
+  seeded from a live `x3dh.initiateUnverified`/`respond`, forcing repeated DH ratchets, every message
+  round-tripping; out-of-order delivery within a chain and across a DH-ratchet boundary (the
+  skipped-key store drains back to empty); `max_skip` giant-`N` rejection with the state untouched and
+  no OOM; the store holding exactly `max_skip_store` keys and refusing the next; a tamper battery
+  (flipped ciphertext, wrong `AD`, rewritten header `PN`, truncated buffer all fail closed and the
+  genuine message still decrypts afterwards); replay of a consumed message refused; a message under a
+  ratchet key with no receiving chain; header codec round trip and wrong-length rejection; the `KDF_CK`
+  0x01/0x02 constants; the state codec (mid-conversation round trip of both sides with skipped keys,
+  byte-identical continuation, every truncation, bad version, oversize count, trailing byte,
+  allocation failures).
+- **X3DH / PQXDH**: `generateSignedPreKey` -> `initiate` -> `respond` end to end; tampered-signature and
+  substituted-prekey fail-closed cases; codec round trips and refusals (truncated header, ciphertext-length
+  mismatch, a `has_opk` byte other than 0/1); a flipped, truncated or empty initial ciphertext refused;
+  `DH4` reaching `SK`; PQXDH's associated data differing when only the KEM prekey differs; a substituted
+  KEM prekey gives a different `SK` and `respond` refuses the initial message, never a `decaps` error.
+- **XEdDSA** (`src/xeddsa.zig`, `src/kat_test.zig`): sign -> verify round trip; tampered message /
+  signature and a malformed-key-and-signature battery fail closed; the sign-0 convention (`verify`'s
+  recovered `A` equals `sign`'s forced `A`, both natural-sign branches); `s + L`, an order-2 key
+  with a signature that satisfies the equation, an order-8 key whose equation holds, a partial-`R`
+  match; the external known answer (`src/xeddsa_kat_vector.zig`, producer `tools/gen_xeddsa_kat.py`)
+  reproduced byte for byte by both signers, accepted by `xeddsa.libsignal.verify` with all 64
+  single-byte tampers rejected and rejected by the spec-pure `xeddsa.verify`; `libsignal.sign`/`verify`
+  self-consistency (an in-house re-derivation, not an anchor); cross-verification of `sign` by
+  `std.crypto.sign.Ed25519`.
+- **Anchors:** see *Anchoring*: libsignal's `KDF_CK` values (`src/interop_vectors.zig`, producer
+  `tools/libsignal_dump.rs`), the PQXDH KDF chain against an independent second implementation
+  (`tools/pqxdh-kdf-check.py`).
+- **Fuzz:** `SIGNAL_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver; `_ONLY` selects a
+  harness): `signal-ratchet` (a live conversation in order and reversed, every delivery first tried
+  damaged), `signal-x3dh` (the codecs and the handshake), `signal-xeddsa`, `signal-state` (the state
+  codec: round trip, truncation / trailing byte / bad version always refused, damaged and random bytes
+  a verdict) (`src/fuzz_test.zig`).
+- **Constant time:** `src/ctgrind_harness.zig` has the targets `sign` and `ratchet`, each with an
+  untainted control row and a no-`-fvalgrind` trap row; the expected rows live in
+  `scripts/checks/ctgrind-expected.tsv`.
+- **Dead-stack residue:** `src/stackprobe_test.zig` (next section).
 
 ### Test-vector honesty (Double Ratchet)
 
@@ -442,20 +449,6 @@ adherence to the spec's stated KDF constants and algorithm, exactly as
 Part 1's agreement is verified. The AEAD/KDF choice is documented above so
 a caller who needs libsignal/Olm wire-compatibility knows it is NOT
 provided.
-- Coverage highlights: sign->verify round-trip; tampered message /
-  tampered signature / malformed-key-and-signature fail-closed battery;
-  sign-0 convention agreement (`verify`'s recovered `A` == `sign`'s
-  forced `A`, both natural-sign branches exercised); libsignal
-  known-answer vector — EXTERNAL ANCHOR — accepted byte-exactly (all 64
-  single-byte tampers rejected) by the shipped `xeddsa.libsignal.verify`,
-  rejected by the spec-pure `verify`, self-round-tripped under both
-  `xeddsa.sign` and `xeddsa.libsignal.sign` over the vector's own sign-1
-  key (nonce differs from libsignal's, so these round-trips are IN-HOUSE
-  RE-DERIVATION, not a byte-exact reproduction of the vector's signature);
-  `libsignal.sign`/`verify` self-consistency across both sign-bit branches
-  (`xeddsa.zig`'s own in-file tests); std-Ed25519 cross-verification;
-  X3DH `generateSignedPreKey` -> `initiate` -> `respond` end-to-end plus
-  tampered-signature / substituted-prekey fail-closed cases.
 
 ## Secret residue on the dead stack
 
@@ -464,7 +457,7 @@ Every public entry point that touches a secret (`x3dh.generateKeyPair`,
 `initiate[Unverified]` / `respond`, `pqxdh.generateKemPreKey`,
 `ratchet.State.initAlice` / `initBob` / `encrypt` / `decrypt`) runs its body one
 frame down (`burn.run`) and then zeroes the stack that body dirtied
-(`burn.zig`). Measured body depth, ReleaseFast, 2026-10-09: 2.5-7 KiB for the
+(`burn.zig`). Measured body depth (ReleaseFast): 2.5-7 KiB for the
 curve and ratchet calls, **89.5 KiB (`pqxdh.initiate`), 120 KiB
 (`pqxdh.respond`) and 135.5 KiB (`generateKemPreKey`)** for the ML-KEM-1024 ones;
 the burns are about 2x that (8-16 KiB, 192 / 256 / 288 KiB). Secret inputs
@@ -488,11 +481,10 @@ the stack pointer.
 
 ## Backlog / deferred
 
-- **Signal-compatible wire messages and KDF strings** (`SignalMessage`/`PreKeySignalMessage` protobufs, AES-256-CBC + truncated HMAC-SHA256, libsignal's `info` labels) *(survey 2026-09-30)*: without this a session cannot talk to Signal servers or clients; the module chose ChaCha20-Poly1305 over a fixed header because the spec leaves the AEAD to the application (`interop_vectors.zig` header). It is a design choice for the spec-shaped core, but a compatibility layer is what a libsignal user expects. Effort: large (protobuf codec, prekey-message flow, version handling). Fits §2 if the protobuf codec is a sibling module.
-- ✅ **DONE 2026-11-17 (`ratchet.State.toBytes`/`fromBytes`, versioned layout, sources in the "Session persistence" bullet above; mid-conversation round trip with skipped keys on both sides, every truncation / bad version / oversize count / trailing byte refused, `signal-state` fuzz harness):** **Session state serialization** (a stable byte format for `ratchet.State`) *(survey 2026-09-30)*: SPEC "Out of scope" said `State` is an in-memory value with no stability-committed format; any long-lived client needs to persist sessions. Effort: small-medium. Fits §2.
-- ✅ **DONE 2026-11-16 (`pqxdh.PreKeyBundle.toBytes`/`fromBytes`, `InitialMessage.toBytes`/`fromBytes`; round trip through a full handshake tested):** **PQXDH wire codec** *(survey 2026-09-30)*: README: "no wire codec — a caller transmitting a PQXDH bundle writes their own", while X3DH has `PreKeyBundle`/`InitialMessage` codecs. Effort: small. Fits §2.
-- **Sender keys (group messaging), sealed sender, safety numbers/fingerprints, Sesame** *(survey 2026-09-30)*: the parts of libsignal that make it a messenger rather than a handshake. Searched `rg -i 'sealed|sender.?key|sesame|fingerprint|safety' modules/signal/src` — no implementation (only libsignal-variant XEdDSA hits). Effort: medium each; safety numbers small. Fits §2 (`megolm`/`mls` cover other group designs).
-- **Header encryption** (Double Ratchet spec §4) and **SPQR / triple ratchet** *(survey 2026-09-30)*: the SPEC excluded header encryption without giving a reason; SPQR is Signal's current PQ-forward-secrecy layer. Effort: medium / large. Fits §2.
+- **Signal-compatible wire messages and KDF strings** (`SignalMessage`/`PreKeySignalMessage` protobufs, AES-256-CBC + truncated HMAC-SHA256, libsignal's `info` labels): without this a session cannot talk to Signal servers or clients; the module chose ChaCha20-Poly1305 over a fixed header because the spec leaves the AEAD to the application (`interop_vectors.zig` header). It is a design choice for the spec-shaped core, but a compatibility layer is what a libsignal user expects. Effort: large (protobuf codec, prekey-message flow, version handling). Fits §2 if the protobuf codec is a sibling module.
+- **Sender keys (group messaging), sealed sender, safety numbers/fingerprints, Sesame**: the parts of libsignal that make it a messenger rather than a handshake; none is implemented. Effort: medium each; safety numbers small. Fits §2 (`megolm`/`mls` cover other group designs).
+- **Header encryption** (Double Ratchet spec §4) and **SPQR / triple ratchet**: the SPEC excluded header encryption without giving a reason; SPQR is Signal's current PQ-forward-secrecy layer. Effort: medium / large. Fits §2.
+- **Interop of the persisted ratchet state** with other implementations: `State.toBytes` is this module's own layout, not libsignal's `SessionStructure`; it belongs with the Signal-compatible wire work above.
 
 ## Anchoring
 
@@ -503,10 +495,8 @@ the stack pointer.
 
 **What the tests actually contain.** X3DH agreement+codec only self round-trip; XEdDSA has an independent-oracle KAT over our own inputs (kat_test.zig); the Double Ratchet KDFs have libsignal vectors (interop_vectors.zig); PQXDH's KDF chain is checked against an INDEPENDENT second implementation (`tools/pqxdh-kdf-check.py`), not against the protocol's authors
 
-**How it got there.** No external oracle exists for what remains. Signal publishes no official X3DH KAT; own Python oracle would be REDERIVED
-
-**PQXDH specifically (2026-08-22).** Signal publishes no byte-exact PQXDH
-vectors either — checked against both the spec page and libsignal's source.
+**PQXDH specifically.** Signal publishes no byte-exact PQXDH
+vectors either (neither the spec page nor libsignal's source has them).
 The composition is therefore anchored one class weaker than the ratchet: a
 second implementation of the same arithmetic, written from Python's
 `hmac`/`hashlib` with no shared code. That catches a term in the wrong order,

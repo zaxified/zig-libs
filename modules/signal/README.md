@@ -172,12 +172,11 @@ defer allocator.free(pt);                          // pt == "hello"
   try signal.ratchet.State.fromBytes(allocator, bytes, &restored);
   defer restored.deinit(allocator);
   ```
-- **Out of scope**: header encryption (HE) and interop of the persisted
+- **Not provided**: header encryption (HE) and interop of the persisted
   state with other implementations (it is this module's own layout, not
-  libsignal's `SessionStructure`). See [SPEC.md](SPEC.md). (PQXDH seeding was in
-  this list until 2026-08-22 and is now Part 3 — seed the ratchet with
-  `PqAgreement.ratchetAssociatedData()`, not the full 1632-byte AD; see the
-  walkthrough below for why they differ.)
+  libsignal's `SessionStructure`). See [SPEC.md](SPEC.md). Under PQXDH, seed the
+  ratchet with `PqAgreement.ratchetAssociatedData()`, not the full 1632-byte AD;
+  see the walkthrough below for why they differ.
 
 ## PQXDH walkthrough (Part 3)
 
@@ -223,16 +222,21 @@ bridge. Passing the full value does not compile, which is the intent.
 
 **What anchors this.** Less than the rest of this module, and the
 difference is stated rather than smoothed over: Signal publishes no
-byte-exact PQXDH vectors (checked 2026-08-22 — neither the spec page nor
+byte-exact PQXDH vectors (neither the spec page nor
 libsignal). XEdDSA carries libsignal's own vector, and the
 composition is checked against an independent implementation of the same
 arithmetic (`tools/pqxdh-kdf-check.py --check`). **ML-KEM-1024 itself is
 unanchored** — std's three `NIST KAT test` blocks all cover `d00.Kyber*`,
 the round-3 variant this module explicitly does not implement, while
-`nist.MLKem1024` gets only a self round trip. This paragraph used to claim
-those KATs as the KEM's anchor; they belong to the other algorithm. A round trip cannot catch a misplaced KEM
+`nist.MLKem1024` gets only a self round trip. A round trip cannot catch a misplaced KEM
 secret — Alice and Bob would agree on the wrong answer together — so the
 wrong answer is pinned as a value the code must never produce.
+
+## Not provided
+
+Signal wire compatibility (protobuf messages, libsignal's AEAD and `info` strings),
+sealed sender, sender-key groups, Sesame session management, safety numbers, header
+encryption and SPQR are not here; see [SPEC.md](SPEC.md) *Backlog / deferred*.
 
 ## Import graph
 
