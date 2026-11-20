@@ -90,7 +90,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   obfuscated id) stops the walk at the hop to its right; a `:port` is dropped; without XFF,
   `X-Real-IP` from a trusted peer, else the peer. IPv4-mapped IPv6 is returned as IPv4; null
   (key `fallback_key`) only without a socket peer. `Options.key` has no default, by design: either
-  default would silently misbehave for the other deployment shape.
+  default would silently misbehave for the other deployment shape. `Options.use_x_real_ip` (default true, the chain above) set false drops the `X-Real-IP` step from `forwarded_ip`, `header`'s fallback and `forwarded_ip_trusted` (`clientKeyWith` / `clientIpWith` for reuse), for a proxy that sets only `X-Forwarded-For`.
 - **Concurrency:** `Limiter` threadsafe; the bare `TokenBucket` single-owner.
 - **`ConnectionLimiter` (conn.zig):** limits *new connections per user* from
   `http.Server.Options.on_connect` — on the accept loop, before a byte is read, so a refusal
@@ -199,10 +199,6 @@ sequence with the clock injected on every side. The card's Performance line carr
 
 ## Backlog / deferred
 
-- **`clientIp` option to ignore `X-Real-IP`** — with no `X-Forwarded-For` it falls back to
-  `X-Real-IP`, so behind a proxy that sets neither, any client names its own address; a consumer that
-  documents XFF only cannot turn the fallback off. Ideal: an `Options` field selecting the headers
-  honoured, keeping today's behaviour as the default.
 - **Sliding-window counter mode** — not a parity gap (the reference, x/time/rate, has none);
   httprate/ulule offer it, and a token bucket allows a `burst`-sized spike at any time. Effort:
   medium; unsure a typical user needs it.

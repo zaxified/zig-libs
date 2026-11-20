@@ -438,6 +438,12 @@ pub const TrustedProxies = union(enum) {
 /// Null only when the request has no socket peer (`serveStream` without
 /// `StreamOptions.peer`).
 pub fn clientIp(req: *const http.Server.Request, trusted: TrustedProxies) ?netaddr.Ip {
+    return clientIpWith(req, trusted, true);
+}
+
+/// `clientIp`, with the `X-Real-IP` fallback switched by `use_x_real_ip`
+/// (`Options.use_x_real_ip`).
+pub fn clientIpWith(req: *const http.Server.Request, trusted: TrustedProxies, use_x_real_ip: bool) ?netaddr.Ip {
     const peer = netaddr.Ip.fromStd(req.peerAddress() orelse return null).unmap();
     if (!trusted.trusts(peer)) return peer;
     var xff: ?[]const u8 = null;
@@ -460,9 +466,9 @@ pub fn clientIp(req: *const http.Server.Request, trusted: TrustedProxies) ?netad
         // Every entry is a trusted proxy: the leftmost one is the client.
         return hop;
     }
-    if (req.header("x-real-ip")) |v| {
+    if (use_x_real_ip) if (req.header("x-real-ip")) |v| {
         if (forwardedEntryIp(std.mem.trim(u8, v, " \t"))) |ip| return ip;
-    }
+    };
     return peer;
 }
 
@@ -510,6 +516,13 @@ pub const Options = struct {
     /// address apart. IPv4 is always the whole address. Same default as
     /// `ConnectionLimiter.Options.unlisted_v6_bits`.
     v6_key_bits: u8 = 64,
+    /// Whether the `forwarded_ip` / `header` / `forwarded_ip_trusted` keys fall
+    /// back to `X-Real-IP` when there is no `X-Forwarded-For`. The default
+    /// (true) is the module's long-standing chain and nginx's `real_ip`
+    /// habit. Set false behind a proxy that sets only `X-Forwarded-For`
+    /// (or neither): otherwise any client can name its own bucket with an
+    /// `X-Real-IP` header the proxy passes through.
+    use_x_real_ip: bool = true,
     /// Idle expiry: a key untouched this long is dropped (swept from the
     /// eviction hand's end when new keys arrive) or reset to a full bucket on its next hit.
     /// Never shorter than the time an empty bucket takes to refill
@@ -940,16 +953,16 @@ fn ceilDivMsToS(ms: u64) u64 {
 
 fn keyOf(l: *const Limiter, ctx: *router.Ctx, peer_buf: *[peer_key_len_max]u8) []const u8 {
     switch (l.options.key) {
-        .forwarded_ip => return ipKey(clientKey(ctx.req, peer_buf), l.options.v6_key_bits, peer_buf),
+        .forwarded_ip => return ipKey(clientKeyWith(ctx.req, peer_buf, l.options.use_x_real_ip), l.options.v6_key_bits, peer_buf),
         .header => |name| {
             if (ctx.req.header(name)) |v| {
                 const trimmed = std.mem.trim(u8, v, " \t");
                 if (trimmed.len != 0) return trimmed;
             }
-            return ipKey(clientKey(ctx.req, peer_buf), l.options.v6_key_bits, peer_buf);
+            return ipKey(clientKeyWith(ctx.req, peer_buf, l.options.use_x_real_ip), l.options.v6_key_bits, peer_buf);
         },
         .forwarded_ip_trusted => |t| {
-            const ip = clientIp(ctx.req, t) orelse return fallback_key;
+            const ip = clientIpWith(ctx.req, t, l.options.use_x_real_ip) orelse return fallback_key;
             return ipKey(netaddr.formatIp(ip, peer_buf), l.options.v6_key_bits, peer_buf);
         },
         .custom => |k| return k.keyFor(k.ctx, ctx, peer_buf),
@@ -982,6 +995,12 @@ fn ipKey(text: []const u8, v6_bits: u8, buf: *[peer_key_len_max]u8) []const u8 {
 /// shorter of the two. Exposed for reuse by other middleware (logging,
 /// abuseguard).
 pub fn clientKey(req: *const http.Server.Request, peer_buf: *[peer_key_len_max]u8) []const u8 {
+    return clientKeyWith(req, peer_buf, true);
+}
+
+/// `clientKey`, with the `X-Real-IP` step switched by `use_x_real_ip`
+/// (`Options.use_x_real_ip`).
+pub fn clientKeyWith(req: *const http.Server.Request, peer_buf: *[peer_key_len_max]u8, use_x_real_ip: bool) []const u8 {
     var xff: ?[]const u8 = null;
     var it = req.iterateHeaders();
     while (it.next()) |h| {
@@ -992,10 +1011,10 @@ pub fn clientKey(req: *const http.Server.Request, peer_buf: *[peer_key_len_max]u
         const ip = std.mem.trim(u8, v[start..], " \t");
         if (ip.len != 0) return ip;
     }
-    if (req.header("x-real-ip")) |v| {
+    if (use_x_real_ip) if (req.header("x-real-ip")) |v| {
         const ip = std.mem.trim(u8, v, " \t");
         if (ip.len != 0) return ip;
-    }
+    };
     if (req.peerAddress()) |peer| {
         const ip: netaddr.Ip = switch (peer) {
             .ip4 => |a| .{ .v4 = a.bytes },
@@ -1492,6 +1511,39 @@ fn hClientIp(ctx: *router.Ctx) anyerror!void {
     var buf: [peer_key_len_max]u8 = undefined;
     const ip = clientIp(ctx.req, t.*) orelse return ctx.res.writeAll("null");
     try ctx.res.writeAll(netaddr.formatIp(ip, &buf));
+}
+
+/// Answers `clientIpWith(.., false)` and `clientKeyWith(.., false)` as `ip|key`.
+fn hClientIpNoReal(ctx: *router.Ctx) anyerror!void {
+    const t: *const TrustedProxies = @ptrCast(@alignCast(ctx.state.?));
+    var buf: [peer_key_len_max]u8 = undefined;
+    var kbuf: [peer_key_len_max]u8 = undefined;
+    const ip = clientIpWith(ctx.req, t.*, false) orelse return ctx.res.writeAll("null");
+    try ctx.res.writeAll(netaddr.formatIp(ip, &buf));
+    try ctx.res.writeAll("|");
+    try ctx.res.writeAll(clientKeyWith(ctx.req, &kbuf, false));
+}
+
+test "use_x_real_ip = false: X-Real-IP is ignored by clientIpWith and clientKeyWith; X-Forwarded-For and the peer still count" {
+    var t: TrustedProxies = .loopback;
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/t", hClientIpNoReal);
+    r.state = &t;
+    const p = try netaddr.parseAddrPort("127.0.0.1:5000").?.toStd();
+    const cases = [_]struct { headers: []const u8, want: []const u8 }{
+        .{ .headers = "X-Real-IP: 203.0.113.7\r\n", .want = "127.0.0.1|127.0.0.1" },
+        .{ .headers = "X-Forwarded-For: 198.51.100.2\r\nX-Real-IP: 203.0.113.7\r\n", .want = "198.51.100.2|198.51.100.2" },
+        .{ .headers = "", .want = "127.0.0.1|127.0.0.1" },
+    };
+    inline for (cases) |c| {
+        var out: [1024]u8 = undefined;
+        const got = runWirePeer(&r, wire(c.headers), &out, p);
+        const body = got[(std.mem.find(u8, got, "\r\n\r\n") orelse return error.NoBody) + 4 ..];
+        try testing.expectEqualStrings(c.want, body);
+    }
+    // the default entry points still honour it
+    try expectClientIp(.loopback, "127.0.0.1:5000", "X-Real-IP: 203.0.113.7\r\n", "203.0.113.7");
 }
 
 fn expectClientIp(trusted: TrustedProxies, peer: ?[]const u8, comptime headers: []const u8, want: []const u8) !void {

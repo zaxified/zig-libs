@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — ADDED `Options.use_x_real_ip` (default true, behaviour unchanged) and `clientIpWith` / `clientKeyWith`: set false and the key chain no longer falls back to `X-Real-IP` (`clientIp` / `clientKey` keep their behaviour). Test in `root.zig`.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private monotonic OS read behind `Clock.monotonic` (duplicate-code pass) is replaced by the `clock` module: `Clock` is now `clock.Clock` (same fields, `.monotonic`, `now()`; additionally `.coarse` and `since()`). A failed read still gives 0; a negative timespec field now maps to 0 instead of tripping `@intCast`. New dependency: `clock`.
 - **2026-10-31** — **CONSUMER-VISIBLE (additive):** `TrustedProxies` (`none`, `loopback`, `set: *const netaddr.IpSet`), `clientIp(req, trusted) ?netaddr.Ip` and `KeySource.forwarded_ip_trusted`: `X-Forwarded-For`/`X-Real-IP` count only when the socket peer is a trusted proxy; the last XFF line is walked from the right past trusted hops to the first untrusted address, a non-address entry stops at the hop to its right, a `:port` is dropped, IPv4-mapped is v4. For a server reachable both through its proxy and directly (asked for by the network-monitor consumer, whose `viewerOf` did this by hand). `forwarded_ip` and `clientKey` unchanged. SPEC backlog entry closed.
 
