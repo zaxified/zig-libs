@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-19 (504/548, 44 eq) · src 9afc73dff3a87200
 
-Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
-
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, SESSIONS_FUZZ) · ct 2026-10-09 (ctgrind: CSRF key/token + session id tainted, `csrf` + `newid`, 0 in-file after the idhex fix) · panic 2026-10-28 (independent sweep of every pub entry point: no peer-reachable panic; stored last generation no longer overflows the save, unwritable cookie options refused at `init`, caller-written lengths a checked panic)
 
 **Performance:** ref 0.04–0.15× alexedwards/scs v2.9.0 + memstore · fastest 0.15× scs (row `new_session`; gofiber/fiber v3.6.1 `middleware/session` + its memory storage measured beside it, faster than scs only on `load_read`, 0.05× there; net of each side's HTTP stack; `tools/go_fast_bench`) (measured 2026-10-24)
@@ -22,6 +20,8 @@ Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-dri
 **Known defects:** none recorded
 
 **Downstream consumer:** yes
+
+Audit history (every review and mutation run, the equivalent-mutant arguments, the defects fixed): [`AUDIT.md`](AUDIT.md).
 
 Design + threat notes for auditors. Usage: see ./README.md. Provenance: the README's `Provenance:` line (no NOTICE: clean-room).
 

@@ -16,6 +16,10 @@ Base `04c1315c4`, `KvStore.iterate` over `kv`'s paged scan. `KvStore.init`'s `it
 
 Whole module: production code of `root.zig`, `cookiestore.zig`, `csrf.zig`, `values.zig`, `idhex.zig`, `common.zig`; the 2026-11-06 mutant set re-applied by text fragment to the current source plus new mutants for the `clock` reads, `Store.iterate`, `RamcacheStore.currentGen`, `KvStore`'s failed-write return and `iterateImpl`'s guards; schemata in a detached copy, ReleaseSafe + one ReleaseFast build for the six `secureZero` defers (stackprobe clean at M0), strict verdict, adversarial read while placing mutants): 528 mutants, 484 killed, 44 equivalent, 0 undecided, no defect. The `Csrf` safe-path id wipe survived the instrumented build (frame moved) and was killed by a single-mutation ReleaseFast build (stackprobe residue 1013 B). New tests: `Manager.iterate` over `KvStore` skips junk keys under the prefix and walks on; the first of two entries with the same key wins in `values.locate` (a hand-built blob; the layer never writes one); `CookieManager.init` with a name and path that together outgrow a Set-Cookie line is `InvalidCookieSize` (reachable, not as the 2026-11-06 note said). Equivalent: the 42 of 2026-11-06 re-checked on the current source (logout fail-closed: head sent gives `SessionNotCleared` either way, two layers guard it; `val.len >= max_val_len` only matters for a cap over 65535, every caller uses 4096), the `monotonicNowNs` clamp (292 years of uptime), `iterateImpl`'s early return shadowed by `getImpl`'s `hasFailed`. Cut: `burn.zig`, `ctgrind_harness.zig`, the stackprobe test.
 
+## 2026-11-01 — delta review (test code only)
+
+A delta over `src/root.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
+
 ## 2026-10-24 — review and mutation (grade-1 wave)
 
 An independent read-only review found two

@@ -16,6 +16,8 @@
 
 **Downstream consumer:** no
 
+Audit history (every review and mutation run, the equivalent-mutant arguments, the defects fixed): [`AUDIT.md`](AUDIT.md).
+
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Speed against these was **not**

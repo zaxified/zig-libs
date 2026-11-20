@@ -106,10 +106,10 @@ then close), each with a regression test that fails without its half (mutation-c
 lingering one deterministic: a GOAWAY followed by 32 KiB of PINGs, `ConnectionResetByPeer` 3 of 3
 without it). The suite needs no fixture: it is the oracle, run before a release.
 
-## 2026-07-30 — trailers and h2 streaming: mutation checks against curl
-
-Self-interop cannot catch a shared misreading of the framing (the writer and reader agree on the same mistake); mutation testing confirmed the difference: emitting the h1 trailer block before the last-chunk line fails curl outright (exit 56), and leaving END_STREAM on the last h2 DATA frame makes curl/nghttp2 *silently discard* the trailer frame and still exit 0, so on h2 the load-bearing assertion is the surfacing check rather than the exit code. For h2 server streaming, 9 mutations were run and each turned tests red; the sharpest is arrival-driven crediting on the streaming surface (8 tests red, 2 of them curl's).
-
 ## 2026-08-14 — anchoring work
 
 The anchoring work landed. DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments
+
+## 2026-07-30 — trailers and h2 streaming: mutation checks against curl
+
+Self-interop cannot catch a shared misreading of the framing (the writer and reader agree on the same mistake); mutation testing confirmed the difference: emitting the h1 trailer block before the last-chunk line fails curl outright (exit 56), and leaving END_STREAM on the last h2 DATA frame makes curl/nghttp2 *silently discard* the trailer frame and still exit 0, so on h2 the load-bearing assertion is the surfacing check rather than the exit code. For h2 server streaming, 9 mutations were run and each turned tests red; the sharpest is arrival-driven crediting on the streaming surface (8 tests red, 2 of them curl's).
