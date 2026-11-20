@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver over dns's wire decoder (added 2026-10-09). Two
+//! Deterministic fuzz driver over dns's wire decoder. Two
 //! harnesses, both generic over their source of choices
 //! (`fn(comptime S, *S, gpa)`):
 //!
@@ -9,19 +9,19 @@
 //!     this one is the "rejected" side;
 //!   - `decode-mutated`: one of the six live captures (`goldens.zig`), a few
 //!     octets damaged, maybe cut short -- reaches the record parsers;
-//!   - `tsig-verify` (2026-10-16): one of dnspython's TSIG-signed messages
+//!   - `tsig-verify`: one of dnspython's TSIG-signed messages
 //!     (`tsig_vectors.zig`), damaged the same way -- `tsig.verify` walks the
 //!     whole message to its last record, and a server reply is hostile input;
-//!   - `query-roundtrip` (2026-11-02): random `QueryOptions` (id, RD/AD/CD, DO,
+//!   - `query-roundtrip`: random `QueryOptions` (id, RD/AD/CD, DO,
 //!     EDNS size or none, up to four EDNS options) and a random name;
 //!     `encodeQuery` either refuses with its documented error or produces
 //!     bytes that `decode` reads back to exactly those options.
 //!
-//!   - `rdata` (2026-11-02): arbitrary or damaged-vector rdata of TLSA / SSHFP /
+//!   - `rdata`: arbitrary or damaged-vector rdata of TLSA / SSHFP /
 //!     URI / NAPTR / SVCB / HTTPS through `rdata.parse`, under a fail-index
 //!     loop over a `FailingAllocator`;
 //!
-//!   - `srv-order` (2026-11-02): random SRV / MX record sets through the pure
+//!   - `srv-order`: random SRV / MX record sets through the pure
 //!     ordering functions of the typed lookups (`Resolver.orderSrv`,
 //!     `orderMx`): the output is a permutation of the input, priorities /
 //!     preferences never decrease, nothing panics;
@@ -231,7 +231,7 @@ fn queryHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     mark(.query_roundtrip);
 }
 
-/// `dns-rdata` (2026-11-02): arbitrary bytes, or a dnspython vector damaged a
+/// `dns-rdata`: arbitrary bytes, or a dnspython vector damaged a
 /// few octets / cut short, as the rdata of each type `rdata.parse` reads.
 /// The input is copied into an exact-size allocation (a read past the end is
 /// then the allocator's to see), and the parse runs under its own fail-index

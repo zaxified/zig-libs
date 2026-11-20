@@ -430,7 +430,7 @@ pub const DecodeError = error{
     OutOfMemory,
 };
 
-/// Default `DecodeOptions.max_decoded_bytes`: 1 MiB. Measured 2026-11-18
+/// Default `DecodeOptions.max_decoded_bytes`: 1 MiB. Measured
 /// (SPEC "Decoded-bytes cap", ReleaseFast, bytes requested by `decode`):
 /// legitimate-shaped 65 535-byte messages decode to at most 426 KB (4 094
 /// A records of one owner, 6.5x); the six real captured replies in
@@ -839,7 +839,7 @@ const testing = std.testing;
 
 test "decode budget: growth through resize and remap is charged, past the limit refused (DN-5 cap)" {
     // `decode`'s own arena use never grows a block in place (measured: the
-    // mutation run of 2026-11-18), so the allocator is checked on its own.
+    // mutation run), so the allocator is checked on its own.
     var buf: [256]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     var b: Budget = .{ .child = fba.allocator(), .limit = 64 };
@@ -1395,7 +1395,7 @@ test "decode: hostile ANCOUNT/QDCOUNT are refused BEFORE the section is allocate
     try testing.expectError(error.Truncated, decode(gpa, qdcount));
     const nscount = "\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00" ++ "\x01a\x00\x00\x01";
     try testing.expectError(error.Truncated, decode(gpa, nscount));
-    // The guard's FACTOR is pinned too (mutation 2026-10-04: a 1-byte
+    // The guard's FACTOR is pinned too (mutation: a 1-byte
     // minimum survived the 65 535-in-5-bytes packets above): 1000 records
     // claimed over 1000 bytes. WHY refused: the smallest record is 11 bytes
     // (`min_record_wire`: root name, type, class, ttl, rdlength), so 1000 of
@@ -1455,7 +1455,7 @@ test "decode: bad rdata lengths are rejected" {
     // BadRecord, not Truncated: `DecodeError.BadRecord` is "an rdata name
     // running past RDLENGTH", and that is the first thing wrong here. Without
     // `takeRdataName`'s own window check the decoder went on to read RNAME
-    // from beyond the packet and reported Truncated (mutation 2026-10-04).
+    // from beyond the packet and reported Truncated (mutation).
     try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x06\x00\x01" ++
         "\x00\x00\x00\x00" ++ "\x00\x01" ++ "\x01x\x00");
 }
@@ -1463,7 +1463,7 @@ test "decode: bad rdata lengths are rejected" {
 test "decode: a 253-char name decodes (the RFC 1035 limit is inclusive)" {
     // RFC 1035 §2.3.4: 255 octets on the wire = 253 characters of dotted
     // text. The encoder's edge is pinned above; the decoder's own cap was
-    // not (mutation 2026-10-04: a 252-char cap survived).
+    // not (mutation: a 252-char cap survived).
     var buf: [max_query_len]u8 = undefined;
     const label63 = strRepeat("a", 63);
     const name253 = label63 ++ "." ++ label63 ++ "." ++ label63 ++ "." ++ strRepeat("b", 61);
@@ -1495,7 +1495,7 @@ fn pointerChain(buf: []u8, jumps: usize) []const u8 {
 test "decode: exactly max_pointer_jumps pointer follows decode, one more is PointerLoop" {
     // `PointerLoop` is documented as MORE than `max_pointer_jumps` follows in
     // one name, so a chain of exactly that many is a legal name (mutation
-    // 2026-10-04: `>` → `>=` survived; only an endless cycle was tested).
+    // `>` → `>=` survived; only an endless cycle was tested).
     var buf: [header_len + 7 + 6 * (max_pointer_jumps + 1)]u8 = undefined;
     var ok = try decode(testing.allocator, pointerChain(&buf, max_pointer_jumps));
     defer ok.deinit();
@@ -1535,7 +1535,7 @@ test "decode: empty and header-only packets" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for dns, wave GV. Findings DN-1 .. DN-4, from
-//! the 2026-10-29 no-panic sweep of `dns`.
+//! the no-panic sweep of `dns`.
 const std = @import("std");
 const testing = std.testing;
 const netaddr = @import("netaddr");
@@ -122,13 +122,13 @@ test "decode: records sharing one owner name share its decoded copy (sweep REV-d
     try testing.expectEqual(@as(usize, 5439), msg.answers.len);
     try testing.expectEqual(@as(usize, 127), msg.answers[5438].labels.len);
     try testing.expectEqualStrings(msg.answers[0].name, msg.answers[5438].name);
-    // Measured 2026-10-31: 848 588 bytes with sharing; without it every one of
+    // Measured: 848 588 bytes with sharing; without it every one of
     // the 5 439 records paid for its own name copy and 127-slot labels array
     // (~13 MB). One MiB leaves room for allocator slack, not for per-record copies.
     try testing.expect(counting.allocated_bytes <= 1 << 20);
 }
 
-// ── 2026-11-18: the decoded-bytes cap (owner decision on DN-5) ──
+// ──: the decoded-bytes cap (owner decision on DN-5) ──
 
 const goldens = @import("goldens.zig");
 

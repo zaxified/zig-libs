@@ -165,7 +165,7 @@ pub const Options = struct {
     /// not timeout + the A query. false = one after the other (glibc
     /// `single-request`); left true, resolv.conf `options single-request`
     /// (when read) also means one after the other. Falls back to sequential
-    /// when the `Io` offers no concurrency. CONSUMER-VISIBLE since 2026-11-02:
+    /// when the `Io` offers no concurrency. CONSUMER-VISIBLE:
     /// both queries leave together. Each side may run its TCP/DoT exchange on
     /// one more concurrent task (`runBounded`), so a lookup can hold three; an
     /// `Io` near its concurrency limit then sees `NetworkFailed` on TCP/DoT
@@ -233,7 +233,7 @@ pub const Options = struct {
     /// and re-reads it when it changed, before the call starts: Go checks at
     /// most every 5 s, glibc ≥ 2.26 on every call, c-ares and getdns watch
     /// it. 0 = on every call; null = read once, never again (the behaviour
-    /// before 2026-11-15). A failed re-read keeps the old settings. Matters
+    /// previously). A failed re-read keeps the old settings. Matters
     /// only where resolv.conf is read at all (no explicit `servers`, or the
     /// search list in use).
     resolv_conf_recheck_ms: ?u32 = 5000,
@@ -547,7 +547,7 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
 
     // Lazily loaded, owned state must exist BEFORE the parallel path copies
     // the Resolver: otherwise each side loads its own (resolv.conf text, the
-    // DoT CA bundle) and the copy's is never freed (review X, 2026-11-02).
+    // DoT CA bundle) and the copy's is never freed (review X).
     // This also lets `no-aaaa`/`single-request` count on the first lookup.
     if (r.options.servers.len == 0) try r.ensureConfig();
     if (dot_enabled and r.options.doh_url == null and r.options.transport == .tls and r.options.dot_tls.verify == .strict)
@@ -618,7 +618,7 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error!Lookup(netaddr.Ip) {
         neg.merge(&cand);
     }
 
-    // Found by simio's dns pilot (2026-10-01): with the server down, both
+    // Found by simio's dns pilot: with the server down, both
     // queries timed out and this returned an empty list — indistinguishable
     // from a name that has no addresses.
     if (list.items.len == 0) if (last_err) |err| return err;
@@ -1718,7 +1718,7 @@ fn callExpired(r: *Resolver) bool {
 // never read anywhere outside `config.zig` -- `Options.timeout_ms`/
 // `.attempts` always won, silently, even when an administrator had set
 // `options timeout:1 attempts:1` specifically to bound the F5 amplification
-// (7 minutes at the shipped defaults). Q8 (round 2, 2026-09-11): a "safe
+// (7 minutes at the shipped defaults). Q8 (round 2): a "safe
 // default plus an escape hatch" choice between two equally-valid semantics,
 // decided here rather than left to the user, because it is a design
 // preference with no norm behind it, not a security defect with one right
@@ -2373,13 +2373,13 @@ test "decodeResponse: the echoed question must be OUR question — name, type, c
 // the wire path really does hand `decodeResponse` this question — while the
 // per-commit lane pays no socket, no thread and no timeout for it.
 //
-// ⭐ WHY THAT MATTERS, MEASURED. Until 2026-09-08 this assertion lived in
+// ⭐ WHY THAT MATTERS, MEASURED. Until this assertion lived in
 // `test "query: a reply whose question is not ours is not the answer, over
 // loopback"`, which drove the same exchange over a socket and then read the
 // stub's `served` counter — from THIS thread, while the stub thread was still
 // runnable, because the joining `await` was a `defer` and ran after the
 // assertions. It failed twice in the wild (three concurrent agents on
-// 2026-09-07, `scripts/test.sh all` on 2026-09-08), always as `expected 1,
+// `scripts/test.sh all`), always as `expected 1,
 // found 0`: the resolver had received the datagram and rejected it correctly
 // every time, and only the measurement was wrong. Reproduced on 8 cores with
 // 32 busy loops: 10 failures in 20 runs. This replacement has nothing to
@@ -2529,7 +2529,7 @@ test "OwnerChain: a CNAME loop and an over-long chain stay bounded" {
 
     // Only class-IN CNAMEs extend the chain: the alias chain `lookupIp` and
     // `reverse` trust is the IN one (`collectAddresses` doc: "class IN"); a
-    // CHAOS-class CNAME is another namespace's data. Mutation 2026-10-04:
+    // CHAOS-class CNAME is another namespace's data. Mutation:
     // dropping the class check survived.
     var chaos = mk.cname("a", "victim.test");
     chaos.class = .ch;
@@ -2678,7 +2678,7 @@ test "toNetAddress maps netaddr.Ip to std.Io.net.IpAddress" {
     try testing.expectEqual(@as(u16, 853), v6.ip6.port);
 }
 
-// ── live-network tests: MOVED OUT 2026-09-09 ──────────────────────
+// ── live-network tests: MOVED OUT ──────────────────────
 //
 // Seven `test "live: …"` used to sit here — recursive UDP/TCP, reverse PTR,
 // and the three DoH shapes — each ending `catch |err| return skipLive(err)`,
@@ -2691,8 +2691,8 @@ test "toNetAddress maps netaddr.Ip to std.Io.net.IpAddress" {
 // that reports success for a run in which it did nothing is the defect, not
 // the noise it makes. They are now `modules/dns/tools/live.zig`, run by
 // `zig build live-dns` and COMPILED by `zig build check-interop` so they
-// cannot rot — the shape `dtls` took on 2026-09-06 and this module's own
-// hostile-loopback anchor took on 2026-09-07.
+// cannot rot — the shape `dtls` took and this module's own
+// hostile-loopback anchor took.
 //
 // Nothing here reaches the network any more. Everything below is loopback or
 // bytes.
@@ -3087,7 +3087,7 @@ test "rememberNoEdns: bounded at max_no_edns, oldest replaced, no duplicates" {
 /// A UDP stub that answers SEVERAL datagrams, each by echoing that query's
 /// own question (so search-list candidates and both families get a reply
 /// that passes `decodeResponse`), shaped by `mode`. Added with the mutation
-/// run of 2026-10-04 for the transport and candidate loops, which `UdpStub`
+/// run for the transport and candidate loops, which `UdpStub`
 /// (one fixed question, one datagram) cannot reach.
 const EchoStub = struct {
     io: std.Io,
@@ -3245,7 +3245,7 @@ test "query: a datagram with another id is skipped and the right one still accep
     // another id is not an answer -- and not a reason to give up: the
     // receive loop must keep waiting for the real one (an off-path spoofer
     // could otherwise fail every query with one wrong guess). Mutation
-    // 2026-10-04: returning the mismatched datagram survived.
+    // returning the mismatched datagram survived.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -3263,7 +3263,7 @@ test "query: a datagram with another id is skipped and the right one still accep
 
 test "query: a datagram from another source port is skipped, even with the right id and question" {
     // RFC 5452 §9.1 again: the reply must come from the address and port the
-    // query went to. Mutation 2026-10-04: dropping the source check survived;
+    // query went to. Mutation: dropping the source check survived;
     // with it gone the forged A 203.0.113.66 won.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -3283,7 +3283,7 @@ test "query: a datagram from another source port is skipped, even with the right
 test "query: every retry carries a fresh transaction id" {
     // The comment in `query` states the rule: one id per datagram, so a
     // retry never re-uses an id an off-path attacker may have seen.
-    // Mutation 2026-10-04: a fixed id survived. `SeqRandomIo` makes the ids
+    // Mutation: a fixed id survived. `SeqRandomIo` makes the ids
     // deterministic, so "different" is not a 2^-16 coin toss.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -3315,7 +3315,7 @@ test "resolve: a NODATA answer for one search candidate moves on to the next" {
     // `resolve` returns the first candidate with NOERROR AND answers (Go
     // `goLookupIPCNAMEOrder` likewise keeps going on an empty answer); a
     // NODATA reply for host.s1.test is not the answer for "host".
-    // Mutation 2026-10-04: stopping at the empty answer survived.
+    // Mutation: stopping at the empty answer survived.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -3370,7 +3370,7 @@ test "lookupIp: the first search candidate with an address wins, later ones are 
     // `lookupIp` doc + Go `nameList` order: candidates are tried in order and
     // the first that yields addresses is the answer -- host.s1.test here;
     // host.s2.test and the bare "host" are other names whose addresses must
-    // not be merged in. Mutation 2026-10-04: dropping the break survived.
+    // not be merged in. Mutation: dropping the break survived.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -3395,7 +3395,7 @@ test "lookupIp: the first search candidate with an address wins, later ones are 
 /// A plain-HTTP loopback "DoH server" that answers every request with
 /// `503 Service Unavailable` and the body `{}` -- a body neither DoH decoder
 /// would turn into an answer, so a status check that is not made shows up
-/// as a different error (mutation 2026-10-04).
+/// as a different error (mutation).
 const Http503 = struct {
     io: std.Io,
     server: net.Server,
@@ -3434,7 +3434,7 @@ test "DoH: a non-200 status is DohFailed on both the wire and the JSON path, nev
     // RFC 8484 §4.2.1: a DNS answer travels in a 2xx response; anything else
     // is an HTTP-level failure, not a DNS message to parse. Both paths must
     // refuse the body of a 503 before reading it as an answer. Mutation
-    // 2026-10-04: dropping the check in `queryJson` survived (and the one in
+    // dropping the check in `queryJson` survived (and the one in
     // `dohExchange` had no test either).
     if (!doh_enabled) return error.SkipZigTest; // the refusal has its own test
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -3482,7 +3482,7 @@ test "built without DoH (-Ddns-doh=false), a doh_url is refused on both paths, n
 }
 
 // ⭐ THE QUESTION-CHECK EXCHANGE OVER A SOCKET LIVES IN
-// `modules/dns/tools/interop.zig`, not here (audit F20, 2026-09-08).
+// `modules/dns/tools/interop.zig`, not here (audit F20).
 //
 // It used to be `test "query: a reply whose question is not ours is not the
 // answer, over loopback"` in this file. What it asserted about PARSING is now
@@ -4087,7 +4087,7 @@ test "query: a refusing first server is skipped and the second server's answer r
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

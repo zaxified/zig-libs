@@ -36,7 +36,7 @@
 //! resp, _ = s.recvfrom(4096)
 //! ```
 //!
-//! Captured 2026-08-01 against Google Public DNS (`8.8.8.8`). Every capture
+//! Captured against Google Public DNS (`8.8.8.8`). Every capture
 //! below is reproducible by re-running the recipe (subject to the records
 //! themselves changing at the authoritative side).
 //!

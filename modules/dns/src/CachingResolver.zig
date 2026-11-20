@@ -2457,7 +2457,7 @@ test "lookupIpMany can be cancelled: every result is set, the cut-short one to e
     try testing.expectEqual(@as(usize, 0), inflightCount(&c));
 }
 
-// ── delta mutation audit 2026-11-15: tests the first schemata run asked for ──
+// ── delta mutation audit: tests the first schemata run asked for ──
 
 fn freeCount(c: *CachingResolver) usize {
     c.pool_mutex.lockUncancelable(c.io);
@@ -3598,7 +3598,7 @@ test "a hit of more than max_sort_candidates addresses keeps its order, and the 
     try testing.expectEqual(@as(u32, 0), probe_calls);
 }
 
-// ── delta mutation audit 2026-11-16 (coalescing, prefetch, lookupIpMany): tests the first schemata run asked for ──
+// ── delta mutation audit (coalescing, prefetch, lookupIpMany): tests the first schemata run asked for ──
 
 fn expectSource(r: anytype, want: Source) !void {
     var a = try r;

@@ -440,7 +440,7 @@ test "NameIterator: over-long candidates are skipped" {
     // with a roomy buffer a 254-char composed candidate and a 254-char bare
     // name are still skipped, 253 still yielded (RFC 1035 §2.3.4; the doc
     // above: "Candidates longer than 253 chars are skipped"). Mutation
-    // 2026-10-04: both checks survived because every caller passed a
+    // both checks survived because every caller passed a
     // 253-byte buffer.
     var big: [512]u8 = undefined;
     const d246 = [_][]const u8{strRepeat("d", 246)};
@@ -460,7 +460,7 @@ test "NameIterator: over-long candidates are skipped" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
