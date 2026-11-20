@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: the README's `Provenance:` line (clean-room from the kernel UAPI headers and captures).
 
 ## Compared with
 
@@ -24,7 +24,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-03 (ti-mo/con
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [ti-mo/conntrack](https://github.com/ti-mo/conntrack) v0.6.0 — **reference** (the fullest permissive feature set, and the only one whose decoder can be called on bytes) | Go | MIT | 164 | no releases; push 2025-11-12 | All attributes known to kernel 4.17+; create/get/update/delete flows, dump with a `Filter` (family, mark/mask, status/mask, zone), `DumpAndZero`, filtered flush, per-CPU stats, global stats, expectation dump/create (experimental), create/update/destroy events with worker goroutines, `SetReadBuffer`/`SetOption`. Here: all of it except filtered flush, expectation writes and label writes (rejected, below), plus dying/unconfirmed dumps and expectation events. |
+| [ti-mo/conntrack](https://github.com/ti-mo/conntrack) v0.6.0 — **reference** (the fullest permissive feature set, and the only one whose decoder can be called on bytes) | Go | MIT | 164 | no releases; push 2025-11-12 | All attributes known to kernel 4.17+; create/get/update/delete flows, dump with a `Filter` (family, mark/mask, status/mask, zone), `DumpAndZero`, filtered flush, per-CPU stats, global stats, expectation dump/create (experimental), create/update/destroy events with worker goroutines, `SetReadBuffer`/`SetOption`. Here: all of it except filtered flush, expectation writes and label writes (rejected, see *What is deliberately not done*), plus dying/unconfirmed dumps and expectation events. |
 | [conntrack-tools](https://www.netfilter.org/projects/conntrack-tools/) (`conntrack`) over libnetfilter_conntrack — the behavioural yardstick | C | GPL-2.0 *(inferred; netfilter.org, not on GitHub)* | — | not checked | `-L/-G/-D/-I/-U/-F/-E` map onto `dump`/`get`/`delete`/`insert`/`update`/`flush`/events here; `-L expect`, `-S`/`-C`, `-L dying`/`unconfirmed`, `-z` and the `-m/-u/-w/-f` filters are covered by `dumpExpect`, `statsCpu`/`statsGlobal`, `dumpWith`. Not here: expectation writes, helpers and timeout policies, XML/CSV output, the conntrackd HA daemon. *(inferred)* |
 | [florianl/go-conntrack](https://github.com/florianl/go-conntrack) v0.7.0 | Go | MIT | 156 | push 2026-08-22 | C-binding-free API; dumps the conntrack *and* the expected table, filters, create/update/delete of flows and expectations, NAT info on expectations. Its decoder is unexported, so no isolated decode comparison is possible. |
 | [vishvananda/netlink](https://github.com/vishvananda/netlink) v1.3.1 `ConntrackTable*` | Go | Apache-2.0 | — | — | List/flush/create/update/filtered delete over a general netlink library; its decoder (`parseRawData`) is unexported. |
@@ -32,9 +32,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-03 (ti-mo/con
 
 (The sibling `procnet` module reads `/proc/net/nf_conntrack` as text — original direction only, no NAT view; this module is the netlink route. `nftables` is the sibling for the ruleset side; there is no sibling for `nfnetlink_cttimeout`, `nfnetlink_cthelper` or `nfnetlink_acct`, which are different subsystems, out of scope.)
 
-**Verdict per survey gap** (survey date 2026-11-03). *Done:* helper name, connlabels, TCP sequence adjustment, SYN-proxy parameters, master tuple, SCTP and DCCP protoinfo (all decoded into `Flow`, fixed-size); server-side filtered dump (mark/mask, status/mask, zone, family) **with a client-side second pass** (`DumpFilter`); dump of the table with counters zeroed, of dying and of unconfirmed flows (`DumpKind`); per-CPU and global statistics, expectation statistics; the expectation table (`dumpExpect`) and expectation events (`nextExpectEvents`); receive-buffer sizing for the event socket (`setRecvBuffer`/`recvBufferSize`); a returned-flow bound for `dumpWith` (`FlowQuery.max_flows`). *Rejected, with a reason (none of these is also in the Backlog):* **`CTA_NAT_SRC`/`_DST`** — the kernel does not send them in a flow dump or event (they are request attributes for NAT'd entries and expectations; ti-mo's `Flow` has no field for them either); a NAT'd flow's translation is visible in `reply` and `IPS.SRC_NAT`/`DST_NAT` *(inferred from ti-mo's model; no capture of one exists)*; **`CTA_SECCTX`** — an SELinux context string of unbounded length, absent on OpenWRT-class kernels; **`CTA_HELP_INFO`** — opaque helper state; **`CTA_FILTER`** (the nested attribute that trims which attributes a dump or event carries) — it only shrinks the reply, the client already skips what it does not need, and kernels differ in what it accepts; **`CTA_LABELS_MASK` and update-with-labels (the write side of connlabels)** — a mask protocol that only `conntrack --label` users need, no consumer, and a wrong mask rewrites other tenants' bits; labels are read, not written; **filtered flush / `conntrack -D` with filters** — kernels that predate the attribute ignore the filter and *flush the whole table* (ti-mo's own source comment), the one failure the separate `flush` name exists to prevent; a caller dumps with a filter and deletes by tuple and id; **`NETLINK_NO_ENOBUFS`** — it would make the kernel stop reporting lost events, against the module's rule that a lost event is `error.Overrun`; **expectation create/delete** — the write path of helper expectations, experimental in ti-mo, no consumer. Out of this module: `nfnetlink_cttimeout`, `cthelper`, `acct`.
+**Built from the survey gaps.** Helper name, connlabels, TCP sequence adjustment, SYN-proxy parameters, master tuple, SCTP and DCCP protoinfo (all decoded into `Flow`, fixed-size); server-side filtered dump (mark/mask, status/mask, zone, family) **with a client-side second pass** (`DumpFilter`); dump of the table with counters zeroed, of dying and of unconfirmed flows (`DumpKind`); per-CPU and global statistics, expectation statistics; the expectation table (`dumpExpect`) and expectation events (`nextExpectEvents`); receive-buffer sizing for the event socket (`setRecvBuffer`/`recvBufferSize`); a returned-flow bound (`FlowQuery.max_flows`). Rejected survey items (`CTA_NAT_SRC`/`_DST`, `CTA_SECCTX`, `CTA_HELP_INFO`, `CTA_FILTER`, the write side of connlabels, filtered flush, `NETLINK_NO_ENOBUFS`, expectation create/delete) and the subsystems outside this module are named, with their reasons, under *What is deliberately not done*.
 
-**Where we are ahead:** the only pure-Zig ctnetlink client we found with typed flows, big-endian attributes handled in the wire layer, goldens captured off a live kernel, and an event socket that reports `error.Overrun` instead of silently losing events; a decode about 12× faster than ti-mo on the bench corpus (`dec_flow` 0.086×; no allocation per flow); a dump that never returns an interrupted or capped table as complete (`InconsistentDump`, `TooManyMessages`, drained to DONE); a filtered dump that is right on kernels that ignore the filter. **Where we are behind:** expectation writes, filtered flush and label writes (rejected on purpose), SELinux contexts, `CTA_NAT_*` on write, `nfnetlink_cttimeout`/`cthelper`.
+**Where we are ahead:** the only pure-Zig ctnetlink client we found with typed flows, big-endian attributes handled in the wire layer, goldens captured off a live kernel, and an event socket that reports `error.Overrun` instead of silently losing events; a decode about 12× faster than ti-mo on the bench corpus (`dec_flow` 0.086×; no allocation per flow); a dump that never returns an interrupted or capped table as complete (`InconsistentDump`, `TooManyMessages`, drained to DONE); a filtered dump that is right on kernels that ignore the filter. **Where we are behind:** expectation writes, filtered flush and label writes (rejected on purpose, see *What is deliberately not done*), SELinux contexts, `CTA_NAT_*` on write, `nfnetlink_cttimeout`/`cthelper`.
+
 
 ## Design & invariants
 
@@ -124,22 +125,22 @@ tuple/attribute parser can answer `EINVAL` for content that is syntactically val
 semantically wrong — the documented case is `NewSpec.timeout == null` on an insert, which the
 kernel rejects with `EINVAL` (see `NewSpec.status`'s sibling doc comment on `.timeout`). A module
 that remapped `EINVAL` here to `SubsystemUnavailable` would be wrong exactly when a caller left out
-a mandatory field, which is worse than the ambiguity it would "fix". These four keep reporting
-`error.InvalidRequest`/`error.NotSupported` as before this change.
+a mandatory field, which is worse than the ambiguity it would "fix". These four report
+`error.InvalidRequest`/`error.NotSupported`.
 
 **Tested by:** `flushFailure`/`dumpFailure` are ordinary functions, so the remapped paths are
 pinned directly — `dumpOver`/`dumpEachOver` accept `transport: anytype` already (the seam their own
 `NLM_F_DUMP_INTR`-restart tests use), so an `NLMSG_ERROR{-EINVAL}` datagram is scripted through
 `ScriptedTransport` exactly like the existing EPERM test. `flush`'s ACK has no equivalent seam — it
-delegates its whole reply loop to `netlink.Socket.awaitAckStrict` (the transport-unification DRY
-candidate above), so `flushFailure` is unit-tested directly as the pure mapping it is, the same
+delegates its whole reply loop to `netlink.Socket.awaitAckStrict` (the shared transport, see *Shared with `netlink`*), so `flushFailure` is unit-tested directly as the pure mapping it is, the same
 style `netlink`'s own `errorFromCode`/`writeErrorFromCode` tests use. The ambiguous `get` path is
 pinned too, on the same `ScriptedTransport`+`EINVAL` datagram, asserting it still yields
 `error.InvalidRequest` unchanged.
 
+
 ### Dump variants, filter, statistics, expectations (`src/ext.zig`)
 
-Pure wire half, no I/O (`root.zig` drives it through the same dump engine as `dump`, now one generic
+Pure wire half, no I/O (`root.zig` drives it through the same dump engine as `dump`, one generic
 `dumpGeneric(T, decode, record_type, ...)`, so the DUMP_INTR drain, the retry budget, the datagram
 and record ceilings and the bad-record drain are shared by every record kind).
 
@@ -156,17 +157,18 @@ and record ceilings and the bad-record drain are shared by every record kind).
   current kernel it drops nothing. For a *filtered* dump `EINVAL` stays `InvalidRequest` (the
   attributes are caller data); every other dump request is well-formed by construction and keeps the
   `SubsystemUnavailable` remap.
-- **`.zero_counters` is a write, so it is the one dump with its own rules** (decided 2026-11-03; each path has a ScriptedTransport test): never retried (`NLM_F_DUMP_INTR` is `InconsistentDump` at once, with the second pass never sent); refused with `error.InvalidRequest`, before anything is sent, when a filter is given (a kernel that ignores the filter would zero the whole table while the client kept a few flows); and when the dump ends in any error (interruption, bad record, record ceiling, a failing visitor, a dropped socket) **the counters of the flows already read are lost** — zeroed in the kernel, records discarded. Documented on `DumpKind.zero_counters`.
+- **`.zero_counters` is a write, so it is the one dump with its own rules** (each path has a ScriptedTransport test): never retried (`NLM_F_DUMP_INTR` is `InconsistentDump` at once, with the second pass never sent); refused with `error.InvalidRequest`, before anything is sent, when a filter is given (a kernel that ignores the filter would zero the whole table while the client kept a few flows); and when the dump ends in any error (interruption, bad record, record ceiling, a failing visitor, a dropped socket) **the counters of the flows already read are lost** — zeroed in the kernel, records discarded. Documented on `DumpKind.zero_counters`.
 - **Statistics**: `CpuStats` (one record per CPU, `res_id` = CPU), `GlobalStats` (`entries`,
   `max_entries`), `ExpectStats`; all big-endian `u32`. **Expectations**: `Expect` (master, tuple, mask,
-  timeout, id, helper, zone, flags, class, function name), decoded from `IPCTNL_MSG_EXP_NEW` records. **The expectation statistics reply carries type `0x0103` (the CONNTRACK subsystem, command 3), not `0x0203`: measured on a live kernel 2026-11-03** (`msg_exp_stats_reply`); the first version filtered on `0x0203` and returned an empty slice for ever. A stats or expectation dump has one record type, so a record of another type is a malformed reply (`MalformedReply` after the drain), never skipped into an empty "complete" answer; a flow dump skips foreign types as it always did. The live test asserts at least one record for the CPU and expectation statistics. The expectation function name (`CTA_EXPECT_FN`, a `const char *` with no bound) keeps its first 15 characters and `fn_truncated` says it was cut; the helper name is bounded by the kernel (16) and a longer one is `BadLength`.
-- **The newer `Flow` attributes decode leniently** (decided 2026-11-03, per attribute): master tuple, helper name, labels, seq-adjust (both), SYN proxy, SCTP and DCCP protoinfo are informational, were skipped as unknown before, and a malformed one (wrong width, a name over 15 characters, labels over 16 bytes, a truncated nest) leaves its field `null` instead of failing the flow; failing it would turn one odd optional attribute into `MalformedReply` for the whole dump. The attributes that were already decoded keep their strict widths (`status`, `timeout`, TCP info, counters …). So nothing got stricter for an existing consumer. `Name` is a fixed 16-byte buffer and `labels` the kernel's 16 bytes (shorter zero-padded), so `Flow` stays pointer-free.
-- **Memory.** `Flow` is 488 bytes (was 256). `dump()` keeps at most 1 Mi flows (`error.TooManyMessages` beyond): 488 MiB of flows, and the result list grows by doubling, so while it grows the old and new buffers coexist and the peak is up to about 1.5x that, roughly 730 MiB; neither number is a measurement of a run, they are the arithmetic. `FlowQuery.max_flows` bounds the flows *returned* for `dumpWith` (default: the 1 Mi ceiling); a flow the client filter drops does not count against it, while a separate ceiling of 1 Mi on the records the kernel produced stays. A small router should set `max_flows` or use `dumpEach`/`dumpEachWith`, which keep nothing.
+  timeout, id, helper, zone, flags, class, function name), decoded from `IPCTNL_MSG_EXP_NEW` records. **The expectation statistics reply carries type `0x0103` (the CONNTRACK subsystem, command 3), not `0x0203`, as measured on a live kernel** (`msg_exp_stats_reply`). A stats or expectation dump has one record type, so a record of another type is a malformed reply (`MalformedReply` after the drain), never skipped into an empty "complete" answer; a flow dump skips foreign types as it always did. The live test asserts at least one record for the CPU and expectation statistics. The expectation function name (`CTA_EXPECT_FN`, a `const char *` with no bound) keeps its first 15 characters and `fn_truncated` says it was cut; the helper name is bounded by the kernel (16) and a longer one is `BadLength`.
+- **The newer `Flow` attributes decode leniently** (decided per attribute): master tuple, helper name, labels, seq-adjust (both), SYN proxy, SCTP and DCCP protoinfo are informational, and a malformed one (wrong width, a name over 15 characters, labels over 16 bytes, a truncated nest) leaves its field `null` instead of failing the flow; failing it would turn one odd optional attribute into `MalformedReply` for the whole dump. The attributes that were already decoded keep their strict widths (`status`, `timeout`, TCP info, counters …). `Name` is a fixed 16-byte buffer and `labels` the kernel's 16 bytes (shorter zero-padded), so `Flow` stays pointer-free.
+- **Memory.** `Flow` is 488 bytes. `dump()` keeps at most 1 Mi flows (`error.TooManyMessages` beyond): 488 MiB of flows, and the result list grows by doubling, so while it grows the old and new buffers coexist and the peak is up to about 1.5x that, roughly 730 MiB; neither number is a measurement of a run, they are the arithmetic. `FlowQuery.max_flows` bounds the flows *returned* by `dumpWith` (default: the 1 Mi ceiling) and the flows *delivered* by `dumpEachWith` (default: no cap). In `dumpEachWith` the flow after `max_flows` delivered ones is not visited, the dump is read to its DONE and `error.TooManyMessages` is returned, so the socket stays usable; the flows before it have been visited (the style of `dumpWith`, which has no reference implementation to follow: libnetfilter_conntrack's callback dump has no cap, a callback stops it with `NFCT_CB_STOP`, our visitor error). A flow the client filter drops does not count against the bound, while a separate ceiling of 1 Mi on the records the kernel produced stays (`dumpWith`; `dumpEachWith` keeps its datagram budget). A small router should set `max_flows` or use `dumpEach`/`dumpEachWith`, which keep nothing.
 - The attribute numbers of the statistics and expectation messages come from the kernel UAPI header
   and ti-mo's constants (MIT). The live test (`unshare -rn`) reads real statistics and the real
   (empty) expectation table and checks the kernel's answer to a mark filter; no capture of a
   non-empty expectation exists, so that decode is checked against hand-built frames only
   *(unverified against a kernel record)*.
+
 
 ### Decoder safety
 
@@ -187,6 +189,7 @@ container-neighbour's traffic can influence in content (never in framing). Invar
 Coverage: hostile/truncated/misaligned attribute streams, wrong-sized scalars, a 64-deep
 self-nested tuple, and a `std.testing.fuzz` target over `decodeFlow` + the message walker.
 
+
 ### Transport
 
 **All of it is `netlink.Socket`'s** — `Socket` here is a one-field wrapper
@@ -206,51 +209,17 @@ and drive the socket from poll/epoll. Both come from `netlink.Socket.recvDatagra
 `awaitAckStrict` — the *strict* half of the shared engine, which the rtnetlink path narrows away
 because it has no multicast groups and no receive timeout. `Socket.send`, `Socket.recvDatagram`,
 `Socket.handle`, `Socket.setRecvTimeout`, `Socket.nextSeq` and `Socket.lastErrorMessage` are
-unchanged in signature and behaviour; they are now one-line forwards.
+one-line forwards.
 
 The event API is deliberately a seam rather than a callback: `Socket.nextEvents()` performs
 exactly one blocking `recv` and hands back an `EventIterator` over that datagram. The iterator
 is pure — it can also be fed a replayed capture, which is how the offline event tests work.
 
-### DRY candidates
+### Shared with `netlink`
 
-Two were filed when this module was written (`modules/netlink` was owned by another workstream
-at the time), and a third — the transport itself — was filed after them. **All three are now
-paid off:**
-
-1. ~~**`asBe16/32/64` + `appendAttrBe16/32/64`** (`wire.zig`)~~ — **done.** They live in
-   `netlink.codec` beside their host-order twins (`Attr.asBe16/32/64`,
-   `codec.appendAttrBe16/32/64`) and this module uses them from there; `nftables` had written
-   the same eight independently, and nfqueue, nflog, cttimeout and nf_acct will want them too.
-   Only the *writers'* error set changed on the way: this module's copies propagated
-   `AttrTooLong` from `appendAttr`, `nftables`' asserted it away. The shared ones assert
-   (`unreachable`) — the payload is a fixed 2/4/8 bytes, so the error is unreachable by
-   construction, and it matches the existing `appendAttrU16/U32/U8`. `BuildError` still lists
-   `AttrTooLong` because the string/raw builders here can still raise it.
-2. ~~**The dump loop**~~ — **done.** `Socket.dump`'s multi-part triage (the (portid, seq)
-   match, the `NLM_F_DUMP_INTR` restart, the `NLMSG_DONE`/`NLMSG_ERROR`/`NLMSG_NOOP`/
-   `NLMSG_OVERRUN` dispatch) is `netlink.classifyDumpMessage`, shared with `netlink`'s own
-   dumps and with `nftables`. It is a pure verdict function, not a driver: the policy above it
-   — which request, which reply type, which parser, which errno mapping, how items are
-   allocated — stays here, which is what lets three different netlink protocols share it.
-3. ~~**The socket transport**~~ — **done.** `netlink.Socket.open` no longer hardcodes
-   `linux.NETLINK.ROUTE`: `openProtocol`/`openProtocolGroups` take the protocol (and a multicast
-   bind mask), and `netlink.Socket` now *is* the shared transport — bind, portid capture,
-   `NETLINK_EXT_ACK`, sequence allocation, `send`, the `MSG_PEEK|MSG_TRUNC` growth loop,
-   `SO_RCVTIMEO`, the extended-ACK capture and the ACK engine. This module's private copies of
-   all of it are gone; `Socket` is `struct { nl: netlink.Socket }` and its transport methods are
-   forwards. Behaviour is bit-for-bit what it was — the strict `Overrun`/`WouldBlock` mapping
-   this module needed became the shared implementation, and `netlink`'s coarser rtnetlink mapping
-   became a narrowing wrapper over it, so neither side moved. **`genetlink` is the remaining
-   candidate** (it still carries its own copy, and `nl80211`/`ethtool`/`wireguard` ride on it).
-
-**Not folded in, deliberately: `nfgenmsg` framing.** `nftables` and this module both define
-`nfgenmsg_len`/`NFNETLINK_V0`/`msgType`/`Nfgenmsg`/`parseNfgenmsg`/`appendNfgenmsg`. `struct
-nfgenmsg` is a *per-protocol fixed payload header*, the same layer as `ifinfomsg` (which lives in
-`netlink`, with rtnetlink), `tcmsg` (in `tc`) and `genlmsghdr` (in `genetlink`) — so it belongs
-with its family, not in `netlink`, whose remit is netlink-generic mechanism. The argument in full
-is in `modules/netlink/SPEC.md`; the trigger to revisit is a third nfnetlink family (nfqueue,
-nflog, ipset), at which point a sibling `nfnetlink` module is the right home.
+- **Big-endian attribute accessors and writers** live in `netlink.codec` beside their host-order twins (`Attr.asBe16/32/64`, `codec.appendAttrBe16/32/64`); `nftables` uses the same ones. The writers assert (`unreachable`) instead of returning `AttrTooLong`: the payload is a fixed 2/4/8 bytes, as with `appendAttrU16/U32/U8`. `BuildError` still lists `AttrTooLong` because the string/raw builders here can raise it.
+- **The dump loop's multi-part triage** (the `(portid, seq)` match, the `NLM_F_DUMP_INTR` restart, the `NLMSG_DONE`/`NLMSG_ERROR`/`NLMSG_NOOP`/`NLMSG_OVERRUN` dispatch) is `netlink.classifyDumpMessage`, shared with `netlink`'s own dumps and with `nftables`. It is a pure verdict function, not a driver: the policy above it (which request, which reply type, which parser, which errno mapping, how items are allocated) stays here, which is what lets different netlink protocols share it.
+- **The socket transport** is `netlink.Socket` (see *Transport*): `openProtocol`/`openProtocolGroups` take the protocol and a multicast bind mask; the strict `Overrun`/`WouldBlock` mapping this module needs is the shared implementation, and `netlink`'s coarser rtnetlink mapping is a narrowing wrapper over it. `Socket` here is `struct { nl: netlink.Socket }`.
 
 ## Size on the real targets
 
@@ -263,13 +232,12 @@ ReleaseSmall, stripped, `zig build-exe` of a program over `netlink` + `netaddr` 
 
 "Before" is the module as of the commit preceding this survey. **The claim "the router-tool consumer pays nothing for the new API" holds for what the router-tool consumer calls today, open + flush, and only for that:** a consumer that dumps pays for the decoder, which now reads more attributes. Probe sources: `main.zig` = `var sock = conntrack.Socket.open(page_allocator) catch return 2; defer sock.close(); sock.flush(.unspec) catch return 3; return 0;`, and `main_dump.zig` = the same with `const flows = sock.dump(.unspec) catch return 3; defer gpa.free(flows); return @truncate(flows.len);`.
 
+
 ## Verification
 
-### Byte-exact goldens (all from real captures)
+Run with `scripts/modtest conntrack`; `unshare -rn zig build test-conntrack` runs every live test against a real kernel in a private network namespace (`CAP_NET_ADMIN` inside the user namespace). Without the namespace the kernel answers `EPERM` to everything, and each live test prints `SKIPPED: …` and passes, so an unprivileged run exercises only the offline tests.
 
-Every golden in `src/goldens.zig` is a **raw netlink frame captured off the wire**, not a
-hand-written layout. The capture used an `nlmon` device, which hands the kernel a verbatim copy
-of every netlink frame in the namespace:
+- **Goldens, all from real captures.** Every golden in `src/goldens.zig` is a **raw netlink frame captured off the wire**, not a hand-written layout. The capture used an `nlmon` device, which hands the kernel a verbatim copy of every netlink frame in the namespace:
 
 ```sh
 unshare -rn bash -c '
@@ -289,13 +257,7 @@ unshare -rn bash -c '
   wait'
 ```
 
-(Set 2 also passed `-m 42 -w 7` to the first insert and added an ICMP flow with
-`-p icmp --icmp-type 8 --icmp-code 0 --icmp-id 1234`.) In a `DLT_NETLINK` pcap each record
-carries a 16-byte cooked header whose last two bytes are the netlink family (`0x000c` =
-`NETLINK_NETFILTER`); the goldens are the bytes after it. The same traffic was independently
-captured with `unshare -rn strace -f -e trace=sendmsg,recvmsg,sendto,recvfrom -xx -s 8192
-conntrack …` and agrees attribute for attribute — that decode is what the layout comments were
-cross-checked against. Tools: conntrack-tools v1.4.9, kernel 7.0.0 x86_64.
+(Set 2 also passed `-m 42 -w 7` to the first insert and added an ICMP flow with `-p icmp --icmp-type 8 --icmp-code 0 --icmp-id 1234`.) In a `DLT_NETLINK` pcap each record carries a 16-byte cooked header whose last two bytes are the netlink family (`0x000c` = `NETLINK_NETFILTER`); the goldens are the bytes after it. The same traffic was independently captured with `unshare -rn strace -f -e trace=sendmsg,recvmsg,sendto,recvfrom -xx -s 8192 conntrack …` and agrees attribute for attribute; that decode is what the layout comments were cross-checked against. Tools: conntrack-tools v1.4.9, kernel 7.0.0 x86_64.
 
 **Encoder goldens** — the module's request bytes are compared to conntrack-tools' byte for byte:
 
@@ -325,81 +287,43 @@ conntrack-tools adds. The delete path is additionally proven end-to-end by the l
 | `get_reply_udp4` (192 B) | the single-entry `conntrack -G` answer, incl. the surprising `NLM_F_MULTI` |
 | `delete_request_udp4` (176 B) | doubles as a decoder fixture — a genuine `IPCTNL_MSG_CT_DELETE` message, i.e. exactly the shape of a destroy *event* |
 
-### Live proof
+- **Live tests** (`src/root.zig`, names starting `live:`): a dump decoded from a real kernel (complete tuples, family matching addresses, ports for TCP/UDP); an insert, get by original and by reply tuple, dump, compare-and-delete with a wrong id (`error.NotFound`, entry survives), delete with the right id, second delete `NotFound`; an event socket seeing the flow another socket creates, decoded through the same `decodeFlow`; filtered dumps, statistics, the (empty) expectation table and the receive buffer, including the kernel's answer to a mark filter. No capture of a non-empty expectation exists, so that decode is checked against hand-built frames only *(unverified against a kernel record)*.
+- **Offline tests:** hostile, truncated and misaligned attribute streams, wrong-sized scalars, a 64-deep self-nested tuple, the byte-order trap, the lenient-versus-strict attribute split, the builders' attribute numbers and gates, `Tuple.invert()` and its ICMP tables, the dump filter and its request encoding, and the dump / await / dumpEach engines driven through a scripted transport (restart budget, ceilings, discard flags, error classes, extended-ACK capture, the `EINVAL` remap).
+- **No-panic sweep:** `src/sweep_test.zig` pins the public decoders' entry points (every truncation of a real reply is an error or a flow).
+- **Fuzz:** the deterministic driver, `CONNTRACK_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`): three harnesses (decode, decode of damaged corpus entries, the dump engine over every request kind) with per-decoder and per-engine-path reach labels (`fz.Seen`); a fixed seed loop and the reach checks run in every test run.
+- **Constant time:** n/a — netlink conntrack decoding, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. Not mutated: attribute and message-type constants (comptime), `goldens.zig`, the fuzz and sweep files, the socket plumbing delegated to `netlink`.
+- **Bench:** `zig build bench-conntrack` (`tools/bench.zig`) against ti-mo/conntrack through `tools/go_bench`; the figures are the card's Performance line.
 
-`unshare -rn zig build test-conntrack` (real kernel, real netns, CAP_NET_ADMIN inside the user
-namespace) runs three live tests, all of which passed in Debug and in `--release=fast`:
 
-1. **dump** — open the socket, `IPCTNL_MSG_CT_GET|NLM_F_DUMP`, decode; every returned flow must
-   have complete `orig`/`reply` tuples, a family matching its addresses, and ports for TCP/UDP.
-2. **round-trip** — insert a synthetic UDP flow on RFC 5737 documentation addresses, `get` it
-   back by the original tuple, `get` it again by the reply tuple and assert both name the same
-   `CTA_ID`, find it exactly once in a `dump(.ipv4)` (this is the path that decodes a genuine
-   kernel dump reply, not a replayed one), attempt a compare-and-delete with a **wrong** id and
-   assert `error.NotFound` *and* that the entry survived, then delete with the right id and
-   assert it is gone and that a second delete answers `NotFound`.
-3. **events** — bind `NFNLGRP_CONNTRACK_NEW/UPDATE/DESTROY` on a second socket, insert a flow
-   from the first, and observe the `new` event decoded through the same `decodeFlow`.
+## Limits
 
-Without the namespace (plain `zig build test-conntrack` as an ordinary user) the kernel answers
-`EPERM` to everything, and each live test prints `SKIPPED: …` and passes.
+- **`Tuple.invert()`** maps only the paired ICMP types (echo/timestamp/information/address-mask, and ICMPv6 echo). Any other type is copied unchanged — the kernel would not track it as a request/reply pair either — but a caller that knows the exact reply tuple should build it explicitly rather than rely on the helper.
+- **`dump()` memory** is bounded by the 1 Mi flow ceiling (see *Dump variants*); a small router sets `FlowQuery.max_flows` or visits with `dumpEach`.
+- **A dump on a kernel that ignores a filter attribute** is unfiltered on the wire; the client pass makes the answer right (see *Dump variants*).
+- **Expectation records** are decoded against hand-built frames only; no capture of a non-empty expectation exists.
 
-**All tests pass** in Debug and `--release=fast`; unprivileged, the offline tests run and the
-live tests skip-and-pass; under `unshare -rn`, every test runs for real. One fuzz
-target (`decodeFlow` + message walker).
+## What is deliberately not done
 
-**Audit 2026-10-04 (mutation).** 34 schemata mutants over the codec (`nfgenmsg` length and
-byte order, tuple completeness and inversion incl. the ICMP/ICMPv6 type tables, tuple and
-flow family cross-checks, fixed-size and TCP-flag lengths, counters, PROTOINFO selection),
-the request builders (incomplete/mixed tuples, ICMPv6 attribute numbers, zones, the dump
-flag, the delete id, the PROTOINFO gate) and the engines (`awaitFlowOver`'s pid/seq filter,
-bare ACK and message cap; `dumpOver`'s cap, restart and record-type filter; the EINVAL
-remap): 34 killed (one by a hang), 0 equivalent, 0 left alive. Eleven survivors of the first
-run got tests: `res_id` big-endian both ways, DCCP PROTOINFO not read as TCP, a 3-byte TCP
-flags attribute, an IPv6 reply tuple under AF_INET, ICMPv6 attribute numbers, PROTOINFO for
-a lone `tcp_flags_orig`, `awaitFlowOver` skipping replies for another port or sequence and
-mapping a bare ACK to `NotFound` (driven through the scripted transport), and a dump skipping
-a non-`CT_NEW` record.
+- **`CTA_NAT_SRC`/`_DST`** — the kernel does not send them in a flow dump or event (they are request attributes for NAT'd entries and expectations; ti-mo's `Flow` has no field for them either); a NAT'd flow's translation is visible in `reply` and `IPS.SRC_NAT`/`DST_NAT` *(inferred from ti-mo's model; no capture of one exists)*.
+- **`CTA_SECCTX`** — an SELinux context string of unbounded length, absent on OpenWRT-class kernels.
+- **`CTA_HELP_INFO`** — opaque helper state.
+- **`CTA_FILTER`** (the nested attribute that trims which attributes a dump or event carries) — it only shrinks the reply, the client already skips what it does not need, and kernels differ in what it accepts.
+- **`CTA_LABELS_MASK` and update-with-labels (the write side of connlabels)** — a mask protocol that only `conntrack --label` users need, no consumer, and a wrong mask rewrites other tenants' bits; labels are read, not written.
+- **Filtered flush / `conntrack -D` with filters** — kernels that predate the attribute ignore the filter and *flush the whole table* (ti-mo's own source comment), the one failure the separate `flush` name exists to prevent; a caller dumps with a filter and deletes by tuple and id.
+- **`NETLINK_NO_ENOBUFS`** — it would make the kernel stop reporting lost events, against the module's rule that a lost event is `error.Overrun`.
+- **Expectation create/delete** — the write path of helper expectations, experimental in ti-mo, no consumer.
+- **`nfnetlink_cttimeout`, `nfnetlink_cthelper`, `nfnetlink_acct`** — different subsystems; out of scope for this module.
+- **Folding `nfgenmsg` framing into `netlink`.** `nftables` and this module both define `nfgenmsg_len`/`NFNETLINK_V0`/`msgType`/`Nfgenmsg`/`parseNfgenmsg`/`appendNfgenmsg`. `struct nfgenmsg` is a *per-protocol fixed payload header*, the same layer as `ifinfomsg` (which lives in `netlink`, with rtnetlink), `tcmsg` (in `tc`) and `genlmsghdr` (in `genetlink`), so it belongs with its family, not in `netlink`, whose remit is netlink-generic mechanism. The argument in full is in `modules/netlink/SPEC.md`; the trigger to revisit is a third nfnetlink family (nfqueue, nflog, ipset), at which point a sibling `nfnetlink` module is the right home.
 
-**Audit 2026-11-19 (whole-module mutation).** 361 schemata mutants over `wire.zig`, `ext.zig` and `root.zig`: every attribute's destination field and byte order in the decoders, the lenient-versus-strict split of the informational attributes, the family cross-checks, the builders' attribute numbers, flags and gates, `invert` and its ICMP tables, the dump filter and its request encoding, the statistics and expectation decoders, the await / dump / dumpEach engines (ceilings, restart budget, discard flags, error classes, extended-ACK capture), `triage`, the event kinds and the live `Socket` methods. Result: 348 killed (2 by a hang, 3 only under `unshare -rn`), 6 equivalent, 7 open, 0 not run. The card's `348/361` replaces the earlier counts (`src ?`). Not mutated: attribute and message-type constants (comptime), `goldens.zig`, the fuzz and sweep files, the socket plumbing delegated to `netlink`. The first run left 63 survivors; tests added: 64-bit counters, timestamps, window scales and TCP flags in asymmetric values, a one-byte TCP flags attribute, malformed SCTP / DCCP / seq-adjust / master-tuple / helper attributes (the flow survives, the field stays null), the orig/reply/nfgen family checks for an absent tuple and for IPv6, ICMPv6 code and id attribute numbers, the flush ACK flag, a NEW request with a lone `tcp_state` or `flags_reply`, `isComplete` per field, `family()` and `invert()` on partial tuples, `Name.prefixOf`, `hasStatus`, the filter's missing-status rule, the padded zone attribute and the status mask in `buildFlowDump`, the sequence in the fixed requests, `fn_truncated`, and engine tests for a framing error, an overrun record, a header-only error record, a foreign record type, extended-ACK capture, a filtered dump failing with a non-EINVAL errno and the sequence patched into a fixed request.
+## Open
 
-Equivalent (6): in `dumpGeneric`, decoding the records that follow an interrupted, a bad or an over-ceiling record (a restart clears the list; a bad or over-ceiling pass returns an error that frees it, only work and memory differ), the two early `clearAndFree` calls (memory released sooner, cost-only), and `strictTypes` in `dumpEach` (it is only ever called with a flow query, whose answer is `false`). Open (7): six OPEN-LIVE mutants that need a privileged namespace and a specific scenario, namely `openEvents` dropping the group mask, the `flush` EINVAL remap, `insert` without `NLM_F_EXCL` (needs a duplicate insert), `update` without ACK, and the stale extended-ACK length in `awaitFlow` and in `statsGlobal`; and the strict `SEQ_ADJ_REPLY` decode, for which a test was added after the last measurement and was not re-run. Three more live mutants (`setRecvBuffer` value, `get` not mapping `NotFound`, `insert` without `NLM_F_CREATE`) are killed by the existing live tests under `unshare -rn` but not by the unprivileged run.
-
-## Deferred (honest list)
-
-*Superseded 2026-11-02 by the verdict per survey gap under "Compared with": expectations (table, stats), NAT (rejected: not in flows), DCCP/SCTP protoinfo, helper and labels, filtered dumps, statistics, dying/unconfirmed dumps and event buffer sizing are done or rejected there. What follows is the 2026-09-30 list as written, kept for its reasoning.*
-
-Scope choices, not oversights. None of them is load-bearing for a dump/get/delete/event client:
-
-- **Expectations** (`NFNL_SUBSYS_CTNETLINK_EXP`, `IPCTNL_MSG_EXP_*`) — a separate subsystem with
-  its own message types; the `Group.CONNTRACK_EXP_*` masks are defined but nothing decodes
-  expectation messages.
-- **NAT attributes** (`CTA_NAT_SRC`/`_DST`, `CTA_SEQ_ADJ_*`, `CTA_SYNPROXY`) — skipped by the
-  decoder and never built. Reading a NAT'd flow's *tuples* works (they are ordinary tuples,
-  and the reply tuple already shows the translation); the explicit NAT range attributes do not.
-- **DCCP/SCTP protoinfo** — `CTA_PROTOINFO_DCCP`/`_SCTP` are skipped; only the TCP sub-tree is
-  decoded. The constants are present.
-- **`CTA_HELP` / `CTA_SECCTX` / `CTA_LABELS`** — helper name, security context and connlabels
-  are neither decoded nor built.
-- **Filtered dumps** (`CTA_MARK`+`CTA_MARK_MASK`, `CTA_FILTER`, `CTA_STATUS_MASK`) — the kernel
-  can filter a dump server-side; this module always dumps and lets the caller filter, which is
-  correct but not the cheapest.
-- **Statistics** (`IPCTNL_MSG_CT_GET_STATS`, `_STATS_CPU`) and the dying/unconfirmed dumps
-  (`IPCTNL_MSG_CT_GET_DYING`, `_GET_UNCONFIRMED`) — message types defined, no typed API.
-- **`nf_conntrack_timeout` / `cthelper` subsystems** — out of scope entirely.
-- **Event socket tuning** — no `SO_RCVBUF` bump and no `NETLINK_BROADCAST_ERROR`/
-  `NETLINK_NO_ENOBUFS`; a busy event socket will report `error.Overrun` rather than silently
-  dropping, and the caller is told to re-dump. A future consumer that needs lossless events
-  should raise the receive buffer first.
-- **`Tuple.invert()`** maps only the paired ICMP types (echo/timestamp/information/address-mask,
-  and ICMPv6 echo). Any other type is copied unchanged — the kernel would not track it as a
-  request/reply pair either — but a caller that knows the exact reply tuple should build it
-  explicitly rather than rely on the helper.
+- Seven mutants of the last whole-module run are open (see the card's `**Audit:**` line): six need a privileged namespace and a specific scenario — `openEvents` dropping the group mask, the `flush` `EINVAL` remap, `insert` without `NLM_F_EXCL` (needs a duplicate insert), `update` without ACK, and the stale extended-ACK length in `awaitFlow` and in `statsGlobal` — and the strict `SEQ_ADJ_REPLY` decode has a test that the measurement predates. Three live mutants (`setRecvBuffer` value, `get` not mapping `NotFound`, `insert` without `NLM_F_CREATE`) are killed only under `unshare -rn`.
 
 ## Backlog / deferred
 
-- **Survey 2026-11-02 closed the items of the 2026-09-30 ranking** (event buffer, filtered dump, statistics and dying/unconfirmed, expectation table and events; NAT attributes, filtered flush, expectation writes and label writes rejected, see "Compared with"). Open: `nfnetlink_cttimeout` as its own module, and a **live-dump comparison row** against ti-mo/florianl in a netns (a kernel tie; needs thousands of inserted flows; not measured).
-- ~~**`dumpEach` has no flow cap, only the datagram budget** *(no-panic sweep GX, 2026-10-31)*~~ — **DONE 2026-11-19 (additive).** `FlowQuery.max_flows`, already the returned-flow bound of `dumpWith`, now also bounds the flows `dumpEachWith` delivers: the flow after `max_flows` delivered ones is not visited, the dump is read to its DONE and `error.TooManyMessages` is returned, so the socket stays usable (the style of `dumpWith`, same precedence: interruption, then whichever of malformed record / overflow came first). The flows before it have been visited. Default null = no cap (unchanged); plain `dumpEach(family)` keeps its signature, so a cap is set through `dumpEachWith(.{ .family = f, .max_flows = n })`. Basis: the module's own `dumpWith` contract; libnetfilter_conntrack's callback dump has no cap (a callback may return `NFCT_CB_STOP`, our visitor error), so there is no reference to follow beyond the module's style. The datagram budget stays the implicit ceiling when no cap is set. Delta mutation 2026-11-19: 6 mutants (cap comparison, counter, overflow flag, final error, discard of the rest, default bound), 6 killed (one after a new test: an overflow followed by a malformed record); the card counts are cumulative (old + 6); `src ?` stays, the earlier run's source is not recorded.
+- **`nfnetlink_cttimeout` as its own module** — a different subsystem (cthelper and acct likewise); nothing in this module depends on it.
+- **A live-dump comparison row** against ti-mo and florianl in a netns — a kernel tie; needs thousands of inserted flows; not measured.
 
 ## Anchoring
 

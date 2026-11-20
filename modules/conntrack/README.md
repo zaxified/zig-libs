@@ -105,10 +105,10 @@ while (true) {
 - `Socket.nextEvents() RecvError!EventIterator` — the **only** blocking call in the event path;
   `Socket.handle()` and `Socket.setRecvTimeout(ms)` let a caller drive it from poll/epoll.
 - `Socket.lastErrorMessage()` — the kernel's extended-ACK reason for the last failure.
-- `Flow` — `orig`/`reply` tuples plus `status`, `timeout`, `mark`, `id`, `use`, `zone`,
+- `Flow` — `family` (the carrying message's `nfgen_family`), `orig`/`reply` tuples plus `status`, `timeout`, `mark`, `id`, `use`, `zone`,
   `counters_orig`/`_reply` (64-bit), `tcp_state`, `tcp_wscale_*`, `tcp_flags_*`,
   `timestamp_start`/`_stop`, `tuple_master`, `helper`, `labels`, `seq_adj_orig`/`_reply`,
-  `synproxy`, `sctp`, `dccp`. Every field optional: present iff the kernel sent it. (NAT
+  `synproxy`, `sctp`, `dccp`. Every field except `family`, `orig` and `reply` is optional: present iff the kernel sent it. (NAT
   translations show in `reply`: the kernel never sends `CTA_NAT_SRC/DST` in a flow.)
 - `Tuple` — `src`/`dst` (`netaddr.Ip`), `proto`, `src_port`/`dst_port` **or**
   `icmp_id`/`icmp_type`/`icmp_code`, plus `isComplete()` and `invert()`.
@@ -130,6 +130,10 @@ Two kernel behaviours worth knowing, both verified live and covered by tests:
   `NewSpec`, so `EINVAL` there stays `error.InvalidRequest` — it can still mean a malformed
   request (e.g. an insert with no `timeout`). See SPEC.md "EINVAL vs subsystem absent".
 
+## Not provided
+
+No filtered flush, expectation create/delete, label writes, `CTA_NAT_*`/`CTA_SECCTX`/`CTA_FILTER` attributes or `NETLINK_NO_ENOBUFS`, and no `nfnetlink_cttimeout`/`cthelper`/`acct`: the reasons are in SPEC *What is deliberately not done*, the open items in *Backlog / deferred*.
+
 ## Verify
 
 ```sh
@@ -140,7 +144,7 @@ unshare -rn zig build test-conntrack           # + live insert/get/dump/delete +
 Every live test prints `SKIPPED: …` and **passes** when the ctnetlink socket cannot be opened,
 `nf_conntrack` is missing, or `CAP_NET_ADMIN` is not held — an unprivileged `zig build test`
 stays green. See SPEC.md for the full verification story (byte-exact captures of real
-conntrack-tools traffic, the capture command, the live proof and the deferred list).
+conntrack-tools traffic, the capture command and the live tests).
 
 Provenance: the committed `tools/go_bench/go.sum` was produced by `go mod tidy` for the pinned
 `github.com/ti-mo/conntrack v0.6.0` (MIT; the comparative bench's reference, not shipped); the

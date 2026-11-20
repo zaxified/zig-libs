@@ -5,10 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit over `wire.zig`, `ext.zig` and `root.zig` (361 mutants: 348 killed, 6 equivalent, 7 open). Tests added for the survivors (asymmetric 64-bit counters, timestamps, window scales and flags, malformed informational attributes, family cross-checks, ICMPv6 attribute numbers, the flush ACK flag, partial NEW specs, filter encoding, and engine tests for framing errors, overrun and header-only error records, extended-ACK capture and the sequence of fixed requests); no source behaviour changed.
 
 - **2026-11-19** — Additive: `FlowQuery.max_flows` also bounds `Socket.dumpEachWith`: after that many delivered flows the next is not visited, the dump is read to its DONE and `error.TooManyMessages` returned (socket usable). Null (default) and `dumpEach` are unchanged.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-03** — Grade 2. Performance line in the card's format; `check-uapi` now also checks `src/ext.zig` (143 constants matched, 0 mismatches).
 
 - **2026-11-03** — **BUG FIX:** `dumpWith`/`dump` exceeding `max_flows` or the 1 Mi record ceiling returned `TooManyMessages` in the middle of the kernel's dump, so the next request on that socket answered EBUSY. They now discard the rest without allocating, read to the DONE and then return the error; the socket stays usable. Precedence: an interruption beats it (restart, or `InconsistentDump` for `.zero_counters`, still one request); of a bad record and this limit the first in wire order wins. Only the 65536-datagram budget still stops undrained: after `TooManyMessages` close the socket unless you know it was a record limit (Socket doc). SPEC survey date corrected to 2026-11-03.
