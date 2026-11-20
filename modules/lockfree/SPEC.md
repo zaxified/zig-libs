@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Go `sync/atomic`, `sync.Pool` | Go | BSD-3-Clause | — | Go stdlib | Atomics and per-P pools only; no lock-free queue or reclamation is needed under a GC. |
 | Zig `std.atomic`, `std.Io` | Zig | MIT | — | Zig 0.16.0 | Atomic primitives only; no reclamation and no lock-free container (this module's SPEC §1). |
 
-**Where we are ahead:** the only one of the Zig options with safe reclamation (EBR) under the queue *(inferred: the other README does not mention any)*, and the most rigorously checked: a poisoning node pool that detects use-after-free, a stress driver with a deliberately broken control, and weak-memory certification on aarch64/riscv64 plus herd7 litmus tests (SPEC §7). **Where we are behind:** no lock-free map, no hazard pointers, and every reclamation-relevant access — pin store, epoch loads/CAS, the `local_epoch` scan loads, the queue's `head`/`tail`/`Node.next` loads and CAS — is `seq_cst` where a tuned design would use acquire/release (correct, slower; the unpin store, registration and orphan bookkeeping already use release/acquire/monotonic, SPEC §4a) (→ Backlog).
+**Where we are ahead:** the only one of the Zig options with safe reclamation (EBR) under the queue *(inferred: the other README does not mention any)*, and the most rigorously checked: a poisoning node pool that detects use-after-free, a stress driver with a deliberately broken control, and weak-memory certification on aarch64/riscv64 plus herd7 litmus tests (SPEC §7). **Where we are behind:** no lock-free map, no hazard pointers (→ *Backlog / deferred*), and every reclamation-relevant access — pin store, epoch loads/CAS, the `local_epoch` scan loads, the queue's `head`/`tail`/`Node.next` loads and CAS — is `seq_cst` where a tuned design would use acquire/release (correct; the demotion would cost a barrier only on riscv64 and ARMv8.3+, SPEC §7.0a; the unpin store, registration and orphan bookkeeping already use release/acquire/monotonic, SPEC §4a) (→ *What is deliberately not done*).
 
 ## 1. Dedup / std-gap
 
@@ -87,7 +87,7 @@ is no untrusted or arbitrarily-blocking thread to stall the epoch. **The
 disqualifier for EBR would be** untrusted/unbounded thread churn, or long
 blocking sections inside a pin; neither applies to DL4. If a future consumer
 needs bounded per-node reclamation latency (e.g. a latency-SLO server holding
-references across I/O), hazard pointers become the next increment (§6).
+references across I/O), hazard pointers become the next increment (*Backlog / deferred*).
 
 Reference design: Keir Fraser's epoch reclamation (PhD thesis, 2004), as
 realized in crossbeam-epoch — a global epoch advancing only when every pinned
@@ -99,7 +99,7 @@ epochs later ("two grace periods").
 One module `lockfree`, not a split `ebr` + `queue`, because the two are
 co-designed: the queue's `dequeue` retires the old dummy **through** EBR, and
 the harness stresses them jointly (the queue is EBR's proving consumer).
-Splitting would introduce an artificial dep edge for a Phase-1 scaffold with a
+Splitting would introduce an artificial dep edge with a
 single shared verification story. Files:
 
 - `atomic.zig` — mechanical: `Backoff`, `CachePadded`, oracle `SpinLock`.
@@ -139,7 +139,7 @@ single shared verification story. Files:
 6. `MpmcQueue.dequeue` — MS-queue head CAS, value read, and retiring the old
    dummy through EBR (never freeing inline).
 
-**Mechanical scaffold (implemented + tested today):** the typed atomic helpers
+**Mechanical scaffold (implemented and tested):** the typed atomic helpers
 and backoff; the node pool + its poison/canary; the EBR `Domain`/`Participant`
 storage structs and `register`/`unregister` slot bookkeeping; the queue node
 type, `init` (dummy sentinel), `deinit`, and `reclaimNode` wiring; the
@@ -190,55 +190,53 @@ the `seq_cst` argument is an ISA-independent C11/LLVM guarantee. But the stress
 test only ever *ran* on x86_64 (a TSO memory model). On x86-TSO a `seq_cst` load
 is a plain `MOV` and a `seq_cst` store is an `XCHG`/`MOV+MFENCE`, so the one
 reordering the discipline must forbid (store→load) is the *only* one TSO allows —
-and the window is so narrow that stress cannot reliably hit it (see §5). On a
+and the window is so narrow that stress cannot reliably hit it (see *Verification*). On a
 weaker model (AArch64, POWER) the same `seq_cst` source is still correct by the
 theorem, but far more of the ordering is doing real work at runtime, so the
 empirical stress would exercise it harder. Bottom line: correctness is carried by
 the argument, not by the ISA; the "verified on" claim is x86_64-TSO only.
 
 What the discipline *costs* is a separate question from what it buys, and it is
-now measured rather than estimated — see **§7.0a**. Short version: on x86-64 and
+measured — see **§7.0a**. Short version: on x86-64 and
 on the aarch64 baseline, demoting every non-interlock `seq_cst` site to
 acquire/release changes **not one instruction**; the only x86-64 instruction the
 discipline pays for is the `xchg` behind `enterCritical`'s pin store (≈8.7 ns per
 pin), which is the Dekker store and cannot be given up. A real barrier gap exists
 only on riscv64 and ARMv8.3+.
 
-**Self-draining `unregister`.** The Phase-1 scaffold's contract was "the caller
-must have drained its limbo bags before unregistering," asserted in Debug. That
-is **not deterministically satisfiable** by a caller: draining needs the global
-epoch to move ≥ 2 past the last retire, and any concurrently pinned thread (e.g.
-one the OS preempted mid-pin) stalls that arbitrarily — so a finite "drain then
-unregister" dance always has a losing schedule (observed as a rare
-unregister-assert abort, ~1-in-20, in the gated stress). `unregister` therefore
-now **self-drains**: it spins `tryAdvance` *unpinned* (with backoff) until its
-bags empty, then flips `in_use`. This terminates under the module's own liveness
-contract — no thread stays pinned forever (per-attempt pins in `mpmc`) — and
-cannot deadlock: the spinning thread is unpinned, so it never blocks the very
-advance it waits on; a lone/last participant self-drains deterministically. A
-**non-blocking alternative** — migrating leftover garbage to a domain-global
-limbo (crossbeam-style) so `unregister` returns immediately — is the documented
-next increment (§6); the self-draining version is accepted for the fixed, trusted
-DL4 roster where a brief bounded wait at teardown is a non-issue.
+**Non-blocking `unregister`.** A caller cannot deterministically drain its limbo
+bags before unregistering: draining needs the global epoch to move at least 2 past
+the last retire, and any concurrently pinned thread (e.g. one the OS preempted
+mid-pin) stalls that arbitrarily. `unregister` therefore does a **bounded**
+self-drain (`max_unregister_advances = num_epochs + 2` `tryAdvance` attempts, no
+backoff, no retry loop; `src/ebr.zig:467`, `src/ebr.zig:510`), which completes
+deterministically for a lone or last participant. If garbage remains, the slot is
+**orphaned**: `orphaned` is published with a release store, `in_use` stays set
+(the bags are live storage), and the call returns (`src/ebr.zig:516`). Any
+participant's next `tryAdvance` adopts the slot (`adoptOrphans`,
+`src/ebr.zig:552`: an acquire CAS on `orphaned` with one winner, the epoch
+re-read after acquiring), drains what has expired and frees it. `unregister`
+never waits on another thread, and the orphan slot cannot block an advance
+because the scan reads `local_epoch` (unpinned), not `in_use`. The grace-period
+theorem never names the draining thread, only the epoch it observed, so it is
+untouched; the one extra access is the `orphaned` release/acquire pair. A
+double `unregister` (a slot not `in_use`, or already orphaned) is a checked panic
+(`msg_unregister_unowned`, `src/ebr.zig:193`).
 
-**Allocation on the retire path — the bounded reserve (was: `dequeue`'s OOM
-`@panic`).** `retire` is called pinned and *after* the unlink, so by then the node
-is out of the structure and its payload is already in the caller's hands: there is
-nothing to roll back, and `dequeue`'s `?u64` cannot surface an error anyway. The
-first version therefore `@panic`ed on `error.OutOfMemory` from the limbo-bag
-append, on the argument that both alternatives (lose the node, or free it under
-live readers) were wrong. That argument was half right — freeing under readers is
-a use-after-free and is never acceptable — but aborting the process is not the
-lesser evil it looks like: it loses *all* the memory rather than one node, and it
-turns a recoverable allocator failure into a crash for every consumer of the
-module. `retire` is now **infallible**, via two mechanisms, neither of which
-touches an ordering or the reclaim predicate:
+**Allocation on the retire path — the bounded reserve.** `retire` is called
+pinned and *after* the unlink, so by then the node is out of the structure and its
+payload is already in the caller's hands: there is nothing to roll back, and
+`dequeue`'s `?u64` cannot surface an error. Freeing the node under live readers
+would be a use-after-free, and aborting the process loses all the memory rather
+than one node and turns a recoverable allocator failure into a crash for every
+consumer. `retire` is therefore **infallible**, via two mechanisms, neither of
+which touches an ordering or the reclaim predicate:
 
-1. **A bounded reserve.** `Config.bag_reserve` (default 16) limbo entries per bag
-   per participant are pre-allocated in `Domain.init` — where a failure is just an
-   `error.OutOfMemory` out of a constructor. Bags keep capacity across drains
-   (`clearRetainingCapacity`), so once warm, retire never calls the allocator at
-   all; the reserve exists to cover the cold start and to bound the window in
+1. **A bounded reserve.** `Config.bag_reserve` (default 16, `src/ebr.zig:69`) limbo
+   entries per bag per participant are pre-allocated in `Domain.init` — where a
+   failure is just an `error.OutOfMemory` out of a constructor. Bags keep capacity
+   across drains (`clearRetainingCapacity`), so once warm, retire never calls the
+   allocator at all; the reserve covers the cold start and bounds the window in
    which the remaining path can be reached.
 2. **Abandon, never free.** If the reserve is exceeded *and* the grow fails, the
    node is dropped on the floor: not staged, not reclaimed. An abandoned node is
@@ -247,13 +245,12 @@ touches an ordering or the reclaim predicate:
    the only one of the three responses that is safe in the reclamation sense. Nor
    is it a heap leak: the node is a pool slot, destroyed by `NodePool.deinit` at
    teardown regardless, so the loss is bounded pool capacity. It is counted
-   (`Domain.droppedRetires`, quiescent-read) so a consumer that cares can assert
-   zero.
+   (`Domain.droppedRetires`, `src/ebr.zig:806`, quiescent-read) so a consumer that
+   cares can assert zero.
 
-`dequeue` keeps its `?u64` signature and contains no failure handling at all. Note
-what did **not** change: the retire tag is still the fresh `.seq_cst`
-`global_epoch` read, the drain predicate is still `observed − tag ≥ 2`, and the
-abandon path leaves `bag_epoch` untouched (the bag is unchanged, and an empty
+`dequeue` keeps its `?u64` signature and contains no failure handling at all. The
+retire tag is the fresh `.seq_cst` `global_epoch` read, the drain predicate is
+`observed − tag ≥ 2`, and the abandon path leaves `bag_epoch` untouched (the bag is unchanged, and an empty
 bag's tag is meaningless). The §7/§7.1 certifications cover the atomics and are
 unaffected — the reserve and the abandon path are plain single-owner memory on a
 path where the allocator has already failed. Tested with
@@ -262,9 +259,9 @@ path where the allocator has already failed. Tested with
 its value, drops nothing else, frees nothing early (`verifyQuiescent` clean), and
 does not panic.
 
-### 4a.1 crossbeam-epoch parity (2026-10-14)
+### 4a.1 crossbeam-epoch parity
 
-**Growing registry.** `Config.max_participants` is now the first chunk of
+**Growing registry.** `Config.max_participants` is the first chunk of
 slots; with `growable` (default) a `register` that finds every slot taken
 appends a chunk of the same size — its first slot claimed before publication,
 the chunk linked by a `.seq_cst` CAS on the last link, never unlinked before
@@ -278,8 +275,8 @@ scan <S P_T — the order the theorem derives for a missed slot, with the same
 contradiction. `slotIndex` is a stored index that continues across chunks;
 `NodePool` caches past their served range already fall back to the locked path.
 A scan that stops at the first chunk is the bug class this must exclude: the
-mutation run's scan-skip mutant crashes the growing-registry stress (16 threads
-into a one-slot domain) with a use-after-free in `dequeue`, 3 of 3.
+growing-registry stress (16 threads register into a one-slot domain while chunks
+are appended under the scan, `src/harness.zig:582`) targets it.
 
 **Nested pins.** `enterCriticalNested` (and `pin`) take an already pinned
 participant: they only count (`nested_pins`, owner-only), and only the
@@ -289,8 +286,8 @@ on an unpinned one, `unregister` while pinned) are checked panics in every mode.
 They read `Participant.pinned`, a plain owner-private bool written only by the
 owning thread in `enterCritical` and the outermost `exitCritical`; reading
 `local_epoch` instead (the atomic the previous unpin just stored, store-forwarded
-on the way to the `xchg`) cost a pin+unpin pair 25 % (`epoch_pin` 1.00 → 1.25×
-crossbeam, A/B against the previous commit, disassembly read). Hand-over of a slot
+on the way to the `xchg`) measurably slowed the pin+unpin pair (A/B, disassembly
+read). Hand-over of a slot
 between threads goes through the `in_use` release/acquire, so the plain bool needs
 no atomic. `unregister` also panics on a slot that is not `in_use` or is already
 orphaned (double unregister). `exitCritical` reads only `nested_pins`/`pinned`.
@@ -324,9 +321,8 @@ guard (Zig has no lifetimes to tie a `Shared` to one); dereferencing is safe
 while pinned, as for every pointer into a domain's structure. `unprotected()`
 has no counterpart for the same reason.
 
-**R4 (an unbounded queue without handles)** is `SegQueue` (§4d): the survey's
-option (b), taken because `Queue(T)` stayed above 1.1× crossbeam after the pool
-fix (§8). `Queue(T)` keeps its explicit participants.
+**The unbounded queue without handles** is `SegQueue` (§4d); `Queue(T)` keeps its
+explicit participants and stays above 1.1× crossbeam (§8).
 
 ## 4b. The bounded ring (`bounded.zig`)
 
@@ -348,7 +344,10 @@ ownership is already conditional on the acquire read of `seq` that preceded the
 CAS. No EBR is involved — slots are never freed, only reused through the `seq`
 handshake, so there is no reclamation to prove. `len` is the one `seq_cst`
 reader: it re-reads `tail` around the `head` load so that the pair is a
-consistent snapshot.
+consistent snapshot. The refusal count is four cache-line stripes picked by a
+hash of the thread's stack address (`refusedCount` sums them,
+`src/bounded.zig:95`, `src/bounded.zig:412`): one shared counter made producers
+spinning on a full ring fight over a single line.
 
 **Capacity.** A power of two (`pos mod capacity` is a mask, and positions wrap
 at the integer width without breaking the mapping) and at least 2: with one
@@ -356,7 +355,7 @@ slot, "free for the next lap" (`pos + capacity`) equals "holds the item"
 (`pos + 1`), and a second push would overwrite an unconsumed item. A compile
 error refuses both.
 
-**Run-time capacity (`ArrayQueue`, 2026-10-14).** Positions become stamps
+**Run-time capacity (`ArrayQueue`).** Positions become stamps
 `lap · one_lap + index`, with `one_lap` the smallest power of two that is at
 least `capacity` and at least 2. The slot is `pos & (one_lap − 1)`; the step
 after a lap's last slot jumps to the next lap's index 0 (`pos − index +
@@ -368,7 +367,7 @@ capacity`, where the step is always `pos + 1`: both share one implementation
 (`Ring`), and for `BoundedQueue` the generated code is the old one. `len`
 counts slots between the stamps (`laps · capacity + index`).
 
-**`forcePush` (2026-10-14, `.multi` only).** When the slot at `tail = pos`
+**`forcePush` (`.multi` only).** When the slot at `tail = pos`
 still holds the previous lap's published item `old = pos − one_lap` — which is
 then the oldest item, `head == old`, since the ring holds `capacity` items —
 the producer takes `old` exactly as a consumer would (CAS `head` `old → after
@@ -415,7 +414,7 @@ owner's lowered `bottom`). The cost is the cost of the fence it replaces: on
 x86-64 the `bottom` store in `pop` is an `xchg` (the paper's `mfence`), every
 other access a plain `mov`. `push` publishes `bottom` with release and the thief's
 `seq_cst` load of `bottom` acquires it — the message-passing shape §7.1 already
-certifies. Lowerings measured 2026-10-07 (`-femit-asm`, ReleaseFast): aarch64
+certifies. Lowerings (`-femit-asm`, ReleaseFast): aarch64
 `pop` = `stlr` bottom, `ldar` top, `casal`; `steal` = `ldar` top, `ldar` bottom,
 acquire load of the buffer pointer (`ldar`, `ldapr` on ARMv8.3+), `casal`;
 riscv64 seq_cst store `fence rw,w; sd`, load `fence rw,rw; ld; fence r,rw`, CAS
@@ -423,26 +422,25 @@ riscv64 seq_cst store `fence rw,w; sd`, load `fence rw,rw; ld; fence r,rw`, CAS
 sequence; on riscv it models the CAS as `amoswap.w.aqrl` (an RMW with the same
 aq+rl bits as the LR/SC pair).
 
-**Atomic slots, any `T` (wide since 2026-10-14).** A thief reads the slot at
+**Atomic slots, any `T`.** A thief reads the slot at
 `top` before its claiming CAS; when the CAS loses, the owner may be overwriting
 that slot on its next lap. crossbeam reads any `T` racily and discards it; in
 Zig that read is a data race on a plain `T`. A `T` that fits one
-`std.atomic.Value` is one monotonic atomic. Any other `T` (until 2026-10-14 a
-compile error) is stored as its bytes in an array of atomic words, each copied
+`std.atomic.Value` is one monotonic atomic. Any other `T` is stored as its bytes in an array of atomic words, each copied
 with a monotonic load/store — race-free, possibly torn. A torn read needs the
 owner to have rewritten the slot, which it does only after reading `top` past
 that position (`push` grows instead while `bottom − top` fills the buffer), so
 the thief's CAS from that position fails and the value is dropped; a successful
 claim proves every word was the position's. The owner never races itself.
 
-**FIFO flavour (`FifoDeque`, 2026-10-14).** crossbeam's `Worker::new_fifo`:
+**FIFO flavour (`FifoDeque`).** crossbeam's `Worker::new_fifo`:
 the owner pops the oldest item with the thieves' own claim — read `top`, read
 the slot, CAS `top → top + 1` — and never lowers `bottom`. Owner and thieves
 then meet only at that CAS, so there is no Dekker pair and no last-item special
 case; the owner's slot read needs no validation (only it writes slots). `len`
-can no longer see the negative transient.
+never sees the negative transient.
 
-**Batches (`stealBatch*`, 2026-10-14).** crossbeam's four `steal_batch*`: move
+**Batches (`stealBatch*`).** crossbeam's four `steal_batch*`: move
 about half of the victim's items (rounded up, at most a limit, default 32) into
 the caller's own deque, optionally returning the oldest instead of moving it.
 The caller first reserves room past its own `bottom` (growing its buffer, the
@@ -453,7 +451,7 @@ victim. FIFO victim: one CAS `top → top + n`. Sound because `bottom` never
 falls, so the `n` positions read below it stay unclaimed unless `top` moves,
 which fails the CAS, and their slots cannot be rewritten while `top` is still
 `t` (above). LIFO victim: `n` single `steal`s, stopping at the first that does
-not succeed — one CAS by `n` is unsound there (Backlog, 2026-10-07: the owner
+not succeed — one CAS by `n` is unsound there (the owner
 pops uncontested down into the batch), and a positive control drives exactly
 that shape (`DEQUE BATCH DRIVER TEETH`, caught as duplicates). Items land in
 the destination in stolen order: a FIFO destination pops them oldest first, a
@@ -466,7 +464,7 @@ else `.retry` if any attempt said retry). `worker()`/`stealer()` return
 `Worker`/`Stealer` views carrying only the owner's or a thief's operations — the
 type-level split crossbeam has; the deque itself still exposes both.
 
-**`Injector` (2026-10-14).** crossbeam's global entry queue: an unbounded MPMC
+**`Injector`.** crossbeam's global entry queue: an unbounded MPMC
 FIFO that any thread pushes to and any thread steals from, one item or a batch
 into its own deque. It is a `SegQueue` (§4d): handle-free and already FIFO, so
 `steal` never answers `.retry`. A batch is `n` pops written past the
@@ -502,7 +500,7 @@ detect, as with `.single` in §4b. crossbeam splits the handle into `Worker` and
 `Queue(T)` costs a node, an EBR pin (`xchg`) and two or three CASes per item, and
 every thread must register; crossbeam's `SegQueue` needs none of that, and
 `Queue(T)` measured 2.2–4.5× it (§8). `SegQueue(T, .{ .block_slots = 63 })` is a
-design of our own (2026-10-14; crossbeam's source not read). The protocol and its
+design of our own (crossbeam's source was not read). The protocol and its
 proof are in the file comment; the decisions are these.
 
 **Positions, not pointers, are compared.** `head` and `tail` are `u64` counters;
@@ -517,23 +515,21 @@ allocator) *before* its claim, so a push fails only with the queue unchanged.
 its own slot (a plain release store); the last slot's consumer retires the block
 onto a `pending` stack (CAS push, swap-all take), and every retire scans what it
 took: a block whose slots all read `read` is recycled (one spare kept, the rest
-freed), the others go back. The first version counted reads with a `fetchAdd`
-per pop on one per-block line; the four consumers contending for it doubled the
-4×4 time (measured with the counter alone, recycling disabled: 118–281 ms against
-~110 ms without it).
+freed), the others go back. A read counter
+(`fetchAdd` per pop on one per-block line) was measured and rejected: the four
+consumers contending for it doubled the 4×4 time.
 
 **Emptiness without touching the producers' line.** `pop` compares its position
 with `tail`; a lower bound of `tail` remembered on the `head` line
 (`tail_seen`) answers that for every pop below it, so consumers read `tail` only
-when they catch up. 1×1 went from 1.29× to 0.68× crossbeam with it.
+when they catch up. The 1×1 case went from slower than crossbeam to faster with it.
 
 **Waits and backoff, both measured.** Waiting on a thread that has claimed
 (installer, hand-off, item write) polls with one pause hint and yields only after
 4096 polls; `Backoff.pause`'s doubling overshot the ~300 ns hand-off by
 microseconds. A lost claim CAS spins `2^step` hints up to `2^10` (not
-`Backoff.spin`'s `2^6`): the 4×4 median went 155 → 94 ms, 8×8 230 → 131 ms,
-1×4 146 → 84 ms, the other shapes flat (i7-7920HQ, 15 runs each). The long
-spins only follow ten straight losses, i.e. only while other pops are winning.
+`Backoff.spin`'s `2^6`), a large win under 4×4/8×8 contention with the other
+shapes flat. The long spins only follow ten straight losses, i.e. only while other pops are winning.
 
 **Progress.** Lock-free except two waits on a thread that has already claimed
 and has a bounded, allocation-free rest of work: producers at the closed position
@@ -541,11 +537,16 @@ wait for the installer, a consumer waits for its own slot's item write. A thread
 pre-empted there stalls the others behind it until it runs — the corner
 `BoundedQueue` (Vyukov) has too.
 
-## 5. Verification strategy — the teeth
+## Verification
+
+Run: `scripts/modtest lockfree` (or `zig build test-lockfree`; offline, no leaks,
+no skips). Weak-memory evidence: `litmus/run.sh` (herd7, §7.1) and the codegen
+audit (§7). Performance: `zig build bench-lockfree` (§8). There is no fuzz
+driver: the stress driver below is the randomised check.
 
 Lock-free correctness is probabilistic under naive stress, so detection is
-engineered four independent ways, and each is proven to bite **before** the core
-exists (the harness runs against controls, not the gated core):
+engineered four independent ways, and each is proven to bite against controls,
+independent of the core under test:
 
 | Test | Mechanism | Nature |
 |---|---|---|
@@ -553,7 +554,7 @@ exists (the harness runs against controls, not the gated core):
 | CANARY TEETH | poison + `verifyQuiescent` catch a UAF write to a freed node | **deterministic** |
 | ORACLE IS CLEAN | driver returns `clean` over the correct spinlock queue | real threads, no-false-positive |
 | DRIVER TEETH | driver catches the racy `BrokenRing` | **probabilistic** (high) |
-| REAL CORE | driver over `MpmcQueue`+`Domain` (8×8×50 000), then pool canary | **probabilistic** — runs now (core implemented); green is corroboration, not proof (see below) |
+| REAL CORE | driver over `MpmcQueue`+`Domain` (8×8×50 000), then pool canary | **probabilistic** — green is corroboration, not proof (see below) |
 | BOUNDED MPMC / MPSC | driver over `BoundedQueue` with 64 slots (8×8 and 8×1 ×50 000; refused pushes retry, so the full path runs constantly) | **probabilistic** |
 | BOUNDED drop-on-full | 6 producers never wait, 1 in-place consumer: accepted = received, received + refused = sent, per-producer order | **probabilistic** |
 | stalled claim | a producer (consumer) claimed and not yet published (freed) — driven by hand | **deterministic** |
@@ -579,8 +580,8 @@ one), an unknown tag = **corrupted** (read of a poisoned reclaimed slot; the poo
 poison `0xA5A5…` decodes to `pid = 0xA5A5`, always out of range). This is the
 single check that catches all three lock-free failure classes at once.
 
-**Honest note on determinism.** Only the DRIVER TEETH and the REAL CORE stress
-are probabilistic — real threads, no controlled interleaving, run in ReleaseFast
+**Honest note on determinism.** The rows marked probabilistic (the driver teeth
+and every stress run) are real threads, no controlled interleaving, run in ReleaseFast
 where reordering is real. `BrokenRing` corrupts via a **bounded, masked** index
 (never a wild dereference), so it loses/duplicates data instead of segfaulting —
 that is what makes the teeth *reliable* rather than a crash lottery; and the test
@@ -592,153 +593,32 @@ independent of scheduling luck. `RefQueue` is a coarse-locked queue and thus
 trivially linearizable, so multiset-equality against it is a sound oracle for the
 lock-free queue.
 
-**What the stress can and cannot catch (sabotage self-check).** Owner-verify
-mutated the real core two ways and re-ran the ReleaseFast suite. A **gross**
-error — breaking the grace period (reclaim two-behind → zero-behind, freeing live
-nodes) — is caught **6/6 runs** (SIGSEGV at REAL CORE / canary trip), confirming
-the teeth bite the implemented core, not just the controls. A **subtle** ordering
-error — demoting the `enterCritical` pin store from `.seq_cst` to `.release`
-(exactly the Dekker-interlock break the theorem forbids) — is **not caught in 60
-runs** on x86_64-TSO, because on TSO the missed reordering window is vanishingly
-rare (§4a). This is the empirical proof of the module's central claim:
-**correctness of the ordering rests on the argument at `tryAdvance`, not on stress
-volume.** A green REAL CORE run is corroboration; the reasoning audit is the
-proof.
+**What the stress can and cannot catch.** A **gross** error — breaking the grace
+period (reclaim two-behind → zero-behind, freeing live nodes) — is caught by the
+real-core stress and the pool canary, so the teeth bite the implemented core, not
+just the controls. A **subtle** ordering error — demoting the `enterCritical` pin
+store from `.seq_cst` to `.release`, exactly the Dekker-interlock break the
+theorem forbids — is **not** caught by stress on x86-64 TSO, because there the
+missed reordering window is vanishingly rare (§4a). This is the empirical proof of
+the module's central claim: **correctness of the ordering rests on the argument at
+`tryAdvance` and on the litmus controls (§7.1), not on stress volume.** A green
+REAL CORE run is corroboration; the reasoning audit is the proof.
 
-**Sanitizers — investigated, not wired in.** Of the two, only
-`-fsanitize-thread` (TSan) exists for pure-Zig code in this toolchain
-(0.16); there is **no** `-fsanitize=address` flag for Zig source (`zig test
--fsanitize=address` fails with *"unrecognized parameter"* — only `-fsanitize-c`,
-for C UB, and `-fsanitize-thread` are accepted), so an ASan lane is not available
-at all. And TSan is unusable here for two reasons:
+Other evidence:
 
-1. It **links libc** (a TSan build's `ldd` shows `libc.so.6`), which violates
-   the module set's zero-C/zero-libc hard invariant (CONVENTIONS §2) for any
-   in-tree build lane.
-2. TSan **silently fails to report a blatant data race on this toolchain** —
-   re-confirmed during owner-verify: a TSan build of the suite runs the racy
-   `BrokenRing` DRIVER-TEETH test (non-atomic `head`/`tail` hammered by 12
-   threads) to completion with **zero** ThreadSanitizer diagnostics. So TSan here
-   cannot be relied on as the UAF/race oracle.
-
-Therefore no sanitizer lane is added. The in-tree substitute is the **poisoning
-node pool**: a broken reclamation that frees a still-referenced node makes a
-reader observe the `0xA5A5…` poison (→ `corrupted` in the multiset) and/or trips
-`verifyQuiescent`'s canary — a deterministic, libc-free UAF detector. A future
-Fable agent may still run the gated stress under an *out-of-tree* TSan build
-manually if a given toolchain's TSan proves functional; that is documented here,
-not baked into `build.zig`.
-
-**Mutation run 2026-10-05** (in-place, Debug, 30 mutants over EBR registration,
-orphaning and adoption, pin/unpin, `retire`, `tryAdvance`'s scan and grace period,
-the MS-queue help paths and value read, the pool's poison and canary, `SpinLock`,
-`Backoff` and the multiset checker): 28 killed. The first pass left 9; five tests
-and one checker case were added (a pin at the current epoch does not block an
-advance; reclamation after exactly two advances; `retire` draining a bag left from
-`num_epochs` ago; `dequeue` and `enqueue` over a lagging tail — the latter mutant
-hangs deterministically in `enqueue`, killed by the watchdog; a producer id one
-past the last). Equivalent: dropping `enqueue`'s own tail swing (every later
-operation helps a lagging tail; one extra retry, same history). Not killable here:
-demoting the pin store in `enterCritical` from `seq_cst` to `monotonic` — the
-Dekker store §7.0a calls not surrenderable; on x86-64 no value test can observe it,
-and it is what the `ebr-interlock-*-relaxed` herd7 controls (§7.1) exist to
-reject. No run was flaky.
-
-**Mutation run 2026-10-06** (schemata, ReleaseSafe, 16 mutants over the new
-code: `BoundedQueue`'s claim CASes, publish/free stores, full/empty branches,
-refusal count, `front`/`advance`, `len`'s re-check and `init`; the generic
-`dequeue`'s value read; `verify`'s FIFO check and its per-consumer reset): 15
-killed (7 by the 20 s watchdog — a lost publish or a missing full/empty branch
-hangs a producer or consumer). The first pass left `len`'s `tail` re-check
-alive: it only matters when both positions move between the two loads, so a
-concurrent test was added (one thread churns push/pop at length ≤ 1, another
-reads `len`) — killed 3/3. Equivalent: not updating `pos` after a lost claim
-CAS (the stale position meets a slot already claimed, `diff > 0`, and the loop
-re-reads `tail` — one extra iteration). Not mutated: the acquire/release pairs
-on `seq` — on x86-TSO no value test can observe their demotion; they are the
-§7.1 message-passing shape.
-
-**Mutation run 2026-10-07** (schemata, ReleaseSafe, 15 mutants over
-`deque.zig`: the full check and growth, the copy's start, keeping the replaced
-buffer, publishing before writing the slot, the one-item and empty branches of
-`pop`, restoring `bottom` in both, the last-item CAS (dropped and inverted),
-`steal`'s empty bound, a lost CAS taken as success, reading the slot after the
-claim, and `len`'s clamp and re-check): 15 killed. The first pass left `len`'s
-clamp alive; the concurrent `len` test written for it then failed on the
-UNMUTATED code — `len` read `top` and `bottom` as two loads and counted 2 in a
-deque never holding more than 1 — so the re-check landed with it (§4c) and was
-mutated too (killed 20/20 after the test drove a push + pop-the-last on every
-iteration; 17/20 before). Not mutated: the `seq_cst`/acquire/release orderings —
-on x86-TSO no value test observes their demotion; the deque litmus pair (§7.1,
-shape 3) is their evidence.
-
-**Mutation run 2026-10-14, `deque.zig`** (schemata, ReleaseSafe, 14 mutants
-over the new code: the FIFO owner's bound and CAS, the batch size, the FIFO
-batch CAS (by `n − 1`, dropped), the destination publish (dropped, short by
-one), `reserve` ignoring `n`, the wide slot's word copy, the injector batch's
-publish, `orElse`'s and `first`'s retry rule, the LIFO batch count and the
-returned oldest item): 14 killed. Stress added: a FIFO owner against six
-thieves from capacity 2, batch thieves (limits 1–9) against LIFO and FIFO
-owners, 20-byte items word by word (a torn item would decode as corrupt), and
-an injector feeding four workers that also steal from each other.
-
-**Mutation run 2026-10-14, `bounded.zig`** (schemata, ReleaseSafe, 16 mutants
-over `ArrayQueue`'s stamps and `forcePush`: the step past a lap's last slot
-(bound off by one, jump dropped), `one_lap` for capacity 1, `len`'s lap
-product and clamp, the capacity-0 refusal, the initial stamps, `pop`'s and
-`advance`'s free value and next position, the claim's next position, and in
-`forcePush` the published check, the `head` CAS, the `tail` CAS, the free value,
-the returned item and `old`'s distance): 15 killed (8 by the watchdog).
-Equivalent: `len`'s clamp to `capacity` — with the `tail` re-check the pair is a
-snapshot, and a producer claims a position only after its slot was freed, so
-`t − h ≤ capacity` already; kept as a defence. The "latest N" stress (6
-producers `forcePush`, 3 consumers pop, capacities 8 / 1 / 3) checks that every
-item comes out once, popped or handed back, in each producer's order.
-
-**Mutation run 2026-10-14, `segqueue.zig`** (schemata, ReleaseSafe, 28 mutants over
-`segqueue.zig`: the closed-position waits on both ends, taking the next block
-before the last claim, the install order (index before block, no `next`, index
-left closed), publishing before or without writing the item, `tail_seen` off by
-one either way, dropping the empty return, the hand-off's `head` block and index,
-the ready wait, storing `read` before the copy or never, the retire, the scan's
-`allRead` (skipped, or taking `written` as read), deferring, freeing the
-displaced spare, both block resets, the lost-claim recycle, `len`'s slot count
-and `deinit`'s pending walk): 27 killed (11 by the 20 s watchdog). The first pass
-left three alive. `init` without resetting its first block passed because a
-fresh page is zeroes, which happen to be an empty slot and a null link — killed
-by a test that runs `init` on memory filled with `0xFF`. `@min(pos % lap,
-closed)` in `len`'s slot count was equivalent (the offset never exceeds
-`closed`) and is gone; its replacement mutant is killed. Storing `read` before
-the copy survives as a timing survivor: the window is a few instructions, and a
-block is recycled only after a later hand-off's scan, so no stress hits it — the
-new positive control `read_before_copy` (the same defect with the copy delayed
-by 256 pause hints, its displaced spares parked instead of freed) is caught
-3/3. Not mutated: the orderings (x86-TSO; §7.1 shapes).
-
-## 6. Out of scope — next increments
-
-*(Removed from this list 2026-08-09: "non-blocking `unregister` via a global
-limbo". It is implemented — see `ebr.Domain.unregister` / `adoptOrphans`. The
-shape landed is orphan-slot adoption rather than a domain-global bag: the
-departing thread leaves its garbage in its own slot and publishes an `orphaned`
-flag, and the next `tryAdvance` by any participant CASes that flag to take
-exclusive ownership. Same effect, and it needs no new shared container and no
-new memory ordering.)*
-
-- **Lock-free hash map** (the F-LF vein's third structure) — a split-ordered or
-  open-addressing lock-free map over the same EBR domain. Deliberately **not**
-  scaffolded in Phase 1; it is the next module increment once the queue core
-  lands and DL4 needs keyed concurrent state.
-- **Hazard-pointer reclamation** — the alternative to EBR for a consumer needing
-  bounded per-node reclamation latency (see §2). Would slot in beside `ebr.zig`
-  behind the same `Retired` callback shape.
-*(Removed 2026-10-06: "Bounded ring MPMC" — implemented as `BoundedQueue`, §4b,
-with the drop-on-full push, in-place fill and single-consumer fast path that the web-server consumer's
-own copy (`src/bounded_ring.zig`, marked `zig-libs request: lockfree`) asked for.)*
-- **Linearizability history check** — the current oracle is multiset-equality
-  against a coarse-locked queue (sound for the "no lost/dup/corrupt" properties).
-  A full per-op timestamped history + sequential-witness search would additionally
-  verify FIFO ordering under concurrency; tractable but deferred.
+- **Mutation:** schemata runs over the EBR core, the MS queue, the pool and
+  checker, then over `deque.zig`, `bounded.zig` (`ArrayQueue`, `forcePush`) and
+  `segqueue.zig`. The card's `**Audit:**` line is the current score, cumulative
+  over the last whole-module mutation run and the delta runs after it. Not
+  mutated: the `seq_cst`/acquire/release orderings — on x86-TSO no value test can
+  observe their demotion; the §7.1 litmus pairs are their evidence. The pin store
+  in `enterCritical` demoted to `monotonic` is the one known unkillable mutant
+  (the Dekker store §7.0a calls not surrenderable).
+- **Panic sweep** (`src/sweep_test.zig`): each misuse is a checked panic with a
+  message, run in a forked child.
+- **Weak memory:** static codegen audit on aarch64 and riscv64 (§7), herd7 litmus
+  pairs (§7.1); QEMU-user runs are functional sanity only.
+- **Constant time:** not applicable (concurrent queues); no ctgrind rows.
 
 ## 7. Weak-memory codegen certification (aarch64 + riscv64)
 
@@ -842,22 +722,6 @@ All sites **CORRECT** on both arches, both opt levels. Grouped by role:
 | single-owner assert loads (`enter`/`exit`/`retire`/`unregister`) | `.monotonic` | debug assert, no cross-thread role | plain `ldr` | plain `ld` |
 | `deinit` chain-walk loads | `.monotonic` | teardown (quiescent) | plain `ldr` | plain `ld` |
 
-The four `unregister`/`adoptOrphans`/`orphan_count` rows were added by the
-non-blocking `unregister` hand-off (finding F4) and originally carried a `†`
-marking them **inferred, not re-measured**. That `†` is now **removed**: the
-codegen audit was re-run (2026-08-09, same `-femit-asm` method, same two targets,
-both opt levels) and every one of those four rows was read off real instructions.
-Two of them are now *more* precise than the inference was: on riscv64 the
-`orphaned` `bool` CAS lowers to a **word**-width `lr.w.aq`+`sc.w` (RVWMO has no
-byte LR/SC, so LLVM emits a masked word CAS — the same shape as `register`'s
-`in_use`), and the `orphan_count` RMWs lower to a bare `amoadd.d` with no
-`.aq`/`.rl` suffix rather than an `lr`/`sc` pair. Neither changes the verdict:
-all four are CORRECT at their site. The re-run also re-confirmed the two
-load-bearing observations above — `dmb` still appears **zero** times in the whole
-module on aarch64 at both opt levels, and the leading `fence rw,rw` is still
-present on every seq_cst load and absent from `Domain.epoch`'s `.acquire` load.
-No site's ordering has ever been changed, so §7.1's litmus verdicts stand.
-
 Note on the seq_cst queue-pointer ops: they are stronger than the queue's own
 linearizability needs (acquire/release would linearize the queue alone), but that
 strength is **required, not gratuitous** — it is the EBR grace-period proof (§4a,
@@ -871,7 +735,7 @@ their site — none carries a cross-thread happens-before obligation.
 
 The standing perf question against this discipline is: *how much throughput does
 `seq_cst`-everywhere cost, and how much of it could a selective demotion to
-acquire/release recover?* It was answered on 2026-08-09 by measurement rather
+acquire/release recover?* It was answered by measurement rather
 than by reasoning, and the answer is **nothing on x86-64 and nothing on the
 aarch64 baseline**.
 
@@ -895,7 +759,7 @@ normalized).
 | `aarch64-linux` `-mcpu=generic+rcpc` (ARMv8.3) | differs: 16 loads become `ldapr` instead of `ldar` |
 | `riscv64-linux`, ReleaseFast | differs: the leading `fence rw,rw` disappears from every demoted load — `dequeue` 10→2, `enqueue` 4→1, `tryAdvance` 3→1, `retire` 1→0 |
 
-Two of those rows correct the intuition this SPEC previously stated:
+Two of those rows matter:
 
 1. **On x86-64 a `seq_cst` *load* and a `seq_cst` *CAS* cost exactly nothing.**
    The loads are plain `mov`; every CAS is `lock cmpxchg` at any ordering ≥
@@ -909,7 +773,7 @@ Two of those rows correct the intuition this SPEC previously stated:
    x86-64 price of the discipline, it is already at the x86 optimum (`xchg` is
    cheaper than the `mov`+`mfence` form of the classic fence recipe, which Zig
    0.16 cannot express anyway — `@fence` is gone), and buying it back is exactly
-   the use-after-free §5's sabotage self-check could not detect in 60 runs.
+   the use-after-free the stress cannot detect on TSO (see *Verification*).
 2. **On the aarch64 baseline an `.acquire` load is also `ldar`.** Without
    `+rcpc` LLVM has no cheaper acquire load to emit, so demoting a `seq_cst`
    load to `.acquire` changes no instruction there either. A real gap opens only
@@ -917,20 +781,10 @@ Two of those rows correct the intuition this SPEC previously stated:
    cost this discipline pays off-x86 is **riscv64-and-ARMv8.3+ specific**, not
    "every weakly-ordered target".
 
-**End-to-end timing, same binary, same inputs.** Both module copies were linked
-into one ReleaseFast binary and run against the same 4-producer × 4-consumer ×
-20 000-items-per-producer workload, 7 rounds with the variant order alternated to
-cancel drift:
-
-| Variant | min | mean |
-|---|---|---|
-| current (`seq_cst`) | 29.31 ms | 30.48 ms |
-| maximally relaxed | 29.58 ms | 31.03 ms |
-
-Ratio relaxed/current: **1.009× at min, 1.018× at mean** — i.e. the "relaxed"
-build measured *marginally slower*, which is the expected reading given the two
-builds are the same machine code. The spread is thread-scheduling noise, and
-that is the point: **on x86-64 there is no win to recover, not a small one.**
+**End-to-end timing.** Both variants linked into one ReleaseFast binary and run on
+the same 4×4 workload showed no difference beyond scheduling noise (the relaxed
+build measured marginally slower, the same machine code): on x86-64 there is no
+win to recover, not a small one.
 
 **Conclusion.** The perf-portability reservation is real only on riscv64 and
 ARMv8.3+. Recovering it means demoting atomics the grace-period theorem (§4a)
@@ -964,12 +818,11 @@ is corroborating sanity only.
 - **Certified now:** the compiler emits architecturally-correct barriers for every
   atomic site on aarch64 and riscv64 (static codegen), and the core is
   functionally correct under both non-x86 ISAs (QEMU-user).
-- **Not yet done (next tier):** (a) dynamic weak-memory stress on *real* ARM/
-  RISC-V hardware (or a reordering-faithful simulator), which is the only way to
-  observe a reordering bug rather than infer its absence from the codegen; (b) a
-  formal litmus/herd7 model-check of the pin/scan interlock and the grace-period
-  argument against the C11/ARMv8/RVWMO axiomatic models — **now DONE, see §7.1.**
-  Item (a) remains open; this section does not claim to replace it.
+- **Not certified here:** dynamic weak-memory stress on *real* ARM/RISC-V hardware
+  (or a reordering-faithful simulator), the only way to observe a reordering bug
+  rather than infer its absence from the codegen (→ *Backlog / deferred*). The
+  formal litmus model-check of the pin/scan interlock against the C11/ARMv8/RVWMO
+  models is §7.1.
 
 ## 7.1 Formal litmus certification (herd7)
 
@@ -979,16 +832,14 @@ static audit above proves the compiler *emits* the right barriers; this
 subsection proves — against the AArch64 and RISC-V axiomatic memory models —
 that those barriers actually *forbid* the use-after-free / stale-read, and that
 weakening them lets the bug back in. Files live in `litmus/` (`run.sh` +
-`README.md` + the eight `.litmus` sources).
+`README.md` + the twelve `.litmus` sources).
 
 ### Toolchain / models
 
 - `herd7` **7.58** (herdtools7). `run.sh` takes it from `HERD7` (default: `herd7`
   on PATH, after `opam env` when opam exists) and the model directory from
-  `HERD_LIBDIR` (`-set-libdir`). The 2026-10-07 run used Ubuntu's `herdtools7`
-  7.58 binary — its package ships no `.cat` files — with the models from the
-  upstream `7.58` tag's `herd/libdir`; the eight earlier results reproduced
-  unchanged.
+  `HERD_LIBDIR` (`-set-libdir`). A distribution's `herdtools7` 7.58 binary ships no
+  `.cat` files, so point `HERD_LIBDIR` at the upstream `7.58` tag's `herd/libdir`.
 - Models: the herd7-shipped **`aarch64.cat`** and **`riscv.cat`** (RVWMO),
   selected by name (`-model aarch64.cat` / `-model riscv.cat`).
 
@@ -1013,7 +864,7 @@ P0 = reader (pin store then shared-pointer load), P1 = reclaimer (advance/unlink
 store then epoch-scan load). Bug = the SB non-SC outcome `0:X2=0 /\ 1:X2=0`
 (reclaimer misses the pin **and** reader misses the unlink → frees a live node).
 
-**Shape 3 — Chase-Lev pop/steal interlock (2026-10-07)**, store-buffering with
+**Shape 3 — Chase-Lev pop/steal interlock**, store-buffering with
 an RMW on one side: P0 = owner `pop` (seq_cst store of the lowered `bottom`, then
 seq_cst load of `top`), P1 = a thief whose claiming CAS on `top` just succeeded,
 then its seq_cst load of `bottom`. Bug = both read the other's old value
@@ -1059,85 +910,88 @@ reduction to the third (with shape 2 for `push`) is the argument in `deque.zig`'
 file comment — neither is a machine-checked model of the entire algorithm.
 What remains beyond this layer is dynamic weak-memory stress on *real* ARM/RISC-V
 hardware (§7 item (a)); with the static codegen cert (§7) and this formal cert
-(§7.1) both green, that hardware run is now belt-and-suspenders corroboration
+(§7.1) both green, that hardware run would be belt-and-suspenders corroboration
 rather than the only line of evidence.
 
-## 8. Performance against crossbeam (2026-10-14)
+## 8. Performance against crossbeam
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-lockfree`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 85.7 %): ref 0.50–1.05×, against 0.51–1.06× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
+`zig build bench-lockfree` (`tools/bench.zig` against `tools/rust_bench`:
+crossbeam-queue 0.3.14, crossbeam-deque 0.8.8, crossbeam-epoch 0.9.21, LTO; the
+crates were read in full before the first build). Same workloads on both sides,
+checksums compared; ratio = ours/crossbeam by wall time. The card's
+`**Performance:**` line carries the figures; every verdict row is at or under 1.1×
+(the 4×4 rows are noisy: spreads of 15–60 % on both sides of a run).
 
-`zig build bench-lockfree` (`tools/bench.zig` against `tools/rust_bench`: crossbeam-queue
-0.3.14, crossbeam-deque 0.8.8, crossbeam-epoch 0.9.21, LTO; the crates were read in full
-before the first build). Same workloads on both sides, checksums compared; ratio =
-ours/crossbeam by wall time, 8-core x86-64, best of 3 × 5.
+| Row | Workload |
+|---|---|
+| bounded_1x1 / 4x1 / 4x4 | ring of 1024, 4 Mi items (`ArrayQueue`) |
+| unbounded_1x1 / 4x4 | `Queue(u64)` (MS + EBR) vs `SegQueue`, 4 Mi items |
+| segqueue_1x1 / 4x4 / 8x8 | `SegQueue(u64, .{})` vs `SegQueue`, 4 Mi items |
+| deque_owner / deque_steal | 1 Mi push + pop; owner vs 3 thieves |
+| epoch_pin | 1 Mi pin + unpin |
 
-| Row | Workload | Ratio |
-|---|---|---|
-| bounded_1x1 / 4x1 / 4x4 | ring of 1024, 4 Mi items (`ArrayQueue`) | 0.68–0.85 / 0.58–0.76 / 0.82–1.06 (2026-10-14, striped refusal count; was 0.92–1.96) |
-| unbounded_1x1 / 4x4 | `Queue(u64)` (MS + EBR) vs `SegQueue`, 4 Mi items | 2.2 / 4.0 |
-| segqueue_1x1 / 4x4 / 8x8 | `SegQueue(u64, .{})` vs `SegQueue`, 4 Mi items | **0.52 / 0.73 / 0.78** (2026-10-14, after §4d) |
-| deque_owner / deque_steal | 1 Mi push + pop; owner vs 3 thieves | 1.02–1.06 / 0.55–0.61 (owner was 1.15 until `grow` went out of line) |
-| epoch_pin | 1 Mi pin + unpin | median 1.03 of 10 runs; about 1 run in 5 comes out 1.12–1.20 (see below) |
+The `unbounded_*` rows (`Queue(T)`) are printed but left out of the verdict:
+`Queue(T)` has no crossbeam counterpart (`segqueue_*` is the like-for-like
+unbounded row) and, with workerpool on `SegQueue`, no consumer. `Queue(T)` stays as
+EBR's proving consumer and for a user that already holds a domain; what is left in
+it is its shape — per item a node, a pin (`xchg`, ~9 ns) on each side and two or
+three CASes, where `SegQueue` claims a slot in a block and pins nothing.
 
-**2026-10-14, after the S2 work** (host not quiet — a browser at ~40 % CPU;
-every number above is from runs on it, each the bench's best of 5 rounds,
-checked by repeating the run). Two findings. `bounded_4x4` was bimodal,
-0.92–1.96 between runs: four producers spinning on a full ring each did a
-`lock xadd` on ONE refusal counter, and that line, not the ring, was the
-fight (without the counter 0.98–1.12; crossbeam has none). The counter is now
-four cache-line stripes picked by a hash of the thread's stack address
-(`refusedCount` sums them): 0.82–1.06. `epoch_pin` is bimodal on its own: 10
-runs of the commit before the S2 EBR work gave 8 at 0.91–1.07 and 2 at
-1.12–1.13, 10 runs of the current code 8 at 0.94–1.06 and 2 at 1.15–1.20, with
-low spread inside each run — a property of the process, not of the code; a
-heap-allocated domain in the bench did not change it. The S2 work did cost
-one real regression on the way, found here: a nesting check in
-`enterCritical` (1.25×, §4a.1), now out of the plain pin.
+Design choices the bench drove: per-participant node caches in `NodePool` (no
+global lock), a `tryAdvance` scan every `advance_period` dequeues instead of after
+every one, MS `head`/`tail` and the queue's read-only fields on separate cache
+lines, backoff on a lost CAS in `BoundedQueue`, the striped refusal count (§4b),
+and `grow` out of line in the deque's owner path. `epoch_pin` is bimodal on its
+own between runs (about 1 run in 5 comes out slower, with low spread inside each
+run): a property of the process, not of the code; a heap-allocated domain in the
+bench did not change it.
 
-Since 2026-10-14 the `unbounded_*` rows (`Queue(T)`) are printed but left out of the
-verdict: `Queue(T)` has no crossbeam counterpart (`segqueue_*` is the like-for-like
-unbounded row) and, with workerpool on `SegQueue`, no consumer. Every verdict row is at
-or under 1.1× (4x4 rows noisy: spreads of 15–60 % on both sides of a run). Found and fixed on the way: a global spinlock per node in `NodePool`
-(per-participant caches), a `tryAdvance` scan after every dequeue (`advance_period`), MS
-`head`/`tail` and the queue's read-only fields on one cache line, and a lost CAS in
-`BoundedQueue` retried without backoff. What is left in `Queue(T)` is its shape — per item
-a node, a pin (`xchg`, ~9 ns) on each side and two or three CASes, where `SegQueue` claims
-a slot in a block and pins nothing; that is what `SegQueue(T)` (§4d) does, and it is
-crossbeam's `SegQueue`'s counterpart. `Queue(T)` stays as EBR's proving consumer and for a
-user that already holds a domain; workerpool, its only consumer, moved to `SegQueue`
-(2026-10-14).
+## What is deliberately not done
+
+- **Acquire/release tuning of the `seq_cst` discipline.** Measured (§7.0a): on
+  x86-64 and the aarch64 baseline it changes no instruction and no timing; it
+  would pay only on riscv64 and ARMv8.3+, and demoting atomics the grace-period
+  theorem puts in the total order S re-admits the bug outcome under both formal
+  models (§7.1 `-relaxed` controls). Reopen only if a weak-memory target is
+  deployed and the reduction is redone with explicit release-sequence reasoning.
+- **A sanitizer lane.** Of the two sanitizers only `-fsanitize-thread` (TSan)
+  exists for pure-Zig code on this toolchain (measured on 0.16, not re-checked on
+  0.17); there is no `-fsanitize=address` flag for Zig source. TSan is unusable
+  here for two reasons: it links libc, which violates the module set's
+  zero-libc invariant (CONVENTIONS §2) for any in-tree lane, and it silently
+  failed to report a blatant data race (a TSan build ran the racy `BrokenRing`
+  DRIVER-TEETH test with zero diagnostics). The in-tree substitute is the
+  poisoning node pool: a broken reclamation that frees a still-referenced node
+  makes a reader observe the `0xA5A5…` poison (`corrupted` in the multiset)
+  and/or trips `verifyQuiescent`'s canary — a deterministic, libc-free UAF
+  detector. An out-of-tree TSan run of the gated stress is not baked into
+  `build.zig`.
+- **One CAS `top → top + k` batch steal on the LIFO deque** — unsound (§4c).
+- **`unprotected()` and guard-tied `Shared` pointers** — Zig has no lifetimes to
+  tie them to (§4a.1).
+- **Detecting a double `release` of an inner guard** — no per-guard state (§4a.1).
 
 ## Backlog / deferred
 
-Items from §6 stay there; the survey adds what a crossbeam user hits first.
-
-- ~~(2026-10-14) P: segmented unbounded queue~~ — ✅ 2026-10-14, `SegQueue(T)` (§4d),
-  0.52–0.78× crossbeam's `SegQueue`.
-- (2026-10-14) `SegQueue`: ~~a schemata mutation run over `segqueue.zig`~~ (✅ 2026-10-14,
-  §5: 27/28) and a litmus pair for the retire/scan shape (the consumer's `read` store
-  → the scanner's acquire load is message passing, already shape 2; the pending stack is
-  a Treiber push + swap-all). Effort: small-medium; fits §2.
-- ~~(2026-10-14) `workerpool` on `SegQueue`~~ — ✅ 2026-10-14 (workerpool CHANGELOG):
-  jobs by value, no EBR, no submit lock; bench-workerpool 0.64–1.01× → 0.19–0.83× thpool.
-- (2026-10-14) `BoundedQueue`/`Queue(T)` lost-CAS backoff: `SegQueue` measured `2^10` against
-  `Backoff.spin`'s `2^6` as a large win under 4×4/8×8 contention (§4d); the other CAS loops
-  were not re-measured. Effort: small; fits §2.
-- ~~(2026-10-14) S2 items R1–R14~~ — ✅ 2026-10-14 (§4a.1, §4b, §4c, §4d). Was: with the owner's
-  answers: runtime-capacity ring, `force_push`, `capacity`/push-returns-item/drain,
-  handle-free unbounded queue ergonomics, FIFO deque, `stealBatch*`, `Injector`, `Steal`
-  helpers, `Worker`/`Stealer` views, wide `T` (word-wise atomic slot copy), `repin`/
-  `flush`/`isPinned`, nested pins, unbounded participant registration + a thread-local
-  default handle, tagged atomic pointers.
-
-- ~~(survey 2026-09-30) Generic payload~~ — ✅ 2026-10-06, `Queue(T)`.
-- ~~(survey 2026-09-30) Bounded ring (`ArrayQueue` equivalent)~~ — ✅ 2026-10-06, `BoundedQueue` (§4b).
-- ~~(2026-10-06) Runtime capacity for the bounded ring~~ — ✅ 2026-10-14, `ArrayQueue` (§4b). Was: crossbeam's `ArrayQueue::new(cap)` takes any capacity at run time; ours is a comptime power of two stored inline. A config-sized ring needs a heap-backed variant (slots slice + `init(allocator, cap)`). Effort: small; fits §2.
-- ~~(2026-10-06) `force_push`~~ — ✅ 2026-10-14, `forcePush` (§4b). Was: (overwrite the oldest when full — crossbeam has it, for "latest N" buffers). With several consumers it needs the producer to claim a consumer position too. Effort: medium; fits §2.
-- ~~(survey 2026-09-30) Work-stealing deque~~ — ✅ 2026-10-07, `Deque(T)` (§4c). ⏭ consumer: `workerpool` still shares one MPMC queue; per-worker deques + stealing is its own change there.
-- ~~(2026-10-07) `Deque`: `stealBatch`~~ — ✅ 2026-10-14 (§4c). Was: (crossbeam's `steal_batch`/`steal_batch_and_pop`: move up to half of a victim's items in one go — fewer steals under imbalance). ⛔ NOT one CAS `top → top + k` on the LIFO deque: the §4c proof covers a claim of ONE position, where an owner reaching it must CAS too (`t == b`). With k, the owner can pop several times uncontested (each reads `top = t < b`) down into `[t, t+k)` before the thief's CAS lands — 4 items, thief takes `t, t+1`, owner pops `t+3, t+2, t+1`: `t+1` taken twice. On the LIFO flavour a batch is k single claims (one CAS each); one CAS by k is sound only for a FIFO flavour, whose owner also claims through `top`. No consumer asks for it today (workerpool's submitters are external threads, no fork-join). Effort: small (k single steals) / medium (FIFO batch); fits §2.
-- ~~(2026-10-07) `Deque`: FIFO worker flavour~~ — ✅ 2026-10-14, `FifoDeque` (§4c). Was: (crossbeam's `Worker::new_fifo`: the owner pops from the top too). Effort: small; fits §2.
-- ~~(2026-10-07) `Deque`: items wider than a word~~ — ✅ 2026-10-14, word-wise atomic slots (§4c). Was: (crossbeam takes any `T` and reads it racily). Needs either a seqlock-style slot or accepting the race; effort: medium; fits §2 only if a consumer needs it.
-- (survey 2026-09-30) Acquire/release tuning of the `seq_cst` discipline where the SPEC's argument allows it (throughput; correctness is unchanged). Effort: medium and needs the litmus/codegen certification redone; fits §2.
+- **Lock-free hash map** (the third structure of the family) — a split-ordered or
+  open-addressing map over the same EBR domain. Deliberately not scaffolded; the
+  next increment once a consumer needs keyed concurrent state.
+- **Hazard-pointer reclamation** — the alternative to EBR for a consumer needing
+  bounded per-node reclamation latency (§2); would slot in beside `ebr.zig` behind
+  the same `Retired` callback shape.
+- **Linearizability history check** — the oracle is multiset equality against a
+  coarse-locked queue (sound for no lost/duplicated/corrupted items); a per-op
+  timestamped history with a sequential-witness search would additionally verify
+  ordering under concurrency. Tractable, deferred.
+- **A litmus pair for `SegQueue`'s retire/scan shape** — the consumer's `read`
+  store → the scanner's acquire load is message passing, already shape 2; the
+  pending stack is a Treiber push plus swap-all. Effort: small-medium.
+- **Lost-CAS backoff in `BoundedQueue` / `Queue(T)`** — `SegQueue` measured `2^10`
+  against `Backoff.spin`'s `2^6` as a large win under 4×4/8×8 contention (§4d); the
+  other CAS loops were not re-measured. Effort: small.
+- **Dynamic weak-memory stress on real ARM/RISC-V hardware** (§7).
+- **Per-worker deques with stealing in `workerpool`** — the pool still shares one
+  queue; this is its own change there.
 
 ## Anchoring
 

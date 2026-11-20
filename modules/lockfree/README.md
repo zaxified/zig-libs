@@ -11,17 +11,16 @@ is the in-process worker pool (P2 DL4), which needs a multi-producer /
 multi-consumer work queue whose retired nodes are freed safely — the
 use-after-free/ABA-notorious kernel of any lock-free data structure.
 
-> **Core implemented.** The mechanical layer + the verification harness were
-> complete and green from Phase 1; the irreducible concurrency-correctness
-> **core** — EBR's `enterCritical`/`exitCritical`/`retire`/`tryAdvance` and the
-> queue's `enqueue`/`dequeue` CAS loops — is now implemented behind
-> `gate.fable_core_implemented` (`true`), each function carrying its
-> memory-ordering argument in place (the grace-period safety theorem lives at
-> `ebr.Domain.tryAdvance`). The whole kernel uses a **`seq_cst` discipline**:
-> Zig 0.16 removed `@fence`, so every reclamation-relevant atomic access (pin
-> store, epoch loads/CAS, the scan loads, and the queue head/tail/next
-> loads/CAS) is `.seq_cst`, placing them in one total order that forbids the
-> store-buffering interleaving a UAF would need. See `SPEC.md`.
+**Memory ordering.** The irreducible concurrency-correctness core — EBR's
+`enterCritical`/`exitCritical`/`retire`/`tryAdvance` and the queue's
+`enqueue`/`dequeue` CAS loops — sits behind `gate.fable_core_implemented`
+(`true`, `src/gate.zig:32`), each function carrying its memory-ordering argument
+in place (the grace-period safety theorem lives at `ebr.Domain.tryAdvance`). The
+whole kernel uses a **`seq_cst` discipline**: Zig 0.16 removed `@fence`, so every
+reclamation-relevant atomic access (pin store, epoch loads/CAS, the scan loads,
+and the queue head/tail/next loads/CAS) is `.seq_cst`, placing them in one total
+order that forbids the store-buffering interleaving a UAF would need. See
+`SPEC.md`.
 
 ```zig
 const lockfree = @import("lockfree");
@@ -72,9 +71,12 @@ switch (other.steal()) {                // any thread: oldest first
 ```
 
 - `Domain` / `Participant` / `Guard` / `Retired` / `Config` — the **EBR**
-  reclamation domain: a global epoch + a fixed registry of per-thread
-  participants (each with a pinned local epoch and three epoch-indexed limbo
-  bags). `register`/`unregister` are mechanical slot bookkeeping;
+  reclamation domain: a global epoch + a registry of per-thread
+  participants (it grows in chunks past `Config.max_participants` unless
+  `.growable = false`; each with a pinned local epoch and three epoch-indexed limbo
+  bags). `register`/`unregister` are mechanical slot bookkeeping (`unregister` never
+  waits: garbage it cannot drain in a bounded number of advances is orphaned and
+  adopted by a later `tryAdvance`);
   `enterCritical`/`exitCritical`/`retire`/`tryAdvance` are the Fable core (the
   safe-reclaim predicate). `retire` is **infallible**: `Config.bag_reserve` limbo
   entries per bag are pre-allocated at `init` (the one place an allocator failure
@@ -164,33 +166,31 @@ source consulted or copied; no NOTICE entry
 required (see CONVENTIONS §5). Test data: the thirteen files under `litmus/` are
 written by this repo — `.litmus` programs in herd7's input syntax, which is a
 published notation, plus a `run.sh` that drives an installed `herd7` as a
-black-box oracle (root NOTICE §0). No herdtools7 source or shipped test is
+black-box oracle. No herdtools7 source or shipped test is
 reproduced; the axiomatic models the tests run against belong to herd7's own
 installation and are not vendored here.
 
 ## Verification
 
-`zig build test-lockfree` — offline, green in Debug **and** ReleaseFast, no
-leaks, no skips: with the core implemented, the gated "REAL CORE"
-stress test (8 producers × 8 consumers × 50 000 ops, then the pool canary) now
-runs for real. The harness proves it bites before *and* after the core exists:
+`scripts/modtest lockfree` (or `zig build test-lockfree`) — offline, no leaks, no
+skips. The harness proves it bites against controls:
 
 - **CHECKER TEETH (deterministic):** the multiset verifier rejects hand-built
   lost / duplicated / corrupted histories.
 - **CANARY TEETH (deterministic):** a use-after-free write to a freed pool node
   trips `verifyQuiescent` and the next `acquire` (`pool.zig`). This is the
   load-bearing UAF detector: a sabotage that breaks the grace period (reclaim
-  two-behind → zero-behind) is caught deterministically (verified: SIGSEGV /
-  canary trip, 6/6 runs).
+  two-behind → zero-behind) is caught by the real-core stress and the canary.
 - **ORACLE IS CLEAN:** the driver returns `clean` over the correct spinlock
   queue under real thread contention — no false positives.
 - **DRIVER TEETH (high probability):** the driver catches the racy `BrokenRing`
   under N×M threads in ReleaseFast.
-- **REAL CORE (probabilistic):** the driver over the real `MpmcQueue`+`Domain`,
-  then the pool canary. A green run is *corroboration, not proof* — a stress run
-  on x86-TSO cannot distinguish a `seq_cst` pin store from a `.release` one
-  (verified: that demotion passes 60/60 runs here). Correctness therefore rests
-  on the memory-ordering argument in `ebr.zig`, not on seed volume.
+- **REAL CORE (probabilistic):** the driver over the real `MpmcQueue`+`Domain`
+  (8 producers × 8 consumers × 50 000 ops), then the pool canary. A green run is
+  *corroboration, not proof* — a stress run on x86-TSO cannot distinguish a
+  `seq_cst` pin store from a `.release` one. Correctness therefore rests on the
+  memory-ordering argument in `ebr.zig` and the herd7 litmus pairs
+  (`litmus/run.sh`), not on seed volume.
 - **BOUNDED (probabilistic + deterministic):** the same driver over a 64-slot
   `BoundedQueue` (8×8 and 8×1 × 50 000, the full path hit constantly), a
   drop-on-full run with an in-place consumer, a concurrent `len` check, and the
@@ -205,9 +205,15 @@ runs for real. The harness proves it bites before *and* after the core exists:
   50 000 growing from 2 slots while thieves steal), the owner's every pop
   checked against a shadow stack (LIFO) and each thief's steals for FIFO, then
   the multiset; a positive control whose `pop` skips the last-item CAS (caught
-  as `duplicated` in the first round, 5/5); the stalled-thief, retired-buffer and
-  failed-growth corners by hand; herd7 litmus pairs for the pop/steal interlock.
+  as `duplicated`); the stalled-thief, retired-buffer and failed-growth corners
+  by hand; herd7 litmus pairs for the pop/steal interlock.
 
 See `SPEC.md` for the EBR-vs-hazard decision, the Fable-core boundary, the
 honest deterministic-vs-probabilistic breakdown of each test, why sanitizers
-are not wired in, and the out-of-scope next increments.
+are not wired in, and what is deliberately not done.
+
+## Not provided
+
+No lock-free map and no hazard-pointer reclamation (EBR only); no sanitizer lane;
+no acquire/release demotion of the `seq_cst` discipline. See `SPEC.md` *What is
+deliberately not done* and *Backlog / deferred*.
