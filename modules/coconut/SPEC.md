@@ -216,9 +216,21 @@ Run: `scripts/modtest coconut` (heavy: pairing arithmetic; ReleaseSafe is the us
   `params.zig`: 143 killed, 2 equivalent; the four heap wipes (`SecretKey`/`SecretKeyShare.deinit`, the keygen polynomials,
   the prover's `m~`) are killed only by the ReleaseFast dead-stack probe (`stackprobe_test.zig`) and were run in a
   ReleaseFast build. Stack burns (`burn.run`) are the probe's and are not mutated. Equivalent: the `G2` subgroup check on
-  `κ` in `verifyCredential` (`inG2`, two mutants): the pairing alone already rejects a `κ` with an order-13 cofactor
-  component even when the Sigma protocol accepts it (premise asserted in the "kappa outside G2" test), so only a `GT`
-  collision could get one through. The transcript is pinned byte for byte (`showChallenge` over fixed inputs) because
+  `κ` in `verifyCredential` (`inG2`, two mutants), equivalent for unforgeability, kept for non-malleability. General
+  argument, for any `κ = κ₀ + T` with `κ₀ ∈ G2` and `T ≠ 0` in the cofactor part of `E'(Fp2)` (`ShowProof.fromBytes`
+  already refuses such a `κ` on the wire; this is the in-memory path): (1) the Sigma check recomputes
+  `Aw' = Aw − [c]T`, so a prover passes it only by committing to `Aw − [t]T` and hitting `c ≡ t (mod ord T)`, about
+  `ord T` hash tries (13 for an order-13 `T`; up to about 2^59 over the smooth part `13²·23²·2713·11953·262069` of
+  `h2`; infeasible once `T` has a component of its large prime factor), and what the Sigma proof then binds is `κ₀` (the opening of `κ − T − A`), not `κ`; (2) the pairing
+  `e(σ₁', κ₀ + T) == e(σ₂'·ν, g2)` then holds only if the pairing ignores `T` at this point
+  (`e(σ₁', κ₀ + T) = e(σ₁', κ₀)`), in which case `κ₀` itself satisfies the equation — the attacker already has a
+  valid show for those attributes and gains a second encoding of it, not a forged attribute — or by a `GT` coincidence
+  among the attacker's at most `h2` choices of `T`, probability about `h2/r` per target (`h2` ≈ 2^507 points, but the Sigma step above limits the usable ones to the
+  smooth part, ≈ 2^59, against `r` ≈ 2^255), negligible. So without the
+  check a show stays unforgeable but may become malleable (two byte strings for one show), which matters to a caller
+  that uses the proof bytes as an identifier; the optimal ate pairing is not bilinear outside `G2`, so whether it
+  ignores a given `T` is not settled in general (it does not for the order-13 point of the "kappa outside G2" test,
+  which the pairing alone rejects). The check stays. The transcript is pinned byte for byte (`showChallenge` over fixed inputs) because
   prover and verifier share the function and no round trip sees a dropped item; the attribute-generator and common-base
   derivations are pinned the same way (no external vector covers them).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
