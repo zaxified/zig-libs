@@ -203,6 +203,23 @@ pub const linkInfo = bpflink.linkInfo;
 /// Feature probe: does this kernel implement perf-event links (>= 5.15)?
 pub const perfLinkSupport = bpflink.perfLinkSupport;
 
+pub const bpfsys = @import("bpfsys.zig");
+/// `BPF_OBJ_PIN` / `BPF_OBJ_GET` / unlink: pin a map, program or link into bpffs.
+pub const objPin = bpfsys.objPin;
+pub const objGet = bpfsys.objGet;
+pub const objUnpin = bpfsys.objUnpin;
+/// `BPF_BTF_GET_NEXT_ID` / `_GET_FD_BY_ID`, and reading a BTF object back.
+pub const btfNextId = bpfsys.btfNextId;
+pub const btfFdById = bpfsys.btfFdById;
+pub const loadBtfById = bpfsys.loadBtfById;
+pub const progBtfId = bpfsys.progBtfId;
+pub const mapBtfId = bpfsys.mapBtfId;
+/// `BPF_PROG_QUERY`: what is attached to a cgroup / netns / interface.
+pub const progQuery = bpfsys.progQuery;
+pub const ProgQueryResult = bpfsys.QueryResult;
+pub const ProgQueryOptions = bpfsys.QueryOptions;
+pub const BpfSysError = bpfsys.Error;
+
 pub const btf = @import("btf.zig");
 /// A parsed BTF blob (kernel or program-side) — see `btf.zig`.
 pub const Btf = btf.Btf;

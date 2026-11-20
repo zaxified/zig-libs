@@ -696,6 +696,28 @@ after linking is `error.ProgramTooLarge`. A call inside one function's own range
 Not verified against a live kernel here (no `CAP_BPF` on the development machine): the golden checks are structural
 (every call lands on a `func_info` start, every relocation on an `LD_IMM64`).
 
+### Pinning (bpffs)
+
+`__uint(pinning, LIBBPF_PIN_BY_NAME)` is honoured the way libbpf does it: `load` looks for a map pinned at
+`<LoadOptions.pin_root>/<map name>` (default `/sys/fs/bpf`) with `BPF_OBJ_GET`; one that is there is **reused** (its type,
+key and value size, `max_entries` and flags must equal the declaration, else `error.PinnedMapMismatch`; the `NUMA_NODE`
+flag bit is ignored) and no map is created, seeded or frozen; one that is not there (`ENOENT`) is created and then
+`BPF_OBJ_PIN`ned (`error.PinFailed` when that fails). `MapSpec.pin_path`, set before `load`, does the same for exactly
+that path whatever `pinning` says. Internal data maps are never auto-pinned, a `pinning` value other than 0/1 is
+`error.PinningUnsupported`, and `MapSpec.reused` tells a caller which maps came from a pin. `Object.pinMaps(dir)`,
+`pinPrograms(dir)`, `unpinMaps(dir)` and `unpinPrograms(dir)` pin and unpin after the fact (a pin is a file on bpffs;
+removing it is `unlink`). The path policy is therefore the caller's: the root directory is an option, never a guess, and
+nothing is pinned unless the object asks for it or the caller does.
+
+### Object-level syscalls (`bpfsys.zig`)
+
+`objPin`/`objGet`/`objUnpin` (`BPF_OBJ_PIN`/`BPF_OBJ_GET`; `path_fd` is left 0, the kernel answers `EINVAL` to a
+non-zero one without `BPF_F_PATH_FD`), `btfNextId`/`btfFdById`/`btfBlob`/`loadBtfById` (`BPF_BTF_GET_NEXT_ID`,
+`BPF_BTF_GET_FD_BY_ID`, then `BPF_OBJ_GET_INFO_BY_FD` twice to read the blob back: what `bpftool btf dump id N` does),
+`progBtfId`/`mapBtfId` (the `btf_id` field of the program / map info, offsets pinned against `<linux/bpf.h>`) and
+`progQuery` (`BPF_PROG_QUERY` with the 6.6+ `revision` tail; a buffer that is too small is `count` > ids filled, not an
+error). One `Error` set maps `errno`. `tools/uapi_layout.c` prints the header offsets the layout tests pin.
+
 ### Order of operations in `load`
 
 1. CO-RE relocations **first**, before anything is created — a relocation
@@ -736,7 +758,7 @@ Every one is a typed error naming the symbol or section:
 `error.ExternSymbolUnsupported` (any
 `SHN_UNDEF` symbol: kfunc, extern kconfig, weak extern),
 `error.MapInMapUnsupported` (a `values` member),
-`error.PinningUnsupported`, `error.UnknownMapMember`,
+`error.PinningUnsupported` (a mode other than none/by-name), `error.UnknownMapMember`,
 `error.UnknownProgramSection` (an executable section matching no prefix —
 `load` refuses unless `ignore_unknown_sections`).
 
@@ -956,8 +978,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **Map-in-map and `prog_array` population** (a `values` member in a `.maps` struct): `error.MapInMapUnsupported`. Needs a
   two-phase create (inner map first, `inner_map_fd` on the outer) and a post-load `BPF_MAP_UPDATE_ELEM` pass filling the
   array with fds.
-- **bpffs pinning** (`__uint(pinning, LIBBPF_PIN_BY_NAME)`): parsed and reported, then `error.PinningUnsupported`. Needs
-  `BPF_OBJ_PIN`/`_GET` and a pin-path policy.
 - **`mmap`-able global-data maps and a generated skeleton.** libbpf sets `BPF_F_MMAPABLE` on internal maps and hands
   userspace a struct pointer into them; here they are ordinary arrays seeded through `BPF_MAP_UPDATE_ELEM`, so a caller
   sets `const volatile` config by editing `MapSpec.initial_data` before `load`, not by writing through a mapped struct.
@@ -966,8 +986,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **`.BTF` sanitization for older kernels.** libbpf downgrades `FLOAT`, `DECL_TAG`, `TYPE_TAG`, `ENUM64` etc. when the
   running kernel's BTF verifier predates them. Here `BPF_BTF_LOAD` simply fails and `LoadOptions.load_btf = false` is the
   escape hatch.
-- **`BPF_BTF_GET_FD_BY_ID` / `BPF_BTF_GET_NEXT_ID`**: reading back the BTF a loaded program or map carries (what
-  `bpftool btf dump id N` does). `BPF_BTF_LOAD` is implemented; the retrieval side is not.
 - **`kprobe_multi` / `uprobe_multi`** (`bpf(BPF_LINK_CREATE)` with the `kprobe_multi`/`uprobe_multi` union arms):
   attaching one program to thousands of symbols in a single call. The attr arms are declared in `bpflink.CreateExtra`; the
   symbol/address array marshalling and the kallsyms-glob resolution are not.
@@ -976,8 +994,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **USDT probe discovery.** `UprobeOptions.ref_ctr_offset` carries the semaphore a USDT probe needs, but finding it means
   parsing the `.note.stapsdt` ELF notes (provider/name/location/base/semaphore, plus the argument descriptor string), a
   separate parser on top of `elfsym`.
-- **`bpf(BPF_PROG_QUERY)`**: enumerating what is already attached to a cgroup or interface; useful for a "detach whatever
-  is there" tool. (`bpflink.linkNextId` covers the link half of that question.)
 - **cpumap/devmap attach** (`BPF_XDP_CPUMAP`/`BPF_XDP_DEVMAP` programs attached via map entries rather than to an
   interface).
 - **Typed map wrapper**: std has fd-based lookup/update/delete/next-key only; batch operations (`BPF_MAP_*_BATCH`) and

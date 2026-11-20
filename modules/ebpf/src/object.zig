@@ -79,8 +79,8 @@
 //!   (`BPF_PSEUDO_KFUNC_CALL`), an extern kconfig variable, or a weak extern.
 //! - `error.MapInMapUnsupported` — a `values` member (`prog_array` /
 //!   `array_of_maps` initialization).
-//! - `error.PinningUnsupported` — a non-zero `pinning` member; bpffs pinning
-//!   is not implemented.
+//! - `error.PinningUnsupported` — a `pinning` member that is neither none nor
+//!   by-name.
 //!
 //! Provenance: the wire formats are the kernel UAPI (`linux/bpf.h`'s
 //! `BPF_PSEUDO_*`, `bpf_map_def`, the `bpf_attr` arms) and the System V gABI
@@ -109,6 +109,7 @@ const elfsym = @import("elfsym.zig");
 const btf_mod = @import("btf.zig");
 const btfext = @import("btfext.zig");
 const tracing = @import("tracing.zig");
+const bpfsys = @import("bpfsys.zig");
 
 pub const Insn = BPF.Insn;
 pub const Btf = btf_mod.Btf;
@@ -362,9 +363,17 @@ pub const MapSpec = struct {
     max_entries: u32 = 0,
     map_flags: u32 = 0,
     numa_node: ?u32 = null,
-    /// `LIBBPF_PIN_BY_NAME` == 1. Parsed, never acted on — see
-    /// `error.PinningUnsupported`.
+    /// `LIBBPF_PIN_NONE` (0) or `LIBBPF_PIN_BY_NAME` (1): with the latter `load`
+    /// reuses the map pinned at `<pin_root>/<name>` when there is one (after
+    /// checking it has the same type, sizes and flags) and otherwise creates
+    /// the map and pins it there. Any other value is `error.PinningUnsupported`.
     pinning: u32 = 0,
+    /// An explicit pin path, set by the caller before `load`: the map is
+    /// reused from / pinned at exactly this path, whatever `pinning` says
+    /// (libbpf's `bpf_map__set_pin_path`).
+    pin_path: []const u8 = "",
+    /// Set by `load` when the map was opened from its pin rather than created.
+    reused: bool = false,
     /// Type ids in **this object's** BTF; only meaningful together with the
     /// BTF fd `load` obtains.
     btf_key_type_id: u32 = 0,
@@ -558,8 +567,14 @@ pub const LoadError = error{
     KernelBtfUnavailable,
     /// A section that looks like a program but matches no known prefix.
     UnknownProgramSection,
-    /// A map declared a non-zero `pinning`; bpffs pinning is not implemented.
+    /// A map declared a `pinning` mode other than none / by-name.
     PinningUnsupported,
+    /// `BPF_OBJ_PIN` of a freshly created map failed (no bpffs there, a
+    /// missing directory, the path exists as something else).
+    PinFailed,
+    /// The map pinned at the map's pin path does not have the type, sizes or
+    /// flags this object declares, so it cannot be reused.
+    PinnedMapMismatch,
     /// `max_entries == 0` for a map type that requires entries.
     ZeroMaxEntries,
     OutOfMemory,
@@ -632,6 +647,48 @@ pub const Object = struct {
         }
         if (self.btf_fd >= 0) _ = linux.close(self.btf_fd);
         self.btf_fd = -1;
+    }
+
+    /// `BPF_OBJ_PIN` every created map (not the internal data maps) at
+    /// `<dir>/<name>`, and `unpinMaps` the reverse. `dir` is a bpffs directory.
+    /// A map already pinned at its path (an explicit `pin_path`, or one that
+    /// `load` pinned) is skipped.
+    pub fn pinMaps(self: *Object, dir: []const u8) bpfsys.Error!void {
+        const a = self.arena.allocator();
+        for (self.maps) |*m| {
+            if (m.fd < 0 or m.origin == .internal or m.reused) continue;
+            const path = a.print("{s}/{s}", .{ dir, m.name }) catch return error.OutOfMemory;
+            try bpfsys.objPin(m.fd, path);
+        }
+    }
+
+    /// `BPF_OBJ_PIN` every loaded program at `<dir>/<program name>`.
+    pub fn pinPrograms(self: *Object, dir: []const u8) bpfsys.Error!void {
+        const a = self.arena.allocator();
+        for (self.programs) |*p| {
+            if (p.fd < 0) continue;
+            const path = a.print("{s}/{s}", .{ dir, p.name }) catch return error.OutOfMemory;
+            try bpfsys.objPin(p.fd, path);
+        }
+    }
+
+    /// Remove the pins `pinMaps(dir)` made (a missing one is not an error).
+    pub fn unpinMaps(self: *Object, dir: []const u8) bpfsys.Error!void {
+        const a = self.arena.allocator();
+        for (self.maps) |*m| {
+            if (m.origin == .internal) continue;
+            const path = a.print("{s}/{s}", .{ dir, m.name }) catch return error.OutOfMemory;
+            bpfsys.objUnpin(path) catch |e| if (e != error.NotFound) return e;
+        }
+    }
+
+    /// Remove the pins `pinPrograms(dir)` made (a missing one is not an error).
+    pub fn unpinPrograms(self: *Object, dir: []const u8) bpfsys.Error!void {
+        const a = self.arena.allocator();
+        for (self.programs) |*p| {
+            const path = a.print("{s}/{s}", .{ dir, p.name }) catch return error.OutOfMemory;
+            bpfsys.objUnpin(path) catch |e| if (e != error.NotFound) return e;
+        }
     }
 
     /// Find a program by C function name first, then by section name.
@@ -1666,6 +1723,9 @@ pub const LoadOptions = struct {
     log_level: u32 = 1,
     /// Ceiling for the verifier log retry loop.
     max_log_bytes: usize = 16 << 20,
+    /// Where `pinning = LIBBPF_PIN_BY_NAME` maps live: `<pin_root>/<map name>`.
+    /// The directory must exist on a bpffs.
+    pin_root: []const u8 = "/sys/fs/bpf",
 };
 
 /// Create every map, relocate every program, and load them all.
@@ -1704,9 +1764,30 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
 
     // ── maps ──
     for (obj.maps) |*m| {
-        if (m.pinning != 0) return error.PinningUnsupported;
+        if (m.pinning > 1) return error.PinningUnsupported;
         if (m.max_entries == 0 and needsEntries(m.map_type)) return error.ZeroMaxEntries;
+        const pin: ?[]const u8 = if (m.pin_path.len != 0)
+            m.pin_path
+        else if (m.pinning == 1 and m.origin != .internal)
+            obj.arena.allocator().print("{s}/{s}", .{ opts.pin_root, m.name }) catch return error.OutOfMemory
+        else
+            null;
+        if (pin) |path| {
+            if (bpfsys.objGet(path, 0)) |fd| {
+                errdefer _ = linux.close(fd);
+                try checkPinnedMap(m, fd);
+                m.fd = fd;
+                m.reused = true;
+                continue;
+            } else |e| switch (e) {
+                error.NotFound => {},
+                error.PermissionDenied => return error.PermissionDenied,
+                error.PathTooLong, error.InvalidArgument => return error.InvalidArgument,
+                else => return error.PinFailed,
+            }
+        }
         m.fd = try createMap(m);
+        if (pin) |path| bpfsys.objPin(m.fd, path) catch return error.PinFailed;
         if (m.origin == .internal) {
             var key: [4]u8 = @splat(0);
             // `.bss` has no file bytes; the map is already zeroed.
@@ -1732,6 +1813,31 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
         try relocateProgram(p, obj.maps);
         p.fd = try loadOneProgram(obj, p, license, opts);
     }
+}
+
+/// A map found at its pin must be the map this object declares; the check is
+/// libbpf's (`map_info` against the definition): type, key and value size,
+/// `max_entries` and flags. A mismatch closes nothing here: the caller owns
+/// the fd and drops it.
+fn checkPinnedMap(m: *const MapSpec, fd: linux.fd_t) LoadError!void {
+    var info: bpfsys.MapInfo = std.mem.zeroes(bpfsys.MapInfo);
+    bpfsys.objInfo(fd, std.mem.asBytes(&info)) catch |e| return switch (e) {
+        error.PermissionDenied => error.PermissionDenied,
+        else => error.PinFailed,
+    };
+    if (!pinnedMapMatches(m, info)) return error.PinnedMapMismatch;
+}
+
+/// Pure half of `checkPinnedMap`. A `numa_node` / kernel-added flag bit does
+/// not make a map different; the creation flags that change what the map
+/// *is* do.
+pub fn pinnedMapMatches(m: *const MapSpec, info: bpfsys.MapInfo) bool {
+    const keep: u32 = ~@as(u32, 1 << 2); // BPF_F_NUMA_NODE says where, not what
+    return info.type == @backingInt(m.map_type) and
+        info.key_size == m.key_size and
+        info.value_size == m.value_size and
+        info.max_entries == m.max_entries and
+        (info.map_flags & keep) == (m.map_flags & keep);
 }
 
 /// Map types the kernel refuses with `max_entries == 0`. `RINGBUF` uses
@@ -3973,8 +4079,14 @@ test "load: refusals that need no privilege come before any syscall" {
         defer o.deinit();
         try testing.expectError(error.ZeroMaxEntries, load(&o, .{ .load_btf = false }));
         o.maps[0].max_entries = 1;
-        o.maps[0].pinning = 1;
+        o.maps[0].pinning = 2; // neither none nor by-name
         try testing.expectError(error.PinningUnsupported, load(&o, .{ .load_btf = false }));
+        // by-name pinning reaches bpffs: no permission, or no such directory to pin into
+        o.maps[0].pinning = 1;
+        if (load(&o, .{ .load_btf = false, .pin_root = "/nonexistent-bpffs-root" })) |_| {
+            return error.TestUnexpectedResult;
+        } else |e| try testing.expect(e == error.PermissionDenied or e == error.PinFailed);
+        o.close();
         o.maps[0].pinning = 0;
         o.maps[0].max_entries = 0;
         o.maps[0].map_type = .struct_ops;
@@ -4624,4 +4736,43 @@ test "sub-programs: a clang object's static and global calls and a callback addr
     for (o.maps, 0..) |*m, i| m.fd = @intCast(10 + i);
     try relocateProgram(main, o.maps);
     for (main.relos) |r| try testing.expect(main.insns[r.insn_idx].imm >= 10);
+}
+
+test "pinnedMapMatches: type, sizes and flags decide, the NUMA bit does not" {
+    var m: MapSpec = .{ .name = "m", .map_type = .hash, .key_size = 4, .value_size = 8, .max_entries = 16, .map_flags = 1, .origin = .legacy, .sec_idx = 0 };
+    var info: bpfsys.MapInfo = std.mem.zeroes(bpfsys.MapInfo);
+    info.type = @backingInt(BPF.MapType.hash);
+    info.key_size = 4;
+    info.value_size = 8;
+    info.max_entries = 16;
+    info.map_flags = 1;
+    try testing.expect(pinnedMapMatches(&m, info));
+    info.map_flags = 1 | (1 << 2); // the kernel reports BPF_F_NUMA_NODE: same map
+    try testing.expect(pinnedMapMatches(&m, info));
+    info.map_flags = 0;
+    try testing.expect(!pinnedMapMatches(&m, info));
+    info.map_flags = 1;
+    for ([_]u2{ 0, 1, 2, 3 }) |which| {
+        var bad = info;
+        switch (which) {
+            0 => bad.type = @backingInt(BPF.MapType.array),
+            1 => bad.key_size = 8,
+            2 => bad.value_size = 4,
+            3 => bad.max_entries = 17,
+        }
+        try testing.expect(!pinnedMapMatches(&m, bad));
+    }
+    m.pin_path = "/x"; // a pin path does not take part in the comparison
+    try testing.expect(pinnedMapMatches(&m, info));
+}
+
+test "pin paths: an unreachable pin is a typed error and pins nothing" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_ringbuf_map, .{});
+    defer o.deinit();
+    // programs/maps that were never loaded have nothing to pin; unpin of absent pins is not an error
+    try o.pinMaps("/nonexistent-bpffs-root");
+    try o.pinPrograms("/nonexistent-bpffs-root");
+    try o.unpinMaps("/nonexistent-bpffs-root");
+    try o.unpinPrograms("/nonexistent-bpffs-root");
 }

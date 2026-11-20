@@ -415,8 +415,14 @@ grown from `log_true_size` so it is never truncated.
 
 What it refuses with a typed error naming the symbol, rather than emitting a
 silently broken program: `error.ExternSymbolUnsupported` (kfuncs,
-extern kconfig/ksym), `error.MapInMapUnsupported` (a `values` member),
-`error.PinningUnsupported`.
+extern kconfig/ksym), `error.MapInMapUnsupported` (a `values` member).
+
+bpffs pinning works: `pinning = LIBBPF_PIN_BY_NAME` reuses a compatible map
+pinned at `<LoadOptions.pin_root>/<name>` or creates and pins it;
+`MapSpec.pin_path` and `Object.pinMaps`/`pinPrograms` do it explicitly. The
+object-level syscalls behind it are `ebpf.objPin`/`objGet`/`objUnpin`,
+`btfNextId`/`btfFdById`/`loadBtfById` (read a loaded program's or map's BTF
+back by id), `progBtfId`/`mapBtfId` and `progQuery` (`BPF_PROG_QUERY`).
 
 Low-level, for building custom programs (all `pub`): `ebpf.Insn` (re-export
 of `std.os.linux.BPF.Insn` — every opcode builder needed lives there
