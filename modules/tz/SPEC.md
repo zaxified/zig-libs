@@ -24,7 +24,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [eggert/tz](https://github.com/eggert/tz) (IANA tz code and data) — **reference** | C | public domain (`LICENSE`: "Unless specified below, all files … are in the public domain"; API says NOASSERTION; files with other terms not read) | 1.8k | pushed 2026-09-30, no GitHub release | The data source and the yardstick: `zic` output is what this module's table is generated from (`scripts/gen/tz-gen`, SHA-256-pinned tzdata 2026a). Its `localtime`/`mktime` give abbreviations and pre-1970 history; this module gives the same since 2026-10-20 (`abbrevAt`, `tz.full`; local-to-UTC since 2026-09-30). |
+| [eggert/tz](https://github.com/eggert/tz) (IANA tz code and data) — **reference** | C | public domain (`LICENSE`: "Unless specified below, all files … are in the public domain"; API says NOASSERTION; files with other terms not read) | 1.8k | pushed 2026-09-30, no GitHub release | The data source and the yardstick: `zic` output is what this module's table is generated from (`scripts/gen/tz-gen`, SHA-256-pinned tzdata 2026a). Its `localtime`/`mktime` give abbreviations and pre-1970 history; this module gives the same (`abbrevAt`, `tz.full`; local-to-UTC through `resolveLocal`). |
 | [Go `time.LoadLocation`](https://pkg.go.dev/time) | Go | BSD-3-Clause *(inferred; `go.dev/LICENSE` not read)* | — | Go stdlib | Zone by name, abbreviation, local-time construction with gap/overlap rules, system zoneinfo or an embedded `time/tzdata` *(inferred: docs not read this run)*. |
 | [chronotope/chrono-tz](https://github.com/chronotope/chrono-tz) | Rust | MIT OR Apache-2.0 (`LICENSE`: "dual-licensed under the MIT License and Apache 2.0"; tzdb folder public domain) | 281 | parse-zoneinfo-v0.5.0 (2025-07-15); pushed 2025-10-10 | Zones compiled into the binary by a build script (README) — the same shape as here, but as `TimeZone` impls for chrono, so local-to-UTC (`Pacific.ymd(..).and_hms(..)` in the README) comes with it. |
 | [BurntSushi/jiff](https://github.com/BurntSushi/jiff) | Rust | Unlicense OR MIT (`COPYING`) | 2.9k | 0.2.0 (2025-02-11); pushed 2026-09-12 | Reads system tzdata or embeds a copy; DST-aware arithmetic (README). |
@@ -33,21 +33,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [leroycep/zig-tzif](https://github.com/leroycep/zig-tzif) | Zig | MIT | 9 | pushed 2024-07-26 | RFC 8536 TZif parser plus a `localtime` example; stale (Zig-version compatibility not checked). |
 | Zig `std.tz.Tz` | Zig | MIT | — | Zig 0.16.0 | Parses a TZif file (transitions, time types, leap seconds, footer as a raw string) and nothing else — public functions are `parse`/`deinit` only (checked in 0.16.0 `lib/std/tz.zig`): no lookup by instant, no footer evaluation. |
 
-**Where we are ahead:** the only Zig entry that answers "offset at this instant" for a **named zone with no file, no allocator, no OS and no `Io`** — 598 zones (aliases such as `Asia/Calcutta`, `US/Eastern` included; counted in `tz_data.zig`) compiled in, future dates evaluated from the POSIX footer (`Mm.w.d`, `Jn`, `n`), fuzzed never-panic, and the table re-derivable from a checksum-pinned tzdata release. **Where we are behind:** no abbreviations (`CET`, `EST`; `Transition` stores only offset and DST flag); transitions start at 1970, earlier history is folded into `init_off` (documented in `tz_data.zig`); the pinned release ages with the module rather than with the system (by design: compile-time table).
+**Where we are ahead:** the only Zig entry that answers "offset at this instant" for a **named zone with no file, no allocator, no OS and no `Io`** — 598 zones (aliases such as `Asia/Calcutta`, `US/Eastern` included; counted in `tz_data.zig`) compiled in, future dates evaluated from the POSIX footer (`Mm.w.d`, `Jn`, `n`), fuzzed never-panic, and the table re-derivable from a checksum-pinned tzdata release. **Where we are behind:** the default table starts at 1970 (earlier history is folded into `init_off`; the full history is the opt-in `tz.full`); the pinned release ages with the module rather than with the system (by design: compile-time table); no zoned date-time type and no loading of the system's TZif files (see *What is deliberately not done*).
 
 ## Design & invariants
 
-**Local → UTC (`resolveLocal`, `localToUtc`, 2026-09-30).** A local time `L` (wall clock read as
-if UTC) names the instants `u` with `u + offsetAt(u) = L`. Candidate offsets are the one in force
-at `L - 2 days` and the new offset at every change point in `[L - 2 d, L + 2 d]` — the explicit
-transitions (binary search) and, from the POSIX footer, the DST start/end of the years around (a
-superset is harmless); each candidate `o` is kept only if `offsetAt(L - o) = o`. One survivor is
-`unique`, two are a fold (`ambiguous`, earlier = first pass), none is a gap: the forward jump `t`
-with `t + before <= L < t + after` gives `earlier = L - after`, `later = L - before`. Because every
-answer is checked against `offsetAt`, the conversion cannot disagree with the forward lookup.
-Names and the `compatible` default follow Temporal's `disambiguation`; java.time's `ofLocal` and
-Python's `fold=0` behave as `compatible`. The policy is a required argument.
-IANA time-zone offset lookup: zone name → UTC offset/DST at a given instant. Pure logic, no OS calls,
+IANA time-zone offset lookup: zone name → UTC offset/DST/abbreviation at a given instant. Pure logic, no OS calls,
 no filesystem — the whole tzdata table is a compiled-in Zig array (`tz_data.zig`, generated ahead of
 time by the `tz-gen` tool, not ported into this module). Each of the 598 IANA zones
 carries an explicit list of UTC-offset transitions from 1970 onward (real tzdata transition history,
@@ -60,6 +50,61 @@ allocation anywhere; reentrant, no shared state. Composes `datefmt` (extracted s
 POSIX-TZ footer's calendar math. `src/root.zig` is original work of the zig-libs authors (MIT);
 `tz_data.zig` is generated data from the IANA tzdata 2026a release (public domain) — see README Provenance.
 
+**Local → UTC (`resolveLocal`, `localToUtc`).** A local time `L` (wall clock read as
+if UTC) names the instants `u` with `u + offsetAt(u) = L`. Candidate offsets are the one in force
+at `L - 2 days` and the new offset at every change point in `[L - 2 d, L + 2 d]` — the explicit
+transitions (binary search) and, from the POSIX footer, the DST start/end of the years around (a
+superset is harmless); each candidate `o` is kept only if `offsetAt(L - o) = o`. One survivor is
+`unique`, two are a fold (`ambiguous`, earlier = first pass), none is a gap: the forward jump `t`
+with `t + before <= L < t + after` gives `earlier = L - after`, `later = L - before`. Because every
+answer is checked against `offsetAt`, the conversion cannot disagree with the forward lookup.
+Names and the `compatible` default follow Temporal's `disambiguation`; java.time's `ofLocal` and
+Python's `fold=0` behave as `compatible`. The policy is a required argument.
+
+## Design notes by feature
+
+- **`localToUnix`** (`src/root.zig`) is the parts-based wrapper: `datefmt.validate` (`error.InvalidDateTime` for an
+  out-of-range field), then `datefmt.partsToUnix`, then `localToUtc`.
+- **Abbreviations** (`abbrevAt`): each transition carries `abbr`, a byte offset into one shared, NUL-terminated
+  abbreviation string table (`tz_data.abbrevs`); `Zone.init_abbr` is the initial state's. Past the table the
+  footer's names are used. Zones tzdata gives no letters appear as the sign and digits without angle brackets
+  (`+05`, `-03`, `+0530`). A hand-built state whose index lies past the table gives the empty string, not a bounds
+  panic. The default table and `tz.full` share this one table.
+- **Pre-1970 history** (`tz.full`: `find`, `zones`): the generator also emits `tz_data_full.zig`, every change back to
+  each zone's local mean time, and the two tables agree from 1970 on. The default table starts at 1970 on purpose
+  (full history would add size for every consumer); `tz.full` is paid only by a program that references it, so no
+  build option is needed. Its zones go through every function of the module.
+- **Transitions** (`nextTransition`, `prevTransition`, `Change`): the table, then the footer's DST starts and ends;
+  a change is any difference in offset, DST flag or abbreviation. For an instant before the table's start the answer
+  is the first change since 1970.
+- **Links**: `Zone.canonical` names the zone an alias points to (null for a canonical zone); `canonicalName` returns
+  it or the zone's own name.
+- **`formatOffset`** writes `.colon` (`+01:00`), `.basic` (`+0100`) or `.short` (`+01`, minutes kept when non-zero);
+  a non-zero seconds part is kept; `max_offset_len` always fits.
+- **Footer parsed once**: the generator stores each footer parsed (`Zone.footer`), so `offsetAt` never re-parses a
+  shipped zone. A zone built by hand leaves `footer` null and `offsetAt` parses `posix` per call. A test holds the
+  stored footer to the per-call parse for every shipped zone.
+- **POSIX rule forms**: the footer parser evaluates `Mm.w.d`, `Jn` (1..365, Feb 29 never counted, so day 60 is always
+  March 1) and plain `n` (0..365, zero-based, Feb 29 counted in leap years), all through `ruleDateUnix` /
+  `posixOffset`. No tzdata release ships a footer with `Jn` or `n` (all 598 use `Mm.w.d`), so they are forward cover,
+  exercised by synthetic zones and by the vote described under Anchoring. The leap-year positive control `J59` vs
+  `59` shows the forms are not aliased: `J59` is Feb 28 in every year, `59` is Feb 29 in a leap year and March 1
+  otherwise.
+- **No silent fallback in the generator**: it asserts that every zone has a footer, every footer parses, every link
+  target exists, and no 4-day window holds more than 12 explicit transitions. `resolveLocal`'s candidate buffer
+  (`Changes`) holds 32 instants; for a hand-built zone with more in a window the excess is dropped and `truncated`
+  is set (no shipped zone truncates; a test pins that).
+- **Data provenance and regeneration**: `scripts/gen/tz-gen/` (outside `modules/` and outside `build.zig.zon`'s
+  `.paths`, so a consumer fetches only the generated tables; it reads a compiled zoneinfo tree and is the sole
+  user of `std.Tz`, which the module's no-filesystem model rules out) re-derives the tables. "Re-derived" means from
+  the PINNED release, not from the machine: `fetch-and-build.sh` fetches `tzdata<release>.tar.gz` from IANA
+  (SHA-256 in `checksums.txt`), compiles it with the system `zic -b fat` and hands that tree to the generator;
+  `--check` regenerates to a temp file and diffs. It never falls back to `/usr/share/zoneinfo` (a different release
+  on the host), and a missing `zic` is a hard failure. `-b fat` is load-bearing: with `-b slim` zic omits the
+  transitions the footer can regenerate, giving a different table from identical input. `tz_data.zig`'s header names
+  the pinned release and the regeneration command. `localtime` and `posixrules` are not IANA zones and are not in the
+  table.
+
 ## Threat model / out of scope
 Not a security-sensitive module — a pure offset-lookup table over a fixed, trusted, compiled-in data
 set; there is no untrusted-input attack surface (the only "input" is a zone name string and an i64
@@ -69,107 +114,61 @@ unknown zone name (never panics); `offsetAt` on a zone whose POSIX footer uses a
 form falls back to the last explicit transition's offset rather than erroring (a documented
 approximation, not a crash).
 
+## What is deliberately not done
+
+- **System TZif loading** (R9; `TZ`, `TZDIR`): rejected by the owner. No loader of the local installation, here or
+  as a separate module: zone data come only from the official IANA release (`scripts/gen/tz-gen/fetch-and-build.sh`,
+  SHA-256 pinned in `checksums.txt`); a fresher release means bumping the pin and regenerating. There is nothing to
+  point at a tzdata directory, and no version accessor to add.
+- **RFC 9557 `[Zone]` suffix / ZonedDateTime** (R6): a date-time layer, not an offset lookup; not in `tz`.
+- **Windows zone names / mapping** (R12): no consumer.
+
 ## Verification
-`zig build test-tz` (Debug and `-Doptimize=ReleaseFast`): zone lookup by name, offset lookup
-before/between/at-or-after the last explicit transition, POSIX-footer-rule evaluation for a
-present-day instant, DST flag correctness across a transition, and POSIX footer `Jn`/plain-`n`
-Julian-day rule evaluation (including a leap-year positive control — see Backlog). Correctness oracle
-is this module's own test values plus the generated tzdata table (produced by `tz-gen` from the real
-IANA release, not hand-authored, so wrong-by-construction errors are ruled out by the generator rather
-than by these tests alone).
+
+- **Run:** `scripts/modtest tz` (`-Doptimize=ReleaseFast` for the optimised build).
+- **Anchors:** `src/all_kat.bin` (`src/all_kat_test.zig`; recipe `tools/gen_all_kat.py`): every one of the 598 zones
+  against Python's zoneinfo over the pinned tzdata release, every change 1970..2050 found by scan and bisection —
+  offset, DST flag, abbreviation, next/previous transition, and local → UTC at every gap and fold under all four
+  policies. `src/local_kat.zig` (`tools/gen_local_kat.py`; Python `zoneinfo` over the SAME pinned release built by
+  `scripts/gen/tz-gen/fetch-and-build.sh --check` into `.zig-cache/tz-gen/<release>/zoneinfo`, never the host's
+  zoneinfo; a test pins that `local_kat.zig` and `tz_data.zig` name the same release): five local times per offset
+  change for 12 zones in three spans, the last in footer territory. `src/posix_kat.zig` (`tools/gen_posix_kat.py`,
+  `tools/go_posix/`): see Anchoring.
+- **Properties:** `resolveLocal`'s defining property around every explicit transition of every zone and at random
+  zones and local times; stored footer equals per-call parse for every shipped zone; no shipped zone truncates a
+  window; the zone count is pinned; `formatOffset`, `canonical`, `localToUnix` and the two tables' agreement from
+  1970.
+- **Hand-built zones** (`src/root.zig`): offset lookup before/between/at the last transition, footer evaluation in
+  the future, the exact transition instant carrying the new offset, and the `Jn` / `n` forms with the leap-year
+  positive control. `src/sweep_test.zig`: no panic at the i64 ends in `nextTransition`, `prevTransition`,
+  `resolveLocal`, `localToUtc` or a hand-built zone with a footer, and an out-of-table abbreviation index.
+- **Fuzz:** driver prefix `TZ_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`): `find` on arbitrary and real zone
+  names, and the POSIX footer grammar through `offsetAt`; reach tests count that the corpus varies (hits, DST and
+  non-zero results).
+- **Bench:** `zig build bench-tz` (`tools/bench.zig`, always ReleaseFast; needs `cc`, `go` and the pinned tzdata
+  tree) against glibc `localtime_r` / `mktime` and Go `time`; the card's Performance line holds the figures.
+- **ctgrind:** not applicable (public data).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Backlog / deferred
 
-**S2 plan — survey 2026-10-20** (Sonnet, read-only; reference tzcode/glibc; Python zoneinfo, Go time,
-chrono-tz, jiff, cctz, ICU, Hinnant date). Consumers (the build-tool consumer expr.zig:4836/4906/4978, the analytics consumer datemath.zig:43)
-use only `find` + `offsetAt`; ⚠ the build-tool consumer hand-rolls local→UTC (expr.zig:4943-4945, a wall time read as UTC —
-wrong within ~2 h of a transition) instead of `localToUtc`.
-
-| # | Item | Effort | Decision |
-|---|---|---|---|
-| R1 | `localToUnix(zone, y, m, d, hh, mm, ss, Disambiguation)` parts-based wrapper (promised at 2026-09-30) | S | **DONE 2026-10-20**; the build-tool consumer moves onto it at repin |
-| R2 | Zone abbreviations (`CET`/`CEST`/`+05`, angle-bracket form) per transition and from the footer | M | **DONE 2026-10-20** — `abbrevAt`; data +27 % source, +24 KB in a stripped ReleaseSmall exe |
-| R3 | Pre-1970 history as an opt-in build option (default keeps today's size; document that `init_off` folds it) | M | **DONE 2026-10-20** — `tz.full.find`/`tz.full.zones` over the generated `tz_data_full.zig` (+78 KB, only in a program that references `full`); one shared abbreviation table, so its zones go through every function. No build option needed |
-| R4 | `nextTransition` / `prevTransition` | S | **DONE 2026-10-20** |
-| R5 | Canonical-vs-link flag for aliases | S | **DONE 2026-10-20** — `Zone.canonical`, `canonicalName` |
-| R7 | Offset formatting (`+01:00`, `+0100`, `+01`) | S | **DONE 2026-10-20** — `formatOffset` |
-| R10 | No silent fallback: generator asserts every footer parses; the 16-candidate `Changes` truncation guarded | S | **DONE 2026-10-20** — bound 32 + `truncated` flag; generator refuses unparsable footers |
-| R11 | Parse the POSIX footer once (generation time), not per `offsetAt` | S-M | **DONE 2026-10-20** — footer era 145–167 → 63–74 ns |
-| R8 | Delta-encoded transitions, shared alias tables | M | after R2/R3, measured |
-| R6 | RFC 9557 `[Zone]` suffix / ZonedDateTime | – | not doing in tz (a datetime layer) |
-| R9 | System TZif loading (`TZ`, `TZDIR`) | – | **REJECTED (owner 2026-10-20):** no loader of the local installation, here or as a separate module — zone data come from the official IANA release (`scripts/gen/tz-gen/fetch-and-build.sh`, SHA-256 pinned in `checksums.txt`); a fresher release = bump the pin and regenerate |
-| R12 | Windows zone mapping | – | not doing (no consumer) |
-
-- **Sweep GN leftovers (2026-10-30, not crashes).** (1) `posix.parse` is lenient: it accepts trailing garbage after the end rule, empty abbreviations and out-of-range `M` rules (`M13.9.9`; harmless, `nthWeekdayOfMonth` returns null and the zone falls back to its table state). A stricter parser would turn some accepted strings into null. (2) `Changes.add` sets `truncated` for a hand-built zone with more than 32 changes in a window, but nothing reads it, so `resolveLocal` is silently incomplete for such a zone; surface it (an error or a documented bound) if a consumer builds zones by hand. (3) A hand-built zone without `footer` re-parses `posix` on every call (O(len) per `offsetAt`).
-
-Evidence (DONE 2026-10-20): Python zoneinfo against the pinned 2026a tree over all 598 zones, every change
-1970–2050 found by scan + bisection (`tools/gen_all_kat.py` → `src/all_kat.bin`, 324 distinct traces):
-offset, dst, abbreviation, next/prev transition, and local→UTC at every gap/fold under all four policies —
-0 disagreements. Bench: glibc `localtime_r` (C, one
-zone per process, TZDIR = pinned tree) as the reference, Go `time` second; UTC→offset in table and footer
-eras, local→UTC with gaps/folds under each policy, `find`.
-- **Build option: zone data subset** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). src/tz_data.zig is 1 MB of source (~0.45 MB in a binary, estimate).
-  `.small` options: a zone allow-list (`tz-zones=Europe/*,UTC`) or system zoneinfo only — a capability cut, so an unknown zone must
+- **R8: delta-encoded transitions, shared alias tables** (effort M; after R2/R3, to be measured). Store transition
+  times as `i32` deltas from a per-zone epoch (or a varint) instead of `i64` absolutes at 16 B per entry after
+  alignment: touches `scripts/gen/tz-gen` (emit deltas) and `offsetAt` (rebuild the absolute time inside the binary
+  search); a pure size win to be measured against the decode cost, and it would make `tz.full` cheaper.
+- **Build option: zone data subset** (mechanism and checklist in CONVENTIONS §4.2). `src/tz_data.zig` is 1 MB of
+  source (~0.45 MB in a binary, estimate); measure first (an HTTPS sizeprobe or `nm -S --size-sort` on a consumer
+  binary) and add a knob only for a measured gain of roughly >= 100 KB or a consumer request. `.small` options: a
+  zone allow-list (`tz-zones=Europe/*,UTC`) or system zoneinfo only — a capability cut, so an unknown zone must
   return an error, never fall back to UTC silently. Unmeasured.
-- **Local → UTC — DONE 2026-09-30** (survey 2026-09-30 item). Oracle: `tools/gen_local_kat.py`
-  runs Python `zoneinfo` (black box) over the SAME pinned release, built by
-  `scripts/gen/tz-gen/fetch-and-build.sh --check` into `.zig-cache/tz-gen/<release>/zoneinfo`
-  (never the host's `/usr/share/zoneinfo`, which is a different release); the test also pins
-  that `local_kat.zig` and `tz_data.zig` name the same release. Five local times per offset
-  change (edges, middle) for 12 zones in 2008–12, 2020–26 and 2036–41 (the last span is
-  POSIX-footer territory). Mutation-checked by schemata: 13 mutants, 11 killed; the two
-  survivors are equivalent (`>`→`>=` on an empty interval; dropping transitions 1–2 days before
-  `L`, which no offset below 26 h can reach).
-- **Done (this session):** the POSIX footer parser now also evaluates the `Jn` (1<=n<=365, Julian day,
-  Feb 29 never counted — day 60 is always March 1) and plain `n` (0<=n<=365, zero-based day of year,
-  Feb 29 counted) rule forms, alongside the pre-existing `Mm.w.d` form, all through the same
-  `ruleDateUnix`/`posixOffset` evaluation path (`src/root.zig`). No current tzdata-2026a zone's footer
-  actually uses `Jn`/`n` (all 598 use `Mm.w.d`), so this is forward cover for zones/releases that do,
-  exercised by synthetic-zone tests (`Test/Jn`, `Test/n`) rather than a real IANA entry. A leap-year
-  positive control (`J59` vs plain `59`) proves the two forms are not accidentally aliased: `J59` is
-  Feb 28 in both a leap (2024) and non-leap (2023) year, while plain `59` is Feb 29 in the leap year
-  and March 1 in the non-leap year — different UTC instants for the same digit, in the year that makes
-  Feb 29 exist. (Note: the *POSIX day-number* that lands on Feb 29 is 59, not 60 — Jn is 1-based so
-  `J60`≡March 1 always, and the zero-based `n` only reaches Feb 29 at index 59; `n=60` is March 1 in a
-  leap year too, so `59` is the number that actually demonstrates the divergence.)
-- ✅ DONE 2026-08-16 (`144823e48`: the `tz-gen` generator lives in this repo under `scripts/gen/tz-gen/`; see CHANGELOG 2026-08-16). **tzdata refresh cadence tooling:** the `tz-gen` generator lives in this repo at
-  `scripts/gen/tz-gen/`, so the pinned release can be re-derived rather than only trusted. It stays out of
-  `modules/` on purpose — it reads a compiled zoneinfo tree and is the sole user of `std.Tz`,
-  both of which the module's no-filesystem/no-syscalls threat model above rules out — and `scripts/` is
-  outside `build.zig.zon`'s `.paths`, so a consumer still fetches nothing but the generated table. This
-  module still has no loader to redirect and no version accessor to add; `tz_data.zig`'s header comment
-  states the pinned release (tzdata 2026a) and the regeneration command. A "point the loader at a fresh
-  tzdata dir" helper does not apply (the table is compile-time-embedded, by design). Refreshing the
-  pinned release remains a `tz-gen`-tool concern, not a `tz` (this module)-API concern.
-- **"Re-derived" means from the PINNED release, not from this machine.** `scripts/gen/tz-gen/fetch-and-build.sh`
-  fetches `tzdata<release>.tar.gz` from IANA (SHA-256 pinned in `scripts/gen/tz-gen/checksums.txt`),
-  compiles it with the system `zic -b fat`, and hands that tree to the generator; `--check` regenerates
-  to a temp file and diffs, exiting non-zero on any difference. Handing the generator
-  `/usr/share/zoneinfo` instead re-derives the table from whatever release THIS distro shipped, which
-  is how the claim came to be false in practice — that tree was 2026c against a 2026a pin. The script
-  never falls back to it: a missing `zic` is a hard failure, because a silent fall-back would produce
-  a table that looks regenerated and is not.
-- **`-b fat` is load-bearing.** With `zic -b slim`, zic omits the transitions the POSIX-TZ footer can
-  regenerate. This module reads transitions, so a slim tree yields a different (smaller, and
-  differently-behaved before the footer takes over) table from identical input data.
-- ~~**Local wall-clock to instant**~~ — DONE 2026-09-30 as `resolveLocal`/`localToUtc` (see the first item) *(survey 2026-09-30)*: `localToUnix(zone, y, m, d, hh, mm, ss, policy)` with an explicit policy for the DST gap (nonexistent time) and overlap (ambiguous time: earlier/later/error). Why: parsing "2026-03-29 02:30 Europe/Prague" is the commonest reason to load a zone at all; today the caller must probe `offsetAt` by hand and gets the gap/overlap cases wrong. Effort: small–medium (pure arithmetic over the existing `offsetAt`). Fits CONVENTIONS §2. Composes with `datefmt.partsToUnix`.
-- ✅ DONE 2026-10-20 (`0a750b739`: `abbrevAt(zone, unix)` returns the abbreviation, `<+05>` form for numeric ones; `root.zig`). **Zone abbreviations** *(survey 2026-09-30)*: `Offset.abbr` (`CET`/`CEST`, `+05`). Why: log and report output shows `Europe/Prague` times as `CEST`; zeit's `%Z` and Go's `Zone()` provide it. Needs the generator to emit an abbreviation index per transition plus a string table (size cost to be measured); the footer already carries the names. Effort: medium (generator + data). Fits §2.
-- ~~**Pre-1970 history**~~ — DONE 2026-10-20 as `tz.full` (R3; paid only by a program that references it) *(survey 2026-09-30; decided 2026-09-30)*: *not now*, for size. The
-  table folds everything before 1970 into `init_off`, so a pre-1970 instant gets the 1970
-  offset. The trim is deliberate: the tables cost the build-tool consumer +347 KB in ReleaseSmall (862 → 1209 KB,
-  +40 %) when they landed there (2026-07-01), and full `zic -b fat` history would add to that
-  for every consumer. If a consumer needs history, it comes as a **build option selecting a
-  fuller table**, so size-sensitive consumers keep today's default.
-- **Halve the tables: store transition times as `i32` deltas from a per-zone epoch (or a
-  varint)** *(carried over from the build-tool consumer, 2026-07-01, "try in the future")*: the tables are almost
-  all `i64` absolute times at 16 B per entry after alignment. Touches `scripts/gen/tz-gen`
-  (emit deltas) and `offsetAt` (rebuild the absolute time inside the binary search); a pure
-  size win, to be measured against the decode cost. It would also make the history option
-  above cheaper.
-
-## Status
-`extract · any · util · reentrant` + deps: `datefmt` — canonical source is `pub const meta` in
-src/root.zig.
+- **No-panic sweep leftovers (not crashes).** (1) `posix.parse` is lenient: it accepts trailing garbage after the end
+  rule, empty abbreviations and out-of-range `M` rules (`M13.9.9`; harmless, `nthWeekdayOfMonth` returns null and the
+  zone falls back to its table state). A stricter parser would turn some accepted strings into null. (2) `Changes.add`
+  sets `truncated` for a hand-built zone with more than 32 changes in a window, but nothing reads it, so
+  `resolveLocal` is silently incomplete for such a zone; surface it (an error or a documented bound) if a consumer
+  builds zones by hand. (3) A hand-built zone without `footer` re-parses `posix` on every call (O(len) per
+  `offsetAt`).
 
 ## Anchoring
 
@@ -185,11 +184,9 @@ release, and 28 POSIX strings no release ships (Jn and n day forms, rule times o
 with minutes, rules crossing the UTC year, angle-bracket names) against the majority of glibc 2.43, Python
 zoneinfo and Go's time package. `resolveLocal`/`localToUtc`: `local_kat.zig` (Python zoneinfo, 12 zones).
 
-**How it got there.** Until 2026-10-05 the Jn/n forms had only hand-built zones ("unreachable from any
-current IANA release"). `tools/gen_posix_kat.py` (+ `tools/go_posix/`, the Go vote) now asks three
-implementations and keeps the majority; this module agreed with every majority answer on the first run --
-no defect. The vote earned its keep at once: Python zoneinfo places the zero-based `n` day form one day
-early (day 59 of a leap year is Feb 29 for glibc and Go, Feb 28 for Python 3.14) and answers differently
-on rules that cross the UTC year, so it is outvoted there. Three strings get three different answers
-and are not tested (listed in `posix_kat.dissent`), among them RFC 9636's all-year-DST example
-`EST5EDT,0/0,J365/25`. Regenerate per the script's docstring (needs the pinned zoneinfo build and `go`).
+
+Three POSIX strings get three different answers from the three implementations and are not tested (listed in
+`posix_kat.dissent`), among them RFC 9636's all-year-DST example `EST5EDT,0/0,J365/25`. Python zoneinfo places the
+zero-based `n` day form one day early (day 59 of a leap year is Feb 29 for glibc and Go, Feb 28 for Python 3.14) and
+answers differently on rules that cross the UTC year, so it is outvoted there. Regenerate the vectors per
+`tools/gen_posix_kat.py`'s docstring (needs the pinned zoneinfo build and `go`).
