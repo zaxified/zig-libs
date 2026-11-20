@@ -370,7 +370,7 @@ Run `scripts/modtest trie`; `zig build bench-trie` is the performance instrument
   byte by byte over every oracle key: no trie, no pruning), with a random small budget
   that must yield a prefix of the answer and report `truncated()` exactly when it stopped
   early; a counting automaton shows that `canMatch` prunes and `willAlwaysMatch` stops
-  the `accept` calls. `opIterator` is checked over 1–5 random indexes in each format
+  the `accept` calls. `opIterator` is checked over 1–5 and 6–64 random indexes (the 64-index limit with distinct indexes) in each format
   against a naive merge of the per-index oracles for all four operations, plus
   hand-computed three-index cases, the zero / one / empty-input and 64 / 65 index edges,
   retry after `KeyTooLong` / `ValuesBufferTooSmall`, the shared budget (exactly the
@@ -453,9 +453,6 @@ it on a small thread stack.
   would cut it. Only if lookup speed against darts-clone ever matters again.
 - **`topN` stack use** (LOW): about 0.46 MB per call; shrink the frame (an offset instead
   of a `NodeView`) or take caller scratch.
-- **Set-operation differential beyond 5 inputs:** the differential checks 1–5 inputs
-  (64 only with copies of one index).
-- **`drainSearch`'s guard loop** (test helper) cannot tell a typed error from a cap.
 
 ## Anchoring
 

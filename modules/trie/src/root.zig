@@ -775,21 +775,23 @@ test "search budget: every budget is honoured to the node, and a cut search stay
 
 /// Naive set operation over the per-index oracles. `all` is every distinct key
 /// across the indexes in ascending order.
-fn opsRound(seed: u64, fmt: FreezeOptions) !void {
+fn opsRound(seed: u64, fmt: FreezeOptions, min_inputs: usize, max_inputs: usize) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var prng = std.Random.DefaultPrng.init(seed ^ 0x0b5);
     const rnd = prng.random();
-    const k = rnd.intRangeAtMost(usize, 1, 5);
+    const k = rnd.intRangeAtMost(usize, min_inputs, max_inputs);
 
-    var oracles: [5]Oracle = undefined;
-    var bufs: [5][]u8 = undefined;
-    var idx: [5]Frozen = undefined;
+    var oracles: [max_op_indexes]Oracle = undefined;
+    var bufs: [max_op_indexes][]u8 = undefined;
+    var idx: [max_op_indexes]Frozen = undefined;
     var made: usize = 0;
     defer for (bufs[0..made]) |bf| testing.allocator.free(bf);
+    // Many inputs get small key sets so the round stays quick.
+    const max_keys: usize = if (k > 5) 8 else 30;
     for (0..k) |i| {
-        const pairs = try genKeys(arena, &prng, rnd.intRangeAtMost(usize, 0, 30));
+        const pairs = try genKeys(arena, &prng, rnd.intRangeAtMost(usize, 0, max_keys));
         oracles[i] = try Oracle.build(arena, pairs);
         bufs[i] = try freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
         made += 1;
@@ -807,6 +809,7 @@ fn opsRound(seed: u64, fmt: FreezeOptions) !void {
 
     var kb: [64]u8 = undefined;
     var vb: [max_op_indexes]IndexedValue = undefined;
+    const full_mask: u64 = if (k == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(k)) - 1;
     for ([_]SetOp{ .@"union", .intersection, .difference, .symmetric_difference }) |op| {
         var it = try opIterator(arena, idx[0..k], op, 0);
         defer it.deinit();
@@ -820,7 +823,7 @@ fn opsRound(seed: u64, fmt: FreezeOptions) !void {
             }
             const want = switch (op) {
                 .@"union" => mask != 0,
-                .intersection => mask == (@as(u64, 1) << @intCast(k)) - 1,
+                .intersection => mask == full_mask,
                 .difference => mask == 1,
                 .symmetric_difference => @popCount(mask) % 2 == 1,
             };
@@ -897,7 +900,17 @@ fn dupCount(sorted: []const []const u8) usize {
 test "differential: set operations over 1-5 random indexes vs a naive merge of the oracles" {
     for (all_formats) |fmt| {
         var seed: u64 = 1;
-        while (seed <= 60) : (seed += 1) try opsRound(seed, fmt);
+        while (seed <= 60) : (seed += 1) try opsRound(seed, fmt, 1, 5);
+    }
+}
+
+test "differential: set operations over 6-64 random indexes, up to the 64-index limit" {
+    for (all_formats) |fmt| {
+        var seed: u64 = 1;
+        while (seed <= 20) : (seed += 1) try opsRound(seed, fmt, 6, max_op_indexes);
+        // The limit itself, with distinct indexes (not copies of one).
+        seed = 100;
+        while (seed < 104) : (seed += 1) try opsRound(seed, fmt, max_op_indexes, max_op_indexes);
     }
 }
 
@@ -1034,44 +1047,55 @@ fn truncatedRound(fmt: FreezeOptions) !void {
     }
 }
 
-/// Drain `search` over a (possibly damaged) buffer with a node budget; true
-/// when it ran to the end, false on any error (all of them typed).
-fn drainSearch(f: Frozen, comptime A: type, aut: *const A) bool {
+/// How a drain over a (possibly damaged) buffer ended: at the end of the
+/// results, on a typed error, or by hitting the loop guard (which a budgeted
+/// walk can never do: it yields at most one result per visited node, so
+/// `guard_hit` is a termination bug, not a cap).
+const Drained = enum { done, typed_error, guard_hit };
+
+/// A drain that hit its loop guard fails the test loudly.
+fn terminated(d: Drained) Drained {
+    if (d == .guard_hit) @panic("drain loop guard hit: a budgeted walk did not terminate");
+    return d;
+}
+
+/// Drain `search` over a (possibly damaged) buffer with a node budget.
+fn drainSearch(f: Frozen, comptime A: type, aut: *const A) Drained {
     var kb: [32]u8 = undefined;
-    var it = f.search(testing.allocator, A, aut, 1000) catch return false;
+    var it = f.search(testing.allocator, A, aut, 1000) catch return .typed_error;
     defer it.deinit();
     var guard: usize = 0;
     while (guard < 2000) : (guard += 1) {
-        const got = it.next(&kb) catch return false;
-        if (got == null) return true;
+        const got = it.next(&kb) catch return .typed_error;
+        if (got == null) return .done;
     }
-    return false;
+    return .guard_hit;
 }
 
 /// The same for `opIterator` over the damaged buffer, twice (a buffer against
 /// itself: every key in both, so every operation walks both inputs).
-fn drainOps(f: Frozen, op: SetOp) bool {
+fn drainOps(f: Frozen, op: SetOp) Drained {
     var kb: [32]u8 = undefined;
     var vb: [2]IndexedValue = undefined;
-    var it = opIterator(testing.allocator, &.{ f, f }, op, 1000) catch return false;
+    var it = opIterator(testing.allocator, &.{ f, f }, op, 1000) catch return .typed_error;
     defer it.deinit();
     var guard: usize = 0;
     while (guard < 2000) : (guard += 1) {
-        const got = it.next(&kb, &vb) catch return false;
-        if (got == null) return true;
+        const got = it.next(&kb, &vb) catch return .typed_error;
+        if (got == null) return .done;
     }
-    return false;
+    return .guard_hit;
 }
 
 fn runQueries(f: Frozen) void {
     var kb: [32]u8 = undefined;
-    _ = drainSearch(f, automaton.AlwaysMatch, &.{});
-    _ = drainSearch(f, automaton.Subsequence, &.{ .subseq = "a" });
+    _ = terminated(drainSearch(f, automaton.AlwaysMatch, &.{}));
+    _ = terminated(drainSearch(f, automaton.Subsequence, &.{ .subseq = "a" }));
     const sw = automaton.startsWith(automaton.Str{ .string = "pra" });
-    _ = drainSearch(f, @TypeOf(sw), &sw);
+    _ = terminated(drainSearch(f, @TypeOf(sw), &sw));
     const cx = automaton.complementOf(automaton.unionOf(automaton.Str{ .string = "brno" }, automaton.Subsequence{ .subseq = "z" }));
-    _ = drainSearch(f, @TypeOf(cx), &cx);
-    for ([_]SetOp{ .@"union", .intersection, .difference, .symmetric_difference }) |op| _ = drainOps(f, op);
+    _ = terminated(drainSearch(f, @TypeOf(cx), &cx));
+    for ([_]SetOp{ .@"union", .intersection, .difference, .symmetric_difference }) |op| _ = terminated(drainOps(f, op));
     _ = f.lookup("a") catch {};
     _ = f.lookup("abc") catch {};
     // The 2026-10-04 queries, bounded the same way as the walks below.
@@ -1383,8 +1407,14 @@ fn sweepV2(base: []const u8, seeds: u64, reach: *SweepReach) !void {
             if (e == error.Corrupt) reach.corrupt += 1;
         }
         runQueries(f);
-        if (drainSearch(f, automaton.AlwaysMatch, &.{})) reach.search_ok += 1 else reach.search_err += 1;
-        if (drainOps(f, .@"union")) reach.ops_ok += 1 else reach.ops_err += 1;
+        switch (terminated(drainSearch(f, automaton.AlwaysMatch, &.{}))) {
+            .done => reach.search_ok += 1,
+            else => reach.search_err += 1,
+        }
+        switch (terminated(drainOps(f, .@"union"))) {
+            .done => reach.ops_ok += 1,
+            else => reach.ops_err += 1,
+        }
     }
 }
 

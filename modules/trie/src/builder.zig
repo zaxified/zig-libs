@@ -20,8 +20,9 @@ const format = @import("format.zig");
 const stream = @import("stream.zig");
 const max_depth = @import("query.zig").max_depth;
 
-/// Which frozen format `freezeWith` writes. Version 2 is the default and the
-/// recommended one (path-compressed, several times smaller); version 1 exists
+/// Which frozen format `freezeWith` writes. `.v2` is the default and the
+/// recommended one (path-compressed, several times smaller); its node layout
+/// is `stream.Options.version` (version 3 unless asked for 2). `.v1` exists
 /// so a buffer can still be produced for a reader built against an older
 /// module that only understands v1.
 pub const FreezeOptions = union(enum) {
@@ -175,8 +176,9 @@ pub const Builder = struct {
         n.value = value; // last write wins
     }
 
-    /// Serialize the trie into a freshly-allocated frozen buffer in format
-    /// version 2 (caller owns and frees it). The builder is left intact and may
+    /// Serialize the trie into a freshly-allocated frozen buffer in the
+    /// default path-compressed format (`.v2` options, node layout version 3;
+    /// caller owns and frees it). The builder is left intact and may
     /// be frozen again.
     pub fn freeze(self: *Builder, out_gpa: Allocator) FreezeError![]u8 {
         return self.freezeWith(out_gpa, .{ .v2 = .{} });
