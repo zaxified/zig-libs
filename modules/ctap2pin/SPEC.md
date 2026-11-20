@@ -6,7 +6,7 @@
 
 **Scope:** core — python-fido2 `pin` protocols and libfido2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-17 (100/111, 11 eq) · src 9ec4d4aec8e8f48b
+**Audit:** review 2026-09-15 · mutation 2026-11-17 (100/111, 11 eq) · src 7af20a6616296bf9
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, CTAP2PIN_FUZZ; protocol at 1/4 of it) · ct 2026-09-09 (ctgrind)
 

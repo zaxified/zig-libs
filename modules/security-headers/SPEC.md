@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — unrolled/secure v1.17.0, the fastest Go member of the field, builds `Strict-Transport-Security` unchecked: `STSSeconds: 60, STSPreload: true` ships `max-age=60; preload` and `STSSeconds: -1` ships `max-age=-1`, neither of which the preload list accepts (`secure.go`, `tools/lead_probe`); this module's `init` refuses the first with `InvalidHstsPreload` (`applyStatic` at compile time) and cannot represent the second (test "HSTS preload: refused unless max-age >= 1 year and includeSubDomains (init error)") (measured 2026-10-24) · correctness — with a `$NONCE` policy unrolled/secure passes the whole CSP to `fmt.Sprintf`, so a `%` in a source arrives corrupted (`https://cdn.example/a%20b` → `a%!b(MISSING)`, a trailing `%` → `%!(NOVERB)`; `tools/lead_probe`); here the policy is rendered by copy (test "renderNonce: a '%' in a source is copied, never read as a format directive") (measured 2026-10-24) · speed — 0.01–0.71× unrolled/secure v1.17.0 and 0.03–0.08× gofiber/fiber v3.6.1 helmet on every workload both can run (`zig build bench-security-headers`) (measured 2026-10-24)
 
-**Audit:** review 2026-11-07 · mutation 2026-11-17 (476/483, 7 eq) · src 74d3a4c60ddc5324
+**Audit:** review 2026-11-07 · mutation 2026-11-17 (476/483, 7 eq) · src 02e5443c372e13ce
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — header policy (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: init refuses values http refuses and more distinct names than its header table; configured values are lent, not copied)
 

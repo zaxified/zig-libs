@@ -6,7 +6,7 @@
 
 **Scope:** mvp — Microsoft SEAL 4.4.5, BFV part (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-09 · mutation 2026-11-18 (227/240, 13 eq) · src d47926dd0ca8121b
+**Audit:** review 2026-09-09 · mutation 2026-11-18 (227/240, 13 eq) · src ad5b3b26dd3de721
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct 2026-09-09 (ctgrind)
 
