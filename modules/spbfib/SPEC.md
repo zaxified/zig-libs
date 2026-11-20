@@ -18,7 +18,7 @@
 
 Design + threat notes for auditors. Usage, API and the field contract: see
 [README.md](README.md) and the `src/root.zig` doc comments.
-Attribution/provenance: see this module's README "Provenance" note — none needed here, so there is no root `/NOTICE` entry (clean-room from the
+Attribution/provenance: see the README's `Provenance:` line (clean-room from the
 public IEEE 802.1aq / RFC 6329 standard; a public spec is not a copyrightable
 work, and no third-party source or implementation was ported or studied).
 
@@ -95,6 +95,15 @@ algorithms in 802.1aq provide path *diversity across* I-SIDs/B-VIDs (each B-VID
 maps to one ECT algorithm), never a per-flow spread within a single B-VID. So a
 FIB with one entry per destination is correct, not a simplification.
 
+### Precondition on the caller: a symmetric route table
+
+SPB's reverse-path forwarding check assumes the forward and reverse B-MAC paths are congruent. `isis-spf` is a
+directed engine (one arc per admitted direction, at its own advertised metric), so that holds only on a
+symmetric-metric fabric, which 802.1aq requires and nothing checks unless asked: `isis_spf.Options.reject_asymmetric`
+defaults to `false` and plain `isis_spf.compute` fixes it to `false`. This module consumes a finished `RouteTable` and
+never calls `compute`, so it cannot set that itself. **A caller building an SPB FIB must obtain its `RouteTable` from
+`isis_spf.computeWith(..., .{ .reject_asymmetric = true })`.**
+
 ### Bounds / determinism
 
 Allocation is bounded by the route count: the transient `system-id → B-MAC` map
@@ -159,20 +168,21 @@ whole domain (tested at the field extremes). No allocation, no failure mode.
 
 ## Verification
 
-Offline only — pure logic, no live-interop surface. `zig build test-spbfib`
-is green in Debug + `-Doptimize=ReleaseFast`:
+Run: `scripts/modtest spbfib`. Offline only: pure logic, no live-interop surface.
 
-**Unicast FIB**
+**Unicast FIB** (`src/root.zig`)
 - **Golden line A—B—C** — a real `isis-spf.RouteTable` (`{a,a,0}`, `{b,b,10}`,
   `{c,b,20}` — the exact routes `isis-spf.compute` emits for that line, mirroring
   `isis-spf`'s own golden test) + a system-id→B-MAC map; asserts the exact
   `dest B-MAC → { next_hop_bmac, next_hop_system_id, metric, local }`, including
   the multi-hop destination C whose next-hop B-MAC (B's) ≠ its dest B-MAC.
+- **Local route** — only metric 0 is local: a neighbour at metric 1 is forwarded.
 - **Unknown destination B-MAC** — a reachable dest absent from the map is skipped,
   no crash.
 - **Unknown next-hop B-MAC** — a reachable dest whose next hop has no B-MAC is
   skipped (the documented egress-unresolvable rule).
-- **Determinism** — a shuffled `bmac_map` yields a byte-identical, key-sorted FIB.
+- **Determinism** — a shuffled `bmac_map` yields a byte-identical, key-sorted FIB; colliding key B-MACs order
+  ascending by destination system-id.
 - **Duplicate binding** — first B-MAC for a system-id wins, order-independently.
 - **Degenerate** — empty route table → empty FIB; local-only → one `local` entry.
 - **Positive control** — `key_by_next_hop_bmac = true` mis-keys the multi-hop
@@ -180,7 +190,7 @@ is green in Debug + `-Doptimize=ReleaseFast`:
   correct build finds it. Permanent proof that destination-B-MAC keying is
   load-bearing.
 
-**Group multicast-DA**
+**Group multicast-DA** (`src/root.zig`)
 - **Exact bytes** — both RFC-6329-derived worked examples reproduced byte-for-byte
   (a test that fails if the SPSourceID or I-SID bits are mis-positioned).
 - **Flag bits** — M (group) and L (local) set and TYP zero for any input.
@@ -189,31 +199,24 @@ is green in Debug + `-Doptimize=ReleaseFast`:
   only in the SPSrcMS nibble or only in an I-SID octet) map to distinct DAs.
 - **Field isolation** — changing only the I-SID moves only octets 3–5; changing
   only the SPSourceID moves only octets 0–2.
-- **Rejection** — `parseGroupDa` returns null for broadcast, all-zero, and an IPv4
-  multicast DA (L clear).
+- **Rejection** — `parseGroupDa` returns null for a DA whose flag nibble is not the SPBM group pattern (broadcast,
+  all-zero, an IPv4 multicast DA).
 - **Positive control** — a deliberately mis-placed construction (I-SID written
   where the SPSourceID belongs) differs from the correct DA.
 
-**Mutation run 2026-10-05** (in-place, Debug, 26 mutants over `lookup`'s
-binary search, the first-binding rule, the local/next-hop/key choices, the
-sort tie-break, the defaulted option and both group-DA directions): 25 killed
-(two `lookup` bound mutants by a deterministic hang — a lookup miss never
-terminates — caught by the 120 s lane timeout). One test added: only metric 0
-is local (a neighbour at metric 1 is forwarded). Equivalent: taking the local
-route's next-hop B-MAC from `next_hop` instead of `dest` (`isis-spf`'s self
-route has `next_hop == dest`).
+**RFC 6329 §5 worked example** (`src/rfc6329_example_test.zig`): see *Anchoring*.
 
-`zig fmt --check` clean; `zig build check-catalog` green.
+- **Constant time, fuzz:** n/a (no secret; no fuzz obligation).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
-## Deliberately deferred (out of scope by design, not oversight)
+## What is deliberately not done
 
 - **B-MAC / SPSourceID extraction from TLVs** — the caller decodes the SPBM-SI
   (RFC 6329 §3.5.4) and SPB-Instance (§3.5.2) sub-TLVs via `isis/spb` and supplies
   the resolved map and IDs; this module takes them as inputs.
-- **Multiple B-VIDs / the 16 ECT algorithm set** — not yet: one congruent path
-  per destination from `isis-spf`'s single deterministic ECT selection; no
-  per-B-VID FIB set and no per-flow ECMP. The 2026-09-30 survey moved the
-  per-B-VID FIB set to Backlog (below) — not deferred by design.
+- **Per-flow ECMP** — SPB does not hash a flow across equal-cost next hops (*One path, no per-flow ECMP*); the
+  per-B-VID FIB set is a different matter and is open (*Backlog / deferred*).
 - **Line-rate forwarding** — a FIB is returned, not programmed hardware state.
 - **I-SID service membership** — which local ports belong to a service is
   `l2forward`'s job.
@@ -222,11 +225,14 @@ route has `next_hop == dest`).
 
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
+- **Per-B-VID FIB set** (one `Fib` per ECT-VID tuple, each from its own SPF tree) (survey). Why: a real SPBM deployment uses two or more B-VIDs for path diversity; a single FIB covers only the base VID (the one congruent path per destination comes from `isis-spf`'s single deterministic ECT selection). Needs multi-algorithm ECT in `spf-ect` (see its backlog). Effort: ~3 days after that. Fits §2: yes.
+- **Multicast FDB assembly** (`bumtree` tree + I-SID membership → (group DA, B-VID) → egress-port set at this node) (survey). Why: without it SPBM carries unicast only; `groupDa` names the DA but nothing installs it. Effort: ~1 week including `bumtree`/`l2forward` glue. Fits §2: yes.
+- **Link-layer port mapping** (adjacency → egress interface) (survey). Why: the FIB names next-hop B-MAC/system-id; a forwarder needs a port. Effort: ~1 day. Fits §2: yes. Priority low (caller can join).
 
-- **Per-B-VID FIB set** (one `Fib` per ECT-VID tuple, each from its own SPF tree) (survey 2026-09-30). Why: a real SPBM deployment uses two or more B-VIDs for path diversity; a single FIB covers only the base VID. Needs multi-algorithm ECT in `spf-ect` (see its backlog). Effort: ~3 days after that. Fits §2: yes.
-- **Multicast FDB assembly** (`bumtree` tree + I-SID membership → (group DA, B-VID) → egress-port set at this node) (survey 2026-09-30). Why: without it SPBM carries unicast only; `groupDa` names the DA but nothing installs it. Effort: ~1 week including `bumtree`/`l2forward` glue. Fits §2: yes.
-- **Link-layer port mapping** (adjacency → egress interface) (survey 2026-09-30). Why: the FIB names next-hop B-MAC/system-id; a forwarder needs a port. Effort: ~1 day. Fits §2: yes. Priority low (caller can join).
+## Open
+
+- **End-to-end LSDB → `isis-spf` → `spbfib` is not tested:** the RFC 6329 §5 test builds the `RouteTable` from the RFC's
+  path list because `isis`/`isis-lsdb` are not `test_deps` of `spbfib` in `build.zig` (*Anchoring*).
 
 ## Anchoring
 
@@ -256,5 +262,3 @@ The Figure 3/4 DA column printed `7300-0100-0001` also independently confirms th
 - **BVID column (all figures)** — `spbfib` is a single-VID FIB; the constant 0100 has nothing to compare against (Backlog: per-B-VID FIB set).
 - **The SPF step is not run.** `spbfib` consumes an `isis-spf` `RouteTable`, but `isis-lsdb` is not a dependency of this module (root `build.zig`), so the test builds the `RouteTable` from the RFC's own normative path list (p.12: `{1-2-3, 1-2-5, 1-2-7, 6-2-5, 4-2-7, 4-1-6, 5-2-7, 6-2-3, 4-2-3}`, every other pair direct). What is checked is therefore the re-keying, next-hop resolution and group-DA construction against the RFC tables; that the SPF itself reproduces the same paths is anchored on the same figure in `bumtree` (over `spf-ect`, which `isis-spf` runs). Closing the gap end to end (LSDB -> `isis-spf` -> `spbfib`) needs `isis`/`isis-lsdb` as `test_deps` of `spbfib` in `build.zig`.
 - Figure 6/7 (SPBV) are not `spbfib`'s: SPBV forwards on VIDs with wildcard DAs, not on B-MACs.
-
-**How it got there.** Transcribed by hand from `rfc6329.txt` (RFC Editor, April 2012) §5, Figures 2-4; every row agreed with the module on the first run, so nothing had to be reconciled.

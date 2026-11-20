@@ -12,7 +12,7 @@ destination's **backbone MAC (B-MAC)**, not its system-id: the ingress backbone
 edge bridge sets the frame's DA to the *destination node's* B-MAC, and every
 transit node forwards on that DA **unchanged** (the DA is not rewritten
 hop-by-hop). Given the route table and a caller-supplied **system-id → B-MAC
-map**, `Fib.build` re-keys every reachable destination by its **destination
+map**, `build` re-keys every reachable destination by its **destination
 B-MAC** and resolves the next-hop system-id to the **next-hop's B-MAC** (which
 selects the egress adjacency, not the DA). `Fib.lookup(dest_bmac)` is an O(log n)
 binary search over the sorted entries.
@@ -60,6 +60,11 @@ ECT route table this consumes) — canonical metadata is `pub const meta` in
 system-id→B-MAC map and each node's SPSourceID are inputs the caller extracts
 from the SPB sub-TLVs (`isis/spb`).
 
+**Precondition.** SPB's reverse-path check assumes congruent forward and reverse paths, which `isis-spf` guarantees
+only on a symmetric-metric fabric and only if asked: build the `RouteTable` with
+`isis_spf.computeWith(..., .{ .reject_asymmetric = true })`. Plain `isis_spf.compute` does not check, and this module
+never calls it.
+
 ## Pairing with `bumtree`
 
 `bumtree` is the **multicast** half of SPBM control-plane forwarding — the
@@ -75,7 +80,8 @@ const spf = @import("isis-spf");
 const spbfib = @import("spbfib");
 
 // A route table from isis-spf (dest system-id → next-hop system-id + metric).
-var table = try spf.compute(gpa, &lsdb, local_system_id, now);
+// SPB needs a symmetric-metric fabric: ask isis-spf to refuse an asymmetric one.
+var table = try spf.computeWith(gpa, &lsdb, local_system_id, now, .{ .reject_asymmetric = true });
 defer table.deinit();
 
 // The caller extracts each node's B-MAC from its SPBM-SI sub-TLV (isis/spb).
@@ -84,7 +90,7 @@ const bmac_map = [_]spbfib.BmacEntry{
     // …
 };
 
-var fib = try spbfib.Fib.build(gpa, &table, &bmac_map);
+var fib = try spbfib.build(gpa, &table, &bmac_map);
 defer fib.deinit();
 
 if (fib.lookup(dest_bmac)) |e| {
@@ -95,7 +101,7 @@ if (fib.lookup(dest_bmac)) |e| {
 const da = spbfib.groupDa(my_spsourceid, isid);
 ```
 
-`Fib.build` uses correct destination-B-MAC keying; `Fib.buildWith(..., .{
+`build` uses correct destination-B-MAC keying; `buildWith(..., .{
 .key_by_next_hop_bmac = true })` mis-keys by the next hop and exists only for the
 positive-control test.
 
@@ -105,16 +111,11 @@ The `isis-spf.RouteTable` is produced by `isis-spf` (LSDB → two-way-checked
 topology → `spf-ect` Dijkstra + ECT tie-break → dest→next-hop table). This module
 consumes that table read-only.
 
-## Deferred (out of scope by design — see `SPEC.md`)
+## Not provided
 
-- **B-MAC / SPSourceID extraction from TLVs** — the caller decodes the SPBM-SI
-  and SPB-Instance sub-TLVs (`isis/spb`) and hands this module the resolved map
-  and IDs.
-- **Multiple B-VIDs / the 16 ECT algorithm set** — one congruent path from
-  `isis-spf`'s single deterministic ECT selection.
-- **Line-rate forwarding** — this returns a FIB, not programmed hardware state.
-- **I-SID service membership** — which local ports belong to a service is
-  `l2forward`'s job.
+No TLV parsing (the caller extracts the B-MAC map and SPSourceIDs from the SPB sub-TLVs via `isis/spb`), no per-B-VID
+FIB set, no multicast FDB, no port mapping, no programming of a bridge, no I-SID membership. What is refused on purpose
+is in `SPEC.md` *What is deliberately not done*; what is open is in *Backlog / deferred*.
 
 ## Verify
 
@@ -123,6 +124,5 @@ zig build test-spbfib                          # Debug
 zig build test-spbfib -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
-Provenance: clean-room from IEEE 802.1aq / RFC 6329; no third-party source or
-implementation ported or studied — no `NOTICE` entry (see `/NOTICE` and
-`CONVENTIONS.md` §5).
+Provenance: clean-room from IEEE 802.1aq / RFC 6329; a public standard, no third-party source or
+implementation ported or studied, so the module has no `NOTICE` file of its own.
