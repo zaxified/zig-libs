@@ -16,21 +16,21 @@
 
 **Downstream consumer:** yes
 
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — public NaCl standard, no third-party code).
+
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. No foreign source was read in this survey (LICENSE file and READMEs only).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [jedisct1/libsodium](https://github.com/jedisct1/libsodium) — **reference** (`crypto_box_seal`) | C | ISC (LICENSE file text; API says NOASSERTION) | 14.0k | 1.0.22-RELEASE (2026-04) | Same construction and wire format (byte-exact, PyNaCl differential). We are 1.25-1.29x slower on 64 B (std X25519) and 1.14-1.21x on 64 KiB (own multi-block XSalsa20-Poly1305 since 2026-10-07; std's was 2.3-2.4x, see Performance). No C dependency on our side. |
+| [jedisct1/libsodium](https://github.com/jedisct1/libsodium) — **reference** (`crypto_box_seal`) | C | ISC (LICENSE file text; API says NOASSERTION) | 14.0k | 1.0.22-RELEASE (2026-04) | Same construction and wire format (byte-exact, PyNaCl differential). Speed against it is the card's Performance line (see *Performance*). No C dependency on our side. |
 | [golang.org/x/crypto/nacl/box](https://pkg.go.dev/golang.org/x/crypto/nacl/box) ([golang/crypto](https://github.com/golang/crypto)) | Go | BSD-3-Clause | 3.4k | push 2026-09 | `SealAnonymous`/`OpenAnonymous` plus full `box`. Same seal; box (authenticated) is not here by design. |
 | [RustCrypto/nacl-compat `crypto_box`](https://github.com/RustCrypto/nacl-compat) | Rust | MIT OR Apache-2.0 (LICENSE-MIT + LICENSE-APACHE present; API blank) | 83 | push 2025-12 | Full `crypto_box` incl. sealed box (feature) *(inferred)*, plus secretbox/kx/secretstream siblings. |
 | [sodiumoxide/sodiumoxide](https://github.com/sodiumoxide/sodiumoxide) | Rust | Apache-2.0 | 644 | 0.1.0 (2018), push 2022-09 | libsodium binding, unmaintained (deprecated). |
-| [Zig `std.crypto.nacl.SealedBox`](https://ziglang.org/documentation/master/std/#std.crypto.nacl.SealedBox) | Zig | MIT | — | Zig std | Supplies X25519 and BLAKE2b here; its XSalsa20-Poly1305 (one block per step) was replaced 2026-10-07 by a multi-block one, ~2x faster on 64 KiB. Ours also adds buffer/alloc APIs with typed errors, base64/hex key codecs (secret ones table-free, ctgrind-pinned), keypair recovery from a stored secret, and an external KAT and differential. |
+| [Zig `std.crypto.nacl.SealedBox`](https://ziglang.org/documentation/master/std/#std.crypto.nacl.SealedBox) | Zig | MIT | — | Zig std | Supplies BLAKE2b here (X25519 is ct25519's); its XSalsa20-Poly1305 (one block per step) is replaced by this module's multi-block one, ~2x faster on 64 KiB. Ours also adds buffer/alloc APIs with typed errors, base64/hex key codecs (secret ones table-free, ctgrind-pinned), keypair recovery from a stored secret, and an external KAT and differential. |
 
-**Where we are ahead:** over plain `std`: key text codecs with a measured constant-time claim, typed errors instead of assertions, fixed-size buffer API, PyNaCl differential in both directions · **Where we are behind:** speed, 1.14–1.29x libsodium (X25519 from std on small messages; libsodium's AVX2 Salsa20 on large ones), no full authenticated `crypto_box` (out of scope by design; see *Threat model / out of scope*).
-
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — public NaCl standard, no third-party code).
+**Where we are ahead:** over plain `std`: key text codecs with a measured constant-time claim, typed errors instead of assertions, fixed-size buffer API, PyNaCl differential in both directions · **Where we are behind:** speed, not at libsodium on every row (the card's Performance line: `open` of a large message is two passes over the ciphertext, and a 64-byte one is one X25519 ladder against libsodium's), no full authenticated `crypto_box` (see *What is deliberately not done*).
 
 ## Design & invariants
 
@@ -39,7 +39,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   plaintext, and prepend the ephemeral public key. `open` recomputes the nonce and unboxes; a
   forged/tampered ciphertext fails the Poly1305 tag (authenticated). Modeled after libsodium
   `crypto_box_seal` / Go `nacl/box` — the public NaCl sealed-box standard. BLAKE2b comes from
-  `std.crypto`, X25519 from the sibling `ct25519` (since 2026-10-09: comb base-point
+  `std.crypto`, X25519 from the sibling `ct25519` (comb base-point
   multiplication for the ephemeral key, MULX/ADX ladder for the shared secret on x86-64, std's
   ladder elsewhere; byte-exact with std's, held by ct25519's KATs and this module's PyNaCl and
   libsodium differentials); HSalsa20 for the shared key is `xsalsa20poly1305.zig`'s; XSalsa20-Poly1305 is this module's own (see the next point). Original work of the zig-libs
@@ -47,16 +47,25 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 - **Allocation-free**, reentrant; keys are fixed-size arrays. `publicFromSecret` (by pointer) /
   `keyPairFromSecretKey` recover a keypair from a stored secret (via ct25519's `X25519.recoverPublicKeyInto`)
   so a persisted secret round-trips. Serialization is fixed-size base64/hex with typed errors.
-- **One primitive implemented here, on purpose (2026-10-07):** XSalsa20-Poly1305
+- **One primitive implemented here, on purpose:** XSalsa20-Poly1305
   (`src/xsalsa20poly1305.zig`, `src/poly1305.zig`). std's computes one Salsa20 block and one
-  Poly1305 block per step, which held 64 KiB at 2.3–2.4x libsodium's time — performance 4 on a
-  consumed module, which the owner ruled must get faster rather than drop the axis. Salsa20 runs
+  Poly1305 block per step, which held 64 KiB at 2.3–2.4x libsodium's time (measured), too slow for a
+  consumed module. Salsa20 runs
   `lanes` blocks at once (state word i of every block in one `@Vector`, 8 with AVX2), Poly1305 runs
   four interleaved Horner chains over r^4 with 26-bit limbs, the last batch multiplied by
   r^4..r^1. Same algorithms, same output: held by differential tests against std over every
   length/counter edge (in-file), the PyNaCl KATs and the 2000-case libsodium differential, and
-  measured constant-time (`seal` 0 / `open` 1 = accept/reject, below). BLAKE2b is still std's;
-  X25519 is ct25519's (its own ctgrind rows).
+  measured constant-time (`seal` 0 / `open` 1 = accept/reject, below). BLAKE2b is std's;
+  X25519 is ct25519's (its own ctgrind rows). `lanes` is capped at 16 (`xsalsa20poly1305.zig:34`):
+  `xorBlocks` transposes `n x n` groups of the 16 state words, so with more lanes (Hexagon HVX and
+  RISC-V zvl1024b+ suggest 32 or more) there is no group and the keystream is never applied. A comptime
+  assert in `xorBlocks` (power of two, at most 16) and a test of every width 1–16 against std on every
+  host (`xorBlocks matches std at every batch width`) hold it.
+- **Dead-stack burn** (`src/burn.zig`): `seal`, `open`, `publicFromSecret` and `keyPairFromSecretKey`
+  run their body one frame down through `burn.run` and then zero `burn.x25519_burn` (8 KiB) of stack at
+  that depth; the four secret-key codecs call `burnCodecStack` (1 KiB). `seal` also zeroes the ephemeral
+  keypair and the shared key, `sharedKey` its Diffie-Hellman value. `stackprobe_test.zig` and
+  `stackprobe2_test.zig` go red when a body outgrows its burn.
 - **`openAlloc` allocates before the tag is verified** (audit finding L7): the output buffer is
   allocated first and freed via `errdefer` on a failed `open`. The amplification is bounded (1×:
   one allocation the size of the plaintext, freed immediately on failure, never leaked — see the
@@ -81,258 +90,136 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `encodeSecretKeyBase64`, `parseSecretKeyBase64`, `encodeSecretKeyHex`, `parseSecretKeyHex` — are
   table-free: no memory access in them has an address derived from key material, and no branch is
   taken on one, except the accept/reject the parsers return anyway. ⛔ This is **not** inherited
-  from `std`: `std.base64` and `std.fmt.bytesToHex`/`hexToBytes` are table-driven, and until
-  2026-09-09 these functions handed them secrets, which measured as **8 / 7 / 43 / 47** memcheck
-  contexts — 95 of them on a LOAD, i.e. `movzbl <table>(%secret)`, the cache-timing class of
-  T-table AES. The **public**-key codecs still use `std` on purpose: their input discloses nothing,
+  from `std`: `std.base64` and `std.fmt.bytesToHex`/`hexToBytes` are table-driven, so a secret handed to
+  them is a cache-timing oracle on a LOAD (`movzbl <table>(%secret)`), the class of T-table AES; measured
+  on the std-backed form as 8 / 7 / 43 / 47 memcheck contexts, 95 of them on a LOAD. The
+  **public**-key codecs still use `std` on purpose: their input discloses nothing,
   so a table lookup there is not a leak and a hand-written decoder would be a worse trade.
 - ⚠ **The claim above is held by optimisation barriers, not by how the code reads.** `ctEq`/`ctGe`
   launder their result mask through an empty `asm volatile` (`blackBox`, the montint `b199192`
-  idiom). Measured on this module: with the barrier on the *input* instead, LLVM still recognised
-  `ctEq(c,'+') & 62` as "62 or 0" and emitted a `test`/`je`. **Deleting `blackBox` as dead weight
+  idiom). With the barrier on the *input* instead, LLVM still recognises `ctEq(c,'+') & 62` as
+  "62 or 0" and emits a `test`/`je`. **Deleting `blackBox` as dead weight
   silently reverts this property**, and no value test can see it — `scripts/checks/ctgrind.sh sealedbox`
-  can, and its pins are exact. ⛔⛔ Verified by deploying the defect: with `blackBox` deleted,
-  only `b64dec`'s **count** moved (1 → 5) — the other three rows were caught **only** by the
-  source digest. Since base64 moved to `b64ct` (2026-11-08) `ctEq`/`ctGe` serve the hex codecs
-  only, and the defect re-deployed on 2026-11-09 moves **no** row's count: the source pin is
-  the whole gate for this barrier now (`b64ct`'s own ctgrind rows guard its decoder).
+  can, and its pins are exact. `ctEq`/`ctGe` serve the hex codecs only (base64 is `b64ct`'s), and
+  deleting `blackBox` moves no row's count: the source pin is the whole gate for this barrier (`b64ct`'s
+  own ctgrind rows guard its decoder).
 - **Out of scope:** key management/storage, secret zeroization beyond the copies this module
   holds, side-channel hardening of X25519/BLAKE2b beyond what `std.crypto` provides, and the full `crypto_box` (authenticated two-party) API.
 
-### Known limitations: two secrets `std.crypto` leaves outside this module's control (H2, M4)
+### Dead-stack residue and the zero-shared-secret check
 
-Both of the following were measured (audit findings H2, M4) and are real: the module's own
-`seal`/`open` do everything they can with the material they own (`seal`'s one `secureZero` on
-`ekp.secret_key` is the one copy this module directly holds and can wipe). What remains is
-inside the Zig standard library this module calls, not inside `modules/sealedbox/`, and the
-resolution — precedent set by the user's decision on `ecvrf` E4, the same class of finding —
-is **(b): document as a known limitation, here, with the exact location the secret remains.
-No report to Zig upstream, no vendored copy of the affected `std` code** (vendoring would
-reintroduce exactly the "no bespoke crypto" risk this module's own design section rules out,
-and turn one small, well-reviewed `std` file into a fork this repository would have to track
-against every future Zig release).
+The ephemeral secret, the clamped scalar and the shared key are handled in `ct25519` (`recoverPublicKeyInto`,
+`scalarmultInto`, which burn their own frames) and in this module (`sharedKey`, HSalsa20, the burn above), not in
+`std.crypto.nacl`'s `SealedBox`/`Box` or std's Curve25519 scratch, which do not wipe. From `std.crypto` the module
+takes BLAKE2b (its input, the two public keys, is public), the public-key codecs, the `KeyPair` type and
+`secureZero`; no secret passes through std's X25519 or `Box`. An all-zero shared secret (a low-order point) is rejected
+by `ct25519`'s `scalarmultInto` (`error.IdentityElement`, `ct25519/src/root.zig:643`), not by a check in the
+installed Zig toolchain's standard library, so the small-order-point rejection this module depends on is a
+property of this repository (`kat_test.zig` pins it for `seal` and for `open`).
 
-- **H2 — dead-stack copies of secret key material after `seal`/`open` return**, inside
-  `std.crypto.nacl.SealedBox`'s own dependencies: `X25519.KeyPair.generate`'s `random_seed`
-  (the raw ephemeral secret), `Curve25519.clampedMul`'s scratch scalar `t` (the CLAMPED
-  ephemeral secret during `seal`, and the recipient's own clamped long-term secret during
-  `open`), and `Box.createSharedSecret`'s derived XSalsa20 key — none of these are wiped by
-  `std`, and none are reachable from `modules/sealedbox/src/root.zig` to wipe on their behalf
-  (they live in stack frames `std`'s own functions own, several calls below this module's
-  code, and return before this module's `seal`/`open` do). Measured twice independently
-  (`A1/sealedbox.md` H2: an instrumented-`std` probe that reads the exact stack addresses
-  those functions used, and a second, uninstrumented raw dead-stack scan that agrees with
-  it) — both find the ephemeral secret (raw and clamped), the recipient's clamped long-term
-  secret after `open`, and the derived shared key, all still present after the call returns.
-  Since 2026-10-09 X25519 is ct25519's, whose `recoverPublicKeyInto`/`scalarmultInto` burn
-  their own frames, and the shared key is derived in this module (`sharedKey`, zeroed).
-- **M4 — the only barrier against a zero shared secret is a single `std` check, shared by 19
-  modules in this repository.** `X25519.scalarmult`'s `if (x2.isZero()) return
-  error.IdentityElement;` lives at `lib/std/crypto/25519/curve25519.zig` in the Zig
-  toolchain's own standard library — **not a file in `zig-libs`** at all, so there is nothing
-  in `modules/sealedbox/` (or in `modules/ct25519/`, or in any of the other 17 modules that
-  use X25519/Curve25519 the same way) that could be changed to add a second, independent
-  check. For `crypto_box_seal` itself this is not exploitable (an attacker who can seal
-  arbitrary plaintext gains nothing from a degenerate shared secret they chose themselves),
-  but it means the small-order-point rejection this module's behaviour depends on for other
-  callers is a property of the *installed compiler*, not of this repository, and would need
-  to be re-verified against any future Zig release that touches this file.
+Decision (the same class as `ecvrf` E4): where a secret remains inside `std` it is documented as a known limitation
+with its exact location; there is no report to Zig upstream and no vendored copy of the affected `std` code
+(vendoring would reintroduce the "no bespoke crypto" risk of this module's own design and a fork to track
+against every Zig release).
 
-These are the same two secrets `ecvrf` E4 named for the identical reason (both point back
-into `std.crypto.ecc.Edwards25519`/`Curve25519` internals this repository does not own);
-closing E4 as "document, don't chase" applies here without modification.
+## What is deliberately not done
+
+- **The full authenticated `crypto_box` (two-party) API.** The module is the anonymous-sender seal
+  (`crypto_box_seal`, the card's Scope); the authenticated box needs the sender's key and gives a different
+  guarantee. `std.crypto.nacl.Box` has it.
+- **Key management and storage; secret zeroization beyond the copies this module holds.** The module wipes what
+  it owns (the ephemeral keypair, the shared key, the dead stack, the caller-visible `wipe`); where a caller keeps
+  a key is the caller's.
+- **Side-channel hardening of BLAKE2b beyond what `std.crypto` provides** (its inputs here are public).
+- **A caller-supplied nonce.** The nonce is derived (`BLAKE2b-192(epk ‖ pk)`, libsodium's), so it cannot be reused.
 
 ## Verification
 
-### Audit 2026-11-13 (whole-module mutation run over the current src)
+`scripts/modtest sealedbox` (`zig build test-sealedbox`).
 
-Re-taken because 22 % of the production lines moved since 2026-10-08 (X25519 from ct25519, the
-dead-stack burns in `burn.zig`, vector loads in the cipher and Poly1305, the no-panic sweep fixes,
-the secret-key base64 on `b64ct`). Production code of `root.zig`, `xsalsa20poly1305.zig`,
-`poly1305.zig`, `burn.zig`; schemata in a detached copy; ReleaseSafe for every mutant, then the
-survivors and the burn group again in ReleaseFast where the stack probes run (M0 clean in every
-instrumented build, so the schemata did not distort the probes). **211 mutants: 183 killed, 28
-equivalent, 0 undecided.** Every guard, error mapping, offset and limb of the constant-time codecs,
-the cipher core and the Poly1305 path, every forged-ciphertext path (verdict skipped or inverted,
-15-byte tag compare, plaintext released early, authentication error swallowed) killed by the
-existing tests. Seven test gaps, closed: `open` with an `out` of the wrong size (`!=` → `>` let an
-oversized buffer reach `decrypt`'s length assert — a panic in ReleaseSafe, an out-of-bounds copy in
-ReleaseFast); the error-path frees of `sealAlloc`/`openAlloc`; a 44-character `==` secret-key text
-(31 bytes; `out` zeroed); dropping the carry after Poly1305's four-lane sum (random messages reach
-the breaking state about once in 2^23 — a crafted message with r = 1 reaches it every time);
-`burnCodecStack` checked directly on a dirtied frame (optimized builds); a `burn_top < 1024` pin
-for `open` as `seal` had (a pair mutant — `burn.run` bypassed and every body wipe skipped — is now
-killed for both). Equivalent: cost-only batch/block bounds (5: the same bytes take the single-block
-or tail path); `generateEphemeral`'s retry and `keyPairFromSecretKeyBody`'s errdefer wipe (an error
-ct25519 cannot return for a clamped scalar); `openBody`'s `sealed.len < overhead` conjunct (implied
-by `sealed.len != out.len + overhead`); an ignored `calcSizeForSlice` error (the 44-character guard
-above excludes it); 12 single body wipes made redundant by `burn.run` zeroing the body frames after
-return (the pair mutants show the probe sees their combination); `publicFromSecret`'s burn (its
-body touches the secret only inside ct25519, which burns its own frames); the codecs'
-`burnCodecStack` call (the codecs leave no residue — a guard, unobservable until a codec frame
-retains key bytes); `stack(n/2)` and `stack(n/4)` (slack in the 8 KiB constant; `stack(n/8)` is
-killed). Not mutated: `timing_safe.eql` → `std.mem.eql` in `decrypt` and the `blackBox` asm (no
-value test can see them; held by the ct-compare and ctgrind pins), comptime-only lane caps,
-transpose masks and asserts (the transpose itself is mutated at run time), and arid code.
+- **Tests by area.** Construction and round trips (`root.zig`): buffer and allocating APIs at various sizes
+  including empty, a wrong-sized `out` as an error, tampering with the box or the ephemeral-key prefix, a wrong
+  recipient, short or garbage ciphertext, a forged tag that agrees with the real one in its first 1/2/4/8
+  bytes, a degenerate/small-order recipient key or ephemeral key (`kat_test.zig`), RFC 7748 X25519 vectors, key
+  text codecs (exact strings, malformed input as typed errors, the secret parsers zeroing `out` on every error,
+  a key whose base64 uses both `+` and `/`). Primitives (`xsalsa20poly1305.zig`, `poly1305.zig`): differential
+  against std over lengths and counters, at every lane width 1–16, in place against out of place, the
+  Poly1305 reduction edge states against a wide-integer reference, the RFC 8439 vector. No-panic sweep
+  (`sweep_test.zig`): `sealedLen` saturates, every ciphertext shorter than the overhead, a wrong-size `out` in
+  both directions, the allocating variants free on every error, a 44-character `==` secret-key text.
+  Stack probes (`stackprobe_test.zig`, `stackprobe2_test.zig`, optimized builds): `wipe` survives the
+  optimiser, the secret-key codecs leave neither text nor key on the dead stack, no recipient-secret residue after
+  `open` or the key rebuild.
+- **Constant-time anchor:** `scripts/checks/ctgrind.sh sealedbox` (valgrind/memcheck, ReleaseFast, the
+  secret — or, for the parsers, the secret-derived text — marked undefined). Pinned in
+  `scripts/checks/ctgrind-expected.tsv`, exact, with an untainted control row and a no-`-fvalgrind` trap row
+  at 0 beside each:
 
-### Audit 2026-10-08 (review + mutation over the current src)
+  | target | in-file | why |
+  |---|---:|---|
+  | `hexenc` / `b64enc` | **0** | pure arithmetic; the only indexed load left is `key[i]` over the loop counter |
+  | `hexdec` | **1** | `if (invalid != 0)` — the accept/reject the parser returns to its caller. ⛔ A pin of 0 here would be wrong; what the claim forbids is an early exit revealing WHICH character was bad, and the decode loops contribute 0 |
+  | `b64dec` | **0** | decoded by `b64ct`, which makes the verdict (and the padding count) public by contract and declassifies them (`b64ct` SPEC § declassifications) — so the accept/reject is not reported |
+  | `seal` | **0** | XSalsa20-Poly1305 encrypt, key and plaintext tainted, 1100 B so every batch/tail path of both primitives runs |
+  | `open` | **1** | decrypt, key tainted: `if (!ok)`, the accept/reject `open` returns. The harness declassifies that verdict before its own `try`, which LLVM would otherwise count as a second context (the verdict compiles to a select) |
 
-Review: the 2026-10-07 primitives (`xsalsa20poly1305.zig`, `poly1305.zig`) line by line (§ Backlog
-"Reviewed 2026-10-08", one HIGH fixed) and the new `seal`/`open` glue in `root.zig`: nonce =
-BLAKE2b-192(epk ‖ pk) as libsodium's `crypto_box_seal_nonce`, shared key = std's
-`Box.createSharedSecret` (X25519 + HSalsa20, rejects the identity; since 2026-10-09 the same
-composition inlined as `sharedKey` over ct25519's X25519 and this module's HSalsa20), ephemeral secret and shared key
-zeroed, tag at `out[32..48]`, nothing written to `out` before the tag verifies; both error sets
-still the named ones. Re-checked independently: the final reduction's `|`-assembly of `acc` is
-sound — limb 1 can reach 2^26 only when the carry rippled through limbs 2–4, which leaves it small.
-
-Mutation schemata (ReleaseSafe, one binary): 39 mutants — glue (size checks, nonce argument order
-on both sides, tag offset, shared-key input), XSalsa20 (head length, block counter, verify skipped,
-tag compared on 15 bytes, counter high word, batch counter step, rotation, a transpose stage,
-HSalsa20 output word, extended nonce words, tail copy, feed-forward), Poly1305 (clamp, carry ×5,
-2^128 bit, padded-block bit, batch bound, tail powers, final select, +5, ×5, pad add, last carry,
-a product term, r^3, lane sum, carry tail) and the constant-time codecs (padding, canonical tail,
-`A`/no-match ambiguity, hex invalid flag, zeroing on error, hex alphabet). **39/39 killed** after
-two tests the first run asked for (37/39):
-- `finish` (the full reduction, split out of `create` for it) dropping its last carry survived:
-  random messages never reach limbs 2..4 all ones with limb 1 at 2^26. New test drives the edge
-  states against a wide-integer reference.
-- `parseSecretKeyBase64` not zeroing `out` on a rejected text survived — the doc promises it, and
-  the constant-time parser has decoded the whole key into `out` by then. New test checks every
-  error path of both secret parsers.
-
-
-RFC 7748-cross-checked X25519 KATs, end-to-end serialize→deserialize→seal→open, tamper/forgery
-rejection, and malformed-key-input typed errors. Run: `zig build test-sealedbox`.
-
-**Constant-time anchor:** `scripts/checks/ctgrind.sh sealedbox` (valgrind/memcheck, ReleaseFast, the
-secret — or, for the parsers, the secret-derived text — marked undefined). Pinned in
-`scripts/checks/ctgrind-expected.tsv`, exact, with an untainted control row and a no-`-fvalgrind` trap row
-at 0 beside each:
-
-| target | in-file | why |
-|---|---:|---|
-| `hexenc` / `b64enc` | **0** | pure arithmetic; the only indexed load left is `key[i]` over the loop counter |
-| `hexdec` | **1** | `if (invalid != 0)` — the accept/reject the parser returns to its caller. ⛔ A pin of 0 here would be wrong; what the claim forbids is an early exit revealing WHICH character was bad, and the decode loops contribute 0 |
-| `b64dec` | **0** | decoded by `b64ct`, which makes the verdict (and the padding count) public by contract and declassifies them (`b64ct` SPEC § declassifications) — so the accept/reject is not reported; was 1 while the module had its own base64 (until 2026-11-08) |
-| `seal` | **0** | XSalsa20-Poly1305 encrypt, key and plaintext tainted, 1100 B so every batch/tail path of both primitives runs (added 2026-10-07) |
-| `open` | **1** | decrypt, key tainted: `if (!ok)`, the accept/reject `open` returns. The harness declassifies that verdict before its own `try`, which LLVM would otherwise count as a second context (the verdict compiles to a select) |
-
-**Value equivalence** is proved separately and exhaustively: every one of the 64 base64 indices, all
-256 characters through both parsers, all 16 nibbles, plus 512 random keys checked against the
-`std`-backed public-key codecs sitting next to them in the same binary. ⭐ That exhaustive agreement
-is also the reminder that it proves the *values*: `hqc`'s table lookup agreed with its replacement
-on all 65 536 pairs and still leaked, because what differed was the access pattern.
-
-**External anchor for the seal/open composition (`kat_test.zig` / `kat_vectors.zig`, added
-2026-07-28):** the tests above only round-trip through this module's own `seal`/`open` — a shared
-misreading of the spec on both sides would still pass. Two independent anchors close that:
-
-1. **Underlying `crypto_box_easy` layer** — the classic djb/NaCl `crypto_box` test vector (Alice's
-   secret key + Bob's public key = RFC 7748 §6.1's own X25519 test keypairs, a fixed nonce, and a
-   published ciphertext) from libsodium's `test/default/box.c` + `box.exp`
-   (github.com/jedisct1/libsodium, fetched 2026-07-28). `std.crypto.nacl.Box.seal`/`.open` — the
-   primitive `SealedBox` composes on top of — reproduces the published 147-byte
-   `tag ‖ ciphertext` byte-exact on the first try.
-2. **The full `crypto_box_seal` composition** (ephemeral key + BLAKE2b nonce + box) — libsodium's
-   *own* test suite (`test/default/box_seal.c`) cannot publish a fixed expected ciphertext because
-   `crypto_box_seal` uses a random ephemeral key by construction (confirmed by reading that file:
-   it only checks a random round-trip). This module's `seal(io, ...)` takes its ephemeral-key
-   entropy through the caller-supplied `io: std.Io`, so a test `Io` whose `.random` returns a fixed
-   32-byte seed (RFC 7748 "Alice", reused as an arbitrary constant) makes the *entire* composition
-   deterministic through the real, unmodified `seal()` — no source change. The expected output was
-   computed independently via **PyNaCl** (a CFFI binding to the real libsodium C library, not this
-   module) directly calling `crypto_scalarmult_base` / `crypto_generichash` (BLAKE2b-192) /
-   `crypto_box` in the same order as libsodium's own `crypto_box_seal.c`
-   (confirmed by reading that file). Result: byte-exact match on the first run — no
-   interoperability divergence found. Teeth confirmed: corrupting one byte of the expected vector
-   produces a real, reported mismatch (verified, then reverted).
-3. **What remains unanchored, and why that's the honest limit:** libsodium's own published test
-   data for `crypto_box_seal` itself is inherently non-deterministic (random ephemeral key), so no
-   third-party-*published* fixed `crypto_box_seal` ciphertext exists anywhere to paste in; the
-   vector above is the closest achievable substitute (real libsodium code, fixed inputs we chose),
-   not a vector libsodium itself publishes.
+- **Value equivalence** of the constant-time codecs is proved separately and exhaustively: every one of the 64
+  base64 indices, all 256 characters through both parsers, all 16 nibbles, plus 512 random keys checked against the
+  `std`-backed public-key codecs sitting next to them in the same binary. ⭐ That exhaustive agreement
+  proves the *values*: `hqc`'s table lookup agreed with its replacement on all 65 536 pairs and still leaked,
+  because what differed was the access pattern.
+- **External anchor for the seal/open composition (`kat_test.zig` / `kat_vectors.zig`):** round trips through
+  this module's own `seal`/`open` alone would pass a shared misreading of the spec on both sides. Two independent
+  anchors close that:
+  1. **Underlying `crypto_box_easy` layer** — the classic djb/NaCl `crypto_box` test vector (Alice's secret key +
+     Bob's public key = RFC 7748 §6.1's own X25519 test keypairs, a fixed nonce, and a published ciphertext) from
+     libsodium's `test/default/box.c` + `box.exp`. `std.crypto.nacl.Box.seal`/`.open` — the primitive
+     `SealedBox` composes on top of — reproduces the published 147-byte `tag ‖ ciphertext` byte-exact.
+  2. **The full `crypto_box_seal` composition** (ephemeral key + BLAKE2b nonce + box) — libsodium's own test
+     suite (`test/default/box_seal.c`) cannot publish a fixed expected ciphertext because `crypto_box_seal` uses a
+     random ephemeral key by construction (it only checks a random round trip). This module's `seal(io, ...)` takes
+     its ephemeral-key entropy through the caller-supplied `io: std.Io`, so a test `Io` whose `.random` returns a
+     fixed 32-byte seed (RFC 7748 "Alice", reused as an arbitrary constant) makes the *entire* composition
+     deterministic through the real, unmodified `seal()`. The expected output was computed independently via
+     **PyNaCl** (a CFFI binding to the real libsodium C library, not this module) directly calling
+     `crypto_scalarmult_base` / `crypto_generichash` (BLAKE2b-192) / `crypto_box` in the same order as
+     libsodium's own `crypto_box_seal.c`. Each anchor has a TEETH test that corrupts the expected vector and
+     expects the mismatch to be reported.
+  3. **What remains unanchored, and why that is the honest limit:** libsodium's own published test data for
+     `crypto_box_seal` itself is inherently non-deterministic (random ephemeral key), so no third-party-*published*
+     fixed `crypto_box_seal` ciphertext exists to paste in; the vector above is the closest achievable
+     substitute (real libsodium code, fixed inputs we chose), not a vector libsodium itself publishes. The
+     bidirectional PyNaCl differential (*Anchoring*) covers the rest.
+- **Fuzz:** `SEALEDBOX_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver; never `zig build --fuzz`) runs
+  two harnesses, `sealedbox_open` (arbitrary ciphertext bytes: opened, refused, never a panic) and
+  `sealedbox_seal` (arbitrary plaintext: the result opens back), with a 500-seed in-suite run that checks every
+  outcome label is reached (`src/fuzz_test.zig`).
+- **What mutation does not reach:** `timing_safe.eql` against `std.mem.eql` in `decrypt` and the `blackBox`
+  asm (no value test can see them; the ct-compare and ctgrind pins hold them), comptime-only lane caps,
+  transpose masks and asserts, and arid code. Equivalent mutants are cost-only batch/block bounds, retries
+  and error wipes of conditions ct25519 cannot return, and body wipes made redundant by `burn.run`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-sealedbox`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.78–1.04×, against 0.86–1.13× before. The card carries these figures; what follows is the earlier measurement.
-
-`zig build bench-sealedbox` (ReleaseFast both sides, best of five batches over 100 ms, a box
-libsodium sealed must open here first), 2026-10-07, same host, libsodium 1.0.18:
-
-| workload | before (std XSalsa20-Poly1305) | after (own, multi-block) |
-|---|---:|---:|
-| seal 64 B | 1.29x | 1.29x |
-| open 64 B | 1.23x | 1.25x |
-| seal 64 KiB | 2.31x | **1.21x** |
-| open 64 KiB | 2.39x | **1.14x** |
-
-2026-10-09, X25519 from ct25519 (worst of three `bench-sealedbox` runs on a quiet host, ours
-stable within 1 %, libsodium's own time moving up to 7 % between runs): seal 64 B **0.86x**,
-seal 64 KiB **0.93x**, open 64 B 1.11x, open 64 KiB 1.13x. What keeps P at 3 is `open`: the
-64 KiB row is the bulk path (Poly1305 over the ciphertext, then Salsa20 — two passes), the
-64 B row is one X25519 ladder against libsodium's.
-
-Zig 0.17.0 (2026-10-18, loaded machine, not a quiet-host figure): LLVM 22 lowered the keystream
-`[4n]u8` <-> `@Vector(n, u32)` XOR byte by byte (0.68-1.20x libsodium, seal 64 KiB 1.20x); after the
-spelling fix (see CHANGELOG) the range is 0.77-1.04x. The 0.86-1.13x card above is the 2026-10-09
-quiet-host measurement; re-measure on a quiet machine before changing it.
-
-Components on 64 KiB (scratch microbench, same host): Salsa20 0.51 → 2.38 GB/s, Poly1305
-1.41 → 2.92 GB/s. Small messages are X25519 (std's, ~1.25x libsodium's) and did not move.
-
-History, audit finding M5: an earlier record (`20260808-zig-libs-audit/modules/sealedbox.md` B3)
-claimed this module "INHERITS std X25519 ... (NOT a finding)" citing a measurement made for a
-*different* module; measured directly on 2026-09 (2.36x / 2.80x on 64 kB), which led to the rewrite.
+`zig build bench-sealedbox` (`tools/bench.zig`; ReleaseFast both sides, best of several batches, a box libsodium
+sealed must open here first) compares `seal` and `open` at 64 B and 64 KiB with libsodium's `crypto_box_seal`;
+the card's Performance line carries the figures. The 64 KiB rows are the bulk path (for `open`, Poly1305 over
+the ciphertext and then Salsa20: two passes); the 64 B rows are one X25519 ladder against libsodium's.
+Salsa20 bulk is near the AVX2 limit of the 32-bit-lane schedule (rotations by 7/9/13/18 are no byte
+shuffle), so further bulk gain would come from fusing the Poly1305 pass into the encrypt loop.
 
 ## Backlog / deferred
-- **Delta review 2026-11-02** *(read-only, independent, `ec102183..` of `src/`)* — covered the changes since the 2026-10-08 audit, not the whole module, with no mutation run, so the `**Audit:**` line stays stale on purpose (A1 needs a mutation run over the current source). Found `seal` without the burn (fixed). Open: the sweep's low-order ephemeral test accepts any of three errors; `kat_test` pins `IdentityElement`, so coverage exists.
 
-- **Own lane-parallel Poly1305 duplicates `chachapoly`'s** (found 2026-10-17 triaging a router-tool consumer size request): src/poly1305.zig
-  (306 lines, 4-way, 26-bit limbs) and chachapoly/src/poly1305.zig (1455 lines, L-lane) are two independent implementations of the
-  same thing (~9.5 KB of the router-tool consumer's binary is this copy). Dedupe: use chachapoly's (or one shared module), keep the differential tests
-  against std; check grade/ctgrind of both. Salsa20 (~4.6 KB) has no sibling — stays. Separately, a `.small` profile could pick a
-  scalar Poly1305 (CONVENTIONS §4.2) — measure after the dedupe.
-- **Speed to parity (P2 needs ≤ 1x on every row)** *(bench 2026-10-07)*: the bulk rows were
-  fixed by the multi-block rewrite (2.3–2.4x → 1.14–1.21x); (a) X25519 was std's, ~1.25x
-  libsodium on every message size — replaced by ct25519's on 2026-10-09 (seal 64 B ~0.75x,
-  open 64 B ~1.0–1.1x, noisy host; see Performance); (b) Salsa20 at
-  2.4 GB/s is near the AVX2 limit of the 32-bit-lane schedule (rotations by 7/9/13/18 are no
-  byte shuffle), so further bulk gain would come from fusing the Poly1305 pass into the
-  encrypt loop (one read of the ciphertext instead of two). Not measured against the fastest
-  field implementation yet (`fastest ?`).
-- **Reviewed 2026-10-08: `xsalsa20poly1305.zig` + `poly1305.zig`** (line-by-line review of the
-  2026-10-07 primitive code; the 2026-07-10 review and the 2026-09-16 audit covered a std
-  wrapper). One HIGH finding, fixed:
-  - **R1 (HIGH, fixed 2026-10-08)**: `lanes` came straight from `suggestVectorLength(u32)`,
-    which is 32+ on Hexagon HVX and RISC-V zvl1024b+. `xorBlocks` transposes `n x n` groups of
-    the 16 state words, so with `n > 16` it has no group and never writes `out`: an in-place
-    `seal` of ≥ 2 KiB left the plaintext as the "ciphertext" (out-of-place left `out` as it
-    was). Probed on x86 by calling `xorBlocks(32, …)`: output untouched. The differential tests
-    only ran the host's width. Fix: `lanes` capped at 16, a comptime assert in `xorBlocks`
-    (power of two, ≤ 16), and a test of every width 1–16 against std on every host. Never
-    shipped in a tag (the rewrite was still Unreleased).
-  - Checked clean: Salsa20 quarter-round and column/row order, state layout, 64-bit counter
-    words with the carry inside a batch, HSalsa20 output words, block 0 = Poly1305 key + first
-    32 message bytes, tag verified before any plaintext is written, exact in-place aliasing;
-    Poly1305 clamping, the 4-lane Horner split (lane j of the last batch × r^(4−j)), limb
-    bounds (every column < 2^60, every u32 truncation lossless), the final carry (limb 1 ≤ 2^26
-    only in the case that re-normalises in the next step) and the branch-free `h ≥ p` select.
-    Big-endian keystream path run under qemu (s390x, ppc64 pwr9), all tests incl. every width.
-    ctgrind seal 0 / open 1 unchanged.
-  - Not covered: secret material left on the dead stack by the new code (keystream vectors,
-    HSalsa20 state, Poly1305 r/s) — the H2 class above, unchanged by the rewrite.
-
-- **Reviewed 2026-07-10** (adversarial security pass, alongside `hashdigest`) — clean: faithful
-  `std.crypto` wrapper, no accidental weakening (key/nonce reuse, truncation, or a silent fallback
-  to something weaker) found.
-- No other gaps found — the full `crypto_box` (authenticated two-party) API and secret zeroization
-  are documented out-of-scope, not v1 gaps.
-
-## Status
-
-`extract · any · util · reentrant` + deps: none (`std.crypto` only) — canonical source is
-`pub const meta` in src/root.zig.
+- **Own lane-parallel Poly1305 duplicates `chachapoly`'s:** `src/poly1305.zig` (4-way, 26-bit limbs) and
+  `chachapoly/src/poly1305.zig` (L-lane) are two independent implementations of the same thing (about 9.5 KB of
+  a router-tool consumer's binary is this copy). Dedupe: use chachapoly's (or one shared module), keep the
+  differential tests against std; check grade/ctgrind of both. Salsa20 (about 4.6 KB) has no sibling and stays.
+  Separately, a `.small` profile could pick a scalar Poly1305 (CONVENTIONS §4.2): measure after the dedupe.
+- **Speed to parity (P2 needs at most 1x on every row):** fuse the Poly1305 pass into the encrypt/decrypt
+  loop (one read of the ciphertext instead of two). Not measured against the fastest field implementation yet
+  (the card's `fastest ?`).
 
 ## Anchoring
 

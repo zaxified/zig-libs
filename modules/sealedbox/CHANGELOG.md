@@ -5,16 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** audit recorded from the whole-module mutation run (183/211 killed, 28 equivalent, 0 undecided); ctgrind source digests re-pinned (test blocks added, contexts unchanged).
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE (tests only):** whole-module mutation run (211 mutants, ReleaseSafe + ReleaseFast stack probes) found seven test gaps, now closed: `open` with an `out` buffer of the wrong size (either direction), `sealAlloc`/`openAlloc` freeing on error, `parseSecretKeyBase64` on a 44-char `==` text (31 bytes), Poly1305's carry after the four-lane sum (a crafted message; random ones reach that state once in ~2^23), `burnCodecStack` itself (direct dead-stack test), and the `burn_top < 1024` pin for `open` (as `seal` has: without it, `open` with no burn and no body wipes passed the probe).
-- **2026-11-09** — **NO CONSUMER-VISIBLE CHANGE:** the ctgrind pin of `b64dec` is 0 (was 1): `b64ct` declassifies the verdict it returns, so the accept/reject is no longer reported; re-deploying the deleted-`blackBox` defect now moves no row's count (the source pin holds that barrier alone, SPEC + `ctgrind-expected.tsv`). The `tools/` driver recipe lists the module's dependencies again (`ct25519`, `b64ct`, `entropy`, `zl_options`).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the secret key's base64 encode/decode (`encodeSecretKeyBase64`, `parseSecretKeyBase64`) runs on `b64ct.standard` (new dependency) instead of a private table-free copy (`ctB64Char`/`ctB64Index`); same 44-char strict format and error mapping. The constant-time hex helpers stay here.
 - **2026-11-02** — **NO CONSUMER-VISIBLE CHANGE:** `seal` runs under the module's dead-stack burn like `open`, which wipes about 2.1 KiB of its frames that were left behind. The probe now covers `seal` with its ephemeral key, X25519 output and box key as needles (none was found, with or without the burn), and a 4 KiB message.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE (fix only):** no-panic sweep + blind review (§ GP). `sealedLen(maxInt(usize))` overflowed; it saturates (`sealAlloc` then reports `OutOfMemory`). Tests: `src/sweep_test.zig`.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: SPEC: 0.17.0 performance notes added from the migration reports; the 0.16 tables are labelled as such.
 
 - **2026-10-18** — Zig 0.17 codegen: LLVM 22 lowers a byte-array <-> wider-lane vector `@bitCast` byte by byte; the keystream XOR (`[4n]u8` <-> `@Vector(n, u32)`) now goes through `@Vector(n, u8)` and a vector -> vector `@bitCast` (one vector move, same little-endian-logical meaning on every target). Spelling only: no new branch or index, no API change.
 - **2026-10-18** — Ported to Zig 0.17.0. `xsalsa20poly1305.zig`: removed the big-endian `@byteSwap` of the keystream (0.17 array<->vector `@bitCast` is little-endian on every target, so the swap would have been a double swap on BE; LE behaviour unchanged). Test `msgs` made `comptime`.
@@ -51,7 +45,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   XSalsa20 batch width came straight from `std.simd.suggestVectorLength(u32)`; at 32+
   lanes (Hexagon HVX, RISC-V zvl1024b+) the keystream was never applied to messages
   of ≥ 2 KiB, so `seal` produced plaintext. Width now capped at 16, with a test of
-  every width against std on every host (review R1, SPEC.md § Backlog). x86, ARM and
+  every width against std on every host (review R1, SPEC.md *Design & invariants*). x86, ARM and
   the other targets were not affected; no tagged release contained the bug.
 - **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE (same bytes, faster):** `seal`/`open`
   no longer call `std.crypto.nacl.SealedBox`; they compose std's X25519 and BLAKE2b
@@ -64,10 +58,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   On a failed `open`, `out` is now left untouched (std wrote to it). Two new ctgrind
   rows, `seal` 0 and `open` 1 (accept/reject); the four codec rows re-pinned for the
   `root.zig` source digest only. `SealedBox` (the std re-export) is unchanged.
-- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
-  bodies are now generic over their source and run by testkit's deterministic
-  driver `SEALEDBOX_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
-  every test run); test code only. New `tools/bench.zig` (`zig build bench-sealedbox`) against libsodium `crypto_box_seal`.
 - **2026-09-16** — **BREAKING:** the secret-key text codecs that measured a
   leak write into caller buffers (audit A1 L8, a measured defect on a module
   with no consumer — the QUESTIONS-ROUND-2 Q3 rule).
@@ -87,33 +77,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `stackprobe_test.zig` gains a test asserting that every secret-key codec
   leaves neither the text nor the key behind.
 
-- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE (test-only):** audit finding
-  L4. The property `wipe` exists for — that the optimiser cannot remove its
-  zeroing — had no test that could see it: `wipe: the encoded secret really is
-  gone` reads the buffer right after wiping it, which keeps even a plain
-  `@memset` alive, and the audit's mutant swapping `secureZero` for `@memset`
-  passed every test. New `stackprobe_test.zig` forces a buffer into memory by
-  volatile writes, wipes it, never reads it again and scans the dead stack
-  after return, beside a negative and a positive control. Measured at
-  ReleaseFast in the full test binary: `secureZero` 0/5, `@memset` 5/5, a no-op
-  5/5. Imported from `kat_test.zig`, so `root.zig` and its ctgrind digest do not
-  move.
 
-- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (doc-only):** `SPEC.md`
-  gains a "Known limitations" section documenting audit findings H2 and
-  M4 by exact location instead of leaving them open. Both point into the
-  Zig standard library this module calls (`std.crypto.nacl.SealedBox`'s
-  dependencies for H2's dead-stack secret copies; `lib/std/crypto/25519/
-  curve25519.zig`'s single `IdentityElement` check, shared by 19 modules
-  in this repository, for M4), not into `modules/sealedbox/`. Resolution
-  follows the precedent the user set for the identical class of finding
-  on `ecvrf` E4 (variant (b): document with the exact location, no
-  upstream report, no vendored copy — vendoring would reintroduce the
-  "no bespoke crypto" risk `SPEC.md`'s own design section rules out and
-  turn a small `std` file into a fork this repository would have to
-  track against every Zig release). Neither finding's underlying
-  behaviour changed; `grep -c "curve25519.zig\|H2 —\|M4 —\|Known limitations"
-  SPEC.md` is 0 before this entry, 4 after.
 
 - **2026-09-10** — A1 fix campaign, audit findings H1/M2/L2/L5/L6/L7 (0 consumers in the repo, `DECISIONS.md` P1/P4). ⏸ Root-cause note: every edit below that touches `src/root.zig` (L2, L6) invalidates the `scripts/checks/ctgrind-expected.tsv` source-digest pin for this module (the digest is a hash over `root.zig` alone, since `src_digest` only hashes files that are both named by `PATTERN` and present in `src/`) and is **deferred for `--update-digests` re-pin at the end of the campaign**; the test-only and doc-only changes (H1, M2, L5, L3, L7, M5) touch `kat_test.zig`/`example/`/`SPEC.md` and do NOT move that digest.
   - **H1 (HIGH):** the AEAD tag check this module relies on (`std.crypto.timing_safe.eql` in std) had no test distinguishing a full 16-byte comparison from a weakened prefix comparison — measured 2026-09-09, every truncation from 1 to 15 bytes survived the suite (20/20 forgeries accepted under a 1-byte check). `kat_test.zig` gains a deterministic ladder test (N = 1/2/4/8): a tag built to match a real one in its first N bytes and provably differ at byte N is asserted to still be rejected. **NO CONSUMER-VISIBLE CHANGE** (test-only); does not touch `root.zig`.
@@ -125,11 +89,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   - **M5:** `SPEC.md` gains a measured Performance section (seal/open vs libsodium at 32B/1kB/64kB) replacing a stale citation from a different module's measurement. Doc-only.
   - **L3:** a stale example comment describing `seal`'s buffer-size check as `std.debug.assert` (the code moved to a real error on 2026-08-23, the comment didn't) is corrected.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** a KAT vector whose base64 contains both `+` and `/` (audit finding L1). Mutation M13 — the decoder switched to the URL-safe alphabet — was caught only **by luck**: both fixed KAT strings in this module contain neither character, so the only test that could see the swap encoded a freshly generated key and its verdict rode on entropy (P ≈ 0.255 per key, two keys, measured RED 11 / GREEN 1 of 12). The new vector puts indices 62 and 63 in three different 6-bit positions and drives BOTH paths — the still-`std`-backed public codec that M13 mutated, and this module's own constant-time secret codec, which must agree character for character. It also asserts that the URL-safe spelling of the same key is **rejected** by both, which is what makes it a test of the alphabet rather than of a string. Verified by deploying M13: the new test fails on every run, by construction rather than by chance.
 
 - **2026-09-09** — **BEHAVIOURAL, not breaking: the four SECRET-key text codecs are now constant-time.** `encodeSecretKeyBase64`, `parseSecretKeyBase64`, `encodeSecretKeyHex` and `parseSecretKeyHex` no longer route key material through `std.base64` / `std.fmt`, which are table-driven. ⛔⛔ Measured before the change (`scripts/checks/ctgrind.sh sealedbox`): **8 / 7 / 43 / 47** memcheck contexts, 95 of them on a LOAD, and the disassembly showed `movzbl 0x…(%rax),%eax` over a secret character (std's 256-byte `char_to_index`) and `movzbl 0x…(%r8),%esi` over a secret 6-bit group (std's 64-byte alphabet) — **secret-indexed table lookups, the cache-timing class of T-table AES**. After: **encoders exact 0, parsers exact 1**, and the 1 is `if (invalid != 0)`, the accept/reject the parser returns anyway (a 0 there would be the wrong pin — the decode loops contribute 0, so there is no early exit revealing WHICH character was bad). ⭐⭐ The `out_sha` pins did not move by a single bit: the branch changed, the result did not. Behaviour a caller can observe is unchanged except that the base64 parser now also rejects a **non-canonical final group** (the last 6-bit value's spare 2 bits must be zero, RFC 4648 §3.5) — `std`'s decoder rejected that too, so this is preserved, not new. ⚠ **The public-key codecs still use `std`, deliberately:** their input discloses nothing, so a table lookup there is not a leak and hand-rolling them would be a worse trade. ⚠ The claim is held by optimisation barriers (`blackBox`, the montint `b199192` idiom), not by how the code reads — with the barrier on the *input* instead of the result mask, LLVM still turned `ctEq(c,'+') & 62` into a `test`/`je`; **deleting `blackBox` as dead weight silently reverts the property** and no value test can see it. SPEC.md gains a "Constant-time scope" statement and names the anchor. Value equivalence is proved exhaustively (all 64 indices, all 256 characters through both parsers, all 16 nibbles, and 512 random keys cross-checked against the std-backed public-key codecs in the same binary); ⭐ a KAT caught a real bug in the first draft, where a mask was sixteen bits wide instead of one.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, which also puts this module in the `ct` class and therefore in `scripts/checks/ctgrind.sh`. It settles a contradiction the 2026-09-09 ctgrind coverage pass left standing: the pass filed `sealedbox` as a thin wrapper over `std` with nothing of its own to measure, while this module's audit record said the secret-key codecs light up immediately. ⭐ Both were right, about different functions — `seal`/`open` ARE pure `std.crypto.nacl.SealedBox` and are deliberately NOT targets, but `encodeSecretKeyBase64`/`parseSecretKeyBase64`/`encodeSecretKeyHex`/`parseSecretKeyHex` hand 32 bytes that grant full decryption capability to `std.base64` and `std.fmt`, neither of which claims to be constant-time. Measured ReleaseFast with the secret (or, for the parsers, the secret-derived TEXT) marked undefined: **43 / 47 / 8 / 7 in-file contexts**, each with an untainted control row and a no-`-fvalgrind` trap row at 0. ⛔⛔ **These are not artefacts and not merely branches:** 95 of them are reported on a LOAD, and the disassembly shows `movzbl 0x100fde8(%rax),%eax` over a secret byte (the 256-byte `char_to_index`) and `shr $0x34 / and $0x3f / movzbl 0x100ff2e(%r8)` over a secret 6-bit group (the 64-byte alphabet) — secret-indexed table lookups, the cache-timing class of T-table AES. ⚠ Sharpness follows table size, so the 256-byte decode table is the worst of the four and the 16-byte hex table the mildest; the counts are unrolled iterations, not severity. The rows are pinned **as a DEFECT**: the module is not fixed by this entry, and constant-time secret-key codecs remain owed.
 
 - **2026-09-07** — `fuzzOpen` had only ever opened a zero-length ciphertext. It drew the
   length FIRST with `smith.valueRangeAtMost(u16, 0, 256)` and read the bytes into

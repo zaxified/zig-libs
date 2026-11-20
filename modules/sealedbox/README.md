@@ -6,7 +6,8 @@ message); the recipient cannot identify the sender.
 
 - Byte-compatible with libsodium's `crypto_box_seal`. BLAKE2b comes from
   `std.crypto`, X25519 from the sibling `ct25519` (byte-exact with std's, faster); XSalsa20-Poly1305 is the module's own multi-block version
-  (same output as std's, ~2x faster on large messages; see SPEC.md § Performance).
+  (same output as std's, ~2x faster on large messages; see SPEC.md *Performance*). Dependencies: `ct25519`, and
+  `b64ct` for the secret-key base64 codec.
 - **Model after:** libsodium `crypto_box_seal` / Go `nacl/box`.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant.
   **Allocation:** none in the buffer API; `*Alloc` variants allocate the result.
