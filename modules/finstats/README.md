@@ -15,10 +15,8 @@ GPD tails, factor attribution, probability of backtest overfitting. Scalar
 functions return the number; series and table functions take the allocator first
 and return an owned slice or a result struct.
 
-Until step R of the dataframe split (2026-11-08) these lived in `finstats.slice`
-next to `Dataset` functions of the same names; the `Dataset` functions are gone
-with the `dataset` module, and `finstats.slice` stays one release as a deprecated
-alias of the root.
+`finstats.slice` is a deprecated alias of the root namespace, kept for one release:
+`finstats.slice.X` is `finstats.X`.
 
 ```zig
 const fs = @import("finstats");
@@ -38,7 +36,7 @@ Nothing panics.
   subset — mirrored, not invented.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
   **Concurrency:** reentrant (no shared state).
-- **Depends on:** nothing. **f64 throughout** — no
+- **Depends on:** `datefmt` (civil calendar arithmetic). **f64 throughout** — no
   `decimal` dependency: risk statistics are inherently floating-point;
   `decimal` is for exact ledger arithmetic, not variance/quantile math.
 
@@ -79,7 +77,7 @@ functions against empyrical on a 1 M-return series (`zig build bench-finstats`).
   returning: the `1e-2` is a threshold on NPV, so what it means depends on the
   size of the cashflows, and on a series denominated in units of ~0.01 it is
   met at the first midpoint and the answer is `4.505`. Set `rate_tol = null`
-  to reproduce the pre-2026-08-23 absolute-only behaviour exactly.
+  to stop on the NPV threshold alone (the older absolute-only behaviour), bit for bit.
 - **`xirr`'s `opening`** — **required, with no default.** `.none` says the
   series starts from nothing (inception-to-date), so external flows plus the
   terminal value are the whole cashflow list. A series sliced out of the middle
@@ -213,7 +211,7 @@ fn correlationMatrix(a, series: []const []const f64, min_overlap: usize) Error![
 fn drawdownEpisodes(a, dates, levels, top_n: usize) Error![]Episode;
 fn brinsonAttribution(a, wp, wb, rp, rb) Error!BrinsonResult;  // per segment + total
 
-// Period statistics (2026-11-02), empyrical / ffn / quantstats conventions; scalar fns over []const f64
+// Period statistics, empyrical / ffn / quantstats conventions; scalar fns over []const f64
 fn sharpeRatio(xs, rf, ppy) f64; fn sortinoRatio(xs, rf, ppy) f64; fn calmarRatio(xs, ppy) f64;
 fn totalReturn(xs) f64; fn cagrPeriods(xs, ppy) f64; fn geometricMean(xs) f64; fn maxDrawdown(xs) f64;
 fn gainToPain(xs) f64; fn recoveryFactor(xs) f64; fn stability(xs) f64;
@@ -239,17 +237,14 @@ denominator give 0 (or +inf for a positive numerator over a zero loss/drawdown).
 See the doc comments in `src/slice.zig` (every function and result struct),
 `src/ratios.zig`, `src/calendar.zig`, `src/overfit.zig` and `src/factor.zig`.
 
-## Deferred (backlog, not implemented here)
+## Not provided
 
-Still intentionally out of scope:
-
-- **Annualization-frequency presets / validation** — `periods_per_year` is a
-  free 252-defaulted knob with no daily/weekly/monthly presets.
-- **Confidence intervals / standard errors** on the statistics, beyond the
-  probabilistic ratios.
-- **Portfolio weights, GARCH, cointegration, Fama-French regression** — a later
-  module. **Plotting, HTML reports, data download** — not statistics.
-- **`montecarloSharpe`** does not reproduce quantstats' spread (SPEC Backlog).
+Portfolio weights, GARCH, cointegration and Fama-French regression are a later
+module; plotting, HTML reports, data download and pandas-index helpers are not
+statistics. Annualisation-frequency presets and confidence intervals / standard
+errors on the statistics (beyond the probabilistic ratios) are open items, and
+`montecarloSharpe` does not reproduce quantstats' spread. The reasons and the open
+items are in `SPEC.md`, *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify
 
