@@ -12,7 +12,7 @@
 //! `aesgcm.Aes256Gcm` and `chacha_poly.ChaCha20Poly1305`.
 //!
 //! **AES-CCM caveat (honest).** DTLS/TLS 1.3 mandate a 12-byte AEAD nonce.
-//! Zig 0.16 std's CCM PRESETS (`aes_ccm.Aes128Ccm8`, etc.) are all fixed at
+//! Zig std's CCM PRESETS (0.17.1) (`aes_ccm.Aes128Ccm8`, etc.) are all fixed at
 //! a 13-byte nonce and the parametric `AesCcm(...)` generator is private, so
 //! there is NO way to instantiate a 12-byte-nonce CCM from std presets. The
 //! `AES_128_CCM_8_SHA256` suite (RFC 7925's CoAP default) therefore CANNOT

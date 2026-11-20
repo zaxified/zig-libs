@@ -38,7 +38,7 @@
 //! uses whichever offered share it can (`clientHelloShare`). Both roles, and
 //! all three retry shapes on the client side, are proven against wolfSSL.
 //!
-//! **After the handshake** (2026-11-13): KeyUpdate both ways
+//! **After the handshake**: KeyUpdate both ways
 //! (`requestKeyUpdate`, `recv` → `error.ReceivedKeyUpdate`, `poll` emits the
 //! ACK / KeyUpdate records, RFC 9147 §8), the RFC 8446 §7.5 exporter
 //! (`exportKeyingMaterial`) and RFC 7301 ALPN (`Config.alpn_protocols`,
@@ -185,7 +185,7 @@ pub const ConfigError = error{
     EmptyPskIdentity,
     NoCipherSuites,
     /// `Config.cipher_suites` offers a suite this module cannot install keys
-    /// for. Both CCM suites are in that position on Zig 0.16, whose std ships
+    /// for. Both CCM suites are in that position: Zig std (checked on 0.17.1) ships
     /// only a 13-byte-nonce CCM. Caught here rather than after a completed
     /// handshake, where it used to surface as `error.UnsupportedSuite` from
     /// `installApplicationKeys`.
@@ -391,7 +391,7 @@ pub const Config = struct {
     /// Defaults to AES-128-GCM, the one mandatory-to-implement TLS 1.3 suite.
     /// It used to default to `.aes_128_ccm_8_sha256` -- the CoAP profile's
     /// choice, and the obvious pick for this module's target consumer -- but
-    /// `suiteParams` returns null for both CCM suites, because 0.16 std ships
+    /// `suiteParams` returns null for both CCM suites, because Zig std (checked on 0.17.1) ships
     /// only a 13-byte-nonce CCM. So that default passed `validate`, completed a
     /// handshake, and failed at `installApplicationKeys` with
     /// `error.UnsupportedSuite`: a config that could never work, in the mode a
@@ -1176,7 +1176,7 @@ fn selectSignatureScheme(
 
 // ── (EC)DHE groups: the `.cert_dhe` key exchange ──────────────────────────
 
-// The computation lives in `tls13.kex` since 2026-10-20 (shared with
+// The computation lives in `tls13.kex` (shared with
 // `tlsserver`); this file keeps the group POLICY (`advertised_groups`, the
 // share a fresh ClientHello offers, preference order) and thin wrappers under
 // the old names, so the engine and its tests read as before.
@@ -1217,7 +1217,7 @@ const hybrid_server_share_len = kex.hybrid_server_share_len;
 const advertised_groups = [_]u16{ x25519_mlkem768_group, x25519_group, secp256r1_group };
 
 /// Room for the longest `KeyShareEntry.key_exchange` `tls13.kex` computes:
-/// 1568 since its ML-KEM-1024 (2026-10-21), which dtls does not advertise —
+/// 1568 since its ML-KEM-1024, which dtls does not advertise —
 /// its own longest is the hybrid's 1216-octet client share. The extra 352
 /// octets only widen the buffers; the ClientHello bound below is unchanged.
 const max_key_share_len = kex.max_share_len;
@@ -4784,7 +4784,7 @@ test "Config.validate: rejects an empty cipher-suite list" {
 
 test "Config.validate: rejects a suite this module cannot install keys for" {
     // `ConfigError.UnsupportedSuite`'s only test. Both CCM suites are in that
-    // position on 0.16 (`suiteParams` returns null for both — std ships only
+    // position (`suiteParams` returns null for both — std ships only
     // a 13-byte-nonce CCM), and naming one must fail HERE, at config time,
     // not after a handshake has completed and spent a flight.
     for ([_]CipherSuite{ .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 }) |ccm| {
@@ -5258,7 +5258,7 @@ fn splitSourceFromEpoch0(record_bytes: []const u8) !SplitSource {
 //
 // ── ⚠ why the choices come out of ONE byte string ─────────────────────────
 //
-// Until 2026-09-07 they came out of ranged `Smith` draws, the FIRST of them
+// Until they came out of ranged `Smith` draws, the FIRST of them
 // included — `smith.valueRangeAtMost(u16, 1, src.body_len - 1)`, which
 // `check-fuzz-reach` classifies R1. A ranged draw reads eight octets as a
 // little-endian `u64` and returns the range MINIMUM unless the whole word lands
@@ -8414,7 +8414,7 @@ test "cert-DHE: our server accepts a secp256r1 client share and answers in the s
     try testing.expectEqual(@as(usize, 32), shared_c.len);
 }
 
-// ── RNG-seam pins (B6, 2026-08-12) ─────────────────────────────────────────
+// ── RNG-seam pins (B6) ─────────────────────────────────────────
 //
 // `startHandshake`/`handleFlight` take an `Entropy`, not a `std.Random`. The
 // weak path still EXISTS — it has to, these tests need a reproducible
@@ -9280,7 +9280,7 @@ test "installApplicationSecrets: SHA-384 secrets install; the [32]u8 installAppl
     try expectRoundTrip(&client, &server, "installed by hand");
 }
 
-// ── audit 2026-11-17 (whole-module mutation), run 2: pins ────────────────
+// ── audit (whole-module mutation), run 2: pins ────────────────
 
 test "audit: AckCollector stops at its capacity" {
     var a: AckCollector = .{};

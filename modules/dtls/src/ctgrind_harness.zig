@@ -18,25 +18,25 @@
 //!  * `app` — after an UNTAINTED handshake, both directions' record keys
 //!    (AEAD key, static IV, sequence-number mask key) tainted, then
 //!    `send`/`recv` both ways under AES-128-GCM, ChaCha20-Poly1305 and
-//!    AES-256-GCM (2026-11-13): record
+//!    AES-256-GCM: record
 //!    protection, sequence-number masking, and the receiver's DTLSInnerPlaintext
 //!    handling of the decrypted (secret) content.
 //!
-//!  * `ku` (2026-11-13) — after an UNTAINTED handshake, both sides'
+//!  * `ku` — after an UNTAINTED handshake, both sides'
 //!    application traffic secrets and exporter master secret tainted, then a
 //!    KeyUpdate in each direction (RFC 9147 §8: the `update_requested`
 //!    exchange, ACKs, `"traffic upd"` derivation, the new record keys used
 //!    both ways) and an RFC 8446 §7.5 export, under AES-128-GCM,
 //!    ChaCha20-Poly1305 and AES-256-GCM-SHA384 (48-byte secrets).
 //!
-//!  * `hs12` (2026-11-13) — DTLS 1.2 (`Connection12`) handshakes: PSK
+//!  * `hs12` — DTLS 1.2 (`Connection12`) handshakes: PSK
 //!    AES-128-GCM and ECDHE_PSK ChaCha20-Poly1305 with the pre-shared key
 //!    tainted on both sides (premaster, RFC 7627 master secret, key block,
 //!    both Finished MACs and their verification), and ECDHE_ECDSA
 //!    AES-256-GCM-SHA384 with the SERVER's ephemeral ECDHE private key
 //!    tainted once its flight is out (the shared secret, the SHA-384 PRF,
 //!    the key block, the encrypted Finished both ways).
-//!  * `app12` (2026-11-13) — after UNTAINTED 1.2 handshakes, both
+//!  * `app12` — after UNTAINTED 1.2 handshakes, both
 //!    directions' record keys (AEAD key, implicit IV / salt) tainted, then
 //!    `send`/`recv` both ways under AES-128-GCM, ChaCha20-Poly1305 and
 //!    AES-256-GCM (RFC 5288 / RFC 7905 nonces).

@@ -604,7 +604,7 @@ test "reassembler: the DECLARED fragment_length must agree with the bytes actual
 // ── ⚠ why the choices come out of ONE byte string ─────────────────────────
 //
 // This target draws a SHAPE, not a frame: nothing about a fragment storm is a
-// byte string off the wire. Until 2026-09-07 every choice was therefore a
+// byte string off the wire. Until every choice was therefore a
 // `smith.valueRangeAtMost`, starting with the first — which `check-fuzz-reach`
 // classifies R1, because a ranged draw reads eight octets as a little-endian
 // `u64` and returns the range MINIMUM unless the whole word lands inside the

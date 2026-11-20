@@ -5,7 +5,7 @@
 //!
 //! ## What this is and where it came from
 //!
-//! Until 2026-09-06 the live wolfSSL interop was a test file inside this
+//! Until the live wolfSSL interop was a test file inside this
 //! module. It `@embedFile`d a 555-line C peer, wrote it to a temp directory,
 //! compiled it with `cc -lwolfssl`, and drove real handshakes against it. So
 //! the library shipped foreign source, `zig build test-dtls` wanted a toolchain
@@ -532,11 +532,11 @@ test "wolfSSL transcript: every recorded exchange replays byte-for-byte, with no
     try testing.expect(r.flows_seen.count() == 3);
     try testing.expect(r.kx_seen.count() == 2);
     try testing.expect(r.retry_cases >= 5);
-    // The post-handshake anchors (2026-11-17): ALPN in both roles, and a
+    // The post-handshake anchors: ALPN in both roles, and a
     // KeyUpdate started by each side, all of them against a live wolfSSL.
     try testing.expect(r.alpn_cases >= 2);
     try testing.expect(r.key_updates >= 2);
-    // The AES-256-GCM-SHA384 anchors (2026-11-17): our client with and without
+    // The AES-256-GCM-SHA384 anchors: our client with and without
     // a HelloRetryRequest, our server stateful and stateless, SHA-384 PSK.
     try testing.expect(r.sha384_cases >= 4);
 }

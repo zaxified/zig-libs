@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! dtls.keyschedule — the RFC 9147 §5.8 / RFC 8446 §7.1 key schedule for DTLS
-//! 1.3, under the names this module has always exported. Since 2026-10-20 the
+//! 1.3, under the names this module has always exported. Since the
 //! schedule itself lives in the `tls13` module (`tls13.keyschedule`, one
 //! `Schedule(prefix)` instance per protocol); this file binds the `dtls13`
 //! instance (the `"dtls13"` HKDF-Expand-Label prefix, RFC 9147 §5.9) to the

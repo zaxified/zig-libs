@@ -29,7 +29,7 @@ fn seeded(csprng: *std.Random.DefaultCsprng) Entropy {
     return .{ .seeded_for_test = csprng.random() };
 }
 
-/// After both RSA (2026-11-13) and the ECDSA (2026-07-21) fixtures' notBefore.
+/// After both RSA and the ECDSA fixtures' notBefore.
 const now_sec: i64 = 1798761600; // 2027-01-01
 
 var server_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;

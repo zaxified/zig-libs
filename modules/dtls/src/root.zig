@@ -255,7 +255,7 @@
 //! while the ECDSA/Ed25519 arms fall back to RFC 6979/8032 deterministic
 //! derivation.
 //!
-//! **Post-handshake (2026-11-13):** KeyUpdate in both directions (RFC 9147
+//! **Post-handshake:** KeyUpdate in both directions (RFC 9147
 //! §8: ACK-gated switch, previous read epoch retained, `poll` emits the
 //! control records, automatic rekey at `Config.key_update_after_records`);
 //! the RFC 8446 §7.5 exporter (`Connection.exportKeyingMaterial`, `"dtls13"`
@@ -264,7 +264,7 @@
 //!
 //! **Out of scope (deliberate, not deferred-as-a-stub):** 0-RTT/early data; session
 //! resumption (`res binder`/NewSessionTicket); and the CCM
-//! suites (Zig 0.16 std ships only a 13-byte-nonce CCM; the TLS/DTLS
+//! suites (Zig std ships only a 13-byte-nonce CCM, checked on 0.17.1; the TLS/DTLS
 //! profile needs 12 — see `aead.zig`'s CCM caveat).
 //!
 //! **AEAD/CCM recon correction:** the scaffold claimed "AES-CCM is NOT a std
@@ -274,7 +274,7 @@
 //! from std presets without a wrong-width nonce. CCM is therefore left
 //! unwired here (documented, not silently broken).
 //!
-//! ## Recon: what Zig 0.16 `std.crypto.tls`/`std.crypto` give this module
+//! ## Recon: what Zig std `std.crypto.tls`/`std.crypto` give this module
 //!
 //! - `std.crypto.tls.hkdfExpandLabel` implements RFC 8446 §7.1's
 //!   HKDF-Expand-Label with the `"tls13 "` prefix HARDCODED. DTLS 1.3
@@ -341,7 +341,7 @@ pub const connection = @import("Connection.zig");
 /// sign/verify over a caller-supplied transcript hash + typed key -- no
 /// wire framing, no X.509 DER handling. Wired into the actual handshake by
 /// `connection`/`certauth` (see the "Certificate mode" section below).
-/// Lives in `tls13` since 2026-10-20 (shared with `tlsserver`); re-exported
+/// Lives in `tls13` (shared with `tlsserver`); re-exported
 /// here under the old name.
 pub const certverify = @import("tls13").certverify;
 
@@ -369,7 +369,7 @@ pub const KeyExchange = connection.KeyExchange;
 /// reproducible handshake. See "Randomness" above and `Connection.Entropy`.
 pub const Entropy = connection.Entropy;
 
-// ── DTLS 1.2 (RFC 6347) and version negotiation (2026-11-13) ────────────
+// ── DTLS 1.2 (RFC 6347) and version negotiation ────────────
 /// The DTLS 1.2 engine: same method shape as `Connection`, same `Config`
 /// (`Config.versions = &.{.dtls12}`).
 pub const Connection12 = @import("Connection12.zig").Connection12;
@@ -399,7 +399,7 @@ pub const meta = .{
     .concurrency = .single_owner,
     .model_after = "RFC 9147 (DTLS 1.3, PSK mode + PSK-less cert-only ephemeral-X25519 mode) + RFC 8446 (TLS 1.3 shared key schedule/handshake message shapes; RFC 9147 §5.8/§5.9 reuse these with the \"dtls13\" label prefix); RFC 8446 §4.2.7/§4.2.8 (supported_groups/key_share) + RFC 7748 (X25519); RFC 8446 §4.4.3 (CertificateVerify, in `certverify.zig`)",
     // `rsa`: `certauth.zig`'s RSA SPKI parsing (`certverify`, whose RSASSA-PSS
-    // dispatch needed it here before, lives in `tls13` since 2026-10-20).
+    // dispatch needed it here before, lives in `tls13`).
     // `x509`: `certauth.zig`'s certificate-DER parsing, routed through
     // `x509.spkiOf`/`x509.safe.safeCertificate` instead of
     // `std.crypto.Certificate.parse` (see certauth.zig's doc comment).
@@ -419,7 +419,7 @@ pub const meta = .{
 // tests into the test binary on its own — every submodule must be named
 // here too. All submodules below now carry real `test` blocks
 // (`keyschedule`/`aead` included, with KATs). `certverify`'s own tests
-// moved with it to `tls13` (2026-10-20).
+// moved with it to `tls13`.
 test {
     _ = record;
     _ = handshake;

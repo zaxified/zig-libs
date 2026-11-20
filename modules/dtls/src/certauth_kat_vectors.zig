@@ -14,8 +14,8 @@
 //! (`rsa.PublicKey.fromDer`). None of these keys/certificates are used
 //! anywhere outside this repo's own tests.
 //!
-//! **The bytes live in `testdata/certs/`, not in hex literals here** (moved
-//! 2026-09-06). `tools/interop.zig` — the live wolfSSL harness, which is a
+//! **The bytes live in `testdata/certs/`, not in hex literals here**.
+//! `tools/interop.zig` — the live wolfSSL harness, which is a
 //! standalone program outside this module — has to hand wolfSSL the SAME
 //! anchor, leaf and key that the Zig side trusts, or "wolfSSL accepted it"
 //! degrades into "wolfSSL trusted something else". It cannot `@import` this
@@ -73,7 +73,7 @@ pub const rsa_cert_der = der("testdata/certs/rsa-cert.der");
 /// ECDSA P-384 self-signed certificate, CN=dtls-test-p384.
 /// Ed25519 self-signed certificate, CN=dtls-test-ed25519.
 ///
-/// ⭐ Added 2026-09-07 for one reason, stated so it does not get "tidied away"
+/// ⭐ Added for one reason, stated so it does not get "tidied away"
 /// later: `certauth.parseLeafPublicKey`'s P-384 and Ed25519 dispatch arms are
 /// the ONLY part of that function with no coverage anywhere else in the tree
 /// (its RSA and P-256 arms are re-fuzzed in `x509` and `rsa`), and its own
@@ -94,7 +94,7 @@ pub const ed25519_cert_der = der("testdata/certs/ed25519-cert.der");
 
 /// RSA-2048 self-signed certificate + its PKCS#1 private key, CN=dtls12-test-rsa,
 /// for the DTLS 1.2 ECDHE_RSA suites' self-interop (`conn12_test.zig`): the
-/// test peers trust the certificate as its own anchor. Generated 2026-11-13
+/// test peers trust the certificate as its own anchor. Generated
 /// with the local OpenSSL CLI:
 ///
 ///     openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -outform der \

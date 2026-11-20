@@ -1535,7 +1535,7 @@ test "HandshakeType: RFC 8446 §4 wire code points for the cert-mode types" {
 // received from an unauthenticated peer (the record/handshake-fragmentation
 // layers above only reassemble bytes; these are what interpret them).
 //
-// ⛔ Until 2026-09-07 not one of the twelve targets below ever saw a byte of
+// ⛔ Until not one of the twelve targets below ever saw a byte of
 // its input. Nine opened with
 //
 //     smith.bytes(&buf);

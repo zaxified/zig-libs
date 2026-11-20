@@ -1620,7 +1620,7 @@ fn messageSeqBefore(a: u16, b: u16) bool {
     return a != b and (b -% a) < 0x8000;
 }
 
-// ── audit 2026-11-17 (whole-module mutation): private-helper pins ────────
+// ── audit (whole-module mutation): private-helper pins ────────
 
 test "audit: transcript and flight-cache appends refuse one byte over their caps and fill them exactly" {
     var c: Connection12 = .{ .role = .client, .config = auditCfg() };

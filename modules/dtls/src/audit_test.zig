@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! Killing tests from the 2026-11-17 whole-module mutation audit (see SPEC
-//! "Audit 2026-11-17"). Each test pins a boundary or a refusal that no other
+//! Killing tests from the whole-module mutation audit (see SPEC
+//! "Audit"). Each test pins a boundary or a refusal that no other
 //! test reached: exact-size buffers, one-past-the-limit lengths, and the
 //! state a helper must leave behind.
 
@@ -1272,7 +1272,7 @@ test "audit: dtls12 certificate options: a PSK identity hint does not leak into 
     }
 }
 
-// ── Connection12, audit run 2 (2026-11-17) ───────────────────────────────
+// ── Connection12, audit run 2 ───────────────────────────────
 
 const psk_cs12 = [_]u16{@backingInt(S12.psk_with_aes_128_gcm_sha256)};
 

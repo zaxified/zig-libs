@@ -409,7 +409,7 @@ test "reconstructSequenceNumber: clamps at the 48-bit ceiling" {
 // the range MINIMUM and `len` was 0 on every input. Both decoders were handed
 // an empty slice, for ever, and outside `--fuzz` the runner replays only the
 // declared corpus plus one empty input, so "for ever" was literally one call
-// each. Measured 2026-09-07: **1 input, 0 non-empty and 0 headers decoded
+// each. Measured: **1 input, 0 non-empty and 0 headers decoded
 // before; 92 and 22 seeds, all non-empty, 85 and 21 headers decoded after** —
 // see the guard at the bottom of this file, which is where those numbers come
 // from and where they stay honest.

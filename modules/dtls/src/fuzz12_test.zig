@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz harnesses for the DTLS 1.2 engine (added 2026-11-13),
+//! Deterministic fuzz harnesses for the DTLS 1.2 engine,
 //! in the shape of `fuzz_test.zig` and run by the same driver
 //! (`DTLS_FUZZ=<runs>[,<first seed>]`, `_ONLY=<name>`):
 //! - `dtls12-handshake`: a whole `Connection12` handshake (PSK, ECDHE_PSK,
 //!   PSK behind a HelloVerifyRequest, ECDHE_ECDSA with a certificate) where
 //!   ONE flight on the way is damaged, replaced by random bytes, dropped,
-//!   duplicated or (2026-11-17) has two of its datagrams swapped. Half the
+//!   duplicated or has two of its datagrams swapped. Half the
 //!   cases also set `max_datagram_len` (128..600) on both sides, so flights
 //!   are fragmented (RFC 6347 §4.2.3) and delivered datagram by datagram
 //!   (`record.nextDatagram`), driving the reassembly and the queue for

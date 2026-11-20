@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for dtls (added 2026-10-10).
+//! Deterministic fuzz driver for dtls.
 //!
 //! Four harnesses (a damaged record that is accepted at all is a failure) over the module's in-memory client <-> server flow, each
 //! generic over its source of choices; `DTLS_FUZZ=<runs>[,<first seed>]` runs
@@ -17,7 +17,7 @@
 //!   damaged / replayed / reordered. An undamaged record is accepted once; a
 //!   replay is refused; a damaged record is refused or, if accepted, carries
 //!   exactly the plaintext that was sent.
-//! - `dtls-keyupdate` (2026-11-13): a connected pair runs KeyUpdates while
+//! - `dtls-keyupdate`: a connected pair runs KeyUpdates while
 //!   the ACK / KeyUpdate records are dropped, damaged or duplicated; after a
 //!   lossless flush nothing is pending and both directions' keys agree.
 //! - `dtls-wire`: the parsers (plaintext and unified record headers,
