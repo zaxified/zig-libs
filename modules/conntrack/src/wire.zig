@@ -659,7 +659,7 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
             };
         },
         // The attributes below are informational and were skipped as unknown
-        // before 2026-11-03; a malformed one is skipped the same way (the field
+        // previously; a malformed one is skipped the same way (the field
         // stays null) rather than failing the flow and with it the dump.
         CTA.TUPLE_MASTER => out.tuple_master = decodeTuple(a.data) catch null,
         CTA.HELP => out.helper = lenient(Name, decodeHelp, a),
@@ -1017,7 +1017,7 @@ fn newPayload(gpa: std.mem.Allocator, family: Family, attrs: []const u8) ![]u8 {
 test "nfgenmsg res_id is big-endian both ways" {
     // `struct nfgenmsg { u8 family; u8 version; __be16 res_id; }`
     // (linux/netfilter/nfnetlink.h). The kernel writes 0 for conntrack, so a
-    // zero-only test cannot tell the byte order. Mutation 2026-10-04: both
+    // zero-only test cannot tell the byte order. Mutation: both
     // directions' endianness survived.
     const h = try parseNfgenmsg(&.{ 2, 0, 0x12, 0x34 });
     try testing.expectEqual(@as(u16, 0x1234), h.res_id);
@@ -1028,7 +1028,7 @@ test "nfgenmsg res_id is big-endian both ways" {
 }
 
 test "decode: protoinfo of another protocol, malformed TCP flags, a reply tuple of the wrong family" {
-    // Mutation 2026-10-04: three decoder guards with no test.
+    // Mutation: three decoder guards with no test.
     const gpa = testing.allocator;
     // (1) Only `CTA_PROTOINFO_TCP` is decoded; a DCCP nest's STATE attribute
     // (same number, 1) is DCCP's state, not a `TcpState`.
@@ -1075,7 +1075,7 @@ test "build: an ICMPv6 tuple uses the ICMPV6 attribute numbers; a lone tcp_flags
     // The kernel parses an ICMPv6 tuple through `CTA_PROTO_ICMPV6_*`
     // (nf_conntrack_proto_icmpv6.c); the ICMP numbers would be ignored.
     // `buildNewRequest` emits PROTOINFO when ANY of its three fields is set.
-    // Mutation 2026-10-04: both survived (the decoder accepts either ICMP
+    // Mutation: both survived (the decoder accepts either ICMP
     // numbering, so a round trip could not tell).
     const gpa = testing.allocator;
     {
@@ -1758,7 +1758,7 @@ test "decoder survives misaligned and adversarially nested attribute streams" {
 /// The harness reads these bytes four ways at once — as a flow payload, as an
 /// `nfgenmsg`, as a tuple nest, and as a stream of whole netlink messages —
 /// so the corpus holds both whole datagrams and bare payloads.
-/// The first seeds of `DecodeCorpus.build`, from before 2026-11-03.
+/// The first seeds of `DecodeCorpus.build`, from previously.
 const original_seeds = 12;
 
 const DecodeCorpus = struct {
@@ -1858,7 +1858,7 @@ const DecodeCorpus = struct {
             self.push(&raw);
         }
 
-        // ── attributes added 2026-11-03 ────────────────────────────────────
+        // ── attributes added ────────────────────────────────────
         // A flow carrying every one of them, as a bare payload.
         var rich: std.ArrayList(u8) = .empty;
         try richFlowPayload(gpa, &rich);
@@ -1899,7 +1899,7 @@ const DecodeCorpus = struct {
     }
 };
 
-/// A CT_NEW payload with every attribute added on 2026-11-03.
+/// A CT_NEW payload with every attribute.
 fn richFlowPayload(gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
     try appendNfgenmsg(gpa, list, .ipv4, 0);
     try appendTuple(gpa, list, CTA.TUPLE_ORIG, .{ .src = .{ .v4 = .{ 10, 0, 0, 1 } }, .dst = .{ .v4 = .{ 10, 0, 0, 2 } }, .proto = IPPROTO.TCP, .src_port = 1, .dst_port = 2 });
@@ -2035,7 +2035,7 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // so `len` was 0 for every seed and all four readings below were handed an
     // EMPTY slice with the reply sitting unread in `raw`.
     //
-    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 12 seeds non-empty,
+    // ⛔ Measured over the corpus above: **0 of 12 seeds non-empty,
     // 0 flows decoded, 0 tuples walked and 0 messages framed before; 12 of 12
     // non-empty, 6 messages framed, 6 flows decoded out of them, 4 tuple
     // nests walked and 16 addresses read, after.** The empty slice
@@ -2068,7 +2068,7 @@ test "corpus: every decode seed reaches the walkers, and the counts are pinned" 
     const entries = try corpus.build();
     var nonempty: usize = 0;
     var total: DecodeTally = .{};
-    // The four seeds appended 2026-11-03 (rich flow, expectation, statistics)
+    // The four seeds appended (rich flow, expectation, statistics)
     // are tallied apart, so the pins of the original twelve stay as measured.
     var fresh: DecodeTally = .{};
     for (entries, 0..) |sd, i| {
@@ -2166,7 +2166,7 @@ test "decode: labels pad when short; a long label, long name or wrong-width attr
     try testing.expectEqualSlices(u8, &.{ 9, 8, 7, 6, 0, 0, 0, 0 }, f.labels.?[0..8]);
 }
 
-// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// ── deterministic fuzz driver ───────────────────────────────────
 // Shared plumbing and the notes on `CONNTRACK_FUZZ` are in `fuzz_test.zig`.
 
 fn fuzzDecodeMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
@@ -2192,7 +2192,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere (decode
     try fz.checkSeen("conntrack decode", .{ fuzzDecode, fuzzDecodeMutated }, &fz.decode_seen, 1500);
 }
 
-// ── whole-module mutation 2026-11-19: survivors of the first run ────────────
+// ── whole-module mutation: survivors of the first run ────────────
 
 test "Tuple: isComplete needs src, dst and proto each; family() prefers src; a missing proto is not ICMPv6 in invert()" {
     const a4: netaddr.Ip = .{ .v4 = .{ 10, 0, 0, 1 } };

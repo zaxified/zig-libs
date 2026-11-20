@@ -232,9 +232,9 @@ const max_dump_messages: u32 = 65536;
 
 /// Ceiling on the payload messages (and so flows) one `dumpOver` attempt may
 /// consume (sweep CT-1). `max_dump_messages` counts DATAGRAMS, each up to
-/// 16 MiB, and a 20-byte message decodes to a 488-byte `Flow` (256 before 2026-11-03) — without this a
+/// 16 MiB, and a 20-byte message decodes to a 488-byte `Flow` (256 previously) — without this a
 /// kernel that streams records and never sends DONE grows the result by
-/// ~12x its input, GBs before the datagram budget fires. 1 Mi flows = 488 MiB (256 MiB before 2026-11-03)
+/// ~12x its input, GBs before the datagram budget fires. 1 Mi flows = 488 MiB (256 MiB previously)
 /// worst case; a router's table (`nf_conntrack_max`) is typically 16k-256k.
 /// A caller with a bigger table uses `dumpEach`, which is uncapped on records.
 /// Exceeding it is `error.TooManyMessages`.
@@ -909,8 +909,8 @@ fn triage(m: codec.Message, portid: u32, seq: u32, interrupted: *bool) netlink.D
 /// A streaming counterpart to `dumpOver`/`dump` (F4): calls `visit` once per
 /// decoded flow, in kernel wire order, instead of collecting into a growing
 /// `ArrayList`. Constant memory regardless of table size — the whole point,
-/// since a busy firewall's table is `@sizeOf(Flow)` (256 B) times 10⁵-10⁶
-/// entries, 25-250 MB before the caller sees a single one via `dump`. `flow`
+/// since a busy firewall's table is `@sizeOf(Flow)` (488 B) times 10⁵-10⁶
+/// entries, 50-500 MB before the caller sees a single one via `dump`. `flow`
 /// is a stack value valid only for the duration of one `visit` call; copy out
 /// whatever the caller needs to keep.
 ///
@@ -1256,7 +1256,7 @@ test "single-entry await: replies for another port or sequence are skipped; a ba
     // `awaitFlowOver` answers only a message addressed to THIS socket's port
     // and THIS request's sequence (a late reply to an earlier request, or one
     // for another socket, must not be taken as the answer), and a bare ACK
-    // (`NLMSG_ERROR` with code 0) carries no entry. Mutation 2026-10-04: the
+    // (`NLMSG_ERROR` with code 0) carries no entry. Mutation: the
     // pid filter, the seq filter and the bare-ACK mapping all survived --
     // nothing drove `awaitFlowOver` without a kernel.
     const id = goldenDumpIdentity();
@@ -1281,7 +1281,7 @@ test "single-entry await: replies for another port or sequence are skipped; a ba
 test "dump engine: a record that is not IPCTNL_MSG_CT_NEW is skipped, not decoded as a flow" {
     // A dump answers with `IPCTNL_MSG_CT_NEW` records; anything else in the
     // stream (here the same entry re-typed `CT_DELETE`) is not a table entry
-    // and must not be collected. Mutation 2026-10-04: dropping the type
+    // and must not be collected. Mutation: dropping the type
     // filter survived.
     const id = goldenDumpIdentity();
     var b: [512]u8 = undefined;
@@ -1486,8 +1486,8 @@ test "A1: dumpEachOver gives up instead of spinning when NLMSG_DONE never arrive
 }
 
 test "A1: the dump budget is the delivered magnitude, not just any value" {
-    // Pinned literally, per `feedback_cap_bounds_the_wrong_quantity` and the
-    // sibling pin in `netlink`'s own test of the same shape: asserting
+    // Pinned literally (a cap test must pin the delivered magnitude, not the
+    // constant) and as the sibling pin in `netlink`'s own test of the same shape: asserting
     // `t.recvs == max_dump_messages` alone would follow the constant wherever
     // it goes and stay green through a shrink that silently breaks a large
     // legitimate dump, or a grow that quietly re-opens this spin.
@@ -2253,7 +2253,7 @@ test "live: filtered dumps, statistics, expectations and the receive buffer (nee
     for (cpus) |c| inserts += c.insert;
     try testing.expect(inserts >= marks.len);
     // Expectation statistics: one record per CPU, at least one (the reply type
-    // is 0x0103 on a real kernel, measured; before 2026-11-03 this read an empty
+    // is 0x0103 on a real kernel, measured; previously this read an empty
     // slice for ever). A kernel without the expectation subsystem answers an
     // error instead, which is not a failure here.
     if (sock.statsExpect()) |es| {
@@ -2277,7 +2277,7 @@ test "live: filtered dumps, statistics, expectations and the receive buffer (nee
     try testing.expect(try sock.recvBufferSize() >= 1 << 19);
 }
 
-// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// ── deterministic fuzz driver ───────────────────────────────────
 // Shared plumbing and the notes on `CONNTRACK_FUZZ` are in `fuzz_test.zig`.
 // `parsed` here is "the dump completed", `rejected` "it ended in an error".
 
@@ -2414,7 +2414,7 @@ test "dump engine: a flag on a terminating NLMSG_ERROR is judged without it (swe
     }
 }
 
-// ── fix round 2026-11-03: the generic engine, the filter, stats, zero-counters ──
+// ── fix round: the generic engine, the filter, stats, zero-counters ──
 
 /// Records of several kinds, framed as a kernel dump reply addressed to `(pid, seq)`.
 const Rec = struct {
@@ -2903,7 +2903,7 @@ test "dumpEachGeneric: an overflow before a bad record wins, one after it loses 
     try testing.expectEqual(@as(usize, 6), t.recvs);
 }
 
-// ── whole-module mutation 2026-11-19: engine survivors of the first run ─────
+// ── whole-module mutation: engine survivors of the first run ─────
 
 /// A header-only message of `ty` addressed to `(pid, seq)`.
 fn bareOf(pid: u32, seq: u32, ty: u16) [codec.header_len]u8 {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! ctnetlink wire extensions (survey 2026-11-02): the pure, I/O-free half of
+//! ctnetlink wire extensions (survey): the pure, I/O-free half of
 //! everything beyond "dump, get, insert, delete, flush, events" — the dump
 //! variants (zero-counters, dying, unconfirmed), the server-side dump filter
 //! with its client-side twin, the statistics messages and the expectation
@@ -41,7 +41,7 @@ pub const msg_exp_get = wire.msgType(NFNL_SUBSYS_CTNETLINK_EXP, IPCTNL_MSG_EXP_G
 pub const msg_exp_get_stats_cpu = wire.msgType(NFNL_SUBSYS_CTNETLINK_EXP, IPCTNL_MSG_EXP_GET_STATS_CPU);
 /// What the kernel answers to `msg_exp_get_stats_cpu` with: the CONNTRACK
 /// subsystem (1), not the expectation one, and command 3. **Measured on a live
-/// kernel, 2026-11-03** (`unshare -rn`, type 0x0103 on every record); the
+/// kernel** (`unshare -rn`, type 0x0103 on every record); the
 /// request is `0x0203`, the records are not.
 pub const msg_exp_stats_reply = wire.msgType(wire.NFNL_SUBSYS_CTNETLINK, IPCTNL_MSG_EXP_GET_STATS_CPU);
 
@@ -702,7 +702,7 @@ test "decodeExpect: hostile names, lengths and truncations are errors, never a p
     while (cut <= p.len) : (cut += 1) _ = decodeExpect(p[0..cut]) catch {};
 }
 
-// ── whole-module mutation 2026-11-19: survivors of the first run ────────────
+// ── whole-module mutation: survivors of the first run ────────────
 
 test "DumpFilter.matches: a flow without a status never matches a status filter" {
     const flt: DumpFilter = .{ .status = .{ .value = 2 } };

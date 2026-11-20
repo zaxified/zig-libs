@@ -3,7 +3,7 @@
 //! The findings that needed code changes (CT-1, CT-2) live next to the private
 //! dump engines in root.zig; these pin the entry points the sweep found CLEAN,
 //! so a later change cannot silently open them.
-//! Source: the 2026-10-29 no-panic sweep of `conntrack`.
+//! Source: the no-panic sweep of `conntrack`.
 const std = @import("std");
 const testing = std.testing;
 const builtin = @import("builtin");
@@ -67,7 +67,7 @@ test "decodeFlow: attributes nested 1000 deep cost one pass, no recursion" {
     _ = try wire.decodeFlow(p.items);
 }
 
-// ── 2026-11-03: the decoders and builders added with the grade-2 survey ────
+// ──: the decoders and builders added with the grade-2 survey ────
 
 const ext = @import("ext.zig");
 

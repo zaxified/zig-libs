@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver support for conntrack's two harnesses
-//! (added 2026-10-09). The harnesses stay in `wire.zig` and `root.zig`
+//! Deterministic fuzz driver support for conntrack's two harnesses.
+//! The harnesses stay in `wire.zig` and `root.zig`
 //! (they use those files' private walkers and corpora), now
 //! generic over their source of choices (`fn(comptime S, *S, gpa)`); this file
 //! holds what they share: the cursor adapter `testing.fuzz` feeds them
