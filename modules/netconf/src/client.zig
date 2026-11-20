@@ -96,8 +96,9 @@ pub const Options = struct {
     /// `lock`/`unlock`/`getConfig`/`copyConfig`/`deleteConfig`/`editConfig`
     /// against `.candidate` need `:candidate` (§8.3), the same group against
     /// `.startup` need `:startup` (§8.7), `.url` needs `:url` (§8.8),
-    /// `commit(.{.confirmed = true})` needs `:confirmed-commit` (§8.4),
-    /// `validate` needs `:validate` (§8.6), and `createSubscription` needs
+    /// `commit(.{.confirmed = true})` needs `:confirmed-commit` in version 1.0
+    /// or 1.1 (§8.4; `persist` / `persist-id` and `cancel-commit` need 1.1),
+    /// `validate` needs `:validate` in either version (§8.6), and `createSubscription` needs
     /// RFC 5277 §3.1's `:notification`. Before this existed, the ten
     /// booleans `capabilities.Capabilities` parses out of the peer's
     /// `<hello>` were read by nothing in this module: they were "parsed,
@@ -396,14 +397,24 @@ pub const Client = struct {
             .delete_config => |d| needed[0] = datastoreCapability(d),
             .lock => |d| needed[0] = datastoreCapability(d),
             .unlock => |d| needed[0] = datastoreCapability(d),
-            .commit => |c| if (c.confirmed) {
-                needed[0] = capabilities.cap_confirmed_commit;
+            // RFC 6241 §8.4.1: `<persist>` / `<persist-id>` exist only in
+            // `:confirmed-commit:1.1`; a plain confirmed commit is also what
+            // RFC 4741's `:confirmed-commit:1.0` offers (ncclient asserts the
+            // bare `:confirmed-commit`, whichever version the peer sent).
+            .commit => |c| {
+                if (c.persist != null or c.persist_id != null) {
+                    needed[0] = capabilities.cap_confirmed_commit;
+                } else if (c.confirmed and !server.confirmed_commit) {
+                    return error.CapabilityNotAdvertised;
+                }
             },
             // RFC 6241 §8.4.4.1: cancel-commit is part of :confirmed-commit:1.1.
             .cancel_commit => needed[0] = capabilities.cap_confirmed_commit,
+            // §8.6: `:validate:1.0` (RFC 4741) and `:validate:1.1` both carry
+            // the whole operation.
             .validate => |s| {
-                needed[0] = capabilities.cap_validate;
-                needed[1] = configSourceCapability(s);
+                if (!server.validate) return error.CapabilityNotAdvertised;
+                needed[0] = configSourceCapability(s);
             },
             .create_subscription => needed[0] = capabilities.cap_notification,
             .discard_changes, .close_session, .kill_session, .raw => {},
@@ -1423,6 +1434,87 @@ test "cancel-commit and with-defaults go out when advertised" {
     }
     var r = try h.client.cancelCommit(.{});
     r.deinit();
+}
+
+test "a :1.0-only peer: confirmed commit and validate pass, persist and cancel-commit are refused" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{
+        capabilities.cap_base_1_0,
+        capabilities.cap_base_1_1,
+        capabilities.cap_candidate,
+        capabilities.cap_confirmed_commit_1_0,
+        capabilities.cap_validate_1_0,
+    }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+    const refused = [_]rpc_mod.Rpc{
+        .{ .commit = .{ .confirmed = true, .persist = "tok" } }, // :1.1 only (§8.4.1)
+        .{ .commit = .{ .persist_id = "tok" } },
+        .{ .cancel_commit = .{} },
+        .{ .cancel_commit = .{ .persist_id = "tok" } },
+    };
+    for (refused) |op| try testing.expectError(error.CapabilityNotAdvertised, h.client.call(op));
+    const allowed = [_]rpc_mod.Rpc{
+        .{ .commit = .{ .confirmed = true } },
+        .{ .commit = .{ .confirmed = true, .confirm_timeout = 120 } },
+        .{ .commit = .{} },
+        .{ .validate = .candidate },
+    };
+    for (allowed) |op| {
+        var r = try h.client.call(op);
+        r.deinit();
+    }
+}
+
+test "a :1.1 peer keeps every confirmed-commit and validate form; a peer with neither refuses them" {
+    const gpa = testing.allocator;
+    {
+        const h = try helloWith(gpa, &.{
+            capabilities.cap_base_1_0,
+            capabilities.cap_base_1_1,
+            capabilities.cap_candidate,
+            capabilities.cap_confirmed_commit,
+            capabilities.cap_validate,
+        }, 0);
+        defer destroy(gpa, h.peer, h.client);
+        try h.client.hello();
+        const ops = [_]rpc_mod.Rpc{
+            .{ .commit = .{ .confirmed = true, .persist = "tok" } },
+            .{ .commit = .{ .persist_id = "tok" } },
+            .{ .commit = .{ .confirmed = true } },
+            .{ .cancel_commit = .{} },
+            .{ .validate = .candidate },
+        };
+        for (ops) |op| {
+            var r = try h.client.call(op);
+            r.deinit();
+        }
+    }
+    {
+        const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1, capabilities.cap_candidate }, 0);
+        defer destroy(gpa, h.peer, h.client);
+        try h.client.hello();
+        const ops = [_]rpc_mod.Rpc{
+            .{ .commit = .{ .confirmed = true } },
+            .{ .commit = .{ .confirmed = true, .persist = "tok" } },
+            .{ .commit = .{ .persist_id = "tok" } },
+            .{ .cancel_commit = .{} },
+            .{ .validate = .candidate },
+        };
+        for (ops) |op| try testing.expectError(error.CapabilityNotAdvertised, h.client.call(op));
+        // A plain commit names no gated feature.
+        var r = try h.client.call(.{ .commit = .{} });
+        r.deinit();
+    }
+    {
+        // `:validate` alone does not cover a `<candidate>` source (§8.3).
+        const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1, capabilities.cap_validate_1_0 }, 0);
+        defer destroy(gpa, h.peer, h.client);
+        try h.client.hello();
+        try testing.expectError(error.CapabilityNotAdvertised, h.client.call(.{ .validate = .candidate }));
+        var r = try h.client.call(.{ .validate = .running });
+        r.deinit();
+    }
 }
 
 test "check_capabilities = false falls back to letting the peer answer" {

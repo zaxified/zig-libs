@@ -148,8 +148,9 @@ after an actual bounded wait, would need thousands of real wait cycles to ever r
 RFC 6241/5277 gate several operations behind a capability the peer must advertise in its
 `<hello>`: `:candidate` (§8.3) for anything naming `.candidate` as a source/target,
 `:startup` (§8.7) for `.startup`, `:url` (§8.8) for a `Datastore.url`/`EditPayload.url`,
-`:confirmed-commit` (§8.4) for `commit(.{.confirmed = true})`, `:validate` (§8.6) for
-`validate`, `:confirmed-commit:1.1` for `cancelCommit`, RFC 6243's `:with-defaults` for any
+`:confirmed-commit` (§8.4; version 1.0 or 1.1) for `commit(.{.confirmed = true})`, `:validate` (§8.6; version
+1.0 or 1.1) for `validate`, `:confirmed-commit:1.1` for `cancelCommit` and for a commit carrying `persist` or
+`persist_id` (RFC 6241 §8.4.1 introduces them in 1.1), RFC 6243's `:with-defaults` for any
 `with_defaults` parameter, and RFC 5277 §3.1's `:notification` for `createSubscription`. By default (
 `Options.check_capabilities = true`) `Client.send` checks the peer's parsed `<hello>`
 (`Client.serverCapabilities()`) against this list before writing anything to the wire, and

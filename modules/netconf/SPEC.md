@@ -213,7 +213,11 @@ YANG (§5) and §3.1 say `identifier`, which is what is sent. Limit: the rest of
 `Rpc.cancel_commit` (`CancelCommit{persist_id}`, `Client.cancelCommit`) writes `<cancel-commit/>`,
 with a `<persist-id>` when one is given (needed to cancel a persistent confirmed commit started by
 another session); `Client.send` requires the peer's `:confirmed-commit:1.1` (with the default
-`Options.check_capabilities`). RFC 6243's
+`Options.check_capabilities`), as it does for a `commit` carrying `persist` or `persist_id` (both are new in
+RFC 6241 §8.4.1). A plain confirmed commit and `validate` are accepted on either capability version
+(`:confirmed-commit:1.0` / `:validate:1.0` from RFC 4741, as `Capabilities.confirmed_commit` / `.validate`
+resolve them); ncclient likewise asserts the bare `:confirmed-commit` / `:validate` whatever version the peer
+advertised (ncclient also lets `cancel-commit` through on a `:1.0` peer; this module stays with RFC 6241). RFC 6243's
 `with_defaults: ?WithDefaults` on `Get`, `GetConfig` and `CopyConfig` (applied to the `<source>`
 when that is a datastore) emits `<with-defaults>` in the RFC 6243 namespace with `report-all`,
 `trim`, `explicit` or `report-all-tagged`, and `Client.send` requires `:with-defaults` (same option). The
