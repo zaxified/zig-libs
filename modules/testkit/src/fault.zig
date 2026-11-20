@@ -3,7 +3,7 @@
 //!
 //! A harness that hands its code under test a `Reader.fixed(input)` and a
 //! growing `Writer.Allocating` tests the one transport that never happens:
-//! everything at once, and never an error. mqtt 2026-10-17: a double free on
+//! everything at once, and never an error. mqtt: a double free on
 //! a transport that fails halfway through a session was invisible to a
 //! session fuzzer whose transport could not fail. These put the transport's
 //! behaviour into the input — where the chunks break, at which byte it

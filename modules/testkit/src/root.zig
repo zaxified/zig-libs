@@ -23,8 +23,7 @@
 //!     shrinking of a failing seed (`shrink.zig`) and fault transports and
 //!     allocator drawn from the source (`fault.zig`).
 //!   - `stackprobe` — the dead-stack probe engine 55 modules had copied.
-//!   - (`bench`, the comparison skeleton, is its own module `benchkit` since
-//!     2026-11-14: no test imports it, and here every edit re-keyed 221
+//!   - (`bench`, the comparison skeleton, is its own module `benchkit`: no test imports it, and here every edit re-keyed 221
 //!     modules' tests.)
 //!   - `guard` — input/output buffers bounded by unreadable pages.
 //!   - `arbitrary` — typed values (structs, unions, slices, UTF-8 strings…) drawn
@@ -113,7 +112,7 @@ pub const expectSnapshotHex = snapshot.expectSnapshotHex;
 /// `GlobalBlock` there, which has no `.view()` method (`WindowsBlock`, which
 /// does, is not the type `native_os == .windows` selects) — so `getPosix`'s
 /// own body fails to compile for that target, regardless of how the result is
-/// used. Measured 2026-08-18: this was one defect copy-pasted into 42
+/// used. Measured: this was one defect copy-pasted into 42
 /// call sites across 26 modules (`if (std.testing.environ.getPosix("X_BENCH")
 /// == null) return error.SkipZigTest;` and this module's own `verboseSkip`),
 /// blocking the Windows cross-compile of every one of them.

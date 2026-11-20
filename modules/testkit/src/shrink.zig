@@ -89,8 +89,7 @@ fn Children(comptime harness: anytype) type {
         /// A fault (SIGSEGV, SIGILL, SIGBUS, SIGFPE) kills the child with
         /// its own signal. Zig's default handler prints a trace and then
         /// aborts, so every fault would end as SIGABRT, like a panic, and a
-        /// trap candidate would count as the panic it was meant to shrink
-        /// (mutation run 2026-10-27). Only the traced replay keeps the
+        /// trap candidate would count as the panic it was meant to shrink. Only the traced replay keeps the
         /// handler: its trace is the point of it.
         fn defaultFaultSignals() void {
             const act: std.posix.Sigaction = .{
@@ -171,7 +170,7 @@ pub fn shrink(comptime harness: anytype, gpa: std.mem.Allocator, opts: Options) 
     // The recorded tape must end the same way when REPLAYED, or every
     // candidate is judged against an outcome replay cannot produce and the
     // "smallest input" printed at the end is no reproducer (a harness that
-    // reads addresses or the clock; review 2026-10-27).
+    // reads addresses or the clock; review).
     if (!try s.tryTape(s.cur)) return error.NotReproducible;
     const from = s.cur.len;
     if (opts.report) std.debug.print("SHRINK {s} seed={d}: {f} after {d} choices\n", .{ opts.name, opts.seed, fmtOutcome(target, s.target_err), from });
@@ -496,7 +495,7 @@ test "shrink: a panic shrinks too (the child dies, the shrink does not)" {
 /// Two different errors: `Target` from 500 up, `Shadow` at 0 — the smaller
 /// input, which a shrinker that ignores the error name would walk into. The
 /// names are the same length, so a comparison of lengths alone does not
-/// tell them apart (mutation run 2026-10-27).
+/// tell them apart.
 fn twoErrors(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     const v = src.valueRangeAtMost(u32, 0, 1000);
     if (v == 0) return error.Shadow;
@@ -581,7 +580,7 @@ fn sliceThenByte(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void 
 test "shrink: a slice is cut whole, length and bytes together" {
     if (!child.supported) return error.SkipZigTest;
     // Several slice lengths: a power of two can also go by a block delete
-    // after its bytes were zeroed (mutation run 2026-10-27), others only whole.
+    // after its bytes were zeroed, others only whole.
     var found: usize = 0;
     var odd_len = false;
     var seed: u64 = 0;

@@ -105,7 +105,7 @@ pub const scratch_len = 4096;
 /// and `scripts/lib/test-lib.sh` fails any step that writes to stderr while
 /// passing — so a self-test that let `expectHex` refuse would have failed the
 /// gate, and consequently **no test asserted the refusals**. Measured at the
-/// 2026-09-04 audit pass: both guards deleted cleanly with the suite green,
+/// Audit pass: both guards deleted cleanly with the suite green,
 /// and swallowing the decode error made `expectHex("zz", &.{})` **pass** —
 /// a malformed golden compared as if it were an empty one.
 pub fn hexVerdict(expected_hex: []const u8, actual: []const u8) !void {
@@ -120,7 +120,7 @@ pub fn expectBytes(expected: []const u8, actual: []const u8) !void {
     if (diff(expected, actual) != null) report(expected, actual);
     // ⚠ The error comes from `verdict`, not from a `return` written here, so
     // the wiring between the decision and the failure is load-bearing.
-    // Measured 2026-09-04: deleting the bare
+    // Measured: deleting the bare
     // `return error.TestExpectedEqual` that used to sit at the end of this
     // function left the suite at 22/22 green while five of five unequal pairs
     // passed — `expectBytes` had become a printf.
@@ -284,7 +284,7 @@ test "hex-decoding the golden is checked before comparing" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

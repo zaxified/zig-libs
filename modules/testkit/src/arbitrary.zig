@@ -630,7 +630,7 @@ test "an allocation failure is an error, not a panic" {
     try testing.expectError(error.OutOfMemory, arbitrary([8][]const u8, Rng, &rng, fa.allocator(), .{}));
 }
 
-// ── mutation delta 2026-11-13: every draw pinned by a script ─────────────────
+// ── mutation delta: every draw pinned by a script ─────────────────
 //
 // `ScriptSource` reads big-endian octets and reduces modulo the span, so a
 // script chooses each branch and each boundary exactly; the random tests above

@@ -4,7 +4,7 @@
 //! A differential fuzz verdict cannot see a read past the end of the input
 //! when every implementation compared shares the code that reads it — and a
 //! many-pointer (`[*]u8`) read has no bounds check even under ReleaseSafe.
-//! brotli 2026-10-15: four decoders over one `HotBits` reader agreed on every
+//! brotli: four decoders over one `HotBits` reader agreed on every
 //! input while it read up to eight bytes past the end. Put the input at
 //! `tail(len)` and such a read faults on the spot, under the seed that made
 //! it; `head(len)` does the same for a read before the start.

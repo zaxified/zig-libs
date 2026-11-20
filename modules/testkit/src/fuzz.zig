@@ -39,7 +39,7 @@
 //! — the seed IS read and IS sitting in `buf`, and `len` is 0 anyway, because
 //! `bytes` consumed `@min(buf.len, in.len)` octets and the ranged draw then
 //! found fewer than the eight it needs and returned the range minimum
-//! (`std/testing/Smith.zig:445`). Measured directly on 2026-09-07 with an
+//! (`std/testing/Smith.zig:445`). Measured directly with an
 //! 18-octet seed: `buf[0] == 'G'`, `len == 0`. The harness fetches its input
 //! and then throws it away. `./scripts/checks/check-fuzz-reach.py` is the gate for
 //! that half; this module is the other half, and neither is sufficient alone.
@@ -321,8 +321,7 @@ test "seedInto: the runtime form reads back the same" {
     const n = smith.slice(&buf);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
     // Byte for byte the comptime form: Smith clamps a too-long length to the
-    // input it has, so the read-back above passes a wrong prefix as well
-    // (mutation run 2026-10-27).
+    // input it has, so the read-back above passes a wrong prefix as well.
     try std.testing.expectEqualSlices(u8, seed("hello"), s);
 }
 
@@ -406,7 +405,7 @@ test "a seed survives being handed to a second draw" {
     try std.testing.expectEqual(@as(u16, 42), smith.valueRangeAtMost(u16, 0, 256));
 }
 
-// ── sweep GK (2026-10-29) ────────────────────────────────────────────────────
+// ── sweep GK ────────────────────────────────────────────────────
 
 test "Cursor.ranged covers the full u32 span without overflow (sweep TK-5)" {
     // `at_most - at_least + 1` was a u32 sum: 0 at the full width, then a

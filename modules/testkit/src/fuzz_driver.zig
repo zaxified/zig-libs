@@ -2,8 +2,7 @@
 //! The deterministic fuzz driver: a verdict in seconds, from seeds.
 //!
 //! `zig build --fuzz` explores; for a verdict it is blind — no progress, exit
-//! 0 on a crash, no limit per input, so a hang reads as a slow run (measured
-//! 2026-09-27: 22 minutes on a bug this driver's shape found in 9 seconds).
+//! 0 on a crash, no limit per input, so a hang reads as a slow run (measured: 22 minutes on a bug this driver's shape found in 9 seconds).
 //! This runs the SAME harness over inputs drawn from seeds, in the ordinary
 //! test binary:
 //!
@@ -26,7 +25,7 @@
 //! process per job).
 //!
 //! Cost: 1.00–1.04× a bare seed loop over the same harness, seed file
-//! included (`zig build bench-testkit`, 2026-10-17).
+//! included (`zig build bench-testkit`).
 //!
 //! ## The harness is generic over its source of choices
 //!
@@ -333,8 +332,7 @@ var current_prefix: []const u8 = "";
 /// Bumped at every harness entry; `busy` while a harness runs. The watchdog
 /// samples both every 50 ms: the same generation still busy for longer than
 /// the limit is a hang. No clock is read per input — two reads per seed
-/// were a tenth of a cheap harness's time (`zig build bench-testkit`,
-/// 2026-10-17) — at the price of a hang being reported up to one sampling
+/// were a tenth of a cheap harness's time (`zig build bench-testkit`) — at the price of a hang being reported up to one sampling
 /// period after the limit.
 var dog_gen = std.atomic.Value(u64).init(0);
 var dog_busy = std.atomic.Value(bool).init(false);
@@ -462,7 +460,7 @@ fn readFile(gpa: std.mem.Allocator, path: []const u8, cap: usize) ![]u8 {
 /// Run `harness` once over the saved `--fuzz` input at `path`; its length.
 /// The whole file: one `read` into a fixed buffer replayed a saved input over
 /// 64 KiB (or a short read) cut short, and printed `ok` for an input that was
-/// never run (review 2026-10-27).
+/// never run.
 fn replayInput(comptime harness: anytype, gpa: std.mem.Allocator, path: []const u8) !usize {
     const input = try readFile(gpa, path, input_cap);
     defer gpa.free(input);
@@ -488,7 +486,7 @@ pub fn run(comptime harness: anytype, opts: Options) !void {
 /// A test must not chain `try run(a, …); try run(b, …);` — `run` skips a
 /// harness `_ONLY` leaves out by returning `error.SkipZigTest`, so the `try`
 /// ends the test there and every harness after it silently never runs (an
-/// `_ONLY=b` verdict "passed" having run zero seeds, traceroute 2026-10-31).
+/// `_ONLY=b` verdict "passed" having run zero seeds, traceroute).
 /// This runs each one, and skips the test only if none of them ran.
 pub fn runAll(comptime harnesses: anytype) !void {
     return runEach(harnesses, run);
@@ -613,7 +611,7 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
 /// mapped page is the page cache, so the text is in the file the moment it
 /// is stored — a crashing process cannot lose it — and a store is a
 /// `memcpy`. The `ftruncate` + `pwrite` this replaced cost ~9 µs per seed
-/// (measured 2026-10-17, `zig build bench-testkit`: a 0.3 µs harness ran at
+/// (measured, `zig build bench-testkit`: a 0.3 µs harness ran at
 /// 29× its bare-loop time), and every runner sets the seed file. The size
 /// changes only when the seed gains a digit. Falls back to a `pwrite` per
 /// seed when the mapping fails (the fd is not readable, say).
@@ -767,8 +765,7 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
     // :653 deinit): the 0.17 `testing.allocator` never reuses memory, so a
     // loop of thousands of seeds on one allocator only grows; a fresh one per
     // batch bounds that. Not one per seed: its `threads: [128]Thread` made
-    // init + deinit ~1 µs, 4.2x a 0.3 µs harness (bench-testkit `hex`,
-    // 2026-10-20). A leak still fails the seed that made it, by number:
+    // init + deinit ~1 µs, 4.2x a 0.3 µs harness (bench-testkit `hex`). A leak still fails the seed that made it, by number:
     // `SeedLedger` counts that seed's live allocations.
     var batch: ?std.heap.SafeAllocator = null;
     defer if (batch) |*b| {
@@ -906,7 +903,7 @@ const RunEachProbe = struct {
 };
 
 /// `runEach` that must have run something: a skip is a failure here, because
-/// a test that propagates `error.SkipZigTest` still exits 0 (mutation 2026-11-01:
+/// a test that propagates `error.SkipZigTest` still exits 0 (mutation:
 /// dropping `ran = true` and propagating a harness skip both "passed").
 fn runEachMustRun(comptime harnesses: anytype) !void {
     runEach(harnesses, RunEachProbe.runOne) catch |e| {
@@ -981,7 +978,7 @@ test "runAll: runs the real driver, which skips a harness whose environment is u
 }
 
 test "Rng: both ends of a range are drawn (a harness must reach its boundaries)" {
-    // Mutation 2026-10-17: an exclusive upper bound passed every other test.
+    // Mutation: an exclusive upper bound passed every other test.
     var prng = std.Random.DefaultPrng.init(1);
     var rng: Rng = .{ .r = prng.random() };
     var lo = false;
@@ -995,7 +992,7 @@ test "Rng: both ends of a range are drawn (a harness must reach its boundaries)"
 }
 
 test "Rng.slice: about half the draws on a big buffer are short (<= 64)" {
-    // Mutation 2026-10-17: dropping the short-length bias passed every other
+    // Mutation: dropping the short-length bias passed every other
     // test (a uniform draw over 1000 bytes is <= 64 about 6% of the time).
     var prng = std.Random.DefaultPrng.init(3);
     var rng: Rng = .{ .r = prng.random() };
@@ -1008,7 +1005,7 @@ test "Rng.slice: about half the draws on a big buffer are short (<= 64)" {
 }
 
 test "hit: counts every arrival per label" {
-    // Mutation 2026-10-17: a `hit` that registered labels but never counted
+    // Mutation: a `hit` that registered labels but never counted
     // passed every other test — and would print REACH lines that lie.
     resetReach();
     defer resetReach();
@@ -1235,7 +1232,7 @@ test "runSeeds: a range ending at the top of u64 runs every seed" {
     try testing.expectEqualSlices(u64, &.{ std.math.maxInt(u64) - 1, std.math.maxInt(u64) }, top_seeds[0..top_n]);
 }
 
-// ── sweep GK (2026-10-29) ────────────────────────────────────────────────────
+// ── sweep GK ────────────────────────────────────────────────────
 
 test "limitNs saturates instead of overflowing on a huge <PREFIX>_MS (sweep TK-1)" {
     try testing.expectEqual(@as(u64, 2_000_000_000), limitNs(2000));
@@ -1289,7 +1286,7 @@ test "Rng.valueRangeAtMost with at_least > at_most is a checked panic, with and 
     try expectAborts(rngInvertedTape);
 }
 
-// ── blind review (2026-10-29) ────────────────────────────────────────────────
+// ── blind review ────────────────────────────────────────────────
 
 fn tmpPath(buf: []u8, tmp: anytype, name: []const u8) ![]const u8 {
     return std.mem.print(buf, ".zig-cache/tmp/{s}/{s}", .{ &tmp.sub_path, name });

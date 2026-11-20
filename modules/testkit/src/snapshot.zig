@@ -22,7 +22,7 @@
 //!
 //! `@src()` yields file, line and column of the `@src()` token. The file is
 //! relative to the *module root directory* (the directory of the module's root
-//! source file), which a test binary does not know; measured 2026-11-15, in a
+//! source file), which a test binary does not know; measured, in a
 //! build-system test run `@src().file` was `probe.zig` for
 //! `modules/testkit/src/probe.zig` and the cwd was the repository root.
 //! So the path is resolved by search from the repository root (the nearest
@@ -1582,7 +1582,7 @@ test "expectSnapshot passes on equal values (the passing path writes nothing)" {
     , &.{ 0xca, 0xfe });
 }
 
-// ── tests added by the 2026-11-15 delta mutation audit ───────────────────
+// ── tests added by the delta mutation audit ───────────────────
 
 const builtin = @import("builtin");
 

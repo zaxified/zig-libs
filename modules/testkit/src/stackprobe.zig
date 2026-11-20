@@ -2,7 +2,7 @@
 
 //! Dead-stack residue probe — the shared engine.
 //!
-//! 55 modules carried a hand-written probe each (27.8k lines, 2026-10-09),
+//! 55 modules carried a hand-written probe each (27.8k lines),
 //! every one a copy of the same engine plus per-algorithm "needles": the
 //! bytes of every intermediate secret (an ECDSA nonce recovered from `(r,s)`,
 //! a WOTS+ chain value, an HKDF pad), re-derived by hand. Deriving those was
@@ -25,7 +25,7 @@
 //! check-secret-api.py` closes most of that statically (no by-value secret
 //! parameters or results on the public surface).
 //!
-//! Method (as the direct-region probes of 2026-10-08): the region is
+//! Method (as the direct-region probes of): the region is
 //! addressed directly, `pad` bytes under the probe's own stack position; the
 //! call runs under a `pad`-deep frame (`shim`) so its frames start inside the
 //! region, and `paint`/`snapshot` run at the probe's depth with frames far
@@ -33,7 +33,7 @@
 //! fill `undefined` with 0xaa, so a dead frame cannot be read there. The
 //! skip is RUNTIME (`enabled`), so a probe body is type-checked in every
 //! mode — a comptime skip left probes compiled only by the ReleaseFast run,
-//! and half of all dead-stack builds of 2026-10-08..09 failed on errors a
+//! and half of all dead-stack builds of..09 failed on errors a
 //! Debug `zig build check` would have shown in seconds.
 //!
 //! Every `run` re-measures three controls in the same binary first: a
@@ -222,7 +222,7 @@ pub fn Probe(comptime cfg: Config) type {
         }
 
         /// `inline`: as a frame of its own it ran the call deeper than the
-        /// region top `run` computed (2026-10-08).
+        /// region top `run` computed.
         inline fn measureOnce(call: *const fn () void) void {
             scrubCalleeSaved();
             paint();
@@ -499,7 +499,7 @@ fn shortBurnedEntry(secret: *const [48]u8, out: *[32]u8) void {
 }
 
 test "stackprobe: residue under a too-short burn fails on its own (no needle, a burn present)" {
-    // Mutation 2026-10-17: dropping the residue term from the verdict passed
+    // Mutation: dropping the residue term from the verdict passed
     // every other test — the unburned entry above fails on "no burn" anyway.
     try skipUnlessOptimized();
     std.crypto.hash.sha2.Sha384.hash("testkit stackprobe residue", &t_secret, .{});
@@ -539,7 +539,7 @@ test "stackprobe: `residue = false` lets public residue pass, never a needle" {
 }
 
 test "analyse: residue counts bytes that are neither zero nor paint, below the burn" {
-    // Mutation 2026-10-17: counting leftover PAINT as residue passed every
+    // Mutation: counting leftover PAINT as residue passed every
     // other test. Synthetic snapshot: paint, then 3 dirty bytes and 2 paint
     // bytes, then a zero run long enough to be the burn, then dirty above it.
     const P = Probe(.{ .window = 4096, .min_burn = 64 });

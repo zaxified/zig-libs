@@ -43,7 +43,7 @@ var debug_info_warm = false;
 /// child that panics or faults prints a stack trace (to /dev/null, usually),
 /// and symbolizing it from a cold start — opening and parsing the DWARF — is
 /// paid again by every child; forked after this, they inherit the parsed
-/// info. Measured 2026-10-17 on this module's panic-shrink test (Debug,
+/// info. Measured on this module's panic-shrink test (Debug,
 /// ~20 crashing children): 2.5 s cold, 0.07 s warm.
 fn warmDebugInfo() void {
     if (debug_info_warm) return;
