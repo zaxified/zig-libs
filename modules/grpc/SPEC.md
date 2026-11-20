@@ -38,7 +38,7 @@ Trailers-Only vs Trailers distinction; a decoded-size bound on every message (de
 never sizes an allocation), pure Zig with no C core, typed struct messages with no codegen step.
 **Where we are behind:** no compression, retries, name resolution/load balancing, interceptors,
 keepalive, `grpc-status-details-bin`, gRPC-Web, and no reflection service (the standard
-`grpc.health.v1` health service exists since 2026-11-16); the server is sequential per connection unless the application installs
+`grpc.health.v1` health service is provided, `src/health.zig`); the server is sequential per connection unless the application installs
 the `http` dispatcher (→ Backlog).
 
 See [README.md](README.md) for what this module is and how to use it.
@@ -48,20 +48,14 @@ protocol specification, plus [`doc/compression.md`](https://github.com/grpc/grpc
 for the server's answer to an encoding it cannot undo. Clean-room; the Python `grpcio` package is
 used only as a black-box test oracle. `Provenance:` see README.
 
-## The server, and what unblocked it
+## The server
 
-This module was client-only at first, and the blocker was one level down: `http`'s HTTP/2 server
-buffered every request body to END_STREAM before dispatching, and staged the whole response before
-re-framing it. A gRPC server on that could answer a unary call and nothing else — a
-client-streaming or bidirectional RPC would have had to receive its entire request before the
-handler ran, and a server-streaming one could not have emitted a message until it had produced
-all of them.
-
-`c742eef` fixed that in `http`, not here: `Options.h2_stream_request` opts a route into starting
-its handler at HEADERS and reading DATA as it lands (`RequestBody.external`), and the response
-side re-frames *as the handler writes* through the h2 `Framer`. Both halves of a stream can now
-be live at once, which is what all four call shapes need. The server here is built on exactly
-that surface — see `server.zig`.
+The server is built on `http`'s HTTP/2 server streaming surface: `Options.h2_stream_request` (which
+`Router.httpOptions` sets, `src/server.zig`) opts a route into starting its handler at HEADERS and
+reading DATA as it lands (`RequestBody.external`), and the response side re-frames *as the handler
+writes* through the h2 `Framer`. Both halves of a stream are live at once, which all four call
+shapes need: a client-streaming or bidirectional RPC cannot wait for its whole request before the
+handler runs, and a server-streaming one cannot stage every message before the first goes out.
 
 ### How the two response shapes are kept apart
 
@@ -103,12 +97,12 @@ a no-op.
 
 ### What the server does not do
 
-- **Concurrent handlers — not wired up here, but no longer absent.** `h2_server` gained an
+- **Concurrent handlers.** `h2_server` has an
   injectable dispatch seam (`h2_server.Options.dispatcher` / `Server.Options.h2_dispatcher`):
   with one installed, a connection's streams run on a bounded worker pool and a slow handler no
   longer holds up the others. `grpc.Server` does not install one — it passes the `http` options
-  through, so the choice (and the thread pool) belongs to the application. **Left as-is, the
-  default is still sequential**: one connection's streams are served on the connection's task,
+  through, so the choice (and the thread pool) belongs to the application. **The
+  default is sequential**: one connection's streams are served on the connection's task,
   and only multiple *connections* run in parallel via the accept engine.
 - **Preemptive deadlines.** `grpc-timeout` is enforced at every engine boundary, but a handler
   blocked in a body read cannot be interrupted — there is no deadline hook on the h2 request-body
@@ -269,7 +263,11 @@ rather than appended alongside ours. Two `grpc-timeout` headers, or a `grpc-stat
 *request*, are a way to confuse an intermediary that reads one of them; letting the last one win
 is the shape of request smuggling.
 
-### 7. Deadlines round up
+### 7. `-bin` metadata is coded in constant time
+
+A `-bin` value may carry a token or key, so its base64 goes through `b64ct.standard_no_pad` (`src/metadata.zig`), not `std.base64`. Peers emit and expect no padding; on receive any trailing padding is trimmed before decoding, so both spellings are accepted.
+
+### 8. Deadlines round up
 
 `grpc-timeout` allows at most 8 digits plus a unit, so a duration is converted to the finest unit
 that fits. The conversion rounds **up**: rounding down would silently shorten the caller's
@@ -277,7 +275,8 @@ deadline and cancel a call it still wanted.
 
 ## Verification
 
-Four layers, and they answer different questions.
+`scripts/modtest grpc` (the `test-grpc` step) needs nothing but Zig: no `python3`, no network, no child
+process, nothing skipped. Four layers, and they answer different questions.
 
 **Unit tests** (`status.zig`, `frame.zig`, `metadata.zig`, `call.zig`, `server.zig`) pin the pure
 functions: header layout, the percent-coding round trip, base64 `-bin` handling, the timeout
@@ -298,11 +297,9 @@ a header or a trailer?" is unanswerable from field values and trivial from frame
 mutation of the two response paths dies here, including the one the live reference does not
 catch.
 
-**The external anchor** is the module's real evidence, and it runs in **both directions**. Since
-2026-09-06 it runs in two places, for one reason: `test-grpc` used to spawn Python `grpcio` and
-"skip loudly" without it, and a skip is a pass — so on any host without grpcio the strongest
-evidence this module has quietly evaporated, while every consumer of the library still carried
-two `@embedFile`d Python scripts inside `src/`.
+**The external anchor** is the module's real evidence, and it runs in **both directions**. It runs in
+two places, so that no host loses it for lack of Python (a skipped test is a pass) and no consumer
+carries a foreign script inside `src/`.
 
 - **`tools/interop.zig`** (`zig build interop-grpc`) does the *taking*: it spawns
   `tools/reference_server.py` / `tools/reference_client.py`, talks to them over real sockets, and
@@ -352,153 +349,44 @@ third-party h2 peer the `http` module's client *and server* have faced: preface,
 flow control, DATA framing, trailer sections and the incremental request-body surface are all
 being validated against a stack that has never seen our code.
 
-### Mutation testing — the client
+**What the suite is built to catch.**
 
-Fourteen mutations were applied to the implementation and the whole suite re-run — twice: once
-in full, and once with the interop tests forced to skip (`GRPC_PYTHON` pointed at a nonexistent
-interpreter), which answers "what would we know *without* the reference?".
-
-✅ **Re-run against the replay, 2026-09-06.** The "Offline-only" column above was retired: it
-named a `test-grpc` configuration (interop forced to skip) that no longer exists — `test-grpc`
-is now always hermetic and always includes the replayed reference evidence, so there is exactly
-one number per mutation, not two. It is replaced by **`test-grpc` (replay)**, measured directly:
-each mutation applied to a clean tree, `./scripts/lib/capped zig build test-grpc --summary all` run
-(119 tests total), the failure/crash counts read off the summary, then `git checkout` to restore
-before the next one. A no-op control (an added comment, no behavior change) was run first and
-last and stayed green both times (119/119), so the runner itself is not the thing that changed
-between rows. Every one of the 22 mutations below was caught — the suite went red — and every
-one compiled cleanly (`grep`-checked for `\.zig:[0-9]+:[0-9]+: error:` in each log; none found).
-The old "Full suite" column is kept for its historical value (it is not something this pass
-re-verified, since `interop-grpc` spawns a real Python peer and was out of scope here) but note
-one thing it gets wrong now: mutations 1, 2 and S3 no longer **hang**. A live `grpcio` peer
-genuinely blocked forever on a five-byte prefix claiming an enormous length; the replay has no
-socket to hang on — it just reads the recorded bytes back and the byte-golden assertions fail
-immediately. The mutation still dies, just by a different mechanism.
-
-| # | Mutation | Full suite (historical, live) | `test-grpc` (replay, 2026-09-06) |
-|---|---|---|---|
-| 1 | LPM length little-endian, **consistently** in writer and reader | **hangs** | 23 fail, 1 crash |
-| 2 | Compressed flag after the length, **consistently** in both halves | **hangs** | 27 fail, 1 crash |
-| 3 | A split message handed over short instead of waited for | 7 (+ live reassembly) | 8 fail, 1 crash |
-| 4 | `grpc-status` read from the response headers, not the trailers | 17 (+ 9 live) | 18 fail |
-| 5 | Trailers-Only not detected (an error reads as an empty body) | 5 (+ 2 live) | 5 fail (+1 leak) |
-| 6 | A non-OK status not raised as an error | 6 (+ 3 live) | 6 fail |
-| 7 | `max_recv_message_size` not enforced | 10 (+ live limit) | 4 fail (+2 leaks) |
-| 8 | `grpc-status` parsed leniently (`parseInt` with no prescan) | 3 | 3 fail |
-| 9 | `grpc-message` passed through raw, not percent-decoded | 3 (+ live failure) | 3 fail |
-| 10 | `-bin` metadata sent raw instead of base64 | 3 (+ live metadata) | 4 fail, 1 crash |
-| 11 | `te: trailers` omitted from the request | 13 (+ **all 12 live**) | 1 crash |
-| 12 | `grpc-timeout` rounded down instead of up | 1 | 1 fail |
-| 13 | Response `content-type` not validated | 1 | 1 fail |
-| 14 | A stream ending mid-message accepted as a clean end | 3 | 4 fail |
-
-Every mutation died, and none of them needed the reference to die — which is the point of how
-the offline suite is written, not a sign that the anchor is redundant. Mutations 1, 2 and 10 are
-exactly the consistent-in-both-halves kind, and the tests that caught them offline are the ones
-that write **literal expected bytes** down (`frame.zig`'s header/encode tests, `call_test.zig`'s
-request byte-golden, the adversarial hand-written frames). The round-trip tests beside them
-stayed green: under mutation 1, "one message split across DATA frames, at every split point",
-"three messages inside ONE DATA frame" and the whole unary happy path all pass, because both
-halves agree with each other. Had the suite been written as round trips — the obvious way — those
-three mutations would have survived it entirely.
-
-What the reference adds is that it does not depend on us having thought to write a golden down.
-Mutation 11 is the clearest case: omitting `te: trailers` is caught offline by exactly **one**
-assertion — the one that happens to check for the header — and by **all twelve** live tests,
-because grpcio rejects the request outright. And mutations 1 and 2 do not merely fail against the
-reference, they **hang**: grpcio reads our five-byte prefix, believes the enormous length it
-declares, and waits for a message that will never arrive. A wrong-framing client does not get a
-clean error from the network; it gets silence.
-
-### Mutation testing — the server
-
-Eight more, same protocol. The "Offline-only" column is retired for the same reason as the
-client table above — replaced by `test-grpc` (replay), measured 2026-09-06 the same way (clean
-mutation, `./scripts/lib/capped zig build test-grpc --summary all`, counts read off the summary,
-restore, repeat; no-op control green before and after). All eight died; none failed to compile.
-
-**S7 needs a caveat the client mutations do not.** The SPEC previously recorded S7 as the sharpest
-result in the file: turning the streaming predicate off killed **zero** offline tests, because the
-old offline harness staged the whole request before the server ran — a body buffered to
-END_STREAM read back identically. Only a *live* run caught it, and only because the interleaved
-bidirectional call genuinely deadlocked (our server waiting for END_STREAM, the reference waiting
-for a reply before sending the next request, neither moving). The replay is not live traffic — it
-is recorded bytes fed back with no real concurrency — so it **cannot** reproduce that deadlock
-either, live-only property or not. What it caught instead is a different, real consequence of the
-same mutation: with every request now buffered ahead of dispatch, the 128 KiB-over-a-64-KiB-limit
-request (`toolarge.code`) no longer gets a clean `RESOURCE_EXHAUSTED` — buffering hits a
-transport-level body limit before the gRPC deframer ever sees the frame, and the assertion fails
-with "no grpc-status on the response at all". So the suite does go red under replay, but not
-because the interleaved-deadlock property became visible offline; that property is still provably
-invisible without a live, genuinely concurrent peer, and remains this repository's argument for
-keeping `interop-grpc` as a pre-release check rather than retiring it now that replay exists.
-
-| # | Mutation | Full suite (historical, live) | `test-grpc` (replay, 2026-09-06) |
-|---|---|---|---|
-| S1 | `grpc-status` set as a response **header** instead of a trailer | 9 (+ live) | 4 fail, 7 crash |
-| S2 | The Trailers-Only path emits a trailer section as well | 10 (**live: no**) | 11 fail |
-| S3 | LPM length little-endian, **consistently** in writer and reader | **hangs** | 23 fail, 1 crash |
-| S4 | A non-OK status never reaches the client (always `0`) | 11 (+ live) | 12 fail |
-| S5 | `max_recv_message_size` not applied to request messages | 3 (+ live) | 3 fail |
-| S6 | Trailers-Only decided by "the call failed", not "nothing sent yet" | 3 (+ live) | 2 fail, 1 crash |
-| S7 | Request bodies buffered to END_STREAM (streaming predicate off) | 1 (**live only**) | 1 fail (different cause — see above) |
-| S8 | A non-gRPC `content-type` accepted instead of answered 415 | 1 (**live: no**) | 1 fail |
-
-Every one died. Four of them are worth reading closely, because they are the ones that say
-something about *how* the suite is written rather than that it exists.
-
-**S2 is the counter-example to "the reference is always the stronger oracle."** Emitting a
-trailer section on the Trailers-Only path leaves every field value identical — same status, same
-message, same metadata, same names — and grpcio accepts it without complaint. The live test does
-not notice. Ten offline tests do, because they count field blocks: `isTrailersOnly()` asserts
-`headers_end_stream and data_frames == 0 and trailers == null`, and all three clauses are
-load-bearing. This is the single most likely thing to get wrong in a gRPC server and the only
-way to see it is to look at frames.
-
-**S6 is the plausible version of the same bug** — "Trailers-Only is the error shape" is a
-reasonable-sounding rule and it is wrong in both directions: a successful call with no messages
-must be Trailers-Only, and a failing call that already sent messages must not be. grpcio reports
-`UNKNOWN: "No status received"` for it, which is what a real client does when a server writes
-the status somewhere the response cannot carry it.
-
-**S1 is what a wrong answer looks like at the HTTP/2 layer**, not the gRPC layer: grpcio fails
-with `UNKNOWN: "Stream removed (Data frame with END_STREAM flag received)"`. Putting the status
-in the head means the head is no longer withheld, END_STREAM lands on the last DATA frame, and
-the trailer section it then sends is a protocol violation the peer rejects outright.
-
-**S7 is the opposite lesson from S2, and the sharpest result in the table**: turning the
-streaming predicate off kills **zero** offline tests. The offline harness stages the whole
-request before the server runs, so a body buffered to END_STREAM reads back identically —
-correct-looking, and unbuildable as a real gRPC server. Only the live run catches it, where the
-interleaved bidirectional call deadlocks: our server waits for END_STREAM, grpcio waits for
-reply N before sending request N+1, neither moves, and the reference reports `UNAVAILABLE:
-"Stream removed (Socket closed)"` after its watchdog fires. That is why the reference client's
-bidirectional generator is written to withhold its next request until the previous reply lands —
-a shape that "works" against a cooperative peer that sends everything up front is not the same
-as one that works. This is still true of the replay lane added 2026-09-06 — see the caveat above
-the mutation table: replay has no live concurrency to deadlock, so it cannot see this specific
-property either, though the same mutation does turn the replay suite red for an unrelated reason.
-
-S3 confirms on the server what the client mutations already showed, and adds one thing: a
-consistently little-endian length is invisible to every round trip and dies to the tests that
-write the bytes down — including `server_test.zig`'s "the length prefix is big-endian on the
-wire, byte for byte", which asserts the response body is literally `00 00 00 00 03 'A' 'B' 'C'`.
-Against the reference it does not fail, it **hangs** in both directions, which is what
-mis-framing looks like on a network.
+- *Consistent-in-both-halves wire mistakes* (a little-endian length, the compressed flag after the
+  length, `-bin` sent raw): invisible to any self round trip, because both halves agree. They die to the
+  tests that write **literal expected bytes** (`frame.zig`'s header/encode tests, `call_test.zig`'s
+  request byte-golden, the adversarial hand-written frames, `server_test.zig`'s "the length prefix is
+  big-endian on the wire, byte for byte") and to the reference, against which a mis-framing peer does
+  not fail cleanly but hangs, the reference waiting for a message of the declared length.
+- *Trailers-Only vs a trailer section*: same field names, so grpcio accepts the wrong shape and the live
+  reference is **not** the stronger oracle here; `isTrailersOnly()` (headers END_STREAM, no DATA frame, no
+  trailers — all three clauses load-bearing) is, and the response shapes are asserted on frames.
+- *The streaming predicate*: a request body buffered to END_STREAM reads back identically offline;
+  only a live, genuinely concurrent peer (an interleaved bidirectional call whose generator withholds
+  request N+1 until reply N lands) deadlocks on it. Replay carries recorded bytes with no concurrency and
+  cannot see that, which is why `zig build interop-grpc` stays a pre-release check beside the replay.
+- *Mutation:* the client and server were mutated by hand (every one of the 22 was caught by the hermetic
+  `test-grpc`); the card's `**Audit:**` line is the score.
 
 ### Fuzzing
 
-Two harnesses (`adversarial.zig`), matching the repository's "never panic on arbitrary input"
-threat model: the deframer fed arbitrary bytes in arbitrary chunk sizes, and the field parsers
-(`grpc-status`, `grpc-timeout`, `grpc-message` percent-coding, `-bin` base64) fed arbitrary
-bytes.
+Deterministic driver `GRPC_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`; harness names
+`grpc-<file>-<function>`), matching the repository's "never panic on arbitrary input" threat model:
+`grpc-adversarial-deframerNeverPanics` (the deframer fed arbitrary bytes in arbitrary chunk sizes),
+`grpc-adversarial-fieldValuesNeverPanic` (the field parsers: `grpc-status`, `grpc-timeout`,
+`grpc-message` percent-coding, `-bin` base64) and `grpc-call_test-responseShape` (the client against
+an arbitrary response shape).
 
-## Not implemented, and why
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+
+## What is deliberately not done
+
+Each item is refused with its reason here; the ones that are open work are also under *Backlog / deferred*.
 
 - **Message compression** (`grpc-encoding: gzip`/`deflate`/`snappy`). Doing it right means
   bounding the *decompressed* size against `max_recv_message_size` — a decompression bomb is a
   second, independent instance of invariant 1, and deserves its own design pass rather than being
-  bolted on. Until then the client advertises `identity` only and refuses a compressed frame
+  bolted on. The client advertises `identity` only and refuses a compressed frame
   loudly. This is the most likely next addition.
 - **Retries and hedging** (`grpc-retry-pushback-ms`, the service-config retry policy). Retry
   policy needs a channel that owns its connection lifecycle; this one borrows a session.
@@ -525,14 +413,9 @@ bytes.
 
 ## Backlog / deferred
 
-- **Constant time — DONE 2026-10-18**: `-bin` metadata now goes through `b64ct.standard_no_pad` (metadata.zig); padding is still trimmed before decoding, so both spellings are accepted.
-Every item below is also listed under *Not implemented, and why*; the survey tags the ones a
-typical grpc-go/tonic user hits in ordinary use.
+Reasons for each are under *What is deliberately not done*; the first four are what a typical grpc-go/tonic user hits in ordinary use.
 
-- **(survey 2026-09-30) Message compression (gzip, deflate)** — a peer that mandates gzip cannot be talked to, and `grpc-accept-encoding: identity` only is unusual next to grpc-go/tonic. Needs a decompressed-size bound (second instance of invariant 1). Effort: medium (gzip decoder already exists in `http`; the bound is the design work). Fits §2: yes.
-- ✅ DONE 2026-11-16 (`grpc.Health` registry + `grpc.health.Service(getFn)` / `grpc.health.service_from_context` over `Methods`: `Check`, `Watch`; unknown service = NOT_FOUND in Check, SERVICE_UNKNOWN in Watch; `shutdown()` drains watchers; src/health.zig) **(survey 2026-09-30) Standard `grpc.health.v1` service** (Check/Watch) — Kubernetes gRPC probes and load balancers expect it; the `health` module is HTTP-only. Effort: small (a service definition over `Methods`, plus a status registry). Fits §2: yes.
-- **(survey 2026-09-30) Interceptors / middleware hooks** (auth, logging, metrics on client and server) — a grpc-go/tonic staple; absent, every caller wraps calls by hand. Effort: medium (needs an API decision). Fits §2: yes.
-- **(survey 2026-09-30) Default server concurrency** — a connection's streams run sequentially unless the application installs the `h2_server` dispatcher; a slow handler blocks the connection. Effort: small–medium (wire a pool option into `grpc.Server`). Fits §2: yes.
-- **(survey 2026-09-30) Retries/hedging, name resolution and load balancing, keepalive, `grpc-status-details-bin`, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 7 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Message compression (gzip, deflate)** — a peer that mandates gzip cannot be talked to, and `grpc-accept-encoding: identity` only is unusual next to grpc-go/tonic. Needs a decompressed-size bound (a second instance of invariant 1). Effort: medium (a gzip decoder already exists in `http`; the bound is the design work). Fits §2: yes.
+- **Interceptors / middleware hooks** (auth, logging, metrics on client and server) — a grpc-go/tonic staple; absent, every caller wraps calls by hand. Effort: medium (needs an API decision). Fits §2: yes.
+- **Default server concurrency** — a connection's streams run sequentially unless the application installs the `h2_server` dispatcher; a slow handler blocks the connection. Effort: small–medium (wire a pool option into `grpc.Server`). Fits §2: yes.
+- **Retries/hedging, name resolution and load balancing, keepalive, `grpc-status-details-bin`, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.

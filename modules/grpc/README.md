@@ -14,7 +14,7 @@ ordinary Zig structs with a `pb_fields` descriptor.
   HTTP/2 peer the `http` module's h2 client and h2 server have talked to.
 - **Platform:** any. **Role:** both. **Concurrency:** single-owner (one task drives a channel;
   the server's handlers run on the connection's task).
-- **Deps:** `http`, `protobuf`.
+- **Deps:** `http`, `protobuf`, `b64ct` (constant-time `-bin` base64), `clock`.
 
 Provenance: the `grpc-over-http2` protocol specification and `doc/compression.md` are public
 specifications (merger doctrine — CONVENTIONS.md §5); clean-room, no gRPC implementation source
@@ -315,11 +315,11 @@ Offline, the server tests put an `h2.Connection` in client role on the other end
 carried END_STREAM, whether a DATA frame exists at all. That is the only way to see the
 Trailers-Only distinction, since both shapes use the same field names.
 
-## Not implemented
+## Not provided
 
 Message **compression** (`grpc-encoding` other than `identity`) — a compressed frame is refused
 rather than handed to the decoder as if it were plaintext. **Retries**, **channel load balancing
 / name resolution**, **`grpc-status-details-bin`** (the `google.rpc.Status` detail payload),
 **gRPC-Web** framing, and **reflection** services (the standard health service is provided, see Server). On the server: concurrent handlers (`h2_server`
 has the dispatch seam, but `grpc.Server` installs no pool of its own — the default stays
-sequential per connection) and preemptive deadline cancellation. See SPEC.md for why each.
+sequential per connection) and preemptive deadline cancellation. See SPEC.md *What is deliberately not done* for why each, and *Backlog / deferred* for the ones that are open work.
