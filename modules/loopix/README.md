@@ -63,11 +63,10 @@ mix.attack = .{ .mix = loopix.PROVIDER_CFG.mixNode(1, 0), .start = 700, .stop = 
 - **The three irreducible mixing functions in `mixing.zig`** —
   `sampleExpDelay` (memoryless integer delay, the discrete geometric law),
   `scheduleRelease` (the Poisson mix's per-arrival hold), `nextCover` (the
-  Poisson cover process) — are implemented for real
-  (`gate.fable_core_implemented = true`), and the test that drives the real
-  `Loopix` mix through netsim now runs (not skipped): the real Poisson mix
-  satisfies `AnonymityBound` across a seed sweep while the FIFO and no-cover
-  controls fail it. See SPEC.md's "Part 2 result" for the measured numbers.
+  Poisson cover process). The test that drives the real `Loopix` mix through
+  netsim runs (`gate.fable_core_implemented = true`, nothing is skipped): the
+  real Poisson mix satisfies `AnonymityBound` across a seed sweep while the FIFO
+  and no-cover controls fail it. See SPEC.md's "Mixing core" for the bound.
 
 ## API
 
@@ -85,12 +84,23 @@ mix.attack = .{ .mix = loopix.PROVIDER_CFG.mixNode(1, 0), .start = 700, .stop = 
   (1/λ), test-traffic `real_period`, and the control's `fifo_delay`.
   `MsgKind` (`real`/`loop_cover`/`drop_cover`), `MixHeader`, `pickRoute`,
   `pickDestClient`, `HopInstruction`.
-- `sampleExpDelay` / `scheduleRelease` / `nextCover` — the mixing core
-  (implemented). `Prng` / `CoverEvent` — the seeded randomness they use.
+- `sampleExpDelay` / `scheduleRelease` / `nextCover` — the mixing core.
+  `Prng` / `CoverEvent` — the seeded randomness they use.
+- `PROVIDER_CFG` / `providerScenario` — Loopix as deployed (clients behind
+  providers with mailboxes, sender-chosen holds); `DEFAULT_CFG` / `scenario` —
+  the plain stratified run with mix-chosen holds. `measureEndToEnd` /
+  `SenderBound` / `SenderResult` / `Origin` — end-to-end sender anonymity.
+  `Attack` / `Alarm` / `Delivery` / `TrafficStats` — the n−1 attacker, the
+  loop-cover alarm, delivery records and the traffic cost.
 
 - **Role:** util. **Platform:** any (pure simulation). **Deps:** `netsim` (the
   seeded discrete-event simulator that runs the mixnet + observes link timing)
   and `sphinx` (the mix packet substrate). **Concurrency:** single-owner.
+
+## Not provided
+
+No real transport (it is a simulator, not a node), no PKI, no cascade or batch-and-reorder mixing, no
+receiver-side metric: see SPEC.md *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from the Loopix paper (Piotrowska et al., USENIX Security
 2017); Sphinx packet reused from this repo's `sphinx` module. No third-party
@@ -113,8 +123,8 @@ all pass, no skips. Highlights:
   modes;
 - the **real `Loopix` mix**, driven through netsim across a seed sweep,
   satisfies `AnonymityBound` while the FIFO/no-cover controls fail it under
-  identical measurement — see SPEC.md's "Part 2 result" for the numbers.
+  identical measurement.
 
 See `SPEC.md` for the threat model, the anonymity invariant + how the adversary
-measures linking advantage, the Fable-vs-mechanical split, and the scoped-out
-increments.
+measures linking advantage, the mixing core, the known limits and the open
+backlog.

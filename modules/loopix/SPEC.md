@@ -14,7 +14,7 @@
 
 **Evidence:** unclassified
 
-What the tests check instead of a model (was `**Evidence:** model` until 2026-11-15, when the card had to name its model and there is none): anonymity invariant over seed sweep incl. fuzzed faults, controls must fail; header decode fuzz (invariant checker, no independent model)
+What the tests check instead of a model: anonymity invariant over seed sweep incl. fuzzed faults, controls must fail; header decode fuzz (invariant checker, no independent model)
 
 **Known defects:** none recorded
 
@@ -69,11 +69,11 @@ around that seam:
 
 Layout mirrors the repo's scaffold→gate→positive-control→harness pattern
 (`df-elect`, `raft`): `types.zig` (config + header codec), `routing.zig`
-(stratified routes + the Sphinx proof), `mixing.zig` (**the mixing core, now
-implemented — see "Part 2 result" below**), `adversary.zig` (**the anonymity
+(stratified routes + the Sphinx proof), `mixing.zig` (**the mixing core — see
+"Mixing core" below**), `adversary.zig` (**the anonymity
 invariant + measurement — the real content**), `protocol.zig` (the
 `netsim.Protocol` consumers + the FIFO positive control), `gate.zig` (the one
-switch, now flipped `true`).
+switch, `fable_core_implemented`, `true`).
 
 ## Threat model — the anonymity invariant, and how it is measured
 
@@ -124,70 +124,51 @@ flukes:
   still memoryless, but at a low real-traffic rate a mix often holds a *single*
   packet, so the causal candidate set is `{d*}` — effective set collapses to 1
   even though `p(d*)` looks unremarkable. It fails clause 1. (Demonstrated by
-  `adversary.zig`'s synthetic thin-pool test; the running no-cover control, now
-  that the core is implemented, confirms clause-1 teeth for real — measured
-  `min_eff_set 1.06` against the `2.0` bound, see "Part 2 result" below.)
+  `adversary.zig`'s synthetic thin-pool test; the running no-cover control
+  confirms clause-1 teeth against the real core, see "Mixing core" below.)
 
 The separation is **1.0 vs ~1/pool, not 0.6 vs 0.4** — there is no seed on which
 FIFO "accidentally mixes", so no threshold tuning can make the teeth flaky. The
 metric is a pure function of a concrete transcript, itself a pure function of the
 netsim seed, so a seed sweep just averages independent draws (LLN). This
 robustness is the design's whole point and the reason the harness — not the
-mixing core itself — is the Fable-worthy work.
+mixing core itself — is where the design's weight lies.
 
-## The Fable boundary — and an honest tier call for the core
+## Mixing core
 
-**Core (`mixing.zig`, now implemented — see "Part 2 result" below):**
+`mixing.zig` holds the three functions the anonymity strategy rests on:
 
-- `sampleExpDelay(prng, mean) Time` — a **memoryless integer** delay draw. The
-  one real subtlety: netsim time is integer ticks, and a floored *continuous*
-  exponential (`@intFromFloat(-mean*ln u)`) is NOT memoryless — the discrete
-  memoryless law is the **geometric** distribution. This is the single place a
-  filler-in could quietly get the anonymity-relevant detail wrong (flagged in
-  the code).
-- `scheduleRelease(prng, cfg, arrival) Time` — the Poisson mix's per-arrival
-  hold/release decision (`arrival + sampleExpDelay(_, mean_delay)`).
-- `nextCover(prng, cfg) CoverEvent` — the Poisson cover process (exponential
-  inter-arrival + loop/drop choice).
-
-**Honest tier call: the gated core is Opus-doable, not genuine-Fable.** Having
-designed it: all three functions are textbook inverse-CDF exponential sampling +
-scheduling. Given this harness — which states *exactly* what "correct" means (a
-run that satisfies `AnonymityBound`) — a strong Opus pass would implement them
-correctly. The one genuine subtlety (discrete geometric vs floored exponential)
-is called out inline; a careful Opus handles it, and even a slightly-wrong hold
-distribution would likely still clear a loose threshold. The **Fable-worthy
-intellectual content is this scaffold pass**: the anonymity invariant, the GPA
-threat model, the spike-vs-smooth-kernel insight that makes FIFO fail
-deterministically, and the robust min/max aggregation that keeps the metric from
-being flaky. That matches the repo's refined Fable-tier heuristic for
-protocol-soundness veins (the scaffold holds the value; the core-impl is Opus).
-Dispatch Part 2 (fill the three stubs + retune `AnonymityBound` against the real
-mix's measured behaviour + flip the gate) to **Opus**.
-
-### Part 2 result (core implemented, gate flipped)
+- `sampleExpDelay(prng, mean) Time` — a **memoryless integer** delay draw. Netsim time is integer
+  ticks, and a rounded continuous exponential is not memoryless — the discrete memoryless law is the
+  **geometric** distribution; this is the one place the anonymity-relevant detail can quietly go wrong.
+- `scheduleRelease(prng, cfg, arrival) Time` — the Poisson mix's per-arrival hold/release decision
+  (`arrival + sampleExpDelay(_, mean_delay)`).
+- `nextCover(prng, cfg) CoverEvent` — the Poisson cover process (exponential inter-arrival + loop/drop choice).
 
 - **Sampling law.** `sampleExpDelay` uses the geometric inverse-CDF
-  `hold = ⌊ln(u) / ln(1 − 1/mean)⌋` — constant per-tick release hazard `1/mean`,
-  i.e. genuinely memoryless in discrete time. Note a precision correction to the
-  inline warning: `⌊−mean·ln u⌋` is *also* geometric (with ratio `e^{−1/mean}`)
-  and *is* memoryless at tick boundaries — the two differ only at `O(1/mean²)`.
-  The real trap is *rounding* (`round`/nearest), which gives the zero bucket
-  half-width and breaks constant hazard near 0. The chosen ratio `(1 − 1/mean)`
-  matches the adversary's `e^{−δ/mean}` kernel to `O(1/mean²)`, so the hold pmf
-  is `∝` the adversary's likelihood — no departure stands out.
-- **Measurement basis.** Anonymity is scored on a **clean** run (global *passive*
-  adversary on a functioning network — the fault fuzzer is an *active* adversary,
-  out of scope) over the **steady-state** window (finite-horizon cool-down
-  excluded; `measureSteadyState` relabels late arrivals to cover so they still
-  swell pools but are not scored — `adversary.measure` itself is untouched).
-- **Measured separation** (worst-case over 50 seeds, each mix scored with its own
-  law): correct Poisson mix `min_eff_set 2.80 / max_link 0.77` (0 of ~24.5k
-  targets below set-2); FIFO `1.00 / 1.00` (every target pinned); no-cover
-  `1.06 / 0.99`. The bound `(2.0, 0.9)` passes the correct mix with margin on
-  both clauses and fails both controls decisively — see `types.zig`.
+  `hold = ⌊ln(u) / ln(1 − 1/mean)⌋` — constant per-tick release hazard `1/mean`, i.e. genuinely
+  memoryless in discrete time. `⌊−mean·ln u⌋` is *also* geometric (with ratio `e^{−1/mean}`) and *is*
+  memoryless at tick boundaries — the two differ only at `O(1/mean²)`. The real trap is *rounding*
+  (`round`/nearest), which gives the zero bucket half-width and breaks constant hazard near 0. The chosen
+  ratio `(1 − 1/mean)` matches the adversary's `e^{−δ/mean}` kernel to `O(1/mean²)`, so the hold pmf is `∝`
+  the adversary's likelihood — no departure stands out. A `mean ≤ 1` degenerates to an immediate release.
+- **Release by own timer.** Each held packet carries its own scheduled release time and the mix releases by
+  that time, not front-first: releasing the oldest arrival on every timer would forward identities in strict
+  arrival order whatever the hold law, an order-preserving mix a Kerckhoffs adversary unlinks with
+  probability 1 even though the departure times look exponential. The memorylessness test
+  (`reorderStats`) pins it.
+- **Measurement basis.** Anonymity is scored on a **clean** run (a global *passive* adversary on a
+  functioning network — the fault fuzzer is an *active* adversary, out of scope) over the **steady-state**
+  window (finite-horizon cool-down excluded; the seed-sweep tests' `measureSteadyState` helper relabels late
+  arrivals to cover so they still swell pools but are not scored — `adversary.measure` itself is untouched).
+- **The bound.** `AnonymityBound` defaults to `min_effective_set = 2.0`, `max_link_prob = 0.9`, set
+  against the real Poisson core's measured behaviour over 50 seeds, each mix scored with its own law (the
+  figures are in the `AnonymityBound` doc comment in `types.zig`). The seed-sweep test requires the real
+  mix to clear the bound with margin (worst effective set ≥ bound + 0.5, worst link probability ≤ bound −
+  0.05), and requires FIFO (every target pinned: set 1, link probability 1) and the no-cover control (set
+  near 1) to fail it on both clauses.
 
-## Phase 2 (2026-10-04): providers, sender-chosen delays, end to end, n−1
+## Providers, sender-chosen delays, end to end, n−1
 
 - **Providers with mailboxes** (`LoopixConfig.providers`, `PROVIDER_CFG`,
   `providerScenario`): client `c` sends through and receives at provider
@@ -220,57 +201,62 @@ mix's measured behaviour + flip the gate) to **Opus**.
 - **Traffic cost** (`TrafficStats`): real/cover packets sent, delivery,
   end-to-end latency (mean/max), cover overhead per real packet.
 
-## Scoped out of Phase 1 (documented increments)
+## Known limits
 
-- ~~Full clients/providers/PKI.~~ Providers and mailboxes: **done (Phase 2)**.
-  A PKI distributing mix keys/epochs is still not modeled (routing is a
-  deterministic hash).
-- ~~Sender-chosen per-hop delays.~~ **Done (Phase 2)**; mix-chosen remains the
-  `DEFAULT_CFG` variant.
-- ~~n−1 active-attack detection.~~ **Done (Phase 2)**, for a blocking attacker
-  on one mix.
-- ~~End-to-end (composed) anonymity.~~ **Done (Phase 2)**: sender anonymity.
-  Receiver-side and sender–receiver unlinkability are Backlog.
-- **Retuning `AnonymityBound`.** DONE (Part 2). The defaults are now
-  `min_effective_set = 2.0`, `max_link_prob = 0.9`, set against the real Poisson
-  core's measured behaviour (like `df-elect`'s `maxBadDfWindow`) — see the
-  measurement basis in `types.zig` and the finding below.
+- **Not a network.** No byte crosses a real network; the module is graded as a simulator/analysis library
+  against the Loopix authors' own tool (see *Compared with*). The netsim hot loop carries the modeled
+  `MixHeader`, not a real onion.
+- **No PKI.** Mix keys and epochs are not modeled; routing is a deterministic hash (`pickRoute`).
+- **Adversary.** The measured guarantee is against a global passive adversary; the only active attacker
+  modelled is one blocking a mix (`Attack`), and a blocking attack is detected only with sender-chosen
+  delays — with mix-chosen delays nobody can know when a loop is due.
+- **Anonymity metrics.** Per-mix and end-to-end *sender* anonymity only; receiver-side and
+  sender–receiver unlinkability are not measured (see *Backlog / deferred*).
+- **Mix-chosen holds** remain the `DEFAULT_CFG` variant; `PROVIDER_CFG` is the as-deployed one.
+
+## What is deliberately not done
+
+- **A deployable Loopix node or client.** The module carries no real transport; the owner chose to
+  grade it as a simulator and analysis library, not to build a node (the open question of whether a node is
+  wanted at all is under *Backlog / deferred*).
 
 ## Verification
 
-`zig build test-loopix`, green in Debug **and** ReleaseFast, no leaks,
-no skips (the gate is flipped — every test that used to be gated now runs for
-real):
+Offline only. Run `scripts/modtest loopix`; the gate (`gate.fable_core_implemented`) is `true`, so no test
+is skipped.
 
-- **Sphinx substrate:** a real onion for a 3-mix route peels hop-by-hop,
-  recovering each hop's `(next_hop, delay)`, final hop flagged.
-- **Anonymity harness teeth (no core needed):** synthetic transcripts separate a
-  well-mixed pool (holds the invariant) from FIFO order-preservation and
-  cover-starved thin pools (both fail); plus cover transits shown to enlarge a
-  real target's crowd without being scored.
-- **FIFO positive control end-to-end:** run through netsim, its transcript scored
-  by `measure` — `max_link_prob > 0.9`, `min_effective_set < 1.5`, invariant
-  fails; and a seed sweep under fuzzed faults keeps flagging it.
-- **Real `Loopix` mix, cross-seed:** with `gate.fable_core_implemented = true`
-  this test now runs (not skipped) and drives the real Poisson mix through
-  netsim across a seed sweep, asserting `AnonymityBound` holds — see "Part 2
-  result" above for the measured separation from the FIFO/no-cover controls.
-
-**Decision 2026-09-30 (user): stays a poc** — superseded **2026-10-04 (user):
-raise the grade, as a simulator/analysis library.** A deployable node is still
-not wanted; the module is graded against the Loopix authors' simulator (see
-Compared with), and Phase 2 above closed the gaps a simulator user hits first.
+- **Sphinx substrate:** a real onion for a 3-mix route peels hop-by-hop, recovering each hop's
+  `(next_hop, delay)`, final hop flagged.
+- **Anonymity harness teeth:** synthetic transcripts separate a well-mixed pool (holds the invariant)
+  from FIFO order-preservation and cover-starved thin pools (both fail); cover transits enlarge a real
+  target's crowd without being scored; ties share the true departure's mass (1/k); a transcript the
+  adversary cannot follow is counted, not silently uniform; no real traffic is vacuously anonymous.
+- **Positive controls end to end:** `FifoMix` through netsim fails both clauses, including under fuzzed
+  faults over a seed sweep; the no-cover control fails the bound under identical measurement.
+- **Real mix:** the Poisson `Loopix` holds `AnonymityBound` across a seed sweep, reorders co-resident
+  packets (`reorderStats` near 1/2 where order-preserving mixes score zero).
+- **Providers and end to end:** topology and mailbox ownership; every answer the same length and every
+  due packet delivered; sender-chosen holds keep the per-mix invariant and stay memoryless; the sender of
+  every real packet stays hidden through all layers (FIFO and no-cover are traced back); n−1: a blocked mix
+  raises the alarm during the attack, a clean network none, a loop's deadline is exactly its holds plus
+  every leg at worst plus one fetch plus the slack; config validation refuses what would overflow the
+  header, the casts or the mailboxes; a mix drops a header that does not name it as the current hop.
+- **Codec and fuzz:** `MixHeader` round trip and fail-closed decode. `LOOPIX_FUZZ=<runs>[,<first seed>]`
+  runs the deterministic driver (testkit) over the harnesses `loopix-header` (header decode) and
+  `loopix-inject` (hostile packets into the relay handlers: never panic, never mis-deliver); each harness
+  has an in-suite reach check and a pinned corpus count.
+- **Oracles:** none; the guarantees are invariants with positive controls (class C, see *Anchoring*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-- **A deployable Loopix node/client (real transport)** (survey 2026-09-30): today the module cannot carry a byte over a network; Nym and Katzenpost can. Needs providers with mailboxes, a PKI/epoch directory, sender-chosen delays in the Sphinx header (the SPEC's "Scoped out of Phase 1" list). Effort L. Fits §2 (pure Zig) but overlaps `sphinx`/`noise` work; decide whether it is wanted at all before starting.
-- **Nym-compatible Sphinx (Curve25519)** (survey 2026-09-30): interop with the only large deployed network needs its packet format; the repo's `sphinx` is secp256k1. Effort M-L. Fits §2.
-- ~~Composed end-to-end anonymity and n-1 detection from loop cover~~ (survey 2026-09-30): **done 2026-10-04** (Phase 2).
-- **Topologies beyond stratified** (survey 2026-10-04): cascade, multi-cascade, free-route — the reference simulates all four. Effort M (routing + scenario builder; the metrics are topology-agnostic once a mix's layer is not assumed). Fits §2.
-- **Batch-and-reorder (threshold/timed pool) mixing** (survey 2026-10-04): the reference's second mixing technique; here only as the order-preserving FIFO control. Effort M. Fits §2.
-- **Mix-originated cover (mix loops)** (survey 2026-10-04): Loopix mixes send their own loops to detect attacks on themselves; here only clients do. Effort S–M. Fits §2.
-- **Sender–receiver third-party unlinkability and receiver anonymity** (survey 2026-10-04): the reference's second metric; here only sender anonymity end to end. Effort M. Fits §2.
-- **Overhead in bytes, larger scale** (survey 2026-10-04): overhead is counted in packets; runs are tens of nodes. Effort S / M.
+- **A deployable Loopix node/client (real transport):** today the module cannot carry a byte over a network; Nym and Katzenpost can. Needs real transport, a PKI/epoch directory, and the real Sphinx header carrying the sender-chosen delays (the simulator models providers with mailboxes and sender-chosen delays already, with a modeled header). Effort L. Fits §2 (pure Zig) but overlaps `sphinx`/`noise` work; decide whether it is wanted at all before starting.
+- **Nym-compatible Sphinx (Curve25519):** interop with the only large deployed network needs its packet format; the repo's `sphinx` is secp256k1. Effort M-L. Fits §2.
+- **Topologies beyond stratified:** cascade, multi-cascade, free-route — the reference simulates all four. Effort M (routing + scenario builder; the metrics are topology-agnostic once a mix's layer is not assumed). Fits §2.
+- **Batch-and-reorder (threshold/timed pool) mixing:** the reference's second mixing technique; here only as the order-preserving FIFO control. Effort M. Fits §2.
+- **Mix-originated cover (mix loops):** Loopix mixes send their own loops to detect attacks on themselves; here only clients do. Effort S–M. Fits §2.
+- **Sender–receiver third-party unlinkability and receiver anonymity:** the reference's second metric; here only sender anonymity end to end. Effort M. Fits §2.
+- **Overhead in bytes, larger scale:** overhead is counted in packets; runs are tens of nodes. Effort S / M.
 
 ## Anchoring
 
