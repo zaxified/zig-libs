@@ -5,17 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/root.zig` (108 mutants, 90 killed, 18 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 4 tests added in `src/mutation_test.zig` (the PSS salt-length gate, an over-long blinded message, `finalize` at the largest modulus, non-canonical `z` / `r_inv` as `SignatureVerificationFailed`). No source change, no behaviour change; the ctgrind source digests are unchanged.
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind source digests of the `blindrsa` rows re-pinned (counts unchanged).
 - **2026-11-13** — **HARDENING (no API change):** `blindSign` with a `random` that never yields a usable blinding factor hung inside `rsa`; rsa's new `error.EntropyFailure` (error-set addition) maps to `error.SigningFailure`. Test `(rsa BRSA-3)`.
 - **2026-11-13** — **HARDENING (no-panic sweep, no API change):** `blindSign` with a `pk` that is not `sk`'s public half asserted (`std.debug.assert`: a panic in safe builds, nothing in ReleaseFast); it is `error.SigningFailure` in every build mode now. `blind` sampled `r` in an unbounded loop, so a `random` that only yields zeros hung it; it makes at most 128 draws (an honest generator misses with probability < 2^-128) and then returns `error.InvalidBlindingFactor`. Still open, in `rsa`: the base-blinding redraw of `blindSign` (Backlog). Tests `(sweep BRSA-1)`, `(sweep BRSA-2)`; probes fail without the fixes.
 - **2026-11-13** — **SPEED + CONSTANT TIME (no API change):** `blind`, `blindWithFactor` and `finalize` run on the montint modulus `rsa.PublicKey.n_mont` instead of `std.crypto.ff` + `std.math.big`. One constant-time safegcd inversion of `m·r` (`DynModint.inverse`) replaces the masked variable-time Euclid (`maskedInvert`/`feInvert` over `rsa.bigModInverse`) AND the big-int gcd of RFC 9474 step 4. `blindSign`'s §7.2 private-op blinding is now `rsa.rsadpCrtBlinded(.csprng)` (CRT-domain blinding) instead of its own ff wrapper. `bench-blindrsa`: `blind` 4.6–5.0× → 0.54–0.81× CIRCL, every row ≤ 0.81× (card ref 0.10–0.81×). ctgrind in-file contexts: `blind` ≤ 493 → 3, `sign` 7 → 4 (re-pinned). Errors are unchanged. One edge changed: a generator that keeps returning a multiple of `p`/`q` no longer ends `blindSign` with `SigningFailure` after four draws; rsa's draw loop keeps retrying. Private helper tests rewritten for the new path; the stack probe's needles are now `r`, `m·r` and `r⁻¹`.
 - **2026-10-14** — follows rsa's 8192-bit cap: `max_modulus_len` (= `rsa.max_modulus_len`) 512 → 1024, so `Context.r_inv` and every `max_modulus_len` buffer doubles; behaviour unchanged. KAT tests build `r_inv` with a zero-padded helper instead of assigning the 512-byte RFC 9474 vector.
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
-  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
-  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
-  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
-  frames. 0 residues, caller's frame included.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** follows rsa's 2026-10-08 API — `rsa.rsasp1` now takes
   the key by pointer (the `rsasp1Ptr` it used is folded into it) and the KAT key fixture, the
   example and the bench build their keys through rsa's out-param constructors.
@@ -28,10 +21,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   volatile 32-byte vector stores instead of `std.crypto.secureZero` (a volatile byte memset,
   ~3 B/ns without libc): ~30× faster per KiB burned. Same size, same depth; the ReleaseFast stack
   probe still reads 0.
-- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
-  bodies are now generic over their source and run by testkit's deterministic
-  driver `BLINDRSA_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
-  every test run); test code only.
 - **2026-10-02** — ctgrind harness: taints the value fields of rsa's new
   `montint.DynModint` (`p_mont`/`q_mont`) but not their slot `L`, the key size.
   `sign` row 216 → 7 in-file — rsa's CRT path left `std.crypto.ff`; what
@@ -138,9 +127,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   claim of a locally-reimplemented `mgf1Xor`/`bigModInverse` are corrected (B15).
   `scripts/modtest blindrsa`: 45/45 (baseline) -> 56/56, Debug and ReleaseFast.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** two tests pin `maskedInvert`'s masking itself. The module's only existing guard asserted that the masked inverse equals the direct inverse — a VALUE, which is exactly what stays true when the masking disappears — so the audit's mutations both survived 42/42: `m8` (`maskedInvert` replaced by `return feInvert(m, x);`) and `m21b` (the fresh uniform scalar replaced by the constant 3). ⚠ ctgrind cannot see this either: a constant mask is still branch-free, so no context count moves. The property is "a fresh, uniform scalar is drawn per attempt", and the seam that makes it observable was already in the signature — `maskedInvert` takes its `std.Random` as a parameter. The tests script that RNG to return `p` (a factor of the RFC 9474 modulus `n`) on the first draw, so the masked product keeps the shared factor, `feInvert` must fail, and the loop must draw a SECOND, different scalar; the answer is still checked against the RFC's published `inv`. The second test scripts `p` for every draw and pins the four-attempt bound and the fail-closed `NotInvertible`. Verified by deploying both mutations: each is killed by both tests.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **blind 477 / sign 218**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. 457 of the 477 are the extended-Euclid modular inverse, which `SPEC.md:188` already names as "the ONE inherently non-constant-time piece" and defends by masking — so this is the first MEASUREMENT of an admitted caveat, not a new finding. ⭐ The two `Modulus.mul` calls SPEC calls constant-time measured ZERO. ⛔⛔ Instrument defect found here and recorded in `scripts/checks/ctgrind.sh`: `modules/blindrsa/src/root.zig` and `modules/rsa/src/root.zig` are different files with the SAME BASENAME, both appear in every stack, and the classifier matches regex text over the whole paragraph — so `root[.]zig` cannot tell them apart and this row's in-file column is "this module plus rsa". The author's first pass mis-attributed several lines that way and corrected it by reading valgrind's qualified symbol names.
 
 - **2026-09-07** — `fuzzVerify` is a damage harness that applied no damage, and its own
   comment's promise about signature length was never kept. The flip count came from

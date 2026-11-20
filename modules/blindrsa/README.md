@@ -97,8 +97,7 @@ blindrsa → rsa → std.crypto.ff / std.crypto.hash
 ## Verify
 
 ```
-zig build test-blindrsa                      # Debug
-zig build test-blindrsa -Doptimize=ReleaseFast
+scripts/modtest blindrsa
 zig fmt --check modules/blindrsa/
 ```
 
@@ -109,5 +108,12 @@ wrong message, wrong salt length, mismatched `Context`, out-of-range
 inputs, non-invertible blinding factors), plus full random-path
 round-trips over the RFC's 4096-bit key and a freshly `rsa.generate`d
 keypair — see SPEC.md's "Verification" for the complete list.
+
+## Not provided
+
+The partially blind RSA draft (public metadata bound into the signature) is
+not built; see SPEC *Backlog / deferred*. Rate limiting and token-redemption
+uniqueness, and enforcing one key per encoding option, are the caller's (SPEC
+*What is deliberately not done*).
 
 Provenance: see [NOTICE](NOTICE).
