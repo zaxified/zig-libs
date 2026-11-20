@@ -65,12 +65,11 @@
 //!      RFC-6265-correct behavior here; python's is a carried-over
 //!      Set-Cookie-parsing habit that does not apply to this input class.
 //!
-//! A real bug WAS found and fixed by this comparison (not a python
-//! divergence, an actual defect): `Iterator.next` located the next `;` before
-//! knowing anything about quoting, so `s="x;y"` was corrupted into `s="x`
-//! plus a bogus valueless `y"` — see root.zig's "quoted value containing a
-//! separator" test and the `next()` doc-comment. Fixed in root.zig; this
-//! file's case 3 below now agrees with python precisely because of that fix.
+//! This comparison once found a real defect (a naive split corrupted
+//! `s="x;y"`). The fix made this module quote-aware, which a 2026-11-19
+//! review showed to be exploitable (a "cookie sandwich" hides or swallows
+//! other cookies), so the module now splits on every `;` like Go and the
+//! browsers; the `;`-in-quotes case is a judged divergence from python below.
 
 const std = @import("std");
 const testing = std.testing;
@@ -113,17 +112,21 @@ test "python oracle: quoted value with embedded space" {
     try testing.expectEqualStrings("x y", got[0].value);
 }
 
-test "python oracle: quoted value containing a semicolon (the real bug this comparison found)" {
+test "divergence (judged): a quoted value containing a semicolon is split here, kept whole by python" {
     // python3: show('a="x;y"; b=2') -> {'a': 'x;y', 'b': '2'}
-    // Before the root.zig fix this module returned a="\"x (truncated at the
-    // embedded ';') plus a bogus valueless "y\"" cookie. Now it agrees.
+    // This module splits on EVERY ';' (RFC 6265 §4.1.1/§5.4: a sent
+    // cookie-value never contains ';'; Go's readCookies and the browsers
+    // split the same way). A quote-aware split, which this module had until
+    // 2026-11-19, lets `a="s; session=S; z="` swallow or hide other cookies
+    // (a "cookie sandwich" between this server and a ;-splitting proxy).
     var buf: [4]cookies.Cookie = undefined;
     const got = collect("a=\"x;y\"; b=2", &buf);
-    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(@as(usize, 3), got.len);
     try testing.expectEqualStrings("a", got[0].name);
-    try testing.expectEqualStrings("x;y", got[0].value);
-    try testing.expectEqualStrings("b", got[1].name);
-    try testing.expectEqualStrings("2", got[1].value);
+    try testing.expectEqualStrings("\"x", got[0].value);
+    try testing.expectEqualStrings("y\"", got[1].name);
+    try testing.expectEqualStrings("b", got[2].name);
+    try testing.expectEqualStrings("2", got[2].value);
 }
 
 test "python oracle: quoted value containing a comma" {
@@ -279,7 +282,7 @@ test "divergence (judged): a DQUOTE inside a cookie-name is rejected by python, 
 // either count without the other is a signal this file drifted from the
 // survey recorded in the module doc-comment.
 test "count canary: agreeing + judged-divergence cases both accounted for" {
-    // 11 agreeing cases (including the fixed-bug case) + 5 judged
-    // divergences = 16 python-oracle comparisons in this file.
-    try testing.expectEqual(@as(usize, 16), 11 + 5);
+    // 10 agreeing cases + 6 judged divergences = 16 python-oracle
+    // comparisons in this file.
+    try testing.expectEqual(@as(usize, 16), 10 + 6);
 }

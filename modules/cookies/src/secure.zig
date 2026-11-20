@@ -112,7 +112,10 @@ pub const Key = struct {
 
 pub const SignError = error{
     /// The value has a byte outside RFC 6265 `cookie-octet` (or is a
-    /// `"…"`-quoted value): the signed result could not be sent.
+    /// `"…"`-quoted value): the signed result could not be sent. Also
+    /// (`private.seal*`) a plaintext longer than AES-GCM's message limit
+    /// (`aesgcm.max_message_len`, about 64 GiB), or a name over
+    /// `private.max_timed_name` for the timed forms.
     InvalidValue,
     /// `out` is shorter than `signed.len(value.len)` / `private.len(value.len)`,
     /// or (`private.seal*`) `value` overlaps the tail of `out` where the raw
@@ -317,6 +320,7 @@ pub const private = struct {
     /// `value` is any bytes; cookie-rs's `PrivateJar` opens only UTF-8. It
     /// must not overlap the tail of `out` the record is built in (`error.NoSpaceLeft`).
     pub fn seal(key: *const Key, name: []const u8, value: []const u8, nonce: [nonce_len]u8, out: []u8) SignError![]const u8 {
+        if (value.len > aesgcm.max_message_len) return error.InvalidValue;
         const enc_len = len(value.len);
         if (out.len < enc_len) return error.NoSpaceLeft;
         // The raw record goes into the tail of `out` (see `sealBody`).
@@ -349,6 +353,7 @@ pub const private = struct {
     /// under a key.
     pub fn sealTimedNonce(key: *const Key, name: []const u8, value: []const u8, issued_s: i64, nonce: [nonce_len]u8, out: []u8) SignError![]const u8 {
         if (name.len > max_timed_name) return error.InvalidValue;
+        if (value.len > aesgcm.max_message_len - issued_len) return error.InvalidValue;
         const enc_len = timedLen(value.len);
         if (out.len < enc_len) return error.NoSpaceLeft;
         // The raw record goes into the tail of `out` (see `sealTimedBody`).
@@ -503,6 +508,23 @@ test "verifyTimed: an authentic MAC over a payload without a well-formed issue t
         const s = signed.signMode(&key, "n", payload, &buf, .timed);
         try std.testing.expectEqualStrings("v", signed.verifyTimed(&.{key}, "n", s, 100, std.math.maxInt(i64)).?);
     }
+}
+
+test "private.seal / sealTimedNonce: a plaintext over AES-GCM's message limit is InvalidValue, before out or value is touched" {
+    if (@bitSizeOf(usize) < 64) return error.SkipZigTest; // the limit does not fit usize
+    var key: Key = undefined;
+    try Key.fromBytesInto(&key, &@as([64]u8, @splat(0x42)));
+    const nonce: [private.nonce_len]u8 = @splat(0);
+    // Fabricated slices, never dereferenced: the length check comes first.
+    const p: [*]u8 = @ptrFromInt(4096);
+    const max = aesgcm.max_message_len;
+    const big_out = p[0 .. std.math.maxInt(usize) / 2];
+    try std.testing.expectError(error.InvalidValue, private.seal(&key, "n", p[0 .. max + 1], nonce, big_out));
+    try std.testing.expectError(error.InvalidValue, private.sealTimedNonce(&key, "n", p[0 .. max - 7], 1, nonce, big_out));
+    // The largest legal plaintext is not refused for its length (out is too
+    // short instead, which is the next check).
+    try std.testing.expectError(error.NoSpaceLeft, private.seal(&key, "n", p[0..max], nonce, p[0..8]));
+    try std.testing.expectError(error.NoSpaceLeft, private.sealTimedNonce(&key, "n", p[0 .. max - 8], 1, nonce, p[0..8]));
 }
 
 test "private.seal / sealTimedNonce: a value inside the raw tail of out is error.NoSpaceLeft; one before it seals and opens" {
