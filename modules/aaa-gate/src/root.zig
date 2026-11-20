@@ -565,10 +565,6 @@ pub const Gate = struct {
     /// API-key verifier callback (dynamic store) + its ctx.
     api_key_verify: ?ApiKeyVerifyFn = null,
     api_key_verify_ctx: ?*anyopaque = null,
-    /// Header the API key is read from — gpa-owned copy.
-    api_key_header: []const u8 = default_api_key_header,
-    /// Optional query-param fallback name — gpa-owned copy, or null.
-    api_key_query_param: ?[]const u8 = null,
     /// Resolved ordered API-key sources — gpa-owned deep copy (legacy
     /// header/query options expand into this list).
     key_sources: []KeySource = &.{},
@@ -628,10 +624,6 @@ pub const Gate = struct {
         errdefer gpa.free(challenge);
         const key_sources = try buildSources(gpa, &options);
         errdefer freeSources(gpa, key_sources);
-        const api_key_header = try gpa.dupe(u8, options.api_key_header);
-        errdefer gpa.free(api_key_header);
-        const api_key_query_param = if (options.api_key_query_param) |q| try gpa.dupe(u8, q) else null;
-        errdefer if (api_key_query_param) |q| gpa.free(q);
         const deny_body = try gpa.dupe(u8, options.deny_body);
         errdefer gpa.free(deny_body);
         const deny_content_type = try gpa.dupe(u8, options.deny_content_type);
@@ -657,8 +649,6 @@ pub const Gate = struct {
             .token_verify_ctx = options.token_verify_ctx,
             .api_key_verify = options.api_key_verify,
             .api_key_verify_ctx = options.api_key_verify_ctx,
-            .api_key_header = api_key_header,
-            .api_key_query_param = api_key_query_param,
             .key_sources = key_sources,
             .basic_verify = options.basic_verify,
             .basic_verify_ctx = options.basic_verify_ctx,
@@ -692,8 +682,6 @@ pub const Gate = struct {
         g.gpa.free(g.challenge);
         g.gpa.free(g.deny_body);
         g.gpa.free(g.deny_content_type);
-        g.gpa.free(g.api_key_header);
-        if (g.api_key_query_param) |q| g.gpa.free(q);
         freeSources(g.gpa, g.key_sources);
         g.basics.deinit(g.gpa);
         g.tokens.deinit(g.gpa);
@@ -5022,19 +5010,20 @@ test "middleware .any: a valid API key AND a valid Basic credential -> the API k
     try testing.expectEqualStrings("basic:alice", bodyOf(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf)));
 }
 
-test "init: the gate keeps its own copies of api_key_header and api_key_query_param" {
+test "init: the gate keeps its own copies of api_key_header and api_key_query_param (in the key sources)" {
     var hdr = "X-Company-Key".*;
     var q = "api_key".*;
     var g = try Gate.init(testing.allocator, .{ .api_key = "k", .auth_mode = .api_key, .api_key_header = &hdr, .api_key_query_param = &q });
     defer g.deinit();
     @memset(&hdr, 'x');
     @memset(&q, 'y');
-    try testing.expectEqualStrings("X-Company-Key", g.api_key_header);
-    try testing.expectEqualStrings("api_key", g.api_key_query_param.?);
+    try testing.expectEqual(@as(usize, 2), g.key_sources.len);
+    try testing.expectEqualStrings("X-Company-Key", g.key_sources[0].name);
+    try testing.expectEqualStrings("api_key", g.key_sources[1].name);
     var d = try Gate.init(testing.allocator, .{ .api_key = "k", .auth_mode = .api_key });
     defer d.deinit();
-    try testing.expectEqualStrings(default_api_key_header, d.api_key_header);
-    try testing.expectEqual(@as(?[]const u8, null), d.api_key_query_param);
+    try testing.expectEqual(@as(usize, 1), d.key_sources.len);
+    try testing.expectEqualStrings(default_api_key_header, d.key_sources[0].name);
 }
 
 test "deny path: without the cached header values the 401 carries the same challenge and media type" {

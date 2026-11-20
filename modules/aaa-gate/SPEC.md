@@ -112,8 +112,6 @@ Re-surveyed 2026-10-17 (first 2026-09-30) per `SURVEY-PLAYBOOK.md`; stars and ac
   pair, a pair without `=` is an empty value, which the key sources treat as absent.
 - Threadsafe; identity attached for downstream handlers; RFC 6750 challenge (401 +
   `WWW-Authenticate`) on failure.
-- `Gate.api_key_header` / `api_key_query_param` are stored copies of the options that the key-source list
-  replaces; see *Backlog / deferred*.
 
 ## Threat model / out of scope
 - Defends: the **timing oracle** on credential comparison (constant-time compare defeats
@@ -205,9 +203,6 @@ line; that line is authoritative.
 
 ## Backlog / deferred
 
-- **`Gate.api_key_header` / `api_key_query_param` are stored but never read after `init`** (the key-source list
-  replaces them): two allocations that could go. Observation from the 2026-11-12 review; removing the fields is a
-  public change.
 - **`identityOf` trusts `ctx.data`** (sweep AAA-3, LOW): cannot be made total without a tag in `router.Ctx`
   (a public change); the documented contract stays until then. See *Threat model*.
 

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — Behaviour change (source-breaking): `Gate.api_key_header` and `Gate.api_key_query_param` (stored, never-read copies of the options; the key-source list is what the gate reads) are removed, saving two allocations per `init`. `Options.api_key_header` / `api_key_query_param` are unchanged and effective (they expand into the key-source list, as the reference gateways' single-header/query-param settings do). A caller reading the removed `Gate` fields reads the options it passed in instead.
+
 - **2026-11-19** — The denied-request throttle map is hashed with a per-instance random seed (Wyhash keyed by a 64-bit seed drawn in `Gate.init`), so peer-influenced throttle keys (X-Forwarded-For) cannot be crafted to collide under the gate's spinlock. New `Options.io` (seed from `io.random`; null = address/counter/clock mix) and `Options.throttle_seed` (fixed seed). Behaviour change: the map's internal iteration/eviction hash differs per instance; throttle decisions (coalescing, folding, LRU cap) are unchanged.
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private monotonic OS read behind `Clock.monotonic` (duplicate-code pass) is replaced by the `clock` module: `Clock` is now `clock.Clock` (same fields, `.monotonic`, `now()`; additionally `.coarse` and `since()`). A failed read still gives 0; a negative timespec field now maps to 0 instead of tripping `@intCast`. New dependency: `clock`.
