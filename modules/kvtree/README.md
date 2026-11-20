@@ -18,25 +18,18 @@ that see a consistent snapshot without blocking the writer.
 
 > **Status: core implemented.** The irreducible core — `commit`'s
 > durability-ordered COW meta swap, `recover`'s crash meta-selection, and the
-> MVCC page-reuse gate — is implemented in `core.zig` and
-> `gate.fable_core_implemented` is `true`: the property tests drive the real
-> `Db` through commit/snapshot schedules (including a multi-level-tree phase)
-> and a crash-point sweep over every storage side effect of a commit, across
-> all four `kv.SimStorage` crash modes. Values larger than a page live in
-> overflow chains; underfull nodes are merged; the free end of the file is
-> given back. Buckets (named nested key spaces, bbolt's unit) and read-only
-> openers in other processes (a shared lock, as bbolt's `ReadOnly`) are in since
-> 2026-10-11. Not built (`SPEC.md` says why): in-place compaction (`copyTo`
-> compacts into a new file, as bbolt's `Compact` does), batching of writers
-> from several threads (a `Db` has one owner).
-> The on-disk freelist is a page CHAIN (not a single bounded page) — freeing
-> more pages than one page holds chains another, so nothing is silently
-> leaked. Chain-storage pages are recycled from the freelist like tree pages;
-> the commit reserves them *before* parking its own freed pages, which is what
-> makes that safe (see `SPEC.md`). They were grown-only until 2026-08-25, and
-> since every commit rewrites the chain, that made the file grow without bound
-> — a page per commit even when the data set did not change. See `SPEC.md` for
-> the A-vs-B design decision and the verification argument.
+> MVCC page-reuse gate — is implemented in `core.zig`; the property tests drive
+> the real `Db` through commit/snapshot schedules and a crash-point sweep over
+> every storage side effect of a commit, across all four `kv.SimStorage` crash
+> modes. Values larger than a page live in overflow chains; underfull nodes are
+> merged; the free end of the file is given back. Buckets (named nested key
+> spaces, bbolt's unit) and read-only openers in other processes (a shared
+> lock, as bbolt's `ReadOnly`) are in. The on-disk freelist is a page CHAIN
+> (not a single bounded page): freeing more pages than one page holds chains
+> another, so nothing is silently leaked, and chain-storage pages are recycled
+> from the freelist like tree pages (the commit reserves them *before* parking
+> its own freed pages, which is what makes that safe). See `SPEC.md` for the
+> A-vs-B design decision and the verification argument.
 
 Provenance: clean-room. Design references only — LMDB (OpenLDAP Public
 License) and BoltDB (MIT) for the copy-on-write B-tree with double-buffered
@@ -118,13 +111,17 @@ Production wires `kvtree.FsStorage` over a real directory; tests use
 **For read speed, open the store on `kvtree.FsStorage.initMmap`** (Linux;
 `Db.open(gpa, fs.storage(), ...)`): pages are then lent out of a read-only
 mapping of the file with no syscall and no copy, the way bbolt and LMDB read
-theirs -- gets about 0.85x LMDB, scans faster than bbolt and LMDB (SPEC.md,
-Performance). Writes stay pwrites with the same fsyncs. Bare `FsStorage.init`
-`pread`s every page of every descent (about 4x slower gets). The caveat of
+theirs -- gets and scans are the fastest of kvtree, bbolt and LMDB (the card's
+`**Performance:**` in SPEC.md). Writes stay pwrites with the same fsyncs. Bare
+`FsStorage.init` `pread`s every page of every descent (much slower reads). The caveat of
 every mmap store applies: a file truncated by someone else below a page in use
 is a SIGBUS -- the store's lock keeps other writers out. A
 `pagecache.PageCache` in front of plain `FsStorage` is the shape for a bounded
 RAM budget (it lends resident pages too, at a cache lookup per page).
+
+## Not provided
+
+In-place compaction (`copyTo` compacts into a new file, as bbolt's `Compact` does), batching of writers from several threads (a `Db` has one owner), readers beside a running writer, and a `WriteTo` byte stream: `SPEC.md` *What is deliberately not done* and *Backlog / deferred* say why.
 
 ## Verify
 

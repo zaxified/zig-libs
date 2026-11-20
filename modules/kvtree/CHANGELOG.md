@@ -5,19 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
-- **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only: three more from the same mutation run: a branch of the bulk loader filled with its slots counted, a freelist chain that rots after open (count and entry at the high water) refused by the next commit, and a merge across siblings of different kinds ending in `Corrupt`.
-- **2026-11-12** — **NO CONSUMER-VISIBLE CHANGE:** Tests only: 29 new tests from a whole-module mutation run over `root.zig`, `core.zig`, `format.zig`, `pager.zig` and `bulk.zig` (598 schemata mutants; the first run left 130 alive). They pin the exact geometry limits of node accessors and the `*ViewSafe` checks, `Meta.decode` with a valid CRC, `ovfPages` at exact multiples, balanced-split cuts and ties, the strict order check of the bulk loader and its bounded memory, the meta-slot alternation, open-time refusal of ids outside the version (root, branch children, overflow chains, freelist head and entries, full and two-page freelist chains), borrowed pages given back on every error and scan, cursor state after a failed `first`/`last`/step, every failed write, sync and truncate of a commit, and `copyTo` temp-file handling.
 
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `Prng.next` (duplicate-code pass) runs `std.Random.SplitMix64` (same constants, same sequence); a known-answer test pins the stream.
 - **2026-10-29** — **Fix:** `Bucket.bucket` / `Txn.bucket` under a bucket at the deepest legal level (`max_bucket_depth` = 16) returned `error.Corrupt` for every name, even a missing one or a plain key, on a healthy file: the sweep's depth check (KT-4) ran before the lookup. It now runs only when a nested bucket is found there (which only rot can make) and a miss is `null`. Found by the delta audit. Test.
-- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 41 mutants over the changed code (one the inverse of the openIn fix), 40 killed, 1 equivalent (the branchViewSafe max_cell_len clause is implied by the in-page check). Survivors became tests: key, value, bucket-header and overflow lengths that rot after open, a shared overflow chain, a freelist chain page that is live, a freelist entry past the file end, a self-loop root collapse, a 17-deep bucket found by copyTo and by a write transaction, the slot and max_value_len bounds, the forged txn_id's oldestReader. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 151/169, 18 eq. Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** a damaged file no longer panics, loops or overflows the stack. Owner decision (SQLite's model): every offset, length, count and child id read out of a node page is checked against the page, and every child id against the version, where it is used — `Leaf`/`Branch` accessors return `error.Corrupt` (node pages carry no CRC; `recover` had validated them once, at open) — and every descent (`get`, `getRef`, cursors, bucket lookups, commit) is capped at `format.max_tree_depth` = 40 levels, so a branch that rotted into a cycle ends in `Corrupt` instead of an endless loop (a commit's recursion is bounded by it too). `recover` refuses at open a tree deeper than that (a forged chain of single-child branches), buckets nested deeper than `max_bucket_depth` = 16, a page reached by two parents, and a freelist that lists a live page or one page twice (was: a later commit could overwrite live data); a `high_water` above the `u32` page-id space; a commit on a forged `txn_id` of `maxInt(u64)` is `Corrupt` instead of wrapping (reads work). A `Cursor` that returned an error is left unpositioned (`next`/`prev` then yield null) instead of on a branch page, where the next call hit `Leaf.init`'s assert; `Cursor.deinit` and `Snapshot.release` may be called twice (the second does nothing; it used to drop another reader's pin). **API:** `Txn.put` and `Bucket.put` return `error.EntryTooLarge` for an entry no leaf can hold at once (was: at `commit`, failing the whole batch); `createBucket` past 16 levels returns the new `BucketError.BucketTooDeep`; `Pager.growOne` and `Freelist.writeChainOn` panic with a message on a contract breach instead of an `@intCast`/`assert`. Docs: the stack a commit needs (`Db`), the cost of a long-lived reader (`Db.cursor`). Not fixed: a linear scan in `Txn.get`/`Bucket.get` over the buffered changes (SPEC Backlog). Cost (A/B vs the previous commit, `bench-kvtree -Djcc-safe`, BENCH_ROUNDS=5, noisy desktop: spread up to 35 %): get 0.617→0.627× bbolt, bucket get 0.623→0.620×, scan 0.793→0.883×, commits unchanged; worst row 0.88× both — card P unchanged.
 
 - **2026-10-25** — **Grade 1.** The production shape for read speed is now `kv.FsStorage.initMmap` (pages lent out of a mapping of the file, as bbolt and LMDB read; a `pagecache` in front of plain `FsStorage` stays the bounded-RAM shape — README). The in-node binary search prefetches the next probes' cells. `Snapshot.getRef` (zero-copy get in a snapshot). `bench-kvtree` also times LMDB 0.9.31, the fastest in the field: gets 0.90×, scan 0.43× LMDB and 0.79× bbolt, commits ≤ 1.12× LMDB (gets were 1.47× LMDB on the pagecache). New `tools/corrupt_probe`: on 6 000 damaged files kvtree never crashed (plain and mmap reads), bbolt panicked 234 times, LMDB crashed 292 times. **Fix:** recovery adopted a leaf whose slot directory was unsorted or held a key twice (`leafViewSafe` now checks the order, as `branchViewSafe` did) — lookups in such a leaf missed present keys. Audit: full review and mutation run (118 mutants), 19 tests added.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — Tests: a tree of near-page-sized keys (300..4000 bytes, down to the longest that fits inline) splits, reads, deletes and reopens consistently (audit 2026-10-19; no defect found, the case was unpinned). No behaviour change.
 
@@ -207,30 +201,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   doc comment already spelled out in full, which independently corroborates
   it as real regardless of the ledger line's shaky provenance.
 
-- **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** `fuzzRecover` had **no seed
-  corpus at all**, so outside `--fuzz` it ran exactly one input — the empty one
-  — and every one of its fifteen knobs was its own range minimum. Traced
-  through: both meta slots were stamped `{txn_id 0, root 0, free_root 0,
-  free_count 0, high_water 0}` and `candidateValid` rejected each at
-  `pageIdOk(0, 0)`, its FIRST bounds check. The tree walk never took a step,
-  `leafViewSafe`/`branchViewSafe` were never called, the freelist chain walk and
-  both cycle guards never ran, and `recover` returned `error.Unrecoverable` on
-  the only input the ordinary lane has ever given it. A short seed could not
-  have fixed it either: the harness opens with `smith.bytes` over a 24 576-octet
-  page image, and `Smith.bytes` consumes `@min(out.len, in.len)`, so anything
-  shorter is swallowed whole and leaves the knobs nothing.
-
-  Ten corpus entries are now built at run time — a full page image plus the knob
-  words — and a corpus-guard test pins what they reach: 12 meta slots stamped,
-  data pages stamped 25 random / 10 leaf / 1 branch / 4 freelist, **3 of 10
-  seeds recovered** (txn_ids 5, 9 and 7, pinned by their sum so one seed cannot
-  mask another), 1 of them adopted through a branch root and 1 with a walked and
-  totalled freelist chain. The seven refusals are the ones the walk exists for:
-  a chain count one over `Freelist.capacity`, a `next` pointing at its own page,
-  a `high_water` past the end of the file, a root below `first_data_page`, a
-  `free_count` of 2^64-1 against an empty freelist, both meta slots left as raw
-  fill, and a leaf page over `0xff` fill whose `count` reads 65 535 — the exact
-  shape `leafViewSafe` was added to reject, asserted directly in the guard.
 
 - **2026-08-25** — **Fixed: the store grew for ever under a steady write load.** Chain
   storage for the freelist was allocated from `Pager.growOne` only, never from the

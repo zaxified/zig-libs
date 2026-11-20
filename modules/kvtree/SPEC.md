@@ -10,7 +10,6 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-12 (549/598, 49 eq) · src 286d7ad0b162661a
 
-Audit detail: the 2026-11-01 review is a delta over `core.zig` (the `fuzz driver: KVTREE_FUZZ` test moved from chained `fuzz_driver.run` calls to `fuzz_driver.runAll`, same prefix, names and harnesses; a skipped harness no longer ends the test before the next one), test code only; the library source the mutation run scored is unchanged.
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, KVTREE_FUZZ) · ct n/a — B-tree store (keyword review, 2026-10-07) · panic 2026-10-29 (every page offset/length/count/child id checked at its point of use → `Corrupt`, descent depth-capped, forged metas refused at open, cursor left unpositioned after an error)
 
@@ -27,7 +26,7 @@ Embedded ordered transactional key-value store: a copy-on-write B-tree with
 MVCC snapshot isolation, multi-key ACID transactions, ordered range scans, and
 VOPR-checked crash-safety. Usage: see ./README.md. Provenance (clean-room from
 the LMDB/BoltDB design + the TigerBeetle VOPR method — design references, no
-source ported): see /NOTICE.
+source ported): see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -42,19 +41,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [xit-vcs/xitdb](https://github.com/xit-vcs/xitdb) | Zig | MIT | 109 | pushed 2026-09-17 (no releases) | The Zig alternative: immutable persistent structures with snapshot semantics; no ordered scans over arbitrary byte keys *(inferred from README)*; no injectable storage or fault-injection sweep. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No embedded database or ordered on-disk store. |
 
-**Where we are ahead:** the only Zig entry with an ordered transactional store (B-tree, MVCC snapshots, multi-key ACID) plus crash-safety proved by a fault-injection sweep over every storage side effect, four crash modes; injectable `Storage` (deterministic testing, `pagecache` tiering); node merge, tail-of-file shrink and overflow chains; pure Zig, no C. **On par since 2026-10-11:** buckets, nested, with a sequence each (bbolt's `Bucket`, `NextSequence`); read-only openers in any number of processes (bbolt's `ReadOnly`: a shared lock — bbolt, like us, never lets a reader in while a writer holds the file; LMDB's reader table is not bbolt's model). **Where we are behind** (each a conscious choice, see Backlog): no in-place compaction (bbolt has none either: its `Compact` copies into a new file, which `copyTo` does); no `DB.Batch` of writers from many threads (a `Db` is `single_owner`; one `Txn` is one fsync for any number of writes, and a caller with many writers serializes them through `Lock` or `writebehind`). **Against bbolt and LMDB, measured 2026-10-25** (the `**Ahead:**` line): a damaged file never crashes the process; gets and scans are the fastest of the three (0.79–0.90×, Performance), read through mmap as theirs are (`kv.FsStorage.initMmap`; the injectable seam stays, the fault-model tests keep running on `SimStorage`); LMDB's commits are still up to 1.14× faster.
-
-## Status: core IMPLEMENTED (gate flipped)
-
-The three irreducible correctness functions in `core.zig` are implemented and
-`gate.fable_core_implemented` is `true`: the formerly-gated property tests now
-drive the real `Db` — a snapshot-isolation + serializability schedule with a
-multi-level-tree phase (~850 commits under pinned snapshots), and a
-crash-point sweep over every storage side effect of an open+commit across all
-four `kv.SimStorage` crash modes, including a destroy-the-in-flight-meta
-probe for the double-buffer invariant. Everything is green in Debug and
-ReleaseFast, `zig fmt` clean, no leaks. The section below is kept as the
-specification the implementation was written against.
+**Where we are ahead:** the only Zig entry with an ordered transactional store (B-tree, MVCC snapshots, multi-key ACID) plus crash-safety proved by a fault-injection sweep over every storage side effect, four crash modes; injectable `Storage` (deterministic testing, `pagecache` tiering); node merge, tail-of-file shrink and overflow chains; pure Zig, no C. **On par:** buckets, nested, with a sequence each (bbolt's `Bucket`, `NextSequence`); read-only openers in any number of processes (bbolt's `ReadOnly`: a shared lock — bbolt, like us, never lets a reader in while a writer holds the file; LMDB's reader table is not bbolt's model). **Where we are behind** (each a conscious choice: batching is in *What is deliberately not done*, in-place compaction in *Backlog / deferred*): no in-place compaction (bbolt has none either: its `Compact` copies into a new file, which `copyTo` does); no `DB.Batch` of writers from many threads (a `Db` is `single_owner`; one `Txn` is one fsync for any number of writes, and a caller with many writers serializes them through `Lock` or `writebehind`). **Against bbolt and LMDB** (the `**Ahead:**` line): a damaged file never crashes the process; gets and scans are the fastest of the three (the card's `**Performance:**` line), read through mmap as theirs are (`kv.FsStorage.initMmap`; the injectable seam stays, the fault-model tests keep running on `SimStorage`); LMDB's commits are still faster.
 
 ## The architecture decision: (A) copy-on-write B-tree, not (B) B-tree + WAL
 
@@ -151,7 +138,7 @@ page id), and a CRC32 over its fields.
 
 ## The Fable core (`core.zig`) — exactly what it is, and why it is irreducible
 
-Two correctness kernels, three functions (now implemented). Each is the kind of bug a
+Two correctness kernels, three functions. Each is the kind of bug a
 human review rubber-stamps and only a model-checker catches — which is why the
 harness, not a diff read, is the acceptance gate.
 
@@ -197,14 +184,14 @@ accounting; it is named separately because the MVCC-safety property is
 genuinely distinct from crash-atomicity (LMDB implements them in separate
 places), not to pad the tier. Everything else — page/node codecs, in-node
 binary search, B-tree node **split** (textbook, unit-tested directly; deletes
-are in-place, with node merge since 2026-09-29 (below), and a node
-left EMPTY is dropped, below), the
+are in-place, with node merge and a node left EMPTY dropped, see
+Design notes by feature), the
 `Pager`, the freelist container, the read/descend/cursor path, and fresh-store
-init — is mechanical scaffold, written and green today. If a future reviewer
+init — is mechanical scaffold. If a future reviewer
 finds `reclaimGate` collapses cleanly into `commit`, folding it in is fair; the
 two-kernel framing is the honest maximum, not a floor.
 
-## Buckets (2026-10-11)
+## Buckets
 
 A bucket is a named, nested key space with keys, values and buckets of its own
 (bbolt's `Bucket`). It is a whole B-tree: a leaf cell in its parent's tree
@@ -252,7 +239,7 @@ levels (400 txns, rollbacks, held snapshots, reopens, page accounting after
 every commit); a crash sweep in `harness.zig` over a commit that drops a bucket
 tree and creates two, all four crash modes (≈ 20 crash points per sweep).
 
-## Read-only openers (2026-10-11)
+## Read-only openers
 
 `Options.read_only` takes a SHARED lock on the `<path>.lock` sidecar
 (`kv.Storage.tryLockShared`; a sidecar that does not exist yet -- a `copyTo`
@@ -263,64 +250,9 @@ nothing (no store: `FileNotFound`; empty file: `NotAKvtreeFile`) and `begin` is
 `error.ReadOnly`. It sees the version that was newest at `open`, which nothing
 can move while it holds the lock.
 
-## Verification (`harness.zig`) — the teeth
+## Design notes by feature
 
-Mirrors `kv`'s VOPR + `df-elect`'s positive-control pattern:
-
-- a reference `Model` (a sorted map with independent, deep-cloned MVCC
-  snapshots) defining the correct answer;
-- pure invariant checkers: **sorted scans**, **snapshot isolation** (a pinned
-  read never sees a later/uncommitted write), **serializability** (committed
-  txns applied in order == observed state), **crash-recovery to a committed
-  prefix** (recovered state == some committed version, never a torn mix);
-- a generic property engine (`runProperty`) driving a store and its reference
-  `Model` in lockstep across randomized transaction/snapshot schedules;
-- **`RefStore`** — a correct in-memory MVCC oracle the engine runs green across
-  a 200-seed sweep today;
-- **`BrokenRefStore`** — the positive control: one planted bug (snapshot reads
-  ignore the pin) that the engine MUST catch. It reuses the *exact* checkers the
-  real store will face, so a violation it trips is provably the same check —
-  and the teeth test asserts it is caught on the vast majority of seeds (a
-  checker with no teeth would catch zero). This proves the harness works
-  independent of whether the B-tree core is filled in.
-
-Formerly gated, now LIVE (`gate.fable_core_implemented` is `true`): the real
-`Db` driven through the same checkers — a snapshot-isolation +
-serializability commit schedule (including a multi-level-tree phase that
-forces leaf splits, branch splits and recursive root growth under pinned
-snapshots), and a crash-recovery sweep that crashes at EVERY storage side
-effect of an open+commit, across all four `kv.SimStorage` crash modes, with
-`.reorder_unsynced` swept under multiple seeds (one keep/drop pattern would
-be a systematic blind spot for a missing data-before-meta fsync) and an
-explicit destroy-the-in-flight-meta probe (this sim's torn write keeps the
-first half of a write, which always covers the whole 48-byte meta record, so
-meta corruption has to be injected to give the double-buffer invariant
-teeth). Still future work: a full randomized VOPR (fuzzed op/crash schedules
-chained across epochs) the way `kv/vopr.zig` is, plus a sabotage self-test
-and a delta-debugging shrinker. The sim modeling caveat that used to sit
-here — an un-synced in-place OVERWRITE below the durable watermark surviving most
-crash modes — **is fixed**: `kv.SimStorage` now keeps an undo log when
-`allow_overwrite` is set, so `.lose_unsynced` rolls the whole un-synced window
-back (overwrites included) and `.reorder_unsynced` restores a dropped range's
-pre-write bytes instead of zero-filling it. Overlapping writes within one sync
-window are consequently allowed too. `.torn_tail` is unchanged on purpose: its
-"first half of the write survives" rule is what the meta-corruption reasoning
-above depends on. ⚠ Note the caveat's stated CONSEQUENCE did not hold even
-before that fix: deleting commit's final `pager.sync()` was checked by fault
-injection against the pre-fix tree and the gated crash sweep already failed with
-`RecoveredStateNotCommitted`. The optimism was real; "a missing final meta fsync
-is not provable by this harness" was not.
-
-## Threat model / out of scope
-
-Not a security boundary; the "adversary" is timing, crash points and I/O faults
-(`kv.SimStorage`'s injectors). Guarantees, with the core implemented and the
-gate passing: ordered scans, atomic multi-key commit/rollback, snapshot isolation
-for lockless readers, and crash-recovery to a committed prefix — under the same
-`fsync`-honesty caveat `kv` documents (a lying drive/hypervisor is below this
-library). Cross-process: one writer per store (an exclusive `flock` on `<path>.lock`), or any number of read-only openers (a shared one) — never both at once.
-
-**Emptied nodes leave the tree** (2026-09-28, found adopting tsdb in the terminal-UI consumer). A
+**Emptied nodes leave the tree.** A
 leaf that a commit's deletes leave with no entries is not written back: `applyRec`
 returns no pieces for it and the parent drops the child together with its
 separator (when the dropped child was the leftmost, the next surviving child
@@ -332,25 +264,23 @@ the commit, so it is already in `ctx.freed` and reaches the freelist under the
 same reclaim gate as any COW-dead page — an open snapshot still pins it. Once
 something was dropped, `commit` collapses the root while it is a branch with a
 single child (the replaced page goes to `ctx.freed` too). Only whole subtrees and
-the root level ever disappear, so every leaf stays at one depth. Before this,
-emptied leaves stayed in the tree, and a key range that only moves forward (a time
-series: append at the right, retention deletes at the left) never wrote to them
-again — measured: tsdb appending and sweeping 1000 points a round grew the file
-~60 KiB a round, linearly; now it reaches a steady size (`tsdb` test "retention
-bounds the file", `kvtree` test "retention on a forward-moving key range …").
+the root level ever disappear, so every leaf stays at one depth. A key range that
+only moves forward (a time series: append at the right, retention deletes at the
+left) therefore reaches a steady file size (`tsdb` test "retention bounds the
+file", `kvtree` test "retention on a forward-moving key range …").
 Tests: a random model check with range deletes, delete-all and open snapshots
 over a 3–4-level tree (long keys), checking after every commit that leaves share
 one depth, no non-root leaf is empty, the root is never a one-child branch, every
 key is inside its separator range, and every page below `high_water` is a meta,
 tree, freelist-chain or freelist-entry page (a dropped page never handed to the
-freelist would be lost). Six schemata mutants of the change are all killed.
+freelist would be lost).
 
-**Underfull nodes are merged** (2026-09-29). A node a commit leaves under a
+**Underfull nodes are merged.** A node a commit leaves under a
 quarter of a page is not written at once: `applyRec` hands it up as a pending
 builder, and the parent merges it with a sibling — the right one when there is
 one — into the union of the two. A union that does not fit a page is split
-again where its BYTES balance (`balancedCut`; the split used to cut at the entry
-midpoint, which with mixed value sizes could leave one half nearly empty), so
+again where its BYTES balance (`balancedCut`; a cut at the entry midpoint could
+leave one half nearly empty with mixed value sizes), so
 merge and borrow are one operation. Both levels: a branch pair pulls the
 separator between them down between the left cells and the right leftmost. The
 sibling's page (or a split piece written earlier in the same commit) is dead
@@ -362,7 +292,7 @@ and the branches too, with at most a quarter of the leaves underfull; mixed
 value sizes; a crash sweep over a merging commit; the existing model check and
 page accounting run through merges at every level.
 
-**The file gives its tail back** (2026-09-29). A run of free pages at the END
+**The file gives its tail back.** A run of free pages at the END
 of the file that the reclaim gate lets go (no reader can reach them) leaves the
 store: `Freelist.cutTail` takes those entries off the list and the commit's
 meta gets the lower high water — before the commit parks its own dead pages,
@@ -378,23 +308,20 @@ page, so rewritten live pages drift towards the front of the file. Tests: a
 store that loses most of its data shrinks its file (and reopens), a snapshot
 holds the tail until released, both threshold directions, the older meta still
 opens after a truncate, and a crash sweep over commits that cut and truncate.
-Mutation check (26 schemata mutants over overflow, merge and shrink): all
-killed after the tests the first run asked for.
 
-**The cursor walks both ways** (2026-10-04). A cursor sits in a GAP between
+**The cursor walks both ways.** A cursor sits in a GAP between
 two keys: `next` yields the key after it and steps over it, `prev` the key
 before it. `first`/`last` put it before the first / after the last key, `seek`
 before the first key >= k, `seekAfter` after the last key <= k — so a reverse
 scan from k down is `seekAfter(k)` + `prev`, and "the latest entry" is `last` +
 `prev`. A `next` then `prev` yields one entry twice (Java's `ListIterator`; bbolt
 stands ON an entry instead). At either end a step yields null and leaves the
-stack as it is, so the other direction walks back from there — `next` used to
-pop its exhausted stack, which made a turn at the end impossible. Tests: a
+stack as it is, so the other direction walks back from there. Tests: a
 30 000-step random walk of `next`/`prev`/all four positioning calls over a
 two-level tree with overflow values, against the gap-count model, hitting both
 ends; an empty store.
 
-**`copyTo`: a backup that is also a compaction** (2026-10-04). `Snapshot.copyTo`
+**`copyTo`: a backup that is also a compaction.** `Snapshot.copyTo`
 (and `Db.copyTo` for the newest version) writes the version as a NEW store, not
 through `commit`: `bulk.zig` builds it bottom-up from the cursor's ordered
 entries, filling every node until the next entry does not fit. Copying through
@@ -416,62 +343,83 @@ node under a quarter full, no one-child branch; leaf and branch filled to the
 last byte; a snapshot copied while the writer moves on, over an older copy,
 `SamePath`; a crash sweep over every side effect of the copy in all four crash
 modes, with and without an older copy at the destination, plus a crash right
-after it returns. Mutation run (30 schemata mutants over the cursor, the loader
-and the rename sequence): 29 killed; the survivor was dead code (a "union fits
-one page" branch), removed.
+after it returns.
 
-**Mutation + review (2026-11-12, whole module,** production parts of `root.zig`, `core.zig`, `format.zig`, `pager.zig`, `bulk.zig`; `harness.zig`, `prng.zig` and `gate.zig` are test machinery and stay unmutated; schemata in a detached copy, ReleaseSafe, fixed seed, strict verdict (30 s cap = hang), adversarial read while placing mutants): 598 mutants, 549 killed (9 by timeout), 49 equivalent, 0 undecided, no consumer-reachable defect. The 2026-10-29 run (169 mutants) was thin: the first run here left 130 alive, closed by 32 new tests. Gaps they filled: no test reopened a store with a multi-page freelist chain or exactly 340 entries on one page, none exercised an open-time out-of-range id (root, branch children, overflow chain, freelist head and entries), none covered the temp-file and borrow-release paths. Others: `ovfPages` at exact multiples, `Meta.decode` with a valid CRC but wrong magic/version/page size, exact geometry limits incl. forged slot offsets, the `*ViewSafe` refusals, oversize `putOverflow`/`putBucket`, a branch full at exactly a page, split cuts and ties; pager `file_pages` and a torn page; bulk order against the last key, a forged 2 GiB length, bounded memory; meta-slot alternation, `setSequence`, a read-only bucket transaction committing nothing, handles under a deleted bucket, `Txn.getRef` shadowing, cursor state after a failed step, Corrupt child ids and loops, a commit shortening a longer file, `copyTo` onto the same path, recover on a one-page file, every failed write and a failed sync via `FailNthSync`, `core.commit` refusing a forged 2 GiB value. Equivalent: checks implied by an earlier one (in-loop `dir_end >= 10`, ids 0/1 fail the kind byte, `claim()` caps the walk, repeated oversize checks, `lookupRef`'s own CannotLend, callers' `errdefer dropFrames`), equal-result boundaries (`orderKeys` `<`/`<=`, the tree-depth bound one level before `Corrupt`, `ovfLenOk` at high water, truncate to the same size), and states that cannot occur (high water 0 at `Pager.init`, freelist ids ≥ 2, `drop` only with `base_root == null`, parent-first buckets, the bulk loader's own `wrote_*` flags, rewritten `cur_sep`, a fresh commit root, the temp file gone after rename, and others — one invariant per id kept by the auditor); the `writeChainOn` caller-contract panic cannot be tested in-process. Not mutated: comptime constants, `Options` defaults, prefetch/capacity hints, asserts, OOM mappings, `Pager.growOne`'s documented panic at 2^32 pages (unreachable: `Db.open` refuses such a meta).
+**Damaged files.** Bounds are checked where a page field is used, so a damaged
+file is `Corrupt`, never a panic, a hang or an out-of-bounds read: every page
+offset, length, count and child id on `get`, cursor and commit paths; an
+overflow length is checked before anything is allocated for it. The descent is
+capped at `format.max_tree_depth` (40; derivation there), bucket nesting at
+`format.max_bucket_depth` (16: `createBucket` beyond it is `BucketTooDeep`, a
+file nested deeper is `Corrupt` at open and on copy). Open refuses a forged
+meta (`high_water` beyond the file or the u32 page-id space), a freelist that
+names a live page or one page twice, a freelist chain page that is a live page,
+and a page claimed by two parents or an overflow chain claimed by two values;
+a freelist entry that rots after open is refused by the commit that reads it. A
+`txn_id` forged to the maximum reads fine and refuses writes with `Corrupt`
+instead of wrapping. A cursor whose descent failed is left unpositioned. A put
+of an entry no leaf can hold (a key whose cell does not fit, a key too long for
+an overflow reference) is `EntryTooLarge` from `Txn.put` / `Bucket.put`, not
+from the commit that carries it. Releasing a snapshot or deinitialising a cursor
+twice is a no-op and does not drop another reader's pin. The two checked
+panics left are caller-contract and unreachable through the API (`Pager.growOne`
+at 2^32 pages, which `Db.open` refuses; `writeChainOn`).
+
+## Verification
+
+Run `scripts/modtest kvtree` (Debug and ReleaseFast through the harness; every
+test runs for real, no skips). Test classes:
+
+- **Property harness** (`src/harness.zig`), mirroring `kv`'s VOPR and `df-elect`'s positive-control pattern:
+  - a reference `Model` (a sorted map with independent, deep-cloned MVCC snapshots) defining the correct answer;
+  - pure invariant checkers: **sorted scans**, **snapshot isolation** (a pinned read never sees a later/uncommitted write), **serializability** (committed txns applied in order == observed state), **crash-recovery to a committed prefix** (recovered state == some committed version, never a torn mix);
+  - a generic property engine (`runProperty`) driving a store and its reference `Model` in lockstep across randomized transaction/snapshot schedules;
+  - **`RefStore`**, a correct in-memory MVCC oracle the engine runs green across a 200-seed sweep, and **`BrokenRefStore`**, the positive control: one planted bug (snapshot reads ignore the pin) that the engine MUST catch on the vast majority of seeds. It reuses the exact checkers the real store faces, so a violation it trips is provably the same check (a checker with no teeth would catch zero).
+- **The real `Db` through the same checkers** (`gate.fable_core_implemented` is `true`): a snapshot-isolation + serializability commit schedule (including a multi-level-tree phase that forces leaf splits, branch splits and recursive root growth under pinned snapshots), and a crash-recovery sweep that crashes at EVERY storage side effect of an open+commit, across all four `kv.SimStorage` crash modes, with `.reorder_unsynced` swept under multiple seeds (one keep/drop pattern would be a systematic blind spot for a missing data-before-meta fsync) and an explicit destroy-the-in-flight-meta probe. Further crash sweeps cover commits that write, overwrite and free overflow chains, merge underfull nodes, give the file's tail back, and drop and create nested buckets, and a crash anywhere in `copyTo`.
+- **Simulator fidelity.** `kv.SimStorage` keeps an undo log when `allow_overwrite` is set, so `.lose_unsynced` rolls the whole un-synced window back (overwrites included) and `.reorder_unsynced` restores a dropped range's pre-write bytes; overlapping writes within one sync window are allowed. `.torn_tail` deliberately keeps the first half of a write, which always covers the whole 48-byte meta record, so meta corruption has to be injected to give the double-buffer invariant teeth.
+- **Model checks in `root.zig`:** a random walk of the cursor in both directions against the gap model, random transactions over two levels of buckets against a nested model (rollbacks, held snapshots, reopens, page accounting after every commit), deletes that empty leaves, branches and the whole tree against a model with open snapshots, a snapshot-held-across-commits model on the mmap storage.
+- **Damaged files:** the point-of-use bounds tests (`kvtree sweep KT-*` in `root.zig`), one per refusal listed in *Damaged files*, plus `recover` tests on forged metas, bucket cells and chains. `tools/corrupt_probe` (README there) is the differential run against bbolt and LMDB behind the card's `**Ahead:**` line.
+- **Fuzz:** the deterministic driver `KVTREE_FUZZ=<runs>[,<first seed>]` runs the `recover` harness (arbitrary page bytes) and `recover-mutated` (a corpus entry lightly damaged), with reach labels (meta stamped, branch page, freelist page, adopted, unrecoverable); 150 seeds also run in every test run, and a corpus test pins what the seeds reach (`src/core.zig`).
+- **Mutation scope:** production code of `root.zig`, `core.zig`, `format.zig`, `pager.zig` and `bulk.zig`; `harness.zig`, `prng.zig` and `gate.zig` are test machinery and stay unmutated. Not mutated: comptime constants, `Options` defaults, prefetch/capacity hints, asserts, OOM mappings.
+- **ctgrind:** n/a, a B-tree store holds no secrets.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## Open
+
+A full randomized VOPR (fuzzed op/crash schedules chained across epochs, the way `kv/vopr.zig` is), a sabotage self-test of the real `Db` and a delta-debugging shrinker for it are not built; the crash sweeps above are exhaustive per commit, the fuzz harnesses cover `recover` only.
+
+## Threat model / Limits
+
+Not a security boundary; the "adversary" is timing, crash points and I/O faults
+(`kv.SimStorage`'s injectors). Guarantees, with the core implemented and the
+gate passing: ordered scans, atomic multi-key commit/rollback, snapshot isolation
+for lockless readers, and crash-recovery to a committed prefix — under the same
+`fsync`-honesty caveat `kv` documents (a lying drive/hypervisor is below this
+library). Cross-process: one writer per store (an exclusive `flock` on `<path>.lock`), or any number of read-only openers (a shared one) — never both at once.
+
+**Known limits.**
+- Rot in a node page after a successful open is bounded, not detected: pages carry no checksum (only the meta pages carry a CRC32), so a flipped byte in a node can read as a wrong value; what is guaranteed is `Corrupt` or a wrong answer, never a crash (*Damaged files*). Owner choice: bounds at the point of use, the SQLite model, no per-page CRC.
+- A long-lived reader (`Db.cursor`, `Snapshot`) keeps every page the writer frees on the freelist, which each commit then reads and each allocation scans: time per commit grows with the commits made since, and the file grows too. Not measured; the remedy is a short-lived reader (documented at `Db.cursor`).
+- `Txn.get`, `Bucket.get` and the bucket lookup scan the transaction's buffered changes linearly: n puts then n gets in one transaction is O(n²).
+- `kvtree.FsStorage.initMmap` reads through a mapping: a file truncated by someone else below a page in use is a SIGBUS (the store's lock keeps other writers out).
 
 ## Performance
 
-**Measured 2026-10-25** (`zig build bench-kvtree`, `BENCH_ROUNDS=5`, ReleaseFast, Zig 0.17.0, Go 1.26.8, LMDB 0.9.31; desktop load only, largest spread 77.5 % on LMDB's update row), ns per op, ours on `kv.FsStorage.initMmap`:
+`zig build bench-kvtree` (`tools/bench.zig`, `BENCH_ROUNDS=<n>`) measures get, scan, 1000-put and 1000-update commits and bucket get against go.etcd.io/bbolt (`tools/go_bench`) and the host's liblmdb (`tools/lmdb_bench`); the card's `**Performance:**` line carries the figures and is authoritative. The production shape is mmap reads (`kv.FsStorage.initMmap`, owner's choice; the injectable seam stays and the fault-model tests keep running on `SimStorage`); `BENCH_PAGECACHE=1` measures the `pagecache`-in-front shape (the one for a bounded RAM budget: a cache lookup, a frequency note and a pin per page). The in-node binary search prefetches both possible next probes. Pager commits sync data with `Storage.syncData` (fdatasync, as bbolt) and key comparison is `format.orderKeys` (eight bytes per step, also in the commit fold).
 
-| row | kvtree | bbolt (ref) | LMDB | kvtree / fastest |
-|---|--:|--:|--:|--:|
-| get_hit (20 000 gets) | 10 416 692 | 17 266 860 | 11 526 048 | 0.90 (LMDB) |
-| scan (100 000 entries) | 1 548 153 | 1 965 833 | 3 578 277 | 0.79 (bbolt) |
-| put_txn_1k | 5 130 914 | 5 953 699 | 5 128 834 | 1.00 (LMDB) |
-| update_txn_1k | 10 030 650 | 12 304 568 | 8 991 897 | 1.12 (LMDB) |
-| bucket_get | 10 208 949 | 16 692 478 | 11 604 919 | 0.88 (LMDB) |
+## What is deliberately not done
 
-What moved it (2026-10-25): the production shape is mmap reads (`kv.FsStorage.initMmap`, owner's choice; until then a `pagecache` in front: gets 1.47× LMDB, scan 0.97–1.12× bbolt — a cache lookup, a frequency note and a pin per page, ~23 % of a resident get; `BENCH_PAGECACHE=1` measures it again). Tried and removed the same day: keeping up to 64 branch pages borrowed between descents took the pagecache gets to 1.12–1.15× LMDB, but on mmap it was worth 0.88× → 0.86× LMDB on get (noise) and it held pins in the cache while idle; the in-node binary search prefetches both possible next probes (the first touch of a probe's cell was 35 % of a get). Before: Zig 0.17.0, 2026-10-20, ref 0.83–1.04× (pagecache shape).
+- **Batching of concurrent writers** (bbolt's `DB.Batch`): rejected. A `Db` is `single_owner` by design, one `Txn` already is one fsync for any number of writes, and the many-writers case belongs to the caller's serializer (`Lock` around the `Db`, or `writebehind`, which batches).
+- **Readers while a writer holds the store** (LMDB's reader table): not built. bbolt's model is the one followed (`Options.read_only`, a shared lock, several readers and no writer at the same time); LMDB's would need a cross-process reader table feeding the reclaim gate.
+- **`Tx.WriteTo` to an arbitrary byte stream:** not built; a caller copies to a temp path with `copyTo` and streams that file.
+- **Overflow keys:** keys stay inline (LMDB does the same): a separator is a copy of a key, and a branch that had to chase overflow chains to route a lookup would pay a page read per comparison. A key whose cell does not fit is `EntryTooLarge`.
+- **Per-page checksums:** see Known limits (SQLite model, no format change).
 
-## Backlog / deferred (mechanical, orthogonal to the Fable core)
+## Backlog / deferred
 
-- **No-panic sweep 2026-10-29:** fixed KT-1 (cursor unpositioned after an error), KT-2 (point-of-use bounds on every page field, owner chose the SQLite model: no per-page CRC, no format change), KT-3 (depth cap 40, derivation in `format.max_tree_depth`), KT-4 (bucket nesting cap 16, copy no longer holds a `Loader` per level on the stack), KT-5 (forged `txn_id`/`high_water`), KT-6 (freelist/tree overlap and shared pages refused at open, freelist entries checked when a commit reads them), KT-8a (`Txn.put`/`Bucket.put` refuse an entry no leaf can hold), KT-9 (`growOne`/`writeChainOn` checked panics, `cutTail` total), KT-10 (stack documented, estimated not measured), KT-11 (double release/deinit is a no-op); not fixed: KT-7 (a long-lived reader makes each commit scan a freelist that only grows; an `ordered by free_txn` list would fix it — documented at `Db.cursor`, not measured), KT-8b (`Txn.get`/`Bucket.get`/`findState`/`hasPlainChange` scan the buffered changes linearly: n puts then n gets in one transaction is O(n²); a hash index is a change of data structure, not a sweep fix). Also not done: the recover fuzz corpus (`core.zig`) lost its one adopted-with-freelist seed to the overlap rule (pins updated there); a `Meta.encode` assert stays (`Meta` is not exported). Owner chose the SQLite model for post-open rot (bounds at the point of use → Corrupt).
-- ~~**Overflow pages**~~ — DONE 2026-09-29 for values (see "On-disk layout"):
-  chains of overflow pages, format v3 only once used. Keys stay inline by
-  design (LMDB does the same): a separator is a copy of a key, and a branch that
-  had to chase overflow chains to route a lookup would pay a page read per
-  comparison. Tests: round trips at every size boundary, overwrite/delete
-  recycling with page accounting, a snapshot holding a replaced chain, a broken
-  chain (read → `Corrupt`, recovery refuses), `getRef` on both kinds, and the
-  crash sweep over commits that write, overwrite and free chains.
-- ~~**Node merge / rebalance-by-borrow**~~ — DONE 2026-09-29, see "Underfull
-  nodes are merged" above.
-- ~~**Automatic freelist/space reclamation thresholds**~~ — DONE 2026-09-29, see
-  "The file gives its tail back" above. The in-memory page cache half is the
-  `pagecache` module (a `Storage` in front of the backend), so nothing is left
-  to compose here.
-- **In-place compaction** (moving live pages down so a free page BELOW a live
-  one can leave the file too) — not built; `copyTo` + swapping the copy in does
-  it offline, the way bbolt's `Compact` does. The lowest-page-first allocation makes live
-  pages drift down on their own as commits rewrite them, so a store that keeps
-  writing ends up with a free tail; a store that stops writing keeps its holes.
-- ~~**Backward iteration (`last`/`prev`, seek-for-prev)**~~ *(survey 2026-09-30)* — DONE 2026-10-04 (`last`, `prev`, `seekAfter`; see "The cursor walks both ways").
-- ~~**Buckets / named sub-keyspaces**~~ *(survey 2026-09-30)* — DONE 2026-10-11, see "Buckets" above.
-- ~~**Backup / consistent snapshot copy of the file**~~ *(survey 2026-09-30)* — DONE 2026-10-04 as `copyTo` (a compact copy to a path on a `Storage`). Not built: bbolt's `Tx.WriteTo` to an arbitrary byte stream (an HTTP response) — a caller can copy to a temp path and stream that file.
-- ~~**Cross-process readers**~~ *(survey 2026-09-30)* — DONE 2026-10-11 the way bbolt has them: `Options.read_only`, a shared lock, several readers and no writer at the same time. The survey's "read while one writes" is LMDB's reader table, not bbolt's; not built (it would need a cross-process reader table feeding the reclaim gate).
-- ~~**Full compaction (holes below live pages)**~~ *(survey 2026-09-30)* — offline DONE 2026-10-04 (`copyTo`, same as bbolt's `Compact`); in place see above.
-- **Batching of concurrent writers** *(survey 2026-09-30)* — REJECTED 2026-10-11: bbolt's `DB.Batch` coalesces commits from many goroutines into one fsync; a `Db` here is `single_owner` by design, one `Txn` already is one fsync for any number of writes, and the many-writers case belongs to the caller's serializer (`Lock` around the `Db`, or `writebehind`, which batches).
-- ~~**Performance: hidden P4 on reads**~~ **DONE 2026-10-11 — measured P3, ref 1.14–1.40× bbolt** via route (a), owner's choice: the bench opens every store on a `pagecache.PageCache` (32 MiB, holds the file) in front of `kv.FsStorage` — the production shape, now in the README — the way bbolt's rows read a resident mmap (two runs, BENCH_ROUNDS=5: get 1.14–1.16×, bucket get 1.16–1.22×, scan 1.29–1.40×, 1000-put commit 1.27–1.30×, 1000-update commit 1.16–1.18×). `build.zig` gained `bench_deps` (pagecache depends on kvtree, so it can be neither a dep nor a test dep). Found on the way: `core.reduceChanges` folded a transaction's changes by inserting into a sorted array, O(n²) moves — 14 % of the bench's run, all in the 100 000-put preload; now a stable sort + one compaction pass (`one transaction, many changes per key` test, negative-controlled). History of the measurement before the fix: `zig build bench-kvtree` vs bbolt v1.5.0 (100 000 keys, 100-byte values, quiet host not guaranteed: spread up to 8 %): get 4.67× (bucket get 4.68×), full scan 3.32×, 1000-put commit 1.28×, 1000-update commit 1.23× (both fsync-bound). The reads are the gap: bbolt reads its mmap with no syscall per page; kvtree `pread`s every page of the descent through `kv.FsStorage` (a cursor copies each page too). Routes, owner's choice: (a) put `pagecache` in front in the bench and in the docs as the production shape (its `preadRef` lends pages, which `lookup` already takes); (b) an mmap `Storage` backend in `kv`; (c) both.
-- ~~**Performance: P3 → P2**~~ **DONE 2026-10-11 (third pass) — ref 0.83–1.02× bbolt, P2.** Owner chose the cheaper borrow over an mmap `Storage` (which would give up the injectable-storage seam's fault model for reads; LMDB and bbolt read an mmap, redb does not). The borrow was five dependent loads in `ramcache`'s map, each a cache and dTLB miss per leaf (ours: 5× bbolt's dTLB misses per cycle on the scan, LLC and L1 alike): entries now live in their node with the key bytes, the map holds `*Node` (three loads), `release` re-files without a lookup, `pagecache` shifts instead of dividing. Scan 1.11–1.12× → 1.02–1.04×, gets 0.96–1.00×, commits unchanged. History of the second pass follows. — every row must reach ≤ 1.1× bbolt. **Now (BENCH_ROUNDS=5): get 1.07×, bucket get 1.07×, 1000-put commit 0.90×, 1000-update commit 0.84×, scan 1.14× (1.09–1.12× in scan-only runs)** — only the scan is left over the line. What the profile found and what moved it: commits were a full `fsync` where bbolt does `fdatasync` (pager now calls `Storage.syncData`; `pagecache` forwards it) — 1.16–1.30× → 0.84–0.90×; key comparison was std's byte loop, the largest single cost of a resident get (`format.orderKeys`, eight bytes per step, also in the commit fold) — 1.14–1.22× → 1.07×; the cursor copied every page twice (into a frame, then the frame onto the stack) — it now borrows each frame from the store (`Storage.preadRef`) and reads straight into the stack slot otherwise; leaf cells are laid out in ascending key order so a scan walks a leaf's memory forward (no format change: readers follow the slot offsets) — scan 1.29–1.40× → 1.09–1.14×. **Tried and reverted:** prefetching a leaf's whole page on entry, and borrowing the next leaf one step early with its lines prefetched — neither moved the scan. **What is left:** the scan is memory-bound on the first touch of each cell and leaf (bbolt's leaves are adjacent in one mmap, where the hardware prefetcher runs across them; ours are separate `pagecache` allocations), plus one `pagecache` borrow per leaf (a ramcache lookup + pin + release, ~20 % of a resident scan). Routes: a cheaper borrow in `pagecache`/`ramcache`, or an mmap `Storage` backend in `kv` (route (b)), which gives up the injectable-storage seam's fault model for reads — owner's call.
-
-## Status line
-
-`any · both · single_owner` + deps `kv`, `crc32`, model_after "LMDB / BoltDB (COW B-tree,
-meta double-buffer); VOPR = TigerBeetle" — canonical source is `pub const meta`
-in src/root.zig.
+- **In-place compaction** (moving live pages down so a free page BELOW a live one can leave the file too) — not built; `copyTo` + swapping the copy in does it offline, the way bbolt's `Compact` does. The lowest-page-first allocation makes live pages drift down on their own as commits rewrite them, so a store that keeps writing ends up with a free tail; a store that stops writing keeps its holes.
+- **Freelist ordered by `free_txn`** so a commit under a long-lived reader need not scan a list that only grows (Known limits); not measured.
+- **Hash index over a transaction's buffered changes** so n puts then n gets in one transaction is not O(n²) (Known limits); a change of data structure, not a sweep fix.
 
 ## Anchoring
 
@@ -481,3 +429,4 @@ in src/root.zig.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
 **What the tests actually contain.** embedded COW B-tree; LMDB/BoltDB design inspiration only, own format
+
