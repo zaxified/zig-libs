@@ -104,7 +104,7 @@ const Fe = Edwards25519.Fe;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Constant-time-on-secrets scalar multiplication for Edwards25519/Ristretto255 — drops std's secret-dependent `rejectIdentity` branch. Caller must validate points. `X25519` with key generation on the fixed-base comb (2.4× std).",
+    .doc = "Constant-time-on-secrets scalar multiplication for Edwards25519/Ristretto255 (ladder `mul`/`mulRistretto`, fixed-base comb `mulBase`/`mulRistrettoBase`, Straus `mulMulti`/`mulMultiRistretto`) — drops std's secret-dependent `rejectIdentity` branch. Caller must validate points. `X25519` (key generation on the comb, 2.4× std; x86-64 MULX/ADX shared-secret ladder), `verifyEd25519Strict`, `mulBaseEncode` encoders.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.

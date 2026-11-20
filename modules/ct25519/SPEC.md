@@ -6,7 +6,7 @@
 
 **Scope:** parity — curve25519-dalek 5.0 (secret-scalar group operations), not a full curve25519 library: point and scalar types are `std`'s (surveyed 2026-10-10)
 
-**Audit:** review 2026-09-15 · mutation 2026-11-13 (117/126, 9 eq) · src 91dc4550dc67787a
+**Audit:** review 2026-09-15 · mutation 2026-11-13 (117/126, 9 eq) · src 62bac05d73f1065d
 
 **Hardening:** fuzz 2026-11-01 (160,000 runs clean, CT25519_FUZZ, 8 jobs × 20,000, every reach label hit) · ct 2026-09-29 (ctgrind) · panic 2026-10-30 (sweep + blind review: nothing to fix (fixed-size inputs, mulMulti already a checked panic); stack minimum in Backlog)
 
@@ -608,7 +608,6 @@ Consumer build options (CONVENTIONS §4.2), added at the router-tool consumer's 
 ## Backlog / deferred
 
 - **aarch64 field core for the X25519 shared secret and the comb:** the field core is x86-64 MULX/ADX inline assembly and other targets run `std`'s ladder unchanged, so an ARM server gets none of the win. Effort: medium (a 4×64 core with `umulh`, reusing the field differential of § P6). Fits CONVENTIONS §2 (inline asm is native Zig).
-- **`meta.doc` describes only the comb** (`src/root.zig`: "`X25519` with key generation on the fixed-base comb (2.4× std)"), not the shared-secret ladder, Ed25519 verify or the encoders; updating it is a source change followed by `zig build gen-catalog`, outside a docs-only change.
 
 ## Anchoring
 
