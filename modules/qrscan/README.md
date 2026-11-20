@@ -3,8 +3,7 @@
 Find a QR symbol in a grayscale image and sample it into a `qr.Matrix`, which
 [`qr`](../qr/README.md) then decodes. No allocator: the caller supplies one
 scratch buffer, sized by `scratchSize` — call it rather than working the number
-out, since it covers the bitmap, the block means and the labeller's runs, and
-what it covers has changed.
+out, since it covers the bitmap, the block means and the labeller's runs.
 
 ```zig
 const qrscan = @import("qrscan");
@@ -100,6 +99,8 @@ takes the tilt from the top edge and corrects for it.
   are 100 %. Below three, binarisation is deciding modules from single pixels.
 - **One symbol per image.** The candidate search finds several, but only the best
   triple is sampled.
+- **`stride` below `width`, or a `luma` shorter than `stride * height`, is refused with
+  `Error.BadImage`**, as is a dimension below 21.
 - **`width`/`height` above `qrscan.max_dimension` (8192) are refused with
   `Error.BadImage`**, checked before `scratchSize`'s arithmetic ever runs. 8192
   is comfortably past the highest resolution either real source (a V4L2 camera

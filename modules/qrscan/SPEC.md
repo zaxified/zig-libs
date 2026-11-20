@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [makiuchi-d/gozxing](https://github.com/makiuchi-d/gozxing) | Go | Apache-2.0 per its LICENSE *(API says NOASSERTION; inferred)* | 672 | pushed 2025-07-20 (no releases) | Go port of ZXing, all symbologies *(inferred)*. |
 | Zig ecosystem / `std` | Zig | — | — | — | No QR reader found: `gh search repos` for zig + "qr scanner"/"qr reader" returned nothing relevant; `std` has none. |
 
-**Where we are ahead:** the only pure-Zig QR reader found; allocation-free with one caller-owned scratch buffer (`scratchSize`), luma plus explicit `stride` so a V4L2 plane is read in place; Reed-Solomon decode is in the sibling `qr` module; a fuzzed and damage-tested pipeline. **Where we are behind:** one symbol per image (quirc, ZXing, rqrr return several), no inverted or mirrored symbol *(searched `src/root.zig` for `invert`/`mirror`: only a matrix-inversion hit)*, tilt limited to 25–30° about the vertical axis in the zxing-cpp differential (`tools/README.md`, 2026-09-17; ZXing reads to 40°) and 10–25° in the in-repo render sweep, where the horizontal axis lags (*Verification*), with no curvature model, a three-pixel-per-module floor, and none of Micro QR / Model 1 / rMQR.
+**Where we are ahead:** the only pure-Zig QR reader found; allocation-free with one caller-owned scratch buffer (`scratchSize`), luma plus explicit `stride` so a V4L2 plane is read in place; Reed-Solomon decode is in the sibling `qr` module; a fuzzed and damage-tested pipeline; inverted (light-on-dark) and mirrored symbols through `scanAny`. **Where we are behind:** one symbol per image (quirc, ZXing, rqrr return several), tilt limited to 25–30° about the vertical axis in the zxing-cpp differential (`tools/README.md`, 2026-09-17; ZXing reads to 40°) and 10–25° in the in-repo render sweep, where the horizontal axis lags (*Verification*), with no curvature model, a three-pixel-per-module floor, and none of Micro QR / Model 1 / rMQR.
 
 ## Design & invariants
 
@@ -48,16 +48,10 @@ with no allocator, and in wasm32 where a static footprint is the point.
 
 **Every region of it is sized from the image, and that is a correctness
 property.** The bitmap, the per-8x8-block means and the labeller's two rows of
-runs all scale with the picture. They did not: the block means were a fixed
-`[128 x 128]u8` on the stack with the loops clamped to it, so **only the first
-1024 x 1024 pixels of any image were binarised** — the rest of the bitmap was
-never written and was scanned as whatever the caller's buffer already held. The
-same symbol read at (100, 100) of a 1200 x 1200 frame and was `NotFound` at
-(1000, 1000), and this file's own example was 1920 x 1080. A fixed cap on a
-working buffer is a cap on the picture, and it fails silently at the far end of
-the frame, which is the end nobody puts the test symbol in. The run buffer had
-the same shape (512 runs per row, rest of the row dropped) and is gone the same
-way.
+runs all scale with the picture. A fixed cap on a working buffer is a cap on the
+picture, and it fails silently at the far end of the frame, which is the end
+nobody puts the test symbol in: the symbol read at (100, 100) of a 1200 x 1200
+frame and was `NotFound` at (1000, 1000).
 
 **Binarisation is block-adaptive because a global threshold cannot survive a
 real capture.** Every hand-held photograph has a gradient or a shadow across it.
@@ -71,16 +65,15 @@ occurs inside the data region as well, and vertical confirmation does not always
 reject it: a real symbol in the tests produces four. So orientation scores every
 triple by how well it forms three corners of a square — equal legs, hypotenuse
 √2 times a leg, agreeing module sizes — and takes the best. Taking the first
-three is what the first implementation did, and one false positive ruined an
-otherwise perfect read.
+three would let one false positive ruin an otherwise perfect read.
 
 **A finder is a ring, and "ring" is a statement about connectivity.** The outer
 band left of the centre and the outer band right of it are one dark region,
 joined above and below where the scan line cannot see. Everything else that
 produces a 1:1:3:1:1 run — a fence, a line of text, a symbol's own data region —
 is three separate regions. Testing that is what makes detection tolerant of
-rotation and damage in a way the old column walk was not: it is a fact about the
-shape rather than about a second scan line staying intact.
+rotation and damage: it is a fact about the shape rather than about a second
+scan line staying intact.
 
 **Labelling by runs, not by pixels, is what makes it affordable.** A label per
 pixel is 16x this module's entire scratch buffer. Labelling *runs* needs one row
@@ -89,13 +82,10 @@ runs — so the candidate test reads the labels of the three dark runs it is
 looking at, in the same pass, with nothing stored per pixel at all. Label 0 means
 the table ran out.
 
-⚠ This paragraph used to continue "and the test then falls back rather than
-rejecting: an unlabelled finder is still a finder". It does not: the **strict**
-pass requires a non-zero label and rejects an unlabelled candidate outright.
-What rescues an exhausted-table picture is the **relaxed** pass, which does not
-require the ring at all. Measured with the table deliberately exhausted
-(13,184 isolated specks, 1238x1238): the symbol still reads, in 16 ms. The
-outcome held; the explanation of how did not.
+The **strict** pass requires a non-zero label and rejects an unlabelled candidate
+outright. What rescues an exhausted-table picture is the **relaxed** pass, which
+does not require the ring at all. Measured with the table deliberately exhausted
+(13,184 isolated specks, 1238x1238): the symbol still reads, in 16 ms.
 
 **Two passes, strict first.** The ring requirement fails on a *small* symbol,
 where the light band between ring and centre is three pixels wide and
@@ -130,14 +120,6 @@ the design matrix carries entries around 1e5 and squaring those into normal
 equations costs more digits than the answer has. Hartley normalisation — centre
 each set, scale to a mean radius of √2 — brings every entry to order 1.
 
-⚠ **An alternating scheme was tried first and is a trap worth recording.** Hold
-the perspective terms, refit the affine part; hold the affine part, solve a 2×2
-for the perspective terms. It reuses the 3×3 solver already here, it minimises
-the correct objective, and it converges — at a rate that made it useless: on
-exact synthetic data, forty rounds had it a fifth of the way to an answer the
-direct solve gets exactly. A test fits a known projective map and demands it
-back, which is what turned "it seems not to help" into "the fitter is wrong".
-
 **Landmarks that do not fit are dropped rather than averaged in.** The search
 window widens with each pass, and a wide window over a data region can return a
 dark module that crosses like an alignment pattern. One such landmark drags a
@@ -148,8 +130,7 @@ model with two spare degrees of freedom is exactly the one that can bend to
 accommodate the odd one out. The three finder centres are never dropped.
 
 ⚠ **The pattern search widens across passes, and the loop must not stop when a
-pass finds nothing.** Those are different conditions, and conflating them cost
-an hour: the first pass looks 1.5 modules out, a version 2–6 symbol's single
+pass finds nothing.** Those are different conditions: the first pass looks 1.5 modules out, a version 2–6 symbol's single
 alignment pattern sits further than that past about 15° of tilt, and a loop that
 returns as soon as a pass adds nothing never reaches the wider window that would
 have found it. It stops when everything expected has been found.
@@ -174,8 +155,7 @@ up. Measured: a rotated version 37 at 3 pixels per module went from 9 in 72 to
 *indices* and `Grid.at` samples module *centres*; fitting on one and sampling on
 the other is half a module of error everywhere. Uniformly — so the finders, the
 triple score, the dimension and the residuals all still look right, and only the
-decode fails. It cost an afternoon; there is a test that fits a known grid and
-demands it back.
+decode fails. A test fits a known grid and demands it back.
 
 **How many candidates the list holds is a detection limit, not a memory
 setting.** False positives scale with the data region, so a large symbol
@@ -222,44 +202,70 @@ p is the top-right. Inverted, the symbol is transposed — and a transposed symb
 still samples cleanly and still yields a well-formed grid, so the failure appears
 as "decodes to nothing" rather than as anything pointing at orientation.
 
-## Threat model & out of scope
+**Inverted and mirrored symbols are retries on the binarised bitmap.** `scan` reads dark
+modules on a light ground only. `scanAny(img, scratch, ScanOptions)` runs the same
+pipeline and, only when the plain attempt yields no *readable* grid, flips the polarity of
+the binarised bitmap in the caller's scratch, then mirrors it, then both (order: plain,
+inverted, mirrored, inverted+mirrored), reporting in `ScannedAny.transform`
+(`Transform.none` / `.inverted` / `.mirrored` / `.inverted_mirrored`) which one matched;
+`found.matrix` is already in the symbol's own orientation. Binarisation runs once, so a
+first-attempt success costs what `scan` costs. `ScanOptions.try_inverted` and `.try_mirrored`
+(both default on) switch a retry off; with only `try_mirrored`, a mirrored symbol is tried
+without the inverted pass. If no attempt is readable but the plain one produced a best-effort
+grid, that grid is returned with `.none`, as `scan` would have; otherwise `NotFound`. `scan`
+itself is unchanged. The retries follow what the ZXing family does.
+
+## Threat model & limits
 
 Input is an image someone else chose, so every dimension and every pixel is
 untrusted. Bounds are checked before anything is indexed: `width`/`height` must
-be at most `max_dimension` (8192, checked *before* `luma` or `scratchSize`),
-`luma` must cover `stride * height`, the scratch must meet `scratchSize`, and
-each sampling point is range-checked against the bitmap rather than assumed to
-land inside it. There is no allocation, so there is no allocation to exhaust;
-work is linear in pixels except the triple search, which is cubic in candidates
-and therefore capped at 64; the dimension search, which samples at most five
-grids; and the label table, which is a fixed 4096 entries and degrades to "no
-label" rather than growing.
+be at least 21 (no legal QR symbol is smaller) and at most `max_dimension` (8192,
+checked *before* `luma` or `scratchSize`), `stride` must be at least `width`, `luma`
+must cover `stride * height` (computed in `u64`), the scratch must meet
+`scratchSize`, and each sampling point is range-checked against the bitmap rather
+than assumed to land inside it. There is no allocation, so there is no allocation to
+exhaust; work is linear in pixels except the triple search, which is cubic in
+candidates and therefore capped at 64; the dimension search, which samples at most
+five grids; and the label table, which is a fixed 4096 entries and degrades to "no
+label" rather than growing. The alignment-pattern run walks are bounded at 1.5
+modules (a longer centre run is rejected anyway, so truncating cannot create a false
+accept), which keeps them out of the cost of a field where every run is
+region-length.
 
-⚠ **The dimension bound exists because the size arithmetic it guards has a
-narrower ceiling than the image does.** `scratchSize` and its helpers used to
-compute in plain `usize`, which is 32 bits on this module's own declared
-`.wasm32` target (`meta.targets`); a 100,000 x 100,000 image — nothing capped
-`width`/`height` before this, only the `< 21` floor did — wraps `bitmapBytes`
-from a true 1,250,000,000 to 176,258,176 before the arithmetic even finishes,
-under-allocating by a factor of about seven with no error raised anywhere. Two
-independent fixes, not one: the arithmetic itself now runs in `u64` (`u32 * u32`
-cannot overflow it) and saturates rather than wraps on the way back to `usize`,
-*and* `scan` refuses an oversized image outright via `max_dimension` — chosen
-comfortably past the highest resolution either real source (a V4L2 camera plane
-or a browser canvas; 8K/7680x4320 is the current practical ceiling for both)
-produces, while leaving `width * height` 64x below the point where a 32-bit
-`usize` product would wrap. `Image.at`'s own index arithmetic had the matching
-defect at smaller scale — `y * stride + x` left in `u32` where `Bitmap.get`/`set`
-deliberately widen to `usize` first — fixed the same way, by widening; unlike
-the scratch-size arithmetic this one is live on 64-bit targets too, since it
-only needs a multi-gigabyte real buffer, not a 32-bit `usize`, to overflow.
+**The dimension bound exists because the size arithmetic it guards has a narrower
+ceiling than the image does.** `scratchSize` and its helpers compute in `u64` (`u32 *
+u32` cannot overflow it) and saturate rather than wrap on the way back to `usize`,
+which is 32 bits on this module's declared `.wasm32` target; and `scan` refuses an
+oversized image outright via `max_dimension`, chosen comfortably past the highest
+resolution either real source (a V4L2 camera plane or a browser canvas; 8K/7680x4320
+is the current practical ceiling for both) produces, while leaving `width * height`
+64x below the point where a 32-bit `usize` product would wrap. `Image.at`'s index
+arithmetic widens `y` to `usize` before multiplying (`Image.index`), as
+`Bitmap.get`/`set` do. `stride` has no ceiling of its own (`max_dimension` bounds
+`width` and `height` only), so a buffer whose `stride * height` exceeds even a
+64-bit `usize` is not claimed to be handled.
 
 Failing to find a symbol returns `NotFound`. Deciding whether a located symbol is
 *readable* is `qr.decode`'s job, and the split matters: a scanner that reports
 success for a grid it merely sampled would hide every decode failure behind a
 detection success.
 
+**Measured limits** (six pixels per module, tilt about each axis, rendered by
+`renderProjective`): version 6 reads to 25°/15° (vertical/horizontal axis), version 13
+to 15°/20°, version 1 to 10° (it has no alignment patterns, so nothing a projective fit
+could be built from). The zxing-cpp differential (`tools/README.md`) measured 25° at
+versions 1 and 15 and 30° at version 4, vertical axis only. Curvature is not modelled:
+a version 1 reads wrapped on a cylinder 18 modules across, a version 6 to 45, a version
+13 to 200. A wider sweep (five versions x two module scales x 5° steps) reads at every
+angle at 4 pixels per module from version 1 to 24, and at 3 pixels per module reads 68
+of 72 angles at version 37 and 57 of 72 at version 1; the small-symbol end is the weaker
+one, since 21 modules at 3 pixels each is where binarisation decides a module from a
+pixel or two.
+
 ## Verification
+
+Run: `scripts/modtest qrscan`; deterministic fuzz: `QRSCAN_FUZZ=<runs>[,<first seed>]`;
+differential: `tools/oracle.py` (see `tools/README.md`).
 
 Tests start from a symbol whose correct answer is known — encoded with `qr`,
 rendered to pixels, scanned back — and check the sampled grid **module for
@@ -267,83 +273,35 @@ module** against the original, not merely that it decodes. A grid that decodes i
 weaker evidence than a grid that is identical, because error correction hides
 sampling mistakes up to its capability.
 
-Covered: three texts across three module scales; a padded-stride buffer with junk
-in the padding; **two symbols swept through a full turn in 15° steps**; and a
-contrast-rich image with no symbol in it, which must return `NotFound` rather
-than a guess. The rotation sweep is the regression net, but three tests pin the
-mechanisms underneath it individually, because a sweep that goes red says only
-that something moved: that the tilt correction turns a 1.41× scan-line estimate
-back into the rendered module size, that a dimension one version out is rejected
-by its timing pattern, and that a large rotated symbol really does produce more
-than sixteen candidates.
-
-**The dimension bound and the wide arithmetic behind it are each tested against
-what makes them meaningful, not against what this host happens to be.** Native
-`usize` is 64 bits, so nothing about the original wrap could ever reproduce
-itself on `linux64` by accident — a test built the way the rest of this module's
-tests are (call the real function, compare the real result) would pass whether
-the fix existed or not. `max_dimension`'s rejection sidesteps that: it is a
-target-independent comparison (`> max_dimension`), asserted directly against
-`Error.BadImage`, on both an over-wide and an over-tall image, plus a check that
-`max_dimension` itself is still accepted. `scratchSize`'s fix is pinned as a
-literal number instead: the auditor's own 100,000 x 100,000 case, checked
-against an independently computed `u64` byte count *and* against the specific
-176,258,176 a 32-bit `usize` implementation would have produced, so a reader can
-verify the claim in `max_dimension`'s doc comment rather than take it on faith.
-`Image.at`'s widening is pulled out into `Image.index` so it is callable without
-the multi-gigabyte real buffer a full repro would need, and is checked against a
-`stride`/`y`/`x` combination that overflows `u32` — explicitly on this 64-bit
-host, since the value being checked does not fit a 32-bit `usize` at all, so the
-same assertion would be meaningless (and does not run) on `.wasm32`.
-
-**Tilt and curvature are rendered, not reasoned about.** `renderProjective` puts
-the symbol on a plane rotated out of the image plane and projects it through a
-pinhole; `renderCylindrical` wraps it round a cylinder, which has no closed-form
-inverse and needs a bisection per destination column — which is itself the
-answer to why curvature is a different problem from perspective rather than a
-harder case of it. Both are checked at their own identity (zero tilt, infinite
-radius) against the flat renderer, because a warp renderer that is wrong turns
-every number measured with it into a statement about the renderer.
-
-Measured at six pixels per module, tilt about each axis: version 6 reads to
-25°/15°, version 13 to 15°/20°, version 1 to 10°. Before the projective fit:
-5°, 0°, 10°. Curvature, unchanged by this work since the map is still a single
-global one: a version 1 reads wrapped on a cylinder 18 modules across, a version
-6 to 45, a version 13 to 200.
-
-A wider sweep than the tests keep — five versions × two module scales × 5° steps
-— reads at every angle at 4 pixels per module from version 1 to 24, and at 3
-pixels per module reads 68 of 72 angles at version 37 and 57 of 72 at version 1.
-The small-symbol end is the weaker one now: 21 modules at 3 pixels each is where
-binarisation is deciding a module from a pixel or two.
-
-The three defects above were all found this way rather than by reading the code,
-which is the argument for rendering the input instead of hand-writing bitmaps.
-
-**Mutation run 2026-10-05** (in-place, Debug, 33 mutants over `scan`'s input
-gates, the scratch arithmetic, binarisation, the finder ratio/ring/vertical
-tests, `orient`, the sampler's bounds, the alignment-run walk, outlier rejection,
-the dimension referee, the label table, `solve8` and `readable`): 26 killed. The
-first pass left 19; ten tests were added (both dimension gates exact at 20/21 and
-`max_dimension + 1` with a real buffer behind each — the old over-max test passed
-on the luma check for an empty slice; scratch one byte short; a block at exactly
-`min_contrast` and a pixel exactly at the threshold; a finder whose vertical
-module is 2.5x its horizontal one; a non-square triple refused by `orient`;
-`insideImage` at `x == width`; a light band over 1.5 modules in `alignmentRun`;
-the last label before exhaustion; `solve8` needing a pivot; `readable` on a
-message longer than its probe buffer). Six are equivalent: the candidate-centre
-dark check in `confirmVertical` (the centre is always inside a dark run), the
-`d[0] < 1` guard in `tripleScore` (a coincident pair already scores >= 2 on leg
-error, or NaN, never chosen), `Grid.at`'s horizon guard and `insideImage`'s
-finiteness check (each other's backstop: NaN and ±inf fail its range compares),
-`alignmentRun`'s image-edge refusal (an edge run has an empty light band, which
-the half-module floor refuses), and the rms gate that withholds the projective
-grid from a flat symbol (versions 7/10/14, 0–352.5° in 7.5° steps at 3 and 4
-px/module all read with it removed: the timing referee picks the affine grid
-anyway; the gate only saves sampling). One survivor is left without a test: the
-ring test's `!= 0` (label table exhausted) clause — reaching it needs an image
-that exhausts the 4096 labels and then places a decoy whose centre was labelled
-before exhaustion and whose bars were not.
+- **Pipeline:** three texts across three module scales; a padded-stride buffer with junk in the padding; **two symbols
+  swept through a full turn in 15° steps**; a contrast-rich image with no symbol in it, which must return `NotFound`
+  rather than a guess. The rotation sweep is the regression net; three tests pin the mechanisms underneath it
+  individually (the tilt correction turns a 1.41x scan-line estimate back into the rendered module size, a dimension one
+  version out is rejected by its timing pattern, a large rotated symbol really does produce more than sixteen
+  candidates), because a sweep that goes red says only that something moved.
+- **Bounds:** `max_dimension` is a target-independent comparison, asserted against `Error.BadImage` on an over-wide and an
+  over-tall image (with a real buffer behind each, so the luma check does not answer first) plus a check that
+  `max_dimension` itself is accepted; both dimension gates are exact at 20/21. `scratchSize`'s `u64` arithmetic is pinned
+  as a literal number — 100,000 x 100,000 against an independently computed byte count and against the 176,258,176 a
+  32-bit `usize` implementation would have produced — and `Image.index` is checked against a `stride`/`y`/`x`
+  combination that overflows `u32` (it does not run on `.wasm32`, where the value does not fit). Native `usize` is 64
+  bits, so a test that merely calls the real function would pass whether the fix existed or not.
+- **Tilt and curvature are rendered, not reasoned about.** `renderProjective` puts the symbol on a plane rotated out of
+  the image plane and projects it through a pinhole; `renderCylindrical` wraps it round a cylinder, which has no
+  closed-form inverse and needs a bisection per destination column (which is why curvature is a different problem from
+  perspective rather than a harder case of it). Both are checked at their own identity (zero tilt, infinite radius)
+  against the flat renderer, because a warp renderer that is wrong turns every number measured with it into a statement
+  about the renderer. Rendering the input, not hand-writing bitmaps, is how the defects behind the projective fit
+  were found.
+- **Fits:** a test fits a known projective map and a known grid and demands each back.
+- **`scanAny`:** each of the three retries (inverted, mirrored, inverted+mirrored) reads only with its option on and is
+  refused with it off.
+- **Fuzz:** harnesses `qrscan-scan`, `qrscan-damaged` and `qrscan-roundtrip` under the deterministic driver (`QRSCAN_FUZZ`).
+- **Differential:** `tools/oracle.py` against zxing-cpp (see *Anchoring*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it. That run's one survivor without a test is the ring test's `!= 0` (label table exhausted)
+  clause: reaching it needs an image that exhausts the 4096 labels and then places a decoy whose centre was labelled
+  before exhaustion and whose bars were not.
 
 ## Anchoring
 
@@ -357,7 +315,7 @@ comparison is internal.
 
 **Anchor grade:** class B · oracle MIXED
 
-Why MIXED (2026-10-06): the template's *external anchor* includes "a live run
+Why MIXED: the template's *external anchor* includes "a live run
 against a foreign peer … It can fail us", produced by an instrument kept in
 `modules/<name>/tools/`. `tools/oracle.py` is exactly that for the image → text
 path: symbols encoded by `segno` (not `qr`), decoded by zxing-cpp and by this
@@ -368,7 +326,7 @@ test-qrscan` asserts — grid, orientation and sampling against `qr`'s own symbo
 — stays re-derived as described above. Anchored for one path, re-derived for the
 rest: MIXED, not EXTERNAL.
 
-**External differential (added 2026-09-17).** The re-derived comparison above cannot
+**External differential.** The re-derived comparison above cannot
 catch a misreading of the geometry both `qr` and `qrscan` share. `tools/oracle.py`
 closes that gap by running zxing-cpp (Apache-2.0), an independently written decoder,
 over rendered/rotated/degraded/perspective images and diffing its verdict against
@@ -378,40 +336,28 @@ perspective** (this module holds to 25° at v1/v15 and 30° at v4, more conserva
 than ZXing but not wrong — see `tools/README.md` for the measured run and the two
 tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
 
-## Backlog
+## What is deliberately not done
 
-- **A mesh instead of one global map.** The grid is a single projective map, so
-  it models a flat plane at an angle and nothing else. Interpolating between the
-  alignment patterns instead — each cell of the lattice carrying its own local
-  map — would handle curvature as well, and would raise the tilt limit too,
-  since it stops assuming the whole symbol is one plane. The landmarks are
-  already collected; what is missing is the lattice and the extrapolation for
-  the margins outside it.
-- **Tilt about the horizontal axis lags the vertical one** — 15° against 25° at
-  version 6. Unexplained. The scan that finds the finders runs along rows, so
-  the two axes are not the same thing to it, but that is a hypothesis and this
-  file has been wrong with one of those before.
-- **Small symbols at three pixels per module.** A version 1 reads at about 79 %
-  of angles there, against 100 % at four pixels.
-  ⛔ **Neighbourhood sampling is not the answer, measured.** Reading each module
-  as the majority of the 3×3 around its centre — the obvious fix, on the theory
-  that one noisy pixel decides a module — makes it *worse*: version 1 went from
-  31 of 36 angles to 22 and version 6 from 36 to 29. At three pixels per module
-  a 3×3 neighbourhood is a whole module wide, so it averages the neighbours in.
-  Whatever helps here has to happen in binarisation, which is what is actually
-  deciding those pixels, not in sampling.
-- ~~**Perspective correction.**~~ Done 2026-08-17: `fitProjective` (see *The grid is projective when the
-  symbol says it should be* above). What remains of tilt is the curved/steep case below.
-- **Multiple symbols per frame.** Candidates for several are already found; only
-  the best triple is sampled. A wallet showing two codes at once is the case.
+- **Neighbourhood (majority of the 3x3) module sampling** for small symbols — measured worse: version 1 went from 31 of 36
+  angles to 22 and version 6 from 36 to 29 at three pixels per module, where a 3x3 neighbourhood is a whole module wide
+  and averages the neighbours in. Whatever helps there has to happen in binarisation, not in sampling.
+- **An alternating affine/perspective refit** instead of the direct eight-parameter solve — converges too slowly to be
+  useful: on exact synthetic data, forty rounds had it a fifth of the way to the answer the direct solve gets exactly.
+- **A minimum timing score for the dimension referee** — the score chooses between candidate versions and does not get a
+  veto, because a real symbol with a damaged timing pattern still decodes (the data is protected, the timing is not).
 
-- ✅ DONE 2026-11-16 (`scanAny(img, scratch, ScanOptions)` retries inverted, mirrored, then both after the plain attempt fails, on the already binarised bitmap; the result's `transform` says which; `scan` unchanged) (survey 2026-09-30) **Inverted (light-on-dark) and mirrored symbols** — ZXing-family readers try them; a user scanning a dark-mode screen or a reflected code gets `NotFound` here. Effort: small-medium (re-run binarisation with flipped polarity; transposed sampling). Fits CONVENTIONS §2.
-- (survey 2026-09-30) **Multiple symbols per image** — quirc, rqrr and ZXing return every code found; here only the best triple is sampled (already listed above under *Multiple symbols per frame*). Effort: medium (API returns a slice, scratch stays bounded). Fits §2.
-- (survey 2026-09-30) **Steeper tilt / curved surfaces** — ZXing-class readers read codes at much sharper angles (40° in the differential); here 25–30° about the vertical axis in the differential and 10–25° in the in-repo sweep (already listed above as *A mesh instead of one global map*). Effort: large. Fits §2.
+## Backlog / deferred
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 4 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`build · any · codec · reentrant` + deps: `qr` — canonical source is
-`pub const meta` in `src/root.zig`.
+- **A mesh instead of one global map.** The grid is a single projective map, so it models a flat plane at an angle and
+  nothing else. Interpolating between the alignment patterns instead — each cell of the lattice carrying its own local
+  map — would handle curvature as well, and would raise the tilt limit too (ZXing-class readers read to 40°; here 25–30°
+  about the vertical axis in the differential, 10–25° in the in-repo sweep), since it stops assuming the whole symbol is
+  one plane. The landmarks are already collected; what is missing is the lattice and the extrapolation for the margins
+  outside it. Effort: large.
+- **Tilt about the horizontal axis lags the vertical one** — 15° against 25° at version 6. Unexplained. The scan that
+  finds the finders runs along rows, so the two axes are not the same thing to it, but that is a hypothesis.
+- **Small symbols at three pixels per module.** A version 1 reads at about 79 % of angles there, against 100 % at four
+  pixels. The fix has to happen in binarisation (see *What is deliberately not done* for the sampling idea that failed).
+- **Multiple symbols per frame** (quirc, rqrr and ZXing return every code found; a wallet showing two codes at once is the
+  case). Candidates for several are already found; only the best triple is sampled. Effort: medium (the API would return
+  a slice, scratch stays bounded).

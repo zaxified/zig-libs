@@ -7,11 +7,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-11-16** — **New:** `scanAny(img, scratch, ScanOptions)` — `scan`, then only if that finds no readable symbol, the inverted (light-on-dark), mirrored and inverted+mirrored images (ZXing-style retries; both `try_inverted` and `try_mirrored` default on). Returns `ScannedAny{ found, transform }` with `Transform = none | inverted | mirrored | inverted_mirrored`. Binarisation runs once and retries flip/mirror the bitmap in place, so a first-attempt success costs what `scan` costs; `scan` is unchanged and no error was added.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-10** — tests: deterministic fuzz driver `QRSCAN_FUZZ` over the scan and damaged-symbol harnesses (generic over their choice source) plus a roundtrip oracle (a pristine rendering of an issued symbol at any scale and ECC level is found, sampled module for module and decoded to its text); a damaged symbol that decodes must decode to the original text. No code change.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: anchor oracle REDERIVED -> MIXED (the zxing-cpp differential in `tools/oracle.py` is an external anchor for the image-to-text path; `zig build test` stays re-derived); tilt figures in Compared with / Backlog / README now cite the measured 25–30° differential alongside the in-repo sweep.
 - **2026-10-05** — Mutation run: 26 of 33 killed, 6 equivalent, 1 left without a
   test (the ring test's exhausted-label clause); 10 tests added (exact dimension
   gates with a real buffer, scratch one byte short, `min_contrast` and threshold
