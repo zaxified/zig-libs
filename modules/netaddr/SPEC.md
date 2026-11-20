@@ -89,7 +89,8 @@ Not security-sensitive; pure logic. Parsing and formatting never panic (`parseIp
 past `rangeCount()` is a checked panic in every build mode. `IpSetBuilder` alternation of
 adds and removals is O(n log n). A parsed zone keeps any byte (CR, LF, NUL, `]`) and formatting writes
 it back, as Go does (documented on `Zone`): a caller that puts a zone into a log line or a header must
-sanitise it. `systemSource` is the only impure, Linux-only surface: a UDP-`connect` route probe (no
+sanitise it, or parse with the opt-in `parseIpZonedStrict` / `parseAddrPortStrict`, which refuse control
+bytes and `]` in a zone (`isStrictZone`). `systemSource` is the only impure, Linux-only surface: a UDP-`connect` route probe (no
 packet sent) + `getsockname` to learn the OS-chosen source (the glibc trick); it needs no privileges
 and returns `null` on an unreachable destination. `Builder`/`IpSet` errors for a malformed `IpRange`
 are returned at the call. Out of scope: see *What is deliberately not done*.
@@ -135,8 +136,6 @@ dependency of a widely consumed module (`set_build` is already well below Go).
 
 ## Backlog / deferred
 
-- **Opt-in strict-zone parse** (reject CR/LF/NUL/`]` and other control bytes in a zone): today a zone
-  keeps any byte, as Go does.
 - **Longest-prefix match with values.** netipx has none: a set answers membership, not "which entry".
   A prefix → value table belongs to a routing-table type; not started, no consumer has asked.
 - **Consumers converting `std.Io.net.IpAddress` by hand** (abuseguard, http/proxy, probe, ratelimit,

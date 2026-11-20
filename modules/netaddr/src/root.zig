@@ -597,7 +597,8 @@ pub const max_zone_len = 31;
 /// An IPv6 zone (`eth0`, `3`): any non-empty text up to `max_zone_len`
 /// bytes, opaque as in Go — not resolved, not checked against interfaces.
 /// Any byte is accepted (CR, LF, NUL, `]`) and formatting writes it back
-/// verbatim: escape a parsed zone before it reaches a log line or a header.
+/// verbatim: escape a parsed zone before it reaches a log line or a header,
+/// or parse with `parseIpZonedStrict` / `parseAddrPortStrict`.
 pub const Zone = struct {
     len: u8 = 0,
     buf: [max_zone_len]u8 = @splat(0),
@@ -674,6 +675,27 @@ pub fn parseIpZoned(text: []const u8) ?ZonedIp {
     if (zone_text.len == 0) return null;
     const b = parseIp6(text[0..pct]) orelse return null;
     return .{ .ip = .{ .v6 = b }, .zone = Zone.fromSlice(zone_text) orelse return null };
+}
+
+/// Whether `zone_text` is a zone safe to put in a log line, a header or a
+/// bracketed literal: no control byte (below 0x20, or DEL), so no CR, LF or
+/// NUL, and no `]`. Empty text is not a zone.
+pub fn isStrictZone(zone_text: []const u8) bool {
+    if (zone_text.len == 0) return false;
+    for (zone_text) |c| {
+        if (c < 0x20 or c == 0x7f or c == ']') return false;
+    }
+    return true;
+}
+
+/// `parseIpZoned` that also refuses a zone `isStrictZone` refuses. Go
+/// `netip.ParseAddr` (the default parse here) takes any byte; this is the
+/// opt-in form for text from an untrusted source.
+pub fn parseIpZonedStrict(text: []const u8) ?ZonedIp {
+    if (std.mem.findScalar(u8, text, '%')) |pct| {
+        if (!isStrictZone(text[pct + 1 ..])) return null;
+    }
+    return parseIpZoned(text);
 }
 
 /// Enough for any output of `formatIpZoned`.
@@ -767,6 +789,13 @@ pub fn parseAddrPort(text: []const u8) ?AddrPort {
     }
     // Unbracketed: IPv4 only (an IPv6 literal would be ambiguous).
     return .{ .ip = .{ .v4 = parseIp4(host) orelse return null }, .port = port };
+}
+
+/// `parseAddrPort` that also refuses a zone `isStrictZone` refuses.
+pub fn parseAddrPortStrict(text: []const u8) ?AddrPort {
+    const ap = parseAddrPort(text) orelse return null;
+    if (!ap.zone.isNone() and !isStrictZone(ap.zone.slice())) return null;
+    return ap;
 }
 
 /// Enough for any output of `formatAddrPort` (`[` addr%zone `]:` 5 digits).
@@ -3256,4 +3285,29 @@ test "Ip.key: v4 zero-padded, v6 masked to v6_bits, bits clamped" {
     const k68 = (Ip{ .v6 = hi }).key(68);
     try std.testing.expectEqual(@as(u8, 0xA0), k68[8]);
     try std.testing.expectEqual(@as(u8, 0), k68[9]);
+}
+
+test "strict zone parse refuses CR, LF, NUL, ']' and other control bytes; the default parse keeps taking them" {
+    try testing.expect(isStrictZone("eth0"));
+    try testing.expect(isStrictZone("3"));
+    try testing.expect(isStrictZone("a b%c"));
+    try testing.expect(!isStrictZone(""));
+    for ([_]u8{ '\r', '\n', 0, ']', 0x01, 0x1f, 0x7f }) |bad| {
+        const zone = [_]u8{ 'e', bad, '0' };
+        var buf: [32]u8 = undefined;
+        const text = std.mem.print(&buf, "fe80::1%{s}", .{&zone}) catch unreachable;
+        try testing.expect(!isStrictZone(&zone));
+        try testing.expect(parseIpZonedStrict(text) == null);
+        try testing.expect(parseIpZoned(text) != null);
+    }
+    const ok = parseIpZonedStrict("fe80::1%eth0").?;
+    try testing.expectEqualStrings("eth0", ok.zone.slice());
+    try testing.expect(parseIpZonedStrict("192.0.2.1").?.zone.isNone());
+    try testing.expect(parseIpZonedStrict("fe80::1%") == null);
+    try testing.expect(parseIpZonedStrict("not an address") == null);
+    // `[v6%zone]:port`: a ']' in the zone already splits the literal wrongly; control bytes are refused
+    try testing.expect(parseAddrPortStrict("[fe80::1%eth0]:80") != null);
+    try testing.expect(parseAddrPort("[fe80::1%e\n0]:80") != null);
+    try testing.expect(parseAddrPortStrict("[fe80::1%e\n0]:80") == null);
+    try testing.expect(parseAddrPortStrict("1.2.3.4:80") != null);
 }
