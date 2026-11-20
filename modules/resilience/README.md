@@ -28,7 +28,7 @@ comparators, which are built from the Go module cache and never vendored.
   `CircuitBreaker` is internally synchronized (documented spinlock, O(1)
   critical sections, no allocation); `Bulkhead` is lock-free (a CAS loop on
   one atomic counter); `Retry`/`Deadline` are immutable values.
-- **Deps:** none (std only).
+- **Deps:** `clock` (`Clock` is `clock.Clock`); otherwise std only.
 
 ## Layers
 

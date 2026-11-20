@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [Xuanwo/backon](https://github.com/Xuanwo/backon) | Rust | Apache-2.0 (source not read) | — | pushed 2026-06-19 | README-verified: retry only — exponential/constant/custom strategies, `when` predicate, `notify`, dynamic backoff such as `Retry-After`. |
 | Zig: [k1ngkevin/zretry](https://github.com/k1ngkevin/zretry), [flowerinthenight/zbackoff](https://github.com/flowerinthenight/zbackoff) | Zig | MIT | 1 / 3 | zretry v0.4.0 (Zig 0.16); zbackoff pushed 2025-03-18 | Retry/backoff helpers only (zretry README-verified: configurable delay and jitter over an error-union function). No Zig breaker/bulkhead library found (GitHub search 2026-09-30 returned only tiny repos). |
 
-**Where we are ahead:** the only Zig library with breaker + bulkhead + retry + timeout composed in one `run` (the Zig retry crates do retry alone); no allocation, no hidden globals, injected clock/delay/random so every test is deterministic and sleep-free; half-open probe reclaim (`probe_timeout_ms`) so a lost probe cannot pin the breaker; typed errors; 3–35× faster than the Go libraries single-threaded and 4–11× on one breaker from 8 threads (`zig build bench-resilience`, *Performance*). **Where we are behind:** nothing a breaker + retry + bulkhead user would notice (2026-10-17: failure-rate and slow-call windows, count and time based, `minimum_calls`, half-open k-of-n, forced-open / disabled / reset, state listener, `counts()`, error classification, retry on result, `Retry-After`, total time budget, proportional jitter, bulkhead in `run`). Deliberately not: fallback (a `catch` in Zig), hedging and a preemptive time limiter (need cancellation the std-only, `Io`-free module does not have), registries (global state), thread-pool bulkhead (`workerpool`). Rate limiting and futex-parked waiting are sibling modules (`ratelimit`, `throttle`), and `upstream` composes breaker + bulkhead per member.
+**Where we are ahead:** the only Zig library with breaker + bulkhead + retry + timeout composed in one `run` (the Zig retry crates do retry alone); no allocation, no hidden globals, injected clock/delay/random so every test is deterministic and sleep-free; half-open probe reclaim (`probe_timeout_ms`) so a lost probe cannot pin the breaker; typed errors; faster than the Go libraries single-threaded and on one breaker from 8 threads (`zig build bench-resilience`; figures on the card's **Performance:** line, see *Performance*). **Where we are behind:** nothing a breaker + retry + bulkhead user would notice (2026-10-17: failure-rate and slow-call windows, count and time based, `minimum_calls`, half-open k-of-n, forced-open / disabled / reset, state listener, `counts()`, error classification, retry on result, `Retry-After`, total time budget, proportional jitter, bulkhead in `run`). Deliberately not: fallback, a preemptive time limiter, the automatic open → half-open monitor, registries, thread-pool bulkhead (see *What is deliberately not done*). Rate limiting and futex-parked waiting are sibling modules (`ratelimit`, `throttle`), and `upstream` composes breaker + bulkhead per member.
 
 ## Design & invariants
 
@@ -81,82 +81,81 @@ connect-timeout; hard cancellation needs preemptible work plus its own timeout. 
 deduplicate or make retried side effects idempotent — retried attempts may repeat effects; only
 wrap idempotent operations. `CircuitBreaker` is count-based (consecutive failures) — bursty-but-rare
 failures behind a high-volume success stream will not trip it; that is what `RateCircuitBreaker` is
-for. No
+for. A user `Clock` runs under the breaker's spinlock (`allow`, `record`, `counts` and the trip call
+`options.clock.now()` while holding it), so a `Clock` that calls back into the same breaker deadlocks;
+the contract on `Clock` is: no call back into the breaker, no blocking, no panic. No
 global/shared state: multiple upstreams need their own `CircuitBreaker`/`Bulkhead` instances (see
 `upstream`, which does exactly this per-member).
 
+
 ## Verification
 
-Fully deterministic and offline (injected clock + injected recording delay + fail-scripted
-synthetic operations, no real sleeps): breaker trips after N consecutive failures, success resets
-the streak, fast-fail while open, half-open after cooldown with fresh-cooldown re-open, probe budget
-honored; exponential backoff progression + cap + overflow safety; full/equal jitter bounds and
-same-seed reproducibility; retry runs exactly `max_attempts` with the exact delay sequence;
-non-retryable errors return immediately; timeout fires on slow attempts including slow *successes*
-and is retryable by default; cooperative deadline reaches the operation; composition cases (recovers
-under threshold, trips mid-run then fast-fails without invoking the op, recovers after cooldown); an
-8-thread breaker check (no lost failure counts, exact half-open probe admission). Bulkhead: N
-acquires then immediate N+1 rejection; `run` returns the slot on both success and error paths and
-fast-fails a full bulkhead without invoking the op; bounded wait succeeds within a virtual-time
-budget and times out poll-by-poll otherwise; a real cross-thread handover; an 8-thread `run()`
-hammer asserting in-flight never exceeds `max_concurrent` and no slot leaks. Run:
-`zig build test-resilience`.
+`scripts/modtest resilience` (the `test-resilience` step). Everything is deterministic and offline: an
+injected clock, an injected recording delay and scripted synthetic operations, so no test sleeps.
 
-**Model fuzzing (2026-10-17, `src/model_test.zig`, driver `RESILIENCE_FUZZ`).** Three harnesses,
-each comparing the real code with a naive model after every step; 200,000 runs each clean, and
-every outcome label reached in 600 seeds inside the ordinary test run:
-- `resilience-breaker` — consecutive, count-window and time-window breakers under a script of
-  edge-biased clock steps (0, 1 ns, the cooldown edge, the probe timeout, a bucket, a whole window),
-  `allow`, `record` (success / failure / ignore, timed or not), `abandonProbe`, `reset`,
-  `forceOpen`, `disable`. The model keeps a plain list of calls and recounts the window at every
-  verdict; compared: every `allow()`, `state()`, `mode()`, all of `counts()`, the listener's
-  transition sequence.
-- `resilience-retry` — the un-jittered schedule exactly against `base × num^k / den^k` in integers
-  (factors 1, 1.5, 2, 2.5, 3 — exact in binary); every jitter flavour within its bounds; one seed,
-  one sequence.
-- `resilience-run` — `run` against an interpreter of the documented composition: scripted values,
-  retryable and fatal errors, ignored and success-classified errors, slow calls against a timeout,
-  results to retry, `Retry-After`, a total budget, a full bulkhead, a scripted fake breaker behind
-  `BreakerHandle` that logs every record. Compared: the result, the calls, the waits, the breaker's
-  log, the `on_retry` events, the bulkhead back at zero.
-Negative control: 8 planted mutants (rate `>=` → `>`, required successes `>=` → `>`, a stale
-time bucket kept, `Retry-After` unclamped, an ignored error recorded as a failure, a half-open
-refusal not counted, a slow probe counted as a success, the budget check ignoring the wait) — all
-killed.
-
-**Audit 2026-10-04 (mutation).** 34 schemata mutants over the breaker (cooldown edge,
-half-open admission and its counters, the reclaim anchor/default/disable switch,
-`abandonProbe`, success/failure transitions, trip threshold, fresh cooldown), the bulkhead
-(cap, no-wait mode, wait deadline, `run`'s release), `Retry` (jitter flavours, cap,
-exponent), `Deadline`, and `run` (attempt count, breaker gate, timeout edge, late
-success/error, failure reporting, `retryable`, backoff): 33 killed, 1 equivalent, 0 left
-alive. Equivalent: dropping `reclaimStaleProbes`' "nothing outstanding" early return -- the
-counters' guards keep `probes_succeeded <= probes_admitted`, so in that case the reclaim
-assignment `probes_admitted = probes_succeeded` is a no-op. Tests added for the 4 real gaps:
-a new half-open episode starts from zero successes, a later probe admission moves the reclaim
-anchor, `abandonProbe` is a no-op while open after a half-open trip, and a full non-waiting
-bulkhead never reads its clock.
+- **Breaker:** trip on N consecutive failures, a success resets the streak, fast-fail while open, half-open
+  after the cooldown with a fresh-cooldown re-open, probe budget, a new half-open episode starting from zero
+  successes, the reclaim anchor moving with a later probe admission, `abandonProbe` while open; an 8-thread
+  check (no lost failure counts, exact half-open probe admission).
+- **Retry:** exponential progression, cap and overflow safety; full / equal jitter bounds and same-seed
+  reproducibility; exactly `max_attempts` with the exact delay sequence; non-retryable errors return at once.
+- **`run`:** timeout on slow attempts including slow *successes* (retryable by default); the cooperative
+  deadline reaches the operation; composition cases (recovers under the threshold, trips mid-run then
+  fast-fails without invoking the operation, recovers after the cooldown).
+- **Bulkhead:** N acquires then an immediate N+1 rejection; `run` returns the slot on success and error and
+  fast-fails a full bulkhead without invoking the op; the bounded wait over virtual time; a non-waiting
+  bulkhead never reads its clock; a real cross-thread handover; an 8-thread `run()` hammer (in-flight never
+  above `max_concurrent`, no slot leaks).
+- **Sweep tests** (`src/sweep_test.zig`): release without acquire, `Retry` attempt 0 / base 0, `Bulkhead.acquire`
+  on a clock that never advances, a time-window breaker built by struct literal with `bucket_ms = 0`, and the
+  `RateCircuitBreaker` counters and slow-call rate past 2^32 calls.
+- **Model fuzzing** (`src/model_test.zig`, deterministic driver `RESILIENCE_FUZZ=<runs>[,<first seed>]`): three
+  harnesses compare the real code with a naive model after every step, and every outcome label is reached
+  inside the ordinary test run.
+  - `resilience-breaker` — consecutive, count-window and time-window breakers under a script of edge-biased
+    clock steps (0, 1 ns, the cooldown edge, the probe timeout, a bucket, a whole window), `allow`, `record`
+    (success / failure / ignore, timed or not), `abandonProbe`, `reset`, `forceOpen`, `disable`. The model
+    keeps a plain list of calls and recounts the window at every verdict; compared: every `allow()`,
+    `state()`, `mode()`, all of `counts()`, the listener's transition sequence.
+  - `resilience-retry` — the un-jittered schedule exactly against `base × num^k / den^k` in integers (factors
+    1, 1.5, 2, 2.5, 3 — exact in binary); every jitter flavour within its bounds; one seed, one sequence.
+  - `resilience-run` — `run` against an interpreter of the documented composition: scripted values,
+    retryable and fatal errors, ignored and success-classified errors, slow calls against a timeout, results
+    to retry, `Retry-After`, a total budget, a full bulkhead, a scripted fake breaker behind `BreakerHandle`
+    that logs every record. Compared: the result, the calls, the waits, the breaker's log, the `on_retry`
+    events, the bulkhead back at zero.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-resilience`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.03–0.67×, against 0.03–0.60× before. The card carries these figures.
+`zig build bench-resilience` (`tools/bench.zig`, always ReleaseFast, `BENCH_ROUNDS` rounds) compares the
+breaker, rate breaker, bulkhead, `run` and the delay schedule with gobreaker, failsafe-go and cenkalti/backoff;
+the Go comparators are built from the module cache (`tools/go_bench/go.sum` pins them). The card's
+**Performance:** line carries the figures and is authoritative.
+
+## What is deliberately not done
+
+- **Fallback** — a documented idiom, not a type (owner decision): `run(&op, policy) catch |e| fallback(e)` is the
+  whole feature in Zig.
+- **A preemptive time limiter and hedging as shipped features** — they need concurrency and cancellation this
+  std-only, `Io`-free module does not have; `Policy.timeout_ms` stays observational and cooperative (see
+  *Threat model*).
+- **Automatic open → half-open without a call** (resilience4j's monitor thread, off by default there) — needs a
+  thread; `state()` stays lazy.
+- **Registries** — global state; each upstream owns its `CircuitBreaker` / `Bulkhead` (see `upstream`).
+- **Thread-pool bulkhead** — lives in `workerpool`.
 
 ## Backlog / deferred
-- **User `Clock` called under the breaker's spinlock** *(sweep GO, 2026-10-30)* — `allow()`, `record()`, `counts()` and `trip` call `options.clock.now()` while holding the lock, so a `Clock` that calls back into the same breaker deadlocks. `Clock` is documented as a plain time source; the contract is now stated on `Clock.now` (must not call back into the breaker, block or panic).
 
-- ~~**Failure-rate / sliding-window breaker**~~, ~~**State-change notification**~~, ~~**`Retry-After`-aware delay**~~ *(survey 2026-09-30)* — done 2026-10-17 (`RateCircuitBreaker`, `Options.listener`, `retryAfterMs`), with the rest of the S2 set (see the CHANGELOG).
-- **Fallback** — deliberately a documented idiom, not a type (owner 2026-10-16): `run(&op, policy) catch |e| fallback(e)` is the whole feature in Zig.
-- **Hedging, a preemptive time limiter** — need concurrency and cancellation this std-only, `Io`-free module does not have; revisit on top of `Io.Group`.
-- **Automatic open → half-open without a call** (resilience4j's monitor thread, off by default there) — needs a thread; `state()` stays lazy.
-- **Open delay from the result** (failsafe-go), **custom / linear interval functions**, **retry budgets** (failsafe-go only), **decorrelated jitter** (stateful) — niche, nobody else ships all of them.
-- **Mutation run over the 2026-10-17 code** — the model harnesses killed 8 planted mutants; a full schemata run is due (`Audit` src stays `?`).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · posix (clock/delay defaults; injectable) · util · threadsafe` + deps: none (std only) —
-canonical source is `pub const meta` in src/root.zig.
+- **Hedging / preemptive time limiter on top of `Io.Group`** — a later, separate layer once cancellation is
+  available; the module stays `Io`-free until then.
+- **Open delay from the result** (failsafe-go), **custom / linear interval functions**, **retry budgets**
+  (failsafe-go only), **decorrelated jitter** (stateful) — niche, nobody else ships all of them; no consumer asks.
+- **Whole-module mutation run over the current code** — the card's mutation entry is the run over the 2026-10-04
+  code (34 mutants) with `src` not recorded; the code has since gained the rate breaker, the listener and the
+  sweep fixes, which only the model harnesses (8 planted mutants) and a 13-mutant delta cover. A schemata run
+  over the whole module is due.
 
 ## Anchoring
 
