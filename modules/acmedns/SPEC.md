@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-16 · mutation 2026-11-14 (144/154, 10 eq) · src df529ae71ef91569
 
-*First mutation run 2026-11-14* (whole module: Dns01Solver.zig, publishers.zig, zone.zig): 154 mutants, 141 killed in the ReleaseSafe schemata binary (8 more after new tests), 3 more (the `nameservers` errdefers) killed only by a Debug probe because allocation indexes differ by mode, covered by a dedicated `FailingAllocator` test; 7 equivalent (`>`/`>=` at an exact millisecond, `any` implies `asked`, an encoded length that is never 512, a guard callers cannot reach, a seen-list that only saves queries, `trimDot` on names `dns.decode` already returns undotted); 3 unobservable here (the system-resolver branch needs a controlled /etc/resolv.conf -- interop lane; the key-authorization wipe is invisible in safe builds, its test bites in ReleaseFast, not yet run).
-
 **Hardening:** fuzz 2026-10-16 (ACMEDNS_FUZZ: acme-dns `/register` reply, TXT reply through `txtPresent`; 500 seeds per test run, every reach label hit) · ct n/a — holds no secret computation: TSIG is `dns.tsig`'s (burned, stack-probed), credentials are passed through to `http` headers · panic 2026-11-14 (sweep of every pub entry point: HIGH `post`/`register` read the response body with no time bound after the head, so a server sending `200` + `Content-Length` and stalling blocked the caller forever, now `readAllAllocTimeout(64 KiB, total_timeout_ms)`; MED `propagation_timeout_ms` was checked only between passes, while one pass could run servers × addresses × `query_timeout_ms`, now gated before every query; MED a failing `toOwnedSlice` in `zone.nameservers` was a use-after-free and double free instead of `error.OutOfMemory`, plus two leaks on allocation failure; LOW basic-auth bound comment 379 -> 378)
 
 **Performance:** n/a — every step waits on DNS, an HTTP endpoint, a child process or the CA
@@ -34,8 +32,9 @@ here: the owner chose the generic ones (acme survey 2026-10-16, Q2).
 
 **Where we are ahead:** the only Zig implementation; propagation is checked against the
 authoritative servers by default and, with `check_resolvers`, against the recursive ones too.
-**Where we are behind:** no vendor APIs (by decision); `AcmeDns` keeps no registration store of its
-own; GSS-TSIG (Windows "secure only" zones) is not supported (`dns.tsig` is HMAC only).
+**Where we are behind:** no vendor APIs (by decision, see *What is deliberately not done*); `AcmeDns` keeps no
+registration store of its own; GSS-TSIG (Windows "secure only" zones) is not supported (`dns.tsig` is HMAC
+only; see *Backlog / deferred*).
 
 ## Design & invariants
 
@@ -43,23 +42,35 @@ own; GSS-TSIG (Windows "secure only" zones) is not supported (`dns.tsig` is HMAC
   `acme.jws`; name = `override_name` or `_acme-challenge.<domain>`; CNAME walk (one hop per query,
   `max_cname_hops` = 8, a loop is `CnameLoop`); zone = `Options.zone` or the longest suffix whose
   own SOA is in an answer section (NXDOMAIN, NODATA and CNAME move to the parent; the root is never
-  a candidate); publish; wait. The record handed to the publisher carries the effective name and
+  a candidate); a challenge name outside `Options.zone` is refused (`ZoneNotFound`) before anything is
+  published; publish; wait. A SERVFAIL or REFUSED on the CNAME or SOA question is `error.ResolverFailed`
+  ("could not find out"), never read as "no CNAME" / "no SOA here", which would publish at the
+  undelegated name or in the parent zone. The record handed to the publisher carries the effective name and
   the zone, plus token and key authorization for the RAW modes.
 - **Cleanup is exact:** every published record is kept (heap-stable, so its slices survive list
   growth) until `cleanup(domain, value)` finds it; the list has room reserved BEFORE publishing, so
-  a published record can never be forgotten for want of memory. A wait that fails cleans up
-  itself, because `acme.Client` calls cleanup only after a successful present.
-- **Propagation:** the zone's NS names → `lookupIp` → each server asked with RD clear; a server
+  a published record can never be forgotten for want of memory. A publisher that fails and a wait that
+  fails both clean up themselves (best effort: the update may have landed before the failure showed;
+  publishers treat removing an absent record as a no-op), because `acme.Client` calls cleanup only
+  after a successful present.
+- **Propagation:** the zone's NS names → their addresses (`zone.nameserverIps`, resolved on every pass; a
+  name whose lookup fails counts as "not yet" under `require_all_authoritative`, never as absent, and a
+  name with no address at all is left out) → each server asked with RD clear; a server
   counts once one of its addresses answers with the value; an address that does not answer is
   skipped. Every server must agree unless `require_all_authoritative` is off; with
   `check_resolvers` the recursive resolvers must also answer with it. Polled every
-  `propagation_interval_ms` until `propagation_timeout_ms`.
+  `propagation_interval_ms` until `propagation_timeout_ms`. The NS list and each name's address list come
+  off the network, so the budget is checked before every query, not between passes (the first query is
+  always made, so a zero timeout still asks once).
 - **Publishers** keep their configuration and a static `note`; `Rfc2136` adds the value (never
   replaces the RRset: a wildcard and its base validate at one name) and deletes exactly that value;
   `AcmeDns` refuses when the account's `fulldomain` is not where the CNAME leads (the usual setup
   error, which acme-dns itself would not report) and has no cleanup (acme-dns keeps the two newest
-  values); `HttpReq` and `AcmeDns` never follow redirects (credentials ride along); `Exec` runs
-  the program with a timeout in its own process group.
+  values); `HttpReq` and `AcmeDns` never follow redirects (credentials ride along) and read the response
+  body under the HTTP client's `total_timeout_ms` (64 KiB at most; so does `AcmeDns.register`); the
+  endpoint's query string and fragment survive the path join; HttpReq's basic auth refuses a `:` in the
+  user (RFC 7617) and credentials over 378 bytes ("user:password"), with their own note, encodes with
+  `b64ct` and wipes the header buffer; `Exec` runs the program with a timeout in its own process group.
 
 ## Threat model / out of scope
 
@@ -94,44 +105,46 @@ questions alone: SOA walk in both zones and for a name in neither, a cross-zone 
 loop, NS lookup. ⚠ The acme-dns side is a STAND-IN written from joohoi/acme-dns's README
 (`tools/peer.py`), not the Go server.
 
+## What is deliberately not done
+
+- **Vendor-API providers** (lego has 200+, libdns several dozen). The owner chose the four generic
+  publishers (acme survey, Q2): a vendor API is a `Publisher` of the caller's own.
+
+## Verification
+
+- **Run:** `scripts/modtest acmedns`; the live lane is `tools/interop.sh` under `hw run` (see `tools/README.md`).
+- **Tests by area:** `solver_test.zig` — the solver's bookkeeping without a network (the record the publisher
+  sees, the RFC 8555 §8.4 value recomputed independently of `acme.jws`, two values at one name, cleanup by
+  domain and value, the options, the key-authorization wipe, an allocation-failure sweep over `present`);
+  `zone_test.zig` — the CNAME and SOA walks, NS lookup and the propagation check against a scripted DNS
+  server on loopback (bounds, wrong class / owner / type answers, partial address failures, the RD bit,
+  allocation failures); `publishers_test.zig` — each publisher's wire (acme-dns and httpreq requests against a
+  recording HTTP peer, the RFC 2136 update against a UDP stub, `Exec` argv / exit / stderr / timeout against
+  shell scripts); basic auth against RFC 7617's example (in `publishers.zig`); `hostile_test.zig` — a peer that sends its head and stalls.
+- **Fuzz:** `fuzz_test.zig`, run by testkit's deterministic driver as `ACMEDNS_FUZZ`: the acme-dns `/register`
+  reply and a TXT reply through `zone.txtPresent`, with reach checks in every test run.
+- **Interop:** Pebble validates every DNS-01 challenge through a dnspython RFC 2136 + TSIG server, one
+  certificate per publisher (see *Anchoring*).
+- **Not observable here:** the system-resolver branch needs a controlled `/etc/resolv.conf` (the interop lane
+  covers it); the key-authorization wipe is invisible to a spy in safe builds (its test bites in ReleaseFast).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
 ## Backlog / deferred
 
-**Review 2026-10-16** (an independent reviewer, read-only; every finding re-read against the code by
-the coordinator, not in the repository).
-Fixed the same day, each with a test: **M1** a nameserver whose address lookup failed was dropped
-and the propagation check could pass without it — NS addresses are now resolved on every pass
-(`zone.nameserverIps`, rcode-aware: `dns.Resolver.lookupIp` reads a SERVFAIL as "no address"), an
-unresolvable one holds the check under `require_all_authoritative`; **M2** `followCname` /
-`findZone` read SERVFAIL/REFUSED as "no CNAME" / "no SOA here" (publishing at the undelegated
-name, or in the parent zone) — now `error.ResolverFailed`; **L1** a failed `present` is cleaned up
-once (lego does the same; the update may have landed before the failure showed); **L4** the
-endpoint's query string / fragment survives the path join (`joinPath`); **L5** a basic-auth user
-containing `:` and over-long credentials are refused with their own note, the encoded header is
-wiped; **N2** a challenge name outside `Options.zone` is refused before publishing. Tests:
-`zone_test.zig` drives the walks and the propagation check against a scripted DNS server on
-loopback (the M1 test failed on the old code).
-Open from the review:
 - **L2** `presentFn` maps `Canceled` to `SolverFailed` (acme's `SolverError` has no `Canceled`).
-- **L3** the propagation timeout is checked between passes; one pass can take servers × addresses ×
-  `query_timeout_ms` — pass the remaining budget as the per-query timeout.
-- **L6** a 3xx from an HTTP endpoint fails with a generic note (redirects are deliberately not
-  followed); say "redirect not followed".
-- **L7** the same (domain, value) presented twice shares one published record; cleanup of the first
-  removes it for both — refcount or refuse the duplicate.
-- **N1** `deinit` with pending records does not clean them up (document or clean); **N3** RAW `Exec`
-  puts the key authorization in argv (visible in `/proc`, as lego RAW) — threat-model sentence;
-  **N4** `AcmeDns.register`'s password is freed unwiped by `Parsed.deinit` — document; **N5**
-  publisher notes are not surfaced through the solver.
-- Test gaps: the publishers' request bodies, headers and argv (Rfc2136 message bytes, AcmeDns,
-  HttpReq default/RAW JSON, Exec argv and exit handling) are pinned only by the live interop; a
-  FailingAllocator sweep over `present`; the zone walks are not fuzzed on hostile replies.
-
-
-- **Mutation run + review** — the module is new (A4 until both are dated).
-- **acme-dns against the real server** (joohoi/acme-dns, Go, MIT): it brings its own DNS listener
-  and database; the stand-in covers the two calls `AcmeDns` makes.
-- **A registration store for `AcmeDns`** (lego writes accounts to a JSON file and registers on first
-  use): today `register` returns the account and the caller keeps it.
+- **L6** a 3xx from an HTTP endpoint fails with a generic note (redirects are deliberately not followed);
+  say "redirect not followed".
+- **L7** the same (domain, value) presented twice: each `present` keeps its own record, but the publisher
+  removes one DNS value, so cleanup of the first removes it for both — refcount or refuse the duplicate.
+- **N1** `deinit` with pending records does not clean them up (document or clean).
+- **N3** RAW `Exec` puts the key authorization in argv (visible in `/proc`, as lego RAW) — add a
+  threat-model sentence.
+- **N4** `AcmeDns.register`'s password is freed unwiped by `Parsed.deinit` — document.
+- **N5** publisher notes are not surfaced through the solver (`solver.note` says only that the publisher
+  failed).
+- **Zone walks on hostile replies** are not fuzzed (only the `/register` reply and the TXT match are).
+- **acme-dns against the real server** (joohoi/acme-dns, Go, MIT): it brings its own DNS listener and
+  database; the interop stand-in covers the two calls `AcmeDns` makes.
+- **A registration store for `AcmeDns`** (lego writes accounts to a JSON file and registers on first use):
+  `register` returns the account and the caller keeps it.
 - **GSS-TSIG** for Windows "secure only" zones — needs Kerberos; `dns.tsig` is HMAC only.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).

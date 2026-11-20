@@ -22,7 +22,8 @@ core + its providers.
 - **Model after:** lego (`challenge/dns01` + providers `rfc2136`, `acmedns`,
   `httpreq`, `exec`), certmagic `DNS01Solver`.
 - **Deps:** `acme` (the solver seam, the TXT value), `dns` (resolver,
-  RFC 2136 + TSIG), `http` (acme-dns, httpreq), `netaddr`, `procrun` (exec).
+  RFC 2136 + TSIG), `http` (acme-dns, httpreq), `netaddr`, `procrun` (exec),
+  `b64ct` (the basic-auth header).
 
 ## Usage
 
@@ -55,7 +56,7 @@ defer cert.deinit(gpa);
 `check_propagation` [true], `authoritative` [the zone's NS records],
 `require_all_authoritative` [true], `check_resolvers` [false],
 `propagation_timeout_ms` [120 000], `propagation_interval_ms` [2 000],
-`delay_ms` [0]. After a failure, `solver.note` (and each publisher's `note`,
+`delay_ms` [0], `port` [53, for every query], `query_timeout_ms` [3 000]. After a failure, `solver.note` (and each publisher's `note`,
 `last_rcode` / `last_status` / `last_term`, `Exec.lastStderr()`) says why.
 
 A publisher of your own is a `Publisher` vtable: `present` must ADD the value
