@@ -933,13 +933,17 @@ the reference implementation uses.
 
 ### Where the send half stops
 
-- **No `PrivateMessage` handshakes**, in either direction (Part 7).
-- **No committer-chosen leaf content.** §7.5 allows a Commit to change the
-  committer's credential, capabilities or extensions ("The application MAY
-  specify other changes to the leaf node"); `createCommit` carries the current
-  leaf's content over and rotates only the keys §7.5 requires. `treekem.StageParams`
-  already exposes the seam for a caller that wants to do it by hand (*Backlog /
-  deferred*).
+- **Committer-chosen leaf content** is supported: §7.5 lets a Commit change
+  the committer's leaf ("The application MAY specify other changes to the leaf
+  node, e.g., providing a new signature key, updated capabilities, or different
+  extensions"), and `CreateCommitParams.leaf_content` (`LeafContent`) takes a
+  new signature key pair, credential, capabilities and extensions — OpenMLS's
+  `CommitBuilder` leaf-node parameters, mls-rs's new signing identity. Each is
+  deep-copied into the Commit's arena; setting any forces the path; the new
+  leaf must pass §7.3's leaf-only extension rule (`error.LeafNodeInvalid`
+  before anything is sent), and `processCommit` applies the same rule to every
+  committer's path leaf. The Commit is signed with the key the group knows; the
+  new leaf with the new key.
 - **No `ReInit` follow-through** (§11.2) and no branching (§11.3). A `ReInit`
   proposal can be committed — §12.2's "a ReInit proposal together with any other
   proposal" rule is enforced — but nothing creates the successor group.
@@ -1549,11 +1553,6 @@ Gaps that are unverified rather than unbuilt:
   that lands.
 - **ReInit and subgroup branch (§11.2/§11.3).** Effort: small-medium; the
   resumption PSKs they need exist.
-- **`createCommit` cannot change the committer's leaf CONTENT** (a new
-  credential, capabilities or extensions, §7.5). The blocker is plumbing, not
-  design: caller-owned credential and capability data would have to be
-  deep-copied into the group's arena the way `dupExtensions` does for
-  GroupContext extensions. `treekem.StageParams` already exposes the seam.
 - **`Group`'s retained state grows with session length** (Threat model). The fix
   is owning leaf bytes rather than aliasing them, which would let an epoch's
   arena go once nothing in the tree points into it.

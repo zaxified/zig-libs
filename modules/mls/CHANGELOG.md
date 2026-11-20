@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-21** — `Group.createCommit` can change the committer's leaf content (§7.5): new `CreateCommitParams.leaf_content` / `Group.LeafContent` (new signature key pair, credential, capabilities, extensions; deep-copied; forces the path). Behaviour change: `processCommit` now applies §7.3's leaf-only extension rule (`Policy.check_leaf_extensions_supported`) to the committer's path leaf as it already did to Add and Update leaves (`error.LeafNodeInvalid`).
+
 - **2026-11-21** — `Group` drives the epoch's §9 secret tree: new `protectApplication`/`unprotectApplication` (application data as `MLSMessage(PrivateMessage)`, OpenMLS's out-of-order 5 / forward 1000 defaults: `group.out_of_order_tolerance`, new `Policy.maximum_forward_distance`), and proposals/Commits can be sent as `PrivateMessage` (`ProposeParams.framing`/`CreateCommitParams.framing`, new `HandshakeFraming`/`PrivateFraming`, default `.public_message`) and are accepted that way by `processCommit`. New `secrettree.EpochTree` (§9.2 deletion: only unconsumed node secrets are held), new `framing.ProtectPrivateParams.signature` (a pre-made signature, for a Commit). **Source-breaking:** `group.Error.PrivateHandshakeNotSupported` is removed (an exhaustive `switch` naming it no longer compiles), and `createProposal` takes `*Self` instead of `*const Self`. Behaviour change: the first `PrivateMessage` of an epoch wipes `secrets.encryption_secret` (the tree holds the root).
 
 - **2026-11-20** — `treemath` gains RFC 9420 Appendix C's `common_ancestor_semantic` and `common_ancestor_direct` (cross-checked against each other on every node pair of full trees up to 64 leaves); no existing behaviour changes.

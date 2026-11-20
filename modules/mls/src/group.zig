@@ -1622,6 +1622,10 @@ pub fn Group(comptime S: type) type {
                 // §7.3 via §12.4.2: source MUST be `commit`.
                 if (path.leaf_node.leaf_node_source != .commit) return error.InvalidUpdatePath;
                 try verifyLeafSignature(S, gpa, path.leaf_node, .commit, w.group_id, committer);
+                // §7.3's leaf-only rule: a committer may change its leaf's
+                // capabilities and extensions (§7.5), so the new leaf gets
+                // the check an Add or an Update gets.
+                try w.checkLeafSelfConsistent(path.leaf_node);
 
                 // The committer's encryption key must actually change —
                 // read BEFORE the merge replaces the leaf. An external
@@ -1972,6 +1976,27 @@ pub fn Group(comptime S: type) type {
             /// `PrivateMessage` under this member's handshake ratchet of the
             /// epoch being left (§6.3).
             framing: HandshakeFraming = .public_message,
+            /// §7.5: "The application MAY specify other changes to the leaf
+            /// node, e.g., providing a new signature key, updated
+            /// capabilities, or different extensions." `null` (the default)
+            /// carries the committer's current leaf content over. Setting
+            /// it forces the path to be populated (the new leaf travels in
+            /// it). Borrowed for the call; deep-copied into the group.
+            leaf_content: ?LeafContent = null,
+        };
+
+        /// The committer's new leaf content for one Commit (§7.5). Each
+        /// `null` field keeps the current value.
+        pub const LeafContent = struct {
+            /// A NEW signature key pair: the new leaf carries its public
+            /// key and is signed with it. The Commit itself is still signed
+            /// with `CreateCommitParams.signature_key_pair` — the key the
+            /// receivers know this member by — and later messages with the
+            /// new one.
+            signature_key_pair: ?*const S.Sig.KeyPair = null,
+            credential: ?tree.Credential = null,
+            capabilities: ?tree.Capabilities = null,
+            extensions: ?[]const tree.Extension = null,
         };
 
         /// The three messages one Commit produces. All three are allocated
@@ -2156,10 +2181,25 @@ pub fn Group(comptime S: type) type {
             // use-after-free the DebugAllocator catches only if a test
             // happens to look at them. An external committer has no old leaf
             // to lose; its content comes from the KeyPackage it published.
-            const base_leaf = switch (mode) {
+            var base_leaf = switch (mode) {
                 .member => try dupLeafNode(arena, try w.ownLeaf()),
                 .external => |e| e.leaf,
             };
+            // The caller's §7.5 changes, deep-copied: the new leaf aliases
+            // them for as long as the group lives.
+            var leaf_signer = params.signature_key_pair;
+            if (params.leaf_content) |lc| {
+                if (lc.signature_key_pair) |kp| {
+                    const pk = S.encodePublicKey(kp.public_key);
+                    base_leaf.signature_key = try arena.dupe(u8, &pk);
+                    leaf_signer = kp;
+                }
+                if (lc.credential) |cred| base_leaf.credential = try dupCredential(arena, cred);
+                if (lc.capabilities) |caps| base_leaf.capabilities = try dupCapabilities(arena, caps);
+                if (lc.extensions) |exts| base_leaf.extensions = try dupExtensions(arena, exts);
+                // §7.3's leaf-only rule, before the leaf is signed and sent.
+                try w.checkLeafSelfConsistent(base_leaf);
+            }
 
             var commit: content.Commit = .{ .proposals = por, .path = null };
             var commit_secret = keyschedule.zeroSecret(S);
@@ -2173,7 +2213,8 @@ pub fn Group(comptime S: type) type {
             // `pathRequiredTypes`), so this disjunct is redundant today —
             // and it is spelled out because the two rules are independent
             // and only one of them is unconditional.
-            const want_path = external or applied.needs_path or !params.omit_path_when_allowed;
+            const want_path = external or applied.needs_path or !params.omit_path_when_allowed or
+                params.leaf_content != null;
             if (want_path) {
                 var path_secret_0: [S.Nh]u8 = undefined;
                 // Commit secret for the UpdatePath: forward secrecy of the
@@ -2187,7 +2228,7 @@ pub fn Group(comptime S: type) type {
                 const st = &staged.?;
                 try treekem.stageUpdatePath(S, arena, &w.ratchet_tree, w.my_leaf_index, .{
                     .group_id = w.group_id,
-                    .signature_key_pair = params.signature_key_pair,
+                    .signature_key_pair = leaf_signer,
                     .leaf_key_pair = &leaf_kp,
                     .path_secret_0 = &path_secret_0,
                     .signature_key = base_leaf.signature_key,
@@ -3982,6 +4023,27 @@ fn findOwnLeaf(gpa: std.mem.Allocator, t: *const tree.RatchetTree, want_encoded:
 /// exactly the aliasing bug this module's decode convention makes easy —
 /// so the only place a caller's extensions enter retained group state uses
 /// this instead.
+fn dupCredential(arena: std.mem.Allocator, cred: tree.Credential) !tree.Credential {
+    return switch (cred) {
+        .basic => |b| .{ .basic = try arena.dupe(u8, b) },
+        .x509 => |certs| blk: {
+            const out = try arena.alloc([]const u8, certs.len);
+            for (certs, out) |c, *slot| slot.* = try arena.dupe(u8, c);
+            break :blk .{ .x509 = out };
+        },
+    };
+}
+
+fn dupCapabilities(arena: std.mem.Allocator, caps: tree.Capabilities) !tree.Capabilities {
+    return .{
+        .versions = try arena.dupe(u16, caps.versions),
+        .cipher_suites = try arena.dupe(u16, caps.cipher_suites),
+        .extensions = try arena.dupe(u16, caps.extensions),
+        .proposals = try arena.dupe(u16, caps.proposals),
+        .credentials = try arena.dupe(u16, caps.credentials),
+    };
+}
+
 fn dupExtensions(arena: std.mem.Allocator, exts: []const tree.Extension) ![]const tree.Extension {
     const out = try arena.alloc(tree.Extension, exts.len);
     for (exts, out) |src, *slot| {
@@ -4496,6 +4558,84 @@ test "§6.3/§9: application messages through the group's secret tree — out of
         const got = try b.unprotectApplication(gpa, m);
         defer got.deinit(gpa);
         try testing.expectEqualSlices(u8, "new", got.data);
+    }
+}
+
+test "§7.5: createCommit changes the committer's credential, capabilities, extensions and signature key, and receivers follow" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const alice = try TestClient.init(aa, "alice", 1);
+    const bob = try TestClient.init(aa, "bob", 2);
+    var a = try tCreate(gpa, .{ .io = io, .group_id = "leaf", .key_package_msg = alice.kp_msg, .encryption_priv = &alice.enc_priv });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = &alice.sig, .proposals = &.{.{ .by_value = .{ .add = bob.kp } }} });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    const old_leaf = b.ratchet_tree.leafNode(1).?;
+    const new_sig = try TestSuite.Sig.KeyPair.generateDeterministic(@splat(0x77));
+    // Caller memory that dies right after the call: the group must copy it.
+    var cred_buf = "bob-2".*;
+    var ext_data = [_]u8{ 1, 2, 3 };
+    var ext_types = [_]u16{0xff01};
+    const caps: tree.Capabilities = .{
+        .versions = old_leaf.capabilities.versions,
+        .cipher_suites = old_leaf.capabilities.cipher_suites,
+        .extensions = &ext_types,
+        .proposals = old_leaf.capabilities.proposals,
+        .credentials = old_leaf.capabilities.credentials,
+    };
+    const exts = [_]tree.Extension{.{ .extension_type = 0xff01, .extension_data = &ext_data }};
+
+    // An extension the new capabilities do not list is refused (§7.3)
+    // before anything is sent, and bob is untouched.
+    try testing.expectError(error.LeafNodeInvalid, b.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = &bob.sig,
+        .leaf_content = .{ .extensions = &exts },
+    }));
+    try testing.expectEqual(@as(u64, 1), b.epoch);
+
+    {
+        const c = try b.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = &bob.sig,
+            .omit_path_when_allowed = true,
+            .leaf_content = .{
+                .signature_key_pair = &new_sig,
+                .credential = .{ .basic = &cred_buf },
+                .capabilities = caps,
+                .extensions = &exts,
+            },
+        });
+        defer c.deinit(gpa);
+        @memset(&cred_buf, 0);
+        @memset(&ext_data, 0);
+        @memset(&ext_types, 0);
+        try a.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &b);
+    }
+    for ([_]*Group(TestSuite){ &a, &b }) |g| {
+        const l = g.ratchet_tree.leafNode(1).?;
+        try testing.expectEqualSlices(u8, "bob-2", l.credential.basic);
+        try testing.expectEqualSlices(u8, &TestSuite.encodePublicKey(new_sig.public_key), l.signature_key);
+        try testing.expectEqualSlices(u16, &.{0xff01}, l.capabilities.extensions);
+        try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, l.extensions[0].extension_data);
+    }
+    // From now on bob signs with the new key, and alice verifies with it.
+    {
+        const c = try b.createCommit(gpa, .{ .io = io, .signature_key_pair = &new_sig });
+        defer c.deinit(gpa);
+        try a.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &b);
     }
 }
 
