@@ -35,6 +35,13 @@ pub const max_explode_cells: usize = 1 << 28;
 /// `explode` may copy: 1 GiB; past it `error.TooLarge`.
 pub const max_explode_bytes: usize = 1 << 30;
 
+/// Whether `explode` takes the column: stored as lists, or declared a list or array with the
+/// storage of no element (all null) or of boxed cells.
+fn explodable(c: Column, d: ColumnData) bool {
+    const declared = c.type == .list or c.type == .array;
+    return d == .list or (declared and (d == .nulls or d == .boxed));
+}
+
 /// One row per element of the list columns `cols` (pandas `explode`, polars `explode`),
 /// the other columns' cells repeated, rows in order. A null or empty list gives one row
 /// with a null there (both engines). Several columns explode together, so their lists
@@ -50,10 +57,13 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
     for (cols, idx, 0..) |name, *ci, i| {
         ci.* = f.columnIndex(name) orelse return error.NoSuchColumn;
         for (idx[0..i]) |prev| if (prev == ci.*) return error.DuplicateColumn;
-        const d = f.columnAt(ci.*);
-        const declared = f.columns[ci.*].type == .list or f.columns[ci.*].type == .array;
-        if (!(d == .list or (declared and (d == .nulls or d == .boxed)))) return error.NotNested;
+        if (!explodable(f.columns[ci.*], f.columnAt(ci.*))) return error.NotNested;
     }
+    // The exploded columns as a mask, for the per-cell test below (a scan of `idx` per cell was width x cols).
+    const exploded = try a.alloc(bool, f.columns.len);
+    defer a.free(exploded);
+    @memset(exploded, false);
+    for (idx) |ci| exploded[ci] = true;
     // Rows out: one per element, at least one per row.
     var rows: usize = 0;
     for (0..f.len) |ri| {
@@ -71,7 +81,7 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
     for (0..f.len) |ri| {
         const reps = @max(elemCount(f.columnAt(idx[0]), ri), 1);
         for (0..f.columns.len) |ci| {
-            if (std.mem.findScalar(usize, idx, ci) != null) continue;
+            if (exploded[ci]) continue;
             bytes +|= reps *| payloadBytes(f.columnAt(ci).get(ri));
         }
         if (bytes > max_explode_bytes) return error.TooLarge;
@@ -88,7 +98,7 @@ pub fn explode(a: std.mem.Allocator, f: Frame, cols: []const []const u8) NestErr
     const out_cols = try a.dupe(Column, f.columns);
     const data = try a.alloc(ColumnData, f.columns.len);
     for (data, 0..) |*d, ci| {
-        if (std.mem.findScalar(usize, idx, ci) == null) {
+        if (!exploded[ci]) {
             d.* = try verbs.take(a, f.columnAt(ci), row_of, false);
             continue;
         }
@@ -112,7 +122,7 @@ pub fn explodeAll(a: std.mem.Allocator, f: Frame) NestError!Frame {
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(a);
     for (f.columns, 0..) |c, ci| {
-        if (c.type == .list or c.type == .array or f.columnAt(ci) == .list) try names.append(a, c.name);
+        if (explodable(c, f.columnAt(ci)) or f.columnAt(ci) == .list) try names.append(a, c.name);
     }
     return explode(a, f, names.items);
 }

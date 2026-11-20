@@ -288,10 +288,12 @@ pub const PivotManySpec = struct {
     agg: sp.AggFn = .sum,
     q: f64 = 0.5,
     skip_na: bool = false,
+    /// A number for an empty cell; `fill` of a number is the same and `fill_value` wins when both are set.
     fill_value: ?f64 = null,
     separator: []const u8 = "_",
     /// The function of each value column (pandas `aggfunc={"v": "sum", "w": "max"}`):
-    /// `aggs[i]` for `values[i]`; a value past the list takes `agg`.
+    /// `aggs[i]` for `values[i]`; a value past the list takes `agg`; more `aggs` than `values`
+    /// is `error.BadArgument`.
     aggs: []const sp.AggFn = &.{},
     /// As `PivotSpec.fill` / `margins` / `margins_name` / `sort_columns`. A margin column
     /// is named `{value}{separator}{margins_name}`; the margin row is the last row.
@@ -307,6 +309,8 @@ pub const PivotManySpec = struct {
 /// values), else `error.TooLarge`.
 pub fn pivotMany(a: std.mem.Allocator, f: Frame, spec: PivotManySpec) Error!Frame {
     if (spec.values.len == 0) return error.NoSuchColumn;
+    // An aggregate for a value that is not there (pandas: a dict key that is no column raises).
+    if (spec.aggs.len > spec.values.len) return error.BadArgument;
     var out: ?Frame = null;
     // `pivot` caps one block; the blocks together are capped at the same `max_pivot_cells`.
     var cells: usize = 0;
@@ -354,6 +358,7 @@ pub const PivotKeysSpec = struct {
     agg: sp.AggFn = .sum,
     q: f64 = 0.5,
     skip_na: bool = false,
+    /// A number for an empty cell; `fill` of a number is the same and `fill_value` wins when both are set.
     fill_value: ?f64 = null,
     separator: []const u8 = "_",
 };
@@ -619,7 +624,8 @@ pub const ScatterSpec = struct {
 };
 
 /// polars `Series.scatter`, pandas `df.iloc[idx, col] = values`: the column with the
-/// cells at `idx` set; a later position overwrites an earlier one.
+/// cells at `idx` set; a later position overwrites an earlier one. A value of another kind than
+/// the column's (text into an int column, say) is `error.BadArgument`.
 pub fn scatter(a: std.mem.Allocator, f: Frame, spec: ScatterSpec) Error!Frame {
     const ci = try mustIndex(f, spec.col);
     if (!(spec.values.len == 1 or spec.values.len == spec.idx.len)) return error.BadArgument;
@@ -638,6 +644,18 @@ pub fn scatter(a: std.mem.Allocator, f: Frame, spec: ScatterSpec) Error!Frame {
             const held = v.cast(f.columns[ci].type) orelse return error.BadArgument;
             // A fraction, say; Float32 rounds the value as `cast` does (0.1 is an everyday literal).
             if (f.columns[ci].type != .float32 and !held.eql(v)) return error.BadArgument;
+        }
+        // The other scalar kinds: a cell of another kind than the column's would leave it holding one it
+        // does not declare (polars' `scatter` casts strictly and raises).
+        if (v != .null) {
+            const ok = switch (f.columns[ci].type) {
+                .text, .categorical => v == .text,
+                .bool => v == .bool,
+                .int => v == .int or v == .uint,
+                .float => v == .int or v == .uint or v == .float,
+                else => true,
+            };
+            if (!ok) return error.BadArgument;
         }
         cells[@intCast(r)] = v;
     }

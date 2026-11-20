@@ -59,8 +59,9 @@ pub const JsonWriteOptions = struct {
     /// `ascii_only`, which would add a module dependency for fifteen lines.
     force_ascii: bool = false,
     /// Round floats to this many decimals and drop trailing zeros but one (pandas
-    /// `double_precision`, default 10 there, at most 15; `null` here: the shortest digits
-    /// that read back exactly, as both engines' own default).
+    /// `double_precision`, default 10 there, at most 15, else `error.BadOptions` as pandas'
+    /// `ValueError`; `null` here: the shortest digits that read back exactly, as both engines' own
+    /// default).
     double_precision: ?u8 = null,
     /// Spaces per nesting level; pandas' `indent` (`"a":1` without a space after the colon, as
     /// ujson prints it). Compact when null or `0`. Needs the document in memory first:
@@ -153,6 +154,7 @@ fn newline(w: *std.Io.Writer, depth: usize, step: u8, at: usize, extra: *usize, 
 }
 
 fn writeDoc(w: *std.Io.Writer, f: Frame, orient: JsonOrient, o: *const JsonWriteOptions) JsonDocError!void {
+    if (o.double_precision) |p| if (p > 15) return error.BadOptions; // pandas: ValueError past 15
     switch (orient) {
         .records => {
             try w.writeByte('[');
@@ -342,7 +344,7 @@ fn writeValueO(w: *std.Io.Writer, v0: Value, col: ?value.Column, depth: u8, o: *
             var fb: [textio.max_float_len]u8 = undefined;
             if (o.double_precision) |p| {
                 var big: [400]u8 = undefined;
-                const t = textio.formatFloatFixed(&big, x, @min(p, 15));
+                const t = textio.formatFloatFixed(&big, x, p);
                 var end = t.len;
                 if (std.mem.findScalar(u8, t, '.')) |dot| {
                     while (end > dot + 2 and t[end - 1] == '0') end -= 1;

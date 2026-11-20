@@ -311,8 +311,9 @@ pub const FillNullSpec = struct {
 /// Fill the missing cells (null, NaN) of `subset` by a strategy (polars
 /// `fill_null(strategy=...)`, pandas `ffill`/`bfill`/`fillna(df.mean())`). A column
 /// with nothing to fill, or nothing to fill it with, is shared. `mean`, `min`, `max`
-/// read only the numbers of a column (`min`/`max` any kind for text); `zero`/`one` of a
-/// text or bool column fill nothing.
+/// read only the numbers of a column (`min`/`max` any kind for text); `mean` of a timestamp,
+/// duration or time-of-day column is one of those (truncated) and of a bool column fills
+/// nothing; `zero`/`one` of a text or bool column fill nothing.
 pub fn fillNull(a: std.mem.Allocator, f: Frame, spec: FillNullSpec) Error!Frame {
     return fillNullImpl(a, f, spec, true);
 }
@@ -386,8 +387,14 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
                             s += x;
                             n += 1;
                         }
-                        if (n == 0) break :blk .null;
+                        // A bool has no mean to fill with (the column is left as it is, as `zero` leaves text).
+                        if (n == 0 or f.columns[ci].type == .bool) break :blk .null;
                         const m = s / @as(f64, @floatFromInt(n));
+                        // The mean of instants, spans or times of day is one of them (pandas): the column keeps its type.
+                        switch (f.columns[ci].type) {
+                            .timestamp, .duration, .time => break :blk .{ .int = @intFromFloat(@trunc(m)) },
+                            else => {},
+                        }
                         // An int column stays int, the mean cut toward zero (polars: the
                         // mean of 1, 4, 6, 10 fills 5, not 5.25; pandas refuses to).
                         const ct = f.columns[ci].type;
@@ -423,7 +430,7 @@ fn fillNullImpl(a: std.mem.Allocator, f: Frame, spec: FillNullSpec, typed: bool)
                 for (cells) |*c| {
                     if (isMissing(c.*)) c.* = fill;
                 }
-                if (spec.strategy == .mean and f.columns[ci].type != .float and f.columns[ci].type != .float32 and !dtype.isInteger(f.columns[ci].type)) {
+                if (spec.strategy == .mean and fill == .float and f.columns[ci].type != .float and f.columns[ci].type != .float32 and !dtype.isInteger(f.columns[ci].type)) {
                     cols[ci].type = .float;
                     cols[ci].time_zone = null;
                     for (cells) |*c| {

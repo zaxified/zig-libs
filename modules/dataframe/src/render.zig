@@ -166,6 +166,9 @@ pub fn formatTo(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: FormatO
     const tail_r = opts.max_rows / 2;
     var rows: std.ArrayList(?usize) = .empty;
     if (f.len <= opts.max_rows) {
+        // Only a hand-built frame claims more rows than a row index holds: refuse it rather than
+        // append until memory is gone.
+        if (f.len > std.math.maxInt(u32)) return error.OutOfMemory;
         for (0..f.len) |i| try rows.append(al, i);
     } else {
         for (0..head_r) |i| try rows.append(al, i);
@@ -544,14 +547,19 @@ fn glimpseType(a: std.mem.Allocator, t: value.Column) std.mem.Allocator.Error![]
         .bool => "<bool>",
         .date => "<date>",
         .decimal => "<decimal>",
-        .timestamp => "<datetime[μs]>",
+        // polars: `<datetime[μs, Europe/Prague]>` for a zoned one.
+        .timestamp => if (t.time_zone) |z| try std.fmt.allocPrint(a, "<datetime[μs, {s}]>", .{z}) else "<datetime[μs]>",
         .categorical => "<cat>",
         .duration => "<duration[μs]>",
         .time => "<time>",
         .binary => "<binary>",
-        .list => "<list>",
+        // polars: `<list[i64]>` (the declared element type) and `<struct[2]>` (the field count).
+        .list => if (t.inner.len > 0) blk: {
+            const e = try glimpseType(a, t.inner[0]);
+            break :blk try std.fmt.allocPrint(a, "<list[{s}]>", .{e[1 .. e.len - 1]});
+        } else "<list>",
         .array => try std.fmt.allocPrint(a, "<{s}>", .{try columnLabel(a, t)}),
-        .@"struct" => "<struct>",
+        .@"struct" => if (t.inner.len > 0) try std.fmt.allocPrint(a, "<struct[{d}]>", .{t.inner.len}) else "<struct>",
         .int8 => "<i8>",
         .int16 => "<i16>",
         .int32 => "<i32>",

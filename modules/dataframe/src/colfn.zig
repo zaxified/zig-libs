@@ -118,8 +118,11 @@ pub fn hist(a: std.mem.Allocator, f: Frame, spec: HistSpec) ColfnError!Frame {
             lo = 0;
             hi = 1;
         } else if (lo == hi) {
-            lo -= 0.5;
-            hi += 0.5;
+            // numpy and polars widen by 0.5; past 2^53 that is no change, so move to the next float.
+            const wl = lo - 0.5;
+            const wh = hi + 0.5;
+            lo = if (wl < lo) wl else std.math.nextAfter(f64, lo, -std.math.inf(f64));
+            hi = if (wh > hi) wh else std.math.nextAfter(f64, hi, std.math.inf(f64));
         }
         edges = try a.alloc(f64, spec.bin_count + 1);
         const n: f64 = @floatFromInt(spec.bin_count);
@@ -261,6 +264,8 @@ pub fn cumFoldColumns(a: std.mem.Allocator, f: Frame, spec: CumFoldSpec, ctx: an
             inline .int8, .int16, .int32, .uint8, .uint16, .uint32, .uint64, .float32 => |_, t| @field(vm.ColumnType, @tagName(t)),
         } };
     }
+    // A column named twice in `cols` gives two results of one name: number the later ones.
+    try keys.uniqueNames(a, cols);
     return .{ .columns = cols, .data = data, .len = f.len };
 }
 

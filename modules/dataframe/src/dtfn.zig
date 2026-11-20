@@ -833,6 +833,7 @@ pub fn scaleDuration(d: Duration, k: i64) ?Duration {
         .months = std.math.mul(i64, d.months, k) catch return null,
         .us = std.math.mul(i64, d.us, k) catch return null,
         .weeks = d.weeks,
+        .days = std.math.mul(i64, d.days, k) catch return null,
     };
 }
 
