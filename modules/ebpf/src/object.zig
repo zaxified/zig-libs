@@ -108,6 +108,7 @@ const btf_mod = @import("btf.zig");
 const btfext = @import("btfext.zig");
 const tracing = @import("tracing.zig");
 const bpfsys = @import("bpfsys.zig");
+const btfsanitize = @import("btfsanitize.zig");
 
 pub const Insn = BPF.Insn;
 pub const Btf = btf_mod.Btf;
@@ -639,6 +640,12 @@ pub const Object = struct {
 
     /// `BPF_BTF_LOAD`'s fd, once `load` has run with `load_btf`.
     btf_fd: linux.fd_t = -1,
+    /// False when `load` had to downgrade the BTF for a kernel without `FUNC`
+    /// support: the programs' `func_info` then names functions that are
+    /// typedefs, so it is not passed.
+    btf_func_info: bool = true,
+    /// `load` downgraded the BTF (`btfsanitize`) to get it accepted.
+    btf_sanitized: bool = false,
     /// The verifier log of the program that failed, if any (arena-owned).
     verifier_log: []const u8 = &.{},
     /// Which program's load failed.
@@ -1872,6 +1879,12 @@ pub const LoadOptions = struct {
     log_level: u32 = 1,
     /// Ceiling for the verifier log retry loop.
     max_log_bytes: usize = 16 << 20,
+    /// When the kernel's BTF verifier rejects the object's BTF, probe which
+    /// kinds it knows and retry with the unknown ones downgraded
+    /// (`btfsanitize`: `FLOAT`, `DECL_TAG`, `TYPE_TAG`, `ENUM64`, `FUNC`,
+    /// `DATASEC`...), as libbpf does. Off: a rejected BTF is
+    /// `error.BtfLoadFailed` (and `load_btf = false` the escape hatch).
+    sanitize_btf: bool = true,
     /// Where `pinning = LIBBPF_PIN_BY_NAME` maps live: `<pin_root>/<map name>`.
     /// The directory must exist on a bpffs.
     pin_root: []const u8 = "/sys/fs/bpf",
@@ -1952,6 +1965,7 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
         try fixupDatasecs(obj);
         obj.btf_fd = btf_mod.loadIntoKernel(obj.btf_bytes.?, null) catch |e| switch (e) {
             error.PermissionDenied => return error.PermissionDenied,
+            error.InvalidBtf => if (opts.sanitize_btf) try loadSanitizedBtf(obj) else return error.BtfLoadFailed,
             else => return error.BtfLoadFailed,
         };
     }
@@ -1988,6 +2002,25 @@ pub fn pinnedMapMatches(m: *const MapSpec, info: bpfsys.MapInfo) bool {
         info.value_size == m.value_size and
         info.max_entries == m.max_entries and
         (info.map_flags & keep) == (m.map_flags & keep);
+}
+
+/// The kernel refused the BTF as written: ask it which kinds it knows, rewrite
+/// the rest into ones it does (`btfsanitize.sanitize`) and load that.
+fn loadSanitizedBtf(obj: *Object) LoadError!linux.fd_t {
+    const feats = btfsanitize.probeFeatures() catch |e| return switch (e) {
+        error.PermissionDenied => error.PermissionDenied,
+        else => error.BtfLoadFailed,
+    };
+    const rewritten = (btfsanitize.sanitize(obj.gpa, obj.btf_bytes.?, feats) catch return error.BtfLoadFailed) orelse
+        return error.BtfLoadFailed; // nothing the kernel lacks: it refused for another reason
+    defer obj.gpa.free(rewritten);
+    const fd = btf_mod.loadIntoKernel(rewritten, null) catch |e| return switch (e) {
+        error.PermissionDenied => error.PermissionDenied,
+        else => error.BtfLoadFailed,
+    };
+    obj.btf_sanitized = true;
+    obj.btf_func_info = feats.func;
+    return fd;
 }
 
 /// Map types the kernel refuses with `max_entries == 0`. `RINGBUF` uses
@@ -2112,7 +2145,7 @@ fn loadOneProgram(obj: *Object, p: *ProgramSpec, license: []const u8, opts: Load
         };
         if (obj.btf_fd >= 0) {
             lo.prog_btf_fd = obj.btf_fd;
-            lo.func_info = p.func_info;
+            if (obj.btf_func_info) lo.func_info = p.func_info;
             lo.line_info = p.line_info;
         }
         if (log.len != 0) {

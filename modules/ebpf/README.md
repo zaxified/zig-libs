@@ -421,6 +421,10 @@ Map-in-map (`ARRAY_OF_MAPS`/`HASH_OF_MAPS` with an inner definition) and
 `PROG_ARRAY` initializers (`.values = { &inner, [1] = &prog }`) are created and
 filled by `load`.
 
+When the kernel refuses the object's BTF, `load` downgrades the kinds that
+kernel does not know (`ebpf.sanitizeBtf`, `LoadOptions.sanitize_btf`), as
+libbpf does.
+
 `ebpf.discoverUsdt(gpa, path)` finds the USDT (SystemTap) probes of an ELF
 file and returns each one's uprobe file offset and semaphore (`ref_ctr_offset`).
 

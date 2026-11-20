@@ -754,6 +754,21 @@ that path whatever `pinning` says. Internal data maps are never auto-pinned, a `
 removing it is `unlink`). The path policy is therefore the caller's: the root directory is an option, never a guess, and
 nothing is pinned unless the object asks for it or the caller does.
 
+### BTF sanitization for older kernels (`btfsanitize.zig`)
+
+When `BPF_BTF_LOAD` rejects the object's BTF (`LoadOptions.sanitize_btf`, on by default) `load` asks the kernel which
+kinds it knows (`probeFeatures`: one tiny blob per kind, loaded and closed; needs `CAP_BPF`) and retries with the unknown
+ones downgraded, the way libbpf's `sanitize_btf` does: `DATASEC` to a same-size `STRUCT` (members named like the variables,
+`.`/`?` in the section name turned into `_`), `VAR` and `DECL_TAG` to a 1-byte `INT`, `FUNC_PROTO` to an `ENUM`, `FUNC` to a
+`TYPEDEF`, a global `FUNC` to a static one, `FLOAT` to an empty `STRUCT` of the same size, `TYPE_TAG` to an anonymous
+`CONST`, `ENUM64` to a `UNION` over one appended 1-byte placeholder `INT`. Every replacement keeps its record's size, so type
+ids (`func_info`, `line_info`, the maps' key and value type ids) stay valid; the one appended type gets the next id.
+Without `FUNC` the programs' `func_info` would name typedefs, so `load` then leaves it out (`Object.btf_func_info`);
+`Object.btf_sanitized` says a downgrade happened. A rejection that is not about a missing kind (nothing to rewrite) stays
+`error.BtfLoadFailed`, and `sanitize_btf = false` or `load_btf = false` are the explicit escape hatches. The rewrite is
+pure (`sanitize(gpa, blob, Features)`), tested with every kind missing and with each one alone; the probes are
+parser-checked blobs, not yet run against a kernel old enough to refuse them.
+
 ### Maps (`map.zig`)
 
 `Map` describes a map fd (`fromFd`, `BPF_OBJ_GET_INFO_BY_FD`) and wraps lookup, lookup-and-delete, update (`UpdateFlags`:
@@ -1041,9 +1056,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
   sets `const volatile` config by editing `MapSpec.initial_data` before `load`, not by writing through a mapped struct.
 - **`struct_ops` maps**: the section is classified, but populating a `struct_ops` value (function pointers resolved to
   program fds) is not implemented.
-- **`.BTF` sanitization for older kernels.** libbpf downgrades `FLOAT`, `DECL_TAG`, `TYPE_TAG`, `ENUM64` etc. when the
-  running kernel's BTF verifier predates them. Here `BPF_BTF_LOAD` simply fails and `LoadOptions.load_btf = false` is the
-  escape hatch.
 
 ### Priority order
 

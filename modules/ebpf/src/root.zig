@@ -251,6 +251,12 @@ pub const UsdtProbe = usdt.Probe;
 pub const UsdtProbeSet = usdt.ProbeSet;
 pub const discoverUsdt = usdt.discover;
 
+pub const btfsanitize = @import("btfsanitize.zig");
+/// Downgrade BTF kinds an older kernel does not know (libbpf's `sanitize_btf`).
+pub const sanitizeBtf = btfsanitize.sanitize;
+pub const probeBtfFeatures = btfsanitize.probeFeatures;
+pub const BtfFeatures = btfsanitize.Features;
+
 pub const btf = @import("btf.zig");
 /// A parsed BTF blob (kernel or program-side) — see `btf.zig`.
 pub const Btf = btf.Btf;
