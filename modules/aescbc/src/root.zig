@@ -1451,6 +1451,115 @@ test "ISO 10126 and zero padding" {
     try testing.expectError(error.InvalidPadding, unpadZero(out[0..15]));
 }
 
+test "ISO 10126 padding: an out buffer of exactly the padded length is enough, one byte less is not" {
+    var prng = std.Random.DefaultPrng.init(2);
+    var out: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 16), try padIso10126("abc", &out, prng.random()));
+    try testing.expectEqual(@as(u8, 13), out[15]);
+    try testing.expectError(error.BufferTooSmall, padIso10126("abc", out[0..15], prng.random()));
+}
+
+test "wipe zeroes the whole Decryptor and Stream structs" {
+    const key: [16]u8 = @splat(7);
+    const iv: [16]u8 = @splat(9);
+    var d = Decryptor(Aes128).init(&key, iv);
+    d.wipe();
+    for (std.mem.asBytes(&d)) |b| try testing.expectEqual(@as(u8, 0), b);
+    var se = StreamEncryptor(Aes128, .pkcs7).init(&key, iv);
+    se.wipe();
+    for (std.mem.asBytes(&se)) |b| try testing.expectEqual(@as(u8, 0), b);
+    var sd = StreamDecryptor(Aes128, .pkcs7).init(&key, iv);
+    sd.wipe();
+    for (std.mem.asBytes(&sd)) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "StreamEncryptor.setIv drops a buffered tail and restarts the chain" {
+    const key: [16]u8 = @splat(3);
+    const iv: [16]u8 = @splat(4);
+    const iv2: [16]u8 = @splat(5);
+    var out: [64]u8 = undefined;
+    var e = StreamEncryptor(Aes128, .pkcs7).init(&key, iv);
+    try testing.expectEqual(@as(usize, 0), try e.update("hello", &out));
+    e.setIv(iv2);
+    var w = try e.update("abc", &out);
+    w += try e.finish(out[w..]);
+    var padded: [16]u8 = undefined;
+    const n = try padPkcs7("abc", &padded);
+    var want: [16]u8 = undefined;
+    _ = try encrypt(Aes128, &key, iv2, padded[0..n], &want);
+    try testing.expectEqualSlices(u8, &want, out[0..w]);
+}
+
+test "Stream.update refuses an out buffer shorter than it would write and changes nothing" {
+    const key: [16]u8 = @splat(3);
+    const iv: [16]u8 = @splat(4);
+    const msg = "0123456789abcdefXYZ"; // one whole block + 3 bytes
+    var small: [15]u8 = undefined;
+    var e = StreamEncryptor(Aes128, .pkcs7).init(&key, iv);
+    try testing.expectError(error.BufferTooSmall, e.update(msg, &small));
+    try testing.expectEqual(@as(usize, 0), e.tail_len);
+    var out: [48]u8 = undefined;
+    var w = try e.update(msg, &out);
+    w += try e.finish(out[w..]);
+    var padded: [32]u8 = undefined;
+    const n = try padPkcs7(msg, &padded);
+    var want: [32]u8 = undefined;
+    _ = try encrypt(Aes128, &key, iv, padded[0..n], &want);
+    try testing.expectEqualSlices(u8, &want, out[0..w]);
+}
+
+test "Stream.finish needs block_len octets of room (15 refused and nothing changes, 16 enough) and ends the message" {
+    const key: [16]u8 = @splat(3);
+    const iv: [16]u8 = @splat(4);
+    var e = StreamEncryptor(Aes128, .pkcs7).init(&key, iv);
+    var out: [48]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try e.update("abc", &out));
+    var b15: [15]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, e.finish(&b15));
+    try testing.expectEqual(@as(usize, 3), e.tail_len);
+    var b16: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 16), try e.finish(&b16));
+    // The buffered tail is gone: 13 more octets do not complete a block.
+    try testing.expectEqual(@as(usize, 0), e.maxUpdateLen(13));
+
+    var ct: [32]u8 = undefined;
+    var padded: [32]u8 = undefined;
+    const n = try padPkcs7("0123456789abcdefX", &padded);
+    _ = try encrypt(Aes128, &key, iv, padded[0..n], &ct);
+    var d = StreamDecryptor(Aes128, .pkcs7).init(&key, iv);
+    _ = try d.update(&ct, &out);
+    try testing.expectEqual(@as(usize, 1), try d.finish(&b16));
+    // A held block would count again here (16 held + 1 = 17 -> 16 written).
+    try testing.expectEqual(@as(usize, 0), d.maxUpdateLen(1));
+
+    // An error ends the message too.
+    var en = StreamEncryptor(Aes128, .none).init(&key, iv);
+    try testing.expectEqual(@as(usize, 0), try en.update("abc", &out));
+    try testing.expectError(error.NotBlockAligned, en.finish(&b16));
+    try testing.expectEqual(@as(usize, 0), en.maxUpdateLen(13));
+}
+
+test "StreamDecryptor.finish refuses a cut-off ciphertext even over a stale, valid block in its buffer" {
+    // After a first message the buffer still holds that message's last
+    // ciphertext block. A second message that is the same ciphertext cut off
+    // inside that block leaves exactly those stale bytes behind the 3 new
+    // ones: decrypting the buffer without checking `tail_len` would accept it.
+    const key: [16]u8 = @splat(3);
+    const iv: [16]u8 = @splat(4);
+    var padded: [32]u8 = undefined;
+    const n = try padPkcs7("0123456789abcdefX", &padded);
+    var ct: [32]u8 = undefined;
+    _ = try encrypt(Aes128, &key, iv, padded[0..n], &ct);
+    var d = StreamDecryptor(Aes128, .pkcs7).init(&key, iv);
+    var out: [64]u8 = undefined;
+    var w = try d.update(&ct, &out);
+    w += try d.finish(out[w..]);
+    try testing.expectEqualSlices(u8, "0123456789abcdefX", out[0..w]);
+    d.setIv(iv);
+    _ = try d.update(ct[0..19], &out);
+    try testing.expectError(error.InvalidPadding, d.finish(&out));
+}
+
 test {
     _ = @import("stackprobe_test.zig");
     _ = @import("fuzz_test.zig");

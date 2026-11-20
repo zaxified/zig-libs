@@ -360,3 +360,12 @@ test "parseProtocolName: the spec §8 examples" {
     for ([_][]const u8{ "", "Noise", "Noise_XX", "Noise_XX_25519_ChaChaPoly", "Noise_XX_25519_ChaChaPoly_SHA256_x", "noise_XX_25519_ChaChaPoly_SHA256", "NoisePSK_XX_25519_ChaChaPoly_SHA256" }) |n|
         try std.testing.expectError(error.UnknownPattern, parseProtocolName(&st, n));
 }
+
+test "parse: a four-message pattern takes psk4, a sixth modifier is refused, a non-psk word of the same length is not a modifier" {
+    var st: Storage = .{};
+    const p = try st.parse("X1Npsk4");
+    try std.testing.expectEqual(@as(usize, 4), p.message_patterns.len);
+    try std.testing.expectEqualSlices(Token, &.{ .se, .psk }, p.message_patterns[3]);
+    try std.testing.expectError(error.UnsupportedModifier, st.parse("XXabc2"));
+    try std.testing.expectError(error.InvalidModifier, st.parse("XXpsk0+psk1+psk2+psk3+psk0+psk1"));
+}

@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go `crypto/cipher` CBC (1.26), RustCrypto `cbc` 0.2.1 + `cts` + `block-padding`, OpenSSL 3.5 EVP AES-CBC / AES-CBC-CTS (surveyed 2026-09-30, gaps closed 2026-10-16)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-05 (17/17) · src ?
+**Audit:** review 2026-08-06 · mutation 2026-11-20 (142/152, 10 eq) · src 3d5fd62dd6f3fd87
 
 **Hardening:** fuzz 2026-10-16 (200,000-run budget per harness clean, AESCBC_FUZZ: cbc, padding, cts, stream) · ct 2026-10-18 on Zig 0.17.0 (ctgrind: all five unpadders, 1 in-file context each = the accept/reject verdict, 0 for unpadZero; the verdict goes through the `rejectIf` asm barrier since 0.17 split iso7816's into two jumps, see `root.zig` `rejectIf`) · panic 2026-10-30 (sweep + blind review: length sums saturate, in-place padding total (`placeMsg`); delta audit 8/9 + 1 eq)
 
@@ -201,6 +201,14 @@ fuzz harness draws AES-192 for a third of its inputs.
 Run with `scripts/modtest aescbc`; the deterministic fuzz drivers run as `AESCBC_FUZZ` (never `zig build --fuzz`).
 
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Mutation:** whole module, schemata over all of `src/root.zig`, ReleaseSafe (152 mutants: the length checks, the
+  encrypt chain and the wide decrypt chain with their chaining, CTS in both directions for all three variants, the
+  incremental and streaming types, and the PKCS#7, XML-Enc, ANSI X9.23, ISO 10126, ISO 7816-4 and zero pad/unpad
+  pairs, including the scan loops and the single reject barrier of the padding-oracle-relevant unpadders); 142
+  killed. The 10 `eq` are equivalent: the clamp of the pad length that the in-range check makes redundant (three
+  unpadders), an in-place copy in either direction, the zero fill of a byte that is overwritten right after (X9.23
+  and ISO 10126), and four boundary variants that only route a block through the tail buffer or the single-block loop
+  (streaming `update`, the wide decrypt loop). Wipes and burns belong to the stack probe.
 - **Constant time:** ctgrind harness `src/ctgrind_harness.zig` over the five unpadders (one in-file context each, the accept/reject verdict the API returns anyway; 0 for `unpadZero`); rows in the card's Hardening line.
 - **Bench:** `zig build bench-aescbc` (`tools/bench.zig`, Go `crypto/cipher` and OpenSSL as foreign sides).
 
@@ -266,4 +274,3 @@ Run with `scripts/modtest aescbc`; the deterministic fuzz drivers run as `AESCBC
 ## Backlog / deferred
 
 - **CTS encrypt is 1.20× OpenSSL** (`cts_enc_1000`; `cts_dec_1000` is 0.98×): the one-shot `encryptCts` pays the key expansion and a 1536-byte burn per call over a latency-bound CBC chain (63 blocks); OpenSSL's provider path is ~200 ns cheaper per call. Counts for the card's `fastest` figure only (Go has no CTS), so it blocks P1, not P2. Candidates: a smaller burn sized to the body, or a keyed CTS context.
-- **Mutation run over the CTS, streaming, the three newer unpadders and the wide decrypt.** The card's whole-module run predates them; the fuzz harnesses carry those paths meanwhile (the card's `src` stays `?`).

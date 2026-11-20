@@ -1180,8 +1180,8 @@ dkg	ReleaseFast	combine	1	0	df061128776b6f52	6407896882d3491c
 # failure reason, and the scan loop contributes 0 contexts, so there is neither.
 # ⚠ The same `u1`-flag idiom did NOT survive the compiler in fss
 # (`dpf.zig:326`), which is why this is measured rather than reviewed.
-aescbc	ReleaseFast	pkcs7	1	1	58af0bb97d00c71b	c4046968725e140d
-aescbc	ReleaseFast	xmlenc	1	1	58af0bb97d00c71b	c4046968725e140d
+aescbc	ReleaseFast	pkcs7	1	1	058d9549f7f9c941	c4046968725e140d
+aescbc	ReleaseFast	xmlenc	1	1	058d9549f7f9c941	c4046968725e140d
 # 2026-10-16: the three strippers added for RustCrypto parity, same shape. x923
 # and iso7816 end in the same accept/reject branch (1); unpadZero never
 # rejects an aligned buffer, so it has no decision to disclose and measures 0
@@ -1194,9 +1194,9 @@ aescbc	ReleaseFast	xmlenc	1	1	58af0bb97d00c71b	c4046968725e140d
 # stripper). iso7816: LLVM split `if (scan | ~seen)` into two jumps, a path per failure reason --
 # fixed in the source (`rejectIf` asm barrier, all four rejecting strippers; old harness + barrier
 # measured 5/1). All five rows back at 5/1 (zero 4/0), same out_sha.
-aescbc	ReleaseFast	x923	1	1	58af0bb97d00c71b	c4046968725e140d
-aescbc	ReleaseFast	iso7816	1	1	58af0bb97d00c71b	c4046968725e140d
-aescbc	ReleaseFast	zero	1	0	58af0bb97d00c71b	c4046968725e140d
+aescbc	ReleaseFast	x923	1	1	058d9549f7f9c941	c4046968725e140d
+aescbc	ReleaseFast	iso7816	1	1	058d9549f7f9c941	c4046968725e140d
+aescbc	ReleaseFast	zero	1	0	058d9549f7f9c941	c4046968725e140d
 # ── sealedbox: the secret-key text codecs ──────────────────────────────────
 # ⭐ These four were 8 / 7 / 43 / 47 until 2026-09-09, all of it std's
 # table-driven base64 and hex reached with a SECRET argument: 95 of the 105
@@ -1439,8 +1439,8 @@ mqtt	ReleaseFast	pwverify	1	0	c17c9c0b37dedc6a	bcc95d04fa79c847
 # (curve25519.zig:77; 2 ephemeral keygens + 4 DH) + 2 x the AEAD tag-verify
 # outcome (std chacha20.zig:713 via chachapoly); transport 6 = the tag-verify
 # outcome of the 6 decryptions.
-noise	ReleaseFast	hs	1	8	afdd3a639ff6f1ae	95912b58e70d0846
-noise	ReleaseFast	transport	1	6	1ac1ca9403f799f9	b4443cf65f6c3849
+noise	ReleaseFast	hs	1	8	8348f4118b1b4abd	95912b58e70d0846
+noise	ReleaseFast	transport	1	6	52e4f61d12470285	b4443cf65f6c3849
 # tlsclient (2026-10-10) — kex: Client.initInto on a canned ServerHello with
 # the key-share secrets (entropy[64..240]) tainted; cv: signCertificateVerify
 # with the client key tainted (P-256, P-384, Ed25519). No context is a branch

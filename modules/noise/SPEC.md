@@ -6,7 +6,7 @@
 
 **Scope:** core — snow v0.10.0, Noise rev 34 (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (25/25) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-20 (171/174, 3 eq) · src cd80cc92e72265fc
 
 **Hardening:** fuzz 2026-10-10 (`noise-transport` 200,000-run budget clean; `noise-handshake` at `.scale` 3 = 66,666 runs over every catalog pattern + XXpsk3 + IKpsk2 with one message damaged; NOISE_FUZZ) · ct 2026-10-10 (ctgrind: XXpsk3 statics/ephemerals/PSK + transport keys tainted, `hs` 8 / `transport` 6 in-file, all std verdicts — X25519 identity check, AEAD tag outcome — none a noise branch)
 **Performance:** not measured
@@ -111,6 +111,14 @@ Run: `scripts/modtest noise`; fuzz: `NOISE_FUZZ=<runs>[,<first seed>]` (testkit'
   the verdicts are the card's Hardening line.
 - **Dead stack:** `src/stackprobe_test.zig`, ReleaseFast/ReleaseSmall only (see *Secret residue on the dead stack*).
 - **Dependents:** `tenantkex` and `bolt8` (BOLT#8 appendix vectors over `Suite.SymmetricState`) run on this module.
+- **Mutation:** whole module, schemata over `src/state.zig` and `src/patterns.zig`, ReleaseSafe (174 mutants: the
+  nonce encoding and the `CipherState` counters, `SymmetricState`'s init, `mixKey`, `mixHash`, `mixKeyAndHash`,
+  encrypt/decrypt-and-hash and `split`, the HKDF, `checkPattern` per class, the pre-message mixing, the `mixDh`
+  roles, the write and read token loops with every buffer bound, the completion and the wipe, and the PSK-modifier
+  and protocol-name parsers); 171 killed. The 3 `eq`: `split`'s reset of the pair (`initializeKey` sets every
+  field), the early `break` of the PSK scan (cost-only), and `applyPsk`'s token-count guard, which no catalog pattern
+  with PSK modifiers can reach (at most 7 of 8 tokens). The pattern table's cells are checked by the 87 vectors, not
+  mutated; wipes of local HKDF temporaries belong to the stack probe.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
   and the delta runs after it.
 
