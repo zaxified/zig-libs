@@ -545,12 +545,12 @@ Go. The card's `**Performance:**` line carries the figures and is authoritative.
 - **A budget on the public `checkNameConstraints`.** The caller owns both inputs; it is the budgeted function's unlimited twin by design, and a cap would add an error to a signature that cannot fail that way.
 - **`rdnEql` bounded below n·m.** One RDN's ATV count is bounded by the name's size, real names have 1-2, and Go's `rdnEql` is the same nested loop; it runs under the pair's single charge.
 - **OCSP in the path** (RFC 6960): the sibling `ocsp` module; see *Design & invariants*.
+- **Caching `Memo` past 12 certificates** — a chain over 12 certificates is not a Web PKI shape (Go bounds a verification at 100 signature checks, Go `maxChainSignatureChecks`), the cost past the cap is a linear re-run of `parseShape` per scan, and raising `cap` only moves the cliff.
 
 ## Backlog / deferred
 
 - **Delta CRLs (RFC 5280 §5.2.4) and indirect CRLs** are refused (`DeltaCrlUnsupported`, `IndirectCrlUnsupported`; also `onlySomeReasons`, attribute-certificate CRLs and a `nameRelativeToCRLIssuer` distribution point, `CrlScopeUnsupported`): a CRL that covers only part of the ground cannot prove "good". Open.
 - **Build option: post-quantum signature verifiers in chain building** (design in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `src/chain.zig` dispatches ML-DSA (3 sets) and SLH-DSA (12 sets, `inline else` over `algorithm.zig`) for every chain verifier. Measured (HTTPS sizeprobe, baseline x86_64 ReleaseSafe): SLH-DSA engine ~62 KB + ML-DSA ~56 KB. `.small` could drop SLH-DSA (no Web PKI issuer uses it) → such a chain is refused with `error.UnsupportedAlgorithm`. Small gain; do it only together with the TLS client's algorithm set.
 - **`crl.parse` per candidate attempt is uncached.** A parse cache keyed by CRL slice needs an owner and an invalidation rule across candidates (a new API surface); the work is linear in the CRL per attempt and attempts are budgeted. Revisit with a measured consumer need.
-- **`Memo` past 12 certificates re-runs `parseShape`.** A chain over 12 certificates is not a Web PKI shape and the cost is linear per scan; raising `cap` only moves the cliff.
 - **An optional diagnostics out-parameter naming the failing certificate** (`NoTrustedPath` hides the cause when several same-subject candidates fail).
 - **Go's parse strictness for serial numbers** (a non-minimal INTEGER encoding is refused by Go; std's parser and `safe.zig` do not check it).

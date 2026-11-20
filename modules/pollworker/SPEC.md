@@ -91,7 +91,8 @@ every slot, so `start`/`stop`/`again`/`run` cannot fail on memory; handles carry
 **`Env`** (libuv `uv_process_options_t.env`): `spawnDetachedEnv(gpa, argv, env, report)`;
 `.empty` (default; `spawnDetached` = this), `.inherit` (snapshot of `/proc/self/environ`
 read with raw syscalls on the loop thread at submit time), `.list` (`NAME=value`: non-empty
-name, no NUL). Replaces the environment as a whole, no merge. Bounds: `env_max_entries` 4096 and
+name, no NUL), `.overlay` (the `.inherit` snapshot with `NAME=value` entries applied on top: same name
+replaced, later duplicates win, as Rust `Command::env`). Without `.overlay` the environment is replaced as a whole. Bounds: `env_max_entries` 4096 and
 `env_max_bytes` 1 MiB (`error.EnvTooLarge`), bad entries `error.InvalidEnv`, no procfs
 `error.EnvUnavailable`; the copy is owned by the worker and freed before DONE with the argv.
 **`procrun` was checked and not reused:** its environment handling is built on
@@ -147,7 +148,6 @@ case, never assumed successful.
 
 - (survey 2026-09-30) **Optional epoll backend / fd registration** — `poll(2)` is O(n) in the fd count; libuv/mio/libxev use epoll. Effort: medium. Fits §2.
 - **Signal handles** (libuv `uv_signal_t`) — not started; a signalfd-based handle would fit the `Waker` shape.
-- **Env merge/overlay** (`.inherit` + overrides) — callers build the list themselves today.
 
 ## Anchoring
 

@@ -99,6 +99,7 @@ pub const Pair = compose_mod.Pair;
 pub const Composed = compose_mod.Composed;
 pub const Single = compose_mod.Single;
 pub const ComposeOptions = compose_mod.Options;
+pub const Schema = compose_mod.Schema;
 pub const ComposeError = compose_mod.Error;
 
 /// Compose every document in `source` into native `Value` trees (Part 2).

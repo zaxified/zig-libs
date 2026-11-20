@@ -134,6 +134,8 @@ closed signal set; one subscriber; no disposition control; (see *What is deliber
 - **Escalation policy** (second Ctrl-C kills at once, grace timers; signal-hook
   `register_conditional_shutdown`). The caller decides what to do with each `Signo`; call
   `wait`/`poll` again for the next one.
+- **A non-blocking descriptor option (`SFD_NONBLOCK`)** — `poll`/`pollInfo` already are the non-blocking read (EAGAIN is `null`), and `fd()` is documented for a caller's own epoll loop, which reads after readiness. tokio, libuv and Go's `os/signal` hand out no descriptor; only raw wrappers (nix's `SfdFlags::SFD_NONBLOCK`) carry the flag, and here it would turn `wait` into an evented read for no consumer.
+- **A `NotifyContext` helper** (Go `signal.NotifyContext`; tokio and libuv have none) — in this module's shape it is `_ = try stop.wait(io); group.cancel(io);` in the caller's `main`; a wrapper would only fix which `Io` object is cancelled, which is the caller's choice.
 
 ## Verification
 
@@ -170,13 +172,6 @@ the test sends the signal to the test's thread and reads the same signal back.
 
 Each is new API; none is implemented.
 
-- **A non-blocking descriptor option (`SFD_NONBLOCK`).** `fd()` is blocking so `wait` can go
-  through `std.Io`; a caller's own epoll loop must read only after readiness (which is how
-  epoll is used). An `Options.nonblocking` would serve a loop that polls the fd
-  optimistically; it would turn `wait` into an evented read. Effort S; deferred until a
-  consumer asks.
 - **Windows (`SetConsoleCtrlHandler`) and macOS/BSD (`kqueue` `EVFILT_SIGNAL`).** No consumer;
   tokio `ctrl_c` and libuv have it, so this is the one gap a user of those would hit. `init`
   returns `error.Unsupported`.
-- **A `NotifyContext` helper (cancel an `Io.Group`/`Future` on the first signal).** A few lines
-  over `wait` in the caller's `main`; revisit when a second consumer writes it the same way.

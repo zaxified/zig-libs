@@ -41,7 +41,7 @@ inside the module are wiped on every exit.
 
 **Helpers:** `p2pkhOfPublicKey`, `p2wpkhOfPublicKey`, `p2shP2wpkhOfPublicKey`,
 `p2shOfRedeemScript`, `p2wshOfWitnessScript`, `p2shP2wshOfWitnessScript`, and the raw templates
-`scriptP2pkh/P2sh/P2wpkh/P2wsh/P2tr`. Sizes are enforced (redeem script <= 520, witness script
+`scriptP2pkh/P2sh/P2wpkh/P2wsh/P2tr`, plus `scriptWitness(out, version, program)` for any witness version. Sizes are enforced (redeem script <= 520, witness script
 <= 10000; segwit helpers require a compressed key).
 
 **Not here:** script interpretation (anything outside the seven templates is

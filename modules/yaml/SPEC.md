@@ -51,7 +51,7 @@ aliases rejected, duplicate keys rejected by default); differential run against 
 documents. Also an emitter (its output composes back to every suite `in.json`, and PyYAML reads it
 to the same JSON), typed mapping onto Zig structs, and opt-in `<<` merge keys checked against PyYAML. **Where we are
 behind:** the emitter writes one style (block, double-quoted scalars) — no style
-round trip, no comments; only the core schema (an explicit `!!binary` / `!!timestamp` is validated and kept as text, `!!set` / `!!omap` are validated and keep their mapping / sequence value; the failsafe and JSON schemas are not resolved); integers outside
+round trip, no comments; the core schema by default (`Options.schema` selects the JSON or failsafe schema of §10; an explicit `!!binary` / `!!timestamp` is validated and kept as text, `!!set` / `!!omap` are validated and keep their mapping / sequence value); integers outside
 `i64` stay strings (*What is deliberately not done*); UTF-8 input only; error marks are best-effort.
 
 ## 1. Why the stages are separate
@@ -277,7 +277,11 @@ Other test classes:
 
 Resolution order for an untagged **plain** scalar is null, bool, int, float,
 str (§10.2.2). Three things are worth stating because they are where a YAML
-implementation quietly becomes a 1.1 one:
+implementation quietly becomes a 1.1 one. `Options.schema` also offers the other two schemas of §10
+(eemeli/yaml and snakeyaml-engine have all three): `.json` resolves `null`, `true`/`false` and
+JSON-shaped numbers only and keeps any other plain scalar a string (the spec calls it an error; the
+empty scalar is a string, not null), `.failsafe` keeps every plain scalar a string. Quoted scalars and
+explicit tags resolve the same under all three.
 
 - **No `yes`/`no`/`on`/`off` booleans.** Only the `true`/`True`/`TRUE` and
   `false`/`False`/`FALSE` sextet. A config reader that treats `no` as false is
@@ -479,8 +483,6 @@ Both are 1.1 parsers so most divergence is expected-and-bucketed, not a module d
   UTF-8 only. A leading UTF-16/UTF-32 BOM is rejected (`error.InvalidYaml`,
   `Scanner.fetchStreamStart`) rather than silently misread as content. Decoding the other
   encodings is not done.
-- **Failsafe and JSON schemas.** Only the core schema is resolved. Not in the 1.2 core, no consumer; each is a small
-  opt-in when one appears. Effort: small.
 - **Comment-preserving round trip.** eemeli/yaml, goccy/go-yaml and go-yaml keep comments for edit-in-place tools. Needs
   comment tokens through scanner, parser and `Value`, plus an emitter: a large change for tools no consumer has. Effort:
   large. Low priority.

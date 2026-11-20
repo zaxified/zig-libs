@@ -310,6 +310,8 @@ pub const Error = parser.Error || error{
     InvalidMerge,
 };
 
+pub const Schema = enum { core, json, failsafe };
+
 pub const Options = struct {
     /// Total composed nodes across the stream. Aliases share rather than copy,
     /// so this bounds real memory rather than expanded size.
@@ -363,6 +365,11 @@ pub const Options = struct {
     /// hence off by default: `<<` is then an ordinary string key. Merged keys
     /// are never duplicates; explicit ones are checked as before.
     merge_keys: bool = false,
+    /// How an untagged plain scalar is resolved (YAML 1.2 §10): `.core` (default, §10.3),
+    /// `.json` (§10.2: `null`, `true`/`false`, JSON-shaped numbers; any other plain scalar, the empty
+    /// one included, stays a string where the spec says "error"), or `.failsafe` (§10.1: every plain
+    /// scalar is a string). An explicit tag and a quoted scalar are resolved the same under all three.
+    schema: Schema = .core,
     /// Most bytes the parse and the composed tree may request from the
     /// allocator; `error.HeapBudgetExceeded` past it. `null` means no budget.
     ///
@@ -782,7 +789,11 @@ const Composer = struct {
         // folded scalar is a string however it reads — `"true"` is not a bool
         // (YAML 1.2 §10.2.2).
         if (style != .plain) return .{ .string = owned };
-        return resolvePlain(owned);
+        return switch (self.options.schema) {
+            .core => resolvePlain(owned),
+            .json => resolveJson(owned),
+            .failsafe => .{ .string = owned },
+        };
     }
 };
 
@@ -1002,6 +1013,33 @@ fn resolvePlain(text: []const u8) Value {
     if (isIntShape(text)) return parseInt(text) orelse .{ .string = text };
     if (parseFloat(text)) |f| return f;
     return .{ .string = text };
+}
+
+/// The JSON schema (§10.2.2): `null`, `true`, `false`, `-?(0|[1-9][0-9]*)` and
+/// `-?(0|[1-9][0-9]*)(\.[0-9]*)?([eE][-+]?[0-9]+)?`; everything else is kept as a string.
+fn resolveJson(text: []const u8) Value {
+    if (std.mem.eql(u8, text, "null")) return .null;
+    if (std.mem.eql(u8, text, "true")) return .{ .bool = true };
+    if (std.mem.eql(u8, text, "false")) return .{ .bool = false };
+    var i: usize = if (text.len > 0 and text[0] == '-') 1 else 0;
+    const int_start = i;
+    while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+    const n_digits = i - int_start;
+    if (n_digits == 0 or (n_digits > 1 and text[int_start] == '0')) return .{ .string = text };
+    if (i == text.len) return parseInt(text) orelse .{ .string = text }; // too big for i64: the text, as in core
+    if (text[i] == '.') {
+        i += 1;
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+    }
+    if (i < text.len and (text[i] == 'e' or text[i] == 'E')) {
+        i += 1;
+        if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
+        const exp_start = i;
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+        if (i == exp_start) return .{ .string = text };
+    }
+    if (i != text.len) return .{ .string = text };
+    return parseFloat(text) orelse .{ .string = text };
 }
 
 fn parseNull(t: []const u8) bool {

@@ -219,6 +219,7 @@ Run `scripts/modtest syslog`; the interop oracles are `zig build interop-syslog`
   instead of half a message.
 - **Microsecond stamps in the encoder** — milliseconds are the documented choice; the parser reads six digits.
 - **Delivery guarantees beyond at-least-once.**
+- **`UnixEmitter` and `connectUnix` with an abstract-namespace path** — the fixed `sockaddr_un` length cannot name one, and an embedded NUL cuts a path. Every syslog daemon listens on a filesystem path (`/dev/log`, journald's `/run/systemd/journal/*`), and glibc `openlog` and Go's `log/syslog` take paths only, so the paths here are filesystem paths and a NUL in one is the caller's mistake.
 
 ## Backlog / deferred
 
@@ -227,8 +228,6 @@ Run `scripts/modtest syslog`; the interop oracles are `zig build interop-syslog`
   on `Io` semantics.
 - **A mutation run over `parse.zig`, `logger.zig`, `ReconnectingEmitter` and `sendThroughMemfd`:** the card's
   mutation score predates this surface (swept, fuzzed and blind-reviewed, not mutation-tested).
-- **`UnixEmitter` and `connectUnix` with an abstract-namespace path:** the fixed `sockaddr_un` length cannot name
-  one, and a NUL in a path cuts it. Not refused today; nobody asked for them.
 
 ## Anchoring
 

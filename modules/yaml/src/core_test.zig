@@ -311,3 +311,31 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "Options.schema: failsafe keeps every plain scalar a string, json resolves only JSON spellings (YAML 1.2 §10.1, §10.2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "[null, true, 12, -0, 1.5e3, 0x1F, 0o7, 012, +1, .5, ~, True, .inf, 1e, 99999999999999999999, \"7\", !!int 5]";
+    const core = (try yaml.composeAllLeaky(a, src, .{}))[0].sequence;
+    const json = (try yaml.composeAllLeaky(a, src, .{ .schema = .json }))[0].sequence;
+    const fs = (try yaml.composeAllLeaky(a, src, .{ .schema = .failsafe }))[0].sequence;
+    try testing.expect(core[5] == .int and core[6] == .int and core[10] == .null);
+    try testing.expect(json[0] == .null and json[1].bool and json[2].int == 12 and json[3].int == 0);
+    try testing.expectEqual(@as(f64, 1500), json[4].float);
+    // Not JSON spellings: kept as text.
+    for ([_]usize{ 5, 6, 7, 8, 9, 10, 11, 12, 13 }) |i| try testing.expect(json[i] == .string);
+    try testing.expectEqualStrings("0x1F", json[5].string);
+    // Too big for i64: the text, as in core. A quoted scalar and an explicit tag are the same everywhere.
+    try testing.expectEqualStrings("99999999999999999999", json[14].string);
+    try testing.expectEqualStrings("7", json[15].string);
+    try testing.expect(json[16] == .int and fs[16] == .int);
+    for (fs[0..15]) |v| try testing.expect(v == .string);
+    try testing.expectEqualStrings("null", fs[0].string);
+    try testing.expectEqualStrings("12", fs[2].string);
+    // An empty plain scalar (a key with no value) is a string in both: the core schema says null.
+    const empty = try yaml.composeAllLeaky(a, "k:\n", .{});
+    try testing.expect(empty[0].mapping[0].value == .null);
+    const empty_fs = try yaml.composeAllLeaky(a, "k:\n", .{ .schema = .failsafe });
+    try testing.expectEqualStrings("", empty_fs[0].mapping[0].value.string);
+}

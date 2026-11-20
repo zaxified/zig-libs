@@ -135,7 +135,6 @@ helper results, whose expected values were derived independently with Python `ha
 - **"Unchecked" address type** (rust-bitcoin's `Address<NetworkUnchecked>`): a value type carrying the `Chains` set that must be `assume/require`d — the current `Decoded.chains` covers the information but not the type-level enforcement. Not now.
 - **Non-standard-script hints** (P2PK, bare multisig, `OP_RETURN` data) as a typed `ScriptKind` instead of `UnsupportedScript` — never for addresses (they have none); maybe as `classify` extension if a consumer asks.
 - **Public-key validation** via `k256` (point on curve) in the key helpers — not now: would add a dependency for a check most callers already made.
-- **`witness_unknown` constructor** (`scriptWitness(version, program)`) — not now; `fromScriptPubKey` on hand-built bytes covers it.
 
 ## Anchoring
 

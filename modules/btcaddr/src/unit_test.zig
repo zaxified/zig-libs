@@ -462,3 +462,30 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "scriptWitness builds every witness script that classify reads back" {
+    var buf: [btcaddr.max_script_len]u8 = undefined;
+    const prog20 = @as([20]u8, @splat(0xab));
+    const prog32 = @as([32]u8, @splat(0xcd));
+    const prog40 = @as([40]u8, @splat(0x01));
+    // The fixed-size builders agree.
+    try testing.expectEqualSlices(u8, &btcaddr.scriptP2wpkh(&prog20), try btcaddr.scriptWitness(&buf, 0, &prog20));
+    try testing.expectEqualSlices(u8, &btcaddr.scriptP2wsh(&prog32), try btcaddr.scriptWitness(&buf, 0, &prog32));
+    try testing.expectEqualSlices(u8, &btcaddr.scriptP2tr(&prog32), try btcaddr.scriptWitness(&buf, 1, &prog32));
+    // Future versions and odd lengths: BIP350's own example (version 16, 2-byte program) and the
+    // longest program.
+    const s16 = try btcaddr.scriptWitness(&buf, 16, &.{ 0x75, 0x1e });
+    try testing.expectEqualSlices(u8, &.{ 0x60, 0x02, 0x75, 0x1e }, s16);
+    try testing.expectEqual(btcaddr.ScriptKind.witness_unknown, btcaddr.classify(s16).?);
+    const s40 = try btcaddr.scriptWitness(&buf, 2, &prog40);
+    try testing.expectEqual(@as(usize, 42), s40.len);
+    try testing.expectEqual(btcaddr.ScriptKind.witness_unknown, btcaddr.classify(s40).?);
+    const a = try btcaddr.fromScriptPubKey(s40, .mainnet);
+    const d = try btcaddr.toScriptPubKey(a.slice());
+    try testing.expectEqualSlices(u8, s40, d.script());
+    // Refusals.
+    try testing.expectError(error.InvalidWitnessVersion, btcaddr.scriptWitness(&buf, 17, &prog20));
+    try testing.expectError(error.InvalidWitnessProgram, btcaddr.scriptWitness(&buf, 1, &.{0x00}));
+    try testing.expectError(error.InvalidWitnessProgram, btcaddr.scriptWitness(&buf, 1, &(prog40 ++ [_]u8{0})));
+    try testing.expectError(error.InvalidWitnessProgram, btcaddr.scriptWitness(&buf, 0, &prog40));
+}

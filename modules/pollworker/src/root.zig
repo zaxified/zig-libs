@@ -759,6 +759,11 @@ pub const Env = union(enum) {
     inherit,
     /// Exactly these `NAME=value` strings (each with a non-empty name, no NUL).
     list: []const []const u8,
+    /// The parent's environment as `.inherit` reads it, with these `NAME=value` strings applied on
+    /// top: an entry replaces the parent's variable of the same name, otherwise it is added; of two
+    /// entries with one name the later wins (Rust `Command::env`, Go `append(os.Environ(), ...)`).
+    /// Entries are checked as in `.list`.
+    overlay: []const []const u8,
 };
 
 /// Hard bounds on a child environment (a request over either is `error.EnvTooLarge`).
@@ -787,14 +792,7 @@ const OwnedEnv = struct {
         switch (env) {
             .empty => return .{ .buf = buf, .ptrs = &empty_envp, .vec = &.{}, .gpa = gpa },
             .list => |items| {
-                if (items.len > env_max_entries) return error.EnvTooLarge;
-                var total: usize = 0;
-                for (items) |e| {
-                    const eq = std.mem.findScalar(u8, e, '=') orelse return error.InvalidEnv;
-                    if (eq == 0 or std.mem.findScalar(u8, e, 0) != null) return error.InvalidEnv;
-                    total += e.len + 1;
-                    if (total > env_max_bytes) return error.EnvTooLarge;
-                }
+                const total = try checkEntries(items);
                 buf = try gpa.alloc(u8, total);
                 var at: usize = 0;
                 for (items) |e| {
@@ -802,6 +800,29 @@ const OwnedEnv = struct {
                     buf[at + e.len] = 0;
                     at += e.len + 1;
                 }
+            },
+            .overlay => |items| {
+                _ = try checkEntries(items);
+                const parent = try readEnviron(gpa);
+                defer gpa.free(parent);
+                var merged: std.ArrayList(u8) = .empty;
+                errdefer merged.deinit(gpa);
+                var start: usize = 0;
+                for (parent, 0..) |c, i| {
+                    if (c != 0) continue;
+                    const ent = parent[start..i];
+                    start = i + 1;
+                    if (ent.len == 0 or overridden(items, 0, ent)) continue;
+                    try merged.appendSlice(gpa, ent);
+                    try merged.append(gpa, 0);
+                }
+                for (items, 0..) |e, k| {
+                    if (overridden(items, k + 1, e)) continue;
+                    try merged.appendSlice(gpa, e);
+                    try merged.append(gpa, 0);
+                }
+                if (merged.items.len > env_max_bytes) return error.EnvTooLarge;
+                buf = try merged.toOwnedSlice(gpa);
             },
             .inherit => buf = try readEnviron(gpa),
         }
@@ -819,6 +840,31 @@ const OwnedEnv = struct {
         self.gpa.free(self.buf);
     }
 };
+
+/// Validates `NAME=value` entries (non-empty name, no NUL, within the bounds); returns the bytes they
+/// take with their terminators.
+fn checkEntries(items: []const []const u8) EnvError!usize {
+    if (items.len > env_max_entries) return error.EnvTooLarge;
+    var total: usize = 0;
+    for (items) |e| {
+        const eq = std.mem.findScalar(u8, e, '=') orelse return error.InvalidEnv;
+        if (eq == 0 or std.mem.findScalar(u8, e, 0) != null) return error.InvalidEnv;
+        total += e.len + 1;
+        if (total > env_max_bytes) return error.EnvTooLarge;
+    }
+    return total;
+}
+
+fn envName(e: []const u8) []const u8 {
+    return e[0 .. std.mem.findScalar(u8, e, '=') orelse e.len];
+}
+
+/// Whether one of `items[from..]` has the variable name of `entry`.
+fn overridden(items: []const []const u8, from: usize, entry: []const u8) bool {
+    const name = envName(entry);
+    for (items[from..]) |o| if (std.mem.eql(u8, envName(o), name)) return true;
+    return false;
+}
 
 /// Count the non-empty NUL-terminated strings of `buf` (which must end in NUL or
 /// be empty) and, when `out` is given, store a pointer to each (`out` needs room).
@@ -1731,6 +1777,40 @@ test "spawnDetachedEnv: .inherit hands the child the parent's variables" {
     if (eq > 100 or std.mem.findScalar(u8, first[0..eq], '\'') != null) return error.SkipZigTest;
     const script = try std.mem.print(&script_buf, "[ -n \"${{{s}+x}}\" ]", .{first[0..eq]});
     try std.testing.expectEqual(@as(?u8, 0), try runSh(.inherit, script));
+}
+
+test "spawnDetachedEnv: .overlay replaces a parent variable, adds new ones, later duplicates win" {
+    if (!haveFile("/bin/sh") or !haveFile("/proc/self/environ")) return error.SkipZigTest;
+    const buf = try readEnviron(std.testing.allocator);
+    defer std.testing.allocator.free(buf);
+    const first = std.mem.sliceTo(buf, 0);
+    const eq = std.mem.findScalar(u8, first, '=') orelse return error.SkipZigTest;
+    if (eq == 0 or eq > 100 or std.mem.findScalar(u8, first[0..eq], '\'') != null) return error.SkipZigTest;
+    var entry_buf: [128]u8 = undefined;
+    const entry = try std.mem.print(&entry_buf, "{s}=overlaid", .{first[0..eq]});
+    var script_buf: [512]u8 = undefined;
+    const script = try std.mem.print(
+        &script_buf,
+        "[ \"${{{s}}}\" = overlaid ] && [ \"$PW_NEW\" = two ] && [ \"$PW_X\" = kept ]",
+        .{first[0..eq]},
+    );
+    const items: []const []const u8 = &.{ entry, "PW_NEW=one", "PW_X=kept", "PW_NEW=two" };
+    try std.testing.expectEqual(@as(?u8, 0), try runSh(.{ .overlay = items }, script));
+    // The parent's other variables are still there (an overlay is not a `.list`).
+    var it = std.mem.splitScalar(u8, buf, 0);
+    var other: ?[]const u8 = null;
+    while (it.next()) |e| {
+        const q = std.mem.findScalar(u8, e, '=') orelse continue;
+        if (q == 0 or q > 100 or std.mem.eql(u8, e[0..q], first[0..eq])) continue;
+        if (std.mem.findScalar(u8, e[0..q], '\'') != null) continue;
+        other = e[0..q];
+        break;
+    }
+    if (other) |name| {
+        const s2 = try std.mem.print(&script_buf, "[ -n \"${{{s}+x}}\" ]", .{name});
+        try std.testing.expectEqual(@as(?u8, 0), try runSh(.{ .overlay = &.{"PW_NEW=1"} }, s2));
+    }
+    try std.testing.expectError(error.InvalidEnv, OwnedEnv.init(std.testing.allocator, .{ .overlay = &.{"=x"} }));
 }
 
 test "spawnDetachedEnv: invalid or oversized environments are refused and claim no slot" {

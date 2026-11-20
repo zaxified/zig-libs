@@ -1200,6 +1200,22 @@ test "protection events: element bits outside the standard are masked, not echoe
     try testing.expectError(error.BufferTooSmall, asdu.encodeElement(.{ .protection_start = .{ .start = .{}, .qdp = .{}, .duration = .{} } }, &small));
 }
 
+test "outstation: a read (C_RD_NA_1, cause 5) of a protection point is answered with the point, as lib60870-C's slave does" {
+    var points = [_]outstation.Point{
+        .{ .ioa = 2, .type_id = .m_ep_ta_1, .element = .{ .protection_event = .{ .event = .{ .state = .on }, .elapsed = .{ .milliseconds = 5 } } }, .time = .{ .cp24 = .{} } },
+    };
+    var o = try outstation.Outstation.init(.{ .common_address = 47 }, &points);
+    var s = outstation.CollectSink{};
+    // C_RD_NA_1, cause 5, CA 47, IOA 2
+    try o.handle(&hex("660105002f00020000"), s.sink());
+    try testing.expectEqual(@as(usize, 2), s.count);
+    const con = try asdu.decode(s.get(0), asdu.default_params);
+    try testing.expectEqual(asdu.Cot.activation_con, con.header.cause.cot);
+    const a = try asdu.decode(s.get(1), asdu.default_params);
+    try testing.expectEqual(asdu.TypeId.m_ep_ta_1, a.header.type_id);
+    try testing.expectEqual(asdu.Cot.request, a.header.cause.cot);
+}
+
 test "outstation: protection events are spontaneous only, never interrogated" {
     var points = [_]outstation.Point{
         .{ .ioa = 1, .type_id = .m_sp_na_1, .element = .{ .siq = .{ .on = true } }, .group = 1 },

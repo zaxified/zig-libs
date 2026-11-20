@@ -199,6 +199,7 @@ does not claim, per-frame authentication (see deferred list).
 - **Fragmentation & encryption** — downstream (`ethfrag`, `wireguard`); this
   module hands them a plain `[]u8` and imports neither.
 - **Per-frame authentication** beyond WireGuard's tunnel-level guarantees.
+- **A header-flags extension point** — the 7 reserved flag bits and the version byte are the only room, so an extension would be a v2; Geneve's option TLVs live in the separate Geneve codec (next item), not in this header, and no consumer asked.
 
 ## Verification
 
@@ -224,7 +225,6 @@ Offline only: a pure codec has no live-interop surface. Run `scripts/modtest l2e
 
 Two optional, low-priority items, both within CONVENTIONS §2:
 
-- **Header-flags extension point** — Geneve's option TLVs are how its users add per-tenant metadata; the header here has 7 reserved flag bits and a version byte, so an extension would be a v2. Only if a consumer asks. Effort: small.
 - **Optional VXLAN/Geneve header codec** — for gateways that must speak to kernel `vxlan` devices; a separate module rather than a change to this one. Effort: small.
 
 ## Anchoring

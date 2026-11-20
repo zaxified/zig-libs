@@ -262,6 +262,7 @@ asserts against that convention, with two carved-out groups:
   Mn Mc Nd Pc) that neither this module nor a sibling has. `stringify` is ASCII-only for the same reason.
 - **Reviver/replacer, a streaming reader, a comment-preserving round trip.** `std.json` typed decoding
   replaces the reviver; no implementation surveyed has the other two.
+- **`AnnotatedResult` against the `diagnostics` module** — the result stays a raw `{ out, next_id }` pair: using `diagnostics`' line/col/severity type would add a dependency to a module whose references (the json5 crate, JSON5 reference implementation) have no such type, and no consumer asked.
 
 ## Open
 
@@ -278,9 +279,6 @@ asserts against that convention, with two carved-out groups:
 - **Format-preserving span find/replace.** What a terminal-UI consumer's own span helper does (replace one
   value in place keeping the surrounding text). Not parity (no reference has it); the decision whether it
   belongs in this module is the owner's. Effort: medium.
-- **`AnnotatedResult` against a `diagnostics` module.** Today a raw `{ out, next_id }` pair with no
-  structured line/col/severity type; formalise it once the sibling `diagnostics` module's shape is the
-  one to follow.
 
 ## Anchoring
 

@@ -199,7 +199,10 @@ loopback script server.
 ## What is deliberately not done
 
 - **Automatic retries / 429 backoff.** The SDKs retry 429/5xx by default; here the retry policy is
-  not duplicated: compose with the `resilience` module.
+  not duplicated: compose with the `resilience` module (the recipe is in README.md *Retrying*). No
+  adapter: `Client` reports a non-2xx answer as `error.UnexpectedStatus` with `lastErrorBody` (the
+  status code and `retry-after` are not exposed), so a wrapper would have to re-parse the body anyway,
+  and a `resilience` dependency would reach every consumer for something they can write in ten lines.
 - **Prompt-caching tooling beyond the per-block `cache_control` field** (breakpoint-placement helpers,
   cache-hit diagnostics).
 - **Following redirects:** never, so `x-api-key` cannot leave `base_url` (see *Threat model*).
@@ -220,7 +223,6 @@ loopback script server.
   blocks for server tools (today `.other`). Each small; fits §2.
 - **OpenAI-compatible variant** (`chat/completions` request/response mapping): sketched only, a fairly
   mechanical follow-up once a second consumer needs it.
-- **A short retry recipe or adapter over `resilience`**, since the SDKs retry 429/5xx by default.
 - **Upstream `sse_parse` as `http.sse.ClientReader`:** it is fully generic SSE parsing with nothing
   Anthropic-specific in it; belongs in `http` once a second consumer needs client-side SSE.
 

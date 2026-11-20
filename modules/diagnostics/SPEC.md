@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — a finding that quotes a hostile key name (`key` + an OSC title change, BEL, a screen clear and the bidi override U+202E of "Trojan Source", CVE-2021-42574) in the source, the message, a label and a note: codespan-reporting 0.13.1, the reference, writes 16 raw ESC/BEL/U+202E characters to the terminal, this module none — the quoted line shows them as `?`, finding text as `\x1b`/`\u{202e}` (`zig build interop-diagnostics -- --lead`; tests "escaping: bidi controls, C1 controls and invalid bytes never reach the terminal", "control characters" in root.zig) (measured 2026-10-23)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-12 (625/675, 50 eq) · src 041febbda9632ede
+**Audit:** review 2026-11-12 · mutation 2026-11-12 (625/675, 50 eq) · src 69705356b0b4ba65
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — diagnostic rendering (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point: no finding; extreme positions/options pinned by a seeded test)
 
@@ -110,12 +110,11 @@ Run: `scripts/modtest diagnostics`. The module has no fuzz obligation (the card'
 - Per-label colours and 24-bit colour, a narrated (screen-reader) printer, an error framework (miette), OSC-8 links and SARIF output.
 - codespan's `medium` display style (our one-line `short` takes its place).
 - Diff-style suggestion rendering (annotate-snippets `Patch`) is listed on the card's Scope line as deliberately not done; the Backlog still carries it as `later` (see there).
+- **Aligning the snippet and LSP readings of a half-given span** — `end_col` with no `end_line` (snippet: one caret, `writeLsp`: ends at it) and `line` with no `col` (snippet: one caret at column 1, `writeLsp`: the whole line) differ on purpose; the snippet goldens are pinned on the former and changing them is a rendering change nobody asked for. Documented on `render`; give both ends for the same span in both.
 
 ## Backlog / deferred
 
 - **R11: diff-style suggestion rendering** (annotate-snippets `Patch`). Effort M. Marked `later` in the survey; the card's Scope line lists it as deliberately not done: the owner decides which holds.
-- **`end_col` without `end_line` / `line` without `col`:** the snippet renderer ignores the former (one caret) while `writeLsp` honours it, and a span with `line` but no `col` is one caret at column 1 in the snippet but the whole line in LSP. Align or document (LOW, no promise broken).
-- The sibling `json5` module intends to formalize its `AnnotatedResult` against this module (a `json5`-side integration task, not a `diagnostics` gap).
 
 ## Anchoring
 

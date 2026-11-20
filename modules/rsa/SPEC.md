@@ -339,6 +339,7 @@ What the figures depend on:
 - **RSA-PSS-restricted key OIDs** (1.2.840.113549.1.1.10) in SPKI/PKCS#8: only `rsaEncryption`
   keys are read and written (Go's PKCS#8 parser takes the same line).
 - **JWK and OpenSSH public-key text** belong to `jwt`/`jwe`/`acme` and `ssh`.
+- **scrypt in PBES2** (owner: not now) — `std.crypto.pwhash.scrypt.kdf` needs an allocator and this module allocates nothing; OpenSSL writes scrypt only on `-scrypt`.
 
 ## Build options
 
@@ -374,8 +375,6 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 - **Prime search sieve.** `bytesMod`'s `%` on the candidate (variable-latency division) and Miller-Rabin's squaring count
   `s = v2(p − 1)` stay observable for a kept prime. Fix: a sieve by multiplication with precomputed reciprocals over the whole
   table, and `p ≡ 3 mod 4` candidates (s = 1) if FIPS 186-5 shape allows. Effort: small–medium. Fits CONVENTIONS §2.
-- **scrypt in PBES2** (owner: not now). `std.crypto.pwhash.scrypt.kdf` needs an allocator and this module allocates nothing;
-  OpenSSL writes scrypt only on `-scrypt`. An allocator-taking `fromPkcs8EncryptedScrypt` would close it. Effort S.
 - **Caller-lowerable PBKDF2 iteration cap.** `max_pbkdf2_iterations` (2^20, ~0.3–1 s per hostile encrypted key) is fixed;
   minisign's `SecretKeyLimits` / `openSecretKeyLimited` is the precedent for letting the caller pass a lower (or higher) cap.
 - **PEM `aes256-ctr` decryption on Zig 0.17.** The encrypted-OpenSSH-key path (`std.crypto.core.modes.ctr` over std `Aes256`

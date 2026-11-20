@@ -424,7 +424,9 @@ fn digits(n: u32) usize {
     return (std.mem.print(&buf, "{d}", .{n}) catch unreachable).len;
 }
 
-/// Write one finding as text. `line`/`col` are 1-based, `col` counted in
+/// Write one finding as text. Two spans read differently here and in `writeLsp`: a `line` with no `col` is one
+/// caret at column 1 here (the whole line there), and an `end_col` with no `end_line` is ignored here (one
+/// caret; `writeLsp` ends the range at it). Give `end_line` (and `col`) to get the same span in both. `line`/`col` are 1-based, `col` counted in
 /// bytes; `end_line`/`end_col`, when present, end the span exclusively (as
 /// in LSP). Every string from the finding (and the quoted source line) is
 /// written with control characters escaped (`\n`, `\x1b`, ...; tab stays

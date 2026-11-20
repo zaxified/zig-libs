@@ -213,7 +213,7 @@ probing, banner grabbing, TLS/protocol handshakes, port-range sweeping, IPv6 zon
 - **A bounded `LiveConnector` connect**: its `timeout_ns` stays advisory, because `std.Io.Threaded` panics on a
   connect timeout; the answer is `PosixConnector`, not waiting for std.
 - **UDP/ICMP probing, raw or SYN scans, banner grabbing and send/expect over the open connection
-  (blackbox's `query_response`), TLS/protocol handshakes, port-range sweeping, IPv6 zone/scope ids.**
+  (blackbox's `query_response`), TLS/protocol handshakes, port-range sweeping, IPv6 zone/scope ids.** So `AppCheck` never gets the open socket: it is a post-connect predicate over the `Target` (it opens its own connection if it needs to talk), and the connect that made it run is already closed.
 - **Stopping the fan-out instead of recording a `.canceled` outcome** (shape B in *Design*).
 
 ## Verification
@@ -268,9 +268,6 @@ probing, banner grabbing, TLS/protocol handshakes, port-range sweeping, IPv6 zon
   out for this module; `LiveConnector` stays the portable path (owner can overrule). Why: only `LiveConnector`
   is portable and it cannot bound a connect. Effort: medium; needs a syscall path other than `std.os.linux` (fits §2
   only if no libc — check per target).
-- **Question for the owner, not a backlog item:** should `AppCheck` ever get a way to use the open socket
-  (blackbox's `query_response`)? Banner grabbing is refused (*What is deliberately not done*), so this is a
-  question only.
 
 ## Anchoring
 

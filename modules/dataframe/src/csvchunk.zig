@@ -72,7 +72,8 @@ pub const ChunkError = CsvReadError || error{
 ///   It also bounds the read-ahead window, so a line with no end in sight (a record, a comment
 ///   or a `skip_rows` line) costs at most `max_bytes` of memory before `error.InputTooLarge`;
 ///   `max_record_bytes` is checked on each header and data record as read, as `readCsv` does;
-/// - `max_rows`, `max_cells` apply to one chunk; `n_rows` to the whole stream;
+/// - `max_rows`, `max_cells` apply to one emitted chunk (the `infer_rows` read-ahead may exceed
+///   `max_rows`); `n_rows` to the whole stream;
 /// - a newline as `delimiter` or `quote`, or `delimiter == quote`, is `error.BadOptions` (records are
 ///   rejoined with `\n` and re-quoted);
 /// - `skipfooter` is `error.UnsupportedOption` (it needs the end of the input);
@@ -179,10 +180,14 @@ pub const CsvChunkReader = struct {
         const infer = s.copts.schema == .first_chunk and s.schema == null;
         const infer_n = if (infer) (s.copts.infer_rows orelse n) else n;
         if (infer_n == 0) return error.BadOptions;
-        try s.fill(@max(n, infer_n));
+        // The schema read-ahead (`infer_rows`) is the caller's explicit request and is bounded by
+        // `max_bytes`: it may exceed `max_rows`, which caps the rows of one emitted chunk (polars
+        // infers over `infer_schema_length` rows independently of how many rows it returns).
+        try s.fill(@max(n, infer_n), if (infer) @max(s.opts.max_rows, infer_n) else s.opts.max_rows);
         const queued = s.ends.items.len;
         if (queued == 0) return null;
         const take = @min(n, queued);
+        if (take > s.opts.max_rows) return error.TooManyRows;
         var frame: Frame = undefined;
         if (infer) {
             const k = @min(infer_n, queued);
@@ -245,7 +250,9 @@ pub const CsvChunkReader = struct {
         var scratch = std.heap.ArenaAllocator.init(s.gpa);
         defer scratch.deinit();
         const types = try s.typesFor(scratch.allocator());
-        const co = s.chunkOptions(types);
+        var co = s.chunkOptions(types);
+        // The queue was capped when filled; the schema read-ahead may hold more than `max_rows`.
+        co.max_rows = @max(co.max_rows, take);
         const end = s.ends.items[take - 1];
         if (csvio.readCsv(a, s.buf.items[0..end], co)) |f| return f else |e| {
             if (e != error.BadValue) return e;
@@ -456,11 +463,11 @@ pub const CsvChunkReader = struct {
     }
 
     /// Queues data records until `target` are there, the stream or `n_rows` ends.
-    fn fill(s: *CsvChunkReader, target: usize) ChunkError!void {
+    fn fill(s: *CsvChunkReader, target: usize, row_cap: usize) ChunkError!void {
         while (s.ends.items.len < target) {
             if (s.opts.n_rows) |lim| if (s.taken >= lim) return;
             const rec = (try s.nextData()) orelse return;
-            if (s.opts.max_rows <= s.taken -| s.emitted) return error.TooManyRows;
+            if (row_cap <= s.taken -| s.emitted) return error.TooManyRows;
             // A fallen-back record is stored fully quoted: the text behind it in this chunk is not
             // the text behind it in the stream, and must not be able to close its open quote
             // (fuzz seed 3206). Any other record closes its own quotes, so it re-reads alone.

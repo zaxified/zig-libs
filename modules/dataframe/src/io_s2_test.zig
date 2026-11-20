@@ -602,3 +602,34 @@ test "readJson .split: many column names are checked for repeats linearly, repea
     const f = try df.readJson(a, aw.written(), .{ .orient = .split });
     try testing.expectEqual(@as(usize, 20000), f.columns.len);
 }
+
+test "CsvChunkReader: infer_rows read-ahead may exceed max_rows; the emitted chunk may not" {
+    const text = "a\n1\n2\n3\n4\n5\n6\n";
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var r = std.Io.Reader.fixed(text);
+    var rd = try df.CsvChunkReader.init(testing.allocator, &r, .{ .max_rows = 2 }, .{ .infer_rows = 5 });
+    defer rd.deinit();
+    const c = (try rd.next(ar.allocator(), 1)).?;
+    try testing.expectEqual(@as(usize, 1), c.len);
+    const c2 = (try rd.next(ar.allocator(), 2)).?;
+    try testing.expectEqual(@as(usize, 2), c2.len);
+    // A chunk bigger than the cap is still refused.
+    var r2 = std.Io.Reader.fixed(text);
+    var rd2 = try df.CsvChunkReader.init(testing.allocator, &r2, .{ .max_rows = 2 }, .{ .infer_rows = 5 });
+    defer rd2.deinit();
+    try testing.expectError(error.TooManyRows, rd2.next(ar.allocator(), 3));
+}
+
+test "NdjsonChunkReader with n_rows never reads past them, a whole readNdjson does" {
+    const text = "{\"a\":1}\n{\"a\":2}\nnot json\n";
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expect(if (df.readNdjson(ar.allocator(), text, .{})) |_| false else |_| true);
+    var r = std.Io.Reader.fixed(text);
+    var rd = df.NdjsonChunkReader.init(testing.allocator, &r, .{ .n_rows = 2 });
+    defer rd.deinit();
+    const c = (try rd.next(ar.allocator(), 10)).?;
+    try testing.expectEqual(@as(usize, 2), c.len);
+    try testing.expect((try rd.next(ar.allocator(), 10)) == null);
+}

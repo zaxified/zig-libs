@@ -367,6 +367,7 @@ the downloaded module and crate compared with the copies read; their provenance 
   deployment's choice (see Threat model). The default allow-list is a starting point to profile, not a policy.
 - **Automatic tree dispatch.** `.tree` is opt-in because the linear program is smaller and easier to audit below
   ~50 numbers.
+- **Upstream report of the libseccomp rule-merge defect** — libseccomp 2.6.0 and 2.6.1 drop a conditional rule / take an action no rule names when several conditional rules of one syscall compare the same argument (the `Ahead` line; reproducer: the two `getppid` rules of the kernel test, `seccomp_export_pfc` shows the second missing). It is not reported upstream (the report is the owner's); when it is, re-check the `Ahead` claim against the fixed release.
 
 ## Open
 
@@ -385,10 +386,6 @@ the downloaded module and crate compared with the copies read; their provenance 
 - **Landlock ABI 10+:** UDP rights and `LANDLOCK_ADD_RULE_QUIET` (10), `LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS` (11).
   Not in the kernel and UAPI header this was built against (7.0, ABI 8); UDP stays unrestricted on a kernel that has
   those rights. Add with one. Effort small each.
-- **Upstream report of the libseccomp rule-merge defect** (owner: "note it for now"): 2.6.0 and 2.6.1 drop a
-  conditional rule / take an action no rule names when several conditional rules of one syscall compare the same
-  argument (Ahead line; reproducer: the two `getppid` rules of the kernel test, `seccomp_export_pfc` shows the
-  second missing). Not reported yet; when it is, re-check the Ahead claim against the fixed release.
 
 ## Anchoring
 

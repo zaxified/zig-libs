@@ -256,4 +256,3 @@ Design references: none beyond the BIP341 specification text itself,
 
 - **Control-block parse / `verifyCommitment` here** — today only `bitcoinscript` verifies; a wallet that only builds does not need it. Would duplicate consensus code or invert the dependency; decide with a consumer.
 - **BIP371 `PSBT_OUT_TAP_TREE` byte (de)serialization** — the depth-list shape is accepted; the wire encoding belongs with `psbt`.
-- **NUMS internal key helper** (BIP341's unspendable-key-path recommendation) — small; the caller picks the internal key today; add when a consumer asks.

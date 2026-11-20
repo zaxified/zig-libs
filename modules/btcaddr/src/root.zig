@@ -210,6 +210,28 @@ pub fn scriptP2tr(output_key: *const [32]u8) [34]u8 {
     return s;
 }
 
+pub const WitnessScriptError = error{
+    /// `version` is above 16 (no OP_0 / OP_1..OP_16 opcode for it).
+    InvalidWitnessVersion,
+    /// The program is not 2..40 bytes (BIP141), or a version 0 program is not 20 or 32 bytes.
+    InvalidWitnessProgram,
+};
+
+/// Builds the scriptPubKey of any witness output: `OP_<version>` + one direct push of `program`
+/// (rust-bitcoin `WitnessProgram::new`, bitcoinj `SegwitAddress.fromProgram` take the same two
+/// arguments). It covers the future versions that `classify` reports as `.witness_unknown`; the
+/// fixed-size `scriptP2wpkh`/`scriptP2wsh`/`scriptP2tr` are the usual forms. The result is
+/// written into `out` and returned as a slice of it.
+pub fn scriptWitness(out: *[max_script_len]u8, version: u8, program: []const u8) WitnessScriptError![]const u8 {
+    if (version > 16) return error.InvalidWitnessVersion;
+    if (program.len < 2 or program.len > 40) return error.InvalidWitnessProgram;
+    if (version == 0 and program.len != 20 and program.len != 32) return error.InvalidWitnessProgram;
+    out[0] = if (version == 0) 0x00 else 0x50 + version;
+    out[1] = @intCast(program.len);
+    @memcpy(out[2..][0..program.len], program);
+    return out[0 .. 2 + program.len];
+}
+
 // -- addresses ------------------------------------------------------------
 
 /// An address string in a fixed buffer.

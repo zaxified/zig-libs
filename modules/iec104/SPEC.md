@@ -112,7 +112,7 @@ depends on Zig's bitfield-packing rules.
   cause table allows the protection events with cause 3 (spontaneous) only (`TypeId.isSpontaneousOnly`, `asdu.zig`),
   so `emitPoint` drops any interrogated cause (20..41) for them (`outstation.zig`) while `reportSpontaneous`
   still sends them (`outstation.zig`). The table was read from a vendor interoperability list that reproduces it, not
-  from the standard text; lib60870-C's slave was not checked. The outstation never generates these events on its own.
+  from the standard text. A read (`C_RD_NA_1`, cause 5) of such a point is answered with the point and cause 5 like any other: lib60870-C's slave type-checks no read (every read goes to the application's handler, a broadcast address and a non-request cause excepted), so the outstation does not refuse what that reference answers. The outstation never generates these events on its own.
 - **Global (broadcast) common address (§7.2.4).** The outstation answers a request on the global address only for the four
   type ids the standard defines it for — station and counter interrogation, clock synchronisation, reset process
   (`broadcastable`, `outstation.zig`); anything else addressed to it, a control-direction command above all, is
@@ -323,12 +323,6 @@ What a full IEC 60870-5-104 implementation has and this one does not (planned it
 
 ## Backlog / deferred
 
-- **Read (`C_RD_NA_1`, cause 5) of a protection-equipment point (types 17-19, 38-40)**: the type/cause table allows these types
-  with cause 3 only, yet `onRead` answers such a point with cause 5 like any other. No reference behaviour to copy was found:
-  lib60870-C's slave hands every read to the application's read handler (it only refuses a broadcast address, with cause 46,
-  and a non-request cause, with cause 45) and checks no type; this outstation's own refusals are "wrong request cause" (45,
-  negative) and "unknown IOA" (negative activation confirmation, then 47), and neither fits a point that exists but may not
-  be read. Decide which refusal (if any) is right before changing it; a test with a protection point read is needed either way.
 - **Redundancy groups (CS 104)** *(survey)*: lib60870 has them; utilities run dual-link 104 as standard; medium, fits §2 (state
   machine + arbitration, no I/O). Ranked first by the survey.
 - **File transfer (type ids 120-127)** *(survey)*: lib60870 file service; needs variable-length elements outside the shape

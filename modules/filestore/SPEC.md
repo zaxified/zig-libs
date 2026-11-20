@@ -168,6 +168,7 @@ not consult or clear the `.expiry` sidecar — they are independent, orthogonal 
 - **Compression** (diskv `Compression`): the caller compresses with `zstd`/`brotli`; a store that
   recompresses could not stream or `importFile` by `rename`.
 - **Mandatory (non-advisory) locking and encryption at rest:** see *Threat model / out of scope*.
+- **A `sweep`-all-kinds convenience** — `sweep` takes one `kind`, matching `list`'s scoping; no comparable store (bbolt buckets, Badger prefixes, Go's `os.ReadDir`) offers a store-wide sweep across namespaces, and a caller loops over its own kinds.
 
 ## Known limits
 
@@ -234,8 +235,6 @@ Run `scripts/modtest filestore` (tests are disk-bound: every write is durable). 
 
 - **`listTyped` iterator or paged form:** `listTyped` still materialises every record's bytes in the
   caller's arena (keys have `iterate`/`iteratePrefix`).
-- **A `sweep`-all-kinds convenience** (today `sweep` takes one `kind`, matching `list`'s scoping). Not
-  planned.
 
 ## Anchoring
 

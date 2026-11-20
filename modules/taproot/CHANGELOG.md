@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — New `nums_internal_x` / `numsInternalKey()`: BIP341's unspendable internal key `H` (test: `x = SHA256(04 || Gx || Gy)`, it lifts, it tweaks). No existing behaviour changes.
 - **2026-11-19** — added `WeightedLeaf`, `huffmanLeaves` and `buildFromWeights`: Huffman tree layout from `(weight, script)` pairs, behaving as rust-bitcoin's `TaprootBuilder::with_huffman_tree` (two lowest weights joined, `u32` saturating sum, ties by larger node hash, empty input `EmptyTree`, depth > 128 `TreeTooDeep`). Additive; no behaviour change to existing functions.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private CompactSize encoder in `tree.zig` is replaced by `bitcointx.encodeCompactSize`; `bitcointx` is now a dependency (it only depends on `bip340`, no cycle).
 - **2026-10-10** — tests: deterministic fuzz driver `TAPROOT_FUZZ` (testkit) over random complete script trees (every control-block path recomputes the Merkle root, a changed script does not, output key equals the tweak of the root) and tweakSecretKey/tweakPublicKey agreement. No change to the library code.

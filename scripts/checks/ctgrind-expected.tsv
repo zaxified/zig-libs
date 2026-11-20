@@ -1027,7 +1027,7 @@ musig2	ReleaseFast	sign	1	<=103	8c50aacfe75ce8bd	2a2f275cd0c5c7c5
 # Source pin moved 2026-10-02 after the BIP341 script trees (7a956ff7): --stacks
 # reads the same nine, at shifted lines -- group.zig:400 x2, taproot
 # root.zig:279/286 (the same two `Scalar.fromBytes` canonicality checks).
-taproot	ReleaseFast	secret	1	8	223d5d70a31b0e56	966e0c7b70c18936
+taproot	ReleaseFast	secret	1	8	a1f2b815bca57c34	966e0c7b70c18936
 # adaptor presign 2026-11-13 (k256 weak-field ecmult): reads 80, inside the <=90 bound (row not
 # changed). preSign's mandatory self-check runs preVerify -> k256 ecmult on values derived from the
 # tainted key (the published key and presignature): wNAF recoding / table-index / topDigit branches
@@ -1360,7 +1360,7 @@ bip32	ReleaseFast	xprv	1	0	b13e4a4f0823039c	446d9a369af15cee
 # gave 6 in-file — the row sees a regression of the check base58 does not
 # cover. Source digest covers btcaddr/src only: re-run `--check btcaddr`
 # after a bech32 edit (as for bip32/xprv).
-btcaddr	ReleaseFast	wif	1	0	5521e73c8b3cc5ec	3724f47a31d201ab
+btcaddr	ReleaseFast	wif	1	0	b19fa46ba92994de	3724f47a31d201ab
 # aesgcm — added 2026-09-28. Key AND plaintext tainted (so round keys, H
 # powers, keystream, ciphertext and tag are all secret-derived to memcheck).
 # The 4 in-file contexts per row are ONE line, the tag-check branch

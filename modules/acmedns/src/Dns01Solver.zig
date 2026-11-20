@@ -84,6 +84,8 @@ pub const Options = struct {
 /// One published record, kept until its cleanup. Heap-allocated so the
 /// record's slices into its own buffers stay valid as the list grows.
 const Pending = struct {
+    /// How many `present` calls (of this domain and value) await a `cleanup`.
+    refs: u32 = 1,
     domain: []u8 = &.{},
     value: []u8 = &.{},
     token: []u8 = &.{},
@@ -97,6 +99,9 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Dns01Solver {
     return .{ .io = io, .gpa = gpa, .options = options };
 }
 
+/// Frees the solver's own memory. Records still pending are NOT removed from DNS (that is network
+/// I/O, and `deinit` cannot report a failure): call `cleanup` for each first; `pendingCount() != 0`
+/// says some are left.
 pub fn deinit(s: *Dns01Solver) void {
     for (s.pending.items) |p| s.destroyPending(p);
     s.pending.deinit(s.gpa);
@@ -138,6 +143,14 @@ pub const Error = zone.Error || root.PublishError || error{
 pub fn present(s: *Dns01Solver, domain: []const u8, token: []const u8, key_authorization: []const u8) Error!void {
     s.note = "";
     const value = acme.jws.dns01TxtValueFromKeyAuthorization(key_authorization);
+
+    // The same (domain, value) again: the record is already published (and waited for), so this
+    // call only takes a reference; the DNS value goes at the last `cleanup`, not the first.
+    for (s.pending.items) |q| {
+        if (!zone.eqlName(q.domain, domain) or !std.mem.eql(u8, q.value, &value)) continue;
+        q.refs += 1;
+        return;
+    }
 
     const p = try s.gpa.create(Pending);
     p.* = .{};
@@ -210,6 +223,10 @@ pub fn present(s: *Dns01Solver, domain: []const u8, token: []const u8, key_autho
 pub fn cleanup(s: *Dns01Solver, domain: []const u8, value: []const u8) void {
     for (s.pending.items, 0..) |p, i| {
         if (!zone.eqlName(p.domain, domain) or !std.mem.eql(u8, p.value, value)) continue;
+        if (p.refs > 1) {
+            p.refs -= 1;
+            return;
+        }
         s.options.publisher.cleanup(s.options.publisher.ctx, &p.record);
         _ = s.pending.orderedRemove(i);
         s.destroyPending(p);
@@ -217,7 +234,7 @@ pub fn cleanup(s: *Dns01Solver, domain: []const u8, value: []const u8) void {
     }
 }
 
-/// How many published records await their cleanup.
+/// How many published records await their cleanup (a record presented twice counts once).
 pub fn pendingCount(s: *const Dns01Solver) usize {
     return s.pending.items.len;
 }

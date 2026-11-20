@@ -107,6 +107,23 @@ test "present: a wildcard and its base keep two records at one name, cleaned one
     try testing.expectEqualStrings(&second, f.cleaned.items[0]);
 }
 
+test "present: the same domain and value twice is one record, removed at the last cleanup" {
+    var f: Fake = .{};
+    defer f.deinit();
+    var s = Dns01Solver.init(std.testing.io, testing.allocator, offline(&f));
+    defer s.deinit();
+    try s.present("example.org", "tok-a", "tok-a.thumb");
+    try s.present("example.org", "tok-a", "tok-a.thumb");
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+    const v = acme.jws.dns01TxtValueFromKeyAuthorization("tok-a.thumb");
+    s.cleanup("example.org", &v);
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+    try testing.expectEqual(@as(usize, 0), f.cleaned.items.len);
+    s.cleanup("example.org", &v);
+    try testing.expectEqual(@as(usize, 0), s.pendingCount());
+    try testing.expectEqual(@as(usize, 1), f.cleaned.items.len);
+}
+
 test "present: a failing publisher leaves nothing pending and says why" {
     var f: Fake = .{ .fail = true };
     defer f.deinit();

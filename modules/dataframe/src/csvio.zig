@@ -1504,7 +1504,7 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
         for (sel, 0..) |fi, i| {
             const c = f.columns[fi];
             if (i != 0) try w.writeByte(opts.delimiter);
-            if (single and c.name.len == 0) try writeEmptyQuoted(w, opts) else try csvstream.writeField(w, c.name, if (opts.quote_style == .non_numeric) always else base);
+            if (single and c.name.len == 0) try csvstream.writeFieldQuoted(w, "", base) else try csvstream.writeField(w, c.name, if (opts.quote_style == .non_numeric) always else base);
         }
         try w.writeAll(term);
     }
@@ -1619,9 +1619,9 @@ pub fn writeCsv(a: std.mem.Allocator, w: *std.Io.Writer, f: Frame, opts: CsvWrit
             }
             const missing = v == .null or (v == .float and std.math.isNan(v.float));
             if (missing) {
-                if (single and s.len == 0) try writeEmptyQuoted(w, opts) else try csvstream.writeField(w, s, base);
+                if (single and s.len == 0) try csvstream.writeFieldQuoted(w, "", base) else try csvstream.writeField(w, s, base);
             } else if (is_text_value and s.len == 0) {
-                try writeEmptyQuoted(w, opts);
+                try csvstream.writeFieldQuoted(w, "", base);
             } else {
                 try csvstream.writeField(w, s, if (opts.quote_style == .non_numeric and text_like) always else base);
             }
@@ -1643,16 +1643,4 @@ fn formatSci(buf: []u8, x: f64, prec: ?u8) []const u8 {
 fn formatPlain(buf: []u8, x: f64, prec: ?u8) []const u8 {
     if (prec) |p| return textio.formatFloatFixed(buf, x, @min(p, 22));
     return std.fmt.bufPrint(buf, "{d}", .{x}) catch "";
-}
-
-/// zig-libs request: csvstream -- `writeField` cannot quote one field that `necessary` would
-/// leave bare (an empty text that must stay distinct from a null, polars' `write_csv`), so the two
-/// quote bytes are written here; a per-field `force_quote` in `WriteOptions` would replace this.
-///
-/// An empty field as `""`: a text that is empty, and a lone empty field (which would
-/// read back as a blank line, so csvstream's `writeRecord` quotes it too).
-fn writeEmptyQuoted(w: *std.Io.Writer, opts: CsvWriteOptions) std.Io.Writer.Error!void {
-    if (opts.quote == 0 or opts.quote_style == .never) return;
-    try w.writeByte(opts.quote);
-    try w.writeByte(opts.quote);
 }

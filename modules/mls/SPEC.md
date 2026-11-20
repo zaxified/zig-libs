@@ -1446,6 +1446,7 @@ AEAD is the sibling `aesgcm`'s (std's AES-GCM bulk path is slow on Zig 0.17,
   checks against state outside the module.
 - **Following §12.4.2's bullet over §12.4 for "path required".** Not a refusal but
   a decision recorded under Part 8: the module follows §12.4's `pathRequiredTypes`.
+- **Relaxing the receive side to §12.4.2's narrower "path required" bullet** — mls-rs's `path_update_required` (message processing and commit creation alike) requires a path for an empty list, Update, Remove, ExternalInit and GroupContextExtensions, i.e. §12.4's `pathRequiredTypes` as this module does; following the majority and the registry's "Path Required" column, the receive side is not relaxed.
 
 ## Open
 
@@ -1519,16 +1520,9 @@ Gaps that are unverified rather than unbuilt:
   duplicated. The clean fix is upstream in `hpke`: export `suiteIdOf`, or have
   `Context` carry its own suite id.
 - **Measure the bulk `PrivateMessage` path** (AEAD from the sibling `aesgcm`; Zig 0.17, #36256); the card says `Performance: not measured`.
-- **Appendix C's `common_ancestor_semantic`/`common_ancestor_direct` in
-  `treemath.zig`.** Not ported: `tree-math.json` does not publish them
-  (`root`/`left`/`right`/`parent`/`sibling` only) and no code needs them, since
-  `group.commonAncestor` and `treekem.Staged.pathSecretFor` serve the two uses.
-  A completeness item with no consumer.
 - **Standalone `Add`/`Update`/`Remove`/`PreSharedKey`/`ExternalInit`/
   `GroupContextExtensions` types in `content.zig`** (each is a `Proposal` union
   arm today): split them out when an extension proposal type needs a real struct.
 - **The secret tree's non-power-of-two shape has no upstream vector** (see
   *Open*); a vector, or a differential oracle over a 5-member group, would anchor
   it.
-- **§12.4 versus §12.4.2 on "path required"** (see *Open*): relax the receive side
-  if the disagreement ever becomes observable against a recorded session.

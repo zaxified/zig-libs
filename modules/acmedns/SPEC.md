@@ -52,7 +52,10 @@ only; see *Backlog / deferred*).
   a published record can never be forgotten for want of memory. A publisher that fails and a wait that
   fails both clean up themselves (best effort: the update may have landed before the failure showed;
   publishers treat removing an absent record as a no-op), because `acme.Client` calls cleanup only
-  after a successful present.
+  after a successful present. The same (domain, value) presented twice is one record with a reference
+  count (the second `present` publishes and waits for nothing); the DNS value is removed at the last
+  `cleanup`. `deinit` removes nothing from DNS (it is network I/O and cannot report): call `cleanup`
+  first, `pendingCount` says what is left.
 - **Propagation:** the zone's NS names → their addresses (`zone.nameserverIps`, resolved on every pass; a
   name whose lookup fails counts as "not yet" under `require_all_authoritative`, never as absent, and a
   name with no address at all is left out) → each server asked with RD clear; a server
@@ -132,9 +135,6 @@ loop, NS lookup. ⚠ The acme-dns side is a STAND-IN written from joohoi/acme-dn
 ## Backlog / deferred
 
 - **L2** `presentFn` maps `Canceled` to `SolverFailed` (acme's `SolverError` has no `Canceled`).
-- **L7** the same (domain, value) presented twice: each `present` keeps its own record, but the publisher
-  removes one DNS value, so cleanup of the first removes it for both — refcount or refuse the duplicate.
-- **N1** `deinit` with pending records does not clean them up (document or clean).
 - **N3** RAW `Exec` puts the key authorization in argv (visible in `/proc`, as lego RAW) — add a
   threat-model sentence.
 - **N4** `AcmeDns.register`'s password is freed unwiped by `Parsed.deinit` — document.

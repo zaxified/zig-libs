@@ -147,7 +147,7 @@ suite's documents, so nothing of yaml-test-suite is vendored here.
 
 ## Not provided
 
-Only the core schema is resolved (the failsafe and JSON schemas are not; an explicit `!!binary`, `!!timestamp`, `!!set`
+The core schema is the default (`ComposeOptions.schema = .json` / `.failsafe` select the other two of §10: JSON resolves only `null`, `true`/`false` and JSON-shaped numbers, failsafe keeps every plain scalar a string; an explicit `!!binary`, `!!timestamp`, `!!set`
 or `!!omap` is validated and kept as text or as its mapping / sequence value, malformed is `error.BadTaggedScalar`:
 `yaml.decodeBinary` returns a `!!binary` scalar's bytes, `yaml.parseTimestamp` a `!!timestamp`'s fields). Integers
 outside `i64` stay strings holding their exact text (SPEC.md §9). Input is UTF-8 only: a UTF-16/UTF-32 BOM is

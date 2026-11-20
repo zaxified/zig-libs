@@ -191,6 +191,48 @@ pub fn copath(x: usize, n_leaves: usize, out: []usize) Error![]usize {
     return out[0..dp.len];
 }
 
+/// RFC 9420 Appendix C `common_ancestor_semantic(x, y, n)`: the lowest node on both `x`'s and `y`'s
+/// path to the root (each path including its own start node); the root when they share none. Works
+/// on any tree size (it walks the real `parent` links).
+pub fn common_ancestor_semantic(x: usize, y: usize, n_leaves: usize) Error!usize {
+    var bx: [max_path_len]usize = undefined;
+    var by: [max_path_len]usize = undefined;
+    const px = try direct_path(x, n_leaves, &bx);
+    const py = try direct_path(y, n_leaves, &by);
+    var best: ?usize = null;
+    // The candidates are x and its direct path, tested for membership in y's.
+    var cand: usize = x;
+    var i: usize = 0;
+    while (true) {
+        var on_y = cand == y;
+        for (py) |q| on_y = on_y or q == cand;
+        if (on_y and (best == null or level(cand) < level(best.?))) best = cand;
+        if (i == px.len) break;
+        cand = px[i];
+        i += 1;
+    }
+    return best orelse root(n_leaves);
+}
+
+/// RFC 9420 Appendix C `common_ancestor_direct(x, y)`: the same node by bit arithmetic on the array
+/// indices, valid for a tree whose size is a power of two (a "full" tree); it takes no tree size.
+pub fn common_ancestor_direct(x: usize, y: usize) usize {
+    // One is an ancestor of the other.
+    const lx = level(x) + 1;
+    const ly = level(y) + 1;
+    if (lx <= ly and (x >> @intCast(ly)) == (y >> @intCast(ly))) return y;
+    if (ly <= lx and (x >> @intCast(lx)) == (y >> @intCast(lx))) return x;
+    var xn = x;
+    var yn = y;
+    var k: usize = 0;
+    while (xn != yn) {
+        xn >>= 1;
+        yn >>= 1;
+        k += 1;
+    }
+    return (xn << @intCast(k)) + (@as(usize, 1) << @intCast(k - 1)) - 1;
+}
+
 // ── tests ─────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -296,5 +338,26 @@ test "direct_path/copath self-consistency across every node of a 512-leaf tree" 
         for (dp[0 .. dp.len - 1], 1..) |node, i| {
             try testing.expectEqual(sibling(node, n_leaves).?, cp[i]);
         }
+    }
+}
+
+test "common_ancestor_semantic/direct: hand values in the 4-leaf tree, and they agree on every pair of full trees" {
+    // Leaves 0,2,4,6; parents 1 (0,2), 5 (4,6); root 3.
+    try testing.expectEqual(@as(usize, 1), try common_ancestor_semantic(0, 2, 4));
+    try testing.expectEqual(@as(usize, 3), try common_ancestor_semantic(0, 4, 4));
+    try testing.expectEqual(@as(usize, 1), try common_ancestor_semantic(1, 0, 4)); // an ancestor of the other
+    try testing.expectEqual(@as(usize, 6), try common_ancestor_semantic(6, 6, 4));
+    try testing.expectEqual(@as(usize, 1), common_ancestor_direct(0, 2));
+    try testing.expectEqual(@as(usize, 3), common_ancestor_direct(0, 4));
+    try testing.expectEqual(@as(usize, 1), common_ancestor_direct(1, 0));
+    try testing.expectEqual(@as(usize, 5), common_ancestor_direct(4, 6));
+    var n: usize = 1;
+    while (n <= 64) : (n *= 2) {
+        const w = node_width(n);
+        for (0..w) |x| for (0..w) |y| {
+            const sem = try common_ancestor_semantic(x, y, n);
+            try testing.expectEqual(sem, common_ancestor_direct(x, y));
+            try testing.expectEqual(sem, try common_ancestor_semantic(y, x, n));
+        };
     }
 }

@@ -246,7 +246,7 @@ Run `scripts/modtest pbb` (Debug), `-Doptimize=ReleaseFast`, and `zig fmt --chec
 ## Backlog / deferred
 
 - **I-SID to group B-MAC helper.** The 01-1E-83 + I-SID derivation used for SPB
-  multicast B-DAs *(inferred from vendor practice, unverified)*; this SPEC currently
+  multicast B-DAs *(inferred from vendor practice; secondary descriptions agree: OUI 00-1E-83 + the 3-octet I-SID with the I/G bit set, so I-SID 1 is 01-1E-83-00-00-01; the IEEE 802.1Q clause text was not readable, so no primary citation yet)*; this SPEC currently
   calls it a provisioning concern. Ask before adding. Effort: small. Fits CONVENTIONS §2.
 
 ## Anchoring

@@ -206,6 +206,7 @@ allowed origin, which is the nature of the feature — pattern a zone you contro
 - **`OptionsSuccessStatus`** (rs/cors, default 204; a few legacy clients choke on 204): not offered. No
   consumer, and the pass-through lets a handler pick any status. Tiny to add if asked (one `u16` option).
 - **Applying `applyActual` after `next.run`:** rejected, see *Header timing vs. `ResponseWriter.reset()`*.
+- **A single-label `*` mode for `Origins.patterns`** — `*` spans dots (`https://*.example.com` matches `a.b.example.com`), as rs/cors' wildcard origins do; no CORS library found offers a per-pattern single-label switch, so a caller who wants one label lists the origins exactly.
 
 ## Verification
 
@@ -254,8 +255,6 @@ server's (parsing the longer head, writing more headers), which tower-http's net
 
 ## Backlog / deferred
 
-- **Single-label `*`:** a pattern mode where `*` may not span dots (a possible tightening of
-  `Origins.patterns`). Not asked for; rs/cors spans dots, as `patterns` does.
 
 ## Anchoring
 

@@ -76,12 +76,10 @@ No fuzz harness (the card's `**Hardening:**` line says why), no oracle: class C,
   that keeps it O(1) when the table is nearly full.
 - **No anti-spoofing token and no unguessable ids.** Ids are sequential and predictable by design
   (`src/root.zig`); a caller that must resist forged replies adds its own token.
+- **A wider id space or composite key (identifier + sequence)** — the reference (a 16-bit sequence) does not offer it; a ping implementation matching on identifier as well (surge-ping) keeps one `seqmap` per identifier, which composes without a second key type.
 
 ## Backlog / deferred
 
-- Optional wider id space or composite key (identifier + sequence, as surge-ping matches replies) for ICMP-style
-  protocols with a 16-bit identifier as well as a sequence. Small effort; fits CONVENTIONS §2. Low priority: a 16-bit
-  sequence is what the reference does *(inferred)*.
 
 ## Anchoring
 

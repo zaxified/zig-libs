@@ -15,7 +15,7 @@ blocks that only share the "single owner drives the loop" discipline:
   RUNNING→DONE half on a detached thread that fork/exec/waitpid's an arbitrary
   argv, keeping the between-fork-and-exec window async-signal-safe (raw
   syscalls, no allocation in the child). `spawnDetachedEnv` adds a child
-  environment (`Env`: `.empty` / `.inherit` / `.list`).
+  environment (`Env`: `.empty` / `.inherit` / `.list` / `.overlay`).
 - **`Waker`** — an eventfd (self-pipe fallback) a worker writes when a job
   finishes, so a `poll` on `waker.fd()` returns at once (libuv `uv_async_send`).
   `JobTable.setWaker` makes `finish` signal it.

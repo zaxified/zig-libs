@@ -151,6 +151,35 @@ never followed.
   each returned `StreamEvent`'s memory is only valid until the next
   `next()` call or `deinit()`.
 
+## Retrying
+
+The Anthropic SDKs retry 429/5xx by default; this client never retries. Wrap one call in a
+`resilience.run` operation (sketch, not compiled here): retry transport failures, timeouts and the
+overload / rate-limit / server-error answers, and let every other error (`InvalidBeta`,
+`MalformedResponse`, a 400-class request mistake) propagate at once.
+
+```zig
+const Op = struct {
+    client: *llmclient.Client,
+    gpa: std.mem.Allocator,
+    req: llmclient.MessageRequest,
+    pub fn call(self: *Op) llmclient.Client.Error!std.json.Parsed(llmclient.Message) {
+        return self.client.create(self.gpa, self.req);
+    }
+};
+// `error.UnexpectedStatus` stands for any non-2xx answer, a 400 included: to retry only
+// 429/5xx, check `client.lastErrorBody()` for the error `type` (`"rate_limit_error"`,
+// `"overloaded_error"`, `"api_error"`) inside `call` and return a caller-defined error for
+// the other bodies, which `retryable` then refuses.
+fn retryable(e: anyerror) bool {
+    return e == error.HttpFailed or e == error.Timeout or e == error.UnexpectedStatus;
+}
+var op: Op = .{ .client = &client, .gpa = gpa, .req = req };
+const msg = try resilience.run(&op, .{ .retry = .{ .max_attempts = 4, .retryable = &retryable } });
+```
+
+A streamed call can be retried only before its first event has been consumed.
+
 ## Not provided
 
 OpenAI-compatible mode, the Batch and Files APIs (and `file` sources), block-array `tool_result` content,

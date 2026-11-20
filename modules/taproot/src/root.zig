@@ -61,6 +61,21 @@ pub const meta = .{
 /// `bip340.hash`).
 pub const tap_tweak_tag = "TapTweak";
 
+/// BIP341's "nothing up my sleeve" point `H`, as an x-only key: the x-coordinate is
+/// `SHA256(0x04 || Gx || Gy)` (the uncompressed secp256k1 generator), and `lift_x` of it exists, so no
+/// one knows a secret key for it. Used directly as the internal key it makes the key path unspendable
+/// (a script-path-only output); BIP341 recommends `H + rG` for a random `r` to also hide that no key
+/// path exists, which is the caller's (needs point addition on the caller's `r`).
+pub const nums_internal_x: [32]u8 = .{
+    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
+    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
+};
+
+/// `nums_internal_x` as a `bip340.XOnlyPublicKey` (BIP341's `H`), for `tweakPublicKey`.
+pub fn numsInternalKey() bip340.XOnlyPublicKey {
+    return bip340.XOnlyPublicKey.fromBytes(nums_internal_x) catch unreachable; // H lifts: pinned by a test
+}
+
 /// BIP341's tweak hash: `t_hash = taggedHash("TapTweak", P_x ‖
 /// merkle_root)`.
 ///
