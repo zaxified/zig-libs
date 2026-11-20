@@ -1889,6 +1889,82 @@ test "scanAny: errors match scan, and a blank image is NotFound under every tran
     try t.expectError(Error.ScratchTooSmall, scanAny(img, scratch[0..10], .{}));
 }
 
+/// A symbol whose finders and format information are intact but whose data area
+/// is wrecked past what the error correction can repair: it is located, sampled
+/// and still unreadable.
+fn wreck(m: *qr.Matrix) void {
+    var y: u16 = m.size / 2;
+    while (y < m.size) : (y += 1) {
+        var x: u16 = m.size / 2;
+        while (x < m.size) : (x += 1) m.setDark(x, y, !m.isDark(x, y));
+    }
+}
+
+test "scanAny: an unreadable symbol comes back as the plain attempt's grid, never as a retry's" {
+    const t = std.testing;
+    var m: qr.Matrix = undefined;
+    var pixels: [256 * 256]u8 = undefined;
+    var scratch: [scratchSize(256, 256)]u8 = undefined;
+    var out: [256]u8 = undefined;
+    try qr.encode(&m, "HELLO WORLD", .{ .ecc = .quartile });
+    wreck(&m);
+
+    const forms = [_]struct { inv: bool, mir: bool }{
+        .{ .inv = false, .mir = false },
+        .{ .inv = false, .mir = true },
+        .{ .inv = true, .mir = true },
+    };
+    const opts = [_]ScanOptions{
+        .{},
+        .{ .try_inverted = false },
+        .{ .try_mirrored = false },
+        .{ .try_inverted = false, .try_mirrored = false },
+    };
+    var plain_found: usize = 0;
+    for (forms) |f| {
+        for (opts) |o| {
+            const img = render(&m, 5, &pixels);
+            if (f.inv) invertLuma(&pixels, img);
+            if (f.mir) mirrorLuma(&pixels, img);
+            const plain = scan(img, &scratch);
+            const any = scanAny(img, &scratch, o);
+            if (plain) |a| {
+                plain_found += 1;
+                // The plain attempt's best-effort grid is what scanAny falls back to.
+                const r = try any;
+                try t.expectEqual(Transform.none, r.transform);
+                try expectGrid(&a.matrix, &r.found.matrix);
+                var fm = r.found.matrix;
+                try t.expect(std.meta.isError(qr.decode(&fm, &out)));
+            } else |_| {
+                if (any) |r| {
+                    try t.expectEqual(Transform.none, r.transform);
+                } else |e| try t.expectEqual(Error.NotFound, e);
+            }
+        }
+    }
+    // The plain, unmirrored, wrecked symbol is located (precondition of the above).
+    try t.expect(plain_found > 0);
+}
+
+test "scanAny: with both retries off a mirrored or inverted symbol is not read" {
+    var m: qr.Matrix = undefined;
+    var pixels: [256 * 256]u8 = undefined;
+    var scratch: [scratchSize(256, 256)]u8 = undefined;
+    try qr.encode(&m, "NO RETRIES", .{ .ecc = .quartile });
+    const off: ScanOptions = .{ .try_inverted = false, .try_mirrored = false };
+    var img = render(&m, 5, &pixels);
+    mirrorLuma(&pixels, img);
+    try expectNotRead(scanAny(img, &scratch, off));
+    img = render(&m, 5, &pixels);
+    invertLuma(&pixels, img);
+    try expectNotRead(scanAny(img, &scratch, off));
+    img = render(&m, 5, &pixels);
+    invertLuma(&pixels, img);
+    mirrorLuma(&pixels, img);
+    try expectNotRead(scanAny(img, &scratch, off));
+}
+
 test "Bitmap.invert and mirror: involutions that move the right pixels" {
     const t = std.testing;
     var mem: [(23 * 5 + 7) / 8]u8 = undefined;
@@ -1905,6 +1981,18 @@ test "Bitmap.invert and mirror: involutions that move the right pixels" {
     try t.expect(!b.get(0, 2) and b.get(1, 2));
     b.invert();
     try t.expect(b.get(0, 2) and !b.get(1, 2));
+}
+
+test "Bitmap.mirror: an even width swaps the two centre columns once" {
+    const t = std.testing;
+    var mem: [(24 * 4 + 7) / 8]u8 = undefined;
+    @memset(&mem, 0);
+    var b: Bitmap = .{ .bits = &mem, .width = 24, .height = 4 };
+    b.set(0, 1, true);
+    b.set(11, 3, true);
+    b.mirror();
+    try t.expect(b.get(23, 1) and b.get(12, 3));
+    try t.expect(!b.get(0, 1) and !b.get(11, 3));
 }
 
 /// Render rotated by `deg` about the image centre, by inverse-mapping each

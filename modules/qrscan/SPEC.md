@@ -6,7 +6,7 @@
 
 **Scope:** mvp — zxing-cpp 3.1.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-04 · mutation 2026-10-05 (26/33, 6 eq) · src ?
+**Audit:** review 2026-09-04 · mutation 2026-11-21 (60/67, 6 eq) · src 2b9d01270a7d83ea
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, QRSCAN_FUZZ) · ct n/a — QR decoding (keyword review, 2026-10-07)
 
@@ -301,7 +301,10 @@ sampling mistakes up to its capability.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
   the delta runs after it. That run's one survivor without a test is the ring test's `!= 0` (label table exhausted)
   clause: reaching it needs an image that exhausts the 4096 labels and then places a decoy whose centre was labelled
-  before exhaustion and whose bars were not.
+  before exhaustion and whose bars were not. `scanAny`, `Transform`, `ScanOptions`, `scanBits`' `readable` flag, the
+  `validate` call sites and `Bitmap.invert`/`mirror` were covered by a delta run of 34 mutants: 27 killed at first, the
+  other 7 by new tests (an unreadable symbol returns the plain attempt's grid and never a retry's, with both retries
+  off nothing is retried, an even-width mirror), so all 34 are killed.
 
 ## Anchoring
 

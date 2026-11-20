@@ -6,7 +6,7 @@
 
 **Scope:** core — Casbin v3.11.0 (RBAC + ABAC) (surveyed 2026-09-30); raised from mvp 2026-09-30 with revoke/remove
 
-**Audit:** review 2026-08-06 · mutation 2026-10-04 (54/55, 1 eq) · src ?
+**Audit:** review 2026-08-06 · mutation 2026-11-21 (84/86, 2 eq) · src 4b0ac7c1bc841583
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — role permissions, no keys (keyword review, 2026-10-07)
 
@@ -245,12 +245,12 @@ minimal change that flips the outcome (a wrong field, a missing edge, an unmet b
 proving each check actually has discriminating power rather than passing by default-deny alone.
 
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
-  run and the delta runs after it.
-
-## Open
-
-- **Pattern permissions (`keyMatch`, `Engine.initWithMatch`) have had no mutation run:** the card's mutation entry
-  covers the module as it was before they were added.
+  run and the delta runs after it. The pattern permissions (`keyMatch`, `Engine.initWithMatch`, the exact-versus-pattern
+  split in `check` and `addPermission`) were covered by a delta run of 31 mutants: 30 killed, 1 equivalent (`star = p`
+  instead of `p + 1` in `keyMatch`: the backtrack re-enters the `*` branch, which resets `mark` to the same value, one
+  extra iteration). It found three missing tests, now present: a stale `mark` re-reading text before the star, a stale
+  pattern index after a failed partial suffix match, and `addPermission` treating a pattern-covered permission as
+  already stored.
 
 ## Backlog / deferred
 

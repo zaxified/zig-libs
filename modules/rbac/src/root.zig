@@ -947,6 +947,36 @@ test "rbac: keyMatch rules" {
     try testing.expect(!km("/api/*", "/api"));
 }
 
+test "rbac: keyMatch backtracking never re-reads text before the star or keeps a stale pattern index" {
+    const km = rbac.keyMatch;
+    // The suffix "bX" must not be re-tried at a text position before the star.
+    try testing.expect(!km("ab*bX", "abX"));
+    try testing.expect(km("ab*bX", "abXbX"));
+    // After a failed partial suffix match the pattern index restarts after the star.
+    try testing.expect(!km("*ab", "acb"));
+    try testing.expect(km("*ab", "aab"));
+    try testing.expect(!km("a*bc", "abxc"));
+    try testing.expect(km("a*bc", "abxbc"));
+}
+
+test "rbac: key_match engine stores specific permissions that a pattern already covers" {
+    var e = rbac.Engine.initWithMatch(testing.allocator, .key_match);
+    defer e.deinit();
+    try e.addRole("r");
+    try e.addPermission("r", .{ .action = "read:*", .resource = "/api/*" });
+    // Covered by the pattern, but a distinct stored entry (idempotence is exact).
+    try e.addPermission("r", .{ .action = "read:doc", .resource = "/api/x" });
+    try e.assignRole("u", "r");
+    // Removal is exact too: the specific entry goes, the pattern stays.
+    try testing.expect(try e.removePermission("r", .{ .action = "read:doc", .resource = "/api/x" }));
+    try testing.expect(e.check("u", "read:doc", "/api/x").isPermit());
+    // Re-add the specific one, drop the pattern: the specific one still grants alone.
+    try e.addPermission("r", .{ .action = "read:doc", .resource = "/api/x" });
+    try testing.expect(try e.removePermission("r", .{ .action = "read:*", .resource = "/api/*" }));
+    try testing.expect(e.check("u", "read:doc", "/api/x").isPermit());
+    try testing.expect(!e.check("u", "read:other", "/api/x").isPermit());
+}
+
 test "rbac: a pathological pattern stays fast" {
     const n = 3000;
     var pat: [2 * n + 1]u8 = undefined;
