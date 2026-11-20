@@ -99,9 +99,10 @@ Prometheus's index. This is why the middleware:
   `.status = .code` opts into exact codes (still bounded series count,
   ~×10; the per-request lookup cost is O(1) regardless of how many
   *other*, unrelated families the registry holds);
-- does **not** label by path. A route-pattern label (`/users/:id`, bounded)
-  is not wired in yet (`router` now exposes `Ctx.matchedPattern()`, so it
-  can be); labeling by raw path would be the footgun above.
+- does **not** label by path. `.route_label = true` opts into a `route` label
+  carrying the matched route's pattern (`/users/:id`, so bounded by the route
+  table; `unmatched` for the 404/405 fallbacks); labeling by raw path would be
+  the footgun above.
 
 Instruments cap at `max_labels` (8) label pairs. The registry also refuses a
 new series past two limits, so a mistake is an error rather than a leak: a
@@ -198,8 +199,8 @@ Deviations from client_golang (noted in doc comments):
 Native histograms and the protobuf exposition, label currying, `Gatherers`,
 the Go-runtime collector, a push gateway / remote-write, float counters (use
 `counterFunc`), UTF-8 metric names, authentication of `/metrics` (put
-`aaa-gate` in front), a route-pattern label on the request middleware and
-`_created` samples. Reasons and the open items: `SPEC.md` *What is
+`aaa-gate` in front) and an exact request size. `_created` samples are opt-in
+(`Registry.created_clock`). Reasons and the open items: `SPEC.md` *What is
 deliberately not done* and *Backlog / deferred*.
 
 ## Verification

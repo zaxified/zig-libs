@@ -692,6 +692,9 @@ const Child = struct {
     /// Values in the family's label-name order.
     label_values: []const []const u8,
     data: Instrument,
+    /// Unix time (ns) the series was created, read from `Registry.created_clock`
+    /// when that was set; null otherwise (no `_created` sample).
+    created_ns: ?i64 = null,
 
     fn destroy(c: *Child, gpa: Allocator) void {
         for (c.label_values) |v| gpa.free(v);
@@ -857,6 +860,14 @@ pub const Registry = struct {
     /// Time source for summaries' sliding windows, captured by each summary
     /// series when it is created — set it before registering summaries.
     clock: Clock = .monotonic,
+    /// Opt-in OpenMetrics `_created` samples (client_golang's
+    /// `EnableOpenMetricsTextCreatedSamples`): when set (`.system` for the
+    /// real time), every counter, histogram and summary series created AFTER
+    /// it records its creation time and the OpenMetrics exposition carries
+    /// `<name>_created{labels} <unix seconds>` after its samples. Set it
+    /// before registering; null (default) writes none. A callback series, a
+    /// collector's sample and a gauge never have one (as in client_golang).
+    created_clock: ?clock_lib.WallClock = null,
     /// Longest label value a NEW series may carry (bytes); longer →
     /// `error.LabelValueTooLong`. With `max_series_per_family` this bounds
     /// what a label fed from request data can cost (the cardinality
@@ -1242,6 +1253,7 @@ pub const Registry = struct {
         }
         c.* = .{
             .label_values = owned,
+            .created_ns = if (r.created_clock) |wc| wc.now() else null,
             .data = switch (fam.kind) {
                 .counter => .{ .counter = .{ .exemplars = .{ .gpa = gpa } } },
                 .gauge => .{ .gauge = .{} },
@@ -1401,8 +1413,8 @@ pub const Registry = struct {
     /// `expfmt` writes it): a counter family named `x_total` is announced
     /// as `x` and its sample keeps `x_total` (one without the suffix is
     /// `unknown`), HELP escapes `"` too, values are OpenMetrics floats
-    /// (`1.0`, `1e+06`), and the output ends in `# EOF`. No `_created`
-    /// samples (client_golang's default) and no exemplars.
+    /// (`1.0`, `1e+06`), and the output ends in `# EOF`. `_created` samples
+    /// only with `created_clock` set (client_golang's default has none).
     pub fn writeOpenMetrics(r: *Registry, w: *std.Io.Writer) std.Io.Writer.Error!void {
         return r.write(w, .openmetrics);
     }
@@ -1504,7 +1516,10 @@ pub const Registry = struct {
             try writeHeader(bw, fam.name, fam.help, fam.kind, format);
             for (entry.children) |c| {
                 switch (c.data) {
-                    .counter => |*ctr| try writeSampleEx(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .count = ctr.value() }, format, ctr.exemplars.slot(0)),
+                    .counter => |*ctr| {
+                        try writeSampleEx(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .count = ctr.value() }, format, ctr.exemplars.slot(0));
+                        try writeCreated(bw, fam, c, format);
+                    },
                     .counter_func => |f| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = f.f(f.ctx) }, format),
                     .gauge => |*g| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = g.value() }, format),
                     .gauge_func => |f| try writeSample(bw, fam.name, "", fam.label_names, c.label_values, null, .{ .float = f.f(f.ctx) }, format),
@@ -2007,6 +2022,21 @@ fn writeHistogram(w: *std.Io.Writer, fam: *const Family, c: *const Child, h: *Hi
     try writeSampleEx(w, fam.name, "_bucket", fam.label_names, c.label_values, leLabel(std.math.inf(f64)), .{ .count = h.observation_count }, format, h.exemplars.slot(h.upper_bounds.len));
     try writeSample(w, fam.name, "_sum", fam.label_names, c.label_values, null, .{ .float = h.observation_sum }, format);
     try writeSample(w, fam.name, "_count", fam.label_names, c.label_values, null, .{ .count = h.observation_count }, format);
+    try writeCreated(w, fam, c, format);
+}
+
+/// The `_created` sample of a series that recorded its creation time (see
+/// `Registry.created_clock`), OpenMetrics only: expfmt's `writeOpenMetricsCreated`
+/// (the counter's `_total` is trimmed before `_created`; the value is
+/// `float64(UnixNano())/1e9`).
+fn writeCreated(w: *std.Io.Writer, fam: *const Family, c: *const Child, format: Format) std.Io.Writer.Error!void {
+    if (format != .openmetrics) return;
+    const ns = c.created_ns orelse return;
+    const base = if (fam.kind == .counter and std.mem.endsWith(u8, fam.name, "_total"))
+        fam.name[0 .. fam.name.len - "_total".len]
+    else
+        fam.name;
+    try writeSample(w, base, "_created", fam.label_names, c.label_values, null, .{ .float = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s }, format);
 }
 
 fn writeSummary(w: *std.Io.Writer, fam: *const Family, c: *const Child, sm: *Summary, format: Format) std.Io.Writer.Error!void {
@@ -2014,6 +2044,7 @@ fn writeSummary(w: *std.Io.Writer, fam: *const Family, c: *const Child, sm: *Sum
     const objs = fam.summary_options.objectives;
     const snap = sm.snapshot(qs[0..objs.len]);
     try writeSummaryLines(w, fam.name, fam.label_names, c.label_values, objs, qs[0..objs.len], snap.sum, snap.count, format);
+    try writeCreated(w, fam, c, format);
 }
 
 fn writeSummaryLines(w: *std.Io.Writer, name: []const u8, label_names: []const []const u8, values: []const []const u8, objs: []const Objective, qs: []const f64, sum: f64, count: u64, format: Format) std.Io.Writer.Error!void {
@@ -2296,9 +2327,10 @@ const class_count = 6;
 /// tradeoff). Failures to create a series (OOM) skip recording but never
 /// fail the request.
 ///
-/// Route-pattern label: deliberately absent — `router.Ctx` does not expose
-/// the matched pattern (route enumeration is a planned router follow-up);
-/// labeling by raw `path` instead would be the cardinality footgun.
+/// Route-pattern label: opt-in (`Options.route_label`), the matched route's
+/// pattern from `router.Ctx.matchedPattern()` (`/users/:id`, bounded by the
+/// route table) and `unmatched` for the 404/405 fallbacks. Labeling by the raw
+/// request path is never offered: that is the cardinality footgun.
 pub const RequestMetrics = struct {
     registry: *Registry,
     options: Options,
@@ -2308,6 +2340,7 @@ pub const RequestMetrics = struct {
     histograms: [method_count]std.atomic.Value(?*Histogram) = @splat(.init(null)),
     request_size_histograms: [method_count]std.atomic.Value(?*Histogram) = @splat(.init(null)),
     response_size_histograms: [method_count]std.atomic.Value(?*Histogram) = @splat(.init(null)),
+    ttwh_histograms: [method_count]std.atomic.Value(?*Histogram) = @splat(.init(null)),
 
     pub const StatusGranularity = enum {
         /// `code="2xx"` … — bounded cardinality (default).
@@ -2341,8 +2374,24 @@ pub const RequestMetrics = struct {
         response_size_buckets: ?[]const f64 = null,
         response_size_name: []const u8 = "http_response_size_bytes",
         response_size_help: []const u8 = "HTTP response body size in bytes, by method.",
+        /// Time-to-write-header histogram bucket bounds in seconds (promhttp
+        /// `InstrumentHandlerTimeToWriteHeader`): the time from the start of the
+        /// request to the moment the response head was written (`label method`);
+        /// `null` = not recorded, nothing is registered (default). A response
+        /// whose head is still unsent when the handler returns is taken at that
+        /// moment (the earliest `http` can write it).
+        time_to_write_header_buckets: ?[]const f64 = null,
+        time_to_write_header_name: []const u8 = "http_request_time_to_write_header_seconds",
+        time_to_write_header_help: []const u8 = "Time to write the HTTP response head in seconds, by method.",
         /// Time source for the latency histogram — inject a fake in tests.
         clock: Clock = .monotonic,
+        /// Add a `route` label (the matched route's pattern, `unmatched` when no
+        /// route matched) to the counter, the latency histogram and the size
+        /// histograms. Off by default: the label set, and with it the
+        /// exposition, is unchanged. The cardinality is the route table's
+        /// (the registry's `max_series_per_family` still applies); every
+        /// request takes a locked registry lookup, as `.code` does.
+        route_label: bool = false,
         /// Optional structured access-log hook (see `AccessEntry`).
         on_request: ?*const fn (?*anyopaque, AccessEntry) void = null,
         /// Opaque context passed to `on_request`.
@@ -2370,7 +2419,7 @@ pub const RequestMetrics = struct {
             if (!std.math.isFinite(b)) return error.InvalidBuckets;
             if (i > 0 and b <= options.buckets[i - 1]) return error.InvalidBuckets;
         }
-        inline for (.{ options.request_size_buckets, options.response_size_buckets }) |ob| {
+        inline for (.{ options.request_size_buckets, options.response_size_buckets, options.time_to_write_header_buckets }) |ob| {
             if (ob) |bs| for (bs, 0..) |b, i| {
                 if (!std.math.isFinite(b)) return error.InvalidBuckets;
                 if (i > 0 and b <= bs[i - 1]) return error.InvalidBuckets;
@@ -2378,10 +2427,11 @@ pub const RequestMetrics = struct {
         }
         if (options.request_size_buckets != null and !validMetricName(options.request_size_name)) return error.InvalidName;
         if (options.response_size_buckets != null and !validMetricName(options.response_size_name)) return error.InvalidName;
+        if (options.time_to_write_header_buckets != null and !validMetricName(options.time_to_write_header_name)) return error.InvalidName;
         // A later registration may collide with an application family: drop
         // the families this call created (not ones that existed already and
         // matched) so a failed `init` leaves the registry as it found it.
-        var created: [5][]const u8 = undefined;
+        var created: [6][]const u8 = undefined;
         var n_created: usize = 0;
         errdefer {
             for (created[0..n_created]) |name| _ = registry.unregister(name);
@@ -2393,27 +2443,36 @@ pub const RequestMetrics = struct {
             n_created += 1;
         }
         const counter_new = !registry.hasFamily(options.counter_name);
-        _ = try registry.counter(options.counter_name, options.counter_help, &.{
-            .{ .name = "method", .value = @tagName(http.Method.get) },
-            .{ .name = "code", .value = classLabel(2) },
-        });
+        var lbuf: [3]Label = undefined;
+        _ = try registry.counter(options.counter_name, options.counter_help, requestLabels(
+            &lbuf,
+            @tagName(http.Method.get),
+            classLabel(2),
+            if (options.route_label) unmatched_route else null,
+        ));
         if (counter_new) {
             created[n_created] = options.counter_name;
             n_created += 1;
         }
         const histogram_new = !registry.hasFamily(options.histogram_name);
-        _ = try registry.histogram(options.histogram_name, options.histogram_help, &.{
-            .{ .name = "method", .value = @tagName(http.Method.get) },
-        }, options.buckets);
+        _ = try registry.histogram(options.histogram_name, options.histogram_help, requestLabels(
+            &lbuf,
+            @tagName(http.Method.get),
+            null,
+            if (options.route_label) unmatched_route else null,
+        ), options.buckets);
         if (histogram_new) {
             created[n_created] = options.histogram_name;
             n_created += 1;
         }
         if (options.request_size_buckets) |bs| {
             const new = !registry.hasFamily(options.request_size_name);
-            _ = try registry.histogram(options.request_size_name, options.request_size_help, &.{
-                .{ .name = "method", .value = @tagName(http.Method.get) },
-            }, bs);
+            _ = try registry.histogram(options.request_size_name, options.request_size_help, requestLabels(
+                &lbuf,
+                @tagName(http.Method.get),
+                null,
+                if (options.route_label) unmatched_route else null,
+            ), bs);
             if (new) {
                 created[n_created] = options.request_size_name;
                 n_created += 1;
@@ -2421,11 +2480,27 @@ pub const RequestMetrics = struct {
         }
         if (options.response_size_buckets) |bs| {
             const new = !registry.hasFamily(options.response_size_name);
-            _ = try registry.histogram(options.response_size_name, options.response_size_help, &.{
-                .{ .name = "method", .value = @tagName(http.Method.get) },
-            }, bs);
+            _ = try registry.histogram(options.response_size_name, options.response_size_help, requestLabels(
+                &lbuf,
+                @tagName(http.Method.get),
+                null,
+                if (options.route_label) unmatched_route else null,
+            ), bs);
             if (new) {
                 created[n_created] = options.response_size_name;
+                n_created += 1;
+            }
+        }
+        if (options.time_to_write_header_buckets) |bs| {
+            const new = !registry.hasFamily(options.time_to_write_header_name);
+            _ = try registry.histogram(options.time_to_write_header_name, options.time_to_write_header_help, requestLabels(
+                &lbuf,
+                @tagName(http.Method.get),
+                null,
+                if (options.route_label) unmatched_route else null,
+            ), bs);
+            if (new) {
+                created[n_created] = options.time_to_write_header_name;
                 n_created += 1;
             }
         }
@@ -2436,6 +2511,7 @@ pub const RequestMetrics = struct {
         registry.pin(options.histogram_name);
         if (options.request_size_buckets != null) registry.pin(options.request_size_name);
         if (options.response_size_buckets != null) registry.pin(options.response_size_name);
+        if (options.time_to_write_header_buckets != null) registry.pin(options.time_to_write_header_name);
         return .{
             .registry = registry,
             .options = options,
@@ -2454,10 +2530,16 @@ pub const RequestMetrics = struct {
         return .{ .state = m, .run = requestRun };
     }
 
-    fn counterFor(m: *RequestMetrics, method: http.Method, status: u16) RegisterError!*Counter {
+    /// The `route` label value of a request: the matched pattern, `unmatched` for a fallback.
+    fn routeFor(m: *const RequestMetrics, ctx: *const router.Ctx) ?[]const u8 {
+        if (!m.options.route_label) return null;
+        return ctx.matchedPattern() orelse unmatched_route;
+    }
+
+    fn counterFor(m: *RequestMetrics, method: http.Method, status: u16, route: ?[]const u8) RegisterError!*Counter {
         const mi = @backingInt(method);
         const ci: usize = if (status >= 100 and status <= 599) status / 100 else 0;
-        if (m.options.status == .class) {
+        if (m.options.status == .class and route == null) {
             if (m.counters[mi][ci].load(.acquire)) |c| return c;
         }
         var code_buf: [3]u8 = undefined;
@@ -2465,41 +2547,80 @@ pub const RequestMetrics = struct {
             .class => classLabel(ci),
             .code => std.mem.print(&code_buf, "{d}", .{status}) catch classLabel(ci),
         };
-        const c = try m.registry.counter(m.options.counter_name, m.options.counter_help, &.{
-            .{ .name = "method", .value = @tagName(method) },
-            .{ .name = "code", .value = code },
-        });
+        var lbuf: [3]Label = undefined;
+        const c = try m.registry.counter(m.options.counter_name, m.options.counter_help, requestLabels(&lbuf, @tagName(method), code, route));
         // Races publish the same registry-owned pointer — last store wins,
         // harmlessly.
-        if (m.options.status == .class) m.counters[mi][ci].store(c, .release);
+        if (m.options.status == .class and route == null) m.counters[mi][ci].store(c, .release);
         return c;
     }
 
-    fn histogramFor(m: *RequestMetrics, method: http.Method) RegisterError!*Histogram {
+    fn histogramFor(m: *RequestMetrics, method: http.Method, route: ?[]const u8) RegisterError!*Histogram {
         const mi = @backingInt(method);
-        if (m.histograms[mi].load(.acquire)) |h| return h;
-        const h = try m.registry.histogram(m.options.histogram_name, m.options.histogram_help, &.{
-            .{ .name = "method", .value = @tagName(method) },
-        }, m.options.buckets);
-        m.histograms[mi].store(h, .release);
+        if (route == null) if (m.histograms[mi].load(.acquire)) |h| return h;
+        var lbuf: [3]Label = undefined;
+        const h = try m.registry.histogram(m.options.histogram_name, m.options.histogram_help, requestLabels(&lbuf, @tagName(method), null, route), m.options.buckets);
+        if (route == null) m.histograms[mi].store(h, .release);
         return h;
     }
 
-    fn sizeHistogramFor(m: *RequestMetrics, method: http.Method, response: bool) RegisterError!?*Histogram {
-        const buckets = (if (response) m.options.response_size_buckets else m.options.request_size_buckets) orelse return null;
-        const cache = if (response) &m.response_size_histograms else &m.request_size_histograms;
+    /// The optional histograms besides the latency one: request size, response
+    /// size, time to write the header.
+    const Extra = enum { request_size, response_size, time_to_write_header };
+
+    fn sizeHistogramFor(m: *RequestMetrics, method: http.Method, kind: Extra, route: ?[]const u8) RegisterError!?*Histogram {
+        const o = &m.options;
+        const buckets = (switch (kind) {
+            .request_size => o.request_size_buckets,
+            .response_size => o.response_size_buckets,
+            .time_to_write_header => o.time_to_write_header_buckets,
+        }) orelse return null;
+        const cache = switch (kind) {
+            .request_size => &m.request_size_histograms,
+            .response_size => &m.response_size_histograms,
+            .time_to_write_header => &m.ttwh_histograms,
+        };
         const mi = @backingInt(method);
-        if (cache[mi].load(.acquire)) |h| return h;
+        if (route == null) if (cache[mi].load(.acquire)) |h| return h;
+        var lbuf: [3]Label = undefined;
         const h = try m.registry.histogram(
-            if (response) m.options.response_size_name else m.options.request_size_name,
-            if (response) m.options.response_size_help else m.options.request_size_help,
-            &.{.{ .name = "method", .value = @tagName(method) }},
+            switch (kind) {
+                .request_size => o.request_size_name,
+                .response_size => o.response_size_name,
+                .time_to_write_header => o.time_to_write_header_name,
+            },
+            switch (kind) {
+                .request_size => o.request_size_help,
+                .response_size => o.response_size_help,
+                .time_to_write_header => o.time_to_write_header_help,
+            },
+            requestLabels(&lbuf, @tagName(method), null, route),
             buckets,
         );
-        cache[mi].store(h, .release);
+        if (route == null) cache[mi].store(h, .release);
         return h;
     }
 };
+
+/// `route` label value of a request no route matched (a router fallback).
+const unmatched_route = "unmatched";
+
+/// The label tuple of a request series: `method`, then `code` when given, then
+/// `route` when given. `buf` holds the result.
+fn requestLabels(buf: *[3]Label, method: []const u8, code: ?[]const u8, route: ?[]const u8) []const Label {
+    var n: usize = 0;
+    buf[n] = .{ .name = "method", .value = method };
+    n += 1;
+    if (code) |c| {
+        buf[n] = .{ .name = "code", .value = c };
+        n += 1;
+    }
+    if (route) |r| {
+        buf[n] = .{ .name = "route", .value = r };
+        n += 1;
+    }
+    return buf[0..n];
+}
 
 /// promhttp's `computeApproximateRequestSize`, on our request: request-target
 /// + method + protocol + header names and values + declared `Content-Length`
@@ -2528,13 +2649,48 @@ fn classLabel(class_index: usize) []const u8 {
     };
 }
 
+/// State of the time-to-write-header probe of one request: lives on the
+/// middleware's stack, installed in `ResponseWriter.on_head` only while the
+/// handler chain runs.
+const HeadProbe = struct {
+    m: *RequestMetrics,
+    t0: u64,
+    method: http.Method,
+    route: ?[]const u8,
+    prev: ?http.Server.HeadHook,
+    fired: bool = false,
+
+    fn observe(p: *HeadProbe, now_ns: u64) void {
+        p.fired = true;
+        const secs = @as(f64, @floatFromInt(now_ns -| p.t0)) / std.time.ns_per_s;
+        if (p.m.sizeHistogramFor(p.method, .time_to_write_header, p.route)) |mh| {
+            if (mh) |h| h.observe(secs);
+        } else |_| {}
+    }
+
+    fn hook(ctx: ?*anyopaque, rw: *http.Server.ResponseWriter) void {
+        const p: *HeadProbe = @ptrCast(@alignCast(ctx.?));
+        if (!p.fired) p.observe(p.m.options.clock.now());
+        if (p.prev) |prev| prev.func(prev.ctx, rw);
+    }
+};
+
 fn requestRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const m: *RequestMetrics = @ptrCast(@alignCast(state.?));
     const t0 = m.options.clock.now();
     m.in_flight.inc();
     defer m.in_flight.dec();
 
+    var probe: HeadProbe = .{ .m = m, .t0 = t0, .method = ctx.req.method, .route = m.routeFor(ctx), .prev = ctx.res.on_head };
+    if (m.options.time_to_write_header_buckets != null) {
+        ctx.res.on_head = .{ .ctx = &probe, .func = HeadProbe.hook };
+    }
     const result = next.run(ctx);
+    if (m.options.time_to_write_header_buckets != null) {
+        ctx.res.on_head = probe.prev;
+        // Head still unsent: it goes out as soon as the handler is done.
+        if (!probe.fired) probe.observe(m.options.clock.now());
+    }
     // On handler error the serving loop sends a clean 500 when nothing hit
     // the wire yet; when the head already went out, what was sent is what
     // the client saw.
@@ -2543,15 +2699,16 @@ fn requestRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!
     else |_| if (ctx.res.headSent()) ctx.res.status else 500;
     const duration_ns = m.options.clock.now() -| t0;
 
-    if (m.counterFor(ctx.req.method, status)) |c| c.inc() else |_| {}
-    if (m.histogramFor(ctx.req.method)) |h| {
+    const route = probe.route;
+    if (m.counterFor(ctx.req.method, status, route)) |c| c.inc() else |_| {}
+    if (m.histogramFor(ctx.req.method, route)) |h| {
         h.observe(@as(f64, @floatFromInt(duration_ns)) / std.time.ns_per_s);
     } else |_| {}
 
-    if (m.sizeHistogramFor(ctx.req.method, false)) |mh| {
+    if (m.sizeHistogramFor(ctx.req.method, .request_size, route)) |mh| {
         if (mh) |h| h.observe(@floatFromInt(approxRequestSize(ctx.req)));
     } else |_| {}
-    if (m.sizeHistogramFor(ctx.req.method, true)) |mh| {
+    if (m.sizeHistogramFor(ctx.req.method, .response_size, route)) |mh| {
         if (mh) |h| if (responseBytes(ctx.res)) |b| h.observe(@floatFromInt(b));
     } else |_| {}
 
@@ -3564,6 +3721,165 @@ test "middleware: .code granularity uses exact status codes" {
     try expectBodyLine(got, "http_requests_total{method=\"get\",code=\"200\"} 1");
     try expectBodyLine(got, "http_requests_total{method=\"post\",code=\"201\"} 1");
     try expectBodyLine(got, "http_requests_total{method=\"get\",code=\"404\"} 1");
+}
+
+/// `tools/go_golden`'s "created" section: client_golang's const metrics with
+/// a creation time, written by expfmt with `WithCreatedLines` (the summary's
+/// part is checked separately, its quantiles come from a const map).
+const golden_go_created =
+    \\# HELP k_events Events.
+    \\# TYPE k_events unknown
+    \\k_events 2.0
+    \\k_events_created 1.7000000002499998e+09
+    \\# HELP k_hits Hits.
+    \\# TYPE k_hits counter
+    \\k_hits_total{m="get"} 3.0
+    \\k_hits_created{m="get"} 1.7000000002499998e+09
+    \\# HELP k_lat_seconds Lat.
+    \\# TYPE k_lat_seconds histogram
+    \\k_lat_seconds_bucket{le="1.0"} 1
+    \\k_lat_seconds_bucket{le="5.0"} 2
+    \\k_lat_seconds_bucket{le="+Inf"} 3
+    \\k_lat_seconds_sum 9.5
+    \\k_lat_seconds_count 3
+    \\k_lat_seconds_created 1.7000000002499998e+09
+    \\# EOF
+    \\
+;
+
+test "created: opt-in _created samples equal client_golang's, OpenMetrics only" {
+    var wall = clock_lib.ManualWallClock.init(1700000000250000000);
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    reg.created_clock = wall.clock();
+    const ev = try reg.counter("k_events", "Events.", &.{});
+    ev.add(2);
+    const hits = try reg.counter("k_hits_total", "Hits.", &.{.{ .name = "m", .value = "get" }});
+    hits.add(3);
+    const h = try reg.histogram("k_lat_seconds", "Lat.", &.{}, &.{ 1, 5 });
+    h.observe(0.5);
+    h.observe(3);
+    h.observe(6);
+    // (The value is float64(UnixNano())/1e9 as in Go: 2^53 bits lost, hence ...2499998.)
+    // A gauge, a callback series and a later series: no `_created` for the
+    // first two; the later series carries its own time.
+    _ = try reg.gauge("k_gauge", "G.", &.{});
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeOpenMetrics(&w);
+    try testing.expect(std.mem.startsWith(u8, w.buffered(), golden_go_created[0 .. golden_go_created.len - "# EOF\n".len]));
+    try testing.expect(std.mem.find(u8, w.buffered(), "k_gauge_created") == null);
+
+    wall.advance(30 * std.time.ns_per_s);
+    _ = try reg.counter("k_hits_total", "Hits.", &.{.{ .name = "m", .value = "post" }});
+    var w2: std.Io.Writer = .fixed(&buf);
+    try reg.writeOpenMetrics(&w2);
+    try testing.expect(std.mem.find(u8, w2.buffered(), "k_hits_created{m=\"post\"} 1.70000003024") != null);
+
+    // The text format never has them.
+    const text = try scrapeInto(&reg, &buf);
+    try testing.expect(std.mem.find(u8, text, "_created") == null);
+
+    // Default registry: none either.
+    var plain = Registry.init(testing.allocator);
+    defer plain.deinit();
+    (try plain.counter("p_total", "P.", &.{})).inc();
+    var w3: std.Io.Writer = .fixed(&buf);
+    try plain.writeOpenMetrics(&w3);
+    try testing.expect(std.mem.find(u8, w3.buffered(), "_created") == null);
+}
+
+test "created: a summary's _created follows its _count" {
+    var wall = clock_lib.ManualWallClock.init(1700000000250000000);
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    reg.created_clock = wall.clock();
+    const sm = try reg.summary("k_size_bytes", "Size.", &.{}, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.05 }} });
+    sm.observe(3);
+    sm.observe(4.5);
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try reg.writeOpenMetrics(&w);
+    try testing.expect(std.mem.find(u8, w.buffered(), "k_size_bytes_count 2\nk_size_bytes_created 1.7000000002499998e+09\n# EOF\n") != null);
+}
+
+test "middleware: .route_label labels by the matched pattern, fallbacks by unmatched" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var rm = try RequestMetrics.init(&reg, .{
+        .route_label = true,
+        .request_size_buckets = &.{ 100, 1000 },
+        .response_size_buckets = &.{ 10, 100 },
+    });
+    var ep: Endpoint = .{ .registry = &reg };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(ep.middleware());
+    try r.use(rm.middleware());
+    try r.get("/users/:id", hOk);
+    try r.post("/users", hCreated);
+
+    var buf: [16384]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/users/1"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/users/2"), &buf), "200");
+    try expectStatus(runWire(&r, wire("POST", "/users"), &buf), "201");
+    try expectStatus(runWire(&r, wire("GET", "/nope/xyz"), &buf), "404");
+
+    const got = runWire(&r, wire("GET", "/metrics"), &buf);
+    // Two paths, one pattern: the cardinality is the route table's.
+    try expectBodyLine(got, "http_requests_total{method=\"get\",code=\"2xx\",route=\"/users/:id\"} 2");
+    try expectBodyLine(got, "http_requests_total{method=\"post\",code=\"2xx\",route=\"/users\"} 1");
+    try expectBodyLine(got, "http_requests_total{method=\"get\",code=\"4xx\",route=\"unmatched\"} 1");
+    try expectBodyLine(got, "http_request_duration_seconds_count{method=\"get\",route=\"/users/:id\"} 2");
+    try expectBodyLine(got, "http_request_size_bytes_count{method=\"get\",route=\"/users/:id\"} 2");
+    try expectBodyLine(got, "http_response_size_bytes_count{method=\"get\",route=\"unmatched\"} 1");
+    try testing.expect(std.mem.indexOf(u8, got, "/users/1") == null);
+}
+
+var ttwh_fake: ?*FakeClock = null;
+fn hFlushThenSlow(ctx: *router.Ctx) anyerror!void {
+    try ctx.res.writeAll("head first");
+    try ctx.res.flush(); // the head goes out here
+    ttwh_fake.?.now_ns += 500 * std.time.ns_per_ms; // the rest of the handler is slow
+}
+
+test "middleware: time-to-write-header is taken when the head goes out" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var fake: FakeClock = .{ .step_ns = 30 * std.time.ns_per_ms };
+    ttwh_fake = &fake;
+    defer ttwh_fake = null;
+    var rm = try RequestMetrics.init(&reg, .{
+        .clock = fake.clock(),
+        .buckets = &.{ 0.1, 1 },
+        .time_to_write_header_buckets = &.{ 0.1, 1 },
+    });
+    var ep: Endpoint = .{ .registry = &reg };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(ep.middleware());
+    try r.use(rm.middleware());
+    try r.get("/ok", hOk);
+    try r.get("/slow", hFlushThenSlow);
+
+    var buf: [16384]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/ok"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/slow"), &buf), "200");
+
+    const got = runWire(&r, wire("GET", "/metrics"), &buf);
+    // Two requests, both heads out after 30 ms of the fake clock: the
+    // streaming one at the flush (not at the end of its slow handler), the
+    // buffered one as the handler returns.
+    try expectBodyLine(got, "http_request_time_to_write_header_seconds_bucket{method=\"get\",le=\"0.1\"} 2");
+    try expectBodyLine(got, "http_request_time_to_write_header_seconds_count{method=\"get\"} 2");
+    // The slow handler's latency is what the flush hook did not see.
+    try expectBodyLine(got, "http_request_duration_seconds_bucket{method=\"get\",le=\"0.1\"} 1");
+    try expectBodyLine(got, "http_request_duration_seconds_bucket{method=\"get\",le=\"1\"} 2");
+
+    try testing.expectError(error.InvalidBuckets, RequestMetrics.init(&reg, .{ .time_to_write_header_buckets = &.{ 2, 1 } }));
+    try testing.expectError(error.InvalidName, RequestMetrics.init(&reg, .{ .time_to_write_header_buckets = &.{1}, .time_to_write_header_name = "no way" }));
 }
 
 test "middleware: custom names and buckets" {

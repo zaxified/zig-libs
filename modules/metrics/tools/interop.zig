@@ -15,6 +15,10 @@
 //!
 //!   zig build interop-metrics              # re-take, write src/go_oracle_vectors.zig
 //!   zig build interop-metrics -- --check   # re-take, compare with the committed file
+//!   zig build interop-metrics -- --phase process
+//!       # LIVE differential, nothing frozen: client_golang's process collector
+//!       # (`tools/go_process_oracle`) and `ProcessCollector` on the same
+//!       # sleeping child process, compared line by line
 
 const std = @import("std");
 const metrics = @import("metrics");
@@ -98,13 +102,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const io = threaded.io();
 
     var check = false;
+    var process_phase = false;
     var args = init.args.iterate();
     _ = args.skip();
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--check")) {
             check = true;
+        } else if (std.mem.eql(u8, a, "--phase")) {
+            const ph = args.next() orelse return 2;
+            if (!std.mem.eql(u8, ph, "process")) return 2;
+            process_phase = true;
         } else {
-            std.debug.print("usage: interop-metrics [--check]\n", .{});
+            std.debug.print("usage: interop-metrics [--check | --phase process]\n", .{});
             return 2;
         }
     }
@@ -116,6 +125,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     // 2026-10-07). go.sum pins every hash and Go's default -mod=readonly
     // refuses to change it, so a download cannot change what is judged.
     var env = try init.environ.createMap(arena);
+    if (process_phase) return processPhase(io, gpa, arena, &env);
     const scripts_path = scratch ++ "/scripts.json";
     const ours_path = scratch ++ "/ours.json";
     const abs = struct {
@@ -170,4 +180,74 @@ fn afterLine(text: []const u8, n: usize) []const u8 {
         rest = rest[nl + 1 ..];
     }
     return rest;
+}
+
+/// Both expositions of the same process, line by line: HELP and TYPE equal,
+/// every sample equal, except where the two reads are moments apart by
+/// nature (CPU time; the host's network counters).
+fn processPhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: *const std.process.Environ.Map) !u8 {
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sleep", "300" },
+        .stdin = .close,
+        .stdout = .close,
+        .stderr = .close,
+    });
+    defer child.kill(io);
+    const pid: u32 = @intCast(child.id.?);
+    // Let `sleep` finish exec: its fds, limits and RSS settle.
+    try io.sleep(.fromMilliseconds(200), .awake);
+
+    var pid_buf: [16]u8 = undefined;
+    const pid_arg = try std.mem.print(&pid_buf, "{d}", .{pid});
+    const go_out = scratch ++ "/process-go.txt";
+    try std.Io.Dir.cwd().createDirPath(io, scratch);
+    if (try goCmd(io, arena, env, &.{ "go", "-C", "modules/metrics/tools/go_process_oracle", "run", ".", pid_arg }, go_out) != 0) return 1;
+    const theirs = try std.Io.Dir.cwd().readFileAlloc(io, go_out, arena, .limited(1 << 20));
+
+    var r = metrics.Registry.init(gpa);
+    defer r.deinit();
+    var pc: metrics.ProcessCollector = .{ .gpa = gpa, .io = io, .ref = .{ .pid = pid } };
+    try pc.register(&r, "");
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try r.writeText(&out.writer);
+    const ours = out.written();
+
+    var a = std.mem.splitScalar(u8, theirs, '\n');
+    var b = std.mem.splitScalar(u8, ours, '\n');
+    var bad: usize = 0;
+    var lines: usize = 0;
+    while (true) {
+        const x = a.next();
+        const y = b.next();
+        if (x == null and y == null) break;
+        if (x == null or y == null) {
+            std.debug.print("process: one exposition is longer\n", .{});
+            return 1;
+        }
+        lines += 1;
+        if (!lineMatches(x.?, y.?)) {
+            std.debug.print("process: client_golang `{s}` vs ours `{s}`\n", .{ x.?, y.? });
+            bad += 1;
+        }
+    }
+    std.debug.print("process: {d} lines compared, {d} differ\n", .{ lines, bad });
+    return if (bad == 0 and lines > 18) 0 else 1;
+}
+
+fn lineMatches(x: []const u8, y: []const u8) bool {
+    if (std.mem.eql(u8, x, y)) return true;
+    if (x.len == 0 or x[0] == '#') return false;
+    const xs = std.mem.findScalar(u8, x, ' ') orelse return false;
+    const ys = std.mem.findScalar(u8, y, ' ') orelse return false;
+    if (!std.mem.eql(u8, x[0..xs], y[0..ys])) return false;
+    const vx = std.fmt.parseFloat(f64, x[xs + 1 ..]) catch return false;
+    const vy = std.fmt.parseFloat(f64, y[ys + 1 ..]) catch return false;
+    const name = x[0..xs];
+    const tol: f64 = if (std.mem.eql(u8, name, "process_cpu_seconds_total"))
+        0.05
+    else if (std.mem.startsWith(u8, name, "process_network_"))
+        1e6 // the host's counters move between the two reads
+    else
+        0;
+    return @abs(vx - vy) <= tol;
 }

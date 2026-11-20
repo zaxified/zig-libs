@@ -1,5 +1,5 @@
 // go_golden prints client_golang's text and OpenMetrics exposition of a fixed
-// registry; root.zig's golden_go_text / golden_go_openmetrics are its output.
+// registry; root.zig's golden_go_created / golden_go_text / golden_go_openmetrics are its output.
 // Run: GOTOOLCHAIN=local GOPROXY=off GOFLAGS=-mod=mod go run .
 
 package main
@@ -54,6 +54,33 @@ func main() {
 	xenc := expfmt.NewEncoder(os.Stdout, expfmt.NewFormat(expfmt.TypeOpenMetrics))
 	for _, mf := range xmfs {
 		if err := xenc.Encode(mf); err != nil {
+			panic(err)
+		}
+	}
+
+	// _created lines (OpenMetrics only, off by default in client_golang): fixed
+	// creation times through the const API; a labelled counter, a counter named
+	// without _total, a histogram and a summary.
+	creg := prometheus.NewRegistry()
+	cts := time.Unix(1700000000, 250000000)
+	cc := prometheus.NewDesc("k_hits_total", "Hits.", []string{"m"}, nil)
+	cb := prometheus.NewDesc("k_events", "Events.", nil, nil)
+	ch := prometheus.NewDesc("k_lat_seconds", "Lat.", nil, nil)
+	cs := prometheus.NewDesc("k_size_bytes", "Size.", nil, nil)
+	creg.MustRegister(constCollector{
+		prometheus.MustNewConstMetricWithCreatedTimestamp(cc, prometheus.CounterValue, 3, cts, "get"),
+		prometheus.MustNewConstMetricWithCreatedTimestamp(cb, prometheus.CounterValue, 2, cts),
+		prometheus.MustNewConstHistogramWithCreatedTimestamp(ch, 3, 9.5, map[float64]uint64{1: 1, 5: 2}, cts),
+		prometheus.MustNewConstSummaryWithCreatedTimestamp(cs, 2, 7.5, map[float64]float64{0.5: 3, 0.9: 4.5}, cts),
+	})
+	cmfs, err := creg.Gather()
+	if err != nil {
+		panic(err)
+	}
+	os.Stdout.WriteString("=== created\n")
+	cenc := expfmt.NewEncoder(os.Stdout, expfmt.NewFormat(expfmt.TypeOpenMetrics), expfmt.WithCreatedLines())
+	for _, mf := range cmfs {
+		if err := cenc.Encode(mf); err != nil {
 			panic(err)
 		}
 	}

@@ -72,6 +72,14 @@ sorted; `error.InvalidBuckets` instead of silent strip/panic.
   stay valid until `deinit`, because a scrape that started before an `unregister`/`delete`/`reset` may still call it.
   Registering the same series twice, or asking a callback family for an ordinary series (or the reverse), is
   `error.AlreadyRegistered`.
+- **Request middleware options** (`RequestMetrics.Options`). `route_label` (opt-in, off = exposition unchanged) adds a
+  `route` label to the counter, the latency histogram and the size histograms: the matched route's pattern from
+  `router.Ctx.matchedPattern()` (`/users/:id`, so its cardinality is the route table's) and `unmatched` for the 404/405
+  fallbacks; never the raw path. It skips the lock-free series caches, so every request takes a locked registry lookup, as
+  `.code` granularity does. `time_to_write_header_buckets` (promhttp `InstrumentHandlerTimeToWriteHeader`; off by default,
+  label `method`) observes the time from the start of the request to the moment the response head was written, taken from
+  `http.Server.ResponseWriter.on_head`; a head still unsent when the handler returns is taken at that moment, the earliest
+  `http` can write it. The request size is promhttp's approximation (the declared `Content-Length`).
 - **Collectors** (`Registry.registerCollector`, `Desc`, `Collector`, `Sink`; client_golang `Collector`): families are
   described up front and their samples computed once per scrape, from the scraping thread with the registry lock not
   held (so `collect` must be thread-safe: concurrent scrapes run it concurrently). `Sink` checks what registration checks
@@ -92,7 +100,7 @@ sorted; `error.InvalidBuckets` instead of silent strip/panic.
   nothing. The rule is the exact set of sample names a family writes, not a stricter one (reference: client_golang
   refuses only what `Gather` finds duplicated, pinned by `go_register_test`): a summary `s` beside a family `s_bucket` is
   accepted, and so is a counter `x_total` beside a family `x`, which OpenMetrics announces under the same name
-  (client_python's registry would refuse that pair; the Go reference wins). There is no `info` kind and no `_created` sample.
+  (client_python's registry would refuse that pair; the Go reference wins). There is no `info` kind; `_created` samples are opt-in (see *OpenMetrics*).
 - **Summary** (`Registry.summary` / `summaryVec`, `SummaryOptions`, engine in `src/summary.zig`; client_golang `Summary`
   with `Objectives`): CKMS targeted quantiles over `age_buckets` rotating streams, every observation inserted into every
   stream as client_golang does; `_sum`/`_count` are cumulative, the quantiles cover a sliding window of `max_age_ns`.
@@ -108,7 +116,12 @@ sorted; `error.InvalidBuckets` instead of silent strip/panic.
   `Endpoint.open_metrics`, `content_type_openmetrics`): output is byte-identical to prometheus/common `expfmt` for the same
   registry. A counter's family is announced without `_total` while its sample keeps it, a counter without the suffix is
   `unknown`, HELP escapes `"` too, floats are OpenMetrics floats, the output ends in `# EOF`. No `_created` samples
-  (client_golang's default). `Format.negotiate` follows `NegotiateIncludingOpenMetrics`: `Accept` clauses by descending
+  (client_golang's default); `Registry.created_clock` (opt-in, set before registering: `clock.WallClock.system` for the real time)
+  turns on client_golang's `EnableOpenMetricsTextCreatedSamples` behaviour: every counter, histogram and summary series
+  created after it carries its creation time and the OpenMetrics text writes `<name>_created{labels} <unix seconds>` after
+  its samples, as expfmt's `WithCreatedLines` does (a counter's `_total` is trimmed first; the value is
+  `float64(UnixNano())/1e9`; pinned by `golden_go_created` from `tools/go_golden`). A gauge, a callback series and a
+  collector's sample have none, as in client_golang; the text format never has them. `Format.negotiate` follows `NegotiateIncludingOpenMetrics`: `Accept` clauses by descending
   `q`, a concrete type before `*` on ties, only the `version` parameter compared; deviation: a `q=0` clause is skipped (RFC
   9110). `Endpoint.open_metrics` is off by default, like promhttp's `EnableOpenMetrics`.
 - **Exemplars** (`Counter.addWithExemplar` / `incWithExemplar`, `Histogram.observeWithExemplar`; client_golang
@@ -163,7 +176,9 @@ network policy) rather than gating the whole router with `.all`.
 - A `*Metric` from `Vec.with` must not be used after `delete`/`reset`/`unregister` of its series (documented on `delete`);
   a concurrent scrape is safe, a retained pointer is not.
 - `delete` is O(series in the family) under the registry lock (find, then ordered remove): it keeps registration order, and
-  client_golang sorts every family's series on every scrape.
+  client_golang sorts every family's series on every scrape. Measured (ReleaseFast, the oldest series of a full family, the
+  worst case): 0.7 µs at 1 000 series, 2.0 µs at 10 000 (the default `max_series_per_family`), 27 µs at 100 000 (a raised
+  cap), so a delete never holds the lock noticeably at the default limit; a faster index was not built.
 - When the parking list for a removed series cannot grow (out of memory), the series is leaked rather than freed under a
   scrape that may still read it. Not counted: client_golang has no such state (the garbage collector frees a removed
   series once no scrape holds it), so there is no reference counter to match; the leak is bounded by the allocation
@@ -199,6 +214,10 @@ network policy) rather than gating the whole router with `.all`.
 - **External parse:** a frozen test (`external anchor: exposition text independently parsed by prometheus_client`) holds what the
   `prometheus_client` parser extracted from this module's own `writeText` bytes. It found no disagreement; that parser strips
   the `_total` suffix at the family level while samples keep it, a client-library convention rather than a defect.
+- **Process collector differential** (live, nothing frozen): `zig build interop-metrics -- --phase process` runs client_golang's
+  process collector (`tools/go_process_oracle`, `go` as above) and `ProcessCollector` on the same sleeping child process and
+  compares the two expositions line by line: names, HELP, TYPE and every value equal, except CPU time (within 0.05 s) and
+  the host's network counters (within 1 MB), which move between the two reads.
 - **Lead:** `src/lead_test.zig` (`tools/go_field_probe`) holds the six scrape-decided rows behind the card's `**Ahead:**` line.
 - **Fuzz:** `src/fuzz_test.zig`, deterministic driver `METRICS_FUZZ` (see *Fuzzing* below). **Constant time:** n/a (metric counters, no secrets).
 - **Bench:** `zig build bench-metrics` (`tools/bench.zig`).
@@ -223,28 +242,24 @@ network policy) rather than gating the whole router with `.all`.
 - **More than `max_labels` (8) labels**: a cardinality guard.
 - **`metrics.handler(registry) -> router.Handler`**: not implementable, a stateless fn pointer cannot close over a `Registry`;
   `Endpoint` is the replacement and `Registry.respond` covers hand-written handlers.
+- **Exact request size**: `approxRequestSize` is promhttp's `computeApproximateRequestSize` (request-target, method, protocol,
+  header names and values, the declared `Content-Length`; 0 for a chunked body). client_golang has no exact count either, and
+  the bytes a handler actually read are not tracked by `http.Server.Request`.
+- **A `*Metric` that survives `delete`/`reset`** (a reference count or a graveyard): client_golang's garbage collector keeps a
+  deleted series alive for as long as a caller holds it; here the memory is given back (that is the point of `delete`) and the
+  rule is the std containers' one, a pointer is valid until the series is removed, documented on `delete`. A count would need
+  a release call on every use of `Vec.with`, which would change the API of the hot path for a mistake the documented rule
+  already names.
 - **A metrics-owned auth wrapper**: `aaa-gate` is the module for that (see *Threat model*).
 
 ## Backlog / deferred
 
-- **A bounded route-pattern label for the request middleware.** `router` exposes the matched pattern
-  (`Ctx.matchedPattern()`), so it can be wired in; today the middleware deliberately does not label by raw path
-  (cardinality).
-- **`_created` samples in OpenMetrics.** client_golang's are opt-in (`EnableOpenMetricsTextCreatedSamples`); needs a creation
-  timestamp per series from a wall clock. Effort S-M.
-- **Time-to-write-header request histogram** (promhttp `InstrumentHandlerTimeToWriteHeader`): `http` has no hook when the
-  head goes out. Sibling `http`.
-- **Exact request size.** `approxRequestSize` follows promhttp (the declared `Content-Length`); the bytes a handler read are
-  not exposed by `http.Server.Request`. Sibling `http`.
-- **Process collector differential**: run client_golang's process collector and ours on the same pid and compare (today: a
-  shape test and an RLIMIT cross-check).
-- **Differential oracle against karlseguin/metrics.zig** (idea, not scheduled): register the same counters, gauges and
-  histograms (label values that need escaping included) in both and diff the exposition byte by byte; it would live in
-  `tools/` as a differential oracle (CONVENTIONS section 9); the library is MIT and targets Zig 0.16.
-- **`delete` is O(series) under the registry lock** (see Known limits): open as the worry that a very large family stalls
-  registrations.
-- **A `*Metric` from `Vec.with` dangles after a concurrent `delete`/`reset`** of that series when no scrape holds it; a
-  refcount would close it, cost unmeasured.
+- **Differential oracle against karlseguin/metrics.zig** (MIT, Zig 0.16): register the same counters, gauges and histograms in
+  both and compare the expositions. Not a byte diff: that library writes label names sorted, no HELP unless given and a
+  different series order, so the comparison would be of the parsed samples (name, label set, value) plus how label values with
+  `"`, `\` and newlines are written. Blocked: building the fresh third-party checkout was refused in the agent sandbox; it
+  needs an owner OK (recipe: clone at a pinned commit into a gitignored `tools/` directory, `zig build` it, run both sides
+  from `tools/interop.zig` as a new `--phase`).
 
 ## Fuzzing
 
