@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — alexedwards/scs v2.9.0 (with its memstore), the reference, has no cross-request guard: a request that loaded the session before a concurrent request logged it out (`Destroy`) or rotated it (`RenewToken`) re-commits it under the OLD token when it finishes (`LoadAndSave` commits every `Modified` session, `Load` marks every loaded session `Modified` once `IdleTimeout > 0`, `Commit` and `MemStore.Commit` are blind writes), so the logged-out or rotated-away cookie works again — with an idle timeout even after a read-only request (`tools/lead_probe`, 4 of 4 interleavings resurrect; the no-idle read-only control does not); here every save is a generation compare-and-swap and both are refused (tests "cross-request race: a stale save cannot resurrect a session destroyed by a concurrent request", "cross-request race: a logout after the live record was EVICTED still wins over a stale save", "cross-request race: a stale save cannot resurrect a session rotated by a concurrent regenerate") (measured 2026-10-24)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-19 (504/548, 44 eq) · src bdfdd7373c870a55
+**Audit:** review 2026-11-12 · mutation 2026-11-19 (504/548, 44 eq) · src 9afc73dff3a87200
 
 Audit detail: the 2026-11-01 review is a delta over `src/root.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
 
