@@ -129,7 +129,7 @@ pub const Frozen = struct {
     // and is answered as the union of `[min_lon, 180]` and `[-180, max_lon]`
     // (two disjoint passes, so no point is reported twice). Both passes share
     // `out`, the visit budget (`max_visited` counts both) and the filter; the
-    // status is that of the first pass that truncated. Before 2026-11-16 such a
+    // status is that of the first pass that truncated. Before such a
     // rectangle silently matched nothing. NaN bounds still match nothing.
 
     /// All indexed points inside the closed rectangle

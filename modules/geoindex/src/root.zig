@@ -625,7 +625,7 @@ test "corpus: the random buffers reach the loader, and what they get past is pin
         }
     }
     try testing.expectEqual(random_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: both were 0 before the draw was fixed — the loader
+    // Measured: both were 0 before the draw was fixed — the loader
     // was handed an empty slice on every iteration.
     try testing.expectEqual(@as(usize, 4), loaded);
     try testing.expectEqual(@as(usize, 1), header_corrupt);
@@ -667,7 +667,7 @@ test "corpus: the mutation scripts actually damage the index, and reach the desc
             runQueries(f);
         } else |_| damaged_and_rejected += 1;
     }
-    // Measured 2026-09-07: `changed_total` was 0 — the flip count was the first
+    // Measured: `changed_total` was 0 — the flip count was the first
     // draw and therefore always the range minimum.
     try testing.expectEqual(@as(usize, 25), changed_total);
     // ⭐ The CRC trap as a number: without the re-seal bit every one of these
@@ -681,7 +681,7 @@ test "corpus: the mutation scripts actually damage the index, and reach the desc
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
