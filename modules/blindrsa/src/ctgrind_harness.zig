@@ -25,9 +25,8 @@
 //! `maskedInvert`/`feInvert` as `blindCore`'s inversion below.
 //!
 //! Until this harness that paragraph had no measurement behind it. Run it
-//! by hand (this module has NO per-module block in `scripts/checks/ctgrind.sh` yet
-//! — see that script's header for why, and the suggested config lines at
-//! the bottom of this comment for what to paste in):
+//! through `scripts/checks/ctgrind.sh blindrsa` (expected rows in
+//! `scripts/checks/ctgrind-expected.tsv`), or by hand:
 //!
 //!   zig build ctgrind -Dctgrind-module=blindrsa -Dctgrind-valgrind=true  -Doptimize=ReleaseFast
 //!   zig build ctgrind -Dctgrind-module=blindrsa -Dctgrind-valgrind=false -Doptimize=ReleaseFast
@@ -123,25 +122,6 @@
 //! `std.debug.print` (not constant-time by design) before returning — the
 //! WITNESS bucket — so a zero count inside `root.zig`/`rsa`'s files means
 //! "no branch found", not "taint never arrived".
-//!
-//! ## Suggested `scripts/checks/ctgrind.sh` config (for the coordinator to paste in)
-//!
-//! ⚠ `root.zig` is NOT a unique basename here: `blindrsa`'s own
-//! `modules/blindrsa/src/root.zig` and the sibling `modules/rsa/src/root.zig`
-//! BOTH appear in `.blind`'s and `.sign`'s call stacks, and
-//! `classify_contexts` buckets by matching the pattern against entire
-//! stack-frame TEXT lines, not by module directory. Check what valgrind
-//! actually prints for a frame (a bare `(root.zig:NNN)` or something
-//! path-qualified) before trusting a plain `root[.]zig` to mean "blindrsa's
-//! own file" here the way it unambiguously does in `rsa`'s own recipe —
-//! this harness's report separates the two by line number, not by pattern.
-//!
-//!   [blindrsa]="blind sign"                                   # TARGETS
-//!   [blindrsa]="ReleaseFast"                                  # MODES
-//!   [blindrsa/blind]='root[.]zig|ff[.]zig'   # PATTERN — both root.zigs + std.crypto.ff (bigModInverse's operand construction, Modulus.mul/Fe ops)
-//!   [blindrsa/sign]='root[.]zig|ff[.]zig'    # PATTERN — both root.zigs (rsasp1's CRT path + the §7.2 wrapper) + std.crypto.ff
-//!   [blindrsa/blind]='blindrsa blind (client r, masked inverse)'   # LABEL
-//!   [blindrsa/sign]='blindrsa blindSign (server sk, +std ff)'      # LABEL
 
 const std = @import("std");
 const builtin = @import("builtin");
