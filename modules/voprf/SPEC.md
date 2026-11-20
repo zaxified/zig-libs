@@ -27,13 +27,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [RFC 9497](https://www.rfc-editor.org/rfc/rfc9497) (spec and its test vectors) — **reference** | — | — | — | RFC, December 2023 | Defines five ciphersuites (ristretto255-SHA512, decaf448-SHAKE256, P256-SHA256, P384-SHA384, P521-SHA512) in three modes; this module implements the first, in all three modes. |
+| [RFC 9497](https://www.rfc-editor.org/rfc/rfc9497) (spec and its test vectors) — **reference** | — | — | — | RFC, December 2023 | Defines five ciphersuites (ristretto255-SHA512, decaf448-SHAKE256, P256-SHA256, P384-SHA384, P521-SHA512) in three modes; this module implements all five, each in all three modes. |
 | [cloudflare/circl](https://github.com/cloudflare/circl) `oprf` | Go | BSD-3-Clause (`LICENSE`); API: NOASSERTION | 1.7k | v1.6.5 (2026-08-05) | The most used Go implementation; exports suites ristretto255, P-256, P-384 and P-521 (names seen in the package listing; source not studied) with client/server/verifiable/partially-oblivious types. |
-| [facebook/voprf](https://github.com/facebook/voprf) | Rust | MIT OR Apache-2.0 (its `Cargo.toml`/README) | 88 | v0.5.0 (2024-03-07); push 2026-04-06 | RFC 9497, default feature ristretto255; the NIST curves ride on the generic `elliptic-curve` traits (p256, p384, p521 appear in its dev-dependencies). Also serde support and client/server state objects (the §5.2 layer that this module leaves out) *(inferred from its docs' shape, not read this run)*. |
+| [facebook/voprf](https://github.com/facebook/voprf) | Rust | MIT OR Apache-2.0 (its `Cargo.toml`/README) | 88 | v0.5.0 (2024-03-07); push 2026-04-06 | RFC 9497, default feature ristretto255; the NIST curves ride on the generic `elliptic-curve` traits (p256, p384, p521 appear in its dev-dependencies). Also serde support (this module has the client/server state objects too, not serde) *(inferred from its docs' shape, not read this run)*. |
 | [bytemare/voprf](https://github.com/bytemare/voprf) | Go | MIT | 16 | v0.21.0 (2023-03-20); push 2026-08-29 | Earlier-draft Go implementation by one of the OPAQUE RFC authors; a smaller project, suites not verified *(inferred)*. |
 | Zig | Zig | — | — | — | No OPRF library found: a GitHub search for `oprf` in Zig returns only a GPL KMS application (`stef/klutshnik`); `std` provides ristretto255 but no OPRF. |
 
-**Where we are ahead:** the only RFC 9497 in Zig as a library; every suite and mode byte-exact against all of Appendix A including the batch-of-2 proofs; decaf448-SHAKE256, which CIRCL does not list (its package exports ristretto255 and the three NIST curves); secret-scalar multiplications constant time with a ctgrind harness per suite (ristretto255 through `ct25519`, with a negative control showing why std's `Ristretto255.mul` is not enough), and the NIST hash-to-curve straight-line (`cMov` only) because the client input it hashes is the secret. **Where we are behind:** nothing a CIRCL or facebook/voprf user needs for the protocol itself (2026-11-13). Left out by policy: an internal RNG (`GenerateKeyPair`/`RandomScalar`; callers pass randomness, `scalarFromWideBytes`), and facebook/voprf's serde derives (the wire values are the RFC's fixed-width byte strings, `toBytes`/`fromBytes`).
+**Where we are ahead:** the only RFC 9497 in Zig as a library; every suite and mode byte-exact against all of Appendix A including the batch-of-2 proofs; decaf448-SHAKE256, which CIRCL does not list (its package exports ristretto255 and the three NIST curves); secret-scalar multiplications constant time with a ctgrind harness per suite (ristretto255 through `ct25519`, with a negative control showing why std's `Ristretto255.mul` is not enough), and the NIST hash-to-curve straight-line (`cMov` only) because the client input it hashes is the secret. **Where we are behind:** nothing a CIRCL or facebook/voprf user needs for the protocol itself. Left out by policy: an internal RNG (`GenerateKeyPair`/`RandomScalar`; callers pass randomness, `scalarFromWideBytes`), and facebook/voprf's serde derives (the wire values are the RFC's fixed-width byte strings, `toBytes`/`fromBytes`).
 
 ## What an OPRF is
 
@@ -53,11 +53,10 @@ upgrades), private set membership, etc.
 | VOPRF | 0x01 | yes | server proves DLEQ `log_G(pkS) == log_blinded(evaluated)`; client verifies before unblinding |
 | POPRF | 0x02 | yes | public `info` input tweaks the key: `t = skS + HashToScalar("Info"‖len‖info)`, evaluation is `t^-1 *`, proof is against the client-derivable `tweakedKey = G*m + pkS` with the composite lists **swapped** (the proven relation is `t*evaluated == blinded`) |
 
-POPRF was in-scope-if-cheap and turned out cheap: it reuses the whole
-DLEQ engine and hash layer; only `poprfInfoScalar`, the tweak/inverse
-arithmetic, and the `info` block in the Finalize hash are new.
+POPRF reuses the whole DLEQ engine and hash layer; only `poprfInfoScalar`, the tweak/inverse
+arithmetic, and the `info` block in the Finalize hash are its own.
 
-## Ciphersuites built (2026-11-13)
+## Ciphersuites built
 
 | Suite (§) | Instance | Group from | Ne / Ns / Nh | HashToGroup | Scalars |
 |---|---|---|---|---|---|
@@ -74,8 +73,8 @@ widths, `hashToGroup`/`hashToScalar`, `encode`/`decode`, `mulSecret`/
 `mulPublic`, scalar ops). `Suite(.p256_sha256)` or the named instance gives
 the namespace; its functions have the top level's names and argument order,
 only the widths (`Ne`, `Ns`, `Nh`, `wide_length`) differ. The top level of
-`root.zig` is `Ristretto255Sha512` re-exported, so code written before
-2026-11-13 compiles unchanged.
+`root.zig` is `Ristretto255Sha512` re-exported, so the single-suite top-level API
+stays what it was.
 
 **Batching** (what CIRCL's `Client.Blind(inputs)`/`Server.Evaluate` and
 facebook/voprf's `batch_*` calls do): `blindEvaluateBatch` (OPRF, no
@@ -155,40 +154,20 @@ suite's `Ne`/`Nh`.
   elements through these (per §3.3).
 - **Side channels**: `skS`, the client `blind` (and its inverse), POPRF's
   `t`/`t_inv` and the DLEQ nonce `r` are multiplied by the sibling
-  **`ct25519`**, not by `Ristretto255.mul`.
+  **`ct25519`**, not by `Ristretto255.mul`. std's `mul` is a constant-time
+  4-bit-window ladder that then ends with `try q.rejectIdentity()`, a branch
+  on a scalar-derived value, and the error union it returns forces a `catch`
+  at every secret-scalar call site. `ct25519` is std's identical ladder with
+  that tail removed: the neutral element is a value, there is no error union,
+  and no call site can branch on the scalar. This is evidenced by a
+  ctgrind-style valgrind/memcheck run, not by reading the source: the harness
+  lives in `ct25519` (`scripts/checks/ctgrind.sh ct25519`), since it is
+  `ct25519` that performs the multiply, and it carries a paired negative
+  control that routes the same tainted scalar through std's
+  `Ristretto255.mul` and reports the `rejectIdentity` branch. Mode, switch
+  and counts are in `ct25519/SPEC.md` § "Constant-time check".
 
-  This SPEC used to say they "only touch constant-time std paths
-  (`Ristretto255.mul`, …)", and that was **false**. std's `mul` is a
-  constant-time 4-bit-window ladder that then ends with
-  `try q.rejectIdentity()` — a branch on a scalar-derived value — and the
-  error union it returns forced a `catch` at all nine secret-scalar call
-  sites in `root.zig`, so the leak was reproduced once per site. Reading
-  "the ladder is constant-time" and stopping there is exactly how the
-  claim survived an audit that graded the module `A6 const-time: PASS` on
-  the same reasoning. `ct25519` is std's identical ladder with that tail
-  removed: the neutral element is a value, there is no error union, and
-  no call site can branch on the scalar. Not verified by re-reading the
-  source — verified with a ctgrind-style valgrind/memcheck run, **mode,
-  switch and counts stated** (the shape the previous sentence lacked, per
-  the internal audit's `ct25519` F6 to-do): the harness
-  lives in `ct25519` (`modules/ct25519/src/ctgrind_harness.zig`, run by
-  `scripts/checks/ctgrind.sh ct25519`) since it is `ct25519`, not `voprf`, that
-  performs the multiply, and all nine of the call sites named above reduce
-  to `ct25519.mulRistrettoBase`/`mulRistretto`. At **ReleaseFast, built with
-  `-fvalgrind`**, tainting the scalar (`MAKE_MEM_UNDEFINED`) and driving it
-  through `ct25519.mulRistrettoBase` reports **0 memcheck contexts in
-  `ct25519/src/root.zig`** (2 total, both inside the harness's own
-  `std.debug.print`, proving the taint reached the output rather than never
-  arriving). The paired negative control — the **same** harness, the
-  **same** tainted scalar, routed through `std.crypto.ecc.Ristretto255.mul`
-  instead — reports a real hit: **1 context in `edwards25519.zig`**, at
-  `pcMul16`'s `try q.rejectIdentity()` line, i.e. the exact branch this
-  paragraph describes. Without `-fvalgrind` both report 0/0 regardless of
-  taint — the documented no-op trap, reproduced rather than assumed. Full
-  control table (6 rows: tainted × untainted × with/without `-fvalgrind`,
-  for both `ct25519` and std): `ct25519/SPEC.md` §"Constant-time check".
-
-  **The other four suites (2026-11-13).** decaf448's secret multiplies use
+  **The other four suites.** decaf448's secret multiplies use
   the sibling's `Element.scalarMul`, which returns a value (no error union,
   its own ctgrind harness). The NIST suites use the siblings' constant-time
   `mulInto`, which ends with ONE laundered branch on the product's identity
@@ -197,9 +176,9 @@ suite's `Ne`/`Nh`.
   of an error, so no voprf API reports it. The NIST hash-to-curve treats the
   input as secret (it is the client's private input): `cMov` selects only,
   no branch on `u` or any field value — the sibling's `Fe.cMov` where it
-  launders its mask (p256; p521 since 2026-11-13), a local laundered byte
+  launders its mask (p256, p521), a local laundered byte
   select for p384, whose `Fe.cMov` builds its mask from the bare bit. Per-suite ctgrind rows: see
-  § Hardening below and `scripts/checks/ctgrind-expected.tsv`.
+  the card's Hardening line and `scripts/checks/ctgrind-expected.tsv`.
 
   PUBLIC scalars stay on std's `mul` on purpose: `verifyProof`'s `s`/`c`
   are wire data, the composite `di` are hashes of wire elements, and
@@ -219,43 +198,6 @@ suite's `Ne`/`Nh`.
   security property — that contract is on the caller, and is what makes
   the RFC's `ProofRandomScalar` KATs reproducible.
 
-## What the KATs pin (RFC 9497 Appendix A.1, byte-exact)
-
-- `deriveKeyPair` → `skSm` (all modes) + `pkSm` (VOPRF/POPRF)
-- `blind`/`blindPoprf` → every `BlindedElement` (transitively pins
-  `HashToGroup` = `expandMessageXmd` + `Ristretto255.fromUniform`)
-- `blindEvaluate*` → every `EvaluationElement`
-- `generateProof` with the vector's `ProofRandomScalar` → every `Proof`,
-  including both batch-size-2 vectors (pins the full transcript order)
-- `verifyProof` accepts each published proof; rejects bit-flipped `c`,
-  bit-flipped `s`, wrong `pkS`, and swapped batch elements
-- `finalize*` → every `Output`; direct `evaluate*` agrees with each
-  blinded round trip; fresh-key e2e round trips for all three modes
-- `expandMessageXmd` standalone vs RFC 9380 Appendix K.3
-- **2026-11-13, every suite** (`suite_kat_test.zig`, vectors generated from
-  the RFC text by `tools/gen_vectors.py`): A.1-A.5, every mode, every
-  vector — `skSm`/`pkSm`, `BlindedElement`, `EvaluationElement`, `Proof`
-  (batch-of-2 included), `Output` through `finalize*`, the batch finalize,
-  and the direct `evaluate*`; tampered proofs and the untweaked POPRF key
-  refused; the context objects reproduce Test Vector 1 of every suite and
-  mode. `h2c_test.zig`: RFC 9380 J.1.1/J.2.1/J.3.1 intermediates and
-  K.1/K.3 (both lengths, i.e. the multi-block XMD loop)
-
-**Mutation run 2026-10-05** (in-place, Debug, 25 mutants over element and
-scalar decoding, `deriveKeyPair`'s retry loop, the composites, `generateProof`,
-every `verifyProof` refusal and its `t2`/`t3` equation, the finalize hash,
-`unblind`'s two refusals, the batch-length checks and the POPRF
-`InverseError`/tweaked-key guards): 21 killed. The first pass left 10; tests
-were added for a proof whose `s` is re-encoded as `s + L` (std's ladder
-multiplies it exactly as `s`, so without the canonicity check a second
-encoding of the same proof verifies), a C/D length mismatch, a non-canonical blind at
-`finalize`, and `skS == -m` / `pkS == -m*G` in POPRF. Two mutants that
-failed to compile were rewritten until they built. Equivalent: identity
-rejection in `hashToGroup` and the zero test and 256th round of
-`deriveKeyPair` (each needs a SHA-512 output that reduces to a chosen
-value), and the canonicity check on the proof's `c` (it is compared byte
-for byte with a canonical hash output, so a non-canonical `c` fails anyway).
-
 ## Secret residue on the dead stack
 
 Every public entry point that touches a secret (`scalarFromWideBytes`,
@@ -265,8 +207,8 @@ Every public entry point that touches a secret (`scalarFromWideBytes`,
 `evaluatePoprf`) runs its body one frame down (`burn.run`) and then zeroes the
 stack that body dirtied (`burn.zig`: 2 KiB for the reduction, 8 KiB for
 `deriveKeyPair`, 20 KiB for the one-multiply calls, 28 KiB for the DLEQ
-prover and everything that verifies or proves). Measured body depth,
-ReleaseFast, 2026-10-09: 0.4 KiB (`scalarFromWideBytes`) .. 11.9 KiB
+prover and everything that verifies or proves). Measured body depth
+(when the sizes were chosen), ReleaseFast: 0.4 KiB (`scalarFromWideBytes`) .. 11.9 KiB
 (`finalizeVerifiable`/`finalizePoprf`); the burns are about 2x that.
 Secret inputs (`sk`, the blind, the proof nonce, the seed) are taken by
 `*const`; secret outputs (the key pair, the finalize/evaluate output, the
@@ -293,41 +235,72 @@ bounded at `max_input_length = 2^16 - 1` bytes. Every entry point that takes
 one checks it first and returns `error.InputTooLong` (in `DeriveKeyPairError`,
 `BlindError`, `FinalizeError`, `EvaluateError`, `FinalizeVerifiableError`,
 `FinalizeBatchError`, `PoprfEvaluateError`, `PoprfDirectEvaluateError`, and
-`poprfInfoScalar`'s own `InputTooLongError`). Until 2026-11-13 the bound was a
-`std.debug.assert` followed by an `@intCast` — a panic in safe builds and UB in
-ReleaseFast for a slice a caller can pass. Test: `suite_kat_test.zig` "2^16-1
+`poprfInfoScalar`'s own `InputTooLongError`); the bound is a checked error, never an assert
+followed by an `@intCast`, which would be a panic in safe builds and UB in ReleaseFast for a slice a
+caller can pass. Test: `suite_kat_test.zig` "2^16-1
 input bound" (65536 refused, 65535 accepted, every entry point, two suites).
 
-## Left out (deliberately)
+## Verification
+
+Run: `scripts/modtest voprf`. Tests sit beside the code (`kat_test.zig`, `suite_kat_test.zig`,
+`h2c_test.zig`, `sweep_test.zig`, `stackprobe_test.zig`, `fuzz_test.zig`).
+
+- **RFC 9497 Appendix A.1 (ristretto255-SHA512), byte-exact:** `deriveKeyPair` gives `skSm` (all modes)
+  and `pkSm` (VOPRF/POPRF); `blind`/`blindPoprf` give every `BlindedElement` (transitively pinning
+  `HashToGroup` = `expandMessageXmd` + `Ristretto255.fromUniform`); `blindEvaluate*` gives every
+  `EvaluationElement`; `generateProof` with the vector's `ProofRandomScalar` gives every `Proof`,
+  including both batch-size-2 vectors (pinning the full transcript order); `verifyProof` accepts each
+  published proof and rejects a bit-flipped `c`, a bit-flipped `s`, a wrong `pkS` and swapped batch
+  elements; `finalize*` gives every `Output`; direct `evaluate*` agrees with each blinded round trip;
+  fresh-key end-to-end round trips for all three modes; `expandMessageXmd` standalone against RFC 9380
+  Appendix K.3.
+- **Every suite** (`suite_kat_test.zig`, vectors generated from the RFC text by `tools/gen_vectors.py`):
+  A.1-A.5, every mode, every vector: `skSm`/`pkSm`, `BlindedElement`, `EvaluationElement`, `Proof`
+  (batch-of-2 included), `Output` through `finalize*`, the batch finalize and the direct `evaluate*`;
+  tampered proofs and the untweaked POPRF key refused; the context objects reproduce Test Vector 1 of
+  every suite and mode; every `Ciphersuite` maps to its instance with the RFC's wire sizes; the NIST
+  suites' `DeserializeElement` refuses uncompressed, identity and off-curve encodings; a zero blind is
+  a value at `blind` and refused at `finalize`; `scalarFromWideBytes` is canonical at every width.
+- **Hash-to-curve** (`h2c_test.zig`): RFC 9380 J.1.1/J.2.1/J.3.1 intermediates (`u`, `Q0`, `Q1`, `P`) and
+  K.1/K.3 (both lengths, i.e. the multi-block XMD loop), the SSWU constants, and the exceptional
+  `tv2 == 0` map case.
+- **Refusals:** a proof whose `s` is re-encoded as `s + L` is refused (std's ladder multiplies it
+  exactly as `s`, so without the canonicity check a second encoding of the same proof would verify), a
+  C/D length mismatch, a non-canonical blind at `finalize`, `skS == -m` and `pkS == -m*G` in POPRF, a
+  non-canonical `Proof.fromBytes`, an empty or mismatched batch (an error, not an assert).
+- **Input bound:** a 65536-byte `input`/`info` is `error.InputTooLong` at every entry point and 65535 is
+  accepted (two suites).
+- **No-panic sweep** (`sweep_test.zig`, one test per finding): a batch longer than `max_batch_length` is
+  an error at every batch entry point; all-0xff and all-zero secrets never panic on any suite or entry
+  point; hostile element and proof encodings are errors on every suite; wiped per-role objects stay
+  total; `expandMessageXmd` accepts the whole 1..255 DST range.
+- **Dead-stack residue:** `stackprobe_test.zig` (ReleaseFast/ReleaseSmall only), see *Secret residue on
+  the dead stack*; ristretto255 only (→ Backlog).
+- **Fuzz:** harnesses generic over their choice source, run by `std.testing.fuzz` and by the
+  deterministic driver `VOPRF_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver): `voprf-decode`,
+  `voprf-decode-suites`, `voprf-oprf`, `voprf-verifiable`, `voprf-poprf`.
+- **Constant time:** `src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh voprf`, 15 targets
+  (5 suites × server/client/keygen); the pinned table is `scripts/checks/ctgrind-expected.tsv` and the
+  card's Hardening line summarises it. The ristretto255 multiply itself is checked in `ct25519`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
+
+## Performance
+
+`zig build bench-voprf` (`tools/bench.zig`, ReleaseFast) against CIRCL's `oprf` (`tools/go_bench`); batch 1,
+POPRF blind and finalize counted as their sum, because RFC 9497 and this module derive the tweaked key
+in `Blind` while CIRCL defers it to `Finalize`. Before timing, per suite × mode, both sides are
+cross-checked: the same `DeriveKeyPair` key, byte-equal FullEvaluate outputs and blinded elements (same
+blind scalar), our server's evaluation and proof finalized by CIRCL, CIRCL's finalized by us. The
+current figures, with their date, are the card's `**Performance:**` line; they are not repeated here.
+
+## What is deliberately not done
 
 - **`GenerateKeyPair`/`RandomScalar` with an internal RNG** (§3.2/§2.1)
   — no-RNG module policy; `deriveKeyPair` + caller-supplied randomness
   cover both KATs and production use.
 - **Serialization frameworks** (facebook/voprf's serde derives) — the wire
   values are the RFC's fixed-width byte strings (`toBytes`/`fromBytes`).
-
-## Performance (2026-11-14)
-
-`zig build bench-voprf` (`tools/bench.zig`, ReleaseFast, against CIRCL v1.6.1
-`oprf` through `tools/go_bench`, Go 1.26; batch 1; best of five after
-doubling the batch past 100 ms). Before timing, per suite × mode: the same
-`DeriveKeyPair` key on both sides, byte-equal FullEvaluate outputs and blinded
-elements (same blind scalar), our server's evaluation and proof finalized by
-CIRCL, CIRCL's finalized by us. Host loaded by other jobs; worst ratio per
-suite over four runs (three on the bench branch, one on main):
-
-| suite | worst ours/CIRCL | best |
-|---|---|---|
-| ristretto255-SHA512 | 0.64–0.73 (one run: oprf fulleval 1.20, not reproduced in three others) | 0.36–0.58 |
-| P256-SHA256 | 0.82–0.86 (one run 1.14 on poprf blindeval, not reproduced) | 0.24–0.40 |
-| P384-SHA384 | 0.63–0.81 | 0.32–0.43 |
-| P521-SHA512 | 0.27–0.44 | 0.12–0.18 |
-
-POPRF splits the client's work differently: RFC 9497 and this module derive
-the tweaked key in `Blind`; CIRCL defers it to `Finalize`. The two rows are
-printed but not paired one to one (ristretto255 `poprf_blind` alone is
-1.11–1.23×); the card counts their sum, the `client` row (0.58–0.65×), which
-does the same work on both sides.
 
 ## Backlog / deferred
 
@@ -340,12 +313,12 @@ does the same work on both sides.
 - **Dead-stack probe for the new suites.** `stackprobe_test.zig` probes the
   ristretto255 entry points only; the other suites run under the same burns
   scaled ×2 (`groups.zig` `burn_scale`), not measured.
-- **zig-libs request: p384 — `Fe.cMov` builds its mask from the bare bit**
-  (2026-11-13). It measured clean under ctgrind, but p521's identical form
+- **zig-libs request: p384 — `Fe.cMov` builds its mask from the bare bit.**
+  It measures clean under ctgrind, but p521's identical form
   compiled to a jump on the bit at ReleaseFast, and p256/p521 now launder
   theirs (`blackBox`). Until p384 does, `h2c.zig`'s `sel` keeps a laundered
   byte select for p384 (`own_select`); then drop it.
-- **Performance leftovers** (bench 2026-11-14, every counted row ≤ 0.86× CIRCL):
+- **Performance leftovers** (every counted row of the card's Performance line is <= 0.86x CIRCL):
   `powC1` in `sqrt_ratio` is a plain square-and-multiply (an addition chain
   would cut it), and the composite sums use one `mulPublic` per term instead
   of a multi-scalar multiply. "fastest" is unmeasured: facebook/voprf (Rust)

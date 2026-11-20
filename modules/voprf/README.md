@@ -52,9 +52,17 @@ Every secret-handling entry point burns the stack it used before it returns
 
 See `SPEC.md` for the threat model and the DLEQ transcript details.
 
+**Deps:** `ct25519`, `decaf448`, `p256`, `p384`, `p521`.
+
+## Not provided
+
+No internal RNG (`GenerateKeyPair`/`RandomScalar`: callers pass randomness, see `scalarFromWideBytes`) and no
+serde-style encodings beyond the RFC's fixed-width byte strings (`toBytes`/`fromBytes`); see `SPEC.md`
+§ What is deliberately not done.
+
 Provenance: clean-room from RFC 9497, a public IRTF specification, with its own
 test vectors as the byte-exact anchor. No reference implementation consulted.
 Detail in this module's own [`NOTICE`](NOTICE); it carries no condition beyond
 zig-libs' MIT license.
 
-Test: `zig build test-voprf`
+Test: `scripts/modtest voprf`
