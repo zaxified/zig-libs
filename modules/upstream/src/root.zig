@@ -1553,7 +1553,7 @@ test "concurrent call(): per-upstream bulkhead cap is never exceeded, nothing le
     try testing.expectEqual(2, ps.healthy);
 }
 
-// ── core (2026-10-04): membership while serving, ring hash, P2C ─────────────
+// ── core: membership while serving, ring hash, P2C ─────────────
 
 test "remove while a call is in flight: the report still lands, reap frees only the idle" {
     var pool: Pool = .init(testing.allocator, .{});
@@ -1902,7 +1902,7 @@ test "sweep: membership churn keeps every invariant under every strategy" {
         _ = pool.reap();
         try testing.expectEqual(0, pool.retiredCount());
     }
-    // Measured 2026-10-04: picks 8286, null picks 4295 (each checked against
+    // Measured: picks 8286, null picks 4295 (each checked against
     // the model), removes 1899, reaped 1564, drained member-steps 25473.
     try testing.expect(reach.picks > 7000);
     try testing.expect(reach.null_picks > 3000);
@@ -1963,7 +1963,7 @@ test "concurrent call() while another thread removes, re-adds and reaps members"
     try testing.expectEqual(0, pool.stats().in_flight);
 }
 
-// ── tests added for mutation survivors (2026-10-04) ─────────────────────────
+// ── tests added for mutation survivors ─────────────────────────
 
 test "remove of the member the rotation points at: the one after it is next" {
     var pool: Pool = .init(testing.allocator, .{});
