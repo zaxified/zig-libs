@@ -419,6 +419,11 @@ single timings swing 5–10 % with layout and load.
   the table, but `midAfter` has no room: every two-byte code point from that state is stepped
   uncached until some new state forces a flush. Not seen in the bench (≤ 20 states); a fix would
   flush from `midAfter` at a point where `s` can be re-interned.
+  *Tried 2026-11-20, not kept:* flushing from `midAfter` (re-interning `s` and the next state) is
+  a few lines, but on the golden work table's 12-state table over Czech text it made the forward
+  steps 404 → 1,507 and the flushes 0 → 32 — a working set past the limit thrashes where the old
+  policy keeps the first states cached. It needs a measured bench with a working set just past 255
+  states and a give-up heuristic (Rust's lazy DFA quits when it clears too often), not a local change.
 - **The backward search's per-call cost** *(2026-10-27)* — when the tail filter passes, each new
   backward state costs a closure per consuming instruction (~100 ns) and the table starts empty on
   every call (no allocator, no cache between calls): ~1.2 µs for ten states. The `tail` filter
@@ -430,7 +435,7 @@ single timings swing 5–10 % with layout and load.
   shorter, and with fewer than two bytes the first-byte set is used. Non-x86 targets look the
   nibbles up by a select tree (AArch64 has `tbl`), unmeasured.
 - **Intel JCC erratum in the prefilter scan** *(2026-10-19 Q4)* — `Prefilter.next`'s `cmp;jne` back-edge (31–40 % of `isMatch` samples) and a loop in `runDfa` cross a 32-byte boundary in the current layout: mitigated build 0.825–0.856× the cycles (mite 492–537 M → 11–37 M uops). Layout luck, moves with any edit. Fix (user-approved 2026-10-19): the scan loop in inline asm behind `.p2align 5`, or at least `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py` after each compiler bump.
-- **A DFA for searches with positions** *(survey 2026-10-07; the `isMatch` DFA done 2026-10-07
+- **A DFA for searches with positions — DONE** (`FindDfa`: forward pass with the start tracked, backward `Back` for the rest, kept in the `Matcher`; see Performance) *(survey 2026-10-07; the `isMatch` DFA done 2026-10-07
   night)* — RE2's and Rust's forward + reverse DFA to find a match's span before the
   capture engine runs; dense long-text find-all is already 0.24–0.32 of Go's time, so speed only.
   Would need caller-owned (`Matcher`) cache scratch.
