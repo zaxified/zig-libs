@@ -130,6 +130,8 @@ reason in *What is deliberately not done*; none is something the router-tool con
   the depth chosen at `Store.initOptions` time — an existing store's on-disk fan-out is not migrated
   by changing the option.
 - **Cross-process ingest locking:** an advisory `flock` (`std.Io.File.Lock`) on `tmp/.ingest.lock`
+  (waiting for it is unbounded by default, as `flock` is; `Options.lock_timeout_ns` is an opt-in bound that retries a
+  non-blocking lock and fails with `error.IngestLockTimeout`)
   serializes the commit-and-refcount-mutate section of `casCommit`/`casDelete`/`gc` across
   processes — the has-check+rename+refcount-bump in `casCommit`, the refcount decrement in
   `casDelete`, and the whole sweep in `gc` each hold it for their duration, released on every path
@@ -319,10 +321,8 @@ Survey verdicts (go-ds-flatfs, git, restic, cacache-rs, go-cloud, boxo), one per
   directory fsync per blob is the durability contract, batching it would weaken it.
 
 ## Backlog / deferred
-- **Bounded wait on the ingest lock.** `lockIngest` blocks for as long as another process holds the flock (`gc`
-  holds it for its whole walk). A bounded `try_lock` retry would be the fix. Deferred on purpose: the safe default
-  is to wait (a holder that dies releases the lock), a timeout is a policy the caller should choose, and nothing in
-  the known consumer's backup vault calls `gc` while another writer works.
+
+None open.
 
 ## Anchoring
 

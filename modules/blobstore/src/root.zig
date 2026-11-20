@@ -104,6 +104,9 @@ pub const Error = error{
     /// would mean entering the critical section holding a lock on an inode
     /// nobody else can see.
     IngestLockUnstable,
+    /// `Options.lock_timeout_ns` elapsed while another process or thread held
+    /// the ingest lock; nothing was changed.
+    IngestLockTimeout,
     /// A refcount sidecar exists but does not hold a count. `delete` and
     /// `refcountOf` say so and write nothing: the true count is unknown, and
     /// reading it as low is how `gc` comes to remove a blob others still use.
@@ -143,6 +146,12 @@ const lock_inode_retries: u8 = 8;
 /// store has always used, so opening a store written before this option
 /// existed needs no migration.
 pub const Options = struct {
+    /// How long `casCommit`, `casDelete` and `gc` wait for the cross-process
+    /// ingest lock, in nanoseconds: 0 (the default) waits for as long as the
+    /// holder keeps it (`gc` holds it for its whole walk), anything else
+    /// retries a non-blocking lock every 5 ms and fails with
+    /// `error.IngestLockTimeout` once the time is spent.
+    lock_timeout_ns: u64 = 0,
     /// Number of leading 2-hex-char directory levels the CAS fan-out uses
     /// before the blob file itself, e.g. `fanout = 1` ⇒ `cas/<hh>/<hex>`
     /// (the historical, default layout); `fanout = 2` ⇒
@@ -265,6 +274,8 @@ pub const Store = struct {
     fanout: u8,
     /// Whether `casCommit` maintains `.rc` sidecars; see `Options.refcount`.
     refcount: bool,
+    /// See `Options.lock_timeout_ns`.
+    lock_timeout_ns: u64 = 0,
 
     /// Ensure `base` exists, with the default (historical) fan-out and
     /// refcounting on. Equivalent to `initOptions(io, base, .{})`.
@@ -285,7 +296,7 @@ pub const Store = struct {
     pub fn initOptions(io: std.Io, base: []const u8, options: Options) !Store {
         if (options.fanout < 1 or options.fanout > 32) return error.InvalidFanout;
         try ensureDir(io, base);
-        return .{ .io = io, .base = base, .fanout = options.fanout, .refcount = options.refcount };
+        return .{ .io = io, .base = base, .fanout = options.fanout, .refcount = options.refcount, .lock_timeout_ns = options.lock_timeout_ns };
     }
 
     // ── content-addressed store (dedup at the file level) ──────────────────────
@@ -1000,7 +1011,7 @@ pub const Store = struct {
         // right answer for a store whose lock file is being churned.
         var attempt: u8 = 0;
         while (attempt < lock_inode_retries) : (attempt += 1) {
-            const f = try cwd.createFile(self.io, path, .{ .truncate = false, .lock = .exclusive });
+            const f = try self.createLocked(cwd, path);
             const held = f.stat(self.io) catch {
                 f.unlock(self.io);
                 f.close(self.io);
@@ -1023,6 +1034,25 @@ pub const Store = struct {
             f.close(self.io);
         }
         return error.IngestLockUnstable;
+    }
+
+    /// Create/open the lock file and take the exclusive flock: blocking, or
+    /// (with `lock_timeout_ns`) a non-blocking retry loop that gives up with
+    /// `error.IngestLockTimeout`.
+    fn createLocked(self: Store, cwd: std.Io.Dir, path: []const u8) !std.Io.File {
+        if (self.lock_timeout_ns == 0) return cwd.createFile(self.io, path, .{ .truncate = false, .lock = .exclusive });
+        const start = std.Io.Timestamp.now(self.io, .awake);
+        while (true) {
+            return cwd.createFile(self.io, path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |e| switch (e) {
+                error.WouldBlock => {
+                    const spent = start.durationTo(std.Io.Timestamp.now(self.io, .awake)).nanoseconds;
+                    if (spent >= self.lock_timeout_ns) return error.IngestLockTimeout;
+                    try self.io.sleep(.fromMilliseconds(5), .awake);
+                    continue;
+                },
+                else => return e,
+            };
+        }
     }
 
     fn unlockIngest(self: Store, f: std.Io.File) void {
@@ -2927,6 +2957,22 @@ test "ingest lock: a second locker waits until the first lets go" {
     th.join();
     try t.expectEqual(@as(u32, 0), early);
     try t.expectEqual(@as(u32, 1), got.load(.acquire));
+}
+
+test "ingest lock: with lock_timeout_ns a locker gives up with IngestLockTimeout; once free it succeeds; 0 still waits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var bb: [256]u8 = undefined;
+    const store = try testStore(&tmp, &bb);
+    var timed = store;
+    timed.lock_timeout_ns = 50 * std.time.ns_per_ms;
+    const f = try store.lockIngest();
+    const t0 = std.Io.Timestamp.now(t.io, .awake);
+    try t.expectError(error.IngestLockTimeout, timed.lockIngest());
+    try t.expect(t0.durationTo(std.Io.Timestamp.now(t.io, .awake)).nanoseconds >= 50 * std.time.ns_per_ms);
+    store.unlockIngest(f);
+    const g = try timed.lockIngest();
+    timed.unlockIngest(g);
 }
 
 test "gc: reaps exactly its own temps, counts each, and leaves strangers, young temps and live files alone" {
