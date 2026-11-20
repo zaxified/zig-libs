@@ -10,10 +10,6 @@
 
 **Audit:** review 2026-11-13 · mutation 2026-11-15 (396/414, 18 eq) · src e8a4548dd252cffe
 
-Audit detail: the 2026-11-01 delta (from b20df27a) covers `fuzz_driver.runAll`, `runEach` and `asOptions`: 10 mutants, 9 killed, 1 equivalent (the `@TypeOf(o) == Options` shortcut in `asOptions`, the field copy yields the same value); 3 new tests (anonymous-struct options reach the runner field by field, `runAll` skips when the environment is unset, and the skip-vs-pass probe now fails on a skip instead of passing it); the totals add the delta to the 2026-10-29 run. The 2026-11-13 delta (from c7885d4b) covers `hex.literal`, added by the duplicate-code pass and evaluated wholly at compile time: 2 mutants, 1 killed (a corrupted decode, by `literal infers the length and decodes at comptime`; M0 132/140 clean under the same command), 1 equivalent (the odd-length guard dropped: `std.fmt.hexToBytes` then returns `InvalidLength` and the `catch` still ends in `@compileError`, only the message differs); the branch quota is a comptime constant (arid). The totals add the delta to the earlier runs. The 2026-11-13 `arbitrary` delta (from `25fea3c6`, `src/arbitrary.zig` new): `gen`, `genSlice`, `finishBytes`, `drawCodePoint`, `drawInt`, `drawFloat` whole, schemata in ReleaseSafe — 87 mutants, 84 killed, 2 equivalent (`try` → `catch unreachable` on vector and sentinel-slice elements: scalars, which never allocate), 1 cut at compile (dropping the empty-enum guard makes `Bare` fail to compile; counted with the equivalents, as regex does); the `@compileError`/type-check paths are comptime. Kills come from `ScriptSource`-scripted draws pinning every int/float selector arm, the optional/enum/union branches, slice length bounds, depth per container kind, every UTF-8 class boundary (surrogate gap, U+10FFFF), the ASCII ends, `.any` bytes and OOM at each allocation. Totals now include it.
-
-**Mutation note 2026-11-15 (delta, `src/snapshot.zig` new, from `a3eb6bd33`):** every production region of the file (the matcher, hex decode, failure report, literal rendering, `locate`/`decode`, `rewrite` with its registry and shifts, `resolve`, `writeAtomic`, `rootDepth`/`envGet`/`updateSource`, `check`), schemata in ReleaseSafe, M0 clean under the same command: 315 mutants, 302 killed (298 by a failing test or safety check, 17 of those by the leak detector alone, 4 by the watchdog as hangs), 10 equivalent, 3 unobservable (the card's `18 eq` counts both; 396 = 94 + 302 over 414 = 99 + 315). Equivalent: the odd-digit guard in `hexBytes` and the `else` error arm below it (`std.fmt.hexToBytes` repeats the odd check and cannot fail otherwise on even input); `>=` for `==` in `writeTextDiff` (`findDiff` never exceeds either length); `>` for `>=` in `locateAt` (at `at == text.len` the empty tail does not start with `@src()`, same error); `line_end > i` (a multiline line holds at least `\\`); `e > p + 2` in `decode` (the byte before is the second backslash); `<` for `<=` in the shift loop (a recorded edit never ends exactly at the next call's region start); `ind_end < at` (the `@` stops the loop); `at + line_end > 0` (never 0). Unobservable without fault injection: the directory-iteration error arm, the `else` arm of the `modules` open (needs a permission-denied directory, unreliable as root), and the `openDir` of the root just found. Tests added: `lineFrom`/`offsetOf`/`shifted` edges, a hand-built registry whose shift would pass before the file start, double `deinit`, a directory as source path, exact and +1 `max_source` files, comma-at-EOF / trailing-newline / stray-comma literals, one-tab and three-space indentation with a CR-ended last line, UTF-8-valid single-line regions and small hex bytes, anchored excerpt-length and hex length-mismatch reports, undecodable candidates, symlinked and file-named `modules`, a descriptor-leak count, and the real environment path driven by replacing `std.testing.environ`, changing directory into a throwaway tree and pointing fd 2 at a file: `check` in compare and update mode, `updateSource` from depth 0, 1 and 2 with and without `TESTKIT_SNAPSHOT_ROOT`, `rootDepth` up to 8 and beyond, `envGet`. The audit found one production off-by-one, fixed: `readSource` used `.limited(max_source)`, and `readFileAlloc` fails when the limit is *reached*, so a file of exactly `max_source` bytes was refused although the documentation and the write check allow it. Totals now include it.
-
 **Hardening:** fuzz 2026-10-17 (TESTKIT_FUZZ, clean: hex 2M, golden 1M, fault 1.6M, tape 240k runs; 5 planted mutants all killed) · ct n/a — test helpers (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: env/file inputs capped, saturating deadlines, checked panics for caller ranges, foreign bench runs capped and timed out)
 
 **Performance:** ref 0.24–0.48× proptest 1.11.0 · fastest 1.03× libFuzzer (LLVM 21, in-process, the property kept out of its instrumentation — libFuzzer at its cheapest; per input over the same hex property, `alloc+seedfile` the worst row; both sides JCC-padded, `-Djcc-safe`; the driver alone 0.98–1.06× a bare seed loop) (measured 2026-10-27)
@@ -70,20 +66,23 @@ place to put things a test might one day want.
 | `loopbackSkip` | the hand-written "loopback bind failed, skipping" give-up in ~25 modules (2026-10-01) |
 | `fuzz.driver.run` / `fuzz.Rng` / `fuzz.driver.hit` | the deterministic fuzz driver, copied by hand into seglog and zstd (2026-09-27) before the web-server consumer needed it a third time |
 | `stackprobe.Probe` | the dead-stack probe engine, copied into 55 modules' `stackprobe_test.zig` (27.8k lines, 2026-10-09) with hand-derived needles for every intermediate secret; this one needs none — residue below the burn is found without needles, and only secret inputs/`out` buffers are needles |
-| ~~`bench`~~ | moved to [`benchkit`](../benchkit/README.md) 2026-11-14. Was: the comparison driver behind the `**Performance:**` line: 18 crypto-style `tools/bench.zig` carried the same ~200 lines (`Cycles`, `timeIt`, `foreign`, `drive`, …) and 20 Go-stdlib benches a ~80-line `timeIt`/`goBuild`/`goRun` (2026-10-17) |
 | `guard.Guarded` | brotli's input-at-a-PROT_NONE-page buffer (2026-10-15), the instrument the guard-page fuzz rule (owner rule) asks every `[*]`-reading decoder for |
 
-Three pieces are here because the evidence asked for them rather than because they were copied: **shrinking** (every fuzz FAIL was diagnosed by hand from a whole random input), the **fault transports and allocator** (mqtt 2026-10-17: a double free visible only with a transport that fails halfway), and the shrinker's forked-child runner.
+The comparison bench driver (`bench`) moved to [`benchkit`](../benchkit/README.md); see "The comparison bench driver" below. Three pieces are here because the evidence asked for them rather than because they were copied: **shrinking** (every fuzz FAIL was diagnosed by hand from a whole random input), the **fault transports and allocator** (mqtt 2026-10-17: a double free visible only with a transport that fails halfway), and the shrinker's forked-child runner.
 
 The golden comparison is the one piece that is *better* than what it replaced,
 not merely shared — see below.
 
-Deliberately **not** here: netns setup and privileged-capability probing. Those
-read genuinely differently per module (`tc` wants a fresh netns with `lo` at
-ifindex 1; `ebpf` wants `CAP_BPF` in the *initial* user namespace, where
-`unshare -r` actively lies to you), and a shared abstraction would hide exactly
-the distinctions that make those skips correct. The VOPR side is already a
-module: [`netsim`](../netsim).
+## What is deliberately not done
+
+- **netns setup and privileged-capability probing.** Those read genuinely differently per module (`tc` wants a
+  fresh netns with `lo` at ifindex 1; `ebpf` wants `CAP_BPF` in the *initial* user namespace, where `unshare -r`
+  actively lies to you), and a shared abstraction would hide exactly the distinctions that make those skips
+  correct. The VOPR side is already a module: [`netsim`](../netsim).
+- **A snapshot review mode** (a `.snap.new` side file to accept or reject one by one). The in-place rewrite plus
+  `git diff` / `git checkout -p` is the review the repository already has; a side file would add a second place for a
+  snapshot to live in. `snapshot.zig` is a test-only file like the rest, so `check-testonly` still holds.
+- **A place for things a test might one day want**: a piece is admitted only on measured duplication or on evidence (the admission rule above).
 
 ## Use
 
@@ -313,11 +312,7 @@ is `error.SnapshotTooLarge`; an allocation failure is `error.OutOfMemory`,
 raised before anything is written, so the file is either untouched or complete.
 Nothing here panics on any input.
 
-**Not done: a review mode** (a `.snap.new` side file to accept or reject
-one by one). The in-place rewrite plus `git diff` / `git checkout -p` is the
-review the repository already has; a side file would add a second place for a
-snapshot to live in. `snapshot.zig` is a test-only file like the rest, so
-`check-testonly` still holds.
+There is no review mode: see *What is deliberately not done*.
 
 ## Faults drawn like any other choice
 
@@ -374,7 +369,7 @@ are what the tests exercise. That is not tidiness — a test asserting "this
 comparison fails" would otherwise print its own diagnostic on every green run,
 and this repo treats any stderr from the suite as a real problem.
 
-## ⚠ The one thing not verified here
+## Open: the one thing not verified here
 
 `verbose_skip_env`'s **value** — the string `"ZIG_LIBS_VERBOSE_SKIP"` — is not
 pinned by any test, and cannot be: a test reading the same literal it checks is
@@ -393,19 +388,14 @@ zig build bench-testkit -Djcc-safe              # cost per input vs proptest, li
 TESTKIT_FUZZ=200000 zig build test-testkit -Doptimize=ReleaseSafe   # the fuzz verdict
 ```
 
-`check-testonly` is the one worth knowing about. `test_deps` claims the
-published module never needs the harness, and **nothing checked that**: Zig
-analyses container-level decls lazily, so an unused `@import("testkit")` in a
-module's non-test code is simply never looked at. Verified by planting
-`pub const leaked_probe = testkit.verbose_skip_env;` in `netlink` — every
-dependent still built green. The step forces the analysis with a
-consumer-shaped probe, and the planted leak then fails it while
-`zig build test-netlink` stays green.
+The card's `**Audit:**` line is the current review and mutation score (cumulative over the last whole-module mutation
+run and the delta runs after it).
 
-Forcing that analysis also compiles public code nothing had ever referenced,
-which immediately found two dead-but-broken declarations: `enip`'s
-`UdpDiscovery.send` constructed an `Ip6Address` with fields Zig 0.16 does not
-have, and `ethtool`'s `max_error_message` took `.len` of a *type*.
+`check-testonly` is the one worth knowing about. `test_deps` claims the published module never needs the harness, and
+**nothing else checked that**: Zig analyses container-level decls lazily, so an unused `@import("testkit")` in a
+module's non-test code is simply never looked at. The step forces the analysis with a consumer-shaped probe, so a
+leak into published code fails it while that module's own `zig build test-<m>` stays green. Forcing that analysis also
+compiles public code nothing had ever referenced.
 
 Provenance: original work of the zig-libs authors (MIT); a thin layer over
 `std.testing`. No third-party source consulted or copied, so no `NOTICE` entry
@@ -428,40 +418,66 @@ vendored or shipped. DATA: none. `src/golden.zig` is named for what it compares,
 
 ## Performance
 
-**Against the field, 2026-10-27** (owner's choice: reference proptest, fastest candidate libFuzzer/AFL++; `zig build bench-testkit -Djcc-safe`, wall time, ns per input, two runs of 3 and 5 rounds, best of rounds):
+The bench is `zig build bench-testkit -Djcc-safe` (`tools/bench.zig`; needs `cargo`, for the crates pinned in
+`tools/proptest_rust/Cargo.lock`, and `clang` with its libFuzzer runtime): the driver's cost per input against proptest
+(the reference) and libFuzzer (the fastest candidate), in rows `hex`, `hex+seedfile`, `alloc` and `alloc+seedfile`,
+ratios by wall time. The card's Performance line holds the figures (the card is authoritative).
 
-| row | driver | proptest 1.11.0 | libFuzzer (LLVM 21) | /ref | /fastest |
-|---|---|---|---|---|---|
-| `hex` | 293–294 | 1 204–1 240 | 561–582 | 0.24 | 0.51–0.52 |
-| `hex+seedfile` | 297–310 | 1 196–1 213 | 562–565 | 0.25–0.26 | 0.53–0.55 |
-| `alloc` | 571–586 | 1 231–1 246 | 588 | 0.46–0.48 | 0.97–1.00 |
-| `alloc+seedfile` | 585–599 | 1 246–1 283 | 584–594 | 0.47 | 0.99–1.03 |
+The property is the same on every side: a byte string of at most 160 bytes mapped to hex digits and decoded; `alloc`
+adds two heap allocations per input — through the driver's leak-checking `SafeAllocator` on our side, glibc `malloc` on
+libFuzzer's. Ours and proptest draw lengths the same way (half up to 64 bytes, half up to 160).
 
-The property is the same on every side: a byte string of at most 160 bytes mapped to hex digits and decoded; `alloc` adds two heap allocations per input — through the driver's leak-checking `SafeAllocator` on our side, glibc `malloc` on libFuzzer's. Ours and proptest draw lengths the same way (half up to 64 bytes, half up to 160; mean ≈ 56).
-
-libFuzzer is measured **at its cheapest**: the property is compiled out of its instrumentation (`noinline`, `no_sanitize("coverage")`), so only its own loop — mutation, coverage collection over the callback, corpus upkeep — is timed. Instrumented as a user would write it, its per-byte compare tracing was 37 % of the profile and the input cost 1.5–1.7 µs (2026-10-27, `perf record`), a cost of the property's code, not of the driver. Without the property's coverage it also keeps its inputs short (≈ 25 bytes on average against our 56, printed by the bench), which favours it again. The `alloc` rows are the only ones near 1.0: two allocations through a leak-checking allocator per input against plain `malloc` on half the bytes. AFL++ is not measured: not installed here, and its fork-server execution costs far more per input than an in-process loop.
-
-Under `-Djcc-safe` the bench set `BENCH_JCC_SAFE` with `setEnvironmentVariable`, which clones the configure-time environment into Zig 0.17's cached build graph: `BENCH_ROUNDS=5` ran 3 rounds (and every bench's `BENCH_*`, `LIBBROTLI_DIR` were frozen the same way). `build.zig` now sets it through `env`, so the bench inherits the maker's environment.
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-testkit`, `BENCH_ROUNDS=5`, wall time, largest spread 3.7 %): driver/bare 1.03 (`hex`), 1.04 (`hex+seedfile`), 1.07 (`alloc`, `alloc+seedfile`). The first 0.17 run read **4.24×** on `hex`: the 0.17 migration gave every seed its own `SafeAllocator`, whose init + deinit (`threads: [128]Thread`) cost ~1 µs, against a 0.3 µs harness. The driver now renews it per batch (1024 seeds or 64 MiB allocated) and pins a leak on its seed through a counting `SeedLedger`. The bare loop now also allocates through one `SafeAllocator` (it used the `DebugAllocator` directly, which on 0.17 cost 25 µs a seed for two allocations, so the `alloc` rows read 0.03× — not a comparison).
+libFuzzer is measured **at its cheapest**: the property is compiled out of its instrumentation (`noinline`,
+`no_sanitize("coverage")`), so only its own loop — mutation, coverage collection over the callback, corpus upkeep — is
+timed. Instrumented as a user would write it, its per-byte compare tracing dominates, a cost of the property's code, not
+of the driver. Without the property's coverage it also keeps its inputs short (about 25 bytes on average against our
+56, printed by the bench), which favours it again. The `alloc` rows are the only ones near 1.0: two allocations through
+a leak-checking allocator per input against plain `malloc` on half the bytes. AFL++ is not measured: not installed
+here, and its fork-server execution costs far more per input than an in-process loop. The driver renews its
+`SafeAllocator` per batch (1024 seeds or 64 MiB allocated) and pins a leak on its seed through a counting
+`SeedLedger`, so the per-seed allocator set-up does not dominate a cheap harness.
 
 ## Backlog / deferred
-- **Regex-string strategy and strategy combinators** (proptest `"[a-z]+"`, Hypothesis `from_regex`, `prop_map`/`filter`): `arbitrary` ships the type mapping only (2026-11-13). A regex strategy needs testkit → `regex`, a test-only module depending on a published one (`check-testonly` forbids the reverse, this would be the first edge from the harness into a library) — owner question. Combinators: a type's own `arbitrary` decl covers the registered-strategy case; map/filter are a wrapper type away and not asked for.
-- **Stateful (model-based) testing** — see the op-sequence item below; still open.
-- **`stackprobe` is blind above the longest zero run** *(sealedbox delta review, 2026-11-02)* — residue is counted only below that run, so an inner burn in a dependency hides a missing outer burn in the entry point (sealedbox `seal` stayed green with its burn removed: the run began 2.1 KiB down). `sealedbox` pins `Report.burn_top` as a workaround. Wanted: an option stating the expected burn top. Other modules that nest burns have not been checked.
-- **Delta audit 2026-10-29 (§ GK):** 36 mutants, 27 killed on the first run; 2 more by new tests (audit TK-18 `FaultPlan.chunk` index past n_chunks 200, TK-13 spurious poll wake-up) → 29. 7 argued, counted eq: TK-16 a failed poll inside `child.run` (no seam: `run` calls the real poll; `waitReadable`'s failure verdict is tested), TK-14 the i32 poll-ms cap (> 24 days), TK-22/31/32 the u32 slice caps (> 4 GiB buffer), TK-24 `perSecond` zero-elapsed branch (n > 1.8e16), TK-33 print-only DONE line. ReleaseSafe, unfiltered suite.
-- **No-panic sweep 2026-10-29 (§ GK):** left: (`bench.timeIt` on a frozen clock moved with `benchkit`); R-TK-7 two jobs given the same `<PREFIX>_SEEDFILE` truncate each other's mapping → SIGBUS (docs: one file per job); R-TK-8 `stackprobe` paints `Config.window` below the stack pointer without checking the stack size (a small thread stack faults); R-TK-9 a `prefix` over ~85 bytes overflows `env()`'s key buffer → the variable is silently ignored.
 
-- ~~Shrinking for `fuzz.driver`~~ — done 2026-10-17 (see "Shrinking a failing seed").
-- **Model-based op-sequence harness** (`ops` vs a model, generic over Impl/Model; proptest-state-machine, Go `rapid`): E1 waves 10-11..10-17 wrote a `model_test.zig` per module, in shapes that differ. Count the shared part before adopting (this module's admission rule).
-- **Mutant switch** (`testkit.mutant("id")` over one env var, for schemata runs): every mutation run re-writes the switch; the runners themselves stay disposable (CONVENTIONS §9). Admit once two runs would have used it.
-- **Multiplexed cycle counter not detected** (2026-10-21, found by tlsserver's bench): `Cycles.read` reads the raw count; when the PMU multiplexes (other perf users, the NMI watchdog, more events than counters) the count covers only part of the run and the best-of-rounds picks the undercount — a ratio by cycles then disagrees with wall time. Ideal: open with `PERF_FORMAT_TOTAL_TIME_ENABLED | _RUNNING` and treat `running < enabled` as no counter (wall time), on both sides (the C harness is copied per module, so the shared C block needs the same). The leak of one counter per `drive` call that triggered it is fixed (`Cycles.close`).
-- **Shrinking a `std.testing.Smith` input** (`_INPUT`): the tape covers the driver's `Rng` only; a `--fuzz` crash input is replayed whole.
-- ~~**Golden-update mode (`ZIG_LIBS_UPDATE_GOLDEN=1` rewrites the expected literal)** (survey 2026-09-30)~~ — done 2026-11-15 as `expectSnapshot` / `expectSnapshotHex` with `TESTKIT_SNAPSHOT=update` (see "Inline snapshots with an update workflow"). Open: a build option handing each module's source directory to the test binary would replace the candidate search; an interactive review mode (`.snap.new`); `expectHex` / `expectBytes` goldens have no update (their expected value is a hex string made from the capture tool, convert a call to `expectSnapshotHex` to get one).
-- **Deliberately not doing (existing reason)**: netns and capability probing helpers stay out (see "Deliberately **not** here" above: they read differently per module).
-- ~~**2026-10-19 — Zig 0.17.0 miscompile #37131** in `ScriptSource.valueRangeAtMost`~~ — done 2026-10-27: the span and the result are computed in the unsigned image of `T` (sign bit flipped for signed `T`), no signed-to-narrower-unsigned cast; test "ranged draws over a span of 2^63 or more stay exact".
-- **Review 2026-10-27, deferred** (fixed in the same pass: `_INPUT` replay whole, a non-reproducible recorded tape refused, the #37131 casts, a seed range at the top of u64, the watchdog's raw write, `doNotOptimizeAway` in the timed loop, the little-endian seed length prefix):
-  - **Same signal ≠ same panic** (`shrink.zig` `tryTape`): a SIGABRT candidate is accepted whatever the panic said. Ideal: the child's panic handler writes the message (or the first return address) into the shared mapping, compared like the error name. Needs a panic hook in the test root — it is the consumer's root, not ours.
-  - **A run that selects no harness is green** (`<PREFIX>_ONLY=typo`): every harness skips. Ideal: the per-core runner (`~/.claude/fuzzing.md`) requires one `DONE <name>` line per expected harness; the driver alone cannot know the expected set.
-  - **Stack-probe secrets too short or too uniform for a needle window** now count in `Report.unprobed_secrets` and print a warning; make it an error once a tag lane shows how many of the 287 calling files would trip.
-  - Smaller: reach counters not atomic and the 48-label cap silent (`hit`); the process-global `dog_running` is wrong in a forked child that ran no watchdog of its own; `guard` regions are not cleared between seeds; a hand-built `FaultPlan` with a zero chunk reads 0 forever and `failingAllocator` never fails `resize`/`remap`; `bench` keeps only the last round's count, reports a worst ratio of 0 when every row is filtered out, and parses `nan`/`inf` and empty fields in a foreign row; `child`'s no-pidfd fallback returns `WaitFailed` unreaped and does not kill the child's own descendants.
+- **Regex-string strategy and strategy combinators** (proptest `"[a-z]+"`, Hypothesis `from_regex`, `prop_map`/`filter`):
+  `arbitrary` ships the type mapping only. A regex strategy needs testkit → `regex`, a test-only module depending on a
+  published one (`check-testonly` forbids the reverse; this would be the first edge from the harness into a library) —
+  an owner question. Combinators: a type's own `arbitrary` decl covers the registered-strategy case; map/filter are a
+  wrapper type away and not asked for.
+- **Model-based (stateful) op-sequence harness** (`ops` vs a model, generic over Impl/Model; proptest-state-machine, Go
+  `rapid`): many modules wrote a `model_test.zig` of their own, in shapes that differ. Count the shared part before
+  adopting (this module's admission rule).
+- **`stackprobe` is blind above the longest zero run** (found in the sealedbox delta review): residue is counted only
+  below that run, so an inner burn in a dependency hides a missing outer burn in the entry point (sealedbox `seal` stayed
+  green with its burn removed: the run began 2.1 KiB down). `sealedbox` pins `Report.burn_top` as a workaround. Wanted:
+  an option stating the expected burn top. Other modules that nest burns have not been checked.
+- **Mutant switch** (`testkit.mutant("id")` over one env var, for schemata runs): every mutation run re-writes the
+  switch; the runners themselves stay disposable (CONVENTIONS §9). Admit once two runs would have used it.
+- **Multiplexed cycle counter not detected** (found by a TLS server's bench): `Cycles.read` (now in `benchkit`, where
+  the fix belongs) reads the raw count; when the PMU multiplexes (other perf users, the NMI watchdog, more events than
+  counters) the count covers only part of the run and the best-of-rounds picks the undercount — a ratio by cycles then
+  disagrees with wall time. Ideal: open with `PERF_FORMAT_TOTAL_TIME_ENABLED | _RUNNING` and treat `running <
+  enabled` as no counter (wall time), on both sides (the C harness is copied per module, so the shared C block needs the
+  same).
+- **Shrinking a `std.testing.Smith` input** (`_INPUT`): the tape covers the driver's `Rng` only; a `--fuzz` crash input
+  is replayed whole.
+- **A build option handing each module's source directory to the test binary** would replace the snapshot update's
+  candidate search over the tree (`expectHex` / `expectBytes` goldens have no update: their expected value is a hex
+  string made from the capture tool; convert a call to `expectSnapshotHex` to get one).
+- **Same signal ≠ same panic** (`shrink.zig` `tryTape`): a SIGABRT candidate is accepted whatever the panic said. Ideal:
+  the child's panic handler writes the message (or the first return address) into the shared mapping, compared like the
+  error name. Needs a panic hook in the test root — it is the consumer's root, not ours.
+- **A run that selects no harness is green** (`<PREFIX>_ONLY=typo`): every harness skips. Ideal: the per-core runner
+  requires one `DONE <name>` line per expected harness; the driver alone cannot know the expected set.
+- **Stack-probe secrets too short or too uniform for a needle window** count in `Report.unprobed_secrets` and print a
+  warning; make it an error once a tag lane shows how many of the 287 calling files would trip.
+- **Two jobs given the same `<PREFIX>_SEEDFILE`** truncate each other's mapping → SIGBUS (docs: one file per job).
+- **`stackprobe` paints `Config.window` below the stack pointer** without checking the stack size (a small thread stack
+  faults).
+- **A `prefix` over ~85 bytes** overflows `env()`'s key buffer → the variable is silently ignored.
+- **Smaller:** reach counters not atomic and the 48-label cap silent (`hit`); the process-global `dog_running` is wrong
+  in a forked child that ran no watchdog of its own; `guard` regions are not cleared between seeds; a hand-built
+  `FaultPlan` with a zero chunk reads 0 forever and `failingAllocator` never fails `resize`/`remap`; `bench` (now in `benchkit`) keeps only
+  the last round's count, reports a worst ratio of 0 when every row is filtered out, and parses `nan`/`inf` and empty
+  fields in a foreign row; `child`'s no-pidfd fallback returns `WaitFailed` unreaped and does not kill the child's own
+  descendants.
