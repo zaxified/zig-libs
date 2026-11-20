@@ -77,8 +77,8 @@ The tree is built to be **Canonical-XML-ready**. In document order it preserves:
   `ns_decls` and are NOT present in `attributes` (C14N treats namespace nodes
   separately anyway).
 - **Text** — entity-expanded, line-ending-normalized character content.
-- **CDATA** — kept as a distinct `cdata` child (verbatim content, no entity
-  expansion) but semantically a text node; C14N replaces it with its content.
+- **CDATA** — kept as a distinct `cdata` child (verbatim content apart from
+  line-end normalization, no entity expansion) but semantically a text node; C14N replaces it with its content.
 - **Comments** — preserved (`comment` child + document `prolog`/`epilog`), so
   both with-comments and without-comments C14N are expressible.
 - **Processing instructions** — preserved (`pi` child + prolog/epilog).
@@ -92,8 +92,9 @@ The tree is built to be **Canonical-XML-ready**. In document order it preserves:
 
 ### Normalization performed (and why)
 
-- **Line endings**: literal `\r\n` and `\r` → `\n` in text and attribute values
-  (XML §2.11). C14N operates on an infoset that has already been through this.
+- **Line endings**: literal `\r\n` and `\r` → `\n` in text, CDATA, comment and PI
+  content and attribute values (XML §2.11; in an attribute value the result is
+  then a space, below). C14N operates on an infoset that has already been through this.
 - **Attribute-value normalization** (CDATA-type, since we do not process DTDs):
   literal whitespace (`\t`, `\n`, normalized `\r`) → space; whitespace
   introduced by a character reference (e.g. `&#9;`) is kept verbatim (XML §3.3.3).
@@ -156,9 +157,10 @@ these are canonicalization policy, not infoset data.
 | Vector | Policy | Test |
 |--------|--------|------|
 | **XXE / external entities / external DTD** | `<!DOCTYPE>` is **rejected by default** (`error.DoctypeForbidden`) — an external subset is never even inspected. With `doctype = .ignore` the DTD is *skipped without parsing any entity declaration*; the parser has **no filesystem/network code path at all**, so `SYSTEM "file:///…"` can never be dereferenced, and the later `&xxe;` fails as `UndefinedEntity`. | `security XXE: *` (incl. a positive control) |
-| **Entity-expansion DoS** (billion laughs / quadratic blowup) | Under the default `.reject` and under `.ignore`, user-defined general entities are **never expanded**: only the 5 predefined + numeric refs; a custom `&lol3;` is undefined ⇒ `UndefinedEntity` (or `DoctypeForbidden`). Under the opt-in `.internal_entities` (2026-10-04) they expand, within one budget charged per byte AND per reference (`max_entity_expansion`, 1 MiB) and a depth cap (`max_entity_depth`, 8) ⇒ `EntityLimit`; loops ⇒ `EntityLoop`; external/parameter entities never read. | `security billion-laughs: *`, `entities: limits are exact`, `entities: references to EMPTY text still spend the budget`, core vector "billion laughs" |
+| **Entity-expansion DoS** (billion laughs / quadratic blowup) | Under the default `.reject` and under `.ignore`, user-defined general entities are **never expanded**: only the 5 predefined + numeric refs; a custom `&lol3;` is undefined ⇒ `UndefinedEntity` (or `DoctypeForbidden`). Under the opt-in `.internal_entities` they expand, within one budget charged per byte AND per reference (`max_entity_expansion`, 1 MiB) and a depth cap (`max_entity_depth`, 8) ⇒ `EntityLimit`; loops ⇒ `EntityLoop`; external/parameter entities never read. | `security billion-laughs: *`, `entities: limits are exact`, `entities: references to EMPTY text still spend the budget`, core vector "billion laughs" |
 | **Adversarial nesting / stack exhaustion** | Element depth capped at `Options.max_depth` (default 256); the parser uses an explicit heap stack (no native recursion on nesting). | `security depth: *` (reject + positive control) |
-| **Pathological attribute counts** | Two separate bounds, because a count cap alone is **not** a CPU bound. (a) `Options.max_attributes` (default 4096) ⇒ `TooManyAttributes`. (b) Per-element duplicate detection — duplicate attributes, duplicate namespace declarations, and prefix resolution — is O(k), not O(k²): above `dup_scan_threshold` entries each runs through a hash set instead of rescanning the list. Before (b), one element at the default cap cost 8.4 M name comparisons ≈ 50 ms of CPU for 127 KB of input, pre-authentication. (c) `Element.resolveNs` — the same resolution reached as a *public* call rather than through the parser — is bounded by the same index plus a scope chain that skips non-declaring ancestors, so a consumer resolving one prefix per attribute does not reintroduce the quadratic. Measured: a 4000-deep document costs 51.4 ms of consumer-side resolution before that change, 0.13 ms after; exclusive C14N over it, 31.6 ms → 1.1 ms. | `security bounds: too many attributes`, `security bounds: per-element duplicate detection is linear in k`, `complexity: Element.resolveNs is O(1) in depth and in declaration count` |
+| **Pathological attribute counts** | Two separate bounds, because a count cap alone is **not** a CPU bound. (a) `Options.max_attributes` (default 4096) ⇒ `TooManyAttributes`. (b) Per-element duplicate detection — duplicate attributes, duplicate namespace declarations, and prefix resolution — is O(k), not O(k²): above `dup_scan_threshold` entries each runs through a hash set instead of rescanning the list. (c) `Element.resolveNs` — the same resolution reached as a *public* call rather than through the parser — is bounded by the same index plus a scope chain that skips non-declaring ancestors, so a consumer resolving one prefix per attribute does not reintroduce the quadratic. | `security bounds: too many attributes`, `security bounds: per-element duplicate detection is linear in k`, `complexity: Element.resolveNs is O(1) in depth and in declaration count` |
+| **Breadth / tree size** | `Options.max_depth` bounds nesting and nothing about breadth: a flat document of tiny elements is the cheap shape, and a caller who bounds the SOURCE has not bounded the TREE. `Options.max_elements` (default 1,048,576) caps the number of elements ⇒ `TooManyElements`. The default is generous, not tight: a caller facing untrusted input should set it far lower. | `TEETH: max_elements bounds BREADTH, which max_depth does not` |
 | **Oversized names** | `Options.max_name_len` (default 1 MiB) ⇒ `NameTooLong`. | (bound enforced in `parseNameRaw`) |
 | **Signature-wrapping via duplicate IDs** | Duplicate ID values ⇒ `DuplicateId`. | `security: duplicate ID rejected` |
 | **Invalid input** | Whole input must be valid UTF-8; numeric char refs bounded to valid XML scalar values; malformed markup ⇒ typed errors, **never a panic**. | `security: invalid UTF-8`, `char ref out of range`, the not-wf suite |
@@ -177,63 +179,46 @@ Mismatched / overlapping tags (`MismatchedTag`), unclosed elements
 malformed comments/PIs/CDATA, multiple or missing root elements, and content
 outside the root.
 
-## Out of scope (deliberate)
+## What is deliberately not done
 
 - **Not a validating parser** — no DTD content-model validation; no
   attribute-default or ID/IDREF typing from a DTD (the ID heuristic above stands
   in for the SAML/dsig use case).
-- **No XML 1.1** (`version` must be `1.0`).
+- **No XML 1.1** yet (`version` must be `1.0`, else `UnsupportedVersion`; deferred, see Backlog).
 - **No XPath** — the `xmldsig`/`saml` layers navigate the tree directly.
 - **Encodings beyond UTF-8/UTF-16/ISO-8859-1/US-ASCII** are rejected
-  (`UnsupportedEncoding`); those four are transcoded to UTF-8 (2026-10-04).
+  (`UnsupportedEncoding`); those four are transcoded to UTF-8.
 - **No external resource access of any kind** — by construction, not by config.
 - **Canonicalization / signing themselves** — that is the `xmldsig` layer; this
   module only guarantees the infoset it needs.
 
-## BEHAVIOURAL (2026-09-11, A1 fix campaign round 2, `QUESTIONS-ROUND-2.md` Q5)
+## Conformance details (XML 1.0 / libxml2 / expat agree; the module follows them)
 
-Five divergences from XML 1.0 / libxml2 / expat, previously listed above as
-deliberate scope limits, are now closed by matching the norm exactly (Q5: "the
-newer/more precise norm wins" — XML 1.0 §2.11/§7 and libxml2/expat agree with
-each other here, only this module diverged, so per Q5 rule 1 there is no
-compatibility switch: the norm and the reference implementations already
-agree, only the module needed to change).
+Where XML 1.0 and the two reference implementations agree, the module matches
+them exactly, with no compatibility switch (the norm and the references already
+agree).
 
-- **Line-ending normalization (§2.11) now applies inside comment and PI
-  content too**, not just text/attribute values (former F3). A document with
-  a raw CR inside a `<!--comment-->` or `<?pi?>` now canonicalizes
-  byte-for-byte identically to libxml2/expat instead of one byte off. Verified black-box
-  against `xmllint --c14n` (audit `A1/xml.md` F3, closed).
+- **Line-ending normalization (§2.11) applies inside comment and PI content
+  too**, not only in text, CDATA and attribute values (`normalizeLineEndings`
+  in `parseComment` and the PI parser): a document with a raw CR inside a
+  `<!--comment-->` or `<?pi?>` canonicalizes byte-for-byte as under libxml2/expat.
 - **Name characters are validated against the real Unicode
-  `NameStartChar`/`NameChar` grammar**, decoded from UTF-8, instead of
-  accepting any byte `>= 0x80` (former F4) or trusting the whole-document
-  `utf8ValidateSlice` check as the only thing standing between a name and
-  malformed UTF-8 (former F9 sub-finding "M16" — both close via the same
-  rewrite of `parseNameRaw`). U+00B7 alone at the start of a name, a bare
-  combining character starting a name, and non-Name characters mid-name are
-  now rejected, matching libxml2/expat exactly (verified black-box). This is
-  BEHAVIOURAL: a small number of previously-accepted non-ASCII-but-out-of-
-  grammar names are now `error.InvalidName`.
-- **A PI target starting with `xml` (e.g. `xml-stylesheet`, `xmlfoo`) is now
-  treated identically at byte 0 of the document and everywhere else** (former
-  F7). Only the EXACT target `xml` (any ASCII case) is reserved, per XML 1.0
-  §7 — not every name that merely starts with those three letters. Verified
-  black-box: `<?xml-stylesheet href="a.xsl"?><a/>` now parses, matching
-  xmllint and Python's expat.
-- **`DoctypePolicy.ignore`'s DOCTYPE skip now tracks quote state for the
-  WHOLE declaration**, not just inside an internal subset's `[ ... ]`
-  (former F10), so a literal `>` inside a `SYSTEM`/`PUBLIC` external
-  identifier literal no longer ends the skip early. Verified black-box
-  against xmllint/expat.
-- **`Document.findByAttr` no longer recurses on the machine stack**
-  (former "F5-zbytek"). Same fix and same shape as `Element.textContent`
-  (F5, closed 2026-09-10): an explicit heap stack, bounded by the allocator
-  instead of `ulimit -s`. **API change**: `findByAttr` now takes an
-  `std.mem.Allocator` and returns `std.mem.Allocator.Error!?*Element`
-  instead of `?*Element`. All three in-repo callers (`xmldsig`,
-  `saml`, `netconf`) were updated in the same commit.
+  `NameStartChar`/`NameChar` grammar**, decoded from UTF-8 (`parseNameRaw`,
+  `isNameStartChar`, `isNameChar`), instead of accepting any byte `>= 0x80`.
+  U+00B7 alone at the start of a name, a bare combining character starting a
+  name, and non-Name characters mid-name are `error.InvalidName`.
+- **A PI target starting with `xml`** (`xml-stylesheet`, `xmlfoo`) is accepted
+  at byte 0 of the document and everywhere else alike. Only the EXACT target
+  `xml` (any ASCII case) is reserved (`MalformedPI`), per XML 1.0 §7.
+- **`DoctypePolicy.ignore`'s DOCTYPE skip tracks quote state for the WHOLE
+  declaration** (`parseDoctype`), so a literal `>` inside a `SYSTEM`/`PUBLIC`
+  external-identifier literal does not end the skip early.
+- **`Document.findByAttr` does not recurse on the machine stack**: an explicit
+  heap stack, bounded by the allocator instead of `ulimit -s`, as
+  `Element.textContent`. It takes an `std.mem.Allocator` and returns
+  `std.mem.Allocator.Error!?*Element`.
 
-## 2026-10-04: encodings, internal entities, writer
+## Encodings, internal entities, writer
 
 - **Encodings, transcoded up front.** `detectEncoding` looks at the first bytes only: a UTF-16
   BOM, the Appendix F `3C 00 3F 00` / `00 3C 00 3F` patterns, else (ASCII-compatible) the
@@ -243,7 +228,7 @@ agree, only the module needed to change).
   again against what was detected (`declMatches`: a contradiction is `UnsupportedEncoding` —
   XML §4.3.3 makes it a fatal error; libxml2 lets a UTF-16 BOM win over a "UTF-8" label, so this
   is one deliberate point of stricter-than-libxml2). Spans index `Document.source`, which for
-  transcoded input is the UTF-8 copy. `Options.utf8_only` restores the old refusal for a
+  transcoded input is the UTF-8 copy. `Options.utf8_only` refuses everything but UTF-8, for a
   consumer that wants no transcoding in front of a signature check.
 - **Internal general entities (`DoctypePolicy.internal_entities`, opt-in).** The internal subset
   is parsed for `<!ENTITY>`; other declarations, comments and PIs are skipped quote-aware; a
@@ -255,32 +240,53 @@ agree, only the module needed to change).
   re-entered with spans that point nowhere in the source (an entity whose replacement
   contains markup is `UnsupportedEntity`; libxml2 expands it). **Bounds:** recursion ≤ `max_entity_depth` (and ≤ 16 by the chain array), a name
   already on the chain is `EntityLoop`, and one budget, `max_entity_expansion`, is charged a unit
-  per byte produced AND per reference expanded — the self-review found that bytes alone let
+  per byte produced AND per reference expanded — bytes alone would let
   ten levels of ten references to `""` run 10^10 expansions for free.
 - **Writer (`writer.zig`).** Escaping chosen so a conforming parser reads back what was written
   (§2.4, §2.11, §3.3.3: `>` always escaped so `]]>` cannot appear, CR as `&#xD;`, attribute
   TAB/LF/CR as references); characters outside XML `Char`, non-QNames, `--` in comments, `xml`
   PI targets and `?>` in PI data are refused, never repaired; `]]>` in CDATA splits the section.
   Tree serialization is iterative. The writer differential (`tools/writer_oracle.*`) compares
-  libxml2's C14N of each original with libxml2's C14N of our output: 119 equal, 0 differ.
-- **Mutation 2026-10-04, one equivalent:** dropping the UTF-16 BOM skip leaves a U+FEFF at the
-  head of the transcoded text, which the UTF-8 BOM skip (`EF BB BF`) then removes.
+  libxml2's C14N of each original with libxml2's C14N of our output.
+## Verification
 
-## Validation
+Run with `scripts/modtest xml` (`zig build test-xml`).
 
-Green in Debug and ReleaseFast (UB-checked). Composition:
-- **W3C-pattern well-formed**: nested elements/attributes/document-order,
-  namespace default/prefixed/scoping/shadowing/resolution, mixed content with
-  comments + PIs + CDATA + byte-span round-trip, entity + numeric-ref decoding,
-  attribute-value normalization, ID lookup, inherited namespace axis.
+- **W3C-pattern well-formed** (`src/root.zig`): nested elements/attributes/
+  document-order, namespace default/prefixed/scoping/shadowing/resolution,
+  mixed content with comments + PIs + CDATA + byte-span round-trip, entity +
+  numeric-ref decoding, attribute-value normalization, ID lookup, inherited
+  namespace axis.
 - **W3C-pattern not-well-formed** (the same defect classes as the W3C
-  `not-wf` suite plus Namespaces error cases, as own inputs): mismatched/overlapping/unclosed tags, duplicate
-  attribute, undeclared entity, undeclared prefix, prefix-undeclaration,
-  invalid name, out-of-range char ref, bad comment, multiple/absent roots,
-  top-level text.
-- **Security** (each with a positive control proving the guard has teeth): XXE,
-  billion-laughs, depth cap, attribute-count cap, duplicate ID, invalid UTF-8,
-  encoding/version rejection.
+  `not-wf` suite plus Namespaces error cases, as own inputs): mismatched/
+  overlapping/unclosed tags, duplicate attribute, undeclared entity, undeclared
+  prefix, prefix-undeclaration, invalid name, out-of-range char ref, bad
+  comment, multiple/absent roots, top-level text.
+- **Security**, each with a positive control proving the guard has teeth: XXE,
+  billion-laughs, depth cap, breadth cap (`max_elements`), attribute-count cap,
+  per-element duplicate detection and `Element.resolveNs` staying linear
+  (`complexity:` test), duplicate ID, invalid UTF-8, encoding/version rejection.
+- **Own-input conformance vectors** (`src/wf_test.zig`, `src/wf_vectors.zig`,
+  recipe `tools/gen_wf_vectors.py`): every input is run through `parse`; the
+  verdict for each, and the infoset of each accepted one, is libxml2's (through
+  lxml, as a black box). The deliberate deviations are recorded in the recipe
+  (`ours`); see Anchoring.
+- **Encodings, entities, writer** (`src/core_test.zig`): libxml2's reading of
+  the encoding and entity cases (`src/core_vectors.zig`, recipe
+  `tools/gen_core_vectors.py`) is replayed, and every accepted own
+  well-formedness vector is replayed through `.internal_entities` and
+  round-tripped through the writer.
+- **Writer differential** (`tools/writer_oracle.*`, by hand): libxml2's C14N of
+  each original document is compared with libxml2's C14N of the writer's output.
+- **W3C XML Conformance Test Suite** (by hand): not in the repository (its files
+  grant no right to redistribution); `tools/xmlconf_fetch.sh` downloads it,
+  sha256-pinned, into a gitignored directory and `tools/xmlconf_run.zig` runs
+  it; see `tools/README.md` for the result and the one known disagreement.
+- **Fuzz:** the deterministic driver, `XML_FUZZ=<runs>[,<first seed>]`
+  (`src/fuzz_test.zig`, harness `xml`).
+- **Constant time:** n/a — XML parsing of data that is not secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
 ## Anchoring
 
@@ -291,43 +297,25 @@ Green in Debug and ReleaseFast (UB-checked). Composition:
 
 **What the tests actually contain.** `src/wf_test.zig` runs 491 OWN inputs (`src/wf_vectors.zig`, 245 not-well-formed + 246 well-formed, written for the XML 1.0 productions and the Namespaces 1.0 constraints; recipe `tools/gen_wf_vectors.py`) through `parse`; the verdict for each, and the infoset of each accepted one, is libxml2's (through lxml, as a black box). Six deliberate deviations are recorded in the recipe (`ours`): five places where `doctype = .ignore` skips a misplaced or malformed DOCTYPE that libxml2 refuses, and `xmlns="<XML namespace>"` accepted (CR inside CDATA sections, the third finding, was fixed 2026-10-24). `core_test.zig` replays the accepted ones through `.internal_entities` and the writer. The W3C suite is not in the repository (its files grant no right to redistribute): `tools/xmlconf_fetch.sh` downloads it, sha256-pinned, into a gitignored directory and `tools/xmlconf_run.zig` runs it by hand (2026-10-24: 883 pass, 1 known disagreement, 0 unexpected; see `tools/README.md`).
 
-**How it got there.** Until 2026-10-24 a licence-filtered slice of the W3C suite was vendored (130 cases, FIVE real bugs found in it, DONE 6cc02e8); it was replaced because its files carry no redistribution licence.
-
 ## Backlog / deferred
 
-**2026-10-04:** writer, non-UTF-8 input and internal entities are **done** (see the 2026-10-04 section); still
-deferred, with the reason:
-
-- **Leniencies against libxml2, found 2026-10-24 by the own-input vectors** (recorded as `OURS` in
-  `tools/gen_wf_vectors.py`, pinned by `wf_test.zig`, not yet fixed): (1) under `doctype = .ignore` a
-  second, misplaced, nameless or `]`-without-`[` DOCTYPE is accepted; (2) `xmlns` bound to the XML
-  namespace URI as the default namespace is accepted. ((3), CR kept inside CDATA, fixed 2026-10-24.)
-  Fixing each flips its `OURS` entry. Real suite: XML 1.0 5th-edition
-  version numbers (`1.7`, `x-rmt-008b`) are refused (`UnsupportedVersion`), the runner's one known
-  disagreement.
-
-- **Streaming (pull/SAX) reader** — a resumable tokenizer is a second parser with its own conformance surface; the
-  tree parser is the one the libxml2-anchored vectors cover, and every consumer in the collection (`xmldsig`, `saml`, `xmlenc`,
-  `netconf`, `iec61850`) needs the tree. Next step when a consumer needs it.
-- **Entities with markup in their replacement text** — needs the parser re-entered on replacement text, with spans
-  that cannot index the source; libxml2/expat do it; no consumer needs it.
-- **XML 1.1** — rare; low priority (unchanged).
-
-**Missing and it matters** *(survey 2026-09-30)*:
-
-- **Streaming (pull/SAX) reader** *(survey 2026-09-30)*: expat, quick-xml and zig-xml are stream-first; a user with a
-  large document, or one arriving in chunks, cannot use a whole-document tree. Effort: medium-large (the parser is one
-  pass already; needs a resumable state machine). Fits CONVENTIONS §2: yes.
-- ~~**XML serializer / writer (escaping, namespaces)**~~ *(survey 2026-09-30)* — done 2026-10-04: libxml2, quick-xml and Go all write XML;
-  here only `xmldsig`'s C14N serializes, so `netconf`/`saml` build XML by hand. Effort: small-medium. Fits §2: yes.
-  (Searched: `rg -i 'fn write|serialize|Writer' modules/xml/src/root.zig` finds no writer; no sibling module named xmlwriter in the catalog.)
-- ~~**Non-UTF-8 input (UTF-16, ISO-8859-1, US-ASCII)**~~ *(survey 2026-09-30)* — done 2026-10-04: libxml2/expat/zig-xml accept them; here
-  `encoding=` other than UTF-8 is `UnsupportedEncoding`. Effort: small for UTF-16 + Latin-1 transcoding in front of the
-  parser. Fits §2: yes.
-- ~~**Internal DTD general entities (opt-in, with expansion limits)**~~ *(survey 2026-09-30)* — done 2026-10-04
-  (text-only): roxmltree and expat resolve
-  them; documents with `<!ENTITY ...>` in the internal subset fail today. Effort: medium (amplification bound is the
-  hard part; must stay off by default). Fits §2: yes.
-- **XML 1.1** *(survey 2026-09-30)*: quick-xml and libxml2 have it; rare in practice, effort small-medium. Fits §2: yes. Low priority.
-
-**Deliberately not done** (already stated above under *Out of scope*): validating DTD, XPath, external resource access.
+- **Leniencies against libxml2** (recorded as `OURS` in `tools/gen_wf_vectors.py`,
+  pinned by `wf_test.zig`, not yet fixed; fixing each flips its `OURS` entry):
+  (1) under `doctype = .ignore` a second, misplaced, nameless or
+  `]`-without-`[` DOCTYPE is accepted; (2) `xmlns` bound to the XML namespace URI
+  as the default namespace is accepted. Also open: XML 1.0 5th-edition version
+  numbers (`1.7`, `x-rmt-008b`) are refused (`UnsupportedVersion`), the W3C
+  runner's one known disagreement.
+- **Streaming (pull/SAX) reader** — expat, quick-xml and zig-xml are
+  stream-first; a user with a large document, or one arriving in chunks, cannot
+  use a whole-document tree. A resumable tokenizer is a second parser with its
+  own conformance surface; the tree parser is the one the libxml2-anchored
+  vectors cover, and every consumer in the collection (`xmldsig`, `saml`,
+  `xmlenc`, `netconf`, `iec61850`) needs the tree. Effort medium-large (the
+  parser is one pass already; it needs a resumable state machine); fits
+  CONVENTIONS §2. Next step when a consumer needs it.
+- **Entities with markup in their replacement text** — needs the parser
+  re-entered on replacement text, with spans that cannot index the source;
+  libxml2/expat do it; no consumer needs it.
+- **XML 1.1** — quick-xml and libxml2 have it; rare in practice; effort
+  small-medium; fits CONVENTIONS §2. Low priority.

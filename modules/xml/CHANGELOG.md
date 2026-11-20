@@ -13,22 +13,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   leniencies recorded the same day); `xmldsig` already normalized when canonicalizing, so its digests
   do not change — a consumer reading `.cdata` directly does see LF now.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE (tests, tools and licence only):** the vendored slice of
-  the W3C XML Conformance Test Suite (130 files, `src/testdata/xmlconf/`) is **removed**: its files
-  carry notices that grant no right to redistribute them, and this repository is MIT. Replaced by
-  (a) **own inputs** — `src/wf_vectors.zig`, 491 documents (245 not well-formed, 246 well-formed)
-  written for the XML 1.0 productions and Namespaces 1.0 constraints, recipe
-  `tools/gen_wf_vectors.py`; the expected verdicts and infosets are libxml2's (through lxml, black box),
-  run by `src/wf_test.zig`, `core_test.zig` (`.internal_entities` and writer round trip), and
-  `tools/writer_oracle.py`; and (b) a **fetch-at-test-time runner** for the real suite —
-  `tools/xmlconf_fetch.sh` (sha256-pinned download into the gitignored `tools/xmlconf-suite/`) and
-  `tools/xmlconf_run.zig` (hand-run; first run 2026-10-24: 883 pass, 1 known disagreement
-  `x-rmt-008b` — XML 1.0 5th ed. allows version `1.7`, this module refuses every version but 1.0 —
-  and 0 unexpected, including the previously excluded `xmltest` sub-suite). `NOTICE` no longer lists
-  third-party test text. **Measured differences from libxml2, recorded not fixed** (`ours` in the
-  recipe): `doctype = .ignore` accepts a second, misplaced (after the root, inside the root), nameless
-  or `]`-without-`[` DOCTYPE; `xmlns="http://www.w3.org/XML/1998/namespace"` is accepted; CR (CR LF or
-  lone CR) is kept inside a CDATA section where XML 1.0 §2.11 and libxml2 normalize it to LF.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 

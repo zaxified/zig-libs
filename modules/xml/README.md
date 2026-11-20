@@ -56,15 +56,19 @@ const bytes = target.?.span.slice(source);
   with `.doctype = .ignore` the DTD is skipped without parsing — no external
   entity or external subset is ever dereferenced (the parser has no filesystem
   or network code path).
-- **Billion-laughs-proof**: no user-defined general entities; only the 5
-  predefined entities + numeric character references expand.
-- **Bounded**: `max_depth` (256), `max_attributes` (4096), `max_name_len`
-  (1 MiB), numeric refs bounded to valid Unicode; UTF-8 validated up front.
+- **Billion-laughs-proof**: by default no user-defined general entities; only
+  the 5 predefined entities + numeric character references expand (the opt-in
+  `.internal_entities` below is bounded by a depth cap and one expansion budget).
+- **Bounded**: `max_depth` (256), `max_elements` (1 Mi — generous; set it far
+  lower for untrusted input), `max_attributes` (4096), `max_name_len` (1 MiB),
+  numeric refs bounded to valid Unicode; input checked as valid UTF-8 up front
+  (after transcoding, for the other encodings).
 - **Signature-wrapping guard**: duplicate ID values ⇒ `error.DuplicateId`.
 - Malformed input ⇒ typed `ParseError`, **never a panic**.
 
-Options: `max_depth`, `max_attributes`, `max_name_len`, `doctype`
-(`.reject` | `.ignore`), `id_attr_names`.
+Options: `max_depth`, `max_elements`, `max_attributes`, `max_name_len`,
+`doctype` (`.reject` | `.ignore` | `.internal_entities`), `max_entity_depth`,
+`max_entity_expansion`, `utf8_only`, `id_attr_names`.
 
 - **Role:** codec. **Platform:** any. **Concurrency:** reentrant (allocator +
   borrowed input slice; no shared state). **Deps:** std-only.
@@ -76,7 +80,7 @@ the authors' own too; the expected verdicts come from libxml2 (through lxml)
 used as a black-box oracle. The W3C XML Conformance Test Suite is not shipped:
 it is downloaded on demand (`tools/xmlconf_fetch.sh`). See [`NOTICE`](NOTICE).
 
-## Input encodings, internal entities, writing (2026-10-04)
+## Input encodings, internal entities, writing
 
 - **Encodings.** UTF-8 (BOM optional), UTF-16 LE/BE (BOM, or detected from
   `<?xml` per XML 1.0 Appendix F), ISO-8859-1 (`latin1`) and US-ASCII by their
@@ -101,28 +105,28 @@ it is downloaded on demand (`tools/xmlconf_fetch.sh`). See [`NOTICE`](NOTICE).
   `xml.writeDocument` / `xml.writeElement` serialize a parsed tree
   (iteratively — no recursion). After a write error the output is not usable.
 
-## Out of scope
+## Not provided
 
 Not a validating parser (no DTD content-model validation / DTD-declared
-defaults or ID typing); no XML 1.1; no XPath; no streaming/pull reader;
-entities whose replacement text holds markup; encodings beyond UTF-8/16,
-ISO-8859-1 and US-ASCII. Canonicalization and signature verification themselves live in the
-`xmldsig` layer — this module only guarantees the infoset that layer needs. See
-`SPEC.md` for the full parse model, C14N-fidelity guarantees, and threat model.
+defaults or ID typing), no XPath, no external resource access, no
+canonicalization or signature verification (the `xmldsig` layer builds on the
+infoset this module guarantees); and, for now, no XML 1.1, no streaming/pull
+reader, no entities whose replacement text holds markup, and no encodings
+beyond UTF-8/16, ISO-8859-1 and US-ASCII. See `SPEC.md` (*What is deliberately
+not done*, *Backlog / deferred*) for the reasons, the parse model, the
+C14N-fidelity guarantees and the threat model.
 
 ## Verification
 
-`zig build test-xml` — green in Debug and `-Doptimize=ReleaseFast`.
-Composition: W3C-pattern well-formed docs (namespaces / mixed content / entities
-/ spans), W3C-pattern not-well-formed rejections (the same defect classes as the
-W3C `not-wf` suite, plus Namespaces error cases), and security tests (XXE, billion-laughs, depth,
-attribute count, duplicate ID, invalid UTF-8) each with a positive control.
-`zig fmt --check modules/xml` clean.
-
-2026-10-04: `core_test.zig` replays libxml2's (lxml's) reading of 27 encoding
-and entity cases (`core_vectors.zig`, recipe `tools/gen_core_vectors.py`) and
-round-trips every accepted own well-formedness vector (`wf_vectors.zig`, 491
-inputs with libxml2's verdicts) through the writer; `fuzz_test.zig` is
-a deterministic fuzz driver (`XML_FUZZ=<runs>[,<seed>]`); `tools/writer_oracle.*`
-hands the writer's output to libxml2 and compares canonical forms (119 of 119
-documents equal).
+`scripts/modtest xml` (`zig build test-xml`). Composition: W3C-pattern
+well-formed docs (namespaces / mixed content / entities / spans), W3C-pattern
+not-well-formed rejections (the same defect classes as the W3C `not-wf` suite,
+plus Namespaces error cases), and security tests (XXE, billion-laughs, depth,
+breadth, attribute count, duplicate ID, invalid UTF-8) each with a positive
+control. `core_test.zig` replays libxml2's (lxml's) reading of the encoding and
+entity cases (`core_vectors.zig`, recipe `tools/gen_core_vectors.py`) and
+round-trips every accepted own well-formedness vector (`wf_vectors.zig`, with
+libxml2's verdicts) through the writer; `fuzz_test.zig` is a deterministic fuzz
+driver (`XML_FUZZ=<runs>[,<seed>]`); `tools/writer_oracle.*` hands the writer's
+output to libxml2 and compares canonical forms. `zig fmt --check modules/xml`
+clean.
