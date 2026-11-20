@@ -421,6 +421,10 @@ Map-in-map (`ARRAY_OF_MAPS`/`HASH_OF_MAPS` with an inner definition) and
 `PROG_ARRAY` initializers (`.values = { &inner, [1] = &prog }`) are created and
 filled by `load`.
 
+`ebpf.Map` / `ebpf.TypedMap(K, V)` drive a map fd (lookup/update/delete/iterate,
+the batch commands, per-CPU values with the right stride), and `ebpf.devmapSet`
+/ `cpumapSet` attach an `xdp/devmap` / `xdp/cpumap` program through a map entry.
+
 bpffs pinning works: `pinning = LIBBPF_PIN_BY_NAME` reuses a compatible map
 pinned at `<LoadOptions.pin_root>/<name>` or creates and pins it;
 `MapSpec.pin_path` and `Object.pinMaps`/`pinPrograms` do it explicitly. The

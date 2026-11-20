@@ -220,6 +220,17 @@ pub const ProgQueryResult = bpfsys.QueryResult;
 pub const ProgQueryOptions = bpfsys.QueryOptions;
 pub const BpfSysError = bpfsys.Error;
 
+pub const map = @import("map.zig");
+/// A map handle: lookup/update/delete/iterate, batch commands, per-CPU stride.
+pub const Map = map.Map;
+/// A comptime-typed `Map` — `ebpf.TypedMap(u32, u64).init(m)`.
+pub const TypedMap = map.Typed;
+pub const MapError = map.Error;
+pub const MapUpdateFlags = map.UpdateFlags;
+/// Attach an `xdp/devmap` / `xdp/cpumap` program through a map entry.
+pub const devmapSet = map.devmapSet;
+pub const cpumapSet = map.cpumapSet;
+
 pub const btf = @import("btf.zig");
 /// A parsed BTF blob (kernel or program-side) — see `btf.zig`.
 pub const Btf = btf.Btf;

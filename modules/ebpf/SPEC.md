@@ -724,6 +724,23 @@ that path whatever `pinning` says. Internal data maps are never auto-pinned, a `
 removing it is `unlink`). The path policy is therefore the caller's: the root directory is an option, never a guess, and
 nothing is pinned unless the object asks for it or the caller does.
 
+### Maps (`map.zig`)
+
+`Map` describes a map fd (`fromFd`, `BPF_OBJ_GET_INFO_BY_FD`) and wraps lookup, lookup-and-delete, update (`UpdateFlags`:
+`any`/`no_exist`/`exist`/`lock`), delete, `nextKey` (a `null` key starts the walk, the end is `false`) and freeze over byte
+slices with every size checked before the syscall (`error.BufferTooSmall`, never a kernel `EFAULT` or a silent
+truncation). A **per-CPU** map's syscall value is one slot per *possible* CPU (`perfbuf.possibleCpuCount`, not online),
+each `value_size` rounded up to 8: `valueStride()`, `valueBytes(ncpus)`. The four batch commands (`lookupBatch`,
+`lookupAndDeleteBatch`, `updateBatch`, `deleteBatch`) take a resume token of at least `cursorSize()` = `max(8, key_size)`
+bytes (the hash path keeps a `u64` bucket cursor, the generic path copies `key_size` bytes of the last key: a smaller
+buffer would be overrun by the kernel); a lookup that reaches the end reports `done` together with the elements it
+gathered (the kernel says `ENOENT` and a valid `count`). `TypedMap(K, V)` fixes the types once against the map's sizes
+(`error.SizeMismatch`) and then offers `get`/`put`/`remove`, `getPerCpu` (one `V` per CPU) and a key iterator.
+`devmapSet` and `cpumapSet` are how a program of expected attach type `xdp_devmap`/`xdp_cpumap` (sections `xdp/devmap`,
+`xdp/cpumap`) is attached: the program fd travels in the map value (`DevmapValue`/`CpumapValue`, `value_size` 8; 4 means
+no program), 0 or negative meaning none. Layouts are pinned against `<linux/bpf.h>`. Not verified against a live kernel
+here; the batch semantics above are the kernel's documented ones.
+
 ### Object-level syscalls (`bpfsys.zig`)
 
 `objPin`/`objGet`/`objUnpin` (`BPF_OBJ_PIN`/`BPF_OBJ_GET`; `path_fd` is left 0, the kernel answers `EINVAL` to a
@@ -1005,10 +1022,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **USDT probe discovery.** `UprobeOptions.ref_ctr_offset` carries the semaphore a USDT probe needs, but finding it means
   parsing the `.note.stapsdt` ELF notes (provider/name/location/base/semaphore, plus the argument descriptor string), a
   separate parser on top of `elfsym`.
-- **cpumap/devmap attach** (`BPF_XDP_CPUMAP`/`BPF_XDP_DEVMAP` programs attached via map entries rather than to an
-  interface).
-- **Typed map wrapper**: std has fd-based lookup/update/delete/next-key only; batch operations (`BPF_MAP_*_BATCH`) and
-  per-CPU value stride handling are absent.
 
 ### Priority order
 
