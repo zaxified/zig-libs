@@ -11,8 +11,8 @@ originating the LAN's pseudonode LSP.
 
 Status: **core** (grade 3). Implements the election rule + preemption +
 the pseudonode LSP-ID derivation + the DIS-change effect. The pseudonode LSP's
-*content*, LAN adjacency formation, and multi-level DIS are deliberately deferred
-— see `SPEC.md`.
+*content*, LAN adjacency formation, and multi-level DIS are not provided here (the
+sibling layers' job) — see `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
 
 Model after: **ISO/IEC 10589 §8.4.5** (LAN Designated-IS election).
 
@@ -25,7 +25,8 @@ highest-wins.** The candidate set is the local system **plus** every router with
 an Up LAN adjacency.
 
 This is the classic footgun, so it is stated precisely and pinned by tests: it is
-*not* lowest-SNPA, and priority is a 7-bit field (0–127, matching the LAN IIH
+*not* lowest-SNPA, and when both priority and SNPA are equal (a duplicate or spoofed SNPA) the
+higher system-id wins, so the result never depends on the order of the neighbour slice. Priority is a 7-bit field (0–127, matching the LAN IIH
 `priority` the sibling `isis` codec decodes). A priority-0 router ("never want to
 be DIS") still **participates** and can win when it is the sole/highest candidate.
 
@@ -82,7 +83,7 @@ election has no timer and no hold-down, `now` is used *only* to timestamp the
 emitted `DisChange.at` — the election result itself does not depend on it. Given
 the same `(candidate-set, now)` stream the FSM is fully deterministic, and the
 election is independent of the neighbour-slice order (SNPAs are unique per LAN, so
-`(priority, snpa)` is a strict total order). Permanent tests pin both.
+`(priority, snpa)` is a strict total order, with the system-id as a last resort for a duplicate SNPA). Permanent tests pin both.
 
 ## What's in it
 
@@ -138,13 +139,12 @@ single-candidate/empty-neighbour case, and an integration test that round-trips 
 derived `lan_id` + pseudonode LSP-ID through the real `isis` LAN-Hello / LSP codec.
 A permanent **positive control** runs a deliberately-wrong lowest-SNPA election and
 asserts it disagrees with the correct one — so a regression to lowest-wins would go
-RED. Green in Debug and ReleaseFast; `zig fmt` clean.
+RED.
 
 Provenance: clean-room from ISO/IEC 10589 §8.4.5; no third-party IS-IS
-implementation (frrouting, IOS, Junos) was ported or studied. See `/NOTICE`
-(no entry required — public spec). License: MIT. DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from the spec clauses above and cross-checked against a third-party dissector's reading. They are this module's own construction, not bytes taken from anyone's corpus.
+implementation (frrouting, IOS, Junos) was ported or studied. No NOTICE entry is required (public spec). License: MIT. DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from the spec clauses above and cross-checked against a third-party dissector's reading. They are this module's own construction, not bytes taken from anyone's corpus.
 
-## Anchored (2026-08-05) — FRR, capture-and-freeze
+## Anchored against FRR (capture-and-freeze)
 
 The wire-visible fields (`lan_id`, priority, the pseudonode LSP-ID split) were
 already checked against Wireshark's dissector (`goldens.zig`), but the
@@ -176,6 +176,6 @@ value it reports about our own configuration — the same reasoning already
 applied to the `isis-spf` FRR anchor and the goaccess/Wireshark captures
 elsewhere in this repo. See the test's own comment for the full citation.
 
-What is still not FRR-anchored: the `SPEC.md` §6-deferred surface (pseudonode
+What is still not FRR-anchored: the surface listed in `SPEC.md` *What is deliberately not done* (pseudonode
 LSP *content*, LAN adjacency formation, multi-level DIS) is out of scope by
 design, not by gap.

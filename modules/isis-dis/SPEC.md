@@ -19,7 +19,7 @@
 Auditor/design reference. The consumer-facing purpose, effects API, defaults and
 API sketch live in `README.md`; this document is the election algorithm, the
 preemption model, the pseudonode LSP-ID derivation, the change-effect semantics,
-and the deferred list.
+and what is deliberately left to other layers.
 
 ## Compared with
 
@@ -39,7 +39,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 The **LAN Designated-IS election** (ISO/IEC 10589 §8.4.5) for ONE broadcast
 circuit at one level. Pure, time-injected, single-owner: the caller supplies the
 candidate set (local + Up LAN neighbours) and `now`, and reacts to the returned
-`Effect`. Out of scope for this increment: everything in §6.
+`Effect`. Out of scope: everything under *What is deliberately not done*.
 
 ## 2. What `isis` provides, and what this module adds
 
@@ -67,6 +67,9 @@ rule:
 2. **Tie-break: highest SNPA wins.** On equal priority, the numerically **higher**
    SNPA (the 6-octet MAC on this LAN, compared as an unsigned 48-bit big-endian
    integer) wins.
+3. **Last resort: highest system-id wins.** On equal priority *and* equal SNPA (a duplicate or spoofed SNPA,
+   which ISO 10589 leaves undefined) the numerically higher system-id, compared most-significant octet first,
+   wins. System-ids are unique, so the order is total under every input (`election.zig` `outranks`).
 
 Both directions are **highest-wins** — this is the deliberate, cited fact. It is
 the classic footgun because it differs from OSPF's DR twice over: OSPF breaks ties
@@ -78,11 +81,13 @@ regression to lowest-wins is caught.
 ### 3.1 Order-independence
 
 `elect` is a single max-scan (`outranks(candidate, best)`) with a **strict** total
-order: `outranks` returns false on equal `(priority, snpa)`, so the scan keeps the
-first-seen best on a tie. In practice no tie is ever reached — SNPAs are unique per
-LAN, so `(priority, snpa)` totally orders distinct candidates and the result is
-independent of the neighbour-slice order. A determinism test shuffles the slice and
-asserts an identical `Result`. The scan is O(neighbour-count), allocation-free.
+order: `outranks` returns false on equal `(priority, snpa, system_id)`. SNPAs are
+unique per LAN, so `(priority, snpa)` normally totally orders distinct candidates; the
+system-id level keeps the order total when an SNPA is duplicated, so the winner never
+depends on which candidate the caller listed first (without it, routers on the same LAN
+fed the same set in different orders could elect different DISes). A determinism test
+shuffles the slice and asserts an identical `Result`, another does so for a duplicate
+SNPA. The scan is O(neighbour-count), allocation-free.
 
 ### 3.2 Priority 0
 
@@ -114,7 +119,7 @@ timer — modelling *that* would need hold-down state; IS-IS explicitly does not
 ### 5.1 Ids
 
 The DIS originates the pseudonode LSP representing the LAN. This module derives the
-ids it is keyed by (not its content — §6):
+ids it is keyed by (not its content — see *What is deliberately not done*):
 
 - **`lan_id` = DIS system-id (6) ‖ DIS pseudonode-id (1)** (7 octets). The
   pseudonode-id is per-candidate: for the local system it is the circuit's
@@ -148,15 +153,17 @@ system-id flips; code is `fsm.zig`):
 
 `became_dis` / `resigned_dis` are the caller's triggers to originate / purge the
 pseudonode LSP. `at` carries the `now` from that `recompute` (a timestamp only —
-the election is independent of it; see §7). A steady recompute with the same winner
+the election is independent of it). A steady recompute with the same winner
 returns `change == null`.
 
-## 6. Deferred
+## What is deliberately not done
+
+This module stops at the winner and the ids; the rest of the LAN machinery belongs to the sibling layers.
 
 - **Pseudonode LSP content** — building the pseudonode LSP body (the IS-Reachability
   entries binding each LAN member to the pseudonode with metric 0, the SPB/area
   TLVs) is an LSP-origination concern for an `isis-lsdb`/`isis-flood` consumer. This
-  module supplies only the LSP-ID and the became/resigned trigger.
+  module supplies only the LSP-ID and the became/resigned trigger (a builder is in *Backlog / deferred*).
 - **LAN adjacency formation** — the LAN variant of `isis-adj`: a LAN IIH does not
   use the RFC 5303 three-way handshake but the IS-Neighbours (#6) SNPA list to
   confirm two-way reachability, plus per-neighbour hold timers. This module takes
@@ -168,12 +175,11 @@ returns `change == null`.
   expiry belong to the LAN adjacency layer above; the election reacts to the
   candidate set that layer maintains, not to timers.
 
-## 7. Verification
+## Verification
 
-Per CONVENTIONS §7 this is **pure logic** → unit + property tests; the derived
-`lan_id` / LSP-ID are validated end-to-end against the sibling `isis` codec
-(golden-tested), and — since 2026-08-05 — the election *result itself* is
-anchored against a real IS-IS speaker: see "FRR anchor" below. Wire-visible
+Per CONVENTIONS §7 this is **pure logic** → unit + property tests (`scripts/modtest isis-dis`); the derived
+`lan_id` / LSP-ID are validated end-to-end against the sibling `isis` codec (golden-tested), and the election
+*result itself* is anchored against a real IS-IS speaker: see "FRR anchor" below. Wire-visible
 content (`lan_id`, priority, the Hello type codes) was separately checked
 against Wireshark's dissector (`goldens.zig`); that anchor cannot grade the
 election outcome, which has no wire form of its own.
@@ -181,16 +187,20 @@ election outcome, which has no wire form of its own.
 - **Priority election**: {10, 64, 64} → the higher-SNPA 64 wins (asserted exactly),
   and the highest-SNPA-but-lower-priority local still loses.
 - **SNPA tie-break direction**: equal priority, …:01 vs …:02 → …:02 wins; the
-  assertion would go RED under lowest-wins.
+  assertion would go RED under lowest-wins. SNPA and system-id are compared most-significant octet first (the
+  tests put the difference in the first octet).
 - **Local is / isn't DIS**: local highest priority → `is_local_dis`, `lan_id` =
   local id ‖ local pseudonode-id; local lower → the winner's `lan_id`.
 - **Preemption**: local DIS → a higher-priority neighbour appears → `resigned_dis`
   and the neighbour is DIS → the neighbour departs → `became_dis` again — the exact
   effect sequence, no hold-down.
+- **Change keying**: a flip between two remote routers is a change with neither flag; a stale or changed
+  pseudonode byte fires a change keyed on `lan_id`; a local DIS that only changes its own pseudonode id fires
+  one with `became_dis` and `resigned_dis` both false.
 - **Priority 0**: participates, wins as the sole candidate, loses to a positive
   priority — no crash.
-- **Determinism**: identical results under neighbour-slice shuffling; identical
-  `(candidate-set, now)` FSM streams yield identical effects.
+- **Determinism**: identical results under neighbour-slice shuffling, also with a duplicate SNPA (system-id
+  decides); identical `(candidate-set, now)` FSM streams yield identical effects.
 - **Single candidate / empty neighbours**: local alone is the DIS.
 - **Integration**: the derived `lan_id` round-trips through a real `isis` LAN IIH,
   and `pseudonodeLspId()` through a real `isis` LSP (`lsp_id[6]` nonzero, `[7]`==0).
@@ -199,37 +209,21 @@ election outcome, which has no wire form of its own.
 - **FRR anchor** (permanent, `election.zig`): a real `isisd` 10.3 LAN election
   (3 routers, one shared broadcast segment, in-VM), two independent
   priority/SNPA assignments, `elect()`'s winner matches FRR's own "is/is not
-  DIS" verdict both times — first try, no adjustment made to match.
+  DIS" verdict both times. The test asserts literals; it does not boot a VM or FRR.
+- **Fuzz:** none (no fuzz obligation under check-fuzz: a pure function over a small struct).
+- **ctgrind:** not applicable (no secret).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. The mutation run covered `election.zig` and `fsm.zig`: priority and SNPA
+  comparison direction, SNPA and system-id octet order, the system-id tie-break, `elect`'s scan (argument
+  order, `is_local` flag), `lan_id` / `dis_snpa` / `pseudonodeLspId` construction and the FSM change detection
+  (keyed on `lan_id`, first election, `old_dis` / `new_dis` / `became_dis` / `resigned_dis` / `at`, stored
+  state, `isLocalDis`); no survivor is open.
 
-Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
-green; the sibling `isis` test suite unaffected.
-
-Provenance: clean-room from ISO/IEC 10589 §8.4.5; no third-party implementation
-ported or studied. See `/NOTICE` (no entry required — public spec).
-
-## Mutation run 2026-10-04
-
-First mutation-schemata run (one ReleaseSafe test binary, 28 mutants behind a
-runtime switch over `election.zig` and `fsm.zig`, baseline first): 28 mutants,
-28 killed, 0 equivalent. Covered: priority and SNPA comparison direction, SNPA and
-system-id octet order, the system-id tie-break, `elect`'s scan (argument order,
-`is_local` flag), `lan_id` / `dis_snpa` / `pseudonodeLspId` construction, and the
-FSM change detection (keyed on `lan_id`, first election, `old_dis` / `new_dis` /
-`became_dis` / `resigned_dis` / `at`, stored state, `isLocalDis`).
-
-Four mutants survived the existing tests and were killed by three new tests:
-SNPA and system-id compared byte-reversed (every existing test varied only the
-last octet; new tests put the difference in the first octet, expected from ISO
-10589 §8.4.5 "numerically highest SNPA" with the big-endian octet order the
-`Snpa` doc states), and `became_dis` / `resigned_dis` fired for a local DIS that
-only changes its own pseudonode id (new test; expected from the `DisChange` field
-docs: "was not, now is" / "was, now is not"). No source defects found. Doc drift
-fixed in §5.2: the change is keyed on `lan_id`, not on the system-id alone (the
-code comment in `fsm.zig` already said so).
+Provenance: clean-room from ISO/IEC 10589 §8.4.5 (public spec; no NOTICE entry required).
 
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
+Missing-and-it-matters items from the 2026-09-30 competitive survey.
 
 - **Pseudonode LSP builder** (metric-0 IS-Reach #22 entries for each Up LAN member, on `became_dis`; purge on `resigned_dis`) (survey 2026-09-30). Why: election without the pseudonode LSP produces nothing on the wire; FRR/holo/goisis all do it. Effort: ~2 days on top of `isis` `LspBuilder`. Fits §2: yes.
 - **DIS hello interval helper and pseudonode-id allocator** (survey 2026-09-30). Why: ISO 10589 §8.4.1: the DIS sends IIHs at one third of the interval; a router DIS on several LANs needs distinct ids. Effort: ~1 day. Fits §2: yes.
@@ -242,5 +236,3 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** Wireshark sharkd validated lan_id/priority/Hello codes; DIS election result closed vs 3 real isisd 10.3 instances
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-05: 3 real isisd 10.3 instances, one shared LAN broadcast segment (netns + veth into one Linux bridge, in-VM), two independent priority/SNPA assignments — run A {10,64,64} decided by priority AND the 64/64 tie by SNPA; run B held priority+system-id fixed and swapped the SNPAs between the two priority-64 routers, and the DIS flipped to match, ruling out an incidental (non-SNPA) cause. `elect()` matched FRR's own "show isis interface detail" is/is-not-DIS verdict both times, first try, no adjustment made — frozen in election.zig, "FRR anchor" test. Mutation-tested (SNPA compare .gt -> .lt: 6/21 tests fail, exit 1; reverted, git diff -U0 shows only the intended addition). Remaining gap unchanged: circuit-type bits and generic PDU framing stay the sibling isis codec's own already-anchored surface.
