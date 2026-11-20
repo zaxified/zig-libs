@@ -2667,26 +2667,26 @@ test "read-ahead: the scratch buffer never exceeds the cache's byte budget, howe
         inner: std.mem.Allocator,
         max: usize = 0,
 
-        fn allocator(self: *MaxAlloc) std.mem.Allocator {
+        fn allocator(self: *@This()) std.mem.Allocator {
             return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
         }
         fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
-            const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+            const self: *@This() = @ptrCast(@alignCast(ctx));
             self.max = @max(self.max, len);
             return self.inner.rawAlloc(len, a, ra);
         }
         fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
-            const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+            const self: *@This() = @ptrCast(@alignCast(ctx));
             self.max = @max(self.max, n);
             return self.inner.rawResize(m, a, n, ra);
         }
         fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
-            const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+            const self: *@This() = @ptrCast(@alignCast(ctx));
             self.max = @max(self.max, n);
             return self.inner.rawRemap(m, a, n, ra);
         }
         fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
-            const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+            const self: *@This() = @ptrCast(@alignCast(ctx));
             self.inner.rawFree(m, a, ra);
         }
     };
