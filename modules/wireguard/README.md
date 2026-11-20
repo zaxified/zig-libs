@@ -19,7 +19,9 @@ daemon: no TUN device and no UDP loop.
   (`genlmsghdr`, nlctrl family resolve, `NETLINK_GENERIC` socket), extracted
   into its own module so other genetlink families (ethtool, devlink,
   nl80211, …) can reuse it too. Re-exported here as `wireguard.genl` for
-  source compatibility; `netaddr` — `AllowedIp.parse`'s CIDR-text parsing.
+  source compatibility; `netaddr` — `AllowedIp.parse`'s CIDR-text parsing;
+  `b64ct` — key base64; `clock` — the userspace client's monotonic deadline;
+  `wipealloc` — the wiping allocator under `buildSetRequests`.
   The handshake/transport half additionally uses `chachapoly` (ChaCha20-Poly1305),
   `ct25519` (X25519) and `entropy` (ephemeral-key / cookie-secret randomness).
 - **Privileges:** CAP_NET_ADMIN for both `getDevice` and `setDevice` (the
@@ -209,10 +211,13 @@ re-export of the `genetlink` module).
   an unprivileged integration test exercises live nlctrl family resolution,
   and a root-gated test (skipped otherwise) round-trips a config on a real
   wg interface created via `ip link add … type wireguard`.
-- **Out of scope (deliberate extension points):** `listDevices()` (needs
-  rtnetlink IFLA_LINKINFO kind filtering — belongs in `netlink`), key
-  generation (X25519 via `std.crypto` — trivial for callers), and the
-  multicast event group.
+
+## Not provided
+
+No daemon (TUN device, UDP loop, GSO/GRO, CPU fan-out), no `wg show` rendering or wg-quick host set-up
+(routes, DNS, scripts), no BSD or Windows kernel API, no FFI bindings, and no netlink multicast event
+group. The reasons are in `SPEC.md` § "What is deliberately not done"; the one open item is in
+§ "Backlog / deferred".
 
 ## Cryptographic handshake (`noise.zig` / `handshake.zig`)
 
@@ -228,7 +233,7 @@ against the in-kernel WireGuard implementation, whose exchanges in both
 directions (handshake, keepalive, a tunnelled ping) are frozen by
 `tools/interop.zig` into `src/testdata/kernel_handshake.zig` and replayed
 without root by `src/kernel_handshake_replay.zig` — observed wire bytes of a
-black-box peer, exempt per root `NOTICE` §0. Provenance: see `/NOTICE`.
+black-box peer, exempt per root `NOTICE` §0. Provenance: see [`NOTICE`](NOTICE).
 
 WireGuard's under-load DoS mitigation (whitepaper §5.4.7) is part of it:
 `CookieChecker.admit()` decides `accept` / `cookie_reply` / `drop` for an

@@ -16,28 +16,28 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./NOTICE.
 
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-02; stars and activity as of the second date (GitHub API). Sources read only where the licence allows: wireguard-go, boringtun and wgctrl-go's public API; `wg`, wg-quick and the kernel as man page and black box.
 
-**Two parts, two yardsticks.** The configuration plane (what the consumer, the router-tool consumer, uses: `keyFromBase64`, `AllowedIp.parse`, `Wireguard.open`, `setDevice`) is measured against wg(8) and wgctrl-go. The data plane against what the userspace implementations offer as a *library*: boringtun's `noise::Tunn` and wireguard-go's per-peer state. The **reference** is wireguard-go, the fuller feature set of the two userspace implementations; boringtun is the candidate for **fastest**, per the data. The card's `**Performance:**` line stays `not measured` until `chachapoly`'s fix: all numbers are in § Backlog.
+**Two parts, two yardsticks.** The configuration plane (what the consumer, the router-tool consumer, uses: `keyFromBase64`, `AllowedIp.parse`, `Wireguard.open`, `setDevice`) is measured against wg(8) and wgctrl-go. The data plane against what the userspace implementations offer as a *library*: boringtun's `noise::Tunn` and wireguard-go's per-peer state. The **reference** is wireguard-go, the fuller feature set of the two userspace implementations; boringtun is the candidate for **fastest**, per the data. The figures are on the card's `**Performance:**` line.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | Linux in-kernel WireGuard (`wireguard.ko`) | C | GPL-2.0 | — | in-tree | The tunnel most deployments run, and what this module's netlink half configures. Interop: `tools/interop.zig` A, B, C drive it from `Handshake` and `Tunnel`; source not read. Not timed: root, a tunnel, a syscall per packet. |
 | [WireGuard/wireguard-tools](https://github.com/WireGuard/wireguard-tools) (`wg`, `wg-quick`) — the yardstick of the configuration plane | C | GPL-2.0 | 735 | no releases; push 2026-05-06 | `wg show`, `set`, `setconf`, `addconf`, `syncconf`, `showconf`, `genkey`, `pubkey`, `genpsk`. Here: `getDevice`, `setDevice`, `conf.parse` / `formatDevice` / `sync`, `listDevices`, `Keypair.generate`, `keyToBase64`. 62 of 65 test files judged alike by `tools/interop.zig` D4, the other 3 refused here on purpose (a port over 65535, brackets around IPv4). `wg show`'s tables and wg-quick's host set-up (routes, DNS, scripts) are not here: a library has the fields, and `.wg_quick_keys = .ignore` reads its files. |
 | [WireGuard/wgctrl-go](https://github.com/WireGuard/wgctrl-go) | Go | MIT | 922 | no releases; push 2024-12-31 | `Device`, `Devices`, `ConfigureDevice` over genetlink and over the userspace socket, on Linux plus the BSDs and Windows. Here the same on Linux. Its other platforms: not here, `meta.platform` is Linux. |
-| [WireGuard/wireguard-go](https://github.com/WireGuard/wireguard-go) — **reference** | Go | MIT | 4.5k | no releases; push 2026-10-24 | The complete userspace daemon. Its state machine is `Tunnel` here (rules ported), its configuration protocol `uapi.Client` here, against it in `tools/interop.zig` E. Its TUN, UDP loop, GSO/GRO, allowed-ips trie and per-source rate limiter are the daemon's. A stitched AVX2 AEAD (x/crypto) makes its transport 1.3-2× faster than ours. |
+| [WireGuard/wireguard-go](https://github.com/WireGuard/wireguard-go) — **reference** | Go | MIT | 4.5k | no releases; push 2026-10-24 | The complete userspace daemon. Its state machine is `Tunnel` here (rules ported), its configuration protocol `uapi.Client` here, against it in `tools/interop.zig` E. Its TUN, UDP loop, GSO/GRO, allowed-ips trie and per-source rate limiter are the daemon's. Its stitched AVX2 AEAD (x/crypto) gives its transport a small edge over ours (the card's `**Performance:**` line has the ratios). |
 | [cloudflare/boringtun](https://github.com/cloudflare/boringtun) — candidate for **fastest** | Rust | BSD-3-Clause | 7.2k | 0.7.1 (crates.io, 2026-05-01); push 2026-06-29 | `noise::Tunn` is the shape of `Tunnel` here: encapsulate, decapsulate, timers. Sessions: a ring of 8, here 3 (previous, current, next); queue: its heap, here the caller's bytes. Ring's stitched AEAD. Its handshake is 1.6× slower than ours. No padding (a packet's length shows). Its `device` module (TUN, UDP) and FFI/JNI are not here. |
 | [mullvad/gotatun](https://github.com/mullvad/gotatun) | Rust | MPL-2.0 | 1.4k | push 2026-11-02 | A boringtun fork per its description, not read (copyleft). |
 | [igorls/meshguard](https://github.com/igorls/meshguard) | Zig | MIT | 21 | push 2026-10-16 | Its description: a decentralized WireGuard-compatible mesh VPN daemon, not a reusable library. Source not read. |
 | Zig `std` | Zig | MIT | — | Zig 0.17.0 | No WireGuard; only primitives. |
 
-**Where we are ahead:** the only pure-Zig WireGuard configuration client we found, anchored on real `wg`, kernel and wireguard-go; handshake 0.63× boringtun and 0.30× wireguard-go; allocation-free `Tunnel` with dead-stack burns on every secret path and a constant-time record (ctgrind). **Where we are behind:** transport speed against stitched AEADs (§ Backlog; `chachapoly`'s); no daemon, by design.
+**Where we are ahead:** the only pure-Zig WireGuard configuration client we found, anchored on real `wg`, kernel and wireguard-go; handshake 0.63× boringtun and 0.30× wireguard-go; allocation-free `Tunnel` with dead-stack burns on every secret path and a constant-time record (ctgrind). **Where we are behind:** transport speed against stitched AEADs, within 1.1× of the reference per the card (the remainder is `chachapoly`'s Backlog); no daemon, by design (→ *What is deliberately not done*).
 
-**Verdict per gap (2026-11-02).** Done: `listDevices` (netlink `Link.kind()` exists since 2026-10-04; the old line here saying it does not was stale), the file format (`conf.parse`, `formatDevice`, `formatConfig`, `sync`), the userspace protocol (`uapi.Client`, `uapi.listDevices`), the peer state machine (`Tunnel`: timers, session rotation, staged packets, cookie handling, roaming signal), static-static precomputation, the multi-peer peek. Rejected: TUN device, UDP loop, GSO/GRO, CPU fan-out (a daemon's: this module has no socket on the data path, and the consumer drives the kernel); `wg show` rendering and wg-quick's host set-up (a program's); the BSD and Windows kernel APIs (`meta.platform` is Linux); FFI/JNI (other languages' concern); `Tunn`'s 8-session ring (3 sessions are the protocol's own, wireguard-go's). Owned by a sibling: per-source limits under load (`ratelimit`, `throttle`, in front of `CookieChecker.admit`), hostnames (`dns`, through `conf.Resolver`), prefix matching for allowed-ips routing (`netaddr`, `trie`), key base64 (`b64ct`).
+**Verdict per gap.** Done: `listDevices`, the file format (`conf.parse`, `formatDevice`, `formatConfig`, `sync`), the userspace protocol (`uapi.Client`, `uapi.listDevices`), the peer state machine (`Tunnel`: timers, session rotation, staged packets, cookie handling, roaming signal), static-static precomputation, the multi-peer peek. Rejected (the TUN device, UDP loop, GSO/GRO and CPU fan-out; `wg show` rendering and wg-quick's host set-up; the BSD and Windows kernel APIs; FFI/JNI; `Tunn`'s 8-session ring): see *What is deliberately not done*. Owned by a sibling: per-source limits under load (`ratelimit`, `throttle`, in front of `CookieChecker.admit`), hostnames (`dns`, through `conf.Resolver`), prefix matching for allowed-ips routing (`netaddr`, `trie`), key base64 (`b64ct`).
 
 ## Design & invariants
 Both wire directions are pure functions over byte slices — `DeviceParser.feed` (GET) and
@@ -56,8 +56,7 @@ kernel replies → typed codec errors (`error.Truncated`/`BadLength`, never a pa
 errnos map to typed errors (`AccessDenied`, `NoSuchDevice`, …). One `Wireguard` per thread/loop; no
 globals; all `Device` allocations use the `open` allocator. Depends on `netlink` for the
 bounds-checked nlmsghdr+nlattr codec and on `genetlink` for the generic-netlink layer (`genlmsghdr`,
-nlctrl `CTRL_CMD_GETFAMILY` resolve, `NETLINK_GENERIC` socket) — re-exported here as `genl` for
-source compatibility with when it lived locally in `src/genl.zig`; that layer was extracted into its
+nlctrl `CTRL_CMD_GETFAMILY` resolve, `NETLINK_GENERIC` socket) — re-exported here as `genl`; the layer lives in its
 own module (`../genetlink/`) so other genetlink families (ethtool, devlink, nl80211, …) can reuse it
 without depending on `wireguard`. `AllowedIp.parse` depends on `netaddr` for CIDR-text parsing
 (`parsePrefix`/`parseIp`) rather than duplicating it — this module only converts the result to its
@@ -66,13 +65,18 @@ own wire-shaped `AllowedIp`. Clean-room from the documented WireGuard netlink UA
 and the `wg` tool's protocol usage — attribute-shape and config-splitting reference only, no source
 consulted or copied — see NOTICE.
 
+The module's dependencies are `netlink`, `genetlink`, `chachapoly`, `ct25519`, `entropy`, `netaddr`, `b64ct`,
+`clock` and `wipealloc`. The handshake + transport half depends only on `chachapoly`/`ct25519`/`entropy`/std.crypto,
+not on either netlink module; `netaddr` is used by `AllowedIp.parse`, `conf` and `uapi`. A consumer that references
+only the control plane does not compile the handshake.
+
 ## Provenance / licensing
 The kernel UAPI headers this module cites (uapi/wireguard.h, linux/genetlink.h) are GPL-2.0, but
 that does not make the module a GPL derivative: only uncopyrightable ABI facts are taken from them
 (command/attribute/flag constants, struct layouts), and separately, those headers carry the
 **Linux-syscall-note** exception, which explicitly permits userspace of any license to use them to
 interface with the kernel. No kernel source was consulted or copied; wgctrl-go (MIT) was a
-behavior-only design reference. Full attribution in /NOTICE.
+behavior-only design reference. Full attribution in NOTICE.
 
 ## Threat model / out of scope
 Both `getDevice` and `setDevice` need **CAP_NET_ADMIN** (the kernel registers the family with
@@ -83,72 +87,43 @@ fuzzed, bounded by `max_reply`, `max_line_len`, `Client.limits` and a deadline),
 fuzzed, bounded by `Options`), and every datagram (`Tunnel.decapsulate`, `peekInitiation`, fuzzed).
 Out of scope (deliberate): the multicast event group.
 
-**Bounds, all defaults chosen and configurable (2026-11-03).** `Limits`: 2^20 peers (the kernel's own
+**Bounds, all defaults chosen and configurable.** `Limits`: 2^20 peers (the kernel's own
 limit) and 2^22 allowed-ips, about 380 MB at the worst, per kernel device read; over it
-`error.LimitExceeded` (the router-tool consumer matches on no wireguard error, so the wider set breaks nothing there).
-`Wireguard.default_recv_timeout_ms`: 30 s per receive, then `RecvFailed`, instead of the former no timeout at
-all. `uapi.Client`, whose other end is less trusted than a kernel: 5 s over the whole exchange, connect to last
+`error.LimitExceeded`.
+`Wireguard.default_recv_timeout_ms`: 30 s per receive, then `RecvFailed`. `uapi.Client`, whose other end is less trusted than a kernel: 5 s over the whole exchange, connect to last
 byte (a receive timeout would let a daemon hold us for as long as it dribbles), 4096 peers, 65536 allowed-ips, 4 MiB
 per reply (those limits as text are about 2.9 MB), lines of 512 bytes. `conf.Options`: 2^16 peers (wireguard-go's `MaxPeers`) and
-2^20 allowed-ips. The sweep's "owner decision" on the first two was taken under the rule "safe default,
-configurable".
+2^20 allowed-ips. The defaults follow the owner rule "safe default, configurable".
 
 ## Verification
-Offline golden-byte + parser + fuzz tests are the gate: WG_CMD_SET_DEVICE request bytes (device +
-peer + allowed-ip) byte-exact (LE-only), ifindex-identity/remove-peer/config validation, a large
-config split across ≥2 messages then round-tripped back through the GET parser, multipart GET peer-
-continuation reassembly, malformed-reply → typed error, errno mapping, a `std.testing.fuzz` harness
-over the device parser. The generic-netlink transport's own golden `CTRL_CMD_GETFAMILY` request
-bytes + truncated-header-rejection tests now live in and run under `zig build test-genetlink` (see
-`../genetlink/SPEC.md`) — extracted, not duplicated. Live tests here: an unprivileged nlctrl
-family-resolve integration test (this module's own, over the WireGuard family specifically), and a
-root-gated test (skipped otherwise) that set+get round-trips a config on a real `wg` interface
-created via `ip link add … type wireguard`. Run: `zig build test-wireguard`.
 
-**External anchor** (`kernel_goldens.zig`): the netlink configuration-plane codec above was, before
-this file, only ever round-tripped through its OWN encoder/decoder pair — self-consistent but blind
-to a bug that is wrong the same way on both sides. `kernel_goldens.zig` freezes two bytestreams
-captured ONCE inside a throwaway `unshare --user --map-root-user --net` namespace: the real
-`wg`(8) tool's WG_CMD_SET_DEVICE request (an independent encoder), and — the stronger anchor — the
-real kernel's own WG_CMD_GET_DEVICE reply to that configuration. Both are decoded through this
-module's actual `DeviceParser`/`genl.splitPayload`, asserted against every configured field
-offline, no root/kernel access needed to run the suite. `wg`'s own attribute order differs from
-this module's `buildSetRequests` (netlink attribute order is not semantically significant); rather
-than asserting a byte-identity that was never true between two conformant encoders, the SET
-direction is cross-checked by decoding both this module's own request and `wg`'s real one to an
-equal semantic `Device`.
+- **Run:** `scripts/modtest wireguard` (the root-gated live tests skip without root). Interop programs: `unshare -rn zig build interop-wireguard` (A, B: the handshake against the kernel; C: `Tunnel` against the kernel in both roles and `allowed_ips` dropping the kernel's reply from outside the list; D: `conf` and `listDevices` against `wg`; F: `Tunnel` lifetime against the kernel, with `--rekey` for the kernel re-keying at us at its real 120 s), `zig build interop-wireguard -- --wireguard-go` (E: `uapi.Client` and `Tunnel` in both roles against a real wireguard-go), `--capture` to rewrite `src/testdata/kernel_handshake.zig`.
+- **Control plane:** golden-byte tests of `buildSetRequests` (device + peer + allowed-ip, byte-exact, little-endian only), ifindex identity, remove-peer and config validation, a large config split across at least two messages and round-tripped through the GET parser, multipart GET peer-continuation reassembly, malformed reply → typed error, errno mapping. The generic-netlink transport's own goldens live in `zig build test-genetlink` (`../genetlink/SPEC.md`). Live: an unprivileged nlctrl family-resolve test and a root-gated set+get round trip on a real `wg` interface created via `ip link add … type wireguard`.
+- **External anchor** (`src/kernel_goldens.zig`): two bytestreams captured once inside a throwaway `unshare --user --map-root-user --net` namespace — the real `wg`(8) tool's WG_CMD_SET_DEVICE request (an independent encoder) and the real kernel's WG_CMD_GET_DEVICE reply to that configuration — decoded through `DeviceParser`/`genl.splitPayload` and asserted against every configured field offline. `wg`'s attribute order differs from `buildSetRequests`' (netlink attribute order is not semantically significant), so the SET direction is cross-checked by decoding both requests to an equal semantic `Device`.
+- **Data plane:** the KDF vectors, the full-handshake KAT, the cookie-layer KAT and the kernel transcript replay (`src/kernel_handshake_replay.zig`, no root) described under *Cryptographic handshake*; the transport differentials and pinned limits under *Transport data plane*; `Tunnel` timers, sessions and drops in `src/tunnel.zig` (the `wireguard-tunnel-sim` harness drives `Tunnel`s through scripted exchanges).
+- **Panic sweeps:** `src/sweep_test.zig` (control plane) and `src/sweep_dataplane_test.zig` (handshake/noise/transport): hostile-input tables and one test per finding, named by finding id.
+- **Fuzz:** the deterministic driver `WIREGUARD_FUZZ=<runs>[,<first seed>]` (e.g. `WIREGUARD_FUZZ=200000 scripts/modtest wireguard -Doptimize=ReleaseSafe`); harnesses `wireguard-parser`, `wireguard-key`, `wireguard-transport`, `wireguard-conf`, `wireguard-uapi`, `wireguard-tunnel` (mac1 computed, so `peekInitiation`, `acceptInitiation` and `consumeResponse` are reached) and `wireguard-tunnel-sim`. Verdicts come from the driver, never from `zig build --fuzz`.
+- **Constant time:** `src/ctgrind_harness.zig` + `scripts/checks/ctgrind.sh wireguard`: key base64 and hex codecs, the whole handshake, seal/open, cookies, `Tunnel`; every in-file context is a verdict or the inner IP header, none is on a key byte (rows in `scripts/checks/ctgrind-expected.tsv`). `conf` has no ctgrind target: its compares are unmeasured.
+- **Dead stack:** `src/stackprobe_test.zig` and `src/stackprobe2_test.zig` (§ Secret residue on the dead stack); ReleaseFast only.
+- **Mutation:** schemata over every non-test line of the module's source files; the surviving-mutant arguments are not restated here. Wipes and burns are mutated in a ReleaseFast build with the switch inside the burn (`scripts/mutation/README.md`). The few constant-time mutants ctgrind cannot see (`conf`'s compares, a compare the compiler emits branch-free) stay argued, not measured.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## Performance
+
+`tools/bench.zig` (`zig build bench-wireguard -Djcc-safe`) measures `Tunnel` against wireguard-go (`tools/go_bench`) and boringtun (`tools/rust_bench`): seal and open at 64 and 1424 bytes (1424 because boringtun does not pad, so every side seals the same bytes) and the handshake, by wall time; what each side does is in `tools/bench.zig`'s header and each foreign program's. `src/bench.zig` is the opt-in in-module bench (`WIREGUARD_BENCH=1`). The figures are the card's `**Performance:**` line, which is authoritative. The remaining transport gap is the AEAD, not `Tunnel`: x/crypto and ring stitch ChaCha20 and Poly1305 into one AVX2 loop, `chachapoly` runs them apart (a scalar stitched Poly1305 is in `chachapoly`'s Backlog). The configuration plane is not benched: its time is a syscall and the kernel's.
 
 ## Backlog / deferred
-- **Mutation audit of the 2026-11-03 code, closed the same day:** 128 mutants over `tunnel.zig` (75), `conf.zig` (25), `uapi.zig` (28), schemata in a copy. First pass 78 killed, 50 survived; the 31 tests this asked for kill 36 more (#49 in ReleaseSafe only, #123 in ReleaseFast only). 14 stay: 11 equivalent by reading (a wipe followed by a whole-value store, a check repeated in `handshake.zig`, a burn scrubbing the frame) and 3 wipes (#64, #66, #128) directly before a store that, measured on Zig 0.17.0, zeroes the same bytes. The tests found no defect. The same day's stack probes found one: `GetParser.feedLine` left a raw key copy in the dead frame, fixed. The card's Audit line stays: `handshake.zig`, `transport.zig`, `root.zig` and `noise.zig` were not in this audit, and the timing logic of `uapi.Deadline` was not mutated.
-- **Audit 2026-11-18 (whole-module mutation):** every non-test line of `noise.zig`, `handshake.zig`, `transport.zig`, `tunnel.zig`, `conf.zig`, `uapi.zig`, `root.zig` (the netlink client included: the root-gated live tests ran, each mutant in its own `unshare -rn` namespace with the kernel's WireGuard) and `wipe.zig`. Schemata in a copy, one mutant per condition × class: guard dropped per conjunct/disjunct, boundary, skipped counter or assignment, flipped boolean return, skipped wipe or burn, plus 15 constant-time mutants (a masked select or a timing-safe compare turned into a branch or `std.mem.eql`). 766 counted (762 generated + 15 CT, minus 9 test fixtures or duplicates and 2 whose statement the behaviour change below removed): **658 killed** (14 of them by the 30 s timeout, 5 by ctgrind, one by construction: `DeviceParser` growth wipe, test written after the last build), **38 equivalent**, **70 unobservable**, none open. Wipes and burns ran in a ReleaseFast build with the switch inside the burn (`scripts/mutation/README.md` §5); 56 are unobservable because another protection covers the same bytes (the entry point's burn and the body's own wipes each suffice), 4 because the `= null` / `= .{}` store right after zeroes the same bytes in this codegen (measured), 2 for want of a probe (`Tunnel.decapsulate`'s peek: no needle for a mid-handshake chaining key; `uapi.Client`'s line buffer: no probe drives a socket exchange), 1 needs a stale netlink ACK (`setDeviceFrom`'s sequence advance), and 7 are constant-time mutants ctgrind cannot see (2 lowered to a select, 1 compiled branch-free, 4 in `conf`, which has no ctgrind target). CT: base64 and hex key codecs' masks and the re-encode compare are seen by ctgrind; mac1 compares are public by construction; `checkMac2`'s compare compiled branch-free; `conf` has no ctgrind target (4 compares unmeasured). 49 killing tests were added, and assertions in 5 existing ones (timers, inner-header bounds, SET splitter shape across every ceiling from 300 to 1400 bytes, conf/uapi edges, `uapi.Deadline`, volatile-view wipe checks after `wipe`/`deinit`). **Behaviour change** found by it: a send, and a give-up, no longer clear the second-keepalive flag (wireguard-go `device/timers.go`, kernel `wg_timers_any_authenticated_packet_sent` / `wg_expired_retransmit_handshake` keep it); one more keepalive in that sequence, as both send. **Open for an owner decision:** the key deadline's extra disarming (see § `Tunnel`). No security defect: every survivor in MAC1/MAC2, replay window, TAI64N and key-confirmation code was a missing test (replay window: a counter exactly `capacity` behind is recorded; a replayed response to a completed handshake) or an argued equivalent. Schemata-only artefact noted: with switches inside `PeerCookie.current`, the ReleaseFast probe found the 16-byte cookie on the dead stack (`current` and `computeMac2` take or return it by value and have no burn); the plain build is clean.
-- **Lifetime against a real peer, closed 2026-11-03:** `tools/interop.zig` F drives `Tunnel` against the kernel. Our side's 120 s, 165 s, 180 s and 540 s are an offset on its clock, each re-key through on its first initiation, a lost initiation retried, crossed initiations, and `--rekey` adds the kernel re-keying at us at its real 120 s (measured 120001 ms, 1951538 of 1951538 pings answered before it, data moved to the new session). No defect. A clock jump needs a real pause first: the kernel drops an initiation 1 ms after the last one, by its own clock.
-- **P3, measured 2026-11-04** (`BENCH_ROUNDS=5 zig build bench-wireguard -Djcc-safe`, by wall time, largest spread 5.2 %, load about 2): against wireguard-go seal 64 B 0.92, seal 1424 B 1.04, open 64 B 1.07, **open 1424 B 1.15, the one row over 1.1×**, handshake 0.30; against boringtun 0.93, 1.06, 0.88, 1.03, 0.63. Bare AEAD against x/crypto: 0.94, 1.05, 0.99, 1.08. Two changes since 11-03: `chachapoly`'s own work, and `seal`/`open` call the pointer-keyed AEAD with no burn of their own (the 1 KiB burn existed for a key copy that is gone; open 64 B 1.17 → 1.04 in the run that isolated it, with the stack probes green). **Where the rest is, 6 pinned runs (`taskset`, 5 rounds, one discarded at 70 % spread):** `open_1424` 1.11-1.14×, bare `aead_open_1424` 1.10-1.12×, so nearly all of it is the AEAD, not `Tunnel`: `open_1424` minus `aead_open_1424` is 21-58 ns against 18-23 ns on the Go side, `open_64` about 22 against 10. `-Djcc-safe` moves none of this beyond the run-to-run spread. The next step would be a scalar stitched Poly1305 (`chachapoly`'s Backlog), not worth it for this row: the router-tool consumer, the consumer, uses the configuration plane only. A single unpinned run read 93 ns on `aead_open_1424`'s noise; that figure was on this card for an hour and is withdrawn.
-- **P3, measured 2026-11-03 on `chachapoly`'s short engine** (`zig build bench-wireguard -Djcc-safe`, 5 rounds, largest spread 7.7 %, other jobs on the host): against wireguard-go seal 64 B 0.96, seal 1424 B 1.12, open 64 B 1.16, open 1424 B 1.22, handshake 0.30; against boringtun 0.97, 1.13, 0.93, 1.08, 0.63. Bare AEAD against x/crypto: 0.95, 1.11, 0.99, 1.21. The module was at 2.07 on open 64 B before that work, and the composition reference this card carried for a day was refused by the owner: a stand-in is no measurement. The rest of the transport gap is `chachapoly`'s (its Backlog: a scalar stitched Poly1305); nothing in this module is left to do. The rows below are the earlier numbers, kept for the record.
 
-  **Numbers.** `BENCH_ROUNDS=5 zig build bench-wireguard -Djcc-safe`, 2026-11-03, ReleaseFast, i7-7920HQ (AVX2, ADX/BMI2), load 2-3, largest spread 4.4 %, by wall time as Go counts no cycles. Ours is `Tunnel` throughout: session check, seal or replay window and AEAD, timers, inner IP length. n = 1424 because boringtun does not pad, so every side seals the same bytes. What each side does: `tools/bench.zig`'s header and each foreign program's.
+- **The root-gated live test shells out to `ip`.** `runIp()` in `src/root.zig` is the one external-process use in the whole repo (zig-libs is otherwise pure Zig, no exec). Either replace it with a direct rtnetlink `RTM_NEWLINK`/`IFLA_LINKINFO` call (consistent with the module's own netlink-native style) or document and allowlist the exception.
 
-  | workload | ours ns/op | wireguard-go ns/op | boringtun 0.7.1 ns/op | ours/wg-go | ours/fastest of the two |
-  |---|---:|---:|---:|---:|---:|
-  | `seal_64` | 363 | 200 | 184 | 1.820 | 1.973 |
-  | `seal_1424` | 1297 | 979 | 954 | 1.325 | 1.360 |
-  | `open_64` | 370 | 179 | 220 | 2.069 | 2.069 |
-  | `open_1424` | 1300 | 889 | 1007 | 1.463 | 1.463 |
-  | `handshake` | 261110 | 866428 | 414885 | 0.301 | 0.629 |
+## What is deliberately not done
 
-  (An earlier run under load read 2.08× on `open_64`.) The refused composition, for the record: `seal_64` 0.856, `seal_1424` 1.051, `open_64` 0.885, `open_1424` 1.057 × OpenSSL 3.5.5's EVP AEAD plus our framing, `handshake` 0.817 × libsodium 1.0.18's X25519 alone (2 base + 6 variable-base, no hashes).
-
-  **The cause, stated:** bare AEAD, `chachapoly` against x/crypto, with no framing at all: seal 64 B 1.945 (323 vs 166 ns), seal 1424 B 1.373 (1243 vs 905), open 64 B 1.957 (328 vs 168), open 1424 B 1.424 (1243 vs 873). The same ratios as the whole-path rows, so `Tunnel`'s framing, burn and timers cost about what Go's framing costs. x/crypto and ring stitch ChaCha20 and Poly1305 into one AVX2 loop (Krasnov; BSD and ISC sources, permissive); `chachapoly` runs them apart and delegates to `std` under 128 bytes. Its own card compares with OpenSSL's EVP and has not measured x/crypto. The handshake was this module's own work: `ct25519` and static-static took it from 1.37× a libsodium X25519-only bound to 0.30× wireguard-go.
-
-  Not benched: the configuration plane. Its time is a syscall and the kernel's. Measurements before 2026-11-03 used the composition alone and are history.
-The root-gated live test's `runIp()` helper shells out to the `ip` binary — the one external-process
-use in the whole repo (zig-libs is otherwise 100% pure-Zig/no-exec). Flagged as a known item
-in this module's own backlog (pure-Zig-invariant audit): either replace with a direct rtnetlink
-`RTM_NEWLINK`/`IFLA_LINKINFO` call
-(consistent with the module's own netlink-native style) or explicitly document/allowlist the
-exception. The multicast event group remains out of scope per the design.
-
-
-**Closed 2026-11-03**, from this list as it stood: `setDeviceFrom`; both control-plane bound items (see § Threat model); the `wg` file format; `listDevices`; the userspace client; **the data-plane hardening the GR sweep left open** (one item besides the two fixed then): a responder with N peers now pays one X25519 per forged-mac1 initiation (`peekInitiation`, then a look-up, then `Tunnel.acceptInitiation` or `consumeInitiationPeeked`), and `Tunnel` itself checks the replay stamp and the initiation rate that `consumeInitiation` leaves to its caller (after authentication, so a forgery moves neither). The under-load cookie gate stays one call per device in front, with `under_load` the caller's: the module sees no queue.
+- **The daemon: TUN device, UDP loop, GSO/GRO, CPU fan-out.** A daemon's, not a library's: this module has no socket on the data path, and the consumer drives the kernel.
+- **`wg show` rendering and wg-quick's host set-up** (routes, DNS, scripts): a program's; a library has the fields, and `.wg_quick_keys = .ignore` reads wg-quick's files.
+- **The BSD and Windows kernel APIs** (wgctrl-go has them): `meta.platform` is Linux.
+- **FFI/JNI bindings:** other languages' concern.
+- **`Tunn`'s 8-session ring** (boringtun): three sessions (previous, current, next) are the protocol's own, as in wireguard-go.
+- **The netlink multicast event group.**
 
 ## Cryptographic handshake (`noise.zig` / `handshake.zig`)
 
@@ -185,18 +160,17 @@ pending index within 256 guesses at 2 X25519 each, and the handshake count on th
 error from `decapsulate` moves no counter, timer, window or index (tests). `previous` has no send key; `next` keeps
 its own, since it sends once confirmed. **A staged packet larger than `out`** is dropped and counted, so it cannot
 stop the timers behind it. **Differences on purpose:** an initiator's pending handshake survives a simultaneous initiation from the peer,
-both sessions work (tested). **The key deadline follows the kernel (owner decision 2026-11-18):** as
+both sessions work (tested). **The key deadline follows the kernel (owner decision):** as
 `wg_queued_expired_zero_key_material` (`wg_noise_handshake_clear` + `wg_noise_keypairs_clear`) it wipes the
 sessions AND an initiation in flight, and touches no timer, no rekey request and no staged packet — so a
 retransmit, keepalive or new-handshake deadline still armed then starts a fresh handshake, and a late response to
 the cleared initiation is refused (`UnknownIndex`). A keepalive that comes due with no session to send under is
-staged and starts a handshake, as `wg_expired_send_keepalive` → `wg_packet_send_keepalive` (before 2026-11-18 the
-deadline also disarmed the timers and dropped the stage, and a session-less keepalive was dropped). Tests "the key
+staged and starts a handshake, as `wg_expired_send_keepalive` → `wg_packet_send_keepalive`. Tests "the key
 deadline clears an initiation in flight …", "… leaves every timer and request armed", "… keeps what was staged …",
 "… drops the handshake in flight: a late response to it is refused", "a keepalive that comes due with no session to
 send it starts a handshake". wireguard-go's `expiredZeroKeyMaterial` (`ZeroAndFlushAll`) also flushes the staged
 packets; the kernel does not, and the kernel is the reference chosen here.
-*Delta mutation 2026-11-18 (key deadline as the kernel):* the 5 killed mutants on the removed `expireKeys` lines (ids 357-361) leave the count; 3 new mutants — `expireKeys` without `wipePending`, a session-less keepalive doing nothing, no re-arm — all killed (card 656/764, 108 eq). **The second keepalive flag** follows both references since 2026-11-18: a send and a give-up cancel the keepalive
+**The second keepalive flag** follows both references: a send and a give-up cancel the keepalive
 but keep the flag (`timersAnyAuthenticatedPacketSent`, `wg_timers_any_authenticated_packet_sent`,
 `expiredRetransmitHandshake`); only a keepalive going out clears it. **Multi-peer:** `ownsIndex`, or the device's own table, or `routed_id`. **Clock:** it must
 keep counting across suspend (CLOCK_BOOTTIME); time going backwards saturates, nothing wraps, but it extends the
@@ -248,7 +222,7 @@ Initiator↔responder self-consistency (both sides agree the transport-key pair;
 wrong PSK fail closed). A netns-gated **live in-kernel WireGuard interop** test (Linux + euid 0 +
 `unshare -rn` + `ip`/wireguard module) runs a real handshake against the kernel and AEAD-decrypts a
 kernel-sent transport packet under the derived key, including a non-zero PSK. That test needs euid 0
-and skips elsewhere, so since 2026-10-06 the same exchange is also FROZEN: `tools/interop.zig`
+and skips elsewhere, so the same exchange is also FROZEN: `tools/interop.zig`
 (`unshare -rn zig build interop-wireguard -- --capture`) records both directions with fixed keys on our
 side, and `src/kernel_handshake_replay.zig` replays them in every lane (see Anchoring).
 The cookie layer has no published vector either, so it is pinned the same way: a second independent
@@ -374,68 +348,21 @@ session's birth (179 s seals, 180 s is `error.SessionExpired`; 119 s is `RekeySt
 canary likewise derives its count from `builtin.test_functions` instead of comparing a literal
 against itself.
 
-**Measured** (i7-7920HQ, AVX2, ReleaseFast, `-Dcpu=native`, 1420-byte payload, `WIREGUARD_BENCH=1`;
-re-measured 2026-08-11, four runs).
-
-The durable claim is the **ratio**, because it is the only figure that survives a shared machine:
-`chachapoly`-over-std is **2.4–2.6× on both `seal` and `open`** at a full MTU, and it does not move
-between an idle and a loaded host. The absolute figures do move: the full `seal` path — header
-write, copy-and-pad, AEAD, counter limits, session age — measured **1.36 µs/packet (0.73 Mpps,
-~1.04 GB/s)** on the least-contended of four runs and **1.75 µs (0.57 Mpps, ~0.81 GB/s)** on the
-most-contended, on a box carrying an unrelated build at load ~4/8. `open` (which additionally
-consults and updates the replay window) tracks it within 2 % in every run. Read the absolutes as
-"about 1.3–1.8 µs/packet on this class of core, single-threaded" and the ratio as the number a
-regression should be judged against; an earlier note quoting `~1.3–1.5 µs` and `2.3–2.4×` was
-narrower than the run-to-run spread the same command actually produces.
-
-The bare AEAD alone measured 1.34–1.74 µs across the same runs — i.e. indistinguishable from the
-full path, so the module's framing (and the §6.1 limit checks) cost approximately nothing next to
-the crypto, and the `chachapoly` win survives to the API a consumer actually calls. The by-size
-sweep still shows no payload size losing materially: ~1.0× up to 128 bytes (where the executed code
-literally *is* std's, via `chachapoly`'s delegation thresholds), ~1.1× at 144 B, then 2.0× at 512 B
-and 2.4–2.5× at 1420 B. Still no socket, no routing table and no queue in the timed region — a real
-tunnel adds a syscall (~1–2 µs) per packet on top, which will dominate.
-
 ## Secret residue on the dead stack
 
-Review 2026-10-09 (`src/stackprobe_test.zig`, ReleaseFast only): Noise_IKpsk2 in both roles,
-`deriveTransportKeys`, the three session constructors, one `seal` and one `open`, the bare KDF
-calls, 47 needles (both static and both ephemeral private keys raw and as X25519 clamps them, the
-PSK, `es`/`ss`/`ee`/`se`, every HKDF `temp_key`, `ck` and the AEAD key after each step, the psk2
-`tau`/`k`, both transport keys, the session key, a control) plus two needles read post hoc (what
-`Keypair.generate` and the generated-ephemeral `createInitiation` drew); NEG 0, POS 1. Before:
-183 hits per 3 runs — `fromPrivateKey` (the clamped scalar), `generate`, every `Handshake` call
-(the ephemeral key, `es`/`ss`/`ee`/`se`, `tau`, the psk key), `deriveTransportKeys` (both
-transport keys and the split `temp_key`), `seal`/`open` (the session key, passed by value to the
-AEAD) and all four bare KDF calls. Depth: handshake calls 3.4 KiB, KDF 1.5 KiB, key generation
-2.0 KiB, `seal`/`open` frames 0.1-0.3 KiB. After: 0 in every probed call.
+`src/stackprobe_test.zig` (ReleaseFast only) probes Noise_IKpsk2 in both roles, `deriveTransportKeys`, the three session constructors, one `seal` and one `open`, the bare KDF calls, the cookie layer, the key text and the control plane. Needles: both static and both ephemeral private keys (raw and as X25519 clamps them), the PSK, `es`/`ss`/`ee`/`se`, every HKDF `temp_key`, `ck` and the AEAD key after each step, the psk2 `tau`/`k`, both transport keys, the session key, the cookie secret `Rm` (fixed, and the one `init`/`refresh` draw under a recording `std.Io`), the cookie it derives, the interface private key, a pre-shared key and the private key's base64 text, plus a control; two more are read post hoc (what `Keypair.generate` and the generated-ephemeral `createInitiation` drew). Heap blocks are checked too: the control plane runs on a bump allocator that never reuses or resizes, and the whole arena is scanned after the last `deinit`. Every probed call leaves 0 stack and 0 heap hits, except the by-value `buildSetRequests` (below).
 
 Burned (`src/burn.zig`, body one frame down, then volatile vector stores): `Keypair.generate`/
-`fromPrivateKey` and `noise.kdf1`/`kdf2`/`kdf3`/`mixKey` 4 KiB; `createInitiation`/
-`consumeInitiation`/`createResponse`/`consumeResponse`/`deriveTransportKeys`/`transportSession`
-8 KiB; `seal`/`open` 1 KiB (per packet, ~10 ns). Secrets no longer travel by value: private keys by
-`*const`, results through `out` (see CHANGELOG, BREAKING). `chachapoly` burns its own tree.
+`fromPrivateKey` 4 KiB (`keypair_burn`); `noise.kdf1`/`kdf2`/`kdf3` 4 KiB (`kdf_burn`); `noise.keyedMac` 2 KiB (`mac_burn`);
+the four `Handshake` message calls, `deriveTransportKeys`, `transportSession` and `peekInitiation` 8 KiB (`hs_burn`).
+`seal`/`open` have no burn of their own: the session key goes to the AEAD by pointer and the probe finds no residue.
+Secrets do not travel by value: private keys by `*const`, results through `out`. `chachapoly` burns its own tree.
 
-Wave 9b (2026-10-09, second test of `src/stackprobe_test.zig`; ReleaseFast): the cookie layer, the key
-text and the control plane. Needles: the cookie secret `Rm` (fixed, and the one `init`/`refresh` draw
-under a RECORDING `std.Io`), the cookie it derives, the interface private key and a pre-shared key
-(raw), the private key's base64 text; NEG 0, POS 1. Heap blocks are checked too: the control plane
-runs on a bump allocator that never reuses or resizes, and the whole arena is scanned after the last
-`deinit`. Before (hits per 3 runs, 126 in all): `initWithSecret` 3 (`Rm`), `init` 9 and `refresh` 3
-(the drawn `Rm`), `cookieFor` 12, `checkMac2`/`createReply`/`createReplyWithNonce`/`consumeReply`/
-`admit (accept)` 3 each and `admit (cookie_reply)` 6 (the cookie), `keyFromBase64` 6 + 3 (key, base64
-text), `buildSetRequests` 6 + 3 (key, PSK), `DeviceParser.feed` 3 + 9, `finish` 6; heap after free: private
-key 9, PSK 9 + 15. Dirty depth before: `initWithSecret` 0.6 KiB, `init` 1.4, `refresh` 1.2, `cookieFor` 0.6,
-`checkMac2` 0.6, `createReply` 1.5, `createReplyWithNonce` 1.0, `admit` 0.9-1.7, `consumeReply` 0.75,
-`keyFromBase64` 0.3, `buildSetRequests` 1.5, `feed` 0.75, `finish` 0.4. After: 0 stack and 0 heap hits
-in every probed call; the one exception is the by-value `buildSetRequests` (the argument copy of
-`Config`, in the CALLER's frame, 191 B below the call: reported as known, see below).
-
-Burned (`burn.cp_burn`, 4 KiB = 2.3x the deepest, bodies one frame down): `CookieChecker.init`/
+Burned (`burn.cp_burn`, 4 KiB, bodies one frame down): `CookieChecker.init`/
 `initWithSecret`/`refresh`/`cookieFor`/`checkMac2`/`createReplyWithNonce` (`createReply` and `admit`
 only call these), `PeerCookie.consumeReply`, `keyFromBase64Into`, `buildSetRequests`/`...From`,
 `DeviceParser.feed`/`finishInto`. `Rm` goes in by `*const`, the checker and the cookie come out
-through `out` (see CHANGELOG). `PeerCookie.current`, `Handshake.computeMac2` and `createInitiation`
+through `out`. `PeerCookie.current`, `Handshake.computeMac2` and `createInitiation`
 with a cookie measured 0 before and are left as they were (cookie by value).
 Heap: `buildSetRequests` builds in a `wipealloc.WipingAllocator` (the shared `wipealloc` module: `free` and every shrink zero
 what they release, a growing `remap` is refused so the caller's alloc + copy + free path wipes the old
@@ -443,8 +370,7 @@ block); `SetRequests.deinit` zeroes `buf` before freeing; `Device.deinit` and `D
 zero the peer table (pre-shared keys) and the device (private key); the parser's peer table grows and
 finishes through blocks it wipes itself (`appendPeer`, `finishInto`).
 
-`Tunnel` (2026-11-03, `src/stackprobe2_test.zig`): `init`, a whole handshake and data both ways, needles the
-statics, the PSK, static-static and the session keys. `conf`/`uapi` wipe what they copy (keys, line scratch, the set
+`src/stackprobe2_test.zig` probes `noise.keyedMac` (the MAC key as needle) and `Tunnel`: `init`, a whole handshake and data both ways, needles the statics, the PSK, static-static and the session keys. `conf`/`uapi` wipe what they copy (keys, line scratch, the set
 frame, the read buffer), by reading, not probed; they cannot wipe the caller's text or writer.
 
 NOT covered, honestly:
@@ -461,16 +387,9 @@ NOT covered, honestly:
   and `getDeviceInto`/`finishInto`/`keyFromBase64Into` are the copy-free forms; `getDevice`, `finish` and
   `keyFromBase64` return the key by value and keep a copy in their own dead frame. The genetlink socket's
   receive buffer holds the GET reply (the private key in plain text) after `getDevice` and is not wiped
-  here (it belongs to `genetlink`; backlog item there, 2026-10-09);
+  here (it belongs to `genetlink`, whose Backlog carries it);
 - the `Handshake` struct itself keeps `chaining_key`/`hash` until `deriveTransportKeys` wipes them
   (by design).
-
-## Status
-`gap · linux · client · reentrant` + deps: `netlink`, `genetlink`, `chachapoly`, `ct25519`, `entropy`, `netaddr`, `b64ct` —
-canonical source is `pub const meta` in src/root.zig. (The handshake + transport half above depends
-only on `chachapoly`/`ct25519`/`entropy`/std.crypto, not on either netlink module; `netaddr` is used by
-`AllowedIp.parse`, `conf` and `uapi`. A consumer that references only the control plane does not compile the
-handshake.)
 
 ## Public test-only entry points, unguarded
 
@@ -484,11 +403,9 @@ rather than fixed, since adding the guard breaks any existing importer.
 
 **Anchor grade:** class A · oracle EXTERNAL
 
-**Live oracles (2026-11-03, `tools/interop.zig`):** `unshare -rn zig build interop-wireguard`: A, B the handshake against the kernel; C `Tunnel` against the kernel in both roles, its first data crossing and coming back, and `allowed_ips` dropping the kernel's reply from outside the list; D `conf` and `listDevices` against `wg`. `zig build interop-wireguard -- --wireguard-go`: E `uapi.Client` and `Tunnel` in both roles against a real wireguard-go, whose counters saw the traffic.
+**Live oracles (`tools/interop.zig`):** `unshare -rn zig build interop-wireguard`: A, B the handshake against the kernel; C `Tunnel` against the kernel in both roles, its first data crossing and coming back, and `allowed_ips` dropping the kernel's reply from outside the list; D `conf` and `listDevices` against `wg`. `zig build interop-wireguard -- --wireguard-go`: E `uapi.Client` and `Tunnel` in both roles against a real wireguard-go, whose counters saw the traffic.
 
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** KDF vs real wireguard-go vectors; netlink configuration plane vs a real `wg` SET_DEVICE request and the real kernel's GET_DEVICE reply (`kernel_goldens.zig`); handshake and data plane vs the real kernel's WireGuard (`tools/interop.zig` -> `src/testdata/kernel_handshake.zig`, replayed by `src/kernel_handshake_replay.zig` without root, 2026-10-06): the kernel's initiation consumed and answered with the response it accepted, its keepalive opened; our initiation (byte-for-byte the KAT's `msg1`, so the REDERIVED KAT is a message the kernel took) and a sealed ICMP echo request accepted by the kernel, its echo reply opened with both checksums holding; the cookie layer stays REDERIVED (an independent Python reference -- the kernel sends no cookie reply unless under load)
-
-**How it got there.** The anchoring work landed. DONE be61caa: real kernel SET/GET_DEVICE netlink frozen; closes the last self-RT layer
+**What the tests actually contain.** KDF vs real wireguard-go vectors; netlink configuration plane vs a real `wg` SET_DEVICE request and the real kernel's GET_DEVICE reply (`kernel_goldens.zig`); handshake and data plane vs the real kernel's WireGuard (`tools/interop.zig` -> `src/testdata/kernel_handshake.zig`, replayed by `src/kernel_handshake_replay.zig` without root): the kernel's initiation consumed and answered with the response it accepted, its keepalive opened; our initiation (byte-for-byte the KAT's `msg1`, so the REDERIVED KAT is a message the kernel took) and a sealed ICMP echo request accepted by the kernel, its echo reply opened with both checksums holding; the cookie layer stays REDERIVED (an independent Python reference -- the kernel sends no cookie reply unless under load)
