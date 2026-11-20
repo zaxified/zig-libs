@@ -8,16 +8,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-17** — Whole-module mutation of `src/root.zig` (211 mutants, 200 killed, 11 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). `Socket.getFamily` and `Socket.listFamilies` bodies factored out as `getFamilyOver` / `listFamiliesOver` so scripted replies can drive them; no behaviour change, no API change. 17 tests added (see SPEC § Audit 2026-11-17).
 - **2026-11-16** — **Additive:** `Socket.wipeRecvBuffer()` (secureZero of the receive buffer, for callers that parsed a secret-carrying reply, e.g. wireguard's `WG_CMD_GET_DEVICE`) and opt-in field `Socket.wipe_on_close` (default false; `close` wipes first). Default behaviour and cost unchanged. Limit: a buffer freed by an earlier growth is not wiped (transport-side).
 - **2026-11-16** — **Additive:** `Socket.listFamilies` (`CTRL_CMD_GETFAMILY` + `NLM_F_DUMP`, every registered family; `ListFamiliesError` adds `DumpInterrupted`), `Socket.getFamily` / `Family` (id, name, `CTRL_ATTR_VERSION`, `HDRSIZE`, `MAXATTR`), pure `parseFamily` / `buildListFamiliesRequest`. Existing resolvers unchanged. Tested offline on real kernel records.
-- **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GZ sweep (13 mutants, ReleaseSafe schemata): 13 killed after 1 new test (a group reply with family id exactly GENL_ID_CTRL / GENL_MAX_ID). hpke's 27 mutants were all killed by the sweep tests. Not a whole-module mutation score.
 - **2026-10-31** — **Behaviour change (no-panic sweep § GZ):** `.one_group` / `.many_groups` replies must carry the requested family's name and an in-range id, as the F2 doc already said (a reply without a name, with another family's name or an out-of-range id is `MalformedReply`). `resolveMcastGroups` resets `out` to all-null on any error, and a `names`/`out` length mismatch is a documented checked panic (was an assert).
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-10** — tests: deterministic fuzz driver `GENETLINK_FUZZ` over the existing harnesses (`splitPayload` plus its attribute walk, `findMcastGroupId` raw and structured); reach labels count real outcomes. No code or API change.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** real `CTRL_CMD_GETFAMILY` exchanges for families
-  with several multicast groups (netdev, nl80211, thermal, mptcp_pm) and for an unknown family are
-  frozen by `tools/families_capture.py` (Python's own socket and decoder) and replayed through the
-  resolve path: every group id matches the independent decode, ENOENT is `FamilyNotFound`. No defect.
 
 - **2026-09-10** — **security audit follow-up: five findings closed in the reply-resolution path,
   two of them HIGH.**

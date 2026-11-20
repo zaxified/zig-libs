@@ -58,7 +58,7 @@ try genetlink.appendHeader(gpa, &list, my_cmd, my_version); // after the nlmsghd
 Socket: `open`/`close`, `handle` (= the `fd` field, for poll/epoll and
 `setsockopt`), `setRecvTimeout`, `nextSeq`, `send`, `recvDatagram` /
 `recvDatagramStrict`, `wipeRecvBuffer` (zero the receive buffer after a secret-carrying reply; `wipe_on_close` does it at `close`), `lastErrorMessage`, `resolveFamily`,
-`resolveMcastGroup`, `getFamily` (id, name, version, header size, max attribute),
+`resolveMcastGroup`, `resolveMcastGroups` (several group names over one round trip), `getFamily` (id, name, version, header size, max attribute),
 `listFamilies` (every registered family; free the slice with `gpa.free`).
 Pure: `Family`, `parseFamily`, `buildListFamiliesRequest`,
 `CTRL_ATTR_VERSION`/`HDRSIZE`/`MAXATTR`.
@@ -73,6 +73,12 @@ bytes), `buildGetFamilyRequest` (the raw `CTRL_CMD_GETFAMILY` request bytes,
 useful for callers that want to drive the socket themselves) and
 `findMcastGroupId` (the pure group-id walk over a `CTRL_CMD_NEWFAMILY`
 reply's attribute bytes).
+
+## Not provided
+
+Joining a multicast group (one `setsockopt` on `sock.fd`, the caller's) and
+policy introspection (`CTRL_CMD_GETPOLICY`) are not provided; see SPEC *What is
+deliberately not done* and *Backlog / deferred*.
 
 ## Design notes
 
