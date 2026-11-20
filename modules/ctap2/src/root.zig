@@ -252,17 +252,17 @@ fn fuzzPinToken(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         var msg: [40]u8 = undefined;
         const mlen = src.valueRangeAtMost(u8, 1, msg.len);
         src.bytes(&msg);
-        const m1 = tok.authenticate(msg[0..mlen]);
-        const m1b = tok.authenticate(msg[0..mlen]);
+        const m1 = try tok.authenticate(msg[0..mlen]);
+        const m1b = try tok.authenticate(msg[0..mlen]);
         if (!std.mem.eql(u8, m1.slice(), m1b.slice())) return error.MacNotDeterministic;
         var flipped = msg;
         flipped[src.index(mlen)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
-        const m2 = tok.authenticate(flipped[0..mlen]);
+        const m2 = try tok.authenticate(flipped[0..mlen]);
         if (std.mem.eql(u8, m1.slice(), m2.slice())) return error.FlippedMessageSameMac;
         PinMark.mark(.mac_differs_on_flip);
         var other = tok;
         other.bytes[src.index(tok_len)] ^= 1;
-        const m3 = other.authenticate(msg[0..mlen]);
+        const m3 = try other.authenticate(msg[0..mlen]);
         if (std.mem.eql(u8, m1.slice(), m3.slice())) return error.OtherTokenSameMac;
         PinMark.mark(.wrong_secret_differs);
     }

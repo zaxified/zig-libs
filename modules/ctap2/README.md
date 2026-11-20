@@ -43,7 +43,7 @@ var token = client.getPinUvAuthTokenUsingPin(pin, .{ .mc = true, .ga = true }, "
     else => return err,
 };
 defer token.deinit(); // wipes it
-const pin_uv_auth_param = token.authenticate(&client_data_hash);
+const pin_uv_auth_param = try token.authenticate(&client_data_hash);
 ```
 
 **Handling notes.** Each call runs a fresh key agreement and wipes the shared secret,

@@ -363,14 +363,14 @@ test "Token.authenticate reproduces ctap2pin's python-fido2 pinUvAuthParam" {
     _ = try std.fmt.hexToBytes(&cdh, "1b84a09dfa3810244f8c86b0457fd7066e958690ea1f4527f38140078b3ed49e");
     var t1: clientpin.Token = .{ .protocol = .one, .len = 16 };
     _ = try std.fmt.hexToBytes(t1.bytes[0..16], "9b9fa85bad3af39ef391c1de54348d54");
-    const s1 = t1.authenticate(&cdh);
+    const s1 = try t1.authenticate(&cdh);
     var want1: [16]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want1, "2ebaa478ec17fd822a95ff8a4210861e");
     try testing.expectEqualSlices(u8, &want1, s1.slice());
 
     var t2: clientpin.Token = .{ .protocol = .two, .len = 32 };
     _ = try std.fmt.hexToBytes(&t2.bytes, "b09aa8ff4768554814c16bdef13dd14822d090d4663fd19f1138df09809603d8");
-    const s2 = t2.authenticate(&cdh);
+    const s2 = try t2.authenticate(&cdh);
     var want2: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&want2, "655feb200692083b2578b594028fe5d0c3fd2261f8a9f26572052cbf1df89694");
     try testing.expectEqualSlices(u8, &want2, s2.slice());
@@ -451,7 +451,7 @@ test "Token.authenticate, protocol One: the whole 32-byte token is the HMAC key,
     const msg = "client data hash stand-in";
     var full: [32]u8 = undefined;
     Hmac.create(&full, msg, &t.bytes);
-    const sig = t.authenticate(msg);
+    const sig = try t.authenticate(msg);
     try testing.expectEqual(@as(u8, 16), sig.len);
     try testing.expectEqualSlices(u8, full[0..16], sig.slice());
     // A 16-byte token keys with those 16 bytes only.
@@ -459,7 +459,7 @@ test "Token.authenticate, protocol One: the whole 32-byte token is the HMAC key,
     @memcpy(t16.bytes[0..16], t.bytes[0..16]);
     var full16: [32]u8 = undefined;
     Hmac.create(&full16, msg, t.bytes[0..16]);
-    try testing.expectEqualSlices(u8, full16[0..16], t16.authenticate(msg).slice());
+    try testing.expectEqualSlices(u8, full16[0..16], (try t16.authenticate(msg)).slice());
 }
 
 test "Token.deinit wipes the bytes and the length" {
@@ -469,6 +469,22 @@ test "Token.deinit wipes the bytes and the length" {
     try testing.expectEqual(@as(u8, 0), t.len);
     try testing.expectEqual(@as(usize, 0), t.slice().len);
     for (t.bytes) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "Token.authenticate on a token with no key is InvalidToken, not a panic or a zero-key MAC" {
+    // Default-constructed and deinit-ed tokens, both protocols.
+    const empty_one: clientpin.Token = .{ .protocol = .one };
+    try testing.expectError(error.InvalidToken, empty_one.authenticate("m"));
+    const empty_two: clientpin.Token = .{ .protocol = .two };
+    try testing.expectError(error.InvalidToken, empty_two.authenticate("m"));
+    var t: clientpin.Token = .{ .protocol = .two, .len = 32 };
+    @memset(&t.bytes, 0xee);
+    _ = try t.authenticate("m");
+    t.deinit();
+    try testing.expectError(error.InvalidToken, t.authenticate("m"));
+    // Protocol Two keys with exactly 32 bytes; a shorter token is refused.
+    const short_two: clientpin.Token = .{ .protocol = .two, .len = 16 };
+    try testing.expectError(error.InvalidToken, short_two.authenticate("m"));
 }
 
 test "getKeyAgreement: a y coordinate of 31 bytes is rejected, not read past" {

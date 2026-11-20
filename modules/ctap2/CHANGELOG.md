@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **Behaviour change, SOURCE-BREAKING:** `Token.authenticate` now returns `TokenError!Signature` (new `clientpin.TokenError = error{InvalidToken}`): a default-constructed or `deinit`ed token (`len == 0`) was a `catch unreachable` (panic in safe builds, UB in ReleaseFast) for protocol One and a MAC under an all-zero key for protocol Two; a protocol-Two token that is not 32 bytes is refused too. Callers add `try`; tokens this module returns never fail. New `ctaphid.max_foreign_packets` (100,000): `Channel` gives up (`TransportFailed`) after that many reports of other channels / other clients' INIT answers in one exchange (was unbounded). A stray continuation report stays `TransportFailed` (as libfido2 and python-fido2), now pinned by a test.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `@typeInfo(error set)` now `.error_set.error_names.?` (status.zig test); `strRepeat` helper is now `inline fn`.

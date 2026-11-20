@@ -229,6 +229,13 @@ pub const ReportDevice = struct {
 /// Give up after this many consecutive keep-alive messages (a stuck device).
 pub const max_keepalives = 100_000;
 
+/// Give up after this many reports in one exchange that do not belong to it:
+/// reports of other channels and, during `Channel.open`, other clients' INIT
+/// responses. Without it a device (or other clients) flooding foreign
+/// traffic would keep the exchange reading for as long as the
+/// `ReportDevice` does not time out.
+pub const max_foreign_packets = 100_000;
+
 /// One CTAPHID channel: `transact` runs a CTAPHID_CBOR exchange and can be
 /// wrapped as a `framing.Transport`.
 pub const Channel = struct {
@@ -267,6 +274,7 @@ pub const Channel = struct {
 
         var asm_ = Assembler.init(self.cid, out);
         var keepalives: usize = 0;
+        var foreign: usize = 0;
         while (true) {
             try self.dev.readFn(self.dev.ctx, &pkt);
             const fed = asm_.feed(&pkt) catch |e| switch (e) {
@@ -274,7 +282,11 @@ pub const Channel = struct {
                 else => return error.TransportFailed,
             };
             switch (fed) {
-                .incomplete, .other_channel => {},
+                .incomplete => {},
+                .other_channel => {
+                    foreign += 1;
+                    if (foreign > max_foreign_packets) return error.TransportFailed;
+                },
                 .complete => |m| switch (m.cmd) {
                     .keepalive => {
                         keepalives += 1;
@@ -287,6 +299,8 @@ pub const Channel = struct {
                     else => {
                         if (m.cmd != cmd) return error.TransportFailed;
                         if (init_nonce) |n| if (m.payload.len >= 8 and !std.mem.eql(u8, m.payload[0..8], n)) {
+                            foreign += 1;
+                            if (foreign > max_foreign_packets) return error.TransportFailed;
                             asm_ = Assembler.init(self.cid, out);
                             continue;
                         };
@@ -680,6 +694,31 @@ test "Channel: a device that only ever sends keep-alives is given up on" {
     var out: [64]u8 = undefined;
     try testing.expectError(error.TransportFailed, ch.transact(&.{0x04}, &out));
     try testing.expectEqual(@as(usize, max_keepalives + 1), sd.reads);
+}
+
+test "Channel: a device that only ever sends other channels' reports is given up on" {
+    var sd: ScriptDev = .{ .a = testing.allocator, .flood_cid = 8 };
+    var ch: Channel = .{ .dev = sd.dev(), .cid = 7 };
+    var out: [64]u8 = undefined;
+    try testing.expectError(error.TransportFailed, ch.transact(&.{0x04}, &out));
+    try testing.expectEqual(@as(usize, max_foreign_packets + 1), sd.reads);
+}
+
+test "Channel: a stray continuation report before the response fails the exchange" {
+    // libfido2 (io.c rx_preamble) and python-fido2 (CtapHidDevice.call) fail
+    // on it too: only other channels' reports and keep-alives are skipped.
+    const a = testing.allocator;
+    var sd: ScriptDev = .{ .a = a };
+    defer sd.queue.deinit(a);
+    var ch: Channel = .{ .dev = sd.dev(), .cid = 7 };
+    var out: [64]u8 = undefined;
+    var stray: Packet = @splat(0);
+    std.mem.writeInt(u32, stray[0..4], 7, .big);
+    stray[4] = 0; // SEQ 0, no message in progress
+    try sd.queue.append(a, stray);
+    try sd.push(7, .cbor, &.{0x00});
+    try testing.expectError(error.TransportFailed, ch.transact(&.{0x04}, &out));
+    try testing.expectEqual(@as(usize, 1), sd.reads);
 }
 
 test "Channel: a response to another command, an empty error, and a stale error" {

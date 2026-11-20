@@ -113,7 +113,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 try ss_auth.encrypt(rng, ct[0..n], &plain_tok);
                 const ss = shared(proto, taint);
                 var tok = try ss.decryptToken(ct[0..n]);
-                const sig = tok.authenticate("clientDataHash-and-rpIdHash....");
+                const sig = try tok.authenticate("clientDataHash-and-rpIdHash....");
                 std.debug.print("ctgrind_result={x}\n", .{tok.slice()});
                 std.debug.print("ctgrind_result={x}\n", .{sig.slice()});
                 tok.deinit();

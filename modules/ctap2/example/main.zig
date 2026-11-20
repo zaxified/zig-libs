@@ -156,7 +156,7 @@ pub fn main() !void {
     var token = try client.getPinUvAuthTokenUsingPin("1234", .{ .mc = true, .ga = true }, "example.com");
     defer token.deinit(); // wipes the token
     const client_data_hash: [32]u8 = @splat(0xCD);
-    const param = token.authenticate(&client_data_hash);
+    const param = try token.authenticate(&client_data_hash);
     std.debug.print("token: {d} bytes; pinUvAuthParam over clientDataHash: {x}\n", .{ token.len, param.slice() });
     const expected_token: [32]u8 = @splat(0xA5);
     if (!std.mem.eql(u8, token.slice(), &expected_token)) return error.WrongToken;

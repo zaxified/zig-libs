@@ -270,6 +270,9 @@ pub const Signature = struct {
     }
 };
 
+/// `Token.authenticate` on a token that holds no usable key.
+pub const TokenError = error{InvalidToken};
+
 /// A pinUvAuthToken obtained from the authenticator. Wipe with `deinit`.
 pub const Token = struct {
     protocol: Protocol,
@@ -282,16 +285,22 @@ pub const Token = struct {
 
     /// `authenticate(token, message)`: the `pinUvAuthParam` for a later
     /// command (e.g. over `clientDataHash` for makeCredential/getAssertion).
-    pub fn authenticate(self: *const Token, message: []const u8) Signature {
+    ///
+    /// `error.InvalidToken` when the token holds no key of its protocol's
+    /// length: a default-constructed or `deinit`ed token (`len == 0`), or a
+    /// protocol-Two token that is not 32 bytes. Tokens this module returns
+    /// never fail.
+    pub fn authenticate(self: *const Token, message: []const u8) TokenError!Signature {
         var out: Signature = .{};
         switch (self.protocol) {
             .one => {
-                // The key is the whole token (16 or 32 bytes: never empty).
-                const mac = ctap2pin.One.authenticate(self.slice(), message) catch unreachable;
+                // The key is the whole token (16 or 32 bytes as obtained).
+                const mac = ctap2pin.One.authenticate(self.slice(), message) catch return error.InvalidToken;
                 @memcpy(out.bytes[0..mac.len], &mac);
                 out.len = mac.len;
             },
             .two => {
+                if (self.len != 32) return error.InvalidToken;
                 const mac = ctap2pin.Two.authenticate(&self.bytes, message);
                 @memcpy(out.bytes[0..mac.len], &mac);
                 out.len = mac.len;
@@ -323,6 +332,7 @@ pub const SharedSecret = struct {
         var out: Signature = .{};
         switch (self.protocol) {
             .one => {
+                // A fixed 32-byte key: `EmptyKey` cannot happen.
                 const mac = ctap2pin.One.authenticate(self.bytes[0..32], message) catch unreachable;
                 @memcpy(out.bytes[0..mac.len], &mac);
                 out.len = mac.len;
