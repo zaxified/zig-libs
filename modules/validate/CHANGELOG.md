@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** audit card re-pinned (`mutation 2026-11-19 (2641/2778, 137 eq)`, src hash after the day's tests); no code change.
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of this day's changes (export gating of `literal`/`one_of`/`none_of`, `uriPortOk`, `isHtml` and the `html` format arms): 51 mutants, 49 killed, 2 equivalent; the first run left three alive and one test was added (a literal beside a non-literal in `patterns` on an `.int` rule).
 - **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** tests only: the `html` refusal carries code `format`, param `html` and its message; `uri` accepts an empty-host `file:///` reference and a user-info + IP-literal authority.
 - **2026-11-19** — **API addition:** `Format.html` (go-playground `html`): the text contains an HTML tag, the regex `<[/]?([a-zA-Z]+).*?>` unanchored with `.` not matching a newline (`hTMLRegexString`): `<`, an optional `/`, an ASCII letter and a later `>` on the same line (`<b>`, `</b>`, `x <a href="u">y`; refused: `<>`, `<1>`, `< a>`, `<a`, `<a` and `>` on different lines). Linear in the input (one pass per line). Exports as `"format":"html"`. A caller that matches `Format` exhaustively gains a member (appended last). Read from the rival's source by hand, not replayed against a running Go validator.
