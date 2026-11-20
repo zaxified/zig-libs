@@ -35,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [Xuanwo/backon](https://github.com/Xuanwo/backon) | Rust | Apache-2.0 (source not read) | — | pushed 2026-06-19 | README-verified: retry only — exponential/constant/custom strategies, `when` predicate, `notify`, dynamic backoff such as `Retry-After`. |
 | Zig: [k1ngkevin/zretry](https://github.com/k1ngkevin/zretry), [flowerinthenight/zbackoff](https://github.com/flowerinthenight/zbackoff) | Zig | MIT | 1 / 3 | zretry v0.4.0 (Zig 0.16); zbackoff pushed 2025-03-18 | Retry/backoff helpers only (zretry README-verified: configurable delay and jitter over an error-union function). No Zig breaker/bulkhead library found (GitHub search 2026-09-30 returned only tiny repos). |
 
-**Where we are ahead:** the only Zig library with breaker + bulkhead + retry + timeout composed in one `run` (the Zig retry crates do retry alone); no allocation, no hidden globals, injected clock/delay/random so every test is deterministic and sleep-free; half-open probe reclaim (`probe_timeout_ms`) so a lost probe cannot pin the breaker; typed errors; faster than the Go libraries single-threaded and on one breaker from 8 threads (`zig build bench-resilience`; figures on the card's **Performance:** line, see *Performance*). **Where we are behind:** nothing a breaker + retry + bulkhead user would notice (2026-10-17: failure-rate and slow-call windows, count and time based, `minimum_calls`, half-open k-of-n, forced-open / disabled / reset, state listener, `counts()`, error classification, retry on result, `Retry-After`, total time budget, proportional jitter, bulkhead in `run`). Deliberately not: fallback, a preemptive time limiter, the automatic open → half-open monitor, registries, thread-pool bulkhead (see *What is deliberately not done*). Rate limiting and futex-parked waiting are sibling modules (`ratelimit`, `throttle`), and `upstream` composes breaker + bulkhead per member.
+**Where we are ahead:** the only Zig library with breaker + bulkhead + retry + timeout composed in one `run` (the Zig retry crates do retry alone); no allocation, no hidden globals, injected clock/delay/random so every test is deterministic and sleep-free; half-open probe reclaim (`probe_timeout_ms`) so a lost probe cannot pin the breaker; typed errors; faster than the Go libraries single-threaded and on one breaker from 8 threads (`zig build bench-resilience`; figures on the card's Performance line, see *Performance*). **Where we are behind:** nothing a breaker + retry + bulkhead user would notice (2026-10-17: failure-rate and slow-call windows, count and time based, `minimum_calls`, half-open k-of-n, forced-open / disabled / reset, state listener, `counts()`, error classification, retry on result, `Retry-After`, total time budget, proportional jitter, bulkhead in `run`). Deliberately not: fallback, a preemptive time limiter, the automatic open → half-open monitor, registries, thread-pool bulkhead (see *What is deliberately not done*). Rate limiting and futex-parked waiting are sibling modules (`ratelimit`, `throttle`), and `upstream` composes breaker + bulkhead per member.
 
 ## Design & invariants
 
@@ -131,8 +131,8 @@ injected clock, an injected recording delay and scripted synthetic operations, s
 
 `zig build bench-resilience` (`tools/bench.zig`, always ReleaseFast, `BENCH_ROUNDS` rounds) compares the
 breaker, rate breaker, bulkhead, `run` and the delay schedule with gobreaker, failsafe-go and cenkalti/backoff;
-the Go comparators are built from the module cache (`tools/go_bench/go.sum` pins them). The card's
-**Performance:** line carries the figures and is authoritative.
+the Go comparators are built from the module cache (`tools/go_bench/go.sum` pins them). The
+card's Performance line carries the figures and is authoritative.
 
 ## What is deliberately not done
 
