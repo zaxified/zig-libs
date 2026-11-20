@@ -20,32 +20,22 @@ BBS signatures — pairing-based multi-message signatures with
 zero-knowledge selective-disclosure proofs; see [README.md](README.md)
 for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: COMPLETE.** Ciphersuite machinery, key generation, the
-`Signature`/`Proof` wire codecs, and the four irreducible cryptographic
-cores — `sign`/`verify`/`proofGen`/`proofVerify` (`bbs.zig`) — are all
-implemented and byte-exact KAT-pinned. `gate.core_implemented = true`;
-the full suite passes byte-exact in Debug and ReleaseFast.
-See `bbs.zig`'s own module doc comment for the exact construction each
-core transcribes.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Foreign source was not read (Apache-2.0 sources are off limits under the playbook); claims come from READMEs, the IETF datatracker and the draft repository's file list.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [draft-irtf-cfrg-bbs-signatures](https://datatracker.ietf.org/doc/draft-irtf-cfrg-bbs-signatures/) ([repo](https://github.com/decentralized-identity/bbs-signature)) — **reference** (the specification) | spec | Apache-2.0 (repo) | 104 | draft revision **-12** (2026-09-28); repo also carries `draft-blind-bbs-signatures.md` | Since 2026-10-06 this module pins -12 and reproduces the vectors of both its suites byte-exactly (BLS12-381-SHA-256 §8.4 + D.2, BLS12-381-SHAKE-256 §8.3 + D.1). |
-| [mattrglobal/pairing_crypto](https://github.com/mattrglobal/pairing_crypto) | Rust | Apache-2.0 | 37 | pushed 2026-09 (no releases); README supports "draft-03" | The source of our draft-04 vectors until 2026-10-06. No independent audit stated in its README. SHA-256 suite; wrappers for other languages. |
+| [draft-irtf-cfrg-bbs-signatures](https://datatracker.ietf.org/doc/draft-irtf-cfrg-bbs-signatures/) ([repo](https://github.com/decentralized-identity/bbs-signature)) — **reference** (the specification) | spec | Apache-2.0 (repo) | 104 | draft revision **-12** (2026-09-28); repo also carries `draft-blind-bbs-signatures.md` | This module pins -12 and reproduces the vectors of both its suites byte-exactly (BLS12-381-SHA-256 §8.4 + D.2, BLS12-381-SHAKE-256 §8.3 + D.1). |
+| [mattrglobal/pairing_crypto](https://github.com/mattrglobal/pairing_crypto) | Rust | Apache-2.0 | 37 | pushed 2026-09 (no releases); README supports "draft-03" | The source of the draft-04 vectors this module used before the pin moved to -12. No independent audit stated in its README. SHA-256 suite; wrappers for other languages. |
 | [Cybersecurity-LINKS/zkryptium](https://github.com/Cybersecurity-LINKS/zkryptium) | Rust | Apache-2.0 | 26 | v0.7.0 per its README (crate), pushed 2026-09 | BBS per **draft-10**, plus **Blind BBS** (blind-signatures draft-02), **per-verifier linkability** (pseudonyms, draft-03) and CL2003. README calls itself experimental / research. |
 | Zig ecosystem (GitHub search "bbs signatures", "bls12-381 pairing", language Zig, 2026-09-30) | Zig | — | — | — | No BBS repository found. |
 
 **Where we are ahead:** the only Zig BBS implementation found; byte-exact against the current draft's (-12) own vectors — keys, generators, message scalars, mocked random scalars, three valid signatures, six invalid ones, five proofs, per suite — where zkryptium tracks -10; explicit-randomness API shared with the KAT path; on-curve **and subgroup** checks on `PK`, `Signature`, `Abar`/`Bbar`/`D` at decode; a ctgrind harness. **Where we are even:** with the draft's two ciphersuites. **Where we are behind:** no Blind BBS, no pseudonyms/per-verifier linkability; no `proofGen`-side helper that turns a "disclosed message set" into indexes.
 
-**Re-assessed 2026-10-06** (no new web survey): the pin moved from -04 to -12, and the SHAKE-256 suite landed (with `expand_message_xof` in `bls12_381`), so both gaps the grade-3 audit named for core are closed; what remains (Blind BBS, pseudonyms, a disclosed-set helper) is separate drafts or convenience. Scope `mvp` → `core`.
-
 ## Draft version pinned: draft-irtf-cfrg-bbs-signatures-**12**
 
-Since 2026-10-06 this module follows **draft-12**
+This module follows **draft-12**
 (`https://www.ietf.org/archive/id/draft-irtf-cfrg-bbs-signatures-12.txt`,
 September 2026) and its KATs are the draft's OWN vectors for the
 BLS12-381-SHA-256 suite — §8.4 (key pair, message scalars, generators,
@@ -56,26 +46,16 @@ Appendix D.1), extracted from the draft text by
 `tools/gen_kat_vectors.py` into `src/kat_vectors.zig`. Every value
 reproduces byte-exactly.
 
-**What changed from draft-04** (the pin until 2026-10-06, whose vectors
-came from `mattrglobal/pairing_crypto`; the byte-level determination of
-that pin is in git history, SPEC as of `7017121e`):
+**Construction (draft-12)**:
 
-- The primitives are byte-identical: key generation, generators, `P1`,
-  message-to-scalar, hash-to-scalar, `calculate_domain`, the mocked RNG
-  (all -04 vectors for them reappear unchanged in -12).
-- **CoreSign** — `e = hash_to_scalar(serialize((SK, msg_1, .., msg_L,
-  domain)))`: `domain` moved from right after `SK` to the end.
-- **The proof** — a new commitment `D = B * r2`, `Abar = A * (r1 * r2)`,
-  `Bbar = D * r1 - Abar * e`, two Schnorr commitments `T1 = Abar * e~ +
-  D * r1~` and `T2 = D * r3~ + sum H_j * m~_j`; the wire form is
-  `(Abar, Bbar, D, e^, r1^, r3^, m^_1..m^_U, c)` (272 + 32·U octets, was
-  192 + 32·U), with `5 + U` random scalars (was `3 + U`).
-- **The challenge** — `serialize((R, i1, msg_i1, .., iR, msg_iR, Abar,
-  Bbar, D, T1, T2, domain)) || I2OSP(len(ph), 8) || ph`: each index is
-  followed by its message, and the points come after them.
-
-A -04 signature or proof does not verify under this module any more
-(no consumer depended on the -04 bytes).
+- The primitives (key generation, generators, `P1`, message-to-scalar, hash-to-scalar, `calculate_domain`, the mocked
+  RNG) are the draft's, byte-exact.
+- **CoreSign** — `e = hash_to_scalar(serialize((SK, msg_1, .., msg_L, domain)))`: `domain` is serialized last.
+- **The proof** — a commitment `D = B * r2`, `Abar = A * (r1 * r2)`, `Bbar = D * r1 - Abar * e`, two Schnorr
+  commitments `T1 = Abar * e~ + D * r1~` and `T2 = D * r3~ + sum H_j * m~_j`; the wire form is
+  `(Abar, Bbar, D, e^, r1^, r3^, m^_1..m^_U, c)` (272 + 32·U octets), with `5 + U` random scalars.
+- **The challenge** — `serialize((R, i1, msg_i1, .., iR, msg_iR, Abar, Bbar, D, T1, T2, domain)) || I2OSP(len(ph), 8)
+  || ph`: each index is followed by its message, and the points come after them.
 
 **Mocked-RNG seed** — draft-12 §8.1/§8.4.5: `SEED =
 "3.141592653589793238462643383279"` (30 digits of pi) and DST `api_id ||
@@ -127,7 +107,7 @@ follows `frost`'s "nonces are an explicit input" convention
 
 ## Secrets: pointers in, out-params out, burned bodies
 
-(2026-10-09) The secret entry points — `keyGen`, `skToPk`, `SecretKey`'s
+The secret entry points — `keyGen`, `skToPk`, `SecretKey`'s
 codec, `sign`, `proofGen`, `ciphersuite.calculateRandomScalars` — take a secret
 by pointer and return one through an out-param (zeroed on error). Each body is
 a `never_inline` frame and the stack it dirtied is zeroed afterwards
@@ -142,15 +122,13 @@ public by construction.
 ## Deserialization subgroup-checks every untrusted point
 
 Same pitfall class `bls12_381`'s own `SPEC.md` centers its threat
-model on. Since 2026-10-03 `G1.fromBytesCompressed`/`G2.fromBytesCompressed`
+model on. `G1.fromBytesCompressed`/`G2.fromBytesCompressed`
 check on-curve-ness AND subgroup membership themselves, so each untrusted
 decode in this module adds only the identity rejection on top:
 `PublicKey.fromBytes` (`src/keys.zig`, `G2`), `Signature.fromBytes` and the
 `Proof` points (`src/bbs.zig`, `G1`), each failing with its own error
 (`InvalidPublicKey` / `InvalidSignatureEncoding` / `InvalidProofEncoding`).
-Until 2026-10-03 this module ran its own `subgroupCheck` after an
-on-curve-only decode (see CHANGELOG); the 2026-10-05 mutation run added a
-refusal test for the identity and for an out-of-subgroup point in every
+A refusal test covers the identity and an out-of-subgroup point in every
 decoded slot.
 
 ## Cores (implemented) — draft mapping
@@ -172,45 +150,6 @@ Every line below holds for both suites (the §8.3/D.1 vectors mirror §8.4/D.2).
   published proofs; refuses each under another presentation header,
   another header, and with a disclosed message dropped.
 
-**Mutation run 2026-10-06** (schemata, ReleaseSafe, 19 mutants over the
-draft-12 changes: CoreSign's `e` serialization order, `D`'s identity
-refusal at decode, every ProofInit term (`D`, `Abar`'s `r1·r2`, `Bbar`'s
-sign, `T1`/`T2` dropping `D`), `r3 = r2⁻¹`, the signs of `e^`/`r1^`, the
-challenge's index/message interleaving and its `D`, both `c`-terms of
-`ProofVerifyInit`, the challenge compare, the pairing check, the random
-scalar count and the proof's scalar order): 18 killed by the draft's own
-vectors and the refusal tests; the 19th — dropping `proofGen`'s `r1 == 0`
-refusal — survived, and a test now pins that a zero `r1` or `r2` is refused
-(re-run: killed).
-
-**Mutation run 2026-10-05** (in-place, Debug, 28 mutants over the
-`Signature`/`Proof`/`PublicKey` decoders, `proofGen`/`proofVerify`'s
-input guards, the challenge and domain transcripts, the challenge and
-pairing checks, and `keyGen`): 28 killed. The first pass left 14; tests
-were added for the identity and an order-3 point in every decoded `G1`
-slot (`Signature.a`, `Abar`, `Bbar`) and an on-twist point outside `G2` as
-a public key — nothing in this module pinned that it uses the checked
-decoders —, index `== L` and too many random scalars in `proofGen`, more
-messages than indexes, index `== L` and a duplicate index in `proofVerify`,
-the `keyGen` length edges, and a proof over a forged signature: the
-Schnorr part is consistent for any `(A, e)`, so only the final pairing
-check refuses it, and dropping that check survived every KAT.
-
-## Remaining hardening
-
-- ~~The subgroup-check obligation on untrusted inputs~~ — done; see *Deserialization subgroup-checks
-  every untrusted point* above.
-
-## Out of scope (future extensions)
-
-- The blind-signature `commitment` extension point (draft §5.11) —
-  `CoreSign`'s `commitment` parameter always defaults to `Identity_G1`
-  in this module's `sign`; a blind-BBS extension would need its own
-  Interface layer per draft §3.8's "Defining New Interfaces" rules.
-- A `bbs.Proof`-level "which messages are disclosed" convenience API
-  beyond the raw `disclosed_indexes: []const usize` this scaffold
-  exposes.
-
 ## Anchoring
 
 **Anchor grade:** class B · oracle EXTERNAL
@@ -218,14 +157,36 @@ check refuses it, and dropping that check survived every KAT.
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** The draft-12 text's own BLS12-381-SHA-256 vectors (NOTICE), byte-exact for every primitive and core
+**What the tests actually contain.** The draft-12 text's own BLS12-381-SHA-256 vectors (NOTICE), byte-exact for every primitive and core.
+
+## Verification
+
+- **Run:** `scripts/modtest bbs`.
+- **Known-answer tests** (`src/kat_test.zig`, vectors in `src/kat_vectors.zig`, generated by `tools/gen_kat_vectors.py`
+  from the draft's text): both suites' key pair, generators (and `P1` re-derived), message scalars, mocked random
+  scalars and the hash-to-scalar example; `sign` byte-exact on the valid cases and `verify` agreeing on every case
+  (the invalid ones refused); `proofGen` byte-exact under the mocked RNG and `proofVerify` accepting; a signature of
+  one suite not verifying under the other. Each gated test is a real assertion (`gate.core_implemented = true`).
+- **Refusals** (`src/keys.zig`, `src/bbs.zig`): the identity and out-of-subgroup points in every decoded slot, an
+  on-twist point as a public key, `keyGen` length edges, `proofGen` / `proofVerify` input guards, a zero `r1` or `r2`,
+  a proof over a forged signature (refused only by the final pairing check).
+- **Fuzz:** `BBS_FUZZ` (testkit's deterministic driver, `src/fuzz_test.zig`): `bbs-signature`, `bbs-public-key`,
+  `bbs-proof` (decoders), `bbs-sign-verify`, `bbs-proof-verify`.
+- **Stack hygiene:** `src/stackprobe_test.zig` (ReleaseFast) fails when a secret body outgrows its burn.
+- **Constant time:** `scripts/checks/ctgrind.sh bbs` (`src/ctgrind_harness.zig`): `sign` and `proofgen` rows.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
 ## Backlog / deferred
 
-
-- ~~**Move the pin from draft-04 to the current draft**~~ — DONE 2026-10-06 (-12, the draft's own vectors byte-exact).
-- ~~**SHAKE-256 ciphersuite**~~ — DONE 2026-10-06 (`bbs.shake256`; `expand_message_xof` in `bls12_381`).
-- **Dead-stack: `verify`/`proofVerify` and the callers' own copies.** Out of scope of the 2026-10-09 sweep: the verifier side holds no secret of its own; `random_scalars`, the messages and the caller's `SecretKey` copies are the caller's to wipe (the example does it for the scalars).
-- **Blind BBS signatures (`draft-irtf-cfrg-bbs-blind-signatures`)** (survey 2026-09-30): lets a holder hide messages from the signer; zkryptium ships it. This SPEC's `commitment` parameter note (draft §5.11) is the hook. Effort: medium. Fits §2.
-- **Pseudonyms / per-verifier linkability (`draft-irtf-cfrg-bbs-per-verifier-linkability`)** (survey 2026-09-30): unlinkable-but-consistent identifiers per verifier, in zkryptium. Effort: medium; depends on the pin move above. Fits §2.
-
+- **Dead stack: `verify` / `proofVerify` and the callers' own copies.** The verifier side holds no secret of its own;
+  `random_scalars`, the messages and the caller's `SecretKey` copies are the caller's to wipe (the example does it for
+  the scalars). Not covered by the stack-burn work.
+- **Blind BBS signatures (`draft-irtf-cfrg-bbs-blind-signatures`)** (survey 2026-09-30): lets a holder hide messages
+  from the signer; zkryptium ships it. `sign` has no `commitment` parameter (draft §5.11's extension point); a
+  blind-BBS extension would need its own Interface layer per draft §3.8's "Defining New Interfaces" rules. Effort:
+  medium. Fits §2.
+- **Pseudonyms / per-verifier linkability (`draft-irtf-cfrg-bbs-per-verifier-linkability`)** (survey 2026-09-30):
+  unlinkable-but-consistent identifiers per verifier, in zkryptium. Effort: medium. Fits §2.
+- **A "which messages are disclosed" convenience API** beyond the raw `disclosed_indexes: []const usize` that
+  `proofGen` takes.
