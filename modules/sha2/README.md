@@ -72,7 +72,7 @@ EVP's per-call overhead. Against std on the same machine, MB/s, best of 5,
 | SHA-384 | 16 KiB | 434 | 671 | 1.54 |
 | SHA-384 | 1 MiB | 438 | 659 | 1.50 |
 
-SPEC.md § Speed has the per-block cycle counts and why our own Zig rounds
+SPEC.md § Speed has the instruction-count model, and *What is deliberately not done* why our own Zig rounds
 did not reach this.
 
 Provenance: `src/asm/*.s` is third-party code. It is CRYPTOGAMS' SHA-NI and

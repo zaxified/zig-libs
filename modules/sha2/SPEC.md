@@ -23,14 +23,13 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [openssl/openssl](https://github.com/openssl/openssl) — **reference** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | The speed yardstick (the README measures 418 MB/s SHA-256 and 640 MB/s SHA-384 on the development CPU against this module's 405 and 597): run-time CPU dispatch to SHA-NI/AVX2/AVX-512 assembly *(inferred)*, the full SHA-2 family incl. SHA-512/224 and /256. |
+| [openssl/openssl](https://github.com/openssl/openssl) — **reference** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | The speed yardstick (ratios on the card's Performance line): run-time CPU dispatch to SHA-NI/AVX2/AVX-512 assembly *(inferred)*, the full SHA-2 family incl. SHA-512/224 and /256. |
 | Zig `std.crypto.hash.sha2` | Zig | MIT | — | Zig 0.16.0 | The closest competition and the API this module mirrors. Has `Sha224/256/384/512` **and** `Sha256T192`, `Sha512T224`, `Sha512T256`, `Sha512_224`, `Sha512_256` (checked in 0.16.0's `lib/std/crypto/sha2.zig`); SHA-NI/`sha2` on x86-64/arm64 for SHA-256 only, scalar schedule otherwise. |
 | [RustCrypto/hashes](https://github.com/RustCrypto/hashes) `sha2` 0.11.0 | Rust | MIT OR Apache-2.0 (`Cargo.toml`) | 2.3k | push 2026-09-22 | All six standard algorithms; backends per its README: `x86-sha` and `aarch64-sha2` (SHA-256), `x86-avx2` and `aarch64-sha3` (SHA-512), `wasm32-simd128`, `loongarch64-asm`, RISC-V `Zknh`; x86/aarch64 backends are **chosen at run time** when the feature is detected. |
 | Go `crypto/sha256`, `crypto/sha512` ([docs](https://pkg.go.dev/crypto/sha256)) | Go | BSD-3-Clause | — | Go stdlib | Full family incl. SHA-512/224 and /256; hardware paths chosen at run time *(inferred; docs not read for this)*. |
 | [google/boringssl](https://github.com/google/boringssl) | C++/C | Apache-2.0 (API; older files carry OpenSSL/ISC terms *(inferred)*) | 2.3k | push 2026-09-29 (no releases) | Same shape as OpenSSL: asm with run-time dispatch *(inferred)*; the BoringSSL/AWS-LC line is what most production TLS stacks link. |
 
-**Where we are ahead:** of `std`, on a machine without SHA-NI, from two blocks up (1.24–1.40× in the module's own bench, not re-run here); pure Zig with the same declarations as std (including under std's `Hmac`/`Hkdf`); RustCrypto's AVX2 path is SHA-512-only, ours covers both word sizes (its README); 0.40–0.99× OpenSSL's EVP calls on every row, HMAC 0.52–0.54× (2026-10-26, *Speed*); since 2026-10-26 the SHA-NI and AVX2 paths are chosen at run time, as OpenSSL, Go and RustCrypto do, so a baseline-x86-64 build gets them. **Where we are behind:** SHA-512's SHA512-extension path (Intel, Arrow Lake and later; OpenSSL and CRYPTOGAMS have it), no NEON path of our own (we hand SHA-256 to std where std has SHA hardware; SHA-512 on arm64 is scalar), no SHA-512 hardware path (→ Backlog, already listed).
-
+**Where we are ahead:** of `std`, on a machine without SHA-NI, from two blocks up (README *Speed* has the table); pure Zig with the same declarations as std (including under std's `Hmac`/`Hkdf`); RustCrypto's AVX2 path is SHA-512-only, ours covers both word sizes (its README); at or under OpenSSL's EVP calls on every row, HMAC included (the card's Performance line); the SHA-NI and AVX2 paths are chosen at run time, as OpenSSL, Go and RustCrypto do, so a baseline-x86-64 build gets them. **Where we are behind:** SHA-512's SHA512-extension path (Intel, Arrow Lake and later; OpenSSL and CRYPTOGAMS have it), no NEON path of our own (we hand SHA-256 to std where std has SHA hardware; SHA-512 on arm64 is scalar), no SHA-512 hardware path (→ *Backlog / deferred*).
 ## What this module is, and what it is not
 
 SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224 and SHA-512/256 (FIPS
@@ -142,12 +141,12 @@ Per word size (`Engine(Word).defaultBackend`), first match wins:
    skips the check at compile time. The assembly is handed at most 2^20
    blocks per call: SHA-256's AVX2 code compares its loop end in 32 bits,
    and a single call whose remaining input is a multiple of 4 GiB stopped
-   early with a wrong digest (reproduced 2026-10-26; the opt-in test
+   early with a wrong digest (the opt-in test
    `SHA2_BIG=1` holds it). This is an upstream defect (`my $a4=$T1;` is
    `%r12d` for SHA-256). OpenSSL ships the same generator; it has not been
-   checked there. Not reported upstream (owner, 2026-10-26); the cap is the
+   checked there. Not reported upstream; the cap is the
    fix here. SHA-512's AVX2 code compares in 64 bits, and the SHA-NI code
-   counts blocks down in a 64-bit register (audit 2026-10-26). ELF only, because
+   counts blocks down in a 64-bit register. ELF only, because
    the files use ELF directives and the SysV ABI; that also rules out
    Windows. x32 is excluded too (`@sizeOf(usize) == 8`): the code does
    64-bit pointer arithmetic. The symbols are `.weak` + `.hidden`, so two
@@ -174,7 +173,7 @@ more than either.
 
 The `.cryptogams_*` paths make a baseline-x86-64 build as fast as a native
 one, on a SHA-NI machine as on an AVX2 one. `.simd` stays compile-time only, because Zig 0.17 has no
-per-function target features (checked 2026-10-26: the langref has none).
+per-function target features (the langref has none).
 
 **Test-only switch.** `test_hooks.forced` exists only when `builtin.is_test`
 (outside tests `test_hooks` is an empty struct), and overrides the backend so
@@ -199,16 +198,13 @@ same class, and so is the `W + K` area of CRYPTOGAMS' stack frame. The
 assembly has no secret-dependent branch or memory index. Its branches test
 the block count and the end of its constant table. The ctgrind harness
 runs through the AVX2 path: the digest's taint reaches the witness
-printer, and no context is attributed to the module or left unattributed
-(2026-10-26). The SHA-NI path is NOT measured by ctgrind. valgrind runs on
+printer, and no context is attributed to the module or left unattributed. The SHA-NI path is NOT measured by ctgrind. valgrind runs on
 the host CPU, which has no SHA-NI. Its claim rests on reading: no branch
 except the block-count loop, and no memory index derived from data. The
 SHA instructions are fixed-latency. The SHA-NI function writes nothing to
-the stack but the saved `%rbp`; state and message stay in XMM registers
-(read 2026-10-26), so its stack residue is only the Zig frames around it.
+the stack but the saved `%rbp`; state and message stay in XMM registers, so its stack residue is only the Zig frames around it.
 jwt's ReleaseFast stack probe (HMAC over this module, with a burn) ran clean
-under `qemu-x86_64 -cpu max`, where HMAC-SHA-256 takes this path
-(2026-10-26). The XMM/YMM registers keep the last block's values after
+under `qemu-x86_64 -cpu max`, where HMAC-SHA-256 takes this path. The XMM/YMM registers keep the last block's values after
 return, on both assembly paths (`vzeroupper` clears only the upper
 halves); neither std nor OpenSSL clears them either.
 
@@ -275,151 +271,48 @@ alignment (loads are unaligned; `@ptrCast` to `*align(1)` vectors).
 
 **Anchor grade:** class B · oracle EXTERNAL
 
-### Audit 2026-10-03
+## Verification
 
-Reviewed `src/root.zig` whole (947 lines) against FIPS 180-4: padding (the
-`0x80` byte, the spill to a second block exactly when fewer than `len_bytes`
-bytes remain, the big-endian bit count), the buffering in `update` (every
-partial/whole/partial split, `buf_len` as `u8`), the derived constants and
-initial values (`fracRoot` stays inside `u256` for both word sizes), the
-rounds, both schedules, the transpose and its masks, the batch loop in
-`compressSimd` (a remainder is 0 or 1 block, so `compressScalar` reads a whole
-block), the `.stdlib` hand-over to std's `update`, and the layout cast of the
-`[rounds]V` table to `[rounds][lanes]Word`. No defect found. The
-constant-time statement holds on reading: every branch and every batch size
-depends on the input length only. INFO: `final` leaves the last partial block
-and the padding in `buf` and the chaining state in `s` (documented under
-*Constant-time contract*, same as std).
-
-Mutation run (schemata, ReleaseSafe, one binary, baseline 1 s): **54 mutants,
-52 killed, 2 equivalent, 0 real**. Covered: every branch and bound of `update`
-and `final` (partial-buffer guard and take, early-return length, whole-block
-split, padding threshold at both edges, `0x80`, the two zero fills, bit-count
-shift and byte order, digest byte order, `init`); `compressBlocks` loop and the
-`.stdlib` state hand-back; `compressSimd` batch threshold, batch size, block
-count, trailing lone block; `scheduleSimd` lane clamp, byte swap, both
-recurrence distances, `K` addition, transpose stage; every rotation/shift
-amount of `sigma0/1`, `vsigma0/1`, `Σ0`, `Σ1`, `vrotr`; `Ch`, `Maj` and its
-carried `b ^ c` (both compressors), the working-variable update, `T1` terms, the
-final state addition (both compressors), the schedule start round, the big-endian
-word load, the table column. Not mutated: the comptime constants (`K`, initial
-values, `maskLow`/`maskHigh`), which are evaluated at compile time; any wrong
-`K` entry, initial value or mask changes every multi-block digest and fails the
-FIPS known answers.
-
-Equivalent:
-- `d.total_len +%= take` instead of `b.len` in `update`'s early return: that path
-  is taken only when the whole input fits the buffer, so `take == b.len`.
-- `compressSimd` loop `>= block_len` instead of `>= 2 * block_len`: a lone block
-  through the lane-wide schedule (`n = 1`, padding lanes ignored) gives the same
-  state; the threshold is a speed choice only.
-
-### Audit 2026-10-26
-
-The source changed since 2026-10-03: CRYPTOGAMS' assembly, the run-time
-dispatch, SHA-512/t and the plain truncations, and `compressOne`. Reviewed
-`src/root.zig` whole and both `src/asm/` files at the Zig/assembly boundary.
-- **Regeneration.** `tools/gen_cryptogams.sh` reproduces both `.s` files
-  byte for byte (upstream files pinned by commit and SHA-256).
-- **ABI.** The functions follow SysV: callee-saved GPRs are pushed and
-  restored, `%rsp` is restored from `%rbp`, and the AVX2 paths end with
-  `vzeroupper`. They start with `endbr64`. The constant tables are
-  64-byte aligned for the aligned loads.
-- **CPU features.** The SHA-NI function uses only SSE2, SSSE3 (`pshufb`,
-  `palignr`) and SHA instructions, which matches its SHA + SSSE3 condition.
-  The AVX2 functions use AVX2, `rorx` (BMI2) and `andn` (BMI1), which
-  matches AVX2 + BMI1 + BMI2 + XCR0 YMM.
-- **Loop ends.** SHA-256 AVX2 has the 32-bit compare (above, capped).
-  SHA-512 AVX2 compares in 64 bits. SHA-NI uses `dec %rdx` and runs at
-  least one block; `compressBlocks` never passes 0.
-- **Odd block.** For an odd block count the AVX2 code points its second
-  lane at its own stack frame, never at the caller's memory (the guard-page
-  test holds this).
-- **Symbols.** All are `.weak`, `.hidden` and prefixed `zl_sha2_`.
-- No defect found in the code.
-
-Two instrument findings, both fixed:
-- **No independent CPUID oracle.** Mutants that read the wrong AVX2 bit
-  (bit 4 for 5) or the wrong SHA bit (28 for 29) passed every existing
-  test. "The default backend" test re-derives from the same function, and
-  a lost SHA-NI path merely drops out of the per-backend tests. The new
-  test "CPU detection agrees with std's native detection" kills both.
-- **The audit's source hash ignored assembly.** `moduleSrcHash`
-  (`scripts/gates/gates.zig`) fingerprinted only `*.zig`, so regenerated
-  assembly would not have made this audit stale. It now includes `*.s` and
-  `*.S`.
-
-Mutation run (schemata, ReleaseSafe, one binary per CPU model, baseline 3 s
-native / 19 s under qemu): **25 mutants, 25 killed**. Each ran natively
-(Kaby Lake: AVX2, no SHA-NI) and under `qemu-x86_64 -cpu max` (SHA-NI). The
-dispatch mutants also ran in a `-mcpu=baseline` build, where AVX2 too is
-decided at run time.
-- `update` / `final`: partial-buffer guard, early-return length,
-  whole-block guard, padding threshold, `0x80`, bit-count shift, the
-  SHA-512/224 tail's leading bytes.
-- Dispatch: the CPUID cache's known flag, the AVX2 and SHA bits, SHA-NI
-  without its SHA condition, SHA-NI not preferred, SHA-NI taken for
-  SHA-512, AVX2 not taken, SHA-NI and AVX2 calls swapped.
-- `compressBlocks`: no 2^20 cap, a `u21` step, `.stdlib` state hand-over.
-- Zig engine: lane clamp, `Maj`, `Ch`, schedule distance, `compressOne`'s
-  σ1, the lone trailing block (SIMD and scalar).
-
-Several kills depend on the CPU, so a single machine does not see all of
-them:
-- The known flag: under qemu, or in the baseline build.
-- The SHA bit, SHA-NI preference and SHA-NI for SHA-512: on a SHA-NI CPU
-  only.
-- SHA-NI without SHA, and the swapped calls: on a CPU without SHA-NI only.
-- The 2^20 cap: only through the opt-in 4 GiB test (`SHA2_BIG=1`, 2026-10-26).
-
-Not mutated: the assembly itself (any change to its rounds or constants
-fails the FIPS answers and the OpenSSL oracle) and the comptime constants.
+- **Run:** `scripts/modtest sha2` (add `-Doptimize=ReleaseFast` for the optimized lane); `zig fmt --check modules/sha2`.
+  The opt-in `SHA2_BIG=1` test (ReleaseFast) feeds 4 GiB + 64 bytes in one `update`.
+- **Known answers and oracles:** the FIPS 180-4 / NIST vectors for every backend, one million `'a'`, RFC 4231
+  and RFC 5869 through std's `Hmac`/`Hkdf`; the live OpenSSL oracle `tools/interop.zig`
+  (`zig build interop-sha2`, `tools/openssl_oracle.c`); see *Anchoring*.
+- **Differential against std** (`src/root.zig`): every length 0 … 1024 one-shot and split, random lengths to 64 KiB
+  with block-edge splits, every SIMD lane count at every offset, byte-at-a-time with `peek`, long runs across the
+  2^20-block call limit, comptime evaluation, guard-page runs (no read outside the input) for every backend.
+- **Dispatch:** the default-backend test, and CPU detection held to std's native detection (a wrong AVX2 or SHA bit
+  must be red); `test_hooks.forced` runs one test pass over every backend the CPU and build have. On a CPU without
+  SHA-NI, `.cryptogams_shani` is exercised under `qemu-x86_64 -cpu max` (test binary and OpenSSL oracle).
+- **Fuzz:** `SHA2_FUZZ` (`src/root.zig`, testkit's deterministic driver): an `agree` harness (arbitrary bytes, an
+  arbitrary cut, all digests, all backends against std) and an `hmac` harness; both with fixed-seed runs and reach
+  checks in every test run.
+- **Constant time:** `src/ctgrind_harness.zig` (targets `hash` and `hmac`, run through the AVX2 path; the card's
+  `ct` line). The SHA-NI path is not measured by ctgrind, see *Constant-time contract*.
+- **Instruction counts:** `src/count.zig` with `scripts/count-insns` holds `tools/count.tsv` (off unless
+  `ZIGLIBS_COUNT` is set).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. The mutation runs covered `update`/`final`, the compressors, both schedules, the
+  dispatch and the call limit; the assembly itself and the comptime constants are not mutated (any change to them
+  fails the FIPS answers and the OpenSSL oracle).
+- **Bench:** `zig build bench-sha2` (`tools/bench.zig`) against OpenSSL; `src/bench.zig` against std.
 
 ## Speed
 
-Comparative: `tools/bench.zig` (`zig build bench-sha2`) against OpenSSL
-3.5.5's EVP digests and one-shot `HMAC()`, by user-mode cycles. The card's
-numbers come from a JCC-mitigated build of the program, made with the
-two-stage recipe in `modules/sort/tools/README.md`. The 2026-10-26 run,
-5 rounds, backend `.cryptogams`, in ours/OpenSSL:
+`tools/bench.zig` (`zig build bench-sha2`) compares against OpenSSL's EVP digests and one-shot `HMAC()` by user-mode
+cycles; the card's `**Performance:**` line carries the ratios and is authoritative (it comes from a JCC-mitigated
+build of the program, made with the two-stage recipe in `modules/sort/tools/README.md`). The block function is
+OpenSSL's own, so bulk converges on 1.0; the rest of the lead is EVP's per-call context handling, about 1 200 cycles
+per call. `src/bench.zig` compares against std (README *Speed*).
 
-| rows | ratio |
-|---|---|
-| SHA-256 64 / 256 / 1 KiB / 16 KiB / 1 MiB | 0.49 / 0.68 / 0.88 / 0.97 / 0.99 |
-| SHA-384 same sizes | 0.40 / 0.63 / 0.82 / 0.97 / 0.99 |
-| SHA-512 same sizes | 0.40 / 0.63 / 0.82 / 0.97 / 0.98 |
-| SHA-224 1 KiB · SHA-512/256 1 KiB | 0.87 · 0.82 |
-| HMAC-SHA-256/384/512, 256-byte message | 0.52 / 0.54 / 0.54 |
+Why the assembly: per block in a dependent chain, the CRYPTOGAMS AVX2 code is clearly faster than our Zig engine, both for
+one block and in bulk, for SHA-256 and SHA-512 alike, and our Zig rounds alone (no schedule) already run close to
+the assembly's whole block; see *What is deliberately not done* for what was tried.
 
-The block function is OpenSSL's own, so bulk converges on 1.0. The rest of
-the lead is EVP's per-call context handling, about 1 200 cycles per call.
-
-Why the assembly, measured 2026-10-25/26 per block in a dependent chain
-(`perf stat`, Kaby Lake, cycles):
-
-| | SHA-256 | SHA-512 |
-|---|---:|---:|
-| CRYPTOGAMS AVX2, 1 block / bulk | 545 / 497 | 776 / 672 |
-| our Zig, 1 block / bulk | 775 / 570 | 968 / 780 |
-| our Zig rounds alone (no schedule) | 526 | 651 |
-
-For the same ~1 800 instructions per SHA-256 block, our Zig rounds alone
-run at 3.0 IPC; the assembly runs the whole block, schedule included, at
-3.5. Three attempts to get there in Zig failed. They were a software
-pipeline of the next batch's schedule between the rounds, the one-block
-schedule for every block, and reordering the round so that `d += T1` comes
-first. The vector schedule shares ports 0, 1 and 5 with the scalar ALU, so
-it does not run "beside" the rounds for free; the assembly's `lea` adds use
-ports the compiler's `add`s leave contended.
-
-Table and machine for the std comparison in the README. Instruction counts from the ReleaseFast
-build (2026-09-29): one round is 24 instructions (6 `rorx`, no spills); the
-scalar schedule adds ~13 per word; the SIMD schedule costs ~1 670 vector
-instructions per batch, i.e. ~5 per round per block at full width. The model
-"instructions per block / 4 per cycle" predicts the measured ratios (1.29–1.33
-for SHA-384 over long inputs, 1.24 at 1 KiB where one of nine blocks is the
-lone padding block), which is why lone blocks are left scalar: an in-block
-vector schedule would save about one instruction per word.
+Why lone blocks are left scalar: one round is 24 instructions (6 `rorx`, no spills); the scalar schedule adds ~13 per
+word; the SIMD schedule costs ~1 670 vector instructions per batch, ~5 per round per block at full width. The model
+"instructions per block / 4 per cycle" predicts the measured ratios, and an in-block vector schedule would save about
+one instruction per word.
 
 ## What is deliberately not done
 
@@ -427,16 +320,24 @@ vector schedule would save about one instruction per word.
   target has it, and this module defers to std there (`.stdlib`). A kernel of
   our own could only be tested on a CPU this project does not have.
 - **AVX-512 (`vprorq`, 16/8 lanes)** — not now: no consumer CPU with it.
+- **Reaching OpenSSL's IPC with our own Zig rounds.** For the same ~1 800 instructions per SHA-256 block, our Zig rounds
+  alone run at 3.0 IPC; the assembly runs the whole block, schedule included, at 3.5. Three attempts to get there in
+  Zig failed: a software pipeline of the next batch's schedule between the rounds, the one-block schedule for every
+  block, and reordering the round so that `d += T1` comes first. The vector schedule shares ports 0, 1 and 5 with the
+  scalar ALU, so it does not run "beside" the rounds for free; the assembly's `lea` adds use ports the compiler's
+  `add`s leave contended. The owner chose CRYPTOGAMS' assembly over a separate session of round tuning.
+- **HMAC/HKDF, multi-buffer hashing:** see *What this module is, and what it is not*.
 
 ## Open
 
 - The speed-up for the web-server consumer's TLS handshake has not been measured. Transcript
-  updates and HMAC/HKDF calls are mostly lone blocks: 545 vs std's ~820
-  cycles each. Measure there before claiming a handshake gain.
+  updates and HMAC/HKDF calls are mostly lone blocks: this module's one-block path against std's. Measure there
+  before claiming a handshake gain.
 
 ## Backlog / deferred
-- **32-bit (seen by `hashdigest`, 2026-11-03):** this module's own tests do not compile for `mips-linux-musl` or `arm-linux-musleabi`, cause not examined. `.targets` stays linux64 and `hashdigest` uses std there.
 
+- **32-bit targets:** this module's own tests do not compile for `mips-linux-musl` or `arm-linux-musleabi` (seen by
+  `hashdigest`), cause not examined. `.targets` stays linux64 and `hashdigest` uses std there.
 - **SHA512 extension (x86).** CRYPTOGAMS has had a SHA512-extension path
   since 2023. It needs Arrow Lake or later, and neither the development CPU
   nor QEMU 10.2's TCG runs it, so it would ship untested. Revisit when a
@@ -444,8 +345,5 @@ vector schedule would save about one instruction per word.
 - **SHA-NI speed is not measured.** The path is verified for correctness
   under emulation only. Measure it on a SHA-NI machine (CI's AMD runners)
   before quoting a speed.
-- **(survey 2026-09-30) Priority of the two existing items:** SHA-512/256 and SHA-512/224 first: done 2026-10-25, together with std's three plain truncations. Run-time dispatch second: done 2026-10-26 for SHA-NI and AVX2 (CRYPTOGAMS, owner's choice of route).
-- **Owner 2026-10-25/26: route for the bulk gap.** Our own Zig rounds could
-  not reach OpenSSL's IPC (*Speed*). The owner chose CRYPTOGAMS' assembly
-  over a separate session of round tuning.
-- **NEON/SVE2 or SHA3-extension SHA-512 path for arm64** (survey 2026-09-30): RustCrypto has `aarch64-sha3` for SHA-512; here arm64 SHA-512 is scalar. Effort M, and untestable without arm64 hardware in CI (see SPEC's SHA-NI reasoning). Fits §2.
+- **NEON/SVE2 or SHA3-extension SHA-512 path for arm64:** RustCrypto has `aarch64-sha3` for SHA-512; here arm64
+  SHA-512 is scalar. Effort M, and untestable without arm64 hardware in CI (see the SHA-NI reasoning above).
