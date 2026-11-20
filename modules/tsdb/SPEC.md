@@ -27,14 +27,14 @@ the evidence.
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Scope re-assessed 2026-10-04 after compression and series deletion were built (table rows not re-fetched). The yardstick
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. The yardstick
 is Prometheus's TSDB (the storage layer, also usable as a Go library); the closest
 embeddable-library peer is tstorage. Full servers (InfluxDB, VictoriaMetrics, QuestDB) are listed
 to show what a "real TSDB" user expects; this module is a storage layer over `kvtree`, not a server.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [prometheus/prometheus](https://github.com/prometheus/prometheus) `tsdb` — **reference** | Go | Apache-2.0 | 66.3k | v3.15.0 (2026-09-25) | Gorilla-style compressed chunks, WAL, inverted label index with matchers (`=`, `!=`, regex), time and size retention, series deletion, compaction. This module has exact-label lookup + name-scoped superset filter, time retention, a size budget, Gorilla-compressed blocks (`compact`) and `deleteSeries`; no regex/negative matchers. |
+| [prometheus/prometheus](https://github.com/prometheus/prometheus) `tsdb` — **reference** | Go | Apache-2.0 | 66.3k | v3.15.0 (2026-09-25) | Gorilla-style compressed chunks, WAL, inverted label index with matchers (`=`, `!=`, regex), time and size retention, series deletion, compaction. This module has exact-label lookup, a name-scoped superset filter, name-scoped `=`/`!=`/`=~`/`!~` matchers (`findSeriesMatching`), time retention, a size budget, Gorilla-compressed blocks (`compact`), `deleteSeries` and `deleteRange`; no cross-name label lookup. |
 | [nakabonne/tstorage](https://github.com/nakabonne/tstorage) | Go | Apache-2.0 | 1.3k | v0.3.6 (2023-03-24), pushed 2026-03 | Embeddable library: time-partitioned storage with `InsertRows`/`Select`, in-memory default, disk mode. Its README (read this run) leads with ingestion speed; compression/WAL details not verified *(inferred)*. |
 | [VictoriaMetrics/VictoriaMetrics](https://github.com/VictoriaMetrics/VictoriaMetrics) | Go | Apache-2.0 | 17.8k | v1.153.0 (2026-09-28) | A server: strong compression, downsampling, MetricsQL. Not an embeddable library *(inferred)*. |
 | [influxdata/influxdb](https://github.com/influxdata/influxdb) | Rust | Apache-2.0 | 31.8k | v3.11.4 (2026-09-08) | A server with SQL/InfluxQL; the TSM row-key shape this module's key codec follows is v1/v2-era. |
@@ -46,9 +46,7 @@ multi-series batches (`appendBatch`); MVCC snapshot range scans that stream with
 resumable, idempotent bounded retention sweeps and a size budget (`sweepToBudget`); overwrite by
 (series, ts) identity; negative timestamps; built on a crash-checked COW B-tree
 (`kvtree`) rather than a bespoke file; compression that needs no migration and keeps writes
-raw (§5b). **Where we are behind** (re-checked 2026-10-04, after compression and series deletion
-landed): no downsampling, no regex/negative label matchers or cross-name lookup, no per-series
-retention, no query/aggregation functions (→ Backlog; the last is a deliberate non-goal, SPEC §9).
+raw (§5b). **Where we are behind:** no downsampling, no cross-name label lookup, no per-series retention, no WAL-plus-head durability model, no query language (→ Backlog and *What is deliberately not done*).
 
 ## 1. Substrate: `kvtree`, not `kv`
 
@@ -119,7 +117,7 @@ keys, or a forward scan would terminate early.
 | `0x03 \| series(BE u64)` | canonical(name, labels) |
 | `0x05 \| series(BE u64) \| orderedTs(LAST sample)(BE u64)` | compressed block (`chunk.zig`) |
 
-`0x04` is reserved for an inverted label index (§9). Keys outside these tags are untouched, so
+`0x04` is reserved for an inverted label index (Backlog). Keys outside these tags are untouched, so
 the tree can be shared. The block partition sorts above both indexes: a raw scan that leaves its
 partition never reaches blocks by accident, and vice versa.
 
@@ -168,8 +166,7 @@ What the atomic pairing buys, precisely:
   ordering property that matters, and it is what atomicity gives for free.
   Committing the position *first* in a separate transaction would violate it: a
   crash in between leaves expired data behind an already-advanced position,
-  stranded for good once the sweep completes and clears the record. (That exact
-  inversion is mutation 10 below, and the crash sweep catches it.)
+  stranded for good once the sweep completes and clears the record. (The retention crash sweep catches exactly that inversion.)
 - **Idempotent.** Re-running converges on exactly the end state an
   uninterrupted sweep produces. Honestly stated: this comes from the *data*, not
   from the position — the operation is "delete keys below a bound", deletes of
@@ -179,8 +176,7 @@ What the atomic pairing buys, precisely:
   sweep still *terminates* and still reaches the same end state — it just
   re-probes every retired series on every chunk. So a stale-but-present position
   is invisible to any end-state assertion; only the linearity bound sees it.
-  That is why the chunked-sweep test asserts the bound (measured 130 correct vs.
-  175 mutated on the same workload).
+  That is why the chunked-sweep test asserts the bound.
 - **A different cutoff restarts from the beginning.** A stored position is only
   valid for the cutoff it was written for. A *larger* cutoff newly expires data
   that lies behind the position — resuming would strand it. The cutoff is
@@ -193,14 +189,10 @@ keeps its id, so re-appearing data lands in the same series.
 deletes anything nor advances its position while claiming more work would spin
 forever, so it stops instead.
 
-## 5a. Series listing, multi-series batches, a size budget — DONE 2026-09-28
+## 5a. Series listing, multi-series batches, a size budget
 
-Requested by the terminal-UI consumer (2026-09-27), which worked around all three (`src/diskhist.zig`, each marked
-`zig-libs request: tsdb — …`); the new API lets that workaround be deleted.
 
-**Series listing (`Db.seriesIterator`, `Db.findSeries`).** The terminal-UI consumer resolved "what series exist"
-by walking ids `1, 2, 3, …` via `seriesCanonical` until one was missing — correct only because ids
-happen to be dense today. `seriesIterator` reads the REVERSE index (`tag_series_rev`) directly, in
+**Series listing (`Db.seriesIterator`, `Db.findSeries`).** `seriesIterator` reads the REVERSE index (`tag_series_rev`) directly, in
 id order, decoding each entry's canonical bytes into a `Descriptor` — no assumption about id
 density. `findSeries(name, filter)` exploits a property of the canonical encoding
 (`canonicalize`, §4) that is not obvious from the byte-lexicographic ordering alone: because every
@@ -209,8 +201,7 @@ labels)`) sharing the SAME `name` share an identical byte PREFIX (`tag | u16(nam
 regardless of their labels — so a single bounded range scan from that prefix, stopping the instant
 a key stops matching it, visits exactly the series registered under `name` and nothing else. Each
 match is then filtered by `filter: []const Label` — a SUPERSET check (every `filter` label must be
-present with an equal value; extra labels on the series are fine) — covering the terminal-UI consumer's own
-`key`/`field` disambiguation without it decoding every series in the store. Both return a
+present with an equal value; extra labels on the series are fine) — covering a lookup by `key`/`field` labels without decoding every series in the store. Both return a
 `SeriesIterator` (streaming, MVCC-snapshotted like `Range`); each `next()` call fully OWNS its
 `SeriesEntry` (a fresh `canon` copy the descriptor's slices point into) rather than borrowing from
 the cursor's next-call-invalidated leaf buffer, so an entry survives past the following `next()`
@@ -219,8 +210,7 @@ call — unlike `Range.next()`'s `Sample`, which carries no slices and has no su
 **Multi-series batches (`Db.appendBatch`).** `appendMany` commits once per series; flushing N
 series is N kvtree transactions, each with kvtree's own two-`fsync` COW commit protocol
 (`kvtree/src/core.zig`'s `commit`: one `fsync` for the written pages, one for the meta-page swap
-that is the linearization point) — so N series cost 2N fsyncs, not N as the terminal-UI consumer's own comment
-assumed. `appendBatch([]const struct{ series, points })` wraps every series' points in ONE
+that is the linearization point) — so N series cost 2N fsyncs. `appendBatch([]const struct{ series, points })` wraps every series' points in ONE
 transaction: a CONSTANT number of fsyncs (kvtree's fixed per-commit cost) regardless of how many
 series are in the batch, and — the atomicity property that actually matters — a crash or an error
 partway through leaves EVERY series in the batch untouched, never some committed and others not.
@@ -230,17 +220,9 @@ batch of three series asserts all three end up with the SAME point count (0 or t
 never a partial set.
 
 **A size budget (`Db.liveSize`, `Db.sweepToBudget`).** kvtree exposes no compaction/vacuum
-operation that would repack the file smaller (checked against `kvtree.Db`'s public API when this
-was written; since 2026-09-29 it does give back a run of free pages at the END of the file,
-`Options.shrink_min_pages`). So a byte BUDGET can only ever be a budget on LIVE data, never on
+operation that would repack the file smaller (it gives back only a run of free pages at the END of the file, `Options.shrink_min_pages`). So a byte BUDGET can only ever be a budget on LIVE data, never on
 file size. Retention does bound the file,
-though: kvtree drops the leaves a sweep empties and recycles their pages (since 2026-09-28 —
-before, a time series never wrote those key ranges again, and the file grew ~60 KiB per 1000
-points appended and swept, linearly; the test "retention bounds the file" pins the steady size
-now). `liveSize()` counts point entries only (not the tiny, retention-untouched series
-index/reverse-index, and not kvtree's own page/freelist overhead) and is EXACT, not an estimate:
-every point key and value is fixed-width (`codec.point_entry_bytes` = 25), so a point count
-converts to a byte count with no rounding.
+though: kvtree drops the leaves a sweep empties and recycles their pages (the test "retention bounds the file" pins the steady size). `liveSize()` counts point entries and compacted blocks (each block's key + value bytes) only (not the tiny, retention-untouched series index/reverse-index, and not kvtree's own page/freelist overhead) and is EXACT, not an estimate: every point key and value is fixed-width (`codec.point_entry_bytes` = 25) and a block's size is known, so no rounding is involved.
 `sweepToBudget(max_bytes, opts)` deletes the globally OLDEST points — by timestamp, across every
 series — until live data fits, or `opts.max_deletes` is spent (call again to continue; idempotent,
 like `sweep`'s cutoff delete). This is NOT the same problem `sweep`'s cutoff deletion solves: a
@@ -250,16 +232,15 @@ old). A cutoff-bisection approach was considered and rejected: evaluating each c
 would need a fresh full-store scan, and a `[minInt, maxInt]` search converges in ~64 rescans in the
 worst case — expensive for a large store. Instead, `sweepToBudget` runs a k-way merge over
 per-series "current oldest surviving point" candidates in a min-heap ordered by timestamp (ties
-broken by series id), seeded once via `seriesIterator` (one probe per series) and re-probed
+broken by series id), seeded once via `seriesIterator` (one probe per series and partition) and re-probed
 per deletion (`O(log(series count))` each) — no rescan proportional to store size. **Narrower
 crash-safety than `sweep`'s**: each chunk of `opts.chunk_deletes` deletions commits atomically, so
 a crash never leaves a torn chunk, but there is no persisted resume record — an interrupted call's
 in-memory merge progress is lost, and the next call recomputes `liveSize` and reseeds from scratch.
 Still correct (idempotent, same end state), just not linear the way `sweep`'s resumed retention is
-— a deliberate v1 scope decision, not an oversight, exactly like `sweep`'s own resumability was
-before it was built (§5's history).
+— a deliberate scope decision (a resume record is in Backlog).
 
-## 5b. Compaction — DONE 2026-10-04
+## 5b. Compaction
 
 **Shape.** Writes are unchanged: one key per sample in `0x01` (cheap appends, overwrites and
 out-of-order writes). `Db.compact(before, opts)` packs samples with `ts < before` into Gorilla
@@ -301,25 +282,56 @@ raw partition (same resume record — its position is just a key): a block whose
 below the cutoff goes whole; a block straddling it is rewritten with its suffix (the key — its
 last sample — is unchanged). `liveSize` adds each block's key + value bytes, still exact.
 `sweepToBudget` deletes units — a raw point or a whole block — oldest first by their oldest
-sample, across series (raw before block on a tie); `max_deletes` counts samples and is checked
+sample, across series (block before raw on a tie: any raw point that shadows a block sample has `ts ≥ block.first`, so block-first cannot delete a raw overwrite of a block's first sample while the block stays; a targeted test kills the reversed order, `root.zig:3773`, the model check does not — the budget must stop exactly between the two entries); `max_deletes` counts samples and is checked
 before each unit. `deleteSeries` deletes both partitions in bounded chunks and the index entries
 in the last one. The id is dead afterwards: an `append` through a `SeriesId` held from before
 the delete writes samples no index points at (no listing, no budget sweep reaches them, but
 `liveSize` counts them) — re-resolve with `seriesId`, which hands out a fresh id.
 
-**Review 2026-10-04, H1** (fixed before commit): `sweepToBudget` broke a timestamp tie raw-first,
-so a raw overwrite of a block's FIRST sample could be deleted while the block stayed, and the
-overwritten value read again. Block-first is the order that cannot do this (any raw point that
-shadows a block sample has `ts ≥ block.first`). The targeted test kills the reversed order; the
-model check, extended with budget sweeps and overwrites of existing timestamps, does NOT (the
-budget must stop exactly between the two entries) — measured, so stated.
+**Space.** Old stores need no migration: their samples are raw until `compact` runs. A 1000-sample
+15 s gauge encodes to 458 bytes in one block (`chunk.zig:994`, the size test); a series with only a
+few samples gains little (the block key dominates, and a 1-sample block costs more than its raw key).
 
-**Measured** (2026-10-04, a one-off program over copies of the consumers' stores, not kept in
-the repo — the stores are the users' data): the terminal-UI consumer: 16 series / 3080 samples,
-25.0 → 2.72 bytes per sample of live data (9.2×, block keys included); the analytics consumer: 23 series / 69
-samples, 25.0 → 20.1 (a block per series with ~3 samples: the key dominates). A 1000-sample 15 s
-gauge encodes to 458 bytes in one block (`chunk.zig` size test). Old stores need no migration —
-their samples are raw until `compact` runs.
+
+## 5c. Housekeeping, cardinality, matchers, range delete, buckets
+
+- **`maintain(now, policy)`** (`root.zig:1306`) is the periodic housekeeping in one call: age retention
+  (`sweep(now -| retention)`), then compaction (`compact(now -| compact_after)`), then the size budget
+  (`sweepToBudget(max_bytes)`). The order is deliberate: expired data is dropped before it is packed,
+  and the budget sees the compacted size. Every `Policy` field is optional; each step keeps its own
+  chunking and guarantees and reports `done = false` when its `max_chunks`/`max_deletes` limit stopped
+  it. Nothing in the module runs by itself: a store that is never maintained keeps 25 bytes per sample
+  and grows without bound, so the owner calls `maintain` from a timer.
+- **Cardinality limit** (`Options.max_series`, `Db.initOptions`): `seriesId` returns `error.TooManySeries`
+  when it would register series number `max_series + 1`; series that exist still resolve. `seriesIds`
+  registers every missing series of a call in ONE transaction (duplicates share an id), counts the whole
+  batch against the limit and is all-or-nothing. The registered-series count is cached keyed on the
+  kvtree version: the `Db`'s own commits keep it valid, a commit by another `Db` over the same tree
+  forces a recount. The name+labels → id cache is bounded by `Options.max_cached_series` (default 65536,
+  no eviction: once full, later series resolve through the tree).
+- **Label listing** (`metricNames`, `labelNames`, `labelValues`): sorted, unique, allocated on the
+  caller's arena, read from the reverse index through `seriesIterator`.
+- **Matchers** (`findSeriesMatching(name, matchers)`): Prometheus semantics — a label the series does not
+  have reads as the empty string, so `.neq` matches a series without the label and `.eq` with value `""`
+  matches one too; `.re`/`.nre` are fully anchored (the whole value must match), compiled once with the
+  `regex` module, and a bad pattern is `error.InvalidRegex`. It scans only the series registered under
+  `name` (the same name-prefix range as `findSeries`); there is no inverted index of its own (`0x04`
+  stays reserved).
+- **`deleteRange(series, from, to)`** removes `from <= ts < to` from the raw partition and the blocks in
+  ONE transaction (all or nothing across a crash; crash-swept in all four modes). A straddling block is
+  decoded, stripped and re-encoded. The result counts a timestamp held both raw and in a block twice.
+  The transaction holds the affected keys and rewritten blocks in memory (see Limits).
+- **`aggregate(series, from, to, step, func, out)`** reduces `[from, to)` into fixed `step` buckets over
+  the streaming `range` (`min`, `max`, `sum`, `count`, `last`, `avg`); an empty bucket is null for every
+  function (also `count`), NaN is ignored by `min`/`max` unless a bucket holds only NaNs and propagates
+  through `sum`/`avg`; `out` shorter than `bucketCount(from, to, step)` or `step <= 0` is
+  `error.InvalidAggregate`. It is a read helper, not a query engine.
+- **`range` on a store without blocks** opens no block cursor: `Db.no_blocks_at` remembers the kvtree
+  version (`Snapshot.txn_id`) at which the store held no block, so a `range` at that same version skips
+  the second cursor and its seek; any commit moves the version and re-checks (one seek per version), and
+  once blocks have been seen (`blocks_seen`) `range` behaves as before. A flag found once at `init` was
+  rejected: a second `Db` over the same tree compacting would leave it stale and `range` would silently
+  skip blocks (test: a second `Db` compacting is seen at once, `root.zig:3217`).
 
 ## 6. Threat model / what can go wrong
 
@@ -339,101 +351,90 @@ their samples are raw until `compact` runs.
 - **Not concurrency-safe by itself.** `single_owner`, inherited: one writer at a
   time. A `Range` holds an MVCC snapshot, so a leaked `Range` pins kvtree's page
   reclaim — hence `defer r.deinit()`.
-- **Inherited caveats from kvtree**, not re-argued here: see `kvtree/SPEC.md` (this list used to
-  name merge-less deletes, a single bounded freelist page and no overflow pages; kvtree now has
-  node merge, a chained freelist and overflow chains).
+- **Inherited caveats from kvtree**, not re-argued here: see `kvtree/SPEC.md`.
+- **`deleteRange` memory.** It holds every affected key and each straddling block's suffix in memory
+  (17 B per raw sample), so a window over a very large series is O(window). Kept because the
+  one-transaction atomicity is the contract and kvtree's transaction holds the deletes anyway; for a
+  very large window prefer `sweep` or several smaller calls.
+- **`sweepToBudget` memory with a huge `max_deletes`.** The picked entries (17 B each) are held until the
+  commits run, so `max_deletes = maxInt` ("until the budget is met") costs memory proportional to the
+  excess; the default 65536 is about 1 MB. Documented on the option.
+- **`max_cached_series` worst case.** The default 65536 cached series times a 3 KiB canonical form is
+  about 200 MB if every series is maximal; documented in `Options.max_cached_series`. Lower it for
+  untrusted label sources.
+- **Negative `Policy.retention`.** `now -| keep` with a negative `keep` puts the cutoff in the future and
+  sweeps everything. Not a crash; rejecting it would be a policy change nobody asked for.
+- **`compact` with `chunk_points` below `min_run` packs nothing.** It returns `done` silently; the
+  documented behaviour of the two options together.
 
-## 7. Verification
+## Verification
 
-`zig build test-tsdb` — **no skips**, green in Debug, ReleaseSafe and
-ReleaseFast (`scripts/modtest tsdb`).
+`scripts/modtest tsdb` (`zig build test-tsdb`): no skips, green in Debug, ReleaseSafe and ReleaseFast.
 
-- **Codec property tests** (§2): pairwise order identity over boundary +
-  random pairs; sort-by-bytes equals sort-by-logic; partition-order checks;
-  canonicalisation order-independence, injectivity-vs-delimiter, and rejection
-  cases.
-- **Range semantics**: half-open `[from, to)`, no bleed into the neighbouring
-  series, empty windows, pre-epoch timestamps straddling the epoch.
-- **Streaming**: 3000 points iterated with this layer's allocator swapped for a
-  256-byte fixed buffer. Buffering the window would need ~48 KB. (The claim is
-  scoped: it proves *this* layer buffers nothing; the cursor's own bounded page
-  stack is kvtree's property, proven there.)
-- **Retention**: strict `<` cutoff, idempotence, chunked-vs-one-shot end-state
-  equality, the linearity bound, resume across a full close/reopen,
-  larger-cutoff restart, `chunk_examines` bounding a no-op sweep, empty store,
-  and non-interference with a foreign key in the same tree.
-- **Series listing** (§5a): `seriesIterator` over an empty store and over several created series
-  (ascending id order, each entry's descriptor checked); `findSeries` filtering by name alone, by
-  name plus a label subset, by a fully-specific label set, and against a name that was never
-  registered.
-- **`appendBatch`** (§5a): multiple series committed by one call; an empty batch and an
-  all-zero-points batch are no-ops; a `FailingAllocator`-induced failure partway through leaves
-  every series in the batch at zero points, not just the one it failed in; a `kv.SimStorage` crash
-  sweep across a three-series batch asserts all three end up with the SAME point count; a
-  `CountingStorage`-wrapped comparison shows one `appendBatch` call over three series costs the
-  SAME sync count as one `appendMany` call over one series (constant, not per-series).
-- **Size budget** (§5a): `liveSize` zero on an empty store and exact after appends/a sweep; a
-  no-op `sweepToBudget` when the budget is already met (both exactly-at and well-above); dropping
-  the globally oldest points across two series with DELIBERATELY misleading id-vs-timestamp
-  ordering (lower id, newer data vs. higher id, older data) to distinguish true timestamp order
-  from key order; `max_deletes` bounding one call, with a second and third call finishing the job
-  and the final surviving points being the newest ones.
-- **Compaction** (§5b): `chunk.zig` — bit-exact round trips over every dod bucket boundary,
-  extreme timestamps (`minInt..maxInt` in one block), NaN payloads/-0/±Inf, 20 000 random blocks,
-  the exact bit cost of each record kind, `BlockFull` leaving the writer unchanged, rejection of
-  truncated/padded/garbage input. `root.zig` — a 3000-sample series compacted to < 1/10 of its
-  live size and read back bit-exact (whole and a window cut inside a block, and after reopen);
-  `min_run` and the horizon; an overwrite and a late sample after compaction winning on read and
-  being merged by the next run; a gap run between two blocks; retention over blocks (whole,
-  straddling, chunked = one-shot); `sweepToBudget` deleting whole blocks oldest-first with exact
-  accounting; a model check (12 seeded rounds × 120 random steps of appends incl. late writes and
-  overwrites, compactions with random `min_run`/`chunk_points`, chunked sweeps) comparing random
-  windows of every series with a map and checking B1/B2 after every step; a crash sweep over
-  `compact` in all four modes; `deleteSeries` over both partitions.
-- **Crash sweeps** over `kv.SimStorage`: the crash point is swept across every
-  storage side effect of (a) a chunked retention sweep and (b) a series-id
-  allocation, in all four crash modes (`lose_unsynced`, `torn_tail`,
-  `reorder_unsynced`, `keep_unsynced`). After each reboot the store must reopen,
-  a re-run must finish, and the result must equal an uninterrupted reference run
-  byte for byte. Instrumented once to confirm the sweeps have teeth: **200 real
-  crashes** fired in the retention sweep, not zero.
-- **Filesystem round trip**: `FsStorage` over a tmp dir, samples + a chunked
-  sweep, reopened and re-read.
+- **Codec property tests** (§2): pairwise order identity over boundary and random pairs; sort-by-bytes
+  equals sort-by-logic; partition-order checks; canonicalisation order-independence,
+  injectivity-vs-delimiter and rejection cases.
+- **Range semantics**: half-open `[from, to)`, no bleed into the neighbouring series, empty windows,
+  pre-epoch timestamps straddling the epoch.
+- **Streaming**: a long window iterated with this layer's allocator swapped for a small fixed buffer
+  (buffering the window would not fit). The claim is scoped: it proves *this* layer buffers nothing; the
+  cursor's own bounded page stack is kvtree's property, proven there.
+- **Retention**: strict `<` cutoff, idempotence, chunked-vs-one-shot end-state equality, the linearity
+  bound (`examined ≤ deleted + series_count + chunks`, the only observation that distinguishes a
+  stale-but-present resume position), resume across a full close/reopen, larger-cutoff restart,
+  `chunk_examines` bounding a no-op sweep, empty store, non-interference with a foreign key in the same
+  tree.
+- **Series listing, batches, budget** (§5a): `seriesIterator` over empty and populated stores (ascending
+  id order, descriptors checked); `findSeries` by name, name plus label subset, fully specific set and an
+  unregistered name; `appendBatch` multi-series, empty and zero-point batches, a `FailingAllocator`
+  failure partway through leaving every series untouched, a `kv.SimStorage` crash sweep asserting all
+  series end with the same point count, a `CountingStorage` comparison showing the sync count of a batch
+  equals that of one `appendMany`; `liveSize` exact after appends and sweeps; `sweepToBudget` no-op when
+  met, dropping the globally oldest points across series whose id order disagrees with timestamp order,
+  `max_deletes` bounding one call.
+- **Compaction** (§5b): `chunk.zig` — bit-exact round trips over every delta-of-delta bucket boundary,
+  extreme timestamps, NaN payloads, -0, ±Inf, random blocks, the exact bit cost of each record kind,
+  `BlockFull` leaving the writer unchanged, rejection of truncated/padded/garbage input. `root.zig` — a
+  compacted series read back bit-exact (whole, a window cut inside a block, and after reopen); `min_run`
+  and the horizon; an overwrite and a late sample after compaction winning on read and being merged by
+  the next run; a gap run between two blocks; retention over blocks (whole, straddling, chunked =
+  one-shot); `sweepToBudget` deleting whole blocks oldest-first with exact accounting and the block-first
+  tie; `deleteSeries` over both partitions; a model check (seeded rounds of random appends including late
+  writes and overwrites, compactions with random `min_run`/`chunk_points`, chunked sweeps) comparing
+  random windows of every series with a map and checking B1/B2 after every step; a crash sweep over
+  `compact` in all four modes.
+- **Housekeeping, matchers, cardinality, range delete, buckets** (§5c): `maintain` ordering and limits,
+  `max_series` (series N+1 refused, existing resolve, count survives reopen, deletion frees a slot,
+  `seriesIds` all-or-nothing), `max_cached_series`, label listing, matcher semantics including the
+  missing-label reading and `InvalidRegex`, `deleteRange` over raw and blocks with a crash sweep,
+  `aggregate` per function with empty buckets and `InvalidAggregate`.
+- **No-panic sweep tests** (`src/sweep_test.zig`; every test name ends with its finding id): on-disk
+  counters and lengths checked at use, zero chunk options read as the default, retention chunk memory
+  bounded, the canonical form refused before work, the series count valid across the `Db`'s own commits.
+- **Crash sweeps** over `kv.SimStorage`: the crash point is swept across every storage side effect of a
+  chunked retention sweep and of a series-id allocation, in all four crash modes (`lose_unsynced`,
+  `torn_tail`, `reorder_unsynced`, `keep_unsynced`). After each reboot the store must reopen, a re-run
+  must finish, and the result must equal an uninterrupted reference run byte for byte. The sweeps are
+  instrumented so a run that fires no real crash fails.
+- **Filesystem round trip**: `FsStorage` over a tmp dir, samples and a chunked sweep, reopened and
+  re-read.
+- **Fuzz**: driver prefix `TSDB_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver, `src/fuzz_test.zig`)
+  over two harnesses, `parseCanonical` and `decodePointKey`; a second draw picks a shape (raw bytes, or a
+  structurally valid input built from them) because random octets essentially never spell either.
+- **Model**: the card's `**Model:**` line names `src/root.zig` model check (random appends, compactions,
+  windows against a map; key-order property; codec fuzz).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-### 7.1 Mutation results
+## Performance
 
-Every central invariant was mutated in the implementation and the suite
-re-run. All twelve go red; the mutations that "come out the same either way"
-were the point of the exercise.
+`zig build bench-tsdb` (`tools/bench.zig` + `tools/tsink_bench`, a Rust program; always ReleaseFast;
+needs `cargo` and the locked crates in the cargo cache) runs the comparison the card's `**Performance:**`
+line records: tsdb against tsink 0.10.2 with its WAL fsynced per append (the like-for-like durable mode;
+every tsdb commit fsyncs), over scrape-shaped appends (many series, one commit each), a bulk append,
+range reads and matcher reads. The card is authoritative for the figures.
 
-| # | Mutation | Caught by |
-|---|---|---|
-| 1 | timestamp encoded **and decoded** little-endian (round-trips perfectly) | codec order property; pre-epoch range; persistence |
-| 2 | sign flip removed on both sides (round-trips perfectly) | codec order property; smoke ordering; retention |
-| 3 | series id encoded and decoded little-endian | codec order property |
-| 4 | labels sorted only when there are >2 of them | series-identity test |
-| 5 | scan's upper bound made inclusive | half-open range test |
-| 6 | chunk commits deletions, never persists the resume position | chunked-sweep; reopen-resume; larger-cutoff |
-| 7 | resume position persisted every chunk but always at the start | **linearity bound**; larger-cutoff |
-| 8 | stored cutoff ignored when resuming | larger-cutoff restart test |
-| 9 | retention deletes `<= cutoff` instead of `< cutoff` | strict-cutoff; chunked-sweep; reopen-resume |
-| 10 | resume position committed **before** the deletions, separately | retention crash sweep |
-| 11 | series id written as three separate autocommits | series-id crash sweep |
-| 12 | series-skip forgets to re-seek the cursor | `chunk_examines` bound test |
 
-**2026-10-04 (compaction, deletion, `chunk.zig`)**, mutant schemata, ReleaseSafe: 112 mutants
-over the new code — 102 killed (4 of them by hanging), 10 argued equivalent, 0 surviving. The
-first run left 22 real gaps; 14 tests added for them (block-placement corners, the raw-wins tie in
-both directions, the sweep's raw→block phase hand-over, `sweepToBudget`'s tie-break and byte
-accounting, `deleteSeries`' cache eviction, codec bucket and padding edges). The equivalents are
-re-puts of a key that is deleted and re-written in the same transaction, a check that reads the
-same 8 bytes twice, and bounds that the surrounding loop already enforces.
-
-Mutation 7 is the one worth noting: it leaves a resume record present and
-well-formed, so every end-state assertion still passes. Only the linearity
-bound distinguishes it — which is why that bound is asserted rather than
-assumed. Two earlier test versions were strengthened *because* mutations 8 and
-11 initially survived them; the fixed tests are in the suite.
 
 ## 8. Provenance
 
@@ -445,78 +446,39 @@ third-party implementation was studied and no source was consulted for this
 module, so per `CONVENTIONS.md` §5 it takes **no root `NOTICE` entry** — this
 section is its citation.
 
-## 9. Backlog — deliberate v1 non-goals
+## What is deliberately not done
 
-~~**Series listing, multi-series batches, a size budget**~~ — **DONE 2026-09-28**, see §5a above.
-Precedent this design followed: Prometheus TSDB label matchers and
-`--storage.tsdb.retention.size`, VictoriaMetrics/InfluxDB multi-series writes; the analytics consumer lesson
-(13 GB in an afternoon) is why the size budget exists at all.
-
-Named as scope decisions, not omissions.
-
-- ~~**Sample compression.**~~ — **DONE 2026-10-04**, see §5b. The v1 worry — a block format
-  makes a single-sample overwrite a read-modify-write — is avoided by keeping writes raw and
-  merging at compaction time.
-- **Downsampling / rollups.** Precomputed `(min, max, sum, count)` per coarse
-  bucket, written by a background pass, with reads picking a resolution. Needs
-  a resolution-aware key tag and a rollup watermark; independent of everything
-  above.
-- **Query language and aggregation functions.** `rate()`, `sum by (…)`, label
-  matchers. This is a query engine, a much larger deliverable than a storage
-  layer, and it belongs above this module rather than inside it.
-- **Cross-name label lookup.** `findSeries` (§5a) already answers "name + a superset of these
-  labels"; what is missing is a lookup across metric names ("every series with `host=web-1`").
-  It wants a `0x04` inverted-index partition. (~~Series deletion~~ — **DONE 2026-10-04**,
-  `deleteSeries`: no inverted index was needed, the series' own key ranges suffice.)
-- **A retention policy per series.** v1 sweeps one global cutoff. Per-series
-  retention wants the policy stored beside the reverse index and the sweep
-  reading it per series — mechanical, but it changes the sweep's skip rule.
+- **WAL plus in-memory head** (Prometheus' durability model). Every commit is durable instead (owner
+  decision 2026-10-20): the speed reference is tsink with its WAL synced per append, the like-for-like
+  durable mode; Prometheus stays the scope reference, its number informative.
+- **Query language and aggregation functions** (`rate()`, `sum by (…)`). A query engine is a much larger
+  deliverable than a storage layer and belongs above this module; `aggregate` is a per-bucket read
+  helper.
+- **Exemplars, native histograms, PromQL, mmap.** Out of scope for a storage layer over `kvtree`; mmap is
+  kvtree's.
+- **Consistent snapshot copy while writing.** Belongs to kvtree.
 
 ## Backlog / deferred
 
-- **deleteRange memory (no-panic sweep GN, 2026-10-30).** `deleteRange` holds every affected key and each straddling block's suffix in memory (17 B per raw sample), so a window over a very large series is O(window). Documented; kept because the one-transaction atomicity is the contract and kvtree's transaction holds the deletes anyway. A bounded variant would be a new chunked, non-atomic entry point (cf. `deleteSeries`).
-- **`max_cached_series` worst case (GN).** The default 65536 cached series x a 3 KiB canonical form is ~200 MB if every series is maximal; documented in `Options.max_cached_series`. Lower it for untrusted label sources.
-- **Negative `Policy.retention` (GN).** `now -| keep` with a negative `keep` puts the cutoff in the future and sweeps everything. Not a crash; rejecting it would be a policy change nobody asked for.
-- **`sweepToBudget` memory with a huge `max_deletes` (GN fix review, 2026-10-30).** The picked entries (17 B each) are held until the commits run, so `max_deletes = maxInt` ("until the budget is met") costs memory proportional to the excess (~680 MB for 40M keys); the default 65536 is ~1 MB. Work-proportional like `deleteRange`, documented on the option. A fix would flush a transaction every `chunk_deletes` inside the pop loop (`unitAt` re-probes by successor key, so it is safe against already-committed deletes).
-- **`compact` with `chunk_points` below `min_run` packs nothing (GN fix review).** It returns `done` silently; predates the sweep and is documented behaviour of the two options together.
-
-**S2 plan — survey 2026-10-20** (Sonnet, read-only; reference Prometheus tsdb v3.15.0, Apache-2.0; also
-VictoriaMetrics, InfluxDB 3, QuestDB, TimescaleDB (Apache part only), nakabonne/tstorage). Key finding:
-`compact` (9.2× on the terminal-UI consumer data) is called by NEITHER consumer — both run on raw 25 B/sample keys; the analytics consumer
-also bypasses `appendBatch` with raw `codec` calls (history.zig:185-215).
-
-| # | Item | Effort | Decision |
-|---|---|---|---|
-| R1 | `maintain(now, policy)` = compact + sweep + budget, and say consumers must run it | S | **DONE 2026-10-20** |
-| R2 | Label matchers `!=`, `=~`, `!~` (scan-based first; the 0x04 postings partition only if series counts grow) | S→M | **DONE 2026-10-20** — `findSeriesMatching`, anchored regex via the `regex` module (new dep) |
-| R3 | `labelNames` / `labelValues` listing | S | **DONE 2026-10-20** (+ `metricNames`) |
-| R4 | WAL + in-memory head (Prometheus' durability model) | L | not doing — **owner 2026-10-20:** the speed reference for P is aidlx/tsink (Rust, MIT) with its WAL synced per append, the like-for-like durable mode; Prometheus stays the scope reference, its number informative |
-| R5 | Per-bucket min/max/sum/count/last read helper over `Range` | S | **DONE 2026-10-20** — `aggregate` (+avg) |
-| R6 | Cardinality limit `Options.max_series` → `error.TooManySeries`, bounded series cache | S | **DONE 2026-10-20** — `Db.initOptions` |
-| R8 | Thread-safe `Db` (cache sync); readers already MVCC | M | document single-owner; later |
-| R11 | Consistent snapshot copy while writing | S-M | belongs to kvtree; document |
-| R13 | `deleteRange(series, from, to)` | S | **DONE 2026-10-20** — one transaction, crash-swept |
-| R14 | Coalesce small compacted blocks (sparse series: 25 → 20 B/sample only) | M | later (internal space optimisation, no API) |
-| R16 | `seriesIds` — register many series in one transaction (bench W1: 1000 commits → 1; the analytics consumer bypasses `appendBatch` with raw `codec` calls for this) | S | **DONE 2026-10-20** |
-| — | WAL replay, exemplars, native histograms, PromQL, per-series retention, mmap | – | not doing (reasons in the survey; mmap is kvtree's) |
-
-Ahead: reader-during-writer via MVCC, crash sweeps at every storage side effect, out-of-order/overwrite
-with no window, negative timestamps, atomic multi-series `appendBatch`, exact `sweepToBudget`.
-Bench plan: Prometheus tsdb as a Go library (pin v3.15.0) — scrape-shaped append, bulk append, range
-query, matcher select, compaction size; equality by an FNV hash of (labels, ts, f64 bits).
-
-(survey 2026-09-30, re-checked 2026-10-04)
-- ~~**Sample compression**~~ — **done 2026-10-04** (§5b, `Db.compact`, `chunk.zig`).
-- ~~**Series deletion**~~ — **done 2026-10-04** (`Db.deleteSeries`).
-- **Label matchers beyond exact/superset** *(survey 2026-09-30)*: `findSeries` (§5a) covers "name +
-  these labels"; Prometheus users also expect `!=`, regex and a cross-metric-name lookup. Effort
-  M (the inverted-index partition §9 already sketches). Fits §2. No consumer asks yet (the terminal-UI consumer
-  and the analytics consumer look series up by exact labels).
-- **Downsampling / rollups, per-series retention** — §9; no consumer asks.
-- **A resume record for `sweepToBudget`** — §5a; would make an interrupted budget sweep linear.
-- ~~**`range` pays for blocks a store never had**~~ ✅ DONE 2026-10-17 *(the terminal-UI consumer repin A/B)*: measured 25.3 → 34.6 ms task-clock (1.37×) on a never-compacted `history.kvt` because every `range` seeked a second cursor into the block keyspace. The proposed fix — a flag found once at `init` — was rejected: a second `Db` over the same tree compacting would leave it stale and `range` would silently skip blocks. Done instead: `Db.no_blocks_at` remembers the kvtree version (`Snapshot.txn_id`) at which the store held no block, so a `range` at that same version opens no block cursor; any commit re-checks (one seek per version), and once blocks are seen (`blocks_seen`) `range` behaves as before. Test: a second `Db` compacting is seen at once (a version-blind mutant fails it).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Downsampling / rollups.** Precomputed `(min, max, sum, count)` per coarse bucket, written by a
+  background pass, with reads picking a resolution. Needs a resolution-aware key tag and a rollup
+  watermark; independent of everything else. No consumer asks.
+- **Cross-name label lookup.** `findSeries` and `findSeriesMatching` answer "name plus these labels";
+  missing is a lookup across metric names ("every series with `host=web-1`"). It wants the `0x04`
+  inverted-index partition (scan-based matchers were enough so far; build it if series counts grow).
+  No consumer asks.
+- **A retention policy per series.** One global cutoff today; per-series retention wants the policy
+  stored beside the reverse index and the sweep reading it per series, which changes the sweep's skip
+  rule. No consumer asks.
+- **A resume record for `sweepToBudget`.** Would make an interrupted budget sweep linear.
+- **Coalescing small compacted blocks.** A sparse series gains only 25 → 20 bytes per sample; an
+  internal space optimisation with no API change.
+- **Thread-safe `Db`** (cache synchronisation; readers are already MVCC). Today `single_owner`.
+- **Bounded `deleteRange` and `sweepToBudget` memory.** `deleteRange` holds every affected key and each
+  straddling block's suffix (17 B per raw sample); `sweepToBudget` holds the picked entries (17 B each)
+  until the commits run. A bounded `deleteRange` would be a new chunked, non-atomic entry point (cf.
+  `deleteSeries`); `sweepToBudget` could flush a transaction every `chunk_deletes` inside the pop loop
+  (`unitAt` re-probes by successor key, so it is safe against already-committed deletes).
 
 ## Anchoring
 

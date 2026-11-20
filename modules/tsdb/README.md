@@ -15,7 +15,7 @@ none of them stores a point beyond process lifetime.
 - **Platform:** any — all I/O goes through `kvtree` → `kv`'s `Storage` seam.
   **Role:** util. **Concurrency:** `single_owner` (inherits kvtree's model: one
   writer, MVCC snapshot readers; this module adds no shared state of its own).
-- **Deps:** `kvtree`.
+- **Deps:** `kvtree`, `regex` (anchored label matchers).
 
 Provenance: clean-room from a publicly documented design; no third-party
 implementation was studied and no source was consulted, so there is no root
@@ -72,7 +72,7 @@ and that retention cutoffs use the same unit. **Negative (pre-epoch) timestamps
 are legal** and sort correctly below the epoch.
 
 The tree may be shared with other data: this module only ever touches keys
-whose first byte is one of its four tags.
+whose first byte is one of its five tags (`0x00` meta, `0x01` samples, `0x02`/`0x03` series index and reverse index, `0x05` compacted blocks).
 
 ## Retention
 
@@ -155,10 +155,8 @@ does not repack its file** (it only gives back a free tail, `Options.shrink_min_
 reads for itself, e.g. via its own `Io.Dir.statFile`).
 
 **Retention does bound the file**, though: kvtree recycles the pages of leaves a sweep empties, so
-a store that appends and sweeps at the same rate reaches a steady size (since 2026-09-28; before,
-the emptied leaves stayed in the tree and the file grew ~60 KiB per 1000 points in and out). The
-steady size is above `liveSize`: pages are not repacked, and pages freed while a reader holds a
-snapshot wait for it.
+a store that appends and sweeps at the same rate reaches a steady size. The steady size is above
+`liveSize`: pages are not repacked, and pages freed while a reader holds a snapshot wait for it.
 
 ## Compression and series deletion
 
@@ -175,11 +173,9 @@ const c = try db.compact(now_ms - std.time.ms_per_hour, .{});
 _ = try db.deleteSeries(id, .{});
 ```
 
-Measured on copies of real stores (2026-10-04): the terminal-UI consumer's history (16 series,
-3080 samples) went from 25.0 to 2.72 bytes per sample of live data (9.2×,
-including the block keys); a regular 15 s gauge packs below 0.5 byte per sample
-inside a block. A series with only a handful of samples gains little — the
-17-byte block key dominates. `compact` leaves a series' newest run raw until it
+A regular 15 s gauge packs below 0.5 byte per sample inside a block (1000 samples in 458 bytes,
+`chunk.zig`'s size test), against 25 bytes per raw sample. A series with only a handful of samples
+gains little — the 17-byte block key dominates. `compact` leaves a series' newest run raw until it
 has `min_run` (64) samples below the horizon, so compacting every minute does
 not cut a tiny block per minute; samples that land inside or between existing
 blocks are always merged. Compaction is idempotent, one transaction per chunk,
@@ -214,9 +210,8 @@ var db = tsdb.Db.initOptions(gpa, &tree, .{ .max_series = 10_000 });
 // seriesId returns error.TooManySeries when it would register series 10_001;
 // series that exist still resolve. The name+labels -> id cache is bounded by
 // Options.max_cached_series (default 65536 entries, no eviction: once full,
-// later series simply resolve through the tree). A new error in `Error`:
-// an exhaustive `switch` over it needs the new prongs (TooManySeries,
-// InvalidRegex, InvalidAggregate).
+// later series simply resolve through the tree). `Error` carries TooManySeries,
+// InvalidRegex and InvalidAggregate: an exhaustive `switch` over it needs those prongs.
 
 const names = try db.labelNames(arena);          // sorted, unique, on `arena`
 const hosts = try db.labelValues(arena, "host");
@@ -239,16 +234,16 @@ var buf: [60]?f64 = undefined;
 const n = try db.aggregate(id, from, from + 60 * step, step, .avg, &buf);
 ```
 
-## Not built (deliberate, see `SPEC.md`)
+## Not provided
 
-Downsampling/rollups, a cross-metric-name label lookup, per-series retention,
-and any query language (`aggregate` is a per-bucket read helper, not a
-query engine). These are scope decisions, not oversights; each is
-listed in `SPEC.md` with what it would take.
+Downsampling/rollups, a cross-metric-name label lookup, per-series retention, a WAL plus in-memory
+head (every commit is durable instead), and any query language (`aggregate` is a per-bucket read
+helper, not a query engine). See `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify
 
 ```
+scripts/modtest tsdb                         # the module's tests
 zig build test-tsdb                          # Debug
 zig build test-tsdb -Doptimize=ReleaseFast   # ReleaseFast
 ```
@@ -257,5 +252,4 @@ All tests run for real (no skips). The key codec's ordering identity is a
 property test over random and boundary `(series, timestamp)` pairs; retention and
 compaction are checked against a crash sweep over every storage side effect in
 all four `kv.SimStorage` crash modes; a model check drives random appends,
-overwrites, late samples, compactions and sweeps against a plain map. See `SPEC.md` for the verification argument and the
-mutation results.
+overwrites, late samples, compactions and sweeps against a plain map. See `SPEC.md` for the verification argument.
