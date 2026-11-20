@@ -104,8 +104,8 @@ RESCUE_FUZZ=200000 zig build test-rescue --release=safe   # deterministic fuzz d
 
 ## Anchoring — grade 1
 
-**57 published known-answer vectors, byte-exact**, from three independent
-upstreams. (`SPEC.md` grades every claim individually; the two weakest are
+**57 published known-answer digests plus one permutation KAT, byte-exact**,
+from three independent upstreams. (`SPEC.md` grades every claim individually; the two weakest are
 named there and neither is grade 3.)
 
 | vectors | source | pins |
@@ -127,27 +127,6 @@ exponents.
 Every number taken from an upstream file was extracted by script; the command
 and the file's SHA-256 are recorded in `src/upstream_vectors.zig`.
 
-### Mutation testing — evidence the tests bite
-
-Five mutations were introduced and reverted (restore verified by a byte-level
-`diff -r` against a pre-mutation copy — the module is untracked, so `git diff`
-had no baseline). Each leaves a deterministic, perfectly round-tripping hash
-that is not RPO:
-
-| # | mutation | caught by |
-|---|---|---|
-| 1 | **S-box halves swapped** — `x^(1/7)` first, `x^7` second | all 3 vector sets + both `permuteInverse` round-trips |
-| 2 | **`x^7` in both halves** — the inverse S-box dropped entirely | all 3 vector sets + both round-trips |
-| 3 | **RPO round order replaced by the paper's** (`S-box → MDS → ARK`), *with `permuteInverse` paired-edited to match* | **the published vectors only** |
-| 4 | constant stream read as `[all ARK1][all ARK2]` instead of interleaved | the miden ARK pin (named the layer) + the layout test + vectors |
-| 5 | circulant MDS index transposed (`j-i` → `i-j`) | MDS-invertibility + round-trips + vectors |
-
-Mutation 3 is the one that matters: with the inverse paired to it, **every
-structural property still held** — injective, invertible, deterministic,
-framings consistent, 39 of 43 tests green — and only the external vectors
-noticed. Mutation 1 is the trap the task literature warns about and it, too,
-survived the injectivity fuzzer.
-
 ## Cost
 
 Measured on this host at `ReleaseFast`, `m = 12`:
@@ -166,14 +145,6 @@ permutation**. Hashing 64 field elements (512 bytes, 8 permutations) takes
 bytes — **61x slower than SHA-256**. That is the expected shape, not a defect:
 this hash is priced in constraints, not cycles.
 
-How it got there: the S-box layers are written lane-parallel (advance all `m`
-chains one step at a time) rather than element-at-a-time, because a
-72-multiply body is far past any compiler's unroll threshold and the naive form
-serialises all 12 chains — **48.0 → 27.4 µs**; then the field's carry handling
-moved off `@addWithOverflow` tuples (LLVM was spilling them to stack) to
-explicit comparison masks — **27.4 → 18.15 µs**. `SPEC.md` has the rest, plus
-what was deliberately left on the table.
-
 **Provenance:** no third-party source code is carried into this repo. Upstream
 constant tables and test vectors ARE reproduced as data, extracted by script —
 `NOTICE` carries the required attribution for the Winterfell- and
@@ -181,3 +152,8 @@ miden-crypto-sourced ones (the RPO report's own published vectors need none,
 being specification material) and says what each is; the design references
 (the RPO authors' sage reference,
 miden-crypto, Winterfell) are named in `SPEC.md`.
+
+## Not provided
+
+RPX, Rescue over BN254 / BLS12-381, a sponge for `xlix` and circuit integration
+are not shipped; see `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.

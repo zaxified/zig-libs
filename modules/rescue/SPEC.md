@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [0xPolygonZero/plonky2](https://github.com/0xPolygonZero/plonky2) | Rust | Apache-2.0 | 858 | v1.1.0 (2025-05-12) | Uses Poseidon over Goldilocks, not Rescue *(inferred)* — listed because it is the Goldilocks hash a STARK user is likelier to meet. |
 | Go and Zig ecosystems | — | — | — | — | No Rescue-Prime implementation found: GitHub searches for "rescue prime" in Zig and Go returned nothing (2026-09-30); `std` has no algebraic hash. |
 
-**Where we are ahead:** the only Rescue-Prime outside Rust/Sage; both published sponge framings of RPO (the reference's and Miden's) instead of one, with a test asserting they never agree; a fixed-chain constant-time inverse S-box; constants derived from SHAKE256 and pinned against the deployed table rather than pasted. **Where we are behind:** no RPX; no Rp62_248; no packed/SIMD or arch-specific permutation (→ Backlog items). The deployed reference itself has been archived and its neighbouring directory carries Poseidon2, so the deployed stack may be moving away from RPO *(inferred from a directory listing)*.
+**Where we are ahead:** the only Rescue-Prime outside Rust/Sage; both published sponge framings of RPO (the reference's and Miden's) instead of one, with a test asserting they never agree; a fixed-chain constant-time inverse S-box; constants derived from SHAKE256 and pinned against the deployed table rather than pasted. **Where we are behind:** no RPX; no Rp62_248; no packed/SIMD or arch-specific permutation (→ *Backlog / deferred*). The deployed reference itself has been archived and its neighbouring directory carries Poseidon2, so the deployed stack may be moving away from RPO *(inferred from a directory listing)*.
 
 ## What was actually decided
 
@@ -165,11 +165,8 @@ and this section should shrink to a footnote.
 (The same generator *does* reproduce miden's RPO tables exactly, all 168 values,
 which is what makes the RPO half of this module grade 1 at the constant level.)
 
-### 5. Not shipped
+## What is deliberately not done
 
-* **RPX** (`eprint 2023/1045`) — Rescue-Prime eXtended, which miden-crypto also
-  ships. Different round structure (three round types), different constants,
-  its own vectors. A separate follow-up, not a flag on this one.
 * **A sponge for `xlix`.** Winterfell's `Rp64_256` hasher exists (additive
   absorption, capacity at `0..4`, `state[0] = num_elements`) but publishes no
   digest KAT — only the permutation one. Building it would mean shipping a
@@ -179,6 +176,13 @@ which is what makes the RPO half of this module grade 1 at the constant level.)
 * **Circuit / constraint-system integration.** Out of scope; the whole point of
   Rescue is what a constraint system does with it, and that belongs in whatever
   `groth16`-side gadget wants it.
+* **A general-purpose field module.** The Goldilocks field stays in-module
+  (next section).
+* **Non-canonical `[0, 2^64)` field representation** (plonky2, Winterfell): the
+  canonical one buys trivial equality and serialisation (next section).
+
+RPX (`eprint 2023/1045`) and a SIMD permutation are not refused, only not built:
+see *Backlog / deferred*.
 
 ## The Goldilocks field is in-module on purpose
 
@@ -215,8 +219,8 @@ whose cost is dominated by the S-box anyway.
   obvious implementation of `x^(1/alpha)` *is* a square-and-multiply over a
   64-bit exponent, and a naive one would be data-independent only by accident
   (the exponent is public, so even a windowed ladder would be safe here — but
-  the chain removes the question, and it is measurably faster: 0.290 µs vs
-  0.358 µs for the module's own constant-time 64-iteration ladder, 1.23x).
+  the chain removes the question, and it is faster than the module's own
+  constant-time 64-iteration ladder).
 * `pow` is a fixed 64-iteration masked ladder. It is used by tests and by the
   comptime MDS inversion, never on the hot path.
 * The permutation and both sponges have fixed loop bounds over public lengths.
@@ -236,35 +240,35 @@ data-dependent branch or table index in the sources.
 
 ## Performance notes
 
-Numbers are in `README.md`. Two things worth an auditor's attention:
+The card's `**Performance:**` line is the authority for figures; `README.md`
+(Cost) shows the shape of the cost. Two things worth an auditor's attention:
 
 **The S-box layer shape is load-bearing, not cosmetic.** Written the obvious
 way — `for (state) |*s| s.* = sboxInv(s.*)` — the 72-multiply body is far past
 LLVM's unroll threshold, so the `m` chains run strictly one after another and
-the layer costs `m` × 72 *latencies*. Advancing all `m` lanes one chain step at
-a time is the same instruction count with `m`-way ILP: measured
-**48.0 µs → 27.4 µs** per permutation. Rewriting the field's carry handling from
-`@addWithOverflow` tuples (which LLVM was spilling to stack) to explicit
-comparison masks took it to **18.15 µs**. Every RPO implementation is written
-lane-parallel; this is why.
+the layer costs `m` × 72 *latencies* (`sboxInvLayer`, `src/goldilocks.zig:202`).
+Advancing all `m` lanes one chain step at a time is the same instruction count
+with `m`-way ILP. The field's carry handling uses explicit comparison masks, not
+`@addWithOverflow` tuples (which LLVM spilled to the stack). Every RPO
+implementation is written lane-parallel; this is why.
 
 **Left on the table**, deliberately: the AVX2/AVX-512 paths miden-crypto ships,
 and the non-canonical `[0, 2^64)` representation that would drop one masked
-subtraction per operation. Both are real and both are unmeasured here — no
-head-to-head against miden's scalar or SIMD paths was run, so this module makes
-no claim about how it compares. Neither is worth the complexity until something
-in this repo actually hashes at volume with Rescue; if that happens, the honest
-first move is SIMD, not micro-tuning the scalar reduce.
+subtraction per operation. No head-to-head against miden's scalar or SIMD paths
+was run, so this module makes no claim about how it compares. Neither is worth
+the complexity until something in this repo actually hashes at volume with
+Rescue; if that happens, the honest first move is SIMD, not micro-tuning the
+scalar reduce.
 
-**Not marked `heavy`** in `build.zig`: strict-Debug compile ~8.5 s + run ~1.0 s
-= 9.5 s, under the >15 s threshold — and a ReleaseSafe compile of this module
-is ~46 s (comptime SHAKE256 + heavily unrolled field code), so marking it heavy
-would cost 5x what it saves. There is no parameter sweep to gate: RPO defines
+**Not marked `heavy`** in `build.zig` (`build.zig:442`): the Debug compile and
+run are short, a ReleaseSafe compile of this module is several times longer
+(comptime SHAKE256 plus heavily unrolled field code), so marking it heavy would
+cost more than it saves. There is no parameter sweep to gate: RPO defines
 exactly two instances and both are always tested.
 
-**Constants are derived at comptime** (~1.4 s of the compile), unlike
-`poseidon`, whose Grain LFSR had to stay at run time. Keccak is cheap in the
-Zig interpreter; a 1512-byte squeeze is 12 permutations.
+**Constants are derived at comptime**, unlike `poseidon`, whose Grain LFSR had
+to stay at run time. Keccak is cheap in the Zig interpreter; a 1512-byte squeeze
+is 12 permutations.
 
 ## Anchoring summary
 
@@ -290,24 +294,48 @@ Nothing here is grade 3. The weakest links are named above and in the
 divergences: the byte path (no upstream KAT exists to have) and the
 Rescue-XLIX constant blob (no derivation recovered).
 
-## Backlog
+## Verification
 
-* Recover Winterfell's constant-generation invocation and turn
+Run: `scripts/modtest rescue` (or `zig build test-rescue`; `-Dstrict-debug` for
+real Debug). Fuzz verdicts come from the deterministic driver, never
+`zig build --fuzz`: `RESCUE_FUZZ=<runs>[,<first seed>] zig build test-rescue
+--release=safe` runs the five harnesses of `src/fuzz_test.zig` (injectivity,
+round trip, field, framings, xlix-differs).
+
+Test classes:
+
+- **Published vectors** (`src/vectors_test.zig`): RPO report 128- and 160-bit
+  digests, miden-crypto `Rpo256::hash_elements` digests, Winterfell's
+  Rescue-XLIX permutation KAT, the two sponges disagreeing on every input,
+  digest serialisation. Sources and per-file SHA-256s: `src/upstream_vectors.zig`.
+- **Constants** (`src/constants_test.zig`): SHAKE256-derived RPO constants vs
+  miden-crypto's embedded ARK1/ARK2, the 160-bit set pinned by SHA-256 from an
+  outside port, the `m = 12` MDS row corroborated by Winterfell, `alpha` and
+  `1/alpha`, the 72-multiply chain replayed over exponents.
+- **Framings** (`src/rpo.zig`): miden's `hash_padding` cases, domain
+  separation, merge, empty-input behaviour of both sponges, digest lengths.
+- **Field and permutation** (`src/goldilocks.zig`, `src/perm.zig`): differential
+  against a `u128 % p` oracle, MDS invertibility, `permuteInverse` round trip.
+- `meta.deps` is empty (`src/root.zig:148`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it. There is no
+  mutation run recorded yet; the only mutation evidence is a manual five-mutation
+  experiment kept outside the repository.
+- No CT disassembly sweep: see *Constant time*.
+
+## Backlog / deferred
+
+- **Recover Winterfell's constant-generation invocation** and turn
   `xlix_constants.zig` into a derivation (divergence 4).
-* RPX, if a consumer appears.
-* A CT disassembly sweep, to bring this module up to `k256`/`montint`'s
+- **RPX (Rescue-Prime eXtension) hasher**, if a consumer appears (survey
+  2026-09-30: miden-crypto ships `Rpx256` next to `Rpo256`; a Miden user who
+  reads RPX-hashed commitments cannot with this module). A second round function
+  over the same Goldilocks field plus its own vectors; miden-crypto is
+  Apache-2.0, so its tests are not readable under the survey playbook's MIT
+  rule and the RPX specification must come from its paper.
+- **A CT disassembly sweep**, to bring this module up to `k256`/`montint`'s
   standard of evidence rather than argument.
-* SIMD S-box layers, if Rescue ever lands on a hot path here.
-* **RPX (Rescue-Prime eXtension) hasher** *(survey 2026-09-30)*. miden-crypto ships
-  `Rpx256` next to `Rpo256`, in the same `rescue/` directory; a Miden user who
-  reads RPX-hashed commitments cannot with this module. Moderate: a second round
-  function over the same Goldilocks field (details *(inferred: not read this run)*),
-  plus vectors — miden-crypto is Apache-2.0, so its tests are not readable under the
-  playbook's MIT rule; the RPX specification must come from its paper. Pure Zig, fits CONVENTIONS §2. Same
-  item as the older "RPX, if a consumer appears" line above; listed here so the
-  survey's gap has a tag.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **SIMD S-box layers**, if Rescue ever lands on a hot path here.
 
 ## Anchoring
 
