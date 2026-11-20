@@ -24,10 +24,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 tmp="$(mktemp "${TMPDIR:-/tmp}/tc-capture.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 
-unshare -rn bash -c "
+# The command goes through the environment and a second shell, so quoted
+# arguments (an ematch tree: `match "cmp(u8 at 0 layer network eq 4)"`) survive.
+TC_CAP_CMD="$cmd" TC_CAP_SETUP="$setup" unshare -rn bash -c '
   ip link set lo up 2>/dev/null
-  $setup >/dev/null 2>&1
-  exec strace -f -e trace=sendmsg -e write=all -xx -s 65536 -e abbrev=none $cmd
-" >/dev/null 2>"$tmp"
+  bash -c "$TC_CAP_SETUP" >/dev/null 2>&1
+  exec strace -f -e trace=sendmsg -e write=all -xx -s 65536 -e abbrev=none bash -c "$TC_CAP_CMD"
+' >/dev/null 2>"$tmp"
 
 python3 "$here/parse_strace.py" "$tmp"

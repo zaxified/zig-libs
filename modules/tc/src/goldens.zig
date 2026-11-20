@@ -4612,3 +4612,351 @@ const g_u32x_offset_eat =
     "5c0000002c00050660dc006b000000000000000001000000000000000000010008004e0008000100753332003000020008" ++
     "00010010000100240005000d0601000f0000000000000000000000ffffffff010101010c00000000000000";
 const seq_u32x_offset_eat: u32 = 1795218528;
+
+// ── the fw, route, basic and cgroup classifiers ─────────────────────────────
+
+fn clsGolden(comptime hex: []const u8, seq: u32, prio: u16, handle: Handle, spec: filter.FilterSpec) !filter.Filter {
+    const codec = @import("netlink").codec;
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = prio, .eth_type = ETH_P.IP, .handle = handle },
+        spec,
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(hex, req);
+    var buf: [hex.len / 2]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&buf, hex);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    return try filter.parseFilter(m.payload);
+}
+
+test "golden: fw (mark as handle, mask, indev, actions)" {
+    // tc filter add dev lo parent 1: protocol ip prio 80 handle 5 fw classid 1:10
+    var f = try clsGolden(g_cls_fw, seq_cls_fw, 80, Handle.fromRaw(5), .{ .fw = .{ .classid = Handle.init(1, 0x10) } });
+    try testing.expectEqualStrings("fw", f.kind());
+    try testing.expectEqual(@as(u32, 5), f.handle.raw);
+    try testing.expectEqual(Handle.init(1, 0x10).raw, f.fw.?.classid.?.raw);
+    // tc filter add dev lo parent 1: protocol ip prio 81 handle 0x5/0xff fw classid 1:10
+    f = try clsGolden(g_cls_fw_mask, seq_cls_fw_mask, 81, Handle.fromRaw(5), .{ .fw = .{
+        .classid = Handle.init(1, 0x10),
+        .mask = 0xff,
+    } });
+    try testing.expectEqual(@as(?u32, 0xff), f.fw.?.mask);
+    // tc filter add dev lo parent 1: protocol ip prio 82 handle 5 fw classid 1:10 indev lo
+    f = try clsGolden(g_cls_fw_indev, seq_cls_fw_indev, 82, Handle.fromRaw(5), .{ .fw = .{
+        .classid = Handle.init(1, 0x10),
+        .indev = "lo",
+    } });
+    try testing.expectEqualStrings("lo", f.fw.?.indev());
+    // tc filter add dev lo parent 1: protocol ip prio 83 handle 5 fw classid 1:10 action drop
+    f = try clsGolden(g_cls_fw_action, seq_cls_fw_action, 83, Handle.fromRaw(5), .{ .fw = .{
+        .classid = Handle.init(1, 0x10),
+        .actions = &.{.{ .gact = .{ .action = .shot } }},
+    } });
+    try testing.expectEqual(@as(usize, 1), f.actions().len);
+    try testing.expectEqual(action.Verdict.shot, f.actions()[0].gen.action);
+}
+
+test "golden: route (realms, fromif, actions) and the handle formula" {
+    // tc filter add dev lo parent 1: protocol ip prio 84 route from 1 to 2 classid 1:10
+    var f = try clsGolden(g_cls_route_from_to, seq_cls_route_from_to, 84, filter.route4Handle(2, 1, null), .{ .route = .{
+        .from = 1,
+        .to = 2,
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(@as(u32, 0x00010002), f.handle.raw);
+    try testing.expectEqual(@as(?u32, 1), f.route.?.from);
+    try testing.expectEqual(@as(?u32, 2), f.route.?.to);
+    // tc filter add dev lo parent 1: protocol ip prio 85 route fromif lo classid 1:10
+    f = try clsGolden(g_cls_route_fromif, seq_cls_route_fromif, 85, filter.route4Handle(null, null, 1), .{ .route = .{
+        .iif = 1,
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(@as(u32, 0x80018000), f.handle.raw);
+    try testing.expectEqual(@as(?u32, 1), f.route.?.iif);
+    // tc filter add dev lo parent 1: protocol ip prio 86 route to 3 classid 1:10
+    f = try clsGolden(g_cls_route_to, seq_cls_route_to, 86, filter.route4Handle(3, null, null), .{ .route = .{
+        .to = 3,
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(@as(u32, 0xffff0003), f.handle.raw);
+    // tc filter add dev lo parent 1: protocol ip prio 87 route from 1 classid 1:10 action drop
+    f = try clsGolden(g_cls_route_action, seq_cls_route_action, 87, filter.route4Handle(null, 1, null), .{ .route = .{
+        .from = 1,
+        .classid = Handle.init(1, 0x10),
+        .actions = &.{.{ .gact = .{ .action = .shot } }},
+    } });
+    try testing.expectEqual(@as(u32, 0x00018000), f.handle.raw);
+    try testing.expectEqual(@as(usize, 1), f.actions().len);
+}
+
+test "golden: basic ematch trees" {
+    const cmp4 = (filter.EmCmp{ .val = 4 }).encode();
+    // tc filter add dev lo parent 1: protocol ip prio 88 basic match "cmp(u8 at 0 layer network eq 4)" classid 1:10
+    var f = try clsGolden(g_cls_basic_cmp, seq_cls_basic_cmp, 88, Handle.unspec, .{ .basic = .{
+        .ematches = &.{.{ .kind = filter.EM_KIND.CMP, .data = &cmp4 }},
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(@as(u16, 1), f.basic.?.ematches.nmatches);
+    try testing.expectEqual(filter.EM_KIND.CMP, f.basic.?.ematches.slice()[0].kind);
+    try testing.expectEqual(@as(u8, 12), f.basic.?.ematches.slice()[0].data_len);
+    try testing.expectEqualSlices(u8, &cmp4, f.basic.?.ematches.slice()[0].dataBytes());
+    // tc filter add dev lo parent 1: protocol ip prio 89 basic match "cmp(u16 at 2 layer transport gt 80)" classid 1:10
+    const cmp16 = (filter.EmCmp{ .val = 80, .off = 2, .@"align" = .u16, .layer = .transport, .opnd = .gt }).encode();
+    f = try clsGolden(g_cls_basic_cmp16, seq_cls_basic_cmp16, 89, Handle.unspec, .{ .basic = .{
+        .ematches = &.{.{ .kind = filter.EM_KIND.CMP, .data = &cmp16 }},
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(@as(u8, 0x12), f.basic.?.ematches.slice()[0].data[11]);
+    // tc filter add dev lo parent 1: protocol ip prio 90 basic match "not cmp(u8 at 0 layer network eq 4)" classid 1:10
+    f = try clsGolden(g_cls_basic_not, seq_cls_basic_not, 90, Handle.unspec, .{ .basic = .{
+        .ematches = &.{.{ .kind = filter.EM_KIND.CMP, .flags = filter.EM_FLAG.INVERT, .data = &cmp4 }},
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(filter.EM_FLAG.INVERT, f.basic.?.ematches.slice()[0].flags);
+    // tc filter add dev lo parent 1: protocol ip prio 91 basic match "cmp(u8 at 0 layer network eq 4) or cmp(u8 at 1 layer network eq 4)" classid 1:10
+    const cmp4b = (filter.EmCmp{ .val = 4, .off = 1 }).encode();
+    f = try clsGolden(g_cls_basic_or, seq_cls_basic_or, 91, Handle.unspec, .{ .basic = .{
+        .ematches = &.{
+            .{ .kind = filter.EM_KIND.CMP, .flags = filter.EM_FLAG.REL_OR, .data = &cmp4 },
+            .{ .kind = filter.EM_KIND.CMP, .data = &cmp4b },
+        },
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(@as(u16, 2), f.basic.?.ematches.nmatches);
+    try testing.expectEqual(filter.EM_FLAG.REL_OR, f.basic.?.ematches.slice()[0].flags);
+    // tc filter add dev lo parent 1: protocol ip prio 92 basic match "u32(u32 0x1 0xff at 0)" classid 1:10
+    const key = filter.emU32(U32Key.word(1, 0xff, 0));
+    f = try clsGolden(g_cls_basic_u32, seq_cls_basic_u32, 92, Handle.unspec, .{ .basic = .{
+        .ematches = &.{.{ .kind = filter.EM_KIND.U32, .data = &key }},
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(@as(u16, 16), f.basic.?.ematches.slice()[0].full_len);
+    // tc filter add dev lo parent 1: protocol ip prio 93 basic match "meta(priority eq 3)" classid 1:10
+    // (a meta match carries its own nested attributes: passed through as bytes)
+    const meta = [_]u8{
+        0x0c, 0x00, 0x01, 0x00, 0x06, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+        0x08, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x03, 0x00,
+        0x03, 0x00, 0x00, 0x00,
+    };
+    f = try clsGolden(g_cls_basic_meta, seq_cls_basic_meta, 93, Handle.unspec, .{ .basic = .{
+        .ematches = &.{.{ .kind = filter.EM_KIND.META, .data = &meta }},
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(filter.EM_KIND.META, f.basic.?.ematches.slice()[0].kind);
+    try testing.expectEqual(@as(u16, meta.len), f.basic.?.ematches.slice()[0].full_len);
+    // tc filter add dev lo parent 1: protocol ip prio 94 basic classid 1:10
+    f = try clsGolden(g_cls_basic_plain, seq_cls_basic_plain, 94, Handle.unspec, .{ .basic = .{ .classid = Handle.init(1, 0x10) } });
+    try testing.expectEqual(@as(u16, 0), f.basic.?.ematches.nmatches);
+    // tc filter add dev lo parent 1: protocol ip prio 95 basic match "cmp(u8 at 0 layer network eq 4)" action drop classid 1:10
+    f = try clsGolden(g_cls_basic_action, seq_cls_basic_action, 95, Handle.unspec, .{ .basic = .{
+        .ematches = &.{.{ .kind = filter.EM_KIND.CMP, .data = &cmp4 }},
+        .actions = &.{.{ .gact = .{ .action = .shot } }},
+        .classid = Handle.init(1, 0x10),
+    } });
+    try testing.expectEqual(@as(usize, 1), f.actions().len);
+    try testing.expectEqual(Handle.init(1, 0x10).raw, f.classid().?.raw);
+}
+
+test "golden: cgroup (bare, with actions, with a meta match)" {
+    // tc filter add dev lo parent 1: protocol ip prio 96 cgroup
+    var f = try clsGolden(g_cls_cgroup, seq_cls_cgroup, 96, Handle.unspec, .{ .cgroup = .{} });
+    try testing.expectEqualStrings("cgroup", f.kind());
+    try testing.expectEqual(@as(u16, 0), f.cgroup.?.ematches.nmatches);
+    // tc filter add dev lo parent 1: protocol ip prio 97 cgroup action drop
+    f = try clsGolden(g_cls_cgroup_action, seq_cls_cgroup_action, 97, Handle.unspec, .{ .cgroup = .{
+        .actions = &.{.{ .gact = .{ .action = .shot } }},
+    } });
+    try testing.expectEqual(@as(usize, 1), f.actions().len);
+    // tc filter add dev lo parent 1: protocol ip prio 98 cgroup match "meta(priority eq 3)" action drop
+    const meta = [_]u8{
+        0x0c, 0x00, 0x01, 0x00, 0x06, 0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+        0x08, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x03, 0x00,
+        0x03, 0x00, 0x00, 0x00,
+    };
+    f = try clsGolden(g_cls_cgroup_meta, seq_cls_cgroup_meta, 98, Handle.unspec, .{ .cgroup = .{
+        .ematches = &.{.{ .kind = filter.EM_KIND.META, .data = &meta }},
+        .actions = &.{.{ .gact = .{ .action = .shot } }},
+    } });
+    try testing.expectEqual(filter.EM_KIND.META, f.cgroup.?.ematches.slice()[0].kind);
+    try testing.expectEqual(@as(usize, 1), f.actions().len);
+}
+
+test "bpf: an eBPF program by fd and name round-trips; neither or both programs are refused" {
+    const codec = @import("netlink").codec;
+    const req = try message.buildFilterSetWith(
+        gpa,
+        1,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.ALL },
+        .{ .bpf = .{ .fd = 7, .name = "prog", .direct_action = true, .flags_gen = 2 } },
+        ps,
+    );
+    defer gpa.free(req);
+    var it: codec.MessageIterator = .{ .buf = req };
+    const m = (try it.next()).?;
+    const f = try filter.parseFilter(m.payload);
+    try testing.expectEqualStrings("prog", f.bpf.?.name());
+    try testing.expectEqual(@as(?u32, 1), f.bpf.?.flags);
+    try testing.expectEqual(@as(?u16, null), f.bpf.?.ops_len);
+    try testing.expectError(error.BadBpfProgram, message.buildFilterSetWith(
+        gpa,
+        1,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.ALL },
+        .{ .bpf = .{ .fd = 7, .ops = &.{.{ .code = 6, .k = 1 }} } },
+        ps,
+    ));
+}
+
+// ── captured request bytes: fw, route, basic, cgroup ────────────────────────
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218794 len=56
+// tc filter add dev lo parent 1: protocol ip prio 80 handle 5 fw classid 1:10
+const g_cls_fw =
+    "380000002c0005066add006b00000000000000000100000005000000000001000800500007000100667700000c00020008" ++
+    "00010010000100";
+const seq_cls_fw: u32 = 1795218794;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218794 len=64
+// tc filter add dev lo parent 1: protocol ip prio 81 handle 0x5/0xff fw classid 1:10
+const g_cls_fw_mask =
+    "400000002c0005066add006b00000000000000000100000005000000000001000800510007000100667700001400020008" ++
+    "000500ff0000000800010010000100";
+const seq_cls_fw_mask: u32 = 1795218794;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218794 len=64
+// tc filter add dev lo parent 1: protocol ip prio 82 handle 5 fw classid 1:10 indev lo
+const g_cls_fw_indev =
+    "400000002c0005066add006b00000000000000000100000005000000000001000800520007000100667700001400020008" ++
+    "00010010000100070003006c6f0000";
+const seq_cls_fw_indev: u32 = 1795218794;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=104
+// tc filter add dev lo parent 1: protocol ip prio 83 handle 5 fw classid 1:10 action drop
+const g_cls_fw_action =
+    "680000002c0005066bdd006b00000000000000000100000005000000000001000800530007000100667700003c00020008" ++
+    "00010010000100300004002c0001000900010067616374000000001c000280180002000000000000000000020000000000" ++
+    "000000000000";
+const seq_cls_fw_action: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=76
+// tc filter add dev lo parent 1: protocol ip prio 84 route from 1 to 2 classid 1:10
+const g_cls_route_from_to =
+    "4c0000002c0005066bdd006b0000000000000000010000000200010000000100080054000a000100726f7574650000001c" ++
+    "000200080003000100000008000200020000000800010010000100";
+const seq_cls_route_from_to: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=68
+// tc filter add dev lo parent 1: protocol ip prio 85 route fromif lo classid 1:10
+const g_cls_route_fromif =
+    "440000002c0005066bdd006b0000000000000000010000000080018000000100080055000a000100726f75746500000014" ++
+    "00020008000400010000000800010010000100";
+const seq_cls_route_fromif: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=68
+// tc filter add dev lo parent 1: protocol ip prio 86 route to 3 classid 1:10
+const g_cls_route_to =
+    "440000002c0005066bdd006b0000000000000000010000000300ffff00000100080056000a000100726f75746500000014" ++
+    "00020008000200030000000800010010000100";
+const seq_cls_route_to: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=116
+// tc filter add dev lo parent 1: protocol ip prio 87 route from 1 classid 1:10 action drop
+const g_cls_route_action =
+    "740000002c0005066bdd006b0000000000000000010000000080010000000100080057000a000100726f75746500000044" ++
+    "00020008000300010000000800010010000100300006002c0001000900010067616374000000001c000280180002000000" ++
+    "000000000000020000000000000000000000";
+const seq_cls_route_action: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=100
+// tc filter add dev lo parent 1: protocol ip prio 88 basic match "cmp(u8 at 0 layer network eq 4)" classid 1:10
+const g_cls_basic_cmp =
+    "640000002c0005066bdd006b0000000000000000010000000000000000000100080058000a000100626173696300000034" ++
+    "0002002800020008000100010000001c000200180001000000010000000000040000000000000000000101080001001000" ++
+    "0100";
+const seq_cls_basic_cmp: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=100
+// tc filter add dev lo parent 1: protocol ip prio 89 basic match "cmp(u16 at 2 layer transport gt 80)" classid 1:10
+const g_cls_basic_cmp16 =
+    "640000002c0005066bdd006b0000000000000000010000000000000000000100080059000a000100626173696300000034" ++
+    "0002002800020008000100010000001c000200180001000000010000000000500000000000000002000212080001001000" ++
+    "0100";
+const seq_cls_basic_cmp16: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=100
+// tc filter add dev lo parent 1: protocol ip prio 90 basic match "not cmp(u8 at 0 layer network eq 4)" classid 1:10
+const g_cls_basic_not =
+    "640000002c0005066bdd006b000000000000000001000000000000000000010008005a000a000100626173696300000034" ++
+    "0002002800020008000100010000001c000200180001000000010004000000040000000000000000000101080001001000" ++
+    "0100";
+const seq_cls_basic_not: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=124
+// tc filter add dev lo parent 1: protocol ip prio 91 basic match "cmp(u8 at 0 layer network eq 4) or cmp(u8 at 1 layer network eq 4)" classid 1:10
+const g_cls_basic_or =
+    "7c0000002c0005066bdd006b000000000000000001000000000000000000010008005b000a00010062617369630000004c" ++
+    "00020040000200080001000200000034000200180001000000010002000000040000000000000000000101180002000000" ++
+    "0100000000000400000000000000010001010800010010000100";
+const seq_cls_basic_or: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=104
+// tc filter add dev lo parent 1: protocol ip prio 92 basic match "u32(u32 0x1 0xff at 0)" classid 1:10
+const g_cls_basic_u32 =
+    "680000002c0005066bdd006b000000000000000001000000000000000000010008005c000a000100626173696300000038" ++
+    "0002002c0002000800010001000000200002001c0001000000030000000000000000ff0000000100000000000000000800" ++
+    "010010000100";
+const seq_cls_basic_u32: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=116
+// tc filter add dev lo parent 1: protocol ip prio 93 basic match "meta(priority eq 3)" classid 1:10
+const g_cls_basic_meta =
+    "740000002c0005066bdd006b000000000000000001000000000000000000010008005d000a000100626173696300000044" ++
+    "0002003800020008000100010000002c0002002800010000000400000000000c0001000610000000100000080002000000" ++
+    "000008000300030000000800010010000100";
+const seq_cls_basic_meta: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=60
+// tc filter add dev lo parent 1: protocol ip prio 94 basic classid 1:10
+const g_cls_basic_plain =
+    "3c0000002c0005066bdd006b000000000000000001000000000000000000010008005e000a00010062617369630000000c" ++
+    "0002000800010010000100";
+const seq_cls_basic_plain: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=148
+// tc filter add dev lo parent 1: protocol ip prio 95 basic match "cmp(u8 at 0 layer network eq 4)" action drop classid 1:10
+const g_cls_basic_action =
+    "940000002c0005066bdd006b000000000000000001000000000000000000010008005f000a000100626173696300000064" ++
+    "0002002800020008000100010000001c000200180001000000010000000000040000000000000000000101300003002c00" ++
+    "01000900010067616374000000001c00028018000200000000000000000002000000000000000000000008000100100001" ++
+    "00";
+const seq_cls_basic_action: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=52
+// tc filter add dev lo parent 1: protocol ip prio 96 cgroup
+const g_cls_cgroup =
+    "340000002c0005066bdd006b0000000000000000010000000000000000000100080060000b0001006367726f7570000004" ++
+    "000200";
+const seq_cls_cgroup: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=100
+// tc filter add dev lo parent 1: protocol ip prio 97 cgroup action drop
+const g_cls_cgroup_action =
+    "640000002c0005066bdd006b0000000000000000010000000000000000000100080061000b0001006367726f7570000034" ++
+    "000200300001002c0001000900010067616374000000001c00028018000200000000000000000002000000000000000000" ++
+    "0000";
+const seq_cls_cgroup_action: u32 = 1795218795;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218795 len=156
+// tc filter add dev lo parent 1: protocol ip prio 98 cgroup match "meta(priority eq 3)" action drop
+const g_cls_cgroup_meta =
+    "9c0000002c0005066bdd006b0000000000000000010000000000000000000100080062000b0001006367726f757000006c" ++
+    "0002003800030008000100010000002c0002002800010000000400000000000c0001000610000000100000080002000000" ++
+    "00000800030003000000300001002c0001000900010067616374000000001c000280180002000000000000000000020000" ++
+    "000000000000000000";
+const seq_cls_cgroup_meta: u32 = 1795218795;

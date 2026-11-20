@@ -1125,19 +1125,25 @@ pub const BpfInsn = struct {
 pub const bpf_max_insns = 4096;
 pub const bpf_insn_len = 8;
 
-/// A bpf classifier carrying an inline **classic-BPF** program
-/// (`tc filter add ... bpf bytecode '<n>,<code> <jt> <jf> <k>,...'`). The
-/// eBPF forms (`obj`, `fd`, `pinned`) need a loaded program (a file descriptor
-/// from the `bpf(2)` syscall), which cannot be produced to capture goldens in
-/// an unprivileged network namespace, so they are not modelled; use
-/// `FilterSpec.raw` for them.
+/// A bpf classifier carrying either an inline **classic-BPF** program
+/// (`tc filter add ... bpf bytecode '<n>,<code> <jt> <jf> <k>,...'`, `ops`)
+/// or an already-loaded **eBPF** program by file descriptor (`fd`; what `tc
+/// … bpf obj FILE`, `pinned PATH` and `fd N` all end up sending). Loading an
+/// object file or opening a pin is the caller's job (`bpf(2)`); the fd form has
+/// no golden, since producing one needs a loaded program (privileged).
 ///
 /// iproute2 6.19 order on the wire: `classid`, the action list, `OPS_LEN`,
 /// `OPS`, `FLAGS_GEN` (`skip_sw`/`skip_hw`), `FLAGS` (`da`); each only when
 /// given.
 pub const Bpf = struct {
-    /// The program, 1..`bpf_max_insns` instructions.
-    ops: []const BpfInsn,
+    /// The classic program, 1..`bpf_max_insns` instructions — or empty when
+    /// `fd` names an eBPF program (exactly one of the two).
+    ops: []const BpfInsn = &.{},
+    /// `TCA_BPF_FD` — a loaded eBPF program's file descriptor.
+    fd: ?u32 = null,
+    /// `TCA_BPF_NAME` — the program name shown by `tc filter show` (`name
+    /// foo`).
+    name: ?[]const u8 = null,
     classid: ?Handle = null,
     actions: []const ActionSpec = &.{},
     /// `da` / `direct-action`: the program's return value is the verdict.
@@ -1153,6 +1159,17 @@ pub const BpfWire = struct {
     ops_len: ?u16 = null,
     flags: ?u32 = null,
     flags_gen: ?u32 = null,
+    /// `TCA_BPF_ID` — the kernel's program id (eBPF).
+    id: ?u32 = null,
+    /// `TCA_BPF_TAG` — the program's 8-byte tag (eBPF).
+    tag: ?[8]u8 = null,
+    name_buf: [qdisc.kind_max * 2]u8 = @splat(0),
+    name_len: u8 = 0,
+
+    /// `TCA_BPF_NAME`, or an empty slice.
+    pub fn name(w: *const BpfWire) []const u8 {
+        return w.name_buf[0..w.name_len];
+    }
 };
 
 fn appendBpfOptions(
@@ -1161,24 +1178,34 @@ fn appendBpfOptions(
     list: *std.ArrayList(u8),
     ps: Psched,
 ) EncodeError!void {
-    if (b.ops.len == 0 or b.ops.len > bpf_max_insns) return error.BadBpfProgram;
+    // Exactly one program: inline classic bytecode, or an eBPF fd.
+    if ((b.ops.len == 0) == (b.fd == null) or b.ops.len > bpf_max_insns) return error.BadBpfProgram;
     if (b.classid) |c| try codec.appendAttrU32(gpa, list, TCA_BPF.CLASSID, c.raw);
     try action.appendActionList(gpa, list, TCA_BPF.ACT, b.actions, ps);
-    var len_raw: [2]u8 = undefined;
-    std.mem.writeInt(u16, &len_raw, @intCast(b.ops.len), native_endian);
-    try appendBytes(gpa, list, TCA_BPF.OPS_LEN, &len_raw);
-    // The OPS attribute (8 bytes per instruction, at most 32 KiB) fits one attribute.
-    var ops: std.ArrayList(u8) = .empty;
-    defer ops.deinit(gpa);
-    for (b.ops) |i| {
-        var raw: [bpf_insn_len]u8 = undefined;
-        std.mem.writeInt(u16, raw[0..2], i.code, native_endian);
-        raw[2] = i.jt;
-        raw[3] = i.jf;
-        std.mem.writeInt(u32, raw[4..8], i.k, native_endian);
-        try ops.appendSlice(gpa, &raw);
+    if (b.ops.len != 0) {
+        var len_raw: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_raw, @intCast(b.ops.len), native_endian);
+        try appendBytes(gpa, list, TCA_BPF.OPS_LEN, &len_raw);
+        // The OPS attribute (8 bytes per instruction, at most 32 KiB) fits one attribute.
+        var ops: std.ArrayList(u8) = .empty;
+        defer ops.deinit(gpa);
+        for (b.ops) |i| {
+            var raw: [bpf_insn_len]u8 = undefined;
+            std.mem.writeInt(u16, raw[0..2], i.code, native_endian);
+            raw[2] = i.jt;
+            raw[3] = i.jf;
+            std.mem.writeInt(u32, raw[4..8], i.k, native_endian);
+            try ops.appendSlice(gpa, &raw);
+        }
+        try appendBytes(gpa, list, TCA_BPF.OPS, ops.items);
     }
-    try appendBytes(gpa, list, TCA_BPF.OPS, ops.items);
+    if (b.fd) |fd| try codec.appendAttrU32(gpa, list, TCA_BPF.FD, fd);
+    if (b.name) |name| {
+        codec.appendAttrString(gpa, list, TCA_BPF.NAME, name) catch |err| switch (err) {
+            error.AttrTooLong => return error.OptionsTooLong,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
     if (b.flags_gen != 0) try codec.appendAttrU32(gpa, list, TCA_BPF.FLAGS_GEN, b.flags_gen);
     if (b.direct_action) try codec.appendAttrU32(gpa, list, TCA_BPF.FLAGS, TCA_BPF_FLAG_ACT_DIRECT);
 }
@@ -1199,9 +1226,395 @@ pub fn parseBpfOptions(data: []const u8) codec.Error!BpfWire {
         TCA_BPF.FLAGS_GEN => if (a.data.len == 4) {
             bw.flags_gen = std.mem.readInt(u32, a.data[0..4], native_endian);
         },
+        TCA_BPF.ID => bw.id = readScalar(u32, a.data, native_endian),
+        TCA_BPF.TAG => bw.tag = readScalar([8]u8, a.data, .big),
+        TCA_BPF.NAME => {
+            const name = a.asString();
+            const n = @min(name.len, bw.name_buf.len);
+            @memcpy(bw.name_buf[0..n], name[0..n]);
+            bw.name_len = @intCast(n);
+        },
         else => {},
     };
     return bw;
+}
+
+// ── ematch trees (basic, cgroup) ────────────────────────────────────────────
+
+/// `TCA_EMATCH_TREE_*`.
+pub const TCA_EMATCH_TREE = struct {
+    pub const HDR: u16 = 1;
+    pub const LIST: u16 = 2;
+};
+
+/// `TCF_EM_*` — the kind of one extended match.
+pub const EM_KIND = struct {
+    pub const CONTAINER: u16 = 0;
+    pub const CMP: u16 = 1;
+    pub const NBYTE: u16 = 2;
+    pub const U32: u16 = 3;
+    pub const META: u16 = 4;
+    pub const TEXT: u16 = 5;
+    pub const VLAN: u16 = 6;
+    pub const CANID: u16 = 7;
+    pub const IPSET: u16 = 8;
+    pub const IPT: u16 = 9;
+};
+
+/// `TCF_EM_REL_*` / `TCF_EM_INVERT` — bits of `Ematch.flags`. `REL_AND` and
+/// `REL_OR` join this match to the NEXT one (the last match has neither);
+/// `INVERT` is the `not` prefix.
+pub const EM_FLAG = struct {
+    pub const REL_AND: u16 = 1;
+    pub const REL_OR: u16 = 2;
+    pub const INVERT: u16 = 4;
+};
+
+/// `tcf_em_cmp.align`.
+pub const EmAlign = enum(u4) { u8 = 1, u16 = 2, u32 = 4 };
+/// `tcf_em_cmp.layer` — `TCF_LAYER_*`.
+pub const EmLayer = enum(u4) { link = 0, network = 1, transport = 2 };
+/// `tcf_em_cmp.opnd` — `TCF_EM_OPND_*`.
+pub const EmOpnd = enum(u4) { eq = 0, gt = 1, lt = 2 };
+
+/// The `cmp(u8 at 0 layer network eq 4)` match: a masked comparison of 1, 2
+/// or 4 bytes at an offset inside one header layer.
+pub const EmCmp = struct {
+    val: u32,
+    mask: u32 = 0,
+    off: u16 = 0,
+    @"align": EmAlign = .u8,
+    layer: EmLayer = .network,
+    opnd: EmOpnd = .eq,
+    /// `TCF_EM_CMP_TRANS` (the `trans` flag: compare after byte-order conversion).
+    trans: bool = false,
+
+    /// `struct tcf_em_cmp`, the data of an `EM_KIND.CMP` match.
+    pub fn encode(c: EmCmp) [12]u8 {
+        var out: [12]u8 = undefined;
+        std.mem.writeInt(u32, out[0..4], c.val, native_endian);
+        std.mem.writeInt(u32, out[4..8], c.mask, native_endian);
+        std.mem.writeInt(u16, out[8..10], c.off, native_endian);
+        out[10] = @as(u8, @backingInt(c.@"align")) | (@as(u8, @intFromBool(c.trans)) << 4);
+        out[11] = @as(u8, @backingInt(c.layer)) | (@as(u8, @backingInt(c.opnd)) << 4);
+        return out;
+    }
+};
+
+/// One extended match of a `basic` or `cgroup` filter: its kind, its flags
+/// (`EM_FLAG`) and the kind's data (`EmCmp.encode`, a `u32` key from
+/// `emU32`, or a pre-encoded blob for `meta`, `nbyte`, `text` …).
+pub const Ematch = struct {
+    kind: u16,
+    flags: u16 = 0,
+    data: []const u8 = &.{},
+};
+
+/// `struct tc_u32_key`, the data of an `EM_KIND.U32` match (`u32(u32 0x1
+/// 0xff at 0)`).
+pub fn emU32(key: U32Key) [tc_u32_key_len]u8 {
+    return key.encode();
+}
+
+/// The most extended matches one tree may carry here.
+pub const em_max_matches = 255;
+/// How many ematches a decoded `basic`/`cgroup` filter keeps.
+pub const em_max_decoded = 4;
+/// How many data bytes of each decoded ematch are kept.
+pub const em_data_decoded = 16;
+
+/// One decoded ematch.
+pub const EmatchWire = struct {
+    kind: u16 = 0,
+    flags: u16 = 0,
+    /// The first `em_data_decoded` bytes of the match's data.
+    data: [em_data_decoded]u8 = @splat(0),
+    data_len: u8 = 0,
+    /// The data length the kernel sent.
+    full_len: u16 = 0,
+
+    pub fn dataBytes(e: *const EmatchWire) []const u8 {
+        return e.data[0..e.data_len];
+    }
+};
+
+/// The decoded ematch tree of a `basic` or `cgroup` filter.
+pub const EmatchTreeWire = struct {
+    /// `tcf_ematch_tree_hdr.nmatches`.
+    nmatches: u16 = 0,
+    items: [em_max_decoded]EmatchWire = @splat(.{}),
+    len: u8 = 0,
+
+    pub fn slice(t: *const EmatchTreeWire) []const EmatchWire {
+        return t.items[0..t.len];
+    }
+};
+
+fn appendEmatchTree(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    ems: []const Ematch,
+) EncodeError!void {
+    if (ems.len == 0) return;
+    if (ems.len > em_max_matches) return error.TooManyKeys;
+    const outer = try codec.nestBegin(gpa, list, attr_type);
+    var hdr: [4]u8 = @splat(0);
+    std.mem.writeInt(u16, hdr[0..2], @intCast(ems.len), native_endian);
+    try appendBytes(gpa, list, TCA_EMATCH_TREE.HDR, &hdr);
+    const tree = try codec.nestBegin(gpa, list, TCA_EMATCH_TREE.LIST);
+    for (ems, 0..) |e, i| {
+        if (e.data.len > std.math.maxInt(u16) - 12) return error.OptionsTooLong;
+        const entry = try codec.nestBegin(gpa, list, @intCast(i + 1));
+        // struct tcf_ematch_hdr: matchid, kind, flags, pad.
+        var eh: [8]u8 = @splat(0);
+        std.mem.writeInt(u16, eh[2..4], e.kind, native_endian);
+        std.mem.writeInt(u16, eh[4..6], e.flags, native_endian);
+        try list.appendSlice(gpa, &eh);
+        try list.appendSlice(gpa, e.data);
+        try list.appendNTimes(gpa, 0, codec.alignUp(e.data.len) - e.data.len);
+        codec.nestEnd(list, entry) catch return error.OptionsTooLong;
+    }
+    codec.nestEnd(list, tree) catch return error.OptionsTooLong;
+    codec.nestEnd(list, outer) catch return error.OptionsTooLong;
+}
+
+fn parseEmatchTree(data: []const u8) codec.Error!EmatchTreeWire {
+    var t: EmatchTreeWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_EMATCH_TREE.HDR => if (a.data.len >= 2) {
+            t.nmatches = std.mem.readInt(u16, a.data[0..2], native_endian);
+        },
+        TCA_EMATCH_TREE.LIST => {
+            var lit: codec.AttrIterator = .{ .buf = a.data };
+            while (try lit.next()) |e| {
+                if (e.data.len < 8) return error.BadLength;
+                if (t.len >= t.items.len) continue;
+                var w: EmatchWire = .{
+                    .kind = std.mem.readInt(u16, e.data[2..4], native_endian),
+                    .flags = std.mem.readInt(u16, e.data[4..6], native_endian),
+                };
+                const body = e.data[8..];
+                const n = @min(body.len, em_data_decoded);
+                @memcpy(w.data[0..n], body[0..n]);
+                w.data_len = @intCast(n);
+                w.full_len = @intCast(body.len);
+                t.items[t.len] = w;
+                t.len += 1;
+            }
+        },
+        else => {},
+    };
+    return t;
+}
+
+// ── fw ──────────────────────────────────────────────────────────────────────
+
+/// `TCA_FW_*`.
+pub const TCA_FW = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const CLASSID: u16 = 1;
+    pub const POLICE: u16 = 2;
+    pub const INDEV: u16 = 3;
+    pub const ACT: u16 = 4;
+    pub const MASK: u16 = 5;
+};
+
+/// The firewall-mark classifier (`tc filter add … handle 5 fw classid 1:10`).
+/// The mark it matches is the filter's **handle** (`FilterTarget.handle`),
+/// not an attribute.
+pub const Fw = struct {
+    classid: ?Handle = null,
+    /// `handle MARK/MASK` — the mask half, sent as `TCA_FW_MASK`.
+    mask: ?u32 = null,
+    indev: ?[]const u8 = null,
+    actions: []const ActionSpec = &.{},
+};
+
+pub const FwWire = struct {
+    classid: ?Handle = null,
+    mask: ?u32 = null,
+    indev_buf: [qdisc.kind_max]u8 = @splat(0),
+    indev_len: u8 = 0,
+
+    pub fn indev(w: *const FwWire) []const u8 {
+        return w.indev_buf[0..w.indev_len];
+    }
+};
+
+fn appendFwOptions(f: Fw, gpa: std.mem.Allocator, list: *std.ArrayList(u8), ps: Psched) EncodeError!void {
+    if (f.mask) |m| try codec.appendAttrU32(gpa, list, TCA_FW.MASK, m);
+    if (f.classid) |c| try codec.appendAttrU32(gpa, list, TCA_FW.CLASSID, c.raw);
+    if (f.indev) |name| {
+        codec.appendAttrString(gpa, list, TCA_FW.INDEV, name) catch |err| switch (err) {
+            error.AttrTooLong => return error.OptionsTooLong,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+    try action.appendActionList(gpa, list, TCA_FW.ACT, f.actions, ps);
+}
+
+pub fn parseFwOptions(data: []const u8) codec.Error!FwWire {
+    var w: FwWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_FW.CLASSID => if (a.data.len == 4) {
+            w.classid = Handle.fromRaw(std.mem.readInt(u32, a.data[0..4], native_endian));
+        },
+        TCA_FW.MASK => w.mask = readScalar(u32, a.data, native_endian),
+        TCA_FW.INDEV => {
+            const name = a.asString();
+            const n = @min(name.len, w.indev_buf.len);
+            @memcpy(w.indev_buf[0..n], name[0..n]);
+            w.indev_len = @intCast(n);
+        },
+        else => {},
+    };
+    return w;
+}
+
+// ── route ───────────────────────────────────────────────────────────────────
+
+/// `TCA_ROUTE4_*`.
+pub const TCA_ROUTE4 = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const CLASSID: u16 = 1;
+    pub const TO: u16 = 2;
+    pub const FROM: u16 = 3;
+    pub const IIF: u16 = 4;
+    pub const POLICE: u16 = 5;
+    pub const ACT: u16 = 6;
+};
+
+/// The filter handle a route filter needs (`FilterTarget.handle`): `to` in
+/// the low half (0x8000 when absent), and in the high half `0x8000 | iif`
+/// for `fromif`, else `from` (0xffff when both are absent).
+pub fn route4Handle(to: ?u8, from: ?u8, iif: ?u16) Handle {
+    const lo: u32 = if (to) |t| t else 0x8000;
+    const hi: u32 = if (iif) |i| 0x8000 | @as(u32, i) else if (from) |f| f else 0xffff;
+    return Handle.fromRaw((hi << 16) | lo);
+}
+
+/// The routing-realm classifier (`tc filter add … route from 1 to 2 classid
+/// 1:10`). The realms are also encoded in the filter's handle; see
+/// `route4Handle`.
+pub const Route4 = struct {
+    to: ?u32 = null,
+    from: ?u32 = null,
+    /// `fromif DEV` as an interface index (`TCA_ROUTE4_IIF`).
+    iif: ?u32 = null,
+    classid: ?Handle = null,
+    actions: []const ActionSpec = &.{},
+};
+
+pub const Route4Wire = struct {
+    classid: ?Handle = null,
+    to: ?u32 = null,
+    from: ?u32 = null,
+    iif: ?u32 = null,
+};
+
+fn appendRoute4Options(r: Route4, gpa: std.mem.Allocator, list: *std.ArrayList(u8), ps: Psched) EncodeError!void {
+    if (r.iif) |v| try codec.appendAttrU32(gpa, list, TCA_ROUTE4.IIF, v);
+    if (r.from) |v| try codec.appendAttrU32(gpa, list, TCA_ROUTE4.FROM, v);
+    if (r.to) |v| try codec.appendAttrU32(gpa, list, TCA_ROUTE4.TO, v);
+    if (r.classid) |c| try codec.appendAttrU32(gpa, list, TCA_ROUTE4.CLASSID, c.raw);
+    try action.appendActionList(gpa, list, TCA_ROUTE4.ACT, r.actions, ps);
+}
+
+pub fn parseRoute4Options(data: []const u8) codec.Error!Route4Wire {
+    var w: Route4Wire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_ROUTE4.CLASSID => if (a.data.len == 4) {
+            w.classid = Handle.fromRaw(std.mem.readInt(u32, a.data[0..4], native_endian));
+        },
+        TCA_ROUTE4.TO => w.to = readScalar(u32, a.data, native_endian),
+        TCA_ROUTE4.FROM => w.from = readScalar(u32, a.data, native_endian),
+        TCA_ROUTE4.IIF => w.iif = readScalar(u32, a.data, native_endian),
+        else => {},
+    };
+    return w;
+}
+
+// ── basic ───────────────────────────────────────────────────────────────────
+
+/// `TCA_BASIC_*`.
+pub const TCA_BASIC = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const CLASSID: u16 = 1;
+    pub const EMATCHES: u16 = 2;
+    pub const ACT: u16 = 3;
+    pub const POLICE: u16 = 4;
+};
+
+/// The ematch classifier (`tc filter add … basic match 'cmp(…)' classid
+/// 1:10`): a tree of extended matches, flat here (joined by `EM_FLAG.REL_*`).
+pub const Basic = struct {
+    ematches: []const Ematch = &.{},
+    classid: ?Handle = null,
+    actions: []const ActionSpec = &.{},
+};
+
+pub const BasicWire = struct {
+    classid: ?Handle = null,
+    ematches: EmatchTreeWire = .{},
+};
+
+fn appendBasicOptions(b: Basic, gpa: std.mem.Allocator, list: *std.ArrayList(u8), ps: Psched) EncodeError!void {
+    try appendEmatchTree(gpa, list, TCA_BASIC.EMATCHES, b.ematches);
+    try action.appendActionList(gpa, list, TCA_BASIC.ACT, b.actions, ps);
+    if (b.classid) |c| try codec.appendAttrU32(gpa, list, TCA_BASIC.CLASSID, c.raw);
+}
+
+pub fn parseBasicOptions(data: []const u8) codec.Error!BasicWire {
+    var w: BasicWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_BASIC.CLASSID => if (a.data.len == 4) {
+            w.classid = Handle.fromRaw(std.mem.readInt(u32, a.data[0..4], native_endian));
+        },
+        TCA_BASIC.EMATCHES => w.ematches = try parseEmatchTree(a.data),
+        else => {},
+    };
+    return w;
+}
+
+// ── cgroup ──────────────────────────────────────────────────────────────────
+
+/// `TCA_CGROUP_*`.
+pub const TCA_CGROUP = struct {
+    pub const UNSPEC: u16 = 0;
+    pub const ACT: u16 = 1;
+    pub const POLICE: u16 = 2;
+    pub const EMATCHES: u16 = 3;
+};
+
+/// The cgroup classifier (`tc filter add … cgroup [match …]`): matches the
+/// packet's net_cls cgroup, with optional extended matches and actions.
+pub const Cgroup = struct {
+    ematches: []const Ematch = &.{},
+    actions: []const ActionSpec = &.{},
+};
+
+pub const CgroupWire = struct {
+    ematches: EmatchTreeWire = .{},
+};
+
+fn appendCgroupOptions(c: Cgroup, gpa: std.mem.Allocator, list: *std.ArrayList(u8), ps: Psched) EncodeError!void {
+    try appendEmatchTree(gpa, list, TCA_CGROUP.EMATCHES, c.ematches);
+    try action.appendActionList(gpa, list, TCA_CGROUP.ACT, c.actions, ps);
+}
+
+pub fn parseCgroupOptions(data: []const u8) codec.Error!CgroupWire {
+    var w: CgroupWire = .{};
+    var it: codec.AttrIterator = .{ .buf = data };
+    while (try it.next()) |a| switch (a.type) {
+        TCA_CGROUP.EMATCHES => w.ematches = try parseEmatchTree(a.data),
+        else => {},
+    };
+    return w;
 }
 
 // ── the filter spec ─────────────────────────────────────────────────────────
@@ -1213,7 +1626,8 @@ pub const EncodeError = std.mem.Allocator.Error || action.EncodeError || error{
     PortWithoutProto,
     /// A pre-encoded `raw` payload longer than one netlink attribute.
     OptionsTooLong,
-    /// A `Bpf` program with no instructions or more than `bpf_max_insns`.
+    /// A `Bpf` with neither instructions nor an fd, with both, or with more than
+    /// `bpf_max_insns` instructions.
     BadBpfProgram,
 };
 
@@ -1223,6 +1637,10 @@ pub const FilterSpec = union(enum) {
     flower: Flower,
     matchall: Matchall,
     bpf: Bpf,
+    fw: Fw,
+    route: Route4,
+    basic: Basic,
+    cgroup: Cgroup,
     raw: qdisc.Raw,
 
     pub fn kind(self: FilterSpec) []const u8 {
@@ -1231,6 +1649,10 @@ pub const FilterSpec = union(enum) {
             .flower => "flower",
             .matchall => "matchall",
             .bpf => "bpf",
+            .fw => "fw",
+            .route => "route",
+            .basic => "basic",
+            .cgroup => "cgroup",
             .raw => |r| r.kind,
         };
     }
@@ -1262,6 +1684,10 @@ pub const FilterSpec = union(enum) {
             .flower => |f| try appendFlowerOptions(f, gpa, list, ps),
             .matchall => |m| try appendMatchallOptions(m, gpa, list, ps),
             .bpf => |b| try appendBpfOptions(b, gpa, list, ps),
+            .fw => |x| try appendFwOptions(x, gpa, list, ps),
+            .route => |x| try appendRoute4Options(x, gpa, list, ps),
+            .basic => |x| try appendBasicOptions(x, gpa, list, ps),
+            .cgroup => |x| try appendCgroupOptions(x, gpa, list, ps),
             .raw => |r| {
                 if (r.options.len > std.math.maxInt(u16)) return error.OptionsTooLong;
                 try list.appendSlice(gpa, r.options);
@@ -1305,6 +1731,11 @@ pub const Filter = struct {
     matchall: ?MatchallWire = null,
     /// Decoded bpf options, when `kind() == "bpf"`.
     bpf: ?BpfWire = null,
+    /// Decoded `fw`, `route`, `basic` and `cgroup` options.
+    fw: ?FwWire = null,
+    route: ?Route4Wire = null,
+    basic: ?BasicWire = null,
+    cgroup: ?CgroupWire = null,
     /// The decoded action list, capped at `action.max_actions_decoded`
     /// entries (`act_list.total` reports the true count). Reach it through
     /// `actions()`.
@@ -1325,6 +1756,9 @@ pub const Filter = struct {
         if (f.flower) |fl| return fl.classid;
         if (f.matchall) |m| return m.classid;
         if (f.bpf) |b| return b.classid;
+        if (f.fw) |x| return x.classid;
+        if (f.route) |x| return x.classid;
+        if (f.basic) |x| return x.classid;
         return null;
     }
 };
@@ -1363,6 +1797,14 @@ pub fn parseFilter(payload: []const u8) codec.Error!Filter {
             f.matchall = try parseMatchallOptions(opt);
         } else if (std.mem.eql(u8, k, "bpf")) {
             f.bpf = try parseBpfOptions(opt);
+        } else if (std.mem.eql(u8, k, "fw")) {
+            f.fw = try parseFwOptions(opt);
+        } else if (std.mem.eql(u8, k, "route")) {
+            f.route = try parseRoute4Options(opt);
+        } else if (std.mem.eql(u8, k, "basic")) {
+            f.basic = try parseBasicOptions(opt);
+        } else if (std.mem.eql(u8, k, "cgroup")) {
+            f.cgroup = try parseCgroupOptions(opt);
         }
         if (actionAttrId(k)) |act_id| {
             var ait: codec.AttrIterator = .{ .buf = opt };
@@ -1383,8 +1825,10 @@ fn actionAttrId(kind: []const u8) ?u16 {
     if (std.mem.eql(u8, kind, "flower")) return TCA_FLOWER.ACT;
     if (std.mem.eql(u8, kind, "matchall")) return TCA_MATCHALL.ACT;
     if (std.mem.eql(u8, kind, "bpf")) return TCA_BPF.ACT;
-    // basic/fw place their action list at an attribute of their own enum; not
-    // modelled, so no guessing here.
+    if (std.mem.eql(u8, kind, "fw")) return TCA_FW.ACT;
+    if (std.mem.eql(u8, kind, "route")) return TCA_ROUTE4.ACT;
+    if (std.mem.eql(u8, kind, "basic")) return TCA_BASIC.ACT;
+    if (std.mem.eql(u8, kind, "cgroup")) return TCA_CGROUP.ACT;
     return null;
 }
 
