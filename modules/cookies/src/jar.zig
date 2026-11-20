@@ -394,16 +394,26 @@ pub const Jar = struct {
         return j.clock;
     }
 
+    /// Drop every expired cookie in one pass (a compaction: `orderedRemove`
+    /// per entry was O(n^2) with a raised `max_cookies`; no-panic sweep
+    /// 2026-10-28, C-5). Order of the rest is kept.
+    fn purgeExpired(j: *Jar, now: i64) void {
+        var w: usize = 0;
+        for (j.entries.items) |e| {
+            if (e.expired(now)) {
+                j.gpa.free(e.buf);
+            } else {
+                j.entries.items[w] = e;
+                w += 1;
+            }
+        }
+        j.entries.items.len = w;
+    }
+
     /// §6.1 limits: expired cookies first, then the least recently used --
     /// within the domain that grew, then across the jar.
     fn evict(j: *Jar, domain: []const u8, now: i64) void {
-        var i: usize = 0;
-        while (i < j.entries.items.len) {
-            if (j.entries.items[i].expired(now)) {
-                j.gpa.free(j.entries.items[i].buf);
-                _ = j.entries.orderedRemove(i);
-            } else i += 1;
-        }
+        j.purgeExpired(now);
         while (true) {
             var n: usize = 0;
             var lru: ?usize = null;
@@ -438,29 +448,28 @@ pub const Jar = struct {
         defer j.mutex.unlock();
         // Drop the expired first: removing while picking would shift the
         // indices already picked.
-        var i: usize = 0;
-        while (i < j.entries.items.len) {
-            if (j.entries.items[i].expired(now)) {
-                j.gpa.free(j.entries.items[i].buf);
-                _ = j.entries.orderedRemove(i);
-            } else i += 1;
-        }
+        j.purgeExpired(now);
         var picked_buf: [256]u32 = undefined;
         var picked: std.ArrayList(u32) = .initBuffer(&picked_buf);
-        for (j.entries.items, 0..) |*e, k| {
+        const entries = j.entries.items;
+        for (entries, 0..) |*e, k| {
             const domain_ok = if (e.host_only) std.mem.eql(u8, host, e.domain) else domainMatch(host, e.domain);
             if (domain_ok and pathMatch(url.path, e.path) and (secure_ok or !e.secure)) {
-                picked.appendBounded(@intCast(k)) catch break;
+                picked.appendBounded(@intCast(k)) catch {
+                    // Full: keep the 256 that §5.4 sends first (longest path,
+                    // then oldest), not the first 256 stored (no-panic sweep
+                    // 2026-10-28, C-4). The last in order makes room if the
+                    // new one sorts before it.
+                    var worst: usize = 0;
+                    for (picked.items, 0..) |pk, n| {
+                        if (sendsBefore(entries, picked.items[worst], pk)) worst = n;
+                    }
+                    if (sendsBefore(entries, @intCast(k), picked.items[worst])) picked.items[worst] = @intCast(k);
+                };
             }
         }
         if (picked.items.len == 0) return false;
-        const entries = j.entries.items;
-        std.sort.pdq(u32, picked.items, entries, struct {
-            fn lt(es: []Entry, a: u32, b: u32) bool {
-                if (es[a].path.len != es[b].path.len) return es[a].path.len > es[b].path.len;
-                return es[a].created < es[b].created;
-            }
-        }.lt);
+        std.sort.pdq(u32, picked.items, @as([]const Entry, entries), sendsBefore);
         try w.writeAll(prefix);
         for (picked.items, 0..) |k, n| {
             if (n > 0) try w.writeAll("; ");
@@ -468,6 +477,12 @@ pub const Jar = struct {
             entries[k].used = j.tick();
         }
         return true;
+    }
+
+    /// §5.4 step 2 order: longer path first, then earlier creation.
+    fn sendsBefore(es: []const Entry, a: u32, b: u32) bool {
+        if (es[a].path.len != es[b].path.len) return es[a].path.len > es[b].path.len;
+        return es[a].created < es[b].created;
     }
 
     fn clockNow(j: *Jar) i64 {
@@ -1119,6 +1134,62 @@ test "writeCookiesAt: the prefix, and nothing at all when no cookie applies" {
     var w2: std.Io.Writer = .fixed(&buf);
     try testing.expect(!try j.writeCookiesAt(u("http://b.test/"), t0, &w2, "Cookie: "));
     try testing.expectEqual(@as(usize, 0), w2.buffered().len);
+}
+
+test "writeCookiesAt: with more than 256 matches the 256 first in section 5.4 order are sent, not the first stored" {
+    var j = Jar.init(testing.allocator, undefined, .{ .max_cookies = 1000, .max_per_domain = 1000 });
+    defer j.deinit();
+    var line: [64]u8 = undefined;
+    // 260 root-path cookies stored first (oldest), then 5 deeper ones.
+    for (0..260) |n| try j.setCookieAt(u("http://a.test/"), try std.fmt.bufPrint(&line, "r{d:0>3}=1; Path=/", .{n}), t0);
+    for (0..5) |n| try j.setCookieAt(u("http://a.test/"), try std.fmt.bufPrint(&line, "d{d}=1; Path=/deep/x", .{n}), t0);
+    // Stored last, longest path of all, yet it must make the cut.
+    try j.setCookieAt(u("http://a.test/"), "z=1; Path=/deep/x/y", t0);
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expect(try j.writeCookiesAt(u("http://a.test/deep/x/y/z"), t0, &w, ""));
+    const out = w.buffered();
+    try testing.expectEqual(@as(usize, 255), std.mem.count(u8, out, "; "));
+    try testing.expect(std.mem.startsWith(u8, out, "z=1; d0=1; d1=1; d2=1; d3=1; d4=1; r000=1; r001=1; "));
+    // The 250 oldest root cookies make it, the 10 youngest do not.
+    try testing.expect(std.mem.endsWith(u8, out, "; r249=1"));
+    try testing.expect(std.mem.indexOf(u8, out, "r250") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "r259") == null);
+}
+
+test "writeCookiesAt: a match later in storage that sorts earlier than the last picked replaces only that one" {
+    var j = Jar.init(testing.allocator, undefined, .{ .max_cookies = 1000, .max_per_domain = 1000 });
+    defer j.deinit();
+    var line: [64]u8 = undefined;
+    for (0..256) |n| try j.setCookieAt(u("http://a.test/"), try std.fmt.bufPrint(&line, "r{d:0>3}=1; Path=/", .{n}), t0);
+    // One more root cookie, younger than all 256: loses.
+    try j.setCookieAt(u("http://a.test/"), "late=1; Path=/", t0);
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expect(try j.writeCookiesAt(u("http://a.test/"), t0, &w, ""));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "late") == null);
+    try testing.expect(std.mem.endsWith(u8, w.buffered(), "; r255=1"));
+}
+
+test "expired cookies are purged in one pass: the survivors keep their order and nothing leaks" {
+    var j = Jar.init(testing.allocator, undefined, .{ .max_cookies = 1000, .max_per_domain = 1000 });
+    defer j.deinit();
+    var line: [64]u8 = undefined;
+    for (0..40) |n| {
+        const life: u32 = if (n % 3 == 0) 10 else 1000;
+        try j.setCookieAt(u("http://a.test/"), try std.fmt.bufPrint(&line, "c{d:0>2}=1; Max-Age={d}", .{ n, life }), t0);
+    }
+    try testing.expectEqual(@as(usize, 40), j.count());
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expect(try j.writeCookiesAt(u("http://a.test/"), t0 + 100, &w, ""));
+    try testing.expectEqual(@as(usize, 26), j.count());
+    try testing.expect(std.mem.startsWith(u8, w.buffered(), "c01=1; c02=1; c04=1; c05=1; "));
+    try testing.expect(std.mem.endsWith(u8, w.buffered(), "; c37=1; c38=1"));
+    // Everything expired: the jar empties and a request has no Cookie header.
+    var w2: std.Io.Writer = .fixed(&buf);
+    try testing.expect(!try j.writeCookiesAt(u("http://a.test/"), t0 + 5000, &w2, ""));
+    try testing.expectEqual(@as(usize, 0), j.count());
 }
 
 test "cookieJar: Set-Cookie lines are stored whatever their case, other headers are not, and the clock is in seconds" {
