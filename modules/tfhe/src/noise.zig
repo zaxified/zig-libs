@@ -58,7 +58,7 @@ inline fn maskOf(c: bool) u64 {
 /// asm hides from LLVM that the mask is `0` or all-ones. Without it LLVM
 /// recognised `(a & m) | (b & ~m)` as a select of two `f64`s and, x86 having
 /// no `f64` cmov, lowered it to a `jbe` around the multiply — measured by
-/// `ctgrind_harness.zig`'s `noise` target (4 contexts, 2026-10-02) and
+/// `ctgrind_harness.zig`'s `noise` target (4 contexts) and
 /// confirmed in the disassembly. No-op at runtime.
 inline fn blackBox(x: u64) u64 {
     if (@inComptime()) return x;

@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: MIT
 
-//! harness_test — the anti-self-consistency verification harness, written
-//! when TFHE gate bootstrapping had no external byte-exact anchor here (one
-//! exists since 2026-10-02: `interop_test.zig` against tfhe-rs). It keeps
-//! guarding the `toy` set on three fronts:
+//! harness_test — the anti-self-consistency verification harness for the
+//! `toy` set. `interop_test.zig` is the external byte-exact anchor (against
+//! tfhe-rs); this file guards on three further fronts:
 //!
 //!   1. A NOISELESS cleartext blind-rotation oracle (`clearBootstrap`) that pins
 //!      the LUT construction + modulus-switch + rotation indexing WITHOUT the
-//!      gated core — the exact place off-by-one/​sign bugs hide.
-//!   2. Deliberately-broken POSITIVE CONTROLS that PASS today (teeth before the
-//!      core exists): a sign-dropped sample extraction, a dropped-level gadget
-//!      decomposition, and a wrong-sign rotation — each is shown to give the
-//!      WRONG answer while the real primitive gives the right one.
-//!   3. Core-dependent end-to-end anchors (SKIP-gated until the core lands): a
-//!      programmable gate (identity refresh / NOT / 2-input AND), an
+//!      bootstrapping core — the exact place off-by-one/​sign bugs hide.
+//!   2. Deliberately-broken POSITIVE CONTROLS (teeth): a sign-dropped sample
+//!      extraction, a dropped-level gadget decomposition, and a wrong-sign
+//!      rotation — each is shown to give the WRONG answer while the real
+//!      primitive gives the right one.
+//!   3. Core-dependent end-to-end anchors (gated on `gate.fable_core_implemented`,
+//!      `true`): a programmable gate (identity refresh / NOT / 2-input AND), an
 //!      UNLIMITED-DEPTH bootstrap chain, a corrupted-bootstrap-key control, and
 //!      an output-noise-budget assertion.
 

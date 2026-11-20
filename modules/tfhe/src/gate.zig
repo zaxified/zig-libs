@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: MIT
 
-//! gate — the single switch that turns on the tests exercising this module's
-//! gated **Fable core**: the programmable gate-bootstrapping arithmetic.
+//! gate — the switch for the tests that exercise the gate-bootstrapping
+//! arithmetic of this module.
 //!
 //! TFHE ships its ENTIRE mechanical layer REAL and tested — the negacyclic ring
 //! (`poly`), the signed gadget decomposition (`gadget`), torus (de)coding and
 //! modulus switching (`torus`), and, in `tfhe.zig`, LWE/GLWE/GGSW keygen /
 //! encrypt / decrypt, bootstrap-key and key-switch-key generation, sample
 //! extraction, LWE key switching, and the cleartext LUT + rotation reference
-//! (`clearBootstrap`). The four irreducible, soundness-bearing functions are
-//! scaffolded behind this flag:
+//! (`clearBootstrap`). The four soundness-bearing functions behind this flag are:
 //!
 //!   • `externalProduct` (GGSW ⊠ GLWE) — decompose the input GLWE and dot with
 //!     the GGSW rows; the noise-growth heart of TFHE.
@@ -21,25 +20,22 @@
 //!     producing a FRESH low-noise LWE encrypting the programmed LUT of the
 //!     input. This is what makes depth unbounded.
 //!
-//! When this flag was introduced there was no external byte-exact KAT for
-//! these, so a self-consistent-but-wrong core could pass a naive round-trip.
-//! Since 2026-10-02 there is one: `interop_test.zig` holds the bootstrap
-//! byte-identical to tfhe-rs's on tfhe-rs's own keys and ciphertexts. The harness defends with: a mechanical
-//! cleartext blind-rotation oracle (`clearBootstrap`) that pins the LUT +
-//! rotation indexing WITHOUT the core; deliberately-broken positive controls
-//! (wrong sample-extract sign, dropped-level gadget, wrong rotation sign) that
-//! PASS today; and — once this flag flips — an unlimited-depth bootstrap chain,
-//! a corrupted-bootstrap-key control, and an output-noise-budget assertion.
+//! `interop_test.zig` holds the bootstrap byte-identical to tfhe-rs's on
+//! tfhe-rs's own keys and ciphertexts, the external anchor a self-consistent-
+//! but-wrong core cannot pass. The harness (`harness_test.zig`) adds a
+//! mechanical cleartext blind-rotation oracle (`clearBootstrap`) that pins the
+//! LUT + rotation indexing WITHOUT the core; deliberately-broken positive
+//! controls (wrong sample-extract sign, dropped-level gadget, wrong rotation
+//! sign); an unlimited-depth bootstrap chain, a corrupted-bootstrap-key
+//! control, and an output-noise-budget assertion.
 //!
-//! While `false`, the four cores `@panic` and the dependent tests report SKIP
-//! (a skip is NOT a green light) — the same convention as `bfv`/`fss`/`coconut`.
-//! **The flag is now `true`**: the four cores are implemented for real (no
-//! `@panic` remains) and every previously SKIP-gated test — the programmable
-//! gate, the 2-input AND, the unlimited-depth bootstrap chain, the
-//! corrupted-bootstrap-key control, and the noise-budget assertion — runs and
-//! passes, with no skips.
+//! The flag is `true`: the four cores are implemented, and every gated test —
+//! the programmable gate, the 2-input AND, the unlimited-depth bootstrap
+//! chain, the corrupted-bootstrap-key control, and the noise-budget
+//! assertion — runs and passes. Were it `false`, the dependent tests would
+//! report SKIP (a skip is NOT a green light), the same convention as
+//! `bfv`/`fss`/`coconut`.
 
-/// The genuine Fable core: externalProduct / cmux / blindRotate / bootstrap.
-/// IMPLEMENTED — see this file's module doc comment and `tfhe.zig`'s
-/// "Fable core" section.
+/// The bootstrapping core: externalProduct / cmux / blindRotate / bootstrap.
+/// Implemented — see this file's module doc comment.
 pub const fable_core_implemented = true;

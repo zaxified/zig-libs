@@ -7,9 +7,9 @@
 //! fixed-trip loops over `sampleBit`, `gadget.decompose` branches only on
 //! ciphertext coefficients and never on key material) and says plainly that
 //! no timing measurement backed any of it. This file is that measurement.
-//! Run through `../../../scripts/checks/ctgrind.sh tfhe` once the coordinator wires
-//! the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries suggested at the bottom of
-//! this comment — until then, drive it directly:
+//! Run through `../../../scripts/checks/ctgrind.sh tfhe` (targets `keygen`,
+//! `encrypt`, `decrypt`, `bootstrap`, `noise`; the script passes the
+//! `--max-stackframe` flag below). To drive it directly:
 //!
 //!     zig build ctgrind -Dctgrind-module=tfhe -Dctgrind-valgrind=true -Doptimize=ReleaseFast
 //!     valgrind --tool=memcheck --error-exitcode=99 --num-callers=20 \
@@ -78,14 +78,14 @@
 //!     drives the REAL `bootstrap`: mod-switch → `blindRotate`'s `n`
 //!     CMux/`externalProduct` steps over the now-tainted bootstrap key →
 //!     sample-extract → key-switch through the now-tainted key-switch key.
-//!     Since 2026-10-02 that is `PreparedBootstrapKey.bootstrap`, the NTT-
+//!     That is `PreparedBootstrapKey.bootstrap`, the NTT-
 //!     domain path a server evaluates with (`boolean.ServerKey`).
 //!     The ciphertext being bootstrapped is built from an UNTAINTED copy of
 //!     the SAME key, so `a_tilde`/`b_tilde` (blindRotate's rotation
 //!     exponents) stay public data throughout — see below for why that
 //!     separation is exactly what the module's own design makes true.
 //!
-//!   * `noise` (2026-10-02) — the Gaussian sampler (`noise.zig`). REAL keys;
+//!   * `noise` — the Gaussian sampler (`noise.zig`). REAL keys;
 //!     the ENCRYPTION entropy of one `lweEncrypt` and one `glweEncrypt` is
 //!     tainted at the source, so every Box–Muller input is undefined. The
 //!     encrypt target above deliberately leaves this entropy clean (it is
@@ -151,7 +151,7 @@
 //!      — an address COMPARISON feeding a real jump, not a memory-address
 //!      computation — on data that traces back to the GLWE/LWE secret key,
 //!      not merely to a value the output discloses anyway: **class 1**.
-//!      **Fixed 2026-10-02:** `ntt.zig`'s `mask()` now launders the mask
+//!      **Fixed:** `ntt.zig`'s `mask` now launders the mask
 //!      through an inline-asm `blackBox`, so LLVM can no longer see that it is
 //!      two-valued and keeps every site a mask. `decrypt` went from 10 in-file
 //!      contexts to 0 and `bootstrap` from 39 (prepared path) / ≤186 to 0; the
@@ -170,7 +170,7 @@
 //!      diamond into a branch-free select despite the plain `if` in source.
 //!      Not a finding against the module — the opposite of one — but
 //!      reported as measured rather than assumed, symmetrically with (1).
-//!      (Since 2026-10-02 `gadget.decompose` is branch-free in source too: it
+//!      (`gadget.decompose` is branch-free in source too: it
 //!      reproduces tfhe-rs's digit rule with shifts and masks.)
 //!
 //! `mulSchoolbook`'s fallback `if (k < N)` branches only on the LOOP INDEX
@@ -502,34 +502,3 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
     }
 }
-
-// ── suggested scripts/checks/ctgrind.sh entries (coordinator wires these) ─────────
-//
-// ⚠⚠ `run_one`'s valgrind invocation needs `--max-stackframe=16777216` added
-// for `tfhe` specifically (see trap 3 above) -- wiring TARGETS/MODES/PATTERN
-// below WITHOUT that flag reproduces this pass's ~7000-error false-positive
-// flood on every single row, on every target including `keygen`.
-//
-// declare -A TARGETS+=( [tfhe]="keygen encrypt decrypt bootstrap noise" )
-// declare -A MODES+=(   [tfhe]="ReleaseFast" )
-// declare -A PATTERN+=(
-//     [tfhe/keygen]='tfhe[.]zig'
-//     [tfhe/encrypt]='tfhe[.]zig'
-//     [tfhe/decrypt]='tfhe[.]zig|torus[.]zig|poly[.]zig|ntt[.]zig'
-//     [tfhe/bootstrap]='tfhe[.]zig|gadget[.]zig|poly[.]zig|torus[.]zig|ntt[.]zig'
-//     [tfhe/noise]='noise[.]zig|tfhe[.]zig'
-// )
-// declare -A LABEL+=(
-//     [tfhe/keygen]='tfhe lweKeyGen/glweKeyGen sampleBit (RNG entropy)'
-//     [tfhe/encrypt]='tfhe lweEncrypt/glweEncrypt plaintext mu/msg'
-//     [tfhe/decrypt]='tfhe lweDecryptBit/lwePhase/glwePhase secret key -> ntt.zig ring mul'
-//     [tfhe/bootstrap]='tfhe bootstrap: blindRotate+cmux+externalProduct+keySwitch, bsk/ksk from tainted LWE+GLWE key'
-//     [tfhe/noise]='tfhe Gaussian sampler (encryption entropy)'
-// )
-// No per-module WITNESS override needed -- the global `Writer[.]zig|Format[.]zig|fmt[.]zig`
-// already covers this harness's `std.debug.print` propagation-proof calls.
-// ⚠ `bootstrap`'s claim row hits memcheck's own 10-million-error cap
-// ("More than 10000000 total errors detected. I'm not reporting any more.")
-// -- `scripts/checks/ctgrind.sh`'s existing `log_hit_error_limit`/`accounted=2`
-// convention for a truncated log already covers this; it needs no new code,
-// only for whoever reads the row to expect `accounted=2`, not 1.

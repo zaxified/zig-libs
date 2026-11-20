@@ -27,8 +27,7 @@
 //! reproduces the dimensions, the gadgets, the binary key distribution and the
 //! Gaussian error widths, and the interop test shows the two implementations
 //! agree on what the parameters mean. tfhe-rs's boolean parameter page
-//! (`docs/references/fine-grained-apis/boolean/parameters.md`, read
-//! 2026-10-02) states "the standard security of 128 bits", an error
+//! (`docs/references/fine-grained-apis/boolean/parameters.md`, read) states "the standard security of 128 bits", an error
 //! probability of at most `2^-64` for the default set and `2^-165` for the
 //! `…_2_POW_MINUS_165` set; it states nothing separate for `TFHE_LIB_PARAMETERS`,
 //! which exists for compatibility with the original library.

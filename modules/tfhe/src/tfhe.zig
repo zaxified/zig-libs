@@ -79,8 +79,7 @@
 //! mechanical: **Zig analyses a callee through its caller.** An `lweKeyGen`
 //! whose body called `lweKeyGenForTest` would drag the guard's `@compileError`
 //! in with it and fail to compile in exactly the non-test build it exists to
-//! serve. That is not hypothetical; it is what this module shipped until
-//! 2026-08-13, invisible to CI because `builtin.is_test` is true for the whole
+//! serve. That is not hypothetical; it is what this module shipped, invisible to CI because `builtin.is_test` is true for the whole
 //! of `zig build test-tfhe`, so the deny branch never compiled.
 //!
 //! Hence the shape below: a PRIVATE `…Inner(…, random: std.Random)` holds the
