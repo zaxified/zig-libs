@@ -11,11 +11,11 @@
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -34,22 +34,22 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 }
 
 /// Raw CBC `encrypt`/`decrypt` (key schedule + block loop) on the data path.
-/// Measured 2026-10-16 in ReleaseFast (`stackprobe_test.zig`): the one-shot
+/// Measured in ReleaseFast (`stackprobe_test.zig`): the one-shot
 /// AES-256 decrypt dirties 959 B (512 left residue to 959 B); was 4 KiB, a
 /// first guess that cost ~80 ns per call.
 pub const cbc_burn = 1024;
 
 /// `Encryptor`/`Decryptor` `initInto`: the key schedule alone (measured clean
-/// at 512 B, 2026-10-16).
+/// at 512 B).
 pub const schedule_burn = 512;
 
 /// `Encryptor`/`Decryptor` `update`: the block loop over round keys held in
 /// the caller's struct (no key bytes in this frame, only plaintext blocks;
-/// measured clean at 512 B, 2026-10-16, on the native CPU; at CI's
+/// measured clean at 512 B,, on the native CPU; at CI's
 /// `-Dcpu=x86_64_v3+aes+pclmul+adx` `Decryptor(Aes256).update` reaches 719 B
-/// from a burn top of 175 B, 2026-10-17 -- hence 1 KiB).
+/// from a burn top of 175 B, -- hence 1 KiB).
 pub const update_burn = 1024;
 
 /// `encryptCts`/`decryptCts`: the one-shot body plus the stolen tail's two
-/// blocks (decryptCts measured 1359 B deep at a 1024 B burn, 2026-10-16).
+/// blocks (decryptCts measured 1359 B deep at a 1024 B burn).
 pub const cts_burn = 1536;

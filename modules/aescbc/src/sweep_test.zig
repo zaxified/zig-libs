@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! No-panic sweep tests (wave GU, gu-a). Every test name ends with its finding
-//! ID; sweep: the 2026-10-29 no-panic sweep of `aescbc`.
+//! ID; sweep: the no-panic sweep of `aescbc`.
 
 const std = @import("std");
 const testing = std.testing;

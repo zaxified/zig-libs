@@ -6,7 +6,7 @@
 //!
 //! ## Why this module has a harness at all
 //!
-//! The 2026-09-09 ctgrind coverage pass filed `aescbc` as a "thin wrapper over
+//! The ctgrind coverage pass filed `aescbc` as a "thin wrapper over
 //! std" — hand the key to `std.crypto.core.aes`, measure nothing of our own —
 //! and that was wrong. `unpadPkcs7` and `unpadXmlEnc` strip padding from a
 //! JUST-DECRYPTED buffer, so the length byte `N` they read is secret-derived,
@@ -146,7 +146,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 /// One out-of-line body PER stripper (a distinct instance per `unpad`), with
 /// the stripper inlined into it exactly as a caller would get it.
 ///
-/// ⛔ Why not one `switch` in `main` (the shape until 2026-10-18): zig 0.17
+/// ⛔ Why not one `switch` in `main` (the shape previously): zig 0.17
 /// inlined all five strippers into `main` and TAIL-MERGED `unpadPkcs7`'s and
 /// `unpadAnsiX923`'s identical `test` / `jne reject` into one instruction. A
 /// merged instruction has no single source line, so DWARF reported it at

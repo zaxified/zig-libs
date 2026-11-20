@@ -14,7 +14,7 @@
 //! **AES-192:** std 0.16 has no `Aes192`; pass the `aes192` module's
 //! `Aes192` (same declarations as std's two). This module is comptime-generic
 //! over the cipher type, so it needed no code change for it — only the
-//! SP800-38A F.2.3/F.2.4 KATs (2026-10-10).
+//! SP800-38A F.2.3/F.2.4 KATs.
 //!
 //! See SPEC.md for the padding-oracle caveat and which consumer uses which
 //! padding scheme.
@@ -59,7 +59,7 @@ pub const PaddingError = error{InvalidPadding};
 /// Encrypt `plaintext` (must be `block_len`-aligned) into `out` under raw
 /// CBC: `C[0] = E(P[0] XOR IV)`, `C[i] = E(P[i] XOR C[i-1])`. `Aes` is
 /// `std.crypto.core.aes.Aes128`/`Aes256` or `aes192.Aes192`; `key` points to
-/// `[Aes.key_bits / 8]u8` (BREAKING 2026-10-09: by pointer, so no key copy is
+/// `[Aes.key_bits / 8]u8` (BREAKING: by pointer, so no key copy is
 /// left in the caller's frame; the body runs under a dead-stack burn). `out` must be at least `plaintext.len` bytes.
 /// No allocation. Returns the written length (== `plaintext.len`).
 /// Zeroization posture (CONVENTIONS §2.1): nothing here is wiped, deliberately.
@@ -835,7 +835,7 @@ const f_2_1_ciphertext = hex("7649abac8119b246cee98e9b12e9197d" ++
     "3ff1caa1681fac09120eca307586e1a7");
 
 // NIST SP800-38A Appendix F.2.3/F.2.4 — CBC-AES192.Encrypt/Decrypt (re-checked
-// against OpenSSL 3 `aes-192-cbc` when added, 2026-10-10).
+// against OpenSSL 3 `aes-192-cbc` when added).
 const f_2_3_key = hex("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b");
 const f_2_3_ciphertext = hex("4f021db243bc633d7178183a9fa071e8" ++
     "b4d9ada9ad7dedf4e5e738763f69145a" ++
@@ -983,7 +983,7 @@ test "PKCS#7 unpad rejects: pad length > block_len" {
     try testing.expectError(error.InvalidPadding, unpadPkcs7(&buf));
 }
 
-// Mutation run 2026-10-05: the test above also fails the byte comparison
+// Mutation run: the test above also fails the byte comparison
 // (only the last octet is 0x11), so the `n > block_len` check itself was
 // unpinned — relaxed to `n > 17`, a whole block of 0x11 unpadded to
 // `len - 16`. RFC 5652 §6.3: the pad length is 1..block_len.
@@ -1080,7 +1080,7 @@ test "XML-Enc unpad round-trip through real CBC encrypt/decrypt" {
 // specific, checkable claim about the buffer's *last byte* and (for PKCS#7)
 // every byte in the claimed pad — so the harness asserts that claim holds,
 // which is strictly stronger than surviving without a crash.
-// ⚠ Both halves of this harness were dead until 2026-09-07. It opened with
+// ⚠ Both halves of this harness were dead previously. It opened with
 //
 //     const len = smith.valueRangeAtMost(u16, 0, buf.len);
 //     smith.bytes(buf[0..len]);
@@ -1249,7 +1249,7 @@ test "decrypt: a message longer than one decryptWide group, in place, against th
 
 // RFC 3962 Appendix B (Kerberos AES-CTS = CS3): AES-128, key "chicken
 // teriyaki", IV 0, prefixes of one sentence. CS1 is OpenSSL 3.5.5's
-// `openssl enc -aes-128-cbc-cts -nopad` (its default `cts_mode`), 2026-10-16.
+// `openssl enc -aes-128-cbc-cts -nopad` (its default `cts_mode`),.
 const cts_key = "chicken teriyaki".*;
 const cts_msg = "I would like the General Gau's Chicken, please, and wonton soup.";
 const cts_vectors = blk: {
@@ -1331,7 +1331,7 @@ test "ISO/IEC 7816-4: pad layout, round trip, refusals" {
     try testing.expectEqual(@as(usize, 9), try unpadIso7816(&blk));
 }
 
-// The verdict moved behind `rejectIf`'s asm barrier (2026-10-18, zig 0.17 split
+// The verdict moved behind `rejectIf`'s asm barrier (zig 0.17 split
 // unpadIso7816's verdict into two jumps). The constant-time half is the ctgrind
 // row; this is the other half: the barrier changed no accept/reject decision
 // and no length, checked against a plain branchy reference on structured last
@@ -1570,7 +1570,7 @@ test {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
