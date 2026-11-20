@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe on the shared engine (`testkit.stackprobe`) for the entry
-//! points burned in the 2026-10-09 sweep: `Pke.keygen` (out form), `prng.Xof.init`
+//! points burned in the sweep: `Pke.keygen` (out form), `prng.Xof.init`
 //! and `prng.hashI`. (The KEM entry points stay covered by the older
 //! `stackprobe_test.zig`.) ReleaseFast only (`skipUnlessOptimized`).
 

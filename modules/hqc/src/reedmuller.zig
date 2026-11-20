@@ -207,7 +207,7 @@ pub fn RM(comptime p: params.Params) type {
         /// compiler inserts overflow checks on the `i16` arithmetic below, and
         /// their operands are secret-derived, so memcheck flags them: 48 at the
         /// `+=` accumulator and 14+14 at the Hadamard butterfly, measured
-        /// 2026-09-09 (`decaps` 94 contexts against ReleaseFast's 14).
+        /// (`decaps` 94 contexts against ReleaseFast's 14).
         ///
         /// Their OUTCOME cannot vary, for any input. `expanded[i]` is a sum of
         /// `multiplicity` values, each 0 or 1, and `rm_multiplicity` is 3

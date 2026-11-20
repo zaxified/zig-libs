@@ -33,7 +33,7 @@
 //!   `(K'[i] & result) ^ (K_bar[i] & ~result)` (reference's
 //!   `vect_compare`-based mask trick) — reproduced here bit-for-bit via
 //!   `ctCompare`, not a source-level `if`/`select`, so there is no
-//!   secret-dependent branch in the selection itself. ⭐ As of 2026-09-09 the
+//!   secret-dependent branch in the selection itself. ⭐ Now the
 //!   second half of that sentence is no longer a hope: `scripts/ctgrind.sh`
 //!   measures `decaps` under memcheck with the decapsulation key tainted, and
 //!   NEITHER `ctCompare` NOR this selection appears among the remaining
@@ -229,7 +229,7 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
             off += ek_bytes;
             // dk_pke and sigma are copies of the secret half of the
             // decapsulation key — H4: 0 `secureZero` calls in this module
-            // before 2026-09-10 left both on the stack after every decaps.
+            // previously left both on the stack after every decaps.
             var dk_pke: Pke.DecKey = dk[off..][0..params.seed_bytes].*;
             defer std.crypto.secureZero(u8, &dk_pke);
             off += params.seed_bytes;

@@ -6,7 +6,7 @@
 //!
 //! ## Why this file exists
 //!
-//! It was written 2026-09-09 to price ONE change: the `asm volatile` mask
+//! It was written to price ONE change: the `asm volatile` mask
 //! barrier in `prng.writeSupportToVector`. That barrier is what stops LLVM
 //! turning the module's masked scatter back into a secret-dependent branch
 //! (38 of `decaps`'s 52 ctgrind contexts, see `SPEC.md`), and it sits in the

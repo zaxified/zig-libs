@@ -9,11 +9,11 @@
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -33,7 +33,7 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 
 /// Burn sizes per parameter set (`security_bytes` 16 / 24 / 32), each above
 /// the body's measured depth; one size for all sets would make HQC-128 need
-/// the stack HQC-256 needs. Measured in ReleaseFast (2026-10-09, burns at
+/// the stack HQC-256 needs. Measured in ReleaseFast (burns at
 /// 64 B): HQC-128 keypair 40 / encaps 65 / decaps 95 KiB, HQC-256 124 / 203 /
 /// 283 KiB; HQC-192 sits between them (the probe covers all three sets).
 pub fn sizes(comptime security_bytes: usize) struct { keypair: usize, encaps: usize, decaps: usize } {

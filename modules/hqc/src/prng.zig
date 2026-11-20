@@ -287,8 +287,8 @@ pub fn sampleFixedWeightBiased(
     while (idx > 0) {
         idx -= 1;
         // ⛔ `found` is derived from the secret support, so the scan being
-        // early-exit-free was only half the property: `if (found) support[idx]
-        // = idx` still branched on it, measured 2026-09-09 as 3 of `decaps`'
+        // early-exit-free was only half the property: `if support[idx]
+        // = idx` still branched on it, measured as 3 of `decaps`'
         // contexts. Accumulate a mask and blend instead — same value written,
         // no decision taken on it. The reference's access pattern is unchanged.
         var found: u32 = 0;
@@ -307,7 +307,7 @@ pub fn sampleFixedWeightBiased(
 /// the reference exactly — this is secret-key/randomness material.
 ///
 /// ⛔⛔ THE MASK IS LAUNDERED, AND THE SOURCE BEING BRANCH-FREE IS NOT ENOUGH.
-/// `val |= btab & mask` has no `if` in it, and until 2026-09-09 that was the
+/// `val |= btab & mask` has no `if` in it, and previously that was the
 /// whole argument for calling this constant-time. It was wrong: LLVM
 /// recognises the select identity and rewrites it back into a branch that
 /// loads `bit_tab[k]` only on the taken path. Measured with ctgrind (memcheck,
@@ -513,7 +513,7 @@ test "sampleFixedWeightRejection rejects a draw equal to the threshold" {
     // larger value, or position t mod n = 0 is over-weighted and the support
     // differs from the reference's for such seeds. A draw of exactly t has
     // probability 2^-24, which no KAT reaches: this seed was found by search
-    // (2026-10-04) so that the stream's first 3-byte draw is t. The first
+    // so that the stream's first 3-byte draw is t. The first
     // support position must then come from the SECOND draw.
     const p = params.hqc128;
     var seed: [32]u8 = @splat(0);

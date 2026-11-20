@@ -348,7 +348,7 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         /// ⛔ The result is laundered through an empty inline-asm, and that is
         /// load-bearing. Written as above, LLVM recovers "this is `x != 0`" and
         /// re-introduces the branch the trick exists to avoid: measured
-        /// 2026-09-09, two contexts inside `computeErrorValues` (`:730`,
+        /// two contexts inside `computeErrorValues` (`:730`,
         /// `:765`), where `x` is `err[i]` and therefore secret. The barrier
         /// sits INSIDE the helper rather than at those two call sites on
         /// purpose — `fss`'s `xorMasked` compiled branch-free at two call sites
@@ -421,7 +421,7 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
                 // ⛔ Laundered for the same reason `maskNonzero` is: both inputs
                 // are comparisons on secret-derived values (`d`, the degrees),
                 // and LLVM turned this one back into a branch -- one context in
-                // `computeElp`, measured 2026-09-09. Everything downstream in
+                // `computeElp`, measured. Everything downstream in
                 // this loop selects through `mask12`, so one barrier here covers
                 // the whole Berlekamp-Massey update.
                 const mask12 = blackBox16(mask1 & mask2);

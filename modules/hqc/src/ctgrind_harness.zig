@@ -10,7 +10,7 @@
 //! `bit_tab[k]` only on the taken path. Adjudicated in the disassembly as real
 //! `je`/`jne`/`jb`, not the known `cmov` false positive (audit finding, 2026).
 //!
-//! ⭐ THE HARNESS DID ITS JOB ON 2026-09-09. The scatter is now behind an
+//! ⭐ THE HARNESS DID ITS JOB ON. The scatter is now behind an
 //! `asm volatile ("" : "+r" (mask))` barrier and the pinned counts moved
 //! `decaps` 52 → 14, `keygen` 26 → 4, `encaps` 33 → 6 — the rows went red on a
 //! FIX, which is exactly the direction this file was written to catch. What is

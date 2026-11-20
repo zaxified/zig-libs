@@ -163,7 +163,7 @@ test "implicit reject: corrupted ciphertext decaps returns a differing, determin
 // the only secret in that formula: a rejection key computed without it is
 // one anyone holding ek and c can compute. The tests above only require the
 // rejection value to differ from the real one and from sigma itself — the
-// 2026-10-04 mutation run dropped sigma from J and they stayed green.
+// mutation run dropped sigma from J and they stayed green.
 
 fn testRejectionKeyIsJ(comptime Kem: type, seed_val: u64) !void {
     var rng = std.Random.DefaultPrng.init(seed_val);
@@ -207,7 +207,7 @@ test "implicit reject: the rejection key is J(H(ek), sigma, c) over the received
 // suite above stayed 75/75 green, because the only corruption it ever tried
 // was a bit inside `u` (`corrupted[0]`) or inside `salt` (the last byte) --
 // never inside `v`. Demonstrated as a real IND-CCA2 break in the audit
-// record (`A1/hqc.md` H2, `repro/hqc/attack.zig`): a ciphertext with one bit
+// record (A1 audit H2, `repro/hqc/attack.zig`): a ciphertext with one bit
 // flipped inside `v` was accepted as genuine, recovering the real shared
 // secret, once the comparison no longer covered `v`. This test corrupts
 // several positions spread across EACH of the three ciphertext components
@@ -269,7 +269,7 @@ test "implicit reject: every ciphertext component (u, v, salt) is covered, not j
 // this one checked "differs from the real ss" and "is deterministic" --
 // both of which are ALSO true of `sigma` itself, so a mutant returning
 // `sigma` verbatim (i.e. leaking the long-term rejection secret on every
-// rejected decapsulation) passed 75/75. `A1/hqc.md` recommends, as the
+// rejected decapsulation) passed 75/75. A1 audit recommends, as the
 // cheap partial fix short of a full external anchor for `hashJ`: a test that
 // `K_bar` is not equal to any part of `dk`, and a test that it depends on
 // `ct`. Both below.

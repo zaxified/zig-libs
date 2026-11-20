@@ -13,18 +13,17 @@
 //! **`mul` follows the reference's algorithm, and it is not a style choice.**
 //! The reference computes a*b via a carryless polynomial multiply followed by
 //! a fixed-tap reduction (`gf_carryless_mul` + `gf_reduce`), and so does this
-//! module. It did not until 2026-09-09: it multiplied via the `exp`/`log`
-//! tables below (`exp[(log[a]+log[b]) mod 255]`), the textbook discrete-log
-//! approach, defended in this very comment as byte-exact.
+//! module. The textbook alternative multiplies via the `exp`/`log`
+//! tables below (`exp[(log[a]+log[b]) mod 255]`), which is byte-exact too but
+//! not constant-time, so it is not used for `mul`.
 //!
-//! ⛔⛔ **Byte-exact it was. Constant-time it was not, and no value test could
-//! have noticed.** `log[a]` indexes a 256-entry table with a SECRET byte, so
+//! ⛔⛔ **Byte-exact is not enough: a table multiply is not constant-time, and no
+//! value test can notice.** `log[a]` indexes a 256-entry table with a SECRET byte, so
 //! the cache line touched depends on the operand — the AES T-table class.
-//! Measured under memcheck on 2026-09-09 (`ctgrind_harness.zig`, `decaps`):
-//! four contexts at the old `gf256.zig:114`, reported as `Use of uninitialised
-//! value` at the LOAD, a different and worse kind than the `Conditional jump`
-//! everything else in this module produces. It was the only verified
-//! secret-indexed lookup in the whole repository. The equivalence argument
+//! Under memcheck (`ctgrind_harness.zig`, `decaps`) the table form
+//! reported `Use of uninitialised value` at the LOAD, a different and worse
+//! kind than the `Conditional jump` the rest of this module can produce; it
+//! would be the only secret-indexed lookup in the repository. The equivalence argument
 //! below is about the VALUE the two algorithms compute; what differed was the
 //! memory ACCESS PATTERN, which is invisible to every test that compares
 //! outputs — including the exhaustive 65536-pair one this file now carries.
@@ -55,7 +54,7 @@
 //! `pclmul`) — see that file's module doc for the same reasoning applied
 //! to the ambient ring instead of this field.
 //!
-//! **Why this is real (Sonnet), not Fable**: every operation here is a
+//! **Why this needs no design judgment**: every operation here is a
 //! closed-form, fully-specified finite-field primitive (table lookup or a
 //! short fixed addition chain) — there is no open algorithmic problem to
 //! solve, unlike the Reed-Solomon/Reed-Muller *decoders* (reedsolomon.zig
@@ -129,9 +128,9 @@ pub fn add(a: u8, b: u8) u8 {
     return a ^ b;
 }
 
-/// a * b in GF(2^8) — see this file's module doc for why a table lookup
-/// (not the reference's carryless-multiply) is used, and why the result
-/// is still byte-exact.
+/// a * b in GF(2^8) by the reference's carryless multiply and fixed-tap
+/// reduction, both under masks (no secret-indexed lookup) — see this file's
+/// module doc.
 pub fn mul(a: u8, b: u8) u8 {
     // Carryless multiply: eight masked shift-and-xor steps. `0 -% bit` is 0 or
     // 0xFFFF, so both arms of "add this shifted copy or don't" always execute.
@@ -152,7 +151,7 @@ pub fn mul(a: u8, b: u8) u8 {
 }
 
 /// a^2 in GF(2^8) (reference: `gf_square`, a bit-doubling-then-reduce
-/// shortcut this scaffold doesn't need — `mul(a, a)` is the same value).
+/// shortcut not needed here — `mul(a, a)` is the same value).
 pub fn square(a: u8) u8 {
     return mul(a, a);
 }
@@ -181,7 +180,7 @@ pub fn inverse(a: u8) u8 {
 
 test "mul/inverse are byte-exact against the exp/log tables (all 65536 pairs)" {
     // The tables stay in this file (reedsolomon.zig indexes them at PUBLIC
-    // positions), so the algorithm `mul` used until 2026-09-09 is still
+    // positions), so the algorithm `mul` used previously is still
     // available as an oracle. This is the direct equivalence proof for the
     // switch to a carryless multiply: same field, same product, for every
     // input pair — not a sample, and not an appeal to the field axioms.

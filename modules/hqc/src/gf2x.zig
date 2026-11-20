@@ -73,7 +73,7 @@ inline fn clmul64(a: u64, b: u64) [2]u64 {
 
 /// Karatsuba base-case threshold (in u64 limbs): at or below this the product
 /// is the direct O(L²)-CLMUL schoolbook, above it the recursion splits.
-/// A1 audit M4 (2026-09-16) timed 3, 4, 5, 6, 10, 12, 16, 20, 24 and 32
+/// A1 audit M4 timed 3, 4, 5, 6, 10, 12, 16, 20, 24 and 32
 /// against 8 on all three parameter sets: 5/6 were 1-3% faster on the
 /// multiply, which did not clear the noise at KEM level, and every other value
 /// was slower. So it stays 8. Any value gives the same product; only speed
@@ -100,7 +100,7 @@ fn karScratch(comptime len: usize) usize {
 ///     (i-1)+len — and assigns r[i+len], which no earlier row reached;
 ///   * rows 0..len-1 together therefore assign r[0 .. 2·len-1], all of `r`.
 /// This replaced `@memset(r, 0)` followed by two XOR-stores per partial
-/// product (A1 audit M4, 2026-09-16). The old form read back, on almost every
+/// product (A1 audit M4). The old form read back, on almost every
 /// product, a word that the memset or the previous product had just stored.
 /// The leaf's cost fell to about a third. `testKaratsubaLength` pre-fills `r`
 /// with junk, so a word this function stopped writing would show up.
@@ -247,7 +247,7 @@ pub fn Ring(comptime n: u32) type {
         ///
         /// The parameter is a POINTER TO A FIXED-SIZE ARRAY, not a slice, so the
         /// length precondition is discharged by the type. It was a slice with a
-        /// `std.debug.assert(bytes.len >= n_bytes)` until 2026-08-14, and this is
+        /// `std.debug.assert(bytes.len >= n_bytes)` previously, and this is
         /// a public entry point (`hqc.gf2x` is re-exported from `root.zig`):
         /// `std.debug.assert` is compiled out in ReleaseFast and ReleaseSmall, so
         /// a caller passing a short slice got an out-of-bounds read in exactly the
