@@ -5,12 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: delta mutation audit of the typed TLV records (`bolt1.zig`, `bolt2.zig`, `bolt7.zig`), 90/91 killed, 1 equivalent; six tests added (leak-checked refusal paths, hand-built accessor guards, length boundaries, compressed `query_flags`, `ChannelType.minimal`).
 - **2026-11-17** — ADDED: typed TLV records for the messages that carried raw `(type, value)` pairs. Accessors: `OpenChannel`/`AcceptChannel` `.upfrontShutdownScript()` / `.channelType()` (`bolt2.ChannelType`, `isSet`/`minimal`), `ClosingSigned.feeRange()` (`bolt2.FeeRange`, `toBytes`), `UpdateFulfillHtlc`/`UpdateFailHtlc` `.attributionData()` (`bolt2.AttributionData`, `toBytes`), `Init.networks()` / `.remoteAddr()`, `QueryShortChannelIds.queryFlags()` (`bolt7.QueryFlags`), `QueryChannelRange.queryOption()` (`QUERY_OPTION_*`). CHANGED (error sets only): `decodeInit`/`serializeInit`, `decode`/`serializeClosingSigned`, `decode`/`serializeUpdateFulfillHtlc`, `decode`/`serializeUpdateFailHtlc`, `decode`/`serializeQueryShortChannelIds`, `decode`/`serializeQueryChannelRange` now also return `error.InvalidTlvLength` (`message.TlvLengthError`, same value as `bolt2.TlvLengthError`) for a KNOWN record of the wrong length/shape (BOLT#1 "MUST fail to parse the tlv_stream"). Unknown odd records are still discarded, unknown even still `UnknownEvenType`. Tests: `src/tlv_typed_test.zig`, decoding the vendored rust-lightning and BOLT#7 vectors through the typed API.
 
 - **2026-11-16** — ADDED: `features.Feature` / `table` / `row` / `Contexts` (named BOLT#9 rows: even bit, I/N/9 contexts, dependencies; partial, unverified rows omitted), `setFeature`, `hasFeature` (either bit) and `checkDependencies` (feature set while a dependency is missing).
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `LNWIRE_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `bolt2-decodeOpenChannel`, `bolt2-reestablishMalformed`, `bolt7-decodeQueryShortChannelIds`, `bolt7-gossipExtra`, `message-frameAndExtension`, `tlv-parseStream`. Verdict: 200,000 runs each, ReleaseSafe, clean.
 - **2026-10-09** — Dead-stack rule (CONVENTIONS §2.1.1), no signature change: `decodeRevokeAndAck`, `serializeRevokeAndAck`, `decodeChannelReestablish` and `serializeChannelReestablish` now run their bodies under a 2 KiB stack burn (new `src/burn.zig`; probe `src/stackprobe_test.zig`, residue only). They keep the by-value message API that every codec in the family shares (`secret-api-ok` markers): the message is the caller-owned secret holder (zero `per_commitment_secret` / `your_last_per_commitment_secret` yourself, as documented).
@@ -32,7 +30,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   decoders validate trailing extension bytes was false (they ignore them, as BOLT#1 permits) and
   is corrected; a vendored `node_announcement` vector description said onionv3 where the bytes
   are onionv2. `meta.doc` updated.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: Scope and Anchoring no longer present `announcement_signatures`/`gossip_timestamp_filter` as settled "not debt" — they are "not yet", filed in Backlog.
 - **2026-10-05** — Mutation run: 36 of 36 killed, 0 equivalent; 4 tests added (BigSize
   one-octet-short edges, digest signature-block edges, `commitment_signed` 65536-signature
   refusal, `init` keeps `remote_addr`). No code change.

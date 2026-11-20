@@ -20,8 +20,8 @@ specification; the TLV/BigSize codec is pinned byte-exact against the spec's own
 Appendix A and B vectors. No third-party Lightning implementation was consulted,
 so no `NOTICE` entry is required for the CODE (root [`NOTICE`](../../NOTICE) §0).
 
-**Added 2026-08-02:** that disclaimer covers the CODE, which remains
-clean-room. The module now separately vendors `lightning/bolts`' own BOLT#7
+That disclaimer covers the CODE, which remains
+clean-room. The module separately vendors `lightning/bolts`' own BOLT#7
 test-vector DATA (`bolt07/extended-queries.json`, CC-BY 4.0), which does
 require attribution — see [`NOTICE`](./NOTICE), a module-local file per root
 NOTICE §1's policy.
@@ -52,16 +52,14 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup and exact
   `Address` values (`ipv4`/`ipv6`/`torv2`/`torv3`/`dns`) and stops at the first unknown type
   (`unparsed()` returns the rest); `encodeAddresses` builds the field and refuses port 0,
   non-ascending types, a second DNS name, and non-ASCII hostnames.
+- **Typed TLV records** — accessors with decode- and encode-time length checks for the known records of `init`, `open_channel`/`accept_channel`, `closing_signed`, `update_fulfill_htlc`/`update_fail_htlc`, `query_short_channel_ids`, `query_channel_range` and `channel_reestablish`; the raw `Extension` (`find(type)`) stays the lossless form (SPEC *Typed TLV records*).
 - **BOLT#9 feature bits** — `lnwire.features`: `isSet`, `supports` (either bit of a pair), `set`,
   `byteLenFor`, `firstUnknownEvenBit`, `minimal`; named table (partial): `Feature`, `table`, `row`,
   `setFeature`, `hasFeature`, `checkDependencies` (set feature whose dependency is missing).
 
-Deliberately deferred (SPEC.md has the full rationale): BOLT#11 invoices / BOLT#12 offers
-(bech32-based — the sibling `lninvoice` module), signature verification (caller's secp256k1 — see
-"Use" below), onion routing (the sibling `sphinx` module), several BOLT#2/#7 messages outside this
-module's required set (Interactive Transaction Construction, Channel Establishment v2, Splicing,
-Quiescence, `start_batch`, modern closing), and per-field TLV-extension value semantics beyond the
-raw `(type, value)` pair (except `channel_reestablish`'s two records).
+## Not provided
+
+No BOLT#11 invoices / BOLT#12 offers (the sibling `lninvoice`), no signature verification (the caller's secp256k1 plugs in through `verifyChannelAnnouncement` and its siblings, see "Use"), no onion routing (the sibling `sphinx`), no interpretation of TLV values beyond the typed accessors, and not yet the BOLT#2 interactive-tx / v2 channel establishment / splicing / quiescence / `start_batch` / modern closing messages or zlib-compressed range queries. The reasons are in SPEC *What is deliberately not done*; the open items in *Backlog / deferred*.
 
 ## Use
 
@@ -134,28 +132,12 @@ zig fmt --check modules/lnwire
 
 Byte-exact against: BOLT#1 Appendix A's BigSize test vectors (all encode/decode/failure cases) and
 Appendix B's TLV stream test vectors (every decoding-success and decoding-failure case, including
-the ordering/duplicate-type and value-truncation vectors) — see `SPEC.md` for exactly what was
-verified against what, plus every message's decode→serialize round-trip and the announcement-digest
-offset-boundary checks.
-
-**Added 2026-08-02:** `query_channel_range`/`reply_channel_range`/`query_short_channel_ids` are
-additionally byte-exact against `lightning/bolts`' own `bolt07/extended-queries.json` vectors (10
-rows, both DECODE and ENCODE directions) — see `SPEC.md`'s "BOLT#7 extended-query vectors" note
-and `modules/lnwire/NOTICE` for the required CC-BY 4.0 attribution. 4 of the 10 rows exercise the
-`COMPRESSED_ZLIB` short_channel_id/`query_flags` encoding this module does not implement; those
-rows' compressed content is not independently reconstructed (documented per-row in `bolt7.zig`'s
-tests), only the fields this module's codec actually interprets.
-
-**Also added 2026-08-02:** `channel_announcement`/`node_announcement`/`channel_update` are
-additionally byte-exact against `lightningdevkit/rust-lightning`'s own encode/decode test hex (22
-vectors, both DECODE and ENCODE directions, dual MIT/Apache-2.0) — `lightning/bolts` carries no
-vectors of its own for these three messages. See `SPEC.md`'s "BOLT#7 announcement/update vectors"
-note and `modules/lnwire/NOTICE` for the required attribution. This closes the previous
-round-trip-only gap for these three messages. (The sentence that followed here — "only the
-BOLT#2 channel-management set remains round-trip-only" — was already false: SPEC's Anchoring
-records all 13 BOLT#2 messages against rust-lightning's vectors.)
-
-**Added 2026-10-06:** `channel_reestablish` (3 cases), `update_fail_malformed_htlc`,
-`announcement_signatures`, `gossip_timestamp_filter` are byte-exact against rust-lightning's
-`msgs.rs` encode tests in both directions, and the address-descriptor walker/encoder against the
-10 vendored `node_announcement` cases — see `SPEC.md`'s "Added 2026-10-06" note.
+the ordering/duplicate-type and value-truncation vectors); `query_channel_range`/`reply_channel_range`/
+`query_short_channel_ids` against `lightning/bolts`' own `bolt07/extended-queries.json` (10 rows, both
+DECODE and ENCODE directions; 4 rows use the `COMPRESSED_ZLIB` encoding this module does not implement,
+so their compressed content is not independently reconstructed); the BOLT#1 and BOLT#2 messages, the three
+BOLT#7 announcement/update messages (22 vectors), `channel_reestablish`, `update_fail_malformed_htlc`,
+`announcement_signatures`, `gossip_timestamp_filter` and the address-descriptor walker/encoder against
+`lightningdevkit/rust-lightning`'s encode/decode test hex (dual MIT/Apache-2.0; `lightning/bolts` carries no
+vectors of its own for these). See `SPEC.md` *Verification* for exactly what was checked against what, and
+`modules/lnwire/NOTICE` for the required attribution.

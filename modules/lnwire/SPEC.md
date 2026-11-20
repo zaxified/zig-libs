@@ -30,14 +30,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ACINQ/eclair](https://github.com/ACINQ/eclair) | Scala | Apache-2.0 | 1.3k | v0.14.3 (2026-09-14) | Scala codecs for the full message set *(inferred)*. |
 | Zig ecosystem | Zig | — | — | — | GitHub search for Lightning/BOLT Zig repositories (2026-09-30) found none besides this collection. |
 
-**Where we are ahead:** the only Zig BOLT#1/2/7 codec; strict TLV rules (increasing types, minimal BigSize, it's-ok-to-be-odd) pinned to the spec's vectors; ownership model documented (decode borrows the input); `update_fail_malformed_htlc`'s `BADONION` rule and `channel_reestablish`'s TLV lengths enforced in the codec itself (rust-lightning's own vector carries a `failure_code` without the bit, i.e. its message codec leaves that rule to a later layer). **Where we are even:** the base channel lifecycle (open → HTLCs → reestablish → close) and the gossip set a node needs to announce a channel and subscribe to gossip; typed `node_announcement` addresses; feature-bit reads. **Where we are behind:** interactive-tx / dual-funding / splicing / quiescence / `closing_complete`+`closing_sig` / `start_batch`, onion messages, zlib-compressed range queries, a named BOLT#9 feature table (`features.Feature`, partial).
+**Where we are ahead:** the only Zig BOLT#1/2/7 codec; strict TLV rules (increasing types, minimal BigSize, it's-ok-to-be-odd) pinned to the spec's vectors; ownership model documented (decode borrows the input); `update_fail_malformed_htlc`'s `BADONION` rule and `channel_reestablish`'s TLV lengths enforced in the codec itself (rust-lightning's own vector carries a `failure_code` without the bit, i.e. its message codec leaves that rule to a later layer). **Where we are even:** the base channel lifecycle (open → HTLCs → reestablish → close) and the gossip set a node needs to announce a channel and subscribe to gossip; typed `node_announcement` addresses; feature-bit reads. **Where we are behind:** interactive-tx / dual-funding / splicing / quiescence / `closing_complete`+`closing_sig` / `start_batch`, onion messages, zlib-compressed range queries, the named BOLT#9 feature table is partial (`features.Feature` holds only rows verified against the spec text).
 
-**Re-assessed 2026-10-06** (no new web survey; the 2026-09-30 table above is a week old): the four messages and the typed addresses/features the survey ranked first in Backlog landed, so what a v1-channel node or a gossip client exchanges is now covered; what remains (the v2/splicing message family, onion messages, zlib) is what newer peers *negotiate* by feature bit, and a peer that has not negotiated them never sends them — Backlog-grade, hence `core`, not `parity`.
+What remains behind (the v2/splicing message family, onion messages, zlib) is what newer peers *negotiate* by feature bit, and a peer that has not negotiated them never sends them: Backlog-grade, hence `core`, not `parity`.
+
 
 ## Design & invariants
 
 Pure codec, no I/O, no allocation beyond what the caller's `Allocator` provides (and the only
-allocation any decode performs is a message's `Extension.records` array — see below). Seven files:
+allocation any decode performs is a message's `Extension.records` array — see below). Source files:
 
 - `tlv.zig` — BigSize (Lightning's varint: CompactSize with big-endian multi-byte forms) encode/
   decode, truncated-integer (`tu16`/`tu32`/`tu64`) encode/decode, and the generic BOLT#1
@@ -51,18 +52,21 @@ allocation any decode performs is a message's `Extension.records` array — see 
   top-level record types via `tlv.parseStream`. Per-record *value* semantics live in the message structs' typed accessors (`feeRange`, `attributionData`, `networks`, ...); `Extension.find(type)` still hands back raw bytes.
 - `bolt1.zig` — `init`, `error`/`warning` (identical wire layout, one codec parameterized by
   `msg_type`), `ping`, `pong`.
-- `bolt2.zig` — 15 BOLT#2 channel messages (the 13 originally required, plus `update_fail_malformed_htlc` and `channel_reestablish` since 2026-10-06; see README's Scope section).
-- `bolt7.zig` — 9 BOLT#7 gossip messages (incl. `announcement_signatures` and `gossip_timestamp_filter` since 2026-10-06) and the `node_announcement` address-descriptor walker/encoder, plus `channelAnnouncementDigest`/
+- `bolt2.zig` — the 15 BOLT#2 channel messages listed under *Scope*.
+- `bolt7.zig` — the 9 BOLT#7 gossip messages listed under *Scope* and the `node_announcement` address-descriptor walker/encoder, plus `channelAnnouncementDigest`/
   `nodeAnnouncementDigest`/`channelUpdateDigest`: the double-SHA256 pre-image each message's
   signature(s) sign, computed exactly as BOLT#7 specifies ("beginning at offset 256/64, up to the
   end of the message" — the offset is precisely the byte-size of the signature field(s) each
   message leads with).
-- `features.zig` — BOLT#9 feature-bit-vector reads/writes plus a named (partial) feature table with dependency check.
+- `features.zig` — BOLT#9 feature-bit-vector reads/writes plus a named (partial) feature table with dependency check (`Feature`, `table`, `row`, `setFeature`, `hasFeature`, `checkDependencies`: 18 rows with the even bit, the I/N/9 contexts and dependencies; a row is included only once verified against the spec text).
+- `burn.zig` — dead-stack burn for the two codecs that carry a per-commitment secret on the wire (`revoke_and_ack`, `channel_reestablish`): each public entry point zeroes the stack its body dirtied.
+- `*_kat_vectors.zig` — vendored vectors (see *Verification*); `tlv_typed_test.zig`, `stackprobe_test.zig`, `fuzz_test.zig` and the `*_kat_test.zig` files are tests.
 - `root.zig` — `meta` + a flat re-export of every public type/function, plus the dark-tests
   aggregator.
 
 Concurrency: `.reentrant` — every `decode`/`serialize` function is a pure transform over
 caller-owned bytes/values, no shared/global state.
+
 
 ## Ownership model
 
@@ -77,14 +81,13 @@ frees exactly that, nothing else. Messages with no defined `tlv_stream` (`fundin
 `reply_short_channel_ids_end`, `update_fail_malformed_htlc`, `announcement_signatures`,
 `gossip_timestamp_filter`) allocate nothing at all and their `deinit` is a no-op. Bytes after their
 last fixed field are **ignored**, which BOLT#1 permits ("upon receiving a message with an
-`extension`: MAY ignore the `extension`"). ⚠ Corrected 2026-10-06: this paragraph used to say
-these decoders "still generically parse (and correctly reject unknown-even / discard unknown-odd)
-any trailing extension bytes" — none of them calls `decodeExtension`, and none ever did.
+`extension`: MAY ignore the `extension`").
 
 `commitment_signed`'s `htlc_signatures` is the one field that reinterprets, rather than slices,
 its input: `num_htlcs * 64` raw bytes are viewed as `[]align(1) const [64]u8` via
 `std.mem.bytesAsSlice` — a pointer reinterpretation, not a copy (`[64]u8` has the same
 layout/alignment as `u8`), so it stays zero-copy.
+
 
 ## Hostile-input handling
 
@@ -106,7 +109,7 @@ Every decode path returns a typed error, never panics, on truncated or adversari
   (`error.NonMinimal`), a declared record length exceeding the bytes remaining
   (`error.Truncated`), and an unrecognized *even* top-level type (`error.UnknownEvenType`) — all
   typed, all fail-closed, matching BOLT#1's Type-Length-Value Format Requirements exactly.
-- (2026-10-06) A KNOWN TLV record whose length is not its encoding's (`channel_reestablish`'s
+- A KNOWN TLV record whose length is not its encoding's (`channel_reestablish`'s
   `next_funding`/`my_current_funding_locked`, exactly 33 octets) fails `error.InvalidTlvLength`,
   BOLT#1's "MUST fail to parse the `tlv_stream`"; `update_fail_malformed_htlc` without the
   `BADONION` bit fails `error.BadOnionBitNotSet` (BOLT#2 receiver MUST); an address descriptor of
@@ -117,10 +120,23 @@ Every decode path returns a typed error, never panics, on truncated or adversari
 - A message decoder handed the wrong 2-byte `type` (e.g. `decodeFundingSigned` given an
   `accept_channel` message) returns `error.WrongType` rather than misinterpreting the payload.
 
+
+### Typed TLV records
+
+`Extension` stays the lossless form: `Extension.find(type)` hands back raw bytes, an unknown odd record is discarded at decode (BOLT#1) and an unknown even one fails. Known records also have typed accessors whose length and shape are checked at decode time (`error.InvalidTlvLength`) and again when the message is serialized (`checkInitTlvs`, `checkAttributionLength`, `checkFeeRangeLength`, `checkQueryFlags`, `checkQueryOption`, `checkReestablishTlvLengths`); an accessor on a hand-built value that does not pass the check yields `null` rather than reading out of range:
+
+- `open_channel` / `accept_channel`: `upfrontShutdownScript()`, `channelType()` (a `ChannelType` with `isSet` and `minimal`; its mapping to named channel types is not done).
+- `closing_signed`: `feeRange()`, exactly 16 octets.
+- `update_fulfill_htlc` / `update_fail_htlc`: `attributionData()`, exactly 920 octets (20 x u32 hold times and 210 x 4-octet truncated HMACs).
+- `init`: `networks()` (a multiple of 32 octets), `remoteAddr()` (one BOLT#7 address descriptor, nothing after it).
+- `query_short_channel_ids`: `queryFlags()`; an uncompressed list (`encoding_type` 0) is walked as minimal bigsizes, a zlib one is carried and `iterator()` answers `error.UnsupportedEncoding` (no zlib here).
+- `query_channel_range`: `queryOption()`, one minimal bigsize.
+- `channel_reestablish`: `next_funding` / `my_current_funding_locked`, exactly 33 octets each (`sha256 || retransmit_flags`); `reply_channel_range`'s `timestamps_tlv` / `checksums_tlv`.
+
 ## Scope
 
 **Implemented**, byte-exact against BOLT#1's own published test vectors where the spec provides
-them (see "Verification" below):
+them (see *Verification*):
 
 - **BOLT#1 base wire**: BigSize (`tlv.encodeBigSize`/`decodeBigSize`), the generic `tlv_stream`
   (`tlv.parseStream`), the 2-byte message-type frame, `init`/`error`/`warning`/`ping`/`pong`.
@@ -137,186 +153,40 @@ them (see "Verification" below):
 - **BOLT#9 feature bit vectors** (`features.zig`): bit reads/writes, pair support, first unknown
   compulsory bit, minimal length.
 
-**Deliberately deferred** (structurally noted, not half-built — each is a self-contained follow-on
-unit of work, not a corner cut inside a message this module claims to implement):
+## What is deliberately not done
 
-- **BOLT#11 invoices / BOLT#12 offers** — bech32-based encodings, a distinct concern from
-  BOLT#1-style binary TLV wire messages; the sibling `lninvoice` module (BOLT#11 decode/encode, BOLT#12 offers and signed invoice_request/invoice).
-- **Signature verification** — every `signature`/`bip340sig`/`point` field is opaque bytes; no
-  secp256k1 anywhere in this module (a pure codec has no business owning curve arithmetic — the
-  caller verifies `channelAnnouncementDigest(payload)` etc. against the message's signature
-  field(s) and `node_id`/`bitcoin_key`, exactly the split `bitcointx`'s sighash functions use
-  relative to their caller's secp256k1). `verifyChannelAnnouncement`/`verifyNodeAnnouncement`/
-  `verifyChannelUpdate` (`bolt7.zig`) are the seam that does the pairing for the caller: each takes
-  an `EcdsaVerifyFn` (a `(ctx, digest, signature, pubkey) -> bool` function pointer the caller
-  supplies, the same function-pointer-seam shape `iec62351` uses for `RawVerifier`) and calls it
-  once per signature with BOLT#7's own digest/signature/pubkey pairing already resolved — a
-  `decodeChannelAnnouncement` result carries no signal of its own that it is unverified; calling
-  `verify*` (or not) is what a caller's code shows.
-- **Onion routing (BOLT#4)** — `update_add_htlc.onion_routing_packet` is an opaque 1366-byte
-  array; encryption/decryption/Sphinx is the sibling `sphinx` module's job, not this codec's.
-- **BOLT#2 messages not in the required set**: Interactive Transaction Construction (`tx_add_input`
-  and siblings), Channel Establishment v2 (`open_channel2`/`accept_channel2`), Channel Splicing,
-  Quiescence (`stfu`), `start_batch`, the modern Closing Negotiation pair
-  (`closing_complete`/`closing_sig` — this module implements only the legacy `closing_signed`
-  negotiation). (`channel_reestablish` and `update_fail_malformed_htlc` landed 2026-10-06, as did
-  BOLT#7's `announcement_signatures` and `gossip_timestamp_filter`.)
-- **Per-field TLV value semantics** — typed since 2026-11-17 (see Backlog): `fee_range`, `attribution_data`, `channel_type`, `networks`, `remote_addr`, `query_option`, `query_flags` have accessors with decode-time length checks; the raw `extension` stays the lossless form. Still out of scope: interpreting `query_flags`'s bits per channel beyond the bigsize walk, the zlib-compressed form, and `channel_type`'s mapping to named channel types.
-- **Script-form parsing** — `shutdown.scriptpubkey`'s `OP_0`/`OP_1`-`OP_16`/`OP_RETURN`
-  allow-list is an opaque byte slice, same "no Script interpretation" scope cut the sibling
-  `bitcointx` module documents for `scriptSig`/`scriptPubKey`. (`node_announcement.addresses` is
-  still carried verbatim — the signature covers it — but `AddressIterator`/`encodeAddresses` type
-  it since 2026-10-06; see "Added 2026-10-06" under Verification.)
+- **BOLT#11 invoices / BOLT#12 offers** — bech32-based encodings, a distinct concern from BOLT#1-style binary TLV wire messages: the sibling `lninvoice` module (BOLT#11 decode/encode, BOLT#12 offers and signed invoice_request/invoice).
+- **Signature verification** — every `signature`/`bip340sig`/`point` field is opaque bytes; no secp256k1 anywhere in this module (a pure codec has no business owning curve arithmetic — the caller verifies `channelAnnouncementDigest(payload)` etc. against the message's signature field(s) and `node_id`/`bitcoin_key`, exactly the split `bitcointx`'s sighash functions use relative to their caller's secp256k1). `verifyChannelAnnouncement`/`verifyNodeAnnouncement`/`verifyChannelUpdate` (`bolt7.zig`) are the seam that does the pairing for the caller: each takes an `EcdsaVerifyFn` (a `(ctx, digest, signature, pubkey) -> bool` function pointer the caller supplies, the same function-pointer-seam shape `iec62351` uses for `RawVerifier`) and calls it once per signature with BOLT#7's own digest/signature/pubkey pairing already resolved — a `decodeChannelAnnouncement` result carries no signal of its own that it is unverified; calling `verify*` (or not) is what a caller's code shows.
+- **Onion routing (BOLT#4)** — `update_add_htlc.onion_routing_packet` is an opaque 1366-byte array; encryption/decryption/Sphinx is the sibling `sphinx` module's job, not this codec's.
+- **Interpreting TLV values beyond the typed accessors** — `query_flags`'s bits per channel beyond the bigsize walk, the zlib-compressed form, and `channel_type`'s mapping to named channel types. `node_announcement.addresses` is carried verbatim (the signature covers it); `AddressIterator`/`encodeAddresses` type it.
+- **Script-form parsing** — `shutdown.scriptpubkey`'s `OP_0`/`OP_1`-`OP_16`/`OP_RETURN` allow-list is an opaque byte slice, the same "no Script interpretation" scope cut the sibling `bitcointx` module documents for `scriptSig`/`scriptPubKey`.
 
 ## Verification
 
-`tlv.zig` is pinned byte-exact against BOLT#1's own **Appendix A: BigSize Test Vectors** (all 8
-valid encode+decode cases, all 3 non-canonical-encoding cases, all 7 truncation cases) and
-**Appendix B: Type-Length-Value Test Vectors** (every decoding-failure and decoding-success case
-listed, transcribed via a test-local `hexBytes` helper directly from the spec's own hex strings —
-including the vector needing 258 zero bytes to demonstrate "value truncated", cross-checked byte-
-count-exact against the fetched spec text at authoring time — rather than hand-typed into `0x..`
-array literals, eliminating transcription slip as a failure mode). The `n1`/`n2` namespaces are the
-spec's own teaching example; `tlv.zig`'s test-local `n1Validate` mirrors exactly what a real
-per-message typed-extension decoder (`bolt2.zig`'s/`bolt7.zig`'s `known_tlv_types` machinery, one
-level up) would do.
+Run with `scripts/modtest lnwire` (`zig build test-lnwire`, Debug and `-Doptimize=ReleaseFast`).
 
-Every BOLT#2/BOLT#7 message has a decode→serialize round-trip test (several also assert
-re-serializing a *decoded* message reproduces the exact input bytes — a strong self-consistency
-check beyond "decode doesn't crash"). `bolt7.zig`'s three digest helpers are each checked against
-an independently-computed `sha256(sha256(payload[offset..]))` inline in the test (not the digest
-function's own internals) — the digest for `channel_announcement` is further checked to be
-**invariant** to changing signature bytes (excluded from the pre-image) and to **change** when a
-byte after the signature block changes, directly exercising the "beginning at offset N" boundary
-BOLT#7 specifies.
+- **BOLT#1 primitives.** `tlv.zig` is pinned byte-exact against BOLT#1's own **Appendix A: BigSize Test Vectors** (the valid encode+decode cases, the non-canonical-encoding cases, the truncation cases) and **Appendix B: Type-Length-Value Test Vectors** (every decoding-failure and decoding-success case listed, transcribed through a test-local `hexBytes` helper directly from the spec's own hex strings rather than hand-typed into `0x..` array literals). The `n1`/`n2` namespaces are the spec's own teaching example; `tlv.zig`'s test-local `n1Validate` mirrors what a real per-message typed-extension decoder (`known_tlv_types`, one level up) does.
+- **Round trips.** Every BOLT#2/BOLT#7 message has a decode→serialize round-trip test; several also assert that re-serializing a *decoded* message reproduces the exact input bytes. `bolt7.zig`'s three digest helpers are each checked against an independently computed `sha256(sha256(payload[offset..]))` in the test (not the digest function's own internals); the `channel_announcement` digest is further checked to be invariant to changing signature bytes (excluded from the pre-image) and to change when a byte after the signature block changes, which exercises BOLT#7's "beginning at offset N" boundary.
+- **Hostile input.** Every message has at least one truncation or oversized-length-prefix test asserting a typed error (never a panic, never unbounded work): a length prefix declaring more bytes than remain (`shutdown.scriptpubkey`, `update_fail_htlc.reason`, `reply_channel_range.encoded_short_ids`, `init.globalfeatures`, `ping.byteslen`, `error.data`), a truncated fixed-width field (points, signatures, `commitment_signed`'s fourth signature cut short, `update_add_htlc`'s onion packet), `commitment_signed`'s `num_htlcs` claiming ~4.19 MB more signature bytes than the buffer holds, an unknown-even top-level TLV type in several messages' extensions (`init`, `open_channel`, `query_channel_range`), wrong-length known TLVs (32 and 34 octets), truncation at every later message's last field, each address type one octet short, a hostname length past the field, a non-ASCII hostname. The typed-record refusal paths run under the leak-detecting allocator (`src/tlv_typed_test.zig` uses `std.testing.allocator`).
+- **Oracles, all EXTERNAL except where marked.**
+  - `lightning/bolts`' own `bolt07/extended-queries.json` (10 rows, CC-BY 4.0, attribution in `modules/lnwire/NOTICE`), vendored as `src/bolt7_extended_queries_kat_vectors.zig`, for `query_channel_range`, `reply_channel_range` and `query_short_channel_ids`. Both directions: DECODE parses the official `hex` and asserts the fields, the opaque `encoded_short_ids` blob and (reconstructed independently from the vector's decoded fields) `timestamps_tlv`/`checksums_tlv` wherever the codec interprets them; ENCODE builds the message from the vector's fields and asserts byte-exact output. 4 of the 10 rows use the `COMPRESSED_ZLIB` encoding (two of them also `query_flags`/`timestamps_tlv`); this module has no zlib codec, so the compressed *content* of those rows is not reconstructed — the encoding-type byte, every non-compressed field and a byte-exact decode→re-encode round trip of the opaque blob are checked. `checksums_tlv` has no encoding byte (always raw), so it is checked even in a `COMPRESSED_ZLIB` row.
+  - `lightningdevkit/rust-lightning`'s `msgs.rs` encode/decode test hex (dual MIT/Apache-2.0, attribution in `modules/lnwire/NOTICE`), vendored in `src/bolt7_announcement_update_kat_vectors.zig` (`channel_announcement`, `node_announcement`, `channel_update`: 22 vectors, 4/10/8, every parameter combination the upstream tests drive, none synthesized), `src/bolt2_channel_management_kat_vectors.zig` (the BOLT#2 channel-management messages), `src/bolt1_kat_vectors.zig` (`init`, `error`/`warning`, `ping`, `pong`; `error` and `warning` share one vector because BOLT#1 gives them one layout), `src/bolt2_reestablish_malformed_kat_vectors.zig` and `src/bolt7_sigs_filter_kat_vectors.zig` (`channel_reestablish` in its three cases, `update_fail_malformed_htlc`, `announcement_signatures`, `gossip_timestamp_filter`). `lightning/bolts` carries no vectors for these messages, so this is an independent implementation's frozen encoder output rather than the spec authors' own data (only hex output taken, never their code read for its own sake). Both directions, field by field, including `channel_announcement`'s four-signature order and the excess/trailing data BOLT#7 requires be preserved verbatim.
+  - `update_fail_malformed_htlc`'s one upstream vector has `failure_code` 255, no `BADONION` bit: it anchors the wire layout through `bolt2.zig`'s private layout codec and is also the external case the public `decodeUpdateFailMalformedHtlc`/`serialize…` refuse (`error.BadOnionBitNotSet`).
+  - Address descriptors are anchored on the 10 vendored `encoding_node_announcement` cases: every ipv4/ipv6/torv2/torv3/dns literal is decoded from its `addresses` bytes and re-encoded byte-exact, and the 64-octet `excess_address_data` (first octet 33, an unknown type) is exactly what `AddressIterator.unparsed()` returns.
+  - Feature bits: rust-lightning's `from_le_bytes([2 | 1 << 5])` / `[0xFF, 0xFF]` values against their wire hex (EXTERNAL, but one octet or all ones, so blind to byte order); the big-endian numbering itself is SELF-DERIVED from the BOLT#9/BOLT#1 text.
+  - The announcement digests are additionally pinned by one independently recomputed digest per message (Python `hashlib.sha256`, twice, over the tail of an already-vendored `payload_hex` vector), so a consistently wrong production offset cannot agree with its own test.
+- **Typed TLV records:** `src/tlv_typed_test.zig`; where a vendored vector carries the record it is decoded through the accessor.
+- **Fuzz:** the deterministic driver, `LNWIRE_FUZZ` (harness names `lnwire-tlv-parse`, `lnwire-message-frame`, `lnwire-bolt2-decode`, `lnwire-bolt2-reestablish`, `lnwire-bolt7-decode`, `lnwire-bolt7-gossip`): the TLV stream parser, the message frame, the BOLT#2 and BOLT#7 decoders, `channel_reestablish` with `update_fail_malformed_htlc`, and the signatures, filter and address walker, with corpora built by the serializers and pinned reach counts.
+- **Dead stack:** `src/stackprobe_test.zig` (`testkit.stackprobe`, optimized builds only) goes red when `burn.zig`'s burn no longer covers a codec body's frames.
+- **Constant time:** n/a — public wire messages.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. Not mutated: the TLV type constants and the known-type arrays (comptime).
 
-**Hostile input** — every message has at least one truncation/oversized-length-prefix test
-asserting a typed error (never a panic, never unbounded work): a length prefix declaring more
-bytes than remain (`shutdown.scriptpubkey`, `update_fail_htlc.reason`,
-`reply_channel_range.encoded_short_ids`, `init.globalfeatures`, `ping.byteslen`,
-`error.data`), a truncated fixed-width field (points, signatures, `commitment_signed`'s
-4th-signature-cut-short case, `update_add_htlc`'s onion packet), `commitment_signed`'s `num_htlcs`
-claiming ~4.19 MB more signature bytes than the buffer holds, and an unknown-even top-level TLV
-type in several messages' extensions (`init`, `open_channel`, `query_channel_range`).
-
-**BOLT#7 extended-query vectors (added 2026-08-02)** — `query_channel_range`, `reply_channel_range`,
-and `query_short_channel_ids` are each additionally checked against `lightning/bolts`' own
-`bolt07/extended-queries.json` (10 rows, CC-BY 4.0 — see `modules/lnwire/NOTICE`), vendored as
-`src/bolt7_extended_queries_kat_vectors.zig`. Both directions are driven: DECODE parses the
-official `hex` and asserts `chain_hash`/block-range/`complete` fields, the raw `encoded_short_ids`
-opaque blob, and (independently reconstructed from the vector's own decoded fields, not just
-self-consistency) `timestamps_tlv`/`checksums_tlv` content wherever this module's codec actually
-interprets it; ENCODE builds a message from the vector's decoded fields and asserts the result is
-byte-exact against the official `hex` — the direction this pass prioritized, since the pre-existing
-suite only round-tripped through this module's own encoder/decoder pair. 4 of the 10 rows use the
-`COMPRESSED_ZLIB` short_channel_id (and, in two of those, also `query_flags`/`timestamps_tlv`)
-encoding; this module has no zlib codec (see "Scope" above) and never interprets `query_flags`'
-per-scid bit-array content regardless of its own encoding, so those rows' compressed *content* is
-not reconstructed from the vector's semantic fields — the encoding-type byte itself, every
-non-compressed field, and a byte-exact decode→re-encode round trip of the opaque blob are still
-checked. `checksums_tlv` has no encoding byte in BOLT#7 (always raw), so it is independently
-checked even in an otherwise-`COMPRESSED_ZLIB` row. `announcement_signatures` and
-`gossip_timestamp_filter` are anchored separately on rust-lightning's vectors (see "Added
-2026-10-06" below).
-
-**BOLT#7 announcement/update vectors (added 2026-08-02)** — `channel_announcement`,
-`node_announcement`, and `channel_update` are each additionally checked against
-`lightningdevkit/rust-lightning`'s own encode/decode test hex (`lightning/src/ln/msgs.rs`'s
-`encoding_channel_announcement`/`encoding_node_announcement`/`encoding_channel_update` tests, dual
-MIT/Apache-2.0 — see `modules/lnwire/NOTICE`), vendored as
-`src/bolt7_announcement_update_kat_vectors.zig`: 22 vectors total (4/10/8 respectively), every
-parameter combination the upstream tests drive, none synthesized. `lightning/bolts` (BOLT#7's own
-spec repository) carries no test vectors for these three messages, so this is an independent
-implementation's frozen encoder output rather than the spec authors' own data — the vendored file's
-module doc comment records exactly which upstream test/commit and why that is still a real anchor
-(only hex output taken, never their encoder/decoder read for its own sake). Both directions are
-driven: DECODE parses the official bytes and asserts every field, including `channel_announcement`'s
-4-signature order (`node_signature_1`, `node_signature_2`, `bitcoin_signature_1`,
-`bitcoin_signature_2`) and the excess/trailing-data bytes BOLT#7 requires be preserved verbatim;
-ENCODE builds the message from those same fields and asserts byte-exact output against the official
-bytes — the direction this pass prioritized, since the pre-existing suite only round-tripped through
-this module's own encoder/decoder pair. All 22 vectors are usable in both directions (unlike 4 of the
-extended-query rows above): `node_announcement.addresses` (ipv4/ipv6/torv2/torv3/hostname) and
-`channel_announcement.features` (including an unknown-bits case) are opaque byte slices in this
-module regardless of what they encode, so no vector needed skipping for an unimplemented encoding.
-`channel_update.htlc_maximum_msat` is unconditional in BOLT#7's current spec text (the
-`option_channel_htlc_max` feature that used to gate it is now mandatory), matching every vector.
-
-This closes the "round-trip only" gap previously recorded here for these three messages.
-
-⚠ The sentence that used to follow — "the whole BOLT#2 channel-management set remains
-round-trip-only (needs a live daemon peer, the anchor record in `SPEC.md`)" — **was false when it
-was written, and this same file said so eighteen lines below**: the Anchoring section records
-"all 13 implemented messages, every upstream parameter combination, byte-exact both directions.
-No regtest daemon was needed." It also cited `SPEC.md` as its own source, which is the signature
-of the mechanical `ANCHOR-TASKS.tsv` substitution that produced it. One document, both claims, and
-the stale half is the one a reader hits first.
-
-**Added 2026-10-06 — `channel_reestablish`, `update_fail_malformed_htlc`,
-`announcement_signatures`, `gossip_timestamp_filter`, address descriptors, feature bits.**
-Same oracle as the rest of BOLT#2/#7 here: `lightningdevkit/rust-lightning`'s `msgs.rs` encode
-tests (`main` commit `15c5d9b8459e852f2b33586e586e3e90307114ee`), vendored in
-`src/bolt2_reestablish_malformed_kat_vectors.zig` and `src/bolt7_sigs_filter_kat_vectors.zig`.
-EXTERNAL, both directions, field by field: the three `encoding_channel_reestablish*` cases (no
-TLV, `next_funding`, `my_current_funding_locked` — the latter two are BOLT#2 master's 33-octet
-`sha256 || retransmit_flags` records), `encoding_announcement_signatures`,
-`encoding_gossip_timestamp_filter`. `update_fail_malformed_htlc`'s one upstream vector has
-`failure_code` 255 — no `BADONION` bit, so a message BOLT#2 requires a receiver to fail: it
-anchors the wire layout through `bolt2.zig`'s private layout codec, byte-exact both ways, and is
-also the external case the public `decodeUpdateFailMalformedHtlc`/`serialize…` refuse
-(`error.BadOnionBitNotSet`). Address descriptors are anchored on the 10 already-vendored
-`encoding_node_announcement` cases: every ipv4/ipv6/torv2/torv3/dns literal rust-lightning
-pushed is decoded from its `addresses` bytes and re-encoded byte-exact, and its 64-octet
-`excess_address_data` (first octet 33, an unknown type) is exactly what `AddressIterator.unparsed()`
-returns. Feature bits: rust-lightning's `from_le_bytes([2 | 1 << 5])` / `[0xFF, 0xFF]` values
-against their wire hex (EXTERNAL, but one octet or all ones, so blind to byte order); the
-big-endian numbering itself is SELF-DERIVED from BOLT#9/BOLT#1 text. BOLT#2/#7 publish no vectors
-for any of these. lnd was not used: it was not needed for a second oracle once rust-lightning had
-a fixed encoding for every new message. New hostile tests: wrong-length known TLVs (32 and 34
-octets), unknown even TLV, truncation at every new message's last field, each address type one
-octet short, a hostname length past the field, a non-ASCII hostname; two new fuzz harnesses
-(`bolt2.zig` reestablish + malformed, `bolt7.zig` signatures + filter + address walker) with
-corpora built by the serializers and pinned reach counts. Not mutation-tested yet.
-
-**Mutation run 2026-10-05** (in-place, Debug, 36 mutants over `tlv.zig`'s BigSize and
-truncated-integer codecs and stream rules, the reader's bounds, `openFrame`, the three
-announcement digests and the `verify*` signer pairing, the known-TLV tables and
-`commitment_signed`'s count guard): 29 killed. Four tests added for the seven survivors:
-BigSize one octet short of each wide form and an encode buffer one short, each digest one
-octet short of its signature block and exactly at it, 65536 `htlc_signatures` refused as
-`FieldTooLong`, `init`'s `remote_addr` (type 3) kept. Equivalent: none.
-
-Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
-
-**Audit 2026-11-17 (delta mutation).** 91 schemata mutants over the typed TLV records added the same day
-(`bolt1.zig`: the `networks` iterator, `checkInitTlvs`, `Init.networks`/`remoteAddr`; `bolt2.zig`: `ChannelType`,
-`AttributionData`, `FeeRange`, their length checks, accessors and encode/decode hooks on `open_channel`,
-`accept_channel`, `update_fulfill_htlc`, `update_fail_htlc`, `closing_signed`; `bolt7.zig`: `QueryFlags`,
-`checkQueryFlags`, `checkQueryOption`, the two accessors and the decode/serialize hooks), ReleaseSafe, one build,
-each mutant under `setsid -w timeout` and `ulimit -v`: length guards (dropped, one short), modulus and boundary
-constants, the looked-up TLV type, byte order and offsets of the 920- and 16-octet encodings, the `bigsize`
-walk, the `errdefer` after `decodeExtension`, the decode- and encode-time check calls, the swallowed error in a
-check, and the accessors' own guards. First run: 73 killed (1 HANG: a position that stops advancing), 18
-survived. Six tests added: the refusal paths run under the leak-detecting allocator (the older tests used an
-arena, so a missing `errdefer` was invisible), `networks` of 16 and 48 octets, accessors and the iterator on
-hand-built values (a malformed record yields `null`, never an out-of-range read), the exact-length boundaries
-of `attribution_data` and `fee_range`, a compressed `query_flags` whose bytes would not parse as bigsizes, and
-`ChannelType.minimal`; the rerun killed 17. 1 is EQUIVALENT: starting the `query_flags` walk at 0 instead of 1
-(the walk only runs for encoding 0, and that octet decodes as the canonical one-octet bigsize 0, which advances by
-exactly one). The TLV type constants and the known-type arrays are comptime and are not mutated. 90 killed + 1 eq
-= 91; the card's counts are cumulative with the 2026-10-05 run (36/36).
-
-## Status
-
-`any (pure codec, no I/O) · codec · reentrant` + deps: none (std-only) — canonical source is
-`pub const meta` in `src/root.zig`.
 
 ## Backlog / deferred
 
-- **Dual-funding / interactive-tx / splicing / `stfu` / `closing_complete`+`closing_sig` message set** *(survey 2026-09-30)* — what current LND/CLN/LDK peers negotiate. Effort: medium (mechanical, spec vectors exist); fits §2.
-- **Named BOLT#9 feature table** *(2026-10-06)* — ✅ DONE 2026-11-16 (`features.Feature`/`table`/`row`/`setFeature`/`hasFeature`/`checkDependencies`: 18 rows with even bit, I/N/9 contexts, dependencies; rows not yet verified against the spec text — dual_fund, attribution data, onion messages, provide storage, trampoline, simple close, splice, initial_routing_sync, the C/B contexts — are omitted, a follow-up).
-- **Typed TLV records for the other messages** *(2026-10-06)* — ✅ 2026-11-17 typed accessors with decode-time (and encode-time) length/shape checks: `open_channel`/`accept_channel` `upfrontShutdownScript`/`channelType`, `closing_signed` `feeRange` (16 octets), `update_fulfill_htlc`/`update_fail_htlc` `attributionData` (920 octets: 20 x u32 hold times + 210 x 4-octet truncated HMACs), `init` `networks` (multiple of 32) / `remoteAddr` (one BOLT#7 descriptor), `query_short_channel_ids` `queryFlags` (uncompressed list walked; zlib carried, not inflated), `query_channel_range` `queryOption` (one minimal bigsize). The raw `extension` stays; an unknown odd record is still discarded at decode (BOLT#1), an unknown even one still fails. `timestamps_tlv`/`checksums_tlv` of `reply_channel_range` were typed before.
-- **zlib-compressed `short_channel_id` lists** *(survey 2026-09-30)* — decode-only support would let extended queries interoperate with peers that compress (4 of the 10 spec rows). Effort: needs an inflate (no zlib/deflate module in this collection; `std.compress.flate` in Zig 0.16 has a zlib-container `Decompress`); fits §2 if std is used.
+- **Dual-funding / interactive-tx / splicing / `stfu` / `closing_complete`+`closing_sig` message set** — what current LND/CLN/LDK peers negotiate. Effort: medium (mechanical, spec vectors exist); fits §2.
+- **BOLT#9 feature table rows not yet verified against the spec text** — dual_fund, attribution data, onion messages, provide storage, trampoline, simple close, splice, initial_routing_sync and the C/B contexts are omitted from `features.table`.
+- **zlib-compressed `short_channel_id` lists** — decode-only support would let extended queries interoperate with peers that compress (4 of the 10 spec rows). Effort: needs an inflate (no zlib/deflate module in this collection; `std.compress.flate` has a zlib-container `Decompress`); fits §2 if std is used.
 
 ## Anchoring
 
@@ -326,5 +196,3 @@ exactly one). The TLV type constants and the known-type arrays are comptime and 
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** BigSize/TLV base wire + BOLT#7 announcements/queries/`announcement_signatures`/`gossip_timestamp_filter` + address descriptors + all BOLT#2 messages incl. `channel_reestablish`/`update_fail_malformed_htlc` vs bolts + rust-lightning msgs.rs, byte-exact; feature-bit byte order SELF-DERIVED from BOLT#9 text
-
-**How it got there.** The anchoring work landed. DONE: BOLT#1 base wire; BOLT#7 extended queries (447b970) + announcements/updates (6ffc927); BOLT#2 channel management - all 13 implemented messages, every upstream parameter combination, byte-exact both directions. No regtest daemon was needed: rust-lightning's msgs.rs encode tests carry the wire hex and are dual MIT/Apache-2.0. DONE 2026-10-06 (was deferred): `channel_reestablish` (3 cases), `update_fail_malformed_htlc` (layout; its `failure_code` 255 is also the refused case), `announcement_signatures`, `gossip_timestamp_filter` against rust-lightning's msgs.rs, byte-exact both directions, plus address descriptors against the 10 vendored `node_announcement` cases. Deferred by SPEC (splicing and the rest of the v2 message family) is not anchoring debt; Backlog has it. Only zlib-compressed extended-query payloads stay decode-only (no zlib here). CLOSED 2026-08-08 (wave-2 F2): "BOLT#1 App A/B" above covers only the BigSize/TLV *primitives*, not the *message* layer built on them — `init`/`error`/`warning`/`ping`/`pong` had 0 external vectors, self round-trip + hostile-truncation only, until this pass. Imported rust-lightning's `encoding_init`/`encoding_error`/`encoding_warning`/`encoding_ping`/`encoding_pong` (`bolt1_kat_vectors.zig`, `bolt1_kat_test.zig`), byte-exact-verified against the fetched `msgs.rs` programmatically before transcribing. `error`/`warning` share one vendored vector (BOLT#1 defines them with one layout; upstream's own two tests drive identical bytes). CLOSED 2026-08-08 (wave-2 F3): the announcement/update *digests* `channelAnnouncementDigest`/`nodeAnnouncementDigest`/`channelUpdateDigest` compute over — the actual security-relevant output fed to secp256k1 verify — were pinned only by literal offset recomputation inside this module's own tests (`payload[256..]`/`[64..]`, hand-derived from the same BOLT#7 reading as production, so a *consistently* wrong offset would agree with itself and stay green forever). Added one independently-recomputed digest per message (Python `hashlib.sha256`, twice, over the tail of an already-vendored rust-lightning `payload_hex` vector — no new upstream source, since rust-lightning's own tests don't assert digest values, only wire bytes). Mutation-tested the exact failure mode this closes: co-mutated the production offset (256→255) AND the old self-referential test's hardcoded literal (same change, simulating a consistently-wrong-from-the-start reading) — old test stayed green, new test alone caught it (`exit 1, 1/90 fail`); both reverted.
