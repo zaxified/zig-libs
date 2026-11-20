@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [nginx/nginx](https://github.com/nginx/nginx) (`$request_id`) | C | BSD-2-Clause | 31.8k | release-1.31.6 (2026-09-15) | Random 16-byte hex ID variable, also cited by our README *(inferred)*. |
 | Zig (`karlseguin/http.zig`) | Zig | MIT | 1.6k | pushed 2026-08-26 | README documents no request-ID middleware. No Zig alternative found. |
 
-**Where we are ahead:** the only Zig implementation; adopt-or-generate with a strict shape check on the incoming value (charset and 200-byte cap; chi and the others take it as given, per what was read), opt-out echo, zero allocation, no use of the auth slot, fiber-safe `generateInto`/`isAdoptable` for explicit-state servers. **Where we are behind:** nothing a user would notice since 2026-10-11 — generated IDs are unique within the process across threads (a process-wide atomic sequence, as chi keeps), and `Options.generator` plugs in a caller's scheme (UUID, ULID) like echo's `Generator` and tower-http's `MakeRequestId`. IDs are still not random (no `Io` entropy) — a design choice; a random scheme goes through the generator. Echo's `Skipper` is covered by registering the middleware on a router group; its `RequestIDHandler` callback by `current()`.
+**Where we are ahead:** the only Zig implementation; adopt-or-generate with a strict shape check on the incoming value (charset and 200-byte cap; chi and the others take it as given, per what was read), opt-out echo, zero allocation, no use of the auth slot, fiber-safe `generateInto`/`isAdoptable` for explicit-state servers. **Where we are behind:** nothing a user would notice — generated IDs are unique within the process across threads (a process-wide atomic sequence, as chi keeps), and `Options.generator` plugs in a caller's scheme (UUID, ULID) like echo's `Generator` and tower-http's `MakeRequestId`. IDs are still not random (no `Io` entropy) — a design choice; a random scheme goes through the generator. Echo's `Skipper` is covered by registering the middleware on a router group; its `RequestIDHandler` callback by `current()`.
 
 ## Design & invariants
 
@@ -61,11 +61,28 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   thread-local `max_adopt_len` buffer. Its result must pass `isAdoptable` and lie inside that buffer,
   otherwise it is discarded and the built-in ID is used — so `current()` keeps the adopted-ID
   shape whatever the generator does, and the echo cannot fail on a CR/LF value.
-- **Memory/concurrency:** an adopted ID borrows the request head (stable for the life of the
-  response). A generated ID lives in thread-local storage — valid because the server is
-  task-per-connection (one request at a time per thread) — reused only by the *next* request on
-  that thread. `current()` reads that thread-local, so it is meaningful only from the connection
-  thread handling the request the middleware ran on. Config is immutable after init (threadsafe).
+- **Memory/concurrency:** an adopted ID is copied, and a generated one written, into thread-local
+  storage (`id_buf`) — valid because the server is task-per-connection (one request at a time per
+  thread) — and reused only by the *next* request on that thread. The copy matters: the request head
+  an adopted ID arrived in is overwritten by the next request on the connection. `current()` reads
+  that thread-local and keeps the last ID after the chain returns, so an access log registered
+  outside the middleware still reads it; it is meaningful only from the connection thread handling
+  the request the middleware ran on (a request that bypasses the middleware sees the previous ID,
+  hence "register first"). Config is immutable after init (threadsafe).
+- **Echo is best effort:** when an outer middleware already filled the response's header table or
+  spent its header-byte budget (`TooManyHeaders`, `HeaderBytesExhausted`), the echo is skipped rather
+  than failing the request as a 500 — the ID may be peer-chosen, up to `max_adopt_len` bytes — and
+  `current()` still has the ID. Any other error from `setHeader` (for example `HeadersSent`)
+  propagates.
+- **`Options.header_name` is checked in `middleware()`:** it must be an RFC 9110 token and not
+  `Content-Length` or `Transfer-Encoding` (the framing headers `http` treats specially), otherwise
+  every echo would fail or vanish; `middleware()` panics, in every build mode, on such a name.
+- **`fork()`:** a child inherits the prefix and the sequence if the parent generated an ID before
+  forking, so parent and child then repeat each other's IDs; a pre-fork server must not generate
+  before it forks.
+- **Explicit-state servers:** `isAdoptable` and `generateInto` are `pub` and touch only process-wide
+  atomics and the caller's buffer, so an engine whose connections are fibers that migrate between
+  threads (where `current()`'s thread-local is unusable) applies the same policy itself.
 
 ## Threat model / out of scope
 
@@ -79,68 +96,55 @@ does not fill that need.
 
 ## Verification
 
-16 offline tests, most through `http.Server.serveStream`: generate + echo + `current()` agreement,
-ID uniqueness across requests, adopt a valid incoming ID, regenerate on a malformed incoming value or
-`trust_incoming=false`, `echo=false` suppresses the response header, custom header name, charset and
-length boundary of `isAdoptable`, the sequence field steps by one under one prefix, **no duplicate
-among 6400 IDs taken by 32 threads at once** (negative control: a thread-local sequence fails it),
-a custom generator used/echoed/seen by `current()` and bypassed by an adopted ID, and a generator
-breaking the contract (empty, CR/LF, comma, literal outside the buffer) falling back to the built-in
-ID (negative control: dropping the `isAdoptable` check fails it). Run: `zig build test-requestid`.
+Run: `scripts/modtest requestid`. The tests sit in `src/root.zig`; most go through
+`http.Server.serveStream`.
 
-**Mutation + review (2026-11-11, whole module,** production part of `root.zig`, schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 83 mutants, 74 killed (9 by six new tests), 9 equivalent, 0 undecided, no finding. New tests: an outer middleware that spent the header byte budget (`HeaderBytesExhausted` swallowed, echo skipped), `HeadersSent` from an earlier flush reaches the caller, the `middleware()` panic on an unusable header name (child process re-running the test binary, 4 names), every byte value against the adoptable charset alone/inside/at the end, a prefix with leading zero digits, a fresh prefix differs from an earlier one (bounded clock wait). Equivalent: id placed at another offset of the thread's buffer, the empty-name guard (`http.h1.isToken("")` is false), the prefix cache fast path (the CAS returns the stored value), the wall/monotonic clock, address and pid hash inputs (cross-process uniqueness only, invisible in one process), `@max(hash, 1)` (needs a zero hash).
-
-**Audit 2026-10-04 (mutation).** 12 schemata mutants over `current()`, the adopt-or-generate
-middleware (`trust_incoming`, `echo`, `isAdoptable` length cap and charset), and
-`generateInto`'s counter and fields: 12 killed, 0 equivalent, 0 left alive. Two survivors of
-the first run got tests: `current()` is null on a thread no middleware ran on (a fresh thread),
-and the last 16 hex digits of consecutive ids step by one (the process-wide counter).
-
-**Audit 2026-10-24 (review + mutation, grade-1 wave).** An independent read-only review found two
-MEDIUM defects, both fixed: `current()` returned a slice of the request head for an adopted ID, which
-the next request on the connection overwrites (an adopted ID is now copied into the thread-local
-buffer; `current()` keeps the last ID so an access log registered outside the middleware still reads
-it after the chain), and a `header_name` that is not a token, or is `Content-Length`/
-`Transfer-Encoding`, made every echo fail or vanish (`middleware()` now panics on it). Documented: a
-`fork()` child repeats the parent's IDs if the parent generated one before forking. 42 schemata
-mutants over the final source (`trust_incoming`, `echo`, the adopted copy, `customId`'s bounds,
-`isAdoptable` per class and length, `isUsableHeaderName`, `generateInto`, `processPrefix`): 40
-killed, 2 equivalent — skipping the prefix cache hit (the `cmpxchg` then returns the stored value)
-and the `@max(…, 1)` zero-bump (a hash of exactly 0, 2^-64). Four survivors of the first run got
-tests: a generator result that is the whole buffer or runs past either end, and 32 threads racing
-the FIRST prefix computation.
-
-**Model-fuzz (2026-10-11).** Two seeded tests (`std.Random.DefaultPrng`, fixed seeds) compare the
-module with a naive restatement of the documented policy (an explicit allowed-character string, a
-length cap of 200, a 32-lowercase-hex check for generated ids; no call into the module's own
-predicate). (1) 4000 random byte strings against `isAdoptable` (length 0/1/200/201/long, clean and
-dirty bytes). (2) 400 requests through `http.Server.serveStream` with random `header_name`,
-`trust_incoming`, `echo`, header absent/present, header spelling (case-insensitive match or a
-different header), lengths around the 200 boundary and metacharacter-laden values; checks the
-response header, `current()` (via body) and uniqueness of generated ids. Reach counters fail the
-test unless every class is hit: adopted, adopted at exactly 200, regenerated for malformed, for
-over-long, for `trust_incoming=false`, header absent, `echo=false`. Negative control: `>` to `>=` on
-the length cap in `isAdoptable` made both tests fail (seed + case/step printed).
+- **Adopt or generate:** a generated ID is echoed and agrees with `current()`; two requests get different
+  IDs; a valid incoming ID is adopted; a malformed one, or `trust_incoming = false`, regenerates; the
+  charset (every single byte value, alone and inside an ID, DEL and high-bit bytes) and the length
+  boundary of `isAdoptable`; `echo = false` suppresses the response header; a custom header name; a
+  `header_name` that is not a token, or a framing header, panics in `middleware()` (a child process
+  re-running the test binary).
+- **Echo failures:** an outer middleware that filled the header table, or spent the header-byte budget,
+  leaves the echo skipped without a 500; an error other than those two propagates.
+- **Generated IDs:** a prefix with leading zero digits is still 32 hex characters; one prefix with a
+  sequence field that steps by one; a freshly computed prefix differs from an earlier one; no duplicate
+  among IDs taken by many threads at once, including the race for the first prefix computation.
+- **Thread-local copy:** `current()` is null on a thread no middleware ran on; an adopted ID is this
+  thread's copy and is still current after the chain.
+- **Generator:** a custom scheme is used, echoed and seen by `current()`, an incoming ID still wins; a
+  result that is empty, carries a bad byte or lies outside the buffer (at either end) falls back to the
+  built-in ID.
+- **Model-fuzz** (seeded `std.Random.DefaultPrng`, fixed seeds; a naive restatement of the documented
+  policy with an explicit allowed-character string, no call into the module's own predicate): random
+  bytes against `isAdoptable`, and random options, header spellings, lengths around the 200-byte
+  boundary and metacharacter-laden values through the middleware against the model, with reach
+  counters that fail the test unless every class (adopted, adopted at exactly 200, regenerated for
+  malformed, for over-long, for `trust_incoming = false`, header absent, `echo = false`) is hit. The
+  model is `modelAdoptable` / `modelIsGenerated` (the card's `**Model:**` line).
+- **Fuzz:** no fuzz obligation under check-fuzz (the card's Hardening line); the model-fuzz tests above
+  are the randomised coverage.
+- **Tools:** `tools/lead_probe` (chi's behaviour on a hostile incoming ID), `tools/go_bench` and
+  `tools/rust_fast_bench` (the other sides of the comparative benchmark), `tools/bench.zig`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-requestid`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 12.3 %): ref 0.14–0.16×, against 0.15–0.24× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+`zig build bench-requestid` (`tools/bench.zig`, ReleaseFast, `BENCH_ROUNDS=5`) against go-chi/chi
+(`tools/go_bench`) and tower-http (`tools/rust_fast_bench`), net of each side's HTTP stack. The current
+figures, with their date, are the card's `**Performance:**` line; they are not repeated here.
+
+## What is deliberately not done
+
+- **A random (unguessable) built-in ID** — the generated ID is a correlation ID, not a security token:
+  no `Io` entropy is taken, so generation allocates nothing and costs no syscall. A random scheme (UUID,
+  ULID, a CSPRNG token) goes through `Options.generator`.
 
 ## Backlog / deferred
 
-- **Delta audit 2026-10-29 (no-panic sweep § GJ):** 1 mutant over the best-effort echo (budget errors re-propagated): 1/1 killed on the first run. Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GJ):** RID-2 (LOW): a bad `header_name` is a documented checked `@panic` in `middleware()`; an erroring `validate(options)` would be the alternative.
-
-- ~~**Collision-free generated IDs**~~ — **DONE 2026-10-11** (process-wide atomic sequence + per-process prefix). Was: *(survey 2026-09-30)* — the current 32-hex ID (clock + thread-address nonce + per-thread counter) can repeat across connection threads (documented in `generateInto`: 128 distinct nonces over 300 threads, first request of two connections can match on all three fields). Why: duplicate IDs merge two requests' logs and traces, which is the failure the module exists to prevent; chi shares a process-wide atomic counter. Effort: small (process-wide atomic counter in the low bits, or a seeded random prefix taken once at `init`). Fits §2.
-- ~~**Pluggable generator**~~ — **DONE 2026-10-11** (`Options.generator`, a context + function; output checked with `isAdoptable`). Was: *(survey 2026-09-30)* — `Options.generate: ?*const fn (buf: *[max_adopt_len]u8) []const u8` (UUIDv4/v7, ULID, the caller's scheme). Why: echo and tower-http both offer it; teams often mandate a format. Effort: small (~30 lines). Fits §2.
-- ~~README drift (charset, test count)~~ — fixed 2026-10-11.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · any · util · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta` in
-src/root.zig.
+- **An erroring `validate(options)`** as the alternative to the checked panic in `middleware()` on an
+  unusable `header_name` (idea, LOW; the panic is the documented behaviour).
 
 ## Anchoring
 

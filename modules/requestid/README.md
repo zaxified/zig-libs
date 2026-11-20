@@ -46,7 +46,7 @@ var ri = requestid.RequestId{ .options = .{ .generator = .{ .run = Gen.run } } }
 ```
 
 - **Role:** util. **Platform:** any. **Deps:** `router`,
-  `http`. **Concurrency:** threadsafe — per-request state is thread-local
+  `http`, `clock`. **Concurrency:** threadsafe — per-request state is thread-local
   (the server is task-per-connection: one request at a time per thread, so the
   ID lives until the response is flushed); the config is immutable. `current()`
   is meaningful only from the connection thread handling the request.
@@ -57,7 +57,6 @@ zig-libs authors (MIT). No third-party source consulted or copied. The comparati
 
 ## Verification
 
-`zig build test-requestid` — 16 offline tests (adopt-or-generate through
-`http.Server.serveStream`, the `isAdoptable` charset and length cap, no duplicate
-ID across 32 threads, the custom generator and its fallback, seeded model-fuzz);
-details in `SPEC.md` § Verification.
+`scripts/modtest requestid` — adopt-or-generate through `http.Server.serveStream`, the
+`isAdoptable` charset and length cap, no duplicate ID across threads, the custom generator and its
+fallback, seeded model-fuzz; details in `SPEC.md` § Verification.

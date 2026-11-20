@@ -5,11 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
-- **2026-11-11** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation run (83 schemata mutants over the production code, 74 killed, 9 equivalent) added six tests: the echo skipped on an exhausted header byte budget (`HeaderBytesExhausted`), other echo errors propagating (`HeadersSent`), the `middleware()` panic on a bad `header_name` (checked in a child process), every byte value against the adoptable charset, a prefix with leading zeros still 32 hex characters, and a fresh prefix that is not a constant.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the header-name character test in `isUsableHeaderName` calls `http.h1.isToken` (same RFC 9110 tchar set, non-empty); the framing-header rejection stays. (duplicate-code pass)
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private wall/monotonic OS reads that only seed the process prefix hash (duplicate-code pass) now call `clock.realtimeNs()` / `clock.monotonicNs()`; the seed values differ in representation only. New dependency: `clock`.
-- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 1 mutant over the best-effort echo (budget errors re-propagated): 1/1 killed on the first run. Card A1 again.
 - **2026-10-29** — **Behaviour change (fix):** the response echo of the ID is best effort: when an outer middleware already filled the response header table or header-byte budget, the echo is skipped instead of failing the request with a 500 (`current()` still has the ID). No-panic sweep + blind review (§ GJ).
 - **2026-10-24** — **Behaviour change (fix):** an adopted ID is copied into the thread-local buffer, so
   `current()` never points into a request head the next request overwrites; it keeps the last ID after the
@@ -20,7 +17,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   bench gains a tower-http 0.7.1 side (`tools/rust_fast_bench`, `BENCH_FAST=0` skips it); `tools/lead_probe`
   shows chi adopting hostile incoming IDs verbatim. Grade 1.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** tools ported to Zig 0.17.0 (compile only): `tools/bench.zig`: `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase`.
 - **2026-10-11** — Generated IDs are now unique within the process across threads: 16 hex of a per-process prefix + 16 hex of a process-wide atomic sequence (was monotonic ns · thread-address nonce · per-thread counter, which could repeat across connection threads). The ID is still 32 lowercase hex; its fields changed. New `Options.generator` (`Generator`: context + function) for a caller's ID scheme; an output that fails `isAdoptable` or lies outside the buffer falls back to the built-in ID. README charset and test count corrected.
 
 - **2026-10-11** — tests: seeded model-fuzz against a naive adopt-or-generate reference model (`isAdoptable` on random bytes; the middleware over random options, headers and lengths). No API or behaviour change.
