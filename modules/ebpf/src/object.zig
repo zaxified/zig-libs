@@ -500,6 +500,11 @@ pub const CoreApplyError = error{
     /// The field is absent from the target BTF and the relocation kind has no
     /// defined answer for that (only `FIELD_EXISTS` does).
     CoreFieldNotFound,
+    /// A type-based relocation (`TYPE_ID_TARGET`, `TYPE_SIZE`) whose type has
+    /// no matching type in the target BTF.
+    CoreTypeNotFound,
+    /// `ENUMVAL_VALUE` whose enumerator is in no matching target enum.
+    CoreEnumvalNotFound,
     /// `insn_off` outside the program.
     RelocationOutOfRange,
 } || btfext.CoreError;
@@ -1318,8 +1323,12 @@ pub fn patchCoreInsn(insns: []Insn, insn_idx: u32, kind: btfext.ReloKind, value:
         BPF_ALU, BPF_ALU64 => {
             // `BPF_X` (source = register) leaves no immediate to patch.
             if (insn.code & 0x08 != 0) return error.UnsupportedCoreInsn;
-            if (value > std.math.maxInt(i32)) return error.CoreValueTooLarge;
-            insn.imm = @intCast(value);
+            // The immediate sign-extends (ALU64), so a negative value (an
+            // `ENUMVAL_VALUE` of a signed enum arrives as its 64-bit
+            // two's-complement pattern) is valid when it fits an `i32`.
+            const sv: i64 = @bitCast(value);
+            if (sv < std.math.minInt(i32) or sv > std.math.maxInt(i32)) return error.CoreValueTooLarge;
+            insn.imm = @intCast(sv);
         },
         BPF_LD => {
             if (insn.code != LD_IMM64_CODE) return error.UnsupportedCoreInsn;
@@ -1352,8 +1361,13 @@ fn sizeBits(bytes: u64) CoreApplyError!u8 {
 pub fn applyCoreRelos(prog: *ProgramSpec, local: *const Btf, target: *const Btf) CoreApplyError!usize {
     var n: usize = 0;
     for (prog.core_relos) |r| {
-        const res = try btfext.computeFieldRelo(local, target, r);
-        if (!res.exists and res.kind != .field_exists) return error.CoreFieldNotFound;
+        const res = try btfext.computeRelo(local, target, r);
+        if (!res.exists) switch (res.kind) {
+            .field_exists, .type_exists, .type_matches, .enumval_exists => {},
+            .type_id_target, .type_size => return error.CoreTypeNotFound,
+            .enumval_value => return error.CoreEnumvalNotFound,
+            else => return error.CoreFieldNotFound,
+        };
         try patchCoreInsn(prog.insns, r.insn_off, res.kind, res.value);
         n += 1;
     }
@@ -4269,4 +4283,64 @@ test "applyCoreRelos: a missing field is an error unless the relocation asks whe
     relos[0].kind = 0;
     try testing.expectEqual(@as(usize, 1), try applyCoreRelos(&prog, &local, &local));
     try testing.expectEqual(@as(i16, 4), insns[0].off);
+}
+
+test "applyCoreRelos: type-based relocations patch `r = value` and map absence to typed errors" {
+    const gpa = testing.allocator;
+    var l = try RawB.init(gpa);
+    defer l.deinit(gpa);
+    const a0 = try l.str(gpa, "0");
+    const a01 = try l.str(gpa, "0:1");
+    const ln_s = try l.str(gpa, "S");
+    const ln_e = try l.str(gpa, "E");
+    const ln_n = try l.str(gpa, "NEG");
+    const ln_p = try l.str(gpa, "POS");
+    const li = try l.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    const ls = try l.rec(gpa, ln_s, btf_mod.K_STRUCT, 0, false, 4, &.{});
+    const le = try l.rec(gpa, ln_e, btf_mod.K_ENUM, 2, true, 4, &.{ ln_p, 1, ln_n, @bitCast(@as(i32, -2)) });
+    _ = li;
+    const lb = try l.finish(gpa);
+    defer gpa.free(lb);
+    var local = try btf_mod.parse(gpa, lb, .{});
+    defer local.deinit();
+
+    var t = try RawB.init(gpa);
+    defer t.deinit(gpa);
+    const tn = try t.str(gpa, "S");
+    const te_n = try t.str(gpa, "E");
+    const te_neg = try t.str(gpa, "NEG");
+    _ = try t.rec(gpa, tn, btf_mod.K_STRUCT, 0, false, 40, &.{});
+    _ = try t.rec(gpa, te_n, btf_mod.K_ENUM, 1, true, 4, &.{ te_neg, @bitCast(@as(i32, -9)) });
+    const tb = try t.finish(gpa);
+    defer gpa.free(tb);
+    var target = try btf_mod.parse(gpa, tb, .{});
+    defer target.deinit();
+
+    // `r1 = <placeholder>` (MOV64 K), twice, then a 64-bit constant load
+    var insns = [_]Insn{ @bitCast(ins8(0xb7, 0x01, 0, 77)), @bitCast(ins8(0xb7, 0x02, 0, 77)) };
+    var relos = [_]btfext.CoreRelo{
+        .{ .insn_off = 0, .type_id = ls, .access_str_off = a0, .kind = 9 }, // TYPE_SIZE
+        .{ .insn_off = 1, .type_id = le, .access_str_off = a01, .kind = 11 }, // ENUMVAL_VALUE of NEG
+    };
+    var prog: ProgramSpec = undefined;
+    prog.insns = &insns;
+    prog.core_relos = &relos;
+    try testing.expectEqual(@as(usize, 2), try applyCoreRelos(&prog, &local, &target));
+    try testing.expectEqual(@as(i32, 40), insns[0].imm);
+    try testing.expectEqual(@as(i32, -9), insns[1].imm); // a negative enumerator survives the imm
+
+    // the enumerator the target lacks, and a type it lacks, are typed errors
+    var empty = try RawB.init(gpa);
+    defer empty.deinit(gpa);
+    _ = try empty.rec(gpa, 0, btf_mod.K_INT, 0, false, 4, &.{32});
+    const eb = try empty.finish(gpa);
+    defer gpa.free(eb);
+    var none = try btf_mod.parse(gpa, eb, .{});
+    defer none.deinit();
+    try testing.expectError(error.CoreTypeNotFound, applyCoreRelos(&prog, &local, &none));
+    relos[0].kind = 8; // TYPE_EXISTS: 0 is a valid answer
+    try testing.expectError(error.CoreEnumvalNotFound, applyCoreRelos(&prog, &local, &none));
+    relos[1].kind = 10; // ENUMVAL_EXISTS
+    try testing.expectEqual(@as(usize, 2), try applyCoreRelos(&prog, &local, &none));
+    try testing.expectEqual(@as(i32, 0), insns[0].imm);
 }

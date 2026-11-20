@@ -249,6 +249,9 @@ pub const parseBtfExt = btfext.parseExt;
 pub const btfFieldByName = btfext.fieldByName;
 /// Apply one `bpf_core_relo` from a program's BTF against a target BTF.
 pub const computeCoreFieldRelo = btfext.computeFieldRelo;
+/// Compute any `bpf_core_relo`: field, type-based and enum-value kinds, over
+/// every same-named candidate of the target (ambiguity is an error).
+pub const computeCoreRelo = btfext.computeRelo;
 
 pub const tracing = @import("tracing.zig");
 /// Which BTF-typed hook a name refers to (`fentry`, `tp_btf`, `lsm`, …).

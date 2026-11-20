@@ -363,12 +363,13 @@ _ = try ebpf.applyCoreRelos(p, &obj.btf.?, &vmlinux);
 // p.insns now reference THIS kernel's field offsets.
 ```
 
-**Still** not covered, and not pretended: multi-candidate matching and
-ambiguity detection (the first name match wins), and the non-field
-relocation kinds (`TYPE_ID_*`, `TYPE_EXISTS`, `TYPE_SIZE`, `TYPE_MATCHES`,
-`ENUMVAL_*`) — those are parsed and refused with
-`error.UnsupportedReloKind`, never computed wrong. See `src/btfext.zig`'s
-header and `SPEC.md`'s backlog.
+Every `bpf_core_relo` kind is computed — field, type-based
+(`TYPE_ID_*`, `TYPE_EXISTS`, `TYPE_SIZE`, `TYPE_MATCHES`) and enum-value
+(`ENUMVAL_*`) — against every same-named candidate of the target, like libbpf:
+candidates that do not match are ignored, the matching ones must agree
+(`error.AmbiguousRelocation`), and a kind with no answer for a missing type is
+a typed error (`CoreFieldNotFound`/`CoreTypeNotFound`/`CoreEnumvalNotFound`),
+never a wrong number. `ebpf.computeCoreRelo` is the single-relocation entry.
 
 ### Loading a real `clang -target bpf` object
 

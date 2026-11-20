@@ -29,21 +29,18 @@
 //!   anonymous members, which `struct sk_buff` requires,
 //! - all six `BPF_CORE_FIELD_*` values (`BYTE_OFFSET`, `BYTE_SIZE`,
 //!   `EXISTS`, `SIGNED`, `LSHIFT_U64`, `RSHIFT_U64`), including the bitfield
-//!   load-widening rule that makes `LSHIFT`/`RSHIFT` correct.
+//!   load-widening rule that makes `LSHIFT`/`RSHIFT` correct,
+//! - the **type-based** (`TYPE_ID_LOCAL`/`_TARGET`, `TYPE_EXISTS`,
+//!   `TYPE_SIZE`, `TYPE_MATCHES`) and **enum-value** (`ENUMVAL_EXISTS`,
+//!   `ENUMVAL_VALUE`) kinds, `computeRelo`,
+//! - **multi-candidate matching**: every same-named target type is a
+//!   candidate, non-matching ones are ignored and the matching ones must agree
+//!   (`error.AmbiguousRelocation`), as libbpf does.
 //!
 //! **Deliberately NOT implemented (and not pretended):**
-//! - **Instruction patching.** `computeFieldRelo` returns the value; nothing
-//!   here rewrites a `[]Insn`. Wiring that needs a BPF-object loader
-//!   (section-to-program mapping, map relocation, `fd_array`) this module
-//!   does not have.
-//! - **Multi-candidate matching and ambiguity detection.** libbpf collects
-//!   *every* target type with a matching name, relocates against each, and
-//!   errors if they disagree. This takes the **first** match and says so.
-//!   On vmlinux BTF that is almost always the only one; it is not a
-//!   guarantee.
-//! - **The non-field relocation kinds**: `TYPE_ID_LOCAL`/`_TARGET`,
-//!   `TYPE_EXISTS`, `TYPE_SIZE`, `TYPE_MATCHES`, `ENUMVAL_EXISTS`,
-//!   `ENUMVAL_VALUE`. They are parsed and reported as
+//! - **Instruction patching.** `computeRelo` returns the value; nothing
+//!   here rewrites a `[]Insn` (`object.applyCoreRelos` does).
+//! - A relocation kind this build has never heard of is
 //!   `error.UnsupportedReloKind`, never silently computed wrong.
 //! - **`.BTF.ext` relocation of the section-name offsets** (`.rel.BTF.ext`)
 //!   and BPF-object ELF loading generally.
@@ -211,9 +208,14 @@ pub const CoreError = error{
     /// ReleaseFast a wrapped `bit_offset` is not a crash but a wrong offset
     /// patched into a loaded BPF instruction, which is the worse outcome.
     FieldOffsetOverflow,
-    /// One of the relocation kinds this module deliberately does not compute
-    /// (see this file's header).
+    /// A relocation kind this module does not know (a future
+    /// `enum bpf_core_relo_kind` value), or `FieldInfo.value` asked for a
+    /// non-field kind.
     UnsupportedReloKind,
+    /// More than one candidate in the target matched and they disagree on the
+    /// answer (libbpf's "ambiguous relocation"): the program would behave
+    /// differently depending on which same-named type was meant.
+    AmbiguousRelocation,
 } || btf.TypeError;
 
 // ── the container ───────────────────────────────────────────────────────────
@@ -541,9 +543,10 @@ pub fn stripFlavor(name: []const u8) []const u8 {
 /// the root type or any named member is absent — which is exactly what a
 /// `BPF_CORE_FIELD_EXISTS` relocation reports as 0.
 ///
-/// Matching is single-candidate: the first target type with the root's
-/// flavor-stripped name and kind wins. See this file's header for why that is
-/// weaker than libbpf.
+/// Matching is against the FIRST candidate only: the first target type with
+/// the root's flavor-stripped name and kind. `computeFieldRelo` is the
+/// multi-candidate caller (every candidate, ambiguity is an error); this is the
+/// building block for a caller that has already chosen one.
 pub fn matchFieldSpec(
     local: *const Btf,
     spec: FieldSpec,
@@ -552,10 +555,50 @@ pub fn matchFieldSpec(
     const root_local = try local.byId(try local.skipModifiers(spec.root_type_id));
     const raw_name = local.str(root_local.name_off) orelse return error.TargetTypeNotFound;
     if (raw_name.len == 0) return error.TargetTypeNotFound; // an anonymous root cannot be matched by name
-    const want = stripFlavor(raw_name);
+    var it = candidates(target, stripFlavor(raw_name), root_local.kind);
+    const root_target = it.next() orelse return null;
+    return matchFieldSpecAt(spec, target, root_target);
+}
 
-    const root_target = target.findByNameKind(want, root_local.kind) orelse return null;
+/// Every target type that is a CO-RE candidate for a local type: same
+/// flavor-stripped ("essential") name, same kind (`ENUM` and `ENUM64` count as
+/// one kind, as in libbpf). Ids ascend, a split blob's base first.
+pub const CandidateIter = struct {
+    target: *const Btf,
+    want: []const u8,
+    kind: btf.Kind,
+    next_id: u32 = 1,
 
+    pub fn next(self: *CandidateIter) ?u32 {
+        const end = self.target.endId();
+        while (self.next_id < end) {
+            const id = self.next_id;
+            self.next_id += 1;
+            const t = self.target.byId(id) catch continue;
+            if (!kindCompat(t.kind, self.kind)) continue;
+            const n = self.target.str(t.name_off) orelse continue;
+            if (std.mem.eql(u8, stripFlavor(n), self.want)) return id;
+        }
+        return null;
+    }
+};
+
+/// Start a candidate scan: `want` must already be flavor-stripped.
+pub fn candidates(target: *const Btf, want: []const u8, kind: btf.Kind) CandidateIter {
+    return .{ .target = target, .want = want, .kind = kind };
+}
+
+fn kindCompat(a: btf.Kind, b: btf.Kind) bool {
+    if (a == b) return true;
+    return (a == .@"enum" or a == .enum64) and (b == .@"enum" or b == .enum64);
+}
+
+/// `matchFieldSpec` against one chosen root type of `target`.
+pub fn matchFieldSpecAt(
+    spec: FieldSpec,
+    target: *const Btf,
+    root_target: u32,
+) CoreError!?FieldSpec {
     var out: FieldSpec = .{
         .root_type_id = root_target,
         .steps = undefined,
@@ -774,14 +817,235 @@ pub fn computeFieldRelo(local: *const Btf, target: *const Btf, relo: CoreRelo) C
     const access = local.str(relo.access_str_off) orelse return error.BadAccessSpec;
 
     const lspec = try parseFieldSpec(local, relo.type_id, access);
-    const tspec = (try matchFieldSpec(local, lspec, target)) orelse {
-        // Absent in the target. Only FIELD_EXISTS has a defined answer.
-        if (kind == .field_exists) return .{ .kind = kind, .exists = false, .value = 0, .field = null };
-        return .{ .kind = kind, .exists = false, .value = 0, .field = null };
-    };
+    const root_local = try local.byId(try local.skipModifiers(lspec.root_type_id));
+    const raw_name = local.str(root_local.name_off) orelse return error.TargetTypeNotFound;
+    if (raw_name.len == 0) return error.TargetTypeNotFound;
 
-    const geo = try fieldGeometry(target, tspec.leaf_type_id, tspec.bit_offset, tspec.bitfield_size);
-    return .{ .kind = kind, .exists = true, .value = try geo.value(kind), .field = geo };
+    // Every candidate is relocated; the ones where the spec does not resolve
+    // are ignored, and the rest must agree (libbpf's rule). Absent from all
+    // of them: only the `*_EXISTS` kind has a defined answer (0), which the
+    // caller (`applyCoreRelos`) distinguishes by `exists`.
+    var found: ?ReloResult = null;
+    var it = candidates(target, stripFlavor(raw_name), root_local.kind);
+    while (it.next()) |cid| {
+        const tspec = (try matchFieldSpecAt(lspec, target, cid)) orelse continue;
+        const geo = try fieldGeometry(target, tspec.leaf_type_id, tspec.bit_offset, tspec.bitfield_size);
+        const res: ReloResult = .{ .kind = kind, .exists = true, .value = try geo.value(kind), .field = geo };
+        if (found) |f| {
+            if (f.value != res.value or f.field.?.bit_offset != geo.bit_offset) return error.AmbiguousRelocation;
+        } else found = res;
+    }
+    return found orelse .{ .kind = kind, .exists = false, .value = 0, .field = null };
+}
+
+/// Compute any `bpf_core_relo`, field or type or enum-value based.
+///
+/// The field kinds are `computeFieldRelo`. The type kinds take the access
+/// string `"0"` and the enum-value kinds `"0:N"` (`N` = the enumerator index
+/// in the LOCAL enum); like libbpf, every same-named candidate of the target
+/// is tried, a candidate that does not match is ignored, the matching ones
+/// must agree (`error.AmbiguousRelocation`), and none matching is
+/// `exists = false` / value 0 — which is the answer for the `*_EXISTS` and
+/// `TYPE_MATCHES` kinds and "cannot be relocated" for the others.
+pub fn computeRelo(local: *const Btf, target: *const Btf, relo: CoreRelo) CoreError!ReloResult {
+    const kind = relo.reloKind();
+    if (kind.isField()) return computeFieldRelo(local, target, relo);
+    switch (kind) {
+        .type_id_local, .type_id_target, .type_exists, .type_size, .type_matches => {},
+        .enumval_exists, .enumval_value => return computeEnumvalRelo(local, target, relo, kind),
+        else => return error.UnsupportedReloKind,
+    }
+    const access = local.str(relo.access_str_off) orelse return error.BadAccessSpec;
+    var idx: [max_spec_len]u32 = undefined;
+    const n = try parseAccessIndices(access, &idx);
+    if (n != 1 or idx[0] != 0) return error.BadAccessSpec;
+    _ = try local.byId(relo.type_id);
+    if (kind == .type_id_local)
+        return .{ .kind = kind, .exists = true, .value = relo.type_id, .field = null };
+
+    // A qualifier has no name to match by; look through it (but not through a
+    // typedef, whose own name is what `bpf_core_type_id_kernel(pid_t)` means).
+    var lid = relo.type_id;
+    var lt = try local.byId(lid);
+    while (lt.kind == .@"const" or lt.kind == .@"volatile" or lt.kind == .restrict or lt.kind == .type_tag) {
+        lid = lt.size_type;
+        if (lid == 0) return error.TargetTypeNotFound;
+        lt = try local.byId(lid);
+    }
+    const raw_name = local.str(lt.name_off) orelse return error.TargetTypeNotFound;
+    if (raw_name.len == 0) return error.TargetTypeNotFound;
+
+    var found: ?u64 = null;
+    var it = candidates(target, stripFlavor(raw_name), lt.kind);
+    while (it.next()) |cid| {
+        const ok = if (kind == .type_matches)
+            try typesMatch(local, lid, target, cid, false, max_match_depth)
+        else
+            try typesCompat(local, lid, target, cid, max_compat_depth);
+        if (!ok) continue;
+        const v: u64 = switch (kind) {
+            .type_id_target => cid,
+            .type_size => try target.sizeOf(cid),
+            else => 1,
+        };
+        if (found) |f| {
+            if (f != v) return error.AmbiguousRelocation;
+        } else found = v;
+    }
+    return .{ .kind = kind, .exists = found != null, .value = found orelse 0, .field = null };
+}
+
+fn computeEnumvalRelo(local: *const Btf, target: *const Btf, relo: CoreRelo, kind: ReloKind) CoreError!ReloResult {
+    const access = local.str(relo.access_str_off) orelse return error.BadAccessSpec;
+    var idx: [max_spec_len]u32 = undefined;
+    const n = try parseAccessIndices(access, &idx);
+    if (n != 2 or idx[0] != 0) return error.BadAccessSpec;
+    const lt = try local.resolve(relo.type_id);
+    if (lt.kind != .@"enum" and lt.kind != .enum64) return error.BadLocalSpec;
+    if (idx[1] >= lt.vlen) return error.BadLocalSpec;
+    const lv = try local.enumValue(lt, @intCast(idx[1]));
+    const vname = local.str(lv.name_off) orelse return error.BadLocalSpec;
+    const raw_name = local.str(lt.name_off) orelse return error.TargetTypeNotFound;
+    if (raw_name.len == 0) return error.TargetTypeNotFound;
+
+    var found: ?u64 = null;
+    var it = candidates(target, stripFlavor(raw_name), lt.kind);
+    while (it.next()) |cid| {
+        const tt = try target.byId(cid);
+        const tv = (try findEnumerator(target, tt, vname)) orelse continue;
+        const v: u64 = if (kind == .enumval_value) @bitCast(tv.value) else 1;
+        if (found) |f| {
+            if (f != v) return error.AmbiguousRelocation;
+        } else found = v;
+    }
+    return .{ .kind = kind, .exists = found != null, .value = found orelse 0, .field = null };
+}
+
+fn findEnumerator(b: *const Btf, t: btf.Type, name: []const u8) CoreError!?btf.EnumValue {
+    var i: u16 = 0;
+    while (i < t.vlen) : (i += 1) {
+        const v = try b.enumValue(t, i);
+        const n = b.str(v.name_off) orelse continue;
+        if (std.mem.eql(u8, n, name)) return v;
+    }
+    return null;
+}
+
+/// libbpf's `MAX_TYPES_ARE_COMPAT_DEPTH` / `MAX_TYPES_MATCH_DEPTH`.
+const max_compat_depth: u32 = 2;
+const max_match_depth: u32 = 32;
+
+/// The type `id` names after looking through typedefs and qualifiers, or
+/// `null` for `void` (id 0).
+fn resolveOrVoid(b: *const Btf, id: u32) CoreError!?btf.Type {
+    if (id == 0) return null;
+    return try b.resolve(id);
+}
+
+fn intIsPlain(b: *const Btf, t: btf.Type) CoreError!bool {
+    return (try b.intInfo(t)).offset == 0;
+}
+
+/// `bpf_core_types_are_compat`: the kinds agree (`ENUM`/`ENUM64` interchange),
+/// recursing through pointers, array elements and `FUNC_PROTO` signatures, at
+/// most `depth` levels deep (a deeper type is an error, as in libbpf). Names
+/// below the root are not compared.
+fn typesCompat(l: *const Btf, lid: u32, t: *const Btf, tid: u32, depth: u32) CoreError!bool {
+    if (depth == 0) return error.TypeChainTooDeep;
+    const lt = (try resolveOrVoid(l, lid)) orelse return (try resolveOrVoid(t, tid)) == null;
+    const tt = (try resolveOrVoid(t, tid)) orelse return false;
+    if (!kindCompat(lt.kind, tt.kind)) return false;
+    switch (lt.kind) {
+        .@"struct", .@"union", .@"enum", .enum64, .fwd, .float => return true,
+        .int => return (try intIsPlain(l, lt)) and (try intIsPlain(t, tt)),
+        .ptr => return typesCompat(l, lt.size_type, t, tt.size_type, depth - 1),
+        .array => return typesCompat(l, (try l.arrayInfo(lt)).elem_type, t, (try t.arrayInfo(tt)).elem_type, depth - 1),
+        .func_proto => {
+            if (lt.vlen != tt.vlen) return false;
+            var i: u16 = 0;
+            while (i < lt.vlen) : (i += 1) {
+                const lp = try l.param(lt, i);
+                const tp = try t.param(tt, i);
+                if (!try typesCompat(l, lp.type_id, t, tp.type_id, depth - 1)) return false;
+            }
+            return typesCompat(l, lt.size_type, t, tt.size_type, depth - 1);
+        },
+        else => return false,
+    }
+}
+
+/// `bpf_core_types_match` (`BPF_CORE_TYPE_MATCHES`): a structural comparison.
+/// Named kinds (enum, struct, union, forward declaration) must have the same
+/// flavor-stripped name; every LOCAL enumerator / named member must exist in
+/// the target one (the target may have more), members matching recursively;
+/// enumerator VALUES and member offsets are not compared. A forward
+/// declaration on either side matches any struct/union behind a pointer.
+fn typesMatch(l: *const Btf, lid: u32, t: *const Btf, tid: u32, behind_ptr: bool, depth: u32) CoreError!bool {
+    if (depth == 0) return error.TypeChainTooDeep;
+    const lt = (try resolveOrVoid(l, lid)) orelse return (try resolveOrVoid(t, tid)) == null;
+    const tt = (try resolveOrVoid(t, tid)) orelse return false;
+
+    const l_agg = lt.kind == .fwd or lt.isComposite();
+    const t_agg = tt.kind == .fwd or tt.isComposite();
+    if (behind_ptr and l_agg and t_agg and (lt.kind == .fwd or tt.kind == .fwd)) return true;
+    if (!kindCompat(lt.kind, tt.kind)) return false;
+
+    switch (lt.kind) {
+        .@"enum", .enum64, .fwd, .@"struct", .@"union" => {
+            const ln = stripFlavor(l.str(lt.name_off) orelse return false);
+            const tn = stripFlavor(t.str(tt.name_off) orelse return false);
+            if (!std.mem.eql(u8, ln, tn)) return false;
+        },
+        else => {},
+    }
+    switch (lt.kind) {
+        .@"enum", .enum64 => {
+            var i: u16 = 0;
+            while (i < lt.vlen) : (i += 1) {
+                const v = try l.enumValue(lt, i);
+                const name = l.str(v.name_off) orelse return false;
+                if ((try findEnumerator(t, tt, name)) == null) return false;
+            }
+            return true;
+        },
+        .fwd => return true,
+        .@"struct", .@"union" => {
+            if (lt.vlen > tt.vlen) return false;
+            var i: u16 = 0;
+            while (i < lt.vlen) : (i += 1) {
+                const lm = try l.member(lt, i);
+                const name = l.str(lm.name_off) orelse return false;
+                if (name.len == 0) continue; // an anonymous member cannot be looked up by name
+                var found = false;
+                var j: u16 = 0;
+                while (j < tt.vlen) : (j += 1) {
+                    const tm = try t.member(tt, j);
+                    const tmn = t.str(tm.name_off) orelse continue;
+                    if (!std.mem.eql(u8, name, tmn)) continue;
+                    found = true;
+                    if (!try typesMatch(l, lm.type_id, t, tm.type_id, false, depth - 1)) return false;
+                    break;
+                }
+                if (!found) return false;
+            }
+            return true;
+        },
+        .int => return (try intIsPlain(l, lt)) and (try intIsPlain(t, tt)),
+        .float => return true,
+        .ptr => return typesMatch(l, lt.size_type, t, tt.size_type, true, depth - 1),
+        .array => return typesMatch(l, (try l.arrayInfo(lt)).elem_type, t, (try t.arrayInfo(tt)).elem_type, false, depth - 1),
+        .func_proto => {
+            if (lt.vlen != tt.vlen) return false;
+            var i: u16 = 0;
+            while (i < lt.vlen) : (i += 1) {
+                const lp = try l.param(lt, i);
+                const tp = try t.param(tt, i);
+                if (!try typesMatch(l, lp.type_id, t, tp.type_id, false, depth - 1)) return false;
+            }
+            return typesMatch(l, lt.size_type, t, tt.size_type, false, depth - 1);
+        },
+        else => return false,
+    }
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -2236,4 +2500,241 @@ test "round 3: local walk and match refuse nameless / unresolvable roots and mem
     try testing.expectEqualStrings("f", m.steps[3].name.?);
     try testing.expectEqual(@as(u64, 32), m.bit_offset);
     try testing.expectEqual(int4, m.leaf_type_id);
+}
+
+// ── type-based and enum-value relocations, multi-candidate matching ─────────
+
+const TestBlob = struct {
+    raw: RawBtf,
+    bytes: []u8 = &.{},
+    parsed: Btf = undefined,
+
+    fn init() !TestBlob {
+        return .{ .raw = try RawBtf.init(testing.allocator) };
+    }
+    fn done(self: *TestBlob) void {
+        self.raw.deinit(testing.allocator);
+    }
+    fn finish(self: *TestBlob) !void {
+        self.bytes = try self.raw.finish(testing.allocator);
+        self.parsed = try btf.parse(testing.allocator, self.bytes, .{});
+    }
+    fn deinit(self: *TestBlob) void {
+        self.parsed.deinit();
+        testing.allocator.free(self.bytes);
+        self.raw.deinit(testing.allocator);
+    }
+    fn str(self: *TestBlob, s: []const u8) !u32 {
+        return self.raw.str(testing.allocator, s);
+    }
+    fn rec(self: *TestBlob, name_off: u32, kind: u5, vlen: u16, kflag: bool, size_type: u32, extra: []const u32) !u32 {
+        return self.raw.rec(testing.allocator, name_off, kind, vlen, kflag, size_type, extra);
+    }
+};
+
+fn typeRelo(kind: u32, ty: u32, access: u32) CoreRelo {
+    return .{ .insn_off = 0, .type_id = ty, .access_str_off = access, .kind = kind };
+}
+
+test "computeRelo: TYPE_ID_LOCAL / TYPE_ID_TARGET / TYPE_EXISTS / TYPE_SIZE" {
+    var l = try TestBlob.init();
+    const a0 = try l.str("0");
+    const a00 = try l.str("0:0");
+    const n_s = try l.str("S");
+    const n_x = try l.str("x");
+    const n_t = try l.str("mytd");
+    const l_int = try l.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    const l_s = try l.rec(n_s, btf.K_STRUCT, 1, false, 4, &.{ n_x, l_int, 0 });
+    const l_td = try l.rec(n_t, btf.K_TYPEDEF, 0, false, l_s, &.{});
+    const l_c = try l.rec(0, 10, 0, false, l_s, &.{}); // const S
+    try l.finish();
+    defer l.deinit();
+
+    var t = try TestBlob.init();
+    const tn_s = try t.str("S___flavor"); // flavors are stripped on the target side too
+    const tn_x = try t.str("x");
+    const tn_t = try t.str("mytd");
+    const t_int = try t.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    _ = try t.rec(0, btf.K_PTR, 0, false, t_int, &.{});
+    const t_s = try t.rec(tn_s, btf.K_STRUCT, 1, false, 24, &.{ tn_x, t_int, 64 });
+    const t_td = try t.rec(tn_t, btf.K_TYPEDEF, 0, false, t_s, &.{});
+    try t.finish();
+    defer t.deinit();
+
+    const lb = &l.parsed;
+    const tb = &t.parsed;
+    // TYPE_ID_LOCAL needs no target at all: it is the local id, as written.
+    const loc = try computeRelo(lb, tb, typeRelo(6, l_s, a0));
+    try testing.expect(loc.exists);
+    try testing.expectEqual(@as(u64, l_s), loc.value);
+    // TYPE_ID_TARGET: the id in the target BTF.
+    try testing.expectEqual(@as(u64, t_s), (try computeRelo(lb, tb, typeRelo(7, l_s, a0))).value);
+    // a typedef root is matched as the typedef (not looked through)
+    try testing.expectEqual(@as(u64, t_td), (try computeRelo(lb, tb, typeRelo(7, l_td, a0))).value);
+    // a qualifier has no name: it is looked through to the struct
+    try testing.expectEqual(@as(u64, t_s), (try computeRelo(lb, tb, typeRelo(7, l_c, a0))).value);
+    // TYPE_SIZE is the TARGET's size; TYPE_EXISTS is 1
+    try testing.expectEqual(@as(u64, 24), (try computeRelo(lb, tb, typeRelo(9, l_s, a0))).value);
+    try testing.expectEqual(@as(u64, 24), (try computeRelo(lb, tb, typeRelo(9, l_td, a0))).value);
+    try testing.expectEqual(@as(u64, 1), (try computeRelo(lb, tb, typeRelo(8, l_s, a0))).value);
+    // absent from the target: exists=false, value 0
+    var e = try TestBlob.init();
+    _ = try e.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    try e.finish();
+    defer e.deinit();
+    const none = try computeRelo(lb, &e.parsed, typeRelo(8, l_s, a0));
+    try testing.expect(!none.exists);
+    try testing.expectEqual(@as(u64, 0), none.value);
+    // a type-based access spec is exactly "0"
+    try testing.expectError(error.BadAccessSpec, computeRelo(lb, tb, typeRelo(9, l_s, 0x7000)));
+    try testing.expectError(error.BadAccessSpec, computeRelo(lb, tb, typeRelo(9, l_s, a00)));
+    // a future kind is refused, not guessed
+    try testing.expectError(error.UnsupportedReloKind, computeRelo(lb, tb, typeRelo(99, l_s, a0)));
+    // an anonymous root cannot be matched by name
+    try testing.expectError(error.TargetTypeNotFound, computeRelo(lb, tb, typeRelo(9, l_int, a0)));
+}
+
+test "computeRelo: enumerator existence and value, signed values, enum vs enum64" {
+    var l = try TestBlob.init();
+    const a00 = try l.str("0:0");
+    const a01 = try l.str("0:1");
+    const a05 = try l.str("0:5");
+    const n_e = try l.str("E");
+    const n_a = try l.str("A");
+    const n_b = try l.str("B");
+    const l_e = try l.rec(n_e, btf.K_ENUM, 2, false, 4, &.{ n_a, 1, n_b, 2 });
+    try l.finish();
+    defer l.deinit();
+
+    var t = try TestBlob.init();
+    const tn_e = try t.str("E");
+    const tn_a = try t.str("A");
+    const tn_b = try t.str("B");
+    // enum E { B = -7, A = 10 } (signed), reordered
+    _ = try t.rec(tn_e, btf.K_ENUM, 2, true, 4, &.{ tn_b, @bitCast(@as(i32, -7)), tn_a, 10 });
+    try t.finish();
+    defer t.deinit();
+    try testing.expectEqual(@as(u64, 10), (try computeRelo(&l.parsed, &t.parsed, typeRelo(11, l_e, a00))).value);
+    const neg = try computeRelo(&l.parsed, &t.parsed, typeRelo(11, l_e, a01));
+    try testing.expectEqual(@as(i64, -7), @as(i64, @bitCast(neg.value)));
+    try testing.expectEqual(@as(u64, 1), (try computeRelo(&l.parsed, &t.parsed, typeRelo(10, l_e, a01))).value);
+    // the local enumerator index must exist locally
+    try testing.expectError(error.BadLocalSpec, computeRelo(&l.parsed, &t.parsed, typeRelo(11, l_e, a05)));
+
+    // target enumerator missing: exists=false
+    var m = try TestBlob.init();
+    const mn_e = try m.str("E");
+    const mn_a = try m.str("A");
+    _ = try m.rec(mn_e, btf.K_ENUM, 1, false, 4, &.{ mn_a, 3 });
+    try m.finish();
+    defer m.deinit();
+    try testing.expect(!(try computeRelo(&l.parsed, &m.parsed, typeRelo(11, l_e, a01))).exists);
+    try testing.expectEqual(@as(u64, 0), (try computeRelo(&l.parsed, &m.parsed, typeRelo(10, l_e, a01))).value);
+
+    // ENUM64 in the target is a candidate for an ENUM; the 64-bit value is read whole
+    var w = try TestBlob.init();
+    const wn_e = try w.str("E");
+    const wn_b = try w.str("B");
+    _ = try w.rec(wn_e, btf.K_ENUM64, 1, false, 8, &.{ wn_b, 0x5, 0x1 });
+    try w.finish();
+    defer w.deinit();
+    try testing.expectEqual(@as(u64, 0x1_0000_0005), (try computeRelo(&l.parsed, &w.parsed, typeRelo(11, l_e, a01))).value);
+}
+
+test "computeRelo: TYPE_MATCHES is structural, names of named kinds, local members must all exist" {
+    var l = try TestBlob.init();
+    const a0 = try l.str("0");
+    const n_s = try l.str("S");
+    const n_a = try l.str("a");
+    const n_b = try l.str("b");
+    const l_int = try l.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    const l_s = try l.rec(n_s, btf.K_STRUCT, 2, false, 8, &.{ n_a, l_int, 0, n_b, l_int, 32 });
+    try l.finish();
+    defer l.deinit();
+
+    // target: more members, other order and offsets, a wider int: still a match
+    var t = try TestBlob.init();
+    const tn_s = try t.str("S");
+    const tn_a = try t.str("a");
+    const tn_b = try t.str("b");
+    const tn_c = try t.str("c");
+    const t_int = try t.rec(0, btf.K_INT, 0, false, 8, &.{64});
+    _ = try t.rec(tn_s, btf.K_STRUCT, 3, false, 24, &.{ tn_c, t_int, 0, tn_b, t_int, 64, tn_a, t_int, 128 });
+    try t.finish();
+    defer t.deinit();
+    try testing.expectEqual(@as(u64, 1), (try computeRelo(&l.parsed, &t.parsed, typeRelo(12, l_s, a0))).value);
+
+    // target missing member b: no match (value 0), but the type still EXISTS
+    var m = try TestBlob.init();
+    const mn_s = try m.str("S");
+    const mn_a = try m.str("a");
+    const m_int = try m.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    _ = try m.rec(mn_s, btf.K_STRUCT, 1, false, 4, &.{ mn_a, m_int, 0 });
+    try m.finish();
+    defer m.deinit();
+    const nm = try computeRelo(&l.parsed, &m.parsed, typeRelo(12, l_s, a0));
+    try testing.expect(!nm.exists);
+    try testing.expectEqual(@as(u64, 0), nm.value);
+    try testing.expectEqual(@as(u64, 1), (try computeRelo(&l.parsed, &m.parsed, typeRelo(8, l_s, a0))).value);
+
+    // a member whose type has another kind does not match
+    var k = try TestBlob.init();
+    const kn_s = try k.str("S");
+    const kn_a = try k.str("a");
+    const kn_b = try k.str("b");
+    const k_int = try k.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    const k_ptr = try k.rec(0, btf.K_PTR, 0, false, k_int, &.{});
+    _ = try k.rec(kn_s, btf.K_STRUCT, 2, false, 16, &.{ kn_a, k_int, 0, kn_b, k_ptr, 64 });
+    try k.finish();
+    defer k.deinit();
+    try testing.expect(!(try computeRelo(&l.parsed, &k.parsed, typeRelo(12, l_s, a0))).exists);
+}
+
+test "computeRelo: several candidates must agree; a candidate that does not match is ignored" {
+    var l = try TestBlob.init();
+    const a0 = try l.str("0");
+    const a00 = try l.str("0:0");
+    const n_s = try l.str("S");
+    const n_x = try l.str("x");
+    const l_int = try l.rec(0, btf.K_INT, 0, false, 4, &.{32});
+    const l_s = try l.rec(n_s, btf.K_STRUCT, 1, false, 4, &.{ n_x, l_int, 0 });
+    try l.finish();
+    defer l.deinit();
+
+    const mk = struct {
+        fn blob(x_off: [3]?u32, sizes: [3]u32) !TestBlob {
+            var t = try TestBlob.init();
+            const nx = try t.str("x");
+            const ns = try t.str("S");
+            const ti = try t.rec(0, btf.K_INT, 0, false, 4, &.{32});
+            for (x_off, sizes) |off, sz| {
+                if (off) |o| {
+                    _ = try t.rec(ns, btf.K_STRUCT, 1, false, sz, &.{ nx, ti, o });
+                } else {
+                    _ = try t.rec(ns, btf.K_STRUCT, 0, false, sz, &.{});
+                }
+            }
+            try t.finish();
+            return t;
+        }
+    }.blob;
+
+    // x at bit 64 in two candidates, absent in the third: agreement, third ignored
+    var ok = try mk(.{ 64, 64, null }, .{ 16, 16, 8 });
+    defer ok.deinit();
+    try testing.expectEqual(@as(u64, 8), (try computeRelo(&l.parsed, &ok.parsed, typeRelo(0, l_s, a00))).value);
+    try testing.expectEqual(@as(u64, 1), (try computeRelo(&l.parsed, &ok.parsed, typeRelo(2, l_s, a00))).value);
+    // x at different offsets: ambiguous, for the field kinds
+    var bad = try mk(.{ 64, 128, null }, .{ 16, 24, 8 });
+    defer bad.deinit();
+    try testing.expectError(error.AmbiguousRelocation, computeRelo(&l.parsed, &bad.parsed, typeRelo(0, l_s, a00)));
+    try testing.expectError(error.AmbiguousRelocation, computeFieldRelo(&l.parsed, &bad.parsed, typeRelo(1, l_s, a00)));
+    // even FIELD_EXISTS (1 in both) is ambiguous: libbpf compares the resolved
+    // bit offsets, not only the value asked for
+    try testing.expectError(error.AmbiguousRelocation, computeRelo(&l.parsed, &bad.parsed, typeRelo(2, l_s, a00)));
+    // sizes 16 / 24: TYPE_SIZE is ambiguous, TYPE_EXISTS is not
+    try testing.expectError(error.AmbiguousRelocation, computeRelo(&l.parsed, &bad.parsed, typeRelo(9, l_s, a0)));
+    try testing.expectEqual(@as(u64, 1), (try computeRelo(&l.parsed, &bad.parsed, typeRelo(8, l_s, a0))).value);
+    // TYPE_ID_TARGET with two candidates is ambiguous by construction
+    try testing.expectError(error.AmbiguousRelocation, computeRelo(&l.parsed, &bad.parsed, typeRelo(7, l_s, a0)));
 }
