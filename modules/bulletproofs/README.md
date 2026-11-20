@@ -10,29 +10,26 @@ Transactions, Monero-style range proofs, and many zk-rollup circuits.
 Several values can share one **aggregated** proof (paper §4.3), whose size
 grows with `log2(n*m)` for `m` values.
 
-**Status: complete.** The generator derivation, the Pedersen commitment,
-the Merlin Fiat-Shamir transcript, both proof structs' byte
-codecs, and every mechanical scalar/vector/multi-scalar-mult helper are
-REAL and tested. The two genuinely irreducible zero-knowledge cores — the
-Inner-Product Argument (`ipa.zig`'s `proveIpa`/`verifyIpa`) and the
-range-proof polynomial construction/reduction (`rangeproof.zig`'s
-`prove`/`verify`) — are implemented and `gate.core_implemented` is `true`,
-so `kat_test.zig`'s full completeness + soundness suite runs for real
-(green in Debug + ReleaseFast). See [SPEC.md](SPEC.md) for the
-design and the verification methodology.
+The generator derivation, the Pedersen commitment, the Merlin Fiat-Shamir transcript, both proof structs'
+byte codecs, the scalar/vector/multi-scalar-mult helpers, the Inner-Product Argument and the range-proof
+construction/reduction are all implemented, and `gate.core_implemented` is `true`, so `kat_test.zig`'s
+full completeness + soundness suite runs. See [SPEC.md](SPEC.md) for the design and the verification
+methodology.
 
 | File | Contents |
 |---|---|
 | `root.zig` | Module doc, `meta`, re-exports, dark-tests aggregator |
-| `generators.zig` | **REAL.** `Generators` — deterministic NUMS generator derivation (`g`, `h`, `g_vec`, `h_vec`); `initParties` for aggregated proofs |
-| `transcript.zig` | **REAL.** `Transcript` — Merlin v1.0 (STROBE-128) Fiat-Shamir transcript, byte-compatible with the `merlin` crate |
-| `scalarvec.zig` | **REAL.** Scalar/vector arithmetic (`innerProduct`, `hadamard`, `addVec`/`subVec`/`scaleVec`, `powers`) + `multiScalarMul` over Ristretto255 |
-| `ipa.zig` | **FABLE CORE (implemented):** `proveIpa`/`verifyIpa`. `InnerProductProof`'s struct + byte codec are REAL |
-| `rangeproof.zig` | **FABLE CORE (implemented):** `prove`/`verify`, aggregated `proveMultiple`/`verifyMultiple`, `verifyBatch` (many proofs, one MSM). `commit`, `deltaYZ`/`deltaYZMultiple`, and `RangeProof`'s struct + byte codec are REAL |
+| `generators.zig` | `Generators` — deterministic NUMS generator derivation (`g`, `h`, `g_vec`, `h_vec`); `initParties` for aggregated proofs |
+| `transcript.zig` | `Transcript` — Merlin v1.0 (STROBE-128) Fiat-Shamir transcript, byte-compatible with the `merlin` crate |
+| `scalarvec.zig` | Scalar/vector arithmetic (`innerProduct`, `hadamard`, `addVec`/`subVec`/`scaleVec`, `powers`), `multiScalarMul` (constant time, secret scalars) and `multiScalarMulVartime` (public scalars) over Ristretto255 |
+| `ipa.zig` | `proveIpa`/`verifyIpa`; `InnerProductProof`'s struct and byte codec |
+| `rangeproof.zig` | `prove`/`verify`, aggregated `proveMultiple`/`verifyMultiple`, `verifyBatch` (many proofs, one MSM); `commit`, `deltaYZ`/`deltaYZMultiple`, `RangeProof`'s struct and byte codec |
 | `gate.zig` | The single switch (`core_implemented`) gating the two cores' tests |
-| `kat_test.zig` | The property/soundness KAT harness (completeness + soundness scenarios) |
-| `aggregate_test.zig` | Aggregated proofs: completeness for m = 1..8, malformed batches, reordered/swapped/dropped commitments |
+| `kat_test.zig` | The property/soundness harness (completeness + soundness scenarios) |
+| `aggregate_test.zig`, `batch_test.zig` | Aggregated proofs (m = 1..8, malformed batches, reordered/swapped/dropped commitments); batch verification |
+| `verify_b8_diff_test.zig` | The verifier held byte-exact to the plain one (SPEC § B8) |
 | `interop_test.zig` | The external anchor: merlin transcripts and dalek range proofs, single and aggregated, in both directions (`interop_vectors.zig`, from `tools/dalek/`) |
+| `fuzz_test.zig`, `stackprobe_test.zig`, `ctgrind_harness.zig` | Decoder/prove-verify fuzz, dead-stack probe, constant-time harness |
 
 ## Import
 
@@ -105,11 +102,8 @@ multi-party dealer/party protocol is not offered.
   `proveMultiple` draw it from `io.randomSecure` (the OS, every call, no
   fallback — a predictable-blinding proof leaks the witness, so an entropy
   failure is `error.EntropyUnavailable`, never a weaker source). Any target.
-- **Constant-time on the prover's secrets, measured.** This bullet used to
-  say the opposite — that `multiScalarMul` skipped zero scalars and leaked the
-  committed value's bit pattern. Audit finding F2 fixed that; the doc did not
-  catch up until 2026-09-09. Every term now goes through `mulCt`
-  unconditionally, including zero, and `src/ctgrind_harness.zig` measures
+- **Constant-time on the prover's secrets, measured.** Every term of `multiScalarMul` goes through
+  the constant-time ladder unconditionally, including zero, and `src/ctgrind_harness.zig` measures
   **0 in-file contexts** with `v` and `gamma` tainted through `prove`. ⚠ The
   blinding `prove` draws internally is outside that measurement. See SPEC.md.
 - `n` and `m` are powers of two; dalek interoperates for `n` in {8, 16,
@@ -118,7 +112,7 @@ multi-party dealer/party protocol is not offered.
 
 ## Wire compatibility — dalek-cryptography/bulletproofs 4.0
 
-Since 2026-09-30 the transcript (Merlin), the generators and the byte
+The transcript (Merlin), the generators and the byte
 layout are dalek's, so proofs cross in both directions: a dalek
 `RangeProof::to_bytes()` decodes with `RangeProof.fromBytesAlloc` and
 verifies with `verify`, and a proof from `prove` verifies under dalek's
@@ -127,8 +121,7 @@ dalek's `prove_multiple`/`verify_multiple`, generators of party `j` from
 chain `'G'/'H' || LE32(j)`). Both sides must start the transcript with the same label
 (dalek leaves it to the application; this module's default is
 `rangeproof_domain`). `interop_test.zig` asserts both directions against
-vectors the crates produced (`tools/dalek/`). Proofs made before that date
-by this module do not verify any more (see CHANGELOG.md). Not compatible
+vectors the crates produced (`tools/dalek/`). Not compatible
 with secp256k1-zkp or Monero (other curves and transcripts).
 
 ## Import graph
@@ -138,11 +131,12 @@ bulletproofs → ct25519 (scalarvec.mulCt, the constant-time secret-scalar ladde
 bulletproofs → std.crypto.ecc.Ristretto255 / std.crypto.core.keccak / std.crypto.hash.sha3
 ```
 
-One sibling-module dependency, `ct25519` (`meta.deps = .{"ct25519"}`) — this
-line previously claimed `meta.deps = .{}`, the same stale claim `NOTICE` made
-before audit finding B11's 2026-09-09 fix corrected it there; this copy of
-the claim was missed at the time and is corrected now (found while verifying
-this file's other claims against the tree for the B1/B10 fixes below).
+One sibling-module dependency, `ct25519` (`meta.deps = .{"ct25519"}`).
+
+## Not provided
+
+No multi-party dealer/party protocol, no `n > 64` witnesses, no R1CS/circuit proofs, no secp256k1-zkp or Monero
+compatibility; see SPEC.md *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify
 

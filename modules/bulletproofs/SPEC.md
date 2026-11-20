@@ -20,16 +20,6 @@ Bulletproofs zero-knowledge range proofs over Ristretto255; see
 [README.md](README.md) for purpose and API. Provenance: see
 [NOTICE](NOTICE).
 
-**Status: complete.** Generators, transcript, scalar/vector helpers, and
-both proof structs' byte codecs are implemented for real. The two
-irreducible zero-knowledge cores — the Inner-Product Argument (`ipa.zig`'s
-`proveIpa`/`verifyIpa`) and the range-proof polynomial
-construction/reduction (`rangeproof.zig`'s `prove`/`verify`) — are
-implemented (Fable core pass) and `gate.core_implemented` is `true`, so
-the full completeness + soundness KAT suite runs (green in Debug
-+ ReleaseFast). See "Caveats" below for the non-constant-time and
-entropy notes.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Foreign source was not read; claims come from READMEs, and from this module's own SPEC where it describes dalek.
@@ -41,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [monero-project/monero](https://github.com/monero-project/monero) | C++ | NOASSERTION (BSD-3-Clause per Monero convention, *inferred*; source not read) | 10.9k | pushed 2026-09 | The largest production Bulletproofs(+) deployment (aggregated range proofs on ed25519 in transaction outputs). Consensus-pinned wire format. |
 | Zig ecosystem (GitHub search "bulletproofs", language Zig, 2026-09-30) | Zig | — | — | — | No Bulletproofs repository found; nothing in Zig `std`. |
 
-**Where we are ahead:** the only Zig Bulletproofs implementation found; pure Zig over `std`'s Ristretto255, wire-compatible with dalek in both directions, single and aggregated proofs (Merlin transcript over `std`'s Keccak, dalek generators and layout; `interop_test.zig`, since 2026-09-30, aggregation since 2026-10-02); a measured constant-time prover on secret `v`/`gamma` (`src/ctgrind_harness.zig`, 0 in-file contexts under valgrind), a Pippenger vartime MSM in the verifier (`scalarvec.multiScalarMulVartime`), a verifier that never materialises `h'`, batch verification of many proofs (mixed `m`) in one MSM, and an exhaustive per-field tamper suite. **Where we are behind:** no multi-party dealer/party protocol (aggregation needs one caller holding every witness); no R1CS/arbitrary-circuit proofs; `v` is a `u64` (`n <= 64`); not compatible with secp256k1-zkp or Monero (other curves and transcripts). (`prove` was Linux-only until 2026-10-02; its randomness now comes from the caller's `std.Io`.)
+**Where we are ahead:** the only Zig Bulletproofs implementation found; pure Zig over `std`'s Ristretto255, wire-compatible with dalek in both directions, single and aggregated proofs (Merlin transcript over `std`'s Keccak, dalek generators and layout; `interop_test.zig`); a measured constant-time prover on secret `v`/`gamma` (`src/ctgrind_harness.zig`, 0 in-file contexts under valgrind), a Pippenger vartime MSM in the verifier (`scalarvec.multiScalarMulVartime`), a verifier that never materialises `h'`, batch verification of many proofs (mixed `m`) in one MSM, and an exhaustive per-field tamper suite. **Where we are behind:** no multi-party dealer/party protocol (aggregation needs one caller holding every witness); no R1CS/arbitrary-circuit proofs; `v` is a `u64` (`n <= 64`); not compatible with secp256k1-zkp or Monero (other curves and transcripts). `prove` draws its randomness from the caller's `std.Io`, so it builds on every target.
 
 ## Design
 
@@ -74,14 +64,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   analogous mixing risk since every scalar here is either a public
   transcript value or a proof response field with a name-scoped role).
 - **Single and aggregated range proofs.** `prove`/`verify` cover one
-  commitment; `proveMultiple`/`verifyMultiple` (2026-10-02) cover `m`
+  commitment; `proveMultiple`/`verifyMultiple` cover `m`
   commitments, `m` a power of two, in one proof sharing one IPA over `n*m`
   generators (paper §4.3). The single proof is the `m = 1` case of the
   same body (`rangeproof.zig`'s `proveInner`/`verifyMultipleTraced`), as
-  in dalek, so the two cannot drift; `verify_b8_diff_test.zig` still holds
-  the `m = 1` verifier byte-exact to its pre-B8 reference. The extension
-  touched `generators.zig` after all, contrary to what this bullet used to
-  predict: value `j` needs its own generators (`Generators.initParties`,
+  in dalek, so the two cannot drift; `verify_b8_diff_test.zig` holds
+  the `m = 1` verifier byte-exact to its pre-B8 reference. Value `j` needs its own generators (`Generators.initParties`,
   dalek's party chains `'G'/'H' || LE32(j)`), or dalek's proofs would not
   verify. `ipa.zig`, `transcript.zig` and `scalarvec.zig` are unchanged.
   One caller holds every witness; dalek's dealer/party MPC protocol, where
@@ -108,9 +96,9 @@ the verifier's fold-and-check equation — that doc comment IS this
 section's normative content; it is not repeated here (CONVENTIONS.md's
 single-source-of-truth rule — one fact, one place).
 
-**Why this is the Fable-hard core, restated**: every other function in
+**Why the fold direction is the risk**: every other function in
 this module is either ordinary hashing/EC arithmetic with no
-cryptographic JUDGMENT, or mechanical codec plumbing. The IPA's per-round
+cryptographic judgment, or mechanical codec plumbing. The IPA's per-round
 fold direction (which half multiplies `u` vs `u^{-1}`, and on which side
 — prover's `a`/`b` fold one way, the verifier's `G_vec`/`H_vec` fold the
 OPPOSITE way, by design, so the two meet at the same final check) is easy
@@ -131,16 +119,13 @@ a public bit-width `n`, prove `v ∈ [0, 2^n)` without revealing `v`/
 relation + the IPA) — again, that doc comment is this section's normative
 content.
 
-**`deltaYZ` (REAL)**: the verifier's `delta(y,z)` scalar correction term
+**`deltaYZ`**: the verifier's `delta(y,z)` scalar correction term
 (paper eq. (39), single-value case) is pure public-input arithmetic (`y`,
-`z`, `n` — no witness) and is implemented for real, tested against a
-hand-derived value computed by a DIFFERENT method than the implementation
-itself (`rangeproof.zig`'s test block) to avoid a circular test. This is
-the one piece of the verifier's own logic that could be pulled out and
-implemented ahead of the two full cores, and doing so gives the eventual
-Fable pass one fewer thing to get right from scratch.
+`z`, `n` — no witness), tested against a hand-derived value computed by a
+DIFFERENT method than the implementation itself (`rangeproof.zig`'s test
+block) to avoid a circular test.
 
-**`commit` (REAL)**: the Pedersen value commitment `v*gens.g +
+**`commit`**: the Pedersen value commitment `v*gens.g +
 gamma*gens.h`. Trivial, but worth calling out: it uses `gens.g`/`gens.h`
 (the two BASE points), never `gens.g_vec`/`gens.h_vec` (the two VECTOR
 generator sets) — a mixup here would silently break every downstream
@@ -149,110 +134,53 @@ specifically ties `V` to `gens.g`/`gens.h`, not the vectors.
 
 ### B8 — the verifier never materialises `h'` (a P5 algorithm change)
 
-`verify` used to build `h'_i = y^{-i}*H_i` with `n` constant-time ladders
-(63 % of its time at n=64 in the 2026-09-05 audit profile) and pass `h'` to
-`verifyIpa`. `h'` enters exactly two places, both MSMs, so `y^{-i}` now
-moves into the coefficient: `((z*y^i + z^2*2^i) * y^{-i}) * H_i` in
-`verify`'s own `h_term`, and `c_i * h_scale[i]` in `ipa.equationSides`'s
-final MSM. The justification is one identity, `(c*s)*H == c*(s*H)`, exact in
-Ristretto255's prime-order group for every scalar. ⚠ The coefficient is
-deliberately the old one times `y^{-i}`, not the "simplified"
-`z + z^2*2^i*y^{-i}`: with `invert(0) == 0` the two differ at `y == 0`, so
-only the unsimplified form makes the new verifier equal to the old one on
-EVERY input. `prove` is not changed and cannot be changed this way: its `h'`
+`verify` does not build `h'_i = y^{-i}*H_i` (that would be `n` constant-time ladders over data with no
+secret in it). `h'` enters exactly two places, both MSMs, so `y^{-i}` moves into the coefficient:
+`((z*y^i + z^2*2^i) * y^{-i}) * H_i` in `verify`'s own `h_term`, and `c_i * h_scale[i]` in
+`ipa.equationSides`'s final MSM. The justification is one identity, `(c*s)*H == c*(s*H)`, exact in
+Ristretto255's prime-order group for every scalar. ⚠ The coefficient is deliberately the unsimplified one
+times `y^{-i}`, not the "simplified" `z + z^2*2^i*y^{-i}`: with `invert(0) == 0` the two differ at
+`y == 0`, so only the unsimplified form makes the verifier equal to the plain one on EVERY input (the
+simplified form would pass the differential too, because `y` is a transcript hash output and the suite
+cannot reach `y == 0`; the code does not rely on that). `prove` cannot be changed this way: its `h'`
 feeds the recursive IPA fold as real points.
 
-Because a mistake here would accept forgeries rather than slow anything
-down, the change was made with four safeguards:
+A mistake here would accept forgeries rather than slow anything down, so the verifier is held to the plain
+one byte for byte: `src/verify_b8_diff_test.zig` keeps the plain `verify`/`verifyIpa` verbatim and requires
+the canonical bytes of `P` and of both IPA equation sides to match, not just the verdict. It covers
 
-1. **Bit-identical to the previous implementation.**
-   `src/verify_b8_diff_test.zig` keeps the pre-B8 `verify`/`verifyIpa`
-   verbatim and requires the canonical bytes of `P` and of both IPA
-   equation sides to match, not just the verdict. That covers honest proofs
-   at n = 1, 2, 4, 8, 16, 32, 64 (Debug stops at 16) and every forgery
-   class: a single-bit flip (0x01, 0x80) at every byte of every wire field;
-   `+2^(8k)` at every byte position of every scalar field; point fields
-   shifted by public generators; each `L_i`/`R_i` perturbed, `L_i<->R_i`
-   swapped, rounds reordered, whole vectors exchanged, a round dropped, an
-   extra round added; seven wrong commitments; generator sets of twice and
-   half the width; an all-identity proof; a cheating prover that forces
-   `t_hat` for an out-of-range `v`, so it passes check 1 and only the IPA
-   can refuse it; and the same points in an E[4]-shifted internal
-   representation, which must still be ACCEPTED.
-2. **Randomized differential.** Seeded random forgeries (wire flips,
-   point/scalar perturbations, point swaps): 200 per width at n = 2, 8, 32,
-   64 in optimized builds, 30 at n = 4 in Debug. Plus an IPA-level
-   differential over arbitrary `h_scale` vectors: geometric, `y = 0`, fully
-   random, and half zeros. Half of those cases are honest proofs, which must
-   be accepted.
-3. **ctgrind.** Not applicable to the changed code: `verify` consumes only
-   public data, and `ctgrind_harness.zig` deliberately does not taint it.
-   No function on the prove path changed. The `rangeproof`/`ipa` rows in
-   `scripts/checks/ctgrind-expected.tsv` fingerprint whole files, so they need a
-   re-pin. That re-pin happens at the end of the fix campaign.
-4. **The number.** A/B against the previous verifier in one process,
-   ReleaseFast, CPU time, 9 interleaved rounds, median µs per verify:
-   n=8 2394 → 2048 (1.17×); n=32 4950 → 3305 (1.50×); n=64 7887 → 4720
-   (**1.67×**). The paired per-round ratio never fell below 1.12, 1.45 and
-   1.44. The audit estimated ~2.7× at n=64; the measured gain is smaller,
-   and the remaining verify time has not been broken down. Why the gain
-   outweighs the risk: the old code spent its time on work that protected
-   nothing, and the new code is held to the old code byte for byte. Ten
-   mutants of the new code all turn the differential RED:
-   - `y^{-i}` omitted, in either MSM or at the call site;
-   - `y^{i}` used instead;
-   - the index shifted by one, in either MSM;
-   - one MSM term dropped, in either MSM;
-   - the sign flipped, in either MSM.
-   A correct rewrite of the same coefficient stays GREEN. The simplified
-   `y == 0`-divergent form also stays GREEN: `y` is a transcript hash
-   output, so the suite cannot reach `y == 0`. That is the reason the code
-   does not rely on it.
+- honest proofs at n = 1, 2, 4, 8, 16, 32, 64 (Debug stops at 16) and every forgery class: a single-bit flip
+  (0x01, 0x80) at every byte of every wire field; `+2^(8k)` at every byte position of every scalar field;
+  point fields shifted by public generators; each `L_i`/`R_i` perturbed, `L_i<->R_i` swapped, rounds
+  reordered, whole vectors exchanged, a round dropped, an extra round added; seven wrong commitments;
+  generator sets of twice and half the width; an all-identity proof; a cheating prover that forces `t_hat`
+  for an out-of-range `v`, so it passes check 1 and only the IPA can refuse it; and the same points in an
+  E[4]-shifted internal representation, which must still be ACCEPTED;
+- seeded random forgeries (wire flips, point/scalar perturbations, point swaps): 200 per width at n = 2, 8,
+  32, 64 in optimized builds, 30 at n = 4 in Debug; plus an IPA-level differential over arbitrary `h_scale`
+  vectors (geometric, `y = 0`, fully random, half zeros), half of them honest proofs, which must be accepted.
+
+ctgrind does not apply: `verify` consumes only public data, and `ctgrind_harness.zig` deliberately does not
+taint it.
 
 ### B9 — the prover's MSMs share their doublings (a P5 algorithm change)
 
-`scalarvec.multiScalarMul` — every prover MSM over secret scalars (`A`, `S`,
-each IPA round's `L`/`R`) — was one full constant-time ladder per term, and
-this module's audit disposition F1 called that "a documented by-design
-boundary, not a residual gap". It was not a boundary: constant time forbids
-a digit-dependent schedule, not shared doublings. Since 2026-09-16 the body is
-`ct25519.mulMultiRistretto`, Straus's interleaved fixed window, where all terms
-share one chain of doublings and every term still pays exactly one `pcSelect`
-and one add per window whatever its scalar (zero included). The length check
-stays here and still returns `error.LengthMismatch`. The primitive, its
-technique and its evidence live in `ct25519`'s `SPEC.md` § B9; this module's
-side of the four P5 items:
+`scalarvec.multiScalarMul` — every prover MSM over secret scalars (`A`, `S`, each IPA round's `L`/`R`) — is
+`ct25519.mulMultiRistretto`, Straus's interleaved fixed window: all terms share one chain of doublings and
+every term still pays exactly one table select and one add per window whatever its scalar (zero included).
+Constant time forbids a digit-dependent schedule, not shared doublings. The length check stays in
+`multiScalarMul` and returns `error.LengthMismatch`. The primitive, its technique and its evidence live in
+`ct25519`'s `SPEC.md` § B9. Held to the plain per-term loop:
 
-1. **Bit-identical to the previous implementation.** `scalarvec.zig`'s
-   `B9 diff` test keeps the pre-B9 body verbatim (`multiScalarMulPreB9`) and
-   compares canonical bytes at n = 0, 1, 2, 3, 4, 7, 8, 9, 16, 17, 32, 33, 64,
-   65, with zero and one scalars mixed into every vector. End to end, the
-   `ipa` ctgrind row's pinned output digest — which depends on every `L`/`R`
-   through the transcript — is unchanged.
-2. **Randomized differential.** 25 random vectors per size in optimized
-   builds (≥ 350 comparisons), 1 in Debug.
-3. **ctgrind.** The `rangeproof` and `ipa` rows stay at 0 in-file
-   (8 / 0 / 8 / 0 and 4 / 0 / 4 / 0), controls and traps 0; `ct25519`'s new
-   `msm` target measures the primitive itself, with a positive control.
-   Both rows here fingerprint `scalarvec.zig`, so they need the end-of-campaign
-   re-pin (they already did, for B8).
-4. **The number.** A/B against this module's sources at `bf7997ce`, one
-   process, ReleaseFast, CPU time, 9 interleaved rounds, median µs:
-   `prove` n=32 23 442 → 15 672 (**1.50×**, paired 1.40..1.85); n=64
-   47 342 → 34 550 (**1.37×**, paired 1.24..1.84); the MSM alone at n=64
-   3 429 → 1 397 (2.45×); `verify`, which B9 does not touch, 1.00× and 0.99×
-   as the control on a shared machine. For both widths the slowest new
-   round beat the fastest old one. The rest of `prove` (the `h'` rescaling,
-   inner products, hashing) is unchanged, which is why the proof gains less
-   than the MSM. Why it outweighs the change: the prover's dominant cost
-   drops without giving up the constant time the old loop was kept for, and
-   `multiScalarMul` is held byte-exact to that loop. Seven mutants of the
-   primitive and its wiring all turn the differentials RED (every term on the
-   first table, three shared doublings, trailing chunk skipped, chunk result
-   overwriting the total, every term on the base table, window shifted one
-   bit, the wire dropping the last term); chunk sizes 5 and 1 stay GREEN.
+- `scalarvec.zig`'s `B9 diff` test keeps that loop verbatim (`multiScalarMulPreB9`) and compares canonical
+  bytes at n = 0, 1, 2, 3, 4, 7, 8, 9, 16, 17, 32, 33, 64, 65, with zero and one scalars mixed into every
+  vector; 25 random vectors per size in optimized builds, 1 in Debug. End to end, the `ipa` ctgrind row's
+  pinned output digest — which depends on every `L`/`R` through the transcript — is the same as before the
+  change.
+- ctgrind: the `rangeproof` and `ipa` rows are 0 in-file; `ct25519`'s `msm` target measures the primitive
+  itself, with a positive control.
 
-## Batch verification (`rangeproof.verifyBatch`, 2026-10-02)
+## Batch verification (`rangeproof.verifyBatch`)
 
 Several independent proofs — single or aggregated, mixed `m`, one shared
 `Generators` — in ONE vartime MSM, dalek's construction. Each proof's two
@@ -271,24 +199,18 @@ Evidence (`src/batch_test.zig`): honest proofs with `m = 1, 2, 1, 4` in one
 batch; every field of the per-field tamper set at every batch position fails
 the batch; swapped commitments and a wrong transcript label fail; dalek's own
 single and aggregated proofs verify as batches at `n = 8…64`; each entry draws
-two distinct fresh weights. Mutation (schemata, 15 mutants over the
-coefficients, weights, shape and replay checks): 14 killed after two tests
-were added for the survivors (a proof with fewer IPA rounds than its
-commitments imply — the shape check is what keeps the replay in bounds — and
-the weight draws). The one survivor is equivalent: ignoring the
-identity-`L`/`R` refusal leaves the remaining challenges undefined, and the
-equation fails anyway; the refusal stays for dalek parity and defined
-behaviour. `verify_b8_diff_test.zig` still pins `P` and the IPA sides
-byte-for-byte after the replay was factored out.
+two distinct fresh weights; a proof with fewer IPA rounds than its commitments imply is refused (the shape
+check is what keeps the replay in bounds). Ignoring the identity-`L`/`R` refusal changes no verdict (the
+remaining challenges are undefined and the equation fails anyway); the refusal stays for dalek parity and
+defined behaviour. `verify_b8_diff_test.zig` pins `P` and the IPA sides byte-for-byte after the replay was
+factored out.
 
 ## Generators (`generators.zig`) — NUMS derivation
 
 dalek's derivation (`generators.zig` doc comment): `g` = the Ristretto255
 base point, `h = fromUniform(SHA3-512(encode(g)))`, and `g_vec`/`h_vec`
 read 64 bytes at a time from SHAKE256(`"GeneratorsChain" || 'G'/'H' ||
-LE32(0)`) through `fromUniform`. Until 2026-09-30 the points came from a
-module-defined `SHA-512(domain || label || suffix)`; they moved so that
-proofs interoperate. The soundness argument is unchanged: every point is
+LE32(0)`) through `fromUniform`, so that proofs interoperate with dalek's. The soundness argument: every point is
 a hash-to-group output of a public label, so nobody knows a discrete-log
 relation between two of them.
 
@@ -311,18 +233,6 @@ dalek"): `dom-sep = "rangeproof v1"`, `n`, `m`, every `V_j` in order, `A`, `S` -
 the IPA's `dom-sep = "ipp v1"`, `n`, and per round `L`, `R` -> `u`. The
 verifier binds every prover point with `validateAndAppendPoint`, which
 refuses the identity as dalek does.
-
-**Decision history.** Until 2026-09-30 this section argued for a
-self-made SHA-512 hash chain: the zero-dependency rule, no STROBE in the
-repo, and the paper not pinning a transcript. The first two were weaker
-than they looked — `std` ships Keccak-f[1600], and the STROBE subset
-Merlin uses is about a hundred lines — and the cost of the choice was
-concrete: no external oracle could apply, so the module's evidence grade
-was capped at SELF, and no proof crossed to or from any other
-implementation. Task A1 of the 2026-09-30 maturity survey anchored the
-module against dalek, which is only possible with dalek's transcript.
-Proofs made by earlier revisions do not verify any more; the module had
-no consumer.
 
 **Verification methodology.** Two halves:
 
@@ -351,12 +261,12 @@ test green and still produce proofs no other implementation accepts.
 
 ## Gate (`gate.zig`)
 
-One flag, `core_implemented`, covers BOTH `ipa.zig` and `rangeproof.zig`:
+One flag, `core_implemented` (`true`), covers BOTH `ipa.zig` and `rangeproof.zig`:
 `rangeproof.prove`/`.verify` cannot be exercised without
 `ipa.proveIpa`/`.verifyIpa` already working (the range proof's last step
 IS a call into the IPA), so there is no intermediate state where one core
-is done and testable but the other isn't — see `gate.zig`'s own doc
-comment.
+is done and testable but the other isn't. `kat_test.zig`'s gated tests report SKIP
+(never PASS) if the flag is `false`.
 
 ## Caveats
 
@@ -364,49 +274,29 @@ comment.
   draws its secret blinding (`alpha`/`rho`/`s_L`/`s_R`/`tau1`/`tau2`) from
   `io.randomSecure` — the OS on every call, with no fallback, so a failure is
   `error.EntropyUnavailable` and never a weaker source (a predictable-blinding
-  range proof leaks the witness). Until 2026-10-02 this was a direct
-  `getrandom(2)` with a `@compileError` on every non-Linux target, and
-  `meta.platform` was `.linux`; it is `.any` now.
-- **Constant-time on the prover's secrets — MEASURED 2026-09-09, and this
-  bullet used to say the opposite.** It read "Not constant-time:
-  `scalarvec.multiScalarMul` skips zero scalars (a `catch continue` on std's
-  'result is the identity element' error), so the time to form commitment `A`
-  … depends on the committed value's bit pattern". That was true when it was
-  written and stopped being true when audit finding F2 was fixed: the current
-  `multiScalarMul` puts every term through `mulCt` unconditionally,
-  "including zero" (`src/scalarvec.zig:135-150`), and the `catch continue`
-  survives only in comments describing the shape it replaced.
-
-  ⭐ THE STALENESS RAN IN THE UNUSUAL DIRECTION — the code got better and the
-  document did not catch up, so this file was advertising a side channel the
-  module no longer has. `src/ctgrind_harness.zig` is the instrument that
-  settles it: tainting `v` and `gamma` through the real `prove` entry point,
-  and a synthetic witness through `proveIpa`, ReleaseFast under valgrind,
-  gives **0 in-file contexts in both targets** — nothing in `rangeproof.zig`,
-  `ipa.zig`, `scalarvec.zig`, `generators.zig`, `transcript.zig`, or the
-  `ct25519` delegate they bottom out in. Untainted control and
-  no-`-fvalgrind` trap rows are both 0, so the zero is a measurement rather
-  than a silent no-op.
+  range proof leaks the witness). `meta.platform` is `.any`.
+- **Constant time on the prover's secrets (measured).** `scalarvec.multiScalarMul` puts every term
+  through the constant-time ladder unconditionally, zero included. `src/ctgrind_harness.zig` taints `v`
+  and `gamma` through the real `prove` entry point, and a synthetic witness through `proveIpa`
+  (ReleaseFast, valgrind): **0 in-file contexts in both targets** — nothing in `rangeproof.zig`,
+  `ipa.zig`, `scalarvec.zig`, `generators.zig`, `transcript.zig`, or the `ct25519` delegate they bottom
+  out in. The untainted control and no-`-fvalgrind` trap rows are both 0, so the zero is a measurement
+  rather than a silent no-op.
 
   ⚠ What is NOT claimed: `prove` draws its own blinding (`alpha`, `rho`,
   `s_L`, `s_R`, `tau1`, `tau2`) from `io.randomSecure` internally, and the
   harness cannot taint those without editing the module. They are outside the
-  measurement, not proven by it. And a range proof's PRIVACY never rested on
-  this anyway — it rests on the zero-knowledge property — so the bullet
-  remains a threat-modelling note about the prover host, now a positive one.
+  measurement, not proven by it. A range proof's privacy never rested on
+  constant time anyway — it rests on the zero-knowledge property.
+- `verifyIpa` and `verifyBatch` use the variable-time Pippenger `scalarvec.multiScalarMulVartime`: their
+  inputs are the public proof and the public generators, so there is no secret to protect. The
+  constant-time path for secret scalars is `multiScalarMul` (B9) and `scalarvec.mulCt`.
 
-## Out of scope (future extensions)
+## What is deliberately not done
 
-- ~~§4.3 aggregated multi-value range proofs~~ — done 2026-10-02
-  (`proveMultiple`/`verifyMultiple`, see "Design").
-- ⚠ **No longer out of scope — this line is stale.** A windowed Pippenger
-  MSM was added as `scalarvec.multiScalarMulVartime` and `ipa.verifyIpa`
-  uses it. It is deliberately VARIABLE-time: its inputs are the public
-  proof and the public generators, so there is no secret to protect, and
-  the constant-time path for secret scalars remains `scalarvec.mulCt`.
-  What is still absent is a windowed CONSTANT-time MSM, which is what the
-  prover would need.
-- `n > 64` bignum witness support (see the `v` is a `u64` note above).
+- **An arithmetic-circuit / R1CS proof API.** dalek's is experimental and unpublished (`yoloproofs`,
+  feature-gated), so nobody ships it stable; recorded so it is not proposed again as a gap.
+- **Compatibility with secp256k1-zkp or Monero.** Other curves and other transcripts.
 
 ## Anchoring
 
@@ -424,36 +314,46 @@ comment.
 | dalek -> here | 14 proofs, n = 8/16/32/64 | dalek's `prove_single_with_rng` output (ChaCha20-seeded, reproducible), already accepted by dalek's `verify_single`, is accepted by `verify` and re-encodes byte-exact through `fromBytesAlloc`/`toBytesAlloc`; this pins `g_vec`/`h_vec` too, since a dalek proof verifies only over dalek's chain |
 | here -> dalek | 16 proofs, n = 8/16/32/64 | proofs from `prove` (`tools/dalek/zig_proofs.txt`, made by `tools/dalek/emit_zig_proofs.zig`) that dalek's `verify_single` ACCEPTED when the vectors were generated; the tool aborts on a rejection |
 | dalek -> here, aggregated | 6 proofs, m = 2/4/8, n = 8/16/32/64 | dalek's `prove_multiple_with_rng` output, accepted by its `verify_multiple`, is accepted by `verifyMultiple` and re-encodes byte-exact; pins the per-party generator chains, the `z^{2+j}` weights and the order of the `V_j` |
-| here -> dalek, aggregated | 5 proofs, m = 2/4/8, n = 8/16/32/64 | proofs from `proveMultiple` that dalek's `verify_multiple` ACCEPTED when the vectors were generated (first run, 2026-10-02) |
+| here -> dalek, aggregated | 5 proofs, m = 2/4/8, n = 8/16/32/64 | proofs from `proveMultiple` that dalek's `verify_multiple` ACCEPTED when the vectors were generated |
 | Controls | per dalek proof | another transcript label, a wider generator set, another commitment and one flipped bit per 32-byte element are each rejected; for aggregated proofs also two commitments swapped and half of them dropped |
 
 **Not anchored externally:** the standalone IPA API (`proveIpa`/`verifyIpa` outside a range proof; dalek's `InnerProductProof::create` is crate-private), widths other than 8/16/32/64, and the prover's blinding (drawn from the OS, never compared — dalek draws its own). The constant-time claims rest on `ctgrind_harness.zig`, not on the oracle.
 
-**Mutation run 2026-10-02 (aggregation).** 15 mutants of the new code in
-one schemata binary (`.zig-cache`, deleted after the run), filtered to
-`aggregate_test`, `interop_test` and the generator tests, ReleaseSafe:
-14 killed, 1 equivalent. ⭐ Three of them change prover AND verifier the
-same way — every value weighted `z^2` instead of `z^{2+j}` (with the
-matching `delta`), `m` left out of the domain separator, only `V_0` bound
-in the transcript — and ONLY the dalek tests killed them: the property
-tests cannot see an error both sides share, which is the reason the
-external half exists. A fourth, every party on chain 0, was also caught
-by `initParties`' own chain test. The equivalent one drops `verifyMultiple`'s
-"`m` is a power of two" check: `ipa.equationSides` refuses a length that is
-not a power of two on its own, so the check is defence in depth (as in
-B14), kept.
+**Why the external half matters.** Aggregation mutants that change prover AND verifier the same way —
+every value weighted `z^2` instead of `z^{2+j}` (with the matching `delta`), `m` left out of the domain
+separator, only `V_0` bound in the transcript — were killed ONLY by the dalek tests: the property tests
+cannot see an error both sides share.
 
-**How it got there.** Task A1 of the 2026-09-30 maturity survey. The transcript, generators and byte layout were moved to dalek's (see "Transcript"), after which every dalek proof verified here and every proof made here verified in dalek on the first run: the algebra had matched the paper, and dalek's, all along.
+## Verification
+
+- **Run:** `scripts/modtest bulletproofs` (`zig build test-bulletproofs`, Debug or `-Doptimize=ReleaseFast`).
+- **Property and soundness tests** (`kat_test.zig`, `aggregate_test.zig`, `batch_test.zig`): completeness
+  (several in-range values including `v = 0` and the boundary `v = 2^n - 1`, a standalone IPA proof), the
+  construction-time refusal of an out-of-range `v`, the exhaustive per-field tamper suite, cross-commitment
+  and parameter-mismatch rejection, aggregated proofs for m = 1..8 with malformed, reordered, swapped and
+  dropped commitments, batch verification (see *Batch verification*), codec round-trips.
+- **Differentials against plain code:** `verify_b8_diff_test.zig` (B8) and the `B9 diff` test in
+  `scalarvec.zig`, as described under *Design*; `deltaYZ` against a hand-derived value.
+- **External:** `interop_test.zig` over `interop_vectors.zig` (merlin and dalek as black boxes; producer
+  `tools/dalek/`, see *Anchoring*).
+- **Fuzz:** `fuzz_test.zig`, driver `BULLETPROOFS_FUZZ=<runs>[,<seed>]` (never `zig build --fuzz`), three
+  harnesses: `RangeProof` decoder (canonical re-encode; a decodable damaged proof does not verify),
+  `InnerProductProof` decoder (never panics, accepts only canonical encodings), and prove/verify (wrong
+  commitment, wrong domain, flipped bit and out-of-range value refused); each has a reach test.
+- **Constant time:** ctgrind rows `rangeproof` and `ipa` (`scripts/checks/ctgrind.sh bulletproofs`), 0
+  in-file; see *Caveats*.
+- **Dead stack:** `stackprobe_test.zig` asserts zero residue for `v`, `v_bytes`, `gamma`, `z^2*gamma` and every
+  random scalar `prove` drew, beside a negative and a positive control.
+- **Mutation:** schemata runs over the aggregation code and over `verifyBatch` (coefficients, weights,
+  shape and replay checks); survivors were killed by new tests or are equivalent (the `m`-is-a-power-of-two
+  check in `verifyMultiple` is defence in depth: `ipa.equationSides` refuses such a length on its own).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
-- **Relation audit 2026-10-03 — LOW:** the standalone `verifyIpa` relies on the caller having
+- **LOW (relation audit):** the standalone `verifyIpa` relies on the caller having
   absorbed `P` and `Q` into the transcript first (the range proof does); a direct caller who does
   not gets a weak Fiat–Shamir. Absorb them inside, or document it at the function.
-
-- **Aggregated range proofs (paper §4.3, `m` values in one proof)** (survey 2026-09-30) — DONE 2026-10-02: `proveMultiple`/`verifyMultiple`, `Generators.initParties`, anchored both ways against dalek's `prove_multiple`/`verify_multiple` (see "Anchoring").
-- **Multi-party aggregation (dalek's dealer/party protocol)** (2026-10-02): parties that do not trust each other build one aggregated proof, each keeping its own value and blinding; dalek's `range_proof::{dealer, party}` with share auditing. Not needed by a single prover; no consumer asks. Effort: medium-large (state machines, share validation, blame). Fits §2.
-- ~~**Batch verification of several independent range proofs**~~ ✅ 2026-10-02: `verifyBatch` (see "Batch verification" above).
-- ~~**Portable entropy for `prove`**~~ — done 2026-10-02: `prove`/`proveMultiple` take an `io: std.Io` and draw blinding from `io.randomSecure` (OS entropy every call, no fallback; failure is `error.EntropyUnavailable`). `meta.platform` is `.any`. Stack probe (ReleaseFast) and ctgrind (0 in-file contexts) re-run green.
-- **Wider values (`n > 64`) and an arithmetic-circuit/R1CS proof API** (survey 2026-09-30): dalek's R1CS API is experimental and unpublished, so this is a "nobody ships it stable" item; recorded so it is not proposed again as a gap. Effort: large. Fits §2.
-
+- **Multi-party aggregation (dalek's dealer/party protocol):** parties that do not trust each other build one aggregated proof, each keeping its own value and blinding; dalek's `range_proof::{dealer, party}` with share auditing. Not needed by a single prover; no consumer asks. Effort: medium-large (state machines, share validation, blame). Fits §2.
+- **Wider values (`n > 64`):** `v` is a `u64`; a wider variant needs a bignum witness type threaded through
+  `prove`'s bit-decomposition step — mechanical widening, no new cryptographic core; no consumer needs it. Effort: medium.

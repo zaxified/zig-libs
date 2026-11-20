@@ -5,16 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. Test only: `IntegerBitSet(N).initEmpty()` -> `.empty`. Examples/tools ported to Zig 0.17.0 (dalek proof emitter passes `io` to `prove`/`proveMultiple` (pre-existing drift)).
 
 - **2026-10-10** — tests: deterministic fuzz driver `BULLETPROOFS_FUZZ` (testkit) over range-proof and inner-product-proof decoders (canonical re-encode; a decodable damaged proof does not verify) and prove/verify (wrong commitment, wrong domain, flipped bit and out-of-range value refused). No change to the library code.
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
-  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
-  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
-  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
-  frames. 0 residues, caller's frame included.
 - **2026-10-08** — **FIX (secrets on the dead stack):** the dead-stack burn's buffer is now
   16-aligned instead of the vector type's natural 32. At 32 the burn's frame was realigned, and
   the up to 56 bytes between its saved frame pointer and the buffer — the top of the frame the
@@ -130,9 +124,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `ctgrind_harness.zig`, `example/main.zig`) and the README snippet are
   updated to pass `v` by pointer.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** the last three stale claims from audit finding B11 are corrected, all verified against the tree rather than taken from the record. `NOTICE` said **"Status: scaffold"** with `ipa.proveIpa`/`rangeproof.prove` described as `@panic("TODO(fable/core): …")` stubs — there is not one such stub left and `gate.core_implemented` is `true`; it also said `meta.deps = .{}` when it is `.{"ct25519"}`. `SPEC.md` listed a "Pippenger/windowed `multiScalarMul`" as out of scope, but `scalarvec.multiScalarMulVartime` exists and `ipa.verifyIpa` uses it (deliberately variable-time: its inputs are the public proof and public generators; a windowed CONSTANT-time MSM, which the prover would need, is what is still absent). ⭐ The other two B11 rows — README and SPEC "Caveats" claiming the prover is "Not constant-time" — were already fixed on 2026-09-09 by the ctgrind pass, so they are left alone; an audit record is always older than the tree. ⚠ The "scaffold" wording is corrected in place with a note saying it stood long after it was true: a status line that under-reports is the same defect as one that over-reports, and this module had one of each at the same time.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **rangeproof 0 / ipa 0**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. **Zero in-file contexts in both targets** — nothing in `rangeproof.zig`, `ipa.zig`, `scalarvec.zig`, `generators.zig`, `transcript.zig`, or the `ct25519` delegate. ⭐ This is why `SPEC.md`'s and `README.md`'s "Not constant-time" caveat was rewritten in the same commit: it described a `catch continue` that audit finding F2 removed, and which now survives only in comments about the shape it replaced. The staleness ran in the unusual direction — the code improved and the documentation advertised a side channel the module no longer has. ⚠ `prove` draws its own blinding internally via `getrandom(2)`; the harness cannot taint that without editing the module, so it is outside this measurement and the SPEC says so.
 
 - **2026-09-07** — **Test-only: both proof decoders were only ever handed the
   empty slice.** `ipa.fuzzFromBytesAlloc` and `rangeproof.fuzzFromBytesAlloc`
