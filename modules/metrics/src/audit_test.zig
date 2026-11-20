@@ -601,7 +601,7 @@ test "summary: buf_cap 1 flushes every observation" {
     try testing.expectEqual(@as(f64, 2), q[0]);
 }
 
-test "summary: an allocation failure while a stream flushes is counted once per failed flush" {
+test "summary: an allocation failure while a stream flushes is counts the real values of a failed flush" {
     var fa = testing.FailingAllocator.init(testing.allocator, .{});
     var s = try summary_mod.Summary.init(fa.allocator(), .{
         .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.05 }},
@@ -611,9 +611,9 @@ test "summary: an allocation failure while a stream flushes is counted once per 
     defer s.deinit();
     fa.fail_index = fa.alloc_index; // the next allocation (the list's first node) fails
     for (0..500) |i| s.observe(@floatFromInt(i), 1);
-    // One failed flush of a 500-value stream buffer: `dropped` says 1 although
-    // up to 500 observations left the quantile stream (review finding L3).
-    try testing.expectEqual(@as(u64, 1), s.droppedInserts());
+    // One failed flush of a 500-value stream buffer, nothing merged: all 500
+    // values are counted as dropped (one stream).
+    try testing.expectEqual(@as(u64, 500), s.droppedInserts());
     var q: [1]f64 = undefined;
     const snap = s.snapshot(1, &q);
     try testing.expectEqual(@as(u64, 500), snap.count); // _count/_sum unaffected

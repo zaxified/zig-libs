@@ -85,6 +85,9 @@ const Stream = struct {
     /// Unflushed raw values (capacity `stream_buf_cap`, preallocated).
     b: std.ArrayList(f64) = .empty,
     sorted: bool = true,
+    /// Raw values lost to a failed flush (allocation failure), cumulative;
+    /// `reset` does not clear it.
+    lost: u64 = 0,
 
     fn deinit(s: *Stream, gpa: std.mem.Allocator) void {
         s.l.deinit(gpa);
@@ -122,7 +125,14 @@ const Stream = struct {
         // Whatever happens, the buffer is spent (a failed merge has already
         // moved the prefix it managed into `l`).
         defer s.b.clearRetainingCapacity();
-        try s.merge(gpa, targets, s.b.items);
+        const before = s.n;
+        const total = s.b.items.len;
+        s.merge(gpa, targets, s.b.items) catch |e| {
+            // `merge` counts each value it placed in `n`; the rest are gone.
+            const merged: usize = @intFromFloat(s.n - before);
+            s.lost += total - merged;
+            return e;
+        };
     }
 
     /// Merge sorted raw values into the list, then compress.
@@ -226,7 +236,6 @@ pub const Summary = struct {
     hot: std.ArrayList(f64) = .empty,
     sum_: f64 = 0,
     count_: u64 = 0,
-    dropped: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, options: Options) InitError!Summary {
         for (options.objectives) |o| {
@@ -306,11 +315,15 @@ pub const Summary = struct {
         return .{ .count = s.count_, .sum = s.sum_ };
     }
 
-    /// Quantile-stream inserts lost to allocation failure (normally 0).
+    /// Values lost from the quantile streams to allocation failure
+    /// (normally 0): every value of a failed buffer flush that did not reach
+    /// the stream's sample list, counted once per stream.
     pub fn droppedInserts(s: *Summary) u64 {
         lockSpin(&s.lock);
         defer s.lock.unlock();
-        return s.dropped;
+        var n: u64 = 0;
+        for (s.streams) |st| n += st.lost;
+        return n;
     }
 
     fn anchor(s: *Summary, now_ns: u64) void {
@@ -330,9 +343,8 @@ pub const Summary = struct {
         }
         for (s.hot.items) |v| {
             for (s.streams) |*st| {
-                st.insert(s.gpa, s.objectives, v) catch {
-                    s.dropped += 1;
-                };
+                // A failure is counted by the stream itself (`lost`).
+                st.insert(s.gpa, s.objectives, v) catch {};
             }
         }
         s.hot.clearRetainingCapacity();
@@ -404,6 +416,21 @@ test "compress: a two-sample list merges when the invariant allows it" {
     // 1 + 1 + 0 <= 2 * 0.5 * (2 - 0) / (1 - 0.5) = 4: one sample of width 2.
     try testing.expectEqual(@as(usize, 1), st.l.items.len);
     try testing.expectEqual(@as(f64, 2), st.l.items[0].width);
+}
+
+test "a flush that fails part-way drops exactly the values it did not merge" {
+    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    var s = try Summary.init(fa.allocator(), .{
+        .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.05 }},
+        .age_buckets = 1,
+        .buf_cap = 500,
+    });
+    defer s.deinit();
+    fa.fail_index = fa.alloc_index + 2; // the list grows twice, then fails
+    for (0..500) |i| s.observe(@floatFromInt(i), 1);
+    const merged: u64 = @intFromFloat(s.streams[0].n);
+    try testing.expect(merged > 0 and merged < 500);
+    try testing.expectEqual(500 - merged, s.droppedInserts());
 }
 
 test "no objectives: only sum and count" {

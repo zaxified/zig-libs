@@ -948,6 +948,12 @@ pub const Registry = struct {
         return .{ .registry = r, .family = try r.getOrRegisterFamily(name, help, .summary, label_names, &.{}, options) };
     }
 
+    fn hasFamily(r: *Registry, name: []const u8) bool {
+        lockSpin(&r.lock);
+        defer r.lock.unlock();
+        return r.family_index.contains(name);
+    }
+
     /// Remove the family `name` and every series in it (client_golang
     /// `Unregister`). Returns whether it was removed — false when it does
     /// not exist or is pinned (a family `RequestMetrics` records into). Pointers into it must not
@@ -2371,20 +2377,57 @@ pub const RequestMetrics = struct {
         }
         if (options.request_size_buckets != null and !validMetricName(options.request_size_name)) return error.InvalidName;
         if (options.response_size_buckets != null and !validMetricName(options.response_size_name)) return error.InvalidName;
+        // A later registration may collide with an application family: drop
+        // the families this call created (not ones that existed already and
+        // matched) so a failed `init` leaves the registry as it found it.
+        var created: [5][]const u8 = undefined;
+        var n_created: usize = 0;
+        errdefer {
+            for (created[0..n_created]) |name| _ = registry.unregister(name);
+        }
+        const in_flight_new = !registry.hasFamily(options.in_flight_name);
         const in_flight = try registry.gauge(options.in_flight_name, options.in_flight_help, &.{});
+        if (in_flight_new) {
+            created[n_created] = options.in_flight_name;
+            n_created += 1;
+        }
+        const counter_new = !registry.hasFamily(options.counter_name);
         _ = try registry.counter(options.counter_name, options.counter_help, &.{
             .{ .name = "method", .value = @tagName(http.Method.get) },
             .{ .name = "code", .value = classLabel(2) },
         });
+        if (counter_new) {
+            created[n_created] = options.counter_name;
+            n_created += 1;
+        }
+        const histogram_new = !registry.hasFamily(options.histogram_name);
         _ = try registry.histogram(options.histogram_name, options.histogram_help, &.{
             .{ .name = "method", .value = @tagName(http.Method.get) },
         }, options.buckets);
-        if (options.request_size_buckets) |bs| _ = try registry.histogram(options.request_size_name, options.request_size_help, &.{
-            .{ .name = "method", .value = @tagName(http.Method.get) },
-        }, bs);
-        if (options.response_size_buckets) |bs| _ = try registry.histogram(options.response_size_name, options.response_size_help, &.{
-            .{ .name = "method", .value = @tagName(http.Method.get) },
-        }, bs);
+        if (histogram_new) {
+            created[n_created] = options.histogram_name;
+            n_created += 1;
+        }
+        if (options.request_size_buckets) |bs| {
+            const new = !registry.hasFamily(options.request_size_name);
+            _ = try registry.histogram(options.request_size_name, options.request_size_help, &.{
+                .{ .name = "method", .value = @tagName(http.Method.get) },
+            }, bs);
+            if (new) {
+                created[n_created] = options.request_size_name;
+                n_created += 1;
+            }
+        }
+        if (options.response_size_buckets) |bs| {
+            const new = !registry.hasFamily(options.response_size_name);
+            _ = try registry.histogram(options.response_size_name, options.response_size_help, &.{
+                .{ .name = "method", .value = @tagName(http.Method.get) },
+            }, bs);
+            if (new) {
+                created[n_created] = options.response_size_name;
+                n_created += 1;
+            }
+        }
         // This middleware keeps series pointers for its whole life: its
         // families must never be freed under it (review 2026-10-17, M1).
         registry.pin(options.in_flight_name);
@@ -3581,6 +3624,29 @@ test "middleware: init fails when the request counter's name collides with an ap
     defer reg2.deinit();
     _ = try reg2.gauge("http_request_duration_seconds", "some app metric", &.{});
     try testing.expectError(error.WrongType, RequestMetrics.init(&reg2, .{}));
+}
+
+test "middleware: a failed init unregisters the families it created, keeps the application's own" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    // The app's family with the histogram's name has another type; the
+    // in-flight gauge and the counter are registered before it is reached.
+    _ = try reg.gauge("http_request_duration_seconds", "some app metric", &.{});
+    try testing.expectError(error.WrongType, RequestMetrics.init(&reg, .{}));
+    // The counter family `init` created is gone: its name takes another type.
+    _ = try reg.gauge("http_requests_total", "now a gauge", &.{});
+    // The in-flight family likewise.
+    _ = try reg.counter("http_requests_in_flight", "now a counter", &.{});
+    // The application's own family is untouched.
+    try testing.expect(reg.hasFamily("http_request_duration_seconds"));
+
+    // A family that existed before and matches is shared, not removed.
+    var reg2 = Registry.init(testing.allocator);
+    defer reg2.deinit();
+    _ = try reg2.gauge("http_requests_in_flight", "HTTP requests currently being served.", &.{});
+    _ = try reg2.gauge("http_requests_total", "app gauge", &.{});
+    try testing.expectError(error.WrongType, RequestMetrics.init(&reg2, .{}));
+    try testing.expect(reg2.hasFamily("http_requests_in_flight"));
 }
 
 const HookCapture = struct {

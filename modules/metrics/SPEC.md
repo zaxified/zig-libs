@@ -99,7 +99,7 @@ sorted; `error.InvalidBuckets` instead of silent strip/panic.
   Time is injected: each series captures `Registry.clock` when it is created (set it before registering summaries), and the
   window starts at the first call that carries a time. Deviations: a NaN counts toward `_count` and poisons `_sum` as in Go
   but is not inserted into the streams; the buffer flush runs inline in the observing thread; an observation whose stream
-  insert fails for lack of memory is not recorded in the quantile streams (`Summary.droppedInserts`), `_sum`/`_count` still
+  insert fails for lack of memory is not recorded in the quantile streams (`Summary.droppedInserts` counts the real values lost, per stream), `_sum`/`_count` still
   update. Limits: at most `max_objectives` (16) objectives, `epsilon` below `min_epsilon` (1e-4) is refused with
   `error.InvalidObjectives`, not clamped (a series fed from request traffic would otherwise keep nearly every observation
   of its window); `quantile` is a reserved label name on summaries. The engine is checked bit-for-bit against beorn7/perks
@@ -245,9 +245,6 @@ network policy) rather than gating the whole router with `.all`.
   refcount would close it, cost unmeasured.
 - **Parking-list leak on out-of-memory:** `unregister`/`retireLocked` leak the family/series when the append to the parking
   list fails (deliberate: leaking beats freeing memory a scrape may read); open question whether to count it.
-- **`Summary.droppedInserts`** counts a failed 500-value stream flush as 1 value.
-- **`RequestMetrics.init` leaves the families it registered** when a later registration is refused by a collision with an
-  existing family (refusals found by validation, before any registration, leave the registry untouched).
 
 ## Fuzzing
 
