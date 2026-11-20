@@ -22,7 +22,7 @@ see that file's placement note). Meta tags live in `src/root.zig`'s
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. This module is deliberately only the RFC 9001 packet-protection seam (no transport, no handshake), so it is graded against the crypto layers that transports plug in, not against whole QUIC stacks; the full stacks are listed for orientation. Claims about this module: at survey time `rg -i 'retry|integrity|v2|9369'` over `src/` found only the v1 Initial salt; the Retry tag and QUIC v2 landed 2026-09-30 (see Backlog, both DONE). Competitor claims are *(inferred)* from prior knowledge of their public docs; no foreign source was read.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. This module is deliberately only the RFC 9001 packet-protection seam (no transport, no handshake), so it is graded against the crypto layers that transports plug in, not against whole QUIC stacks; the full stacks are listed for orientation. Claims about this module: at survey time `rg -i 'retry|integrity|v2|9369'` over `src/` found only the v1 Initial salt; the Retry tag and QUIC v2 landed 2026-09-30 (see *Versions and Retry*). Competitor claims are *(inferred)* from prior knowledge of their public docs; no foreign source was read.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -33,7 +33,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [quic-go/quic-go](https://github.com/quic-go/quic-go) | Go | MIT | 11.8k | v0.63.0 (2026-09-22) | Whole QUIC + HTTP/3 stack over `crypto/tls`'s QUIC hooks. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No QUIC; the primitives (AES-GCM, ChaCha20-Poly1305, HKDF) only. |
 
-**Where we are ahead:** of everything in Zig, the only RFC 9001 packet-protection code, byte-exact to RFC 9001 Appendix A (Initial, header protection, ChaCha20 set, key update), std-only apart from the `chachapoly` sibling, allocation-free, and it carries the header-protection ordering hazard in its API (`remove` returns the discovered PN length). **Where we are behind:** any handshake bridge (TLS 1.3 with QUIC transport parameters), which rustls and Go provide; that is what a transport author needs beside this. (The Retry integrity tag, RFC 9001 §5.8, and QUIC v2, RFC 9369, gaps found by the survey were closed 2026-09-30.)
+**Where we are ahead:** of everything in Zig, the only RFC 9001 packet-protection code, byte-exact to RFC 9001 Appendix A (Initial, header protection, ChaCha20 set, key update), std plus the `chachapoly` and `aesgcm` siblings only, allocation-free, and it carries the header-protection ordering hazard in its API (`remove` returns the discovered PN length). **Where we are behind:** any handshake bridge (TLS 1.3 with QUIC transport parameters), which rustls and Go provide; that is what a transport author needs beside this. (The Retry integrity tag, RFC 9001 §5.8, and QUIC v2, RFC 9369, gaps found by the survey were closed 2026-09-30.)
 
 ## What this module is (and is deliberately not)
 
@@ -58,7 +58,7 @@ ON this seam, not the reverse.
 | §5.8 Retry Packet Integrity | `retry.zig` | AEAD_AES_128_GCM over an empty plaintext, fixed per-version key/nonce, AAD = Retry Pseudo-Packet. See "Versions and Retry" below. |
 | §6 Key Update | `keyschedule.zig` | `next_secret = HKDF-Expand-Label(secret, "quic ku", "", Hash.length)`; new key+iv from it; **hp unchanged** (§6.1) so header protection keeps covering the Key Phase bit. |
 
-## Recon vs. Zig 0.16 `std.crypto` (single source of truth = root.zig)
+## Recon vs. `std.crypto` (single source of truth = root.zig)
 
 Recorded in `src/root.zig`'s module doc. Summary of the exact std paths:
 
@@ -81,7 +81,7 @@ Recorded in `src/root.zig`'s module doc. Summary of the exact std paths:
 
 ## The dtls constructions mirrored (and how QUIC differs)
 
-No `dtls` code is imported or copied (the only dependency is the `chachapoly` sibling, for the re-exported `ChaCha20Poly1305`; everything else is std). The two shared
+No `dtls` code is imported or copied (the only dependencies are the `chachapoly` sibling, for the re-exported `ChaCha20Poly1305`, and the `aesgcm` sibling for the AES-GCM AEADs; everything else is std). The two shared
 CONSTRUCTIONS, re-expressed QUIC-shaped:
 
 1. **AEAD nonce** — `dtls.aead.Protection.nonce` (RFC 9147 §4.2.2,
@@ -130,8 +130,6 @@ CONSTRUCTIONS, re-expressed QUIC-shaped:
 
 ## Versions and Retry (design & invariants)
 
-Added 2026-09-30 (survey items, both DONE below).
-
 - **`Version` = `enum(u32) { v1 = 1, v2 = 0x6b3343cf }`** (`version.zig`) is the
   ONLY version switch. RFC 9369 changes exactly: the Initial salt
   (§3.3.1), the four HKDF labels `quicv2 key/iv/hp/ku` (§3.3.2), the Retry
@@ -169,12 +167,9 @@ Added 2026-09-30 (survey items, both DONE below).
   and vice versa, v1 labels or v1 salt cannot open the v2 client Initial. The
   two Retry tags were also cross-checked with python `cryptography`.
 
-## Crypto-implementation pass — DONE (all 9 items landed)
+## Implementation notes per function
 
-The formerly-stubbed function bodies are all implemented and every
-previously skip-guarded test un-guarded and passing byte-exact against
-RFC 9001 Appendix A. What each turned out to be, in the original
-dependency order:
+Every function below is implemented and checked byte-exact against RFC 9001 Appendix A (`KAT`). In dependency order:
 
 1. **`keyschedule.derivePacketKeys`** (§5.1) — three
    `std.crypto.tls.hkdfExpandLabel` calls (`"quic key"`/`"quic iv"`/
@@ -215,15 +210,53 @@ dependency order:
    KAT: App. A.5 `"quic ku"` secret; key/iv checked against the sanity
    derivation of that secret.
 
+## Secret residue (dead stack)
+
+Secrets go in by `*const` and secret results come out through an `out` pointer (`deriveInitialSecrets`,
+`derivePacketKeys`, `advanceKeys` and their `*For` forms write an `InitialSecrets` / `PacketKeys` /
+`KeyUpdate`; `KeyUpdate.next_secret` may alias the input secret, so a ratchet can run in place; `Protection.seal` /
+`open` take the key as `*const [key_length]u8`). Every secret-touching entry point (the key derivations and key
+update, the header-protection masks, `seal`/`open`) runs its body one frame down and then zeroes the stack that
+body dirtied (`src/burn.zig`: `burn.run`, with `kdf_burn` for derivations and `packet_burn` per packet);
+`src/stackprobe_test.zig` goes red when a body outgrows its burn. The caller's own copies (the traffic secret it
+holds, the `PacketKeys` it receives) are the caller's to wipe.
+
 ## Verification
 
-The `sanity` tests prove the constants + std constructions inside the test
-binary (independent oracle), and the API tests route the public surface
-through the SAME expected values — both green in Debug and ReleaseFast.
-Beyond the App. A KATs, a live wire-interop test (against ngtcp2 / quiche /
-msquic Initial packets) belongs to the eventual `quic` transport consumer,
-not to this crypto seam — this module has no socket and no packet framing to
-drive such a test on its own.
+Run: `scripts/modtest quic-crypto`; fuzz: `QUIC_CRYPTO_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver;
+never `zig build --fuzz`); constant time: `scripts/checks/ctgrind.sh quic-crypto`.
+
+- **Known-answer tests.** RFC 9001 Appendix A (A.1 Initial secrets and keys, A.2 client Initial, A.3 server Initial,
+  A.4 Retry, A.5 ChaCha20-Poly1305 short packet and key update) and RFC 9369 Appendix A.1-A.5, byte-exact, in
+  `initial.zig`, `keyschedule.zig`, `headerprot.zig`, `protection.zig`, `retry.zig` and `rfc9369_vectors.zig`; every
+  expected value is the RFC's own (see Anchoring).
+- **`sanity` tests.** Each submodule proves the published vectors chain through `std.crypto` directly (an oracle
+  independent of this module's code), and the per-function tests route the public API through the same expected
+  values.
+- **Negative tests.** The AEAD tamper matrix, every single-bit flip of ODCID / Retry packet / tag, a v1 tag under v2
+  and the reverse, v1 labels or the v1 salt cannot open the v2 client Initial; boundaries of the Retry
+  pseudo-packet (`max_pseudo_packet_len`) and of `headerprot.apply` / `remove` (`pn_offset` past the packet, a PN
+  one octet past the end).
+- **Fuzz harnesses** (`src/fuzz_test.zig`): `quic-hp-remove`, `quic-hp-roundtrip`, `quic-protection` (three AEADs:
+  a sealed packet opens, any flipped bit, other packet number, key, iv, truncation or random bytes is refused),
+  `quic-initial-retry` (both versions' Initial secrets and packet keys, the key-update chain, the Retry tag).
+- **Constant time:** `src/ctgrind_harness.zig` (targets `aes`, `chacha`); verdicts on the card's Hardening line.
+  Initial secrets and the Retry key are public by construction and not measured.
+- **Dead stack:** `src/stackprobe_test.zig` over every entry point.
+- **Not tested:** a live wire interop run (ngtcp2 / quiche / msquic Initial packets): it belongs to the eventual
+  `quic` transport consumer, since this module has no socket or packet framing to drive one.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
+
+## What is deliberately not done
+
+- **Anything above the crypto seam** — no transport state, handshake bridge, packet-number reconstruction, version
+  negotiation (RFC 9368) or connection type; see *What this module is*. A future `quic` transport module would
+  depend on this seam.
+
+## Backlog / deferred
+
+- **AES-GCM bulk path not re-measured** since AES-GCM moved to the `aesgcm` module (Zig 0.17 #36256).
 
 ## Anchoring
 
@@ -232,26 +265,4 @@ drive such a test on its own.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** RFC 9001 Appendix A vectors verbatim in initial/headerprot/protection.zig
-
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
-mutant): **23 mutants, 22 killed, 1 equivalent**. Points: v2 wire decoding, the v2 Retry key and
-nonce, both versions' long-header type bits, the Retry ODCID and pseudo-packet limits and the
-tag-only packet, the nonce's PN byte order, `seal`/`open` buffer and length checks, the ChaCha20
-mask counter, `apply`'s two bounds, `remove`'s empty-packet check, `pn_len` and atomic restore,
-both first-byte masks, the key-update `ku` label and secret, and the Initial client label.
-
-First pass: 4 survivors — **no defect, 3 test gaps** closed: the Retry pseudo-packet at exactly
-2049 octets (the existing 2057-octet case could not see an off-by-one that overruns the stack
-buffer), and `apply` with `pn_offset` past the packet and with a PN one octet past the end (no
-test had a packet that did not fit). **Equivalent:** `verifyRetryTag` refusing a 16-octet
-(tag-only) packet as `PacketTooShort` instead of `IntegrityFailed` — refused either way.
-
-## Backlog / deferred
-
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
-
-- **Retry integrity tag (RFC 9001 §5.8)** — DONE 2026-09-30 (survey 2026-09-30): `retry.computeRetryTag` / `verifyRetryTag`, anchored on RFC 9001 A.4 and RFC 9369 A.4.
-- **QUIC v2 (RFC 9369): salt, HKDF labels (`quicv2 key` …), Retry key** — DONE 2026-09-30 (survey 2026-09-30): `Version` + `*For` derivations + Retry key/nonce + packet-type codes, anchored on RFC 9369 A.1–A.5.
+**What the tests actually contain.** RFC 9001 Appendix A vectors verbatim in initial/headerprot/protection.zig and RFC 9369 Appendix A vectors in rfc9369_vectors.zig/retry.zig
