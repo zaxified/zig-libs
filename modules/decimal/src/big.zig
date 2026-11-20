@@ -48,8 +48,8 @@
 //! budget (`max_result_digits`) checked before allocating — see that
 //! constant's doc comment for why `pow` in particular cannot be left
 //! unbounded. `pow` is deliberately integer-exponent-only; the general GDA
-//! `power` needs `exp`/`ln` on bignums and is out of scope (stated in `pow`'s
-//! doc comment).
+//! `power` (non-integer and negative exponents, via `exp`/`ln`) is the
+//! separate `BigDecimal.power`.
 //!
 //! Provenance: original scaffold by the zig-libs authors (MIT), modeled
 //! after Java `BigDecimal` / IBM General Decimal Arithmetic (design
@@ -367,8 +367,8 @@ pub const BigDecimal = struct {
 
     // -----------------------------------------------------------------
     // Comparison — exact. Aligning exponents by exact widening (never
-    // rounding) and then comparing magnitudes is enough; no Fable stub
-    // needed here.
+    // rounding) and then comparing magnitudes is enough; no rounding
+    // primitive is involved.
     // -----------------------------------------------------------------
 
     /// Three-way compare. Allocates a scratch difference when exponents
@@ -406,7 +406,7 @@ pub const BigDecimal = struct {
 
     // -----------------------------------------------------------------
     // Exact arithmetic. Arbitrary precision means +/-/× never need to
-    // round: no Fable stub anywhere in this section.
+    // round: no rounding primitive appears in this section.
     // -----------------------------------------------------------------
 
     /// Exact addition. Result exponent is `min(a.exponent, b.exponent)`
@@ -471,7 +471,7 @@ pub const BigDecimal = struct {
     /// normalizes to `12` at exponent `0` (i.e. `12`), the identical value in
     /// canonical form. Exact: each step is a divisibility-by-10 check via
     /// `Managed.divTrunc`, no rounding decision — unlike `roundedDivMag`,
-    /// this does **not** need to be a Fable stub. Zero is returned unchanged
+    /// this needs no rounding primitive. Zero is returned unchanged
     /// (its exponent carries no information once normalized, and GDA leaves
     /// zero's exponent alone rather than collapsing it to 0).
     pub fn normalize(allocator: Allocator, a: BigDecimal) Error!BigDecimal {
@@ -1018,9 +1018,8 @@ pub const BigDecimal = struct {
     ///
     /// **Scope boundary.** GDA's general `power` also admits non-integer and
     /// negative exponents, which require `exp`/`ln` on arbitrary-precision
-    /// decimals — a transcendental-function project in its own right, not a
-    /// wrapper around `std.math.big.int.Managed.pow`. This function
-    /// deliberately implements only the integer case; a negative `n` is
+    /// decimals; those are `BigDecimal.power`, not this function. This
+    /// function implements only the integer case; a negative `n` is
     /// `error.NegativeExponent` rather than a silently wrong answer (Java
     /// throws `ArithmeticException` in the same situation).
     ///
@@ -1884,7 +1883,7 @@ fn applyRounding(
 /// Exact: multiply `coeff` by `10^shift`. This is the "gain precision"
 /// direction (used by `add`/`sub` alignment and `rescale`'s widening
 /// branch) — never a rounding decision, so — unlike `roundedDivMag` — it
-/// does not need to be a Fable stub.
+/// needs no rounding primitive.
 fn scaleUp(allocator: Allocator, coeff: *const Managed, shift: u32) BigDecimal.Error!Managed {
     var p = try pow10(allocator, shift);
     defer p.deinit();
@@ -2896,7 +2895,7 @@ fn alignShift(hi_exp: i32, lo_exp: i32) BigDecimal.Error!u32 {
     return @intCast(diff);
 }
 
-/// **THE Fable-tier primitive.** Given nonnegative `num`/`den` (`den != 0`)
+/// **The rounding primitive.** Given nonnegative `num`/`den` (`den != 0`)
 /// and the intended result sign, return `round(num/den)` as an exact
 /// arbitrary-precision integer, using `mode` to resolve a nonzero
 /// remainder — round-half-even and friends, generalized from
@@ -2922,8 +2921,7 @@ fn alignShift(hi_exp: i32, lo_exp: i32) BigDecimal.Error!u32 {
 /// correctness bug, and it deserves the same exhaustive-KAT treatment as
 /// `root.zig`'s "rounding truth table — all modes" test, generalized to
 /// non-terminating arbitrary-precision quotients. See `div_kat_vectors` /
-/// `rescale_kat_vectors` below (the live regression suite) and SPEC.md's
-/// "BigDecimal — Fable worklist" section.
+/// `rescale_kat_vectors` below (the live regression suite).
 fn roundedDivMag(
     allocator: Allocator,
     num: *const Managed,
@@ -3185,7 +3183,7 @@ test "parse — literal exponent overflow is a clean error, not a trap" {
 }
 
 test "add: max_align_shift is exactly 1_000_000, not merely 'the configured value' (F4)" {
-    // F4 (2026-08-11 re-audit): `max_align_shift` is the module's only DoS
+    // F4 (re-audit): `max_align_shift` is the module's only DoS
     // guard on the exponent-alignment path, reachable straight from `parse`
     // (a hostile/typo'd exponent needs no other gate before it drives `add`),
     // and nothing referenced the delivered literal — a 9x raise to
@@ -3598,7 +3596,7 @@ test "sqrt — errors and the correctly-rounded contract" {
 }
 
 test "sqrt — the five directed rounding modes are observable without a tie (F3)" {
-    // F3 (2026-08-11 re-audit): `sqrt.vec`'s rounding column is 3203
+    // F3 (re-audit): `sqrt.vec`'s rounding column is 3203
     // `half_even` + 65 `half_up` vectors, but a sqrt tie is essentially
     // unreachable (the true root would need to terminate in `5·10^(drop-1)`),
     // so every one of those vectors lands where the choice makes no
@@ -4258,11 +4256,11 @@ test "corpus: every literal reaches BigDecimal.parse, and the counts are pinned"
     }
     // One seed IS the empty literal, a legal member of a refusal corpus.
     try testing.expectEqual(parse_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed and
+    // Measured: with the collapsing draw, 0 non-empty, 0 parsed and
     // 0 octets delivered — one empty string seventeen times. After:
     try testing.expectEqual(@as(usize, 10), parsed);
     try testing.expectEqual(@as(usize, 360), digits);
-    // The harness's claim, now executable: measured 2026-09-08 at 0. Every
+    // The harness's claim, now executable: measured at 0. Every
     // seed reaches `BigDecimal.parse` verbatim, because `testkit.fuzz.seed`
     // leaves no tail and `boolWeighted` on an exhausted input is `false`. ⛔ A
     // non-zero value here would mean a quarter of the corpus's own literals
@@ -4271,7 +4269,7 @@ test "corpus: every literal reaches BigDecimal.parse, and the counts are pinned"
 }
 
 // ---------------------------------------------------------------------------
-// Mutation run 2026-10-04: boundary and short-circuit pins. Each test kills
+// Mutation run: boundary and short-circuit pins. Each test kills
 // mutants the earlier suite let survive (SPEC.md "Mutation run 2026-10-04").
 // Expected values come from the stated invariant or from Python 3 `decimal`
 // (the General Decimal Arithmetic reference), noted per test.
@@ -4491,7 +4489,7 @@ test "parse: long exponent literals are read by value, never truncated" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

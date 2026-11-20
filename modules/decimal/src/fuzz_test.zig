@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Deterministic fuzz driver over decimal's two existing `testing.fuzz`
-//! harnesses (`Decimal.parse`, `BigDecimal.parse`; added 2026-10-09). The
+//! harnesses (`Decimal.parse`, `BigDecimal.parse`; added). The
 //! bodies live here, generic over their source of choices (`fn(comptime S, *S,
 //! gpa)`); the `testing.fuzz` tests in `root.zig` / `big.zig` feed them through
 //! the cursor adapter below, the driver feeds them a PRNG.

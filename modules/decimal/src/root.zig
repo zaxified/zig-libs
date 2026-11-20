@@ -55,7 +55,7 @@ pub const meta = .{
     .targets = .{ .linux64, .windows },
     .platform = .any, // pure integer logic, no OS calls
     .role = .util,
-    .concurrency = .reentrant, // no shared state, no allocation
+    .concurrency = .reentrant, // no shared state; only `BigDecimal`'s allocating calls take an allocator
     .model_after = "Java BigDecimal (incl. RoundingMode) / IBM General Decimal Arithmetic / DB DECIMAL(38,12)",
     .deps = .{}, // std only
 };
@@ -73,7 +73,7 @@ pub const BigDecimal = big_impl.BigDecimal;
 pub const Decimal = struct {
     raw: i128, // value × 10^scale
 
-    /// Number of fractional digits (fixed).
+    /// Number of fractional digits.
     pub const scale: u32 = 12;
     /// 10^scale — the raw-representation multiplier.
     pub const scale_factor: i128 = 1_000_000_000_000;
@@ -1667,12 +1667,12 @@ test "corpus: every literal reaches Decimal.parse, and the counts are pinned" {
     }
     // One seed IS the empty literal, a legal member of a refusal corpus.
     try testing.expectEqual(parse_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed, 0
+    // Measured: with the collapsing draw, 0 non-empty, 0 parsed, 0
     // overflows and 0 octets delivered — one empty string 24 times. After:
     try testing.expectEqual(@as(usize, 9), parsed);
     try testing.expectEqual(@as(usize, 5), overflows);
     try testing.expectEqual(@as(usize, 294), digits);
-    // The harness's claim, now executable: measured 2026-09-08 at 0. Every
+    // The harness's claim, now executable: measured at 0. Every
     // seed reaches `Decimal.parse` verbatim, because `testkit.fuzz.seed` leaves
     // no tail and `boolWeighted` on an exhausted input is `false`. ⛔ A non-zero
     // value here would mean a quarter of the corpus's own literals were being
@@ -1854,7 +1854,7 @@ test "float bridge: toFloat(fromFloatShortest(x)) == x for typed decimals with <
     }
 }
 
-// ── mutation run 2026-10-04: boundary and short-circuit pins ────────────────
+// ── mutation run: boundary and short-circuit pins ────────────────
 //
 // Each test below kills one or more mutants that the earlier suite let
 // survive (see SPEC.md "Mutation run 2026-10-04"). The expected values come
@@ -1979,7 +1979,7 @@ test "parse: values far below the last place round to 0 instead of Overflow" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
