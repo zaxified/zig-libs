@@ -42,6 +42,14 @@ pub const ParseError = error{
     BadOptionLength,
 };
 
+/// `Message.concatOption` failures.
+pub const ConcatError = error{
+    /// The concatenated option does not fit the caller's buffer.
+    BufferTooSmall,
+    /// An overloaded `file`/`sname` region has a damaged option.
+    TruncatedOption,
+};
+
 pub const BuildError = error{
     BufferTooSmall,
     /// Option data longer than 255 bytes.
@@ -320,6 +328,49 @@ pub const Message = struct {
     /// Re-iterate the raw options field (unknown options included).
     pub fn optionIterator(m: *const Message) OptionIterator {
         return OptionIterator.init(m.options_raw);
+    }
+
+    /// RFC 3396 long-option reassembly: every instance of option `code`, in
+    /// wire order (the options field, then `file`, then `sname` when option
+    /// overload says they carry options, RFC 2132 §9.3), concatenated. One
+    /// instance is returned as is (a slice of the message, `out` untouched);
+    /// several are copied into `out`. `null`: the option is absent.
+    /// `error.BufferTooSmall`: the total does not fit `out`;
+    /// `error.TruncatedOption`: an overloaded region is malformed. The typed
+    /// fields of `Message` keep the last instance only (they are slices of
+    /// the message), so use this for options that may exceed 255 octets
+    /// (43, 82, 119, 121 ...).
+    pub fn concatOption(m: *const Message, code: u8, out: []u8) ConcatError!?[]const u8 {
+        const ov: u8 = if (m.overload) |o| @backingInt(o) else 0;
+        const regions = [3][]const u8{
+            m.options_raw,
+            if (ov & 1 != 0) m.file else &.{},
+            if (ov & 2 != 0) m.sname else &.{},
+        };
+        var first: ?[]const u8 = null;
+        var n: usize = 0;
+        var copied = false;
+        for (regions) |region| {
+            var it = OptionIterator.init(region);
+            while (it.next() catch return ConcatError.TruncatedOption) |opt| {
+                if (opt.code != code) continue;
+                if (first == null) {
+                    first = opt.data;
+                    continue;
+                }
+                if (!copied) {
+                    if (first.?.len > out.len) return ConcatError.BufferTooSmall;
+                    @memcpy(out[0..first.?.len], first.?);
+                    n = first.?.len;
+                    copied = true;
+                }
+                if (opt.data.len > out.len - n) return ConcatError.BufferTooSmall;
+                @memcpy(out[n..][0..opt.data.len], opt.data);
+                n += opt.data.len;
+            }
+        }
+        if (copied) return out[0..n];
+        return first;
     }
 
     /// Iterate options overloaded into `sname` (check `overload` first).
@@ -901,6 +952,38 @@ test "DHCP: option overload surfaced" {
     // sname region is all-zero here: iterating it yields nothing (all Pad).
     var it = m.snameOptionIterator();
     try testing.expectEqual(@as(?RawOption, null), try it.next());
+}
+
+test "DHCP: RFC 3396 concatOption joins repeated and overloaded instances" {
+    var buf: [400]u8 = undefined;
+    var b = try Builder.init(&buf, .{ .op = .boot_reply, .xid = 3 });
+    try b.addOption(119, "abc");
+    try b.addOption(12, "host");
+    try b.addOption(119, "def");
+    try b.addOption(@backingInt(OptionCode.option_overload), &.{3});
+    const bytes_len = (try b.finish(.{})).len;
+    // Plant a third fragment in `file` and a fourth in `sname` (offsets 108 / 44).
+    buf[108..114].* = .{ 119, 2, 'g', 'h', 255, 0 };
+    buf[44..50].* = .{ 119, 1, 'i', 255, 0, 0 };
+    const m = try Message.parse(buf[0..bytes_len]);
+    var out: [16]u8 = undefined;
+    try testing.expectEqualStrings("abcdefghi", (try m.concatOption(119, &out)).?);
+    // A single instance is returned without a copy; absent is null.
+    const one = (try m.concatOption(12, &out)).?;
+    try testing.expectEqualStrings("host", one);
+    try testing.expect(one.ptr != @as([*]const u8, &out));
+    try testing.expectEqual(@as(?[]const u8, null), try m.concatOption(120, &out));
+    // Exact fit works, one byte less does not.
+    var tight: [9]u8 = undefined;
+    try testing.expectEqualStrings("abcdefghi", (try m.concatOption(119, &tight)).?);
+    try testing.expectError(ConcatError.BufferTooSmall, m.concatOption(119, tight[0..8]));
+    // The typed field of the same option keeps only what parse saw last in the main field.
+    try testing.expectEqualStrings("def", m.domain_search.?);
+    // A damaged overloaded region is an error, not a silent partial result.
+    buf[108..114].* = @splat(0);
+    buf[234..236].* = .{ 119, 9 }; // length runs past the end of `file`
+    const bad = try Message.parse(buf[0..bytes_len]);
+    try testing.expectError(ConcatError.TruncatedOption, bad.concatOption(119, &out));
 }
 
 test "DHCP malformed: typed errors, no panic" {

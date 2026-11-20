@@ -1050,7 +1050,6 @@ pub const Builder = struct {
         try b.addOrgSpecific(oui_ieee_8021, 1, &be);
     }
 
-    /// IEEE 802.3 Maximum Frame Size (subtype 4).
     /// LLDP-MED Capabilities (TIA subtype 1) — a MED device sends this first.
     pub fn addMedCapabilities(b: *Builder, capabilities: u16, device_type: MedDeviceType) BuildError!void {
         var v: [3]u8 = undefined;
@@ -1071,6 +1070,47 @@ pub const Builder = struct {
         try b.addOrgSpecific(oui_tia, 2, &v);
     }
 
+    /// IEEE 802.3 Power Via MDI (subtype 2); the 802.3at extension is
+    /// written when `p.dot3at` is set (the decoder's inverse).
+    pub fn addPowerViaMdi(b: *Builder, p: PowerViaMdi) BuildError!void {
+        var v: [8]u8 = undefined;
+        v[0] = p.mdi_support;
+        v[1] = p.pse_power_pair;
+        v[2] = p.power_class;
+        var n: usize = 3;
+        if (p.dot3at) |e| {
+            v[3] = e.type_source_priority;
+            std.mem.writeInt(u16, v[4..6], e.pd_requested_dw, .big);
+            std.mem.writeInt(u16, v[6..8], e.pse_allocated_dw, .big);
+            n = 8;
+        }
+        try b.addOrgSpecific(oui_ieee_8023, 2, v[0..n]);
+    }
+
+    /// LLDP-MED Location Identification (TIA subtype 3): format byte plus
+    /// the raw LCI (`MedLocation.format` / `.data`).
+    pub fn addMedLocation(b: *Builder, format: u8, data: []const u8) BuildError!void {
+        var scratch: [max_tlv_len]u8 = undefined;
+        if (1 + data.len + 4 > scratch.len) return BuildError.ValueTooLong;
+        scratch[0] = format;
+        @memcpy(scratch[1..][0..data.len], data);
+        try b.addOrgSpecific(oui_tia, 3, scratch[0 .. 1 + data.len]);
+    }
+
+    /// LLDP-MED Extended Power-via-MDI (TIA subtype 4).
+    pub fn addMedExtPower(b: *Builder, p: MedExtPower) BuildError!void {
+        var v: [3]u8 = undefined;
+        v[0] = (@as(u8, p.power_type) << 6) | (@as(u8, p.power_source) << 4) | p.priority;
+        std.mem.writeInt(u16, v[1..3], p.power_dw, .big);
+        try b.addOrgSpecific(oui_tia, 4, &v);
+    }
+
+    /// One LLDP-MED inventory string (TIA subtypes 5-11).
+    pub fn addMedInventory(b: *Builder, field: MedInventoryField, text: []const u8) BuildError!void {
+        try b.addOrgSpecific(oui_tia, @backingInt(field), text);
+    }
+
+    /// IEEE 802.3 Maximum Frame Size (subtype 4).
     pub fn addMaxFrameSize(b: *Builder, size: u16) BuildError!void {
         var be: [2]u8 = undefined;
         std.mem.writeInt(u16, &be, size, .big);
@@ -1216,6 +1256,49 @@ test "LLDP: network-address chassis id + IPv6 management address" {
         .max_frame_size => |s| try testing.expectEqual(@as(u16, 1522), s),
         else => return error.WrongOrgValue,
     }
+}
+
+test "LLDP Builder: typed power, location and inventory adders round-trip through the decoder" {
+    var buf: [256]u8 = undefined;
+    var b = Builder.init(&buf);
+    try b.addChassisIdMac(kat_mac);
+    try b.addPortIdIfName("e0");
+    try b.addTtl(60);
+    try b.addPowerViaMdi(.{ .mdi_support = 7, .pse_power_pair = 1, .power_class = 4 });
+    try b.addPowerViaMdi(.{ .mdi_support = 7, .pse_power_pair = 2, .power_class = 5, .dot3at = .{
+        .type_source_priority = 0x62,
+        .pd_requested_dw = 255,
+        .pse_allocated_dw = 300,
+    } });
+    try b.addMedLocation(3, "5551234");
+    try b.addMedExtPower(.{ .power_type = 1, .power_source = 1, .priority = 2, .power_dw = 65 });
+    try b.addMedInventory(.serial_number, "SN-42");
+    const du = try Lldpdu.parse(try b.finish(), .{});
+    var it = du.orgIterator();
+
+    const p1 = (try it.next()).?.decode().?.power_via_mdi;
+    try testing.expectEqual(@as(u8, 4), p1.power_class);
+    try testing.expect(p1.dot3at == null);
+    const p2 = (try it.next()).?.decode().?.power_via_mdi;
+    try testing.expectEqual(@as(u8, 2), p2.pse_power_pair);
+    try testing.expectEqual(@as(u16, 255), p2.dot3at.?.pd_requested_dw);
+    try testing.expectEqual(@as(u16, 300), p2.dot3at.?.pse_allocated_dw);
+    try testing.expectEqual(@as(u8, 0x62), p2.dot3at.?.type_source_priority);
+    const loc = (try it.next()).?.decode().?.med_location;
+    try testing.expectEqual(@as(u8, 3), loc.format);
+    try testing.expectEqualStrings("5551234", loc.data);
+    const ep = (try it.next()).?.decode().?.med_ext_power;
+    try testing.expectEqual(@as(u2, 1), ep.power_type);
+    try testing.expectEqual(@as(u2, 1), ep.power_source);
+    try testing.expectEqual(@as(u4, 2), ep.priority);
+    try testing.expectEqual(@as(u16, 65), ep.power_dw);
+    const inv = (try it.next()).?.decode().?.med_inventory;
+    try testing.expectEqual(MedInventoryField.serial_number, inv.field);
+    try testing.expectEqualStrings("SN-42", inv.text);
+
+    // An LCI too long for one TLV is refused, not truncated.
+    var big: [max_tlv_len]u8 = undefined;
+    try testing.expectError(BuildError.ValueTooLong, b.addMedLocation(3, &big));
 }
 
 test "LLDP: an oversized management-address OID is refused, not a scratch-buffer overrun" {

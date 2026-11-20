@@ -281,6 +281,26 @@ pub const VendorClassIterator = struct {
     }
 };
 
+/// One Vendor-specific Information option (17, RFC 8415 §21.17): the enterprise number and
+/// the encapsulated vendor options (same code/length framing as the message's own).
+pub const VendorOpts = struct { enterprise: u32, options: OptionIterator };
+
+pub const VendorOptsIterator = struct {
+    it: OptionIterator,
+
+    pub fn next(self: *VendorOptsIterator) ParseError!?VendorOpts {
+        while (try self.it.next()) |o| {
+            if (o.code != OptionCode.vendor_opts) continue;
+            if (o.data.len < 4) {
+                self.it.failed = true;
+                return error.BadOptionLength;
+            }
+            return .{ .enterprise = std.mem.readInt(u32, o.data[0..4], .big), .options = OptionIterator.init(o.data[4..]) };
+        }
+        return null;
+    }
+};
+
 pub const UserClassIterator = struct {
     it: OptionIterator,
 
@@ -647,6 +667,11 @@ pub const Message = struct {
     /// Every Vendor Class option (16, RFC 8415 §21.16): one per enterprise number may appear,
     /// each with any number of opaque entries.
     pub fn vendorClasses(m: *const Message) VendorClassIterator {
+        return .{ .it = m.options() };
+    }
+
+    /// Every Vendor-specific Information option (17, RFC 8415 §21.17; one per enterprise number).
+    pub fn vendorOpts(m: *const Message) VendorOptsIterator {
         return .{ .it = m.options() };
     }
 
@@ -1293,6 +1318,26 @@ test "dhcp6: option 39 / 16 / 15 / 19 / 20 / 67 hostile and partial cases (RFC 4
     try testing.expectEqual(@as(u32, 9), (try vit.next()).?.enterprise);
     try testing.expectError(error.BadOptionLength, vit.next());
     try testing.expect((try vit.next()) == null);
+    // Vendor-specific Information: two enterprises (the first with two encapsulated options), then a short one.
+    const vo = try Message.parse(hp("01000000" ++ "0011000f" ++ "00000009" ++ "000100020a0b" ++ "00020001ff" ++ "00110004" ++ "00000137" ++ "00110003" ++ "000001"));
+    var voit = vo.vendorOpts();
+    var v1 = (try voit.next()).?;
+    try testing.expectEqual(@as(u32, 9), v1.enterprise);
+    const e1 = (try v1.options.next()).?;
+    try testing.expectEqual(@as(u16, 1), e1.code);
+    try testing.expectEqualSlices(u8, &.{ 0x0a, 0x0b }, e1.data);
+    try testing.expectEqual(@as(u16, 2), (try v1.options.next()).?.code);
+    try testing.expect((try v1.options.next()) == null);
+    var v2 = (try voit.next()).?;
+    try testing.expectEqual(@as(u32, 311), v2.enterprise);
+    try testing.expect((try v2.options.next()) == null);
+    try testing.expectError(error.BadOptionLength, voit.next());
+    try testing.expect((try voit.next()) == null);
+    // A damaged encapsulated option is reported by the inner iterator, not hidden.
+    const vbad = try Message.parse(hp("01000000" ++ "00110009" ++ "00000009" ++ "0001000aff"));
+    var vbit = vbad.vendorOpts();
+    var vb = (try vbit.next()).?;
+    try testing.expectError(error.TruncatedOption, vb.options.next());
     // User Class: an empty option violates "one or more".
     const uc = try Message.parse(hp("01000000" ++ "000f0000"));
     var uit = uc.userClasses();
