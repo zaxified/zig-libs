@@ -371,6 +371,32 @@ pub fn Opaque(comptime C: type) type {
             return .{ .private_key = kp.sk, .public_key = kp.pk.toBytes() };
         }
 
+        /// §6.3.2.2 / §10.9 fake `RegistrationRecord` for unregistered users:
+        /// `client_public_key` = `DeriveDiffieHellmanKeyPair(key_seed)`'s public
+        /// key (a valid group element; 32 random bytes would not be one, see
+        /// the module doc comment), `masking_key` copied, all-zero envelope —
+        /// the shape of RFC 9807 Appendix C.2.1's record. The module draws no
+        /// randomness: pass `key_seed` and `masking_key` fresh from a CSPRNG,
+        /// once, and keep the record (one per server, or one per credential
+        /// identifier, is the server's policy). bytemare/opaque's
+        /// `GetFakeRecord` and opaque-zig's `createFakeRecord` are the same
+        /// helper with an internal RNG. The derived private key is wiped and
+        /// the stack burned before the call returns; `out` is written only on
+        /// success.
+        pub fn fakeRecord(key_seed: *const [Nseed]u8, masking_key: *const [Nh]u8, out: *RegistrationRecord) error{DeriveKeyPairFailed}!void {
+            return burn.run(burn.small_burn, error{DeriveKeyPairFailed}!void, fakeRecordBody, .{ key_seed, masking_key, out });
+        }
+
+        fn fakeRecordBody(key_seed: *const [Nseed]u8, masking_key: *const [Nh]u8, out: *RegistrationRecord) error{DeriveKeyPairFailed}!void {
+            var kp = try akeKeyPair(key_seed);
+            defer std.crypto.secureZero(u8, &kp.private_key);
+            out.* = .{
+                .client_public_key = kp.public_key,
+                .masking_key = masking_key.*,
+                .envelope = Envelope.fromBytes(@splat(0)),
+            };
+        }
+
         /// §5.2.2/§6.3.2.2's per-client OPRF key: `seed = Expand(oprf_seed,
         /// credential_identifier || "OprfKey", Nok)`, then RFC 9497
         /// `DeriveKeyPair(seed, "OPAQUE-DeriveKeyPair")` via `voprf`.
@@ -447,6 +473,37 @@ pub fn Opaque(comptime C: type) type {
                 var out: [Nh]u8 = undefined;
                 try self.stretchFn(self.ctx, in, &out);
                 return out;
+            }
+        };
+
+        /// RFC 9807 §7's recommended KSF, Argon2id with `S = zeroes(16)` and
+        /// `T = Nh`, as a `Ksf`: `adapter.ksf()`. Opt-in, like opaque-ke's
+        /// `argon2` feature (`impl Ksf for argon2::Argon2` over a zero salt);
+        /// nothing else in the module allocates or does I/O — the allocator
+        /// and `Io` std's `argon2.kdf` needs are the caller's, held here. Any
+        /// failure of the KDF (allocation, parameters) is `error.KsfFailed`.
+        /// Both sides must use the same parameters; changing them invalidates
+        /// existing registrations (§8).
+        pub const Argon2idKsf = struct {
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            params: std.crypto.pwhash.argon2.Params,
+
+            /// §7: `Argon2id(S = zeroes(16), p = 4, T = Nh, m = 2^21, t = 1,
+            /// v = 0x13, K = nil, X = nil, y = 2)` — 2 GiB per stretch.
+            pub const rfc9807_params: std.crypto.pwhash.argon2.Params = .{ .t = 1, .m = 1 << 21, .p = 4 };
+            /// §7's memory-constrained variant: `m = 2^16` (64 MiB), `t = 3`.
+            pub const rfc9807_low_memory_params: std.crypto.pwhash.argon2.Params = .{ .t = 3, .m = 1 << 16, .p = 4 };
+
+            pub fn ksf(self: *Argon2idKsf) Ksf {
+                return .{ .ctx = self, .stretchFn = stretch };
+            }
+
+            fn stretch(ctx: ?*anyopaque, in: [Nh]u8, out: *[Nh]u8) error{KsfFailed}!void {
+                const self: *Argon2idKsf = @ptrCast(@alignCast(ctx.?));
+                const salt: [16]u8 = @splat(0);
+                std.crypto.pwhash.argon2.kdf(self.allocator, out, &in, &salt, self.params, .argon2id, self.io) catch
+                    return error.KsfFailed;
             }
         };
 

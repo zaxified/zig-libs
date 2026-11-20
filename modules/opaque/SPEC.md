@@ -42,7 +42,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [cloudflare/circl](https://github.com/cloudflare/circl) | Go | BSD-3-Clause | 1.7k | v1.6.5 (2026-08-05) | Checked: the repository root listing has `oprf` but no OPAQUE package. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | Ristretto255, HKDF, HMAC, Argon2 and P-256/P-384 exist; no OPAQUE (checked `lib/std/crypto`). |
 
-**Where we are ahead:** byte-exact against the RFC's registration and login vectors *including* the fake-credential-response case; a pluggable, mandatory KSF with no default (the Identity KSF cannot be reached by omission — the READMEs read this run of the others do not say what their default is *(inferred: unverified)*); secret-scalar DH through `ct25519` for ristretto255 (std's ladder ends in a branch on the result); no allocation, no `Io`, no internal RNG. **Where we are behind:** two configurations only (ristretto255 and P-256, both 3DH) — not the curve25519 AKE suites (C.1.3/C.1.4); no built-in Argon2id (the KSF is the caller's, a stated design choice because std's Argon2 needs an allocator and `Io`); no fake-record helper (a documented recipe instead); no server-key-material or record-store helpers (→ Backlog items).
+**Where we are ahead:** byte-exact against the RFC's registration and login vectors *including* the fake-credential-response case; a pluggable, mandatory KSF with no default (the Identity KSF cannot be reached by omission — the READMEs read this run of the others do not say what their default is *(inferred: unverified)*); secret-scalar DH through `ct25519` for ristretto255 (std's ladder ends in a branch on the result); no allocation, no `Io`, no internal RNG outside the opt-in `Argon2idKsf`. **Where we are behind:** two configurations only (ristretto255 and P-256, both 3DH) — not the curve25519 AKE suites (C.1.3/C.1.4); no server-key-material or record-store helpers (→ Backlog items).
 
 
 ## What an aPAKE is (and why OPAQUE)
@@ -145,15 +145,21 @@ no legitimate default value doesn't earn a wrapper). This module stays
 `Allocator`/`Io`-free (API discipline below) — a real KSF like
 Argon2id needs both (`std.crypto.pwhash.argon2.kdf`'s signature takes
 an `Allocator` and a `std.Io`), so it lives on the CALLER's side of
-`ctx`, not inside this module — and precisely because it can't default
-to a real one without acquiring that dependency, it doesn't default to
-anything: a caller reaching for `Ksf.identity` outside a test has to
-write that name, not get it by omission (`.{}` does not compile — see
-`Ksf.identity`'s doc comment). See `kat_test.zig`'s `Argon2Ksf` for a worked
-example (used by two tests: a real Argon2id round-trip that still
-agrees on both sides and demonstrably changes
-`session_key`/`export_key`, and one proving `error.KsfFailed`
-propagates from a failing KSF rather than being swallowed).
+`ctx` — and it doesn't default to anything: a caller reaching for
+`Ksf.identity` outside a test has to write that name, not get it by
+omission (`.{}` does not compile — see `Ksf.identity`'s doc comment).
+
+`Argon2idKsf` is the opt-in adapter for §7's recommended Argon2id, shipped the
+way the reference ships it (opaque-ke's `argon2` cargo feature: `impl Ksf for
+argon2::Argon2` hashing into `T = Nh` bytes over a zero 16-byte salt). It holds the
+caller's `Allocator` and `Io` for std's `argon2.kdf` and maps any failure to
+`error.KsfFailed`; `rfc9807_params` (`m = 2^21`, `t = 1`, `p = 4`) and
+`rfc9807_low_memory_params` (`m = 2^16`, `t = 3`, `p = 4`) are §7's two Argon2id
+rows. Nothing picks them by default; a caller that does not reference the type
+compiles none of it. Tests: the adapter equals std's `argon2.kdf` over a zero salt,
+a failing allocator is `KsfFailed`, a real Argon2id round trip agrees on both sides
+and changes `session_key`/`export_key`, and `KsfFailed` propagates out of
+`finalizeRegistrationRequest`.
 
 ## Login: 3DH AKE (§6.4)
 
@@ -270,9 +276,17 @@ design); registers and the red zone below the stack pointer.
   production (blinds via `scalarFromWideBytes`).
 - **No allocation, no I/O**; all state is in caller-held value types
   (`ClientLoginState` borrows only the password slice). A real `Ksf`
-  the caller plugs in (e.g. Argon2id) may itself allocate/use `Io`
-  internally — that dependency lives entirely on the caller's side of
-  the `Ksf.ctx` pointer, this module never sees it.
+  (e.g. `Argon2idKsf`) may allocate/use `Io` internally — through the
+  allocator and `Io` the caller put behind the `Ksf.ctx` pointer; the
+  protocol code never sees them.
+- **Fake record (§6.3.2.2):** `fakeRecord(key_seed, masking_key, &out)` builds
+  the record a server answers unregistered users with —
+  `DeriveDiffieHellmanKeyPair(key_seed)`'s public key, the masking key, an
+  all-zero envelope (the shape of Appendix C.2.1's record), from CSPRNG
+  seeds the caller supplies once. bytemare/opaque (`GetFakeRecord`) and
+  opaque-zig (`createFakeRecord`) ship the same helper with an internal RNG.
+  32 random bytes as the public key would be refused by `generateKE2` about
+  94 % of the time (non-canonical ristretto255); a test pins both.
 - Public-key/OPRF-element inputs are validated on deserialization
   (canonical ristretto255 + identity rejection via `voprf.Element`,
 - Public-key/OPRF-element inputs are validated on deserialization
@@ -290,9 +304,9 @@ design); registers and the red zone below the stack pointer.
 
 - **Other ciphersuites than the two built:** the curve25519 3DH configuration
   (C.1.3/C.1.4, with C.2.2) is the open Backlog item; nothing else of RFC 9807 §7 is planned.
-- **A bundled non-Identity KSF** (Argon2id/scrypt): the concrete algorithm and
-  parameters are the consumer's; this module never picks one and stays `Allocator`/`Io`-free.
-  The seam is the public `Ksf` callback (see above).
+- **A bundled scrypt KSF** and any default KSF: the concrete algorithm and
+  parameters are the consumer's (§7's scrypt row has no adapter; opaque-ke ships
+  only Argon2). The seam is the public `Ksf` callback (see above).
 - **HMQV / SIGMA-I instantiations** (Appendix B): sketches only in the
   RFC, no vectors, no consumer.
 - **`randomized_password` backup login** (§10.13): storage-side
@@ -344,18 +358,6 @@ Offline. Run `scripts/modtest opaque`.
   drive the ristretto255 configuration only; the P-256 one runs
   through the same code with `voprf`'s P-256 suite (whose own ctgrind rows are
   pinned) but has no opaque-level row yet.
-- **Fake-record helper:** bytemare/opaque
-  (`GetFakeRecord`) and opaque-zig (`createFakeRecord`) ship one (opaque-ke not checked); here it is a
-  documented recipe (`deriveAkeKeyPair` over a random seed, keep `.public_key`, zero
-  envelope) — and the audit found the obvious shortcut (32 random bytes) is wrong
-  93.754% of the time (root.zig header). A helper removes a proven foot-gun. Small
-  (a dozen lines and a test against C.2.1); pure Zig. Not the same as the fake-record
-  *policy*, which stays the server's job.
-- **Optional bundled Argon2id KSF adapter:** opaque-zig defaults
-  to Argon2id and opaque-ke has an `argon2` feature; here the caller writes the
-  callback (`kat_test.zig`'s `Argon2Ksf` is the worked example). The module stays
-  allocator-free by design, so this belongs in an example or a small sibling, not
-  in `root.zig`. Small; pure Zig.
 
 
 ## Anchoring

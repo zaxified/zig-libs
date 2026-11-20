@@ -8,7 +8,8 @@ each login yields a mutually authenticated `session_key` (both sides)
 plus a client-only `export_key`. OPRF layer reused from the sibling
 `voprf` module (RFC 9497 modeOPRF) and secret-scalar DH through its group
 layer (for ristretto255 the sibling `ct25519`); the rest is pure std
-(HKDF, HMAC, SHA-2, Ristretto255). No allocation, no
+(HKDF, HMAC, SHA-2, Ristretto255). No allocation (except inside the opt-in
+`Argon2idKsf`, through the caller's allocator), no
 internal RNG (all nonces/blinds/seeds are caller-supplied CSPRNG
 output; blinds via `scalarFromWideBytes`).
 
@@ -44,6 +45,12 @@ try opaque_pake.serverFinish(&server.state, finished.ke3, &session_key);
 // finished.session_key == session_key; finished.export_key == registered.export_key
 ```
 
+`ksf` is mandatory: `opaque_pake.Argon2idKsf{ .allocator, .io, .params =
+Argon2idKsf.rfc9807_params }` and `.ksf()` gives RFC 9807 §7's Argon2id (the only
+part of the module that allocates, through the caller's allocator). For an
+unregistered user, `opaque_pake.fakeRecord(&random_seed, &random_masking_key,
+&record)` builds the §6.3.2.2 fake record once; `generateKE2` answers with it.
+
 Every secret-handling entry point burns the stack it used before it returns
 (`SPEC.md` § Secret residue on the dead stack).
 
@@ -56,8 +63,8 @@ the 3DH schedule.
 
 ## Not provided
 
-The curve25519 3DH configuration (RFC 9807 C.1.3/C.1.4), a bundled Argon2id/scrypt KSF (the caller supplies the
-mandatory `Ksf`), a fake-record helper, HMQV/SIGMA-I and the `randomized_password` backup login: see `SPEC.md`
+The curve25519 3DH configuration (RFC 9807 C.1.3/C.1.4), a bundled scrypt KSF, HMQV/SIGMA-I and the
+`randomized_password` backup login: see `SPEC.md`
 *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from RFC 9807, a public IRTF specification, with its own

@@ -359,26 +359,29 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
 // `Allocator`/`Io` dependency anywhere else), but every entry point that
 // calls `randomizedPassword` now accepts any `Ksf`.
 //
-// Argon2id needs an `Allocator` and a `std.Io` -- this module's `Ksf`
-// carries neither; the CALLER (here, the test) supplies both via `ctx`.
-const Argon2Ksf = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    salt: [16]u8,
-    params: std.crypto.pwhash.argon2.Params,
-    fail: bool = false, // fault injection, see the KsfFailed test below
-
-    fn stretchFn(ctx: ?*anyopaque, in: [64]u8, out: *[64]u8) error{KsfFailed}!void {
-        const self: *Argon2Ksf = @ptrCast(@alignCast(ctx.?));
-        if (self.fail) return error.KsfFailed;
-        std.crypto.pwhash.argon2.kdf(self.allocator, out, &in, &self.salt, self.params, .argon2id, self.io) catch
-            return error.KsfFailed;
-    }
-
-    fn ksf(self: *Argon2Ksf) opaque_pake.Ksf {
-        return .{ .ctx = self, .stretchFn = stretchFn };
-    }
-};
+// Argon2id needs an `Allocator` and a `std.Io`; `Argon2idKsf` holds the
+// caller's and is the module's opt-in adapter.
+test "Argon2idKsf: Argon2id over a zero 16-byte salt, Nh output; a KDF failure is KsfFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const params = std.crypto.pwhash.argon2.Params.owasp_2id;
+    var adapter: opaque_pake.Argon2idKsf = .{ .allocator = testing.allocator, .io = threaded.io(), .params = params };
+    const in: [64]u8 = @splat(0x42);
+    var got: [64]u8 = undefined;
+    const k = adapter.ksf();
+    try k.stretchFn(k.ctx, in, &got);
+    var want: [64]u8 = undefined;
+    try std.crypto.pwhash.argon2.kdf(testing.allocator, &want, &in, &@as([16]u8, @splat(0)), params, .argon2id, threaded.io());
+    try testing.expectEqualSlices(u8, &want, &got);
+    var failing: opaque_pake.Argon2idKsf = .{ .allocator = testing.failing_allocator, .io = threaded.io(), .params = params };
+    const kf = failing.ksf();
+    try testing.expectError(error.KsfFailed, kf.stretchFn(kf.ctx, in, &got));
+    // §7's parameter sets, as the RFC prints them.
+    try testing.expectEqual(@as(u32, 1 << 21), opaque_pake.Argon2idKsf.rfc9807_params.m);
+    try testing.expectEqual(@as(u32, 1), opaque_pake.Argon2idKsf.rfc9807_params.t);
+    try testing.expectEqual(@as(u32, 1 << 16), opaque_pake.Argon2idKsf.rfc9807_low_memory_params.m);
+    try testing.expectEqual(@as(u32, 3), opaque_pake.Argon2idKsf.rfc9807_low_memory_params.t);
+}
 
 test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSFs on both sides still agree" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -389,10 +392,9 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
     // OWASP's t/m/p (cheaper than the RFC's 2^21 KiB example) so this test
     // runs in a reasonable time while still exercising a real KDF, not a
     // toy stand-in.
-    var argon2: Argon2Ksf = .{
+    var argon2: opaque_pake.Argon2idKsf = .{
         .allocator = testing.allocator,
         .io = io,
-        .salt = @as([16]u8, @splat(0)),
         .params = std.crypto.pwhash.argon2.Params.owasp_2id,
     };
 
@@ -482,12 +484,11 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
 test "M6: a failing KSF propagates error.KsfFailed, not silently swallowed or panicking" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
-    var argon2: Argon2Ksf = .{
-        .allocator = testing.allocator,
+    // The adapter over an allocator that always fails: argon2 cannot run.
+    var argon2: opaque_pake.Argon2idKsf = .{
+        .allocator = testing.failing_allocator,
         .io = threaded.io(),
-        .salt = @as([16]u8, @splat(0)),
         .params = std.crypto.pwhash.argon2.Params.owasp_2id,
-        .fail = true,
     };
 
     var wide: [64]u8 = undefined;
@@ -695,6 +696,34 @@ test "RFC 9807 C.2.1 fake credential response reproduces KE2 byte-exact" {
         server_keyshare_seed,
     );
     try testing.expectEqualSlices(u8, &ke2, &res.ke2.toBytes());
+}
+
+test "fakeRecord: the C.2.1 record shape from a seed, and every such record yields a KE2" {
+    const masking_key = comptime hx("39ebd51f0e39a07a1c2d2431995b0399bca9996c5d10014d6ebab4453dc10ce5cef38ed3df6e56bfff40c2d8dd4671c2b4cf63c3d54860f31fe40220d690bb71");
+    const oprf_seed = comptime hx("743fc168d1f826ad43738933e5adb23da6fb95f95a1b069f0daa0522d0a78b617f701fc6aa46d3e7981e70de7765dfcd6b1e13e3369a582eb8dc456b10aa53b0");
+    const server_private_key = comptime hx("c788585ae8b5ba2942b693b849be0c0426384e41977c18d2e81fbe30fd7c9f06");
+    const server_public_key = comptime hx("825f832667480f08b0c9069da5083ac4d0e9ee31b49c4e0310031fea04d52966");
+    const ke1 = comptime hx("b0a26dcaca2230b8f5e4b1bcab9c84b586140221bb8b2848486874b0be44890542d4e61ed3f8d64cdd3b9d153343eca15b9b0d5e388232793c6376bd2d9cfd0ab641d7f20a245a09f1d4dbb6e301661af7f352beb0791d055e48d3645232f77f");
+    var prng = std.Random.DefaultPrng.init(0xFA4E);
+    var raw_rejected: usize = 0;
+    for (0..64) |_| {
+        var seed: [opaque_pake.Nseed]u8 = undefined;
+        prng.random().bytes(&seed);
+        var record: opaque_pake.RegistrationRecord = undefined;
+        try opaque_pake.fakeRecord(&seed, &masking_key, &record);
+        // Shape: DeriveDiffieHellmanKeyPair(seed).public_key, the masking key, a zero envelope.
+        const kp = try shim.deriveAkeKeyPair(seed);
+        try testing.expectEqualSlices(u8, &kp.public_key, &record.client_public_key);
+        try testing.expectEqualSlices(u8, &masking_key, &record.masking_key);
+        for (record.envelope.toBytes()) |b| try testing.expectEqual(@as(u8, 0), b);
+        // Usable: generateKE2 accepts it (the C.2.1 server inputs).
+        _ = try shim.generateKE2(server_private_key, server_public_key, record, "1234", oprf_seed, opaque_pake.KE1.fromBytes(ke1), .{ .client = "alice", .server = "bob" }, "OPAQUE-POC", @splat(1), @splat(2), @splat(3));
+        // The foot-gun it replaces: the seed's bytes taken as the public key.
+        var raw = record;
+        raw.client_public_key = seed;
+        if (shim.generateKE2(server_private_key, server_public_key, raw, "1234", oprf_seed, opaque_pake.KE1.fromBytes(ke1), .{ .client = "alice", .server = "bob" }, "OPAQUE-POC", @splat(1), @splat(2), @splat(3))) |_| {} else |_| raw_rejected += 1;
+    }
+    try testing.expect(raw_rejected > 32); // ~94 % of random 32-byte strings are not canonical points
 }
 
 // ── (8) RegistrationRecord.validate (A1 audit L1) ────────────────────

@@ -116,8 +116,7 @@
 //! - The "Fake" credential-response flow for unregistered users
 //!   (§6.3.2.2) is a server-side POLICY built on this API: keep one
 //!   fake `RegistrationRecord` (a randomly generated **public key** +
-//!   `masking_key`, all-zero envelope) and call `generateKE2` with it;
-//!   nothing extra is needed from this module. ⚠ "Randomly generated
+//!   `masking_key`, all-zero envelope) and call `generateKE2` with it. ⚠ "Randomly generated
 //!   public key" is NOT 32 uniformly random bytes reinterpreted as
 //!   `client_public_key` (A1 audit M1: 93.754% of those are
 //!   rejected by `generateKE2`'s peer-element check as
@@ -125,10 +124,11 @@
 //!   canonically-encoded points — a server that builds its one fake
 //!   record that way has nothing valid to send an attacker enumerating
 //!   users, which defeats the whole point of §6.3.2.2). Build it the
-//!   same way any other AKE public key here is built: a random 32-byte
-//!   seed through `deriveAkeKeyPair`, keeping only `.public_key`.
-//!   KAT'd against RFC 9807 Appendix C.2.1 (see the "fake credential
-//!   response" test below).
+//!   same way any other AKE public key here is built — `fakeRecord(seed,
+//!   masking_key, &out)` does exactly that (a random 32-byte seed through
+//!   `DeriveDiffieHellmanKeyPair`, keeping only the public key, all-zero
+//!   envelope). KAT'd against RFC 9807 Appendix C.2.1 (see the "fake
+//!   credential response" tests in `kat_test.zig`).
 //!
 //! Wire sizes (§2/§6.1, ristretto255-SHA-512): Nn = Nseed = 32,
 //! Noe = Nok = Npk = Nsk = 32, Nh = Nm = Nx = 64; KE1 = 96, KE2 = 320,
@@ -156,7 +156,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no allocation, no RNG
     .concurrency = .reentrant, // no globals; all state is caller-held values
-    .model_after = "RFC 9807 (\"The OPAQUE Augmented Password-Authenticated Key Exchange (aPAKE) Protocol\"), ristretto255-SHA-512 and P256-SHA256 configurations, 3DH AKE, internal-keying Envelope (§4.1), KSF = pluggable and mandatory, no default (Identity only for the RFC vectors, see Ksf); OPRF layer = the sibling voprf module (RFC 9497 modeOPRF); std supplies HKDF-SHA-512 / HMAC-SHA-512 / SHA-512 / Ristretto255",
+    .model_after = "RFC 9807 (\"The OPAQUE Augmented Password-Authenticated Key Exchange (aPAKE) Protocol\"), ristretto255-SHA-512 and P256-SHA256 configurations, 3DH AKE, internal-keying Envelope (§4.1), KSF = pluggable and mandatory, no default (Identity only for the RFC vectors; Ksf; opt-in Argon2idKsf, RFC 9807 §7); OPRF layer = the sibling voprf module (RFC 9497 modeOPRF); std supplies HKDF-SHA-512 / HMAC-SHA-512 / SHA-512 / Ristretto255",
     .deps = .{ "voprf", "ct25519" },
 };
 
@@ -217,6 +217,8 @@ const expandMulti = Default.expandMulti;
 const i2osp2 = Default.i2osp2;
 const checkIdentities = Default.checkIdentities;
 pub const deriveAkeKeyPair = Default.deriveAkeKeyPair;
+pub const fakeRecord = Default.fakeRecord;
+pub const Argon2idKsf = Default.Argon2idKsf;
 const deriveAkeKeyPairBody = Default.deriveAkeKeyPairBody;
 const akeKeyPair = Default.akeKeyPair;
 const deriveOprfKey = Default.deriveOprfKey;
