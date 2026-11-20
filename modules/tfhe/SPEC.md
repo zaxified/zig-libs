@@ -106,12 +106,12 @@ integer below `2^{preparedBoundLog2}` (`(k+1)·ℓ·N·(B/2)·2^32`, `2^53` for
 determines it and the result mod `2^32` is exact. A differential test holds the
 prepared path to the reference `externalProduct`/`bootstrap` bit for bit.
 
-Measured (ReleaseFast, this host, `bench.zig`), `tfhers_default`: bootstrap-key
-generation 2.1 s, key-switch key 0.1 s, preparation 0.45 s; AND 247 ms, MUX
-491 ms. The key generation was 15 s + 5 s before its samplers read entropy a
-polynomial at a time: through `entropy.SecureSource` every `fillFn` call is a
-`getrandom(2)`. tfhe-rs's SIMD f64 FFT is about 20× faster per gate; closing
-that is backlog, not a correctness question.
+Speed: `src/bench.zig` (off unless `TFHE_BENCH` is set; ReleaseFast) measures the schoolbook against the exact-NTT
+ring multiply per degree, the toy-set gate bootstrap and the boolean gates at `tfhers_default`; the card's
+Performance line is the figure of record (README *Speed* gives the order of magnitude, about a quarter second per
+gate, roughly 20x behind tfhe-rs's SIMD f64 FFT; closing that is backlog, not a correctness question). The
+samplers read entropy a polynomial at a time (one `fillFn` call per polynomial, the same bytes as the per-sample
+form), because through `entropy.SecureSource` every `fillFn` call is a `getrandom(2)`.
 
 ## Error sampling
 
@@ -125,24 +125,6 @@ absolute below), `cos` within `10^-14` absolute; truncated at `8.57σ`
 (`u₁ ≥ 2^-53`).
 Every sampler consumes a fixed number of bytes; a sampler and its bulk form
 draw the same bytes in the same order (tested).
-
-## Verification
-
-1. **tfhe-rs interop** (`interop_test.zig`, `tools/tfhers`) — see Anchoring.
-   This is the external, byte-exact anchor the core used to lack.
-2. **Cleartext blind-rotation oracle** (`clearBootstrap`): a NOISELESS
-   re-implementation of what blind rotation must compute, pinning LUT
-   construction + modulus switch + rotation indexing independently of the core.
-3. **Differential tests**: prepared vs reference external product and
-   bootstrap (bit for bit, arbitrary GLWE inputs); bulk vs per-sample samplers.
-4. **Homomorphic properties**: every gate's truth table on encrypted and
-   trivial inputs, a 4-bit ripple-carry adder 40 gates deep, an unlimited-depth
-   bootstrap chain, a corrupted-bootstrap-key control, the noise budget.
-5. **Deliberately broken positive controls**: sign-dropped sample extraction,
-   dropped-level decomposition, wrong-sign rotation exponent — each gives the
-   wrong answer, so the checks have teeth.
-
-**Audit 2026-11-17 (whole-module mutation).** 441 mutants over the runtime code of `torus`, `poly`, `gadget`, `noise`, `ntt`, `params`, `boolean`, `codec` and `tfhe`: every arithmetic and index in the ring, the gadget decomposition (rounding, wrap, carry rule, digit order, tie rule), the NTT butterflies and the 128-bit reduction (carry/borrow fixes, canonical reduction, signed recovery at `p/2`), the Box–Muller sampler (fold, series terms, sign, scale), every `Params.validate` condition at its boundary, the gate constants and their linear combinations, every codec header field and each payload section, the key-generation row order, sample extraction, key switching, the external product, CMux, blind rotation and the bootstrap (both the reference and the prepared forms), the secret wipes and the error paths of the allocating constructors. Round 1 (ReleaseSafe, one runtime switch per mutant): 388 killed, 53 survived. The survivors were test gaps: 11 tests were added (`mulMonomial`'s exponent reduction and `eql` on every coefficient; the decomposition at the top of the range for every digit width; `addMod` at `a + b == p`; the logarithm within 2 ulp at the widest series argument and the cosine within 1.5e-15 at the quarter points; every `validate` boundary (ring degree 1, zero and 33-bit gadgets, uniform 2^30, Gaussian 0 and 1/4, the prepared bound at 60 and 61, the rounding of the bound); `drawBytes`; header byte 7; `ClientKey.deinit`; `ServerKey.generate`/`fromKeys` under a failing allocator; an all-zero random stream that pins the error sign, the mask draw and the 2-bit message space of `lweEncrypt` and the sign of `glweEncrypt`'s error; and `ServerKey`'s gates compared **byte for byte** with tfhe-rs's, which the vectors already carried but the old test only decrypted — it killed the gate-constant mutants, the `+2`/`-2` XNOR scalar included). Round 2 killed 36 of the 53. 17 remain: EQUIVALENT (12) the `decompose` mask after rounding (it changes only `state = 2^L`, whose low L bits are zero and which no digit reads), `ln` folding at `m == sqrt2`, the `z^21` term of `ln` (0.17 ulp at its largest), the cosine fold at `a == 1/4` and its widened band (0.2), the `x^22` term of the cosine (<= 2e-17, the module's stated truncation bound), `neg_b = 2N` against 0 and an unreduced `a_tilde` in both blind rotations (`mulMonomial` reduces its exponent), the sampler batch size (cost-only: same byte stream), and `si & 1` in `clearBootstrap` (key words are bits by construction); UNOBSERVABLE (5) the wipes of stack-local secrets or public draws (`defer secureZero` of the draw, error, scaled-message and big-key-copy arrays, and the `errdefer ck.deinit()` of `readClientKey`): they need a ReleaseFast stack probe, which this module has not got (the heap wipes are observable and killed). Not mutated, because the value is a comptime constant or only a comptime-evaluated table: the ntt twiddle tables and `powMod`, `Params`' defaults and the named parameter sets (pinned by the interop vectors), the gate-flag constants, `testOnly`, and `littleToNative` (identity on the supported little-endian targets). Counts on the card are whole-module.
 
 ## Noise / failure-probability ledger
 
@@ -187,9 +169,48 @@ ledger is in `params.zig` (`erfc ≈ 48`, correctness only, no security).
   check the parameter fingerprint and that secret-key words are bits; they do
   not authenticate.
 
+## What is deliberately not done
+
+GPU/HPU backends, ZK proofs of encryption and C/WASM bindings: CONVENTIONS.md §2 (pure Zig, no C).
+
+## Verification
+
+- **Run:** `scripts/modtest tfhe` (the module is `heavy`); `TFHE_BENCH=1` additionally runs the benchmarks in a
+  ReleaseFast build.
+- **tfhe-rs interop** (`src/interop_test.zig`, `tools/tfhers`) — the external, byte-exact anchor; see Anchoring.
+- **Cleartext blind-rotation oracle** (`clearBootstrap`, `src/harness_test.zig`): a NOISELESS re-implementation of
+  what blind rotation must compute, pinning LUT construction + modulus switch + rotation indexing independently of the
+  core.
+- **Differential tests**: prepared vs reference external product and bootstrap (bit for bit, arbitrary GLWE inputs);
+  bulk vs per-sample samplers.
+- **Homomorphic properties**: every gate's truth table on encrypted and trivial inputs, a 4-bit ripple-carry adder
+  40 gates deep (`src/boolean.zig`), an unlimited-depth bootstrap chain, a corrupted-bootstrap-key control, the
+  noise budget.
+- **Deliberately broken positive controls**: sign-dropped sample extraction, dropped-level decomposition,
+  wrong-sign rotation exponent — each gives the wrong answer, so the checks have teeth.
+- **Boundary tests** (named `mutation: …` or in the codec/`params`/`ntt`/`noise` files): `Params.validate` at every
+  boundary, the decomposition at the top of the range, `ln`/`cos` accuracy at the series ends, an all-zero random
+  stream pinning the error sign and mask draw, `ServerKey`'s gates byte for byte against tfhe-rs's, secret wipes
+  and allocation-failure paths.
+- **Fuzz:** driver prefix `TFHE_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`): the codec readers on damaged
+  encodings, all six kinds — whatever is accepted re-encodes to the bytes read, an intact encoding is accepted; a
+  reach test requires every kind to be both accepted and refused.
+- **ctgrind:** `src/ctgrind_harness.zig`; rows `keygen`, `encrypt`, `decrypt`, `bootstrap`, `noise` in
+  `scripts/checks/ctgrind-expected.tsv`, all pinned at 0 in-file contexts.
+- **Not mutated:** the ntt twiddle tables and `powMod`, `Params`' defaults and named sets (pinned by the interop
+  vectors), the gate-flag constants, `testOnly`, `littleToNative`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
+
+## Open
+
+- **No ReleaseFast stack probe.** The wipes of stack-local secrets (the draw, error, scaled-message and big-key-copy
+  arrays, and `readClientKey`'s `errdefer ck.deinit()`) are not observable by a test; a dead-stack probe would
+  decide whether they hold. The heap wipes are tested.
+
 ## Backlog / deferred
 
-Ranked by the 2026-10-05 re-survey. **Missing and it matters** (against the `boolean` yardstick):
+Against the tfhe-rs `boolean` yardstick, missing and it matters:
 
 1. **Speed**: ≈ 0.25 s per gate, ~20× behind tfhe-rs and behind zig-tfhe's claimed ≈ 40 ms. Candidates: a vectorised NTT, a 32-bit-friendly NTT prime pair, keeping the accumulator in the transform domain across CMux steps, and multi-threaded evaluation of independent gates (through `std.Io`). Medium–large. The gap a user notices first.
 2. **Public-key encryption** (tfhe-rs `boolean::PublicKey`, also in zig-tfhe): lets a third party encrypt inputs without the client key — an LWE public key of encryptions of zero, plus the security bookkeeping for its size. Small–medium.
@@ -197,14 +218,10 @@ Ranked by the 2026-10-05 re-survey. **Missing and it matters** (against the `boo
 4. **Seeded (compressed) keys**: tfhe-rs ships keys whose masks are a CSPRNG seed, ~`(k+1)×` smaller (this module's `tfhers_default` server key is ~78 MB). Needs tfhe-rs's CSPRNG reproduced. Medium.
 5. **`EncryptionKeyChoice::Big`** (ciphertexts under the big key, key switch before PBS: tfhe-rs's `DEFAULT_PARAMETERS_KS_PBS`). Small.
 
-**Scope extension, not a gap in this module's main use case:**
+Scope extension, not a gap in this module's main use case:
 
 - **Integer arithmetic** on top of programmable bootstrapping (tfhe-rs `shortint`/`integer`: multi-bit messages with carry space, radix/CRT decomposition, carry propagation, comparison) and multi-value / larger-precision LUTs — what most tfhe-rs users call. Large; would be judged against tfhe-rs's `integer` API, against which this module is currently below mvp.
 - **A parameter-selection helper** driven by a lattice estimate, for sets tfhe-rs does not ship. Medium.
-
-**Deliberately not doing here:** GPU/HPU backends, ZK proofs of encryption, C/WASM bindings (CONVENTIONS.md §2: pure Zig, no C).
-
-**Done since the 2026-09-30 survey (2026-10-02):** tfhe-rs's real boolean parameter sets with a stated security level (was `toy` only), the gate layer (`boolean.zig`), byte encodings (`codec.zig`), and tfhe-rs interop in both directions; they landed after the 2026-09-30 verdict and are what this re-survey re-judged.
 
 ## Anchoring
 
@@ -222,5 +239,3 @@ Ranked by the 2026-10-05 re-survey. **Missing and it matters** (against the `boo
 | tfhe-rs → here | small `k = 2` set: secret keys, standard bootstrap and key-switch keys, 32 ciphertexts, their PBS and key-switch outputs, 7 gates × 16 outputs | ciphertexts decrypt; `keySwitch` **byte-identical**; this module's bootstrap (prepared and reference) with tfhe-rs's key **byte-identical** to tfhe-rs's PBS; tfhe-rs's gate outputs decrypt correctly and this module's gates on tfhe-rs's keys compute the same function; `codec.zig` payloads = tfhe-rs's containers word for word |
 | tfhe-rs → here | `DEFAULT_PARAMETERS`: secret keys, 8 ciphertexts, 7 gates × 2 outputs from tfhe-rs's own server key | all decrypt correctly here; this module's server key for tfhe-rs's secret keys evaluates every gate on tfhe-rs's ciphertexts correctly |
 | here → tfhe-rs | small set and `DEFAULT_PARAMETERS`: this module's secret keys, bootstrap and key-switch keys, ciphertexts and gate outputs (`tools/tfhers/emit_zig.zig`) | tfhe-rs decrypts every ciphertext and gate output; tfhe-rs's `ServerKey`, built from this module's bootstrap key (converted to its Fourier domain) and key-switch key, evaluates 112 + 28 gates correctly (the tool panics otherwise; first run, 2026-10-02) |
-
-**How it got there.** Before 2026-10-02 the module had only `toy` parameters and no external anchor (oracle SELF). The interop work recovered tfhe-rs's conventions from its outputs (no implementation read), changed this module's layouts and decomposition to match, and found no disagreement in the core itself: the first run of the bootstrap comparison was byte-identical.
