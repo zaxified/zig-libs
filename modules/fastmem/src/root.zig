@@ -10,7 +10,7 @@
 //! and every `std.crypto.secureZero`, ends in compiler_rt's `memset`, which in
 //! Zig 0.16 stores **one byte per iteration**: measured 3.2 GB/s on an
 //! i7-7920HQ, against 65–96 GB/s for compiler_rt's own `memcpy` on the same
-//! core (the web-server consumer audit, 2026-09-28). A 4 KiB clear costs ~1.25 µs where it should
+//! core (the web-server consumer audit). A 4 KiB clear costs ~1.25 µs where it should
 //! cost ~50 ns, and the callers are not only ours: std's deflate clears a
 //! 64 KiB hash table per gzip response, TLS libraries scrub record buffers
 //! per handshake.
@@ -87,7 +87,7 @@ pub fn set(dest: [*]u8, c: u8, len: usize) void {
     const first = std.mem.alignForward(usize, start + 1, 32);
     const end = start + len - 32; // the tail store covers from here
     // Four stores per iteration: 37 against 44 ns for a 4 KiB clear with one
-    // (disposable probe, 2026-10-26), level from 16 KiB up.
+    // (disposable probe), level from 16 KiB up.
     var p = first;
     while (p + 128 <= end) : (p += 128) {
         storeAligned(@ptrFromInt(p), v);
@@ -103,7 +103,7 @@ pub fn set(dest: [*]u8, c: u8, len: usize) void {
 /// every build mode. On x86-64 the trap is an inline-asm `ud2`, not `@trap()`
 /// or `orelse @panic`: with either of those LLVM gave `memset` a stack frame
 /// (push rbp/rbx) on every call, the asm form keeps it frameless with one
-/// test-and-branch (objdump of ReleaseFast, 2026-10-30). Other targets use
+/// test-and-branch (objdump of ReleaseFast). Other targets use
 /// `@trap()`.
 pub fn memset(dest: ?[*]u8, c: c_int, len: usize) callconv(.c) ?[*]u8 {
     if (len == 0) return dest;
@@ -161,7 +161,7 @@ pub fn copy(noalias dest: [*]u8, noalias src: [*]const u8, len: usize) void {
 /// The C `memcpy`, over `copy`. A null `dest` or `src` is allowed only with
 /// `len == 0`; with a non-zero `len` it traps (SIGILL) in every build mode
 /// (undefined in C). `@trap`, not `@panic`: a call would give `memcpy` a stack
-/// frame on every call; the trap is a bare `ud2` (objdump, 2026-10-30). Overlapping ranges are undefined too, as in C: unchecked, but no
+/// frame on every call; the trap is a bare `ud2` (objdump). Overlapping ranges are undefined too, as in C: unchecked, but no
 /// byte outside `dest[0..len]` is ever written.
 pub fn memcpy(noalias dest: ?[*]u8, noalias src: ?[*]const u8, len: usize) callconv(.c) ?[*]u8 {
     if (len != 0) copy(
@@ -187,9 +187,9 @@ const V = @Vector(32, u8);
 
 /// From this length up the middle is stored by `rep stosq` instead of the
 /// vector loop. Measured on an i7-7920HQ (32 KiB L1d, 256 KiB L2): from
-/// 256 KiB up the string store is 0.75-0.84x the loop (2026-10-11), where the
+/// 256 KiB up the string store is 0.75-0.84x the loop, where the
 /// loop's stores each pay a read-for-ownership the fast-string protocol skips;
-/// against the four-store loop (2026-10-26) it is 0.77-0.82x at 32 KiB,
+/// against the four-store loop it is 0.77-0.82x at 32 KiB,
 /// level at 64 KiB and 0.88-0.97x from 96 to 160 KiB -- once the buffer is
 /// out of L1. At 16 KiB the two are level.
 const stos_min = 32 * 1024;
@@ -205,7 +205,7 @@ const use_stos = builtin.cpu.arch == .x86_64 and @sizeOf(usize) == 8 and builtin
 /// most 7 bytes past the tail vector's start, which it covers anyway, so
 /// nothing outside `[dest, dest + len)` is written. `noinline` and reached by
 /// a tail call, so `set` itself stays a leaf with no frame: measured
-/// 2026-10-11, a call inside it cost the 256 B and 4 KiB rows 15-40 %.
+/// a call inside it cost the 256 B and 4 KiB rows 15-40 %.
 noinline fn setLarge(dest: [*]u8, c: u8, len: usize) void {
     const v: V = @splat(c);
     store(V, dest, v);
@@ -238,7 +238,7 @@ inline fn load(comptime T: type, p: [*]const u8) T {
 }
 
 /// From this length up `copy` moves the middle by `rep movsb` instead of the
-/// vector loop. Measured 2026-10-26 on an i7-7920HQ (ERMS, no FSRM;
+/// vector loop. Measured on an i7-7920HQ (ERMS, no FSRM;
 /// disposable probe, destination offsets 0/5/37, source 3× that): at 8 KiB the
 /// loop is 0.60-0.88× the string move, at 16 KiB the string move is 0.79-0.88×
 /// the loop and stays level with or ahead of it up to 2 MiB (0.75-0.95× from
@@ -572,7 +572,7 @@ test "the export took effect: the linked `memset` is this module's" {
     // fires in any build that merely imports this file under `zig test` --
     // `check-pubfn-reach` does, and analysing `exportSymbols`' body there is a
     // second `@export` of the same name: "exported symbol collision"
-    // (CI run 36443590540, 2026-09-28).
+    // (CI run 36443590540).
     comptime exportSymbols();
     const linked = @extern(*const fn (?[*]u8, c_int, usize) callconv(.c) ?[*]u8, .{ .name = "memset" });
     try testing.expectEqual(@intFromPtr(&memset), @intFromPtr(linked));
