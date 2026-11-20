@@ -22,7 +22,7 @@ const cookies = @import("cookies");
 
 pub fn main() !void {
     // ── parse: multiple cookies, one header, awkward real-world shapes ─────
-    const header = "session=abc123; theme=dark; empty=; jwt=a=b=c; note=\"hi; there\"";
+    const header = "session=abc123; theme=dark; empty=; jwt=a=b=c; note=\"hi there\"";
     var it = cookies.parse(header);
 
     const session = it.next() orelse return error.MissingCookie;
@@ -40,13 +40,18 @@ pub fn main() !void {
     // after it is the value verbatim.
     const jwt = it.next() orelse return error.MissingCookie;
     if (!std.mem.eql(u8, jwt.name, "jwt") or !std.mem.eql(u8, jwt.value, "a=b=c")) return error.WrongPair;
-    // A quoted value containing the segment separator ";" must not split the
-    // segment early — the exact bug the python http.cookies oracle caught
-    // (see SPEC.md "External anchor").
+    // A quoted value: one matching pair of surrounding DQUOTEs is stripped.
     const note = it.next() orelse return error.MissingCookie;
-    if (!std.mem.eql(u8, note.name, "note") or !std.mem.eql(u8, note.value, "hi; there")) return error.WrongPair;
+    if (!std.mem.eql(u8, note.name, "note") or !std.mem.eql(u8, note.value, "hi there")) return error.WrongPair;
     if (it.next() != null) return error.UnexpectedExtraCookie;
-    std.debug.print("parsed 5 cookies from one header, incl. empty value / embedded \"=\" / quoted \";\"\n", .{});
+    std.debug.print("parsed 5 cookies from one header, incl. empty value / embedded \"=\" / quoted value\n", .{});
+
+    // Every ";" splits, quoted or not (RFC 6265 §5.4, as Go and the browsers
+    // do): a quoted value cannot hide a cookie inside it ("cookie sandwich").
+    const sandwich = "a=\"start; session=S; z=end\"";
+    const smuggled = cookies.find(sandwich, "session") orelse return error.SandwichHidCookie;
+    if (!std.mem.eql(u8, smuggled, "S")) return error.WrongPair;
+    std.debug.print("cookie sandwich: the inner session cookie is seen, not swallowed by a quoted value\n", .{});
 
     // `find` — case-sensitive per RFC 6265 §5.4.
     const sid = cookies.find(header, "session") orelse return error.MissingCookie;
