@@ -328,3 +328,13 @@ const hex33 = testkit.hex.literal;
 test {
     _ = @import("stackprobe_test.zig");
 }
+
+test "derivePrivateKey / deriveRevocationPrivateKey: out is zeroed on error, whatever it held" {
+    const zero = @as([32]u8, @splat(0)); // not a valid secret
+    var out: [32]u8 = @splat(0xaa);
+    try std.testing.expectError(error.InvalidSecret, derivePrivateKey(&out, &zero, &tv_pcs));
+    try std.testing.expectEqualSlices(u8, &zero, &out);
+    out = @splat(0xaa);
+    try std.testing.expectError(error.InvalidSecret, deriveRevocationPrivateKey(&out, &zero, &tv_pcs));
+    try std.testing.expectEqualSlices(u8, &zero, &out);
+}
