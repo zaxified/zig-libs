@@ -5,31 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** Audit card counts the 15 UNOBSERVABLE mutants (an input no generator emits, or probability at most 2^-128) as equivalent, as `hpke` does: 553/621, 68 eq.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the whole-module mutation run's 111 open ids settled by a second schemata run over the merged tests: 108 killed, 2 equivalent, 1 unobservable (argued in SPEC); Audit card 553/621, 53 eq; ctgrind re-measured (counts unchanged), source digests re-pinned.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** Tests only, killing survivors of the whole-module mutation run: §4.3 opening cases (a round-2 message the opener shows that its sender signed but did not send to it: another round, sender, recipient or session, too short, a byte too many; a lying `k`; records of Γ and R̄ that disagree with the opening), the `Presignature` codec bounds and signer order, hand-computed pool id, Γ commitment and session id, Πprm with a non-unit generator, `verifyWellFormedBound` with a failing Πmod proof, the prover's aux gate under an above-floor Paillier key, and Bob's verifier with a sub-floor `N`. No source line changed.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only (root.zig): killing tests for 29 of the 30 whole-module survivors in the AuxParams validation, the safe/Blum prime search, `generatePaillierBlum`, `paillierBlumFromPrimes`, the ring-Pedersen exponent draw, `auxFeJacobiIsOne` and the PublicKeys/KeyShare decoders (a prime Ñ, a non-residue generator, exact-width and primality of the generated primes pinned to a fixed seed, λ < p'q', the width and Blum guards, truncated, over-counted and trailing-byte encodings, a header share that differs from the broadcast copy). The remaining one (the `paillierModulusAsAux` null check in `paillierBlumFromPrimes`) is unreachable: both factors are at most half of `aux_modulus_bytes`, so the odd product always fits.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** Whole-module mutation audit (621 mutants including the 22 of the BIP-32 delta: 445 killed, 51 equivalent, 125 survivors, classified in SPEC "Audit 2026-11-17"). Tests only: layout KATs for the Fiat-Shamir challenges and the Πmod / Πprm seeds, a valid Πmod proof for a prime modulus, key-check tests for the verifiers, a Miller-Rabin table, unit tests for `intCompare` / `mulBytes` / `scalarFromWide` / `auxExponentTooLong`, `Party.init`, state-guard and round-1 key tests, one-byte-too-long and short messages per round, a zero-sum delta, and the `aux_info`, `root` and `mta` bound checks. No source line changed.
 - **2026-11-17** — **NEW:** BIP-32 non-hardened child derivation of shares: `childTweak(group_public_key, chain_code, index)` (CKDpub's HMAC step; `error.HardenedIndex` for `index >= 2^31`, `error.InvalidChildKey` for `IL >= n`, a zero tweak or an identity child key) and `deriveChild(&share, allocator, tweak)` (adds the public tweak to the share and `tweak*G` to the group key and every verifying share). Anchors: BIP-32 vectors 1 and 2 and signing under the derived key. Delta mutation 21/22 killed + 1 equivalent (SPEC; no whole-module baseline). The module's tests no longer read paillier's deleted `CrtParams.p_sq_fe` (rebuilt from `crt.p_sq`).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `stripLeadingZeros` helper is gone; its call sites use `std.mem.trimStart(u8, bytes, &.{0})` (same result, including the empty result for all-zero input).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the six copies of `appendLenPrefixed` and `readLenPrefixed` (root, aux_info, aux_proofs, fac_proof, zkproofs, presign) are one pair in the new internal `src/wire.zig`; presign keeps a two-line `?[]const u8` wrapper. Same bytes, same errors.
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
-- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** the presign deviation and §4.3-opening tests and the
-  aux_info end-to-end test are split into tests of at most ~45 s ReleaseSafe (aux_info over a shared
-  announcement fixture); together they exceeded CI's 3-minute `--test-timeout` under a full crypto lane.
 - **2026-10-10** — **Fixed:** `MtaProofWc.fromBytesAlloc` accepted trailing octets after the final point
   (`bytes.len < offset + Ne`), so one proof had many encodings; it now requires the exact length, as
   `PdlProof` does. Regression test in the round-trip test.
-- **2026-10-10** — **NO CONSUMER-VISIBLE CHANGE:** deterministic fuzz driver (`TECDSA_FUZZ`, `src/fuzz_test.zig`) over every wire decoder: Feldman commitments, public keys, aux params, key share, `Element`, the four EC proofs (honest proof accepted, damaged one refused), range / MtA / MtAwc / PDL / Πmod / Πprm / Πfac proofs, `Presignature`, and `combine` (shares nobody signed never combine). Harness bodies are generic over their choice source, so existing `--fuzz` corpora replay unchanged. 200,000 runs per harness clean in ReleaseSafe; the Πmod/Πprm harnesses now hold a full 67 KB frame (the old 4096-octet buffer could never reach `accepted`). Note: `MtaProofWc.fromBytesAlloc` ignores octets after the final point (only a lower bound is checked), unlike `PdlProof`.
 
 - **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `messagePublicKey(seed: *const [32]u8)` takes the Ed25519 message-signing seed by pointer (was by value; it was already burned). `aux_proofs.deriveModChallenge` / `derivePrmChallengeBits` carry `secret-api-ok` markers: their `seed` is the public Fiat-Shamir digest, not a secret. Call sites in `aux_info`, `presign`, `tsslib_interop`, the old stack probe and `dkg` migrated.
 
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
-  engine (p256's, 2026-10-08): the call runs under a `PAD`-deep shim, the region is painted and read
-  through a pointer, callee-saved registers are scrubbed first. The old "claim an uninitialised
-  buffer" engine could not see the top ~250–450 B of the call — the caller's and the wrappers'
-  frames. 0 residues, caller's frame included.
 - **2026-10-08** — **BREAKING + FIX (secrets on the dead stack, HIGH):** measured with the new
   ReleaseFast stack probe (`src/stackprobe_test.zig`), every entry point that touches a secret
   left it in dead stack frames although each named buffer was wiped: the presigning rounds
@@ -244,14 +229,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `GammaCommitment`, `SchnorrProof`, `GammaReveal`, `DeltaShare`, `SigShare` and the
   `gamma_*_domain` constants are removed (the state machine has its own, session-bound ones).
   No in-repo consumer.
-- **2026-10-02** — **NO CONSUMER-VISIBLE CHANGE:** the ctgrind harness drives `presign.Party`
-  state machines with one wrapped PRNG per party (`signWithShares` now seeds per-party CSPRNGs, so
-  a wrapper around its `random` would taint only the seeds), and `nonce` taints every 48-byte
-  secret-scalar draw (16, was 6). `ctgrind-expected.tsv`: share `<=394`, nonce `<=669`, betaprime
-  `<=462` in-file, controls and traps 0; every new context classified (verifier-side over-taint,
-  `paillier.decrypt`, std `rejectIdentity`, the draws' own reduction) — none on a prover-side branch.
-  New oracle: `tools/tsslib` (tss-lib v3.0.0, both directions) → `src/tsslib_vectors.zig`,
-  tested by `src/tsslib_interop.zig`.
 - **2026-09-30** — **BREAKING:** `signing.identifyAbortCulprit` is removed. It was a public
   `noreturn` function whose only behaviour was `@panic` (GG20 identifiable abort is not
   implemented), so a caller compiled and then crashed at run time. Identifiable abort stays a
@@ -265,11 +242,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   Bit-exact with the old shape (differential test, 200 random trials + boundary cases; ctgrind
   harness out_sha unchanged). `ctgrind-expected.tsv`: `share` `<=273`→`<=267`, `nonce`
   `<=400`→`<=378`, `betaprime` `<=313` now holds for real (was the intentionally-red R2 marker).
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1 R1. The ctgrind harness
-  (`src/ctgrind_harness.zig`, never part of the library build) gains a `betaprime` target that
-  taints Bob's 160-byte MtA blind `β'`, and `scripts/checks/ctgrind-expected.tsv` gains its row. No
-  library source changed. The row is RED on purpose: `zkproofs.mulAddBytes`'s carry tail
-  branches on secret-derived sums (A1 R2).
 - **2026-09-15** — **ADDITIVE:** audit F6. `signing.signWithSharesOptions(allocator, shares, message,
   random, options)` with `SignOptions{ .pair_threads, .pair_scratch_bytes }` runs Phase 3's
   `t(t−1)` ordered-pair MtA/MtAwc conversions on OS threads. Each pair gets its own ChaCha seed
@@ -279,12 +251,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   sequential, same randomness order). Measured, ReleaseFast, 5 interleaved reps, median sequential
   → 8 threads: `t=2` 1109 → 570 ms, `t=3` 3275 → 865 ms, `t=4` 6683 → 1612 ms.
 
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** audit F4(b)/(c). Two input guards could be
-  deleted with the suite green, because every existing reject test also broke a per-round equation.
-  New tests build proofs whose every round holds: Πmod over the non-Blum `Ñ = 187 = 11·17` with a
-  non-unit `w` (0 and 17), refused only by `Pimod.verify`'s `(w/Ñ) = −1` check; Πprm over the
-  degenerate tuples `(h1, h2) = (4, 1)` and `(1, 1)` with the honest `λ = 0` proof, refused only by
-  `Piprm.verify`'s `h ∉ {0, 1}` check.
 
 - **2026-09-15** — **SECURITY + BREAKING (signature) + BEHAVIOURAL:** audit F5. MtA drew Bob's
   blind `β'` from `Zq`, so the integer Alice decrypts, `α' = a·b + β'`, was `a·b` plus a blind
@@ -313,15 +279,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   refused (`InvalidAuxParams`) although both proofs hold; a real 2048-bit safe-prime tuple (fixed
   primes, generated once with OpenSSL and checked) is accepted, and a tampered proof for it refused.
 
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds fuzz harnesses for
-  the last 5 of the 12 originally-unfuzzed public `fromBytes*` entry points
-  (audit F8, closed): `RangeProof`/`MtaProof`/`MtaProofWc`.`fromBytesAlloc`
-  (`zkproofs.zig`) and `ModProof`/`PrmProof`.`fromBytesAlloc`
-  (`aux_proofs.zig`). Same shape as the 7 already covered (a fixed, cheap,
-  one-time fixture built outside the fuzz loop — a toy 8-bit `n_tilde` and
-  a `min_generate_bits`/512-bit Paillier key, not the 2048-bit fixture this
-  module's security-relevant tests need — then arbitrary bytes into the
-  decoder). 12 of 12 now covered. No production code changed.
 
 - **2026-09-10** — **DOC ONLY, no behavior changed:** this file's
   2026-07-15 entry below (and, independently, `paillier.decrypt`'s own doc
@@ -354,42 +311,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   Internal-only signature change (`runCheckedMtA`/`runCheckedMtAwc`, both
   file-private) — no public API touched.
 
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds fuzz harnesses for
-  the five fixed-size wire-message codecs `signing.zig` decodes from a
-  counterparty during signing (audit F8 continued — `GammaCommitment`,
-  `SchnorrProof`, `GammaReveal`, `DeltaShare`, `SigShare`.`fromBytes`). With
-  `KeyShare.fromBytesAlloc` (closed earlier this campaign), 6 of the 12
-  originally-unfuzzed public `fromBytes*` entry points now have coverage;
-  `RangeProof`/`MtaProof`/`MtaProofWc`.`fromBytesAlloc` and
-  `ModProof`/`PrmProof`.`fromBytesAlloc` remain open. No production code
-  changed.
 
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds a fuzz harness for
-  `KeyShare.fromBytesAlloc` (audit F8, MED — 12 of 15 public `fromBytes*`
-  entry points had zero fuzz coverage; this closes the highest-severity
-  one, the decoder whose missing validation was audit F2's HIGH). Corpus
-  seeds a real accepted `KeyShare`, the F2 "own index missing from
-  `public_keys`" shape as a corpus entry (not just the standalone
-  regression test), an index tampered to an absent value, a truncation,
-  and a header-only/empty input; a companion test pins that only the real
-  seed is accepted (1 of 5 non-empty seeds). No production code changed.
 
-- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds a test isolating
-  `verifyBobMtaWc`'s equation 6 (audit F4(a), MED) — the existing "wrong
-  B" test tampers `b_point` only at verify time against a proof whose
-  challenge was bound to a different point, so it fails equations 3-5
-  (Fiat-Shamir mismatch) before equation 6 is ever reached; the new test
-  keeps `b_point` consistent between prove and verify (so the transcript
-  matches and equations 3-5, which do not reference `b_point`/`u1_point`
-  in their own arithmetic, pass on their own terms) while that `b_point`
-  is not the Paillier witness `b`'s actual `·G` — isolating the rejection
-  to equation 6 alone. No production code changed. Also corrects a
-  `Pimod.verify` comment (audit F9, LOW) that claimed its Miller-Rabin
-  witnesses are outside the modulus-crafter's control; `SHA256(n_tilde)`
-  is a public deterministic function a crafter can evaluate offline, so
-  the real argument is cost (~2^-128 per grind attempt at 64 rounds), not
-  unpredictability — the underlying conclusion (per-round equations, not
-  MR, carry the check) is unchanged.
 
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `AuxParams.validate` now
   rejects an `h1`/`h2` of order 2 (audit F1, HIGH — an order-2 `h2` let a
@@ -409,21 +332,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   never reject anything (audit F3, MED) — internal-only, no observable
   signature-shape or API change for a well-behaved caller.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **share 127 / nonce 400**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. Settles a disputed audit claim by measurement: `signing.zig:267`'s `Secp256k1.basePoint.mul(nonce) catch continue` does fire, but `k256`'s own `mul`/`combMulBase` end in `try q.rejectIdentity()` identically (`k256/src/group.zig:278`, `:347`), so routing through `k256` would remove nothing — the class was never fixed for secp256k1, only for Edwards/Ristretto, and it fires at p≈2⁻²⁵⁶. ⭐ Two things nobody was looking for: `paillier.decrypt`'s L-function does a variable-time big-integer division on `k_i`-derived data on EVERY run (audit item A5 had only theorised it), and `zkproofs.zig:345`'s `mulAddBytes` ripple-carry loop has a trip count that depends on the RAW secret witness, before the blinding that makes the published response safe — no document in this module mentions it. ⚠ These numbers are NOT adjusted for single-process over-taint (see `dkg`'s entry); a share of them is public commitment data that only looks secret because one process built it.
 
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** this module is out of
-  `zig build check-testonly` again, and its fuzz corpus uses a nine-line local
-  copy of `testkit.fuzz`'s seed helper rather than the shared one. Enrolling it
-  via `test_deps` puts it in that gate, whose probe imports the *published*
-  module and references every declaration three levels deep — and this module
-  deliberately guards a test-only function with a `@compileError` that fires
-  outside a test build, so the probe touches a decl that exists to refuse being
-  touched. The two gates contradict each other for any module shaped this way.
-  ⛔ A local copy is the thing `testkit.fuzz` was created to abolish (33 of them
-  across 12 modules). What stops this one drifting is its anchor test, which
-  drives the real `std.testing.Smith` over what the helper produces — the same
-  shape as testkit's own tests, so a future Zig that changes `slice`'s framing
-  fails here loudly instead of leaving the corpus quietly seeding nothing.
 
 - **2026-09-07** — ⛔⛔ The harness written to guard the fixed ~29 TB over-allocation bug had
   never once produced the input that caused it. All three counted/length-prefixed fuzz

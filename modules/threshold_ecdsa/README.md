@@ -1,9 +1,6 @@
 # threshold_ecdsa
 
-Pure-Zig GG20 threshold-ECDSA over secp256k1. **This module is now
-end-to-end: Phase 2a (trusted-dealer keygen) + Phase 2b (ring-Pedersen aux
-params + the semi-honest MtA core) + Phase 2c (MtA zero-knowledge range
-proofs + MtAwc, IMPLEMENTED) + Phase 2d (online signing).** The arc: keygen
+Pure-Zig GG20 threshold-ECDSA over secp256k1. **This module is end-to-end: Phase 2a (trusted-dealer keygen) + Phase 2b (ring-Pedersen aux params + the semi-honest MtA core) + Phase 2c (MtA zero-knowledge range proofs + MtAwc) + Phase 2d (online signing).** The arc: keygen
 (2a) → aux-params/MtA (2b) → range proofs + MtAwc (2c) → threshold signing
 (2d) → a standard secp256k1 ECDSA signature, verifiable under
 `std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256` against the group public key —
@@ -40,9 +37,7 @@ conversion: `α + β ≡ a·b (mod q)`, built on `paillier`'s homomorphic ops.
 upgrades MtA to malicious security: `RangeProof`/`MtaProof`/`MtaProofWc`
 structs and byte codecs, a real SHA-256 Fiat-Shamir `Transcript` (binding
 the verifier's aux params, the Paillier public key — modulus **and**
-generator, audit F3 — every ciphertext/point, and every first-message
-commitment; domain tags are at `v2` since the generator was added, a
-deliberate BREAKING transcript revision, see `SPEC.md`), and the
+generator, audit F3 — every ciphertext/point, the caller's session context, and every first-message commitment; the domain tags are versioned (`v3` for the range and MtA proofs) and bumped whenever the absorbed set changes, see `SPEC.md`), and the
 `proveAliceRange`/`verifyAliceRange`/`proveBobMta`/`verifyBobMta`/
 `proveBobMtaWc`/`verifyBobMtaWc` API — ALL REAL, verified against the actual
 GG18 paper text (see `zkproofs.zig`'s module doc comment for the
@@ -56,7 +51,7 @@ Phase 2 runs MtA (`k·γ`) and MtAwc (`k·x`, bound to each signer's public
 `T_i` to `σ_i`, Phase 4 opens `Γ_i`, Phase 5 publishes `R̄_i = k_i·R` with a
 proof that it matches `Enc(k_i)` and checks `Σ R̄_j = G`, Phase 6 publishes
 `S_i = σ_i·R` with a proof that it matches `T_i` and checks `Σ S_j = X`.
-Phase 7 (`signShare`/`combine`) is the online round. `ecproofs` holds the
+Phase 7 (`signShare`/`combine`) is the online round. Presignatures can be kept across restarts with `PresignaturePool` over a `PresignatureStore` whose `take` hands each record out at most once; `signing.signWithSharesOptions` with `SignOptions.threads` runs the in-process driver's parties on several threads. `ecproofs` holds the
 curve-only proofs of §3.3. See `SPEC.md` "Signing" for the round table and
 the caller's duties (authenticated reliable broadcast, a fresh session id,
 timeouts, one presignature per message).
@@ -177,8 +172,6 @@ comment for why a real deployment never calls it. See `src/signing.zig` for
 the in-process driver (`signWithShares`, `lagrangeCoefficient`) and
 `src/presign.zig` for the per-signer state machine.
 
-## Backlog
+## Not provided
 
-See `SPEC.md` "Backlog / deferred": redistribution to a different committee
-and an independent cryptographic review
-(`SPEC.md` "Auditor brief", A1–A9).
+Redistribution to a different committee (no wrapper here; `dkg`'s reshare takes the new `n'`, `t'`), hardened BIP-32 derivation, and interoperability of the proofs and wire formats with other implementations are not provided, and the module has had no independent cryptographic audit. See `SPEC.md` "What is deliberately not done" and "Backlog / deferred".

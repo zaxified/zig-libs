@@ -16,21 +16,6 @@
 
 **Downstream consumer:** no
 
-**Audit 2026-11-17 (whole-module mutation).** 621 mutants = the 22 BIP-32 delta mutants run earlier (21 killed, 1 equivalent; not re-run) + 599 new over every non-test line of `zkproofs`, `aux_proofs`, `fac_proof`, `ecproofs`, `mta`, `presign`, `signing`, `aux_info` and `root` (one mutant per condition x class, protocol checks first: proof verification, range and floor checks, abort paths, party and index validation, codecs, the Fiat-Shamir layout). Schemata, one build per round, in a detached copy, baseline first. The module's tests take 4 minutes, so round 1 ran each mutant against the tests of its own source file only (all 599: 320 killed + 4 hung, 255 survived); every survivor was then rerun against the tests of the files that call it (and, for `presign.zig`, against `presign` + `signing`). Tests written during the audit: layout KATs for the Fiat-Shamir challenges of `ecproofs`, `fac_proof` and the Πmod/Πprm seeds, the `reusesMaterial` / `AnnouncementSet` / `assembleKeyShare` checks, a valid Πmod proof for a prime modulus (the primality test alone refuses it), the factors-swapped Πfac teeth case, `mtaBobResponseChecked` below the floor, `Party.init` checks (one signer for t = 1, own share and seed against the table), the state guards, own N below the floor at round 1, three malformed-message cases and one per later round (one byte too many), a delta that sums to zero, `splitSecretKey` / `keygenTrustedDealer` bounds and a small-order message key inside `PublicKeys`. 424 of the 599 are killed (445 of 621 with the delta), 50 more are EQUIVALENT (51 with the delta). 125 of the 621 survive on the card; they are not equal:
-
-- **Test written, NOT verified against the mutant (56).** Written after the last schemata build and run only as part of the module's own lane (green), never against the mutant: the layout KAT for `rangeProofChallenge`, `mtaProofChallenge`, `mtaProofWcChallenge`, `pdlProofChallenge` and `Transcript.appendAuxParams` / `appendPaillierPublicKey` (35 mutants dropping one transcript field: no honest proof and no tampered proof can show a field missing from a challenge when the equations bind the same value, only the layout can), the key-check test (valid Alice / Bob proofs under a non-standard Γ, a 1024-bit N, a 1000-bit Ñ), the unit tests for `intCompare`, `mulBytes`, `scalarFromWide` and `auxExponentTooLong`, the Miller-Rabin table (Carmichael numbers and strong pseudoprimes), the Πprm challenge bit order, the truncated-flags decode, and `prove` with the factors swapped.
-- **UNOBSERVABLE (14).** Needs a value the prover cannot be made to draw or a key that cannot exist: `bitLen` and `+1` boundary of the Πfac `z` bound (an honest `z` is one bit under it), a zero Πfac challenge (hash preimage), `sampleBits` mask at the tested size (the width is a whole number of bytes), `decryptWithRandomness` for an N not invertible mod lambda (no key generator emits one), `r = 0` and `s = 0` in the presignature (probability 2^-256), `mulAddOwned` with an all-zero result, `paillierModulusAsAux` for an N above 2048 bits, the Alice and Bob `s1` / `t1` comparisons when the length check already agrees (an equal-length value above q^3 needs a chosen alpha), and the Bob N floor (no valid Bob proof exists below q^7).
-- **EQUIVALENT (50), argued, not machine-proven.** Every Πmod prover mutant on the Blum exponents and the sign of the fourth root (`x^4 = -c` for a non-residue c, and `(p+1)/4` and `(p-3)/4` are both square-root exponents in the odd-order group of residues, so the proof is the same up to the sign of `x`), `intCompare` length order where both operands have the same length, `auxFeLeq` strictness for an odd modulus, the zero-value checks of every verifier (every commitment is a factor of an equation whose other side is a unit, so a zero fails the equation), the `s1` / `t1` / `s2` / `t2` length checks (covered by `intCompare` or by the `auxExponentTooLong` DoS cap, which only changes time), the `AuxFe` decode without trimming leading zeros (`ff` accepts them), `Party.init` `signers > n`, duplicate and zero signer (each also refused by the key-table count or by the sum of the weighted shares), `signWithShares` with one share (`Party.init` refuses it), own messages delivered back (`collect` ignores them), `delta = 0` (the identity point is refused one line later), the final ECDSA verification in `combine` (every share was checked against the equation before), a Πmod w with Jacobi +1 (some y has Jacobi -1 and fails its equation), `validate` for h = 0 or 1 (refused by the Jacobi symbol and by h^2 = 1), `verifyAnnouncement`'s N floor (N is 2048 bits), `splitSecretKey` with n = 0 (t > n), an empty Ñ in the codec, the Ed25519 point parse in `decodeMessageKey`, and the overflow guard of `auxLogInverse` (a product of two 1024-bit primes fits).
-- **No test yet (55).** Opening and identification (`openedRound2` round / sender / recipient / session, type 5 nonce, gamma*G and R-bar, type 7 plaintext range, `round2Fields` lengths), `Presignature` decoding (signer count, sorted signers), the presignature-id and session-id inputs (`sid`, index, R, group key), the safe-prime and Blum-prime generators (top bits, Miller-Rabin on either candidate, the size and `3 mod 4` checks of `paillierBlumFromPrimes`, `topHundredBitsMatch`, the order of the ring-Pedersen subgroup, `shrBytesBe`), `validate` (prime Ñ, Jacobi of h1 and h2), `auxFeJacobiIsOne` for a zero symbol, the `PublicKeys` and `KeyShare` decoders (count bound, truncation, trailing bytes, own share against the table), Πprm verify for h2 = 1 and for a non-unit h, `verifyWellFormedBound` with only the Πmod half wrong, and `proveAliceRange`'s received-parameter validation.
-
-- **Follow-up the same day: the 111 open ids settled.** The survivors' list had to be rebuilt from this paragraph's descriptions (the original mutant table was scratch and had gone); one schemata build in ReleaseSafe with the kit's runner (`scripts/mutation/test_runner.zig`: runtime test selection, fail-fast), each mutant against the tests of its file and its callers. The 56 "test written" ids: 54 killed, 2 survived (`66`, `527`). Of the 55 "no test" ids, 3 were already killed by tests written later in the audit (`302`, `339`, `420`). New tests (named `mut <id>: ...`) for the other 52 and for `527` (Bob's proof over a sub-floor N was never exercised: the earlier test had only Alice), then a second schemata build of the merged tree: 51 of 54 killed; the three left are argued: `66` EQUIVALENT (Miller-Rabin: once `x = 1` it stays 1, never reaches `n - 1`, and the loop ends in the same `return false`), `410` EQUIVALENT (`paillierBlumFromPrimes`: after `paillier.fromPrimes` accepted two odd factors of at most 128 bytes, N is odd and below 2^2048, so `paillierModulusAsAux` cannot return null), `85` UNOBSERVABLE (Πprm verify without the `h2 = 1` refusal: with `t = h2 = 1` every round needs `A_i = h1^-e_i` committed before the challenge bit, so a cheating prover passes with probability 2^-128; `h1 = 1` is refused separately). Card: 445 + 54 + 3 + 51 = 553 killed; 68 counted as equivalent = 51 + 2 argued equivalent + the 15 UNOBSERVABLE (14 above + `85`). An UNOBSERVABLE mutant needs an input no key generator emits or a value drawn with probability at most 2^-128, so no caller can tell it apart. The card counts these as equivalent, as `hpke`'s does for its probability-bounded ones (owner decision 2026-11-17).
-
-Cross-check: the mutants in `root.zig`'s BIP-32 code are the 22 of the delta paragraph below. The kit's `run.sh` was not used: a parallel runner with the same verdicts, an early kill at the first failing test and a per-file test selection (a scratch patch of every `test "..."` header in the copy) took its place, because one full run costs 4 minutes.
-
-The 2026-10-03 additions (signed messages and attestations, the §4.3 opening, the
-presignature pool, the constant-time key setup, `dkg.EcdsaRefresh`) have had neither an
-independent review nor a mutation run yet (Backlog).
-
 Design + threat notes for auditors. Usage: see ./README.md.
 Attribution/provenance: see ./README.md "Provenance" + ./NOTICE.
 
@@ -47,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [coinbase/kryptology](https://github.com/coinbase/kryptology) | Go | Apache-2.0 | 869 | **archived**, pushed 2022-09 | Multi-primitive Go library including threshold signing *(inferred)*; unmaintained. |
 | Zig ecosystem (GitHub search "threshold ecdsa", "threshold signatures", language Zig, 2026-09-30) | Zig | — | — | — | Nothing comparable found. |
 
-**Where we are ahead:** the only Zig threshold ECDSA found; **one-round online signing over presignatures** (GG20 §3; tss-lib signs GG18-style, all rounds online) with **identifiable abort for every GG20 fault type**, types 5 and 7 through the §4.3 opening (`Party.openAbort`/`identify`, a DLEQ proof instead of revealing `σ_i`); every message is Ed25519-signed and the broadcast-consistency check is per-signer signed attestations, so an equivocating signer is NAMED (tss-lib relies on its transport); presignatures can be pooled across restarts with a store contract that hands each out at most once; every proof is bound to a session id and the sender; the final signature is a plain secp256k1 ECDSA signature verified under `std.crypto.sign.ecdsa` before it is returned; Πprm/Πmod (128 rounds) and Πfac over every party's keys; key setup and the secret-dependent paths constant-time through `montint`, measured by ctgrind. **Where we are behind:** keygen and refresh live in the sibling `dkg` (`EcdsaKeygen`, `EcdsaRefresh`); redistribution to a DIFFERENT committee (`n'`, `t'`, tss-lib's resharing) has no wrapper yet; BIP-32 non-hardened child shares exist (`childTweak`/`deriveChild`, 2026-11-17), hardened derivation cannot by construction; no independent cryptographic audit (the README states this); cross-implementation evidence is key material and signatures, not proofs (different Fiat-Shamir transcripts) (→ Backlog).
+**Where we are ahead:** the only Zig threshold ECDSA found; **one-round online signing over presignatures** (GG20 §3; tss-lib signs GG18-style, all rounds online) with **identifiable abort for every GG20 fault type**, types 5 and 7 through the §4.3 opening (`Party.openAbort`/`identify`, a DLEQ proof instead of revealing `σ_i`); every message is Ed25519-signed and the broadcast-consistency check is per-signer signed attestations, so an equivocating signer is NAMED (tss-lib relies on its transport); presignatures can be pooled across restarts with a store contract that hands each out at most once; every proof is bound to a session id and the sender; the final signature is a plain secp256k1 ECDSA signature verified under `std.crypto.sign.ecdsa` before it is returned; Πprm/Πmod (128 rounds) and Πfac over every party's keys; key setup and the secret-dependent paths constant-time through `montint`, measured by ctgrind. **Where we are behind:** keygen and refresh live in the sibling `dkg` (`EcdsaKeygen`, `EcdsaRefresh`); redistribution to a DIFFERENT committee (`n'`, `t'`, tss-lib's resharing) has no wrapper yet; BIP-32 non-hardened child shares exist (`childTweak`/`deriveChild`), hardened derivation cannot by construction (see *What is deliberately not done*); no independent cryptographic audit (the README states this); cross-implementation evidence is key material and signatures, not proofs (different Fiat-Shamir transcripts) (→ Backlog).
 
 ## Design & invariants
 
@@ -60,8 +45,7 @@ aux-params/MtA → 2c range proofs + MtAwc → 2d signing), over secp256k1
 order). See the dedicated "Phase 2c" and "Phase 2d" sections below for
 those layers' design and status.
 
-**`keygenTrustedDealer` is the trusted-dealer path** (dealer-free keygen is `dkg.EcdsaKeygen`, see
-Backlog). A single dealer holds the plaintext group
+**`keygenTrustedDealer` is the trusted-dealer path** (dealer-free keygen is `dkg.EcdsaKeygen`). A single dealer holds the plaintext group
 ECDSA secret key `x`, Shamir-splits it into `n` shares (degree-`(t-1)`
 polynomial `f`, `f(0) = x`) via `splitSecretKey`, and distributes one share
 to each party out-of-band, alongside a Feldman VSS commitment so every party
@@ -72,9 +56,7 @@ their own trusted-dealer paths. A full Pedersen-style DKG (interactive
 complaint/justification sub-protocol, no single party ever learns `x`) is
 not part of `splitSecretKey`; it is the sibling `dkg` module.
 
-**What's implemented (all REAL, no panics — Phase 2c's prove/verify number
-theory AND Phase 2d's online signing are now implemented and tested, see the
-dedicated sections below). `zig build test-threshold_ecdsa` passes, and the
+**What's implemented (no panics; Phase 2c's prove/verify number theory and Phase 2d's online signing are in the dedicated sections below). `zig build test-threshold_ecdsa` passes, and the
 security-critical reject tests are NOT skipped in the default run: this
 module is marked `heavy` in the root `build.zig`, so a Debug request builds
 it at ReleaseSafe, where the `builtin.mode == .debug` guards on the
@@ -100,8 +82,7 @@ its reject tests are fast and run in EVERY mode:**
   paillier/rsa probable-prime shape + an extra Miller-Rabin pass on
   (candidate-1)/2 and a p̃ ≡ 3 (mod 4) filter), `N_tilde = p̃·q̃`, a random
   quadratic residue `h2 = r²`, a secret exponent `lambda ← [1, p'·q')`, and
-  `h1 = h2^lambda mod N_tilde` (so `h1 ∈ ⟨h2⟩`; until 2026-10-03 it was
-  `h2 = h1^lambda`, the wrong direction — see "Πprm / Πmod"). `lambda` is DISCARDED (the tuple's owner is a
+  `h1 = h2^lambda mod N_tilde` (so `h1 ∈ ⟨h2⟩`, see "Πprm / Πmod"). `lambda` is DISCARDED (the tuple's owner is a
   proof *verifier*, not a prover under its own `N_tilde`; see the function's
   doc comment for the retention decision). A separate trapdoor-retaining
   variant, `generateAuxParamsWithTrapdoor`, exists for a party that DOES
@@ -127,32 +108,9 @@ exercise the struct/codec.
 Alice's decryption `α'` is a Paillier plaintext in `[0, N)`, reduced into Zq
 at full width.
 
-**The blind `β'` must dominate `a·b` (audit F5, fixed 2026-09-16).** Alice
-knows `a` and decrypts the integer `α' = a·b + β'`, so `β'` alone hides `b`.
-`β'` used to be a `Zq` scalar — a `~q` blind over `a·b ≈ q²` — and `α'/a`
-returned `b` to within a few units: measured, Alice recovered Bob's `b` in 4/4
-semi-honest and 3/4 checked-path trials (in signing, `b` is `γ_j` or the
-Lagrange-weighted key share `w_j`, so one signing session hands every signer
-every other signer's `w_j`, i.e. the group key). Now `mtaBobResponse` draws
-`β' ← Z_N` (GG18 §3) and `mtaBobResponseChecked` draws `β' ← Z_{q⁵}` (tss-lib
-`BobMid`/`BobMidWC`, `GetRandomPositiveInt(q5)`; the widest range Bob's
-`t1 <= q⁷` bound admits). `a·b` then moves the plaintext's distribution by at
-most `q²/N` resp. `q⁻³`. The checked responder refuses `N <= q⁷`
-(`error.PaillierModulusBelowFloor`), so `a·b + β' < q² + q⁵` cannot wrap;
-the semi-honest one wraps with probability `< q²/N`. Regression test:
-`mta.zig` "audit F5: Alice's own decryption of c_B must not reveal Bob's b".
+**The blind `β'` must dominate `a·b` (audit F5).** Alice knows `a` and decrypts the integer `α' = a·b + β'`, so `β'` alone hides `b`. A `Zq` scalar blind (`~q` over `a·b ≈ q²`) would let `α'/a` return `b` to within a few units, and in signing `b` is `γ_j` or the Lagrange-weighted key share `w_j`: one signing session would hand every signer every other signer's `w_j`, i.e. the group key. So `mtaBobResponse` draws `β' ← Z_N` (GG18 §3) and `mtaBobResponseChecked` draws `β' ← Z_{q⁵}` (tss-lib `BobMid`/`BobMidWC`, `GetRandomPositiveInt(q5)`; the widest range Bob's `t1 <= q⁷` bound admits). `a·b` then moves the plaintext's distribution by at most `q²/N` resp. `q⁻³`. The checked responder refuses `N <= q⁷` (`error.PaillierModulusBelowFloor`), so `a·b + β' < q² + q⁵` cannot wrap; the semi-honest one wraps with probability `< q²/N`. Regression test: `mta.zig` "audit F5: Alice's own decryption of c_B must not reveal Bob's b".
 
-**MtA (`mtaAliceInit`/`mtaBobResponse`/`mtaAliceFinalize`) is SEMI-HONEST
-ONLY** — correct against passive adversaries, not secure against a malicious
-party. The GG18 range proofs / MtAwc check that close that gap are Phase 2c,
-which is now **IMPLEMENTED** — structs, transcript, fail-closed wiring AND
-the prove/verify number theory are all real (see the dedicated "Phase 2c"
-section below and `zkproofs.zig`'s module doc comment). The malicious-secure
-entry point `mtaAliceFinalizeChecked` is a working alternative to the
-semi-honest path, not a scaffold. (This paragraph described the scaffold
-state and was left stale by the pass that implemented Phase 2c; corrected
-here, since it contradicted the rest of this file on exactly the security
-property that matters.)
+**MtA (`mtaAliceInit`/`mtaBobResponse`/`mtaAliceFinalize`) is SEMI-HONEST ONLY** — correct against passive adversaries, not secure against a malicious party. The malicious-secure path is the `*Checked` family (`mtaAliceInitChecked`, `mtaBobResponseChecked`, `mtaAliceFinalizeChecked`), which runs the GG18 range proofs / MtAwc of Phase 2c (below) and refuses a failed proof before anything is decrypted. It is a working alternative to the semi-honest path, not a scaffold.
 
 **Ring-Pedersen aux params' role (why Phase 2a carries this at all).**
 GG18/GG20's Phase-2b/2c zero-knowledge range proofs (proving a Paillier
@@ -162,8 +120,7 @@ commitment mod a second, INDEPENDENT RSA-strength modulus `N_tilde` (distinct
 from any party's own Paillier `n`) as their commitment base. Every party
 generates its OWN `(N_tilde, h1, h2)` and broadcasts it (never the discrete
 log `lambda` relating `h1`/`h2` — see `generateAuxParams`'s doc comment for
-why `lambda` is secret and discarded, and the `TODO(2c)` note on whether a
-future aux-param-correctness proof needs to retain it). Carrying `AuxParams`
+why `lambda` is secret and discarded, and `generateAuxParamsWithTrapdoor`, which retains it for a Πprm/Πmod prover). Carrying `AuxParams`
 in `KeyShare`/`PublicKeys`, even though the range proofs that consume it are
 Phase 2c, means the key-distribution step doesn't need to run twice.
 
@@ -185,24 +142,7 @@ internal serialization, real and round-trip-tested, not a standard.
 
 ## Threat model / out of scope
 
-- **Secret residue on the dead stack** (sweep 2026-10-08, `src/stackprobe_test.zig`,
-  ReleaseFast). Wiping named buffers did not keep secrets off the stack: compiler copies,
-  by-value parameters and results, and callee frames left them in dead stack memory. Fix,
-  as `bip32`/`k256` (2026-10-08): (1) every public entry point that touches a secret runs its
-  body one frame down (`noinline`) and then zeroes, at that depth, a region a little deeper than
-  the body was measured to reach (`burn.zig`: volatile 32-byte vector stores into a 16-aligned
-  buffer — 32-aligned, the frame realigned and left up to 56 bytes unzeroed, which held half a
-  secret); (2) a secret never crosses the API by value: secret parameters are pointers, secret
-  results go to an out-parameter, because the copy a by-value argument or result makes lives in
-  the CALLER's frame, where no burn of the callee reaches. The probe paints a window, makes one
-  call, copies the uninitialised window at the same depth and looks for every 16-byte window of
-  every secret's big-endian, little-endian and in-memory image and of every byte the call drew
-  from its `std.Random` (published bytes excluded); negative and positive controls in the same
-  binary. `verbose = true` prints each call's depth, to resize a burn after a change.
-  Before: 141 copies on the signing path (rounds 1-6, `finish`, `signShare`; round 3 left the
-  whole Paillier secret key, 21-23 copies per party) and 354 over 28 building blocks; after: 0
-  over 61 calls (presigning, the §4.3 opening, the codec and pool, `signWithShares`, MtA, every
-  prover, key generation and the codecs). Stack cost: up to ~1.3 MiB below `proveWellFormed*`.
+- **Secret residue on the dead stack** (`src/stackprobe_test.zig`, ReleaseFast). Wiping named buffers does not keep secrets off the stack: compiler copies, by-value parameters and results, and callee frames leave them in dead stack memory. As `bip32`/`k256`: (1) every public entry point that touches a secret runs its body one frame down (`noinline`) and then zeroes, at that depth, a region a little deeper than the body was measured to reach (`burn.zig`: volatile 32-byte vector stores into a 16-aligned buffer — a 32-aligned one left the frame realigned and up to 56 bytes unzeroed, which held half a secret); (2) a secret never crosses the API by value: secret parameters are pointers, secret results go to an out-parameter, because the copy a by-value argument or result makes lives in the CALLER's frame, where no burn of the callee reaches. The probe paints a window, makes one call, copies the uninitialised window at the same depth and looks for every 16-byte window of every secret's big-endian, little-endian and in-memory image and of every byte the call drew from its `std.Random` (published bytes excluded); negative and positive controls in the same binary. It covers presigning, the §4.3 opening, the codec and pool, `signWithShares`, MtA, every prover, key generation and the codecs, and finds no residue. `verbose = true` prints each call's depth, to resize a burn after a change. Stack cost: up to ~1.3 MiB below `proveWellFormed*`.
 - **`secret_share` (x_i) and `paillier_secret` are SECRET** — as sensitive
   as any raw ECDSA/Paillier private key. `KeyShare` does not add any
   handling beyond what `Scalar`/`paillier.SecretKey` already provide
@@ -212,7 +152,7 @@ internal serialization, real and round-trip-tested, not a standard.
 - **`reconstructSecret` is a TEST/AUDIT utility, not a production
   primitive.** The entire point of threshold ECDSA is that the raw secret
   key `x` is never assembled in one place during ordinary operation —
-  Phase 2c (signing, a later module) computes a valid ECDSA signature
+  Signing (`presign.zig`, `signing.zig`) computes a valid ECDSA signature
   WITHOUT ever calling anything like this function. It exists here so this
   module's own Shamir/Feldman self-consistency tests have something to
   assert against (mirrors `frost.deriveInterpolatingValue`'s and
@@ -233,9 +173,7 @@ internal serialization, real and round-trip-tested, not a standard.
 - **`generateAuxParams` const-time posture.** The safe-prime *search* is
   inherently variable-time (how long it took reveals nothing about the primes
   kept) — same acceptable posture `paillier.generatePrime`/`rsa` establish.
-  The secret exponent `lambda`'s use in `h1 = h2^lambda mod N_tilde` is the
-  constant-time `AuxModulus.pow`, mirroring `paillier.fromPrimes`'s
-  `g^lambda mod n²`. All secret buffers (p̃/q̃/p'/q'/`lambda` source bytes)
+  The secret exponent `lambda`'s use in `h1 = h2^lambda mod N_tilde` is the constant-time `zkproofs.powSecret` on montint (`root.zig:1224`). All secret buffers (p̃/q̃/p'/q'/`lambda` source bytes)
   are `secureZero`'d.
 - **MtA const-time posture.** MtA touches secrets `a`/`b`/`α`/`β`/`β'` and
   Alice's Paillier secret key; every step is an already-constant-time
@@ -246,19 +184,14 @@ internal serialization, real and round-trip-tested, not a standard.
   introduced — see `paillier`'s SPEC). **MtA is semi-honest only** — see the
   boundary section; range proofs (Phase 2c) add malicious security.
 - **This module DOES produce signatures** — `signing.signWithShares`
-  (Phase 2d) emits a real secp256k1 ECDSA signature, and verifies it against
-  the group public key before returning (`error.SigningAborted` otherwise).
-  The keygen/MtA layers on their own are inert, but the module as a whole is
-  not. (This bullet used to read "no signature is produced anywhere in this
-  module", true only before Phase 2c/2d landed here rather than in a
-  follow-up module; corrected.)
+- **This module DOES produce signatures** — `signing.signWithShares` emits a real secp256k1 ECDSA signature and verifies it against the group public key before returning (`error.SigningAborted` otherwise). The keygen and MtA layers on their own are inert; the module as a whole is not.
 - **No official KAT vectors exist for threshold-ECDSA** (unlike `frost`'s
   RFC 9591 Appendix E.5) — verification here is self-consistency
   (Shamir-reconstruct-equals-original-secret, Feldman-derived-equals-
   direct-scalar-mult, byte round-trips), the same posture
   `bls12_381.threshold` uses for its own tests.
 
-## Phase 2c — MtA zero-knowledge range proofs (`zkproofs.zig`, IMPLEMENTED)
+## Phase 2c — MtA zero-knowledge range proofs (`zkproofs.zig`)
 
 **Design.** GG18 (ePrint 2019/114) Appendix A defines two Sigma-protocol,
 Fiat-Shamir-transformed proofs over the ring-Pedersen commitment scheme
@@ -286,9 +219,7 @@ real SHA-256 Fiat-Shamir `Transcript` (domain-separated per proof kind,
 binding the verifier's `AuxParams`, the Paillier public key — modulus `N`
 **and** generator `Γ`, see the audit-F3 section below — every
 ciphertext/point in play, and the proof's own first-message commitments)
-are REAL and tested. The six `proveAliceRange`/`verifyAliceRange`/
-`proveBobMta`/`verifyBobMta`/`proveBobMtaWc`/`verifyBobMtaWc` functions now
-carry the full number theory (sample masks → commit → Fiat-Shamir challenge
+are REAL and tested. The six `proveAliceRange`/`verifyAliceRange`/ `proveBobMta`/`verifyBobMta`/`proveBobMtaWc`/`verifyBobMtaWc` functions carry the full number theory (sample masks → commit → Fiat-Shamir challenge
 → integer response → verification equations), **verified against the ACTUAL
 GG18 paper** — Appendix A.1 "Range Proof", A.2 "Respondent ZK Proof for
 MtAwc", A.3 "Respondent ZK Proof for MtA" (retrieved from the NSF Public
@@ -309,18 +240,15 @@ and structurally cross-checked against bnb-chain/tss-lib's `crypto/mta`
     verifier checks `t1 <= q⁷`, which additionally BOUNDS Bob's additive
     blind `β'` — closing the unbounded-`β'` degree of freedom that the
     Alpha-Rays failure class abuses. This module's checked-MtA wiring samples
-    `β' ∈ Z_{q⁵}`, exactly tss-lib's range (audit F5: until 2026-09-16 it
-    sampled `β' ∈ Z_q`, which passed the proof and leaked `b` to Alice — see
-    "The blind `β'` must dominate `a·b`" above).
+    `β' ∈ Z_{q⁵}`, exactly tss-lib's range (see "The blind `β'` must dominate `a·b`" above).
     **This "closing" is SIZE-CONDITIONAL (audit F2): the `t1 <= q⁷` bound only
     bites when the Paillier `N` (and ring-Pedersen `Ñ`) it lives over EXCEED
     `q⁷ ≈ 2^1792`. Below ~2048 bits the check is VACUOUS — a `<= q⁷` modulus
     can never make it fire — so the "unbounded-`β'` freedom" would remain
-    open. This is now ENFORCED: every RECEIVED Paillier `N` and aux `Ñ` on the
+    open. This is ENFORCED: every RECEIVED Paillier `N` and aux `Ñ` on the
     checked-MtA / zkproofs path must clear `N > q⁷` (`root.paillierNMeetsFloor`
     / `root.nTildeMeetsFloor`), fail-closed at both the prove and verify
-    entry points. The module no longer accepts 1024-bit keys on the checked
-    path; all checked-path tests were bumped to 2048-bit accordingly.**
+    entry points. The module does not accept 1024-bit keys on the checked path.**
   - `tau` widens from the paper's `Z_{q·Ñ}` to `Z_{q³·Ñ}` accordingly, so
     `t2 = e·sigma + tau` stays statistically hiding.
 - MtAwc (paper A.2): the A.3 proof plus `u1 = alpha·G` reusing the SAME
@@ -370,15 +298,14 @@ FRESH `r_B` HE chose). `mtaBobResponseChecked` (`mta.zig`) instead composes
 `c_B` via `mulPlaintext` + a FRESH `encrypt(β'; r_b)` + `addCiphertexts` —
 decrypts to the identical `a·b + β'` (Paillier decryption is randomness-
 independent; a dedicated test in `mta.zig` asserts both this AND that the
-resulting ciphertext bytes differ from `mtaBobResponse`'s), but now carries
+resulting ciphertext bytes differ from `mtaBobResponse`'s), but carries
 the witness `r_b` the proof needs. Similarly, `mtaAliceInitChecked` retains
 `r_A` (the semi-honest `mtaAliceInit` discards it inside
 `paillier.encryptRandom`).
 
 **Fail-closed wiring.** `mta.mtaAliceFinalizeChecked` calls
 `zkproofs.verifyBobMta` and returns `error.InvalidMtaProof` (never reaching
-`mtaAliceFinalize`'s decryption) if it returns `false`. Both the control
-flow and the predicate are now real; `mta.zig`'s end-to-end test runs the
+`mtaAliceFinalize`'s decryption) if it returns `false`. Both the control flow and the predicate are real; `mta.zig`'s end-to-end test runs the
 full `mtaAliceInitChecked → verifyAliceRange → mtaBobResponseChecked →
 proveBobMta → mtaAliceFinalizeChecked` round, asserts `α + β ≡ a·b`, and
 asserts a tampered `c_B` / wrong-witness proof is refused with
@@ -401,9 +328,7 @@ pass every "honest accept" test trivially while leaving the vulnerability
 wide open. These reject tests are REAL and passing; they must NOT be
 weakened.
 
-**Received-parameter validation — the honesty note (audit F1/F2/F3).** Three
-facts this SPEC previously UNDERSTATED as tidy deferred niceties, corrected
-here:
+**Received-parameter validation (audit F1/F2/F3).** Three facts about what the received parameters must satisfy:
 
 - **(F1) Without validation of RECEIVED ring-Pedersen aux params, the
   zero-knowledge (hiding) property COLLAPSES against a malicious verifier,
@@ -413,7 +338,7 @@ here:
   `Ñ`, or `h1`/`h2` outside the square subgroup) makes those commitments leak
   bits of `m` (Alice's nonce `k_i` in `runCheckedMtA`, Bob's Lagrange-weighted
   share `w_j` in MtAwc) — the TSSHOCK / Alpha-Rays class, breaking HIDING (not
-  soundness). This is now MITIGATED: `root.AuxParams.validate` runs
+  soundness). This is mitigated: `root.AuxParams.validate` runs
   fail-closed at every prove entry point (`zkproofs.proveAliceRange`/
   `proveBobMta`/`proveBobMtaWc`) and rejects a received tuple unless `Ñ` is
   odd + composite (Miller-Rabin) + `> q⁷`, `1 < h1,h2 < Ñ`, `gcd(h1,Ñ) =
@@ -422,73 +347,62 @@ here:
   quadratic residuosity** (a non-residue mod BOTH prime factors of `Ñ` also
   has symbol +1) — it is the strongest guarantee available WITHOUT `Ñ`'s
   factorization. The full fix — a CGGMP21 `Πprm`/`Πmod` zero-knowledge
-  proof-of-correct-generation broadcast alongside the tuple — is now
-  **IMPLEMENTED** (`aux_proofs.zig` — see the dedicated section below): a
+  proof-of-correct-generation broadcast alongside the tuple — is **implemented** (`aux_proofs.zig` — see the dedicated section below): a
   generator proves its tuple well-formed via `proveWellFormed` and a
   validator rejects any tuple whose proof fails via `verifyWellFormed`,
   closing exactly the residuosity gap the Jacobi floor cannot. The
   structural validation (`AuxParams.validate`) remains the always-enforced
   cheap floor beneath it, not a replacement. **`verifyWellFormed(aux, proof,
-  random)` runs `validate` itself before the proofs (audit F10, 2026-09-14)**:
-  it used to leave `validate` — and with it the `Ñ > q⁷` floor — to the caller
-  by doc comment, although Πprm/Πmod hold over any small modulus (tested: an
-  honest 128-bit tuple with its honest proof passes both proofs and is refused
-  as `error.InvalidAuxParams`; a real 2048-bit safe-prime tuple is accepted).
-  A malicious-secure per-party-aux deployment runs `verifyWellFormed` on every
-  received tuple; nothing else is needed.
+  random)` runs `validate` itself before the proofs (audit F10)**: Πprm/Πmod
+  hold over any small modulus (tested: an honest 128-bit tuple with its honest
+  proof passes both proofs and is refused as `error.InvalidAuxParams`; a real
+  2048-bit safe-prime tuple is accepted). A malicious-secure per-party-aux
+  deployment runs `verifyWellFormed` on every received tuple; nothing else is
+  needed.
 - **(F2) The "closed the unbounded-`β'` freedom" claim is size-conditional**
-  and only holds at `N > q⁷` — now enforced (see the Bob's-proof bounds
+  and only holds at `N > q⁷` — enforced (see the Bob's-proof bounds
   section above).
-- **(F3) The Fiat-Shamir transcript did not bind the Paillier generator `Γ`
-  — a grinding seam. FIXED, and the fix is BREAKING on the wire.** Fiat-
-  Shamir is only as sound as the transcript is complete: a public value that
-  is not absorbed is a value the prover may still CHANGE after the challenge
-  is fixed. `Γ` is part of the statement (`c = Γ^m · r^N mod N²`) and appears
-  in verification equation 2 (`u · c^e == Γ^{s1} · s^N`), yet
-  `Transcript.appendPaillierPublicKey` absorbed the modulus `N` ONLY. The
-  challenge was therefore invariant under a change of generator, so a prover
-  could enumerate candidate `Γ` values against ONE fixed challenge, looking
-  for a generator under which a false statement's equation closes — a search
-  that transcript binding is supposed to make as hard as breaking the Sigma
-  protocol itself. Two changes close it, and BOTH are needed:
-  - **the binding** — `appendPaillierPublicKey` now absorbs `Γ` as well as
-    `N` (each length-prefixed, so the two fields cannot be re-split
-    ambiguously). This is the general Fiat-Shamir-completeness fix.
+- **(F3) The Fiat-Shamir transcript binds the Paillier generator `Γ`.**
+  Fiat-Shamir is only as sound as the transcript is complete: a public value
+  that is not absorbed is a value the prover may still change after the
+  challenge is fixed. `Γ` is part of the statement (`c = Γ^m · r^N mod N²`)
+  and appears in verification equation 2 (`u · c^e == Γ^{s1} · s^N`), so a
+  prover could otherwise enumerate candidate `Γ` values against ONE fixed
+  challenge, looking for a generator under which a false statement's equation
+  closes. Two measures close it, and BOTH are needed:
+  - **the binding** — `Transcript.appendPaillierPublicKey` absorbs `Γ` as
+    well as `N` (each length-prefixed, so the two fields cannot be re-split
+    ambiguously);
   - **the structural precondition** — `root.paillierGeneratorIsStandard`
     rejects any RECEIVED Paillier key whose `Γ != N+1`, fail-closed at every
     prove AND verify entry point (alongside the F1/F2 gates). Binding alone
     would not help against a *degenerate* `Γ`: a generator of order smaller
     than `N` (`Γ = 1` being the extreme) makes equation 2 stop tying `s1` to
     the ciphertext's plaintext at all, so the `s1 <= q³` range check in
-    equation 1 would be guarding a value unrelated to what was encrypted —
-    and that is true for every challenge, ground or not. Every key
-    `paillier.generate`/`fromPrimes` produces already has `g = n+1`, so this
-    rejects only deliberately hand-built keys. Consequence:
-    `zkproofs.gammaPowWide`'s non-standard-`g` fallback branch is now DEAD
-    from the proof paths (kept only so the helper stays a total function).
+    equation 1 would guard a value unrelated to what was encrypted, for every
+    challenge. Every key `paillier.generate`/`fromPrimes` produces already has
+    `g = n+1`, so this rejects only deliberately hand-built keys. Consequence:
+    `zkproofs.gammaPowWide`'s non-standard-`g` fallback branch is dead from the
+    proof paths (kept only so the helper stays a total function).
 
-  **BREAKING wire change.** Absorbing a new value changes every challenge,
-  so a proof minted before this change does not verify after it, and vice
-  versa. The three domain tags were bumped `…/v1` → `…/v2`
-  (`range_proof_domain`, `mta_proof_domain`, `mta_proof_wc_domain`) to make
-  the break explicit rather than silent — a stale proof now fails as a plain
-  verification failure. This is acceptable here because the module has no
-  deployed peer and these proofs were never byte-compatible with any other
-  implementation (see the "Wire codecs" and "Verification level" notes);
-  it would NOT be acceptable after a deployment.
+  **Domain tags are versioned.** `range_proof_domain`, `mta_proof_domain` and
+  `mta_proof_wc_domain` end in `/v3`, `pdl_proof_domain` in `/v1`
+  (`zkproofs.zig:714-719`). The tag is bumped whenever the absorbed set
+  changes — `v2` added `Γ`, `v3` the caller's `context` (session id and prover
+  index), so a proof made in one session or by one prover does not verify in
+  another — and a proof made under an older tag fails as a plain verification
+  failure, never as a subtly mismatched challenge. That is acceptable because
+  the module has no deployed peer and these proofs were never byte-compatible
+  with any other implementation (see "Wire codecs" and "Verification level").
 
-  **What proves the binding is load-bearing** (not just that round-trips
-  still pass): a test varies ONLY `Γ` — same `N`, same aux tuple, same
-  ciphertexts, same commitments — across all three challenge functions and
-  requires the challenge to move, with a control asserting that the same `Γ`
-  supplied two different ways hashes identically. Fault injection confirms
-  the teeth: deleting the `g` append makes exactly that test RED and nothing
-  else; neutering `paillierGeneratorIsStandard` makes exactly the F3
-  fail-closed test RED and nothing else. The end-to-end form of the test
-  (prove under one `Γ`, verify under another) is not writable *because* of
-  the second half of the fix — a non-standard `Γ` is now refused before
-  either side does any arithmetic — which is why the property is asserted at
-  the challenge-function level.
+  **What proves the binding is load-bearing:** a test varies ONLY `Γ` — same
+  `N`, same aux tuple, same ciphertexts, same commitments — across all three
+  challenge functions and requires the challenge to move, with a control
+  asserting that the same `Γ` supplied two different ways hashes identically
+  (`zkproofs.zig` "audit F3 (a)"). The end-to-end form (prove under one `Γ`,
+  verify under another) is not writable, because a non-standard `Γ` is refused
+  before either side does any arithmetic; the property is asserted at the
+  challenge-function level.
 
 **Signing-safety was never in question.** Neither F1 nor F2 lets this module
 emit an INVALID signature: `signing.signWithShares`'s step-6 std-ECDSA
@@ -497,7 +411,7 @@ cheat. F1 is a HIDING (witness-secrecy) property and F2 a range-bound-vacuity
 property; both concern what an adversary can LEARN, not what a bad signature
 it can force.
 
-## Πprm / Πmod — aux-param proofs-of-correct-generation (`aux_proofs.zig`, IMPLEMENTED — closes audit F1)
+## Πprm / Πmod — aux-param proofs-of-correct-generation (`aux_proofs.zig`, closes audit F1)
 
 **Design.** CGGMP21 (R. Canetti, R. Gennaro, S. Goldfeder, N. Makriyannis, U.
 Peled, "UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable
@@ -511,40 +425,9 @@ genuine product of two Blum primes `p̃, q̃ ≡ 3 (mod 4)` with `gcd(n_tilde,
 audit F1 (the Jacobi check above is necessary-but-not-sufficient; these
 proofs are the sufficient fix the F1 write-up always pointed at).
 
-**Direction (review 2026-10-03, fixed the same day).** The commitment is
-`h1^x·h2^ρ`, so hiding needs the MESSAGE base in the subgroup of the
-RANDOMNESS base: `h1 = h2^λ` makes it `h2^{λx+ρ}`, which `ρ` masks. Πprm
-shows exactly `h1 ∈ ⟨h2⟩` — not `⟨h1⟩ = ⟨h2⟩`, which hiding does not need.
-Until 2026-10-03 the module generated and proved `h2 = h1^λ` (`h2 ∈ ⟨h1⟩`),
-which a dishonest tuple owner satisfies with `h2 = h1^M` for a smooth `M`
-dividing `ord(h1)`: Blum primes with smooth `(p̃−1)/2` pass Πmod, the
-commitment fixes `x mod M` for every `ρ`, and Pohlig–Hellman reads it off —
-the honest prover's MtA witness, the key share among them (Alpha-Rays /
-TSSHOCK class). tss-lib avoids it by proving both directions (two DLN
-proofs); CGGMP21 Fig.17 proves `s = t^λ`, the one that matters, which is
-what this module now does. Wire format unchanged; a proof made before the
-fix does not verify after it. Regression test: "review 2026-10-03 F1".
+**Direction.** The commitment is `h1^x·h2^ρ`, so hiding needs the MESSAGE base in the subgroup of the RANDOMNESS base: `h1 = h2^λ` makes it `h2^{λx+ρ}`, which `ρ` masks. Πprm shows exactly `h1 ∈ ⟨h2⟩` — not `⟨h1⟩ = ⟨h2⟩`, which hiding does not need. Proving the opposite direction (`h2 ∈ ⟨h1⟩`) would be satisfied by a dishonest tuple owner with `h2 = h1^M` for a smooth `M` dividing `ord(h1)`: Blum primes with smooth `(p̃−1)/2` pass Πmod, the commitment fixes `x mod M` for every `ρ`, and Pohlig–Hellman reads it off — the honest prover's MtA witness, the key share among them (Alpha-Rays / TSSHOCK class). tss-lib avoids it by proving both directions (two DLN proofs); CGGMP21 Fig.17 proves `s = t^λ`, the one that matters, which is what this module does. Regression test: `aux_proofs.zig` "review 2026-10-03 F1" (a proof of `h2 ∈ ⟨h1⟩` over a tuple with `[⟨h1⟩:⟨h2⟩] = 5` is refused).
 
-**Status: IMPLEMENTED, `pi_mod_iterations`/`pi_prm_iterations` soundness
-parameter `m = 128` (≈2^-128 error) for both** (80 until 2026-10-03, review F7:
-a non-interactive proof is grindable, so `2^-80` meant 80-bit security). REAL: the `ModProof`/
-`PrmProof` struct shapes and byte codecs, the Fiat-Shamir transcript wiring
-(`deriveModChallenge`/`derivePrmChallengeBits`, built on
-`zkproofs.Transcript`'s new `finalizeDigest` — the same domain-separated
-SHA-256 binding discipline the Phase-2c proofs use, extended with a local
-deterministic counter-mode expansion since Πmod/Πprm need `m` independent
-per-round challenges rather than one `Zq` scalar), `root.AuxTrapdoor` /
-`root.generateAuxParamsWithTrapdoor` (the `p̃`/`q̃`/`lambda`-retaining
-variant of `generateAuxParams` a prover needs — ordinary `generateAuxParams`
-is UNCHANGED, still discarding the trapdoor), the
-`proveWellFormed`/`verifyWellFormed` public-API wiring, AND the two
-irreducible number-theory cores, `aux_proofs.Piprm.prove`/`.verify` and
-`aux_proofs.Pimod.prove`/`.verify` (the full CGGMP21 construction: Blum-QR
-witness search + CRT quadratic-residue classification + 4th roots +
-Paillier-shaped `z_i^N` response for Πmod; `phi(n_tilde)`-modular linear
-response `z_i = a_i + e_i·lambda` for Πprm). `gate.aux_proofs_core_implemented`
-is flipped `true` — the same scaffold-then-implement pattern `bn254`'s
-`pairing.zig` and `df-elect`'s `election.decide` followed to completion.
+**Soundness parameter and parts.** `pi_mod_iterations` and `pi_prm_iterations` are both `128` (`aux_proofs.zig:98,103`): a non-interactive proof is grindable, so `2^-80` would mean 80-bit security. The module provides the `ModProof`/`PrmProof` struct shapes and byte codecs, the Fiat-Shamir wiring (`deriveModChallenge`/`derivePrmChallengeBits`, built on `zkproofs.Transcript.finalizeDigest` — the same domain-separated SHA-256 binding discipline the Phase-2c proofs use, extended with a local deterministic counter-mode expansion since Πmod/Πprm need `m` independent per-round challenges rather than one `Zq` scalar), `root.AuxTrapdoor` / `root.generateAuxParamsWithTrapdoor` (the `p̃`/`q̃`/`lambda`-retaining variant of `generateAuxParams` a prover needs — ordinary `generateAuxParams` discards the trapdoor), the `proveWellFormed`/`verifyWellFormed` API, and the two number-theory cores, `aux_proofs.Piprm.prove`/`.verify` and `aux_proofs.Pimod.prove`/`.verify` (the full CGGMP21 construction: Blum-QR witness search + CRT quadratic-residue classification + 4th roots + Paillier-shaped `z_i^N` response for Πmod; `phi(n_tilde)`-modular linear response `z_i = a_i + e_i·lambda` for Πprm).
 
 **Soundness note (deterministic-MR is defense-in-depth only).** `Pimod.verify`
 has no CSPRNG, so its "n_tilde must be composite" Miller-Rabin step draws
@@ -580,31 +463,9 @@ demonstrate the exact gap these proofs close:
 Plus a tamper suite (flip a byte of `w`/`x_i`/`z_i`(Πmod)/`A_i`/`z_i`(Πprm)
 in an honest proof → `verifyWellFormed` rejects) and a completeness test
 (honest `generateAuxParamsWithTrapdoor` → `proveWellFormed` →
-`verifyWellFormed` accepts) — all now run for real (gate flipped `true`).
+`verifyWellFormed` accepts) — all run unconditionally.
 
-**Still deferred within Phase 2c / at the 2c-2d boundary:**
-
-- Independent cryptographic review of the implemented constructions against
-  GG18 Appendix A (see the verification-level note above) before production
-  use — the self-tests prove self-consistency + the reject contract, not
-  soundness against an unbounded malicious prover.
-- Exactly which signing-round steps invoke plain MtA vs. MtAwc — that
-  wiring belongs to Phase 2d (the signing protocol itself), not this file;
-  `zkproofs.zig`/`mta.zig` only provide the primitives.
-- `generateAuxParams`'s own correctness proof (Πprm/Πmod, `h1 = h2^lambda`)
-  is now DONE. The CHEAP structural validation of received aux tuples (audit
-  F1 — composite `Ñ`, in-range square-subgroup `h1`/`h2`, coprimality) is
-  enforced fail-closed at the prove entry points (`root.AuxParams.validate`);
-  the full zero-knowledge proof-of-correct-generation is IMPLEMENTED
-  (`aux_proofs.zig` — struct/codec/transcript AND the two proof cores real,
-  `gate.aux_proofs_core_implemented` flipped `true` — see the dedicated
-  "Πprm / Πmod" section above). The one residual item is an independent
-  cryptographic review of the Fiat-Shamir instantiation before production
-  MPC-custody use — question **A4** in the "Auditor brief" section (there is
-  no cross-implementation KAT for Πprm/Πmod, same posture as the rest of
-  this module's proofs).
-
-## Πfac and the dealer-free aux half (`fac_proof.zig`, `aux_info.zig`, 2026-10-02)
+## Πfac and the dealer-free aux half (`fac_proof.zig`, `aux_info.zig`)
 
 When parties generate their own Paillier keys, each `N` must be proven a
 Paillier-Blum modulus (Πmod, `aux_proofs.Pimod.provePaillier`) with no small
@@ -629,45 +490,12 @@ factor (Πfac, `fac_proof`, CGGMP21 Fig.28). Without both, a party can choose
   `zkproofs.powSecret` (montint's constant-time `powMont`, chunked to the
   modulus width, since the masks reach ~4900 bits) and fixed-trip-count byte
   arithmetic.
-- **`std.crypto.ff`'s pow is not constant-time in ReleaseFast** (ctgrind,
-  target `fac`, 2026-10-02): LLVM compiles its table select
-  `cmov(ct.eql(k, i))` into `jne`/`je` (objdump), so a secret exponent's 4-bit
-  windows leak. Every secret-exponent pow over a PUBLIC modulus here now goes
-  through `powSecret`: Πfac, Πmod's `y^d`, Πprm's commitments `h2^{a_i}`,
-  `generateAuxParams`' `h2^λ`. The two keygen-time sites that also had the
-  secret factor as the MODULUS moved on 2026-10-03, once `montint.DynModint`
-  took a secret modulus: Πmod's per-round work (Legendre symbols by Euler's
-  criterion, the 4th roots `v^((r+1)/4)` with a constant-time `±s` select,
-  the CRT, `q⁻¹ mod p` by Fermat; ctgrind `pimod`: 0 contexts in the rounds)
-  and Miller-Rabin over secret prime candidates (`isProbablePrime(m, n_bits,
-  …)`: montint ladder, length from the caller, witnesses below `2^(bits−1)`,
-  the round's two verdicts combined; ctgrind `prime`: 4 contexts, all
-  verdicts on public-by-construction bits). Πmod's `d = Ñ⁻¹ mod φ` followed
-  the same day: φ as a limb product of the secret primes and `d` from
-  `montint`'s `inverseOfModulus` (constant-time, even modulus) — `pimod` 540 →
-  4, the rest length verdicts and the published `a_i`/`b_i`. Πprm followed too:
-  `φ` a limb product, `z_i = a_i + e_i·λ mod φ` one masked subtraction, the
-  nonce draw's `a_i < φ` a borrow (ctgrind `piprm`: 3 — two length verdicts and
-  that accept verdict). Miller-Rabin moved into `montint`
-  (`DynModint.isProbablePrime`, shared with `rsa` and `paillier`; `prime` 4 →
-  3). Still variable-time: the prime searches' trial-division sieve, and
-  `generateAuxParams`' big-int `λ` sampling (keygen-time, → Backlog).
-- **Products and moves of secrets are off `std.crypto.ff` too** (2026-10-02):
-  `ff`'s `mul` branches on the Montgomery extra-reduction bit and its
-  `fromBytes`/`toBytes` on the value (ctgrind). The provers' ring-Pedersen
-  commitments (`pedersenCt`: `h1^x·h2^r`, Πfac's `s^p·t^μ` …), the
-  `c_A^α·Enc(γ)` and `r^e·β` products (`mulCt`), every secret moved between
-  moduli (`rebase`, `feFromSecretBytes`: `r_a mod N`, masks, `b`, `β'`, the
-  encryption randomness) and `paillier.addCiphertexts` run on
-  `montint.DynModint`, crossing from and to the `ff` carrier types by a
-  positional limb repack. ctgrind (in-file): `share` 394 → 244, `nonce` 669 → 478 (481 after the Bob unit check, 2026-10-03), `betaprime` 462 → 285 (287),
-  `fac` 17 → 5; the rest of each row is the verifier side's over-taint (one
-  process simulates every signer), `std`'s secp256k1, and the scalar
-  reductions of the draws.
+- **`std.crypto.ff`'s pow is not constant-time in ReleaseFast** (ctgrind): LLVM compiles its table select `cmov(ct.eql(k, i))` into `jne`/`je` (objdump), so a secret exponent's 4-bit windows leak. Every secret-exponent pow over a PUBLIC modulus here therefore goes through `zkproofs.powSecret` (montint's constant-time `powMont`, chunked to the modulus width, since the masks reach ~4900 bits): Πfac, Πmod's `y^d`, Πprm's commitments `h2^{a_i}`, `generateAuxParams`' `h2^λ`. Where the secret factor is itself the MODULUS the work runs on `montint.DynModint` (secret modulus): Πmod's per-round work (Legendre symbols by Euler's criterion, the 4th roots `v^((r+1)/4)` with a constant-time `±s` select, the CRT, `q⁻¹ mod p` by Fermat); Πmod's `d = Ñ⁻¹ mod φ` (φ a limb product of the secret primes, `d` from `montint`'s constant-time `inverseOfModulus`, which takes an even modulus); Πprm's `z_i = a_i + e_i·λ mod φ` (φ a limb product, one masked subtraction, the nonce draw's `a_i < φ` a borrow); and Miller-Rabin over secret prime candidates (`DynModint.isProbablePrime`, shared with `rsa` and `paillier`; `root.isProbablePrimeBE` works on the candidate's bytes, the length from the caller, witnesses below `2^(bits−1)`, the round's two verdicts combined), behind a constant-time trial-division sieve (`root.sieveRejects`: reciprocal multiply, OR-ed zero flags, one verdict). `generateAuxParams`' `Ñ` and `ord = p′q′` are montint limb products and `λ` is drawn below the public `2^(bits−2)` and kept on the borrow of `λ − ord`; that construction is split out as `root.auxParamsWithTrapdoorFromSafePrimes`, which is also an import path for tss-lib's safe primes (the interop test: their primes give their `Ñ` byte for byte). The ctgrind targets `fac`, `pimod`, `piprm`, `prime` and `auxgen` measure these paths; what remains in their rows is length verdicts, published values and accept verdicts (`scripts/checks/ctgrind-expected.tsv`). The prime searches themselves stay variable-time (how long they took reveals nothing about the primes kept).
+- **Products and moves of secrets are off `std.crypto.ff` too.** `ff`'s `mul` branches on the Montgomery extra-reduction bit and its `fromBytes`/`toBytes` on the value (ctgrind). The provers' ring-Pedersen commitments (`pedersenCt`: `h1^x·h2^r`, Πfac's `s^p·t^μ` …), the `c_A^α·Enc(γ)` and `r^e·β` products (`mulCt`), every secret moved between moduli (`rebase`, `feFromSecretBytes`: `r_a mod N`, masks, `b`, `β'`, the encryption randomness) and `paillier.addCiphertexts` run on `montint.DynModint`, crossing from and to the `ff` carrier types by a positional limb repack. What the ctgrind rows `share`, `nonce`, `betaprime` and `fac` still count is the verifier side's over-taint (one process simulates every signer), `std`'s secp256k1, and the scalar reductions of the draws.
 - **`aux_info`**: `LocalAux` (own key + aux tuple + trapdoor), `Announcement`
-  (codec; `verifyAnnouncement` = q⁷ floor, `Γ = N+1`, Πprm+Πmod(Ñ), Πmod(N)),
+  (codec; `verifyAnnouncement` = q⁷ floor, `Γ = N+1`, `N` and `Ñ` both 2048 bits, Πprm+Πmod(Ñ), Πmod(N); `aux_info.zig:195-205`),
   `verifyFactors`, `findDuplicate` (any two of all `N_i`, `Ñ_i` equal — the
-  second line against a copied `Ñ` — the Ñ proofs are bound to the sender's context since 2026-10-02, `proveWellFormedBound`), and
+  second line against a copied `Ñ` — the Ñ proofs are bound to the sender's context, `proveWellFormedBound`), and
   `assembleKeyShare` (DKG share + Feldman commitments + every announcement →
   `KeyShare`, refusing a share that does not match its commitment).
 
@@ -680,23 +508,7 @@ parties announce, cross-verify, prove factors pairwise and assemble shares.
 The protocol run itself (GJKR + these rounds → sign → `std` verify) is
 `dkg`'s `ecdsa_keygen.zig` test.
 
-Audit 2026-10-02: an independent review (Sonnet) found no HIGH; fixed from
-it — `verifyAnnouncement` now requires a 2048-bit `N` (the `q⁷` floor alone
-admits ~1793 bits, where Πfac only bounds factors at ~2^127),
-`PaillierBlumKey.wipe` clears the Paillier secret key too (λ, μ, CRT are
-factorization-equivalent), the prover no longer strips leading zeros off the
-secret factors (`fitRight`), `assembleKeyShare` checks `h1`/`h2` of its own
-slot and `t ≤ n`, `paillierBlumFromPrimes` refuses an empty factor,
-`generatePaillierBlum` takes whole-byte primes only. Mutation (schemata, 24
-mutants over `fac_proof`, Πmod(N), `aux_info`): 21 killed, 3 equivalent — the
-zero-commitment guard (each equation already fails on a zero), σ in the
-transcript (extraction goes through the `s` exponent; σ only moves the `t`
-part) and the Πmod(N) domain constant (the transcript contents differ
-anyway); all three stay as defence in depth. Four tests were added for gaps
-the mutant plan exposed (over-wide integer, `Γ ≠ N+1`, a broken Πprm, `N = Ñ`).
-ctgrind: target `fac` taints `p`, `q` through `fac_proof.prove`.
-
-## Signing — GG20 per-signer state machine (`presign.zig`, 2026-10-02)
+## Signing — GG20 per-signer state machine (`presign.zig`)
 
 **Design.** GG20 (R. Gennaro, S. Goldfeder, ePrint 2020/540) §3.2, Phases
 1–7, one `presign.Party` per signer. A party holds its own `KeyShare` and
@@ -727,21 +539,17 @@ protocol with a loop as the transport (one `Party` per share).
   MtA response; round 3 verifies Π^MtA/Π^MtAwc before decrypting.
 - **`s_i` is released only after `Σ R̄_j = G` and `Σ S_j = X`.** Together they
   make the signature valid (GG20 §4.2: `R^s = (Σ R̄_j)^m·(Σ S_j)^r = g^m·y^r`),
-  and an `s_i` released against a wrong `R` would leak `x_i` (§4.3). The
-  in-process driver this replaced made neither check; with every share in one
-  process that was safe, with separate signers it would not have been.
+  and an `s_i` released against a wrong `R` would leak `x_i` (§4.3). 
 - **One ciphertext `c_i` per signer per session**, broadcast, shared by the
   MtA and MtAwc of every pair and by the Phase 5 proof — which is what binds
-  `k_i` across pairs (§4.2 property 1; the in-process driver drew a fresh
-  `Enc(k_i)` per pair).
+  `k_i` across pairs (§4.2 property 1).
 - **Session binding.** The header (`version, round, sid, from, to`) is checked
   on every message; the Γ commitment and every proof added here
   (`PdlProof`, `PedersenProof`, `StProof`, `SchnorrProof`) absorb
   `sid || sender index`. The GG18 MtA proofs are not changed: they bind the
   ciphertexts, which are fresh per session.
 - **Presignature use.** `signShare` wipes `k_i`, `σ_i` and refuses a second
-  call (`PresignatureUsed`). Two messages under one `R` reveal the key; a copy
-  of the struct is the caller's to prevent (there is no codec, on purpose).
+  call (`PresignatureUsed`). Two messages under one `R` reveal the key; a copy of the struct is the caller's to prevent. Keeping presignatures across a restart goes through the codec and the pool ("Design notes by feature").
 - **Public material is checked at `init`:** every signer has a public-keys
   entry and `Σ λ_j·X_j = X` over the signing set, so inconsistent key material
   fails as `InvalidParameters` instead of an unattributed abort.
@@ -754,10 +562,11 @@ peer key or tuple refused by the prover-side checks (audit F1/F2/F3), and in
 `combine` a share failing `s_j·R == m·R̄_j + r·S_j` (type 8). **Unattributed
 (`culprit == null`):** `r_bar_sum` (type 5) and `s_sum` (type 7) — consistent
 lies every proof accepts (a shifted `δ_j`; a `σ_j` with matching `T_j`/`S_j`);
-naming the party needs the paper's §4.3 opening protocol (publish `k_i`, `γ_i`,
-the MtA shares and encryption randomness; for type 7 the `μ_ij` and a
-Chaum–Pedersen proof), not implemented. And `degenerate` (`δ = 0`, `r = 0`,
-`s = 0`). An abort wipes the party's secrets.
+the §4.3 opening (`Party.openAbort` / `echoOpenings` / `identify`, see "Design
+notes by feature") names the party afterwards. And `degenerate` (`δ = 0`,
+`r = 0`, `s = 0`). An abort wipes the party's secrets, except that types 5 and
+7 keep the session's nonce material for the opening until `identify` or
+`abandon`.
 
 **The new proofs.**
 
@@ -774,110 +583,66 @@ Chaum–Pedersen proof), not implemented. And `degenerate` (`δ = 0`, `r = 0`,
 - `ecproofs.SchnorrProof` (Phase 4): textbook Schnorr. The Γ commitment is
   `SHA-256(domain || sid || i || Γ_i || ρ_i)` with a 32-byte random `ρ_i`.
 
-**Broadcast consistency is checked in the protocol** (independent review F1,
-2026-10-02). GG20 assumes a reliable broadcast channel; without one, a signer
-showing different broadcasts to different peers splits their views, and the
-honest signers then fail each other's proofs and blame each other. Every
-message after round 1 therefore starts with the sender's running hash of all
-broadcasts it processed (own included, signer order); a mismatch aborts with
-`equivocation` (unattributed) before anything from the split round is used.
-Phase-7 shares carry the final hash. Test: `equivocate` (one signer sends a
-different `δ` to one victim) — every honest signer aborts `equivocation`,
-nobody honest is named.
+**Signed messages, and broadcast consistency in the protocol.** Every message ends with its sender's Ed25519 signature over `message_domain || header || SHA-256(body)` (`signedBytes`), under the `message_key` each signer publishes in `PartyPublicKeys` (its seed is `KeyShare.message_seed`; `keygenTrustedDealer` takes the seeds, `aux_info.LocalAux` and the keygen announcement create them, `aux_info.findDuplicate` refuses a key shared by two parties, `root.decodeMessageKey` refuses a non-canonical or small-order one, and signatures are checked with `verifyStrict`, `presign.zig:192`). Only such a message — signed by its claimed sender for this round of this session — is evidence against that sender: a message whose signature fails, or a signed one of another round or session (a replay), is dropped as transport noise, `collect` and `combine` check the signature before anything else so an unsigned header never blames anyone, and a sender whose valid message never arrives is named with `missing_message`. GG20 assumes a reliable broadcast channel; here every message of a round that follows a broadcast round starts with an attestation block: for each signer, the body hash and signature of that signer's previous-round broadcast as the sender received it (a hash echo, no new evidence). A receiver compares every entry with its own view before using anything from the round. A different body under a valid signature is two signed versions of one broadcast: the signer who made them is named (`equivocation`); a different body whose signature fails names the sender of the attestation instead — it misquoted. Without this a signer showing different broadcasts to different peers would make the honest ones fail each other's proofs and blame each other. Phase-7 shares attest the Phase-6 broadcasts and `combine` checks them the same way. Test: the `equivocate` case (one signer sends a different `δ` to one victim) — every honest signer aborts `equivocation`, nobody honest is named; the `noise` case (replays, forged headers, bad signatures, other rounds, sessions and recipients) aborts nothing.
 
 **Session binding.** The id on the wire is `SHA-256(domain || sid || X || t ||
 signers)`: a signer configured with another signing set or key fails at the
 first header instead of later at a proof (review F7).
 
-**Caller's duties** (module doc comment of `presign.zig`): authenticate the
-header's `from` (`peekHeader`), hand in only the current round's messages,
-pick a fresh agreed `sid` per session, and turn silence into a timeout
-before handing the inbox in.
+**Caller's duties** (module doc comment of `presign.zig`): hand in only the current round's messages (`peekHeader().round`), buffering early ones (the signature, not the transport, decides who sent a message), pick a fresh agreed `sid` per session, and turn silence into a timeout before handing the inbox in.
 
 **Const-time posture.** Secret scalars (`k_i`, `γ_i`, `ℓ_i`, `w_i`, `σ_i`,
 `δ_i` before release, every proof nonce) meet only `Scalar` arithmetic,
 std's constant-time `Secp256k1.mul`, `paillier`'s and `montint`'s
 constant-time modexp. Verification uses `mulPublic` over public values only.
-Measured by `ctgrind_harness.zig` (targets `share`, `nonce` — now every
-48-byte secret-scalar draw of every party — and `betaprime`), see
-`scripts/checks/ctgrind-expected.tsv`. On Zig 0.17.0 (2026-10-18) the three
-rows read 506 / 870 / 559 (0.16: 275 / 515 / 317): std's `mulPublic` became
-a generic n-base wNAF (`mulMultiPublic`) with many more variable-time branch
-sites, all under the verifiers (`verifySt`/`verifyPedersen`/`verifySchnorr`)
-and `combine`, over values the single-process harness derives from the
-tainted secrets but the protocol publishes; every other class went down.
-0.17.0's std ff pow still branches on a secret exponent (`cmov` per window
-entry); no production path here passes a secret exponent to it (`powSecret`
-on montint; the ff `pow` with `λ` is test-only).
+Measured by `ctgrind_harness.zig` (targets `share`, `nonce` — every 48-byte secret-scalar draw of every party — and `betaprime`, plus `open7` for Alice's decryption proof in a type-7 opening); the pinned rows are in `scripts/checks/ctgrind-expected.tsv`. Most of what the first three rows still count sits under the verifiers (`verifySt`/`verifyPedersen`/`verifySchnorr`) and `combine`: `std`'s `mulPublic` is a generic n-base wNAF (`mulMultiPublic`) with many variable-time branch sites, run over values the single-process harness derives from the tainted secrets but the protocol publishes. `std`'s ff pow still branches on a secret exponent (`cmov` per window entry); no production path here passes a secret exponent to it (`powSecret` on montint; the ff `pow` with `λ` is test-only).
 
-**Audit 2026-10-02.** Independent review (Sonnet, from the paper text) of
-`presign.zig`, `ecproofs.zig`, `PdlProof` and the driver: no HIGH; one MED —
-an equivocating signer made honest signers blame each other (fixed: the
-echoed broadcast transcript, above) — and LOWs fixed the same day: session
-id bound to key/threshold/signer set, own key material validated, a party's
-own messages ignored, `offset + len` wrap on 32-bit in every length-prefixed
-reader, `s1`/`t1` length caps, trailing bytes refused by the `PublicKeys` /
-`KeyShare` decoders, duplicate public-key entries refused, an outbox leak on
-OOM in the driver. Mutation (schemata, 36 mutants over every check of
-`presign`, `ecproofs` and `PdlProof`, ReleaseSafe): 34 killed, 2 equivalent
-(the abort wipe, duplicated by the error wrapper; the duplicate-signer check,
-duplicated by `Σ λ_j·X_j = X`). The first run left 7 survivors, each closed
-by a new test: the `init` checks (signer count below `t`, `Σ λ_j·X_j = X`,
-`x_i·G = X_i`), low-S normalisation, each ST equation alone, and two
-Fiat-Shamir completeness forgeries (a Pedersen proof for a `T` solved after
-the challenge; a PDL proof for a base solved after the challenge).
+## Design notes by feature
 
-**Audit 2026-10-03** (plan F: signed messages, the §4.3 opening, the presignature pool, the CT
-key setup, `dkg.EcdsaRefresh`). Review: see the Backlog entry (2 HIGH — the type-7 opening
-leaked every key share; a decryption lifted by `N` framed an honest Bob — both fixed with
-F3/F4/F9/F10). Mutation, schemata, ReleaseSafe, two rounds (83 + 111 mutants over
-`presign`, `zkproofs`, `mta`, `aux_proofs`, `aux_info`, `ecproofs`, `root` and `dkg`'s
-`ecdsa_keygen`/`ecdsa_refresh`; round 1 mutants on code rewritten after the review were
-superseded and re-done in round 2). Every real survivor got a test — among them Bob's MtA
-proof with a non-unit `c_B`/`s` (forged with a `P²` factor so that every equation holds), a
-lie in the LAST signer's opening section (decryption +1, a decryption with a leading zero
-dropped, a cut round-2 message, a Bob mask — a skipped check would blame the first-checked
-honest signer), every strict prefix of an opening, a signed broadcast in a p2p round and the
-reverse, the ssid's key-table hash, a duplicate Πfac frame. Left alive, with reasons:
-`verifyStrict`→`verify` (small-order keys refused earlier); two implied presignature
-relations (the per-share equation and `r = R.x`); `centeredModQ` vs plain (proof-bounded
-value); the group-key check in refresh (the receiver checks it); `n < 2` and the ssid's group
-key in the codec/init (fixed by the key table and the relation checks); in `openedRound2` the
-round, trailing-byte and length guards behind the sender's signature (an honest sender never
-signs such a message; a colluding pair only moves blame between two cheaters); a failed `r_k`
-read (later fields misalign, the opener is named anyway); and two redundant pairs in type 5 —
-the nonce check vs `k·R = R̄_i`, the `Γ` check vs the rebuilt `c_γ` — where dropping either one
-names the same signer through the other.
+Behaviour of the pieces added on top of the GG18/GG20 core, grouped by area. Each names the code a reader can check.
 
-**Tests.** `presign.zig`: honest 2-of-3 (signers out of order) and 3-of-3,
-bytes and prehashed; a presignature signs once; 19 deviations by one signer (incl. equivocation)
-(each injected into its outgoing bytes or, for the consistent-liar cases,
-its state), each aborting every honest signer with the expected fault and
-culprit, secrets wiped; `combine` naming a wrong share and refusing missing,
-duplicate and foreign ones; `init` refusing bad signer sets. `signing.zig`:
-the driver end to end, every subset, a signing set larger than `t`, bad
-inputs, the threaded path giving the same signature. `tsslib_interop.zig`:
-see "Anchoring".
+**Proofs and MtA**
 
-## Phase 2a / 2b / 2c / 2d boundary
+- **Session binding of the GG18 proofs.** The range, MtA and MtAwc transcripts absorb the caller's `context` first (session id and prover index, as `PdlProof` and `ecproofs` do), and `presign` passes `sid || index` (`zkproofs.zig:711-716`, `rangeProofChallenge` at `zkproofs.zig:872`).
+- **Units.** Alice's range proof and Bob's MtA/MtAwc proofs refuse a `c_A`/`c_B` or `s` that is not a unit of `Z*_N` (`unitsModN`, `zkproofs.zig:585`; applied at `zkproofs.zig:1391` and, for Bob, `zkproofs.zig:2004`); `v` follows from equation 5. The inversion-free equations presume units, so the check says so.
+- **Centered lift after a verified MtA.** `mta.mtaAliceFinalizeVerified` (`mta.zig:297`) lifts Alice's decryption of `c_B` to its centered representative in `(−N/2, N/2]`, because the proof bounds `|β'|` but not its sign: a negative `β'` neither wraps nor aborts. The semi-honest `mtaAliceFinalize` keeps `[0, N)`, where `β'` is uniform.
+- **Πmod / Πprm details.** Πmod refuses a challenge `y_i` with `gcd(y_i, Ñ) > 1` (`aux_proofs.zig:1402`) and takes the canonical root `x ≤ Ñ − x` (prover `aux_proofs.zig:1288`, verifier `aux_proofs.zig:1414`, so the prover picks it without a branch). The `ModProof`/`PrmProof` codecs are strict: full-width fields, flag bytes 0 or 1, no trailing bytes (`aux_proofs.zig:252,259,317`), so there is one encoding per proof.
+- **`proveFailed`** (`presign.zig:792`) attributes any prover error to the peer. That is right because every non-allocation prover error can only come from the peer's key, tuple or ciphertext: this party's own were validated in round 1, its secrets are canonical scalars and `random` cannot fail. The parameter is the provers' error sets (`ProverError`), not `anyerror`, so a new error variant has to be placed deliberately.
 
-- **Phase 2a (done, this module):** trusted-dealer Shamir+Feldman keygen,
-  each party's Paillier keypair, each party's ring-Pedersen aux params
-  (`generateAuxParams`, real). Output: `KeyShare` per party.
-- **Phase 2b (done, this module — `mta.zig`):** MtA, the semi-honest
-  multiplicative→additive share conversion the parties' `paillier` homomorphic
-  ops exist to support. Output: additive shares `α`/`β` with
-  `α + β ≡ a·b (mod q)`.
-- **Phase 2c (IMPLEMENTED, this module — `zkproofs.zig` + `mta.zig`'s
-  `*Checked` functions):** the GG18 Appendix A zero-knowledge range proofs
-  (A.1/A.2/A.3, verified against the paper) and the fail-closed checked-MtA
-  wiring that upgrade the semi-honest MtA core to malicious security.
-  Structs/transcript/wiring AND the six prove/verify functions are real and
-  tested (self-consistency + reject contract; pending external review — see
-  the section above).
-- **Phase 2d (this module — `presign.zig`, driven by `signing.zig`):** GG20
-  signing, one state machine per signer, Phases 1–7 with every check of the
-  paper and identifiable abort for every GG20 type — see "Signing" above.
+**Keys and the dealer-free aux half**
+
+- **`aux_info.AnnouncementSet`** (`aux_info.zig:293`) records which checks have passed for every peer (`verifyAnnouncement`, the distinct-moduli check, each peer's Πfac made for this party); only its `verified()` produces the `Verified` that `assembleKeyShare` takes (`aux_info.zig:352,361,380`), so a key share cannot be assembled from announcements nobody checked. `Verified`'s seal is the address of a declaration private to `aux_info.zig`, so a hand-written `Verified` is refused (`InvalidParameters`). `assembleKeyShare` also refuses a DKG share that does not match its Feldman commitment (`ShareMismatch`) and checks `h1`/`h2` of its own slot and `t ≤ n`.
+- **Message keys.** Every participant has an Ed25519 message key (`message_key` in `PartyPublicKeys`, `message_seed` in `KeyShare`; `keygenTrustedDealer` takes one 32-byte seed per party, `aux_info.LocalAux` and the keygen announcement create them on the dealer-free path). `findDuplicate` refuses a key shared by two announcements; `aux_info.reusesMaterial` (`aux_info.zig:246`) lets a key refresh refuse a new announcement that reuses an old Paillier `N`, ring-Pedersen `Ñ` or message key.  The `KeyShare`, `PublicKeys` and `Announcement` codecs carry the keys.
+- **Dealer-free keygen** is `dkg.EcdsaKeygen` over `aux_info` + `fac_proof` + `Pimod.provePaillier`, and key refresh is `dkg.EcdsaRefresh`; this module supplies the aux half, the sibling the rounds. The protocol run (GJKR + these rounds, then sign, then `std` verify) is tested in `dkg`'s `ecdsa_keygen.zig`.
+- **Constant-time key setup.** Paillier-Blum key generation, Πmod, Πprm, Πfac and `generateAuxParams` handle the secret factors on `montint` (see "Πfac and the dealer-free aux half").
+
+**Identifiable abort for types 5 and 7 (GG20 §4.3)**
+
+- Each signer keeps the signed round-2 messages it received and its own Bob masks until the presignature is finished (`Party.abandon` wipes what a pending opening kept at once). After a type-5 or type-7 abort every signer calls `Party.openAbort` (its opening, a signed broadcast), `Party.echoOpenings` on everyone's openings and `Party.identify` on everyone's echoes (`presign.zig:1250,1313,1372`).
+- **Type 5** opens `k_i` (with the randomness of `c_i`), `γ_i`, the received round-2 messages and the signer's `β'` masks with their randomness; everyone rebuilds each `c_γ`, recomputes every `δ_j` and names the inconsistent signer.
+- **Type 7** opens `k_i`, the decryptions `μ'` of the received `c_w` with their Paillier randomness (`mta.decryptWithRandomness`, `mta.zig:390`; a decryption must be below `N`, else `m + N` re-encrypts to the same ciphertext and lifts to another `μ`), and a DLEQ proof (`ecproofs.DleqProof`, `ecproofs.zig:395`) that `S_i = σ_i·R` for the `σ_i·G = (Σ_j k_j)·W_i + Σ_b (μ'_ib − μ'_bi)·G` everyone recomputes. Every Alice's decryption is checked before any `σ` is derived from it.
+- **What stays closed.** The signer's own `ν'` masks as Bob (with `k_j` and `μ'_ji = k_j·w_i + ν'` public, `ν'` would give `w_i` away; everyone uses `ν'·G = μ'_ji·G − k_j·W_i`, and `μ'_ji` alone hides `k_j·w_i` behind `ν' < q⁵`), `σ_i` and `w_i`. The `expectNoMaskInOpenings` test rebuilds every `β'` and finds it in no opening.
+- Openings are signed messages and the round-2 messages inside are checked against their senders' signatures, so a lie in an opening names the liar. The echo round (round 9: an empty broadcast whose attestation block carries the openings as received) is checked first by `identify`, so a signer who showed two signed openings is named (`equivocation`) by every honest signer before any opening is judged.
+
+**Presignature codec and pool**
+
+- `Presignature.toBytesAlloc` / `fromBytesAlloc` (`presign.zig:1780,1838`) encode SECRET bytes. Encoding marks the presignature used and wipes `k` and `σ` (the bytes are the only copy left, so the in-memory one can no longer sign); a used presignature is refused (`PresignatureUsed`). Decoding checks every field and the relations a finished session leaves — `r = R.x`, `Σ R̄_j = G`, `Σ S_j = X`, `k·R = R̄_i`, `σ·R = S_i` — and that the seed is the signer's key, and wipes its stack copies of `k`, `σ`, the seed and the derived secret key (`presign.zig:1897-1906`). It is not authenticated encryption at rest: whoever can write a record can write a coherent one.
+- `PresignatureStore` (`presign.zig:1981`) is the contract: `take` removes the record durably BEFORE returning it, so a record is handed out at most once, ever. `PresignaturePool` (`presign.zig:1997`) wraps a store: `put` encodes, files and wipes the original, `take` restores once. `MemoryPresignatureStore` is the in-process store (single thread only: two concurrent `take`s of one id could both get the record). A durable store with the contract (an fsync'd delete before the read returns) is the caller's.
+
+**BIP-32 child shares**
+
+- `childTweak(group_public_key, chain_code, index)` (`root.zig:2051`) is BIP-32's `CKDpub` HMAC step: `IL || IR = HMAC-SHA512(chain_code, X || ser32(index))`. `deriveChild(&share, allocator, tweak)` (`root.zig:2084`) adds the public `IL` to the Shamir share and `IL·G` to the group key, the party's verifying share and every `PublicKeys` entry. Shamir shares are evaluations of `f` with `f(0) = x` and the Lagrange coefficients of any signing set sum to 1, so adding `δ` to every share moves the secret to `x + δ`: the shares sign under exactly the key a plain BIP-32 wallet derives from the group public key, with no interaction (every party computes the same `δ` from public data). Presignatures made under the parent key are bound to its shares and are not reusable under the child.
+- Behaviour like the references and BIP-32 itself: non-hardened only (`error.HardenedIndex` for `index >= 2^31`, `root.zig:2052`; multi-party-sig and cggmp24 refuse it too), `IL >= n` or a child key (or a child share) at the identity is `error.InvalidChildKey`, not "try the next index" (the same verdict as the sibling `bip32` module's `ckdPub`; BIP-32's ~2^-127 case). An `IL = 0` tweak is also refused (the sibling does the same; BIP-32 allows it, probability 2^-256).
+- The HMAC step is repeated here (about ten lines, std `HmacSha512`) instead of calling `bip32.ckdPub`, because `threshold_ecdsa` has no `bip32` dependency and `ckdPub` returns only the child key, not `IL`; a shared helper would need `bip32` to export it.
+- Anchors: the BIP-32 test vectors 1 and 2 (every non-hardened step: parent key + `IL·G` is the BIP's child key and `IR` its chain code; `src/root.zig`), and a (2,3) group whose child shares sign under the derived key, with Σλx' = x + δ, X' = X + δG, a second level, and refusal of a zero or share-zeroing tweak (`src/signing.zig`).
+
+## Layers
+
+- **Keygen and aux params** (`root.zig`): trusted-dealer Shamir + Feldman keygen (`keygenTrustedDealer`), each party's Paillier keypair, each party's ring-Pedersen aux params (`generateAuxParams`). Output: one `KeyShare` per party.
+- **MtA** (`mta.zig`): the multiplicative→additive share conversion the parties' `paillier` homomorphic ops support; `α + β ≡ a·b (mod q)`. Semi-honest functions and the `*Checked` family.
+- **Range proofs** (`zkproofs.zig`, with `mta.zig`'s `*Checked` functions): the GG18 Appendix A proofs (A.1/A.2/A.3) and the fail-closed checked-MtA wiring that upgrade the semi-honest MtA to malicious security; `PdlProof` for GG20 Phase 5.
+- **Aux proofs** (`aux_proofs.zig`, `fac_proof.zig`, `aux_info.zig`): Πprm/Πmod/Πfac and the announcement verification of the dealer-free aux half.
+- **Signing** (`presign.zig`, driven in-process by `signing.zig`; `ecproofs.zig` for the curve-only proofs): GG20 signing, one state machine per signer, Phases 1–7 with every check of the paper and identifiable abort for every GG20 fault type.
 
 ## Auditor brief — what actually needs a human cryptographer
 
@@ -887,7 +652,7 @@ a property over a named construction, plus why the code cannot settle it.
 Everything NOT listed here is closed, wired fail-closed, and fault-tested —
 in particular **audit F1 (received-aux validation), F2 (the `N > q⁷`
 key-size floor) and F3 (transcript binding of `Γ` + the standard-generator
-precondition) are code work and are DONE**; they are not open audit items
+precondition) are code work, closed in code and fault-tested**; they are not open audit items
 and do not need re-adjudication. Do not re-open them; do check the
 questions below, which no amount of testing can answer.
 
@@ -908,7 +673,7 @@ honest transcripts plus a finite set of hand-crafted cheats. A passing
 reject test shows a specific cheat is caught, never that no cheat exists.
 
 **A2 — Completeness of the Fiat-Shamir transcript (post-F3).** The
-challenge now absorbs, in order: a per-proof-kind domain tag, `(Ñ, h1, h2)`,
+challenge absorbs, in order: a per-proof-kind domain tag, `(Ñ, h1, h2)`,
 `(N, Γ)`, `c_A` (and `c_B` for the Bob proofs), every first-message
 commitment (`z, u, w` / `z, z1, t, v, w`), and for MtAwc the public point
 `B` and the Schnorr commitment `u1`. *Property to check:* that this is the
@@ -935,12 +700,10 @@ this is a statement about the amplification of a per-instance slack across
 `O(t²)` instances and many sessions — the exact shape of the Alpha-Rays
 failure class — and the module tests one instance at a time.
 
-**A4 — Fiat-Shamir instantiation of Πprm/Πmod (`aux_proofs.zig`).**
-CGGMP21 Fig.16/17 need `m = 80` independent per-round challenges. This
+**A4 — Fiat-Shamir instantiation of Πprm/Πmod (`aux_proofs.zig`).** CGGMP21 Fig.16/17 need `m = 128` independent per-round challenges. This
 module derives them by expanding ONE `zkproofs.Transcript` SHA-256 digest
 in a local deterministic counter mode. *Property to check:* that this
-expansion is a sound instantiation in the random-oracle model (the 80
-challenges must be independent, and the prover must not be able to
+expansion is a sound instantiation in the random-oracle model (the 128 challenges must be independent, and the prover must not be able to
 influence any of them after committing). Related: `Pimod.verify` draws its
 Miller-Rabin witnesses deterministically from `SHA256(n_tilde)` — the code
 argues this is defense-in-depth only, because soundness rests on the
@@ -948,130 +711,43 @@ per-round `z_i^N ≡ y_i` and `x_i^4 ≡ (−1)^{a_i} w^{b_i} y_i` equations;
 confirm that argument. *Why the code cannot settle it:* both are ROM
 arguments about an adversary's ability to bias a hash output.
 
-**A5 — Audit F5: is `paillier.decrypt`'s L-function division a real leak
-here? (Fix lives in `paillier`, judgment lives here.)** `paillier.decrypt`
-computes `L(x) = (x−1)/n` with `std.math.big.int`'s variable-time
-`divFloor`. The standing note that this is harmless because the decrypted
-plaintext is "masked by Bob's fresh uniform `β'` mod N, hence
-information-theoretically independent of the nonce `k`" is **NOT a sound
-justification as this module is actually wired, and should not be accepted
-at face value**: `mta.mtaBobResponseChecked` samples `β' ← Zq`, not `Z_N`,
-so the plaintext `a·b + β'` is `k_i·γ_j + β'` — a value up to `~q²` masked
-by a `~q` blind. It is not uniform over `Z_N` and it is not independent of
-`k_i`. *Property to check:* whether `divFloor`'s running time on
-`(x−1)/n` — where `x = c^λ mod n²` is essentially full-width and the
-quotient `L(x) = m·µ⁻¹ mod n` is a bijective image of the plaintext —
-actually varies with anything a network adversary can correlate against
-`k_i`, and if so, whether repeating it across the `O(t²)` MtA instances per
-signature and across sessions accumulates into a usable nonce leak. *Why
-the code cannot settle it:* this is a quantitative side-channel question
-(does limb-granularity timing carry usable information about a bijective
-function of a partially-masked secret?). **Update 2026-09-10 (audit F5,
-doc fix):** a dudect-class harness (`scripts/checks/ctgrind.sh`, memcheck-based)
-now exists in this toolchain and this module HAS two registered targets
-(`share`, `nonce` in `src/ctgrind_harness.zig` /
-`scripts/checks/ctgrind-expected.tsv`) — but those target the EC-scalar-mul call
-sites in `signing.zig` (`provePoK`'s nonce, `signWithShares`'s `gamma_i`),
-not this `paillier.decrypt` L-function division. The quantitative question
-above is therefore still open — the earlier audit pass (F5) ran an ad-hoc
-probe (not wired into this toolchain's harness registry) over the real
-`mtaAliceInitChecked → mtaBobResponseChecked → mtaAliceFinalize` chain and
-found 132 `Conditional jump or move depends on uninitialised value(s)`
-contexts, 69 of them on `paillier`'s `divFloor`/`writeTwosComplement`, with
-0 in the untainted negative control — a tainted signal is measurably
-present, but whether it is exploitable at limb granularity is not
-answered. Outcome should be either a constant-time exact division in
-`paillier`, a `paillier`-scoped ctgrind target added to this toolchain's
-registry, or a *corrected* written rationale replacing the `β' mod N` one.
-
-**Update 2026-09-10 (audit F5, third pass — the "reaches the division" half
-is now answered; the exploitability half is not).** `paillier` already HAD
-the `paillier`-scoped ctgrind target this note asked for — it was added
-independently of this module (`src/ctgrind_harness.zig` targets `crt`/
-`noncrt`, pinned as `scripts/checks/ctgrind-expected.tsv` rows `paillier/crt`,
-`paillier/noncrt`) — this section simply had not been re-checked against
-it. Ran it ad hoc (`zig build-exe -fvalgrind` over
-`modules/paillier/src/ctgrind_harness.zig` + manual `valgrind
---tool=memcheck`, the same technique this session used for `bn254`'s
-`Fr.toBytes` fix, NOT `scripts/checks/ctgrind.sh`), tainting `lambda`/`mu`/the CRT
-block (`crt` target) and `lambda`/`mu` alone (`noncrt` target) — i.e. the
-secret key, which the L-function's input `x = c^λ mod n²` is a function
-of. **Result: `crt` 333 contexts / 92089 errors tainted vs 0/0 untainted;
-`noncrt` 143/3851 vs 0/0**, with `math.big.int.Managed.divFloor` called
-from `paillier.decrypt` (the exact disputed line) a first-class contributor
-in both, confirmed by reading the raw memcheck stack traces, not inferred.
-So: **the taint from the secret key does reach the L-function division** —
-this module's own pinned gate already exercises and would catch a
-regression in exactly the disputed code path, closing the "is there a
-harness that reaches this line" half of this note's own ask without a
-third target added here. Also found and fixed while checking this:
-`paillier.decrypt`'s own doc comment carried the *wrong* justification for
-why the leak was "accepted" — it named `samplePaillierRandomness`
-(`Z_N`-uniform ciphertext randomness) as the source of MtA's `β'`, when
-`β'` is actually `randomScalar` (`Zq`-uniform, matching the `~q²`-masked-
-by-`~q` accounting three paragraphs above in this very section — the
-`paillier` comment and this section disagreed with each other). Fixed
-there, not here, since the comment lives in `paillier` (commit `e98cdb2a`).
-**What remains open, and is explicitly NOT answered by this measurement:**
-whether `divFloor`'s limb-granularity timing on the `~q²`-masked plaintext
-is *exploitable* against `k_i` in practice, accumulated across `O(t²)` MtA
-instances per signature and across sessions — a genuine side-channel/
-statistical question needing a cryptographer's analysis (dudect-style
-leakage estimation, or a proof that limb-count variance is bounded
-independent of the masked value), not another ctgrind context count. Track
-this the same way as this module's own F4(b)/(c): needs a specialist, not
-another fixer pass.
-
-**Update 2026-09-16 (audit F5, closed) — the question above was the wrong
-one.** The masked plaintext did not need a timing channel to leak: with
-`β' ∈ Zq`, Alice read `b` straight off `α'/a` (4/4 and 3/4 trials, see "The
-blind `β'` must dominate `a·b`"). With `β'` now drawn from `Z_N` / `Z_{q⁵}`,
-the plaintext is statistically independent of `k_i` and of `b` (distance
-`q²/N` resp. `q⁻³`), so no function of it — `divFloor`'s running time
-included — carries information about either. What `divFloor` still depends
-on is `λ`: `c^λ mod N² = 1 + (m·λ mod N)·N`, so `L(x) = m·λ mod N`, a
-function of Alice's long-term Paillier secret. That is `paillier`'s own
-constant-time question, measured by its `crt`/`noncrt` ctgrind rows, not a
-threshold-ECDSA one.
+**A5 — `paillier.decrypt`'s L-function division (closed here; the judgment lives in `paillier`).** `paillier.decrypt` computes `L(x) = (x−1)/n` with `std.math.big.int`'s variable-time `divFloor`. The masked plaintext Alice decrypts, `a·b + β'`, is statistically independent of `k_i` and of `b` (`β' ← Z_N` resp. `Z_{q⁵}`, distance `q²/N` resp. `q⁻³`; see "The blind `β'` must dominate `a·b`"), so no function of it — `divFloor`'s running time included — carries information about either. What `divFloor` still depends on is `λ`: `c^λ mod N² = 1 + (m·λ mod N)·N`, so `L(x) = m·λ mod N`, a function of Alice's long-term Paillier secret. That is `paillier`'s own constant-time question, measured by its `crt`/`noncrt` ctgrind rows, not a threshold-ECDSA one.
 
 **A6 — Protocol composition: Πprm/Πmod is not auto-exchanged online.**
 `aux_proofs.proveWellFormed`/`verifyWellFormed` close audit F1's residuosity
-gap, but they are an out-of-band SETUP artifact — the online
-`signing.runCheckedMtA` path enforces only the always-on structural floor
-`AuxParams.validate`. *Property to check:* whether a deployment that
-exchanges Πprm/Πmod once at setup, and thereafter trusts the structural
-floor per session, is sound — or whether the proofs must be re-verified
-against the tuple used in each signing session. *Why the code cannot settle
-it:* it is a question about the deployment's protocol composition, not about
-either function in isolation.
+gap, but they are a SETUP artifact: `aux_info.verifyAnnouncement` runs them
+(bound to the sender's context) when keys are announced, and the online
+`presign.Party` path enforces only the always-on structural floor
+`AuxParams.validate`, the `N > q⁷` floor and `Γ = N+1` on each peer's tuple
+(through the prover entry points; a refusal is `invalid_peer_keys`). *Property
+to check:* whether a deployment that exchanges Πprm/Πmod once at setup, and
+thereafter trusts the structural floor per session, is sound — or whether the
+proofs must be re-verified against the tuple used in each signing session.
+*Why the code cannot settle it:* it is a question about the deployment's
+protocol composition, not about either function in isolation.
 
 **A6 addendum — the structural floor's known remaining gap, and why it stays
-a floor (2026-09-10 fix, user decision).** `AuxParams.validate` rejects an
-`h1`/`h2` of order dividing 2 (`h² ≡ 1 mod Ñ`): `h2 = Ñ-1` used to pass every
-prior check whenever `Ñ ≡ 1 (mod 4)` (the case `generateSafePrime`'s real
-safe primes, both `≡ 3 mod 4`, always land on — `Jacobi(-1|Ñ) =
-Jacobi(-1|p̃)·Jacobi(-1|q̃) = (-1)(-1) = +1`), and an order-2 generator
-collapses the Pedersen commitment's hiding: `z = h1^m · h2^rho mod Ñ` gives
-`z² = h1^(2m)` independent of the blinding `rho`, so `z²` becomes a
-deterministic function of the witness `m` — measured via
-`zkproofs.proveAliceRange`: `z²` came back byte-identical across three
-independently-sampled `rho` for the same witness, byte-different for a
-different witness. This is the **maximum** a structural check can close
-without the tuple's factorization: a value that is a quadratic non-residue
-mod BOTH prime factors of `Ñ` also has Jacobi symbol `+1` and order dividing
-2 is exactly that residual case restricted to `{Ñ-1}` and its cousins — the
-new check closes the residual case the Jacobi check alone missed, but the
-general non-residue-mod-both-factors gap A6 already describes is untouched.
-**This is deliberately a floor, not the fix** — closing the general gap
-needs Πprm (`h2 ∉ ⟨h1⟩` detection) as A6 describes, which the online path
-still does not require. Turning that on is a separate, deferred decision
-(protocol change: adds a setup-phase proof exchange), gated on the module
-acquiring a real consumer that needs it — see `root.AuxParams.validate`'s
-doc comment and the regression test `"AuxParams.validate rejects an order-2
-generator (audit F1 HIGH, 2026-09-10 fix)"` in `root.zig`.
+a floor (owner decision).** `AuxParams.validate` rejects an `h1`/`h2` of order
+dividing 2 (`h² ≡ 1 mod Ñ`): `h2 = Ñ-1` would otherwise pass every other check
+whenever `Ñ ≡ 1 (mod 4)` (the case `generateSafePrime`'s real safe primes, both
+`≡ 3 mod 4`, always land on — `Jacobi(-1|Ñ) = Jacobi(-1|p̃)·Jacobi(-1|q̃) =
+(-1)(-1) = +1`), and an order-2 generator collapses the Pedersen commitment's
+hiding: `z = h1^m · h2^rho mod Ñ` gives `z² = h1^(2m)` independent of the
+blinding `rho`, so `z²` is a deterministic function of the witness `m` —
+measured via `zkproofs.proveAliceRange`: `z²` came back byte-identical across
+three independently-sampled `rho` for the same witness, byte-different for a
+different witness. This is the **maximum** a structural check can close without
+the tuple's factorization: a value that is a quadratic non-residue mod BOTH
+prime factors of `Ñ` also has Jacobi symbol `+1`, and order dividing 2 is
+exactly that residual case restricted to `{Ñ-1}` and its cousins — the check
+closes that case, but the general non-residue-mod-both-factors gap A6 describes
+is untouched. **This is deliberately a floor, not the fix**: closing the
+general gap needs Πprm (`h2 ∉ ⟨h1⟩` detection) on the online path (Backlog).
+See `root.AuxParams.validate`'s doc comment and the regression test
+`"AuxParams.validate rejects an order-2 generator (audit F1 HIGH, 2026-09-10
+fix)"` in `root.zig`.
 
-**A7 — Cross-pair consistency (was the "abort-only v1" cut, closed
-2026-10-02 by construction).** Each signer now sends ONE `c_i = Enc(k_i)` to
+**A7 — Cross-pair consistency (closed by construction).** Each signer sends ONE `c_i = Enc(k_i)` to
 everyone (broadcast), the MtA and MtAwc of every pair use it, the Phase 5
 `PdlProof` ties `R̄_i` to it, and `Σ R̄_j = G` plus `Σ S_j = X` gate the
 release of `s_i` (GG20 §4.2 properties 1–2 by construction, 3–5 by the sums).
@@ -1080,7 +756,7 @@ both sums cannot make an honest signer's `s_i` reveal anything beyond what a
 valid signature reveals — i.e. that GG20's §3.2 argument carries over to this
 instantiation (Fiat-Shamir over SHA-256, the PDL construction of A8, the
 echoed broadcast transcript in place of a reliable broadcast channel). *Why the code cannot settle it:*
-the tests cover 19 specific deviations, not all of them.
+the tests cover specific deviations, not all of them.
 
 **A8 — `zkproofs.PdlProof` (GG20 Phase 5).** The paper names the statement
 ("consistency between `R̄_i` and `E_i(k_i)`") and cites MacKenzie–Reiter,
@@ -1101,153 +777,36 @@ it breaks when combined with additive key derivation — this module has no
 key derivation). *Why the code cannot settle it:* a property of the
 signature scheme's security game, not of any function.
 
-## Signing cost and the parallel pair phase (audit F6, 2026-09-16)
+## Parallel signing (`SignOptions.threads`)
 
-⚠ The table below was measured on the pre-2026-10-02 driver (one function
-computing every party's values). The state machine adds a `PdlProof` per
-ordered pair and the Phase 3/4/6 curve proofs, drops the duplicate per-pair
-`Enc(k_i)` + range proof, and parallelises per party (`SignOptions.threads`)
-instead of per pair. Not re-measured.
+GG20's "one-round" online signing is one round of messages, not one unit of work: presigning runs an MtA and an MtAwc for each of the `t(t−1)` ordered pairs, each with 2048-bit Paillier and ring-Pedersen proofs. `signWithSharesOptions(…, .{ .threads = n })` (`signing.zig:76-85,114`) is the opt-in parallel path; the default (`threads = null`) runs every party's round on the caller's thread. With `n`, each round's per-party work runs on `min(n, t)` threads, the caller's included (at most `max_threads = 64`, `signing.zig:102`); a thread that cannot be spawned has its parties run on the caller's thread. Each party draws from its own ChaCha CSPRNG seeded from `random` up front, so the signature does not depend on `n`, and worker threads allocate from per-party arenas over `std.heap.page_allocator`, so the caller's `allocator` is touched only from the caller's thread. Test: the signature for `threads` = null, 1 and 4 from one PRNG state is identical (`signing.zig:459-477`). Performance is not measured; the card's `**Performance:**` line is the authority.
 
-GG20's "one-round" online signing is one round of messages, not one unit of
-work: Phase 3 runs an MtA and an MtAwc for each of the `t(t−1)` ordered
-pairs, each with 2048-bit Paillier and ring-Pedersen proofs. Measured
-(ReleaseFast, i7-7920HQ 4C/8T, 5 interleaved reps each, shared machine at
-load 1.3–4.7; min / median / max, ms):
+## What is deliberately not done
 
-| `t` | sequential (`signWithShares`) | 4 threads | 8 threads |
-|---|---|---|---|
-| 2 | 1094 / 1109 / 1122 | 544 / 587 / 602 | 541 / 570 / 578 |
-| 3 | 3186 / 3275 / 3359 | 1136 / 1347 / 1445 | 821 / 865 / 873 |
-| 4 | 6607 / 6683 / 7479 | 1642 / 1774 / 2260 | 1507 / 1612 / 3171 |
-
-`signWithSharesOptions(…, .{ .pair_threads = n })` is the opt-in parallel
-path; the default stays sequential. Its sharing discipline is the design, not
-a detail: the pair computation only READS `k`/`γ`/`w`; the accumulators
-`δ_i`/`σ_i` — which every party touches from `2(t−1)` pairs, and which a naive
-thread-per-pair loop would race on — are summed on the caller's thread after
-all workers join. Each pair has its own slot in a preallocated job array, its
-own ChaCha CSPRNG seeded from `random` before any worker starts, and each
-thread its own fixed scratch allocator, so the caller's `allocator` is never
-touched from a worker. Results are independent of the thread count (test:
-per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
-`signWithShares` from the same PRNG state).
+- **Hardened BIP-32 derivation.** It needs the private key; `childTweak` returns `error.HardenedIndex` for `index >= 2^31`, as multi-party-sig and cggmp24 do. Also not provided: SLIP-10 or other derivation schemes, multi-level path helpers (call `childTweak` per level with the previous chain code and `deriveChild`'s output key), additive (non-Shamir) share layouts.
+- **A "next index" after an invalid BIP-32 child.** `IL >= n` or an identity child key or share is `error.InvalidChildKey`, the verdict of the sibling `bip32` module; the case has probability about 2^-127.
+- **A claimed interop wire format.** The codecs are this module's own internal serialization; the proofs use a SHA-256 Fiat-Shamir transcript that is not byte-compatible with tss-lib's (SHA512/256 over Go big.Int bytes) or anyone else's, so a mixed signing session is impossible and no cross-implementation KAT for the proofs can exist. Key material and final signatures do interoperate with tss-lib (see Anchoring).
+- **The `N > q⁷` floor on generic codec paths.** The `AuxParams`/`PublicKeys`/`KeyShare`/`paillier` `fromBytes*` codecs parse generic wire values, including the small toy moduli the serialization tests round-trip, and deliberately do not floor. The floor is a checked-path precondition applied where the parameters are consumed by a range proof (`root.paillierNMeetsFloor` / `nTildeMeetsFloor`, fail-closed at prove and verify entry points); `paillier` stays a general-purpose module and does not impose this threshold-ECDSA-specific floor.
+- **Retaining `lambda` in `generateAuxParams`.** The tuple's owner is a verifier of its own tuple, not a prover under its `N_tilde`; a party that needs to prove it well-formed uses `generateAuxParamsWithTrapdoor`.
+- **Opening `σ_i`, `w_i` or the Bob masks `ν'` in the §4.3 opening.** They stay closed; the opening proves what it must by DLEQ and by derived points (see "Design notes by feature").
+- **A durable presignature store, a transport, a reliable-broadcast channel, timeouts.** The module defines the `PresignatureStore` contract and the signed, attested messages; delivery, timeouts and a store that deletes durably before reading are the caller's (see `presign.zig`'s module doc comment).
 
 ## Backlog / deferred
 
-- ~~**Relation audit 2026-10-03 — LOW items** and **review 2026-10-03 F3–F8**~~ — closed
-  2026-10-03: (1) range/MtA/MtAwc transcripts absorb the caller's context (session id, prover
-  index; domains `v3`), `presign` passes `sid || index` as for PDL; (2) Bob's MtA proofs require
-  `c_B`, `s` units (`v` follows); (3) after a verified MtA, Alice lifts `Dec(c_B)` to its centered
-  representative (`mta.mtaAliceFinalizeVerified`), so a negative `β'` neither wraps nor aborts —
-  nothing to read (the semi-honest `mtaAliceFinalize` keeps `[0, N)`, its `β'` is uniform); F3
-  Πmod refuses `gcd(y_i, Ñ) > 1`; F4 strict `ModProof`/`PrmProof` codecs (full-width fields, flag
-  bytes 0/1, no trailing bytes) and the canonical root `x ≤ Ñ − x` (prover picks it without a
-  branch); F5 `aux_info.AnnouncementSet` → `Verified` is what `assembleKeyShare` takes; F6
-  `verifyAnnouncement` requires a 2048-bit `Ñ`; F7 128 rounds; F8 `dkg`'s keygen context carries a
-  form byte (raw vs hashed session id) and the unbound `Piprm.verify`/`Pimod.verify` say "never in
-  keygen".
+- **Independent cryptographic review** of the implemented constructions (GG18 Appendix A proofs, the Fiat-Shamir instantiations, `PdlProof`, the presigning composition) before production use: the questions A1–A9 are itemized in "Auditor brief". Signing inherits it, being built on `zkproofs.zig`'s checked MtA/MtAwc. The tests show self-consistency and the reject contract, not soundness against an unbounded malicious prover.
+- **Redistribution to a new committee.** `dkg`'s reshare already takes `n'`, `t'`; a `threshold_ecdsa` wrapper needs the NEW committee's aux rounds (announcements, Πfac) alongside the old committee's dealing, and new parties that hold no `KeyShare` yet. Effort: medium.
+- **Πprm/Πmod on the online path** (Auditor brief A6): re-verifying the setup proofs against the tuple used in each signing session would close the general non-residue-mod-both-factors gap the structural floor cannot. A protocol change (a setup-phase proof exchange); deferred until a consumer needs it.
 
-- Phase 2c: independent cryptographic review of `zkproofs.zig`'s implemented
-  constructions against GG18 Appendix A before production use — see the
-  **"Auditor brief"** section above for the itemized questions (A1–A9),
-  and the dedicated Phase 2c section for the verification-level breakdown.
-  Phase 2d inherits this same residual audit debt, since `signing.zig` is
-  built entirely on `zkproofs.zig`'s checked MtA/MtAwc.
-- ~~**Identifiable abort, types 5 and 7**~~ — ✅ 2026-10-03: `Party.openAbort`/`echoOpenings`/
-  `identify` (GG20 §4.3; the echo round since 2026-10-04, review F5). Each signer keeps the signed round-2 messages it received and its own Bob
-  masks until the presignature is finished. Type 5 opens `k_i` (with `c_i`'s randomness),
-  `γ_i`, the received round-2 messages and its `β'` masks with randomness; everyone rebuilds
-  each `c_γ`, recomputes every `δ_j` and names the inconsistent signer. Type 7 opens `k_i`,
-  the decryptions `μ'` of the received `c_w` with their Paillier randomness
-  (`mta.decryptWithRandomness`; a decryption must be below `N`, else `m + N` re-encrypts to
-  the same ciphertext and lifts to another `μ`), and a DLEQ proof (`ecproofs.DleqProof`)
-  that `S_i = σ_i·R` for the `σ_i·G = (Σ_j k_j)·W_i + Σ_b (μ'_ib − μ'_bi)·G` everyone
-  recomputes. The signer's own `ν'` masks as Bob stay closed: with `k_j` and
-  `μ'_ji = k_j·w_i + ν'` public, `ν'` would give `w_i` away (review 2026-10-03 F1 — the
-  first, unreleased version opened them); everyone uses `ν'·G = μ'_ji·G − k_j·W_i`, and
-  `μ'_ji` alone hides `k_j·w_i` behind `ν' < q⁵`. `σ_i` and `w_i` stay closed. Openings are
-  signed messages, and the round-2 messages inside are checked against their senders'
-  signatures, so a lie in an opening names the liar. Every Alice's decryption is checked
-  before any `σ` is derived from it (F2).
-- `generateAuxParams` aux-param-correctness ZK proof (Πprm/Πmod): a
-  trapdoor-retaining variant, `root.generateAuxParamsWithTrapdoor`, now
-  exists (ordinary `generateAuxParams` is unchanged — still discards
-  `lambda`, per its own doc comment's retention decision). Distinct from
-  `zkproofs.zig`'s MtA range proofs — this one is about proving the AUX
-  PARAMS themselves were generated correctly, not about proving a Paillier
-  plaintext's range. **Closed (audit F1): `root.AuxParams
-  .validate` enforces the cheap structural preconditions (composite `Ñ`,
-  `1 < h1,h2 < Ñ`, coprimality, Jacobi `(h/Ñ)=+1`) fail-closed on every
-  received tuple, and the full zero-knowledge `Πprm`/`Πmod` fix — the part
-  the Jacobi check is NECESSARY-but-not-SUFFICIENT for — is now IMPLEMENTED
-  in `aux_proofs.zig` (CGGMP21 Fig.16/17): struct/codec/Fiat-Shamir-transcript
-  wiring AND the two proof cores are real and KAT-tested (including the
-  crafted-parameter scenarios — a 3-prime `Ñ` and an `h2 ∉ ⟨h1⟩` pair — that
-  both pass `validate` yet are REJECTED by `verifyWellFormed`),
-  `gate.aux_proofs_core_implemented` flipped `true` — see the dedicated
-  "Πprm / Πmod" section above. The one residual item is an independent
-  cryptographic review of the Fiat-Shamir instantiation before production
-  MPC-custody use (question **A4** in the "Auditor brief" section).**
-- Full Pedersen-style DKG (no single dealer) — a distinct module, now `dkg` (GJKR; wired in as
-  `dkg.EcdsaKeygen`, see the dealer-free keygen item below),
-  not a `splitSecretKey` signature change.
-- Minimum-key-size floor: NOW ENFORCED where it matters for security — every
-  RECEIVED Paillier `N` and aux `Ñ` on the checked-MtA / zkproofs path must
-  clear `N > q⁷ ≈ 2^1792` (`root.paillierNMeetsFloor` / `nTildeMeetsFloor`),
-  fail-closed at both prove and verify entry points (audit F2). The generic
-  `AuxParams`/`PublicKeys`/`KeyShare`/`paillier` `fromBytes*` CODEC paths
-  deliberately do NOT floor (they parse generic wire values, including the
-  small toy moduli the serialization tests round-trip); the floor is a
-  checked-path security precondition, applied where the params are actually
-  consumed by a range proof, not a byte-codec concern. `paillier`'s own
-  "minimum-key-size floor on `fromBytes`" backlog item is unaffected —
-  `paillier` stays a general-purpose module and does not impose this
-  threshold-ECDSA-specific `q⁷` floor.
+## Verification
 
-- ~~Per-participant signing state machine~~ — **done 2026-10-02** (`presign.zig`). ~~Pre-signing / 1-round online signing~~ — **done 2026-10-02** (GG20 §3, not CGGMP21). ~~Identifiable abort~~ — **done 2026-10-02** except types 5/7 (item above).
-- ~~**Dealer-free keygen wired in**~~ — done 2026-10-02: `dkg.EcdsaKeygen` over `aux_info` + `fac_proof` + `Pimod.provePaillier`. Original note (survey 2026-09-30): the trusted dealer sees `x`. Sibling `dkg` (GJKR) exists but is a lockstep simulation and does not exchange Paillier / aux proofs; finishing both together is the real fix. It must come with **Πmod + Πfac for every party's Paillier `N`** (CGGMP21 Fig. 16/28): once parties generate their own Paillier keys, an unproven `N` with small factors lets its owner extract an honest Bob's `w_j` through the MtA responses — the BitForge class (Fireblocks, 2023). Today the dealer generates every Paillier key, so the precondition does not arise. Effort: large. Fits §2.
-- ~~**Constant-time Πmod prover and prime search**~~ (2026-10-02): ✅ 2026-10-03 — rounds and Miller-Rabin on `montint.DynModint` modulo the secret factor, then `d = Ñ⁻¹ mod φ` through `montint`'s constant-time `inverseOfModulus` (ctgrind `pimod` 540 → 4, `prime` 4). ~~Left: the prime search's trial-division sieve (`bytesMod`).~~ ✅ 2026-10-03: `sieveRejects` (reciprocal multiply, OR-ed zero flags, one verdict) and Miller-Rabin straight from bytes (`isProbablePrimeBE`, no ff parse); ctgrind `prime` now measures that path (in-file 3, unchanged).
-- ~~**Constant-time Πprm prover**~~ (2026-10-03): ✅ same day — `φ` as a limb product, `z_i` by add + one masked subtraction, a borrow-based accept for `a_i < φ`; ctgrind target `piprm` (3, all verdicts).
-- ~~**`generateAuxParams` off big-int**~~ — ✅ 2026-10-03: `Ñ` and `ord = p′q′` as montint limb products, `λ` drawn below the public `2^(bits−2)` and kept on the borrow of `λ − ord`; split out as `auxParamsWithTrapdoorFromSafePrimes` (also an import path for tss-lib's safe primes — interop test: their primes give their `Ñ` byte for byte). New ctgrind target `auxgen`: no context on the `ord`/`λ` arithmetic, 115 class-(a) contexts over the public `Ñ` plus the accept verdict.
-- ~~**Presignature serialisation**~~ — ✅ 2026-10-03 (user: codec + consume-once pool): `Presignature.toBytesAlloc`/`fromBytesAlloc` (SECRET bytes; refuses a used presignature; checks every field and that the seed is the signer's key), `PresignatureStore` (the contract: `take` removes durably BEFORE returning, so a record is handed out at most once, ever), `PresignaturePool` (`put` wipes the in-memory original; `take` restores once) and `MemoryPresignatureStore`. A durable store with that contract (an fsync'd delete before the read returns) is the caller's.
-- ~~**Naming an equivocator**~~ — ✅ 2026-10-03 (user: Ed25519 key per participant): every presigning message is signed (`message_key` in `PartyPublicKeys`, `message_seed` in `KeyShare`, generated by the dealer, `aux_info.LocalAux` and announced in keygen); the transcript hash became per-signer signed attestations, so the equivocator — or a misquoting attester — is named; `combine` checks Phase-7 shares' signatures and attestations too. `findDuplicate` refuses a shared message key. Wire `v2`; KeyShare/PublicKeys/Announcement codecs extended (breaking).
-- **Redistribution to a new committee** (2026-10-03): `dkg`'s reshare already takes `n'`, `t'`; a `threshold_ecdsa` wrapper needs the NEW committee's aux rounds (announcements, Πfac) alongside the old committee's dealing, and new parties that hold no `KeyShare` yet. Effort: medium.
-- ~~**BIP-32 / HD derivation of shares**~~ — ✅ 2026-11-17 (survey: multi-party-sig `DeriveChild`, cggmp24 `hd_wallet`): `childTweak(group_public_key, chain_code, index)` is BIP-32's `CKDpub` HMAC step (`IL || IR = HMAC-SHA512(chain_code, X || ser32(index))`), `deriveChild(&share, allocator, tweak)` adds the public `IL` to the Shamir share and `IL·G` to the group key, the party's verifying share and every `PublicKeys` entry. Shamir shares are evaluations of `f` with `f(0) = x`, and the Lagrange coefficients of any signing set sum to 1, so adding `δ` to every share moves the secret to `x + δ`: the shares sign under exactly the key a plain BIP-32 wallet derives from the group public key, with no interaction (every party computes the same `δ` from public data). Behaviour like the references and BIP-32 itself: non-hardened only (`error.HardenedIndex` for `index >= 2^31`: hardened needs the private key; multi-party-sig and cggmp24 refuse it too), `IL >= n` or a child key (or a child share) at the identity is `error.InvalidChildKey`, not "try the next index" (the same verdict as the sibling `bip32` module's `ckdPub`; BIP-32's ~2^-127 case). An `IL = 0` tweak is also refused (the sibling does the same; BIP-32 allows it, probability 2^-256). Presignatures made under the parent key are bound to its shares and are not reusable under the child. The HMAC step is repeated here (about ten lines, std `HmacSha512`) instead of calling `bip32.ckdPub`, because `threshold_ecdsa` has no `bip32` dependency and `ckdPub` returns only the child key, not `IL`; a shared helper would need `bip32` to export it. Anchors: the BIP-32 test vectors 1 and 2 (every non-hardened step: parent key + `IL·G` is the BIP's child key and `IR` its chain code; `src/root.zig`), and a (2,3) group whose child shares sign under the derived key, with Σλx' = x + δ, X' = X + δG, a second level, and refusal of a zero or share-zeroing tweak (`src/signing.zig`). Not done: SLIP-10 / other derivation schemes, multi-level path helpers (call `childTweak` per level with the previous chain code and `deriveChild`'s output key), additive (non-Shamir) share layouts.
-- ~~**Independent review + mutation run of the 2026-10-03 additions**~~ — review done 2026-10-03
-  (Sonnet, read-only; 2 HIGH, 5 MED, 8 LOW). Fixed the same day: **F1 HIGH** the type-7 opening
-  published each signer's Bob masks `ν'` next to `k_j` and `μ'_ji`, so anyone computed
-  `w_i = (μ'_ji − ν')/k_j` — one cheater shifting `σ` made every honest opening hand out the key
-  (now `ν'·G` is derived, the masks stay closed; test `expectNoMaskInOpenings` rebuilds every
-  `β'` and finds it in no opening); **F2 HIGH** an opened decryption `m + N` re-encrypted to the
-  same ciphertext and lifted to another `μ`, naming an honest Bob (now `m < N`, and every
-  decryption is checked before any `σ` is derived); **F3** blame from an unsigned header —
-  `collect`/`combine` are signature-first, noise is dropped (`noise` case: replays, forged
-  headers, bad signatures, other rounds/sessions/recipients, no abort; fault `bad_signature`
-  removed); **F4** `Presignature.fromBytesAlloc` checks `r = R.x`, `ΣR̄ = G`, `ΣS = X`,
-  `k·R = R̄_i`, `σ·R = S_i`; **F8** attestation block documented as a hash echo; **F9** the
-  session id hashes the public-key table; **F10** `root.decodeMessageKey` refuses small-order
-  message keys, signatures checked with `verifyStrict`; **F12** `MemoryPresignatureStore`
-  documented as single-thread. Mutation runs: see § Audit 2026-10-03. Open items below.
-- ~~**Opening round without attestation**~~ (review 2026-10-03 F5) ✅ 2026-10-04: round 9
-  (`echoOpenings`): an empty broadcast whose attestation block carries the openings as received;
-  `identify` checks the echoes first, so a signer who showed two signed openings is named
-  (`equivocation`) by every honest signer before any opening is judged (test: the last signer
-  shows signer 0 another version — all three name it).
-- ~~**`toBytesAlloc` does not consume**~~ (review F11) ✅ 2026-10-04: encoding marks the
-  presignature used and wipes `k`/`σ` (the bytes are the only copy left); `fromBytesAlloc` wipes
-  its stack copies of `k`, `σ`, the seed and the derived secret key; `Party.abandon` wipes what a
-  pending §4.3 opening kept, at once instead of at `deinit`.
-- ~~**`aux_info.Verified` can be built by hand**~~ (review F13) ✅ 2026-10-04: the seal is the
-  address of a declaration private to `aux_info.zig`; `assembleKeyShare` refuses any other
-  (`InvalidParameters`; test with a hand-written `Verified`).
-- ~~**`proveFailed` blames the peer for any prover error**~~ (review F15) — checked 2026-10-04,
-  kept: every non-OOM prover error can only come from the peer's key, tuple or ciphertext (this
-  party's own were validated in `round1`, secrets are canonical, `random` cannot fail).
-  Documented at `proveFailed`, whose parameter is now the provers' error sets instead of
-  `anyerror`, so a new variant has to be placed deliberately.
-
-**Delta mutation 2026-11-17 (BIP-32 child shares, `childTweak`/`childTweakFromIl`/`shiftElement`/`deriveChild`).** These 22 are counted in the whole-module total of the Audit 2026-11-17 paragraph above (21 killed, 1 equivalent); they were not re-run. 22 mutants (schemata, one build, detached copy): 21 killed, 1 equivalent. Killed by: the hardened-index test (boundary and dropped guard), the BIP-32 vector steps (HMAC key/data swap, index endianness, dropped parent key, chain-code swap and zeroing, `add` to `sub`), the `childTweakFromIl` test (`IL = 0`, `IL = n-1` on `G`, `IL >= n`), and the (2,3) signing test (every `deriveChild` field, entry shift, allocation length, ownership of `public_keys`, the zero/identity-share refusals and the `errdefer` leak). Equivalent: `Scalar.fromBytes(il) catch Scalar.zero` — a non-canonical `IL` becomes the zero tweak, which the next line (`basePoint.mul(0)` is the identity error) refuses with the same `InvalidChildKey`. Not mutated: the skipped `writeInt` of `index` (same class as the wrong-endianness mutant, killed by the same vectors; one mutant per class), `burn.stack`.
+- **Run:** `scripts/modtest threshold_ecdsa` (Debug request; the module is `heavy` in the root `build.zig`, so a Debug request builds it at ReleaseSafe, where the `builtin.mode == .debug` guards on the 2048-bit fixtures do not fire; `-Dstrict-debug` forces genuine Debug and does skip them). The security-critical reject tests of the received-parameter validation are fast and run in every mode.
+- **Test classes by file.** `zkproofs.zig`: honest prove → verify, codec round trips that re-verify, the reject paths (out-of-range `a`/`b`/`β'` driven through the byte-level inner provers, tampered `c_A`/`c_B`, wrong witnesses, wrong public point, every mangled proof field, sub-floor `N`/`Ñ`, non-standard `Γ`), layout KATs for every Fiat-Shamir challenge (`rangeProofChallenge`, `mtaProofChallenge`, `mtaProofWcChallenge`, `pdlProofChallenge`, `Transcript.appendAuxParams`/`appendPaillierPublicKey`), the `Γ`-binding test, the Miller-Rabin table (Carmichael numbers, strong pseudoprimes). `aux_proofs.zig`: struct/codec/transcript determinism, the two crafted-parameter scenarios (a 3-prime `Ñ`, an `h2 ∉ ⟨h1⟩` pair: `validate` accepts, the proofs refuse), a tamper suite, completeness over a trapdoor-retaining tuple, the Πprm direction test, strict codec tests. `fac_proof.zig` / `aux_info.zig`: tss-lib's 2048-bit Paillier primes and aux tuples drive Πfac and Πmod(N) at full size (honest, codec round trip, context and verifier binding, every field tampered); the BitForge shape `N0 = 3·X` passes all three Πfac equations and is refused by the range check alone; a non-Blum two-prime `N` is refused by Πmod; a below-floor `N` by `verifyAnnouncement`; three tss-lib parties announce, cross-verify, prove factors pairwise and assemble shares. `mta.zig`: `α + β ≡ a·b` over random and edge inputs, the end-to-end checked round, a tampered `c_B` refused before decryption, the β'-blind regression. `presign.zig`: honest 2-of-3 (signers out of order) and 3-of-3, over bytes and prehashed messages; a presignature signs once; every deviation by one signer (each injected into its outgoing bytes or, for consistent-liar cases, its state) aborts every honest signer with the expected fault and culprit and secrets wiped; the `equivocate` and `noise` cases; `combine` naming a wrong share and refusing missing, duplicate and foreign ones; `init` refusing bad signer sets; the §4.3 openings (a lie in the last signer's opening, truncated openings, no mask in any opening, the echo round); the presignature codec and pool. `signing.zig`: the driver end to end, every subset, a signing set larger than `t`, bad inputs, the threaded path giving the same signature. `root.zig`: Shamir/Feldman self-consistency, `AuxParams.validate` cases, the BIP-32 vectors. Tests named `mut <id>: …` were written to kill specific mutants of the whole-module mutation run.
+- **Interop and anchors:** `src/tsslib_interop.zig` over `src/tsslib_vectors.zig`, produced by `tools/tsslib` (see its README for the field mapping); see Anchoring.
+- **Fuzz:** the deterministic driver, `TECDSA_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_ONLY` selects a harness by name, `_MS`, `_SEEDFILE`, `_INPUT` as documented there), never `zig build --fuzz`. The harness bodies live beside their corpora in `root.zig`, `zkproofs.zig`, `aux_proofs.zig`, `ecproofs.zig` and `presign.zig`; the shared plumbing is `src/fuzz_test.zig`. Harness names: `tecdsa-feldman`, `tecdsa-public-keys`, `tecdsa-aux-params`, `tecdsa-key-share`, `tecdsa-element`, `tecdsa-ec-proofs`, `tecdsa-range-proof`, `tecdsa-mta-proof`, `tecdsa-mta-proof-wc`, `tecdsa-mod-proof`, `tecdsa-prm-proof`, `tecdsa-pdl-proof`, `tecdsa-fac-proof`, `tecdsa-presig`, `tecdsa-combine` — every wire decoder.
+- **ctgrind:** `src/ctgrind_harness.zig`, targets `share`, `nonce`, `betaprime`, `fac`, `pimod`, `piprm`, `prime`, `auxgen`, `open7`; pinned rows (counts, digests) in `scripts/checks/ctgrind-expected.tsv`. `fac` taints `p`, `q` through `fac_proof.prove`.
+- **Dead-stack residue:** `src/stackprobe_test.zig` (see Threat model).
+- **Mutation:** schemata, one build, in a detached copy, per `scripts/mutation/README.md`; the whole module was covered (one mutant per condition × class, protocol checks first: proof verification, range and floor checks, abort paths, party and index validation, codecs, the Fiat-Shamir layout). Survivors are killing tests, or argued equivalent or unobservable (an input no key generator emits, or a value drawn with probability at most 2^-128), and the card counts those as equivalent.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Anchoring
 
@@ -1261,6 +820,6 @@ per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
 | Direction | What | What is asserted |
 |---|---|---|
 | tss-lib → here | 2-of-3 key material from tss-lib's own DEALER-FREE keygen (Paillier safe primes, ring-Pedersen `Ñ`/`h1`/`h2` and trapdoor, shares, `X_j`) and the 3 signatures tss-lib made with it | each `x_i·G = X_j`; the committed signatures verify under tss-lib's key; this module's state machines sign with every 2-subset and std ECDSA verifies under tss-lib's key (Shamir indices, Lagrange weights, Paillier `g = N+1`, aux tuples all read as tss-lib means them); every tss-lib aux tuple passes `verifyWellFormed` — this module's Πprm/Πmod, proven from tss-lib's trapdoor |
-| here → tss-lib | 2-of-3 key material from `keygenTrustedDealer` with Paillier primes and aux tuples from this module's own safe-prime generator (`tools/tsslib/emit_zig_keys.zig`), and the 3 signatures tss-lib made after importing it | tss-lib signed with every 2-subset (the tool exits non-zero unless Go's `ecdsa.Verify` accepts each; first run, 2026-10-02); the committed signatures verify; this module signs with the same material |
+| here → tss-lib | 2-of-3 key material from `keygenTrustedDealer` with Paillier primes and aux tuples from this module's own safe-prime generator (`tools/tsslib/emit_zig_keys.zig`), and the 3 signatures tss-lib made after importing it | tss-lib signed with every 2-subset (the tool exits non-zero unless Go's `ecdsa.Verify` accepts each); the committed signatures verify; this module signs with the same material |
 
-**Not anchored externally (oracle SELF):** the zero-knowledge proofs and the protocol transcript. tss-lib's proofs use a different Fiat-Shamir encoding (SHA512/256 over Go big.Int bytes), so neither side can verify the other's proofs, and a mixed signing session is impossible; the GG18/GG20 papers publish no vectors. Those rest on the self-consistency and reject tests (`zkproofs.zig`, `ecproofs.zig`, `presign.zig`'s 18 deviations) and on the auditor brief (A1–A9).
+**Not anchored externally (oracle SELF):** the zero-knowledge proofs and the protocol transcript. tss-lib's proofs use a different Fiat-Shamir encoding (SHA512/256 over Go big.Int bytes), so neither side can verify the other's proofs, and a mixed signing session is impossible; the GG18/GG20 papers publish no vectors. Those rest on the self-consistency and reject tests (`zkproofs.zig`, `ecproofs.zig`, `presign.zig`'s deviation tests) and on the auditor brief (A1–A9).
