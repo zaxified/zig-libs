@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe (`testkit.stackprobe`) for the `RawSecretKey` codec
-//! (`toBytes`, `fromBytes`) burned 2026-10-09; the signing / sealing paths are
+//! (`toBytes`, `fromBytes`) burned; the signing / sealing paths are
 //! in `stackprobe_test.zig`. Per-call codec burn (`codec_burn`).
 //! ReleaseFast only (`skipUnlessOptimized`).
 

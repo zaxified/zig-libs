@@ -1148,7 +1148,7 @@ test "sign/verify round-trip, both algorithms, plus tamper + wrong-key-id" {
 }
 
 test "KeyPair.generate: two calls produce different seeds (A1 F5 -- a fixed seed left the suite green)" {
-    // RED, confirmed 2026-08-13 and reconfirmed by the 2026-09-04 audit: the
+    // RED, confirmed and reconfirmed by the audit: the
     // mutation `entropy.fill(io, &seed)` -> `@memset(&seed, 0x42)` in
     // `KeyPair.generate` leaves the WHOLE suite green (32/32 at the time) --
     // nothing compared two generated keys against EACH OTHER, only against
@@ -1503,7 +1503,7 @@ pub fn sigFileHarness(comptime S: type, src: *S, allocator: std.mem.Allocator) a
     // The corpus is real `.minisig` files, so pass (a) drives the parser with
     // what a verifier actually receives; pass (b) keeps the skeleton generator
     // alive by reading its choices from a `Cursor` over the same bytes.
-    // Measured 2026-09-07 over the corpus above: **1 distinct file and 0
+    // Measured over the corpus above: **1 distinct file and 0
     // signature files parsed before; 10 files, 3 parsed, and the generator
     // producing 9 distinct skeletons instead of 1, after.**
     const n: usize = src.slice(&buf);
@@ -1604,7 +1604,7 @@ test "corpus: every signature file reaches the parser, and the counts are pinned
     }
     // One seed IS the empty file, a legal member of a refusal corpus.
     try std.testing.expectEqual(sig_file_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draws the generator emitted
+    // Measured: with the collapsing draws the generator emitted
     // exactly 1 skeleton across the whole corpus, and no real signature file
     // ever reached the parser at all. After:
     try std.testing.expectEqual(@as(usize, 3), parsed);
@@ -1810,7 +1810,7 @@ pub fn commentHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
     // then finds fewer than the eight it needs and returns the range MINIMUM —
     // so `len` was 0 on every input and this validator, whose whole risk is an
     // off-by-one at the END of the buffer, was only ever handed a buffer with
-    // no end to walk to. Measured 2026-09-07 over the corpus above: **0 of 13
+    // no end to walk to. Measured over the corpus above: **0 of 13
     // seeds non-empty and 0 comments accepted before, 12 of 13 non-empty (one
     // seed IS the empty comment) and 5 accepted after.**
     const len: usize = src.slice(&buf);
@@ -1838,7 +1838,7 @@ test "corpus: every comment reaches isPrintableComment, and the verdicts are pin
     }
     // One seed IS the empty comment, a legal member of the corpus.
     try std.testing.expectEqual(comment_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: with the collapsing draw, 13 empty comments — 13
+    // Measured: with the collapsing draw, 13 empty comments — 13
     // accepted, 0 rejected, 0 octets walked. After:
     try std.testing.expectEqual(@as(usize, 6), accepted);
     try std.testing.expectEqual(@as(usize, 7), rejected);
@@ -1887,7 +1887,7 @@ test "KeyPair.wipe destroys the long-term secret key, leaving the public half us
     );
 }
 
-// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+// ── audit: tests asked for by mutation survivors ──────────────────
 
 test "isPrintableComment: overlong, out-of-range, broken and C1-control UTF-8 rejected" {
     // RFC 3629 §3/§4: the octets C0, C1 and F5..FF never appear in UTF-8; E0
@@ -2000,7 +2000,7 @@ test "writers refuse a carriage return and an unprintable trusted comment" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

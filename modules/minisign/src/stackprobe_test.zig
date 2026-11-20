@@ -223,7 +223,7 @@ inline fn scrubCalleeSaved() void {
 }
 
 /// `inline`: as its own frame it ran the call deeper than the region top
-/// `runProbe` computed (acme, 2026-10-08).
+/// `runProbe` computed (acme).
 inline fn measure(call: *const fn () void, n: *const Needles) Hits {
     scrubCalleeSaved();
     paint();
