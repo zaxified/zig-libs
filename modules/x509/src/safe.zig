@@ -175,7 +175,25 @@ pub const Error = error{
     /// descends into holds a PRIMITIVE element, whose interior this validator
     /// never examined. See `requireStdDescentPoints`.
     PrimitiveWhereStdDescends,
+    /// `safeCertificate` / `validateForStdParse` only: the TBSCertificate's
+    /// serialNumber is not an INTEGER, is empty, is not minimally encoded, or
+    /// is negative — refused like Go's `x509.ParseCertificate` (see
+    /// `validSerialNumber`).
+    InvalidSerialNumber,
 };
+
+/// `serialNumber` INTEGER content (no tag/length) as Go's
+/// `x509.ParseCertificate` accepts it: `cryptobyte`'s `ReadASN1Integer`
+/// refuses an empty or non-minimal encoding (a leading `0x00` before an octet
+/// below `0x80`, a leading `0xff` before one at or above it, X.690 §8.3.2),
+/// and since Go 1.23 a negative serial is "x509: negative serial number"
+/// (RFC 5280 §4.1.2.2: a positive integer). Zero is accepted, as in Go.
+pub fn validSerialNumber(content: []const u8) bool {
+    if (content.len == 0) return false;
+    if (content[0] & 0x80 != 0) return false; // negative
+    if (content.len >= 2 and content[0] == 0x00 and content[1] & 0x80 == 0) return false; // non-minimal
+    return true;
+}
 
 const Header = struct {
     /// Offset of the first content octet.
@@ -331,6 +349,8 @@ fn requireStdDescentPoints(bytes: []const u8, certificate: Header) Error!void {
     // serialNumber -> signature -> issuer. std descends into none of the
     // three: it compares `issuer` as raw bytes and never walks its RDNs.
     var f = try decodeHeader(b, pos, lim);
+    // The serial is checked here as Go checks it, not for std's sake.
+    if (b[pos] != 0x02 or !validSerialNumber(b[f.content_start..f.content_end])) return error.InvalidSerialNumber;
     for (0..2) |_| {
         pos = f.content_end;
         f = try decodeHeader(b, pos, lim);
@@ -1331,6 +1351,7 @@ test "differential: guard-accepted mutants reach std's parser and none of them p
     var validated: usize = 0;
     var guarded: usize = 0;
     var parsed: usize = 0;
+    var serial_refused: usize = 0;
     const reps = 20_000;
     for (0..reps) |_| {
         @memcpy(buf[0..base.len], &base);
@@ -1338,7 +1359,10 @@ test "differential: guard-accepted mutants reach std's parser and none of them p
         for (0..nmut) |_| buf[rnd.uintLessThan(usize, base.len)] = rnd.int(u8);
         const input = buf[0..base.len];
         if (validateCertificate(input)) |_| validated += 1 else |_| {}
-        const cert = safeCertificate(input, &scratch) catch continue;
+        const cert = safeCertificate(input, &scratch) catch |e| {
+            if (e == error.InvalidSerialNumber) serial_refused += 1;
+            continue;
+        };
         guarded += 1;
         _ = cert.parse() catch continue;
         parsed += 1;
@@ -1350,8 +1374,15 @@ test "differential: guard-accepted mutants reach std's parser and none of them p
     // exact. Roughly 80 % of 1-3 byte mutations still satisfy the guard, which
     // is what makes this a real differential rather than a rejection counter.
     try testing.expectEqual(@as(usize, 16_700), validated);
-    try testing.expectEqual(@as(usize, 15_798), guarded); // 15_814 before the signatureValue rule (2026-10-10)
-    try testing.expectEqual(@as(usize, 13_821), parsed); // 13_822 before: std matches the BIT STRING tag NUMBER only, the guard wants 0x03
+    // The Go-strict serialNumber rule (checked before the later structural
+    // rules) refuses 86 mutants, 46 of which the structural rules accepted
+    // (15_798 guarded before it).
+    // parsed: 13_822 before the BIT STRING tag rule (std matches the tag
+    // NUMBER only, the guard wants 0x03), 13_821 before the serial rule.
+    if (serial_refused != 86 or guarded != 15_752 or parsed != 13_777) {
+        std.debug.print("serial_refused={d} guarded={d} parsed={d}\n", .{ serial_refused, guarded, parsed });
+        return error.TestUnexpectedResult;
+    } // guarded: 15_814 before the signatureValue rule (2026-10-10) // 13_822 before: std matches the BIT STRING tag NUMBER only, the guard wants 0x03
 }
 
 test "the guard rejects a primitive at every position std descends into" {
@@ -1470,6 +1501,67 @@ test "the guard rejects a primitive inside the extensions loop (X4a, subjectAltN
     try validateCertificate(&cert);
     var scratch: [max_certificate_len + parse_slack]u8 = undefined;
     try testing.expectError(error.PrimitiveWhereStdDescends, safeCertificate(&cert, &scratch));
+}
+
+/// A minimal well-formed v1 certificate with the given serialNumber TLV
+/// (signature not valid; shape only).
+fn testCertWithSerial(comptime serial: []const u8) [serial.len + 101]u8 {
+    const ec_algid = [_]u8{ 0x30, 0x13 } ++
+        [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 } ++
+        [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+    const algid_sha256rsa = [_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00 };
+    const validity_der = [_]u8{ 0x30, 0x1e, 0x17, 0x0d } ++ "250101000000Z".* ++
+        [_]u8{ 0x17, 0x0d } ++ "350101000000Z".*;
+    const spki_content = ec_algid ++ [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+    const spki = [_]u8{ 0x30, spki_content.len } ++ spki_content;
+    const empty_name = [_]u8{ 0x30, 0x00 };
+    const tbs_content = serial[0..serial.len].* ++ algid_sha256rsa ++ empty_name ++ validity_der ++ empty_name ++ spki;
+    const tbs = [_]u8{ 0x30, tbs_content.len } ++ tbs_content;
+    const cert_content = tbs ++ algid_sha256rsa ++ [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+    return [_]u8{ 0x30, cert_content.len } ++ cert_content;
+}
+
+test "serialNumber: Go-strict -- empty, non-minimal, negative or not an INTEGER is refused" {
+    const chain = @import("chain.zig");
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    // Accepted: 1, zero (Go accepts it), 127, a leading 0x00 that keeps 0x80 positive, 20 octets.
+    const accepted = comptime [_][]const u8{
+        &[_]u8{ 0x02, 0x01, 0x01 },
+        &[_]u8{ 0x02, 0x01, 0x00 },
+        &[_]u8{ 0x02, 0x01, 0x7f },
+        &[_]u8{ 0x02, 0x02, 0x00, 0x80 },
+        &([_]u8{ 0x02, 0x14, 0x7f } ++ arrRepeat(u8, &.{0xee}, 19)),
+    };
+    inline for (accepted) |serial| {
+        const cert = testCertWithSerial(serial);
+        try validateForStdParse(&cert);
+        _ = try safeCertificate(&cert, &scratch);
+        const id = try chain.certSerialAndIssuer(&cert);
+        try testing.expectEqualSlices(u8, serial[2..], id.serial);
+    }
+    // Refused: empty, a redundant 0x00, a negative value (0x80.., 0xff 0x80),
+    // a non-minimal negative, an OCTET STRING where the INTEGER belongs.
+    const refused = comptime [_][]const u8{
+        &[_]u8{ 0x02, 0x00 },
+        &[_]u8{ 0x02, 0x02, 0x00, 0x01 },
+        &[_]u8{ 0x02, 0x02, 0x00, 0x7f },
+        &[_]u8{ 0x02, 0x01, 0x80 },
+        &[_]u8{ 0x02, 0x01, 0xff },
+        &[_]u8{ 0x02, 0x02, 0xff, 0x80 },
+        &[_]u8{ 0x02, 0x02, 0xff, 0x7f },
+        &[_]u8{ 0x04, 0x01, 0x01 },
+    };
+    inline for (refused) |serial| {
+        const cert = testCertWithSerial(serial);
+        try validateCertificate(&cert); // well-formed DER: only the serial rule refuses it
+        try testing.expectError(error.InvalidSerialNumber, validateForStdParse(&cert));
+        try testing.expectError(error.InvalidSerialNumber, safeCertificate(&cert, &scratch));
+        // The chain walk (verifyChain, certSerialAndIssuer, certValidity) refuses it too.
+        if (chain.certSerialAndIssuer(&cert)) |_| return error.TestUnexpectedResult else |_| {}
+        if (chain.certValidity(&cert)) |_| return error.TestUnexpectedResult else |_| {}
+    }
+    try testing.expect(validSerialNumber(&.{0x00}));
+    try testing.expect(!validSerialNumber(&.{}));
 }
 
 // (b) claimed `message_slice` (the bytes `Certificate.Parsed.verify` hashes)

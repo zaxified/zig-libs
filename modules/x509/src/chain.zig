@@ -1247,6 +1247,7 @@ fn expectTag(e: der.Element, byte: u8) Certificate.ParseError!void {
 
 const tag_sequence: u8 = 0x30;
 const tag_bit_string: u8 = 0x03;
+const tag_integer: u8 = 0x02;
 
 /// `parseShape` and std's `Certificate.parse` results for the certificates
 /// one `verifyChain` call looks at, keyed by the DER slice (the same slice
@@ -1325,6 +1326,10 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
         try extensions.parseElement(bytes, version_elem.slice.end)
     else
         version_elem;
+    // Go-strict serialNumber (`safe.validSerialNumber`): an INTEGER, minimal,
+    // not negative. std's own `parse` does not look at it.
+    try expectTag(serial_number, tag_integer);
+    if (!safe.validSerialNumber(bytes[serial_number.slice.start..serial_number.slice.end])) return error.CertificateFieldHasInvalidLength;
     const tbs_signature = try extensions.parseElement(bytes, serial_number.slice.end);
     try expectTag(tbs_signature, tag_sequence);
     const issuer = try extensions.parseElement(bytes, tbs_signature.slice.end);

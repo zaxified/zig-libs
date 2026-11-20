@@ -495,6 +495,15 @@ per link plus one per rejected same-DN candidate. Trust anchors and `verifySigne
 pass `validateForStdParse` before std's parser reads them; buffers over 4 GiB are refused before std's
 u32 offsets.
 
+**serialNumber, as Go parses it.** Go's `x509.ParseCertificate` reads the serial with `cryptobyte`'s
+`ReadASN1Integer` (refuses an empty or non-minimal INTEGER) and, since Go 1.23, refuses a negative one
+("x509: negative serial number"; release notes, GODEBUG `x509negativeserial=1` reverts it). This module
+does the same (`safe.validSerialNumber`; zero is accepted, as in Go): `validateForStdParse` and
+`safeCertificate` return `error.InvalidSerialNumber`, and the chain walk (`verifyChain`,
+`certSerialAndIssuer`, `certValidity`) `CertificateFieldHasInvalidLength` (std's vocabulary;
+`CertificateFieldHasWrongDataType` when the field is not an INTEGER). std's own `Certificate.parse`
+does not look at the serial. CRL entries keep their by-value match (redundant zero octets ignored).
+
 ## Verification
 
 - **Run:** `scripts/modtest x509`; `zig build interop-x509 [-- --seed N] [--write]` runs the live Go oracle (needs `go`, stdlib only); the benches are `zig build bench-x509` (`tools/bench.zig`, with the `tools/go_bench`, `tools/c_bench` and `tools/rust_fast_bench` foreign sides).
@@ -553,4 +562,3 @@ Go. The card's `**Performance:**` line carries the figures and is authoritative.
 - **Build option: post-quantum signature verifiers in chain building** (design in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `src/chain.zig` dispatches ML-DSA (3 sets) and SLH-DSA (12 sets, `inline else` over `algorithm.zig`) for every chain verifier. Measured (HTTPS sizeprobe, baseline x86_64 ReleaseSafe): SLH-DSA engine ~62 KB + ML-DSA ~56 KB. `.small` could drop SLH-DSA (no Web PKI issuer uses it) → such a chain is refused with `error.UnsupportedAlgorithm`. Small gain; do it only together with the TLS client's algorithm set.
 - **`crl.parse` per candidate attempt is uncached.** A parse cache keyed by CRL slice needs an owner and an invalidation rule across candidates (a new API surface); the work is linear in the CRL per attempt and attempts are budgeted. Revisit with a measured consumer need.
 - **An optional diagnostics out-parameter naming the failing certificate** (`NoTrustedPath` hides the cause when several same-subject candidates fail).
-- **Go's parse strictness for serial numbers** (a non-minimal INTEGER encoding is refused by Go; std's parser and `safe.zig` do not check it).
