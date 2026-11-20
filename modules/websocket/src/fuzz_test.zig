@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Support for websocket's deterministic fuzz driver (added 2026-10-09): the source
+//! Support for websocket's deterministic fuzz driver: the source
 //! adapter `testing.fuzz` feeds the harness through, and reach labels. The
 //! harness bodies and the driver tests live beside the corpora they share:
 //! `handshake.zig` (`response`, `response-mutated`, `request`, `request-mutated`),

@@ -17,8 +17,7 @@ const frame = @import("frame.zig");
 const deflate = @import("deflate.zig");
 
 /// Incremental (streaming) UTF-8 validator (RFC 6455 §8.1/§5.6, "Fail-fast
-/// UTF-8 across fragments" — found by the web-server consumer's Autobahn lane, 2026-09-26; fixed
-/// 2026-09-28). Carries at most the state of one partially-consumed
+/// UTF-8 across fragments" — found by the web-server consumer's Autobahn lane; fixed). Carries at most the state of one partially-consumed
 /// multi-byte sequence across calls, which is what lets a text message's
 /// UTF-8 be checked one fragment at a time instead of only once the whole
 /// message is reassembled — a code point legitimately split across two
@@ -192,7 +191,7 @@ pub const Connection = struct {
     /// Frames received while `close_received` was already true (the frame
     /// that SETS `close_received` does not count itself).
     frames_after_close: u32 = 0,
-    /// "Fail-fast UTF-8 across fragments", 2026-09-28: incremental UTF-8
+    /// "Fail-fast UTF-8 across fragments": incremental UTF-8
     /// state for the text message currently being reassembled (meaningless,
     /// and never fed, while `fragment_opcode` is `.binary` or null). Reset
     /// to `.{}` whenever a new fragmented TEXT message starts; every
@@ -200,7 +199,7 @@ pub const Connection = struct {
     /// UTF-8 in an early fragment is caught at that fragment instead of
     /// only once the whole message has been reassembled.
     text_utf8: IncrementalUtf8 = .{},
-    /// "Fail fast on invalid UTF-8 within one frame", 2026-09-28: how far
+    /// "Fail fast on invalid UTF-8 within one frame": how far
     /// into a text frame that has not fully arrived yet `receive` has
     /// already checked (see `checkPartialText`).
     partial_text: PartialText = .{},
@@ -356,7 +355,7 @@ pub const Connection = struct {
 
     /// Where a data frame's payload may be read straight to, instead of
     /// behind its header in the caller's buffer: `conn.Conn` does this for
-    /// a frame its reader's buffer cannot hold whole (2026-10-26) -- one copy
+    /// a frame its reader's buffer cannot hold whole -- one copy
     /// from the transport into `message_buf`, no buffer shuffling, and no
     /// buffer of `max_frame_size` needed. `h` comes from `frame.parseHeaderWith`
     /// with this connection's role, `max_frame_size` and RSV1 option, so every
@@ -364,7 +363,7 @@ pub const Connection = struct {
     ///
     /// A frame the state machine refuses whatever its payload is fails here,
     /// with the error and in the order `receive` would give once the whole
-    /// frame had arrived (review F3, 2026-10-26: before, such a frame over
+    /// frame had arrived (review F3: before, such a frame over
     /// the reader's buffer was `FrameExceedsBuffer`, close 1009, where a
     /// buffered one is 1002): data after a close (`TooManyFramesAfterClose`
     /// / `DataAfterClose`), a frame out of sequence (`InvalidFragmentation`),
@@ -481,7 +480,7 @@ pub const Connection = struct {
                 // The size first, as for a one-frame message: a fragment
                 // that cannot fit is `MessageTooLarge` whatever its bytes
                 // and however it arrived (`checkPartialText` leaves it
-                // alone; 2026-10-26, found by `conn-direct`).
+                // alone; found by `conn-direct`).
                 if (self.message_len + parsed.payload.len > self.message_buf.len) return error.MessageTooLarge;
                 // Fed BEFORE `appendFragment`, so an invalid byte anywhere in
                 // THIS fragment's payload fails this call -- the whole point
@@ -563,7 +562,7 @@ pub const Connection = struct {
     }
 
     /// "Fail fast on invalid UTF-8 within one frame" (Autobahn §6.4.3-4,
-    /// found by the web-server consumer's Autobahn lane, 2026-09-28). `buf` holds a frame that
+    /// found by the web-server consumer's Autobahn lane). `buf` holds a frame that
     /// has not fully arrived; if it is text -- a new text frame, or a
     /// continuation of a text message -- the payload bytes that did arrive
     /// are validated now, so a byte that can never be valid UTF-8 fails the
@@ -591,7 +590,7 @@ pub const Connection = struct {
             else => self.message_buf.len,
         };
         // A frame that cannot fit fails as `MessageTooLarge` once complete,
-        // whatever its bytes (2026-10-26, found by `conn-direct`).
+        // whatever its bytes (found by `conn-direct`).
         if (h.payload_len > room) return;
         const start: IncrementalUtf8 = switch (h.opcode) {
             .text => if (self.fragment_opcode == null) .{} else return,
@@ -777,7 +776,7 @@ test "a UTF-8 codepoint split across fragment boundaries validates correctly" {
     }
 }
 
-// External anchor (F5, 2026-08-08): the real `Autobahn|Testsuite` run this
+// External anchor (F5): the real `Autobahn|Testsuite` run this
 // finding asks for is unobtainable on this host — `wstest` is a Python-2-era
 // package broken under Python 3 (`from _version import __version__`, an
 // implicit relative import Python 3 removed; confirmed by running it, see
@@ -799,7 +798,7 @@ test "a UTF-8 codepoint split across fragment boundaries validates correctly" {
 // UTF-16 surrogate halves and pairs, and the non-character code points that
 // RFC 3629 permits) is transcribed below, each wrapped in a real single-frame
 // unmasked text message and fed through `Connection.receive` — the same
-// validation (`IncrementalUtf8`, 2026-09-28 — `std.unicode.utf8ValidateSlice`
+// validation (`IncrementalUtf8` — `std.unicode.utf8ValidateSlice`
 // itself before that date) a live Autobahn run would have exercised. This
 // corpus is also reused below (`checkUtf8EquivalenceAtEverySplit`) to prove
 // `IncrementalUtf8` agrees with `utf8ValidateSlice` regardless of where a
@@ -902,7 +901,7 @@ test "external anchor: Autobahn|Testsuite's frozen UTF-8 stress-test corpus (Mar
 
 // ── IncrementalUtf8 vs. std.unicode.utf8ValidateSlice: the equivalence ─────
 //
-// "Fail-fast UTF-8 across fragments", 2026-09-28. `IncrementalUtf8`'s doc
+// "Fail-fast UTF-8 across fragments". `IncrementalUtf8`'s doc
 // comment argues BY CONSTRUCTION that it cannot disagree with
 // `utf8ValidateSlice` on a complete byte string, no matter how that string is
 // chopped into feed() calls -- every check either algorithm makes is one
@@ -1000,7 +999,7 @@ test "IncrementalUtf8 agrees with utf8ValidateSlice on random byte strings (fixe
 // executed and their behaviour recorded. It is an oracle that can disagree
 // with us, and on its first run it did — see `close_code_1012`/`1013`.
 //
-// Frozen 2026-08-09 by tools/{cases,oracle_python,report,emit_zig}.py +
+// Frozen by tools/{cases,oracle_python,report,emit_zig}.py +
 // tools/oracle_go_main.go. These tests run offline and never skip; all
 // three implementations can be deleted and nothing here changes. Licences are
 // all permissive and nothing is copied, translated or redistributed from any
@@ -1259,7 +1258,7 @@ test "invalid UTF-8 single-frame text message is rejected (close 1007)" {
     try testing.expectEqual(@as(u16, 1007), frame.closeCode(error.InvalidUtf8));
 }
 
-// "Fail-fast UTF-8 across fragments", 2026-09-28. Before this fix, invalid
+// "Fail-fast UTF-8 across fragments". Before this fix, invalid
 // UTF-8 in the FIRST fragment of a message was not refused until the LAST
 // fragment arrived (validation ran once, over the reassembled whole, only
 // once `fin` was seen) -- this exact test used to assert `_ = try
@@ -1307,7 +1306,7 @@ test "a message ending mid-code-point (FIN with a pending sequence) is rejected 
     try testing.expectEqual(@as(u16, 1007), frame.closeCode(error.InvalidUtf8));
 }
 
-// ── fail fast on invalid UTF-8 within one frame (2026-09-28) ───────────────
+// ── fail fast on invalid UTF-8 within one frame ───────────────
 //
 // Autobahn §6.4.3-4, from the web-server consumer's lane: one text frame delivered in TCP chops,
 // invalid from an early chop. `receive` used to validate only once the frame
@@ -1726,8 +1725,8 @@ test "positive control: a later unrelated message still reassembles after an ear
 
 // ── fuzz: Connection.receive off the wire, client role, never panics ───────
 //
-// A1/websocket.md F5's "second half": `frame.parseFrame` got fuzz coverage
-// (2026-09-07, `857f7014`), but `connection.zig` -- the layer that does
+// A1 audit F5's "second half": `frame.parseFrame` got fuzz coverage
+// (`857f7014`), but `connection.zig` -- the layer that does
 // fragment reassembly, the close handshake, and UTF-8 validation across
 // fragment boundaries -- had ZERO harnesses, and the `.client` role had
 // none anywhere in the module. `error.MaskedServerFrame` (the one rule that
@@ -2057,7 +2056,7 @@ test "deflate: writeFrame refuses compressed control and continuation frames" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

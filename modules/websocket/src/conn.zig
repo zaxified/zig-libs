@@ -76,7 +76,7 @@ pub const ReadError = Connection.Error || std.Io.Reader.Error || frame.WriteErro
     /// The transport may be closed now.
     Closed,
     /// A frame does not fit the reader's buffer, so it can never be parsed
-    /// whole. Since 2026-10-26 only a compressed frame (permessage-deflate)
+    /// whole. Only a compressed frame (permessage-deflate)
     /// or a frame whose message would not fit `message_buf` anyway can get
     /// here: an uncompressed text/binary/continuation payload that does not
     /// fit is read straight into `message_buf`. With deflate, give the reader
@@ -116,7 +116,7 @@ pub const Conn = struct {
     /// `peer_reason_buf`.
     peer_close: ?frame.CloseInfo = null,
     peer_reason_buf: [123]u8 = undefined,
-    /// The error that ended reading (review F1/F2, 2026-10-26): every later
+    /// The error that ended reading (review F1/F2): every later
     /// `readMessage` returns it again. A protocol error has been answered
     /// with a close frame, so nothing after it is read, whichever way its
     /// frame came in. A transport error (`ReadFailed`, `EndOfStream`) is
@@ -229,7 +229,7 @@ pub const Conn = struct {
 
     /// A data frame the reader's buffer cannot hold from where it starts
     /// (it would be shuffled to the buffer's front, or never fit at all):
-    /// its payload goes straight into `message_buf` (2026-10-26). Before, a
+    /// its payload goes straight into `message_buf`. Before, a
     /// 64 KiB frame in a 128 KiB buffer cost a 64 KiB `memmove` on top of the
     /// read about every other frame, and a frame over the buffer was refused.
     /// Null when the frame is not one for this path (`directPayload`) or is
@@ -877,7 +877,7 @@ test "Conn: random frame streams read the same through a 140-byte and a 4 KiB re
 const fz = @import("fuzz_test.zig");
 const fuzz_driver = @import("testkit").fuzz.driver;
 
-/// `conn-direct` (2026-10-26, review F5): a stream of frames chosen by the
+/// `conn-direct` (review F5): a stream of frames chosen by the
 /// fuzz source -- text/binary/continuation/ping/close, FIN or not, payloads
 /// up to 300 bytes (mostly ASCII, so text is often valid) -- read through a
 /// server `Conn` with a 140-byte reader buffer (data frames over it go
@@ -975,7 +975,7 @@ test "Conn: permessage-deflate both ways, small messages stay uncompressed" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

@@ -295,7 +295,7 @@ pub const Window = [flate.max_window_len]u8;
 /// where it means `-`, so it can drop bits past the end, and the next
 /// `peekBitsEnding` computes `left.len * 8 - consumed_bits` with
 /// `left.len == 0` -- an integer-overflow panic in safe builds (found by
-/// WEBSOCKET_FUZZ `inflate`, 2026-10-11, on a flipped compressed message).
+/// WEBSOCKET_FUZZ `inflate`, on a flipped compressed message).
 /// With padding the end is never reached, so those paths never run; the
 /// padding cannot make an invalid message pass (`inflate` refuses any
 /// decode that consumed it), and it cannot keep the decoder busy: zero bits

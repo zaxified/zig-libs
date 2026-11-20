@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Tests the 2026-10-26 mutation audit asked for: each pins a behaviour no
+//! Tests the mutation audit asked for: each pins a behaviour no
 //! other test did (a boundary, a reset, a duplicate check, a path's
 //! contract). Grouped by the file they exercise. Tests only.
 
@@ -538,7 +538,7 @@ test "acceptHandshake: a 24-character key that is not base64 is refused" {
 test "acceptHandshake: an empty Host never reaches the same-host Origin check (h1 refuses it)" {
     // So the check's `authority.len != 0` is defence in depth: an empty
     // `Origin` authority can only meet an empty `Host`, which the parser
-    // has already refused (mutation audit 2026-10-04 and 2026-10-26).
+    // has already refused (mutation audit and).
     if (serverHead("Host:\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n" ++ std_key ++ "Origin: http://\r\n")) |_| {
         return error.EmptyHostParsed;
     } else |_| {}
@@ -620,7 +620,7 @@ test "Connection: a fragment too big for the rest of message_buf is MessageTooLa
     try testing.expectError(error.MessageTooLarge, feedWire(&c3, "\x01\x09\xffxxxxxxxx"));
 }
 
-// ── 2026-11-07 whole-module mutation run: tests its survivors asked for ─────
+// ── whole-module mutation run: tests its survivors asked for ─────
 
 test "pongFor answers with a pong carrying the ping's payload" {
     const o = frame.pongFor("abc", null);
@@ -919,10 +919,10 @@ test "writeRequest: no protocols, no Sec-WebSocket-Protocol field" {
     try testing.expect(std.ascii.findIgnoreCase(w.buffered(), "sec-websocket-protocol") == null);
 }
 
-// ── 2026-11-07: caller contracts are errors, not panics ─────────────────────
+// ──: caller contracts are errors, not panics ─────────────────────
 
 test "checkPartialText: max_fragments of maxInt(u32) does not overflow the fragment count" {
-    // Mutation run 2026-11-07 F1: `fragment_count + 1` overflowed once the
+    // Mutation run F1: `fragment_count + 1` overflowed once the
     // count had saturated at maxInt(u32) (2^32 - 1 frames of one message).
     var mb: [64]u8 = undefined;
     var c: Connection = .init(.client, &mb, 1 << 20);

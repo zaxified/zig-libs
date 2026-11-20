@@ -254,7 +254,7 @@ pub fn parseFrameWith(buf: []u8, role: Role, max_frame_size: u64, opts: ParseOpt
 /// needed yet. `parseFrame` is `parseHeader` plus "is the whole payload
 /// there"; `Connection` uses it alone to look at the part of a text frame's
 /// payload that has already arrived ("fail fast on invalid UTF-8 within one
-/// frame", 2026-09-28).
+/// frame").
 pub const Header = struct {
     fin: bool,
     opcode: Opcode,
@@ -925,7 +925,7 @@ fn fuzzParseFrameServer(_: void, smith: *std.testing.Smith) !void {
     // the loop, so `while (off < len)` never ran a single pass and
     // `parseFrame` was **never called at all**, while the comment above
     // promises multi-frame streams and `.need_more` retries. `check-fuzz-reach`
-    // only learned to see that shape on 2026-09-07. Measured over the corpus
+    // only learned to see that shape on. Measured over the corpus
     // above: **0 of 18 seeds reached `parseFrame` and 0 frames were parsed
     // before, 18 of 18 and 7 frames after.**
     const len: usize = smith.slice(&buf);
@@ -1029,7 +1029,7 @@ fn fuzzDecodeCloseBody(_: void, smith: *std.testing.Smith) !void {
     // ⛔ And here the collapse looked HEALTHY: `decodeCloseBody("")` SUCCEEDS
     // by design (§5.5.1, "empty payload → no code"), so the harness returned a
     // `CloseInfo` on every round while never reading a close code, a reason or
-    // a UTF-8 octet. Measured 2026-09-07 over the corpus above: **0 of 19
+    // a UTF-8 octet. Measured over the corpus above: **0 of 19
     // seeds non-empty, 19 of 19 "accepted" and 0 close codes read before; 18 of
     // 19 non-empty (the empty body is a deliberate seed), 10 accepted and 9
     // codes read after.**
@@ -1097,7 +1097,7 @@ test "corpus: every close-body seed reaches the decoder, and the codes read are 
     try testing.expectEqual(@as(usize, 131), reason_bytes);
 }
 
-// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+// ── audit: tests asked for by mutation survivors ──────────────────
 
 test "max_frame_size: a payload of exactly the cap parses, one byte more is FrameTooLarge" {
     // `parseFrame` doc / `FrameTooLarge`: "declared payload length EXCEEDS
@@ -1140,7 +1140,7 @@ test "encodeCloseBody: a reason needs a code, and code + reason fit in 125 bytes
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

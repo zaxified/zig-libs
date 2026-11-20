@@ -127,7 +127,7 @@ fn validateKey(key: []const u8) HandshakeError!void {
     if (key.len != 24) return error.InvalidKey;
     // 24 base64 characters WITHOUT `==` padding decode to 18 octets, not 16:
     // check the decoded size before decoding into the fixed buffer (found by
-    // WEBSOCKET_FUZZ 2026-10-09: a client's key panicked the server in safe
+    // WEBSOCKET_FUZZ: a client's key panicked the server in safe
     // builds and wrote 2 octets past `decoded` in ReleaseFast).
     const n = std.base64.standard.Decoder.calcSizeForSlice(key) catch return error.InvalidKey;
     if (n != 16) return error.InvalidKey;
@@ -145,7 +145,7 @@ pub const ServerAcceptOptions = struct {
     /// subprotocol negotiation happens and `ServerAccept.protocol` is
     /// always null.
     protocols: []const []const u8 = &.{},
-    /// `Origin` allow-list (the web-server consumer security review M6.2, 2026-09-28). RFC 6455
+    /// `Origin` allow-list (the web-server consumer security review M6.2). RFC 6455
     /// requires every browser to send `Origin` on a WebSocket handshake
     /// (§1.3) but the base protocol enforces nothing about its value —
     /// unlike an ordinary cross-origin HTTP request, CORS never applies to a
@@ -290,7 +290,7 @@ fn countHeader(head: h1.RequestHead, name: []const u8) usize {
 /// (server-supported set). Returns a slice of `allowed` (stable regardless
 /// of the client buffer's lifetime) — the same bytes the client sent.
 ///
-/// Exact, not case-insensitive (fixed 2026-10-04): RFC 6455 §4.1 has the
+/// Exact, not case-insensitive: RFC 6455 §4.1 has the
 /// client fail the connection when the response names a subprotocol "that
 /// was not present in the client's handshake", and gorilla/websocket,
 /// python-websockets and browsers compare exactly — answering our own
@@ -456,7 +456,7 @@ fn validRequestFields(options: ClientRequestOptions) bool {
     for (options.extra_headers) |h| {
         if (!h1.isToken(h.name)) return false;
         if (!h1.isValidFieldValue(h.value)) return false;
-        // Review F9 (2026-10-26): a field `writeRequest` writes itself would
+        // Review F9: a field `writeRequest` writes itself would
         // go out twice -- a request this module's own server refuses as
         // `DuplicateHeader`, and an intermediary may read either copy.
         for (reserved_request_fields) |r| if (std.ascii.eqlIgnoreCase(h.name, r)) return false;
@@ -674,7 +674,7 @@ test "acceptHandshake: rejects malformed key (wrong decoded length)" {
 }
 
 test "acceptHandshake: rejects a 24-character key without padding (decodes to 18 octets)" {
-    // Regression (WEBSOCKET_FUZZ, 2026-10-09): the length check alone let this
+    // Regression (WEBSOCKET_FUZZ): the length check alone let this
     // through to a decode into a 16-octet buffer -- a panic in safe builds,
     // two octets written past the buffer in ReleaseFast.
     const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAAAA\r\nSec-WebSocket-Version: 13\r\n";
@@ -705,7 +705,7 @@ test "acceptHandshake: no protocols offered -> no negotiation, always null" {
     try testing.expectEqual(@as(?[]const u8, null), accept.protocol);
 }
 
-// ── ServerAcceptOptions.origins (the web-server consumer security review M6.2, 2026-09-28) ────
+// ── ServerAcceptOptions.origins (the web-server consumer security review M6.2) ────
 //
 // Each test would pass vacuously if the `originAllowed` check were deleted
 // (every request here is otherwise a valid RFC 6455 upgrade), so the assert
@@ -990,7 +990,7 @@ test "writeRequest: positive control, ordinary fields still write correctly" {
 
 // ── fuzz: verifyResponse off the wire, client role, never panics ───────────
 //
-// A1/websocket.md F5's "second half": `handshake.zig` had ZERO fuzz
+// A1 audit F5's "second half": `handshake.zig` had ZERO fuzz
 // harnesses, on either side. `verifyResponse` is the client's ONLY defense
 // against a malicious or compromised server response — including the
 // accept-key check that RFC 6455 §4.1 point 9 calls the anti-cache-poisoning
@@ -1371,7 +1371,7 @@ test "respond: refused on a writer that cannot upgrade, with no header left behi
     try std.testing.expectEqual(@as(usize, 0), rw.headers_len);
 }
 
-// ── audit 2026-10-04: tests asked for by mutation survivors ──────────────────
+// ── audit: tests asked for by mutation survivors ──────────────────
 
 test "acceptHandshake: Upgrade and Connection must CONTAIN the right token, not merely be present" {
     // §4.2.1 point 3: an |Upgrade| header field containing the value
