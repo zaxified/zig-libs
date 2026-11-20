@@ -262,9 +262,9 @@ pub const Element = struct {
     /// arrived"), against 0/0 for the untainted control and 0/0 for a
     /// build without `-fvalgrind`. Re-introducing an `if (nibble != 0)`
     /// table lookup in `Point.mul` moves it to 4 in-file, exit 99. See
-    /// `SPEC.md`'s "Constant-time note (measured)" for the full table.
+    /// `SPEC.md`'s "Constant-time note" for the full table.
     ///
-    /// Scalar by pointer (BREAKING 2026-10-08): by value, the caller's frame
+    /// Scalar by pointer (BREAKING): by value, the caller's frame
     /// kept a copy of it (`stackprobe_test.zig`). The widened copy is passed on
     /// to ed448's `Point.mul` by pointer too and wiped before this frame is left.
     pub fn scalarMul(a: Element, s: *const scalar.CompressedScalar) Element {

@@ -37,7 +37,7 @@ pub const max_output_length = 65535;
 pub const HashError = error{
     /// The DST is empty (RFC 9380 §3.1: tags MUST have nonzero length).
     DstEmpty,
-    /// Not returned since 2026-11-16 (a DST over 255 bytes is reduced,
+    /// Not returned (a DST over 255 bytes is reduced,
     /// RFC 9380 §5.3.3); kept so an exhaustive switch still compiles.
     DstTooLong,
     /// More than 65535 output bytes requested (RFC 9380 §5.3.2 step 1).

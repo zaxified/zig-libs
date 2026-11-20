@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s "Constant-time
-//! note (measured)" and for `element.zig`'s `scalarMul` doc comment, as an
+//! note" and for `element.zig`'s `scalarMul` doc comment, as an
 //! actual committed program. Run it through
 //! `../../../scripts/checks/ctgrind.sh decaf448`.
 //!

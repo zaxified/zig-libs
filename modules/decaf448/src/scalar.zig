@@ -130,7 +130,7 @@ const l_minus_2: CompressedScalar = blk: {
 /// `Blind` redraws a zero blind before it is ever inverted.
 ///
 /// Burned (`burn.zig`): the square-and-multiply chain left both `a` and its
-/// inverse on the dead stack (`stackprobe_test.zig`, 2026-10-08) — the
+/// inverse on the dead stack (`stackprobe_test.zig`) — the
 /// inverse of a blind is as secret as the blind.
 pub fn invert(a: CompressedScalar) CompressedScalar {
     const r = invertUnburned(&a);
@@ -189,9 +189,9 @@ pub const RandomError = std.Io.RandomSecureError;
 /// (`EntropyUnavailable`, `Canceled`), passed through to the caller.
 ///
 /// Burned like `invert`: the reduction left the result on the dead stack
-/// (`stackprobe_test.zig`, 2026-10-08).
+/// (`stackprobe_test.zig`).
 ///
-/// Into `out` (zeroed on error; BREAKING 2026-10-08): returned in an error
+/// Into `out` (zeroed on error; BREAKING): returned in an error
 /// union, the scalar sat in the caller's temporary.
 pub fn random(out: *CompressedScalar, io: std.Io) RandomError!void {
     const r = randomUnburned(out, io);
