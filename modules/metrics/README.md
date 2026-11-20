@@ -220,3 +220,10 @@ per-request hook fields (incl. `req`/`res`), scrape-not-counted proof, endpoint 
 5xx traffic → scrape asserts exact counter values, histogram presence with
 correct `_count`s, in-flight back at 0, one TYPE line per family) that only
 skips when loopback binding is unavailable.
+
+`METRICS_FUZZ=<runs> scripts/modtest metrics` runs the deterministic fuzz
+driver (`src/fuzz_test.zig`): six harnesses over the `Accept` header, the
+scrape endpoint and request middleware on the wire, registration and
+`Vec.with` label values and exemplars, collector samples, numeric extremes and
+the process collector. Each scrape it produces is parsed back by an
+independent checker; see the SPEC's *Fuzzing*.
