@@ -1208,7 +1208,7 @@ pub const seccomp = struct {
         // list keeps it because `abort`/`raise` and thread cancellation use
         // it on the caller's own threads. Narrow it with `buildRules`
         // (`arg = 0, .eq, .u32, value = getpid()`), or add Landlock's
-        // `scope.signal` for processes outside the domain (review 2026-10-27).
+        // `scope.signal` for processes outside the domain.
         "tgkill",
         // Audit S11: calls a libc or language runtime makes on its own, which
         // killed a process under this list. Each checked for grant: none
@@ -1973,7 +1973,7 @@ test "seccomp default allow-list: named CONTENT, and no silent drop by @hasField
     // died of SIGSYS under a list whose author had allowed it.
     // `.epoll_pwait`, not `.epoll_wait`: aarch64 has no `epoll_wait` syscall
     // at all, so naming it here stopped this module compiling for arm64
-    // (found by the full matrix, 2026-09-18). Both are on the list.
+    // (found by the full matrix). Both are on the list.
     const must_have = [_]linux.SYS{ .read, .write, .close, .epoll_pwait, .accept4, .futex, .mmap, .exit_group, .rt_sigreturn, .getrandom } ++ s11_added;
     for (must_have) |s| try testing.expect(seccomp.containsSyscall(seccomp.default_allowlist, s));
     // `prlimit64`/`setrlimit`: audit S11 listed them, and they stay out on
@@ -2588,8 +2588,7 @@ fn childSeccompControl() void {
 // 3 skip", exit 0.
 /// Skip gates are written here with raw syscalls, NOT with the module's own
 /// probes (`seccomp.available`, `landlockAbiVersion`): a regression in a probe
-/// would otherwise skip every test that could notice it, green (review
-/// 2026-10-27, the same class as audit S5).
+/// would otherwise skip every test that could notice it, green (review, the same class as audit S5).
 fn requireSeccompFilter() !void {
     const action: u32 = linux.SECCOMP.RET.KILL_PROCESS;
     const rc = linux.syscall3(.seccomp, 2, 0, @intFromPtr(&action)); // SECCOMP_GET_ACTION_AVAIL
@@ -2986,7 +2985,7 @@ fn tsyncWorker(ready: *std.atomic.Value(bool), release: *std.atomic.Value(bool))
 /// syscall ABI every other architecture uses (arm64 included) has no
 /// `SYS_alarm` at all, so `linux.syscall1(.alarm, …)` is not a portability
 /// wart — it fails to COMPILE on arm64 with "enum 'Arm64' has no member named
-/// 'alarm'". Caught by the arm64 lane on 2026-08-15, the first run of this
+/// 'alarm'". Caught by the arm64 lane on, the first run of this
 /// module on anything but x86_64. `setitimer(ITIMER_REAL, …)` is the portable
 /// spelling and is what glibc's `alarm()` itself calls there.
 ///
@@ -3046,7 +3045,7 @@ test "seccomp(2)+TSYNC: filter installed on main thread also kills a pre-existin
 // Audit S16: `ThreadSyncFailed`'s whole reason to exist — a POSITIVE return
 // from the TSYNC syscall, which `linux.errno()` decodes as `.SUCCESS` because
 // it only recognizes values in `(-4096, 0)` as errors — had no witness.
-// Reproduced 2026-09-10 by probe (`.zig-cache/probe/tsync_probe2.zig`, since
+// Reproduced by probe (`.zig-cache/probe/tsync_probe2.zig`, since
 // discarded): TSYNC fails for a sibling thread whose OWN filter chain has
 // already diverged from the caller's — concretely, a worker that installed
 // its own single-thread filter via `install()` BEFORE the main thread calls
@@ -3194,7 +3193,7 @@ fn childRulesOverlap() void {
 test "seccomp.buildRules on the kernel: two conditional rules of one syscall on the same argument both hold (libseccomp 2.6.0 drops the second)" {
     // Found by tools/interop.zig against libseccomp 2.6.0: added there, the
     // second rule is missing from `seccomp_export_pfc`, and the kernel lets
-    // the first call below through (SPEC.md, 2026-10-27).
+    // the first call below through.
     try requireSeccompFilter();
     const prog = try seccomp.buildRules(testing.allocator, &.{
         .{ .sysno = .getppid, .when = &.{.{ .arg = 2, .op = .ge, .width = .u32, .value = 0xffff_ffff }}, .action = .{ .errno = @backingInt(E.NOENT) } },
@@ -3711,12 +3710,12 @@ fn childRlimitCannotRaise() void {
     // The property is "a NON-privileged process cannot raise it" (`setLimit`'s
     // doc). Root holds CAP_SYS_RESOURCE, which raises a hard limit legitimately,
     // so as root this test failed for the wrong reason — first seen when
-    // `scripts/vm/run.sh sandbox` ran it as real root (2026-09-15). Shed the
+    // `scripts/vm/run.sh sandbox` ran it as real root. Shed the
     // capabilities first; the property under test is then the one documented.
     if (linux.geteuid() == 0) clearCapabilities() catch linux.exit(72);
     limitOpenFiles(64) catch linux.exit(70); // lowers the hard limit to 64
     // Both halves are the cap: a hard limit above it would let the soft one
-    // climb back (mutation 2026-10-27: `n + 1` survived the raise below).
+    // climb back (mutation: `n + 1` survived the raise below).
     var rl: linux.rlimit = undefined;
     if (linux.errno(linux.getrlimit(.NOFILE, &rl)) != .SUCCESS or rl.cur != 64 or rl.max != 64) linux.exit(73);
     // A non-privileged process must NOT be able to raise the hard limit back up.
@@ -4067,7 +4066,7 @@ test "clearCapabilities: effective/permitted/inheritable read back as zero" {
     try testing.expect(res.exitedWith(0));
 }
 
-// ── root: the read-back sees each id and the permitted set (mutation 2026-11-07) ──
+// ── root: the read-back sees each id and the permitted set ──
 //
 // Run for real by `scripts/vm/run.sh sandbox`. As root the child first puts
 // its ids and capabilities into one exact state (raw syscalls), then the
@@ -4137,7 +4136,7 @@ test "privilege drop read-back: one wrong real/effective/saved id or a kept perm
     }
 }
 
-// ── mutation-audit additions (2026-10-04) ────────────────────────────────────
+// ── mutation-audit additions ────────────────────────────────────
 
 test "seccomp.buildRules accepts exactly max_rules rules (kills the `>=` boundary mutant)" {
     const rules: [seccomp.max_rules]seccomp.Rule = @splat(.{ .sysno = .read });
@@ -4194,7 +4193,7 @@ test "landlock restrictSelf without no-new-privs reports NoNewPrivsRequired, not
     try testing.expect(res.exitedWith(0));
 }
 
-// ── review 2026-10-27: what the findings asked for ───────────────────────────
+// ── review: what the findings asked for ───────────────────────────
 
 fn childDropWithThread() void {
     const t = std.Thread.spawn(.{}, struct {
@@ -4212,7 +4211,7 @@ fn childDropWithThread() void {
 
 test "dropPrivileges: a second thread is MultipleThreads before anything changes (ids are per thread)" {
     // Raw open, not the parser under test: a `threadCount` that always said
-    // "unknown" skipped this test and the guard with it (mutation 2026-11-07).
+    // "unknown" skipped this test and the guard with it.
     const proc = linux.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(proc) != .SUCCESS) return error.SkipZigTest; // no /proc
     _ = linux.close(@intCast(proc));
@@ -4274,7 +4273,7 @@ fn childLandlockFileRule() void {
     if (!rawNoNewPrivs()) linux.exit(101);
     var rs = Ruleset.init() catch linux.exit(80);
     // A FILE with directory rights in the union: refused by the kernel
-    // before 2026-10-27 (EINVAL -> RulesetFailed), now `read_file` only.
+    // earlier (EINVAL -> RulesetFailed), now `read_file` only.
     rs.allowPath(g_ll_allowed_file.ptr, Ruleset.access.read_only) catch linux.exit(1);
     // A ruleset handling only write_file, asked for read_only: nothing is
     // left after the clamp -> a no-op, not RulesetFailed (kernel ENOMSG).
@@ -4461,7 +4460,7 @@ test "landlock access mask: RESOLVE_UNIX is handled from ABI 9, not before" {
     try testing.expectEqual(Ruleset.access.all, Ruleset.accessMaskForAbi(9));
 }
 
-// ── whole-module mutation run 2026-11-07: what only an injected syscall reaches ──
+// ── whole-module mutation run: what only an injected syscall reaches ──
 //
 // A seccomp filter answering `SECCOMP_RET_ERRNO | 0` makes a syscall report
 // SUCCESS without running; `| e` makes it fail with `e`. Both arrive through
@@ -4506,7 +4505,7 @@ const drop_cases = [_]DropCase{
     // the caller's own ids, so the drop is clean and the `noCapabilities`
     // read-back must say so. It failed (DropNotEffective) while that read-back
     // used std's `cap_user_header_t` (`pid: usize` at offset 8; the UAPI has an
-    // `int` at 4, so capget asked about a garbage pid) -- mutation 2026-11-07, F1.
+    // `int` at 4, so capget asked about a garbage pid) -- mutation, F1.
     .{ .fake = &all_id_calls, .want = .ok },
     // The read-back, not the setter's return value, decides.
     .{ .fake = &all_id_calls, .creds = .other_uid, .want = .drop_not_effective },
@@ -4717,7 +4716,7 @@ test "landlockAbiVersion reports the kernel's ABI exactly (the raw query agrees)
     try testing.expectEqual(raw, rs.abi);
 }
 
-// ── Landlock ABI 9, emulated (mutation 2026-11-07) ──────────────────────────
+// ── Landlock ABI 9, emulated ──────────────────────────
 //
 // The host kernel is ABI 8, so `init()`'s ABI-9 request (RESOLVE_UNIX) never
 // reached a kernel. A seccomp USER_NOTIF filter on `landlock_create_ruleset`
