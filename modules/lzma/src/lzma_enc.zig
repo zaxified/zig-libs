@@ -32,10 +32,17 @@ pub const Options = struct {
     nice_len: u32 = 64,
     /// 0 picks the finder's default from `nice_len`.
     depth: u32 = 0,
+    /// Opt-in ceiling on `depth`: 0 (the default, as in liblzma, which takes
+    /// any uint32) means none, else a larger `depth` is
+    /// `error.InvalidOptions`. A huge `depth` on repetitive data costs up to
+    /// a dictionary of chain steps per byte; set this where `depth` comes
+    /// from untrusted input.
+    max_depth: u32 = 0,
 
     pub fn valid(o: Options) bool {
         return o.lc <= c.lclp_max and o.lp <= c.lclp_max and o.lc + o.lp <= c.lclp_max and o.pb <= c.pb_max and
-            o.nice_len >= c.match_len_min and o.nice_len <= c.match_len_max;
+            o.nice_len >= c.match_len_min and o.nice_len <= c.match_len_max and
+            (o.max_depth == 0 or o.depth <= o.max_depth);
     }
 
     pub fn lzOptions(o: Options) lz.Options {
@@ -950,3 +957,10 @@ pub const Coder = struct {
         co.backward(len_res, back_res, cur);
     }
 };
+
+test "Options.max_depth is an opt-in ceiling on depth" {
+    try std.testing.expect((Options{ .depth = 1 << 30 }).valid());
+    try std.testing.expect((Options{ .depth = 100, .max_depth = 100 }).valid());
+    try std.testing.expect(!(Options{ .depth = 101, .max_depth = 100 }).valid());
+    try std.testing.expect((Options{ .depth = 0, .max_depth = 1 }).valid());
+}

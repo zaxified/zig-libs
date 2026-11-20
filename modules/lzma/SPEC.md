@@ -48,6 +48,10 @@ below — which is what the tests pin (not merely round trips). It is a one-shot
 `std.Io.Writer`; the output does not depend on how the input is cut into writes. The decompressor
 reads what liblzma reads and refuses what it refuses, within the limits listed below.
 
+**Encoder time is caller-bounded:** `LzmaOptions.depth` takes any `u32`, as liblzma does, and a huge value on
+repetitive data costs up to a dictionary of chain steps per byte; `nice_len` is already limited to 273.
+`LzmaOptions.max_depth` (0 = none) is an opt-in ceiling: a larger `depth` is `error.InvalidOptions`.
+
 **Not here (expected by some, deliberately absent):** BCJ and delta filters (the decoder names
 them: `error.UnsupportedFilter`), multi-threaded and multi-block `.xz` compression, the preset
 dictionary, sync-flush, `.lz` (lzip), `.7z`, raw LZMA1 without an end marker as *encoder* output,
@@ -196,5 +200,4 @@ algorithm*.
   LZ encoder with a reset window); would match `xz --block-size` bytes.
 - **B2** Parallel blocks (`xz -T`), after B1.
 - **B3** BCJ x86 / ARM64 / delta in the decoder (small) and encoder.
-- **B6** Encoder time is caller-bounded: `LzmaOptions.depth` (and `nice_len`) are not capped, a huge `depth` on repetitive data makes each byte cost up to a dictionary of chain steps (liblzma behaves the same). Not a crash; cap only if a consumer ever takes `depth` from untrusted input.
 - **B7** A public CRC-64/XZ (PCLMULQDQ + slicing-by-8) beside the `crc32` module; `src/crc64.zig` is the private one the decoder uses (the encoder and `xzfmt`'s index still use std's).
