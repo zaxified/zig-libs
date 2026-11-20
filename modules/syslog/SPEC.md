@@ -42,20 +42,20 @@ Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | `std.log` sink | done: `Logger` + `stdLogFn` |
 | Severity methods, detected identity, a mask (Go, Rust) | done: `Logger` |
 | Reconnect and retry (Go) | done: `ReconnectingEmitter`; it also sees a peer's close first, which Go and Rust do not [V] |
-| TLS (RFC 5425) | done as a seam: `WriterEmitter`, held against OpenSSL with `tlsclient` in `tools/live_oracle.py`; a production dep on a TLS stack rejected, its size cost stays with who needs it |
+| TLS (RFC 5425) | done as a seam: `WriterEmitter`, held against OpenSSL with `tlsclient` in `tools/live_oracle.py`; no TLS stack in the module (see *What is deliberately not done*) |
 | journald memfd for large entries (`sd_journal_send`) | done; a real journald stored 3 MiB |
-| TcpEmitter send deadline | already done 2026-10-31; the Backlog line was stale |
+| TcpEmitter send deadline | done |
 | Cutting a truncated UDP message at a UTF-8 boundary | done |
 | LF / NUL framing (Go, glibc, old collectors), unix stream socket (Go, Rust) | done: `Framing`, `connectUnix` |
 | RFC 3164 over UDP and TCP (Go, Rust) | done: `sendBsd`, `sendRaw` |
 | Messages past 2 KiB on a stream (Rust, Go have no cap) | done: `sendRaw` |
 | Parser (go-syslog, `syslog_rfc5424`, `syslog_loose`) | done: `parse`, `parseBsd`, `parseAny`, `nextFrame`. No client yardstick has one, but a Zig program that ingests syslog finds nothing else: the honest parity is the pair, as Go needs two packages for it |
-| macOS / BSD local paths | rejected: the emitters are Linux syscalls and `meta.targets` is `linux64`; `open(path)` takes any path |
-| A listener | rejected: a daemon's job; `nextFrame` + `parse` are what it would call |
-| Host names in `connect` (Go, Rust take them) | rejected: `std.Io.net.HostName` resolves; a name re-resolved on reconnect is in Backlog |
-| RFC 3195 (BEEP), Cisco IOS format (go-syslog) | rejected: 3195 is dead; a Cisco line reads through `parseBsd` with the vendor text in `msg` |
-| Best-effort partial RFC 5424 (go-syslog option) | rejected: `parseAny` falls back to the lenient reading instead of half a message |
-| Microsecond stamps in the encoder (Rust) | rejected: milliseconds are the documented choice; the parser reads six digits |
+| macOS / BSD local paths | not provided: see *What is deliberately not done* |
+| A listener | not provided: see *What is deliberately not done* |
+| Host names in `connect` (Go, Rust take them) | not provided in `connect`; a name re-resolved on reconnect is in Backlog |
+| RFC 3195 (BEEP), Cisco IOS format (go-syslog) | not provided: see *What is deliberately not done* |
+| Best-effort partial RFC 5424 (go-syslog option) | not provided: see *What is deliberately not done* |
+| Microsecond stamps in the encoder (Rust) | not provided: see *What is deliberately not done* |
 
 **Where we are ahead:** an RFC 5424 stream that is delimited at all, unlike the Rust crate over TCP [V]; a record is not lost to a half-closed socket after a collector restart, unlike both clients [V]; deadlines on every send; journald's native protocol with the memfd path; injected timestamps; no allocation anywhere; the only Zig RFC 5424 parser found. **Where we are behind:** no name resolution in `connect`, no macOS/BSD (the module's target is Linux).
 
@@ -84,7 +84,7 @@ separated, ≤ 255 bytes, which covers host names and IPv4 literals; otherwise t
 which is what glibc's `syslog()` sends and what receivers fill in from the peer. An IPv6 address
 belongs in RFC 5424's HOSTNAME, which rsyslogd reads intact.
 
-**Local delivery** (requested by the terminal-UI consumer, 2026-09-28; `src/unix.zig`, Linux only — raw AF_UNIX
+**Local delivery** (`src/unix.zig`, Linux only — raw AF_UNIX
 syscalls, since `std.Io.net.UnixAddress` has no datagram-socket API, only `SOCK_STREAM`
 `connect`/`listen`). Two emitters, neither binding or listening — both dial a well-known path, same
 as every reference client named below:
@@ -118,6 +118,11 @@ as every reference client named below:
   `syslog()` local-delivery path for
   `UnixEmitter` (design only — no source read; this repo never links libc), the protocol document
   above plus `sd_journal_send`'s field-name rule for `journal`.
+- `journal.stderrIsJournal(journal_stream_env)` / `fdIsJournalStream(fd, env)` tell a process whether its
+  stderr (or another descriptor) is the journal's stream: systemd's `JOURNAL_STREAM=<dev>:<ino>` is parsed
+  strictly as two decimal numbers (the device in glibc's `makedev` encoding) and compared with `statx` of
+  the descriptor. The caller passes the env value (the module reads no global state); any malformed value
+  or `statx` failure is `false`. Raw syscall, so no `io` parameter.
 
 **Parser** (`src/parse.zig`). `parse` walks the ABNF of RFC 5424 §6 once, no backtracking, and returns
 slices of the input; `Parsed.elements()` walks the SD it validated, and on a `structured_data` a caller
@@ -159,7 +164,7 @@ emitted raw — held by BOTH encoders: RFC 5424's HOSTNAME/APP-NAME/PROCID/MSGID
 RFC 3164's PID via `bsd.writePid` (also no `[`/`]`) and TAG via `writeTag`, the latter alnum-only
 per RFC 3164 §5.3, while an RFC 3164 HOSTNAME that is not a host name or IPv4 address
 (`bsd.validHostname`) is omitted rather than sent — a receiver decides by looking whether the first
-word is a hostname, and rsyslogd read `evil app[1]:` as TAG and PID (oracle 2026-10-05) — so an
+word is a hostname, and rsyslogd read `evil app[1]:` as TAG and PID — so an
 untrusted field cannot forge a second record, or another field, on either wire shape; MSG is
 deliberately passed through raw on both, matching the external rsyslogd anchor below), and oversized
 UDP payloads (truncated with a marker rather than silently dropped or
@@ -167,120 +172,63 @@ fragmented unpredictably). Out of scope: a listener, a TLS stack of its own (RFC
 delivery guarantees beyond at-least-once.
 
 ## Verification
-Offline golden-byte tests (no live socket): a full message with structured data, a minimal
-all-NILVALUE message, SD escaping of `"`/`\`/`]`, PRI for several facility/severity pairs,
-timezone-offset timestamps, field truncation at the length limits, and the RFC 6587 octet-count
-prefix. `TcpEmitter` and `ReconnectingEmitter` run over loopback and unix stream sockets in `src/sweep_test.zig`
-(a peer restart included); a real UDP send is the one path no unit test opens, and the rsyslogd oracle does.
-Run: `zig build
-test-syslog` (Debug and `-Doptimize=ReleaseFast`).
 
-**Local delivery (`unix.zig`) is exercised over a real kernel socket, not compile-checked only** —
-unlike UDP/TCP, a unix datagram socket needs no privileged listener or network access to test for
-real: each test binds its own throwaway `AF_UNIX SOCK_DGRAM` socket under `.zig-cache/tmp/` (never
-`/tmp`) and asserts the exact bytes a real receiver would see, for both `UnixEmitter` (RFC 5424 and
-RFC 3164) and `journal.Emitter` (text-form fields, the binary form triggered by an embedded
-newline, the `sendMessage` convenience, field-name validation refusing the whole send before
-anything goes out, `TooManyFields`, and `MessageTooLarge` from a deliberately shrunk `SO_SNDBUF`
-forcing a real kernel `EMSGSIZE` regardless of the host's actual defaults).
+Run `scripts/modtest syslog`; the interop oracles are `zig build interop-syslog` (re-take the vectors, or with
+`-- --check` compare with the committed file) and `-- --live`; see `tools/README.md`. Test classes:
 
-### External-anchor investigation: a real rsyslogd (2026-08-01, done)
+- **Golden bytes** (no live socket): a full message with structured data, a minimal all-NILVALUE message, SD
+  escaping of `"`/`\`/`]`, PRI for several facility/severity pairs, timezone-offset timestamps, field truncation
+  at the length limits, the RFC 6587 octet-count prefix.
+- **Emitters** (`src/sweep_test.zig`): `TcpEmitter` and `ReconnectingEmitter` over loopback and unix stream
+  sockets (a peer restart included); a real UDP send is the one path no unit test opens, the rsyslogd oracle does.
+- **Local delivery** (`src/unix.zig`) over a real kernel socket: each test binds its own throwaway
+  `AF_UNIX SOCK_DGRAM` socket under `.zig-cache/tmp/` (never `/tmp`) and asserts the exact bytes a receiver would
+  see, for `UnixEmitter` (RFC 5424 and RFC 3164) and `journal.Emitter` (text-form fields, the binary form
+  triggered by an embedded newline, `sendMessage`, field-name validation refusing the whole send before anything
+  goes out, `TooManyFields`, and `MessageTooLarge` from a deliberately shrunk `SO_SNDBUF` forcing a real
+  `EMSGSIZE`); `journal.stderrIsJournal`, `makedev` against glibc values and the decimal parser directly.
+- **Oracles, frozen offline:** `src/rsyslog_oracle_test.zig` replays a real rsyslogd's and a real
+  systemd-journald's verdicts on our encoders' output (`tools/interop.zig` + `tools/rsyslog_oracle.py` produce
+  `src/rsyslog_oracle_vectors.zig`); `src/parse_oracle_test.zig` holds the parsers against those vectors and
+  against go-syslog (`tools/go_oracle` produces `src/parse_oracle_vectors.zig`); the test
+  `external anchor: message live-verified by a real rsyslogd` pins one message and its wire string. Details
+  under *Anchoring*. The oracle is run once and its bytes frozen; no test re-runs a daemon.
+- **Live only, nothing frozen** (`tools/live_oracle.py`): RFC 5425 through `tlsclient` into OpenSSL, a daemon
+  restart between two records, LF framing, a 3 MiB entry through journald's memfd path.
+- **Fuzz:** the deterministic driver, `SYSLOG_FUZZ=<runs>[,<first seed>]`, four harnesses (`syslog-5424`,
+  `syslog-roundtrip`, `syslog-3164`, `syslog-frames`; a few thousand seeds of each in every test run), every
+  reach label required; never `zig build --fuzz`.
+- **Sweep** (`src/sweep_test.zig`): every parser on every byte after every prefix, unix/journal and
+  `TcpEmitter` send and connect deadlines, hostile inputs to the encoders, `Logger` and `WriterEmitter`.
+- **Benchmark:** `zig build bench-syslog` against Go and Rust peers (`tools/bench.zig`, `go_bench/`,
+  `rust_bench/`); the card's `**Performance:**` line holds the figures.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
 
-The send path (`UdpEmitter`/`TcpEmitter`) genuinely speaks the wire protocol a
-real syslog receiver expects — unlike a self-authored format, this is a case
-where a real conformant listener is the correct oracle. `rsyslogd 8.2512.0` is
-installed on this machine. It was run, unprivileged, and it worked:
+## What is deliberately not done
 
-**Oracle reachable, with one workaround.** `rsyslogd`'s own AppArmor profile
-(`/etc/apparmor.d/usr.sbin.rsyslogd`, present and enforced) confines it to
-reading `/etc/rsyslog.conf`+`/etc/rsyslog.d/**` and writing
-`/var/log/**`+`/var/spool/rsyslog/**` — both root-owned, so a throwaway config
-or output path could not simply be passed on the command line (confirmed via
-`journalctl -k`: `apparmor="DENIED" ... profile="rsyslogd"` for a scratch
-config path). No sudo/setcap/host change was used to lift this. Instead, an
-unprivileged `unshare --user --map-root-user --mount --net` namespace
-bind-mounted a throwaway config over `/etc/rsyslog.conf` and a throwaway
-directory over `/var/log`, both visible only inside that private mount
-namespace — the real `/etc/rsyslog.conf` and `/var/log` were never touched.
-Inside that same namespace, `rsyslogd -n -iNONE -f /etc/rsyslog.conf` listened
-on UDP and TCP (`imudp`/`imtcp`) on a high port, and a template rendered every
-parsed RFC 5424 property to a file: `%syslogfacility-text% %syslogseverity-text%
-%pri% %timereported:::date-rfc3339% %hostname% %programname% %procid% %msgid%
-%structured-data% %msg% %inputname%`.
-
-**What was frozen.** A one-off Zig program (not part of the module; built and
-run, then deleted) called this module's actual `UdpEmitter.send` and
-`TcpEmitter.send` — not hand-built bytes — with a message exercising every
-header field, an SD element with 3 params, and a MSG containing raw `"` `\` `]`
-(unescaped, since only SD values are escaped, not MSG). rsyslogd's real,
-independent RFC 5424 parser re-rendered, identically on both transports:
-
-```
-RCVD facility=local3 severity=warning pri=156 timereported=[2026-07-09T13:34:56.123+01:00]
-  hostname=[probe-host] appname=[live-probe] procid=[4242] msgid=[ORACLE]
-  structured-data=[[exampleSDID@32473 iut="3" eventSource="Application" eventID="1011"]]
-  msg=[live rsyslogd oracle probe: quotes " backslash \ bracket ] end] protocol=imudp
-(byte-identical second line, protocol=imtcp)
-```
-
-Every field matches what this module intended byte-for-byte: PRI arithmetic
-(`local3*8+warning` = 156), the `+01:00`-shifted millisecond timestamp,
-truncation-free header fields, SD element/param syntax (proving the escaping
-rules produce real, externally-parseable SD grammar, not just
-internally-consistent output), and MSG passed through raw. **No disagreement
-was found** — a real third-party implementation accepted every message this
-encoder can produce, on both UDP and RFC 6587 octet-counted TCP.
-
-That exact message and its frozen wire string are now a permanent offline
-golden test (`external anchor: message live-verified by a real rsyslogd`,
-`src/root.zig`) — asserted against the literal bytes, not re-run against
-rsyslogd at test time (the governing rule: run the foreign thing once, freeze
-its bytes, assert offline). No `/NOTICE` entry: `rsyslogd` was used purely as a
-black-box receiving oracle — its own parser's rendering was observed, no
-rsyslog source was read or consulted (root `NOTICE` §0, the same relationship
-as `icmp`/`genetlink`/`nftables`/`traceroute`).
-
-**Audit 2026-11-15 (delta mutation).** 19 schemata mutants over `journal.stderrIsJournal`/`fdIsJournalStream`/
-`parseDecimal`/`makedev`, ReleaseSafe, one build, each mutant under `setsid -w timeout` and `ulimit -v`: the
-descriptor (2 as 1), the colon split and both slices, `AT_EMPTY_PATH`, the statx mask and error test, the verdict
-(`and` as `or`, each half dropped, the inode forced), the empty-string and digit-range checks of `parseDecimal`, and each
-term of `makedev`. 10 killed in the first run; 9 survived. Tests added: `makedev` against known glibc values
-(the old test computed the expected string with `makedev` itself, so a wrong encoding agreed with itself), a direct
-`parseDecimal` test (sign, underscore, hex, overflow, digit edges), and a `stderrIsJournal` test that points fd 2 at a
-pipe for its duration (stdout and stderr are often the same file in a harness, which hid fd 1 vs 2). 16 killed. Left: the
-empty-string check in `parseDecimal` is EQUIVALENT (`parseInt` refuses an empty string); dropping the statx mask is
-UNOBSERVABLE (the kernel returns the inode of a pipe or socket whatever the mask says; it needs a filesystem that
-fills `st_ino` only on request); ignoring a failed `statx` is UNOBSERVABLE (the kernel writes nothing on error, so
-the result depends on uninitialised stack; a test would have to pin the fill pattern, which is build-mode dependent).
-16/19, 1 equivalent, 2 unobservable.
-
-**Audit 2026-10-04 (mutation).** 33 schemata mutants over PRI, the timestamp range and
-offset rendering, header-field NILVALUE/length/printable rules, SD-NAME and SD-value
-escaping, the RFC 3164 encoder (sanitizing, TAG filter and cap, day padding), the UDP
-datagram truncation, octet counting, and the unix/journal emitters (socket path, field-name
-rules, binary field form, field-count caps, PRIORITY digit): 32 killed, 1 equivalent, 0 left
-alive. Equivalent: dropping the `om == 0` special case (the general path prints `+00:00`
-for 0 too). One defect found and fixed: `buildDatagram` added the truncation marker only when
-the formatted bytes exceeded `udp_limit`; with `udp_limit >= scratch.len` a message longer
-than the scratch came back exactly `scratch.len` bytes and unmarked. Tests added for the fix
-and for the 6 real gaps (the first instant past year 9999, an empty header field, a 33-byte
-SD-NAME, a budget shorter than the marker, a 108-byte unix socket path, `sendMessage` over
-`max_fields`).
+- **A listener / daemon** — a daemon's job (rsyslogd); `nextFrame` + `parse` are what one would call.
+- **macOS / BSD local paths** — the emitters are Linux syscalls and `meta.targets` is `linux64`; `open(path)`
+  takes any path.
+- **A TLS stack in the module** — RFC 5425 is a seam (`WriterEmitter` over the caller's session); a production
+  dependency on a TLS stack would put its size cost on everyone.
+- **Host names in `connect`** — `std.Io.net.HostName` resolves; the caller resolves and passes an address.
+- **RFC 3195 (BEEP) and a Cisco IOS format** — 3195 is dead; a Cisco line reads through `parseBsd` with the
+  vendor text in `msg`.
+- **Best-effort partial RFC 5424** (a go-syslog option) — `parseAny` falls back to the lenient reading
+  instead of half a message.
+- **Microsecond stamps in the encoder** — milliseconds are the documented choice; the parser reads six digits.
+- **Delivery guarantees beyond at-least-once.**
 
 ## Backlog / deferred
 
-Closed 2026-11-02: parser, `std.log` sink, reconnect, RFC 5425 seam, memfd, TCP send deadline (done 2026-10-31, this list was stale), UTF-8 cut. See `## Compared with`.
-
-- **A host name in `ReconnectingEmitter.Target`, re-resolved per connect** (survey 2026-11-02): a collector behind a DNS change is not followed today, since the target is an address. Effort small, once `std.Io.net.HostName` is taken as a dep on `Io` semantics. Fits §2.
-- **A mutation run over the 2026-11-02 surface** (`parse.zig`, `logger.zig`, `ReconnectingEmitter`, `sendThroughMemfd`): swept, fuzzed and blind-reviewed once (Sonnet, read-only: the backoff measured from the attempt, a multi-line record refused on LF framing, a line below any header, `in_sink` global to the thread, a second deadline on the memfd path, all fixed the same day); the audit line's score predates it.
-- **`UnixEmitter` and `connectUnix` with an abstract-namespace path** (review): the fixed `sockaddr_un` length cannot name one, a NUL in a path cuts it. Not refused today; nobody asked for them.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- ~~**`journal.stderrIsJournal` (consumer request 2026-11-15; effort S).** Choosing between plain stderr lines and journald-native output needs systemd's documented `JOURNAL_STREAM=<dev>:<ino>` check against `fstat(2)` of fd 2; nothing in the repo does it (`rg JOURNAL_STREAM modules/syslog` is empty; `journal` in `src/unix.zig` is the datagram emitter only). Expected: sd_journal_stream / the systemd protocol, Go `go-systemd` `journal.StderrIsJournalStream`. Proposed: `syslog.journal.stderrIsJournal(io, journal_stream_env: ?[]const u8) bool` (env passed in, so the module reads no global state; false on any parse error or non-Linux).~~ **Done 2026-11-15:** `journal.stderrIsJournal(journal_stream_env: ?[]const u8) bool` and `journal.fdIsJournalStream(fd, env)`. The `io` parameter of the proposal is dropped (the module is raw-syscall throughout; `statx(fd, "", AT_EMPTY_PATH)`). The env value is parsed strictly as `<decimal dev>:<decimal ino>` (glibc `makedev` encoding of `st_dev`); any malformed value or `statx` failure is `false`.
-
-## Status
-`gap · any · client + codec · reentrant` + deps: `datefmt` — canonical source is
-`pub const meta` in src/root.zig.
+- **A host name in `ReconnectingEmitter.Target`, re-resolved per connect:** a collector behind a DNS change is
+  not followed, since the target is an address. Effort small, once `std.Io.net.HostName` is taken as a dependency
+  on `Io` semantics.
+- **A mutation run over `parse.zig`, `logger.zig`, `ReconnectingEmitter` and `sendThroughMemfd`:** the card's
+  mutation score predates this surface (swept, fuzzed and blind-reviewed, not mutation-tested).
+- **`UnixEmitter` and `connectUnix` with an abstract-namespace path:** the fixed `sockaddr_un` length cannot name
+  one, and a NUL in a path cuts it. Not refused today; nobody asked for them.
 
 ## Anchoring
 
@@ -292,7 +240,3 @@ Closed 2026-11-02: parser, `std.log` sink, reconnect, RFC 5425 seam, memfd, TCP 
 **The parser.** src/parse_oracle_test.zig holds it against both foreign parsers offline: rsyslogd's verdicts on all of `rsyslog_oracle_vectors.zig` (it must read each message as rsyslogd did), and go-syslog v4.6.0 on the RFC's examples, every grammar edge and 1500 seeded damaged lines (`tools/go_oracle`, 1634 lines, 187 it accepts): same verdict, same fields, three named rules of disagreement. The first replay found one defect in ours: a line with no timestamp lost its HOSTNAME, where rsyslogd read it. `tools/live_oracle.py` (2026-11-02, OpenSSL through Python 3.14, rsyslogd 8.2512, systemd 259) is live only, nothing frozen: RFC 5425 through `tlsclient`, a daemon restart between two records, LF framing, 3 MiB through journald's memfd path, all ok.
 
 **What the tests actually contain.** src/rsyslog_oracle_test.zig replays a real rsyslogd 8.2512 (`tools/interop.zig` + `tools/rsyslog_oracle.py` → `rsyslog_oracle_vectors.zig`) on 565 messages of ours — all 192 PRIs, timestamps at and past every edge (epoch, leap days, year 9999, offsets to ±32767 minutes), every byte class at and past every header-field limit, hostile SD-IDs, PARAM-NAMEs and values (escapes, NUL, invalid UTF-8, 600 bytes), MSG shapes, datagrams past the UDP limit, RFC 3164 lines with every hostname/TAG/PID shape: each RFC 5424 message as `buildDatagram`'s datagram over UDP AND as the `writeOctetCounted` frame over TCP, parsed back to its PRI, instant, millisecond and offset, header fields after the documented sanitizing and limits, every SD-PARAM value unescaped (mmpstrucdata), MSG byte for byte. The same run has a real systemd-journald 259 store exactly the fields of each `journal.Emitter` datagram (values empty, binary, newline-bearing, 4 KiB, forging `\nMESSAGE=`; repeated names; 61 fields), keep exactly the 22 probed field names `validFieldName` accepts, and read `UnixEmitter`'s datagrams on dev-log (`/dev/log` on a systemd host); src/unix.zig's last test replays those bytes through the real emitters. One listed divergence (`RSYSLOGD_YEAR_2100`, decided by RFC 3339 and Python `datetime`). Self only: `nowTimestamp`'s clock read
-
-**rsyslogd + journald oracle 2026-10-05.** Five defects, fixed the same day: the RFC 3164 HOSTNAME default `"-"` (and an IPv6 literal, `host:1`, `evil app[1]:`) was read as the TAG — the field is now sent only when it is a host name or IPv4 address; `UnixEmitter.sendBsd` sent a HOSTNAME, so journald parsed no identifier — now never; an offset past ±23:59 printed the clamped offset over a clock shifted by the full one (a different instant) — now clamped first; `journal.Emitter.send` failed `EFAULT` on an empty value from an allocator (and `sendRaw` on an empty buffer) — a valid address is substituted; a `]` in a PID closed `[PID]` early. An empty SD-NAME (outside RFC 5424's grammar, accepted by rsyslogd) is now written `-`.
-
-**How it got there.** The anchoring work landed. DONE a58d626: real rsyslogd receives+re-renders both transports; MSG escaping bug class

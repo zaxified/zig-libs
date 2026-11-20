@@ -5,10 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Delta mutation audit of `journal.stderrIsJournal` and helpers (19 schemata mutants: 16 killed, 1 equivalent, 2 unobservable; new tests for the `makedev` encoding against known values, `parseDecimal` edges and fd 2 vs fd 1).
 - **2026-11-15** — **NEW:** `journal.stderrIsJournal(env)` and `journal.fdIsJournalStream(fd, env)`: systemd's `JOURNAL_STREAM=<dev>:<ino>` check against `statx` of the descriptor (consumer request 2026-11-15). The caller passes the env value; false on any parse error or syscall failure.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** Backlog: journald stderr detection (consumer request triaged into `SPEC.md` § "Backlog / deferred"; no code).
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `nowTimestamp` and the `Logger` default clock (duplicate-code pass) read `clock.realtimeMs()`; 0 on a failed read as before. The two monotonic reads that return null on failure (`unix.zig`, `transport.zig`) stay, because `clock` cannot signal failure. New dependency: `clock`.
 - **2026-11-02** — **FIX (blind review of the same day's surface):** `ReconnectingEmitter` backoff runs from the failure of a connect, not its start; `Logger` turns a sink's trailer byte into a space instead of having the record refused; `Options.max_line` has a floor of `min_line_limit` (128); a sink may forward to another logger (re-entry is per logger); one deadline over `journal.Emitter`'s memfd path, `memfd_create` failures mapped by cause. **DOCS:** the parity card.
 
@@ -18,9 +15,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-31** — **BREAKING (small):** no-panic sweep + blind review (§ GY). `UnixEmitter` and `journal.Emitter` no longer block forever on a stuck `/dev/log`/journald: the send is non-blocking with one deadline (`send_timeout_ms`, default 1000; 0 = fail at once), then `error.WouldBlock` (new in `WriteError`), and the record is dropped. `MSG_NOSIGNAL` is set on every send. `TcpEmitter.connect` gets a 5 s deadline (new `connectTimeout`), and its error set is now the explicit `TcpEmitter.ConnectError`. `send` has one deadline per frame (`send_timeout_ms`, default 1000) → `error.Timeout`. After a failure with part of a frame on the wire, the emitter is sticky `error.Broken` (close and reconnect). New `SendError` members: `Timeout`, `Broken`.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig`: `arena.dupeZ` (removed in Zig 0.17) -> `dupeSentinel(u8, raw, 0)`.
 - **2026-10-05** — **Anchoring: a real rsyslogd and a real systemd-journald judge every encoder and emitter**
   (`tools/rsyslog_oracle.py`, `tools/interop.zig`, `src/rsyslog_oracle_test.zig`, replay in `unix.zig`): 617 cases.
   rsyslogd 8.2512 (unconfined copy, `unshare -rn`) parses each RFC 5424 message from `buildDatagram` (UDP) and the

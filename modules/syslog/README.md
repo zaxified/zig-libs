@@ -22,7 +22,8 @@ native protocol), and a `Logger` with a `std.log` sink.
   threads. **Allocation:** none — fixed buffers throughout (`journal.Emitter.send`
   references a caller's field values zero-copy via `sendmsg` scatter-gather; the
   parser returns slices of its input).
-- **Deps:** `datefmt` (RFC 3339 / BSD timestamp rendering).
+- **Deps:** `datefmt` (RFC 3339 / BSD timestamp rendering), `clock` (`nowTimestamp` and the `Logger`
+  default clock).
 
 Provenance: clean-room from RFC 5424 (syslog protocol), RFC 6587 (TCP octet
 framing) and RFC 3164 (BSD legacy). The `Message`/`Sender` *design* (a pure
@@ -287,9 +288,9 @@ zig build test-syslog                          # Debug
 zig build test-syslog -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
-## Not implemented, on purpose
+## Not provided
 
-- **A listener / daemon**: rsyslogd's job; the parser is the part a program needs.
-- **macOS / BSD local paths**: the emitters are Linux syscalls; `open(path)` takes any path.
-- **A TLS stack in the module**: a seam, above.
-- **Microseconds in the encoder**: milliseconds are what it prints; the parser reads up to six digits.
+A listener or daemon, macOS/BSD local paths, a TLS stack in the module, host names in `connect`,
+RFC 3195 and Cisco formats, microsecond stamps in the encoder: the reasons are in SPEC.md
+*What is deliberately not done*; the one open gap (re-resolving a host name per reconnect) is under
+*Backlog / deferred*.
