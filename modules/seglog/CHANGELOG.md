@@ -9,17 +9,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `.idx` until sealed) and extends it over the appended tail, so `seek` / `seekTime` there no longer re-walk the whole
   segment per call. The cache covers only whole CRC-valid records and is dropped on a new newest segment, a shrunk
   segment or a changed last record. No API change.
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** new offline tool `tools/seglog-dump` (`zig build install-dump-seglog`): `segments`, `verify`, `seek --lsn|--time`, `get --lsn [--hex]` and `rebuild-manifest` over a log directory, read-only except the last; public API only, no library change. Smoke script `tools/seglog-dump/smoke.sh`.
 - **2026-11-16** — Review LOW-6 and LOW-8: an `OutOfMemory` in `dropBefore` (or before `compress`'s rename) no longer
   leaves `segments()` ahead of the manifest on disk with the log unpoisoned (a retry found nothing to drop); every
   allocation now happens before the view changes. `Stats.compress_verify_failed` counts only a real read-back mismatch.
   Two failing-allocator sweeps.
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** documentation only (review LOW-10): the README backup warning now
-  describes `OrphanSegment` and `rebuildManifest` instead of a truncated segment, SPEC lists manifest form 2 (a migration
-  under way) and that `compact` verifies a recompressed segment, the module doc lists every file in the directory, and
-  `CompressError` no longer carries `compact`'s doc comment.
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** the two independent reviews of the day recorded on the card.
-- **2026-11-16** — NO CONSUMER-VISIBLE CHANGE: delta mutation audit of the day's review fixes and survey additions, 104/111 killed, 6 equivalent, 1 unobservable (SPEC, *Audit 2026-11-16 (delta mutation)*); seven new tests and three extended ones in `src/root.zig` and `src/migrate_test.zig`, no library change.
 - **2026-11-16** — Review fixes to the same day's changes (before any release): `rebuildManifest` refuses a MANIFEST of an
   unknown format version with a good CRC (`ManifestPresent`) instead of overwriting a newer writer's; `rotate` returns the new
   `RotateError.LsnExhausted` once every LSN is used (it could still write an unreopenable manifest); `isEmpty` now returns
@@ -29,20 +22,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-16** — New `Log` / `Concurrent` calls from the survey's gap list: `firstLsn() ?u64`, `lastLsn() ?u64`, `isEmpty() bool` (of a writer, like `nextLsn`); `get(lsn, buf) GetError![]u8` (one record's payload copied into `buf`; `NotFound`, `SegmentGone`, `BufferTooSmall`); `dropBeforeLsn(lsn) DropError!usize` (drops the closed segments wholly below `lsn`, whole segments only, never the newest). `Concurrent` also gains `compactByKey`, `verify`, `segmentsAlloc(gpa)` (an owned copy of `segments()`), `segmentFirstLsn`, `end`, `bytesCutOnOpen`, `isPoisoned`, `migration` and `translatePosition`, each under the lock.
 - **2026-11-16** — **BEHAVIOUR CHANGES:** `append*` returns the new `error.LsnExhausted` instead of writing a record whose LSN is above 2^62 (a log that then did not reopen); `seek(0)` is the first record, not `SegmentGone`, on a log whose first segment starts at LSN 1; a storage error in the second or a later frame of one read of a compressed segment is returned as that error (it was a short read that the iterator reported as `Corrupt`). Bug: `seek` of an LSN compaction removed from the end of a compacted segment returned `Corrupt`; it now lands on the next record.
 - **2026-11-16** — **BEHAVIOUR CHANGES:** `compact` of a compressed segment reads the rewritten `.zst` back before replacing the old one, as `compress` does; a mismatch keeps the old segment and returns the new `error.CompressVerifyFailed` (counted in `Stats.compress_verify_failed`). `rebuildManifest` now replaces a `MANIFEST` that does not decode (empty, truncated, failed CRC) instead of refusing it with `ManifestPresent`; a `MANIFEST` that decodes is still refused. `open` accepts a newest segment whose header is all zeros (`preallocate`, crash in `rotate`) as an unfinished creation instead of returning `Corrupt`; a bad header with any non-zero byte is still `Corrupt`.
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** documentation: the audit line and the whole-module
-  mutation audit (355 mutants, 301 killed, 46 equivalent, 7 unobservable, 1 finding) recorded in SPEC.
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** tests only: sharper tests for the read window's
-  short-read memory, a reader meeting a torn segment header, a manifest first LSN of 0, and `resync`
-  past a record whose LSN is beyond any log (mutation audit, second pass).
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** tests only, from the whole-module mutation audit
-  (SPEC *Anchoring*): unit tests for the sparse index, the tally, the seal codec and the read window;
-  the on-disk layout byte by byte (header, record, seal, manifest, index); the durability protocol as
-  a call-by-call trace of the storage seam (which writes, syncs, renames, truncates, deletes and
-  directory syncs each operation makes); every field of the manifest, the index file and a seal
-  refused when wrong with a good CRC; seek and `resync` edge cases; a migration whose converted
-  segment is well formed and wrong.
-- **2026-11-16** — **NO CONSUMER-VISIBLE CHANGE:** scope survey and independent review recorded in `SPEC.md`: `**Scope:**` is `core` (reference tidwall/wal v1.2.1, shape model Kafka's log layer), new `## Compared with` table and `## Backlog / deferred` (four gaps proposed for implementation: `dropBeforeLsn`, `firstLsn`/`lastLsn`/`get`, `Concurrent` pass-throughs, a dump tool; plus the review's unfixed defects). No code changed; `zig build gen-catalog` not yet run.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-15** — Tools wired into zig-libs (they still named the old consumer's
   paths and build steps): `example/bench.zig` is now `tools/bench.zig`, so `zig build
   bench-seglog -- <scenario> <dir> ...` builds and runs it (ReleaseFast, as for

@@ -6,11 +6,12 @@ record keeps its `Position` until its segment is dropped, and a consumer can
 persist a position and resume from it after a restart. Every record also has
 an **LSN** — 1, 2, 3 … across the whole log, never reused — and a timestamp.
 
-**Status:** a zig-libs module since 2026-11-15, moved from the energy-monitoring consumer's
-the ingest daemon's `seglog/` (its first consumer, which has not switched to this copy
-yet; ⚠ it meets `error.TooManySegments` in `RotateError` and `AppendError`, new
-2026-11-15, when it does: a `switch` over those sets needs the arm). Depends on `kv` (the `Storage` seam and `SimStorage` crash simulator),
-`crc32c` and `zstd`.
+**Status:** a zig-libs module; its first consumer is an energy-monitoring ingest
+daemon, which has not switched to this copy yet. An exhaustive `switch` over
+`RotateError` / `AppendError` needs the arms `TooManySegments` and
+`LsnExhausted` (`AppendError` also `TimestampOutOfRange`), and over `CompactError`
+`CompressVerifyFailed`. Depends on `kv` (the `Storage` seam and `SimStorage` crash
+simulator), `crc32c` and `zstd`.
 
 **Model after:** the LevelDB log format and the Prometheus TSDB WAL for the
 record format and for repairing only the last segment; Kafka log segments for
@@ -63,6 +64,9 @@ _ = try log.dropBefore(today - 30);               // never drops the newest
 - **Retention**: `dropBefore(id)`, or `enforceRetention(.{ .max_bytes, .max_age },
   now)` — oldest first, by the files' size and by each closed segment's newest
   timestamp (from its seal); never the newest segment.
+- `firstLsn()`, `lastLsn()` and `isEmpty()` (null on a read-only log),
+  `get(lsn, buf)` (one record's payload by LSN) and `dropBeforeLsn(lsn)` (drops the
+  closed segments wholly below it) are on `Log` and `Concurrent`.
 
 **Seek.** `log.seek(lsn)` and `log.seekTime(t)` return the `Position` to start
 an iterator from: the segment from the manifest, then a sparse index per
@@ -118,19 +122,17 @@ and the first `rotate` that reaches a restored segment's name refuses with
 Back both up, or neither, in one step; a lost `MANIFEST` is rebuilt with
 `Log.rebuildManifest` (below).
 
-**Recovering a lost `MANIFEST`.** Every other kind of damage already has a
-path back (a torn tail is repaired on `open`, `resync`/`skipSegment` step
-over mid-segment damage, a missing `.idx` is rebuilt by a walk) — a torn or
-corrupt `MANIFEST` did not, until `Log.rebuildManifest(gpa, store, ids)`:
-given the segments' ids in order (an operator's `ls seg-*.log seg-*.zst`, or
-a small wrapper that lists the directory — `kv.Storage` has none), it reads
-each one's own header and seal and writes a fresh manifest, refusing if they
-disagree with each other or a manifest is already there. Run `Log.verify`
-afterwards: this checks headers and seals, not every data record.
-the ingest daemon's tools: `manifest-rebuild --dir LOG` is the wrapper: it does the
-directory listing (`std.Io.Dir`, since this is an offline recovery tool, not
-the online path the "no listing" reasoning above is about) and calls
-`rebuildManifest`.
+**Recovering a lost `MANIFEST`.** Every other kind of damage has a path back (a
+torn tail is repaired on `open`, `resync`/`skipSegment` step over mid-segment
+damage, a missing `.idx` is rebuilt by a walk), and so has a torn or corrupt
+`MANIFEST`: `Log.rebuildManifest(gpa, store, ids)`, given the segments' ids in
+order (an operator's `ls seg-*.log seg-*.zst`, or `tools/seglog-dump
+rebuild-manifest`, which lists the directory: `kv.Storage` has no listing),
+reads each one's own header and seal and writes a fresh manifest. It refuses
+(`error.Corrupt`) if the segments disagree with each other, and
+(`error.ManifestPresent`) if a manifest that decodes is already there; one that
+does not decode is replaced. Run `Log.verify` afterwards: this checks headers
+and seals, not every data record.
 
 **Upgrades.** A log in the previous format is migrated by the writer's `open`
 itself: checked whole first (damage refuses it, nothing written), converted
@@ -178,12 +180,11 @@ and a reader in another process. Writing is disk-bound for all three.
 workloads (appends, rotations, drops, compaction, compression,
 preallocation, `Concurrent`) under four crash models, and again inside the
 recovering `open`. A fuzz harness damages every kind of file; its
-deterministic driver (`SEGLOG_FUZZ=<runs>`) runs 160 000 cases in about two
-minutes with a watchdog per case. On a real ext4 filesystem,
-`tools/crash-dm/run.sh` (root) records the workload through dm-log-writes and
-checks the log at every flush and FUA write: all 301 states of a 300-record
-run, with and without preallocation, clean. Guards are mutation-checked (see
-`SPEC.md`, *Anchoring*).
+deterministic driver (`SEGLOG_FUZZ=<runs>`) runs it with a watchdog per case.
+On a real ext4 filesystem, `tools/crash-dm/run.sh` (root) records the workload
+through dm-log-writes and checks the log at every flush and FUA write, with and
+without preallocation. The card's `**Audit:**` line is the mutation score; see
+`SPEC.md`, *Verification*.
 
 Provenance: clean-room from the publicly documented designs named above; no
 third-party implementation was studied and no source was consulted, so no

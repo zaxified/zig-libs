@@ -20,15 +20,13 @@
 
 **Consumers:** an energy-monitoring consumer's ingest daemon (ingest daemon's primary store) — still builds its own copy under the ingest daemon's `seglog/` and has not switched to this module yet, so the card says `no` above.
 
-**Provenance (history before this module existed here).** `seglog` was written inside an energy-monitoring consumer's ingest daemon as a "zig-libs module in waiting" and moved here unchanged on 2026-11-15 (the edits: `meta.deps` now names all three imports, `kv`, `crc32c`, `zstd`, `zig fmt` reformatted `root.zig`, `fault_test.zig` and `example/bench.zig`, `fuzz_test.zig`'s first draw became `value(u64) % 4` for check-fuzz-reach, and `example/main.zig` was added). What the energy-monitoring consumer history records, and nothing more: format version 2 and migration from version 1 (2026-09-27); guard-removal mutation checks run by hand against the suite (2026-09-21, preallocation 13 of 13 on 2026-09-27, before the runners were deleted — see *Anchoring*); the fuzz driver (`SEGLOG_FUZZ`, 160 000 cases in about two minutes, per README); the `tools/crash-dm` dm-log-writes run on ext4 (2026-09-27, see *Anchoring*); an audit in the energy-monitoring consumer (`ingest-consumer audit 2026-09-27`, findings L1–L6 in `CHANGELOG.md`). None of these was re-run for the move, none is an audit of this tree in zig-libs' sense, so Audit stays `none` and Hardening `fuzz none` until a run is recorded here with a date.
-
 ## Compared with
 
 Surveyed 2026-11-16 per `SURVEY-PLAYBOOK.md`; stars and dates fetched from the GitHub API that day (`pkg.go.dev` / `docs.rs` / `crates.io` where noted). No foreign source was read: the comparison is from READMEs, published API listings and repository metadata. Licences are the `LICENSE` file texts; hashicorp/raft-wal is MPL-2.0 (copyleft), so only its README was opened. The throughput rows (tidwall/wal, Prometheus `wlog`) are the 2026-09-27 numbers in `README.md` § "How it compares" and were not re-run for this survey; for every other row nothing was measured.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [tidwall/wal](https://github.com/tidwall/wal) — **reference** | Go | MIT | 733 | v1.2.1 (2025-08-31, pkg.go.dev); pushed 2025-08-31 | One dense-index log: `Write(index, data)`, `WriteBatch`, `Read(index)`, `FirstIndex`/`LastIndex`/`IsEmpty`, `TruncateFront(index)`, `TruncateBack(index)`, `Sync`, `NoSync`, `SegmentSize` (20 MB), a segment cache, a JSON log format. Records carry no checksum and `open` does no tail check *(from the README and API listing; our measurement, `tools/bench-go`)*. Has truncation from both ends at any index and `Read(index)`; this module has neither `truncateAfter` nor a one-call read by LSN. Equal on small synced appends (disk-bound), 2× on scans, ~110× on seek, ~20× slower on `open` (0.07 s vs 3.5 ms for 155 MB: we walk and check the tail). |
+| [tidwall/wal](https://github.com/tidwall/wal) — **reference** | Go | MIT | 733 | v1.2.1 (2025-08-31, pkg.go.dev); pushed 2025-08-31 | One dense-index log: `Write(index, data)`, `WriteBatch`, `Read(index)`, `FirstIndex`/`LastIndex`/`IsEmpty`, `TruncateFront(index)`, `TruncateBack(index)`, `Sync`, `NoSync`, `SegmentSize` (20 MB), a segment cache, a JSON log format. Records carry no checksum and `open` does no tail check *(from the README and API listing; our measurement, `tools/bench-go`)*. Has truncation from both ends at any index and `Read(index)`; this module has the one-call read (`get`) and a head truncation at segment granularity (`dropBeforeLsn`), but no `truncateAfter`. Equal on small synced appends (disk-bound), 2× on scans, ~110× on seek, ~20× slower on `open` (0.07 s vs 3.5 ms for 155 MB: we walk and check the tail). |
 | [Apache Kafka](https://github.com/apache/kafka) log layer — **shape model** | Java | Apache-2.0 | 34.2k | pushed 2026-11-15 (no GitHub release object) | The design this module follows: segments named by first offset, a sparse offset index and a time index per segment, `segment.bytes` / `segment.ms`, `retention.bytes` / `retention.ms` by whole segment, key compaction, per-batch compression, `preallocate`, `flush.messages` / `flush.ms`. Not an embeddable library, so it cannot be diffed against. This module has all of those except truncating the log's tail (Kafka does it on leader change) and compression per batch (here: per closed segment, seekable zstd) *(from the documentation as remembered; not re-fetched this session)*. |
 | [Prometheus tsdb/wlog](https://github.com/prometheus/prometheus) | Go | Apache-2.0 | 67.6k | v3.16.0 (2026-11-05) | The WAL this module's repair-only-the-newest-segment rule is modelled on: 32 KiB blocks (LevelDB format), segments numbered, optional snappy/zstd of records, checkpoints written by the caller. Benchmarked in `tools/bench-go` (7 B/record, no per-record LSN or time, no index, no seek). Repair on read, no seals on closed segments. *(measured; format from the docs)* |
 | [etcd server/storage/wal](https://github.com/etcd-io/etcd) | Go | Apache-2.0 | 52.6k | v3.7.3 (2026-10-22) | `Create`/`Open`/`ReadAll`/`Save`/`Cut`/`ReleaseLockTo`/`Verify`: 64 MB preallocated segments, a CRC32C chained through every record (a missing or reordered record fails the chain), fsync per `Save` batch, a repair for a torn last record, `fsync` latency as a Prometheus histogram. Locks segments for readers and releases them as the caller's snapshots advance. This module has the preallocation, the fsync latency histogram and the torn-tail repair; it detects a lost record by LSN and seal instead of a chain. *(inferred from the package documentation as remembered; not re-fetched)* |
@@ -46,7 +44,7 @@ Surveyed 2026-11-16 per `SURVEY-PLAYBOOK.md`; stars and dates fetched from the G
 
 **Reference.** tidwall/wal: the closest permissive library to what this module offers (a numbered, durable, truncatable log a program embeds), already benchmarked in `tools/bench-go`, and the one a Go programmer reaching for "a WAL" meets first. Kafka's log layer is the model for segments, indexes and retention but is not a library. **Fastest.** Not established: the three measured (seglog, tidwall/wal, Prometheus `wlog`) are disk-bound on synced appends and within a few percent of each other on batches; seglog reads faster than both on small records, `wlog` and tidwall `open` faster. The Java and Rust rows (Kafka, raft-engine, okaywal) were not measured, so no row carries the **fastest** mark and the card has no `**Ahead:**` line.
 
-**Where we are ahead** (from the README numbers and reading the documentation, none re-run today): a CRC on every record and a check of the newest segment's tail on `open` (tidwall: none; `wlog`: when a reader reaches damage; raft-wal: by design none on read); an LSN and a timestamp in every record, and closed segments sealed so a lost tail or record is reported, never shortened (none of the Go logs); preallocation with `fdatasync`, group commit across threads and an fsync latency histogram in one library; compression of closed segments in the seekable zstd format that `zstd -d` reads back byte for byte (Prometheus: per-record, no seek; raft-engine: lz4 per entry; the rest none); Kafka-style key compaction and a time index (`seekTime`), which no Go WAL library listed here has; a read-only open in another process beside a live writer; and the verification — an injectable `Storage`, a crash sweep over every side effect under four crash models, a deterministic fuzz driver and a dm-log-writes run on a real filesystem. **Where we are behind:** no truncation of the log's tail (`TruncateBack`, `truncate(offset)`, raft-wal's suffix truncate) and no truncation of its head below segment granularity; no `Read(index)` / `FirstIndex` / `LastIndex` one-liners; atomic multi-record batches (raft-engine, okaywal) are not offered — a batch is a prefix after a crash; 25 bytes of overhead per record against 2–7; `open` walks the whole newest segment (linear, 2.3 GB/s); Linux only (`meta.targets` is `.linux64`; `allocate` and `syncData` are raw Linux syscalls in `kv`) where the Go libraries are portable; no ready-made offline dump / verify tool (Kafka, etcd and raft-engine ship one). The gaps are listed, with the ones proposed for implementation first, under Backlog.
+**Where we are ahead** (from the README numbers and reading the documentation, none re-run today): a CRC on every record and a check of the newest segment's tail on `open` (tidwall: none; `wlog`: when a reader reaches damage; raft-wal: by design none on read); an LSN and a timestamp in every record, and closed segments sealed so a lost tail or record is reported, never shortened (none of the Go logs); preallocation with `fdatasync`, group commit across threads and an fsync latency histogram in one library; compression of closed segments in the seekable zstd format that `zstd -d` reads back byte for byte (Prometheus: per-record, no seek; raft-engine: lz4 per entry; the rest none); Kafka-style key compaction and a time index (`seekTime`), which no Go WAL library listed here has; a read-only open in another process beside a live writer; and the verification — an injectable `Storage`, a crash sweep over every side effect under four crash models, a deterministic fuzz driver and a dm-log-writes run on a real filesystem. **Where we are behind:** no truncation of the log's tail (`TruncateBack`, `truncate(offset)`, raft-wal's suffix truncate) and no truncation of its head below segment granularity; atomic multi-record batches (raft-engine, okaywal) are not offered — a batch is a prefix after a crash; 25 bytes of overhead per record against 2–7; `open` walks the whole newest segment (linear, 2.3 GB/s); Linux only (`meta.targets` is `.linux64`; `allocate` and `syncData` are raw Linux syscalls in `kv`) where the Go libraries are portable; The gaps are listed under *Backlog / deferred* (open) and *What is deliberately not done* (refused).
 
 ## What this module is, and what it is not
 
@@ -61,7 +59,7 @@ records, or reads an archive written from them.
 
 ## Format
 
-Version 2 (2026-09-27). Version 1 — no LSNs, no timestamps — is read only to
+Version 2. Version 1 — no LSNs, no timestamps — is read only to
 migrate from it (*Format versions and migration*). All integers little-endian.
 
 **Segment file** `seg-<id as 20 decimal digits>.log`, a 40-byte header:
@@ -93,11 +91,11 @@ record a log ever takes is LSN 1. LSNs run on across segments and are never
 reused, dropped segments included. Timestamps are the caller's (`appendAt`)
 or the log's clock's; they need not be monotonic.
 
-⚠ **One absurd timestamp is permanent** (2026-09-27, audit finding L3): a
+⚠ **One absurd timestamp is permanent** unless `Options.timestamps` bounds it: a
 segment's seal keeps only a running `min`/`max` of every `ts` ever added to
 it (`Tally`), with no bound of its own — so one caller mistake (a device
-clock badly stepped, cf. The ingest daemon's own `t` validation, a different layer)
-becomes the seal's `max_ts`/`min_ts` for good, once the segment is sealed.
+clock badly stepped) becomes the seal's `max_ts`/`min_ts` for good, once the
+segment is sealed.
 Two things then follow, both silent: `seekTime` — "the first record at which
 the newest timestamp so far reaches `t`" — matches that one record for every
 real `t` from then on, since its timestamp already "reached" anything; and
@@ -112,8 +110,8 @@ narrows the blast radius to the configured range instead of any `i64`;
 neither changes `seekTime`'s "newest so far" semantics for a query *inside*
 that range, which still matches a record at or after it — only a caller that
 knows its own domain's real bounds can close that with `.refuse`/`.clamp`.
-The default, `.unbounded`, is today's behaviour and the module's original
-contract. `compact` already fixes a poisoned segment's seal as a side effect
+The default, `.unbounded`, leaves any `i64` unchanged (the module's original
+contract). `compact` fixes a poisoned segment's seal as a side effect
 if the offending record is among those it drops (the seal is recomputed from
 the survivors) — a manual, non-obvious escape hatch, not a substitute.
 
@@ -168,57 +166,62 @@ recovery: a record in the newest segment that is damaged *and* complete stops
 the reader there, silently, until the writer's next `open` cuts it. It needs
 no manifest to notice a rotation — `rotate` syncs the seal before it commits
 the manifest naming the successor, so the reader meets the seal first and
-looks the successor up then; a guard for "refresh at the live end" was
-removed during mutation and nothing failed, so it went.
+looks the successor up then.
+
+**Opening read-only.** `Log.openReadOnly` (`src/root.zig:1540`) opens the log
+beside a live writer: no lock, every file opened `kv.Storage.OpenMode.read_only`,
+nothing created, repaired or deleted; `refresh` re-reads the manifest. The
+writer's own iterator opens segments `read_only` too, so a segment deleted from
+outside is `SegmentGone` instead of being recreated empty, and `open` without
+`create` leaves no empty `MANIFEST` in a directory that had none.
 
 **Why the manifest and not the directory.** `kv.Storage` has no listing, and
 a log that derived its segments from file names would adopt any stray file
 that looked like one.
 
-**Recovering a lost or torn `MANIFEST`** (2026-09-27, audit finding L4): every
-other kind of damage has a path back — a torn record's tail is repaired on
-`open`, mid-segment damage is `resync`/`skipSegment`'s to step over, a missing
-or wrong `.idx` is rebuilt by a walk — but a `MANIFEST` that fails its CRC or
-structural checks made `open` fail outright, with nothing the caller could do
-except restore from a backup or hand-craft a replacement (documented well
-enough to do by hand, but no tool did it). `Log.rebuildManifest(gpa, store,
-ids)` does: given the segments' ids, ascending, in the order they form the
-log, it reads each one's own header (which already carries its first LSN,
-the base-LSN field) and, for every one but the last, its seal (the last
-record of a closed segment always lies exactly at its end — see
-*Preallocation*), checks that consecutive segments' LSN ranges agree, and
-writes a fresh `MANIFEST` naming each one's form (raw or compressed,
-`SegStore` reads either transparently). It cannot discover `ids` itself — the
-same missing directory listing this section already explains — so a caller
-that can list the directory supplies them (the ingest daemon's tools: `manifest-rebuild
---dir LOG`, or an operator's `ls`). It refuses outright over a `MANIFEST` that
-still opens (not a way to override one `Log.open` accepts), and checks only
-each segment's own header and seal, never a data record's CRC or LSN sequence
-inside one — run
-`Log.verify` after. Not run: what a stray file the rebuild's caller
-mistakenly includes does (`SegStore`/`checkHeaderFlags` reject it once its
-header does not name the id it was found under, but two segments that
-happen to chain LSNs correctly and are NOT what the caller meant are not
-detectable from here).
+**Recovering a lost or torn `MANIFEST`.** Every other kind of damage has a
+path back — a torn record's tail is repaired on `open`, mid-segment damage is
+`resync`/`skipSegment`'s to step over, a missing or wrong `.idx` is rebuilt by
+a walk — and so has a `MANIFEST` that fails its CRC or structural checks:
+`Log.rebuildManifest(gpa, store, ids)` (`src/root.zig:1591`). Given the
+segments' ids, ascending, in the order they form the log, it reads each one's
+own header (which carries its first LSN, the base-LSN field) and, for every
+one but the last, its seal (the last record of a closed segment always lies
+exactly at its end — see *Preallocation*), checks that consecutive segments'
+LSN ranges agree (a gap, an overlap or a non-last segment with no readable
+seal is `error.Corrupt`), and writes a fresh `MANIFEST` naming each one's form
+(raw or compressed, `SegStore` reads either transparently); it writes nothing
+else (no `.idx`, no pending drops). It cannot discover `ids` itself — the same
+missing directory listing this section already explains — so a caller that can
+list the directory supplies them (an operator's `ls`, or `tools/seglog-dump
+rebuild-manifest`, which lists the directory with `std.Io.Dir`). It refuses
+(`error.ManifestPresent`) over a `MANIFEST` that decodes — a good CRC, a known
+version, counts that fit — since it is not a way to override one `Log.open`
+accepts, and replaces atomically one that does not (empty, truncated, failed
+CRC). It checks only each segment's own header and seal, never a data record's
+CRC or LSN sequence inside one — run `Log.verify` after. Not detectable from
+here: two segments that chain LSNs correctly and are NOT what the caller meant
+(`SegStore`/`checkHeaderFlags` reject a stray file once its header does not
+name the id it was found under).
 
 ## Limits and refusals
 
 - `max_record_len` (default 1 MiB): `append` refuses a longer payload, and a
   reader treats a longer length field as corrupt *before* allocating for it.
-  ⚠ **Lowering it after larger records were written** (2026-09-27, audit
-  finding L5) makes them read exactly like corruption, because the format
-  has no header or manifest field recording what limit was in force when a
-  segment was written — everything else a reader checks is self-describing
-  (LSN, CRC, seal counts), this is not. Reading one back: `Iterator.next`
-  gives it `Damage.Reason.record_too_long`, distinct from `bad_record` (the
-  reason every other "not a whole record" case gets), but still
-  `error.Corrupt` — there is no way to tell "real data, over today's limit"
-  from "this length field is garbage" from the bytes alone, only a
-  narrower name for the uncertainty. Writing into it: a writer's `open`
-  refuses outright with `error.RecordTooLongForOptions` if the *active*
-  segment holds such a record, rather than treating it like a torn tail and
-  silently truncating a real record the moment the option is lowered.
-  Raise `max_record_len` back, or accept the data loss deliberately.
+  ⚠ **Lowering it after larger records were written** makes them read exactly
+  like corruption, because the format has no header or manifest field
+  recording what limit was in force when a segment was written — everything
+  else a reader checks is self-describing (LSN, CRC, seal counts), this is
+  not. Reading one back: `Iterator.next` gives it
+  `Damage.Reason.record_too_long`, distinct from `bad_record` (the reason
+  every other "not a whole record" case gets), but still `error.Corrupt` —
+  there is no way to tell "real data, over today's limit" from "this length
+  field is garbage" from the bytes alone, only a narrower name for the
+  uncertainty. Writing into it: a writer's `open` refuses outright with
+  `error.RecordTooLongForOptions` if the *active* segment holds such a
+  record, rather than treating it like a torn tail and silently truncating a
+  real record the moment the option is lowered. Raise `max_record_len` back,
+  or accept the data loss deliberately.
 - At most 2²⁰ segment ids in a manifest (live plus pending drops), so a corrupt
   count cannot make `open` allocate without bound. `rotate` refuses the one
   that would exceed it with `error.TooManySegments` (also through
@@ -227,7 +230,9 @@ detectable from here).
   `dropBefore` makes room.
 - LSNs above 2⁶² are refused on disk (a manifest's first LSN, a record's LSN:
   `error.Corrupt` / `Damage.Reason.lsn_out_of_sequence`): no log reaches them,
-  and below them no LSN arithmetic can overflow whatever bytes a file holds.
+  and below them no LSN arithmetic can overflow whatever bytes a file holds. `append*` and `rotate` refuse with
+  `error.LsnExhausted`, before anything is written and without poisoning the log,
+  when the next LSN would pass them.
 - Segment ids strictly increase; rotating to the active id is a no-op;
   rotating to a sealed id is `error.NonMonotonic`.
 - `dropBefore` never drops the newest segment: it is where the id sequence
@@ -235,94 +240,10 @@ detectable from here).
 - A position must be one this log produced. One inside a header, between two
   live segments, or past the newest is `error.InvalidPosition`; one in a
   dropped segment is `error.SegmentGone`.
-
-## Anchoring
-
-No external truth exists: the format is ours. Expected values are the
-format's own arithmetic (positions in tests are computed from header and
-record sizes, not read back), and the crash model is `kv`'s `SimStorage`.
-
-What the suite is known to catch — each line a guard that was removed on
-purpose and the test that then failed (2026-09-21, before the runner was
-deleted):
-
-| guard removed | caught by |
-|---|---|
-| fsync in `append` | the crash sweep; `appendMany writes once and syncs once` |
-| the seal on `rotate` | the crash sweep |
-| the seal's count check | `a seal that disagrees with its segment is corrupt` |
-| "a closed segment ends in a seal" | `a closed segment that lost its seal` |
-| counting records | the crash sweep |
-| truncating the repaired tail | the sweep's tail invariant; `a torn tail … is cut` |
-| truncating before finishing a half-created segment | `a half-created segment whose name survived` (simulator tripwire) |
-| CRC check while scanning the tail | `a full-length record with bad bytes at the tail` |
-| header check in the reader | `a closed segment whose header names another id` |
-| durable-end bound in the reader | `a record whose fsync failed is never handed to a reader` |
-| manifest before file in `rotate` | the sweep's file-existence invariant |
-| pending list before delete in `dropBefore` | the crash sweep |
-| finishing drops on `open` | the sweep's file-existence invariant |
-| directory fsync in a manifest commit | the crash sweep |
-| "never drop the newest" | the crash sweep; `dropBefore … never the newest` |
-| that `fault_test.zig` runs at all | a planted `expect(false)` |
-| *read-only open (2026-09-22):* | |
-| "not yet" in the reader's live tail | `a reader stops at a record still arriving` |
-| patience for an unfinished newest segment | `a reader waits for a segment the writer has named` |
-| refresh when the next segment is unknown | `a reader beside a live writer …`; the real-filesystem reader test |
-| refresh for a start position in an unknown segment | `a reader resumes from a position in a segment it has not heard of yet` |
-| no lock taken by the reader | four reader tests (a lock-taking reader) |
-| manifest probed `read_only` | `looking for a missing log creates nothing` |
-| segments opened `read_only` | `a reader beside a live writer …`; `a reader waits …` |
-
-| *preallocation (2026-09-27, schemata, ReleaseSafe, 13 of 13):* | |
-| the `fallocate` call / whole steps / reserving at `rotate` | `preallocate: reserved in steps …` |
-| extending the reservation on append | the same; `a full disk refuses the append cleanly` |
-| cutting the reservation at the seal | `a read-only reader beside the writer …` |
-| zeros after a seal accepted / anything after a seal accepted | `zeros after a seal are a cut the crash lost …` |
-| zeros not counted as cut / zero tail truncated on open | the preallocated fault sweep |
-| the reader's second read at the live end | `a read-only reader beside the writer …` |
-| a full disk not poisoning | `a full disk refuses the append cleanly` |
-| the last-nonzero arithmetic | `a torn tail … is cut`, `a full-length record with bad bytes …` |
-| retention counting data, not the reservation | `retention by size counts the active segment's data …` (added: the mutant survived) |
-
-Three of those — the half-created segment, the full-length bad record and
-the failed fsync — are states `SimStorage` cannot produce, so they have
-direct tests. The first round of mutations found them green.
-
-**On a real filesystem** (`tools/crash-dm/run.sh`, 2026-09-27, ext4 on a
-64 MiB dm-log-writes device): 300 records appended with fsync each, rotating
-every 64 and compressing closed segments; the recorded writes replayed and
-the log checked on a mounted copy after every flush and every FUA write.
-Without preallocation 1 028 crash points, with it 456; both saw all 301
-states (0 … 300 records), each log opened, held exactly 1 … n with the right
-bytes and verified clean, n never went back, and all 300 acked records were
-there at the end. Getting "all states" took both kinds of point: with
-preallocation an fdatasync into written reserved blocks is a bare flush,
-and a record in a fresh unwritten block becomes readable only at the
-journal commit's FUA write.
-
-**Anchor grade:** class C · oracle n/a
-
-**Audit 2026-11-16 (mutation, whole module).** 355 schemata mutants over `src/root.zig` (the library part, before its tests), ReleaseSafe, one build with every mutant behind a runtime switch, one run per mutant in a detached copy, baseline first; one mutant per guard x operator class (drop a check, flip or shift a comparison, off by one, skip an assignment, take the other arm, skip a sync, a truncate, a delete or a directory sync, a wrong constant or field in the on-disk format). First pass against the suite as it was: 179 killed, 176 survived. The survivors drove 66 new tests (`root.zig`, `migrate_test.zig`): unit tests of the sparse index, tally, seal codec and read window; the layout byte by byte; the call-by-call trace of the storage seam; every manifest, index and seal field refused when wrong with a good CRC; seek and `resync` edges; a migration whose converted segment is well formed and wrong. Second pass over the survivors not argued away beforehand (130 ids, with the six first-pass hangs), and a third over five that the second left: every one of them killed except the arguments below. Four mutants (the `Concurrent` group-sync switches 251-253 and the iterator step 347) are real hangs at 60 s and count as killed. Result **301 killed (4 by hang), 46 equivalent, 7 unobservable, 1 finding**; no unexplained survivor.
-
-Killed / total by area: sparse index and encoders 15/15; tally 12/12; read window 7/13; compressed-segment store 2/7; record and header parsing 16/16; open, rotate, append, sync, retention, compression and compaction 8/8 (drops and cleanup) and 19/22 (seal and open of the newest segment); manifest load 22/23; manifest commit 10/10; tail scan 8/8; seek 20/25; index file 14/19; seal agreement 10/10; iterator `next` 27/28; `skipSegment`, `resync` 18/30; enter and start positions 16/20; `Concurrent` 7/9; migration (scan, convert, verify, read-back) 62/72; misc (position, latency) 8/8.
-
-Fate of every survivor:
-
-- **Equivalent (46).** Window reload versus extend and the boundary of the short-read memory give the same bytes (cost only): 29, 30 (every caller asks for at least 9 bytes), 32, 33, 36, 37. Skipping a segment by its seal's newest time, an empty active segment's walk, a reader's seal lookup, an empty index file versus a rebuilt one, an equal-time index entry, an entry with a duplicate offset, an entry LSN one too high (the walk only starts earlier): 77, 82, 85, 89, 101, 102, 105. An index file whose size is not a multiple of the entry length (the exact count check refuses it as well): 90. A reader never has `create`: 109. Only `.read_only` can answer `FileNotFound`: 41. A writer never reads the legacy-manifest flag again after `migrate`: 135. The flush threshold of the converting buffer only changes write chunking: 171. The directory sync after a converted segment's rename is covered by the manifest commit that follows at once: 176. A position past the data of a version-1 segment ends the walk by a failed parse: 192. Dead stores, since `rotate` discards the sealed segment's state: 223, 226. `Concurrent`: `durableLsn() <= want` ends through `syncBegin` returning null (255); the poisoned check is repeated by `syncBegin` (256). Shadowed pairs, each check redone by its partner on the same value: 312/318, 313/319, 315/320/321, and the seal header filter 316; the second `forget` of `retrySoft` is redone at the next call (297); `d.offset == segment_header_len` is covered by the expected-LSN branch before it (299); `it.seg != d.segment` with an open handle is unreachable (306); `break` versus `continue` once the window is past its end, with the short-read memory (311, 317). A writer's `refresh` is a no-op, so `enter` answers the same without it (332). A start position at a live end that is refused falls back to `seek` with the same outcome (337, 338, 339). A gap between uncompacted segments ends in `Corrupt` at the next segment's first record anyway (70); `>=` at the end of the `seek` walk is reached only after `==` has returned (73). The bad-frame bookkeeping of a compressed segment, each part shadowed by the others (44, 45, 47).
-- **Unobservable (7), with the injection each would need.** 177: the length prefix of the payload hash in a migration needs a converted file whose payload boundaries moved but whose bytes and record count stayed. 181, 183, 187, 188: the read-back of the temporary file checks the seal, the sealed flag and the record count after the exact file size has been compared; they need a backend that rewrites that file into a different structure of the same total length. 190: `translatePosition` bounds its walk by the synced end of the active segment, which differs only for a version-1 position past the migrated data, an out-of-contract input. 232: a newest segment whose header carries the compacted flag, which `compact` never produces; it needs a hand-written header.
-- **Finding (1).** 46: when a storage error hits while decoding the second or a later frame inside one `pread` of a compressed segment, `SegStore.pread` returns the bytes decoded so far; the caller sees a short read and the iterator reports `Corrupt` (`bad_record`) for a healthy segment on a transient I/O error. The same error in the first frame is returned as the storage error. Not changed (a behaviour change, left to the owner); the mutant that returns the storage error in both cases survives for that reason.
-
-**Review 2026-11-16 (independent, two read-only passes).** The survey's review of the whole module (no HIGH; MED: an
-all-zero preallocated header after a crash in `rotate` left the log unopenable, `rebuildManifest` refused a damaged
-MANIFEST, `compact` replaced a compressed segment with an unverified re-encode, `scanTail` cuts acknowledged records after
-a mid-segment bad CRC — kept, see Backlog) and a review of the fixes (no HIGH; MED: a newer-version MANIFEST was
-overwritten, `rotate` past 2^62, `isEmpty` on a read-only log): every MED but `scanTail`'s fixed with a test the same day.
-
-**Audit 2026-11-16 (delta mutation).** The same day's review fixes and survey additions changed `src/root.zig` after the whole-module audit above: 111 schemata mutants over exactly the new and changed non-test code, same method (ReleaseSafe, one build with every mutant behind a runtime switch, one run per mutant in a detached copy, baseline first). Mutated: the all-zero header of the newest segment in `openNewest` and the shared `restartHeader` (every guard, the cut count, the `created` stamp, the truncate, the directory sync, the fields of the new active segment); `manifestDecodes` (both size bounds off by one and dropped, the CRC, the magic, the version arm, the id-count bound, each term of the length check, the short-read arm) and its use in `rebuildManifest` (dropped, flipped, handle not closed); the compact read-back (dropped, wrong size, counter, temporary file); `SegStore.pread` error mapping (storage error, allocation failure, stale error); `seek(0)` / `seekExact` and the gap flag; `LsnExhausted` in `appendBatch` and `rotate` (each operand, off by one both ways, the empty-batch arm); `firstLsn`, `lastLsn`, `isEmpty`, `get`, `dropBeforeLsn` (every guard, the comparison, the index); and the `Concurrent` pass-throughs (the result, the argument, and the unlock of each of the 14 new methods; a skipped unlock hangs the second call, so those 14 are real hangs and count as killed). First pass: 81 of the 111 failed or hung, 30 survived. The survivors drove seven new tests and three extended ones (`root.zig`, `migrate_test.zig`): every `manifestDecodes` check refused on its own with the others intact, a short MANIFEST read and a leaked probe handle (a storage wrapper that reports a longer file and counts open handles), a segment gap in an uncompacted segment, the exact LSN edge for `rotate` and for an empty batch, a stale-error check on a handle whose disk came back, one allocation failing while a frame decodes, a torn newest segment and a poisoned log seen through `Concurrent`, `Concurrent.migration` after a migration, and the `created` stamp of a restarted header. Result **104 killed (14 by hang), 6 equivalent, 1 unobservable**, no finding, no unexplained survivor; the whole-module finding 46 (a storage error in a later frame turned into `Corrupt`) is fixed by the same change and its test is among the new ones.
-
-- **Equivalent (6).** `get`'s guard on `pos.lsn != lsn` and its guard on `rec.lsn != lsn` (two guards of one question: a position from `seek` names a record the iterator then returns, and a record with another LSN is refused by whichever guard stays; the first only saves opening the iterator, cost-only); the second `orelse` of `get` (the iterator cannot be at its end right after `seek` returned a position, single-threaded); `dropBeforeLsn`'s `k == 0` early return (`dropBefore` returns 0 itself for the first id, after the same read-only and poisoned checks); `.reserved` of a restarted header (the first append raises it from whatever it was, cost-only); the `lsn` handed to `Concurrent.translatePosition` (`Log.translatePosition` reads only the position's segment and offset).
-- **Unobservable (1), with the injection it would need.** `SegStore.pread` returning the bytes decoded so far when an allocation fails in a later frame: the decoder allocates only when a frame needs a larger buffer than the frames before it, and every segment this module writes has equal frames, so it needs a hand-made seekable file whose later frame is larger, plus an allocator that fails exactly that allocation.
-
+- `open` cuts the newest segment at the first record whose CRC does not match,
+  every later record included, CRC-valid acknowledged ones too: a mid-segment
+  bad CRC is indistinguishable from a torn write there (`scanTail`), as in
+  Prometheus's WAL. Keeping the cut bytes is under *Backlog / deferred*.
 
 ## Rotation
 
@@ -357,14 +278,16 @@ at the hole and cuts what follows.
 time with `kv.Storage.allocate` (`fallocate`, size-extending): at `rotate`,
 before the header, so its sync makes the reservation durable, and whenever an
 append would run past it. Data syncs are `Storage.syncData` (`fdatasync`), so
-an append into reserved space has no size to record. Measured 2026-09-27,
-NVMe ext4, `.always`: 155-byte appends 295 → 887 a second, 8-thread group
-commit 1 289 → 2 827 a second — and 4 KiB appends no faster (283 → 292):
-`fallocate` leaves *unwritten* extents, and the first write into each block
-still journals its conversion; a record that fills its own block pays it
-every time. A full disk is `error.NoSpaceLeft` from the reservation, before a
-byte of the append lands, and the log is not poisoned; at `rotate` it is (the
-segment is already named), and the next `open` finishes the segment.
+an append into reserved space has no size to record. That helps small synced
+appends, but not appends that fill their own block: `fallocate` leaves
+*unwritten* extents, and the first write into each block still journals its
+conversion (README *How it compares* has the measured comparison). A full disk
+is `error.NoSpaceLeft` from the reservation, before a byte of the append lands,
+and the log is not poisoned; at `rotate` it is (the segment is already named),
+and the next `open` finishes the segment. A newest segment whose header is all
+zeros (`rotate` made the allocation durable but not the header) opens like an
+unfinished creation: the header is rewritten and nothing is counted as cut; a
+bad header with any non-zero byte stays `Corrupt`.
 
 The reservation reads as zeros. `seal` cuts it before writing the seal, so a
 closed segment ends at its seal; if a crash keeps the seal but loses the cut,
@@ -395,23 +318,24 @@ gives the segment back byte for byte, CRCs and seal included. The newest
 segment is never compressed (appends go there).
 
 **Crash order:** the compressed file is written to `COMPRESS.tmp`, synced,
-**decoded back and compared byte for byte against the raw segment** (2026-09-27,
-audit finding L2/E13 — the same check `migrate` runs on its own converted
-segment before trusting it: a frame's checksum, inside the compressed stream,
-only proves the bytes are self-consistent, not that they decode to what the
-raw segment holds — an encoder bug that emits a wrong-but-well-formed stream
-passes it too), then renamed to `seg-<id>.zst`, the directory synced; then the
-manifest names the segment's form as compressed; then the `.log` is deleted.
-A verification mismatch (`error.CompressVerifyFailed`, counted in
-`Stats.compress_verify_failed`) deletes `COMPRESS.tmp` and returns without
-touching the raw segment or the manifest — nothing durable has changed yet, so
-the segment stays raw and is compressible again later. `compact` of a
-compressed segment makes the same check on its rewritten `.zst` (2026-11-16,
-review MED-4) and returns the same error, the old segment untouched. `open` removes
-`COMPRESS.tmp` and, of each live segment, the file that is not of its form —
-a `.zst` renamed before the manifest said so, a `.log` not yet deleted after.
-The crash sweep runs a script of compressions (and a compaction of a
-compressed segment) and checks that a live segment has exactly one file.
+**decoded back and compared byte for byte against the raw segment** (the same
+check `migrate` runs on its own converted segment before trusting it: a
+frame's checksum, inside the compressed stream, only proves the bytes are
+self-consistent, not that they decode to what the raw segment holds — an
+encoder bug that emits a wrong-but-well-formed stream passes it too), then
+renamed to `seg-<id>.zst`, the directory synced; then the manifest names the
+segment's form as compressed; then the `.log` is deleted. A verification
+mismatch (`error.CompressVerifyFailed`, counted in
+`Stats.compress_verify_failed`; an `OutOfMemory` or storage error out of the
+read-back is not counted) deletes `COMPRESS.tmp` and returns without touching
+the raw segment or the manifest — nothing durable has changed yet, so the
+segment stays raw and is compressible again later. `compact` of a compressed
+segment makes the same check on its rewritten `.zst` and returns the same
+error, the old segment untouched. `open` removes `COMPRESS.tmp` and, of each
+live segment, the file that is not of its form — a `.zst` renamed before the
+manifest said so, a `.log` not yet deleted after. The crash sweep runs a script
+of compressions (and a compaction of a compressed segment) and checks that a
+live segment has exactly one file.
 
 **Reading** goes through a wrapper around the caller's `Storage`: a segment
 opened for reading whose `.log` is not there is opened as `.zst` and read
@@ -423,7 +347,8 @@ half done reads whichever file it opens: the bytes are equal. What cannot be
 decoded — a frame whose checksum fails, a seek table that does not parse —
 reads as bytes that are not there, so it is `Corrupt` like a truncated closed
 segment (`bad_header` for an unreadable table), and `resync`/`skipSegment`
-step over it; a storage error is passed on as itself.
+step over it; a storage error is passed on as itself, also when it
+hits a later frame of one read.
 
 **Compacting a compressed segment** compacts to `COMPACT.tmp`, compresses
 that to `COMPRESS.tmp` and renames it over the `.zst`: one rename, as for a
@@ -433,21 +358,10 @@ read decompressed.
 
 `Concurrent.compress` holds the lock throughout.
 
-**Measured on a real day of the ingest daemon** (2026-09-27, `bench-seglog -- realz`: segment
-20722, 62 656 records of 191 bytes average, 13.5 MB as a v2 segment;
-ReleaseFast, NVMe):
-
-| level | ratio | bytes/record | compress the day | scan it compressed |
-|---|---|---|---|---|
-| 1 | 8.6× | 25.2 | 0.05 s | ~730 MB/s |
-| 3 (default) | 9.4× | 23.0 | 0.06 s | ~730 MB/s |
-| 9 | 11.0× | 19.6 | 0.22 s | ~820 MB/s |
-| 19 | 12.4× | 17.4 | 8.1 s | ~790 MB/s |
-
-(256 KiB frames; 64 KiB and 1 MiB differ by a few percent either way.) Larger
-frames buy little because every record carries a 4-byte CRC, which does not
-compress — a fifth of what is left. For the ingest daemon, compressing once a day,
-level 9: about 1.2 MB a day, 37 MB for 30 days.
+**Choosing the level.** Larger frames buy little because every record carries a 4-byte CRC, which does
+not compress — a fifth of what is left. The level trades compress time for
+ratio; `bench-seglog -- realz` measures both on a real segment (see
+*Performance*).
 
 ## Format versions and migration
 
@@ -497,20 +411,6 @@ carries its LSN and every migration keeps LSNs: an iterator given a moved
 position finds its record by `seek` — nothing for the caller to do, if it
 saves the whole `Position`.
 
-Verified by: a crash sweep over the migrating `open` (a crash at every side
-effect, a second one inside the recovering `open`, reordered writes), direct
-tests of every refusal leaving the files byte for byte, a read-back fault
-injected by a storage wrapper, and the fuzz driver (a quarter of its cases
-build a random format-1 log, maybe damage it, and demand: undamaged —
-migrated and equal; refused — unchanged). Of 15 planted mutants, 13 were
-killed; two survive knowingly: the directory sync after a segment's rename
-(the manifest commit that follows syncs the directory anyway, before anything
-relies on the rename), and the payload-hash comparison of the read-back (the
-record CRCs catch any corruption a disk or RAM makes; the hash is there for a
-conversion bug that writes a different, well-formed record). On the ingest daemon's
-notebook log (a copy of it): 25 days, 1 492 944 records in 11 s, and the
-hub's decoded rows of the old and the new log identical (7 328 354).
-
 ## Seeking: by LSN and by time
 
 `seek(lsn)` finds the segment from the manifest (the last whose first LSN is
@@ -531,14 +431,33 @@ in order) on every load, and rebuilt by a walk when missing or wrong; it
 leaves with its segment. Format: magic `SGLI`, version 1, segment id,
 entry count, 24-byte entries, CRC32C.
 
-What the checks guard against, and the tests that hold them: an index
-pointing *earlier* than it should only costs a longer walk, but one pointing
-*later* skips records — for `seek` the walk then meets a higher LSN and says
-`Corrupt`; for `seekTime` nothing would notice, so the CRC is what stands
-between a damaged entry (a `max_before` lowered, still in order) and a wrong
-answer: removing the check fails `seek and seekTime find every record …`.
-`a seek reads a sliver of a big segment` holds that the index is used at all
-(under three read blocks for a 1.25 MB segment).
+An index pointing *earlier* than it should only costs a longer walk, but one
+pointing *later* skips records — for `seek` the walk then meets a higher LSN
+and says `Corrupt`; for `seekTime` nothing would notice, so the CRC is what
+stands between a damaged entry (a `max_before` lowered, still in order) and a
+wrong answer (test `seek and seekTime find every record …`). `a seek reads a
+sliver of a big segment` holds that the index is used at all (under three read
+blocks for a 1.25 MB segment). `seek(0)` is the first record (LSNs start at 1);
+on a log whose first live segment starts above 1 it is `SegmentGone`, like any
+LSN below the first.
+
+A read-only `Log` keeps the index it rebuilt for the newest segment (which has
+no `.idx` until sealed) and a `seek` / `seekTime` extends it over the bytes
+appended since instead of re-walking the segment (`SeekCache`, keyed by segment
+id, first LSN, the bytes it covers and the stored CRC of the last record
+walked). `refresh` drops it when the newest segment changes, and a shrunk or
+rewritten segment rebuilds it.
+
+## Reading by LSN
+
+`firstLsn()`, `lastLsn()` and `isEmpty()` (tidwall's `FirstIndex`, `LastIndex`,
+`IsEmpty`; commitlog's `last_offset`) answer from the writer's state and are
+null on a log opened read-only, which has no append state (use `seek` there).
+`get(lsn, buf)` copies one record's payload into `buf` with one `seek` and one
+read: `error.NotFound` when there is no such record (not written yet, dropped by
+compaction), `error.SegmentGone` when retention took it, `error.BufferTooSmall`
+when the payload does not fit. For many records in a row, an `iterator` from a
+`seek` is the way: `get` opens the segment each time.
 
 ## Compaction
 
@@ -556,14 +475,12 @@ anywhere leaves the old segment or the new. `open` deletes a leftover
 `COMPACT.tmp`. A damaged segment is refused (`Corrupt`) and left as it is.
 The old `.idx` goes, and would not be believed anyway: it records its
 segment's size. The crash sweep runs a compacting script (compact, compact
-again, drop, append around it) under every crash model; syncing the temp file
-before the rename and deleting a leftover one on `open` were each removed on
-purpose, and the sweep failed.
+again, drop, append around it) under every crash model.
 
 **Positions across a compaction.** Offsets move. Every `Position` the log
 hands out carries its record's LSN, and an iterator started from one checks
 that the record there has it; if not, `seek(lsn)` finds it — or, if it was
-dropped, the next record kept. `seek` returns the first record at or after an
+dropped, the next record kept (also when the dropped LSNs were the end of a compacted segment and the next segment starts above them). `seek` returns the first record at or after an
 LSN for exactly this. A `Position` built by hand without an LSN is not checked
 and is not safe across a compaction.
 
@@ -596,13 +513,16 @@ at once — to the next file opened, so the fsync would land on the wrong file
 (on a real one, `EBADF` and a poisoned log). A rotated handle is therefore
 *retired* while a sync is in flight and closed when the last one finishes;
 the marks `syncFinish` records only ever move forward, since the seal already
-synced the old segment. Held by `a rotate inside a running group fsync leaves
-that fsync its handle`, which pauses a sync on purpose: a many-thread test
-never reached the window in six runs, and the handle's slot is reused without
-a crash, so the test compares which file the handle names before and after.
+synced the old segment. Held by `Concurrent: a rotate inside a running group
+fsync leaves that fsync its handle`, which pauses a sync on purpose and, since
+the handle's slot is reused without a crash, compares which file the handle
+names before and after.
 
-Measured (bench `group`, NVMe ext4, 155-byte records, every append durable on
-return): 1 thread 279/s, 2 → 396, 4 → 649, 8 → 1 248, 16 → 2 153, 32 → 4 564.
+`Concurrent` also has the lock-taking counterparts of `compactByKey`, `verify`,
+`segmentsAlloc` (a copy of `segments()`), `end`, `segmentFirstLsn`,
+`bytesCutOnOpen`, `isPoisoned`, `migration`, `translatePosition`, `firstLsn`,
+`lastLsn`, `isEmpty`, `get` and `dropBeforeLsn`, so a caller never reaches
+`c.log` without the lock.
 
 The crash sweeps run through `Concurrent` too (one thread, `SimStorage`), so
 the split sync meets every crash. Iterators of a `Concurrent` take the lock
@@ -614,8 +534,8 @@ A reader never repairs and never skips on its own: damage anywhere but the
 newest segment's torn tail is `error.Corrupt`, with `Iterator.damage()` saying
 which segment, which offset and which of eight reasons (bad header, bad
 record, LSN out of sequence, bad seal, missing seal, bytes after a seal,
-truncated, a record's length over `max_record_len` — its own reason since
-2026-09-27, L5: not necessarily damage, see *Limits and refusals*). The
+truncated, a record's length over `max_record_len` — its own reason:
+not necessarily damage, see *Limits and refusals*). The
 caller then chooses, after RocksDB's WAL recovery modes:
 
 - stop there — the default, and `point_in_time` recovery;
@@ -625,7 +545,7 @@ caller then chooses, after RocksDB's WAL recovery modes:
   next segment's first) is where reading goes on; LevelDB resynchronises the
   same way at its 32 KiB block boundaries, which this format has no need of,
   because each record's LSN says where in the sequence it belongs. A seal found
-  so is checked against its own offset and LSN range, no longer against a
+  so is checked against its own offset and LSN range, not against a
   count the damage made unknowable.
 
 Both return a `Gap` of LSNs stepped over, bounded by what the log knows: the
@@ -637,29 +557,7 @@ resynchronised record's own. `from > to` means nothing was lost.
 bytes there claim. The read window therefore extends rather than reloads, and
 remembers where a read came up short: past that point `resync` stops, since
 no record can start there (a damaged seek table may claim a size of
-gigabytes). Before this, a damaged segment cost a block read per byte tried —
-hours for a 10 MB segment.
-
-**Fuzzing.** `fuzz_test.zig` has one harness, generic over its source of
-choices: `zig build --fuzz` feeds it `Smith`; the deterministic driver
-(`SEGLOG_FUZZ=<runs>[,<first seed>]`, `SEGLOG_FUZZ_MS`, `SEGLOG_FUZZ_SEEDFILE`,
-`SEGLOG_FUZZ_INPUT` to replay a file) feeds it a PRNG, with a watchdog per
-input that names a hanging seed. Verdicts come from the driver: 8 jobs × 20 000
-seeds in about 2 minutes clean (2026-09-27, after the fixes above).
-
-The harness itself was checked with planted mutants (2026-09-27, one driver
-build, 8 × 2 500 seeds each): found — `resync` not stopping at the data end
-(HANG), `open` deleting the wrong form, `compress` not recording the form, no
-seek table written, the window's drop off by one, an unreadable table as an
-I/O error, the seal keeping its reservation. Not found, knowingly: the
-bad-frame cache and the window's short-read memo (they only save time, and
-the harness's segments are too small to show it); an undecodable frame read
-as garbage and `resync` starting on the damaged byte (equivalent: the
-record CRC and the LSN sequence reject what they let through); zeros after
-the *newest* segment's seal (a state only a crash makes; a direct test
-holds it). Two gaps the mutants exposed were closed: segments shorter than
-a 64 KiB block never reached the window's extend path — a test build now
-reads in 512-byte blocks — and preallocation was never switched on.
+gigabytes).
 
 ## Retention
 
@@ -671,64 +569,109 @@ same way. A closed segment whose seal cannot be read has no known age: age
 alone keeps it (size can still drop it). An empty segment is as old as can be.
 The newest segment is never dropped.
 
+`dropBeforeLsn(lsn)` (also on `Concurrent`) drops the closed segments whose
+successor's first LSN is at or below `lsn`, through the same path as
+`dropBefore` (pending list, manifest, delete) — Kafka's `deleteRecords` at
+segment granularity, tidwall's `TruncateFront` and raft-wal's head
+`DeleteRange` as far as segments go. Whole segments only: the segment that holds
+`lsn` survives with its older records, so the oldest record left can be below
+`lsn`. The newest segment is never dropped. `dropBefore` reserves the pending
+list and the manifest buffer before it changes the view, and `compress` the
+manifest buffer before its rename: an `OutOfMemory` leaves `segments()` as the
+disk has it and the log not poisoned, and a retry drops.
+
+## Verification
+
+Run `scripts/modtest seglog`; the crash sweeps, migration tests and fuzz
+harness live in `src/fault_test.zig`, `src/migrate_test.zig` and
+`src/fuzz_test.zig`, the unit tests in `src/root.zig`. Expected values are the
+format's own arithmetic (positions in tests are computed from header and record
+sizes, not read back).
+
+- **Crash sweeps** (`src/fault_test.zig`): `kv`'s `SimStorage` crashes scripted
+  workloads at every side effect under four crash models (`lose_unsynced`,
+  `keep_unsynced`, `torn_tail`, `reorder_unsynced`), and again inside the
+  recovering `open`. The workloads cover appends, rotations, drops, compaction,
+  compression, preallocation (also with a 128-byte step), deferred sync policies
+  and `Concurrent`; the sweeps are deterministic.
+- **States `SimStorage` cannot produce** have direct tests: a half-created
+  segment whose name survived, a full-length record with bad bytes at the tail,
+  and a failed fsync (`a record whose fsync failed is never handed to a reader of
+  this log`).
+- **Read-only open**: tests of a reader beside a live writer (a reader stops at a
+  record still arriving, waits for a segment the writer has named, resumes from a
+  position in a segment it has not heard of yet, and looking for a missing log
+  creates nothing).
+- **Migration**: a crash sweep over the migrating `open` (a crash at every side
+  effect, a second one inside the recovering `open`, reordered writes), direct
+  tests of every refusal leaving the files byte for byte, a read-back fault
+  injected by a storage wrapper, and the fuzz driver, where a quarter of the cases
+  build a random format-1 log, maybe damage it, and demand: undamaged — migrated
+  and equal; refused — unchanged.
+- **Fuzz**: `src/fuzz_test.zig` has one harness, generic over its source of
+  choices. It builds a valid log (appends, rotations, a compaction, compressed
+  segments, preallocation on or off), damages its files (bit flips, truncation,
+  junk in segments, compressed segments, the manifest and the index files) and runs
+  everything that reads over it: a writer's `open`, a reader's, iteration with
+  `resync` past every damage, `verify`, `seek`, `seekTime`; nothing may panic,
+  leak, loop forever or return an error outside its set, and without damage every
+  record must come back in order and `verify` must be clean. The verdict comes
+  from the deterministic driver in the ordinary test binary
+  (`SEGLOG_FUZZ=<runs>[,<first seed>]`, `SEGLOG_FUZZ_MS` the limit per input,
+  `SEGLOG_FUZZ_SEEDFILE`, `SEGLOG_FUZZ_INPUT` to replay a file; a hang is
+  `HANG seed=N`), never from `zig build --fuzz`. The test build reads in 512-byte
+  blocks (`read_block`), so small segments reach the read window's extend path.
+- **Real filesystem**: `zig build interop-seglog` is the self-check without root.
+  `tools/crash-dm/run.sh` (root; first `zig build install-interop-seglog`) records
+  the workload through dm-log-writes on ext4 and checks the log on a mounted copy
+  after every flush and every FUA write: it must open, hold 1 … n with the right
+  bytes, verify clean, never go back, and hold every acked record at the end, with
+  and without preallocation.
+- **Offline tool**: `tools/seglog-dump/smoke.sh` runs every command against a fresh
+  log.
+- **Index and seek**: `seek and seekTime find every record, live, reopened,
+  without or with a bad index, and from a reader`; `a seek reads a sliver of a big
+  segment, not the segment`.
+- **Mutation**: schemata runs over `src/root.zig` (the library part, before its
+  tests): a whole-module run and a delta over the later changes. Every survivor
+  was killed by a test or argued equivalent or unobservable; the arguments are the
+  evidence behind the card's equivalent count.
+- **ctgrind**: n/a, the module holds no secret material.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## Performance
+
+No re-measure diary here: `zig build bench-seglog` (`tools/bench.zig`; scenarios
+`append`, `batch`, `read`, `open`, `group`, `seek`, `compress`, `zread`, and
+`realz` over a real payload file) and `tools/bench-go` (tidwall/wal and
+Prometheus `wlog`, each with its own sync) are the benches; README *How it
+compares* holds the comparison table, and the card's `**Performance:**` line is
+authoritative for the status.
+
 ## What is deliberately not done
 
-- ~~No resync after mid-segment corruption~~ — done 2026-09-27 as an explicit
-  caller's choice (`resync`, `skipSegment`), never silent; see *Damage and
-  recovery*.
-- ~~No compaction and no rewrite~~ — compaction done 2026-09-27 as a whole-
-  segment rewrite by rename, never in place; see *Compaction*.
-- ~~No compression~~ — done 2026-09-27 for closed segments; see *Compression*.
-- ~~No index~~ — done 2026-09-27: LSNs and a sparse index per segment; see
-  *Seeking*.
-
-## Open
-
-- ✅ 2026-09-22: **a reader in another process** — `Log.openReadOnly`, on
-  `kv.Storage.OpenMode.read_only` (zig-libs `6aa12029`). The same change
-  closed two neighbours: the writer's iterator opens segments `read_only`, so
-  a segment deleted from outside is `SegmentGone` instead of being recreated
-  empty, and `open` without `create` no longer leaves an empty `MANIFEST` in
-  a directory that had none.
-- `open` walks the whole newest segment, linear in its size: 155 MB of
-  155-byte records in 0.068 s (2026-09-27, hardware CRC, NVMe) — about 2.3 GB/s.
-  A day of the ingest daemon is some tens of MB. A "verified up to" mark written at a
-  clean close would make it constant; not needed yet.
-- Throughput: `tools/bench.zig` (`zig build bench-seglog`) against tidwall/wal and Prometheus's wlog
-  (`tools/bench-go`); numbers in the plan until the final comparison lands in
-  the README.
+- **A consumer-offset / checkpoint store** (Kafka `__consumer_offsets`, okaywal
+  checkpoints): the caller saves the `Position`.
+- **Many logs in one shared stream** (raft-engine).
+- **A JSON log format** (tidwall `LogFormat`).
+- **Encryption at rest** (none of the compared logs ships it).
 
 ## Backlog / deferred
 
-From the 2026-11-16 survey (`## Compared with`) and the independent review of the same day. "Propose" means substantial for a user of the competing libraries and cheap here: do it before the next survey; the rest waits with its reason. The review's findings that are bugs (not gaps) are listed last; none was fixed in the survey commit.
-
-**Propose to implement (missing, and it matters, and cheap):**
-
-- ✅ 2026-11-16 `Log.dropBeforeLsn(lsn)` (+ `Concurrent`): drop every closed segment whose last LSN is below `lsn` (tidwall/wal `TruncateFront(index)`, raft-wal head `DeleteRange`, Kafka `deleteRecords` at segment granularity). Sketch: `k` = the live segments whose *successor's* first LSN is at or below `lsn`, never the newest; then the existing `dropBefore(live[k])` path (pending list → manifest → delete). About 15 lines, one unit test, one more step in the fault sweep's dropping script. Documented granularity: the segment.
-- ✅ 2026-11-16 `Log.firstLsn()`, `lastLsn()`, `isEmpty()` and `Log.get(lsn, buf)` (tidwall `FirstIndex`/`LastIndex`/`IsEmpty`/`Read(index)`, commitlog `last_offset`/`next_offset`): the first from `live_lsn[0]` and `next_lsn - 1`, the last one `seek` + one `next` copied into the caller's buffer.
-- ✅ 2026-11-16 `Concurrent` pass-throughs for `compactByKey`, `verify`, `segments`, `end`, `segmentFirstLsn`, `bytesCutOnOpen`, `isPoisoned`, `migration`, `translatePosition`: today a caller reaches `c.log` without the lock.
-- ✅ DONE 2026-11-16 `tools/seglog-dump` (`segments`, `verify`, `seek --lsn|--time`, `get --lsn [--hex]`, `rebuild-manifest`; read-only open except the last; public API plus one `std.Io.Dir` listing, `tools/seglog-dump/smoke.sh`): list segments, `verify`, `seek` by LSN or time, print one record, `rebuildManifest --dir` (Kafka `kafka-dump-log`, etcd `etcd-dump-logs`, raft-engine `ctl`). The directory listing belongs in a tool (`std.Io.Dir`), not in the online path the "no listing" reasoning is about.
-
-**Backlog, with the reason it waits:**
+Open items, each with the reason it waits. They come from the survey (*Compared
+with*) and the independent review.
 
 - `truncateAfter(lsn)` (tidwall `TruncateBack`, commitlog `truncate`, raft-wal suffix truncation, Kafka leader-change truncation). Not cheap: the sealed-segment-is-immutable rule would have to give way (the seal, the index and the manifest's later entries all change), the seal's min/max must be recomputed by a walk, and the whole crash sweep needs a new script. It is a replicated-log feature; the module's stated purpose is one writer whose data leaves by age. Needs an owner decision on scope before it is built. A restricted form (cut inside the active segment only, back to a record boundary at or above the last seal) is the cheap half.
-- Atomic multi-record batch (raft-engine, okaywal; `kv` has one since 2026-11-15). A format change (a batch record or a batch-end marker), plus a recovery rule and sweep; today `appendMany` is a prefix after a crash, documented.
-- Torn-tail evidence (review MED-2): `open` cuts every record after a mid-segment bad CRC in the newest segment, CRC-valid acknowledged ones included. Keep the cut bytes in a side file, or `Options.torn_tail = .cut | .keep_and_cut | .refuse`. A design decision (the Prometheus rule), not a defect, so it waits for the owner; kept as Prometheus's wlog does it; a side file is Backlog.
+- Atomic multi-record batch (raft-engine, okaywal; `kv` has one). A format change (a batch record or a batch-end marker), plus a recovery rule and sweep; today `appendMany` is a prefix after a crash, documented.
+- Torn-tail evidence: `open` cuts every record after a mid-segment bad CRC in the newest segment, CRC-valid acknowledged ones included (see *Limits and refusals*). Keep the cut bytes in a side file, or `Options.torn_tail = .cut | .keep_and_cut | .refuse`. A design decision (the Prometheus rule), not a defect, so it waits for the owner.
 - A context for `Options.now` / `monotonic_ns` (bare function pointers today; a clock that needs an `Io` needs a global). API change.
 - Non-Linux targets: `meta.targets` is `.linux64` because `Storage.allocate` / `syncData` are raw Linux syscalls in `kv`'s `FsStorage`; tidwall/wal and rosedb are portable. Belongs to `kv`.
-- ✅ 2026-11-16 A reader-side cache for the newest segment's index (review LOW-7): a read-only `Log` keeps the index it rebuilt, keyed by (segment id, first LSN, the bytes it covers, the CRC of the last record walked), and a seek walks only the bytes appended since; refresh drops it when the newest segment changes, a shrunk or rewritten segment rebuilds it.
+- A "verified up to" mark written at a clean close, so that `open` need not walk the whole newest segment (linear in its size, a few GB/s with hardware CRC; a day of the ingest daemon is some tens of MB). Not needed yet.
 
-**Deliberately not done** (the competition has it, the module does not want it): a consumer-offset / checkpoint store (Kafka `__consumer_offsets`, okaywal checkpoints: the caller saves the `Position`); many logs in one shared stream (raft-engine); a JSON log format (tidwall `LogFormat`); encryption at rest (none of the compared logs ships it).
+## Anchoring
 
-**Defects from the 2026-11-16 review** (details in the review report handed to the owner):
+No external truth exists: the format is ours. Expected values are the
+format's own arithmetic (positions in tests are computed from header and
+record sizes, not read back), and the crash model is `kv`'s `SimStorage`.
 
-- ✅ 2026-11-16 MED-1: a newest segment whose header is all zeros (`rotate` with `preallocate`, allocation durable, header not) opens like an unfinished creation: the header is rewritten, nothing is counted as cut. A bad header with any non-zero byte stays `Corrupt`.
-- ✅ 2026-11-16 MED-3: `rebuildManifest` replaces a `MANIFEST` that does not decode (empty, truncated, failed CRC, not a manifest, counts that do not fit its size) through the usual tmp + fsync + rename + directory fsync; one that decodes is still refused with `ManifestPresent`.
-- ✅ 2026-11-16 MED-4: `compact` of a compressed segment reads the new `.zst` back and compares it (the L2 check `compress` makes) before it replaces the old one; on a mismatch the old segment stays, both temp files go, `Stats.compress_verify_failed` counts it and the call returns `CompressVerifyFailed` (new in `CompactError`).
-- ✅ 2026-11-16 LOW-5: `append*` refuses with `LsnExhausted` (new in `AppendError`) when the batch's last LSN would pass 2^62; nothing is written and the log is not poisoned.
-- ✅ 2026-11-16 LOW-9: `seek(0)` is the first record (LSNs start at 1); on a log whose first live segment starts above 1 it is `SegmentGone` like any LSN below the first.
-- ✅ 2026-11-16 mutation finding 46: a storage error in the second or a later frame of one read of a compressed segment is returned as that error, not as a short read the iterator turns into `Corrupt`.
-- ✅ 2026-11-16 found while testing `get`: `seek` of an LSN that compaction removed from the end of a compacted segment returned `Corrupt` when the next segment starts above it; it now lands on that segment's first record.
-- ✅ 2026-11-16 LOW-6: `dropBefore` reserves the pending list and the manifest buffer before it changes the view, and `compress` the manifest buffer before its rename: an `OutOfMemory` leaves `segments()` as the disk has it, the log not poisoned, and a retry drops.
-- ✅ 2026-11-16 LOW-8: `Stats.compress_verify_failed` counts only `CompressVerifyFailed`, not an `OutOfMemory` or storage error out of the read-back.
-- ✅ 2026-11-16 LOW-7 (reader seek cache, above). LOW-10 closed 2026-11-16: the README backup warning (`OrphanSegment`, `rebuildManifest`), the manifest `form` 2, the directory's file list in the module doc, the `CompressError` doc comment and *Compression*'s note that `compact` verifies too.
+**Anchor grade:** class C · oracle n/a
