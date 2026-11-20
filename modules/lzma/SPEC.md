@@ -37,8 +37,7 @@ own description or was measured as a black box.
 **Where we are ahead:** the only pure-Zig implementation with an encoder, and the only one whose
 compressor output is checked equal to liblzma's; typed errors, a dictionary and an output cap, and
 a pull `std.Io.Reader` / push `std.Io.Writer` interface. **Where we are behind:** no BCJ / delta
-filters (`error.UnsupportedFilter`), no multi-threaded or multi-block output (B1, B2), the
-decoder is slower than liblzma's (see Performance).
+filters (`error.UnsupportedFilter`), no multi-threaded or multi-block output (B1, B2).
 
 ## What this module is, and what it is not
 
@@ -87,6 +86,13 @@ the `xz` command-line program.
 - **The decoder** accepts what liblzma's does: distances up to the dictionary size rounded up to 16,
   properties with `lc + lp <= 4`, an LZMA1 stream with a known size and an optional end marker,
   `.xz` block headers with or without sizes, any check of the four supported types.
+- **The decoder's hot path** (what brings it to liblzma's speed): the range coder's refill is a plain branch; on
+  x86-64 LLVM builds liblzma's bit-tree, matched-literal and direct-bit sequences are multi-output inline asm (the
+  registers stay in registers; the self-hosted x86_64 backend takes the Zig path, `use_asm`); the dictionary ring is
+  `overshoot` (16) bytes longer than its window, so a match copy is whole 16-byte moves with no length branch; CRC-64
+  is PCLMULQDQ folding with run-time CPUID detection and a table fallback (`src/crc64.zig`; the encoder and
+  `xzfmt`'s index still use std's). liblzma's reverse-tree asm (position special / align bits, measured at most 1 %)
+  is not ported.
 
 ## Constant-time contract
 
@@ -146,17 +152,6 @@ None claimed: the data is public. There is no secret in this module.
   a block per stream is what the single-threaded `xz` writes.
 - **Reading `.lz` (lzip) or `.7z`** — never; other formats.
 
-## Backlog / deferred
-
-- **B1** Multi-block `.xz` output with a block size (the block encoder is a loop over the existing
-  LZ encoder with a reset window); would match `xz --block-size` bytes.
-- **B2** Parallel blocks (`xz -T`), after B1.
-- **B3** BCJ x86 / ARM64 / delta in the decoder (small) and encoder.
-- **B4** ~~Decoder speed~~ DONE 2026-10-31 (1.19–1.27× → 0.92–1.02× liblzma). Same IPC and mispredicts as liblzma, 25–34 % more instructions; closed by (1) the plain branch for the refill (the select form cost ~7 instructions a bit and LLVM re-branched it anyway), (2) liblzma's x86-64 asm for the bit trees, matched literal and direct bits — with multi-output inline asm (Zig 0.17 + LLVM) the registers stay in registers, which the 2026-10-20 attempt did not have, (3) a ring `overshoot` (16) bytes longer than the window so a match copy is whole 16-byte moves with no length branch, (4) CRC-64 by PCLMULQDQ (`src/crc64.zig`; std's was ~5 % of a decode). Left: liblzma's reverse-tree asm (pos_special / align, measured ≤ 1 %, not worth a second node numbering).
-- **B6** Encoder time is caller-bounded: `LzmaOptions.depth` (and `nice_len`) are not capped, a huge `depth` on repetitive data makes each byte cost up to a dictionary of chain steps (liblzma behaves the same). Not a crash; cap only if a consumer ever takes `depth` from untrusted input.
-- **B7** A public CRC-64/XZ (PCLMULQDQ + slicing-by-8) beside the `crc32` module; `src/crc64.zig` is the private one the decoder uses (the encoder and `xzfmt`'s index still use std's).
-- **B5** zipstream convenience: a function that writes / reads the 9-byte ZIP method 14 header.
-
 ## Open
 
 - The optimal parser's tie-breaks and the LZMA2 chunk limits are verified against liblzma on the
@@ -164,16 +159,40 @@ None claimed: the data is public. There is no secret in this module.
   of them reaches.
 - The encoder of liblzma 5.8.1 is the reference; releases 5.8.2-5.8.4 were not compared (the
   system `xz` 5.8.3 gave identical bytes in the spot checks).
-- 18 mutation survivors are open (see the audit record below): 10 in the encoder (optimal-parser price ties,
+- 18 mutation survivors are open (the card's Audit line counts them): 10 in the encoder (optimal-parser price ties,
   `optimumFast` distance edges, an LZMA2 state reset after a stored chunk ending in a match) and 8 in the
   decoder (error-code-only differences, sticky failure state, a VLI with 11 continuation bytes, a few
-  framing corners). None is a bug lead; each has the test that would kill it in the reports.
-
-**Audit 2026-11-01 (mutation, whole module).** 568 schemata mutants in ReleaseSafe: encoder side 295
-(encoder, lzma_enc, lz_enc, rangeenc, xzfmt, common) 263 killed, 22 equivalent; decoder side 273
-(decoder, lzma_dec incl. 8 asm-template variants, crc64) 235 killed, 30 equivalent. New tests:
-`src/mutation_test.zig` (byte-exact against the xz 5.8.3 command line over 35 option sets and every
-short string over a small alphabet) and `src/mutation_dec_test.zig` (a symbol-level LZMA encoder and a
-hand-built `.xz` writer for decoder corners). Blind review of the 2026-10-31 decoder change: no HIGH/MED;
-three LOW fixed (asm off on the self-hosted backend, wrap only a ring with slack, `max_dict` note).
+  framing corners). None is a bug lead.
 - Big-endian and 32-bit targets are not run; `meta.targets` is `linux64`.
+
+## Verification
+
+- **Run:** `scripts/modtest lzma` (heavy); `zig build interop-lzma` drives liblzma (see *Anchoring*; `--capture`
+  refreezes the goldens, `--decoder` runs the decoder checks alone).
+- **Unit and oracle tests:** `src/decoder_test.zig`, `src/encoder_test.zig`; `src/golden_test.zig` replays the frozen
+  liblzma streams (SHA-256 and length) offline from `src/testdata/`; inputs come from `src/shapes.zig`.
+- **Mutation-driven tests:** `src/mutation_test.zig` (byte-exact against the `xz` command line over 35 option sets
+  and every short string over a small alphabet) and `src/mutation_dec_test.zig` (a symbol-level LZMA encoder and a
+  hand-built `.xz` writer for decoder corners).
+- **No-panic sweep:** `src/sweep_test.zig`.
+- **Fuzz:** `LZMA_FUZZ` (testkit's deterministic driver, `src/fuzz_test.zig`): `lzma-decode` over arbitrary and
+  mutated streams of all four framings, and a round trip; a few thousand seeds run in every test run.
+- **Constant time:** n/a, no secret is processed.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
+
+## Performance
+
+Bench: `zig build bench-lzma -Djcc-safe` (`tools/bench.zig` against liblzma, seeded text and binary payloads,
+presets 1, 6 and 9); the card's Performance line carries the figures. The decoder's design is under *Wire format /
+algorithm*.
+
+## Backlog / deferred
+
+- **B1** Multi-block `.xz` output with a block size (the block encoder is a loop over the existing
+  LZ encoder with a reset window); would match `xz --block-size` bytes.
+- **B2** Parallel blocks (`xz -T`), after B1.
+- **B3** BCJ x86 / ARM64 / delta in the decoder (small) and encoder.
+- **B6** Encoder time is caller-bounded: `LzmaOptions.depth` (and `nice_len`) are not capped, a huge `depth` on repetitive data makes each byte cost up to a dictionary of chain steps (liblzma behaves the same). Not a crash; cap only if a consumer ever takes `depth` from untrusted input.
+- **B7** A public CRC-64/XZ (PCLMULQDQ + slicing-by-8) beside the `crc32` module; `src/crc64.zig` is the private one the decoder uses (the encoder and `xzfmt`'s index still use std's).
+- **B5** zipstream convenience: a function that writes / reads the 9-byte ZIP method 14 header.
