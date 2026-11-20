@@ -6,6 +6,7 @@ stack (authentication, privacy, discovery, anti-replay). Feeds the
 network-device management work (alongside `netlink`, `nftables`, `icmp`).
 
 - No mature pure-Zig SNMP implementation exists.
+- **Deps:** `aes192` (the AES-192/256 block cipher for the privacy modes; std has none).
 - **Platform:** any (codec, OID, message model and clients are pure
   computation; only the optional `UdpTransport` adapter touches
   `std.Io.net`).
@@ -98,13 +99,13 @@ network-device management work (alongside `netlink`, `nftables`, `icmp`).
     from the engine's authenticated `notInTimeWindows` Report.
   - **DES note.** Zig's `std.crypto` has no DES, so this module carries its own
     (`des.zig`, from FIPS 46-3). It is provided **for interop with legacy
-    agents only and is not a recommendation** — single DES has a 56-bit key.
+    agents only and is not a recommendation** — single DES has a 56-bit key and this implementation is table-driven, not constant time.
     Prefer AES-128-CFB (RFC 3826), and prefer the RFC 7860 SHA-2 auth
     protocols over MD5/SHA-1.
-  - Out of scope for now: the **agent/engine (server) side**; trap listening
-    beyond `receiver`; MIB/SMI parsing; SNMPv3 over TLS/DTLS (RFC 6353);
-    RFC 3826's `usmDHKickstart`/key-change (`KeyChange`) machinery; and
-    context-engine-ID *proxy* forwarding.
+## Not provided
+
+No agent/engine (server) side, no MIB/SMI parsing, no SNMPv3 over TLS/DTLS (RFC 6353), no v3 Trap sending or
+v3 notification receipt. What is open and what is deferred is in SPEC *Backlog / deferred*.
 
 **Verified against a real agent.** The v3 stack is checked three ways: the
 RFC 3414 Appendix A.3 key-derivation KATs; byte-exact goldens captured from

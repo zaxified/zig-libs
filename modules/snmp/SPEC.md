@@ -8,15 +8,6 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-11-17 (416/427, 11 eq) · src b8bb2161898c7028
 
-**Audit 2026-11-17 (whole-module mutation).** 415 mutants = the 21 delta mutants over the AES-192/256 change run earlier (19 killed, 2 EQUIVALENT, listed under "Mutation 2026-11-17" in Verification; not re-run) + 394 new over every other non-test source file (`ber`, `oid`, `message`, `usm`, `priv`, `des`, `timewin`, `v3`, `report`, `receiver`, `client`, `v3client`), one schemata build per round, baseline first. Round 1: 271 killed + 6 hung, 117 survived. 51 tests were added, in the files they test: BER length-octet and sign-padding boundaries, the OID first-octet split at 40/80 and the 2^32 - 1 ceiling of the first subidentifier, `prependUnsigned`'s top bit of exactly 0x80, `Encoder.prependBytes` filling a buffer exactly, `authOffsetFor`'s header / length / position checks one at a time, DES buffer bounds and zero padding, `latch` on an equal clock, a stray element inside each of the v3 message, header, ScopedPDU, PDU, Trap-PDU and varbind SEQUENCEs, `msgID` / `msgMaxSize` / request-id / error-index / specific-trap values that would wrap into range, GetBulk count clamping, the 32-varbind notification limit, `Walker` / `BulkWalker` (v1/v2c and v3) where every way a walk can end is final and a further `next()` sends nothing, `request()`'s retry bookkeeping, request-id wrap at 2^31 - 1, `UdpTransport` Timeout and oversize-reply, and the v3 client's Report handling (acting on one authenticated `unknownEngineIDs` and giving up after exactly one retry; an unauthenticated Report cannot move the clock at an authenticated level; a Report naming another engine is not dated against our clock; `notInTimeWindows` about another engine is `EngineIdMismatch`; a downgraded or foreign-engine data reply). The test `FakeAgent` gained the knobs these needed (a discovery-Report reason, an advertised engine id, an unauthenticated reply or Report, a repeating forced Report, a data-reply budget). Round 2 killed 104 of the 117 (4 of those by a hang: a loop that no longer ends); round 3 killed 5 more after two of the new tests were corrected (`message.encodePdu` closes its element over everything already in the encoder, so a stray element has to be appended behind a separately built PDU; a Report naming another engine has to be armed after discovery). 8 survive, all EQUIVALENT:
-- sign-padding strip `c.len > 1` -> `> 2` in `parseInteger` and `parseUnsigned` (two padded bytes accumulate to the same value as one; the strip only matters for the 8-byte length test);
-- `authOffsetFor` `ap < base` -> `<=` (a field at offset 0 is refused by the `off < 2` line after it with the same null);
-- `cfb128` `i + 16 <= in.len` -> `<` (a last full block taken by the partial-block path yields the same keystream XOR; only the unused next feedback differs);
-- `checkTimeWindow` `msg_time > engine_time` -> `>=` (equal gives a zero difference either way);
-- `V3Client` unreachable defences: `k.len < priv_protocol.keyLen()` after `priv.localizeKey` (it returns at least that many bytes by construction) and the three `engine.discovered` tests inside `processReply` (`request()` discovers before `exchangeOnce`, the only caller).
-
-Not mutated: the DES permutation and S-box tables (comptime data cannot take a runtime switch; any DES known-answer test fails on a wrong entry), the `decodePdu` and trap time-stamp `switch` prongs (comptime items), `UdpTransport.sendFn` / `exchangeFn` error mapping other than Timeout and truncation, `root.zig`, `burn.zig` and the tool files.
-
 **Hardening:** fuzz 2026-10-10 (SNMP_FUZZ: `snmp-wire` and `snmp-auth-priv` 200,000-run budget clean; `snmp-v3-reply` at `.scale` 64 = 3,125 runs — every run derives USM keys from passwords, ~65/s; the existing decode harnesses are unchanged) · ct 2026-11-17 (ctgrind: password KDF + AES-192/256 key extension, all auth digests, AES-128/192/256-CFB privacy 0 in-file; DES-CBC privacy 256 = open finding, table-driven des.zig)
 **Performance:** not measured
 
@@ -32,14 +23,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [net-snmp/net-snmp](https://github.com/net-snmp/net-snmp) — **reference** | C | BSD-style, several notices in `COPYING` (API: NOASSERTION); source read only for `keytools.c`/`snmpusm.c` (AES key extension, 2026-11-17), otherwise not read | 490 | push 2026-09-29 (no GitHub release) | The de-facto tool set and the oracle: this module's v3 goldens and live test are captured from a stock 5.9.4 `snmpd`. Adds MIB loading (names instead of OIDs), an agent/`snmpd`, AgentX, trap sending, AES-192/256, TLS/DTLS/SSH transports *(inferred from general knowledge; not re-read)*. |
-| [gosnmp/gosnmp](https://github.com/gosnmp/gosnmp) | Go | BSD-style (LICENSE file; API: NOASSERTION) | 1.3k | v1.45.0 (2026-09-19) | README: Get, GetNext, GetBulk, Walk, **BulkWalk**, Set, **SendTrap**, **Listen** for traps, v1/v2c/v3, IPv4/IPv6. Versus us: BulkWalk and trap sending exist there; this module's walker is GetNext-only and its receiver only listens. |
+| [net-snmp/net-snmp](https://github.com/net-snmp/net-snmp) — **reference** | C | BSD-style, several notices in `COPYING` (API: NOASSERTION); source read only for `keytools.c`/`snmpusm.c` (AES key extension, 2026-11-17), otherwise not read | 490 | push 2026-09-29 (no GitHub release) | The de-facto tool set and the oracle: this module's v3 goldens and live test are captured from a stock 5.9.4 `snmpd`. Adds MIB loading (names instead of OIDs), an agent/`snmpd`, AgentX, v3 Trap sending, TLS/DTLS/SSH transports *(inferred from general knowledge; not re-read)*. |
+| [gosnmp/gosnmp](https://github.com/gosnmp/gosnmp) | Go | BSD-style (LICENSE file; API: NOASSERTION) | 1.3k | v1.45.0 (2026-09-19) | README: Get, GetNext, GetBulk, Walk, **BulkWalk**, Set, **SendTrap**, **Listen** for traps, v1/v2c/v3, IPv4/IPv6. Versus us: BulkWalk, trap sending and a listener exist here too (v1/v2c Trap and Inform, v3 Inform); v3 Trap sending and v3 notification receipt do not. |
 | [roboplc/snmp2](https://github.com/roboplc/snmp2) | Rust | Apache-2.0 | 59 | push 2026-07-12 | README: "dependency-free" v1/v2/v3 client, v3 auth MD5/SHA1/SHA224–512, privacy DES/AES128/**AES192/AES256**, v1 traps, optional async. MIB support only through `libnetsnmp`. |
 | [rusticata/snmp-parser](https://github.com/rusticata/snmp-parser) | Rust | NOASSERTION (not read) | 45 | push 2026-01-19 | Parser only (`nom`), no client *(inferred from name/description)*. |
 | [lextudio/pysnmp](https://github.com/lextudio/pysnmp) | Python | BSD-2-Clause | 159 | push 2026-09-28 | Full manager/agent/notification framework with MIB support; asyncio *(inferred)*. |
 | [clarkmcc/snmp.zig](https://github.com/clarkmcc/snmp.zig) | Zig | MIT | 1 | push 2025-07-11 | Its README: bindings to the Net-SNMP C library; v1/v2c, "v3 in progress". Links libnetsnmp, so not pure Zig. The only Zig SNMP client found. |
 
-**Where we are ahead:** the only pure-Zig SNMP stack we found (the one Zig alternative links libnetsnmp); full SNMPv3 USM with six auth protocols incl. RFC 7860 SHA-2 and AES-128 privacy, with the library owning salt uniqueness, checked against fifteen net-snmp captures and a live `snmpd` matrix; zero-allocation, transport-agnostic; v1/v2c trap and Inform receiver with ack · **Where we are behind:** no BulkWalk (walker uses GetNext; `getBulk` exists as a call) *(searched: `rg -i bulk src/client.zig src/v3client.zig`)*, no trap/notification sending, no v3 notifications, no MIB name resolution, no agent side, no request retry policy (→ Backlog).
+**Where we are ahead:** the only pure-Zig SNMP stack we found (the one Zig alternative links libnetsnmp); full SNMPv3 USM with six auth protocols incl. RFC 7860 SHA-2 and AES-128 privacy, with the library owning salt uniqueness, checked against fifteen net-snmp captures and a live `snmpd` matrix; zero-allocation, transport-agnostic; v1/v2c trap and Inform receiver with ack, GETBULK-driven walkers, a retry policy and v1/v2c/v3 notification sending (v3 Inform) · **Where we are behind:** no v3 Trap sending and no v3 notification receipt (→ *Backlog / deferred*), no MIB name resolution, no agent side.
 
 ## Design & invariants
 Layered: `ber` (X.690 subset — definite-length TLV, SNMP application types incl. Counter64 + v2c
@@ -70,6 +61,37 @@ post-decrypt use, and the send side is `encodeScopedPdu` (the plaintext TLV to e
 (v2c), 3412 (v3 message processing), 3414 (USM), 3826 (AES priv), 7860 (SHA-2 auth), 2578 (SMI
 types), X.690 (BER) — see README "Provenance"; no NOTICE entry needed.
 
+## Design notes by feature
+
+- **Walkers.** `Client.walker` / `V3Client.walker` walk a subtree by GetNext; `Client.bulkWalker` / `bulkWalkerWith` and
+  `V3Client.bulkWalker` / `bulkWalkerWith` by GetBulk, default max-repetitions 10 (`default_max_repetitions`,
+  `client.zig:317`, net-snmp's `snmpbulkwalk` default). Every way a walk can end is final: the end of the subtree,
+  endOfMibView, noSuchName, or an empty batch; a failing step finishes the walker, so a further `next()` sends
+  nothing. A name that is not strictly greater than the previous one is `error.OidNotIncreasing`, max-repetitions
+  0 is `error.InvalidMaxRepetitions`, and a v1 client's bulk walker answers `error.UnsupportedPdu`
+  (`client.zig:324-374`; `v3client.zig:802-906`).
+- **Retry policy (v1/v2c).** `Client.Options.retries` (default 5, net-snmp's `-r 5`): on `error.Timeout` or a reply
+  with another request id the same bytes (same id) are re-sent, `retries + 1` tries in all, so a late reply to an
+  earlier try is accepted by a later one. A transport failure, `Canceled`, an undecodable reply or a wrong PDU type
+  is returned at once (`client.zig:226-255`). The per-try timeout is the transport's own
+  (`UdpTransport.Options.timeout`, default `.none`, which blocks: set 1 s to match net-snmp). The module owns no clock
+  policy. `V3Client` keeps its own single Report retry and adds no timeout retry.
+- **Notification sending.** `Client.trapV1`, `trapV2` (fire and forget, through the optional `Transport.sendFn`,
+  otherwise `error.SendNotSupported`), `Client.inform` and `V3Client.inform` (wait for the Response; `inform` re-sends
+  per `retries` on the v1/v2c client). For v2c and v3 the library inserts `sysUpTime.0` and `snmpTrapOID.0` as the first
+  two varbinds (RFC 3416 §4.2.6); a payload varbind naming either is `error.ReservedVarbind`, and more than
+  `max_notification_varbinds` (32) payload varbinds is `error.TooManyOids` (`client.zig:142-170`,
+  `message.zig:394-430`). v3 **Trap** sending is not offered, see *Backlog / deferred*.
+- **`msgID` / `msgMaxSize` ranges.** RFC 3412 §6 gives `msgID` 0..2147483647 and `msgMaxSize` 484..2147483647 and
+  §7.2.2 says a message outside them is no SNMPv3Message. `v3.decode` refuses a negative `msgID` and a `msgMaxSize`
+  below `min_msg_max_size` (484) with `error.InvalidValue` (`v3.zig:202-203`); above `i32` max stays
+  `IntegerTooLarge`. net-snmp's `snmpv3_parse` (`snmplib/snmp_api.c`) rejects both with `SNMPERR_ASN_PARSE_ERR`; gosnmp
+  stores both as `uint32` and does not range-check on receive, so the spec rule and the reference agree and the
+  permissive one is the outlier. Encode side: the client's `msgID` counter runs 1..2^31-1 and wraps to 1, an
+  `initial_msg_id` below 0 is raised to 0 (`v3client.zig:295`), the default `msgMaxSize` is 65507, and `v3.encode*`
+  itself writes whatever `i32` the caller puts in `EncodeParams` (documented, not checked). The client does not read a
+  peer's `msgMaxSize` at all (no response-size clamping).
+
 ## Threat model / out of scope
 USM is the security-sensitive part.
 
@@ -83,8 +105,10 @@ USM is the security-sensitive part.
 - **Privacy.** DES-CBC (RFC 3414 §8), AES-128-CFB128 (RFC 3826) and AES-192/256-CFB128 (below), encrypt + decrypt, wired into
   the message path both ways. **DES is legacy and is provided for interop only, not as a
   recommendation** (56-bit key); Zig's std has no DES, so `des.zig` is a from-scratch FIPS 46-3
-  implementation. SNMPv3 over TLS/DTLS (RFC 6353) remains out of scope.
-- **AES-192/256 privacy** (2026-11-17), the four variants net-snmp (the reference) offers, named after
+  implementation, table-driven (S-boxes and permutations indexed by key- and data-dependent values), so DES-CBC is
+  **not constant time**: ctgrind reports it (`src/ctgrind_harness.zig`, the open finding on the card's
+  `**Hardening:**` line); replacing it is the owner's call. SNMPv3 over TLS/DTLS (RFC 6353) remains out of scope.
+- **AES-192/256 privacy**, the four variants net-snmp (the reference) offers, named after
   what it calls them: `aes192_cfb`/`aes256_cfb` = `usmAES192PrivProtocol`/`usmAES256PrivProtocol`
   (OIDs 1.3.6.1.4.1.14832.1.3/.4, draft-blumenthal-aes-usm-04), `aes192_cisco_cfb`/`aes256_cisco_cfb` =
   `usmAES192CiscoPrivProtocol`/`usmAES256CiscoPrivProtocol` (1.3.6.1.4.1.9.12.6.1.1/.2). Mode, IV
@@ -141,20 +165,17 @@ USM is the security-sensitive part.
     authPriv" — the first encrypted message it attempts is refused with `error.SaltSeedRequired`.
     This module owns no RNG (std removed `std.crypto.random` in 0.16; still absent in 0.17) and no clock, so it has nothing
     unpredictable of its own to fall back on, and every value it *could* pick is public.
-    ⚠ **Superseded design, recorded because it was wrong in an instructive way:** the counter used
-    to be seeded from the engine's discovered `engineBoots‖engineTime`. Those are clock/boot
-    registers standing in for entropy, and both are read off the same wire by every manager talking
-    to that engine — so two clients that reach their first authPriv message in the same engine
-    second started from the *same* value. RFC 3414 §2.6 key localization is `H(Ku ‖ engineID ‖ Ku)`
-    with nothing per-client in it, so those two clients also hold the same localized privacy key:
-    same key, same IV sequence. Consequence, per mode and measured by a test in `v3client.zig`:
-    AES-CFB reuses the keystream outright, so `C1 XOR C2 = P1 XOR P2` over the plaintexts' common
-    prefix **and the first block in which they differ** (CFB feeds the previous *ciphertext* block
-    forward, so the keystream stays shared until the ciphertexts diverge) — with an SNMP ScopedPDU's
-    known prefix that is plaintext recovery, not merely a distinguisher. DES-CBC is strictly weaker:
-    a repeated IV under a shared key makes identical plaintext blocks encrypt identically, which
-    leaks how far two ScopedPDUs agree (and that a message repeats), but carries no XOR relation to
-    the plaintexts and recovers nothing.
+    Why not seed it from the engine's discovered `engineBoots‖engineTime`: those are clock/boot registers standing in
+    for entropy, and both are read off the same wire by every manager talking to that engine, so two clients that
+    reach their first authPriv message in the same engine second would start from the *same* value. RFC 3414 §2.6 key
+    localization is `H(Ku ‖ engineID ‖ Ku)` with nothing per-client in it, so those two clients also hold the same
+    localized privacy key: same key, same IV sequence. Consequence, per mode and measured by a test in
+    `v3client.zig`: AES-CFB reuses the keystream outright, so `C1 XOR C2 = P1 XOR P2` over the plaintexts' common
+    prefix **and the first block in which they differ** (CFB feeds the previous *ciphertext* block forward, so the
+    keystream stays shared until the ciphertexts diverge) — with an SNMP ScopedPDU's known prefix that is plaintext
+    recovery, not merely a distinguisher. DES-CBC is strictly weaker: a repeated IV under a shared key makes identical
+    plaintext blocks encrypt identically, which leaks how far two ScopedPDUs agree (and that a message repeats), but
+    carries no XOR relation to the plaintexts and recovers nothing.
 - **Illegal security flags.** `v3.decode` discards a message whose `msgFlags` has privFlag set with
   authFlag clear (`error.InvalidSecurityFlags`, RFC 3412 §7.2 step 5 / RFC 3414 §3.1's
   `snmpInvalidMsgs`), and one whose `msgSecurityModel` is not USM (`error.UnsupportedSecurityModel`,
@@ -182,7 +203,7 @@ USM is the security-sensitive part.
   security level — an `authNoPriv`/`authPriv` request answered unauthenticated or unencrypted is
   `error.SecurityLevelDowngrade`; (5) the engine ID must match the one our keys are localized to.
   A Report we could not act on is terminal immediately; only an acted-on Report earns the single
-  retry, so a hostile peer cannot spin the client. "Acted on" is now literal: the `notInTimeWindows`
+  retry, so a hostile peer cannot spin the client. "Acted on" is literal: the `notInTimeWindows`
   branch calls `timewin.latch`, so a Report carrying nothing newer moves nothing, does not earn the
   retry, and comes back as `error.NotInTimeWindow`.
 - **Discovery bootstrap.** The RFC 3414 §4 probe is unauthenticated by construction, so the engine
@@ -194,10 +215,6 @@ USM is the security-sensitive part.
   treat input as untrusted (never panics; caller decides trust).
 - MD5/SHA-1 are the RFC 3414 originals and are weak by modern standards; prefer the RFC 7860 SHA-2
   protocols. No MIB compiler/SMI parsing; no agent (server) role.
-- **Reviewed 2026-07-10 (adversarial security pass):** `snmp.usm` const-time compare and
-  auth/privacy algorithm confusion (MD5 vs SHA-1, DES vs AES selection) confirmed clean — the
-  algorithm-selection path can't be tricked into a weaker/wrong primitive by a malicious agent
-  reply; an empty-password panic found in the pass was fixed.
 
 ## Verification
 
@@ -211,8 +228,8 @@ across a change, but cannot catch a codec that is self-consistently wrong in a w
 matches the hand-derivation error. `client.zig`'s v1/v2c manager likewise has no live-interop test
 (no `SNMP_TEST_AGENT`-equivalent gate) — only offline `Transport` round-trips against this same
 module's own encoder/decoder. The v3/USM stack below is anchored far more strongly: RFC 3414
-Appendix A KATs, fifteen byte-exact captures from a real net-snmp agent, and (as of 2026-07-23) a
-green live-interop run against a real `snmpd`. Do not generalize the v3 anchoring's strength to the
+Appendix A KATs, fifteen byte-exact captures from a real net-snmp agent, and a
+live-interop run against a real `snmpd`. Do not generalize the v3 anchoring's strength to the
 v1/v2c layer — they are validated to very different standards.
 
 BER + message golden-byte KATs, length-boundary + garbage sweeps, scripted-agent round-trips
@@ -226,7 +243,7 @@ ciphertext (a keystream-reuse detector, since a repeat would make `C1 XOR C2` al
 even when `engineTime` moves; the adjacent-only limit of that tripwire is pinned by an `A, B, A`
 test that asserts the repeat is *not* caught; the DES 2^32-per-boots budget refuses to wrap; and
 two `V3Client`s against engines with different clocks start their counters at different values.
-One test is gated live. Run: `zig build test-snmp`.
+One test is gated live. Run: `scripts/modtest snmp` (`zig build test-snmp`).
 
 The v3 stack is anchored three independent ways:
 
@@ -252,21 +269,11 @@ The v3 stack is anchored three independent ways:
    case, with or without the hyphens (`DES`, `AES`, `AES-128`, `AES-192`, `AES-256`, `AES-192-C`,
    `AES-256-C`, `AES192`, `AES256C`, …; table `usm_priv_type` in `snmplib/snmpusm.c`, BSD, matched
    there with `strncasecmp`; exact names only here, no abbreviations). Without the variable it prints `SKIPPED:` and passes,
-   like the live tests in `netconf` and `tc`. Executed 2026-07-23 against an unprivileged net-snmp
-   5.9.4 `snmpd` on `udp:127.0.0.1:11161` — all green:
-
-   | user | level | auth | priv | result |
-   |---|---|---|---|---|
-   | md5User | authNoPriv | HMAC-MD5-96 | — | sysName.0 read |
-   | shaDesUser | authPriv | HMAC-SHA-1-96 | DES-CBC | sysName.0 read |
-   | shaAesUser | authPriv | HMAC-SHA-1-96 | AES-128-CFB | sysName.0 read |
-   | sha224User | authPriv | HMAC-128-SHA-224 | AES-128-CFB | sysName.0 read |
-   | sha256User | authPriv | HMAC-192-SHA-256 | AES-128-CFB | sysName.0 read |
-   | sha384User | authPriv | HMAC-256-SHA-384 | AES-128-CFB | sysName.0 read |
-   | sha512User | authPriv | HMAC-384-SHA-512 | AES-128-CFB | sysName.0 read |
-   | shaAesUser | noAuthNoPriv | — | — | exchange OK, agent VACM returns `authorizationError` |
-
-   The `snmpd.conf` that produces this matrix is reproduced at the top of `src/interop.zig`.
+   like the live tests in `netconf` and `tc`. The matrix run against an unprivileged net-snmp 5.9.4 `snmpd` covered
+   `authNoPriv` with HMAC-MD5-96, `authPriv` with DES-CBC and with AES-128-CFB over HMAC-SHA-1-96, AES-128-CFB over
+   each RFC 7860 hash (SHA-224/256/384/512), and `noAuthNoPriv` (the exchange succeeds and the agent's VACM answers
+   `authorizationError`); a read of `sysName.0` in every authenticated row. The `snmpd.conf` that produces the matrix
+   is reproduced at the top of `src/interop.zig`.
 
 Hostile-input coverage for v3: truncated/oversized/garbage security parameters; an auth field whose
 length is not the protocol's truncation length (both too short and too long, in a real envelope);
@@ -276,26 +283,21 @@ non-Counter32 value, or extra varbinds; an out-of-window timestamp; msgID and re
 a reply from a different engine; security-level downgrade; and full truncation + bit-flip sweeps
 over both the captured net-snmp datagrams and a live authPriv reply. Every one is a typed error.
 
-**msgID / msgMaxSize ranges (2026-11-17).** RFC 3412 §6 SYNTAX: `msgID` 0..2147483647, `msgMaxSize` 484..2147483647; §7.2.2 says a message whose header is outside it is no SNMPv3Message (`snmpInASNParseErrs`, discard). `v3.decode` therefore refuses a negative `msgID` and a `msgMaxSize` below 484 with `error.InvalidValue` (above `i32` max stays `IntegerTooLarge`). Sources: net-snmp `snmpv3_parse` in `snmplib/snmp_api.c` rejects both with `SNMPERR_ASN_PARSE_ERR` (`msgid < 0`, `msgMaxSize < SNMP_MIN_MAX_LEN` (484), `> 2^31-1`); gosnmp stores both as `uint32` and does not range-check them on receive (so the spec rule and the reference agree and the permissive one is the outlier). Encode side: the client's `msgID` counter runs 1..2^31-1 and wraps to 1 (`initial_msg_id` below 0 is raised to 0); the encoder's default `msgMaxSize` is 65507; `v3.encode*` itself writes whatever `i32` the caller passes in `EncodeParams` (documented, not checked). The client does not read a peer's `msgMaxSize` at all (no response-size clamping) — reported, no feature added. Delta mutation: 12 mutants, 11 killed, 1 UNOBSERVABLE (the `min_msg_max_size` constant is a comptime initializer and cannot take a runtime switch; its 483/485 neighbours are pinned by the 483/484/485 test cases).
-
-**Mutation 2026-11-17 (delta over the AES-192/256 change; the 2026-08-23 whole-module run recorded no counts, so this is the first countable figure):** 21 mutants (`usm.extendLocalizedKey`, `priv.localizeKey`, `PrivProtocol.keyLen/extension`, the AES-192/256 key slices, the `V3Client` privacy-key call), 19 killed (one by a hang), 2 EQUIVALENT: `have >= need` -> `have > need` (at equality the loop does not run and the same slice is returned) and `orelse return k` -> always extend (DES/AES-128 need <= 16 bytes, every auth hash gives >= 16, so the extension returns early). Not mutated: the `hashOnce` hash-type `switch` (comptime type selection cannot take a runtime switch; the SHA-224 arm is pinned by the KATs).
+- **Mutation scope:** every non-test source file except `root.zig`, `burn.zig` and the tool files; not mutated are
+  comptime data and selectors that cannot take a runtime switch (the DES permutation and S-box tables, which any DES
+  known-answer test pins; the `decodePdu` and trap time-stamp `switch` prongs; `hashOnce`'s hash-type `switch`, whose
+  SHA-224 arm the KATs pin; the `min_msg_max_size` constant, whose 483/484/485 neighbours the range test pins) and
+  `UdpTransport`'s error mapping other than Timeout and truncation.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Backlog / deferred
-Agent (engine/server) role; MIB compiler / SMI parsing; SNMPv3 over TLS/DTLS (RFC 6353); RFC 3826 `usmDHKickstart` and the `KeyChange`
-(key-update) TC; context-engine-ID proxy forwarding; v3 **notifications** (authenticated Trap/Inform
-send + receive — `receiver` is still v1/v2c only). The security-review pass on `snmp.usm`
-const-time/alg-confusion (see Threat model above) is done — clean, 2026-07-10.
 
-- **BulkWalk (GETBULK-driven walker)** *(survey 2026-09-30)*. `Client.walker`/`V3Client.walker` use GetNext, so a table walk over a WAN costs one round trip per row; gosnmp and net-snmp `snmpbulkwalk` batch. Every monitoring user walks tables. Effort: small (`getBulk` and the OID-not-increasing guard exist). Fits CONVENTIONS §2. ✅ DONE 2026-11-16 (`Client.bulkWalker`/`bulkWalkerWith` and `V3Client.bulkWalker`/`bulkWalkerWith`: GETBULK-driven walkers, default max-repetitions 10 (net-snmp `snmpbulkwalk`), stop at the subtree end / endOfMibView / noSuchName / an empty batch, `OidNotIncreasing` on a non-increasing name, `InvalidMaxRepetitions` on 0; v1 client -> `UnsupportedPdu`)
-- **Request timeout/retry policy for the UDP transport (v1/v2c)** *(survey 2026-09-30)*. UDP loses packets; net-snmp defaults to retries, `UdpTransport` has a timeout only (`rg -i retr src/` finds the v3 Report retry alone). Effort: small; possibly caller's by design (module owns no clock policy) — question for the owner. ✅ DONE 2026-11-16 (`Client.Options.retries`, default 5 like net-snmp: on a transport `Timeout` or a reply with another request id the same bytes (same id) are re-sent, `retries + 1` tries; a late reply to an earlier try is accepted by the next try; Canceled/TransportFailed/decode errors are never retried. Per-try timeout = the transport's own timeout (`UdpTransport.Options.timeout`, default `.none` = blocks, so set it to 1 s for net-snmp's default). The module still owns no clock. v3 keeps its own Report-retry; no v3 timeout retry added)
-- ✅ DONE 2026-11-16 for v1/v2c (`Client.trapV1`/`trapV2`/`inform`, `message.encodeTrapV1`/`Notification`, optional `Transport.sendFn`) and v3 **Inform** (`V3Client.inform`); v3 **Trap** stays in Backlog: the sender is the authoritative engine, which needs a local engine id / boots / time (and users localized to it) that `V3Client` does not own. **Trap / Inform / SNMPv2-Trap sending, and v3 notifications** *(survey 2026-09-30)*. gosnmp `SendTrap`, net-snmp `snmptrap`; needed by anyone writing an agent, a test harness or a relay. The codecs for the PDUs already exist. Effort: small (v1/v2c), medium (v3, needs the engine-ID/boots ownership of the sender). Fits §2.
-- ✅ DONE 2026-11-17 (all four net-snmp variants; see Scope). **AES-192/256 privacy (Cisco / draft-blumenthal variants)** *(survey 2026-09-30)*. snmp2 has them, net-snmp too *(inferred)*; some network gear mandates it. Effort: small (std AES) but the key-extension algorithm differs by vendor. Fits §2; already listed above as deferred.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · codec+client · single_owner` + deps: none (std only) — canonical source is
-`pub const meta` in src/root.zig.
+- **v3 Trap sending and v3 notification receipt** (authenticated Trap send, authenticated Trap/Inform receive;
+  `receiver` is v1/v2c only). The v3 sender is the authoritative engine, which needs a local engine id / boots /
+  time (and users localized to it) that `V3Client` does not own. Effort: medium.
+- **Deferred, no plan:** the agent (engine/server) role; a MIB compiler / SMI parsing; SNMPv3 over TLS/DTLS
+  (RFC 6353); RFC 3826 `usmDHKickstart` and the `KeyChange` textual convention; context-engine-ID proxy forwarding.
 
 ## Anchoring
 
