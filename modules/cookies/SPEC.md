@@ -233,8 +233,7 @@ route in Backlog.
 - **From the 2026-10-23 review (LOW, not defects of a documented promise):** `writeCookiesAt`
   sends at most 256 matching cookies, the first 256 in storage order rather than the most specific
   (`max_cookies` defaults to 3000); (the client jar's §5.7 `__Host-` / `__Secure-` ingest rules: done 2026-11-19); an unbalanced `"` in a `Cookie`
-  header swallows the later pairs, as CPython's `http.cookies` does and browsers do not (a sibling
-  domain that plants `a="` can hide later cookies from this parser); `percentDecode` asserts
+  header swallows the later pairs (DONE 2026-11-19: a DQUOTE opens a span only at a value start and only if a closing one follows; Go's `readCookies` and the browsers split on `;` regardless of quotes, CPython's `http.cookies` is the outlier; the quote-aware read of a balanced `s="x;y"` is kept, found by the CPython oracle); `percentDecode` asserts
   `out.len >= in.len` rather than returning an error.
 - **Constant time (low, found 2026-10-18 pre-tag sweep)**: the public `percentEncode`/`percentDecode` helpers use a hex table / `charToDigit` (root.zig ~368-423) and `isCookieValue` switches per byte (~214, ~281-296) — over a session id on Set-Cookie write. Not used internally with secrets; a CT variant if a consumer needs one.
 None recorded before the 2026-09-30 survey.
