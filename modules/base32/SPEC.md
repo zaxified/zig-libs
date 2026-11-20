@@ -77,8 +77,9 @@ characters is accumulated as a mask and reported once, after the loop. What stil
 branches is public: the options, the lengths, and whether a character is padding or
 skippable whitespace (for canonical text the public length fixes the padding outcome).
 The final `NonCanonical` verdict reads the unused low bits once, at the end. Evidence: the
-ctgrind harness `src/ctgrind_harness.zig` (see Hardening). The module does not zero any
-buffer: callers own `dest` and should clear it after use.
+ctgrind harness `src/ctgrind_harness.zig` (see Hardening). The module does not zero a
+caller's buffer: callers own `dest` and should clear it after use (its own temporary in
+`decodeAlloc` it wipes, below).
 
 ## Limits and residual risks
 
@@ -86,9 +87,9 @@ buffer: callers own `dest` and should clear it after use.
 - When `dest` is too small, `BufferTooSmall` is reported where the buffer runs out, ranked by position against a bad
   character or misplaced padding met earlier; it comes before the length / padding-count / canonical-bits faults a
   complete scan would find. On error the contents of `dest` are unspecified.
-- `decodeAlloc` decodes into a temporary buffer and frees it without clearing it, so a decoded secret (also the partial
-  one of a failed decode) stays in freed heap memory. Consistent with "the module does not zero any buffer"; see
-  *Backlog / deferred*.
+- `decodeAlloc` decodes into a temporary buffer and wipes it (`secureZero`) before freeing it, also after a failed
+  decode, so a decoded secret is not left in freed heap memory; the returned copy is the caller's to wipe. The wipe is
+  asserted by a ReleaseFast-only free-scanner test (CONVENTIONS §2.1: in Debug/ReleaseSafe `free` already scrubs).
 
 ## Verification
 
@@ -122,8 +123,6 @@ module is the two RFC 4648 alphabets (see *What this module is, and what it is n
 
 ## Backlog / deferred
 
-- `decodeAlloc` could `secureZero` its temporary buffer before freeing it (TOTP secrets pass through it). Not observable
-  by a test, so not done.
 - Streaming encoder/decoder (for secrets read in pieces): none needed yet.
 
 ## Anchoring

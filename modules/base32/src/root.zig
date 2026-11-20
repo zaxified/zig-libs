@@ -307,10 +307,15 @@ pub fn decode(dest: []u8, text: []const u8, opts: DecodeOptions) DecodeError!usi
     return out;
 }
 
-/// Owning variant of `decode`; the caller frees the result.
+/// Owning variant of `decode`; the caller frees the result. The temporary
+/// buffer is wiped before it is freed (TOTP secrets pass through it); the
+/// result is the caller's to wipe.
 pub fn decodeAlloc(allocator: std.mem.Allocator, text: []const u8, opts: DecodeOptions) (DecodeError || std.mem.Allocator.Error)![]u8 {
     const buf = try allocator.alloc(u8, decodedLenUpperBound(text.len));
-    defer allocator.free(buf);
+    defer {
+        std.crypto.secureZero(u8, buf);
+        allocator.free(buf);
+    }
     const n = try decode(buf, text, opts);
     return allocator.dupe(u8, buf[0..n]);
 }
@@ -318,6 +323,52 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, text: []const u8, opts: DecodeO
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "decodeAlloc: the temporary buffer is wiped before it goes back to the allocator" {
+    // ReleaseFast only (CONVENTIONS §2.1): `Allocator.free` scrubs a freed
+    // block to 0xaa in Debug/ReleaseSafe, so a scanner sees nothing there
+    // whatever the module does; in ReleaseFast our `secureZero` is the wipe.
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
+    const FreeScanner = struct {
+        child: std.mem.Allocator,
+        needle: []const u8,
+        leaked: bool = false,
+        frees_seen: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawAlloc(len, a, ra);
+        }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (m.len >= self.needle.len) {
+                self.frees_seen += 1;
+                if (std.mem.find(u8, m, self.needle) != null) self.leaked = true;
+            }
+            self.child.rawFree(m, a, ra);
+        }
+    };
+    const secret = "a TOTP secret!!!"; // 16 octets
+    var text_buf: [encodedLen(secret.len, true)]u8 = undefined;
+    const text = try encode(&text_buf, secret, .{});
+    var scan: FreeScanner = .{ .child = testing.allocator, .needle = secret };
+    const out = try decodeAlloc(scan.allocator(), text, .{});
+    try testing.expectEqualStrings(secret, out);
+    std.crypto.secureZero(u8, out); // the caller's wipe of the result
+    testing.allocator.free(out);
+    try testing.expect(scan.frees_seen >= 1); // the temporary went through the scanner
+    try testing.expect(!scan.leaked);
+}
 
 const Rfc = struct { raw: []const u8, std: []const u8, hex: []const u8 };
 
