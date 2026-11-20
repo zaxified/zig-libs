@@ -174,7 +174,7 @@ test "readFrameAlloc: a frame of exactly 16 KiB is one exact allocation, never r
     try testing.expectEqual(@as(usize, n), fa.allocated_bytes);
 }
 
-// ── general prefix (2026-11-03): hostile configurations and streams ─────────
+// ── general prefix: hostile configurations and streams ─────────
 
 test "general prefix: extreme offset/adjustment/skip over hostile streams never panic (sweep)" {
     const widths = [_]framing.Width{ .u8, .u16, .u24, .u32, .u40, .u48, .u56, .u64, .varint };
@@ -206,7 +206,7 @@ test "general prefix: extreme offset/adjustment/skip over hostile streams never 
     };
 }
 
-// ── review 2026-11-03: hostile u64 fields (Zig #37131), skip, NotDrained ────
+// ── review: hostile u64 fields (Zig #37131), skip, NotDrained ────
 
 test "hostile length fields are FrameTooLarge in every optimize mode (#37131 guard)" {
     // A field in the upper half of u64 (and of the narrower widths), with and

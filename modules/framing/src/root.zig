@@ -717,7 +717,7 @@ test "corpus: every stream seed reaches the header decode, and the payload octet
     }
     // One seed is deliberately the empty stream.
     try std.testing.expectEqual(frame_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 0 frames, 0 payload octets and 0 refusals before the
+    // Measured: 0 frames, 0 payload octets and 0 refusals before the
     // draw was fixed — every iteration ran out of input inside `takeArray(4)`.
     try std.testing.expectEqual(@as(usize, 5), frames);
     try std.testing.expectEqual(@as(usize, 138), payload_octets);
@@ -975,7 +975,7 @@ test "depth scan counts structure, not text: brackets inside strings are payload
     try t.expect(jsonDepthWithin(strRepeat("]", 100) ++ "[", 1));
 }
 
-// ── tests: prefix formats and the incremental decoder (2026-10-04) ──────────
+// ── tests: prefix formats and the incremental decoder ──────────
 
 fn framed(buf: []u8, payload: []const u8, limits: Limits) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
@@ -1516,7 +1516,7 @@ test "fuzz harness: 4000 seeds in every test run, and they reach frames, refusal
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
