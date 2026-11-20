@@ -291,8 +291,119 @@ pub const TCA_FLOWER = struct {
     pub const KEY_UDP_SRC: u16 = 20;
     pub const KEY_UDP_DST: u16 = 21;
     pub const FLAGS: u16 = 22;
-    pub const KEY_SCTP_SRC: u16 = 27;
-    pub const KEY_SCTP_DST: u16 = 28;
+    pub const KEY_VLAN_ID: u16 = 23;
+    pub const KEY_VLAN_PRIO: u16 = 24;
+    pub const KEY_VLAN_ETH_TYPE: u16 = 25;
+    pub const KEY_ENC_KEY_ID: u16 = 26;
+    pub const KEY_ENC_IPV4_SRC: u16 = 27;
+    pub const KEY_ENC_IPV4_SRC_MASK: u16 = 28;
+    pub const KEY_ENC_IPV4_DST: u16 = 29;
+    pub const KEY_ENC_IPV4_DST_MASK: u16 = 30;
+    pub const KEY_ENC_IPV6_SRC: u16 = 31;
+    pub const KEY_ENC_IPV6_SRC_MASK: u16 = 32;
+    pub const KEY_ENC_IPV6_DST: u16 = 33;
+    pub const KEY_ENC_IPV6_DST_MASK: u16 = 34;
+    pub const KEY_ENC_UDP_DST_PORT: u16 = 45;
+    pub const KEY_FLAGS: u16 = 47;
+    pub const KEY_FLAGS_MASK: u16 = 48;
+    pub const KEY_ICMPV4_CODE: u16 = 49;
+    pub const KEY_ICMPV4_CODE_MASK: u16 = 50;
+    pub const KEY_ICMPV4_TYPE: u16 = 51;
+    pub const KEY_ICMPV4_TYPE_MASK: u16 = 52;
+    pub const KEY_ICMPV6_CODE: u16 = 53;
+    pub const KEY_ICMPV6_CODE_MASK: u16 = 54;
+    pub const KEY_ICMPV6_TYPE: u16 = 55;
+    pub const KEY_ICMPV6_TYPE_MASK: u16 = 56;
+    pub const KEY_ARP_SIP: u16 = 57;
+    pub const KEY_ARP_SIP_MASK: u16 = 58;
+    pub const KEY_ARP_TIP: u16 = 59;
+    pub const KEY_ARP_TIP_MASK: u16 = 60;
+    pub const KEY_ARP_OP: u16 = 61;
+    pub const KEY_ARP_OP_MASK: u16 = 62;
+    pub const KEY_ARP_SHA: u16 = 63;
+    pub const KEY_ARP_SHA_MASK: u16 = 64;
+    pub const KEY_ARP_THA: u16 = 65;
+    pub const KEY_ARP_THA_MASK: u16 = 66;
+    pub const KEY_MPLS_TTL: u16 = 67;
+    pub const KEY_MPLS_BOS: u16 = 68;
+    pub const KEY_MPLS_TC: u16 = 69;
+    pub const KEY_MPLS_LABEL: u16 = 70;
+    pub const KEY_TCP_FLAGS: u16 = 71;
+    pub const KEY_TCP_FLAGS_MASK: u16 = 72;
+    pub const KEY_IP_TOS: u16 = 73;
+    pub const KEY_IP_TOS_MASK: u16 = 74;
+    pub const KEY_IP_TTL: u16 = 75;
+    pub const KEY_IP_TTL_MASK: u16 = 76;
+    pub const KEY_CVLAN_ID: u16 = 77;
+    pub const KEY_CVLAN_PRIO: u16 = 78;
+    pub const KEY_CVLAN_ETH_TYPE: u16 = 79;
+    pub const KEY_ENC_IP_TOS: u16 = 80;
+    pub const KEY_ENC_IP_TOS_MASK: u16 = 81;
+    pub const KEY_ENC_IP_TTL: u16 = 82;
+    pub const KEY_ENC_IP_TTL_MASK: u16 = 83;
+    pub const KEY_PORT_SRC_MIN: u16 = 87;
+    pub const KEY_PORT_SRC_MAX: u16 = 88;
+    pub const KEY_PORT_DST_MIN: u16 = 89;
+    pub const KEY_PORT_DST_MAX: u16 = 90;
+    pub const KEY_CT_STATE: u16 = 91;
+    pub const KEY_CT_STATE_MASK: u16 = 92;
+    pub const KEY_CT_ZONE: u16 = 93;
+    pub const KEY_CT_ZONE_MASK: u16 = 94;
+    pub const KEY_CT_MARK: u16 = 95;
+    pub const KEY_CT_MARK_MASK: u16 = 96;
+    pub const KEY_CT_LABELS: u16 = 97;
+    pub const KEY_CT_LABELS_MASK: u16 = 98;
+    /// The SCTP port keys come after the whole mask block, not at 27/28 (which
+    /// are the tunnel IPv4 source keys): iproute2 6.19 sends 41 and 42.
+    pub const KEY_SCTP_SRC: u16 = 41;
+    pub const KEY_SCTP_DST: u16 = 42;
+};
+
+/// `TCA_FLOWER_KEY_CT_FLAGS_*` — bits of `Flower.ct_state`.
+pub const FLOWER_CT = struct {
+    pub const NEW: u16 = 0x01;
+    pub const ESTABLISHED: u16 = 0x02;
+    pub const RELATED: u16 = 0x04;
+    pub const TRACKED: u16 = 0x08;
+    pub const INVALID: u16 = 0x10;
+    pub const REPLY: u16 = 0x20;
+};
+
+/// `TCA_FLOWER_KEY_FLAGS_*` — bits of `Flower.ip_flags`.
+pub const FLOWER_KEY_FLAGS = struct {
+    pub const IS_FRAGMENT: u32 = 1;
+    pub const FRAG_IS_FIRST: u32 = 2;
+};
+
+fn allOnes(comptime T: type) T {
+    return switch (@typeInfo(T)) {
+        .int => std.math.maxInt(T),
+        .array => @splat(0xff),
+        else => @compileError("allOnes: integer or array"),
+    };
+}
+
+/// A value and the mask flower applies to it. `.mask` defaults to all ones
+/// (an exact match), which is what `tc` sends for a bare value.
+pub fn Masked(comptime T: type) type {
+    return struct {
+        value: T,
+        mask: T = allOnes(T),
+    };
+}
+
+/// What flower read back for a value/mask pair: either half may be absent.
+pub fn MaskedWire(comptime T: type) type {
+    return struct {
+        value: ?T = null,
+        mask: ?T = null,
+    };
+}
+
+/// `dst_port MIN-MAX` / `src_port MIN-MAX` (`TCA_FLOWER_KEY_PORT_*_MIN/MAX`).
+pub const PortRange = struct {
+    min: u16,
+    max: u16,
 };
 
 /// An IPv4 prefix match (`dst_ip 10.0.0.0/24`).
@@ -323,6 +434,63 @@ pub const Flower = struct {
     /// `ip_proto` to be tcp, udp or sctp — otherwise `error.PortWithoutProto`.
     src_port: ?u16 = null,
     dst_port: ?u16 = null,
+    /// `dst_mac` / `src_mac`; `tc` sends the full mask for a bare address.
+    eth_dst: ?Masked([6]u8) = null,
+    eth_src: ?Masked([6]u8) = null,
+    /// `vlan_id`, `vlan_prio`, `vlan_ethtype` (the ethertype inside the tag,
+    /// host order) and the same three for the inner tag, `cvlan_*`.
+    vlan_id: ?u16 = null,
+    vlan_prio: ?u8 = null,
+    vlan_eth_type: ?u16 = null,
+    cvlan_id: ?u16 = null,
+    cvlan_prio: ?u8 = null,
+    cvlan_eth_type: ?u16 = null,
+    /// `tcp_flags V/M` (big-endian on the wire; `tc` defaults the mask to
+    /// 0x0fff).
+    tcp_flags: ?Masked(u16) = null,
+    /// `ip_tos V/M` and `ip_ttl V/M` (the IPv6 traffic class and hop limit).
+    ip_tos: ?Masked(u8) = null,
+    ip_ttl: ?Masked(u8) = null,
+    /// `type` / `code` of an ICMP or ICMPv6 message; needs `ip_proto` icmp or
+    /// icmpv6 (`error.PortWithoutProto` otherwise).
+    icmp_type: ?Masked(u8) = null,
+    icmp_code: ?Masked(u8) = null,
+    /// `src_port MIN-MAX` / `dst_port MIN-MAX`; need a port protocol.
+    src_port_range: ?PortRange = null,
+    dst_port_range: ?PortRange = null,
+    /// `indev NAME` — the receiving interface.
+    indev: ?[]const u8 = null,
+    /// `ct_state`, `ct_zone`, `ct_mark`, `ct_label` (`FLOWER_CT` bits for the
+    /// state).
+    ct_state: ?Masked(u16) = null,
+    ct_zone: ?Masked(u16) = null,
+    ct_mark: ?Masked(u32) = null,
+    ct_labels: ?Masked([16]u8) = null,
+    /// `arp_sip`, `arp_tip` (addresses with a mask, not pre-masked), `arp_op`,
+    /// `arp_sha`, `arp_tha`.
+    arp_sip: ?Masked([4]u8) = null,
+    arp_tip: ?Masked([4]u8) = null,
+    arp_op: ?Masked(u8) = null,
+    arp_sha: ?Masked([6]u8) = null,
+    arp_tha: ?Masked([6]u8) = null,
+    /// `mpls_label`, `mpls_tc`, `mpls_bos`, `mpls_ttl`.
+    mpls_label: ?u32 = null,
+    mpls_tc: ?u8 = null,
+    mpls_bos: ?u8 = null,
+    mpls_ttl: ?u8 = null,
+    /// `ip_flags` (`FLOWER_KEY_FLAGS` bits; `nofrag` is value 0, mask
+    /// `IS_FRAGMENT`).
+    ip_flags: ?Masked(u32) = null,
+    /// Tunnel keys: `enc_key_id` (big-endian), `enc_src_ip`, `enc_dst_ip`
+    /// (IPv4 and IPv6), `enc_dst_port`, `enc_tos`, `enc_ttl`.
+    enc_key_id: ?u32 = null,
+    enc_ipv4_src: ?Masked([4]u8) = null,
+    enc_ipv4_dst: ?Masked([4]u8) = null,
+    enc_ipv6_src: ?Masked([16]u8) = null,
+    enc_ipv6_dst: ?Masked([16]u8) = null,
+    enc_dst_port: ?u16 = null,
+    enc_tos: ?Masked(u8) = null,
+    enc_ttl: ?Masked(u8) = null,
     /// `classid X:Y`.
     classid: ?Handle = null,
     /// `TCA_FLOWER_FLAGS` (skip_hw / skip_sw); always sent, 0 by default.
@@ -346,7 +514,111 @@ pub const FlowerWire = struct {
     src_port: ?u16 = null,
     dst_port: ?u16 = null,
     flags: ?u32 = null,
+    eth_dst: MaskedWire([6]u8) = .{},
+    eth_src: MaskedWire([6]u8) = .{},
+    vlan_id: ?u16 = null,
+    vlan_prio: ?u8 = null,
+    vlan_eth_type: ?u16 = null,
+    cvlan_id: ?u16 = null,
+    cvlan_prio: ?u8 = null,
+    cvlan_eth_type: ?u16 = null,
+    tcp_flags: MaskedWire(u16) = .{},
+    ip_tos: MaskedWire(u8) = .{},
+    ip_ttl: MaskedWire(u8) = .{},
+    /// The ICMPv4 or ICMPv6 type/code, whichever the kernel sent.
+    icmp_type: MaskedWire(u8) = .{},
+    icmp_code: MaskedWire(u8) = .{},
+    src_port_min: ?u16 = null,
+    src_port_max: ?u16 = null,
+    dst_port_min: ?u16 = null,
+    dst_port_max: ?u16 = null,
+    indev_buf: [qdisc.kind_max]u8 = @splat(0),
+    indev_len: u8 = 0,
+    ct_state: MaskedWire(u16) = .{},
+    ct_zone: MaskedWire(u16) = .{},
+    ct_mark: MaskedWire(u32) = .{},
+    ct_labels: MaskedWire([16]u8) = .{},
+    arp_sip: MaskedWire([4]u8) = .{},
+    arp_tip: MaskedWire([4]u8) = .{},
+    arp_op: MaskedWire(u8) = .{},
+    arp_sha: MaskedWire([6]u8) = .{},
+    arp_tha: MaskedWire([6]u8) = .{},
+    mpls_label: ?u32 = null,
+    mpls_tc: ?u8 = null,
+    mpls_bos: ?u8 = null,
+    mpls_ttl: ?u8 = null,
+    ip_flags: MaskedWire(u32) = .{},
+    enc_key_id: ?u32 = null,
+    enc_ipv4_src: MaskedWire([4]u8) = .{},
+    enc_ipv4_dst: MaskedWire([4]u8) = .{},
+    enc_ipv6_src: MaskedWire([16]u8) = .{},
+    enc_ipv6_dst: MaskedWire([16]u8) = .{},
+    enc_dst_port: ?u16 = null,
+    enc_tos: MaskedWire(u8) = .{},
+    enc_ttl: MaskedWire(u8) = .{},
+
+    /// `indev`, or an empty slice.
+    pub fn indev(w: *const FlowerWire) []const u8 {
+        return w.indev_buf[0..w.indev_len];
+    }
 };
+
+fn appendScalar(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    v: anytype,
+    endian: std.builtin.Endian,
+) std.mem.Allocator.Error!void {
+    const T = @TypeOf(v);
+    switch (@typeInfo(T)) {
+        .int => {
+            var raw: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &raw, v, endian);
+            try appendBytes(gpa, list, attr_type, &raw);
+        },
+        .array => try appendBytes(gpa, list, attr_type, &v),
+        else => @compileError("appendScalar: integer or array"),
+    }
+}
+
+fn appendMasked(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    val_type: u16,
+    mask_type: u16,
+    m: anytype,
+    endian: std.builtin.Endian,
+) std.mem.Allocator.Error!void {
+    try appendScalar(gpa, list, val_type, m.value, endian);
+    try appendScalar(gpa, list, mask_type, m.mask, endian);
+}
+
+fn readScalar(comptime T: type, data: []const u8, endian: std.builtin.Endian) ?T {
+    switch (@typeInfo(T)) {
+        .int => {
+            if (data.len != @sizeOf(T)) return null;
+            return std.mem.readInt(T, data[0..@sizeOf(T)], endian);
+        },
+        .array => {
+            if (data.len != @sizeOf(T)) return null;
+            return data[0..@sizeOf(T)].*;
+        },
+        else => @compileError("readScalar: integer or array"),
+    }
+}
+
+/// Store one half of a value/mask pair (`is_mask` picks which).
+fn setMasked(
+    comptime T: type,
+    slot: *MaskedWire(T),
+    is_mask: bool,
+    data: []const u8,
+    endian: std.builtin.Endian,
+) void {
+    const v = readScalar(T, data, endian) orelse return;
+    if (is_mask) slot.mask = v else slot.value = v;
+}
 
 fn prefixMask6(prefix_len: u8) [16]u8 {
     var m: [16]u8 = @splat(0);
@@ -397,15 +669,93 @@ fn portAttrs(ip_proto: u8) ?struct { src: u16, dst: u16 } {
     };
 }
 
+/// The keys beyond L2-L4 basics, in this module's fixed order.
+fn appendFlowerExtra(
+    f: Flower,
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+) EncodeError!void {
+    const T = TCA_FLOWER;
+    if (f.eth_dst) |m| try appendMasked(gpa, list, T.KEY_ETH_DST, T.KEY_ETH_DST_MASK, m, .big);
+    if (f.eth_src) |m| try appendMasked(gpa, list, T.KEY_ETH_SRC, T.KEY_ETH_SRC_MASK, m, .big);
+    if (f.vlan_id) |v| try appendScalar(gpa, list, T.KEY_VLAN_ID, v, native_endian);
+    if (f.vlan_prio) |v| try appendScalar(gpa, list, T.KEY_VLAN_PRIO, v, native_endian);
+    if (f.vlan_eth_type) |v| try appendScalar(gpa, list, T.KEY_VLAN_ETH_TYPE, v, .big);
+    if (f.cvlan_id) |v| try appendScalar(gpa, list, T.KEY_CVLAN_ID, v, native_endian);
+    if (f.cvlan_prio) |v| try appendScalar(gpa, list, T.KEY_CVLAN_PRIO, v, native_endian);
+    if (f.cvlan_eth_type) |v| try appendScalar(gpa, list, T.KEY_CVLAN_ETH_TYPE, v, .big);
+    if (f.tcp_flags) |m| try appendMasked(gpa, list, T.KEY_TCP_FLAGS, T.KEY_TCP_FLAGS_MASK, m, .big);
+    if (f.ip_tos) |m| try appendMasked(gpa, list, T.KEY_IP_TOS, T.KEY_IP_TOS_MASK, m, native_endian);
+    if (f.ip_ttl) |m| try appendMasked(gpa, list, T.KEY_IP_TTL, T.KEY_IP_TTL_MASK, m, native_endian);
+    const v6 = f.ip_proto != null and f.ip_proto.? == IPPROTO.ICMPV6;
+    if (f.icmp_type) |m| try appendMasked(
+        gpa,
+        list,
+        if (v6) T.KEY_ICMPV6_TYPE else T.KEY_ICMPV4_TYPE,
+        if (v6) T.KEY_ICMPV6_TYPE_MASK else T.KEY_ICMPV4_TYPE_MASK,
+        m,
+        native_endian,
+    );
+    if (f.icmp_code) |m| try appendMasked(
+        gpa,
+        list,
+        if (v6) T.KEY_ICMPV6_CODE else T.KEY_ICMPV4_CODE,
+        if (v6) T.KEY_ICMPV6_CODE_MASK else T.KEY_ICMPV4_CODE_MASK,
+        m,
+        native_endian,
+    );
+    if (f.src_port_range) |r| {
+        try appendScalar(gpa, list, T.KEY_PORT_SRC_MIN, r.min, .big);
+        try appendScalar(gpa, list, T.KEY_PORT_SRC_MAX, r.max, .big);
+    }
+    if (f.dst_port_range) |r| {
+        try appendScalar(gpa, list, T.KEY_PORT_DST_MIN, r.min, .big);
+        try appendScalar(gpa, list, T.KEY_PORT_DST_MAX, r.max, .big);
+    }
+    if (f.indev) |name| {
+        codec.appendAttrString(gpa, list, T.INDEV, name) catch |err| switch (err) {
+            error.AttrTooLong => return error.OptionsTooLong,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+    if (f.ct_state) |m| try appendMasked(gpa, list, T.KEY_CT_STATE, T.KEY_CT_STATE_MASK, m, native_endian);
+    if (f.ct_zone) |m| try appendMasked(gpa, list, T.KEY_CT_ZONE, T.KEY_CT_ZONE_MASK, m, native_endian);
+    if (f.ct_mark) |m| try appendMasked(gpa, list, T.KEY_CT_MARK, T.KEY_CT_MARK_MASK, m, native_endian);
+    if (f.ct_labels) |m| try appendMasked(gpa, list, T.KEY_CT_LABELS, T.KEY_CT_LABELS_MASK, m, .big);
+    if (f.arp_sip) |m| try appendMasked(gpa, list, T.KEY_ARP_SIP, T.KEY_ARP_SIP_MASK, m, .big);
+    if (f.arp_tip) |m| try appendMasked(gpa, list, T.KEY_ARP_TIP, T.KEY_ARP_TIP_MASK, m, .big);
+    if (f.arp_op) |m| try appendMasked(gpa, list, T.KEY_ARP_OP, T.KEY_ARP_OP_MASK, m, native_endian);
+    if (f.arp_sha) |m| try appendMasked(gpa, list, T.KEY_ARP_SHA, T.KEY_ARP_SHA_MASK, m, .big);
+    if (f.arp_tha) |m| try appendMasked(gpa, list, T.KEY_ARP_THA, T.KEY_ARP_THA_MASK, m, .big);
+    if (f.mpls_label) |v| try appendScalar(gpa, list, T.KEY_MPLS_LABEL, v, native_endian);
+    if (f.mpls_tc) |v| try appendScalar(gpa, list, T.KEY_MPLS_TC, v, native_endian);
+    if (f.mpls_bos) |v| try appendScalar(gpa, list, T.KEY_MPLS_BOS, v, native_endian);
+    if (f.mpls_ttl) |v| try appendScalar(gpa, list, T.KEY_MPLS_TTL, v, native_endian);
+    if (f.enc_key_id) |v| try appendScalar(gpa, list, T.KEY_ENC_KEY_ID, v, .big);
+    if (f.enc_ipv4_src) |m| try appendMasked(gpa, list, T.KEY_ENC_IPV4_SRC, T.KEY_ENC_IPV4_SRC_MASK, m, .big);
+    if (f.enc_ipv4_dst) |m| try appendMasked(gpa, list, T.KEY_ENC_IPV4_DST, T.KEY_ENC_IPV4_DST_MASK, m, .big);
+    if (f.enc_ipv6_src) |m| try appendMasked(gpa, list, T.KEY_ENC_IPV6_SRC, T.KEY_ENC_IPV6_SRC_MASK, m, .big);
+    if (f.enc_ipv6_dst) |m| try appendMasked(gpa, list, T.KEY_ENC_IPV6_DST, T.KEY_ENC_IPV6_DST_MASK, m, .big);
+    if (f.enc_dst_port) |v| try appendScalar(gpa, list, T.KEY_ENC_UDP_DST_PORT, v, .big);
+    if (f.enc_tos) |m| try appendMasked(gpa, list, T.KEY_ENC_IP_TOS, T.KEY_ENC_IP_TOS_MASK, m, native_endian);
+    if (f.enc_ttl) |m| try appendMasked(gpa, list, T.KEY_ENC_IP_TTL, T.KEY_ENC_IP_TTL_MASK, m, native_endian);
+}
+
 fn appendFlowerOptions(
     f: Flower,
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     ps: Psched,
 ) EncodeError!void {
-    if ((f.src_port != null or f.dst_port != null)) {
+    if (f.src_port != null or f.dst_port != null or
+        f.src_port_range != null or f.dst_port_range != null)
+    {
         const proto = f.ip_proto orelse return error.PortWithoutProto;
         if (portAttrs(proto) == null) return error.PortWithoutProto;
+    }
+    if (f.icmp_type != null or f.icmp_code != null) {
+        const proto = f.ip_proto orelse return error.PortWithoutProto;
+        if (proto != IPPROTO.ICMP and proto != IPPROTO.ICMPV6) return error.PortWithoutProto;
     }
 
     // Emission order is this module's own fixed order (keys as proto, src,
@@ -443,10 +793,89 @@ fn appendFlowerOptions(
     }
     if (f.src_port) |p| try appendBe16(gpa, list, portAttrs(f.ip_proto.?).?.src, p);
     if (f.dst_port) |p| try appendBe16(gpa, list, portAttrs(f.ip_proto.?).?.dst, p);
+    try appendFlowerExtra(f, gpa, list);
     if (f.classid) |c| try codec.appendAttrU32(gpa, list, TCA_FLOWER.CLASSID, c.raw);
     try action.appendActionList(gpa, list, TCA_FLOWER.ACT, f.actions, ps);
     try codec.appendAttrU32(gpa, list, TCA_FLOWER.FLAGS, f.flags);
+    // `tc` puts the fragment flags after `TCA_FLOWER_FLAGS`, unlike the other keys.
+    if (f.ip_flags) |m| try appendMasked(gpa, list, TCA_FLOWER.KEY_FLAGS, TCA_FLOWER.KEY_FLAGS_MASK, m, .big);
     try appendBe16(gpa, list, TCA_FLOWER.KEY_ETH_TYPE, f.eth_type);
+}
+
+fn parseFlowerExtra(fw: *FlowerWire, a: codec.Attr) void {
+    const T = TCA_FLOWER;
+    const ne = native_endian;
+    switch (a.type) {
+        T.INDEV => {
+            const name = a.asString();
+            const n = @min(name.len, fw.indev_buf.len);
+            @memcpy(fw.indev_buf[0..n], name[0..n]);
+            fw.indev_len = @intCast(n);
+        },
+        T.KEY_ETH_DST => setMasked([6]u8, &fw.eth_dst, false, a.data, .big),
+        T.KEY_ETH_DST_MASK => setMasked([6]u8, &fw.eth_dst, true, a.data, .big),
+        T.KEY_ETH_SRC => setMasked([6]u8, &fw.eth_src, false, a.data, .big),
+        T.KEY_ETH_SRC_MASK => setMasked([6]u8, &fw.eth_src, true, a.data, .big),
+        T.KEY_VLAN_ID => fw.vlan_id = readScalar(u16, a.data, ne),
+        T.KEY_VLAN_PRIO => fw.vlan_prio = readScalar(u8, a.data, ne),
+        T.KEY_VLAN_ETH_TYPE => fw.vlan_eth_type = readScalar(u16, a.data, .big),
+        T.KEY_CVLAN_ID => fw.cvlan_id = readScalar(u16, a.data, ne),
+        T.KEY_CVLAN_PRIO => fw.cvlan_prio = readScalar(u8, a.data, ne),
+        T.KEY_CVLAN_ETH_TYPE => fw.cvlan_eth_type = readScalar(u16, a.data, .big),
+        T.KEY_TCP_FLAGS => setMasked(u16, &fw.tcp_flags, false, a.data, .big),
+        T.KEY_TCP_FLAGS_MASK => setMasked(u16, &fw.tcp_flags, true, a.data, .big),
+        T.KEY_IP_TOS => setMasked(u8, &fw.ip_tos, false, a.data, ne),
+        T.KEY_IP_TOS_MASK => setMasked(u8, &fw.ip_tos, true, a.data, ne),
+        T.KEY_IP_TTL => setMasked(u8, &fw.ip_ttl, false, a.data, ne),
+        T.KEY_IP_TTL_MASK => setMasked(u8, &fw.ip_ttl, true, a.data, ne),
+        T.KEY_ICMPV4_TYPE, T.KEY_ICMPV6_TYPE => setMasked(u8, &fw.icmp_type, false, a.data, ne),
+        T.KEY_ICMPV4_TYPE_MASK, T.KEY_ICMPV6_TYPE_MASK => setMasked(u8, &fw.icmp_type, true, a.data, ne),
+        T.KEY_ICMPV4_CODE, T.KEY_ICMPV6_CODE => setMasked(u8, &fw.icmp_code, false, a.data, ne),
+        T.KEY_ICMPV4_CODE_MASK, T.KEY_ICMPV6_CODE_MASK => setMasked(u8, &fw.icmp_code, true, a.data, ne),
+        T.KEY_PORT_SRC_MIN => fw.src_port_min = readScalar(u16, a.data, .big),
+        T.KEY_PORT_SRC_MAX => fw.src_port_max = readScalar(u16, a.data, .big),
+        T.KEY_PORT_DST_MIN => fw.dst_port_min = readScalar(u16, a.data, .big),
+        T.KEY_PORT_DST_MAX => fw.dst_port_max = readScalar(u16, a.data, .big),
+        T.KEY_CT_STATE => setMasked(u16, &fw.ct_state, false, a.data, ne),
+        T.KEY_CT_STATE_MASK => setMasked(u16, &fw.ct_state, true, a.data, ne),
+        T.KEY_CT_ZONE => setMasked(u16, &fw.ct_zone, false, a.data, ne),
+        T.KEY_CT_ZONE_MASK => setMasked(u16, &fw.ct_zone, true, a.data, ne),
+        T.KEY_CT_MARK => setMasked(u32, &fw.ct_mark, false, a.data, ne),
+        T.KEY_CT_MARK_MASK => setMasked(u32, &fw.ct_mark, true, a.data, ne),
+        T.KEY_CT_LABELS => setMasked([16]u8, &fw.ct_labels, false, a.data, .big),
+        T.KEY_CT_LABELS_MASK => setMasked([16]u8, &fw.ct_labels, true, a.data, .big),
+        T.KEY_ARP_SIP => setMasked([4]u8, &fw.arp_sip, false, a.data, .big),
+        T.KEY_ARP_SIP_MASK => setMasked([4]u8, &fw.arp_sip, true, a.data, .big),
+        T.KEY_ARP_TIP => setMasked([4]u8, &fw.arp_tip, false, a.data, .big),
+        T.KEY_ARP_TIP_MASK => setMasked([4]u8, &fw.arp_tip, true, a.data, .big),
+        T.KEY_ARP_OP => setMasked(u8, &fw.arp_op, false, a.data, ne),
+        T.KEY_ARP_OP_MASK => setMasked(u8, &fw.arp_op, true, a.data, ne),
+        T.KEY_ARP_SHA => setMasked([6]u8, &fw.arp_sha, false, a.data, .big),
+        T.KEY_ARP_SHA_MASK => setMasked([6]u8, &fw.arp_sha, true, a.data, .big),
+        T.KEY_ARP_THA => setMasked([6]u8, &fw.arp_tha, false, a.data, .big),
+        T.KEY_ARP_THA_MASK => setMasked([6]u8, &fw.arp_tha, true, a.data, .big),
+        T.KEY_MPLS_LABEL => fw.mpls_label = readScalar(u32, a.data, ne),
+        T.KEY_MPLS_TC => fw.mpls_tc = readScalar(u8, a.data, ne),
+        T.KEY_MPLS_BOS => fw.mpls_bos = readScalar(u8, a.data, ne),
+        T.KEY_MPLS_TTL => fw.mpls_ttl = readScalar(u8, a.data, ne),
+        T.KEY_FLAGS => setMasked(u32, &fw.ip_flags, false, a.data, .big),
+        T.KEY_FLAGS_MASK => setMasked(u32, &fw.ip_flags, true, a.data, .big),
+        T.KEY_ENC_KEY_ID => fw.enc_key_id = readScalar(u32, a.data, .big),
+        T.KEY_ENC_IPV4_SRC => setMasked([4]u8, &fw.enc_ipv4_src, false, a.data, .big),
+        T.KEY_ENC_IPV4_SRC_MASK => setMasked([4]u8, &fw.enc_ipv4_src, true, a.data, .big),
+        T.KEY_ENC_IPV4_DST => setMasked([4]u8, &fw.enc_ipv4_dst, false, a.data, .big),
+        T.KEY_ENC_IPV4_DST_MASK => setMasked([4]u8, &fw.enc_ipv4_dst, true, a.data, .big),
+        T.KEY_ENC_IPV6_SRC => setMasked([16]u8, &fw.enc_ipv6_src, false, a.data, .big),
+        T.KEY_ENC_IPV6_SRC_MASK => setMasked([16]u8, &fw.enc_ipv6_src, true, a.data, .big),
+        T.KEY_ENC_IPV6_DST => setMasked([16]u8, &fw.enc_ipv6_dst, false, a.data, .big),
+        T.KEY_ENC_IPV6_DST_MASK => setMasked([16]u8, &fw.enc_ipv6_dst, true, a.data, .big),
+        T.KEY_ENC_UDP_DST_PORT => fw.enc_dst_port = readScalar(u16, a.data, .big),
+        T.KEY_ENC_IP_TOS => setMasked(u8, &fw.enc_tos, false, a.data, ne),
+        T.KEY_ENC_IP_TOS_MASK => setMasked(u8, &fw.enc_tos, true, a.data, ne),
+        T.KEY_ENC_IP_TTL => setMasked(u8, &fw.enc_ttl, false, a.data, ne),
+        T.KEY_ENC_IP_TTL_MASK => setMasked(u8, &fw.enc_ttl, true, a.data, ne),
+        else => {},
+    }
 }
 
 pub fn parseFlowerOptions(data: []const u8) codec.Error!FlowerWire {
@@ -489,7 +918,7 @@ pub fn parseFlowerOptions(data: []const u8) codec.Error!FlowerWire {
         TCA_FLOWER.FLAGS => if (a.data.len == 4) {
             fw.flags = std.mem.readInt(u32, a.data[0..4], native_endian);
         },
-        else => {},
+        else => parseFlowerExtra(&fw, a),
     };
     return fw;
 }

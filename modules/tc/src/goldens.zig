@@ -4042,3 +4042,390 @@ test "golden: tc actions flush (RTM_DELACTION + ACK|ROOT, kind only, LARGE_DUMP 
     defer gpa.free(req);
     try expectGolden(g_action_flush_gact, req);
 }
+
+// ── flower goldens beyond the L2-L4 basics ──────────────────────────────────
+
+/// Build one flower filter, compare it with the golden, and decode the
+/// golden back.
+fn flowerGolden(comptime hex: []const u8, seq: u32, prio: u16, f: filter.Flower) !filter.FlowerWire {
+    const codec = @import("netlink").codec;
+    const req = try message.buildFilterSetWith(
+        gpa,
+        seq,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = prio, .eth_type = f.eth_type },
+        .{ .flower = f },
+        ps,
+    );
+    defer gpa.free(req);
+    try expectGolden(hex, req);
+    var buf: [hex.len / 2]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&buf, hex);
+    var it: codec.MessageIterator = .{ .buf = bytes };
+    const m = (try it.next()).?;
+    const fl = try filter.parseFilter(m.payload);
+    return fl.flower.?;
+}
+
+test "golden: flower sctp ports (the keys are 41 and 42, not 27 and 28)" {
+    // tc filter add dev lo parent 1: protocol ip prio 50 flower ip_proto sctp src_port 5 dst_port 6
+    const w = try flowerGolden(g_flower_sctp, seq_flower_sctp, 50, .{
+        .eth_type = ETH_P.IP,
+        .ip_proto = IPPROTO.SCTP,
+        .src_port = 5,
+        .dst_port = 6,
+    });
+    try testing.expectEqual(@as(?u16, 5), w.src_port);
+    try testing.expectEqual(@as(?u16, 6), w.dst_port);
+}
+
+test "golden: flower MAC addresses, VLAN and QinQ" {
+    // tc filter add dev lo parent 1: protocol ip prio 51 flower dst_mac 00:11:22:33:44:55 src_mac 66:77:88:99:aa:bb
+    var w = try flowerGolden(g_flower_macs, seq_flower_macs, 51, .{
+        .eth_type = ETH_P.IP,
+        .eth_dst = .{ .value = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 } },
+        .eth_src = .{ .value = .{ 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb } },
+    });
+    try testing.expectEqual(@as(?[6]u8, .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 }), w.eth_dst.value);
+    try testing.expectEqual(@as(?[6]u8, @as([6]u8, @splat(0xff))), w.eth_src.mask);
+    // tc filter add dev lo parent 1: protocol 802.1Q prio 52 flower vlan_id 100 vlan_prio 3 vlan_ethtype ip
+    w = try flowerGolden(g_flower_vlan, seq_flower_vlan, 52, .{
+        .eth_type = ETH_P.@"802_1Q",
+        .vlan_id = 100,
+        .vlan_prio = 3,
+        .vlan_eth_type = ETH_P.IP,
+    });
+    try testing.expectEqual(@as(?u16, 100), w.vlan_id);
+    try testing.expectEqual(@as(?u8, 3), w.vlan_prio);
+    try testing.expectEqual(@as(?u16, ETH_P.IP), w.vlan_eth_type);
+    // tc filter add dev lo parent 1: protocol 802.1ad prio 53 flower vlan_id 7 vlan_ethtype 802.1q cvlan_id 8 cvlan_prio 2 cvlan_ethtype ip
+    w = try flowerGolden(g_flower_cvlan, seq_flower_cvlan, 53, .{
+        .eth_type = 0x88a8,
+        .vlan_id = 7,
+        .vlan_eth_type = ETH_P.@"802_1Q",
+        .cvlan_id = 8,
+        .cvlan_prio = 2,
+        .cvlan_eth_type = ETH_P.IP,
+    });
+    try testing.expectEqual(@as(?u16, 8), w.cvlan_id);
+    try testing.expectEqual(@as(?u8, 2), w.cvlan_prio);
+    try testing.expectEqual(@as(?u16, ETH_P.IP), w.cvlan_eth_type);
+}
+
+test "golden: flower TCP flags, TOS, TTL, ICMP, port ranges and indev" {
+    // tc filter add dev lo parent 1: protocol ip prio 54 flower ip_proto tcp tcp_flags 0x2/0xff ip_tos 0x10/0xfc ip_ttl 64/0xff
+    var w = try flowerGolden(g_flower_tcp_flags_tos_ttl, seq_flower_tcp_flags_tos_ttl, 54, .{
+        .eth_type = ETH_P.IP,
+        .ip_proto = IPPROTO.TCP,
+        .tcp_flags = .{ .value = 2, .mask = 0xff },
+        .ip_tos = .{ .value = 0x10, .mask = 0xfc },
+        .ip_ttl = .{ .value = 64 },
+    });
+    try testing.expectEqual(@as(?u16, 2), w.tcp_flags.value);
+    try testing.expectEqual(@as(?u16, 0xff), w.tcp_flags.mask);
+    try testing.expectEqual(@as(?u8, 0xfc), w.ip_tos.mask);
+    try testing.expectEqual(@as(?u8, 0xff), w.ip_ttl.mask);
+    // tc filter add dev lo parent 1: protocol ip prio 55 flower ip_proto tcp tcp_flags 0x2
+    w = try flowerGolden(g_flower_tcp_flags_default, seq_flower_tcp_flags_default, 55, .{
+        .eth_type = ETH_P.IP,
+        .ip_proto = IPPROTO.TCP,
+        .tcp_flags = .{ .value = 2, .mask = 0x0fff },
+    });
+    try testing.expectEqual(@as(?u16, 0x0fff), w.tcp_flags.mask);
+    // tc filter add dev lo parent 1: protocol ip prio 56 flower ip_proto icmp type 8 code 0
+    w = try flowerGolden(g_flower_icmp, seq_flower_icmp, 56, .{
+        .eth_type = ETH_P.IP,
+        .ip_proto = IPPROTO.ICMP,
+        .icmp_type = .{ .value = 8 },
+        .icmp_code = .{ .value = 0 },
+    });
+    try testing.expectEqual(@as(?u8, 8), w.icmp_type.value);
+    try testing.expectEqual(@as(?u8, 0), w.icmp_code.value);
+    // tc filter add dev lo parent 1: protocol ipv6 prio 57 flower ip_proto icmpv6 type 128 code 0
+    w = try flowerGolden(g_flower_icmpv6, seq_flower_icmpv6, 57, .{
+        .eth_type = ETH_P.IPV6,
+        .ip_proto = IPPROTO.ICMPV6,
+        .icmp_type = .{ .value = 128 },
+        .icmp_code = .{ .value = 0 },
+    });
+    try testing.expectEqual(@as(?u8, 128), w.icmp_type.value);
+    // tc filter add dev lo parent 1: protocol ip prio 58 flower ip_proto tcp dst_port 100-200
+    w = try flowerGolden(g_flower_port_range, seq_flower_port_range, 58, .{
+        .eth_type = ETH_P.IP,
+        .ip_proto = IPPROTO.TCP,
+        .dst_port_range = .{ .min = 100, .max = 200 },
+    });
+    try testing.expectEqual(@as(?u16, 100), w.dst_port_min);
+    try testing.expectEqual(@as(?u16, 200), w.dst_port_max);
+    // tc filter add dev lo parent 1: protocol ip prio 59 flower ip_proto udp src_port 10-20
+    w = try flowerGolden(g_flower_src_port_range, seq_flower_src_port_range, 59, .{
+        .eth_type = ETH_P.IP,
+        .ip_proto = IPPROTO.UDP,
+        .src_port_range = .{ .min = 10, .max = 20 },
+    });
+    try testing.expectEqual(@as(?u16, 20), w.src_port_max);
+    // tc filter add dev lo parent 1: protocol ip prio 60 flower indev lo
+    w = try flowerGolden(g_flower_indev, seq_flower_indev, 60, .{ .eth_type = ETH_P.IP, .indev = "lo" });
+    try testing.expectEqualStrings("lo", w.indev());
+}
+
+test "golden: flower conntrack state, zone and mark" {
+    // tc filter add dev lo parent 1: protocol ip prio 61 flower ct_state +trk+est ct_zone 5 ct_mark 7
+    var w = try flowerGolden(g_flower_ct, seq_flower_ct, 61, .{
+        .eth_type = ETH_P.IP,
+        .ct_state = .{
+            .value = filter.FLOWER_CT.TRACKED | filter.FLOWER_CT.ESTABLISHED,
+            .mask = filter.FLOWER_CT.TRACKED | filter.FLOWER_CT.ESTABLISHED,
+        },
+        .ct_zone = .{ .value = 5 },
+        .ct_mark = .{ .value = 7 },
+    });
+    try testing.expectEqual(@as(?u16, 0x0a), w.ct_state.value);
+    try testing.expectEqual(@as(?u16, 5), w.ct_zone.value);
+    try testing.expectEqual(@as(?u16, 0xffff), w.ct_zone.mask);
+    try testing.expectEqual(@as(?u32, 7), w.ct_mark.value);
+    // tc filter add dev lo parent 1: protocol ip prio 62 flower ct_state -trk
+    w = try flowerGolden(g_flower_ct_neg, seq_flower_ct_neg, 62, .{
+        .eth_type = ETH_P.IP,
+        .ct_state = .{ .value = 0, .mask = filter.FLOWER_CT.TRACKED },
+    });
+    try testing.expectEqual(@as(?u16, 0), w.ct_state.value);
+    try testing.expectEqual(@as(?u16, 8), w.ct_state.mask);
+}
+
+test "golden: flower ARP, MPLS and fragment flags" {
+    // tc filter add dev lo parent 1: protocol arp prio 63 flower arp_sip 10.0.0.2/24 arp_tip 10.0.0.1 arp_op request arp_sha 66:77:88:99:aa:bb arp_tha 00:11:22:33:44:55
+    var w = try flowerGolden(g_flower_arp, seq_flower_arp, 63, .{
+        .eth_type = ETH_P.ARP,
+        .arp_sip = .{ .value = .{ 10, 0, 0, 2 }, .mask = .{ 255, 255, 255, 0 } },
+        .arp_tip = .{ .value = .{ 10, 0, 0, 1 } },
+        .arp_op = .{ .value = 1 },
+        .arp_sha = .{ .value = .{ 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb } },
+        .arp_tha = .{ .value = .{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 } },
+    });
+    try testing.expectEqual(@as(?[4]u8, .{ 10, 0, 0, 2 }), w.arp_sip.value);
+    try testing.expectEqual(@as(?[4]u8, .{ 255, 255, 255, 0 }), w.arp_sip.mask);
+    try testing.expectEqual(@as(?u8, 1), w.arp_op.value);
+    try testing.expectEqual(@as(?[6]u8, .{ 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb }), w.arp_sha.value);
+    // tc filter add dev lo parent 1: protocol mpls_uc prio 64 flower mpls_label 100 mpls_tc 3 mpls_bos 1 mpls_ttl 64
+    w = try flowerGolden(g_flower_mpls, seq_flower_mpls, 64, .{
+        .eth_type = 0x8847,
+        .mpls_label = 100,
+        .mpls_tc = 3,
+        .mpls_bos = 1,
+        .mpls_ttl = 64,
+    });
+    try testing.expectEqual(@as(?u32, 100), w.mpls_label);
+    try testing.expectEqual(@as(?u8, 64), w.mpls_ttl);
+    // tc filter add dev lo parent 1: protocol ip prio 65 flower ip_flags nofrag
+    w = try flowerGolden(g_flower_ip_flags, seq_flower_ip_flags, 65, .{
+        .eth_type = ETH_P.IP,
+        .ip_flags = .{ .value = 0, .mask = filter.FLOWER_KEY_FLAGS.IS_FRAGMENT },
+    });
+    try testing.expectEqual(@as(?u32, 1), w.ip_flags.mask);
+}
+
+test "golden: flower tunnel keys" {
+    // tc filter add dev lo parent 1: protocol ip prio 66 flower enc_key_id 5 enc_src_ip 10.0.0.1 enc_dst_ip 10.0.0.2 enc_dst_port 4789 enc_tos 4 enc_ttl 64
+    var w = try flowerGolden(g_flower_enc, seq_flower_enc, 66, .{
+        .eth_type = ETH_P.IP,
+        .enc_key_id = 5,
+        .enc_ipv4_src = .{ .value = .{ 10, 0, 0, 1 } },
+        .enc_ipv4_dst = .{ .value = .{ 10, 0, 0, 2 } },
+        .enc_dst_port = 4789,
+        .enc_tos = .{ .value = 4 },
+        .enc_ttl = .{ .value = 64 },
+    });
+    try testing.expectEqual(@as(?u32, 5), w.enc_key_id);
+    try testing.expectEqual(@as(?[4]u8, .{ 10, 0, 0, 2 }), w.enc_ipv4_dst.value);
+    try testing.expectEqual(@as(?u16, 4789), w.enc_dst_port);
+    try testing.expectEqual(@as(?u8, 4), w.enc_tos.value);
+    try testing.expectEqual(@as(?u8, 64), w.enc_ttl.value);
+    // tc filter add dev lo parent 1: protocol ip prio 67 flower enc_src_ip 2001:db8::1 enc_dst_ip 2001:db8::2
+    const a6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{1};
+    const b6: [16]u8 = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{2};
+    w = try flowerGolden(g_flower_enc_v6, seq_flower_enc_v6, 67, .{
+        .eth_type = ETH_P.IP,
+        .enc_ipv6_src = .{ .value = a6 },
+        .enc_ipv6_dst = .{ .value = b6 },
+    });
+    try testing.expectEqual(@as(?[16]u8, b6), w.enc_ipv6_dst.value);
+}
+
+test "flower: ICMP and port ranges need the matching ip_proto; conntrack labels round-trip" {
+    const codec = @import("netlink").codec;
+    try testing.expectError(error.PortWithoutProto, message.buildFilterSetWith(
+        gpa,
+        1,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.IP },
+        .{ .flower = .{ .eth_type = ETH_P.IP, .icmp_type = .{ .value = 8 } } },
+        ps,
+    ));
+    try testing.expectError(error.PortWithoutProto, message.buildFilterSetWith(
+        gpa,
+        1,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.IP },
+        .{ .flower = .{ .eth_type = ETH_P.IP, .ip_proto = IPPROTO.ICMP, .dst_port_range = .{ .min = 1, .max = 2 } } },
+        ps,
+    ));
+    // ct_label has no iproute2 golden (6.19 sends an empty value for it), so
+    // it is checked as a round trip only.
+    const labels: [16]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const req = try message.buildFilterSetWith(
+        gpa,
+        1,
+        .add,
+        .{ .ifindex = lo, .parent = Handle.init(1, 0), .prio = 1, .eth_type = ETH_P.IP },
+        .{ .flower = .{ .eth_type = ETH_P.IP, .ct_labels = .{ .value = labels } } },
+        ps,
+    );
+    defer gpa.free(req);
+    var it: codec.MessageIterator = .{ .buf = req };
+    const m = (try it.next()).?;
+    const fl = try filter.parseFilter(m.payload);
+    try testing.expectEqual(@as(?[16]u8, labels), fl.flower.?.ct_labels.value);
+    try testing.expectEqual(@as(?[16]u8, @as([16]u8, @splat(0xff))), fl.flower.?.ct_labels.mask);
+}
+
+// ── captured request bytes: flower extras ───────────────────────────────────
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218405 len=92
+// tc filter add dev lo parent 1: protocol ip prio 50 flower ip_proto sctp src_port 5 dst_port 6
+const g_flower_sctp =
+    "5c0000002c000506e5db006b0000000000000000010000000000000000000100080032000b000100666c6f77657200002c" ++
+    "0002000500090084000000060029000005000006002a000006000008001600000000000600080008000000";
+const seq_flower_sctp: u32 = 1795218405;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218405 len=116
+// tc filter add dev lo parent 1: protocol ip prio 51 flower dst_mac 00:11:22:33:44:55 src_mac 66:77:88:99:aa:bb
+const g_flower_macs =
+    "740000002c000506e5db006b0000000000000000010000000000000000000100080033000b000100666c6f776572000044" ++
+    "0002000a00040000112233445500000a000500ffffffffffff00000a00060066778899aabb00000a000700ffffffffffff" ++
+    "000008001600000000000600080008000000";
+const seq_flower_macs: u32 = 1795218405;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218405 len=92
+// tc filter add dev lo parent 1: protocol 802.1Q prio 52 flower vlan_id 100 vlan_prio 3 vlan_ethtype ip
+const g_flower_vlan =
+    "5c0000002c000506e5db006b0000000000000000010000000000000000000100810034000b000100666c6f77657200002c" ++
+    "00020006001700640000000500180003000000060019000800000008001600000000000600080081000000";
+const seq_flower_vlan: u32 = 1795218405;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218405 len=108
+// tc filter add dev lo parent 1: protocol 802.1ad prio 53 flower vlan_id 7 vlan_ethtype 802.1q cvlan_id 8 cvlan_prio 2 cvlan_ethtype ip
+const g_flower_cvlan =
+    "6c0000002c000506e5db006b000000000000000001000000000000000000010088a835000b000100666c6f77657200003c" ++
+    "0002000600170007000000060019008100000006004d000800000005004e000200000006004f0008000000080016000000" ++
+    "00000600080088a80000";
+const seq_flower_cvlan: u32 = 1795218405;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218405 len=124
+// tc filter add dev lo parent 1: protocol ip prio 54 flower ip_proto tcp tcp_flags 0x2/0xff ip_tos 0x10/0xfc ip_ttl 64/0xff
+const g_flower_tcp_flags_tos_ttl =
+    "7c0000002c000506e5db006b0000000000000000010000000000000000000100080036000b000100666c6f77657200004c" ++
+    "000200050009000600000006004700000200000600480000ff0000050049001000000005004a00fc00000005004b004000" ++
+    "000005004c00ff00000008001600000000000600080008000000";
+const seq_flower_tcp_flags_tos_ttl: u32 = 1795218405;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218405 len=92
+// tc filter add dev lo parent 1: protocol ip prio 55 flower ip_proto tcp tcp_flags 0x2
+const g_flower_tcp_flags_default =
+    "5c0000002c000506e5db006b0000000000000000010000000000000000000100080037000b000100666c6f77657200002c" ++
+    "00020005000900060000000600470000020000060048000fff000008001600000000000600080008000000";
+const seq_flower_tcp_flags_default: u32 = 1795218405;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218405 len=108
+// tc filter add dev lo parent 1: protocol ip prio 56 flower ip_proto icmp type 8 code 0
+const g_flower_icmp =
+    "6c0000002c000506e5db006b0000000000000000010000000000000000000100080038000b000100666c6f77657200003c" ++
+    "0002000500090001000000050033000800000005003400ff000000050031000000000005003200ff000000080016000000" ++
+    "00000600080008000000";
+const seq_flower_icmp: u32 = 1795218405;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=108
+// tc filter add dev lo parent 1: protocol ipv6 prio 57 flower ip_proto icmpv6 type 128 code 0
+const g_flower_icmpv6 =
+    "6c0000002c000506e6db006b000000000000000001000000000000000000010086dd39000b000100666c6f77657200003c" ++
+    "000200050009003a000000050037008000000005003800ff000000050035000000000005003600ff000000080016000000" ++
+    "00000600080086dd0000";
+const seq_flower_icmpv6: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=92
+// tc filter add dev lo parent 1: protocol ip prio 58 flower ip_proto tcp dst_port 100-200
+const g_flower_port_range =
+    "5c0000002c000506e6db006b000000000000000001000000000000000000010008003a000b000100666c6f77657200002c" ++
+    "0002000500090006000000060059000064000006005a0000c8000008001600000000000600080008000000";
+const seq_flower_port_range: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=92
+// tc filter add dev lo parent 1: protocol ip prio 59 flower ip_proto udp src_port 10-20
+const g_flower_src_port_range =
+    "5c0000002c000506e6db006b000000000000000001000000000000000000010008003b000b000100666c6f77657200002c" ++
+    "000200050009001100000006005700000a0000060058000014000008001600000000000600080008000000";
+const seq_flower_src_port_range: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=76
+// tc filter add dev lo parent 1: protocol ip prio 60 flower indev lo
+const g_flower_indev =
+    "4c0000002c000506e6db006b000000000000000001000000000000000000010008003c000b000100666c6f77657200001c" ++
+    "000200070002006c6f000008001600000000000600080008000000";
+const seq_flower_indev: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=116
+// tc filter add dev lo parent 1: protocol ip prio 61 flower ct_state +trk+est ct_zone 5 ct_mark 7
+const g_flower_ct =
+    "740000002c000506e6db006b000000000000000001000000000000000000010008003d000b000100666c6f776572000044" ++
+    "00020006005b000a00000006005c000a00000006005d000500000006005e00ffff000008005f000700000008006000ffff" ++
+    "ffff08001600000000000600080008000000";
+const seq_flower_ct: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=84
+// tc filter add dev lo parent 1: protocol ip prio 62 flower ct_state -trk
+const g_flower_ct_neg =
+    "540000002c000506e6db006b000000000000000001000000000000000000010008003e000b000100666c6f776572000024" ++
+    "00020006005b000000000006005c000800000008001600000000000600080008000000";
+const seq_flower_ct_neg: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=164
+// tc filter add dev lo parent 1: protocol arp prio 63 flower arp_sip 10.0.0.2/24 arp_tip 10.0.0.1 arp_op request arp_sha 66:77:88:99:aa:bb arp_tha 00:11:22:33:44:55
+const g_flower_arp =
+    "a40000002c000506e6db006b000000000000000001000000000000000000010008063f000b000100666c6f776572000074" ++
+    "000200080039000a00000208003a00ffffff0008003b000a00000108003c00ffffffff05003d000100000005003e00ff00" ++
+    "00000a003f0066778899aabb00000a004000ffffffffffff00000a00410000112233445500000a004200ffffffffffff00" ++
+    "0008001600000000000600080008060000";
+const seq_flower_arp: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=100
+// tc filter add dev lo parent 1: protocol mpls_uc prio 64 flower mpls_label 100 mpls_tc 3 mpls_bos 1 mpls_ttl 64
+const g_flower_mpls =
+    "640000002c000506e6db006b0000000000000000010000000000000000000100884740000b000100666c6f776572000034" ++
+    "00020008004600640000000500450003000000050044000100000005004300400000000800160000000000060008008847" ++
+    "0000";
+const seq_flower_mpls: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=84
+// tc filter add dev lo parent 1: protocol ip prio 65 flower ip_flags nofrag
+const g_flower_ip_flags =
+    "540000002c000506e6db006b0000000000000000010000000000000000000100080041000b000100666c6f776572000024" ++
+    "000200080016000000000008002f000000000008003000000000010600080008000000";
+const seq_flower_ip_flags: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=148
+// tc filter add dev lo parent 1: protocol ip prio 66 flower enc_key_id 5 enc_src_ip 10.0.0.1 enc_dst_ip 10.0.0.2 enc_dst_port 4789 enc_tos 4 enc_ttl 64
+const g_flower_enc =
+    "940000002c000506e6db006b0000000000000000010000000000000000000100080042000b000100666c6f776572000064" ++
+    "00020008001a000000000508001b000a00000108001c00ffffffff08001d000a00000208001e00ffffffff06002d0012b5" ++
+    "0000050050000400000005005100ff000000050052004000000005005300ff000000080016000000000006000800080000" ++
+    "00";
+const seq_flower_enc: u32 = 1795218406;
+
+// ### RTM_NEWTFILTER type=44 flags=0x605 seq=1795218406 len=148
+// tc filter add dev lo parent 1: protocol ip prio 67 flower enc_src_ip 2001:db8::1 enc_dst_ip 2001:db8::2
+const g_flower_enc_v6 =
+    "940000002c000506e6db006b0000000000000000010000000000000000000100080043000b000100666c6f776572000064" ++
+    "00020014001f0020010db800000000000000000000000114002000ffffffffffffffffffffffffffffffff140021002001" ++
+    "0db800000000000000000000000214002200ffffffffffffffffffffffffffffffff080016000000000006000800080000" ++
+    "00";
+const seq_flower_enc_v6: u32 = 1795218406;
