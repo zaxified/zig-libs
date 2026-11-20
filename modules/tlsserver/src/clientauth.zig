@@ -248,12 +248,18 @@ fn publicKeyOf(spki: x509.Spki) VerifyError!certverify.PublicKey {
         return error.UnsupportedCertificate;
     }
     if (spki.algorithmIs(&x509.safe.oid_ed25519)) {
+        // RFC 8410 §3: the parameters MUST be absent (Go: "Ed25519 key
+        // encoded with illegal parameters").
+        if (spki.parameters != null) return error.BadCertificate;
         const n = std.crypto.sign.Ed25519.PublicKey.encoded_length;
         if (bits.len != n) return error.BadCertificate;
         return .{ .ed25519 = std.crypto.sign.Ed25519.PublicKey.fromBytes(bits[0..n].*) catch return error.BadCertificate };
     }
     // ML-DSA (RFC 9881): the encoded key, borrowed from `der`.
     if (x509.MlDsa.map.get(spki.algorithm_oid)) |set| {
+        // RFC 9881 §2: the parameters MUST be absent, as for the private
+        // key (`keys.zig`).
+        if (spki.parameters != null) return error.BadCertificate;
         // A key of another length is a malformed certificate, not a
         // signature that fails (independent review 2026-10-21, LOW).
         switch (set) {
@@ -485,4 +491,60 @@ test "X509Verifier: a client chain through an intermediate CA is taken at the de
     try std.testing.expectError(error.UnknownCa, cv.verify(cv.ctx, chain[0..1], now_s));
     v.max_intermediates = 0;
     try std.testing.expectError(error.BadCertificate, v.verifier().verify(cv.ctx, &chain, now_s));
+}
+
+test "RFC 8410 / RFC 9881: an Ed25519 or ML-DSA key with AlgorithmIdentifier parameters is bad_certificate" {
+    // SEQUENCE { SEQUENCE { OID, [NULL] }, BIT STRING { 0, key } }.
+    const Spki = struct {
+        fn build(buf: []u8, oid: []const u8, with_null: bool, key_len: usize) []const u8 {
+            var alg: [32]u8 = undefined;
+            var a: usize = 0;
+            alg[a] = 0x06;
+            alg[a + 1] = @intCast(oid.len);
+            @memcpy(alg[a + 2 ..][0..oid.len], oid);
+            a += 2 + oid.len;
+            if (with_null) {
+                alg[a] = 0x05;
+                alg[a + 1] = 0;
+                a += 2;
+            }
+            var w: usize = 0;
+            const body_len = 2 + a + 4 + 1 + key_len;
+            buf[w] = 0x30;
+            buf[w + 1] = 0x82;
+            std.mem.writeInt(u16, buf[w + 2 ..][0..2], @intCast(body_len), .big);
+            w += 4;
+            buf[w] = 0x30;
+            buf[w + 1] = @intCast(a);
+            @memcpy(buf[w + 2 ..][0..a], alg[0..a]);
+            w += 2 + a;
+            buf[w] = 0x03;
+            buf[w + 1] = 0x82;
+            std.mem.writeInt(u16, buf[w + 2 ..][0..2], @intCast(1 + key_len), .big);
+            buf[w + 4] = 0;
+            @memset(buf[w + 5 ..][0..key_len], 0x42);
+            w += 5 + key_len;
+            return buf[0..w];
+        }
+    };
+    var buf: [4096]u8 = undefined;
+    // Ed25519: a 32-octet key takes short-form lengths.
+    var ed: [46]u8 = undefined;
+    @memcpy(ed[0..12], &[_]u8{ 0x30, 0x2c, 0x30, 0x07, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x05, 0x00, 0x03 });
+    ed[12] = 0x21;
+    ed[13] = 0;
+    // A valid Ed25519 point: the base point's encoding.
+    const base = std.crypto.ecc.Edwards25519.basePoint.toBytes();
+    @memcpy(ed[14..46], &base);
+    try testing.expectError(error.BadCertificate, rawPublicKey(&ed));
+    var ed_plain: [44]u8 = undefined;
+    @memcpy(ed_plain[0..9], &[_]u8{ 0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70 });
+    @memcpy(ed_plain[9..12], &[_]u8{ 0x03, 0x21, 0x00 });
+    @memcpy(ed_plain[12..44], &base);
+    _ = try rawPublicKey(&ed_plain);
+
+    const mldsa65_oid = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
+    const n = x509.MlDsa.Impl(.ml_dsa_65).PublicKey.encoded_length;
+    try testing.expectError(error.BadCertificate, rawPublicKey(Spki.build(&buf, &mldsa65_oid, true, n)));
+    _ = try rawPublicKey(Spki.build(&buf, &mldsa65_oid, false, n));
 }

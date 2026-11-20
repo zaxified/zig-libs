@@ -405,7 +405,8 @@ CertificateVerify). Otherwise: at most 16 certificates and a leaf of at most
 `ClientAuth.max_leaf_len` octets (4096 by default; `bad_certificate` past either); the leaf's
 key must be one `certverify` verifies (RSA, ECDSA P-256/P-384/P-521, Ed25519, ML-DSA — the last
 two only with their schemes in `ClientAuth.schemes`; an ML-DSA-65/87 leaf, 5.5-7.5 KB, needs a
-larger `max_leaf_len`) and its `keyUsage`,
+larger `max_leaf_len`; an Ed25519 or ML-DSA key whose AlgorithmIdentifier carries parameters is
+`bad_certificate`, RFC 8410 §3 / RFC 9881 §2, as for the server's own key and in Go) and its `keyUsage`,
 if present, must assert `digitalSignature`
 (`unsupported_certificate`; BoringSSL checks this in the TLS layer whatever the verifier says,
 read from an `x509.safe`-vetted copy, made where the leaf is kept); then the chain, leaf first, goes to
@@ -996,8 +997,6 @@ records (the per-record 4 KiB burn).
   are unobservable today.
 - **Key loading.** Encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys: `fromPemEncrypted`); a private-key reader shared
   with `acme` (request filed in `x509/SPEC.md` § Backlog).
-- **ML-DSA client leaf.** The AlgorithmIdentifier's absent parameters are checked for the private key, not for a client leaf
-  (`x509.Spki` does not expose them).
 - **JA4 differential check** against Wireshark's JA4 field (`tshark` is not installed on the development host).
 - **Ticket count request** (RFC 9149).
 
