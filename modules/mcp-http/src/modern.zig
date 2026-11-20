@@ -678,3 +678,21 @@ test "statusFor: 400 for the three modern refusals, 404 for an unknown method, e
     try testing.expect(isResponseLine(a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"));
     try testing.expect(!isResponseLine(a, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}"));
 }
+
+test "annotation chains are followed to max_chain properties deep, no further" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]struct { levels: usize, found: usize }{
+        .{ .levels = mcp.header_annotations.max_chain, .found = 1 },
+        .{ .levels = mcp.header_annotations.max_chain + 1, .found = 0 },
+    }) |c| {
+        var text: std.ArrayList(u8) = .empty;
+        for (0..c.levels) |_| try text.appendSlice(arena, "{\"type\":\"object\",\"properties\":{\"p\":");
+        try text.appendSlice(arena, "{\"type\":\"string\",\"x-mcp-header\":\"Deep\"}");
+        for (0..c.levels) |_| try text.appendSlice(arena, "}}");
+        const found = try paramHeaders(arena, text.items);
+        try testing.expectEqual(c.found, found.len);
+    }
+}

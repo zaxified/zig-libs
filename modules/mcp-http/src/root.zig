@@ -3099,3 +3099,173 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── boundaries and state left behind (whole-module mutation audit) ─────────
+
+test "405 names the methods the endpoint takes, and a full session table is 429" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var plain = Transport{ .gpa = gpa, .server = &server };
+    var r1 = router.Router.init(gpa);
+    defer r1.deinit();
+    try r1.use(plain.middleware());
+    var buf: [2048]u8 = undefined;
+    const put = runWire(&r1, "PUT /mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, put, "HTTP/1.1 405"));
+    try testing.expectEqualStrings("POST", headerValue(put, "allow").?);
+
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    sessions.max_sessions = 1;
+    var with = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+    var r2 = router.Router.init(gpa);
+    defer r2.deinit();
+    try r2.use(with.middleware());
+    var buf2: [2048]u8 = undefined;
+    const put2 = runWire(&r2, "PUT /mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf2);
+    try testing.expectEqualStrings("POST, GET, DELETE", headerValue(put2, "allow").?);
+
+    var rbuf: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    const first = runWire(&r2, postWithSession(&rbuf, "", init_body), &out);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200"));
+    var out2: [4096]u8 = undefined;
+    const second = runWire(&r2, postWithSession(&rbuf, "", init_body), &out2);
+    try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 429"));
+}
+
+test "GET: an empty queue is a heartbeat that keeps the session; a closed one ends after it" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var rbuf: [1024]u8 = undefined;
+    var out: [8192]u8 = undefined;
+    const created = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+    const sid_h = headerValue(created, "Mcp-Session-Id").?;
+    var sidbuf: [64]u8 = undefined;
+    @memcpy(sidbuf[0..sid_h.len], sid_h);
+    const sid = sidbuf[0..sid_h.len];
+
+    for (0..2) |_| {
+        var o: [8192]u8 = undefined;
+        const beat = runWire(&r, getWithSession(&rbuf, sid, null), &o);
+        try testing.expect(std.mem.startsWith(u8, beat, "HTTP/1.1 200"));
+        try testing.expect(std.mem.find(u8, beat, "keep-alive") != null);
+    }
+    try testing.expect(sessions.map.contains(sid));
+    sessions.close(sid);
+    var o3: [8192]u8 = undefined;
+    const last = runWire(&r, getWithSession(&rbuf, sid, null), &o3);
+    try testing.expect(std.mem.startsWith(u8, last, "HTTP/1.1 200"));
+    var o4: [8192]u8 = undefined;
+    const gone = runWire(&r, getWithSession(&rbuf, sid, null), &o4);
+    try testing.expect(std.mem.startsWith(u8, gone, "HTTP/1.1 404"));
+}
+
+test "eviction takes the session idle the longest, and naming a session refreshes it" {
+    const gpa = testing.allocator;
+    var s = Sessions.init(gpa);
+    defer s.deinit();
+    s.max_sessions = 30;
+    var ids: [30][32]u8 = undefined;
+    var tags: [30]u64 = undefined;
+    for (&ids, &tags) |*id, *tag| {
+        const c = try s.create();
+        try testing.expectEqual(@as(usize, 32), c.id.len);
+        @memcpy(id, c.id);
+        tag.* = c.tag;
+    }
+    // the very oldest is named again, so the next one in line is the oldest now
+    try testing.expectEqual(@as(?u64, tags[0]), s.tagOf(&ids[0]));
+    s.max_idle_ns = 0;
+    const fresh = try s.create();
+    try testing.expectEqual(@as(?u64, tags[1]), fresh.evicted);
+    try testing.expect(s.map.contains(&ids[0]));
+    try testing.expect(!s.map.contains(&ids[1]));
+    try testing.expectEqual(@as(usize, 30), s.map.count());
+}
+
+test "an evicted session takes its server-side handshake state with it" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.max_peers = 2;
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    sessions.max_sessions = 1;
+    sessions.max_idle_ns = 0;
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var rbuf: [1024]u8 = undefined;
+    for (0..3) |_| {
+        var out: [4096]u8 = undefined;
+        const res = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+        try testing.expect(std.mem.startsWith(u8, res, "HTTP/1.1 200"));
+        try testing.expect(std.mem.find(u8, res, "\"error\"") == null);
+        try testing.expectEqual(@as(usize, 1), server.peers.items.len);
+    }
+}
+
+test "correlatableResponse: the last id wins, as the parser reads it" {
+    const gpa = testing.allocator;
+    try testing.expect(correlatableResponse(gpa, "{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"id\":7,\"result\":{}}"));
+}
+
+test "2026-07-28: a notification is 202 with no body, whichever Accept it sends" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    const body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1," ++ modern_meta ++ "}}";
+    const hdr = "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: notifications/cancelled\r\n";
+    var buf: [4096]u8 = undefined;
+    const sse = runWire(&r, postHeaders("Accept: application/json, text/event-stream\r\n" ++ hdr, body), &buf);
+    try testing.expect(std.mem.startsWith(u8, sse, "HTTP/1.1 202"));
+    try testing.expectEqualStrings("", bodyOf(sse));
+    var buf2: [4096]u8 = undefined;
+    const json = runWire(&r, postHeaders("Accept: application/json\r\n" ++ hdr, body), &buf2);
+    try testing.expect(std.mem.startsWith(u8, json, "HTTP/1.1 202"));
+    try testing.expectEqualStrings("", bodyOf(json));
+}
+
+const q_filler: [6000]u8 = @splat('Q');
+
+test "SSE: a response larger than the stream buffer arrives once, byte for byte" {
+    const gpa = testing.allocator;
+    var server = try buildOracleServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var buf: [16384]u8 = undefined;
+    const got = runWire(&r, postHeaders("Accept: text/event-stream\r\n", "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ &q_filler ++ "\"}}}"), &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    // the tool result carries the text twice (`content` and `structuredContent`)
+    try testing.expectEqual(@as(usize, 12000), std.mem.count(u8, got, "Q"));
+}
+
+test "a POST whose body ends before its Content-Length is a 400" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, "POST /mcp HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 50\r\nConnection: close\r\n\r\n{\"a\"", &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
+}

@@ -6,7 +6,7 @@
 
 **Scope:** core — official MCP SDKs (python-sdk v2.2.0) and the Streamable HTTP transport of spec 2026-07-28 (surveyed 2026-09-30; raised from mvp 2026-09-30 when the 2026-07-28 transport was served)
 
-**Audit:** review 2026-09-02 · mutation ? · src ?
+**Audit:** review 2026-09-02 · mutation 2026-11-20 (169/181, 2 eq) · src d1440d13367f5fef
 
 **Hardening:** fuzz 2026-10-10 (MCP_HTTP_FUZZ: `mcp-http-pre-parse` 200,000-run budget clean after the `Scanner.skipValue` fix ("Hostile bodies" below); `mcp-http-wire` at `.scale` 2 = 100,000 runs — raw HTTP requests against two live sessions: forged session id → 404, foreign Origin → 403, DELETE takes only its own session, damaged requests answered or dropped) · ct 2026-10-10 (ctgrind: Mcp-Session-Id bytes through the id encoding; 0 in-file after replacing std.fmt `{x}`)
 **Performance:** not measured
@@ -198,6 +198,20 @@ Run: `scripts/modtest mcp-http`; the example (`example/main.zig`) is built by
   with a fixed number of seeds in every test run and must reach every outcome.
 - **ctgrind:** `src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh mcp-http`, target `sid`
   (the id bytes through `sidhex.encode`); the row is in `scripts/checks/ctgrind-expected.tsv`.
+- **Mutation:** the whole production code (`root.zig`, `modern.zig`), by mutant schemata: every condition
+  clause negated, every ordering comparison at its boundary, every state and counter assignment dropped, the
+  `max_body` limit moved by one, every status code changed. 181 mutants, 169 killed, 2 equivalent (ties in
+  the idle-time ordering, whose order is unspecified; `Sessions.touch`, a function nothing calls), 10 open,
+  each unobservable through the transport's own interfaces: the spin lock's exclusion (needs a race
+  detector), the `getrandom` failure and `EINTR` branches (need syscall injection), equality of the idle
+  time (needs an injectable clock), the cancelled-write branch of the stateless stream, the held-response
+  and trailing-line branches of the SSE adapter and its multi-slice drain (`mcp` writes single,
+  newline-terminated lines and its response is the last line), and the session id taken from an
+  `initialize` (no handler issues a server-to-client request while answering it). The first pass left 25
+  survivors; they became tests: the 405 `Allow` header per mode, the 429 on a full table, the heartbeat
+  and `close()` sequence, eviction order and its peer cleanup, duplicate `id` keys in a response, the 202
+  of a stateless notification under either `Accept`, a response larger than the stream buffer, a short
+  body, and the annotation-chain depth ceiling.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
   whole-module mutation run and the delta runs after it.
 
