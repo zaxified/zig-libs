@@ -5,10 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** the ctgrind `secret` row re-pinned to the new source digest after the Huffman layout landed (counts unchanged, 8 contexts; the row measures `tweakSecretKey`, the layout code handles public data only).
 - **2026-11-19** — added `WeightedLeaf`, `huffmanLeaves` and `buildFromWeights`: Huffman tree layout from `(weight, script)` pairs, behaving as rust-bitcoin's `TaprootBuilder::with_huffman_tree` (two lowest weights joined, `u32` saturating sum, ties by larger node hash, empty input `EmptyTree`, depth > 128 `TreeTooDeep`). Additive; no behaviour change to existing functions.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC backlog brought up to date (1 item marked done/obsolete).
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** the KAT test and the example call `bip340.sign(…, .{})` for bip340's new trailing `SignOptions` argument.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private CompactSize encoder in `tree.zig` is replaced by `bitcointx.encodeCompactSize`; `bitcointx` is now a dependency (it only depends on `bip340`, no cycle).
 - **2026-10-10** — tests: deterministic fuzz driver `TAPROOT_FUZZ` (testkit) over random complete script trees (every control-block path recomputes the Merkle root, a changed script does not, output key equals the tweak of the root) and tweakSecretKey/tweakPublicKey agreement. No change to the library code.
 - **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe (`src/stackprobe_test.zig`) moved to the direct-region
@@ -37,7 +34,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-09-30** — **New:** BIP341 script-tree construction (`src/tree.zig`, maturity task B6): `tapLeafHash`, `tapBranchHash`, `buildFromTree` (explicit `Node` shape) and `buildFromLeaves` (BIP371 depth list) returning a `SpendInfo` with the Merkle root, tweaked output key + parity and, per leaf, the Merkle path and `controlBlock` (`(version | parity) ‖ internal_x ‖ path`). Malformed depths, odd/`0x50` leaf versions and depth > 128 are typed errors. Byte-exact against all 12 `scriptPathControlBlocks` of BIP341's wallet vectors (recipe: `tools/gen_tree_vectors.py`); cross-checked against `bitcoinscript`'s consensus verifier (`taproot` is now a test-only dependency of `bitcoinscript`; its production code is unchanged). Scope `mvp` → `core`. Additive, no existing API changed.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **secret 10**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ **This module has ZERO branches of its own on a secret.** `d.add(t).toBytes()` — the line `SPEC.md:85-93`'s constant-time claim is actually about — contributed nothing, and `tweakPublicKey` is public-data-only by its own doc comment. All ten contexts belong to the delegated `bip340.KeyPair.fromSecretKey` and `k256`. One of them (`bip340/root.zig:165`) is the disputed even-Y `if`/`else`; the experimental control that makes it disputable was taken here — a second secret whose point has even Y drops the count 12→11. See `bip340`'s entry and `CTGRIND-OPEN-QUESTIONS.md`.
 
 - **2026-07-18** — Security audit: no findings. Byte-exact against BIP341's published
   test vectors.

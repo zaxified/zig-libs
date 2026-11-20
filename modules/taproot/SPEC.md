@@ -28,20 +28,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [rust-bitcoin/rust-bitcoin (`taproot` module, `taproot_primitives`)](https://github.com/rust-bitcoin/rust-bitcoin) — **reference** | Rust | CC0-1.0 | 2.7k | units-0.2.0 (tag; push 2026-09-30) | `TaprootBuilder` (add leaves at depths, finalize), `TaprootSpendInfo` (merkle root, control block per leaf), `TapLeafHash`/`TapNodeHash`, control-block parse/verify. What a user of a taproot library builds outputs with *(inferred; repo layout seen, module contents not read)*. |
 | [bitcoin-core/secp256k1](https://github.com/bitcoin-core/secp256k1) | C | MIT | 2.5k | v0.8.0 (2026-08-03) | `xonly_pubkey_tweak_add`, `xonly_pubkey_tweak_add_check`, `keypair_xonly_tweak_add` — the exact scope of this module's two functions; no script-tree code at all. On that yardstick this module is complete. |
 | [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) | C++ | MIT | 90.3k | v31.1 (2026-07-08) | `TaprootBuilder`/`TaprootSpendData`/`XOnlyPubKey::CreateTapTweak` in `script/script.h`/`pubkey.h`; the `bip-0341/wallet-test-vectors.json` scriptPubKey generation is what this module's vectors reproduce for the key-path half. |
-| [btcsuite/btcd (`txscript/taproot.go`)](https://github.com/btcsuite/btcd/tree/master/txscript) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | `ComputeTaprootOutputKey`, `TapLeaf`, `AssembleTaprootScriptTree`, `ControlBlock` with inclusion proofs — the script-tree half this module lacks (file `taproot.go` present; contents *(inferred)*). |
+| [btcsuite/btcd (`txscript/taproot.go`)](https://github.com/btcsuite/btcd/tree/master/txscript) | Go | ISC | 6.7k | v0.26.2 (2026-07-24) | `ComputeTaprootOutputKey`, `TapLeaf`, `AssembleTaprootScriptTree`, `ControlBlock` with inclusion proofs — the script-tree half, which this module has too (`src/tree.zig`); file `taproot.go` present, contents *(inferred)*. |
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | `payments.p2tr` builds outputs from a script tree and computes control blocks *(inferred)*. |
 
-**Where we are ahead:** key-path tweaking with the `null` (no tree) vs zero-root distinction made explicit, pubkey and secret tweak byte-exact against all 7 BIP341 wallet vectors; the script-tree builder is byte-exact against all 12 published control blocks and is cross-checked against the consensus verifier in `bitcoinscript`. **Where we are behind** (2026-09-30, after the builder landed): (the Huffman-weighted layout landed 2026-11-19), no control-block *parse*/verify helper here (the verifier is `bitcoinscript.tapscript.verifyCommitment`; `taproot` deliberately does not depend on it), no BIP371 `PSBT_OUT_TAP_TREE` (de)serialization of the byte format (the depth-list *shape* is accepted), no address encoding (bech32m is `bech32`'s), no MuSig2 internal-key aggregation.
+**Where we are ahead:** key-path tweaking with the `null` (no tree) vs zero-root distinction made explicit, pubkey and secret tweak byte-exact against all 7 BIP341 wallet vectors; the script-tree builder is byte-exact against all 12 published control blocks and is cross-checked against the consensus verifier in `bitcoinscript`. **Where we are behind:** no control-block *parse*/verify helper here (the verifier is `bitcoinscript.tapscript.verifyCommitment`; `taproot` deliberately does not depend on it, see *What is deliberately not done*), no BIP371 `PSBT_OUT_TAP_TREE` (de)serialization of the byte format (the depth-list *shape* is accepted), no address encoding (bech32m is `bech32`'s), no MuSig2 internal-key aggregation. The open ones are in *Backlog / deferred*.
 
 ## Design
 
 - **Source of truth**: BIP341 ("Taproot: SegWit version 1 spending rules",
-  `bitcoin/bips`), §"Constructing and Spending Taproot Outputs" (the
-  key-path tweak). This module does not implement script-path spending, the
-  Merkle-tree construction itself, or the sighash algorithm (BIP341's other
-  sections) — only the tweak that turns an internal key into an output
-  key/scalar, taking the script tree's Merkle root (if any) as an opaque
-  32-byte input the caller already computed.
+  `bitcoin/bips`), §"Constructing and Spending Taproot Outputs": the
+  key-path tweak (`src/root.zig`) and the script-tree construction
+  (`src/tree.zig`, below). The tweak functions take the script tree's Merkle
+  root (if any) as an opaque 32-byte input, so a caller that built the tree
+  elsewhere can use them alone. Script-path spending and the sighash
+  algorithm (BIP341's other sections) are not implemented.
 - **Reuse of `bip340`**: the curve group (`std.crypto.ecc.Secp256k1`),
   `XOnlyPublicKey`/`lift_x`, `SecretKey`, and the tagged-hash machinery
   (`bip340.hash.taggedHash`/`taggedHasher`) are all the sibling `bip340`
@@ -96,7 +96,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   (`33 + 32·depth` bytes). Ownership: the `SpendInfo` owns its leaf array and
   path storage (`deinit(allocator)`); leaf `script` slices BORROW the
   caller's input. `leaves` keeps the input's depth-first order.
-- **Huffman layout (2026-11-19).** `huffmanLeaves(allocator, []WeightedLeaf)`
+- **Huffman layout.** `huffmanLeaves(allocator, []WeightedLeaf)`
   returns a depth-first `DepthLeaf` list; `buildFromWeights` feeds it to
   `buildFromLeaves`. Reference: rust-bitcoin `TaprootBuilder::with_huffman_tree`
   (checked against its master source): repeatedly take the two lowest-weight
@@ -114,20 +114,16 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   nothing to compare there. KATs: roots and orders computed by an independent
   sort-based re-implementation; rust-bitcoin's own test publishes only the
   depths, which are pinned too.
-- **Delta mutation (2026-11-19, Huffman code only).** 29 mutants: 25 killed, 4 equivalent (equal-hash tie order of two identical entries; `pop`'s `len == 0` shortcut; the two off-by-one child-bound mutants, where the stale slot read is the sifted element itself). The card counts are cumulative (21/29 + 25/29, eq 8 + 4).
-- **Not done:** building a tree that
-  hides the internal key (NUMS point) — the caller picks the internal key.
 
 ## Threat model / limits
 
-- **Secret residue on the dead stack** (review 2026-10-08, `src/stackprobe_test.zig`,
-  ReleaseFast). `tweakSecretKey` used to take the key by value and return `q` by value; after
-  it returned, dead frames held the internal key ×2, the normalised `d` ×2 and `q` ×3 per call
-  (`kp`/`d` were wiped by name — the copies were the compiler's and the caller's). Now the key
-  comes in by pointer, `q` goes out through `out`, and the body runs one frame down followed by
-  a 16 KiB zeroing at that depth (volatile vector stores). Probe: 0 in fifteen representations
-  (key, `d`, `n−d`, `q`, `n−q`; BE, LE, `Scalar` image) over 5 calls, both even-y arms,
-  negative control 0, positive control 1. What it does not cover: the caller's own copy of `q`.
+- **Secret residue on the dead stack.** `tweakSecretKey` takes the key by pointer and writes `q` through `out`
+  (a returned `[32]u8` would land in a temporary of the caller's frame, out of reach of any wipe here); its body runs
+  one frame down (`tweakSecretKeyBody`, `noinline`), followed by a `stack_burn` (16 KiB) zeroing at that depth with
+  volatile 16-byte vector stores (`burnStack`, `src/root.zig`). On error `out` is left untouched.
+  `src/stackprobe_test.zig` (ReleaseFast) looks for the key, the normalised `d`, `n−d`, `q` and `n−q` in big-endian,
+  little-endian and `Scalar` image over repeated calls on both even-y arms, with negative and positive controls. What
+  it does not cover: the caller's own copy of `q`.
 - **A wrong tweak is a fund-loss bug, not a correctness nitpick.** Two
   failure directions, both severe:
   - **Too permissive** (e.g. skipping the `t ≥ n` rejection, or getting the
@@ -177,95 +173,75 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   and makes no constant-time claim (mirroring `bip340.verify`'s documented
   exemption).
 
-## Crypto cores — done-record (was: TODO(fable))
-
-Both cores are implemented in `root.zig` (crypto pass 2026-07-12); the
-former `@panic` stubs and the `error.SkipZigTest` KAT guards are gone.
+## The two tweaks (`src/root.zig`)
 
 1. **`tweakPublicKey`** — BIP341's `taproot_output_key`:
    `t = int(tapTweakHash(internal.toBytes(), merkle_root))`; reject
    `t ≥ n` via `Scalar.fromBytes`'s canonical check (reject, never
    reduce); `P = internal.lift()`; `Q = P + t*G` (one
-   `basePoint.mul` + one complete point add; a zero `t` — where `mul`
+   `Secp256k1.combMulBase` + one complete point add; a zero `t` — where it
    refuses to produce the identity — degrades explicitly to `Q = P`, and
    an identity `Q` is rejected defensively since it has no affine
    coordinates); output = x-only(Q), parity = `Q.y.isOdd()`; returns the
-   raw 32-byte tweak-hash bytes alongside. KAT: all 7 official vectors'
-   `tweakedPubkey` byte-exact + the control-block-recovered parity
-   (rows 1-6) + the returned `tweak` field.
+   raw 32-byte tweak-hash bytes alongside.
 2. **`tweakSecretKey`** — the matching secret-key tweak: even-y
    normalization delegated to `bip340.KeyPair.fromSecretKey` itself
    (`kp.secret` = the normalized `d`, `kp.public.x` = `bytes(x(d*G))`),
    so the tweak lands on exactly the scalar BIP340 signing uses — the
    half-the-keys-wrong raw-`d0` pitfall is structurally impossible; `t`
    hashed over that same even-y `internal_x`, rejected if `≥ n`;
-   `q = (d + t) mod n` via constant-time scalar add. KAT: all 7 vectors'
-   published `tweakedPrivkey` byte-exact, PLUS an operational
-   sign→verify round-trip per vector (`bip340.sign` under `q` verifies
-   against `Q`'s x-only encoding, and `q`'s own derived x-only public key
-   equals `x(Q)`).
+   `q = (d + t) mod n` via constant-time scalar add.
 
 Design references: none beyond the BIP341 specification text itself,
 `std.crypto.ecc.Secp256k1`, and the sibling `bip340` module (see `NOTICE`).
 
+## What is deliberately not done
+
+- **Script-path spending and the sighash algorithm** (BIP341's other sections): this module builds outputs and control
+  blocks; spending is the consumer's.
+- **Verifying a control block here.** `bitcoinscript` owns the consensus verifier (`tapleafHash`, `verifyCommitment`) and
+  depends on `taproot` in tests only, to cross-check the two implementations; `taproot` does not depend on
+  `bitcoinscript`, so a verifier here would duplicate consensus code or invert the dependency.
+
 ## Verification
 
-- KAT oracle: the official BIP341 "wallet test vectors",
-  `bip-0341/wallet-test-vectors.json` from `bitcoin/bips` (see `NOTICE` for
-  the fetch source), re-paired by `internalPubkey` into 7 rows in
-  `src/kat_vectors.zig` — 1 key-path-only (`merkle_root = null`) and 6 with
-  a real script-tree Merkle root; parity recovered independently from each
-  row's `scriptPathControlBlocks[0]` leading byte.
-- Exercised (`src/kat_test.zig`): `tapTweakHash` reproduces the published
-  `tweak` field for all 7 rows, plus a dedicated test proving the
-  `null`-vs-all-zero-root distinction; `tweakPublicKey` reproduces all 7
-  rows' `tweakedPubkey` + parity + tweak; `tweakSecretKey` reproduces all
-  7 rows' `tweakedPrivkey`; a sign→verify round-trip proves the two cores
-  mutually consistent and usable through `bip340` on every row;
-  `TweakedPublicKey.toBytes`/`asXOnly` round-trip on a real on-curve value.
-- Both `zig build test-taproot` (Debug) and `-Doptimize=ReleaseFast` pass
-  — zero skips, no test failures — and `zig fmt --check
-  modules/taproot/` is clean.
-
-### Script-tree verification
-
-- Anchor: the same BIP341 `wallet-test-vectors.json`, the 6 `scriptPubKey`
-  rows that have a `scriptTree` (`src/tree_vectors.zig`, generated by
-  `tools/gen_tree_vectors.py`, which is the recipe — rerun it against a
-  fresh download). `src/tree_test.zig` asserts leaf hashes, Merkle root,
-  tweak, output key, scriptPubKey and all 12 `scriptPathControlBlocks`
-  byte-exact, from both entry points, plus: single leaf, empty tree,
-  malformed depth lists, bad leaf versions, the 128/129 depth boundary,
-  multi-byte CompactSize, allocation-failure injection, and a `testing.fuzz` harness over depth lists (success implies a complete tree, path length = depth, Kraft sum = 1).
-- Cross-check (`bitcoinscript/src/taproot_builder_xcheck_test.zig`): for the
-  vector trees and 24 deterministic random trees (depth ≤ 8, mixed versions,
-  scripts around the 0xfd CompactSize boundary), `tapleafHash` agrees and
-  `verifyCommitment` accepts every control block and rejects a flipped
-  parity bit, a flipped byte in any path node or in the internal key, and a
-  different script.
-
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build, `setsid -w timeout -s KILL 20` per
-mutant): **29 mutants, 21 killed, 8 equivalent or unobservable**. Points: `TapTweak`'s inputs
-and their order, `t < n` on both tweak paths, the identity check, the output parity and reported
-tweak, `tweakSecretKey`'s even-y normalisation and both wipes, `TapLeaf`'s version byte, both
-CompactSize edges and the u16 byte order, `TapBranch` ordering, `validLeafVersion`, the control
-block's parity bit and internal key, the depth limit in both builders, the depth-0 and
-root-depth rules, the merge condition, Merkle path assembly, and `finish`'s root.
-
-First pass: 10 survivors. **No defect in the code; 2 were test gaps** — moving either
-CompactSize boundary by one (`< 0xfd` → `<=`, `<= 0xffff` → `<`) stayed green because the only
-long-script test uses 300 bytes. Closed by one test pinning 252, 253, 65535 and 65536 bytes
-against hand-built CompactSize prefixes (`tree_test.zig`).
-
-Equivalent or unobservable (8): `t < n` on both paths and the tweaked-key identity check
-(`t ≥ n` has probability ~2^-128 and `t·G = −P` needs a discrete log); the depth-0 rule and the
-depth-0 merge (the final `top == 1 and depth == 0` check refuses the same lists, and a second
-depth-0 entry is never pushed); `flatten`'s limit off by one (`buildFromLeaves` refuses depth 129
-itself — `flatten`'s check only bounds the recursion); and the two wipes in `tweakSecretKey`
-(`kp.deinit()` and the `d` scalar are stack copies, not observable in-process — the test named
-after `kp.deinit` pins bip340's `deinit`, not this `defer`; see Backlog).
+- **Run:** `scripts/modtest taproot`; `zig build test-taproot` (also `-Doptimize=ReleaseFast`), no skipped tests.
+- **KAT oracle:** the official BIP341 `bip-0341/wallet-test-vectors.json` from `bitcoin/bips` (fetch source in `NOTICE`),
+  re-paired by `internalPubkey` into the rows of `src/kat_vectors.zig`: one key-path-only (`merkle_root = null`), the
+  rest with a script-tree Merkle root; parity recovered independently from each row's `scriptPathControlBlocks[0]`
+  leading byte. `src/kat_test.zig`: `tapTweakHash` reproduces the published `tweak`, a dedicated test pins `null` and
+  an explicit all-zero root to different values, `tweakPublicKey` reproduces `tweakedPubkey` + parity + tweak,
+  `tweakSecretKey` reproduces `tweakedPrivkey`, a `bip340.sign` → `verify` round-trip under the tweaked key holds on
+  every row, and `TweakedPublicKey.toBytes`/`asXOnly` round-trip.
+- **Script trees:** the same vectors, the rows that have a `scriptTree` (`src/tree_vectors.zig`, produced by
+  `tools/gen_tree_vectors.py`, which is the recipe: rerun it against a fresh download). `src/tree_test.zig` asserts leaf
+  hashes, Merkle root, tweak, output key, scriptPubKey and every `scriptPathControlBlocks` entry byte-exact from both
+  entry points, plus a single leaf, the empty tree, malformed depth lists, bad leaf versions, the 128/129 depth
+  boundary, the CompactSize prefix edges of the leaf hash (252, 253, 65535, 65536 bytes), allocation-failure
+  injection, a `testing.fuzz` harness over depth lists (success implies a complete tree with matching paths), and the Huffman layout (roots and orders from an independent sort-based re-implementation; rust-bitcoin's
+  own test publishes only the depths, which are pinned too).
+- **Cross-check:** `bitcoinscript/src/taproot_builder_xcheck_test.zig`: for the vector trees and deterministic random
+  trees (mixed leaf versions, scripts around the 0xfd CompactSize boundary), `tapleafHash` agrees and
+  `verifyCommitment` accepts every control block and rejects a flipped parity bit, a flipped byte in any path node or
+  in the internal key, and a different script.
+- **Fuzz:** `TAPROOT_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver, `src/fuzz_test.zig`), harnesses
+  `taproot-tree` (random complete script trees: every control-block path recomputes the Merkle root, a changed script
+  does not, the output key is the tweak of the root; depth lists, success implies a complete tree, path length =
+  depth, Kraft sum = 1) and `taproot-tweak` (`tweakSecretKey` and `tweakPublicKey` agree); reach checks run in every
+  test run.
+- **Dead stack:** `src/stackprobe_test.zig` (see Threat model).
+- **Constant time:** the ctgrind `secret` row measures `tweakSecretKey` (`src/ctgrind_harness.zig`, ReleaseFast under
+  valgrind, with untainted-control and no-`-fvalgrind` trap rows); this module has no secret-dependent branch of its own,
+  everything the row flags is in the delegated `bip340.KeyPair.fromSecretKey` and `k256`.
+- **Mutation coverage:** `TapTweak`'s inputs and their order, `t < n` on both tweak paths, the identity check, the
+  output parity and reported tweak, `tweakSecretKey`'s even-y normalisation and wipes, `TapLeaf`'s version byte,
+  CompactSize edges, `TapBranch` ordering, `validLeafVersion`, the control block's parity bit and internal key, the
+  depth limit in both builders, the depth-0 and root-depth rules, the merge condition, Merkle path assembly,
+  `finish`'s root, and the Huffman heap, tie-break and layout. The survivors that stay are argued equivalent or
+  unobservable: `t ≥ n` (probability ~2^-128) and `t·G = −P` (needs a discrete log), rules a later check refuses
+  anyway, and the two wipes inside `tweakSecretKey`'s body (stack copies, covered by the stack probe instead).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
 
 ## Anchoring
 
@@ -278,12 +254,6 @@ after `kp.deinit` pins bip340's `deinit`, not this `defer`; see Backlog).
 
 ## Backlog / deferred
 
-- ✅ DONE 2026-10-08 (`f31cc18f8`: `tweakSecretKey` off the dead stack, measured by `src/stackprobe_test.zig`). **Dead-stack residue of `tweakSecretKey`** (mutation run 2026-10-05): removing its
-  `kp.deinit()` or the `d` wipe changes nothing any test can see. `bip340` and `k256` measure
-  this with a stackprobe (ReleaseFast) and burn the signing region; this module has neither, so
-  whether the internal scalar survives the call is unmeasured. Effort S (copy `bip340`'s probe).
-- ~~Script-tree builder~~ — done 2026-09-30 (`src/tree.zig`).
-- ✅ DONE 2026-11-19 (`huffmanLeaves`/`buildFromWeights`, SPEC § Script trees). **Huffman tree construction from `(weight, leaf)` pairs** (BIP341's suggested layout).
 - **Control-block parse / `verifyCommitment` here** — today only `bitcoinscript` verifies; a wallet that only builds does not need it. Would duplicate consensus code or invert the dependency; decide with a consumer.
 - **BIP371 `PSBT_OUT_TAP_TREE` byte (de)serialization** — the depth-list shape is accepted; the wire encoding belongs with `psbt`.
-- **NUMS internal key helper** (BIP341's unspendable-key-path recommendation) — small; add when a consumer asks.
+- **NUMS internal key helper** (BIP341's unspendable-key-path recommendation) — small; the caller picks the internal key today; add when a consumer asks.
