@@ -150,7 +150,7 @@ fn optStrField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 /// `MalformedResponse`. These used to be `@intCast`/`@intFromFloat` on the
 /// raw value, which is a panic in Debug/ReleaseSafe and a silently wrong
 /// number in ReleaseFast — on `index` (what a caller indexes its content
-/// blocks by) and on `usage` (what it bills by). Measured 2026-09-06 with
+/// blocks by) and on `usage` (what it bills by). Measured with
 /// `"index":4294967296` and `"input_tokens":1e300`: exit 134 in both safe
 /// modes, `index=0` / `input_tokens=9223372036854775808` in ReleaseFast.
 fn u64Field(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
@@ -746,7 +746,7 @@ test "parseStreamEvent: an unrecognized delta type is MalformedResponse, not an 
     );
 }
 
-// Review 2026-10-06 (PR #5): `DocumentBlock.citations` let a request turn
+// Review (PR #5): `DocumentBlock.citations` let a request turn
 // citations on, but the parser knew neither form the answer comes back in —
 // a streamed `citations_delta` was `MalformedResponse` (the stream died at the
 // first citation) and a non-streaming text block's `citations` array was
@@ -1019,7 +1019,7 @@ test "fuzz parseTokenCount never panics" {
     try testing.fuzz({}, fuzzParseTokenCountSmith, .{ .corpus = &token_corpus });
 }
 
-// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+// ── whole-module mutation audit: tests for the mutants that survived ──
 
 test "parseMessage: every field of a full message, including thinking, stop_sequence and cache usage" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

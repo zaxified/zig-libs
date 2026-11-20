@@ -900,7 +900,7 @@ test "CountTokensRequest: carries system, tool_choice, thinking through; never m
     );
 }
 
-// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+// ── whole-module mutation audit: tests for the mutants that survived ──
 
 fn jsonHas(req: MessageRequest, needle: []const u8) !void {
     const json = try stringifyAlloc(testing.allocator, req);

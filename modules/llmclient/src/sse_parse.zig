@@ -39,8 +39,7 @@ pub const Error = error{
     /// One dispatch group's joined `data:` payload exceeded
     /// `Parser.max_data_bytes` — the only bound the accumulator has on the
     /// memory a peer can make it hold (each `data:` line is bounded by the
-    /// reader, the number of lines in a group was not: measured
-    /// 2026-09-06, 10.0 MB of legal 4 KiB lines in one group → 2.40 GB
+    /// reader, the number of lines in a group was not: measured, 10.0 MB of legal 4 KiB lines in one group → 2.40 GB
     /// live, and the buffer kept its capacity after the error).
     DataTooLarge,
     OutOfMemory,
@@ -554,7 +553,7 @@ fn fuzzSseStream(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -564,7 +563,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+// ── whole-module mutation audit: tests for the mutants that survived ──
 
 test "Parser: a BOM only counts on the very first line, a second id: replaces the first, an overflowing retry is null" {
     const wire = "data: a\n\xEF\xBB\xBFdata: b\nid: 1\nid: 2\nretry: 99999999999\n\n";

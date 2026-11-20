@@ -45,7 +45,7 @@ max_response_bytes: usize = 10 << 20,
 /// (`EventIterator.next`) may allocate while being parsed into
 /// `Message`/`StreamEvent` — the quantity that actually costs. A body of
 /// 7.8 MB, under the 10 MiB wire cap, parsed into 310 MiB of `std.json`
-/// nodes and returned `OK` before this existed (2026-09-06); past this
+/// nodes and returned `OK` before this existed; past this
 /// bound the call is `error.ResponseTooLarge` and the arena is released.
 max_parsed_bytes: usize = 64 << 20,
 /// Upper bound on one SSE dispatch group's joined `data:` payload
@@ -672,8 +672,7 @@ const CreateCancelPeer = struct {
 /// the head (or reply) is read #1 and the body read #2. With a sleep, a loaded
 /// machine could cancel an earlier step, which passes by the wrong route. It
 /// could also cancel before the connect: the peer then waits in `accept`
-/// forever, and so does `join`. That is the http full-gate hang of
-/// 2026-09-15, and the same shape as this module's peer.
+/// forever, and so does `join`. That is the http full-gate hang, and the same shape as this module's peer.
 const ReadCueIo = struct {
     vtable: std.Io.VTable,
     userdata: ?*anyopaque,
@@ -1262,7 +1261,7 @@ test "BoundedAllocator: refuses past the limit, credits frees back, and flags th
     try testing.expect(!b.exceeded);
 }
 
-// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+// ── whole-module mutation audit: tests for the mutants that survived ──
 
 test "lastErrorBody / noteError: null when empty, kept truncated to the scratch size" {
     var c: Client = .init(undefined, "k");
