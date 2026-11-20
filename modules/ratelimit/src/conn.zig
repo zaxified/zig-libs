@@ -724,7 +724,7 @@ test "ConnectionLimiter: concurrent accepts admit exactly the user's burst" {
     try testing.expectEqual(@as(usize, 0), cl.unlistedKeyCount());
 }
 
-// The shipped defaults are the owner's ruling of, not a suggestion:
+// The shipped defaults are the owner's ruling, not a suggestion:
 // max 4 new connections per second per user, with a burst of 8 so a browser
 // opening several tabs is not refused. Every other test here configures its
 // own rate, so without this one the *values* are unpinned — the mechanism
