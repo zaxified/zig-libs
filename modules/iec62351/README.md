@@ -35,7 +35,7 @@ module (certificate extensions). Three captured GOOSE frames used as test fixtur
 | platform | `.any` |
 | role | `.util` |
 | concurrency | `.reentrant` |
-| deps | `x509`, `rsa`, `p256` |
+| deps | `x509`, `rsa`, `p256`, `aesgcm` |
 
 ## Import
 
@@ -323,16 +323,19 @@ if (!guard.accept(.{
 ```
 
 (The `iec61850` call names above are illustrative — that module is a sibling,
-not a dependency, and this one never calls it. Audit finding N5: an earlier
-version of this example named `encodePdu`/`decodePdu`, neither of which
-exists — the real names are `Pdu.encode`/`Pdu.decode` — and passed `pdu.t`
-[a `UtcTime` struct] directly where `GooseIdentity.t_ns` wants a `u64` of
-nanoseconds, with no converter in either module to bridge them. Corrected
-2026-09-10.)
+not a dependency, and this one never calls it.)
 
 Order matters on receive: **authenticate first, then replay-check, then
 decode.** The replay counters are only meaningful once the frame is known to be
 authentic, and the decoder should never see unauthenticated bytes.
+
+## Not provided
+
+No AES-GCM confidentiality or R-GOOSE/R-SV session PDUs, no 62351-9 key
+management, no 62351-8 role-based access tokens, no TLS transport, no
+HMAC-SHA-3 profiles (use `RawSealer`/`RawVerifier`), no CRL/OCSP inside the
+62351-3 policy. See `SPEC.md` *What is deliberately not done* and *Backlog /
+deferred*.
 
 ## What this does not protect against
 
@@ -364,14 +367,13 @@ never been confirmed by a second implementation.
 
 **If you have access to a 62351-6 stack, run the frozen frame in
 `src/vectors_test.zig` through it and report what it says.** That is the single
-most valuable contribution this module can receive. See `SPEC.md` §"Settled:
-there is no public IEC 62351-6 interop oracle" for the closed routes; the
-survey does not need repeating.
+most valuable contribution this module can receive. See `SPEC.md` *What is deliberately not done*
+(interoperability) for the closed routes; the survey does not need repeating.
 
 ## Verify
 
 ```sh
-zig build test-iec62351                  # Debug
-zig build test-iec62351 --release=fast   # ReleaseFast
+scripts/modtest iec62351                          # Debug
+scripts/modtest iec62351 -Doptimize=ReleaseFast
 zig fmt --check modules/iec62351
 ```

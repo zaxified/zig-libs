@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Commercial stacks (e.g. MZ Automation add-ons, vendor IEDs) | — | proprietary | — | — | The only place -6/-9/RBAC are deployed; not inspectable *(inferred)*. |
 | Rust / Go / Zig | — | — | — | — | `gh search repos 62351` returns only toy repositories (an OpenSSL wrapper from 2016, a FreeRADIUS script from 2021); nothing in Rust, Go or Zig. |
 
-**Where we are ahead:** the only open implementation of IEC 62351-6 (GOOSE/SV authentication: HMAC-SHA-256-128, AES-GMAC, replay protection) and of a checkable 62351-3 profile, in any language found; pure Zig, MIT. **Where we are behind:** no actual TLS transport (out of scope by layering), no 62351-9 key management, no AES-GCM confidentiality or R-GOOSE session PDUs, no 62351-8 RBAC tokens *(inferred absent from the SPEC's Deferred list)*, and no interop against another 62351-6 stack (none exists publicly — see the SPEC's "Settled" note) (→ Backlog items).
+**Where we are ahead:** the only open implementation of IEC 62351-6 (GOOSE/SV authentication: HMAC-SHA-256-128, AES-GMAC, replay protection) and of a checkable 62351-3 profile, in any language found; pure Zig, MIT. **Where we are behind:** no actual TLS transport (out of scope by layering), no 62351-9 key management, no AES-GCM confidentiality or R-GOOSE session PDUs, no 62351-8 RBAC tokens, and no interop against another 62351-6 stack (none exists publicly, see *What is deliberately not done*) (→ *Backlog / deferred*).
 
 ## Design & invariants
 
@@ -125,12 +125,10 @@ error.
 
 `std.crypto.Certificate.der.Element.parse` reads its identifier octet without
 checking the index against the buffer length, and derives a content slice from
-the encoded length without validating it. **The fuzz test found this the first
-time it ran**: `inspectCertificate(&.{})` aborted the process inside std rather
-than returning an error. The guard that used to live here
-(`tlsprofile.structurallySafe`) has moved to the shared **`x509.safe`** helper,
-which three modules independently needed; `inspectCertificate` now parses the
-certificate through `x509.safe.safeCertificate`, which validates DER
+the encoded length without validating it: `inspectCertificate(&.{})` aborted the
+process inside std rather than returning an error (the fuzz target found it).
+`inspectCertificate` therefore parses the certificate through the shared
+**`x509.safe`** helper (`x509.safe.safeCertificate`), which validates DER
 well-formedness and hands std a validated, zero-padded copy so a hostile
 certificate is a typed `MalformedCertificate`, never a crash. See
 `modules/x509/src/safe.zig` and `modules/x509/SPEC.md`.
@@ -173,13 +171,13 @@ editions):
 - The authentication value's field order: version, TimeOfCurrentKey (4 octets),
   TimeToNextKey (2 octets), initialisation vector, Key ID (4 octets), MAC value
   (8–32 octets). ⚠ **This order is NOT inherited from 61850-90-5 and must not be
-  read as if it were** (checked 2026-08-08 against Wireshark 4.6.4's `rgoose`
+  read as if it were** (checked against Wireshark 4.6.4's `rgoose`
   dissector source, which is the closest independently-implemented relative):
   90-5's session PDU runs TimeOfCurrentKey, TimeToNextKey, **Key ID, then an
   explicit IV-length octet and the IV**, and carries a two-octet version in the
   outer session header rather than one octet inside the security block. So the
   bullet above shares only the `0x85` tag with 90-5; the order itself rests on
-  this module's own reading and is exactly what finding F4 says is unanchored.
+  this module's own reading and is unanchored (see *Verification*).
 - IEC TS 62351-6:2007 used SHA-256 + RSASSA-PSS (RFC 3447), and the 2020 IS
   replaced it with symmetric MACs because signatures cannot meet IEC 61850-5's
   3 ms transfer-time class.
@@ -192,6 +190,11 @@ editions):
 - TLS cipher-suite code points (IANA registry) and the IEC 62351-4:2018 cipher
   suite tables including `TLS_RSA_WITH_AES_128_CBC_SHA256` as
   mandatory-to-implement for the native mode.
+
+The module's own `NOTICE` covers only the vendored GOOSE capture frames; no code is
+ported and no third-party implementation was studied for algorithm or API shape.
+OpenSSL and `asn1crypto` run purely as black-box test oracles, which
+`CONVENTIONS.md` §5 exempts.
 
 **Modelled by this module** (parameterised or escapable in every case):
 
@@ -211,7 +214,7 @@ editions):
   octet`) rather than papered over.
 - The 2007 `Reserved 2` CRC is **not** computed or checked. It is an integrity
   check, not a security one, and inventing a polynomial would be worse than
-  omitting it. Deferred, listed below.
+  omitting it (see *What is deliberately not done*).
 - HMAC-SHA-3 variants are **not** implemented. They are discussed around the
   IEC 62351 series but do not appear in the -6 algorithm table this module was
   built from, and inventing registry numbers for them would be worse than not
@@ -294,15 +297,14 @@ comparison isolated in one function.
   enforce and is easy to enforce correctly — but it is a policy, not a
   cryptographic guarantee.
 - **A publisher that repeats a GMAC IV across a restart.** This is the module's
-  sharpest edge and it is stated here because the rest of this list used to look
-  exhaustive without it. GMAC is GCM with an empty plaintext, so a repeated
+  sharpest edge. GMAC is GCM with an empty plaintext, so a repeated
   (key, IV) pair is not a degradation: two tags under one pair give a polynomial
   in the GHASH subkey `H`, and an attacker who solves it forges a valid tag for
   **any** frame — everything this module provides, gone. Under IEC 62351-9 the
   key is a *group* key held by every IED on the segment, so an IV scheme that is
   not explicitly partitioned per publisher repeats by default rather than by
   accident.
-  What the module now does: `build` will not accept a bare IV at all. It takes an
+  What the module does: `build` will not accept a bare IV at all. It takes an
   `IvSource`, either `IvCounter` — NIST SP 800-38D §8.2.1's deterministic
   construction, `fixed` (per-publisher, 32 bits) ‖ `invocation` (a counter that
   refuses at §8.3's 2^32-per-key cap rather than wrapping) — or the explicitly
@@ -356,7 +358,7 @@ comparison isolated in one function.
   TLS session, so a token captured on one connection is usable on another
   within the freshness window by an attacker who can intercept it. Channel
   binding would need an exporter value from the TLS layer this module does not
-  own. Deferred, listed below.
+  own (see *Backlog / deferred*).
 
 ### IEC 62351-3 specifics
 
@@ -368,13 +370,12 @@ assumed. Path validation is `x509.verifyChain`; revocation is `ocsp`/`ocspcache`
 
 ## Verification
 
-### What was run
+Run `scripts/modtest iec62351` (Debug, and `-Doptimize=ReleaseFast`) and `zig fmt --check modules/iec62351`; the sibling dependencies are checked with `scripts/modtest x509` and `scripts/modtest rsa`. The deterministic fuzz driver is `IEC62351_FUZZ=<runs>[,<first seed>]` (see Fuzzing).
 
-- `zig build test-iec62351` in **Debug** and **`--release=fast`**: all pass,
-  no failures, no skips, in both.
-- `zig build test-x509` and `zig build test-rsa` (the two sibling dependencies):
-  green.
-- `zig fmt --check modules/iec62351`: clean.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Mutation scope.** The whole-module run covers every runtime line of `replay.zig`, `ber.zig`, `goose.zig`, `acse.zig`, `tlsprofile.zig` and `burn.zig`: the GOOSE and SV replay state machines (RFC 1982 half-space edge, every inclusive/exclusive bound of the future, stale, idle-gap and time-allowed-to-live checks, the strict and wrapping counters, what the guard stores after an accept), the BER reader and writer (every length-size edge, the minimal-length rules, exact buffers), the layer-2 header encodings for both editions, `Frame.macDomain`'s exact range, the extension value, the MAC registry, the IV counter, `computeMac`/`verifyMac`/`constantTimeEql`, `build` and `verify`, the ACSE-requirements bit string, `findAuthFields`, `parseAuthValue`, `insertAuthFields`, the signed token (signing input bytes, strict parsing, freshness window both ways, the signature length), the password comparison, and every `tlsprofile` session and certificate rule with its boundary and profile switch. Not mutated, because the value is a constant or a size that cannot be switched at run time: tag and OID constants, `Profile`'s defaults and the named suite lists (pinned by the conforming-session tests), the `constantTimeEql` size dispatch (the fallback loop gives the same answer), the half-size and call-skipping variants of `burn.run`, the `SignedToken` and `AuthenticationValue` field-tag constants. The stack-burn mutant is killed by `stackprobe2_test`. The equivalent-mutant arguments behind the card's eq count are not kept in the repository.
+- **ctgrind** (`ctgrind_harness.zig`, row `mac`): the GOOSE/SV MAC key through `computeMac`/`verifyMac` for every HMAC and GMAC algorithm; the signature profiles go through `rsa`/`p256`.
+- **Dead-stack probes:** `stackprobe2_test.zig` for the GOOSE MAC entry points (`computeMac`/`verifyMac`), `stackprobe_test.zig` for the ECDSA signers (`goose.build`, `acse.signToken`).
 
 ### Test vectors, and where each one comes from
 
@@ -412,9 +413,9 @@ vectors rest on the standard-derived ones instead of on themselves.
 
 ### Third-party oracle — what actually ran
 
-`libiec61850` is not installed on this machine and its 62351 support was not
-obtainable, so **no IEC 61850 stack was used as an oracle and no GOOSE
-interoperability is claimed.** What was available was used, as a black box:
+No IEC 61850 stack with 62351 support is obtainable, so **no IEC 61850 stack is
+an oracle and no GOOSE interoperability is claimed.** What was available is used,
+as a black box (frozen into the tests, so nothing needs installing to run the suite):
 
 - **OpenSSL 3.5.5, `openssl dgst -sha256 -mac HMAC -macopt hexkey:0b0b…`** over
   the exact 39 octets of the frozen frame's `macDomain()`, giving
@@ -440,7 +441,7 @@ interoperability is claimed.** What was available was used, as a black box:
 
 ### Real GOOSE captures — header/APDU boundary anchor, not an interop claim
 
-`libiec61850` remaining unavailable (previous section), three real IEC
+With no 62351-6 stack available (previous section), three real IEC
 61850-8-1 GOOSE frames — a GE F650 relay and two IEDs from a mock four-bus
 substation, all captured from genuine devices, none of them this module's own
 output — were vendored instead (`cutaway-security/goosestalker`, MIT; see
@@ -495,103 +496,39 @@ below the floor; compression enabled; missing secure renegotiation; missing
 mutual authentication; session and resumption lifetimes exceeded;
 `chain_validated`/`revocation_checked` false; a malformed certificate.
 
-**Audit 2026-11-17 (whole-module mutation).** 352 mutants over every runtime line of `replay.zig`, `ber.zig`, `goose.zig`, `acse.zig`, `tlsprofile.zig` and `burn.zig`: the GOOSE and SV replay state machines (RFC 1982 half-space edge, every inclusive/exclusive bound of the future, stale, idle-gap and time-allowed-to-live checks, the strict and wrapping counters, what the guard stores after an accept), the BER reader and writer (every length-size edge, the minimal-length rules, 8- and 9-octet lengths, exact buffers), the layer-2 header encodings for both editions, `Frame.macDomain`'s exact range, the extension value (field widths, byte order, trailing bytes, IV presence), the MAC registry, the IV counter (cap, byte order, rekey), `computeMac`/`verifyMac`/`constantTimeEql`, `build` (frame-length bound, header counting, buffer bounds, domain, tag and extension placement), `verify` (every check, the domain it authenticates), the ACSE-requirements bit string, `findAuthFields` (duplicates, slices, trailing bytes), `parseAuthValue`, `insertAuthFields` (ordering around the authentication tags, exact buffers), the signed token (signing input bytes, strict parsing, freshness window both ways, the signature length), the password comparison, and every `tlsprofile` session and certificate rule with its boundary and its profile switch. Round 1 (ReleaseSafe, one switch per mutant): 251 killed, 100 survived. None of the 100 was a module defect (no replay or authentication decision was found wrong): they were tests that never reached an edge. 19 tests were added (`replay.zig`, `ber.zig`, `goose.zig`, `acse.zig`, `tlsprofile.zig`, plus a 2047-bit RSA fixture in `test_keys.zig` for the tag-length rounding, a modulus that is not a whole number of octets), among them the first test that accepts a second Sampled Value frame under the DEFAULT options (`smp_rate = 0`; the counter wrap at 2^16), the first that runs a certificate with an EC or Ed25519 key or an `extKeyUsage` extension through `inspectCertificate` (hand-assembled unsigned DER, since `rsa.selfSignedCert` emits only RSA keys without the extension), and byte-exact checks of the token's signing input and of the ACSE-requirements encoding. Round 2 killed 86 of the 100; the stack-burn mutant (`burn.stack` skipped, a ReleaseFast schemata build with the switch inside the callee and the switch read before the probed call) is killed by `stackprobe2_test` (`DeadStackResidue`; its baseline passes). 14 remain EQUIVALENT: the strict `>=` for `stNum` (equal is handled one branch earlier), `smp_rate == 1` (only counter 0 is acceptable), the length-of-length mask's bit 6 and the reserved `0xff` (both are also `n > 8`), `content.len == fixed` and `n == 0` in `computeMac`/`verifyMac`/`build` (the same error comes out of the next check), the repeated length check in `verifyMac`, the IV-presence comparison in `verify` (`parse` derives it from the same flag), bit 0 of the ACSE-requirements string (never an unused bit), two scratch-size bounds in `writeAuthValue` dominated by a tighter one, and `not_after == not_before` in the certificate length bound. Not mutated, because the value is a constant or a size that cannot be switched at run time: tag and OID constants, `Profile`'s defaults and the named suite lists (pinned by the conforming-session tests), the `constantTimeEql` size dispatch (the fallback loop gives the same answer), the half-size and call-skipping variants of `burn.run` (`stack`'s size is a comptime parameter), the `SignedToken` and `AuthenticationValue` field-tag constants. Counts on the card are whole-module.
-
 ### Fuzzing
 
-Six `std.testing.fuzz` targets, chosen for the specific failure modes the task
-of writing a parser for attacker-controlled bytes invites:
+The deterministic driver (`fuzz_test.zig`, `IEC62351_FUZZ`; never `zig build --fuzz`) runs three harnesses, each generic over its choice source:
 
-- `ber.zig` — the reader over arbitrary bytes, asserting every accepted element
-  lies wholly inside the input, including its children.
-- `goose.zig` — frame parse over arbitrary bytes under both header profiles,
-  asserting `apdu + extension + header == Length` and that the covered range
-  stays inside the frame; then `verify` on the same bytes, which must fail
-  cleanly.
-- `goose.zig` — extension parse over arbitrary octets with a randomised
-  `expect_iv`, asserting the tag never exceeds the bound and the IV presence
-  matches what was asked for. This is the "`reserved2` disagreeing with the
-  actual tag length" case.
-- `acse.zig` — authentication-field discovery over arbitrary bytes as both AARQ
-  and AARE, asserting everything reported points inside the input. This is the
-  "authentication-value whose declared type does not match its content" case.
-- `acse.zig` — token parsing, additionally asserting arbitrary bytes never
-  verify against a real key.
-- `tlsprofile.zig` — certificate inspection over arbitrary DER, **and** over a
-  real certificate with one fuzzer-chosen octet corrupted. The first of these
-  found the `std.crypto.Certificate.parse` out-of-bounds abort described above.
+- `iec62351-goose` — GOOSE/SV frames sealed by `goose.build` (HMAC-SHA-256 at three tag lengths, AES-GMAC at two, ECDSA P-256; both header profiles) verify; damaged (0-3 octets, truncation) they are refused, or accepted only if nothing the MAC covers changed (the unauthenticated key metadata is by design not covered); the extension, BER and frame parsers never panic on the same bytes.
+- `iec62351-replay` — a publisher's genuine GOOSE identities (state changes, retransmissions) interleaved with replays, reorderings and forged old state: the guard accepts the genuine in-order stream, never accepts a (stNum, sqNum) pair twice or one older than the last accepted, and a rejection leaves its state untouched.
+- `iec62351-acse` (scaled by 4) — a signed token spliced into an AARQ by `acse.insertAuthFields`: found, verified and genuine; a damaged PDU or token is refused (a damaged octet outside the token may still verify); another key, an expired or a future token never. The RSA-PSS sealers are not driven.
 
-## Deferred
+Corpus-seeded `std.testing.fuzz` targets sit beside the code they test:
 
-Stated, not hidden:
+- `ber.zig` — the reader over arbitrary bytes, asserting every accepted element lies wholly inside the input, including its children.
+- `goose.zig` — frame parse over arbitrary bytes under both header profiles, asserting `apdu + extension + header == Length` and that the covered range stays inside the frame, then `verify` on the same bytes, which must fail cleanly; and extension parse over arbitrary octets with a randomised `expect_iv`, asserting the tag never exceeds the bound and the IV presence matches what was asked for (the "`reserved2` disagreeing with the actual tag length" case).
+- `acse.zig` — authentication-field discovery over arbitrary bytes as both AARQ and AARE, asserting everything reported points inside the input; and token parsing, additionally asserting arbitrary bytes never verify against a real key.
+- `tlsprofile.zig` — certificate inspection over arbitrary DER, and over a real certificate with one fuzzer-chosen octet corrupted.
+- `replay.zig` — a GOOSE guard never accepts a strictly older (stNum, sqNum) pair.
 
-- **AES-GCM confidentiality for the routed profiles.** IEC 62351-6:2020 covers
-  AES-GCM over L2 GOOSE/SV and IEC 61850-90-5 defines AES-128/256-GCM for
-  R-GOOSE/R-SV. Only authentication is implemented here; encryption is not.
-- **R-GOOSE / R-SV (IEC 61850-90-5) session PDUs.** The UDP-routed profile has
-  its own session header (SPDU number, TimeOfCurrentKey, security algorithms
-  octet, Key ID) which is a different, larger wire format than the L2 extension.
-  Not implemented; the MAC registry here is deliberately numbered compatibly
-  with it, which is the groundwork.
-- **Key management (IEC 62351-9 / RFC 8052 GDOI).** No key derivation,
-  distribution, rollover or revocation. The key-schedule fields are carried and
-  surfaced, nothing more.
-- **The 2007 `Reserved 2` CRC.** Not computed, not checked, polynomial not
-  guessed.
-- **HMAC-SHA-3 profiles.** See the provenance section — no grounded registry
-  numbers; use the raw seam.
-- **Channel binding for `acse.SignedToken`.** The token is not bound to the TLS
-  session it travels over.
-- **CRL/OCSP inside the 62351-3 policy.** By design — `revocation_checked` is
-  the caller's assertion and `ocsp`/`ocspcache` do the work.
-- **SNTP security (IEC 62351-6 clause 7) and the SCL extensions (clause 9).**
-  Out of scope: the first is a different protocol, the second is configuration
-  schema rather than a security mechanism.
-- **Real GOOSE interoperability.** No IEC 61850 stack with 62351 support was
-  obtainable, so the wire format is verified for self-consistency, structural
-  agreement with an independent ASN.1 decoder, and primitive-level agreement
-  with OpenSSL — but **not** against another 62351 implementation. Anyone with
-  access to one should run the frozen frame in `vectors_test.zig` through it
-  before deploying. **This is a settled property of the module, not an open
-  task — see below.**
+## What is deliberately not done
 
-### Settled: there is no public IEC 62351-6 interop oracle
+- **HMAC-SHA-3 profiles.** No grounded registry numbers appear in the -6 algorithm table this module was built from, and inventing them would be worse than not shipping them; use `RawSealer`/`RawVerifier`.
+- **The 2007 `Reserved 2` CRC.** Not computed, not checked, polynomial not guessed: it is an integrity check, not a security one.
+- **CRL/OCSP inside the 62351-3 policy.** By design `revocation_checked` is the caller's assertion and `ocsp`/`ocspcache` do the work; likewise `chain_validated` and `x509.verifyChain`.
+- **SNTP security (IEC 62351-6 clause 7) and the SCL extensions (clause 9).** Out of scope: the first is a different protocol, the second is configuration schema rather than a security mechanism.
+- **A TLS transport.** Out of scope by layering; the module judges the 62351-3 profile of a session negotiated elsewhere.
+- **Interoperability against another 62351-6 stack.** No public oracle exists, so the wire format is verified for self-consistency, structural agreement with an independent ASN.1 decoder and primitive-level agreement with OpenSSL, but **not** against another 62351 implementation. A negative survey (2026-08-08) closed every route: `libiec61850`'s open build has no 62351-6 support (its README claims 62351-3/4 TLS only, and a code search finds no security-extension fields); the academic `61850security` framework (GoSV / S-GoSV) repositories hold a README and no code, and `R-GoSV`'s README documents six programs of which the tree contains two, both unsecured; `pygoose` and the scapy GOOSE tooling do not implement 62351-6; all 493 real GOOSE frames across the five vendored `.pcap` files carry `Reserved 1` = `Reserved 2` = `0x0000`, i.e. no security extension is present in any publicly available capture. So the `0x85` tag, the field order inside the authentication value and the BER framing of the `Extension` SEQUENCE rest on public secondary descriptions of the standard, the honest ceiling for a clean-room implementation of a paywalled standard. **Do not re-run this survey.** It unblocks only by an event outside this repository (an open stack shipping 62351-6, or a capture from an IED with the security profile switched on); then the frozen frame in `vectors_test.zig` is what to run through it.
 
-Recorded 2026-08-09 so this is not re-surveyed a fourth time. A dated,
-exhaustive negative survey (2026-08-08) closed every route:
+## Backlog / deferred
 
-- `libiec61850`'s open build has **no 62351-6 support**. Its README claims
-  62351-3/4 (TLS) only, and a code search across the repository returns zero
-  hits for the security-extension fields.
-- The academic `61850security` framework (GoSV / S-GoSV) repositories contain a
-  README and nothing else — no code. `R-GoSV`'s README documents six programs;
-  the tree contains two, both unsecured.
-- `pygoose` and the scapy GOOSE tooling do not implement 62351-6.
-- All **493** real GOOSE frames across the five vendored `.pcap` files carry
-  `Reserved 1` = `Reserved 2` = `0x0000`, i.e. **no security extension is
-  present in any publicly available capture**.
-
-So the `0x85` tag, the field order inside the authentication value and the BER
-framing of the `Extension` SEQUENCE rest on public secondary descriptions of
-the standard. That is the honest ceiling for a clean-room implementation of a
-paywalled standard whose deployed instances are not publicly captured.
-
-**Do not re-run this survey.** It unblocks only two ways, and both are events
-outside this repository: `libiec61850` (or an equivalent open stack) shipping
-62351-6, or someone contributing a capture taken from an IED with the security
-profile actually switched on. If either happens, the frozen frame in
-`vectors_test.zig` is the thing to run through it.
-
-## Coordinator notes
-
-- `NOTICE` needs **no entry for code** (the module's own `NOTICE` exists only for the vendored GOOSE capture frames, added later): this module is clean-room from public
-  specifications and public descriptions; no third-party source was ported and
-  no third-party implementation was studied for algorithm or API shape. OpenSSL
-  and `asn1crypto` were run purely as black-box test oracles, which
-  `CONVENTIONS.md` §5 explicitly exempts.
-- The root `README.md` catalog row and the `build.zig` entry were pre-wired by
-  the coordinator and are correct as written; no change needed.
-- `CHANGELOG.md` wants an "added module" line for the next release.
+- **IEC 62351-9 key management (GDOI/RFC 8052 group-key distribution, rollover).** No key derivation, distribution, rollover or revocation; the key-schedule fields are carried and surfaced, nothing more. Without it the 62351-6 keys must be provisioned by hand. Large; fits §2 only as a codec/state machine.
+- **R-GOOSE/R-SV session PDU and AES-GCM confidentiality (61850-90-5 / 62351-6:2020).** The routed WAN profile has its own session header (SPDU number, TimeOfCurrentKey, security algorithms octet, Key ID), a larger wire format than the L2 extension; 62351-6:2020 covers AES-GCM over L2 GOOSE/SV and 61850-90-5 defines AES-128/256-GCM for R-GOOSE/R-SV. Only authentication is implemented; the MAC registry is numbered compatibly with 90-5 as groundwork. Medium; fits §2; pairs with the R-GOOSE item in `iec61850`.
+- **IEC 62351-8 role-based access control tokens.** Not covered. Medium; fits §2. Confirm with the owner that this is not "deliberately not done".
+- **Channel binding for `acse.SignedToken`.** The token is not bound to the TLS session it travels over; binding needs an exporter value from the TLS layer, which this module does not own.
+- **Bulk GMAC path not re-measured** since the GMAC code moved to `aesgcm` (Zig 0.17 #36256); the card's `**Performance:**` line is "not measured", and there is no bench.
+- **Run the frozen frame through a 62351-6 stack** when one exists (see *What is deliberately not done*, interoperability).
 
 ## Anchoring
 
@@ -601,13 +538,3 @@ profile actually switched on. If either happens, the frozen frame in
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** RFC4231/GCM+OpenSSL oracle external for MAC; GOOSE frame self, no stack tested
-
-**How it got there.** The anchoring work landed. DONE 941bbfe: header anchored; 493 real frames show NO 62351-6 extension exists in the wild
-
-## Backlog / deferred
-
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
-
-- (survey 2026-09-30) **IEC 62351-9 key management (GDOI/RFC 8052 group-key distribution, rollover)**: without it the 62351-6 keys must be provisioned by hand; large, fits §2 only as a codec/state machine.
-- (survey 2026-09-30) **R-GOOSE/R-SV session PDU + AES-GCM confidentiality (61850-90-5 / 62351-6:2020)**: routed WAN profile; medium; fits §2. Already under Deferred; pairs with the R-GOOSE item in `iec61850`.
-- (survey 2026-09-30) **IEC 62351-8 role-based access control tokens**: not covered by the Deferred list; medium; fits §2. (Confirm with the owner that this is not "deliberately not done".)

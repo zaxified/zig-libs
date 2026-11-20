@@ -5,14 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** a test-local alias in `goose.zig` renamed (`ts` -> `hdr07`) so `check-ct-compare` still resolves the file's `const ts = std.crypto.timing_safe;` alias (it counts 5 constant-time compares again); the card's source hash and the ctgrind source digest follow.
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of the replay guards, BER, GOOSE/SV MAC and extension code, ACSE authentication fields and signed token, and the TLS profile (352 mutants, 338 killed, 14 EQUIVALENT; the card now carries whole-module counts). 19 tests added (replay boundaries incl. SV under default options, BER length edges, header/extension/IV/`build`/`verify` edges, ACSE field slices/duplicates/ordering, token strictness and signing-input bytes, every TLS-profile switch and boundary, EC/Ed25519/extKeyUsage certificate facts) and a 2047-bit RSA fixture in `test_keys.zig`. No module code changed. `SPEC.md` § Verification.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** GOOSE/SV GMAC now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `EnumSet.initEmpty()` -> `.empty` in `tlsprofile.zig`.
 - **2026-10-10** — tests: deterministic fuzz driver `IEC62351_FUZZ` (`src/fuzz_test.zig`). `iec62351-goose`: GOOSE / SV frames sealed with HMAC-SHA-256 (80/128/256), AES-GMAC (64/128) or ECDSA P-256, both header profiles, verify; damaged they are refused, or accepted only with the covered domain, tag and IV unchanged (the key metadata is unauthenticated by design). `iec62351-replay`: a publisher's genuine GOOSE identities interleaved with replays and forged old state: the guard accepts the genuine stream, never accepts a pair twice or an older one, and a rejection leaves its state untouched. `iec62351-acse`: a signed IEC 62351-4 token spliced into an AARQ is found and verified; another key, an expired or a future token never; a token with changed octets never verifies. Verdicts clean (acse at `.scale` 4). No code change.
@@ -65,42 +61,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   which from the module directory resolves to `modules/NOTICE` — a path that has never existed.
   It means this module's own `NOTICE`. Found by the new link-resolution check in
   `zig build check-catalog`, not by the audit pass that fixed the `src/` links.
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
-  `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
-  helper existed **33 times across 12 modules in three shapes**, each carrying its
-  own note about the same trap (the returned array has to be container-level or
-  the slice dangles with the right length and garbage behind it). Proved
-  byte-identical to the copies it replaces before they were deleted, and the
-  comparison test was itself broken on purpose first to show it was not vacuous.
-  `testkit` added to this module's `test_deps`; test-only, nothing a consumer
-  imports changed.
 
-- **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** all 8 fuzz harnesses in this
-  module were replaying a single fixed input, and two of them were testing
-  nothing at all. A `Smith` ranged draw returns the range MINIMUM unless the
-  eight octets it reads as a little-endian u64 already lie inside the range, and
-  `smith.bytes` had eaten the seed before the length draw ran, so every harness
-  saw the empty input. The frame draws are now `smith.slice(&buf)`, the flags
-  that used to precede them (`fuzzFind`'s PDU kind, `fuzzParse`'s header
-  profile, `fuzzExtension`'s `expect_iv`) follow them and use `value(u64)`, and
-  every harness carries a corpus built by this module's own encoders. Measured
-  over those corpora, non-empty inputs / inputs the parser accepts: ACSE field
-  discovery 0 -> 7/2 (and the PDU kind was `.aare` on every run before, `.aarq`
-  on 5 of 7 now), signed tokens 0 -> 5/2, BER 0 -> 14/6, GOOSE frames 0 -> 7/4
-  (profile `.ts2007` on every run before, `.ed2020` on 5 of 7 now), GOOSE
-  extensions 0 -> 6/4, certificate inspection 0 -> 6.
-- **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** the two harnesses that were
-  testing nothing. `tlsprofile.fuzzCorrupt`, named "a real certificate with one
-  octet corrupted", drew `smith.index(der.len)` and `smith.value(u8)` — both
-  collapse — so it did `der[0] ^= 0` and inspected the PRISTINE certificate on
-  every run: **0 octets changed.** It now draws both from `value(u64)`, with a
-  16-seed corpus: **16 distinct (index, mask) pairs, 16 of 16 octets changed.**
-  `replay.fuzzGoose` built its (stNum, sqNum, t) triple from three ranged draws,
-  so it offered the guard the SAME identity 32 times running: over 8 seeds,
-  **1 distinct identity across 256 steps and 8 acceptances** (the eight first
-  steps, one per seed) — the "accepting must mean the pair moved strictly
-  forward" branch could never see a pair that had moved. Now **256 distinct
-  identities and 15 acceptances.**
 
 - **2026-08-18** — Portability fix (`check-portable`): `ber.writeHeader`'s multi-byte
   length branch shifted its `usize` `content_len` by a hardcoded `shift: u6`, which
