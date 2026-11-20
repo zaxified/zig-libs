@@ -14,11 +14,13 @@ local-header+data straight to the caller's output as each entry is added.
   public PKWARE ZIP spec) — behavior only, no third-party source.
 - **Platform:** `any` (pure `std.Io`/`std.zip`/`std.compress.flate`, no OS-
   specific code). **Role:** codec (reader + writer).
-  **Concurrency:** reentrant — one `Archive` owns one file cursor; no
-  globals, no shared state between instances.
-- **Deps:** none (std only — `std.zip` for the wire structs/central-directory
-  walk, `std.compress.flate` for Deflate, `std.hash.Crc32` for the writer's
-  per-entry checksum).
+  **Concurrency:** reentrant — no globals, no shared state between
+  instances; every `EntryReader` has its own cursor into the archive's source,
+  so entries may be read concurrently.
+- **Deps:** `std.zip` for the wire structs, `std.compress.flate` for Deflate;
+  modules `crc32` (the CRC-32 of reader and writer), `zstd`, `bzip2`, `lzma`
+  (methods 93, 12, 14, 95), `aes192` and `encoding` (WinZip AES, CP437) and
+  `datefmt` (DOS dates).
 
 Provenance: original work of the zig-libs authors (MIT). The wire
 format is the public PKWARE ZIP spec (APPNOTE.TXT) — no third-party source
@@ -59,8 +61,7 @@ while (true) {
     if (n == 0) break;
     // consume buf[0..n]
 }
-// Finish (or abandon) this EntryReader before opening the next one — both
-// share the Archive's single file cursor.
+// Each EntryReader has its own cursor, so several may be open at once.
 ```
 
 `Archive` and `EntryReader` hold internal self-pointers (the file reader's
@@ -103,8 +104,9 @@ else the DOS fields read as UTC; null for an invalid DOS date) and
 `ArchiveWriter` is not self-referential (unlike `Archive`/`EntryReader`) — it
 may be moved freely. Entry names are gated through `isSafeEntryName` on the
 way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at
-`addEntry` rather than written. On Windows builds (or with `isSafeEntryNameOpts(.., .{ .windows = true })` / `ExtractOptions.windows_names`) names with a `:` (NTFS streams) and DOS device names (`CON`, `NUL.txt`, `COM1`) are refused too. Classic (non-zip64) format only — see
-"Ceiling" below.
+`addEntry` rather than written. On Windows builds (or with `isSafeEntryNameOpts(.., .{ .windows = true })` / `ExtractOptions.windows_names`) names with a `:` (NTFS streams) and DOS device names (`CON`, `NUL.txt`, `COM1`) are refused too. A member too big for the classic fields (or 65 535 or more entries) makes the
+archive zip64 automatically; `ArchiveWriter.allow_zip64 = false` refuses that
+with `Error.ZipWriteTooLarge` instead.
 
 ## Design notes
 
@@ -112,9 +114,9 @@ way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at
   *local* file header directly (its own filename/extra lengths), so a
   central-vs-local `version_needed` mismatch some writers emit (seen from
   real-world producers) never matters — nothing needs patching.
-- **Directory entries are skipped** during the central-directory walk (any
-  name ending in `/`, or empty after backslash normalization) — `Archive`
-  only ever lists members with content.
+- **Directory entries are skipped** by default during the central-directory
+  walk (any name ending in `/`, or empty after backslash normalization) —
+  `Archive` lists members with content unless `Options.list_directories`.
 - **Bounded memory.** The archive's own bookkeeping is O(entry count) (one
   name arena); streaming an entry is O(one window) — `std.compress.flate`'s
   window for Deflate, or the caller's buffer size for Store.
@@ -132,7 +134,7 @@ way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at
   error) with `EntryReader.crcMismatch()` set, so tampered content is never
   delivered as if it were valid.
 
-## Since 2026-10-20 (S2)
+## Sources, codecs, encryption and extraction
 
 ```zig
 // Any positional source: a file (`Archive.init`), memory, or your own.
@@ -156,7 +158,7 @@ zw.comment = "built 2026-10-20";
 try zipstream.extractAll(&archive, io, dest_dir, .{ .symlinks = .skip, .max_total = 1 << 32 });
 ```
 
-- **zip64** read and write (automatic past 4 GiB / 65 534 entries;
+- **zip64** read and write (automatic past 4 GiB / from 65 535 entries;
   `force_zip64`; `allow_zip64 = false` restores the classic-only refusal).
 - **Methods:** Store, Deflate, Zstandard (93, via `zstd`), bzip2 (12, via `bzip2`),
   LZMA (14) and XZ (95, via `lzma`) — the compressors byte-identical to libbzip2 /
@@ -172,11 +174,13 @@ try zipstream.extractAll(&archive, io, dest_dir, .{ .symlinks = .skip, .max_tota
 - **Speed:** CRC-32 via the hardware-backed `crc32` module; 0.31–1.07× Go
   `archive/zip` (`zig build bench-zipstream`).
 
-## Ceiling (documented, not a bug)
+## Not provided
 
-- Deflate64 (9), PPMd (98) and the legacy PKZIP methods are listed and refused
-  (`error.UnsupportedCompressionMethod`); a consumer can register its own `Codec`.
-- No in-place editing of an existing archive (append, delete, rename).
+Deflate64, PPMd and the legacy PKZIP methods (listed and refused with
+`error.UnsupportedCompressionMethod`; a consumer can register its own `Codec`),
+in-place editing of an existing archive, multi-disk archives and ZipCrypto
+writing. SPEC *What is deliberately not done* and *Backlog / deferred* give the
+reasons and what is open.
 
 ## Testing
 

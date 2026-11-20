@@ -16,13 +16,13 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code; wire format is the public PKWARE ZIP spec).
+Design + threat notes for auditors. Usage: see ./README.md. Provenance: see ./NOTICE (own code; wire format is the public PKWARE ZIP spec).
 
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Sibling modules
-relevant to the gaps: `tar` (the other archive format), `zstd` (a candidate ZIP method 93 codec),
-`crc32c` (unrelated polynomial; the CRC-32 here is std's).
+relevant to the gaps: `tar` (the other archive format), `zstd` (the ZIP method 93 codec),
+`crc32c` (unrelated polynomial; the CRC-32 here is the sibling `crc32`).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -34,153 +34,216 @@ relevant to the gaps: `tar` (the other archive format), `zstd` (a candidate ZIP 
 | [everalert/zzip](https://github.com/everalert/zzip) | Zig | MIT | 0 | pushed 2024-04-15 | The only other Zig ZIP library found by GitHub search; dormant, 0 stars; README not read. |
 
 **Where we are ahead:** the only maintained Zig ZIP reader **and** writer *(as far as the searches
-above show)*; bounded-memory streaming reads through `std.Io.Reader`; CRC-32 verified against the
-central directory (authoritative under data descriptors) with a distinct `crcMismatch()`;
-decompression-bomb cap and zip-slip name gate on both read and write; hostile-archive handling
-(truncated EOCD, bad offsets, lying sizes) with typed errors; `ArchiveWriter` output frozen against
-real `unzip`/`zipinfo`. **Where we are behind:** only Store + Deflate (zip2 also Bzip2, Zstandard,
-XZ, LZMA, Deflate64, PPMd), no encryption, no zip64 writing (entry modification time and mode are supported since
-2026-09-30), writer buffers one entry's
-compressed bytes (no data-descriptor streaming), reader needs a seekable `File` (→ Backlog).
+above show)*; bounded-memory streaming reads through `std.Io.Reader` over any positional source; zip64 in both
+directions; streamed writes with data descriptors; Store, Deflate, Zstandard, bzip2, LZMA and XZ plus a codec
+registry; WinZip AES read and write; CRC-32 verified against the central directory (authoritative under data
+descriptors) with a distinct `crcMismatch()`; decompression-bomb cap and zip-slip name gate on both read and write;
+hostile-archive handling (truncated EOCD, bad offsets, lying sizes) with typed errors; `ArchiveWriter` output frozen
+against real `unzip`/`zipinfo` and read back by Go. **Where we are behind:** no Deflate64 or PPMd (zip2 reads
+Deflate64, has PPMd), no raw copy between archives, no append or in-place editing (libzip, zip2, Python), no
+`zipalign`-style alignment, no archive-wide integrity scan (Python `testzip`); the rejected ones (in-place editing,
+multi-disk, async, ZipCrypto write, PPMd) are named in *What is deliberately not done*, the rest in *Backlog /
+deferred*.
 
 ## Design & invariants
+
 Streaming ZIP archive reader **and** writer. Reader: walk the central directory once, then stream each member's
-*decompressed* bytes on demand — no whole-archive or whole-entry buffering. `Archive.init` opens a
-file (already open, not closed by `deinit`) and walks the central directory once; `EntryReader.init`
-streams one entry's bytes through a caller-owned window buffer. Local header, not central: data
-offsets are resolved by reading the *local* file header directly (its own filename/extra lengths), so
-a central-vs-local `version_needed` mismatch some real-world writers emit never matters — nothing
-needs patching. Directory entries are skipped during the central-directory walk (any name ending in
-`/`, or empty after backslash normalization) — `Archive` only ever lists members with content.
-Bounded memory: the archive's own bookkeeping is O(entry count) (one name arena); streaming an entry
-is O(one window) — `std.compress.flate`'s window for Deflate, or the caller's buffer size for Store.
-`Archive` and `EntryReader` hold internal self-pointers (the file reader's `interface`, the inflate
-stream's input handle) — must be initialized in place via a `*Self` and never moved after `init`; both
-share the `Archive`'s single file cursor, so one `EntryReader` must finish (or be abandoned) before
-the next opens. Reentrant — one `Archive` owns one file cursor; no globals, no shared state between
-instances. Std-only: `std.zip` for the wire structs/central-directory walk, `std.compress.flate` for
-Deflate. Original work of the zig-libs authors (MIT); wire format is the public PKWARE ZIP spec
-(APPNOTE.TXT) — no third-party source, no NOTICE entry needed.
+*decompressed* bytes on demand — no whole-archive or whole-entry buffering. `Archive.init` (a file already open, not
+closed by `deinit`), `Archive.initOpts` and `Archive.initSource` (any `Source`) walk the central directory once;
+`EntryReader.init` / `initMax` / `open` stream one entry's bytes through a caller-owned window buffer. Local header,
+not central: data offsets are resolved by reading the *local* file header directly (its own filename/extra lengths),
+so a central-vs-local `version_needed` mismatch some real-world writers emit never matters — nothing needs patching.
+Directory entries are skipped during the central-directory walk (any name ending in `/`, or empty after backslash
+normalization) unless `Archive.Options.list_directories` is set.
 
-Writer: `ArchiveWriter.addEntry(name, data, .{.method=...})` per member, then `finish()`. Each
-`addEntry` writes that member's local file header + data straight to the caller's `*std.Io.Writer`
-immediately (Store passthrough or `std.compress.flate.Compress` for Deflate); `finish()` appends the
-central directory + EOCD. Because the local file header (written before the payload) needs the final
-`compressed_size`, `addEntry` buffers one entry's *compressed* copy in memory before writing it — never
-the whole archive, and never more than the caller already handed in via `data`. Entry names are gated
-through the same `isSafeEntryName` zip-slip predicate the reader documents, so this module can never
-itself produce a zip-slip archive. Not self-referential (unlike `Archive`/`EntryReader`) — no in-place
-`*Self` init needed. Classic (non-zip64) format only: offsets/sizes/entry-count must fit the 32/16-bit
-ZIP fields, else `Error.ZipWriteTooLarge` before anything corrupt is written — zip64 *writing* stays in
-the backlog (below); zip64 *reading* is fully supported (see next paragraph).
+Bounded memory: the archive's own bookkeeping is O(entry count) (one name arena; the up-front reservation from the
+end record's untrusted count is capped at 4096 entries, `max_initial_entries`); streaming an entry is O(one window) —
+`std.compress.flate`'s window for Deflate, or the caller's buffer size for Store.
 
-Modification time and mode (2026-09-30). Write: `AddEntryOptions.mtime` (Unix seconds, UTC) fills the
-DOS date/time fields — clamped to 1980-01-01..2107-12-31 23:59:58, rounded DOWN to an even second
-(Info-ZIP rounds up; either is within the format's 2 s resolution) — and, when it fits a `u32` (1970..2106;
-until 2026-10-05 an `i32`, which cut it at 2038), a 9-byte
-Info-ZIP `UT` extra record (flags=1, mtime) in both the local and the central header. `mode` sets host 3
-(Unix) in `version made by` and `(S_IFREG | mode & 0o7777) << 16` as external attributes. Without
-`mtime`, the DOS fields are 1980-01-01 00:00:00 (`DosDateTime.min`): a zero date — what the writer wrote
-until then — is not a date (month 0), unzip tools list it as garbage, and a fixed valid value keeps
-archives reproducible. Read: `Entry.mtime` is taken from the central extra field when it carries a
-time — the LAST of `UT` (0x5455, unsigned 32-bit seconds), NTFS (0x000a, tag 1, 100 ns since 1601),
-PKWARE Unix (0x000d) and Info-ZIP `UX` (0x5855) wins, as Go and `zipinfo` decide it — else from the DOS
-fields (zoneless; read as UTC — Info-ZIP writes LOCAL time there, which only an extra record corrects),
-and is null when neither is valid; `Entry.mode` is set only for a Unix host. The extra-field walk is
-advisory and bounded by `extra_len`: a record whose length runs past the field ends the walk without a
-time, never an error. (Until 2026-10-05 that promise was false: `std.zip.Iterator` validated every
-extra field first and refused the whole archive — `ZipBadExtraFieldSize` — over one malformed record.)
-Writing, a name with a non-ASCII byte that is valid UTF-8 sets general-purpose bit 11 in both headers
-(since 2026-10-05; without it Go flagged `NonUTF8` and unzip showed the name in code page 437).
+Lifetimes and concurrency: `Archive` and `EntryReader` hold internal self-pointers (the source reader's `interface`,
+the inflate stream's input handle), so both are initialised in place via a `*Self` and never moved after `init`. An
+`Archive` is read-only after `init` and every `EntryReader` has its own cursor into the `Source` (positional reads),
+so several entries may be open at once, also from several threads; a `FileSource` reads with `pread`. Reentrant: no
+globals, no shared state between instances. `ArchiveWriter` is not self-referential and may be moved.
 
-zip64 (archives/entries beyond the classic 32-bit fields — > 4 GiB, or > 65535 central-directory
-records): supported for **reading**. The central directory is this module's own walk since 2026-10-05
-(`findDirectory`, `parseExtra` in `src/root.zig`; it was `std.zip.Iterator`, whose strictness refused
-archives unzip and Go read — below): the end record is the last signature whose record and comment fit
-the file; a saturated classic field sends it to the zip64 locator and end record; each entry's zip64
-extra field supplies exactly the saturated sizes/offset; every record is bounded by the file size in
-u64. Tolerated as unzip and Go tolerate them: bytes prepended without adjusting offsets (a
-self-extractor stub — the directory is then found right before the end record and the difference
-becomes the base offset), a directory size that is off, disk numbers (read as one concatenated
-archive). The record count must match the records actually present, either way. An entry with another
-method or the encryption flag is listed (`Entry.encrypted`) and refused when opened
-(`error.UnsupportedCompressionMethod` / `error.ZipEncryptedEntry`), so one such member does not hide
-the rest; a stored entry whose compressed and uncompressed sizes differ is refused when opened
-(`error.ZipBadCentralDirectory`; it used to be read to the uncompressed size, past the member). An
-empty name is listed (only a trailing '/' marks a directory). `buildZip64` (SPEC "Verification")
-still forces the zip64 path on a small member.
+Dependencies: `std.zip` for the wire structs, `std.compress.flate` for Deflate; sibling modules `crc32` (the CRC-32
+of the reader and writer), `zstd`, `bzip2`, `lzma` (methods 93, 12, 14, 95), `aes192` and `encoding` (WinZip AES,
+CP437) and `datefmt` (DOS dates) — the `.deps` list in `src/root.zig` (`meta`) is authoritative. Original work of the
+zig-libs authors (MIT); wire format is the public PKWARE ZIP spec (APPNOTE.TXT) — no third-party source.
 
-## Threat model / out of scope
-Untrusted-archive hardening: a corrupted local file header signature → `EntryReader.init` returns
-`Error.ZipBadFileOffset` cleanly (never over-reads); a central-directory size that lies beyond the
-physical file (simulated truncation/corruption of just one entry's bookkeeping) hits
-`error.EndOfStream` cleanly instead of looping or over-reading; a truncated archive (missing central
-directory/EOCD) → `Archive.init` returns `error.ZipNoEndRecord` cleanly. A **decompression bomb** is
-bounded twice: `EntryReader.init` refuses up front (`Error.ZipEntryTooLarge`) any entry whose declared
-uncompressed size exceeds `default_max_output` (1 GiB — an absolute size cap, not a ratio cap;
-`EntryReader.initMax` takes the cap explicitly), and the running Deflate output is clamped to the
-declared size, so a stream that expands past its own central-directory bound is cut off there rather
-than read unbounded. **Content integrity** is checked, not assumed: `reader()` accumulates a CRC-32 over
-every decompressed byte and compares it against the entry's *central-directory* checksum (authoritative
-even under a post-data data descriptor, where the local header's copy is zero) at end-of-stream — a
-mismatch fails the read with `error.ReadFailed` and `EntryReader.crcMismatch()` set. zip64 archives/entries (> 4
-GiB, or > 65535 records) are read correctly — not a ceiling, see "Design & invariants" above. Documented
-ceiling, not a bug: **no encrypted entries** (listed, refused when opened: `error.ZipEncryptedEntry`);
-**Store + Deflate only** — an entry with any other method (bzip2, LZMA, …) is listed and refused when
-opened, `error.UnsupportedCompressionMethod`. `ArchiveWriter` writes classic (non-zip64) archives only — an
-entry/archive that would overflow the 32/16-bit ZIP fields is refused with `Error.ZipWriteTooLarge`
-before anything is written, same "clean typed error, never silent truncation" discipline as the reader.
-Not a security boundary beyond crash/DoS resistance on malformed archives — path handling of member
-names is the caller's responsibility if extracting a *read* archive to disk (this module's reader never
-writes files); `ArchiveWriter` gates entry names through the identical `isSafeEntryName` zip-slip
-predicate on the way in, so the module itself can't be tricked into emitting a zip-slip archive.
+### Writer
+
+`ArchiveWriter.addEntry(name, data, options)` per member, then `finish()`. Each `addEntry` writes that member's local
+file header + data to the caller's `*std.Io.Writer`; `finish()` appends the central directory + end record(s). The
+local file header (written before the payload) needs the final `compressed_size`, so `addEntry` buffers one entry's
+compressed (and, with encryption, sealed) copy in memory before writing it — never the whole archive, and never more
+than the caller already handed in via `data`. For data that is not in memory, `beginEntry` / `endEntry` stream (see
+below). `ArchiveWriter` never flushes or closes `out`. Entry names are gated through the same `isSafeEntryName`
+zip-slip predicate the reader documents (`Error.ZipUnsafeEntryName`), so this module can never itself produce a
+zip-slip archive.
+
+### Design notes by feature
+
+- **Modification time and mode.** Write: `AddEntryOptions.mtime` (Unix seconds, UTC) fills the DOS date/time fields —
+  clamped to 1980-01-01..2107-12-31 23:59:58, rounded DOWN to an even second (Info-ZIP rounds up; either is within the
+  format's 2 s resolution) — and, when it fits a `u32` (1970..2106), a 9-byte Info-ZIP `UT` extra record (flags=1,
+  mtime) in both the local and the central header. `mode` sets host 3 (Unix) in `version made by` and
+  `(S_IFREG | mode & 0o7777) << 16` as external attributes. Without `mtime`, the DOS fields are 1980-01-01 00:00:00
+  (`DosDateTime.min`): a zero date is not a date (month 0), unzip tools list it as garbage, and a fixed valid value
+  keeps archives reproducible. Read: `Entry.mtime` is taken from the central extra field when it carries a time — the
+  LAST of `UT` (0x5455, unsigned 32-bit seconds), NTFS (0x000a, tag 1, 100 ns since 1601), PKWARE Unix (0x000d) and
+  Info-ZIP `UX` (0x5855) wins, as Go and `zipinfo` decide it — else from the DOS fields (zoneless; read as UTC —
+  Info-ZIP writes LOCAL time there, which only an extra record corrects), and is null when neither is valid;
+  `Entry.mode` is set only for a Unix host. The extra-field walk is advisory and bounded by `extra_len`: a record
+  whose length runs past the field ends the walk without a time, never an error. Not read: atime/ctime and `ux`/`Ux`
+  uid/gid.
+- **UTF-8 names.** Writing, a name with a non-ASCII byte that is valid UTF-8 sets general-purpose bit 11 in both
+  headers (`nameFlags`; without it Go flags `NonUTF8` and unzip shows the name in code page 437). Reading, a name
+  without bit 11 is the Info-ZIP Unicode Path extra field (0x7075) when its CRC matches the stored name and it is valid
+  UTF-8, else the stored bytes (`Entry.name_is_utf8` false) or, with `Archive.Options.legacy_names = .cp437`, decoded
+  as IBM 437 through `encoding` (Python `zipfile`, zip2). A stored or Unicode Path name longer than `std.Io.Dir.max_path_bytes` is `Error.ZipNameTooLong`.
+- **zip64 read.** The central directory is this module's own walk (`findDirectory`, `parseExtra` in `src/root.zig`;
+  `std.zip.Iterator` refused archives unzip and Go read): the end record is the last signature whose record and
+  comment fit the file; a saturated classic field sends it to the zip64 locator and end record; each entry's zip64
+  extra field supplies exactly the saturated sizes/offset; every record is bounded by the file size in u64. Tolerated
+  as unzip and Go tolerate them: bytes prepended without adjusting offsets (a self-extractor stub — the directory is
+  then found right before the end record and the difference becomes the base offset), a directory size that is off,
+  disk numbers (read as one concatenated archive). The record count must match the records actually present, either
+  way. An entry with an unsupported method is listed and refused when opened (`error.UnsupportedCompressionMethod`),
+  an encrypted one is listed (`Entry.encrypted`) and refused without a password (`error.ZipEncryptedEntry`), so one such
+  member does not hide the rest; a stored entry whose compressed and uncompressed sizes differ is refused when opened
+  (`error.ZipBadCentralDirectory`). An empty name is listed (only a trailing '/' marks a directory).
+- **zip64 write.** An entry or archive past a classic field (4 GiB sizes or offsets, 65 535 entries) gets the zip64
+  extra field, the zip64 end record and its locator, automatically; `AddEntryOptions.force_zip64` writes the extra
+  even when the sizes fit (Python `force_zip64`); `ArchiveWriter.allow_zip64 = false` (Python `allowZip64`) restores
+  the classic-only refusal `Error.ZipWriteTooLarge`, raised before anything corrupt is written. A streamed entry
+  that may pass 4 GiB needs `force_zip64` up front, since its local header already promised 32-bit sizes; without it
+  `endEntry` refuses at that point.
+- **Sources.** `Source` is a `readAt(offset, buf)` vtable with a size; `FileSource` (positional `pread`) and
+  `MemorySource` are the two shipped. Go's `NewReader(ReaderAt, size)` is the model.
+- **Streamed writes.** `beginEntry` returns a `*std.Io.Writer`; `endEntry` finishes the compressor and writes the data
+  descriptor (general-purpose bit 3), so nothing is buffered beyond one deflate window; only one streamed entry is open
+  at a time (a second `beginEntry`, `addEntry` or `finish` while one is open panics).
+- **Methods and the codec registry.** Store and Deflate come from std; Zstandard (93, `zstd`), bzip2 (12, `bzip2`),
+  LZMA (14, APPNOTE 4+5-byte header, bit 1 for the end marker) and XZ (95) (`lzma`) are the built-in `Codec`s
+  (`zstd_codec`, `bzip2_codec`, `lzma_codec`, `xz_codec`); the compressors are byte-identical to libbzip2 / liblzma
+  and were checked against Python `zipfile` both ways. Any other method plugs in through a `Codec`
+  (`Archive.Options.codecs`, searched before the built-ins; `AddEntryOptions.codec` with `WriteMethod.custom`), Go's
+  `RegisterDecompressor` / `RegisterCompressor`. `EntryReader.deinit` releases a codec's decoder (a no-op for Store
+  and Deflate). The bzip2 and LZMA readers pass no output cap of their own, so the entry cap (`max_output` /
+  `ExtractOptions.max_entry`) is the only bound. Reading links no compressor.
+- **Encryption.** WinZip AES-128/192/256 read (AE-1, AE-2) and write (AE-2: CRC stored as 0, the 10-byte code
+  authenticates; `AddEntryOptions.encryption`, salt from `std.Io.randomSecure` or fixed for tests); ZipCrypto read
+  only. `EntryReader.open(…, .{ .password })`; a wrong password is `error.ZipBadPassword` (AES's verifier, ZipCrypto's
+  check byte — 1 in 256 wrong passwords pass that one and the CRC-32 then fails); an AES authentication failure fails
+  the read and sets `EntryReader.authFailed()`. Checked against 7-Zip and Info-ZIP (`tools/crypto_fixtures.sh`).
+  `addDirectory` and `addSymlink` ignore `encryption`.
+- **Entries.** Comments (`Entry.comment`, `Archive.comment`, `AddEntryOptions.comment`, `ArchiveWriter.comment`; at most
+  65 535 bytes), the raw central `Entry.extra` and caller `AddEntryOptions.extra` written after the module's own
+  records, directories (`addDirectory`: trailing `/`, mode 040755; read with `list_directories`), symlinks
+  (`Entry.isSymlink`, `addSymlink`; the content is the link target).
+- **Extraction.** `extractAll(archive, io, dir, ExtractOptions)` is where zip-slip bites: every name passes
+  `isSafeEntryNameOpts` first (`ZipUnsafeEntryName`), parent directories are created, an existing file is an error
+  unless `overwrite`, the declared sizes may not pass `max_total` (4 GiB, `ZipExtractTooLarge`) nor `max_entry` (1 GiB, `ZipEntryTooLarge`),
+  symlinks are skipped by default (`create`: relative target without `..`; `refuse`: `ZipUnsafeSymlink`), mode and
+  mtime are restored by default with the setuid/setgid/sticky bits masked off unless `restore_special_bits` (Info-ZIP
+  `unzip -K`), and a file whose stream fails (CRC, AES, cap, I/O) is removed, never left under the entry's name.
+- **Windows name rules.** `isSafeEntryNameOpts(name, .{ .windows })` and `ExtractOptions.windows_names` refuse a `:`
+  anywhere and any segment whose base name (cut at the first `.`/`:`, trailing spaces trimmed, ASCII case-insensitive)
+  is `CON PRN AUX NUL COM1-9 LPT1-9` (also with the superscript digits) `CONIN$ CONOUT$`. Default: on only when built
+  for Windows (`isSafeEntryName` is `isSafeEntryNameOpts(name, .{})`), as Go's `filepath.IsLocal` is OS-dependent and
+  Python `zipfile` and libarchive sanitise only when extracting on Windows; always-on would refuse ordinary POSIX
+  names (`2026-11-19T10:00.log`, `aux.c`). Trailing dots and spaces are not checked (Go does not). `ArchiveWriter`
+  uses the native default.
+- **Truncated deflate input.** std's `flate.Decompress` reaches `unreachable` when its input ends inside a block (any
+  proper prefix of an ordinary stream did it, e.g. an entry whose data runs to end of file). The decoder therefore reads
+  `PaddedInput`: exactly `compressed_size` bytes of the source (Go's SectionReader bound), then zeros, so it never
+  sees an end of input; what the zeros decode to is refused by the CRC-32 check or by the decoder. `CrcReader` checks
+  on the read that reaches the declared size and withholds that read's bytes, so a consumer reading exactly
+  `uncompressed_size` bytes cannot get corrupted content without an error.
+- **Speed.** CRC-32 comes from the hardware-backed `crc32` module; the bench is below under *Performance*.
+
+## Threat model / Limits / Known limits
+
+Untrusted-archive hardening: a corrupted local file header signature → `EntryReader.open` returns
+`Error.ZipBadFileOffset` cleanly (never over-reads, also for an offset at or past the end of the source); a
+central-directory size that lies beyond the physical file hits `error.EndOfStream` cleanly instead of looping or
+over-reading; a truncated archive (missing central directory/EOCD) → `Archive.init` returns `error.ZipNoEndRecord`
+cleanly; zip64 locator and extra-field offsets near 2^64 are a bad directory, not an overflow; a forged entry count
+reserves little memory. A **decompression bomb** is bounded twice: `EntryReader.init` refuses up front
+(`Error.ZipEntryTooLarge`) any entry whose declared uncompressed size exceeds `default_max_output` (1 GiB — an
+absolute size cap, not a ratio cap; `initMax` and `OpenOptions.max_output` take the cap explicitly), and the running
+output is clamped to the declared size, so a stream that expands past its own central-directory bound is cut off
+there rather than read unbounded. **Content integrity** is checked, not assumed: `reader()` accumulates a CRC-32 over
+every decompressed byte and compares it against the entry's *central-directory* checksum (authoritative even under a
+post-data data descriptor, where the local header's copy is zero) at end-of-stream — a mismatch fails the read with
+`error.ReadFailed` and `EntryReader.crcMismatch()` set (WinZip AE-2 entries carry no CRC; their authentication code
+decides, `authFailed()`).
+
+Limits and residual risks a consumer relies on:
+
+- **Archive memory is O(archive size), uncapped.** `Archive.init` lists every central-directory record (about 3-4x the
+  46 header bytes of heap per entry); a hostile multi-GiB archive of empty members costs gigabytes. Bounded by the
+  input, not by an option (see *Backlog / deferred*).
+- **Zstandard window.** `Archive.Options.zstd_window_log_max` (default 27 = 128 MiB per open entry) bounds the memory
+  an open Zstandard entry can make the decoder allocate from a few header bytes; a larger frame is refused
+  (`error.ReadFailed` from the entry's reader). lzma (default `max_dict` 64 MiB) and bzip2 (about 4 MiB) stay at their
+  module defaults; there is no zipstream option for them.
+- **Methods.** An entry with a method that has no codec (Deflate64, PPMd, the legacy PKZIP methods, or a built-in
+  one compiled out by `-Dzipstream-builtin-decoders=false`) is listed and refused when opened,
+  `error.UnsupportedCompressionMethod`.
+- **No path handling for you.** This module's reader never writes files; path handling of member names is the
+  caller's responsibility when extracting a *read* archive to disk (`extractAll` does it). `ArchiveWriter` gates names
+  through the identical `isSafeEntryName` predicate. Not a security boundary beyond crash/DoS resistance on malformed
+  archives.
+- **Wrong password.** ZipCrypto's check byte lets 1 in 256 wrong passwords through to the CRC-32 check.
 
 ## Verification
-`buildZip` in the test file constructs real ZIP byte streams in-code (the same `std.zip` structs the
-production walk parses, so the layout can't drift), covering: multi-entry archives, directory-entry
-skipping, `find`/`findSuffix`; shared-file-cursor streaming across consecutive entries; a Store +
-Deflate mix in one archive (Deflate bytes produced via `std.compress.flate.Compress`, raw container,
-decoded back through `EntryReader` and compared byte-for-byte); an empty archive; a truncated archive
-(central directory/EOCD missing); a corrupted local file header signature; a central-directory size
-lying beyond the physical file. `buildZip64` similarly hand-builds a zip64-escaped archive (0xFFFFFFFF
-placeholders + real sizes/offset relocated into the zip64 extra field, plus a zip64 EOCD + locator ahead
-of the classic EOCD) on a small member, covering both Store and Deflate through that path. Writer tests
-round-trip `ArchiveWriter`'s output (Store + Deflate) back through this module's own `Archive`/
-`EntryReader` byte-for-byte, cross-check the written CRC-32/sizes independently via `std.zip.Iterator`
-directly (so a wrong field written by `ArchiveWriter` can't hide behind a lenient reader), and confirm
-`addEntry` rejects zip-slip names.
 
-`write_golden_test.zig` freezes what used to be an ad hoc, uncommitted check: a small
-`ArchiveWriter`-produced archive (`testdata/write_golden.zip`, 327 bytes, Store + Deflate entries) was
-verified once against the real `unzip`/`zipinfo` (`unzip -t` clean, `zipinfo -v` confirms CRC-32/sizes/
-EOCD/central-directory offsets, `unzip -p` byte-exact for both entries) and committed. `ArchiveWriter`
-is asserted to reproduce those exact bytes offline (no subprocess); local-header-vs-central-directory
-consistency, CRC-32, sizes, and the end-of-central-directory record are each asserted directly against
-the frozen bytes, and this module's own `Archive`/`EntryReader` are asserted to decode them back to the
-original plaintext. `std.zip.Iterator`'s agreement is kept as an extra internal-consistency check but
-is not counted as the external oracle (see that file's doc comment for the reasoning). Run: `zig build
-test-zipstream`.
+Run: `scripts/modtest zipstream`; the Go oracle is re-taken with `zig build interop-zipstream` (`-- --regen` rewrites
+the vectors; `go run . -dump DIR` in `tools/go_oracle` writes every read case as a file for unzip), the encrypted
+fixtures with `tools/crypto_fixtures.sh` (needs 7z and Info-ZIP `zip`).
 
-**Audit 2026-10-04 (mutation).** 37 schemata mutants over the central-directory pre-check
-(u16 advance cap, signature), method gate, name normalisation, directory skip, mode/host
-rules, the `UT` extra-field walk, `isSafeEntryName`, the local-header checks, the
-decompression-bomb cap and deflate clamp, CRC verification, `DosDateTime` ranges and leap
-years, and the writer's name/offset/count/mode/`UT` paths: 36 killed, 1 equivalent, 0 left
-alive. Equivalent: dropping `readUtMtime`'s `len > left` guard -- std's `Iterator.next`
-validates every central-directory extra record (`ZipBadExtraFieldSize`) before
-`Archive.init` reads it, so an overrunning record never reaches this walk (std 0.16). 15
-survivors got tests: the exact 65 536-byte pre-check edge, a bad CD signature and a BZIP2
-method refused at init, backslash normalisation, mode only from a Unix host with non-zero
-attributes, a `UT` record without the mtime flag, the cap at exactly `max_output`, deflate
-output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 / 2024-02-29,
-65 535 written entries with the 65 536th refused, and the writer masking type bits off `mode`.
+- **Reader/writer tests.** `buildZip` in the test file constructs real ZIP byte streams in-code (the same `std.zip`
+  structs the production walk parses, so the layout can't drift): multi-entry archives, directory skipping,
+  `find`/`findSuffix`, streaming across consecutive entries, a Store + Deflate mix, an empty archive, a truncated
+  archive, a corrupted local header signature, a central-directory size beyond the file; `buildZip64` hand-builds a
+  zip64-escaped archive on a small member (Store and Deflate). Writer tests round-trip `ArchiveWriter`'s output
+  through this module's `Archive`/`EntryReader` and cross-check the written CRC-32/sizes via `std.zip.Iterator`
+  directly, so a wrong field can't hide behind a lenient reader; zip-slip names are rejected; 65 535 entries are
+  admitted classic and the 65 536th archive is a zip64 archive the reader lists completely.
+- **Golden.** `src/write_golden_test.zig` freezes a small `ArchiveWriter` archive (`src/testdata/write_golden.zip`,
+  Store + Deflate) that was verified once against the real `unzip`/`zipinfo` (`unzip -t`, `zipinfo -v`, `unzip -p`
+  byte-exact); the writer must reproduce those exact bytes offline, and each header field is asserted against them.
+  `std.zip.Iterator`'s agreement is kept as an internal-consistency check, not the external oracle.
+- **Go oracle.** `src/go_oracle.zig` + `src/go_oracle_vectors.zig` replay Go `archive/zip` verdicts on archives built
+  record by record (central vs local header, data descriptors, integrity, methods and flags, DOS and extra-field times,
+  attributes, end-record shapes, zip64), with divergences decided by Info-ZIP unzip 6.0 / zipinfo as the tiebreaker;
+  the replay also has Go read this module's `ArchiveWriter` output (methods, modes, times to 2106, non-ASCII names).
+  Producer `tools/go_oracle/` (stdlib only), driver `tools/interop.zig`.
+- **Real archives.** `src/testdata/infozip_*.zip`, `xlsx_sample.xlsx` (LibreOffice output), Python `zipfile` fixtures
+  for bzip2 and LZMA, and 7-Zip / Info-ZIP encrypted archives in `src/testdata/crypto/` (`src/crypto_test.zig`).
+- **Sweep tests.** `src/sweep_test.zig` pins each no-panic sweep finding (locator overflow, extra-field overflow,
+  zstd window limit, compiled-out decoders, special bits, failed-open `deinit`, forged entry counts, offsets at the
+  end of the source, partial files after a CRC failure); `src/s2_test.zig` covers sources, concurrent entries,
+  codecs, comments, directories, symlinks and `extractAll`; `src/mtime_test.zig` times and modes.
+- **Fuzz:** `src/fuzz_test.zig`, deterministic driver `ZIPSTREAM_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver);
+  the harness writes Store, Deflate, zstd, AES-encrypted and streamed members and opens them with the password.
+- **ctgrind:** n/a (archive streaming).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
-**Audit 2026-11-19 (delta mutation, Windows name rules).** 27 schemata mutants over `isSafeEntryNameOpts`/`isWindowsDeviceName` and the `extractAll` plumbing (each device name dropped, case-insensitivity, the `.`/`:` cut, trailing-space trim, COM/LPT prefix and digit range, the three superscript digits, both guards forced on/off, name and symlink-target plumbing of `windows_names`): 25 killed, 2 EQUIVALENT. Mutant 5 (cut at `.` only): a `:` in the name is refused by the colon rule anyway, so a device name behind a `:` is unreachable. Mutant 21 (`d[0] <= ':'` for `'9'`): the base is cut at `:`, so the digit byte can never be `:`. Two tests were added after the first run (`AUX.c`, `COM` + U+00B3, symlink target). Card count cumulative: 36/37 (1 eq) + 25/27 (2 eq) = 61/64, 3 eq.
+## Performance
+
+`zig build bench-zipstream` (`tools/bench.zig` against Go `archive/zip` through `tools/go_bench`, fixtures generated
+once from a seeded PRNG under `.zig-cache/bench-zipstream/`): an xlsx-shaped 200 MB deflate extract, 512 MiB stored,
+a central directory of 100 k entries, 10 k small entries, and the writer and streamed writer (256 MiB deflate and
+store). The figures are on the card's `**Performance:**` line.
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-11-02 at the build-tool consumer's request (a CLI that reads Store
-and Deflate and never writes):
+Consumer build options (CONVENTIONS §4.2), added at the build-tool consumer's request (a CLI that reads Store and
+Deflate and never writes):
 
 | option | values | default | `-Dprofile=small` |
 |---|---|---|---|
@@ -192,123 +255,42 @@ and Deflate and never writes):
   affected.
 - **Gain** (read-only probe `tools/sizeprobe.zig`, ReleaseSmall, x86_64): 512 512 -> 197 632 B.
 - **Independent of the option:** reading links no compressor at all, since the fallback table holds
-  decoders only (same probe, before that split: 1 269 136 B in ReleaseSmall, 15.6 -> 5.5 MB in
-  ReleaseSafe; the build-tool consumer's CLI ReleaseSmall 2.80 -> 2.05 MB).
+  decoders only (the build-tool consumer's CLI ReleaseSmall 2.80 -> 2.05 MB).
+
+## What is deliberately not done
+
+- **In-place editing** (delete, replace, rename entries of an existing archive; R11): libzip's whole charter (a
+  source abstraction plus transactional update). The rebuild by raw copy (open item R10) covers it.
+- **Multi-disk / spanned / split archives** (R24): the leaders (zip2, Go, Python) do not either; disk numbers are
+  read as one concatenated archive.
+- **Async reader/writer** (R25): everything here is `std.Io`-based already (the reader takes an `Io`), concurrency
+  is the caller's choice.
+- **ZipCrypto write**: a broken cipher; it is read only, never written.
+- **PPMd** (98; R18): only zip2 has it, and no real producer besides 7-Zip's option.
+- **Implode / Shrink / Reduce** (legacy PKZIP methods 1-6; part of R17): no producer since the 1990s.
+- **atime/ctime and `ux`/`Ux` uid/gid** extra fields: nothing asked.
 
 ## Backlog / deferred
 
-- ~~(GM review R-ZS-8) `isSafeEntryName` does not reject Windows NTFS alternate data streams or reserved device names~~ **DONE 2026-11-19:** `isSafeEntryNameOpts(name, .{ .windows })` (and `ExtractOptions.windows_names`) refuse a `:` anywhere and any segment whose base name (cut at the first `.`/`:`, trailing spaces trimmed, ASCII case-insensitive) is `CON PRN AUX NUL COM1-9 LPT1-9` (+ superscript digits) `CONIN$ CONOUT$`. **Default: on only when built for Windows** (`isSafeEntryName` is `isSafeEntryNameOpts(name, .{})`). Decision rule: reference/majority. Go `filepath.IsLocal` (used by `archive/zip` ErrInsecurePath) is OS-dependent: on Windows it rejects any `:` and the reserved names above (read from `internal/filepathlite/path_windows.go`), on POSIX it does neither; Python `zipfile` and libarchive likewise sanitise only when extracting on Windows. Always-on would refuse ordinary POSIX names (`2026-11-19T10:00.log`, `aux.c`) that legitimate archives carry, so the stricter rules are opt-in elsewhere for an extractor targeting Windows. Trailing dots/spaces are not checked (Go does not). `ArchiveWriter` uses the native default.
+Numbering `R<n>` is the S2 parity survey's (Go `archive/zip`, zip2, Python `zipfile`, libzip, minizip-ng).
 
-### Scope parity gap list (S2 re-survey 2026-10-20)
-
-Owner rule (2026-10-16): S2 = every SUBSTANTIAL feature of the leading competitors is present or
-deliberately excluded with a reason; speed rows go to Backlog, not a condition. Sources: Go
-`archive/zip` (BSD-3, stdlib docs), zip2 (MIT, cloned 2026-10-20: README support table, `write.rs` /
-`read/*.rs` API surface), Python `zipfile` (PSF, docs), libzip (BSD-3, docs/man pages), minizip-ng
-(zlib licence, README feature list; not cloned). Items marked *(inferred)* come from documentation
-recollection, not from a source read this run. The build-tool consumer column: the build-tool consumer uses only `Archive`, `Entry`,
-`EntryReader` (xlsx ingest and the parallel `zipPrePass`), read side, Store + Deflate; it opens one
-independent `Archive` per worker because the module is single-cursor.
-
-| # | Feature | Who has it | Effort | Recommendation | Consumer |
-|---|---|---|---|---|---|
-| R1 | Reader over any random-access source, not only `std.Io.File`: in-memory slice, `ReaderAt` + size | Go `NewReader(ReaderAt, size)`, Python (file-like), zip2 (`Read + Seek`), libzip sources | S-M (a small `Source` vtable: `readAt(offset, buf)`; the File case stays the default) | **DONE 2026-10-20** (`Source` / `FileSource` / `MemorySource`, `Archive.initSource`) — do | yes (xlsx from memory, network buffers, tests without files) |
-| R2 | Several entries open at once / thread-safe positional reads (Go's `ReaderAt` design lets concurrent `Open`s share one `Reader`) | Go, libzip (via sources) *(inferred)* | M (follows from R1: `EntryReader` carries its own offset instead of the shared cursor; today the build-tool consumer's `zipPrePass` re-opens the file once per worker) | **DONE 2026-10-20** (each `EntryReader` its own cursor; threads tested) — do (with R1) | yes |
-| R3 | Zstandard (method 93) read + write | zip2, libzip, minizip-ng; Python 3.14 *(inferred)* | S-M glue over sibling `zstd` (adds a module dependency; streaming API check needed) | **DONE 2026-10-20** (`.zstd` via the `zstd` module, read and write) — do | no |
-| R4 | zip64 **writing** (> 4 GiB, > 65535 entries; the zip64 extra in local + central header, EOCD64 + locator) | Go, zip2, Python (`allowZip64`, `force_zip64`), libzip, minizip-ng | M | **DONE 2026-10-20** (automatic + `force_zip64`, `allow_zip64`) — do (needed together with R5, since an unknown size forces the zip64 decision up front) | no |
-| R5 | Streaming writes with data descriptors (general-purpose bit 3): the entry is written as the producer delivers bytes, sizes and CRC follow; `ArchiveWriter.beginEntry() -> *std.Io.Writer`, no buffered compressed copy | Go `Create`, Python `open(name, "w")`, zip2 `start_file` + `Write`, libzip (via sources), minizip-ng | M | **DONE 2026-10-20** (`beginEntry` / `endEntry`, data descriptor) — do | no |
-| R6 | Archive comment and per-entry comment, read and write | Go `Comment`, Python `comment`, zip2 `set_comment`, libzip, minizip-ng | S | **DONE 2026-10-20** (`Entry.comment`, `Archive.comment`, `AddEntryOptions.comment`, `ArchiveWriter.comment`) — do | no |
-| R7 | Raw `extra` field exposed on read, caller-supplied extra on write (besides the `UT` record we add) | Go `FileHeader.Extra`, zip2 `extra_data`, Python `ZipInfo.extra`, libzip | S | **DONE 2026-10-20** (`Entry.extra`, `AddEntryOptions.extra`) — do | no |
-| R8 | Directory entries: writer `addDirectory` (name with trailing `/`, mode 040755) and an option to LIST them (the reader skips them by design) | Go lists them and writes via a trailing-slash `Create`, zip2 `add_directory`, Python `mkdir` (3.11) | S | **DONE 2026-10-20** (`addDirectory`, `Options.list_directories`) — do (keep skip as the default, add `Archive.Options.list_directories`) | no |
-| R9 | Symlinks: `Entry.isSymlink()` on read (mode S_IFLNK), `addSymlink` on write | zip2 `add_symlink`, libzip, Go (`Mode()` carries `ModeSymlink`) | S | **DONE 2026-10-20** (`Entry.isSymlink`, `addSymlink`) — do-later (mode is already read and written; this is a helper and a test) | no |
-| R10 | Raw copy of an entry between archives without recompression, and raw read of the compressed bytes | Go `Copy`, `CreateRaw`, `OpenRaw`; zip2 `raw_copy_file`, `merge_archive`, `by_index_raw`; libzip | S-M | do-later | no |
-| R11 | Append to / modify an existing archive: append mode; delete, replace, rename entries | Python `"a"`, zip2 `new_append`, libzip (full editing), Go (`SetOffset` only) | M (append: rewrite central directory), L (in-place edit with compaction) | append: do-later; in-place edit/rename/delete: not-doing, reason: it is libzip's whole charter (a source abstraction + transactional update), the rebuild via R10 raw copy covers it | no |
-| R12 | Extract to a directory: zip-slip safe, restores mode and mtime, symlink policy | Python `extractall`, zip2 `extract`, Go (`fs.FS` + `os.CopyFS`), `std.zip.extract` | S-M (the zip-slip predicate exists; file creation goes through `std.Io.Dir`) | **DONE 2026-10-20** (`extractAll` (zip slip, total cap, symlink policy, mode/mtime)) — do (with an explicit symlink and total-size policy; it is where zip-slip actually bites) | no |
-| R13 | Directory tree as source: `addTree` / Go `Writer.AddFS` | Go, zip2 (`add_directory` + walk, `write_dir`) *(inferred)* | S | do-later | no |
-| R14 | Non-UTF-8 names: the Info-ZIP Unicode Path extra field (0x7075) and CP437 / caller-chosen legacy encoding for names without bit 11 | zip2 (decodes CP437 and 0x7075), Python (`metadata_encoding`, cp437 default), libzip, Go (flags `NonUTF8`, leaves bytes) | S (0x7075), S-M (CP437; table lives in sibling `encoding`, which lacks CP437: see `encoding` R12, cross-module dependency) | **DONE 2026-10-20** (0x7075 Unicode Path, `legacy_names = .cp437` via `encoding`) — 0x7075: do; CP437: do-later after `encoding` R12 | no |
-| R15 | Compression methods: bzip2 (12) | zip2 (r+w), Python (r+w), libzip, minizip-ng | L: no `bzip2` module in zig-libs; decoder M, encoder L | **DONE 2026-10-20** (`bzip2_codec`, `WriteMethod.bzip2` via the new `bzip2` module; Python zipfile fixture) — **OWNER 2026-10-20: do** — new zig-libs module `bzip2` (decoder + encoder), then zipstream glue — do-later, as a NEW sibling module (`bzip2`) with zipstream glue; owner decision on whether any consumer justifies it | no |
-| R16 | LZMA (14) / XZ (95) | zip2 (LZMA read, XZ r+w), Python (LZMA r+w), libzip, minizip-ng | L: no `lzma` module in zig-libs | **DONE 2026-10-20** (`lzma_codec` method 14 with the APPNOTE 4+5-byte header and bit 1, `xz_codec` method 95, via the new `lzma` module; Python zipfile fixture both ways) — **OWNER 2026-10-20: do** — new zig-libs module `lzma` (LZMA/XZ), after R15 — do-later, as a new sibling module, after R15; same owner decision | no |
-| R17 | Deflate64 (9) read; Implode/Shrink/Reduce (legacy PKZIP methods 1-6) read | Deflate64: zip2 (read), minizip-ng *(inferred)*; legacy methods: zip2 read, Info-ZIP unzip | M (Deflate64 needs its own inflater, `std.compress.flate` cannot do it) | Deflate64: do-later (real-world .NET / Windows Explorer output above 4 GiB); Implode/Shrink/Reduce: not-doing, reason: no producer since the 1990s | no |
-| R18 | PPMd (98) | zip2 (r+w) | L | not-doing: only zip2 has it, no real producer besides 7-Zip's option | no |
-| R19 | Custom codec registry: caller registers `(method id, decompressor, compressor)` | Go `RegisterDecompressor` / `RegisterCompressor`, zip2 (`CompressionMethod::Unsupported(id)` raw) | S (a method vtable on `Archive.Options`/`AddEntryOptions`) | **DONE 2026-10-20** (`Codec`, `Archive.Options.codecs`, `WriteMethod.custom`) — do (cheapest route to R15-R18 without new dependencies: a consumer plugs its own codec) | no |
-| R20 | Encryption, read: ZipCrypto (legacy) and WinZip AES AE-1/AE-2 | ZipCrypto: Python, zip2, libzip, minizip-ng; AES: zip2, libzip, minizip-ng (not Python, not Go) | ZipCrypto decrypt S; AES M (needs PBKDF2-HMAC-SHA1 + AES-CTR + HMAC check; sibling `aes192` has CTR, `hashdigest`/`sha2` the hashes; verify that PBKDF2 exists in-tree before estimating) | **DONE 2026-10-20** (WinZip AES AE-1/AE-2 + ZipCrypto read (7-Zip / Info-ZIP fixtures)) — **OWNER 2026-10-20: do** — WinZip AES read and ZipCrypto read (never ZipCrypto write) — ZipCrypto read: do-later (password option, legacy files in the wild, key stream is trivially weak but reading is harmless); AES read: do-later; ZipCrypto write: not-doing (broken cipher, the earlier decision stands) | no |
-| R21 | Encryption, write: WinZip AES | zip2, libzip, minizip-ng | M | **DONE 2026-10-20** (WinZip AES AE-2 write (7-Zip tested the golden)) — **OWNER 2026-10-20: do** — WinZip AES write — do-later, after R20 | no |
-| R22 | Alignment of stored data (`zipalign` style, APK/OOXML tooling) and "first entry Store" (EPUB `mimetype`) | zip2 `start_file_aligned`, libzip *(inferred)* | S (extra-field padding on write) | do-later | no |
-| R23 | Archive-wide integrity check (`testzip`: decode everything, verify every CRC) and a ratio/overlap check on the central directory against zip-bomb quines | Python `testzip`; overlap checks: none of the surveyed libraries documents one *(inferred)*, which makes this a lead rather than parity | S (verify), M (overlap) | verify: do-later; overlap detection: do-later (our size cap already stops the 42.zip class, not a quine reading overlapping ranges) | no |
-| R24 | Multi-disk / spanned / split archives | minizip-ng, libzip (read only, partly) *(inferred)*; zip2, Go, Python do not | M | not-doing, reason: the leaders do not; disk numbers are already read as one concatenated archive | no |
-| R25 | Async reader/writer | rs-async-zip | -- | not-doing, reason: everything here is `std.Io`-based already (the reader takes an `Io`), concurrency is the caller's choice | no |
-| R26 | Use the sibling `crc32` module (hardware backends, `combine`) instead of std's CRC-32 in `CrcReader` and the writer | -- (internal; `crc32` module exists in-tree) | S (adds a dependency) | **DONE 2026-10-20** (the `crc32` module (store rows 10.9× → 0.5×)) — do-later, as a speed row (see P bench); `combine` also enables parallel CRC over chunks | speed only |
-
-Already done: Store + Deflate read/write, zip64 read, mtime/mode with all four extra encodings, UTF-8
-name flag on write, compression level on write (`AddEntryOptions.level`), prepended-stub tolerance, CRC
-check against the central directory, zip-slip gate on both sides, bomb cap, encrypted entries listed and refused.
-
-**P bench proposal.** Reference = Go `archive/zip` (pattern `modules/tz/tools/go_bench`; stdlib only,
-`GOPROXY=off`). Fastest-in-field rows = C: `libdeflate` (MIT; inflate/deflate, single-directory C source,
-compile with `cc -O3` from a pinned clone under `.zig-cache`) wrapped by a minimal ZIP reader in
-`c_bench/driver.c`, or `libzip` (BSD-3) with zlib-ng if the toolchain has it (pattern
-`modules/decimal/tools/mpdec_bench`); zip2 (Rust) optional behind a pinned clone. Rows, all on one
-generated archive set (seeded): (1) xlsx-shaped archive: 12 entries, one 200 MB sheet of repetitive XML
-at deflate level 6, stream-extract the large entry (inflate + CRC bound: the row the build-tool consumer feels; shows
-`std.compress.flate` against libdeflate and Go); (2) the same entry Stored, 1 GiB (CRC bound; shows R26);
-(3) central-directory open: 100 k tiny entries, time to `Archive.init` + `find` (Go `NewReader`, zip2);
-(4) many small entries streamed one by one (per-entry setup cost); (5) writer: 256 MiB text into Deflate
-level 6 and Store, compression ratio reported next to MB/s (std's compressor is not zlib's, so ratio
-must be shown or the row misleads). Metric: MB/s of uncompressed data, min of 5, ReleaseFast, single
-thread; ratios on the `**Performance:**` line.
-
-### Earlier entries (kept for the record)
-
-- ~~**SUSPECTED: std 0.16 `flate.Decompress` panic reachable from a crafted archive**~~ **CONFIRMED and
-  fixed 2026-10-11.** Any proper prefix of an ordinary deflate stream, decoded to the end of its input,
-  reaches `unreachable` in std's `tossBits` via `tossBitsShort` (no crafting needed; measured on every
-  prefix of a 3.9 KB stream). Reachable here when an entry's data runs to end of file, e.g. a local
-  header in the EOCD comment. Fix: the decoder reads `PaddedInput` -- exactly `compressed_size` bytes
-  of the file (Go's SectionReader bound), then zeros, so it never sees an end of input; what the zeros
-  decode to is refused by the CRC-32 check or by the decoder. Found alongside: `CrcReader` checked only
-  on the read AFTER the last byte, so a consumer reading exactly `uncompressed_size` bytes got corrupted
-  content with no error; it now checks on the read that reaches the declared size and withholds that
-  read's bytes. Test: "a deflate stream cut short at end of file" (every prefix length).
-zip64 **writing** (`ArchiveWriter` is classic-format only — zip64 reading is fully supported, see
-"Design & invariants"; not worth the extra-field/EOCD64 bookkeeping until a real >4 GiB or
->65535-entry write use case shows up); encrypted entries (no consumer needs authoring/reading
-password-protected members, and ZipCrypto's legacy stream cipher is cryptographically broken — not
-worth building even for read-only support; AES per WinZip AE-x would be a genuine but currently
-unneeded addition); compression methods beyond Store/Deflate (bzip2, LZMA, …) — Store/Deflate are the
-two methods ordinary zip tools and Excel emit, no observed producer needs the rest. (README "Deferred
-(not built)".)
-
-- ~~**Entry modification time (and permissions) on read and write**~~ *(survey 2026-09-30)* — **DONE
-  2026-09-30** (see "Design & invariants"); NTFS (0x000a), PKWARE Unix (0x000d) and `UX` (0x5855) mtimes
-  read since 2026-10-05 (the Go oracle showed them). Not done: atime/ctime,
-  and `ux`/`Ux` uid/gid — nothing asked.
-- ✅ DONE 2026-10-20 (`a93a190be`: `ArchiveWriter` writes zip64 automatically, `force_zip64` / `allow_zip64`; see CHANGELOG, S2 batch). **zip64 writing** *(survey 2026-09-30)*: already deferred above; Go and zip2 write it. Matters at
-  > 4 GiB or > 65535 entries. Effort M. Fits §2.
-- ✅ DONE 2026-10-20 (`a93a190be`: streamed `beginEntry`/`endEntry` with a data descriptor). **Data-descriptor streaming writes** *(survey 2026-09-30)*: `addEntry` needs the whole payload up
-  front and buffers its compressed copy; a producer with unknown size cannot stream in. Effort M.
-  Fits §2.
-- ✅ DONE 2026-10-20 (`a93a190be`: `.zstd` (method 93) and `Codec` entries; zstd, bzip2 and LZMA/XZ come through `zstd_codec` & co., `root.zig` deps). **Zstandard (method 93) and other methods** *(survey 2026-09-30)*: zip2 reads/writes Zstandard, Bzip2,
-  XZ; the sibling `zstd` module makes method 93 the cheapest addition. Effort M for zstd (glue
-  over sibling `zstd`, adds a dependency); bzip2/LZMA/XZ Effort L each and only if a consumer
-  asks. Fits §2.
-- Encryption stays where the SPEC put it (ZipCrypto broken, AES unneeded).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 3 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-### No-panic sweep GM (2026-10-29) — open decisions
-
-- **Archive memory is O(archive size), uncapped.** `Archive.init` lists every central-directory record
-  (about 3-4x the 46 header bytes of heap per entry); a hostile multi-GiB archive of empty members costs
-  gigabytes. Bounded by the input, not by an option. Candidate: `Options.max_entries` (default unlimited
-  or generous). Not added: new limit, needs an owner decision.
-- ~~**`extractAll` restores setuid/setgid/sticky bits**~~ DONE 2026-10-29 (§ GM, owner-delegated safe default):
-  masked to 0o777 unless `ExtractOptions.restore_special_bits` (Info-ZIP `unzip -K` semantics).
-- Zstandard window is now `Options.zstd_window_log_max` (default 27 = 128 MiB per open entry, unchanged).
-  lzma (default `max_dict` 64 MiB) and bzip2 (about 4 MiB) stay at their module defaults; no zipstream option.
-
-## Status
-`extract · any · codec (reader + writer) · reentrant` + deps: none (std only) — canonical source is
-`pub const meta` in src/root.zig.
+- **R10 raw copy:** copy an entry between archives without recompression, and raw read of the compressed bytes (Go
+  `Copy` / `CreateRaw` / `OpenRaw`; zip2 `raw_copy_file`, `merge_archive`; libzip). Effort S-M. It is also the
+  route to editing by rebuilding.
+- **R11 append:** append mode (rewrite the central directory), as Python `"a"` and zip2 `new_append`. Effort M.
+- **R13 directory tree as source:** `addTree`, Go `Writer.AddFS`, zip2 `add_directory` + walk. Effort S.
+- **R17 Deflate64 (9) read:** needs its own inflater (`std.compress.flate` cannot do it); real-world .NET / Windows
+  Explorer output above 4 GiB. Effort M.
+- **R22 alignment of stored data** (`zipalign` style, APK/OOXML tooling) and "first entry Store" (EPUB `mimetype`):
+  extra-field padding on write. Effort S.
+- **R23 archive-wide integrity check** (Python `testzip`: decode everything, verify every CRC) and an overlap check on
+  the central directory against zip-bomb quines (none of the surveyed libraries documents one, a lead rather than
+  parity). The size cap already stops the 42.zip class, not a quine reading overlapping ranges. Effort S (verify), M
+  (overlap).
+- **`Archive.Options.max_entries`:** cap the entry list (default unlimited or generous) so a hostile archive cannot cost
+  gigabytes (see *Limits*). A new limit, needs an owner decision.
+- **Zstandard / lzma / bzip2 limits through zipstream:** only the Zstandard window has an `Archive` option; lzma and
+  bzip2 stay at their module defaults (see *Limits*). Add options only if a consumer asks.
 
 ## Anchoring
 
@@ -324,14 +306,3 @@ shapes, zip64), 12 listed divergences each decided by Info-ZIP unzip 6.0 / zipin
 plus real Info-ZIP and LibreOffice archives (`testdata/infozip_*.zip`, `xlsx_sample.xlsx`); writer: Go
 reads this module's ArchiveWriter output (methods, modes, times to 2106, non-ASCII names; the replay
 rewrites Go's view and requires the same bytes), plus the unzip/zipinfo-checked goldens.
-
-**Go oracle 2026-10-05.** `tools/go_oracle/` (stdlib only) answers this module's own cases;
-`zig build interop-zipstream` re-takes it (`-- --regen` rewrites the vectors; `go run . -dump DIR`
-writes every read case as a file for unzip). Defects it found, fixed the same day: one entry with an
-unsupported method made the whole archive unreadable; a malformed extra field did too (contradicting
-this SPEC); a stored entry whose sizes disagree was read past its end; self-extractor archives,
-multi-disk-flagged and under-sized directories that unzip and Go read were refused; the UT time was
-read signed (2100 came back as 1963) and the writer dropped it after 2038; a non-ASCII UTF-8 name was
-written without the UTF-8 flag; NTFS/Unix extra-field times were ignored.
-
-**How it got there.** The anchoring work landed. DONE 23312c0: unzip/zipinfo agreement was PROSE ONLY; now a committed archive
