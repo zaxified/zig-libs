@@ -673,7 +673,7 @@ test "File.realPath of a file in the root directory" {
     try testing.expectEqualStrings("/top.txt", out[0..len]);
 }
 
-// ── review findings (2026-10-01) ───────────────────────────────────────────
+// ── review findings ───────────────────────────────────────────
 
 fn defaultStdio(io: Io, got_eof: *bool) !void {
     // `writer`/`reader` start positional; stdio must answer `Unseekable` so

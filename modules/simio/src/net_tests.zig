@@ -859,7 +859,7 @@ test "socketpair is refused, as std 0.16 on Linux refuses it" {
     try testing.expect(err != null);
 }
 
-// ── review findings (2026-10-01) ───────────────────────────────────────────
+// ── review findings ───────────────────────────────────────────
 
 fn blackHoleClient(io: Io, to: net.IpAddress, out: *?anyerror) !void {
     const s = try to.connect(io, .{ .mode = .stream });

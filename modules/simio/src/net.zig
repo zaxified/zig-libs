@@ -1362,10 +1362,6 @@ const Gather = struct {
 /// (ports compared by the caller). A wildcard is per family, as on Linux:
 /// `0.0.0.0` is an AF_INET socket and never sees IPv6, while `::` (with
 /// IPV6_V6ONLY off, the Linux default std leaves alone) also takes IPv4.
-/// Before 2026-10-17 `0.0.0.0` took IPv6 too, so std's `HostName.connect`,
-/// which connects to every resolved address at once, got two accepted-or-
-/// queued connections from one lookup; which one it kept depended on the
-/// schedule (the `timeouts` pilot went red on an unrelated http change).
 fn boundMatches(local: net.IpAddress, dst: net.IpAddress) bool {
     if (!isUnspecified(local)) return sameIp(local, dst);
     return local == .ip6 or dst == .ip4;

@@ -20,7 +20,7 @@
 //! list (on Linux it is an ordinary temporary LLVM allocates), and `x30` is,
 //! but a ReleaseSafe build for an SVE CPU still kept the current `*Fiber` in
 //! `x30` across the asm (llvm-objdump of `maybeYield`). Seen as a Bus error in
-//! `example-simio` on the arm64 CI runner (tag 2026-10-06 matrix) and as a
+//! `example-simio` on the arm64 CI runner (tag matrix) and as a
 //! wild `Host` pointer after `maybeYield` under qemu-aarch64 (`cortex-a72`
 //! for x18, `neoverse-n2` for x30). The asm now pushes both before it saves
 //! `sp` and pops them where it resumes, so neither depends on the clobber
