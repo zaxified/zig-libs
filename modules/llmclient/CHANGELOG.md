@@ -5,11 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (364 mutants, 355 killed, 9 equivalent or unobservable, none surviving); 25 tests added, no source change; the card records `mutation 2026-11-17 (355/364, 9 eq)`.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `writeRequestObject` reflects with `@typeInfo(T).@"struct".field_names/field_types`; test `ReadCueIo` uses `vtable.operate`; the `max_response_bytes` exact-count test moved one byte down (`L-1` refused / `L` accepted) because `http` `readAllAlloc(max)` now accepts exactly `max` (documented limit "over max" is unchanged).
 - **2026-10-10** — tests: deterministic fuzz driver `LLMCLIENT_FUZZ`: `llmclient-sse-parse`, `llmclient-message`, `llmclient-stream-event`, `llmclient-token-count` over the existing harnesses (driver draws a corpus string with 0-3 octets damaged), each now also parsing a well-formed document whose fields must come back; and `llmclient-sse-stream` (events written the way a server writes them -- BOM, comments, LF/CRLF, event/id/retry/data fields -- parse back to exactly those events). A count above i64 max arriving as a `number_string` is refused by design and kept out of the genuine range. No source change.
@@ -45,12 +42,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   - Anchored to Anthropic's published docs examples (vision, PDF, citations, prompt caching,
     token counting; JSON-compared). `scripts/modtest llmclient`: 51 → 71 pass (+1 skip).
 
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the threat-model out-of-scope line now lists `count_tokens`, files/vision content blocks and the Batch API as "not yet — see Backlog".
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `create` and `EventIterator.next` body-read cancel tests canceled after a fixed
-  sleep. Both now cancel once the client is inside the socket read under test (`ReadCueIo`, a
-  `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
-  before `join`. On a loaded full gate the sleep could land the cancel before the connect. The
-  peer thread then waited in `accept` forever, the shape that hung `http` in full-gate attempt 3.
 
 - **2026-09-10** — **BEHAVIOURAL, not breaking — the remaining 16 A1 findings (F6-F8,
   F11-F14, F16-F24), all closed.** A stream event whose `event:` name disagrees with its

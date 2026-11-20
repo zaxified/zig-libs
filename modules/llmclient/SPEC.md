@@ -16,6 +16,8 @@
 
 **Downstream consumer:** no
 
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: the README's `Provenance:` line.
+
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. The SDK
@@ -49,12 +51,10 @@ for these are JSON-compared against Anthropic's own published examples.
 mode (→ Backlog). None blocks a single-request Messages API user; that is why the scope is
 `core`, not `parity`.
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
-the zig-libs authors (MIT).
-
 ## Design & invariants
+
 An Anthropic Messages API client (`POST /v1/messages`) layered over the sibling `http` module:
-buffered `Client.create` and a streaming `Client.stream`/`EventIterator` built on a new
+buffered `Client.create` and a streaming `Client.stream`/`EventIterator` built on a
 client-side SSE line-accumulator (`sse_parse`, following the WHATWG "server-sent events" grammar —
 `http.sse` only implements the server write side, there was no client-side consumer anywhere else
 in this repo). `http.Client`'s h1 stack does real HTTPS via `std.crypto.tls` (the BYO-TLS caveat
@@ -74,48 +74,58 @@ Concurrency: single-owner, like `http.Client` itself — one task drives a `Clie
 non-2xx response body (server-side error detail, not a caller secret) for diagnostics. Clean-room
 implementation from the public Anthropic Messages API documentation (request/response JSON shapes,
 streaming event sequence, tool-use shape) and the WHATWG HTML Living Standard §9.2 (SSE parsing
-grammar) — see NOTICE. No third-party client library or SDK code copied.
+grammar) — see the README's `Provenance:` line. No third-party client library or SDK code copied.
+
+**Request surface.** `MessageRequest` carries `system` (plain string) and `system_blocks` (array of
+text blocks, each with an optional `cache_control`; both set: the string goes first as an uncached
+block), tools, `tool_choice` and `thinking`. Content blocks cover text, thinking, tool use / result,
+base64 and url images, base64 / url / plain-text documents (`title`, `context`, `citations`) and
+`cache_control` on blocks; the returned citations are raw JSON objects on `ContentBlock.text.citations`,
+streamed as `Delta.citations_delta`. Image/document blocks and server-tool result blocks in a
+response parse as `ContentBlock.other`. Request bodies are JSON-compared against Anthropic's own
+published examples (see *Verification*); the byte-exact field order and the system-string/blocks
+merge rule are self-derived goldens.
 
 ## Threat model / out of scope
+
 The API key is a bearer credential handled like any HTTP client credential: held in memory for the
 `Client`'s lifetime, never logged, sent only over the (real, `std.crypto.tls`) HTTPS connection to
 `base_url` — **and to no other host, whatever the peer says.** A caller who overrides `base_url`
 (e.g. to a proxy) chooses where the key is sent; a peer that answers a 3xx does not: redirects are
 never followed (`follow_redirects = false` on every request), and a 3xx is `error.UnexpectedStatus`
-with its body in `lastErrorBody`. Measured 2026-09-06 (A1 F1) before that line existed: one
-`Location:` from `base_url` sent `x-api-key` and the whole prompt to a host of the peer's choosing
-and `create` returned `OK` — `http.Client` strips `Authorization`/`Cookie` across an origin change
-but cannot know `x-api-key` is a credential, and even a same-origin hop resends the prompt.
+with its body in `lastErrorBody`. Without that line one `Location:` from `base_url` sent `x-api-key`
+and the whole prompt to a host of the peer's choosing and `create` returned `OK`: `http.Client`
+strips `Authorization`/`Cookie` across an origin change but cannot know `x-api-key` is a credential,
+and even a same-origin hop resends the prompt.
 
 **Bounds, and which quantity each one bounds.** The peer controls the size of everything it sends
 and the pace at which it sends it; each of the four is bounded by a knob on `Client`:
 - `max_response_bytes` (10 MiB) — bytes ON THE WIRE of a buffered body. That is not what a body
-  costs: 7.8 MB of one-character content blocks parsed into 310 MiB of `std.json` nodes under it
-  (A1 F5), so
+  costs: 7.8 MB of one-character content blocks parsed into 310 MiB of `std.json` nodes under it, so
 - `max_parsed_bytes` (64 MiB) — the memory a response's or an event's parse may allocate, enforced by
   a `BoundedAllocator` over the parse arena; past it, `error.ResponseTooLarge` and the arena is
   released, never `OK` with a giant tree.
 - `max_event_bytes` (1 MiB) — one SSE dispatch group's joined `data:` payload
-  (`sse_parse.Parser.max_data_bytes`). Each line is bounded by the reader (~4 KiB); the number of
-  lines in a group was not, and 10 MB of legal lines made 2.4 GB live that stayed allocated after
-  the error (A1 F3/F15). Past it, `error.ResponseTooLarge` and the buffers are freed.
+  (`sse_parse.Parser.max_data_bytes`). Each line is bounded by the reader, but the number of lines in
+  a group is not: 10 MB of legal lines made 2.4 GB live. Past the cap, `error.ResponseTooLarge` and
+  the buffers are freed.
   **The effective per-line ceiling is 4088 bytes, not ~4 KiB** — it comes from `http`'s own
-  `body_scratch_len = 4096` (`body_scratch_len` in `http/src/Client.zig`), which is not configurable and which this
-  module does not otherwise surface (A1 F13). A single SSE line past it is `error.LineTooLong`
+  `body_scratch_len = 4096` (in `http/src/Client.zig`), which is not configurable and which this
+  module does not otherwise surface. A single SSE line past it is `error.LineTooLong`
   from `sse_parse`, which `EventIterator.next` maps to `error.HttpFailed` — indistinguishable from
-  a dead connection (see F14 below) unless the caller already knows about this ceiling. Not a knob
+  a dead connection unless the caller already knows about this ceiling. Not a knob
   on `Client`: raising it would require a change in `http`, not here.
 - `read_timeout_ms` (60 s) — the body read: the whole body for `create`, each `next()` for a stream.
   `http.Client.total_timeout_ms` covers connect + request + response HEAD and, by its own design,
   not the body; a peer trickling one byte a second held `create` 30 s against a 2 s total timeout
-  and a stream 60 s, both ended by the peer (A1 F4). Enforced by racing the read on a concurrent
+  and a stream 60 s, both ended by the peer. Enforced by racing the read on a concurrent
   task (the same shape `http.Client` uses for its total timeout); when the `std.Io` cannot spare a
   unit of concurrency the read runs unbounded, as `http.Client`'s does.
 
 **Numbers from the wire are checked, not cast.** A content-block `index` above `u32`, or a
-`usage` count that is negative, ≥ 2^64, or not finite, is `error.MalformedResponse`. They were
-`@intCast`/`@intFromFloat` on the raw value: a panic in Debug/ReleaseSafe and a silently wrong
-`index`/billing number in ReleaseFast (A1 F2).
+`usage` count that is negative, ≥ 2^64, or not finite, is `error.MalformedResponse` (a raw
+`@intCast`/`@intFromFloat` would panic in Debug/ReleaseSafe and give a silently wrong
+`index`/billing number in ReleaseFast).
 
 `sse_parse` makes two deliberate,
 documented simplifications vs. the full WHATWG grammar (LF/CRLF only, no persisted "last event ID
@@ -125,137 +135,94 @@ generic browser-grade parser; malformed/hostile SSE bytes resolve to typed error
 `error.ResponseTooLarge`; `ReadFailed` goes through
 `http.Client.Response.readFailure()` first and surfaces as `error.Canceled` when a
 `std.Io` cancelation is the real cause, `error.HttpFailed` otherwise), not panics. Out of
-scope: OpenAI-compatible variant, retries/429 backoff (compose with `resilience` instead),
-and prompt-caching tooling beyond the plain `cache_control` field. Not yet — see Backlog:
-the Files API and the Batch API.
+scope: see *What is deliberately not done*; not yet built: see *Backlog / deferred*.
 
-**`count_tokens` and `anthropic-beta` (2026-10-06).** `countTokens` goes through the same
+**`count_tokens` and `anthropic-beta`.** `countTokens` goes through the same
 buffered path as `create` (`postBuffered`: same headers, `max_response_bytes`,
 `read_timeout_ms`, redirect refusal, `max_parsed_bytes` on the parse), so it inherits every
 bound above. Its response parser fails closed: `input_tokens` absent, non-numeric, negative,
-≥ 2^64 or not finite is `error.MalformedResponse`, never a silent 0 (fuzzed:
-`fuzz parseTokenCount never panics`). `Client.betas` entries are checked against
+≥ 2^64 or not finite is `error.MalformedResponse`, never a silent 0 (fuzzed by the
+`llmclient-token-count` harness). `Client.betas` entries are checked against
 `A-Z a-z 0-9 . _ -` before any connection is made (`error.InvalidBeta`), so a caller-supplied
 name cannot add a header line or split the comma-joined list; `http.Client`'s own header
 validation would also refuse CR/LF, but as an indistinguishable `HttpFailed`. Base64 image/PDF
 data is the caller's and goes on the wire verbatim (JSON-escaped like any string).
 
-**Connection reuse is entirely the caller's call, not this module's (A1 F22, corrected 2026-09-10).**
-Two places in this module's docs (this file's own Out-of-scope line and the README's DEFER list)
-used to claim "`http.Client` opens a fresh connection per request (`Connection: close`)" — that was
-never true of the code: `requestHeaders()` sends no `Connection`
-header at all, and `http.Client.Options.pool.enabled` **defaults to `true`** (`Options.pool` in `http/src/Client.zig`).
-`Client.init` takes a caller-owned, caller-configured `*http.Client` ("share it with other
-subsystems freely" — see the design comment above) and has no lever of its own to force or forbid
+**Connection reuse is entirely the caller's call, not this module's.**
+`requestHeaders()` sends no `Connection` header, and `http.Client`'s `Options.pool.enabled`
+**defaults to `true`**. `Client.init` takes a caller-owned, caller-configured `*http.Client`
+("share it with other subsystems freely") and has no lever of its own to force or forbid
 pooling on it — there is no per-request override in `http.RequestOptions`, only the transport-wide
 `Options.pool` the caller set when they built it. So whether two `create`/`stream` calls through
 the same `Client` reuse a TCP/TLS connection is whatever the caller's `http.Client` was configured
 to do (pooled by default), not a guarantee either way this module makes.
 
 ## Verification
-Tests span `root.zig`/`Client.zig`/`response.zig`/`sse_parse.zig`/`types.zig` (dark-aggregated
-via the `test { _ = ...; }` block in root.zig). Covers: golden request headers/URL construction,
-non-2xx → `error.UnexpectedStatus` + `lastErrorBody` round-trip, request/response type re-exports,
-JSON stringify of polymorphic content-block/tool-choice unions, response parsing of every
-`StreamEvent`/`ContentBlock` variant, and `sse_parse` line-accumulation edge cases.
 
-**External anchor, added 2026-08-01**: the hand-built "full sequence" SSE fixture above is an
-in-house re-derivation (this module's own author wrote it to match a mental model of the docs,
-never checked against an independently-published example). `response.zig`'s test "external
-anchor: Anthropic's own published basic-streaming SSE example parses byte-exact" instead embeds,
-byte-for-byte, the "Basic streaming request" → "Response" example published at
-`https://platform.claude.com/docs/en/build-with-claude/streaming.md` (fetched 2026-08-01, no API
-key used, no network call made by the committed test) — including its `ping` event, which no
-hand-built fixture in this module previously exercised — and asserts the documented literal
-values (message id, model, token counts, delta text, `stop_reason`) after running it through this
-module's own `sse_parse.Parser` + `parseStreamEvent`. This is a genuine external anchor for the
-SSE wire format and this module's parsing of it. Treated the same as this module's existing
-"clean-room from the public Anthropic Messages API documentation" framing (see the module's
-design comment above) rather than as vendored third-party data — the example illustrates a wire
-format, not creative expression, the same rationale root `NOTICE` §0 already applies to RFC/spec
-citations.
+Run: `scripts/modtest llmclient`. Tests span `root.zig`/`Client.zig`/`response.zig`/`sse_parse.zig`/`types.zig`
+(dark-aggregated via the `test { _ = ...; }` block in root.zig); the `Client` tests run against a
+loopback script server.
 
-**External anchor, added 2026-10-06 (request bodies).** Seven tests in `types.zig` take the
-cURL request bodies Anthropic publishes in
-`platform.claude.com/docs/en/build-with-claude/{vision,pdf-support,citations,prompt-caching,token-counting}.md`
-(fetched 2026-10-06, embedded verbatim; shell placeholders such as `$BASE64_IMAGE_DATA`
-replaced by one fixed value on both sides) and require this module's serialization of the same
-inputs to be the same JSON value (object key order free; `"stream":false`, which the docs omit
-and `create` always sends, removed first on `/v1/messages` bodies). Covered: base64 and url
-image, url PDF, plain-text document with `title`/`context`/`citations`, the `system` block
-array with `cache_control` (that example's `system` value only — its `messages` use the
-string shorthand this module never emits), and two whole `count_tokens` bodies (image, PDF),
-which also proves `max_tokens`/`stream` stay off that endpoint. The docs' `count_tokens`
-outputs (`{ "input_tokens": 14 }` …) are parsed verbatim in `response.zig`. The comma-joined
-`anthropic-beta` form is the one documented at `docs/en/api/beta-headers.md`. **Not** an SDK
-oracle: no official SDK was run (this module has no `tools/` recipe and no SDK in the repo);
-the docs examples are the published wire contract. Byte-exact field order and the
-system-string/blocks merge rule are SELF-DERIVED goldens.
+- Golden request headers/URL construction, non-2xx → `error.UnexpectedStatus` + `lastErrorBody`
+  round-trip, redirect refusal, the four bounds and the read deadline (including a slow-trickle peer
+  and cancelation), `BoundedAllocator` directly (growth, shrink, refusal, rollback, `remap`),
+  JSON stringify of the polymorphic content-block / tool-choice / thinking unions, response parsing
+  of every `StreamEvent`/`ContentBlock` variant (absent and wrongly typed fields, count edges), and
+  `sse_parse` line-accumulation edge cases (CRLF, BOM, comments, `id`/`retry` fields, the data cap).
+- **External anchors (published examples, no network call, no API key):** `response.zig`'s test
+  "external anchor: Anthropic's own published basic-streaming SSE example parses byte-exact"
+  embeds, byte for byte, the "Basic streaming request" → "Response" example from
+  `platform.claude.com/docs/en/build-with-claude/streaming.md` (including its `ping` event) and
+  asserts the documented literal values after `sse_parse.Parser` + `parseStreamEvent`. Seven tests
+  in `types.zig` take the cURL request bodies Anthropic publishes in the vision, pdf-support,
+  citations, prompt-caching and token-counting docs (embedded verbatim; shell placeholders such as
+  `$BASE64_IMAGE_DATA` replaced by one fixed value on both sides) and require this module's
+  serialization of the same inputs to be the same JSON value (object key order free; `"stream":false`,
+  which the docs omit and `create` always sends, removed first on `/v1/messages` bodies): base64 and
+  url image, url PDF, plain-text document with `title`/`context`/`citations`, the `system` block
+  array with `cache_control`, and two whole `count_tokens` bodies (image, PDF), which also proves
+  `max_tokens`/`stream` stay off that endpoint. The docs' `count_tokens` outputs are parsed verbatim
+  in `response.zig`; the comma-joined `anthropic-beta` form is the one documented at
+  `docs/en/api/beta-headers.md`. These are docs examples (the published wire contract), **not** an SDK
+  oracle: no official SDK was run and the module has no `tools/` recipe.
+- One live test against the real API is present but unconditionally `error.SkipZigTest`: a real
+  call needs a paid key and returns a nondeterministic body, so it cannot be a frozen offline
+  golden, and reading `ANTHROPIC_API_KEY` from a plain `test` block is not wired. Its dead-code path
+  (`if (false)`) still type-checks the real call shape, so an API-shape regression fails the build
+  without a network call. The live end-to-end call is therefore untested (see *Open*).
+- Fuzz: deterministic driver `LLMCLIENT_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver), harnesses
+  `llmclient-message`, `llmclient-stream-event`, `llmclient-token-count` (`response.zig`),
+  `llmclient-sse-parse` and `llmclient-sse-stream` (`sse_parse.zig`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-**The originally-graded `S` (assuming the skipped live test could simply be un-skipped) does not
-hold up.** A real call to `POST /v1/messages` needs a paid API key, costs money per request, and
-returns a nondeterministic body (the exact response text varies run to run) — none of which is
-compatible with a frozen, offline, checked-in golden. No API call was made or considered for this
-module. What *can* be anchored without a key is exactly the SSE wire-format shape covered above;
-the "live test currently `error.SkipZigTest`" gap in the Backlog section below is real and
-distinct from that anchor — it stays open because there is no way to close it without spending
-money on a nondeterministic response. **Recommended grade: one tier below the original `S`** —
-the SSE wire format itself is now genuinely externally anchored, but the live end-to-end call
-against the real API remains untested (and cannot be, offline, without paying for a nondeterministic
-response), so this module should not carry the same grade as one whose live path is actually
-exercised.
+## What is deliberately not done
 
-One live test
-against the real API is present but unconditionally `error.SkipZigTest` — the
-`std.process.Environ` needed to read `ANTHROPIC_API_KEY` was taken to be reachable only from `main`'s `Init`
-parameter, not from a plain `test` block (the repo's other modules read it via `std.testing.environ`, which this test does not use yet); the dead-code path (`if (false)`) still type-checks the
-real call shape so an API-shape regression fails `zig build test-llmclient` without ever making a
-network call. Run: `zig build test-llmclient`.
+- **Automatic retries / 429 backoff.** The SDKs retry 429/5xx by default; here the retry policy is
+  not duplicated: compose with the `resilience` module.
+- **Prompt-caching tooling beyond the per-block `cache_control` field** (breakpoint-placement helpers,
+  cache-hit diagnostics).
+- **Following redirects:** never, so `x-api-key` cannot leave `base_url` (see *Threat model*).
+- **A browser-grade SSE parser:** `sse_parse` takes LF/CRLF only and keeps no last-event-ID buffer
+  across dispatch groups.
 
-**Audit 2026-11-17 (whole-module mutation).** 364 schemata mutants over `Client.zig`, `sse_parse.zig`, `response.zig` and
-`types.zig` (ReleaseSafe, one build per round, each mutant under `setsid -w timeout` and `ulimit -v`, baseline first):
-every header and value of `requestHeaders`, the `anthropic-beta` join and every edge character of `validBeta`, the
-endpoint paths, `mapHttpError` and `mapParserError`, `requestOptions`' no-redirect rule, the read deadline and
-`runBounded`, every branch of `BoundedAllocator` (charge, refuse, credit, roll back, for `alloc`, `resize`, `remap` and
-`free`), the 2xx test at both edges for `create` and `stream`, the `max_*` knobs reaching the iterator, the leak-on-error
-`defer`s, the SSE field grammar (CRLF, BOM, comment, leading space, `data` cap, `id` NUL, `retry` digits), the JSON key
-and `"type"` literal of every response shape and every serializer branch. Round 1: 257 killed, 4 hung (counted killed),
-103 survived. 25 tests added (110 now): a `Client` with an empty or oversized error body, the `validBeta` edge
-characters, `mapHttpError`, `readDeadline`, direct `BoundedAllocator` tests with a fixed-buffer and a failing child
-(growth, shrink, refusal, rollback, `remap`), `stream` posting to `/v1/messages` with a clean end and an empty-data
-event and `read_timeout_ms = 0` against a slow peer, 299 accepted and 300 refused on `stream`, the two knobs reaching
-the iterator and the arena and parser buffers released after a bound hit, `countTokens` bounded, `mapParserError`, a BOM
-mid-stream, a second `id:`, an overflowing `retry:`, a line over the reader's buffer, a failing reader, every
-`response` field (thinking, signature, tool_use, deltas, stop_sequence, cache usage), absent and wrongly typed fields,
-missing nested objects, bad JSON against an allocation failure, float edges of a count (0.0, 2^64, negative), and the
-tag and fields of every `tool_choice` and `thinking` variant, `toolErrorBlock`, `MessageParam.assistant` and
-`fromMessageRequest`. Final: 355 killed, 9 equivalent or unobservable, 0 survivors. The 9: a remaining time of exactly
-0 ns (`runBounded`), a result landing inside the cancelation window (a race), an equal-size `resize` charged 0 bytes,
-a 1xx as the final status (the transport never delivers one), a read failure surfacing through the parser
-(`mapParserError`: it and the default both give `HttpFailed`, and `Canceled` arrives through `runBounded`),
-`isAllDigits`' empty guard (`parseInt` rejects an empty value the same way), the comment-line skip (`:...` parses as the
-empty field name), and `number_string` in `parseTokenCount` (`u64Field` refuses it with the same error). Not mutated:
-the `type` defaults of the request structs and the 256-byte URL buffer, which a switch cannot reach; the existing
-values and `BaseUrlTooLong` tests pin them. The module has no retry or backoff (see Compared with), so there was
-none to mutate.
+## Open
+
+- The live end-to-end call against the real API is untested (see *Verification*): it needs a paid key
+  and returns a nondeterministic body.
 
 ## Backlog / deferred
-**Survey 2026-09-30** (the pre-existing list below stays as is):
-- ~~**(survey 2026-09-30) Image / document content blocks and the `system` array-of-blocks form**~~ — DONE 2026-10-06 (`ContentBlockParam.image`/`.document`, `MessageRequest.system_blocks`).
-- ~~**(survey 2026-09-30) `count_tokens` endpoint and beta-header support**~~ — DONE 2026-10-06 (`Client.countTokens`, `Client.betas`).
-- **(survey 2026-09-30) Batch and Files APIs** — already listed below; medium. Retries stay with `resilience` (design choice), but the SDKs retry 429/5xx by default, so a short recipe or adapter would help.
-- **(2026-10-06) Smaller request-surface gaps left after the above:** block-array `tool_result` content (an image returned by a tool), top-level automatic `cache_control`, `file` image/document sources (with the Files API), per-request (rather than per-`Client`) betas, typed response blocks for server tools (today `.other`). Each small; Fits §2: yes.
 
-Per the module README's DEFER list: OpenAI-compatible variant (sketched only); retries/429 backoff
-(defer to `resilience`); prompt-caching tooling beyond `cache_control`; the Files API; the
-Batch API
-(`/v1/messages/batches`); upstreaming `sse_parse` as `http.sse.ClientReader` once a second
-client-side-SSE consumer exists in
-this repo.
-
-## Status
-`gap · any · client · single_owner` + deps: `http` — canonical source is `pub const meta` in
-src/root.zig.
+- **Batch API** (`/v1/messages/batches`) and **Files API** (with `file` image/document sources that
+  reference it). Medium.
+- **Smaller request-surface gaps:** block-array `tool_result` content (an image returned by a tool),
+  top-level automatic `cache_control`, per-request (rather than per-`Client`) betas, typed response
+  blocks for server tools (today `.other`). Each small; fits §2.
+- **OpenAI-compatible variant** (`chat/completions` request/response mapping): sketched only, a fairly
+  mechanical follow-up once a second consumer needs it.
+- **A short retry recipe or adapter over `resilience`**, since the SDKs retry 429/5xx by default.
+- **Upstream `sse_parse` as `http.sse.ClientReader`:** it is fully generic SSE parsing with nothing
+  Anthropic-specific in it; belongs in `http` once a second consumer needs client-side SSE.
 
 ## Anchoring
 
@@ -265,5 +232,3 @@ src/root.zig.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** src/response.zig parses Anthropic's own published basic-streaming SSE example byte-exact, including a `ping` event no hand-built fixture had; since 2026-10-06 src/types.zig also JSON-compares image/document/system-array/count_tokens request bodies against Anthropic's published docs examples, and src/response.zig parses the docs' count_tokens outputs; every other fixture is docs-derived and the one live API test is unconditionally SkipZigTest, so it anchors nothing
-
-**How it got there.** The anchoring work landed. DONE 88eda93: Anthropic published SSE example; S grade was WRONG (paid, nondeterministic)

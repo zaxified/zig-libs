@@ -151,19 +151,9 @@ never followed.
   each returned `StreamEvent`'s memory is only valid until the next
   `next()` call or `deinit()`.
 
-## DEFER (not in this v1)
+## Not provided
 
-- **OpenAI-compatible variant** — sketched only (a `chat/completions`
-  request/response mapping is a fairly mechanical follow-up once a second
-  consumer needs it; not built here).
-- Retries / 429 backoff — compose with the `resilience` module later
-  rather than duplicating retry policy in this client.
-- Prompt-caching tooling beyond the per-block `cache_control` field
-  (top-level automatic `cache_control`, breakpoint-placement helpers,
-  cache-hit diagnostics).
-- The Files API (and `file` image/document sources that reference it).
-- Block-array `tool_result` content (images inside a tool result).
-- Batch API (`/v1/messages/batches`).
-- Upstreaming `sse_parse` as `http.sse.ClientReader` — it's fully generic
-  SSE parsing with nothing Anthropic-specific in it, and belongs in `http`
-  once a second consumer needs client-side SSE.
+OpenAI-compatible mode, the Batch and Files APIs (and `file` sources), block-array `tool_result` content,
+top-level automatic `cache_control`, automatic retries / 429 backoff (compose with `resilience`) and
+prompt-caching tooling beyond the per-block `cache_control` field: see SPEC.md *What is deliberately not
+done* and *Backlog / deferred*.
