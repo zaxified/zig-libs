@@ -109,122 +109,30 @@ None claimed: the data is public. There is no secret in this module.
   guard: ~45 000:1 expansion; `null` opts out); one byte over is `error.OutputTooLarge` (the
   decoder never produces more than 1 byte past the cap). Pinned by `test "bomb cap"`.
 - The encoder accepts levels 1..9 (`error.InvalidLevel`).
-- **Encoder worst-case time (B4, 2026-11-18).** Each call of the fallback sort's quicksort
+- **Encoder worst-case time.** Each call of the fallback sort's quicksort
   (`fallbackQSort3`, one per unresolved group per doubling round) may scan at most
   `fallback_work_factor` (16) x n x (log2 n + 1) elements for its range of n; past that it sorts
   the range and every pending sub-range by key with `std.sort.block` (stable, O(n log n), no
   allocation) and returns. Below the bound every decision is libbzip2's, so the output stays
   byte-identical; above it the order of equal keys may differ from libbzip2's — only identical
   rotations (periodic data) can then end up in another order, which moves the stored origin
-  pointer, never the decoded data. Measured (ReleaseFast, 2026-11-18), a block built against
-  libbzip2's pivot choice (`worstcase_test.zig`: McIlroy's adversary run over `fallbackQSort3`'s
-  own control flow, the keys placed as 4-byte suffixes of `ZYXW` units so the group survives to
-  the h = 4 round with them as its keys):
-
-  | block | before: adversarial | before: same keys shuffled | after: adversarial |
-  |---|---|---|---|
-  | 100 KiB | 237 ms | 10 ms | 15 ms |
-  | 300 KiB | 2.5 s | 33 ms | 53 ms |
-  | 500 KiB | 3.3 s | 61 ms | 72 ms |
-  | 700 KiB | 8.0 s | 97 ms | 116 ms |
-  | 900 KiB | 13.8 s | 138 ms | 153 ms |
-
-  End to end through `compress` with the default options (a 1/8 period-3 prefix burns the main
-  sort's `work_factor` budget so the block goes to the fallback): 787 KiB took 6.9 s before,
-  206 ms after (112 KiB: 270 -> 29 ms; 450 KiB: 1.9 s -> 122 ms). Where the bound sits: the largest
-  per-call work seen, in thousandths of n x (log2 n + 1), was 1 236 for shuffled keys, 2 199 for
-  keys already in ascending or descending order, 2 052 over every shape of the golden corpus —
-  the bound (16 000) is 7x above the worst of them, so the corpus keeps libbzip2's bytes (golden
-  tests). libbzip2 1.0.8 itself has no such bound (its fallback is documented as the safe path);
-  this is a deliberate departure above the bound only (owner decision 2026-11-18, security first).
-  Tests (`worstcase_test.zig`, time-independent: `fallbackSortWith(.., .{ .stats })` counts the
-  partition work): the 32 KiB adversarial block engages the bound, stays under it and under m^2/2, and
-  its rotations come out sorted; the same keys shuffled never reach it; a 4-letter random block sorted
-  once without a bound and once with half of its costliest call's work as the bound stops mid-call
-  with sub-ranges pending and still has every rotation in order; an adversarial block round-trips
-  through `compress`/`decompress`. The bound's mutants
-  (factor, `>`/`>=`, never/always, the work charge, the two bounded-tail sorts, the stats) are part of
-  the whole-module run below: every one is killed except `work >= budget` for `work > budget`
-  (EQUIVALENT: a heuristic threshold, the two differ only when a call's work lands exactly on it).
+  pointer, never the decoded data. The fallback's pivot choice (an LCG seeded 0 per call) is fixed
+  by byte parity with libbzip2, so without the bound a hostile block could steer it to quadratic
+  time: a 900 KiB block built against that pivot choice (`worstcase_test.zig`: McIlroy's adversary
+  run over `fallbackQSort3`'s own control flow) took 13.8 s to sort, 153 ms with the bound (the same
+  keys shuffled: 138 ms). Where the bound sits: the largest per-call work seen was 1 236 thousandths
+  of n x (log2 n + 1) for shuffled keys, 2 199 for keys already in ascending or descending order,
+  2 052 over every shape of the golden corpus — the bound (16 000) is 7x above the worst of them,
+  so the corpus keeps libbzip2's bytes (golden tests). libbzip2 1.0.8 itself has no such bound (its
+  fallback is documented as the safe path); this is a deliberate departure above the bound only
+  (owner decision, security first). Tests (`worstcase_test.zig`, time-independent:
+  `fallbackSortWith(.., .{ .stats })` counts the partition work): a 32 KiB adversarial block
+  engages the bound, stays under it and under m^2/2, and its rotations come out sorted; the same
+  keys shuffled never reach it; a 4-letter random block sorted once without a bound and once with
+  half of its costliest call's work as the bound stops mid-call with sub-ranges pending and still
+  has every rotation in order; an adversarial block round-trips through `compress`/`decompress`.
 - Truncated input is `error.TruncatedInput`, never a short success; bytes after a complete stream
   that do not start another are `error.TrailingData` unless `ignore_trailing_garbage`.
-
-## Audit 2026-11-19 (whole-module mutation)
-
-820 schemata mutants over every non-test line, one per condition x class (strict, arid code skipped):
-`decoder.zig` 332 (bit input and EOF padding, stream header and level digit, block header and trailer
-magic, origin pointer, symbol map, selectors and their MTF, coding tables and the 1..20 length walk,
-the Huffman window walk in both its copies, run symbols and their 2^21 limit, block overflow and
-growth, T^-1, the randomised path, the unRLE state machine, `read`'s latch and `max_output`, the
-readers), `blocksort.zig` 242 (fallback sort, the B4 bound, main sort), `encoder.zig` 202 (block
-assembly, bit writer, MTF and zero runs, table partition and refinement, selectors, tables, the
-writers), `huffman.zig` 32, `crc.zig` 12; the 11 delta mutants of 2026-11-18 are in the list (mutant 8,
-the pending ranges left unsorted at the bound, is killed). One schemata build per round, tiered runs
-(the decoder tests first, then the rest of the suite for the survivors), baseline first, in a copy of
-the tree. **699 killed (31 of them by hang), 109 EQUIVALENT, 12 UNOBSERVABLE, 0 open;** the card counts
-are whole-module (`eq` = EQUIVALENT + UNOBSERVABLE).
-
-Added for the survivors: hand-built decoder streams (each of "B", "Z", "h" alone; a zero selector
-count judged before the tables; selector values at 0..ng-1, ng and past it; more groups of symbols than
-selectors, also inside a run; a 20-bit code decoded by the symbol loop as well as the run loop; a run
-after a symbol overflowing the block as a whole; blocks ending in 1, 2 or 3 equal bytes), the block
-buffer's geometric growth and its cap (counting allocator), `total_out` one byte past `max_output`,
-`decompressStream`'s length, flush and unbuffered writer, `.nothing` as the stream limit, OutOfMemory
-only from a failing allocator, odd-sized and line reads across a refill, `readVec` keeping the
-unread octets, many small streams through an unbuffered input, `Decoder.streams`, a randomised
-multi-block stream; for the encoder the table count at 200 / 600 / 1200 / 2400 symbols and the selector
-count, a full output buffer at `bsFinish`, the 17-bit code limit (a Fibonacci-skewed table whose plain
-tree is 19 deep), `init`'s work factor default and block limit, a failing allocator while the sort
-tables grow on a reused encoder, `compressInto`'s write-path `OutputTooLarge`, `StreamWriter` vectors
-and splats; `huffman.zig`: a tree exactly as deep as the limit, a known canonical table, the halving
-retry pinned for two skewed sets (checked against an independent port of `hbMakeCodeLengths`);
-`worstcase_test.zig`: the B4 counters of a fixed block pinned; goldens: 11 `wf-t*` periodic shapes
-(classes of 2..100 equal rotations, blocks the main sort gives up on) and 240 repeated-unit inputs
-(`shapes.tieInput`, `testdata/tie_data.zig`), all against libbzip2 1.0.8's `bzip2 -9` digests (work
-factor 30 only; `--capture` would add the other factors).
-
-EQUIVALENT, by group (every mutant has its own reason and guarding line in the audit table; the groups):
-
-- **Dead or defensive code in the decoder.** `idx < 0` and `idx >= max_alpha` after the Huffman walk
-  are unreachable (`base[min_len] = 0`; for longer codes `zvec >= 2 (limit[zn-1] + 1)`, so
-  `idx >= cum[zn-1]`; `idx <= cum[zn] - 1 <= alpha_size - 1`; a window that would reach a length
-  without symbols has `limit = 0` and would already have broken at `min_len`; the `huffman.zig` probe
-  checks 256 000 random tables x windows); the first-length test `zn > 20` (`min_len <= 20` by the
-  length check); `sym >= eob` (`sym <= eob`); `readInner`'s `used != nblock + 1 or out_len != 0` after a
-  zero-length read (`unRle` returns 0 only with a destination that has room, so `out_len == 0` and
-  `used == end`); the selector clamp at 18002 (a block has at most `nblock_max + 1` symbols = 18001
-  groups); `seq_to_unseq[n_in_use..]` (never read); `need`'s 20 / 24 / 32-bit refill thresholds (the
-  widest `bits` read is 16, the code window 20); dead stores (`out_len`, `out_ch`, `used` before they are
-  set again; `rand_to_go` / `rand_pos` for a plain block).
-- **Cost only.** Buffer growth at an exact fit, the unbuffered refill for a buffered reader, the
-  slice-by-8 start, flush timing in the bit writer, `bsW`'s `|` against `^`, the packed cost path
-  (`len_pack`), main-sort and insertion-sort bookkeeping that leaves the order alone.
-- **Main sort (`blocksort.zig` 324..659, 43 mutants that keep the order).** The main sort completes only
-  on blocks of distinct rotations: two equal rotations cost `n / 8` budget units per comparison, a block
-  with equal rotations has at least `n / 2` such comparisons against a budget of at most `33 n`, so it
-  always ends in the fallback sort, and distinct rotations have one sorted order whichever sorter
-  produced it. Everything that does not break the order (budget accounting, the work factor clamp and
-  scale, the 10 000-byte switch, bucket order, quadrant bookkeeping) therefore cannot change a byte of
-  output; the golden tier (every shape, level 1/5/9, 3 work factors) killed every mutant that does break
-  it.
-- **Encoder tables.** `ensureArr2` is asked for `nb + n_overshoot` words while the sort needs three
-  quarters of that; a partition end passing the alphabet is impossible (`t_freq <=` the remaining
-  frequency); the first part never takes the back-off (`ng - n_part = 0`); the EOB frequency reaches
-  the initial partition only through the last part; the lowest code length scan start (a full tree over
-  258 symbols has a minimum length <= 9).
-- **Fallback sort scans (`blocksort.zig` 255..316).** Word-skip patterns of the bit scans, `l` / `r`
-  against `nb`, singleton ranges, the class tracker's first value, `h == nb`, an extra round without
-  unsorted ranges, a non-negative count: each either does the same scan by another route or acts only
-  where the loop would end anyway.
-
-UNOBSERVABLE (12): the tie order inside the fallback sort for eight steps that no input of the 410
-libbzip2-checked ones (170 goldens + 240 repeated-unit inputs) reaches in a way that moves the origin
-pointer (a 5-element insertion range, the low / high partition scans stopping at equal keys, the
-crossing test, the sentinel clear bits, three bit-scan variants) — a differential search against
-libbzip2 over more periodic mixes would settle them; `randomise` clearing `in_use` (a test-only hook
-with no reference encoder to compare bytes with); `downHeap`'s `yy <= n_heap` (one stale heap slot; 3 000
-random frequency sets through an independent port showed no divergence); the encoder's run state after
-`finish` (never read; `reset` sets it). **No survivor is in a bounds or security check.**
 
 ## Anchoring
 
@@ -248,6 +156,35 @@ random frequency sets through an independent port showed no divergence); the enc
 
 **Anchor grade:** class A · oracle EXTERNAL
 
+## Verification
+
+- **Run:** `scripts/modtest bzip2`; `zig build interop-bzip2` compares live against libbzip2 and Python's `bz2`
+  (`tools/README.md`); `zig build bench-bzip2` against libbzip2.
+- **Golden replays** (`src/golden_test.zig`): the SHA-256 and length of libbzip2's streams for every shape,
+  level and work factor captured by `interop-bzip2 -- --capture`, plus small streams; goldens for ties between
+  equal rotations (`wf-t*` periodic shapes and the repeated-unit inputs of `shapes.tieInput`,
+  `testdata/tie_data.zig`, work factor 30) and for table-count edges.
+- **Decoder** (`src/decoder_test.zig`): hand-built streams through a small bit writer for every validation
+  (level digit, magic letters, table and selector counts and values, code lengths 0/20/21, origin pointer, run
+  limit, block overflow, blocks ending in 1..3 equal bytes), the bomb cap, truncation and trailing data, the
+  block buffer's growth and cap (counting allocator), failing allocators, odd-sized and line reads across a
+  refill, an unbuffered input, `Decoder.streams`, a randomised multi-block stream.
+- **Encoder and round trips:** the table count at its thresholds, the 17-bit code limit (a skewed table whose plain
+  tree is deeper), a full output buffer at `bsFinish`, `compressInto` and `StreamWriter` write paths, the halving
+  retry of `huffman.zig` (checked against an independent port of libbzip2's `hbMakeCodeLengths`), failing-allocator
+  sweeps (`src/sweep_test.zig`), the fallback-sort bound (`src/worstcase_test.zig`).
+- **Fuzz:** `src/fuzz_test.zig`, driven by `BZIP2_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver, never
+  `zig build --fuzz`): arbitrary and mutated streams, synthetic blocks with well-formed tables, chunked and failing
+  readers and sinks, a failing allocator, round trips; every reach label must be hit; 4 000 seeds run in every
+  test run.
+- **ctgrind:** not applicable (no secret).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. The whole-module run covered every non-test line of `decoder.zig`, `blocksort.zig`,
+  `encoder.zig`, `huffman.zig` and `crc.zig`, one mutant per condition x class; no survivor is in a bounds or
+  security check. The survivors that are UNOBSERVABLE are tie orders inside the fallback sort that none of the
+  libbzip2-checked inputs reaches in a way that moves the origin pointer, which a differential search over more
+  periodic mixes would settle (see *Open*). There is no mutation run over the tests.
+
 ## What is deliberately not done
 
 - **Matching `BZ2_bzBuffToBuffCompress`'s block closing at a block-sized input** — never: with
@@ -267,12 +204,8 @@ random frequency sets through an independent port showed no divergence); the enc
 - **B2** `bzip2recover`: scan for block magics at any bit offset and emit each intact block as a
   stream. Not now.
 - **B3** Decoder speed: the Huffman walk is a 20-bit window with a per-length loop; a lookup table
-  on the first 8-10 bits would take the common symbols in one step (see Performance).
-- ~~**B4**~~ **DONE 2026-11-18** (work bound in `fallbackQSort3`, see "Limits and refusals"). Encoder worst-case time on adversarial input (no-panic sweep BZ-5, 2026-10-30): the
-  fallback sort's pivot choice (`fallbackQSort3`, an LCG seeded 0 per call) is fixed by byte
-  parity with libbzip2, so a hostile input could in principle steer it to quadratic time; the main
-  sort's work budget (`work_factor`) does not bound the fallback. Not reproduced; a bound would
-  need a deliberate departure from libbzip2's tie order. Decision pending.
+  on the first 8-10 bits would take the common symbols in one step (the card's Performance line has the
+  decoder's current ratio).
 
 ## Open
 

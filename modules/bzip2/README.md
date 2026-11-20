@@ -9,7 +9,7 @@ errors and a decompression-bomb cap.
   **Concurrency:** reentrant (every `Encoder` / `Decoder` is its own state). **Deps:** none
   (std-only, pure Zig — no C, no libc).
 - **Memory:** both sides grow with the data, up to one block. Decoding holds the block's symbols
-  (4 bytes each: 3.6 MB at `-9`) plus about 25 KB of tables; encoding at level `n` needs about
+  (4 bytes each: 3.6 MB at `-9`) plus about 45 KB of tables; encoding at level `n` needs about
   `7.5 * n * 100 000` bytes for a full block (about 7 MB at `-9`) and a few kilobytes for a small
   input. Nothing is allocated up front but the small tables.
 
@@ -61,12 +61,15 @@ the bytes only through which sort breaks ties between equal rotations, exactly a
 The bytes do not depend on how the input was cut into writes. `compressInto` writes into a caller's
 buffer, `compressBound(n)` bytes always fit.
 
-## Not here
+## Not provided
 
 No multithreaded (pbzip2 / lbzip2 style) block compression, no `bzip2recover` (finding intact
-blocks in a damaged file), no sync-flush marker. See SPEC.md.
+blocks in a damaged file), no sync-flush marker, no low-memory decoding mode. See SPEC.md
+*What is deliberately not done* and *Backlog / deferred*.
 
-Tests: `zig build test-bzip2` (golden replays of libbzip2's bytes, decoder error paths, fuzz
+## Tests
+
+`zig build test-bzip2` (golden replays of libbzip2's bytes, decoder error paths, fuzz
 harnesses at 4000 seeds); `BZIP2_FUZZ=<runs>` runs the deterministic fuzz driver;
 `zig build interop-bzip2` compares live against libbzip2 and Python's `bz2`
 (`tools/README.md`); `zig build bench-bzip2` against libbzip2.
