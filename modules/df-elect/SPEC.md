@@ -18,8 +18,8 @@
 Designated-Forwarder election with failover + split-horizon for N-member
 segments of a link-state L2VPN fabric, verified in `netsim` and compared with
 FRRouting run as a black box. Usage: see ./README.md. Provenance (clean-room
-from RFC 7432 / RFC 8584; FRR observed, never read): see ./README.md; no
-third-party terms to restate in /NOTICE.
+from RFC 7432 / RFC 8584; FRR observed, never read): see the README's
+`Provenance:` line.
 
 ## Compared with
 
@@ -117,12 +117,11 @@ it yield. EVPN gets the same effect from BGP sessions being two-way. The cost
 is at most one extra Hello period before a gain (a peer's view is up to one
 period old), which the zero-DF bound absorbs.
 
-**Core isolation.** The consensus alone has the mirror-image hole, found by
-review 2026-10-01: a member whose INBOUND path died hears nothing, so its view
+**Core isolation.** The consensus alone has the mirror-image hole: a member whose INBOUND path died hears nothing, so its view
 holds only itself and it names itself DF for every tag — while its peers,
 which still hear it, defer to that view. It held every role and received no
 frame: the segment got no traffic at all, for as long as the cut lasted, and
-the zero-DF check (which counts holders) saw nothing wrong. Now a member that
+the zero-DF check (which counts holders) saw nothing wrong. A member that
 has heard no fabric node for `stale_after` (or not yet since it started) is
 **isolated**: its view is empty — without even its own bit — so it is named
 for nothing, and the Hellos it still manages to send tell its peers to stop
@@ -147,11 +146,10 @@ before a crash cannot double the new chain.
 
 ### Why duplicates are bounded, not zero
 
-Until 2026-09-30 this module elected a static owner per segment and never
-failed over: `is_df` ignored liveness, which bought zero duplicates and cost
-availability without bound (a dead owner black-holed the segment for good).
-The argument behind it still holds and is exactly what failover costs: a
-member decides from its local view, and a Hello flood cannot distinguish
+Electing a static owner per segment would give zero duplicates and cost
+availability without bound (a dead owner black-holes the segment for good);
+failover trades the other way. A member decides from its local view, and a
+Hello flood cannot distinguish
 "peer dead" from "peer cut off from me". During a real partition each side
 legitimately carves the tags among its own members (no frame reaches both
 sides, so no duplicate). When the partition heals, a BUM frame and the next
@@ -242,50 +240,40 @@ leaving, which RFC 7432 also does by withdrawing its ES route).
 
 ## Verification
 
-`zig build test-df-elect`:
+Run with `scripts/modtest df-elect` (`zig build test-df-elect`), offline.
 
-- **Fuzz sweep**, all three algorithms, 120 seeds in Debug and 400 optimized, every
-  fault kind enabled: zero split-horizon violations; every duplicate explained
-  by a heal/link-up/restart within 100 ticks (measured worst 44 both modes,
-  2026-10-01); worst zero-DF 363 Debug / 409 optimized against the 470
-  bound; no unexplained lost frame; no frame of our own ever dropped as
-  malformed; the heal race really happens (duplicates > 0 asserted). The
-  measurements live in a comment, not on stderr (the lanes fail a passing
-  step that writes there); a failure prints the fault schedule and the
-  `<segment, tag>`'s DF transitions.
-- **One-way member cuts**: inbound (`core1→4`, `core2→7`: the member goes
-  deaf, gives every role up, the segment keeps receiving) and outbound
-  (`4→core1`, `7→core2`: it yields to the peers' carving, no duplicate) —
-  the first failed before core isolation, 16 of 16 frames lost. The deeper
-  core asymmetry is pinned as a known limit.
+- **Fuzz sweep**, all three algorithms, more seeds in optimized builds than in
+  Debug, every fault kind enabled (netsim's fault fuzzer): zero split-horizon
+  violations; every duplicate explained by a heal/link-up/restart within
+  `maxDuplicateWindow`; worst zero-DF within `maxZeroDfWindow`; no unexplained
+  lost frame; no frame of our own ever dropped as malformed; the heal race
+  really happens (duplicates > 0 asserted). The measurements live in a test
+  comment, not on stderr (the lanes fail a passing step that writes there); a
+  failure prints the fault schedule and the `<segment, tag>`'s DF transitions.
+- **One-way member cuts**: inbound (the member goes deaf, gives every role up,
+  the segment keeps receiving) and outbound (it yields to the peers' carving,
+  no duplicate). The deeper core asymmetry is pinned as a known limit.
 - **Fault-free**: no duplicate at all (`duplicates_fatal`), the roles settle on
   the RFC assignment over all members (`settledDf`), the startup zero window
   is real (> 0, the wait is observed) and within the bound.
-- **Failover**: the DF of a tag crashes at t=400 — a survivor holds it before
-  the restart, the zero window stays within bound, no duplicate (a restarted
+- **Failover**: the DF of a tag crashes — a survivor holds it before the
+  restart, the zero window stays within bound, no duplicate (a restarted
   member starts blocked), and after the restart the RFC assignment returns.
 - **Partition/heal**: the isolated member carves every tag for itself during
   the cut, every duplicate is explained by the heal, and the roles settle.
 - **Negative control**: `df_wait = 0` duplicates at startup, unexplained; the
   config check refuses it.
 - **Positive control**: `BrokenAlwaysDf` trips the checker on one seed, across
-  a 100-seed sweep, and shrinks to the empty fault set.
-- **EXTERNAL** (`frr_test.zig`): the preference choice in 12 settled phases
-  observed from FRRouting 10.7.1, and a control that mod N and HRW do not
-  reproduce them.
-- **REDERIVED** (`kat_test.zig`): 4 cases, 20 tags, 64 HRW weights and both DF
-  functions against `tools/rederive.py`.
-- **Mutation run 2026-10-01** (schemata, ReleaseSafe, 37 mutants over the
-  DF functions, `stepRole`, the protocol's liveness/isolation/consensus/
-  input guards and every analyzer): 33 killed. The first pass left 8; four
-  missing tests were added (the timer start-epoch guard, view bits past the
-  member list, a member's Hello naming another segment or none, the
-  `df_wait == hello_period` edge). Four are equivalent: the HRW digest's
-  MSB mask (multiplication mod 2^31 drops bit 31), `>` vs `>=` at exactly
-  `stale_after`, not clearing `last_heard` on restart (with `df_wait +
-  hello_period > stale_after` a restarted member is isolated before it could
-  gain), and evaluating roles on BUM arrival (only granularity; the bounds
-  hold without it).
+  a seed sweep, and shrinks to a minimal fault set.
+- **EXTERNAL** (`frr_test.zig`): the preference choice in the settled phases
+  observed from FRRouting 10.7.1 (`tools/frr/`), and a control that mod N and
+  HRW do not reproduce them.
+- **REDERIVED** (`kat_test.zig`): `hrwWeight` and both DF functions against
+  `tools/rederive.py`, which produces `src/kat_vectors.zig`.
+- **Hardening cases** in `protocol.zig`: the timer start-epoch guard, a Hello's
+  view bits past the member list, a member's Hello naming another segment or
+  none, and the `df_wait == hello_period` edge of the config check; malformed
+  inbound frames are dropped, counted and never crash the node.
 - **Units**: the DF functions (even load for mod N, HRW minimal disruption and
   tie-break), `stepRole` (immediate loss, continuous-wait gain, interrupted
   wait), `allowForward`, `EdgeSegment.validate`, the codecs (round trips,
@@ -294,6 +282,8 @@ leaving, which RFC 7432 also does by withdrawing its ES route).
   measured from the last disruption, two holders not counted, an unreachable
   member neither serving nor holding), and `firstUnexplainedLoss` (each
   explanation, its edges, and what is not owed at all).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
 
@@ -301,25 +291,16 @@ leaving, which RFC 7432 also does by withdrawing its ES route).
   hears (an adjacency LSP); each member can then compute which members the
   BUM sources reach and carve among those, replacing the deference heuristic
   and closing the known limit (a one-way failure deeper in the core).
-- ~~Segments with more than two members~~ — done 2026-09-30 (N members, per-tag DF).
-- ~~RFC 8584 HRW~~, ~~preference-based DF~~ — done 2026-09-30. Left of the
-  preference algorithm: the "don't preempt" option (a returning
-  higher-preference member does not take the role back) and per-tag
-  preference ranges. Fits §2.
+- **Preference algorithm, rest of RFC 8584:** the "don't preempt" option (a
+  returning higher-preference member does not take the role back) and per-tag
+  preference ranges (the preference-based draft was not read).
 - A real LSA age/refresh liveness model in place of the abstract `stale_after`
   threshold, if this graduates from a model-checked jewel into a fabric
-  component (`isis-sim` now has one to borrow).
+  component (`isis-sim` has one to borrow).
 - A dedicated DF-wait timer instead of evaluating on the Hello tick, which
   would take one `hello_period` of granularity out of both bounds.
 - RFC 8584 §4 AC-influenced DF (a member whose attachment circuit for a tag is
   down drops out of that tag's candidate list).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`any · util · single_owner` + dep `netsim` — canonical source is `pub const
-meta` in src/root.zig.
 
 ## Anchoring
 
@@ -329,5 +310,3 @@ meta` in src/root.zig.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** EXTERNAL: `src/frr_test.zig` — the preference-based DF choice in 12 settled phases observed from FRRouting 10.7.1 run as a black box (`tools/frr/`, raw observations committed under `tools/frr/observed/`): equal and distinct preferences, preference raised, lowered and reset to the default, the DF's ES link down and back, the DF PE down and back; a control shows mod N and HRW do not reproduce those choices. REDERIVED: `src/kat_test.zig` — mod N (RFC 7432 §8.5) and HRW (RFC 8584 §3.2) against an independent Python re-derivation (`tools/rederive.py`: `zlib` CRC-32, unbounded integers), 20 tags and 64 weights. SELF: the protocol — failover, the view consensus, the duplicate and zero-DF bounds — is model-checked in `netsim` against invariants stated here, with positive and negative controls, not against a foreign implementation; FRR's timings are recorded in "Compared with" but not asserted (different liveness source, different time base).
-
-**How it got there.** Until 2026-09-30 the module was class D (its own static two-member election, oracle n/a). Moving to the RFC algorithms made an outside truth exist, so the class is B; the FRR lab gave the preference algorithm an external oracle and the RFC formulas a re-derivation.

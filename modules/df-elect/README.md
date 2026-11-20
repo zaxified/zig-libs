@@ -78,7 +78,7 @@ algorithm in Debug and 400 optimized:
 - duplicates: every one follows a heal / link-up / restart within
   `maxDuplicateWindow` (= 100 with the default config);
 - zero-DF: every stretch without a DF, measured from the last disruptive
-  fault, stays within `maxZeroDfWindow` (= 470 with the default config; measured worst: see SPEC);
+  fault, stays within `maxZeroDfWindow` (= 470 with the default config);
 - fault-free runs: no duplicate at all, and the roles settle on the RFC
   assignment; explicit failover (DF crash + restart) and partition/heal cases;
 - negative control: `df_wait = 0` duplicates at startup with no fault to
@@ -89,4 +89,4 @@ algorithm in Debug and 400 optimized:
   observed from FRRouting 10.7.1 (`tools/frr/`).
 
 See `SPEC.md` for the argument (why failover makes duplicates bounded rather
-than zero, why the view consensus is needed) and the measured numbers.
+than zero, why the view consensus is needed).
