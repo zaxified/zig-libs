@@ -195,7 +195,7 @@ pub const TargetResult = struct {
     /// its own `std.Io` task. Excluded from `stats` entirely — they are not
     /// evidence about the host, and counting them as loss is exactly the
     /// "dead host" report the `.canceled` status was added to remove
-    /// (W2 re-audit 2026-09-02, `probe` F2).
+    ///(`probe` F2).
     pub fn canceledCount(self: TargetResult) usize {
         var n: usize = 0;
         for (self.samples) |s| {
@@ -263,7 +263,7 @@ pub const Options = struct {
     /// `tcp_syn_retries` and about two minutes. It does not mean "do not
     /// wait". The convention lived only in two private doc comments while
     /// this, the public knob, said nothing
-    /// (W2 re-audit 2026-09-02, `probe` F3).
+    ///(`probe` F3).
     timeout_ms: u32 = 1000,
     /// Repetitions per target (clamped to `[1, max_repetitions]`). Each
     /// `probeMany` target holds `count` `Result` slots, so the batch allocates
@@ -280,7 +280,7 @@ pub const Options = struct {
     /// Reject a `probeMany` batch whose `targets.len * count` (after the
     /// `count` clamp) exceeds this: each attempt is a connect and a `Result`
     /// slot allocated up front, and the two separate caps alone allowed
-    /// ~268 M of them (sweep PR-2, owner 2026-10-29).
+    /// ~268 M of them (sweep PR-2, owner).
     max_attempts: usize = 1 << 20,
     /// Optional post-connect application check.
     app_check: ?AppCheck = null,
@@ -320,9 +320,7 @@ pub const Sleeper = struct {
 /// one and hand `sleeper()` to `Options`; it must outlive any probe using it.
 /// A canceled sleep answers `error.Canceled` and re-arms the cancelation
 /// (`io.recancel()`), so the run stops and the caller's next cancelation point
-/// still sees it. Until 2026-10-23 the cancelation was swallowed here: std
-/// reports it once, so every later repetition and target ran as if nothing
-/// had happened.
+/// still sees it.
 pub const IoSleeper = struct {
     io: std.Io,
 
@@ -409,14 +407,10 @@ pub fn probeTarget(gpa: Allocator, target: Target, opts: Options) Allocator.Erro
 }
 
 /// Fill `r.samples` and compute `r.stats`. Pure w.r.t. allocation (samples
-/// already allocated) — safe to call from a worker thread. A cancelation
-/// (a `.canceled` sample, or the interval sleep answering `error.Canceled`)
+/// already allocated) — safe to call from a worker thread. A cancelation (a
+/// `.canceled` sample, or the interval sleep answering `error.Canceled`)
 /// sets `stop`; once it is set, no further connect is made, here or in any
 /// other worker of the batch, and the repetitions left are `.canceled`.
-/// Until 2026-10-23 one canceled sample changed nothing: std reports a
-/// cancelation once, so the next repetition and the next target connected
-/// as usual, and `probeMany`'s helper threads (plain threads, not `Io`
-/// tasks) never saw it at all.
 fn probeInto(r: *TargetResult, opts: Options, stop: *std.atomic.Value(bool)) void {
     for (r.samples, 0..) |*s, i| {
         if (stop.load(.acquire)) {
@@ -807,7 +801,7 @@ fn selectAddresses(addrs: *[PosixConnector.max_addresses]netaddr.Ip, n: usize, p
 /// `rtt_ns` of an `.up` is the winning address's own connect time: the name
 /// resolution and the other addresses' attempts are charged against the
 /// budget but are not in it (fping/nmap time the connect alone; until
-/// 2026-10-23 it was the whole attempt, so a cold resolver skewed min/avg/max).
+/// earlier it was the whole attempt, so a cold resolver skewed min/avg/max).
 /// `LiveConnector` cannot split them: its `rtt_ns` stays the whole attempt.
 /// A `.timeout`'s `rtt_ns` is the whole attempt.
 ///
@@ -911,7 +905,7 @@ pub const PosixConnector = struct {
     /// its answer -- the loop's decision logic on its own, a pure value, so
     /// every sequence of outcomes can be tested without a resolver that
     /// returns several addresses (the only way the loop sees more than one).
-    /// Extracted 2026-10-04 with the verdict for every sequence unchanged:
+    /// Extracted with the verdict for every sequence unchanged:
     ///
     ///  * an `.up` decides at once (`add` returns true: try no further address);
     ///  * `.refused` outranks every later non-`.up` verdict -- it is the
@@ -979,7 +973,7 @@ pub const PosixConnector = struct {
             0,
         );
         // The errno says WHY (EMFILE under fd exhaustion is a local limit,
-        // not a dead host); until 2026-10-23 it was dropped here.
+        // not a dead host); earlier it was dropped here.
         if (linux.errno(sock_rc) != .SUCCESS)
             return .{ .done = .{ .status = .@"error", .errno = @backingInt(linux.errno(sock_rc)) } };
         const fd: i32 = @intCast(sock_rc);
@@ -1081,12 +1075,7 @@ pub const PosixConnector = struct {
     /// keep running; one `poll` waits on all of them and the first completed
     /// handshake wins. The verdicts fold as `VerdictFold` describes.
     ///
-    /// Until 2026-10-23 the addresses were tried one after another, each with
-    /// the WHOLE remaining budget: a black-holed first address (a dual-stack
-    /// name whose IPv6 path is broken) used it all, and a service listening
-    /// on the second address was reported `.timeout` -- the false "down" the
-    /// F1 fix of 2026-09-02 had moved, not removed. `LiveConnector` (std's
-    /// `HostName.connect`) races the addresses too.
+    /// `LiveConnector` (std's `HostName.connect`) races the addresses too.
     ///
     /// Never allocates; every descriptor it opened is closed on return.
     fn connectRace(addrs: []const netaddr.Ip, port: u16, budget_ns: u64, source: ?netaddr.Ip, device: ?[]const u8) RaceResult {
@@ -1234,11 +1223,11 @@ pub const PosixConnector = struct {
     /// first address black-holed it burned the whole budget and reported
     /// `.timeout`. `.system` is the default and `PosixConnector` is the
     /// recommended connector, so that is a false "service down" on the health
-    /// checker this module exists for (W2 re-audit 2026-09-02, `probe` F1).
+    /// checker this module exists for(`probe` F1).
     ///
     /// `error.Canceled` when the caller's task was canceled during the lookup
     /// (re-armed with `io.recancel()` for the caller's next cancelation
-    /// point): until 2026-10-23 it was swallowed into "0 addresses", and a
+    /// point): earlier it was swallowed into "0 addresses", and a
     /// canceled probe reported `.error` -- the live-target-reported-dead
     /// shape `.canceled` exists to prevent.
     fn resolveAll(io: std.Io, host: []const u8, port: u16, out: *[max_addresses]netaddr.Ip) error{Canceled}!usize {
@@ -2120,8 +2109,6 @@ test "race: a black-holed first address does not starve a listening second one (
     const t0 = monoNs();
     const r = PosixConnector.connectRace(&addrs, bh.port, 2 * std.time.ns_per_s, null, null);
     const el = monoNs() -| t0;
-    // Before 2026-10-23: the first address took the whole 2 s and the answer
-    // was `.timeout`.
     try testing.expectEqual(Status.up, r.verdict.status);
     try testing.expect(el >= PosixConnector.attempt_delay_ns); // the second started after the delay
     try testing.expect(el < std.time.ns_per_s);
@@ -2367,7 +2354,7 @@ test "live: the std path ignores the same budget — the contrast that makes thi
 test "canceledCount counts only cancellations; one up repetition is reachable" {
     // `canceledCount`: repetitions that "never ran to a verdict because the
     // caller cancelled" -- a timeout is a verdict. `reachable`: "True if at
-    // least one repetition connected" -- one is enough. Mutation 2026-10-04:
+    // least one repetition connected" -- one is enough. Mutation:
     // counting timeouts as cancelled, and needing two ups, both survived.
     var scripts = [_]FakeConnector.Script{
         .{
@@ -2392,7 +2379,7 @@ test "canceledCount counts only cancellations; one up repetition is reachable" {
 
 test "PosixConnector.VerdictFold: every multi-address rule, one sequence each" {
     // The fold is `connectImpl`'s per-address logic extracted unchanged
-    // (2026-10-04) so these sequences -- reachable live only through a name
+    // so these sequences -- reachable live only through a name
     // resolving to several addresses -- can be pinned. WHY each expectation
     // is right: the doc of `connectImpl`/`VerdictFold` -- `.refused` is the
     // definitive negative and outranks a later error; a timeout (per address
@@ -2436,7 +2423,7 @@ test "PosixConnector: a budget already spent before the connect is a timeout, an
     // it is gone nothing more is attempted"; with nothing tried and the budget
     // gone the verdict is `.timeout`. A 1 ns budget is spent by the time the
     // literal has been parsed. (A closed port proves no connect ran: it would
-    // have answered `.refused` at once.) Mutation 2026-10-04: dropping the
+    // have answered `.refused` at once.) Mutation: dropping the
     // check survived -- and underflowed `timeout_ns - spent_now`.
     const ln = try listenLoopback(false, 8);
     _ = tl.close(ln.fd);
@@ -2500,7 +2487,7 @@ fn lowestFreeFd() !i32 {
     // huge positive number. `@intCast` to `i32` therefore panics before the
     // `fd < 0` guard can ever be true, and the guard was dead code. This is
     // the descriptor-leak oracle, i.e. exactly the test that runs when
-    // descriptors are scarce (W2 re-audit 2026-09-02, `probe` F6).
+    // descriptors are scarce(`probe` F6).
     if (tl.errno(rc) != .SUCCESS) return error.DupFailed;
     const fd: i32 = @intCast(rc);
     _ = tl.close(fd);
@@ -2620,7 +2607,7 @@ test "live: system resolution does resolve a name, without leaving the host" {
     // taking only the head of that list is what made `PosixConnector` report
     // a service listening on the second address as `.refused` — a definitive
     // negative — where `LiveConnector` reported `.up`
-    // (W2 re-audit 2026-09-02, `probe` F1).
+    //(`probe` F1).
     if (n < 2) std.debug.print(
         "\nnote: localhost resolved to {d} address(es) here, so the multi-address path is untested on this host\n",
         .{n},
@@ -2846,7 +2833,7 @@ test "a cancelled run is not a dead host, and an .up with no rtt is not a 0 ns c
         // `std.Io` task saw the targets it never finished probing reported as
         // dead hosts". The sample said `canceled`; the aggregate — which is
         // what a consumer reads — still said received=0, reachable=false,
-        // loss=100% (W2 re-audit 2026-09-02, `probe` F2).
+        // loss=100%(`probe` F2).
         var scripts = [_]FakeConnector.Script{
             .{ .host = "svc", .outcomes = &.{.{ .status = .canceled, .err_name = "Canceled" }} },
         };
@@ -3498,7 +3485,7 @@ test "delta audit: the connectors report the refuser's and the winner's address 
     try testing.expect(bcast.addr == null);
 }
 
-// ── whole-module mutation run 2026-11-11: tests for the survivors ───────────
+// ── whole-module mutation run: tests for the survivors ───────────
 
 test "mutation: probeTcp drops the rtt of every non-up outcome; max_targets is the largest accepted list" {
     var scripts = [_]FakeConnector.Script{
