@@ -8,9 +8,6 @@
 
 **Audit:** review 2026-11-01 · mutation 2026-11-14 (125/144, 19 eq) · src 6a582d6c05cec3ff
 
-*Delta mutation run 2026-11-14:* the new `SignError.EntropyFailure` arm in `signRsaPss` remapped to `FaultDetected` and to `BufferTooSmall`, 2 mutants, both killed by the new test "sign: an all-zero `random` … is error.EntropyFailure on every RSA-PSS scheme" (`mutation_test.zig`); the old suite had not distinguished them.
-
-Audit detail: the FFDHE delta of the same day (from `abdc66c5`: `ffdhe.zig`, the FFDHE hunks of `kex.zig`, three RFC 7919 prime bits; 55 mutants, 46 killed, 9 equivalent: the three secure-zero defers of `ffdhe.zig` that `burn.run` already covers, five `catch`/`orelse` arms that cannot fail, and the exponent length +1 in `generate`, whose draw is masked to `xbits` bits; the three burn-size mutants are killed only by the ReleaseFast stack probe; 6 new tests in `ffdhe_test.zig` and an FFDHE leg in the kex fuzz harness, 120,000 driver runs clean) is added to the totals. The 2026-11-01 mutation run is a delta over everything since `e62faa4f` — the secp521r1/MLKEM512/MLKEM768 groups, the Ed25519 signer in certverify, P-384 signing and the switch to the `mlkem` module (87 mutants, 4 survivors closed by new tests in `mutation_test.zig`; the 10 equivalents are local wipes already covered by `burn.run`'s dead-stack wipe (8), the P-521 mask's extra bit rejected by the range check, and an Ed25519 branch reachable with probability 2^-252); the coordinator's review the same day covered the `mlkem` switch diff. Earlier: the 2026-10-31 mutation run is a delta over the NIST hybrids, `Expanded` and the Ed25519 signer (blind review the same day); the 2026-10-28 whole-module run was 50/51, 1 eq. The 2026-11-01 review is a delta over the live OpenSSL oracle's replay (`src/openssl_oracle_test.zig`, test code only); the library source the mutation runs scored is unchanged.
 
 **Hardening:** fuzz 2026-10-31 (`certverify.verify` 320,000 runs 2026-10-20; `kex` over all 10 groups incl. secp521r1, MLKEM512/768 and the NIST hybrids, 20,000 runs clean 2026-11-01, TLS13_FUZZ; planted mutants caught) · ct 2026-10-31 (own ctgrind harness: key schedule SHA-256/384, kex shared/server per group, CertificateVerify signers; re-pinned 2026-11-01 after the switch to the `mlkem` module: the ML-KEM rows went from 17–65 in-file contexts (std's rejection sampling over public rho and its FO `ctneq`) to 0; nonzero contexts attributed — the NIST rejection-sampling verdict on a discarded draw (P-256 rows), FFDHE's zero-exponent rejection (ffdhe*_shared 1, ffdhe*_server 2: reveals only x == 0, p ≤ 2^-225), sibling modules' own rows) · panic 2026-10-28 (independent sweep of every pub entry point: `HkdfLabel` bounds checked in every mode, exporter bounds are errors, u24 transcript length checked; hybrids 2026-10-31 reviewed blind, 0 findings in kex)
 
@@ -36,72 +33,27 @@ Surveyed 2026-10-31 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std.crypto.tls` | Zig | MIT (Zig LICENSE) | — | Zig 0.17.0 | `tls.zig` has enums and two helpers (`hkdfExpandLabel` hard-coding `"tls13 "`, `hmacExpandLabel`), a `Client` and no server; no public key schedule, no CertificateVerify helper, no transcript type (V: `lib/std/crypto/tls.zig:535-600`, `tls/Client.zig` only). |
 | wolfSSL | C | GPL-3.0 (API) | 3.0k | pushed 2026-10-30 | Copyleft: not read. Used only as a black-box oracle (`dtls`' 14-flow replay). |
 
-**Where we are ahead:** a *public*, engine-independent TLS 1.3 + DTLS 1.3 key schedule (rustls, Go, s2n and BoringSSL all keep theirs internal; std has only expand-label), anchored to RFC 8448 §3/§4/§5 byte for byte and re-derived against Python and std; the HkdfLabel prefix as the only parameter (`dtls13`); CertificateVerify sign **and** verify with eight schemes, including ECDSA P-521 (Go has it, rustls via provider) and pure ML-DSA-44/65/87 (neither Go 1.26's `SignatureScheme` list nor — as far as I could see — rustls has it; the `certverify.zig:52` comment says "2026-10-21 for rustls parity", which I could not confirm from `enums.rs`); PSK binder truncation and HRR `message_hash` handled by `Transcript`; RFC 8446 §7.5 exporter and §7.2 KeyUpdate; constant-time/burn contract with stack probes; zero allocation. **Where we were behind (closed 2026-10-31):** two of the three IANA ECDHE-ML-KEM hybrids that Go 1.26 and rustls ship, SecP256r1MLKEM768 (0x11eb) and SecP384r1MLKEM1024 (0x11ed) — now in `kex`; P-521 ECDH (0x0019, Go lists `CurveP521`) and pure MLKEM768/512 (draft-ietf-tls-mlkem 0x0201/0x0200, rustls has them) closed 2026-11-01. **FFDHE gap closed 2026-11-01:** the RFC 7919 named groups ffdhe2048..ffdhe8192 (0x0100..0x0104; OpenSSL, GnuTLS, NSS, wolfSSL and rustls have them) are in `kex` (`ffdhe.zig`, arithmetic on `montint.DynModint(8192)`: constant-time `pow` for the private exponent, 225/275/325/375/400-bit exponents as OpenSSL's `ffc_dh.c`; peer check length = len(p), 1 < Y < p-1, Y^q = 1; shared secret left-padded to len(p)). `tlsserver` can enable them through `Config.groups`; no default list contains them. Known-answer tests against Python `pow()` for ffdhe2048/3072. **Still behind:** nothing in the key-exchange group list. Early-data secrets and the ECH confirmation live in engine-side modules, not here.
+**Where we are ahead:** a *public*, engine-independent TLS 1.3 + DTLS 1.3 key schedule (rustls, Go, s2n and BoringSSL all keep theirs internal; std has only expand-label), anchored to RFC 8448 §3/§4/§5 byte for byte and re-derived against Python and std; the HkdfLabel prefix as the only parameter (`dtls13`); CertificateVerify sign **and** verify with ten schemes, including ECDSA P-521 (Go has it, rustls via provider) and pure ML-DSA-44/65/87 (neither Go 1.26's `SignatureScheme` list nor, as far as could be seen, rustls has it); PSK binder truncation and HRR `message_hash` handled by `Transcript`; RFC 8446 §7.5 exporter and §7.2 KeyUpdate; constant-time/burn contract with stack probes; zero allocation. **Where we are behind:** nothing in the key-exchange group list: the three IANA ECDHE-ML-KEM hybrids that Go 1.26 and rustls ship (SecP256r1MLKEM768 0x11eb, SecP384r1MLKEM1024 0x11ed, X25519MLKEM768), P-521 ECDH (0x0019, Go lists `CurveP521`), the pure ML-KEM groups (draft-ietf-tls-mlkem 0x0200/0x0201/0x0202, rustls has them) and the RFC 7919 named groups ffdhe2048..ffdhe8192 (0x0100..0x0104; OpenSSL, GnuTLS, NSS, wolfSSL and rustls have them) are all in `kex`. `tlsserver` can enable the ffdhe groups through `Config.groups`; no default list contains them. Early-data secrets and the ECH confirmation live in engine-side modules, not here.
 
-Full survey (licences, ranked gap list, bench proposal): kept in the coordinator workspace, `20261031-hpke-tls13-g2/tls13-survey.report.md`.
+## Performance
 
-## Performance — `bench-tls13` (2026-10-31)
-
-`zig build bench-tls13` (`tools/bench.zig` + `tools/c_bench/foreign_bench.c`, OpenSSL 3.5.5
-libcrypto through public EVP APIs): an interop gate first (key schedule byte-identical at
-SHA-256/384, every group agreeing both ways, every scheme verifying the other side's
-signature), then ns per op, ReleaseFast, `BENCH_ROUNDS=5`, i7-7920HQ, Zig 0.17.0. OpenSSL's
-`TLS13-KDF` returned a wrong early secret for the all-zero PSK/salt case (ours is RFC 8448's),
-so the OpenSSL side computes the schedule with `EVP_KDF` "HKDF" (extract/expand) and the
-HkdfLabel built in C. The ML-KEM rows time `generateExpanded` / `sharedSecretExpanded`
-(OpenSSL keeps the expanded key too). **`cli_x25519`** was 1.16× (the `ct25519` ladder, then 1.20× OpenSSL's asm); after `ct25519` P7 (2026-10-31, ladder order + ADX squaring) it is 0.86×. Table: the run after P7.
-
-```
-bench-tls13: building the foreign side (modules/tls13/tools/c_bench/foreign_bench.c) ...
-bench-tls13: interop OK (key schedule SHA-256 and SHA-384 identical; 7 groups agree both ways; 4 signature schemes verify both ways)
-workload               ours ns      ref ns      alt ns    /ref   /fast spr us spr rf spr al  count
-ks256                    11286       23466           0   0.472   0.472   2.4%   3.4%   0.0%  1
-ks384                    14169       28010           0   0.504   0.504   1.7%  14.3%   0.0%  1
-gen_x25519               19843       42451           0   0.475   0.475   5.4%   7.1%   0.0%  1
-gen_secp256r1            12476       17482           0   0.744   0.744   2.5%   7.5%   0.0%  1
-gen_secp384r1            66025      198947           0   0.330   0.330   1.9%   4.2%   0.0%  1
-gen_x25519mlkem768       67440      106025           0   0.658   0.658   1.7%   5.5%   0.0%  1
-gen_secp256r1mlkem768       58222       79863           0   0.748   0.748   3.0%   3.4%   0.0%  1
-gen_secp384r1mlkem1024      149545      316560           0   0.478   0.478   0.5%   1.8%   0.0%  1
-gen_mlkem1024            78909       93266           0   0.856   0.856   1.3%   2.0%   0.0%  1
-srv_x25519               54097       84258           0   0.652   0.652   1.4%   2.3%   0.0%  1
-srv_secp256r1            67775       91989           0   0.746   0.746   0.7%   2.8%   0.0%  1
-srv_secp384r1           324218      707820           0   0.461   0.461   1.4%   1.9%   0.0%  1
-srv_x25519mlkem768      107678      151792           0   0.719   0.719   0.7%   2.2%   0.0%  1
-srv_secp256r1mlkem768      119925      161274           0   0.752   0.752   0.6%   1.8%   0.0%  1
-srv_secp384r1mlkem1024      399936      796560           0   0.499   0.499   2.0%   2.0%   0.0%  1
-srv_mlkem1024            78872       94917           0   0.847   0.847   1.8%   2.1%   0.0%  1
-cli_x25519               32825       37821           0   0.863   0.863   0.8%   2.5%   0.0%  1
-cli_secp256r1            54503       68780           0   0.800   0.800   1.0%   2.6%   0.0%  1
-cli_secp384r1           253095      474201           0   0.530   0.530   0.8%   1.2%   0.0%  1
-cli_x25519mlkem768       75469       96659           0   0.783   0.783   1.0%   2.2%   0.0%  1
-cli_secp256r1mlkem768       95710      129119           0   0.748   0.748   1.0%   1.9%   0.0%  1
-cli_secp384r1mlkem1024      310976      560087           0   0.558   0.558   1.3%   0.6%   0.0%  1
-cli_mlkem1024            59542       77408           0   0.773   0.773   3.0%   1.4%   0.0%  1
-sign_ecdsa_secp256r1_sha256       23513       27915           0   0.866   0.866   2.0%   2.7%   0.0%  1
-sign_ecdsa_secp384r1_sha384      102330      262196           0   0.396   0.396   0.9%   1.3%   0.0%  1
-sign_rsa_pss_rsae_sha256      656159      617320           0   1.064   1.064   0.7%   2.5%   0.0%  1
-sign_ed25519             43879       46852           0   0.936   0.936   0.7%   1.0%   0.0%  1
-verify_ecdsa_secp256r1_sha256       61764       72372           0   0.862   0.862   0.6%   2.5%   0.0%  1
-verify_ecdsa_secp384r1_sha384      355031      592638           0   0.612   0.612   1.0%   2.5%   0.0%  1
-verify_rsa_pss_rsae_sha256       18839       25472           0   0.739   0.739   0.6%   3.2%   0.0%  1
-verify_ed25519           71915      124482           0   0.578   0.578   1.6%   1.1%   0.0%  1
-rounds: 5; ratios by user-mode cycles; largest spread 14.3% (OVER 5 %: noisy run, repeat)
-reference: OpenSSL 3.5.5 27 Jan 2026 (libcrypto, public EVP APIs)
-worst ours/OpenSSL = 1.064 (best 0.330)
-note: the fastest candidate, aws-lc-rs 1.18.0 (tlsserver/tools/rust_bench), is not built or measured here
-card: **Performance:** ref 0.33–1.06× OpenSSL <version> libcrypto (key schedule, 7 key-exchange groups, 4 CertificateVerify schemes) · fastest ? (measured <today>)
-```
+`zig build bench-tls13` (`tools/bench.zig` + `tools/c_bench/foreign_bench.c`, OpenSSL 3.5.5 libcrypto through
+public EVP APIs; the `alt` column is aws-lc-rs 1.18.0 through `tools/rust_bench`) runs an interop gate first
+(key schedule byte-identical at SHA-256/384, every group agreeing both ways, every scheme verifying the other
+side's signature), then times ns per op in ReleaseFast. The OpenSSL side computes the key schedule with
+`EVP_KDF` "HKDF" (extract/expand) and the HkdfLabel built in C, because `TLS13-KDF` does not fit the
+all-zero-PSK early secret (see *Interop*). The ML-KEM rows time `generateExpanded` / `sharedSecretExpanded`
+(OpenSSL keeps the expanded key too). The FFDHE rows are measured against OpenSSL only (aws-lc-rs has no
+FFDHE). The figures are on the card's `**Performance:**` line.
 
 ## What this module is, and what it is not
 
 The TLS 1.3 handshake building blocks that more than one TLS-family engine in the collection
-needs, so each is written, anchored and audited once. Today, all moved from `dtls` on
-2026-10-20 as step M0 of the `tlsserver` plan:
+needs, so each is written, anchored and audited once:
 
 - the RFC 8446 §7.1 key schedule (`keyschedule.zig`);
 - the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify (`certverify.zig`);
-- the (EC)DHE key exchange for x25519, secp256r1, secp384r1, secp521r1, ML-KEM-512/768/1024 and the hybrids X25519MLKEM768, SecP256r1MLKEM768 and SecP384r1MLKEM1024 (`kex.zig`);
+- the (EC)DHE key exchange for x25519, secp256r1, secp384r1, secp521r1, ffdhe2048..ffdhe8192, ML-KEM-512/768/1024 and the hybrids X25519MLKEM768, SecP256r1MLKEM768 and SecP384r1MLKEM1024 (`kex.zig`, `ffdhe.zig`);
 - the handshake transcript hash, generic over the suite hash (`transcript.zig`).
 
 **Not here:** anything that sends, parses or decides — handshake messages, the state machine,
@@ -137,8 +89,10 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
   transcript_hash`, context `"TLS 1.3, server CertificateVerify"` or `"… client …"`.
   DTLS 1.3 uses the same construction (RFC 9147 does not redefine it).
 - `SignatureScheme` (non-exhaustive `enum(u16)`): `ecdsa_secp256r1_sha256` 0x0403,
-  `ecdsa_secp384r1_sha384` 0x0503, `rsa_pss_rsae_sha256/384/512` 0x0804–0x0806, `ed25519`
-  0x0807. `hashDigestLen` pairs each with its hash (Ed25519: none).
+  `ecdsa_secp384r1_sha384` 0x0503, `ecdsa_secp521r1_sha512` 0x0603, `rsa_pss_rsae_sha256/384/512`
+  0x0804–0x0806, `ed25519` 0x0807, and pure ML-DSA `mldsa44/65/87` 0x0904–0x0906
+  (draft-ietf-tls-mldsa, empty context; the public key is the borrowed encoded key,
+  decoded inside `verify`). `hashDigestLen` pairs each with its hash (Ed25519 and ML-DSA: none).
 - `sign(scheme, SecretKey, side, transcript_hash, ?Random, out)` / `verify(scheme, PublicKey,
   side, transcript_hash, signature)`. Keys are tagged unions by family; a family that does not
   match the scheme is `KeyMismatch`. The transcript hash is the cipher suite's (any length up to
@@ -162,11 +116,14 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
   `mlkem768_group` 0x0201 (draft-ietf-tls-mlkem: encapsulation key 800 / 1184, ciphertext 768 / 1088
   octets, a 32-octet secret), `mlkem1024_group` 0x0202
   (draft-ietf-tls-mlkem: encapsulation key and ciphertext 1568 octets each, a 32-octet secret),
-  `secp256r1_mlkem768_group` 0x11eb, `secp384r1_mlkem1024_group` 0x11ed (draft-ietf-tls-ecdhe-mlkem).
+  `secp256r1_mlkem768_group` 0x11eb, `secp384r1_mlkem1024_group` 0x11ed (draft-ietf-tls-ecdhe-mlkem), `ffdhe2048_group` .. `ffdhe8192_group`
+  0x0100..0x0104 (RFC 7919).
   `expectedShareLen(group)`: the exact CLIENT-form share length (32 / 65 / 97 / 133 / 1216 / 1568 /
-  800 / 1184 / 1249 / 1665; 0 = not computed here). `scalarLen(group)`: the prefix of `KeyPair.secret` the
-  group uses (32 / 32 / 48 / 66 / 96 / 64 / 64 / 64 / 96 / 112; 0 = not computed here). `max_share_len` 1665,
-  `max_server_share_len` 1665 (`ServerExchange.public`); `SharedSecret.bytes` is 80 octets.
+  800 / 1184 / 1249 / 1665; for an ffdhe group len(p) = 256 / 384 / 512 / 768 / 1024; 0 = not computed
+  here). `scalarLen(group)`: the prefix of `KeyPair.secret` the group uses (32 / 32 / 48 / 66 / 96 / 64 / 64 / 64
+  / 96 / 112; the ffdhe exponent 29 / 35 / 41 / 47 / 50; 0 = not computed here). `max_share_len` 1665,
+  `max_server_share_len` 1665 (`ServerExchange.public`); `SharedSecret.bytes` holds `shared_secret_cap` = 1024
+  octets (ffdhe8192's len(p)), `slice()` the live part.
 - **The two NIST hybrids put the ECDH element FIRST**, the reverse of X25519MLKEM768, in all
   three places: client share `SEC1 point ‖ ML-KEM key` (65 + 1184, 97 + 1568), server share
   `SEC1 point ‖ ciphertext` (65 + 1088, 97 + 1568), shared secret `x(ECDH) ‖ ss_MLKEM` (32 + 32,
@@ -183,6 +140,17 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
   `ciphertext ‖ X25519 public`.
 - `serverExchange(group, client_share, random, *ServerExchange)`: the server's answer in one
   step (the hybrid server encapsulates, so it cannot be split into generate + shared).
+- **FFDHE (`ffdhe.zig`, RFC 7919 Appendix A, TLS code points RFC 8446 §4.2.7).** The named safe-prime groups
+  with g = 2, arithmetic on `montint.DynModint(8192)` (`powBits`, constant-time in base and exponent over the public
+  exponent length). The private exponent is `xbits` random bits, uniform in [1, 2^xbits − 1], with the lengths OpenSSL
+  uses for these groups (225 / 275 / 325 / 375 / 400 bits for 2048 / 3072 / 4096 / 6144 / 8192, `crypto/ffc/ffc_dh.c`;
+  RFC 7919 §5.2 asks for at least that); an all-zero draw is redrawn, 64 failed draws are `KeyExchangeFailed`. The
+  share Y = g^x mod p and the shared secret Z = Y^x mod p are big-endian, LEFT-padded to len(p), leading zeros kept
+  (RFC 8446 §4.2.8.1, §7.4.1). The peer check is the one RFC 7919 §5.1 makes the whole MUST for a known safe-prime
+  group: length exactly len(p) (else `MissingKeyShare`) and 1 < Y < p − 1 (else `KeyExchangeFailed`). A full Y^q = 1
+  test is **not** run: it would cost 4–9× the handshake's own exponentiation and only refuse order-2q elements, which
+  reveal at most x mod 2 of an ephemeral exponent; OpenSSL's TLS path does not run it either. A zero exponent in
+  `shared` (a wiped or never-generated key) is refused rather than answered with Z = 1.
 - The private form of the hybrid key is the 64-byte FIPS 203 seed (`secret_len` 96 with the
   X25519 scalar), re-expanded at decapsulation.
 
@@ -198,7 +166,7 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
 Generic over the hash: `Hkdf`/`Hmac` are std types (`HkdfSha256`, `Hkdf(HmacSha384)`); every
 buffer is `Hkdf.prk_length` or `Hmac.mac_length`.
 
-## Expanded ML-KEM key and Ed25519 signer (2026-10-31)
+## Expanded ML-KEM key and Ed25519 signer
 
 - `kex.Expanded` (union: `.none` / ML-KEM-512 / ML-KEM-768 / ML-KEM-1024 `SecretKey`, ~12 KB for the larger arm) is the
   expanded decapsulation key. `generateExpanded` returns it from the same keygen that makes the share;
@@ -212,8 +180,8 @@ buffer is `Hkdf.prk_length` or `Hmac.mac_length`.
   (public-half check against the stored key, constant-time compare, and `R = r·B`), std's scalar
   arithmetic and SHA-512. Byte-identical to std's signer (KAT: RFC 8032 §7.1 TESTs 1 and 2, plus a
   differential over random seeds/lengths). h, a, r and the nonce hash are wiped.
-- ECDSA P-256 verify no longer calls std's `toUncompressedSec1` (a field inversion per call) for a
-  `z == 1` key: 1.14x to 0.87x OpenSSL.
+- ECDSA P-256 verify does not call std's `toUncompressedSec1` (a field inversion per call) for a
+  `z == 1` key (`certverify.zig`, the helper documented at the `pk.toUncompressedSec1()` wrapper).
 
 ## Constant-time contract
 
@@ -231,61 +199,60 @@ std's; a key crosses into `p256`/`p384` as its octets. The only comparison here 
 (`timing_safe.eql`, pinned in `scripts/checks/ct-compare-expected.tsv`). Verification handles
 public data only.
 
+
 `kex`: the secrets are the ephemeral scalars / ML-KEM seed and the shared secret. The
 arithmetic is the collection's for the curves (`ct25519.X25519`, `p256`, `p384`: their
-`*Into` forms, burned and ctgrind-checked there; std's curves only check the scalar range) and
-the collection's `mlkem` module for ML-KEM (switched from std 2026-11-01; the ctgrind rows below were measured on std's and are to be re-measured); the code here branches only on the public group
+`*Into` forms, burned and ctgrind-checked there; std's curves only check the scalar range), for ML-KEM
+(the `mlkem` module) and for FFDHE (`montint`); the code here branches only on the public group
 id and on lengths. Every seed and every derived intermediate (expanded decapsulation key, raw
 shared secrets) is wiped before return; on an error the `out` secret is zeroed.
 
-Machine-checked (`scripts/checks/ctgrind.sh tls13`, ReleaseFast, 21 rows, `src/ctgrind_harness.zig`;
+Machine-checked (`scripts/checks/ctgrind.sh tls13`, ReleaseFast, 31 rows, `src/ctgrind_harness.zig`;
 counts pinned in `scripts/checks/ctgrind-expected.tsv`, controls and traps 0):
 
 - `ks256`, `ks384`: the whole schedule (early, binder, handshake, traffic, master, application,
   exporter, resumption, traffic update, finished, key/iv) over a tainted PSK and DHE secret:
-  **0** in-file (the 20 contexts are the printed result: the propagation witness).
+  **0** in-file.
 - `kex`, per group, `<group>_shared` (`sharedSecret`, private key tainted) and `<group>_server`
-  (`serverExchange`, the random source tainted, i.e. the ephemeral scalar / ML-KEM `m`):
-  x25519 0/0, secp256r1 3/6, secp384r1 0/2, secp521r1 0/2, X25519MLKEM768 37/0, SecP256r1MLKEM768 40/6,
-  SecP384r1MLKEM1024 65/2, ML-KEM-512 17/0, ML-KEM-768 37/0, ML-KEM-1024 65/0. Attribution of every nonzero context:
-  - **rejection-sampling verdict** (OURS, `kex.zig` `generateNistAt` :301/:302, the `*_server` rows
-    of the NIST curves incl. secp521r1 and their hybrids, 1-2 contexts each): a candidate >= n or zero is redrawn;
+  (`serverExchange`, the random source tainted, i.e. the ephemeral scalar / ML-KEM `m`), in-file contexts
+  shared/server: x25519 0/0, secp256r1 3/6, secp384r1 0/2, secp521r1 0/2, X25519MLKEM768 0/0,
+  SecP256r1MLKEM768 3/6, SecP384r1MLKEM1024 0/2, ML-KEM-512/768/1024 0/0, ffdhe2048 and ffdhe3072 1/2
+  (ffdhe4096..8192 have no row). Attribution of every nonzero context:
+  - **rejection-sampling verdict** (OURS, `generateNistAt` in `kex.zig`, the `*_server` rows of the NIST
+    curves incl. secp521r1 and their hybrids, 1-2 contexts each): a candidate >= n or zero is redrawn;
     it reveals only that a discarded draw was out of range (p ~ 2^-32 / 2^-190), never the accepted
     value (same pattern as hpke's `deriveKeyPair` rows).
-  - the `p256` module's own (`ecdh.zig:55`/`:56` identity and on-curve verdicts, `group.zig:567`
-    `mulCtWindowed`, `group.zig:694` `combMulBaseFastWithTable`; 3 in each secp256r1 `*_shared` row
-    and 4 in the `*_server` rows besides the sampler): the same contexts as `hpke` `p256_decap`;
+  - the `p256` module's own (identity and on-curve verdicts in `ecdh.zig`, `mulCtWindowed` and
+    `combMulBaseFastWithTable` in `group.zig`; 3 in each secp256r1 and SecP256r1MLKEM768 `*_shared` row
+    and more in the `*_server` rows besides the sampler): the same contexts as `hpke` `p256_decap`;
     `ct25519` X25519 and `p384` contribute 0.
-  - std ML-KEM (measured before the 2026-11-01 switch to `mlkem`; re-measure), never this module: `ml_kem.zig:1950` `sampleUniformRejection` (16 / 36 / 36 / 36 / 64 / 64
-    contexts, ML-KEM-512 / ML-KEM-768 / X25519MLKEM768 / SecP256r1MLKEM768 / ML-KEM-1024 / SecP384r1MLKEM1024: the public matrix A is sampled from rho, which comes out of the tainted compact seed
-    that `sharedSecret` re-expands per FIPS 203; rho is public in the encapsulation key) and
-    `ml_kem.zig:1429` `ctneq` (the FO re-encryption verdict that drives `cmov`; 1 per ML-KEM group).
+  - **FFDHE zero-exponent rejection** (`ffdhe.zig`: a draw of 0 in `generate`, a wiped key in `shared`):
+    reveals only x == 0, an event of probability 2^-225 or less.
 - `sign_*` (`certverify.sign`, signing key tainted): P-384 **0**, P-521 **0** (those modules
   declassify the signature; a printed copy of the key is the taint-arrival witness), P-256 10
-  (`p256`'s signer: std's `deterministicScalar` rejection loop (5), `finalizePrehashed` r/s == 0
-  verdicts (2), the comb (1) and `sign.zig:355`'s key-range verdict (2); was 23 before 2026-11-01, when
-  `p256` began declassifying the published r/s so `rawToDer`/memcpy of the signature no longer count), Ed25519 2 since the signer runs on `ct25519`'s comb (2026-10-31; was 4 with std's
-  signer: `pcMul16` x2 and std's public-key `mem.eql`): `certverify.zig:754`, the verdict of the
-  `timing_safe.eql` derived-vs-stored public key check (says only that the key is inconsistent),
-  and `:772`, the identity verdict on R = r·B (r ≡ 0 mod L, unreachable in practice), RSA-PSS 2 (`rsa`'s blinding-pair redraw
-  verdict and its Bellcore fault-check verdict). ML-DSA has no row (the signer is std's).
+  (`p256`'s signer: std's `deterministicScalar` rejection loop, `finalizePrehashed` r/s == 0
+  verdicts, the comb and the key-range verdict in `sign.zig`), Ed25519 2 (the signer runs on `ct25519`'s
+  comb: the verdict of the `timing_safe.eql` derived-vs-stored public key check, which says only that the
+  key is inconsistent, and the identity verdict on R = r·B, r ≡ 0 mod L, unreachable in practice),
+  RSA-PSS 2 (`rsa`'s blinding-pair redraw verdict and its Bellcore fault-check verdict). ML-DSA has
+  no row (the signer is std's).
 
-The only contexts in this module's own code are the sampler verdict above and `certverify.zig:726`;
-neither depends on a secret beyond a verdict. `dtls hs` additionally covers the schedule inside a
-handshake.
+The only contexts in this module's own code are the sampler verdict above and the Ed25519 verdicts of
+`certverify.zig`; neither depends on a secret beyond a verdict. `dtls hs` additionally covers the schedule
+inside a handshake.
 
 Dead stack (`CONVENTIONS.md` §2.1.1): secrets in by `*const`, out through out-pointers;
 `expandLabel`, `earlySecret`, `pskBinder`, `deriveHandshakeSecret`, `deriveMasterSecret` and
-`computeFinishedVerifyData` run their body under an 8 KiB burn (`burn.ks_burn`), the chaining
-steps need none. `certverify.sign` runs each signer under its own burn (`ecdsa_burn` 48 KiB,
-`ed25519_burn` 40 KiB, `rsa_burn` 8 KiB above `rsa`'s own); secret keys are borrowed by pointer
-in every `SecretKey` variant. Probed by `dtls`'s `stackprobe_test.zig`/`stackprobe2_test.zig`
-(ReleaseFast), through the `keyschedule` shim and the `certverify` re-export. `kex`'s entry
-points burn per group (`kex_x25519_burn` 96 KiB, `kex_p256_burn` and `kex_p384_burn` 112 KiB,
-`kex_hybrid_burn` 160 KiB, `kex_p256_hybrid_burn` 112 KiB (deepest 65.7 / 49.4 / 73.3 KiB),
-`kex_p384_hybrid_burn` 160 KiB (deepest 98.5 / 67.1 / 107.0 KiB, measured 2026-10-31), ~1.5–2× the unburned ReleaseFast depth, deepest 58 / 64 / 67 / 78 KiB) and are probed by
-this module's own `stackprobe_test.zig` (residue below the burn, secrets as needles). Cost: one
-burn per exchange, ~2–3 µs of stack zeroing at ~50 B/ns.
+`computeFinishedVerifyData` run their body under a burn (`burn.ks_burn`), the chaining
+steps need none. `certverify.sign` runs each signer under its own burn (`ecdsa_burn`,
+`ed25519_burn`, `rsa_burn` above `rsa`'s own, `mldsa_sign_burn` / `mldsa_verify_burn` per parameter set);
+secret keys are borrowed by pointer in every `SecretKey` variant. `kex`'s entry points burn per group
+(`kex_x25519_burn`, `kex_p256_burn`, `kex_p384_burn`, `kex_p521_burn`, `kex_hybrid_burn`,
+`kex_p256_hybrid_burn`, `kex_p384_hybrid_burn`, `kex_mlkem512/768/1024_burn`, `kex_ffdhe_burn`). The
+sizes live in `src/burn.zig`, next to the measured depth they cover. They are probed by `dtls`'s
+`stackprobe_test.zig`/`stackprobe2_test.zig` (ReleaseFast) through the `keyschedule` shim and the
+`certverify` re-export, and for `kex` by this module's own `stackprobe_test.zig` (residue below the
+burn, secrets as needles). Cost: one burn per exchange, of the order of microseconds of stack zeroing.
 
 ## Limits and refusals
 
@@ -298,13 +265,15 @@ asserts guard misuse, not input. The key schedule has no runtime errors.
 the wrong family, a short output buffer, a missing `Random` for RSA-PSS, a degenerate or
 inconsistent secret key (`KeyMismatch`, including an Ed25519 key whose embedded public half is
 not its own — checked in every mode, std checks it only under runtime safety), an RSA fault
-(`FaultDetected`), and any malformed or wrong signature (`InvalidSignature`).
+(`FaultDetected`), a `random` that cannot deliver an RSA blinding factor in a bounded number of
+draws (`EntropyFailure`), and any malformed or wrong signature (`InvalidSignature`).
 
 `kex` refuses with `MissingKeyShare` (a group it does not compute, a peer share of other than
 the group's exact length) or `KeyExchangeFailed` (X25519 low-order / identity results — in the
 hybrid's X25519 half too —, a P-256 point off the curve, a non-canonical ML-KEM encapsulation
 key, a private key shorter than the group needs, 64 failed P-256/P-384 scalar draws; in the NIST
-hybrids also a leading point that is off the curve or not `0x04`-formed). A forged hybrid
+hybrids also a leading point that is off the curve or not `0x04`-formed; for an ffdhe group a
+peer value of 0, 1, p − 1 or ≥ p, and a wrong length is `MissingKeyShare`). A forged hybrid
 ciphertext is NOT refused here: FIPS 203 implicit rejection decapsulates it to a garbage secret
 and the handshake fails at Finished.
 
@@ -367,35 +336,38 @@ HkdfLabel built in C, and TLS13-KDF) and asserts they agree.
 
 **Anchor grade:** class A · oracle EXTERNAL
 
-## Fuzzing
+## Verification
 
-`src/fuzz_test.zig`, harness `tls13-certverify` (`TLS13_FUZZ=<runs>[,<first seed>]`, testkit's
-deterministic driver; `zig build --fuzz` keeps working through a `ScriptSource`). For each KAT key
-(ECDSA P-256/P-384, Ed25519, RSA-PSS SHA-256) the genuine signature is accepted; a damaged
-signature (random octets, and the DER SEQUENCE / INTEGER headers aimed at), truncation and
-extension, a flipped transcript-hash bit and the other side's context string are
-`InvalidSignature`; a key of another family is `KeyMismatch`; an arbitrary scheme code point,
-transcript-hash length and signature bytes is refused without a panic; a quarter of runs signs a
-fresh transcript hash (ECDSA, Ed25519; deterministic and with noise) and verifies it back.
-`fuzz harness: … reaches every outcome` runs 200 seeds in every test lane and fails if a label
-never fires.
+Run: `scripts/modtest tls13`; the live OpenSSL oracle is `zig build interop-tls13` (see *Interop*), the
+benchmark `zig build bench-tls13` (see *Performance*), the example `zig build run-example-tls13`.
 
-Verdict 2026-10-20: 8 × 40,000 runs, ReleaseSafe, clean (~420 runs/s per job under full load).
-Harness checked by five planted mutants (schemata, one build): context string ignoring the side,
-P-256 verify ignoring the verdict, Ed25519 length check removed (a panic), the content's 0x00
-separator changed, RSA-PSS verify on a shortened signature — each caught on the first seeds.
-
-`tls13-kex`: for each group a genuine `generate` → `serverExchange` → `sharedSecret` agrees on
-both sides; a damaged client share (server side) and a damaged server share (client side) —
-random octets, the SEC1 form octet, an all-zero X25519 point or a zeroed hybrid X25519 half,
-the SEC1 form octet of the NIST hybrids' leading point (2026-10-31: both NIST hybrids join the seven-group
-rotation, with their own `agree_*` labels; 2026-11-01: secp521r1, MLKEM512 and MLKEM768 make it ten), the last coordinate octet, truncation and extension — end in a typed error or an exchange, and
-the damage that makes a share unusable by construction (zero point, zeroed X25519 half, a SEC1
-form octet other than 0x04, any length change) MUST be refused; a failure leaves `out` zeroed;
-an arbitrary group code point never succeeds unless the group is one it computes. Verdict
-2026-10-20: 8 × 20,000 runs, ReleaseSafe, clean (~570 runs/s per job). Four planted mutants
-caught: X25519 identity accepted, the error-path zeroing removed, the hybrid halves swapped on
-the client, the hybrid client-share length check removed (a panic).
+- **Test classes:** key schedule (RFC 8448 §3 and §4 byte for byte, the `dtls13` prefix against an independent
+  Python reimplementation, "traffic upd" against std's `hkdfExpandLabel`), `certverify` (signed content byte-exact,
+  verify KATs for every scheme, deterministic ECDSA/Ed25519 sign byte-exact, tamper and reject paths),
+  `kex` (per-group KATs, hybrid halves pinned against the primitives, NIST hybrids against the Go composition
+  oracle in `src/kex_nist_hybrid_kat.zig`, FFDHE in `src/ffdhe_test.zig` with KATs against Python `pow()` for
+  ffdhe2048/3072, peer-value refusals and a dead-RNG fail-closed case), `transcript` (RFC 8448 §3 and §5),
+  stack probes (`src/stackprobe_test.zig`: residue below the burn, secrets as needles), the hermetic replay of the
+  live OpenSSL oracle (`src/openssl_oracle_test.zig` over `src/openssl_oracle_vectors.zig`, regenerated by
+  `interop-tls13 -- --write`), and `src/mutation_test.zig` (tests added to kill surviving mutants).
+- **Oracles:** see *Anchoring* (RFC 8448, Python, Go 1.26, std) and *Interop* (OpenSSL 3.5 libcrypto, live).
+- **Fuzz** (`src/fuzz_test.zig`; `TLS13_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver; each harness's "reaches every outcome" test runs 200 seeds in
+  every test lane and fails if a label never fires):
+  - `tls13-certverify`: for each KAT key (ECDSA P-256/P-384, Ed25519, RSA-PSS SHA-256) the genuine signature is
+    accepted; a damaged signature (random octets, and the DER SEQUENCE / INTEGER headers aimed at), truncation and
+    extension, a flipped transcript-hash bit and the other side's context string are `InvalidSignature`; a key of
+    another family is `KeyMismatch`; an arbitrary scheme code point, transcript-hash length and signature bytes is
+    refused without a panic; a quarter of runs signs a fresh transcript hash (ECDSA, Ed25519; deterministic and with
+    noise) and verifies it back.
+  - `tls13-kex`: for each group (the ten curve / ML-KEM / hybrid groups and ffdhe2048/3072) a genuine `generate` →
+    `serverExchange` → `sharedSecret` agrees on both sides; a damaged client share (server side) and a damaged
+    server share (client side) — random octets, the SEC1 form octet (also the NIST hybrids' leading point), an
+    all-zero X25519 point or a zeroed hybrid X25519 half, the last coordinate octet, truncation and extension — end
+    in a typed error or an exchange, and the damage that makes a share unusable by construction (zero point, zeroed
+    X25519 half, a SEC1 form octet other than 0x04, any length change) MUST be refused; a failure leaves `out`
+    zeroed; an arbitrary group code point never succeeds unless the group is one it computes.
+- **ctgrind:** the 31 rows of *Constant-time contract*.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## What is deliberately not done
 
@@ -406,40 +378,35 @@ the client, the hybrid client-share length check removed (a panic).
 
 ## Backlog / deferred
 
-- **P1, 2026-11-13 (Zig 0.17.1, `bench-tls13` on a loaded host):** `cli_x25519` 1.296× → 1.240× aws-lc-rs after `ct25519` P9 (asm `cswap`, fused add/sub) — under 1.25 but inside the 6–7 % spread; re-measure on a quiet host before the card says P1. `sign_rsa_pss_rsae_sha256` 1.06–1.12× OpenSSL (2026-11-13). **Corrected 2026-11-15** (perf + disassembly of libcrypto's hot loop): OpenSSL signs RSA-2048 here with its scalar MULX/ADX code, not `rsaz_avx2` (it declines on a BMI2+ADX CPU). Both sides run at the same IPC, and the 1024-bit modexp is at parity (montint SPEC "Almost-Montgomery ladder", which also took −2.8 % off it). What remains is mostly the stateless `.csprng` base blinding `rsa.signPss` does per call, ~5–6 % of a 2048 private op (the fresh `r`, its inverse and `r^e`). OpenSSL caches a blinding pair per key. Closing that needs an rsa entry point taking a `Blinding` (`.cached` with a per-key `BlindingCache`, as `signPkcs1v15Blinded` has) and a mutable per-key cache held next to `certverify.SecretKey.rsa`: an API/ownership decision, not done. Re-measured 2026-11-15 (loaded host, one run each, OpenSSL spread up to 8 %): base 1.041×, with the ladder 1.050×. The ~2.5 % modexp gain is below this row's noise.
-
-- **Engine support for secp521r1 / MLKEM512 / MLKEM768** (2026-11-01): `kex` computes them (OpenSSL oracle both ways); `tlsserver` and `dtls` keep their offered/accepted group lists, so no engine offers them yet.
-
+- **Performance: `cli_x25519` and `sign_rsa_pss_rsae_sha256`.** `cli_x25519` (`ct25519`'s ladder against
+  s2n-bignum) is the row over the 1.25× fastest-candidate bound; re-measure on a quiet host before the card says
+  P1. `sign_rsa_pss_rsae_sha256` is the worst row against OpenSSL (figures on the card). OpenSSL signs RSA-2048
+  here with its scalar MULX/ADX code (`rsaz_avx2` declines on a BMI2+ADX CPU); both sides run at the same IPC and
+  the 1024-bit modexp is at parity (`montint` SPEC "Almost-Montgomery ladder"). What remains is mostly the
+  stateless `.csprng` base blinding `rsa.signPss` does per call, ~5–6 % of a 2048-bit private op (the fresh `r`,
+  its inverse and `r^e`); OpenSSL caches a blinding pair per key. Closing it needs an `rsa` entry point taking a
+  `Blinding` (`.cached` with a per-key `BlindingCache`, as `signPkcs1v15Blinded` has) and a mutable per-key cache
+  held next to `certverify.SecretKey.rsa`: an API/ownership decision, not done.
+- **Engine support for secp521r1 / MLKEM512 / MLKEM768:** `kex` computes them (OpenSSL oracle both ways);
+  `tlsserver` and `dtls` keep their offered/accepted group lists, so no engine offers them yet.
 - **End-to-end interop for SecP256r1MLKEM768 / SecP384r1MLKEM1024:** `tlsserver` (and
   `tlsclient`/`dtls`) must offer and accept the groups; only then does a real Go 1.26 / rustls
   handshake anchor them beyond the composition oracle. `tlsserver` sizes buffers from
-  `kex.max_*_share_len` (now 1665); the engines' group policy is theirs.
-
+  `kex.max_*_share_len` (1665); the engines' group policy is theirs.
 - **Signing without re-deriving the public key:** `sign` gets a secret key and recomputes
   `d·G` before every ECDSA signature (the public half is not used by the signature): ~7 % of a
-  `tlsserver` P-256 handshake (profile 2026-10-21). A `SecretKey` variant holding the
+  `tlsserver` P-256 handshake (profile). A `SecretKey` variant holding the
   collection's `KeyPair` would drop it — an API change for `dtls` and `tlsserver`.
 - **SHA-384 HMAC state caching in the key schedule:** 18 % of a `tlsserver`
-  TLS_AES_256_GCM_SHA384 handshake is SHA-384 (profile 2026-10-21), mostly lone-block HMACs
+  TLS_AES_256_GCM_SHA384 handshake is SHA-384 (profile), mostly lone-block HMACs
   that recompute the ipad/opad blocks of the same secret; `sha2` does not help lone blocks.
-- ✅ DONE 2026-10-20 (`2fae1fcf8`: `kex.zig` secp384r1 group 0x0018, `generate`/`sharedSecret`/`serverExchange`, `scalarLen`). **secp384r1 key exchange** (`kex`): the web-server consumer fork serves it by default; `tlsserver` M1 adds it
-  (std `P384`, KAT against `cryptography`/OpenSSL) so a P-384-only client is not regressed.
 - **Certificate-authentication helpers** (`dtls/certauth.zig`): deferred to `tlsserver` M2
   (client auth), where the one-hop `verifyLeafAgainstAnchor` gives way to `x509.verifyChain`.
 - **Survey** for the Scope line (rustls `tls13::key_schedule`, Go `crypto/tls` key_schedule.go).
-- **Constant-time verify helpers** (review 2026-10-28): `computeFinishedVerifyData` and
+- **Constant-time verify helpers:** `computeFinishedVerifyData` and
   `pskBinder` hand out the MAC and only DOCUMENT `timing_safe.eql`; a `verifyFinished` /
   `verifyPskBinder` that compares and wipes would take the mistake away from every consumer.
   `tlsserver`'s Finished compare is right; it does not use `pskBinder`.
-- **Stack requirement per entry point** (review 2026-10-28): ML-DSA-87 verify/sign need
+- **Stack requirement per entry point:** ML-DSA-87 verify/sign need
   ~340/260 KiB and the ML-KEM arms 160–256 KiB of burn (`burn.zig`), so a small-stack worker
   thread overflows on a peer that picks them. State a `stack_requirement` per entry point.
-
-## Open
-
-- Historical (the Maturity card has the current dates: review and mutation 2026-10-28). The
-  code is `dtls`'s, reviewed there (2026-09-10), plus the five new derivations of 2026-10-20
-  (anchored). The 2026-10-31 NIST hybrids are new since that review (not yet reviewed or mutated).
-  `certverify` moved unchanged apart from its doc comments; `kex` moved with one API change
-  (secrets out through out-pointers, per-group burns, `out` zeroed on error) and otherwise the
-  same code. `transcript` moved and became generic over the hash.

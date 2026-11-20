@@ -1,15 +1,18 @@
 # tls13
 
 The TLS 1.3 handshake building blocks shared by the collection's TLS-family engines: `dtls`
-(DTLS 1.3) and the planned `tlsserver` (TLS 1.3 over TCP). Today that is:
+(DTLS 1.3) and `tlsserver` (TLS 1.3 over TCP). They are:
 
 - the RFC 8446 §7.1 key schedule, instantiated once per protocol label prefix —
   `keyschedule.tls13` (`"tls13 "`) and `keyschedule.dtls13` (`"dtls13"`, RFC 9147 §5.9) —
   including the resumption, exporter and KeyUpdate steps;
 - `certverify`: the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify for
   ECDSA P-256/P-384/P-521, Ed25519, RSA-PSS (`rsa_pss_rsae_sha256/384/512`) and pure ML-DSA-44/65/87;
-- `kex`: the (EC)DHE key exchange for x25519, secp256r1, secp384r1, secp521r1, the three ML-KEM hybrids and ML-KEM-512/768/1024 — a
-  client's share, the server's one-step answer, the client's shared secret.
+- `kex`: the (EC)DHE key exchange for x25519, secp256r1, secp384r1, secp521r1, the three ML-KEM hybrids,
+  ML-KEM-512/768/1024 and the RFC 7919 groups ffdhe2048..ffdhe8192 — a client's share, the server's one-step
+  answer, the client's shared secret;
+- `transcript`: the handshake transcript hash over SHA-256 or SHA-384 (PSK binder truncation, HelloRetryRequest
+  `message_hash`).
 
 Pure functions over caller bytes: no I/O, no allocation, no key storage, no
 handshake decisions.
@@ -17,8 +20,8 @@ handshake decisions.
 - **Model after:** RFC 8446 §7 and RFC 9147 §5.9; the API split follows rustls's
   `tls13::key_schedule` (one function per derivation, secrets through out-pointers).
 - **Platform:** any (pure computation). **Role:** codec. **Concurrency:** reentrant.
-  **Deps:** `rsa` (RSA-PSS); otherwise std (HKDF/HMAC, ECDSA, Ed25519, X25519, P-256,
-  ML-KEM-768).
+  **Deps:** `rsa` (RSA-PSS), `ct25519`, `p256`, `p384`, `p521` (key exchange and ECDSA
+  arithmetic), `mlkem` (the ML-KEM groups), `montint` (the ffdhe groups); otherwise std (HKDF/HMAC, SHA-2).
 
 Provenance: original work of the zig-libs authors (MIT), written from RFC 8446 / RFC 9147 —
 public standards, not copyrightable works. The test vectors are RFC 8448's, an independent
@@ -63,11 +66,13 @@ received Finished or binder with `std.crypto.timing_safe.eql`, never `std.mem.eq
 
 ## Tests
 
-`zig build test-tls13`. Anchors: RFC 8448 §3 (early, handshake, master, traffic, exporter and
-resumption master secrets, finished key, traffic key/iv) and §4 (resumption PSK, res binder key,
-binder), an independent Python oracle for the `dtls13` prefix, and std's
-`std.crypto.tls.hkdfExpandLabel` for `traffic upd` at SHA-256 and SHA-384. `certverify`: the
-signed content byte-exact, verify KATs for every scheme (RSA-PSS by OpenSSL, Ed25519 by
-`cryptography`), deterministic ECDSA/Ed25519 sign reproduced byte-exact, tamper and reject-path
-tests. Fuzz: `TLS13_FUZZ=<runs>` drives the `tls13-certverify` and `tls13-kex` harnesses (see `SPEC.md`
-§ Fuzzing). Example: `zig build run-example-tls13`.
+`scripts/modtest tls13` (or `zig build test-tls13`). Anchors: RFC 8448, an independent Python oracle, std's
+`hkdfExpandLabel`, OpenSSL 3.5 (live through `zig build interop-tls13`, replayed hermetically in the tests),
+Go 1.26 for the NIST hybrids. Fuzz: `TLS13_FUZZ=<runs>` drives the `tls13-certverify` and `tls13-kex` harnesses.
+Example: `zig build run-example-tls13`. SPEC.md § Verification has the full list.
+
+## Not provided
+
+Handshake messages, the state machine, record protection, certificate parsing and chain verification, early-data
+secrets and the policy of which signature scheme or group to offer stay in the engines (`dtls`, `tlsserver`,
+`tlsclient`); SPEC.md *What is deliberately not done* and *Backlog / deferred* have the reasons and the open items.
