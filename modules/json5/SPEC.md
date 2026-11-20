@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — the json5 crate 1.3.1 (callum-oakley/json5-rs, the fastest JSON5 reader measured, see Performance) accepts a document whose block comment never closes (`{a: 1} /* unterminated` → `{"a":1}`): its comment skipper stops at end of input without an error, so a config cut off inside a comment reads as complete; json5/json5 2.2.3 and this module refuse it (test "lead: a truncated block comment is refused", probe `tools/rs_field/src/bin/lead.rs`) (measured 2026-10-24) · correctness — the same crate reads the string `'\9'` as `"9"` (its `'1'..'9'` escape range excludes `9`; ES5.1 §7.8.4 has no `\8`/`\9` escape); the reference and this module refuse it (test "lead: `\8` and `\9` are no escapes") (measured 2026-10-24) · feature — an integer literal past 128 bits (`123456789012345678901234567890123456789012`) is a number here (a `number_string` in a `std.json.Value`, 1.2345678901234568e41 in an `f64`, as the reference reads it); both Rust crates refuse it ("number too large" / "Invalid integer literal") (test "lead: an integer past 128 bits is a number") (measured 2026-10-24)
 
-**Audit:** review 2026-11-12 · mutation 2026-11-18 (61/68, 7 eq) · src b7bda3817151b41c
+**Audit:** review 2026-11-12 · mutation 2026-11-18 (61/68, 7 eq) · src e14f8f3a49646e4b
 
 **Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, JSON5_FUZZ; 3 harnesses incl. the single-pass reader against the two-stage path, ReleaseSafe) · ct n/a — JSON5 parsing (keyword review, 2026-10-07) · panic 2026-10-28 (coordinator pass + independent sweep of every pub entry point: the diagnostic prefix no longer grows with an input run of `_` (quadratic output), recovery counters widened)
 

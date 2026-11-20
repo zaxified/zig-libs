@@ -633,7 +633,7 @@ test "write: structs, optionals, enums, slices, tuples, unions" {
     try testing.expectEqualStrings("\"q\"", val);
 }
 
-// ── survivors of the 2026-11 whole-module mutation run ──────────────────────
+// ── survivors of the whole-module mutation run ──────────────────────
 
 fn parseAndRender(json: []const u8, opts: Options) ![]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});

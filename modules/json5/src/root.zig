@@ -1857,7 +1857,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     closed = true;
                     const msg = try alloc.print("unterminated string at line {d}", .{lines.at(input, str_start)});
                     pending_value_errs.append(alloc, msg) catch |e| {
-                        alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                        alloc.free(msg); // not queued: nobody else frees it
                         return e;
                     };
                     i = skipValue(input, i);
@@ -1900,7 +1900,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 try out.append(alloc, '"');
                 const msg = try alloc.print("unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
                 pending_value_errs.append(alloc, msg) catch |e| {
-                    alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                    alloc.free(msg); // not queued: nobody else frees it
                     return e;
                 };
             }
@@ -1932,7 +1932,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     closed = true;
                     const msg = try alloc.print("unterminated string at line {d}", .{lines.at(input, str_start)});
                     pending_value_errs.append(alloc, msg) catch |e| {
-                        alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                        alloc.free(msg); // not queued: nobody else frees it
                         return e;
                     };
                     i = skipValue(input, i);
@@ -1975,7 +1975,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 try out.append(alloc, '"');
                 const msg = try alloc.print("unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
                 pending_value_errs.append(alloc, msg) catch |e| {
-                    alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                    alloc.free(msg); // not queued: nobody else frees it
                     return e;
                 };
             }
@@ -2240,7 +2240,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                                 trimForMessage(ident), err_line,
                             });
                             pending_value_errs.append(alloc, msg) catch |e| {
-                                alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                                alloc.free(msg); // not queued: nobody else frees it
                                 return e;
                             };
                         }
@@ -4061,7 +4061,7 @@ test "diagnostic prefix stays short whatever runs of '_' the input holds (no-pan
     try std.testing.expectEqual(@as(usize, 3 + 64), parsed.value.object.count());
 }
 
-// ── survivors of the 2026-11 whole-module mutation run ──────────────────────
+// ── survivors of the whole-module mutation run ──────────────────────
 // Each test below pins a guard no earlier test looked at; the comment names it.
 
 fn msHas(out: []const u8, needle: []const u8) !void {
@@ -4554,7 +4554,7 @@ test "strings past one vector: a control byte inside the first vector" {
     try std.testing.expectEqualStrings("\"\\u001f" ++ pad ++ "\"", out);
 }
 
-// ── nesting limit (wave 7, J-2) ────────────────────────────────────────────
+// ── nesting limit ─────────────────────────────────────────────────────
 
 const DeepNode = struct { children: []const DeepNode = &.{} };
 
