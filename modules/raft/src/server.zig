@@ -22,7 +22,7 @@
 //! the cluster into a majority and a minority side (the case leader election and
 //! the commit rule must survive) and heal.
 //!
-//! History: until 2026-10-04 this file held its own copy of the Raft plumbing
+//! History: this file held its own copy of the Raft plumbing
 //! around the kernel (timers, vote tally, nextIndex/matchIndex, the apply
 //! loop), and `example-apps/raft-kv` held a second one. The model-check
 //! verified the first; nothing verified the second, and it had drifted (no
@@ -1082,7 +1082,7 @@ test "real: a crashed server restarts from its disk alone and the cluster stays 
 // every peer whose entries exceed the cap — at its own current term, from
 // index 1. The receivers must drop every one (counted in `malformedDropped`),
 // and the cluster must stay safe and keep committing. What pins the refusal
-// is the COUNTER, not the invariants: measured 2026-11-18 (mutation run, the
+// is the COUNTER, not the invariants: measured (mutation run, the
 // follower's cap check removed), the accepted hostile entries were repaired
 // by the honest leader's walk-back before any of the five properties could
 // see them, and only `received == malformedDropped()` failed.

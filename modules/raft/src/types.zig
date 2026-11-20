@@ -947,7 +947,7 @@ test "corpus: every raft seed reaches its decoder, and what each accepted is pin
     // would score full marks on "accepted" while never entering the entry loop,
     // which is where the out-of-bounds write these guards exist for lives.
     //
-    // Measured 2026-09-07 — every counter below was 0 before the draws were
+    // Measured — every counter below was 0 before the draws were
     // fixed, because every decoder saw `""`: `tagOf` refuses the empty payload,
     // and so does every other decoder here. After: 9/9/10/15/11 seeds non-empty
     // (minus the one deliberately empty seed in each corpus), 6 tags, 5 log
@@ -1038,7 +1038,7 @@ test "corpus: every raft seed reaches its decoder, and what each accepted is pin
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

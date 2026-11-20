@@ -17,7 +17,7 @@
 //!
 //! **Status: mvp.** Not yet: snapshots / log compaction, membership changes
 //! (`jointMajority` implemented, not wired), linearizable reads (PreVote,
-//! CheckQuorum and leadership transfer are in) — see SPEC.md § Backlog.
+//! CheckQuorum and leadership transfer are in) — see SPEC.md § Backlog / deferred.
 //!
 //! **What the LIVE sweep actually catches** — stated explicitly, because a
 //! checker that cannot fail is worse than no checker:

@@ -29,9 +29,9 @@
 //! Every consensus DECISION is the kernel's (`safety.zig`): the vote grant, the
 //! AppendEntries consistency check and conflict-only truncation, the Figure-8
 //! commit rule, term observation. This file is the plumbing the model-check
-//! used to own (`server.zig` before 2026-10-04) moved to where a deployment can
-//! reach it: `server.RaftServer` now runs N of these inside `netsim`, so the
-//! fuzzed fault sweep checks exactly the code a consumer runs.
+//! used to own moved to where a deployment can reach it: `server.RaftServer`
+//! now runs N of these inside `netsim`, so the fuzzed fault sweep checks
+//! exactly the code a consumer runs.
 //!
 //! Structural fixes that came with the move. Elections are tick-driven: every
 //! non-leader counts toward its timeout on every tick, so "a step-down forgot
@@ -53,7 +53,7 @@
 //! proposals, brings the target's log up to date and tells it to campaign at
 //! once; abandoned after one election timeout.
 //!
-//! Not here yet (see SPEC.md § Backlog): snapshots / log compaction, membership
+//! Not here yet (see SPEC.md § Backlog / deferred): snapshots / log compaction, membership
 //! change, linearizable reads. The whole log
 //! lives in memory, and so does every entry's data.
 
@@ -764,7 +764,7 @@ pub const Node = struct {
         self.transferee = no_vote;
         // A broadcast scheduled while leader must not go out after the step
         // down: `ready` would send the stale tail under the NEW term, as a
-        // leader of a term this node never won (review 2026-10-04, H1).
+        // leader of a term this node never won (review, H1).
         self.bcast_pending = false;
         self.resetElectionTimer();
     }

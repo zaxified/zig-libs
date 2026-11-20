@@ -54,7 +54,7 @@ pub const VoteReq = struct {
     /// (etcd/raft's `campaignTransfer` context, hashicorp/raft's
     /// `RequestVoteRequest.LeadershipTransfer`). Wire: an optional 26th byte
     /// (= 1), present only when set, so a frame without it is the 25-byte
-    /// RequestVote of before 2026-11-18; an older decoder refuses the longer
+    /// RequestVote of before; an older decoder refuses the longer
     /// frame. Never sent, and refused, on `pre_vote_req` (a transfer never
     /// pre-votes).
     transfer: bool = false,
@@ -113,14 +113,14 @@ pub const Tag = enum(u8) {
     append_req = 0x12,
     append_resp = 0x13,
     /// PreVote (Raft thesis §9.6; etcd/raft `MsgPreVote` / `MsgPreVoteResp`).
-    /// Added 2026-11-18 as new tags, the way this codec versions additions
+    /// Added as new tags, the way this codec versions additions
     /// (no version byte): an older decoder refuses them as an undefined tag
     /// (dropped and counted), so `Config.pre_vote` must only be switched on
     /// once every server runs a decoder that knows them.
     pre_vote_req = 0x14,
     pre_vote_resp = 0x15,
     /// Leadership transfer (Raft thesis §3.10; etcd/raft `MsgTimeoutNow`,
-    /// hashicorp/raft `TimeoutNow`). Added 2026-11-18 as a new tag, same
+    /// hashicorp/raft `TimeoutNow`). Added as a new tag, same
     /// caveat as PreVote: an older decoder drops it, so a transfer to a
     /// server that predates it is abandoned after one election timeout.
     timeout_now = 0x16,
