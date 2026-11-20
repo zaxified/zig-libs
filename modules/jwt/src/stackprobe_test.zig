@@ -698,3 +698,123 @@ test "STACKPROBE: no key, nonce or MAC-state residue on the dead stack after jwt
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
+
+// ── key loading: `PrivateKey.fromPem` and `VerifiedCache.init` ──────────────
+
+const pem_vectors = @import("pem_vectors.zig");
+
+/// The loaded key, outside the probed region (a global), and the PEM it
+/// came from.
+var pem_key: root.PrivateKey = undefined;
+var pem_text: []const u8 = "";
+
+noinline fn callPemLoad() void {
+    root.PrivateKey.fromPem(&pem_key, pem_text) catch unreachable;
+}
+
+/// The secrets a loaded key holds: EC `d`, the Ed25519 seed, RSA `d`, `p`,
+/// `q` (each in both byte orders). ML-DSA keys are left to the signing
+/// probe above: their expanded secret key carries public parts (`rho`, `tr`)
+/// a stack may legitimately hold.
+fn pemKeyNeedles(n: *Needles, k: *const root.PrivateKey) !void {
+    switch (k.*) {
+        .ecdsa_p256 => |*kp| addBoth(n, "d", &kp.secret_key.toBytes()),
+        .ecdsa_p384 => |*kp| addBoth(n, "d", &kp.secret_key.toBytes()),
+        .ecdsa_p521 => |*kp| addBoth(n, "d", &kp.secret_key.toBytes()),
+        .ed25519 => |*kp| addBoth(n, "seed", &kp.secret_key.seed()),
+        .rsa => |*kp| {
+            // `addBoth` reverses into 128 bytes; an RSA `d` is longer.
+            var buf: [512]u8 = undefined;
+            const len = kp.public_key.bits() / 8;
+            try kp.secret_key.d.toBytes(buf[0..len], .big);
+            n.addImage("rsa d", buf[0..len]);
+            try kp.secret_key.d.toBytes(buf[0..len], .little);
+            n.addImage("rsa d", buf[0..len]);
+            try kp.secret_key.p.v.toBytes(buf[0 .. len / 2], .big);
+            n.addImage("rsa p", buf[0 .. len / 2]);
+            try kp.secret_key.p.v.toBytes(buf[0 .. len / 2], .little);
+            n.addImage("rsa p", buf[0 .. len / 2]);
+            try kp.secret_key.q.v.toBytes(buf[0 .. len / 2], .big);
+            n.addImage("rsa q", buf[0 .. len / 2]);
+            try kp.secret_key.q.v.toBytes(buf[0 .. len / 2], .little);
+            n.addImage("rsa q", buf[0 .. len / 2]);
+        },
+        else => return error.UnexpectedKey,
+    }
+}
+
+test "STACKPROBE: no key residue on the dead stack after PrivateKey.fromPem" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    var seen: usize = 0;
+    for (pem_vectors.cases) |c| {
+        const probed = [_][]const u8{ "p256-sec1", "p384-pkcs8", "p521-sec1", "ed25519-pkcs8", "rsa-pkcs8", "rsa-pkcs1" };
+        const want = for (probed) |p| {
+            if (std.mem.eql(u8, p, c.name)) break true;
+        } else false;
+        if (!want) continue;
+        seen += 1;
+        Sha256.hash(c.name, &leak_src, .{});
+        pem_text = c.key_pem;
+        callPemLoad();
+        const n = fresh();
+        try pemKeyNeedles(n, &pem_key);
+        n.sort();
+        bad += try runProbe(c.name, callPemLoad, n);
+        pem_key.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 6), seen);
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+const ProbeCache = root.VerifiedCache(u8);
+var cache_out: ProbeCache = undefined;
+
+noinline fn callCacheInit() void {
+    cache_out = ProbeCache.init(std.heap.page_allocator, std.testing.io, .{ .capacity = 16 }) catch unreachable;
+}
+
+/// `init` returns the cache BY VALUE, MAC key included (CONVENTIONS §2.1.1
+/// D2; SPEC Backlog): one copy of that return value is measured on the dead
+/// stack (2026-11-20, ReleaseFast). The probe pins "at most that one", so a
+/// dropped wipe of `init`'s own `mac_key` local (a second copy) goes red.
+const cache_init_known_residue = 1;
+
+test "STACKPROBE: VerifiedCache.init leaves no copy of its MAC key on the dead stack beyond its by-value return" {
+    try skipUnlessOptimized();
+    var bad: usize = 0;
+    for (0..2) |i| {
+        Sha256.hash(&[_]u8{ 'c', 'a', 'c', 'h', 'e', @intCast(i) }, &leak_src, .{});
+        callCacheInit();
+        // The key `init` drew is the needle; each measured call draws a new
+        // one, so the needle is re-read after the run and the scan repeated.
+        const n = fresh();
+        n.addImage("mac_key", &cache_out.mac_key);
+        n.sort();
+        cache_out.deinit();
+        region_hi = stackHere() - PAD;
+        region_lo = region_hi - WINDOW;
+        const neg = measure(callInnocent, n);
+        for (neg) |h| try std.testing.expectEqual(@as(usize, 0), h);
+        scrubCalleeSaved();
+        paint();
+        shim(callCacheInit);
+        snapshot();
+        const n2 = fresh();
+        const base = n2.len;
+        n2.addImage("mac_key", &cache_out.mac_key);
+        if (n2.len == base) return error.SkipZigTest; // < 8 distinct bytes in the drawn key: nothing to look for (~never)
+        n2.sort();
+        const hits = scan(n2);
+        var sum: usize = 0;
+        for (hits) |h| sum += h;
+        const pos = measure(callLeaky, n2);
+        var pos_sum: usize = 0;
+        for (pos) |h| pos_sum += h;
+        if (sum > cache_init_known_residue or pos_sum == 0) std.debug.print("\n=== STACKPROBE jwt: VerifiedCache.init: residue {d}, POS={d} ===\n", .{ sum, pos_sum });
+        try std.testing.expect(pos_sum >= 1);
+        if (sum > cache_init_known_residue) bad += sum;
+        cache_out.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}

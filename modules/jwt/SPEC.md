@@ -355,8 +355,9 @@ Not wired into `Provider`/`Guard`/`ResourceServer` — see Backlog.
   `jwt-sign-verify`, `jwt-token-response` (in `src/root.zig`, shared plumbing in `src/fuzz_test.zig`).
 - **ctgrind:** rows `hmac`, `ec` and `rsa` in `scripts/checks/ctgrind-expected.tsv`; the card's Hardening
   line says what each covers. `timing_safe.eql` instead of `mem.eql` on a MAC is held by `check-ct-compare`.
-- **Stack probe:** `src/stackprobe_test.zig` (ReleaseFast) over the signing, HMAC and cache-key paths; PEM
-  loading and `VerifiedCache.init` are not probed (see Backlog).
+- **Stack probe:** `src/stackprobe_test.zig` (ReleaseFast) over the signing, HMAC and cache-key paths, PEM
+  loading (`PrivateKey.fromPem`: EC P-256/384/521, Ed25519, RSA PKCS#8 and PKCS#1; 0 residue of `d`, the
+  seed, RSA `d`/`p`/`q`) and `VerifiedCache.init` (at most the one by-value copy of the MAC key, see Backlog).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Performance
@@ -400,12 +401,11 @@ the figures and is authoritative.
   key, so folding a per-instance constant into the key never changes a hit; separate callers are
   kept apart by separate instances already. The docs say so; open: either remove the field
   (breaking) or make it effective.
-- **Dead-stack probes missing:** no stackprobe covers PEM key loading (its wipes are unobservable) or
-  `VerifiedCache.init`'s MAC-key copy; a probe in `stackprobe_test.zig` would decide those mutants.
 - **Dead-stack residue not yet probed or burned:** the `kty:"oct"` secret in `parseJwks` (`jwkMaterial`
   decodes `k` through arena/stack buffers before it becomes `Key.hmac`); `VerifiedCache`'s SipHash
-  `mac_key` (zeroed by `defer`, but the SipHash state it keys is not burned; the key is not a bearer
-  credential, only a cache-poisoning one); ML-DSA/Ed25519 *key generation* in the caller's frame (std);
+  `mac_key` (zeroed by `defer`, but the SipHash state it keys is not burned, and `init` returns the cache by
+  value, so the stack probe measures one copy of the key on the dead stack, pinned as the known residue; the
+  key is not a bearer credential, only a cache-poisoning one); ML-DSA/Ed25519 *key generation* in the caller's frame (std);
   ES384 key generation burns inside p384, but the returned `KeyPair` still lands in the caller's frame.
   `buildTokenRequest`'s `client_secret` is a borrowed slice and only copied into the request body.
 
