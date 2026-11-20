@@ -177,8 +177,8 @@ Run: `scripts/modtest slhdsa`; fuzz: `SLHDSA_FUZZ=<runs>[,<first seed>]`
   `setTypeAndClear` already zeroed that word), and the `- 1` in `(index - 1) / 2` on the right-child branch of
   `xmssPkFromSig` and `forsPkFromSig` (the index is odd there, so `(odd - 1) / 2 == odd / 2`). Not mutated:
   `params.zig`, the `PreHash` hash switch and `tree_mask` (comptime, which a runtime switch cannot reach; Table 2
-  and the ACVP vectors pin them) and the stack burns (visible only to the ReleaseFast probe). Two tests came out of
-  it, both in `src/kat_test.zig`: a 255-byte context through `signPrehashDigest` / `verifyPrehashDigest`, and a
+  and the ACVP vectors pin them) and the stack burns (visible only to the ReleaseFast probe). One test came out of
+  it, in `src/kat_test.zig`: a 255-byte context through `signPrehashDigest` / `verifyPrehashDigest`, and a
   signature over a wrong-length digest built with `signInternal`, which `verifyPrehashDigest` must refuse.
 
 ## Performance
