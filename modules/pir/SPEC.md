@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [brave-experiments/frodo-pir](https://github.com/brave-experiments/frodo-pir) | Rust | MPL-2.0 | 78 | push 2024-01-10 | Single-server LWE PIR (FrodoPIR); weak-copyleft, source not read. Different security model. |
 | Zig ecosystem | Zig | — | — | — | No PIR library in `std`; none found on GitHub (search 2026-09-30). |
 
-**Where we are ahead:** the only PIR library found for Zig; the reference's two-server DPF trust model, with `k`-record retrieval in one round trip, an aggregate query, keyword lookup, range sharding for multi-core servers and malicious-server detection (`verify.zig`), and — unlike SimplePIR — no per-client hint download. **Where we are behind:** no cuckoo- or simple-hashed sparse database (keyword collisions are false negatives the operator must provision away), no single-server PIR (the non-collusion assumption stays), and no wire format compatible with the reference's protobuf messages (→ Backlog). *(added 2026-10-06 from the 2026-09-30 survey table)*
+**Where we are ahead:** the only PIR library found for Zig; the reference's two-server DPF trust model, with `k`-record retrieval in one round trip, an aggregate query, keyword lookup, range sharding for multi-core servers and malicious-server detection (`verify.zig`), and — unlike SimplePIR — no per-client hint download. **Where we are behind:** no cuckoo- or simple-hashed sparse database (keyword collisions are false negatives the operator must provision away), no single-server PIR (the non-collusion assumption stays), and no wire format compatible with the reference's protobuf messages (→ *What is deliberately not done*).
 
 ## Why this is a module and not an addition to `fss`
 
@@ -53,10 +53,8 @@ catalog row and its own SPEC. Folding PIR into `fss` would also have widened
 that module's `meta.role` from `.util` to something it is not, and put a
 non-collusion threat model into a SPEC whose threat model is a hiding property.
 
-`fss`'s README-catalog row and SPEC both said PIR was future work "out of
-Phase 1". The catalog row has been updated to point here; `fss/SPEC.md`'s
-scoped-out list is left as the historical record of that module's Phase-1
-boundary.
+`fss/SPEC.md`'s scoped-out list keeps PIR as the record of that module's
+Phase-1 boundary; the catalog row points here.
 
 ## The composition, and the correction to the textbook description
 
@@ -173,8 +171,8 @@ Re-checked against `k` points rather than assumed:
    those same points add, so the aggregate gives `2·record[7]`. That divergence
    is exactly why retrieval uses the components and not the sum.
 
-The server makes **one pass** over the database, and since the interleaved
-evaluator landed it makes it in the evaluator too: `Mpf.evalEachFullWith`
+The server makes **one pass** over the database, in the evaluator too:
+`Mpf.evalEachFullWith`
 (`fss/SPEC.md` §"Interleaved multi-tree prefix evaluation") descends all `k`
 trees together over the `[0, count())` prefix and hands the server every
 instance's share at each record as it arrives, so each record's bytes are
@@ -271,8 +269,7 @@ padding or per-instance counter of its own.
 
 ## Keyword lookup (`keywordIndex` / `queryKeyword`)
 
-Was scoped out ("Index lookup only; keyword PIR needs a hashing/cuckoo layer
-above this"); now built, as the thinnest possible layer: a **public, total,
+The thinnest possible layer over index lookup: a **public, total,
 deterministic hash-to-index map** composed in front of the unchanged index
 protocol.
 
@@ -420,6 +417,13 @@ threat model in prose is a threat model people skip.
 - *Sending both shares to one server.* Self-evidently fatal; stated because
   `query` returns them as one array and an off-by-one in the caller's plumbing
   is all it takes.
+- *Non-canonical share encoding.* `fss`'s key encoding is not injective: each
+  control-bit correction word is serialized as a whole byte valued 0/1 but
+  parsed from its low bit only, so two distinct byte strings decode to the same
+  key (`fss/SPEC.md` §"The encoding is not injective"). A share that decodes to
+  an equivalent key produces an identical answer, so nothing in `pir` is
+  affected; a consumer that signs, MACs, hashes or deduplicates a serialized
+  share must canonicalize it first.
 - *Traffic analysis above this layer.* Query timing, frequency and correlation
   with observable events are outside a library with no I/O.
 
@@ -517,9 +521,8 @@ verified layer requires `index < db.count()`.
 - **Privacy holds AT THE RECOMMENDED `S = tag_slack_bytes = 8`, and the
   single-word abort-bit argument below is what the module's own guard test
   exercises there — but the "no selective-failure index test" conclusion does
-  NOT extend uniformly down to the permitted floor `S = 1`.** ⚠ **Corrected
-  from an earlier draft of this section**, which stated the no-selective-
-  failure claim without this scoping. `tag_slack_bytes` is therefore not
+  NOT extend uniformly down to the permitted floor `S = 1`.**
+  `tag_slack_bytes` is therefore not
   purely an *integrity* knob — it is also a *privacy* parameter, and the
   accept/reject bit's independence from `i` degrades as `S` shrinks, not just
   the soundness bound's magnitude.
@@ -599,15 +602,15 @@ verified layer requires `index < db.count()`.
 
 ### Constant-time position
 
-⭐ **MEASURED 2026-09-09, and the claim below holds.**
+**Measured, and the claim below holds.**
 `modules/pir/src/ctgrind_harness.zig` + `scripts/checks/ctgrind.sh pir`, ReleaseFast,
 valgrind/memcheck, pinned exactly in `scripts/checks/ctgrind-expected.tsv` with an
 untainted control row and a no-`-fvalgrind` trap row at 0 beside each:
 
 | target | in-file | what the 1 is |
 |---|---:|---|
-| `query` (SECRET index → DPF Gen) | **1** | `pir.zig:146` `if (index >= domain_size)` — a contract check on a PUBLIC bound whose outcome the caller already knows |
-| `reconstruct` (client's check) | **1** | `verify.zig:453` `if (diff != 0) return error.AnswerRejected` — the abort this section itself calls the protocol's public output |
+| `query` (SECRET index → DPF Gen) | **1** | `query`'s `if (index >= domain_size)` — a contract check on a PUBLIC bound whose outcome the caller already knows |
+| `reconstruct` (client's check) | **1** | `reconstruct`'s `if (diff != 0) return error.AnswerRejected` — the abort this section itself calls the protocol's public output |
 
 ⛔ A pin of **0** would be wrong on both, and the interesting number is the one
 that IS zero: the fixed-trip loops contribute **no context at all**, so there is
@@ -619,11 +622,6 @@ below, machine-checked rather than reviewed.
 `aes.has_hardware_support`, so on an AES-NI host the default would measure green
 for a reason that does not hold on a soft-AES host. **A green `query` row is
 therefore not a claim about the default instantiation on a soft-AES target.**
-
-⚠ This claim was unverified until 2026-09-09 (audit finding M2), and the sibling
-it stands on is the argument for having measured it: `fss` entered the same gate
-the same day and immediately failed — `xorMasked` skipped its XOR exactly when
-the secret bit was zero.
 
 The client's check is a fixed-trip loop of ring multiply/add/xor accumulating
 one difference word — no data-dependent branch, no early exit — with a single
@@ -646,18 +644,15 @@ generation (`Gen`) walks the domain tree keyed by the query index `i`, so a
 co-resident cache-timing attacker observing that soft-AES fallback can
 recover bits of `i` — exactly the thing this whole protocol exists to hide.
 
-`fss` already exposes the escape hatch this needs — `Sha256Prg`, a
-constant-time PRG built on `std.crypto.hash.sha2.Sha256` — via
-`fss.DpfWith`/`fss.MpfWith`. Prior to `PirWith`/`VerifiedWith` existing,
-nothing threaded that choice through: `Pir`/`Verified` were hard-wired to
-`fss.Dpf`/`fss.Mpf`, i.e. to the default PRG, with no way for a caller on a
-soft-AES target to opt into `Sha256Prg` instead. `pir.PirWith(Prg, ...)` and
-`pir.VerifiedWith(Prg, ...)` now take the PRG as an explicit parameter,
-mirroring `fss.DpfWith`/`fss.MpfWith` exactly; `Pir`/`Verified` remain
-`PirWith`/`VerifiedWith` applied to `fss.prg.default`, unchanged for every
-existing caller. A caller on a target without AES-NI/ARMv8-AES that cares
-about this side channel should instantiate with `fss.prg.Sha256Prg`
-explicitly rather than relying on the default.
+`fss` exposes the escape hatch this needs — `Sha256Prg`, a constant-time PRG
+built on `std.crypto.hash.sha2.Sha256` — via `fss.DpfWith`/`fss.MpfWith`.
+`pir.PirWith(Prg, ...)` and `pir.VerifiedWith(Prg, ...)` take the PRG as an
+explicit parameter, mirroring `fss.DpfWith`/`fss.MpfWith` exactly; `Pir` and
+`Verified` are `PirWith`/`VerifiedWith` applied to `fss.prg.default`, and
+`PirWith(...).Verified(S)` forwards the choice to both channels. A caller on a
+target without AES-NI/ARMv8-AES that cares about this side channel should
+instantiate with `fss.prg.Sha256Prg` explicitly rather than relying on the
+default.
 
 ### Anchoring the verified layer
 
@@ -755,11 +750,8 @@ Without them the STAT test would prove nothing about its own sensitivity.
 
 ## Backlog / deferred
 
-- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128/u256`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `wordAt`, `writeWord`, `reconstructFromBytes*`, `queryBody` (per database word). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
-
-- **Collision-free keyword lookup** (cuckoo- or simple-hashed database with a client that queries the candidate slots) *(survey 2026-09-30)*: the reference has dedicated cuckoo-hashed and simple-hashed sparse PIR; here `keywordIndex` is a single public hash, so a collision is a false negative the operator must provision away. The SPEC records cuckoo placement as rejected in `fss` with a stated trigger (§ "Scoped out"), so this is a question of revisiting that trigger, not a surprise gap. Medium; fits §2.
-- **Single-server PIR (LWE-based: SimplePIR / YPIR class)** *(survey 2026-09-30)*: removes the non-collusion assumption that this module's README warns about first. Large (a lattice module of its own; would share `bfv`/`tfhe`-style ring arithmetic at best); fits §2. Not this module's construction — noted so a reader comparing with SimplePIR sees why it is absent.
-- **Wire-compatible message format with a reference implementation** *(survey 2026-09-30)*: none exists (SPEC "Anchoring — no external vector exists"); Google's uses protobuf. Interop with a Google DPF-PIR deployment is not possible; no plan, question for the maintainer.
+- **Zig 0.17: a wide `@bitCast` on a possibly hot path** — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128/u256`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `wordAt`, `writeWord`, `reconstructFromBytes*`, `queryBody` (per database word). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+- **Collision-free keyword lookup** (cuckoo- or simple-hashed database with a client that queries the candidate slots): the reference has dedicated cuckoo-hashed and simple-hashed sparse PIR; here `keywordIndex` is a single public hash, so a collision is a false negative the operator must provision away. Cuckoo placement is rejected in `fss` with a stated revisit trigger (§"What is deliberately not done"), so this is a question of revisiting that trigger. Medium; fits §2.
 
 ## Anchoring — no external vector exists, and why
 
@@ -775,22 +767,18 @@ omission:
   A search of the PIR literature and of Google's `distributed_point_functions`
   library surfaced DPF vectors and PIR *parameters*, never a retrieval-level
   test vector.
-- **Even the DPF layer could not interoperate — but not for the reason this
-  section used to give.** `fss`'s *default* PRG is now fixed-key AES
-  (`Aes128Mmo`), not a module-defined SHA-256 (that swap happened after this
-  paragraph was first written; `Sha256Prg` still exists as a
-  correctness-anchoring instantiation and, separately, a caller-selectable
-  constant-time-safe alternative — see §"Constant-time PRG selection"). The conclusion is
-  unchanged, but for `fss`'s actual reason (`fss/SPEC.md`
-  §"External-reference anchoring"): moving to fixed-key AES removes the
-  *primitive* as an obstacle to interop with Google's
-  `distributed_point_functions`, but not the rest — byte-exactness would also
-  need that library's exact fixed AES keys, tweak/counter convention, byte
-  order, control-bit extraction, value-correction scheme and protobuf key
+- **Even the DPF layer could not interoperate.** `fss`'s *default* PRG is
+  fixed-key AES (`Aes128Mmo`); `Sha256Prg` exists as a correctness-anchoring
+  instantiation and as a caller-selectable constant-time alternative (see
+  §"Constant-time PRG selection"). Fixed-key AES removes the *primitive* as an
+  obstacle to interop with Google's `distributed_point_functions`, but not the
+  rest (`fss/SPEC.md` §"External-reference anchoring"): byte-exactness would
+  also need that library's exact fixed AES keys, tweak/counter convention,
+  byte order, control-bit extraction, value-correction scheme and protobuf key
   layout, none of which is pinned by a published vector file. `fss`'s PRG and
-  key layout remain module-defined regardless of which primitive backs them,
-  so any external PIR vector — built on a different DPF library's key format
-  — cannot byte-exactly agree with this composition's output either way.
+  key layout are module-defined regardless of which primitive backs them, so
+  any external PIR vector — built on a different DPF library's key format —
+  cannot byte-exactly agree with this composition's output either way.
 - **The DPF underneath is already anchored**, byte-exact, against an
   independent Python re-derivation of BGI16 Fig. 1 (`fss/kat_vectors.zig`).
   This module leans on that for the DPF itself: everything below
@@ -826,112 +814,64 @@ answer**: if the server ever skipped a record — an early exit, a
 zero-share shortcut — perturbing that record would leave the answer unchanged.
 That is the access-pattern claim in `answer`'s doc comment, made falsifiable.
 
-### Harness teeth (mutation testing)
+## Verification
 
-The suite was mutation-tested rather than assumed to work. Earlier, undated
-run — each mutation was applied, the suite run, and the mutation reverted:
-
-| Mutation | Caught by |
-|---|---|
-| `reconstruct` combines with `-` instead of `+` | every correctness test |
-| server's loop stops one record short | the retrieval sweep, the `DERIVED` re-derivation, and the every-record-influences test |
-| a **real** one-bit index leak into `cw_final` in the live `query` path | the correctness tests **and the STAT privacy test** — which is the evidence that the STAT test fires on a genuine regression, not only on its own synthetic controls |
-| `reconstructFromBytes` derives its word count from the **input** buffer instead of the receiver's geometry (the bug shape the brief flags) | the exhaustive length sweep, the geometry-error test, and a hard `SIGABRT` under the standalone hammer |
-| **(Verified)** the presence-word check dropped from `reconstruct` | the coordinated-zeroing test, the presence-bit-flip sweep, and the unpopulated-index test — 3 tests, exactly the ones that exist because of that word |
-| **(Verified)** the MAC loop checks only word 0 (`per` → `min(per, 1)`) | both bit-flip sweeps, on flips in words ≥ 1 |
-| **(Verified)** the tag comparison truncated to the low `8L` bits — an "inconclusive" check that silently reintroduces the un-widened ring | the tag-answer bit-flip sweep (high-bit flips sail through) **and the top-bit ring-forgery test** — the test built to guard the widening catches its removal |
-
-**Mutation run 2026-10-06** (in-place, Debug, 53 mutants over `pir.zig`'s
-query/keyword map/range answer/codecs/reconstruct/`Multi`, `db.zig`'s
-geometry, and `verify.zig`'s seed guard, odd `m`, presence word, tag checks
-and wipe; `fss` untouched): 52 killed. The first pass left 10; one test was
-added (each channel's keys carry that channel's own seeds — seeding the tag
-DPF with `sv0` survived) and four were extended: the coordinated all-zero
-transcript now also goes through `reconstructFromBytes` (its presence check
-alone could be dropped), too-long buffers and per-operand lengths in both
-geometry tests (`answerToBytes`, `accumulate`, `reconstruct`'s `a1`,
-`Multi.reconstruct*`'s `records_out`, `Verified.reconstruct`'s `t1`), and
-`answerAggregate`'s `DomainTooSmall`. Equivalent: `Verified.answer`'s own
-`n > domain_size` check, which `Value.answer` makes first over the same
-database and the same `domain_size`.
-
-## Fuzzing
-
-Every parser that touches bytes from a peer is held to
-`CONVENTIONS.md` §7.1's never-panic bar. There are two such boundaries: a
-**server parses a client's share**, and a **client parses two servers'
-answers**. Both have `std.testing.fuzz` harnesses, including one that runs the
-*whole* server path — parse a hostile share, then compute an answer with it —
-because a share that parses is not a share that is valid, and the answer
-arithmetic must survive arbitrary key material.
-
-**The count-from-input bug class is absent by construction.** The codec has no
-length fields, no headers and no counts anywhere. Every length is either a
-compile-time constant (`share_len`) or derived from the *receiver's own*
-buffers (`answerFromBytes` computes the required length from `out`, not from
-`buf`), and the input is required to match exactly. A share is a fixed-width
-read at compile-time-known offsets. There is nothing an attacker can claim a
-length about. `Database.init` rejects `record_len == 0` up front so that
-`count()`/`record()` are total afterwards and no division by an
-attacker-influenced zero exists downstream.
-
-**Two gaps in the standard workflow, stated because they affect what the fuzz
-evidence is worth:**
-
-1. ~~`zig build test-pir --fuzz` does not build on this Zig 0.16.0.~~
-   **CORRECTED.** The failure is **Debug-only**: `zig build test-pir --fuzz`
-   still fails to compile the shipped `lib/compiler/test_runner.zig` under
-   `-ffuzz` (`*builtin.StackTrace` vs `*const debug.StackTrace`, re-confirmed),
-   but **`zig build test-pir --fuzz --release=safe` builds and runs the real
-   fuzzer**. The original claim was too broad, and while it stood, the default
-   corpus was all these harnesses had ever run. They have since been run under
-   the real fuzzer; see "What the real fuzzer found" below.
-2. That corpus was measurably too thin: the deliberate count-from-input
-   mutation above **was not caught by the in-repo fuzz harnesses** — only by
-   the explicit unit test. Two things were done about it rather than noting it
-   and moving on: an **exhaustive deterministic length sweep** was added
-   (every combination of two answer-buffer lengths against every record length
-   in a small range, asserting both that correct lengths are accepted *and*
-   that every other length is rejected — a parser that rejects everything
-   would pass a never-panics test while being useless), and it does catch the
-   mutation; and a standalone hammer was run outside the repo.
-
-The hammer drove ~300 000 iterations across six `(domain_bits, word_bytes)`
-configurations — `(1,1)`, `(8,4)`, `(8,1)`, `(5,32)`, `(16,16)`, `(31,8)` —
-feeding arbitrary bytes and arbitrary lengths through every boundary, plus
-`Database.init` with `record_len ∈ {0, maxInt(usize), random}` and
-`domainBitsFor` over the full `usize` range. Clean in **both Debug and
-ReleaseSafe**; it aborts within seconds on the injected count-from-input bug,
-so it has teeth. Per `CONVENTIONS.md` §7.1 this is evidence about a Debug or
-`ReleaseSafe` build and says nothing about a `ReleaseFast` one.
-
-**No crash was found.** No bug in `fss` was found either — its `Key.fromBytes`
-takes a `*const [serialized_len]u8`, a fixed-size array pointer, so the parser
-has no length to trust in the first place. The multi-index boundaries preserve
-that property exactly: `fss.Mpf`'s key is `k` sub-keys at compile-time-known
-offsets, `k` is a compile-time parameter rather than anything read from the
-input, and `Multi.shareFromBytes` accepts exactly one length. There is still
-no count an attacker can claim.
-
-### What the real fuzzer found
-
-With `--release=safe --fuzz` working, both modules' harnesses were run under
-the actual fuzzer rather than the default corpus. Result: **no crash, no
-panic** in either — but the fuzzer did immediately reject a wrong *assertion*
-that the default corpus had accepted, and the finding is `fss`'s, not this
-module's:
-
-> A fuzz harness asserted that decoding a key and re-encoding it reproduces the
-> input bytes. It does not. `serializeCw` writes each control-bit correction
-> word as a whole byte valued 0/1 while `fromBytes` truncates that byte to its
-> low bit, so **the encoding is not injective**: two distinct byte strings
-> decode to the same key. See `fss/SPEC.md` §"The encoding is not injective".
-
-No protocol consequence here — nothing in `pir` signs, MACs, hashes or
-deduplicates a serialized share, and a share that decodes to an equivalent key
-produces an identical answer. It is recorded because a consumer that *does* any
-of those things must canonicalize first, and because it is a concrete example
-of the default corpus being too thin to be relied on.
+- **Run:** `scripts/modtest pir` (Debug and `-Doptimize=ReleaseFast`); the
+  tests are in `src/` (`pir.zig`, `verify.zig`, `db.zig`, `kat_test.zig`,
+  `privacy_test.zig`, `fuzz_test.zig`, `stackprobe_test.zig`; `bench.zig` is
+  opt-in via `PIR_BENCH=1` and prints the mode it was built in).
+- **Correctness:** exhaustive per-index retrieval over databases that straddle
+  the DPF's tree boundaries, crossed with record lengths that straddle the word
+  boundary, plus the every-record-influences-the-answer test, the `DERIVED`
+  plaintext re-derivation and wire round-trips (§"Anchoring — no external
+  vector exists, and why").
+- **Oracle:** `tools/rederive.py` (stdlib-only Python, written from the SPECs)
+  emits `src/kat_vectors.zig`; `src/kat_test.zig` asserts shares, answers and
+  reconstructed records byte-exact over `PirWith(fss.prg.Sha256Prg, ...)`
+  (§"Anchoring"). `Multi` and `Verified` are not covered by the vectors.
+- **Privacy battery:** `src/privacy_test.zig`, the `EXACT` structural tests and
+  the one `STAT` test with its negative controls (§"Privacy — what is and is
+  not established", §"Multi-index privacy").
+- **Detection:** the `ATTACK` tests (simulated malicious servers: bit flips at
+  every position, zeroing by one and by both servers, replay, one-sided
+  database modification, the top-bit ring forgery) and the two documented
+  non-detections made executable (colluding forgery, agreed-wrong-database);
+  §"Anchoring the verified layer".
+- **Harness sensitivity:** the suite is mutation-tested against the bug shapes
+  that matter here: wrong combine operator, a server loop one record short, a
+  one-bit index leak in the live `query` path (must trip `STAT`), a word count
+  taken from the input buffer, the `Verified` presence word dropped, the MAC
+  loop checking only word 0, and the tag comparison truncated to `8L` bits
+  (must trip the top-bit forgery test).
+- **Fuzz:** the deterministic driver `PIR_FUZZ=<runs>[,<first seed>]`
+  (`testkit` fuzz driver; harnesses `pir-plain`, `pir-multi`,
+  `pir-verified`, `pir-db`) runs whole protocol rounds over random databases
+  through the byte codecs, damaged shares through the server path, and
+  `Database.init`/`domainBitsFor` over hostile values. Verdicts come from the
+  driver in the ordinary test binary, never from `zig build --fuzz`. The
+  `std.testing.fuzz` harnesses (`pir.zig`, `verify.zig`, `db.zig`) run their
+  corpus in the ordinary test pass, next to the exhaustive length sweeps (every
+  combination of two answer-buffer lengths against every record length in a
+  small range: correct lengths accepted, every other rejected), which exist
+  because a never-panics fuzz test alone passes a parser that rejects
+  everything or derives a count from its input. Per `CONVENTIONS.md` §7.1 this
+  is evidence about the Debug and `ReleaseSafe` builds, not `ReleaseFast`.
+- **No peer-supplied length:** the codec has no length fields, headers or
+  counts. Every length is a compile-time constant (`share_len`) or derived from
+  the *receiver's own* buffers (`answerFromBytes` computes the required length
+  from `out`, not from `buf`), and the input must match exactly;
+  `Multi.shareFromBytes` accepts exactly one length and `k` is a compile-time
+  parameter. `Database.init` rejects `record_len == 0` (`error.ZeroRecordLen`)
+  so `count()`/`record()` are total afterwards. The count-from-input bug class
+  is absent by construction.
+- **Constant time:** `src/ctgrind_harness.zig` + `scripts/checks/ctgrind.sh pir`
+  (ReleaseFast, `fss.prg.Sha256Prg`), rows `query` and `reconstruct` pinned in
+  `scripts/checks/ctgrind-expected.tsv` (§"Constant-time position").
+- **Dead stack:** `src/stackprobe_test.zig` probes every secret-touching entry
+  point for residue below each `burn.zig` wipe, and for the root seeds / MAC
+  secret / share bytes as needles in any frame (ReleaseFast only).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
 ## Where the library stops
 
@@ -953,47 +893,34 @@ arithmetic. A caller with a memory-mapped file, a slice-of-slices
 The seam is deliberately at the same place as the rest of the repo's
 protocol modules: bytes in, bytes out, and the transport is the integrator's.
 
-## Scoped out
+## What is deliberately not done
 
-- ~~**Multi-index queries.**~~ **Built** — `Multi(k)`, above, once `fss` grew
-  `Mpf`. The blocker was correctly identified as being in `fss`, not here.
+- **Single-server PIR (LWE-based: SimplePIR / YPIR class).** It would remove
+  the non-collusion assumption that the README warns about first, but it is not
+  this module's construction: a lattice module of its own (at best sharing
+  `bfv`/`tfhe`-style ring arithmetic), a different security model.
+- **A wire format compatible with a reference implementation.** None exists
+  (§"Anchoring — no external vector exists, and why"); Google's uses protobuf,
+  so interop with a Google DPF-PIR deployment is not possible. No plan.
 - **Sublinear batch PIR.** `Multi(k)` amortizes the *database pass* (one
   interleaved walk over the record prefix, all `k` trees at once) but still
-  costs `k·N` DPF evaluations. The
-  cuckoo/batch-code multi-point construction would cut that to `O(N)`; it is
-  scoped out in `fss` with its revisit trigger stated there.
-- ~~**Answer verification / malicious-server security.**~~ **Built** —
-  `Verified`, §"Malicious-server detection" above: detection of a lying
-  server via a secret-scalar MAC in a widened ring. What remains scoped out
-  of *that* is stated there: recovery/robustness, attribution, binding to a
-  published database (authenticated PIR), and a verified `Multi(k)` (`k` tag
-  channels compose the same way; nothing new cryptographically, deferred
-  until a consumer wants it).
-- ~~**PIR by keyword.**~~ **Built** — `keywordIndex`/`queryKeyword`,
-  §"Keyword lookup" above: a public total hash-to-index map with no retry and
-  no existence check, so a miss is the same call as a hit; collisions are a
-  provisioned false-negative cost, not a leak. What remains scoped out of
-  *that* is stated there: a published injective mapping (needs an out-of-band
-  publishing pipeline this no-I/O module cannot provide) and cuckoo/multi-slot
-  placement (rejected in `fss` with a stated trigger; a deployment can compose
-  `Multi(k)` over `keywordIndex` variants above this layer).
+  costs `k·N` DPF evaluations. The cuckoo/batch-code multi-point construction
+  would cut that to `O(N)`; it is scoped out in `fss` with its revisit trigger
+  stated there.
+- **Recovery, attribution and a verified `Multi(k)`.** `Verified` (§"Malicious-server detection")
+  detects a lying server; it does not recover the record, say which server
+  lied, or bind answers to a published database (authenticated PIR). `k` tag
+  channels would compose the same way for a verified `Multi(k)`; nothing new
+  cryptographically, deferred until a consumer wants it.
+- **Keyword resolution beyond the public hash.** A published injective mapping
+  needs an out-of-band publishing pipeline this no-I/O module cannot provide;
+  cuckoo/multi-slot placement is rejected in `fss` with a stated trigger (a
+  deployment can compose `Multi(k)` over `keywordIndex` variants above this
+  layer). See §"Keyword lookup".
 - **Hiding `k` itself.** `k` is public protocol geometry and the share length
   reveals it; a client hides only its *effective* count, by padding. Making `k`
   itself private would mean padding every share to a deployment-wide maximum,
   which is a protocol decision above this layer.
-- ~~**An efficient full-domain evaluator.**~~ **Built, in `fss` as
-  predicted** — `Dpf.evalFull`/`evalFullWith` (tree-reuse **prefix**
-  evaluation; `fss/SPEC.md` §"Tree-reuse prefix evaluation"), wired into
-  `answer`/`answerSlices` and `Verified.answer`'s tag channel
-  (§"Server cost" above): ~1 PRG call per record instead of `domain_bits`,
-  measured ~11× at `domain_bits=16`, with the unused-tail truncation invariant
-  and the access-pattern requirement both preserved and still tested.
-  `Multi(k)`'s inner loop is now wired too, and to the shape this entry
-  predicted it needed: **not** `k` prefix walks (which would have flipped the
-  documented one-pass-over-records property into `k` passes) but `fss`'s
-  `Mpf.evalEachFullWith`, a single `k`-tree interleaved walk — ~`k` PRG calls
-  per record instead of `k·domain_bits`, measured ~9.5–14×, same keys, same
-  construction, answers word-for-word identical to the loop it replaced.
 
 ## References
 
@@ -1016,4 +943,4 @@ entry is required and the citations live here.
 
 **What the tests actually contain.** `src/kat_test.zig` asserts, byte-exact, against `src/kat_vectors.zig` (emitted by the stdlib-only Python re-derivation `tools/rederive.py`, written from the fss/pir SPECs): the serialized query shares from `query`, both servers' serialized answers computed from the recorded shares, and the reconstructed record, for twelve fixed cases over `PirWith(fss.prg.Sha256Prg, ...)` (`domain_bits` 1..10, `word_bytes` 1, 2, 3, 4, 8, 16, 32, record lengths that leave a ragged last word, a truncated domain, a full domain, indices 0 and the last index, and an in-domain unpopulated index). The script first reproduces every `fss` KAT vector byte-exact. The remaining tests are the `DERIVED` plaintext re-derivation, `SELF` round-trips and the `EXACT`/`STAT` privacy battery described above. No vector from outside this repository exists (§"Anchoring — no external vector exists, and why").
 
-**How it got there.** Upgraded from SELF on 2026-09-30. The oracle shares the SHA-256 PRG definition and the SPEC's construction with the module, so a misreading of BGI16 or of the ring inner product that both implementations inherit from the SPEC would pass; the byte layouts (key, answer, zero-padded last word) were taken from the Zig source and are pinned only by agreement, not by an outside document. The default fixed-key-AES PRG is not covered by these vectors (it cannot be re-derived from a standard library alone); the correction-word and PIR code are one body shared by every PRG. `Multi(k)` and `Verified` are not covered by the vectors.
+**Limits of the oracle.** The oracle shares the SHA-256 PRG definition and the SPEC's construction with the module, so a misreading of BGI16 or of the ring inner product that both implementations inherit from the SPEC would pass; the byte layouts (key, answer, zero-padded last word) were taken from the Zig source and are pinned only by agreement, not by an outside document. The default fixed-key-AES PRG is not covered by these vectors (it cannot be re-derived from a standard library alone); the correction-word and PIR code are one body shared by every PRG. `Multi(k)` and `Verified` are not covered by the vectors.

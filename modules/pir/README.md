@@ -247,20 +247,14 @@ Read the security statement before relying on it (`SPEC.md`
   all-zero convention is indistinguishable from a zeroing attack).
 - Costs: 2 keys and ~2 answers of bandwidth, 2 DPF evaluations per record.
 
-### What this does not do
+## Not provided
 
-Keyword lookup resolves collisions for nobody: a collision means the losing
-keyword is unreachable (provision `domain_bits` for your keyword count — see
-the callout), and there is no published-mapping distribution and no
-cuckoo/multi-slot placement (see `SPEC.md` §"Keyword lookup" for why both
-were declined). `Verified` detects but never repairs — no recovery, no
-attribution, no protection when both servers serve the same modified database
-(see above). `Multi(k)` makes a single pass over the database — `fss`'s
-interleaved `k`-tree prefix walk, ~`k` PRG calls per record — but still costs
-`k` DPF evaluations per record; sublinear batch PIR needs the cuckoo/batch-code
-multi-point construction, scoped out in `fss`. It has no verified variant yet.
-The base (unverified) protocol remains available where integrity is provided
-elsewhere.
+Single-server PIR, a wire format compatible with another implementation,
+recovery or attribution after a lying server is detected, a verified `Multi(k)`,
+sublinear batch PIR, and collision resolution for keyword lookup (a collision
+makes the losing keyword unreachable; provision `domain_bits` as above) are
+not provided. The reasons are in `SPEC.md` §"What is deliberately not done"
+and §"Backlog / deferred".
 
 ## Verify
 
@@ -268,7 +262,7 @@ elsewhere.
 zig build test-pir                          # Debug
 zig build test-pir -Doptimize=ReleaseFast
 zig build test-pir -Doptimize=ReleaseSafe
-zig build test-pir --fuzz --release=safe    # the real fuzzer (NOT Debug — see SPEC.md)
+PIR_FUZZ=100000 zig build test-pir -Doptimize=ReleaseSafe   # deterministic fuzz driver (see SPEC.md §Verification)
 ```
 
 What the suite establishes, and what it does not, is set out in `SPEC.md`
