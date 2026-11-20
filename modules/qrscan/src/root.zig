@@ -2761,7 +2761,7 @@ test "corpus: every scan script produces a distinct image, and the light pixels 
         }
         _ = w;
     }
-    // Measured 2026-09-07. Before: 1 round, w = h = 21, stride = 1, 21 octets,
+    // Measured. Before: 1 round, w = h = 21, stride = 1, 21 octets,
     // 0 light pixels.
     try std.testing.expectEqual(scan_scripts.len - 1, nonempty); // the deliberate empty script
     try std.testing.expectEqual(@as(usize, 8), shapes); // every script's stride*h fits
@@ -2796,7 +2796,7 @@ fn fuzzScan(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void {
     // with no corpus, is every time. The harness went from a 1x1 all-zero
     // image to a 21x21 all-zero image with a 1-octet stride: `scan` still
     // refuses it, the `catch return` still fires, and both assertions below
-    // still never execute. Re-measured 2026-09-07: `w=21 h=21 stride=1`,
+    // still never execute. Re-measured: `w=21 h=21 stride=1`,
     // 21 octets handed to `scan`, 0 light pixels, 0 assertions reached.
     //
     // The fix for the DRAW is `testkit.fuzz.Cursor`: one byte-first
@@ -2869,7 +2869,7 @@ fn fuzzDamaged(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!voi
     // and a ranged `Smith` draw returns the range MINIMUM when fewer than
     // eight octets remain. With no corpus this target ran one empty input, so
     // `blobs` was 0 and the PRISTINE symbol was scanned on every run — the
-    // "noise on top of a genuine symbol" never existed. Measured 2026-09-07:
+    // "noise on top of a genuine symbol" never existed. Measured:
     // 1 round, 0 blobs, 0 pixels damaged. One byte-first `smith.slice` plus a
     // `Cursor` fixes it, and the scripts above are readable damage patterns.
     var m: qr.Matrix = undefined;
@@ -2945,7 +2945,7 @@ test "corpus: every damage script writes the blobs it says, and the scans that s
         var scratch: [scratchSize(400, 400)]u8 = undefined;
         if (scan(img, &scratch)) |_| found += 1 else |_| {}
     }
-    // Measured 2026-09-07. Before: 1 round, 0 blobs, 1 scan of a pristine
+    // Measured. Before: 1 round, 0 blobs, 1 scan of a pristine
     // symbol.
     try std.testing.expectEqual(damage_scripts.len - 1, nonempty); // the deliberate empty script
     try std.testing.expectEqual(@as(usize, 131), blobs);
@@ -3247,7 +3247,7 @@ test "TEETH: fuzzScan's single smoke run produces a scannable image, not a 1x1 f
     try std.testing.expect(h >= 21);
 }
 
-// ── mutation-run tests (2026-10-05) ─────────────────────────────────────────
+// ── mutation-run tests ─────────────────────────────────────────
 
 test "the dimension gate is exact at both ends, with a real buffer behind each refusal" {
     // Each image has a `luma` of the full `stride * height`, so the luma check
@@ -3415,7 +3415,7 @@ test "readable: a grid whose message is longer than the probe buffer still count
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

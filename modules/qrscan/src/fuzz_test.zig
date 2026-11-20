@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for qrscan's deterministic fuzz driver (added 2026-10-10).
+//! Shared plumbing for qrscan's deterministic fuzz driver.
 //!
 //! The harness bodies (`fuzzScan`, `fuzzDamaged`, and the roundtrip oracle
 //! `fuzzScanRoundtrip`) live in `root.zig` beside their corpora and the
