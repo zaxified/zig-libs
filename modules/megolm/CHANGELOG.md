@@ -5,10 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** joined the portable ctgrind lane (`scripts/test.sh ctgrind-portable`, `cpu=x86_64` variant rows msg 138 / skey 33 / pickle 28). The unattributed `msg` trap context was the harness printing over the returned plaintext length, left undefined by std soft AES's `undefined` batch padding; the harness now prints the length it sent (checked under `-fvalgrind`). The rest is std soft-AES key schedule, std `mem.eql` chunking on public keys and std Ed25519 verify code shape; no megolm branch on a key. SPEC Backlog item closed.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: excluded from the portable ctgrind lane, because the x86_64 run reports an unattributed context in the `msg` trap (numbers in the item).
 - **2026-11-17** — **NO API CHANGE** — Hardening: `pickle.decodeInbound`, `sealOutbound`, `sealInbound` and `openInbound` (public) now run a `noinline` body under their own stack burn; a direct `decodeInbound` call used to leave ratchet copies 111..1519 B deep on the dead stack. Stack-probe rows for the four (ReleaseFast); delta mutation of the burns (8 mutants, 4 killed, 4 equivalent); the card is cumulative: `mutation 2026-11-17 (324/364, 40 eq)`.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (356 mutants over the six source files; 320 killed, 36 equivalent or unobservable, none surviving; no MAC, signature, replay or ratchet mutant survived); thirteen tests in `audit_test.zig` (advanceTo against repeated advanceStep, deinit/secureZero contracts, message-index and varint limits, missing-field errors, share-key guards, forgetBefore/exportAt edges, InvalidPadding, pickle header order) and a stack probe for `Ratchet.advanceStep` and `InboundGroupSession.pickleSealed`, no source change; the card records `mutation 2026-11-17 (320/356, 36 eq)`; the ctgrind source digests are re-pinned (counts unchanged: msg 16, skey 25, pickle 26).
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** `OutboundSession.pickleSealed` and `InboundGroupSession.pickleSealed` run under `decrypt_burn`, like `fromSealedPickle` (the stack probe found pickle-key residue).
 
 - **2026-10-17** — The private `src/b64ct.zig` is gone: session keys use the new `b64ct` module (`standard_no_pad`), same accept set and errors. ctgrind `skey` 26 -> 23 in-file (the module declassifies its verdict). No API change.
@@ -38,8 +35,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `forgetBefore`, `Ratchet.advanceStep` / `advanceTo` keep their signatures and burn. Migrated:
   tests (via `src/test_shim.zig`), example, README. No other consumer in the tree.
 
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** `pickle.zig` documents that restoring an
-  old outbound pickle rewinds the ratchet and reuses message indices (review of PR #4).
 
 - **2026-10-06** — ADDED: session pickling (`pickle.zig`). `OutboundSession.pickle` /
   `pickleSealed` / `fromPickle` / `fromSealedPickle` and the same four on `InboundGroupSession`
@@ -51,7 +46,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   strict and fail-closed (`PickleError`: length, magic, version, kind, tag, flags, key validity,
   cache consistency). New sibling dependency: `chachapoly`. Fuzzed (`fuzzPickleDecode`).
   Scope mvp -> core.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the mutation note no longer calls the module "untracked" in the present tense.
 - **2026-09-08** — Test-only, no production change: `fuzzMessageDecode`'s payload generator
   emitted exactly **one** field on every seed, and the field it emitted was always the same one.
   Measured 2026-09-08 over the whole corpus: `fields = 1`, `tag_kinds = {1, 0, 0, 0}`,

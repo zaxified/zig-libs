@@ -30,43 +30,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [matrix-org/matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk) | Rust | Apache-2.0 | 2.3k | matrix-sdk-0.19.1 (2026-09-18) | Not a competitor for the ratchet; the client SDK that wraps vodozemac, i.e. what a Megolm user builds around it (event JSON, key backup, room-key sharing). |
 | Zig ecosystem | Zig | — | — | — | No Megolm/Olm in Zig found on GitHub; `std.crypto` provides HKDF/HMAC/AES/Ed25519 only. |
 
-Re-assessed 2026-10-06 (no new survey; the table above is unchanged): session persistence landed, which was the one gap a user restarting a client would hit. Against vodozemac: **even** on the main use cases (create/share/encrypt, import/decrypt, export, pickle both session types), **behind** on libolm-pickle import and the experimental V2 message format, both Backlog-grade.
+Against vodozemac: **even** on the main use cases (create/share/encrypt, import/decrypt, export, pickle both session types), **behind** on libolm-pickle import (open, see *Backlog / deferred*) and on the experimental V2 message format (see *What is deliberately not done*).
 
-**Where we are ahead:** the only Zig Megolm; libolm's ratchet vectors byte-exact (including 2^24/2^16/2^8 boundary and 32-bit wraparound cases); a message decoder that keeps the received signed span so verification authenticates the bytes that arrived; explicit refusal of backward ratcheting. **Where we are behind:** pickles are this module's own versioned layout (`pickle.zig`) — vodozemac can also import libolm-format pickles, which this module cannot read; no vodozemac experimental full-MAC message version (deliberately: not in the published spec, SPEC "Scope note"). Olm, the event-JSON layer and key backup are outside the module by its own README (→ Backlog).
-
-## Corrections to the informal description this module was commissioned
-## against
-
-The task that produced this module summarized Megolm from memory before
-any primary source was read. Two details in that summary turned out
-imprecise once the spec and reference implementations were actually
-checked:
-
-1. **"advancing part `i` rehashes it and resets every part to its
-   right"** — correct in spirit, but the mechanism is not "rehash part
-   `i` in place, then separately reset the others." It is: find the
-   SLOWEST part `h` whose boundary the new counter crosses, then rehash
-   `h` and **every part to `h`'s right** all FROM THE SAME (pre-update)
-   value of part `h`, in one cascade — see `ratchet.zig`'s `advanceStep`.
-   The distinction matters for the single-step case at index 1 in
-   `kat_test.zig`: it does not exercise the cascade at all (nothing is to
-   the right of part 3), so a broken implementation that skips the
-   cascade entirely would still pass it. Only a boundary-crossing index
-   (0x1000000, 0x1041506, or the wraparound cases) exposes the bug — see
-   "Verification" below and the mutation-testing note there.
-2. **The message cipher** — the task description didn't specify one, but
-   it is worth stating precisely since it is NOT a design choice left to
-   this module (unlike `signal`'s Double Ratchet, where the spec
-   explicitly permits any AEAD): Megolm's spec **mandates** AES-256-CBC +
-   PKCS#7 padding + HMAC-SHA-256 (truncated to 8 bytes) — megolm.md
-   "Message encryption". This module implements exactly that, over the
-   sibling `aescbc` module, and does not offer an AEAD alternative.
-
-No other part of the informal description was found to be wrong; the
-128-byte/four-32-byte-part ratchet shape, the "wound forwards, not
-backwards" security property, the Ed25519 signature over the message
-frame, and the `SESSION_KEY`/export-format existence were all confirmed
-against the spec and reference implementations as described.
+**Where we are ahead:** the only Zig Megolm; libolm's ratchet vectors byte-exact (including 2^24/2^16/2^8 boundary and 32-bit wraparound cases); a message decoder that keeps the received signed span so verification authenticates the bytes that arrived; explicit refusal of backward ratcheting. **Where we are behind:** pickles are this module's own versioned layout (`pickle.zig`) — vodozemac can also import libolm-format pickles, which this module cannot read; no vodozemac experimental full-MAC message version (deliberately, see *What is deliberately not done*). Olm, the event-JSON layer and key backup are outside the module by its own README (→ README *Scope*, *What is deliberately not done*).
 
 ## Ratchet byte layout (`ratchet.zig`)
 
@@ -96,11 +62,14 @@ against the spec and reference implementations as described.
   `advanceToUnchecked` directly. See "Threat model" below for why the
   unconditional primitive is not the default.
 
+
 ## Cipher (`cipher.zig`)
 
 ```
 AES_KEY(32) ‖ HMAC_KEY(32) ‖ AES_IV(16) = HKDF-SHA-256(salt = "", ikm = R_i, info = "MEGOLM_KEYS", L = 80)
 ```
+
+The cipher is mandated by the spec (megolm.md "Message encryption"), not a design choice of this module, and no AEAD alternative is offered.
 
 `salt = ""` (zero-length), not omitted from the call — RFC 5869 §2.2
 treats an absent salt as `HashLen` zero bytes internally, and
@@ -110,10 +79,11 @@ the sibling `aescbc` module (PKCS#7 padding); the wire MAC is
 HMAC-SHA-256 over `version ‖ payload`, truncated to its first 8 bytes
 (spec: "The first 8 bytes of the MAC are appended to the message").
 
+
 ## Wire formats
 
 **Message** (`message.zig`, spec version `0x03` — the ONLY version this
-module implements; see "Scope note" below):
+module implements; see *What is deliberately not done*):
 
 ```
 version(1) ‖ [tag 0x08, varint message_index] ‖ [tag 0x12, varint len, ciphertext] ‖ mac(8) ‖ signature(64)
@@ -125,21 +95,19 @@ The Ed25519 signature covers `version ‖ payload ‖ mac` (everything except
 itself); the MAC covers `version ‖ payload` (everything except itself and
 the signature). **On the receiving side those are the RECEIVED bytes, not
 a re-encoding of the decoded fields** — `Message.decode` retains the
-signed span and `macBytes`/`signatureBytes` return it verbatim, the way
+signed span (`received_signed`) and `macBytes`/`signatureBytes` return it verbatim, the way
 libolm's `_decrypt` (`src/inbound_group_session.c`) hands the same
 `message, message_length` received range to both
 `_olm_crypto_ed25519_verify` and `megolm_cipher->ops->decrypt`.
-Until the wave-2 audit (W2-33) they re-encoded canonically
-instead, which made the wire format malleable: this decoder accepts
-non-minimal LEB128 varints, reordered fields and duplicate fields (as do
-libolm's and vodozemac's), so byte-different frames decoded to identical
-fields and all verified under one unchanged signature — the audit turned
-a real 93-byte libolm message into a 94-byte one that still decrypted.
-That defeats any dedup / replay / audit cache keyed on the wire bytes.
-The decoder is deliberately still permissive (rejecting non-canonical
-encodings would make this module stricter than the network); the property
-callers get instead is that `decode` followed by `encode` is
-byte-identical to the input, which the fuzz harness asserts.
+Re-encoding canonically instead would make the wire format malleable: this
+decoder accepts non-minimal LEB128 varints, reordered fields and duplicate
+fields (as do libolm's and vodozemac's), so byte-different frames would
+decode to identical fields and all verify under one unchanged signature,
+which defeats any dedup / replay / audit cache keyed on the wire bytes.
+The decoder is deliberately permissive (rejecting non-canonical encodings
+would make this module stricter than the network); the property callers
+get instead is that `decode` followed by `encode` is byte-identical to the
+input, which the fuzz harness asserts.
 
 This ordering is why the reject-teeth in
 "Verification"/`session.zig`'s module doc comment work out the way they
@@ -158,15 +126,6 @@ used when handing over a RATCHETED-FORWARD copy of a session would
 otherwise invalidate the original signature (megolm.md "Session export
 format"). Base64 is unpadded standard alphabet (matches both libolm and
 vodozemac's own wire encoding).
-
-### Scope note: message-format version 4 not implemented
-
-vodozemac ships an experimental, non-default `Version::V2`/message
-version `4` with a FULL (untruncated, 32-byte) MAC, gated behind its own
-`experimental-session-config` feature flag and explicitly not the
-default. That variant is NOT part of the published Megolm specification
-(megolm.md only ever describes the 8-byte truncated MAC) — this module
-implements only the spec's version `0x03`.
 
 ## Session pickles (`pickle.zig`)
 
@@ -201,6 +160,15 @@ cache that is not exactly the first-known ratchet advanced to its counter
 `secureZero`; the caller owns (and should wipe) the plain pickle it asked
 for. **The plain form is unauthenticated** — use the sealed form for
 anything stored where an attacker could write.
+
+**A pickle is a snapshot: never restore an outbound one twice.** Restoring an
+`OutboundSession` pickle rewinds the ratchet to the index it was taken at
+(`src/pickle.zig` module doc). Encrypting from there again reuses message
+indices, so two different plaintexts go out under the same message key.
+Sealing cannot prevent it (an old pickle is still a genuine one): re-pickle
+after every encrypt that matters, keep only the newest, and never resume one
+copy in two places. An inbound pickle restored from an earlier state only
+loses fast-forward state.
 
 ## Threat model / limitations (the spec's own, not gaps this module adds)
 
@@ -286,94 +254,49 @@ Separately, `ratchet.Ratchet.advanceTo` has its own
 backward directly, a proactive guard distinct from `MessageIndexTooOld`'s
 reactive "we already forgot that state" (see "Threat model" above).
 
-## Verification / anchoring grades
 
-This module distinguishes three grades of anchoring (see the top-level
-task this module was built against): (1) published vectors from the spec
+## Verification
+
+Run `scripts/modtest megolm`. The deterministic fuzz driver is `MEGOLM_FUZZ=<runs>[,<first seed>]`
+(testkit's driver; `_ONLY` selects a harness), never `zig build --fuzz`.
+
+This module distinguishes three grades of anchoring: (1) published vectors from the spec
 or a reference implementation, (2) in-house re-derivation against an
 independent implementation, (3) self round-trip only.
 
 | Area | Grade | Detail |
 |---|---|---|
-| Ratchet advance (`advanceStep`/`advanceToUnchecked`) | **1** | libolm's own `tests/test_megolm.cpp` — `expected1`/`expected2`/`expected3` byte-exact vectors (single step, a 2^24-boundary fast-forward, a further fast-forward crossing 2^24+2^16+2^8) plus the wraparound/overflow-by-one/double-wraparound vectors. Extracted programmatically (regex over the fetched `.cpp` source — see `kat_test.zig`'s module doc comment for the exact command), not hand-transcribed twice: a first by-eye transcription of the 128-byte ASCII seed misread `"...ABCDEF..."` as `"...ABDEF..."` (missing a `C`) — the programmatic re-extraction caught it before it reached a test. |
+| Ratchet advance (`advanceStep`/`advanceToUnchecked`) | **1** | libolm's own `tests/test_megolm.cpp` — `expected1`/`expected2`/`expected3` byte-exact vectors (single step, a 2^24-boundary fast-forward, a further fast-forward crossing 2^24+2^16+2^8) plus the wraparound/overflow-by-one/double-wraparound vectors. Extracted programmatically (regex over the fetched `.cpp` source — see `kat_test.zig`'s module doc comment for the exact command), not hand-transcribed. |
 | Message/session-key wire codecs + full decrypt (`message.zig`, `session_key.zig`, `session.zig`) | **1 + 2** | Grade 1: a real libolm-produced `session_key` + `message` pair (`tests/test_group_session.cpp`, "Inbound group session export/import" test) decodes and decrypts byte-exactly to plaintext `"Message"` at index 0 through this module's OWN code (`SessionKey.fromBase64` → `InboundGroupSession.fromSessionKey` → `Message.fromBase64` → `.decrypt`). A second such pair from the "Invalid signature group message" test is used both as a positive (decrypts correctly) and negative (libolm's own last-byte-of-signature tamper, reproduced by decoding + flipping the raw byte + re-encoding, rejected as `InvalidSignature`) anchor. Grade 2: BOTH pairs were independently decoded/verified/decrypted end-to-end with a SEPARATE toolchain before being trusted (Python's `cryptography` for AES-CBC + HKDF-SHA256, stdlib `hmac`/`hashlib`, PyNaCl 1.5 for Ed25519) — none of which share code with libolm, vodozemac, or this module. Every layer (self-signature, message signature against the same key, derived keys producing a matching truncated MAC, AES-256-CBC/PKCS7 plaintext) reproduced independently. |
 | Payload tag/varint header encoding | **1** | libolm's `tests/test_message.cpp`, "Group message encode test" — `_olm_encode_group_message(version=3, counter=200, ciphertext_len=10, ...)` produces `03 08 C8 01 12 0A`; pinned in `message.zig`. |
 | `OutboundSession`↔`InboundGroupSession` round-trip, out-of-order delivery, export/import, forgetBefore | **3** | Self round-trip only — there is no published external vector for a FULL two-sided session exercise (only the single-message decrypt vectors above are published); these behaviors are exercised by this module's own `session.zig` tests instead. |
 | The four reject-teeth (`InvalidSignature`/`MessageIndexTooOld`/`InvalidMac`/`InvalidPadding`) and `CannotRatchetBackward` | **1 (signature) + 3 (the rest)** | `InvalidSignature` is grade 1 (libolm's own tampered vector, above). The other three have no external "this exact tamper must fail this exact way" vector to anchor against (they are internal-consistency properties of this module's own layering) — grade 3, exercised directly in `kat_test.zig`/`session.zig`'s own tests, including the honest re-signed-bad-MAC construction described above. |
-| Session pickles (`pickle.zig`) | **3 (SELF-DERIVED)** | The layout is this module's own, so no external vector can exist. Tests prove restore-equivalence instead: a restored outbound session emits byte-identical message frames (ciphertext, MAC, Ed25519 signature) to the original from the same index on, after crossing a 2^8 ratchet boundary; a restored inbound session decrypts and refuses (`MessageIndexTooOld`) exactly as the original, in and out of order; the verified flag and a `forgetBefore` survive; every single-byte flip and every truncation of a sealed pickle is refused, a wrong key is `AuthenticationFailed`. The AEAD itself is anchored in `chachapoly` (RFC 8439 KATs + differential against std). Fuzzed by `fuzzPickleDecode` with a pinned corpus guard. |
+| Session pickles (`pickle.zig`) | **3 (SELF-DERIVED)** | The layout is this module's own, so no external vector can exist. Tests prove restore-equivalence instead: a restored outbound session emits byte-identical message frames (ciphertext, MAC, Ed25519 signature) to the original from the same index on, after crossing a 2^8 ratchet boundary; a restored inbound session decrypts and refuses (`MessageIndexTooOld`) exactly as the original, in and out of order; the verified flag and a `forgetBefore` survive; every single-byte flip and every truncation of a sealed pickle is refused, a wrong key is `AuthenticationFailed`. The AEAD itself is anchored in `chachapoly` (RFC 8439 KATs + differential against std). Fuzzed by the `megolm-pickle` harness. |
 | `aescbc`/HKDF/HMAC/Ed25519 primitives themselves | n/a (inherited) | Anchored in their own modules (`aescbc`'s own SPEC.md; `std.crypto`'s HKDF/HMAC/Ed25519 are std, not re-verified here). |
 
-### Mutation-testing note (required verification step)
-
-Before this module was reported done, `ratchet.zig`'s `advanceStep` was
-deliberately mutated to reseed ONLY the boundary-crossing part `h` itself
-(`self.rehash(h, h)`), skipping the cascade into every part to its right
-— exactly "the Megolm-specific mistake" this file's module doc comment
-warns about, and one that still round-trips against itself (an
-`OutboundSession`/`InboundGroupSession` pair running the SAME mutated
-code still agree with each other on every message, since both sides
-compute the identical, consistently-wrong ratchet). Running
-`zig build test-megolm` against the mutated code failed exactly two
-tests, both boundary-crossing cross-checks (never the non-boundary
-single-step vectors, confirming the mutation is invisible without a
-boundary-crossing case):
-
-- `ratchet.zig`'s own "advanceStep and advanceTo(counter+1) agree, at
-  every boundary depth" (byte divergence at a 2^8-boundary starting
-  counter, where `advanceStep` — mutated — disagreed with the unmutated
-  `advanceToUnchecked`).
-- `kat_test.zig`'s libolm-vector overflow-by-one test (counter
-  `0xffffffff` → `0`, an h=0 full-cascade case), where the mutated
-  `advanceStep` disagreed with the correct `advanceToUnchecked`.
-
-The mutation was then reverted via paired editing (not `git checkout`,
-per this repository's standing hazard with that command) and the
-restoration verified by re-running the full suite green (39/39) —
-`modules/megolm/` was untracked at the time (a brand-new module; it is
-tracked now), so `git diff` had no tracked baseline to compare against; the restoration
-was confirmed by direct byte-for-byte comparison of the pre- and
-post-mutation source text instead.
-
-**Audit 2026-11-17 (whole-module mutation).** 356 schemata mutants over `ratchet.zig`, `cipher.zig`, `message.zig`,
-`session_key.zig`, `session.zig` and `pickle.zig` (313 functional: every guard, boundary, error value, offset, copy and
-skipped call of the ratchet advance and fast-forward, the key derivation and MAC, the message codec and varints, both
-session-key formats, session setup/encrypt/decrypt, `findRatchet`, `forgetBefore`, `exportAt`, the pickles and their
-frame checks; 43 stack-burn and wipe sites). The functional set ran in ReleaseSafe, the burn/wipe set in ReleaseFast
-against the stack probes with the switch moved into the burn itself (`burn.runAt`/`zeroAt`, so the probe's frame is the
-original one; mutant 0 passes the probe), one build per round, each mutant under `setsid -w timeout` and `ulimit -v`,
-baseline first. **No MAC, signature, replay or ratchet mutant survived**: dropping the signature check in `decrypt` or
-`SessionKey.decode`, dropping the MAC check, not advancing the ratchet after `encrypt`, a one-step or one-byte error in
-`advanceStep`/`advanceTo`, a wrong HKDF label or key split and every pickle consistency check are all killed. Round 1:
-277 killed, 1 hung (counted killed), 35 survived. Thirteen tests added in `audit_test.zig` and one stack probe
-(`Ratchet.advanceStep` and `InboundGroupSession.pickleSealed` measured on their own): `advanceTo` against repeated
-`advanceStep` for byte differences above 127 (a 7-bit step count passed every KAT), `secureZero` and every `deinit`
-(ratchet, signing key, derived keys) leaving zeros, empty and unaligned CBC input, the message-index limits
-(`0xFFFFFFFF` decodes, `2^32` is `VarintTooLong`), ten- and eleven-byte length varints, the missing-index and
-missing-ciphertext errors, `ExportedSessionKey.fromBase64`, a share key with a trailing byte, a flipped version byte and
-a non-canonical public key, `firstKnownIndex` after a later decrypt, `forgetBefore` at the first known index,
-`exportAt` below it, `InvalidPadding` from an authentic message (honest construction, as the `InvalidMac` test) and the
-pickle header order (magic, then kind, before length). Final: 320 killed, 36 equivalent or unobservable, none
-surviving. Equivalent (10): the `advanceStep` scan ending at part 3 either way; a one-byte zero HKDF salt equal to the
-empty one; an empty CBC ciphertext reaching `unpadPkcs7`; the `findRatchet` cache hit, restart and equal-index cases
-(the cache is an optimisation, correctness never depends on it); `exportAt` reporting the requested index; the
-`generateDeterministic` failure arm (identity public key, 2^-252). Stack burns and wipes (26 survivors, none a missing
-probe): each is either mutually covered by a second burn or wipe (the pairs and the triple `encrypt` burn +
-`advanceStep` burn, `encrypt` burn + its `keys.deinit`, `forgetBefore` + `advanceToUnchecked`, `pickleSealed` burn + the
-sealing function's plain-buffer wipe (outbound and inbound), `fromSealedPickle` + `openOutbound` + `openOutboundBody`'s
-plain wipe are each killed when removed together), covered by an inner burn that is itself required (`decodeOutbound`,
-`deriveKeys`, `OutboundSession.init`, `decrypt`), a token burn with nothing secret in the frame
-(`ExportedSessionKey.decode`/`fromBase64`, `fromSessionKey`, `fromExportedKey`), or a heap wipe right before `free`
-(unobservable: `free` poisons the bytes). The `pickle.*` functions `decodeInbound`, `sealOutbound`,
-`sealInbound` and `openInbound` are public and, as first audited, carried no burn of their own (a direct
-`decodeInbound` call left ratchet copies 111..1519 B deep). Closed 2026-11-18: each runs a `noinline` `…Unburned` body
-under `burn.run` (`session_burn` for `decodeInbound`, `decrypt_burn` for the others), no API change, and the
-ReleaseFast probe has a row for each. The two decoders return the session by value; the copies of that result in the
-wrapper's and the caller's top frames (135..683 B) are the output the caller holds, so their rows count only hits
-deeper than 1 KiB. Delta mutation of the four burns (8 mutants: skipped, and shortened to 1/32): `decodeInbound` and
-`openInbound` skip and shortening killed (4); the same four mutants on `sealOutbound` and `sealInbound` survive and are
-equivalent: their unburned bodies leave no needle on the dead stack (the plain buffer is wiped, `encodeOutbound` burns
-itself, the AEAD leaves no key copy), so those two burns are defence in depth that the probe cannot see. Cumulative:
-324 killed of 364, 40 equivalent or unobservable.
+- **The ratchet cascade needs a boundary-crossing test.** `advanceStep` rehashes the slowest crossed part and every part to its
+  right from the same pre-update value; a mutant that reseeds only the crossed part still round-trips against itself, because both
+  session sides compute the same wrong ratchet, and it passes the single-step vector at index 1 (nothing lies to the right of
+  part 3). It is caught only by boundary-crossing cases: `ratchet.zig`'s "advanceStep and advanceTo(counter+1) agree, at every
+  boundary depth" and `kat_test.zig`'s libolm overflow-by-one vector (`0xffffffff` to `0`, a full cascade).
+- **Fuzz:** `src/fuzz_test.zig` has three harnesses, `megolm-message`, `megolm-session-key` and `megolm-pickle`. Each builds a genuine
+  session from knob octets, drives the public API with the genuine artifact (accepted) and with a damaged copy (one flipped bit:
+  refused; a few octets damaged or truncated: never a panic, never accepted unless byte-identical), and has a reach test over its outcomes.
+- **Stack residue:** `src/stackprobe_test.zig` (ReleaseFast only), see *Secret residue on the dead stack*.
+- **ctgrind:** rows `msg` (encrypt/decrypt with the ratchet and signing key tainted), `skey` (session-key base64 round trip) and
+  `pickle` (sealed pickle round trip) in `scripts/checks/ctgrind-expected.tsv`, native and, in `scripts/test.sh ctgrind-portable`,
+  `cpu=x86_64` variant rows. No megolm branch on a key; the residual contexts are std soft AES key schedule and std Ed25519
+  sign/verify (public input), itemised in that file. The `msg` harness prints the length of the plaintext it sent (`src/ctgrind_harness.zig`), checked against the returned
+  one under `-fvalgrind`, so it does not print the decrypted plaintext over a length that std soft AES's `undefined` padding leaves undefined.
+- **Mutation:** whole-module schemata run over `ratchet.zig`, `cipher.zig`, `message.zig`, `session_key.zig`, `session.zig` and `pickle.zig`
+  (functional set in ReleaseSafe; the stack-burn and wipe set in ReleaseFast against the stack probes). No MAC, signature, replay or
+  ratchet mutant survives. The equivalent set: the `advanceStep` scan ending at part 3 either way; a one-byte zero HKDF salt equal to the
+  empty one; an empty CBC ciphertext reaching `unpadPkcs7`; the `findRatchet` cache hit, restart and equal-index cases (an optimisation,
+  correctness never depends on it); `exportAt` reporting the requested index; the `generateDeterministic` failure arm (identity public key,
+  2^-252); stack burns and wipes that are mutually covered by a second burn, covered by an inner burn that is itself required, carry
+  nothing secret in the frame, or are a heap wipe right before `free`; and the `sealOutbound`/`sealInbound` burns, defence in depth that
+  the probe cannot see.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 [spec]: https://gitlab.matrix.org/matrix-org/olm/-/blob/master/docs/megolm.md
 
@@ -381,14 +304,15 @@ itself, the AEAD leaves no key copy), so those two burns are defence in depth th
 
 `OutboundSession.init` / `encrypt` / `sessionKey`, `InboundGroupSession`
 `fromSessionKey` / `fromExportedKey` / `decrypt` / `exportAt` / `forgetBefore`,
-the unsealed and sealed pickle readers, `Ratchet.advanceStep` /
+the unsealed and sealed pickle readers and `pickle.decodeInbound` /
+`sealOutbound` / `sealInbound` / `openInbound` (a `noinline` `…Unburned` body under `burn.run`, `session_burn` for `decodeInbound`, `decrypt_burn` for the others), `Ratchet.advanceStep` /
 `advanceToUnchecked` / `generate`, `cipher.deriveKeys` and the key decoders
 (`SessionKey` / `ExportedSessionKey` `decode` and `fromBase64`) run their body one
 frame down (`burn.run`) and then zero the stack that body dirtied (`burn.zig`:
 4 KiB for the ratchet advance and `deriveKeys`, 3 KiB for `generate`, 12 KiB for
 the session calls, 16 KiB for `decrypt`, the sealed openers and `SessionKey`
 decoding, 1 KiB for the `ExportedSessionKey` decoders). Measured body depth,
-ReleaseFast, 2026-10-09: 0.9 KiB (`advanceTo`) .. 7.3 KiB (`decrypt`); the burns
+ReleaseFast: 0.9 KiB (`advanceTo`) .. 7.3 KiB (`decrypt`); the burns
 are about 2x that. Results that carry the ratchet or the signing key
 (`OutboundSession`, `Ratchet`, `Keys`, `SessionKey`, `ExportedSessionKey`, a
 restored session) go through `out` rather than a return value, and every input
@@ -411,18 +335,28 @@ Not covered: the long-lived sessions (`ratchet`, `signing_key` live in the
 `OutboundSession` / `InboundGroupSession` by design, zeroed by `deinit`); the
 `encode` output buffers and the `toBase64` / `Message.toBase64` strings (the
 caller's memory: the output IS the secret, the caller wipes it); `pickle` /
-`pickleSealed` (probed clean as shipped, no new burn); the by-value
-`pickle.decodeOutbound` / `decodeInbound` return (internal; only reachable
-inside the burned `fromPickle` bodies); the AES-CBC key schedule inside
+`pickleSealed`; the by-value `pickle.decodeInbound` / `openInbound` return
+(the copy in the wrapper's and caller's top frames is the output the caller holds, so
+the probe counts only hits deeper than 1 KiB); the AES-CBC key schedule inside
 `aescbc` (sibling module, sits inside `decrypt`'s burn); the heap beyond the
 decoders' scratch.
 
+
+## What is deliberately not done
+
+- **vodozemac's experimental message version 4 (full MAC).** vodozemac ships a non-default `Version::V2`/message
+  version `4` with a full (untruncated, 32-byte) MAC behind its `experimental-session-config` feature flag. It is not part
+  of the published Megolm specification (megolm.md only describes the 8-byte truncated MAC); this module implements only the
+  spec's version `0x03`.
+- **Olm, the event-JSON layer, key backup.** Outside the module by its README *Scope*: the pairwise partner protocol, the
+  `m.room_key`/`m.room.encrypted` content shapes, and the PBKDF2-encrypted session export file.
+- **A stricter, canonical-only message decoder.** It would make this module stricter than libolm and vodozemac; the
+  `decode`/`encode` byte-identity property is what callers get instead (see *Wire formats*).
+
 ## Backlog / deferred
 
-- ✅ DONE 2026-11-18 (wave 6) ~~**Portable ctgrind (`CTGRIND_CPU=x86_64`)**~~ *(2026-11-18)*: megolm runs in `scripts/test.sh ctgrind-portable` with `cpu=x86_64` variant rows (msg 138 with control 1 / trap 105, skey 33, pickle 28). The trap's unattributed context was the HARNESS printing the decrypted plaintext over its returned length, which std soft AES's `undefined` batch padding (cause A2) leaves undefined untainted and the no-`-fvalgrind` trap cannot declassify; it now prints the length it sent, checked against the returned one under `-fvalgrind`. The rest: msg +120 std soft-AES key schedule (A1) + 2 std Ed25519 `sign`'s public-key `mem.eql` chunk branch (C); skey +7 std Ed25519 verify of the session-key signature at more sites (S, the documented public-input verifier) + 1 C; pickle +1 C + the stored-public-key compare split in two (C). No megolm branch on a key. Itemised in ctgrind-expected.tsv.
-- ~~Session state serialization for `OutboundSession` and `InboundGroupSession`~~ — done 2026-10-06 (`pickle.zig`; see "Session pickles" above).
-- **libolm / vodozemac pickle import** *(re-assessed 2026-10-06)*: a client migrating from libolm or vodozemac storage would need to read their pickle formats. Not readable here; migration means re-sharing or exporting sessions. Needs a published layout description or MIT source to implement from — not the Apache-2.0 code. Effort: medium.
-- **vodozemac experimental message version 4 (full MAC)** — deliberately out (not in the published spec; "Scope note" above).
+- **libolm / vodozemac pickle import**: a client migrating from libolm or vodozemac storage would need to read their pickle formats. Not readable here; migration means re-sharing or exporting sessions. Needs a published layout description or MIT source to implement from — not the Apache-2.0 code. Effort: medium.
+
 
 ## Anchoring
 
@@ -430,7 +364,3 @@ decoders' scratch.
 
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
-
-**What the tests actually contain.** libolm KAT byte-exact ratchet/message but session.zig 2-sided round-trip is self-only (SPEC grade 3); session pickles (pickle.zig, the module's own layout) are self-derived restore-equivalence tests
-
-**How it got there.** No external oracle exists for what remains. SPEC.md: no external vector for a full 2-sided session; self round-trip is the ceiling

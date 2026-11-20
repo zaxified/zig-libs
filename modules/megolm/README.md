@@ -87,7 +87,9 @@ keeps every field, and restore to a session that continues exactly where
 the original left off (same ciphertexts and signatures from an outbound
 session, same decrypts and refusals from an inbound one; the inbound
 `signing_key_verified` flag is kept — `exportAt`/`fromExportedKey` drops
-it). See [SPEC.md](SPEC.md) "Session pickles" for the layout.
+it). A pickle is a snapshot: restoring an outbound one rewinds the ratchet, so
+never resume the same one twice (message indices would be reused). See
+[SPEC.md](SPEC.md) "Session pickles" for the layout.
 
 ```zig
 // Sealed with ChaCha20-Poly1305 under a 32-byte key the caller manages:
@@ -133,9 +135,10 @@ format, not libolm's or vodozemac's.
 
 ```
 megolm → aescbc → std.crypto.core.aes
-       → chachapoly (sealed pickles) / entropy
+       → chachapoly (sealed pickles) / entropy (R0 draw, pickle nonces)
+       → b64ct (session-key base64, constant time)
        → std.crypto.kdf.hkdf.HkdfSha256 / std.crypto.auth.hmac.sha2.HmacSha256 /
-         std.crypto.sign.Ed25519 / std.base64
+         std.crypto.sign.Ed25519
 ```
 
 ## Verify
