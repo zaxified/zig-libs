@@ -3,16 +3,13 @@
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s Part 4
 //! claim (quoted below) and `bls_sig.zig`'s own module doc comment, as an
 //! actual committed program instead of an unmeasured sentence. Run it
-//! through `../../../scripts/checks/ctgrind.sh bls12_381` (once the coordinator
-//! adds the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries this file's doc
-//! comment suggests below — that script REFUSES an unlisted module rather
-//! than silently skipping it).
+//! through `../../../scripts/checks/ctgrind.sh bls12_381` (its expected rows
+//! are in `scripts/checks/ctgrind-expected.tsv`).
 //!
 //! NOT wired into `zig build test-bls12_381` — memcheck's context count is
 //! valgrind's own verdict, not something a Zig test can assert on. `zig
-//! build check-ctgrind` compiles it (a rot guard, no valgrind) once the
-//! coordinator's `build.zig` discovery picks this file up by its path
-//! existing — see that step's own comment for why that is enough.
+//! build check-ctgrind` compiles it (a rot guard, no valgrind): the
+//! harness is discovered by its path existing — see that step's own comment.
 //!
 //! ## Why this module needed a harness
 //!
@@ -244,24 +241,3 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
     }
 }
-
-// ── suggested scripts/checks/ctgrind.sh config (coordinator: paste in, do not
-// generate mechanically — every existing entry carries hand-written
-// reasoning in its own comment; these follow the same shape) ─────────────
-//
-// declare -A TARGETS=(
-//     [bls12_381]="field g1_scalarmul g2_scalarmul"
-// )
-// declare -A MODES=(
-//     [bls12_381]="ReleaseFast"
-// )
-// declare -A PATTERN=(
-//     [bls12_381/field]='fp[.]zig'
-//     [bls12_381/g1_scalarmul]='g1[.]zig|fp[.]zig|scalar[.]zig'
-//     [bls12_381/g2_scalarmul]='g2[.]zig|fp2[.]zig|fp[.]zig|scalar[.]zig'
-// )
-// declare -A LABEL=(
-//     [bls12_381/field]='bls12_381 fp.zig'
-//     [bls12_381/g1_scalarmul]='bls12_381 g1+fp+scalar'
-//     [bls12_381/g2_scalarmul]='bls12_381 g2+fp2+fp+scalar'
-// )
