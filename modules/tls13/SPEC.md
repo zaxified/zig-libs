@@ -70,6 +70,7 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
   HKDF-Expand.
 - `Schedule(prefix)` binds every label-dependent step to one prefix: `hkdfExpandLabel`,
   `deriveSecret`, `binderKey` ("ext binder"), `resumptionBinderKey` ("res binder"), `pskBinder`,
+  `verifyPskBinder` (recompute, `timing_safe.eql`, wipe; a wrong-length binder is false),
   `deriveHandshakeSecret` (salt = Derive-Secret(early, "derived", ""), IKM = the (EC)DHE secret
   or zeros), `deriveHandshakeTrafficSecrets` ("c/s hs traffic"), `deriveMasterSecret`,
   `deriveApplicationTrafficSecrets` ("c/s ap traffic", transcript through the SERVER Finished),
@@ -79,7 +80,9 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
   ("res master", transcript through the CLIENT Finished), `deriveResumptionPsk` (§4.6.1,
   "resumption" with the ticket nonce as context), `nextApplicationTrafficSecret` (§7.2,
   "traffic upd"), `deriveFinishedKey`, `deriveTrafficKeyIv` (§7.3, "key"/"iv").
-- `earlySecret` and `computeFinishedVerifyData` carry no label and are shared by both instances.
+- `earlySecret`, `computeFinishedVerifyData` and `verifyFinished` (the receiving side's
+  recompute-compare-wipe, as Go's `hmac.Equal` and rustls's `ConstantTimeEq`) carry no label and
+  are shared by both instances.
 - `tls13 = Schedule("tls13 ")`, `dtls13 = Schedule("dtls13")` (RFC 9147 §5.9: no trailing
   space — the one byte-level difference between the two protocols' schedules).
 
@@ -242,8 +245,8 @@ The only contexts in this module's own code are the sampler verdict above and th
 inside a handshake.
 
 Dead stack (`CONVENTIONS.md` §2.1.1): secrets in by `*const`, out through out-pointers;
-`expandLabel`, `earlySecret`, `pskBinder`, `deriveHandshakeSecret`, `deriveMasterSecret` and
-`computeFinishedVerifyData` run their body under a burn (`burn.ks_burn`), the chaining
+`expandLabel`, `earlySecret`, `pskBinder`, `verifyPskBinder`, `deriveHandshakeSecret`,
+`deriveMasterSecret`, `computeFinishedVerifyData` and `verifyFinished` run their body under a burn (`burn.ks_burn`), the chaining
 steps need none. `certverify.sign` runs each signer under its own burn (`ecdsa_burn`,
 `ed25519_burn`, `rsa_burn` above `rsa`'s own, `mldsa_sign_burn` / `mldsa_verify_burn` per parameter set);
 secret keys are borrowed by pointer in every `SecretKey` variant. `kex`'s entry points burn per group
@@ -402,11 +405,6 @@ benchmark `zig build bench-tls13` (see *Performance*), the example `zig build ru
   that recompute the ipad/opad blocks of the same secret; `sha2` does not help lone blocks.
 - **Certificate-authentication helpers** (`dtls/certauth.zig`): deferred to `tlsserver` M2
   (client auth), where the one-hop `verifyLeafAgainstAnchor` gives way to `x509.verifyChain`.
-- **Survey** for the Scope line (rustls `tls13::key_schedule`, Go `crypto/tls` key_schedule.go).
-- **Constant-time verify helpers:** `computeFinishedVerifyData` and
-  `pskBinder` hand out the MAC and only DOCUMENT `timing_safe.eql`; a `verifyFinished` /
-  `verifyPskBinder` that compares and wipes would take the mistake away from every consumer.
-  `tlsserver`'s Finished compare is right; it does not use `pskBinder`.
 - **Stack requirement per entry point:** ML-DSA-87 verify/sign need
   ~340/260 KiB and the ML-KEM arms 160–256 KiB of burn (`burn.zig`), so a small-stack worker
   thread overflows on a peer that picks them. State a `stack_requirement` per entry point.

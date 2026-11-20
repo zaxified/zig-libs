@@ -257,7 +257,8 @@ fn earlySecretBody(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, psk: []const 
 
 /// RFC 8446 §4.4.4: `verify_data = HMAC(finished_key, Transcript-Hash(...))`.
 /// The receiving side MUST recompute this and compare with
-/// `std.crypto.timing_safe.eql` — never `std.mem.eql`. Label-free.
+/// `std.crypto.timing_safe.eql` — never `std.mem.eql`; `verifyFinished`
+/// does both. Label-free.
 pub fn computeFinishedVerifyData(
     comptime Hmac: type,
     out: *[Hmac.mac_length]u8,
@@ -276,6 +277,40 @@ fn computeFinishedVerifyDataBody(
     Hmac.create(out, transcript_hash, finished_key);
 }
 
+/// RFC 8446 §4.4.4, the receiving side: true iff `received` is the
+/// Finished `verify_data` for `finished_key` over `transcript_hash`. The
+/// expected MAC is recomputed under the burn, compared with
+/// `std.crypto.timing_safe.eql` (as Go's `hmac.Equal` and rustls's
+/// `ConstantTimeEq` compare it) and wiped. A `received` of another length
+/// is false; its length is public. Label-free.
+pub fn verifyFinished(
+    comptime Hmac: type,
+    finished_key: *const [Hmac.mac_length]u8,
+    transcript_hash: []const u8,
+    received: []const u8,
+) bool {
+    return burn.run(burn.ks_burn, bool, verifyFinishedBody, .{ Hmac, finished_key, transcript_hash, received });
+}
+
+fn verifyFinishedBody(
+    comptime Hmac: type,
+    finished_key: *const [Hmac.mac_length]u8,
+    transcript_hash: []const u8,
+    received: []const u8,
+) bool {
+    var expected: [Hmac.mac_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &expected);
+    Hmac.create(&expected, transcript_hash, finished_key);
+    return macEql(Hmac.mac_length, &expected, received);
+}
+
+/// `timing_safe.eql` of a computed MAC against a received slice (its
+/// length public).
+fn macEql(comptime n: usize, expected: *const [n]u8, received: []const u8) bool {
+    if (received.len != n) return false;
+    return std.crypto.timing_safe.eql([n]u8, expected.*, received[0..n].*);
+}
+
 /// Every label-dependent step of the RFC 8446 §7.1 schedule, for one
 /// HKDF-Expand-Label prefix (`tls13_prefix` or `dtls13_prefix`).
 pub fn Schedule(comptime prefix: []const u8) type {
@@ -287,6 +322,8 @@ pub fn Schedule(comptime prefix: []const u8) type {
         pub const earlySecret = keyschedule.earlySecret;
         /// Label-free; the same function for both protocols.
         pub const computeFinishedVerifyData = keyschedule.computeFinishedVerifyData;
+        /// Label-free; the same function for both protocols.
+        pub const verifyFinished = keyschedule.verifyFinished;
 
         /// HKDF-Expand-Label with this instance's prefix.
         pub fn hkdfExpandLabel(
@@ -346,7 +383,7 @@ pub fn Schedule(comptime prefix: []const u8) type {
         ///
         /// Server side: recompute this and compare against the offered
         /// binder with `std.crypto.timing_safe.eql` BEFORE trusting the PSK
-        /// identity.
+        /// identity — `verifyPskBinder` does both.
         pub fn pskBinder(
             comptime Hkdf: type,
             comptime Hmac: type,
@@ -367,6 +404,35 @@ pub fn Schedule(comptime prefix: []const u8) type {
             var finished_key: [Hmac.mac_length]u8 = undefined;
             hkdfExpandLabel(Hkdf, Hmac.mac_length, &finished_key, binder_key, "finished", "");
             Hmac.create(out, truncated_client_hello_transcript_hash, &finished_key);
+        }
+
+        /// RFC 8446 §4.2.11.2, the server side: true iff `received` is the
+        /// binder `pskBinder` computes for `binder_key` over the truncated
+        /// ClientHello's transcript hash. Recomputed under the burn (which
+        /// also covers the finished key's frame), compared with
+        /// `std.crypto.timing_safe.eql`, the expected binder wiped. A
+        /// `received` of another length is false.
+        pub fn verifyPskBinder(
+            comptime Hkdf: type,
+            comptime Hmac: type,
+            binder_key: *const [Hkdf.prk_length]u8,
+            truncated_client_hello_transcript_hash: []const u8,
+            received: []const u8,
+        ) bool {
+            return burn.run(burn.ks_burn, bool, verifyPskBinderBody, .{ Hkdf, Hmac, binder_key, truncated_client_hello_transcript_hash, received });
+        }
+
+        fn verifyPskBinderBody(
+            comptime Hkdf: type,
+            comptime Hmac: type,
+            binder_key: *const [Hkdf.prk_length]u8,
+            truncated_client_hello_transcript_hash: []const u8,
+            received: []const u8,
+        ) bool {
+            var expected: [Hmac.mac_length]u8 = undefined;
+            defer std.crypto.secureZero(u8, &expected);
+            pskBinderBody(Hkdf, Hmac, &expected, binder_key, truncated_client_hello_transcript_hash);
+            return macEql(Hmac.mac_length, &expected, received);
         }
 
         /// RFC 8446 §7.1: `handshake_secret = HKDF-Extract(salt =
@@ -842,6 +908,55 @@ test "pskBinder helper reproduces the RFC 8448 §4 binder end-to-end" {
     var want: [32]u8 = undefined;
     HmacSha256.create(&want, &binder_hash, &fk);
     try testing.expectEqualSlices(u8, &hexTo(32, "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d"), &want);
+}
+
+test "verifyFinished: the computed verify_data, nothing else (every flipped octet, every other length)" {
+    const fk = @as([32]u8, @splat(0xAB));
+    const th = sha256Of("transcript");
+    const vd = v_computeFinishedVerifyData(HmacSha256, fk, &th);
+    try testing.expect(verifyFinished(HmacSha256, &fk, &th, &vd));
+    try testing.expect(tls13.verifyFinished(HmacSha256, &fk, &th, &vd)); // the instances re-export it
+    for (0..vd.len) |i| {
+        var bad = vd;
+        bad[i] ^= 0x80;
+        try testing.expect(!verifyFinished(HmacSha256, &fk, &th, &bad));
+    }
+    try testing.expect(!verifyFinished(HmacSha256, &fk, &th, vd[0..31]));
+    try testing.expect(!verifyFinished(HmacSha256, &fk, &th, ""));
+    const long = vd ++ [_]u8{0};
+    try testing.expect(!verifyFinished(HmacSha256, &fk, &th, &long));
+    // Another key or another transcript: refused.
+    const fk2 = @as([32]u8, @splat(0xAC));
+    try testing.expect(!verifyFinished(HmacSha256, &fk2, &th, &vd));
+    try testing.expect(!verifyFinished(HmacSha256, &fk, &sha256Of("transcript."), &vd));
+    // SHA-384: 48-octet MACs.
+    const Hmac384 = std.crypto.auth.hmac.sha2.HmacSha384;
+    const fk384 = @as([48]u8, @splat(0x5A));
+    var vd384: [48]u8 = undefined;
+    computeFinishedVerifyData(Hmac384, &vd384, &fk384, &th);
+    try testing.expect(verifyFinished(Hmac384, &fk384, &th, &vd384));
+    try testing.expect(!verifyFinished(Hmac384, &fk384, &th, vd384[0..32]));
+}
+
+test "verifyPskBinder: the RFC 8448 §4 binder is accepted, a flipped or resized one is not" {
+    const bk = hexTo(32, "69fe131a3bbad5d63c64eebcc30e395b9d8107726a13d074e389dbc8a4e47256");
+    const binder_hash = hexTo(32, "63224b2e4573f2d3454ca84b9d009a04f6be9e05711a8396473aefa01e924a14");
+    const binder = hexTo(32, "3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d");
+    try testing.expect(tls13.verifyPskBinder(HkdfSha256, HmacSha256, &bk, &binder_hash, &binder));
+    for (0..binder.len) |i| {
+        var bad = binder;
+        bad[i] ^= 0x01;
+        try testing.expect(!tls13.verifyPskBinder(HkdfSha256, HmacSha256, &bk, &binder_hash, &bad));
+    }
+    try testing.expect(!tls13.verifyPskBinder(HkdfSha256, HmacSha256, &bk, &binder_hash, binder[0..31]));
+    try testing.expect(!tls13.verifyPskBinder(HkdfSha256, HmacSha256, &bk, &binder_hash, ""));
+    // The dtls13 instance derives another finished key from the same binder key.
+    try testing.expect(!dtls13.verifyPskBinder(HkdfSha256, HmacSha256, &bk, &binder_hash, &binder));
+    try testing.expect(dtls13.verifyPskBinder(HkdfSha256, HmacSha256, &bk, &binder_hash, &v_pskBinder(HkdfSha256, HmacSha256, bk, &binder_hash)));
+    // Another truncated-ClientHello hash: refused.
+    var other_hash = binder_hash;
+    other_hash[31] ^= 1;
+    try testing.expect(!tls13.verifyPskBinder(HkdfSha256, HmacSha256, &bk, &other_hash, &binder));
 }
 
 // ── DTLS-prefix ("dtls13") vectors — independent Python hmac/hashlib
