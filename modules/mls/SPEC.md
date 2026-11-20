@@ -1507,6 +1507,16 @@ AEAD is the sibling `aesgcm`'s (std's AES-GCM bulk path is slow on Zig 0.17,
   a decision recorded under Part 8: the module follows §12.4's `pathRequiredTypes`.
 - **Relaxing the receive side to §12.4.2's narrower "path required" bullet** — mls-rs's `path_update_required` (message processing and commit creation alike) requires a path for an empty list, Update, Remove, ExternalInit and GroupContextExtensions, i.e. §12.4's `pathRequiredTypes` as this module does; following the majority and the registry's "Path Required" column, the receive side is not relaxed.
 
+- **Wrapper structs for the single-field proposals** (`Add`, `Update`,
+  `Remove`, `PreSharedKey`, `ExternalInit`, `GroupContextExtensions`). Each of
+  these RFC 9420 §12.1 structs has exactly ONE field (`Add { KeyPackage
+  key_package; }`, `Remove { uint32 removed; }`, …), so the `Proposal` union arm
+  carrying that field IS the struct, byte for byte; OpenMLS's `AddProposal`
+  etc. are Rust newtypes over the same single field. A wrapper would add a field
+  name that carries no information and break every caller's `.add = kp`. The
+  one multi-field proposal, `ReInit`, already is a struct. Custom proposal
+  types (§17.4's extension point) are not supported, so no proposal needs more.
+
 ## Open
 
 Gaps that are unverified rather than unbuilt:
@@ -1564,6 +1574,3 @@ Gaps that are unverified rather than unbuilt:
   duplicated. The clean fix is upstream in `hpke`: export `suiteIdOf`, or have
   `Context` carry its own suite id.
 - **Measure the bulk `PrivateMessage` path** (AEAD from the sibling `aesgcm`; Zig 0.17, #36256); the card says `Performance: not measured`.
-- **Standalone `Add`/`Update`/`Remove`/`PreSharedKey`/`ExternalInit`/
-  `GroupContextExtensions` types in `content.zig`** (each is a `Proposal` union
-  arm today): split them out when an extension proposal type needs a real struct.
