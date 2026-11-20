@@ -82,26 +82,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - `verify` truncation (Protocol One) still compares constant-time over
   the full 16 bytes; a 32-byte (full-HMAC) signature is rejected by
   length, not truncated.
-- **Known limitation (A1 M3):** `Two.kdf` zeroes its own local `prk`
-  (`defer std.crypto.secureZero(u8, &prk)`), but a dead-stack scan after a
-  by-the-book transaction still finds `prk` and (intermittently, depending
-  on how the compiler schedules the two `expand` calls) `hmacKey` residue.
-  Root cause, confirmed by reading `std.crypto.hmac.Hmac.init` (Zig
-  0.16.0's `lib/std/crypto/hmac.zig`, the function `HkdfSha256.expand`
-  calls once per output half): when `key.len <= block_length`, `init`
-  copies the key BYTE FOR BYTE into a local `scratch: [block_length]u8`
-  to build `i_key_pad`/`o_key_pad`, and never clears `scratch` — this is
-  `std`'s own generic HMAC, not code this module owns, and it is called
-  again with `prk` as the key on every `expand`. This module's `secureZero`
-  reaches its own `prk` variable; it cannot reach a copy `std.crypto.hmac`
-  made two frames deeper and never erased. Same class of gap as
-  `zig_std_crypto_leaves_key_schedules_on_stack` (owner notes) — vendoring
-  a scrubbing HMAC would fork a small, well-reviewed piece of `std` and
-  has to track every future Zig release, which this module's design
-  section rules out for the same reason `sealedbox` H2/M4 did. No fix in
-  this repository; documented here per the `ecvrf` E4 precedent.
+- **Secrets on the dead stack.** The secret-touching entry points
+  (`publicKeyFromScalar`, `ecdhZ`, both protocols' `kdf` / `encapsulate` /
+  `encrypt` / `decrypt` / `authenticate` / `verify`, `Aes256Cbc`) take secrets by
+  pointer and hand secrets out through an out-parameter (zeroed on error), so no
+  copy lives in the caller's frame. Each runs its body one `noinline` frame down
+  and then zeroes the bytes that frame dirtied (`src/burn.zig`; ECDH 8 KiB, kdf
+  4 KiB, AES 1 KiB twice, HMAC 2 KiB); `Two.kdf` also zeroes its `prk`. The scrub
+  covers what `std.crypto` leaves behind inside those calls (the HMAC pad block,
+  the AES key schedules). `src/stackprobe_test.zig` scans the dead stack after each
+  call in ReleaseFast/ReleaseSmall (Debug and ReleaseSafe fill `undefined`, so a
+  scan cannot see a dead frame there) and goes red when a body outgrows its burn.
+  Residual: the caller's own copy of the shared secret and the `pinUvAuthToken`
+  stay the caller's to zero (`std.crypto.secureZero`), and a toolchain that
+  changes argument promotion could move a copy out of the burned frame (the
+  probe is the detector).
 
-## Validation
+## Verification
+
+Run with `scripts/modtest ctap2pin` (or `zig build test-ctap2pin
+[-Doptimize=ReleaseFast]`; the stack probes run only in ReleaseFast).
 
 No official CTAP2 pinUvAuthProtocol KAT table exists; each composed
 primitive is anchored byte-exact to its own official vector
@@ -122,29 +122,25 @@ once and frozen offline (`pin_protocol_oracle_vectors.zig` /
 | Protocols One/Two | round-trip | two-sided `encapsulate` agreement; `decrypt∘encrypt = id`; `verify∘authenticate = true`; tamper/length rejection |
 | Protocol framing (One/Two) | live `python-fido2` capture | `encapsulate`'s platform pubkey + shared secret; `pinHashEnc`; a simulated `pinUvAuthToken` exchange; `pinUvAuthParam` keyed by the shared secret AND by the token — all byte-exact |
 
-Green in Debug and ReleaseFast (`zig build test-ctap2pin
-[-Doptimize=ReleaseFast]`; `scripts/modtest ctap2pin`).
+- **Key shape.** `authenticate`/`verify` are keyed by the shared secret or by a
+  `pinUvAuthToken` (16 or 32 bytes for protocol One, 32 for protocol Two), so a
+  fixed-size `SharedSecret` could not express the per-command `pinUvAuthParam`;
+  the python-fido2 anchoring exercises both keyings.
+- **Mutation tests** (`src/mutation_test.zig`): destination-length gates of the CBC
+  and of `Two.encrypt`, the non-canonical scalar (order plus one), zeroed output on
+  every ECDH and `encapsulate` error, an over-long MAC signature.
+- **Fuzz:** `CTAP2PIN_FUZZ=<runs>` (testkit's deterministic driver) over three
+  harnesses: `toPoint`, `Two.decrypt`, and the whole protocol (a quarter of the
+  budget per run); each has a reach test.
+- **Dead stack:** `src/stackprobe_test.zig` (ReleaseFast), with a negative and a
+  positive control in the same binary.
+- **ctgrind:** `src/ctgrind_harness.zig`, four contexts (ECDH, protocol One,
+  protocol Two, token keying).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
-### Real finding: `authenticate`/`verify`'s `key` type was too narrow
+## What is deliberately not done
 
-Building the `python-fido2`-anchored framing tests surfaced a genuine API
-gap (not a numeric divergence): `One.authenticate`/`Two.authenticate` and
-their `verify` counterparts previously took `key: SharedSecret` — a
-fixed-size array (32 bytes for One, 64 for Two). But CTAP2's own
-per-command `pinUvAuthParam` (used by every command after `getPinToken`,
-e.g. `makeCredential`/`getAssertion`) computes `authenticate(pinUvAuthToken,
-clientDataHash)`, where `pinUvAuthToken` is 16 or 32 bytes for protocol One
-and always 32 bytes for protocol Two — never the same length as
-`SharedSecret`. For protocol Two this made the token-keyed call
-**impossible to express at all** (a `[32]u8` cannot coerce to `[64]u8`);
-for protocol One it worked only when the token happened to be 32 bytes.
-Fixed by widening both to `key: []const u8` (later narrowed again for protocol Two to `*const [32]u8`, audit H2) (§6.5.7/§6.5.8's own
-`authenticate` abstract operation is generic over `key`; `Two.authenticate`
-already only reads `key[0..32]`, which is correct unchanged for both a
-64-byte shared secret and a 32-byte token). All existing call sites
-updated; behavior for shared-secret keys is bit-for-bit unchanged.
-
-## Non-goals
 
 - CBOR / COSE_Key codecs and the `clientPin` command framing (the sibling
   `ctap2` module's job since 2026-09-30; this module is the pure crypto layer
@@ -160,25 +156,8 @@ updated; behavior for shared-secret keys is bit-for-bit unchanged.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; PIN protocol framing is round-trip only
-
-**How it got there.** The anchoring work landed. DONE 0341464: fido2 anchors the FRAMING; found unexpressible protocol-Two pinUvAuthParam
-
-## Audit 2026-11-17 (whole-module mutation)
-
-111 mutants over every non-test line of `src/root.zig`: `Aes256Cbc` (the length gates, IV, chaining, the xor, the block loop, the step, every burn and the key-pointer escape), `PublicKey.toPoint` (endianness, x/y order, the identity refusal), `publicKeyFromScalar` and `ecdhZ` (the canonical check and its endianness, the zero-scalar refusal, the multiply, the error codes, which coordinate is Z, the wipes and the zeroing of `out` on error, the burns), `Protocol.fromWire`, and for `One` and `Two`: `kdf` (hash, salt, info strings, half positions), `encapsulate` (every step and its wipe), `encrypt` / `decrypt` (IV, key half, IV framing, length gates), `encryptedLength` / `decryptedLength` (every boundary), `authenticate` (key and message order, which half of the MAC), `verify` (the length gate in each direction, the empty-key arm, a first-byte or last-byte-only compare). Two schemata builds: ReleaseSafe for the functional mutants, ReleaseFast for the burn and wipe mutants (the stack probes only run there); the survivors of both were re-run in a build with the new tests, and the one that needs a safety panic (`Two.encrypt` with a destination shorter than the IV) in ReleaseSafe again.
-
-83 mutants die on the existing suite. 6 tests were added in `src/mutation_test.zig`: a destination shorter than the plaintext (encrypt) or longer than the ciphertext (decrypt) is `InvalidLength`; the group order plus one is refused as a scalar although its little-endian reading is below the order (kills both `.little` canonical-check mutants); `ecdhZ` and both `encapsulate`s zero their output on every error (three `errdefer` mutants); `Two.encrypt` with a destination shorter than the IV is `InvalidLength` (otherwise a slice panic); a signature one byte longer than the MAC is refused by `One.verify` and `Two.verify`. With them 100 of 111 die; 8 of those (the burn of `publicKeyFromScalar`, `ecdhZ`, both `kdf`s, both `authenticate`s, and the `Z` wipes of both `encapsulate`s) only in the ReleaseFast build, by the stack probes. No crypto check survives: the canonical scalar rule, the zero-scalar refusal, the identity refusal, the MAC compare byte by byte and the key-half selection are all killed.
-
-11 do not, none of them a defect:
-
-- 6 EQUIVALENT by redundancy: dropping one of the two overlapping `burn.stack` calls of `Aes256Cbc.encrypt` / `decrypt` (4 mutants; the probe reads the state after both), the `shared` wipe in `ecdhZUnburned` and the `prk` wipe in `Two.kdfUnburned` (their frames are burned by the public entry point below them). A follow-up run (2026-11-17, ReleaseFast, where the stack probes run) mutated each pair TOGETHER: both `encrypt` burns off, both `decrypt` burns off, the `ecdhZUnburned` `shared` wipe plus the `ecdhZ` burn off, the `Two.kdfUnburned` `prk` wipe plus the `Two.kdf` burn off. All four combined mutants are killed by the stack probes, so the redundancy verdicts stand: each overlapping protection is individually redundant but the pair is load-bearing.
-- 2 UNOBSERVABLE: `std.mem.doNotOptimizeAway(key)` in `encryptUnburned` / `decryptUnburned`: it guards against an LLVM argument promotion that the ReleaseFast stack probe does not see on Zig 0.17.1 x86_64 (the comment records the 2026-10-08 measurement on an older build); the injection would be a toolchain that promotes the pointer.
-- 3 EQUIVALENT: `ecdhZ`'s second multiply failure code (a canonical non-zero scalar times a validated non-identity point of the prime-order group cannot fail), and the destination-length checks of `Two.encrypt` (longer destination) and `Two.decrypt`, which `Aes256Cbc` repeats and answers with the same `InvalidLength` before anything is written.
-
-Not mutated: comptime constants and lengths (pinned by the KATs), the `Impl` switch, the doc comments, and every test file. ctgrind: the four rows keep their counts (`--check` measured them unchanged); only the source digests were re-pinned because `root.zig` gained the test import. Counts on the card are whole-module.
+**What the tests actually contain.** AES/HKDF/HMAC/ECDH NIST/RFC KAT anchor the crypto core; the PIN protocol framing is anchored byte-exact to a frozen `python-fido2` capture (the protocol round-trips are self-consistency only)
 
 ## Backlog / deferred
 
-- ~~**`clientPin` command layer**~~ *(survey 2026-09-30)* — **DONE 2026-09-30 as the new module `ctap2`** (every clientPIN subcommand over both protocols, getInfo, CTAPHID framing; its request bytes asserted equal to python-fido2's). This module stays the crypto layer beneath it.
-
+None open.

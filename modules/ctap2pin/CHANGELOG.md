@@ -5,9 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** audit note only: the four burn/wipe redundancy verdicts of the whole-module mutation were re-checked by mutating each redundant pair together in ReleaseFast (both CBC burns, a wipe plus its covering burn); all four combined mutants die in the stack probes. No source, test or behaviour change.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation of `src/root.zig` (111 mutants, 100 killed, 11 EQUIVALENT/UNOBSERVABLE; the card now carries whole-module counts). 6 tests added in `src/mutation_test.zig` (CBC destination lengths, a scalar that is canonical only little-endian, zeroed outputs on error, the IV-short destination, a signature longer than the MAC). No source change, no behaviour change; the ctgrind source digests were re-pinned (counts unchanged).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
 - **2026-10-10** — tests: deterministic fuzz driver `CTAP2PIN_FUZZ` (testkit) over `PublicKey.toPoint` (canonical, flipped bit leaves the curve), `Two.decrypt` (genuine round trip, CBC malleability) and both pinUvAuth protocols (shared secrets agree, round trip, MAC accepted, tampered/wrong-key MAC refused). No change to the library code.
 - **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** `check-secret-api` closed at 0 findings: `One`/`Two` `encrypt`/`decrypt` (key already by pointer) delegate to `Aes256Cbc.encrypt`/`decrypt`, which burn the key schedule; they carry `secret-api-ok` markers saying so. No burn or signature changed.
@@ -38,21 +35,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   escapes the key pointer so LLVM argument promotion cannot copy the key into the wrapper.
   `authenticate`/`verify` keep their signatures. `ctap2` migrated.
 
-- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
-  dead-stack probe `src/stackprobe_test.zig` (A1 M3) is deleted: it asserted
-  nothing and its stderr failed the CI lane in ReleaseFast. M3 stays the
-  known limitation SPEC.md describes; its last run still read `prk` 1 and
-  `hmacKey` 1.
 
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE (doc-only):** SPEC.md's
-  threat-model notes now document audit finding M3's remaining dead-stack
-  residue (`prk`, intermittently `hmacKey`) as a confirmed `std.crypto`
-  limitation, not an open leak in this module or measurement noise —
-  `std.crypto.hmac.Hmac.init` copies its key byte-for-byte into an
-  uncleared local `scratch` when `key.len <= block_length`, and
-  `HkdfSha256.expand` calls it with `prk` as the key on every output
-  half. This module's own `secureZero(&prk)` cannot reach a copy `std`
-  made in a deeper, already-retired frame.
 
 - **2026-09-11** — **API CHANGE:** `Two.authenticate`/`Two.verify`'s `key`
   parameter changes from `[]const u8` to `*const [32]u8` (audit finding
@@ -99,7 +82,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `ecdhZ`'s all-zero scalar check uses `std.crypto.timing_safe.eql` instead of `std.mem.allEqual` (audit finding L1). `std.mem.allEqual` is a naive byte loop with an early return — for a real scalar it stops after roughly one byte, for the all-zero one it walks all 32 — and it was reading the SECRET scalar. ⚠ **Measured, it did not compile that way:** LLVM vectorised it into a single data-independent `vptest`, observed twice over (here and in `sphinx`), so this was never a live leak. It was **safe by accident**: `std.mem.allEqual` promises nothing about timing, nothing pins that vectorisation, and another LLVM, `ReleaseSafe` or another target turns it back into the byte loop with no test able to notice. `timing_safe.eql` promises it, which is what the MAC comparison 35 lines above already did deliberately. ⭐ The ctgrind counts do **not** move (`ecdh` stays at 4 in-file) — exactly as expected, since the binary was already branch-free; what changed is the guarantee, and `scripts/checks/check-ct-compare.py` now pins the call so it cannot be swapped back unnoticed (it went red on this very edit, in the good direction, and was re-pinned deliberately).
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **ecdh 4 / one 7 / two 7 / token 0**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. First evidence for `SPEC.md`'s two claims ("`mul(scalar, .big)` is the constant-time scalar-mult", "both `verify`s compare MACs in constant time and fail closed") — the `token` target's clean **0** backs the second. ⭐ Confirms an audit lead and REFINES it: `root.zig:162`'s `if (std.mem.allEqual(u8, &private_scalar, 0))` does branch on raw secret-key bytes, but the implied mechanism — a byte-count-dependent early-exit scan — is refuted at the compiled level: LLVM emits one `vmovdqu`+`vptest` over all 32 bytes and a single `je`, so only the branch direction depends on the secret, the same shape as the other negligible-probability checks. The second independent sighting of `allEqual` being vectorised (see `sphinx`). ⚠ The secret here is a PIN, whose entropy is tiny, so this module's checks deserve more caution than the same shapes on a 256-bit key.
 
 - **2026-09-07** — Test-only, no production change: `fuzzTwoDecrypt` had never decrypted
   anything. `cipher_len` came from `smith.valueRangeAtMost(u16, 0, 256)` drawn after

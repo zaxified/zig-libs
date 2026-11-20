@@ -12,15 +12,8 @@ so this module carries its own (see below); HKDF vs RFC 5869 A.1; P-256 ECDH
 vs RFC 5903 §8.1; HMAC vs RFC 4231; plus the protocol FRAMING — encapsulate,
 the pinHashEnc/pinUvAuthToken exchange, and pinUvAuthParam in both keying
 shapes — byte-exact against a live capture of Yubico's `python-fido2` SDK).
+`aescbc` is a separate AES-CBC core (for `xmlenc`/`jwe`); this module keeps its own, byte-exact to it on the NIST vector, because `aescbc` accepts `dst.len >= src.len` while this module requires exact equality and a dependency would add nothing else.
 
-Audit finding L5 (2026-09-05): the `aescbc` module exists precisely to give
-`xmlenc`/`jwe` a single shared CBC core instead of two hand-rolled copies —
-`ctap2pin` is a third, independent one, byte-exact to `aescbc` against the
-same NIST vector but written before `aescbc` existed and not folded onto it
-(that would add a dependency on a second AES-CBC module, and `aescbc`
-currently accepts `dst.len >= src.len`; this module requires exact equality,
-so folding is a behavior decision, not a doc fix). Noted here rather than
-silently left implying this is the repository's only from-scratch CBC.
 **Deps:** `p256` (the P-256 curve for ECDH; byte-exact to `std.crypto.ecc.P256`); AES/HKDF/HMAC stay on `std`.
 
 See `SPEC.md`.
@@ -32,6 +25,8 @@ See `SPEC.md`.
 | `kat_test.zig` | Byte-exact KAT assertions + protocol round-trip/tamper/length tests |
 | `pin_protocol_oracle_vectors.zig` | Real PIN protocol framing material captured from a live `python-fido2` run (`encapsulate`, `pinHashEnc`, the `pinUvAuthToken` exchange, `pinUvAuthParam`), frozen |
 | `pin_protocol_oracle_test.zig` | Assertions that this module's framing reproduces the captured `python-fido2` bytes, both protocols |
+| `burn.zig`, `stackprobe_test.zig` | Dead-stack burn of the secret-touching entry points and the ReleaseFast probe that checks it |
+| `mutation_test.zig`, `fuzz_test.zig`, `ctgrind_harness.zig` | Tests that kill specific mutants, the fuzz harness helpers, the constant-time harness |
 
 Provenance: clean-room from the FIDO Alliance CTAP 2.1 specification §6.5.6–6.5.8,
 a public specification; every KAT is a published NIST/RFC vector. No third-party
