@@ -1303,3 +1303,58 @@ test "finalize: bare multisig takes a SINGLE-bug signature when allow_sighash_si
     const results = try psbt.finalize(a, try wrapPsbt(a, unsigned, &maps), .{ .allow_sighash_single_bug = true });
     try testing.expect(results[1] == null);
 }
+
+test "finalize: witness program shapes and UTXO field checks that only their own error distinguishes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A version-0 program of 33 bytes is neither P2WPKH nor P2WSH, even with a
+    // multisig witness script on hand.
+    {
+        const unsigned = try buildUnsignedTx(a, 900);
+        const spk = [_]u8{ 0x00, 0x21 } ++ @as([33]u8, @splat(0x33));
+        const pk = [_]u8{0x02} ++ @as([32]u8, @splat(0x11));
+        const ws = [_]u8{ 0x51, 33 } ++ pk ++ [_]u8{ 0x51, 0xae };
+        var recs = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = try buildWitnessUtxoValue(a, 5000, &spk) },
+            .{ .keytype = psbt.input_key.WITNESS_SCRIPT, .keydata = &.{}, .value = &ws },
+        };
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const results = try psbt.finalize(a, try wrapPsbt(a, unsigned, &maps), .{});
+        try expectInputError(results, 0, error.NonStandardScript);
+    }
+    // A version-2 32-byte program is not taproot, even with a TAP_KEY_SIG present.
+    {
+        const unsigned = try buildUnsignedTx(a, 900);
+        const spk = [_]u8{ 0x52, 0x20 } ++ @as([32]u8, @splat(0x44));
+        var recs = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = try buildWitnessUtxoValue(a, 5000, &spk) },
+            .{ .keytype = psbt.input_key.TAP_KEY_SIG, .keydata = &.{}, .value = &@as([64]u8, @splat(1)) },
+        };
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const results = try psbt.finalize(a, try wrapPsbt(a, unsigned, &maps), .{});
+        try expectInputError(results, 0, error.NonStandardScript);
+    }
+    const prev = try buildPrevTx(a, 2, &.{.{ .value = 5000, .script_pubkey = &.{0x51} }});
+    const unsigned = try buildUnsignedTxSpending(a, try prev.txid(a), 0, 900);
+    const nwu = try bitcointx.serializeLegacy(a, prev);
+    // require_non_witness_utxo is satisfied by a NON_WITNESS_UTXO that is there
+    // (the input then fails for its own reason: OP_1 is no standard template).
+    {
+        var recs = [_]psbt.Record{.{ .keytype = psbt.input_key.NON_WITNESS_UTXO, .keydata = &.{}, .value = nwu }};
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const results = try psbt.finalize(a, try wrapPsbt(a, unsigned, &maps), .{ .require_non_witness_utxo = true });
+        try expectInputError(results, 0, error.NonStandardScript);
+    }
+    // Same amount, different scriptPubKey in WITNESS_UTXO: the two fields disagree.
+    {
+        var recs = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.NON_WITNESS_UTXO, .keydata = &.{}, .value = nwu },
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = try buildWitnessUtxoValue(a, 5000, &.{0x52}) },
+        };
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const results = try psbt.finalize(a, try wrapPsbt(a, unsigned, &maps), .{});
+        try expectInputError(results, 0, error.UtxoFieldsDisagree);
+    }
+}

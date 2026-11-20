@@ -255,3 +255,22 @@ test "P2TR: TAP_KEY_SIG still wins over script-path data" {
     try testing.expect(res[0] != null);
     try testing.expect(res[0].? != error.NonStandardScript and res[0].? != error.MissingTaprootSignature);
 }
+
+test "P2TR script path: a 1-of-2 multi_a leaf takes exactly one signature even when both keys signed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const k2 = try key(2);
+    const k3 = try key(3);
+    // <k2> CHECKSIG <k3> CHECKSIGADD 1 NUMEQUAL
+    const s = try a.dupe(u8, &([_]u8{0x20} ++ k2.x ++ [_]u8{ 0xac, 0x20 } ++ k3.x ++ [_]u8{ 0xba, 0x51, 0x9c }));
+    var f = try fixture(a, &.{s}, &.{0});
+    try addSig(a, &f, k2, 0);
+    try addSig(a, &f, k3, 0);
+    const res = try psbt.finalize(a, f.ps, .{});
+    try testing.expectEqual(@as(?psbt.InputFinalizeError, null), res[0]);
+    const w = try witnessOf(a, &f);
+    try testing.expectEqual(@as(usize, 4), w.len);
+    try testing.expectEqual(@as(usize, 0), w[0].len); // the second key's slot: it gets no signature
+    try testing.expectEqual(@as(usize, 64), w[1].len);
+}
