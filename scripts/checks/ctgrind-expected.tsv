@@ -1121,10 +1121,10 @@ sphinx	ReleaseFast	process	1	<=47	8df3507d45f1fbeb	e7c50d755f64b027
 # derivePrivateKey now refuses a per_commitment_secret >= n, so the std scalar
 # canonicality verdict (common.zig:75 via scalar.zig:87, root.zig:98) appears
 # for the second secret too — the class already counted for basepoint_secret.
-bolt3	ReleaseFast	derive	1	6	fd5425df4f932526	c0fc92c5fbd8fb55
-bolt3	ReleaseFast	revocation	1	8	fd5425df4f932526	bc9bf12a55a312c4
-bolt3	ReleaseFast	shachain	1	0	fd5425df4f932526	0516122e43713a52
-bolt3	ReleaseFast	shachain_index	1	1	fd5425df4f932526	21055013990ce08a
+bolt3	ReleaseFast	derive	1	6	ce9e1eca134a94be	c0fc92c5fbd8fb55
+bolt3	ReleaseFast	revocation	1	8	ce9e1eca134a94be	bc9bf12a55a312c4
+bolt3	ReleaseFast	shachain	1	0	ce9e1eca134a94be	0516122e43713a52
+bolt3	ReleaseFast	shachain_index	1	1	ce9e1eca134a94be	21055013990ce08a
 ctap2pin	ReleaseFast	ecdh	1	3	1b2ea97a80cc47e9	4596df5a3f29ae3b
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 ctap2pin	ReleaseFast	one	1	5	1b2ea97a80cc47e9	12de2588e792c80e
@@ -1355,7 +1355,7 @@ bip32	ReleaseFast	xprv	1	0	a792f27563199c2b	446d9a369af15cee
 # gave 6 in-file — the row sees a regression of the check base58 does not
 # cover. Source digest covers btcaddr/src only: re-run `--check btcaddr`
 # after a bech32 edit (as for bip32/xprv).
-btcaddr	ReleaseFast	wif	1	0	444c7820fd321227	3724f47a31d201ab
+btcaddr	ReleaseFast	wif	1	0	3a6b1e6178deab29	3724f47a31d201ab
 # aesgcm — added 2026-09-28. Key AND plaintext tainted (so round keys, H
 # powers, keystream, ciphertext and tag are all secret-derived to memcheck).
 # The 4 in-file contexts per row are ONE line, the tag-check branch
@@ -1692,8 +1692,8 @@ mls	ReleaseFast	priv	1	4	8eb897814c57e255	616cb338b933af50
 # the base32 module; its encoder indexed its alphabet by the secret 5-bit
 # group (8 = base32/root.zig:149) until base32 went constant-time the same
 # day: uri 8 -> 0.
-otp	ReleaseFast	code	1	0	41e20250e3ab913d	df6ca288cedbb864
-otp	ReleaseFast	uri	1	0	dde8622cdc825c90	36cedfe2472c9cba
+otp	ReleaseFast	code	1	0	4f434aecfc9116ad	df6ca288cedbb864
+otp	ReleaseFast	uri	1	0	ad3875b611617c80	36cedfe2472c9cba
 # aeskw (2026-10-10) — wrap: KEK + wrapped key tainted, AES-128/192/256 KEKs
 # (192 via the aes192 module since 2026-10-10), wrap, unwrap, tampered unwrap.
 # 6 = the integrity verdict after the constant-time IV compare, twice per KEK
