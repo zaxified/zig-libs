@@ -334,7 +334,7 @@ pub const Options = struct {
     /// name an existing edge (asserted at `init`, so a typo cannot be a silently
     /// perfect link).
     link_overrides: []const LinkOverride = &.{},
-    /// LSP aging, refresh and purge in the run (SPEC §10). `null` (the default)
+    /// LSP aging, refresh and purge in the run (SPEC §11). `null` (the default)
     /// is the original harness: lifetimes stamped high and never `tick`ed, so
     /// nothing ages.
     aging: ?Aging = null,
@@ -1380,7 +1380,7 @@ pub const Fabric = struct {
     /// segment reaches every member, so it is sent to each one this node believes
     /// alive (each copy is impaired by its own member-pair link).
     ///
-    /// `isis-flood` has no broadcast mode (SPEC §12, the gap): it treats the LAN
+    /// `isis-flood` has no broadcast mode (this module's SPEC §12, the gap): it treats the LAN
     /// circuit as point-to-point, so the two broadcast rules are applied here —
     /// (1) an LSP sent on a LAN is not retransmitted until acknowledged: SRM is
     /// cleared on transmission (ISO 10589 §7.3.15.1), the DIS's CSNP repairs
