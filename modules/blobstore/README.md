@@ -82,7 +82,7 @@ const stats = try store.gc(arena, &.{}, .{}); // -> GcStats{blobs_removed,bytes_
 
 // opt-in check before trusting a `refcount` toggle on an existing store — see
 // "Opting out of refcounting" below
-_ = try store.hasOrphanedRcSidecars();   // bool
+_ = try store.hasAnyRcSidecar();         // bool
 
 // digests round-trip through hex text
 const parsed = try blobstore.Digest.fromHex(hex64);
@@ -108,8 +108,7 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
 - **Crash safety.** Every write lands in a hidden temp and is made visible by a
   single `rename(2)`, so a crash mid-write leaves only a temp (garbage, never
   referenced) and a live blob is never torn or partial. **`fsync` is narrower
-  than the rename discipline and this bullet used to conflate them:** since
-  2026-09-03 every rename goes through `renameDurable` — the temp is `fsync`ed
+  than the rename discipline:** every rename goes through `renameDurable` — the temp is `fsync`ed
   before the rename and the directory after it — so `put`, `putNamed`, the raw
   `commit`, `casCommit` and the `.rc` sidecars are all durable once they return,
   not just atomic.
@@ -118,10 +117,9 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   regardless of how many times it is put.
 - **Path safety.** `ns`/`key` must be single safe segments (`segmentSafe`:
   `[A-Za-z0-9._-]`, no leading dot, no `.`/`..`), checked on *every* public
-  entry point, so a request can never traverse out of `base`. This used to
-  carve out "CAS hex keys are generated internally and always safe" — but five
-  public functions take `hex` from the caller, and `casDelete("../victim")`
-  wrote outside the store. Every CAS path now goes through `requireCasHex`, and
+  entry point, so a request can never traverse out of `base`. CAS hex keys are
+  not assumed safe either: five public functions take `hex` from the caller, so
+  every CAS path goes through `requireCasHex` (64 lowercase hex characters), and
   `scratchCreate` validates its name too.
 - **Verification.** `verify` re-reads the stored bytes to EOF (it does not
   trust `stat().size`) and compares the hash to the address — catching silent
@@ -166,8 +164,7 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   the ingest lock while it reads, so a hung read there blocks every writer.
 - **32-bit targets.** Built and tested for big-endian MIPS32 soft-float and
   ARM (Cortex-A7) with `zig test` under `qemu-mips` / `qemu-arm`; the ingest
-  counter is a `usize` because those targets have no 64-bit atomics (before
-  2026-11-03 the module did not compile there).
+  counter is a `usize` because those targets have no 64-bit atomics.
 - **Design choices.** `put` owns the hash-while-write (a single streaming
   pass), so callers never hash externally. `verify` re-reads to detect
   bit-rot; `Digest` and per-entry-point segment validation guard every path.
@@ -207,7 +204,7 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   makes `gc`'s CAS sweep skip the whole store, so those sidecars are never
   collected again — fail-safe (nothing is deleted that shouldn't be), but
   permanent. `false` is for a store created that way from the start, not a
-  runtime switch on an established one. `Store.hasOrphanedRcSidecars()` is an
+  runtime switch on an established one. `Store.hasAnyRcSidecar()` is an
   opt-in check for exactly this situation — see its doc comment for why it
   is opt-in rather than automatic.
 - **Configurable fan-out.** `Options.fanout` (`Store.initOptions`, `1..=32`,
@@ -228,6 +225,13 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   only a process-local counter), closing the old same-name-clash-across-
   processes risk for the pre-lock streaming phase too. `casCommit`'s
   has-check+rename+refcount-bump happens as one lock-held unit, so two
-  processes committing the *same* content no longer race the refcount bump
-  itself (the earlier benign rename-only TOCTOU note still applies to the
-  rename call in isolation).
+  processes committing the *same* content do not race the refcount bump
+  itself (the rename call in isolation has a benign check-then-rename TOCTOU).
+  The lock waits for as long as another process holds it, with no timeout (`gc`
+  holds it for its whole walk); a holder that dies releases it.
+
+## Not provided
+
+Other hash algorithms, compression, packing of small blobs, chunking, encryption, sharding functions,
+disk-usage tracking, batch put, ordered listing, Windows and async I/O are refused on purpose (reasons in SPEC
+*What is deliberately not done*); the one open item, a bounded wait on the ingest lock, is in SPEC *Backlog / deferred*.

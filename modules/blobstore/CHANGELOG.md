@@ -5,10 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** one more test (`verify` compares the whole digest: a copy stored under an id that shares the first 32 hex chars is corrupt) kills the last hash-check mutant; whole-module mutation now 252/282 killed, 30 eq.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (282 mutants, 251 killed, 31 equivalent or unobservable, none surviving); 25 tests added, no source change; the card records `mutation 2026-11-17 (251/282, 31 eq)`.
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
 - **2026-11-03** — **BREAKING (error set) + data-safety fixes (second review):** `casCreateTemp(uniq)` and `createTemp` create a new file on every call, the caller's name is only a label. Two uploads under one name used to share one file through truncation, and `casCommit`, which trusts the caller's hash, renamed the mixture. **CONSUMER-VISIBLE:** a crash's temp is no longer reused, so only `gc` frees it (`gc` on a `refcount = false` store reaps temps and nothing else). `Error` gains `CorruptSidecar` and `PathAlreadyExists`. A sidecar holding no count is `CorruptSidecar` from `delete` and `refcountOf` and is never written over; it used to read as 1, so `delete` wrote 0 and `gc` removed a blob with other referrers. Fixed an open temp left behind by `putNamed` on a base too long for its path buffer. SPEC states what directory durability does not cover and that no test observes an fsync.
 - **2026-11-03** — **BREAKING (error set) + durability and count fixes (review round):** `Error` now names `StreamTooLong` and `StaleAfterTooSmall`, which were already returned. `ensureDir` fsyncs the parent of every directory it creates (`cas/`, `cas/<hh>`, `named/<ns>`, `raw/<ns>`, `tmp/`, `base`): a returned `put` could lose its whole fan-out directory on power loss. An I/O error (EMFILE, EIO) while reading a sidecar or checking a blob's existence now propagates from `casCommit` (dedup), `casDelete`, `delete`, `refcountOf`, where it used to read as "no sidecar" and could write 2 for a count of 5, or 0 so `gc` removed a live blob; `refcountOf` also reports a stat error instead of "absent" (a malformed digest is still `null`). The module's own temps (`putLimited` ingest, `putNamed`) are created with `O_EXCL`, trying the next counter on a clash, so two processes with the same PID and counter no longer mix bytes. `gc` also reaps stale `named/` and `raw/` `.part` temps, `.<hex>.rc.tmp` and an orphan `<hex>.rc` (`GcStats.temps_removed` counts them); a new blob's sidecar is written as 1 whatever an orphan said. `openRegularAt` opens with `follow_symlinks = false`. `verify` and `putLimited` use one 32 KiB buffer (were 128 KiB of stack). Documented, not changed: an interrupted `delete`/dedup `put` is not idempotent, the caller reconciles with `refcountOf`. ReleaseSmall growth of the router-tool consumer probe since the counter fix: mips32 +1,632 B, arm +1,600 B, x86-64 +1,536 B.
 
@@ -18,7 +14,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-10-31** — **BEHAVIOURAL, not breaking:** no-panic sweep + blind review (§ GW). `casCreateTemp` validates `uniq` (non-empty, no `/`, NUL or leading `.`, temp name ≤ 255 bytes); `casDir`/`ensureCasDir`/`gc`/`hasAnyRcSidecar` refuse an out-of-range `fanout` with `InvalidFanout`; `putNamed` above 64 MiB is `error.StreamTooLong` (what `readNamed` returns), before any I/O; `gc` no longer overflows on an ancient temp mtime or casts `keep.len` unchecked.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
@@ -35,15 +30,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   stops reaping. No consumers in the repo (`gc`'s only caller is the module's own test suite);
   `default_stale_after_ns` is a new public constant, additive.
 
-- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (test-only):** confirmed by measurement
-  (A1/blobstore.md's open "PODEZŘENÍ") that `gc`'s DEFAULT `stale_after_ns` (10 minutes)
-  offers no protection against a `put` whose source stalls that long — `reapStaleIngestTemps`
-  has no liveness signal beyond mtime, so a slow-but-alive ingest is indistinguishable from
-  abandoned crash debris once quiet for 10+ minutes. New test backdates a temp's on-disk
-  mtime (`std.Io.Dir.setTimestamps`) instead of waiting or injecting a fake clock — no
-  production code changed. Left open as a question for the user (raise the default? add a
-  liveness check? document and accept?) rather than a code fix — see the audit record's
-  2026-09-11 disposition.
 - **2026-09-10** — **Three A1 findings, no consumer in the repo (P1: hardening
   free).** `gc(.{ .stale_after_ns = 0 })` now returns `error.StaleAfterTooSmall`
   instead of silently disarming the only guard that keeps a sweep from

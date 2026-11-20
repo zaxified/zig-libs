@@ -20,7 +20,7 @@
 **Downstream consumer:** yes
 
 Content-addressed blob store (git-object/restic style) + a name-addressed raw layer and opaque
-named records. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+named records. Usage: see ./README.md. Provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -53,39 +53,38 @@ every entry point and regular-file-only reads (a FIFO or `/dev/zero` symlink in 
 hang the caller); bounded-memory listing (`names`); a name-addressed raw layer and opaque named
 records in the same store; built and tested for big-endian MIPS32 and ARM. **Where we are
 behind:** SHA-256 only (cacache: multi-hash), no compression, no packing or delta, no
-chunking/encryption (restic's domain), POSIX only. Each is a verdict in Backlog (rejected with a
-reason); none is something the router-tool consumer or a flatfs user asks of a block store.
+chunking/encryption (restic's domain), POSIX only. Each is rejected with a
+reason in *What is deliberately not done*; none is something the router-tool consumer or a flatfs user asks of a block store.
 
 ## Design & invariants
 - **Layout:** `<base>/cas/<hh...>/<hex>` (content-addressed, dedup, `hh...` = `Options.fanout`
-  levels of hex[0..2] fan-out, default 1 level = the historical layout) plus a `<hex>.rc` refcount
+  levels of hex[0..2] fan-out, default 1 level) plus a `<hex>.rc` refcount
   sidecar next to each blob (unless `Options.refcount = false`, see below), `<base>/raw/<ns>/<key>`
   (name-addressed, caller-owned key), `<base>/named/<ns>/<key>` (opaque byte records), `<base>/tmp/`
   (scratch + in-flight ingest temps + the `tmp/.ingest.lock` cross-process lock file). Each of these
   four subdirectories is created lazily, on that layer's first write, not at `Store.init` time — a
   store that never uses a layer (e.g. never calls `putNamed`) never creates its directory.
 - **Crash safety:** every write lands in a hidden temp and is made visible by a single `rename(2)`,
-  including the `.rc` refcount sidecars since 2026-09-01 — a crash mid-write leaves only an orphaned
-  temp; a live blob or sidecar is never torn or partial. **`fsync` is not part of that invariant and
-  this line used to claim it was:** since 2026-09-03 every
-  rename goes through `renameDurable` (temp `fsync` before, directory `fsync` after), so `put`,
-  `putNamed`, the raw `commit`, `casCommit` and the `.rc` sidecars are durable once they return.
+  including the `.rc` refcount sidecars — a crash mid-write leaves only an orphaned
+  temp; a live blob or sidecar is never torn or partial. `fsync` is not part of that atomicity
+  claim: every rename goes through `renameDurable` (temp `fsync` before, directory `fsync` after), so
+  `put`, `putNamed`, the raw `commit`, `casCommit` and the `.rc` sidecars are durable once they return.
 - **Dedup:** `put` hashes while streaming (single pass, bounded memory); `casCommit` skips the
   rename if the content already exists — one copy on disk regardless of put count — but still bumps
   that blob's refcount, since a dedup hit is a real reference.
 - **Reference counting + GC:** `put`/`casCommit` increment a blob's `.rc` sidecar (creating it at 1
   if new); `delete`/`casDelete` only decrement it (floored at 0) and never unlink the blob
   themselves. `gc(keep)` is the sole physical-reclaim path: it sweeps every CAS blob whose refcount
-  is zero and is not named in the caller-supplied `keep` allow-list, plus stale abandoned ingest
-  temps. Chosen over pure mark-sweep because `put`/`delete` already touch every blob's refcount at
+  is zero and is not named in the caller-supplied `keep` allow-list, plus stale abandoned temps (below).
+  Chosen over pure mark-sweep because `put`/`delete` already touch every blob's refcount at
   the exact moment a reference is established/dropped, so `gc` needs no knowledge of `named`
   manifests or any other caller-defined reference format; `keep` remains available as an
   additive escape hatch for callers who want to double-check against their own root set. A blob
-  with no `.rc` sidecar at all (written before this feature, never `delete`d since) is treated as
-  still-referenced and left alone.
+  with no `.rc` sidecar at all (written without refcounting, never `delete`d since) is treated as
+  still-referenced and left alone: it has one implicit reference.
 - **`Options.refcount = false` — opting out of sidecars entirely:** for a store that never deletes
-  and never calls `gc` (a frozen append-only CAS layout, e.g. a consumer with its own pre-refcount
-  test harness asserting an exact file count), `casCommit` becomes rename-only: no `.rc` sidecar is
+  and never calls `gc` (a frozen append-only CAS layout, e.g. a consumer with its own test harness
+  asserting an exact file count), `casCommit` becomes rename-only: no `.rc` sidecar is
   ever read or written, so the CAS directory holds exactly one file per blob. This is
   contract-compatible with the rule directly above, not a special case: a sidecar-less blob is
   already, unconditionally, "still-referenced and left alone" from `gc`'s point of view, and
@@ -93,7 +92,7 @@ reason); none is something the router-tool consumer or a flatfs user asks of a b
   `put`/`delete` touches it. Concretely: `gc`'s CAS sweep is skipped outright (it would find nothing
   to collect — every blob is sidecar-less — so skipping it is an optimization, not a behavior
   change) and reports `GcStats{ .blobs_removed = 0, .bytes_reclaimed = 0 }` truthfully rather than
-  silently pretending nothing was asked; `reapStaleIngestTemps` still runs, since ingest-temp reap is
+  silently pretending nothing was asked; the temp reap still runs, since it is
   unrelated to refcounting. `casDelete`/`delete` return `error.RefcountDisabled` instead of
   fabricating a sidecar on demand — a caller that opted into "never delete" should never reach this
   path, and one that does is told so loudly rather than getting a half-bookkept blob that
@@ -106,27 +105,27 @@ reason); none is something the router-tool consumer or a flatfs user asks of a b
   pre-existing sidecar, including ones at zero, is never swept again. The direction is fail-safe:
   nothing is deleted that `refcount = true` semantics would have kept, so this cannot corrupt data or
   drop something live — but it silently converts what would have been reclaimable disk space into
-  permanent retention, for as long as the store stays open with `refcount = false`. This was
-  undocumented before 2026-08-18; it is now stated on `Options.refcount`'s doc comment (source of
-  truth) and in README, next to the option itself, per §5's doc-ownership rule. `false` is meant for
-  a store created that way from the start — "never deletes, never calls `gc`" is the option's stated
-  precondition, not a runtime switch to flip on an established store.
-  **Why this got a check (`Store.hasOrphanedRcSidecars`) instead of only a warning, and why that
-  check is opt-in rather than automatic at `init`/`gc` time.** A pure prose warning is easy to miss
-  at the moment it matters (reopening an existing `base` with different `Options`, months after the
-  store was created), so an opt-in existence probe gives a caller a concrete way to check before
-  trusting a toggle is safe. It is deliberately **not** run automatically: `Store.init`/`initOptions`
-  do zero CAS-tree I/O today (every layer directory is created lazily, per the module doc comment),
-  and folding a directory walk into construction would tax every caller's "opening a store is cheap"
-  assumption, not only the ones toggling `refcount`. Running it inside `gc` instead would tax exactly
-  the callers `refcount = false` is meant to exempt — since "never calls `gc`" is the flag's own
-  precondition, a store using it as intended mostly never reaches `gc` at all, and `gc`'s existing
-  `refcount = false` path is a *true*, zero-cost no-op specifically so a caller that does call it
-  anyway is not surprised by hidden work. Given the failure mode is already fail-safe in direction
-  (permanent retention, never a wrong delete), there is no correctness argument for forcing the cost
-  onto a path every consumer pays for — only a discoverability one, which the doc-comment pointer and
-  the opt-in function both address without the cost.
-- **Configurable fan-out:** `Options.fanout` (`1..=32`, default 1) sets how many 2-hex-char
+  permanent retention, for as long as the store stays open with `refcount = false`. The warning is on
+  `Options.refcount`'s doc comment (source of truth) and in the README, next to the option itself.
+  `false` is meant for a store created that way from the start — "never deletes, never calls `gc`"
+  is the option's stated precondition, not a runtime switch to flip on an established store. The
+  reverse (a store used with `false`, later reopened with `true`) is safe too: a dedup `put` reads a
+  missing sidecar as the one implicit reference, the same assumption `casDelete` and `gc` make.
+  **`Store.hasAnyRcSidecar` is the check, and it is opt-in rather than automatic at `init`/`gc`
+  time.** It answers "does this CAS tree hold any `.rc` sidecar" (on a live blob as much as on an
+  abandoned one; `hasOrphanedRcSidecars` is the same function under its old, inaccurate name, kept
+  for source compatibility). A prose warning is easy to miss at the moment it matters (reopening an
+  existing `base` with different `Options`, months after the store was created), so the probe gives a
+  caller a concrete way to check before trusting a toggle is safe. It is deliberately **not** run
+  automatically: `Store.init`/`initOptions` do zero CAS-tree I/O (every layer directory is created
+  lazily), and folding a directory walk into construction would tax every caller's "opening a store is
+  cheap" assumption, not only the ones toggling `refcount`. Running it inside `gc` would tax exactly
+  the callers `refcount = false` is meant to exempt: `gc`'s `refcount = false` path is a *true*,
+  zero-cost no-op so a caller that does call it anyway is not surprised by hidden work. Given the
+  failure mode is already fail-safe in direction (permanent retention, never a wrong delete), there
+  is no correctness argument for forcing the cost onto a path every consumer pays for.
+- **Configurable fan-out:** `Options.fanout` (`1..=32`, default 1; anything else is
+  `error.InvalidFanout`) sets how many 2-hex-char
   directory levels the CAS uses before the blob file. Only affects newly-created stores/paths at
   the depth chosen at `Store.initOptions` time — an existing store's on-disk fan-out is not migrated
   by changing the option.
@@ -137,34 +136,34 @@ reason); none is something the router-tool consumer or a flatfs user asks of a b
   (including error returns). It does **not** cover `put`'s streaming/hashing phase before commit —
   only the section touching shared on-disk state needs mutual exclusion, so concurrent ingests still
   stream into their own temps in parallel. Temp *names* additionally fold in the PID (not just a
-  process-local counter), closing the historical same-name collision risk across processes even for
-  the pre-commit phase the lock doesn't cover.
+  process-local counter), so two processes do not draw the same name even in the pre-commit phase the
+  lock does not cover. After locking, `lockIngest` checks that the descriptor still names the file at
+  the lock path (an unlinked lock file would let a second locker lock a fresh inode and enter the
+  section beside the first); it retries a bounded number of times and then returns
+  `error.IngestLockUnstable`. The lock waits for as long as another process holds it (no timeout, see
+  Backlog); a holder that dies releases it.
 - **Path safety:** `ns`/`key` must be single safe segments (`segmentSafe`: `[A-Za-z0-9._-]`, no
   leading dot, no `.`/`..`), checked on every public entry point — a request can never traverse out
-  of `base`. **The sentence that used to follow — "CAS hex keys are generated internally and always
-  safe" — was false, and the escape clause it granted was the bug.** `casPath`, `casHas`, `casOpen`,
-  `casCommit` and `casDelete` are all public and take `hex` verbatim from the caller; with the
-  fan-out slicing added in `3ac5fee9`, a leading `..` became a real directory climb, and
-  `casDelete("../victim")` WROTE a `.rc` sidecar outside the store. Since 2026-09-01 every CAS path
+  of `base`. The CAS hex keys are not assumed safe: `casPath`, `casHas`, `casOpen`,
+  `casCommit` and `casDelete` are public and take `hex` verbatim from the caller, so every CAS path
   is built through `requireCasHex` (exactly 64 lowercase-hex characters), which also supplies the
-  length precondition the fan-out loop never had — a short `hex` used to panic in Debug and, in
-  ReleaseFast, read adjacent stack bytes into a directory name. `scratchCreate` was the other
-  unguarded entry point and now runs `segmentSafe` like its siblings.
+  length precondition the fan-out slicing needs. `scratchCreate` runs `segmentSafe` like its siblings
+  and refuses the ingest lock's own file name.
 - **Verification primitive:** `verify` re-reads stored bytes to EOF (it does not trust `stat().size`)
-  and compares to the address, catching silent bit-rot/tampering. It no longer goes through
-  `hashdigest.sha256File` (which follows symlinks and opens FIFOs): see the next bullet.
-- **Directory creation is durable (2026-11-03):** `ensureDir` fsyncs the PARENT of every directory it
+  and compares to the address, catching silent bit-rot/tampering. It opens the file through the
+  same regular-file check as every other read (see *Hostile or damaged store*), not through
+  `hashdigest.sha256File`, which follows symlinks and opens FIFOs.
+- **Directory creation is durable:** `ensureDir` fsyncs the PARENT of every directory it
   really created (`base` itself, `cas/`, `cas/<hh>`, `named/<ns>`, `raw/<ns>`, `tmp/`), then returns;
-  `renameDurable` alone syncs only the directory a rename lands in, so before this a whole fan-out
+  `renameDurable` alone syncs only the directory a rename lands in, so without this a whole fan-out
   directory could vanish after power loss although `put` had returned. Steady state (directory exists)
   costs one failed `mkdir`. Crash points sit after the `mkdir` and after the parent sync. Residual: a
   process killed between the two leaves a directory the restart sees as existing and does not sync.
-- **Counts are never guessed from an I/O error (2026-11-03):** a sidecar (or blob) that is absent or not
+- **Counts are never guessed from an I/O error:** a sidecar (or blob) that is absent or not
   a regular file reads as the default (one implicit reference); any other error (EMFILE, EIO ...)
   propagates out of `put`'s dedup branch, `delete`, `refcountOf`. `gc` reads an unreadable sidecar as
-  "keep". Before, EIO on a count of 5 wrote 2 on dedup and 0 on `delete` (and `gc` then removed a live
-  blob). Tested with an injected fault (`crash_hook.read_fault`).
-- **Interrupted `delete` / `put`: the caller reconciles (2026-11-03):** a refcount change is one
+  "keep". Tested with an injected fault (`crash_hook.read_fault`).
+- **Interrupted `delete` / `put`: the caller reconciles:** a refcount change is one
   crash-atomic sidecar write, but nothing records WHICH operation it belonged to, so if `delete` or a
   dedup `put` returns an error or the process dies, the change may or may not have landed, and
   retrying it applies it a second time (`delete`: 0 instead of 1, and `gc` then collects the blob; a
@@ -172,20 +171,20 @@ reason); none is something the router-tool consumer or a flatfs user asks of a b
   and is not provided. The caller that retries a `delete` must first read `refcountOf` and decide.
   The asymmetry is deliberate: a crash can leave a count too HIGH (safe), and the sidecar is never torn,
   but "never under-counted" holds only for the state RIGHT AFTER a crash, not across a blind retry.
-- **Exclusive temps (2026-11-03):** `putLimited`'s ingest temp and `putNamed`'s temp are created with
+- **Exclusive temps:** `putLimited`'s ingest temp and `putNamed`'s temp are created with
   `O_EXCL`; a name that exists (stale temp of a crashed run, a planted file or FIFO, another PID
   namespace's process with the same PID and counter) costs one draw of the next counter value, at most 64
-  draws, then `PathAlreadyExists`. The earlier text claimed truncation made a clash harmless; it did not:
-  two writers shared one file and a mixture was renamed under a hash it does not match. `casCreateTemp(uniq)`
-  and `createTemp` do the same, with the caller's name as a label only: the router-tool consumer's backup vault builds `uniq` from device,
-  key and index, so a client retrying a running upload shared the first upload's file, and `casCommit` trusts
-  the caller's hash. `scratchCreate` keeps the caller's name; a scratch file is never committed. **The cost:**
+  draws, then `PathAlreadyExists`. Truncating an existing name instead would let two writers share one
+  file and rename a mixture under a hash it does not match. `casCreateTemp(uniq)`
+  and `createTemp` do the same, with the caller's name as a label only (a client retrying a running upload
+  gets its own file, which matters because `casCommit` trusts the caller's hash). `scratchCreate` keeps
+  the caller's name; a scratch file is never committed. **The cost:**
   a crash's temp is never reused, so each crash leaves one until `gc` reaps it (24 h by default). A store whose
   owner never runs `gc` keeps them; `gc` on a `refcount = false` store reaps temps and touches nothing else.
-- **Corrupt sidecar (2026-11-03):** a sidecar holding no count is `error.CorruptSidecar` from `delete` and
-  `refcountOf`, with nothing written; a dedup `put` succeeds and leaves it; `gc` keeps the blob. It used to read
-  as 1, so `delete` wrote 0 and `gc` removed a blob with other referrers. Removing the sidecar by hand gives the
-  blob its one implicit reference back. A blob with a corrupt sidecar is never collected until then.
+- **Corrupt sidecar:** a sidecar holding no count is `error.CorruptSidecar` from `delete` and
+  `refcountOf`, with nothing written; a dedup `put` succeeds and leaves it; `gc` keeps the blob (reading
+  it as 1 would let `delete` write 0 and `gc` remove a blob with other referrers). Removing the sidecar by
+  hand gives the blob its one implicit reference back. A blob with a corrupt sidecar is never collected until then.
 - **Directory durability, what is not covered:** `ensureDir` syncs the parent only when its own `mkdir`
   created the directory. A process that finds the directory already there (another process made it and has not
   synced, or was killed first, or the earlier sync failed with an error) does not sync it, so a `put` can return
@@ -195,48 +194,54 @@ reason); none is something the router-tool consumer or a flatfs user asks of a b
   sync: after a power cut a blob can return without its sidecar, untracked until the next `put`, which is the safe direction.
 - **`gc` stops on a directory it cannot read** (`named/` or `raw/` without permission): it returns the error
   before the CAS sweep, so no blob is reclaimed. Nothing is deleted that it could not judge.
-- **`gc` reaps more (2026-11-03):** besides `cas/.ingest-*.part` it removes `named/<ns>/.*.part` and
+- **What `gc` reaps:** besides `cas/.ingest-*.part` it removes `named/<ns>/.*.part` and
   `raw/<ns>/.*.part` older than `stale_after_ns` (the same mtime rule), `.<hex>.rc.tmp` sidecar temps
   (unconditionally: their writers hold the ingest lock `gc` holds), and a `<hex>.rc` whose blob is gone
   (`gc` interrupted between its two unlinks; `casCommit` of a new blob writes a count of 1 and ignores
   such a leftover). `temps_removed` counts all of these. `gc` holds the ingest lock for its whole walk
   and reads sidecars inside it: a read that hangs (a FIFO swapped in after the `lstat`) holds every
-  `put`/`delete` of every process on the store until the `gc` is killed.
-- **Hostile or damaged store (2026-11-03):** every read of a blob, `.rc` sidecar, raw blob or named
+  `put`/`delete` of every process on the store until the `gc` is killed. The stale-temp reap is age-gated
+  by `GcOptions.stale_after_ns` (default `Store.default_stale_after_ns`, 24 h; `0` is `error.StaleAfterTooSmall`).
+  mtime is its only liveness signal, so a `put` whose source stalls longer than that is indistinguishable
+  from crash debris; the default errs toward not deleting live data, and a caller whose ingests finish fast
+  may set a shorter value.
+- **Hostile or damaged store:** every read of a blob, `.rc` sidecar, raw blob or named
   record is `lstat` then `open` then `fstat`, and goes ahead only for a regular file
-  (`error.NotRegularFile`; a sidecar that is not one reads as the one implicit reference). Before, a
-  FIFO at any of those paths blocked `casOpen`/`verify`/`readNamed`/`put`/`delete`, and `gc`
-  while it held the ingest lock; a symlink to `/dev/zero` made `verify` hash for ever; a directory
-  at a blob path counted as a dedup hit. `casHas` is now "is a regular file". The deterministic temp
+  (`error.NotRegularFile`; a sidecar that is not one reads as the one implicit reference). A FIFO at
+  any of those paths therefore cannot block `casOpen`/`verify`/`readNamed`/`put`/`delete`, nor `gc`
+  while it holds the ingest lock; a symlink to `/dev/zero` cannot make `verify` hash for ever; a directory
+  at a blob path is not a dedup hit. `casHas` is "is a regular file". The deterministic temp
   names (`.<hex>.rc.tmp`, `.<key>.part`, `tmp/<uniq>`, the named-record temp) are cleared of a planted
-  FIFO before they are created (`clearNonRegular`). `put` bounded by `putLimited`. Residual,
-  stated: a FIFO swapped in between the `lstat` and the `open`, by a writer who already has write
-  access to `<base>` (outside the threat model: that writer can delete the blob).
-- **Crash consistency, tested (2026-11-03):** every step of the write sequences calls `crashPoint`
+  FIFO before they are created (`clearNonRegular`). `put` streams to EOF: bound an untrusted reader with
+  `putLimited`. Residual: a FIFO swapped in between the `lstat` and the `open`, by a writer who already has
+  write access to `<base>` (outside the threat model: that writer can delete the blob).
+- **Crash consistency, tested:** every step of the write sequences calls `crashPoint`
   (test builds only; `root.crash_hook`): ingest written, ingest synced, sidecar temp written, temp
   synced, renamed, directory synced. `crash_test.zig` interrupts `put`, a dedup `put`, `delete` of the
-  last and of a shared reference, `putNamed` over an old record and a raw `commit` over an old blob at
-  each point, leaves the directory as a killed process would (`discardTemp` and the error cleanups are
-  no-ops once tripped), checks it (every visible blob hashes to its name, every sidecar parses, the
-  record/blob is the old or the new value whole, a count is never LOWER than the references that
-  completed: a crash between the blob's rename and its sidecar write leaves the blob untracked, which
-  reads as one implicit reference, and the retry makes it two, which only delays `gc`), then retries on
-  a fresh `Store`, runs `gc` and checks that no debris survives in `cas/`, `named/` or `raw/` and that
-  the retried operation lands exactly one step beyond whatever the crash had landed. Eight sequences are
-  interrupted (put, dedup put, dedup put onto a count of 12 whose half-written sidecar would read 1, both
-  deletes, putNamed, raw commit, `gc` between its two unlinks) at the points of `ensureDir`,
-  `lockIngest`, the ingest, `renameDurable` and `casRefWrite`; a mutant that writes the sidecar in place
-  of through its temp is killed by the count-of-12 test. What it cannot show: that `fsync`
-  actually orders the writes on a given disk.
-- **32-bit targets (2026-11-03):** `ingest_counter` was a `u64` atomic, which does not compile on
-  mips32 or 32-bit arm (the module did not build for the router-tool consumer's own target); it is a `usize`. The tests
-  that need a 64-bit slice length or 64-bit `time_t` skip themselves there.
+  last and of a shared reference, `putNamed` over an old record, a raw `commit` over an old blob and `gc`
+  between its two unlinks at each point, leaves the directory as a killed process would (`discardTemp`
+  and the error cleanups are no-ops once tripped), checks it (every visible blob hashes to its name, every
+  sidecar parses, the record/blob is the old or the new value whole, a count is never LOWER than the
+  references that completed: a crash between the blob's rename and its sidecar write leaves the blob
+  untracked, which reads as one implicit reference, and the retry makes it two, which only delays `gc`),
+  then retries on a fresh `Store`, runs `gc` and checks that no debris survives in `cas/`, `named/` or `raw/`
+  and that the retried operation lands exactly one step beyond whatever the crash had landed. The sequences
+  cover the points of `ensureDir`, `lockIngest`, the ingest, `renameDurable` and `casRefWrite`, including a
+  dedup `put` onto a count of 12 whose half-written sidecar would read 1 (the test that fails if the sidecar
+  is written in place instead of through its temp). What it cannot show: that `fsync` actually orders the
+  writes on a given disk.
+- **32-bit targets:** `ingest_counter` is a `usize` atomic (a `u64` atomic does not compile on mips32 or 32-bit
+  arm); `meta.targets` names `.linux32`. The tests that need a 64-bit slice length or 64-bit `time_t` skip
+  themselves there.
 - Reentrant — shared state (refcounts, gc) is coordinated via the advisory ingest flock, not
   in-process synchronization. Posix (atomic-rename visibility, flock; filesystem via `std.Io`).
 - Design choices: `put` owns hash-while-write (a single streaming pass, callers never hash
   externally); `verify`, `Digest`, and per-entry-point segment validation guard every path; the raw
   layer is `raw/<ns>/<key>` and opaque records are `named/<ns>/<key>` (any bytes, not just JSON) — no
-  JSON/Outcome wrapping, this is pure storage.
+  JSON/Outcome wrapping, this is pure storage. Listing: `list`/`listNamed` materialize every name into the
+  caller's arena; `names` is the bounded-memory iterator (unordered; ordered or prefix listing is the
+  caller's sort over it). `putLimited` bounds a stream (`error.StreamTooLong`, nothing committed);
+  `putNamed` above 64 MiB is `StreamTooLong` before any I/O, and `readNamed` reads a record of exactly 64 MiB.
 
 ## Threat model / out of scope
 Not a security boundary against a co-resident attacker with filesystem access to `<base>` — no
@@ -247,85 +252,50 @@ TOCTOU outside the ingest lock's reach only in the sense that two processes comm
 content just double-rename to the same bytes; the refcount bump itself is inside the lock, so it
 does not double-count. `.rc` sidecar writes are crash-atomic (temp + `renameDurable`, like blob/named
 writes; `casRefWrite`), so a torn sidecar cannot under-count references. `gc`'s stale-temp reap is age-gated
-(`GcOptions.stale_after_ns`, default 24 h, `0` refused with `error.StaleAfterTooSmall`) specifically so it cannot race a slow-but-live `put`
+(see *What `gc` reaps*) specifically so it cannot race a slow-but-live `put`
 still streaming into its own temp. Cross-process locking covers only blobstore's own ingest/refcount
-path — it is not a general-purpose file lock for caller-defined concurrent access patterns.
+path — it is not a general-purpose file lock for caller-defined concurrent access patterns. The residual
+risks stated in the design bullets (a retried `delete`, directory sync not observed by any test, `gc`
+blocking on a swapped-in FIFO, a `put` stalled past `stale_after_ns`) are part of the contract.
 
 ## Verification
-`scripts/modtest blobstore` (+ `zig fmt --check modules/blobstore`); `zig build check-examples -Dmodule=blobstore`;
-the same tests on big-endian MIPS32 soft-float and 32-bit ARM: `zig test -OReleaseSafe -target mips-linux-musl
--mcpu=mips32+soft_float --test-no-exec` (and `arm-linux-musleabi -mcpu=cortex_a7`) then `qemu-mips` /
-`qemu-arm` on the binary, 63 pass and 2 skipped on each (2026-11-03). `src/crash_test.zig` (grade-2 round,
-2026-11-03): crash injection after every step of six write sequences, hostile-store cases (FIFO, directory,
-`/dev/zero` symlink at a blob, sidecar, record and temp path), `putLimited` on an endless stream, `names`, and
-the seeded reference model. Benchmark and its foreign side: `tools/bench.zig`, `tools/go_bench`
-(`zig build bench-blobstore`, needs go 1.26 and the pinned modules in the module cache). Tests from the
-earlier rounds cover CAS put/dedup/has/open/verify(intact + bit-rot)/delete, `Digest.fromHex` round-trip,
-the raw createTemp→commit→openBlob→list crash-safe path, named put/read/list, `segmentSafe`
-rejecting `..`/leading-dot/traversal attempts on every public entry point, `gc` sweeping a
-zero-refcount orphan while keeping both a live-refcount blob and an explicitly-`keep`'d
-zero-refcount blob (positive control on both), refcount surviving repeated dedup'd puts and only
-becoming collectible at zero, configurable fan-out (1/2/3) round-tripping bytes and landing at the
-expected nested path, `Store.init` still opening a plain (no-`Options`) store at the default
-fan-out, a single writer doing repeated put/delete/gc/reopen cycles never deadlocking on the
-ingest flock, `Options.refcount = false` producing exactly one CAS file with no `.rc` sidecar and a
-still-readable blob, the no-`Options` default still writing a sidecar (regression guard for the
-consumers that pin the historical layout), `gc`'s CAS sweep being a truthful (zero-stats) no-op
-under `refcount = false` while `casDelete` refuses with `error.RefcountDisabled`, lazy layer
-creation leaving `cas/`/`named/`/`tmp/` absent from a store that only ever wrote to `raw/`, and
-(2026-08-18) `hasOrphanedRcSidecars` returning `false` on a fresh store and under normal
-`refcount = true` use, plus the refcount-toggle footgun end to end: a store run with
-`refcount = true`, a blob deleted down to a zero sidecar `gc` has not yet swept, the same `base`
-reopened with `refcount = false`, `hasOrphanedRcSidecars` finding the stale sidecar, and `gc`
-confirming it is truthfully untouched (`blobs_removed == 0`).
+- **Run:** `scripts/modtest blobstore` (+ `zig fmt --check modules/blobstore`); `zig build check-examples -Dmodule=blobstore`.
+- **32-bit:** the same tests on big-endian MIPS32 soft-float and 32-bit ARM: `zig test -OReleaseSafe -target mips-linux-musl
+  -mcpu=mips32+soft_float --test-no-exec` (and `arm-linux-musleabi -mcpu=cortex_a7`) then `qemu-mips` /
+  `qemu-arm` on the binary; a few tests skip themselves there (64-bit slice length, 64-bit `time_t`).
+- **Test classes** (`src/root.zig`, `src/crash_test.zig`, `src/sweep_test.zig`): CAS put/dedup/has/open/verify (intact and
+  bit-rot)/delete; `Digest.fromHex` round-trip; the raw createTemp→commit→openBlob→list path; named put/read/list;
+  `segmentSafe`/`uniqSafe` and `requireCasHex` at their exact limits and on every public entry point; `gc` (zero-refcount
+  orphan swept, live and `keep`'d blobs kept, refcount surviving repeated dedup'd puts, temps reaped by age and
+  counted, orphan and temp sidecars); configurable fan-out (1/2/3); the default `Store.init` layout; a single writer
+  cycling put/delete/gc/reopen without deadlocking on the flock, a second locker waiting for the first;
+  `Options.refcount = false` (one CAS file, no sidecar, truthful zero-stats `gc`, `RefcountDisabled`), the default
+  still writing a sidecar, the refcount-toggle footgun end to end with `hasAnyRcSidecar`; lazy layer creation;
+  sidecar text parsing (whitespace, length limit, garbage is `CorruptSidecar` and kept by `gc`); no file descriptor
+  left open by put, a refused put, `putNamed`, `names`, `gc`; `putLimited` over the total across chunks and on an
+  endless stream; `names`; hostile-store cases (FIFO, directory, `/dev/zero` symlink at a blob, sidecar, record and temp path).
+- **Crash and model tests** (`src/crash_test.zig`): crash injection after every step of the write sequences, and the
+  seeded reference model (`Model`: digest → present / refcount) compared with the store after every step (see the
+  card's Evidence line).
+- **Fuzz:** none; the card's Hardening line records the obligation as n/a.
+- **Constant time:** n/a — content-addressed blobs, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it (the whole-module run mutated `src/root.zig`, ReleaseSafe, one schemata build per round; its
+  equivalent-mutant classes are: redundant guards that fire twice, directory entries whose failed
+  `deleteFile`/`openDir` is skipped, and what no test can inject — a missing `fsync`, a lock file replaced between
+  `open` and `flock`, a swap or delete between `lstat` and `open`, an `open`/`write` fault; the crash hooks and comptime
+  constants are not mutated).
+- **Bench:** `tools/bench.zig` and its foreign side `tools/go_bench` (`zig build bench-blobstore`, needs go 1.26 and the
+  pinned modules in the module cache).
 
-**Audit 2026-11-17 (whole-module mutation).** 282 schemata mutants over `src/root.zig` (every guard, comparison,
-boundary, skipped call and swapped argument of the hex/segment/uniq validation, sidecar read/write, `casCommit`,
-`casDelete`, `put`/`putLimited`, `verify`, the raw/named layers and listings, `names`, scratch files, the ingest lock,
-`gc` and its reapers, the hostile-store readers and `createUniqueTemp`), ReleaseSafe, one build per round, each mutant
-under `setsid -w timeout` and `ulimit -v`, baseline first. The `crash_test.zig` model and crash loops cost 48 s of a
-50 s suite, so mutants first ran against the fast tests only and the survivors then against `crash_test`. Round 1: 154
-killed, 3 hung (counted killed), 125 survived. 26 tests added (94 now): the characters just outside `[0-9a-f]` and
-lengths 63/65, the exact `segmentSafe`/`uniqSafe` limits, sidecar text (whitespace trimmed, 31 digits, garbage is
-`CorruptSidecar` and kept by `gc`, a trimmed `0` collectible), `casCommit` return values and a dedup onto a corrupt
-sidecar, a dedup put on a `refcount = false` store, the `putLimited` limit on the total across chunks, no file
-descriptor left open by put/refused put/putNamed/names/gc, listings skipping directories and hidden files with the
-two layers apart, ns and key validated at every raw/named entry point, scratch truncation, a second locker waiting for
-the first, `gc` reaping exactly its own temps and counting them, orphan and temp sidecars, per-blob size sums, a
-dangling symlink under an orphan check, 63 stale temp names, `casCommit` of a foreign temp onto a missing `cas/`, a
-symlink at a blob path, `putNamed`'s hidden `.part` temp. Final: 252 killed (7 of them by a hang), 30 equivalent or
-unobservable, 0 survivors (a `verify` that compared only the first 32 of 64 hex characters is killed by a copy stored under an id sharing that prefix).
-The 30:
-redundant guards that fire twice (`ensureCasDir`'s fan-out and hex checks, `casCommit`/`casDelete`'s first
-`requireCasHex`, `names`'s second kind test, `scratchCreate`'s lock-name test behind `segmentSafe`, the `age >= 0`
-conjunct of `oldEnough`), directory entries whose `deleteFile`/`openDir` fails and is skipped, and the ones that need
-what no test can inject: a missing `fsync` (5), a lock file replaced between `open` and `flock` (2), a swap or delete
-between `lstat` and `open` (3), an `open`/`write` fault (2), a legacy-blob default of 0 that ends at the same count as
-1. Not mutated: the crash-injection hooks (`crashPoint`, `crash_hook`), the comptime constants (`name_max`,
-`temp_label_max`, `lock_inode_retries`, `max_record_bytes`), which a switch cannot reach; the `Error`/`Options` value
-tests pin them.
+## Performance
+Against go-ds-flatfs (like-for-like: temp + fsync + rename + directory fsync) and diskv: `zig build bench-blobstore`,
+ReleaseFast. The card's Performance line carries the figures and the pairing (the verdict rows run with
+`Options.refcount = false`; the default store's `put_rc` is an info row, as it does work no Go side does). The fsync of
+the parent of every directory a `put` creates is the one durability step diskv does not pay.
 
-## Backlog / deferred
-None outstanding from the original four-item backlog (garbage collection, reference counting,
-configurable fan-out depth, cross-process ingest locking/isolation) — all implemented, see
-"Design & invariants" above. Possible future work, not currently planned: `gc` does not sweep
-`raw/`/`named/` temp debris (only `cas/.ingest-*.part`, since those are the only ones this module's
-own `put` creates unprompted — `raw`/`named` temps are tied to a caller-driven create→commit
-sequence with no equivalent "ambient" ingest); Windows/non-POSIX `flock` support (module is POSIX
-by design, `meta.platform = .posix`).
-
-(The 2026-09-30 survey items - multi-hash, compression, packing, chunking/encryption - have verdicts below; none is planned.)
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- (sweep GW 2026-10-31, status 2026-11-03) `list`/`listNamed` still materialize every name into the
-  caller's arena; `Store.names` is the bounded-memory form (done). `put(reader)` streams to EOF;
-  `putLimited` bounds it (done). A FIFO or other non-regular file at a blob/sidecar path no longer
-  blocks (done, see Design). `lockIngest` still blocks for as long as another process holds the flock
-  (no timeout; `gc` holds it for its whole walk): a bounded `try_lock` retry would be the fix.
-  Deferred on purpose: the safe default is to wait (a holder that dies releases the lock), a timeout is
-  a policy the caller should choose, and nothing in the router-tool consumer's backup vault calls `gc` while another writer works.
-
-**Survey verdicts (2026-11-02), one per substantial gap:**
+## What is deliberately not done
+Survey verdicts (go-ds-flatfs, git, restic, cacache-rs, go-cloud, boxo), one per substantial gap:
 - *Multiple hash algorithms* (cacache): **rejected.** One store has one address algorithm; the hex
   length is the layout. Interoperating with a git (sha1) or OCI (sha512) store is a different store; a
   caller who needs it builds on `hashdigest` and the raw layer (`Store.createTemp`/`commit`).
@@ -342,15 +312,17 @@ by design, `meta.platform = .posix`).
   uniform in every position, so `fanout` prefix levels are all a sharding rule can add.
 - *Disk usage tracking* (flatfs): **rejected**: `GcStats` reports what a sweep reclaimed; a `du` of
   `<base>` is the caller's.
-- *Paged / ordered listing* (go-cloud `List`): **done** as `names` (unordered, bounded memory); ordered
-  or prefix listing is a caller's sort over it.
-- *Windows, async I/O*: **rejected** (`meta.platform = .posix`, sync `std.Io`).
+- *Ordered or prefix listing* (go-cloud `List`): **rejected**: `names` is the paged, bounded-memory form (unordered);
+  ordering or a prefix is a caller's sort over it.
+- *Windows, async I/O*: **rejected** (`meta.platform = .posix`, sync `std.Io`; the ingest lock is `flock`).
 - *Batch put* (flatfs): **rejected**: `put` per blob is already one temp + one rename each; the
   directory fsync per blob is the durability contract, batching it would weaken it.
 
-## Status
-`extract · posix · util · reentrant` + deps: `hashdigest` (SHA-256) — canonical source is
-`pub const meta` in src/root.zig.
+## Backlog / deferred
+- **Bounded wait on the ingest lock.** `lockIngest` blocks for as long as another process holds the flock (`gc`
+  holds it for its whole walk). A bounded `try_lock` retry would be the fix. Deferred on purpose: the safe default
+  is to wait (a holder that dies releases the lock), a timeout is a policy the caller should choose, and nothing in
+  the known consumer's backup vault calls `gc` while another writer works.
 
 ## Anchoring
 
