@@ -771,7 +771,7 @@ const ProbeCache = root.VerifiedCache(u8);
 var cache_out: ProbeCache = undefined;
 
 noinline fn callCacheInit() void {
-    cache_out = ProbeCache.init(std.heap.page_allocator, std.testing.io, .{ .capacity = 16 }) catch unreachable;
+    cache_out = ProbeCache.init(std.heap.page_allocator, std.testing.io, .{ .capacity = 16 }) catch unreachable; // global-alloc-ok: a stack-probe target takes no arguments; the cache is freed by the test
 }
 
 /// `init` returns the cache BY VALUE, MAC key included (CONVENTIONS §2.1.1
