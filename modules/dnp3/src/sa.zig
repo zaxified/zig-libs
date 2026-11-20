@@ -613,7 +613,7 @@ pub const AggregateMac = struct {
 // definition of those slices (documented below). Validated for full-flow
 // self-consistency, not against a live opendnp3 MAC vector (see module header).
 //
-// ── TRANSCRIPT ADJUDICATION (adversarial-soundness review, 2026-07-19) ────────
+// ── TRANSCRIPT ADJUDICATION (adversarial-soundness review) ────────
 // Verdict: SOUND — no attacker-malleable field and no reachable splicing gap,
 // given the calling contract below. No code-logic change was required; this
 // note exists so the transcript is not re-audited from scratch.

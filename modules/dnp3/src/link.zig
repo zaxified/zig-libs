@@ -471,7 +471,7 @@ fn fuzzDecodeFrame(_: void, smith: *std.testing.Smith) !void {
     // MINIMUM — so `len` was 0 for every seed and `decodeFrame` was handed
     // `frame[0..0]`, which is `ShortFrame` on the first line. The CRC block
     // loop named in the comment below — the "block runs past end" surface this
-    // harness exists for — was never entered once. Measured 2026-09-07 over
+    // harness exists for — was never entered once. Measured over
     // the corpus above: **0 of 13 seeds non-empty, 0 frames decoded and 0 user
     // octets recovered before; 12 of 13 non-empty (the empty frame is a
     // deliberate seed), 5 decoded and 289 user octets after.**

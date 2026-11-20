@@ -43,7 +43,7 @@ const Step = union(enum) {
 
 // ── CAPTURED: opendnp3 master-demo -> this module's Outstation ──────────────
 //
-// Recorded 2026-07-23. opendnp3's `master-demo` (master address 1, outstation
+// Recorded. opendnp3's `master-demo` (master address 1, outstation
 // address 10) connected to a real loopback TCP socket; a proxy split the byte
 // stream into data-link frames and handed each to this module's
 // `outstation.Session`; every reply byte came out of this module. The master
@@ -407,7 +407,7 @@ test "CAPTURED: the fragmented session reproduces byte-for-byte, FIR/FIN/SEQ inc
 
 // ── CAPTURED: this module's master-side codecs -> a live opendnp3 outstation ─
 //
-// The reverse direction, recorded 2026-07-23 against opendnp3's
+// The reverse direction, recorded against opendnp3's
 // `outstation-demo` (outstation address 10, master address 1) over a real
 // loopback TCP socket. The requests were built by this module's
 // `link`/`transport`/`application`/`objects` codecs; the responses are

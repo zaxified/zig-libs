@@ -53,7 +53,7 @@ fn verifyBoth(ok: bool, bad: bool) void {
     // accepted). It is declassified here instead of being left for the
     // formatter to branch on: whether that branch lands in std's formatting
     // frames (a witness) or on this line (unattributed) depends on how LLVM
-    // inlines `main`, and adding the `keys5` arm moved it here (2026-11-19).
+    // inlines `main`, and adding the `keys5` arm moved it here.
     var verdict = [2]u8{ @intFromBool(ok), @intFromBool(bad) };
     std.valgrind.memcheck.makeMemDefined(&verdict);
     std.debug.print("ctgrind_result={x}\n", .{verdict});

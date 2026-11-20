@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for dnp3 (added 2026-10-10).
+//! Deterministic fuzz driver for dnp3.
 //!
 //! `DNP3_FUZZ=<runs>[,<first seed>]` runs the harnesses (testkit's fuzz
 //! driver; `_ONLY` selects one by name, `_MS`, `_SEEDFILE`, `_INPUT` as

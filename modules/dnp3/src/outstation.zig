@@ -264,7 +264,7 @@ pub const Database = struct {
 /// finally encodes the value comes from the MASTER'S REQUESTED variation
 /// (`emitStatics`), not from the point's configured one, so any shape chosen
 /// here was a guess about a number the requester had not sent yet. Two
-/// defects came out of that guess (audit 2026-09-02): the two variations could
+/// defects came out of that guess (audit): the two variations could
 /// disagree, giving `records.encode` a float where it read `.analog_int` --
 /// a panic in Debug, a reinterpreted low half in ReleaseFast; and the float
 /// variation numbers hard-coded here are group 30's, while g40's are 3 and 4
@@ -1749,7 +1749,7 @@ pub const Outstation = struct {
             // NOT `value < min or value > max`: both comparisons are FALSE
             // for a NaN, so `00 00 C0 7F` in a g41v3 setpoint walked through
             // a declared [-100, 100] and was written to the point and handed
-            // to the caller's hook and its actuator (audit 2026-09-02). Phrased
+            // to the caller's hook and its actuator (audit). Phrased
             // as the positive property, a NaN fails it like anything else.
             if (!(value >= point.min and value <= point.max)) return .out_of_range;
 
@@ -4180,7 +4180,7 @@ const hostile_objects = [_][2]u8{
     .{ 41, 4 }, .{ 1, 2 },  .{ 2, 2 },  .{ 10, 2 },
     .{ 20, 1 }, .{ 30, 1 }, .{ 50, 1 }, .{ 60, 1 },
     .{ 60, 2 }, .{ 80, 1 }, .{ 99, 7 },
-    // ⭐ The NARROW read variations, added 2026-09-02. Every read variation in
+    // ⭐ The NARROW read variations, added. Every read variation in
     // the pool above is one that can carry any value the database holds, so
     // the whole "the master asked for a variation this value does not fit"
     // path -- which produced a CRITICAL non-terminating response series --
@@ -4520,7 +4520,7 @@ fn fuzzStructuredHandle(_: void, smith: *testing.Smith) !void {
     // `CursorDrawer` for the R1 collapse this replaces. The `!smith.eos()`
     // loop guard went with it: a cursor cycles rather than running out, so all
     // 32 fragments are always drawn, where before an exhausted input ended the
-    // loop early. Measured 2026-09-07: **one constant fragment on every input
+    // loop early. Measured: **one constant fragment on every input
     // before, reaching neither named shape; 10 scripts and both shapes after
     // — pinned executably by the corpus guard's non-vacuity arm.**
     var script: [1024]u8 = undefined;
@@ -4715,7 +4715,7 @@ test "meta: the module reports both roles" {
     try testing.expectEqual(.both, root.meta.role);
 }
 
-// ── audit 2026-09-02 (drift campaign) ───────────────────────────────────────
+// ── audit (drift campaign) ───────────────────────────────────────
 
 test "a value the requested variation cannot carry ends the response instead of looping for ever" {
     // ⛔ CRITICAL regression. One legal 20-byte request -- READ g20v2, the
@@ -4858,7 +4858,7 @@ test "a NaN setpoint is out of range, not a value that walks through the limits"
 
 test "a read of a point kind the database does not have is OBJECT_UNKNOWN, not an empty-range walk" {
     // The guard is `if (n == 0) return error.UnknownObject` in
-    // `parseReadHeader`, and until 2026-09-02 NOTHING pinned it: disabling it
+    // `parseReadHeader`, and previously NOTHING pinned it: disabling it
     // left the whole suite green, because every test configures the kind it
     // reads. It is load-bearing -- with it disabled, `all_values` computes
     // `stop = n - 1` on an unsigned zero: `integer overflow` in Debug, and in
@@ -4880,7 +4880,7 @@ test "a read of a point kind the database does not have is OBJECT_UNKNOWN, not a
     try testing.expect(!reply.more);
 }
 
-// ── deterministic fuzz driver (DNP3_FUZZ, added 2026-10-10) ─────────────────
+// ── deterministic fuzz driver (DNP3_FUZZ, added) ─────────────────
 
 const fz = @import("fuzz_test.zig");
 

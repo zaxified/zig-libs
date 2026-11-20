@@ -118,7 +118,7 @@ pub const Value = union(enum) {
     /// eight peer-supplied bytes, and `f32`/`f64` have encodings for all
     /// three). `lossyCast` saturates instead, and maps NaN to 0: a wrong
     /// number is not good, but it is a number, and the alternative here was
-    /// illegal behaviour in a release build. Audit 2026-09-02.
+    /// illegal behaviour in a release build. Audit.
     pub fn asInt(self: Value) i64 {
         return switch (self) {
             .binary => |b| @intFromBool(b),
@@ -133,7 +133,7 @@ pub const Value = union(enum) {
     /// `error.ValueOutOfRange` when it does not survive the conversion.
     ///
     /// ⭐ The layout decides the WIRE form; the value is just a number. Until
-    /// 2026-09-02 the `.i16`/`.i32` encoders read `value.analog_int`
+    /// the `.i16`/`.i32` encoders read `value.analog_int`
     /// unconditionally, so a float-shaped value there was an inactive-union
     /// read: a panic in Debug, and in ReleaseFast the float's low bytes
     /// reinterpreted as an integer — a SCADA reading of `12.3` reaching the
