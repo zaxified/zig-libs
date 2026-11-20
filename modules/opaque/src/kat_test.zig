@@ -643,7 +643,7 @@ test "H1: every byte of KE3's client_mac is checked, not just the last byte" {
 // it is also the only vector in this suite that exercises the §6.3.2.2
 // user-enumeration defense end-to-end, which C.1's "Real" vectors cannot
 // (there is no registered record to be missing). Bytes extracted
-// mechanically from `rfc9807.txt` by ,
+// mechanically from `rfc9807.txt` by
 // same method C1 uses for the "Real" vectors.
 
 fn hx(comptime s: []const u8) [s.len / 2]u8 {
