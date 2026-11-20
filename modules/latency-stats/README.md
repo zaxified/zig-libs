@@ -66,7 +66,7 @@ Percentiles are the separate, allocating `Histogram` type (counts array sized on
 at `init`): `Histogram.init(gpa, .{ .highest = ..., .sigfigs = 3 })`, then
 `record` / `recordCount` / `valueAtPercentile` / `percentileSnapshot` / `add` (merge).
 
-Beyond that (2026-11-02):
+Beyond that:
 
 ```zig
 h.recordCorrected(rtt_ns, expected_interval_ns); // coordinated-omission correction
@@ -84,3 +84,11 @@ var back = try ls.wire.decode(gpa, bytes, .{ .max_counts = 1 << 20 }); // hostil
 After `wire.decode`, `min()` and `max()` are the bounds of the lowest and highest non-empty counts slot, not the exact recorded extremes (the wire carries counts only); every other query matches the encoded histogram.
 
 `Histogram.countsLen(opts)` says what a configuration costs (8 bytes a slot) before `init` allocates it.
+
+## Not provided
+
+No thread safety (one owner per `Accumulator` / `Histogram`; guard it or keep
+one per thread and merge), no auto-resize (values past `highest` clamp), no
+floating-point `DoubleHistogram`, no V0/V1 decoding or interval-log text
+format, no exponential histograms or windowing. Reasons and revisit
+conditions: SPEC *What is deliberately not done*.

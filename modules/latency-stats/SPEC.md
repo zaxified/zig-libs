@@ -19,7 +19,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see README § Provenance (no module NOTICE; the root `NOTICE` has no entry for this module).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -29,10 +29,10 @@ HdrHistogram. S2 re-survey 2026-11-02: the licence files of HdrHistogram_c, `hdr
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [HdrHistogram/HdrHistogram_c](https://github.com/HdrHistogram/HdrHistogram_c) — **reference** (histogram) | C | CC0-1.0 and BSD-2-Clause, both stated in its `LICENSE.txt` (read 2026-11-02; the API says NOASSERTION) | 290 | 0.11.10 (2026-06-29) | Record, corrected record, percentiles, mean/stddev, min/max, merge, reset, plus iterators (all values, recorded, percentiles, linear, logarithmic), V0-V2 serialization with zlib and a base64 log format, an interval recorder with a reader/writer phaser, atomic variants. Here (2026-11-02): all of the first group, iterators `recorded`/`linear`/`logarithmic`/`percentiles`, V2 plain and compressed interchange that C and Go read exactly. Not here, on purpose: V0/V1 reading, the interval-log text format, the phaser/interval recorder and atomics (single owner by design, see Backlog). Measured: ours 0.07-1.06x its time per op (`bench-latency-stats`); it is the quickest of the three on `record_corrected`. |
+| [HdrHistogram/HdrHistogram_c](https://github.com/HdrHistogram/HdrHistogram_c) — **reference** (histogram) | C | CC0-1.0 and BSD-2-Clause, both stated in its `LICENSE.txt` (read 2026-11-02; the API says NOASSERTION) | 290 | 0.11.10 (2026-06-29) | Record, corrected record, percentiles, mean/stddev, min/max, merge, reset, plus iterators (all values, recorded, percentiles, linear, logarithmic), V0-V2 serialization with zlib and a base64 log format, an interval recorder with a reader/writer phaser, atomic variants. Here: all of the first group, iterators `recorded`/`linear`/`logarithmic`/`percentiles`, V2 plain and compressed interchange that C and Go read exactly. Not here, on purpose: V0/V1 reading, the interval-log text format, the phaser/interval recorder and atomics (single owner by design, see *What is deliberately not done*). Speed against it and the other two: the card's Performance line (`bench-latency-stats`). |
 | [HdrHistogram/HdrHistogram](https://github.com/HdrHistogram/HdrHistogram) | Java | NOASSERTION (CC0-1.0/BSD-2 per this repo's README) | 2.3k | HdrHistogram-2.2.2 (2024-05-30) | The original design; same feature list as the C port *(inferred)*. |
-| [HdrHistogram/HdrHistogram_rust](https://github.com/HdrHistogram/HdrHistogram_rust) (`hdrhistogram` 7.6.0) — **fastest** (merge, `mean_stddev`) | Rust | MIT OR Apache-2.0 (crates.io metadata and the `LICENSE-MIT` read 2026-11-02) | 373 | 7.6.0 (2026-07-18) | `record_correct`, iterators, auto-resize, a sync recorder, serialization (features `serialization`, `sync`; built without them for the bench). Quickest of the three on `merge` (ours 0.98x) and on `mean_stddev` (ours 0.40x); merging into an empty histogram is a `memcpy`, which this module now does too. |
-| [HdrHistogram/hdrhistogram-go](https://github.com/HdrHistogram/hdrhistogram-go) v1.4.0 | Go | MIT (`LICENSE` read 2026-11-02) | — | v1.4.0 (2026-10-08) | Record, corrected record, merge, quantiles, windowed and packed histograms, V2 compressed encode/decode (base64). Quickest of the three on `percentiles` (ours 0.81x), slowest elsewhere. |
+| [HdrHistogram/HdrHistogram_rust](https://github.com/HdrHistogram/HdrHistogram_rust) (`hdrhistogram` 7.6.0) — **fastest** (merge, `mean_stddev`) | Rust | MIT OR Apache-2.0 (crates.io metadata and the `LICENSE-MIT` read 2026-11-02) | 373 | 7.6.0 (2026-07-18) | `record_correct`, iterators, auto-resize, a sync recorder, serialization (features `serialization`, `sync`; built without them for the bench). Quickest of the three on `merge` and on `mean_stddev` (card's Performance line); merging into an empty histogram is a `memcpy`, which this module now does too. |
+| [HdrHistogram/hdrhistogram-go](https://github.com/HdrHistogram/hdrhistogram-go) v1.4.0 | Go | MIT (`LICENSE` read 2026-11-02) | — | v1.4.0 (2026-10-08) | Record, corrected record, merge, quantiles, windowed and packed histograms, V2 compressed encode/decode (base64). Quickest of the three on `percentiles`, slowest elsewhere. |
 | [floatdrop/hdrhistogram_zig](https://github.com/floatdrop/hdrhistogram_zig) | Zig | MIT | 2 | push 2025-11-25 | The Zig alternative: comptime-sized static histogram; its own README: "Many methods are absent yet". No moments, no loss accounting. |
 | [floatdrop/hdrhistogram_c_zig](https://github.com/floatdrop/hdrhistogram_c_zig) | Zig (wraps C) | MIT | 0 | push 2025-10-23 | Builds the C library through Zig; C dependency, not pure Zig *(README not readable via API; inferred from name)*. |
 | [DataDog/sketches-go](https://github.com/DataDog/sketches-go) (DDSketch) | Go | Apache-2.0 | 187 | v1.4.8 (2026-02-20) | Relative-error quantile sketch, mergeable, wire format shared with other DDSketch ports *(inferred)*; a different algorithm family, not a competitor for exact-bucket semantics. |
@@ -43,7 +43,7 @@ HdrHistogram. S2 re-survey 2026-11-02: the licence files of HdrHistogram_c, `hdr
 (min/max/mean/population stddev/RFC 3550 jitter/loss, Welford-stable) and an HdrHistogram-style percentile type in
 pure Zig with a runtime-configured range (the other Zig histogram is comptime-sized, moment-free and by its own README
 incomplete); percentiles never under-report (`valueAtPercentile` = highest-equivalent bucket); clamping never drops a
-sample; tested against a sorted-array oracle at sigfigs 1-4. **Where we are behind:** (2026-11-02) no concurrent or interval recording, no auto-resize, no double-valued histogram, no V0/V1 reading, no interval-log text format (each rejected with a reason, see Backlog); coordinated-omission correction, iterators, `Accumulator.merge` and V2 interchange, listed here until 2026-11-02, are closed.
+sample; tested against a sorted-array oracle at sigfigs 1-4. **Where we are behind:** no concurrent or interval recording, no auto-resize, no double-valued histogram, no V0/V1 reading, no interval-log text format (each rejected with a reason, see *What is deliberately not done*).
 
 ## Design & invariants
 
@@ -57,87 +57,142 @@ sample; tested against a sorted-array oracle at sigfigs 1-4. **Where we are behi
   output; `jitter_ns` follows the RFC 3550 §6.4.1 recurrence `J += (|D| - J)/16` over successive RTT
   differences. `addLoss` counts toward `sent`/loss% without disturbing timing state.
 - **Histogram guarantees:** any value in `[lowest, highest]` is resolved with bounded relative
-  error `1 / 2^significant_bits`; `record`/`recordCount` are O(1), never fail and never drop a
-  sample (out-of-range values clamp, saturating). `valueAtPercentile` returns the
+  error `1 / 2^significant_bits`; `record`/`recordCount` are O(1) and never fail (out-of-range
+  values clamp; only samples past a total of `maxInt(u64)` are not counted, see *Threat model*). `valueAtPercentile` returns the
   *highest-equivalent* bucket value (never under-reports); `add` merges two same-config histograms.
 - **Platform:** any (pure arithmetic; no I/O, no clock). **Concurrency:** single_owner — one
   `Accumulator`/`Histogram` per probe stream; not thread-safe. `compute()` folds a slice of `?u64`
   (null = loss) as a one-shot equivalent of the streaming path.
+- **Coordinated-omission correction.** `Histogram.recordCorrected` / `recordCorrectedCount`
+  (HdrHistogram's `record_corrected_value`): on top of `value`, the samples a stalled probe loop
+  never sent are recorded, `value - expected_interval`, `value - 2 * expected_interval`, ... down to
+  `expected_interval`; `expected_interval == 0` records `value` only. It takes at most one step per
+  counts slot, not one per synthetic sample, so `expected_interval = 1` with a huge value returns
+  at once, and the result equals the one-by-one loop (parity-tested, also when `lowest` is not a
+  power of two and when the total runs out mid-run). An `addCorrected` that corrects while merging
+  is not provided (see *What is deliberately not done*): a caller iterates `recorded()` and calls
+  `recordCorrectedCount` with the representative value it wants.
+- **Distribution iterators** (`iter.zig`): `recorded()`, `linear(step)`, `logarithmic(first, base)`
+  and `percentiles(ticks_per_half_distance)`. Each is a plain value with `next()`, lazy,
+  allocation-free and total over any argument (a nonsense step or base falls back to a default).
+  An interval iterator attributes a counts slot to the interval containing the slot's smallest
+  value and stops at the interval holding the largest recorded value, so the bins' counts add up
+  to `total_count`. They borrow the histogram: do not record while iterating.
+- **`Accumulator.merge`** folds a later or parallel stream into another: counts add (saturating),
+  min/max combine, mean and variance combine exactly (Chan et al.'s pairwise update of Welford).
+  `jitter_ns` is a smoothed estimate with no exact merge: the result is the average of the two
+  weighted by received replies, and the RTT step across the seam is not counted.
+- **HdrHistogram V2 interchange** (`wire.zig`): `wire.encode` (plain), `wire.encodeCompressed`
+  (cookie, length, zlib stream) and `wire.decode` (both), the format the Java, C, Go and Rust
+  tools read, checked both ways against HdrHistogram_c and hdrhistogram-go. The compressed encoder
+  writes Huffman-only deflate (the payload is already run-length coded, so LZ matching gains
+  little; any inflater reads it). `decode` treats the bytes as hostile: every length is checked
+  against the configuration it describes before anything is allocated, the counts array is bounded
+  by `DecodeOptions.max_counts` (default 4 Mi slots = 32 MiB), inflation stops at the declared
+  payload length (a declared length larger than the stream could inflate to is refused first),
+  and totals are checked for overflow. Errors: `BadFormat`, `Unsupported` (V0/V1 cookies, a
+  non-zero normalizing offset), `TooLarge`, `InvalidConfig`; `encode` adds `CountTooLarge` (a slot
+  past `maxInt(i64)`) and `OutputTooLarge`. After `decode`, `min()`/`max()` are the bounds of the
+  lowest and highest non-empty slot (the wire carries counts only). The log-line base64 is the
+  caller's (sibling `b64ct` / `encoding`).
+- **Memory of a configuration.** `Histogram.init` is uncapped (the parameters document the cost);
+  `Histogram.countsLen(opts)` returns what a configuration costs (8 bytes a slot, at most about
+  6.3 million slots) before it allocates, for a caller whose `highest`/`sigfigs` come from outside.
+  `wire.decode`, the one path where the numbers come from outside, takes `max_counts`.
+- **Exact median of a slice.** `median(samples: []u64) ?u64` and `medianWith(samples, .lower |
+  .upper)`: in-place introselect (median-of-3 pivot, three-way partition, a depth budget of
+  `2 * log2(n)` and then `std.mem.sortUnstable` on the remaining range), so sorted, reverse-sorted
+  and all-equal input stays linear. It reorders the slice, returns null when empty, and for an even
+  count `.lower` is element `(n - 1) / 2` and `.upper` element `n / 2` of the sorted order, always
+  a sample (`median` is `.lower`; no averaging variant). Allocation-free; losses are the caller's
+  to filter out first.
+- **Against ping/fping.** min/avg/max/mdev/loss % match their summary line (population stddev, as
+  fping and iputils print it). Neither prints a median; `Histogram.valueAtPercentile(50)` gives a
+  bounded-error one and `median` an exact one.
 
-## Threat model / out of scope
+## Threat model / limits
 
 Not security-sensitive. It performs no timing measurement itself (the caller supplies the clock and
-the RTT samples) and holds no secrets. What it explicitly does not do: no thread safety (wrap it if
-shared), no allocation in the `Accumulator` path (the `Histogram` is the only allocator, once at
-`init`), no exact percentiles (bounded-error by design), and no exponential histograms /
-windowing / decay. `wire.decode` is the one parser of untrusted bytes: every header field and length is checked against the
-configuration it describes before anything is allocated, and a forged `highest` or `payload_len` is `error.TooLarge` /
+the RTT samples) and holds no secrets. What it does not do: no thread safety (wrap it if shared),
+no allocation in the `Accumulator` path (the `Histogram` is the only allocator, once at `init`),
+no exact percentiles (bounded-error by design), and no exponential histograms / windowing / decay.
+Histogram counts and the total saturate at `maxInt(u64)` instead of overflowing; only samples past
+that total are not counted (`recordCount` then counts what still fits, and a saturated `add` is
+skewed toward low values). `valueAtPercentile` and `rankAtPercentile` are total: `p` is clamped to
+0-100, NaN counts as 0, and a total near 2^64 does not trap. `wire.decode` is the one parser of
+untrusted bytes: every header field and length is checked against the configuration it describes
+before anything is allocated, and a forged `highest` or `payload_len` is `error.TooLarge` /
 `error.BadFormat`, never a large allocation or a panic.
+
+## What is deliberately not done
+
+Rejected with a reason; the reference is HdrHistogram_c unless stated.
+- **`Histogram.addCorrected`** (C `hdr_add_while_correcting_for_coordinated_omission`, Rust
+  `add_correct`): C takes the slot's lowest value as the representative, Rust the highest
+  equivalent, so there is no single meaning. A caller iterates `recorded()` and calls
+  `recordCorrectedCount` with the one it wants.
+- **`DoubleHistogram` (floating-point values).** The reference has none (Java and Rust do). A
+  latency in ns is an integer, and a caller with seconds scales by 10^9 once. Revisit when a
+  consumer holds non-time doubles.
+- **Concurrent / atomic recording, interval recorder, reader/writer phaser.** Single owner by
+  design (`meta.concurrency`); a caller that shares a histogram guards it, or keeps one per thread
+  and merges with `add` (what the phaser exists to avoid). The sibling `lockfree` is the place for
+  a lock-free variant if a consumer needs one.
+- **Auto-resize.** The counts array is fixed at `init` so `record` never allocates and never fails;
+  values past `highest` clamp. Rust and Go resize.
+- **V0/V1 decoding, the interval-log text format (`#[StartTime...]` lines), Go's packed and
+  windowed histograms.** Legacy or tooling formats; V2 is what current writers produce, and
+  `decode` answers `error.Unsupported` for V0/V1 cookies.
+- **Exponential histograms / DDSketch / t-digest, windowing and decay.** A different algorithm
+  family (see *Threat model*).
+- **A module-level cap on `Histogram.init`'s memory.** `init` stays uncapped; `countsLen` and
+  `DecodeOptions.max_counts` bound it where the numbers come from outside.
 
 ## Verification
 
-Hand-computed known-answer sets: empty/single-sample snapshots, the `{10,12,14,16}` mean +
-population-stddev vector, loss accounting + `lossPct`, the RFC 3550 jitter recurrence, and
-`compute` ≡ streaming. Histogram: empty/invalid-config, single-value exactness, uniform collapse,
-an exact 1..1000 ramp (percentiles + mean + population-variance verbatim), an 8192 LCG distribution
-cross-checked against a sorted oracle at sigfigs 1–4 within the guaranteed relative error,
-representation-error sweep, `recordCount` ≡ repeated `record`, clamp policy, `add` merge, reset.
-2026-11-02 additions: `recordCorrectedCount` against the one-by-one loop over 3 configs x 6 intervals x 8 values; `Accumulator.merge`
-against one stream (min/max/mean/stddev) and at the extremes; iterator invariants (counts add up, ticks monotone, huge totals
-terminate); `wire` round trips, known varint bytes, every truncation, forged configuration (`TooLarge`/`InvalidConfig`), a run past
-the array, a total past u64, a count past i64; the decode fuzz harness (`src/fuzz_test.zig`, driver `LATENCY_STATS_FUZZ`) with an
-in-suite 600-seed reach test; interop with HdrHistogram_c and hdrhistogram-go in `tools/bench.zig`. Run: `zig build test-latency-stats`.
-
-**Audit 2026-11-15 (gap-wave delta).** 6 schemata mutants over `medianWith` (ReleaseSafe, one build, each mutant under
-`setsid -w timeout` and `ulimit -v`): `median` delegating with `.upper` instead of `.lower`, the empty guard dropped,
-the `.lower` rank taken as `n / 2` and as one too low, the `.upper` rank taken as `(n - 1) / 2` and as one too high.
-6 killed (the empty guard by an integer-overflow panic, one off-by-one by an out-of-bounds panic); no test needed.
-The Audit line's count is cumulative: 19/21 (2026-10-04) + 15/27 with 12 eq (the `median`/`select` delta below) + 6/6.
-
-**Audit 2026-11-15 (delta mutation).** 27 schemata mutants over `median`/`select` (the introselect), ReleaseSafe,
-one build, each mutant under `setsid -w timeout` and `ulimit -v`: the empty guard, the rank `(n-1)/2`, the depth budget
-(zeroed, never decremented, exhausted test), the range ends, the three-way partition (both comparisons, both swaps,
-both counter moves, the `gt == 0` guard, the scan step), the narrowing (`k < lt`, `k > gt`, `hi = lt - 1`, `lo = gt + 1`)
-and the return of the pivot and of `a[k]`. 15 killed (1 by a hang); no test needed. 12 are equivalent, each a
-change that only moves the cost or is an invariant: a zero budget (the sort fallback is correct, just not
-linear); `lo <= hi` (with one element left, `k == lo` and the pivot is that element); the budget never
-decremented, `mid = lo`, the first sample taken from `hi`, the pivot `x`, `<=` in place of `<` (all keep a pivot that
-is an element of the range and only cost partition quality; the budget bounds the damage and the fallback sorts);
-`hi = lt` and `lo = gt` (a superset of the needed range); `k >= gt` (when `k == gt` the slot already holds the pivot);
-the `gt == 0` guard (the pivot is an element of the range, so `i` stops before `gt` reaches 0); the final
-`return a[lo]` (the loop only exits with `lo == hi == k`). 15/27, 12 equivalent.
-
-**Audit 2026-10-04 (mutation).** 21 schemata mutants over `Stats.lossPct`, the
-`Accumulator` (min/max, Welford update, RFC 3550 jitter gain and previous sample,
-population stddev, `compute`'s losses) and the `Histogram` (config validation, `recordCount`,
-clamping, merge compatibility and extremes, empty `min`, percentile target rounding and the
-p0 floor, `countBetween` order, `highestEquivalent`, bucket-0 index mapping): 19 killed,
-2 equivalent, 0 left alive. Equivalent: updating min/max from an empty merged histogram (its
-extremes are the identity values `maxInt`/0); mapping index range `[half, 2·half)` through
-the general branch of `bucketSubAtIndex` (it yields the same `b = 0, sub = idx`). One test
-added: `recordCount(v, 0)` leaves the histogram untouched, `max()` included.
+Run: `scripts/modtest latency-stats`; the example (`example/main.zig`) is built by
+`zig build check-examples -Dmodule=latency-stats`. Class C (no foreign data of its own except the
+wire format), so the oracles are hand-computed vectors, a sorted array, and the foreign
+HdrHistogram implementations.
+- **Accumulator:** hand-computed known answers (empty and single-sample snapshots, the
+  `{10,12,14,16}` mean and population-stddev vector), loss accounting and `lossPct`, the RFC 3550
+  jitter recurrence, `compute` equal to the streaming path, `reset`, and `Accumulator.merge`
+  against one stream (min/max/mean/stddev) and at the extremes.
+- **Histogram:** empty and invalid configurations, single-value exactness, uniform collapse, an
+  exact 1..1000 ramp (percentiles, mean and population variance verbatim), an LCG distribution
+  cross-checked against a sorted-array oracle at sigfigs 1-4 within the guaranteed relative error
+  (the model named on the card), the representation-error sweep, `recordCount` equal to repeated
+  `record`, the clamp policy, `add` equal to recording both sets into one, `reset`, and the
+  saturation cases of the panic sweep (`recordCount`/`add` totals, percentile with a total near
+  2^64, NaN and infinite `p`, `init` extremes, a fully dropped histogram folded by `add`).
+- **Coordinated-omission correction:** `recordCorrectedCount` against the one-by-one loop over a
+  grid of configurations, intervals and values, a tiny interval with a huge value, and a total that
+  runs out mid-run.
+- **Iterators:** counts add up, ticks are monotone and end at 100, huge totals terminate, any
+  argument is accepted.
+- **Median:** against a full sort on random input (many duplicates too), on 100k sorted,
+  reverse-sorted, all-equal and organ-pipe input, with the depth-budget fallback forced.
+- **Wire:** round trips (plain and compressed), known varint bytes, every truncation, forged
+  configuration (`TooLarge` / `InvalidConfig`), a run past the array, a total past `u64`, a count
+  past `i64`, a forged compressed payload length refused before it is allocated, `countsLen`
+  equal to what `init` allocates.
+- **Fuzz:** the deterministic driver `LATENCY_STATS_FUZZ=<runs>[,<first seed>]` (testkit; `_ONLY`
+  selects a harness) over `latency-stats-wire` (`wire.decode` on damaged and forged input, and the
+  refusals built on purpose; an accepted histogram must satisfy its invariants and survive every
+  query and iterator), `latency-stats-corrected` (against the one-by-one definition) and
+  `latency-stats-add` (min/max in non-empty slots, total equal to the saturating sum). The
+  harnesses also run with a fixed number of seeds in every test run and must reach every outcome.
+- **Interop and bench:** `tools/bench.zig` (`zig build bench-latency-stats`, set-up in
+  `tools/README.md`) first runs a wire gate: HdrHistogram_c and hdrhistogram-go decode our
+  compressed V2 histogram to exactly our counts, and we decode theirs. It then times the
+  `Histogram` against HdrHistogram_c, the Rust `hdrhistogram` and `hdrhistogram-go`; the card's
+  Performance line holds the figures.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
 ## Backlog / deferred
-Verdicts of the 2026-11-02 S2 re-survey (gaps from the 2026-09-30 survey and the ones found against HdrHistogram_c 0.11.10, `hdrhistogram` 7.6.0, `hdrhistogram-go` v1.4.0):
 
-- **Coordinated-omission correction — DONE 2026-11-02.** `Histogram.recordCorrected` / `recordCorrectedCount`; one step per counts slot (not per synthetic sample), so `expected_interval = 1` with a huge value returns at once; equals the one-by-one definition (parity test in `sweep_test.zig`). `Histogram.addCorrected` (C `hdr_add_while_correcting_for_coordinated_omission`, Rust `add_correct`) is **rejected**: C takes the slot's lowest value, Rust the highest equivalent as the representative, so there is no single meaning; a caller iterates `recorded()` and calls `recordCorrectedCount` with the representative it wants.
-- **Distribution iterators — DONE 2026-11-02.** `recorded()`, `linear(step)`, `logarithmic(first, base)`, `percentiles(ticks_per_half_distance)` in `iter.zig`; lazy, allocation-free, total over any argument. Slot-to-interval attribution is by the slot's smallest value (documented in `iter.zig`).
-- **`Accumulator` merge — DONE 2026-11-02.** `Accumulator.merge`: counts, min/max and mean/variance exact (Chan's parallel update); jitter, a smoothed estimate with no exact merge, is the received-weighted average (documented).
-- **Serialization — DONE 2026-11-02.** `wire.encode` / `encodeCompressed` / `decode`, the HdrHistogram V2 binary format (plain, and cookie + length + zlib), checked both ways against HdrHistogram_c and hdrhistogram-go; hostile input is bounded (`DecodeOptions.max_counts`, default 4 Mi slots = 32 MiB; inflation stops at the declared length). The compressed encoder writes Huffman-only deflate (std's matcher state is ~225 KiB and the payload is already run-length coded); any inflater reads it. Sibling modules own the neighbours: base64 for the log line is `b64ct`/`encoding`.
-- **The 2026-10-31 open question (a module-level cap on `Histogram.init`'s memory) — DECIDED 2026-11-02:** `init` stays uncapped (the parameters document the cost), and `Histogram.countsLen(opts)` tells a caller what a configuration costs before it allocates; `wire.decode`, the one path where the numbers come from outside, takes `max_counts`.
-- **`DoubleHistogram` (floating-point values) — rejected.** HdrHistogram_c, the reference, has none; Java and Rust do. A latency in ns is an integer, and a caller with seconds scales by 10^9 once. Revisit when a consumer holds non-time doubles.
-- **Concurrent / atomic recording, interval recorder, reader/writer phaser — rejected.** Single owner by design (`meta.concurrency`); a caller that shares a histogram guards it or keeps one per thread and merges with `add` (that is what the phaser exists to avoid). Sibling `lockfree` is the place for a lock-free variant if a consumer needs one.
-- **Auto-resize — rejected.** The counts array is fixed at `init` so `record` never allocates and never fails; values past `highest` clamp. Rust and Go resize.
-- **V0/V1 decoding, the interval-log text format (`#[StartTime…]` lines), Go's packed/windowed histograms — rejected.** Legacy or tooling formats; V2 is what current writers produce, `decode` answers `error.Unsupported` for V0/V1 cookies.
-- **Exponential histograms / DDSketch / t-digest, windowing and decay — rejected,** a different algorithm family (see Threat model).
-- **`Accumulator` vs ping/fping:** min/avg/max/mdev/loss % match their summary line (population stddev, as fping and iputils print it); ping's median is not printed by either, `Histogram.valueAtPercentile(50)` gives it.
-- ~~**`median(samples)` (consumer request 2026-11-15; effort S).** `Accumulator` keeps mean/variance/min/max and `Histogram` p50 is bounded-error (HdrHistogram resolution); there is no exact median of a small sample set (`rg median modules/latency-stats/src` finds only the internal bucket median-equivalent). Expected: Python `statistics.median`, numpy `median`. Proposed: `latency_stats.median(samples: []u64) ?u64` by in-place selection (nth_element, not a full sort; null when empty; even count returns the lower middle, documented, or `medianF64` for the average). Allocation-free.~~ **Done 2026-11-15:** `median(samples: []u64) ?u64`, introselect (median-of-3, three-way partition, depth budget `2*log2(n)` then `std.mem.sortUnstable` on the range). Reorders the slice, null when empty, even count = lower middle `(n-1)/2` (always a sample; no `medianF64`). Tested against a full sort, and on 100k sorted / reverse-sorted / all-equal / organ-pipe input.
-- ~~**`medianWith(samples, pick)`**~~ *(consumer request 2026-11-15)* — DONE 2026-11-15: `medianWith(samples, .lower | .upper) ?u64`, the same in-place selection as `median` with the even-count middle chosen explicitly (`.lower` = element `(n - 1) / 2`, `.upper` = element `n / 2`); `median(s)` is `medianWith(s, .lower)`. Odd and single counts agree for both picks.
-
-## Status
-
-`extract · any · util · single_owner` + deps: none (std only) — canonical source is `pub const
-meta` in src/root.zig.
+None open.
 
 ## Anchoring
 
