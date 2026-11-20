@@ -6,7 +6,7 @@
 
 **Scope:** core — CPython `str` + `unicodedata`, Rust std (`str::to_lowercase`, `to_uppercase`) + `unicode-normalization`, Go `golang.org/x/text` (`unicode/norm`, `cases`, `runes`), ICU (surveyed 2026-11-09 from their documentation, not by reading their source; CPython and Rust were then RUN over the module's inputs, see Anchoring). What a pandas / polars string column user needs is here; what a Go or ICU user also expects and is missing (language-tailored case, word-boundary titlecase, `unicodedata.name`/`numeric`, segmentation) is under Backlog with reasons.
 
-**Audit:** review 2026-11-09 · mutation none · src ?
+**Audit:** review 2026-11-09 · mutation 2026-11-20 (169/193, 24 eq) · src 6e7e0324b04728a7
 
 **Hardening:** fuzz 2026-11-09 (300,000 runs clean in ReleaseSafe after the UR-1 fix, `UNITEXT_FUZZ`, 15 s; the harness is described under Anchoring; no planted-mutant check yet, see Open) · ct n/a — no secret: the module transforms caller-supplied text · panic 2026-11-09 (independent sweep of every pub entry point, `src/unit_test.zig` "sweep: …": per-code-point functions clamp any `u21` (surrogates, above U+10FFFF) to the default record before indexing; every string form decodes through `utf8.step`, whose reads are guarded by `i + k >= s.len`; the 256-byte emitter block is checked before each append; `ListOut` checks `bytes.len > cap - len` with `len <= cap` by construction; the normalization working buffer is capped by `max_segment` and the output by `max_output`, zero caps give `error.TooLarge` or an empty result; sort and compose are linear or n log n, Final_Sigma look-ahead crosses each case-ignorable run at most once; no finding, no `unreachable`/`assert` on a caller value)
 
@@ -119,8 +119,15 @@ The CPython comparison covers the tables where 16.0.0, 17.0.0 and 18.0.0 all agr
   ASCII-only `unaccent` result on Latin input. A fixed seed run with reach checks is in every test run. It has no
   independent value oracle; the values come from the vectors.
 - **Constant time:** n/a — no secret: the module transforms caller-supplied text.
-- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
-  and the delta runs after it (none yet, see *Open*).
+- **Mutation:** one whole-module run over every file but the generated `tables.zig` (193 mutants: one per condition and
+  operator class in `utf8`, `common`, `norm`, `case`, `props`, `ucd`, `unaccent`), 169 killed, 24 equivalent (lead-byte masks,
+  stable-sort choice, redundant quick-check shortcuts, guards behind the segment cut, the Cased = Upper | Lower | Lt identity;
+  the tests that pin those facts are in `unit_test.zig`), none open. It found real gaps, now tests: the emit block's flush
+  points and the order of direct writes, the Hangul range edges, `max_segment` with ASCII-only input, ill-formed bytes
+  inside `isNormalized`, `title` / `capitalize` after an ill-formed stretch, `isPrintableCp` for surrogates, `isAscii` at
+  0x80.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over that whole-module run and the delta runs
+  after it.
 
 ## What is deliberately not done
 
@@ -134,7 +141,6 @@ The CPython comparison covers the tables where 16.0.0, 17.0.0 and 18.0.0 all agr
 
 ## Open
 
-- No mutation run (the card's Audit line says `mutation none`).
 - The fuzz harness has not been checked with planted mutants (a check that its reach classes really catch a broken algebra).
 - The CPython column does not cover the 17,833 code points whose data changed between 16.0.0 and 18.0.0 (4,815 in 17.0, 13,016 in 18.0); Unicode's `NormalizationTest.txt` covers normalization for them and Rust covers lower / upper for the 17.0 ones, nothing foreign covers their classification (`isAlpha` …, new scripts) or title / casefold. Running the generator on UCD 16.0.0 and comparing *all* code points with CPython would close that (it needs a second build of the module with the 16.0.0 tables; not done: the intersection already compares 1.1 M code points).
 

@@ -384,3 +384,163 @@ test "sweep: zero caps and empty inputs are errors or empty results, never a tra
         if (ut.unaccent(a, s, .{ .max_output = 0, .max_segment = 0 })) |r| a.free(r) else |e| try testing.expect(e == error.TooLarge);
     }
 }
+
+// ── whole-module mutation audit 2026-11: cases the survivors asked for ─────────
+
+const Chunks = struct {
+    sizes: [8]usize = undefined,
+    n: usize = 0,
+    data: [1024]u8 = undefined,
+    len: usize = 0,
+    pub const Error = error{};
+    pub fn put(self: *Chunks, bytes: []const u8) Error!void {
+        self.sizes[self.n] = bytes.len;
+        self.n += 1;
+        @memcpy(self.data[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+};
+
+test "Emitter: block flush points, direct writes keep the order" {
+    const E = @import("common.zig").Emitter(Chunks);
+    const y65: [65]u8 = @splat('y');
+    const y64: [64]u8 = @splat('y');
+    const y57: [57]u8 = @splat('y');
+    const y56: [56]u8 = @splat('y');
+    { // a code point is buffered while 4 bytes still fit: the first block is 253 bytes
+        var c: Chunks = .{};
+        var e: E = .{ .out = &c };
+        var i: usize = 0;
+        while (i < 260) : (i += 1) try e.cp('a');
+        try e.flush();
+        try testing.expectEqual(@as(usize, 2), c.n);
+        try testing.expectEqual(@as(usize, 253), c.sizes[0]);
+        try testing.expectEqual(@as(usize, 7), c.sizes[1]);
+    }
+    { // more than 64 bytes go straight to the sink, after what is pending
+        var c: Chunks = .{};
+        var e: E = .{ .out = &c };
+        try e.cp('x');
+        try e.bytes(&y65);
+        try e.flush();
+        try testing.expectEqual(@as(usize, 2), c.n);
+        try testing.expectEqual(@as(usize, 1), c.sizes[0]);
+        try testing.expectEqual(@as(usize, 65), c.sizes[1]);
+        try testing.expectEqualStrings("x" ++ y65, c.data[0..c.len]);
+    }
+    { // exactly 64 bytes are still buffered
+        var c: Chunks = .{};
+        var e: E = .{ .out = &c };
+        try e.cp('x');
+        try e.bytes(&y64);
+        try e.flush();
+        try testing.expectEqual(@as(usize, 1), c.n);
+        try testing.expectEqual(@as(usize, 65), c.sizes[0]);
+    }
+    { // the block is filled to exactly 256 bytes before it is flushed
+        var c: Chunks = .{};
+        var e: E = .{ .out = &c };
+        var i: usize = 0;
+        while (i < 200) : (i += 1) try e.cp('a');
+        try e.bytes(&y56);
+        try e.flush();
+        try testing.expectEqual(@as(usize, 1), c.n);
+        try testing.expectEqual(@as(usize, 256), c.sizes[0]);
+    }
+    { // one byte more does not fit: flush first, then buffer
+        var c: Chunks = .{};
+        var e: E = .{ .out = &c };
+        var i: usize = 0;
+        while (i < 200) : (i += 1) try e.cp('a');
+        try e.bytes(&y57);
+        try e.flush();
+        try testing.expectEqual(@as(usize, 2), c.n);
+        try testing.expectEqual(@as(usize, 200), c.sizes[0]);
+        try testing.expectEqual(@as(usize, 57), c.sizes[1]);
+    }
+}
+
+test "normalize: Hangul composition stops at the edges of the L, V, T and syllable ranges" {
+    const cases = [_][]const u8{
+        "\u{1113}\u{1161}", // first code point after the 19 leading consonants
+        "\u{1100}\u{1176}", // first code point after the 21 vowels
+        "\u{D7A4}\u{11A8}", // first code point after the last syllable
+        "\u{AC00}\u{11A7}", // T base itself is not a trailing consonant
+        "\u{AC00}\u{11C3}", // first code point after the 27 trailing consonants
+    };
+    for (cases) |s| {
+        const got = try ut.normalize(a, s, .nfc, .{});
+        defer a.free(got);
+        try testing.expectEqualStrings(s, got);
+    }
+}
+
+test "composition tables: what the segment state machine relies on" {
+    const t = @import("tables.zig");
+    const ucd = @import("ucd.zig");
+    // a composite is always a starter, so composing never needs to keep the combining class of the result
+    for (t.compose_pairs) |p| try testing.expectEqual(@as(u8, 0), ucd.ccc(@intCast(p.c)));
+    // the guards on the second element of a Hangul pair sit behind the segment cut: a starter
+    // stays in a segment only with NFC_QC=Maybe, which is exactly the V and T ranges
+    for ([_]u21{ 0x1176, 0x11A7, 0x11C3 }) |cp| try testing.expectEqual(ucd.Qc.yes, ucd.nfcQc(cp));
+    var v: u21 = ucd.hangul.v_base;
+    while (v < ucd.hangul.v_base + ucd.hangul.v_count) : (v += 1) try testing.expectEqual(ucd.Qc.maybe, ucd.nfcQc(v));
+    var tj: u21 = ucd.hangul.t_base + 1;
+    while (tj < ucd.hangul.t_base + ucd.hangul.t_count) : (tj += 1) try testing.expectEqual(ucd.Qc.maybe, ucd.nfcQc(tj));
+    // the quick-check bits already cover every Hangul syllable (the explicit test is redundant)
+    var s: u21 = ucd.hangul.s_base;
+    while (s < ucd.hangul.s_base + ucd.hangul.s_count) : (s += 1) {
+        const info = ucd.normInfo(s);
+        if (info & (1 << 12) == 0 or info & (1 << 13) == 0) return error.SyllableWithoutNoBit;
+    }
+}
+
+test "normalize: a starter that stays in a segment after a kept mark still composes with the next starter" {
+    // x + U+0301 keeps the mark; U+16129 and U+1611F are starters with NFC_QC=Maybe (no cut), and
+    // U+16129 + U+1611F composes to U+16124: the blocking state must be reset by the starter
+    const got = try ut.normalize(a, "x\u{301}\u{16129}\u{1611F}", .nfc, .{});
+    defer a.free(got);
+    try testing.expectEqualStrings("x\u{301}\u{16124}", got);
+}
+
+test "normalize: the segment cut uses NFC_QC, and ASCII never enters a segment (max_segment)" {
+    // U+00B2 is NFC_QC=Yes but NFKC_QC=No: under NFC it still cuts, so a cap of one code point holds
+    const sq = try ut.normalize(a, "\u{B2}\u{B2}\u{B2}\u{B2}", .nfc, .{ .max_segment = 1 });
+    defer a.free(sq);
+    try testing.expectEqualStrings("\u{B2}\u{B2}\u{B2}\u{B2}", sq);
+    const nfc = try ut.normalize(a, "a", .nfc, .{ .max_segment = 0 });
+    defer a.free(nfc);
+    try testing.expectEqualStrings("a", nfc);
+    const nfd = try ut.normalize(a, "a\xFF", .nfd, .{ .invalid_utf8 = .pass_through, .max_segment = 0 });
+    defer a.free(nfd);
+    try testing.expectEqualStrings("a\xFF", nfd);
+}
+
+test "isNormalized: an ill-formed stretch is a boundary and neutral under .replace and .pass_through" {
+    // mark 230, raw byte, mark 220: out of canonical order only if the raw byte did not end the run
+    try testing.expect(try ut.isNormalized(a, "\u{301}\xFF\u{316}", .nfd, .{ .invalid_utf8 = .pass_through }));
+    try testing.expect(try ut.isNormalized(a, "\u{301}\xFF\u{316}", .nfd, .{ .invalid_utf8 = .replace }));
+    // NFC_QC=Maybe forces the full comparison, which must not rewrite the byte to U+FFFD
+    try testing.expect(try ut.isNormalized(a, "\u{301}\xFF", .nfc, .{ .invalid_utf8 = .replace }));
+    try testing.expect(try ut.isNormalized(a, "\u{301}\xFF", .nfc, .{ .invalid_utf8 = .pass_through }));
+}
+
+test "title and capitalize: an ill-formed stretch under .pass_through is uncased and ends a word" {
+    const o: ut.Options = .{ .invalid_utf8 = .pass_through };
+    const t1 = try ut.title(a, "ab\xFFcd", o);
+    defer a.free(t1);
+    try testing.expectEqualStrings("Ab\xFFCd", t1);
+    const c1 = try ut.capitalize(a, "\xFFabc", o);
+    defer a.free(c1);
+    try testing.expectEqualStrings("\xFFabc", c1);
+}
+
+test "properties: surrogates are not printable, 0x80 is not ASCII, Cased = Uppercase | Lowercase | Lt" {
+    try testing.expect(!ut.isPrintableCp(0xD800) and !ut.isPrintableCp(0xDFFF));
+    try testing.expect(!ut.isAscii("\x80") and ut.isAscii("\x7F"));
+    var cp: u21 = 0;
+    while (cp <= 0x10FFFF) : (cp += 1) {
+        const want = ut.isUpperCp(cp) or ut.isLowerCp(cp) or ut.isTitleCp(cp);
+        if (ut.isCasedCp(cp) != want) return error.CasedIsNotUpperLowerTitle;
+    }
+}
