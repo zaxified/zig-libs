@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! No-panic sweep tests for blobstore (wave GW). Findings BS-1 .. BS-4, from
-//! the 2026-10-29 no-panic sweep of `blobstore`.
+//! the no-panic sweep of `blobstore`.
 const std = @import("std");
 const t = std.testing;
 const root = @import("root.zig");

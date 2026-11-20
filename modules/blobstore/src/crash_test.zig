@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Crash-consistency and hostile-store tests for blobstore (grade-2 round,
-//! 2026-11-03).
+//! Crash-consistency and hostile-store tests for blobstore.
 //!
 //! * Crash injection: every write sequence is interrupted after each of its
 //!   steps (`root.crash_hook`), the directory is left exactly as a process

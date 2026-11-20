@@ -32,8 +32,7 @@
 //! raw `hex`, which reach disk through `requireCasHex`, and `scratchCreate`,
 //! which runs `segmentSafe` on its name. This paragraph used to exempt CAS hex
 //! keys as "generated internally and always safe"; they are not, and
-//! `casDelete("../victim")` wrote a sidecar outside the store until
-//! 2026-09-01.
+//! `casDelete("../victim")` wrote a sidecar outside the store until.
 //!
 //! **Reference counting + GC.** `put`/`casCommit` increment a per-blob
 //! refcount sidecar (even on a dedup hit); `delete`/`casDelete` only
@@ -194,7 +193,7 @@ pub const Options = struct {
     /// The paragraph above discusses `true` → `false` and calls the direction
     /// fail-safe. **The reverse — a store used with `false` and later reopened
     /// with `true` — is the one that used to lose blobs**, and was documented
-    /// nowhere. Its blobs carry no sidecars, and until 2026-09-01
+    /// nowhere. Its blobs carry no sidecars, and previously
     /// `casCommit`'s dedup branch read a missing sidecar as zero references
     /// instead of the one implicit reference `casDelete` and `gc` both assume:
     /// a second referrer's `put` wrote `1` for two live references, and the
@@ -1979,7 +1978,7 @@ fn liveTempAged(store: Store, io: std.Io, age: u64, tbuf: []u8, tbuf2: []u8) !st
 }
 
 test "F_Q8: gc's new default (24h) no longer reaps an 11-minute-silent live put" {
-    // A1/blobstore.md's open suspicion, now resolved by policy (round-2
+    // A1 audit's open suspicion, now resolved by policy (round-2
     // decision Q8: safe default + switch for the exception). Under the OLD
     // 10-minute default this same setup was CONFIRMED to reap a genuinely
     // live, merely slow, put (see git history) -- the sweep's only liveness
@@ -2399,7 +2398,7 @@ test "scratchCreate: returns a Scratch, not a Temp — write, read back via .pat
     try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, s.path, .{}));
 }
 
-// ── audit 2026-09-01: the guards nothing was holding ────────────────────────
+// ── audit: the guards nothing was holding ────────────────────────
 
 test "SECURITY: a sidecar-less blob keeps every reference when a second referrer puts it" {
     // The whole store agreed a blob with no `.rc` sidecar carries one implicit
@@ -2608,7 +2607,7 @@ test "casRefWrite leaves no temp behind, and a stale one is never taken for a bl
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -2635,7 +2634,7 @@ test "oldEnough: the wide signed comparison is exact at the boundary and beyond 
     try std.testing.expect(oldEnough(@as(i96, 1) << 64, 1));
 }
 
-// ── whole-module mutation audit (2026-11-17): tests for the mutants that survived ──
+// ── whole-module mutation audit: tests for the mutants that survived ──
 
 fn openFdCount() !usize {
     var dir = try std.Io.Dir.openDirAbsolute(t.io, "/proc/self/fd", .{ .iterate = true });
