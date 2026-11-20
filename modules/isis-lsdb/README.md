@@ -9,12 +9,11 @@ layer drains, plus the **CSNP/PSNP** database-sync reconcile. Like the sibling
 The caller supplies a monotonic `now`, feeds it received LSP/CSNP/PSNP bytes (via
 the `isis` codec), and reads/clears the flags to drive flooding.
 
-Status: **gap** — first increment. Implements the store + the ISO §7.3.16.1
-comparison + time-injected aging/purge + the SRM/SSN flag matrix + CSNP/PSNP
-reconcile. The flooding transmit loop (the SRM consumer) lives in the sibling
-`isis-flood`, SPF in `isis-spf`; generating our own LSP (fragmentation) and
-MT/multi-level are deliberately deferred — see `SPEC.md`. LSP/SNP
-authentication (RFC 5304/5310) is in: see below.
+Status: the update process is complete: the store, the ISO §7.3.16.1
+comparison, time-injected aging/purge, the SRM/SSN flag matrix, CSNP/PSNP
+reconcile, and LSP/SNP authentication (RFC 5304/5310, see below). The flooding
+transmit loop (the SRM consumer) lives in the sibling `isis-flood`, SPF in
+`isis-spf`; see *Not provided* for what this module does not do.
 
 Model after: **ISO/IEC 10589 §7.3** (the update process). The §7.3.16.1 newer
 comparison was cross-checked against FRRouting `isis_lsp.c:lsp_compare` for the
@@ -174,6 +173,14 @@ var out: [64]isis.tlvs.LspEntry = undefined;
 const count = db.summarise(&out, start_id, end_id, now);
 ```
 
+## Not provided
+
+Generating and fragmenting our own LSP (the module raises `refresh_pending` and
+`challenge_sequence` and stops), LSPDBOverload, multi-topology, a level-agnostic
+instance (an L1 and an L2 database are two `Lsdb` instances) and more than 32
+circuits. The flooding loop and SPF are the siblings above. Reasons and the
+open items: `SPEC.md` *What is deliberately not done* and *Backlog / deferred*.
+
 ## Test
 
 ```
@@ -193,7 +200,6 @@ purge-for-unknown handling; a two-database end-to-end reconcile-and-flood
 integration test through the `isis` wire codec; a `std.testing.fuzz` target over
 `insert` (hostile bytes never panic, a rejected LSP is inert); a determinism
 test; and a `std.testing.allocator` leak check (`deinit` frees all owned bytes).
-Green in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from ISO/IEC 10589 §7.3 (the IS-IS update process), a
 public spec — merger doctrine, so the construction needs no attribution. One

@@ -19,7 +19,7 @@
 Auditor/design reference. The consumer-facing purpose, API sketch, and verify
 steps live in `README.md`; this document is the comparison rule (with ISO cites),
 the SRM/SSN outcome matrix, the aging/purge state machine, the CSNP/PSNP reconcile
-matrix, the capacity/DoS bound, and the deferred list.
+matrix, the capacity/DoS bound, and what is not done.
 
 ## Compared with
 
@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [takehaya/goisis](https://github.com/takehaya/goisis) | Go | Apache-2.0 (LICENSE file) — README/design doc only, source not read | 0 | v0.9.0 (2026-09-25) | Update process plus fragment-0 + spill-fragment generation, RFC 7987 remaining-lifetime floor, HMAC verification before state change, purge with POI; design doc §Threat. |
 | [mdlayher/isis](https://github.com/mdlayher/isis) | Go | MIT | 0 | no release; pushed 2026-09-29 | No LSP database. |
 
-**Where we are ahead:** the store is the most adversarially hardened piece surveyed: separate request-placeholder budget and timeout, the own-LSP challenge rule and sequence-exhaustion refusal, purge keeps header only, checksum discard with the purge/zero exemptions, bounded capacity, `summarise` in a defined ascending order — each with a hostile-peer test; pure and time-injected. **Where we are behind:** no LSP generation/fragmentation or refresh (the module raises `refresh_pending`/`challenge_sequence` and stops; `rg -i 'fn (originate|generate)' isis-lsdb/src` is empty); no LSPDBOverload; a fixed 32-circuit `InterfaceSet`; one level per instance (two instances is the intended way, not a gap); RFC 6232/7987 lifetime rules absent (→ Backlog). LSP/SNP authentication (RFC 5304/5310) is at parity with holo since 2026-11-18 (§8a); like holo, no Purge Originator Identification (#13) is added to our own purges.
+**Where we are ahead:** the store is the most adversarially hardened piece surveyed: separate request-placeholder budget and timeout, the own-LSP challenge rule and sequence-exhaustion refusal, purge keeps header only, checksum discard with the purge/zero exemptions, bounded capacity, `summarise` in a defined ascending order — each with a hostile-peer test; pure and time-injected. **Where we are behind:** no LSP generation/fragmentation or refresh (the module raises `refresh_pending`/`challenge_sequence` and stops; `rg -i 'fn (originate|generate)' isis-lsdb/src` is empty); no LSPDBOverload; a fixed 32-circuit `InterfaceSet`; one level per instance (two instances is the intended way, not a gap); RFC 6232/7987 lifetime rules absent (→ Backlog). LSP/SNP authentication (RFC 5304/5310) is at parity with holo (§8a); like holo, no Purge Originator Identification (#13) is added to our own purges.
 
 ## 1. Scope
 
@@ -41,7 +41,7 @@ database, the newer-LSP comparison, aging/purge, and the SRM/SSN flooding flags
 plus CSNP/PSNP database synchronisation. Pure, time-injected, single-owner: the
 caller supplies `now`, feeds received LSP/CSNP/PSNP PDUs (decoded by `isis`), and
 reads/clears the flags to drive flooding and acknowledgement. Out of scope for
-this increment: everything in §8.
+this module: everything under *What is deliberately not done* and *Backlog / deferred*.
 
 ## 2. What `isis` provides, and what this module adds
 
@@ -126,7 +126,7 @@ IS-IS as built here is **unauthenticated** unless `Config.auth_keys` is set
 this system may originate its own LSPs. The standard's remedy — mirrored by
 FRRouting's `own_lsp` branch in `isis_pdu.c:process_lsp`, which calls
 `lsp_inc_seqno` and re-floods — is to **re-originate at the challenger's
-sequence + 1**. LSP generation is deferred (§8), so this module reports it:
+sequence + 1**. LSP generation is not in this module (*Backlog / deferred*), so it reports the challenge:
 
 | Case | Effect |
 |------|--------|
@@ -177,11 +177,14 @@ a zero-lifetime flood cannot grow the DB. Reported as `{ ordering = .same, store
   and flags are kept verbatim (§7.3.16.1 and the CSNP summary still reason over
   them). Two consequences, both load-bearing:
   - a **received** purge cannot smuggle a TLV body into the database. The purge
-    is deliberately exempt from the §7.3.14.2 e) checksum discard (§4.5), so
+    is deliberately exempt from the §7.3.14.2 e) checksum discard (§8), so
     without this rule "Remaining Lifetime = 0" would be a content-replacement
     primitive that no checksum defends;
   - an **aged-out** LSP is flooded as a purge rather than as a copy of itself at
     its original lifetime, so the removal actually propagates.
+
+  With `Config.auth_keys` set a purge is instead kept whole (a verified received
+  purge) or carries one Authentication TLV (an aged-out one); see §8a.
 - **Pass 2 (remove)** — two kinds of entry are dropped: any **purge-hold** entry
   with `now ≥ purge_deadline` (bytes freed, `AgeReport.removed`) and any
   **request placeholder** with `now ≥ set_now + request_timeout` (§7,
@@ -257,7 +260,7 @@ the store unchanged. Purges for unknown LSPs are never stored. So no flood grows
 the database without limit — the adversarial memory ceiling is `capacity` entries
 plus one in-flight decode. Updates to existing LSP-IDs never change membership,
 so they always succeed at capacity. (ISO's LSPDBOverload — set the overload bit
-and shed — is a hook for the LSP-generation layer, §8.)
+and shed — is a hook for the LSP-generation layer, *Backlog / deferred*.)
 
 **Bounding *size* is not bounding *availability*.** A request placeholder is
 minted from an SNP entry, i.e. from bytes any on-link party can send, and it is
@@ -279,50 +282,32 @@ placeholders specifically:
   fabricated LSP-IDs would wedge the database permanently, returning
   `DatabaseFull` for every genuine LSP thereafter.
 
-## 8. Deferred (with hooks)
+## 8. The receive checksum discard (ISO §7.3.14.2 e)
 
-- **The flooding transmit loop** — the consumer that drains SRM (paces LSP
-  transmission, honours the ISO minimumLSPTransmissionInterval), and the PSNP/CSNP
-  emission that drains SSN. Now the sibling `isis-flood`; this module exposes the
-  flags + iterators + owned bytes it needs and performs no I/O.
-- **SPF / route computation** — reading the stored LSPs' reachability TLVs into a
-  shortest-path tree. Now the sibling `isis-spf`; purely a consumer of the stored
-  bytes.
-- **Generating our own LSP** — building/fragmenting the local LSP from adjacency
-  + reachability state and sequence-number management; stamping the ISO Fletcher
-  checksum on it is the generator's job (the receive-side check is in scope, §3/§9).
-  `refresh_pending` is the trigger hook; `insert(_, null, now)` is how a generated
-  LSP enters the DB. LSPDBOverload lives here too.
-- ~~**Authentication**~~ — TLV #10 / RFC 5304/5310 validation of LSP/SNP PDUs: **implemented 2026-11-18** (§8a).
-- **Multi-topology (MT) and multi-level** — this is a single-level database; an
-  L1 and an L2 database are two `Lsdb` instances. MT would key/scope entries by
-  topology.
-- **~~The ISO Fletcher checksum~~ — CLOSED.** Both halves now exist, split as
-  planned: the **primitive** in `isis` (`isis.checksum` + `pdu.{compute,check,
-  stamp}LspChecksum`, ISO 10589 §7.3.11 over the region after Remaining Lifetime,
-  ISO 8473 / RFC 905 Annex B construction, KAT-anchored on the Wireshark-graded
-  `0xaee7` in `src/goldens.zig`), and the **policy** here, in `Lsdb.insert`
-  immediately after `isis.Lsp.decode`: a **received** LSP whose checksum does not
-  check out is `error.CorruptedLsp` and is discarded before any §7.3.16.1
-  comparison (§7.3.14.2 e). That restores the precondition §7.3.16.1(d) (§3, row
-  "c) checksum") assumes, so a differing checksum at an equal sequence number can
-  again only mean "two well-formed copies disagree" (§7.3.16.2) rather than
-  "somebody sent arbitrary bytes". Exemptions, each load-bearing: a **purge**
-  (zero Remaining Lifetime — §7.3.16.4 b) keeps only the header, so its checksum
-  cannot match; §7.3.16.4 note 36 and `draft-li-isis-error-lsp-processing` §4
-  Fig 1 say check lifetime first and never checksum a purge) and a **locally
-  originated** LSP (§7.3.14.2 is a receive rule; stamping is the generator's job
-  per §7.3.11). A **zero checksum on a live LSP is rejected**, not exempted — a
-  correct ISO 8473 checksum can never be zero (RFC 3719 §7), and exempting it
-  would leave clause (d) reachable with `checksum = 0`.
+The Fletcher **primitive** lives in `isis` (`isis.checksum` and
+`isis.pdu.{compute,check,stamp}LspChecksum`: ISO 10589 §7.3.11 over the region
+after Remaining Lifetime, the ISO 8473 / RFC 905 Annex B construction, anchored on
+the Wireshark-graded `0xaee7` in this module's `src/goldens.zig`); the **policy**
+is here, in `Lsdb.insert` immediately after `isis.Lsp.decode`: a **received** LSP
+whose checksum does not check out is `error.CorruptedLsp` and is discarded before
+any §7.3.16.1 comparison. That restores the precondition §7.3.16.1(d) (§3, row
+"c) checksum") assumes, so a differing checksum at an equal sequence number can
+only mean "two well-formed copies disagree" (§7.3.16.2) rather than "somebody sent
+arbitrary bytes". Exemptions, each load-bearing: a **purge** (zero Remaining
+Lifetime — §7.3.16.4 b) keeps only the header, so its checksum cannot match;
+§7.3.16.4 note 36 and `draft-li-isis-error-lsp-processing` §4 Fig 1 say check
+lifetime first and never checksum a purge) and a **locally originated** LSP
+(§7.3.14.2 is a receive rule; stamping is the generator's job per §7.3.11). A
+**zero checksum on a live LSP is rejected**, not exempted — a correct ISO 8473
+checksum can never be zero (RFC 3719 §7), and exempting it would leave clause (d)
+reachable with `checksum = 0`.
 
-  **This is not authentication.** Fletcher is unkeyed: an on-link forger computes
-  a valid checksum as easily as we do. What the discard removes is the specific
-  primitive where *arbitrary* checksum bytes at an *equal* sequence number
-  sufficed. RFC 5304/5310 remains the only defence against a deliberate forger.
-  (Wave-2 audit `isis-lsdb` F4 / `isis` F3.)
+**This is not authentication.** Fletcher is unkeyed: an on-link forger computes a
+valid checksum as easily as we do. What the discard removes is the specific
+primitive where *arbitrary* checksum bytes at an *equal* sequence number
+sufficed. RFC 5304/5310 (§8a) is the defence against a deliberate forger.
 
-## 8a. Authentication (RFC 5304 / RFC 5310, 2026-11-18)
+## 8a. Authentication (RFC 5304 / RFC 5310)
 
 `Config.auth_keys` — this level's keys (RFC 5310 §3.2: the Area
 Authentication string for Level 1, the domain one for Level 2; one `Lsdb` is
@@ -367,26 +352,25 @@ one level). Empty, the default, is the old behaviour byte for byte. Non-empty:
   default** (`area-password … authenticate snp send-only|validate` makes it
   opt-in), so an FRR peer left at its default sends unauthenticated SNPs that
   this store, like holo, refuses **unless `Config.auth_snp = false`** (owner
-  decision 2026-11-19; default `true`): then SNPs are neither verified (an
+  decision; default `true`): then SNPs are neither verified (an
   unsigned one reconciles, a signed one is taken unchecked) nor, by the
   caller, signed — FRR's default and Junos `no-csnp-authentication` /
   `no-psnp-authentication`; IOS and holo behave as `true`. LSPs are
   unaffected. isis-flood's `snp.buildCsnp`/`buildPsnp` never add a #10, so
-  nothing in the tree signs SNPs and needs the flag. Delta mutation
-  2026-11-19 (5 mutants: both `auth_snp` conditions dropped/negated, the
-  default flipped): see CHANGELOG. Signing our own SNPs is the builder's job
+  nothing in the tree signs SNPs and needs the flag. Signing our own SNPs is the builder's job
   (`isis.auth.addPlaceholder` + `sign`; `summarise` only supplies entries).
 - Several keys allow a rollover (each verifies; the first signs). Keys are
   borrowed and caller-wiped (`isis.auth.Key`). Replay is not prevented by
   either RFC; the sequence-number rules (§3, §4.2) still bound it.
 
-## 9. Verification
+## Verification
 
 Per CONVENTIONS §7 this is **pure logic** → unit + property/round-trip; the wire
 format is exercised end-to-end against the sibling `isis` codec (itself
 golden-tested), so no external oracle is needed. The §7.3.16.1 rule was
 cross-checked against FRRouting `isis_lsp.c:lsp_compare`.
 
+- **Run:** `scripts/modtest isis-lsdb`.
 - **Comparison KAT table** (`compare.zig`): higher sequence wins incl. the
   high-bit case a signed compare fails; equal-seq incoming purge wins (and the
   reverse is older); equal purge-state → same; the oriented checksum tie-break
@@ -404,85 +388,84 @@ cross-checked against FRRouting `isis_lsp.c:lsp_compare`.
   completeness-omitted→SRM; and `summarise` filling LSP-Entries for a range.
 - **Adversarial / bounds**: malformed LSP bytes → typed error, store unchanged;
   a distinct-LSP-ID flood refused at `capacity` (membership unchanged);
-  purge-for-unknown ignored; a `std.testing.fuzz` target over `insert` (hostile
-  bytes never panic, an errored insert leaves membership unchanged); no leak
-  (`std.testing.allocator`, `deinit` frees all owned bytes).
+  purge-for-unknown ignored; hostile bytes never panic and an errored insert
+  leaves membership unchanged; no leak (`std.testing.allocator`, `deinit` frees
+  all owned bytes).
 - **Hostile on-link peer** (each drives the exact input an unauthenticated
   neighbour can send): a CSNP of `capacity` fabricated LSP-IDs leaves the
   request budget bounded and genuine LSPs still admissible; placeholders expire
-  at `request_timeout` and return their budget; a peer's zero-lifetime purge of
-  our own LSP is refused, our copy survives past `ZeroAgeLifetime`,
-  `refresh_pending` + `challenge_sequence` are set and SRM is asserted on every
-  circuit; a peer's `2^32-1` for one of our LSP-IDs is refused and we can still
-  re-originate; the two combined still leave both fragments re-originable;
-  originating at `2^32-1` is `error.SequenceExhausted`; an SNP listing our own
-  LSP-IDs never yields SSN or a placeholder. The Wireshark-anchored golden LSP
-  additionally pins that the *same anchored bytes* replayed from a circuit at a
-  higher sequence are refused with `self_challenge`.
+  at `request_timeout` (also at its shipped default) and return their budget; a
+  peer's zero-lifetime purge of our own LSP is refused, our copy survives past
+  `ZeroAgeLifetime`, `refresh_pending` + `challenge_sequence` are set and SRM is
+  asserted on every circuit; a peer's `2^32-1` for one of our LSP-IDs is refused
+  and we can still re-originate; the two combined still leave both fragments
+  re-originable; originating at `2^32-1` is `error.SequenceExhausted`; an SNP
+  listing our own LSP-IDs never yields SSN or a placeholder. The
+  Wireshark-anchored golden LSP additionally pins that the *same anchored bytes*
+  replayed from a circuit at a higher sequence are refused with `self_challenge`.
+- **Same-sequence and request-placeholder details**: purge vs purge at equal
+  sequence is older; same/older arrivals clear SRM resp. SSN on the arrival
+  circuit; an identical echo of our own LSP is an ack, a challenge withdraws
+  pending SSNs and `challenge_sequence` only rises (by LSP and by SNP); an SNP
+  identical to our own LSP clears SRM there; a listed-identical LSP gets no
+  completeness SRM and a placeholder is never flooded; a malformed CSNP is not
+  complete; an all-zero SNP entry requests nothing and a full store requests
+  nothing; a placeholder is filled by any real copy and returns its budget slot;
+  refresh is flagged exactly at the threshold and counted once; an aged purge
+  reads lifetime 0 at any query time and `srmIsSet` past the circuit table is
+  false.
+- **Authentication** (`src/auth_test.zig`): a signed LSP stored for every
+  algorithm; unsigned, wrong secret, wrong Key ID, content changed after signing
+  (checksum re-stamped, so only #10 can tell) and a malformed #10 refused with
+  the store empty; no keys accepts signed and unsigned alike and keys do not gate
+  local originations; an LSP whose Remaining Lifetime was lowered in flight still
+  verifies; purges — unsigned refused, an IS-Reachability TLV in a purge refused,
+  #13 + #137 accepted and kept verbatim, still verifying, accepted by a keyed
+  peer; a purge whose TLV stream breaks after #10 refused; an aged-out LSP
+  becomes header + our #10 signed with the first key, checksum kept, accepted by
+  a keyed peer as the purge; the header-only fallback when #10 cannot be built and
+  when the allocation fails; CSNP and PSNP refused (no placeholder) unsigned or
+  wrong, reconciled when signed, unchanged without keys; a live LSP may carry
+  TLVs a purge may not.
 - **Determinism**: identical `(ops, now)` streams yield identical flag state and
   count.
 - **Integration**: two `Lsdb` instances reconcile a CSNP and flood the delta into
   each other through the `isis` wire codec, converging.
-- **Mutation run 2026-10-05** (in-place, Debug, 52 mutants over the
-  §7.3.16.1 comparison, the receive checksum check, sequence exhaustion, the
-  own-LSP challenge path, the capacity and request-budget bounds, the
-  SRM/SSN matrix, aging/refresh/purge boundaries, `summarise`, and the
-  CSNP/PSNP reconcile incl. completeness): 47 killed. The first pass left 22;
-  nine tests added and one KAT extended: purge vs purge at equal sequence is
-  older; same/older arrivals clear SRM resp. SSN on the arrival circuit; an
-  identical echo of our own LSP is an ack, a challenge withdraws pending SSNs
-  and `challenge_sequence` only rises (by LSP and by SNP); an SNP identical to
-  our own LSP clears SRM there; a listed-identical LSP gets no completeness
-  SRM and a placeholder is never flooded; a malformed CSNP is not complete;
-  an all-zero SNP entry requests nothing and a full store requests nothing; a
-  placeholder is filled by any real copy and returns its budget slot; refresh
-  is flagged exactly at the threshold and counted once; an aged purge reads
-  lifetime 0 at any query time and `srmIsSet` past the circuit table is false.
-  Equivalent: `elapsed > initial_lifetime` (equal gives 0 either way), the
-  three `is_request` checks on the own-LSP paths (a placeholder is only ever
-  made for a foreign LSP-ID), and `summarise`'s `== .gt` skip (map keys are
-  unique, so `.eq` never occurs).
-
-- **Authentication 2026-11-18** (`src/auth_test.zig`, 12 tests): a signed
-  LSP stored for every algorithm; unsigned, wrong secret, wrong Key ID,
-  content changed after signing (checksum re-stamped, so only #10 can tell)
-  and a malformed #10 refused with the store empty; no keys accepts signed
-  and unsigned alike and keys do not gate local originations; an LSP whose
-  Remaining Lifetime was lowered in flight still verifies; purges — unsigned
-  refused, an IS-Reachability TLV in a purge refused, #13 + #137 accepted and
-  kept verbatim, still verifying, accepted by a keyed peer; a purge whose
-  TLV stream breaks after #10 refused; an aged-out LSP becomes header + our
-  #10 signed with the first key, checksum kept, accepted by a keyed peer as
-  the purge; the header-only fallback when #10 cannot be built and when the
-  allocation fails; CSNP and PSNP refused (no placeholder) unsigned or wrong,
-  reconciled when signed, unchanged without keys; a live LSP may carry TLVs a
-  purge may not. **Delta mutation 2026-11-18** (20 mutants over the new
-  lines of `store.zig`: each gate of the receive check skipped or forced,
-  the purge test applied to live LSPs or dropped, whole-purge retention
-  dropped, the signed-purge path skipped, the last key taken, each step of
-  `retainSignedPurge` — header stamp, length, signature, checksum restore,
-  length off by one, the result — the AuthMissing/AuthFailed fold, both SNP
-  checks, and `purgeTlvsAllowed`'s three exits): 19 killed on the first run,
-  the survivor (the purge TLV rule applied to live LSPs went unseen because
-  the test LSPs carried only #10 and #137) killed by the last test above:
-  20/20. The card adds them to the 2026-10-05 counts.
-
-Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
-green; the sibling `isis` suite unaffected.
+- **Fuzz**: three harnesses (`insert`, `snp`, `sequence`; the sequence one runs
+  against a model of the update process) in `src/root.zig`, with the draw and the
+  reach counters in `src/fuzz_test.zig`; verdicts come from testkit's
+  deterministic driver, `ISIS_LSDB_FUZZ=<runs>[,<first seed>]`, and each run
+  checks that its seeds reach every outcome.
+- **Bench:** an opt-in test in `src/bench.zig` (`ISIS_LSDB_BENCH`) measures the
+  flooding-flag query cost, idle and busy; the card's `**Performance:**` line
+  says whether it is measured.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
 Provenance: clean-room from ISO/IEC 10589 §7.3; §7.3.16.1 cross-checked against
 FRRouting `isis_lsp.c` (behaviour reference, no source ported). No NOTICE
-entry is required (public spec + a black-box behaviour cross-check; root
-`NOTICE` §0).
+entry is required (public spec + a black-box behaviour cross-check; see the
+README's `Provenance:` line).
+
+## What is deliberately not done
+
+- **The flooding transmit loop** (draining SRM with ISO's minimumLSPTransmissionInterval pacing, and the PSNP/CSNP
+  emission that drains SSN) is the sibling `isis-flood`; this module exposes the flags, iterators and owned
+  bytes it needs and performs no I/O.
+- **SPF / route computation** (reading the stored LSPs' reachability TLVs into a shortest-path tree) is the sibling
+  `isis-spf`, a pure consumer of the stored bytes.
+- **Multi-level in one instance**: this is a single-level database; an L1 and an L2 database are two `Lsdb`
+  instances (the intended way, not a gap).
 
 ## Backlog / deferred
 
-Missing-and-it-matters items from the 2026-09-30 competitive survey (existing deferred lists stay where they are, above).
+Missing-and-it-matters items from the 2026-09-30 competitive survey.
 
-- **Local LSP generation, fragmentation and refresh** (build fragment 0..n from adjacency and reachability state, sequence management, `finishStamped`) (survey 2026-09-30). Why: the reference layer includes it (`lsp_build*` in holo); today `isis-sim` hand-builds LSPs. Effort: ~1 week. Fits §2: yes.
-- ~~**LSP/SNP authentication check**~~ — **closed 2026-11-18** (§8a; security triage row isis-lsdb:401 done). (RFC 5304/5310 verify before `insert`, needs the `isis` HMAC primitive) (survey 2026-09-30). Why: the module's own threat model (SPEC §8, §4.2) says an on-link forger wins without it. Effort: ~2 days after the codec part. Fits §2: yes.
+- **Local LSP generation, fragmentation and refresh** (build fragment 0..n from adjacency and reachability state, sequence management, `finishStamped`) (survey 2026-09-30). Why: the reference layer includes it (`lsp_build*` in holo); today `isis-sim` hand-builds LSPs. Effort: ~1 week. Fits §2: yes. Hooks that exist: `refresh_pending` and `challenge_sequence` are the triggers, `insert(_, null, now)` is how a generated LSP enters the database, and stamping the Fletcher checksum on it is the generator's job.
 - **LSPDBOverload (set the overload bit and shed on `DatabaseFull`)** (survey 2026-09-30). Why: ISO 10589 §7.3.19; hook already documented. Effort: ~1 day. Fits §2: yes.
 - **Lift the 32-circuit limit of `InterfaceSet`** (survey 2026-09-30). Why: a big aggregation router has more circuits; other implementations have no such cap *(inferred)*. Effort: ~1 day (comptime-parameterised width). Fits §2: yes. Priority low.
+- **Multi-topology (MT)**: would key or scope entries by topology; not built.
+- **RFC 6232 / RFC 7987 lifetime rules**: Purge Originator Identification (#13) is not added to our own purges (holo adds it behind an option) and the RFC 7987 remaining-lifetime floor is absent (goisis has it).
 
 ## Anchoring
 
@@ -492,5 +475,3 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** checksum tie-break (§7.3.16.1) cross-checked vs FRR isis_lsp.c; rest of KAT table hand-authored only
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-05: the PSNP path (Lsdb.reconcilePsnp) and the L2 CSNP/PSNP (25/27) type codes driven through this module's own builders and Lsdb.reconcileCsnp/reconcilePsnp, confirmed by sharkd (golden 3a-3c, goldens.zig; mutation-tested). Remaining gap: IP-reachability/hostname/IS-Neighbours TLVs a future LSP-generation layer would place in the TLV region are out of this module's scope (never built/emitted here, SPEC §8) so there is no typed content of theirs to validate; the Fletcher checksum computation itself lives in `isis` (`isis.checksum`, SPEC §2); this module's part — the §7.3.14.2 receive check in `Lsdb.insert`, which calls `isis.pdu.checkLspChecksum` and discards a bad or zero checksum on a live LSP with `error.CorruptedLsp` (SPEC §8, "CLOSED") — is tested on the Wireshark-graded `0xaee7` golden passing cleanly and on hand-corrupted LSPs being refused; stamping our own LSP's checksum stays out of scope with LSP generation (SPEC §8)
