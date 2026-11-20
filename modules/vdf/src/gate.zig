@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-//! gate — the single switch that turns on the tests exercising `vdf.zig`'s
-//! two Fable-hard cores: `prove` (the efficient/streaming Wesolowski
-//! prover) and `verify` (the `π^l * x^r == y (mod N)` soundness check).
-//! Both are now REAL — see each function's implementation + doc comment
-//! in `vdf.zig`.
+//! gate — the switch for the tests exercising `vdf.zig`'s two cores: `prove`
+//! (the efficient/streaming Wesolowski prover) and `verify` (the
+//! `π^l * x^r == y (mod N)` soundness check). Both are real — see each
+//! function's implementation + doc comment in `vdf.zig`.
 //!
 //! Everything ELSE in this module — `group.zig`'s Z_N* wrapper + element
 //! validation + the RSA-2048 Factoring Challenge modulus, `vdf.zig`'s

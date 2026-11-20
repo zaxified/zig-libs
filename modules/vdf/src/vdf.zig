@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! vdf — `eval`, `hashToPrime`, the `Proof` codec, and the two Fable cores
-//! `prove`/`verify` (all REAL). See `root.zig`'s module doc comment for the
+//! vdf — `eval`, `hashToPrime`, the `Proof` codec, and the two cores
+//! `prove`/`verify`. See `root.zig`'s module doc comment for the
 //! construction overview and the trusted-setup caveat; this file is where
 //! every piece of it actually lives.
 
@@ -366,8 +366,7 @@ fn hashToPrimeUnsieved(n_bytes: []const u8, x_bytes: []const u8, y_bytes: []cons
 /// y (mod N)` (see `verify`'s doc comment below). REAL, not gated: this is
 /// ordinary square-and-multiply modular exponentiation of the PUBLIC
 /// constant `2` by the PUBLIC exponent `t`, entirely mechanical — no
-/// cryptographic design judgment lives here, unlike `prove`/`verify`'s
-/// Fable cores. Cost is `O(log t)` modular operations on a `prime_bits`
+/// cryptographic design judgment lives here, unlike `prove`/`verify`. Cost is `O(log t)` modular operations on a `prime_bits`
 /// (256-bit) value, independent of `t`'s magnitude in any way that scales
 /// with the VDF's actual delay `T` — this IS the "verification is cheap"
 /// half of the construction. `verify` calls this directly (step 3) rather
@@ -647,7 +646,7 @@ pub const VerifyError = error{InvalidElement};
 /// second half is why this verifier works in Z_N*/{±1} (BBF §6): in Z_N*
 /// the same `π` negated is a valid proof of `N-y`, so a prover chooses
 /// which of two "outputs" to publish — 38 of 38 such forgeries were
-/// accepted before 2026-09-06. The full argument is Wesolowski §3
+/// accepted before. The full argument is Wesolowski §3
 /// Theorem 1 over the quotient; implementing steps 1-4 above without
 /// internalizing WHY step 2's binding must include `y` (not just `N, x,
 /// T`), and why `-1` must be quotiented away, are the two easiest ways to
@@ -778,7 +777,7 @@ test "fuzz: Proof.fromBytes never panics on arbitrary bytes" {
     // Seeds at the one boundary the codec has (exactly `modulus_bytes`, one
     // short, one long): without a corpus the harness sees a single empty
     // input on the default lane — `check-fuzz-reach` measured that across
-    // the repository on 2026-09-06.
+    // the repository on.
     try testing.fuzz({}, fuzzProofFromBytes, .{ .corpus = &.{
         &(@as([group.modulus_bytes]u8, @splat(0xab))),
         &(@as([group.modulus_bytes - 1]u8, @splat(0xab))),
@@ -915,7 +914,7 @@ test "prove core: streaming quotient matches naive big.int division (incl. q=0 a
     }
 }
 
-// ── the quotient group Z_N*/{±1} (A1 F1, 2026-09-06) ────────────────────────
+// ── the quotient group Z_N*/{±1} (A1 F1) ────────────────────────
 
 /// `x` as a canonical fixed-width element, for the RSA-2048 tests below.
 fn smallElement(v: u8) [group.modulus_bytes]u8 {
@@ -1003,8 +1002,7 @@ test "quotient group: the negation forgery y' = N - y, π' = N - π is rejected,
 test "quotient group: the identity class x ∈ {1, N-1} is refused — no free proof of 10^18 squarings (A1 F2)" {
     // `1^(2^T) = 1` and `(N-1)^(2^T) = 1` for every `T ≥ 1`: `eval` is
     // constant in `T` on these, and the honest proof is `π = x^q ∈ {1, N-1}`
-    // — writable without a single squaring. Before 2026-09-06 `verify`
-    // accepted `x = 1, y = 1, π = 1, T = 10^18` in 6.3 ms.
+    // — writable without a single squaring.
     const m = group.rsa2048ChallengeModulus();
     const one_bytes = smallElement(1);
     var n_minus_1_bytes: [group.modulus_bytes]u8 = undefined;
@@ -1076,7 +1074,7 @@ test "isProbablePrime: strong pseudoprimes to base 2 are rejected — the witnes
     try testing.expect(isProbablePrime(p, prng.random()));
 }
 
-// F3 (A1/vdf.md): the existing anchor above uses OEIS A001262 (strong
+// F3 (A1 audit): the existing anchor above uses OEIS A001262 (strong
 // pseudoprimes to base 2 alone, all < 10^5) -- a MUCH weaker adversary than
 // what the finding actually asked for ("an Arnault pseudoprime"). Below is a
 // real, independently-verified one: 3825123056546413051 = 149491 x 747451 x
@@ -1137,7 +1135,7 @@ test "isProbablePrime: a real 9-base Arnault-class pseudoprime is still rejected
 }
 
 test "isProbablePrime: a witness fixed to any base this number fools calls it prime — the mutation last session's suite could not see" {
-    // A1/vdf.md's own mutation ladder found "witness hard-wired to base 2 ->
+    // A1 audit's own mutation ladder found "witness hard-wired to base 2 ->
     // GREEN" but left it as a one-off probe result, not a standing test.
     // Pinned here with a real, verified pseudoprime: EVERY one of the first
     // nine prime bases individually fools it (not just base 2), so this is
@@ -1187,7 +1185,7 @@ test "isProbablePrime: known small primes pass, known composites fail" {
     try testing.expect(!isProbablePrime(composite, random));
 }
 
-// ── whole-module mutation (2026-11-17): the tests its survivors asked for ───
+// ── whole-module mutation: the tests its survivors asked for ───
 
 test "incrementCandidateByTwo: carries ripple through 0xff bytes, and a plain byte takes exactly +2" {
     var buf: [prime_bytes]u8 = @splat(0);

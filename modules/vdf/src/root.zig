@@ -28,8 +28,8 @@
 //! ```text
 //! eval(N, x, T)              -> y  = canon(x^(2^T))      (REAL)
 //! hashToPrime(N, x, y, T)    -> l  (a challenge prime)   (REAL)
-//! prove(N, x, y, T)          -> pi = canon(x^floor(2^T / l))   (REAL, Fable core)
-//! verify(N, x, y, pi, T)     -> canon(pi^l * x^r) == y, r=2^T mod l  (REAL, Fable core)
+//! prove(N, x, y, T)          -> pi = canon(x^floor(2^T / l))
+//! verify(N, x, y, pi, T)     -> canon(pi^l * x^r) == y, r=2^T mod l
 //! ```
 //!
 //! `canon(v) = min(v, N-v)`: the group is the quotient **Z_N*/{±1}**, not
@@ -102,26 +102,21 @@
 //! ## Honest tier note
 //!
 //! `eval` and `hashToPrime` (including the determinism subtlety above) are
-//! MECHANICAL — recipe, not research; get the loop and the domain
-//! separation right and they are done. `prove`/`verify` are genuinely
-//! Fable-hard, but narrowly so: the "irreducible" part is not the
-//! arithmetic (every operation involved is a modular squaring/
-//! multiplication this module already has) but two specific judgment
-//! calls that are easy to get subtly wrong — (1) the streaming-quotient
-//! trick in `prove` (materializing `q = floor(2^T/l)` naively works but
-//! defeats the module's own no-big-int design goal; the streaming version
-//! requires tracking the long-division remainder correctly in lock-step
-//! with `eval`'s squaring loop) and (2) `verify`'s exact relation,
-//! specifically that `hashToPrime`'s binding MUST include `y` (the
-//! prover's claim), not just `(N, x, T)` — binding only the latter would
-//! let a cheating prover pick `l` in advance and forge a proof for a wrong
-//! `y`. Neither is large in code volume (`prove`/`verify` are well under
-//! 100 lines combined); both are exactly the kind of
-//! few-lines-but-wrong-and-everything-breaks logic this repo reserved for
-//! a dedicated Fable pass rather than folding into the scaffold — and both
-//! are now implemented and verified (completeness/soundness KATs + a
-//! naive-vs-streaming quotient cross-check). See `SPEC.md` for the full
-//! writeup.
+//! mechanical: get the loop and the domain separation right and they are
+//! done. `prove`/`verify` are small but easy to get subtly wrong: the
+//! "irreducible" part is not the arithmetic (every operation involved is a
+//! modular squaring/multiplication this module already has) but two specific
+//! judgment calls — (1) the streaming-quotient trick in `prove`
+//! (materializing `q = floor(2^T/l)` naively works but defeats the module's
+//! own no-big-int design goal; the streaming version requires tracking the
+//! long-division remainder correctly in lock-step with `eval`'s squaring
+//! loop) and (2) `verify`'s exact relation, specifically that
+//! `hashToPrime`'s binding MUST include `y` (the prover's claim), not just
+//! `(N, x, T)` — binding only the latter would let a cheating prover pick `l`
+//! in advance and forge a proof for a wrong `y`. Neither is large in code
+//! volume (`prove`/`verify` are well under 100 lines combined). Both are
+//! verified by completeness/soundness KATs and a naive-vs-streaming quotient
+//! cross-check. See `SPEC.md` for the full writeup.
 
 const std = @import("std");
 

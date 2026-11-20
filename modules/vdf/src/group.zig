@@ -12,7 +12,7 @@
 //! `canonicalize`. `-1 = N-1` has order 2 in Z_N*, and the Fiat-Shamir
 //! prime `l` is odd, so `(-π)^l · x^r = -(π^l · x^r)`: in Z_N* a proof for
 //! `y` is also a proof for `N-y`, and a prover picks which of the two
-//! "outputs" to publish (measured 2026-09-06: 38 of 38 such forgeries
+//! "outputs" to publish (measured: 38 of 38 such forgeries
 //! accepted). Boneh-Bünz-Fisch §6 and every production RSA-group VDF work
 //! in the quotient for exactly this reason: an element is its class
 //! `{v, N-v}`, represented by the smaller of the two. `eval`/`prove` emit
@@ -164,7 +164,7 @@ pub fn montPowPublic(m: Modulus, mod: *const MontN, base: Fe, exp_be: []const u8
     // empty slice must get the mathematically correct `base^0 = 1`, not a
     // `usize` underflow on the `exp_be.len - 1` below (which panicked in
     // Debug/ReleaseSafe and produced a mode-divergent result in ReleaseFast;
-    // see `A1/vdf.md` F8). Early-return before that subtraction ever runs.
+    // see A1 audit F8). Early-return before that subtraction ever runs.
     if (exp_be.len == 0) return fromMont(m, mod, mod.one_mont);
     const base_mont = toMont(mod, base);
     var acc = mod.one_mont;
@@ -400,7 +400,7 @@ test "toBytes: round trip through elementFromBytes" {
 
 // (A1 F8) `montPowPublic` with an empty exponent: `exp_be.len - 1` used to
 // underflow before ever entering the loop — a panic in Debug/ReleaseSafe, a
-// mode-divergent result in ReleaseFast (see `A1/vdf.md` F8). It is
+// mode-divergent result in ReleaseFast (see A1 audit F8). It is
 // unreachable from this module's own two call sites (`l`/`r` are always
 // `prime_bytes` wide) but the function is `pub` and re-exported via
 // `vdf.group`, so an external caller's empty exponent must get the
