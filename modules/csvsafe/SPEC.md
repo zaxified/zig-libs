@@ -19,7 +19,7 @@
 **Downstream consumer:** no
 
 OWASP CSV formula-injection guard — and nothing else. Usage: see ./README.md.
-Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Attribution/provenance: see the README's `Provenance:` line (clean-room; the module has no NOTICE of its own).
 
 ## Compared with
 
@@ -28,7 +28,7 @@ de-facto reference is the OWASP "CSV Injection" guidance, and every implementati
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [OWASP CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection) — **reference** | guidance (no code) | CC-BY-SA site *(inferred)* | — | — | Lists the dangerous leads `=`, `+`, `-`, `@`, tab, CR and recommends an apostrophe prefix; this module implements that set (test `each dangerous lead char individually`), adds a signed-number exception, and since 2026-09-30 also guards LF, `|` and `%`. The OWASP-recommended sanitisation also wraps fields in double quotes and doubles `"` (as go-safe-csv-writer's README describes it; OWASP page not re-read), which is the CSV writer's job (`csvstream.writeField`). |
+| [OWASP CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection) — **reference** | guidance (no code) | CC-BY-SA site *(inferred)* | — | — | Lists the dangerous leads `=`, `+`, `-`, `@`, tab, CR and recommends an apostrophe prefix; this module implements that set (test `each dangerous lead char individually`), adds a signed-number exception, and also guards LF, `|` and `%`. The OWASP-recommended sanitisation also wraps fields in double quotes and doubles `"` (as go-safe-csv-writer's README describes it; OWASP page not re-read), which is the CSV writer's job (`csvstream.writeField`). |
 | [raphaelm/defusedcsv](https://github.com/raphaelm/defusedcsv) | Python | Apache-2.0 (README) | 27 | no releases (push 2025-09-03) | Drop-in for the `csv` module. Guards leads `@ + - = \| %` (adds pipe and percent) and escapes `\|` inside those cells; no number exception, so it corrupts `-12.34` and phone numbers (its README says the files change "of course"). |
 | [samber/go-safe-csv-writer](https://github.com/samber/go-safe-csv-writer) | Go | MIT | 5 | v0.2.0 (2025-12-17) | Fork of Go `encoding/csv`: quotes every field, guards leads `= + - @ \t \r \n` (adds LF) and also fields with a quote/separator followed by a dangerous character; guard+writer in one. |
 | [zvory/csv-safe](https://github.com/zvory/csv-safe) | Ruby | MIT | 40 | no releases (push 2026-06-12) | Wraps Ruby's `CSV`: sanitises on write, and adds a converter that sanitises on read *(as its README states)*. |
@@ -38,74 +38,63 @@ de-facto reference is the OWASP "CSV Injection" guidance, and every implementati
 `-12.34`, `+.5` and `+420 555 0101` survive while `-1+cmd|'/c calc'!A1` is guarded (audit F1; tested against the OWASP
 WSTG payloads); locale decimal separator (`*Sep` variants); allocation-free streaming (`writeSafe`). **Where we are
 behind:** no Unicode lookalike
-handling (listed as out of scope), and it is not wired into a writer (a caller composes `writeSafe` with
-`csvstream.writeField`).
+handling (see *What is deliberately not done*); the writer is `csvstream`'s, and `writeField` / `writeRecord` only chain the guard
+and its quoting, like go-safe-csv-writer's `Write`.
 
 ## Design & invariants
-- Neutralizes a cell a spreadsheet would read as a formula (leading `=`, `+`, `-`, `@`, tab, CR, and since 2026-09-30 LF, `|`, `%`) by
-  prefixing a single apostrophe (`guard_char`), forcing literal-text rendering.
+- Neutralizes a cell a spreadsheet would read as a formula (leading `=`, `+`, `-`, `@`, tab, CR, and, beyond OWASP, LF, `|`, `%`) by
+  prefixing a single apostrophe (`guard_char`), forcing literal-text rendering. LF is go-safe-csv-writer's addition and
+  `|` / `%` are defusedcsv's: the union of the ecosystem's lead sets. Whether a spreadsheet evaluates a cell led by them is
+  unsettled (OWASP lists none), so this is hardening, and its price is that a value that really starts with `%` or `|`
+  (`%20`, `%PATH%`) comes out with the apostrophe in front.
 - **Signed-number exception:** a `+`/`-` lead passes unguarded only when **every** byte after the
   sign is a digit, `.`, `,`, the decimal separator or a space (and the first one a digit or the separator) — so `-12.34`, `+.5` and `+420 555 0101` pass,
-  while `-1+cmd|'/c calc'!A1` is guarded. (Checking only the byte after the sign let that whole
-  injection class through: audit F1, `isSignedNumber`.)
+  while `-1+cmd|'/c calc'!A1` is guarded. Both `.` and `,` are accepted in the tail under every locale (digit grouping);
+  only the byte right after the sign must be a digit or the configured separator. Checking only the byte after the sign
+  would let that whole injection class through (`isSignedNumber`).
 - `needsGuard`/`writeSafe` are allocation-free (stream to `*std.Io.Writer`); only `guard` (returns
   an owned `[]u8`) takes an allocator. `*Sep` variants let a comma-decimal locale recognize
   `-12,34` as a number via `needsGuardSep`/`writeSafeSep`/`guardSep`.
+- `writeField` / `writeRecord` (with `WriteOptions`: a `csvstream.WriteOptions` dialect and the decimal separator) guard
+  first and quote second, as go-safe-csv-writer's `Write` does: the field is what `csvstream.writeField` writes for
+  `guard_char ++ value` when `value` needs the guard, so the apostrophe lands inside the quotes. `writeRecord` is byte for
+  byte `csvstream.writeRecord` of the guarded fields (an empty single field is never guarded; a first field starting with the
+  comment byte is quoted as `csvstream` does). Nothing is allocated; the quoting is re-implemented for the guarded case
+  (`writeGuarded`) and held to `csvstream` by a differential test. This is the module's only dependency.
 - Pure logic, no OS calls, reentrant, no shared state.
 
 ## Threat model / out of scope
 Defends against the `=cmd|'/c calc'!A1` / DDE class of CSV formula-injection when the CSV is opened
-in a spreadsheet. Out of scope by design (deliberately narrow — the injection guard and nothing
-else): **RFC 4180 quoting** (delimiter/quote/CR-LF wrapping — the CSV writer's or `csvstream`'s
-job, not this guard's); **decimal-separator remapping** for numeric output (this module only *reads*
-the separator to spot a signed number, never rewrites it); **Unicode formula-lead lookalikes** (ASCII
-leads only — a non-UTF-8/homoglyph lead is unguarded); **configurable guard char** (fixed to `'`,
-exposed as `guard_char` for reference only, not a parameter).
+in a spreadsheet. Residual risk: a Unicode / homoglyph lead is unguarded (ASCII leads only). The other
+boundaries are in *What is deliberately not done*.
 
 ## Verification
-`zig build test-csvsafe` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/csvsafe`):
-`needsGuard`/`needsGuardSep` over the dangerous-lead set and the signed-number exception (both
-decimal separators), `writeSafe`/`writeSafeSep` streaming output, `guard`/`guardSep` allocation
-round-trip.
+`scripts/modtest csvsafe` (`zig fmt --check modules/csvsafe` for formatting). Tests (`src/root.zig`), by class:
+- the guarded-lead set: each dangerous lead individually, the OWASP WSTG payloads, benign cells unchanged;
+- the signed-number exception under both decimal separators and a custom one: signed numbers and phone numbers pass,
+  non-numeric `+`/`-` leads and a formula tail after a number are guarded, `.` / `,` as digit grouping;
+- consistency of `needsGuard`, `writeSafe`/`writeSafeSep` streaming output and `guard`/`guardSep` allocation round-trips;
+- `writeRecord` against `csvstream.writeRecord` of the guarded fields over random dialects (differential), and a
+  guarded field that needs quoting.
+- **Mutation:** mutant schemata over the guard logic (every lead, the empty check, the signed-number decision and each
+  accepted tail byte class, the separator plumbing, the prefix) — the card's score covers it.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- No fuzz harness: the card's Hardening line states the exemption.
 
-## Mutation run 2026-10-04
-
-27 mutants (mutant schemata, one ReleaseSafe build, 20 s cap per run): each of the nine guarded leads
-dropped one at a time (`=`, `@`, tab, CR, LF, `|`, `%`, `+`, `-`), the empty-cell check, the inverted
-signed-number decision, `isSignedNumber`'s length check, first-byte check and each of the tail's five
-accepted byte classes (digit, caller's separator, `.`, `,`, space), the default separator in `needsGuard`
-and `guard`, the separator argument dropped in `writeSafeSep` and `guardSep`, and the guard prefix (dropped,
-wrong byte, value not written, inverted in `guardSep`).
-First run: 23 killed, 4 survived (3 mutants of the tail/default separator, plus the `guard` default
-separator); all four were test gaps, none equivalent: the caller's separator inside the tail
-(`-1_5` with sep `_`), `,` as grouping punctuation under a `.` locale, and `guard` with the default separator.
-Tests added: 3, each stating the rule it pins. Final: 27 of 27 killed, 0 equivalent, 0 findings.
-
-Note for the SPEC's own prose: the code accepts both `.` and `,` in the tail of a signed number under every
-locale (grouping punctuation), not only the configured separator as the "Design & invariants" bullet reads;
-the invariant (no operator, function name or cell reference can be formed) still holds, so this is
-documentation drift, not a defect.
+## What is deliberately not done
+The module is deliberately narrow: the injection guard and nothing else. Refused, permanently (scope boundaries,
+not TODOs):
+- **RFC 4180 quoting** by the guard itself — the CSV writer's job (`csvstream`, which owns the delimiter and quote
+  char). `writeField` / `writeRecord` chain the two for a `csvstream` dialect, guard first.
+- **Decimal-separator remapping** (`.` to `,` for numeric output) — a writer/locale concern; the module only *reads*
+  the separator to spot a signed number and never rewrites it.
+- **Unicode formula-lead lookalikes** — ASCII leads only; a non-UTF-8 or homoglyph lead is unguarded. Add only if a
+  concrete threat model needs it.
+- **Configurable guard char** — fixed to `'`, the spreadsheet-standard literal lead; `guard_char` is exposed for
+  reference, not as a parameter.
 
 ## Backlog / deferred
-From README "DEFER (intentionally out of scope for this v1)": RFC 4180 quoting, decimal-separator
-remapping, Unicode formula-lead lookalikes, configurable guard char — all as listed above under
-Threat model / out of scope (this module is deliberately narrow; these are permanent scope
-boundaries, not TODOs).
-
-
-**Missing and it matters** *(survey 2026-09-30)*:
-
-- ~~**Leading `\n`, `|` and `%` as guarded leads**~~ *(survey 2026-09-30)* — **DONE 2026-09-30 (user: follow the union)**; the price (a `%`/`|`-led value gains the apostrophe) is in the module doc. Was: go-safe-csv-writer guards LF; defusedcsv guards `|` and `%`.
-  Whether a spreadsheet evaluates a cell led by them is unsettled (OWASP lists neither), so this is a hardening
-  question, not a proven hole: decide with the user whether to follow the union of the ecosystem's lead sets (over-guarding
-  a `%`-led value like `%20` changes data). Effort: small. Fits §2: yes.
-- ✅ **DONE 2026-11-16 (`writeField` / `writeRecord` over `csvstream.WriteOptions`, a differential test against `csvstream.writeRecord` of the guarded fields):** **Guard + quote in one call for a `csvstream` writer** *(survey 2026-09-30)*: today the caller chains `writeSafe` and
-  `csvstream.writeField` by hand and must get the order right; `go-safe-csv-writer` ships them together. Effort: small
-  (a `csvstream` option or a thin function; note the dependency direction between the two modules). Fits §2: yes.
-
-## Status
-`extract · any · util · reentrant` + deps: none — canonical source is `pub const meta` in
-src/root.zig.
+None open.
 
 ## Anchoring
 

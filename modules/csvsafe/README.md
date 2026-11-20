@@ -12,12 +12,13 @@ hardening beyond OWASP — a value that genuinely starts with `%` or `|` gains
 the apostrophe).
 
 - The injection guard only; decimal-separator
-  remapping and RFC 4180 quoting are deliberately left to the CSV writer /
-  csvstream consumer.
+  remapping and RFC 4180 quoting are left to the CSV writer (`csvstream`);
+  `writeField` / `writeRecord` chain the guard with `csvstream`'s quoting.
 - **Model after:** OWASP CSV Injection prevention.
 - **Platform:** any (pure logic, no OS calls). **Role:** util.
-  **Concurrency:** reentrant (no shared state). **Allocation:** `needsGuard`
-  and `writeSafe` are allocation-free; only `guard` takes an allocator.
+  **Concurrency:** reentrant (no shared state). **Allocation:** `needsGuard`,
+  `writeSafe`, `writeField` and `writeRecord` are allocation-free; only `guard` takes an allocator.
+  **Depends on:** `csvstream` (the dialect options of `writeField` / `writeRecord`).
 
 Provenance: original work of the zig-libs authors (MIT). No third-party code.
 
@@ -53,6 +54,20 @@ fn guardSep(alloc: std.mem.Allocator, value: []const u8, decimal_sep: u8) ![]u8;
 
 The `*Sep` variants let a comma-decimal locale recognize `-12,34` as a number.
 
+### Guard and quote in one call
+
+```zig
+pub const WriteOptions = struct {
+    csv: csvstream.WriteOptions = .{}, // the dialect to quote for
+    decimal_sep: u8 = default_decimal_sep,
+};
+
+// Guard first, then quote (the apostrophe lands inside the quotes).
+fn writeField(w: *std.Io.Writer, value: []const u8, opts: WriteOptions) std.Io.Writer.Error!void;
+// One record, joined and terminated like csvstream.writeRecord of the guarded fields.
+fn writeRecord(w: *std.Io.Writer, fields: []const []const u8, opts: WriteOptions) std.Io.Writer.Error!void;
+```
+
 ## Verify
 
 ```
@@ -61,18 +76,7 @@ zig build test-csvsafe -Doptimize=ReleaseFast
 zig fmt --check modules/csvsafe
 ```
 
-## DEFER (intentionally out of scope for this v1)
+## Not provided
 
-- **RFC 4180 quoting** — wrapping a cell that contains the delimiter, the quote
-  char, CR or LF, and doubling internal quotes. Left to the CSV writer /
-  `csvstream` (it owns the delimiter and quote char; the guard does not).
-  `csvsafe.writeField` / `writeRecord` do both for a `csvstream` dialect, guard
-  first (go-safe-csv-writer's order).
-- **Decimal-separator remapping** — converting `.` → `,` for numeric outputs.
-  Also a writer/locale concern; `csvsafe` only *reads* the separator to spot a
-  signed number, it never rewrites it.
-- **Unicode formula-lead lookalikes** — the guard checks ASCII leads only. A
-  spreadsheet reading a non-UTF-8 / homoglyph lead is out of scope; add if a
-  concrete threat model needs it.
-- **Configurable guard char** — fixed to `'` (the spreadsheet-standard literal
-  lead). Exposed as `guard_char` for reference, not as a parameter.
+RFC 4180 quoting by the guard itself, decimal-separator remapping, Unicode lookalike leads and a configurable guard
+char are refused by design; see SPEC *What is deliberately not done* (nothing is open in *Backlog / deferred*).
