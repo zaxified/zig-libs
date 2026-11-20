@@ -8,10 +8,6 @@ private key on demand. Encrypt to an identity before its holder has
 ever contacted the PKG; decrypt once the private key has been
 extracted.
 
-**Status: REAL — fully implemented, no stubs.** `setup`, `extract`,
-`encrypt`, and `decrypt` are all real, built on `bls12_381`'s
-already-proven field/group/pairing/hash-to-curve primitives.
-
 **How it is anchored.** The encrypt/decrypt *assembly* is checked
 against a foreign artifact: `ibe.Scheme` is a `comptime` seam over the
 ciphersuite, and the tests instantiate this module's own
@@ -24,9 +20,7 @@ all: RFC 9380 §3.1 requires every application to pick its own DST, so
 there is no foreign value for ours to match, and with no external byte
 target the cube is a free choice. Those rest on the round-trip,
 pairing-consistency and soundness tests, and that is the end state.
-See [SPEC.md](SPEC.md)'s "KAT plan" for both halves, including the
-mutations that showed the anchor catches what the self-consistency
-tests structurally cannot.
+See [SPEC.md](SPEC.md)'s "KAT plan" for both halves.
 
 **Relationship to `tlock`**: `tlock` (this repo) is the SAME
 Boneh-Franklin primitive specialized so the PKG is a drand randomness
@@ -40,6 +34,7 @@ at any time.
 | `ciphersuite.zig` | `h1` (identity -> `G1`), `h2`/`h3`/`h4` (this module's own domain-separated hash constructions), `randomSigma` |
 | `ibe.zig` | `KeyPair`, `setup`/`extract` (the PKG API), `Ciphertext` `(U ∈ G2, V, W)` struct + byte codec, `encrypt`/`decrypt` + the private `fp12Pow` `Gt`-exponentiation helper |
 | `burn.zig` | Dead-stack burn wrapper run around every secret-holding entry point (`setup`, `extract`, `encrypt`, `decrypt`, `randomSigma`) |
+| `fuzz_test.zig`, `stackprobe_test.zig`, `ctgrind_harness.zig` | The `IBE_FUZZ` driver plumbing, the dead-stack probe, and the constant-time harness (run by `scripts/checks/ctgrind.sh ibe`, not by `test-ibe`) |
 | `kat_test.zig` | Round-trip, pairing-consistency and soundness (tamper/wrong-key rejection) KATs, plus the drand-parameterised interop anchor (test-only `tlock` import) |
 
 ## Import

@@ -20,11 +20,6 @@ Standalone Boneh-Franklin Identity-Based Encryption over `bls12_381` —
 see [README.md](README.md) for purpose and API. Provenance: see
 [NOTICE](NOTICE).
 
-**Status: REAL — fully implemented.** `ciphersuite.zig` (hashes/DSTs),
-`ibe.Ciphertext` (wire struct + codec), `ibe.setup`/`ibe.extract` (the
-PKG API), and `ibe.encrypt`/`ibe.decrypt` (the BF-IBE FullIdent core)
-are all real and tested.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Only READMEs, repository metadata and LICENSE heads were read; no foreign source.
@@ -40,15 +35,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 ## The construction (Boneh-Franklin "FullIdent", CRYPTO 2001 §4.2)
 
 ```
-setup(out, io):                           [REAL — ibe.setup]
+setup(out, io):
   msk = Fr.random(io)
   mpk = msk · G2_generator
 
-extract(out, &msk, id):                   [REAL — ibe.extract]
+extract(out, &msk, id):
   Qid = H1(id) = hashToCurveG1(id, dst_g1)
   return msk · Qid                        ∈ G1
 
-encrypt(mpk, id, &M, &sigma):              [REAL — ibe.encrypt]
+encrypt(mpk, id, &M, &sigma):
   Qid   = H1(id)
   Gid   = pairing(Qid, mpk) ∈ Gt
   r     = H3(sigma, M) ∈ Fr
@@ -58,7 +53,7 @@ encrypt(mpk, id, &M, &sigma):              [REAL — ibe.encrypt]
   W     = M XOR H4(sigma)
   return (U, V, W)
 
-decrypt(out, &d_id, (U,V,W)):              [REAL — ibe.decrypt]
+decrypt(out, &d_id, (U,V,W)):
   gid_r = pairing(d_id, U) ∈ Gt           (ONE pairing call — bilinearity gives gid_r for free)
   sigma = V XOR H2(gid_r)
   M     = W XOR H4(sigma)
@@ -99,14 +94,13 @@ round trip.
 
 `encrypt` needs `Gid^r`; `bls12_381.Fp12` exports no `pow`. Same
 resolution `tlock` already took (`tlock/SPEC.md`'s "Known gap", option
-1): a module-local `fp12Pow` in `ibe.zig` — a constant-time
-square-and-multiply-ALWAYS loop over `Fp12.square`/`.mul` and a
-component-wise `Fp2.ctSelect` lift, adapted directly from `tlock.zig`'s
-implementation (identical construction; `r = H3(sigma, M)` is
-secret-derived in both modules, so the exponent is treated like a
-secret scalar in both). Its exponentiation law is pinned ungated
-against pairing bilinearity (`e(P,Q)^r == e(rP,Q)`) in both `ibe.zig`'s
-own tests and `kat_test.zig`.
+1): a module-local `fp12Pow` in `ibe.zig`, the same construction as `tlock.zig`'s: a fixed 4-bit window over the
+exponent's 32 bytes (four squarings and one multiplication per window, no leading-zero skip) whose table lookup reads
+every one of the 16 entries and merges them with a component-wise `Fp2.ctSelect` lift (`fp12CtSelect`), so
+neither a branch nor a memory address depends on the exponent. `r = H3(sigma, M)` is secret-derived in both modules,
+so the exponent is treated like a secret scalar in both; the base `Gid` is a pairing of public points. The
+exponentiation law is pinned ungated against pairing bilinearity (`e(P,Q)^r == e(rP,Q)`) in both `ibe.zig`'s own
+tests and `kat_test.zig`, and the windowed result against a bitwise reference for every window digit.
 
 ## No drand-style cube
 
@@ -166,18 +160,6 @@ language, either of which would be a sibling implementation and would
 prove nothing. Both the byte-exact `encrypt` direction and the
 `decrypt` direction are checked, plus rejection under a wrong key.
 
-*Verified to have teeth, by mutation, twice.* (1) Swapping `V` and `W`
-in `Ciphertext.toBytes` AND `fromBytes` — a consistent change, so the
-codec still round-trips: `exit 1`, **40 pass / 2 fail**, and both
-failures are section 5's. (2) Feeding `H4` the ciphertext's `V` instead
-of `sigma` in `encrypt` AND `decrypt` — again consistent, so every
-round-trip and tamper test still passes: `exit 1`, **40 pass / 2 fail**,
-again only section 5's. Both mutations are exactly the systematic
-assembly error a self-consistency suite is structurally blind to, and
-in both cases the entire pre-existing suite stayed green while the
-foreign fixture caught it. Reverted; `test-ibe` back to `exit 0`,
-42/42.
-
 **The parameters CANNOT be externally anchored — by construction, not
 for want of effort.** RFC 9380 §3.1 *requires* every application to
 choose its own domain-separation tag, so there is no external value for
@@ -188,33 +170,33 @@ decision (see "No drand-style cube" above) is the same kind of choice —
 convention, and with no external byte target any self-consistent
 representation is correct. `Fr.reduceWide`-based `h3` likewise. These
 are pinned by the self-consistency tests below and by nothing else, and
-that is the end state, not an open to-do.
+that is the end state, not an open item.
 
 What `kat_test.zig` verifies on the parameter side:
 
-- **Round-trip (done)**: `setup -> extract -> encrypt -> decrypt`
+- **Round-trip**: `setup -> extract -> encrypt -> decrypt`
   recovers the original message, across five distinct
   `(identity, message)` pairs including an empty-string identity and a
   policy-string identity; a second test uses `ciphersuite.randomSigma`
   (the production entropy path, not a fixed KAT sigma); a third
   confirms `encrypt` is deterministic given fixed inputs.
-- **Pairing consistency (done)**: `e(d_id, U) == fp12Pow(Gid, r)`
+- **Pairing consistency**: `e(d_id, U) == fp12Pow(Gid, r)`
   checked directly on a known case (see "Correctness identity" above),
   plus the `Extract`-correctness identity `e(d_id, G2gen) ==
   e(H1(id), mpk)` a caller crossing a trust boundary would check (the
   same idiom `tlock`'s own pairing-sanity test uses for a beacon round
   signature).
-- **`fp12Pow` law (done)**: `base^0`/`base^1`, exponent additivity, and
+- **`fp12Pow` law**: `base^0`/`base^1`, exponent additivity, and
   the bilinearity cross-check `e(P,Q)^r == e(rP,Q)` — pinned in both
   `ibe.zig`'s own tests (mirroring `tlock.zig`'s identical tests) and
   `kat_test.zig`.
-- **Soundness/CCA (done)**: tampered `U`/`V`/`W` (three separate
+- **Soundness/CCA**: tampered `U`/`V`/`W` (three separate
   tests), a random `G1` point used as `d_id` (not a real extracted
   key), `extract`-for-`id_A` used against a ciphertext encrypted to
   `id_B`, and a private key extracted under a DIFFERENT PKG's `msk` —
   all six must return `error.FoCheckFailed`, never a garbage plaintext.
 
-- **drand-parameterised interop anchor (done)**: section 5, described
+- **drand-parameterised interop anchor**: section 5, described
   above — `ibe.Scheme` under drand's parameters, byte-compared against
   a genuine Go-`tle`-produced ciphertext in both directions, plus a
   provenance check (`e(sig, G2gen) == e(h1(beaconId(round)), P_pub)`)
@@ -240,25 +222,6 @@ would slip past it — the bodies are generic in `cs.block_bytes` and use
 no width-specific arithmetic, which is why that residual is judged
 narrow rather than absent, but it is a residual and not nothing.
 
-## Honest tier note
-
-This module is a full **Sonnet-tier** adaptation, not a Fable-hard
-build: the hard pairing-based `encrypt`/`decrypt` core (the actual
-irreducible cryptographic difficulty in any BF-IBE implementation —
-getting the FO transform, the `Gt` exponentiation, and the bilinearity
-bookkeeping right) was already proven by the sibling `tlock` module's
-Fable pass. Building `ibe` was: (1) recognizing which parts of
-`tlock.zig` generalize directly (the entire `encrypt`/`decrypt`/
-`fp12Pow`/`Ciphertext` shape, essentially unchanged) versus which parts
-are drand-interop-specific and must NOT be copied (the beacon-ID
-digest format, the little-endian `h3` rejection-sampling counter, and
-— most importantly — the `gtToDrandRepr` cube, whose absence had to be
-justified, not merely omitted by oversight); and (2) the genuinely
-trivial `Setup`/`Extract` (a scalar-times-generator and a
-scalar-times-point-on-`G1`, both already-existing `bls12_381`
-primitives). No new cryptographic construction, no new field/group/
-pairing math, and no unresolved hard problem remain in this module.
-
 ## Constant-time measurement (ctgrind)
 
 Three targets run under memcheck with one party's secret tainted; the counts
@@ -266,32 +229,42 @@ are pinned in `scripts/checks/ctgrind-expected.tsv`.
 
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|
-| `extract` | `msk` | 1 | `toAffine` of `d_id` (the output) — 2026-10-02; the old 3 held two ff `toBytes` contexts |
-| `decrypt` | `d_id` (the pairing plus the FO consistency check) | 8 | the Miller loop, `Fp2.inv`, the FO compare (`decryptBody` in `ibe.zig`), output `toAffine`/compression — 2026-10-02 (10); 8 on Zig 0.17.0 (2026-10-18), the same sites with the Miller loop's three contexts merged into one by inlining and the FO compare's two into one |
-| `fp12pow` | `sigma`, `message` | 0 | the old 2 were ff `toBytes` on `r` (2026-10-02) |
+| `extract` | `msk` | 1 | `toAffine` of `d_id` (the output) |
+| `decrypt` | `d_id` (the pairing plus the FO consistency check) | 8 | the Miller loop, `Fp2.inv`, the FO compare (`decryptBody` in `ibe.zig`), output `toAffine`/compression |
+| `fp12pow` | `sigma`, `message` | 0 | none |
 
 ⛔ Not a constant-time claim about the pairing — `bls12_381/src/pairing.zig`
-makes none. What is pinned is this module's own `fp12Pow` (audit F4, the same
-windowed construction `tlock` uses) and the shape of `decrypt` around it.
+makes none. What is pinned is this module's own `fp12Pow` (the same windowed
+construction `tlock` uses) and the shape of `decrypt` around it. The decrypt
+contexts are `toAffine`/`inv` and the compression sort bit on output points, `Fr`'s
+canonical accept/reject, and `decrypt`'s FO re-encryption compare (`std.mem.eql`;
+accept/reject is public, per the code). Read with `--stacks`. A count moves when the
+sibling `bls12_381` changes its branches (its Miller loop, its `Fp.ctSelect`), not
+only when this module does; check that the harness still reaches the module (`decrypt`
+prints a real recovered plaintext) before re-pinning.
 
-⚠ **`decrypt` re-pinned 2026-09-16**, from 14. Nothing here changed: the
-sibling's Miller loop stopped paying an `Fp2` inversion per step
-(`bls12_381` `32e751ad`), so the branches those inversions carried are gone.
-`extract` and `fp12pow` stayed green throughout. Checked explicitly that the
-fall is not a harness that stopped reaching the module — `decrypt` still prints
-a real recovered plaintext.
+## Verification
 
-⚠ **Re-pinned 2026-10-02 — the rise is the sibling's fix, not a regression.**
-`bls12_381`'s `Fp.ctSelect` had no optimization barrier, so inside its ladders
-LLVM lowered the select to a jump on the scalar bit; memcheck tracks data flow,
-not control flow, so that jump dropped the taint and everything downstream of
-`[k]P` looked public. With the select branchless (and `Fr` off
-`std.crypto.ff`) the taint survives and these rows see more of the module:
-`toAffine`/`inv` and the compression sort bit on output points, `Fr`'s
-canonical accept/reject, and `decrypt`'s FO re-encryption compare
-(`std.mem.eql`; accept/reject is public, per the code). Read with `--stacks`.
+Run: `scripts/modtest ibe` (the whole module is `heavy`); `IBE_FUZZ=<runs>` for the fuzz driver;
+`scripts/checks/ctgrind.sh ibe` for the constant-time rows.
 
-## Out of scope
+- **KAT plan above** (`src/kat_test.zig`): round trips, entropy seam, determinism, pairing consistency, `fp12Pow` law,
+  soundness/CCA rejection, and the drand-parameterised interop anchor.
+- **Unit tests** (`src/ibe.zig`, `src/ciphersuite.zig`): the `Ciphertext` codec and its malformed-G2 rejection,
+  `setup`/`extract` properties (`mpk = msk * G2gen`, determinism, on-curve and subgroup membership, distinct keys),
+  `KeyPair.deinit` and a failed `decrypt` zeroing their outputs, the windowed `fp12Pow` against a bitwise reference,
+  and the hash constructions (`h1` on-curve and in the subgroup, `h2`/`h4` domain-separated and exactly one block
+  wide, `h3` a canonical scalar).
+- **Fuzz** (`src/kat_test.zig`, `src/fuzz_test.zig`): `Ciphertext.fromBytes` and `decrypt` on corrupted ciphertext
+  bytes never panic, under testkit's deterministic driver as `IBE_FUZZ` (harness `ibe-ciphertext`); every seed of
+  the corpus reaches `fromBytes` with its outcome pinned; fixed-seed reach checks run in every test run.
+- **Dead stack** (`src/stackprobe_test.zig`, ReleaseFast only): no `msk`, `d_id`, `sigma`, `r`, `Gid^r` or plaintext
+  residue after `setup`, `extract`, `encrypt` and `decrypt`.
+- **Constant time:** `src/ctgrind_harness.zig` (*Constant-time measurement*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
+
+## What is deliberately not done
 
 - Arbitrary-length payload encryption. `Ciphertext`'s `V`/`W` are fixed
   32-byte blocks; larger payloads are expected to be encrypted with a
@@ -308,12 +281,19 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
   Feldman machinery, not in scope here.
 - Hierarchical IBE (HIBE), anonymous IBE, or any Boneh-Franklin variant
   beyond the base "FullIdent" scheme.
+- A DEM helper for arbitrary-length payloads: the caller does KEM-then-DEM (the sibling `hpke` or any `std` AEAD
+  can); not filed as a gap.
 
 ## Backlog / deferred
 
-- **Additional IBE / IBKEM schemes** (Kiltz-Vahlis IBE1 CCA KEM, Waters, Boyen-Waters) *(survey 2026-09-30)*: the reference offers five, all on BLS12-381; a user who wants a KEM rather than 32-byte blocks, or anonymous IBE, needs one. Medium each (an IBKEM API around the existing pairing); fits §2. The SPEC's "Out of scope" already refuses HIBE and other Boneh-Franklin variants.
-- **A DEM helper for arbitrary-length payloads** *(survey 2026-09-30)*: the SPEC leaves KEM-then-DEM to the caller (reason given in "Out of scope"); recorded here only to say the sibling `hpke`/`std` AEAD can do it, not filed as a gap.
-- **Threshold PKG** *(survey 2026-09-30)*: already refused in "Out of scope"; recorded as a question because a single `msk` is the module's largest operational hazard.
+- **Additional IBE / IBKEM schemes** (Kiltz-Vahlis IBE1 CCA KEM, Waters, Boyen-Waters): the reference offers five, all
+  on BLS12-381; a user who wants a KEM rather than 32-byte blocks, or anonymous IBE, needs one. Medium each (an IBKEM
+  API around the existing pairing); fits §2. HIBE and other Boneh-Franklin variants stay refused (*What is
+  deliberately not done*).
+
+## Open
+
+- **No whole-module mutation run is recorded** (the card's mutation entry is `?`).
 
 ## Anchoring
 
@@ -323,5 +303,3 @@ canonical accept/reject, and `decrypt`'s FO re-encryption compare
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** assembly byte-exact vs a genuine drand Go tle ciphertext: ibe.Scheme (comptime ciphersuite seam) driven with drand's parameters reproduces the fixture in kat_test.zig §5, encrypt and decrypt both directions; own DSTs/tags/h3/no-cube remain self-only and are unanchorable by construction (RFC 9380 §3.1 mandates a per-application DST, so no foreign value exists to match)
-
-**How it got there.** The anchoring work landed. CLOSED 2026-08-09: the original NOTE was wrong on its own terms — no external implementation of THIS scheme exists, but this module's assembly is not scheme-specific. Split ibe.zig into an ASSEMBLY (which hash feeds which XOR, the FO consistency check, fp12Pow, the U||V||W encoding) and PARAMETERS (DSTs, tags, block width, Gt representation) via a comptime `Scheme(ciphersuite)` seam — the published API is Scheme(ciphersuite), unchanged. kat_test.zig §5 then instantiates THAT SAME CODE with drand's parameters (tlock's ciphersuite, imported as a test-only dep, plus the gt->gt³ adapter kilic's final exponentiation needs) and requires it to reproduce, byte for byte, the genuine Go-tle-produced ciphertext modules/tlock already had frozen — encrypt direction and decrypt direction, plus rejection under a wrong key, plus a pairing-identity check binding the transcribed pubkey/signature/identity so a typo is a RED. Explicitly NOT the py_ecc re-derivation the audit finding proposed: writing our own assembly a second time in Python would be a sibling, and a sibling for exactly the layer that lacked an oracle. Mutation-tested TWICE, both times consistently on both sides so the self-consistency layer stays blind: (1) V/W swapped in Ciphertext.toBytes+fromBytes, (2) H4 fed ct.V instead of sigma in encrypt+decrypt — each gave exit 1, 40 pass / 2 fail, with the ONLY failures being the two new drand tests while all 40 pre-existing round-trip/tamper/pairing tests stayed green. Reverted; test-ibe exit 0, 42/42. RESIDUAL, stated in SPEC.md/NOTICE/README/kat_test.zig header rather than papered over: the DST strings and the no-cube decision stay self-anchored forever — RFC 9380 §3.1 requires each application to choose its own DST, so an ibe DST matching someone else's would be a defect, not an anchor.
