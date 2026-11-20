@@ -48,9 +48,14 @@ in this module are written for that case and pass on it.
 
 | | |
 |---|---|
-| **Implemented** | `GET` (device enumeration), `PORT_GET`/`PORT_SET`/`PORT_SPLIT`/`PORT_UNSPLIT`, `PARAM_GET`/`PARAM_SET`, `RESOURCE_DUMP`/`RESOURCE_SET`, `REGION_GET`/`REGION_NEW`/`REGION_DEL`/`REGION_READ`, `HEALTH_REPORTER_GET`/`HEALTH_REPORTER_RECOVER`, `ESWITCH_GET`/`ESWITCH_SET`, `INFO_GET`, the `config` multicast group |
+| **Implemented** | `GET` (device enumeration), `PORT_GET`/`PORT_SET`/`PORT_SPLIT`/`PORT_UNSPLIT`, `PARAM_GET`/`PARAM_SET`, `RESOURCE_DUMP`/`RESOURCE_SET`, `REGION_GET`/`REGION_NEW`/`REGION_DEL`/`REGION_READ`, `HEALTH_REPORTER_GET`/`HEALTH_REPORTER_RECOVER`, `ESWITCH_GET`/`ESWITCH_SET`, `INFO_GET`, `RELOAD`, the `config` multicast group |
 | **Escape hatch** | `Devlink.raw` — any command, caller-encoded attributes, replies handed back as attribute bytes |
-| **Deferred** | rate objects, traps / trap groups / trap policers, DPIPE, shared buffers (`SB_*`), flash update, selftests, linecards, `RELOAD`, port functions, `PORT_NEW`/`PORT_DEL`, health diagnose/dump, `NOTIFY_FILTER_SET` — all reachable through `raw`; see `SPEC.md` |
+
+## Not provided
+
+Rate objects, traps / trap groups / trap policers, DPIPE, shared buffers (`SB_*`), flash update, selftests, linecards, port
+functions, `PORT_NEW`/`PORT_DEL`, health diagnose/dump, the reload counters and `NOTIFY_FILTER_SET` are not modelled; all are
+reachable through `raw` (reasons and order in SPEC *Backlog / deferred*). No test issues a write, even under privilege.
 
 ## API
 

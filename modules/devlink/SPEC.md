@@ -37,7 +37,7 @@ chunked reads, health reporters, port split/unsplit, resource writes and the `co
 subscription are in none of the Go/Rust libraries; request bytes are diffed against the real `devlink`
 binary and replies are captures from `netdevsim`. **Where we are behind:** the CLI's operational
 command `dev flash`, port functions/`port add|del`, rate objects, traps, shared buffers,
-health diagnose/dump (→ Backlog; all reachable via `Devlink.raw`). `dev reload` is typed since 2026-11-17.
+health diagnose/dump (→ *Backlog / deferred*; all reachable via `Devlink.raw`). `dev reload` is typed (§2.8).
 
 ## 1. What this module is
 
@@ -71,10 +71,9 @@ a different device.
 **`Handle.parse` vs `PortHandle.parse` — anchored against the real CLI, not
 just self-consistent.** `Handle.parse` scans forward for one `/` and rejects a
 second one (a port-suffixed string); `PortHandle.parse` scans backward for the
-LAST `/` and requires the tail to be a valid port index. Whether this actually
-matches what the `devlink` binary itself accepts and rejects for its own
-`bus_name/dev_name` vs `bus_name/dev_name/port_index` forms was previously
-`UNVERIFIED` — checked only against this module's own round trip. Verified
+LAST `/` and requires the tail to be a valid port index. This matches what the
+`devlink` binary itself accepts and rejects for its own
+`bus_name/dev_name` vs `bus_name/dev_name/port_index` forms, checked
 live against **iproute2 6.19.0's `devlink`** (same tool/version §4.1's byte-
 exact goldens are captured from) on a hardware-less host — no real devlink
 instance needs to exist for these; the CLI's own argument parser rejects a
@@ -187,6 +186,19 @@ headers are written, and a test over `client.zig`'s own source keeps it that
 way. The flags are preserved exactly as the client sent them before, including
 this module's choice to ask for an `NLM_F_ACK` on `RESOURCE_DUMP`/`RESOURCE_SET`
 where the `devlink` binary does not (§4.1).
+### 2.8 Reload
+
+`reload.zig` (`buildReload`, `Devlink.reload(handle, Options{ action, limit, netns })`) sends `DEVLINK_CMD_RELOAD`:
+the handle, then the optional `NETNS_PID` | `NETNS_FD` | `NETNS_ID` (the `Netns` union: exactly one selector),
+`RELOAD_ACTION` (u8: `driver_reinit` / `fw_activate`) and `RELOAD_LIMITS` (bitfield32: `value` = `1 << limit`,
+`selector` = the kernel's valid mask, 3, as `devlink` sends it), in the order `devlink` itself uses (§4.1). Every
+attribute is optional; a bare reload is the handle alone, which the kernel treats as `driver_reinit` with no limits.
+A limit outside the valid mask is `error.InvalidRequest` locally. The reply's `RELOAD_ACTIONS_PERFORMED` is decoded
+into `Performed` (`did(action)`; an absent attribute is an empty mask). Reload is destructive (the driver is
+re-instantiated, netdevs and ports of the device disappear and come back, and with a `netns` the whole instance moves
+to another network namespace) and needs `CAP_NET_ADMIN`; nothing is a dry run, so no test sends one. The netns is
+passed as the pid, fd or id the kernel takes; the CLI's name lookup is not reproduced. The `DEV_STATS`/`RELOAD_STATS`
+counters are not decoded (Backlog).
 
 ## 3. Threat model
 
@@ -218,11 +230,31 @@ Requests are validated locally where the kernel would answer `EINVAL` anyway
 zero-length region read), so those are `error.InvalidRequest` without a round
 trip.
 
-Fuzz targets (`std.testing.fuzz`): device + info decode, port decode, parameter
-decode, resource decode, region decode + chunk reassembly, health decode,
-notification parse — seven in total.
+## Verification
 
-## 4. Verification
+- **Run:** `scripts/modtest devlink` (or `zig build test-devlink`, also `--release=fast`). Offline golden-byte, decoder,
+  hostile-input and fuzz tests are the gate; the live tests need no privilege and no device (§4.4).
+- **Fuzz:** `src/fuzz_test.zig`, run by testkit's deterministic driver as `DEVLINK_FUZZ`: device + info decode, port
+  decode, parameter decode, resource decode, region decode + chunk reassembly, health decode and notification parse.
+  Every harness takes its input from `drawInput` (a slice of the fuzz input, or a corpus entry built at run time from
+  the value tests' own builders and this module's encoders: a devlink attribute is a netlink TLV whose length and
+  scalars are host byte order, so a hex corpus would be a little-endian one) and carries a corpus guard on what it
+  decoded: an empty attribute list is a legal devlink reply, so a bare "decoded" count cannot tell a real reply from
+  an empty one.
+- **Constant time:** n/a — netlink device info.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it. The mutated areas: the region snapshot bounds and chunk `Assembler`, handle validation and
+  echo checks, `walkStep`'s pid/seq/family filters, error mapping and message ceiling, the version/param/resource/port
+  bounds, `asU64`/`copyName`, the health counters and `reload.zig` (the performed-actions decoder, the limit validation,
+  each `NETNS_*` selector, the action value and the limit bitfield). Two paths have no offline test for want of a seam:
+  `param`'s name-echo compare in `client.zig` and `collect` keeping the first family message run only on a `*Devlink`
+  with a real socket, and so does `Devlink.reload` itself like the other client methods.
+- **UAPI constants:** `scripts/checks/check-uapi-consts.py` checks the module's kernel-ABI enum values against the
+  kernel header.
+- **Bounds pinned by tests:** `value_max` (128) at `value_max` and `value_max + 1` on both the `.binary` and the unknown
+  type branch (without the bound a 200-byte `PARAM_VALUE_DATA` panics in Debug and in ReleaseFast clobbers the `len`
+  field); `max_walk_messages` counts messages, not datagrams; `newSnapshot` correlates its reply with the request like
+  the other single-object methods (`checkHandleEcho` plus a region-name compare).
 
 ### 4.1 Byte-exact request goldens — real captures
 
@@ -233,8 +265,7 @@ strace -f -e trace=%network -e write=all -e read=all -s 64 -o log.txt devlink <a
 ```
 
 `-e trace=%network` rather than a `sendmsg` filter, because **`devlink` sends
-with `sendto`** — the same trap that made an early `ethtool` capture attempt
-come back empty. The capture was checked to be non-empty before anything was
+with `sendto`**. The capture is checked to be non-empty before anything is
 written down.
 
 Commands captured (each with its exact command line in a comment beside the
@@ -265,7 +296,7 @@ golden in `src/goldens.zig`):
 | `devlink region read … address 0 length 16` | `CHUNK_ADDR`/`CHUNK_LEN` **u64**, and `NLM_F_DUMP` |
 | `devlink health recover <handle> reporter fw` | `CMD.HEALTH_REPORTER_RECOVER` = 54 |
 | `devlink dev eswitch set … mode … inline-mode … encap-mode …` | the u16/u8/u8 width asymmetry |
-| `devlink dev reload <handle> [action A] [limit L] [netns PID]` | `CMD.RELOAD` = 37; `RELOAD_ACTION` u8, `RELOAD_LIMITS` bitfield32 (value `1<<limit`, selector 3), `NETNS_PID`; attribute order handle, netns, action, limits (4 captures, 2026-11-17) |
+| `devlink dev reload <handle> [action A] [limit L] [netns PID]` | `CMD.RELOAD` = 37; `RELOAD_ACTION` u8, `RELOAD_LIMITS` bitfield32 (value `1<<limit`, selector 3), `NETNS_PID`; attribute order handle, netns, action, limits (four captures) |
 
 Every SET-form capture was made against a handle that does not exist and was
 refused with `ENODEV`/`EPERM` — **after** the bytes were already on the wire,
@@ -302,7 +333,7 @@ Two iproute2 quirks are pinned rather than normalised:
 - an `NLMSG_ERROR` carrying `-ENODEV`;
 - an `NLMSG_ERROR` carrying `-EPERM` (from the privileged `ESWITCH_GET`).
 
-**Captured from a real device (2026-08-08, wave-2 F1)** — all eight object
+**Captured from a real device** — all eight object
 replies: the device reply, the two-port dump, the parameter dump (a generic
 `u32` and a driver-specific flag), the recursive resource tree, the region
 reply with a snapshot, the `REGION_READ` chunk, the health-reporter dump and
@@ -381,85 +412,37 @@ common case):
 Everything that needs a real instance prints `SKIPPED: …` and passes. **No live
 test can fail for want of hardware.**
 
-### 4.5 Mutation run
+## Open
+- **`PARAM_SET` request golden.** iproute2 will not emit one without a device (§4.1 quirk 1), so those request bytes
+  are UAPI-derived, not captured. A live `netdevsim` supplies a device: reachable with the same recipe, in the same guest.
+- **A notification golden.** `devlink monitor` prints, and nothing on a capture machine ever emits on the `config`
+  group; a `netdevsim` guest can.
+- **A tripped health reporter.** The reply goldens for one are constructed; `HEALTH_REPORTER_TEST` trips netdevsim's
+  `dummy` on demand, so a capture is reachable.
 
-**Delta run 2026-11-17** (schemata, ReleaseSafe, 12 mutants over `reload.zig`:
-the performed-actions decoder — the selector mask, the width check, `did`'s
-shift guard — the limit validation (both operands), each `NETNS_*` selector,
-the action value, and the limit bitfield's value and selector): 12 killed, 0
-survivors. The audit line is cumulative with the 2026-10-05 run below.
-`Devlink.reload` itself runs only on a real socket and is, like the other
-client methods, untested offline.
+## What is deliberately not done
+- **Writes in the live tests.** No SET, SPLIT, SNAPSHOT, RECOVER or RELOAD is issued by any test, privileged or not:
+  devlink writes reset hardware (§4.4).
+- **Name lookup of a network namespace** for `reload` (the CLI's `netns <name>`): the caller passes the pid, fd or id.
 
-**Mutation run 2026-10-05** (in-place, Debug, 40 mutants over the region
-snapshot bounds and chunk `Assembler`, handle validation and echo checks,
-`walkStep`'s pid/seq/family filters, error mapping and message ceiling, the
-version/param/resource/port bounds, `asU64`/`copyName`, and the health
-counters): 29 killed. Seven survivors were missing tests, now added: more
-than `max_snapshots` top-level snapshot ids, an empty chunk outside the
-window, a 9-octet u64 attribute, and three `walkStep` cases over the mock
-socket — a family message for another socket and for another request, an
-`NLMSG_ERROR` with a negative errno, and the ceiling reached by a message
-inside a datagram. Equivalent: `checkHandleEcho`'s `isComplete` (the wanted
-handle is validated non-empty, so a half handle can never `eql` it) and
-`unrecoveredCount`'s `e > c` vs `e >= c` (both give 0 at equality). **Two
-survivors have no test:** `param`'s name-echo compare in `client.zig` and
-`collect` keeping the first family message — both run only on a `*Devlink`
-with a real socket, and no seam reaches them (`walkStep` is the only one).
-36 of 40 killed after.
-
-## 5. Deferred — and why
-
-Everything below is reachable through `Devlink.raw`; none of it is blocked by a
-design decision here.
+## Backlog / deferred
+Everything below is reachable through `Devlink.raw`; none of it is blocked by a design decision here. Ranked by the
+survey's value to an operator or fleet agent; all fit CONVENTIONS §2 (pure Zig, no libc).
 
 | deferred | why |
 |---|---|
-| **rate objects** (`RATE_GET`/`SET`/`NEW`/`DEL`) | Only meaningful on an eswitch with VF/SF rate limiting; a full model needs the leaf/node tree and the TC bandwidth nest. Sizeable and unverifiable without hardware. |
-| **traps, trap groups, trap policers** | Three related object families with their own statistics nests; mlxsw-specific in practice. Large enough to be its own increment. |
-| **DPIPE** (`DPIPE_TABLE_GET`, `ENTRIES_GET`, `HEADERS_GET`) | A whole pipeline-introspection schema — headers, fields, matches, actions, entries — nested five deep. Bigger than the rest of devlink combined, and only mlxsw implements it. |
-| **shared buffers** (`SB_*`, 20 commands) | Pool/port-pool/TC-bind matrix plus occupancy snapshots. Coherent as a unit, and none of it is testable without a switch ASIC. |
-| **flash update** | Needs a firmware file on disk and emits an asynchronous progress stream on the `config` group (`FLASH_UPDATE_STATUS`). The write half is dangerous to expose without a way to exercise it. |
+| **flash update** (`devlink dev flash`, the `FLASH_UPDATE_STATUS` progress stream on the `config` group) | The main reason an operator uses devlink on a NIC. Needs a firmware file on disk and emits an asynchronous progress stream; the write half is dangerous to expose without a way to exercise it. Effort medium (request plus stream decoding). |
+| **port functions** (`PORT_FUNCTION` nest) and **`PORT_NEW`/`PORT_DEL`** | SF/VF provisioning, the clearest standalone value for an SR-IOV/SF fleet agent (vishvananda/netlink has it). Hardware address, admin state, capability bitfield and max-IO-EQs; subfunction lifecycle pairs with it. The port decoder reports the nest's *presence* (`Port.has_function`) but does not decode it. Effort medium. |
+| **rate objects** (`RATE_GET`/`SET`/`NEW`/`DEL`) | VF/SF rate limiting; a full model needs the leaf/node tree and the TC bandwidth nest. Only meaningful on an eswitch with rate limiting, unverifiable without hardware. Effort medium-large. |
+| **health diagnose / dump** (`HEALTH_REPORTER_DIAGNOSE`, `DUMP_GET`, `DUMP_CLEAR`, `TEST`) and `HEALTH_REPORTER_SET` | Their payload is the `DEVLINK_ATTR_FMSG` nest, a self-describing, recursively typed object/array format that is its own decoder; an FMSG decoder unlocks the group in one step. Effort medium. |
+| **`DEV_STATS` / `RELOAD_STATS`** | Per-action, per-limit reload counters. `Device.has_reload_stats` reports the nest's presence only. The nesting of the counters is not in the UAPI header and cannot be captured without a driver that supports reload (netdevsim needs root); decoding it from memory would be guessing. |
+| **traps, trap groups, trap policers** | Three related object families with their own statistics nests; mlxsw-specific in practice. Large. |
+| **DPIPE** (`DPIPE_TABLE_GET`, `ENTRIES_GET`, `HEADERS_GET`) | A whole pipeline-introspection schema nested five deep, bigger than the rest of devlink combined, and only mlxsw implements it. Large. |
+| **shared buffers** (`SB_*`, 20 commands) | Pool/port-pool/TC-bind matrix plus occupancy snapshots; coherent as a unit, untestable without a switch ASIC. Large. |
 | **selftests** | `SELFTESTS_GET`/`RUN`; running one takes the device down. |
 | **linecards** | Modular-chassis only; carries a `NESTED_DEVLINK` handle whose semantics deserve their own treatment. |
-| **port functions** (`PORT_FUNCTION` nest) | Hardware address, admin state, capability bitfield and max-IO-EQs for SF/VF ports. The port decoder reports the nest's *presence* (`Port.has_function`) but does not decode it. |
-| **`PORT_NEW`/`PORT_DEL`** | Subfunction lifecycle; pairs with port functions. |
-| **health diagnose / dump** (`HEALTH_REPORTER_DIAGNOSE`, `DUMP_GET`, `DUMP_CLEAR`, `TEST`) | Their payload is the `DEVLINK_ATTR_FMSG` nest — a self-describing, recursively typed object/array format that is its own decoder. `HEALTH_REPORTER_SET` is deferred with them. |
-| **`DEV_STATS` / `RELOAD_STATS`** | Per-action, per-limit reload counters. `Device.has_reload_stats` reports the nest's presence only. The nesting of the counters is not in the UAPI header and cannot be captured without a driver that supports reload (netdevsim needs root); decoding it from memory would be guessing. |
-| **`NOTIFY_FILTER_SET`** | Narrows what a multicast subscriber receives; useful, but only once there is something to receive. |
+| **`NOTIFY_FILTER_SET`** | Narrows what a multicast subscriber receives; useful only once there is something to receive. |
 | **`PORT_PARAM_GET`/`SET`** | Per-port parameters. The decoders already handle a `PORT_INDEX` on a parameter; only the commands are missing. |
-
-## 6. Backlog
-
-1. ~~**Verify against `netdevsim`.**~~ **DONE 2026-08-08** — see §4.2. All
-   eight object replies are now real captures from a live `netdevsim` in the
-   VM lane. What is *not* yet captured from it: a **tripped** health reporter
-   (`HEALTH_REPORTER_TEST` trips `dummy` on demand) and a notification on the
-   `config` group; both are reachable with the same recipe.
-2. **`PARAM_SET` request golden.** iproute2 will not emit one without a device
-   (§4.1 quirk 1), and `netdevsim` now supplies one — reachable with the same
-   recipe, in the same guest, and no longer blocked.
-3. **A notification golden.** Same: `devlink monitor` prints, and nothing on
-   this machine ever emits on the `config` group.
-4. **Port functions**, then **rate objects** — the two deferred items with the
-   clearest standalone value for an SR-IOV/SF fleet agent.
-5. **FMSG decoder**, which unlocks health diagnose/dump in one step.
-
-### Survey findings (survey 2026-09-30)
-
-Ranked; each is reachable through `Devlink.raw` today. All fit CONVENTIONS §2 (pure Zig, no libc).
-
-1. ✅ 2026-11-17 **`RELOAD`** (survey 2026-09-30) — `reload.zig`: `buildReload` / `Devlink.reload` with `Options{action, limit, netns}` (`NETNS_PID`/`FD`/`ID`) and the reply's `RELOAD_ACTIONS_PERFORMED` as `Performed`; four request goldens captured from iproute2 6.19.0 (refused with EPERM after the bytes were on the wire, like the other SET captures). Not done: the `DEV_STATS`/`RELOAD_STATS` counters (see §5) and `NETNS_*` through the CLI-style name lookup (the caller passes the pid/fd/id). Was: `devlink dev reload` is the routine step after a firmware flash or a
-   `driverinit` parameter change; a fleet agent that sets params cannot apply them. Effort: small (command
-   plus `ACTION`/`LIMIT` and the netns attributes). Needs a destructive-op guard, see §5.
-2. **Flash update** (survey 2026-09-30) — `devlink dev flash` plus the `FLASH_UPDATE_STATUS` progress
-   stream is the main reason an operator uses devlink on a NIC. Effort: medium (request plus stream decoding).
-3. **Port functions and `PORT_NEW`/`PORT_DEL`** (survey 2026-09-30) — SF/VF provisioning; vishvananda/netlink
-   already has it. Effort: medium. Continues backlog item 4 above.
-4. **Rate objects** (survey 2026-09-30) — VF/SF rate limiting. Effort: medium-large.
-5. **Health diagnose/dump/set (FMSG decoder)** (survey 2026-09-30) — see backlog item 5. Effort: medium.
-6. **Traps / trap groups / policers, shared buffers, dpipe, selftests, linecards** (survey 2026-09-30) —
-   switch-ASIC territory (mlxsw); low user count. Effort: large each.
 
 ## Anchoring
 
@@ -470,4 +453,3 @@ Ranked; each is reachable through `Devlink.raw` today. All fit CONVENTIONS §2 (
 
 **What the tests actually contain.** goldens captured from real devlink binary + kernel via strace, goldens.zig
 
-**How it got there.** The anchoring work landed. CLOSED 2026-08-08 (wave-2 F1). The finding's own reproducer was that a CONSISTENT mutation of a reply-only constant (ATTR.PORT_FLAVOUR 77 -> 200) left the whole suite GREEN, because the constructed golden and the decoder read the same symbol. All eight object replies -- device, port, parameter, resource tree, region, chunked region read, health reporter, info -- are now real captures from a live netdevsim, and that same mutation is RED: exit 1, 1/141 fail, caught only by the captured port test. A second, structural mutation (ATTR.RESOURCE_LIST 63 -> 163) gives exit 1, 2/142 fail. GETTING netdevsim WAS THE WHOLE PROBLEM and the answer is worth recording: it is shipped by NO Debian and NO OpenWRT package -- Debian sets CONFIG_NETDEVSIM in neither its cloud nor its generic kernel (both checked empirically in the guest, plus a packages.debian.org contents search for the filename: no results), and OpenWRT 25.12.4 x86/64 has no kmod-netdevsim among its 1173 kmods. So it was built from the kernel's own sources out of tree (drivers/net/netdevsim @ v6.12.96, matching the guest kernel exactly) against the guest's own linux-headers, inside a throwaway -snapshot boot that was discarded; `modprobe psample` first, or insmod fails on Unknown symbol. The build toolchain is deliberately NOT in scripts/vm/manifest.sh: the lane's value is that it gives real root once, and what is committed is frozen bytes that decode on any machine with no VM, no kernel module and no privilege. The oracle is not the bytes alone: iproute2 6.19.0's own devlink binary decoded the same replies in the same run, and every assertion is read off its transcript (netdevsim/netdevsim1; ports eni1np1/eni1np2 flavour physical port 1/2; max_macs generic driverinit 32 and test1 driver-specific driverinit true; dummy region size 32768 snapshot [0] max 16; the 32 region-read bytes iproute2 hexdumped; reporters empty and dummy both healthy; driver netdevsim fw.mgmt 10.20.30 running and stored; the IPv4/IPv6/nexthops resource tree with occ 9/3/9/2/1). TWO DISAGREEMENTS FOUND, both pinned rather than smoothed over: (i) a param dump is answered with PARAM_GET (38) and a region dump with REGION_GET (42), NOT with PARAM_NEW (40)/REGION_NEW (44) the way the device and port dumps answer with NEW/PORT_NEW -- which is what the constructed goldens assumed. Harmless today because client.params/regions parse every message rather than filtering on the reply command, but a future 'tighten the dump loop by checking the command' would have returned nothing on real hardware; (ii) INFO_DRIVER_NAME arrives AFTER the version nests, not before. Also confirmed against the kernel rather than against our own fixture: REGION_SNAPSHOTS/REGION_SNAPSHOT are sent WITHOUT NLA_F_NESTED, a flag param's true is a zero-length PARAM_VALUE_DATA, and the kernel OMITS graceful_period/auto_recover on a reporter that has none rather than sending zeros. The constructed goldens were kept, not replaced: netdevsim has no VF representor ports, no tripped health reporter, no pending firmware update and no out-of-order chunked region read, so they remain the only coverage of those shapes. REMAINING, same recipe, not blocked: a tripped health reporter (HEALTH_REPORTER_TEST trips netdevsim's `dummy` on demand), a PARAM_SET request golden (iproute2 would not emit one without a device, and now there is one), and a notification on the config group.
