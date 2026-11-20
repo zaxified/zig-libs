@@ -219,14 +219,13 @@ test "unaccent: titlecase digraphs keep both letters (UR-1)" {
     // Dž Lj Nj Dz (U+01C5 U+01C8 U+01CB U+01F2) are named "LATIN CAPITAL LETTER D WITH SMALL LETTER Z
     // WITH CARON" and have only a compatibility decomposition; the name rule used to fold them to
     // their first letter (D L N D), silently dropping the second letter. They keep both letters:
-    // since 2026-11-10 expanded to Dz Lj Nj Dz (they stayed untouched before; the next test).
+    // expanded to Dz Lj Nj Dz (they stayed untouched before; the next test).
     try expectUnaccent("\u{1C5}\u{1C8}\u{1CB}\u{1F2}", "DzLjNjDz");
 }
 
 test "unaccent: the twelve Latin digraphs DZ LJ NJ expand like Latin-ASCII (UR-1 follow-up)" {
     // U+01C4-01CC and U+01F1-01F3: capital, titlecase and small shape of each digraph, two ASCII
-    // letters in the same shape. (Before 2026-11-10 they stayed as they were; UR-1 left the
-    // expansion to the owner, who chose parity with Latin-ASCII.)
+    // letters in the same shape.
     const cases = [_]struct { cp: u21, want: []const u8 }{
         .{ .cp = 0x1C4, .want = "DZ" }, .{ .cp = 0x1C5, .want = "Dz" }, .{ .cp = 0x1C6, .want = "dz" },
         .{ .cp = 0x1C7, .want = "LJ" }, .{ .cp = 0x1C8, .want = "Lj" }, .{ .cp = 0x1C9, .want = "lj" },
@@ -248,7 +247,7 @@ test "unaccent: the twelve Latin digraphs DZ LJ NJ expand like Latin-ASCII (UR-1
 }
 
 test "unaccent: letters without WITH in their name fold like Latin-ASCII (eng, kra, long s, ...)" {
-    // A consumer's report 2026-11-13: ŋ Ŋ (LATIN SMALL/CAPITAL LETTER ENG) stayed; the name rule only
+    // A consumer's report: ŋ Ŋ (LATIN SMALL/CAPITAL LETTER ENG) stayed; the name rule only
     // knew "<X> WITH ...".
     try expectUnaccent("ŋ Ŋ", "n N");
     try expectUnaccent("Ŋaŋ ĸ ſ ẛ ɛ Ɛ ʉ Ʉ ɡ Ɩ Ɖ", "Nan q s s e E u U g I D");
