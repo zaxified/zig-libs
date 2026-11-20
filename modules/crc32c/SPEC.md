@@ -6,7 +6,7 @@
 
 **Scope:** parity — Go `hash/crc32` Castagnoli + google/crc32c 1.1.2 (surveyed 2026-09-30)
 
-**Audit:** review 2026-10-04 · mutation 2026-10-04 (32/33) · src ?
+**Audit:** review 2026-10-04 · mutation 2026-11-20 (56/60, 3 eq) · src 1cd289aadcbe6255
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, CRC32C_FUZZ) · ct n/a — checksum only (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: nothing to fix; edge cases pinned)
 
@@ -126,7 +126,7 @@ None: every length, every alignment (loads are unaligned `readInt`s), and
 - **Instruction count:** `tools/count.tsv` holds the cost per 4 KiB round for `scripts/count-insns` (`src/count.zig`).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. The one
   survivor of that run is CPUID bit 30 for bit 20 (alive only because the test host has both RDRAND and
-  SSE4.2; the bit number is the SDM's).
+  SSE4.2; the bit number is the SDM's). The delta over the inline-asm block (27 mutants: `X86.block3`'s seeds, start index, the three end-of-block bases and the three stores; `threeWay`'s block threshold, advance, joins, tail steps and the dispatch to the block) has 24 killed and 3 equivalent, all cost-only: the block and tail thresholds at `>` (the bytes left over take the next path, which gives the same checksum) and the plain loop in place of the asm block (the same value, only the code layout differs). The asm text and its comptime clobbers are not mutated; the plain loop is compiled out on x86-64 LLVM and is covered by the arm64 and self-hosted runs.
 - **Bench:** `zig build bench-crc32c` (`tools/bench.zig`) against Go `hash/crc32` Castagnoli (`tools/go_bench`).
 
 ## Performance
@@ -148,8 +148,6 @@ self-hosted backend, and arm64 (unaffected), keep the plain loop.
 - **Other polynomials.** Refused: std's generic `Crc` has them.
 
 ## Open
-
-- No mutation run is recorded for `X86.block3`, added after the whole-module run.
 
 - A caller wanting to force the table path (benchmarks, bit-exact audits)
   uses `hashWith(.table, …)`; there is no global override.
