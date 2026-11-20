@@ -53,8 +53,8 @@ pub const VoteReq = struct {
     /// `timeout_now`): receivers honour it inside a CheckQuorum lease
     /// (etcd/raft's `campaignTransfer` context, hashicorp/raft's
     /// `RequestVoteRequest.LeadershipTransfer`). Wire: an optional 26th byte
-    /// (= 1), present only when set, so a frame without it is the 25-byte
-    /// RequestVote of before; an older decoder refuses the longer
+    /// (= 1), present only when set, so a frame without it is the plain 25-byte
+    /// RequestVote; an older decoder refuses the longer
     /// frame. Never sent, and refused, on `pre_vote_req` (a transfer never
     /// pre-votes).
     transfer: bool = false,
