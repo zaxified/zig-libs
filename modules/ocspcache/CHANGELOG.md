@@ -6,16 +6,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: the private `runBounded` copy (and `readAllAllocFn`) is gone; `httpFetch` bounds the body read with `http.Client.Response.readAllAllocTimeout` (the same deadline, `error.Timeout` at it, `error.Canceled` when the calling task is canceled, an unbounded read when there is no concurrency or `body_timeout_ms == 0`). Tests unchanged. Delta mutation of the new call and the `Timeout` arm of `mapReadAllAllocError`; card counts and hash re-taken.
-- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: whole-module mutation (the 2026-09-10 run was never itemized): 89 more mutants over `root.zig`, 35 survived the first run and 17 tests were added (corrupt/truncated certificate, AIA tag checks, scheme case, the GET URL exact, eviction boundary, a loopback server for what `httpFetch` puts on the wire, what `refresh` hands the transport and how it maps a transport failure, non-200 statuses, a response of another type, a full cache with an expired entry). Card counts are now the whole module (102/105, 3 eq); the test `MockTransport` gains recording fields. Tests only.
-- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: delta mutation of the export/import code (16 mutants, all killed after one added test: 24 synthetic entries pin the export order); card counts and hash re-taken.
 - **2026-11-17** — optional persistence of cached staples: `Cache.exportEntries`, `Cache.freeExported`, `Cache.subjectKey`, `Cache.Exported` and `Cache.importStaple`. Import re-verifies the stored response through the same path as a fetched one (`ocsp.verify` against the issuer and `now_unix`; stale, tampered, foreign and revoked responses are refused as in `refresh`), recomputes the expiry and never trusts a stored one. No I/O; additive. `refresh`'s steps after the fetch moved into a private `verifyAndStore` that both calls share; behaviour unchanged. Tests: round trip into a second cache with a dead transport, expiry boundary of the export, every refusal, allocation-failure sweep.
 - **2026-10-18** — Ported to Zig 0.17.0. Test-only `ReadCueIo` overrides `vtable.operate` and counts `.net_read`. No behaviour change.
 - **2026-10-09** — tests: deterministic fuzz driver `OCSPCACHE_FUZZ` over the existing harnesses (`aia`, `refresh`); `refresh` checks the genuine captured response is accepted and an altered one refused.
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The two `httpFetch` cancel tests (connect/head wait, body wait) canceled after a fixed
-  sleep. They now cancel once the client is inside the socket read under test (`ReadCueIo`, a
-  `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
-  before `join`. On a loaded full gate the sleep could land the cancel before the connect. The
-  peer thread then waited in `accept` forever, the shape that hung `http` in full-gate attempt 3.
 
 - **2026-09-10** — **BEHAVIOURAL, not breaking: a responder that answers a head and then
   sends no body no longer parks `refresh` forever (F2).** `httpFetch`'s response-BODY

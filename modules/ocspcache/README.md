@@ -8,30 +8,23 @@ query the CA itself — this module is the feeder that keeps that cache warm;
 embedding the response into the TLS handshake itself is the server's job,
 not this module's (see SPEC.md "Scope").
 
-**Status: implemented.** `discoverResponderUrl` extracts the OCSP responder
-URL from a certificate's Authority Information Access extension (RFC 5280
-§4.2.2.1). `Cache.refresh` builds a request (`ocsp.buildRequest`), fetches it
-through an injectable `Transport` (POST by default, RFC 6960 §4.2.1; or the
-GET form, Appendix A.1.1), and — only if `ocsp.verify` accepts the response
-**and** its status is `good` — caches the raw bytes; every other outcome
-(unreachable responder, `tryLater`, a bad signature, an `unknown` status) is a
-typed error that leaves any existing cache entry untouched — the soft-fail
-posture. ⚠ **`revoked` is the exception, and deliberately so:** it is an
-authenticated answer rather than an absence of one, so it EVICTS the cached
-entry and returns `error.CertRevoked`. (This paragraph said "revoked/unknown …
-untouched" until 2026-09-03, contradicting both the code and the example thirty
-lines below it, which already said the entry had been evicted.) `Cache.getStapled` serves the cached DER while it's
-genuinely still valid; `Cache.needsRefresh` tells a scheduler when to call
-`refresh` again, ahead of actual expiry. `zig build test-ocspcache` (Debug +
-ReleaseFast) covers AIA discovery (present/absent/malformed),
-a full fetch→verify→cache→serve round trip via a mock transport (no
-network), the proactive-margin vs. hard-expiry distinction, a tampered
-response never being cached, a `tryLater` response being soft-failed while
-the prior good entry keeps serving, a non-200 HTTP status, a
-certificate with no AIA entry, the GET-form path, and the cache-size bound —
-plus (`goldens.zig`) a real fetch→verify→cache round trip against a live-CA
-delegated OCSP response and a real Authority Information Access extension.
-See SPEC.md "Real captured fixture".
+`discoverResponderUrl` extracts the OCSP responder URL from a certificate's
+Authority Information Access extension (RFC 5280 §4.2.2.1); only `http://` and
+`https://` locations count. `Cache.refresh` builds a request (`ocsp.buildRequest`),
+fetches it through an injectable `Transport` (POST by default, RFC 6960 §4.2.1;
+or the GET form, Appendix A.1.1; redirects are not followed, a response body is
+read under a size bound and a deadline), and — only if `ocsp.verify` accepts the
+response **and** its status is `good` — caches the raw bytes. Every other
+outcome (unreachable responder, `tryLater`, a bad signature, an `unknown`
+status) is a typed error that leaves any existing cache entry untouched — the
+soft-fail posture. ⚠ **`revoked` is the exception, and deliberately so:** it is
+an authenticated answer rather than an absence of one, so it EVICTS the cached
+entry and returns `error.CertRevoked`. `Cache.getStapled` serves the cached DER
+while it's genuinely still valid; `Cache.needsRefresh` tells a scheduler when to
+call `refresh` again, ahead of actual expiry. `scripts/modtest ocspcache` runs
+the offline tests (mock transport, a loopback server for the HTTP adapter, and
+a real fetch→verify→cache round trip against a live-CA delegated OCSP
+response); see `SPEC.md` "Verification".
 
 ```zig
 const ocspcache = @import("ocspcache");
@@ -43,7 +36,7 @@ defer client.deinit();
 
 var cache = ocspcache.Cache.init(gpa, ocspcache.httpTransport(&client), .{
     // defaults: POST, 64 KiB response bound, 24h max-age fallback,
-    // 12h refresh-ahead margin, 64 distinct certs.
+    // 12h refresh-ahead margin, 64 distinct certs, 10 s body deadline.
 });
 defer cache.deinit();
 
@@ -95,21 +88,28 @@ if (try cache.getStapled(handshake_gpa, my_leaf_cert_der, now_unix)) |ocsp_respo
     refused as `refresh` would), so nothing read back is trusted.
 - `Config` — `hash` (CertID hash algo), `fetch_method` (`.post`/`.get`),
   `max_response_bytes`, `max_age_seconds`, `refresh_margin_seconds`,
-  `max_entries`.
+  `max_entries`, `body_read_timeout_ms` (deadline for the response body,
+  `0` = none).
+  - `Cache.evictExpired(now_unix) usize` — drops entries past their
+    `nextUpdate` (`refresh` does this itself before refusing with `CacheFull`).
 - Error sets `DiscoverError`, `FetchError`, `RefreshError` — every failure
   mode is typed (no responder URL, malformed DER, transport failure,
-  oversized response, non-200, unsuccessful OCSP status, verify failure,
-  non-good status, cache full).
+  cancellation, body timeout, oversized response, non-200 (a redirect
+  included), unsuccessful OCSP status, verify failure, non-good status, cache
+  full).
 
 - **Model after:** RFC 6960 §4.2.2 (OCSP over HTTP) + RFC 5280 §4.2.2.1
   (Authority Information Access); the nginx/Apache OCSP-stapling soft-fail
   posture. Built on this repo's `ocsp` (request/verify), `http` (fetch), and
   `x509` (bounds-safe DER reader) modules.
-- **Deferred, by design:** embedding the cached response into the TLS
-  handshake (the consuming server's job), CRL-based revocation, multi-
-  responder failover, and any background scheduler loop (this module has no
-  timers/threads/system clock — `now_unix` is always caller-supplied). See
-  `SPEC.md`.
+
+## Not provided
+
+Embedding the cached response into the TLS handshake (the consuming server's
+job), CRL-based revocation, multi-responder failover, HTTP cache headers and any
+background scheduler loop (this module has no timers/threads/system clock —
+`now_unix` is always caller-supplied). See `SPEC.md` "What is deliberately not
+done".
 
 Provenance: clean-room from RFC 6960 §4.2.2 and RFC 5280 §4.2.2.1 (both
 public IETF specifications). See `SPEC.md`.

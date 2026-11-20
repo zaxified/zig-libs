@@ -22,7 +22,7 @@ refreshing. See [README.md](README.md) for the API and a usage example.
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module come from its SPEC ("Deferred") and `rg` over `src/root.zig` (no persistence, no scheduler, no retry, one URL per certificate). Competitor feature claims are *(inferred)* from prior knowledge of their public docs; no foreign source was read. The Rust world has no comparable stapling feeder that the survey found *(inferred)*.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module come from its SPEC ("What is deliberately not done") and `rg` over `src/root.zig` (no scheduler, no retry, one URL per certificate; persistence is export/import). Competitor feature claims are *(inferred)* from prior knowledge of their public docs; no foreign source was read. The Rust world has no comparable stapling feeder that the survey found *(inferred)*.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | Nothing: no OCSP, no stapling. |
 | rustls | Rust | (see `tlsclient`) | — | — | Takes a staple as opaque bytes in `CertifiedKey`; fetching and refreshing is left to the application *(inferred)*. |
 
-**Where we are ahead:** of Zig `std`, the only stapling feeder available; verify-before-cache is enforced structurally (the map is mutated in one place), a verified `revoked` evicts the entry, copies are caller-owned, all bounded (`max_entries`, `max_response_bytes`), and an injectable `Transport` keeps it testable with no network. **Where we are behind:** no scheduler (by design: the caller owns timers, `now_unix` is a parameter) and no I/O of its own, with export/import for the caller to persist staples, no HTTP cache-header use, no responder failover, no must-staple handling, and everything inherits `ocsp`'s signature-algorithm gaps (no Ed25519/P-521; ECDSA P-384 is supported since 2026-09-30).
+**Where we are ahead:** of Zig `std`, the only stapling feeder available; verify-before-cache is enforced structurally (the map is mutated in one place), a verified `revoked` evicts the entry, copies are caller-owned, all bounded (`max_entries`, `max_response_bytes`), and an injectable `Transport` keeps it testable with no network. **Where we are behind:** no scheduler (by design: the caller owns timers, `now_unix` is a parameter) and no I/O of its own, with export/import for the caller to persist staples, no HTTP cache-header use, no responder failover, no must-staple handling, and everything inherits `ocsp`'s signature-algorithm gaps (no Ed25519/P-521; ECDSA P-384 is supported).
 
 ## Scope
 
@@ -60,7 +60,13 @@ module exposes it — so this module walks it locally, on the same bounds-safe
 primitive (`x509.extensions.parseElement`) `ocsp` and `x509` themselves use.
 It looks for an `AccessDescription` whose `accessMethod` is `id-ad-ocsp`
 (`1.3.6.1.5.5.7.48.1`) and whose `accessLocation` is a
-`uniformResourceIdentifier [6]` `GeneralName`; the first match wins. A
+`uniformResourceIdentifier [6]` `GeneralName` with an `http://` or `https://`
+scheme (ASCII case-insensitive, slashes required); the first such match wins.
+An `id-ad-ocsp` entry whose location is not a URI or has another scheme
+(`file:` …) is skipped like no entry, not an error: a URI is an arbitrary
+IA5String, and `refresh` hands the result to the transport, so a caller that
+ever ran this over a peer-supplied certificate would otherwise let the peer aim
+the fetch at an internal host or a cloud metadata endpoint (SSRF). A
 certificate with no v3 extensions, no AIA extension, or an AIA extension with
 no OCSP entry yields `null` — a legitimate "no stapling available for this
 cert" outcome, not an error. A structurally malformed AIA extension (hostile
@@ -80,8 +86,21 @@ context-pointer + function-pointer pair (the same by-hand vtable idiom
   and the DER request as the body (RFC 6960 §4.2.1), or `GET` with the
   base64url-ish path form (`buildGetUrl`, RFC 6960 Appendix A.1.1, reserved
   base64 characters percent-encoded). The response body is read via
-  `Response.readAllAlloc` bounded by `FetchRequest.max_response_bytes` — an
-  oversized reply is `error.ResponseTooLarge`, never buffered unbounded.
+  `Response.readAllAllocTimeout` bounded by `FetchRequest.max_response_bytes`
+  — an oversized reply is `error.ResponseTooLarge`, never buffered unbounded —
+  and, when `FetchRequest.body_timeout_ms` is non-zero, by that deadline
+  (`error.Timeout`; `Cache.refresh` sets it from `Config.body_read_timeout_ms`,
+  default 10 s, because `http.Client`'s own timeout covers the head and not the
+  body, and a responder that sends a head and then nothing would park the read).
+  A cancelled fetch is `error.Canceled`, kept apart from `TransportFailed`;
+  with no unit of concurrency to race the read, the body is read unbounded
+  rather than refused. A hand-written `Transport` may ignore the deadline, and
+  `refresh` re-checks the size ceiling itself.
+- **Redirects are not followed** (`follow_redirects = false`): the responder
+  does not get to choose where the fetch goes (the OCSP URL is cleartext
+  `http://`, so an on-path attacker could otherwise inject a redirect, and a
+  307/308 would replay the request body there). A redirect arrives as a
+  non-200 status and is `ResponderHttpError`, the posture of the sibling `rdap`.
 - **Tests**: a mock `Transport` returns a canned, pre-verified-fixture
   response, so `Cache.refresh`'s full verify-before-cache path is exercised
   without a network dependency (see "Fixture provenance" below and the
@@ -120,10 +139,12 @@ a step:
    the two apart — and apart from a mere outage — from the error alone.
 7. `Config.max_entries` bounds the number of distinct certificates cached
    (`CacheFull`) — a production TLS server serves a handful of its own
-   certificates, not an open-ended set.
+   certificates, not an open-ended set. On a full cache, entries already past
+   their `nextUpdate` (which `getStapled` reports as absent) are reclaimed
+   first (`Cache.evictExpired`, also public), so dead entries never hold a slot.
 
-Every one of steps 1–7 that fails returns a typed `RefreshError` and touches
-**nothing** in the cache — see "Soft-fail" below.
+Every one of steps 1–7 that fails returns a typed `RefreshError` and leaves
+every servable entry in the cache — see "Soft-fail" below.
 
 ## Expiry: `nextUpdate` + refresh-ahead margin
 
@@ -152,9 +173,11 @@ A responder outage, a `tryLater`, a malformed reply, an `unknown` status, or
 a single unverifiable fetch must never evict a still-valid cached response — that
 would turn a transient responder problem into an unnecessary stapling
 outage. `Cache.refresh` enforces this structurally, not by exception
-handling: the cache map (`entries`) is mutated in exactly one place, at the
-very end of `refresh`, after every check above has already succeeded. Every
-early return leaves `entries` untouched. `getStapled` and `needsRefresh`
+handling: bytes enter the cache map (`entries`) in exactly one place, at the
+very end of `verifyAndStore` (shared by `refresh` and `importStaple`), after
+every check above has already succeeded. Every early return leaves `entries`
+untouched; the only removals are a verified `revoked`, `invalidate` and
+`evictExpired` (which drops only entries `getStapled` already reports absent). `getStapled` and `needsRefresh`
 never call `refresh` themselves and never look at the last `refresh`
 outcome — they only ever look at what's actually in the cache and
 `now_unix`. Concretely: if `refresh` fails at 2pm but the cache still holds
@@ -249,82 +272,32 @@ doc-comment recording exactly what each one is and how it was made — real
 signatures over real DER, verified by the real `ocsp.verify`, with no
 network and no third-party certificate involved.
 
-Covered: AIA discovery (present → URL; absent → `null`, never an error;
-several malformed-DER shapes → `Malformed` or a safe `null`, never a panic);
-a full fetch→verify→cache→serve round trip via a mock `Transport`; the
-`needsRefresh` proactive-margin flip versus `getStapled`'s hard
-actual-expiry cutoff, checked as two distinct instants; a tampered response
-(bad signature) never cached; a `tryLater` response soft-failed while the
-prior good entry keeps serving; a non-200 HTTP status soft-failed; a
-certificate with no AIA entry rejected before ever calling the transport;
-the GET-form request path; and `Config.max_entries` rejecting a second
-distinct certificate once the bound is reached without disturbing the first.
+## Real captured fixture (`goldens.zig`)
 
-## Real captured fixture (`goldens.zig`, added 2026-08-01)
+The fixtures above are all CONSTRUCTED — an offline generator, never a real CA — and their `CertID`s are SHA-256-hashed like `ocsp`'s own constructed fixtures. `goldens.zig` adds a real, live-captured round trip reusing the GoDaddy capture documented in `ocsp`'s own `SPEC.md`/`goldens.zig` (delegated responder, real AIA extension, SHA-1 `CertID`): `discoverResponderUrl` against the real leaf certificate's actual Authority Information Access extension (resolves `http://ocsp.godaddy.com/`, independently confirmed via `openssl x509 -text`), and a full `Cache.refresh` → verify (delegated responder, real 4096-bit RSA responder key) → cache → `getStapled` round trip via a mock `Transport` that returns the real captured response bytes verbatim. `now_unix` is pinned to a fixed instant inside the response's real `[thisUpdate, nextUpdate]` window, never the wall clock. It is the one test here that exercises a SHA-1 `CertID` against a real responder.
 
-The fixtures above (this file's earlier "Fixture provenance" section) are all
-CONSTRUCTED — an offline generator, never a real CA — and their `CertID`s are
-SHA-256-hashed like `ocsp`'s own constructed fixtures. `goldens.zig` adds a
-real, live-captured round trip reusing the GoDaddy capture documented in
-`ocsp`'s own `SPEC.md`/`goldens.zig` (delegated responder, real AIA
-extension, SHA-1 `CertID`): `discoverResponderUrl` against the real leaf
-certificate's actual Authority Information Access extension (resolves
-`http://ocsp.godaddy.com/`, independently confirmed via
-`openssl x509 -text`), and a full `Cache.refresh` → verify (delegated
-responder, real 4096-bit RSA responder key) → cache → `getStapled` round trip
-via a mock `Transport` that returns the real captured response bytes
-verbatim. `now_unix` is pinned to a fixed instant inside the response's real
-`[thisUpdate, nextUpdate]` window, never the wall clock.
+Attribution: none required (same reasoning as `ocsp`'s `NOTICE` — a black-box compatibility test oracle, CONVENTIONS.md §5 / root NOTICE §0). `ocspcache` has no module-local `NOTICE` file of its own (nothing here ports third-party source or a design reference), so this note lives in SPEC.md only.
 
-A shared-root-cause teeth-check: re-applying the same mutation used for
-`ocsp`'s own teeth-check (dropping the SHA-1 arm of `hashAlgoFromOid` in
-`ocsp/src/root.zig`) turns exactly the real-fixture `Cache.refresh` test red
-(`VerifyFailed` ← `CertIdMismatch`) while every constructed-fixture
-test in `ocspcache_test.zig` — and the other two real-fixture tests, which
-don't touch `CertID` verification — stay green. The blind spot in `ocsp`
-propagates transitively through this module's dependency, and only the real
-captured response in `ocspcache`'s own suite catches it.
+## What is deliberately not done
 
-Attribution: none required (same reasoning as `ocsp`'s `NOTICE` — a
-black-box compatibility test oracle, CONVENTIONS.md §5 / root NOTICE §0); no
-root NOTICE change accompanies this addition. `ocspcache` has no
-module-local `NOTICE` file of its own (nothing here ports third-party source
-or a design reference), so this note lives in SPEC.md only.
+- **TLS handshake stapling wire integration** (RFC 6066 `status_request`): the consuming TLS server's job (see *Scope*).
+- **HTTP cache headers** (`Cache-Control` / `Expires` on the responder's HTTP response, which a caching layer in front of the responder could honour): this module relies solely on the OCSP `nextUpdate` field, the authoritative signal RFC 6960 defines.
+- **Multi-responder / CDN failover:** `refresh` fetches from exactly the one URL AIA names; a caller wanting fallback responders composes that above this module.
+- **A background scheduler loop:** `needsRefresh` / `refresh` are the primitives; running them on a timer is the consuming application's job (this module has no threads, no timers, no system clock).
+- **CRL-based revocation:** a revocation learned out of band goes in through `Cache.invalidate`.
 
-## Audit 2026-11-17 (whole-module mutation)
+## Verification
 
-The 2026-09-10 run was never itemized, so the card now counts a whole-module run. 105 mutants in total: the 16 of the export/import delta (below) and 89 over the rest of `root.zig`, ReleaseSafe, one schemata build per round, each mutant under `setsid -w timeout` and `ulimit -v`.
+- **Run:** `scripts/modtest ocspcache` (offline; the `httpFetch` tests use a loopback server).
+- **Test classes** (`src/ocspcache_test.zig`, constructed fixtures; `src/root.zig` for the private pieces): AIA discovery (present, absent and `caIssuers`-only give a URL or `null`, never an error; non-URI and non-http(s) entries skipped in favour of a later valid one; truncated and hostile DER give `Malformed` or a safe `null`, never a panic; every tag check and the scheme case); a full fetch → verify → cache → serve round trip through a mock `Transport`; `needsRefresh`'s proactive-margin flip versus `getStapled`'s hard `nextUpdate` cutoff, as two distinct instants; a tampered response never cached; `tryLater` and non-200 statuses soft-failed while the prior entry keeps serving; a verified `revoked` evicting and being a different error from `unknown`; no AIA entry rejected before the transport is called; the GET form (exact URL byte for byte, no body); `max_entries` and expired-entry reclaim; what `refresh` hands the transport (deadline, ceiling, hash, both methods) and every transport error name; the staple a caller holds surviving the next refresh; export/import (a restart serves the same staples, export order by key, import re-verifies and every refusal leaves the cache untouched, every allocation failure clean); `httpFetch` (POST body and content type, GET without, redirects not followed, ceiling, body deadline and its positive control, cancellation, allocation failure, no-concurrency fallback); `nextUpdateFor` both arms.
+- **External anchor:** `src/goldens.zig` — a real `www.godaddy.com` leaf and issuer and the real OCSP response its responder returned (see *Real captured fixture*), through discovery and fetch/verify/cache. The constructed fixtures are NOT captured from a public source (see *Fixture provenance*), so that half is self-anchored.
+- **Fuzz:** deterministic driver prefix `OCSPCACHE_FUZZ` (`OCSPCACHE_FUZZ=<runs>[,<first seed>]`), harnesses `aia` (the responder-URL walk never panics) and `refresh` (a hostile responder body never panics; the genuine captured response is accepted and an altered one refused); reach and corpus-count tests run in every test run.
+- **Mutation:** the whole-module run covers `root.zig` (the AIA walk, `httpFetch`, `buildGetUrl`, `Cache`, `refresh`, `verifyAndStore`, export/import). Not mutated: the `follow_redirects = false` flag (pinned by the redirect test) and the allocation-failure arms of `refresh` and `buildGetUrl` (arid). `Config.max_age_seconds` handed to `ocsp.verify` is unobservable here: it matters only for a response without `nextUpdate`, and a signed one needs the RSA signer outside this module's graph (`nextUpdateFor` is tested directly and `ocsp` tests its own bound). `Entry.this_update_unix` is stored and nothing reads it (a test pins the stored value).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-- **Delta (16).** `exportEntries` (the expiry compare at its boundary and dropped, the exported expiry and key, the sort comparator flipped and constant, the three cleanup paths of the error unwind), `freeExported` (each of its two frees), `subjectKey`, `importStaple` (the size bound at its boundary and dropped, subject and issuer swapped) and `refresh`'s call into `verifyAndStore` (subject and issuer swapped). One survivor (the comparator made constant: the two real fixtures iterate in key order) was killed by a test over 24 synthetic entries. 16 killed.
-- **Rest (89).** The AIA walk (both error arms of `discoverResponderUrl`, the extension id test, each tag check and the accessMethod OID compare, the scheme allow-list: ASCII case, `http:` without slashes), `httpFetch` (method, content-type header, body, the body-deadline switch and its value, each error arm of the read, the no-concurrency fallback), `runBounded` (the expiry compare, the cancel path), `buildGetUrl` (the slash join and each percent-encoding arm), `Cache` (`deinit`, `getStapled`, `evictExpired` at its boundary, `invalidate`, `needsRefresh` at its boundary, `nextUpdateFor`), `refresh` (the Malformed / NoResponderUrl split, the CertID hash, the method switch, what is handed to the transport, each transport-error mapping, the size ceiling, the HTTP 200 test) and `verifyAndStore` (each refusal, the verify arguments, the three status arms, the full-cache path with its eviction, the unwind, the stored fields). First run: 52 killed, 2 hung (counted killed), 35 survived. Every survivor was a missing test; 17 tests were added: the corrupt and truncated certificate, the three tag checks, scheme case, the GET URL byte for byte, the eviction boundary, a loopback server for what `httpFetch` sends (POST body and content type, GET without), a body over the ceiling, an allocation failure, a late body inside the deadline, no concurrency available, a cancel inside the bounded read, what `refresh` hands the transport (deadline, ceiling, hash, both methods), every transport error name, the non-200 statuses, a response of another type, and a full cache with an expired entry. Second run: 86 killed, 3 survive, argued equivalent below.
-- **Equivalent / unobservable (1).** `Config.max_age_seconds` handed to `ocsp.verify`: it matters only for a response without `nextUpdate`, and a signed one needs the RSA signer outside this module's graph; `nextUpdateFor` (the arm that uses it) is tested directly, and `ocsp` tests its own bound. (The two other equivalents of the whole-module run were `runBounded`'s `<= 0` compare, deleted with the copy, and `mapReadAllAllocError`'s `Timeout` arm, which the move to `Response.readAllAllocTimeout` made reachable and killed, see the delta below.)
-- **Not mutated.** The `follow_redirects = false` flag (pinned by the redirect test), allocation-failure arms of `refresh` and `buildGetUrl` (arid). `Entry.this_update_unix` is stored and nothing reads it (a test pins the stored value, so the mutant of it is killed).
-- **Delta, bounded body read (3).** `httpFetch` now reads the body with `http.Client.Response.readAllAllocTimeout` instead of a private `runBounded` copy: the timeout handed over (forced to 0, so unbounded: HANG, the F2 test never finishes), the size ceiling handed over (unbounded: killed by the body-over-ceiling test) and the `Timeout` arm of `mapReadAllAllocError` (to `TransportFailed`: killed by the F2 test, which now takes this arm). 3 killed, 0 survived, ReleaseSafe, one build. The mutants of the deleted `runBounded` were never itemized and stay in the cumulative counts.
-- Cards: `mutation 2026-11-17 (105/106, 1 eq)`.
+## Backlog / deferred
 
-## Deferred (out of scope, not silently skipped)
-
-- **TLS handshake stapling wire integration** (RFC 6066 `status_request`) —
-  the consuming TLS server's job.
-- **OCSP-stapling for the GET-form response cache-control interplay** (some
-  responders publish `Cache-Control`/`Expires` on their HTTP response, which
-  a caching HTTP layer in front of the responder could honor) — this module
-  relies solely on the OCSP `nextUpdate` field, the authoritative signal RFC
-  6960 defines; HTTP-level cache headers are not consulted.
-- **Multi-responder / CDN failover** — `refresh` fetches from exactly the
-  one URL AIA names; a caller wanting fallback responders composes that
-  above this module.
-- **A background scheduler loop** — `needsRefresh`/`refresh` are the
-  primitives; running them on a timer is the consuming application's job
-  (this module has no threads, no timers, no system clock).
-
-## Status
-
-Implemented: AIA-based responder discovery, an injectable fetch `Transport`
-(POST priority + GET form + an `http`-backed production adapter), and a
-`Cache` (`getStapled` / `needsRefresh` / `refresh`) with verify-before-cache
-and the soft-fail posture. `zig build test-ocspcache` — green in
-Debug and ReleaseFast.
+None open.
 
 ## Anchoring
 
@@ -334,11 +307,3 @@ Debug and ReleaseFast.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** src/goldens.zig carries a real www.godaddy.com leaf+issuer and the real OCSP response its responder returned, captured 2026-08-01, exercised through fetch/verify/cache; src/ocspcache_test.zig states in its own header that its byte arrays are NOT captured from a public source but constructed via ocsp's der_writer+rsa, so that half stays self
-
-**How it got there.** The anchoring work landed. DONE 6c2d6d9: same real CA fixtures; blind spot shown to propagate through the sibling
-
-## Backlog / deferred
-
-- ~~**Inherits the `ocsp` ECDSA P-384 gap**~~ (survey 2026-09-30) — **fixed in `ocsp` 2026-09-30**; nothing to change here (`refresh` verifies through `ocsp.verify`).
-- **Optional persistence of cached staples across restarts** — DONE 2026-11-17, see "Persistence across restarts".
-
