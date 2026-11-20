@@ -398,7 +398,7 @@ test "saturation never wraps" {
     try testing.expectEqual(@as(i16, 32767), saturateI16(1e30));
 }
 
-// Whole-module mutation audit 2026-11-18: the guards and boundaries of every
+// Whole-module mutation audit: the guards and boundaries of every
 // driver, each at the exact edge.
 test "ramp: a wrapping ramp at its exact maximum stays there; a zero span does not divide" {
     var w = Driver{ .ramp = .{ .start = 0, .per_ms = 1, .min = 0, .max = 10, .wrap = true } };

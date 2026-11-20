@@ -1237,7 +1237,7 @@ test "netsim trace maps onto fleet faults and reports what it cannot map" {
     try testing.expectEqual(@as(usize, 1), echo.restarts);
 }
 
-// ── whole-module mutation audit 2026-11-18 ──────────────────────────────────
+// ── whole-module mutation audit ──────────────────────────────────
 //
 // Each test below pins one behaviour the audit found unobserved: stats
 // counters, boundary lengths, the one-outstanding-tick rule, heal clearing

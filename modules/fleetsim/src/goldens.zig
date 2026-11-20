@@ -240,8 +240,8 @@ test "anchor: Wireshark reads the S7comm adapter's TPKT/COTP Connect Confirm" {
     // adapter answers `.dst_ref = cr.src_ref, .src_ref = 1`, so with both
     // equal the CC's destref/srcref PLACEMENT was not a distinction this
     // vector could express -- swapping the two assignments emitted a
-    // byte-identical frame and the whole suite stayed green (measured
-    // 2026-09-01). Still not discriminated, and worth knowing: the CC's TPKT
+    // byte-identical frame and the whole suite stayed green.
+    // Still not discriminated, and worth knowing: the CC's TPKT
     // length and COTP li are both equal to the CR's, so an implementation
     // that echoed the request's lengths is indistinguishable here too.
     const cr = [_]u8{
@@ -282,7 +282,7 @@ test "anchor: Wireshark reads the EtherNet/IP adapter's RegisterSession reply" {
     std.mem.writeInt(u16, req[2..4], 4, .little);
     // Non-zero on purpose: the encapsulation header's sender context is echoed
     // verbatim, and an all-zero one cannot tell an echo from a device that
-    // drops it. Measured 2026-09-01 -- with the echo removed in
+    // drops it. Measured -- with the echo removed in
     // `modules/enip/src/adapter.zig`, the zero-context fixture stayed GREEN
     // and only the pycomm3 corpus (whose context is `_pycomm_`) caught it.
     @memcpy(req[12..20], "zigfleet");

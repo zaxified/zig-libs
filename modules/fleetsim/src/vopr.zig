@@ -998,7 +998,7 @@ test "vopr: the standalone pump() at the top of onTimer keeps a device's own clo
     try testing.expect(h.probeTicks() <= 45);
 }
 
-// ── whole-module mutation audit 2026-11-18 ──────────────────────────────────
+// ── whole-module mutation audit ──────────────────────────────────
 
 fn replyFrame(buf: []u8, txid: u16, unit: u8, fc: u8, regs: []const u16) []const u8 {
     const bc: usize = regs.len * 2;

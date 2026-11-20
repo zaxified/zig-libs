@@ -1246,7 +1246,7 @@ test "bacnet adapter: trouble moves Reliability, StatusFlags and Out_Of_Service"
     try testing.expect(!obj.find(.out_of_service).?.value.boolean);
 }
 
-// ── whole-module mutation audit 2026-11-18 ──────────────────────────────────
+// ── whole-module mutation audit ──────────────────────────────────
 
 test "modbus adapter: restart clears trouble; a broadcast or a PDU-less frame gets no trouble reply" {
     var holdings = [_]u16{ 0x1111, 0x2222, 0x3333, 0x4444 };

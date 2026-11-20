@@ -79,7 +79,7 @@
 //! redundant rather than weak. The S7 negotiated PDU length (`db2[8]`) used
 //! to be the one genuine echo — the master's own proposal against a device
 //! ceiling equal to it, so `@min` was the identity and the mark graded
-//! nothing (audit F-C). Since 2026-09-15 the session is recorded against a
+//! nothing (audit F-C). Since the session is recorded against a
 //! ceiling of 240, below the master's 480, and the mark grades the
 //! negotiation.
 //!
@@ -911,7 +911,7 @@ test "anchor: replay a real python-snap7 3.1.0 client's recorded session offline
     // The negotiated PDU length, as the CLIENT learned it. The recorded
     // request proposes pdu_length = 0x01E0 = 480; the device's ceiling is
     // 240, so only a responder that really takes `@min(asked, ceiling)`
-    // answers 0x00F0 and gets this mark back. Until 2026-09-15 the ceiling
+    // answers 0x00F0 and gets this mark back. Until the ceiling
     // was also 480, `@min` was the identity, and this literal was a verbatim
     // echo of the master's own number (audit F-C: replacing `@min` with
     // `asked` left the whole suite green). Re-recorded in the VM lane.

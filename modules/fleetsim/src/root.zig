@@ -689,7 +689,7 @@ const fuzzseed = @import("testkit").fuzz;
 /// `fuzzDispatch`'s very first line is `if (input.len == 0) return;`. **The
 /// target built no fleet, added no node and submitted no frame — it returned
 /// before allocating anything, on every run it has ever made.** Measured
-/// 2026-09-07: 1 input, 0 octets, 0 chunks submitted, 0 outbound frames.
+/// 1 input, 0 octets, 0 chunks submitted, 0 outbound frames.
 ///
 /// The inputs below already existed as a separate deterministic test that the
 /// fuzz lane could not see. They are now the target's corpus as well, so the
@@ -983,7 +983,7 @@ test "corpus: every seed reaches the dispatch loop, and the chunks submitted are
         chunks += dispatch_stats.chunks;
         submitted += dispatch_stats.submitted;
     }
-    // Measured 2026-09-07. Before the draw was restructured every one of these
+    // Measured. Before the draw was restructured every one of these
     // was 0: `fuzzDispatch` returned on its `input.len == 0` line.
     try testing.expectEqual(@as(usize, 11), nonempty);
     try testing.expectEqual(@as(usize, 208), octets);
@@ -1816,10 +1816,10 @@ const s7_verdict = struct {
     const no_such_block: u32 = 0x0A;
     const invalid_address: u32 = 0x05;
     /// The live device's PDU ceiling, deliberately BELOW the 480 python-snap7
-    /// proposes. With the two equal (as until 2026-09-15), `@min(asked,
+    /// proposes. With the two equal (as previously), `@min(asked,
     /// ceiling)` was the identity, the client's DB2.DBD32 mark was a verbatim
     /// echo of its own proposal, and a responder with no ceiling at all passed
-    /// (audit F-C, measured 2026-09-01). Below it, only a device that actually
+    /// (audit F-C, measured). Below it, only a device that actually
     /// negotiates reports 240.
     const device_pdu_ceiling: u16 = 240;
 
@@ -2829,7 +2829,7 @@ test "anchor: Wireshark reads the OPC UA adapter's ACKF handshake reply" {
     // number echoed -- and neither the receive/send CROSS-SWAP (what the
     // server sends is bounded by what the client can receive, and vice versa)
     // nor the ceiling itself was a distinction the frozen reading could
-    // express. Measured 2026-09-01: with `modules/opcua/src/server.zig`'s
+    // express. Measured: with `modules/opcua/src/server.zig`'s
     // cross-swap dropped, and again with `.max_message_size =
     // client_max_message`, the whole suite stayed GREEN on the old fixture.
     // Those four fields are that module's documented denial-of-service bounds,

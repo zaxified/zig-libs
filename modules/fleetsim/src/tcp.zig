@@ -95,7 +95,7 @@ fn checkCanceled(io: std.Io) error{Canceled}!void {
 /// cancel that lands before the socket exists is reported by the bind/listen
 /// call itself (its `Syscall.start`). All three entry points used to rename it
 /// `BindFailed`, telling a caller that canceled a session on its way up that
-/// the port was unavailable. Measured: full-gate attempt 5 (2026-09-15),
+/// the port was unavailable. Measured: full-gate attempt 5,
 /// `serveUdp` -> `expected error.Canceled, found error.BindFailed`.
 fn bindFailure(err: anyerror) error{ Canceled, BindFailed } {
     return if (err == error.Canceled) error.Canceled else error.BindFailed;
@@ -157,7 +157,7 @@ fn writeAllChecked(writer: *std.Io.net.Stream.Writer, bytes: []const u8) error{C
 /// therefore panics above 2^31 ms (~24.8 days) in Debug and ReleaseSafe, and
 /// in ReleaseFast silently becomes an infinite wait -- from an option value a
 /// caller may set to "run for a month" without doing anything wrong. Measured
-/// 2026-09-01: `readable(io, fd, 3_000_000_000)` -> `panic: integer does not
+/// `readable(io, fd, 3_000_000_000)` -> `panic: integer does not
 /// fit in destination type`. Saturating is the honest answer; a 24-day poll
 /// round is already indistinguishable from forever.
 fn pollTimeout(ms: u32) i32 {
@@ -786,7 +786,7 @@ fn socketSkip(what: []const u8) anyerror {
 
 // ── CueIo: cancel and connect on EVENTS, never after a sleep or on a fixed port
 //
-// Full-gate attempt 5 (2026-09-15, every module lane in parallel) failed
+// Full-gate attempt 5 (every module lane in parallel) failed
 // `serveUdp: a canceled receive wait …` with `expected error.Canceled, found
 // error.BindFailed`. The test canceled after a fixed 100 ms sleep; under that
 // load the task had not bound its socket yet, the bind's own `Syscall.start`
@@ -1398,7 +1398,7 @@ test "readData: a canceled blocking read surfaces Canceled, not 0" {
     try expectCanceledAt(io, &fut, awaitCue(&CueIo.read_entered, 1), "readData");
 }
 
-// ── audit 2026-09-01: the real-socket surface, held by nothing ─────────────
+// ── audit: the real-socket surface, held by nothing ─────────────
 
 // The silent peer both tests below need is a plain connect from the test
 // thread into the backlog of a listen `CueIo` holds -- no thread, no port
@@ -1593,7 +1593,7 @@ test "a run_ms past 2^31 ms saturates the poll timeout instead of panicking" {
     try testing.expectEqual(@as(i32, std.math.maxInt(i32)), pollTimeout(std.math.maxInt(u32)));
 }
 
-// ── whole-module mutation audit 2026-11-18 ──────────────────────────────────
+// ── whole-module mutation audit ──────────────────────────────────
 //
 // Report counters, session limits, split-frame carry, the idle round and the
 // multi-peer routing, each pinned by exact numbers over a real loopback

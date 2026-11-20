@@ -329,7 +329,7 @@ test "Protocol: ports and datagram-ness" {
     try testing.expect(!Protocol.modbus.isDatagram());
 }
 
-// Whole-module mutation audit 2026-11-18: every length rule pinned at both
+// Whole-module mutation audit: every length rule pinned at both
 // sides of its boundary, because a frame length is the first thing computed
 // from untrusted bytes.
 test "frameLen: modbus_tcp body-length bounds (0 and > 254 are malformed)" {
