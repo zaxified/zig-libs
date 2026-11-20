@@ -1,8 +1,8 @@
 # workerpool
 
 An in-process, fixed-width **worker pool** over `lockfree.SegQueue`: a closed
-roster of `std.Thread`s pulls type-erased jobs off one shared unbounded
-multi-producer/multi-consumer queue and runs them. Jobs travel by value — no
+roster of `std.Thread`s pulls type-erased jobs off one shared
+multi-producer/multi-consumer queue (bounded at 1 Mi jobs by default) and runs them. Jobs travel by value — no
 allocation per job, no lock on submit. It is the execution
 substrate for the P2 write-behind data-layer coordinator (DL5), which submits
 "flush this dirty entry to the sink" jobs to run off the request path.
@@ -10,8 +10,9 @@ substrate for the P2 write-behind data-layer coordinator (DL5), which submits
 Clean lifecycle: `init` → `submit` / `Submitter.submit` → `drain` (graceful) or
 `shutdownNow` (abrupt) → `deinit`. Idle workers sleep on an `std.Io` futex after a
 short bounded spin (`Options.spin_ns`, 50 µs by default; 0 parks at once);
-the pool owns its threads; misuse returns typed errors, never
-panics.
+the pool owns its threads; `submit` reports failure as a typed error, and the
+only panics are caller-contract checks (a lifecycle call or `wait` made from one
+of the pool's own jobs, a second `Submitter.deinit`).
 
 ```zig
 const workerpool = @import("workerpool");
@@ -67,6 +68,8 @@ pool.drain();              // stop accepting; run everything queued; join
 - `WorkerPool.deinit()` — drains gracefully if still running, then frees
   everything. Safe after `drain`/`shutdownNow`.
 - `completedCount()` / `submittedCount()` / `workerCount()` — observability.
+  `drainedCleanly()` — after `drain`, true iff every accepted job ran (makes a
+  `submit` that raced `drain` visible).
 - `Job` = `{ func: *const fn(*anyopaque) void, ctx: *anyopaque }`.
 
 **Job shape — why the type-erased closure** (over a generic `WorkerPool(Job)`):
@@ -76,12 +79,12 @@ callable (no per-job-type instantiation, smaller binary); a comptime job type
 would force one concrete `Job`/`run` per pool. The caller owns `ctx` and keeps
 it valid until the job runs.
 
-**Backpressure — unbounded by default, never blocking.** The queue grows on demand, so
-`submit` never blocks; it fails with `error.SubmitFailed` (allocator exhaustion) or
-`error.Shutdown` (pool no longer accepting). Set `Options.max_queued = N` to bound it: a submit that
-would leave more than `N` jobs queued-and-not-started returns `error.QueueFull` (nothing allocated,
-nothing counted; the bound is exact under concurrent submitters), the caller retries or sheds. A
-blocking submit is deferred.
+**Backpressure — bounded by default, never blocking.** The queue grows on demand, so
+`submit` never blocks; it fails with `error.SubmitFailed` (allocator exhaustion),
+`error.Shutdown` (pool no longer accepting) or `error.QueueFull`: `Options.max_queued`
+(default 1 Mi) is the most jobs queued-and-not-started, a submit past it allocates and
+counts nothing (the bound is exact under concurrent submitters), and the caller retries
+or sheds. `max_queued = 0` is the explicit unbounded opt-in.
 
 ```zig
 const pool = try workerpool.WorkerPool.init(allocator, .{ .io = io, .n_workers = 4, .max_queued = 64 });
@@ -111,6 +114,13 @@ behaviour of `pause`/`resume`/`num_threads_working` (2026-10-13), and an
 unmodified copy of it (plus an SPDX line) sits in `tools/c_bench/thpool/` as
 the benchmark's reference side — attributed in `NOTICE`. Data: none beyond
 that benchmark; `tools/c_bench/main.c` is our own tooling.
+
+## Not provided
+
+No blocking submit, no per-job result or future handle (use `std.Io.Group`, or a
+caller-owned slot plus `wait`), no panic isolation, no dynamic resizing and no
+timeout variant of `wait` / `drain`; see SPEC *What is deliberately not done* and
+*Backlog / deferred*.
 
 ## Verification
 

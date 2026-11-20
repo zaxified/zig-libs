@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Pithikos/C-Thread-Pool](https://github.com/Pithikos/C-Thread-Pool) — **reference** | C | MIT | 2.4k | no release; push 2025-05-18 | Same shape (init(n), add work = function + one pointer, destroy). Its README's API adds `wait` (block until queue and running jobs are done, pool stays usable), `pause`/`resume`, `num_threads_working`; this module has all of them since 2026-10-13: `wait` (2026-09-30), `pause`/`resume`/`isPaused`, `workingCount`, plus a terminal `drain`/`shutdownNow`, a bounded queue (`Options.max_queued`, `error.QueueFull`) and `queuedCount`. |
+| [Pithikos/C-Thread-Pool](https://github.com/Pithikos/C-Thread-Pool) — **reference** | C | MIT | 2.4k | no release; push 2025-05-18 | Same shape (init(n), add work = function + one pointer, destroy). Its README's API adds `wait` (block until queue and running jobs are done, pool stays usable), `pause`/`resume`, `num_threads_working`; this module has all of them: `wait`, `pause`/`resume`/`isPaused`, `workingCount`, plus a terminal `drain`/`shutdownNow`, a bounded queue (`Options.max_queued`, `error.QueueFull`) and `queuedCount`. |
 | [panjf2000/ants](https://github.com/panjf2000/ants) | Go | MIT | 14.5k | v2.12.0 (2026-03-20) | Goroutine pool: panic recovery, non-blocking mode, capacity `Tune` at runtime, `ReleaseTimeout`, `Reboot` (its README). No panic isolation, resize or restart here. Measured 2026-10-25 (`tools/go_fast_bench`, `NewPoolWithFunc` + `Invoke` + a `WaitGroup`): the fastest pingpong in the field (0.65 µs per round; ours 0.42 µs with the default spin), 0.998 allocations per job. |
 | [rust-threadpool/rust-threadpool](https://github.com/rust-threadpool/rust-threadpool) `threadpool` | Rust | MIT OR Apache-2.0 | — | 1.8.1 | The classic fire-and-forget shape on an mpsc channel (`execute`, `join`, `set_num_threads`, panic counting). Measured 2026-10-25 (`tools/rust_fast_bench`): ours 0.43–0.48× on the bursts, 0.05× on pingpong; one boxed closure per job. |
 | [rayon-rs/rayon](https://github.com/rayon-rs/rayon) | Rust | Apache-2.0 (API; dual MIT OR Apache-2.0 *(inferred)*) | 13.4k | no GitHub release; push 2026-08-28 | Data-parallelism with parallel iterators and work stealing: a different problem (fork-join), not a fire-and-forget queue. Measured 2026-10-25 as a pool (rayon-core 1.13.0 `ThreadPool::scope` + `spawn`, `tools/rust_fast_bench`): the fastest contender on the bursts and on four producers (ours 0.48–0.52×), 1.000 allocation per job (a boxed `HeapJob`). |
@@ -40,21 +40,19 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [kprotty/zap](https://github.com/kprotty/zap) | Zig | MIT | 553 | no release; push 2025-01-02 | Work-stealing Zig thread pool with batch scheduling (its README: "resource efficient", competitive in performance); written for Zig of 2020-21, unmaintained since *(inferred from push date)*; not `Io`-based. |
 | Zig 0.16 `std.Io` (`Io.Group`, `Io.Threaded`) | Zig | MIT | — | Zig 0.16.0 | `std.Thread.Pool` is gone in 0.16 (checked: no `Pool` in `lib/std/Thread.zig`). std's answer is `Group.async`/`concurrent` + `await`/`cancel` on the `Io` implementation: results, cancellation and a wait-for-all are built in, but the queue is the Io's own, unbounded *(inferred)* and not tuned as a bare closure pool. |
 
-**Where we are ahead:** typed, non-panicking failure modes (`SubmitFailed`, `Shutdown`, `TooManySubmitters`); a *lock-free* submit from any thread (`lockfree.SegQueue`, jobs by value, no allocation per job); futex idle wakeup with a gated `futexWake` and an optional pre-park spin (`spin_ns`); `shutdownNow` that frees queued jobs, `drainedCleanly` to make a producer-quiescence violation visible; a watchdog-instrumented real-thread stress suite in Debug and ReleaseFast. **Where we are behind:** nothing a user of the reference (thpool) notices; since 2026-10-13 `pause`/`resume`, `workingCount` and a bounded queue are implemented. Consciously out, each with its reason (§6b, §7): no result/future handle (`std.Io.Group`/`Io.Future` are the result-carrying API in 0.16; this pool is fire-and-forget, `wait` covers wait-for-all, a per-job result is a caller-owned slot plus `wait`); no panic isolation (Zig has no recover); no dynamic resizing (ants' `Tune`; fixed size like the reference, a resize is a new pool); no blocking submit (deferred: a caller retries or sheds on `QueueFull`).
+**Where we are ahead:** typed, non-panicking failure modes (`SubmitFailed`, `Shutdown`, `TooManySubmitters`); a *lock-free* submit from any thread (`lockfree.SegQueue`, jobs by value, no allocation per job); futex idle wakeup with a gated `futexWake` and an optional pre-park spin (`spin_ns`); `shutdownNow` that frees queued jobs, `drainedCleanly` to make a producer-quiescence violation visible; a watchdog-instrumented real-thread stress suite in Debug and ReleaseFast. **Where we are behind:** nothing a user of the reference (thpool) notices. Consciously out, each with its reason under *What is deliberately not done*: no result/future handle (`std.Io.Group`/`Io.Future` are the result-carrying API in 0.16; this pool is fire-and-forget, `wait` covers wait-for-all, a per-job result is a caller-owned slot plus `wait`); no panic isolation (Zig has no recover); no dynamic resizing (ants' `Tune`; fixed size like the reference, a resize is a new pool); no blocking submit yet (a caller retries or sheds on `QueueFull`; see *Backlog / deferred*).
 
-## Performance (2026-10-14)
 
-**The field and the spin default, 2026-10-25** (`zig build bench-workerpool`, `BENCH_ROUNDS=5`, ReleaseFast, load average ~1.8). With `spin_ns = 0` (the default until then) every job paid a park and a wake: ours over the fastest contender was 3.3× rayon-core on burst_noop, 2.9× on burst_work and 11.9× ants on pingpong (multi_producer 0.56×). With a 50 µs spin in the workers only, pingpong was still 1.57× ants: its `wait` parked at once. The same bounded spin in `wait` (`spinUntilChanged`, shared with the workers) took it to 0.64–0.68×. The owner made 50 µs the default (2026-10-25); the card's figures are that default, re-measured after the review's waiter changes (one spin per `wait` call, `parked_waiters`, a wake only on the completion that makes the pool idle): burst_noop 0.54× rayon-core, burst_work 0.51×, pingpong 0.67× ants, multi_producer 0.42× rayon-core, and 0.05–0.14× the reference. `BENCH_SPIN_NS=0` measures the old setting.
+## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-workerpool`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 17.1 %): ref 0.06–0.84×, against 0.19–0.83× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures; what follows is the earlier measurement.
-
-`zig build bench-workerpool` (`tools/bench.zig` against `tools/c_bench`, thpool at 2b56942a built
-with `zig cc -O2`), 4 workers, 7 rounds, ratio ours/thpool by wall time, best round per side:
-burst of 100 000 no-op jobs + wait 0.83, the same with ~1 µs of work 0.62, 10 000
-submit-one-then-wait 0.82, four producers 0.19. Before the queue change (2026-10-13, MS-queue +
-EBR + a box per job + a spinlock on `submit`): 1.01 / 0.77 / 0.84 / 0.64. The four-producer row
-gained most: the shared `submit` no longer serializes on a lock. thpool's rounds spread 13–190 %,
-ours 5–210 % on the four-producer row (thread spawn is inside its timing on both sides).
+`zig build bench-workerpool` (`tools/bench.zig`, always ReleaseFast) runs this pool against the reference
+(`tools/c_bench`, thpool built from the unmodified copy in `tools/c_bench/thpool`), rayon-core and
+threadpool (`tools/rust_fast_bench`) and ants (`tools/go_fast_bench`) on a burst of no-op jobs, a burst with
+~1 µs of work, submit-one-then-wait (pingpong) and four producers; the figures are the card's `**Performance:**`
+and `**Ahead:**` lines. `Options.spin_ns` (default 50 µs) is what makes them: a worker that finds the queue
+empty, and a `wait` caller that finds the pool busy, keep looking before they park, so a short job skips a
+park and a wake (two futex syscalls); `BENCH_SPIN_NS=0` measures park-at-once. The spin in `wait` is once per
+call, so a long wait over a stream of completions still parks.
 
 ## 1. Dedup / std-gap
 
@@ -70,8 +68,7 @@ existing worker pool in `modules/` to extract from — this is the first.
 
 ## 2. Layering on `lockfree`
 
-The pool is a thin lifecycle + wakeup layer over **`lockfree.SegQueue(Job)`**
-(2026-10-14):
+The pool is a thin lifecycle + wakeup layer over **`lockfree.SegQueue(Job)`**:
 
 - **Jobs by value.** A `Job` (two pointers) rides in a queue slot; a worker pops
   it and runs it. Nothing is allocated per job: the queue takes a block per 63
@@ -89,12 +86,6 @@ The pool is a thin lifecycle + wakeup layer over **`lockfree.SegQueue(Job)`**
 - **Teardown** is `dropQueued` (pop whatever is left, count it dropped), then
   `queue.deinit` (frees its blocks), then the workers slice and the pool.
 
-**Before 2026-10-14** the queue was `lockfree.MpmcQueue` (Michael-Scott over EBR):
-a `u64` payload, so each job was a heap `JobBox` from a `NodePool`, every worker
-and `Submitter` held an EBR participant, and the zero-setup `submit` shared one
-participant behind a spinlock. That structure cost a node, a box and a pin per job
-and measured 2–4× crossbeam's `SegQueue` (lockfree SPEC §8); its teardown order
-(unregister every participant so its limbo bags drain) is gone with it.
 
 ## 3. Lifecycle & drain semantics
 
@@ -116,7 +107,7 @@ by a single CAS in `drain`/`shutdownNow` (idempotent — a second call no-ops).
   safe to drop (process teardown).
 - **`deinit`.** If still `running`, `drain` first; then free everything (§2).
 
-### `wait` — idle without shutdown (2026-09-30)
+### `wait` — idle without shutdown
 
 `wait()` blocks until `completedCount() == submittedCount()` is observed — nothing queued, nothing in
 flight — and leaves the pool running (Pithikos `thpool_wait`). Returns `true` when idle, `false` when
@@ -124,22 +115,20 @@ the pool was shut down with `shutdownNow` (whose dropped jobs never complete; a 
 hang forever). Same producer contract as `drain`: a waiter is guaranteed to return only once
 producers pause; any number of threads may wait.
 
-Wakeup: waiters park on a separate `done_gen` futex word, not on `notify` (which is the workers'). A
-worker, after a job, increments `completed` (seq_cst) and then — only if `waiters > 0` — bumps
-`done_gen` and wakes; a pool nobody waits on pays one load per job. A waiter registers in `waiters`
-BEFORE it snapshots `done_gen` and checks the counts. The two sides are the store-buffering pattern
-with seq_cst on every access, so at least one sees the other: either the waiter's check sees the
-completion, or the worker's load sees the registration and bumps the generation the waiter's park
-compares against (`completed` was monotonic before; it is seq_cst now for exactly this). `shutdownNow`
-bumps `done_gen` after its state change so a parked waiter re-reads the state. Calling `wait` from a
+Wakeup: waiters park on a separate `done_gen` futex word, not on `notify` (which is the workers'). A waiter
+registers in `waiters` BEFORE it snapshots `done_gen` and checks the counts; a worker increments `completed`
+BEFORE it reads `waiters` (both seq_cst). The two sides are the store-buffering pattern, so at least one sees
+the other. Only the completion that brings `completed` up to the `submitted` it then reads (the one that makes
+the pool idle) bumps `done_gen`, and it wakes (`futexWake`) only if `parked_waiters > 0`: it bumps first, so a
+waiter that counts itself parked after that load parks on a generation already moved, and its futex compare
+returns at once. A pool nobody waits on pays one load per job. A completion that does not reach `submitted`
+leaves a job outstanding whose own completion will; `submitted` falls only on a `SubmitFailed` rollback, which
+wakes by itself. `shutdownNow` bumps `done_gen` after its state change so a parked waiter re-reads the state.
+`Options.spin_ns` holds for a waiter too, once per `wait` call (`spinUntilChanged` on `done_gen`, shared with
+the workers). Calling `wait` from a
 job of the same pool would wait on itself; a threadlocal marks worker threads and turns that into a
 panic instead of a deadlock.
 
-Tested (§6): idle pool, wait → submit more → wait again, four concurrent waiters, 5 000
-submit-one-then-wait rounds under the watchdog (the lost-wakeup detector), and a waiter released
-with `false` by a `shutdownNow` that drops 50 queued jobs. Mutation-checked once by hand
-(2026-09-30): removing the worker's wake makes the lost-wakeup test and the four-waiter test hit
-the watchdog.
 
 ## 4. Wakeup correctness — no busy-spin, no lost wakeup, no shutdown deadlock
 
@@ -182,10 +171,10 @@ wake-all is left unconditional since it is not a hot path.
 loop:
   st = state.load(seq_cst)
   if st == stopping_now: break
-  if dequeue() |v|: run(v); continue        // work drains first
+  if takeJob() |v|: run(v); continue        // work drains first
   if st == draining:  break                 // graceful: empty ⇒ done
   gen = notify.load(seq_cst)                // SNAPSHOT before parking
-  if dequeue() |v|: run(v); continue        // re-check queue …
+  if takeJob() |v|: run(v); continue        // re-check queue …
   if state.load(seq_cst) != running: continue   // … and state
   idle += 1                                 // F4: about to (maybe) block
   futexWaitUncancelable(&notify, gen)       // sleeps iff *notify == gen
@@ -244,29 +233,32 @@ worker still between its `S` and its wait sees the state change at `R'` (the sta
 same condition) or the bumped generation at the futex, by the same argument. The state is monotonic, so a
 pause set afterwards changes nothing.
 
-*What `pause` guarantees.* After it returns, no worker takes a NEW job off the queue, with one
-exception: a worker that passed the check before the store and has already dequeued counts as
-running and finishes it (its job is in `workingCount`). Jobs already running are never interrupted
-(the reference interrupts a worker mid-job by signal and parks it inside the handler; we do not).
-`submit` still accepts while paused, bounded only by `max_queued`; `wait` on a paused pool with queued
+*What `pause` guarantees.* Once it returns, no job submitted afterwards can start. A worker publishes `taking`
+before it reads `paused` (`takeJob`), and `pause` stores `paused` before it reads each worker's `taking` and
+waits for it to clear (both seq_cst, so one side sees the other): a worker that checked the flag just before
+the call finishes its dequeue before `pause` returns, so the job it took counts as running and finishes (it is
+in `workingCount`), and nothing is taken after. `pause` blocks only while a worker is between its check and its
+dequeue (a few instructions). Jobs already running are never interrupted (the reference interrupts a worker
+mid-job by signal and parks it inside the handler; we do not). `submit` still accepts while paused, bounded only by `max_queued`; `wait` on a paused pool with queued
 jobs blocks until `resume` (so would `thpool_wait`). A submit while paused still bumps `notify` and
 wakes one parked worker, which finds the pause and parks again: one spurious wake per submit, no
 hang. `Options.spin_ns` is unaffected (a paused worker never reaches the spin).
 
-**No busy-spin.** A worker only spins while it is *finding work*; once it
-observes the queue empty (in `running`) it blocks on the futex until a real or
+**No busy-spin.** A worker's spin is bounded (`Options.spin_ns`, default 50 µs; 0 parks at once): once it
+has observed the queue empty (in `running`) it watches `notify` (not counted in `idle`, so a submit landing
+meanwhile skips the wake) for at most that long, then blocks on the futex until a real or
 spurious wake. Spurious wakes just re-run the loop (cheap) and re-park.
 
 ## 5. Backpressure policy
 
 The queue grows by a block per 63 jobs; `submit` is **non-blocking** and sheds only at the
-`max_queued` bound (default 1 Mi jobs since 2026-10-29, review R-WP-2: a network-fed producer
+`max_queued` bound (default 1 Mi jobs, review R-WP-2: a network-fed producer
 must meet `QueueFull`, not an OOM; `max_queued = 0` is the explicit unbounded opt-in). The failure
 modes are typed: `error.SubmitFailed` (the queue's block allocation failed), `error.QueueFull`
 and `error.Shutdown` (state ≠ running). A consumer whose flush *work* is the bottleneck and for
 which losing a queued flush is worse than growth (the DL5 case) sets `max_queued = 0`.
 
-**Bounded queue (2026-10-13; default since 2026-10-29).** `Options.max_queued = N > 0` (default
+**Bounded queue.** `Options.max_queued = N > 0` (default
 `1 << 20`; 0 = unbounded) adds a fourth, explicit refusal: `error.QueueFull` when `N` jobs are submitted and not
 yet started. Admission is an atomic counter `queued` (submitted, not yet taken by a worker), kept
 ONLY when `N > 0`:
@@ -291,10 +283,9 @@ saturating), so the per-job hot path pays ONE extra read-modify-write (`started`
 four (`queued` ±1, `working` ±1) a counter per quantity would cost on lines every worker shares. A release can
 only follow a reservation (a dequeue follows its enqueue, which follows its reservation), so the
 counter cannot underflow. The counter sits beside the queue, not in it, so `lockfree.BoundedQueue`
-is not needed. Unbounded pools (`N = 0`) pay one
-fetch-add and one fetch-sub per job for `queuedCount()`/`workingCount()` and nothing else.
+is not needed.
 
-**Blocking submit — deferred**: a caller that wants to wait retries after `QueueFull` or sheds.
+There is no blocking submit: a caller that wants to wait retries after `QueueFull` or sheds (see *Backlog / deferred*).
 
 **Producer-quiescence contract.** `submit`/`Submitter.submit` may run from any
 threads concurrently; the lifecycle calls (`drain`/`shutdownNow`/`deinit`) may
@@ -303,125 +294,89 @@ first. This is the standard executor contract and is what lets `drain` treat a
 first observed-empty queue as permanently empty (§3) without a
 submitted-vs-completed reconciliation dance.
 
-## 6. Verification — real threads, both opt levels
 
-`zig build test-workerpool` and `… -Doptimize=ReleaseFast`, both green, no
-leaks. All on real `std.Thread`s over a real `std.Io.Threaded` futex; a
-**watchdog** thread panics if any operation misses its deadline, converting a
-(hypothetical) lost-wakeup/deadlock from a silent hang into a loud, bounded
-failure. Coverage: exactly-once over 20 000 jobs ≫ workers; graceful-drain
-completeness + post-drain `error.Shutdown`; idle→wake promptness;
-shutdown-while-idle and shutdown-while-busy termination; `shutdownNow`
-in-flight-vs-queued + ran + dropped = submitted; and an 8-producer × 6-worker ×
-20 000 stress that drives the queue's multi-producer path (160 000 jobs, each
-run once). ReleaseFast matters: reordering is real there, so a green
-ReleaseFast run corroborates the ordering discipline in §4 (the queue's own
-argument lives in `lockfree` SPEC §4d).
+## Known limits
 
-**2026-10-14 (queue change).** The two `SubmitFailed` tests (box allocation, queue-node allocation)
-became one: 62 jobs on a paused pool, then the push that needs a new block meets a failing
-allocator — `submittedCount`, `queuedCount` and the queue's `len` unchanged, the next submit runs.
-`outstandingBoxes` assertions became queue-empty / ran + dropped = submitted. **The 2026-10-04
-mutation run predates this**: it covered `runBox` / `freeQueuedBoxes` and the box rollback, which
-are now `runJob` / `dropQueued` and one rollback — re-run owed.
+- **Producer quiescence is the caller's contract.** `drain` / `shutdownNow` / `deinit` racing a `submit` is a
+  precondition violation (a job accepted behind the point where the last worker observed `draining` is never
+  run); `drainedCleanly` (`submittedCount() == completedCount()`) makes a violation visible after `drain`. A
+  concurrent `drain` and `deinit` is a use-after-free: the lifecycle is single-owner and documented as such.
+- **Checked panics, not errors:** `drain`, `shutdownNow`, `deinit` and `wait` called from a job of the same
+  pool (they would join or wait on their own thread); `drain` from a job of an already draining pool returns
+  normally, `deinit` from one still panics; a second `Submitter.deinit` for one `registerSubmitter`.
+- **`Options.n_workers` is taken as given** (clamped to at least 1): a huge value fails with `SpawnFailed` or
+  `OutOfMemory` after trying, never a crash; `spin_ns = maxInt` means a worker never parks.
+- **The queue is bounded at 1 Mi jobs by default** (`max_queued`); unbounded only with `max_queued = 0` (§5).
+- **A job that panics aborts the process,** as any thread body does.
+- **The allocator must be thread-safe** (§2).
 
-**Audit 2026-10-04 (mutation).** 23 schemata mutants over `init`'s worker clamp, the
-lifecycle (`drain` idempotence, `shutdownNow` box flush and waiter wake, `deinit` drain),
-`wait`, the shutdown refusals of `submit`/`registerSubmitter`, the enqueue rollback, the
-wake gate and `idle` accounting, `runBox`, `freeQueuedBoxes`, the worker loop's stop/drain
-exits, the spin and the final pre-park re-check, and `drainedCleanly`: 23 killed, 0
-equivalent, 0 left alive. Two of them sit in windows no free-running test can enter, and
-got comptime-gated test seams (no code, field or branch outside `builtin.is_test`, like
-`park_seam`): `snapshot_seam` (between a worker's empty look and its `notify` snapshot) pins
-the final queue re-check -- a job published there is only found by it; `wait_seam` (between
-`wait`'s last check and its park) runs a whole `shutdownNow` there with the worker held by
-`park_seam`, so only `shutdownNow`'s `wakeWaiters` can release the waiter. Both TEETH tests
-hang into the watchdog with their mutant applied. Other tests added: `n_workers = 0` clamps
-to one worker, `registerSubmitter` after `drain` is `Shutdown`, and a job submitted during a
-5 s `spin_ns` runs long before the spin would end.
+## Verification
 
-**2026-10-13 (pause, workingCount, max_queued).** Real-thread tests under the same watchdog:
-`pause` holds 200 queued jobs for 50 ms (`completedCount` unchanged, `queuedCount` = 200,
-`workingCount` = 0), `resume` + `wait` runs them all; a job running when `pause` is called finishes
-and the next one waits; `pause` + `drain` runs the queue; `pause` + `shutdownNow` drops it with
-`outstandingBoxes` and `queuedCount` back at 0; 2 000 sequential pause/submit/resume/wait rounds plus
-2 000 submits racing a thread that flips the flag 2 000 times (the lost-wakeup detector); a TEETH
-test with `pause_seam` that runs `resume` inside the pause window (hangs into the watchdog if the
-snapshot follows the re-check); `workingCount` = N for N gated jobs on N workers, 0 after `wait`;
-`max_queued = 4` on a paused pool: 4 accepted, the 5th `QueueFull` from `submit` and from a
-`Submitter` with `submittedCount`/queue length/`queuedCount` untouched, accepted again after
-`resume` + `wait`; a bound of one block after the `SubmitFailed` rollback (2026-10-14; was
-`max_queued = 1` after each of the two old rollbacks) still accepts the next job (slot released); 8 producers hammering `max_queued = 3`
-(24 000 accepted jobs, a `QueueFull` seen, `queuedCount() > 3` never observed inside a job or after a
-submit, every accepted job run exactly once, boxes and slots back at 0).
-Mutation map (to be confirmed by a schemata run): dropping the worker's pause branch is killed by
-"pause: submitted jobs stay queued"; dropping `resume`'s wake by the 2 000-round test and the TEETH
-test; the pause-window snapshot order by the TEETH test; the admission CAS (an unconditional
-increment) by "max_queued: 4 accepted" and the 8-producer hammer; the release on dequeue by the same
-"max_queued: 4 accepted" (accepted again after `wait`); the release on either rollback by "max_queued:
-the slot is released on both SubmitFailed rollbacks"; the release in `freeQueuedBoxes` by "pause:
-shutdownNow" (`queuedCount` back at 0); `started` counted at dequeue by "workingCount" (N for N
-gated jobs).
+Run: `scripts/modtest workerpool`, and again with `-Doptimize=ReleaseFast`: reordering is real there, so a
+green ReleaseFast run corroborates the ordering discipline in §4 (the queue's own argument lives in
+`lockfree` SPEC § 4d). All tests use real `std.Thread`s over a real `std.Io.Threaded` futex, and a
+**watchdog** thread panics if an operation misses its deadline, turning a lost wakeup or a deadlock into a
+loud, bounded failure; `std.testing.allocator` catches leaks and double frees.
 
-## 6b. Backlog / deferred
-- **Delta audit 2026-10-29 (§ GK):** 7 mutants, 6 killed on the first run; the survivor (dropping `deinit`'s own-job guard, hidden by `drain`'s guard on a running pool) now killed by "deinit from a job of an already draining pool still panics (audit WP-5)" → 7/7. ReleaseSafe, unfiltered suite.
+- **Lifecycle** (`src/root.zig`): exactly-once over 20 000 jobs on 4 workers; graceful drain completeness and
+  `error.Shutdown` after it; idle-to-wake promptness; shutdown while idle and while busy; `shutdownNow`
+  (in-flight completes, ran + dropped = submitted, queue empty); `n_workers = 0` clamps to one worker;
+  `registerSubmitter` after `drain` is `Shutdown`; a job submitted during a 5 s `spin_ns` runs long before the
+  spin would end; state ends in `.stopped`; a thread-spawn failure after k workers unwinds them all and leaks
+  nothing; re-entrancy (a job that submits the next job, `wait` covering the chain; submitting while the pool
+  drains is refused with `Shutdown`).
+- **Stress:** 8 producers (via `Submitter`, and again through the shared `submit`) against 6 workers, every job
+  accounted for exactly once.
+- **`SubmitFailed`:** the push that needs a new block meets a failing allocator on a paused pool: submitted,
+  queued and the queue's length unchanged, the next submit runs, and a `wait` parked while a submit was in
+  flight is released by that submit's rollback.
+- **`wait`:** idle pool, wait then submit more then wait again, several concurrent waiters, thousands of
+  submit-one-then-wait rounds under the watchdog (the lost-wakeup detector), a waiter released with `false`
+  by a `shutdownNow` that drops queued jobs, a waiter arriving once `shutdownNow` has begun, a returning waiter
+  unregisters itself.
+- **`pause` / `resume`:** 200 queued jobs held for 50 ms with `completedCount` unchanged, a running job
+  finishes and the next one waits, `drain` and `shutdownNow` override a pause, thousands of racing
+  pause/submit/resume rounds, a worker parked on the pause counts as idle and settles back after `resume`,
+  and a job submitted after `pause()` returned never starts.
+- **TEETH tests (comptime seams):** the windows no free-running test can enter have test seams
+  (`park_seam`, `snapshot_seam`, `wait_seam`, `pause_seam`, `pause_snapshot_seam`, `take_seam`), declared in
+  `src/root.zig` and compiled out of non-test builds (no field or branch outside `builtin.is_test`). Each
+  TEETH test holds its window open and hangs into the watchdog (or fails) when the ordering it pins is
+  broken: the pre-park snapshot, the final queue re-check, `shutdownNow`'s wake of a parked waiter, the
+  resume-inside-the-pause-window, and `pause` not returning while a worker is inside its take window.
+- **`workingCount` / `max_queued`:** N gated jobs on N workers read N and 0 after `wait`; a bound of 4 on a
+  paused pool accepts 4 and refuses the 5th with `QueueFull` (from `submit` and from a `Submitter`) with
+  every count untouched, and accepts again after `resume` + `wait`; the slot is released on every give-up
+  path (dequeue, the `SubmitFailed` rollback, `dropQueued`); 8 producers on a bound of 3 never overshoot it.
+- **Panics** (`src/audit_test.zig`): each checked panic above runs in a child process.
+- **Lead** (`src/lead_test.zig`): no heap allocation per job in the steady state (the card's `**Ahead:**`
+  allocation claim); `tools/rust_fast_bench` and `tools/go_fast_bench` give the other pools' counts.
+- **Model-fuzz** (`src/model_fuzz_test.zig`, the card's Evidence): a drawn pool (1 to 4 workers, bounded or
+  not, spin or not) runs a drawn operation sequence (gated and open jobs, pause/resume, wait, two-thread
+  bursts, drain, `shutdownNow` with a waiter across it) on real threads; after each operation the pool must
+  settle into the one state a sequential FIFO model predicts (queued, working, completed and submitted counts,
+  per job started and finished exactly once). 60 seeds run in every test run;
+  `WORKERPOOL_FUZZ=<runs>[,<seed>]` runs the deterministic driver for longer.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
-- (2026-10-25) **Audit leftovers** (the
-  two MED defects -- a job submitted after `pause()` returned could start, and a `SubmitFailed`
-  rollback left a `wait` parked on an idle pool -- were fixed the same day): ~~`drain`/`shutdownNow`/
-  `deinit` from a job of the same pool join their own thread~~ (DONE 2026-10-29, sweep WP-1: checked
-  panic like `wait`); a job published right after the spin loop's last look is
-  seen only when `spin_ns` runs out (bounded delay, not a loss). ~~The pause regression test catches a
-  disabled `taking` handshake in 2 of 3 runs (a race window, not a seam)~~ (DONE 2026-11-17: `take_seam`
-  in `takeJob`, between the `taking` store and the `paused` load, `comptime`-gated on `builtin.is_test`
-  like the other seams; "TEETH: pause() does not return while a worker is inside its take window" parks the
-  worker there, calls `pause()` and requires the worker to have left when it returns. Delta mutation
-  2026-11-17, 3 mutants, ReleaseSafe, 10 runs each of the one test: `taking` never published, `pause` not
-  waiting on `taking`, the seam call dropped -- each fails 10/10; the unmutated binary passes 10/10.)
+## What is deliberately not done
 
-- (2026-10-29, blind review)
-  Left in the Backlog: **R-WP-3** `n_workers` unclamped (30k threads) and `spin_ns = maxInt` means
-  never park; **R-WP-4** concurrent `drain` + `deinit` is a use-after-free (single owner documented);
-  **R-WP-6** no timeout variant of `wait`/`drain`.
+- **Result / future handle.** `std.Io.Group` / `Io.Future` are the result-carrying API in 0.16; this pool is
+  fire-and-forget by design, `wait` covers wait-for-all, and a per-job result is a caller-owned slot plus
+  `wait`.
+- **Panic isolation** (ants recovers a panicking task). Zig has no recover, and catching or quarantining a
+  faulty job would need a per-job boundary; refused unless std offers one (the DL5 flush closures are trusted,
+  non-panicking code).
+- **Dynamic resizing** (ants' `Tune`). Fixed size like the reference; a resize is a new pool.
 
-- (2026-10-29, sweep GK) **Left deliberately:** `Options.n_workers` is taken as given (a huge value
-  fails with `SpawnFailed`/`OutOfMemory` after trying, never a crash); the queue is bounded at 1 Mi
-  jobs by default, unbounded only with `max_queued = 0` (§5); `drain`/`shutdownNow` racing a `submit` is the documented
-  caller precondition (`drainedCleanly` makes a violation visible).
+## Backlog / deferred
 
-- (2026-10-14, DONE 2026-10-25: 125/129, 4 eq) **Mutation re-run after the queue change.** The 2026-10-04 schemata run (23/23)
-  covered `runBox`, `freeQueuedBoxes` and the box rollback; those are now `runJob`, `dropQueued`
-  and one rollback, and `registerSubmitter` gained a counting CAS. Re-run over the changed code.
-  Effort: small; fits §6.
-
-- ~~**A short spin before a worker parks**~~ — DONE 2026-09-25: `Options.spin_ns`
-  (0 = park at once, as before). A worker that finds the queue empty watches `notify`
-  for up to `spin_ns` before counting itself idle and parking, so a submit landing in
-  that window skips the `futexWake` and the job skips the park. The spin always ends in
-  the old park. Test: with a spin the worker is not idle 50 ms after its job, takes the
-  next one, and is parked once the spin has run out; control without it is parked.
-
-- ~~**`wait()`: block until every submitted job has run, keep the pool running**~~ (survey 2026-09-30) — **DONE 2026-09-30**, see §3 "wait".
-- ~~**Result / future handle**~~ (survey 2026-09-30) — **REJECTED 2026-10-13**: `std.Io.Group` / `Io.Future` are the result-carrying API in 0.16; this pool is fire-and-forget by design, `wait` covers wait-for-all, and a per-job result is a caller-owned slot plus `wait`.
-- ~~**Bounded queue with `error.QueueFull` submit**~~ (survey 2026-09-30) — **DONE 2026-10-13**: `Options.max_queued`, `error.QueueFull`, `queuedCount`, see §5 (an atomic admission counter beside the MS-queue; `lockfree`'s bounded MPMC was not needed). The *blocking* variant stays deferred: a caller retries or sheds.
-- ~~**`pause`/`resume`**~~ (survey 2026-09-30) — **DONE 2026-10-13**: `pause`, `resume`, `isPaused`, argument in §4. Also from the reference: `workingCount` (`thpool_num_threads_working`).
-- ~~**Panic isolation**~~ (survey 2026-09-30) — **REJECTED**, reason kept: ants recovers a panicking task; Zig has no recover, so this stays refused unless std offers a per-job boundary (§7).
-- ~~**Dynamic resizing**~~ (ants `Tune`) — **REJECTED 2026-10-13**: fixed size like the reference; a resize is a new pool.
-
-## 7. Out of scope — next increments
-
-- **Blocking submit.** Shedding with `error.QueueFull` exists (`Options.max_queued`, §5); a
-  `submit` that blocks on a full queue is deferred — a caller retries or sheds.
-- **Result / future handles — rejected.** `std.Io.Group` / `Io.Future` are the result-carrying
-  API in 0.16; this pool is fire-and-forget by design, `wait` covers wait-for-all, and a per-job
-  result is a caller-owned slot plus `wait`.
-- **Dynamic resizing — rejected.** Fixed size like the reference; a resize is a new pool.
-- **Priority / fairness.** A single FIFO queue today; a multi-queue or
-  work-stealing variant (crossbeam-deque style) is deferred until a consumer
-  needs it.
-- **Panicking jobs.** A job that panics aborts the process (as any thread body
-  does). Catching/quarantining a faulty job would need a per-job boundary; not
-  attempted — the DL5 flush closures are trusted, non-panicking code.
+- **Blocking submit** — a `submit` that blocks on a full queue; today a caller retries or sheds on
+  `error.QueueFull`.
+- **Priority / fairness** — a single FIFO queue today; a multi-queue or work-stealing variant
+  (crossbeam-deque style) is deferred until a consumer needs it.
+- **R-WP-6: a timeout variant of `wait` / `drain`** — none today.
 
 ## Anchoring
 
@@ -431,3 +386,4 @@ gated jobs).
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
 **What the tests actually contain.** internal thread pool over own lockfree SegQueue, no wire
+
