@@ -1493,6 +1493,12 @@ pub const Server = struct {
     /// ticket resumed; the tickets are sealed and opened around it.
     peer_buf: []u8 = &.{},
     peer_len: u16 = 0,
+    /// The caller's (`setPeerChainBuffer`): the certificates the client
+    /// sent after its leaf, `u24` length ‖ DER each, `peer_chain_len`
+    /// octets, from a full handshake's Certificate (tickets do not carry
+    /// them).
+    peer_chain_buf: []u8 = &.{},
+    peer_chain_len: u32 = 0,
     /// The client proved it holds the key of the leaf (its
     /// CertificateVerify verified, or the ticket was issued after one).
     peer_authenticated: bool = false,
@@ -1591,6 +1597,21 @@ pub const Server = struct {
     pub fn setPeerBuffer(self: *Server, buf: []u8) void {
         if (self.state != .client_hello) @panic("tlsserver: setPeerBuffer after the first feed");
         self.peer_buf = buf;
+    }
+
+    /// With `Config.client_auth`: a buffer for the rest of the client's
+    /// chain (the certificates after the leaf), so that `peerCertificates`
+    /// hands the application the whole chain the client sent, as rustls
+    /// `peer_certificates` and Go `PeerCertificates` do. Without it only the
+    /// leaf is kept. A chain whose other certificates do not fit is refused
+    /// (`bad_certificate`): the joiner's message cap
+    /// (`inbound.default_max_message` by default) always fits. Owned by the
+    /// caller until `deinit`; not a secret. Set before the first `feed`:
+    /// calling it later is a programmer error and panics (checked, in every
+    /// build mode).
+    pub fn setPeerChainBuffer(self: *Server, buf: []u8) void {
+        if (self.state != .client_hello) @panic("tlsserver: setPeerChainBuffer after the first feed");
+        self.peer_chain_buf = buf;
     }
 
     /// With `Config.ech`: the buffer a client's encrypted ClientHello is
@@ -1708,6 +1729,36 @@ pub const Server = struct {
     pub fn peerCertificate(self: *const Server) ?[]const u8 {
         return if (self.peer_authenticated) self.peerLeaf() else null;
     }
+
+    /// The client's chain as it sent it, leaf first (rustls
+    /// `peer_certificates`, Go `ConnectionState.PeerCertificates`): the
+    /// leaf (`peerCertificate`) and, with `setPeerChainBuffer`, the
+    /// certificates that followed it in its Certificate message. Those are
+    /// not carried by tickets or `serialize`: on a resumption or a
+    /// deserialized connection only the leaf. Null without client
+    /// authentication. Valid while `self` is.
+    pub fn peerCertificates(self: *const Server) ?PeerCertificates {
+        const leaf = self.peerCertificate() orelse return null;
+        return .{ .leaf = leaf, .rest = self.peer_chain_buf[0..self.peer_chain_len] };
+    }
+
+    pub const PeerCertificates = struct {
+        leaf: ?[]const u8,
+        rest: []const u8,
+
+        /// The next certificate (DER), leaf first; null after the last.
+        pub fn next(it: *PeerCertificates) ?[]const u8 {
+            if (it.leaf) |l| {
+                it.leaf = null;
+                return l;
+            }
+            if (it.rest.len < 3) return null;
+            const n = std.mem.readInt(u24, it.rest[0..3], .big);
+            const der = it.rest[3..][0..n];
+            it.rest = it.rest[3 + n ..];
+            return der;
+        }
+    };
 
     /// `peerCertificate` is an RFC 7250 raw public key: a DER
     /// SubjectPublicKeyInfo, not a certificate (`ClientAuth.raw_public_keys`).
@@ -3542,6 +3593,16 @@ pub const Server = struct {
         const now_s = @divFloor(ca.clock.now_ms(ca.clock.ctx), 1000);
         try ca.verifier.verify(ca.verifier.ctx, chain[0..n], now_s);
         self.peer_len = @intCast(chain[0].len);
+        if (self.peer_chain_buf.len != 0) {
+            var at: usize = 0;
+            for (chain[1..n]) |der| {
+                if (self.peer_chain_buf.len - at < 3 + der.len) return error.BadCertificate;
+                std.mem.writeInt(u24, self.peer_chain_buf[at..][0..3], @intCast(der.len), .big);
+                @memcpy(self.peer_chain_buf[at + 3 ..][0..der.len], der);
+                at += 3 + der.len;
+            }
+            self.peer_chain_len = @intCast(at);
+        }
         self.appendTranscript(m);
         self.state = .client_certificate_verify;
     }
@@ -9390,4 +9451,49 @@ test "Config.check: what every handshake would refuse with internal_error is ref
     c = base;
     c.ech = &no_keys;
     try testing.expectError(error.Unsupported, c.check());
+}
+
+test "peerCertificates: the whole chain the client sent with setPeerChainBuffer, the leaf alone without" {
+    const chain_certs = @import("client_chain_certs.zig");
+    var prng = std.Random.DefaultPrng.init(1);
+    var auth: ClientAuth = .{ .verifier = .{ .verify = AcceptAny.verify }, .clock = .{ .now_ms = AcceptAny.clock } };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .client_auth = &auth };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    var peer: [peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
+    // Certificate: context, certificate_list of leaf and intermediate.
+    const certs_in = [_][]const u8{ &chain_certs.leaf_cert, &chain_certs.inter_cert };
+    var msg: [4 + 1 + 3 + 2 * (3 + 2) + chain_certs.leaf_cert.len + chain_certs.inter_cert.len]u8 = undefined;
+    msg[0] = 11;
+    std.mem.writeInt(u24, msg[1..4], msg.len - 4, .big);
+    msg[4] = 0;
+    std.mem.writeInt(u24, msg[5..8], msg.len - 8, .big);
+    var at: usize = 8;
+    for (certs_in) |der| {
+        std.mem.writeInt(u24, msg[at..][0..3], @intCast(der.len), .big);
+        @memcpy(msg[at + 3 ..][0..der.len], der);
+        std.mem.writeInt(u16, msg[at + 3 + der.len ..][0..2], 0, .big);
+        at += 3 + der.len + 2;
+    }
+    var chain_buf: [1024]u8 = undefined;
+    for ([_]bool{ true, false }) |with_buf| {
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+        if (with_buf) s.peer_chain_buf = &chain_buf;
+        try testing.expect(try s.onHandshake(handshakeMessage(&msg)) == null);
+        try testing.expectEqual(null, s.peerCertificates()); // not before its CertificateVerify
+        s.peer_authenticated = true; // as the CertificateVerify would
+        var it = s.peerCertificates().?;
+        try testing.expectEqualSlices(u8, &chain_certs.leaf_cert, it.next().?);
+        if (with_buf) try testing.expectEqualSlices(u8, &chain_certs.inter_cert, it.next().?);
+        try testing.expectEqual(null, it.next());
+        try testing.expectEqual(null, it.next());
+    }
+    // An intermediate that does not fit the caller's buffer: bad_certificate.
+    var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+    s.peer_chain_buf = chain_buf[0 .. 3 + chain_certs.inter_cert.len - 1];
+    try testing.expectError(error.BadCertificate, s.onHandshake(handshakeMessage(&msg)));
+    s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+    s.peer_chain_buf = chain_buf[0 .. 3 + chain_certs.inter_cert.len];
+    try testing.expect(try s.onHandshake(handshakeMessage(&msg)) == null);
+    try testing.expectEqual(@as(u32, 3 + chain_certs.inter_cert.len), s.peer_chain_len);
 }

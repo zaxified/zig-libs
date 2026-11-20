@@ -418,9 +418,12 @@ business. The CertificateVerify over the transcript through the client's Certifi
 the server did not ask for, RSA PKCS#1 v1.5 (RFC 8446 §4.4.3) or one that does not suit the
 leaf's key is `illegal_parameter`, a signature that does not verify `decrypt_error`. Then the
 client's Finished as before. `peerCertificate()` is the leaf once its CertificateVerify verified
-(never before), `peerSignatureScheme()` its scheme. Tickets carry both, so a resumption reports
-the identity of the handshake that issued its ticket (rustls keeps the whole chain; here only
-the leaf). With a mandatory certificate a ticket without one is not resumed (a full handshake
+(never before), `peerSignatureScheme()` its scheme. `peerCertificates()` is the whole chain the
+client sent, leaf first (rustls `peer_certificates`, Go `PeerCertificates`), when the caller gave a
+buffer for the certificates after the leaf (`setPeerChainBuffer`; one that cannot take them is
+`bad_certificate`, the joiner's message cap always can); without one, the leaf. Tickets carry the
+leaf and the scheme, so a resumption reports the identity of the handshake that issued its ticket
+(rustls keeps the whole chain in its tickets; here only the leaf, and so after `deserialize`). With a mandatory certificate a ticket without one is not resumed (a full handshake
 asks for the certificate; rustls resumes it). A ticket also carries when the certificate was
 proved, carried across re-issued tickets: past the ticket lifetime from that full handshake the
 ticket is not resumed, however young it is — so an expired or revoked certificate does not live
@@ -678,7 +681,8 @@ The receive side's refusals are the table under *Wire format*. Record protection
   signature scheme is matched: a misconfigured key is `internal_error` even for a client that could not have used it.
 - **Client certificates.** The leaf's key and `keyUsage` are checked before the verifier (BoringSSL's order; rustls verifies
   first, so an untrusted unusable leaf gets `unsupported_certificate` here, `unknown_ca` there); a chain signature that does
-  not verify is `bad_certificate` (rustls: `decrypt_error`); only the leaf is kept, not the chain.
+  not verify is `bad_certificate` (rustls: `decrypt_error`); the chain after the leaf is kept only in `setPeerChainBuffer`'s
+  buffer and only for the connection (tickets carry the leaf).
 - **0-RTT.** A `ReplayGuard` shared across threads is the caller's lock. The skip budget (2^14 octets) counts ciphertext, so many
   tiny refused records can exceed it and it cannot skip a full-size early record (as rustls); empty early records cost nothing
   (a binder is needed first); a server KeyUpdate at 2^23 records could fall before the client's Finished (not reachable in
@@ -992,7 +996,6 @@ records (the per-record 4 KiB burn).
   are unobservable today.
 - **Key loading.** Encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys: `fromPemEncrypted`); a private-key reader shared
   with `acme` (request filed in `x509/SPEC.md` § Backlog).
-- **The whole client chain for the application** (rustls `peer_certificates`; here the leaf only).
 - **ML-DSA client leaf.** The AlgorithmIdentifier's absent parameters are checked for the private key, not for a client leaf
   (`x509.Spki` does not expose them).
 - **JA4 differential check** against Wireshark's JA4 field (`tshark` is not installed on the development host).
