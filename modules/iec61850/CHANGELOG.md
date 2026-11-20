@@ -5,21 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** tests only. Whole-module mutation audit closed (2151 mutants: 2065 killed, 86 equivalent or unobservable, none open; see SPEC "Audit 2026-11-18 (whole-module mutation)"): 91 further killing tests for the server's caps, control-block resolution and notification queue, the client's name-list continuation, wait loops and length limits, the TCP adapter's bounds and cancelled write, the report buffer and engine, the SCL parser and resolver, the setting-group and log control blocks, the journal codecs and the SCL writer's exact output. The card now records the whole-module counts. No source line outside the tests changed.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** tests only. Whole-module mutation audit, partial (see SPEC "Audit 2026-11-18 (whole-module mutation)"): killing tests for the BER/TPKT/COTP/session/presentation/ACSE/MMS decoders' boundaries, GOOSE/SV field-shape and frame-length rules, the subscriber's sequence state, ACSI reference parsing, the in-memory link double, server association slots, the application-context check, per-domain lookups, two-association control ownership end to end, client response matching and association refusal, the control `Point`/`Machine` state machines, RCB ownership and attribute writes, report reassembly and the GOOSE publisher's schedule. No source line outside the tests changed.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0. enum `@typeInfo` loops use `field_names`/`field_values`; `EnumSet.empty`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-10** — **Fixed (malformed PDUs are refused, found by the new `IEC61850_FUZZ` driver):** `cotp.decode` refuses a nonzero low nibble of the code octet (`UnknownTpduCode`; for a DT `BadDataTpdu`); `goose.Pdu.decode` and `sv.Asdu.decode` refuse an unknown context tag (`UnexpectedTag`; `security [12]` is still skipped, as the SPEC says) and a wrong constructed bit on a known field; `sv.Asdu.decode` now requires smpCnt [2], confRev [3] and smpSynch [5], and `goose.Pdu.decode` timeAllowedToLive [1] and datSet [2] (`MissingField`; `encode` always writes them, so an absent one used to be invented). `ber.decodeBool` is unchanged (any nonzero octet is TRUE, X.690 8.2.2). Tests: deterministic fuzz driver over all 27 existing harnesses (200,000 runs each, clean) plus a reach test each; the cotp DT oracle compares TPDU-NR through `Data.number`; the GOOSE oracle skips PDUs carrying `security [12]` and, when byte identity fails, accepts only BOOLEAN-octet differences and encoder-defaulted fields ([7]/[9] FALSE, [10], [3]=gocbRef) with a canonical-stability check.
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The write→read→write regression
-  test bound the fixed port 15684; its peer now binds port 0 and publishes the port it got. The F-B
-  test ("one octet does not park the read") slept a fixed 1200 ms and then canceled. On a loaded
-  machine a correct read could still be on its way back, a false red. The test now waits for the
-  read to return on its own, with a 20 s watchdog.
 
 - **2026-09-13** — **BEHAVIOURAL:** A1 finding `iec62351` N1 (cross-module, one commit with
   `iec62351`). `goose.Frame.decode` took `Length - 8` octets as the PDU, so a frame secured under

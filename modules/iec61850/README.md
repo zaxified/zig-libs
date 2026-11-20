@@ -17,6 +17,10 @@ for the ride.
 - **Platform:** any (codecs, state machines, the client's PDU logic and the
   responder are pure computation; only the optional `TcpTransport` adapter
   touches `std.Io.net`).
+- **Dependencies:** the `xml` sibling (SCL parsing and the round-trip check on emission); every
+  other file is std-only and allocation-free. **Concurrency:** single owner — one `Client`/`Server`
+  owns one association; a front end may multiplex peers onto one `Server` by setting `Server.peer`
+  per frame (SPEC.md, Design & invariants).
 - **Model after:** ISO 9506 (MMS) as profiled by IEC 61850-8-1, over ISO
   8073/8327/8823/8650, with wire behaviour cross-checked against captured
   traffic between two independent third-party stacks, against the Wireshark
@@ -185,6 +189,13 @@ overruns, an indefinite length with no terminator, an `MMS Data` nested past
 the depth bound, a GOOSE `Length` that disagrees with the frame, an `allData`
 count contradicting the entries and a `UtcTime` with an impossible accuracy are
 all typed errors.
+
+## Not provided
+
+No IEC 62351 security (TLS on 102, GOOSE/SV signing: the sibling `iec62351`), no R-GOOSE/R-SMV
+(IEC 61850-90-5), no server-side MMS file services, no SCL `Substation` section, no SV timing and no
+PRP/HSR. Reasons and the planned items: SPEC.md *What is deliberately not done* and
+*Backlog / deferred*.
 
 ## Use
 
