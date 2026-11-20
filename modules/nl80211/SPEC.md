@@ -6,7 +6,7 @@
 
 **Scope:** parity — iw 6.17, mdlayher/wifi v0.10.0, rust-netlink/wl-nl80211 (surveyed 2026-11-07; every substantial feature of `iw` that has a request/reply wire shape, and every feature of the Go and Rust libraries that a client of the wire needs, is built or rejected with a reason, see "Compared with"; AP, P2P, TDLS, WoWLAN, CQM, key management and raw MLME are rejected there)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-15 (506/519, 13 eq) · src ce72c3a755145bec
+**Audit:** review 2026-10-04 · mutation 2026-11-15 (506/519, 13 eq) · src c6cb0dd3b1181cf0
 
 **Hardening:** fuzz 2026-11-07 (200,000-run budget per harness clean, NL80211_FUZZ; the wiphy corpus carries HT/VHT/HE, interface-combination and EXT_FEATURES seeds, REACH `capabilities`) · ct n/a — wifi netlink queries (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: dump/wiphy/reg ceilings → `TooManyEntries`/`TooManyMessages`, indexed channel lookup, DUMP_INTR and one-bad-record exits drain to DONE, EventSocket drops a malformed datagram; delta audit 29/29)
 
@@ -441,8 +441,6 @@ attribution.
 - **Capability decoding beyond HT/VHT/HE bytes:** HE/EHT per-bit accessors (needs a capture from an HE radio; this host's iwlwifi
   is 802.11ac), `TID_STATS`, `BSS_PARAM`, `CHAIN_SIGNAL`, and multi-link (`BSS_MLD_ADDR` / `MLO_LINK_ID`) handling beyond decoding the attributes.
 - **`SET_WIPHY` antenna masks** (channel, tx power, RTS/fragmentation, retry limits and coverage class are built).
-- **The third IEEE 802.11i H.4 vector (63 characters) is not pinned**; `pmkFromPassphrase`'s test pins two vectors and the
-  63-character length boundary only (`src/connect.zig`).
 - **An empty mesh id is passed to the kernel unchecked** (`src/modes.zig` rejects only more than 32 bytes).
 - **Parser ceilings as options:** make the fixed ceilings (see § 3, Limits) options only if real hardware ever meets one.
 
