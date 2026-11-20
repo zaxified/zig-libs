@@ -21,7 +21,7 @@
 //!
 //! **Two eras, one server** (spec 2026-07-28, basic/versioning.mdx, "dual-era
 //! server"). A request whose `params._meta` carries
-//! `io.modelcontextprotocol/protocolVersion` is a *modern* (2026-07-28)
+//! `io.modelcontextprotocol/protocolVersion` is a *modern*
 //! request and is served statelessly: its version, client capabilities and
 //! client identity come from that `_meta`, never from an earlier message; its
 //! result carries `resultType`, `_meta.io.modelcontextprotocol/serverInfo` and,
@@ -76,9 +76,11 @@
 //! see the "server→client requests" section for why that is not implementable
 //! here and what to do instead.
 //!
-//! Subscriptions and list-change notifications are NOT implemented — the
-//! advertised capabilities say so (`subscribe:false`, `listChanged:false`),
-//! which the spec allows. Pagination is likewise not implemented: list
+//! Subscriptions and list-change notifications are off by default: the
+//! advertised capabilities then say so (no `subscribe`, no `listChanged`),
+//! which the spec allows. Setting `Server.push` offers them (`listChanged` on
+//! tools/prompts/resources, `resources/subscribe`, `subscriptions/listen`).
+//! Pagination is opt-in too: with `Server.page_size` = 0 (the default) list
 //! results never carry a `nextCursor` (the whole catalog is one page).
 //!
 //! Error behavior: malformed input NEVER panics — it produces the proper
@@ -231,7 +233,7 @@ pub const MethodAnchor = struct {
 /// instead of a hardcoded count, so a new dispatch arm without a matching
 /// `spec_anchor_index` entry turns the suite RED.
 ///
-/// (Re-audit 2026-08-11, F9: the canary used to compare `spec_anchor_index`
+/// (Re-audit, F9: the canary used to compare `spec_anchor_index`
 /// against the literals 14/8/6 and never read the dispatch chain at all, so it
 /// only fired when someone edited the index itself — the one direction that
 /// needs no guard. A method added to `handleMessage` was invisible to it,
@@ -420,7 +422,7 @@ pub fn writeResultLine(w: *std.Io.Writer, id: ?std.json.Value, raw_result_json: 
 /// else — object, array, bool — is not an identifier.
 ///
 /// A non-finite float (`1e999` parses to inf) has no JSON spelling, so it is
-/// not an identifier either (no-panic sweep 2026-10-28 M-6).
+/// not an identifier either (no-panic sweep M-6).
 fn conformingId(v: std.json.Value) bool {
     return switch (v) {
         .string, .integer, .number_string, .null => true,
@@ -710,7 +712,7 @@ fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
     return s[0..end];
 }
 
-// ── the stateless (2026-07-28) request path ─────────────────────────────────
+// ── the stateless request path ─────────────────────────────────
 
 /// What a 2026-07-28 request declared about itself in `params._meta` — the
 /// stateless stand-in for a peer's `initialize`. Built per request and never
@@ -889,7 +891,7 @@ fn writeImplementation(jw: *std.json.Stringify, info: *const Info) std.Io.Writer
 }
 
 /// `Implementation`'s optional `description`, `websiteUrl` and `icons`, on
-/// both the session `serverInfo` and the 2026-07-28 `_meta` one.
+/// both the session `serverInfo` and the `_meta` one.
 fn writeImplementationExtras(jw: *std.json.Stringify, info: *const Info) std.Io.Writer.Error!void {
     if (info.description) |d| {
         try jw.objectField("description");
@@ -1439,7 +1441,7 @@ const secret_needles = [_][]const u8{
 pub fn looksLikeSecretField(name: []const u8) bool {
     // No length limit: the normalized name is scanned through a sliding window
     // exactly as long as the longest needle, so a name of ANY length is
-    // searched in full without allocating. (Re-audit 2026-08-11, F8: this used
+    // searched in full without allocating. (Re-audit, F8: this used
     // to normalize into a fixed `[128]u8` and `break` on overflow, so a
     // credential word past the 128th alphanumeric character — a 130-character
     // label ending in `password` — was never seen. An attacker-supplied field
@@ -1857,7 +1859,7 @@ fn writeElicitationParams(
 
 /// Everything a sampling or elicitation request can be refused for before it
 /// goes anywhere — the capability gate plus the payload checks. Shared by the
-/// session path (`Server.send*Request`) and the 2026-07-28 path
+/// session path (`Server.send*Request`) and the path
 /// (`InputRound.ask`), so neither can drift from the other.
 pub const RequestCheckError = error{
     SamplingNotSupported,
@@ -1885,7 +1887,7 @@ fn checkSamplingRequest(caps: ClientCapabilities, req: SamplingRequest) RequestC
     }
     // `std.json.Stringify` writes +-inf bare (`inf`, not JSON) and NaN as a
     // string: either way the request line is not what the client expects
-    // (review 2026-10-24).
+    //.
     if (req.temperature) |t| if (!std.math.isFinite(t)) return error.InvalidTemperature;
 }
 
@@ -1906,7 +1908,7 @@ fn checkElicitationRequest(arena: std.mem.Allocator, caps: ClientCapabilities, r
     }
 }
 
-// ── multi round-trip requests (2026-07-28, basic/patterns/mrtr.mdx) ─────────
+// ── multi round-trip requests (basic/patterns/mrtr.mdx) ─────────
 //
 // The 2026-07-28 revision removed server→client requests. A `tools/call`,
 // `prompts/get` or `resources/read` that needs something from the client —
@@ -1936,7 +1938,7 @@ fn checkElicitationRequest(arena: std.mem.Allocator, caps: ClientCapabilities, r
 // the state plus the request it belongs to, the principal and an expiry).
 
 /// One entry of `InputRequiredResult.inputRequests`. `roots/list` (the third
-/// kind the spec allows) is not offered: roots are deprecated in 2026-07-28 and
+/// kind the spec allows) is not offered: roots are deprecated and
 /// this module never implemented them on the session path either.
 pub const InputRequest = union(enum) {
     sampling: SamplingRequest,
@@ -2347,7 +2349,7 @@ const ToolCheck = struct {
     output: ?schema_check.Schema,
     /// The schemas as `tools/list` writes them -- the literal parsed and
     /// re-serialized -- computed once here instead of on every list (that
-    /// re-parse was 95 % of a 20-tool `tools/list`, 2026-10-24). Null when the
+    /// re-parse was 95 % of a 20-tool `tools/list`). Null when the
     /// literal is not JSON: `buildToolsList` then parses it as before and
     /// fails where it always did.
     input_json: ?[]const u8,
@@ -2412,7 +2414,7 @@ fn outputFailure(arena: std.mem.Allocator, schema: *const schema_check.Schema, t
     const f = (try schema.validate(arena, v)) orelse return null;
     // Output too large to check within the step budget is the server's own
     // result, not a client's attack: it passes unchecked rather than turning a
-    // correct tool into a failing one (review 2026-10-20 M4).
+    // correct tool into a failing one (review M4).
     if (std.mem.eql(u8, f.keyword, "budget")) return null;
     return try arena.print("Output validation error: {s}{s}{s}", .{ f.pointer, if (f.pointer.len != 0) ": " else "", f.message });
 }
@@ -2908,7 +2910,7 @@ pub const ResourceRequest = struct {
     /// is `.private`, a static file may live longer) overwrites it. Ignored
     /// on the session path, which has no caching fields.
     cache: CacheHint = .{},
-    /// Multi round-trip (2026-07-28): see `InputRound` and `ToolCall.input`.
+    /// Multi round-trip: see `InputRound` and `ToolCall.input`.
     /// A template handler that declines (`false`) has its asks discarded with
     /// its contents; any other handler that asked gets an
     /// `InputRequiredResult`, whatever it returned.
@@ -3084,7 +3086,7 @@ pub const PromptRequest = struct {
     args: std.json.Value,
     /// Accumulated messages (internal; fill via `message`).
     messages: std.ArrayList(Message) = .empty,
-    /// Multi round-trip (2026-07-28): see `InputRound` and `ToolCall.input`.
+    /// Multi round-trip: see `InputRound` and `ToolCall.input`.
     /// Asking anything turns the reply into an `InputRequiredResult`, whatever
     /// the handler returns.
     input: InputRound = .{},
@@ -3246,7 +3248,7 @@ fn writeAnnotations(jw: *std.json.Stringify, a: Annotations) std.Io.Writer.Error
         try jw.endArray();
     }
     // NaN / inf have no JSON spelling: omitted rather than written as an
-    // invalid line (no-panic sweep 2026-10-28 M-10).
+    // invalid line (no-panic sweep M-10).
     if (a.priority) |pr| if (std.math.isFinite(pr)) {
         try jw.objectField("priority");
         try jw.write(pr);
@@ -3392,7 +3394,7 @@ pub const max_subscription_uri_len = 8192;
 /// Uri bytes one `subscriptions/listen` filter may carry in all.
 pub const max_listen_uri_bytes = 256 * 1024;
 /// Open listens and session subscriptions over every peer — the per-peer caps
-/// do not bound a transport with many peers (review 2026-10-20 M5).
+/// do not bound a transport with many peers (review M5).
 pub const max_listens = 4096;
 pub const max_session_subscriptions = 65536;
 
@@ -3575,7 +3577,7 @@ pub const Server = struct {
     /// burnt when it is allocated, even if the send then fails, so a late
     /// answer can never be matched to a different request.
     next_request_id: u64 = 1,
-    /// Caching hint on the 2026-07-28 `server/discover` and list results
+    /// Caching hint on the `server/discover` and list results
     /// (`tools/list`, `resources/list`, `resources/templates/list`,
     /// `prompts/list`). See `CacheHint` for why the default caches nothing.
     list_cache: CacheHint = .{},
@@ -3984,7 +3986,7 @@ pub const Server = struct {
         if (!ok) return sendError(arena, out, id, error_code.internal_error, "Method failed");
         const text = if (buf.items.len == 0) "{}" else buf.items;
         // Handler output is re-serialized recursively: bound its nesting first
-        // (no-panic sweep 2026-10-28 M-2).
+        // (no-panic sweep M-2).
         if (!jsonDepthOk(text)) return sendError(arena, out, id, error_code.internal_error, "Method result is not a JSON object");
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -4592,7 +4594,7 @@ pub const Server = struct {
         // The acknowledgment is built before the entry is registered and the
         // entry dropped again if the write fails: nothing is left behind that
         // the client was never told about, and nothing freed that the table
-        // still points to (review 2026-10-20 H1).
+        // still points to (review H1).
         var aw: std.Io.Writer.Allocating = .init(arena);
         buildListenAck(&aw.writer, l) catch {
             l.free(self.gpa);
@@ -4729,7 +4731,7 @@ pub const Server = struct {
             const w = sink.writerFor(sink.ctx, p.peer) orelse continue;
             // One write of the whole line, as `notifyResourceUpdated` does: a
             // failure between pieces of a `print` left a fragment ahead of
-            // the next message (review 2026-10-24).
+            // the next message.
             var line_buf: [128]u8 = undefined;
             const line = std.mem.print(&line_buf, "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\"}}\n", .{method}) catch unreachable;
             w.writeAll(line) catch continue;
@@ -4756,7 +4758,7 @@ pub const Server = struct {
             if (!std.mem.eql(u8, sub.uri, uri)) continue;
             const w = sink.writerFor(sink.ctx, sub.peer) orelse continue;
             // One write of the whole line: a failure midway must not leave a
-            // fragment that corrupts the next message (review 2026-10-20 L3).
+            // fragment that corrupts the next message (review L3).
             var aw: std.Io.Writer.Allocating = .init(self.gpa);
             defer aw.deinit();
             aw.writer.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"uri\":", .{method}) catch continue;
@@ -5086,7 +5088,7 @@ pub const Server = struct {
         const args: std.json.Value = params.object.get("arguments") orelse .null;
         // `arguments` is an object in every schema revision. Anything else
         // reached a tool with no compiled input schema as `args`, where
-        // `lookupArg` reads every argument as absent (review 2026-10-24).
+        // `lookupArg` reads every argument as absent.
         if (args != .null and args != .object) return sendError(arena, out, id, error_code.invalid_params, "Invalid arguments");
 
         // The SDKs' convention (TS `tools.md` "Send arguments the schema
@@ -5134,7 +5136,7 @@ pub const Server = struct {
         const registered = if (id_json) |k| k.len <= 128 and self.registerInflight(peer, k, &call.cancel_flag) else false;
         // What the answer needs from the registration, copied out: a handler
         // may `addTool`/`removeTool` (a dynamic catalog), which moves or frees
-        // `tool` and `check` (review 2026-10-20 M3).
+        // `tool` and `check` (review M3).
         const tool_name = tool.name;
         const allow_structured = tool.allow_structured;
         const has_output_schema = tool.output_schema.len != 0;
@@ -5258,7 +5260,7 @@ pub const Server = struct {
             if (self.findResource(req.uri)) |r| break :blk r.handler(r.ctx, &req);
             // Indexed, re-read every round: a template handler may add or
             // remove templates, and slices captured once would then be freed
-            // or shifted under the loop (review 2026-10-24).
+            // or shifted under the loop.
             var k: usize = 0;
             while (k < self.resource_templates.items.len) : (k += 1) {
                 const t = self.resource_templates.items[k];
@@ -5382,7 +5384,7 @@ pub const Server = struct {
         // A copy, taken before the handler runs: `prompt` points into
         // `self.prompts`, which a handler that calls `addPrompt` (reallocates)
         // or `removePrompt` (shifts) invalidates -- the use-after-free the
-        // tools path already guards against (review 2026-10-24). The slices
+        // tools path already guards against. The slices
         // inside are the application's and outlive the server.
         const entry = prompt.*;
         const ok = entry.handler(entry.ctx, &req);
@@ -5446,7 +5448,7 @@ fn buildListenAck(w: *std.Io.Writer, l: Listen) std.Io.Writer.Error!void {
 /// One notification on a listen stream: `_meta.subscriptionId` first, then
 /// `uri` for a resource update.
 fn writeStreamNotification(out: *std.Io.Writer, method: []const u8, id_json: []const u8, uri: ?[]const u8) std.Io.Writer.Error!void {
-    // Built whole, then written once (review 2026-10-20 L3); a uri is at most
+    // Built whole, then written once (review L3); a uri is at most
     // `max_subscription_uri_len` (escaping can grow it 6×, still bounded).
     var buf: [6 * max_subscription_uri_len + 512]u8 = undefined;
     var fw: std.Io.Writer = .fixed(&buf);
@@ -5551,7 +5553,7 @@ fn buildCustomResult(jw: *std.json.Stringify, members: std.json.ObjectMap, info:
     try beginResult(jw, modern);
     var it = members.iterator();
     while (it.next()) |e| {
-        // `endResult` writes the 2026-07-28 `_meta` (serverInfo); a handler's
+        // `endResult` writes the `_meta` (serverInfo); a handler's
         // own `_meta` and `resultType` give way to it there.
         if (modern and (std.mem.eql(u8, e.key_ptr.*, "_meta") or std.mem.eql(u8, e.key_ptr.*, "resultType"))) continue;
         try jw.objectField(e.key_ptr.*);
@@ -5599,7 +5601,7 @@ fn sendError(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value,
     try flushLine(out, aw.written());
 }
 
-/// An error response with a `data` member — the 2026-07-28 shapes that carry
+/// An error response with a `data` member — the shapes that carry
 /// one (`UnsupportedProtocolVersionError`, resource-not-found's `uri`).
 /// `data` is any value `std.json.Stringify` can write, so every string in it
 /// is escaped the same way as the rest of the line.
@@ -5765,7 +5767,7 @@ fn isSingleJsonObject(gpa: std.mem.Allocator, text: []const u8) bool {
 }
 
 /// True when `text` is exactly one JSON value of any kind plus whitespace —
-/// the 2026-07-28 `structuredContent` shape. Same `std.json` check as
+/// the `structuredContent` shape. Same `std.json` check as
 /// `isSingleJsonObject`, for the same reasons (it is what makes the newline
 /// strip safe), minus the leading-`{` requirement.
 fn isSingleJsonValue(gpa: std.mem.Allocator, text: []const u8) bool {
@@ -6578,7 +6580,7 @@ test "completion/complete: the spec's examples, both eras" {
         \\{"jsonrpc":"2.0","id":1,"result":{"completion":{"values":["flask"],"total":1,"hasMore":false}}}
         \\
     );
-    // 2026-07-28: the same plus resultType; `_meta.serverInfo` (which the
+    //: the same plus resultType; `_meta.serverInfo` (which the
     // example omits, a SHOULD) is the only other member.
     try expectResponse(&c,
         \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"language","value":"py"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
@@ -6969,7 +6971,7 @@ test "pagination: page_size pages the list, nextCursor until the last page, then
         \\{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"e","description":"","inputSchema":{}}]}}
         \\
     );
-    // One past the end is not a position this server minted (mutation 2026-10-24).
+    // One past the end is not a position this server minted.
     try expectResponse(&s,
         \\{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"cursor":"dDo2"}}
     ,
@@ -7640,7 +7642,7 @@ test "lead: prompts/get without a required argument is -32602, the handler never
     // The card's `**Ahead:**` line. prompts.mdx "Error Handling": servers
     // SHOULD answer "Missing required arguments" with -32602. The Go SDK
     // v1.8.0 calls the handler with the argument absent and returns what it
-    // renders ("Hello, !"; probe `tools/go_lead`, 2026-10-24).
+    // renders ("Hello, !"; probe `tools/go_lead`).
     var lib = TestLibrary{};
     var s = try libraryServer(&lib);
     defer s.deinit();
@@ -7862,7 +7864,7 @@ test "readLine: an over-long unterminated line is capped, not buffered unbounded
 }
 
 test "readLine: the cap is 16 MiB exactly, and it is the delivered value (re-audit F5)" {
-    // Re-audit 2026-08-11 F5: the test above is written entirely in terms of
+    // Re-audit F5: the test above is written entirely in terms of
     // `max_line_len`, so it stays green for ANY value of it — `16 * 1024 * 1024`
     // → `1024` was a green mutation (exit 0), i.e. the DoS bound this constant
     // exists for was unpinned on the very line the previous audit's CRIT was
@@ -8111,7 +8113,7 @@ test "ClientCapabilities.parse: the spec's declaration shapes" {
 }
 
 test "ClientCapabilities.parse: a malformed declaration grants nothing (re-audit F7)" {
-    // Re-audit 2026-08-11 F7: `parse` granted a capability on ANY non-null
+    // Re-audit F7: `parse` granted a capability on ANY non-null
     // value, so it failed OPEN — contradicting its own doc ("Anything
     // unparseable yields all-false (fail closed) — a malformed handshake must
     // never *grant* a capability"). Worst shape: `{"elicitation":"url"}` used
@@ -8897,7 +8899,7 @@ test "looksLikeSecretField: separator/case forms and the words it does NOT claim
 }
 
 test "looksLikeSecretField: a long name is searched in full, not truncated (re-audit F8)" {
-    // Re-audit 2026-08-11 F8: normalization ran into a fixed [128]u8 and
+    // Re-audit F8: normalization ran into a fixed [128]u8 and
     // `break`ed on overflow, so only the first 128 alphanumeric characters
     // were ever searched — a padded label ending in a credential word slipped
     // through the form-mode refusal entirely. Pad lengths straddle the old
@@ -8992,7 +8994,7 @@ test "elicitation: url mode rejects non-navigable schemes and empty ids" {
 }
 
 test "elicitation: userinfo cannot smuggle a host past the http loopback allowance (re-audit F3)" {
-    // Re-audit 2026-08-11 F3: the loopback check matched a host PREFIX and
+    // Re-audit F3: the loopback check matched a host PREFIX and
     // accepted the tail as soon as its first byte was '/', ':' or '?'. The ':'
     // branch swallowed the rest of the authority, so RFC 3986 userinfo defeated
     // it: in `http://localhost:8080@evil.example/steal` the real host is
@@ -9095,7 +9097,7 @@ test "elicitation: userinfo cannot smuggle a host past the http loopback allowan
 }
 
 test "capability gate: one peer's initialize does not move another peer's gate (re-audit F11)" {
-    // Re-audit 2026-09-02 F11: capabilities, the negotiated revision and the
+    // Re-audit F11: capabilities, the negotiated revision and the
     // lifecycle flag were three fields on the `Server`, and a `Server` is
     // shared across sessions by `mcp-http`. So any party that could POST
     // could open a session, declare `elicitation`, and thereby lift the gate
@@ -9609,7 +9611,7 @@ test "outbound: a cancelled request's late answer is ignored" {
 }
 
 test "outbound: the pending table's DEFAULT cap is 256 (re-audit F6)" {
-    // Re-audit 2026-08-11 F6: the test below sets `max_pending = 2` itself, so
+    // Re-audit F6: the test below sets `max_pending = 2` itself, so
     // the DEFAULT — the only value any in-tree consumer actually runs with —
     // was unpinned: `256` → `maxInt(usize)` was a green mutation (exit 0),
     // which is exactly "a client that never answers grows this without bound".
@@ -9855,7 +9857,7 @@ test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
     // dispatch chain (or the server->client send surface) without updating
     // `spec_anchor_index` -- reclassify, don't just bump the numbers.
     //
-    // Re-audit 2026-08-11 F9: this canary used to assert the literals 14/8/6
+    // Re-audit F9: this canary used to assert the literals 14/8/6
     // and NEVER READ the dispatch chain, so it could only fire when someone
     // edited the index itself. A dispatch arm added without a spec anchor was
     // invisible (proved by adding `zzprobe/undeclared` to handleMessage: exit
@@ -10241,7 +10243,7 @@ test "notifications/cancelled: field shape matches the spec's example (basic/uti
 // `smith.value(u64)` drawn AFTER the bytes, so it was 0 as well, which means
 // the `handleMessageFrom` arm the comment calls out as "the peer arm the
 // harness above never exercised" was itself always called with peer 0.
-// Measured 2026-09-07: 1 round, 0 non-empty inputs, 0 methods dispatched.
+// Measured: 1 round, 0 non-empty inputs, 0 methods dispatched.
 
 /// `testkit.fuzz.seed`, aliased so the corpus reads as the JSON-RPC lines it
 /// is. A corpus entry is not the line: `Smith.slice` reads a little-endian
@@ -10351,13 +10353,13 @@ test "corpus: every JSON-RPC seed reaches the dispatcher, and the replies are pi
         reply_octets += out.len;
         if (std.mem.find(u8, out, "\"error\":") != null) errors += 1;
     }
-    // Measured 2026-09-07. Before: 1 round, `handleMessage("")`, one -32700.
+    // Measured. Before: 1 round, `handleMessage("")`, one -32700.
     try testing.expectEqual(message_seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 1731), reply_octets);
     try testing.expectEqual(@as(usize, 9), errors);
 }
 
-// ── fuzz: the inbound RESPONSE path (re-audit 2026-08-11, F4) ───────────────
+// ── fuzz: the inbound RESPONSE path(F4) ───────────────
 //
 // The harness above builds `testServer(null)`, which never ISSUES a
 // server→client request, so `Server.pending` is empty on every iteration and
@@ -10619,7 +10621,7 @@ test "corpus: every response script builds a distinct line, and the octets are p
         seen_len[si] = @min(out.len, 256);
         @memcpy(seen[si][0..seen_len[si]], out[0..seen_len[si]]);
     }
-    // Measured 2026-09-07. Before: the four fuzzed rounds built ONE distinct
+    // Measured. Before: the four fuzzed rounds built ONE distinct
     // line, repeated.
     try testing.expectEqual(@as(usize, 8), distinct); // all eight scripts, none repeating another
     try testing.expectEqual(@as(usize, 470), octets);
@@ -10641,7 +10643,7 @@ fn fuzzClientResponse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
     // is a peer that IS armed, so even that was not the miss it is named for.
     // The aim canary below is hand-written and did keep working, which is why
     // this target looked healthy: it asserted three correlating answers that
-    // do not depend on the fuzzer at all. Measured 2026-09-07: 1 round,
+    // do not depend on the fuzzer at all. Measured: 1 round,
     // 4 identical fuzzed answers, 1 distinct JSON shape.
     var script: [64]u8 = undefined;
     const script_len: usize = src.slice(&script);
@@ -11395,7 +11397,7 @@ test "2026-07-28: malformed per-request metadata is -32602; removed methods are 
         \\{"jsonrpc":"2.0","id":5,"error":{"code":-32602,"message":"Missing io.modelcontextprotocol/protocolVersion"}}
         \\
     );
-    // `ping` does not exist in 2026-07-28 …
+    // `ping` does not exist …
     try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"ping\",\"params\":{" ++ modern_meta_open ++ "}}}",
         \\{"jsonrpc":"2.0","id":6,"error":{"code":-32601,"message":"Method not found"}}
         \\
@@ -11614,7 +11616,7 @@ test "mcp: 2026-07-28 spec-anchor classification matches servedStatelessly (cana
     try testing.expectEqual(@as(usize, 10), modern_spec_anchor_index.len);
 }
 
-// ── multi round-trip requests (2026-07-28) ──────────────────────────────────
+// ── multi round-trip requests ──────────────────────────────────
 //
 // Anchored on the revision's own MRTR examples: `schema/2026-07-28/examples/
 // InputRequests/elicitation-and-sampling-input-requests.json`,
@@ -12038,7 +12040,7 @@ test "2026-07-28 MRTR: sealState/openState bind the state to the round's method 
     try testing.expect(std.mem.find(u8, ok, "\"text\":\"done\"") != null);
 }
 
-// ── subscriptions/listen (2026-07-28) ───────────────────────────────────────
+// ── subscriptions/listen ───────────────────────────────────────
 
 test "2026-07-28 anchor: subscriptions/listen acknowledges an empty filter and closes gracefully (schema examples)" {
     var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
@@ -12133,7 +12135,7 @@ test "subscriptions/listen: integer ids echo as integers; a non-object filter is
     try testing.expect(std.mem.find(u8, legacy, "acknowledged") == null);
 }
 
-// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// ── deterministic fuzz driver ───────────────────────────────────
 //
 // The harnesses above are generic over their source of choices
 // (`fn(comptime S, *S, gpa)`); `testing.fuzz` feeds them through `FuzzScript`,
@@ -12324,7 +12326,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -12334,7 +12336,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── no-panic sweep 2026-10-28 ───────────────────────────────────────────────
+// ── no-panic sweep ───────────────────────────────────────────────
 
 /// `{"jsonrpc":"2.0","id":1,"method":<method>,"params":{"a":[[…]]}}` whose
 /// total bracket depth is exactly `depth` (outer object + params object + arrays).
@@ -12529,7 +12531,7 @@ test "sweep 2026-10-28 M-3: brackets inside a string do not count toward max_jso
     );
 }
 
-// ── whole-module mutation run 2026-11-11: gaps it found ─────────────────────
+// ── whole-module mutation run: gaps it found ─────────────────────
 
 fn parseJsonText(arena: std.mem.Allocator, text: []const u8) !std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
@@ -13161,7 +13163,7 @@ test "mutation 2026-11-11: a listen is told about the catalog it asked for, not 
     }
 }
 
-// ── mutation 2026-11-11: dispatch, limits, bookkeeping ──────────────────────
+// ── mutation: dispatch, limits, bookkeeping ──────────────────────
 
 /// Feed one message and assert that the answer contains `needle`.
 fn expectContains(s: *Server, msg: []const u8, needle: []const u8) !void {

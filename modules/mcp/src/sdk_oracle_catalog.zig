@@ -33,7 +33,7 @@ pub fn Catalog(comptime mcp: type) type {
             return false;
         }
 
-        /// Asks for a name on the 2026-07-28 path (MRTR), greets once answered.
+        /// Asks for a name on the path (MRTR), greets once answered.
         fn greet(_: ?*anyopaque, call: *mcp.ToolCall) bool {
             if (call.input.elicitation("name")) |r| {
                 if (r.action != .accept) {

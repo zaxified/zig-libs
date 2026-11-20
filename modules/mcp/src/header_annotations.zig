@@ -48,7 +48,7 @@ pub const max_chain = 32;
 pub fn validate(gpa: std.mem.Allocator, input_schema: []const u8) Error!void {
     // The cheap pre-check works on the raw text, so it must also let through
     // any schema with an escape: `"x-mcp-header"` spelled with `\u` escapes
-    // is the same key once parsed, and skipped every rule (review 2026-10-24).
+    // is the same key once parsed, and skipped every rule.
     if (std.mem.find(u8, input_schema, "x-mcp-header") == null and std.mem.findScalar(u8, input_schema, '\\') == null) return;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();

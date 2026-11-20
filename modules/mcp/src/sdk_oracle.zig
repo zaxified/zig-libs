@@ -12,7 +12,7 @@
 //! for byte. A change to the module's wire output fails here until the SDK
 //! has accepted the new bytes (re-run `drive.py`).
 //!
-//! One judged departure of the SDK's, not ours: on the 2026-07-28 path it
+//! One judged departure of the SDK's, not ours: on the path it
 //! still sends `ping`, which that revision removed (changelog, major change
 //! 5); the server answers -32601 and `drive.py` checks for exactly that.
 

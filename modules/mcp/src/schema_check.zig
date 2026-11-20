@@ -381,7 +381,7 @@ const EqlStop = error{
 /// bounding their depth or size. Unbounded, two equal-shaped 200k-deep
 /// arrays (under 1 MB on the wire) overflowed the stack, and 500 items of
 /// 10k elements cost 1e9 compares inside a budget charged per pair
-/// (review 2026-10-24).
+///.
 fn jsonEql(budget: *Budget, a: std.json.Value, b: std.json.Value, depth: u32) EqlStop!bool {
     if (budget.left == 0) return error.Budget;
     budget.left -= 1;
@@ -468,7 +468,7 @@ const Checker = struct {
     /// Inside a branch whose failure is thrown away (anyOf / oneOf / not / the
     /// `if` condition) only "it failed" matters, so `fail` builds no pointer or
     /// message: the arena grows with the number of REPORTED failures, not with
-    /// branches x path length (no-panic sweep 2026-10-28 M-1).
+    /// branches x path length (no-panic sweep M-1).
     quiet: bool = false,
 
     fn quieted(c: Checker) Checker {

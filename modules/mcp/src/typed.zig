@@ -484,7 +484,7 @@ test "parse: OOM is an error, never a crash" {
 }
 
 // Verdicts frozen from tools/typed_oracle (github.com/google/jsonschema-go v0.4.3
-// inferring the schema of equivalent Go structs, run 2026-11-13): `schemaOf` +
+// inferring the schema of equivalent Go structs, run): `schemaOf` +
 // `schema_check` and `parse` must agree with them on every instance.
 const OracleRow = struct { valid: bool, instance: []const u8 };
 const oracle_search = [_]OracleRow{
@@ -541,7 +541,7 @@ test "schemaOf: verdicts agree with jsonschema-go" {
     try expectOracle(OTriple, &oracle_triple);
 }
 
-// ── mutation-run tests (2026-11-13): the hostile-client shapes of `decode` ──
+// ── mutation-run tests: the hostile-client shapes of `decode` ──
 
 fn objWith(arena: std.mem.Allocator, key: []const u8, val: std.json.Value) !std.json.Value {
     var m: std.json.ObjectMap = .empty;
