@@ -28,7 +28,8 @@ validated byte-exact against the official RFC test vectors. See
 | `ed448.zig` | RFC 8032 Ed448/Ed448ph: `dom4` framing, wire codecs, `Point` curve arithmetic (complete Edwards formulas), sign/verify |
 | `scalar.zig` | Arithmetic mod `L` (the edwards448 subgroup order) for Ed448 signing — constant-time binary reduction |
 | `kat_vectors.zig` | Official RFC 7748 §5.2/§6.2 (X448) and RFC 8032 §7.4/§7.5 (Ed448/Ed448ph) test vectors |
-| `kat_test.zig` | Byte-exact KAT assertions against `kat_vectors.zig` through the public API |
+| `rfc8032_vectors.zig`, `wycheproof_vectors.zig` | Every RFC 8032 §7.4/§7.5 vector, and the Wycheproof `ed448_test.json` cases, as data |
+| `kat_test.zig` | Byte-exact KAT assertions against the vector files through the public API |
 
 ## Import
 
@@ -45,6 +46,14 @@ var kp: x448.KeyPair = undefined;
 x448.KeyPair.generate(&kp, io); // secret half lands in `kp`, no temporary
 var shared: [x448.shared_length]u8 = undefined;
 try x448.scalarmult(&shared, &kp.secret_key, peer_public_key);
+```
+
+An Ed448 key converts to an X448 one (RFC 7748 §4.2's 4-isogeny, libdecaf's `convert_private_key_to_x448`):
+
+```zig
+var xkp: x448.KeyPair = undefined;
+try x448.KeyPair.fromEd448(&xkp, &ed_kp); // ed_kp: ed448.ed448.KeyPair; error.IdentityElement for x = 0
+const xpub = try x448.publicKeyFromEd448(ed_kp.public_key.bytes);
 ```
 
 ## Ed448 (signatures)
@@ -80,14 +89,19 @@ zig build -Doptimize=ReleaseFast test-ed448   # ReleaseFast — all green
 zig fmt --check modules/ed448/
 ```
 
-All tests pass in both modes. `kat_test.zig` asserts byte-exact
-output against the official RFC 7748 §5.2/§6.2 (X448: both single-vector
-tests, the 1-iteration test, and the full Alice/Bob Diffie-Hellman
-example) and RFC 8032 §7.4/§7.5 (Ed448: the empty-message, 1-octet,
-1-octet-with-context, and 11-octet vectors; Ed448ph: the "TEST abc"
-vector) test vectors, plus context-binding, tamper-reject, and
-Ed448-vs-Ed448ph cross-rejection property tests; the per-file suites add
+`kat_test.zig` asserts byte-exact output against the official RFC 7748
+§5.2/§6.2 (X448: both single-vector tests, the 1-iteration test, and the
+full Alice/Bob Diffie-Hellman example) and every RFC 8032 §7.4 Ed448 and
+§7.5 Ed448ph vector, plus context-binding, tamper-reject, and
+Ed448-vs-Ed448ph cross-rejection property tests, and holds `verify` to the
+Wycheproof `ed448_test.json` cases; the per-file suites add
 field/scalar/point self-checks (inverse, sqrt, encode/decode
 round-trips, non-canonical rejects).
+
+## Not provided
+
+RFC 9380 hash-to-curve, batch verification and key blinding, a cofactorless `verify`, and the all-zero
+shared-secret check in `x448.scalarmult` (the caller's). See SPEC *What is deliberately not done* and
+*Backlog / deferred*.
 
 Provenance: see [NOTICE](NOTICE).

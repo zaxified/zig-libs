@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-17** — NO CONSUMER-VISIBLE CHANGE: audit card refreshed after the tests-only commit (all RFC 8032 vectors and Wycheproof `ed448_test.json`); production code unchanged, so no mutants were run.
 - **2026-11-17** — **TESTS (no src change):** all 11 RFC 8032 §7.4/§7.5 vectors (9 Ed448 incl. the 1023-octet message, 2 Ed448ph; `rfc8032_vectors.zig`) and the 87 Wycheproof `ed448_test.json` cases (`wycheproof_vectors.zig`; 17 valid, 70 invalid, 0 acceptable) are asserted in `kat_test.zig`; `verify` agrees with Wycheproof on every case (12 wrong-length, 16 non-canonical `S`, 42 rejected by the verification/small-order check). Wycheproof attribution added to `NOTICE`.
 - **2026-11-16** — `x448.KeyPair.fromEd448` and `x448.publicKeyFromEd448` (libdecaf's Ed448 → X448 conversion, std's
   `X25519.KeyPair.fromEd25519` analogue): u = y²/x² through RFC 7748's 4-isogeny, the secret the first 56 bytes of
@@ -25,10 +24,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `KeyPair.create(seed: *const [57]u8)`, `x448.scalarmult(out, k: *const, u) !void`,
   `x448.recoverPublicKey(k: *const)`, `x448.KeyPair.generateDeterministic(out, seed: *const) !void`,
   `x448.KeyPair.generate(out, io)`. 0 residues after, caller's frame included.
-- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
-  bodies are now generic over their source and run by testkit's deterministic
-  driver `ED448_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
-  every test run); test code only. New `tools/bench.zig` (`zig build bench-ed448`) against OpenSSL Ed448/X448.
 - **2026-10-04** — Fix (BEHAVIOURAL): `verify`/`verifyPh` now reject `S >= L` themselves
   (`error.InvalidScalar`). Before, only `Signature.fromBytes` checked it, so a `Signature`
   built field by field with `S + L` (or bits 448..455 set) verified — a malleable second

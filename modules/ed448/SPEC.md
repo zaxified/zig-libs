@@ -19,13 +19,6 @@
 Ed448/X448, the "Goldilocks" 448-bit curve family; see [README.md](README.md)
 for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: implemented.** Wire codecs, clamping, `dom4` domain-separation
-framing, sign/verify/DH orchestration, AND the full field/scalar/curve
-number-theory (`field.zig`'s `Fp448` arithmetic, `x448.zig`'s Montgomery
-ladder, `ed448.zig`'s `Point` operations, `scalar.zig`'s mod-`L`
-arithmetic) are real — see "Implementation notes (crypto core)" below
-for how each formerly-stubbed piece was built.
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date.
@@ -37,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [RustCrypto/elliptic-curves](https://github.com/RustCrypto/elliptic-curves) `ed448-goldilocks` | Rust | Apache-2.0 OR MIT (crate manifest + LICENSE-MIT/-APACHE) | 876 (monorepo) | crate 0.14.0-pre.15; no GitHub releases, pushed 2026-09-28 | Pre-release crate whose README says "NOT BEEN AUDITED OR REVIEWED". Exposes the curve, Curve448, Decaf448, RFC 9380 hash-to-curve/hash-to-scalar and an optional signing feature; group-level API (points, scalars), where this module offers the two protocols plus raw `Point`. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No 448-bit curve at all (checked `lib/std/crypto/`: `25519/`, `pcurves/{p256,p384,secp256k1}`, no 448 field or curve). |
 
-**Where we are ahead:** the only Ed448/X448 in Zig (a GitHub search for Ed448 in Zig found none), pure Zig with no C, constant-time secret paths with a `ctgrind` harness, and a recorded security review (Audit line) where the Rust crate's README says it has none. **Where we are behind:** RFC 9380 edwards448 hash-to-curve, batch verification and the X448/Ed448 key mapping that the Rust crate or CIRCL-style toolkits offer as extras (→ Backlog); none of these is part of what OpenSSL offers for Ed448/X448.
+**Where we are ahead:** the only Ed448/X448 in Zig (a GitHub search for Ed448 in Zig found none), pure Zig with no C, constant-time secret paths with a `ctgrind` harness, and a recorded security review (Audit line) where the Rust crate's README says it has none; the Ed448 to X448 key conversion (`x448.publicKeyFromEd448`, `x448.KeyPair.fromEd448`) that libdecaf and `std`'s `X25519.KeyPair.fromEd25519` offer. **Where we are behind:** RFC 9380 edwards448 hash-to-curve and batch verification / key blinding that the Rust crate or CIRCL-style toolkits offer as extras (→ *Backlog / deferred*); none of these is part of what OpenSSL offers for Ed448/X448.
 
 ## Design
 
@@ -57,12 +50,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   curve forms are birationally equivalent (same underlying group, RFC
   7748 §4.1's map for the 25519 case; RFC 7748 does not spell out the
   448 map explicitly, but the relationship is the same shape) but this
-  module does NOT implement a Montgomery<->Edwards point conversion —
-  `x448.zig` and `ed448.zig` are independent consumers of `field.zig`,
-  not of each other (matching `std.crypto.dh.X25519`/`sign.Ed25519`'s
-  own independence, aside from the one-directional `fromEd25519`
-  convenience `std.crypto.dh.X25519.KeyPair` offers that this module does
-  NOT currently mirror — see "Out of scope" below).
+  module does NOT implement a general Montgomery<->Edwards point conversion —
+  `x448.zig`'s ladder and `ed448.zig`'s `Point` are independent consumers of
+  `field.zig`, matching `std.crypto.dh.X25519`/`sign.Ed25519`. The one exception
+  is the one-directional key conversion that `std.crypto.dh.X25519.KeyPair.fromEd25519`
+  also offers, see the *Ed448 to X448* bullet below.
 - **Field representation: 8×56-bit limbs (hand-rolled), NOT
   `std.crypto.ff`.** `bls12_381/src/fp.zig` (this repository's other
   large-prime field module) delegates entirely to `std.crypto.ff.
@@ -91,7 +83,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   [4]R + [4][k]A'`), matching `std.crypto.sign.Ed25519`'s own default
   cofactored `verify()` for the analogous reason — see "Threat model"
   below for why cofactored (not cofactorless) is this module's only
-  variant so far.
+  variant.
 - **`dom4` — always non-empty, unlike Ed25519's `dom2`.** RFC 8032 §5.1:
   Ed25519's plain (non-`ctx`, non-`ph`) mode uses an EMPTY `dom2` — no
   domain separation at all, which is why `std.crypto.sign.Ed25519.sign`
@@ -113,16 +105,78 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   sign bit of its own; `ed448.zig`'s `Point.toBytes`/`fromBytes` do the
   56-byte-`Fe` <-> 57-byte-point-encoding conversion at the point layer,
   not inside `field.zig`.
+- **Weakly reduced field elements.** An `Fe` has every limb `< 2^57` and is any representative of its
+  residue class below `2^457`; `add`/`sub`/`mulSmall` end with one parallel carry step (`carryWeak`, the
+  carry out of limb 7 folds into limbs 0 and 4, `2^448 ≡ 2^224 + 1`), `sub` adds `4p` limb-wise so no limb
+  goes negative, and `mul`/`square` end with one carry pass after the Goldilocks fold; nothing subtracts `p`.
+  The canonical representative (`0 <= value < p`) is produced only where a value leaves the arithmetic or
+  is compared (`toBytes`, `isOdd`, `isZero`, `eql`, all through `canonical`), so the codec and those
+  predicates behave as with always-canonical values; `fromBytes` and the constants are canonical, which is
+  also weak. Code outside `field.zig` never reads `limbs`.
+- **Field operations.** `mul` is an 8×8-limb schoolbook multiply into 15 `u128` column accumulators, then
+  `reduceColumns` (the high columns folded onto `k-4` and `k-8`, one carry pass); `square` is its
+  squaring form, and `mulI`/`squareI` are forced-inline variants for the point formulas and the ladder
+  step (inlining measured faster; other multiply layouts were measured and not kept, see `Fe.mul`'s doc
+  comment). `invert` and `sqrt` use fixed addition chains over a shared head (`chainHead`: `e2` and `e222`):
+  `invert` is Fermat `a^(p-2)` (RFC 8032 §5.2.1), `sqrt` is the `p ≡ 3 (mod 4)` candidate
+  `a^((p+1)/4)` verified by squaring. `sqrtRatio(u, v)` is RFC 8032 §5.2.3's combined power
+  `x = u^3 v (u^5 v^3)^((p-3)/4)`, accepted iff `v x^2 = u`, one exponentiation instead of an inversion
+  plus a square root; point decoding uses it. `pow(a, e)` (big-endian 56-byte exponent) is the generic
+  square-and-always-multiply, constant-time in base and exponent, kept for other exponents (`decaf448`).
+- **X448 ladder** (`x448.zig`): RFC 7748 §5's `x_2/z_2/x_3/z_3` recurrence, a fixed 448 iterations driven
+  by the running swap bit through `Fe.ctSwap`, `a24` (39081) applied with `Fe.mulSmall`, and the final
+  `x_2 * z_2^(p-2)` through `invert() catch Fe.zero` (a small-order input drives `z_2` to 0, for which the
+  RFC formula yields 0; the caught branch depends only on the PUBLIC input point). `scalarmult` clamps `k`
+  itself, as `std.crypto.dh.X25519.scalarmult` does.
+- **`ed448.zig`'s `Point` arithmetic.** `add`/`dbl` are RFC 8032 §5.2.4's complete addition and dedicated
+  doubling formulas; `neg` flips `x`; `equivalent` is the cross-multiplied projective comparison (no
+  inversion). `mul` runs 112 fixed 4-bit windows over all 448 bits (bit 447 included: the RFC 8032 §5.2.5
+  CLAMPED secret scalar has bit 447 set and is used un-reduced by keygen and signing): four doublings and
+  one unconditional add per window, the 16-entry table built from `p` and read by a masked scan
+  (`ctSelectPoint`); `mulBasePoint` uses the comptime fixed-base comb `baseComb[112][16]`
+  (`[d·2^(4w)]B`), so no runtime doublings, 112 masked lookups and adds. `verify` uses a variable-time
+  Straus double-scalar pass (`mulDoubleBaseVartime`) over width-`w` NAFs: width 7 for `B` (a comptime table
+  of 32 odd multiples) and width 5 for the public key (8 odd multiples built per call).
+- **`Point.fromBytes` / `toBytes`** (RFC 8032 §5.2.2/§5.2.3): `y` occupies bytes 0..55 in full (bit 447
+  is part of `y`, `p < 2^448`); byte 56 holds the sign bit of `x` in its top bit and its low 7 bits are
+  required-zero padding (`error.InvalidEncoding`); `x = 0` with sign bit 1 is refused. `toBytes` of a
+  `Point` with `z == 0` (only a hand-built struct can make one) is total and encodes as 57 zero bytes.
+- **`verify`** (RFC 8032 §5.2.7): `S` must satisfy `0 <= S < L` here as well as in `Signature.fromBytes`
+  (`Signature`'s fields are public, so a value built field by field never went through that parse; a
+  non-canonical `S` is `error.InvalidScalar`); `R` and `A'` are decoded; both are refused with
+  `error.SignatureVerificationFailed` if clearing the cofactor makes them the identity (the public-key
+  guard prevents the universal forgery `A' = O, R = O, S = 0`, which verifies for every message; the `R`
+  guard is this module's policy, RFC 8032 itself would accept a key holder's signature with `R = O`);
+  then the cofactored equation `[4]([S]B + [k](-A')) = [4]R` with `k = SHAKE256(dom4 ‖ R ‖ A' ‖ M, 114)
+  mod L`.
+- **Scalars** (`scalar.zig`): internal 56-bit `u64` limbs, 9 per scalar. `L` has no Solinas structure, so
+  reduction is a generic constant-time binary long division (`reduceLimbs`): one fixed iteration per input
+  bit, each `r = 2r + bit` then a branch-free conditional subtract of `L` (`condSubL`, the same
+  trial-subtract-and-select shape as the field's). `reduceWide` reduces the 114-byte digest (17 limbs);
+  `mul` is a 9×9 schoolbook product (accepting un-reduced 456-bit inputs, the clamped scalar again)
+  through the same reduction; `add` is one limb add and one conditional subtract; `mulAdd` is
+  `add(mul(a, b), c)`.
+- **Ed448 to X448** (`x448.publicKeyFromEd448`, `x448.KeyPair.fromEd448`): the X448 public key of an
+  Ed448 public key goes through RFC 7748 §4.2's 4-isogeny `u = y²/x²`, which sends the Ed448 base point to
+  `u = 5`, so the image of `[s]B` is `X448(s, 5)`. A key that does not decode is refused as Ed448 refuses
+  it; one with `x = 0` (the identity and `(0, -1)`, whose image is the point at infinity or of order 2)
+  is `error.IdentityElement`. `KeyPair.fromEd448` is libdecaf's `convert_private_key_to_x448` (std's
+  `X25519.KeyPair.fromEd25519` analogue): the X448 secret is the first 56 bytes of `SHAKE256(seed, 114)`,
+  the bytes Ed448 clamps into its scalar, so X448's own clamping yields the same scalar; the digest is
+  wiped and the derivation burned. Using one key for both signing and key agreement is a protocol
+  decision this only makes possible; prefer separate keys.
+- **decaf448** — the prime-order-group wrapper that removes edwards448's cofactor — is the sibling module
+  `decaf448`, which rides this module's `Point.mul`.
 
 ## Threat model / limits
 
 - **Constant-time posture (as implemented).** Every secret-input path is
   branch-free with fixed iteration counts: `field.zig`'s
-  `add`/`sub`/`mul`/`square` (fixed carry/fold rounds, mask-select
-  conditional subtracts), `pow` (square-and-always-multiply,
+  `add`/`sub`/`mul`/`square` (fixed carry/fold rounds, no data-dependent subtract),
+  `canonical` (mask-select conditional subtract), `pow` (square-and-always-multiply,
   mask-selected — constant-time in base and exponent both, though every
   current caller's exponent is public), `isZero`/`eql` (accumulator
-  compares, no early exit), `ctSelect`/`ctSwap` (byte-mask merges);
+  compares, no early exit), `ctSelect`/`ctSwap` (limb mask merges);
   `x448.zig`'s ladder (fixed 448 iterations, `ctSwap` swaps);
   `ed448.zig`'s `Point.mul` / `mulBasePoint` (fixed 112 nibble windows,
   each a masked 16-entry table scan plus an unconditional point-add) —
@@ -136,60 +190,57 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   secret path — the ladder's `z_2.invert() catch Fe.zero` — branches
   only on whether the PUBLIC input point has small order, never on
   scalar bits (see `ladder`'s comment). KATs cannot detect timing
-  side-channels — so this posture is MEASURED, not merely constructed,
-  and since 2026-08-11 the measurement is a **committed program** rather
-  than a number to take on faith:
+  side-channels — so this posture is MEASURED, not merely constructed:
   [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
-  `scripts/checks/ctgrind.sh ed448`. It marks the seed `MAKE_MEM_UNDEFINED`,
-  forces a volatile reload, and drives it through two targets. **Full
-  control table** (zig 0.16.0, valgrind 3.26.0, x86_64, ReleaseFast,
-  2026-08-11; `in-file` = memcheck CONTEXTS whose stack names an `ed448`
-  source):
+  `scripts/checks/ctgrind.sh ed448`, marks the seed `MAKE_MEM_UNDEFINED`,
+  forces a volatile reload, and drives it through two targets
+  (valgrind memcheck, x86_64, ReleaseFast; `in-file` = memcheck CONTEXTS whose
+  stack names an `ed448` source):
 
-  | target | `-fvalgrind` | seed tainted | total contexts | in `ed448` src | exit |
-  |---|---|---|---|---|---|
-  | `full` (`KeyPair.create` + `sign` + `x448.scalarmult`) | yes | **yes** | 9 | **3** | 99 |
-  | `full` | yes | no | 0 | 0 | 0 *(control)* |
-  | `full` | **no** | yes | 0 | 0 | 0 *(trap)* |
-  | `ladder` (`Point.mul` + `Point.mulBasePoint`, no `toBytes`) | yes | **yes** | 12 | **0** | 99 |
-  | `ladder` | yes | no | 0 | 0 | 0 *(control)* |
-  | `ladder` | **no** | yes | 0 | 0 | 0 *(trap)* |
+  | target | `-fvalgrind` | seed tainted | in `ed448` src |
+  |---|---|---|---|
+  | `full` (`KeyPair.create` + `sign` + `x448.scalarmult`) | yes | **yes** | **3** |
+  | `full` | yes | no | 0 *(control)* |
+  | `full` | **no** | yes | 0 *(trap)* |
+  | `ladder` (`Point.mul` + `Point.mulBasePoint`, no `toBytes`) | yes | **yes** | **0** |
+  | `ladder` | yes | no | 0 *(control)* |
+  | `ladder` | **no** | yes | 0 *(trap)* |
 
-  All three `full` contexts are the SAME line — `Fe.invert`'s
-  `if (a.isZero())` guard at `field.zig:473` — reached from
-  `Point.toBytes` (`ed448.zig:314`, once from `KeyPair.create` and once
-  from `signInternal`) and from the X448 ladder's final `z_2.invert()`
-  (`x448.zig:156`). Read them yourself with
-  `scripts/checks/ctgrind.sh --stacks ed448` rather than trusting this
-  sentence. Neither is a leak, and neither may be removed: for
-  `Point.toBytes` the operand is a projective `Z` on a complete Edwards
-  curve, so the branch outcome is invariantly "nonzero" for every
-  scalar; for the ladder it is the small-order case above, fixed by the
+  All three `full` contexts are the SAME line — `Fe.invert`'s `isZero`
+  guard — reached from `Point.toBytes` (once from `KeyPair.create` and
+  once from the signing path) and from the X448 ladder's final `z_2.invert()`.
+  Read them yourself with `scripts/checks/ctgrind.sh --stacks ed448` rather
+  than trusting this sentence. Neither is a leak, and neither may be
+  removed: for `Point.toBytes` the operand is a projective `Z` on a
+  complete Edwards curve, so the branch outcome is invariantly "nonzero" for
+  every scalar; for the ladder it is the small-order case above, fixed by the
   public input point. Both are genuine VALIDATIONS
   (`error.NotInvertible` on zero), the opposite of the scalar-derived
   rejection `ecvrf` had to strip out of `std`'s `Edwards25519.mul` —
   which this module is not exposed to, since `Point.mul` has no
   rejection and no error union.
 
-  The non-zero `total` on both rows is the propagation witness: the
-  taint demonstrably reached the harness's (non-constant-time) hex
+  The non-zero total of contexts on both rows is the propagation witness:
+  the taint demonstrably reached the harness's (non-constant-time) hex
   formatter, so `ladder`'s **0** means "no branch found", not "the taint
-  never arrived". `ladder` uses `Fe.toBytes` rather than
-  `Point.toBytes` precisely so the `Fe.invert` context above cannot
-  double as its own witness.
-
-  **Teeth, measured 2026-08-11.** Re-introducing a variable-time
-  `if (nibble != 0) acc = acc.add(table[nibble]);` in `Point.mul` moves
-  the `ladder` row from **12 total / 0 in-file** to **10 / 4** (and
-  `decaf448`'s own harness, which rides this ladder, from 6/0 to 4/4) —
-  the harness reaches the code it claims to. It does NOT move the `full`
-  row, which stays 3: `KeyPair.create`/`sign` use the fixed-base
-  `mulBasePoint` comb and X448 has its own ladder, so `Point.mul` is not
-  on that path at all. Reverted; `cmp` against a pre-mutation copy
-  confirmed byte-identical. *(An earlier note recorded this mutation as
-  "report 860" — that was the ERROR count, not the context count;
-  measured here as 421 errors from 4 contexts. Errors and contexts are
-  not interchangeable and the earlier phrasing mixed them.)*
+  never arrived". `ladder` uses `Fe.toBytes` rather than `Point.toBytes`
+  precisely so the `Fe.invert` context above cannot double as its own
+  witness. A variable-time `if (nibble != 0)` in `Point.mul` moves the
+  `ladder` row's in-file count off 0 but not the `full` row, because
+  `KeyPair.create`/`sign` use the fixed-base `mulBasePoint` comb and X448
+  has its own ladder: `Point.mul` is not on that path at all.
+- **Select masks.** The masks of `Fe.ctSelect` and `condSubP` go through `field.blackBox` (an empty
+  asm barrier): ReleaseFast had compiled `Fe.ctSelect` to a conditional jump, seen through
+  `decaf448`'s `Element.encode`/`oneWayMap` on secret values by `voprf`'s ctgrind rows (`ed448`'s own
+  rows never reached it with a tainted condition). The same barrier on `scalar.zig`'s `condSubL` moved a
+  scalar copy into a frame `decaf448`'s `scalar.invert` stack probe reads, so `condSubL`'s mask is not
+  laundered (*Backlog / deferred*). The `Fe.fromBytes` canonical verdict `voprf` also reports is a
+  verdict on whether an encoding is `< p`; on the `decaf448` path that rebuilds an element from computed
+  bytes, it always passes.
+- **Dead stack.** `Point.mul`, `Point.mulBasePoint`, Ed448 signing and key creation, and
+  `x448.scalarmult` / `x448.KeyPair.fromEd448` run their body one frame down (`noinline`) and then
+  zero the bytes it dirtied (`burn.zig`, 48 KiB for the point and signing paths, 8 KiB for X448;
+  `stackprobe_test.zig` and `stackprobe2_test.zig` go red when a body outgrows its burn).
 - **X448's `scalarmult` REJECTS non-canonical `u`** rather than silently
   masking the high bit the way RFC 7748 §5's own text permits
   ("implementations SHOULD mask the most significant bit in the final
@@ -212,9 +263,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Ed448's `verify` uses cofactored (not cofactorless) checking.** Same
   rationale `std.crypto.sign.Ed25519`'s own default `verify()` documents:
   broader interoperability, aligns with common batch-verification
-  approaches. A hypothetical `verifyStrict` (cofactorless, RFC 8032
-  §5.2.7's `[S]B = R + [k]A'` variant) is NOT currently implemented — see
-  "Out of scope" below.
+  approaches. A cofactorless `verifyStrict` (RFC 8032
+  §5.2.7's `[S]B = R + [k]A'` variant) is not implemented, see
+  *What is deliberately not done*.
 - **All-zero X448 shared secret**: RFC 7748 §6.2 notes an X448 output can
   be the all-zero value if a peer sends a small-order `u`-coordinate;
   callers SHOULD check for and reject the all-zero shared secret (the RFC's
@@ -223,186 +274,67 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   protocol layer built on top, matching `std.crypto.dh.X25519`'s
   identical choice to leave the check to the caller.
 
-## Out of scope (this scaffold)
+## What is deliberately not done
 
-- **decaf448** — the prime-order-group wrapper that eliminates
-  edwards448's cofactor-4 subgroup entirely (a distinct, separate
-  construction layered on top of, not a variant of, plain Ed448). Not
-  requested by the task that produced this scaffold; it now exists as the
-  sibling module `decaf448`, which rides this module's ladder.
-- **Hash-to-curve / Elligator2 for edwards448** — RFC 9380 defines one
-  (`edwards448_XMDSHA512_ELL2_RO_`/`_NU_`, mirroring `std.crypto.ecc.
-  Edwards25519.fromString`'s RFC-9380 support for the 25519 case); not
-  required for plain X448 DH or Ed448 signing, and not implemented here.
-- **`X448.KeyPair.fromEd448`** — the X25519-side convenience
-  `std.crypto.dh.X25519.KeyPair.fromEd25519` offers (deriving an X25519
-  key pair from an Ed25519 one via the birational map) has no `ed448.zig`
-  analogue in this scaffold; `x448.zig` and `ed448.zig` are independent
-  consumers of `field.zig`, not cross-wired to each other.
-- **Ed448 batch verification / key blinding** — `std.crypto.sign.
-  Ed25519` offers `verifyBatch` and a `key_blinding` submodule; neither
-  has an Ed448 analogue here.
-
-## Implementation notes (crypto core, 2026-07-15)
-
-The formerly-stubbed number theory, as built (each function's own doc
-comment carries the details):
-
-1. **`field.zig`'s `Fp448` arithmetic.** *(As built in 2026-07; the
-   2026-11-13 performance pass replaced the reduction strategy, the
-   multiply layout and `invert`/`sqrt` — see § Performance. What follows
-   is the original design.)* `mul` is an 8×8-limb schoolbook
-   multiply into u128 column accumulators, carried into 16 clean 56-bit
-   limbs, then Goldilocks-folded: writing the 896-bit product as four
-   224-bit chunks `A + B*2^224 + C*2^448 + D*2^672` and using `2^448 ≡
-   2^224 + 1`, `2^672 ≡ 2*2^224 + 1 (mod p)` gives `(A + C + D) +
-   (B + C + 2D)*2^224` — all limb-aligned, no cross-limb shifting (the
-   point of the 56-bit layout). The shared reduction tail
-   (`reduceAfterFold`) takes 8 accumulators `< 2^58`, runs a FIXED three
-   carry-propagate+fold rounds (a documented bounds argument shows round
-   3 can never carry out), then one branch-free conditional subtract of
-   `p` (`condSubP`: trial subtraction + mask select). `add` feeds limb
-   sums straight into that tail; `sub` computes `a + 2p - b` per limb
-   (never negative, no borrow chain) into the same tail; `neg` is
-   `sub(0, a)`; `square` is `mul(a, a)` (dedicated squaring is a
-   performance follow-up). `invert` = Fermat `a^(p-2)`; `sqrt` =
-   `a^((p+1)/4)` + square-check (`p ≡ 3 (mod 4)`); both via `pow`, a
-   square-and-ALWAYS-multiply that mask-selects the multiply result in
-   or out — constant-time in the base AND (beyond requirements) in the
-   exponent. `isZero`/`eql` are OR/XOR-accumulator comparisons with no
-   early exit.
-2. **`x448.zig`'s `ladder`** — RFC 7748 §5's recurrence, transcribed
-   verbatim: fixed 448 iterations, `Fe.ctSwap` conditional swaps driven
-   by the running swap bit, `a24` as a comptime-built `Fe`. The final
-   `x_2 * z_2^(p-2)` recovery uses `invert() catch Fe.zero` — for a
-   small-order input driving `z_2` to 0 the RFC formula yields 0, which
-   the catch reproduces exactly (the caught branch depends only on the
-   PUBLIC input point, never on scalar bits).
-3. **`ed448.zig`'s `Point`** — `add`/`dbl` are RFC 8032 §5.2.4's
-   complete-addition/dedicated-doubling formulas verbatim; `neg` flips
-   `x`; `equivalent` is the cross-multiplied projective comparison (no
-   inversion). `mul` is a constant-time left-to-right double-and-add
-   with a FIXED 448 iterations (bits 447..0 — NOT only `L`'s 446 bits:
-   the RFC 8032 §5.2.5 CLAMPED secret scalar has bit 447 set and is
-   deliberately used un-reduced by keygen/signing), computing the point
-   addition unconditionally each round and mask-selecting it in or out
-   via the componentwise `ctSelect`.
-4. **`scalar.zig`'s mod-`L` arithmetic** — internal 56-bit u64 limbs
-   (9 per scalar). Since `L` has no Solinas structure, reduction is a
-   generic constant-time binary long division (`reduceLimbs`): one fixed
-   iteration per input bit, each doing `r = 2r + bit` then a branch-free
-   conditional subtract of `L` (`condSubL`, same trial-subtract+select
-   shape as the field's). `reduceWide` runs it over the 114-byte digest
-   (17 limbs); `mul` runs a 9×9 schoolbook product (accepting un-reduced
-   456-bit inputs — the clamped scalar again) through the same
-   reduction; `add` is one limb add + one conditional subtract; `mulAdd`
-   is the doc-sanctioned `add(mul(a, b), c)` composition.
-
-One scaffold bug was found and fixed during this pass: `Point.fromBytes`
-carried a "defensive clear" of byte 55's top bit before decoding `y` —
-but bit 447 IS part of `y` (`p < 2^448`; only byte 56's low 7 bits are
-required-zero padding), so the clear silently corrupted every point with
-`y >= 2^447` (about half of all points — including any signature whose
-`R` lands there). Removed; the required padding check on byte 56 stays.
-
-Byte-exact oracle for all of the above: `kat_vectors.zig`'s official RFC
-7748 §5.2/§6.2 (X448) and RFC 8032 §7.4/§7.5 (Ed448/Ed448ph) vectors,
-exercised end-to-end by `kat_test.zig` — which needed NO changes for the
-crypto core to turn it green, as designed. `field.zig`, `x448.zig`,
-`ed448.zig`, and `scalar.zig` each additionally carry their own
-self-check tests (field inverse/sqrt/mul-square agreement, point
-encode/decode round-trips and invalid-encoding rejects, scalar
-wrap-around identities) independent of the KAT vectors.
-
-Deferred (unchanged from the scaffold's "Out of scope" list; decaf448 has
-since shipped as its own module): hash-to-curve/Elligator2 (RFC 9380), `fromEd448` key conversion, batch
-verification / key blinding, plus the performance follow-ups noted
-inline (dedicated squaring, windowed scalar mul, `mulSmall`, fused
-`mulAdd` reduction).
+- **A cofactorless `verifyStrict`** (RFC 8032 §5.2.7's `[S]B = R + [k]A'`): `verify`/`verifyPh` are
+  cofactored only, as `std.crypto.sign.Ed25519.verify` is (see *Threat model*).
+- **The all-zero X448 shared-secret check** inside `scalarmult` / the DH helpers: left to the protocol
+  layer, as in `std.crypto.dh.X25519` (see *Threat model*).
+- **Masking a non-canonical `u`** that RFC 7748 §5 permits: `scalarmult` rejects it (see *Threat model*).
+- **A general Montgomery<->Edwards point conversion**: only the one-directional key conversion exists
+  (see *Design*).
+- **`std.crypto.ff.Modulus(448)`** for the field: correct, but it would throw away the Solinas-style
+  reduction that `p = 2^448 - 2^224 - 1` was chosen for (see *Design*).
 
 ## Verification
 
-- `zig build test-ed448` (Debug) and `zig build test-ed448
-  -Doptimize=ReleaseFast`: **all tests pass in both modes, no panics**
-  (verified 2026-07-15, the day the crypto core landed). `zig fmt
-  --check modules/ed448/` is clean.
-- Byte-exact KATs: X448 RFC 7748 §5.2 vectors 1+2, the
-  §5.2 1-iteration vector, the §6.2 Alice/Bob DH example (public keys +
-  shared secret both directions); Ed448 RFC 8032 §7.4 Blank / 1 octet /
-  1 octet-with-context / 11 octets (keygen public key, 114-byte
-  signature, verify-accept, tamper-reject each); Ed448ph §7.5 "TEST
-  abc"; plus context-binding and Ed448-vs-Ed448ph cross-rejection
-  property tests.
-
-### Mutation run 2026-10-04
-
-Mutant schemata over a copy (one ReleaseSafe build, 57 tests in the binary,
-`setsid -w timeout -s KILL 20` per mutant): **58 mutants, 56 killed, 2
-equivalent**. Points: Edwards add/double/negate, the windowed `Point.mul`, the
-comb `mulBasePoint`, the vartime Straus pass, point encode/decode (sign bit,
-high bits, non-square y, `x = 0` with sign), `clearCofactor`, `equivalent`,
-dom4 (length bound, phflag), both small-order guards and the equation in
-`verify`, `S`'s range check, `mulAdd`; scalar canonical check, clamp,
-`condSubL`, `reduceLimbs`, carries; the X448 clamp and ladder (swap, `z_3`,
-final swap, `z = 0`, top bit); field canonical check, the fold rounds,
-`condSubP`, the 2^672 fold, squaring, `mulSmall`, `invert(0)`, `sqrt`'s check,
-`isOdd`, `eql`, `isZero`, `ctSwap`.
-
-- **Defect, fixed:** `verify` did not check `0 <= S < L` itself — only
-  `Signature.fromBytes` did, and `Signature`'s fields are public. A
-  `Signature` built field by field with `S + L` (or any bits 448..455 set)
-  verified like `S`: a second valid encoding of one signature, against RFC 8032
-  §5.2.7 step 1. `verify` now returns `error.InvalidScalar` (already in
-  `VerifyError`, never returned before). Test `verify rejects S >= L in a
-  Signature built field by field`.
-- **Wrong note, corrected:** the identity-key test said the two small-order
-  guards were "not independently pinnable". The public-key guard is: with
-  `A' = O`, `(R = B, S = 1)` verifies for every message. Now pinned; the
-  `R` guard is pinned separately as this module's policy (RFC 8032 itself would
-  accept a key holder's signature with `R = O`).
-- **Tests added for the other survivors:** `Point.mul` had no test at all (its
-  only caller is decaf448) — now held to the RFC 8032 public keys; the
-  cofactored equation (an order-4 point on `R`, which an equation multiplied by
-  2 would reject); `equivalent` on `P` and `-P`; a 255-octet context; the
-  scalar canonical check deciding at the most significant differing byte;
-  X448 of `u = 0, 1, p - 1` → all zeros (RFC 7748 §5); `isZero`/`eql` reading
-  every limb.
-- **Equivalent:** the ladder's final `x` swap (after clamping, bit 0 is 0, so
-  the last `swap` is always 0); `reduceAfterFold`'s third round (by the bound
-  argument in its doc comment, round 2's fold never pushes a limb past
-  2^56 − 1, so round 3 never changes a limb).
-
-**Audit 2026-11-17.** Tests added only (RFC 8032 + Wycheproof), production code unchanged: no mutants were run
-for this commit; the 2026-10-04 mutation counts stand and the card's `src` hash is refreshed over the tree that
-now holds the new vectors.
+- **Run:** `scripts/modtest ed448` (every file also carries its own self-check tests: field inverse,
+  sqrt and mul/square agreement against the `std.crypto.ff` oracle, point encode/decode round trips and
+  invalid-encoding rejects, scalar wrap-around identities); ctgrind `scripts/checks/ctgrind.sh ed448`
+  (rows in *Threat model*); deterministic fuzz driver `ED448_FUZZ=<runs>[,<first seed>]` (testkit's
+  driver, never `zig build --fuzz`).
+- **Byte-exact KATs** (`kat_test.zig` over `kat_vectors.zig`, `rfc8032_vectors.zig`): X448 RFC 7748
+  §5.2 vectors 1 and 2, the §5.2 1-iteration vector, the §6.2 Alice/Bob DH example (public keys and the
+  shared secret both directions); every RFC 8032 §7.4 Ed448 vector (9, including the 1023-octet message)
+  and both §7.5 Ed448ph vectors (the latter two sets extracted from the RFC text by script): keygen
+  public key, 114-byte signature, verify-accept and tamper-reject for each; plus context-binding and
+  Ed448-vs-Ed448ph cross-rejection property tests.
+- **Wycheproof** `ed448_test.json` (`wycheproof_vectors.zig`, Apache-2.0, attribution in `NOTICE`): every
+  case agrees with `verify`. Of the 70 invalid ones, 12 are wrong-length signatures (rejected before the
+  fixed-size API), 16 have a non-canonical `S` (`Signature.fromBytes`), and 42 fail the verification
+  equation or the small-order/identity guard in `verify`.
+- **Mutation-driven tests:** `verify` rejects `S >= L` in a `Signature` built field by field; the
+  identity public-key guard (with `A' = O`, `(R = B, S = 1)` would verify for every message) and the `R`
+  guard are pinned separately; `Point.mul` against the RFC 8032 public keys (its only caller is
+  `decaf448`); the cofactored equation (an order-4 point on `R`, which an equation multiplied by 2 would
+  reject); `equivalent` on `P` and `-P`; a 255-octet context; the scalar canonical check deciding at the
+  most significant differing byte; X448 of `u = 0, 1, p - 1` giving all zeros (RFC 7748 §5); `isZero`/`eql`
+  reading every limb.
+- **Fuzz** (`src/fuzz_test.zig`, `ED448_FUZZ`): `ed448_point` and `ed448_signature` harnesses, plus a
+  seed loop with reach checks in every test run.
+- **Dead-stack probes:** `src/stackprobe_test.zig` (Ed448 signing, X448) and `src/stackprobe2_test.zig`
+  (Ed448 key generation), ReleaseFast.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last
+  whole-module mutation run and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ed448`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.10–3.94×, against 0.99–3.99× before.
-
-**2026-11-13, Zig 0.17.1: ref 0.74–3.21× → 0.47–1.07×** (`zig build bench-ed448` against OpenSSL 3.5.5, same host, shared with other jobs). A profile of the baseline put 43 % of the time in the field reduction (every `add`/`sub`/`mul` returned the canonical form: three carry rounds and a conditional subtraction of `p`), 21 % in `mul`'s body and 19 % in `pow` (the generic square-and-always-multiply behind `invert`/`sqrt`). What changed, each measured:
-
-| step | sign | verify | X448 |
-|---|--:|--:|--:|
-| baseline (`BENCH_ROUNDS=5`) | 0.74 | 3.21 | 2.15 |
-| weak reduction (limbs `< 2^57`, canonical only in `toBytes`/`isOdd`/`isZero`/`eql`) + addition-chain `invert`/`sqrt` | 0.58 | 1.63 | 0.97 |
-| + `Fe.sqrtRatio` decode (RFC 8032 §5.2.3 combined power: one exponentiation per decoded point, not two) + width-7/5 NAF Straus `verify` with a comptime table of 32 odd multiples of `B` | 0.43 | 1.27 | 1.05 |
-| + `mul`/`square` forced inline into `Point.add`/`dbl` and the ladder step (`mulI`/`squareI`) — the card | 0.47 | 1.07 | 0.78 |
-
-The last row's run: sign 152.6 µs vs 326.5 µs, verify 326.1 µs vs 304.6 µs, X448 214.6 µs vs 275.5 µs. OpenSSL's own figures moved 268–428 µs (verify) between runs of the same day, so verify sits at parity: 1.03–1.07× over the last three runs, the 1.03 from a run of an equivalent multiply layout (see `Fe.mul`'s doc comment for the layouts measured and dropped). Every row is ≤ 1.1× (P2).
-
-**Constant time after the pass** (`ctgrind.sh --check --stacks ed448 decaf448`, 2026-11-13): counts unchanged — `full` 3 in-file contexts, all `Fe.invert`'s `isZero` verdict (from `Point.toBytes` in key creation and signing, and the X448 ladder's final `z_2` inversion: the only value it can reject is 0, the documented exceptional case), `ladder` 0, decaf448 `scalarmul` 0. The weak-reduction code is straight-line, and the select masks of `Fe.ctSelect` and `condSubP` now go through `field.blackBox` (an empty asm barrier). ReleaseFast had compiled `Fe.ctSelect` to a conditional jump, seen through decaf448's `Element.encode`/`oneWayMap` on secret values by voprf's ctgrind rows; `ed448`'s own rows never reached it with a tainted condition. The same barrier on `scalar.zig`'s `condSubL` was tried and reverted: it moved a scalar copy into a frame decaf448's `scalar.invert` stack probe reads (30 hits) — left for the scalar's own pass (Backlog). The `Fe.fromBytes` canonical verdict voprf also reports is a verdict on whether an encoding is `< p`. On the decaf448 path that rebuilds an element from computed bytes, it always passes.
+`zig build bench-ed448` (`tools/bench.zig`, `BENCH_ROUNDS=5`, ReleaseFast) compares sign, verify and
+X448 with OpenSSL Ed448/X448; the card's `Performance` line carries the figures. The design choices that
+buy them (weak reduction, addition-chain `invert`/`sqrt`, `sqrtRatio` decoding, the Straus NAF `verify`,
+forced-inline `mulI`/`squareI`) are in *Design*.
 
 ## Backlog / deferred
 
-- **Build option: fixed-base comb size** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). `baseComb: [112][16]Point` (src/ed448.zig:257) ≈ 1792 points ×
+- **Build option: fixed-base comb size** (mechanism and checklist in CONVENTIONS §4.2; measure first —
+  HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of
+  roughly ≥ 100 KB or a consumer request). `baseComb: [112][16]Point` ≈ 1792 points ×
   ~224 B ≈ 400 KB of table (estimate). `.small` → a smaller comb (fewer teeth or w=4 windowed) — slower keygen/sign, same constant-time
   guarantees (table lookups stay masked; re-run ctgrind). Unmeasured.
 - **RFC 9380 hash-to-curve for edwards448** (`edwards448_XOF:SHAKE256_ELL2_RO_`/`_NU_`) *(survey 2026-09-30)*. Needed by VOPRF/VRF/BLS-style protocols on the 448 curve; `ed448-goldilocks` ships it. Searched `rg -i 'hash_to|hashToCurve|elligator|fromUniform' modules/ed448/src` — nothing. Effort: medium (Elligator 2 + isogeny + `expand_message_xof`, RFC 9380 has vectors). Fits CONVENTIONS §2.
-- ✅ **DONE 2026-11-16 (`x448.KeyPair.fromEd448`, `x448.publicKeyFromEd448`; the 4-isogeny sends the Ed448 base point to u = 5, tested):** **`X448.KeyPair.fromEd448` / Ed448 to X448 key mapping** *(survey 2026-09-30)*. Std's `X25519.KeyPair.fromEd25519` has the 25519 analogue; SPEC's "Out of scope" lists it only as "not in this scaffold", not as a refusal. Effort: small (birational map over `Fp448`). Fits §2.
-- **`scalar.zig` `condSubL` mask not laundered** *(2026-11-13)*: `Fe`'s selects now use `field.blackBox`. The same change on the scalar's conditional subtraction made decaf448's `scalar.invert` stack probe find the scalar (30 hits, 167–199 B below the region top), so it was reverted. It needs a ctgrind look at whether that select lowers to a branch at all, and a burn depth that covers the new frame. Effort S.
-- **Speed leftovers** *(after the 2026-11-13 pass, verify at 1.03–1.07× OpenSSL)*. Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
-- ✅ 2026-11-17 **Wider vector coverage** *(survey 2026-09-30)*: every RFC 8032 §7.4 Ed448 vector (9, incl. the 1023-octet message) and both §7.5 Ed448ph vectors (11 in all, `src/rfc8032_vectors.zig`, extracted by script from the RFC text) are signed, verified and tamper-checked by `kat_test.zig`; the Wycheproof `ed448_test.json` (87 cases: 17 valid, 70 invalid, no acceptable; `src/wycheproof_vectors.zig`) agrees with our `verify` on every case. Of the 70 invalid ones, 12 are wrong-length signatures (rejected before the fixed-size API), 16 have a non-canonical `S` (`Signature.fromBytes`), 42 fail the verification equation or the small-order/identity guard in `verify`. No disagreement, no code change.
+- **Ed448 batch verification and key blinding** *(survey 2026-09-30)*: `std.crypto.sign.Ed25519` offers `verifyBatch` and a `key_blinding` submodule; neither has an Ed448 analogue here.
+- **`scalar.zig` `condSubL` mask not laundered**: `Fe`'s selects use `field.blackBox`; the same change on the scalar's conditional subtraction made `decaf448`'s `scalar.invert` stack probe find the scalar (30 hits, 167–199 B below the region top), so it was reverted. It needs a ctgrind look at whether that select lowers to a branch at all, and a burn depth that covers the new frame. Effort S.
+- **Speed leftovers** (verify at 1.03–1.07× OpenSSL). Not done, in the order they would pay: (1) `scalar.reduceWide`, a bitwise constant-time long division over the 114-byte digest (912 iterations; ~6 % of a sign+verify+X448 profile), could fold by `2^446 ≡ δ (mod L)` like the field does; (2) a Karatsuba split of `Fe.mul` on the Goldilocks halves (`(a0 + a1φ)(b0 + b1φ)`, `φ² ≡ φ + 1`: 48 products instead of 64); (3) mixed (`Z = 1`) additions against an affine form of the comptime `B` table. Effort small–medium each; anchored by the RFC KATs, the `std.crypto.ff` oracle test in `field.zig` and the ctgrind harness.
 
 ## Anchoring
 
@@ -411,4 +343,4 @@ The last row's run: sign 152.6 µs vs 326.5 µs, verify 326.1 µs vs 304.6 µs, 
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** RFC 8032 / RFC 7748 official test vectors, byte-exact, kat_test.zig Also all 11 RFC 8032 §7.4/§7.5 vectors (`src/rfc8032_vectors.zig`) and the 87 Wycheproof `ed448_test.json` cases (`src/wycheproof_vectors.zig`, Apache-2.0, attribution in `NOTICE`), asserted against `verify` in `kat_test.zig` (2026-11-17).
+**What the tests actually contain.** RFC 8032 / RFC 7748 official test vectors, byte-exact, kat_test.zig Also all 11 RFC 8032 §7.4/§7.5 vectors (`src/rfc8032_vectors.zig`) and the 87 Wycheproof `ed448_test.json` cases (`src/wycheproof_vectors.zig`, Apache-2.0, attribution in `NOTICE`), asserted against `verify` in `kat_test.zig`.
