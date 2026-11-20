@@ -35,8 +35,6 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 **Where we are ahead:** the netlink libraries above give primitives and leave the ordering, handle allocation and validity to the caller; this module returns an ordered, byte-identical, collision-checked plan and rejects a topology that cannot be shaped (`CpuStraddle`, `CeilExceedsParent`, `HandleExhausted`, …) as a typed error — and the cpumap → `mq` → per-CPU-HTB alignment is structural, not a convention. No Zig alternative exists (the sibling `tc` module is the layer below). **Even:** a dual-stack / multi-address circuit shares one HTB class (one filter per prefix, overlaps refused), and HTB `burst`/`cburst`/`prio`/`quantum` are settable per node. **Where we are behind:** no reconcile against live state (a full `.replace` replay instead), none of LibreQoS's XDP steering, integrations or telemetry (→ Backlog; the steering half is the sibling `xdp-classifier`'s job, the rest is platform, not a tree compiler).
 
-Re-assessed 2026-10-06 (no new web survey; the table above is from 2026-09-30): the two gaps a user hit on the main path — a circuit with more than one IP/prefix, and the HTB class knobs `tc` exposes — are closed; what remains (live reconcile) is Backlog-grade, since a full idempotent `.replace` replay already realises any target topology.
-
 ## Design
 
 tcplan is a **pure compiler**: `Topology` in, `Plan` out, no I/O. It owns none of
@@ -189,24 +187,8 @@ duplicate. A compiled plan must return `null`; the permanent positive-control
 test forges a `Plan` with two class ops sharing a handle and asserts the check
 goes RED, so a regression that breaks handle uniqueness cannot pass silently.
 
-**Mutation run 2026-10-05** (in-place, Debug, 30 mutants over `compile`/`assign`,
-the handle counters, `firstOrderingViolation`/`findHandleCollision` and
-`effectiveCeil`): 28 killed. The first pass left 8; five tests were added — a
-root on `cpu == queue_count` (an `>` there dropped it silently), a ceil-0 child
-whose rate exceeds the parent's ceil, `htb_defcls` reaching every HTB root, a
-match-less leaf not spending a filter prio, and an `mq` child counting as
-available only after the `mq` root itself. Equivalent: emitting the effective
-ceil instead of 0 (`tc` builds `ceil 0` as `ceil = rate`, byte-identical), and
-dropping the `is_leaf` guard on `Resolved.match` (an interior match is refused
-earlier with `ClassifierOnInterior`).
+## What is deliberately not done
 
-## Deliberately deferred
-
-- **Live-diff / reconcile.** Diffing a target topology against the kernel's
-  current state to emit a *minimal* add/change/del sequence is valuable but a
-  larger design (it needs a state read-back and a diff engine). tcplan today
-  emits a full create-or-replace plan; a reconciling caller replays it
-  idempotently with `.replace`.
 - **`u32` / fwmark classifiers.** The subscriber classifier is modelled as
   `flower` (value-typed L3 prefix match) to keep every `Operation` free of owned
   key slices. Raw-offset `u32` selectors and fwmark-based steering are not
@@ -222,10 +204,35 @@ earlier with `ClassifierOnInterior`).
   class per queue. A caller wanting one adds a single top site per queue.
 - **IPv6 classifier depth.** `Match.ipv6` covers host/prefix matches; flow-label
   and extension-header matching are out of scope.
+- **None of LibreQoS's XDP steering, billing/CRM integrations or telemetry:** the steering half is the sibling
+  `xdp-classifier`'s job, the rest is platform, not a tree compiler.
+
+
+## Verification
+
+Run: `scripts/modtest tcplan`. Everything is pure logic, so the tests need no privilege and no network.
+
+- **Golden plan** (`src/root.zig`): exact handles, targets, rates, kinds and order for a hand-computed topology;
+  unique handles and parent-before-child order; a leaf without a classifier gets a class and a CAKE qdisc but no filter.
+- **Executability:** every op builds valid netlink bytes through `tc`'s real builders.
+- **Determinism:** two compiles of one topology are byte-identical.
+- **Ordering and collision self-checks** (`src/plan.zig`): `findHandleCollision` on a forged duplicate (the permanent
+  positive control, see above), `firstOrderingViolation` on a child before its parent and on an `mq` child before the `mq` root.
+- **Invariants** (`src/compile.zig`, `src/handles.zig`, `src/topology.zig`): each typed error of *Validation / error semantics*;
+  handle counters independent per queue, CAKE majors global and skipping the `mq` major, fail-closed exhaustion; multi-match
+  prios consecutive in slice order; overlap and prefix-length checks; HTB knobs reaching the class op; `htb_defcls` on every root.
+- **External:** one byte-identity check against stock iproute2 requests for a dual-stack circuit with every HTB knob set
+  (see Anchoring; producer `tools/capture_dualstack.sh`).
+- **Fuzz:** none (no fuzz obligation under check-fuzz; pure planner over a typed topology).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
 
 ## Backlog / deferred
 
-- **Live reconcile (diff of target vs kernel state)** (survey 2026-09-30): already in the SPEC's deferred list; filed because the reference reloads a running shaper incrementally *(inferred)*, whereas `.replace` replays everything. Effort L (needs a `tc` read-back). Fits §2.
+- **Live reconcile (diff of target vs kernel state)** (survey 2026-09-30): diffing a target topology against the kernel's
+  current state to emit a *minimal* add/change/del sequence needs a state read-back (a `tc` dump) and a diff engine.
+  tcplan emits a full create-or-replace plan today; a reconciling caller replays it idempotently with `.replace`. The
+  reference reloads a running shaper incrementally *(inferred)*. Effort L. Fits §2.
 
 ## Anchoring
 

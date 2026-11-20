@@ -12,11 +12,9 @@ the sibling [`tc`](../tc/) module's own `QdiscTarget`/`ClassTarget`/
 `FilterTarget` + `QdiscSpec`/`ClassSpec`/`FilterSpec` types, and hands the caller
 an ordered `Plan`. The caller executes the plan through `tc` + `netlink`.
 
-**Status:** implemented; compile + validate. Live-diff/reconcile against a
-running interface is deliberately out of scope (see SPEC.md). No kernel round-trip
-of a whole plan is exercised here (the plan is pure data); the sibling `tc`
-module owns the live-kernel integration tests, and this module proves a
-representative op sample builds valid netlink bytes through tc's real builders.
+No kernel round-trip of a whole plan is exercised here (the plan is pure data); the sibling `tc` module owns the
+live-kernel integration tests, and this module proves a representative op sample builds valid netlink bytes through
+tc's real builders.
 
 Provenance: original work of the zig-libs authors (MIT) — a pure-Zig compiler
 from a hierarchical shaping topology to an ordered plan of `tc` operations. Design reference: LibreQoS
@@ -135,6 +133,11 @@ for (plan.ops) |op| {
 `Plan.findHandleCollision` and `Plan.firstOrderingViolation` are self-checks a
 caller (or a test) can assert against before executing.
 
+## Not provided
+
+Live reconcile against a running interface (a full `.replace` replay instead), `u32`/fwmark classifiers, XDP steering and
+platform integrations. SPEC.md, *What is deliberately not done* and *Backlog / deferred*, has the reasons.
+
 ## Import
 
 ```zig
@@ -144,8 +147,7 @@ const tcplan = b.dependency("zig_libs", .{}).module("tcplan");
 ## Verify
 
 ```
-zig build test-tcplan                       # Debug
-zig build test-tcplan -Doptimize=ReleaseFast
+scripts/modtest tcplan
 ```
 
 Everything is pure logic, so the tests need no privilege and no network: a
