@@ -21,7 +21,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line — clean-room, from the Kubernetes probe model.
 
 ## Compared with
 
@@ -35,9 +35,10 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Kubernetes probe model (liveness/readiness/startup) | — | n/a (documentation, not source) | — | — | The contract this module is modelled on. The kubelet reads only the status code; three probe kinds, all served (the startup probe is opt-in). |
 | Zig (`karlseguin/http.zig`, `zigzap/zap`) | Zig | MIT | 1.6k / 3.4k | pushed 2026-08-26 / 2026-09-06 (zap **archived**) | Neither README documents a health-probe endpoint; a Zig service writes its own. |
 
-**Where we are ahead:** the only ready-made probe middleware found for a Zig server; zero allocation, immutable config, router-free `probeFor`/`respond`, `detail = false` to keep dependency names off an external probe, and each check runs exactly once per probe so body and status agree. **Where we are behind:** ~~the Go libraries answer with a JSON component report~~ DONE 2026-10-11 (opt-in `json`, the reference's `{"status","details":{name:{"status"}}}` shape, no timestamps or error strings since `Check`s return `bool`); ~~no startup probe~~ DONE 2026-10-11 (opt-in `startup = .{ .started = &flag }`). Per-check timeouts, result caching and periodic background checks are absent **by design** (SPEC: `Check`s are cheap atomic-flag loads the application updates; no dependency polling).
+**Where we are ahead:** the only ready-made probe middleware found for a Zig server; zero allocation, immutable config, router-free `probeFor`/`respond`, `detail = false` to keep dependency names off an external probe, and each check runs exactly once per probe so body and status agree. **Where we are behind:** per-check timeouts, result caching and periodic background checks are absent **by design** (see *What is deliberately not done*: `Check`s are cheap atomic-flag loads the application updates; no dependency polling).
 
 ## Design & invariants
+
 Liveness always answers 200 — a bare "the server can run this handler" check; this module never
 fails liveness, since a liveness failure/no-response is what tells the orchestrator to restart, so
 the check itself has nothing to evaluate. Readiness answers 200 when every registered `Check`
@@ -53,6 +54,23 @@ load. Clean-room from the documented Kubernetes liveness/readiness probe model a
 `/healthz`–`/readyz` endpoints; original work of the zig-libs authors, no NOTICE entry beyond the
 public k8s convention itself.
 
+- **Startup probe** (`Health.startup: ?Startup = null`, opt-in): `Startup{ .path = "/startupz", .started = *const atomic bool }`,
+  503 `not started` until the application sets its flag, then 200. The flag is the application's, so `Health` stays
+  immutable (a `const` config may live in read-only memory). `respond(.startup)` on a `Health` without `startup` answers 404.
+- **JSON body** (`Health.json = true`): `application/json; charset=utf-8`, `{"status":"up"|"down","details":{"<check>":{"status":"up"|"down"}}}`
+  on readiness (liveness and startup: `{"status":...}`), governed by `detail`; `details` is omitted when there are no
+  checks; names are JSON-escaped (a name that is not valid UTF-8 has every byte >= 0x80 written as `\u00XX`); no
+  allocation. `details` lists at most 256 checks (pass bits on the stack; every check still runs once and decides
+  the status); the ones past 256 are summed in one last `"(N more)"` entry, `down` when any of them failed, so a 503
+  never lists only `up` checks. The text probes send `Content-Type: text/plain`, every probe `Cache-Control: no-store`.
+- **Probe methods:** only GET and HEAD are probes (`isProbeMethod`); every other method on a probe path reaches the
+  application and runs no check.
+- **Misconfiguration:** `middleware()` panics when `live_path`, `ready_path` and `startup.path` are not all different
+  (two probes on one path would make one silently dead).
+- **Detail budget:** the text 503 body lists failing names within a 512-byte budget (`detail_buf_len`) and a
+  `not ready: ...` marker for what does not fit; a line that does not fit is skipped and a later shorter one may still fit.
+
+
 ## Threat model / out of scope
 Not a security boundary: the probe paths are intentionally unauthenticated (an orchestrator has no
 token to present), so anything reachable on `/healthz`/`/readyz` should be information an
@@ -60,67 +78,41 @@ unauthenticated caller may see (check *names*, not internal detail). Custom prob
 callbacks are called synchronously on every `/readyz` hit and must already be cheap (an atomic
 flag), not a live database ping.
 
+## What is deliberately not done
+
+- Per-check timeouts, result caching and periodic background checks: `Check`s are cheap atomic-flag loads the
+  application updates; there is no dependency polling (see *Threat model / out of scope*).
+- The reference's `Pragma: no-cache` / `Expires` headers (`handler.go:83-88`): the module already sends `Cache-Control: no-store`,
+  which is stricter, and HTTP/1.0 caches are not a target.
+- Timestamps and error strings in `details`: `Check`s return `bool`, and an error string would publish internals on an unauthenticated path.
+
+
 ## Verification
-Offline tests through `http.Server.serveStream` (2026-10-11: plus the startup latch and the JSON body, byte goldens and a JSON oracle in the model-fuzz): liveness always-200 + pass-through of other
-paths, readiness 200/503 with the failing-check listing, the empty-checks default (no checks
-registered → always ready), custom probe paths. Green in Debug + ReleaseFast. Run: `zig build
-test-health`.
 
-**Audit 2026-10-24 (review + mutation, grade-1 wave).** An independent read-only review found no
-HIGH; fixed: the JSON `details` left out every check past the 256th, so a 503 could list only `up`
-checks — they are now summed in one last `"(N more)"` entry, `down` when any failed; the text probes'
-`Content-Type: text/plain` was asserted nowhere (the model-fuzz now checks it in both modes); the
-`Health` doc comment sat on `Startup`; two probes on one path made one silently dead (`middleware()`
-now panics on it). Schemata mutants over the final source (probe routing, each status and
-header, every JSON escape arm and the plain-name fast path, the 256-check split and summary, the
-text budget and marker): 47 mutants, 46 killed, 1 equivalent — `probeFor` testing ready before live,
-which differs only when the two share a path, the configuration `middleware()` refuses. Four survivors of the first run got tests: `\r` and
-`\t` in a JSON name, exactly 256 checks (no summary entry), and shared paths.
+Run: `scripts/modtest health`.
 
-**Audit 2026-10-04 (mutation).** 12 schemata mutants over the probe methods and paths,
-`probeFor`, the readiness checks, the 503 detail body (budget edge, truncation marker, line
-ends, `detail = false`), the status and `Cache-Control: no-store` on both probes: 11 killed,
-1 equivalent, 0 left alive. Equivalent: collecting failing names while `detail` is off -- the
-`!detail` branch writes `not ready` and never the collected bytes. The survivors that were
-real gaps got one test: two names that fill the 512-byte detail budget exactly are both
-listed with no marker, a third failing check adds `not ready: ...`, and the 503 carries
-`Cache-Control: no-store`.
+- **Offline tests** through `http.Server.serveStream`: liveness always-200 and pass-through of other paths,
+  readiness 200/503 with the failing-check listing (budget edge, truncation marker, `detail = false`), the
+  empty-checks default (no checks registered: always ready), custom probe paths, the startup latch, the JSON body
+  (byte goldens, escapes, exactly 256 checks, the summary entry), non-probe methods and shared probe paths.
+- **Model-fuzz** (`src/root.zig:model-fuzz`, the card's Model): one seeded test (`std.Random.DefaultPrng`, fixed seed)
+  builds a random `Health` (checks with random names and pass/fail state, default or custom paths, `detail`, JSON
+  on/off, startup) and a random request (method, path) and compares the wire response with a naive model of the
+  documented contract; a JSON oracle checks the JSON body. Reach counters fail the test unless every class is hit
+  (live, ready ok, 503 with and without detail, marker, skip-then-fit, exact fill, pass-through, probe path with a
+  non-probe method, HEAD, custom paths). HEAD bodies are not compared.
+- **Fuzz:** none beyond the model-fuzz (the card's Hardening line says why).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-**Model-fuzz (2026-10-11).** One seeded test (`std.Random.DefaultPrng`, fixed seed, 1200 steps)
-builds a random `Health` (0-8 checks with random names and pass/fail state, default or custom
-paths, `detail` on/off) and a random request (GET/HEAD/POST over eight paths) and compares the wire
-response with a naive model of the documented contract: liveness always 200; readiness 200 iff all
-checks pass, else 503 with one `not ready: <name>` line per failing check in order under a
-512-byte budget plus the `not ready: ...` marker (a line that does not fit is skipped, a later
-shorter one may still fit), or `not ready` with `detail` off; `Cache-Control: no-store` on probes;
-each check called exactly once per readiness probe and never otherwise; non-probe paths and
-methods pass through to the app; `probeFor` agrees. Some steps craft two failing names that sum to
-the budget -1/0/+1 bytes. Reach counters fail the test unless every class is hit (live, ready ok,
-503 with detail, 503 without, marker, skip-then-fit, exact fill, pass-through, probe path with a
-non-probe method, HEAD, custom paths). HEAD bodies are not compared. Negative control: `>` to
-`>=` in the detail budget check (`detail_len + line_len > detail_buf.len`) made the new test fail
-(step 984) as well as the existing exact-fill test.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-health`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 13.2 %): ref 0.01–0.09×, against 0.01–0.09× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+`zig build bench-health` (`tools/bench.zig`; its `go_bench/` side is the reference, `go_fast_bench/` the fiber side;
+`lead_probe/` is the behaviour probe of the reference). The card's Performance line carries the figures.
 
 ## Backlog / deferred
 
-**Delta audit 2026-10-29 (no-panic sweep § GH):** 2 mutants (the 404 status, the null unwrap back) on the unfiltered ReleaseSafe suite, 2/2.
-
-None beyond its place in the "prod-API hardening + nice-to-have cluster"
-(requestid/health/conditional/multipart/cookies/...) — no per-module gap noted.
-
-- ~~**Startup probe (`/startyz` or configurable third path)**~~ — DONE 2026-10-11: `Health.startup: ?Startup = null` (opt-in; `Startup{ .path = "/startupz", .started = *const atomic bool }`), 503 `not started` until the application sets its flag, then 200. The flag is the app's, so `Health` stays immutable (a `const` config may live in read-only memory). Tests: "startup probe: 503 until the app's flag is set..." and the model-fuzz startup branch.
-- ~~**JSON probe body (opt-in)**~~ — DONE 2026-10-11: `Health.json = true`, `application/json; charset=utf-8`, `{"status":"up"|"down","details":{"<check>":{"status":"up"|"down"}}}` on readiness (liveness and startup: `{"status":...}`), governed by `detail`, `details` omitted with no checks, names JSON-escaped, no allocation. `details` lists at most 256 checks (pass bits on the stack; all checks still run once and decide the status). Tests: "json body: byte goldens...", "json body: check names are escaped..." and the model-fuzz JSON oracle.
-- **Rejected, one line each:** the reference's `Pragma: no-cache` / `Expires` headers (`handler.go:83-88`) — the module already sends `Cache-Control: no-store`, which is stricter, and HTTP/1.0 caches are not a target; timestamps and error strings in `details` — `Check`s return `bool`, and an error string would publish internals on an unauthenticated path.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · util · threadsafe` · deps: `router`, `http` — canonical source is `pub const meta` in
-src/root.zig.
+None open.
 
 ## Anchoring
 

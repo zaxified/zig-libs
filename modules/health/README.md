@@ -54,6 +54,5 @@ implementations only through their public APIs.
 
 ## Verification
 
-`zig build test-health` — offline tests through `http.Server.serveStream`
-(liveness always-200 + pass-through, readiness 200/503 with the failing-check
-listing, empty-checks default, custom paths, startup latch, JSON body), green in Debug + ReleaseFast.
+`scripts/modtest health` — offline tests through `http.Server.serveStream` (liveness always-200 + pass-through, readiness
+200/503 with the failing-check listing, empty-checks default, custom paths, startup latch, JSON body) and a model-fuzz.

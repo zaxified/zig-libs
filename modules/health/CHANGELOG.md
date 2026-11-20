@@ -5,8 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
-- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 2 mutants, 2/2 on the first run; cumulative 48/49, 1 eq. Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** `Health.respond(.startup, …)` on a `Health` without `startup` answers 404 instead of unwrapping null.
 - **2026-10-24** — **Behaviour change (fix):** with more than 256 readiness checks the JSON `details`
   ends in one `"(N more)": {"status": "up"|"down"}` entry for the unlisted ones (they were left out, so a
@@ -14,7 +12,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `live_path`, `ready_path` and `startup.path` are not all different. Docs: `Health`'s doc comment is on
   `Health` again; `h`, its checks and the startup flag must outlive the router.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-11** — Added (S2, closes the survey gaps against alexliesenfeld/health v0.8.1): an opt-in startup probe (`Health.startup = .{ .started = &flag }`, path `/startupz` by default; 503 `not started` until the application sets its own atomic flag) and an opt-in JSON body (`Health.json`; `{"status":"up"|"down","details":{"<check>":{"status":...}}}` with `application/json; charset=utf-8`, still governed by `detail`, names escaped, no allocation; `details` lists at most 256 checks). `Probe` gains `.startup`. Tests: startup + JSON goldens and an extended model-fuzz. New `tools/bench.zig` + `tools/go_bench` (`zig build bench-health`).
 
