@@ -16,7 +16,7 @@ connect.
   device fleet (the ModbusPal / Kepware-simulator problem, done
   deterministically).
 - **Concurrency:** single-owner. One thread owns a `Fleet`; there are no locks.
-- **Depends on:** the seven responder modules plus `netsim`.
+- **Depends on:** the seven responder modules, `netsim` and `clock` (`tcp.zig` reads the monotonic clock).
 
 ## Scope
 
@@ -33,8 +33,8 @@ connect.
   TCP read into frames, and to split a responder's multi-frame answer back into
   individual frames so per-frame link faults are meaningful.
 - **Adapters** — `ModbusNode`, `Dnp3Node`, `Iec104Node`, `S7Node`,
-  `BacnetNode`, `EnipNode`, `OpcuaNode`. **No responder module was modified**;
-  the two transport-driven ones (IEC 104, BACnet) get a small shim transport
+  `BacnetNode`, `EnipNode`, `OpcuaNode`. **No existing responder API was changed**
+  (`dnp3` gained one additive function, `Session.unsolicitedFrames`); the two transport-driven ones (IEC 104, BACnet) get a small shim transport
   from `shim.zig` instead. All seven implement `trouble` natively — Modbus
   exception `0x04`, DNP3 `IIN1.6`, IEC 104 `iv` quality, S7 CPU `STOP`, BACnet
   `Reliability`/`Status_Flags`/`Out_Of_Service`, the CIP Identity status word
@@ -138,6 +138,12 @@ const report = try fleetsim.serveTcpMulti(gpa, io, &f, &bindings, .{
 });
 // report.peak_concurrent is how many masters were connected simultaneously.
 ```
+
+## Not provided
+
+No declarative fleet file or CLI (fleets are built in Zig code), no serial/RTU inter-character timing,
+no TLS, authentication or rate limiting in the bindings (a lab fixture, not a server), no fleet-native
+shrinker. See `SPEC.md` *Threat model / Limits*, *What is deliberately not done* and *Backlog / deferred*.
 
 ## Verify
 
@@ -331,9 +337,8 @@ cmake --build build -j"$(nproc)" && cmake --install build
 g++ -std=c++17 -O1 -o fm-dnp3 scripts/vm/guests/fleetsim-dnp3-master.cpp -lopendnp3 -lpthread
 ```
 
-What was actually run against real third-party masters (all seven protocols,
-with the transcript of what each master did), the determinism proof, the
-measured scale numbers and the deferred list are in [SPEC.md](./SPEC.md).
+What each real third-party master is graded on (all seven protocols), the determinism proof,
+the scale test, the limits and the open items are in [SPEC.md](./SPEC.md).
 Provenance: original work of the zig-libs authors (MIT), composed over
 [`netsim`](../netsim) — which carries its own record for the TigerBeetle VOPR
 methodology reference. The device-behavior envelope follows what SCADA device

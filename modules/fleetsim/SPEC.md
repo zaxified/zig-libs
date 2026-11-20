@@ -15,7 +15,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's `NOTICE` and the README's `Provenance:` note — clean-room, so there is deliberately no root `NOTICE` entry to point at.
 
 ## Compared with
 
@@ -29,7 +29,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [open62541/open62541](https://github.com/open62541/open62541) | C | MPL-2.0 | 3.2k | v1.5.8 (2026-09-06) | A full OPC UA stack that can host a simulated server; a stack, not a fleet. |
 | Zig ecosystem | Zig | — | — | — | Nothing comparable found (`gh search repos 'modbus simulator'` and `'industrial protocol device simulator'`: no Zig result). |
 
-**Where we are ahead:** seven device-side protocols (Modbus, DNP3, IEC 104, S7comm, BACnet, ENIP, OPC UA) in one deterministic fleet: one injected clock, one seed, total event order, byte-exact replay, per-node link faults (delay, jitter, loss, duplication, reordering) and node faults, `netsim` fault-trace mapping and shrinking, a fixed-memory scale measurement, and evidence against real third-party masters (SPEC "What was verified live"). **Where we are behind:** no GUI or declarative config file for building a fleet (fleets are built in Zig code), a TCP/UDP binding that is a lab fixture (no serial/RTU timing, no TLS, no rate limiting), a multi-master binding proved with two peers, and a scale test that is Modbus-only (→ Backlog).
+**Where we are ahead:** seven device-side protocols (Modbus, DNP3, IEC 104, S7comm, BACnet, ENIP, OPC UA) in one deterministic fleet: one injected clock, one seed, total event order, byte-exact replay, per-node link faults (delay, jitter, loss, duplication, reordering) and node faults, `netsim` fault-trace mapping and shrinking, a fixed-memory scale measurement, and evidence against real third-party masters (*Evidence against third-party masters*). **Where we are behind:** no GUI or declarative config file for building a fleet (fleets are built in Zig code), a TCP/UDP binding that is a lab fixture (no serial/RTU timing, no TLS, no rate limiting), a multi-master binding proved with two peers, and a scale test that is Modbus-only (→ *Backlog / deferred*).
 
 ## Design & invariants
 
@@ -46,8 +46,7 @@ length rule; `FrameIterator` walks a buffer of concatenated frames and reports
 the unconsumed tail separately from a malformed head, because "a truncated read"
 and "the responder emitted garbage" are different bugs and must not be conflated.
 
-**`adapters.zig` — seven translations.** Not one line of any responder module
-changed. Three shapes:
+**`adapters.zig` — seven translations.** The adapters change no existing responder API (the one addition, `dnp3`'s `Session.unsolicitedFrames`, is described below). Three shapes:
 
 1. *Already packet-to-packet* — Modbus, S7, ENIP. The adapter is a signature
    translation plus an error map.
@@ -70,7 +69,19 @@ gain. `fleetsim` is the only place the two shapes meet and already depends on
 both. The reusable half — `Window`, which owns all the buffer discipline
 (all-or-nothing datagrams, a latching `overflow` that never writes half a frame)
 — is protocol-agnostic and public, so an eighth `Transport`-driven responder
-costs one ~15-line vtable binding, not another buffer discipline.
+costs one ~15-line vtable binding, not another buffer discipline. `Window`,
+`StreamShim` and `DatagramShim` are re-exported from the root (`fleetsim.Window`,
+`fleetsim.StreamShim`, `fleetsim.DatagramShim`): a consumer holding one of those
+two responders outside a fleet wants exactly this, and both `LoopTransport`s are the
+wrong shape for it.
+
+**DNP3 unsolicited traffic.** `adapters.Dnp3`'s `tickFn` frames an
+outstation-initiated fragment with `dnp3.outstation.Session.unsolicitedFrames`
+(`adapters.zig` 222; `outstation.zig` 2092). It belongs on `Session` because `Session`
+owns `tx_seq`: framing an outstation-initiated fragment anywhere else means
+duplicating the transport-sequence bookkeeping, which is what confuses a master's
+reassembler. The function is purely additive; `Outstation.unsolicited` is untouched for
+callers that own their framing.
 
 **Restart** is uniform: each adapter snapshots its responder *by value* at
 construction and restores that snapshot on `Control.restart`. This is a genuine
@@ -96,8 +107,7 @@ gives a degraded device:
 Three of these reach state that belongs to the **caller** — BACnet object
 properties, an OPC UA `NodeStore` — and they do it strictly through the
 responder module's own public API (`Object.find` + `Device.update`;
-`NodeStore.getNode` / `setValue` / `refreshServerStatus`). Not one line of any
-responder module changed. Where the caller's model declares nothing to degrade
+`NodeStore.getNode` / `setValue` / `refreshServerStatus`). Where the caller's model declares nothing to degrade
 (a BACnet device whose objects carry none of the three fault properties),
 `control` still returns **false** and the fleet records `control_unsupported`:
 the honest answer is preserved for the case that actually deserves it.
@@ -143,7 +153,9 @@ sinks and a period, and the fleet schedules it as an ordinary event.
 
 `serveTcp` binds, accepts up to `max_sessions` peers one at a time, and pumps:
 `readVec` (one underlying read) → `submitStream` → `advance(elapsed)` → write
-`outbound()`. `poll(2)` bounds both the read and the accept so the `run_ms`
+`outbound()`. `readVec`, not `readSliceShort`: the latter keeps reading until the whole
+destination buffer is full unless the stream ends, which on a request/response protocol
+blocks for bytes a master will never send. `poll(2)` bounds both the read and the accept so the `run_ms`
 budget means something and the fleet's timers still fire on a quiet link.
 `serveUdp` is the same for BACnet, replying to the last peer seen.
 
@@ -155,7 +167,9 @@ Concurrency here is a *readiness set*, not a thread pool — which is the only w
 to add it without moving I/O into the core: there is still exactly one clock
 read per loop iteration, at the top, and the fleet still receives an injected
 `Time`. Everything is allocated before the loop (`max_peers` slots × three
-buffers), so the steady state never touches the allocator.
+buffers), so the steady state never touches the allocator. The listeners bound so far are
+closed by one `defer` over `listeners[0..bound]`, so the "no peer connected" path closes
+each of them once.
 
 Routing: a node's reply goes to the peer that most recently sent it something;
 when nothing was asked (unsolicited traffic) it goes to every peer on that
@@ -195,7 +209,7 @@ time, before the ring decides whether to keep the entry. That is what makes
 "same seed ⇒ same run" checkable on a 1000-node run whose full trace would never
 fit in memory.
 
-Proved, not asserted, by three tests:
+Proved, not asserted, by these tests:
 
 1. `determinism: the same seed reproduces a byte-identical emitted stream` runs
    a two-node fleet (Modbus + DNP3) behind a lossy/jittery/duplicating/
@@ -211,342 +225,108 @@ Proved, not asserted, by three tests:
    every `TraceEntry` (time, node, kind, payload length) plus the payload bytes
    for two same-seed runs and compares them field by field, then checks a
    different seed does not coincidentally produce the same trace.
-4. `fleet.zig` carries a fourth, smaller version over the toy echo node, so the
-   scheduler's determinism is testable without any protocol in the picture.
+4. `fleet.zig` carries a smaller version over the toy echo node (`determinism: same seed
+   = identical fingerprint; different seed diverges`), so the scheduler's determinism is
+   testable without any protocol in the picture.
 
-## What was verified live, against real third-party masters
+## Evidence against third-party masters
 
-> **How to tell whether any of this ran.** The transcripts below are a record of
-> runs that happened once, on a host where those masters were installed; they
-> are prose, not a check. Two things make that record falsifiable:
->
-> 1. **`FLEETSIM_EXPECT_LIVE=1`** — the live lane. With it set, every live test
->    whose `FLEETSIM_*_LISTEN` variable is missing (or whose binding gets no
->    peer) **fails** instead of skipping, so "0 of 8 live tests ran" can no
->    longer look identical to "all 8 passed" at the exit code. Without it, the
->    default run still skips, and its summary line still says so.
-> 2. **`src/goldens.zig`** (plus the OPC UA vector in `src/root.zig`) — a
->    third-party *reading* of the bytes the adapters emit, frozen from
->    Wireshark 4.6.4's dissectors for all seven protocols. It runs offline on
->    every build with no new dependency. It grades frames, so it does not
->    replace a real master's state machine; it does mean a green
->    `test-fleetsim` is no longer entirely self-anchored.
-> 3. **`scripts/vm/run.sh fleetsim debian`** — the live lane, actually run, in a
->    disposable VM with **all seven** real masters provided by the provisioning
->    recipe: pymodbus 3.14.0, pycomm3 1.2.16, bacpypes3 0.0.106, python-snap7
->    3.1.0, asyncua 2.0.1 and c104 2.2.1 from pinned wheels, and **opendnp3
->    3.1.2 built from a pinned source** — DNP3 has no installable master for
->    this interpreter, so the recipe grew a third slot (`VM_DEBIAN_SRC`) whose
->    URL, tag, sha256 and cmake flags are all part of the recipe hash. Six of
->    the seven recorded sessions are frozen in **`src/master_goldens.zig`** and
->    replay offline on every build, so their transcripts below are no longer
->    only prose: they are committed, byte-exact exchanges that a third party's
->    encoder composed and its decoder accepted. **OPC UA is the one exception,
->    and deliberately so** — a UA session carries server-minted material, so a
->    recording cannot be replayed against a freshly built server.
->
-> **The caution the VM lane produced — and what was done about it.**
-> A live master is not automatically an anchor. `test "live: a real Modbus
-> master drives a simulated slave over the TCP binding"` used to assert exactly
-> two things: `stats.delivered > 0` and `stats.replied > 0`. Both are liveness —
-> frames arrived, frames left — and neither says anything about what the device
-> said. Measured: byte-swapping the register encoder (`.big` → `.little` in
-> `modules/modbus/src/server.zig`'s read-registers reply) and re-running the
-> live lane produced **`GUEST_EXIT=0`: the live test passed with every register
-> value wrong**, because a wrong answer is still an answer and still gets
-> counted. What went red was the master's own grading, enforced by a `grep` in
-> `run.sh` for its `MODBUS_MASTER_OK` marker. A grade enforced by a shell gate
-> is not a test suite.
->
-> **The fix is that the master now reports what it decoded, in-band, and the
-> live test grades that.** `scripts/vm/guests/fleetsim-modbus-master.py`
-> compares every read against the fixture in its own number domain and writes
-> its marks back into the device with FC 0x10 and FC 0x05 — a magic word, the
-> number of checks it ran, the number it rejected, the exception code it
-> *named* for an out-of-range read, the sum of the holding registers it
-> decoded, the sum of the input registers, the coil bitmap it unpacked, and a
-> pass bit written either way. `modbus_verdict` in `src/root.zig` asserts on all
-> of it against constants derived from the fixture. Note what is deliberately
-> *not* done: the decoded values are never echoed back verbatim, because an echo
-> is the inverse of the read and a device that encoded and decoded with the same
-> wrong convention would round-trip cleanly — sums and a bitmap cannot cancel
-> that way.
->
-> The gate in `run.sh` was correspondingly demoted to `MODBUS_MASTER_DONE`,
-> which means "the counterpart connected and ran to the end" and never "the
-> counterpart was satisfied". Re-running the same byte-swap mutation against the
-> new arrangement: the marker gate passes, and **the live test itself fails**
-> (`expected 0, found 4` on the master's failure count) — `GUEST_EXIT=1`,
-> `run.sh` exit 1. The same marks are frozen into `src/master_goldens.zig`, so
-> the offline suite carries the grading too.
->
-> **Four more masters were then held to exactly that bar**, each with a verdict
-> channel of its own, because the value of the live lane is in the counterpart's
-> assertions and not in the counterpart's presence:
->
-> | protocol | counterpart | write-back channel | marks |
-> |----------|-------------|--------------------|-------|
-> | EtherNet/IP | pycomm3 1.2.16 | CIP `Write Tag` 0x4D into `Verdict` DINT[8] + `VerdictPass` | magic, checks, failures, sum of a six-element DINT array, a REAL scaled x10, a checksum of the `ListIdentity` product name, the CIP general status it named for an unserved tag, and the sum of a three-element slice starting at element 2 (which grades array-element addressing) |
-> | BACnet | bacpypes3 0.0.106 | `WriteProperty` into `analog-value,1..8` + `binary-value,1` | magic, checks, failures, present-value x10, an object-name checksum, the four status flags packed from what it unpacked *by name*, the device instance learned from an `I-Am`, and the error code it named for a missing property |
-> | S7comm | python-snap7 3.1.0 | a DB write into DB2 | magic, checks, failures, the sum of DB1[16..47], a REAL x10, `DINT - INT` from a typed record, the two *different* S7 return codes it named for an unbound DB (0x0A) and a read past the end of a bound one (0x05), and the PDU length the device chose |
-> | OPC UA | asyncua 2.0.1 | the `Write` service into `ns=1;s=verdict.0..7` + `verdict.pass` | magic, checks, failures, the Int32 measurement **plus** the Double setpoint x10, a decoded String checksum, the numeric `StatusCode` it named for an unknown node, a checksum of namespace 1's URI read from the server's own `NamespaceArray`, and DataType x100 + AccessLevel |
->
-> **Never a plain echo, and OPC UA is why that rule is not pedantry.** An
-> Int32 read followed by an Int32 write of the same number is precisely the
-> round trip a server whose integer codec is byte-swapped in *both* directions
-> survives untouched. Every numeric mark above is therefore a sum, a
-> difference, a bitmap, a checksum, a scaled integer or a status code the
-> counterpart itself named — a form a symmetric codec fault moves instead of
-> cancelling inside.
->
-> **Each was measured, not asserted.** For every one of the four, a wrong value
-> was injected into that protocol's adapter and the run repeated; the exit
-> codes are in "Mutation proofs" below. A master that connects but whose test
-> survives a wrong value is not an anchor, and landing one would repeat exactly
-> the defect this section is about.
->
-> **Mutation proofs — one wrong value per adapter, measured, not asserted.**
-> Each was injected on a clean tree, the offline suite and that master's live
-> lane were run, and the file was reverted and `cmp`-checked byte-identical
-> (`git diff --stat` empty in all four cases). What matters in the last column
-> is that the master's presence marker still printed: the run went red because
-> **the test** rejected the marks, not because a shell `grep` missed a marker.
->
-> | master | mutation | offline `test-fleetsim` | live lane |
-> |--------|----------|-------------------------|-----------|
-> | pycomm3 | `modules/enip/src/adapter.zig` `pathElement` → always 0 (array member segment ignored) | **exit 1** — the frozen pycomm3 corpus bites | `ENIP_MASTER_DONE` present, `live: a real EtherNet/IP master … FAIL (TestExpectedEqual)`, `expected 0, found 1`, `1 passed; 0 skipped; 1 failed`, **`GUEST_EXIT=1`, `run.sh` exit 1** |
-> | bacpypes3 | `modules/bacnet/src/tag.zig` `appReal` `.big` → `.little` | **exit 1** — the frozen bacpypes3 corpus bites | `BACNET_MASTER_DONE` present, `live: a real BACnet client … FAIL (TestExpectedEqual)`, `expected 0, found 1`, **`GUEST_EXIT=1`, `run.sh` exit 1** |
-> | python-snap7 | `modules/s7comm/src/items.zig` `byteOffset` `>> 3` → `>> 2` | **exit 1** — the frozen python-snap7 corpus bites | `S7_MASTER_DONE` present, `live: a real S7 client … FAIL (TestExpectedEqual)`, **`expected 1008, found 1520`** — i.e. the client summed a different window, **`GUEST_EXIT=1`, `run.sh` exit 1** |
-> | asyncua | `modules/opcua/src/encoding.zig` `encodeDouble` `.little` → `.big` | **exit 0, and that is expected** — there is no frozen OPC UA corpus to bite (see above) | `OPCUA_MASTER_DONE` present, `live: a real OPC UA client … FAIL (TestExpectedEqual)`, `expected 0, found 1`, **`GUEST_EXIT=1`, `run.sh` exit 1** |
->
-> The S7 line is the most legible of the four: the mark is a *sum over a byte
-> window*, so a halved address shift moves it from 1008 to 1520 and the failure
-> message names both numbers. The other three report through the failure count
-> the master itself wrote (`expected 0, found 1`) — the master graded, disagreed,
-> and said so in-band.
+All seven protocols have third-party-master evidence through the adapter and the module's
+own binding, on Linux. Each live run schedules a `trouble` fault at simulated t=15 s and the
+master polls across it, so the live runs are also the proof that device trouble is
+expressible in every one of the seven (the table under "Trouble" lists what each master saw).
 
-> **DNP3 is wired now, and it is the reason the lane can build from source at
-> all.** opendnp3 publishes no wheel and Debian packages no DNP3 stack in any
-> suite; the maintained Rust successor is under a proprietary non-commercial
-> licence. So the recipe gained `VM_DEBIAN_SRC` — `name|version|url|sha256|
-> cmake-flags`, checksum verified *in the guest* before extraction, every field
-> hashed into the recipe so a changed pin makes the image's filename change and
-> a stale guest stays unreachable. Verified rather than asserted: mutating the
-> tag, the checksum, the URL or one cmake flag each produced a different
-> `recipe-sha256`. `master-demo` is an interactive REPL and no scriptable master
-> binary exists, so the driver is a C++ program of ours against opendnp3's
-> public headers — it calls the stack, it does not reimplement it.
->
-> **IEC 104 is wired now.** An earlier attempt was built and rolled back
-> because the link would not stay up, and the instability was attributed to the
-> global-common-address conformance defect in `modules/iec104`. That attribution
-> was wrong twice over. The defect is real and is fixed (`4158b1d`: a station
-> answering a broadcast identifies itself with its own CA), but re-running the
-> lane against the *pre*-fix code did not break either — and the rebuilt lane
-> runs with **zero reconnects** (`CLOSED_AWAIT_OPEN → OPEN_MUTED → OPEN`, one
-> `OPEN`, then an orderly `OPEN_AWAIT_CLOSED → CLOSED`). What actually made the
-> difference was on the master's side: one connection, opened once, never
-> racing c104's auto-reconnect. The single-`Transport`/single-`state.Connection`
-> shape of `iec104.OutstationServer` was never exercised beyond one peer.
+**How to tell whether any of it ran.**
 
-**All seven protocols now have third-party-master evidence through the adapter
-and the module's own binding**, on Linux, Debug build. Each run schedules a
-`trouble` fault at simulated t=15 s and the master polls across it, so the
-transcripts below are also the proof that device trouble is expressible in every
-one of the seven.
+1. **`FLEETSIM_EXPECT_LIVE=1`**, the live lane. With it set, every live test whose
+   `FLEETSIM_*_LISTEN` variable is missing (or whose binding gets no peer) **fails** instead
+   of skipping, so "no live test ran" cannot look identical to "all passed" at the exit
+   code. Without it the default run skips and its summary line says so. `FLEETSIM_EXPECT_TCP=1`
+   does the same for the loopback-socket tests in `tcp.zig`.
+2. **`src/goldens.zig`** (plus the OPC UA vector in `src/root.zig`): a third-party *reading*
+   of the bytes the adapters emit, frozen from Wireshark 4.6.4's dissectors for all seven
+   protocols. It runs offline on every build with no new dependency. It grades frames, so it
+   does not replace a real master's state machine.
+3. **`scripts/vm/run.sh fleetsim debian`**, the live lane, run in a disposable VM with all
+   seven real masters provided by the provisioning recipe: pymodbus 3.14.0, pycomm3 1.2.16,
+   bacpypes3 0.0.106, python-snap7 3.1.0, asyncua 2.0.1 and c104 2.2.1 from pinned wheels,
+   and opendnp3 3.1.2 built from a pinned source (DNP3 has no installable master for the
+   guest's interpreter, so the recipe has a third slot, `VM_DEBIAN_SRC`, whose URL, tag,
+   sha256 and cmake flags are all part of the recipe hash; the driver is a C++ program of
+   ours against opendnp3's public headers, calling the stack, not reimplementing it). Six of
+   the seven recorded sessions are frozen in **`src/master_goldens.zig`** and replay offline
+   on every build (producers: `tools/gen-dnp3-goldens.py`, `tools/gen-iec104-goldens.py`).
+   **OPC UA is the exception, deliberately**: a UA session carries server-minted material, so
+   a recording cannot be replayed against a freshly built server.
 
-- **`pymodbus` 3.14.0 → `ModbusNode`** (`FLEETSIM_TEST_LISTEN`, `serveTcp`).
-  12 × `read_holding_registers(0, count=8)`, a `write_register(5, 0xBEEF)` with
-  a read-back, a `write_coil(3, True)` with a `read_coils` read-back, a
-  `read_input_registers`, and an out-of-range read that came back as
-  `ExceptionResponse(function_code=131, exception_code=2)`. The sine `Signal`
-  was visibly animating holding register 0 across the reads
-  (`500 → 623 → 735 → 823 → 880 → 900 → 880 → … → 500`, a 5 s period sampled at
-  250 ms). Our side:
-  `live fleetsim Modbus: sessions=1 frames_in=18 frames_out=18 bytes_in=216 bytes_out=371 delivered=18 replied=18 signal_fires=13 hr0=264 hr5=0xBEEF coil3=true`
-  — byte-identical to the first pass, i.e. the multi-peer work changed nothing
-  for the single-peer path.
+**A live master is an anchor only if the test grades what it decoded.** Counting frames
+(`delivered > 0`, `replied > 0`) is liveness: a device whose register encoder is
+byte-swapped still answers every request. So every master reports what it decoded in-band:
+it compares each read against the fixture in its own number domain and writes marks back
+into the device, and a `*_verdict` block in `src/root.zig` (`modbus_verdict`,
+`iec104_verdict`, …) asserts on them against constants derived from the fixture. `run.sh`
+requires each master's `*_MASTER_DONE` marker, which means only "the counterpart connected and
+ran to the end", never "was satisfied"; correctness is asserted in Zig.
 
-- **`opendnp3` 3.1.2 (Apache-2.0) → `Dnp3Node`** (`FLEETSIM_DNP3_LISTEN`,
-  `serveTcpMulti`), **in the VM lane, grading and frozen.** Built from a pinned
-  source inside the provisioning recipe (`VM_DEBIAN_SRC`) and driven by
-  `scripts/vm/guests/fleetsim-dnp3-master.cpp`, which calls opendnp3's own stack
-  and contains no DNP3 framing, CRC or object parsing of its own. It ran the
-  library's real startup sequence — disable unsolicited, clear the restart IIN,
-  a class 3/2/1/0 startup integrity poll, enable unsolicited — then a second
-  integrity poll on the far side of the scheduled fault, then two commands the
-  outstation was *expected to refuse*, then its marks.
+| protocol | counterpart | write-back channel | marks |
+|----------|-------------|--------------------|-------|
+| Modbus | pymodbus | FC 0x10 and FC 0x05 into holding registers and a coil | a magic word, the number of checks and of rejections, the exception code it named for an out-of-range read, the sum of the holding registers it decoded, the sum of the input registers, the coil bitmap it unpacked, a pass bit |
+| EtherNet/IP | pycomm3 1.2.16 | CIP `Write Tag` 0x4D into `Verdict` DINT[8] + `VerdictPass` | magic, checks, failures, sum of a six-element DINT array, a REAL scaled x10, a checksum of the `ListIdentity` product name, the CIP general status it named for an unserved tag, and the sum of a three-element slice starting at element 2 (which grades array-element addressing) |
+| BACnet | bacpypes3 0.0.106 | `WriteProperty` into `analog-value,1..8` + `binary-value,1` | magic, checks, failures, present-value x10, an object-name checksum, the four status flags packed from what it unpacked *by name*, the device instance learned from an `I-Am`, and the error code it named for a missing property |
+| S7comm | python-snap7 3.1.0 | a DB write into DB2 | magic, checks, failures, the sum of DB1[16..47], a REAL x10, `DINT - INT` from a typed record, the two *different* S7 return codes it named for an unbound DB (0x0A) and a read past the end of a bound one (0x05), and the PDU length the device chose |
+| OPC UA | asyncua 2.0.1 | the `Write` service into `ns=1;s=verdict.0..7` + `verdict.pass` | magic, checks, failures, the Int32 measurement **plus** the Double setpoint x10, a decoded String checksum, the numeric `StatusCode` it named for an unknown node, a checksum of namespace 1's URI read from the server's own `NamespaceArray`, and DataType x100 + AccessLevel |
 
-  **IIN over the run: `[0x90, 0x00]` (restart + need-time) → `[0x10, 0x00]`
-  → `[0x50, 0x00]`** — that 0x40 is IIN1.6 `device_trouble`, set by the fault at
-  t=15 s and seen by the master. Its twenty checks all passed and its marks came
-  back through DNP3's control direction: eleven g41v1 analog output blocks and
-  two g12v1 control relay output blocks.
+**Never a plain echo.** An Int32 read followed by an Int32 write of the same number is the
+round trip a server whose integer codec is byte-swapped in both directions survives
+untouched. Every numeric mark is therefore a sum, a difference, a bitmap, a checksum, a scaled
+integer or a status code the counterpart itself named, a form a symmetric codec fault moves
+instead of cancelling inside. The DNP3 master (opendnp3, `FLEETSIM_DNP3_LISTEN`, link
+addresses outstation 10 / master 1) writes its marks through DNP3's control direction (g41v1
+analog output blocks and g12v1 control relay blocks); the IEC 104 master (c104,
+`FLEETSIM_IEC104_LISTEN`) commands ten `C_SE_NB_1` marks into IOA 900..909 and a `C_SC_NA_1`
+pass bit into 910, and leaves the float domain (a `C_SE_NC_1` echo of the read float would be the
+exact inverse of the read) for a scaled integer, a difference across two different type decodes,
+a checksum of the whole interrogation set and two different causes the outstation itself chose
+(47 for an unbound IOA, 46 for a foreign common address).
 
-  **Why none of the marks is an echo.** A bitmap packed from eight separate
-  binary decodes (173); a sum over three g30v1 analogs (6556); a difference
-  across two *different* type decodes — an unsigned g20 counter minus a signed
-  g30v1 analog (87655) — which no echo of either operand can make; the g30v5
-  short float taken out of the float domain (x100) and differenced against a
-  signed integer decode (8939); a checksum over the whole integrity poll folding
-  every point's index with the DNP3 group opendnp3's own dispatch chose for it
-  (1437), so a superset or right-values-wrong-type fails; **two different
-  refusal codes the outstation chose and opendnp3 named** — `OUT_OF_RANGE` (12)
-  for a write past a bounded analog output's limit and `NOT_SUPPORTED` (4) for a
-  control against an index that does not exist; an IIN bitmap read off the
-  application header rather than the object data (0b111); and a pass bit
-  commanded last and commanded *either way*.
+**Each master is held to that bar by measurement:** a wrong value injected into the adapter's
+codec must turn the live test itself red (not only the shell gate); the injection results are
+archived, not restated here.
 
-- **`c104` 2.2.1 (lib60870-C, GPL-3.0) → `Iec104Node`** (`FLEETSIM_IEC104_LISTEN`,
-  `serveTcpMulti`), **in the VM lane, grading and frozen.** The client's state
-  machine went `CLOSED_AWAIT_OPEN → OPEN_MUTED → OPEN` (i.e. our `STARTDT con`
-  was accepted) and stayed there — **zero reconnects**. `Init.INTERROGATION`
-  opens with the automatic interrogation of the **global common address
-  0xFFFF**, and our outstation answered it under its own CA 47
-  (`680e0000020064010700`**`2f00`**`00000014`), which is §7.2.4's rule and the
-  behaviour `4158b1d` fixed. Then a station interrogation, a counter
-  interrogation, a command to an unbound IOA, an interrogation of a foreign
-  common address, and — after the t=15 s fault — a second station
-  interrogation across which every quality octet went `00` → `80`
-  (`Invalid`). c104 decoded 21.5 as `M_ME_NC_1`, -12345 as `M_ME_NB_1`, the
-  double point as `Double.ON`, and the integrated total 1234567 with sequence
-  5. It then commanded **ten `C_SE_NB_1` marks into IOA 900..909 and a
-  `C_SC_NA_1` pass bit into 910**; `iec104_verdict` in `root.zig` asserts on
-  them. Our side:
-  `live fleetsim IEC 104: peers=1 frames_in=21 frames_out=52 delivered=21 replied=20 started=true iv101=true iv201=true`
-  `live fleetsim IEC 104 verdict: checks=6 failures=0 observed=0b1111111 measured_x10=215 scaled_minus_measured=-12560 gi_checksum=7114 unknown_ioa=47 unknown_ca=46 iv_mask=0b11111 pass=true`
+Facts the live work established:
 
-  **Why a scaled integer and not the float.** Commanding 21.5 back as a
-  `C_SE_NC_1` short float would be the exact inverse of the read: an outstation
-  whose float codec was wrong in both directions would round-trip it clean.
-  Mark 904 leaves the float domain (`×10` to an integer), mark 905 is a
-  difference across two *different* type decodes (SVA minus that scaled float),
-  mark 906 checksums the whole interrogation set, and marks 907/908 are two
-  different causes the outstation itself chose — 47 for an unbound IOA, 46 for
-  a foreign common address — as c104's own `explain_bytes_dict` named them.
+- The S7comm device caps the negotiated PDU at 240 (`device_pdu_ceiling`, `root.zig` 1824) while
+  python-snap7 asks for 480; with the ceiling equal to the proposal the `DB2.DBD32` mark would
+  echo the client's own value.
+- python-snap7 3.1.0's `get_cpu_state()` does not issue an SZL read (it sends a one-byte parameter
+  `0x04` with the source comment "Use READ_AREA function for simplicity", which is not a valid S7
+  job), so no real CPU would answer it and this responder correctly does not either;
+  `read_szl(0x0424, 0)` is the real request.
+- c104 runs with zero reconnects (`CLOSED_AWAIT_OPEN → OPEN_MUTED → OPEN`, one orderly close). It
+  opens with an interrogation of the global common address 0xFFFF, which the outstation answers
+  under its own CA (§7.2.4).
+- pycomm3 opens a fresh socket per call, so its run exercises the multi-peer binding with many
+  sequential peers.
+- A two-master run (pymodbus on the Modbus node, c104 on the IEC 104 node, `FLEETSIM_MULTI_LISTEN`,
+  one binding thread) shows no cross-node leakage.
 
-  **Measured teeth.** `modules/iec104/src/info.zig`'s `writeI16` flipped
-  `.little` → `.big` (the SVA encoder — a constant, not a guard): c104 read
-  IOA 202 as **-14385** instead of -12345 and said so, the master still printed
-  `IEC104_MASTER_DONE` so the shell gate passed, and the **live test** failed on
-  the master's own failure count — `expected 0, found 1`, `1 passed; 0 skipped;
-  1 failed`, `GUEST_EXIT=1`. Reverted; `git diff` over `modules/iec104/` empty.
+## Scale
 
-- **`python-snap7` 3.1.0 → `S7Node`** (`FLEETSIM_S7_LISTEN`, `serveTcpMulti`).
-  COTP connect, `Setup communication` negotiating a **480-byte PDU**, then 14
-  rounds of `db_read(1, 0, 16)` + `read_szl(0x0424, 0)`. DB1.DBD8 was animated
-  by a sine and the client decoded it as a big-endian REAL
-  (`900.00 → 176.39 → 623.61 → …`); DB1[0:8] read back `0001020304050607` every
-  time. **SZL 0x0424 record `5144ff08` (bzu_id 0x08 = RUN) → `5144ff04`
-  (0x04 = STOP)** at t=15 s. Our side:
-  `live fleetsim S7comm: peers=1 frames_in=31 frames_out=30 delivered=31 replied=30 pdu=480 cpu_status=stop`
+`test "scale: 1000 in-process Modbus nodes, advanced over simulated minutes"` stands up 1000
+Modbus nodes (16 holding registers each, 1 ms link delay, 3 ms jitter, 1% loss) plus 64 signals
+(32 sine, 32 seeded random walk) and polls every node once per simulated second for six
+simulated minutes (360 000 requests). It asserts more than 90 % of the polls were answered, that
+every in-flight slot is back in the pool, and that the signals moved the registers. The reply and
+event counts are identical between builds and between runs (the determinism property, at scale)
+and there are no capacity losses. Memory is about 3 kB per node including its point storage,
+adapter, restart snapshot and share of the fixed pools. Wall-clock and RSS figures are not
+recorded here; the card's `**Performance:**` line says `not measured`.
 
-  *Re-recorded 2026-09-15 (audit F-C).* With the device ceiling equal to the
-  client's proposal, `@min(asked, ceiling)` was the identity and the DB2.DBD32
-  mark echoed the client's own 480. The live device now caps at **240**. The
-  client still asks for 480 and learns 240:
-  `live fleetsim S7comm: peers=1 frames_in=11 frames_out=10 delivered=11 replied=10 connected=false pdu=240 cpu_status=stop`,
-  verdict `pdu=240 pass=1`. The frozen session in `src/master_goldens.zig`
-  differs from the old one in exactly those two places: the setup response and
-  the verdict write.
-
-  *Oracle defect worth recording:* python-snap7 3.1.0's own `get_cpu_state()`
-  does **not** issue an SZL read — `build_cpu_state_request` sends a one-byte
-  parameter `0x04` with the source comment "Use READ_AREA function for
-  simplicity", which is not a valid S7 job. No real CPU would answer it, and
-  this responder correctly does not either. `read_szl(0x0424, 0)` is the real
-  request and works.
-
-- **`asyncua` 2.0.1 → `OpcuaNode`** (`FLEETSIM_OPCUA_LISTEN`, `serveTcpMulti`).
-  Full session bring-up (HEL/ACK, OpenSecureChannel, GetEndpoints, a second
-  channel, CreateSession, ActivateSession — 78 messages in, 77 out, 10 365 bytes
-  in / 6 384 bytes out), `get_namespace_array()` →
-  `['http://opcfoundation.org/UA/', 'urn:zig-libs:fleetsim']`, a browse of the
-  Objects folder → `['i=2253', 'ns=1;s=the.measurement']`, and 14 reads of the
-  measurement. **`value=42 status=Good ServerState=0` → `value=42
-  status=BadDeviceFailure ServerState=1`** at t=15 s. Our side:
-  `live fleetsim OPC UA: peers=1 peak=1 frames_in=78 frames_out=77 delivered=78 replied=77 measurement_status=0x808B0000`
-
-- **`pycomm3` 1.2.16 → `EnipNode`** (`FLEETSIM_ENIP_LISTEN`, `serveTcpMulti`).
-  `CIPDriver.list_identity` decoded the identity item completely
-  (`product_type='Programmable Logic Controller'`, `product_code=1`,
-  `revision={major:1,minor:0}`, `serial='00c0ffee'`,
-  `product_name='zig-fleetsim adapter'`), and an unconnected
-  `Get_Attributes_All` on the Identity object was repeated across the fault.
-  **`identity.status b'0\x00'` (0x0030) → `b'P\x04'` (0x0450), `state 3` →
-  `state 5`, and `Get_Attributes_All` `ok=True error=None` → `ok=False
-  error='Device state conflict'`.** pycomm3 opens a fresh socket per call, so
-  this run also exercised the multi-peer binding hard:
-  `live fleetsim EtherNet/IP: peers=29 peak=2 frames_in=87 frames_out=58 identity=20 identity_status=0x0450 state=major_unrecoverable_fault`
-
-- **`bacpypes3` 0.0.106 → `BacnetNode`** over UDP (`FLEETSIM_BACNET_LISTEN`,
-  `serveUdp`). A directed `who_is` drew an I-Am identifying `device,260001`;
-  `ReadProperty analog-input,1 object-name` returned `Zone-1-Temp`; then 14
-  rounds reading present-value, reliability, status-flags and out-of-service.
-  **`reliability=no-fault-detected status-flags= out-of-service=0` →
-  `reliability=unreliable-other status-flags=in-alarm;fault;out-of-service
-  out-of-service=1`** at t=15 s. Our side:
-  `live fleetsim BACnet: datagrams_in=58 datagrams_out=58 delivered=58 replied=58 reliability=7 status_flags=0xD0 out_of_service=true`
-
-- **Two masters at once** (`FLEETSIM_MULTI_LISTEN`, `serveTcpMulti`).
-  `pymodbus` on the Modbus node and `c104` on the IEC 104 node, two sockets, two
-  protocols, one binding thread: 25 Modbus reads (`[1000, 1001, 1002, 1003]`
-  every time — the *other* node's registers never leaked in) and 22 IEC 104
-  point updates, with **28.8 s of overlapping traffic**. Our side:
-  `live fleetsim multi-peer: peers=2 peak_concurrent=2 refused=0 frames_in=38 frames_out=70 modbus_replied=25 iec104_replied=13`
-
-Findings from the live work, worth recording:
-
-1. The first version of the TCP binding used `std.Io.Reader.readSliceShort`,
-   whose contract is "fill the whole destination buffer unless end-of-stream" —
-   **not** "return what is available". On a request/response protocol that means
-   blocking for 8 KiB a master will never send, and every master timed out.
-   `readVec` (one underlying read) is the right call for a framed stream.
-2. `serveTcpMulti`'s first version had both an `errdefer` over the listeners
-   bound so far *and* a `defer` over the whole array. On the "no peer connected"
-   path that closes every bound listener **twice**, which aborts. Only a live
-   run with no master reached it; the offline `error.BindFailed` test passed by
-   luck, because it never bound anything. It is now one `defer` over
-   `listeners[0..bound]`, evaluated at scope exit.
-3. `OpcuaNode` did not compile once anything instantiated its vtable: the error
-   map named `error.NoSpaceLeft`, which is not in `server.ServerError`. The
-   adapter was exported and never called, so nothing had ever analysed
-   `deliverFn`. Standing up the offline round-trip test found it immediately.
-
-## Scale — measured, not estimated
-
-`test "scale: 1000 in-process Modbus nodes, advanced over simulated minutes"`
-stands up **1000 Modbus nodes** (16 holding registers each, 1 ms link delay,
-3 ms jitter, 1% loss) plus **64 signals** (32 sine, 32 seeded random walk) and
-polls every node once per simulated second for **six simulated minutes** =
-**360 000 requests**. Measured on this machine (x86-64 Linux, Zig 0.16):
-
-| build | wall time | per poll | replies | events | RSS before → after setup → peak |
-|---|---|---|---|---|---|
-| Debug | 2.5–2.6 s | 6.9–7.3 µs | 352 822 / 360 000 | 732 900 | 6.4 → 9.4 → 9.5 MiB |
-| ReleaseFast | 175–202 ms | 0.49–0.56 µs | 352 822 / 360 000 | 732 900 | 3.0 → 3.7 → 4.2 MiB |
-
-Re-measured after the trouble/multi-peer/shim work (three runs each, on a
-machine with three other agents building concurrently — the earlier pass
-recorded Debug 2.0–2.6 s / 5.5–7.2 µs and ReleaseFast 171–188 ms / 0.48–0.52 µs
-on an idle machine). **Reply count and event count are byte-identical to the
-first pass**, which is the number that matters: nothing in this work perturbed
-the scheduler's behaviour, only its surroundings.
-
-Reply count and event count are identical between builds and between runs — the
-same determinism property, at scale. Zero capacity losses. The RSS delta for the
-whole fleet is ~3 MiB, i.e. **~3 kB per node** including its point storage, its
-adapter, its restart snapshot and its share of the fixed pools; the numbers
-above are process RSS from `/proc/self/statm`, so the "before" column carries
-whatever earlier tests left behind and only the deltas are meaningful.
-
-1000 nodes was reached comfortably; the binding constraint is not the scheduler
-but per-protocol state. A Modbus node is ~300 bytes of adapter plus its
-registers. An OPC UA node needs an allocator, a `NodeStore` and a receive buffer
-sized by the negotiated limits (≥ 8 KiB, 64 KiB by default) plus a reassembly
-buffer — call it a megabyte each in a realistic configuration, so an OPC UA
-fleet is measured in hundreds, not thousands. That is a property of the
-protocol, not of this module.
+The binding constraint is not the scheduler but per-protocol state. A Modbus node is about 300
+bytes of adapter plus its registers. An OPC UA node needs an allocator, a `NodeStore` and a
+receive buffer sized by the negotiated limits (at least 8 KiB, 64 KiB by default) plus a
+reassembly buffer, about a megabyte each in a realistic configuration, so an OPC UA fleet is
+measured in hundreds, not thousands. That is a property of the protocol, not of this module.
 
 ## Searching for a failure — the fleet as a `netsim` protocol
 
@@ -587,50 +367,25 @@ Liveness is deliberately **not** an invariant. An adversary free to cut a link
 and never heal it, or to crash the master, can starve any device of any reply;
 "every poll is answered" would report the adversary as a bug.
 
-**Teeth.** netsim's contract for a consumer is a deliberately-broken positive
-control (its own `LoopyForward`, `raft`'s `BrokenRaft`). `BrokenDevice` is this
-module's, and it carries four defects — one per master-side invariant. Each is
-gated on the same transaction id arriving twice, which **only a duplicated
-request can produce**, so each is provably unreachable on a clean run: the test
-`every bug is unreachable without the adversary` replays each of them with an
-empty fault trace and requires `.ok` *and* more than 20 answered polls. The
-search then finds all four, and minimises each to a single fault:
+**Teeth.** netsim's contract for a consumer is a deliberately-broken positive control (its own
+`LoopyForward`, `raft`'s `BrokenRaft`). `BrokenDevice` is this module's, and it carries four
+defects, one per master-side invariant. Each is gated on the same transaction id arriving twice,
+which only a duplicated request can produce, so each is unreachable on a clean run: the test
+`every bug is unreachable without the adversary` replays each with an empty fault trace and
+requires `.ok` and more than 20 answered polls. The search then finds all four and minimises each
+to a single surviving `dup_once 0->1` (one duplicated request on the master → device link), the
+root cause stated exactly. The same harness running the real `adapters.Modbus` is clean across the
+whole seed sweep.
 
-```
-length_counts_retransmit: seed=4 err=error.MalformedReply     trace 26 -> 1 events
-stale_unit_id:            seed=4 err=error.UnitIdMismatch     trace 26 -> 1 events
-invented_transaction:     seed=4 err=error.UnknownTransaction trace 26 -> 1 events
-stale_register_buffer:    seed=4 err=error.ValueOutOfRange    trace 26 -> 1 events
-    t= 489 dup_once 0->1
-    replay(minimised) -> violated
-```
+`BrokenDevice` has no arm for the fifth invariant, `SlotLeak`, because it is fleet-internal: a
+device cannot express it. The invariant is written in terms of `slotsHeld + free_count`, and
+`slotsHeld` is always zero in this configuration (the fleet's own link delays are zero, so a submit
+and its reply resolve inside one `advance`), so what bites is the `free_count` term; the test
+`SlotLeak fires when a slot is silently never returned` covers it.
 
-That single surviving `dup_once 0->1` at t=489 is the root cause stated exactly:
-one duplicated request on the master → device link. The same harness running the
-real `adapters.Modbus` is clean across the whole seed sweep.
-
-`BrokenDevice` has **no arm for the fifth invariant**, `SlotLeak` — it is
-fleet-internal, so a device cannot express it. Its teeth were measured instead,
-by deleting `self.freeSlot(slot)` from the success path of `Fleet.onEmit`
-(`src/fleet.zig`): `findFailing` reported `error.SlotLeak at seed 1`, all seven
-`vopr` tests went red and `test-fleetsim` exited 1 (69 pass / 8 skip / 11 fail).
-This matters because the invariant is written in terms of `slotsHeld + free_count`
-and `slotsHeld` is **always zero in this configuration** (the fleet's own link
-delays are zero here, so a submit and its reply resolve inside one `advance`) —
-so what actually bites is the `free_count` term, and the measurement is what
-distinguishes that from an invariant that only looks like one.
-
-The harness also has teeth against the **real** module, not just its own toy: a
-`.big` → `.little` flip of the register writer in `modules/modbus/src/server.zig`
-takes `adapters.Modbus`'s reported values outside the `Signal` band and
-`findFailing` reports `error.ValueOutOfRange at seed 1`. The bounds are
-load-bearing too, not decorative: widening `value_hi` 701 → 65535 or narrowing
-the sweep to seeds 1..2 each makes the planted-defect search fail.
-
-Every search here is **bounded** and modest (seeds 1..60, `until = 1200` ticks,
-a 20-tick poll period): a netsim sweep is one replay per seed and ddmin is one
-replay per candidate cut, so an unbounded budget would be a runaway rather than
-a better test.
+Every search here is bounded and modest (seeds 1..60, `until = 1200` ticks, a 20-tick poll period):
+a netsim sweep is one replay per seed and ddmin is one replay per candidate cut, so an unbounded
+budget would be a runaway rather than a better test.
 
 ## Hostile input & fuzzing
 
@@ -642,7 +397,7 @@ asserts is the one that matters for a scheduler: after the queue drains, every
 in-flight slot is back in the pool. A deterministic seed corpus runs the same
 body in CI without the fuzzer.
 
-The hostile cases the task called for are covered explicitly:
+The hostile cases covered explicitly:
 
 - **A frame for an unknown node** — `error.UnknownNode` from `submit` and
   `submitStream`, typed, never a crash.
@@ -663,7 +418,7 @@ The hostile cases the task called for are covered explicitly:
   `bad_framing` and its unparsed remainder (the whole reply when nothing parsed) shipped rather than swallowed; frames already sent are not repeated — a fleet that hides a
   responder bug is worse than useless.
 
-## Threat model / out of scope
+## Threat model / Limits
 
 This is a **simulator**, not a device. It authenticates nothing and encrypts
 nothing, because the protocols it speaks do not (except OPC UA, whose security
@@ -685,115 +440,92 @@ link, maps a `partition` cut onto "those devices are unreachable", and reports
 `clock_jump` as unmapped (a fleet has one clock by construction — per-node skew
 would break the total order that makes replay work).
 
-## DRY candidates found while building this — both now resolved
+**Limits.**
 
-- **`dnp3.outstation.Session.unsolicitedFrames(now_ms, out)` — added.**
-  `Session` could frame a *solicited* fragment (`feedFrame`, `nextFrames`) but
-  had no public way to frame an **unsolicited** one, because `sendFragment` is
-  private; this adapter re-did that job over `dnp3`'s public `link`/`transport`
-  API. It belongs on `Session` because `Session` owns `tx_seq`: framing an
-  outstation-initiated fragment anywhere else means duplicating the transport
-  sequence bookkeeping, which is exactly what confuses a master's reassembler.
-  The addition is purely additive — `Outstation.unsolicited` is untouched for
-  callers that own their framing — and `adapters.Dnp3.tickFn` now calls it.
-- **`shim.zig` — added, in this module.** See "Why `shim.zig` lives here" above
-  for why it cannot live in `iec104` or `bacnet`, and why a module of its own
-  would be worse than either. It is public (`fleetsim.Window`,
-  `fleetsim.shim.StreamShim`, `fleetsim.shim.DatagramShim`), because a consumer holding
-  one of those two responders outside a fleet wants exactly this, and both
-  `LoopTransport`s are the wrong shape for it.
+- **RTU framing is `opaque_whole`** (`node.zig`): a Modbus RTU node cannot be fed a concatenated
+  stream, only whole frames, because RTU has no length field (real RTU uses inter-character timing).
+  Fine for TCP fleets; a serial-gateway simulation would need t3.5 gap modelling.
+- **`serveTcpMulti` fans a node's unsolicited traffic to every peer on that node's listener.** For a
+  device with several masters subscribed that is the right behaviour; where the masters are meant to
+  be isolated it is not, and the binding cannot tell the difference.
+- **The `iec104.OutstationServer` shape** (single `Transport`, single `state.Connection`) was not
+  exercised beyond one peer.
+- **`OpcuaNode`'s `trouble` degrades the Variables the caller nominates** (`trouble_nodes`), not
+  every process value the server has.
+- **BACnet's trouble sets one shared `StatusFlags` octet for every degraded object**, so an object that
+  was already `in-alarm` for its own reasons comes back healthy on `trouble_off`.
 
-## Audit 2026-11-18 (whole-module mutation)
+## Verification
 
-532 schemata mutants over the production code of `node`, `shim`, `drivers`, `fleet`, `adapters`, `tcp` and `vopr` (test scaffolding, `root.zig` re-exports and allocation/deinit plumbing excluded; conditions: drop / boundary, skipped assignments and increments, flipped returns, comparison and connective swaps). First round against the existing suite left 326 alive; the audit added tests in every file (frame-length bounds at both sides, driver edges, stats counters, tick scheduling, heal clearing, trace ring wrap, PRNG draw counts, slot flag reuse, adapter move/restart/trouble paths, the BACnet COV notification path, the oracle in `vopr`, and loopback-socket tests for exact `Report` counters, session limits, split frames, idle rounds, refusal, routing and UDP). Final round: 469 killed (incl. hangs), 63 equivalent or unobservable, none open. The audit found one behaviour defect, fixed: `Fleet.sendOut` re-sent frames it had already sent when a good frame was followed by an unparseable tail; it now ships only the unconsumed remainder (the whole reply when nothing parsed). Delta mutant on the new condition killed.
+Run: `scripts/modtest fleetsim` (`zig build test-fleetsim`, also `--release=fast`); the live lane is
+`scripts/vm/run.sh fleetsim debian` (see *Evidence against third-party masters*). The eight live tests print
+`SKIPPED: …` and pass unless an endpoint is given (`FLEETSIM_TEST_LISTEN`, `FLEETSIM_ENIP_LISTEN`,
+`FLEETSIM_BACNET_LISTEN`, `FLEETSIM_DNP3_LISTEN`, `FLEETSIM_IEC104_LISTEN`, `FLEETSIM_S7_LISTEN`,
+`FLEETSIM_OPCUA_LISTEN`, `FLEETSIM_MULTI_LISTEN`).
 
-Equivalent (the guard is unreachable or its removal changes cost only): `Framing.dnp3_link` `user > 250` (the length octet caps `user` at 250) and `user == 0` (`(0+15)/16 == 0`); `FrameIterator.next` `self.bad` / `pos >= len` (an empty tail is "need more" for every framing, `bad` is idempotent); `Window.take` `n == 0`; replay `span > 0` (`span >= 1` by construction); `saturate*` edge comparisons (the edge values convert to themselves); `Event.before` `seq` tie (seqs are unique); `Fleet.pop` empty check (sole caller checks); `takeSlot` oversize check (both callers bound the frame); `sendOut` `!any and len != 0` (rest equals the whole reply); heal `slow_extra = 0` (read only under `slow_until`); Modbus trouble reply `pdu.len == 0` (both decoders reject an empty PDU); IEC 104 / BACnet drain-loop bounds, `drained`, `closed`, `.none`, `overflow` (the write failure surfaces first, the loop exits on the next round); BACnet `!cov_reported` (rewriting an unreported property is a no-op); OPC UA restart `Connection.init` failure (same buffers as `init`); `Vopr` `n != master` in `onTimer` (only the master arms a timer), `fleet_live = false` and `self.* = undefined` in `deinit`; `tcp` `bindings.len == 0` (both paths end in `NoPeer`), `poll_i = null` (overwritten for every active peer), `p.active` / `!p.active` re-checks, `ready != 0` / `listener_fds != 0` shortcuts, the unused return of `flushUdp`, `peers[slot].binding == b` and `.active` in `flushMulti` (invariants kept by `closePeer`), the end-of-run `closePeer` (a `defer` closes the same peers).
+Test classes, by file:
 
-Unobservable (name of the missing injection): `fleet` `self.now = ev.time` and `out_used = off` (an allocation failure inside `advance`); `drivers` NaN guards (`@intFromFloat(NaN)` yields 0 on this target in ReleaseSafe); `tcp` `writeCanceled` (cancel during a blocking write), `readable` poll-failure return, `writeAllChecked` failed-write return and `serveTcp` NoPeer-after-connect catch (socket-level fault injection), the `run_ms` and `elapsed` `>=`/`>` boundaries (same-millisecond clock reads), reader-buffered tail ids (`bufferedLen` conjuncts, `buffered` timeout, `has_buffered`: a test that writes more than one read buffer through a live peer hangs in a blocking `readVec`; needs a bounded read on a socketpair), `closePeer` clearing of `last_peer` (a reused slot plus unsolicited traffic on a listener with another peer); BACnet/IEC 104 transport re-pointing in `restart` and `reportSpontaneous` (the next entry point re-points, `reportSpontaneous` only queues); BACnet `init` field reset (needs a poisoned `self`, Debug fills 0xAA only in unoptimised builds); OPC UA `status_info` refresh (needs ExtensionObject decoding).
+- **`node.zig`:** the framing rules (frame-length bounds on both sides) and the frame iterator (truncated tail
+  versus malformed head).
+- **`adapters.zig`:** every adapter's round trip plus its restart and its trouble path (a real BACnet `ReadProperty`
+  of `Reliability`, a real CIP `Get_Attributes_All` refused with `0x10`, the BACnet COV path), an OPC UA HEL/ACK
+  round trip through a whole `NodeStore` and `Server`, adapter move/restart state.
+- **`drivers.zig`:** every driver, edge cases, PRNG draw counts.
+- **`fleet.zig`:** the scheduler (tick scheduling, heal clearing, trace ring wrap, slot flag reuse, stats counters,
+  slot-pool return), the toy-node determinism test.
+- **`shim.zig`:** the `Window` buffer discipline (all-or-nothing datagrams, the latching `overflow`).
+- **`tcp.zig`:** loopback-socket tests for exact `Report` counters, session limits, split frames, idle rounds, refusal,
+  routing and UDP; the multi-peer binding driven by two in-process clients at once (`FLEETSIM_EXPECT_TCP=1` makes a
+  skip a failure).
+- **`root.zig`:** the three determinism proofs, the scale run, the hostile-input cases, the verdict blocks and the
+  live tests.
+- **`vopr.zig`:** the netsim model-checking harness: a bounded seed sweep over the real `ModbusNode` that must stay clean,
+  the planted defects, minimisation, the oracle's classification of each reply fault.
+- **Goldens:** `src/goldens.zig` (Wireshark 4.6.4 readings) and `src/master_goldens.zig` (six frozen master sessions, with
+  their verdict exchanges) replay offline on every build.
+- **Fuzz:** `src/fuzz_test.zig`, a deterministic driver (`FLEETSIM_FUZZ=<runs>[,<first seed>]`) over `fuzzDispatch`, a
+  three-adapter fleet (Modbus + S7 + IEC 104 with a 500 ms tick); the invariant is that every in-flight slot is back in the
+  pool after the queue drains.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-A split-frame test for the multi-peer loop kills `serveTcpMulti` `p.carry = have - consumed`.
+## Provenance and licences
 
-## Deferred (honest list)
+No root `NOTICE` entry is required: nothing here ports third-party source and no third-party implementation was
+consulted as a design reference; the determinism methodology comes from the repo's own `netsim`. The seven masters
+(`pymodbus`, `pycomm3`, `bacpypes3`, `opendnp3`, `c104`/lib60870, `python-snap7`, `asyncua`) are run as black-box
+compatibility oracles only, in a disposable guest, which CONVENTIONS §5 says needs no entry. Their licences were checked:
+pymodbus is BSD-3-Clause; pycomm3, bacpypes3 and python-snap7 are MIT; opendnp3 is Apache-2.0 and the only one built from
+source (nothing of it is vendored); c104 is GPL-3.0-or-later, the strictest, stated in this module's `NOTICE`; asyncua is
+LGPL-3.0-or-later and the one whose session is not frozen at all. What is frozen for the other six is the byte output of
+two programs exchanging messages defined by public specifications (MODBUS Application Protocol, ODVA CIP Vol 1/2, ASHRAE
+135, the published S7 frame layouts), plus what each master reported it decoded.
 
-Four entries from the first pass have been **closed** and are recorded above
-rather than here: third-party-master evidence for DNP3 / IEC 104 / S7comm /
-OPC UA, `OpcuaNode`'s offline round-trip, `trouble` for BACnet / ENIP / OPC UA,
-and the multi-connection binding. What is still open:
+## What is deliberately not done
 
-- **`applyNetsimTrace` drops `clock_jump`** and returns the count of unmapped
-  events. Per-node clock skew would need a per-node clock offset, which the
-  single total order does not currently model.
-- **No fleet-native shrinker.** Delta-debugging over a *netsim* `FaultTrace` now
-  works end to end on a fleet — see "Searching for a failure" above — so a
-  failing run comes back as a minimised fault trace. What still does not exist
-  is a shrinker over the fleet's *own* inputs (`Fault` lists and submitted
-  frames), which is what you would want to minimise a failure that a netsim
-  schedule cannot express.
-- **RTU framing is `opaque_whole`** — a Modbus RTU node cannot be fed a
-  concatenated stream, only whole frames, because RTU has no length field (real
-  RTU uses inter-character timing). Fine for TCP fleets; a serial-gateway
-  simulation would need t3.5 gap modelling.
-- **The scale test is Modbus-only.** A mixed 1000-node fleet would be a better
-  number; the per-protocol memory story in the table above is reasoned, not
-  measured, for the six non-Modbus adapters.
-- **`serveTcpMulti` fans a node's unsolicited traffic to every peer on that
-  node's listener.** For a device with several masters subscribed that is the
-  right behaviour; for one where the masters are meant to be isolated it is not,
-  and the binding has no way to tell the difference. A per-peer session identity
-  (which is what DNP3 and OPC UA actually have) would fix it, and belongs with
-  whoever needs it.
-- **The multi-peer binding is proved with two peers, not many.** The offline
-  test uses two, the live run reached `peak_concurrent=2` with two different
-  masters and 29 sequential peers from pycomm3. `max_peers` is honoured and
-  over-limit connections are counted, but nothing here has driven 100 masters at
-  one fleet.
-- **`OpcuaNode`'s `trouble` degrades the Variables the caller nominates**
-  (`trouble_nodes`), not "every process value the server has". There is no
-  notion in the `NodeStore` of which Variables are process values as opposed to
-  server diagnostics, and inventing one here would be a guess about the caller's
-  address space.
-- **BACnet's trouble sets one shared `StatusFlags` octet for every degraded
-  object**, so an object that was already `in-alarm` for its own reasons comes
-  back healthy on `trouble_off`. Per-object save/restore would need per-object
-  storage; the simulator's answer is that a healthy simulated point has clear
-  flags.
-- (survey 2026-09-30) A declarative fleet description (file or comptime table) plus a small CLI that starts a fleet: ModbusPal and the pymodbus simulator are used by people who do not write code, and a fleet built only in Zig code excludes them. Effort: medium; fits CONVENTIONS §2 (parser over `std`, no deps).
-- (survey 2026-09-30) Serial/RTU inter-character timing (t3.5) for gateway-style tests: already listed above under RTU framing; ModbusPal users on serial gateways hit it. Effort: medium; fits §2.
+- **`clock_jump` is not mapped by `applyNetsimTrace`** (it returns the count of unmapped events): a fleet has one clock by
+  construction, and per-node clock skew would break the total order that makes replay work.
+- **`OpcuaNode`'s `trouble` does not degrade "every process value":** the `NodeStore` has no notion of which Variables are process
+  values as opposed to server diagnostics, and inventing one here would be a guess about the caller's address space.
+- **No per-object save/restore of BACnet `StatusFlags` on `trouble_off`:** it would need per-object storage; a healthy simulated
+  point has clear flags.
+- **Liveness is not an invariant of the model-checking harness** (see "Searching for a failure").
+- **No authentication, encryption or rate limiting in the bindings** (see "Threat model / Limits").
 
-## Coordinator notes
+## Backlog / deferred
 
-- `build.zig`, the root `README.md` catalog row and the `check-catalog` step
-  were pre-wired and were not touched.
-- **No `/NOTICE` entry is required.** Nothing here ports third-party source and
-  no third-party implementation was consulted as a design reference; the
-  determinism methodology comes from the repo's own `netsim`, whose TigerBeetle
-  VOPR design-reference entry already exists. `pymodbus`, `pycomm3`,
-  `bacpypes3`, `opendnp3`, `c104`/lib60870, `python-snap7` and `asyncua` were
-  run as black-box compatibility oracles only, which CONVENTIONS §5 explicitly
-  says needs no entry. (`opendnp3` already has a NOTICE entry from the `dnp3`
-  module's own interop work; nothing new is owed.)
-
-  **The licences were checked rather than assumed**, because six of the seven
-  masters now carried by the VM image also have their sessions *frozen* into
-  `src/master_goldens.zig`. pymodbus is BSD-3-Clause; pycomm3, bacpypes3 and
-  python-snap7 are MIT; **opendnp3 is Apache-2.0** and is the only one built
-  from source rather than installed — nothing of it is vendored, and Apache-2.0
-  would have permitted vendoring, which is what makes the choice not to a clean
-  statement rather than an attribution obligation; **c104 is GPL-3.0-or-later**,
-  the strictest in the list, and is stated exactly in this module's `NOTICE`;
-  **asyncua is LGPL-3.0-or-later** and is the one whose session is not frozen at
-  all. It did not need much: asyncua is run as a
-  separate process inside a disposable guest, nothing from it is copied,
-  translated, linked or redistributed, and — as it happens — nothing of its
-  session is frozen either, because an OPC UA session is not byte-replayable
-  (see `master_goldens.zig`). What *is* frozen for the other four is the byte
-  output of two programs exchanging messages defined by public specifications
-  (MODBUS Application Protocol, ODVA CIP Vol 1/2, ASHRAE 135, the published S7
-  frame layouts), plus what each master reported it decoded. That statement is
-  true of what was actually done.
-- **`modules/dnp3` gained one additive public function**
-  (`outstation.Session.unsolicitedFrames`) plus its test and doc updates. The
-  existing public API is unchanged and source-compatible.
+- **A fleet-native shrinker (idea):** delta-debugging over a netsim `FaultTrace` works end to end on a fleet, so a failing run comes
+  back as a minimised fault trace. What does not exist is a shrinker over the fleet's own inputs (`Fault` lists and submitted frames),
+  which a failure that a netsim schedule cannot express would need.
+- **Modbus RTU inter-character timing (t3.5) for gateway-style tests (planned, survey 2026-09-30):** ModbusPal users on serial gateways
+  hit it. Effort: medium; fits §2.
+- **A mixed-protocol scale test (open):** the scale test is Modbus-only; the per-protocol memory figures for the six other adapters are
+  reasoned, not measured.
+- **Per-peer session identity in `serveTcpMulti` (open, belongs with whoever needs it):** DNP3 and OPC UA have one; it would let the binding
+  isolate masters instead of fanning unsolicited traffic out.
+- **Driving many masters at one fleet (unverified):** the multi-peer binding is proved with two concurrent peers (the offline test and the
+  live run) and 29 sequential peers; `max_peers` is honoured and over-limit connections are counted, but nothing has driven 100 masters.
+- **A declarative fleet description plus a small CLI that starts a fleet (idea, survey 2026-09-30):** ModbusPal and the pymodbus simulator are
+  used by people who do not write code. Effort: medium; fits CONVENTIONS §2 (parser over `std`, no deps).
 
 ## Anchoring
 
@@ -810,3 +542,4 @@ own frames. ⚠ The seven LIVE tests against those masters (asyncua 2.0.1 is the
 one deliberately not frozen) are gated on `FLEETSIM_*_LISTEN` and **skip** unless the VM lane is
 running; `FLEETSIM_EXPECT_LIVE=1` turns a skip into a failure, and `FLEETSIM_EXPECT_TCP=1` does
 the same for the loopback-socket tests in `tcp.zig`.
+
