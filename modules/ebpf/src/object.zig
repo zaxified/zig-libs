@@ -77,8 +77,6 @@
 //!   concatenation and `func_info` merging.
 //! - `error.ExternSymbolUnsupported` — an `SHN_UNDEF` symbol: a kfunc
 //!   (`BPF_PSEUDO_KFUNC_CALL`), an extern kconfig variable, or a weak extern.
-//! - `error.MapInMapUnsupported` — a `values` member (`prog_array` /
-//!   `array_of_maps` initialization).
 //! - `error.PinningUnsupported` — a `pinning` member that is neither none nor
 //!   by-name.
 //!
@@ -374,6 +372,17 @@ pub const MapSpec = struct {
     pin_path: []const u8 = "",
     /// Set by `load` when the map was opened from its pin rather than created.
     reused: bool = false,
+    /// `ARRAY_OF_MAPS` / `HASH_OF_MAPS`: the inner map's definition, from the
+    /// element type of the `values` member. `load` creates a template inner
+    /// map from it (its fd goes in `inner_map_fd` of the outer's create).
+    inner: ?*const MapSpec = null,
+    /// A `values` member is present (also true for a `PROG_ARRAY`'s).
+    has_values: bool = false,
+    /// Byte offset of the `values` member in the map's variable.
+    values_off: u32 = 0,
+    /// Pre-filled slots (`.values = { &inner_a, [2] = &prog }`): `load`
+    /// stores the target's fd under key `index` once everything exists.
+    init_slots: []const InitSlot = &.{},
     /// Type ids in **this object's** BTF; only meaningful together with the
     /// BTF fd `load` obtains.
     btf_key_type_id: u32 = 0,
@@ -438,6 +447,18 @@ pub const CallSite = struct {
 /// Ceiling on the instruction count of one program after sub-programs are
 /// linked in (the kernel's own limit for a privileged load is 1M).
 pub const max_program_insns: usize = 1 << 20;
+
+/// A slot of a map-in-map or `PROG_ARRAY` initializer.
+pub const InitSlot = struct {
+    /// The array index: the map key the fd is stored under.
+    index: u32,
+    target: union(enum) {
+        /// Index into `Object.maps`.
+        map: usize,
+        /// Index into `Object.programs`.
+        program: usize,
+    },
+};
 
 /// One program: an instruction range of one program section, named by the
 /// `STT_FUNC` symbol that covers it.
@@ -506,8 +527,6 @@ pub const ParseError = error{
     MalformedMapDefinition,
     /// A member name in a `.maps` struct this loader does not know.
     UnknownMapMember,
-    /// A `values` member (`prog_array`/`array_of_maps` initialization).
-    MapInMapUnsupported,
     /// A non-zero `pinning` member.
     PinningUnsupported,
     /// `max_entries` is 0 for a map type that requires entries.
@@ -898,6 +917,9 @@ fn parseImage(
         .target = "",
     }, &subs);
 
+    // ── pass 4b: map-in-map / prog_array initial slots (`.rel.maps`) ──
+    if (maps_btf_sec) |i| try collectMapSlots(&obj, a, i);
+
     // ── pass 5: relocations + .BTF.ext slices ──
     for (obj.programs) |*p| {
         try collectRelocations(&obj, a, p);
@@ -975,52 +997,94 @@ fn parseBtfMaps(obj: *Object, a: std.mem.Allocator, sec_idx: usize, out: *std.Ar
             .origin = .btf_defined,
             .sec_idx = sec_idx,
         };
-
-        var m: u16 = 0;
-        while (m < st.vlen) : (m += 1) {
-            const mem = b.member(st, m) catch return error.MalformedBtf;
-            const mname = b.str(mem.name_off) orelse return error.MalformedMapDefinition;
-            const which = std.meta.stringToEnum(MapMember, mname) orelse return error.UnknownMapMember;
-            switch (which) {
-                .values => return error.MapInMapUnsupported,
-                .key, .value => {
-                    // `T *key` — the pointee's size AND type id.
-                    const p_id = b.skipModifiers(mem.type_id) catch return error.MalformedBtf;
-                    const p = b.byId(p_id) catch return error.MalformedBtf;
-                    if (p.kind != .ptr) return error.MalformedMapDefinition;
-                    const t_id = p.refType() orelse return error.MalformedMapDefinition;
-                    if (t_id == 0) return error.MalformedMapDefinition; // `void *`
-                    const size = b.sizeOf(t_id) catch return error.MalformedMapDefinition;
-                    if (size > std.math.maxInt(u32)) return error.MalformedMapDefinition;
-                    if (which == .key) {
-                        spec.key_size = @intCast(size);
-                        spec.btf_key_type_id = t_id;
-                    } else {
-                        spec.value_size = @intCast(size);
-                        spec.btf_value_type_id = t_id;
-                    }
-                },
-                else => {
-                    const v = try uintMemberValue(b, mem.type_id);
-                    switch (which) {
-                        .type => spec.map_type = @fromBackingInt(@intCast(v)),
-                        .max_entries => spec.max_entries = v,
-                        .map_flags => spec.map_flags = v,
-                        .key_size => spec.key_size = v,
-                        .value_size => spec.value_size = v,
-                        .numa_node => spec.numa_node = v,
-                        .pinning => spec.pinning = v,
-                        // `map_extra` is a u64 in the UAPI; the `__ulong`
-                        // encoding is a 64-bit array element count, which
-                        // does not fit this u32 path. Refused rather than
-                        // truncated.
-                        .map_extra => if (v != 0) return error.UnknownMapMember,
-                        else => unreachable,
-                    }
-                },
-            }
-        }
+        try parseMapDef(b, a, st, &spec, 0);
         out.append(a, spec) catch return error.OutOfMemory;
+    }
+}
+
+/// Fill `spec` from the members of a map-definition struct. `depth` is 0 for a
+/// `.maps` variable and 1 for an inner map definition, which may not itself
+/// have a `values` member (the kernel has no map-in-map-in-map).
+fn parseMapDef(b: *const Btf, a: std.mem.Allocator, st: btf_mod.Type, spec: *MapSpec, depth: u8) ParseError!void {
+    var values_mem: ?btf_mod.Member = null;
+    var m: u16 = 0;
+    while (m < st.vlen) : (m += 1) {
+        const mem = b.member(st, m) catch return error.MalformedBtf;
+        const mname = b.str(mem.name_off) orelse return error.MalformedMapDefinition;
+        const which = std.meta.stringToEnum(MapMember, mname) orelse return error.UnknownMapMember;
+        switch (which) {
+            .values => values_mem = mem,
+            .key, .value => {
+                // `T *key` — the pointee's size AND type id.
+                const p_id = b.skipModifiers(mem.type_id) catch return error.MalformedBtf;
+                const p = b.byId(p_id) catch return error.MalformedBtf;
+                if (p.kind != .ptr) return error.MalformedMapDefinition;
+                const t_id = p.refType() orelse return error.MalformedMapDefinition;
+                if (t_id == 0) return error.MalformedMapDefinition; // `void *`
+                const size = b.sizeOf(t_id) catch return error.MalformedMapDefinition;
+                if (size > std.math.maxInt(u32)) return error.MalformedMapDefinition;
+                if (which == .key) {
+                    spec.key_size = @intCast(size);
+                    spec.btf_key_type_id = t_id;
+                } else {
+                    spec.value_size = @intCast(size);
+                    spec.btf_value_type_id = t_id;
+                }
+            },
+            else => {
+                const v = try uintMemberValue(b, mem.type_id);
+                switch (which) {
+                    .type => spec.map_type = @fromBackingInt(@intCast(v)),
+                    .max_entries => spec.max_entries = v,
+                    .map_flags => spec.map_flags = v,
+                    .key_size => spec.key_size = v,
+                    .value_size => spec.value_size = v,
+                    .numa_node => spec.numa_node = v,
+                    .pinning => spec.pinning = v,
+                    // `map_extra` is a u64 in the UAPI; the `__ulong`
+                    // encoding is a 64-bit array element count, which
+                    // does not fit this u32 path. Refused rather than
+                    // truncated.
+                    .map_extra => if (v != 0) return error.UnknownMapMember,
+                    else => unreachable,
+                }
+            },
+        }
+    }
+
+    // `values` is `typeof(T) *values[]`: an array of pointers to T. For a map
+    // in map T is the inner map's definition struct; for a `PROG_ARRAY` it is
+    // a function type. It is judged after the loop: `type` may follow it.
+    if (values_mem) |vm| {
+        if (depth != 0) return error.MalformedMapDefinition;
+        const arr_id = b.skipModifiers(vm.type_id) catch return error.MalformedBtf;
+        const arr = b.byId(arr_id) catch return error.MalformedBtf;
+        if (arr.kind != .array) return error.MalformedMapDefinition;
+        const ai = b.arrayInfo(arr) catch return error.MalformedBtf;
+        const p_id = b.skipModifiers(ai.elem_type) catch return error.MalformedBtf;
+        const p = b.byId(p_id) catch return error.MalformedBtf;
+        if (p.kind != .ptr) return error.MalformedMapDefinition;
+        const t_id = p.refType() orelse return error.MalformedMapDefinition;
+        if (t_id == 0) return error.MalformedMapDefinition;
+        const t = b.resolve(t_id) catch return error.MalformedBtf;
+        spec.has_values = true;
+        spec.values_off = vm.bit_offset / 8;
+        switch (spec.map_type) {
+            .array_of_maps, .hash_of_maps => {
+                if (t.kind != .@"struct") return error.MalformedMapDefinition;
+                const inner = a.create(MapSpec) catch return error.OutOfMemory;
+                inner.* = .{
+                    .name = "inner",
+                    .map_type = .unspec,
+                    .origin = .btf_defined,
+                    .sec_idx = spec.sec_idx,
+                };
+                try parseMapDef(b, a, t, inner, 1);
+                spec.inner = inner;
+            },
+            .prog_array => if (t.kind != .func_proto) return error.MalformedMapDefinition,
+            else => return error.MalformedMapDefinition,
+        }
     }
 }
 
@@ -1326,6 +1390,91 @@ fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) Pa
     }
     prog.relos = relos.toOwnedSlice(a) catch return error.OutOfMemory;
     prog.call_sites = calls.toOwnedSlice(a) catch return error.OutOfMemory;
+}
+
+/// `.rel.maps` carries the initializer of a map-in-map or `PROG_ARRAY`
+/// (`.values = { &inner_a, [2] = &prog }`): one `R_BPF_64_ABS64` per filled
+/// slot, at `<variable offset> + <values member offset> + 8 * index`, against
+/// the target's symbol — a `.maps` variable (a map) or a function (a program).
+fn collectMapSlots(obj: *Object, a: std.mem.Allocator, maps_sec: usize) ParseError!void {
+    var any = false;
+    for (obj.maps) |m| {
+        if (m.has_values and m.origin == .btf_defined and m.sec_idx == maps_sec) any = true;
+    }
+    if (!any) return;
+
+    // Where each map's variable sits in `.maps`: from its `STT_OBJECT` symbol.
+    const Var = struct { off: u64, size: u64, map: usize };
+    var vars: std.ArrayList(Var) = .empty;
+    const n = obj.image.symbolCount(obj.symtab_idx) catch return error.MalformedElf;
+    var si: u32 = 0;
+    while (si < n) : (si += 1) {
+        const sym = obj.image.symbol(obj.symtab_idx, si) catch return error.MalformedElf;
+        if (sym.st_shndx != maps_sec or sym.kind() != STT_OBJECT) continue;
+        const mi = findMapIdx(obj, obj.image.symbolName(obj.symtab_idx, sym)) orelse continue;
+        if (!obj.maps[mi].has_values) continue;
+        vars.append(a, .{ .off = sym.st_value, .size = sym.st_size, .map = mi }) catch return error.OutOfMemory;
+    }
+    std.mem.sort(Var, vars.items, {}, struct {
+        fn lt(_: void, x: Var, y: Var) bool {
+            return x.off < y.off;
+        }
+    }.lt);
+
+    const rel_idx: usize = blk: {
+        for (obj.image.sections, 0..) |s, i| {
+            if (s.sh_type == elfsym.SHT_REL and s.sh_info == maps_sec) break :blk i;
+        }
+        return; // no initializers at all
+    };
+    const count = obj.image.relocationCount(rel_idx) catch return error.MalformedElf;
+
+    const Slots = std.ArrayList(InitSlot);
+    const lists = a.alloc(Slots, obj.maps.len) catch return error.OutOfMemory;
+    for (lists) |*l| l.* = .empty;
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const rel = obj.image.relocation(rel_idx, i) catch return error.MalformedElf;
+        if (rel.type != R_BPF_64_ABS64) return error.UnsupportedRelocation;
+        // The variable whose range holds `r_offset`: the last one starting at or before it.
+        var lo: usize = 0;
+        var hi: usize = vars.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (vars.items[mid].off <= rel.r_offset) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return error.RelocationOutOfRange;
+        const v = vars.items[lo - 1];
+        const m = &obj.maps[v.map];
+        const rel_in_var = rel.r_offset - v.off;
+        if (rel_in_var >= v.size or rel_in_var < m.values_off) return error.RelocationOutOfRange;
+        const slot_off = rel_in_var - m.values_off;
+        if (slot_off % 8 != 0) return error.RelocationOutOfRange;
+        const index = slot_off / 8;
+        if (index >= m.max_entries) return error.RelocationOutOfRange;
+
+        const sym = obj.image.symbol(obj.symtab_idx, rel.sym) catch return error.MalformedElf;
+        const sym_name = obj.image.symbolName(obj.symtab_idx, sym);
+        const target: @FieldType(InitSlot, "target") = switch (m.map_type) {
+            .array_of_maps, .hash_of_maps => .{ .map = blk: {
+                if (sym.st_shndx != maps_sec) return error.UnresolvedRelocation;
+                break :blk findMapIdx(obj, sym_name) orelse return error.UnresolvedRelocation;
+            } },
+            .prog_array => .{ .program = blk: {
+                if (sym.kind() != STT_FUNC) return error.UnresolvedRelocation;
+                for (obj.programs, 0..) |p, k| {
+                    if (p.sec_idx == sym.st_shndx and p.sec_byte_off == sym.st_value) break :blk k;
+                }
+                return error.UnresolvedRelocation;
+            } },
+            else => return error.UnresolvedRelocation,
+        };
+        lists[v.map].append(a, .{ .index = @intCast(index), .target = target }) catch return error.OutOfMemory;
+    }
+    for (lists, 0..) |*l, k| {
+        if (l.items.len != 0) obj.maps[k].init_slots = l.toOwnedSlice(a) catch return error.OutOfMemory;
+    }
 }
 
 const SubKey = struct { sec: usize, off: u64 };
@@ -1786,7 +1935,7 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
                 else => return error.PinFailed,
             }
         }
-        m.fd = try createMap(m);
+        m.fd = try createMapWithInner(m);
         if (pin) |path| bpfsys.objPin(m.fd, path) catch return error.PinFailed;
         if (m.origin == .internal) {
             var key: [4]u8 = @splat(0);
@@ -1813,6 +1962,7 @@ pub fn load(obj: *Object, opts: LoadOptions) LoadError!void {
         try relocateProgram(p, obj.maps);
         p.fd = try loadOneProgram(obj, p, license, opts);
     }
+    try fillInitSlots(obj);
 }
 
 /// A map found at its pin must be the map this object declares; the check is
@@ -1850,13 +2000,51 @@ fn needsEntries(t: BPF.MapType) bool {
     };
 }
 
-fn createMap(m: *const MapSpec) LoadError!linux.fd_t {
+/// Create `m`, first creating its inner-map template when it is a
+/// map-in-map: the kernel fixes the inner type, sizes and flags from the fd
+/// handed in `inner_map_fd`, and the template is not needed afterwards.
+fn createMapWithInner(m: *const MapSpec) LoadError!linux.fd_t {
+    const outer = switch (m.map_type) {
+        .array_of_maps, .hash_of_maps => true,
+        else => false,
+    };
+    if (!outer) return createMap(m, 0);
+    const inner = m.inner orelse return error.InvalidArgument;
+    if (inner.max_entries == 0 and needsEntries(inner.map_type)) return error.ZeroMaxEntries;
+    const tmpl = try createMap(inner, 0);
+    defer _ = linux.close(tmpl);
+    return createMap(m, tmpl);
+}
+
+/// Fill the pre-initialized slots of every map-in-map and `PROG_ARRAY`
+/// (`BPF_MAP_UPDATE_ELEM`, key = the slot index, value = the target's fd).
+/// Runs after every map exists and every program is loaded.
+fn fillInitSlots(obj: *Object) LoadError!void {
+    for (obj.maps) |*m| {
+        if (m.reused or m.init_slots.len == 0) continue;
+        for (m.init_slots) |sl| {
+            const target_fd: linux.fd_t = switch (sl.target) {
+                .map => |k| obj.maps[k].fd,
+                .program => |k| obj.programs[k].fd,
+            };
+            if (target_fd < 0) return error.MapNotCreated;
+            var key: [4]u8 = undefined;
+            std.mem.writeInt(u32, &key, sl.index, builtin.cpu.arch.endian());
+            var val: [4]u8 = undefined;
+            std.mem.writeInt(u32, &val, @intCast(target_fd), builtin.cpu.arch.endian());
+            BPF.map_update_elem(m.fd, &key, &val, 0) catch return error.MapUpdateFailed;
+        }
+    }
+}
+
+fn createMap(m: *const MapSpec, inner_fd: linux.fd_t) LoadError!linux.fd_t {
     var attr: BPF.MapCreateAttr = std.mem.zeroes(BPF.MapCreateAttr);
     attr.map_type = @backingInt(m.map_type);
     attr.key_size = m.key_size;
     attr.value_size = m.value_size;
     attr.max_entries = m.max_entries;
     attr.map_flags = m.map_flags;
+    attr.inner_map_fd = inner_fd;
     if (m.numa_node) |n| {
         attr.numa_node = n;
         attr.map_flags |= 1 << 2; // BPF_F_NUMA_NODE
@@ -2016,6 +2204,7 @@ const fx_legacy_map = @embedFile("testdata/legacy_map.bpf.o");
 const fx_core_reloc = @embedFile("testdata/core_reloc.bpf.o");
 const fx_two_progs = @embedFile("testdata/two_progs.bpf.o");
 const fx_subprog = @embedFile("testdata/subprog.bpf.o");
+const fx_mapinmap = @embedFile("testdata/mapinmap.bpf.o");
 
 test "section table: every prefix resolves, longest match wins" {
     // The exact-vs-target rule.
@@ -4234,7 +4423,7 @@ test "BTF-defined maps: every member lands in its field; every malformation is t
         .{ .mem = &.{}, .flavor = .nameless, .want = error.MalformedMapDefinition },
         .{ .mem = &.{}, .flavor = .non_struct, .want = error.MalformedMapDefinition },
         .{ .mem = &.{.{ .name = "foo", .kind = .uint, .v = 1 }}, .want = error.UnknownMapMember },
-        .{ .mem = &.{.{ .name = "values", .kind = .ptr_int }}, .want = error.MapInMapUnsupported },
+        .{ .mem = &.{.{ .name = "values", .kind = .ptr_int }}, .want = error.MalformedMapDefinition }, // not an array of pointers
         .{ .mem = &.{.{ .name = "key", .kind = .plain_int }}, .want = error.MalformedMapDefinition },
         .{ .mem = &.{.{ .name = "value", .kind = .ptr_void }}, .want = error.MalformedMapDefinition },
         .{ .mem = &.{.{ .name = "max_entries", .kind = .ptr_plain }}, .want = error.MalformedMapDefinition },
@@ -4775,4 +4964,43 @@ test "pin paths: an unreachable pin is a typed error and pins nothing" {
     try o.pinPrograms("/nonexistent-bpffs-root");
     try o.unpinMaps("/nonexistent-bpffs-root");
     try o.unpinPrograms("/nonexistent-bpffs-root");
+}
+
+test "map-in-map and prog_array: inner definitions and initial slots come out of a clang object" {
+    const gpa = testing.allocator;
+    var o = try open(gpa, fx_mapinmap, .{});
+    defer o.deinit();
+
+    const outer = o.findMap("outer").?;
+    try testing.expectEqual(BPF.MapType.array_of_maps, outer.map_type);
+    try testing.expectEqual(@as(u32, 4), outer.max_entries);
+    try testing.expectEqual(@as(u32, 4), outer.key_size);
+    try testing.expect(outer.has_values);
+    const inner = outer.inner.?;
+    try testing.expectEqual(BPF.MapType.array, inner.map_type);
+    try testing.expectEqual(@as(u32, 8), inner.max_entries);
+    try testing.expectEqual(@as(u32, 4), inner.key_size);
+    try testing.expectEqual(@as(u32, 8), inner.value_size);
+
+    // `.values = { &inner_a, &inner_b }`: slots 0 and 1, pointing at the maps by index
+    try testing.expectEqual(@as(usize, 2), outer.init_slots.len);
+    for (outer.init_slots, 0..) |sl, k| {
+        try testing.expectEqual(@as(u32, @intCast(k)), sl.index);
+        try testing.expectEqualStrings(if (k == 0) "inner_a" else "inner_b", o.maps[sl.target.map].name);
+    }
+    try testing.expect(o.findMap("inner_a").?.inner == null);
+
+    // a hash-of-maps with a definition and no initializer
+    const hmap = o.findMap("hmap").?;
+    try testing.expectEqual(BPF.MapType.hash_of_maps, hmap.map_type);
+    try testing.expect(hmap.inner != null);
+    try testing.expectEqual(@as(usize, 0), hmap.init_slots.len);
+
+    // `.values = { [1] = &target }` of a prog_array names a program, not a map
+    const jumps = o.findMap("jumps").?;
+    try testing.expectEqual(BPF.MapType.prog_array, jumps.map_type);
+    try testing.expect(jumps.inner == null);
+    try testing.expectEqual(@as(usize, 1), jumps.init_slots.len);
+    try testing.expectEqual(@as(u32, 1), jumps.init_slots[0].index);
+    try testing.expectEqualStrings("target", o.programs[jumps.init_slots[0].target.program].name);
 }

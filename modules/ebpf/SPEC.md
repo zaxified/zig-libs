@@ -696,6 +696,21 @@ after linking is `error.ProgramTooLarge`. A call inside one function's own range
 Not verified against a live kernel here (no `CAP_BPF` on the development machine): the golden checks are structural
 (every call lands on a `func_info` start, every relocation on an `LD_IMM64`).
 
+### Map-in-map and `PROG_ARRAY`
+
+A `values` member is `typeof(T) *values[]`, an array of pointers to `T`. For `ARRAY_OF_MAPS`/`HASH_OF_MAPS` `T` is the
+inner map's definition struct (parsed by the same code as an outer one; no nesting deeper than one level): it becomes
+`MapSpec.inner`, and `load` creates a throw-away template map from it whose fd goes in the outer's `inner_map_fd` (the
+kernel fixes the inner type, sizes and flags from it). For `PROG_ARRAY` `T` is a function type. Anything else, or a
+`values` member on another map type, is `error.MalformedMapDefinition`; an outer map with no inner definition cannot be
+created (`InvalidArgument`), as in libbpf. A static initializer (`.values = { &inner_a, [2] = &prog }`) is the
+`R_BPF_64_ABS64` records of `.rel.maps`: each sits at `variable + values member offset + 8 * index` against the target's
+symbol, a `.maps` variable for a map-in-map and a function (an entry program, not a sub-program) for a `PROG_ARRAY`
+(`error.UnresolvedRelocation` otherwise, `RelocationOutOfRange` for an index past `max_entries`). They become
+`MapSpec.init_slots`; once every map exists and every program is loaded, `load` stores each target's fd under the slot
+index with `BPF_MAP_UPDATE_ELEM` (a map the object reused from a pin is left alone). Hash-of-maps are filled the same
+way, key = the slot index. Not verified against a live kernel here; the golden test reads a clang object.
+
 ### Pinning (bpffs)
 
 `__uint(pinning, LIBBPF_PIN_BY_NAME)` is honoured the way libbpf does it: `load` looks for a map pinned at
@@ -757,7 +772,6 @@ big the log would have been. `Object.verifier_log` and
 Every one is a typed error naming the symbol or section:
 `error.ExternSymbolUnsupported` (any
 `SHN_UNDEF` symbol: kfunc, extern kconfig, weak extern),
-`error.MapInMapUnsupported` (a `values` member),
 `error.PinningUnsupported` (a mode other than none/by-name), `error.UnknownMapMember`,
 `error.UnknownProgramSection` (an executable section matching no prefix —
 `load` refuses unless `ignore_unknown_sections`).
@@ -975,9 +989,6 @@ symbol, never a mis-load; the attach and API gaps are simply absent.
 - **kfuncs / externs / ksyms.** An `SHN_UNDEF` symbol is `error.ExternSymbolUnsupported`. Real support needs
   `BPF_PSEUDO_KFUNC_CALL` with the kfunc's BTF id resolved out of vmlinux (and out of module BTF, which the split-BTF
   parser can already read) plus an `fd_array` of module BTF fds, and, for extern variables, a synthesized `.kconfig` map.
-- **Map-in-map and `prog_array` population** (a `values` member in a `.maps` struct): `error.MapInMapUnsupported`. Needs a
-  two-phase create (inner map first, `inner_map_fd` on the outer) and a post-load `BPF_MAP_UPDATE_ELEM` pass filling the
-  array with fds.
 - **`mmap`-able global-data maps and a generated skeleton.** libbpf sets `BPF_F_MMAPABLE` on internal maps and hands
   userspace a struct pointer into them; here they are ordinary arrays seeded through `BPF_MAP_UPDATE_ELEM`, so a caller
   sets `const volatile` config by editing `MapSpec.initial_data` before `load`, not by writing through a mapped struct.

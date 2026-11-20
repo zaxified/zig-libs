@@ -415,7 +415,11 @@ grown from `log_true_size` so it is never truncated.
 
 What it refuses with a typed error naming the symbol, rather than emitting a
 silently broken program: `error.ExternSymbolUnsupported` (kfuncs,
-extern kconfig/ksym), `error.MapInMapUnsupported` (a `values` member).
+extern kconfig/ksym).
+
+Map-in-map (`ARRAY_OF_MAPS`/`HASH_OF_MAPS` with an inner definition) and
+`PROG_ARRAY` initializers (`.values = { &inner, [1] = &prog }`) are created and
+filled by `load`.
 
 bpffs pinning works: `pinning = LIBBPF_PIN_BY_NAME` reuses a compatible map
 pinned at `<LoadOptions.pin_root>/<name>` or creates and pins it;
