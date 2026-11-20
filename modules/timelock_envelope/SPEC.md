@@ -6,7 +6,7 @@
 
 **Scope:** core — drand `tle` / age (time-lock and hybrid-PQ file encryption); no equivalent AND-of-locks envelope exists (surveyed 2026-09-30; mvp -> core 2026-10-06 after the streaming format landed)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-06 (10/10) · src ?
+**Audit:** review 2026-08-06 · mutation 2026-11-20 (113/130, 17 eq) · src f9566cc82b035ad6
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget, clean at `.scale` 10 = 20,000 runs per harness — a run is a pairing plus an HQC decapsulation, TLE_FUZZ) · ct 2026-10-10 (ctgrind: lock secrets through the KDFs 0; seal/open with randomness, plaintext and HQC dk tainted 8 in-file, all in tlock/HQC/AEAD reached through the envelope, none in this module)
 **Performance:** not measured
@@ -289,7 +289,8 @@ Run `scripts/modtest timelock_envelope`.
 - **Dead stack and constant time:** `src/stackprobe_test.zig` (ReleaseFast) scans the dead stack after `seal`, `open`,
   `sealStream`, `openStream`; `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh timelock_envelope`) taints both lock
   secrets through the KDFs and the seal/open randomness, plaintext and HQC decapsulation key through the envelope.
-- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. That run covers `envelope.zig` and `stream.zig` (130 mutants: both KDFs input by input, every refusal, error mapping and length/endianness choice of `seal`, `parse`, `open`, `peekHeader` and the stream sealer and opener, the AAD and transcript extents, `SealRandomness`; 113 killed, 17 equivalent). The 17 are the stack wipes inside the burned bodies (the KDF buffers, shared secrets, derived keys and STREAM key): `burn.run` zeroes the same frame right after the body returns, and the ReleaseFast stack probe stays green with any one of them removed. Not mutated: `root.zig` (re-exports and the comptime `meta`), `burn.zig`, the comptime wire constants, the heap wipes before `free` (unobservable: `free` poisons the bytes first) and the `errdefer`s with no failing step after their allocation.
+- **Wire layout:** `security_test.zig` recomputes the version-1 header, both lock regions, tag and content from `tlock.encrypt`, `Kem.encaps`, `deriveKeys` and the AEAD, and checks `parse`'s views; `stream_test.zig` does the same for the version-2 header and locks.
 
 ## Backlog / deferred
 

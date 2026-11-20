@@ -609,6 +609,22 @@ test "parse rejects truncated / bad-magic / wrong-version / wrong-suite / wrong-
     try testing.expectError(error.LengthMismatch, Envelope128.parse(&bad_len));
 }
 
+test "parse checks every magic byte, and a header-sized buffer is framed, not Truncated" {
+    var buf = @as([Envelope128.overhead]u8, @splat(0));
+    @memcpy(buf[0..4], &magic);
+    buf[4] = version;
+    buf[5] = Envelope128.suite_id;
+    for (0..4) |i| {
+        var bad = buf;
+        bad[i] ^= 1;
+        try testing.expectError(error.BadMagic, Envelope128.parse(&bad));
+    }
+    // Exactly `header_bytes` long: the header is read and judged; only then
+    // is the length (pt_len 0 needs `overhead`) refused.
+    try testing.expectError(error.LengthMismatch, Envelope128.parse(buf[0..header_bytes]));
+    try testing.expectError(error.BadMagic, Envelope128.parse(&@as([header_bytes]u8, @splat(0))));
+}
+
 test "an all-but-one-byte-short buffer is Truncated, not a panic" {
     const buf = @as([header_bytes - 1]u8, @splat(0));
     try testing.expectError(error.Truncated, Envelope128.parse(&buf));

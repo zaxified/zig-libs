@@ -26,7 +26,9 @@ const prefix_bytes = stream.Stream(Kem).prefix_bytes;
 
 fn pattern(gpa: std.mem.Allocator, len: usize) ![]u8 {
     const pt = try gpa.alloc(u8, len);
-    for (pt, 0..) |*b, i| b.* = @truncate(i *% 131 +% 7);
+    // i % 251, not i: the bytes at 0 and at every multiple of 256 differ, so the
+    // byte carried across a chunk boundary (index 64 KiB) is not the chunk's first.
+    for (pt, 0..) |*b, i| b.* = @truncate((i % 251) *% 131 +% 7);
     return pt;
 }
 
@@ -238,6 +240,61 @@ test "streaming release: chunks before a tampered one are written, authentic and
     defer testing.allocator.free(o.written);
     try testing.expectError(error.AuthFailed, o.result);
     try testing.expectEqualSlices(u8, pt[0..chunk], o.written);
+}
+
+test "stream header and lock regions are what the documented construction gives" {
+    const kp = fx.recipientKeypair(0x01);
+    const rnd = fx.fixedRandomness();
+    const wire = try sealAlloc("secret", kp);
+    defer testing.allocator.free(wire);
+
+    try testing.expectEqualSlices(u8, "TLE1", wire[0..4]);
+    try testing.expectEqual(stream.stream_version, wire[4]);
+    try testing.expectEqual(Env.suite_id, wire[5]);
+    try testing.expectEqual(@as(u8, 0), wire[6]); // flags: sealed as zero
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xE8, 0x03, 0, 0, 0, 0, 0, 0 }, wire[7..15]); // round 1000, little-endian
+    const tl = tlock.encrypt(fx.quicknetPubkey(), fx.seal_round, &rnd.s_time, &rnd.tlock_sigma).toBytes();
+    try testing.expectEqualSlices(u8, &tl, wire[stream.stream_header_bytes..][0..Env.time_lock_bytes]);
+    var ct: Kem.Ciphertext = undefined;
+    var ss: Kem.SharedSecret = undefined;
+    Kem.encaps(&ct, &ss, &kp.ek, &rnd.kem_coins);
+    try testing.expectEqualSlices(u8, &ct, wire[stream.stream_header_bytes + Env.time_lock_bytes ..][0..Env.pq_lock_bytes]);
+}
+
+test "openStream: framing is judged on the bytes that are there; empty and short input is Truncated" {
+    const kp = fx.recipientKeypair(0x01);
+    const wire = try sealAlloc("secret", kp);
+    defer testing.allocator.free(wire);
+    const sig = fx.round1000Signature();
+    try expectOpenError(wire[0..0], kp.dk, sig, &.{error.Truncated});
+    try expectOpenError(wire[0..3], kp.dk, sig, &.{error.Truncated});
+    // A valid 15-byte header and nothing more: the locks are missing.
+    try expectOpenError(wire[0..stream.stream_header_bytes], kp.dk, sig, &.{error.Truncated});
+    // A complete but wrong 15-byte header is judged as wrong, not as short.
+    var bad = wire[0..stream.stream_header_bytes].*;
+    bad[0] ^= 1;
+    try expectOpenError(&bad, kp.dk, sig, &.{error.BadMagic});
+}
+
+test "openStream: an undecodable time-lock point is MalformedTimeLock, not TimeGateClosed" {
+    const kp = fx.recipientKeypair(0x01);
+    const wire = try sealAlloc("secret", kp);
+    defer testing.allocator.free(wire);
+    wire[stream.stream_header_bytes] &= 0x7f; // clear U's compression flag
+    try expectOpenError(wire, kp.dk, fx.round1000Signature(), &.{error.MalformedTimeLock});
+}
+
+test "openStream: an empty last chunk after a non-empty one is MalformedPayload, not a tag failure" {
+    const kp = fx.recipientKeypair(0x01);
+    const pt = try pattern(testing.allocator, 2 * chunk + 5);
+    defer testing.allocator.free(pt);
+    const wire = try sealAlloc(pt, kp);
+    defer testing.allocator.free(wire);
+    // Chunk 0 (genuine, non-last) followed by sixteen bytes: a "last" chunk of
+    // no plaintext, which only an empty payload may have.
+    const bad = try std.mem.concat(testing.allocator, u8, &.{ wire[0 .. prefix_bytes + stream.sealed_chunk_bytes], &@as([stream.tag_bytes]u8, @splat(0xAB)) });
+    defer testing.allocator.free(bad);
+    try expectOpenError(bad, kp.dk, fx.round1000Signature(), &.{error.MalformedPayload});
 }
 
 test "version 1 and version 2 each refuse the other's wire" {

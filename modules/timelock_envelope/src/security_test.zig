@@ -144,6 +144,53 @@ test "empty plaintext round-trips" {
     try testing.expectEqual(@as(usize, 0), opened.len);
 }
 
+test "SealRandomness.wipe zeroes all three secrets" {
+    var r = fixedRandomness();
+    r.wipe();
+    for (std.mem.asBytes(&r)) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "wire layout: header, both lock regions, tag and content are what the documented construction gives" {
+    // Recomputed from the primitives (tlock.encrypt, Kem.encaps, deriveKeys,
+    // the AEAD), not read back from `seal`: pins what the round trip cannot
+    // see (the reserved flags byte sealed as 0, the byte order of the two
+    // length fields, which secret each primitive got, the AAD extent).
+    const kp = recipientKeypair(0x10);
+    const rnd = fixedRandomness();
+    const wire = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &rnd);
+    defer testing.allocator.free(wire);
+
+    try testing.expectEqualSlices(u8, "TLE1", wire[0..4]);
+    try testing.expectEqual(@as(u8, 1), wire[4]);
+    try testing.expectEqual(Env.suite_id, wire[5]);
+    try testing.expectEqual(@as(u8, 0), wire[6]);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xE8, 0x03, 0, 0, 0, 0, 0, 0 }, wire[7..15]); // round 1000, little-endian
+    try testing.expectEqualSlices(u8, &[_]u8{ plaintext.len, 0, 0, 0 }, wire[15..19]);
+
+    const tl = tlock.encrypt(quicknetPubkey(), seal_round, &rnd.s_time, &rnd.tlock_sigma).toBytes();
+    try testing.expectEqualSlices(u8, &tl, wire[envelope.header_bytes..][0..Env.time_lock_bytes]);
+    var ct: Kem.Ciphertext = undefined;
+    var ss: Kem.SharedSecret = undefined;
+    Kem.encaps(&ct, &ss, &kp.ek, &rnd.kem_coins);
+    try testing.expectEqualSlices(u8, &ct, wire[envelope.header_bytes + Env.time_lock_bytes ..][0..Env.pq_lock_bytes]);
+
+    var keys: envelope.DerivedKeys = undefined;
+    envelope.deriveKeys(&keys, &rnd.s_time, &ss, Env.suite_id, seal_round);
+    var want_ct: [plaintext.len]u8 = undefined;
+    var want_tag: [envelope.tag_bytes]u8 = undefined;
+    Aead.encrypt(&want_ct, &want_tag, plaintext, wire[0..Env.aad_bytes], keys.nonce, keys.key);
+    try testing.expectEqualSlices(u8, &want_tag, wire[Env.aad_bytes..][0..envelope.tag_bytes]);
+    try testing.expectEqualSlices(u8, &want_ct, wire[Env.overhead..]);
+
+    // `parse` views the same extents, the AAD being header + both locks whole.
+    const p = try Env.parse(wire);
+    try testing.expectEqual(seal_round, p.round);
+    try testing.expectEqual(@as(usize, plaintext.len), p.pt_len);
+    try testing.expectEqual(Env.aad_bytes, p.aad.len);
+    try testing.expectEqual(@intFromPtr(wire.ptr), @intFromPtr(p.aad.ptr));
+    try testing.expectEqual(@intFromPtr(wire.ptr) + Env.aad_bytes, @intFromPtr(p.tag));
+}
+
 test "entropy seam: generate draws all three fields afresh, and two seals differ" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -340,6 +387,13 @@ test "tamper: an undecodable time-lock point is MalformedTimeLock, not TimeGateC
     defer testing.allocator.free(dup);
     dup[envelope.header_bytes] &= 0x7f; // clear U's compression flag
     try testing.expectError(error.MalformedTimeLock, Env.open(testing.allocator, dup, &kp.dk, round1000Signature()));
+}
+
+test "a plaintext of exactly 2^32 - 1 bytes passes the length check (it reaches the allocation)" {
+    const byte: [1]u8 = .{0};
+    const edge = @as([*]const u8, &byte)[0..std.math.maxInt(u32)];
+    const kp = recipientKeypair(0x0F);
+    try testing.expectError(error.OutOfMemory, Env.seal(testing.failing_allocator, edge, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness()));
 }
 
 test "seal refuses a plaintext longer than the u32 length field before touching it" {
