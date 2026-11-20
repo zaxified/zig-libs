@@ -863,3 +863,132 @@ test "F2: heapRemove's interior-removal fixup needs BOTH siftDown and siftUp, no
     try testing.expectEqual(@as(usize, 7), n);
     try testing.expectEqualSlices(u64, &remaining, &out);
 }
+
+/// Every slot that is not running carries no mid-pass request, and the free list holds exactly
+/// the untracked slots, all marked `.free`.
+fn expectSlotHygiene(q: *const Q) !void {
+    for (q.slots) |s| {
+        if (s.state == .running) continue;
+        try testing.expect(!s.dirty and !s.force_drop and s.dirty_due == null);
+    }
+    var n: u32 = 0;
+    var i = q.free_head;
+    while (i != nil) : (i = q.slots[i].next) {
+        try testing.expectEqual(Q.State.free, q.slots[i].state);
+        n += 1;
+    }
+    try testing.expectEqual(q.capacity - q.tracked, n);
+}
+
+test "forget of a running key: streak cleared now, key dropped when the pass returns" {
+    var q = try Q.init(testing.allocator, 6);
+    defer q.deinit();
+
+    for ([_]u32{ 1, 2, 3 }) |k| _ = try q.enqueue(k);
+    _ = try q.enqueueAfter(4, 0, 50);
+    _ = try q.enqueueAfter(5, 0, 60);
+    try testing.expect(q.forget(1)); // ready
+    try testing.expect(q.forget(4)); // waiting
+    try expectSlotHygiene(&q);
+
+    const idx = q.takeReady().?;
+    try testing.expectEqual(@as(u32, 2), q.slotKey(idx));
+    q.setSlotFailures(idx, 3);
+    try testing.expectEqual(types.Admission.marked_dirty, try q.enqueue(2));
+    try testing.expectEqual(types.Admission.marked_dirty, try q.enqueueAfter(2, 0, 70));
+    try testing.expect(q.forget(2));
+    try testing.expectEqual(@as(?u32, 0), q.failuresOf(2));
+    try testing.expectEqual(Q.State.running, q.stateOf(2).?);
+    q.finish(idx, 0, .{ .after = 100 }); // whatever the pass asks for, the key is gone
+    try testing.expect(!q.contains(2));
+    try testing.expectEqual(@as(u32, 2), q.tracked); // 3 ready, 5 waiting
+    try expectSlotHygiene(&q);
+    q.assertInvariants();
+}
+
+test "finish leaves no mid-pass request behind, whichever branch consumed it" {
+    var q = try Q.init(testing.allocator, 4);
+    defer q.deinit();
+
+    // an immediate re-enqueue (with a deferred one as well): ready again, nothing left over
+    _ = try q.enqueue(1);
+    var idx = q.takeReady().?;
+    _ = try q.enqueue(1);
+    _ = try q.enqueueAfter(1, 0, 40);
+    q.finish(idx, 0, .drop);
+    try testing.expectEqual(Q.State.ready, q.stateOf(1).?);
+    try expectSlotHygiene(&q);
+
+    // a deferred re-check only: waiting on its timer, request consumed
+    idx = q.takeReady().?;
+    _ = try q.enqueueAfter(1, 10, 40);
+    q.finish(idx, 10, .drop);
+    try testing.expectEqual(Q.State.waiting, q.stateOf(1).?);
+    try testing.expectEqual(@as(?Instant, 50), q.nextTimer());
+    try expectSlotHygiene(&q);
+
+    // nothing asked for: dropped, slot clean
+    _ = try q.enqueue(2);
+    idx = q.takeReady().?;
+    q.finish(idx, 0, .drop);
+    try testing.expect(!q.contains(2));
+    try expectSlotHygiene(&q);
+}
+
+test "finish after zero ns is ready at once; after one ns it waits" {
+    var q = try Q.init(testing.allocator, 4);
+    defer q.deinit();
+
+    _ = try q.enqueue(1);
+    var idx = q.takeReady().?;
+    q.finish(idx, 5, .{ .after = 0 });
+    try testing.expectEqual(Q.State.ready, q.stateOf(1).?);
+    try testing.expectEqual(@as(u32, 1), q.ready_len);
+    try testing.expectEqual(@as(u32, 0), q.heap_len);
+
+    idx = q.takeReady().?;
+    q.finish(idx, 5, .{ .after = 1 });
+    try testing.expectEqual(Q.State.waiting, q.stateOf(1).?);
+    try testing.expectEqual(@as(?Instant, 6), q.nextTimer());
+    q.assertInvariants();
+}
+
+test "enqueueAfter reports dedup for a ready and a waiting key, marked_dirty for a running one" {
+    var q = try Q.init(testing.allocator, 4);
+    defer q.deinit();
+
+    _ = try q.enqueue(1);
+    try testing.expectEqual(types.Admission.deduped, try q.enqueueAfter(1, 0, 10)); // ready
+    _ = try q.enqueueAfter(2, 0, 100);
+    try testing.expectEqual(types.Admission.deduped, try q.enqueueAfter(2, 0, 200)); // later: ignored
+    try testing.expectEqual(types.Admission.deduped, try q.enqueueAfter(2, 0, 50)); // sooner: rescheduled
+    try testing.expectEqual(@as(?Instant, 50), q.nextTimer());
+
+    const idx = q.takeReady().?;
+    try testing.expectEqual(types.Admission.marked_dirty, try q.enqueueAfter(1, 100, 10)); // due 110
+    try testing.expectEqual(types.Admission.marked_dirty, try q.enqueueAfter(1, 100, 500)); // due 600 must not replace it
+    q.finish(idx, 100, .drop);
+    try testing.expectEqual(@as(?Instant, 50), q.nextTimer());
+    try testing.expectEqual(@as(u32, 1), q.promoteDue(50));
+    try testing.expectEqual(@as(?Instant, 110), q.nextTimer());
+}
+
+test "equal deadlines: an equal re-request keeps the place, a sooner one goes behind the existing ties" {
+    var q = try Q.init(testing.allocator, 6);
+    defer q.deinit();
+
+    _ = try q.enqueueAfter(1, 0, 100);
+    _ = try q.enqueueAfter(2, 0, 100);
+    _ = try q.enqueueAfter(1, 0, 100); // equal deadline: no reschedule, no new tie-break number
+    _ = try q.enqueueAfter(3, 0, 200);
+    _ = try q.enqueueAfter(4, 0, 150);
+    _ = try q.enqueueAfter(3, 0, 150); // sooner: rescheduled, ties with 4 but queued after it
+    try testing.expectEqual(@as(u32, 4), q.promoteDue(150));
+    var seen: [4]u32 = undefined;
+    for (&seen) |*s| {
+        const idx = q.takeReady().?;
+        s.* = q.slotKey(idx);
+        q.finish(idx, 150, .drop);
+    }
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 4, 3 }, &seen);
+}

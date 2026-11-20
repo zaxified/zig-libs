@@ -295,3 +295,24 @@ test "PROPERTY: over random interleavings, expired fires exactly once iff never 
         }
     }
 }
+
+test "arm records the window, reset clears it" {
+    var t: RollbackTimer = .idle;
+    _ = t.arm(100, 50);
+    try testing.expectEqual(@as(Instant, 100), t.armed_at);
+    try testing.expectEqual(@as(Instant, 150), t.deadline);
+    t.reset();
+    try testing.expectEqual(RollbackTimer.State.idle, t.state);
+    try testing.expectEqual(@as(Instant, 0), t.armed_at);
+    try testing.expectEqual(@as(Instant, 0), t.deadline);
+}
+
+test "the generation wraps instead of trapping, and only the current one confirms" {
+    var t: RollbackTimer = .idle;
+    t.generation = std.math.maxInt(u32);
+    const g = t.arm(0, 100);
+    try testing.expectEqual(@as(u32, 0), g);
+    try testing.expectEqual(RollbackTimer.Confirm.not_armed, t.confirmGeneration(10, g +% 1)); // from the future
+    try testing.expectEqual(RollbackTimer.Confirm.not_armed, t.confirmGeneration(10, g -% 1)); // stale
+    try testing.expectEqual(RollbackTimer.Confirm.committed, t.confirmGeneration(10, g));
+}
