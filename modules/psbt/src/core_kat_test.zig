@@ -31,26 +31,23 @@
 //!    nonzero `PSBT_GLOBAL_VERSION` with `error.UnsupportedPsbtVersion`. These
 //!    two Core vectors are this fix's external oracle (test group A below).
 //!
-//! 2. **BIP371 defects are now rejected (2026-11-13).** Core's 11 `invalid[]`
-//!    taproot-field cases (28-35, 37, 38, 41) and `invalid_with_msg[0]`/`[1]`
-//!    (taproot keypath length, empty tap tree) were accepted as passthrough
-//!    until `parse` learned the BIP371 field shapes (`bip371.zig`); each is now
-//!    a reject with a specific error. **Everything else Core's
-//!    `invalid`/`invalid_with_msg` sets exercise that this module still accepts
-//!    is out of its declared scope, not a bug.** Every remaining case was individually decoded (its keytypes
-//!    inspected directly, not guessed from Core's message) and falls into
-//!    exactly one bucket: (formerly) BIP371 Taproot single-sig fields (`0x13`-`0x18`,
-//!    `0x5`-`0x7` at output scope), MuSig2 fields (`0x1a`-`0x1c`, a BIP-374-ish
-//!    proposal Core validates), BIP370 (PSBTv2) fields coexisting with or
-//!    instead of this module's v0 fields, or BIP174 §"Signer"'s TXID-of-
-//!    NON_WITNESS_UTXO-matches-prevout cross-check (a Signer-role
-//!    responsibility per the BIP's own text, and Signer is explicitly
-//!    deferred here -- SPEC.md). None of this is validated by BIP174 v0's
-//!    own wire-format rules, which is all `parse` implements; accepting it
-//!    as opaque passthrough is the documented, correct behavior (SPEC.md
-//!    "Known vs. unknown key types"), not a security hole -- `finalize`
-//!    never consumes any of these fields. Test groups B/C below assert this
-//!    explicitly (ACCEPT, not reject) so the claim is checked, not assumed.
+//! 2. **BIP371 defects are rejected.** Core's 11 `invalid[]` taproot-field
+//!    cases (28-35, 37, 38, 41) and `invalid_with_msg[0]`/`[1]` (taproot
+//!    keypath length, empty tap tree) are refused by `parse`'s BIP371 field
+//!    shapes (`bip371.zig`), each with a specific error. `invalid[39]`/`[40]`
+//!    (a UTXO that does not bind to its input) are accepted by `parse`, a pure
+//!    wire codec, and refused by `finalize` (group B2). **Everything else
+//!    Core's `invalid`/`invalid_with_msg` sets exercise that this module
+//!    accepts is out of its declared scope, not a bug.** Every remaining case
+//!    was individually decoded (its keytypes inspected directly, not guessed
+//!    from Core's message) and falls into exactly one bucket: MuSig2 fields
+//!    (`0x1a`-`0x1c`, BIP373, which Core validates) or BIP370 (PSBTv2) fields
+//!    coexisting with or instead of this module's v0 fields. None of this is
+//!    validated by BIP174 v0's own wire-format rules; accepting it as opaque
+//!    passthrough is the documented behaviour (SPEC.md "Known vs. unknown key
+//!    types"), not a security hole -- `finalize` never consumes any of these
+//!    fields. Test groups B/C below assert this explicitly (ACCEPT, not
+//!    reject) so the claim is checked, not assumed.
 //!
 //! 3. **`valid[5]` hits the ALREADY-DOCUMENTED `bitcointx` 0-vin/BIP144-marker
 //!    ambiguity, via a new error code.** `kat_vectors.zig`'s BIP174 "PSBT with
@@ -61,17 +58,12 @@
 //!    `error.TooManyItems` instead. Still fail-closed, same underlying
 //!    limitation, not a new independent bug -- test group E below.
 //!
-//! `invalid_with_msg`: of the 23, only 4 are rejected by `parse` at all
-//! (`{0, 20, 21, 22}`); of those, `{20, 21, 22}` are rejected for a genuinely
-//! defensible reason (`error.UnsupportedPsbtVersion` on a PSBTv2-marked
-//! PSBT -- correct, even though Core's own stated reason is more specific).
-//! `invalid_with_msg[0]` is rejected too, but *coincidentally*: it is
-//! fuzzer-generated garbage (its `PSBT_GLOBAL_UNSIGNED_TX` value is not a
-//! parseable transaction at all), so `error.Truncated` fires from the
-//! unrelated "not enough bytes for the input/output maps the (garbage)
-//! unsigned tx implies" path -- NOT because this module validates Taproot
-//! BIP32 keypath length (it doesn't; `0x16` is opaque here). Test group D
-//! below documents this explicitly rather than claiming credit for it.
+//! `invalid_with_msg`: `{20, 21, 22}` are rejected with
+//! `error.UnsupportedPsbtVersion` (the PSBTv2 marker; Core's own stated
+//! reason is more specific), `[0]` with `error.InvalidFixedFieldLength` (the
+//! BIP371 taproot BIP32 derivation shape) and `[1]` with
+//! `error.InvalidTapTree`; the rest are MuSig2 content, accepted as
+//! passthrough (test group D).
 
 const std = @import("std");
 const testing = std.testing;
@@ -112,7 +104,7 @@ test "Core invalid[19] and invalid[42]: PSBT_GLOBAL_VERSION=1/2 specifically rej
     }
 }
 
-// ── B/C: out-of-scope BIP370/BIP371/MuSig2/Signer-role content -- ACCEPTED, not a bug ──
+// ── B: BIP371 field defects -- REJECTED; C: out-of-scope BIP370 (PSBTv2) content -- ACCEPTED, not a bug ──
 
 /// BIP371 field defects Core's `invalid` set lists; `parse` has validated these
 /// since the BIP371 typed fields landed (`bip371.zig`), each with the error for
@@ -142,7 +134,7 @@ test "Core invalid[]: BIP371 field defects are rejected with the specific error 
     try testing.expectEqual(@as(usize, 11), n);
 }
 
-test "Core invalid[]: BIP370/MuSig2/Signer-role content is accepted as opaque passthrough (documented scope cut, not a bug)" {
+test "Core invalid[]: BIP370 (PSBTv2) field mixes are accepted as opaque passthrough (documented scope cut, not a bug)" {
     const allocator = testing.allocator;
     for (vectors.invalid_out_of_scope) |case| {
         if (std.mem.eql(u8, case.reason, "taproot")) continue;
@@ -163,7 +155,7 @@ test "Core invalid[]: BIP370/MuSig2/Signer-role content is accepted as opaque pa
     }
 }
 
-test "Core invalid_with_msg: 6 of 23 rejected (3 as PSBTv2, 2 BIP371 defects, 1 garbage); the other 17 are MuSig2 content, accepted" {
+test "Core invalid_with_msg: 5 of 23 rejected (3 as PSBTv2, 2 BIP371 defects); the other 18 are MuSig2 content, accepted" {
     const allocator = testing.allocator;
     for (vectors.invalid_with_msg) |case| {
         const raw = try hexToBytesAlloc(allocator, case.hex);

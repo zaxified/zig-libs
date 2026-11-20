@@ -48,9 +48,16 @@ const Fixture = struct {
 /// One P2TR input spending a taproot output committing to `scripts` (depth-first
 /// list `depths`), with every leaf and the internal key recorded as an Updater would.
 fn fixture(a: Allocator, scripts: []const []const u8, depths: []const u8) !Fixture {
+    return fixtureVersioned(a, scripts, depths, null, null);
+}
+
+/// `fixture` with explicit BIP341 leaf versions for the tree (`versions`,
+/// default 0xc0 each) and, separately, the leaf version written into each
+/// `TAP_LEAF_SCRIPT` record (`record_versions`, default: the tree's).
+fn fixtureVersioned(a: Allocator, scripts: []const []const u8, depths: []const u8, versions: ?[]const u8, record_versions: ?[]const u8) !Fixture {
     const internal = try key(1);
     var list: std.ArrayList(taproot.DepthLeaf) = .empty;
-    for (scripts, depths) |s, d| try list.append(a, .{ .depth = d, .script = s });
+    for (scripts, depths, 0..) |s, d, i| try list.append(a, .{ .depth = d, .script = s, .version = if (versions) |v| v[i] else tapscript.TAPSCRIPT_LEAF_VERSION });
     const info = try taproot.buildFromLeaves(a, .{ .x = internal.x }, list.items);
 
     var spk: [34]u8 = undefined;
@@ -72,7 +79,8 @@ fn fixture(a: Allocator, scripts: []const []const u8, depths: []const u8) !Fixtu
     if (info.merkle_root) |r| try bip371.setInputTapMerkleRoot(a, &ps, 0, r);
     for (info.leaves, 0..) |leaf, i| {
         const cb = try info.controlBlockAlloc(a, i);
-        try bip371.addInputTapLeafScript(a, &ps, 0, cb, leaf.script, leaf.version);
+        const rv = if (record_versions) |v| v[leafIndexIn(list.items, leaf.script)] else leaf.version;
+        try bip371.addInputTapLeafScript(a, &ps, 0, cb, leaf.script, rv);
     }
     return .{ .ps = ps, .tx = tx, .spent = spent, .info = info, .internal = internal };
 }
@@ -87,6 +95,11 @@ fn signLeaf(a: Allocator, f: *const Fixture, k: Key, leaf_index: usize) ![64]u8 
 fn addSig(a: Allocator, f: *Fixture, k: Key, leaf_index: usize) !void {
     const sig = try signLeaf(a, f, k, leaf_index);
     try bip371.setInputTapScriptSig(a, &f.ps, 0, k.x, f.info.leaves[leaf_index].leaf_hash, &sig);
+}
+
+fn leafIndexIn(leaves: []const taproot.DepthLeaf, script: []const u8) usize {
+    for (leaves, 0..) |l, i| if (std.mem.eql(u8, l.script, script)) return i;
+    unreachable;
 }
 
 fn leafIndex(f: *const Fixture, script: []const u8) usize {
@@ -240,6 +253,45 @@ test "P2TR script path: refusals name their reason and leave the input unfinaliz
         const res = try psbt.finalize(a, ps2, .{});
         try testing.expectEqual(@as(?psbt.InputFinalizeError, error.NonStandardScript), res[0]);
         _ = &f;
+    }
+}
+
+test "P2TR script path: only tapscript leaves (0xc0) whose control block carries the same version are used" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const k2 = try key(2);
+    const sa = try checksigScript(a, k2.x);
+    // A committed, signed leaf of another (future) leaf version, 0xc2: its
+    // script is not tapscript, so the finalizer does not interpret it.
+    {
+        var f = try fixtureVersioned(a, &.{sa}, &.{0}, &.{0xc2}, null);
+        try testing.expectEqual(@as(u8, 0xc2), f.info.leaves[0].version);
+        try addSig(a, &f, k2, 0);
+        const res = try psbt.finalize(a, f.ps, .{});
+        try testing.expectEqual(@as(?psbt.InputFinalizeError, error.NonStandardScript), res[0]);
+        try testing.expect(f.ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
+    }
+    // The record says 0xc0, but its control block (which the commitment is
+    // checked with) says 0xc2: the record contradicts itself and is skipped,
+    // even with a signature over the 0xc0 leaf hash present.
+    {
+        var f = try fixtureVersioned(a, &.{sa}, &.{0}, &.{0xc2}, &.{0xc0});
+        var exec: tapscript.ExecData = .{ .tapleaf_hash = tapscript.tapleafHash(0xc0, sa), .codesep_pos = 0xffffffff };
+        const sighash = try tapscript.sighash(a, f.tx, 0, tapscript.SIGHASH_DEFAULT, f.spent, &exec);
+        const io: std.Io = undefined;
+        const sig = try bip340.sign(&k2.sk, &sighash, @as([32]u8, @splat(0xaa)), io, .{});
+        try bip371.setInputTapScriptSig(a, &f.ps, 0, k2.x, exec.tapleaf_hash, &sig);
+        const res = try psbt.finalize(a, f.ps, .{});
+        try testing.expectEqual(@as(?psbt.InputFinalizeError, error.NonStandardScript), res[0]);
+        try testing.expect(f.ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
+    }
+    // Control: the same leaf at 0xc0 is finalized.
+    {
+        var f = try fixtureVersioned(a, &.{sa}, &.{0}, &.{0xc0}, null);
+        try addSig(a, &f, k2, 0);
+        const res = try psbt.finalize(a, f.ps, .{});
+        try testing.expectEqual(@as(?psbt.InputFinalizeError, null), res[0]);
     }
 }
 
