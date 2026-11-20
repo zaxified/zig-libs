@@ -138,18 +138,48 @@ test "fromPrimes accepts a four-byte public exponent below 2^32 (sweep audit GP-
     const p = primeBytes(kp.secret_key.p, &pb);
     const q = primeBytes(kp.secret_key.q, &qb);
     // Odd 32-bit values; an e sharing a factor with lambda(n) is refused for that
-    // reason alone, so try a few. The key is fixed, so the outcome is deterministic.
+    // reason alone. Each verdict is predicted independently: e is invertible
+    // mod lambda(n) iff gcd(e, p - 1) = gcd(e, q - 1) = 1, and gcd(e, x) =
+    // gcd(e, x mod e). Every accepted key must carry e and round-trip RSAEP/RSADP.
     var accepted: usize = 0;
+    var refused: usize = 0;
     for ([_]u32{ 0xFFFF_FFFF, 0x8000_0001, 0x1000_0001, 0x1234_5679, 0xCAFE_BABF, 0x0100_0003 }) |e| {
         var eb: [4]u8 = undefined;
         std.mem.writeInt(u32, &eb, e, .big);
+        const want = std.math.gcd(e, minusOneMod(p, e)) == 1 and std.math.gcd(e, minusOneMod(q, e)) == 1;
         var sk: rsa.SecretKey = undefined;
         if (rsa.SecretKey.fromPrimesWith(&sk, p, q, &eb, small)) {
+            defer sk.deinit();
+            if (!want) {
+                std.debug.print("e=0x{x} accepted but gcd(e, lambda) != 1\n", .{e});
+                return error.TestUnexpectedResult;
+            }
             accepted += 1;
-            sk.deinit();
-        } else |err| try std.testing.expectEqual(error.InvalidPrivateKey, err);
+            try std.testing.expectEqual(e, try sk.e.toPrimitive(u32));
+            var m: [64]u8 = @splat(0);
+            m[63] = 0x2a;
+            m[1] = 0x5c;
+            const c = try rsa.rsaep(64, m, sk.publicKey());
+            try std.testing.expectEqualSlices(u8, &m, &(try rsa.rsadp(64, c, &sk)));
+        } else |err| {
+            try std.testing.expectEqual(error.InvalidPrivateKey, err);
+            if (want) {
+                std.debug.print("e=0x{x} refused but gcd(e, lambda) = 1\n", .{e});
+                return error.TestUnexpectedResult;
+            }
+            refused += 1;
+        }
     }
+    // Both verdicts occur over this fixed key, so neither branch is vacuous.
     try std.testing.expect(accepted >= 1);
+    try std.testing.expect(refused >= 1);
+}
+
+/// (x - 1) mod e for a big-endian x >= 1 (u128 intermediates; e < 2^32).
+fn minusOneMod(x: []const u8, e: u32) u64 {
+    var r: u64 = 0;
+    for (x) |b| r = @intCast(((@as(u128, r) << 8) | b) % e);
+    return (r + e - 1) % e;
 }
 
 // ── mutation audit 2026-11-13 (delta over bb4efd9a9): tests asked for by survivors ──

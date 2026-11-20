@@ -22,8 +22,11 @@ PKCS#8), `b64ct` (constant-time PEM base64 of private keys), `keycodec` (the PEM
   (DER/PEM PKCS#1/PKCS#8/SPKI, and OpenSSH `PROTOCOL.key` incl. bcrypt/
   aes256-ctr/aes256-cbc encrypted private keys); password-protected PKCS#8
   (PBES2/PBKDF2/AES-CBC, what `openssl genpkey -aes256` writes) through
-  `fromPkcs8Encrypted`/`SecretKey.fromPemEncrypted`. On-disk `n`/`d`/CRT
-  fields are checked against the key derived from `p`, `q`, `e`.
+  `fromPkcs8Encrypted`/`SecretKey.fromPemEncrypted` (`…Limited` twins take
+  a caller's PBKDF2 iteration cap). On-disk `n`/`d`/CRT fields are checked
+  against the key derived from `p`, `q`, `e`; primality of `p`, `q` is not
+  tested (as Go and BoringSSL) unless `fromPrimesWith(.., .{ .check_primality
+  = true })` asks for it.
 - **Writing keys** — `toPkcs1Der`/`toSpkiDer`/`toPkcs8Der`/`toPem` and
   `toPkcs8Encrypted`/`toPemEncrypted`: byte-identical to OpenSSL 3's output
   for the same key (encrypted: same shape, fresh salt and IV).

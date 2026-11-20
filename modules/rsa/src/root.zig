@@ -116,9 +116,7 @@ pub const meta = .{
     .platform_note = "any",
     // NOTE: CONVENTIONS.md's `meta` tag vocabulary (platform/role/concurrency/
     // model_after/deps) has no dedicated "status" tag; module maturity lives
-    // in each SPEC.md's closing "Status" line instead, using the catalog's
-    // `extract` (built) / `gap` (not yet built) vocabulary. All phases P1-P6
-    // have landed, so SPEC.md's Status line uses `extract`.
+    // in SPEC.md's card (Grade, Scope, Audit lines).
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation (no I/O, no wire framing of its own) -> util, not .codec
@@ -614,9 +612,11 @@ pub const SecretKey = struct {
     ///   n = p*q, d = e⁻¹ mod λ(n) with λ(n) = lcm(p-1, q-1),
     ///   dP = d mod (p-1), dQ = d mod (q-1), qInv = q⁻¹ mod p.
     ///
-    /// `p` and `q` are trusted to be prime (this constructor validates
+    /// `p` and `q` are trusted to be prime: this constructor validates
     /// structure — oddness, p ≠ q, gcd(e, λ(n)) = 1, qInv·q ≡ 1 (mod p) —
-    /// but performs no primality test; that is P5 territory).
+    /// but performs no primality test, as Go's `crypto/rsa`, BoringSSL and
+    /// ring do not on import. `fromPrimesWith(.., .{ .check_primality =
+    /// true })` adds one (OpenSSL's `RSA_check_key` shape).
     ///
     /// A modulus below `min_private_modulus_bits` (1024) is
     /// `error.InvalidPrivateKey` (Go 1.24's floor, 2026-11-18); see
@@ -644,7 +644,7 @@ pub const SecretKey = struct {
     }
 
     fn fromPrimesValue(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8) FromPrimesError!SecretKey {
-        return fromPrimesImpl(p_bytes, q_bytes, e_bytes, min_private_modulus_bits) catch error.InvalidPrivateKey;
+        return fromPrimesImpl(p_bytes, q_bytes, e_bytes, min_private_modulus_bits, false) catch error.InvalidPrivateKey;
     }
 
     pub const FromPrimesOptions = struct {
@@ -653,9 +653,21 @@ pub const SecretKey = struct {
         /// test fast). A key this small is factorable; never set it for a key
         /// that protects anything.
         insecure_allow_small_modulus: bool = false,
+        /// Refuse (`InvalidPrivateKey`) unless `p` and `q` both pass 64
+        /// Miller-Rabin rounds (`mr_rounds`; worst case 4^-64 for a composite
+        /// chosen to pass). Off by default, as Go's `crypto/rsa`, BoringSSL
+        /// and ring test no primality on import; OpenSSL tests it only in the
+        /// explicit `RSA_check_key`. Use it for primes from an untrusted
+        /// source. Witnesses come from a ChaCha CSPRNG keyed by SHA-256 of the
+        /// prime, so the verdict is deterministic and needs no `random`.
+        /// Cost: 2 × 64 modular exponentiations at the prime size (tens of ms
+        /// for a 2048-bit key). Constant-time in a prime's value along the
+        /// path a prime takes, as key generation's test is.
+        check_primality: bool = false,
     };
 
-    /// `fromPrimes` with options (the testing-only small-modulus escape).
+    /// `fromPrimes` with options (the opt-in primality test, the testing-only
+    /// small-modulus escape).
     pub fn fromPrimesWith(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8, options: FromPrimesOptions) FromPrimesError!void {
         const r = fromPrimesWithUnburned(out, p_bytes, q_bytes, e_bytes, options);
         burn.stack(burn.key_burn);
@@ -664,7 +676,7 @@ pub const SecretKey = struct {
 
     noinline fn fromPrimesWithUnburned(out: *SecretKey, p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8, options: FromPrimesOptions) FromPrimesError!void {
         const min_bits: usize = if (options.insecure_allow_small_modulus) 0 else min_private_modulus_bits;
-        out.* = fromPrimesImpl(p_bytes, q_bytes, e_bytes, min_bits) catch {
+        out.* = fromPrimesImpl(p_bytes, q_bytes, e_bytes, min_bits, options.check_primality) catch {
             std.crypto.secureZero(u8, std.mem.asBytes(out));
             return error.InvalidPrivateKey;
         };
@@ -778,16 +790,32 @@ pub const SecretKey = struct {
     }
 
     noinline fn fromPemEncryptedUnburned(out: *SecretKey, text: []const u8, password: []const u8) (PemError || FromEncryptedError)!void {
-        out.* = fromPemEncryptedValue(text, password) catch |err| {
+        out.* = fromPemEncryptedValue(text, password, .{}) catch |err| {
             std.crypto.secureZero(u8, std.mem.asBytes(out));
             return err;
         };
     }
 
-    fn fromPemEncryptedValue(text: []const u8, password: []const u8) (PemError || FromEncryptedError)!SecretKey {
+    fn fromPemEncryptedValue(text: []const u8, password: []const u8, limits: EncryptedKeyLimits) (PemError || FromEncryptedError)!SecretKey {
         const block = try pemDecodeBody(text);
-        if (std.mem.eql(u8, block.label, "ENCRYPTED PRIVATE KEY")) return fromPkcs8EncryptedValue(block.der(), password);
+        if (std.mem.eql(u8, block.label, "ENCRYPTED PRIVATE KEY")) return fromPkcs8EncryptedValue(block.der(), password, limits);
         return fromPemValue(text);
+    }
+
+    /// `fromPemEncrypted` with an explicit PBKDF2 iteration cap (see
+    /// `EncryptedKeyLimits`).
+    // secret-api-ok: `limits` holds a public cost cap, not a secret.
+    pub fn fromPemEncryptedLimited(out: *SecretKey, text: []const u8, password: []const u8, limits: EncryptedKeyLimits) (PemError || FromEncryptedError)!void {
+        const r = fromPemEncryptedLimitedUnburned(out, text, password, limits);
+        burn.stack(burn.key_burn);
+        return r;
+    }
+
+    noinline fn fromPemEncryptedLimitedUnburned(out: *SecretKey, text: []const u8, password: []const u8, limits: EncryptedKeyLimits) (PemError || FromEncryptedError)!void {
+        out.* = fromPemEncryptedValue(text, password, limits) catch |err| {
+            std.crypto.secureZero(u8, std.mem.asBytes(out));
+            return err;
+        };
     }
 
     /// DER PKCS#8 `EncryptedPrivateKeyInfo`: PBES2, PBKDF2, AES-CBC
@@ -897,7 +925,7 @@ pub fn bigModInverse(gpa: std.mem.Allocator, e: *const BigInt, m: *const BigInt)
     return rem;
 }
 
-fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8, min_bits: usize) !SecretKey {
+fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8, min_bits: usize, check_primes: bool) !SecretKey {
     const pb = std.mem.trimStart(u8, p_bytes, &.{0});
     const qb = std.mem.trimStart(u8, q_bytes, &.{0});
     const eb = std.mem.trimStart(u8, e_bytes, &.{0});
@@ -928,6 +956,8 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8,
     var qv = MontParams.loadBE(qb) catch return error.InvalidPrivateKey;
     defer std.crypto.secureZero(u64, &qv);
     if (MontParams.eql(&pv, &qv)) return error.InvalidPrivateKey; // p == q
+    // `FromPrimesOptions.check_primality`; the verdict is the one branch.
+    if (check_primes and !(factorIsPrime(pb, &pv) and factorIsPrime(qb, &qv))) return error.InvalidPrivateKey;
 
     // n = p·q, capped at max_modulus_bits (n is public: its size may branch).
     var nprod: [2 * MontParams.max_limbs]u64 = undefined;
@@ -2738,10 +2768,16 @@ pub const max_encrypted_pem_len = marshal.max_encrypted_pem_len;
 pub const EncryptError = marshal.EncryptError;
 
 pub const FromEncryptedError = error{
+    /// Not a well-formed `EncryptedPrivateKeyInfo` — checked before the KDF
+    /// is dispatched, so a scrypt file with malformed parameters (N not a
+    /// power of two, r or p zero) is this, not `UnsupportedEncryption`.
     InvalidDer,
-    /// Not PBES2-with-PBKDF2-and-AES-CBC (scrypt, PBES1, another cipher).
+    /// Not PBES2-with-PBKDF2-and-AES-CBC (a well-formed scrypt file, PBES1,
+    /// another cipher, a PBKDF2 salt given as `otherSource`).
     UnsupportedEncryption,
-    /// The file names more than `max_pbkdf2_iterations` PBKDF2 iterations.
+    /// The file names more PBKDF2 iterations than the cap
+    /// (`EncryptedKeyLimits.max_pbkdf2_iterations`, by default
+    /// `max_pbkdf2_iterations`).
     KdfIterationsTooLarge,
     /// Wrong password, or a corrupted ciphertext: the two cannot be told
     /// apart (CBC padding and the inner key's DER are the only check), so
@@ -2749,32 +2785,52 @@ pub const FromEncryptedError = error{
     IncorrectPasswordOrCorrupt,
 };
 
+/// Cost caps for reading an encrypted key, checked before the password is
+/// used or any KDF work is done (the shape of minisign's `SecretKeyLimits`).
+pub const EncryptedKeyLimits = struct {
+    /// Refuse (`KdfIterationsTooLarge`) a file naming more PBKDF2
+    /// iterations. The default, `max_pbkdf2_iterations` (2^20), costs
+    /// ~0.3–1 s per hostile file; a service that reads keys from untrusted
+    /// uploads can lower it (OpenSSL writes 2048 by default), a caller with
+    /// a deliberately slow key can raise it.
+    max_pbkdf2_iterations: u32 = max_pbkdf2_iterations,
+};
+
 /// Parse a DER PKCS#8 `EncryptedPrivateKeyInfo` (PBES2) holding an RSA key.
 /// `out` is zeroed on error; the derived key and the decrypted PKCS#8 are
-/// wiped before return.
+/// wiped before return. The iteration cap is `EncryptedKeyLimits{}`'s; see
+/// `fromPkcs8EncryptedLimited`.
 pub fn fromPkcs8Encrypted(out: *SecretKey, der: []const u8, password: []const u8) FromEncryptedError!void {
-    const r = fromPkcs8EncryptedUnburned(out, der, password);
+    const r = fromPkcs8EncryptedUnburned(out, der, password, .{});
     burn.stack(burn.key_burn);
     return r;
 }
 
-noinline fn fromPkcs8EncryptedUnburned(out: *SecretKey, der: []const u8, password: []const u8) FromEncryptedError!void {
-    out.* = fromPkcs8EncryptedValue(der, password) catch |err| {
+/// `fromPkcs8Encrypted` with an explicit PBKDF2 iteration cap.
+// secret-api-ok: `limits` holds a public cost cap, not a secret.
+pub fn fromPkcs8EncryptedLimited(out: *SecretKey, der: []const u8, password: []const u8, limits: EncryptedKeyLimits) FromEncryptedError!void {
+    const r = fromPkcs8EncryptedUnburned(out, der, password, limits);
+    burn.stack(burn.key_burn);
+    return r;
+}
+
+noinline fn fromPkcs8EncryptedUnburned(out: *SecretKey, der: []const u8, password: []const u8, limits: EncryptedKeyLimits) FromEncryptedError!void {
+    out.* = fromPkcs8EncryptedValue(der, password, limits) catch |err| {
         std.crypto.secureZero(u8, std.mem.asBytes(out));
         return err;
     };
 }
 
-fn fromPkcs8EncryptedValue(der: []const u8, password: []const u8) FromEncryptedError!SecretKey {
+fn fromPkcs8EncryptedValue(der: []const u8, password: []const u8, limits: EncryptedKeyLimits) FromEncryptedError!SecretKey {
     // The structure walk, the key derivation and the CBC decryption are
     // `keycodec.pbes2`'s (since 2026-11-07; this module used to carry its own
     // copy). What stays here is this module's profile: PBKDF2 only (no
     // `scrypt_work`, so a scrypt file is `UnsupportedEncryption`), its
     // iteration cap, and the PKCS#8 -> RSA step.
-    const pp = try pbes2Params(der);
+    const pp = try pbes2ParamsLimited(der, limits.max_pbkdf2_iterations);
     var plain: [max_pkcs8_der_len + 16]u8 = undefined;
     defer std.crypto.secureZero(u8, &plain);
-    const pt = keycodec.pbes2.decrypt(pp.info, password, &plain, .{ .max_pbkdf2_iterations = max_pbkdf2_iterations }) catch |err| return switch (err) {
+    const pt = keycodec.pbes2.decrypt(pp.info, password, &plain, .{ .max_pbkdf2_iterations = limits.max_pbkdf2_iterations }) catch |err| return switch (err) {
         error.MalformedKey, error.NoSpaceLeft => error.InvalidDer,
         error.UnsupportedEncryption => error.UnsupportedEncryption,
         error.KdfParamsTooLarge => error.KdfIterationsTooLarge,
@@ -2798,6 +2854,10 @@ const Pbes2Params = struct {
 /// profile on top (PBKDF2 only, salt and ciphertext bounds) and keeps the
 /// parameters in this module's enums.
 fn pbes2Params(der: []const u8) FromEncryptedError!Pbes2Params {
+    return pbes2ParamsLimited(der, max_pbkdf2_iterations);
+}
+
+fn pbes2ParamsLimited(der: []const u8, max_iterations: u32) FromEncryptedError!Pbes2Params {
     const info = keycodec.parseEncryptedInfo(der) catch |err| return switch (err) {
         error.MalformedKey => error.InvalidDer,
         error.UnsupportedEncryption => error.UnsupportedEncryption,
@@ -2807,7 +2867,7 @@ fn pbes2Params(der: []const u8) FromEncryptedError!Pbes2Params {
         .scrypt => return error.UnsupportedEncryption,
     };
     if (info.salt.len > max_pbes2_salt_len) return error.InvalidDer;
-    if (k.iterations > max_pbkdf2_iterations) return error.KdfIterationsTooLarge;
+    if (k.iterations > max_iterations) return error.KdfIterationsTooLarge;
     if (info.ciphertext.len > max_pkcs8_der_len + 16) return error.InvalidDer;
     return .{
         .prf = std.meta.stringToEnum(Pbes2Prf, @tagName(k.prf)).?,
@@ -3188,9 +3248,9 @@ fn parsePrivateSection(section: []const u8, cipher: OpensshCipher, encrypted: bo
 // a worst-case (adversarial-composite) error bound of 4^-64 = 2^-128 per
 // accepted candidate — for self-generated random candidates the
 // average-case error (Damgård-Landrock-Pomerance) is far smaller still.
-// Witnesses are drawn from the caller's `random`, uniformly in
-// [2, 2^(bits−1)) — below every candidate by its length, so no draw is
-// compared against the secret.
+// Witnesses are drawn from the caller's `random`, near-uniform over
+// [2, m − 2] (`montint`: `bits + 64` random bits reduced mod m, statistical
+// distance below 2^-64), which is what Rabin's 1/4-per-round bound assumes.
 //
 // Timing: the search loop is data-dependent (every implementation's is),
 // but what it reveals is about REJECTED candidates. Along the path a kept
@@ -3247,6 +3307,40 @@ fn bytesMod(bytes: []const u8, divisor: u64) u64 {
 /// Set bit `bit` (LSB = 0) of a big-endian byte string.
 fn setBitBe(buf: []u8, bit: usize) void {
     buf[buf.len - 1 - bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
+}
+
+/// `FromPrimesOptions.check_primality` on one caller-supplied factor
+/// (stripped big-endian, odd — `Modulus.fromBytes` checked — and non-zero).
+/// Up to 32 bits: exact trial division (`isProbablePrime`'s witness range
+/// `[2, m − 2]` is empty for m = 3; test keys only, variable-time). Above:
+/// Miller-Rabin with witnesses from a ChaCha CSPRNG keyed by SHA-256 of the
+/// factor, so the result is deterministic without a `random` parameter while
+/// a composite chosen to pass still has to beat `mr_rounds` unpredictable
+/// rounds (the shape `paillier.fromPrimes` uses). No trial-division sieve:
+/// its `%` and early exit would branch on the secret along a prime's path.
+fn factorIsPrime(bytes: []const u8, v: *const MontElem) bool {
+    const bits = bitLenBe(bytes);
+    if (bits <= 32) {
+        const x = std.mem.readVarInt(u32, bytes[bytes.len - (bits + 7) / 8 ..], .big);
+        if (x < 2) return false;
+        if (x % 2 == 0) return x == 2;
+        var d: u32 = 3;
+        while (d <= x / d) : (d += 2) {
+            if (x % d == 0) return false;
+        }
+        return true;
+    }
+    var seed: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("zig-libs/rsa/fromPrimes/miller-rabin/v1");
+    h.update(bytes);
+    h.final(&seed);
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&csprng)); // keyed by a secret factor
+    var m = MontParams.fromLimbsBits(v, bits) catch return false;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
+    return m.isProbablePrime(csprng.random(), mr_rounds);
 }
 
 /// Miller-Rabin with `mr_rounds` witnesses on an `ff` modulus — the
@@ -3868,6 +3962,42 @@ test "primitives reject representative >= n" {
     try testing.expectError(error.MessageRepresentativeOutOfRange, rsaep(2, .{ 0x0c, 0xa1 }, pk));
     try testing.expectError(error.MessageRepresentativeOutOfRange, rsadp(2, .{ 0xff, 0xff }, &sk));
     try testing.expectError(error.MessageRepresentativeOutOfRange, rsadpCrt(2, .{ 0x0c, 0xa1 }, &sk));
+}
+
+test "fromPrimesWith check_primality: a Carmichael p passes the structural checks and is refused only by the opt-in test" {
+    // p = 1154558595724288849 = (6k+1)(12k+1)(18k+1), a Chernick Carmichael
+    // number of 61 bits (above the trial-division path): q^(p-1) = 1 (mod p),
+    // so the qInv Fermat self-check holds and the default path accepts it.
+    const p = [_]u8{ 0x10, 0x05, 0xd0, 0xec, 0xfa, 0x85, 0x23, 0x51 };
+    const q = [_]u8{ 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11 }; // prime
+    const e = [_]u8{ 0x01, 0x00, 0x01 };
+    var sk: SecretKey = undefined;
+    try SecretKey.fromPrimesWith(&sk, &p, &q, &e, small_test_key);
+    sk.deinit();
+    const checked: SecretKey.FromPrimesOptions = .{ .insecure_allow_small_modulus = true, .check_primality = true };
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &p, &q, &e, checked));
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &q, &p, &e, checked)); // either position
+    // Small factors (the exact trial-division path): 55 = 5 * 11 is accepted
+    // without the test (the self-check runs mod the prime 61) and refused with it.
+    try SecretKey.fromPrimesWith(&sk, &.{61}, &.{55}, &.{17}, small_test_key);
+    sk.deinit();
+    try testing.expectError(error.InvalidPrivateKey, SecretKey.fromPrimesWith(&test_sk_out, &.{61}, &.{55}, &.{17}, checked));
+    // Real primes pass: the textbook pair and the OpenSSL 2048-bit key, the
+    // latter giving the same key as the default path.
+    try SecretKey.fromPrimesWith(&sk, &.{61}, &.{53}, &.{17}, checked);
+    sk.deinit();
+    var a: SecretKey = undefined;
+    try SecretKey.fromPrimesWith(&a, &kat2048.p, &kat2048.q, &kat2048.e, .{ .check_primality = true });
+    defer a.deinit();
+    var b: SecretKey = undefined;
+    try SecretKey.fromPrimes(&b, &kat2048.p, &kat2048.q, &kat2048.e);
+    defer b.deinit();
+    var da: [256]u8 = undefined;
+    var db: [256]u8 = undefined;
+    try a.d.toBytes(&da, .big);
+    try b.d.toBytes(&db, .big);
+    try testing.expectEqualSlices(u8, &db, &da);
+    try testing.expect(a.publicKey().equal(&b.publicKey()));
 }
 
 test "fromPrimes reproduces the OpenSSL 2048-bit key exactly" {
@@ -5551,6 +5681,39 @@ test "PBES2: an iteration count over max_pbkdf2_iterations is refused before any
     try testing.expectError(error.KdfIterationsTooLarge, fromPkcs8Encrypted(&test_sk_out, der, "pw"));
 }
 
+test "PBES2: a caller-lowered iteration cap is applied at the boundary, before the password" {
+    var sk = try kat2048.secretKey();
+    defer sk.deinit();
+    var want_buf: [max_pkcs1_private_der_len]u8 = undefined;
+    const want = try sk.toPkcs1Der(&want_buf);
+    var got_buf: [max_pkcs1_private_der_len]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(8);
+    var buf: [max_encrypted_pkcs8_der_len]u8 = undefined;
+    const der = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .iterations = 1000 }, &buf);
+    // One under the file's count: refused, whatever the password.
+    try testing.expectError(error.KdfIterationsTooLarge, fromPkcs8EncryptedLimited(&test_sk_out, der, "pw", .{ .max_pbkdf2_iterations = 999 }));
+    try testing.expectError(error.KdfIterationsTooLarge, fromPkcs8EncryptedLimited(&test_sk_out, der, "wrong", .{ .max_pbkdf2_iterations = 999 }));
+    // At the count: read.
+    var got: SecretKey = undefined;
+    try fromPkcs8EncryptedLimited(&got, der, "pw", .{ .max_pbkdf2_iterations = 1000 });
+    defer got.deinit();
+    try testing.expectEqualSlices(u8, want, try got.toPkcs1Der(&got_buf));
+    // The default cap reads it too.
+    var got_default: SecretKey = undefined;
+    try fromPkcs8Encrypted(&got_default, der, "pw");
+    defer got_default.deinit();
+    try testing.expectEqualSlices(u8, want, try got_default.toPkcs1Der(&got_buf));
+    // The PEM twin carries the same cap.
+    var pem_buf: [max_encrypted_pem_len]u8 = undefined;
+    var prng2 = std.Random.DefaultPrng.init(8);
+    const pem = try sk.toPemEncrypted("pw", prng2.random(), .{ .iterations = 1000 }, &pem_buf);
+    try testing.expectError(error.KdfIterationsTooLarge, SecretKey.fromPemEncryptedLimited(&test_sk_out, pem, "pw", .{ .max_pbkdf2_iterations = 999 }));
+    var got_pem: SecretKey = undefined;
+    try SecretKey.fromPemEncryptedLimited(&got_pem, pem, "pw", .{ .max_pbkdf2_iterations = 1000 });
+    defer got_pem.deinit();
+    try testing.expectEqualSlices(u8, want, try got_pem.toPkcs1Der(&got_buf));
+}
+
 // ── audit 2026-10-18: mutation survivors of the 2026-10 additions ───────────
 //
 // Each test below breaks ONE property of an otherwise valid input (or checks
@@ -5608,6 +5771,44 @@ const Epki = struct {
         }
     }
 };
+
+/// An `EncryptedPrivateKeyInfo` naming scrypt (RFC 7914 §7) with the given
+/// N, r, p contents, and a PBKDF2 one whose salt is `otherSource` (a
+/// SEQUENCE where the OCTET STRING goes, RFC 8018 A.2).
+fn scryptEpki(a: std.mem.Allocator, n: []const u8, r: []const u8, p: []const u8) ![]const u8 {
+    const d: der_writer.Builder = .{ .a = a };
+    const kp = try d.seq(&.{ try d.octetString("0123456789abcdef"), try d.integerRaw(n), try d.integerRaw(r), try d.integerRaw(p) });
+    const kdf = try d.seq(&.{ try d.oid(&keycodec.pbes2.oid_scrypt), kp });
+    const enc = try d.seq(&.{ try d.oid(try d.cat(&[_][]const u8{ &marshal.oid_aes_arc, &[_]u8{0x2a} })), try d.octetString("ivivivivivivivi!") });
+    const alg = try d.seq(&.{ try d.oid(&marshal.oid_pbes2), try d.seq(&.{ kdf, enc }) });
+    return d.seq(&.{ alg, try d.octetString(&(@as([32]u8, @splat(0x5a)))) });
+}
+
+test "PBES2 error mapping: scrypt is UnsupportedEncryption when well-formed, InvalidDer when malformed; otherSource salt is UnsupportedEncryption" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Well-formed scrypt: this module reads PBKDF2 only.
+    try testing.expectError(error.UnsupportedEncryption, fromPkcs8Encrypted(&test_sk_out, try scryptEpki(a, &.{ 0x40, 0x00 }, &.{8}, &.{1}), "pw"));
+    // Malformed scrypt parameters (N not a power of two, N = 1, r = 0, N wider
+    // than 64 bits): the structure is checked before the KDF is dispatched,
+    // so a broken file reads as broken, as OpenSSL's decode-then-dispatch does.
+    for ([_][3][]const u8{
+        .{ &.{0x03}, &.{8}, &.{1} },
+        .{ &.{0x01}, &.{8}, &.{1} },
+        .{ &.{0x10}, &.{0}, &.{1} },
+        .{ &.{ 0x01, 0, 0, 0, 0, 0, 0, 0, 0 }, &.{8}, &.{1} },
+    }) |c| try testing.expectError(error.InvalidDer, fromPkcs8Encrypted(&test_sk_out, try scryptEpki(a, c[0], c[1], c[2]), "pw"));
+    // otherSource salt: a form RFC 8018 defines and no profile in use writes.
+    const d: der_writer.Builder = .{ .a = a };
+    const other = try d.seq(&.{try d.oid(&.{ 0x2a, 0x03 })});
+    const kp = try d.seq(&.{ other, try d.integerRaw(&.{ 0x08, 0x00 }) });
+    const kdf = try d.seq(&.{ try d.oid(&marshal.oid_pbkdf2), kp });
+    const enc = try d.seq(&.{ try d.oid(try d.cat(&[_][]const u8{ &marshal.oid_aes_arc, &[_]u8{0x2a} })), try d.octetString("ivivivivivivivi!") });
+    const alg = try d.seq(&.{ try d.oid(&marshal.oid_pbes2), try d.seq(&.{ kdf, enc }) });
+    const os_der = try d.seq(&.{ alg, try d.octetString(&(@as([32]u8, @splat(0x5a)))) });
+    try testing.expectError(error.UnsupportedEncryption, fromPkcs8Encrypted(&test_sk_out, os_der, "pw"));
+}
 
 test "PBES2 structure walk: every container must end where its last child ends" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

@@ -181,8 +181,12 @@ length: that is only acceptable for a public modulus. The secret CRT primes keep
 the shortcut to them put the secret bit length into a loop bound and added ctgrind contexts to `rsa`'s `keygen` row.
 
 **Encrypted keys and OpenSSH containers.** Password-protected PKCS#8 is PBES2 with PBKDF2 and AES-CBC only. The PBKDF2
-iteration count a file names is capped at `max_pbkdf2_iterations` (2^20; more is `KdfIterationsTooLarge`) and the salt at
-`max_pbes2_salt_len` (64). The bcrypt `rounds` of an OpenSSH container are capped at `max_openssh_kdf_rounds` (2048,
+iteration count a file names is capped at `max_pbkdf2_iterations` (2^20; more is `KdfIterationsTooLarge`, checked before
+the password is used) and the salt at `max_pbes2_salt_len` (64). The cap is the caller's to lower or raise per call:
+`fromPkcs8EncryptedLimited` / `SecretKey.fromPemEncryptedLimited` with `EncryptedKeyLimits` (minisign's
+`SecretKeyLimits` / `openSecretKeyLimited` shape). A scrypt file is `UnsupportedEncryption` when well-formed and
+`InvalidDer` when its parameters are malformed (structure is checked before the KDF is dispatched, as OpenSSL decodes
+before it dispatches); a PBKDF2 salt given as `otherSource` is `UnsupportedEncryption`. The bcrypt `rounds` of an OpenSSH container are capped at `max_openssh_kdf_rounds` (2048,
 `KdfRoundsTooLarge`), as Go's `x/crypto/ssh` does (`maxRounds = 1 << 11`; OpenSSH sets no bound); without a cap a hostile
 file with `rounds = 2^32-1` pins the KDF for minutes.
 
@@ -233,8 +237,12 @@ PublicKey.fromBytes does" covers both the default and the escape floor.
 
 **Residual risks a consumer relies on.**
 
-- `SecretKey.fromPrimes` trusts `p` and `q` to be prime and does not test it (see Backlog); a composite is caught late
-  (a Carmichael `p` passes the `qInv` Fermat self-check and the sign-time fault check then refuses the key), not at import.
+- `SecretKey.fromPrimes` (and every parser built on it) trusts `p` and `q` to be prime and does not test it, as Go's
+  `crypto/rsa` (`crypto/internal/fips140/rsa` `checkPrivateKey`: structure only), BoringSSL and ring do not; OpenSSL tests
+  primality only in the explicit `RSA_check_key`. A composite is then caught late (a Carmichael `p` passes the `qInv`
+  Fermat self-check and the sign-time fault check refuses the key). Primes from an untrusted source:
+  `fromPrimesWith(.., .{ .check_primality = true })`, 64 Miller-Rabin rounds on each with witnesses from a ChaCha CSPRNG
+  keyed by SHA-256 of the prime (deterministic, `paillier.fromPrimes`'s shape), 2 × 64 modexps of the prime size.
 - `sk.p`/`sk.q` are `std.crypto.ff` `Modulus` carriers whose construction branches on the secret value; this is most of
   ctgrind `keygen`'s count (Backlog). The prime search's sieve and Miller-Rabin's squaring count are observable for a kept
   prime (Backlog).
@@ -364,10 +372,6 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 
 ## Backlog / deferred
 
-- **`fromPrimes` has no primality test.** `p` and `q` are trusted to be prime; a Carmichael `p` passes the `qInv` Fermat
-  self-check and the sign-time fault check then refuses the key, so it fails late rather than at import. Paillier's checked
-  path tests primality; `rsa` could offer the same with `DynModint.isProbablePrime` on both. Also reword the "2^-128 worst
-  case" Miller-Rabin comment (witnesses come from the lower half; montint backlog). Effort S.
 - **`p`, `q` as `std.crypto.ff` `Modulus` carriers.** `sk.p`/`sk.q` are public API fields of ff's type, and
   `Modulus.fromBytes` on them branches on the value (`shrink`, `shiftIn`, `computeRR` — most of ctgrind `keygen`'s ≤ 173).
   Fix: carry the CRT primes as `DynModint` only (`p_mont`/`q_mont` exist) and keep the ff `Modulus` for public values —
@@ -375,13 +379,9 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 - **Prime search sieve.** `bytesMod`'s `%` on the candidate (variable-latency division) and Miller-Rabin's squaring count
   `s = v2(p − 1)` stay observable for a kept prime. Fix: a sieve by multiplication with precomputed reciprocals over the whole
   table, and `p ≡ 3 mod 4` candidates (s = 1) if FIPS 186-5 shape allows. Effort: small–medium. Fits CONVENTIONS §2.
-- **Caller-lowerable PBKDF2 iteration cap.** `max_pbkdf2_iterations` (2^20, ~0.3–1 s per hostile encrypted key) is fixed;
-  minisign's `SecretKeyLimits` / `openSecretKeyLimited` is the precedent for letting the caller pass a lower (or higher) cap.
 - **PEM `aes256-ctr` decryption on Zig 0.17.** The encrypted-OpenSSH-key path (`std.crypto.core.modes.ctr` over std `Aes256`
   in `src/root.zig`) pays 0.17's byte-wise `writeInt(u128)` counter (#36256; 2.3× on `aes192`'s CTR bench). Cold path (once per
   key load), so not urgent; the fix is `aes192`'s `ctr` shape (two `u64` halves, vector byte swap).
-- **`fromPrimes` 4-byte exponent test is weak.** The test asserts only `accepted >= 1` over 6 candidates (`src/sweep_test.zig`);
-  its reject cases are exact.
 - **Performance, remaining lever:** the modexp itself (REDC is about 54 % of it at L = 16, i.e. 2048-bit keys); the blinded
   `.csprng` rows additionally carry the stateless draw (the inverse and `r^e`, ~4.7 % of cycles), which `.cached` removes.
 
