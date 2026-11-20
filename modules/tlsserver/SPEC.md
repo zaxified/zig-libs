@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-15 (1671/1773, 102 eq) · src 7f1cdc3692cc5f1e
 
-Audit detail: the FFDHE delta of the same day (from abdc66c5: `ffdhe_groups` and `supported_groups` in `server.zig`, the only library lines of that commit; 8 mutants, all killed; 2 new tests pin the exact code points and order, and serve every group alone) is added to the totals, which also carry the earlier 2026-11-01 delta below. The 2026-11-01 delta (from da5c973a) covers the prepared Ed25519 signer in `keys.zig` (`ed25519_signer`, `prepareSigner`, `certifiedKey`, `deinit`): 8 mutants, 5 killed, 3 equivalent (the unreachable `Ed25519Signer.init` failure, and the two `deinit` wipes of the signer, which `self.* = undefined` overwrites in every checked build); 1 new test (`fromPemDelegated` prepares the signer for every key kind, killing the missing `prepareSigner` call there); the totals add the delta to the 2026-10-28 run.
-
 **Hardening:** fuzz 2026-10-22 (after the grade-1 features, ReleaseSafe driver, 4 jobs: `tlsserver-ech` 1,000,000 runs clean, new — the inner hello rebuilt from a model, every fault refused with its error; `tlsserver-hello` 4,000,000, `tlsserver-server` 160,000 (ECH recordings included), `tlsserver-keyupdate` 400,000 (its model fixed: an empty record no longer refills the budget), `tlsserver-quic` 800,000, `tlsserver-record` 8,000,000, `tlsserver-inbound` 1,200,000, `tlsserver-keys` 400,000, `tlsserver-clientauth` 1,200,000, all clean; earlier: `tlsserver-quic`, 800,000 runs, clean, TLSSERVER_FUZZ: recorded Go QUICClient sessions whole, in pieces, flipped, at a wrong level, cut short; reach 8/8 in 400 seeds; `tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught; `tlsserver-server`, 160,000 runs, clean, 5 planted mutants caught) · ct 2026-10-22 (ctgrind, target `ech` added: the recorded Go ECH sessions with the ECH private key tainted, 384 in-file contexts all on the decrypted inner hello, none on the key; hs/app/ticket unchanged 28/8/77; earlier the ClientHello to the first flight with the randomness and certificate key tainted, record seal/open per suite with the traffic secret tainted, ticket issue + resumption with the STEK tainted; `hs` 28 / `app` 8 / `ticket` 77 in-file, none a branch on a key — signing/kex verdicts below `tls13`/`p256`/std, AEAD/binder/Finished verdicts, the padding scan and the parse of decrypted tickets and records) · panic 2026-10-28 (independent sweep of every pub entry point: ECH retry-config buffer, `findShare` linear, caller-contract asserts made total or errors; hello 300,000 + server 30,000 driver runs clean after it)
 
 **Performance:** ref 0.44–0.93× OpenSSL 3.5.5 libssl (server side only, replayed sessions: full handshake ECDSA P-256 / RSA-2048 over X25519 and P-256 over X25519MLKEM768, resumption, AES-256-GCM 16 KiB records sent and received) · fastest 1.02× worst vs the faster of OpenSSL and rustls 0.23.43 + aws-lc-rs 1.18.0 (sending a 16 KiB record; every other row ≤ 0.99) (measured 2026-10-22)
@@ -40,45 +38,32 @@ picotls do); 0-RTT on stateless tickets with a replay guard (rustls takes early 
 its stateful cache); SCT stapling (rustls dropped it); RFC 8449 `record_size_limit` for
 constrained clients (rustls and Go have none); dynamic record sizing with an idle reset (Go
 has it without the reset, s2n with it, rustls not); the JA4 client fingerprint (s2n has it,
-rustls and Go not). **Where we are behind:** a full (EC)DHE handshake with a
-certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
-collection's `tlsclient` and Zig std's client, sans-I/O or through the
-blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
-BoringSSL's BoGo suite passes 339 tests with none failing (`tools/bogo/passing.txt`; everything
-else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1), KeyUpdate
-both ways (step 2), session tickets with resumption (step 3), client certificates (step 4) and
-OCSP / SCT stapling (step 5) work. **rustls parity (step 6):** of the 436 BoGo server tests
-at TLS 1.3 that rustls 0.23.43 passes (`tools/bogo/rustls-owed.txt`), 247 pass here (278 after
-M4 step 3, 304 after step 4 — 0-RTT; 305 after step 5, the exporter: no gap left), 140 are disabled with a reason (131 after it) (121 run at TLS 1.2 under a name without a version; 19 deliberate
-divergences: P-521 and ML-DSA client keys, four with rustls's own behaviour that the pinned
-runner cannot map, extensions this server ignores), and 49 were gaps on 2026-10-20: 0-RTT (27),
-certificate compression (6), P-521 and ML-DSA server keys (12), standalone ML-KEM-1024 (4) — all
-closed by M4 step 5 (see *Backlog*). RFC 7250 raw
-public keys, both ways and across resumption, work against OpenSSL 3.5 (2026-10-22). QUIC (RFC 9001,
-rustls `quic::ServerConnection`): `Config.quic`, CRYPTO data in and out per encryption level
-(`quicFeed`, `quicOutput`), each level's traffic secret for the QUIC stack (`quicSecret`, keys
-via `quic-crypto`), transport parameters both ways, 0-RTT with the stack's resumption data and
-veto (`setQuicResumptionData`, `Quic.accept_early`), alerts as `quicAlert` — against Go 1.26's
-`tls.QUICClient` (full, HelloRetryRequest, resumption, 0-RTT taken and vetoed, client
-certificate; every secret compared with the client's) (2026-10-22). SCT stapling
-(RFC 6962) is beyond rustls, which dropped it; BoringSSL and OpenSSL have it.
-**tlsfuzzer (M2 exit gate, 2026-10-21):** 50 of its TLS 1.3 scripts run
-(`interop-tlsserver -- --tlsfuzzer DIR`, counts in `tools/tlsfuzzer/baseline.tsv`); against
-the 17 scripts the web-server consumer's fork of ianic/tls.zig is held to, none is worse except two deliberate
-divergences (`connection-abort`: no tickets for a client without `psk_key_exchange_modes`;
-`obsolete-curves`: JDK 11 compatibility), three are better (`signature-algorithms` 278/4
-over all its cases, `ecdsa-support` with a P-384 key, `eddsa` with an Ed25519 key), and
-`legacy-version` reached the fork's 10/0 with a fix found by it.
+rustls and Go not). **Where we are behind:** no TLS 1.2 and no DTLS (deliberately, *What is deliberately not done*), no early
+exporter, no compressed client certificates, no ECH split mode as a client-facing server. A full (EC)DHE handshake
+with a certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the collection's `tlsclient`
+and Zig std's client, sans-I/O or through the blocking `Connection`, with its certificate and key loaded from
+openssl's PEM forms. BoringSSL's BoGo suite runs with this module as its shim (`tools/bogo`): every TLS 1.3 server test
+that rustls 0.23.43 passes (`tools/bogo/rustls-owed.txt`) passes here, with no gap; the tests not run are disabled in
+`tools/bogo/config.json`, each glob with its reason (TLS 1.2 tests under a name without a version, extensions this
+server ignores, deliberate divergences). HelloRetryRequest, KeyUpdate both ways, session tickets with resumption, client
+certificates, OCSP / SCT stapling, 0-RTT, RFC 8879 certificate compression, the exporter, RFC 7250 raw public keys and
+a QUIC mode (below) all work; the raw public keys against OpenSSL 3.5, the QUIC mode against Go 1.26's
+`tls.QUICClient`. SCT stapling (RFC 6962) is beyond rustls, which dropped it; BoringSSL and OpenSSL have it.
+**tlsfuzzer:** the TLS 1.3 scripts listed in `tools/tlsfuzzer/baseline.tsv` run
+(`interop-tlsserver -- --tlsfuzzer DIR`); against the 17 scripts the web-server consumer's fork of ianic/tls.zig is held
+to, none is worse except two deliberate divergences (`connection-abort`: no tickets for a client without
+`psk_key_exchange_modes`; `obsolete-curves`: JDK 11 compatibility), three are better (`signature-algorithms` over all
+its cases, `ecdsa-support` with a P-384 key, `eddsa` with an Ed25519 key), and `legacy-version` reached the fork's
+result with a fix found by it.
 
 ## What this module is, and what it is not
 
 A TLS 1.3 (RFC 8446) server for the collection, built as a buffer-driven (sans-I/O) core with
 a blocking wrapper on top, on the `tls13` handshake building blocks (key schedule,
 CertificateVerify, key exchange, transcript) and the collection's AEADs (`aesgcm`,
-`chachapoly`). It is being built to replace the web-server consumer's fork of a third-party TLS server, milestone by
-milestone.
+`chachapoly`). It is built to replace the web-server consumer's fork of a third-party TLS server.
 
-**Today:** `Server`, a sans-I/O full handshake — ClientHello → ServerHello, compatibility CCS,
+**What it does:** `Server`, a sans-I/O full handshake — ClientHello → ServerHello, compatibility CCS,
 EncryptedExtensions, Certificate, CertificateVerify, Finished → the client's Finished — then
 application data both ways and close_notify, over the record layer (header, in-place protection,
 the receive side, alerts), the ClientHello decoder and the message encoders. It handshakes with
@@ -92,11 +77,12 @@ gets a HelloRetryRequest. After the handshake KeyUpdate works both ways: a clien
 receive key over (and `update_requested` is answered once), the server rekeys on its own at
 `max_records_per_key` (2^23 records, asking the client to rekey too) or when the application
 calls `keyUpdate`; at most `max_key_updates` (32) KeyUpdates may come between two
-application-data records (rustls, BoringSSL). With `Config.tickets` it issues NewSessionTickets
+application-data records (rustls, BoringSSL); only a record with data refills that budget, an empty
+application-data record does not (BoringSSL `kMaxKeyUpdates`, `src/server.zig:2266-2268`). With `Config.tickets` it issues NewSessionTickets
 and resumes them (below). With `Config.client_auth` it asks for a client certificate, verifies
 the chain (`ClientCertVerifier`; `X509Verifier` = `x509.verifyChain` with clientAuth) and the
-client's CertificateVerify, and reports the leaf (`peerCertificate`), resumptions included. It
-is not yet the server the web-server consumer runs (M3: the web-server consumer's seams and performance).
+client's CertificateVerify, and reports the leaf (`peerCertificate`), resumptions included. The seams the web-server consumer's zero-copy codecs need are in:
+one send buffer, `Connection.reader()` / `writer()` in place, `Server.writeSlot` / `commitWrite`.
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** kTLS itself (the
 record keys can be handed over to it: `Server.extractSecrets`) and post-handshake client authentication (*What is deliberately not
@@ -120,8 +106,7 @@ of `key_pem`:
 | any of the above, malformed | — | `MalformedKey`: strict DER throughout (a field or byte after the key's last element, an attribute not shaped `SEQUENCE { OID, SET }`, an ML-DSA key part of the wrong length); explicit EC parameters (a `[0]` or AlgorithmIdentifier holding no curve OID) are `UnsupportedKey` |
 
 The PEM walk, the base64 decode and the DER structure (strict DER, version, algorithm identifier,
-every length, the EC scalar range) are the `keycodec` module's (`parsePrivateKeyPem`, since
-2026-11-06); this file maps its parts onto the signing key types and checks what keycodec leaves
+every length, the EC scalar range) are the `keycodec` module's (`parsePrivateKeyPem`); this file maps its parts onto the signing key types and checks what keycodec leaves
 to the key type (an ML-DSA `both` key's halves, the key against the leaf).
 
 An EC scalar shorter than the order is left-padded (as OpenSSL reads it); longer, zero or ≥ the
@@ -206,7 +191,7 @@ ticket (a replayed ClientHello finds no session). Costs of single use (rustls ha
 id crosses the wire in the clear, so whoever saw a ClientHello can spend its ticket with a bad
 binder; a flood of full handshakes evicts real sessions; every lookup scans the whole cache (up to
 32 identities per ClientHello). Entries are sized by the configuration's `max_leaf_len` (a
-smaller cache issues no ticket to a longer leaf). Not yet: the ticket count request (RFC 9149).
+smaller cache issues no ticket to a longer leaf). Not done: the ticket count request (RFC 9149, *Backlog*).
 
 **0-RTT early data** (RFC 8446 §2.3, §4.2.10, §4.5, §8; opt-in `Config.early_data`, with
 tickets). Each NewSessionTicket carries `early_data` with `EarlyData.max_size` (BoringSSL's
@@ -332,7 +317,7 @@ spaces, the context string, 0, the leaf's DER, `cred`, `algorithm`) and that `ke
 credential's (`checkDelegatedKey` without the signature). DelegationUsage on the leaf is
 the client's check (BoringSSL's server makes none): `delegated.hasDelegationUsage`.
 Checked by BoGo's `DelegatedCredentials-*` server tests (basic, both algorithm fields,
-multiple credentials, key mismatch, RSA refused) — the shim now takes BoringSSL's
+multiple credentials, key mismatch, RSA refused) — the shim takes BoringSSL's
 credential list (`-new-x509-credential`, `-new-delegated-credential`,
 `-expect-selected-credential`), which also runs 21 `CertificateSelection-Server-*` tests.
 **Finding:** BoGo's runner signs and verifies credentials over leaf ‖ `algorithm` ‖
@@ -380,8 +365,8 @@ out everywhere. Allocation-free; a hello with more than 512 suites or extensions
 `fingerprint.ja4` on the `ClientHello` it gets and refuse the client before anything is sent.
 `hello.ClientHello.extensions_raw` is the checked extension block. Anchored on the
 specification's worked example (`t13d1516h2_8daaf6152771_e5627efa2ab1`, its two hashes
-recomputed independently), with GREASE and shuffled order added. Backlog: a differential check
-against Wireshark's JA4 field (`tshark` is not installed here).
+recomputed independently), with GREASE and shuffled order added. A differential check against
+Wireshark's JA4 field is open (*Backlog*).
 
 **Offloaded signing** (BoringSSL `SSL_PRIVATE_KEY_METHOD`, s2n `s2n_async_pkey`, picotls
 `ptls_async_job_t`; rustls signs synchronously inside the handshake, `Signer::sign`). A
@@ -402,8 +387,8 @@ it first, then calls its `signer`; without one the handshake fails with `Signatu
 the same way (`quicFeed` reports `signature_needed`). `tls13.certverify.signContent` is the
 signing for a signer that holds the key (re-exported as `tlsserver.certverify`). Checked by:
 every key kind × suite through `tlsclient`, after a HelloRetryRequest and with a client
-certificate; and BoGo's 49 `*-Async` tests, which the shim now runs with the key offloaded and
-`Connection.signer` (before: `-async` ignored).
+certificate; and BoGo's 49 `*-Async` tests, which the shim runs with the key offloaded and
+`Connection.signer`.
 
 **Client certificates** (RFC 8446 §4.3.2, §4.4.2, §4.4.3; rustls 0.23 rules,
 `Config.client_auth`). A full handshake sends a CertificateRequest after the
@@ -439,6 +424,32 @@ proved, carried across re-issued tickets: past the ticket lifetime from that ful
 ticket is not resumed, however young it is — so an expired or revoked certificate does not live
 on through resumptions (rustls re-issues indefinitely). A failed handshake reports no identity.
 
+**Raw public keys** (RFC 7250). `CertifiedKey.raw_public_key` makes the server's certificate its key's DER
+SubjectPublicKeyInfo (`chain[0]`, rustls `only_raw_public_keys`), sent only to a client that offers RawPublicKey in
+`server_certificate_type`. `ClientAuth.raw_public_keys` (a `clientauth.RawKeyVerifier`) authenticates a client by a raw
+key instead of a chain, only when it offers RawPublicKey in `client_certificate_type`; `peerCertificate` is then the
+key's DER SubjectPublicKeyInfo and `peerRawPublicKey()` is true. A resumption does not ask the raw-key verifier again,
+and a resuming client must offer RawPublicKey again (as in rustls).
+
+**Certificate compression** (RFC 8879; `CertifiedKey.compressed_certificates`; rustls and BoringSSL compress per
+handshake, here no compressor runs in the handshake and the module gains no dependency). The caller compresses the
+Certificate message ahead of time: `CertifiedKey.uncompressedCertificate(out, staples)` → any compressor → one
+`CompressedCertificate` per algorithm and per set of staples, in the caller's order of preference. The handshake sends
+the first whose algorithm the client offers and whose staples are the ones this handshake sends, else the Certificate
+uncompressed. `check` refuses an entry whose `uncompressed_len` no longer matches (`CompressedStale`), and with the
+entry's `digest` set (SHA-256 of the uncompressed message) any other change too; without it a same-length replacement
+(a refreshed OCSP staple usually is one) is not seen, so the caller compresses again whenever it replaces the chain or
+a staple (`src/server.zig:183-196, 305-313`). Interop: OpenSSL 3.5 `s_client` decompresses a std-zlib entry; the BoGo
+shim installs BoringSSL's three mock algorithms.
+
+**QUIC mode** (RFC 9001; rustls `quic::ServerConnection`). `Config.quic`: CRYPTO data in and out per encryption level
+(`quicFeed`, `quicOutput`), each level's traffic secret for the QUIC stack (`quicSecret`; packet keys via `quic-crypto`),
+transport parameters both ways, 0-RTT with the stack's resumption data and a veto (`setQuicResumptionData`,
+`Quic.accept_early`; the veto's reason is `quic_parameter_mismatch`), alerts as `quicAlert`. A QUIC ticket carries the
+stack's resumption data and resumes over QUIC only (ticket formats `format_quic` / `format_quic_raw`,
+`src/server.zig:992-1001`); `pendingOutput` gives one level at a time. Offloaded signing works the same way (`quicFeed`
+reports `signature_needed`).
+
 **HelloRetryRequest** (RFC 8446 §4.1.4, rustls 0.23 rules): when the client sent no share for
 the chosen group, the server fixes the suite, answers with a HelloRetryRequest naming the group
 (no cookie) and a compatibility CCS, and restarts the transcript as
@@ -446,8 +457,7 @@ the chosen group, the server fixes the suite, answers with a HelloRetryRequest n
 ClientHello must end its record flight (`unexpected_message`). The second must carry a share for
 that group, the same SNI, still offer that suite, and no `early_data` — otherwise
 `illegal_parameter`. Stricter than rustls, which re-chooses suite and group on the second hello
-and compares only the hash: RFC 8446 §4.1.4/§4.2.8 bind both to the HelloRetryRequest
-(independent review 2026-10-20, MEDIUM ×2); the ServerHello that follows has no second CCS.
+and compares only the hash: RFC 8446 §4.1.4/§4.2.8 bind both to the HelloRetryRequest; the ServerHello that follows has no second CCS.
 Early data the first ClientHello announced is skipped in the clear up to 2^14 octets of
 ciphertext, an empty record counting one octet (more: `unexpected_message`, as rustls). One compatibility CCS per ClientHello is
 accepted (two in all).
@@ -457,7 +467,11 @@ accepted (two in all).
 record), so `read` returns a slice of it, valid until the next read; pending output is flushed
 before every wait, after the handshake, each `writeAll` and `close`; a refusal's alert is flushed
 before the error is returned. A transport that ends before the handshake or mid-record is
-`EndOfStream` (truncation).
+`EndOfStream` (truncation). Reading sends too (what the server queued, before a read waits), so a reader and a writer
+that may park while sending (fibers of one thread, an HTTP/2 stream per fiber) need a `Connection.Guard` (a mutex that
+parks): it is held wherever the connection changes or sends its output and released while a read waits. Writers are still
+serialised among themselves, there is one reader, `deinit` comes after every fiber is done with the connection, and `err`
+holds whichever side's error came last. The guard does not make the connection safe across threads (`src/connection.zig:46-60`).
 
 RFC 8446 §5, record layer over a byte stream:
 
@@ -547,7 +561,7 @@ RFC 8446 §5, record layer over a byte stream:
 
 ## Constant-time contract
 
-**Key loading** (`keys`, through `keycodec` since 2026-11-06): the private key's PEM body is
+**Key loading** (`keys`, through `keycodec`): the private key's PEM body is
 decoded by `b64ct` (constant time) into a stack buffer that is wiped on every exit; the block
 search walks block by block and skips a foreign body with a scan for its END line's first `-` (a
 compare false on every base64 character), never a Boyer-Moore-Horspool `std.mem.find` over key
@@ -557,7 +571,7 @@ scalar range check is keycodec's borrow-chain compare (no branch on the scalar),
 comparison std's and a `mem.eql` over public values.
 `fromPem` runs under a 64 KiB burn (`burn.key_burn`; unburned 35 / 39 / 31 KiB for P-256 /
 P-384 / Ed25519, an RSA parse burns its own below), held by `src/stackprobe_test.zig`. No
-ctgrind row yet.
+ctgrind row covers key loading.
 
 Secrets: the traffic secret, the AEAD key state and the IV. The AEADs are the collection's
 (`aesgcm` with its own ctgrind rows, `chachapoly`); the code here branches only on public
@@ -565,7 +579,8 @@ values — the suite, lengths, the sequence number, the tag verdict. The content
 `open` runs over the decrypted inner plaintext from its end and stops at the first non-zero
 octet, so its time reveals the padding length; that is what rustls and OpenSSL do as well, and
 the padding length is not a secret the record layer protects (padding hides the content length
-from the wire, not from the receiver's timing). No ctgrind row yet (*Open*).
+from the wire, not from the receiver's timing). The `hs`, `app`, `ticket` and `ech` ctgrind rows (`src/ctgrind_harness.zig`) run the handshake,
+the record layer, ticket handling and the decrypted ECH inner hello under tainted secrets.
 
 Dead stack (`CONVENTIONS.md` §2.1.1): secrets in by `*const`, key state held in the caller's
 `Protection`, wiped by `Protection.wipe`. `init` / `initKeyIv` run under a 1 KiB burn (their
@@ -575,7 +590,11 @@ HKDF and AES key expansion burn their own 8 KiB below); `seal` / `open` under 4 
 for a caller that scrubs the whole stack itself, e.g. at connection close; `Protection.burn_records`
 carries it, set by `installTx` / `installRx`, and `init` resets it to true. `Protection.wipe`
 zeroes with the vector `zeroize` (volatile stores, as `burn.stack`).
-Measured and held by `src/stackprobe_test.zig` (ReleaseFast).
+Measured and held by `src/stackprobe_test.zig` (ReleaseFast). `burn.handshake_burn` (16 KiB around each handshake step) is
+held by a stack probe in `src/interop_replay_test.zig` that replays recorded handshakes (full, hybrid, HRR, resumed, mTLS,
+RSA, P-384, Ed25519) through `Connection.handshake` in ReleaseFast; the client Certificate and CertificateVerify steps run
+unburned (they touch no secret; their verifier frames reach deep), so the mTLS cases are probed for needles only
+(`Expect.residue = false`, `src/interop_replay_test.zig:714`).
 
 The receive side branches only on framing values (record types, lengths, the handshake header,
 the alert octets). Decrypted application data stays in the caller's buffer; joined handshake
@@ -634,6 +653,28 @@ The receive side's refusals are the table under *Wire format*. Record protection
   its cap. `minOutputLen(config, key)` sizes the output for the first flight with a
   CertificateRequest and for the tickets with the longest leaf.
 
+- **Stack.** `fromPem` wants ~110 KiB of stack (more for RSA; up to 1.3 MiB for ML-DSA, `burn.mldsa_key_burn`). A handshake
+  signs and exchanges under `tls13`'s burns: up to 352 KiB for an ML-DSA-87 signature and 256 KiB for ML-KEM-1024 (ReleaseFast
+  depths ×1.3; Debug frames are larger), so a small-stack worker or fiber must be sized for the keys and groups it enables.
+  The `CertKeyPair` must not move after `certifiedKey()`.
+- **Accepted differences, kept.** `signature_algorithms` is required (`handshake_failure` without it) even on a ClientHello
+  that resumes (rustls). The second ClientHello is compared with the first only where it matters to this server (suite
+  offered, share, SNI, `early_data`), not in `random`, `legacy_session_id`, other suites or ALPN (*Backlog*). ALPN may differ
+  from the ticket's on a 1-RTT resumption (RFC 8446 allows it, rustls the same). `close()` before any ClientHello still lets
+  a later ClientHello get a flight. `commitWrite` / `discardOutput` past their bounds are caller-contract asserts only.
+  After a HelloRetryRequest the second ClientHello's `status_request` / `signed_certificate_timestamp` decide (as in rustls;
+  RFC 8446 §4.1.2 would have them unchanged). `CertifiedKey.check` runs right after certificate selection, before the
+  signature scheme is matched: a misconfigured key is `internal_error` even for a client that could not have used it.
+- **Client certificates.** The leaf's key and `keyUsage` are checked before the verifier (BoringSSL's order; rustls verifies
+  first, so an untrusted unusable leaf gets `unsupported_certificate` here, `unknown_ca` there); a chain signature that does
+  not verify is `bad_certificate` (rustls: `decrypt_error`); only the leaf is kept, not the chain.
+- **0-RTT.** A `ReplayGuard` shared across threads is the caller's lock. The skip budget (2^14 octets) counts ciphertext, so many
+  tiny refused records can exceed it and it cannot skip a full-size early record (as rustls); empty early records cost nothing
+  (a binder is needed first); a server KeyUpdate at 2^23 records could fall before the client's Finished (not reachable in
+  practice).
+- **Certificate compression:** a same-length replacement of the chain or a staple is not seen by `check` unless the entry carries
+  its `digest` (*Wire format*).
+
 ## Anchoring
 
 - **External:** RFC 8448 §3 — all seven protected records of the simple 1-RTT handshake
@@ -668,8 +709,7 @@ The receive side's refusals are the table under *Wire format*. Record protection
   (Go's two default shares against a server with only secp256r1, or only secp384r1 under
   TLS_AES_256_GCM_SHA384; Go's `ConnectionState.HelloRetryRequest` printed). The Go client verifies the
   chain with `x509.Certificate.Verify`, prints the negotiated version, suite, group (`CurveID`)
-  and ALPN — anchored on the end of the line, so `X25519` does not match `X25519MLKEM768`
-  (negative control 2026-10-20: the no-hybrid case against a server with the hybrid fails) —
+  and ALPN — anchored on the end of the line, so `X25519` does not match `X25519MLKEM768` —
   and requires close_notify (`io.ReadAll` without an error).
 - **External (foreign implementation):** whole handshakes against Zig std's
   `crypto.tls.Client` (`src/handshake_test.zig`, in one thread through in-memory pipes): an
@@ -721,7 +761,7 @@ The receive side's refusals are the table under *Wire format*. Record protection
   (`-cert`/`-key`: ECDSA P-256, RSA-2048 with RSA-PSS, Ed25519; an optional request answered
   with none; tickets after client authentication and their resumption) and Go 1.26's crypto/tls
   client (the same) against `X509Verifier` over a test client CA (`tools/client_certs.py`,
-  `client_certs.zig`) — 11 more interop sessions (46 in all), captured and replayed byte-exact;
+  `client_certs.zig`) — more interop sessions, captured and replayed byte-exact;
   the server must end with the presented leaf as `peerCertificate`, from the ticket on a
   resumption. In process: `tlsclient` with each key kind under every suite, no certificate
   (mandatory → `certificate_required`; optional → unauthenticated, the request's CA names and
@@ -730,68 +770,22 @@ The receive side's refusals are the table under *Wire format*. Record protection
   not matching the certificate (`decrypt_error`), resumption keeping the identity, and a ticket
   without one refused under a mandatory certificate.
 
-- **External (foreign test suite):** BoringSSL's BoGo runner (`ssl/test/runner` at 784fcafc,
-  2026-08-31 — the last commit before it required Go 1.27), with `tlsserver` as its shim
-  (`tools/bogo_shim.zig`, `zig build interop-tlsserver -- --bogo`). Before the first build the
-  runner's 75 source files (~50,000 lines) and the 75 third-party files compiled into it
-  (x/crypto, x/sys/unix, x/term, filippo.io/mldsa; `-tags purego`, ~27,000 lines) were read in
-  full: it spawns only the shim, listens on loopback only, writes only its temp test keys
-  (under `.zig-cache`). `tools/bogo/MANIFEST` pins every source file's git blob hash and `--bogo`
-  refuses a tree that differs; Go modules come from `go.sum` (`GOFLAGS=-mod=readonly`).
-  Result 2026-10-20 (M1): **130 pass, 0 fail**; with the rustls parity gate (M2 step 6) **339
-  pass, 0 fail**: the shim gained `-expect-hrr`/`-expect-no-hrr` (`Server.usedHelloRetryRequest`),
-  `-signing-prefs` (`CertifiedKey.signature_schemes`), `-server-preference`
-  (`Config.server_order`), `-max-send-fragment` (`Config.max_fragment_len`), `-no-ticket`,
-  `-resumption-delay` + `-expect-ticket-age-skew` (`Server.ticketAgeSkew`), ALPN decline /
-  reject / `-expect-advertised-alpn` and `-expect-peer-verify-pref` (checked in the
-  `CertificateSelector`, BoringSSL's early callback), `-expect-early-data-reason disabled`.
-  The gate itself: `tools/bogo/rustls_parity.py` reconstructs the tests rustls passes from its
-  `bogo/config.json.in` (preprocessed as the aws-lc-rs build) and its shim's option table
-  (`bogo/src/main.rs`: a flag it answers 89 or does not know is not owed), with each test's
-  flags captured by running the pinned runner once per test against a stub shim; `--bogo`
-  prints `GAP` for each owed test that does not pass and is not disabled. Three tests named
-  without a version (`Basic-Server-*`) turned out to be TLS 1.2 (`MaxVersion: VersionTLS12`) and
-  are disabled as such; with client certificates (M2 step 4: the
-  shim's `-require-any-client-certificate`, `-verify-peer`, `-verify-fail`, `-verify-prefs`,
-  `-trust-cert` → `X509Verifier`, `-use-client-ca-list`, `-expect-peer-signature-algorithm`,
-  `-expect-peer-cert-file` for a single certificate) **274 pass, 0 fail**; with stapling (step 5:
-  `-ocsp-response`, `-signed-cert-timestamps`) **286 pass, 0 fail** — the per-algorithm
-  `Server-Verify-*`/`Server-InvalidSignature-*` tests (the scheme reported on resumption too),
-  key usage, CA lists, empty and refused certificates; the BoGo run found the missing
-  `keyUsage` check (a leaf limited to keyEncipherment or keyCertSign signed its
-  CertificateVerify), fixed with it. Disabled with reasons: TLS ≤ 1.2 tests the client-auth flags
-  used to hide, P-521 and ML-DSA client keys, `rsa_pkcs1_sha256_legacy`, Ed25519 accepted by
-  default (rustls), the legacy-callback `CertificateVerificationFail-Server-TLS13` variants
-  (BoringSSL answers `handshake_failure`, tlsserver the verifier's alert, as the CustomCallback
-  variant expects), `GarbageCertificate-Server-TLS13` (`bad_certificate`, as rustls, where
-  BoringSSL sends `decode_error`). Skipped: raw public keys (RFC 7250,
-  `ClientCertificateType-*`) and a peer chain to compare (`SendReceiveIntermediate-Server`: only
-  the leaf is kept); with KeyUpdate (M2 step 2) **142 pass, 0 fail**;
-  with resumption (M2 step 3, the shim's `-resume-count` loop with `-on-initial-`/`-on-resume-`
-  flags and `-expect-session-miss`) **166 pass, 0 fail** — binder errors, PSK modes, corrupt
-  tickets, suite/SNI changes on resume; disabled: the TLS ≤ 1.2 resumption tests the
-  `-resume-count` exit 89 used to hide, `Resume-Server-OmitAllPSKsOnSecondClientHello` (rustls
-  divergence: RFC 8446 §4.1.2 lets the second ClientHello drop the PSKs; BoringSSL, having
-  decided on the first, wants `missing_extension`) and `TLS-ECH-Server-ECHInner` (no ECH);
-  `PackedEncryptedHandshake-TLS13` made the server pack its tickets into one record and
-  `GREASE-Server-TLS13` made it GREASE them
-  (`KeyUpdate-ToServer`, and `KeyUpdate-FromServer` with the shim's new `-key-update`; the
-  other KeyUpdate tests are client, DTLS or BoringSSL-specific); with HelloRetryRequest (M2
-  step 1) **140 pass, 0 fail** — the eight HRR globs re-enabled, one rustls-parity divergence disabled
-  (`SkipEarlyData-SecondClientHelloEarlyData`: early_data in the second ClientHello is
-  `illegal_parameter` here and in rustls, `bad_record_mac` in BoringSSL; rustls maps it with a
-  `TestLocalErrorMap` runner 784fcafc lacks). M1 run: 6,047 exit 89 (unimplemented: client tests, DTLS,
-  QUIC, resumption, client certificates, OCSP, BoringSSL-only features — the shim logs the flag
-  of each); 3,676 disabled in `tools/bogo/config.json`, each glob with its reason (TLS ≤ 1.2;
-  HelloRetryRequest and KeyUpdate, M2; extensions the server ignores; one rustls-parity
-  divergence). `tools/bogo/passing.txt` is a ratchet: a listed test that fails or disappears
-  fails the run (negative controls: a bogus entry → LOST; the version check moved back after
-  `signature_algorithms` → 11 LOST). The first run found four defects, fixed with it: a client
-  without `supported_versions` got `handshake_failure` instead of `protocol_version` (the
-  version is now checked first); no `supported_groups` or no `key_share` was
-  `handshake_failure` instead of `missing_extension` (RFC 8446 §9.2); a 1024-bit RSA key was
-  offered `rsa_pss_rsae_sha512`, which it cannot encode (`tls13.certverify.canSign`; signing
-  then failed with `internal_error` instead of refusing with `handshake_failure`).
+- **External (foreign test suite):** BoringSSL's BoGo runner (`ssl/test/runner` at 784fcafc, the last commit before it
+  required Go 1.27), with `tlsserver` as its shim (`tools/bogo_shim.zig`, `zig build interop-tlsserver -- --bogo`). The
+  runner's source files and the third-party files compiled into it were read in full before the first build: it spawns only
+  the shim, listens on loopback only, writes only its temp test keys (under `.zig-cache`). `tools/bogo/MANIFEST` pins every
+  source file's git blob hash and `--bogo` refuses a tree that differs; Go modules come from `go.sum`
+  (`GOFLAGS=-mod=readonly`). `tools/bogo/passing.txt` is a ratchet: a listed test that fails or disappears fails the run.
+  What is not run is disabled in `tools/bogo/config.json`, each glob with its reason (TLS 1.2 and earlier, extensions the
+  server ignores, client-side, DTLS and BoringSSL-only features, deliberate divergences from BoringSSL that follow rustls).
+  The shim maps the runner's flags onto `Config` (HelloRetryRequest expectations, signing preferences, server preference,
+  maximum fragment, tickets and the ticket-age skew, ALPN, client-certificate verification, stapling, KeyUpdate, the
+  exporter, the ECH server keys, BoringSSL's credential list, asynchronous signing, the `-resume-count` loop).
+  **The rustls parity gate:** `tools/bogo/rustls_parity.py` reconstructs the tests rustls 0.23.43 passes from its
+  `bogo/config.json.in` (preprocessed as the aws-lc-rs build) and its shim's option table (`bogo/src/main.rs`: a flag it
+  answers 89 or does not know is not owed), with each test's flags captured by running the pinned runner once per test
+  against a stub shim; the result is `tools/bogo/rustls-owed.txt`, and `--bogo` prints `GAP` for each owed test that neither
+  passes nor is disabled. The list is re-derived with the script when the rustls reference moves.
 
 **Anchor grade:** class A · oracle EXTERNAL
 
@@ -816,27 +810,13 @@ truncation, spliced random octets) never panics, and damage that reaches a prote
 carrying output is never accepted with the genuine output. `fuzz harness: inbound, 300 seeds,
 reaches every outcome` runs in every test lane.
 
-Verdict 2026-10-20: 8 × 1,500,000 runs, ReleaseSafe, clean (~42,000 runs/s per job). Five
-planted mutants caught (schemata, one build): the sequence number left out of the nonce, the
-header left out of the additional data, the sequence advanced on a failed open, the content
-type kept in the content, the record-length check removed (a panic).
-
-Verdict `tlsserver-inbound` 2026-10-20: 4 × 300,000 runs, ReleaseSafe, clean (~5,700 runs/s per
-job). Five planted mutants caught: a whole message held back one octet, the joiner's compaction
-left out, the last record left out of `consumed`, the header kept in the body, the protected
-record limit set to the plaintext one (survived the first harness, which almost never cut a
-whole 2^14 record; whole records are now one cut in eight).
-
 Harness `tlsserver-hello`: a ClientHello built from a model — the fixed fields, a random subset
 of nine known extensions with random well-formed bodies and up to three unknown ones, in random
 order, `pre_shared_key` last one time in three — decodes to exactly the model (every list walked,
 the SNI class, the binder offset); planted faults give their error (a repeated extension or
 `pre_shared_key` not last: `illegal_parameter`; a 33-octet session id: `decode_error`). The same
 message damaged never panics, and whatever it decodes to is walked to the end by every iterator
-(bounds-checked in ReleaseSafe). Verdict 2026-10-20: 4 × 1,000,000 runs, ReleaseSafe, clean
-(~23,800 runs/s per job). Six planted mutants caught: the duplicate check, the PSK-last check
-and the 32-octet session id limit removed, the binder offset two octets early, the ALPN iterator
-skipping one octet short (a panic), the key share read one octet early.
+(bounds-checked in ReleaseSafe).
 
 Harness `tlsserver-keys`: `keys.CertKeyPair.fromPem` on the key vectors — the key's DER with
 octets rewritten (anywhere, or among the leading tags and lengths), truncated or extended and
@@ -844,13 +824,7 @@ re-armoured under its own or another key label; rebuilt from a model of its fiel
 the scalar or seed at lengths around the curve's, own or other curve OIDs, optional `[0]` /
 `[1]`, with or without the PKCS#8 wrapper, Ed25519 parameters that RFC 8410 forbids); or the
 PEM text itself with octets rewritten or cut. Any outcome is a typed error, or exactly the
-genuine key (compared with a genuine load); never a panic, never a leak. Verdict 2026-10-20:
-4 × 30,000 runs, ReleaseSafe, clean (~450 runs/s per job, RSA dominates; rerun clean after
-the review fixes below). Five planted mutants
-caught: the DER length bound removed (a panic), the EC key-to-leaf comparison removed (a
-different key loaded), the Ed25519 seed length check removed (survived the first harness,
-which never shortened a nested octet string consistently — the model mode added), the scalar
-length bound removed, the long-form length bound removed.
+genuine key (compared with a genuine load); never a panic, never a leak.
 
 Harness `tlsserver-server`: `Server` as a whole, fed the recorded OpenSSL and Go client
 streams (`interop_vectors.zig`) with the recorded seed, so its output is a function of its
@@ -867,14 +841,7 @@ to 300 octets of padding it ends as recorded. Over every run: after a failure `f
 the server had sent nothing else, else one sealed alert record, and none after the server's own
 close_notify or for an error naming none; application data never precedes `handshake_done`;
 `write` before it is `NotConnected`. RSA cases run one time in ten (signing dominates).
-`fuzz harness: server, 400 seeds, reaches every outcome` runs in every test lane. Verdict
-2026-10-20: 4 × 40,000 runs, ReleaseSafe, clean (~1,070 runs/s per job). Five planted mutants
-caught: the client's Finished check removed (survived the first harness — every change to the
-ClientHello changes the client's keys, so damage never got past the AEAD to the Finished
-check; the resealing white-box mode added), the failed state not kept, one octet more awaited
-than a record needs, any change_cipher_spec body accepted, the alert after the flight left out.
-The KeyUpdate recordings (2026-10-20) are driven with the same KeyUpdate before "pong" (and
-s_client's "again"); 4 × 12,000 runs clean.
+`fuzz harness: server, 400 seeds, reaches every outcome` runs in every test lane.
 
 Harness `tlsserver-keyupdate`: `Server` after a recorded handshake (fed through the client's
 Finished), then up to 24 scripted post-handshake steps against a model client that follows
@@ -889,14 +856,9 @@ server's next application data; the number of server KeyUpdates, and of those re
 back, is exactly what the requests, the `keyUpdate` calls and the key limit account for
 (coalesced while one stays queued, dropped after close_notify); a refusal is the predicted
 error, its alert the last record, sealed under the key in force; nothing is accepted after.
-`fuzz harness: keyupdate, 400 seeds, reaches every outcome` runs in every test lane. Verdict
-2026-10-20: 4 × 12,000 runs, ReleaseSafe, clean (~750 runs/s per job). Seven planted mutants
-caught, each within seconds: the reply sealed under the new key, the KeyUpdate count not reset
-by application data, `update_requested` never answered, no rekey at the limit, no alert
-reserve (the harness's first run found that defect for real: a full output dropped the fatal
-alert), an invalid request octet taken as `update_not_requested`, a deferred reply dropped.
+`fuzz harness: keyupdate, 400 seeds, reaches every outcome` runs in every test lane.
 
-Client certificates (2026-10-20). `tlsserver-server` and `tlsserver-keyupdate` replay the
+Client certificates. `tlsserver-server` and `tlsserver-keyupdate` replay the
 mTLS recordings with the recorded `client_auth` (`X509Verifier` over the test client CA): the
 keyupdate harness feeds the client's sealed records one at a time up to `handshake_done` (Go
 sends Certificate, CertificateVerify and Finished in records of their own, OpenSSL in one); the
@@ -909,31 +871,48 @@ certificate), whole — it decodes to the same chain, the leaf's key reads, the 
 only) is refused for signing — or damaged (bit flips, an octet rewritten, truncation, splices),
 when every certificate it still decodes to goes through `leafPublicKey` and `checkLeafKeyUsage`
 (std's DER walk on an `x509.safe` copy) without a panic; then a CertificateVerify body, maybe
-truncated. Verdicts 2026-10-20, ReleaseSafe, clean: `tlsserver-server` 4 × 60,000 (~1,150
-runs/s per job), `tlsserver-keyupdate` 4 × 20,000, `tlsserver-clientauth` 4 × 1,500,000 (~35,000
-runs/s per job). Eighteen planted mutants (schemata, one build, the whole test suite per
-mutant) caught: the certificate's proof age not checked on resumption, an empty certificate let through when mandatory, the verifier skipped, an
-unadvertised scheme or a bad signature accepted, the server's context string in the client's
-signed content, a ticket without a certificate resumed under a mandatory one, tickets without
-the certificate, `peerCertificate` before the CertificateVerify, a CertificateRequest on a
-resumption, the resumed identity lost, entry extensions or another context accepted, an empty
-`cert_data`, `digitalSignature` ignored, an expiry reported as `bad_certificate` — and two that
-survived the first pass, now caught by new tests: the server not calling the key-usage check
-(only `clientauth`'s own test covered it) and the ticket's leaf-length cap (the test's ticket
-was too short to get there).
+truncated.
 
-Independent read-only review of `keys` (Sonnet, 2026-10-20): no HIGH. MEDIUM fixed — an EC
-scalar ≥ the order loaded and failed only at the first signature (std's `fromBytes` does not
-range-check; test with d = n, n + 1, 0). LOWs fixed: legacy `Proc-Type` encrypted keys gave
-`InvalidPem` (now `UnsupportedKey`); a skipped block with a cut END line swallowed the next
-BEGIN (END must now match); one pass over the blocks instead of one per label; intermediates
-are checked; the key's size limit no longer counts whitespace; an RSA-PSS leaf is named. Added:
-an allocation-failure sweep (`checkAllAllocationFailures`) over every key form, CRLF, `out`
-zeroed after an error. Documented, not changed: the pair must not move after `certifiedKey`,
-and `fromPem` wants ~110 KiB of stack (more for RSA; for ML-DSA, 2026-10-21, up to 1.3 MiB —
-`burn.mldsa_key_burn`). A handshake signs and exchanges under `tls13`'s burns: up to 352 KiB
-for an ML-DSA-87 signature and 256 KiB for ML-KEM-1024 (ReleaseFast depths ×1.3; Debug frames
-are larger), so a small-stack worker must be sized for the keys and groups it enables.
+Harness `tlsserver-ech`: the inner ClientHello rebuilt from a model (the outer extensions it names, `ech_outer_extensions`
+replaced in one pass); every fault is refused with its error.
+
+Harness `tlsserver-quic`: recorded Go `tls.QUICClient` sessions fed to the QUIC entry points whole, in pieces, with bits
+flipped, at a wrong encryption level and cut short.
+
+The driver prefix of every harness is `TLSSERVER_FUZZ=<runs>[,<first seed>]`.
+
+## Verification
+
+Run: `scripts/modtest tlsserver`. External tools are not part of the test lane: `zig build interop-tlsserver` (OpenSSL 3.5
+`s_client` and Go 1.26 crypto/tls sessions over loopback; `--capture` records the sessions that the tests replay),
+`zig build interop-tlsserver -- --bogo` (the BoGo runner, the ratchet and the rustls parity gate, *Anchoring*),
+`-- --tlsfuzzer DIR` (counts held in `tools/tlsfuzzer/baseline.tsv`: more failures than listed fail the run, other counts are a
+note to update the line), `zig build bench-tlsserver` (*Performance*).
+
+Test classes, by area:
+
+- **Record layer** (`src/record.zig`, `src/record_kat_vectors.zig`): RFC 8448's protected records sealed byte-exact and opened
+  back; the other two suites against OpenSSL-sealed records; every refusal of *Limits and refusals* (overflow, MAC, padding,
+  sequence exhaustion).
+- **Receive side, ClientHello, messages** (`src/inbound.zig`, `src/hello.zig`, `src/messages.zig`,
+  `src/message_kat_vectors.zig`): the strictness tables of *Wire format*, RFC 8448's ClientHellos and server messages.
+- **Handshake engine** (test blocks of `src/server.zig`, `src/handshake_test.zig`): whole handshakes through in-memory pipes
+  against Zig std's client and `tlsclient` (every suite, group, key kind, HelloRetryRequest, tickets, client certificates,
+  0-RTT, KeyUpdate, ECH, delegated credentials, offloaded signing, migration, QUIC mode), refusals and their alerts.
+- **Replay** (`src/interop_replay_test.zig`, `src/interop_vectors.zig`): the recorded OpenSSL and Go sessions through
+  `Connection`, byte for byte, and with one octet flipped (refused), in every test lane.
+- **Keys** (`src/keys.zig`, `src/key_vectors.zig`): every PEM form the OpenSSL command line writes, matching and refusal,
+  an allocation-failure sweep over every key form.
+- **Mutation-derived** (`src/mutation_test.zig`, `src/mutation2_test.zig`, test blocks in the production files): each pins a
+  guard that a mutant showed unguarded. Fixtures for client chains and certificates: `src/client_chain_certs.zig`,
+  `src/client_certs.zig`, `src/test_certs.zig` (producers in `tools/`).
+- **Dead stack** (`src/stackprobe_test.zig`, `src/interop_replay_test.zig`, ReleaseFast): the burns of `Protection`, `fromPem`,
+  `Server.deserialize`, `ech.openFirst` and the handshake steps leave no secret residue.
+- **Fuzz:** the harnesses of *Fuzzing*; each runs a short fixed seed set in every test lane.
+- **ctgrind:** `src/ctgrind_harness.zig` through `scripts/checks/ctgrind.sh tlsserver`, rows `hs`, `app`, `ticket` and `ech`;
+  counts and digests are pinned in `scripts/checks/ctgrind-expected.tsv`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the
+  delta runs after it.
 
 ## What is deliberately not done
 
@@ -941,143 +920,36 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
 - **0-RTT without a replay guard:** `EarlyData.replay` is mandatory (BoringSSL takes early
   data with none and leaves anti-replay to the application). What early data may do is still
   the application's call (RFC 8470 for HTTP): the module only marks it (`early_data` events).
-- **kTLS:** not driven by this module — measured in the web-server consumer at 41 % slower than userspace records.
-  `Config.enable_secret_extraction` + `Server.extractSecrets` hand both directions' keys, IVs
-  and sequence numbers to a caller that sets the socket up (rustls `enable_secret_extraction` /
-  `dangerous_extract_secrets`, added 2026-10-21); like rustls, no traffic secrets, so a
-  KeyUpdate after the hand-over cannot be followed.
+- **kTLS:** not driven by this module (measured in the web-server consumer at 41 % slower than userspace records).
+  `Config.enable_secret_extraction` + `Server.extractSecrets` hand both directions' keys, IVs and sequence numbers to a
+  caller that sets the socket up (rustls `enable_secret_extraction` / `dangerous_extract_secrets`); like rustls, no traffic
+  secrets, so a KeyUpdate after the hand-over cannot be followed.
 - **Strict parsing of extensions a TLS 1.3 server ignores** (`extended_master_secret`,
   certificate types, QUIC parameters, ECH): skipped as unknown, where rustls checks their form —
   a difference only in what malformed-but-ignored octets are refused.
 - **Constant-time padding removal:** not done, as in rustls and OpenSSL (see the constant-time
   contract).
-- **FFDHE groups, AES-CCM suites, brainpool and x448 / Ed448:** not offered (rustls's default
-  provider neither); tlsfuzzer's scripts for them stay red by design (`tools/tlsfuzzer/baseline.tsv`).
+- **AES-CCM suites, brainpool and x448 / Ed448:** not offered (rustls's default provider neither); tlsfuzzer's scripts for them
+  stay red by design (`tools/tlsfuzzer/baseline.tsv`). **FFDHE groups** (ffdhe2048 … ffdhe8192, `ffdhe_groups`) are served only
+  when `Config.groups` enables them: they are not in `default_groups` (`src/server.zig:1165-1174`).
 - **psk_ke (PSK without (EC)DHE) and external PSKs:** never (rustls likewise).
-
-## Audit (2026-10-23, the step frame)
-
-**Mutation** — over the frame change (`Connection.step` with `Server.onHandshake` and `sign`
-out of line) and the loop around it. 14 schemata over `step`, `sign` and the handshake dispatch
-in `feed` (the per-pass seal, the refusal's alert, the toss, `signature_needed` and `need_more`
-taken as results, the flush before the wait, the full-buffer refusal, the guard released for the
-wait, EndOfStream's mapping, the flush before signing, `signatureFailed` on a failing or missing
-signer, a handshake event or error dropped), the whole test suite per mutant (ReleaseSafe, one
-binary, `TSMUT=n`); and the two `never_inline` calls each made `always_inline`, one build per
-mutant (a schema would inline the arm into the baseline too). First run 11/14 + 1/2. New tests:
-a read waits under a frame of under 4 KiB from `handshake` down to the reader (512 octets
-measured; optimized builds only — Debug inlines nothing), the full-buffer refusal reached by
-swapping a short reader in after `init`, and the client hearing `internal_error` from a failing
-or missing signer — which first showed `tlsclient` reporting any alert under the handshake key
-as an unexpected message (fixed there). Final 15/16 over src `b8c33ee96363892a` (`581c2c366e89c392` after rewording one test comment, carried over: a mechanical change); the one left is
-equivalent in this module's binaries: `onHandshake` inlined into `feed` reaches `step`'s frame
-only where the optimizer also inlines `feed` into `step` — it did in the web-server consumer's ReleaseFast build,
-not in this module's ReleaseSafe or ReleaseFast test binary (the depth test passes there with
-the mutant). ctgrind re-run: in-file counts unchanged (hs 28, app 8, ticket 77, ech 384; re-pinned 2026-11-01 to hs 22, app 8, ticket 78, ech 388: p256 signature declassified, Ed25519 on ct25519, and the public guards `transcript.writeHeader` length, `psk.checkContext` nonce length, `netaddr.parseIp` on the decrypted SNI, hpke `readyAead` verdict; ech 388 → 384 again by full CI 41323098008 after tls13/hpke moved to `mlkem`, matched by count, not read by stack; see the comments in `ctgrind-expected.tsv`),
-source digests re-pinned.
-
-## Audit (2026-10-22, the grade-1 features)
-
-**Review** — two independent read-only reviews of the day's features (Sonnet, by reading:
-ECH + delegated credentials + JA4; offload + migration + record_size_limit + dynamic records).
-No HIGH. Seven MEDIUM, all fixed (`f7f81744`): an inner ECH offer on the wire accepted by a
-client-facing server (RFC 9849 §7 says abort); `retry_configs` sent for an inner offer after a
-HelloRetryRequest; an ECH key that skipped `Ech.check` with a short public key could panic on a
-peer's offer; `provideSignature` after `close()` finished the flight unprotected; an offloaded
-delegated credential verified under the leaf's key (always failing); a migration blob not bound
-to its connection (resuming one twice is AES-GCM nonce reuse — now a caller context in the AAD
-and documented single use); `serialize` bypassing `enable_secret_extraction`. LOW items fixed or
-documented (HPKE context and inner hello wiped early, idle measured from the last record
-written, `Connection.serialize`, the blob's length bound, lifetimes).
-
-**Mutation** — 149 mutant schemata over the new code (ech, delegated, fingerprint, the ECH /
-offload / delegated / record-limit / dynamic-record / migration / JA4 glue in `server`), the
-whole test suite per mutant (ReleaseSafe, one binary, `TSMUT=n`). First run 68/149: the new
-features were tested on their happy paths and by BoGo/interop, not unit by unit. 75 survivors
-became tests (refusals of every ECH offer variant on both hellos, `retry_configs` on the wire,
-the backend confirmations recomputed, the record-size boundaries, every `serialize`
-precondition and round-tripped field, a golden delegated-credential signed message, JA4's
-count cap and hex rule…); one of them found a real defect: `serialize` on a server without a
-peer buffer (no client authentication — the normal case) sliced past it and panicked, fixed.
-Final 143/149 over src `643af7aec0f133be` (`fca7271ced10a026` after renaming one test-local struct, carried over: a mechanical change); the 6 survivors are equivalent: a GREASE version is
-never below 0x0304 (58); the version octet is checked before the seal opens (99); a restored
-connection refuses a CCS on `app_data_ok` before `handshake_seen`/`ccs_left` are read (112,
-114); ALPN names are never empty (132); a SubjectPublicKeyInfo filling the credential fails
-the next length check anyway (138). The morning's 106/108 run covers the code before these
-features.
-
-## Audit (2026-10-21)
-
-**Review** — two independent read-only reviews of the whole module (not a diff), by reading:
-`server.zig` end to end (state machine, HRR, PSK/tickets, 0-RTT, client authentication,
-KeyUpdate, secret hygiene, output accounting), and the rest (`record`, `inbound`, `outbound`,
-`hello`, `messages`, `connection`, `clientauth`, `keys`, `alert`, `zeroize`, `burn`). No HIGH,
-no MEDIUM. Fixed: a zero-length application_data record refilled the KeyUpdate budget, so
-KeyUpdates interleaved with empty records never hit `max_key_updates` (now only a record with
-data refills it, as BoringSSL); a reader buffer under `record.max_record_len` (an `init`
-assert, gone in ReleaseFast) is refused in `Connection.step` instead of asking a full reader
-for more; `installTx`/`installRx` clear `protected` before `init` (a refused init no longer
-leaves a direction "protected" by a wiped key; unreachable today); `KeyShareIter` and
-`PskIdentityIter` widen their u16 lengths (safe on parsed input, wrapping on raw bytes).
-Kept as they are, with the reason: `signature_algorithms` required even on a resumption, as
-`handshake_failure` (rustls's behaviour); the second ClientHello compared with the first only
-where it matters to this server (suite offered, share, SNI, `early_data` — rustls compares
-partly more); `close()` before any ClientHello; ALPN may differ from the ticket's on a 1-RTT
-resumption (RFC 8446 allows it, rustls the same) — Backlog.
-
-**Mutation** — 62 mutant schemata over `server`, `record`, `inbound`, `hello`, `clientauth`
-and `outbound`: every state's message-type check, ClientHello and HRR refusals, Finished and
-CertificateVerify verification, the ticket filter and parse, every 0-RTT condition and the
-replay guard, record length/type/size limits, nonce construction and padding scan, record
-framing and CCS rules, extension parsing, client-leaf key usage, output room. The whole test
-suite (ReleaseSafe, one binary, `TSMUT=n`). First run 58/61; the three survivors became
-tests (a Finished where the CertificateVerify belongs; records shorter than the tag; the
-ticket head wiped in the peer buffer after a resumption, with re-issue off — issuing wipes
-the same head and hid it); 62/62 over src `8959c5888ec76b96`. Then the kTLS secret hand-over (`extractSecrets`) was added,
-reviewed on its own (no HIGH/MEDIUM; the send key at its AEAD record limit is now refused,
-its documentation names what the caller must have drained and what is gone afterwards; a test
-per suite for the derived key/IV) and given 6 mutants of its own: final run 68/68 over src
-`2ca8a57963d7b587`. RFC 7250 raw public keys (2026-10-22) had a review of their own (no
-HIGH/MEDIUM; documented: `peerCertificate` is an SPKI when `peerRawPublicKey`, a resumption does
-not ask the raw-key verifier again, a resuming client must offer RawPublicKey again as in
-rustls) and 10 mutants; two survived until OpenSSL sessions showed them (`rpk-server-status`:
-no staple from a raw-key server; `rpk-client-unasked`: no `client_certificate_type` without a
-CertificateRequest): final run 78/78 over src `100984b3fcfead68`. QUIC mode (2026-10-22): its own review (one MEDIUM, fixed: 0-RTT over QUIC
-had no hook for the stack to check the transport parameters a ticket remembers, and a ticket was
-not bound to its transport — now QUIC tickets (formats 5/6) carry the stack's resumption data,
-resume over QUIC only, and `Quic.accept_early` can decline 0-RTT, reason
-`quic_parameter_mismatch`; LOWs fixed: `pendingOutput` gives one level at a time, a failed
-handshake sends nothing more, `extractSecrets`/`commitWrite`/`abandonWrite` refused, an output
-overflow is `internal_error` for `quicAlert`), 21 mutants of its own and the `tlsserver-quic`
-fuzz harness: final run 97/99 over src `85b081da243a31ea` — the 2 equivalent ones change which
-secret `installRx` gets in QUIC mode, where it installs none.
-The `Connection` guard (2026-10-22, found from the web-server consumer: a read sends what is queued before it waits,
-so a writer parked mid-send — an HTTP/2 stream on a fiber — and the reader sent the same records
-twice): its own review found one MEDIUM, fixed — a writer could open a record while the reader
-waited for input, and what `feed` then queued (a KeyUpdate reply, an alert) landed over it;
-`step` now seals what `writer()` holds on every pass, not only on entry. LOWs fixed in the
-contract (one reader, `deinit` after every fiber, `err` last-wins, threads only where nothing
-runs between a writer's octets and its next park); the test rig now joins its threads and
-unblocks the socket on failure. 9 mutants (each entry point's guard, the release around the
-wait, the per-pass seal), killed by three socketpair tests and one single-threaded invariant
-test (every send made with the guard held; `writer()`'s record turnover is reachable only that
-way, threads cannot stand in for fibers there): final run 9/9 over src `3628dfe31d6d24a6` (106/108 with the runs before it, the same 2 equivalent).
+- **Post-handshake client authentication:** not in v1, and not in rustls either; a client's post-handshake message other than
+  KeyUpdate is refused (`src/server.zig:2530-2531`).
+- **The early exporter** (`early_exporter_master_secret`, RFC 8446 §7.5's 0-RTT variant): rustls has none on the server.
+- **Compressed client certificates** (rustls `ServerConfig::cert_decompressors`: `compress_certificate` in the
+  CertificateRequest and a decompressor bounded by `max_leaf_len`): BoGo has no server test for it, so parity does not ask.
+  **A built-in zlib / brotli / zstd helper** for server-side compression: the caller picks (`zstd` and `brotli` are modules
+  here, zlib is in std).
+- **Staple parsing** (expiry, matching the leaf) and BoringSSL's server OCSP callback (`ServerOCSPCallback-*`, disabled by
+  rustls too): the caller refreshes the staple; a staple per selected certificate already works through
+  `Config.certificate.select`.
 
 ## Performance
 
-**Measured 2026-10-22** (`zig build bench-tlsserver`, `BENCH_ROUNDS=5`, ReleaseFast, this host
-(Kaby Lake, 4 cores), load average ~2 (a desktop, no other heavy job); ratios by user-mode cycles;
-our side's spread ≤ 3.4 %, the foreign sides' up to 12 % (a second run with 3 rounds gave every
-ratio within ±0.02):
-
-| workload | tlsserver | OpenSSL 3.5.5 libssl | rustls 0.23.43 + aws-lc-rs 1.18.0 | ours / OpenSSL | ours / faster |
-|---|---|---|---|---|---|
-| full handshake, ECDSA P-256, X25519 | 114 µs | 237 µs | 159 µs | 0.49 | 0.72 |
-| full handshake, ECDSA P-256, X25519MLKEM768 | 173 µs | 327 µs | 194 µs | 0.54 | 0.89 |
-| full handshake, RSA-2048 (PSS), X25519 | 716 µs | 794 µs | 715 µs | 0.90 | 0.99 |
-| resumption (psk_dhe_ke, X25519), one ticket | 105 µs | 233 µs | 141 µs | 0.44 | 0.73 |
-| send one 16 KiB record | 4.64 µs | 5.08 µs | 4.63 µs | 0.93 | 1.02 |
-| receive one 16 KiB record | 5.23 µs | 5.94 µs | 6.78 µs | 0.89 | 0.89 |
+Bench: `zig build bench-tlsserver` (`BENCH_ROUNDS` rounds, ReleaseFast; `tools/bench.zig`, `tools/c_bench/foreign_bench.c`,
+`tools/rust_bench`). The card's `**Performance:**` line is the authoritative figure. Workloads: a full handshake with
+ECDSA P-256 over X25519 and over X25519MLKEM768, a full handshake with RSA-2048 (PSS) over X25519, a resumption
+(`psk_dhe_ke`, X25519) with one ticket, and sending and receiving one 16 KiB record; ratios by user-mode cycles.
 
 All TLS_AES_256_GCM_SHA384. The method (`tools/bench.zig`, `tools/c_bench/foreign_bench.c`):
 each side records one session of its own client against its own server in memory, with the
@@ -1090,168 +962,43 @@ resumption. Same certificate and key, signature scheme pinned (`ecdsa_secp256r1_
 `rsa_pss_rsae_sha256`), one stateless ticket per handshake where tickets are on, no session
 cache, OpenSSL's output to a null BIO and its input from a read-only memory BIO. The bulk rows
 replace the connection (a timed replay) every 2048 records on both sides (~1 % of a bulk op).
-What the numbers say: OpenSSL 3's handshake carries ~100 µs that is not the cryptography
-(a resumption, with no signature, costs it as much as a full ECDSA handshake); RSA-2048 is
-dominated by the private-key operation on both sides; the bulk rows are AES-GCM over the
-`aesgcm` module against OpenSSL's assembly, record framing included. The rustls side
+The rustls side
 (`tools/rust_bench`, rustls with only the aws-lc-rs provider) cannot replay — aws-lc draws its
 ECDSA nonces, RSA-PSS salts and ephemeral keys from its own RNG — so each of its handshake ops is
 a fresh rustls client and server in memory with only the server's calls timed (the meter stops
 around the client's work); its bulk rows run on a live connection renewed every 2048 records, the
-renewal's server handshake timed, as on the other sides. The one row at parity, sending, is
-`aesgcm` against aws-lc's AES-GCM assembly. Not measured: ChaCha20-Poly1305 and P-384 rows, small
+renewal's server handshake timed, as on the other sides.Not measured: ChaCha20-Poly1305 and P-384 rows, small
 records (the per-record 4 KiB burn).
 
-**Mutation (whole module, three waves 2026-11-06..07;** schemata in detached copies, ReleaseSafe, strict verdict with the failing test name checked against M0): 1634 mutants (1626 + 8 for the later QUIC `Outbound.write` fix `f9971765`), 1542 killed, 86 equivalent + 6 unobservable, 0 undecided; no defect in wave 3. Wave 3 built test-only rigs: a scripted client (`W3Script`: Certificate/CertificateVerify/Finished, plaintext tickets, its own PSK binders incl. after HRR), `Connection` driven over the recorded interop sessions with injected client-sealed records and QUIC frame-by-frame replay, partial-write and buffer-swapping transports, misbehaving ticketers, RSA-1024 and corrupted-CRT keys, a 16384-octet padded leaf (table2's "cannot be built" note was wrong), a worst-case first flight (HRR + SecP384r1MLKEM1024 + 255-octet ALPN + 64-octet records; ≥ 240 octets of room past `alert_reserve`), an anchor → intermediate → leaf client chain (`client_chain_certs.zig`, `tools/client_certs.py --chain`; the default fixture stays byte-identical because the recorded mTLS/RPK sessions carry it), and ReleaseFast stack probes for `Server.deserialize` and `ech.openFirst` (531 — the ECH private key wipe — killed on a plain build). Four wave-1/2 mutants (973, 1285, 1414, 1498: `S384`→`S256` in a type position) never ran because `mut()` is false at comptime; rewritten as call-level swaps and killed. Equivalent (invariant per id in table3): duplicated exporter checks in tls13 (1108, 1110), `installTx` cannot fail (1427, 1459), GREASE above 0x0304 (1327), unused QUIC inbound key (1433), write-once defaults (1355, 1358, 1304, 1305), no QUIC write slot (1166), subsumed checks (1269, 1633), unread `tickets_due` (1541), padding-only difference (1006), reader/writer no-ops (731, 740, 744), `Outbound.slot` and first-flight size bounds with measured slack (916, 926, 927). Unobservable: burn mutants 59, 60, 661, 1045, 1210, 1218 — the probe stays green without the burn and no red control shows it sees that frame.
-
-**Mutation + review (2026-11-12, whole module, strict re-run,** production code of all 13 files (`server.zig` to its test section at ~3580, `connection.zig`, `keys.zig`, `inbound.zig`, `ech.zig`, `hello.zig`, `record.zig`, `messages.zig`, `clientauth.zig`, `outbound.zig`, `fingerprint.zig`, `delegated.zig`, `alert.zig`); production code unchanged since 2026-11-06; schemata in detached copies, ReleaseSafe + ReleaseFast, plain single-mutation ReleaseFast builds for burn/wipe mutants, strict verdict): 1751 mutants, 1649 killed, 94 equivalent + 8 unobservable, 0 undecided, no defect. Two corrections to the 2026-11-06..07 run: it never mutated `Server.onClientHello`'s validation and negotiation (~2593–2700: SNI, legacy_version, version/suite/group choice, QUIC and retry checks), `CertifiedKey.check`, `firstUsableKey`, the strike-register and session-cache adapters, the ECH AEAD arms or ML-DSA key loading — 121 mutants added here, 22 survived and were closed; and about 30 of its "killed" verdicts survive under the strict verdict (rc ≠ 0 with a failure M0 lacks), most now killed. New tests: strike register OOM refuses; `CacheTicketer` sealing into exactly `cache_id_len`; `minOutputLen` counts the ticket client leaf; only the first 32 PSK identities are read; unparseable ClientHello outer/inner gives `decode_error` vs `illegal_parameter`; ECH offers sealed with AES-256-GCM and ChaCha20-Poly1305 and in backend mode; legacy_version 0x0301; a one-octet QUIC session id refused and QUIC JA4 starting with `q`; a second compatibility CCS after HRR and no third; ticket early_data only for a non-zero max size; ECHConfig trailing octets; `ecMatches` KeyMismatch for an RSA SPKI, a P-384 key against a P-256 cert and an EC SPKI without named-curve parameters; read after close_notify; reader rebase; QUIC `installRx` installs no key; no early-data skip while a handshake message is half held; `writeAll` seals what `writer()` holds first; `keyUpdate` into an output that cannot hold it is `OutputFull`; a Certificate that does not fit is `OutputFull` at every output size; stack probes after `provideSignature` and after `serialize` (distinct-byte blob key as needle). Equivalent (new): `isDnsName`'s empty body, `firstFlightLen` OCSP slack, `sign_cert = null` read only in `.server_signature`, a fully overwritten `serializeBody` memset, `app_data_ok` refusing CCS before `ccs_left`, `SessionCache.find`'s id length, a zero-length compression list refused earlier, `certificateMessage`'s FieldTooLong/InvalidStaples mapping (`ck.check()` refuses them at the ClientHello), the `own` wipe in `fromPem` (the ML-DSA expansion runs inside a 448 KiB burn; the plain-build probe finds no K). Unobservable: six burn mutants as before, and the `handshake_burn` drops in `completeSignature` and `serializeBody` (no needle survives in the frame layout; the residue check reads 5.7 KiB of public data). Cut: test helpers in the production files, `unreachable` arms and accessors, comptime initialisers (their use sites are mutated), constant-time paths (ctgrind's).
-
-**Mutation (2026-11-15, delta over `2810fced1`,** `Config.record_burn`, `Config.server_suite_order` and the vector-`zeroize` `Protection.wipe`; 22 mutants, 22 killed, 0 equivalent, 0 undecided, no defect; the whole-module total is now 1773 mutants, 1671 killed, 102 equivalent + unobservable). 20 schemata over `inbound`, `outbound`, `record` and `server` (one ReleaseSafe binary, `TLSD_MUT=n`, strict verdict: the failing test differs from the baseline, which passes), 2 plain single-mutation ReleaseFast builds for the comptime field defaults, and ReleaseFast builds for the burn mutants, because the stack probes only run in ReleaseFast. Per condition: `installRx` / `installTx` copying `record_burn` into the protection (dropped, flipped; killed by `server.test.record_burn: Config reaches both directions' protections`); `Server.init` handing `config.record_burn` to each direction (dropped, flipped, both); `chooseSuite`'s `server_order or server_suite_order` (each operand dropped; killed by the `server_order` and `server_suite_order` tests); `init` resetting `burn_records` (dropped; the new test re-keys after clearing it); `Protection.wipe` (skipped, one byte short; killed by the `Server.deinit` wipe tests); `seal` / `open` choosing the unburned path (flipped, always unburned, never unburned) — six mutants whose verdict needs ReleaseFast and the burn-off stack probe; the field defaults `Config.record_burn` and `Config.server_suite_order` flipped (one build, killed by the `dflt` check). Three survivors, each a missing test: `initKeyIv` not resetting `burn_records` (the `init` test now clears the flag and re-keys with `initKeyIv` too); `open` always burning (the burn-off stack probe covered `seal` only; it now seals a record, opens it with the burn off and expects `DeadStackResidue`, then opens with it on and expects clean); `Inbound.record_burn` / `Outbound.record_burn` defaulting to false (`Server.init` always overwrites them, so only a direct `Inbound` / `Outbound` user saw it; new tests `record_burn: installRx` / `installTx` hand the flag to the protection, default on; the two defaults ran as one build, both failing tests are theirs). The schemata run's first verdict column also printed `panic` for ten mutants, matched in test names (`…not an arithmetic panic`); the failing-test lines were read instead. Cut: `Protection.burn_records`'s own default (every path to a `Protection` goes through `init` / `initKeyIv`, which set it), doc comments, `stackprobe_test` helpers.
-
 ## Backlog / deferred
-- **2026-11-07 (mutation wave 3):** `burn.zig` still says ML-DSA-65 expansion reaches 553 KiB, yet with `mlDsaExpand`'s burn removed the `fromPem` probe stays green — re-measure the burn sizes; a probe that can see those frames would decide the 6 unobservable burn mutants.
 
-- **`Config.check()`** (no-panic sweep 2026-10-28, F13): a config the server accepts but cannot
-  serve fails per handshake with `InternalError` — a group `kex` does not compute (an HRR for it
-  first), an empty `ClientAuth.schemes`, `Quic.transport_parameters` or `authorities` over 64 KiB,
-  a `compressed_certificates` mismatch. One up-front check would refuse them at `init`.
-- **Stack requirement of a handshake** (sweep F16): hybrid/ML-KEM kex plus the burns is ~250 KiB
-  and more; state it for fiber and thread-pool users (`tls13` has the same backlog item).
-- **`Connection.reader()` and std's delimiter helpers** (sweep F15): on a fresh connection
-  `takeDelimiterInclusive` returns `StreamTooLong` through std's failing-writer path (no panic);
-  document or prefill.
-- **Clock arithmetic in `tlsresume`** (sweep F14): `now_ms - session.issued_at_ms` traps on an
-  extreme caller clock; `tlsserver`'s own two subtractions saturate now.
-
-- **Review leftovers (2026-10-21, LOW/INFO, kept):** `signature_algorithms` required (and
-  `handshake_failure` without it) even on a ClientHello that resumes; the second ClientHello
-  not compared with the first in `random`, `legacy_session_id`, suites, ALPN; `close()`
-  before the ClientHello still lets a later ClientHello get a flight; `commitWrite`/
-  `discardOutput` past their bounds are caller-contract asserts only.
-- **M1 closed 2026-10-20:** secp384r1 and P-384 certificates; the key loader; interop with the
-  Go client and `tlsclient`; the `tlsserver-server` fuzz harness; the BoGo shim (130 pass).
-- **M4 step 1 (2026-10-21): ML-KEM-1024, P-521 and ML-DSA** — 16 of the 49 gaps closed (BoGo
-  359/0, parity 267 of 436, 33 gaps). ML-DSA-65/87 client leaves (5.5-7.5 KB): the owner chose
-  (2026-10-21) a caller-supplied leaf buffer over a larger constant cap — done in M4 step 2
-  (`ClientAuth.max_leaf_len`, `Server.setPeerBuffer`). The ML-DSA AlgorithmIdentifier's absent
-  parameters are checked for the private key, not for a client leaf (`x509.Spki` does not
-  expose them).
-- **M4 step 3 (2026-10-21): RFC 8879 certificate compression, server side** — BoGo 370/0,
-  parity 278 of 436, 27 gaps (0-RTT only). The caller compresses the Certificate message ahead of
-  time (`CertifiedKey.uncompressedCertificate(out, staples)` → any compressor →
-  `CertifiedKey.compressed_certificates`, in its order of preference, one entry per algorithm and
-  per set of staples); the handshake sends the first one whose algorithm the client offers and
-  whose staples are the ones this handshake sends, else the Certificate uncompressed. No
-  compressor runs in the handshake and the module gains no dependency (rustls compresses per
-  handshake behind a small cache; BoringSSL per handshake). `check` refuses an entry whose
-  `uncompressed_len` no longer matches (`CompressedStale`), but a same-length change (a refreshed
-  OCSP staple usually is one) is not seen: the caller compresses again whenever it replaces the
-  chain or a staple (review 2026-10-21, MEDIUM, documented rather than hashed per handshake; a
-  digest of the body in each entry, checked at load time, is the backlog option). Interop: OpenSSL
-  3.5 `s_client` decompresses a std-zlib one (`cert-comp-zlib`, 52 recorded sessions); the BoGo
-  shim installs BoringSSL's three mock algorithms. **Not done:** compressed *client*
-  certificates (rustls `ServerConfig::cert_decompressors`: `compress_certificate` in the
-  CertificateRequest and a decompressor bounded by `max_leaf_len`) — BoGo has no server test for
-  it, so parity does not ask; a built-in zlib/brotli/zstd helper (the caller picks; `zstd` and
-  `brotli` are modules here, zlib is in std).
-- **M4 step 4 (2026-10-21): 0-RTT early data** — BoGo 400/0, parity 304 of 436, one gap left
-  (`ExportKeyingMaterial-Server-HalfRTT`: the exporter). OpenSSL `s_client -early_data` interop
-  (`early-new`, `early`, `early-refused`; 55 recorded sessions), replayed byte-exact; a replay of
-  the recorded 0-RTT ClientHello is refused (`replayed`). Not done: early exporters
-  (`early_exporter_master_secret`), a guard shared across threads (the caller's lock).
-  Review 2026-10-21 (Sonnet): no HIGH; fixed: the HRR path's skip budget (`skipBudget`), the
-  claimed identity during early data documented, the guard window (2 × skew + 1 s) and scope,
-  the guard asked only after the key exchange. Accepted: the skip budget counts ciphertext (many
-  tiny refused records can exceed it, as with rustls); empty early records cost nothing (a
-  binder is needed first); a server KeyUpdate at 2^23 records could fall before the client's
-  Finished (not reachable in practice).
-- **M4 step 5 (2026-10-21): the exporter** (RFC 8446 §7.5, `Server.exportKeyingMaterial`) — BoGo
-  401/0, rustls parity 305 of 436 with **no gap left** (`ExportKeyingMaterial-Server-HalfRTT`).
-  The shim taking `-export-keying-material` unhid BoringSSL's TLS 1.0–1.2 cipher-suite tests
-  (`TLS-TLS1x-<suite>-server`, the version as an infix): disabled precisely in `config.json`.
-  Interop: `s_client -keymatexport` (`exporter`, `exporter-chacha`) and Go
-  `ExportKeyingMaterial` (`go-exporter`) print the server's octets; the recorded value is checked
-  in the replay (58 recorded sessions). Every `tlsclient` handshake test compares both sides'
-  exports (with and without a context, the longest output), and refuses one before the client's
-  Finished. tls13: KATs from an independent Python reimplementation, a dead-stack probe
-  (negative control: without the burn it finds the label's secret). Not done: the early exporter.
-- **rustls parity gaps (2026-10-20, 49 tests, `--bogo` prints them as `GAP`):** 0-RTT (27:
-  `EarlyData-*`, `TLS13-MaxEarlyData-*`, `TLS13-TicketAgeSkew-*-60-*`, EndOfEarlyData) and
-  certificate compression (6, RFC 8879) are M4; P-521 and ML-DSA server keys (12:
-  `Server-Sign*-ECDSA_P521_SHA512`, `Server-Sign*-ML-DSA-*`; zig-libs has `p521` and an ML-DSA
-  module would be needed in `tls13.certverify`) and standalone ML-KEM-1024 as a group (4,
-  `CurveTest-*-MLKEM1024`, `tls13.kex`) are not scheduled yet. The owed list is
-  re-derived with `tools/bogo/rustls_parity.py` when the rustls reference moves (it takes
-  about 4 minutes).
-- **Second ClientHello unchanged (2026-10-21, tlsfuzzer `test-tls13-shuffled-extentions`, 17):**
-  RFC 8446 §4.1.2 has the client resend the same ClientHello after a HelloRetryRequest but for
-  the listed changes; only the suite, the group's share, SNI and early_data are compared now
-  (rustls compares less). A comparison of the first hello's other extensions (kept as a hash
-  of their octets) would refuse a reordered or altered one with `illegal_parameter`.
-- **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
-  `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
-  `x509/SPEC.md` § Backlog).
-- **M2:** ~~HRR~~ (step 1, 2026-10-20), ~~KeyUpdate~~ (step 2, 2026-10-20), ~~NewSessionTicket and resumption through `tlsresume`~~ (step 3, 2026-10-20), ~~mTLS through
-  `x509.verifyChain`~~ (step 4, 2026-10-20), ~~OCSP stapling~~ (step 5, 2026-10-20, with SCT
-  lists). Later for stapling: a staple per selected certificate already works through
-  `Config.certificate.select`; BoringSSL's server OCSP callback (`ServerOCSPCallback-*`, disabled
-  by rustls too) and parsing the staple (expiry, matching the leaf) are not done — the caller
-  refreshes it.
-  `CertifiedKey.check` runs right after certificate selection, before the signature scheme is
-  matched: a misconfigured key is `internal_error` even for a client that could not have used it
-  (configuration errors first). After a HelloRetryRequest the second ClientHello's
-  `status_request` / `signed_certificate_timestamp` decide (as in rustls; RFC 8446 §4.1.2 would
-  have them unchanged — only the SNI is compared).
-- **Client certificates, later:** raw public keys (RFC 7250, rustls has them), the whole client
-  chain kept for the application (rustls `peer_certificates`; here the leaf), P-521 and ML-DSA
-  client keys (with `tls13.certverify`), post-handshake authentication (not in rustls either). **M3:** the differential run against the fork and
-  the web-server consumer on a branch; the seams are in (2026-10-21: one send buffer, `Connection.reader()`/`writer()`
-  in place, `Server.writeSlot`/`commitWrite`; the fork's atomics are not needed — the web-server consumer reads and
-  writes a connection from one fiber, and the rekey bound is `max_records_per_key`, 2^23 as the web-server consumer's);
-  the curve arithmetic moved to `ct25519`/`p256`/`p384` on 2026-10-21 (through `tls13`).
-  Server-side handshakes per second, replayed recordings (`TLSSERVER_BENCH`, ReleaseFast, one
-  core, this host, best of 5 × 0.4 s): P-256 certificate + X25519 + TLS_AES_256_GCM_SHA384 2,012
-  → 6,705; X25519MLKEM768 1,825 → 4,788; P-384 certificate 506 → 1,832; Ed25519 3,036 → 3,491;
-  RSA-2048 1,124 → 1,202; resumption 4,480 → 5,496. Not a P-axis number (that is the in-memory
-  harness against OpenSSL libssl, M4).
-  **M4:** rustls scope (0-RTT, ~~certificate compression~~ step 3), ctgrind, mutation, independent review.
+- **`burn.zig` ML-DSA-65 size.** `burn.zig` says ML-DSA-65 expansion reaches 553 KiB, yet with `mlDsaExpand`'s burn removed the
+  `fromPem` probe stays green: re-measure the burn sizes. A probe that can see those frames would decide the burn mutants that
+  are unobservable today.
+- **`Config.check()`.** A config the server accepts but cannot serve fails per handshake with `InternalError` — a group `kex`
+  does not compute (an HRR for it first), an empty `ClientAuth.schemes`, `Quic.transport_parameters` or `authorities` over
+  64 KiB, a `compressed_certificates` mismatch. One up-front check would refuse them at `init`.
+- **`Connection.reader()` and std's delimiter helpers.** On a fresh connection `takeDelimiterInclusive` returns
+  `StreamTooLong` through std's failing-writer path (no panic); document or prefill.
+- **Clock arithmetic in `tlsresume`.** `now_ms - session.issued_at_ms` traps on an extreme caller clock; `tlsserver`'s own two
+  subtractions saturate.
+- **Second ClientHello unchanged.** RFC 8446 §4.1.2 has the client resend the same ClientHello after a HelloRetryRequest but for
+  the listed changes; only the suite, the group's share, SNI and `early_data` are compared (rustls compares less). Comparing the
+  first hello's other extensions (kept as a hash of their octets) would refuse a reordered or altered one with
+  `illegal_parameter` (tlsfuzzer `test-tls13-shuffled-extentions`).
+- **Key loading.** Encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys: `fromPemEncrypted`); a private-key reader shared
+  with `acme` (request filed in `x509/SPEC.md` § Backlog).
+- **The whole client chain for the application** (rustls `peer_certificates`; here the leaf only).
+- **ML-DSA client leaf.** The AlgorithmIdentifier's absent parameters are checked for the private key, not for a client leaf
+  (`x509.Spki` does not expose them).
+- **JA4 differential check** against Wireshark's JA4 field (`tshark` is not installed on the development host).
+- **Ticket count request** (RFC 9149).
 
 ## Open
 
-- KeyUpdate review 2026-10-20 (Sonnet, read-only): no HIGH or MEDIUM; four LOWs fixed the same
-  day (see CHANGELOG). Accepted as rustls does: an empty application-data record resets the
-  KeyUpdate count, so a peer may alternate 32 KeyUpdates and an empty record (one HKDF and two
-  key setups per 27 octets it sends; replies stay bounded, one at a time). The KeyUpdate path
-  holds only pointers in its own frames (HKDF and record setup burn their own) and is not yet
-  in the stack probe.
+- The KeyUpdate path holds only pointers in its own frames (HKDF and record setup burn their own) and is not in the stack probe.
+- `tlsserver-server` drives `Server` only through recorded clients (plus the resealed Finished); a model client that builds
+  ClientHellos from fields, as `tlsserver-hello` does, is not there.
+- The cost of the per-record 4 KiB burn on small records is not measured (the bulk rows against OpenSSL libssl are 16 KiB
+  records, *Performance*).
 
-- Client-certificate review 2026-10-20 (Sonnet, read-only): no HIGH. MEDIUM fixed: re-issued
-  tickets kept a certificate alive indefinitely (now bounded by the lifetime from its proof).
-  LOWs fixed: an unknown revocation status is `certificate_unknown` (rustls); the shim's
-  lingering close is bounded in time; a failed handshake clears the identity; `ClientAuth.schemes`
-  precondition documented. Accepted: the leaf's key and keyUsage are checked before the verifier
-  (BoringSSL's order; rustls verifies first, so an untrusted unusable leaf gets
-  `unsupported_certificate` here, `unknown_ca` there); a chain signature that does not verify is
-  `bad_certificate` (rustls: `decrypt_error`); 4 KiB of `peer_buf` per `Server` (gone
-  2026-10-21: the caller's buffer, only under client authentication).
-
-- `burn.handshake_burn` (16 KiB around each handshake step) is measured since 2026-10-21: a
-  stack probe in `src/interop_replay_test.zig` replays recorded handshakes (full, hybrid, HRR,
-  resumed, mTLS, RSA, P-384, Ed25519) through `Connection.handshake` in ReleaseFast; the steps
-  reach 10.2 KiB below the burn. Its first run failed: the steps reached 3 KiB past the then
-  32 KiB burn, because `onClientHello` held two 8 KiB duplicate bitsets (extension types in the
-  inlined ClientHello parse, key-share groups) — both out of line now. The client Certificate
-  and CertificateVerify steps run unburned (they touch no secret; their verifier frames reach
-  ~190 KiB down), so the mTLS cases are probed for needles only (`Expect.residue = false`).
-- `tlsserver-server` drives `Server` only through recorded clients (plus resealed Finished);
-  a model client that builds ClientHellos from fields (as `tlsserver-hello` does) is not there.
-- Independent read-only review 2026-10-20 (Sonnet, of server/inbound/outbound): no HIGH; the
-  MEDIUM (KeyUpdate / AEAD limit) closed by M2 step 2; LOWs fixed the same day
-  (`cipherSuite` before a suite was chosen, secrets kept after a failure, two compatibility CCS
-  with one ClientHello, every kex error as `illegal_parameter`, an unknown enabled suite) or
-  accepted: the 0-RTT skip budget of 2^14 octets cannot skip a full-size early record (rustls has
-  the same budget).
-
-- No ctgrind row and no audit or mutation run yet; the record layer is new code.
-- The cost of the per-record 4 KiB burn on small records is not measured (the bulk rows against
-  OpenSSL libssl are 16 KiB records, § Performance).

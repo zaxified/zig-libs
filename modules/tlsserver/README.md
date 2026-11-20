@@ -2,7 +2,7 @@
 
 A TLS 1.3 server (RFC 8446) for the collection: a buffer-driven (sans-I/O) core with a blocking
 wrapper on top, built on the `tls13` handshake building blocks and the `aesgcm` / `chachapoly`
-AEADs. At rustls's server scope (re-surveyed 2026-10-22, grade 2): a full (EC)DHE handshake with
+AEADs. At rustls's server scope: a full (EC)DHE handshake with
 a certificate — TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256;
 X25519MLKEM768, X25519, secp256r1, secp384r1 (and ML-KEM-1024 when enabled); ECDSA
 P-256/P-384/P-521, Ed25519, RSA-PSS and ML-DSA-44/65/87 certificates or RFC 7250 raw public
@@ -13,15 +13,16 @@ OCSP and SCT stapling; RFC 8879 certificate compression (precompressed by the ca
 RFC 8446 §7.5 exporter; kTLS secret hand-over (`extractSecrets`); and a QUIC mode (RFC 9001,
 `Config.quic`: CRYPTO data and traffic secrets per encryption level). Sans-I/O (`Server`) or
 blocking (`Connection`), certificate and key from PEM (`keys`). The rustls parity gate runs
-with BoGo: the 305 TLS 1.3 server tests rustls passes that apply all pass here (131 more are
-disabled with a reason, 0 gaps; `SPEC.md`).
+with BoGo: every TLS 1.3 server test rustls passes that applies passes here, with no gap (the
+rest are disabled with a reason; `SPEC.md`).
 
 - **Status:** the collection's TLS 1.3 server (with `tlsclient` and `dtls`); the web-server consumer runs it behind
   `-Dtls-engine=tlsserver` while its fork of a third-party server is still the default.
 - **Model after:** RFC 8446; rustls `ServerConnection` for scope and the buffer-driven split.
 - **Platform:** any (pure computation; `Connection` uses std.Io). **Role:** server.
-  **Concurrency:** single owner. **Deps:** `tls13`, `aesgcm`, `chachapoly`, `netaddr`,
-  `x509`, `rsa`, `b64ct`, `tlsresume`.
+  **Concurrency:** single owner; with a `Connection.Guard`, one reader and serialised writers on
+  fibers of one thread (`src/connection.zig`), never across threads. **Deps:** `tls13`, `aesgcm`,
+  `chachapoly`, `netaddr`, `x509`, `rsa`, `keycodec`, `tlsresume`, `p521`, `hpke`.
 
 ## Usage
 
@@ -56,7 +57,8 @@ const body = try ck.uncompressedCertificate(&body_buf, .{});
 const zlib_data = try zlibCompress(gpa, body); // e.g. std.compress.flate, `.zlib`
 var compressed_ck = ck;
 compressed_ck.compressed_certificates = &.{.{ .algorithm = 1, .uncompressed_len = @intCast(body.len), .data = zlib_data }};
-try compressed_ck.check(); // compress again whenever the chain or a staple is replaced
+try compressed_ck.check(); // compress again whenever the chain or a staple is replaced;
+                           // an entry's `.digest` makes check() refuse a stale one of the same length
 
 // Per connection: a joiner, a reader whose buffer holds one whole record
 // (`record.max_record_len`), and a stream writer (a socket's) whose buffer
@@ -74,21 +76,32 @@ The record layer alone (`tlsserver.record.Protection`: `init` from a traffic sec
 A failed `open` (`BadRecordMac`, …) leaves the sequence number unchanged and the ciphertext
 zeroed; the engine answers it with the matching alert.
 
+**Stack:** `fromPem` wants ~110 KiB (more for RSA, up to 1.3 MiB for ML-DSA keys) and a handshake
+with ML-KEM-1024 or an ML-DSA-87 signature up to 256 / 352 KiB under the zeroing burns, so size a
+small-stack thread or fiber for the keys and groups it enables (`SPEC.md` § Limits and refusals).
+
 ## Tests
 
 `zig build test-tlsserver`. Anchors (`SPEC.md` § Anchoring): RFC 8448's records, ClientHellos
 and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls client sessions
 (`zig build interop-tlsserver`, replayed byte-exact in the tests); BoringSSL's BoGo suite
-(`-- --bogo`, 370 pass, with the rustls parity report); tlsfuzzer's TLS 1.3 scripts
+(`-- --bogo`, with the rustls parity report); tlsfuzzer's TLS 1.3 scripts
 (`-- --tlsfuzzer DIR`, a checkout such as the web-server consumer's `scripts/tools/tlsfuzzer`; counts held in
 `tools/tlsfuzzer/baseline.tsv`); handshakes against Zig std's
 client and the collection's `tlsclient`; keys in every PEM form
 the OpenSSL command line writes (`tools/key_vectors.py`). Fuzz: `TLSSERVER_FUZZ=<runs>` drives
-the `tlsserver-record`, `-inbound`, `-hello`, `-keys`, `-server`, `-keyupdate` and
-`-clientauth` harnesses (`SPEC.md` § Fuzzing). Dead
+the `tlsserver-record`, `-inbound`, `-hello`, `-keys`, `-server`, `-keyupdate`,
+`-clientauth`, `-ech` and `-quic` harnesses (`SPEC.md` § Fuzzing). Dead
 stack: `src/stackprobe_test.zig` (ReleaseFast). Example: `zig build run-example-tlsserver`.
 
 Provenance: clean-room from RFC 8446 (a public standard), no third-party source ported or
-studied, so no `NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0). The test vectors
+studied, so the module has no `NOTICE` entry. The test vectors
 are RFC 8448's and OpenSSL's output (via Python `cryptography`). tlsfuzzer (GPL-2.0) is only
 run against the server as an external oracle, never copied or linked.
+
+## Not provided
+
+TLS 1.2 and earlier and DTLS (the `dtls` module), kTLS itself (the record keys can be handed over),
+post-handshake client authentication, PSK without (EC)DHE and external PSKs, the early exporter,
+compressed client certificates and a built-in certificate compressor, ECH split mode: see `SPEC.md`
+under *What is deliberately not done* and *Backlog / deferred*.
