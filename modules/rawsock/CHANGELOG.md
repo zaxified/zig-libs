@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-04** — **behaviour:** `Block.nextPacket` after `BadBlock` is null; before, a chain error let the next calls hand out a packet of that block, a header error repeated for ever. Dead first-pass branch in `vlan` deleted, stale comments fixed, `pcapng.Record.orig_len` and `Reader.order` documented, stack margin on the card.
 
 - **2026-11-04** — delta audit of the grade-2 code (190 mutants over `filter.zig`, `ring.zig`, `pcapng.zig`; 68 survived the existing suite, 53 of them are now killed by 16 new tests and 15 are argued equivalent): the `Scratch` allocator's owner-following `resize`/`remap`, the vlan re-parse freeing a spilled first arena, spines of 1..20 chain links around the on-stack buffer, jumps of exactly 255/256 on both sides and a 4096-instruction program, offset/prefix/octet limits, the ancillary window edges, the scratch-slot 16 and short-load drops in `run`, `Block` header limits at their exact values (empty block, header-only packet, packed back to back, next header at the block's end, a stray `next_off`), a sticky ring failure, and the pcapng framing, option, resolution and Simple/obsolete Packet Block limits. Tests only; no production change.
@@ -35,19 +34,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-11-03** — **CONSUMER-VISIBLE (additive; one stricter behaviour):** grade-2 pass. `filter.compile` gains IPv6 `host`/`net`, bare `host`/`net`, `arp`/`rarp host`, `portrange`, `less`/`greater`/`len`, `broadcast`/`multicast` and offset expressions `ether|ip|ip6|arp|rarp|tcp|udp|icmp|sctp[off:size] & mask RELOP n` (previously `UnsupportedExpression`; no error set changed). New `rawsock.pcapng` (reader and writer). `filter.run` is rewritten as one switch over the opcode (2.2x to 1.05x libpcap's interpreter): it now drops a frame on an opcode the kernel would refuse at attach time (`ret` with the X source, `ldx` from the packet, `ld` size with `imm`, ...) where it used to execute a lenient reading; a scratch slot nothing stored to still reads 0. Tests: 100-expression tcpdump oracle on a 30-frame corpus, pcapng fixtures from `editcap`, fuzz harnesses for filter/pcap/pcapng, sweep tests; tools: `bench.zig` + `c_bench.c` (vs libpcap), `gen_filter_oracle.py`, `gen_pcapng_fixtures.py`; `interop-rawsock` also checks the interface lookups against `ip`.
 
-- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GS sweep: 32/36 + 4 eq; 3 new killing tests (gen depth cap exactly 512/513 on every edge kind, parser leaf cap 4096/4097, an exact-fit auxdata cmsg record).
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GS). `filter.compile` no longer overflows the stack on a long `a and a and …` chain (parser leaf cap at `max_insns` and a code-generator depth cap of 512 → `FilterTooComplex`; a too-long input with a later syntax error now reports `FilterTooComplex`); `filter.run` jump arithmetic saturates (32-bit); cmsg scanners total on a huge `cmsg_len`; `pcap.Reader.next` total on a hand-set `pos`; an interface name containing NUL is `NoSuchInterface`. Docs: `Reader.next` does not check `orig_len >= incl_len`; a persistent `RecvFailed` must not be retried in a tight loop. Tests: `src/sweep_test.zig`.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. ifreq union-bytes `@bitCast` of `[N]u8` <-> int replaced by `std.mem.toBytes`/`bytesToValue` (native memory order, as the kernel ABI). Also: comptime `strRepeat` helper quota raised.
 - **2026-10-09** — tests: deterministic fuzz driver `RAWSOCK_FUZZ` over the existing harnesses (Ethernet header,
   hardware address, ARP reply).
 
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig` (`unshare -rn zig build interop-rawsock`)
-  asks the Linux kernel "who-has" over a veth pair through this module's own socket and ARP builder, and
-  the kernel answers; the request and reply are frozen (`src/testdata/kernel_arp.zig`) and replayed without
-  privileges: `arp.buildRequest` must build the request the kernel answered, `arp.parseReply` must read
-  the kernel's reply. No defect.
 
 - **2026-10-04** — mvp → core (survey 2026-09-30 backlog items 1–4 except the ring). ADDED
   `rawsock.filter`: `compile` (a pcap-filter(7) subset — `ip`/`ip6`/`arp`/`icmp`/`tcp`/`udp`/
@@ -63,28 +55,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   killed at once, 4 killed by new tests, 2 equivalent (removed: a dead step guard in `run`, a
   redundant empty-octet check in the IPv4 parser).
 
-- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1/rawsock.md F12's last surviving
-  mutant (m33, `setPromisc(false)` never actually issuing `DROP_MEMBERSHIP`) gets a
-  permanent regression test. The prior measurement attempt checked the wrong kernel
-  observable (`IFF_PROMISC` via `SIOCGIFFLAGS`, which `dev_get_flags()` derives from
-  `dev->gflags` and which a `PACKET_MR_PROMISC` membership never touches, on any kernel,
-  in any namespace — not a privilege gap). The right one, `dev->promiscuity`
-  (`IFLA_PROMISCUITY` via `RTM_GETLINK`), moves under the standard `unshare -rn`-style
-  recipe this campaign already uses, no VM required. New test-only `ifacePromiscuity()`
-  helper (hand-rolled `RTM_GETLINK` query, same no-external-dependency style as the rest of
-  the module); `scripts/vm/run.sh` gets a `rawsock` `guest_setup` entry creating a `dummy`
-  device (`rstest0`) so the VM lane exercises a real netdevice, not just `lo`. F12 closed.
-- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1/rawsock.md F12's two-gate mutation
-  runner (`A1/repro/rawsock/mut/mutate.py`, host `zig test` lane + `unshare -rn` netns lane,
-  36 mutations) ported into `modules/rawsock/tools/mutate.py` per CONVENTIONS.md #9 (a
-  foreign-toolchain instrument belongs beside the module it checks, not in the audit tree).
-  Mutation table and classification logic byte-identical to the original; 3 of 36 patterns
-  had drifted from source changes since the audit (F13's `setRcvTimeout` error-checking, a
-  variable rename, F4's filter-ordering change) and were updated to the current shape with
-  the same mutation intent, then re-verified against the tree (36/36 patterns match, no
-  accidental no-ops). Not executed this session (raw `zig test`/`unshare` calls are outside
-  this campaign's modtest-only gate) -- F12 itself stays open until someone runs it and adds
-  permanent tests for the surviving mutations.
 - **2026-09-10** — A1 fix campaign, second-pass fix queue (no consumers in-repo, P1
   applies): three more of the audit's sixteen findings closed (fourteen of sixteen total).
   **New, additive:** `Socket.open`'s `Options.filter` — a classic-BPF program attached as
