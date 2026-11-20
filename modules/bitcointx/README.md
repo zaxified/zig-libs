@@ -66,10 +66,11 @@ Implemented — see `SPEC.md` for the full design/threat-model writeup:
   Bitcoin Core's `PrecomputedTransactionData` behaves the same way; detecting mutation would mean
   re-hashing the transaction on every call, i.e. paying back exactly what the cache saves.
 
-Deliberately deferred (structurally noted, not half-built — SPEC.md has the full rationale): BIP342
-tapscript signature hashing itself (the message layout is shared, the tapscript semantics live in
-`bitcoinscript`), and annex support in the *key-path* sighash (the plumbing exists via
-`CommonOptions.annex_hash`; only the key-path caller does not use it).
+## Not provided
+
+BIP342 tapscript signature hashing itself (the message layout is shared via `CommonOptions`; the tapscript
+semantics live in `bitcoinscript`), Bitcoin Script interpretation, and `Amount`/`LockTime` types. SPEC.md,
+*What is deliberately not done* and *Backlog / deferred*, has the reasons and the one open item.
 
 ## Use
 

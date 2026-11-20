@@ -30,12 +30,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [bitcoinjs/bitcoinjs-lib](https://github.com/bitcoinjs/bitcoinjs-lib) | JavaScript | MIT | 6.0k | v7.0.1 (tag; push 2026-02-17) | `Transaction` with `weight()`/`virtualSize()`, `hashForSignature/Witness/WitnessV1` *(inferred)*. |
 | [zig-bitcoin/bitcoin-primitives, zig-bitcoin/btczee](https://github.com/zig-bitcoin/bitcoin-primitives) | Zig | MIT | 19 / 70 | 2024-09 / 2024-10 | Zig Bitcoin primitives and a node experiment; last pushed in 2024; not surveyed in depth *(inferred)*. Zig `std` has no Bitcoin transaction code. |
 
-**Where we are ahead:** every deployed sighash (legacy incl. the SIGHASH_SINGLE bug, BIP143, BIP341) is byte-exact against Core's full `sighash.json` (500 rows), BIP143/BIP341 vectors and 213 real transactions; a `PrecomputedTransactionData` that turns quadratic validation linear; zero-copy hostile-input-safe parsing. Tapscript (ext_flag=1) sighash lives in the sibling `bitcoinscript` (`tapscript.sigMsg`/`sighash`), so it is covered, not missing. **Where we are behind:** no `weight()`/`vsize()`/coinbase helpers (`rg -i 'vsize|weight|coinbase' src/` finds none), no block merkle-root helper, borrowed-slice `Transaction` makes building one caller work, no `Amount`/`LockTime` types.
+**Where we are ahead:** every deployed sighash (legacy incl. the SIGHASH_SINGLE bug, BIP143, BIP341) is byte-exact against Core's full `sighash.json` (500 rows), BIP143/BIP341 vectors and 213 real transactions; a `PrecomputedTransactionData` that turns quadratic validation linear; zero-copy hostile-input-safe parsing. Tapscript (ext_flag=1) sighash lives in the sibling `bitcoinscript` (`tapscript.sigMsg`/`sighash`), so it is covered, not missing. **Where we are behind:** borrowed-slice `Transaction` makes building one caller work, no `Amount`/`LockTime` types.
 
 ## Design & invariants
 
 Pure codec + pure computation, no I/O, no allocation beyond what the caller's `Allocator`
-provides. Five files:
+provides. Source files:
 
 - `tx.zig` — CompactSize (Bitcoin's varint) encode/decode, and `Transaction`/`TxIn`/`TxOut`/
   `Witness` (de)serialization for both the legacy and BIP144 segwit wire forms. **Zero-copy**:
@@ -70,6 +70,7 @@ provides. Five files:
   Bitcoin Core's struct, which carries no check at all. A content hash would catch it and would
   cost per call exactly the `O(n)` this cache exists to remove, so the limit is documented and
   asserted (the F12 test) rather than engineered away.
+- `merkle.zig` — block Merkle roots and the witness commitment (see *Size, weight and block Merkle checks*).
 - `instrument.zig` — that counter. `builtin.is_test`-gated, so it is `void` and compiles away
   entirely outside a test build.
 
@@ -94,8 +95,7 @@ items are opaque byte slices throughout; `sighash_legacy`/`sighash_bip143`'s `sc
 parameter is caller-supplied (typically the spent output's `scriptPubKey`, or a P2SH
 `redeemScript`) rather than derived by walking a script. Two concrete consequences:
 
-- **`OP_CODESEPARATOR` removal IS implemented** (as of the wave-2 burn-down; this section used to
-  record it as a scope cut). `sighash_legacy.zig`'s `appendScriptCode` reproduces Core's
+- **`OP_CODESEPARATOR` removal IS implemented**. `sighash_legacy.zig`'s `appendScriptCode` reproduces Core's
   `CTransactionSignatureSerializer::SerializeScriptCode`: an opcode-aware walk that omits every
   literal `OP_CODESEPARATOR` (`0xab`) *opcode* while leaving a `0xab` *byte* inside a push payload
   alone, with Core's `scriptCode.size() - nCodeSeparators` length prefix and Core's truncation of
@@ -106,125 +106,21 @@ parameter is caller-supplied (typically the spent output's `scriptPubKey`, or a 
   **no** scope cut relative to its spec — `script_code` is hashed exactly as given, matching
   BIP143 precisely.
 
-## Deferred: BIP342 tapscript (structural note, not half-built)
+## What is deliberately not done
 
-`sighash_bip341.zig` implements taproot key-path spending in full (`buildCommonSigMsg`), and the
-annex commitment is part of that: `CommonOptions.spend_type`/`annex_hash` let a caller signal an
-annex and `sha_annex` is emitted into `SigMsg` per BIP341 (`sighash_bip341.zig:354`). `bitcoinscript`
-uses this directly for real BIP342 (tapscript) spends that carry an annex
-(`tapscript.zig:275-279`). Deliberately out of scope, not attempted:
+- **BIP342 tapscript signature hashing** — a distinct signing mode (`ext_flag = 1`) that additionally commits to
+  the tapleaf hash, `key_version` and `codeseparator_position`. It is not "the same function with one more
+  field": it needs the tapscript leaf-hash machinery (`TapLeaf` tagged hashing over a script + leaf version)
+  this module does not build. `bitcoinscript` builds that layer on top of `commonSigMsg`/`commonSigMsgWith`.
+  What this module does carry is the annex commitment: `sighash_bip341.zig` implements taproot key-path
+  spending in full (`buildCommonSigMsg`), and `CommonOptions.spend_type`/`annex_hash` let a caller signal an
+  annex, whereupon `sha_annex` is emitted into `SigMsg` per BIP341; `bitcoinscript` uses this for tapscript
+  spends that carry an annex. The key-path wrapper (`sigMsg`/`sighash`) never sets one.
+- **Bitcoin Script interpretation, `Amount`/`LockTime` types, a transaction builder** — see *Threat model /
+  out of scope* and *Compared with*.
 
-- **BIP342 tapscript signature hashing** — a distinct signing mode (`ext_flag = 1`) that
-  additionally commits to the tapleaf hash, `key_version`, and `codeseparator_position`. This is
-  not "the same function with one more field": it requires the tapscript leaf-hash machinery
-  (`TapLeaf` tagged hashing over a script + leaf version) this module does not build. `bitcoinscript`
-  builds that layer itself, on top of `commonSigMsg`/`commonSigMsgWith` (see that module's docs).
 
-⚠ **Coverage gap, not a scope cut:** the annex path above has no byte-exact test *in this module*
-with `annex_hash != null` — the official `bip-0341/wallet-test-vectors.json` `keyPathSpending`
-fixture this module's KATs are pinned against contains **no** annex case (confirmed: zero
-occurrences of `"annex"` in the source JSON), and this module's own tests never set `annex_hash`.
-`CommonOptions`'s two fields are cross-checked for internal consistency
-(`error.SpendTypeAnnexMismatch`, finding X1), but the wire layout of the annex commitment itself is
-reviewed rather than vector-anchored here. `bitcoinscript`'s `sighash_annex` case anchors it one
-level up.
-
-This is a real, independent follow-on unit of work (getting an official script-path/annex vector
-into this module, or building one), not a corner cut inside what's already built.
-
-## Verification
-
-`legacy_kat_vectors.zig`/`bip143_kat_vectors.zig`/`bip341_kat_vectors.zig`/`tx_kat_vectors.zig` are
-machine-transcribed (never hand-typed) directly from fetched official sources — see each file's
-doc comment for the exact source URL and, where applicable, an independent from-scratch
-cross-check (a second implementation, in Python, run once at generation time) that caught a real
-transcription/byte-order pitfall before it ever reached this module's Zig tests (see "Pitfalls
-this caught" below).
-
-- **Legacy sighash** — `bitcoin/bitcoin`'s own `src/test/data/sighash.json` (the reference-oracle
-  fixture `SignatureHash()` is checked against upstream): **all 500 data rows, no filter** (the
-  file has 501 array entries, one of which is the header comment). 210 of them carry a raw `0xab`
-  byte in the `script` column and were excluded until `SerializeScriptCode` was implemented;
-  measured, all 210 are real `OP_CODESEPARATOR` opcodes rather than push payload. Covering all
-  3 named base types (`ALL`/`NONE`/`SINGLE`) × both `ANYONECANPAY` states plus many rows whose
-  low-5-bit hashType isn't 1/2/3 at all (the "falls back to ALL-like" classification). See
-  `modules/bitcointx/NOTICE` for the required Bitcoin Core attribution this data carries.
-- **BIP143** — `bip-0143.mediawiki`'s own two published "Example" cases (Native P2WPKH,
-  P2SH-P2WPKH): `hashPrevouts`/`hashSequence`/`hashOutputs` AND the full preimage AND the final
-  sighash, all four asserted byte-exact per case.
-- **BIP341** — `bip-0341/wallet-test-vectors.json`'s `keyPathSpending` section: one shared
-  9-prevout transaction, 7 `inputSpending` sub-cases covering every hashType BIP341 defines
-  (`DEFAULT`, `ALL`, `NONE`, `SINGLE`, and each with `ANYONECANPAY`), `SigMsg` and sighash both
-  asserted byte-exact per case.
-- **Real transactions** — `tx.deserialize` → `tx.serialize` round-trip plus `txid`/`wtxid`, against
-  (1) mainnet block 170's second transaction (the earliest known peer-to-peer Bitcoin transaction),
-  fetched live by block height from a block explorer and keyed by that explorer's own reported
-  txid, and (2) BIP143's own published Native-P2WPKH *signed* example (an officially-published
-  canonical interop reference), with `txid`/`wtxid` independently derived in Python at generation
-  time.
-- **Hostile input** — `tx.zig`'s own tests: truncated at every stage (before the version field,
-  mid-input), a `vin`/`vout` count claiming far more items than remain (`error.TooManyItems`, no
-  allocation-by-hostile-count), a non-minimally-encoded CompactSize, an unrecognized segwit flag
-  byte, and trailing bytes after a complete transaction — every one a typed error. A witness
-  item count is bounded twice: locally (min 1 wire byte/item, same shape as `vin`/`vout`) and
-  against a per-transaction memory budget (`bytes.len / @sizeOf([]const u8)`, shared and
-  decremented across every witness stack the transaction decodes) — a witness item costs as
-  little as 1 wire byte but `@sizeOf([]const u8)` = 16 bytes once parsed, and the local bound
-  alone let a hostile count amplify wire bytes into live memory 16x-22x (audit finding M1,
-  measured: 4 MB of wire -> 85 MB peak live).
-
-### Pitfalls this caught
-
-Both of the following were caught by the independent-implementation cross-check *before* being
-committed to a Zig test, i.e. this is what that process is for, not a hypothetical:
-
-- `sighash.json`'s `signature_hash` column turned out to be in **display** (reversed) byte order,
-  like a txid string — not this module's internal/wire order. `legacy_kat_vectors.zig` stores the
-  already-reversed (internal-order) value, documented at the point of storage.
-- `wallet-test-vectors.json`'s `sigMsg` field name is a false friend: despite the name, its first
-  byte IS the BIP341 sighash epoch (`0x00`), i.e. the field actually holds `0x00 || SigMsg` (what
-  BIP341's prose calls "Message"), not `SigMsg` alone. `sighash_bip341.zig`'s `sigMsg()` follows
-  the vector's actual content (returns the epoch-prefixed bytes) rather than the prose's
-  potentially-misleading field name.
-
-Run: `zig build test-bitcointx` (Debug and `-Doptimize=ReleaseFast`).
-
-## Status
-
-`gap · any (pure codec + pure computation, no I/O) · codec · reentrant` + deps: `bip340` —
-canonical source is `pub const meta` in src/root.zig.
-
-## Anchoring
-
-**Anchor grade:** class A · oracle MIXED
-
-- **Class A** — wire/interop format — other implementations must byte-agree with it.
-- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
-
-**What the tests actually contain.** BIP143/341 official vectors EXTERNAL; legacy sighash modeled on Core ref only, no vector
-
-**How it got there.** The anchoring work landed. DONE 4523b96: 7 -> 290 Core sighash.json rows, attribution added
-
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build with the dependency closure, 70
-tests, `setsid -w timeout -s KILL 20` per mutant): **34 mutants, 32 killed, 2 equivalent**.
-Points: every CompactSize width boundary (length, truncation, minimality), `readBytes`, the
-count and witness-item caps, the segwit marker/flag probes and flag value, the superfluous
-witness record, trailing bytes, the witness/input count on serialize, `hasWitnessData`,
-`wtxid`'s fallback, every sighash's input-index check, the legacy SIGHASH_SINGLE bug constant
-and sequence zeroing, `getOp`'s PUSHDATA1 bound, BIP143's SINGLE sequence/output rules, BIP341's
-hash-type set, prevout count, spend-type/annex consistency, base extraction and SINGLE without
-an output, and the legacy base mask. The sighash arithmetic is pinned by Core's `sighash.json`
-and the BIP143/BIP341 vectors.
-
-First pass: 4 survivors — **no defect, 2 test gaps** closed: a 4-octet transaction (version
-only; the marker probe read `bytes[4]` without its bound) and `OP_PUSHDATA1` as the last octet
-of a scriptCode (its length octet read past the end). **Equivalent (2):** the pre-allocation
-caps on the input/output count and the witness item budget moved by one — the input is refused
-either way (`Truncated` instead of `TooManyItems`); the caps bound memory, not correctness.
-
-## Size, weight and block Merkle checks (2026-11-19)
+## Size, weight and block Merkle checks
 
 Reference: Bitcoin Core (`GetTransactionWeight`, `GetVirtualTransactionSize`, `CTransaction::IsCoinBase`,
 `ComputeMerkleRoot(hashes, &mutated)`, `BlockMerkleRoot`/`BlockWitnessMerkleRoot`, `CheckBlock`,
@@ -260,23 +156,86 @@ Reference: Bitcoin Core (`GetTransactionWeight`, `GetVirtualTransactionSize`, `C
   segwit, 5-input legacy) against the explorer's reported size and weight. The streaming fold is also
   compared with a level-by-level reference for 0..70 leaves, plain and with every adjacent duplicate.
 
-### Delta mutation run 2026-11-19 (size/weight, `merkle.zig`)
+## Verification
 
-51 mutants over the new code (size arithmetic and every CompactSize width, ceil in `vsize`, the
-coinbase predicate per field, the stack fold, the `mutated` flag, header check order, commitment
-matching, nonce checks, the 6..38 payload slice), one schemata build, ReleaseSafe. **50 killed, 1
-equivalent, 0 survivors.** First pass: nothing survived once the width tests (253-entry counts,
-300-octet scripts and witness items) and the exhaustive 3-symbol fold test existed; they were added
-before the run because the obvious mutants (`compactSizeLen(n)` to `1`) are invisible to any realistic
-transaction.
+Run: `scripts/modtest bitcointx` (Debug; `-Doptimize=ReleaseFast` for the optimized mode).
 
-**Equivalent (1):** the equal-neighbour test inside `MerkleBuilder.finish`. A final-fold pair
-that is equal always contains, as its own children, an equal pair that was joined and flagged at
-`push` time (padding builds `H(g,g)`, whose children are equal; an unpadded top would already have
-been joined with its same-height neighbour). It is kept because it is Core's definition of the
-flag; every sequence over 3 symbols up to length 8 agrees with the level-by-level reference.
+`legacy_kat_vectors.zig`/`bip143_kat_vectors.zig`/`bip341_kat_vectors.zig`/`tx_kat_vectors.zig` are
+machine-transcribed (never hand-typed) directly from fetched official sources — see each file's
+doc comment for the exact source URL and, where applicable, an independent from-scratch
+cross-check (a second implementation, in Python, run once at generation time) that caught a real
+transcription/byte-order pitfall before it ever reached this module's Zig tests (see "Pitfalls
+this caught" below). `merkle_kat_vectors.zig` is produced by `tools/gen_merkle_vectors.py`.
+
+- **Legacy sighash** — `bitcoin/bitcoin`'s own `src/test/data/sighash.json` (the reference-oracle
+  fixture `SignatureHash()` is checked against upstream): **all 500 data rows, no filter** (the
+  file has 501 array entries, one of which is the header comment). 210 of them carry a raw `0xab`
+  byte in the `script` column; all 210 are real `OP_CODESEPARATOR` opcodes rather than push payload,
+  so they exercise `SerializeScriptCode`. Covering all
+  3 named base types (`ALL`/`NONE`/`SINGLE`) × both `ANYONECANPAY` states plus many rows whose
+  low-5-bit hashType isn't 1/2/3 at all (the "falls back to ALL-like" classification). See
+  the module's `NOTICE` for the required Bitcoin Core attribution this data carries.
+- **BIP143** — `bip-0143.mediawiki`'s own two published "Example" cases (Native P2WPKH,
+  P2SH-P2WPKH): `hashPrevouts`/`hashSequence`/`hashOutputs` AND the full preimage AND the final
+  sighash, all four asserted byte-exact per case.
+- **BIP341** — `bip-0341/wallet-test-vectors.json`'s `keyPathSpending` section: one shared
+  9-prevout transaction, 7 `inputSpending` sub-cases covering every hashType BIP341 defines
+  (`DEFAULT`, `ALL`, `NONE`, `SINGLE`, and each with `ANYONECANPAY`), `SigMsg` and sighash both
+  asserted byte-exact per case.
+- **Real transactions** — `tx.deserialize` → `tx.serialize` round-trip plus `txid`/`wtxid`, against
+  (1) mainnet block 170's second transaction (the earliest known peer-to-peer Bitcoin transaction),
+  fetched live by block height from a block explorer and keyed by that explorer's own reported
+  txid, and (2) BIP143's own published Native-P2WPKH *signed* example (an officially-published
+  canonical interop reference), with `txid`/`wtxid` independently derived in Python at generation
+  time.
+- **Hostile input** — `tx.zig`'s own tests: truncated at every stage (before the version field,
+  mid-input), a `vin`/`vout` count claiming far more items than remain (`error.TooManyItems`, no
+  allocation-by-hostile-count), a non-minimally-encoded CompactSize, an unrecognized segwit flag
+  byte, and trailing bytes after a complete transaction — every one a typed error. A witness
+  item count is bounded twice: locally (min 1 wire byte/item, same shape as `vin`/`vout`) and
+  against a per-transaction memory budget (`bytes.len / @sizeOf([]const u8)`, shared and
+  decremented across every witness stack the transaction decodes) — a witness item costs as
+  little as 1 wire byte but `@sizeOf([]const u8)` = 16 bytes once parsed, and the local bound
+  alone let a hostile count amplify wire bytes into live memory 16x-22x (audit finding M1,
+  measured: 4 MB of wire -> 85 MB peak live).
+- **Size, weight and Merkle** — real mainnet data (see *Size, weight and block Merkle checks*) plus the
+  streaming fold against a level-by-level reference and an exhaustive 3-symbol fold test; width tests
+  (253-entry counts, 300-octet scripts and witness items) pin every CompactSize width.
+- **Fuzz:** the deterministic driver, `BITCOINTX_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver), over three
+  harnesses: `bitcointx-deserialize` (untrusted bytes into `deserializePartial`), `bitcointx-sighash`, and
+  `bitcointx-roundtrip` (an accepted transaction re-serializes to octets that decode and re-serialize to the same octets).
+- **ctgrind:** not applicable — public transaction data.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+### Pitfalls this caught
+
+Both of the following were caught by the independent-implementation cross-check *before* being
+committed to a Zig test, i.e. this is what that process is for, not a hypothetical:
+
+- `sighash.json`'s `signature_hash` column turned out to be in **display** (reversed) byte order,
+  like a txid string — not this module's internal/wire order. `legacy_kat_vectors.zig` stores the
+  already-reversed (internal-order) value, documented at the point of storage.
+- `wallet-test-vectors.json`'s `sigMsg` field name is a false friend: despite the name, its first
+  byte IS the BIP341 sighash epoch (`0x00`), i.e. the field actually holds `0x00 || SigMsg` (what
+  BIP341's prose calls "Message"), not `SigMsg` alone. `sighash_bip341.zig`'s `sigMsg()` follows
+  the vector's actual content (returns the epoch-prefixed bytes) rather than the prose's
+  potentially-misleading field name.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle MIXED
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
+
+**What the tests actually contain.** BIP143/BIP341 official vectors, Bitcoin Core's `sighash.json` (all 500 rows) and `tx_valid`/`tx_invalid` EXTERNAL; the annex commitment and the Merkle/witness-commitment rules follow Core and are checked against explorer data, with no official annex vector in this module.
+
 
 ## Backlog / deferred
 
-- **`Transaction.weight()`/`vsize()`/`baseSize()`/`isCoinbase()`** (survey 2026-09-30) — every fee-estimating wallet needs vsize; all four competitors have it. Effort S. Fits §2. **DONE 2026-11-19** (§ "Size, weight and block Merkle checks").
-- **Merkle root over txids/wtxids (block header check, witness commitment)** (survey 2026-09-30) — `btcp2p.decodeBlock` returns transactions but nothing can confirm them against the header. Effort S. Fits §2. **DONE 2026-11-19** (§ "Size, weight and block Merkle checks").
+- **Official annex vector for the BIP341 sighash** — `CommonOptions.annex_hash` is cross-checked for internal
+  consistency (`error.SpendTypeAnnexMismatch`), but the byte layout of the annex commitment has no vector-anchored
+  test in this module: the official `bip-0341/wallet-test-vectors.json` `keyPathSpending` fixture contains no
+  annex case and this module's tests never set `annex_hash`. `bitcoinscript`'s `sighash_annex` case anchors it one
+  level up. Plan: get an official script-path/annex vector into this module, or build one.
+
