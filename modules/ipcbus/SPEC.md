@@ -18,7 +18,7 @@
 
 **Downstream consumer:** no
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [godbus/dbus](https://github.com/godbus/dbus) | Go | BSD-2-Clause | 1.2k | v5.2.2 (2025-12-29) | D-Bus client for Go: calls, signals, exported objects. |
 | Zig `std` / ecosystem | Zig | MIT (std) | — | Zig 0.16.0 | `std.Io.net` gives unix sockets (`std` checked only by name, *inferred*); no Zig request/reply bus found: the only `zig-ipc` hit (pseudocc/zig-ipc, MIT, 7 stars) is a shared-memory example. |
 
-**Where we are ahead:** small, libc-free (raw syscalls) and dependency-light (`framing` only); the frame length is checked before the body is read and the request buffer is sized to the announced length, so a peer cannot force a per-connection allocation; socket lifecycle (stale-socket unlink) handled; a scratch `Bus` with a change `version`. **Where we are behind:** no concurrency (one connection at a time), no persistent or multiplexed connections, no push/pub-sub, no in-band auth (peer uid check only), no timeouts *(searched `src/root.zig` for `timeout`/`SO_RCV`: none)*, Linux only, pathname sockets only (no abstract namespace).
+**Where we are ahead:** small, libc-free (raw syscalls) and dependency-light (`framing` only); the frame length is checked before the body is read and the request buffer is sized to the announced length, so a peer cannot force a per-connection allocation; socket lifecycle (stale-socket unlink) handled; a scratch `Bus` with a change `version`. **Where we are behind:** no concurrency (one connection at a time), no persistent or multiplexed connections, no push/pub-sub, no in-band auth (peer uid check only), timeouts are opt-in per call (`Options.timeout_ms`; default blocks), Linux only, pathname sockets only (no abstract namespace) — see *What is deliberately not done* and *Backlog / deferred*.
 
 ## Design & invariants
 
@@ -47,7 +47,24 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   or multiplexed connection.
 - **Framing delegated to `framing`.** Every message is a length-prefixed frame; an oversize header
   is rejected *before* the body is read, so a bogus length never blocks waiting for a body that
-  will not arrive.
+  will not arrive. `handleOne` sizes the request buffer to the announced length (checked against
+  `limits.max_frame` first), so the cap is a rejection threshold, not a per-connection price.
+- **Peer admission.** `Server.acceptOne` reads the kernel-recorded `SO_PEERCRED` uid of every
+  accepted connection and applies the server's `PeerPolicy`: `.same_uid` (default, the server's
+  effective uid at `listen`), `.uids` (an allowlist; the server's own uid is not implied) or `.any`
+  (no credential read). Basis: the D-Bus session bus, whose `EXTERNAL` SASL mechanism takes the
+  identity from kernel-passed credentials. A refused peer, or one whose credentials cannot be
+  read, is closed and counted in `Server.refused`; `acceptOne` keeps waiting and never errors for
+  it, so a non-admitted local user cannot end an accept loop that stops on `catch return`.
+  `peerCred(fd)` returns `PeerCred{pid, uid, gid}` for finer decisions inside `dispatch` callers.
+- **Timeouts are opt-in.** `Options.timeout_ms` (`Client.requestWithOptions`,
+  `Server.handleOneWithOptions`) is one monotonic deadline polled over the request and reply I/O
+  after the connection exists; a silent or stalled peer returns `error.Timeout`, never a hang.
+  `dispatch` time is not interrupted, and the unix `connect` is not timed (it does not wait for
+  `accept` while the backlog has room). `request`/`handleOne` keep blocking forever.
+- **Descriptors are `CLOEXEC`** at creation (listen, connect, accepted), so a spawned child never
+  inherits the listening socket. `Server.listen` unlinks a stale socket path first; `deinit`
+  closes and unlinks its own.
 - **`Bus(max_keys)` semantics:** `set` dupes key+value (owned); overwriting frees the old value in
   place; inserting a *new* key at `max_keys` evicts an arbitrary existing entry; `version` bumps on
   every mutation (poll to detect change); `get`/`list` return borrowed slices valid until the next
@@ -55,63 +72,57 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Concurrency:** single_owner — one thread/loop owns the listen socket and the `Bus`; the `Bus`
   is lock-free and must be touched from that owning thread only.
 
-## Threat model / out of scope
+## Threat model / Limits
 
-Access control is the socket path's filesystem permissions plus the `SO_PEERCRED` uid check
-`Server.acceptOne` applies (`PeerPolicy`, default: only the server's own uid, as on the D-Bus
-session bus; `.any` opts out) — there is no in-band authentication, and any peer the policy admits
-can issue any `dispatch` command the app registers. The transport hardens the framing surface (oversize/garbage length
-rejected before reading a body, bounded per-request allocation via `limits.max_frame`) but performs
-no input validation of the request bytes themselves — that is the caller's `dispatch` function's
-job. Out of scope: real push/notify (this is poll-a-shared-map — subscribers poll the `Bus`
-`version`, no server-initiated push), persistent/multiplexed connections, multi-connection
-concurrency (no thread pool or event loop — one connection serviced at a time), and any
-in-band (password/token) authentication layer.
+Access control is the socket path's filesystem permissions plus the `PeerPolicy` uid check
+`Server.acceptOne` applies — there is no in-band authentication, and any peer the policy admits
+can issue any `dispatch` command the app registers. The transport hardens the framing surface
+(oversize/garbage length rejected before reading a body, bounded per-request allocation via
+`limits.max_frame`) but performs no input validation of the request bytes themselves — that is the
+caller's `dispatch` function's job.
+
+Limits a consumer relies on: one connection is serviced at a time, so a stalled client blocks every
+other request unless the caller passes `Options.timeout_ms`; a path longer than 107 bytes is
+silently truncated by `unixAddr` (the kernel limit); sockets are pathname sockets only.
 
 ## Verification
 
-Tests cover the raw transport (`FdReader`/`FdWriter` `std.Io` adapters over a socket fd,
-oversize-frame rejection via `framing.readFrame`, end-of-stream handling) and the framing
-integration. Run: `zig build test-ipcbus`.
+Run: `scripts/modtest ipcbus` (`zig build test-ipcbus`). No interop step and no fuzz harness: the
+module has no wire format of its own (see *Anchoring*).
 
-**Mutation run 2026-10-05** (in-place, Debug, 25 mutants over the transport
-helpers, the `std.Io` adapters, `Server`'s listen/accept/handle/deinit, `CLOEXEC`
-at every fd creation, and the `Bus`'s cap, eviction, version and frees): 25
-killed, three of them by a deterministic hang (no EOF in `FdReader.stream` or in
-`readExact`, no flush of the reply — each blocks a test forever, so modtest's
-watchdog ends the run). The first pass left 15; seven tests were added (`CLOEXEC`
-on listen, connect and accepted fds; a stale socket path replaced and `deinit`
-unlinking; one-byte `writeAllFd`/`readExact` and `readExact`'s EOF; `drain`'s
-slices, splat and count; `handleOne` closing its fd; `clear` bumping `version`;
-`Bus.set` under every allocation failure). None equivalent.
+- **Transport:** socketpair and real-listener round-trips through a trivial echo `dispatch`;
+  `FdReader`/`FdWriter` (`std.Io` adapters), `writeAllFd`/`readExact` including one-byte messages
+  and end-of-stream, `unixAddr` truncation, `CLOEXEC` on every fd, stale-socket replacement and
+  unlink on `deinit`, `handleOne` closing its fd.
+- **Framing bridge:** oversize header and truncated body fail cleanly without a hang.
+- **Timeouts and credentials:** silent, partial-frame and never-reading peers time out within a
+  bound; a generous timeout still completes; `peerCred` on a socketpair, a real connection and a
+  non-socket fd.
+- **Peer policy:** `PeerPolicy.allows` decides on the uid alone; the default admits a same-uid
+  peer; an injected foreign own-uid makes the peer closed and counted; unreadable credentials are
+  refused (and the fd closed); `.any` reads no credentials; an allowlist naming our uid admits.
+- **`Bus`:** set/get/list, eviction at `max_keys`, undersized `list` buffer, `clear` bumping
+  `version`, no leak under any allocation failure.
+- **Mutation:** whole-module and delta runs, every hang-detected mutant killed by modtest's
+  watchdog.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-Delta mutation 2026-11-18 of the `PeerPolicy` / `Server.admit` / `acceptOne` code: 15 mutants
-(uid comparison flipped or forced, allowlist match flipped, `.any` inverted, own uid off by one,
-policy default, credential-read-failure and refusal paths dropping the close / the `refused`
-count / the refusal, `acceptOne` returning refused fds), 15 killed (4 by hang), 0 equivalent;
-one survivor (the close on the credential-read-failure path) got a killing test
-(`fcntl(F_GETFD)` is `EBADF` afterwards). Cumulative with the 2026-10-05 run: 40/40.
+## What is deliberately not done
+
+- **Persistent / multiplexed connections** — one connection per request, by design.
+- **In-band (password/token) authentication** — access is filesystem permissions plus the
+  `PeerPolicy` uid check; the D-Bus `EXTERNAL` model, not a secret on the wire.
+- **Abstract-namespace sockets, non-Linux targets** — pathname sockets over raw Linux syscalls
+  only (a conscious ceiling).
 
 ## Backlog / deferred
 
-- **Real push/notify** — no server-initiated push; subscribers must poll `Bus.version`.
-- **Persistent/multiplexed connections** — one connection per request only, by design.
-- **Multi-connection concurrency** — no thread pool or event loop; single-owner accept loop.
-- ✅ DONE 2026-11-18 **Auth/permissions on the socket** — `Server.acceptOne` checks the peer's
-  `SO_PEERCRED` uid against `PeerPolicy` (default: the server's own uid; `.uids` allowlist; `.any` opt-out).
-  Basis: the D-Bus session bus (`EXTERNAL` SASL: identity = Unix user from kernel credentials; the spec
-  recommends it wherever credentials travel out of band). A refused peer is closed and counted in
-  `Server.refused`; `acceptOne` never errors for it. No in-band/password authentication.
-
-- (survey 2026-09-30) **Publish/subscribe (server push)** — NNG, ZeroMQ and D-Bus users expect notifications; here subscribers poll `Bus.version`. Effort: medium-large (needs persistent connections and an event loop). Fits CONVENTIONS §2. Already listed as deferred above.
-- (survey 2026-09-30) **Concurrent connections** — a slow or stalled client blocks every other request (one connection at a time, no read timeout). Effort: medium (poll-based accept loop or `std.Io` group; per-connection deadline). Fits §2.
-- ✅ DONE 2026-11-16 (`peerCred(fd) !PeerCred{pid,uid,gid}` via `getsockopt(SO_PEERCRED)`; call it on the `acceptOne` fd before `handleOne`) (survey 2026-09-30) **Peer credentials (`SO_PEERCRED`)** — D-Bus users get uid/pid of the caller; without it the only access control is the socket file mode. Effort: small (one `getsockopt`, exposed to `dispatch`). Fits §2.
-- ✅ DONE 2026-11-16 (`Options{.timeout_ms}`; `Client.requestWithOptions`, `Server.handleOneWithOptions`; poll(2) against one monotonic deadline, `error.Timeout`; default unchanged) (survey 2026-09-30) **Read/write timeouts on `Client.request` and `handleOne`** — a silent peer hangs the caller forever. Effort: small. Fits §2.
-
-## Status
-
-`extract · linux · server · single_owner` + deps: `framing` — canonical source is `pub const meta`
-in src/root.zig.
+- **Real push / notify (pub/sub)** — no server-initiated push; subscribers poll `Bus.version`.
+  NNG, ZeroMQ and D-Bus users expect notifications. Effort: medium-large (needs persistent
+  connections and an event loop). Fits CONVENTIONS §2.
+- **Concurrent connections** — a slow or stalled client blocks every other request (one connection
+  at a time; a per-call timeout is opt-in). Effort: medium (poll-based accept loop or `std.Io`
+  group; per-connection deadline). Fits §2.
 
 ## Anchoring
 

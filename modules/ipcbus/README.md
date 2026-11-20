@@ -83,13 +83,10 @@ a socket fd are also exported for callers that need to build their own loop.
 - `version` bumps on every mutation — poll it to detect change.
 - `get`/`list` return borrowed slices valid **until the next mutation**.
 
-## Deferred (not in v1)
+## Not provided
 
-- **Real push/notify.** This is a poll-a-shared-map model: subscribers poll the
-  `Bus` `version` (or re-`get`); there is no server-initiated push.
-- **Persistent / multiplexed connections.** One connection per request only.
-- **Multi-connection concurrency.** The server handles one connection at a
-  time; no thread pool or event loop.
-- **In-band authentication.** Access is the socket path's filesystem
-  permissions plus the peer-uid check (`PeerPolicy`, default same uid); no
-  password/token layer.
+No push/notify (subscribers poll `Bus.version`), no persistent or multiplexed connections, no
+multi-connection concurrency (one connection is serviced at a time; pass `Options.timeout_ms` so a
+stalled peer cannot hold the loop), no in-band password/token authentication (access is the socket
+path's permissions plus the `PeerPolicy` uid check), pathname sockets only. See SPEC *What is
+deliberately not done* and *Backlog / deferred*.
