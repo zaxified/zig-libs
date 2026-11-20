@@ -263,19 +263,14 @@ pub const Store = struct {
     /// covering every shard, rather than each shard taking its own via
     /// `kvtree.Db.open`'s default `Options.lock == .exclusive`. Per-shard
     /// locking would work too (it is `kvtree`'s default), but it doubles the
-    /// handle count per shard (data file + lock sidecar). When this was
-    /// written, `FsStorage`'s handle table was fixed at `max_handles == 4`
-    /// (sized for one `kv`/`kvtree` store's own data+lock+compaction-temp
-    /// needs), so four shards alone would have needed 8 concurrently open
-    /// handles over one `FsStorage` and failed. One lock at the `Store` level
-    /// gives the identical guarantee this module's F2 finding asked for — a
-    /// second `Store` over the same paths gets `error.Locked` with nothing
-    /// touched — at the cost of one handle instead of N.
+    /// handle count per shard (data file + lock sidecar). One lock at the
+    /// `Store` level gives the identical guarantee this module's F2 finding
+    /// asked for — a second `Store` over the same paths gets `error.Locked`
+    /// with nothing touched — at the cost of one handle instead of N.
     ///
-    /// **That handle constraint is gone, and this is still not debt.**
-    /// `a77c388` raised `kv.FsStorage`'s default table to 64 and added
-    /// `FsStorageCapacity(n)`, so per-shard locking is no longer *blocked*.
-    /// It is simply not better: one store-wide lock is fewer handles, fewer
+    /// **This is not debt.** `kv.FsStorage`'s default handle table (64, see
+    /// `FsStorageCapacity(n)`) does not block per-shard locking; it is simply
+    /// not better: one store-wide lock is fewer handles, fewer
     /// files, one acquire/release path to reason about, and it already
     /// delivers the exclusion guarantee in full. **Do not re-propose
     /// per-shard locking as a cleanup or a follow-up.** It would buy no
@@ -901,10 +896,9 @@ test "round-trip: put→get across shards, delete, values survive reads on other
 //     state that forces ordering, and the barrier is never met: the shim
 //     gives up, sets `timed_out`, and the test fails. That is a deterministic
 //     consequence of serialization, not a race we hope to catch in the act.
-//     `n_shards` is 3, not 4 — `FsStorage.max_handles == 4` (kv module) plus
-//     the one store-wide lock handle `Store.init` now holds for cross-process
-//     exclusion (the F2 fix) leaves room for exactly 3 concurrently open
-//     shards; see the test itself.
+//     `n_shards` is 3: enough shards for the barrier to prove simultaneity,
+//     and a small handle count (3 data files plus the one store-wide lock
+//     handle `Store.init` holds); see the test itself.
 //  3. Three rounds, each re-arming the barrier and rewriting every key, with a
 //     full exact-value read-back of all the keys as the correctness oracle —
 //     one lost or torn write is one wrong value — under the leak-checking
@@ -1021,11 +1015,9 @@ test "multi-core write parallelism: three writers provably inside the backend at
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // 3, not 4: `FsStorage.max_handles == 4` (kv module) has zero headroom
-    // beyond exactly `n_shards` data-file handles, and `Store.init` now also
-    // holds one store-wide lock handle for the whole store's lifetime (the
-    // F2 fix) — 3 shard handles + 1 lock handle == 4 fits exactly; 4 shards
-    // would need 5 and fail with `error.Unexpected` from `FsStorage.vOpen`.
+    // 3 shards: enough for the barrier to prove simultaneity. `Store.init`
+    // also holds one store-wide lock handle for the whole store's lifetime
+    // (the F2 fix), so the test holds 3 shard handles + 1 lock handle.
     const n_shards = 3;
     var fs = FsStorage.init(testing.io, tmp.dir);
     var rv = Rendezvous{ .inner = fs.storage(), .want = n_shards };
@@ -1191,10 +1183,9 @@ test "persistence: data survives reopening the shards (FsStorage over a tmp dir)
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // 3, not 4: see the multi-core-parallelism test above — `Store.init` now
+    // 3 shards: see the multi-core-parallelism test above — `Store.init`
     // holds one store-wide lock handle for the whole store's lifetime (the
-    // F2 fix), and `FsStorage.max_handles == 4` (kv module) has no headroom
-    // beyond exactly `n_shards` data-file handles + that one lock handle.
+    // F2 fix) next to the `n_shards` data-file handles.
     {
         var fs = FsStorage.init(testing.io, tmp.dir);
         var store = try Store.init(testing.allocator, fs.storage(), .{ .n_shards = 3 });
