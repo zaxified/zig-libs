@@ -34,8 +34,8 @@
 //!
 //! Scope: **point-to-point and LAN topology → SPF → next-hop table**. A LAN
 //! pseudonode is transit only: members it lists and that list it back are
-//! joined by arcs at each member's own metric (`addLanArcs`, since
-//! 2026-09-30). Multi-level (L1/L2) leaking, IP/prefix reachability leaves, the overload
+//! joined by arcs at each member's own metric.
+//! Multi-level (L1/L2) leaking, IP/prefix reachability leaves, the overload
 //! bit's transit exclusion, and incremental SPF are deferred — see `SPEC.md`.
 
 const std = @import("std");
@@ -90,8 +90,7 @@ pub const Route = struct {
 /// NOT be advertised", which the RFC does not say — it never uses the token
 /// `MaxLinkMetric` at all — and which **inverts** the rule: the whole point is
 /// that the link STAYS advertised, as the sentence right above already said.
-/// `scripts/gen/check-citations.py` had been reporting the MISMATCH. Corrected
-/// 2026-09-03.
+/// `scripts/gen/check-citations.py` had been reporting the MISMATCH. Corrected.
 ///
 /// RFC 5305 §3 also defines `MAX_PATH_METRIC` (0xFE000000), a ceiling on the
 /// SUMMED cost along a path, which this module does NOT enforce.
@@ -307,7 +306,7 @@ fn computeInternal(
         // ISO/IEC 10589 §7.3.17: an LSP whose Remaining Lifetime has reached
         // zero is excluded from the Decision Process. `ev.remaining_lifetime`
         // is already aged to `now` by `isis-lsdb`, which is the whole reason
-        // `now` is threaded down here — and until 2026-09-03 nothing read it.
+        // `now` is threaded down here — and previously nothing read it.
         //
         // ⚠ The `bytes.len == 0` test above is NOT this check. `isis-lsdb`
         // drops an expired LSP's bytes inside `Lsdb.tick`, which is
@@ -943,7 +942,7 @@ test "old-style #2 default metric: the I/E bit is masked off, not folded into th
 // non-zero pseudonode octet (octet 6), and every router on the LAN — the DIS's
 // own real LSP included — advertises reachability to that pseudonode id, not to
 // each other (ISO 10589 §7.2.5 / RFC 1195). `addLanArcs` turns that into arcs
-// between the admitted members. Until 2026-09-30 this module dropped every
+// between the admitted members. Until this module dropped every
 // pseudonode entry (LAN transit was deferred); these fixtures pinned the drop
 // and now pin the transit.
 //
@@ -1068,7 +1067,7 @@ test "LAN (#2 old-style) without a pseudonode LSP: not admitted, the real P2P me
 // neighbour-side finding above but injected from the *origin* end instead of
 // the *neighbour* end of an entry.
 //
-// ⚠ The fixture below was rewritten on 2026-09-03. Its predecessor justified
+// ⚠ The fixture below was rewritten. Its predecessor justified
 // itself by a mechanism the directed rewrite (`6634cbb7`) DELETED: it argued
 // that `computeWith` "picks its canonical undirected weight from the
 // advertisement running from the lexicographically-LOWER system-id to the
@@ -2188,7 +2187,7 @@ test "RFC 5305 §3 MAX_PATH_METRIC: the ceiling is exceeded, and the gap is stat
     try testing.expect(far.metric > std.math.maxInt(u32));
 }
 
-// ── whole-module mutation audit 2026-11-17 ───────────────────────────────────
+// ── whole-module mutation audit ───────────────────────────────────
 
 fn id7(s: SystemId) [7]u8 {
     return .{ s[0], s[1], s[2], s[3], s[4], s[5], 0 };
