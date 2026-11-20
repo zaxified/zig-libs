@@ -12,13 +12,11 @@
 
 **Performance:** ref 0.06–0.11× Go vishvananda/netlink v1.3.1 · fastest ?× rust netlink-packet-route (measured 2026-11-03)
 
-Ours/Go wall time, lower is faster, `tools/bench.zig`, `-Djcc-safe`, counts agree, 5 rounds on the merged code: dec_link 0.059, dec_addr 0.088, dec_route 0.102, dec_neigh 0.104, enc_route 0.112. Largest spread 26.6 %, over the 5 % line: other jobs ran on the host, and an earlier run gave 0.061..0.125, so the numbers are rough; both are far below 1.1×. The fastest candidate is not measured (Backlog).
-
 **Known defects:** none recorded
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -28,12 +26,12 @@ Surveyed 2026-09-30, re-surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`. Licences r
 |---|---|---|--:|---|---|
 | [iproute2](https://github.com/shemminger/iproute2) (`ip`, `bridge`; mirror of the kernel.org repo) — **reference** | C | GPL-2.0 | 999 | no releases; push 2026-09-21 | The yardstick: this module's request bytes are checked against its captures. Covers every rtnetlink object; `ip monitor` for events, `ip rule`, multipath/nexthop routes, `ip link add type <kind> …` with kind data. *(feature list inferred from the tool's known command set; source not read)* |
 | [thom311/libnl](https://github.com/thom311/libnl) | C | LGPL-2.1 | 489 | libnl3_12_0 (2025-12-04) | The C library behind many tools: caches, per-kind link modules, rules, nexthops, multicast event handling. *(inferred)* |
-| [vishvananda/netlink](https://github.com/vishvananda/netlink) — **reference** for speed (callable, same work) | Go | Apache-2.0 | 3.3k | v1.3.1 (2025-05-09), push 2026-11-02 | The Go de-facto package: ~30 link kinds, multipath routes, rules, `LinkSubscribe`/`AddrSubscribe`, xfrm/tc/conntrack/ipset beside. **No nexthop objects** (verified: no `nexthop` source in v1.3.1). Decoders and the route encoder timed in `tools/bench.zig`: ours is 8–16× faster. *(verified by reading the source)* |
+| [vishvananda/netlink](https://github.com/vishvananda/netlink) — **reference** for speed (callable, same work) | Go | Apache-2.0 | 3.3k | v1.3.1 (2025-05-09), push 2026-11-02 | The Go de-facto package: ~30 link kinds, multipath routes, rules, `LinkSubscribe`/`AddrSubscribe`, xfrm/tc/conntrack/ipset beside. **No nexthop objects** (verified: no `nexthop` source in v1.3.1). Decoders and the route encoder timed in `tools/bench.zig` (figures: the card's **Performance:** line). *(verified by reading the source)* |
 | [rust-netlink/rtnetlink](https://github.com/rust-netlink/rtnetlink) + [netlink-packet-route](https://github.com/rust-netlink/netlink-packet-route) — **fastest** (candidate, NOT measured) | Rust | MIT | 190 / 77 | v0.23.0 / v0.33.0 (2026-08-18) | Async handle plus the widest typed message model (link kinds, rules, nexthops incl. groups, events). Built from a typed enum model, so its decode allocates; no speed claim is made against it. *(inferred)* |
 | [zoptia/zoptia0netlink](https://github.com/zoptia/zoptia0netlink) | Zig | Apache-2.0 | 0 | push 2026-05-26 | Its GitHub description: typed access for interfaces, routes, addresses and neighbours. Source not read (licence is not MIT); nothing on bridge/FDB/VLAN in the description. |
 | Zig `std.os.linux` | Zig | MIT | — | Zig 0.16.0 | Constants and syscalls only (this module builds its message types on `linux.NetlinkMessageType`, `linux.IFLA`); no netlink client. *(inferred for the absence of a client)* |
 
-**Where we are ahead (2026-11-02):** decode and encode 8–16× faster than vishvananda/netlink on the same bytes (bench above); nexthop objects, which vishvananda lacks; the bounds-checked walker; byte-exact goldens. Earlier:  a dependency-free pure-Zig rtnetlink client whose codec is the one every netlink family in this repo shares (`genetlink`, `nl80211`, `ethtool`, `tc`, `wireguard`, `conntrack`, `nftables`); typed bridge/FDB/per-port-VLAN/bridge-port options and `neighborFlush` with iproute2's default mask, pinned by tests; fuzzed, bounds-checked walker with typed errors. **Where we are behind** (2026-11-02): only the items listed as rejected in Backlog (MDB, per-VLAN options, MRP/CFM/MST, SR-IOV VFs, XDP, MPLS/SRv6 encap, resilient nexthop groups, other tunnel kinds beyond the raw hatch). Built 2026-11-02: multipath routes + metrics, nexthop objects, `ip route get`, single-link lookups, vxlan/macvlan/ipvlan/vrf/bond/gre/ipip/geneve + raw kind data with read-back, bridge device options, the remaining `ip rule` selectors, address lifetimes, link netns move/group/alias.
+**Where we are ahead:** decode and encode faster than vishvananda/netlink on the same bytes (`tools/bench.zig`; the card's **Performance:** line has the figures); nexthop objects, which vishvananda lacks; the bounds-checked walker; byte-exact goldens. Also: a dependency-free pure-Zig rtnetlink client whose codec is the one every netlink family in this repo shares (`genetlink`, `nl80211`, `ethtool`, `tc`, `wireguard`, `conntrack`, `nftables`); typed bridge/FDB/per-port-VLAN/bridge-port options and `neighborFlush` with iproute2's default mask, pinned by tests; fuzzed, bounds-checked walker with typed errors. **Where we are behind:** only the items listed in *What is deliberately not done* (MDB, per-VLAN options, MRP/CFM/MST, SR-IOV VFs, XDP, MPLS/SRv6 encap, resilient nexthop groups, other tunnel kinds beyond the raw hatch). Also built: multipath routes + metrics, nexthop objects, `ip route get`, single-link lookups, vxlan/macvlan/ipvlan/vrf/bond/gre/ipip/geneve + raw kind data with read-back, bridge device options, the remaining `ip rule` selectors, address lifetimes, link netns move/group/alias.
 
 ## Design & invariants
 The attr/message walker is the security boundary and lives in `codec.zig` — pure, no I/O, no
@@ -56,7 +54,7 @@ modern iproute2. IPv4 prefers `IFA_LOCAL` over `IFA_ADDRESS`. Clean-room from th
 headers (`linux/netlink.h`, `linux/rtnetlink.h`, `linux/if_link.h`, `linux/if_addr.h`,
 `linux/neighbour.h`, `linux/if.h`) + RFC 3549; libmnl and Go `vishvananda/netlink` are design
 references only (framing/validation discipline, typed-query shape) — constants/struct layouts are
-the OS ABI, see NOTICE.
+the OS ABI, see the README's `Provenance:` line.
 
 ## Shared codec surface (what other netlink families reuse)
 `codec.zig` is not just this module's private wire layer — it is the codec every netlink-family
@@ -92,9 +90,8 @@ without this module having to model their transports. `Socket.dump` and `Socket.
 here are themselves written on it, so it cannot drift from the behaviour it describes.
 
 **Raw transport seam — `Socket.send` + `Socket.recvDatagram` (public).** For callers that need a
-message this module does not model. `tc` drives its `RTM_GET*` dumps this way (it used to
-re-implement the syscall loops against the shared socket's fd; it now collapses onto this pair
-plus `classifyDumpMessage`). The returned datagram borrows the socket's receive buffer and is
+message this module does not model. `tc` drives its `RTM_GET*` dumps this way, on this pair
+plus `classifyDumpMessage`. The returned datagram borrows the socket's receive buffer and is
 valid until the next call on the socket. Sequence numbers come from `nextSeq`.
 
 ## The shared netlink transport (protocol-parameterised)
@@ -148,8 +145,7 @@ nfnetlink family lands (`nfqueue`, `nflog`, `ipset`), promote it to a sibling `n
 source-compatible, and it does not widen `netlink`.
 
 ## Write ops (RTM_NEW\*/RTM_DEL\*)
-Supported, and **not** "read/dump only" any more (that scope statement was retired when the write
-path landed). Implemented: **addresses** (`addressAdd`/`addressDel` — `IFA_LOCAL`+`IFA_ADDRESS`,
+Supported. Implemented: **addresses** (`addressAdd`/`addressDel` — `IFA_LOCAL`+`IFA_ADDRESS`,
 prefixlen/scope/flags, optional broadcast/label/`IFA_FLAGS`), **routes** (`routeAdd`/`routeDel` —
 `RTA_DST`/`RTA_GATEWAY`/`RTA_OIF`/`RTA_PREFSRC`/`RTA_PRIORITY`, table/scope/protocol/type, tables
 >255 promoted to `RTA_TABLE` like iproute2), **links** (`linkSet`/`linkUp`/`linkDown` — admin
@@ -202,7 +198,7 @@ static ARP entries. This function encapsulates that loop plus iproute2's default
 
 **Where the state mask came from.** Not derived from the NUD_* semantics in the kernel headers —
 read directly from iproute2's own source, `ip/ipneigh.c` (`iproute2/iproute2`, `main` branch,
-fetched 2026-08-18): `do_show_or_flush()` sets, for a flush with no `nud` argument,
+fetched from its `main` branch): `do_show_or_flush()` sets, for a flush with no `nud` argument,
 
 ```c
 filter.state = ~(NUD_PERMANENT|NUD_NOARP);
@@ -256,7 +252,7 @@ failed for any other reason. The `raced` case is normal: the neighbour table is 
 actor (or the kernel's own cache eviction) can remove an entry between the dump and the delete.
 `neighborFlush` catches exactly `error.NotFound` and counts it in `raced` rather than aborting the
 loop. Any other delete failure — `error.AccessDenied` if `CAP_NET_ADMIN` is lost mid-flush,
-`error.Busy`, `error.Unexpected` — stops the loop, but as of 2026-08-18 is recorded in
+`error.Busy`, `error.Unexpected` — stops the loop, but is recorded in
 `FlushResult.stopped` and returned as a normal (non-error) result, rather than raised and
 discarded. **Why not raise, matching every other write op's "no silent write failure"
 discipline:** those other ops are single writes with nothing accumulated to lose. `neighborFlush`
@@ -267,7 +263,7 @@ hazard for anyone auditing or retrying after a lost capability. This is the same
 `traceroute`'s `Trace.transport_err`: "eight good hops then a send failure" is a useful partial
 result, not nothing, and `traceroute`'s `TraceError` narrows out `TransportError` for exactly this
 reason (a transport failure mid-trace never discards the hops already collected). `neighborFlush`
-follows that precedent rather than an out-parameter or a wrapper return type: `FlushError` now
+follows that precedent rather than an out-parameter or a wrapper return type: `FlushError`
 covers only failures with nothing yet to report (`DumpError`, from the initial dump — nothing has
 been deleted before that call), and every failure that happens once the delete loop is already
 running becomes data on the `FlushResult` the function still returns `Ok`. A caller that only
@@ -338,20 +334,16 @@ port state back needs `RTM_GETLINK` with `ifi_family = AF_BRIDGE`: a plain AF_UN
 *build* side, in a separate `bridge.BuildError`/`bridge.WriteError` so the existing
 `BuildError`/`WriteError` sets stay byte-for-byte compatible for sibling modules.
 
-`ENETDOWN` (moving an operationally-down port to `BR_STATE_FORWARDING`) maps to
-`error.NetworkDown`. It used to be left unmapped on the stated grounds that widening the shared
-`writeErrorFromCode` table "would change a public error set other modules compose with" — which is
-not a cost: adding a member to a Zig error set is source-compatible, no consumer switches
-exhaustively over `RequestError`, and the sibling `nl80211` had already mapped the identical errno
-to its own `NetworkDown` after the identical symptom. The real cost was on the other side: the
-single most ordinary failure of a bridge-port state change arrived as `error.Unexpected`, which
-carries no information at all, and that is exactly what a flaky netns test then reported for weeks
-(2026-08-12; see `waitOperUp` for the race behind it).
+`ENETDOWN` (moving an operationally-down port to `BR_STATE_FORWARDING`) maps to `error.NetworkDown`, as
+in the sibling `nl80211`; left unmapped it would arrive as `error.Unexpected`, which carries no information
+about the single most ordinary failure of a bridge-port state change (the race behind it is the one the
+test helper `waitOperUp` waits out). Adding a member to a Zig error set is source-compatible for callers
+that do not switch exhaustively over `RequestError`.
 
 **`Socket.lastErrorCode`** exists for the same reason: the typed error sets are a lossy projection
 of the kernel's errno, and every unmapped errno collapses onto `error.Unexpected`. A caller
 diagnosing one needs the number, so the socket keeps it beside the extended-ACK reason string, set
-on the ACK path and — new — on the dump path, which previously discarded both.
+on the ACK path and on the dump path.
 
 ## Provenance / licensing
 The kernel UAPI headers this module cites are GPL-2.0, but that does not make the module a GPL
@@ -359,11 +351,11 @@ derivative: only uncopyrightable ABI facts are taken from them (numeric constant
 and separately, those headers carry the **Linux-syscall-note** exception, which explicitly permits
 userspace of any license to use them to interface with the kernel. No kernel or libmnl (LGPL-2.1)
 source was consulted or copied; the codec is an original pure-Zig implementation. Full attribution
-in /NOTICE. The golden request bytes in the tests were captured from iproute2's own traffic with
+in the README's `Provenance:` line. The golden request bytes in the tests were captured from iproute2's own traffic with
 `strace` and with an `nlmon` + `tcpdump` netlink tap (observed wire bytes = ABI facts, no iproute2
 code involved).
 
-## Events, rules, kind data, statistics (2026-10-04)
+## Events, rules, kind data, statistics
 
 **Events.** `openMonitor(gpa, mask)` binds the legacy `nl_groups` bit set (`rtnlGroupMask`:
 group *n* is bit *n*-1; every group in `RTNLGRP` is ≤ 32, so `NETLINK_ADD_MEMBERSHIP` is not
@@ -406,14 +398,34 @@ fuzzed walker and parsers as dumps. A notification stream can lose messages when
 fills — `recvEvents` surfaces that as `error.Overrun`, never as a silent gap, and the caller must
 re-dump. Joining the `RTNLGRP` groups needs no privilege (rtnetlink's choice); a test pins that.
 
-**Deferred inside the bridge surface; rejected 2026-11-02 for parity, no competitor library with a typed model but rust-netlink has them and none of our consumers does** (honest list — all reachable through the public codec +
-`nextSeq`/`requestAck` if needed before they are built): MDB / IGMP-MLD multicast snooping
-(`RTM_NEWMDB`/`DELMDB`/`GETMDB`, `MDBA_*`) and the bridge's own multicast options
-(`IFLA_BR_MCAST_*`); (VXLAN device creation is DONE 2026-11-02 via `KindData.vxlan`); VLAN tunnel mapping (`IFLA_BRIDGE_VLAN_TUNNEL_INFO`); per-VLAN options and stats
-(`BRIDGE_VLANDB_*`, `IFLA_BR_VLAN_STATS_ENABLED`, `RTEXT_FILTER_BRVLAN_COMPRESSED` — the dump
-decoder *handles* compressed ranges, but the request always asks for the uncompressed form);
-MRP, CFM and MST (`IFLA_BRIDGE_MRP`/`_CFM`/`_MST`); bridge-port backup port
-(`IFLA_BRPORT_BACKUP_PORT`), `IFLA_BRPORT_FLUSH` and the read-only STP timers/ids; (reading the bridge device's own options is DONE 2026-11-02: `Link.info.bridge`).
+Refused features (the bridge surface's MDB / per-VLAN options / MRP-CFM-MST, other tunnel kinds, SR-IOV, XDP, encap
+routes, resilient nexthop groups, other netlink protocols) are listed with their reasons in *What is deliberately
+not done*; all remain reachable through the public codec plus `nextSeq`/`requestAck`.
+
+## Dump tolerance
+
+Attributes added for extra detail never fail a record: a wrong-width `IFLA_TXQLEN/GROUP/queues/MTU range/CARRIER/LINK_NETNSID`, a malformed `IFLA_INFO_DATA` (`Link.info` falls back to `.none`), `RTA_METRICS`, `RTA_MULTIPATH`, `RTA_NH_ID`, a short `IFA_CACHEINFO`, wrong-width rule additions: the field stays unset and the other records of the dump come back (tests: a scripted dump with one such record among good ones). Malformed attribute framing, and attributes this module already read strictly before, fail as before.
+
+## Nexthop groups
+
+A group may carry `fdb` (the kernel accepts an FDB group of FDB nexthops; netns test). A group has `family == AF_UNSPEC`; the kernel's own family filter on a dump drops groups, so `nexthops(.{ .family = … })` dumps everything and filters here, groups passing.
+
+## Memory per dump record
+
+Measured with `@sizeOf`:
+
+| type | size | worst case at `max_dump_records` (4 Mi) |
+|---|--:|--:|
+| `Link` | 272 | 1.14 GB |
+| `Route` | 188 | 0.79 GB |
+| `Address` | 56 | 235 MB |
+| `Nexthop` | 104 | 436 MB |
+
+(`ArrayList` growth can briefly hold twice that.) The records come from the kernel, not from a peer, and a real full table is ~1 M routes (190 MB); an allocation failure stays `error.OutOfMemory`. A lower, configurable cap (`Filter.max_records`) would be additive and is **not built** (Backlog).
+
+## Protocol-parameterised transport
+
+`Socket.open` does not hardcode the protocol (see "The shared netlink transport" above); `conntrack`, `nftables`, `tc` and `genetlink` (with its reverse dependents `nl80211`, `ethtool`, `wireguard`) sit on it. No module in the repo keeps a private copy of socket/bind/portid/`NETLINK_EXT_ACK`/`MSG_PEEK|MSG_TRUNC`.
 
 ## Verification
 Offline unit tests over canned payloads built by the codec's own encoders: per-type parse
@@ -435,7 +447,7 @@ plus the delete forms and the `ifi_change`-mask cases.
 -Z root -w cap.pcap -U -s0 & …'`), which records the raw datagrams rather than strace's decoded
 rendering (`DLT_NETLINK`: a 16-byte Linux cooked header, then the `nlmsghdr`); the
 `strace -f -e trace=sendmsg -xx -s 400` form yields the same fields. Every builder's output was
-diffed byte-for-byte (nlmsg_seq masked) against the capture — **23/23 identical**. Commands
+diffed byte-for-byte (nlmsg_seq masked) against the capture. Commands
 covered, each cited in its test: `ip link add name br0 type bridge forward_delay 100 ageing_time
 20000 stp_state 1 priority 4096 vlan_filtering 1` (100 B) and its minimal `vlan_filtering 1` form
 (68 B) and bare form (56 B, no `IFLA_INFO_DATA`); `ip link set dev veth0 master br0` (40 B) and
@@ -478,12 +490,10 @@ entry and find it through both the per-port and the per-bridge kernel-side filte
 the entry, the VLANs, release the port and delete both devices (checking the veth peer disappears
 with its partner). Nothing touches the host: the namespace dies with the child. Where namespaces or
 the bridge/veth drivers are unavailable the child reports a skip code and the test prints
-`SKIPPED` and passes — the suite never fails for lack of privilege. Run: `zig build test-netlink`
-(and `--release=fast`): all pass, none skipped, on a stock Linux 7.0 with user namespaces
-enabled, i.e. both live round-trips really execute there.
+`SKIPPED` and passes — the suite never fails for lack of privilege. Run: `scripts/modtest netlink`
+(the `test-netlink` step). With user namespaces enabled both live round-trips really execute.
 
-
-**2026-10-04 additions.** Request bytes for `ip link add zv0 type veth peer name zv1`,
+**Rules, kind data, read-back.** Request bytes for `ip link add zv0 type veth peer name zv1`,
 `ip link add link zv0 name zv0.10 type vlan id 10`, `… type vlan protocol 802.1ad id 20`,
 `ip rule add from 10.0.0.0/8 table 100 priority 1000` (and `to …/24`, `fwmark 0x10`, `iif zv0`,
 `-6 from 2001:db8::/32`) and `ip rule del priority 1000` are rebuilt field by field from `strace`
@@ -496,87 +506,37 @@ a veth pair (each end's `parent` is the other), an 802.1ad VLAN read back with i
 rules added, dumped per family (an IPv6 rule must not leak into the AF_INET dump; table 4000 must
 come back via `FRA_TABLE`) and deleted, `lo`'s `IFLA_STATS64` counting one UDP datagram as both tx
 and rx (≥ 29 bytes), and a monitor opened before all of it that sees zv0's `link_new` and the
-rule's `rule_del`. Plus: a monitor socket opens unprivileged on the host. Mutation 2026-10-04:
-41 mutants over the new code, 37 killed at once, 4 survivors (exact-80 stats bound, DELLINK
-mapping, client-side rule family filter, the family reaching the kernel) killed by new tests.
+rule's `rule_del`. Plus: a monitor socket opens unprivileged on the host.
+
+**Parity-wave tests.** `src/ext_test.zig`: multipath/metrics/nexthop/kind encode, decode, hostile input and spec refusals, with the constants pinned as independent literals (every attribute number, enum value and struct layout — `rtnexthop`, `nhmsg`, `nexthop_grp`, `fib_rule_port_range`, `fib_rule_uid_range`, `ifa_cacheinfo` — was printed by a C program compiled against the system `linux/*.h` headers and compared, all equal) and hand-written wire bytes for vxlan VNI, macvlan, ipvlan, vrf, bond, GRE key and flags, and nexthop group weights. Root tests for the changed builders read back through `parseLink/parseRoute/parseRule/parseAddress`; `getOver` over a scripted transport; sweep cases in `src/sweep_test.zig` (20,000 attribute-framed payloads through every parser; oversized and degenerate builder inputs). Live, in a forked user+network namespace, the kernel is the judge: addresses with lifetimes, a multipath route with metrics read back hop by hop, `routeGet`, nexthop objects (id, group with weights, blackhole, route `nhid`, delete cascades), vrf/vxlan/macvlan/ipvlan/bond/gretap/ipip/geneve/bridge options read back (each skipped alone when the kernel lacks the driver), rule selectors and goto. The builder bytes of these newer messages are not diffed against iproute2 captures (see Open).
+
+**Fuzz.** Deterministic driver `NETLINK_FUZZ=<runs>[,<first seed>]` over seven harnesses: `netlink-walkers` (codec), `netlink-parsers`, `netlink-builders`, `netlink-bridge-builders`, `netlink-bridge-parsers`, `netlink-ext`, `netlink-lookup`.
+
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## Performance
+
+`zig build bench-netlink` (`tools/bench.zig`, `tools/go_bench`; see `tools/README.md`): the four dump decoders and the route request builder against vishvananda/netlink over the same seeded messages, counts must agree; the Go side reaches three unexported functions of that package with `go:linkname` (`deserializeRoute`, `parseAddr`, `(*Handle).prepareRouteReq`). The card's **Performance:** line carries the figures and is authoritative.
+
+## What is deliberately not done
+
+- **Bridge surface:** MDB / IGMP-MLD multicast snooping (`RTM_NEWMDB`/`DELMDB`/`GETMDB`, `MDBA_*`) and the bridge's own multicast options (`IFLA_BR_MCAST_*`); VLAN tunnel mapping (`IFLA_BRIDGE_VLAN_TUNNEL_INFO`); per-VLAN options and stats (`BRIDGE_VLANDB_*`, `IFLA_BR_VLAN_STATS_ENABLED`, `RTEXT_FILTER_BRVLAN_COMPRESSED` — the dump decoder *handles* compressed ranges, but the request always asks for the uncompressed form); MRP, CFM and MST (`IFLA_BRIDGE_MRP`/`_CFM`/`_MST`); bridge-port backup port (`IFLA_BRPORT_BACKUP_PORT`), `IFLA_BRPORT_FLUSH` and the read-only STP timers/ids. Reason: only rust-netlink has a typed model for them and none of our consumers does; all reachable through the public codec plus `nextSeq`/`requestAck`.
+- **Resilient nexthop groups** (`NHA_RES_GROUP`) — need a bucket model, no consumer.
+- **Other link kinds as typed data** (ip6gre, ip6tnl, vti, xfrm, bareudp, netkit, ifb, can, …) — one encoder each, no consumer; reachable through `KindData.raw`.
+- **SR-IOV VF configuration, XDP attach, `RTA_ENCAP` (MPLS/SRv6/BPF), `RTA_VIA`, `RTA_SRC`** — no consumer; other modules own BPF (`ebpf`).
+- **Qdisc/class/filter, conntrack** — owned by the siblings `tc`, `conntrack`, `nftables`; **xfrm, ipset, inet_diag** have no module and are refused here (other netlink protocols).
+- **A portable (non-Linux) fallback** — raw-syscall nature; the Linux-only ceiling is an accepted design choice, grouped with icmp/rawsock/wireguard/l2disco/procnet.
+
+## Open
+
+- **Builder bytes of the newer messages** (multipath, nexthop, the added link kinds, the rule selectors beyond the captured ones, address lifetimes) are not diffed against `strace` of iproute2; the kernel accepted and read back every one in the netns test instead.
+- **Single absolute deadline across foreign datagrams** — needs a clock read + setsockopt on the foreign path; not done. The worst case is bounded at 64 × `SO_RCVTIMEO` (`max_foreign_datagrams`; past it `error.ForeignDatagramLimit`).
+- **32-bit targets: `Message.errorAttrs` (`4 + echoed`, `alignUp`) can wrap `usize`** when the echoed `nlmsg_len` of an extended ACK is near `0xffffffff`. Harmless on 64-bit (the sum cannot overflow, the bounds check follows); a 32-bit fix (compare `echoed` against `payload.len - 4` before adding) has no killing test on the 64-bit CI host, so it is parked until a 32-bit lane exists.
 
 ## Backlog / deferred
 
-### Survey 2026-11-02 — verdict per gap (parity)
-| gap (source) | verdict |
-|---|---|
-| multipath routes, `nexthop` weight/onlink (iproute2, vishvananda, rust) | **done** `RouteSpec.hops`, `Route.hops` (4 inline + `hop_count`, `MultipathIterator` for all) |
-| route metrics mtu/advmss/hoplimit, tos, prefsrc read-back, `nhid` | **done** |
-| `ip route get` (vishvananda `RouteGet`) | **done** `Socket.routeGet` |
-| `ip link show dev X` (`LinkByName`/`LinkByIndex`) | **done** `linkByName`/`linkByIndex` |
-| nexthop objects incl. groups, blackhole, fdb (iproute2, rust; vishvananda has none) | **done** `nexthopAdd/Del/Get`, `nexthops`; resilient groups (`NHA_RES_GROUP`) **rejected**: needs bucket model, no consumer |
-| link kinds vxlan, macvlan/macvtap, ipvlan/ipvtap, vrf, bond, gre/gretap, ipip/sit, geneve | **done**, with read-back in `Link.info` |
-| other kinds (ip6gre, ip6tnl, vti, xfrm, bareudp, netkit, ifb, can, …) | **rejected as typed** (one encoder each, no consumer); reachable through `KindData.raw` |
-| bridge device options, read-back | **done** (`BridgeSpec` + `Link.info.bridge`) |
-| MDB, per-VLAN options, VLAN tunnel, MRP/CFM/MST | **rejected** (rust-netlink only; reachable through the raw seam) |
-| rule selectors tos, goto, suppress, l3mdev, uidrange, protocol, ipproto, sport/dport | **done** |
-| address lifetimes (`IFA_CACHEINFO`), `IFA_FLAGS` read-back | **done** |
-| link `netns` move, group, alias; txqlen/queues/MTU range/carrier read-back | **done** (alias is write-only) |
-| SR-IOV VF configuration, XDP attach, `RTA_ENCAP` (MPLS/SRv6/BPF), `RTA_VIA` | **rejected**: no consumer, other modules own BPF (`ebpf`) |
-| qdisc/class/filter, conntrack, xfrm, ipset, inet_diag | **owned by siblings** (`tc`, `conntrack`, `nftables`); xfrm/ipset/diag have no module: rejected here (other netlink protocols) |
-| event subscriptions | already done 2026-10-04 |
-
-### Memory per dump record (measured 2026-11-03, `@sizeOf`)
-| type | main (2ff0f545) | now | worst case at `max_dump_records` (4 Mi) now | before |
-|---|--:|--:|--:|--:|
-| `Link` | 168 | 272 | 1.14 GB | 0.70 GB |
-| `Route` | 52 | 188 | 0.79 GB | 0.22 GB |
-| `Address` | 44 | 56 | 235 MB | 185 MB |
-| `Nexthop` (new) | — | 104 | 436 MB | — |
-(`ArrayList` growth can briefly hold twice that.) The records come from the kernel, not from a peer, and a real full table is ~1 M routes (190 MB now); an allocation failure stays `error.OutOfMemory`. A lower, configurable cap (`Filter.max_records`) would be additive and is **not built** (Backlog below).
-
-### Dump tolerance (review 2026-11-03)
-Attributes added for extra detail never fail a record: a wrong-width `IFLA_TXQLEN/GROUP/queues/MTU range/CARRIER/LINK_NETNSID`, a malformed `IFLA_INFO_DATA` (`Link.info` falls back to `.none`), `RTA_METRICS`, `RTA_MULTIPATH`, `RTA_NH_ID`, a short `IFA_CACHEINFO`, wrong-width rule additions: the field stays unset and the other records of the dump come back (tests: a scripted dump with one such record among good ones). Malformed attribute framing, and attributes this module already read strictly before, fail as before.
-
-### Constants checked against the real headers (2026-11-03)
-Every new attribute number, enum value and struct layout (`rtnexthop`, `nhmsg`, `nexthop_grp`, `fib_rule_port_range`, `fib_rule_uid_range`, `ifa_cacheinfo`) was printed by a C program compiled against /usr/include/linux/{if_link,if_tunnel,rtnetlink,nexthop,fib_rules,if_addr,neighbour}.h and compared: all equal. `ext_test.zig` pins them as independent literals, with hand-written wire bytes for vxlan VNI, macvlan, ipvlan, vrf, bond, GRE key and flags, and nexthop group weights.
-
-### Nexthop groups (live-checked)
-A group may carry `fdb` (the kernel accepts an FDB group of FDB nexthops; netns test). A group has `family == AF_UNSPEC`; the kernel's own family filter on a dump drops groups, so `nexthops(.{ .family = … })` dumps everything and filters here, groups passing.
-
-### Open
-- **`Filter.max_records`** (lower, configurable dump cap): additive, not built; see the memory table.
-- **P "fastest" row:** rust netlink-packet-route (MIT) is the candidate for the fastest decoder; not benchmarked 2026-11-02 (the reference, Go, was). A cargo bench under `tools/` would settle it.
-- Builder bytes of the new messages are not diffed against `strace` of iproute2 (the instrument was not available to this wave); the kernel accepted and read back every one in the netns test instead.
-- single absolute deadline across foreign datagrams (needs a clock read + setsockopt on the foreign path) — not done, worst case bounded at 64 × SO_RCVTIMEO (`max_foreign_datagrams`, past it `error.ForeignDatagramLimit`, sweep GZ REV, 2026-10-31).
-- **32-bit targets: `Message.errorAttrs` (`4 + echoed`, `alignUp`) can wrap `usize`** when the
-  echoed `nlmsg_len` of an extended ACK is near `0xffffffff` (sweep NL-5, 2026-10-31). Harmless on
-  64-bit (the sum cannot overflow, the bounds check follows); a 32-bit fix (compare `echoed`
-  against `payload.len - 4` before adding) has no killing test on the 64-bit CI host, so it is
-  parked here until a 32-bit lane exists.
-~~Multicast event monitoring~~ — **done 2026-10-04** (`openMonitor`/`recvEvents`, see "Events,
-rules, kind data, statistics").
-
-**Protocol-parameterised transport: done.** `Socket.open` no longer hardcodes the protocol (see
-"The shared netlink transport" above); `conntrack`, `nftables` and `tc` have had their private
-copies of bind + portid capture + `NETLINK_EXT_ACK` + the `MSG_PEEK|MSG_TRUNC` growth loop
-deleted, and `genetlink` followed in the next wave (it has the richest reverse-dependent set:
-`nl80211`, `ethtool`, `wireguard`). **The consolidation is complete**: no module in the repo
-keeps a private copy of socket/bind/portid/`NETLINK_EXT_ACK`/`MSG_PEEK|MSG_TRUNC`.
-
-Write-path gaps listed under "Threat model / out of scope" above:
-`IFLA_INFO_DATA` for kinds other than bridge/veth/VLAN, multipath routes, nexthop objects, and the bridge
-sub-list (MDB/multicast snooping, VXLAN device creation, VLAN tunnels, per-VLAN options, MRP/CFM/
-MST, backup port). Linux-only platform
-ceiling is an accepted design choice (raw-syscall nature, no portable fallback), grouped with
-icmp/rawsock/wireguard/l2disco/procnet.
-
-- ~~**Multicast event monitoring**~~ **Done 2026-10-04.** *(survey 2026-09-30)* — `RTNLGRP_*` vocabulary + decoded link/addr/route/neigh event iterator. Every reference (`ip monitor`, libnl, vishvananda `*Subscribe`, rust-netlink) has it and it is the first thing a daemon watching interfaces needs; `openProtocolGroups` already binds groups, so effort is small-medium (decoders exist, `parseLink`/`parseAddress`/…). Fits §2.
-- **Kind-specific link data (`IFLA_INFO_DATA`)** — **veth and VLAN done 2026-10-04, `IFLA_INFO_KIND` now read back**; VXLAN/macvlan/bond/… still deferred: one encoder + capture each, no consumer has asked (the router-tool consumer only flushes neighbours and reads links). *(survey 2026-09-30)* — veth peer, VLAN id/protocol, VXLAN, macvlan, … plus reading `IFLA_INFO_KIND` back into `Link` (`rg 'INFO_KIND' src/root.zig` shows write-only use). `ip link add type veth|vlan|vxlan` is everyday use, and `linkAdd` cannot express it today. Medium (one encoder per kind). Fits §2.
-- **Multipath routes (`RTA_MULTIPATH`) and policy rules (`RTM_*RULE`)** — **rules done 2026-10-04**; multipath still deferred: `struct rtnexthop` lists inside `RTA_MULTIPATH` need their own encoder, decoder and capture, and `Route` (plain data, one gateway) would need a bounded nexthop array — a shape decision worth its own pass. *(survey 2026-09-30)* — `ip route … nexthop`, `ip rule`. Small-medium each; `RTA.MULTIPATH` constant exists, nothing encodes/decodes it (`rg MULTIPATH src/`). Fits §2.
-- **Link statistics (`IFLA_STATS64`) and nexthop objects (`RTM_*NEXTHOP`)** — **statistics done 2026-10-04** (`Link.stats`); nexthop objects deferred (lower priority per the survey, no consumer). *(survey 2026-09-30)* — counters are the other reason to dump links (`ip -s link`); `Link` carries none (`rg 'STATS' src/root.zig`: no hit). Nexthop objects are lower priority. Small / medium. Fits §2.
-
-## Evidence 2026-11-02 (survey parity)
-Offline: `ext_test.zig` (multipath/metrics/nexthop/kind encode, decode, hostile input, spec refusals), root tests for the changed builders read back through `parseLink/parseRoute/parseRule/parseAddress`, `getOver` over a scripted transport. Fuzz harness `netlink-ext` (`NETLINK_FUZZ`), sweep cases in `sweep_test.zig` (20,000 attribute-framed payloads through every parser; oversized and degenerate builder inputs). Live, in a forked user+network namespace, the kernel is the judge: addresses with lifetimes, multipath route with metrics read back hop by hop, `routeGet`, nexthop objects (id, group with weights, blackhole, route `nhid`, delete cascades), vrf/vxlan/macvlan/ipvlan/bond/gretap/ipip/geneve/bridge options read back (each skipped alone when the kernel lacks the driver), rule selectors and goto. Bench: `tools/bench.zig` + `tools/go_bench` (Go decoders reached with `go:linkname`: the unexported `deserializeRoute`, `parseAddr` and `(*Handle).prepareRouteReq`).
-
-## Status
-`gap · linux · client · reentrant` + deps: none (std only) — canonical source is `pub const meta`
-in src/root.zig.
+- **`Filter.max_records`** — a lower, configurable dump cap (additive; see *Memory per dump record*).
+- **P "fastest" row** — rust netlink-packet-route (MIT) is the candidate for the fastest decoder; not benchmarked (the reference, Go, was). A cargo bench under `tools/` would settle it.
 
 ## Anchoring
 

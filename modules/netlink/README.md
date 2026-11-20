@@ -122,7 +122,7 @@ while (true) {
 
 Monitoring needs no privilege (rtnetlink lets any user join its groups).
 
-### Multipath, nexthops, lookups, more kinds (2026-11-02)
+### Multipath, nexthops, lookups, more kinds
 
 ```zig
 // ECMP route with weights and metrics; a hop-only route needs no gateway/oif at the top.
@@ -314,8 +314,11 @@ Shared with the other netlink families (see SPEC.md § "Shared codec surface"):
   carrier change is published by the kernel's `linkwatch` workqueue and lands
   later — measured here at 0.5–2.8 ms later under load. Wait for `IFF_RUNNING`
   in a link dump (that flag *is* `netif_oper_up`) before setting the state.
-- **Out of scope (deliberate extension points):**
-  qdiscs/filters (sibling `tc` module), conntrack, multipath
-  routes, and — within the bridge surface — MDB/multicast snooping
-  (`RTM_*MDB`), VXLAN link creation, VLAN tunnel mapping, MRP/CFM/MST and
-  per-VLAN options. See SPEC.md.
+
+## Not provided
+
+Typed models for the bridge's multicast snooping (MDB), per-VLAN options, VLAN tunnel mapping and MRP/CFM/MST,
+for link kinds beyond the ones listed above (they go through `KindData.raw`), for resilient nexthop groups, SR-IOV,
+XDP and encap routes; qdiscs/filters (sibling `tc`), conntrack (`conntrack`, `nftables`) and other netlink
+protocols' typed APIs; any non-Linux platform. The reasons are in SPEC.md *What is deliberately not done*;
+open gaps are under *Open* and *Backlog / deferred* there.

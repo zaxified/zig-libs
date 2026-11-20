@@ -5,12 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed).
 - **2026-11-08** — **NEW:** `codec.appendAttrU64` (host-order u64 rtattr), next to `appendAttrU32`; tc and devlink had private copies (duplicate-code pass).
 - **2026-11-02** — **ADDITIVE:** `netlink.builders.*` (the request builders as pure functions: address, route, linkSet, linkAdd, linkDel, rule, neighbor, routeGet, linkGet); `tools/bench.zig` + `tools/go_bench` (ours/Go vishvananda/netlink 0.06-0.12x); SPEC survey 2026-11-02 (Scope parity), README section; uid-range live test uses the one uid the test namespace maps.
 - **2026-11-03** — **CONSUMER-VISIBLE (review fixes):** extra-detail attributes no longer fail a record (see SPEC "Dump tolerance"); `ext.appendMultipath` validates its hops (weight 0/257 and odd gateway lengths were a panic); `getOver` ends on `NLMSG_DONE` (`NotFound`) and refuses an unasked-for type; nexthop FDB groups are accepted and `nexthops(.{ .family })` keeps groups; fuzz harnesses `netlink-ext` (every kind, wrapped in real LINKINFO/rtmsg/ifaddrmsg/rule payloads) and `netlink-lookup`; builder sweep; constants checked against the system headers.
 - **2026-11-02** — **CONSUMER-VISIBLE (additive source, but):** new members in `BuildError` (so in `WriteError`/`LookupError`), new `KindData` variants (an exhaustive `switch` over it stops compiling), `Link` is no longer zeroable (`std.mem.zeroes(Link)`; `Link.info` is a union), `Address` has non-zero defaults (`preferred_lft`/`valid_lft` = `infinite_lft`), and the records grew (`Link` 168 -> 272 bytes, `Route` 52 -> 188, `Address` 44 -> 56). Otherwise **ADDITIVE API (survey parity):** multipath routes (`RouteSpec.hops`, `Route.hops`/`hop_count`, `MultipathIterator`), route metrics (`mtu`/`advmss`/`hoplimit`), `tos`, `nhid` and `prefsrc` read-back; nexthop objects (`nexthopAdd`/`nexthopDel`/`nexthopGet`/`nexthops`, `RouteSpec.nhid`); single lookups `routeGet` (`ip route get`), `linkByName`, `linkByIndex`; link kinds vxlan, macvlan/macvtap, ipvlan/ipvtap, vrf, bond, gre/gretap, ipip/sit, geneve plus `KindData.raw` for any other kind, each read back through `Link.info`, with the bridge device's own options; `BridgeSpec` hello/max-age/group-fwd-mask/mcast/default-pvid; rule selectors tos/goto/suppress/l3mdev/uidrange/protocol/ipproto/sport/dport (set and read back); address lifetimes (`preferred_lft`/`valid_lft`, `Address.flags32`); `LinkChange` group/alias/netns move; more `Link` fields (txqlen, group, queues, MTU range, carrier, link netns id). New `BuildError` members `InvalidHop`, `TooManyHops`, `RouteConflict`, `InvalidNexthop`, `InvalidKindData`, `TooManyAttrs`, `InvalidRange`. Build a `Link` with its required fields instead of `std.mem.zeroes`.
-- **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GZ fix (6 mutants): 6 killed after 1 new test (a foreign flood during an ACK wait is `ForeignDatagramLimit` from `awaitAckStrict`, `RecvFailed` from `awaitAck`).
 - **2026-10-31** — **API change (no-panic sweep § GZ):** `recvDatagramLimit` skips at most 64 datagrams from a non-kernel sender per call, then returns the new `error.ForeignDatagramLimit` (in `StrictRecvError` / `StrictRequestError`; the non-strict forms fold it into `RecvFailed`). A CAP_NET_ADMIN peer in the same netns could stretch a reply wait without bound before (each `recvfrom` restarted SO_RCVTIMEO).
 - **2026-10-31** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GV). NLMSG_DONE carrying a negative errno (the kernel's `dump_done_errno`) is now a dump failure, not a complete (partial) list. NLM_F_DUMP_INTR drains the interrupted dump to its DONE before re-sending under a fresh seq (an immediate re-send got -EBUSY); the request is patched into an owned copy, the caller's buffer is no longer written (`dumpCollect`/`dumpCollectOver` take `[]const u8`). New `max_dump_records` (4 Mi produced items per dump, `error.TooManyMessages`), oversize datagrams (> 16 MiB) are dropped instead of blocking every later receive, `finishHeader` > 4 GiB is a checked panic (`codec.checkedMessageLen`), `VlanEntry.count` total.
 - **2026-10-18** — Ported to Zig 0.17.0. `sockaddr.in` test address via `bytesToValue`; `@typeInfo` struct-of-arrays spellings; `waitpid` status pointer cast.
@@ -44,29 +42,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   SPEC.md already documents. `scripts/checks/check-uapi-consts.py`'s `netlink`
   entry now also scans `root.zig` (~90 constants), not just `bridge.zig`.
 
-- **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** `bridge.fuzzBuilders` draws
-  **31 knobs behind its two byte draws**, the longest such tail in the
-  repository, and its corpus carried no octets past the name and the MAC. So
-  every one of those knobs was its own minimum — `eos` returns `true` on an
-  exhausted input, so every option was PRESENT with the value 0. `vlan_id_min`
-  is 1 and both `buildFdbRequest` and `buildVlanRequest` open with `checkVid`,
-  so those two builders answered `error.InvalidVlanId` on **every seed in the
-  corpus** and had never once returned a request. Measured per builder:
-  3/0/0/5/5 before, 3/2/3/4/5 after (13 of 25 accepted before, 17 of 25 after)
-  — the previously pinned total of 13 could not show the two zeros, which is
-  why the guard now pins the five builders separately.
-
-  A seed is now written as the VALUES its 31 draws read, in a struct of the
-  same type the harness records what it drew into, so the corpus guard compares
-  the whole schedule with one `expectEqualDeep` — a draw inserted, removed or
-  reordered fails there instead of silently shifting every later knob onto the
-  wrong word. The seeds cover the VID range refusals (`vid_end` below `vid`, a
-  VID above `vlan_id_max`, `self` and `master` together, a PVID with a range),
-  a bridge request with no IFLA_INFO_DATA nest and a brport request with
-  nothing to change.
-
-  `root.fuzzBuilders`'s guard now pins its four builders separately too
-  (3/3/4/5) and checks all six of its knobs, not just `prefix` and `ifindex`.
 
 - **2026-09-07** — **The netns bridge integration test failed on any host with
   the tunnel modules loaded, and the module was fine.** `upAllButLoopback`
