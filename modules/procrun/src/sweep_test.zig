@@ -192,6 +192,42 @@ test "closeStdin then wait returns for a child that reads stdin to EOF (sweep D7
     try testing.expect(seen.n.load(.monotonic) >= 1);
 }
 
+test "Handle.writeStdinTimeout: delivers within the deadline, times out on a child that never reads" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A reader: the whole body arrives, and the descriptor is blocking again.
+    var seen: Seen = .{};
+    const h = try pr.spawnStreaming(testing.allocator, io, .{
+        .argv = &.{"cat"},
+        .stdin = .pipe,
+    }, .{ .ctx = &seen, .on_stdout = Seen.onOut });
+    try h.writeStdinTimeout("hello\n", 5000);
+    try h.writeStdin("again\n");
+    try h.closeStdin();
+    const t = h.wait();
+    try testing.expect(t == .exited and t.exited == 0);
+    try testing.expect(seen.n.load(.monotonic) >= 1);
+
+    // A child that never reads: a body larger than the pipe buffer times out.
+    const body = try testing.allocator.alloc(u8, 4 << 20);
+    defer testing.allocator.free(body);
+    @memset(body, 'x');
+    var seen2: Seen = .{};
+    const h2 = try pr.spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sleep", "30" },
+        .stdin = .pipe,
+    }, .{ .ctx = &seen2, .on_stdout = Seen.onOut });
+    const t0 = nowNs();
+    try testing.expectError(error.Timeout, h2.writeStdinTimeout(body, 150));
+    const took_ms = (nowNs() - t0) / std.time.ns_per_ms;
+    try testing.expect(took_ms >= 100 and took_ms < 5000);
+    h2.kill();
+    _ = h2.wait();
+}
+
 const AckJob = struct {
     h: pr.Handle,
     seen: *Tail,

@@ -150,6 +150,7 @@ forced to wrap); what is pinned by a test is the gate itself, in both directions
 - `Handle.kill`/`cancel`/`signal*`/`terminate` from another thread racing `Handle.wait` is a use-after-free of the context (`wait` frees it) and is not allowed; call `wait` exactly once. A refcounted `Handle` would lift this (*Backlog / deferred*).
 - `Spec.stream_permits` of 0 is treated as 1 and a huge value cannot make cancel/kill spin.
 - The stdin writer of a `runTimeout`/`Cancel` run is deadline-bounded (non-blocking writes polled in slices of at most 50 ms).
+- `Handle.writeStdinTimeout(data, timeout_ms)` is `writeStdin` with a deadline (Linux; `error.Unsupported` elsewhere): `error.Timeout` when the pipe did not take the whole body in time (an unknown prefix may have been written, as with Python's `communicate(timeout=)`'s `TimeoutExpired`); the descriptor is non-blocking only for the call.
 
 ## Verification
 
@@ -177,7 +178,6 @@ forced to wrap); what is pinned by a test is the gate itself, in both directions
 - **Windows reap-race coverage.** The `TerminateProcess`/`create_no_window` branch compiles but is untested for the POSIX-specific regression this module exists to fix; needs a Windows runner.
 - **Refcounted `Handle` for watchdog threads (D10).** Lifts the "no `kill`/`cancel`/`signal*`/`terminate` racing `wait`" rule (use-after-free of the context today).
 - **PATH-resolution policy.** Explicit control over `argv[0]` resolution (`.parent` | `.child_env` | `.none`/explicit `path`); needs an own resolver for everything but `.parent`, including the non-rlimit path, plus decisions on X_OK-vs-file semantics and on `env_mode = .merge`. Do it when a consumer states which policy it needs.
-- **Deadline variant of `Handle.writeStdin`.** None today; callers write from their own thread.
 
 ## Anchoring
 

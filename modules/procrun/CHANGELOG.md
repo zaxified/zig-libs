@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — Added `Handle.writeStdinTimeout(data, timeout_ms)` and `WriteTimeoutError`: `writeStdin` with a deadline (`error.Timeout`; Linux, `error.Unsupported` elsewhere).
 - **2026-11-19** — **BEHAVIOUR CHANGE:** a NUL byte inside an `argv` element, `cwd`, or an `env` value (when `env_mode` uses `Spec.env`) is now `error.NulByte`, returned before anything is spawned. Before, the vfork path silently truncated the C string at the NUL (a different argument or program than written). Same as Go `os/exec` (EINVAL), Rust `Command` ("nul byte found in provided data") and Python `subprocess` (`ValueError`).
 - **2026-11-15** — **BEHAVIOUR CHANGE (Linux):** a spawned child starts with an empty signal mask (`Spec.reset_signal_mask`, default `true`, as Go's `os/exec` and Rust's `Command`). Before, the vfork spawner passed on the spawning thread's mask, so a program that blocks SIGTERM for a signalfd loop (`stopsignal`) started children with SIGTERM blocked and `cancel_grace_ns`'s SIGTERM stayed pending until the SIGKILL. `.reset_signal_mask = false` keeps the old behaviour. std's fallback spawn (other POSIX targets, no readable `/proc/self/environ`) is unchanged.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** the private `monoNowNs` (duplicate-code pass), including its hand-written Windows QPC branch, is replaced by `clock.monotonicNs()` (same QPC math, no libc). New dependency: `clock`.

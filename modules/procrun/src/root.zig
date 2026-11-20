@@ -1868,6 +1868,39 @@ const default_pump_grace_ns: u64 = 250 * std.time.ns_per_ms;
 /// `error.BrokenPipe`.
 pub const StdinError = error{StdinUnavailable};
 
+/// Errors of `Handle.writeStdinTimeout`.
+pub const WriteTimeoutError = error{ StdinUnavailable, Timeout, BrokenPipe, Unsupported, Unexpected };
+
+/// Write all of `data` to the pipe `fd` before the absolute `monoNowNs()`
+/// `deadline_ns`, with the descriptor non-blocking for the duration (its
+/// previous flags are restored).
+fn writeBoundedLinux(fd: std.posix.fd_t, data: []const u8, deadline_ns: u64) WriteTimeoutError!void {
+    const L = std.os.linux;
+    const fl = L.fcntl(fd, L.F.GETFL, 0);
+    if (L.errno(fl) != .SUCCESS) return error.Unexpected;
+    var flags: L.O = @bitCast(@as(u32, @truncate(fl)));
+    const was_nonblock = flags.NONBLOCK;
+    flags.NONBLOCK = true;
+    _ = L.fcntl(fd, L.F.SETFL, @as(usize, @as(u32, @bitCast(flags))));
+    defer if (!was_nonblock) {
+        flags.NONBLOCK = false;
+        _ = L.fcntl(fd, L.F.SETFL, @as(usize, @as(u32, @bitCast(flags))));
+    };
+    var rest = data;
+    while (rest.len > 0) {
+        const ms = remainingMs(deadline_ns);
+        if (ms == 0) return error.Timeout;
+        const rc = L.write(fd, rest.ptr, @min(rest.len, 1 << 20));
+        switch (L.errno(rc)) {
+            .SUCCESS => rest = rest[rc..],
+            .INTR => {},
+            .AGAIN => _ = pollReady(fd, std.posix.POLL.OUT, ms),
+            .PIPE => return error.BrokenPipe,
+            else => return error.Unexpected,
+        }
+    }
+}
+
 /// A running streaming child. The caller MUST eventually call `wait` exactly
 /// once — it joins the reader threads, reaps the child, fires `on_exit`, and
 /// frees the handle's state. After `wait` returns, the handle is invalid.
@@ -1986,6 +2019,23 @@ pub const Handle = struct {
     pub fn writeStdin(h: Handle, data: []const u8) !void {
         const f = h.ctx.child.stdin orelse return error.StdinUnavailable;
         try f.writeStreamingAll(h.ctx.io, data);
+    }
+
+    /// `writeStdin` with a deadline: writes all of `data` or fails with
+    /// `error.Timeout` once `timeout_ms` milliseconds have passed without the
+    /// whole body being accepted by the pipe (Python's `communicate(timeout=)`
+    /// raises `TimeoutExpired` the same way). An unknown prefix of `data` may
+    /// already have been written, so after a timeout the byte stream is
+    /// unusable for framed protocols: close stdin or kill the child. The
+    /// write end is switched to non-blocking for the call and restored
+    /// afterwards, so a later `writeStdin` blocks as before. Errors as
+    /// `writeStdin` (`BrokenPipe` when the child closed stdin). Linux only;
+    /// elsewhere `error.Unsupported`. Same concurrency rules as `writeStdin`.
+    pub fn writeStdinTimeout(h: Handle, data: []const u8, timeout_ms: u32) WriteTimeoutError!void {
+        const f = h.ctx.child.stdin orelse return error.StdinUnavailable;
+        if (builtin.os.tag != .linux) return error.Unsupported;
+        const deadline = monoNowNs() +| @as(u64, timeout_ms) *| std.time.ns_per_ms;
+        return writeBoundedLinux(f.handle, data, deadline);
     }
 
     /// Close the child's stdin, signalling EOF to it (many programs — `cat`,
