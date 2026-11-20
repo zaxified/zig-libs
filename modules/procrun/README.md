@@ -34,7 +34,8 @@ third-party data is reproduced.
   **Concurrency:** reentrant (no shared module state beyond the idempotent,
   threadsafe `SIGCHLD`-fixup guard).
 - **Deps:** `argsafe` (opt-in argv sanitization via `runValidated`/
-  `buildValidatedArgv` only — every other entry point is std-only).
+  `buildValidatedArgv` only), `clock` (monotonic deadlines); every other entry
+  point is std-only.
 
 ## API
 
@@ -160,67 +161,39 @@ Errors are typed (`error.FileNotFound`, `error.AccessDenied`, … from
 `.signal`/`.stopped` `std.posix.SIG`, `.unknown` raw status) — no lossy
 re-encoding to `i32`.
 
-## Backlog (deferred from v1)
+## Evidence
 
-- **Windows depth.** The `TerminateProcess` / `create_no_window` branch is
-  present and the module compiles for Windows, but the reap-race regression is a
-  POSIX phenomenon — Windows reap-race coverage is deferred. `new_process_group`
-  and `rlimit` are POSIX-only for the same reason (see below).
-- **PATH-resolution policy.** Explicit control over `argv[0]` PATH resolution
-  (see `Spec`'s doc comment for current behavior) — independent of the
-  `argsafe` *sanitization* integration below, which has landed. Open, and not
-  a one-line knob: see `SPEC.md`.
+`src/oracle_test.zig` replays the scenarios of `src/oracle_scenarios.json`
+(exit codes, deaths by signal, 2 MiB/4 MiB I/O, merge order, caps, env, cwd,
+fds, process groups, timeouts) against the frozen results of Python's
+`subprocess` (`src/oracle_results.json`, produced by
+`python3 -I tools/oracle/run_python.py`; no Python at test time), plus
+no-zombie and stable-fd-count invariants. Deliberate differences carry a
+`diff` reason in the scenario file.
 
-Rejected: a type-level "consumed" marker for `Handle` (Zig has no move-only
-types; see `SPEC.md`).
+## Behaviour notes
 
-Done since v1:
+- **Defaults.** `Spec.stdin` defaults to `.ignore` (`/dev/null`), not `.close`
+  (a closed fd 0 is reused by the child's first `open`). `Spec.pass_fds` keeps
+  the listed descriptors under the same numbers; every other descriptor keeps
+  its own CLOEXEC state (no `close_fds` walk, so a non-CLOEXEC fd leaks).
+  `Spec.uid`/`gid` go to std (`setreuid`/`setregid`; refusal is
+  `error.PermissionDenied`; supplementary groups are not touched).
+  `Spec.reset_signal_mask` (default `true`) starts the child with an empty
+  signal mask. A NUL byte in `argv`, `cwd` or an env value is `error.NulByte`.
+- **Results.** `Output.core_dumped` and `Output.rusage` come from
+  `run`/`runTimeout`; `waitTolerantExit` is `waitTolerant` returning them.
+  `Output.timed_out` and `Output.grace_expired` report a deadline and an
+  expired SIGTERM grace (`Spec.cancel_grace_ns`).
+- **Limits.** `Spec.rlimit` needs a POSIX `/bin/sh` with `ulimit`. `run`
+  without `runTimeout` or `Spec.cancel` waits for pipe EOF without bound. A
+  child that exits without reading all of `stdin_body` makes `run` return
+  `error.BrokenPipe`. `Handle.wait` must be called exactly once and must not
+  race `kill`/`cancel`/`signal*` from another thread. Details: `SPEC.md`.
 
-- **Stdio redirection.** `StdioMode` gains `.ignore` (`/dev/null`), `.file`
-  (caller-owned `std.Io.File`) and, for `Spec.stderr`, `.stdout` (Python's
-  `stderr=STDOUT`: one shared pipe, write order preserved).
-- **`pass_fds`, `uid`/`gid`, `/dev/null` stdin, core flag, rusage
-  (2026-10-20).** `Spec.pass_fds: []const std.Io.File` keeps those descriptors
-  open in the child under the same numbers (std's `inherit_files`: CLOEXEC is
-  cleared in the forked child only, so it is race-free); every other
-  descriptor keeps its own CLOEXEC state (no `close_fds` walk -- a non-CLOEXEC
-  fd still leaks). `Spec.uid`/`Spec.gid` are passed to std (`setreuid`/
-  `setregid`; a refusal is `error.PermissionDenied`; supplementary groups are
-  NOT touched). **`Spec.stdin` now defaults to `.ignore` (`/dev/null`)**, not
-  `.close`. `Output.core_dumped` (`WCOREDUMP`) and `Output.rusage` (`wait4`'s
-  record, e.g. `maxrss`) come from `run`/`runTimeout`; `waitTolerantExit` is the
-  `waitTolerant` that returns them.
-- **Evidence.** `src/oracle_test.zig` replays ~55 scenarios (exit codes,
-  deaths by signal, 2 MiB/4 MiB I/O, merge order, caps, env, cwd, fds,
-  process groups, timeouts) against the frozen results of Python's
-  `subprocess` (`src/oracle_results.json`, produced by
-  `python3 -I tools/oracle/run_python.py`; no Python at test time), plus
-  no-zombie and stable-fd-count invariants. Deliberate differences carry a
-  `diff` reason in `src/oracle_scenarios.json`.
-- **Graceful cancellation.** `Spec.cancel_grace_ns` (blocking runs: `Cancel`
-  and the `runTimeout` deadline) and `Handle.terminate`/`terminateGroup`
-  (streaming): SIGTERM, wait up to the grace, then SIGKILL. `Output.timed_out`
-  and `Output.grace_expired` report what happened. POSIX-only.
-- **Line-delimited / NDJSON stdout mode.** `Callbacks.on_stdout_line` +
-  `max_line_bytes`: bounded reassembly across chunks, one callback and one
-  backpressure permit per line, final unterminated line flushed at EOF.
+## Not provided
 
-- **Process-group / whole-tree kill.** `Spec.new_process_group` (`setpgid(0,
-  0)` between fork and exec) plus `Handle.cancelGroup`/`killGroup`/
-  `signalGroup` (`kill(-pgid, sig)`) and a grouped `runTimeout` deadline-kill,
-  so a killed child's own `&`-backgrounded jobs are reachable too. POSIX-only;
-  a documented no-op on Windows.
-- **rlimit control.** `Spec.rlimit` (`RlimitSpec`: `cpu_seconds`,
-  `address_space_bytes`, `open_files`, `file_size_bytes`), applied via a
-  `/bin/sh -c 'ulimit ...; exec "$@"'` wrapper inserted in front of `argv` —
-  `std.process.spawn` has no post-fork/pre-exec hook to call `setrlimit`
-  directly, so the *immediate* child (the shell) sets its own limits, which
-  POSIX guarantees survive `exec`. POSIX-only; `error.OperationUnsupported` on
-  Windows.
-- **Streaming stdin after spawn.** `Handle.writeStdin`/`closeStdin` on a
-  `spawnStreaming` handle (`Spec.stdin = .pipe`) — interactive request/
-  response protocols (e.g. an MCP stdio transport) can now keep stdin open
-  and drive it incrementally, independent of `run`'s one-shot `stdin_body`.
-- **`argsafe` integration.** `runValidated`/`buildValidatedArgv` — opt-in;
-  ordinary `run`/`runTimeout`/`spawnStreaming` still treat `Spec.argv` as
-  trusted-by-construction, per module convention.
+`setsid`/`umask`/`PDEATHSIG`, a `close_fds` walk, PATH policies, pipelines, a
+pty, a type-level "consumed" marker for `Handle` (rejected), and Windows
+reap-race coverage; reasons in `SPEC.md` *What is deliberately not done* and
+*Backlog / deferred* (pidfd signalling, refcounted `Handle`, PATH policy).

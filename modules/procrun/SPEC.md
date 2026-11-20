@@ -19,8 +19,8 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
-the zig-libs authors (MIT).
+
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: the README's `Provenance:` line and ./NOTICE (the Linux spawner follows musl's `posix_spawn`; the rest is original work of the zig-libs authors, MIT).
 
 ## Compared with
 
@@ -28,7 +28,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| Python [`subprocess`](https://docs.python.org/3/library/subprocess.html) (CPython) — **reference** | Python | PSF-2.0 (API says NOASSERTION for [python/cpython](https://github.com/python/cpython), 77.4k stars, push 2026-09-30; source not read) | — | Python 3.x docs | `run` with timeout, input, cwd, env, check; `capture_output`; **`stderr=STDOUT` merges stderr into stdout** (verified in the docs), `DEVNULL`, redirect to files/fds, `pass_fds`, `start_new_session`/`process_group`, `umask`, `user`/`group` *(the last five inferred)*. This module now has `stderr = .stdout`, `.ignore` (`DEVNULL`) and `.file` (2026-09-30); `pass_fds`, `user`/`group`/`umask`/`start_new_session` are missing. |
+| Python [`subprocess`](https://docs.python.org/3/library/subprocess.html) (CPython) — **reference** | Python | PSF-2.0 (API says NOASSERTION for [python/cpython](https://github.com/python/cpython), 77.4k stars, push 2026-09-30; source not read) | — | Python 3.x docs | `run` with timeout, input, cwd, env, check; `capture_output`; **`stderr=STDOUT` merges stderr into stdout** (verified in the docs), `DEVNULL`, redirect to files/fds, `pass_fds`, `start_new_session`/`process_group`, `umask`, `user`/`group` *(the last five inferred)*. This module has `stderr = .stdout`, `.ignore` (`DEVNULL`), `.file`, `pass_fds` and `uid`/`gid` (`user`/`group`); `umask` and `start_new_session` are not provided (*What is deliberately not done*). |
 | Go [`os/exec`](https://pkg.go.dev/os/exec) — reference for cancellation | Go | BSD-3-Clause (Go project) | — (golang/go: 139k) | Go stdlib | `Run`/`Start`/`Wait`/`Output`/`CombinedOutput`/`StdoutPipe` (names verified); `CommandContext` + `Cancel` + `WaitDelay`, `SysProcAttr` (setpgid, credentials, ...) *(inferred)*. This module's `Cancel`, `cancel_grace_ns` ("Go's `Cmd.Cancel` + `WaitDelay`", its own doc comment) and `new_process_group` follow that shape. |
 | [oconnor663/duct.rs](https://github.com/oconnor663/duct.rs) | Rust | MIT | 1.0k | no release; push 2026-09-20 | Its README: pipelines and shell-like IO redirection, errors from children reported by default, portability gotchas handled. This module has redirection (`.ignore`, `.file`, `stderr = .stdout`) but no pipelines. |
 | [oconnor663/shared_child.rs](https://github.com/oconnor663/shared_child.rs) | Rust | MIT | 52 | no release; push 2026-09-03 | Wait/kill a child from several threads *(inferred)*; the nearest thing to this module's reap-race focus. |
@@ -36,7 +36,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [sindresorhus/execa](https://github.com/sindresorhus/execa) | JavaScript | MIT | 7.6k | v10.0.1 (2026-07-31) | Popular high-level runner for Node (piping, lines, IPC) *(inferred)*; not a Zig alternative, listed for the feature bar users bring. |
 | Zig 0.16 `std.process` (`spawn`, `run`, `Child.wait`) | Zig | MIT | — | Zig 0.16.0 | What this module wraps. Per this module's SPEC: `Child.wait` **panics** on `ECHILD` when a sibling thread reaps the child, and `std.process.run` fails with `error.StreamTooLong` and discards the output at the cap; no timeout, cancel, group kill or rlimit. `gh search` for Zig subprocess libraries found nothing notable. |
 
-**Where we are ahead:** of Zig `std`, on everything a supervisor needs: reap-race-tolerant wait (no panic), deadlock-free capture that keeps the prefix past the cap, hard timeout, `Cancel` token shared by many runs, SIGTERM-then-SIGKILL grace, whole-process-group kill, opt-in rlimits, streaming with backpressure and NDJSON line framing, streaming stdin, opt-in `argsafe` argv validation. Compared with Python, ahead on cancellation/grace/group-kill in one API (Python has `timeout` and `Popen` signals, not a cancel token) *(inferred)*. **Where we are behind:** no redirection to an arbitrary fd number (`pass_fds` keeps the number, since 2026-10-20), no `umask`/`setsid` for the child (std has no pre-exec hook; `uid`/`gid` since 2026-10-20), no `close_fds` walk (a non-CLOEXEC parent fd reaches the child), no pipelines, no pty, no pidfd-based signalling (PID-reuse window narrowed, not closed: SPEC), Windows reap-race untested (→ Backlog).
+**Where we are ahead:** of Zig `std`, on everything a supervisor needs: reap-race-tolerant wait (no panic), deadlock-free capture that keeps the prefix past the cap, hard timeout, `Cancel` token shared by many runs, SIGTERM-then-SIGKILL grace, whole-process-group kill, opt-in rlimits, streaming with backpressure and NDJSON line framing, streaming stdin, opt-in `argsafe` argv validation. Compared with Python, ahead on cancellation/grace/group-kill in one API (Python has `timeout` and `Popen` signals, not a cancel token) *(inferred)*. **Where we are behind:** no redirection to an arbitrary fd number (`pass_fds` keeps the number), no `umask`/`setsid` for the child, no `close_fds` walk (a non-CLOEXEC parent fd reaches the child), no pipelines, no pty (all rejected: *What is deliberately not done*); no pidfd-based signalling (PID-reuse window narrowed, not closed: *Threat model*, *Backlog / deferred*), Windows reap-race untested (*Backlog / deferred*).
 
 ## Design & invariants
 
@@ -58,9 +58,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   deliberate (so the child can flush and exit instead of blocking on a full pipe), but it still
   reads and discards every byte the child writes: a hostile child that writes 1 GiB past a 1 KiB
   cap costs the caller ~1 GiB of read()s and wall time 1:1, regardless of the cap. `run()` has no
-  time bound of its own — pair a small cap with `runTimeout` (F1, 2026-09-10, made `runTimeout`
-  itself actually bounded) to also bound wall time, or with `Spec.rlimit`'s `address_space_bytes`/
-  `cpu_seconds` to bound the child's own resource use directly. See F5 in `A1/procrun.md`.
+  time bound of its own — pair a small cap with `runTimeout` (which is bounded) to also bound wall time, or with `Spec.rlimit`'s `address_space_bytes`/
+  `cpu_seconds` to bound the child's own resource use directly.
 - **`stderr = .stdout` is ONE pipe, created by us.** std can only give each stream its own pipe,
   which loses the write order between them. With a captured stdout, `spawnChild` makes one
   `O_CLOEXEC` pipe itself (`std.Io.Threaded.pipe2`), passes its write end to `std.process.spawn`
@@ -81,6 +80,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Concurrency:** reentrant — no shared module state beyond an idempotent, threadsafe
   `SIGCHLD`-fixup guard (`ensureChildReaping`/`restoreChildReaping`).
 
+- **Linux spawner (`src/vfork_spawn.zig`).** Zig 0.17's `std.process.spawn` forks, which copies the parent's page tables, so a spawn costs time proportional to the parent's mapped memory (and serialises on the mm lock under concurrent spawners). On Linux procrun spawns with `clone(CLONE_VM | CLONE_VFORK)` like musl/glibc `posix_spawn`, Go and Rust: the cost does not grow with the parent's memory. The child runs on memory shared with the parent, so everything it needs (argv, envp, PATH-search buffer, stack) is allocated before the clone; it allocates nothing and takes no lock; signals are blocked across the clone and every handled signal is reset to `SIG_DFL` before the mask is restored; a failure is reported as a code on a CLOEXEC pipe (`execve` closes it on success). Steps and error mapping follow `std.process.spawn` (same `SpawnError` values). Fallback to std's spawn: non-Linux targets, and `.inherit` when `/proc/self/environ` is unreadable (the child must never get an empty environment). Capture pipes are 256 KiB (`F_SETPIPE_SZ`, best effort). `.pipe` stdio is made by procrun itself (`PipeEnds`, POSIX) and closed on every error path, because std leaks the parent's pipe ends when its spawn fails. The structure follows musl 1.2.5 `posix_spawn.c` (MIT; ./NOTICE).
+- **Descriptors, credentials, signal mask.** `Spec.stdin` defaults to `.ignore` (`/dev/null`, Go's default): a closed fd 0 is reused by the child's first `open`, so `.close` stays available but is not the default. `Spec.pass_fds` keeps the listed descriptors open under the same numbers via std's `inherit_files` (CLOEXEC is cleared in the forked child only, so it is race-free); every other descriptor keeps its own CLOEXEC state, there is no `close_fds` walk. `Spec.uid`/`gid` are passed to std (`setreuid`/`setregid`; refusal is `error.PermissionDenied`; supplementary groups are not touched, as Python `user=` without `extra_groups`). `Spec.reset_signal_mask` (default `true`, as Go and Rust) starts the child with an empty signal mask on the vfork path; std's fallback spawn passes the current mask on (documented on the field). A NUL in any `argv` element, `cwd` or an env value is `error.NulByte` before anything is spawned (Go, Rust and Python refuse the same way; no opt-out). `Output.core_dumped` (`WCOREDUMP`, host policy: a piped `core_pattern` sets it even under `ulimit -c 0`) and `Output.rusage` (`wait4`'s record) come from `run`/`runTimeout`; `waitTolerantExit` is `waitTolerant` returning them.
+- **Graceful cancellation.** `Spec.cancel_grace_ns: ?u64` (default null = SIGKILL at once): on `Cancel.request` or the `runTimeout` deadline the killer thread sends SIGTERM (to `-pgid` with `new_process_group`), polls every 5 ms for the direct child to exit (Linux: `waitid(WNOHANG|WNOWAIT|WEXITED)`, non-consuming, so `waitTolerant` still gets the status), then SIGKILLs. The deadline path's pump deadline grows by the grace, keeping the invariant that SIGKILL was sent before the drainers give up. `Output.timed_out` (the deadline, as opposed to `canceled`) and `Output.grace_expired` (SIGKILL followed SIGTERM) say what happened. Streaming twin: `Handle.terminate(grace_ns) bool` / `terminateGroup`, blocking, from the owning thread, `true` = exited within the grace. A child that closes its stdout/stderr and keeps running is still waited for and killed at the deadline (Linux: after the pumps end `runKilled` waits for the exit with `WNOWAIT`; other POSIX targets have no non-reaping wait). Windows: no SIGTERM, `TerminateProcess` at once, grace ignored.
+- **Line-framed stdout.** `Callbacks.on_stdout_line` (replaces `on_stdout` when set) with `max_line_bytes` (default 1 MiB): `LineFramer` reassembles across reads. `\n` is stripped and ONE trailing `\r`; empty lines are delivered; a final unterminated line is flushed at EOF; an over-long line is delivered once, cut to `max_line_bytes` with `truncated = true`, the rest discarded to the next `\n` (memory stays bounded and the next line intact; an allocation failure is treated the same way). Backpressure is one permit per delivered line, acked once per callback, so a chunk holding many lines can block the reader mid-chunk. No JSON parser; stderr stays raw chunks.
+- **Streaming `Handle.wait`.** It observes the child's exit without reaping (`waitid WNOWAIT`, Linux); the readers then stop once the pipe has been idle for 250 ms (`default_pump_grace_ns`, not configurable; idle means inside `poll` only, never during callbacks or backpressure parking), so a descendant holding the pipe cannot hold `wait` unless it keeps writing (remedy: `new_process_group` + `killGroup`). Before the exit the readers wait in 500 ms `poll` slices. Join-before-reap and `on_exit`-after-the-last-chunk hold. `wait` does not close stdin or lift backpressure on entry: a child that reads stdin to EOF needs `closeStdin` first, and the consumer keeps acking while `wait` runs.
+- **`argv[0]` resolution.** Always against the PARENT's `PATH` (std does it), also under `Spec.rlimit`, where `resolveArgv0ForRlimit` resolves it before the wrapper shell runs (otherwise `exec "$@"` would search the child's `PATH`).
+- **`argsafe` and `Spec.rlimit` plumbing.** `runValidated`/`buildValidatedArgv` are opt-in; `Spec.rlimit` (`RlimitSpec`: `cpu_seconds`, `address_space_bytes`, `open_files`, `file_size_bytes`) goes through the `/bin/sh -c 'ulimit ...; exec "$@"'` wrapper because `std.process.spawn` has no pre-exec hook (the immediate child, the shell, sets its own limits; POSIX guarantees they survive `exec`). `Spec.new_process_group` (`setpgid(0, 0)`) with `Handle.cancelGroup`/`killGroup`/`signalGroup` and a grouped `runTimeout` deadline-kill reaches a killed child's own descendants. `Handle.writeStdin`/`closeStdin` stream stdin after `spawnStreaming` (`Spec.stdin = .pipe`), independent of `run`'s one-shot `stdin_body`.
+
 ## Threat model / out of scope
 
 Not a full sandbox: no seccomp/namespace isolation (that remains the caller's responsibility); an
@@ -88,10 +95,7 @@ opt-in `RlimitSpec` (`Spec.rlimit`) covers the resource-exhaustion axis only (CP
 open-files/file-size), applied via a `/bin/sh -c 'ulimit ...; exec "$@"'` wrapper — see SPEC below
 for why (`std.process.spawn` has no post-fork/pre-exec hook). **`Spec.rlimit` therefore hard-depends
 on `/bin/sh` existing and being POSIX-`ulimit`-capable — a caller sandboxing a distrusted program
-with `rlimit` runs a shell first to get there.** (F6, 2026-09-10: an earlier audit's headline PASS —
-"no `/bin/sh`, no `-c`, anywhere in the module" — was true before `rlimit` existed and is not
-true now; not rewritten in place, since it is a dated snapshot, but recorded here and in
-`A1/procrun.md`'s 2026-09-10 disposition.) Only numeric limit VALUES (formatted by this module,
+with `rlimit` runs a shell first to get there.** Only numeric limit VALUES (formatted by this module,
 never caller-supplied text) are embedded in the generated script, and `Spec.argv` reaches the
 shell as positional parameters (`"$@"`), never re-parsed as shell syntax — so this does not by
 itself reopen a shell-injection surface, it only adds the dependency. `argsafe` integration
@@ -106,7 +110,7 @@ killed child's own descendants (e.g. a shell's `&`-backgrounded jobs) are reacha
 only covers descendants that stayed in the group the kernel assigns at fork; a descendant that
 calls `setsid`/`setpgid` itself escapes it, same as any POSIX process-group signal.
 
-**Cancelling a blocking run (2026-09-28, requested by the terminal-UI consumer).** `Spec.cancel` borrows a
+**Cancelling a blocking run.** `Spec.cancel` borrows a
 `Cancel` token; `Cancel.request` (any thread, sticky, one token may serve many concurrent runs)
 makes every run carrying it SIGKILL its child — the group with `new_process_group` — and return
 the captured output with `Output.canceled` set. A token already requested at the call spawns
@@ -120,175 +124,60 @@ wakes each run's killer through an intrusive list under a mutex; the flag is sto
 run registering concurrently either is woken or finds it set.
 
 **Signalling a pid we may no longer own (PID reuse).** The premise of this module — a sibling
-thread's `wait4(-1)` can reap our child — has a second edge nothing addressed until 2026-09-03.
+thread's `wait4(-1)` can reap our child — has a second edge.
 When somebody else reaps the child, the pid becomes FREE for the host's next `fork`, while
 `child.id` is still set (nothing nulls it until `waitTolerant` runs) and, on the `runTimeout`
-path, the killer thread is still armed and can fire up to the deadline. Both `deliver` and
-`deliverGroup` then signalled that pid regardless — and `deliverGroup`'s form is
-`kill(-pid, SIGKILL)`, i.e. an entire recycled process **group**. Reproduced: after an
-out-of-band reap, `child.id` is still set and both paths proceeded to signal the freed pid.
+path, the killer thread is still armed and can fire up to the deadline. Without a guard both `deliver` and
+`deliverGroup` would signal that pid regardless — and `deliverGroup`'s form is
+`kill(-pid, SIGKILL)`, i.e. an entire recycled process **group**.
 
-Every signal now passes `stillOurChild(pid)` first — `waitid` with `WNOHANG | WNOWAIT`, which is
+Every signal passes `stillOurChild(pid)` first — `waitid` with `WNOHANG | WNOWAIT`, which is
 non-destructive (it never consumes the status `waitTolerant` still needs), non-blocking for a
 running child or a zombie alike, and answers `ECHILD` exactly when the pid is no longer ours.
 
 ⚠ **This narrows the window; it does not close it.** The pid can be reaped between that answer
 and the `kill`. Closing it properly means signalling through a `pidfd` opened at spawn
-(`pidfd_open` / `pidfd_send_signal`), which is immune to reuse by construction — deferred rather
-than done, because it costs a descriptor per child and needs a fallback for kernels without it,
+(`pidfd_open` / `pidfd_send_signal`), which is immune to reuse by construction — not done, because it costs a descriptor per child and needs a fallback for kernels without it,
 and because `std.process.spawn` gives no hook to open the pidfd atomically with the fork. Also
 Linux-only: on other POSIX targets `stillOurChild` answers "ours" unconditionally and the
 unguarded behaviour stands. Actual pid RECYCLING was not reproduced (it needs the pid counter
 forced to wrap); what is pinned by a test is the gate itself, in both directions.
 
+**Residual risks and caller contracts.**
+- `Handle.writeStdin` blocks the calling thread until the child reads; there is no deadline variant. A caller that needs one writes from its own thread.
+- `run` without `runTimeout`/`Spec.cancel` waits for pipe EOF without bound; a descendant holding the pipe holds `run`.
+- A child that exits on its own without reading all of `stdin_body` makes `run`/`runTimeout` return `error.BrokenPipe` and drop the captured output (a listed oracle difference: Python and Go swallow EPIPE; the build-tool consumer relies on it). When procrun itself kills the child (deadline/cancel) the EPIPE is swallowed and the `Output` is returned with `timed_out`/`canceled`.
+- `Handle.kill`/`cancel`/`signal*`/`terminate` from another thread racing `Handle.wait` is a use-after-free of the context (`wait` frees it) and is not allowed; call `wait` exactly once. A refcounted `Handle` would lift this (*Backlog / deferred*).
+- `Spec.stream_permits` of 0 is treated as 1 and a huge value cannot make cancel/kill spin.
+- The stdin writer of a `runTimeout`/`Cancel` run is deadline-bounded (non-blocking writes polled in slices of at most 50 ms).
+
 ## Verification
 
-Deterministic tests over real spawned processes (`git`, `sleep`, `cat`, `dd`, `/bin/sh`, and
-synthetic scripts) plus the reap-race regression itself (a sibling-thread `wait4(-1)` racing the
-runner's own wait): blocking run + capture, capped-output truncate-not-discard,
-stdin-larger-than-pipe-buffer non-deadlock, all three env modes, hard-timeout SIGKILL+reap,
-streaming spawn with ack/cancel/kill/signal and `on_exit` firing exactly once,
-**`Spec.new_process_group` + `Handle.killGroup` actually reaping a `sh -c 'sleep 100 &'`
-grandchild** (polled against `/proc/<pid>/stat`'s state byte, not just `kill(pid,0)`, so a
-not-yet-reaped zombie can't pass for "still running"), **`RlimitSpec.file_size_bytes` biting real
-`dd` output** (asserted via both `Term.signal == SIGXFSZ` and the file's on-disk size staying at
-the cap) and **`RlimitSpec.cpu_seconds` terminating a busy loop** well inside a generous
-`runTimeout` safety net (proving the *rlimit*, not the safety net, fired), **`Handle.writeStdin`/
-`closeStdin` round-tripping incremental chunks through `cat`** plus their unavailable/double-close
-error paths, and **`runValidated` rejecting a flag-injection-shaped arg via `argsafe` before
-spawning anything** alongside an accept-and-actually-run case, and **`Cancel`**: a run stopped
-from another thread returns its partial stdout promptly, a pre-requested token spawns nothing, one
-token stops three concurrent runs (all unregistered after), a grandchild outside the group holding
-stdout cannot hold the return past the grace, and an unrequested token changes nothing. Mutants
-(one schemata build, 2026-09-28): the killer ignoring the token, no late drain deadline, and
-`request` not waking — all three caught. Stdio redirection (2026-09-30): stderr merged into stdout keeps the child's write order (`a`,`b`->stderr,`c`,... arrives as `abcde`, stderr empty) under `run`, `runTimeout`, `Cancel`, streaming and line framing; `.ignore` discards 2 MiB of output and gives `cat` an immediate EOF; `.file` output/input round-trips through a temp dir and stays open for the caller; impossible combinations return `error.InvalidStdio`. Run: `zig build test-procrun`.
+- **Run:** `scripts/modtest procrun` (`zig build test-procrun`); benchmark `zig build bench-procrun`.
+- **Process tests** over real spawned programs (`git`, `sleep`, `cat`, `dd`, `/bin/sh`, synthetic scripts) in `src/root.zig` and the no-panic regressions in `src/sweep_test.zig`: blocking run and capture, capped output truncating (not discarding), a stdin body larger than the pipe buffer without deadlock, the three env modes, hard-timeout SIGKILL and reap, the reap-race regression itself (a sibling thread's `wait4(-1)` racing the runner's wait), streaming spawn with ack/cancel/kill/signal and `on_exit` firing exactly once, `Handle.writeStdin`/`closeStdin` incremental round trips and their error paths.
+- **Process groups and rlimits:** `new_process_group` + `killGroup` reaping a `sh -c 'sleep 100 &'` grandchild (polled against `/proc/<pid>/stat`'s state byte, so a zombie cannot pass for "still running"); `RlimitSpec.file_size_bytes` biting real `dd` output (`SIGXFSZ` and the on-disk size at the cap) and `cpu_seconds` ending a busy loop well inside the safety-net timeout.
+- **Cancel:** a run stopped from another thread returns its partial stdout promptly, a pre-requested token spawns nothing, one token stops several concurrent runs (all unregistered after), a grandchild outside the group holding stdout cannot hold the return past the grace, an unrequested token changes nothing; the graceful-stop classes (SIGTERM honoured, ignored, grace expiry).
+- **Stdio:** stderr merged into stdout keeps write order under `run`, `runTimeout`, `Cancel`, streaming and line framing; `.ignore` discards output and gives EOF on stdin; `.file` round-trips and stays open for the caller; impossible combinations are `error.InvalidStdio`; `pass_fds`, `reset_signal_mask` (the child's `SigBlk`), `error.NulByte`, `runValidated` rejecting a flag-injection-shaped argument before spawning.
+- **Oracle (model):** `src/oracle_test.zig` replays the scenarios of `src/oracle_scenarios.json` against the frozen results of Python 3.14 `subprocess` (`src/oracle_results.json`, produced by `python3 -I tools/oracle/run_python.py`; no Python at test time): exits, signal deaths, spawn errors, capture/merge/caps, stdin, env, cwd, fds, process groups, timeouts. Invariants: stable fd count over repeated runs, no zombie. The deliberate differences carry a `diff` reason in the scenario file (stdin EPIPE surfaces as `error.BrokenPipe`; no `close_fds` walk).
+- **Fuzz:** none (no fuzz obligation; see the card's Hardening line). **ctgrind:** n/a, a process runner.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## What is deliberately not done
+
+- **`setsid`, `umask`, `PDEATHSIG`:** `std.process.spawn` has no pre-exec hook, so they are not possible without a shell wrapper; `new_process_group` plus group kill covers the clean case. Python's `start_new_session`/`umask` have no counterpart.
+- **PATH policy, `close_fds` walk, pipelines (`a | b`), pty:** not built; none is a common need for the daemon use this module targets, and a PATH policy needs an own resolver and decisions (X_OK semantics, whose PATH under `.merge`) that a consumer must state first.
+- **Windows parity beyond compiling:** out of scope without a Windows runner (`new_process_group` is a no-op, `rlimit` is `error.OperationUnsupported`).
+- **Type-level "consumed" marker for `Handle`:** rejected. Zig has no move-only types, so any compile-time marker is defeated by copying the by-value `Handle`; a runtime flag cannot live in the state `wait` frees (a second `wait` is a use-after-free, not a detectable state) and keeping the state alive would leak per handle. The contract stays documented: call `wait` exactly once.
+- **Stop-signal helper for a daemon's own SIGTERM/SIGINT:** lives in the `stopsignal` module.
+- **Child `setgroups`:** not provided (std has none); supplementary groups are kept.
 
 ## Backlog / deferred
 
-**S2 plan — survey 2026-10-20** (Sonnet, read-only; Python subprocess, Go os/exec, Rust std::process, duct,
-libuv, Zig std.process). Main finding: on Zig 0.17 the "NOT POSSIBLE" items below are stale — std's
-`SpawnOptions.inherit_files`/`inherit_dirs` clear CLOEXEC after fork (Python's own `pass_fds` mechanism)
-and `uid`/`gid` exist.
-
-| # | Item | Effort | Decision |
-|---|---|---|---|
-| R1 | `Spec.pass_fds` via std's `inherit_files` (same fd number in the child, as Python) | S | **DONE 2026-10-20** |
-| R2 | `uid`/`gid` pass-through | S | **DONE 2026-10-20** (no setgroups, documented) |
-| R3 | Default stdin `.close` → `/dev/null` (Go's default; a closed fd 0 is reused by the child's first open) | S | **DONE 2026-10-20** — breaking default; the terminal-UI consumer (`source.zig:121`, `data.zig:194`) used it and gets the safer one, the build-tool consumer sets `.close` explicitly |
-| R4 | Core-dump flag next to `Term` | S | **DONE 2026-10-20** — `Output.core_dumped` (host policy: a piped core_pattern sets it even under `ulimit -c 0`) |
-| — | `rusage` via std's `request_resource_usage_statistics` | S | **DONE 2026-10-20** — `Output.rusage` |
-| — | EPIPE on stdin when the child stops reading: Python and Go swallow it, we return `error.BrokenPipe` | – | kept — the build-tool consumer's `runPhaseLabel` depends on it; a listed oracle difference |
-| — | Review 2026-10-20 of `vfork_spawn` (Sonnet): no HIGH; M1 `.inherit` without a readable /proc/self/environ now falls back to std's spawn (never an empty env); M2 capture pipes 256 KiB, not 1 MiB (user pipe-page quota); L1–L3 fixed (fd leak on a failed lift, error mapping, signal-mask init) | – | **FIXED 2026-10-20** |
-| — | Zig 0.17 std leaks the parent's pipe ends when `processSpawnPosix` fails (found by the fd invariant) | – | worked around: `.pipe` streams are made by procrun (`PipeEnds`) and closed on error, POSIX |
-| R10 | pidfd signalling (PID-reuse window) | M | do if time allows |
-| R6/R8 | `setsid`, PDEATHSIG | – | not doing — std has no pre-exec hook; `new_process_group` + group kill covers the clean case |
-| R5/R7/R9/R11/R13 | PATH policy, umask, close_fds walk, pipelines, pty | – | not doing (reasons in the survey) |
-| R14 | Windows parity tests | M | out of scope without a Windows runner |
-
-Evidence plan (E3 → E2): a scenario table run through procrun and through Python `subprocess` (and Go for
-signals/fds) comparing exit/signal, captured bytes (SHA-256), env seen by the child, cwd, `/proc/self/fd`,
-process groups, timeouts; invariants: no zombie, no fd/thread leak. Bench: Go os/exec as the reference,
-Rust std::process as fastest; spawn+wait ×2000, 8 concurrent spawners, 100 MB capture, cat round trip.
-
-- ~~**Graceful cancellation**~~ — DONE 2026-09-29. `Spec.cancel_grace_ns: ?u64` (default null =
-  SIGKILL at once, unchanged): on `Cancel.request` or the `runTimeout` deadline the killer thread
-  sends SIGTERM (to `-pgid` with `new_process_group`), polls every 5 ms for the direct child to
-  exit (Linux: `waitid(WNOHANG|WNOWAIT|WEXITED)`, non-consuming, so `waitTolerant` still gets the
-  status), then SIGKILLs. The deadline path's pump deadline grows by the grace, keeping the
-  invariant that SIGKILL was sent before the drainers give up. `Output.timed_out` (new; the
-  deadline, as opposed to `canceled`) and `Output.grace_expired` (SIGKILL followed SIGTERM) say
-  what happened. Streaming: `Handle.terminate(grace_ns) bool` / `terminateGroup` — blocking, from
-  the owning thread, `true` = exited within the grace. Windows: no SIGTERM, TerminateProcess at
-  once, grace ignored. Non-Linux POSIX: exit is only noticed via pipe EOF (run) or never
-  (`terminate` always SIGKILLs after the grace, harmlessly at a zombie). ~~A child that closes its
-  stdout/stderr and keeps running made `runKilled` stop the killer once the pipes hit EOF, so it
-  was then waited for, not killed~~ — fixed 2026-09-29 on Linux: after the pumps end, `runKilled`
-  waits for the exit itself (`waitid` with `WNOWAIT`, so the pid stays ours) while the killer
-  still guards the deadline and the token. Other POSIX targets keep the old behaviour (no
-  non-reaping wait there).
-- ~~**Line-delimited / NDJSON stdout mode**~~ — DONE 2026-09-29. `Callbacks.on_stdout_line`
-  (replaces `on_stdout` when set) + `max_line_bytes` (default 1 MiB): `LineFramer` reassembles
-  across reads. Decisions: `\n` stripped and ONE trailing `\r` stripped; empty lines delivered;
-  a final unterminated line is flushed at EOF; an over-long line is delivered once, cut to
-  `max_line_bytes` with `truncated = true`, the rest discarded to the next `\n` (so memory is
-  bounded and the next line is intact; an allocation failure is treated the same way); backpressure
-  is one permit per delivered line, acked once per callback, so a chunk holding many lines can
-  block the reader mid-chunk. No JSON parser. stderr is unchanged (raw chunks).
-- **Windows reap-race coverage** — the `TerminateProcess`/`create_no_window` branch compiles but is
-  untested for the POSIX-specific regression this module exists to fix. Still open.
-  `new_process_group`/`RlimitSpec` are also POSIX-only (`new_process_group` is a documented no-op,
-  `rlimit` is `error.OperationUnsupported`) on Windows.
-- ~~**Type-level "consumed" marker**~~ — REJECTED 2026-09-29. Zig has no move-only/linear types:
-  `Handle` is a plain by-value struct (a pointer), so any compile-time marker (a phantom type
-  parameter, a `wait` that returns a different type) is defeated by copying the value, and the
-  language cannot flag a use after `wait`. A runtime check does not work either: `wait` frees the
-  state the flag would live in (a second `wait` is a use-after-free, not a detectable state), and
-  keeping the state alive would leak per handle; `wait(*Handle)` that nulls its pointer would
-  break the existing by-value signature for a check that still misses copies. The contract stays
-  documented ("call `wait` exactly once").
-- **PATH-resolution policy** — explicit control over `argv[0]` PATH resolution independent of
-  `argsafe` (now wired in for argv *sanitization* via `runValidated`/`buildValidatedArgv`). Still
-  open, deliberately not done 2026-09-29: it is not a small knob. Today resolution is fixed to the
-  PARENT's `PATH` (std does it itself). Any real policy (`.parent` | `.child_env` | `.none`/
-  explicit `path` string) needs our own resolver for everything but `.parent` — including the
-  non-rlimit path, where `std.process.spawn` cannot be told to search another `PATH` — plus a
-  decision on X_OK-vs-file semantics and on `env_mode = .merge` (whose PATH?). Do it when a
-  consumer states which policy it needs. ~~One specific gap in it~~ — F2, 2026-09-10, fixed: under `Spec.rlimit`
-  the `exec "$@"` inside the wrapper shell used to resolve a `/`-less `argv[0]` against the
-  SHELL's (i.e. the child's, per `env_mode`) `PATH`, breaking `Spec`'s own documented promise that
-  resolution "ALWAYS reads from the real parent process environment, regardless of `env_mode`" —
-  true without `rlimit` (`std.process.spawn` resolves it directly, against the real environment),
-  false with it. `argv[0]` is now resolved against the parent's real `PATH` before the shell ever
-  runs (`resolveArgv0ForRlimit`), so the promise holds in both cases.
-- ~~**Process-group / `setsid` + whole-tree kill**~~ — done: `Spec.new_process_group` (`setpgid(0,
-  0)`) + `Handle.cancelGroup`/`killGroup`/`signalGroup` + a grouped `runTimeout` deadline-kill.
-- ~~**rlimit control**~~ — done: `Spec.rlimit` (`RlimitSpec`: CPU/address-space/open-files/
-  file-size), applied via a `ulimit`-then-`exec` shell wrapper (`std.process.spawn` has no
-  post-fork/pre-exec hook to call `setrlimit` directly in the child).
-- ~~**Streaming stdin after spawn**~~ — done: `Handle.writeStdin`/`closeStdin` on a
-  `spawnStreaming` handle (`Spec.stdin = .pipe`), independent of the one-shot `stdin_body` on
-  `run`/`runTimeout`.
-- ~~**`argsafe` integration**~~ — done: `runValidated`/`buildValidatedArgv` (opt-in; ordinary
-  `run`/`runTimeout`/`spawnStreaming` still treat `Spec.argv` as trusted).
-
-- ~~**`stderr` merged into `stdout` (`2>&1`), `/dev/null`, redirect to a file**~~ — DONE 2026-09-30.
-  `StdioMode` is now a union: `.ignore`, `.file: std.Io.File` (caller-owned) and, for `Spec.stderr`,
-  `.stdout` (one shared pipe, order preserved; see Design & invariants). `.close` stays.
-- ~~**`pass_fds`** — NOT POSSIBLE over Zig 0.16~~ **DONE 2026-10-20** over Zig 0.17's `SpawnOptions.inherit_files` (CLOEXEC cleared in the forked child; same fd number).
-- **Child credentials and session:** `uid`/`gid` **DONE 2026-10-20** (std pass-through; no `setgroups` — supplementary groups are kept, as Python `user=` without `extra_groups`); `umask`, `setsid` still not possible (survey 2026-09-30): Python `user`/`group`/`umask`/`start_new_session`; effort medium-large because `std.process.spawn` has no pre-exec hook (the reason `rlimit` goes through a shell). `new_process_group` is the one that exists. Fits §2 only if std grows the hook or a shell wrapper is accepted.
-- **pidfd signalling** (survey 2026-09-30): already deferred in the SPEC (closes the PID-reuse window). Effort medium. Fits §2.
-- **Pipelines (`a | b`)** (survey 2026-09-30): duct's headline feature; not a common need for the daemon use this module targets, listed as a gap for completeness. Effort large. Fits §2.
-
-**No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons:
-- `Handle.writeStdin` blocks the calling thread until the child reads (documented); there is no deadline variant. A caller that needs one writes from its own thread.
-- `run` without `runTimeout`/`Spec.cancel` waits for pipe EOF without bound (documented); a descendant holding the pipe holds `run`.
-- A child that exits on its own without reading all of `stdin_body` makes `run`/`runTimeout` return `error.BrokenPipe` and drop the captured output (documented, the build-tool consumer relies on it; not a crash). When procrun itself kills the child (deadline/cancel) the EPIPE is swallowed and the `Output` returned with `timed_out`/`canceled` (D9, 2026-10-30).
-- REV-PR-1 (D7, caller contract, documented 2026-10-30): streaming `Handle.wait` does not close stdin or lift backpressure on entry (the build-tool consumer and the terminal-UI consumer call it on a waiter thread while another thread acks); a child that reads stdin to EOF needs `closeStdin` first, and the consumer must keep acking while `wait` runs.
-- REV-PR-2 (D8, 2026-10-30): `Handle.wait` observes the child's exit without reaping (`waitid WNOWAIT`, Linux), then readers stop once the pipe has been idle 250 ms (`default_pump_grace_ns`, not configurable; idle = inside `poll` only, never during callbacks or backpressure parking). Join-before-reap and `on_exit`-after-last-chunk unchanged. A descendant that keeps writing keeps the stream alive (remedy: `new_process_group` + `killGroup`). Before the exit the readers wait in 500 ms `poll` slices. Windows: unchanged.
-- **Refcounted `Handle` for watchdog threads** (D10): `Handle.kill`/`cancel`/`signal*`/`terminate` from another thread racing `Handle.wait` is a use-after-free of the context (`wait` frees it); documented as not allowed. A refcounted handle would lift that.
-- ~~NUL bytes inside `argv`/`env` strings truncate the C string silently on the vfork path~~ **DONE 2026-11-19:** `run`/`runTimeout`/`spawnStreaming` return `error.NulByte` before spawning for a NUL in any `argv` element, `cwd`, or (when `env_mode` uses `Spec.env`) an env value (`Environ.Map.put` already asserts on a NUL in a key). Decision rule: reference/majority and security agree (Go `os/exec`: `syscall.ByteSliceFromString` -> EINVAL; Rust `Command`: "nul byte found in provided data"; Python `subprocess`: `ValueError: embedded null byte`); a NUL cannot be passed to a child by any means, so no opt-out. `runValidated` still adds the `argsafe` discipline on top.
-- ~~**Stop-signal helper (consumer request 2026-11-15)**~~ — **moved to the new module `stopsignal`** (`StopSignals.init/wait/poll/fd/deinit`, 2026-11-15); nothing left here.
-- ~~**Reset the child's signal mask (found while writing `stopsignal`, 2026-11-15; effort S).** The vfork spawner restores the parent's CURRENT mask in the child before `execve` (`vfork_spawn.zig` `childMain`: `sigprocmask(SETMASK, &a.old_mask)`), and std's fork path leaves it alone too, so a child spawned by a program that holds blocked signals (a `stopsignal.StopSignals` in a daemon) starts with SIGTERM/SIGINT blocked: the `cancel_grace_ns` SIGTERM stays pending and only the SIGKILL works. Wanted: `Spec.reset_signal_mask: bool` (default `true`, as Go's `os/exec` and Rust's `Command` start children with an empty mask) applied in `childMain`, plus the same for the std fallback path if reachable. Default flip is consumer-visible, hence a decision for the owner.~~ **DONE 2026-11-15:** `Spec.reset_signal_mask` (default `true`, the Go/Rust behaviour; `false` keeps the inherited mask) on the vfork path; std's fallback spawn has no mask hook and still passes the mask on (documented on the field). Test `reset_signal_mask:` reads the child's `SigBlk`.
-
-## Status
-
-`extract · any (full behavior on POSIX; reap-race handling, new_process_group, and rlimit are
-POSIX-only) · util · reentrant` + deps: `argsafe` (opt-in argv sanitization via `runValidated`/
-`buildValidatedArgv`; every other entry point is std-only) — canonical source is `pub const meta`
-in src/root.zig.
-
-**Audit 2026-11-15 (delta mutation).** 9 schemata mutants over the `reset_signal_mask` path, ReleaseSafe, one build, each
-mutant under `setsid -w timeout` and `ulimit -v`: the plumbing (`Spec` to `Options` to the child's arguments: forced
-true, forced false), the child's choice (flag inverted, always empty, always inherited), the `rt_sigprocmask` call skipped,
-the empty set replaced by a full one. All 9 killed by the existing signal-mask test; no test needed. The two
-defaults (`Spec.reset_signal_mask = true` and the internal `Options` one) cannot sit behind a runtime switch: the
-`Spec` default is exercised by that same test (it runs a child without naming the field and expects an empty mask), but
-was not mutated by a run; the `Options` default is never relied on, since `procrun` always passes the field. 9/9.
-
-**Audit 2026-11-19 (delta mutation, `rejectNul`).** 8 schemata mutants over the NUL refusal in `spawnChild`, ReleaseSafe, one
-build: the argv check dropped and inverted, the `cwd` check dropped, the env-value check dropped and inverted, the
-`env_mode != .inherit` guard flipped and forced open, the `rejectNul` call skipped. All 8 killed by the test `NUL inside argv,
-cwd or env is refused before spawning`. 8/8. Card count cumulative: 3 (2026-09-28) + 9 (2026-11-15, above) + 8 = 20/20 over three different sources; a whole-module run is still outstanding.
+- **pidfd signalling (R10).** Signal through a `pidfd` opened at spawn (`pidfd_open`/`pidfd_send_signal`) to close the PID-reuse window that `stillOurChild` only narrows. Costs a descriptor per child, needs a fallback for kernels without it, and `std.process.spawn` gives no hook to open it atomically with the fork (the vfork spawner could). Effort medium.
+- **Windows reap-race coverage.** The `TerminateProcess`/`create_no_window` branch compiles but is untested for the POSIX-specific regression this module exists to fix; needs a Windows runner.
+- **Refcounted `Handle` for watchdog threads (D10).** Lifts the "no `kill`/`cancel`/`signal*`/`terminate` racing `wait`" rule (use-after-free of the context today).
+- **PATH-resolution policy.** Explicit control over `argv[0]` resolution (`.parent` | `.child_env` | `.none`/explicit `path`); needs an own resolver for everything but `.parent`, including the non-rlimit path, plus decisions on X_OK-vs-file semantics and on `env_mode = .merge`. Do it when a consumer states which policy it needs.
+- **Deadline variant of `Handle.writeStdin`.** None today; callers write from their own thread.
 
 ## Anchoring
 
