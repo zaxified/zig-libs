@@ -1188,9 +1188,9 @@ pub const DecryptError = std.crypto.ff.NullExponentError || std.crypto.ff.Repres
 /// multiple of `n` (`c` not a ciphertext under this key) — both
 /// `error.InvalidCiphertext`, never a silently decrypted garbage value.
 ///
-/// `L` was `std.math.big.int`'s variable-time `divFloor` until.
-/// Its quotient is `m·λ mod n`, so its timing was a function of the
-/// plaintext and of `λ` — measured reaching that line (ctgrind
+/// `L` is computed on montint limbs, not with `std.math.big.int`'s
+/// variable-time `divFloor`, whose quotient is `m·λ mod n`: its timing would
+/// be a function of the plaintext and of `λ` — measured reaching that line (ctgrind
 /// `paillier/crt`, `noncrt`; `threshold_ecdsa` F5 and `paillier` F3 traced
 /// what it could reveal). Exact division by a known odd divisor needs no
 /// long division: `q = (x − 1)·n⁻¹ mod 2^(64·L)` is the quotient whenever
