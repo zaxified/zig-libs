@@ -1,7 +1,7 @@
 # aaa-gate
 
 Bearer-token authentication + audit hook + denied-request throttle as a
-`router` middleware — the AAA layer of the Web/API cluster. Wave P1.
+`router` middleware — the AAA layer of the Web/API cluster.
 
 Provenance: original work of the zig-libs authors (MIT); modeled after envoy
 ext_authz (Apache-2.0) and oauth2-proxy (MIT) — bearer-gate behavior only, no
@@ -15,7 +15,8 @@ RFC 9110. Data: the only committed data files are `tools/go_bench/go.mod`/`go.su
   lock; no hidden globals, caller-supplied allocator.
 - **Deps:** `router` (Middleware/Ctx/Next, the reserved `Ctx.data` slot),
   `http` (`Request.header`/`peerAddress`, `ResponseWriter`), `b64ct`
-  (constant-time Basic credential decoding).
+  (constant-time Basic credential decoding), `cookies` (cookie-source lookup, `cookieValue`),
+  `clock` (`Options.clock`).
 
 Import name: the module registers as **`aaa-gate`** —
 `@import("aaa-gate")` (a hyphen is fine in a module name, like
@@ -87,8 +88,8 @@ try gate.addBasicUser("ci", ci_pw); // rotation: gate.removeBasicUser(user, pw)
 
 A form-field source is deliberately absent: the gate runs before the handler
 and reading the urlencoded body would consume it. `Identity.scheme` is
-`.basic` for a Basic login; the username is not kept (digests only) — use
-`basic_verify` if a handler needs it.
+`.basic` for a Basic login and `Identity.user` carries the presented user name
+(the password is never kept).
 
 A bearer store the gate cannot mirror (an operator token file another
 process rewrites), a JSON denial body, and one open endpoint:
@@ -267,7 +268,8 @@ header values out of your request type remains yours.
   `on_audit` on every single denial. Responses are never
   throttled — every denied request still gets its 401. The store is
   bounded (`throttle_max_keys`, default 1024, LRU eviction; evicting a
-  key may drop its pending fold count — bounded memory wins). Clock
+  key may drop its pending fold count — bounded memory wins). The map hash is seeded per instance (`Options.io`, or
+  `Options.throttle_seed` to pin it) so crafted keys cannot collide on purpose. Clock
   injected via `Options.clock` (POSIX `clock_gettime(MONOTONIC)` /
   QueryPerformanceCounter by default) for deterministic tests. On
   allocator exhaustion the throttle **fails open** — the denial is
@@ -283,8 +285,13 @@ header values out of your request type remains yours.
   strip those headers at the edge. `KeyFn` is handed a
   `*[client_key_len_max]u8` scratch buffer to render the address into and
   `formatPeerKey` does the rendering, so that extractor needs no storage of
-  its own — before 2026-09-17 it had nowhere to write, which made this
-  recommendation one a caller could not follow race-free.
+  its own.
+
+## Not provided
+
+No form-field key lookup, no error handler beyond the `deny_body` data, no token issuance or OAuth2/OIDC
+(use `jwt`), no fine-grained authorization. The reasons are in SPEC *What is deliberately not done* and
+*Threat model*; open items are in SPEC *Backlog / deferred*.
 
 ## Verification
 

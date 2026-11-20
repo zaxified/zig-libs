@@ -21,7 +21,7 @@
 
 **Downstream consumer:** yes
 
-Auth + audit front for an API (Bearer/API-key gate). Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Auth + audit front for an API (Bearer/API-key gate). Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -29,14 +29,14 @@ Re-surveyed 2026-10-17 (first 2026-09-30) per `SURVEY-PLAYBOOK.md`; stars and ac
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [labstack/echo](https://github.com/labstack/echo) (`middleware/key_auth.go`) — **reference** | Go | MIT | 32.7k | v5.4.0 (2026-09-27) | The closest widely used "static key / bearer gate" middleware. Its config (source read 2026-10-17): key lookup from header (optional prefix), query, form or cookie, several sources tried in order, a `Skipper`, a caller `Validator`, an `ErrorHandler`. Comparing the key safely is left to the caller's `Validator`. `basic_auth.go` is a separate middleware (realm default `Restricted`, `Validator(user, password)`, `WWW-Authenticate: Basic realm` on a miss). Here: header-with-prefix/query/cookie sources (`api_key_sources`), `exempt` = Skipper, `*_verify` = Validator, Basic as `AuthMode.basic`/`.any`; **not offered, by design:** form-field lookup (reading the body would consume it for the handler), `ErrorHandler`, `AllowedCheckLimit`; `ContinueOnIgnoredError` only for an absent credential (`credentials_optional`). |
+| [labstack/echo](https://github.com/labstack/echo) (`middleware/key_auth.go`) — **reference** | Go | MIT | 32.7k | v5.4.0 (2026-09-27) | The closest widely used "static key / bearer gate" middleware. Its config (source read 2026-10-17): key lookup from header (optional prefix), query, form or cookie, several sources tried in order, a `Skipper`, a caller `Validator`, an `ErrorHandler`. Comparing the key safely is left to the caller's `Validator`. `basic_auth.go` is a separate middleware (realm default `Restricted`, `Validator(user, password)`, `WWW-Authenticate: Basic realm` on a miss). Here: header-with-prefix/query/cookie sources (`api_key_sources`), `exempt` = Skipper, `*_verify` = Validator, Basic as `AuthMode.basic`/`.any`; **not offered:** form-field lookup, `ErrorHandler`, `AllowedCheckLimit` (see *What is deliberately not done*); `ContinueOnIgnoredError` only for an absent credential (`credentials_optional`). |
 | [tower-rs/tower-http](https://github.com/tower-rs/tower-http) (`auth`, `validate_request`) | Rust | MIT (`tower-http/LICENSE`; the API reports no licence) | 919 | tower-http-0.7.1 (2026-08-31) | Header-validation layers over `http`; fixed-header bearer/basic checks *(inferred: only the file names were listed)*. No audit hook, no throttle. |
 | [oauth2-proxy/oauth2-proxy](https://github.com/oauth2-proxy/oauth2-proxy) | Go | MIT | 15.0k | v7.15.4 (2026-08-20) | A different problem: an interactive OAuth2/OIDC login proxy or middleware (README). Not a static-credential gate; the equivalent here is `jwt` + `sessions`. |
 | [envoyproxy/envoy](https://github.com/envoyproxy/envoy) (`ext_authz`) | C++ | Apache-2.0 (source not read) | 29.0k | v1.39.1 (2026-08-27) | Delegates the decision to an external authorization service *(inferred)*; a deployment pattern, not a library. This module's README names it as behaviour model only. |
 | [zigzap/zap](https://github.com/zigzap/zap) (authenticators) | Zig over C (facil.io) | MIT | 3.4k | v0.11.0 (2025-08-28); **archived** | README lists an authenticated-endpoint example and `doc/authentication.md`; C-backed and archived. |
 | [karlseguin/http.zig](https://github.com/karlseguin/http.zig) | Zig | MIT | 1.6k | no release; pushed 2026-08-26 | Ships a middleware mechanism; its README documents no ready-made bearer/API-key gate (it shows reading the `Authorization` header by hand). |
 
-**Where we are ahead:** the only one of these with the comparison built in and constant-time (`secretEqual`, digest scan), with credential **rotation** (`addToken`/`removeToken`), an **audit hook** with a coalescing denied-request throttle, a fail-closed empty credential set (a verifier callback also closes the plane), a router-free decision core (`verify`, `bearerTokenOf`, `clientKeyFrom`) and a wire-level test corpus. **Where we are behind:** no form-field key lookup (the body cannot be read without consuming it), no username on `Identity` for Basic (digests only; use `basic_verify`), and the 401 body is data (`deny_body`), not an arbitrary error handler, by design (see *Design & invariants*).
+**Where we are ahead:** the only one of these with the comparison built in and constant-time (`secretEqual`, digest scan), with credential **rotation** (`addToken`/`removeToken`), an **audit hook** with a coalescing denied-request throttle, a fail-closed empty credential set (a verifier callback also closes the plane), a router-free decision core (`verify`, `bearerTokenOf`, `clientKeyFrom`) and a wire-level test corpus. **Where we are behind:** no form-field key lookup and no error handler (the 401 body is data, `deny_body`); both are in *What is deliberately not done*.
 
 ## Design & invariants
 - Credential check is **constant-time** (never a short-circuiting `mem.eql`) so a network attacker
@@ -49,8 +49,7 @@ Re-surveyed 2026-10-17 (first 2026-09-30) per `SURVEY-PLAYBOOK.md`; stars and ac
   dev/demo behavior). Configuring any token/key closes the plane regardless — and so does
   configuring a **verifier** (`token_verify` / `api_key_verify`) with an empty static set: a
   callback is a credential source the gate cannot enumerate, so "the static set is empty" must not
-  be read as "nothing is configured". Both schemes decide this identically; the bearer half gained
-  it second (2026-08-17) and the asymmetry was the defect.
+  be read as "nothing is configured". Both schemes decide this identically.
 - **Dynamic verifiers** are consulted only after the static digest scan misses, and **outside the
   gate's lock** (caller code may take its own locks and must not deadlock against ours; it may also
   race a concurrent `addToken`, which is the same window `addToken` already has against a request
@@ -77,15 +76,44 @@ Re-surveyed 2026-10-17 (first 2026-09-30) per `SURVEY-PLAYBOOK.md`; stars and ac
   shared fallback) — same forgeability caveat as `ratelimit` when directly reachable.
 - **Basic** credentials are stored as SHA-256 of `user:password` (a user holds no `:`, RFC 7617), scanned
   in full without early exit: user existence and both lengths stay hidden. The header is decoded with
-  `b64ct` into a 512-byte stack buffer wiped after the decision; a longer credential counts as absent.
+  `b64ct` into a 512-byte stack buffer (`basic_credentials_max`); a longer credential counts as absent. The
+  decode and the digest compare run in `basicCheck` under a dead-stack burn (`burn.request_burn`, 4 KiB zeroed
+  afterwards), so neither `user:password` nor the SHA-256 state outlives the request in a dead frame; the
+  server's own request buffer still holds the base64 credential. The credential-rotation entry points
+  (`addToken`, `removeToken`, `addBasicUser`, `removeBasicUser`, the API-key pair) burn their frames the same way.
+  `Identity.user` carries the presented user name of a `.basic` identity (copied out of the decode buffer before
+  it is zeroed, valid until the handler returns; the password is never kept; empty for every other scheme); the
+  static set still stores only `SHA-256(user:password)`.
   Challenge: `Basic realm="<realm|Restricted>"`; `.any` sends `Bearer, Basic realm=…`.
 - **Key sources**: `api_key_sources` (header+optional prefix, query, cookie) replaces the legacy
   header/query options; the **first source carrying a non-empty value decides** — a wrong key there is
   not rescued by a valid one in a later source (the old header-wins rule, generalised). Every `Cookie`
   field line is scanned (HTTP/2 splits cookies). No form source: the gate runs before the handler and
   reading the body would consume it.
+- **Optional authentication** (`Options.credentials_optional`, fiber's optional-auth pattern, echo's
+  `ContinueOnIgnoredError`): deliberately narrower than echo. Only a request with **no** credential for the
+  active mode (no `Authorization` where it is read, no API-key value in any source) passes anonymously, with no
+  `Identity` and no audit entry; a wrong, malformed or repeated credential stays a 401, so a bad password
+  never becomes an anonymous request and guessing stays audited. An empty (blank) API-key value is no
+  credential in every source.
+- **Configuration errors are errors, not panics.** `Gate.init` returns `error.InvalidOptions` (checked in every
+  build mode, before anything is allocated) for an option that breaks its contract: an empty token, key,
+  key-source name, key header, key query name or content type; a `realm` with `"`, `\` or a control byte (a
+  CR/LF would make every 401 fail, a quote would break the quoted-string); a Basic user with `:` or an empty
+  password; `throttle_max_keys` 0. `addToken`/`addApiKey`/`addBasicUser` return `error.InvalidArgument` for an
+  empty credential or a `:` in the user. The checks look at lengths and the non-secret user name only.
+- **Seeded throttle hash.** The throttle map hashes with Wyhash keyed by a per-instance 64-bit seed, so peer-chosen
+  keys cannot be crafted to collide (Go's per-map hash seed, Rust's `RandomState`: hash-flooding resistance by
+  an unpredictable per-table key; `throttle_max_keys` stays the memory cap). The seed is one `io.random` draw
+  when `Options.io` is given; without an `io` it is the instance address, a process counter and the clock folded
+  through Wyhash (weaker against a peer that can read addresses); `Options.throttle_seed` pins one for
+  reproducible tests.
+- **Cookie lookup** is `cookies.find` (`cookieValue` is an alias): the name compare is exact, a quoted `;` ends the
+  pair, a pair without `=` is an empty value, which the key sources treat as absent.
 - Threadsafe; identity attached for downstream handlers; RFC 6750 challenge (401 +
   `WWW-Authenticate`) on failure.
+- `Gate.api_key_header` / `api_key_query_param` are stored copies of the options that the key-source list
+  replaces; see *Backlog / deferred*.
 
 ## Threat model / out of scope
 - Defends: the **timing oracle** on credential comparison (constant-time compare defeats
@@ -94,7 +122,7 @@ Re-surveyed 2026-10-17 (first 2026-09-30) per `SURVEY-PLAYBOOK.md`; stars and ac
 - Defends: **credential-field confusion** — a request with a credential field the gate reads
   on more than one line (two `Authorization`, two API-key header lines) is denied, so a proxy
   that reads the other line than the gate cannot authenticate one credential while the gate
-  checks another (2026-10-25; before, the first line decided).
+  checks another.
 - Does **NOT** defend: credential brute-force by request volume. The denied-request throttle only
   rate-limits invocations of the **audit hook** (coalescing repeated 401 log entries from one
   client key) — it never throttles responses; every denied request still gets its 401 as fast as
@@ -107,6 +135,9 @@ Re-surveyed 2026-10-17 (first 2026-09-30) per `SURVEY-PLAYBOOK.md`; stars and ac
   sanitizes/sets them; directly reachable, an attacker can pick any key value (subject to the
   `client_key_len_max` clamp) to split across many audit-coalescing buckets or collide with a
   victim's key.
+- `identityOf` trusts `ctx.data`: it casts the slot to this module's `Identity`, so a different middleware storing
+  another type there makes it undefined behaviour. The slot carries no tag (`router.Ctx` would need one); the
+  contract is documented, not enforced.
 - Does **NOT** defend against what a `token_verify`/`api_key_verify` callback or an `exempt`
   predicate decides: both are caller code running with the gate's authority. A verifier that
   compares with `std.mem.eql` reintroduces the timing oracle the gate exists to close, and an
@@ -122,84 +153,63 @@ Re-surveyed 2026-10-17 (first 2026-09-30) per `SURVEY-PLAYBOOK.md`; stars and ac
   connection-level DoS/abuse controls (`abuseguard`/`throttle`).
 
 ## Verification
-`zig build test-aaa-gate`. Offline unit tests (constant-time verify both branches incl. length
-mismatch; open plane; rotation via `extra_tokens`/`addToken`/`removeToken`; `token_verify`
-accept/reject, a call counter proving the static set is scanned first, and the plane-closing case
-paired with the bare-`allow_when_unconfigured` gate that *does* admit; throttle
-coalescing/fold/reset, window-0 disable, max-keys bound, OOM fail-open; `init` unwinding proven
-leak-free at every allocation-failure index) plus wire-level goldens over
-the socket-free `http.Server.serveStream` (401 + challenge, valid/wrong/missing token, malformed
-`Authorization` corpus never panics, `.mutations` split, an external token store rotated between
-requests, the `deny_body`/`deny_content_type` override asserted byte-exact with audit + throttle
-unchanged, `exempt` routes admitted without identity or audit, audit-entry fields, throttle keying; Basic: parser corpus, pair compare, rotation, open-plane rules, 401 challenge, `.any` precedence; key sources and cookie lookup incl. several `Cookie` lines; fuzz harnesses for Basic header parsing and cookie extraction)
-and a
-loopback integration (`router`+`http.Server`+`http.Client`), skipping only when loopback binding is
-unavailable.
 
-**Mutation (2026-10-18,** the echo-parity code, rotation entry points and the denied-request throttle: schemata over a copy of `root.zig`, one ReleaseSafe build, the whole suite except the loopback `integration:` test): 129 mutants — init de-duplication of tokens/keys/Basic pairs and the throttle window, `verify`/`verifyApiKey`/`verifyBasic` (open-plane condition, `allow_when_unconfigured`, digest match, verifier call), add idempotence and remove for all three sets, `basicFingerprint`'s separator, `containsFp`, `buildChallenge` (every mode and realm), `buildSources` (legacy count, given vs legacy, kinds, prefix copy), the throttle (window, boundaries, LRU touch, fold/reset, cap, sweep), `isMutating` (seven verbs), `bearerTokenOf`/`basicCredentialsOf`/`headerKey`/`queryValue` (length boundaries, case, separators, trims, first colon), `apiKeyPresented` (sources, trim, `k.len`), `clientKeyFrom`/`formatPeerIp` (v4-mapped bytes, padding, separators, blank headers, last XFF), `authorize` for `.any`/`.either` (each open-plane conjunct, precedence, order), `schemeOf`, `middlewareRun` (scope, exempt, 401 status/headers/body, audit gates, 500 vs sent status, `ctx.data` restore) and `auditDenied`. First run: 105 killed, 24 alive; new tests killed 16 (`basicFingerprint…`, `challenge: the exact WWW-Authenticate value…`, `bearerTokenOf: a TAB…`, `key sources: blanks…`, `clientKeyFrom: a blank X-Real-IP…`, `formatPeerKey…`, `authorize: in .any / .either one configured scheme keeps the plane closed…`, `audit: a handler error AFTER the head went out…`, `middleware: ctx.data is restored…`). Two mutants first read as survivors only because Zig evaluated the mutated format string at compile time (`comptime fmt`); they were re-written as run-time branches. 8 equivalent: `window_ns != 0 and X` (with window 0, `now -| last < 0` is already false), the `value.len <` / `<=` boundary of `bearerTokenOf` and `basicCredentialsOf` (a 7-/6-byte value after trimming has a non-blank last byte, so `value[6]`/`value[5]` is not a space), the `tok.len == 0` / `enc.len == 0` guards behind them (dead: the trimmed remainder is non-empty; an empty Basic body would decode to no colon), `headerKey`'s `prefix.len == 0` shortcut (an empty prefix strips nothing) and its `v.len <= prefix.len` boundary (an empty remainder is an absent key to the caller), and the trim of the header value (the HTTP parser already removed OWS).
+`scripts/modtest aaa-gate` (`zig build test-aaa-gate`); the loopback integration test needs loopback binding and
+skips without it.
 
-**Mutation (2026-10-04,** schemata over a copy, one ReleaseSafe build, the whole suite): 43
-mutants — both verifiers' open-plane rule, fail-open, static-set match and callback,
-`containsFp`'s accumulation, both removals, `addToken`'s idempotence and `init`'s dedupe,
-`secretEqual`, the throttle (window boundary, suppressed count, its reset, `last_ns`, the
-sweep's two conditions, the key cap), `isMutating`, `bearerTokenOf` (scheme case, separator,
-trim, empty token), `apiKeyPresented` (empty header, query fallback, empty query),
-`queryValue`'s exact name, the XFF rightmost-element rule and empty element, the
-`X-Real-IP` fallback, `clampKey`, IPv4-mapped unification, `.either`'s open rule and
-precedence, exemption, the deny short-circuit, read/write audit split, the 500-on-error
-status and the denied-audit coalescing. First run: 39 killed, 4 alive; four tests added
-(an api-key verifier alone closes the plane; an admitted entry resets the fold count;
-`Bearer` + blanks carries no token, RFC 6750 §2.1; `.either` with one configured scheme
-stays closed under `allow_when_unconfigured`); rerun: 42 killed, 1 equivalent —
-`bearerTokenOf`'s empty-token check (the whole value is trimmed first, so text after
-`Bearer ` can never trim to empty). No defect found.
+- **Unit tests** (`src/root.zig`): constant-time `verify` both branches including length mismatches; the open plane
+  and its closing by any configured credential or verifier; rotation by `extra_tokens`/`addToken`/`removeToken`
+  (and the API-key and Basic pairs); `token_verify`/`api_key_verify` accepted/rejected, the static set scanned
+  first (call counter), the plane-closing case paired with the bare `allow_when_unconfigured` gate that admits;
+  throttle coalescing, fold, reset, window 0, key cap, LRU, idle sweep, OOM fail-open, the seeded hash; `init` and
+  the rotation entry points unwinding every allocation failure; the parsers (`bearerTokenOf`,
+  `basicCredentialsOf`, `queryValue`, cookie lookup, `clientKeyFrom`) on boundary corpora.
+- **Wire goldens** over the socket-free `http.Server.serveStream`: byte-exact 401 with challenge; valid, wrong and
+  missing credentials per scheme; a malformed `Authorization` corpus never panics; the `.mutations` split with
+  identity absence; an external token store rotated between requests; the `deny_body`/`deny_content_type`
+  override byte-exact with audit and throttle unchanged; `exempt` routes without identity or audit;
+  `credentials_optional` per mode; audit-entry fields including a handler error after the head went out; throttle
+  keying; the `lead:` tests behind the card's `**Ahead:**` claims (scheme case, runs of SP, HTAB, suffixed
+  tokens, two credential lines).
+- **Integration:** `router` + `http.Server` + `http.Client` over loopback.
+- **Model-fuzz** (`src/model_test.zig`, `AAA_GATE_FUZZ=<runs>[,<first seed>]`, `AAA_GATE_FUZZ_ONLY` picks a
+  harness): `aaa-gate-verify` drives `verify`/`verifyApiKey`/`verifyBasic` under rotation, verifier callbacks and
+  both open-plane settings against plain credential lists; `aaa-gate-throttle` runs the denied-request throttle
+  end to end through the middleware on the wire against an array model of its documented rule. Further
+  harnesses cover the bearer, API-key, query, bearer-value, client-key, Basic and cookie parsers. The card's
+  `**Model:**` line names the models.
+- **Constant time:** `src/ctgrind_harness.zig` (`scripts/checks/ctgrind.sh aaa-gate`): the stored token, key
+  and Basic digests tainted in place, `verify*` with a good and a bad credential (two in-file reports per target,
+  the two verdicts); `check-ct-compare` covers the compares. Pins live in `ctgrind-expected.tsv`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aaa-gate`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 20.4 %): ref 0.09–0.75×, against 0.11–0.87× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+`zig build bench-aaa-gate` (`BENCH_ROUNDS=5`, `tools/bench.zig`): router + middleware + rendered response over
+pre-parsed requests, no sockets, each row net of a no-middleware twin, against labstack/echo (`go_bench`) and,
+for the fastest-in-the-field ratio, gofiber/fiber v2 and v3 (`go_fast_bench`) and tower-http
+(`rust_fast_bench`) with the same hashed validator; `BENCH_FAST=0` skips the second group. Tools: `tools/README.md`.
+`bench-aaa-gate -- --profile <row>` profiles one row under `perf`. The figures are the card's `**Performance:**`
+line; that line is authoritative.
 
-**Fastest in the field, 2026-10-25** (`zig build bench-aaa-gate`, `BENCH_ROUNDS=5`, which now
-also runs `tools/go_fast_bench` — gofiber/fiber v2.52.16 and v3.6.1 — and `tools/rust_fast_bench`
-— tower-http 0.7.1 `ValidateRequestHeaderLayer` — with the like-for-like hashed validator, each
-net of its own `_plain` twin; ours re-timed in the same rounds). Worst ours/fastest 1.16× on
-`no_credential` (a 401 with nothing to check: 66 ns vs tower-http's 57 ns per request net);
-authenticated rows 0.59–0.83×, the other denied rows 0.67–0.97×. Before the day's work the
-`no_credential` row was 2.67×: the 401 cost 137 ns per request net. Where it went, measured
-with `bench-aaa-gate -- --profile <row> [s [gated|plain]]` under `perf`: (1) our `_plain` twin
-sent no `Content-Type`, every foreign twin does — the net had counted one header line extra;
-(2) `http`'s `writeHead` wrote each header line through `print`, `validHeaderValue` checked
-byte by byte, `findHeader` ran a `findScalar` per line (now a 64-byte '\n' bitmask); (3) the
-gate checked and copied its fixed challenge and media type into every response (now checked
-once, lent through `setHeaderBorrowed`); (4) a request with no credential took the credential
-lock to learn an answer that cannot depend on the set (now decided before it, when a verifier
-is configured or `allow_when_unconfigured` is off). The number moves ±15 % between runs on
-this shared host (0.97–1.17× in four focused runs of that row).
+## What is deliberately not done
 
-**Mutation + review (2026-11-12, whole module,** production part of `root.zig` (lines 117–1584) incl. errdefer drops on the OOM paths, schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 496 mutants, 459 killed (15 by timeout — 14 of them "lock never released"; `secretEqual` → `std.mem.eql` by `check-ct-compare`; the `containsFp` short-circuit by ctgrind, as 2026-11-07), 37 equivalent or unobservable, 0 undecided, no defect. New tests (14): `init` saturates a throttle window beyond u64; `basicFingerprint` uses `:` as the one separator (every byte value, plus a SHA-256 known answer); `api_key` without `api_key_query_param` reads no query pair (a mutant accepted `?=<valid key>`); a header named like a query or cookie key source is neither a repeated credential field nor a credential under `credentials_optional`; one wrong byte anywhere in `Bearer`/`Basic` refuses; `headerKey` with a value exactly the prefix; `clientKeyFrom` trims SP and TAB (XFF element, `X-Real-IP`); `authorize` leaves the user length 0 for every non-Basic result; `.any` with a valid API key and valid Basic picks the API key identity; the gate owns copies of `api_key_header`/`api_key_query_param`; the deny path without cached header values is byte-identical; `init` and throttle tracking unwind every allocation failure. Equivalent: the cached `HeaderValue`s (= `HeaderValue.init` of the same bytes), the lock-free fast paths of `verify*` (same verdict, lock avoided), swapped-in elements of the distinct digest sets, `window_ns != 0` (u64 `-|`), `assert(removed)`, the `repeatedField` bounds (every value is CRLF-terminated inside `header_block`), the scheme-offset/empty guards of `bearerTokenOf`/`basicCredentialsOf`/`headerKey` (values are right-trimmed), user kept only after `.ok_basic`, one Authorization header cannot be both valid Bearer and Basic, the key-header trim (`h1.lineValue` trims). Unobservable: the decode-buffer wipe (stack only, covered by `burn.request_burn` and the stackprobe test), `g.* = undefined` after `deinit`. Observation: `Gate.api_key_header`/`api_key_query_param` are pub but never read after `init` (the key-source list replaces them) — two allocations that could go. Cut: `burn.zig`, `lockSpin`, lock acquisition, `middleware()` wiring, aliases.
-
-**Mutation (2026-11-07, whole module,** production part of `root.zig`, schemata in a detached copy, ReleaseSafe, strict verdict): 307 mutants, 279 killed (6 by new tests; mutant 111, `containsFp` early exit, by ctgrind — in-file 3/4/3 against 2; mutant 1, `secretEqual` → `mem.eql`, by `check-ct-compare` — the harness never calls `secretEqual`), 27 equivalent + 1 unobservable (224: the stack wipe of the Basic decode buffer — superseded by the burned `basicCheck` frame), 0 undecided; no defect. New tests: scheme names of the same length (`Digest`/`Token` are not Bearer/Basic), an exactly-filling Basic credential, `.any` precedence (bearer over API key). Equivalent: the cached `HeaderValue` (perf only), the no-credential fast paths and their `or`→`and` (the locked path gives the same verdict), the remove loops (digest sets hold distinct entries), `window_ns != 0` (u64 `-|` already false), `repeatedField` offsets (line-based block), length boundaries and start offsets of `headerKey`/scheme parsing (the byte there is checked to be a space), dead empty guards, `user_len` reset. **Changes from the run:** (1) the 20 `require` Options/argument panics are errors — `Gate.InitError` (`InvalidOptions`) and `Gate.AddError` (`InvalidArgument`), checked before anything is allocated; (2) an empty API-key header counts as no credential like an empty query/cookie value (echo's extractors), pinned per source × `credentials_optional`; (3) STACKPROBE found `user:password` 19 KiB below the middleware after a Basic request (6 needles, 23 windows) — the decode and digest compare now run in `basicCheck` under `burn.request_burn` (4 KiB zeroed per request with an `Authorization` header in `.basic`/`.any`; not benched); the server's own request buffer still holds the base64 credential. ⏭ ctgrind digests for aaa-gate are stale on main (sources changed): re-pin from the full-CI output.
+- **Form-field key lookup** (echo's `form:` source): the gate runs before the handler and reading the urlencoded
+  body would consume it. Revisit only if `http`'s `Request` grows a rewindable or buffered body.
+- **An error handler** (echo's `ErrorHandler`): the 401 is fixed (status, `WWW-Authenticate`, audit entry,
+  throttle); only its body and media type are data (`deny_body`/`deny_content_type`), so a consumer changing the
+  body cannot change the security-relevant half.
+- **`AllowedCheckLimit`** and **continuing on any ignored error** (echo's `ContinueOnIgnoredError` beyond an absent
+  credential): only an absent credential passes anonymously (`credentials_optional`).
 
 ## Backlog / deferred
-- **Delta mutation 2026-11-19 (seeded throttle hash,** 11 mutants over `drawSeed`, the seeded context and the seed wiring, ReleaseSafe, strict verdict): 9 killed, 1 equivalent (the Wyhash key constant of the io-less fallback: any constant gives the same property), 1 unobservable (the instance address in the fallback mix: the counter alone keeps instances apart; the address only adds unpredictability, which no deterministic test can see). Two tests were added for survivors of the first run: the `io` draw does not read the clock, the io-less fallback does. Counts above are cumulative with the 2026-11-12 whole-module run.
-- **No-panic sweep 2026-10-29:** nothing peer-reachable; the option/argument contracts of `Gate.init`, `addToken`, `addApiKey`, `addBasicUser` were `std.debug.assert` (silently accepted an empty credential in ReleaseFast) → checked panics (AAA-1/2), since 2026-11-07 errors (`Gate.InitError.InvalidOptions`, `Gate.AddError.InvalidArgument`: a consumer-reachable panic broke the no-panic rule); `realm` validated at init (R2-4: a CR/LF made every 401 fail, a `"`/`\` broke the quoted-string). Checks look at lengths and the non-secret user name only. ✅ DONE 2026-11-07 (contract errors `Gate.InitError.InvalidOptions` / `Gate.AddError.InvalidArgument` in modules/aaa-gate/src/root.zig:575-579, commit a46deb987).
-Reviewed 2026-07-10 (adversarial security pass, paired with `jwt`): const-time compare,
-alg-confusion resistance, and JWKS-smuggling/rotation handling all confirmed clean; a throttle-key
-amplification issue (HIGH) found in the pass was fixed.
 
-- **`identityOf` trusts `ctx.data`** *(sweep 2026-10-29, AAA-3, LOW c2)* — the cast assumes the slot holds this module's `Identity`; a different middleware storing another type there makes it UB. Cannot be made total without a tag in `router.Ctx` (public change); documented contract for now.
-- **Throttle map hash is unseeded** *(review R2-6, 2026-10-29)* — ✅ DONE 2026-11-19: the map hashes with Wyhash keyed by a per-instance 64-bit seed (`Options.io` draw via `io.random`; without an `io`, instance address + process counter + clock folded through Wyhash; `Options.throttle_seed` pins one). Same design as Go's per-map hash seed and Rust's `RandomState` (SipHash with random keys): hash-flooding resistance by an unpredictable per-table key; `throttle_max_keys` stays the memory cap. Behaviour is otherwise unchanged.
-- ~~HTTP Basic scheme~~ — done 2026-10-17 (`AuthMode.basic`/`.any`).
-- ~~Cookie / multi-source key lookup~~ — done 2026-10-17 (`Options.api_key_sources`).
-- **Form-field key lookup** *(DN, 2026-10-17)* — echo's `form:` source. Needs a rewindable / buffered request body in `http`; revisit if `Request` grows one.
-- ~~**Username on `Identity` for Basic**~~ **DONE 2026-11-05** *(ND, 2026-10-17; grade probe core gap, fiber `basicauth.UsernameFromContext`)*: `Identity.user` carries the presented user name of a `.basic` identity (copied out of the decode buffer before it is zeroed; the password is never kept); the static set still stores `SHA-256(user:password)` only.
-- **Optional authentication DONE 2026-11-05** *(grade probe core gap: fiber's optional-auth pattern, echo `ContinueOnIgnoredError`)*: `Options.credentials_optional`. Deliberately narrower than echo: only a request with **no** credential passes anonymously; a wrong, malformed or repeated one stays a 401, so a bad password never becomes an anonymous request.
-- ~~**Use `cookies.find` instead of the local `cookieValue`**~~ — ✅ 2026-10-18: `cookies` is a dep, `cookieValue` = `cookies.find` (a quoted `;` now stays in the value; a pair without `=` is an empty value, which the key sources already treated as absent).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`extract · any · server · threadsafe` + deps `router`, `http` — canonical source is `pub const meta`
-in src/root.zig.
+- **`Gate.api_key_header` / `api_key_query_param` are stored but never read after `init`** (the key-source list
+  replaces them): two allocations that could go. Observation from the 2026-11-12 review; removing the fields is a
+  public change.
+- **`identityOf` trusts `ctx.data`** (sweep AAA-3, LOW): cannot be made total without a tag in `router.Ctx`
+  (a public change); the documented contract stays until then. See *Threat model*.
 
 ## Anchoring
 
