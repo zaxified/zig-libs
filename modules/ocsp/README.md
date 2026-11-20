@@ -14,7 +14,7 @@ buffer. `verify` is the security core: it authorizes the responder (issuing CA
 itself, matched by name or key hash, **or** a delegated responder cert carried
 in the response, directly signed by the issuer and bearing the
 `id-kp-OCSPSigning` EKU — RFC 6960 §4.2.2.2), verifies the `tbsResponseData`
-signature (RSA PKCS#1 v1.5 SHA-1/256/384/512; ECDSA P-256/P-384 with SHA-256/384/512), confirms the
+signature (RSA PKCS#1 v1.5 SHA-1/256/384/512; ECDSA P-256/P-384 with SHA-256/384/512; Ed25519), confirms the
 `CertID` binds to the subject certificate (recomputed issuerNameHash /
 issuerKeyHash / serial), checks freshness against a caller-supplied `now_unix`,
 and matches a request nonce if one was sent. `zig build test-ocsp` (Debug +
@@ -76,13 +76,16 @@ switch (verdict.status) {
   mismatch, malformed, …).
 
 - **Model after:** RFC 6960 (OCSP). Built on this repo's `x509` (DER reader +
-  `id-kp-OCSPSigning` EKU check), `rsa` (RFC 8017 PKCS#1 v1.5 verify) and
-  `p256` (ECDSA-P256 verify). Never calls `std.crypto.Certificate.parse` on
+  `id-kp-OCSPSigning` EKU check), `rsa` (RFC 8017 PKCS#1 v1.5 verify),
+  `p256` (ECDSA-P256 verify), `datefmt` (time parsing), and `std.crypto.sign` for P-384 ECDSA and
+  Ed25519. Never calls `std.crypto.Certificate.parse` on
   attacker-influenced input.
-- **Deferred, by design:** OCSP *stapling* wire integration (the TLS server's
-  job), CRL-based revocation (separate mechanism), full delegated-responder
-  path building beyond the single issuer→responder link RFC 6960 requires, and
-  P-521 responder signatures (Ed25519 is supported). See `SPEC.md`.
+
+## Not provided
+
+OCSP stapling wire integration (the TLS server's job), CRL-based revocation, full
+delegated-responder path building, P-521 responder signatures, request signing and
+responder-side signing. See SPEC *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from RFC 6960 (a public IETF specification). See
 `SPEC.md` and `NOTICE`.

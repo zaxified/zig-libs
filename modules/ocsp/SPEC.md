@@ -21,7 +21,7 @@ RFC 6960 OCSP request building + response parsing/verification; see
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module were checked against its SPEC and `rg` over `src/root.zig` (signature schemes: `rsa_sha1/256/384/512`, `ecdsa_sha256` only; one `Request` per request). Competitor claims are *(inferred)* from prior knowledge of their public docs; no foreign source was read.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module were checked against its SPEC and `rg` over `src/root.zig` (signature schemes: `SigScheme`, RSA with SHA-1/256/384/512, ECDSA P-256/P-384 with SHA-256/384/512, Ed25519). Competitor claims are *(inferred)* from prior knowledge of their public docs; no foreign source was read.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -31,7 +31,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | rustls / rustls-webpki | Rust | (see `x509`) | — | — | Neither fetches nor verifies OCSP; a stapled response is handed to the caller *(inferred)*. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | No OCSP at all. |
 
-**Where we are ahead:** of Zig `std`, the only OCSP code in the Zig world we know of; allocation-free bounds-safe decoding, a check order that authorises the responder before trusting any status, EKU stricter than `hasPurpose` (no `anyExtendedKeyUsage` responder), subject/issuer link check, and it is tested on real DigiCert and GoDaddy responses. **Where we are behind:** P-521 responder signatures (RSA, ECDSA P-256 and P-384 since 2026-09-30, Ed25519 since 2026-11-16), one certificate per request/response, no responder-side signing, no signed requests.
+**Where we are ahead:** of Zig `std`, the only OCSP code in the Zig world we know of; allocation-free bounds-safe decoding, a check order that authorises the responder before trusting any status, EKU stricter than `hasPurpose` (no `anyExtendedKeyUsage` responder), subject/issuer link check, and it is tested on real DigiCert and GoDaddy responses. **Where we are behind:** P-521 responder signatures (RSA, ECDSA P-256/P-384 and Ed25519 are supported), no responder-side signing, no signed requests (see *What is deliberately not done* and *Backlog / deferred*).
 
 ## Scope
 
@@ -40,7 +40,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   profile, or SHA-256), issuerNameHash = H(issuer subject `Name` DER TLV),
   issuerKeyHash = H(issuer `subjectPublicKey` BIT STRING value, unused-bits
   octet excluded), serialNumber (the subject cert's serial, re-emitted
-  verbatim) }. Optional `id-pkix-ocsp-nonce` (`1.3.6.1.5.5.7.48.1.2`), encoded
+  verbatim) }. `buildRequests` puts one `Request` per `CertPair` into one
+  `OCSPRequest` (one hash, one optional nonce for the whole request; an empty
+  list is `Malformed`); `buildRequest` is the one-pair case. Optional `id-pkix-ocsp-nonce` (`1.3.6.1.5.5.7.48.1.2`), encoded
   as an OCTET STRING nested inside the extnValue OCTET STRING. No optional
   request signature (not needed for stapling fetches).
 - **Response** (`parseResponse`): DER-decode `OCSPResponse` = { responseStatus
@@ -52,7 +54,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   certID, certStatus (good [0] / revoked [1] {revocationTime, reason?} /
   unknown [2]), thisUpdate, nextUpdate?, singleExtensions? }. Decoding is
   **allocation-free** — every field is a view into the caller's buffer.
-- **Verification** (`verify`): the security core (below).
+- **Verification** (`verify`, `verifyMany`): the security core (below).
+  `verifyMany` answers several certificates from one response: `out[i]` is
+  exactly what `verify` would decide for `queries[i]` (a `Verdict`, `.absent`
+  for what `verify` reports as `CertIdMismatch`, or `.failed` with the
+  `VerifyError`), but consecutive queries sharing an issuer authorize the
+  responder and check the signature once; each pair is judged on its own.
 
 ## Verification model
 
@@ -92,11 +99,12 @@ supplied subject/issuer pair must actually be a chain. Every step fails **closed
    - Failure of every path ⇒ `UntrustedResponder` / `ResponderMissingOcspSigning`
      / `ResponderCertExpired`.
 2. **Signature** over `tbsResponseData`: RSA PKCS#1 v1.5 (SHA-1/256/384/512, via
-   `rsa.verifyPkcs1v15`) or ECDSA with any of SHA-256/384/512 on the curve the
+   `rsa.verifyPkcs1v15`), Ed25519 (`id-Ed25519` 1.3.101.112 as key and as
+   signature algorithm, RFC 8410, via `std.crypto.sign.Ed25519`; key and
+   algorithm must agree either way, else `UnsupportedSignatureAlgorithm`) or ECDSA with any of SHA-256/384/512 on the curve the
    responder's SPKI names (RFC 5480 `namedCurve`; the signature OID never says
    which curve): P-256/SHA-256 via `p256.sign.ecdsaVerify`, every other pair —
-   P-384, and P-256 with SHA-384/512 — via `std.crypto.sign.ecdsa` (since
-   2026-09-30). Both decode the DER `SEQUENCE { r, s }` strictly first
+   P-384, and P-256 with SHA-384/512 — via `std.crypto.sign.ecdsa`. Both decode the DER `SEQUENCE { r, s }` strictly first
    (`p256.sign.derToRaw`, or its generalization `p256.sign.derToRawN` for 48-byte
    scalars — never std's `Signature.fromDer`, which accepts a short negative or
    non-minimal INTEGER). An EC key on any other curve is `UnsupportedSignatureAlgorithm`. A tampered tbs, a wrong
@@ -104,7 +112,7 @@ supplied subject/issuer pair must actually be a chain. Every step fails **closed
    `UnsupportedSignatureAlgorithm` / `InvalidResponderKey`.
 3. **CertID binding.** For each `SingleResponse`, the `CertID` is recomputed
    against the subject/issuer certificates *using the hash algorithm the CertID
-   names* (SHA-1 or SHA-256): issuerNameHash = H(issuer subject Name TLV),
+   names* (SHA-1, SHA-256, SHA-384 or SHA-512; an entry naming any other hash never matches): issuerNameHash = H(issuer subject Name TLV),
    issuerKeyHash = H(issuer public-key value), serialNumber = the subject's
    serial. All three must match, else that SingleResponse does not apply. No
    match in any SingleResponse ⇒ `CertIdMismatch`. This prevents a valid signed
@@ -167,7 +175,9 @@ Consequences:
   (on the same bounded `parseElement`). If x509 later exposes `parseShape`,
   `parseCert` here can delegate to it.
 
-## Fixture provenance (Validation)
+## Verification
+
+### Constructed fixtures (`ocsp_test.zig`)
 
 All OCSP responses in `ocsp_test.zig` are **CONSTRUCTED**, not captured from a
 public CA: a `BasicOCSPResponse` is hand-built with `der_writer` (`rsa`'s
@@ -192,7 +202,7 @@ accepted and mismatch → `NonceMismatch`; `responseStatus != successful` →
 `ResponderMissingOcspSigning`; ECDSA-P256 direct-issuer signature accepted; a
 malformed/truncated-DER batch that must never panic.
 
-## Real captured responses (`goldens.zig`, added 2026-08-01)
+### Real captured responses (`goldens.zig`)
 
 The constructed fixtures above are hermetic by construction — they are DER
 this module's own writer built, signed by the sibling `rsa`/`p256` modules.
@@ -200,12 +210,12 @@ That is the classic "encoder and decoder agree on the same misreading" blind
 spot: nothing in this module had ever been fed DER an actual CA emits. Two
 real, live-captured OCSP responses close that gap, obtained via
 `openssl s_client` (fetch the chain) + `openssl ocsp` (query the real
-responder named in the leaf's AIA extension) against public CAs that still
-run OCSP as of 2026-08-01 — see `goldens.zig`'s doc comment for the exact
+responder named in the leaf's AIA extension) against public CAs that
+ran OCSP at capture time — see `goldens.zig`'s doc comment for the exact
 recipe and reference timestamps. (RFC 6960 does not obligate a CA to run
 OCSP forever — Let's Encrypt in particular has been winding its responder
 down — so which CA answers on a given day varies; DigiCert and GoDaddy both
-answered at capture time, as did Sectigo, not kept as a fixture.)
+answered at capture time, as did a third CA, not kept as a fixture.)
 
 - **DigiCert** — a *direct* responder: `ResponderID` **byKey**, no delegate
   cert. `CertID.hashAlgorithm` is **SHA-1** — every constructed response
@@ -228,37 +238,67 @@ see `goldens.zig` for the exact epoch values and how they were independently
 computed).
 
 Attribution: none required — see `NOTICE` ("black-box compatibility test
-oracle" reasoning, CONVENTIONS.md §5 / root NOTICE §0). No root NOTICE change
-accompanies this addition.
+oracle" reasoning, CONVENTIONS.md §5).
 
-A mutation teeth-check confirmed the goldens are load-bearing: dropping the
-SHA-1 arm of `hashAlgoFromOid` turns the real-response tests red
-(`CertIdMismatch`) while the constructed-fixture tests stay green, because
-none of them ever hashes a response `CertID` with SHA-1 — precisely the blind
-spot real data and only real data catches here.
-⚠ The counts that used to be in that sentence ("exactly the three … all
-nineteen") were stale: re-measured, **5** go red (two as
-`TestUnexpectedError`) and there are **25** constructed tests. The claim
-survives; the numbers did not. A count in prose is a measurement with no
-gate under it, and it ages every time a test is added.
+The goldens are load-bearing: dropping the SHA-1 arm of `hashAlgoFromOid` turns
+the real-response tests red (`CertIdMismatch`) while the constructed-fixture
+tests stay green, because none of them hashes a response `CertID` with SHA-1.
 
-## Deferred (out of scope, not silently skipped)
+### OpenSSL-generated goldens and the P-384 anchors
 
-- **OCSP stapling wire integration** — embedding/reading the response in the
-  TLS `status_request` (RFC 6066) / `status_request_v2` extension is the TLS
-  server's job; this module is the response library it calls.
-- **CRL-based revocation** — a separate mechanism (a distinct future module).
+- `goldens.zig` also holds an OpenSSL-generated **direct/byName** response (the
+  combination no live public CA emitted): `ResponderID` byName naming the issuer
+  takes the direct path, a byName that names nobody in the chain is
+  `UntrustedResponder`, and with `nextUpdate` absent `max_age_seconds` bounds the
+  response. It is the only golden with `nextUpdate` absent.
+- `p384_test.zig`: three responses OpenSSL 3 made and verified itself
+  ("Response verify OK") — a P-384 CA answering directly with
+  ecdsa-with-SHA384 (byKey) and with ecdsa-with-SHA256 (byName), and a delegated
+  P-384 responder (its certificate signed ecdsa-with-SHA384) answering
+  `revoked`/keyCompromise; fixtures in `src/testdata/p384/`, recipe in the
+  file's header. A signed-byte or signature-byte change is `SignatureInvalid`;
+  the answer for another serial under the same issuer is not accepted.
+  `p256.sign.derToRawN` has its own rows for the DER shapes std's `fromDer` lets
+  through.
+- Ed25519 responders are covered by in-test vectors only (a responder built with
+  a fixed seed); there is no external Ed25519 OCSP oracle. Key/algorithm
+  mismatch either way is `UnsupportedSignatureAlgorithm`.
+
+### Test classes
+
+- Request: `buildRequest` byte-exact for both hashes with and without a nonce,
+  cross-checked by the independent `extractBits` cert walker; `buildRequests`.
+- Response and verify: good / revoked / unknown, the typed `VerifyError`s,
+  each signature scheme with its key type accepted / one bit of `r` flipped /
+  non-DER signature, delegate selection among decoys, validity edges inclusive
+  at both ends, nonce length/early-byte differences, `verifyMany` with a second
+  issuer and an unparsable issuer, junk and wrong identifier octets at every
+  structural element, time parsing windows.
+- Fuzz: two harnesses, `parse` (OCSP response DER decode: no panic, always a
+  typed error) and `verify`, run by the deterministic driver
+  (`OCSP_FUZZ=<runs>[,<first seed>]`, `OCSP_FUZZ_ONLY=parse|verify`); shared plumbing in
+  `src/fuzz_test.zig`.
+- Run: `scripts/modtest ocsp`. No interop step; the oracles are the goldens above.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## What is deliberately not done
+
+- **OCSP stapling wire integration** — embedding/reading the response in the TLS
+  `status_request` (RFC 6066) / `status_request_v2` extension is the TLS server's
+  job; this module is the response library it calls.
+- **CRL-based revocation** — a separate mechanism (a distinct module).
 - **Full path building for a delegated responder** beyond the single
-  issuer→responder link RFC 6960 §4.2.2.2 mandates.
-- **P-521** responder signatures — no CA we know of uses them for OCSP. (Ed25519: done 2026-11-16.)
+  issuer→responder link RFC 6960 §4.2.2.2 mandates (the responder must be issued
+  directly by the CA that issued the certificate in question).
+- **P-521 responder signatures** — no CA known to us uses them for OCSP; an EC
+  key on any other curve than P-256/P-384 is `UnsupportedSignatureAlgorithm`.
 - **Request signing** (`optionalSignature`) — not needed for stapling fetches.
 
-## Status
+## Backlog / deferred
 
-Implemented: request build (SHA-1/SHA-256 CertID + nonce), response parse
-(allocation-free, bounds-safe), and full verification (direct + delegated
-responder, RSA + ECDSA P-256/P-384, CertID binding, freshness, nonce). `zig build
-test-ocsp` — green in Debug and ReleaseFast.
+- **Responder side: `CreateResponse`-style signing** (survey 2026-09-30). Go can sign a
+  response; a user running a private CA's OCSP responder cannot use this module. Effort:
+  medium. Fits §2, no consumer yet.
 
 ## Anchoring
 
@@ -268,16 +308,3 @@ test-ocsp` — green in Debug and ReleaseFast.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
 **What the tests actually contain.** request CertID cross-checked by independent extractBits (REDERIVED); responses anchored on real captures AND on OpenSSL-signed fixtures.
-⚠ This line used to end "responses self-signed fixtures", two lines above the sentence recording that real DigiCert and GoDaddy responses had landed. It was a generated block that went stale against the paragraph directly below it, and it understated the module's own anchoring — the example's two responses are OpenSSL-signed and re-verify with `openssl ocsp` → `Response verify OK`.
-
-**How it got there.** The anchoring work landed. DONE 6c2d6d9: real DigiCert + GoDaddy responses captured; delegated responder now exercised
-
-**Audit 2026-11-17 (whole-module mutation).** 368 mutants over every non-test line of `src/root.zig`: the bounded DER reader (`wantMinimalLength`, `wantTag`, `closes`, `checkAlgParams`), the certificate walk (`parseCert`, every field and every identifier octet), time parsing, `buildRequest` (hash OIDs, NULL parameters, nonce wrapping, `[2]` tag), `parseResponse` / `parseBasic` / `findNonce`, `verify` / `verifyMany` (responder authorization, delegate selection and its signature, EKU, validity window, nonce, thisUpdate / nextUpdate / max-age edges, the CertID match and each of its three comparisons), `parseSingleTail` / `parseRevoked`, and every signature scheme with its key type, hash and error code. One schemata build per round (the builds also covered the survivors' error codes). Round 1: 207 killed, 161 survived. Added to `src/ocsp_test.zig` (the response builder gained knobs: CertID hash, decoy entries, a pluggable signer, raw single / status / responses, version and trailer elements, a critical foreign extension, and an identifier-octet flip inside the SIGNED data so only the parser can object) and `src/root.zig` (private-function tests): CertIDs hashed with SHA-1 / SHA-384 / SHA-512 and an entry naming a hash this module does not know (which must never match, even carrying SHA-1's digests); RSA responder signatures with SHA-1 / 384 / 512 and ECDSA P-256 / P-384 with SHA-256 / 384 / 512, each accepted, with one bit of r flipped and with a non-DER signature; keys that cannot load (garbage RSA, a point not on the curve, a non-canonical Ed25519 key, a 31-byte one), a key type or an EC key without a curve that must not be guessed, a 63-byte Ed25519 signature; a delegate found among decoys by name and by key, only decoys, a delegate signed by someone else, `certs` that are not certificates, validity window inclusive at both ends, an extension block without extendedKeyUsage, an EC delegate under an RSA issuer, a delegate certificate signed with another hash than the issuer certificate, and delegate certificates whose extension block cannot be walked (one per level of the walk); a missing nonce, a nonce that differs in an early byte or in length, a 128-byte nonce (the first long-form length); thisUpdate == nextUpdate == now accepted, producedAt / thisUpdate / nextUpdate returned exactly; `verifyMany` with a second issuer the responder is not authorized for, and an unparsable issuer; junk after every container of the response, after the response, and after the NULL parameters (`closes`), a wrong identifier octet on every structural element of the response, of the signed SingleResponse and of the issuer certificate, empty BIT STRINGs in the key and the signatures, an explicit version, a foreign trailing element, extensions without a nonce, a critical extension; malformed and foreign elements inside a SingleResponse and a RevokedInfo (a two-byte reason is not a reason); `buildRequest` byte-exact for both hashes with and without a nonce; time parsing with every field distinct, the 1950..2049 window, the `Z`, `0` / `9` / `:` digits, and the legacy month wrap. 25 do not die, each argued: 9 are redundant with another check that runs on the same input (`start + 1 >= len` and `status_elem.end >= outer.end` with `parseElement`; the long-form octet check and the header-length check with each other; the outer algorithm's identifier and OID with the byte-for-byte comparison to the inner one; the identifier check of a delegate certificate with the one `parseCert` repeats), 6 agree on every reachable input (`>` vs `!=` on a short-form length; `closes` with `<`; `outer.end < len`; the month 13 / 14 wrap; a non-OID parameter read as a curve), 3 depend on what always follows (extensions absent, `nextUpdate` absent, no reason), 1 on `rsa.PublicKey.fromDer` accepting a bare `RSAPublicKey`, 4 are cost-only (re-authorization and digest recomputation) and 2 UNOBSERVABLE (the `el()` after the certID and after the status cannot fail inside a parsed response; the injection would be a response whose bytes end there). The verdict table lists each. Counts on the card are whole-module.
-
-## Backlog / deferred
-
-- ~~**ECDSA P-384 / SHA-384 (and P-256 with SHA-384) responder signatures**~~ (survey 2026-09-30) — **DONE 2026-09-30**. Anchored on three responses OpenSSL 3 made and verified itself ("Response verify OK"): a P-384 CA answering directly with ecdsa-with-SHA384 (byKey) and with ecdsa-with-SHA256 (byName), and a delegated P-384 responder (its certificate signed ecdsa-with-SHA384) answering `revoked`/keyCompromise (`src/p384_test.zig`, recipe in its header; fixtures in `src/testdata/p384/`). A signed-byte or signature-byte change is `SignatureInvalid`; `p256.sign.derToRawN` (moved from ocsp's `derToRawStrict`, 2026-11-08) has its own rows for the DER shapes std's `fromDer` lets through.
-- ✅ DONE 2026-11-16 (id-Ed25519 1.3.101.112 signatureAlgorithm + Ed25519 SPKI via `std.crypto.sign.Ed25519`; key/algorithm mismatch either way is `UnsupportedSignatureAlgorithm`; in-test vectors only, no external one) **Ed25519 responder signatures** (survey 2026-09-30). Go and OpenSSL support them; rare in the wild. Effort: small (std has Ed25519). Fits §2.
-- ✅ DONE 2026-11-16 (`buildRequests(gpa, []CertPair, opts)` — several Requests in one OCSPRequest; `verifyMany(response, []CertPair, []CertOutcome, opts)` — per-pair `.verdict` / `.absent` / `.failed`, responder authorization + signature shared across consecutive same-issuer pairs; `verify`/`buildRequest` unchanged) **Several `Request`s / `SingleResponse`s matched per call** (survey 2026-09-30). Go's `ParseResponse` and OpenSSL handle multi-cert exchanges; here the first matching single response wins. Effort: small. Fits §2.
-- **Responder side: `CreateResponse`-style signing** (survey 2026-09-30). Go can sign a response; a user running a private CA's OCSP responder cannot use this module. Effort: medium. Fits §2, no consumer yet.
-
