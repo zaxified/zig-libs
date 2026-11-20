@@ -616,7 +616,7 @@ test "findReader and capturesReader: the match anywhere in the stream, a failure
 test "isMatch DFA: a full state table met by the idle skip to a new start context is emptied, not overrun" {
     // `Dfa.intern`'s reset (`d.n == max_states`) is reached when the 32-state
     // table fills and the next idle skip lands on a start context it does not
-    // hold. Found by search (main, 2026-11-12): without the reset the add
+    // hold. Found by search (main): without the reset the add
     // writes `keys[32]` -- a panic in safe builds, a stack overwrite in
     // ReleaseFast. The answer must match the Pike VM's.
     const pat = "a[ab]*b[ab]{5}\\b";

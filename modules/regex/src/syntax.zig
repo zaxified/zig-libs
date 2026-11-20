@@ -1564,7 +1564,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 // Layout now: lhs | rhs | folded lhs. Rebuild lhs' | rhs, lhs'
                 // sorted and merged again: the fold appended its orbits after
                 // it (`[a-c]` → `a-c A-C`), and `appendSetOp` sweeps both
-                // sides in order (fuzz 2026-10-28: `(?i)[a-c~~b-d]` lost
+                // sides in order (fuzz: `(?i)[a-c~~b-d]` lost
                 // `A-C` and came out as the union).
                 const tmp = b.nranges;
                 for (0..rhs_len) |i| try b.addRange(b.ranges[rhs_start + i]);
@@ -1742,8 +1742,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         fn emitNode(b: *Self, n: u16) Error!void {
             // Copies of a body that emits nothing (`(?:(?:)(?:)…){100000}`)
             // meet no instruction capacity: the walk itself is budgeted, so a
-            // compile's time is bounded whatever the pattern (audit
-            // 2026-10-28).
+            // compile's time is bounded whatever the pattern.
             b.work += 1;
             if (b.work > max_emit_work) return error.PatternTooLarge;
             const nd = b.nodes[n];
@@ -2123,7 +2122,7 @@ const posix_classes = std.StaticStringMap([]const Range).initComptime(.{
     .{ "xdigit", &[_]Range{ .{ .lo = '0', .hi = '9' }, .{ .lo = 'A', .hi = 'F' }, .{ .lo = 'a', .hi = 'f' } } },
 });
 
-// ── tests (mutation audit 2026-11-12) ──
+// ── tests ──
 
 const testing = std.testing;
 

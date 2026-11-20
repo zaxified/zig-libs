@@ -59,13 +59,12 @@
 //! `4 * max_insts` (the `*Alloc` entry points only).
 //!
 //! The Go oracle (`go_oracle_test.zig`) is what holds the answers to Go's;
-//! this holds the engine to itself over far more shapes. Planted mutants
-//! (2026-10-07): the harness fails on a broken unanchored restart, a missing
+//! this holds the engine to itself over far more shapes. Planted mutants: the harness fails on a broken unanchored restart, a missing
 //! leftmost-first cut, a broken range search, a lost capture restore, a
 //! byte-wise iterator advance and a kept empty-adjacent match; it does NOT see
 //! `_` dropped from `\w` or a swapped split priority — pure semantics with no
 //! reference here, both killed by the Go oracle.
-//! 2026-10-07 night: a leftmost-longest that stops at its first match passes
+//! A leftmost-longest that stops at its first match passes
 //! the old "starts where first does, ends no earlier" check; the substring
 //! reference fails it.
 //!
@@ -351,7 +350,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (posix) genAltPosix(S, src, &g, 0) else genAlt(S, src, &g, 0, mode);
     // A share padded past the lazy DFA's size with a dead alternative (`q` is
     // not in the input alphabet): the same language, but `isMatch` runs the
-    // NFA set simulation (the build-tool consumer 2026-10-19: a stale closure after a prefilter
+    // NFA set simulation (the build-tool consumer: a stale closure after a prefilter
     // skip lived only there; repeating the whole pattern instead hid it —
     // 0 of 200 000 seeds). Half of them start with an assertion reachable
     // both from the start and after a consumed code point (`a?\b`): when the

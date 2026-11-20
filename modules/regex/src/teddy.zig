@@ -18,7 +18,7 @@ const syntax = @import("syntax.zig");
 
 const Inst = syntax.Inst;
 
-/// Test hook (mutation audit 2026-11-12): counts of the search loops' steps,
+/// Test hook: counts of the search loops' steps,
 /// which no result shows (a candidate is verified either way). File-private;
 /// `probe` compiles to nothing outside test builds.
 threadlocal var probe_counts: struct { vec_block: usize = 0, cand_block: usize = 0, scalar_step: usize = 0, verify: usize = 0, bs_vec: usize = 0 } = .{};
@@ -431,7 +431,7 @@ test "ByteSet: the nibble tables hold exactly the set, and find agrees with a by
     try testing.expectEqual(null, ByteSet.build(nine));
 }
 
-// ── tests (mutation audit 2026-11-12) ──
+// ── tests ──
 
 const test_ranges = [_]Range{
     .{ .lo = 'a', .hi = 'a' },

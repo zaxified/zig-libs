@@ -74,7 +74,7 @@ const Inst = syntax.Inst;
 const Range = syntax.Range;
 const Assert = syntax.Assert;
 
-/// Test hook (mutation audit 2026-11-12): counts of internal events that do
+/// Test hook: counts of internal events that do
 /// not change a result — a lazy DFA's slow steps and table resets, a
 /// prefilter's skips, which engine answered — so that tests can pin the
 /// caches, limits and give-up heuristics no answer shows. File-private;
@@ -869,7 +869,7 @@ pub const RegexSet = struct {
         var n_ranges: usize = 0;
         // Its runs keep their scratch on the stack (as `Regex.isMatch`):
         // refused as soon as the patterns so far are past it, not after
-        // compiling every one (review 2026-10-28).
+        // compiling every one.
         const bytes = !opts.utf8 and opts.syntax == .rust;
         const cap: usize = if (bytes) max_insts else 4 * max_insts;
         for (patterns, res) |pat, *re| {
@@ -4520,7 +4520,7 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
 }
 
 test "isMatch past the DFA's size: a prefilter skip starts with a fresh closure" {
-    // the build-tool consumer 2026-10-19 (differential driver vs Go): 129 instructions, so `runSetOn`
+    // the build-tool consumer (differential driver vs Go): 129 instructions, so `runSetOn`
     // answers. The threads die after `a` with `\b` visited (it fails between
     // `a` and `1`); the skip to ` ` reused that `seen` and never walked `\b`
     // again, where it holds. Go: MatchString true, FindIndex [2 3].
@@ -5146,7 +5146,7 @@ test "compile: past max_insts on the heap, past 4 * max_insts refused — never 
     defer m.deinit();
     try testing.expectEqual(@as(?Span, .{ .start = 1, .end = 2001 }), m.find("x" ++ text, 0));
     // Past what `isMatch` runs on the stack: refused at compile time (it
-    // compiled and then panicked in `isMatch`, 2026-10-28).
+    // compiled and then panicked in `isMatch`).
     const huge = "a{1000}b{1000}c{1000}d{1000}e{1000}";
     try testing.expectError(error.PatternTooLarge, Regex.compile(testing.allocator, huge));
     try testing.expectError(error.PatternTooLarge, matches(testing.allocator, huge, "x"));
@@ -5220,7 +5220,7 @@ test "no misuse panics: a bytes Regex through a reader, a short or long RegexSet
 }
 
 test "RegexSet: a joined range table past a u16 is refused, not wrapped" {
-    // Fuzz 2026-10-28: 160 × `\pL` summed the range offsets in a u16 — a
+    // Fuzz: 160 × `\pL` summed the range offsets in a u16 — a
     // panic in safe builds, rune instructions reading the wrong ranges in
     // ReleaseFast.
     const pats: [160][]const u8 = @splat("\\pL");
@@ -5280,7 +5280,7 @@ test "findAnchored / capturesAnchored: a match that starts at from, in every eng
 }
 
 test "Rust nest height counts a concatenation; bytes-mode classes reach raw bytes" {
-    // Mutation 2026-10-28: both survived the oracle replays.
+    // Mutation: both survived the oracle replays.
     const gpa = testing.allocator;
     const open = strRepeat("(?:", 250);
     const close = strRepeat(")", 250);
@@ -5307,7 +5307,7 @@ test "Rust nest height counts a concatenation; bytes-mode classes reach raw byte
 }
 
 test "Rust class set operations under (?i) fold both sides first" {
-    // Fuzz 2026-10-28: the folded left side was left unsorted, and the
+    // Fuzz: the folded left side was left unsorted, and the
     // symmetric difference came out as the union.
     const Case = struct { []const u8, []const u8, []const u8 };
     for ([_]Case{
@@ -5326,7 +5326,7 @@ test "Rust class set operations under (?i) fold both sides first" {
 }
 
 test "find from inside a code point: a Unicode assertion sees the text, in every engine" {
-    // Fuzz 2026-10-28: the Pike VM took the U+FFFD it read for the byte at
+    // Fuzz: the Pike VM took the U+FFFD it read for the byte at
     // 1 as the code point before 2; the backtracker reads `é` there.
     var re = try Regex.compileOptions(testing.allocator, "a|.\\b", .{ .syntax = .rust });
     defer re.deinit(testing.allocator);
@@ -5396,7 +5396,7 @@ test "nested counted repetitions multiply, as Go limits them — no compile-time
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -5406,7 +5406,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── tests: mutation audit 2026-11-12 (private paths and the probe hook) ──
+// ── tests: mutation audit (private paths and the probe hook) ──
 
 test "mutation audit A: decode reads DEL as itself, refuses the overlong C1 lead, takes C2..DF pairs" {
     try testing.expectEqual(Decoded{ .cp = 0x7f, .w = 1 }, decode("\x7f", 0));
@@ -5950,7 +5950,7 @@ test "mutation B: the Pike VMs' full-match mode takes a match only at the end of
     try testing.expect(!mb.runOnBytes("aab", 0, true));
 }
 
-// The golden work table (mutation audit 2026-11-12). The lazy DFAs' caches,
+// The golden work table. The lazy DFAs' caches,
 // table limits, give-up heuristics and prefilter skips never change an
 // answer, so the answers alone cannot pin them: each row is a case's answers
 // (digest) and every `Probe` count, over `isMatch`, `fullMatch`,
@@ -6217,7 +6217,7 @@ test "mutation M: the lazy DFAs take a program of exactly Dfa.max_insts" {
     try testing.expect(found_fwd and found_rev);
 }
 
-// Every error site of the three grammars (mutation audit 2026-11-12): which
+// Every error site of the three grammars: which
 // error a bad pattern reports, under each syntax, is part of the API (the
 // error names are public). The table pins it for a spread of bad and
 // borderline patterns; set `errtab_print` to regenerate after a deliberate
