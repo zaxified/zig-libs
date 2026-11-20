@@ -24,14 +24,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** (its `RIPEMD160` class) | C++ | MIT | 90.3k | push 2026-09-29 | The consumer that makes RIPEMD-160 matter: `hash160` for every address. A small in-tree implementation, measured: **2026-10-07** (`zig build bench-ripemd160`, one-shot digest, ReleaseFast vs v29.0 `ripemd160.cpp` compiled with `zig c++ -O3`, digests equal first): ours/Bitcoin Core 1.07 at 64 B, 1.04 at 64 KiB, 1.04 at 1 MiB, i.e. about 4–7% slower. |
+| [bitcoin/bitcoin](https://github.com/bitcoin/bitcoin) — **reference** (its `RIPEMD160` class) | C++ | MIT | 90.3k | push 2026-09-29 | The consumer that makes RIPEMD-160 matter: `hash160` for every address. A small in-tree implementation, measured (`zig build bench-ripemd160`, one-shot digest, ReleaseFast vs v29.0 `ripemd160.cpp` compiled with `zig c++ -O3`, digests equal first): a few percent slower, the ratio is the card's Performance line. |
 | [RustCrypto/hashes](https://github.com/RustCrypto/hashes) `ripemd` 0.2.0 | Rust | MIT OR Apache-2.0 (`Cargo.toml`) | 2.3k | push 2026-09-22 | RIPEMD-160 plus -128, -256 and -320 behind the `Digest` traits; its README: only the 1996 versions, not the 1992 original. |
 | [golang/crypto](https://github.com/golang/crypto) `ripemd160` | Go | BSD-3-Clause | 3.4k | push 2026-09-29 | The x/crypto package; marked as a legacy hash *(inferred; docs not read)*. |
 | OpenSSL `RIPEMD160` | C | Apache-2.0 | (see openssl/openssl, 30.9k) | openssl-4.0.3 (2026-09-29) | Only in the legacy provider in OpenSSL 3+ (this module's SPEC relies on that to cross-check with `openssl dgst -rmd160`). **Measured 2026-10-07** (`zig build bench-ripemd160`, one-shot digest, ReleaseFast vs libcrypto.so.3 of OpenSSL 3.5.5, digests equal first): ours/OpenSSL 0.65 at 64 B, 0.66 at 64 KiB, 0.65 at 1 MiB, i.e. about 1.5× faster (second run; the first gave 0.63–0.64). |
 | [vitalnodo/ripemd160.zig](https://github.com/vitalnodo/ripemd160.zig), [samrock5000/ripemd160](https://github.com/samrock5000/ripemd160), [deatil/zig-hash](https://github.com/deatil/zig-hash) | Zig | Unlicense / MIT / Apache-2.0 | 0 / 0 / 0 | push 2023-12-15 / 2024-11-01 / 2026-09-15 | Small third-party Zig ports found by a GitHub search; unmaintained or single-author *(inferred: READMEs and source not read)*. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No RIPEMD of any width (`rg -i ripemd lib/std/crypto` finds nothing in 0.16.0). |
 
-**Where we are ahead:** among the Zig options (std has none; the ports above are zero-star repos) the one with a documented KAT/differential/fuzz suite, `Hmac` vectors and audit + mutation runs; ships `hash160`; anchored on the spec's vectors including the million-`a` case, RFC 2286 HMAC vectors and `openssl`/`hashlib` cross-checks; the double-line rounds are fully unrolled (3.0–3.7× over a loop, module's own A/B). **Where we are behind:** RIPEMD-128/256/320 (RustCrypto has them; almost nobody uses them) and no throughput comparison against Bitcoin Core's or OpenSSL's implementation exists — unmeasured, not a known gap.
+**Where we are ahead:** among the Zig options (std has none; the ports above are zero-star repos) the one with a documented KAT/differential/fuzz suite, `Hmac` vectors and audit + mutation runs; ships `hash160`; anchored on the spec's vectors including the million-`a` case, RFC 2286 HMAC vectors and `openssl`/`hashlib` cross-checks; the double-line rounds are fully unrolled (3.0–3.7× over a loop, module's own A/B; see *Design & invariants*). **Where we are behind:** RIPEMD-128/256/320 (RustCrypto has them; almost nobody uses them, see *What is deliberately not done*) and a few percent of throughput against Bitcoin Core's implementation (the card's Performance line; see *Backlog / deferred*); against OpenSSL's, ours is faster (measured above).
 
 ## Design & invariants
 
@@ -64,6 +64,11 @@ does not clear `Self`: a second `final()`, an `update()` after `final()`, or
 reuse without a fresh `init()` all return a digest, just not the one over the
 bytes a caller probably meant. None of `sha2`/`sha3`/`blake2`/`blake3` in
 `std` offer a `reset()` either — the fix is `init()` again, not recycling.
+The misuse is defined, not undefined: `final` keeps `buf_len < 64` even when the 0x80 terminator fills the
+block, so a repeated `final` or an `update` after `final` never traps or writes out of bounds (digest unspecified).
+
+**`compress` unrolls both lines at compile time** (`inline for (0..80)`), not a runtime loop over the round
+tables: 3.0–3.7× faster in the module's own A/B (8 KiB input, ReleaseFast), bit-for-bit identical output.
 
 ## Threat model / out of scope
 
@@ -72,7 +77,7 @@ address derivation — the input is a public key or message, not a key or
 password), so no constant-time claim is needed for those consumers; RIPEMD-160
 itself has no secret-dependent branch/index in this implementation (round tables
 are compile-time constants, indexed by the public round counter `j`, not by
-data). Measured since 2026-10-09 rather than only read: `src/ctgrind_harness.zig`
+data). Measured rather than only read: `src/ctgrind_harness.zig`
 taints the MESSAGE and hashes it one-shot (0/1/55/56/64/1000 B), streamed and
 through `hash160`; 0 memcheck contexts in `root.zig` at ReleaseFast
 (`scripts/checks/ctgrind.sh ripemd160`, pinned in `ctgrind-expected.tsv`). RIPEMD-160's 160-bit output has a lower collision-resistance margin
@@ -84,61 +89,46 @@ Bitcoin does).
 
 ## Verification
 
-Official RIPEMD-160 test vectors (spec Appendix, widely republished, e.g.
-the Bosselaers reference page): `""`, `"a"`, `"abc"`, `"message digest"`,
-`"abcdefghijklmnopqrstuvwxyz"`, the 62-char alphanumeric vector, the 8×
-`"1234567890"` vector, and the 1,000,000-`'a'` stress vector (fed in 1000
-chunks of 1000 bytes, so it also exercises the multi-block `compress` loop
-and both one-shot vs. chunked-streaming agreement). All cross-checked
-locally against `openssl dgst -rmd160` and Python's
-`hashlib.new('ripemd160')` while authoring this module (both back RIPEMD-160
-via OpenSSL's legacy provider) — independent oracles beyond eyeballing the
-published hex. Streaming teeth: byte-at-a-time feed and uneven chunking
-across a >64-byte message (straddling the block boundary, including a chunk
-that lands exactly on a 64-byte boundary) both agree with the one-shot
-digest. `hash160`: cross-checked against a real secp256k1 compressed pubkey
-generated locally (`openssl ecparam -genkey -name secp256k1`) piped through
-`openssl dgst -sha256 | openssl dgst -rmd160` — the same
-SHA256∘RIPEMD160 composition Bitcoin uses — plus an in-module differential
-against a manual `Sha256` → `Ripemd160` composition. Also `Hmac(Ripemd160)`
-against the RFC 2286 HMAC-RIPEMD160 vectors — the one test that actually
-reads `block_length`, rather than comparing it to its own hardcoded copy.
-Run: `zig build test-ripemd160`.
-
-**Fuzz:** one `testing.fuzz` target, `fuzzStreamingMatchesOneShot` —
-differential oracle, streaming `update`/`final` against one-shot `hash`, at
-however many block-boundary-straddling splits the input's own bytes pick.
-Corpus seeds sit at the lengths the KATs don't reach (55/56, 63/64/65, and
-others around `block_length`). It does not re-check byte-exactness against
-an external reference — the KATs above already pin that — it checks the
-buffer arithmetic (`update`'s partial-fill / full-block / remainder logic)
-the KATs' one-shot calls can't exercise.
+- **Run:** `scripts/modtest ripemd160`.
+- **Tests** (`src/root.zig`): the spec Appendix vectors (`""`, `"a"`, `"abc"`, `"message digest"`, the
+  alphabet, the 62-character alphanumeric, the 8× `"1234567890"` vector) and the 1,000,000-`'a'` stress vector
+  (fed in 1000 chunks of 1000 bytes, so it also exercises the multi-block `compress` loop and one-shot against
+  streaming); the padding boundaries (length 55 mod 64 needs no extra block, 56 forces a second); streaming
+  teeth (byte-at-a-time and uneven chunking across a block boundary, a chunk landing exactly on 64 bytes, a
+  `final` right after the update that fills the buffer, empty updates); `hash160` against a Bitcoin-corpus
+  vector and a manual `Sha256` → `Ripemd160` composition; `Hmac(Ripemd160)` against the RFC 2286 vectors, the
+  one test that reads `block_length` rather than comparing it to its own copy. The vectors are cross-checked
+  against `openssl dgst -rmd160` and Python's `hashlib.new('ripemd160')` (both via OpenSSL's legacy provider),
+  and `hash160` against a locally generated secp256k1 compressed public key piped through `openssl`.
+  `src/sweep_test.zig` pins the misuse sequences (`final` twice, `update` after `final`) at every residue.
+- **Fuzz:** `fuzzStreamingMatchesOneShot` — streaming `update` / `final` against one-shot `hash` at however
+  many block-boundary-straddling splits the input picks (corpus seeds at 55/56, 63/64/65 and others around
+  `block_length`); run by testkit's deterministic driver as `RIPEMD160_FUZZ`, with reach checks in every test
+  run. It checks the buffer arithmetic of `update`, not byte-exactness (the vectors pin that).
+- **Oracle tools:** `tools/` holds the foreign-oracle sweeps (`oracle_sweep.py`, `bigsweep.zig`,
+  `filehash.zig`, `sweep.zig`; see `tools/README.md`), run by hand.
+- **Constant time:** `src/ctgrind_harness.zig` (see *Threat model*).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. The round-constant, rotate-amount and word-selection tables (`R`,
+  `RP`, `S`, `SP`, `K_GROUP`, `KP_GROUP`, the IV) are not mutated entry by entry (arid; each entry feeds every
+  digest, which the vectors pin). The mutants that survive are equivalent (`f2` / `f4` with `|` as `^`: the two
+  terms are bit-disjoint; the `buf_len != 0` guard of `update`; `final` zeroing from `buf_len + 1`) or
+  unobservable (`total_len +%=` as `+=`: needs 2^64 bytes).
+- **Bench:** `zig build bench-ripemd160` (`tools/bench.zig`) against Bitcoin Core's `ripemd160.cpp` and OpenSSL's
+  libcrypto.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ripemd160`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.02–1.05×, against 1.04–1.07× before. The card carries these figures; what follows is the earlier measurement.
-
-`compress`'s 80-round double-line schedule is `inline for (0..80)` (fully
-unrolled at compile time), not a runtime `while` loop over the round tables.
-Measured A/B, same process, ReleaseFast, 8 KiB input, 5 interleaved rounds
-each side (fix campaign, 2026-09-15): runtime loop 98–113 MiB/s, unrolled
-340–362 MiB/s — **≈3.0–3.7× faster**, bit-for-bit identical output (checked
-against two independently constructed chaining-state inputs). This roughly
-matches an earlier audit estimate (2026-09-04) of 3.0–3.2×; the range here is
-wider because the measuring machine was shared with concurrent agent work
-(see the fix campaign's own measurement notes), not because the two
-implementations diverge.
-
-**Audit 2026-11-17 (whole-module mutation).** 113 mutants over every non-test line of `src/root.zig` that is not a constant table: the five round functions (each operator and each negation), the init state, `update` (the partial-fill guard in every operator class, fill count, copy offsets, the middle-block loop bound and step, remainder copy and `buf_len` advance, `total_len`), `final` (zero fill, the `0x80` marker, the `64 - buf_len < 8` guard in three classes, the pad block and its zeroing, bit length scale and endianness, digest endianness and word order), `compress` (block read, all ten initial register loads, group selection, every term of both lines' step, the register rotation, both mirrored function / constant / permutation / rotation tables, all five output sums) and `hash160`. One schemata build, baseline first: 108 killed, 5 survive and are not killable: 2 EQUIVALENT (`f2` and `f4` with `|` turned into `^`: the two terms are bit-disjoint, `x & y` against `~x & z`), 1 EQUIVALENT (dropping the `buf_len != 0` guard of `update`: with an empty buffer the fill branch copies the first 64 bytes and compresses them, which is what the block loop would do — cost-only), 1 EQUIVALENT (`final` zeroing from `buf_len + 1`: the byte at `buf_len` is overwritten by the marker on the next line) and 1 UNOBSERVABLE (`total_len +%=` as `+=`: needs 2^64 bytes hashed). No test was needed: the KATs, the 55/56/64-byte padding tests, the million-`a` vector and the HMAC vectors killed every observable mutant. The round-constant, rotate-amount and word-selection tables (`R`, `RP`, `S`, `SP`, `K_GROUP`, `KP_GROUP`, the IV) were not mutated entry by entry (arid; each entry feeds every digest, which the ten KATs pin). Counts on the card are whole-module.
+The figures are the card's Performance line (`zig build bench-ripemd160`, ReleaseFast).
 
 ## Backlog / deferred
 
-- 2026-10-07: 4–7% slower than the reference, Bitcoin Core v29.0 `CRIPEMD160` (`tools/bench.zig`: 1.07× at 64 B, 1.04× at 64 KiB and 1 MiB). Not profiled; a candidate is the compression function's register/schedule shape versus Bitcoin's hand-unrolled macros. Closing it needs a change in `src/`, outside the benchmark task.
+- A few percent slower than the reference (Bitcoin Core `CRIPEMD160`, the card's Performance line). Not profiled; a
+  candidate is the compression function's register/schedule shape versus Bitcoin's hand-unrolled macros.
+  Closing it needs a change in `src/`.
 
-## Status
+## What is deliberately not done
 
-`extract · any · util · reentrant` · deps: none (std only) — canonical
-source is `pub const meta` in `src/root.zig`.
+- **RIPEMD-128 / -256 / -320.** RustCrypto has them; almost nobody uses them. Not here.
 
 ## Anchoring
 

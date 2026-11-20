@@ -10,13 +10,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length. Examples/tools ported to Zig 0.17.0 (bigsweep `bufPrintZ` -> `bufPrintSentinel`).
-- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** constant-time evidence: new
-  `src/ctgrind_harness.zig` (message tainted; `hash` and `hash160` targets), 0
-  contexts in `root.zig` at ReleaseFast, pinned in `scripts/checks/ctgrind-expected.tsv`.
-- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
-  bodies are now generic over their source and run by testkit's deterministic
-  driver `RIPEMD160_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
-  every test run); test code only.
 - **2026-09-15** — **A1 fix campaign, perf pass: `compress`'s 80-round schedule
   unrolled at compile time (`inline for` instead of a runtime `while`
   loop).** Measured A/B, same process, ReleaseFast, 8 KiB input, 5
