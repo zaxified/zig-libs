@@ -109,15 +109,18 @@ const Dec = struct {
 
     /// An Accept header: mostly well-formed clauses (type, version, q), so
     /// both formats and every tie-break are reached; sometimes raw damage.
-    fn accept(d: *Dec, out: []u8) []const u8 {
+    /// The clauses drawn are left in `cl` (`n` of them, 0 for raw damage), so
+    /// `fuzzNegotiate` can judge the answer against a model.
+    fn accept(d: *Dec, out: []u8, cl: *[4]Clause, n: *usize) []const u8 {
+        n.* = 0;
         if (d.byte() < 70) return d.strAscii(out, &accept_vocab);
-        const types = [_][]const u8{ "application/openmetrics-text", "text/plain", "*/*", "text/*", "application/*", "application/json", "TEXT/PLAIN", "Application/OpenMetrics-Text" };
-        const versions = [_][]const u8{ "", ";version=1.0.0", ";version=0.0.1", ";version=0.0.4", ";version=2", ";version=\"1.0.0\"", ";charset=utf-8", ";escaping=underscores" };
-        const qs = [_][]const u8{ "", ";q=1", ";q=0.5", ";q=0", ";q=0.001", ";q=0.9", ";q=1.0", ";q=x", ";Q=0.2" };
         var w: std.Io.Writer = .fixed(out);
         for (0..1 + d.below(4)) |i| {
             if (i != 0) w.writeAll(if (d.byte() < 200) "," else ", ") catch break;
-            w.print("{s}{s}{s}", .{ types[d.below(types.len)], versions[d.below(versions.len)], qs[d.below(qs.len)] }) catch break;
+            const c: Clause = .{ .ty = d.below(a_types.len), .ver = d.below(a_versions.len), .q = d.below(a_qs.len) };
+            w.print("{s}{s}{s}", .{ a_types[c.ty], a_versions[c.ver], a_qs[c.q] }) catch break;
+            cl[n.*] = c;
+            n.* += 1;
         }
         return w.buffered();
     }
@@ -135,6 +138,75 @@ const Dec = struct {
         };
     }
 };
+
+const Clause = struct { ty: usize, ver: usize, q: usize };
+const a_types = [_][]const u8{ "application/openmetrics-text", "text/plain", "*/*", "text/*", "application/*", "application/json", "TEXT/PLAIN", "Application/OpenMetrics-Text" };
+const a_versions = [_][]const u8{ "", ";version=1.0.0", ";version=0.0.1", ";version=0.0.4", ";version=2", ";version=\"1.0.0\"", ";charset=utf-8", ";escaping=underscores" };
+const a_qs = [_][]const u8{ "", ";q=1", ";q=0.5", ";q=0", ";q=0.001", ";q=0.9", ";q=1.0", ";q=x", ";Q=0.2" };
+const q_milli = [_]u16{ 1000, 1000, 500, 0, 1, 900, 1000, 0, 0 };
+
+/// The expected answer for well-formed clauses, derived from `negotiate`'s
+/// documented rule (prometheus/common `NegotiateIncludingOpenMetrics`):
+/// clauses by descending q, ties a concrete type before `*`, the first that
+/// matches OpenMetrics 1.0.0 / 0.0.1 or text 0.0.4 wins, q=0 skipped, nothing
+/// matching: text. `null` when a clause is one the model does not judge.
+fn modelNegotiate(cl: []const Clause) ?metrics.Format {
+    var order: [4]Clause = undefined;
+    for (cl, 0..) |c, i| {
+        if (c.q == 7 or c.q == 8 or c.ver == 5) return null;
+        order[i] = c;
+    }
+    const rank = struct {
+        fn of(c: Clause) u8 {
+            const t = a_types[c.ty];
+            const slash = std.mem.findScalar(u8, t, '/').?;
+            return @as(u8, @intFromBool(!std.mem.eql(u8, t[0..slash], "*"))) + @intFromBool(!std.mem.eql(u8, t[slash + 1 ..], "*"));
+        }
+    };
+    // stable insertion sort, best first
+    for (1..cl.len) |i| {
+        var j = i;
+        while (j > 0) : (j -= 1) {
+            const a = order[j - 1];
+            const b = order[j];
+            const b_first = q_milli[b.q] > q_milli[a.q] or (q_milli[b.q] == q_milli[a.q] and rank.of(b) > rank.of(a));
+            if (!b_first) break;
+            order[j - 1] = b;
+            order[j] = a;
+        }
+    }
+    for (order[0..cl.len]) |c| {
+        if (q_milli[c.q] == 0) continue;
+        const t = a_types[c.ty];
+        const slash = std.mem.findScalar(u8, t, '/').?;
+        const ty = t[0..slash];
+        const sub = t[slash + 1 ..];
+        const explicit: ?[]const u8 = switch (c.ver) {
+            1 => "1.0.0",
+            2 => "0.0.1",
+            3 => "0.0.4",
+            4 => "2",
+            else => null,
+        };
+        const offers = [_]struct { []const u8, []const u8, []const u8, metrics.Format }{
+            .{ "application", "openmetrics-text", "1.0.0", .openmetrics },
+            .{ "application", "openmetrics-text", "0.0.1", .openmetrics },
+            .{ "text", "plain", "0.0.4", .text },
+        };
+        for (offers) |o| {
+            const ty_ok = std.mem.eql(u8, ty, "*") or std.ascii.eqlIgnoreCase(ty, o[0]);
+            const sub_ok = std.mem.eql(u8, sub, "*") or std.ascii.eqlIgnoreCase(sub, o[1]);
+            if (!ty_ok or !sub_ok) continue;
+            const exact = std.ascii.eqlIgnoreCase(ty, o[0]) and std.ascii.eqlIgnoreCase(sub, o[1]);
+            // A missing version means 0.0.1 for OpenMetrics, 0.0.4 for text,
+            // and only on the exact type.
+            const dflt: []const u8 = if (std.mem.eql(u8, o[1], "plain")) "0.0.4" else "0.0.1";
+            const eff = explicit orelse (if (exact) dflt else "");
+            if (std.mem.eql(u8, eff, o[2])) return o[3];
+        }
+    }
+    return .text;
+}
 
 const accept_vocab = [_][]const u8{
     "application/openmetrics-text", "text/plain",     "*/*", "application/*", "text/*",                                           ";version=1.0.0",
@@ -460,8 +532,17 @@ fn fuzzNegotiate(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void 
     const n = fill(S, src, &raw);
     var d: Dec = .{ .b = raw[0..n] };
     var buf: [900]u8 = undefined;
-    const accept = if (d.byte() < 40) d.chunk(900) else d.accept(&buf);
+    var cl: [4]Clause = undefined;
+    var ncl: usize = 0;
+    const accept = if (d.byte() < 40) d.chunk(900) else d.accept(&buf, &cl, &ncl);
     const f = metrics.Format.negotiate(accept);
+    if (ncl != 0) if (modelNegotiate(cl[0..ncl])) |want| {
+        if (want != f) {
+            std.debug.print("Accept: {s}\nmodel {t}, negotiate {t}\n", .{ accept, want, f });
+            return error.NegotiateDisagreesWithModel;
+        }
+        hit("negotiate-model-agrees");
+    };
     if (f != metrics.Format.negotiate(accept)) return error.NotDeterministic;
     switch (f) {
         .text => hit("negotiate-text"),
@@ -523,7 +604,9 @@ fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const method: []const u8 = if (d.byte() < 200) "GET" else d.str(&mbuf, &method_vocab);
     const target: []const u8 = if (d.byte() < 150) "/metrics" else d.str(&tbuf, &path_vocab);
     var accept_buf: [600]u8 = undefined;
-    const accept = d.accept(&accept_buf);
+    var cl: [4]Clause = undefined;
+    var ncl: usize = 0;
+    const accept = d.accept(&accept_buf, &cl, &ncl);
     w.print("{s} {s} HTTP/1.1\r\nHost: t\r\nAccept: {s}\r\n", .{ method, target, accept }) catch {};
     for (0..d.below(4)) |_| {
         var nb: [40]u8 = undefined;
@@ -560,7 +643,9 @@ fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD")))
     {
         hit("wire-scrape-200");
-        const want = (if (open_metrics) metrics.Format.negotiate(std.mem.trim(u8, accept, " \t")) else metrics.Format.text).contentType();
+        const modelled: ?metrics.Format = if (ncl != 0) modelNegotiate(cl[0..ncl]) else null;
+        const fmt = modelled orelse metrics.Format.negotiate(std.mem.trim(u8, accept, " \t"));
+        const want = (if (open_metrics) fmt else metrics.Format.text).contentType();
         var hdrs = std.mem.splitSequence(u8, got, "\r\n");
         var found = false;
         while (hdrs.next()) |l| {
