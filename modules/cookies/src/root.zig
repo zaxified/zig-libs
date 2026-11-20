@@ -72,38 +72,13 @@ pub const Iterator = struct {
     pub fn next(it: *Iterator) ?Cookie {
         const ows = " \t";
         while (it.rest.len != 0) {
-            // Take up to the next `;` → one segment; advance past it. A `;`
-            // inside a DQUOTE-wrapped value does not end the segment — found
-            // via python's `http.cookies` oracle (see golden_test.zig):
-            // naively splitting first broke `s="x;y"` into `s="x` + `y"`.
-            // No backslash-escaping is recognized (RFC 6265's cookie-value
-            // grammar has none — that's a Python-only legacy extension).
-            // A DQUOTE opens a span only where a value starts (after the
-            // first `=` and optional whitespace) AND only when a closing
-            // DQUOTE follows; a quote anywhere else is an ordinary byte. So
-            // a sibling-planted `a="` or `a=x"y` cannot swallow the later
-            // pairs, as it does in CPython and in no browser or Go parser
-            // (backlog item of the 2026-10-23 review).
-            var seg_end: usize = it.rest.len;
-            var seen_eq = false;
-            var at_value_start = false;
-            var i: usize = 0;
-            while (i < it.rest.len) : (i += 1) {
-                const c = it.rest[i];
-                if (c == ';') {
-                    seg_end = i;
-                    break;
-                }
-                if (c == '"' and at_value_start) {
-                    if (std.mem.findScalar(u8, it.rest[i + 1 ..], '"')) |close| i += 1 + close;
-                    at_value_start = false;
-                } else if (c == '=' and !seen_eq) {
-                    seen_eq = true;
-                    at_value_start = true;
-                } else if (c != ' ' and c != '\t') {
-                    at_value_start = false;
-                }
-            }
+            // Take up to the next `;` → one segment; advance past it. EVERY
+            // `;` ends a segment, quoted or not: a sent cookie-value never
+            // contains `;` (RFC 6265 §4.1.1 / §5.4), and Go's `readCookies`
+            // and the browsers split the same way. A quote-aware split let
+            // `a="x; session=S; z="` hide or swallow other cookies (a
+            // "cookie sandwich"), so it is gone (2026-11-19 review).
+            const seg_end: usize = std.mem.findScalar(u8, it.rest, ';') orelse it.rest.len;
             const segment = it.rest[0..seg_end];
             it.rest = if (seg_end == it.rest.len) "" else it.rest[seg_end + 1 ..];
 
@@ -723,67 +698,46 @@ test "quoted value: matching DQUOTEs stripped, unbalanced kept" {
     try testing.expectEqualStrings("\"", find("s=\"", "s").?);
 }
 
-test "a stray DQUOTE hides no later pair: it opens a span only at a value start, and only if closed" {
-    // Unterminated: the quote is an ordinary byte, the `;` ends the segment.
-    var it = parse("a=\"; b=2; c=3");
-    try expectPair(&it, "a", "\"");
-    try expectPair(&it, "b", "2");
-    try expectPair(&it, "c", "3");
+test "every `;` ends a pair, quoted or not: no quote hides or swallows another cookie (cookie sandwich)" {
+    // `a="start; session=SECRET; z=end"`: the old quote-aware scan yielded one
+    // pair `a` holding `session=SECRET`.
+    var it = parse("a=\"start; session=SECRET; z=end\"");
+    try expectPair(&it, "a", "\"start");
+    try expectPair(&it, "session", "SECRET");
+    try expectPair(&it, "z", "end\"");
     try testing.expectEqual(@as(?Cookie, null), it.next());
 
-    // A quote inside a value never opens a span (an odd number of them used
-    // to swallow the rest of the header).
-    var it2 = parse("a=x\"y; b=2; c=\"z\"");
-    try expectPair(&it2, "a", "x\"y");
-    try expectPair(&it2, "b", "2");
+    // An opening quote that never closes in its own pair hid `s`.
+    var it2 = parse("a=\"; s=1; c=\"z\"");
+    try expectPair(&it2, "a", "\"");
+    try expectPair(&it2, "s", "1");
     try expectPair(&it2, "c", "z");
     try testing.expectEqual(@as(?Cookie, null), it2.next());
 
-    // A quote in the NAME is not a value start either.
-    var it3 = parse("\"a; b=2");
-    try expectPair(&it3, "\"a", "");
+    try testing.expectEqualStrings("SECRET", find("a=\"start; session=SECRET; z=end\"", "session").?);
+
+    // A quote inside a value or a name is an ordinary byte.
+    var it3 = parse("a=x\"y; b=2; \"c; d=\"\"");
+    try expectPair(&it3, "a", "x\"y");
     try expectPair(&it3, "b", "2");
+    try expectPair(&it3, "\"c", "");
+    try expectPair(&it3, "d", "");
+    try testing.expectEqual(@as(?Cookie, null), it3.next());
 
-    // Whitespace before the opening quote still counts as the value start;
-    // a second `=` does not restart it.
-    var it4 = parse("a= \t\"x;y\"; b=2");
-    try expectPair(&it4, "a", "x;y");
+    // A balanced quoted value with a `;` inside is split like any other
+    // (RFC 6265: a sent cookie-value has no `;`; Go and browsers split too).
+    var it4 = parse("s=\"x;y\"; b=2");
+    try expectPair(&it4, "s", "\"x");
+    try expectPair(&it4, "y\"", "");
     try expectPair(&it4, "b", "2");
-    var it5 = parse("a=b=\"x;y\"; c=3");
-    try expectPair(&it5, "a", "b=\"x");
-    try expectPair(&it5, "y\"", "");
-    try expectPair(&it5, "c", "3");
+    try testing.expectEqual(@as(?Cookie, null), it4.next());
+
+    // One matching pair of quotes is still stripped per value.
+    var it5 = parse("a=\"p\"; b=\"\"; c=\"q\"r\"");
+    try expectPair(&it5, "a", "p");
+    try expectPair(&it5, "b", "");
+    try expectPair(&it5, "c", "q\"r");
     try testing.expectEqual(@as(?Cookie, null), it5.next());
-
-    // A closed quote span stays closed: the quote after it is an ordinary byte.
-    var it6 = parse("a=\"p;q\"r\"; b=2");
-    try expectPair(&it6, "a", "p;q\"r");
-    try expectPair(&it6, "b", "2");
-    try testing.expectEqual(@as(?Cookie, null), it6.next());
-
-    // ... also when the next byte is another DQUOTE: it must not open a second span.
-    var it7 = parse("a=\"p;q\"\"x;y\"; b=2");
-    try expectPair(&it7, "a", "\"p;q\"\"x");
-    try expectPair(&it7, "y\"", "");
-    try expectPair(&it7, "b", "2");
-    try testing.expectEqual(@as(?Cookie, null), it7.next());
-}
-
-test "quoted value containing a separator is not split mid-value (audit, python-oracle)" {
-    // Found via the python http.cookies oracle (golden_test.zig): the naive
-    // "split on the next ';'" scan broke a `;` living inside a quoted value
-    // into two bogus pairs (`s="x` and orphan `y"`). The scan must not treat
-    // a `;` as a segment boundary while inside a DQUOTE-wrapped span.
-    var it = parse("s=\"x;y\"; b=2");
-    try expectPair(&it, "s", "x;y");
-    try expectPair(&it, "b", "2");
-    try testing.expectEqual(@as(?Cookie, null), it.next());
-
-    // Two quoted values in the same header, the first containing a `;`.
-    var it2 = parse("a=\"p;q\"; b=\"r\"");
-    try expectPair(&it2, "a", "p;q");
-    try expectPair(&it2, "b", "r");
-    try testing.expectEqual(@as(?Cookie, null), it2.next());
 }
 
 test "empty-name segments skipped; first '=' splits" {
@@ -1190,9 +1144,9 @@ const seed = @import("testkit").fuzz.seed;
 const cookie_seeds = [_][]const u8{
     seed("sid=abc123"), // the smallest real header
     seed("a=1; b=2; c=3"), // three segments, the ordinary case
-    seed("q=\"a;b=c\""), // ⭐ a ';' INSIDE a quoted value: the toggle branch the generator existed for
+    seed("q=\"a;b=c\""), // a ";" inside quotes: split like any other (judged divergence from CPython)
     seed("q=\"a\\\"b\"; r=2"), // a '\'-escaped quote inside a quoted value
-    seed("q=\"unterminated; r=2"), // an unterminated quote: the scan runs to the end
+    seed("q=\"unterminated; r=2"), // an unterminated quote: the next ";" still ends the pair
     seed("novalue; a=1"), // a segment with no '=' at all
     seed("=justvalue; a=1"), // an empty name
     seed("a=; b=2"), // an empty value
@@ -1245,12 +1199,11 @@ test "corpus: every cookie seed reaches the scanner, and the segments yielded ar
     // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 cookies yielded,
     // 0 quoted values — the whole target was `parse("")`.
     try std.testing.expectEqual(cookie_seeds.len - 1, nonempty); // the deliberate empty seed
-    // 79 until 2026-11-19: the unterminated-quote seed `q="unterminated; r=2`
-    // now yields `r` as its own pair instead of being swallowed.
-    try std.testing.expectEqual(@as(usize, 80), yielded);
-    // 3 until 2026-11-19 (the unterminated-quote seed was one of them: its
-    // value ran to the end of the header, `;` included).
-    try std.testing.expectEqual(@as(usize, 2), quoted); // the seeds whose value survives the DQUOTE span with a ';' inside
+    // 79 until 2026-11-19; the scanner then split on every `;` (quoted or
+    // not), so the quoted seeds yield their pieces as pairs of their own.
+    try std.testing.expectEqual(@as(usize, 82), yielded);
+    // No value holds a `;` any more (3 seeds did before 2026-11-19).
+    try std.testing.expectEqual(@as(usize, 0), quoted);
 }
 
 // ── audit 2026-10-04: test asked for by a mutation survivor ──────────────────

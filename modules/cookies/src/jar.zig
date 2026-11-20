@@ -451,6 +451,7 @@ pub const Jar = struct {
         j.purgeExpired(now);
         var picked_buf: [256]u32 = undefined;
         var picked: std.ArrayList(u32) = .initBuffer(&picked_buf);
+        var worst: ?usize = null;
         const entries = j.entries.items;
         for (entries, 0..) |*e, k| {
             const domain_ok = if (e.host_only) std.mem.eql(u8, host, e.domain) else domainMatch(host, e.domain);
@@ -459,12 +460,19 @@ pub const Jar = struct {
                     // Full: keep the 256 that §5.4 sends first (longest path,
                     // then oldest), not the first 256 stored (no-panic sweep
                     // 2026-10-28, C-4). The last in order makes room if the
-                    // new one sorts before it.
-                    var worst: usize = 0;
-                    for (picked.items, 0..) |pk, n| {
-                        if (sendsBefore(entries, picked.items[worst], pk)) worst = n;
+                    // new one sorts before it; its index is cached and found
+                    // again only after a replacement (not once per match).
+                    if (worst == null) {
+                        var w_i: usize = 0;
+                        for (picked.items, 0..) |pk, n| {
+                            if (sendsBefore(entries, picked.items[w_i], pk)) w_i = n;
+                        }
+                        worst = w_i;
                     }
-                    if (sendsBefore(entries, @intCast(k), picked.items[worst])) picked.items[worst] = @intCast(k);
+                    if (sendsBefore(entries, @intCast(k), picked.items[worst.?])) {
+                        picked.items[worst.?] = @intCast(k);
+                        worst = null;
+                    }
                 };
             }
         }
