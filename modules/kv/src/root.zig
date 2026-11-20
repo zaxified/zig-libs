@@ -2435,7 +2435,11 @@ pub const Db = struct {
                     }
                 }
             }
-            // Copied under the lock: the heap borrows the keydir's keys.
+            // Copied BEFORE `unlockShared`: the heap borrows the keydir's
+            // own key bytes, which a writer frees (delete, overwrite of an
+            // expired key, compaction's keydir rebuild) as soon as it gets the
+            // exclusive lock. Raced by the paged scan in "concurrency: readers
+            // alongside puts, deletes and compactions" (run it under TSan).
             const out = try gpa.alloc([]u8, n);
             out_buf = out;
             while (copied < n) : (copied += 1) out[copied] = try gpa.dupe(u8, heap[copied]);
@@ -5713,6 +5717,7 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
     const Reader = struct {
         bad: usize = 0,
         reads: usize = 0,
+        scanned: usize = 0,
         fn run(r: *@This(), d: *Db, stop: *std.atomic.Value(bool)) void {
             var buf: [32]u8 = undefined;
             while (!stop.load(.acquire)) {
@@ -5735,6 +5740,32 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
                     break :blk null;
                 }) |p| {
                     if (!std.mem.startsWith(u8, p.value, p.key) or p.value[p.key.len] != '=') r.bad += 1;
+                }
+                // A paged scan in pages of 1-2 racing the same keys' puts,
+                // deletes, compactions and merges: every page's keys are
+                // copied before the shared lock is released (`scanKeys`), so
+                // a key here is never freed or rewritten keydir memory —
+                // well-formed "k<n>", strictly ascending across pages.
+                var cursor: [4]u8 = undefined;
+                var cursor_len: ?usize = null;
+                var limit: usize = 1;
+                while (true) : (limit = 3 - limit) {
+                    const after: ?[]const u8 = if (cursor_len) |n| cursor[0..n] else null;
+                    const page = d.scanKeys(testing.allocator, "", after, limit) catch unreachable;
+                    defer page.deinit(testing.allocator);
+                    for (page.keys) |k| {
+                        r.scanned += 1;
+                        const ok = k.len >= 2 and k.len <= cursor.len and k[0] == 'k' and
+                            (std.fmt.parseInt(u8, k[1..], 10) catch 16) < 16 and
+                            (if (cursor_len) |n| keyLess(cursor[0..n], k) else true);
+                        if (!ok) {
+                            r.bad += 1;
+                            return;
+                        }
+                        @memcpy(cursor[0..k.len], k);
+                        cursor_len = k.len;
+                    }
+                    if (!page.more) break;
                 }
             }
         }
@@ -5805,6 +5836,7 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
     for (readers) |r| {
         try testing.expectEqual(@as(usize, 0), r.bad);
         try testing.expect(r.reads > 0);
+        try testing.expect(r.scanned > 0);
     }
 }
 

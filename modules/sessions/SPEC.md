@@ -135,12 +135,12 @@ Closed against scs v2.9.0 (cites are `~/go/pkg/mod/github.com/alexedwards/scs/v2
   (`keep`/`destroy`/`stop`); returns the number destroyed. Expired records (idle/absolute) are skipped. A
   `.destroy` goes through `Store.delete` (generation bump), so a request already holding that session cannot
   resurrect it — the CAS guarantee is unchanged (tested). `KvStore` lists the keys under its prefix with
-  `db.scanKeys` a page of `KvStore.Config.iterate_page` (default 256) at a time — memory bounded by the
+  `db.scanKeys` a page of `KvStore.Config.iterate_page` (default 4096) at a time — memory bounded by the
   page, not the number of sessions (until 2026-11-19 one `db.keys` snapshot of every key) — and reads each
   key like `get`, skipping keys removed in between and non-records; its lock is taken per read, never across
   the callback. Between pages `kv`'s cursor rule holds (kv SPEC § "Paged key scan"): a session live for the
   whole walk is shown exactly once, in key order; one created during the walk is shown iff its key sorts
-  after the page already listed (scs's `Iterate` over a store's `All` has no rule for that either). `RamcacheStore` has no enumeration (`iterate = null`): `Manager.iterate`
+  after the cursor and a later page is fetched (one created during the last page is missed; scs's `Iterate` over a store's `All` has no rule for that either). The walk is not one snapshot, and each page is a full pass over the `kv` keydir under its shared lock (writers wait): N sessions cost N / `iterate_page` passes, quadratic in N — hence the 4096 default (independent review 2026-11-19; it was 256). A store that fails mid-walk stops at the next page. `RamcacheStore` has no enumeration (`iterate = null`): `Manager.iterate`
   returns `error.Unsupported`. Logout-everywhere for a user whose id the app stored via `putValue("uid", …)`
   is one pass; the test shows 3 sessions of A and 2 of B.
 - **`Options.hash_id_in_store`** (scs `HashTokenInStore`: data.go `hashToken` 627-630, applied in
