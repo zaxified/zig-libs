@@ -1200,6 +1200,12 @@ pub const WriteError = error{
     /// value ("value 2097152 out of uid_t range 0..2097151", exit 2) instead
     /// of writing it, and this writer matches it.
     ///
+    /// Also a `path` or link target the reader would refuse (over `max_name_len`
+    /// bytes, less one for the NUL of a GNU 'L'/'K' record), and a pax-mode
+    /// `uname`/`gname` over `max_name_len`: Go's `archive/tar` reader bounds
+    /// its special records too (`maxSpecialFileSize`, 1 MiB), and an archive
+    /// this module's own reader cannot read back is refused rather than written.
+    ///
     /// `size` is deliberately not in this set: it has the GNU/star base-256
     /// escape (`writeSizeField`) and needs no ceiling.
     FieldOutOfRange,
@@ -1294,7 +1300,17 @@ pub const Writer = struct {
             return error.FieldOutOfRange;
         if (std.mem.findScalar(u8, e.uname, 0) != null or std.mem.findScalar(u8, e.gname, 0) != null)
             return error.FieldOutOfRange;
-        if (self.options.long_names == .pax) return writePaxHeader(w, &block, e, typeflag);
+        // What this module's reader refuses is refused here, before a byte is
+        // written: a GNU 'L'/'K' payload (name + NUL) over `max_name_len`, a
+        // pax path/linkpath/uname/gname over it (so a pax payload stays under
+        // `max_pax_len`).
+        const name_limit: usize = if (self.options.long_names == .pax) max_name_len else max_name_len - 1;
+        const has_link_target = e.kind == .symlink or e.kind == .hardlink;
+        if (e.path.len > name_limit or (has_link_target and e.link_target.len > name_limit)) return error.FieldOutOfRange;
+        if (self.options.long_names == .pax) {
+            if (e.uname.len > max_name_len or e.gname.len > max_name_len) return error.FieldOutOfRange;
+            return writePaxHeader(w, &block, e, typeflag);
+        }
         if (e.uname.len > 32 or e.gname.len > 32) return error.FieldOutOfRange;
         if (e.uid > max_octal_8) return error.FieldOutOfRange;
         if (e.gid > max_octal_8) return error.FieldOutOfRange;
@@ -2963,6 +2979,37 @@ test "reader: a contiguous ('7') entry still carries content, so the set above i
     const second = (try tr.next()).?;
     try testing.expectEqualStrings("safe.txt", second.path);
     try testing.expectEqual(@as(?Entry, null), try tr.next());
+}
+
+test "writer refuses a path, link target or pax name the reader would refuse (limits are exact, nothing is emitted)" {
+    const gpa = testing.allocator;
+    const big = try gpa.alloc(u8, max_name_len + 1);
+    defer gpa.free(big);
+    @memset(big, 'p');
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const gw = Writer.init(&aw.writer);
+    const pw = Writer.initOptions(&aw.writer, .{ .long_names = .pax });
+    // GNU 'L'/'K': name + NUL must fit max_name_len.
+    try testing.expectError(error.FieldOutOfRange, gw.writeHeader(.{ .path = big[0..max_name_len] }));
+    try testing.expectError(error.FieldOutOfRange, gw.writeHeader(.{ .path = "l", .kind = .symlink, .link_target = big[0..max_name_len] }));
+    // pax: the value itself may be max_name_len, one more is refused.
+    try testing.expectError(error.FieldOutOfRange, pw.writeHeader(.{ .path = big }));
+    try testing.expectError(error.FieldOutOfRange, pw.writeHeader(.{ .path = "l", .kind = .symlink, .link_target = big }));
+    try testing.expectError(error.FieldOutOfRange, pw.writeHeader(.{ .path = "u", .uname = big }));
+    try testing.expectError(error.FieldOutOfRange, pw.writeHeader(.{ .path = "g", .gname = big }));
+    try testing.expectEqual(@as(usize, 0), aw.written().len);
+    // The largest accepted ones round-trip through the reader.
+    try gw.writeHeader(.{ .path = big[0 .. max_name_len - 1] });
+    try pw.writeHeader(.{ .path = big[0..max_name_len] });
+    try gw.finish();
+    var fr: std.Io.Reader = .fixed(aw.written());
+    var rd = Reader.init(gpa, &fr);
+    defer rd.deinit();
+    const e1 = (try rd.next()).?;
+    try testing.expectEqual(@as(usize, max_name_len - 1), e1.path.len);
+    const e2 = (try rd.next()).?;
+    try testing.expectEqual(@as(usize, max_name_len), e2.path.len);
 }
 
 test "writer refuses a numeric field that does not fit, instead of truncating it" {

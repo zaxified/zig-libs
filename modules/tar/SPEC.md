@@ -58,7 +58,7 @@ every earlier release: 'L'/'K' records, `FieldOutOfRange` for ids/mtime that do 
 with `len` the fixed point counting its own digits, computed without allocating) for exactly what ustar
 cannot hold, the ustar field then holding 0 (name truncated, size base-256); a path over 100 bytes first
 tries the ustar `prefix`/`name` split and needs no record then; `mode` has no pax keyword and stays
-`FieldOutOfRange`; `mtime_nsec` above 999 999 999 is `FieldOutOfRange` in both modes. Reentrant, portable codec / Linux packer: `Reader`/`Writer`/`packTarGz` are
+`FieldOutOfRange`; `mtime_nsec` above 999 999 999 is `FieldOutOfRange` in both modes. So is a path or link target the reader would refuse (over `max_name_len`, less one for a GNU record's NUL) and a pax-mode `uname`/`gname` over `max_name_len`: nothing is written (Go's reader bounds special records at 1 MiB the same way). Reentrant, portable codec / Linux packer: `Reader`/`Writer`/`packTarGz` are
 platform-pure (I/O only through the caller's `std.Io.Reader`/`Writer`); only `packDir` (filesystem
 walker reading real attrs via raw `statx`/`readlink`) is Linux. Implements the public POSIX ustar
 format plus the documented GNU long-name/long-link ('L'/'K') header extensions; the installed GNU
@@ -233,8 +233,6 @@ of a member to disk and a sparse header of a few hundred bytes can declare a lar
 
 ## Backlog / deferred
 
-- **The pax writer does not cap a payload at the reader's `max_pax_len`/`max_name_len`:** a caller writing a path over
-  64 KiB produces an archive this reader refuses (the same as the GNU 'L' mode). Open; no caller needs it.
 - **`packDir` over a file whose `read` returns EINVAL panics in Debug only:** `std.Io` maps EINVAL from `read()` to
   `errnoBug`, a panic in Debug; ReleaseSafe/Fast get the error and pad + count it in `skipped` as documented (sysfs
   attributes do this). Not ours to fix (std); the test skips itself in Debug. LOW.

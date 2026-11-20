@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **Behaviour change:** `Writer.writeHeader`/`writeEntry` refuse with the existing `error.FieldOutOfRange`, before writing anything, a path or link target longer than this module's reader accepts (`max_name_len`; one byte less in GNU 'L'/'K' mode for the NUL) and a pax-mode `uname`/`gname` over `max_name_len`: such an archive used to be written and then refused by `Reader` with `BadHeader`. Test in `root.zig`.
 - **2026-11-19** — Audit record: delta mutation of the `packDirOptions` code (15 mutants, all killed, 3 after new tests); card counts cumulative, 66/68 with 2 eq.
 - **2026-11-19** — Tests only: `packDirOptions` limits count directories and symlinks, `same_device` takes the device per root (mutation survivors).
 - **2026-11-19** — Tests only: `devKey` (the device identity `PackOptions.same_device` compares) is a function with its own test.
