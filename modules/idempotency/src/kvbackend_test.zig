@@ -243,7 +243,7 @@ test "KvBackend: a lease check against a clock that jumped backwards does not ov
     b.vtable.release(b.ptr, "k");
 }
 
-// ── whole-module mutation run 2026-11-07 (A1): tests for the survivors ──────
+// ── whole-module mutation run (A1): tests for the survivors ──────
 
 /// Whether `key` holds a live record (the record is read and released).
 fn isFound(b: Backend, key: []const u8) !bool {

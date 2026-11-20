@@ -20,8 +20,8 @@
 //!   body and short-circuits the chain — the handler genuinely never runs
 //!   (what the hit-counter test asserts). On a miss it exposes the (scoped)
 //!   key via `Store.current(req)` and runs the chain.
-//! - The *record* half is **transparent** by default (`Options.capture`,
-//!   2026-11-06): when the handler returns without error and has not called
+//! - The *record* half is **transparent** by default:
+//! when the handler returns without error and has not called
 //!   `respond`, the middleware reads the status, headers and body off
 //!   `ctx.res` -- before the server puts a buffered response on the wire --
 //!   and records them. A body that outgrew the server's response buffer has
@@ -35,7 +35,7 @@
 //!   it writes the response **and** records it first (so a dropped client
 //!   still leaves the record, streamed body or not); a handler that uses it
 //!   is never captured a second time. With `capture = .off` it is the only
-//!   way to record -- the module's contract before 2026-11-06.
+//!   way to record -- the module's contract previously.
 //!
 //! ## Key scoping
 //!
@@ -506,7 +506,7 @@ pub const Store = struct {
         // Record BEFORE writing: once the handler has reached `respond` the
         // side effect has run, so a write that fails (the client dropped the
         // connection, the exact case this module exists for) must still leave
-        // the record a retry replays. Until 2026-10-23 the write came first and
+        // the record a retry replays. Until the write came first and
         // its error skipped the record -- the retry ran the side effect again.
         if (store.current(ctx.req)) |c| {
             const hs = ctx.res.headers[@min(c.headers_mark, ctx.res.headers_len)..ctx.res.headers_len];
@@ -586,7 +586,7 @@ pub const RecordedResponse = struct {
 
 /// Status bit 15 set: a header block follows the content type. A record
 /// without replayable headers keeps the original layout byte for byte, so
-/// records written before 2026-10-23 (and `KvBackend` files) still decode.
+/// records written previously (and `KvBackend` files) still decode.
 const headers_flag: u16 = 0x8000;
 
 fn replayable(name: []const u8) bool {
@@ -594,7 +594,7 @@ fn replayable(name: []const u8) bool {
     // goes to whoever presents the same key and body (any client, with the
     // default `principal = null`), and a session cookie -- a whole
     // `sessions.CookieManager` session -- would hand them the first caller's
-    // session (audit G 2026-11-06, finding 3).
+    // session (audit G, finding 3).
     const skip = [_][]const u8{ "content-type", "content-length", "transfer-encoding", "content-encoding", "trailer", "connection", "keep-alive", "upgrade", "date", "set-cookie" };
     for (skip) |n| if (std.ascii.eqlIgnoreCase(name, n)) return false;
     return true;
@@ -672,7 +672,7 @@ pub fn decode(blob: []const u8) ?RecordedResponse {
 /// What transparent capture (`Options.capture`) records of a handler that
 /// answered without `respond`.
 pub const Capture = enum {
-    /// Nothing: only `respond` records (the module before 2026-11-06).
+    /// Nothing: only `respond` records (the module previously).
     off,
     /// 2xx answers only -- IdempotentAPI's `CacheOnlySuccessResponses`. A
     /// 4xx/5xx the handler wrote is not kept, so the retry runs again.
@@ -749,7 +749,7 @@ pub const Options = struct {
     /// `respond` still records first and wins. A handler that returns an
     /// error records nothing. Responses that cannot be replayed faithfully
     /// are never recorded and counted in `Store.capture_refused` (see
-    /// there). Default `.all` since 2026-11-06; `.off` restores the
+    /// there). Default `.all`; `.off` restores the
     /// cooperative-only behaviour.
     capture: Capture = .all,
     /// Largest response body transparent capture keeps; a longer one is
@@ -877,7 +877,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
             ctx.res.setStatus(rec.status);
             // Passed straight through: `setHeader` copies, so it does not matter
             // that `rec.content_type` borrows `blob`, which the `defer` above
-            // frees before the head is flushed. Until 2026-08-12 this had to be
+            // frees before the head is flushed. Until this had to be
             // staged in a 256-byte thread-local, which silently DROPPED any
             // longer value; the cap was an artifact of that buffer, not a policy,
             // so a replay now reproduces the recorded Content-Type whatever its
@@ -1310,7 +1310,7 @@ test "first key runs the handler once; replay returns the cached response withou
     try testing.expectEqual(@as(u32, 1), app.calls);
 }
 
-// ── review additions (2026-10-23) ───────────────────────────────────────────
+// ── review additions ───────────────────────────────────────────
 
 fn idemRouter(r: *router.Router, idem: *Idempotency, app: *App, h: router.Handler) !void {
     r.state = app;
@@ -2049,7 +2049,7 @@ test "body fingerprint cap: exactly at the cap fingerprints normally; one byte o
     try testing.expectEqual(@as(u32, 1), app.calls); // still 1 — the over-cap request never ran
 }
 
-// ── transparent capture (2026-11-06) ────────────────────────────────────────
+// ── transparent capture ────────────────────────────────────────
 
 /// `runWire` with a bigger response buffer budget on the wire side and,
 /// with `gzip`, response compression on (min 16 bytes) -- the request
@@ -2966,7 +2966,7 @@ test "model-fuzz: validKey, scopeKey, principalTag and decode vs. models on rand
     try testing.expect(valid_n > 0 and invalid_n > 0 and overflow_n > 0 and fit_n > 0 and dec_ok > 0 and dec_null > 0);
 }
 
-// ── delta audit 2026-11-06 (G): transparent-capture boundaries ──────────────
+// ── delta audit (G): transparent-capture boundaries ──────────────
 
 /// What `hShape` answers: status, `len` body bytes written one at a time,
 /// an optional declared `Content-Length`.
@@ -3231,7 +3231,7 @@ test "capture refuses when an inner tap displaced its own without chaining or re
     try testing.expectEqual(@as(u64, 2), f.refused());
 }
 
-// ── whole-module mutation run 2026-11-07 (A1): tests for the survivors ──────
+// ── whole-module mutation run (A1): tests for the survivors ──────
 
 /// An allocator that counts allocations and notes every freed block that still
 /// holds `marker` (a block freed unwiped).
@@ -3434,7 +3434,7 @@ test "the buffered request body and the encoded record are wiped before they are
     try testing.expectEqual(@as(u32, 2), app.calls);
     try testing.expectEqual(@as(usize, 0), wipe.dirty);
     // The replay: `begin` hands the middleware its own copy of the stored
-    // record, freed once the response is written (mutation 2026-11-07, F2).
+    // record, freed once the response is written (mutation, F2).
     _ = runWire(&r2, reqKey("POST", "/orders", "wipe-2"), &b);
     try testing.expectEqual(@as(u32, 2), app.calls); // replayed, not re-run
     try testing.expectEqual(@as(usize, 0), wipe.dirty);
@@ -3442,7 +3442,7 @@ test "the buffered request body and the encoded record are wiped before they are
 
 test "HeaderIterator: a recorded header name at the u16 edge (65535 bytes) iterates, no overflow" {
     // `4 + nl` used to be computed in u16: a name of 65532..65535 bytes, which
-    // `encode` and `decode` accept, panicked on replay (mutation 2026-11-07, F1).
+    // `encode` and `decode` accept, panicked on replay (mutation, F1).
     const big = try testing.allocator.alloc(u8, 65535);
     defer testing.allocator.free(big);
     @memset(big, 'x');
@@ -3923,7 +3923,7 @@ test "Store.deinit frees the request binding of a reservation still held" {
     store.deinit(); // its in_flight key is the binding's key: freed once
 }
 
-// ── whole-module mutation run 2026-11-11: survivors ─────────────────────────
+// ── whole-module mutation run: survivors ─────────────────────────
 
 test "begin compares the whole fingerprint: a digest that differs in any single byte is a mismatch (ramcache)" {
     var cache = newCache();
