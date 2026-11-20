@@ -426,6 +426,34 @@ test "hotpResync: two consecutive RFC 4226 codes" {
     try std.testing.expectEqual(@as(?u64, top - 1), try hotpResync(.sha1, rfc4226_key, top - 3, 6, z, a, 10));
 }
 
+test "hotpResync: window at the cap, no predecessor at the first position, lowest pair wins" {
+    // The cap itself is allowed (like hotpVerify).
+    try std.testing.expectEqual(@as(?u64, 1), try hotpResync(.sha1, rfc4226_key, 0, 6, rfc4226_codes[0], rfc4226_codes[1], max_hotp_window));
+    // Position `counter` has no predecessor: code2 = HOTP(counter) with an
+    // unrelated code1 is not a pair, even with window 0.
+    try std.testing.expectEqual(@as(?u64, null), try hotpResync(.sha1, rfc4226_key, 0, 6, 123456, rfc4226_codes[0], 0));
+    // 1-digit codes repeat: find a consecutive pair that occurs twice and
+    // require the first occurrence (the lowest c) to win.
+    var codes: [300]u32 = undefined;
+    for (&codes, 0..) |*c, i| c.* = hotp(.sha1, rfc4226_key, i, 1);
+    var first: usize = 0;
+    var found_twice = false;
+    outer: for (0..codes.len - 2) |a| {
+        for (a + 1..codes.len - 1) |b| {
+            if (codes[a] == codes[b] and codes[a + 1] == codes[b + 1]) {
+                first = a;
+                found_twice = true;
+                break :outer;
+            }
+        }
+    }
+    try std.testing.expect(found_twice);
+    // The lowest occurrence of the pair (codes[first], codes[first + 1]).
+    var lowest: usize = 0;
+    while (!(codes[lowest] == codes[first] and codes[lowest + 1] == codes[first + 1])) lowest += 1;
+    try std.testing.expectEqual(@as(?u64, lowest + 1), try hotpResync(.sha1, rfc4226_key, 0, 1, codes[first], codes[first + 1], 299));
+}
+
 test {
     _ = @import("otpauth.zig");
     _ = @import("fuzz_test.zig");

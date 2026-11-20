@@ -858,3 +858,72 @@ test "format: period 86400 is accepted, 86401 is not; the unreserved set include
         try render(&out, .{ .kind = .totp, .secret = "foo", .account = "a-b.c_d~e" }),
     );
 }
+
+// ── tests: whole-module mutation run additions ──────────────────────────────
+
+test "parse: a known parameter given twice is DuplicateParameter (algorithm, period, counter)" {
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.DuplicateParameter, parse("otpauth://totp/x?secret=MZXW6&algorithm=SHA1&algorithm=SHA1", &buf));
+    try testing.expectError(error.DuplicateParameter, parse("otpauth://totp/x?secret=MZXW6&period=30&period=30", &buf));
+    try testing.expectError(error.DuplicateParameter, parse("otpauth://hotp/x?secret=MZXW6&counter=1&counter=1", &buf));
+}
+
+test "parse: decimal fields reject the bytes just above '9' and the hotp type is case-insensitive" {
+    var buf: [128]u8 = undefined;
+    // ':' is 0x3A and 'a' 0x61, both above '9': a digit test that only checks
+    // the lower bound would add c - '0' into the value.
+    try testing.expectError(error.InvalidCounter, parse("otpauth://hotp/x?secret=MZXW6&counter=1a", &buf));
+    try testing.expectError(error.InvalidCounter, parse("otpauth://hotp/x?secret=MZXW6&counter=1:", &buf));
+    try testing.expectError(error.InvalidPeriod, parse("otpauth://totp/x?secret=MZXW6&period=3:", &buf));
+    const k = try parse("otpauth://HoTp/x?secret=MZXW6&counter=1", &buf);
+    try testing.expectEqual(Kind.hotp, k.kind);
+}
+
+test "parse: algorithm names map to their algorithm in any case; defaults are SHA-1 / 6 / 30 / counter 0" {
+    var buf: [128]u8 = undefined;
+    const explicit = try parse("otpauth://totp/x?secret=MZXW6&algorithm=SHA1", &buf);
+    try testing.expectEqual(Algorithm.sha1, explicit.algorithm);
+    const lower = try parse("otpauth://totp/x?secret=MZXW6&algorithm=sha1", &buf);
+    try testing.expectEqual(Algorithm.sha1, lower.algorithm);
+    const d = try parse("otpauth://totp/x?secret=MZXW6", &buf);
+    try testing.expectEqual(Algorithm.sha1, d.algorithm);
+    try testing.expectEqual(@as(u5, 6), d.digits);
+    try testing.expectEqual(@as(u32, 30), d.period);
+    try testing.expectEqual(@as(u64, 0), d.counter);
+}
+
+test "parse: a literal space after the issuer separator is skipped; label error classes and buffer boundaries" {
+    var buf: [128]u8 = undefined;
+    const k = try parse("otpauth://totp/Example: alice?secret=MZXW6", &buf);
+    try testing.expectEqualStrings("alice", k.account);
+    try testing.expectEqualStrings("Example", k.issuer.?);
+    // A bad escape in the issuer prefix is a label fault, not an issuer-parameter fault.
+    try testing.expectError(error.InvalidLabel, parse("otpauth://totp/%zz:alice?secret=MZXW6", &buf));
+    // Issuer fits (2 bytes), the account (6 bytes) does not fit the 5 bytes left.
+    var seven: [7]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, parse("otpauth://totp/ab:cdefgh?secret=MZXW6", &seven));
+    // The secret needs `decodedLenUpperBound(5)` = 3 bytes after the 1-byte account:
+    // exactly 3 left is enough, 2 left is BufferTooSmall (not InvalidSecret).
+    var four: [4]u8 = undefined;
+    const ok = try parse("otpauth://totp/a?secret=MZXW6", &four);
+    try testing.expectEqualStrings("foo", ok.secret);
+    var three: [3]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, parse("otpauth://totp/a?secret=MZXW6", &three));
+}
+
+test "format: digits in label and issuer stay literal; HOTP ignores an out-of-range period" {
+    var out: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "otpauth://totp/Corp2:user1?secret=MZXW6&issuer=Corp2",
+        try render(&out, .{ .kind = .totp, .secret = "foo", .account = "user1", .issuer = "Corp2" }),
+    );
+    // `period` is TOTP-only: for HOTP neither 0 nor max_period + 1 is an error.
+    try testing.expectEqualStrings(
+        "otpauth://hotp/x?secret=MZXW6&counter=1",
+        try render(&out, .{ .kind = .hotp, .secret = "foo", .account = "x", .counter = 1, .period = 0 }),
+    );
+    try testing.expectEqualStrings(
+        "otpauth://hotp/x?secret=MZXW6&counter=1",
+        try render(&out, .{ .kind = .hotp, .secret = "foo", .account = "x", .counter = 1, .period = max_period + 1 }),
+    );
+}
