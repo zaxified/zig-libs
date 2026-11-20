@@ -401,6 +401,10 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
   Certificate is sent (Ed25519 client keys work in TLS 1.3).
 - **0-RTT** (Go's client has none).
 - **Resumption by server-assigned session IDs** (Go does not either).
+- **`eof` by pointer:** `eof(c: Client)` takes the client by value, as `std.crypto.tls.Client.eof` does
+  in Zig 0.17.1 (checked in its `lib/std/crypto/tls/Client.zig`); a `*const Client` would break
+  `Client.eof(c)` callers of the drop-in. The by-value copy may put the traffic keys in the
+  caller's frame for the call (std behaves the same); a caller that burns its stack covers it.
 
 ## Anchoring
 
@@ -431,9 +435,6 @@ rustls + aws-lc-rs on the primitives a client handshake uses; BoringSSL is not i
 - **Stack requirement checked at run time**: `init` documents about 400 KiB; a caller on a small fibre stack
   overflows. A check needs the thread's stack bounds (no std API); revisit if a consumer runs clients on
   small stacks.
-- **`eof(c: Client)` takes the client by value** (hygiene): it copies the traffic keys to the stack per
-  call; std's signature, kept for drop-in use (`c.eof()` would still compile with `*const Client`,
-  `Client.eof(c)` would not).
 - **Zig 0.17: std AES-GCM is 2.6x slower, move to zig-libs `aesgcm`**: 0.17 lowers `writeInt(u128, ...)` in
   `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig
   #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G -> 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages.

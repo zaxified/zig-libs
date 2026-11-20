@@ -193,7 +193,7 @@ const DeriveCaller = struct {
 };
 
 fn cached(gpa: std.mem.Allocator, io: std.Io, token: []const u8, jwks: *const jwt.JwkSet) !void {
-    var cache: jwt.VerifiedCache(Caller) = try .init(gpa, io, .{ .capacity = 256, .context = "iss" });
+    var cache: jwt.VerifiedCache(Caller) = try .init(gpa, io, .{ .capacity = 256 });
     defer cache.deinit();
     const opts: jwt.Options = .{
         .now_s = 1_700_000_000,

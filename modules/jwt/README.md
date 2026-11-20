@@ -169,7 +169,7 @@ ID-token acceptance).
 | `verifyWithJwks(&parsed, jwks) VerifyError!void` | `selectKey` → `verify`; no usable key → `NoMatchingKey` |
 | `parseVerifyJwks(gpa, token, jwks, Options) !ParsedToken` | the one-call JWKS API: parse → resolve by `kid` + verify → validateClaims |
 | `JwkSet.id` | the set's process-unique identity (stamped by `parseJwks`/`fetchJwks`, never reused; 0 on a hand-built set) — what binds a `VerifiedCache` entry to the set it verified under |
-| `VerifiedCache(Value).init(gpa, io, .{ .capacity, .context })` (+ `deinit`, `clear`, `capacity`) | opt-in, bounded, thread-safe cache of tokens that verified, until their `exp`; `Value` is plain data the caller derives from the token (a principal, scope bits) — see "Verified-token cache" below |
+| `VerifiedCache(Value).init(gpa, io, .{ .capacity })` (+ `deinit`, `clear`, `capacity`) | opt-in, bounded, thread-safe cache of tokens that verified, until their `exp`; `Value` is plain data the caller derives from the token (a principal, scope bits) — see "Verified-token cache" below |
 | `VerifiedCache.verifyJwks(scratch, token, &set, Options, deriver) !Value` | `parseVerifyJwks` with the cache in front: a hit returns the stored value, a miss verifies, calls `deriver.derive(*const ParsedToken) ?Value` and stores it; `lookup` / `insert` are the two halves |
 | `Fetcher` / `HttpFetcher` | GET-a-URL seam (offline-testable); `HttpFetcher` adapts `http.Client` |
 | `discover(gpa, fetcher, issuer) !Metadata` · `fetchJwks(gpa, fetcher, url) !JwkSet` | OIDC discovery + JWKS fetch |
@@ -369,10 +369,9 @@ It returns exactly what `parseVerifyJwks` followed by `derive` would:
 
 - the key is a SipHash-2-4-128 MAC, under a random key drawn per cache, over
   the **exact token bytes**, the claim policy (every `Options` field but
-  `now_s`) and `Config.context`, so another audience, issuer or leeway never
-  shares an entry (a different derive step needs its own instance:
-  `Config.context` is a per-instance constant and separates nothing; the key
-  must stay secret — SPEC.md says what a process-memory disclosure would allow);
+  `now_s`), so another audience, issuer or leeway never shares an entry (a
+  different derive step needs its own instance — instances share nothing; the
+  key must stay secret — SPEC.md says what a process-memory disclosure would allow);
 - each entry is bound to `JwkSet.id`: a replaced set (refresh, rotation) makes
   every entry verified under the old one a miss;
 - a hit re-runs the `exp`/`nbf`/`iat` checks against `now_s` (the same code
@@ -381,7 +380,7 @@ It returns exactly what `parseVerifyJwks` followed by `derive` would:
 - only successes are stored; a failure is never cached.
 
 `derive` must be a pure function of the token; derive steps that differ need
-separate cache instances (`Config.context` has no effect). Nothing in the module uses the cache on its own;
+separate cache instances. Nothing in the module uses the cache on its own;
 `Provider`, `Guard` and `ResourceServer` are unchanged.
 
 ## Semantics notes

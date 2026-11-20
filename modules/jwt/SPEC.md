@@ -228,7 +228,7 @@ access token on every request.
 `parseVerifyJwks` is a deterministic function of (token bytes, key set, `Options`); the cache
 fixes the first two and every part of the third except the clock, and re-evaluates the clock:
 
-- **Key = SipHash-2-4-128 under a per-cache secret key, over (domain tag ‖ policy ‖ context ‖
+- **Key = SipHash-2-4-128 under a per-cache secret key, over (domain tag ‖ policy ‖
   token).** The policy is every `Options` field but `now_s` (`leeway_s`, `issuer`, `audience`,
   `require_exp`, `reject_future_iat`), length-prefixed, with the token last; a comptime check
   fails the build when a field is added to `Options` without being folded in or excluded. So the
@@ -271,8 +271,11 @@ fixes the first two and every part of the third except the clock, and re-evaluat
   hit path allocation-free and bounds an entry: a token whose claims do not fit the caller's
   `Value` is refused by `derive` and simply not cached. `derive` must be a pure function of the
   token; what else it reads (which claim names the principal, which scopes map to which bits)
-  needs its own `VerifiedCache` instance (`Config.context` is folded into the key but, being a
-  per-instance constant, separates nothing; see Backlog).
+  needs its own `VerifiedCache` instance: each instance has its own table and MAC key, so nothing
+  is shared between instances. There is no per-instance "context" folded into the key — being a
+  constant within one instance it would separate nothing. Same shape as
+  fast-jwt's verifier cache (`createVerifier({ cache })`): one cache per verifier, keyed by the
+  token, no namespace option.
 
 **Residual differences — none in the answer, under one assumption.** With the MAC key secret, a
 hit returns what verifying again would, except with probability 2^-128 per request. What does
@@ -343,7 +346,7 @@ Not wired into `Provider`/`Guard`/`ResourceServer` — see Backlog.
   *Encode:* a round trip through `parseAndVerify` for every algorithm, the HMAC floor, wrong-length free
   under `FailingAllocator`. *PEM:* `src/pem_test.zig` over OpenSSL-produced keys. *`VerifiedCache`:* hit and
   miss, `exp` crossing while cached, `nbf`/`iat` re-check, set replacement and key rotation, policy and
-  context separation, one-byte-different tokens, failures never stored, capacity and CLOCK eviction,
+  instance separation, one-byte-different tokens, failures never stored, capacity and CLOCK eviction,
   four-thread hammering, ES256 end to end. *Audit tests:* `src/audit_test.zig` pins the findings of the
   independent audit (duplicate JSON members refused, canonical base64url, the HMAC floor).
 - **Oracles and goldens.** Published RFC vectors above, in `src/*_vectors.zig` (RFC 9964's three
@@ -397,10 +400,6 @@ the figures and is authoritative.
   refresh must run before a lookup (else a hit would outlive a dropped key). The fit is a
   `derive`-style entry point on `Provider` that refreshes first and then calls
   `VerifiedCache.verifyJwks` with its current set. Add it when a consumer of those types asks.
-- **`VerifiedCache` `Config.context` has no effect.** Each instance has its own table and random MAC
-  key, so folding a per-instance constant into the key never changes a hit; separate callers are
-  kept apart by separate instances already. The docs say so; open: either remove the field
-  (breaking) or make it effective.
 - **Dead-stack residue not yet probed or burned:** the `kty:"oct"` secret in `parseJwks` (`jwkMaterial`
   decodes `k` through arena/stack buffers before it becomes `Key.hmac`); `VerifiedCache`'s SipHash
   `mac_key` (zeroed by `defer`, but the SipHash state it keys is not burned, and `init` returns the cache by

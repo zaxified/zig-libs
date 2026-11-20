@@ -13,7 +13,7 @@
 //!
 //! * The key is a SipHash-2-4-128 MAC, under a random key drawn for each
 //!   cache (`io.randomSecure`), over the claim policy (`Options` minus
-//!   `now_s`), the cache's `Config.context` and the EXACT compact token bytes.
+//!   `now_s`) and the EXACT compact token bytes.
 //!   Without the key nobody can aim a different byte string at a stored
 //!   entry: a false hit is a 2^-128 guess per request. So a hit means these
 //!   very bytes verified before under this very policy. (Why not an unkeyed
@@ -51,21 +51,14 @@ const digest_len = Mac.mac_length;
 /// Entries per bucket (the table is 4-way set-associative).
 pub const ways = 4;
 
-/// Longest `Config.context` accepted.
-pub const max_context_len = 64;
-
 pub const Config = struct {
     /// Most tokens held at once. Rounded up so the bucket count is a power
     /// of two (`VerifiedCache.capacity` reports the result). Must be > 0.
     capacity: usize,
-    /// Bytes folded into every key besides the claim policy. **No effect
-    /// today:** each instance has its own table and its own random MAC key,
-    /// so entries are never shared between instances, and within one
-    /// instance the value is a constant. Callers whose derive steps differ
-    /// (which claim is the principal id, which scope names map to which
-    /// bits) must use separate instances. Copied; at most `max_context_len`
-    /// bytes.
-    context: []const u8 = "",
+    // No `context` field: each instance has its own table and its own random
+    // MAC key, so entries are never shared between instances. Callers whose
+    // derive steps differ (which claim is the principal id, which scope names
+    // map to which bits) use separate instances.
 };
 
 /// The time-based claims a hit re-checks.
@@ -110,8 +103,6 @@ pub fn VerifiedCache(comptime Value: type) type {
         buckets: []Bucket,
         /// The MAC key: secret, drawn at `init`, wiped at `deinit`.
         mac_key: [Mac.key_length]u8,
-        context_buf: [max_context_len]u8 = @splat(0),
-        context_len: usize = 0,
 
         const Entry = struct {
             digest: [digest_len]u8 = @splat(0),
@@ -139,13 +130,12 @@ pub fn VerifiedCache(comptime Value: type) type {
             }
         };
 
-        pub const InitError = error{ OutOfMemory, InvalidCapacity, ContextTooLong } || std.Io.RandomSecureError;
+        pub const InitError = error{ OutOfMemory, InvalidCapacity } || std.Io.RandomSecureError;
 
         /// Allocate the table (`capacity` entries, rounded up) and draw the
         /// MAC key from `io.randomSecure` — fail-closed: no entropy, no cache.
         pub fn init(gpa: std.mem.Allocator, io: std.Io, config: Config) InitError!Self {
             if (config.capacity == 0) return error.InvalidCapacity;
-            if (config.context.len > max_context_len) return error.ContextTooLong;
             const wanted = std.math.divCeil(usize, config.capacity, ways) catch unreachable;
             const n = std.math.ceilPowerOfTwo(usize, wanted) catch return error.InvalidCapacity;
             var mac_key: [Mac.key_length]u8 = undefined;
@@ -153,10 +143,7 @@ pub fn VerifiedCache(comptime Value: type) type {
             try io.randomSecure(&mac_key);
             const buckets = try gpa.alloc(Bucket, n);
             @memset(buckets, .{});
-            var self: Self = .{ .gpa = gpa, .buckets = buckets, .mac_key = mac_key };
-            @memcpy(self.context_buf[0..config.context.len], config.context);
-            self.context_len = config.context.len;
-            return self;
+            return .{ .gpa = gpa, .buckets = buckets, .mac_key = mac_key };
         }
 
         /// Free the table. The derived values are wiped first (they may name
@@ -226,8 +213,8 @@ pub fn VerifiedCache(comptime Value: type) type {
         /// `error.NotDerived`, and nothing is stored.
         ///
         /// `derive` must be a pure function of the token, and the cache has
-        /// no way to tell derive steps apart (`Config.context` has no effect):
-        /// use one instance per derive configuration. The whole call returns what
+        /// no way to tell derive steps apart: use one instance per derive
+        /// configuration. The whole call returns what
         /// `parseVerifyJwks` + `derive` would return without the cache.
         pub fn verifyJwks(
             self: *Self,
@@ -337,16 +324,16 @@ pub fn VerifiedCache(comptime Value: type) type {
         }
 
         fn digestOf(self: *const Self, token: []const u8, opts: root.Options) [digest_len]u8 {
-            return keyDigest(&self.mac_key, self.context_buf[0..self.context_len], token, opts);
+            return keyDigest(&self.mac_key, token, opts);
         }
     };
 }
 
 /// SipHash-2-4-128 under `mac_key` over a domain tag, the claim policy (every
-/// `Options` field except `now_s`), the context and the token. Everything
+/// `Options` field except `now_s`) and the token. Everything
 /// before the token is length-delimited and the token comes last, so no two
 /// distinct inputs encode alike.
-fn keyDigest(mac_key: *const [Mac.key_length]u8, context: []const u8, token: []const u8, opts: root.Options) [digest_len]u8 {
+fn keyDigest(mac_key: *const [Mac.key_length]u8, token: []const u8, opts: root.Options) [digest_len]u8 {
     // A field added to `Options` must be decided here — folded into the key,
     // or excluded like `now_s` — before this compiles again.
     comptime {
@@ -372,7 +359,6 @@ fn keyDigest(mac_key: *const [Mac.key_length]u8, context: []const u8, token: []c
         .any => h.update(&.{0}),
         .required => |s| updatePrefixed(&h, 1, s),
     }
-    updatePrefixed(&h, 2, context);
     h.update(token);
     return h.finalResult();
 }
@@ -564,7 +550,7 @@ test "VerifiedCache: a replaced key set invalidates every entry; a dropped key s
     try testing.expectError(error.NoMatchingKey, cache.verifyJwks(testing.allocator, token, &set3, policy(1000), &d));
 }
 
-test "VerifiedCache: another audience, issuer, leeway or context never shares an entry" {
+test "VerifiedCache: another audience, issuer, leeway or instance never shares an entry" {
     var set = try root.parseJwks(testing.allocator, jwks_a);
     defer set.deinit();
     var cache: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 64 });
@@ -594,19 +580,17 @@ test "VerifiedCache: another audience, issuer, leeway or context never shares an
     leeway.leeway_s = 0;
     try testing.expectEqual(@as(?TestValue, null), try cache.lookup(token, &set, leeway));
 
-    // Same policy, another cache context: its own entries.
-    var cache2: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 64, .context = "id=email" });
+    // Same policy, another instance (own table, own MAC key): its own entries.
+    var cache2: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 64 });
     defer cache2.deinit();
-    const mk: [Mac.key_length]u8 = @splat(9);
-    const k1 = keyDigest(&mk, "", token, policy(1000));
-    const k2 = keyDigest(&mk, "id=email", token, policy(1000));
-    try testing.expect(!std.mem.eql(u8, &k1, &k2));
     try testing.expectEqual(@as(?TestValue, null), try cache2.lookup(token, &set, policy(1000)));
+    const mk: [Mac.key_length]u8 = @splat(9);
+    const k1 = keyDigest(&mk, token, policy(1000));
     // now_s is NOT part of the key; the MAC key is.
-    const k3 = keyDigest(&mk, "", token, policy(4999));
+    const k3 = keyDigest(&mk, token, policy(4999));
     try testing.expectEqualSlices(u8, &k1, &k3);
     const other_key: [Mac.key_length]u8 = @splat(10);
-    const k4 = keyDigest(&other_key, "", token, policy(1000));
+    const k4 = keyDigest(&other_key, token, policy(1000));
     try testing.expect(!std.mem.eql(u8, &k1, &k4));
     // Two caches draw different keys.
     try testing.expect(!std.mem.eql(u8, &cache.mac_key, &cache2.mac_key));
@@ -699,7 +683,6 @@ test "VerifiedCache: capacity rounds up; eviction prefers free, then expired, th
     var set = try root.parseJwks(testing.allocator, jwks_a);
     defer set.deinit();
     try testing.expectError(error.InvalidCapacity, Cache.init(testing.allocator, testing.io, .{ .capacity = 0 }));
-    try testing.expectError(error.ContextTooLong, Cache.init(testing.allocator, testing.io, .{ .capacity = 1, .context = &(@as([65]u8, @splat('x'))) }));
     var big: Cache = try .init(testing.allocator, testing.io, .{ .capacity = 9 });
     try testing.expectEqual(@as(usize, 16), big.capacity()); // 3 buckets -> 4
     big.deinit();
@@ -1059,8 +1042,8 @@ test "VerifiedCache: the policy digest is length-delimited even when a policy st
     const hdr = "\x01\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa";
     const p1: root.Options = .{ .now_s = 1000, .issuer = .{ .required = "x" ++ hdr ++ "y" }, .audience = .{ .required = "z" } };
     const p2: root.Options = .{ .now_s = 1000, .issuer = .{ .required = "x" }, .audience = .{ .required = "y" ++ hdr ++ "z" } };
-    const d1 = keyDigest(&key, "", "tok", p1);
-    const d2 = keyDigest(&key, "", "tok", p2);
+    const d1 = keyDigest(&key, "tok", p1);
+    const d2 = keyDigest(&key, "tok", p2);
     try testing.expect(!std.mem.eql(u8, &d1, &d2));
-    try testing.expect(std.mem.eql(u8, &d1, &keyDigest(&key, "", "tok", p1)));
+    try testing.expect(std.mem.eql(u8, &d1, &keyDigest(&key, "tok", p1)));
 }

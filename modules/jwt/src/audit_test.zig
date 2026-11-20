@@ -896,12 +896,7 @@ fn hit(c: *Cache, set: *const jwt.JwkSet, tok: []const u8, now: i64) !bool {
     return (try c.lookup(tok, set, pol(now))) != null;
 }
 
-test "VerifiedCache.init: a context of exactly max_context_len bytes is accepted, one more is not; capacity 0 is refused" {
-    const ctx64: [64]u8 = @splat('x');
-    const ctx65: [65]u8 = @splat('x');
-    var c = try Cache.init(gpa, testing.io, .{ .capacity = 4, .context = &ctx64 });
-    c.deinit();
-    try testing.expectError(error.ContextTooLong, Cache.init(gpa, testing.io, .{ .capacity = 4, .context = &ctx65 }));
+test "VerifiedCache.init: capacity 0 is refused" {
     try testing.expectError(error.InvalidCapacity, Cache.init(gpa, testing.io, .{ .capacity = 0 }));
 }
 
