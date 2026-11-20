@@ -123,7 +123,11 @@ Structural / algorithm / resolution problems return a typed `VerifyError`
 `TransformOrderInvalid`, `UriNotResolved`, `KeyAlgorithmMismatch`, `TooManyReferences`, `MaxDepthExceeded`,
 `OutputTooLarge`, plus `OutOfMemory`); a structurally
 valid signature that simply fails to verify returns `Result{ .valid = false }`
-with per-reference detail. **No input path panics.**
+with per-reference detail (`RefResult.digest_valid`), the way the reference reports it: xmlsec's
+`xmlSecDSigCtxVerify` succeeds and sets the context status to `xmlSecDSigStatusInvalid`. signxml
+(`InvalidDigest` / `InvalidSignature` exceptions) and goxmldsig (`"Signature could not be verified"` /
+the `CheckSignature` error) raise errors instead; the status shape is kept because a caller trying several
+keys (`saml`'s key rotation) reads a mismatch as "try the next key", not as a failure. **No input path panics.**
 
 ## Algorithm allow-list (everything else rejected)
 

@@ -237,10 +237,6 @@ pub const VerifyError = error{
     /// independently when deciding what the signature covers, and a resolution
     /// the two sides can disagree about is signature wrapping.
     UriNotResolved,
-    /// A recomputed reference digest did not match `<DigestValue>`.
-    DigestMismatch,
-    /// The `<SignatureValue>` did not verify against the configured key.
-    SignatureMismatch,
     /// The configured key's type does not match the `<SignatureMethod>` (e.g.
     /// an RSA method with an ECDSA key).
     KeyAlgorithmMismatch,
