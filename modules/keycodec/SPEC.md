@@ -8,42 +8,6 @@
 
 **Audit:** review 2026-11-05 · mutation 2026-11-14 (555/582, 27 eq) · src 9e565e6e8c316586
 
-*Delta mutation run 2026-11-14:* `pem.zig` `tokenMask` (now on `b64ct.eqMask`, the local copy removed by the duplicate-code pass) whole plus the shared `eqMask` as seen from here, 8 mutants, 8 killed. `startsHeader` reads `tokenMask`, whose behaviour is unchanged, so its earlier mutants stand.
-
-Audit detail: mutation run 2026-11-06 (whole module, outside the repo): 390
-mutants in one ReleaseSafe build; 378 killed by the suite (2 of them hangs), 4 burn mutants
-(`burn.run` dropped from either entry point, the burn writing 0xff, `stack` skipped) killed by
-the ReleaseFast stack probe, each planted and seen to fail it. Equivalent 8: six guards a later
-check repeats (DER `n == 0`, `atEnd` `>=`, `encoding` set twice, empty scalar and EC write
-`secret.len == 0` caught by `scalarInRange`, PKCS#8 version > 1 refused earlier), the burn
-zeroing half its length (both burns are over twice the depth their bodies dirty), and the
-`writePrivateKeyPemBody` buffer wipe (the burn covers the buffer). No finding. Source stamp
-moved 54e6909322f40c53 → 17f8430dba129b5f by the ctgrind harness alone (a new file under `src/`,
-not part of the module).
-
-Delta run 2026-11-07 (`c2623bc1b..79f4e9aa`: `pbes2.zig` whole, the encrypted-key and header parts of
-`root.zig` and `pem.zig`; mutant schemata outside the repo): 182 more mutants in one ReleaseSafe build
-(plus a ReleaseFast build for the dead-stack and slow-boundary ones); 163 killed, 19 equivalent
-(27 with the 8 above). One finding, from the coordinator's check of the wipe equivalences: `pbes2` is
-`pub`, and its `decrypt`/`encrypt` ran without a burn, so a direct call left ~1.9 KiB of KDF/HMAC/AES
-state on the dead stack (probe residue 1902 B and 1730 B); both now burn (`burn.pbes2_burn`), the probe
-calls them directly, and the two burn-dropped mutants were planted in a plain ReleaseFast build and seen
-to fail it (184 mutants, 165 killed). The first suite let 71 of the 175 ReleaseSafe-run
-mutants live (data after each nesting level, PRF and cipher OIDs of the right length in the wrong arc,
-explicit `hmacWithSHA1`, parse-time checks that `decrypt` repeated, exact-size scrypt buffers at every
-alignment, overlap boundaries, the INTEGER width edges, the `UnsupportedAlgorithm` and wiped-plaintext
-paths, `writePrivateKeyPemWithHeaders`, header iteration corner cases, duplicate `Proc-Type`); tests
-for those went into `pbes2_test.zig` and `pem.zig`, a `SLOW` ReleaseFast test pins the cost caps at
-their edges, and the stack probe now also looks for the derived cipher key and covers `decryptPkcs8`.
-Equivalent: `scryptWorkLen` `>` -> `>=` (the sum is a multiple of 32, never `maxInt(usize)`, shown by
-a test); `writeUint`'s 9-byte arm and `validate`'s iteration, log2(N)/r/p, r/p > 2^30, cost-cap
-(2^24), buffer-size checks and `encrypt`'s stage-length check (`validate` repeats `derive` and std, which
-answer the same `InvalidOptions` through `catch`; the 13-case bad-option test passes with each of them
-removed); `decrypt`'s wipe after `aescbc.decrypt` fails (unreachable: the length is checked above),
-`encrypt`'s size assert, and the derived-key wipes in `decrypt`/`encrypt` and the staged-plaintext wipe
-in `encryptPkcs8` (every public path now burns the same frames, as for `writePrivateKeyPemBody`; the
-two key wipes dropped together, in a plain ReleaseFast build, pass the probe).
-
 **Hardening:** fuzz 2026-11-05 (24,000,000 runs clean, KEYCODEC_FUZZ, ReleaseSafe, 8 jobs in 44 s; all 10 reach labels hit in the 2000 seeds of every test run; oracles: round trip of random parts, an independent big-integer scalar-range model, write/read fixpoint of every accepted mutated DER and PEM) · ct 2026-11-06 (ctgrind, ReleaseFast: der 2 / write 4 / pem 3 in-file, every one the public scalar-range verdict or a scan false on every base64 character) · panic 2026-11-05 (sweep of every pub entry point by the author + the independent review's panic pass: every `.?`/`unreachable`/assert guarded by an earlier check, DER and PEM arithmetic bounded incl. 32-bit; `pem.encodedLen` made saturating; random-mutation sweep over all 33 vectors in `tests.zig`)
 
 **Performance:** n/a — a key file is read once per process start or reload; no consumer or rival treats key decoding as a hot path (2026-11-05)
@@ -59,11 +23,11 @@ Surveyed 2026-11-05 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [golang/go](https://github.com/golang/go) `crypto/x509` + `encoding/pem` — **reference** | Go | BSD-3-Clause | 139.6k | Go 1.26, push 2026-11-05 | `ParsePKCS8PrivateKey` (RSA, ECDSA P-224..P-521, Ed25519, X25519), `ParseECPrivateKey`, `ParsePKCS1PrivateKey`/`PublicKey`, `ParsePKIXPublicKey` (+ DSA), the `Marshal*` counterparts; `pem.Decode` with RFC 1421 headers, `pem.Encode`. Returns typed keys (ours: parts, the step to a type is the caller's). No ML-DSA/ML-KEM, Ed448, X448, secp256k1; no PBES2 (only the deprecated legacy `DecryptPEMBlock`). |
-| [RustCrypto/formats](https://github.com/RustCrypto/formats) `pkcs8`, `sec1`, `spki`, `pem-rfc7468` | Rust | Apache-2.0 OR MIT | 345 | push 2026-11-05 | The same split as ours (type-agnostic `PrivateKeyInfo`, typed keys in the curve crates). **Encrypted PKCS#8 (PBES2: PBKDF2/scrypt + AES-CBC)** behind a feature: ours reads and writes the same set (since 2026-11-07). Strict RFC 7468 (rejects RFC 1421 headers; we read and write them). No PBES1 in `pkcs8`, as here. |
+| [RustCrypto/formats](https://github.com/RustCrypto/formats) `pkcs8`, `sec1`, `spki`, `pem-rfc7468` | Rust | Apache-2.0 OR MIT | 345 | push 2026-11-05 | The same split as ours (type-agnostic `PrivateKeyInfo`, typed keys in the curve crates). **Encrypted PKCS#8 (PBES2: PBKDF2/scrypt + AES-CBC)** behind a feature: ours reads and writes the same set. Strict RFC 7468 (rejects RFC 1421 headers; we read and write them). No PBES1 in `pkcs8`, as here. |
 | [openssl/openssl](https://github.com/openssl/openssl) `PEM_read_bio_PrivateKey`, `d2i_*` | C | Apache-2.0 | 31.2k | 3.5.5 (2026-01-27), push 2026-11-05 | Everything, including legacy `Proc-Type` encryption, every curve with explicit parameters, DSA, DH, and encrypted PKCS#8 with DES/3DES/Camellia/ARIA ciphers and PBES1. Of its encrypted PKCS#8, ours reads and writes what `pkcs8 -topk8` writes by default and with `-v2 aes-{128,192,256}-cbc`, `-v2prf hmacWithSHA{1,224,256,384,512}`, `-scrypt` (byte for byte, § Anchoring); the rest is refused by name (§ Encrypted keys). The vector oracle (`tools/vectors.py`): its output is what the tests read and must reproduce byte for byte. |
 | [pyca/cryptography](https://github.com/pyca/cryptography) `serialization` | Python (Rust core) | Apache-2.0 OR BSD-3-Clause | 7.8k | push 2026-11-05 | `load_pem_private_key`/`load_der_*` with a password (PBES2 and legacy), OpenSSH keys, PKCS#12. Not measured. Ours: PBES2 only (no legacy). |
 
-**Where we are ahead:** ML-DSA (RFC 9881) and ML-KEM (RFC 9935) in all three private-key forms, Ed448/X448 and secp256k1, which the reference does not read; PEM decoded in constant time (Go's `encoding/pem` uses `encoding/base64`'s table). **Where we are behind:** the legacy `Proc-Type: 4,ENCRYPTED` PEM encryption, PBES1 and DES/3DES/Camellia/ARIA PBES2 ciphers (OpenSSL, pyca; Go deprecates its own and RustCrypto refuses them): refused by name with a reason each (§ Encrypted keys, § Backlog). Closed 2026-11-07: encrypted PKCS#8 read and write (§ Encrypted keys) and PEM headers on encode (`pem.encodeWithHeaders`, `writePrivateKeyPemWithHeaders`; `Block.header` / `headerIterator` read them back, as Go's `Block.Headers`).
+**Where we are ahead:** ML-DSA (RFC 9881) and ML-KEM (RFC 9935) in all three private-key forms, Ed448/X448 and secp256k1, which the reference does not read; PEM decoded in constant time (Go's `encoding/pem` uses `encoding/base64`'s table). **Where we are behind:** the legacy `Proc-Type: 4,ENCRYPTED` PEM encryption, PBES1 and DES/3DES/Camellia/ARIA PBES2 ciphers (OpenSSL, pyca; Go deprecates its own and RustCrypto refuses them): refused by name with a reason each (§ Encrypted keys, § What is deliberately not done). Encrypted PKCS#8 is read and written (§ Encrypted keys), and PEM headers are written (`pem.encodeWithHeaders`, `writePrivateKeyPemWithHeaders`) and read back (`Block.header` / `headerIterator`, as Go's `Block.Headers`).
 
 ## What this module is, and what it is not
 
@@ -79,8 +43,8 @@ families (std's ECDSA in `tlsserver`, `p256`/`p384`/`p521` in `jwt` and `acme`,
 `rsa`, std's ML-DSA/ML-KEM). A parsed key is therefore its `Algorithm` plus
 slices of the caller's DER: the EC scalar, the Ed/X key, the PKCS#1 DER, the ML
 seed/expanded key, the public key the encoding carries. This is the shape
-`modules/x509/SPEC.md` asked for on 2026-10-20 and RustCrypto's `pkcs8` uses,
-and it keeps the dependency list at `b64ct`.
+`modules/x509/SPEC.md` asked for and RustCrypto's `pkcs8` uses,
+and it keeps the dependency list to `b64ct` (PEM) and `aescbc` + `aes192` (encrypted PKCS#8).
 
 **What is checked:** strict DER (minimal lengths, nothing trailing at any
 level), each version field (PKCS#8 0 or 1, SEC1 1, PKCS#1 0 with exactly
@@ -150,6 +114,17 @@ refuse that form, as `tlsserver` does); the RSA numbers (the `rsa` module).
 - **RSA public keys** are written as SPKI (`writePublicKeyPem`) or as PKCS#1
   `RSA PUBLIC KEY` (`writeRsaPublicKeyPem`, OpenSSL's `-RSAPublicKey_out`).
 
+## Consumers
+
+The readers and writers are shared by `jwt` (PEM and key readers), `tlsserver` (key loading), `acme` (EC reader
+and writer, RSA reader), `rsa` (PEM walk, PKCS#8 and SPKI readers; its `fromPkcs8Encrypted` decrypts through
+`pbes2` under its own PBKDF2-only profile and error set, while its writer `toPkcs8Encrypted` still emits from the
+big-number limbs and stays there), `ssh` (the `OPENSSH PRIVATE KEY` block walk) and `mlkem` (keys load into it,
+`src/mlkem_test.zig`; `mlkem` itself stays dependency-free). Deliberately not moved: `x509.parseSpki` is a
+structural accessor for any algorithm (SLH-DSA, DSA in a chain) over untrusted certificate DER, keycodec's is
+typed and refuses what it does not know; `rsa`'s writers emit the INTEGERs straight into `out` from the
+big-number limbs, and keycodec's writers would need the PKCS#1 DER staged in a buffer first.
+
 ## Encrypted keys
 
 `ENCRYPTED PRIVATE KEY` (RFC 5958 §3 `EncryptedPrivateKeyInfo`) under PBES2
@@ -184,7 +159,7 @@ password, bad padding and a decrypted plaintext that is not a PKCS#8 are
 **one** error, `IncorrectPasswordOrCorrupt`: CBC has no MAC, so the only check
 is the padding plus the plaintext's DER, and telling them apart would be a
 padding oracle. The padding check is `aescbc.unpadPkcs7` (branch-free).
-**Limit, stated (review 2026-11-07):** the error is one, the time is not. A
+**Limit, stated:** the error is one, the time is not. A
 bad pad returns at once, a good pad goes on to the DER parse, and the IV is
 unauthenticated, so flipping OID bits in block 0 of a file with a known
 password can turn `IncorrectPasswordOrCorrupt` into `UnsupportedAlgorithm`.
@@ -239,12 +214,12 @@ writer under 20 KiB (its frame holds the 16 KiB DER buffer). A failed DER
 write zeroes what it had written. The RFC 1421 header test reads the
 characters of a body line only when that line holds a `:` (a one-line PEM
 with a trailing comment) and then classifies all of them before the `:`
-with masks, no early exit. **Machine-checked 2026-11-06** (ctgrind, ReleaseFast,
+with masks, no early exit. **Machine-checked** (ctgrind, ReleaseFast,
 `src/ctgrind_harness.zig`, seven OpenSSL keys, RSA left to `rsa`): `der` 2 in-file
 contexts with only the secret octets tainted, both the scalar range verdict
-(root.zig:428); `write` 4, the same verdict in `checkWritable` (root.zig:831/832);
+(`scalarInRange`); `write` 4, the same verdict in `checkWritable`;
 `pem` 3 with the whole base64 body tainted, the END-line scan and `startsHeader`'s two
-scans (pem.zig:128/145/147), each a compare false on every base64 character; b64ct and
+scans, each a compare false on every base64 character; b64ct and
 the DER walk over secret octets none. Itemised in `scripts/checks/ctgrind-expected.tsv`.
 The dead stack after both burned entry points is held by `src/stackprobe_test.zig`
 (ReleaseFast; every burn mutant but "half the length" fails it).
@@ -286,45 +261,77 @@ P-384, Ed25519, X25519, ML-KEM-768, ML-DSA-44) equal OpenSSL's SPKI.
 
 **Anchor grade:** class A · oracle EXTERNAL
 
+## Verification
+
+`scripts/modtest keycodec` runs the suite. Beyond it: `zig build interop-keycodec` (the live OpenSSL oracle, needs
+`openssl` 3.x on PATH, exit 2 otherwise), `KEYCODEC_FUZZ=<runs>` (the deterministic fuzz driver, ReleaseSafe),
+`scripts/checks/ctgrind.sh keycodec` (valgrind; not part of `zig build test-keycodec`) and the ReleaseFast
+dead-stack probe, which skips in unoptimised builds. The vectors' recipe is `tools/vectors.py`
+(`--encrypted` for the PBES2 files).
+
+- **Vectors (`src/tests.zig`, `src/vectors.zig`):** every OpenSSL key is read back into the parts OpenSSL prints
+  and written back to OpenSSL's exact bytes; RFC 8410 §10.3's Ed25519 examples; public keys derived from the parsed
+  secrets with std equal OpenSSL's SPKI (see Anchoring).
+- **Hostile input:** trailing data and parameters at every nesting level, length checks per ML/Ed/EC form, SPKI
+  refusals, PKCS#1 versions and INTEGER shape, PKCS#8 attribute shape, EC scalar range on every curve, PEM
+  blanks / CRLF / headers / positions / label limit, writer guards and error mappings, the RSA size limit, the wipe
+  on a failed PEM parse, and a random-mutation sweep over every vector that must never panic.
+- **Encrypted keys (`src/pbes2_test.zig`, `src/vectors_enc.zig`):** OpenSSL fixtures that decrypt to
+  `openssl pkcs8 -nocrypt`'s bytes and re-encrypt byte for byte; a hostile-parameter table (OIDs and trailing data
+  at every level, cost caps, exact scrypt buffers, INTEGER widths); a mutation sweep per fixture; round trips over
+  every vector key; option ranges; the wiping of `out`, `scrypt_work` and the in-place PEM region; a `SLOW`
+  ReleaseFast test pins the cost caps at their edges.
+- **Live oracle (`tools/interop.zig`):** random keys and PBES2 variants in both directions against `openssl`,
+  and wrong passwords (see Anchoring).
+- **Fuzz (`src/fuzz.zig`, driver prefix `KEYCODEC_FUZZ`):** round trip of random keys of every algorithm and
+  encoding, an independent big-integer scalar-range model, and the write/read fixpoint of every accepted mutated
+  DER and PEM; a seed run in the ordinary suite checks every reach label is hit. It does not cover the
+  encrypted-key layer (see Open).
+- **ctgrind (`src/ctgrind_harness.zig`; targets `der`, `write`, `pem`):** rows itemised in
+  `scripts/checks/ctgrind-expected.tsv`; `pbes2.zig` is not covered (see Open).
+- **Dead stack (`src/stackprobe_test.zig`, ReleaseFast):** after `parsePrivateKeyPem`, `writePrivateKeyPem`,
+  `parseEncryptedPrivateKeyPem`, `parseEncryptedPkcs8`, `decryptPkcs8`, `encryptPkcs8` and the public
+  `pbes2.decrypt`/`encrypt`, the key's DER and, for the encrypted layer, the derived cipher key are not found on
+  the dead stack; each non-equivalent burn mutant planted in a plain ReleaseFast build fails it.
+- **Consumers:** `src/mlkem_test.zig` loads every OpenSSL ML-KEM key into `mlkem` and writes one back to OpenSSL's
+  bytes.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
+
 ## What is deliberately not done
 
 See § What this module is, and what it is not. In short: no key arithmetic
 (the key types own it), no certificates, OpenSSH or PKCS#12 (`x509`, `ssh`,
-never), no explicit EC parameters (never).
+never), no explicit EC parameters (never). Each of these is refused with its reason:
 
-## Backlog / deferred
-
-- **Review 2026-11-07 of the PBES2 layer, LOW left open** (MED-1/2 and LOW-1/4 fixed in the
-  same wave): an N wider than 64 bits saturates and reads as `MalformedKey`, not
-  `KdfParamsTooLarge` (comment at `pbes2.zig` overstates it); `rsa.fromPkcs8Encrypted` now
-  answers `InvalidDer` for a scrypt file with malformed scrypt parameters (was
-  `UnsupportedEncryption`) and `UnsupportedEncryption` for an `otherSource` salt (was
-  `InvalidDer`) -- malformed input only; no header line-length cap on encode and `DEK-Info` not
-  forced second; the stack probe's secrets omit the derived key and PBKDF2's T blocks; tests
-  missing for an absent-vs-explicit `hmacWithSHA1` on read, a duplicate `Proc-Type` mid-list,
-  a non-INTEGER scrypt keyLength.
-- **Done 2026-11-07:** encrypted PKCS#8 (PBES2; § Encrypted keys) and PEM headers on encode. `rsa.fromPkcs8Encrypted` now decrypts through `pbes2` here (its PBKDF2-only profile and error set unchanged); `rsa`'s own writer (`toPkcs8Encrypted`) still emits from the big-number limbs and stays there.
-- **Not doing, each with its reason (survey 2026-11-05, decided 2026-11-07):** legacy `Proc-Type: 4,ENCRYPTED` PEM decryption, PBES1 and DES/3DES/RC2 (OpenSSL, pyca read them; RustCrypto refuses them and Go deprecated its own: MD5/SHA-1 key derivation, no integrity check, std has no DES; a user who must read such a key converts it once with `openssl pkcs8 -topk8`); AES-GCM and other AEAD in PBES2 (OpenSSL's `pkcs8` does not write them); Camellia/ARIA/SM4 (OpenSSL only); PBKDF2 PRFs hmacWithSHA512-224/-256 (OpenSSL only, no std HMAC); PKCS#12 (never, above).
-- **Consumers onto this module: done** (2026-11-05/06): `jwt` (`PrivateKey.fromPem`,
-  `Key.fromPem`), `tlsserver/src/keys.zig`, `acme/src/x509.zig` (EC reader and writer,
-  RSA reader, `pemBlockStart`), `mlkem` (keys load into it, `src/mlkem_test.zig`; it stays
-  dependency-free), `rsa` (PEM walk, PKCS#8 and SPKI readers), `ssh` (the `OPENSSH PRIVATE
-  KEY` block walk). The `x509` backlog row "Private-key readers" is closed. **Not moved, on
-  purpose:** `x509.parseSpki` is a structural accessor for any algorithm (SLH-DSA, DSA in a
-  chain) over untrusted certificate DER, keycodec's is typed and refuses what it does not
-  know; `rsa`'s writers emit the INTEGERs straight into `out` from the big-number limbs, and
-  keycodec's writers would need the PKCS#1 DER staged in a buffer first.
+- **Legacy `Proc-Type: 4,ENCRYPTED` PEM decryption, PBES1 and DES/3DES/RC2:** OpenSSL and pyca read them; RustCrypto
+  refuses them and Go deprecated its own (MD5/SHA-1 key derivation, no integrity check, std has no DES). A user
+  who must read such a key converts it once with `openssl pkcs8 -topk8`.
+- **AES-GCM and other AEAD in PBES2:** OpenSSL's `pkcs8` does not write them.
+- **Camellia, ARIA, SM4:** OpenSSL only.
+- **PBKDF2 PRFs hmacWithSHA512-224 and -256:** OpenSSL only, no std HMAC.
+- **PKCS#12:** never, a container format with its own MAC and encryption.
+- **P-224 and SLH-DSA private keys:** not now (§ What this module is, and what it is not).
 
 ## Open
 
-- Independent review 2026-11-05 (outside the repo): no HIGH/MED; LOW 1-7 and INFO 1, 2, 4 fixed the same
-  day (RSA v2 public key checked, one-line PEM with a `:` after it, PKCS#1
-  version/INTEGER and attribute shape, EC curve fallback, PKCS#1 writer
-  checks, failed writes wiped, stray BEGIN skipped, writer burn depth,
-  scalar-range tests on every curve); INFO 3's gaps are listed above.
+- **Encrypted keys have no fuzz harness and no ctgrind target.** They have tests (OpenSSL fixtures,
+  hostile-parameter table, mutation sweeps, round trips, option ranges, wiping, the ReleaseFast stack probe), a
+  planted-mutant run and a live OpenSSL oracle, but `src/fuzz.zig` and `src/ctgrind_harness.zig` do not reach
+  `pbes2.zig`.
+- **The fuzz harness (`src/fuzz.zig`) has not been checked by planted mutants aimed at it;** its seed test is part
+  of the suite the mutation runs use.
+- **No-panic sweep of the encrypted-key entry points** (`parseEncryptedPkcs8`, `parseEncryptedPrivateKeyPem`,
+  `decryptPkcs8`, `parseEncryptedInfo`, `encryptPkcs8`, `writeEncryptedPrivateKeyPem`): they were added after the
+  card's panic sweep.
 
-- Encrypted keys (2026-11-07) have tests (OpenSSL fixtures, hostile-parameter table, a 300-mutation sweep per fixture, round trips over every vector key, option ranges, wiping, the ReleaseFast stack probe), a planted-mutant run (§ Audit) and a live OpenSSL oracle (`tools/interop.zig`), but no fuzz harness and no ctgrind target yet.
-- The fuzz harness (`src/fuzz.zig`) has not yet been checked by planted
-  mutants (`~/.claude/fuzzing.md` rule 8); the module's mutation run will
-  include its 2000-seed test.
-- No-panic sweep of every pub entry point.
+## Backlog / deferred
+
+- **scrypt N wider than 64 bits** saturates and reads as `MalformedKey`, not `KdfParamsTooLarge` (the doc comment of
+  `pbes2.parse` says values wider than 64 bits saturate without noting it).
+- **`rsa.fromPkcs8Encrypted`** answers `InvalidDer` for a scrypt file with malformed scrypt parameters and
+  `UnsupportedEncryption` for an `otherSource` salt; malformed input only.
+- **PEM header encoding:** no header line-length cap on encode, and `DEK-Info` is not forced second (only
+  `Proc-Type` goes first).
+- **Stack probe:** its secrets omit PBKDF2's T blocks.
+- **Tests:** a non-INTEGER scrypt `keyLength` is not tested.
