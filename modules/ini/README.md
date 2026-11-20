@@ -92,12 +92,12 @@ var st = ini.StreamScanner.init(reader, .python);     // error.LineTooLong past 
 Every preset is strict. The `Document` owns copies of everything; the input
 text can be freed right after `parse`.
 
-## Not here
+## Not provided
 
 No git-config dialect (subsections as such, `include`), no backslash line
 continuation or `"""` quoting (go-ini's), no multi-byte separators or comment
 prefixes, no file I/O (the caller reads the text). Each with its reason in
-`SPEC.md`, § Compared with.
+`SPEC.md`, *What is deliberately not done*.
 
 Provenance: clean-room. The grammar is this module's own; CPython's
 `configparser` (PSF) and GLib's `GKeyFile` (LGPL) were only run as black-box

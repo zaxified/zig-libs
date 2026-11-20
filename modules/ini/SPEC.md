@@ -33,19 +33,18 @@ Surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md` (first 2026-09-30); stars and activ
 | [ndevilla/iniparser](https://github.com/ndevilla/iniparser), [brofield/simpleini](https://github.com/brofield/simpleini), [metayeti/mINI](https://github.com/metayeti/mINI), [rxi/ini](https://github.com/rxi/ini), [tini](https://github.com/pinecrew/tini) | C, C++, Rust | MIT; tini BSD-3-Clause | 1.1k, 1.3k, 660, 405, — | active, tini 2021 | [I] Not measured, so `fastest` means fastest of those measured. No feature here that the table above lacks. |
 | Zig `std` | Zig | MIT | — | Zig 0.17.0 | No INI parser. |
 
-**Verdicts on every gap the survey found** (✔ done · ✘ rejected, why · ⇒ a sibling owns it):
+**Verdicts on every gap the survey found** (✔ done · ✘ rejected, the reason is in *What is deliberately not done* · ⇒ a sibling owns it):
 
 - ✔ Writer: `Document.write` (order kept; `.merged` = `configparser.write` byte for byte). ✔ Comments and layout: `Editor` keeps every untouched byte, `getComment`/`setComment` read and write them (go-ini's `Key.Comment`, GKeyFile's `get_comment`); go-ini and rust-ini normalise a file, this does not.
-- ✔ Typed getters: `getInt`, `getFloat`, `getBool`, `intValue`, ... with Python's grammar. ✘ go-ini's `0x10` and `t`/`y`: neither reference reads them, and `std.fmt.parseInt(T, v, 0)` is one call. ✘ `MustInt(default)`, `In`, `Range`, `Validate`: `orelse` and an `if`. ⇒ Time values: `datefmt`. ✘ Durations: no INI format defines one.
-- ✔ Lists: `getList`, `parseList` (go-ini's `Strings` by default, `ListOptions.desktop` = `get_string_list`). ✔ `mapSection` (go-ini's `MapTo`, one section, no nesting). ✘ `ReflectFrom`: how a float is written is the caller's call, and `Editor.set` takes the text.
+- ✔ Typed getters: `getInt`, `getFloat`, `getBool`, `intValue`, ... with Python's grammar. ✘ go-ini's `0x10` and `t`/`y`, `MustInt(default)`, `In`, `Range`, `Validate`, durations. ⇒ Time values: `datefmt`.
+- ✔ Lists: `getList`, `parseList` (go-ini's `Strings` by default, `ListOptions.desktop` = `get_string_list`). ✔ `mapSection` (go-ini's `MapTo`, one section, no nesting). ✘ `ReflectFrom`.
 - ✔ Streaming: `Scanner`, `StreamScanner` (ziglibs/ini, inih, ini_core).
-- ✔ `[DEFAULT]`: `Options.default_section`, `merged`, `sectionNames`. ✔ Interpolation: `interpolated`, Basic and Extended, an opt-in layer; values stay raw. Bounded where configparser only bounds depth (a billion-laughs value ends in an error). Re-judged against the parity rule: the old "never" was wrong, configparser's users notice both.
-- ✔ `inline_comments` as `configparser` (audit LOW closed). ✔ `empty_lines_in_values`, its default. ✔ `no_value_keys`: `allow_no_value`, go-ini's boolean keys, `my.cnf`. ✔ `firstDuplicate`: `strict=True`, as a check, because `parse`'s error set is a contract (the terminal-UI consumer switches over it exhaustively).
+- ✔ `[DEFAULT]`: `Options.default_section`, `merged`, `sectionNames`. ✔ Interpolation: `interpolated`, Basic and Extended, an opt-in layer; values stay raw. Bounded where configparser only bounds depth (a billion-laughs value ends in an error).
+- ✔ `inline_comments` as `configparser`. ✔ `empty_lines_in_values`, its default. ✔ `no_value_keys`: `allow_no_value`, go-ini's boolean keys, `my.cnf`. ✔ `firstDuplicate`: `strict=True`, as a check, because `parse`'s error set is a contract (the terminal-UI consumer switches over it exhaustively).
 - ✔ Locale keys: `getLocale`. ✔ Child sections: `getInherited`. ✔ Shadows: `entries`. ✔ Lenient mode: go-ini's `SkipUnrecognizableLines`, GKeyFile has none. ✔ Quoting on write: `quote`, `escapeDesktop`.
-- ✘ git-config: subsections read as a raw name and bare keys work, but its escapes in names and `include` make it a format of its own; a module when a consumer asks. ✘ PHP's `parse_ini_file`: typed scalars and arrays are PHP's semantics, not syntax. ✘ Backslash continuation, `"""` and backtick quoting, auto-increment `-` keys, AWS nesting: go-ini's own, no other surveyed reader takes them, and `Scanner` lets a caller build them.
-- ✘ Multiple sources, `Append`, `Reload`: `over.get(s, k) orelse base.get(s, k)`, and the module does no I/O. ✘ File I/O, `ValueMapper`, name mappers: the caller's, one line each. ✘ `Key.Value` shadows on write, `PrettyFormat` alignment: `Editor` keeps what the file had. ✘ Multi-byte delimiters and comment prefixes (`//`, `REM`): rare, and a single byte is why the classifier needs no table; a caller can pre-process. ✘ UTF-16 BOM: this module reads UTF-8.
+- ✘ git-config, PHP's `parse_ini_file`, backslash continuation, `"""` and backtick quoting, auto-increment `-` keys, AWS nesting, multiple sources / `Append` / `Reload`, file I/O, `ValueMapper` and name mappers, `Key.Value` shadows on write, `PrettyFormat` alignment, multi-byte delimiters and comment prefixes, UTF-16 BOM.
 
-**Where we are ahead:** the only entry in this table whose parser is measured against two foreign implementations, on 2,100 texts (905 of them against both); an edit that leaves every other byte alone and refuses what would change the file's meaning, proved by reading the new line with the parser's own classifier and fuzzed against reading the output back; a strict/lenient invariant; line numbers everywhere. An independent review on 2026-11-02 then found what those had not: a kept slice of the caller's comment text, merged output putting headerless entries under `[DEFAULT]`, edits half done on allocation failure, and a skipped line absorbed by `set`; each is pinned in `src/edit_fail_test.zig`. **Where we are behind:** the `write` row against a crate that proves nothing and keeps no order; and `Editor` memory, which grows with each edit until `deinit`.
+**Where we are ahead:** the only entry in this table whose parser is measured against two foreign implementations, on 2,100 texts (905 of them against both); an edit that leaves every other byte alone and refuses what would change the file's meaning, proved by reading the new line with the parser's own classifier and fuzzed against reading the output back; a strict/lenient invariant; line numbers everywhere. **Where we are behind:** the `write` row against a crate that proves nothing and keeps no order; and `Editor` memory, which grows with each edit until `deinit`.
 
 ## What this module is, and what it is not
 
@@ -99,7 +98,7 @@ implementation each on every text in the golden corpus.
 
 ## Grammar
 
-The input is split on `\n`; one trailing `\r` is dropped from every line; a
+The input is split on `\n` (a lone `\r` is not a line break); one trailing `\r` is dropped from every line; a
 leading UTF-8 BOM is skipped. Leading and trailing spaces/tabs are set aside,
 and the rest of the line (`content`) is classified, **in this order** — the
 order is load-bearing, it is the one measured on configparser:
@@ -109,7 +108,7 @@ order is load-bearing, it is the one measured on configparser:
    value (`k=v`, `  # c`, `  more` is an error in configparser, measured); with
    `empty_lines_in_values` neither a blank nor a comment ends it, and blanks that
    a later continuation line follows become empty lines of the value.
-   With `inline_comments` the comment is now cut from the line (at the first
+   With `inline_comments` the comment is cut from the line (at the first
    comment character after a blank), before anything below looks at it.
 3. **Continuation** (`continuation_lines`): a line indented deeper than the
    line of the last entry (counted in bytes of leading blanks) appends
@@ -128,7 +127,7 @@ order is load-bearing, it is the one measured on configparser:
    blanks and brackets (`InvalidKey`; `Name[cs]` and even `Name[]` pass —
    GKeyFile's rule, measured key by key). The value is left-trimmed; with
    `inline_comments` it ends at a comment character that follows a blank;
-   with `trim_values` it is right-trimmed. Before any header it goes into a
+   with `trim_values` it is right-trimmed (the text before an inline comment is right-trimmed even without it). Before any header it goes into a
    section `""` (`global_entries`) or is `EntryOutsideSection`.
 6. Anything else — no separator — is `MissingSeparator`, unless `no_value_keys`
    makes it a key with no value (which then cannot be continued).
@@ -150,9 +149,7 @@ reads other scripts' digits.
 
 No limit of its own: memory is O(input) — one arena holding a copy of every
 name and value plus the section and entry lists. A value continued over many
-lines grows one buffer (linear; pinned by the 100 000-line test — the first
-version concatenated per line, which was quadratic and allocated ~10 GB for
-that input). Line numbers and offsets are `usize`. Lookups are O(1) in the file
+lines grows one buffer (linear; pinned by the 100 000-line test). An allocation failure at any point of a parse frees everything (arena `errdefer`). Line numbers and offsets are `usize`. Lookups are O(1) in the file
 size. Edits are amortized O(1), not worst-case: the guard against a line reading as
 a continuation can rewrite a long run of indented lines, each only once since
 indentation only shrinks, and the first insert into section `""` walks to the first
@@ -163,6 +160,36 @@ buffer's size already is, unless it is the last and has no `\n`. `interpolated` 
 (`configparser`'s; at most 64 is honoured, it recurses), 1 MiB of output, 2^20
 references followed; the second and third are this module's, safe defaults, since
 ten levels of doubling references would otherwise be a memory and time bomb.
+
+## What is deliberately not done
+
+Each is named in *Compared with*; the reason is here.
+
+- **go-ini's `0x10` and `t`/`y` as numbers and booleans:** neither reference reads them, and `std.fmt.parseInt(T, v, 0)` is one call.
+- **`MustInt(default)`, `In`, `Range`, `Validate`:** `orelse` and an `if`.
+- **Durations:** no INI format defines one.
+- **`ReflectFrom`:** how a float is written is the caller's call, and `Editor.set` takes the text.
+- **git-config:** subsections read as a raw name and bare keys work, but its escapes in names and `include` make it a format of its own; a module when a consumer asks.
+- **PHP's `parse_ini_file`:** typed scalars and arrays are PHP's semantics, not syntax.
+- **Backslash continuation, `"""` and backtick quoting, auto-increment `-` keys, AWS nesting:** go-ini's own, no other surveyed reader takes them, and `Scanner` lets a caller build them.
+- **Multiple sources, `Append`, `Reload`:** `over.get(s, k) orelse base.get(s, k)`, and the module does no I/O.
+- **File I/O, `ValueMapper`, name mappers:** the caller's, one line each.
+- **`Key.Value` shadows on write, `PrettyFormat` alignment:** `Editor` keeps what the file had.
+- **Multi-byte delimiters and comment prefixes (`//`, `REM`):** rare, and a single byte is why the classifier needs no table; a caller can pre-process.
+- **UTF-16 BOM:** this module reads UTF-8.
+
+## Verification
+
+Run `scripts/modtest ini`; the live oracle half is `tools/writer_oracle.py` (GLib and CPython in the loop, not in `modtest`). Test classes:
+
+- **Foreign goldens:** `src/oracle_test.zig` renders `Options.python` / `Options.desktop` documents into the merged view and requires equality with CPython `configparser` and GLib `GKeyFile` on every golden text, and failure where the reference refused (the case and refusal counts are pinned); `src/oracle_ext_test.zig` does the same for the opt-in features (inline comments, `[DEFAULT]` and the bytes of `write()`, `strict`, `allow_no_value`, both interpolation styles, `int`/`float`/`getboolean`, GKeyFile's list, locale, string and escape functions). Producers: `tools/gen_goldens.py`, `tools/gen_goldens_ext.py` (see Anchoring).
+- **Hand-written expectations** (`src/api_test.zig`, `src/root.zig`): the default preset, lenient mode, `quote`, `getInherited`, `mapSection`, `parseList`, `unquote`/`unescapeDesktop`, `getBool`, locale-key rules, inline comments, the 100 000-line continuation, line numbers and `ErrorInfo`, allocation failure at every point of a parse.
+- **Writer and editor:** `Document.write` and every `Editor` operation, `NotRepresentable` refusals, byte-for-byte round trips, and `src/edit_fail_test.zig` (every allocation of every edit failed in turn: the bytes and every lookup must be unchanged).
+- **No-panic sweep** (`src/sweep_test.zig`): every public input over hostile text, edits not scanning the file, interpolation bounded in depth, bytes and steps.
+- **Fuzz:** two harnesses, `ini-parse` (parse never panics, a lenient parse never fails, strict agrees with lenient) and `ini-edit` (readers agree, writers round-trip, an edit means what it says), run by testkit's deterministic driver as `INI_FUZZ` (`src/fuzz_test.zig`), with a fixed seed loop and reach checks in every test run.
+- **Constant time:** n/a, INI parsing.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-ini` (`tools/bench.zig`; Go, Rust and C reference sides under `tools/`); the figures are on the card's Performance line.
 
 ## Anchoring
 
@@ -210,58 +237,13 @@ hand-written tests had not (a stray `\r` doubled before an appended line;
 a stripped indentation exposing the next line as a continuation; section `""`
 outliving its last entry).
 
-### Audit 2026-10-03
-
-Reviewed: all of `src/root.zig` (line classification, continuation buffer and
-its pointer lifetime, header and key rules, `Document` lookups, `unquote`,
-`unescapeDesktop`, `getBool`, allocation-failure paths) against the grammar
-above, CPython `configparser` (run, not read) and the Desktop Entry
-specification. No HIGH or MED defect; no panic reachable from input (every
-slice is bounded by a prior check; the 100 000-line and fuzz tests agree).
-Findings:
-
-- LOW (fixed 2026-11-02, with goldens): `inline_comments` was applied to the value
-  after the line was split at the separator, and only to the entry's own line.
-  `configparser` with `inline_comment_prefixes` strips the comment from every
-  line first, so `x ; y = z` is a parse error there and key `x ; y` here, and a
-  comment on a continuation line is cut there and kept here (run on CPython
-  3.x, 2026-10-03). No preset sets the option.
-- INFO: with `trim_values = false` and `inline_comments`, the text before an
-  inline comment is still right-trimmed (`k = v ; c` is `v`); GKeyFile has no
-  inline comments, so nothing to disagree with. Pinned by a test now.
-- INFO: a lone `\r` (classic Mac) is not a line break; only `\n` is, with one
-  trailing `\r` dropped (as the Grammar says).
-- INFO: allocation failure at any point of a parse frees everything (arena
-  `errdefer`); a new test fails every allocation of three option sets in turn.
-
-Mutation run (schemata, ReleaseSafe, 77 mutants over BOM and CR handling,
-indentation, blank/comment/continuation rules, header and entry classification,
-key and locale-key rules, line numbers and `ErrorInfo`, inline comments, the
-lenient skips, `unquote`, `unescapeDesktop`, `getBool`, case-insensitive
-lookups and the entry iterator): 77 killed, 0 equivalent. The first pass left
-17 alive, all real gaps, each pinned by a test now: the locale rule's blank,
-`[` and `]` checks one by one, a tab before an inline comment, trimming before
-an inline comment with `trim_values = false`, a lone single quote and a
-trailing backslash in `unquote`, the `\t` and `\r` escapes of `unquote` and of
-`unescapeDesktop` and `\\` of the latter, the words `1`, `on` and `0` of
-`getBool`, and `case_insensitive_keys` (never exercised: neither the lookup
-nor the flag reaching the `Document`).
-
-## Backlog / deferred
-
-- **`Document.write` speed** *(bench 2026-11-02)*: the worst `fastest` row (4.75× a
-  crate that neither proves its lines nor keeps file order). The per-line proof is
-  probably most of it (inferred, not profiled). A cheap way to skip it safely would need to know the document was read
-  under the same options and has no stray `\r`; not worth a contract yet.
-- **`Editor` memory** *(2026-11-02)*: replaced lines stay in the arena until `deinit`.
-  A long-lived editor rewriting one key forever grows; no consumer does.
-- **rust-ini not measured** *(survey 2026-11-02, coordinator's decision)*: the most
-  downloaded INI crate, but its dependency tree (ordered-multimap, dlv-list, hashbrown,
-  ahash, ...) was not read, and foreign code is read before it is compiled. So
-  `fastest` on the card is fastest of those measured.
-- **Audit**: review and mutation of 2026-10-03 predate `scan`, `editor`, `value`,
-  `write`. The fuzz harness and the oracles cover them; a mutation run does not yet.
-
 ## Open
 
 - `.targets` is `linux64` only until a `portable-ini-*` build is run.
+
+## Backlog / deferred
+
+- **`Document.write` speed:** the worst `fastest` row (a crate that neither proves its lines nor keeps file order is faster). The per-line proof is probably most of it (inferred, not profiled). A cheap way to skip it safely would need to know the document was read under the same options and has no stray `\r`; not worth a contract yet.
+- **`Editor` memory:** replaced lines stay in the arena until `deinit`. A long-lived editor rewriting one key forever grows; no consumer does.
+- **rust-ini not measured** (coordinator's decision): the most downloaded INI crate, but its dependency tree (ordered-multimap, dlv-list, hashbrown, ahash, ...) was not read, and foreign code is read before it is compiled. So the card's `fastest` is fastest of those measured.
+- **Mutation run over `scan`, `editor`, `value` and `write`:** the whole-module run predates them; the fuzz harnesses and the oracles cover them, a mutation run does not yet (the card's `src` stays `?`).
