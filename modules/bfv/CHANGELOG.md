@@ -5,13 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit (240 mutants: 231 functional, 6 burn sites, 3 constant-time; 227 killed, 13 equivalent, SPEC "Audit 2026-11-18 (whole-module mutation)"). Tests only: 23 killing tests, among them KATs that pin the key-generation error `e` and each relin-key row's error `e_i` (decryption cannot see either), `Δ` in a nonzero-message encryption, the decryption rounding step and exact noise-budget values; ctgrind source digests re-pinned.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** constant-time: on baseline x86-64 (`-mcpu=x86_64`) LLVM compiled the mask of `modarith.csub` and `subMod` into a branch (`cmp`/`jb` inside the Shoup NTT butterflies of `RnsPoly.mul`, on secret-key products). ctgrind `keygen` read 292 in-file and `decrypt` 194, against native bounds of 29 and 6; now 4 and 2. Both masks go through an asm `blackBox`, on every target. Results are bit-identical. Bench (`BFV_BENCH=1`, ReleaseFast, native, on a host shared with three other jobs, so noisy): Shoup mulmod 1.01-1.10x, NTT N=256 1.08x, full HomMul (BEHZ) the same or faster on every row; the `rescale/coeff` micro-row 1.25-2.2x slower (SPEC Backlog). ctgrind source digests re-pinned.
-- **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** `stackprobe_test.zig` probes NTT(s) instead of the ternary secret `s` (no 16-byte window of a ternary vector can be a needle) and replays the test PRNG to learn `s` for the sec-set key generation; tests only.
 - **2026-10-18** — Ported to Zig 0.17.0: `std.meta.Int` -> `@Int`; `Fn.params` -> `param_types` (test seam).
-- **2026-10-09** — **NO CONSUMER-VISIBLE CHANGE:** the stack probe now also runs the security-grade set
-  (`sec_n8192_logq218`, on a 256 MiB thread, 8 MiB window): `keyGen`, `genRelinKey`, `decrypt`,
-  `noiseBudget` leave no residue below their `rings(Ring, 16)` ≈ 4 MiB burns in ReleaseFast.
 - **2026-10-09** — **BREAKING:** dead-stack burns (`CONVENTIONS.md` §2.1.1).
   `keyGen(io, out: *KeyPair)`, `keyGenForTest(random, out)` and
   `genRelinKey(sk, io, out: *RelinKey)`, `genRelinKeyForTest(sk, random, out)`
@@ -22,12 +17,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   from the ring (`burn.rings`: 16 ring elements + 4 KiB). New `src/burn.zig`
   and `stackprobe_test.zig` (`testkit.stackprobe`, probed at `bfv_toy`).
 
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: the backlog lists byte codecs and parameter selection once each, and the fast-RNS item names only the step still open (the input CRT lift) now that `mulBehz` has landed.
 - **2026-10-05** — Mutation run: 18 of 23 killed, 5 equivalent; 2 tests added
   (an encrypt KAT that pins both fresh error terms, `Ntt.init` refusing a
   composite modulus). No code change.
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **keygen 29 / encrypt 17 / decrypt 6**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⛔⛔ Two class-1 findings, both disassembled. `sampleTernary`'s is_neg select at `bfv.zig:655` carries its own doc comment saying "arithmetic mask, no branch" and compiles to `test %rcx,%rcx` + `je` — this is the noise sampler, the classic side channel in this family. ⭐⭐ And `modarith.csub` (`modarith.zig:58`): walking the ENTIRE disassembly of the binary shows it compiled to `cmov` at roughly 98 call sites and to `cmp`/`jb` at **exactly one**, `bfv.zig:686` in `scaledPlaintext`. One leaf function, ninety-nine call sites, one jump — the sharpest evidence in this campaign that "the source is branchless" says nothing about the binary. ⚠ Deliberately left open: `reconstruct`'s `if (acc >= q_product)` compiles to `cmov`/`sbb` and is not flagged, but the agent recorded it as "not disproven, not proven safe" because V-bit propagation through the wide `mulx`/`adc` Barrett chain was not verified bit for bit.
 
 - **2026-08-13** — The production entry points can now actually be compiled by a
   consumer. **BEHAVIOURAL, not BREAKING.** Since the 2026-08-12 entry below,

@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [tuneinsight/lattigo](https://github.com/tuneinsight/lattigo) | Go | Apache-2.0 | 1.5k | v6.2.0 (2026-02-02) | Its README: BFV as a wrapper over BGV, CKKS, multiparty versions, linear transformations / slot permutations and polynomial evaluation circuits. Source not read (not MIT). |
 | Zig ecosystem | Zig | — | — | — | No FHE library of any kind in `std` (ML-KEM/ML-DSA only) and none found on GitHub (`gh search repos "fhe zig"` returned nothing on 2026-09-30). The sibling `paillier` is additively homomorphic only. |
 
-**Where we are ahead:** the only FHE scheme found for Zig, pure Zig with `std` offering none (and `paillier` additively homomorphic only); exact-integer BFV that adds and multiplies to a bounded depth with relinearization and a noise-budget report. **Where we are even:** the BFV core that SEAL, OpenFHE and Lattigo also carry (keygen, encrypt, decrypt, add, multiply) and SEAL's default parameter/NTT design, but no SEAL vectors have been produced or checked in, so this is a design match, not a verified interop. **Where we are behind:** BGV and CKKS, bootstrapping, batching, Galois rotations, modulus switching and byte codecs (see Backlog), which the references offer; only one security-grade parameter set (`sec_n8192_logq218`), the others being toy sets. *(added 2026-10-06 from the survey table and the README)*
+**Where we are ahead:** the only FHE scheme found for Zig, pure Zig with `std` offering none (and `paillier` additively homomorphic only); exact-integer BFV that adds and multiplies to a bounded depth with relinearization and a noise-budget report. **Where we are even:** the BFV core that SEAL, OpenFHE and Lattigo also carry (keygen, encrypt, decrypt, add, multiply) and SEAL's default parameter/NTT design, but no SEAL vectors have been produced or checked in, so this is a design match, not a verified interop. **Where we are behind:** BGV and CKKS, bootstrapping, batching, Galois rotations, modulus switching and byte codecs (see Backlog), which the references offer; only one security-grade parameter set (`sec_n8192_logq218`), the others being toy sets.
 
 ## What this module is
 
@@ -62,68 +62,21 @@ row is a *could-be-anchored* argument for why BFV is not Fable-tier, not a
 claim that a SEAL KAT has been run. No SEAL vectors exist in this repo; see
 "Anchors (verification harness)" below for what is actually checked.
 
-## Part-1 scope, and the sub-split
+## Layers
 
-FHE is a moonshot **in scale**. A single "full leveled BFV with multiply" is too
-large for one clean scaffold, so the arc is split and **Part 1 is scaffolded
-cleanly** rather than everything half-built:
+- **Arithmetic backbone:** `modarith` + `ntt` + `rns` + `ring` + `encode` + `params`, byte-exact-KAT'd.
+- **Scheme core:** `bfv.Bfv` — `keyGen` / `encrypt` / `decrypt` / `add` / `sub`; textbook leveled BFV over the RNS ring.
+- **Noise-management core:** `mul` (tensor + `⌊t/q·…⌉` rescale) + `genRelinKey` / `relinearize` (relin-key key-switch) + `noiseBudget`.
 
-- **Part 1 (this commit) — arithmetic backbone (REAL) + scheme scaffold.**
-  `modarith` + `ntt` + `rns` + `ring` + `encode` + `params` are real and
-  byte-exact-KAT'd; `bfv.Bfv` ships real types/`add`/`sub` with the
-  scheme cores gated (byte codecs deferred — see backlog below).
-- **Part 2 (Opus) — `keyGen` / `encrypt` / `decrypt` / (observe `add`).**
-  Textbook leveled-BFV over the now-real RNS ring; a construction that a
-  SEAL KAT *could* validate byte-exact, which is why it is tiered Opus and
-  not Fable — but no SEAL KAT has actually been produced (see "Anchors"
-  below for what validates it today: `Dec(Enc(·))` round-trips against this
-  module's own reference). Turns on `gate.scheme_core_implemented`.
-- **Part 3 (Fable) — `mul` (tensor + `⌊t/q·…⌉` rescale) + `relinearize`
-  (relin-key key-switch) + `noiseBudget`.** The noise-management core. Turns on
-  `gate.fable_core_implemented`.
+`gate.zig` holds two switches (`scheme_core_implemented`, `fable_core_implemented`), both `true`; the tests of the scheme layer skip while one is `false`.
 
-Deferred increments (all out of the whole three-part arc): **bootstrapping**
-(the biggest single deferred piece), **CKKS** (approximate arithmetic), **key
-rotation / Galois automorphisms** (for batched-slot rotations), full **CRT-slot
-SIMD batch encoding** (needs `t ≡ 1 mod 2N`), and byte codecs. Since landed:
-constant-time secret paths (see "Threats / caveats"), fast RNS base conversion
-(BEHZ/HPS — `mulBehz`), and a **security-grade parameter set**
-(`params.sec_n8192_logq218`, `N = 8192` / `log q = 218`). The `rns.Basis`
-helpers still ship only the exact O(reconstruct) base conversion; the fast one
-lives with the scheme layer, where its bounds are checkable against `P`.
+Not part of the module (see *Backlog / deferred*): bootstrapping, CKKS/BGV, Galois rotations and CRT-slot SIMD batch encoding, modulus switching, byte codecs, plaintext-operand ops. The `rns.Basis` helpers ship only the exact O(reconstruct) base conversion; the fast one lives with the scheme layer (`mulBehz`), where its bounds are checkable against `P`.
 
-## Fable boundary + honest tier call
+## Which layers have an external anchor
 
-Applying the matured heuristic (CONVENTIONS-adjacent `feedback_fable_tier_heuristic`:
-*not Fable* if there is an external byte-exact KAT and the construction is fully
-published with a small fix-space; *Fable* if there is no external anchor / a
-self-consistent-but-wrong test can pass, or the design space is nontrivial):
-
-- **NTT / RNS / encode — Opus, NOT Fable.** The negacyclic Cooley-Tukey NTT and
-  CRT are textbook and *byte-exact-KAT-able*: a forward/inverse NTT on a fixed
-  polynomial is fully deterministic and cross-checkable against a re-derivation
-  and against an independent schoolbook convolution. Small fix-space, strong
-  deterministic feedback → a careful non-Fable pass lands it. (These are done in
-  Part 1.)
-- **`keyGen`/`encrypt`/`decrypt` — Opus (Part 2).** Textbook, and a
-  construction *for which* byte-exact SEAL vectors would exist to check
-  against — that possibility, not an actual SEAL cross-check, is the basis
-  for the Opus/not-Fable call. **No SEAL vectors have been produced or run**
-  (`modules/bfv/data/` is empty); what actually validates this layer is
-  `Dec(Enc(·))` round-trips against `encode.addRef`/`mulRef`. The decrypt
-  `⌊t/q·(c0+c1·s)⌉` rounding is the only noise-adjacent piece, and it too has
-  no external anchor in place — only the same round-trip check.
-- **`mul` + `relinearize` + `noiseBudget` — genuine Fable (Part 3).** This is
-  the "no simple anchor for the hard part" case. Self-consistent tests can pass
-  while noise is silently mismanaged: a multiply that "works" for tiny inputs
-  but whose noise growth is wrong and fails at depth; a relin key-switch that
-  decrypts *subtly* wrong (right for degree-1, wrong after a rescale); a rescale
-  that rounds the wrong way. There is no byte-exact vector that bounds the
-  noise-budget accounting — the ciphertext noise is randomised, so end-to-end
-  correctness at depth is the only real teeth, and getting the growth right is
-  the irreducible skill. **The Part-1 gated core (`fable_core_implemented`) is
-  genuinely Fable; the `scheme_core_implemented` half is Opus** — hence two
-  flags, so Parts 2 and 3 dispatch to the right tier.
+- **NTT / RNS / encode:** textbook and byte-exact-KAT-able: a forward/inverse NTT on a fixed polynomial is deterministic and cross-checked against a re-derivation and against an independent schoolbook convolution (see *Anchors*).
+- **`keyGen` / `encrypt` / `decrypt`:** a construction for which byte-exact SEAL vectors could exist, but **no SEAL vectors have been produced or run** (the module has no `data/` directory); what validates this layer is `Dec(Enc(·))` round-trips against `encode.addRef`/`mulRef`, and scripted-draw KATs for the draws. The decrypt `⌊t/q·(c0+c1·s)⌉` rounding is the only noise-adjacent piece and has no external anchor either.
+- **`mul` + `relinearize` + `noiseBudget`:** no simple anchor for the hard part. Self-consistent tests can pass while noise is silently mismanaged (a multiply that works for tiny inputs but whose noise growth is wrong and fails at depth; a key-switch that decrypts subtly wrong; a rescale that rounds the wrong way), and ciphertext noise is randomised, so end-to-end correctness at depth is the only real test. That is why the multiply parameters are sized by a worst-case ledger (see *Multiply*).
 
 ## Anchors (verification harness)
 
@@ -142,46 +95,27 @@ Two anchor families, per the plan:
    == a+b (mod t)`, `Dec(relin(Enc(a)⊗Enc(b))) == a·b (mod t)`, and a
    multiply-DEPTH `a·b·c` that still decrypts (exercises the noise budget) — all
    decrypt against the `encode.mulRef`/`addRef` plaintext-space references.
-   These defeat self-consistent-but-wrong; LIVE since Parts 2–3 landed. The
+   These defeat self-consistent-but-wrong. The
    mul/depth anchors run over random AND boundary (all-`t−1`) plaintexts on
-   `params.test_mul` — see "Part-3 multiply" below for why not `test_tiny`.
+   `params.test_mul` — see *Multiply* below for why not `test_tiny`.
 
-**Teeth before the core (deliberately-broken positive controls, PASS today):**
+**Deliberately-broken positive controls:**
 
 - *Cyclic-vs-negacyclic discriminator* — builds the WRONG (`X^N=+1` cyclic)
   ring product with no NTT code, confirms it differs from the negacyclic answer,
   and confirms the real NTT matches the negacyclic (not the cyclic) one. Proves
   the `mulNegacyclic == mulSchoolbook` anchor would have caught a cyclic-NTT
   bug.
-- *Wrong-scale "encryptor"* — using ONLY the real ring arithmetic (no gated
+- *Wrong-scale "encryptor"* — using ONLY the real ring arithmetic (no scheme
   core), constructs a noiseless toy ciphertext with the correct scale
   (`c0+c1·s == Δ·m`) and one with a dropped scale (`Δ'=1`); the structural
   `scaleCheck` ACCEPTS the correct one and REJECTS the wrong one. Proves the
-  scaling/noise anchor bites before `encrypt`/`decrypt` exist — this is exactly
-  the dropped-`Δ` bug class the Fable core must not commit.
+  scaling/noise anchor bites independently of `encrypt`/`decrypt` — this is exactly
+  the dropped-`Δ` bug class the multiply must not commit.
 
-**Mutation run 2026-10-05** (in-place, Debug, 23 mutants over the modular
-arithmetic's selects and refusals, the NTT's prime check and `N⁻¹` scaling,
-CRT reconstruction, the ternary sampler, key generation, encryption,
-decryption's rounding and `s^i` loop, relinearization's digit mask, the
-noise budget, both tensor centerings, the negacyclic fold, the BEHZ
-rounding bit and the auxiliary-prime search): 18 killed. The first pass
-left 7; tests were added for an encryption that leaves out `e0` (decryption
-cannot see it -- it only lowers the noise -- so a zero-key, scripted-draw
-KAT now pins `ct == (e0, e1)`) and for `Ntt.init` on a composite `q` with
-`2N | q − 1`. One mutant that failed to compile was rewritten until it
-built. Equivalent: `primitive2NthRoot`'s divisibility refusal (by Lagrange
-no element then has order `2N`, so the scan finds none anyway),
-`reconstruct`'s `>=` vs `>` (a partial sum equal to `q` would need every
-CRT digit to be 0), the noise budget's `<= 1` vs `< 1` (`log2(1) == 0`),
-the BEHZ rounding bit's `>` vs `>=` (`q` is odd, so `2ρ == q` never
-happens), and `NoAuxiliaryPrimes` (primes `≡ 1 mod 2N` between `2^61`
-and `2^62` are never exhausted by a handful of draws).
+## Multiply: exact-tensor path + worst-case noise ledger
 
-## Part-3 multiply (landed): exact-tensor path + worst-case noise ledger
-
-The Fable core (`mul`/`genRelinKey`/`relinearize`/`noiseBudget`) is REAL.
-Design decisions and the noise argument, for audit:
+Design decisions of `mul`/`genRelinKey`/`relinearize`/`noiseBudget` and the noise argument, for audit:
 
 - **Exact integer tensor (the correctness crux).** The tensor
   `(c0d0, c0d1+c1d0, c1d1)` must be the EXACT integer product of fixed
@@ -189,10 +123,7 @@ Design decisions and the noise argument, for audit:
   per-component `⌊t/q·T_i⌉` rescale. This is forced: the rescale does not
   commute with mod-`q` reduction (`⌊t/q·[T]_q⌉` differs from `[⌊t/q·T⌉]_q` by
   `t·k ≢ 0 (mod q)`), so a "stay in RNS, multiply in the ring, then rescale"
-  shortcut decrypts to garbage. Verified by fault injection: that exact
-  variant, and a dropped-rescale (`Δ²`) variant, and a wrong-gadget-base relin
-  variant were each injected and each turns the two mul anchors red
-  deterministically.
+  shortcut decrypts to garbage.
 - **How the exact tensor is obtained — three paths, one value.** `mulExactRef`
   is the `O(N²)` schoolbook over an exact integer (the ORACLE). `mulRnsNtt`
   computes it in an auxiliary RNS basis sized so the centered CRT lift is exact
@@ -213,7 +144,7 @@ Design decisions and the noise argument, for audit:
   Δ[m1m2]_t + (m1v2+m2v1) + t(r1v2+r2v1) − r_t(…small…) + ⌊·⌉-error (mod q)`
   — one `Δ` is cancelled by `t/q`, the `q·[…]` cross terms collapse to
   `t·(r_i·v_j)` (the dominant growth), and `q²r1r2` vanishes mod `q`.
-- **Relin correctness.** `rlk_i = (−(a_i·s+e_i) + w^i·s², a_i)`, `w = 2^8`;
+- **Relin correctness.** `rlk_i = (−(a_i·s+e_i) + w^i·s², a_i)`, `w = 2^relin_base_log2` (a `Params` field, default 8; the security-grade set uses 55, so 4 rows);
   `relinearize` digit-decomposes `c2 = Σ w^i d_i` exactly and adds
   `Σ d_i·rlk_i`, so the phase gains `Σ d_i(w^i s² − e_i) + Σ d_i a_i s −
   Σ d_i a_i s = c2·s² − Σ d_i e_i` — the `c2·s²` term is replaced by the same
@@ -223,8 +154,8 @@ Design decisions and the noise argument, for audit:
   `test_tiny`'s `q = 1649` cannot hold even one multiply (worst-case cross
   term alone exceeds `q`). On `test_mul` the full ledger (params.zig) bounds
   depth-2 noise at `≈ 5.7e8 < Δ/2 ≈ 1.61e9` (≈2.8× margin) for ANY seed and
-  ANY plaintexts including all-`(t−1)` — which resolves the Part-1
-  "verifiability risk" flag below for these parameters: the depth anchor is
+  ANY plaintexts including all-`(t−1)` — which answers the
+  "verifiability risk" caveat below for these parameters: the depth anchor is
   deterministic teeth, not a lucky seed.
 
 ## External-reference anchoring
@@ -284,13 +215,13 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   separating them from the production path, and `bfv.zig`'s "RNG seam" tests pin
   both halves of that split at comptime.
 - **Partially constant-time — read the boundary, do not round it up.**
-  What IS source-level constant time now: the ternary sampler (`sampleTernary`
+  What IS source-level constant time: the ternary sampler (`sampleTernary`
   draws with the fixed-cost `uintLessThanBiased` instead of a rejection loop and
   selects the trit with an arithmetic mask, so neither the draw nor the store
   branches on the secret), and the word-arithmetic leaves every secret-bearing
   product routes through (`addMod`/`subMod`/`Modulus.mul`/`Shoup.mul` end in a
-  masked conditional subtract, `modarith.csub` — its mask, and `subMod`'s, laundered through an asm `blackBox` since 2026-11-18, because on baseline x86-64 (`-mcpu=x86_64`) LLVM compiled it to `cmp`/`jb` in the Shoup NTT butterflies on secret-key products: portable ctgrind `keygen` 292 -> 4 in-file, `decrypt` 194 -> 2; native unchanged — and the `%q` division that had
-  data-dependent latency on some µarch is gone).
+  masked conditional subtract, `modarith.csub` — its mask, and `subMod`'s, laundered through an asm `blackBox` on every target, because on baseline x86-64 (`-mcpu=x86_64`) LLVM otherwise compiles it to `cmp`/`jb` in the Shoup NTT butterflies on secret-key products (the portable ctgrind run reads `keygen` 4 and `decrypt` 2 in-file with the barrier; native is unaffected) — and there is no `%q` division, which had
+  data-dependent latency on some µarch).
   What is NOT, and is not claimed to be: `powMod`/`invMod`/`primitive2NthRoot`/
   the auxiliary-prime search are public-data setup and remain variable-time;
   `sampleUniform` still uses the rejection-based `uintLessThan` (its output is
@@ -303,34 +234,37 @@ paper/spec is not a copyrightable work; no third-party source was ported).
   rematerialise a branch from a mask, and nothing here is verified codegen or a
   microarchitectural claim.
 - **No fixed integer width remains.** `Bfv.QU` (the `[0,q)` value and CRT
-  accumulator) and `Bfv.TensorI` are both derived from the parameter set; the
-  `u128` ceiling that used to cap `log q` at 127 is gone, and so is the older
-  `i256` tensor guard. `params.sec_n8192_logq218` (`N = 8192`, `log q = 218`,
+  accumulator) and `Bfv.TensorI` are both derived from the parameter set, so
+  `log q` is not capped by a native integer width. `params.sec_n8192_logq218` (`N = 8192`, `log q = 218`,
   `t = 65537`) builds and evaluates a depth-2 circuit exactly — see "Security
   status" above. `decrypt`/`noiseBudget` still reconstruct a wide integer per
   coefficient (that is inherent to `⌊t/q·…⌉` at decrypt time); the MULTIPLY no
   longer does.
-- **Verifiability risk (flagged in Part 1, addressed in Part 3):** BFV
-  ciphertext noise is randomised, so the Part-3 multiply's correctness at depth
+- **Verifiability risk:** BFV
+  ciphertext noise is randomised, so the multiply's correctness at depth
   has no byte-exact external KAT — the noise-budget accounting is exactly the
-  piece with no external deterministic anchor. This is why Part 3 was tiered
-  Fable. Part 3 answers it by SIZING the mul-anchor parameters so that the
+  piece with no external deterministic anchor. The multiply answers it by SIZING the mul-anchor parameters so that the
   worst-case noise ledger (params.zig `test_mul`) guarantees depth-2
   correctness for every seed — turning the probabilistic property back into a
-  deterministic test (see "Part-3 multiply" above).
+  deterministic test (see *Multiply* above).
 
-## Per-module backlog (mechanical, not Fable)
+## Verification
 
-- The remaining fast-RNS step: Halevi–Polyakov base conversion replacing `convertExact` for the
-  `[0,q)` CRT lift of the multiply's inputs. The BEHZ/HPS multiply itself has landed (`mulBehz`: no
-  exact tensor, no big-integer division); that input lift is the only wide arithmetic left.
-- CRT-slot batch encoding (`encode.zig`), needs `t ≡ 1 mod 2N`.
-- **Byte codecs for `SecretKey`/`PublicKey`/`RelinKey`/`Ciphertext`** *(survey 2026-09-30; shape fixed, serialisation to fill in)*: without them a ciphertext cannot leave the process, so the client/server split that FHE exists for cannot be built; SEAL serializes every object. Small (a day; fixed-width RNS limbs, versioned header); fits CONVENTIONS §2 (pure Zig).
-- **Plaintext-operand ops** (`addPlain`, `mulPlain`, plain-constant multiply) *(survey 2026-09-30)*: the cheapest way to apply a model weight or a mask to a ciphertext, used in almost every SEAL/OpenFHE BFV program; none exists (searched `pub fn` in `src/bfv.zig`). Small; fits §2.
-- **CRT-slot batch encoding + Galois rotations (rotate rows/columns, key switching for `x -> x^g`)** *(survey 2026-09-30)*: SIMD packing is how BFV gets throughput (`t` prime, `t = 1 mod 2N`); the sum-of-slots and matrix-vector products need rotations. Already in the list above for batching; rotations were named "deferred" in the module doc. Medium (a week: slot permutation tables, Galois keys); fits §2.
-- **Modulus switching** *(survey 2026-09-30)*: shrinks ciphertexts and noise after a multiply; SEAL/OpenFHE/Lattigo all offer it. Medium; fits §2.
-- **Standard security-level parameter selection** *(survey 2026-09-30)*: only one security-grade set (`sec_n8192_logq218`) and no `N`/depth chooser, where SEAL ships `CoeffModulus::BFVDefault` for the HomomorphicEncryption.org tables at 128/192/256 bits. `sec_n8192_logq218` is hand-derived; there is no function that picks a chain for a target `N`/`log q`/depth. Small-to-medium; fits §2.
-- **BGV and CKKS** *(survey 2026-09-30)*: CKKS is what most SEAL/OpenFHE/Lattigo users actually run (real-number arithmetic, ML inference). Large (a month each: encoder, rescale, bootstrapping for CKKS); fits §2. Torn on whether this is "missing and it matters" for a BFV module — recorded here so the question is asked, not assumed. Listed as a deferred increment by the module already.
+- **Run:** `scripts/modtest bfv`. Opt-in benchmark (old-path vs new-path ns/op, `src/bench.zig`): `BFV_BENCH=1 scripts/lib/capped zig build test-bfv -Doptimize=ReleaseFast`.
+- **Test classes:**
+  - arithmetic leaves (`modarith`, `ntt`, `rns`, `ring`, `encode`, `params` validation), each against a division-based or schoolbook reference kept in the module as the differential oracle;
+  - byte-exact KATs from the independent re-derivation (NTT at `q = 17` and `q = 97`, RNS CRT) — see *Anchors* and *External-reference anchoring*;
+  - the deliberately-broken positive controls (cyclic vs negacyclic, wrong-scale "encryptor", corrupted relin key);
+  - scripted-draw KATs that pin which random draws `keyGen`, `genRelinKey` and `encrypt` make and that the key-generation error `e`, each relin-key row's `e_i`, the encryption errors and `Δ` land in the output (decryption cannot see these), plus ternary-sampler and `sampleUniform` range tests;
+  - decrypt rounding and `noiseBudget` KATs with exact values (including `t = 5` and a 3-component product);
+  - homomorphic add, mul+relin and multiply-depth end to end over random and boundary plaintexts on `test_mul`, a depth-2 evaluation on the security-grade set, and an enc/dec round-trip at `bfv_toy` (`N = 1024`);
+  - the three multiply paths (`mulExactRef`, `mulRnsNtt`, `mulBehz`) bit-identical at `log q ∈ {11, 36, 120, 300}`, including saturating inputs;
+  - parameter and modulus refusals (`init` running `validate`, `Ntt.init` on a composite `q`, the `2^62` bounds, auxiliary primes equal to a main prime skipped).
+- **Stack probe:** `src/stackprobe_test.zig` (`testkit.stackprobe`) checks that `keyGen`, `genRelinKey`, `decrypt` and `noiseBudget` leave no secret-key residue on the dead stack, at `bfv_toy` and at the security-grade set (ReleaseFast).
+- **Fuzz:** none (the card's Hardening line records the fuzz obligation as n/a).
+- **ctgrind:** `src/ctgrind_harness.zig`, targets `keygen`, `encrypt`, `decrypt` (ReleaseFast; rows in `scripts/checks/ctgrind-expected.tsv`, run by `scripts/checks/ctgrind.sh`); the baseline-CPU variant is `CTGRIND_CPU=x86_64`. Source-level CT only, see *Threats / caveats*.
+- **Mutation:** the whole-module run covers every non-test file (`modarith`, `ntt`, `rns`, `ring`, `encode`, `params`, `bfv`); comptime sizing, `gate.zig`, `bench.zig`, the ctgrind harness and the KAT data are not mutated. Three kinds of mutant: functional (one ReleaseSafe schemata build), burn-site (one `burn.run` per secret entry point, read by the stack probe, `DeadStackResidue`) and constant-time (judged by ctgrind only: `csub`'s and `subMod`'s `blackBox` removed, the `sampleTernary` trit select written as `if`/`else`; no functional test can see them).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Anchoring
 
@@ -341,53 +275,16 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 
 **What the tests actually contain.** NTT/RNS/BFV KAT vectors from independent Python re-derivation (SPEC.md)
 
-**How it got there.** No external oracle exists for what remains. SEAL/OpenFHE ciphertext layout is implementation-defined; no portable vector exists
-
-**Delta mutation 2026-11-18 (the `csub`/`subMod` barriers; not a whole-module score, the card's last run has no source hash):** 2 mutants, each removing one `blackBox`, i.e. the pre-fix code. Both were KILLED by the portable ctgrind run (`CTGRIND_CPU=x86_64`): `csub` +200 in-file at modarith.zig:58 and `subMod` +88 at :69 in `keygen`. The functional suite cannot see either (the values are identical), so ctgrind is the killing test.
-
-**Audit 2026-11-18 (whole-module mutation):** 240 mutants over every non-test
-file (`modarith`, `ntt`, `rns`, `ring`, `encode`, `params`, `bfv`; comptime
-sizing, `gate.zig`, `bench.zig`, the ctgrind harness and the KAT data not
-mutated): 231 functional ones in one ReleaseSafe schemata build, 6 burn-site
-mutants (one `burn.run` per secret entry point, switch inside the callee) in a
-ReleaseFast build read by the stack probe, and 3 constant-time mutants judged
-by ctgrind. Order: secret paths first (sampler, key generation, relin-key
-generation, decryption, noise budget), then the parameter and modulus checks,
-then the arithmetic. Round 1 killed 195 of 231; 23 killing tests were added
-(round 2 killed all 23); the 6 burn mutants are killed by the stack probe
-(`DeadStackResidue`); the 3 CT mutants are killed by ctgrind only, never by a
-functional test: `csub`'s and `subMod`'s `blackBox` removed (the delta run
-above) and the trit select of `sampleTernary` written as an `if`/`else`
-(`keygen` in-file 4 -> 6, native and `CTGRIND_CPU=x86_64`, on a forced copy).
-Result 227/240, 13 equivalent: `powMod` with an unreduced base (`mulMod` takes
-any `u64`); `isPrime`'s trial division (cost-only, Miller-Rabin over the 12
-bases is deterministic) and one extra squaring (`a^(n-1) = -1 (mod n)` is
-impossible for odd `n`: it would force `n = 1 mod 2^(v2(n-1)+1)`);
-`primitive2NthRoot`'s divisibility refusal (Lagrange); both `NoAuxiliaryPrimes`
-mutants (never exhausted); `>=` vs `>` in both CRT accumulators (a partial sum
-equal to the modulus needs every residue to be 0); `auxCenter`'s `>=` half
-(`∏p ≥ 2·tensor_bound + 3`); the BEHZ rounding bit's `>=` (`q` odd); an
-unreduced relin digit (`< 2^63`, the NTT keeps it congruent and the pointwise
-Barrett reduce canonicalises); `noiseBudget`'s `>=` half and its `ratio <= 1`
-refusal (both read 0 either way; `ratio ≥ 1` always). The new tests pin what
-decryption cannot see: the key-generation error `e` (`pk = (-(a·s + e), a)`
-with scripted draws: without `e` the public key is `-a·s` and gives `s` away),
-each relin-key row's `e_i` (zero key: `b_i = -e_i`; without it the rows are
-error-free RLWE samples of `w^i·s²`), `Δ` in a nonzero-message encryption KAT,
-the decryption rounding step (phase 1030 -> 2, 1031 -> 3 at `test_tiny`), exact
-noise-budget values (including `t = 5`, where `r_t ≠ 1` makes the final `mod t`
-visible) and the budget of a 3-component product; plus the `sampleUniform`
-range per limb, `init` running `validate` (`t = 1`), an auxiliary prime equal
-to a main prime being skipped, `invMod` on a nonzero multiple of `q`, the
-`2^62` bounds of `Ntt.init` and `validate`, `validate`'s `n = 0`, empty-chain
-and `1 mod N`-only refusals, `fromCoeffs` reduction, `eql`'s domain tag and
-both `decodeUint` overflow checks. No finding: no survivor in a security or
-bounds check. ctgrind counts unchanged (keygen 8, encrypt 2, decrypt 3 total;
-source digests re-pinned for the appended tests).
-
 ## Backlog / deferred
 
-- **Rescale loop: restore vectorisation under the CT barrier (vector-select form)** *(2026-11-18)*: since `csub`/`subMod` launder their mask (constant-time fix, CHANGELOG 2026-11-18) the `rescale/coeff` BEHZ-RNS micro-row reads 59.1 -> 131.9 ns at log2 q=36 and 1.25-1.33x slower at q=120..300 (`BFV_BENCH=1`, ReleaseFast, on a shared, noisy host; end-to-end HomMul not slower). Not done: one primitive, always constant-time; a vector-select form would let LLVM vectorise again without a branch. Re-measure on a quiet host first.
-- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `reduceWide` (per polynomial coefficient). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+Open items only. All are additive; none is a defect of what exists.
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **Bootstrapping** (the depth-refresh step): the biggest deferred piece; the scheme is leveled, so the multiplicative depth is bounded by the parameter set's noise ledger.
+- **Byte codecs for `SecretKey`/`PublicKey`/`RelinKey`/`Ciphertext`** *(survey 2026-09-30; shape fixed, serialisation to fill in)*: without them a ciphertext cannot leave the process, so the client/server split that FHE exists for cannot be built; SEAL serializes every object. Small (a day; fixed-width RNS limbs, versioned header); fits CONVENTIONS §2 (pure Zig).
+- **Plaintext-operand ops** (`addPlain`, `mulPlain`, plain-constant multiply) *(survey 2026-09-30)*: the cheapest way to apply a model weight or a mask to a ciphertext, used in almost every SEAL/OpenFHE BFV program; none exists (searched `pub fn` in `src/bfv.zig`). Small; fits §2.
+- **CRT-slot batch encoding (`encode.zig`, needs `t` prime with `t ≡ 1 mod 2N`) and Galois rotations (rotate rows/columns, key switching for `x -> x^g`)** *(survey 2026-09-30)*: SIMD packing is how BFV gets throughput; the sum-of-slots and matrix-vector products need rotations. Medium (a week: slot permutation tables, Galois keys); fits §2.
+- **Modulus switching** *(survey 2026-09-30)*: shrinks ciphertexts and noise after a multiply; SEAL/OpenFHE/Lattigo all offer it. Medium; fits §2.
+- **Standard security-level parameter selection** *(survey 2026-09-30)*: only one security-grade set (`sec_n8192_logq218`) and no `N`/depth chooser, where SEAL ships `CoeffModulus::BFVDefault` for the HomomorphicEncryption.org tables at 128/192/256 bits. `sec_n8192_logq218` is hand-derived; there is no function that picks a chain for a target `N`/`log q`/depth. Small-to-medium; fits §2.
+- **BGV and CKKS** *(survey 2026-09-30)*: CKKS is what most SEAL/OpenFHE/Lattigo users actually run (real-number arithmetic, ML inference). Large (a month each: encoder, rescale, bootstrapping for CKKS); fits §2. Torn on whether this is "missing and it matters" for a BFV module — recorded here so the question is asked, not assumed.
+- **Fast RNS step for the multiply's input lift:** Halevi–Polyakov base conversion replacing `rns.Basis.convertExact` for the `[0,q)` CRT lift of the multiply's inputs. `mulBehz` itself needs no exact tensor and no big-integer division; that input lift is the only wide arithmetic left on the multiply path.
+- **Rescale loop: restore vectorisation under the CT barrier (vector-select form):** since `csub`/`subMod` launder their mask, the `rescale/coeff` BEHZ-RNS micro-row of the opt-in bench reads 59.1 -> 131.9 ns at log2 q=36 and 1.25-1.33x slower at q=120..300 (`BFV_BENCH=1`, ReleaseFast, measured on a shared, noisy host; end-to-end HomMul not slower). Not done: one primitive, always constant-time; a vector-select form would let LLVM vectorise again without a branch. Re-measure on a quiet host first.

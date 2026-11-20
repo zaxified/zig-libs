@@ -6,25 +6,26 @@ it can never read. BFV (Fan–Vercauteren, ePrint 2012/144) is the cleanest
 **exact-integer** scheme — no CKKS-style approximate rescaling — and matches
 Microsoft SEAL's default parameter/NTT design, which makes it cross-checkable
 **in principle** against SEAL (small fix-space, deterministic construction).
-**No SEAL vectors have actually been produced or checked in** —
-`modules/bfv/data/` is empty; what validates the scheme today is
+**No SEAL vectors have actually been produced or checked in**; what validates the scheme is
 `Dec(Enc(x)) == x` and the homomorphic property against this module's own
-reference helpers (see "Verification" below). This module targets a
+reference helpers (see "Verify" below). This module targets a
 *leveled* BFV that can homomorphically **add** and **multiply** to a bounded
 multiplicative depth (no bootstrapping). This is a first-in-pure-Zig
 capability: `std` ships lattice KEM/signatures (ML-KEM/ML-DSA) but no
 homomorphic-evaluation scheme, and the sibling `paillier` is only additively
 homomorphic — BFV adds the multiply.
 
-FHE is large, so it was built as a multi-part arc — **all three parts are now
-real:** the arithmetic backbone (byte-exact-KAT'd), the BFV scheme core
-(`keyGen`/`encrypt`/`decrypt`), and the noise-management core (`mul` /
-`genRelinKey`/`relinearize` / `noiseBudget`). Toy/test parameters only — no
-security level is claimed, and no bootstrapping (leveled depth only).
+The module has three layers: the arithmetic backbone (byte-exact-KAT'd), the
+BFV scheme core (`keyGen`/`encrypt`/`decrypt`), and the noise-management core
+(`mul` / `genRelinKey`/`relinearize` / `noiseBudget`). The `test_*` and
+`bfv_toy` parameter sets are toys that claim no security level; the one set
+with a security claim is `params.sec_n8192_logq218` (`N = 8192`,
+`log2 q = 218`, taken from the HomomorphicEncryption.org tables, not a lattice
+estimate run here); there is no bootstrapping (leveled depth only).
 
-## What is real today (Part 1)
+## The arithmetic backbone
 
-The whole computational backbone FHE stands on is implemented and tested:
+The whole computational backbone FHE stands on:
 
 | Piece | File | What |
 |---|---|---|
@@ -36,23 +37,23 @@ The whole computational backbone FHE stands on is implemented and tested:
 | Parameters | `params.zig` | `Params` + NTT-friendly-prime validation; toy sets `test_tiny`, `bfv_toy`, `test_mul`, plus the security-grade `sec_n8192_logq218` (`N=8192`, `log2 q=218`, `t=65537`) |
 | Benchmarks | `bench.zig` | old-path-vs-new-path ns/op, opt-in: `BFV_BENCH=1 scripts/lib/capped zig build test-bfv -Doptimize=ReleaseFast` |
 
-## The scheme core (Part 2) + the Fable core (Part 3)
+## The scheme core and the noise-management core
 
-`bfv.Bfv(P)` exposes the scheme; both flags in `gate.zig` are now **`true`**:
+`bfv.Bfv(P)` exposes the scheme; both flags in `gate.zig` are **`true`**:
 
-- `scheme_core_implemented` = **`true`** — **Part 2 (Opus), REAL:** `keyGen`
+- `scheme_core_implemented`: `keyGen`
   (`pk=(−(a·s+e), a)`, ternary `s`) / `encrypt` (`c0=Δ·m+p0·u+e0`, `c1=p1·u+e1`,
   `Δ=⌊q/t⌋`) / `decrypt` (`⌊t/q·(c0+c1·s)⌉ mod t`, exact CRT reconstruction +
   round-half-up rescale). Anchored by a deterministic noiseless-ciphertext
   decrypt KAT, the enc/dec round-trip (tiny + N=1024), and homomorphic-add
   end-to-end.
-- `fable_core_implemented` = **`true`** — **Part 3 (Fable), REAL:** `mul`
+- `fable_core_implemented`: `mul`
   (exact integer tensor + `⌊t/q·…⌉` rescale) / `genRelinKey`+`relinearize`
-  (base-`2^8` gadget key-switch for `s²`) / `noiseBudget`. Anchored by the
+  (base-`2^relin_base_log2` gadget key-switch for `s²`; `Params` field, default 8) / `noiseBudget`. Anchored by the
   mul+relin and multiply-DEPTH (`a·b·c`) end-to-end tests over random AND
   boundary plaintexts on `params.test_mul`, whose worst-case noise ledger
   makes depth-2 correctness a guarantee for every seed — see `SPEC.md`
-  "Part-3 multiply" for the design and the noise argument.
+  "Multiply" for the design and the noise argument.
 
 ## Usage
 
@@ -92,13 +93,20 @@ zig build test-bfv --summary all                    # Debug
 zig build test-bfv -Doptimize=ReleaseFast --summary all
 ```
 
-Parts 1–3: green in Debug and ReleaseFast. The set includes the
+The set includes the
 byte-exact NTT + RNS KATs, three deliberately-broken positive controls (a
 cyclic-vs-negacyclic discriminator, a wrong-scale "encryptor", and a
 corrupted-relin-key catch), a deterministic noiseless-ciphertext decrypt KAT
 with margin-boundary teeth, the enc/dec round-trip + homomorphic-add anchors
-(tiny params + N=1024), and the Part-3 mul+relin and multiply-DEPTH anchors
-over random + boundary plaintexts on `test_mul`.
+(tiny params + N=1024), and the mul+relin and multiply-DEPTH anchors
+over random + boundary plaintexts on `test_mul`; `scripts/modtest bfv` runs
+the module's tests.
+
+## Not provided
+
+Bootstrapping, BGV/CKKS, batching and Galois rotations, modulus switching,
+byte codecs for keys and ciphertexts, plaintext-operand ops and a parameter
+chooser: see `SPEC.md` "Backlog / deferred".
 
 **Deps:** `entropy` (the `SecureSource` adapter behind `keyGen`/`encrypt`/`genRelinKey`); everything else is `std`.
 
