@@ -53,32 +53,31 @@
 //! and resource caps (max_connections / max_subscriptions_total /
 //! max_subscriptions_per_conn / max_retained / connect_timeout_ms).
 //!
-//! QoS 2 (spec 4.3.3) both ways since 2026-10-01: an inbound one is PUBRECed
+//! QoS 2 (spec 4.3.3) both ways since: an inbound one is PUBRECed
 //! and routed once, its id remembered until the PUBREL (in the session for a
 //! persistent client, so a resend after a reconnect is not routed twice); an
 //! outbound one waits for PUBREC, then PUBCOMP, and a resumed session resends
 //! the PUBREL rather than the message. `Config.maximum_qos` caps it.
 //!
-//! MQTT 5.0 since 2026-10-01, per connection (the CONNECT's level decides):
-//! reason codes on every ack and refusal, a DISCONNECT that says why the
-//! broker ends a connection, Session Expiry with Clean Start, Message Expiry
-//! counted down through the retained store and session queues, the
-//! forwardable properties carried unaltered, inbound Topic Aliases, Receive
-//! Maximum and Maximum Packet Size both ways, the subscription options (No
-//! Local, Retain As Published, Retain Handling), Subscription Identifiers,
-//! Shared Subscriptions (`$share/`, for 3.1.1 clients too), Will properties
-//! and Will Delay. 3.1.1 and 5.0 clients share one broker; each gets every
-//! message in its own version. Extended authentication (AUTH, 2026-10-17)
+//! MQTT 5.0, per connection (the CONNECT's level decides): reason codes on
+//! every ack and refusal, a DISCONNECT that says why the broker ends a
+//! connection, Session Expiry with Clean Start, Message Expiry counted down
+//! through the retained store and session queues, the forwardable properties
+//! carried unaltered, inbound Topic Aliases, Receive Maximum and Maximum
+//! Packet Size both ways, the subscription options (No Local, Retain As
+//! Published, Retain Handling), Subscription Identifiers, Shared
+//! Subscriptions (`$share/`, for 3.1.1 clients too), Will properties and
+//! Will Delay. 3.1.1 and 5.0 clients share one broker; each gets every
+//! message in its own version. Extended authentication (AUTH)
 //! runs through `Config.extendedAuthFn`; without the hook a CONNECT naming a
 //! method is refused with 0x8C.
 //!
-//! Deliberately deferred (documented, not built): a store written by the
-//! broker itself (sessions and retained messages live in memory; the server
-//! keeps them through `sessionStatesWith`/`retainedMessages`), and TLS (terminate it in front and hand
-//! `TcpServer` the plaintext, or drive the socket-free core over a TLS stream
-//! yourself). ⭐ Will / LWT was on this list until 2026-09-11 and is now built
-//! (3.1.2.5, 3.14.4), as is `publish` — a message the server itself originates
-//! — and, since 2026-09-21, persistent sessions.
+//! Deliberately deferred (documented, not built): a store written by the broker itself (sessions and
+//! retained messages live in memory; the server keeps them through
+//! `sessionStatesWith`/`retainedMessages`), and TLS (terminate it in front and hand `TcpServer` the
+//! plaintext, or drive the socket-free core over a TLS stream yourself). ⭐ Will / LWT was on this list
+//! and is now built (3.1.2.5, 3.14.4), as is `publish` — a message the server itself
+//! originates — and, persistent sessions.
 //!
 //! Provenance: clean-room from the OASIS MQTT 3.1.1 specification;
 //! mosquitto/Paho referenced for behavior only, no source consulted or copied.
@@ -1348,7 +1347,7 @@ pub const Config = struct {
     /// It runs on the publisher's own thread with **no broker lock held**. This
     /// used to say flatly that it "must not call back into the broker" — which
     /// was stricter than anything here enforces, and ruled out the one call a
-    /// bridge actually wants. Measured 2026-09-16 (A1 mqtt drift audit):
+    /// bridge actually wants. Measured (A1 mqtt drift audit):
     /// `Broker.publish` from inside the tap works. It takes the registry lock
     /// itself and finds it free, and it cannot recurse, because `Broker.publish`
     /// deliberately does not fire this tap. What is still forbidden is
@@ -3567,7 +3566,7 @@ pub const Broker = struct {
             // From the close, not the last packet (5.0 3.1.2-23: kept for the
             // interval AFTER the connection closes): an idle keep-alive-0
             // connection that drops would otherwise lose its session at the
-            // next sweep (review 2026-10-01 F3). The broker reads no clock;
+            // next sweep (review F3). The broker reads no clock;
             // `now_hint` is the latest time it was given — `TcpServer`'s
             // upkeep moves it every second.
             x.offline_since_ms = @max(conn.last_packet_ms, b.now_hint);
@@ -3583,7 +3582,7 @@ pub const Broker = struct {
     /// Delete retained and queued messages whose 5.0 Message Expiry ran out
     /// (3.3.2-5): left in place they would hold `max_retained` /
     /// `max_retained_store_bytes` and the session queue bounds against live
-    /// messages until something read past them (review 2026-10-01 F8).
+    /// messages until something read past them (review F8).
     /// Caller holds `mutex`.
     fn sweepExpiredLocked(b: *Broker, now: i64) void {
         var i: usize = 0;
@@ -3712,9 +3711,7 @@ pub const Broker = struct {
     }
 
     /// The one place a dropped delivery is counted: `queueDrops` and `$SYS`
-    /// `publish/messages/dropped` move together. (Until 2026-10-17 the
-    /// clean-session path that could not even make its queue bumped only
-    /// `queue_drops`, so `$SYS` under-reported it.)
+    /// `publish/messages/dropped` move together.
     fn countQueueDrop(b: *Broker) void {
         _ = b.queue_drops.fetchAdd(1, .monotonic);
         _ = b.stats.publish_dropped.fetchAdd(1, .monotonic);
@@ -3823,7 +3820,7 @@ pub const Broker = struct {
     /// A resume (spec 4.4): every in-flight message of `x` is owed again —
     /// unacknowledged PUBLISHes with DUP, released QoS 2 ones as PUBREL — and
     /// `pumpLocked` sends them, oldest first, within the NEW connection's
-    /// Receive Maximum and Maximum Packet Size (review 2026-10-01 F6: they
+    /// Receive Maximum and Maximum Packet Size (review F6: they
     /// used to go all at once, whatever the client announced). Caller holds
     /// `conn.tx_lock`.
     fn resendLocked(b: *Broker, conn: *Connection, x: *Session, now: i64) Error!void {
@@ -3870,7 +3867,7 @@ pub const Broker = struct {
             // `claimedByAnother`): one still inside its own CONNECT has not
             // claimed it, and superseding it raced that CONNECT — its state
             // was set back to `.connected` afterwards and the two could each
-            // supersede the other (review 2026-10-01 F1).
+            // supersede the other (review F1).
             if (other.state != .connected) continue;
             if (std.mem.eql(u8, other.clientId(), id)) {
                 b.dropSubscriptions(other);
@@ -3894,7 +3891,7 @@ pub const Broker = struct {
     /// is free right now. A writer holding it may be blocked on the very dead
     /// peer this take-over is about; waiting for it would stall the new
     /// connection, and the close below is what wakes that writer (FIX C,
-    /// review 2026-10-01 F2).
+    /// review F2).
     fn tellSuperseded(b: *Broker, owed: *const Superseded) void {
         _ = b;
         for (owed.conns[0..owed.n]) |other| {
@@ -9409,7 +9406,7 @@ test "v5 UNSUBACK: Success, or No subscription existed, per filter" {
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x11 }, (try next5(&tt)).?.unsuback.codes);
 }
 
-// ── review 2026-10-01: one test per confirmed finding ───────────────────────
+// ── review: one test per confirmed finding ───────────────────────
 
 const ReentrantAuth = struct {
     b: *Broker,
@@ -10028,7 +10025,7 @@ test "clean session: a QoS 2 subscriber slower than the publisher still gets eve
 
 test "clean session: a delivery lost because its queue cannot be made counts in queueDrops and in $SYS dropped alike" {
     // The OOM path of `enqueueConn` once bumped `queue_drops` only, so
-    // `$SYS/broker/publish/messages/dropped` missed it (found 2026-10-17).
+    // `$SYS/broker/publish/messages/dropped` missed it.
     // Fails exactly the allocation `enqueueConn` makes for the queue (a
     // `Session`), once armed: a FailingAllocator would fail the fan-out's
     // subscriber list first, and `publish` would return OutOfMemory instead.
@@ -10704,7 +10701,7 @@ test "review L6: publishSys survives a clock step back, and its retained topics 
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

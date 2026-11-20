@@ -2306,7 +2306,7 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // the loop, so `while (off < len)` never ran a single pass and `decode`
     // was **never called at all**, while the paragraph above promises a reader
     // loop over back-to-back packets. `check-fuzz-reach` only learned to see
-    // that shape on 2026-09-07. Measured over the corpus above: **0 of 18
+    // that shape on. Measured over the corpus above: **0 of 18
     // seeds reached `decode` and 0 packets were walked before, 18 of 18 and 18
     // packets after.**
     const len: usize = src.slice(&buf);
@@ -3007,7 +3007,7 @@ test "corpus v5: every seed reaches decodePacket, and the packets walked are pin
     try testing.expectEqual(@as(usize, 4), refused);
 }
 
-// ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────
+// ── deterministic fuzz driver ───────────────────────────────────
 //
 // The harnesses above are generic over their source of choices
 // (`fn(comptime S, *S, gpa)`); `testing.fuzz` feeds them through
@@ -3132,7 +3132,7 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

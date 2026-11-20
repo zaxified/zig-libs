@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz harnesses for the 2026-10-17 code (driver
+//! Deterministic fuzz harnesses for the code (driver
 //! `MQTT_FUZZ`, testkit; `_ONLY` picks one by name):
 //!
 //! - `mqtt-acl-parse` — damaged `acl_file` and `password_file` texts through

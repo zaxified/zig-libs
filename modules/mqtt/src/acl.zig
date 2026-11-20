@@ -651,7 +651,7 @@ test "acl: a deny rule refuses every SUBSCRIBE it overlaps" {
 }
 
 // Lines written by the official mosquitto_passwd 2.1.2 (1000 iterations,
-// 64-byte salt), 2026-10-17.
+// 64-byte salt).
 const golden_alice = "alice:$7$1000$aVdP5TwRZIFzLGb8rViI1k6ir2ldLZamfpOm9Av4n0QzEQsO7s6qVsXb9qy8LAy3V0kIG7dqu9T+yxdsCwTcRw==$hdd22TxC7KfyRQBDDQMmcoWz3nwFxlhMdwh45yQsryyMx/ffsn+AqUhLle2+HQeBiA1SWT+DFrDiBqV9xRya0Q==";
 const golden_bob_salt = "AdPRuou8DmEDG7SizhAjrmHJk94sE28EL96MplcRW3GWofUi9cyHDpl20p0STCFvX+XDgUwKS0IuX5vaMU3Ckg==";
 const golden_bob = "bob:$7$1000$" ++ golden_bob_salt ++ "$jn0M3dNRPYhYpWOfsFHQVZJZc0XulVhPZD5Do8iAGJ0qH7G6wdWRd9rFb1WUbIfAD395dO/0HWm3L189aObziw==";

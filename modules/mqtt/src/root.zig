@@ -46,7 +46,7 @@ pub const meta = .{
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any",
-    // ⭐ `.linux32` declared 2026-09-11, and it is a claim that was measured,
+    // ⭐ `.linux32` declared, and it is a claim that was measured,
     // not assumed. The first consumer to cross-compile this module for a
     // 32-bit machine (a store-and-forward proxy, ARMv7 in a router container)
     // found the broker did not build there **at all**: four counters were
