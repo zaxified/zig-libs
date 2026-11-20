@@ -8,7 +8,7 @@
 
 **Ahead:** feature — a read-only open beside a live writer in another process: kv's `Options.read_only` reads all 100 of 100 keys and, after `refresh`, the writer's later ones; rosedb, prologic/bitcask and nutsdb have no read-only open and refuse a second process (`directory is used by another process`, `database locked`, `the dir of db is locked`) (`tools/lead_probe`, probe P1) (measured 2026-10-25) · correctness — garbage appended to the active log (a write torn mid-record, 7 lengths × 20 seeds): kv opens with all 1000 keys and takes new writes in 140 of 140; rosedb v2.4.0 panics inside `Open` in 139 of 140 (`slice bounds out of range`, rosedblabs/wal segment.go:447), nutsdb refuses to open in 140 of 140 (`crc error`), prologic/bitcask without its close-time index file refuses in 140 of 140 (`unexpected EOF` / `key/value size is invalid`) (`tools/lead_probe`, probe P2) (measured 2026-10-25)
 
-**Audit:** review 2026-11-15 · mutation 2026-11-15 (72/75, 3 eq) · src 07b76b25a9ce66e3
+**Audit:** review 2026-11-15 · mutation 2026-11-19 (98/101, 3 eq) · src 18f50aa966833ddf
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — key-value store (keyword review, 2026-10-07) · panic 2026-10-29 (hostile manifest/hint/data files: next_file_id and v1-active manifests Corrupt, hint expiry/size checked, replay allocates after the CRC, FsStorage handles total)
 
@@ -287,6 +287,49 @@ a merge or compaction between the two calls can return values from different mom
   writer and a merger, 20 clean runs). Mutant: retirement ignoring pins — red (reads from closed
   handles, leaks).
 
+## Paged key scan
+
+`Db.scanKeys(gpa, prefix, after, limit)` → `ScanPage` (`keys`, `more`, `last()`, `deinit`) (2026-11-19,
+first user: `sessions`' `KvStore.iterate`, whose `keys` call held every session key in memory at once).
+The at most `limit` smallest live keys under `prefix` that sort strictly after `after` (null = from the
+start), sorted bytewise; resume with `after = page.last()` while `page.more`.
+
+- **Memory per call: `limit`, not the store.** One pass over the keydir under the shared keydir lock
+  keeps the `limit` smallest candidates in a bounded max-heap of borrowed keys (sized
+  `min(limit, keydir entries)`, so a huge `limit` costs nothing extra), then copies them out before the
+  lock is released. `more` = a candidate was turned away, so a full last page says `false` and needs no
+  extra call. `limit == 0` → `error.InvalidLimit` (new `ScanError = Allocator.Error || {InvalidLimit}`;
+  Redis refuses `COUNT 0` too).
+- **Time per call: one keydir pass** — the keydir is a hash map, so there is no ordered index to seek;
+  a full scan in pages of `limit` is `count / limit` passes. Ordered indexes stay out of scope (§ Threat
+  model); a caller that can afford the memory and wants one pass uses `keys` or `iterator`.
+- **Consistency model (stated in the doc comment):** each page is a snapshot of the keydir at its call;
+  nothing is held between calls (no lock, no pin). The cursor is a **key**, not a position, so across
+  pages — whatever writes, deletes, merges, compactions or a crash + reopen happen in between:
+  a key live for the whole scan is listed **exactly once**; no key is listed twice and keys come in
+  strictly ascending order; a key put between pages is listed iff it sorts after the cursor at the next
+  call; a key deleted or expired between pages is not listed if it sorts after the cursor, and stays
+  listed if an earlier page returned it (a `get` then answers null). Values are not read (`get` per key,
+  as for `keys`).
+- **Why this model (compared 2026-11-19):** Redis `SCAN` (redis.io/commands/scan, "Scan guarantees"):
+  a full iteration returns every element present from start to end, may return one **more than once**,
+  and elements added or removed meanwhile may or may not be returned — its cursor is a hash-table
+  position (reverse-binary, to survive a resize). etcd (`Range` with `limit`, paging by
+  `key = last + "\x00"`; consistent across pages only when the caller pins `revision`, MVCC that kv does
+  not have) and DynamoDB `Scan` (`ExclusiveStartKey`) page by **key**: no repeats, and the rest as here.
+  LevelDB/RocksDB iterators and bbolt cursors give a **snapshot** for the iterator's life — kv's
+  `iterator` already is that shape (memory O(keys)); resuming them across transactions is again a seek
+  to the last key. Bitcask's `fold`/`list_keys` freeze the keydir (multi-version entries) for the whole
+  walk. kv takes the key cursor: it is what the majority of paged scans without MVCC do, it is stronger
+  than Redis (no repeats, ordered) at the cost of one keydir pass per page, and a key survives every
+  change of the keydir's layout (rehash, merge, reopen), which a position would not.
+- **Tests:** page boundaries (page size 1, exactly full, one short, a `limit` of `maxInt(usize)`, empty
+  store, after the last key, `limit` 0); prefix, a cursor outside the prefix, a key that is a prefix of
+  the next, expired keys (never counted toward `more`); deletes and puts on both sides of the cursor
+  between pages, an overwrite, a delete of the page's own last key; a multi-file compaction and a crash +
+  reopen (`SimStorage`) between pages; 20 random stores (keys with `0x00`/`0xff` bytes) × random page
+  sizes against `keys`; an allocation-failure sweep (no leak, `OutOfMemory` only).
+
 ## Read-only open
 
 `Options.read_only` (2026-10-14, S2 survey R5b; Bitcask's read-only `open/1`) opens a store another
@@ -523,6 +566,8 @@ self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`
 
 **Delta mutation (2026-11-15, base `cdee457d3`, the atomic batch):** the new code of `root.zig` — `Batch` (`add`, `putExpiring`, `putTtl`, `commit`, `keyOff`), `commitBatchLocked`, `appendVersioned` and its rotation version, the `rotateLocked` version parameter, `replayBatch` / `batchRecord`, the `replay` and `merge` branches for op 3, the `loadManifest` version 4 arms; schemata in a detached copy, ReleaseSafe, strict verdict (20 s cap = hang): 73 mutants, 71 killed (one by the hang cap: pass 2 not advancing; one by the leak detector: a keydir key not freed on a batch delete, 13 tests leak), 2 equivalent, 0 undecided. The first run left 6 alive and 1 unclear: three became tests (the `expiring` counter exact when a batch deletes or overwrites an expiring key; a record whose last CRC piece is one byte, applied whole and dropped when flipped), one a debug assertion (`ReplayWindow.view`'s contract `off + n <= file_size`: a mutant letting a batch's length check run one byte over read bytes the window never loaded and the CRC alone caught them), two equivalent. **Positive controls:** "replay does not check the envelope CRC" dies in the flipped-bit tests; "a torn envelope is skipped and its records replayed one by one" — the batch applied partially — dies in the torn-at-every-cut test, `op 3 in a v1 file`, the read-only opener test and the crash sweep (`batch sweep FAILED: mode=torn_tail … crash_point=24/66`); "no migration for the first batch" (op 3 into a v1/v2 file) dies in the reopen tests. **Equivalent:** (a) a delete's key copy made too, and counted in the capacity reserve (`op != op_del` skipped): a copy freed unused, room reserved for more keys than are inserted — cost only; (b) the CRC pass hashing in 7-byte pieces instead of window-sized ones: CRC-32 is the same over any split — cost only. **Not mutated, not observable:** the `@min(max_batch_bytes, maxInt(u32))` cap and the `maxInt(u32)` key/value length checks need a 4 GiB batch or a 4 GiB slice. **Not independently reviewed** (the whole-module review of 2026-11-12 predates the batch code): a read-only review of `replayBatch` / `commitBatchLocked` is open.
 
+**Delta mutation (2026-11-19, base `04c1315c4`, the paged key scan):** `Db.scanKeys` and its bounded heap (`Scan.siftUp`/`siftDown`); schemata in a detached copy, ReleaseSafe, the kit's runner filtered to the `scanKeys` tests, strict verdict (20 s cap = hang): 26 mutants, 26 killed, 0 equivalent, 0 undecided — the `limit == 0` refusal dropped and at `<= 1`; the errdefer freeing no key copy (leak); the heap sized by the store alone, by `limit` alone (a `maxInt` limit runs out of memory) and one short; the clock never read; the prefix, cursor (dropped, and `>=` instead of `>`) and expiry filters dropped; `n <= heap.len`; `more` never set; never replacing the root and replacing it the wrong way; each sift dropped; the copy taking the root every time; the final sort dropped; each sift comparison flipped or dropped, its bounds off by one, the right child never chosen, `i > 1` for `i > 0`. Card counts cumulative (72/75, 3 eq + 26/26). The review fixes after it changed only a test (a paged scan in the ThreadSanitizer stress test's readers) and a comment: no new mutants, src hash refreshed. **Not independently reviewed yet** (concurrency: the shared-lock pass and the copy-out before the lock is released).
+
 ## Performance
 
 **Measured 2026-10-25** (`zig build bench-kv`, `BENCH_ROUNDS=5`, ReleaseFast, Zig 0.17.0, Go 1.26.8, desktop load only; largest spread 27.5 %), ns per op (one op = the row's whole batch):
@@ -586,6 +631,7 @@ What moved it (2026-10-25): `FsStorage.initMmap` (reads lent from a mapping of t
 - **Hint files / fast open** *(survey 2026-09-30)* — `open` replays the whole log, so start time grows with store size; Bitcask's hint files exist for exactly this. Effort: medium (a second CRC'd file rewritten by `compact`, torn-hint fallback to replay, needs the VOPR sweep extended). Fits §2.
 - **Data-file rotation / multi-file log** *(survey 2026-09-30)* — one ever-growing file means compaction rewrites everything; Bitcask merges sealed files incrementally. Effort: large (format v2, manifest). Fits §2.
 - ~~**Atomic batch write**~~ *(survey 2026-09-30)* — **DONE 2026-11-15**, see § "Atomic batch".
+- ~~**Paged key scan with bounded memory**~~ *(asked for by `sessions`, whose `KvStore.iterate` listed every key at once)* — **DONE 2026-11-19**, see § "Paged key scan".
 - ~~**Per-key expiry (TTL)**~~ *(survey 2026-09-30)* — **DONE 2026-09-30**, see § "Key expiry". Not built: expiry in the background (a timer thread dropping keys) — `compact` is the caller's already, and an expired key costs only memory and disk until then.
 - ~~**Sync policy**~~ *(S2 survey 2026-10-14, R1)* — **DONE 2026-10-14**, see § "Sync policy".
 - ~~**Reader concurrency without a spinlock across fsync**~~ *(survey 2026-09-30)* — **DONE 2026-10-14 (in-process, S2 R5)**: writer mutex + keydir `RwLock`, exclusive only for the in-memory update. Tests: a reader answered (with the previous value) while a writer is parked inside fsync; readers alongside puts/deletes/compactions on the real filesystem, clean under ThreadSanitizer (`-fllvm -fsanitize-thread`; the self-hosted backend silently does not instrument — negative control needed it). Mutants: reader taking the writer lock (red), compaction swap without the exclusive lock (red + TSan races). Cross-process read-only open while a writer runs is the open half (S2 R5b).
