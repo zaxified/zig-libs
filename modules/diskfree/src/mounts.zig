@@ -75,7 +75,7 @@ pub fn unescapeOctal(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
 /// injecting a NUL into a returned `mount_point`, and `\777` to `0xff`. The
 /// leading digit was never compared against anything; `isOctalDigit` says a
 /// character is a digit, which is not the same fact as the three digits
-/// naming a byte. Found by this module's first audit (2026-09-04).
+/// naming a byte. Found by this module's first audit.
 ///
 /// Out-of-range escapes are passed through literally, which is the rule the
 /// doc comment above already states for every other malformed escape.
@@ -225,7 +225,7 @@ pub const mount_table_read_limit = 1024 * 1024;
 /// `rw,size=1024k`: not a visibly broken row, a well-formed wrong one, 100x
 /// off. Dropping the tail after the last newline here is what makes the
 /// promise true, and it is done once for both tables rather than trusted to
-/// each parser (first audit, 2026-09-04).
+/// each parser (first audit).
 ///
 /// That is a deliberate repair of the opposite behaviour, and of the same
 /// defect `procnet.readVirtualFile` carried (fixed there first): this was
@@ -631,7 +631,7 @@ test "fuzz harness (mounts): 300 seeds in every test run, and they get everywher
 /// returned its minimum: the previous version of this harness picked branch
 /// 0, drew length 0, and ran the parser on `""` — twice per gate run, and
 /// nothing else. That is how the `\400` overflow in `unescapeOctal` survived
-/// to this module's first audit (2026-09-04). `Smith.bytes` copies the input
+/// to this module's first audit. `Smith.bytes` copies the input
 /// faithfully in both modes, so deriving from bytes is what makes a corpus
 /// entry mean anything outside the fuzzer.
 ///

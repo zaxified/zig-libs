@@ -118,7 +118,7 @@ test "isRemote: network type names, fuse subtypes, and the host:/ and // device 
 }
 
 test "every name of the three tables is classified (golden lists, written independently of the tables)" {
-    // Whole-module mutation 2026-11-19: dropping any single table entry other than the
+    // Whole-module mutation: dropping any single table entry other than the
     // sixteen named above survived. These lists are the documented names
     // (kernel docs, mount(8), filesystems(5)); a name added to a table later needs a line here.
     const pseudo = [_][]const u8{

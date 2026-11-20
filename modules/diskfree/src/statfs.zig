@@ -76,8 +76,8 @@ pub const Usage = struct {
     /// which can differ from the options text in `/proc/self/mounts` (a
     /// filesystem remounted read-only after an error shows `rw` there and
     /// `St.rdonly` here). 0 on a kernel older than 2.6.36, which never set it.
-    /// Without the kernel's `ST_VALID` marker, so it equals glibc's `statvfs().f_flag`
-    /// (measured). musl's `statvfs().f_flag` KEEPS the marker (measured with a static
+    /// Without the kernel's `ST_VALID` marker, so it equals glibc's `statvfs().f_flag` (measured).
+    /// musl's `statvfs().f_flag` KEEPS the marker (measured with a static
     /// musl probe: `/` 4128 against this field's 4096): compare `flags | St.valid`.
     flags: u32 = 0,
 
@@ -134,7 +134,7 @@ pub const Usage = struct {
     /// `statvfs` counts in `f_frsize` units; musl's `statvfs` (and glibc's)
     /// copy the counts unchanged and fill `f_frsize` with `f_bsize` only when
     /// it is 0, and GNU `df` multiplies by that — so this is the unit that
-    /// agrees with `df`. (Before 2026-10-04 the counts were multiplied by
+    /// agrees with `df`. (Before the counts were multiplied by
     /// `block_size`: identical wherever the two sizes agree, which is every
     /// mount the `df` differential has seen, wrong where they differ.)
     /// A non-positive size (hostile/corrupt report) is clamped to 0 rather
@@ -161,7 +161,7 @@ pub const St = struct {
     pub const nosymfollow: u32 = 8192;
     /// `ST_VALID`: the kernel sets it in `f_flags` to say the field is filled
     /// in (kernel 2.6.36+). `Usage.flags` does not carry it: glibc's `statvfs.f_flag`
-    /// does not either (measured against Python's `os.statvfs`), musl's does (measured).
+    /// does not either (measured against Python's `os.statvfs`), musl's does.
     pub const valid: u32 = 32;
 };
 

@@ -551,7 +551,7 @@ test "fuzz harness (mountinfo): 300 seeds in every test run, and they get everyw
 /// returned its minimum: the previous version of this harness picked branch
 /// 0, drew length 0, and ran the parser on `""` — twice per gate run, and
 /// nothing else. That is how the `\400` overflow in `unescapeOctal` survived
-/// to this module's first audit (2026-09-04). `Smith.bytes` copies the input
+/// to this module's first audit. `Smith.bytes` copies the input
 /// faithfully in both modes, so deriving from bytes is what makes a corpus
 /// entry mean anything outside the fuzzer.
 ///
