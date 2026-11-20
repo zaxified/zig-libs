@@ -6,7 +6,7 @@
 
 **Scope:** core — RustCrypto `aes-kw` 0.3.1 (RFC 3394 + 5649) (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation 2026-10-05 (12/13, 1 eq) · src ?
+**Audit:** review 2026-08-06 · mutation 2026-11-21 (64/66, 2 eq) · src 01d57db26f0c1f5d
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget, clean, AESKW_FUZZ); 2026-11-16 `unwrapPad` (200,000 driver runs clean, ReleaseSafe, AESKW_PAD_FUZZ; every outcome reached) · ct 2026-11-16 (ctgrind: KEK + wrapped key through wrap/unwrap/tampered unwrap and the RFC 5649 wrapPad/unwrapPad/tampered unwrapPad, AES-128/192/256; 12 in-file = each integrity verdict after its constant-time compare, twice per KEK size per construction)
 **Performance:** not measured
@@ -152,12 +152,12 @@ the README), each byte-exact in both directions.
   AES-192 and AES-256; every integrity verdict is taken after the constant-time compare.
 - **Dead stack:** `src/stackprobe_test.zig` (ReleaseFast only): no KEK or key-data residue after the four
   functions (`burn.run` around each body).
-- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. Delta run 2026-11-21 over `wrapPad`/`unwrapPad`, the single-block (n = 1) branch of the shared unwrap recurrence and the AES-192 arms of `encBlock`/`decBlock`: 53 mutants (51 in one ReleaseSafe schemata build, 2 burn-site mutants in a ReleaseFast build), 52 killed, 1 equivalent (the wipe of `out` when the KEK width is refused inside `unwrapInto`: `out` then holds only a copy of the ciphertext). The first suite let 8 live (the `u32` length cap, each of the four AIV-prefix bytes compared alone, a padding mask keeping only bit 0, a padding accumulator that is overwritten instead of OR-ed); tests for them are `unwrapPad §4.2 checks one by one` and `wrapPad length cap`.
 - **Speed:** not measured; see the card's Performance line.
 
 ## Open
 
-- `wrapPad`/`unwrapPad` were added after the last whole-module mutation run and have none of their own.
+None.
 
 ## Backlog / deferred
 

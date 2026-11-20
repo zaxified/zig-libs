@@ -517,6 +517,61 @@ test "wrapPad/unwrapPad refusals: tamper, wrong MLI, non-zero padding, bad lengt
     try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &clean);
 }
 
+test "unwrapPad §4.2 checks one by one: every AIV prefix byte, every padding byte, any bit of a padding byte" {
+    const kek = @as([16]u8, @splat(0x11));
+    const forge = struct {
+        fn make(k: []const u8, mli: u32, prefix: [4]u8, body: [8]u8) [16]u8 {
+            var block: [16]u8 = undefined;
+            block[0..4].* = prefix;
+            std.mem.writeInt(u32, block[4..8], mli, .big);
+            block[8..16].* = body;
+            aes.Aes128.initEnc(k[0..16].*).encrypt(&block, &block);
+            return block;
+        }
+    };
+    var out: [8]u8 = undefined;
+    // Each byte of the 4-byte prefix alone wrong (a compare that skips one byte is refused here).
+    for (0..4) |k| {
+        var prefix = aiv_prefix;
+        prefix[k] ^= 0x01;
+        const ct = forge.make(&kek, 8, prefix, @splat(1));
+        try std.testing.expectError(error.Unauthentic, unwrapPad(&kek, &ct, &out));
+    }
+    // A single non-zero padding byte at each position, with zero padding after it (an accumulator
+    // that is overwritten instead of OR-ed forgets it) and with even values (a mask that keeps only
+    // bit 0 misses them).
+    for (1..8) |mli| {
+        for (mli..8) |pos| {
+            for ([_]u8{ 0x01, 0x02, 0x80 }) |v| {
+                var body: [8]u8 = @splat(7);
+                @memset(body[mli..], 0);
+                body[pos] = v;
+                const ct = forge.make(&kek, @intCast(mli), aiv_prefix, body);
+                try std.testing.expectError(error.Unauthentic, unwrapPad(&kek, &ct, &out));
+                try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), &out);
+            }
+        }
+        // The same block with clean padding is accepted (positive control).
+        var good: [8]u8 = @splat(7);
+        @memset(good[mli..], 0);
+        const ct = forge.make(&kek, @intCast(mli), aiv_prefix, good);
+        try std.testing.expectEqualSlices(u8, good[0..mli], try unwrapPad(&kek, &ct, &out));
+    }
+}
+
+test "wrapPad length cap: 2^32 bytes and more are InvalidLength, 2^32-1 passes the cap (never read)" {
+    if (@sizeOf(usize) < 8) return error.SkipZigTest;
+    const kek = @as([16]u8, @splat(0x11));
+    var buf: [16]u8 = undefined;
+    // Slices over a many-item pointer are not bounds-checked and the functions fail before reading a
+    // byte, so a length that no machine holds is enough to reach the cap.
+    const p: [*]const u8 = &buf;
+    const over = p[0 .. @as(usize, std.math.maxInt(u32)) + 1];
+    try std.testing.expectError(error.InvalidLength, wrapPad(&kek, over, &buf));
+    const at_cap = p[0..std.math.maxInt(u32)];
+    try std.testing.expectError(error.BufferTooSmall, wrapPad(&kek, at_cap, &buf));
+}
+
 // ── fuzz: `unwrap` on an attacker-controlled ciphertext ─────────────────────
 //
 // W2 A3 (F2): CLASS B, zero `testing.fuzz(` harnesses — this module was
