@@ -32,7 +32,9 @@ a prefix-style one (`if (x` -> `if (!mut(1) and x`) cannot take a second mutant
 and is refused with that reason. Every mutated file gets, once, a switch read
 from <ENV_NAME>:
 
-    fn mut(n: u32) bool   -- true when <ENV_NAME>=n (0 or unset = the original)
+    fn mut(mut_sel__: u32) bool   -- true when <ENV_NAME>=mut_sel__ (0 or unset = the original)
+
+(the parameter has an unlikely name so it cannot shadow a `pub const n` of the mutated file)
 
 placed after the file's `const std = @import("std");`, or at the end of the file
 when there is none (a file opening with a `//!` block must keep it first).
@@ -51,13 +53,13 @@ from pathlib import Path
 SWITCH = '''
 // ── mutant schemata (scripts/mutation/insert.py) ──
 var mut_id: ?u32 = null;
-fn mut(n: u32) bool {{
-    if (@inComptime()) return n == 0;
+fn mut(mut_sel__: u32) bool {{
+    if (@inComptime()) return mut_sel__ == 0;
     if (mut_id == null) {{
         const v = std.testing.environ.getPosix("{env}") orelse "0";
         mut_id = std.fmt.parseInt(u32, v, 10) catch 0;
     }}
-    return mut_id.? == n;
+    return mut_id.? == mut_sel__;
 }}
 '''
 
