@@ -8,14 +8,6 @@
 
 **Audit:** review 2026-11-01 · mutation 2026-11-15 (197/224, 27 eq) · src 0a39ee3b419607e4
 
-Audit detail: whole-src mutation run (schemata, 179 mutants over montint, limbs, dyn, nt, safegcd, field and the Zig glue of asm_core; inline-asm template text is out of scope) with 4 new tests in `src/sweep_test.zig` (`Modint`/`Field` per-limb `eql`/`isZero`/`neg`, `DynModint` slot boundary, `safegcd` gcd 2^62+1 verdict); 22 equivalents are argued in the audit report; three are NOT closed: `DynModint.slotFor` `n < slot` (landed on a comment line in the run, new test unverified against it), and `safegcd` `updateDE` without the `e`-sign term and `normalize` without its first add (survive all exhaustive/random inversions, no constructed input yet).
-
-**Mutation 2026-11-15 (delta over `bfbac27b8`, the almost-Montgomery ladder, plus the three 2026-11-01 survivors):** schemata build (ReleaseSafe, default unrolled build, one test binary, per-mutant `setsid -w timeout -s KILL`, `ulimit -v`; baseline first, 25-28 s, so the per-mutant timeout was 90 s instead of 20 s) over 48 mutants: **43 killed, 5 equivalent, 0 undecided**. Rows: `condSubTopInto` operands and `mulBlockImpl`/`sqrBlockImpl`/lazy wrappers (lazy/canonical flipped both ways, `top` forced to 0/1, wrong source slice, `top`/`m`/`src` operands), nine single-instruction variants of the `condSubTopText` template (the asm text is comptime, so each variant is a comptime copy of the template behind a runtime switch), `powMontBits` ladder (table args/destination, one square skipped, all squares skipped, multiply skipped or by `acc`, closing `fromMontgomery` dropped), `ladderMul`/`ladderSqr` (operands, `n0inv`, fallback, canonical kernel) and the three survivors below. The value tests that kill them: `kat_test.zig` "almost-Montgomery block kernels == exact REDC model" (value and top decision, aliasing) and "powMont ... == canonical ladder". Template variants killed: `sbb`->`sub` in the borrow chain, either `shlx` dropped (first limb or loop), mask polarity inverted, shift count 4 or 6 instead of 5, `sub`->`add` in limb 0. The gate `lazy_ladder` is a comptime constant (no runtime switch), so four variants were built separately: `false`, `L > block_min_limbs`, `L % 8` dropped (does not compile: the block engine's comptime assert fires for an instantiated `L >= 16` that is not a multiple of 8), and `asm_unroll` dropped (built with `-Dmontint-asm-unroll=false`, whose own baseline passes): the other three fail the `lazy_ladder == (supported and implemented and asm_unroll)` assertion.
-
-Equivalent (5): (a) the first-limb `subq` -> `sbbq` in `condSubTopText`: the flags come from `shll $5, %ecx` of a value in {0, 1}, whose last shifted-out bit is 0, so CF = 0 and `sbb` = `sub`; (b) `montMul(b, a)` for `montMul(a, b)` in the `ladderMul` fallback: the product is commutative and both operands are below `m` there; (c) `montMul(acc, acc)` for `montSqr(acc)` in the `ladderSqr` fallback: the same value by definition (the differential suite pins square against multiply); (d) and (e) `montMulBlock`/`montSqrBlock` (canonical) instead of the lazy kernels inside the ladder: results are canonical and congruent, so the ladder's value is unchanged. These are cost-only (that was the point of the change), observable by a cycle count, not by a value. Cut (not mutated): the asm clobber list and register constraints (a changed constraint is a compile error or a register-allocation difference no test input can steer), the `asm_active` conjunct of `lazy_ladder` (true on this host; false only off x86-64, where the block kernels `@panic`: needs a non-x86 run, the aarch64 lane's job), unchanged lines around the edit (`defer zeroWords`, `productBlock`/`redcBlock` calls).
-
-The three 2026-11-01 survivors are closed: `DynModint.slotFor` `n <= slot` -> `n < slot` (the earlier run put it on a comment line; now on the code line it is killed by the existing slot-boundary test), `safegcd` `updateDE` without the `e`-sign terms and `normalize` without its first conditional add are killed by two new direct tests in `src/safegcd.zig` ("updateDE: d, e stay in (-2m, m) ... from edge states" and "normalize: (-2m, m) -> [0, m)"), which drive the two steps from states a divstep chain never reaches (both values at `-2m`, lopsided transition matrices, an exact `i512` model); they also kill the `u & sd` and `q & sd` terms (new mutants), which the first version of the test missed. The CT discipline note: test-only changes alter the ctgrind source digests (not re-pinned here).
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MONTINT_FUZZ) · ct 2026-10-26 (ctgrind) · panic 2026-10-30 (sweep + blind review: caller-contract asserts → checked panics (limbs, asm_core, safegcd nbits, Field.pow, fromElemUncheckedBits), even modulus folded into the safegcd verdict branch-free, `sqrt` work capped (`error.SqrtWorkLimit`), `stack_bytes` documented and probed; delta audit 46/48 + eq/NA)
 
 **Performance:** ref 0.91–1.02× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-10-20; since 2026-11-15 `powMont` −1.8…−2.9 % cycles, A/B on a loaded host, see "Almost-Montgomery ladder")
@@ -38,13 +30,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; **re-surveyed 2026-10-05** after `
 |---|---|---|--:|---|---|
 | Zig `std.crypto.ff` — **reference** (the API this module mirrors) | Zig | MIT | — | Zig 0.16.0 (the in-tree toolchain; a newer Zig release not checked — ziglang.org unreachable from the survey host) | `Uint`/`Modulus`/`Fe` over odd moduli with `add`, `sub`, `mul`, `sq`, `reduce`, `eql`, `isZero`, `compare`, `fromPrimitive`, and constant-time `pow` plus a variable-time `powPublic` (function list of 0.16.0's `lib/std/crypto/ff.zig`, 2026-09-30). No inversion, gcd or primality. Portable 63-bit limbs: 13–26× slower per multiply than this module's shipped path (module's own table), and not constant-time in ReleaseFast by this module's own ctgrind `ffcontrol` target (27 contexts, 2026-10-02). The only Zig alternative found: a 2026-10-05 web search turned up no maintained third-party Zig constant-time bignum library *(verified as far as a search can)*. |
 | [RustCrypto/crypto-bigint](https://github.com/RustCrypto/crypto-bigint) | Rust | MIT OR Apache-2.0 (`LICENSE-MIT` + `LICENSE-APACHE`; MIT text verified) | 311 | 0.7.5 (crates.io, verified) | Constant-time by default, variable-time functions explicitly marked (README, verified). Const, fixed and boxed (run-time-sized) Montgomery forms, safegcd inversion, `sqrt`, `lincomb`, `pow` (file listing of `src/modular` on 2026-09-30; GitHub API not reachable on 2026-10-05, so *not re-checked*). Primality lives in the separate `crypto-primes` crate *(inferred)*. NCC-audited, with the README noting the code "has diverged significantly since the last audit" (verified). |
-| [openssl/openssl](https://github.com/openssl/openssl) `BN_mod_exp_mont_consttime` | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29, verified); 4.1.0-beta1 (2026-09-23) | The speed yardstick: module's table has this module at 1.3–1.5× OpenSSL modmul and ~1.5–1.8× modexp at 2048/4096 bits, faster at 256 bits (module's own measurements against OpenSSL 3.5.5, not re-run). Also `BN_mod_sqrt`, BPSW-style primality, gcd, and `BN_mod_inverse` *(inferred from the OpenSSL BN manual pages, not re-read)*. |
+| [openssl/openssl](https://github.com/openssl/openssl) `BN_mod_exp_mont_consttime` | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29, verified); 4.1.0-beta1 (2026-09-23) | The speed yardstick: the card's `**Performance:**` line has the measured ratio against OpenSSL 3.5.5 (Montgomery multiply and modexp, 1024–4096 bit). Also `BN_mod_sqrt`, BPSW-style primality, gcd, and `BN_mod_inverse` *(inferred from the OpenSSL BN manual pages, not re-read)*. |
 | [FiloSottile/bigmod](https://github.com/FiloSottile/bigmod) (`filippo.io/bigmod`, the exported Go `crypto/internal/bigmod`) | Go | BSD-3-Clause (LICENSE text verified) | 16 | v0.1.0 (2025-05-08, pkg.go.dev, verified) | The Go standard library's RSA/ECDSA backend, exported; README warns the API is not stable. `Nat`/`Modulus` with `Add`/`Sub`/`Mul`/`Mod`, constant-time `Exp`, `ExpShortVarTime`, `Equal`/`IsZero`/`IsOne`/`IsMinusOne`/`IsOdd`, `NewModulusProduct` — but `InverseVarTime` and `GCDVarTime` are **variable-time** (pkg.go.dev function list, verified). No square root, no primality (Go's `crypto/rsa` key generation does that around it *(inferred)*). |
 | [rust-num/num-bigint](https://github.com/rust-num/num-bigint) | Rust | MIT OR Apache-2.0 (`LICENSE-MIT` verified) | 613 | 0.5.1 (crates.io, verified) | What a Rust user reaches for first: general heap bignums with `modpow`, `modinv`, `sqrt`, gcd (`num-integer`). The README says nothing about constant time (verified), so not a secret-key backend — listed because it is the general-purpose alternative a user compares against, not as competition on this module's contract. |
 
-**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core, and constant-time where ff is not; ctgrind-measured constant-time on every type (`scripts/checks/ctgrind.sh montint`: `small`/`portable`/`asmcore`/`field`/`dyn`). Of `filippo.io/bigmod`: **constant-time** inversion, gcd and lcm (bigmod's are `VarTime`), and constant-time Miller-Rabin along a prime's path. **Where we are even:** with crypto-bigint and bigmod on the main use case — CT modmul/modexp over a run-time odd modulus (`DynModint`), a variable-time public-exponent power (`powPublic`), a comptime prime field (`Field`), `eql`/`isZero`, exact division, CT inversion (also of the modulus mod an even `n`), gcd/lcm, and Miller-Rabin key-generation primitives; four in-repo consumers (`rsa`, `paillier`, `threshold_ecdsa`, `vdf`) run every secret operation on it. **Where we are behind (→ Backlog; none on the modmul/modexp/keygen path):** a Baillie-PSW/Lucas test (Miller-Rabin only; random witnesses meet FIPS 186-5 B.3.1, as OpenSSL), and aarch64 runs only the portable path. (Closed 2026-10-14: square root mod a prime, element `compare`/`isOdd`/`isOne` and `Modint.eql`/`isZero`/`neg`, batched CT inversion — `montint.safegcd`, 59 divsteps per matrix.) (Closed since the 2026-09-30 survey: `powPublic`, wide `reduce`, `eql`/`isZero`, run-time-sized moduli — `DynModint`, 2026-10-02; CT inversion, `nt` gcd/lcm/`divExact`, Miller-Rabin — 2026-10-03; the 2026-10-03 review's five LOW hardening items — 2026-10-06.)
-
-**Verdict (2026-10-05): core.** The main use cases of a constant-time Montgomery library over arbitrary odd moduli — RSA/Paillier/DH-style modexp with secret exponents, public-exponent verify, key setup (inverses of `e` mod `λ`, `lcm`, prime search) and VDF squaring — are all covered, tested against `std.math.big.int`/CPython oracles and measured under ctgrind, and in production use by four sibling modules. The remaining gaps are off that path (square roots matter for point decompression and Rabin-style schemes, BPSW strengthens a Miller-Rabin test FIPS 186-5 already accepts *(inferred)*), cosmetic (`compare`/`isOdd`), or speed (per-message inversion, aarch64). Not `parity`: crypto-bigint and OpenSSL still have square roots, faster inversion and a stronger primality test that a user of either would notice missing.
+**Where we are ahead:** of `std.crypto.ff`, ~17× at 2048-bit modmul and 5–7× at modexp on amd64 (module's own bench) with full 2^64 limbs and a `MULX/ADCX/ADOX` core, and constant-time where ff is not; ctgrind-measured constant-time on every type (`scripts/checks/ctgrind.sh montint`: `small`/`portable`/`asmcore`/`field`/`dyn`). Of `filippo.io/bigmod`: **constant-time** inversion, gcd and lcm (bigmod's are `VarTime`), and constant-time Miller-Rabin along a prime's path. **Where we are even:** with crypto-bigint and bigmod on the main use case — CT modmul/modexp over a run-time odd modulus (`DynModint`), a variable-time public-exponent power (`powPublic`), a comptime prime field (`Field`), `eql`/`isZero`, exact division, CT inversion (also of the modulus mod an even `n`), gcd/lcm, and Miller-Rabin key-generation primitives; the in-repo consumers (`rsa`, `paillier`, `threshold_ecdsa`, `vdf`, `bls12_381`, `bn254`, `ssh`, `tls13`: `build.zig` `.deps`) run their modular arithmetic on it. **Where we are behind (→ Backlog; none on the modmul/modexp/keygen path):** a Baillie-PSW/Lucas test (Miller-Rabin only; random witnesses meet FIPS 186-5 B.3.1, as OpenSSL), and aarch64 runs only the portable path.
 
 ## What this module is
 
@@ -56,26 +46,26 @@ Because it must accept composite moduli (RSA/Paillier `N`, a hidden-order VDF
 group) it is deliberately **not** called a "field" — there is no inversion by
 Fermat, no primality assumption.
 
-**`Field(p)` (2026-10-02)** is the one prime-field layer on top: `GF(p)` for a
+**`Field(p)`** is the one prime-field layer on top: `GF(p)` for a
 comptime prime, Montgomery-resident, with `fromBytesBE` (canonical check),
 `toBytesBE`, `reduceBytesBE` (any width, Horner over 64-bit limbs so every
 `montMul` operand stays `< p`), `add`/`sub`/`neg`/`mul`/`sq`, `pow` (all
 `64·L` exponent bits through `powMont`) and Fermat `inv`. Constants are
 `comptime_int` arithmetic, no `computeConstants` loop. It exists because
 `std.crypto.ff` — which `bls12_381.Fr` and `bn254.Fr` wrapped — is not
-constant-time in ReleaseFast (ctgrind 2026-10-02: `montgomeryMul`'s
+constant-time in ReleaseFast (ctgrind: `montgomeryMul`'s
 extra-reduction select and `powWithEncodedExponent`'s window select compile to
 conditional jumps); both `Fr`s are now views of `Field`. Evidence: ctgrind
 target `field` (the bls12_381 `r`, operands, exponent and a 64-byte reduce
 input tainted) — 0 in-file contexts except `inv`'s documented zero check —
 next to `ffcontrol`, the replaced ff path on the same operands, which must
-stay non-zero in `ff.zig` (27 contexts on 2026-10-02; 28 on Zig 0.17.0, 2026-10-18: std's `ff` `pow` window select changed, still a positive control, the pin is `>=1`). Differential tests
+stay non-zero in `ff.zig` (a positive control: the pin is `>=1`). Differential tests
 against `std.crypto.ff` at L=4 (bls12_381 `r`) and L=7 (ed448 `l`).
 
-**`DynModint(max_bits)` (2026-10-02)** is the run-time counterpart of `Field`:
+**`DynModint(max_bits)`** is the run-time counterpart of `Field`:
 an odd modulus whose value AND limb count are chosen at run time (slots every
 4 limbs up to 1024 bits, then the key sizes 1536/2048/3072/4096/6144/8192 bits
-and the type's top — since 2026-10-18; each operation dispatched to the
+and the type's top; each operation dispatched to the
 matching `Modint`), with normal-domain
 elements (`[max_limbs]u64`, so an element of `p²` is directly an operand mod
 `n²`). API: branchless `loadBE`, canonical `elemFromBytesBE` (CT up to the
@@ -88,25 +78,22 @@ verdict), `toBytesBE`, `reduceLimbs`/`reduceBytesBE` of any width — Horner ove
 full width — Paillier's L-function). It exists because `rsa` and `paillier`
 each carried a private copy of the slot machinery for their modexps while their
 other secret arithmetic stayed in `std.crypto.ff`; both now run every
-private-key operation on it (ctgrind `rsa/crt` 213 → 1, `paillier/crt` 325 → 2), and `threshold_ecdsa`'s provers their products (`fac` 17 → 5). `elemFromFf`/`elemToFf`/`fromFf` move values to and from `std.crypto.ff` by a positional limb repack, since `ff`'s own `toBytes`/`fromBytes` branch on the value.
+private-key operation on it and `threshold_ecdsa`'s provers their products. `elemFromFf`/`elemToFf`/`fromFf` move values to and from `std.crypto.ff` by a positional limb repack, since `ff`'s own `toBytes`/`fromBytes` branch on the value.
 The bit LENGTH of the modulus (which picks the slot) is treated as public — it
 is the key size; its value is not. `fromLimbs` finds the length by scanning;
-`fromLimbsBits(v, nbits)` (2026-10-03) takes it from the caller and checks
+`fromLimbsBits(v, nbits)` takes it from the caller and checks
 length, oddness and `≥ 3` in one combined verdict, so a secret prime is never
 scanned (`threshold_ecdsa`'s Πmod prover and Miller-Rabin use it; built on
 `Modint.fromElemUnchecked`, which skips `fromElem`'s two branches on the low
-bits). `select(on, a, b)` is a constant-time blend with an asm-laundered mask. Evidence: ctgrind target `dyn` — secret
+bits). `select(on, a, b)` is a constant-time blend with an asm-laundered mask.
+
+**Slot policy.** Every operation dispatches on the slot through an `inline` loop, so code size grows with the slot count: on an ADX/BMI2 CPU each slot is its own `Modint(64·L)` with straight-line asm per `L`. The slots are every 4 limbs up to 1024 bits, then only the sizes that occur (1536, 2048, 3072, 4096, 6144, 8192 bits) and the type's top, so `DynModint(8192)` has 10 slots (`DynModint.slots`, `dyn.zig`). A modulus of a common size keeps an exact slot; any other runs in the smallest slot that fits it (a 1100-bit modulus in the 1536-bit one). The build option `montint-asm-unroll` (see *Build options*) trims the code further. Evidence: ctgrind target `dyn` — secret
 modulus (value fields tainted after construction, slot not), operands,
 exponent, wide inputs, at L=16 and L=32 — 2 in-file contexts, both
 `elemFromBytesBE`'s accept/reject; differential tests against
-`std.math.big.int` at 2…8192-bit moduli. Mutation 2026-10-02 (schemata, 14
-mutants): 12 killed after one added test (`divExact` with a non-zero limb above
-`2·L`); 2 equivalent — forcing the digit width to 64 for a small modulus (the
-portable CIOS tolerates an operand `< R`; the narrower digit keeps the
-documented `< m` contract) and dropping the `m < 3` check (`Modint.fromElem`
-rejects it too).
+`std.math.big.int` at 2…8192-bit moduli.
 
-**Square root (2026-10-14).** `sqrt(a, out) bool` is a square root of `a`
+**Square root.** `sqrt(a, out) bool` is a square root of `a`
 modulo a PRIME modulus (OpenSSL `BN_mod_sqrt`, Go `ModSqrt`): `true` and a root
 iff `a` is a residue (`0` counts), else `false` with `out` zeroed; `a ≥ m` is
 refused like `inverse`; which of `±r` comes back is unspecified. The modulus is
@@ -124,52 +111,42 @@ root, never a wrong one. Evidence: KATs from CPython Tonelli-Shanks
 criterion through `powPublic`, ctgrind `dyn` row `sqrt` (secret `a` mod the
 P-224 prime).
 
-**Inversion (2026-10-03).** `inverse(a, out) bool` is `a⁻¹ mod m` by
-Bernstein–Yang divsteps (2019, §11), one step at a time, every branch a masked
-blend, run for the paper's bound — `⌊(49b + 57)/17⌋` steps for `b ≥ 46` bits,
-`⌊(49b + 80)/17⌋` below (Theorem 11.2) — with `b` the modulus's (public) bit
-length. `d`, `e` are tracked mod `m` (`f ≡ d·a`, `g ≡ e·a`), halving `g`
+**Inversion.** `inverse(a, out) bool` is `a⁻¹ mod m` by
+Bernstein–Yang divsteps (2019, §11), every branch a masked blend, run for a
+step bound that depends only on `b`, the modulus's (public) bit length. (The
+one-step form, kept as the private test oracle `inverseDivsteps`, runs the
+paper's bound — `⌊(49b + 57)/17⌋` steps for `b ≥ 46` bits, `⌊(49b + 80)/17⌋`
+below, Theorem 11.2.) `d`, `e` are tracked mod `m` (`f ≡ d·a`, `g ≡ e·a`), halving `g`
 becoming `e·2⁻¹`. The verdict checks `g = 0` and `f = ±1`, so a bound that fell
-short would refuse rather than return a wrong value — and, since 2026-10-06,
+short would refuse rather than return a wrong value, and so does
 `a < m` over the whole `Elem` (an operand outside the contract is refused in
 the same verdict, not truncated to the slot). `inverseOfModulus(n, out)
 bool` is `m⁻¹ mod n` for ANY `n ≥ 2`, even included — the shape the callers
 have (`Ñ⁻¹ mod φ(Ñ)`, `e⁻¹ mod (p − 1)`), which divsteps cannot take directly:
 `z = n⁻¹ mod m` (odd side), then `m⁻¹ mod n = n − (n·z − 1)/m`, the exact
-division a Hensel product with `m⁻¹ mod 2^(64·max_limbs)`. Since 2026-10-14 `inverse` runs on the batched engine `safegcd.Inverter` (libsecp256k1 `modinv64` shape: 59 divsteps on the low words per transition matrix, applied once to signed-62 limb vectors; the old one-step form is the private test oracle `inverseDivsteps`) and verifies `a·inv ≡ 1` before answering `true`; the cost below is the old one-step form's, the batched one is ~tens of µs at 2048 bits. Since 2026-10-18 the batched engine runs `⌊(45907·b + 26313)/19929⌋` divsteps, the half-delta bound of sipa/safegcd-bounds `genproofhd.md` for `0 ≤ g ≤ f < 2^b` (libsecp256k1 runs 590 at 256 bits, one below it), instead of Theorem 11.2's original-divstep bound: 40 batches at 1024 bits instead of 51 (rsa-2048's blinding inverse ~22 % cheaper, ~1 % of a blinded op). The one-step oracle keeps Theorem 11.2. Both are CT in the
-operand AND the modulus value up to the verdict. Cost (amd64, ReleaseFast,
-`bench.zig`): 0.8 / 3.5 / 16 ms at 1024 / 2048 / 4096 bits — about one modexp
-of the same width; meant for key setup and provers. Evidence: exhaustive over
+division a Hensel product with `m⁻¹ mod 2^(64·max_limbs)`. `inverse` runs on the batched engine `safegcd.Inverter` (libsecp256k1 `modinv64` shape: 59 divsteps on the low words per transition matrix, applied once to signed-62 limb vectors; the old one-step form is the private test oracle `inverseDivsteps`) and verifies `a·inv ≡ 1` before answering `true`. The batched engine runs `⌊(45907·b + 26313)/19929⌋` divsteps, the half-delta bound of sipa/safegcd-bounds `genproofhd.md` for `0 ≤ g ≤ f < 2^b` (libsecp256k1 runs 590 at 256 bits, one below it); Theorem 11.2's original-divstep bound is kept only by the one-step test oracle. Both are CT in the
+operand AND the modulus value up to the verdict. Evidence: exhaustive over
 every `a` below every odd `m < 512`; differential against `std.math.big.int` at
 46…4096 bits (units and constructed non-units) and for `inverseOfModulus` at
 mixed widths (2…4096 bits, even and odd `n`); ctgrind `dyn` drives both on
 tainted operands and modulus at L=16 and L=32 (coprime operands, so the success
-path runs; values equal Python's `pow(x, -1, m)`) — no context added. Mutation
-2026-10-03 (schemata, 24 mutants on the divsteps, the halving, the verdict and
-the Hensel step): 21 killed, 3 equivalent — all three lean on the step bound's
-slack: one step fewer (Theorem 11.2's bound is not tight; the exhaustive
-`m < 512` sweep still converges), `δ += 2` (the invariants `f ≡ d·a`,
-`g ≡ e·a` hold for any swap schedule — only the speed of convergence changes),
-and dropping the `g = 0` half of the verdict (redundant once the bound holds;
-it is the fail-closed guard for a bound that would not).
+path runs; values equal Python's `pow(x, -1, m)`) — no context added.
 
-**`nt` and primality (2026-10-03).** `montint.nt` holds constant-time number
+**`nt` and primality.** `montint.nt` holds constant-time number
 theory on plain limb arrays — the key-setup arithmetic no odd modulus carries:
 `oddPart` (`x = u·2^t` by masked one-bit shifts over every position), `gcd`
 and `lcm` (odd parts, divsteps on them with `f` odd, the common power of two
 shifted back in; `lcm = (odd(a)/g)·odd(b)·2^max(t_a, t_b)`, the division a
 Hensel one), `divExact` (any divisor, even included: its power of two shifted
 out of the dividend, then Hensel by the odd part; `error.NotDivisible` for
-`b = 0` or `b ∤ a`, checked as `q·b = a` over the full product since
-2026-10-06), and the shared masked-limb
+`b = 0` or `b ∤ a`, checked as `q·b = a` over the full product), and the shared masked-limb
 helpers `DynModint.inverse` uses. `DynModint.isProbablePrime(random, rounds)`
 is Miller-Rabin constant-time in the modulus's value along a prime's path:
 `m − 1 = d·2^s` by `nt.oddPart`, the ladder `pow` modulo the secret `m`,
-witnesses near-uniform over `[2, m − 2]` (since 2026-10-06: `bits + 64`
+witnesses near-uniform over `[2, m − 2]` (`bits + 64`
 random bits reduced by `reduceBytesBE`, `0`/`1`/`m − 1` masked to `2` — no
-compare against `m`, no retry loop; before, they were drawn below
-`2^(bits−1)`, so the theorem's `4^−rounds` bound did not literally apply), and
-`rounds = 0` refused (`false`) since 2026-10-06, a round's verdicts
+compare against `m`, no retry loop; so the theorem's `4^−rounds` bound applies literally), and
+`rounds = 0` refused (`false`), a round's verdicts
 (`x = 1`, `x = −1` at any of the `s` squarings) OR-ed before the one branch.
 Observable by design: `s` (the squaring count) and everything about a
 rejected candidate. `rsa`, `paillier` and `threshold_ecdsa` run their prime
@@ -180,10 +157,7 @@ differential against `std.math.big.int` at 64…4096 bits with shared powers of
 two and odd factors; `divExact` for odd and even divisors at 1…64 limbs;
 `isProbablePrime` on every odd `m < 3000`, eight Carmichael numbers including
 a 180-bit Chernick one with ~60-bit factors, RFC 3526's 2048-bit safe prime,
-its Sophie Germain half and two composites near it. Mutation 2026-10-03
-(schemata, 20 mutants): 20 killed — one only after the Chernick number was
-added (a Fermat-test mutant passed the small Carmichael numbers, whose
-witnesses hit a factor).
+its Sophie Germain half and two composites near it.
 
 ## Why it exists (std-gap, not a dup)
 
@@ -246,28 +220,25 @@ a different regime (see its SPEC's reuse map).
   the modmul yet. The threshold (`karatsuba_threshold = 16`) is descriptive; the
   tuned crossover is a bench-time question.
 
-## The asm core (implemented — was the scaffold cut-line)
+## The asm core
 
-Exactly one function was gated (`gate.asm_core_implemented`, now `true`):
+The hand-written x86-64 `MULX/ADCX/ADOX` Montgomery multiply (the `x86_64-mont5` technique: `MULX` for the widening
+products, `ADCX` for the add carry chain, `ADOX` for the mul carry chain — two independent flag chains that keep both
+carries live without stalls). The runtime-`n` entry points are
 
 ```
 asm_core.montMul(z: []u64, a, b, m: []const u64, n0inv: u64)   // z = a·b·R⁻¹ mod m
+asm_core.montSqr(z: []u64, a, m: []const u64, n0inv: u64, scratch: []u64)
 ```
 
-the hand-written x86-64 `MULX/ADCX/ADOX` CIOS Montgomery multiply over `n =
-m.len` full 2^64 limbs (the `x86_64-mont5` technique: `MULX` for the widening
-products, `ADCX` for the add carry chain, `ADOX` for the mul carry chain — two
-independent flag chains that keep both carries live without stalls). A
-dedicated squaring (`asm_core.montSqr`, SOS over the shared `mulRow` row
-primitive) was added on top — see "Dedicated squaring" under Threats/caveats.
-The signature is final; only the body changes. Its result
-is the same `[]u64` the portable CIOS returns, so a wrong core **cannot**
-typecheck-and-silently-pass: the differential harness compares it limb-for-limb
-against the proven-vs-CPython oracle.
+over `n = m.len` full 2^64 limbs; the dedicated squaring is described under Threats/caveats. The result is the same
+`[]u64` the portable CIOS returns, so a wrong core **cannot** typecheck-and-silently-pass: the differential harness
+compares it limb-for-limb against the oracle that is proven against CPython. The switch `gate.asm_core_implemented`
+is `true`.
 
-Dispatch: `montMul` routes to the asm core iff `builtin.cpu.arch == .x86_64 and
-featureSetHas(.adx) and featureSetHas(.bmi2)` **and** the gate is on; every other
-target (aarch64/armv7/mips/…) runs the portable CIOS forever.
+Dispatch: the asm kernels are used iff `asm_core.supported` (x86-64 with ADX and BMI2) and the gate is on
+(`montint.asm_active`); every other target runs the portable CIOS forever. Which kernel a `Modint` gets depends on `L`:
+see *Small-L dispatch* and the kernel sections below.
 
 ## Constant-time contract
 
@@ -302,524 +273,223 @@ recovers `mask ∈ {0, ~0}` and turns the masked code back into a branch.
 The amd64 core inherits the contract — the CIOS instruction schedule is fixed
 and the final subtract must stay a `CMOV`/masked select, not a `Jcc`.
 
-### MEASURED 2026-08-13: found leaking on the portable path, fixed, re-measured
+### ctgrind measurement
 
-`scripts/checks/ctgrind.sh montint` (harness: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig))
-is the first timing-audit tool ever run against this module. It found the
-"enforced structurally" claim FALSE on the portable path at ReleaseFast, in two
-of the four bullets above. Both are now repaired and re-measured; **every one of
-the three targets reports zero in-file contexts, with no residual.**
+`scripts/checks/ctgrind.sh montint` (harness: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig)) measures the
+constant-time contract with valgrind/memcheck. Targets: `small` (`Modint(256)`, L=4), `portable` (`Modint(512)`, L=8),
+`asmcore` (`Modint(2048)`, L=32), `field`, `dyn` (secret modulus; L=16 and L=32) and the positive control `ffcontrol`
+(the replaced `std.crypto.ff` path, which must stay non-zero). Each target runs a claim row (tainted operands, base and
+exponent), an untainted control and a no-`-fvalgrind` trap; the expected counts are in
+`scripts/checks/ctgrind-expected.tsv`, and `zig build check-ctgrind` compiles the harness so it cannot rot. The size is
+the interesting axis: the leak class is LLVM recovering `mask ∈ {0, ~0}` at a comptime-known, fully unrolled `L`, so
+every `L` is separate codegen with its own verdict, and every dispatch size gets a target. The in-file count of
+`small`, `portable` and `asmcore` is 0. The totals stay non-zero because the harness prints its results through a
+hex formatter that is not constant-time — that is the propagation witness that makes the in-file zeros readable
+(`total_min` in the table asserts it fired).
 
-**Full control table after the fix** (zig 0.16.0, valgrind 3.26.0, x86_64 +
-ADX/BMI2, ReleaseFast, 2026-08-13; `in-file` = memcheck CONTEXTS whose stack
-names `montint.zig`, `limbs.zig` or `asm_core.zig`):
+What the measurement established, and the design that follows from it:
 
-| target | modulus | dispatch | `-fvalgrind` | tainted | total | in-file (was) | exit |
-|---|---|---|---|---|---|---|---|
-| `small` | `Modint(256)`, L=4 | portable CIOS (both cutoffs missed) | yes | **yes** | 8 | **0** ✅ *(was 7)* | 99 |
-| `small` | | | yes | no | 0 | 0 | 0 *(control)* |
-| `small` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `portable` | `Modint(512)`, L=8 *(L=16 until 2026-10-10)* | portable CIOS + `montSqrCios` | yes | **yes** | 4 | **0** ✅ *(was 5)* | 99 |
-| `portable` | | | yes | no | 0 | 0 | 0 *(control)* |
-| `portable` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
-| `asmcore` | `Modint(2048)`, L=32 | `asm_core.montMulFixed`/`montSqrFixed` *(runtime-`n` `montMul`/`montSqr` until 2026-10-10)* | yes | **yes** | 4 | **0** ✅ *(was 0)* | 99 |
-| `asmcore` | | | yes | no | 0 | 0 | 0 *(control)* |
-| `asmcore` | | | **no** | yes | 0 | 0 | 0 *(trap)* |
+- **The structure alone is not enough.** The final conditional subtract (`condSubTop`) and `sub`'s masked add-back
+  compiled to secret-dependent branches at ReleaseFast even though they are written as unconditional masked code.
+  What removes the branch is the `blackBox` inline-asm optimization barrier on the mask (`montint.zig`); the
+  two-pass masked form of `condSubTop` is the shipped shape (it drops a scratch `Elem` and mirrors `asm_core.condSub`)
+  but is neither necessary nor sufficient. The same barrier guards `powMont`'s table gather.
+- **`asm_core.condSub` is clean for a different reason:** its `n` is a runtime slice length, so LLVM cannot unroll
+  it and recover the mask.
+- **The measurement has teeth.** Injecting a data-dependent branch into `montMulCios`'s inner loop, around
+  `powMont`'s window multiply, into `asm_core.condSub`'s second pass, or restoring the old select-between-buffers
+  `condSubTop` / dropping `sub`'s barrier moves the corresponding row from 0 to non-zero. The last also proves that
+  taint propagates through the inline-asm blocks.
+- **Standing caveat.** This is a property of one compiler on one target at one optimize level, not a theorem:
+  `blackBox` denies LLVM the range fact it needs today, and nothing stops a future backend from finding another
+  route. The value of the harness is that it is committed and re-runnable.
 
-`small` and `portable` taint both operands / both the base and the EXPONENT;
-`portable` and `asmcore` run a full `powMont`. The totals stay non-zero (8 / 4 /
-4) because the harness prints its results through a hex formatter that is not
-constant-time — that is the propagation witness which makes the in-file zeros
-readable, and `total_min` in `scripts/checks/ctgrind-expected.tsv` asserts it fired.
-Under the classifier's `witness`/`unattr` columns every one of those 8 / 4 / 4 is
-accounted for as formatting and **0 are unattributed** — so the in-file zeros are
-zeros of a complete partition, not of a filter that dropped what it could not
-name.
+## Verification
 
-**`sub` at every width, added 2026-08-13.** The `portable` and `asmcore` totals
-read 2 and 2 when this table was first written, because `runPow` did not call
-`sub` — `sub` is not on the `powMont` path, so it was measured at L=4 only, by
-`small`. That was a real gap and not a formality: the leak class here is LLVM
-re-deriving `mask ∈ {0, ~0}` at a comptime-known, fully unrolled `L`, so every
-`L` is separate codegen with its own verdict — and **L=16 is the RSA-2048 CRT
-width this whole fix was about**. `runPow` now drives one `sub`, which covers
-L=16 and L=32 without a fourth target; the totals moved 2 → 4 on both rows (two
-more tainted bytes reaching the formatter) and the in-file counts stayed **0**.
-The teeth for those two new rows are in the control table below.
+Run `scripts/modtest montint` (add `--fresh` for a cache-free run). ReleaseFast: `zig build test-montint
+-Doptimize=ReleaseFast`; the opt-in bench: `MONTINT_BENCH=1 zig build test-montint -Doptimize=ReleaseFast`;
+constant time: `scripts/checks/ctgrind.sh montint --check`. A test summary without counts means nothing ran.
 
-**What the 7 and the 5 were.** Every one was the same shape — LLVM recovered
-`bit ∈ {0,1}` from a borrow, concluded the mask is `0` or all-ones, and rewrote
-the masked code as a branch on that bit:
+- **KAT against an external oracle.** `kat_test.zig` checks `mul` and `powMont` byte-exact against
+  `kat_vectors.zig` at 256/512/2048/4096 bits. The vectors are CPython's arbitrary-precision answers (`(a*b)%m`,
+  `pow(a,e,m)`), which share no code with this module and equal OpenSSL `BN_mod_mul`/`BN_mod_exp`; moduli are random
+  odd composites, not primes. Square-root KATs: `tools/gen_sqrt_kat.py` → `src/sqrt_vectors.zig` (see *Square root*).
+- **Differentials against the portable oracle.** The runtime-`n` asm core against `montMulCios` on random
+  `(a, b, odd N)` and an `n`-sweep including leading-zero-limb moduli and squaring aliasing; the fixed-`L` kernels at
+  `L = 2, 8, 16, 24, 32, 48, 64` with short-top-limb moduli and `0`/`1`/`m−1` operands; the lazy block kernels
+  against a word-serial `u128` REDC model (value and the `top` decision, aliasing); `powMont` against a plain
+  square-and-multiply ladder over `montSqr`/`montMul`; and `montSqrCios`, the asm square and `montMul(a, a)` against
+  each other at every remainder class of the reduction row. `DynModint`, `Field` and `nt` are checked against
+  `std.math.big.int` (2…8192-bit moduli) and `std.crypto.ff`; inversion is exhaustive over every `a` below every odd
+  `m < 512`; `gcd`/`lcm`/`oddPart` over every pair below 600; `isProbablePrime` over every odd `m < 3000`, Carmichael
+  numbers (including a 180-bit one with ~60-bit factors), RFC 3526's 2048-bit safe prime and composites near it.
+- **Positive controls (teeth).** A copy of CIOS without the final conditional subtract (it disagrees with the oracle
+  only ever by exactly `m`), an asm square with the doubling omitted, and a square without the diagonal term must
+  all be flagged; the Karatsuba/schoolbook pair anchor each other.
+- **Boundary cases the random tests cannot reach.** The conditional subtract exists in two copies (`condSubTop`,
+  `asm_core.condSub`) and each has two passes whose outgoing borrow `s[1] | s2[1]` matters only when a limb has
+  `v[i] == m[i]` with a borrow coming in — a probability of about 2⁻⁶⁴ per limb for random operands. Constructed cases
+  (`montint.zig` "the borrow must survive a limb where v[i] == m[i]", `asm_core.zig` "condSub pass 1" / "pass 2", each at
+  `n = 32` against a full-width modulus) pin every instance; the cases are strictly pass-specific. Likewise the
+  `safegcd` steps `updateDE` and `normalize` are driven from states a divstep chain never reaches, against an exact
+  `i512` model.
+- **Constants measured through.** `asm_min_limbs`, `sqr_min_limbs` and `fixed_min_limbs` are asserted by value, and by
+  what they select (`Modint(1024)`, `Modint(2048)`, `Modint(4096)` dispatch to asm; `Modint(512)` and the pairing
+  widths do not), because a test phrased as `L >= asm_min_limbs` re-derives the rule and passes for any value. The
+  `blackBox` `@inComptime` guard is exercised by a comptime `fromElem` test that compile-fails without the guard and
+  without its own `@setEvalBranchQuota`, and checks that the comptime and runtime constants agree limb for limb.
+- **Panics and stack.** `sweep_test.zig` pins every caller-contract check (checked panics in `limbs`, `asm_core`,
+  `safegcd` `nbits`, `Field.pow`, `fromElemUncheckedBits`; the `sqrt` work cap; slot boundaries); `stackprobe_test.zig`
+  keeps `DynModint.stack_bytes` honest for `pow`, `inverse` and `sqrt`.
+- **Fuzz.** `MONTINT_FUZZ=<runs>[,<first seed>]` (deterministic driver, `src/fuzz_test.zig`): fixed-width differential
+  against `std.math.big`, dyn differential, dyn `sqrt` against Euler's criterion through `powPublic`, and the modulus
+  and element loaders. Verdicts come from the driver, never from `zig build --fuzz`.
+- **ctgrind.** See *ctgrind measurement*; rows in `scripts/checks/ctgrind-expected.tsv`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-- `condSubTop` — the final conditional subtract of every `montMulCios`,
-  `montSqrCios`, `add` and `doubleMod`. Disassembly at the reported address:
-  `cmp %rdx,%rsi; setb …; testb $0x1,…; jne` skipping the entire store block
-  (and at L=16 the block is an AVX `vmovups` pair, so the branch is
-  unmistakable). This is the **Montgomery final-subtraction leak** — the branch
-  reveals, per multiply, whether the pre-reduction value was `≥ m`. 6 of the 7
-  `small` contexts and all 5 `portable` contexts.
-- `sub` (`montint.zig`, inlined `limbs.subInto`) — the masked add-back of `m` on
-  borrow, compiled to `test $0x1,%dil; je`. The 7th `small` context.
+## Performance
 
-In `powMont` the leak fired on **every** window: 3 contexts via `montMulCios`
-(`toMontgomery`, the table build, the per-window multiply) plus 1 via
-`montSqrCios` (the 5 squarings per window) plus 1 via `fromMontgomery`.
+Bench: `MONTINT_BENCH=1 zig build test-montint -Doptimize=ReleaseFast` (`src/bench.zig`, ns/op for the portable and
+the asm path and `std.crypto.ff`; the OpenSSL side is a small libcrypto driver, `tools/c_bench`; `zig build
+bench-montint` runs the exponent benches). The card's `**Performance:**` line is authoritative for the ratio against
+OpenSSL; numbers on a laptop are noisy (turbo, thermal), so read them as ratios. `modmul` is one Montgomery multiply
+on operands already in the Montgomery domain (comparable to OpenSSL `BN_mod_mul_montgomery`); `modexp` is a full-width
+constant-time exponent (`BN_mod_exp_mont_consttime`, not RSA-CRT).
 
-**Blast radius, while it was live.** The dispatch cutoff `asm_min_limbs = 32`
-means the portable path is the DEFAULT for: every non-amd64 target (all `L`);
-every modulus `< 2048-bit` on amd64 — which by `rsa`'s own dispatch comment is
-exactly **RSA-2048 CRT signing/decryption, whose mod-p and mod-q halves run at
-L=16** with the secret CRT exponents `dP`/`dQ`; plus `paillier`,
-`threshold_ecdsa`'s `powCt`, and the pairing-field sizes (L=4/6) the small-L
-comment calls out as ones that "MUST stay portable".
+Where the speed comes from: the full-limb Montgomery-resident portable CIOS is most of the win over `std.crypto.ff`
+(63-bit redundant limbs and a half-limb `mulWide` foreclose `MULX`/`ADCX`/`ADOX`); the asm kernels add the rest from
+2048-bit up, and the small-L dispatch below keeps them off the sizes where they lose.
 
-#### What actually fixed it — and what did not
+## Small-L dispatch
 
-The obvious hypothesis was structural: `asm_core.condSub` reports zero because
-its second pass subtracts `m & smask` *unconditionally* instead of selecting
-between two buffers, so write `condSubTop` that way too. **Measured, that
-hypothesis is wrong.** Rewriting `condSubTop` into `asm_core.condSub`'s exact
-two-pass shape moved the counts by nothing at all: `small` 7 → 7,
-`portable` 5 → 5. At a comptime-known `L` the loops fully unroll and LLVM still
-recovers `smask ∈ {0, ~0}`, sees that subtracting an all-zero operand is a no-op,
-and hoists the pass behind the same branch. `asm_core.condSub` escapes only
-because its `n` is a runtime slice length.
+The runtime-`n` asm core is not universally faster. Its `MULX/ADX` block runs runtime-`n` loops (trip-count setup,
+remainder handling, the mul→reduce register shuffle), whereas the portable CIOS is comptime fully unrolled for the fixed
+`L` with zero loop bookkeeping. At small `L` that overhead dominates the handful of limb products: on the measured host
+(Kaby Lake) the runtime-`n` asm modmul was ~2.4× slower at 256-bit, ~1.06× at 512-bit, ~1.07× at 1024-bit and only
+ahead from 2048-bit, so the breakeven there is ~1.5–2k bit (higher than the canonical ~512-bit `mont5` breakeven, a
+mobile-CPU/turbo artifact). The pairing fields (`bn254` Fp, 254-bit, L=4; `bls12_381` Fp, 381-bit, L=6) live exactly
+in that regime and MUST stay on the portable path.
 
-`sub` is the same story from the other direction: it *already* added `m & mask`
-unconditionally and was compiled to a branch anyway.
+`Modint` therefore dispatches by `L` at comptime (`Modint.montMul`/`montSqr`, `montint.zig`):
 
-What fixed both was the `blackBox` optimization barrier (`montint.zig`), applied
-to the subtract mask in `condSubTop` and to the add-back mask in `sub` — the same
-defence `powMont`'s table gather already used and `k256/src/field.zig` cites by
-commit hash. Isolated by measurement:
+- **`L < 16` (`fixed_min_limbs`), or no asm (`asm_core.supported` false, gate off):** the portable CIOS. Squaring is the
+  dedicated portable `montSqrCios` from `L >= 8` (`sqr_min_limbs`: the SOS square carries a fixed per-op overhead that
+  cancels its product saving at tiny `L`), `montMulCios(a, a)` below. This is also every `L` on a non-amd64 target.
+- **`L >= 16`, asm active, default unrolled build:** the comptime-unrolled asm kernels: the 8-row block kernels when
+  `L % 8 == 0`, the fixed-`L` kernels otherwise (next two sections).
+- **`L >= 16`, asm active, `-Dmontint-asm-unroll=false`:** the one looped runtime-`n` kernel
+  (`asm_core.montMul`/`montSqr`).
 
-| variant | `small` | `portable` | `asmcore` |
-|---|---|---|---|
-| original select-between-buffers, no barrier | 7 | 5 | 0 |
-| two-pass masked form, no barrier | 7 | 5 | 0 |
-| original select-between-buffers **+ barrier** | 0 | 0 | 0 |
-| two-pass masked form **+ barrier** (shipped) | **0** | **0** | **0** |
+`asm_min_limbs` (= 32) is the cutoff of the earlier runtime-`n` dispatch; it is still pinned by value and `dispatchesToAsm`
+is derived from `fixed_min_limbs`. Every kernel is correct at every `L` (the differentials cover `n ∈ {1, 2, 3, 4, 5, 8,
+16, 17, 32, 33, 64}` for the runtime-`n` core): the cutoffs are a speed dispatch, not a correctness bound.
 
-So the barrier is the load-bearing half and the two-pass rewrite is neither
-necessary nor sufficient. The two-pass form ships anyway because it drops the
-second `Elem` scratch buffer off the stack and makes the function structurally
-identical to the sibling asm core — but the SPEC should not claim it as the fix,
-because it is not.
+### Fixed-`L` kernels
 
-**The measurement has teeth** (positive controls, each reverted and `cmp`-verified
-byte-identical afterwards):
+`Modint` knows `L` at comptime, so `asm_core.montMulFixed(L, …)` and `asm_core.montSqrFixed(L, …)` spell every row out at
+comptime (one `mulx / adcx mem / adox / mov` per limb product, CF for the accumulator words, OF for the previous high
+half) and keep only the public outer loop in asm. The runtime-`n` core carries loop and OF/CF-fold bookkeeping that
+loses to the portable CIOS below 2048 bits; the fixed kernels do not. They serve `L >= 16` that is not a multiple of 8
+(multiples of 8 take the block kernels below): `montMul` → `montMulFixed`; `montSqr` → `montSqrFixed` (SOS: `L(L−1)/2`
+unrolled cross products, one doubling+diagonal pass, `L` REDC rows in an asm loop) up to
+`asm_core.sqr_fixed_max_limbs` (32, a code-size bound: the cross phase is ~2·L² instructions), `montMulFixed(a, a)`
+above it. The asm text is generated with a linear comptime buffer (`AsmText`). The runtime-`n` core stays compiled,
+benched and differentially tested; only the `-Dmontint-asm-unroll=false` build reaches it. Differential: `kat_test.zig`
+"fixed-L asm kernels (mul, sqr) == portable CIOS" at L = 2, 8, 16, 24, 32, 48, 64 with short-top-limb moduli and the
+`0`/`1`/`m−1` operands. ctgrind: no row's size dispatches to the fixed kernels (the rows are L = 4, 8, 16, 32, which
+take the portable or block path); the `portable` target is `Modint(512)` so the portable bodies stay measured.
 
-| injected defect | effect |
-|---|---|
-| `if (a[j] == 0) continue;` in `montMulCios`'s inner loop | `small` 7 → 27, `portable` 5 → 69, 20 new contexts at the mutated line |
-| `if (digit != 0)` around `powMont`'s window multiply | `portable` 5 → 6 and **`asmcore` 0 → 1**, at the mutated line |
-| `asm_core.condSub`'s masked pass 2 → `if (under == 1) return;` | **`asmcore` 0 → 5**, at `asm_core.zig:491`, reached from both `montMulAmd64` and `montSqrAmd64` — which also proves the taint really propagates *through* the inline-asm Montgomery blocks |
-| **after the fix:** `condSubTop` restored to the old select-between-buffers form | `small` 0 → **6**, `portable` 0 → **5**, at `condSubTop` — the defect class is still detectable and the barrier is what removed it (the 7th `small` context stays away because `sub` is separately fixed, which is also how the 7 splits 6 + 1) |
-| **2026-08-13, for the new `sub` rows:** `blackBox` dropped from `sub`'s add-back mask only | `small` 0 → **1**, `portable` 0 → **1**, `asmcore` 0 → **1**, leaf frame `sub` in all three (`montint.zig:214` at L=4; at L=16/32 `sub` is fully inlined into `runPow` and ReleaseFast reports the frame as `sub (montint.zig:0)`, with `runPow (ctgrind_harness.zig:198)` — the new call site — directly below it). This is what makes the two new zeros readable, and it is also the first evidence that `sub`'s barrier is load-bearing at L=16 and L=32 rather than only at L=4 |
+### 8-row block kernels — `L % 8 == 0`, `L >= 16`
 
-A null result worth recording: replacing `sub`'s masked add-back with an explicit
-`if (borrow == 1)` changed **nothing** (7 → 7) — because that site was already
-compiled to a branch. A control that lands on already-red code proves nothing;
-the useful controls above all land on code that is green at baseline.
+`asm_core.montMulBlock`/`montSqrBlock` (product or cross+doubling+diagonal, then a blocked REDC, then `condSubFixed`)
+serve every RSA size (L = 16/24/32 CRT halves, 32/48/64 moduli). Why: the fixed kernels add each limb product into a
+memory word, so every row re-reads and re-writes all of `t` and the next row waits on those stores.
 
-**Standing caveat.** This is a property of one compiler on one target at one
-optimize level, not a theorem. `blackBox` denies LLVM the range fact it needs
-today; nothing stops a future backend from finding another route. The value of
-the harness is that it is committed and re-runnable, so the next regression is
-caught the same way this one was.
+The block engine keeps an 8-word accumulator WINDOW in r8–r15: position `q` of the double-width accumulator always lives
+in `r(8 + q mod 8)`, so eight rows × eight columns (a "chunk") are the same text at every offset and loop. A product
+is `mulx` + `adcx` (low half, CF chain) + `adox` (high half, OF chain); a row's top word is written by its last `mulx`
+straight into the register the row's lowest (final) position just vacated, and the CF/OF folds into it cannot
+overflow (window < B^8, row product < (B−1)(B^8−1), sum < B^9). Memory words enter once per chunk (a carry chain parked
+in a stack slot between chunks) and leave once per row. Every row starts with `xor eax, eax`: flags are 0 at row
+boundaries, so it changes no value but cuts the flag dependency between rows. REDC computes `u_r` in each block's first
+chunk, parks it for the later chunks, and adds the accumulator's high half at the block end together with the previous
+block's carry-out word. Each asm block moves rsp 256 bytes down (past the red zone) for 16 scratch slots and zeroes
+the secret ones (`u`, carries) before returning. Mechanics and the overflow argument: the section comment above
+`block_min_limbs` in `asm_core.zig`.
 
-## Verification harness (teeth)
-
-1. **KAT vs an external oracle.** `mul` and `powMont` are byte-exact against
-   `kat_vectors.zig` at **256/512/2048/4096 bits**. The vectors come from an
-   INDEPENDENT external oracle — CPython's arbitrary-precision integers
-   (`(a*b)%m`, `pow(a,e,m)`), which share no code with this module and are
-   numerically identical to OpenSSL `BN_mod_mul`/`BN_mod_exp`. This is the same
-   cross-language anchoring the `vdf` audit used (`pow(5,2**T,N)`); no libcrypto
-   dev headers are installed on the audit host, so a direct C/OpenSSL generator
-   is not available, but the function computed is identical. Moduli are random
-   ODD composites (the arbitrary-odd case RSA/Paillier exercise), not primes.
-2. **asm-vs-portable differential** (the anti-self-consistency anchor). For 5000
-   random `(a,b,odd-N)` the gated core must equal `montMulCios` bit-for-bit.
-   SKIPs until `gate.asm_core_implemented` — a skip is not a green light.
-3. **Positive control — BrokenMont.** A byte-for-byte copy of CIOS with the
-   final conditional subtract removed disagrees with the oracle on random inputs
-   and only ever by exactly `m` (an unreduced residue) — proving the reduction
-   is load-bearing and the equality checks have teeth. Runs and PASSES today.
-   (The `limbs` Karatsuba anchor is likewise real teeth: it caught an odd-split
-   bug during development.)
-4. **CT smoke + `condSubTop` boundary coverage.** `kat_test.zig`'s smoke test
-   pins `(m−1)+1 == 0`, `0−1 == m−1`, `(m−1)² mod m == 1` — but it uses
-   `m = 1_000_003` inside a 128-bit element, where `a+b < 2m ≪ B^L` always, so
-   the carry word `top` is 0 in every case it covers and the `top = 1` half of
-   the borrow chain had no test. `montint.zig` now adds three that do, against a
-   FULL-WIDTH modulus where `top = 1` is reachable: the six hand-checked
-   boundaries (`v == m`, `v == m−1`, `top=1` with all-zero `v`, the range top
-   `2m−1`, all-ones limbs, all-zero limbs), a 12 800-sample differential against
-   an independent wide compare-and-subtract built from `limbs.zig` (asserting
-   both arms fire and that the postcondition `result < m` holds), and one
-   constructed pair for the borrow term that random sampling reaches with
-   probability ~2⁻⁶⁴ — a limb where `v[i] == m[i]` with a borrow coming in.
-   That last one is not decoration: dropping `s2[1]` from the outgoing borrow
-   left the KATs, both differentials, the BrokenMont control and the random
-   sweep **all green**, and is caught only by the constructed case.
-   **The same term exists in `asm_core.condSub`** — the conditional subtract is
-   written twice in the module — **and it appears twice within each copy**, once
-   in the borrow-learning pass 1 and once in the subtracting pass 2. That is
-   four instances of `s[1] | s2[1]`, and each needs an input of its own; an
-   earlier revision of this section claimed the routine was covered "in both
-   copies", which was true of pass 2 and false of `condSub`'s pass 1.
-   `asm_core.zig` now carries both, each built at `n = 32` (the smallest width
-   the dispatch routes there) against a full-width modulus — which also
-   discharges the `value < 2m` precondition for free, since `m ≥ 2^2047` makes
-   `2m ≥ B^32`:
-   - **pass 2** — the mirror image of `condSubTop`'s case.
-   - **pass 1** (added 2026-08-13, after the re-audit found it open) — the
-     consequential one, because pass 1's outgoing borrow is what `smask` is
-     computed from: dropping `s2[1]` there flips the reduction DECISION rather
-     than corrupting a value, and it is the copy on the amd64 asm path, i.e.
-     the one RSA-2048/4096, `paillier` and `vdf` take at `L >= asm_min_limbs`.
-     The pass-2 case cannot see it — in both of its inputs the subtract fires
-     under the mutation as well — so `borrow = s[1]` in pass 1 kept the whole
-     suite green (28 pass, exit 0) with every other case already committed.
-     The input that catches it is `z = m − 1`, `top = 0`: limb 0 is the only
-     source of a real `s[1]` borrow, every limb above it has `z[i] == m[i]`,
-     so the borrow reaches the top only through `s2[1]`; the mutant reports no
-     borrow, subtracts `m` from a value below it, and returns `B^n − 1`.
-
-   Measured one pass at a time, `borrow`/`b2 = s[1] | s2[1]` → `s[1]`
-   (`zig build test-montint`, judged by exit code, 2026-08-13):
-
-   | mutated | result |
-   |---|---|
-   | `condSubTop` pass 1 | exit 1, **4 red**: the boundary cases, the wide-reduction sweep, the public-loader round-trip, and `kat_test`'s CT smoke |
-   | `condSubTop` pass 2 | exit 1, **1 red**: `condSubTop: the borrow must survive a limb where v[i] == m[i]` |
-   | `condSub` pass 2 | exit 1, **1 red**: `condSub pass 2: …` |
-   | `condSub` pass 1 | exit 1, **1 red**: `condSub pass 1: …` |
-
-   Two things that table says and a summary would hide. The `v[i] == m[i]` cases
-   are strictly pass-specific: neither is red for the other pass's mutation, in
-   either copy. And the reason `condSub` pass 1 was the gap while `condSubTop`
-   pass 1 was never one is that `condSubTop` has GENERAL tests running through
-   it — the sweep, the KAT smoke, the loader round-trip all reduce through it,
-   and a wrong decision shows up as a wrong value. `asm_core.condSub` has no
-   equivalent: the asm↔portable differentials reach it only with random
-   operands, which land on an equal limb mid-borrow with probability ~2⁻⁶⁴ per
-   limb, so nothing there could ever have caught it.
-   A green boundary test still says nothing about branch structure, which is
-   exactly why item 5 exists.
-5. **ctgrind (valgrind/memcheck).** `scripts/checks/ctgrind.sh montint` — three
-   dispatch sizes (L=4 / L=16 / L=32), each as a claim row plus an untainted
-   control and a no-`-fvalgrind` trap. Rows recorded in
-   `scripts/checks/ctgrind-expected.tsv`; `zig build check-ctgrind` compiles the harness
-   so it cannot rot. This is the item that found the `condSubTop` branch, and
-   the only item that can tell whether it stays fixed — items 1–4 were all green
-   for the entire life of the defect.
-6. **The two constants the other five items are measured *through*** (added
-   2026-08-13). Both were previously pinned by nothing, and both are the kind of
-   change that moves what everything above measures while leaving every light
-   green:
-   - `asm_min_limbs = 32` decides whether a modulus takes the asm core. Raising
-     it to 64 left `test-montint` AND all 22 modules of the reverse-dependency
-     closure green — the asm↔portable differentials call `asm_core` directly,
-     not through the dispatch — and item 5's `asmcore` target would have kept
-     reporting `--check: OK` while measuring the portable path. Now asserted by
-     VALUE (`== 32`, and `sqr_min_limbs == 8`), plus what those values select:
-     `Modint(2048)`/`Modint(4096)` dispatch to asm, `Modint(1024)` (the RSA-2048
-     CRT half) and the pairing widths do not. A test phrased as
-     `L >= asm_min_limbs` would re-derive the rule and pass for any value;
-     these fail when the value moves, verified by mutating each constant.
-   - `blackBox`'s `if (@inComptime()) return x;` guard. Deleting it also left
-     all 22 modules green, because nothing in the repo evaluates montint at
-     comptime. Now exercised by a `comptime M.fromElem(…)` test that both
-     compile-fails without the guard ("unable to evaluate comptime expression")
-     and compile-fails without its own `@setEvalBranchQuota` ("evaluation
-     exceeded 1000 backwards branches"), and that checks the comptime and
-     runtime constants agree limb-for-limb. The quota is the caller's
-     responsibility, and the guard's comment now says so — the property was
-     previously stated without its precondition.
-
-## Benchmarks — the zig-vs-OpenSSL table (this host, ReleaseFast)
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-montint`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average ~4.4 from other sessions, largest spread 14.7 %): ref 0.91–1.02× OpenSSL 3.5.5, against 0.90–1.02× on Zig 0.16.0. A first 0.17 run read `exp_1536` 1.28× with 41 %/80 % spread on the two sides — load, gone on the repeat. The card carries these figures; what follows is the 0.16.0 measurement.
-
-Host: Intel i7-7920HQ (Kaby Lake, mobile). All four columns measured on the
-**same** host; numbers are noisy (turbo/thermal on a laptop) — read them as
-ratios. **`modmul` = one Montgomery multiply** `a·b·R⁻¹ mod m` with `a,b` already
-in the Montgomery domain, so it is directly comparable to OpenSSL
-`BN_mod_mul_montgomery`. **`modexp` = a full-width constant-time exponent**
-(`BN_mod_exp_mont_consttime`, *not* RSA-CRT) — no CRT normalization needed, this
-is a true full-width modexp on both sides. Columns: **portable-Zig** (`montMulCios`)
-· **asm-Zig** (the `MULX/ADX` core) · **OpenSSL 3.5.5** (libcrypto, same host) ·
-**`std.crypto.ff`** (the "before" the audit measured). The Zig columns come from
-`bench.zig` (`MONTINT_BENCH=1`); OpenSSL from a small libcrypto driver.
-
-**modmul** (ns/op — one Montgomery multiply):
-
-| bits | portable-Zig | asm-Zig | OpenSSL | std.crypto.ff |
-|---|---|---|---|---|
-| 256  | **30**  | 73   | 52    | 785    |
-| 512  | **147** | 156  | 99    | 2 032  |
-| 2048 | 2 094   | **1 463** | 1 106 | 24 591 |
-| 4096 | 9 610   | **5 467** | 3 857 | 98 194 |
-
-**modexp** (full-width, constant-time):
-
-| bits | portable-Zig | asm-Zig | OpenSSL | std.crypto.ff |
-|---|---|---|---|---|
-| 256  | **9.1 µs** | 22.1 µs | 18.8 µs | 61.3 µs |
-| 512  | **87 µs**  | 102 µs  | 38 µs   | 342 µs  |
-| 2048 | 5.15 ms | **3.43 ms** | 1.91 ms | 16.4 ms |
-| 4096 | 44.1 ms | **26.7 ms** | 14.9 ms | 125 ms  |
-
-(**bold** = the path `montMul`'s small-L dispatch actually selects at that size,
-see below.) Honest OpenSSL multiple of the **shipped** path:
-
-| size | modmul vs OpenSSL | modexp vs OpenSSL |
-|---|---|---|
-| 256  | 0.58× (montint **faster**) | 0.48× (montint **faster**) |
-| 512  | 1.48× | 2.3× |
-| 2048 | 1.32× | **1.79×** |
-| 4096 | 1.42× | **1.79×** |
-
-Everything is inside the ≤3× goal. **Bottom line:** the bulk of the win over the
-`ff` baseline is the Montgomery-resident portable CIOS on full 2^64 limbs
-(ff→portable ≈ **3.2×** at 2048-bit modexp, ≈ **12×** at 2048-bit modmul); the
-asm core adds ≈ **1.5×** on top at 2048-bit (portable 5.15 ms → asm 3.43 ms
-modexp; 2 094 ns → 1 463 ns modmul). Combined, the shipped path is **≈1.8×
-OpenSSL** full-width at 2048/4096-bit modexp and **1.3–1.4× OpenSSL** at modmul —
-and it *beats* OpenSSL outright at 256-bit — versus the **8–29×** the `ff`-backed
-modules pay today. (Prior CRT caveat retired: this table measures full-width
-`BN_mod_exp` directly, so there is no apples-to-oranges CRT normalization. For
-reference, OpenSSL rsa2048 **CRT sign** on this host is ≈ 624 µs ≈ ¼ of a
-full-width 2048 modexp, consistent with the 1.91 ms measured here.)
-
-## 256-bit regression / small-L dispatch
-
-The asm core is **not** universally faster. The `MULX/ADX` block runs
-runtime-`n` loops (trip-count setup, remainder handling, the mul→reduce register
-shuffle), whereas the portable CIOS is comptime-**fully unrolled** for the fixed
-`L` with zero loop bookkeeping. At small `L` that overhead dominates the handful
-of limb products, so the asm modmul is **~2.4× SLOWER at 256-bit** (73 vs 30 ns),
-~1.06× slower at 512-bit, ~1.07× slower at 1024-bit, and only pulls ahead at
-2048-bit (1.43× faster) and 4096-bit (1.75× faster). Measured breakeven on this
-host is **~1.5–2k bit** — higher than the canonical ~512-bit `mont5` breakeven, a
-mobile-CPU/turbo artifact.
-
-**This matters for the pairing fields.** `bn254` Fp (254-bit → L=4) and
-`bls12_381` Fp (381-bit → L=6) live exactly in the small-L regime where asm is
-2×+ slower, so they MUST NOT use it. `montMul` therefore applies a comptime
-cutoff — `asm_active AND L >= montint.asm_min_limbs` (**= 32**, i.e. ≥2048-bit) —
-routing every smaller modulus to the portable CIOS and reserving the asm core for
-the large RSA/Paillier/VDF moduli where it robustly wins. The asm core remains
-correct at every `L` (the differential exercises `n ∈ {1,2,3,4,5,8,16,17,32,33,64}`
-incl. leading-zero-limb moduli and squaring aliasing) — the cutoff is purely a
-speed dispatch, not a correctness bound.
-
-### Fixed-`L` kernels (2026-10-10) — what `L >= 16` dispatches to now
-
-`Modint` knows `L` at comptime, so `asm_core.montMulFixed(L, …)` and
-`asm_core.montSqrFixed(L, …)` spell every row out at comptime (one
-`mulx / adcx mem / adox / mov` per limb product, CF for the accumulator words,
-OF for the previous high half) and keep only the public outer loop in asm. The
-runtime-`n` core above (`montMul`/`montSqr`/`mulRow`) carried loop and
-OF/CF-fold bookkeeping that lost to the portable CIOS below 2048 bits; the
-fixed kernels do not. Dispatch (`montint.fixed_min_limbs = 16`):
-`montMul` → `montMulFixed` at `L >= 16`; `montSqr` → `montSqrFixed` (SOS:
-`L(L−1)/2` unrolled cross products, one doubling+diagonal pass, `L` REDC rows
-in an asm loop) at `16 <= L <= asm_core.sqr_fixed_max_limbs` (32, a code-size
-bound: the cross phase is ~2·L² instructions), `montMulFixed(a, a)` above it.
-Below 16 limbs nothing changed (bn254/bls12_381 Fp, 512-bit). Measured, TSC
-cycles per op on the bench host (previous best path → fixed): mul L=16 1273 →
-~930, L=24 3032 → ~1900, L=32 4064 → ~3200; square L=16 → ~850, L=24 → ~1750,
-L=32 → ~2900. Effect on `rsa` (`bench-rsa`): private op 1.9–2.4× → ~1.3–1.5×
-OpenSSL 3.5.5. Differential: `kat_test.zig` "fixed-L asm kernels (mul, sqr) ==
-portable CIOS" at L = 2, 8, 16, 24, 32, 48, 64 with short-top-limb moduli and
-the `0`/`1`/`m−1` operands. ctgrind: `asmcore` (L=32) measures them (0
-in-file); the `portable` target moved to `Modint(512)` to keep measuring the
-portable bodies; L=16 is reached through `dyn`. The asm text is generated with a
-linear comptime buffer (`AsmText`), not `++` (quadratic: it doubled the test
-build with the square kernel). The runtime-`n` core stays compiled, benched and
-differentially tested, but no `Modint` reaches it any more.
-
-### 8-row block kernels (2026-10-14) — what `L % 8 == 0`, `L >= 16` dispatches to now
-
-`asm_core.montMulBlock`/`montSqrBlock` (product or cross+doubling+diagonal, then a
-blocked REDC, then `condSubFixed`) replace the fixed kernels for every RSA size
-(L = 16/24/32 CRT halves, 32/48/64 moduli); other `L` keep the fixed kernels.
-Why: the fixed kernels add each limb product into a memory word, so every row
-re-reads and re-writes all of `t` and the next row waits on those stores — perf
-on the bench host showed ~6.6 µops per product issued at ~3 µops/cycle, and the
-dedicated square no better than 0.9 of a multiply.
-
-The block engine keeps an 8-word accumulator WINDOW in r8–r15: position `q` of
-the double-width accumulator always lives in `r(8 + q mod 8)`, so eight rows ×
-eight columns (a "chunk") are the same text at every offset and loop. A product
-is `mulx` + `adcx` (low half, CF chain) + `adox` (high half, OF chain); a row's
-top word is written by its last `mulx` straight into the register the row's
-lowest (final) position just vacated, and the CF/OF folds into it cannot
-overflow (window < B^8, row product < (B−1)(B^8−1), sum < B^9). Memory words
-enter once per chunk (a carry chain parked in a stack slot between chunks) and
-leave once per row. Every row starts with `xor eax, eax`: flags are 0 at row
-boundaries, so it changes no value but cuts the flag dependency between rows
-(−3…6 %). REDC computes `u_r` in each block's first chunk, parks it for the
-later chunks, and adds the accumulator's high half at the block end together
-with the previous block's carry-out word. Each asm block moves rsp 256 bytes
-down (past the red zone) for 16 scratch slots and zeroes the secret ones
-(`u`, carries) before returning. Mechanics and the overflow argument: the
-section comment above `block_min_limbs` in `asm_core.zig`.
-
-Three costs outside the products mattered as much (perf on the whole op first):
-- **`condSubFixed` in Zig** compiled to ~240 cycles at L = 16, a quarter of a
-  block square; now asm (borrow pass, `sbb` → keep mask, pass 2 subtracts
-  `m << c << c` with `c ∈ {0, 32}` — `shlx` leaves the flags alone, `pdep`
-  would be data-timed on AMD Zen 1/2), reading the accumulator's high half
+Three costs outside the products matter as much:
+- **`condSubFixed`** is asm (borrow pass, `sbb` → keep mask, pass 2 subtracts `m << c << c` with `c ∈ {0, 32}` —
+  `shlx` leaves the flags alone, `pdep` would be data-timed on AMD Zen 1/2), reading the accumulator's high half
   directly so no copy is made.
-- **Zig 0.16 `@memset`/copies of a few hundred bytes become calls into the
-  byte-wise `compiler_rt`** (0.16 measurement; 0.17.0's `compiler_rt.memset` is vectorised, not re-measured): zeroing the 768-byte accumulator of an L = 48
-  multiply cost 735 cycles. `zeroWords` (vector stores in asm) zeroes and wipes
-  it; an asm store with a memory clobber is never elided, so it is the wipe too.
-- **`powMont`'s gather** kept its accumulator in memory (a load and a store per
-  word per table entry); explicit `@Vector(4, u64)` lanes stay in registers.
+- **Zeroing and wiping.** `@memset` of a few hundred bytes can lower to a call into the byte-wise `compiler_rt`;
+  `zeroWords` (vector stores in asm) zeroes and wipes the accumulator, and an asm store with a memory clobber is
+  never elided, so it is the wipe too.
+- **`powMont`'s gather** keeps its accumulator in registers with explicit `@Vector(4, u64)` lanes.
 
-Measured, core cycles per operation (perf `cycles:u`, ReleaseFast, bench host;
-fixed kernels → block kernels): square L = 16 958 → 750, L = 32 3325 → 2523,
-L = 48 → 5712, L = 64 → 9514 (was a multiply, no dedicated square above 32);
-multiply L = 16 1092 → 874, L = 32 3775 → 3066, L = 64 → 12111. What is left is
-the front end: `mulx`/`adcx`/`adox` are 6 bytes each and the hot code exceeds the
-µop cache, so legacy decode (16 B/cycle) bounds a product at ~1.1 cycles.
+**Operand contract** (relied on by `DynModint`'s Horner reducer): every Montgomery multiply here — portable CIOS, fixed
+and block kernels — is exact for `a < R`, `b < m` (not only `a, b < m`): the result before the final subtract is
+`< a·b/R + m < 2m`. `reduceLimbs`/`reduceBytesBE` feed whole `L`-limb digits through `montMul(digit, R² mod m)` on that
+basis.
 
-**Operand contract** (relied on by `DynModint`'s Horner reducer since
-2026-10-14): every Montgomery multiply here — portable CIOS, fixed and block
-kernels — is exact for `a < R`, `b < m` (not only `a, b < m`): the result before
-the final subtract is `< a·b/R + m < 2m`. `reduceLimbs`/`reduceBytesBE` feed
-whole `L`-limb digits through `montMul(digit, R² mod m)` on that basis.
+### Almost-Montgomery ladder — what `powMont` runs at `L % 8 == 0`, `L >= 16`
 
-### Almost-Montgomery ladder (2026-11-15) — what `powMont` runs at `L % 8 == 0`, `L >= 16`
+`powMont` runs `asm_core.montMulBlockLazy`/`montSqrBlockLazy` **in place** (`Modint.lazy_ladder`; the default unrolled
+build only, not `-Dmontint-asm-unroll=false`).
 
-Profile first (bench host i7-7920HQ, `bench-montint exp_1024`, perf on both sides):
-
-- **IPC is the same on both sides:** ours 2.52 instructions/cycle (3.0 µops issued/cycle, 97 % from
-  legacy decode), OpenSSL 3.5.5 2.58 (3.2 µops/cycle, 79 % from the µop cache), with about the same
-  instructions per op. `exp_1024` is at parity (~1.0×).
-- **No port is saturated:** p0/p1/p5/p6 each run 56–64 % on both sides. Front-end starvation is
-  10 % of issue slots for us and 6 % for OpenSSL.
-- **OpenSSL's hot loop on this CPU is `mulx`/`adcx`/`adox`** (perf samples mapped to libcrypto
-  addresses and disassembled), not `rsaz_avx2`: its `rsaz_avx2_eligible` declines on a BMI2+ADX
-  CPU. That closes the inference recorded in the rsa SPEC 2026-10-14.
-- **The `u = w·n0inv` chain is not what limits the REDC.** The REDC block's first chunk (it computes
-  `u` row by row) costs the same per product as the later chunks (they reload the parked `u`):
-  25.3 % vs 25.4 % of `powMont` cycles for 64 products each. The REDC is ~50 % of the time because
-  it is 256 of the ~392 products of an L=16 square.
-
-What is left outside the products: the conditional subtract (~4.6 %), the copies of each returned
-`Elem` (vector loads right after `condSub`'s scalar stores), and the gather.
-
-The ladder now runs `asm_core.montMulBlockLazy`/`montSqrBlockLazy` **in place** (`Modint.lazy_ladder`;
-the default unrolled build only, not `-Dmontint-asm-unroll=false`).
-
-- **The bound.** With both operands `< R`, `(a·b + U·m)/R < R + m`. So one subtract of `m`, decided
-  by the REDC's carry word alone (`top ∈ {0, 1}`), leaves the result `< R`.
-- **What it drops.** The borrow pass and its keep-mask: the subtract is one `sub/sbb` pass with
-  `m << c << c`, `c = (1 − top)·32`, computed arithmetically (no branch, flags untouched).
-- **Canonical output.** Intermediates may sit at or above `m`. The ladder ends in `fromMontgomery`,
-  a full multiply by 1 (contract `a < R`, `b < m`), so `powMont`'s result is canonical as before.
+- **The bound.** With both operands `< R`, `(a·b + U·m)/R < R + m`. So one subtract of `m`, decided by the REDC's carry
+  word alone (`top ∈ {0, 1}`), leaves the result `< R`.
+- **What it drops.** The borrow pass and its keep-mask: the subtract is one `sub/sbb` pass with `m << c << c`,
+  `c = (1 − top)·32`, computed arithmetically (no branch, flags untouched).
+- **Canonical output.** Intermediates may sit at or above `m`. The ladder ends in `fromMontgomery`, a full multiply by 1
+  (contract `a < R`, `b < m`), so `powMont`'s result is canonical.
 - **Tests.**
-  - `kat_test.zig` "almost-Montgomery block kernels == exact REDC model" (L = 16/24/32/48/64)
-    pins the value AND the top decision against a word-serial `u128` model, including aliasing. The
-    generator must hit the top word and results `≥ m`.
-  - "powMont (almost-Montgomery ladder) == canonical ladder" compares against a plain
-    square-and-multiply over `montSqr`/`montMul`, plus `powMontBits`.
-
-Measured (standalone ReleaseFast harness looping `Modint(bits).powMont`, base `4115cf211` vs new,
-pinned, interleaved, min of 10 runs, loaded host):
-
-| bits (L) | instructions | cycles (min of 10) |
-|---|--:|--:|
-| 1024 (16) | −2.0 % | −2.8 % |
-| 2048 (32) | −1.2 % | −1.8 % |
-| 4096 (64) | −1.1 % | −2.9 % |
-
-The products themselves are untouched. A faster scalar kernel would have to raise issue efficiency
-(µop-cache residency of a ~5–9 KiB hot body, or fewer µops per product). OpenSSL, which does run
-from the µop cache, gets no more from it, so the remaining scalar headroom looks small. An AVX2
-radix-2^29 kernel would compete against a MULX path that is already at parity, not against
-OpenSSL's AVX2 code.
+  - `kat_test.zig` "almost-Montgomery block kernels == exact REDC model" (L = 16/24/32/48/64) pins the value AND the top
+    decision against a word-serial `u128` model, including aliasing. The generator must hit the top word and results
+    `≥ m`.
+  - "powMont (almost-Montgomery ladder) == canonical ladder" compares against a plain square-and-multiply over
+    `montSqr`/`montMul`, plus `powMontBits`.
 
 ## Threats / caveats
 
-- **amd64-only fast path.** The `MULX/ADX` core lands only on x86-64 with the ADX
-  + BMI2 feature flags; every other target (aarch64/armv7/mips/…) runs the
-  portable CIOS forever, and even on amd64 the small-L dispatch (see above) keeps
-  moduli `< 2048-bit` — including the pairing fields — on the portable path.
-- **Best-effort CT, like `ff` — measured, not asserted.** The contract is
-  structural, and a sufficiently clever optimizer *did* in fact reintroduce a
-  branch: until 2026-08-13 the portable `condSubTop` and `sub` compiled to
-  secret-dependent `jne`s, which the hand-read disassembly missed because it was
-  of `asm_core.montMul` — code an `L < asm_min_limbs` modulus never reaches. For
-  that function the old reading still holds: every conditional branch is on the
-  PUBLIC limb count `n` (asm loop trip counts, the outer limb loop, the
-  `condSub` loop counters + its unrolled-remainder `n`-parity test) and its final
-  subtract really is a `setb`+mask masked select. The portable path is now fixed
-  and all three dispatch sizes measure zero in-file contexts — see
-  "MEASURED 2026-08-13" under the constant-time contract above for the tables,
-  the controls and what did *not* fix it. The sentence "no timing audit tool has
-  been run" that used to close this bullet was the reason the defect survived,
-  and it is now `scripts/checks/ctgrind.sh montint --check` instead.
-- **The byte loaders are outside the CT contract.** `fromBytesBE` /
-  `elementFromBytesBE` / `elemFromBytesBE` branch on byte VALUES (the zero-byte
-  skip), so an encoding's zero-byte positions are observable. No secret reaches
-  them today — `vdf` is the only consumer and passes public values, while `rsa`
-  and `paillier` load through a branchless `beToLimbs` + `fromElem`, which for
-  `rsa` is load-bearing because it runs on the secret CRT primes `p` and `q`. A
-  caller loading secret material must do the same. See "Constant-time contract"
-  above; this is stated, not measured, and deliberately not tainted in the
-  harness.
-- **No base blinding / fault countermeasures.** This is a modular-arithmetic
-  primitive, not a signing scheme; blinding (rsa F2) and CRT fault-checks
-  (rsa F3) are the consumer's responsibility, layered on top.
-- **Dedicated squaring — DONE, portable AND asm.** The portable constant-time
-  dedicated Montgomery square (`montSqrCios`, SOS: the symmetric `a[i]·a[j]`
-  off-diagonal products computed once and doubled, plus the diagonal squares,
-  then a Montgomery reduce) backs `montSqr`/`powMont` for
-  `sqr_min_limbs ≤ L < asm_min_limbs` **and** all `L` on non-amd64 targets
-  (~1.15–1.23× vs the portable multiply at L=8…64 on this host; wins rsa-2048
-  CRT sign at L=16 and every large-modulus op on non-amd64/OpenWRT). The
-  dedicated **asm** square (`asm_core.montSqr`) now serves `L ≥ asm_min_limbs`
-  on amd64: same SOS phase order as the portable oracle, with both O(L²) inner
-  loops — the off-diagonal product rows and the word-serial REDC rows — run on
-  `asm_core.mulRow`, the `MULX/ADCX/ADOX` dual-carry-chain accumulate row
-  (verbatim the labels-1–4 half of `ciosIter`). The classic `×2`+diagonal carry
-  pitfall is structurally absent: the doubling is a separate funnel-shift pass
-  over the COMPLETED cross-product sum (outside any carry chain), and the
-  diagonal add + per-row tail carries are the same Zig `u128` arithmetic as the
-  oracle. Anchored by a three-way differential (asm sqr == `montSqrCios` ==
-  asm `montMul(a,a)`, thousands of random trials at L∈{1,2,3,4,5,8,16,17,32,
-  33,34,35,48,64} — every rem class of the reduction row — plus carry-saturation
-  edges, Debug AND ReleaseFast) and an asm-rows positive control (a square with
-  the doubling omitted goes RED). Measured (this host, ReleaseFast, same-run
-  A/B): asm sqr beats asm `montMul(a,a)` ~1.10–1.13× at L=32 and ~1.12–1.15× at
-  L=64 → modexp-2048 ≈ 3.23 ms (was ≈ 3.5), modexp-4096 ≈ 22.3–24.4 ms (was
-  ≈ 26.5) ⇒ ≈ **1.7×**/**1.5–1.6×** OpenSSL (from 1.8×/1.8×); rsa-4096 CRT sign
-  ≈ −10 % (CRT halves are L=32), rsa-2048 CRT sign unchanged (halves are L=16,
-  already on the portable square).
-- **Deferred:** the large-size SOS+Karatsuba
-  modmul path, and tuning the small-L cutoffs per-µarch (`asm_min_limbs`/
-  `sqr_min_limbs` are single-host measurements). (The dynamic-limb-count
-  modulus once listed here shipped 2026-10-02 as `DynModint`; `Modint` itself
-  still fixes `L` by `max_bits`.) Consumer note: `rsa`/`paillier`/
-  `threshold_ecdsa` and vdf's Montgomery-resident `prove`/`verify` all call
-  `montint`'s `montSqr`/`powMont`, so they inherit this change automatically (no
-  consumer edit) — the win lands wherever the dispatch picks a dedicated square
-  (asm at L≥32 on amd64, portable at L=8..31 on amd64 and at all L on
-  non-amd64). vdf's `eval` loop included: it is Montgomery-resident on
-  `montint` (`group.montSquare` → `Modint.montSqr`, `vdf/src/vdf.zig` `eval`,
-  verified 2026-10-05) — an earlier version of this bullet said it still
-  called `std.crypto.ff`, which is no longer true.
+- **amd64-only fast path.** The `MULX/ADX` kernels land only on x86-64 with the ADX + BMI2 feature flags; every other
+  target (aarch64/armv7/mips/…) runs the portable CIOS forever, and even on amd64 the small-L dispatch (see above) keeps
+  moduli below 1024 bits — including the pairing fields — on the portable path.
+- **Best-effort CT, like `ff` — measured, not asserted.** The contract is structural, and a sufficiently clever
+  optimizer can reintroduce a branch (the portable `condSubTop` and `sub` did, before the `blackBox` barrier):
+  `scripts/checks/ctgrind.sh montint --check` measures every dispatch size (see *ctgrind measurement*). For the
+  hand-written `asm_core.montMul` the reading by hand holds: every conditional branch is on the PUBLIC limb count `n`
+  (asm loop trip counts, the outer limb loop, the `condSub` loop counters + its unrolled-remainder `n`-parity test) and
+  its final subtract really is a `setb`+mask masked select.
+- **The byte loaders are outside the CT contract.** `fromBytesBE` / `elementFromBytesBE` / `elemFromBytesBE` branch on
+  byte VALUES (the zero-byte skip), so an encoding's zero-byte positions are observable. No secret reaches them in
+  this repository — `vdf` passes public values, while `rsa` and `paillier` load through a branchless `beToLimbs` +
+  `fromElem`, which for `rsa` is load-bearing because it runs on the secret CRT primes `p` and `q`. A caller loading
+  secret material must do the same. See "Constant-time contract" above; this is stated, not measured, and deliberately
+  not tainted in the harness.
+- **No base blinding / fault countermeasures.** This is a modular-arithmetic primitive, not a signing scheme; blinding
+  and CRT fault-checks are the consumer's responsibility, layered on top.
+- **Dedicated squaring, portable and asm.** The portable constant-time dedicated Montgomery square (`montSqrCios`, SOS:
+  the symmetric `a[i]·a[j]` off-diagonal products computed once and doubled, plus the diagonal squares, then a
+  Montgomery reduce) backs `montSqr`/`powMont` for `sqr_min_limbs ≤ L < fixed_min_limbs` on amd64 and for every
+  `L >= sqr_min_limbs` where no asm kernel applies (non-amd64 targets). The dedicated **asm** square
+  (`asm_core.montSqr`, the runtime-`n` core, reached by the `-Dmontint-asm-unroll=false` build; the unrolled build uses
+  `montSqrFixed`/`montSqrBlock`) has the same SOS phase order as the portable oracle, with both O(L²) inner loops —
+  the off-diagonal product rows and the word-serial REDC rows — run on `asm_core.mulRow`, the `MULX/ADCX/ADOX`
+  dual-carry-chain accumulate row. The classic `×2`+diagonal carry pitfall is structurally absent: the doubling is a
+  separate funnel-shift pass over the COMPLETED cross-product sum (outside any carry chain), and the diagonal add +
+  per-row tail carries are the same Zig `u128` arithmetic as the oracle. Anchored by a three-way differential (asm sqr
+  == `montSqrCios` == asm `montMul(a,a)`, at every remainder class of the reduction row plus carry-saturation edges,
+  Debug AND ReleaseFast) and an asm-rows positive control (a square with the doubling omitted goes RED).
+- **Known limits (no-panic sweep).** `DynModint.powPublic` walks every bit of `e_be`: a caller that hands it an
+  attacker-sized exponent pays linear time, so bound the exponent at the call site (`rsa`, `paillier` and
+  `threshold_ecdsa` already do). `asm_core.mulRow` takes raw pointers, so its trip counts cannot be checked; it is
+  internal to the asm squaring and must not be called from outside. `nt.gcd`/`lcm`/`oddPart` take operands `≥ 1`
+  (a zero operand gives garbage; every caller passes `p − 1 ≥ 2`); `nt.divExact` refuses `b = 0` and a non-divisor
+  with `error.NotDivisible`.
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-10-18 at the analytics consumer's request:
+Consumer build options (CONVENTIONS §4.2):
 
 | option | values | default | `-Dprofile=small` |
 |---|---|---|---|
@@ -833,64 +503,50 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18 at the analytics co
 - **What it buys:** the per-slot unrolled kernels. Size probe `tools/sizeprobe.zig` (`DynModint(8192)`, one secret `pow`;
   ReleaseSmall, native ADX/BMI2 x86_64, stripped): **319 288 → 173 104 B**; rsa's probe under `.small` (with its 4096-bit cap)
   319 128 → 233 400 B.
-- **What it costs** (`MONTINT_BENCH=1`, ReleaseFast, `powMont`, this host 2026-10-18): modexp 1024-bit 291 → 592 µs (2.0×),
+- **What it costs** (`MONTINT_BENCH=1`, ReleaseFast, `powMont`, the bench host): modexp 1024-bit 291 → 592 µs (2.0×),
   2048-bit 1.98 → 3.54 ms (1.8×), 4096-bit 14.9 → 23.5 ms (1.6×). An RSA-2048 signature (two 1024-bit CRT halves) is ~2× slower.
   Still 3.9–5.4× faster than `std.crypto.ff`.
 
+## What is deliberately not done
+
+- **A non-unrolled generic path for all large `DynModint` slots by default.** Rejected: re-proving constant time for no
+  default gain. The looped kernel is offered instead as the opt-in `montint-asm-unroll=false` / `-Dprofile=small`
+  (see *Build options*); the default keeps the unrolled kernels because the grade is measured on them.
+- **`Modint` `isOdd` / `compare`.** Not offered: they need the normal-domain value and no consumer wants them on the
+  fixed-width type; `DynModint` has them (constant-time `isOdd`/`isOne`/`one`/`compare`).
+- **Little-endian / primitive-integer helpers** (the `std.crypto.ff` `fromPrimitive` shape). Out of scope per the card:
+  elements are `[L]u64` little-endian limbs, and the byte loaders are big-endian.
+- **Base blinding and CRT fault countermeasures** are the consumer's (see Threats/caveats).
+
+## Open
+
+- **ctgrind rows for the fixed-`L` kernels.** No `ctgrind-expected.tsv` row dispatches to `montMulFixed`/`montSqrFixed`
+  (the rows' sizes take the portable or block path); a `Modint` with `L >= 16`, `L % 8 != 0` is covered by the
+  differentials but not by a timing measurement.
+- **The off-x86 `asm_core` wrappers** `@panic` (checked) instead of `unreachable`; that is not testable on an x86 host
+  and needs the aarch64 lane.
+
 ## Backlog / deferred
 
-- **No-panic sweep GT (2026-10-30), left open on purpose.** (1) `DynModint.powPublic` walks every bit of `e_be`: a caller
-  that hands it an attacker-sized exponent pays linear time; bound the exponent at the call site (rsa/paillier/threshold_ecdsa
-  already do). (2) `asm_core.mulRow` takes raw pointers, so its trip counts cannot be checked; it is internal to the
-  asm squaring and must not be called from outside. (3) The `unreachable`→`@panic` change of the off-x86 `asm_core` wrappers is
-  not testable on an x86 host.
-
-- **Self-hosted Debug does not compile `zeroWords` (found 2026-10-22 from the web-server consumer's test redesign).** The
-  self-hosted backend rejects `asm_core.zig:1185`'s generated store (`unknown size: '0(%%rdi)'`: AT&T
-  needs the `q` suffix the generated text leaves out), so a consumer's `-fno-llvm` Debug build fails,
-  although `asm_core.zig:252/407` take care to support that backend. Fix the generator (`movq`), and
-  add a self-hosted compile to the module's checks. p256 has the same gap (its SPEC backlog).
-
-- **`DynModint` code size — slot policy (DEFAULT) + build option `montint-asm-unroll`** (the analytics consumer request 2026-10-17; decisions
-  of the user 2026-10-17). Every `DynModint` operation dispatches on the slot through `inline while (s <= max_limbs) : (s += step)`
-  with `step = min_limbs = 4`, so `DynModint(8192)` instantiates 32 `Modint(64·L)` slots, and on an ADX/BMI2 CPU each slot's
-  `montMulFixed`/`montMulBlock` is straight-line asm generated per `L` (`ciosFixedBody(L)`). **Measured** (http sizeprobe =
-  HTTPS client, ReleaseSafe, musl): baseline x86_64 `DynModint(8192)` 0.27 MB of `.text`; native CPU **5.37 MB** (`pow` 2.65 MB,
-  `powPublic` 1.12 MB, `horner` 0.77 MB, `mul` 0.52 MB); with rsa's `.small` cap (4096) 1.77 MB. ssh's `GexMod` is the same type.
-  Plan:
-  1. ✅ 2026-10-18 **Default (approved):** slots every 4 limbs up to 1024 bits, then only the sizes that occur — 1536, 2048, 3072,
-     4096, 6144, 8192 (6144 for ssh GEX) — and the type's top slot (`DynModint.slots`; `DynModint(8192)` 32 → 10 slots). Common
-     keys keep an exact slot (the same `Modint(64·L)` instantiation as before, so the same code); an odd size runs one slot up
-     (e.g. a 1100-bit modulus at 1536 bits). **Measured** (rsa sizeprobe, ReleaseSmall, native ADX/BMI2 x86_64, stripped):
-     default 863 144 → 427 536 B, `-Dprofile=small` 436 768 → 319 128 B — the new DEFAULT is smaller than the old `.small`.
-  2. ✅ 2026-10-18 — see § Build options. Was: **Knob `montint-asm-unroll`** (CONVENTIONS §4.2): default = straight-line asm (as graded); `.small` = the looped engine above
-     N limbs. Expected to remove most of what is left on ADX CPUs; costs speed — measure the bench delta and state it.
-  Rejected: a non-unrolled generic path for all large slots by default (re-proving constant time for no default gain).
-- ~~**Review 2026-10-03 (independent, read-only) — no wrong value found; five LOW items**~~ ✅ 2026-10-06 (L1–L4 each with a test that failed on the old code; L5 by a ReleaseFast probe, a panic being untestable in-process):
-  (L1) `isProbablePrime(rounds = 0)` now returns `false` (no evidence is not "prime"); (L2) witnesses are
-  near-uniform over `[2, m − 2]` (`bits + 64` random bits reduced mod `m`, trivial ones masked to `2`), so
-  the `4^−rounds` bound rsa/paillier quote is the theorem's; (L3) `inverse` refuses `a ≥ m` in its verdict
-  (CT, folded in) — a non-zero limb above the slot used to be dropped and the inverse of the truncated value
-  returned; (L4) **BREAKING** `nt.divExact` returns `error{NotDivisible}![n]u64`, refusing `b = 0` and a
-  non-divisor (checked `q·b = a` over `2n` limbs; `paillier`, the one caller, maps it to
-  `error.InvalidPrimes`); (L5) `DynModint.toBytesBE` (short `out`) and `Modint.toBytesBE` (`out.len ≠
-  encoded_bytes`) `@panic` in every optimize mode — the old `std.debug.assert` was `unreachable` in
-  ReleaseFast, and a probe there crashed with SIGSEGV instead of truncating. Still documented-only:
-  `nt.gcd`/`lcm`/`oddPart` take `≥ 1` (a zero operand gives garbage; every caller passes `p − 1 ≥ 2`).
-
-- **DONE 2026-10-06 — ctgrind re-pinned after the L1–L5 fix** (`scripts/checks/ctgrind.sh --check`, whole table): context counts unchanged for every montint row (`small`/`portable`/`asmcore` 0, `field` 1, `dyn` 2) and for `threshold_ecdsa prime` (3); only the source digests moved. `paillier keygen` 294 → 314 in-file, old-vs-new stack diff: +2 `nt.divExact`'s new verdict (passes on every valid key), and the witness draw's 16 `loadBE` contexts replaced by 34 in `reduceBytesBE`/`ByteDigits.at`/`horner`/memcpy — the same two documented classes (the length `bits` the harness derives from the tainted factor's top byte, and the CSPRNG keyed by the secret factor), just more sites over a 64-bit-longer string. `threshold_ecdsa` `share`/`nonce`/`betaprime`/`fac` printed results changed (their seeded Paillier key generation consumes witness randomness differently). Re-pinned: source digests, `paillier keygen` bound `<=314` (with the cause in `ctgrind-expected.tsv`), and the `threshold_ecdsa` output pins.
-- ~~**Variable-time `powPublic` (public exponent)**~~ ✅ 2026-10-02 as `DynModint.powPublic` (rsa's verify uses it).
-- ~~**`reduce` of a wider value, plus `eql`/`isZero`/`isOdd` on elements**~~ ✅ 2026-10-14: `DynModint.isOdd`/`isOne`/`one`/`compare` (CT) and `Modint.eql`/`isZero`/`neg`; `Modint` `isOdd`/`compare` deliberately not offered (they need the normal-domain value; no consumer). Original text (survey 2026-09-30): ✅ for comptime prime moduli via `Field` and for run-time moduli via `DynModint` (2026-10-02); still open (re-survey 2026-10-05): CT `isOdd` and a CT element `compare` (ff has `compare`, bigmod `IsOdd`; today a user writes them on the limbs), and the fixed-width `Modint` has none of `eql`/`isZero`/`neg`. Effort S. Fits §2.
-- ~~**Modular inversion (constant-time, safegcd-style)**~~ ✅ 2026-10-03 `DynModint.inverse` (divsteps) and `inverseOfModulus` (any `n`, even included); `threshold_ecdsa`'s Πmod `d = Ñ⁻¹ mod φ` moved onto it (ctgrind `pimod` 540 → 4). `Field.inv` (Fermat) covers comptime primes.
-- ~~**Batched divsteps**~~ ✅ 2026-10-14: `safegcd.zig` (moved from `rsa`, 59 steps per transition matrix on signed-62 vectors) is now `DynModint.inverse`'s engine, `a·inv ≡ 1` verified; the one-step form survives only as the private test oracle `inverseDivsteps`.
-- ~~**Square root modulo a prime**~~ ✅ 2026-10-14 `DynModint.sqrt(a, out) bool` (see "Square root" above). Original text: Tonelli-Shanks with the `p ≡ 3 mod 4` shortcut; crypto-bigint and OpenSSL `BN_mod_sqrt` had it; a user wants it for point decompression over a run-time curve or Rabin-style schemes.
-- **L=16 REDC + `condSubInto` (speed beyond P2) — DEFERRED by the owner 2026-10-18** until the http TLS server exists and is
-  measured: the REDC rows are 54 % of `pow` at L=16 (latency-bound `u = w·n0inv` chain) and `condSubInto` 7.7 %; estimate 10–20 % on an RSA-2048 signature, unmeasured. No grade effect (P2 already).
-- **Baillie-PSW (strong Lucas) primality** — missing; `isProbablePrime` is Miller-Rabin only, which FIPS 186-5 accepts with enough rounds *(inferred, standard not re-read)*, so this strengthens rather than unblocks. Needs a CT Jacobi symbol. Effort M. Fits §2.
-- ~~**A run-time-modulus `Field` counterpart for secrets**~~ ✅ 2026-10-02 `DynModint`; `rsa`, `paillier` and `threshold_ecdsa`'s zkproofs moved onto it (their private slot copies are gone); it also carries the `std.crypto.ff` bridge (`elemFromFf`/`elemToFf`/`fromFf`) all three use.
-- ~~**Run-time-sized modulus (limb count chosen at run time)**~~ ✅ 2026-10-02 `DynModint` (slots of 4 limbs; a small modulus no longer runs at the width of the largest).
-- ~~**`DynModint.reduceLimbs` costs two Montgomery multiplies per 64-bit digit**~~ ✅ 2026-10-14: whole `L`-limb digits (the operand contract `a < R, b < m` is now stated in "8-row block kernels"). Original text (2026-10-02): a 2L-limb input reduces in 4L multiplies, ~5 % of a CRT half's modexp. A chunked form (`L` limbs at a time, `R²` per chunk) needs `montMul` to accept one operand `≥ m`, which the portable CIOS does (`< R` suffices) but the asm core's contract does not state. Effort S once the asm contract is checked. Fits §2.
-- **aarch64 asm core (`UMULH`/`ADCS`)** (survey 2026-09-30): arm64 servers and phones run the portable CIOS only (~1.5× slower than amd64 asm at 2048 bits, by the module's own ff→portable→asm ratios). Effort M-L, untestable without arm64 CI. Fits §2.
+- **Self-hosted Debug does not compile `zeroWords`** (found from a consumer's test redesign). The self-hosted backend
+  rejects `asm_core.zig`'s `zeroWords` generated store (`unknown size: '0(%%rdi)'`: AT&T needs the `q` suffix the generated
+  text leaves out), so a consumer's `-fno-llvm` Debug build fails, although `asm_core.zig` takes care to support that
+  backend elsewhere. Fix the generator (`movq`) and add a self-hosted compile to the module's checks. p256 has the same gap
+  (its SPEC backlog).
+- **L=16 REDC + `condSubInto` (speed beyond P2)** — deferred by the owner until the http TLS server exists and is measured:
+  the REDC rows are 54 % of `pow` at L=16 (latency-bound `u = w·n0inv` chain) and `condSubInto` 7.7 %; estimate 10–20 %
+  on an RSA-2048 signature, unmeasured. No grade effect (P2 already).
+- **Baillie-PSW (strong Lucas) primality** — missing; `isProbablePrime` is Miller-Rabin only, which FIPS 186-5 accepts
+  with enough rounds *(inferred, standard not re-read)*, so this strengthens rather than unblocks. Needs a CT Jacobi
+  symbol. Effort M. Fits §2.
+- **aarch64 asm core (`UMULH`/`ADCS`)** (survey 2026-09-30): arm64 servers and phones run the portable CIOS only (~1.5×
+  slower than amd64 asm at 2048 bits, by the module's own ff→portable→asm ratios). Effort M-L, untestable without arm64
+  CI. Fits §2.
+- **Large-size SOS + Karatsuba modmul path.** The Karatsuba/schoolbook full-product pair in `limbs.zig`
+  (`karatsuba_threshold = 16`, descriptive) is the building block for a separate full multiply followed by a Montgomery
+  reduce at large sizes; it is not wired into the modmul, and the tuned crossover is a bench-time question.
+- **Per-µarch tuning of the small-L cutoffs** (`asm_min_limbs`, `sqr_min_limbs`, `fixed_min_limbs` are single-host
+  measurements).
 
 ## Provenance
 

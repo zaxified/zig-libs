@@ -17,23 +17,28 @@ portable CIOS fallback on every other architecture. Inline asm in Zig is still
 native Zig — no libc, no C dependency — so the collection's zero-C invariant
 holds.
 
-## Status: IMPLEMENTED (amd64 asm core live)
 
-The **portable path is real, constant-time, and byte-exact** against an
-independent CPython-bignum oracle at 256/512/2048/4096 bits — it is the
-correctness oracle. The irreducible amd64 asm core (`asm_core.montMul`, the
-`MULX/ADCX/ADOX` dual-carry-chain CIOS) is **implemented and switched on**
-(`gate.asm_core_implemented = true`): on x86-64+ADX+BMI2 the asm-vs-portable
-differential harness runs live (5000 random 2048-bit cases + an `n`-sweep across
-`{1,2,3,4,5,8,16,17,32,33,64}` limbs incl. leading-zero-limb moduli and squaring
-aliasing, all bit-exact), and `montMul` dispatches to it for large moduli.
+## What is in the module
 
-**Small-L dispatch:** the asm core is ~2.4× slower than the comptime-unrolled
-portable CIOS at 256-bit and only wins from ~2048-bit up (`SPEC.md`
-"256-bit regression"), so `montMul` routes to it only when
-`L >= asm_min_limbs` (= 32, ≥2048-bit). Every smaller modulus — **including the
-`bn254`/`bls12_381` pairing fields (L=4/6)** — stays on the faster portable path.
-See `SPEC.md` for the full zig-vs-OpenSSL table.
+- `Modint(max_bits)` — the fixed-width Montgomery type used in the example below: comptime width, normal- and
+  Montgomery-domain elements, `mul`, `add`/`sub`/`neg`, `eql`/`isZero`, constant-time `powMont` and `powMontBits`.
+- `Field(p)` — GF(p) for a comptime prime, Montgomery-resident, with Fermat `inv`.
+- `DynModint(max_bits)` — an odd modulus whose value and limb count are chosen at run time: constant-time
+  `pow`/`powBits`, variable-time `powPublic`, `inverse`/`inverseOfModulus`, `sqrt` modulo a prime, `divExact`,
+  Miller-Rabin `isProbablePrime`, element predicates and `compare`.
+- `nt` — constant-time `gcd`/`lcm`/`oddPart`/`divExact` on limb arrays; `safegcd` — the batched divsteps engine behind
+  `DynModint.inverse`.
+- `asm_core`, `limbs`, `gate` — the asm kernels, the full-width limb helpers and the dispatch switch.
+
+`SPEC.md` has the design of each.
+
+## Dispatch
+
+The portable CIOS runs on every target and is the correctness oracle: it is byte-exact against CPython bignum KATs at
+256/512/2048/4096 bits. On x86-64 with ADX and BMI2 the `MULX/ADCX/ADOX` kernels take over from `L >= 16` limbs
+(1024 bits) in the default build; below that — including the `bn254`/`bls12_381` pairing fields (L=4/6) — the
+portable path is faster and stays. `-Dmontint-asm-unroll=false` (or `-Dprofile=small`) swaps the per-`L` kernels for
+one looped kernel: far less code, slower modexp. See `SPEC.md` "Small-L dispatch" for the kernels and the figures.
 
 ## Usage
 
@@ -71,24 +76,24 @@ the modulus must be odd and ≥ 3. Elements are `[L]u64` little-endian; the doma
 ## Verify
 
 ```
-zig build test-montint --summary all                      # Debug
+scripts/modtest montint                                  # Debug tests
 zig build test-montint -Doptimize=ReleaseFast --summary all
 MONTINT_BENCH=1 zig build test-montint -Doptimize=ReleaseFast  # opt-in ns/op bench
+scripts/checks/ctgrind.sh montint --check                # constant-time measurement
 ```
 
-Green (Debug and ReleaseFast on amd64+ADX+BMI2). The one skip is the
-opt-in bench; the asm-vs-portable differential now runs. The suite includes the
-byte-exact modmul+modexp KATs at 256/512/2048/4096 bits, the live asm-vs-portable
-differential, the BrokenMont positive control (a dropped conditional-subtract,
-flagged RED), the Karatsuba==schoolbook mutual anchor, and the CT-boundary
-checks.
+The suite includes the byte-exact modmul+modexp KATs at 256/512/2048/4096 bits, the asm-vs-portable differentials, the
+BrokenMont positive control (a dropped conditional-subtract, flagged RED), the Karatsuba==schoolbook mutual anchor, and
+the CT-boundary checks; the one skip is the opt-in bench. Speed against OpenSSL: the card's `**Performance:**` line in
+`SPEC.md` is authoritative. The win over `std.crypto.ff` is mostly the full-limb Montgomery-resident portable CIOS; the
+asm kernels add the rest from 1024 bits up.
 
-Measured this host (Kaby Lake, ReleaseFast; full table in `SPEC.md`), shipped
-path vs OpenSSL 3.5.5 full-width: **2048-bit modmul 1.32× OpenSSL** (1.46 µs asm
-vs 1.11 µs), **2048-bit modexp 1.79× OpenSSL** (3.43 ms asm vs 1.91 ms), and
-montint *beats* OpenSSL at 256-bit — versus the 8–29× the `std.crypto.ff`-backed
-modules pay. The win is mostly the full-limb Montgomery-resident portable CIOS
-(ff→portable ~3.2× at 2048 modexp); the asm core adds ~1.5× on top.
+## Not provided
+
+No Baillie-PSW primality test (Miller-Rabin only), no aarch64 asm core (arm64 runs the portable path), no
+constant-time byte loaders (see the note under Usage), no blinding or fault countermeasures (this is a primitive, not a
+signing scheme). See `SPEC.md` § What is deliberately not done and § Backlog / deferred.
+
 
 Provenance: clean-room from public algorithm descriptions. The portable CIOS
 Montgomery multiply is clean-room from Koç, Acar & Kaliski, "Analyzing and
