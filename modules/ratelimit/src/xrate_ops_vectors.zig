@@ -5,7 +5,7 @@
 //!
 //! * Driver:   `modules/ratelimit/tools/xrate/ops.go`
 //! * Command:  `cd modules/ratelimit/tools/xrate && go run . ops > ../../src/xrate_ops_vectors.zig`
-//! * Captured: 2026-10-11, Go 1.26 linux/amd64.
+//! * Captured:, Go 1.26 linux/amd64.
 //!
 //! Each case runs ONE limiter through a seeded random sequence of operations
 //! (times only move forward; several ops may share an instant), or -- `seed`
@@ -22,8 +22,7 @@
 //!
 //! ## Deliberately not captured: a second CancelAt of the same reservation
 //!
-//! x/time/rate v0.15.0 restores the tokens AGAIN on a second `CancelAt` (seen
-//! 2026-10-11: a reservation of 3 cancelled twice at 800 ms took the balance
+//! x/time/rate v0.15.0 restores the tokens AGAIN on a second `CancelAt` (seen: a reservation of 3 cancelled twice at 800 ms took the balance
 //! 2.1 -> 7.4 -> 10), so a holder that cancels twice admits more than the
 //! limit. `TokenBucket.cancelAt` zeroes the reservation and makes the second
 //! call a no-op. The random cases happen to repeat cancels only where both

@@ -332,7 +332,7 @@ fn configError(rate_per_s: ?f64, burst: ?u32) ?[]const u8 {
 
 /// The caller's `cfg` checked in every build mode, as `Limiter.init` checks
 /// its options: an `assert` here was UB in ReleaseFast on a config the
-/// caller passes (no-panic sweep 2026-10-28, RL-1).
+/// caller passes (no-panic sweep, RL-1).
 fn checkConfig(cfg: TokenBucket.Config) void {
     if (configError(cfg.rate_per_s, cfg.burst)) |msg| @panic(msg);
 }
@@ -376,7 +376,7 @@ pub const KeyFn = struct {
     /// `KeyFn` is shared across the server's per-connection threads, and a
     /// slice of a stack local does not outlive the callback. A key borrowed
     /// from the request (a header value, `ctx.req.path`) ignores `buf`.
-    /// Reported by a consumer of the sibling `aaa-gate`, 2026-09-17.
+    /// Reported by a consumer of the sibling `aaa-gate`.
     keyFor: *const fn (?*anyopaque, *router.Ctx, *[peer_key_len_max]u8) []const u8,
 };
 
@@ -392,7 +392,7 @@ pub const KeySource = union(enum) {
     /// something that rejects invalid values first (an auth middleware
     /// ahead of this one): taken as it is, the header is chosen by the
     /// client, and a new value per request is a new full bucket — a bypass,
-    /// and a way to flush other keys out of the table (review 2026-10-24).
+    /// and a way to flush other keys out of the table.
     header: []const u8,
     /// Client IP from forwarding headers only when the socket peer is a
     /// trusted proxy (`clientIp`); a peer outside `TrustedProxies` is the
@@ -624,7 +624,7 @@ pub const Limiter = struct {
 
     /// Panics on an invalid `options` in every build mode: a NaN or zero
     /// rate would otherwise deny or admit everything silently in a release
-    /// build (review 2026-10-24).
+    /// build.
     pub fn init(gpa: Allocator, options: Options) Limiter {
         if (optionsError(options)) |msg| @panic(msg);
         return .{ .gpa = gpa, .options = options, .idle_ns = idleNs(options) };
@@ -781,8 +781,7 @@ pub const Limiter = struct {
         const cfg = l.config();
         // A key may expire only once its bucket would be full anyway: a TTL
         // shorter than the refill time (5/hour with a 10 min TTL) would hand
-        // an idle key a fresh burst early -- over-admission (review
-        // 2026-10-24). So the effective TTL is at least `refillNs`.
+        // an idle key a fresh burst early -- over-admission. So the effective TTL is at least `refillNs`.
         const ttl_ns = l.idle_ns;
         if (l.map.getKeyAdapted(key, HashedKey{ .h = h })) |e| {
             // Idle-expired keys start over with a full bucket (the bucket
@@ -793,7 +792,7 @@ pub const Limiter = struct {
                 e.bucket = .full(cfg, now_ns);
             // Second chance instead of an LRU relink: a hit writes one flag
             // in the entry it already updates, not three other entries'
-            // links (exact LRU cost ~20 % of a keyed decision, 2026-10-24).
+            // links (exact LRU cost ~20 % of a keyed decision).
             e.referenced = true;
             return &e.bucket;
         }
@@ -903,8 +902,7 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
-    // A hand-built `router.Middleware` without `state` (no-panic sweep
-    // 2026-10-28, RL-2): `.?` was UB in ReleaseFast.
+    // A hand-built `router.Middleware` without `state` (no-panic sweep, RL-2): `.?` was UB in ReleaseFast.
     const l: *Limiter = @ptrCast(@alignCast(state orelse
         @panic("ratelimit: the middleware needs state = the Limiter (use Limiter.middleware())")));
     var peer_buf: [peer_key_len_max]u8 = undefined; // outlives the allow call; the store copies
@@ -960,7 +958,7 @@ fn keyOf(l: *const Limiter, ctx: *router.Ctx, peer_buf: *[peer_key_len_max]u8) [
 
 /// The bucket key for a client address: parsed, IPv4-mapped unified with
 /// IPv4, and an IPv6 address cut to its first `v6_bits` (so one host's
-/// /64 is one bucket, not 2^64 -- review 2026-10-24), rendered canonically
+/// /64 is one bucket, not 2^64 -- review), rendered canonically
 /// into `buf` (`::1` and `0:0:0:0:0:0:0:1` are one key). Text that is not
 /// an address (a forwarded value naming something else) stays the key
 /// as it is. `text` may point into `buf`: it is parsed before `buf` is
@@ -1153,7 +1151,7 @@ test "TokenBucket: replays captured x/time/rate AllowN/ReserveN/CancelAt/SetLimi
     // balance within a tolerance (see the AllowN trace test for why), the
     // reservation delay within 1 ns (x/time/rate truncates a float product
     // to whole nanoseconds; an ULP on either side can move it by one).
-    // Negative controls 2026-10-11, each red here: (a) `cancelAt` without
+    // Negative controls, each red here: (a) `cancelAt` without
     // the later-reservation correction (restore all `n`); (b) `allowNAt` not
     // recording `last_event_ns`; (c) `advanceAt` capping only when time
     // moved (a lowered burst then leaves the balance above it).
@@ -1336,7 +1334,7 @@ test "Limiter: TTL resets idle keys and sweeps their memory" {
     _ = l.allow("b");
 
     tc.advanceMs(1500); // past the configured TTL, not the refill time
-    // Negative control 2026-10-24: with the bare `ttl_ms` the drained key
+    // Negative control: with the bare `ttl_ms` the drained key
     // reset to a full bucket here (a fresh burst every TTL, review M1).
     try testing.expect(!l.allow("a").allowed);
     try testing.expect(l.allow("c").allowed);
@@ -1735,7 +1733,7 @@ test "Limiter: a pending reservation keeps its key from idle reset" {
         try testing.expect(b.reserveNAt(l.config(), clk.ns, 1, std.math.maxInt(u64)).ok);
     }
     clk.advanceMs(1500 * std.time.ms_per_s); // past TTL and refill time, before the reservation is due
-    // Negative control 2026-10-11: with `updated_ns` instead of
+    // Negative control: with `updated_ns` instead of
     // `idleSince()` the key reset to a full bucket here and admitted.
     try testing.expect(!l.allow("k").allowed);
 }
@@ -2249,7 +2247,7 @@ fn hHello(ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll("hello");
 }
 
-// ── tests: whole-module mutation run 2026-11-11 (survivors) ─────────────────
+// ── tests: whole-module mutation run (survivors) ─────────────────
 
 test "TokenBucket.full stamps its instant and starts with no event" {
     const cfg: TokenBucket.Config = .{ .rate_per_s = 1, .burst = 3 };

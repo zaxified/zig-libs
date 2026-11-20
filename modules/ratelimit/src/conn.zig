@@ -70,7 +70,7 @@ const TokenBucket = rl.TokenBucket;
 const Decision = rl.Decision;
 const Clock = rl.Clock;
 
-/// Owner's ruling (2026-08-10): max 4 new connections per second per user.
+/// Owner's ruling: max 4 new connections per second per user.
 pub const default_conn_rate_per_s: f64 = 4;
 /// Burst allowance. A browser opening several tabs, or an h2 client racing
 /// happy-eyeballs sockets, legitimately establishes a handful of connections
@@ -166,7 +166,7 @@ pub const ConnectionLimiter = struct {
     const key_len_max = 17;
 
     pub fn init(gpa: Allocator, options: Options) Allocator.Error!ConnectionLimiter {
-        // Checked in every build mode, as `Limiter.init` (review 2026-10-24).
+        // Checked in every build mode, as `Limiter.init`.
         if (optionsError(options)) |msg| @panic(msg);
 
         const buckets = try gpa.alloc(TokenBucket, options.users.len);
@@ -226,7 +226,7 @@ pub const ConnectionLimiter = struct {
     /// `Options.on_connect` with `Options.on_connect_ctx = &limiter`.
     /// Rejection closes the socket without a byte written or a task spawned.
     pub fn onConnect(ctx: ?*anyopaque, peer: std.Io.net.IpAddress) http.Server.ConnDecision {
-        // `on_connect_ctx` left null (no-panic sweep 2026-10-28, RL-2): `.?`
+        // `on_connect_ctx` left null (no-panic sweep, RL-2): `.?`
         // was UB in ReleaseFast.
         const cl: *ConnectionLimiter = @ptrCast(@alignCast(ctx orelse
             @panic("ratelimit: onConnect needs Options.on_connect_ctx = &the ConnectionLimiter")));
@@ -670,7 +670,7 @@ test "ConnectionLimiter: unmapping never merges two distinct peers" {
     try testing.expectEqual(@as(usize, 2), cl.unlistedKeyCount()); // .7 and .8, not 4
 
     // A v4 customer configured in the v4-mapped v6 spelling is canonicalised
-    // like the peers are (audit 2026-10-19, S8-3): `::ffff:0:0/96` is the
+    // like the peers are(S8-3): `::ffff:0:0/96` is the
     // whole v4 space and `::ffff:192.0.2.0/120` is `192.0.2.0/24`.
     const v6_spelled = [_]User{
         .{ .name = "wrong", .prefixes = &.{pfx("::ffff:192.0.2.0/120")}, .burst = 2 },
@@ -724,7 +724,7 @@ test "ConnectionLimiter: concurrent accepts admit exactly the user's burst" {
     try testing.expectEqual(@as(usize, 0), cl.unlistedKeyCount());
 }
 
-// The shipped defaults are the owner's ruling of 2026-08-10, not a suggestion:
+// The shipped defaults are the owner's ruling of, not a suggestion:
 // max 4 new connections per second per user, with a burst of 8 so a browser
 // opening several tabs is not refused. Every other test here configures its
 // own rate, so without this one the *values* are unpinned — the mechanism
@@ -742,7 +742,7 @@ test "the shipped connection defaults are the values the owner ruled" {
     try testing.expect(!cl.allowPeer(peer).allowed);
 }
 
-// ── tests: whole-module mutation run 2026-11-11 (survivors) ─────────────────
+// ── tests: whole-module mutation run (survivors) ─────────────────
 
 test "optionsError: a /128 unlisted v6 key is valid" {
     try testing.expect(optionsError(.{ .unlisted_v6_bits = 128 }) == null);

@@ -17,7 +17,7 @@
 //!               zig-libs keeps zero external dependencies and no `go` reference
 //!               under `modules/`).
 //! * Command:    `go run . > modules/ratelimit/src/xrate_vectors.zig`
-//! * Captured:   2026-08-09, Go 1.26.0 linux/amd64.
+//! * Captured:, Go 1.26.0 linux/amd64.
 //!
 //! Every number below is a reference output, obtained through x/time/rate's
 //! public API only:
