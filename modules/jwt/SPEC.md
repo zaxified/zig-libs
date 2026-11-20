@@ -18,7 +18,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./NOTICE.
 
 ## Compared with
 
@@ -26,14 +26,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [golang-jwt/jwt](https://github.com/golang-jwt/jwt) — **reference** | Go | MIT | 9.2k | v5.3.1 (2026-01-28) | Sign and verify for HS/RS/PS/ES(256/384/512)/EdDSA, custom claims, validation options. This module signs and verifies every one of them (RS/PS through the in-repo `rsa` module since 2026-10-13; PSS with the RFC 7518 §3.5 salt length, where golang-jwt's verifier auto-detects any), plus ML-DSA. |
+| [golang-jwt/jwt](https://github.com/golang-jwt/jwt) — **reference** | Go | MIT | 9.2k | v5.3.1 (2026-01-28) | Sign and verify for HS/RS/PS/ES(256/384/512)/EdDSA, custom claims, validation options. This module signs and verifies every one of them (RS/PS through the in-repo `rsa` module; PSS with the RFC 7518 §3.5 salt length, where golang-jwt's verifier auto-detects any), plus ML-DSA. |
 | [panva/jose](https://github.com/panva/jose) | TypeScript | MIT | 7.8k | v6.2.12 (2026-09-05) | Full JOSE (JWS, JWE, JWK, JWKS with remote fetch and cache, JWT); every RFC 7518 alg. JWE is a separate sibling module here (`jwe`). *(inferred from README; not exercised)* |
 | [Keats/jsonwebtoken](https://github.com/Keats/jsonwebtoken) — **fastest** | Rust | MIT | 2.1k | push 2026-09-24 (no releases via GH API) | Top Rust crate: encode/decode, RS/PS/ES/EdDSA, JWK sets. No OIDC discovery or resource-server middleware *(inferred)*. Fastest measured (9.3.1 over ring 0.17.14, `tools/rust_fast_bench`, 2026-10-25): ahead of golang-jwt on HS256, ES256 verify, EdDSA verify, RS/PS; no ES512 in 9.x. |
 | [lestrrat-go/jwx](https://github.com/lestrrat-go/jwx) | Go | MIT | 2.4k | v4.5.0 (2026-09-08) | Whole JOSE family plus a JWKS auto-refresh cache. *(inferred)* |
 | [go-jose/go-jose](https://github.com/go-jose/go-jose) | Go | Apache-2.0 | 536 | v4.1.5 (2026-09-03) | JWS/JWE/JWK toolkit (source not read: not MIT). |
 | [leroycep/zig-jwt](https://github.com/leroycep/zig-jwt) / [deatil/zig-jwt](https://github.com/deatil/zig-jwt) / [NikoMalik/jwt-zig](https://github.com/NikoMalik/jwt-zig) | Zig | MIT / Apache-2.0 / MIT | 42 / 21 / 5 | push 2025-08 / 2026-09-29 / 2026-07 | Zig ecosystem: small sign/verify libraries; none found with JWKS by `kid`, OIDC discovery, a resource-server guard or the OAuth2 PKCE helpers. *(inferred from repo descriptions; sources not read)* |
 
-**Where we are ahead:** the only pure-Zig JWT with JWKS-by-`kid`, OIDC discovery + cached `Provider`, a `router` Bearer middleware and framework-agnostic `Guard`, the OAuth2/OIDC relying-party helpers (PKCE, state, nonce, id-token checks), a verified-token cache and RFC 9964 ML-DSA (published RFC vectors in tests); safe defaults (mandatory audience/issuer, plain-HTTP key source refused, `alg` fixed by the key type when signing). · **Where we are behind:** DPoP (RFC 9449), which golang-jwt does not offer either (→ Backlog). Closed 2026-10-13: PS256/384/512 verification, RS/PS signing (RFC 7520 §4.1/§4.2 vectors; golang-jwt interop in `bench-jwt`), OAuth2 error responses (RFC 6749 §5.2, §4.1.2.1).
+**Where we are ahead:** the only pure-Zig JWT with JWKS-by-`kid`, OIDC discovery + cached `Provider`, a `router` Bearer middleware and framework-agnostic `Guard`, the OAuth2/OIDC relying-party helpers (PKCE, state, nonce, id-token checks), a verified-token cache and RFC 9964 ML-DSA (published RFC vectors in tests); safe defaults (mandatory audience/issuer, plain-HTTP key source refused, `alg` fixed by the key type when signing). · **Where we are behind:** DPoP (RFC 9449), which golang-jwt does not offer either (→ Backlog).
+
 
 ## Design & invariants
 
@@ -44,18 +45,17 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   and have no `http` dep in the hot path; only `Provider`/`HttpFetcher` reach the network, behind a
   `Fetcher` seam. P7 also does no I/O — it builds requests and parses responses; the caller's HTTP
   client sends the request (same seam philosophy as P5's `Fetcher`).
-- **No bespoke crypto:** `std.base64.url_safe_no_pad`, `std.json`, `std.crypto` (HMAC and
-  Ed25519 verification from `std.crypto`) — plus the **in-repo `p384` module for ES384** since
-  2026-10-13 (std's P-384 signed 4.2× and verified 2.8× slower than golang-jwt; p384's nonces are
-  RFC 6979 exactly, so ES384 signature bytes differ from std's — same key, both valid), plus the **in-repo `rsa` module for
-  RS\*/PS\*** since 2026-10-13 (verify through `rsa.VerifyKey`, sign through
-  `signPkcs1v15`/`signPss`; std's PSS verify asserts on a modulus of 8k+1 bits, so RS\* moved
-  off `std.crypto.Certificate.rsa` with it), the **`ct25519` module's comb for EdDSA signing**
-  (`R = r·B`; std's algorithm otherwise, byte-identical output, tested against std), plus the **in-repo `p256` module for ES256** since `3403d47`, which is
-  byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256` and carries that module's own KAT /
-  differential evidence, and the **in-repo `p521` module for ES512** since 2026-10-10 (std has
-  no P-521; CAVP/Wycheproof/OpenSSL-anchored there). Nothing is hand-rolled here. Modeled after
-  the JOSE/OAuth2 RFCs (7515/7519/7517/7518/8037/8017/8725, OIDC Discovery/RFC 8414, RFC 6750, RFC
+- **No bespoke crypto:** `std.base64.url_safe_no_pad`, `std.json`, `std.crypto` (Ed25519 verification and
+  the HMAC construction) -- plus the in-repo modules: `p384` for ES384 (std's P-384 signed 4.2x and
+  verified 2.8x slower than golang-jwt; p384's nonces are RFC 6979 exactly, so ES384 signature bytes
+  differ from std's -- same key, both valid), `rsa` for RS\*/PS\* (verify through `rsa.VerifyKey`, sign
+  through `signPkcs1v15`/`signPss`; std's PSS verify asserts on a modulus of 8k+1 bits), `ct25519`'s
+  comb for EdDSA signing (`R = r*B`; std's algorithm otherwise, byte-identical output, tested against
+  std), `p256` for ES256 (byte-exact to `std.crypto.sign.ecdsa.EcdsaP256Sha256`, carrying that module's
+  own KAT and differential evidence), `p521` for ES512 (std has no P-521; CAVP/Wycheproof/OpenSSL-anchored
+  there), and `sha2` for HS256/384/512 (std's `Hmac` construction over the `sha2` module's compression,
+  whose CRYPTOGAMS assembly is faster than std's without SHA-NI). Nothing is hand-rolled here. Modeled
+  after the JOSE/OAuth2 RFCs (7515/7519/7517/7518/8037/8017/8725, OIDC Discovery/RFC 8414, RFC 6750, RFC
   6749, RFC 7636); see NOTICE for full citation list.
 - **Concurrency:** reentrant except `Provider` (one mutable key cache) — the caller injects a lock
   (`ResourceServer.lock`) under a threaded server; the clock is injected too (testable expiry).
@@ -69,21 +69,43 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   for parsing, signature verification and `iss`/`aud`/`exp`/`nbf` — the OIDC-specific `azp`/`nonce`
   checks are the only new logic, layered on top of the returned `ParsedToken`.
 
-- **Token issuance** (2026-09-28, requested by the web-server consumer): `encode(gpa, claims, key, opts)` /
-  `encodeJson(gpa, claims_json, key, opts)` in `encode.zig` build the compact JWS. The key is a
-  `SigningKey` whose variant fixes `alg` (RFC 8725 §2.1: never the caller's word alone; `none` is
-  unrepresentable); `SigningKey.verificationKey()` gives the matching `Key`. HMAC secrets shorter
-  than the hash output are refused (RFC 7518 §3.2 MUST); `encodeJson` refuses a payload that is
-  not one JSON object. Signatures are deterministic (ECDSA per RFC 6979, Ed25519, ML-DSA with an
-  empty context per RFC 9964). Every algorithm is tested by a round trip through
-  `parseAndVerify`. **Secrets and the dead stack** (2026-10-09): the `SigningKey` key-pair variants
-  are `*const` (borrowed, never copied), signing runs in a `burn.run` body per algorithm family and
-  the HMAC compare of `verify` for HS256/384/512 does too (`burn.zig`); `stackprobe_test.zig`
-  (ReleaseFast) asserts 0 residue of the keys, nonces and keyed HMAC state, with NEG/POS controls.
-
-- **Verified-token cache** (2026-09-28, requested by the web-server consumer): `VerifiedCache(Value)` in
-  `cache.zig`, opt-in. See § "Verified-token cache" below for the argument that a hit answers
-  exactly what verifying again would.
+- **Token issuance:** `encode(gpa, claims, key, opts)` / `encodeJson(gpa, claims_json, key, opts)` in
+  `encode.zig` build the compact JWS. The key is a `SigningKey` whose variant fixes `alg` (RFC 8725
+  §2.1: never the caller's word alone; `none` is unrepresentable); `SigningKey.verificationKey()` gives
+  the matching `Key`. HMAC secrets shorter than the hash output are refused (RFC 7518 §3.2 MUST);
+  `encodeJson` refuses a payload that is not one JSON object. Signatures are deterministic (ECDSA per
+  RFC 6979, Ed25519, ML-DSA with an empty context per RFC 9964). The returned slice is exactly the
+  allocation (a shrink in place, else a copy into an exact block, `OutOfMemory` if the copy fails), so
+  `gpa.free(token)` is valid on every allocator. Every algorithm is tested by a round trip through
+  `parseAndVerify`. RS\*/PS\* signing keys come from `PrivateKey.rsaSigningKey` (PS\* carry the CSPRNG for
+  the salt). **Secrets and the dead stack:** the `SigningKey` key-pair variants are `*const` (borrowed,
+  never copied), signing runs in a `burn.run` body per algorithm family and the HMAC compare of `verify`
+  for HS256/384/512 does too (`burn.zig`); `stackprobe_test.zig` (ReleaseFast) asserts 0 residue of the
+  keys, nonces and keyed HMAC state, with negative and positive controls.
+- **Keys from PEM, PKCS#8 and SPKI** go through the shared `keycodec` module (one codec for the
+  repository): `PrivateKey.fromPem` (PKCS#8, SEC1, PKCS#1: EC P-256/384/521, Ed25519, RSA >= 2048,
+  ML-DSA `both`/`seed`; an expanded-only ML-DSA key is refused, a `both` key's halves must agree),
+  `PrivateKey.signingKey` / `rsaSigningKey` (RS\*/PS\*), `Key.fromPem` (SPKI, PKCS#1 `RSA PUBLIC KEY`) and
+  `Key.fromSpki`. Anchored on OpenSSL keys (`tools/pem_vectors.py`): a token signed with the loaded key
+  verifies under OpenSSL's public key. Not read: certificates (golang-jwt's `ParseRSAPublicKeyFromPEM`
+  takes one; here `x509.spkiOf` + `Key.fromSpki`) and encrypted keys (keycodec's own Backlog).
+- **Provider interval clock.** `Provider` measures its JWKS fetch intervals on `now_s` by default; a
+  `now_s` before the recorded fetch/attempt counts as the interval having passed, so a backward clock
+  step triggers one re-fetch that re-bases the marks instead of freezing both refreshes. With
+  `ProviderOptions.interval_clock` (opt-in, default null, keeping the no-hidden-clock rule) the
+  intervals run on that clock, e.g. `Clock.boot` (CLOCK_BOOTTIME on Linux), so a forward wall-clock step
+  does not expire the TTL early; claims always stay on `now_s`.
+- **OAuth2 error responses (RFC 6749 §5.2, §4.1.2.1).** `parseOAuthError` (token-endpoint body),
+  `parseAuthorizationError` (the redirect query, decoded with `http.body.urlencoded`) and the
+  status-aware `parseTokenEndpointResponse` (200 -> `TokenResponse`, 400/401 -> `OAuthError`, else
+  `UnexpectedStatus`); `error`/`error_description`/`error_uri` are held to the RFC's character sets.
+- **`Guard` over a static `JwkSet`.** `Guard.Options.jwks` (exactly one of `provider`/`jwks`, else
+  `error.InvalidKeySource`) runs the same Bearer extraction, `at+jwt` check, scope policy and RFC 6750
+  challenges over a caller-held set; nothing is fetched, so an unknown `kid` is refused at once. A
+  static set has no issuer to default to, so `claim_opts.issuer = .provider` fails `init` with
+  `error.IssuerNotConfigured`.
+- **Verified-token cache:** `VerifiedCache(Value)` in `cache.zig`, opt-in. See § "Verified-token cache"
+  below for the argument that a hit answers exactly what verifying again would.
 
 ## Threat model / out of scope
 
@@ -137,25 +159,32 @@ This is the security core; the defenses are the point:
 - **RFC 9068 `at+jwt` typ (optional):** `Guard.require_at_jwt_typ` enforces the access-token JOSE
   header `typ` = `at+jwt` (or `application/at+jwt`, case-insensitive). Off by default — many issuers
   still omit it — so it is a conscious opt-in, not a silent gate.
-- **Mandatory audience/issuer — confused deputy (RFC 8725 §3.9), FIXED 2026-07-09:** `iss` and
+- **Mandatory audience/issuer -- confused deputy (RFC 8725 §3.9):** `iss` and
   `aud` validation are safe-by-default and cannot be skipped by omission. `Options.issuer`/
-  `Options.audience` are typed unions (`IssuerPolicy`/`AudiencePolicy`) with **no default** —
-  the caller must write `.{ .required = "…" }` (must match) or the explicit, greppable `.any`
+  `Options.audience` are typed unions (`IssuerPolicy`/`AudiencePolicy`) with **no default** --
+  the caller must write `.{ .required = "..." }` (must match) or the explicit, greppable `.any`
   (conscious opt-out). `Provider.ClaimOptions.audience` is likewise mandatory; its `.issuer`
   defaults to `.provider` (enforce the discovered/configured issuer) and a jwks_uri-only provider
   with no configured issuer **fails closed** (`IssuerNotConfigured`) rather than silently skipping.
-  Previously a same-IdP token minted for a *different* service was accepted unless the operator
-  opted in — the classic confused-deputy hole.
-- **Symmetric key from a fetched JWKS (RFC 8725 §3.5 / §2.1), FIXED 2026-07-09:** a network-fetched
-  JWKS (`fetchJwks`/`Provider`) **refuses** `kty:"oct"` keys (`JwkSkipReason.oct_from_network`) — a
+  Without it a same-IdP token minted for a *different* service would be accepted: the classic
+  confused-deputy hole.
+- **Symmetric key from a fetched JWKS (RFC 8725 §3.5 / §2.1):** a network-fetched
+  JWKS (`fetchJwks`/`Provider`) **refuses** `kty:"oct"` keys (`JwkSkipReason.oct_from_network`) -- a
   published JWKS is attacker-readable, so a symmetric key there would let anyone forge HS\* tokens.
   Symmetric keys are trusted only from a locally-configured `parseJwks` set.
-- **Out of scope:** encryption (JWE); `x5c` chain validation; revocation
-  lists / token introspection (RFC 7662); `c_hash`/`at_hash` (implicit/hybrid-flow-only checks —
-  P7 covers the authorization *code* flow, where they do not apply). Provider trust rests on TLS to
-  the issuer (via the `http` client / `Fetcher`); P7's `TokenRequest`/`buildAuthorizationUrl` carry
-  no transport of their own, so the same TLS-to-issuer assumption applies to whatever HTTP client
-  the caller sends them with.
+- **A plain-HTTP key source is refused:** `discover`, `fetchJwks` and `Provider` refuse an `http://` (or
+  scheme-less) issuer, discovered `jwks_uri` or configured `jwks_uri` with `error.InsecureKeySource`,
+  before any fetch -- anyone on a plain-HTTP path could serve their own keys and mint any token.
+  `KeySourceOptions.allow_plain_http` / `ProviderOptions.allow_plain_http` opt out (tests, a loopback
+  issuer), through `discoverWith`/`fetchJwksWith`; the three-argument calls keep their signatures.
+- **HMAC key floor on the verify side:** `verify` (so every entry point, `oct` JWKs included) refuses
+  an HS256/384/512 secret shorter than the hash output with `InvalidKey`, the floor `encode` has
+  (RFC 7518 §3.2 "MUST"). golang-jwt and jsonwebtoken accept any length; an empty secret would make every
+  attacker-computable MAC valid. Pinned by `audit_test.zig`.
+- **Trust assumption:** Provider trust rests on TLS to the issuer (via the `http` client / `Fetcher`);
+  P7's `TokenRequest`/`buildAuthorizationUrl` carry no transport of their own, so the same
+  TLS-to-issuer assumption applies to whatever HTTP client the caller sends them with. What is out of
+  scope is in *What is deliberately not done*.
 - **PKCE is mandatory in the P7 API surface, not optional-by-omission:** every
   `AuthorizationRequest`/`TokenRequestParams` field for `code_challenge`/`code_verifier` is
   required (no default) — there is no code path that builds a code-flow request without PKCE. S256
@@ -189,7 +218,7 @@ This is the security core; the defenses are the point:
 ## Verified-token cache
 
 `VerifiedCache(Value)` remembers a token that verified until its `exp`, so a repeat skips the
-signature. Measured motive (the web-server consumer audit): ES256 through `p256` ~1.6 k verifications/s per core
+signature. Motive: ES256 through `p256` ~1.6 k verifications/s per core
 under load (~4 k quiet), RS256 slower through std's bignum — a JWT API is capped at a few
 thousand requests per second per core by verification alone, while a client sends the same
 access token on every request.
@@ -208,10 +237,9 @@ fixes the first two and every part of the third except the clock, and re-evaluat
   single tag offline, and a request whose bytes differ from a cached token's hits only if the two
   tags collide — 2^-128 per request, and each attempt is an online request that learns one bit
   (hit or miss). That is the sense in which a hit implies these exact bytes verified before.
-  *Why keyed and not SHA-256/BLAKE3 (measured, table below):* on this host (no SHA extensions)
-  hashing a 682-byte token costs SHA-256 ≈ 3.1–4.2 µs and BLAKE3 ≈ 2.3–3.0 µs against SipHash-2-4
-  ≈ 0.37–0.51 µs, and the digest is almost the whole hit path: the first version of this cache
-  used BLAKE3 and its ES256 hit measured 2.6–3.5 µs, the keyed one 0.70 µs. The price is one
+  *Why keyed and not SHA-256/BLAKE3 (measured once):* on a host without SHA extensions hashing a
+  682-byte token costs SHA-256 about 3-4 µs and BLAKE3 about 2.3-3.0 µs against SipHash-2-4 about
+  0.4-0.5 µs, and the digest is almost the whole hit path. The price is one
   assumption: **the key must stay secret.** An attacker who can read the process's memory (the
   key and a stored tag) could search offline for a byte string with the same tag — SipHash is a
   PRF, not collision-resistant under a known key — and a hit never parses, so such a string
@@ -227,7 +255,7 @@ fixes the first two and every part of the third except the clock, and re-evaluat
   A set with `id == 0` (assembled by hand) is never cached. A set is immutable after parse (its
   `keys` are `[]const`), which is what makes the id a sound stand-in for its contents.
 - **Time claims re-checked on every hit** by `checkTimes`, the same function `validateClaims`
-  runs (it was factored out for this), against the caller's `now_s`. `validateClaims` checks
+  runs, against the caller's `now_s`. `validateClaims` checks
   `exp`, `nbf`, `iat` before `iss`/`aud`, and `iss`/`aud` are fixed by the key, so the first
   failure a hit reports is the one a fresh verify would report. An `Expired` entry is evicted;
   a `NotYetValid` one (a clock stepped back) stays, since it may pass again.
@@ -252,8 +280,8 @@ hits for cached principals until their `exp`. (2) Timing: a hit is faster, so so
 already present a token can tell whether it was recently verified; learning that needs the token
 itself. (3) Residency: each cached token's tag and derived `Value` stay in memory until evicted or
 `deinit` (both wipe); the token itself is never stored. (4) Staleness of the key *source* stays
-the caller's: a remote set too old to use must still be refused before the lookup (the web-server consumer's
-`Remote.acquire` returns null), exactly as before. None of these changes an accept/refuse
+the caller's: a remote set too old to use must still be refused before the lookup (a consumer's key-source
+wrapper returns null), exactly as before. None of these changes an accept/refuse
 decision, so a consumer may enable the cache by default; one whose threat model counts a memory
 disclosure as survivable for bearer tokens not currently in flight should leave it off.
 
@@ -278,232 +306,105 @@ Capacity is the caller's (`Config.capacity`, rounded up to a power-of-two bucket
 **Flooding.** Only tokens that verified can occupy slots. An attacker holding one valid token
 can make a handful of distinct-byte variants that still verify (ECDSA `s ↔ n−s`; not unused
 base64url tail bits, which `parse` refuses as `InvalidBase64` — `interop-jwt` cases
-b64-noncanonical-*, audit 2026-10-25 F2) — each costs a full verification before it is stored, and filling the
+b64-noncanonical-*) — each costs a full verification before it is stored, and filling the
 table only evicts other clients' entries, which then re-verify: the worst case is the cost
 without a cache, never a wrong answer.
 
-**Measured** (ReleaseFast, `taskset -c 1`, this host — i7-7920HQ, no SHA extensions — under
-other jobs' load; µs per Bearer verify, `parseVerifyJwks` vs the cache):
-
-| | `parseVerifyJwks` | cache miss (MAC + verify + insert) | **cache hit** |
-|---|---|---|---|
-| ES256, 682-byte token, `p256` | 313–435 µs | 402–449 µs | **0.70–0.73 µs** |
-| RS256, RFC 7515 A.2 (2048-bit), 458 bytes | 218–317 µs | 209–297 µs | **0.42–0.55 µs** |
-
-Three runs each; the machine was running other jobs (load average 4–12), so the verify columns
-are noisy and the miss/no-cache difference (one MAC and one insert, < 1 µs) is inside that noise.
-A hit is two to three orders of magnitude cheaper than a verify. Digest candidates over the same
-682 bytes, same runs: SHA-256 3.1–4.2 µs, BLAKE3 2.3–3.0 µs, SipHash-1-3-128 0.20–0.25 µs,
-SipHash-2-4-128 0.37–0.51 µs (the standard parameters were kept; 1-3 would save ~0.2 µs). The
-bench was a throwaway test in the worktree's `.zig-cache`, deleted after.
+A hit costs one MAC and one table probe, two to three orders of magnitude less than a verify (README
+gives the order of magnitude; the digest candidates measured were SHA-256, BLAKE3, SipHash-1-3-128 and
+SipHash-2-4-128, and the standard 2-4 parameters were kept).
 
 Not wired into `Provider`/`Guard`/`ResourceServer` — see Backlog.
 
+
 ## Verification
 
-RFC known-answer vectors transcribed from the RFCs: JWS 7515 A.1 (HS256) / A.2 (RS256) / A.3
-(ES256), 8037 A.4 (Ed25519); JWK/JWKS 7517 vectors; PKCE RFC 7636 Appendix B (S256 challenge,
-byte-exact); plus adversarial negatives (alg=none, alg-confusion downgrade, kid mismatch,
-embedded-jwk ignored, expired/nbf, tampered signature, mandatory-audience confused-deputy
-rejection, oct-from-network refusal, ID-token nonce-mismatch positive control, azp/iss/aud/exp
-rejection) and Provider cache/rotation/TTL tests behind a scripted fetcher. `VerifiedCache`: hit/miss
-(derive count), `exp` crossing while cached (same error as a fresh verify, then evicted), `nbf`/`iat`
-re-check, set replacement and key rotation, policy/context separation, one-byte-different tokens,
-failures never stored (bad signature, expired, underivable, misused `insert`, id-less set),
-capacity/CLOCK eviction, four-thread hammering, ES256 end to end. Mutation check at landing (mutant schemata,
-one ReleaseSafe build): ten mutants — set-id check dropped, time re-check dropped, audience not folded
-into the key, context not folded into the key, CLOCK bit ignored, expired entry not evicted, `insert`
-prefix guard dropped, both locks dropped, lookup without the lock, MAC key not wiped — all killed. The P6 resource-server
-guard adds self-constructed policy tests (own signer, not external interop KATs — the correct
-approach for policy logic): `Guard.authenticate` valid/missing/garbage/expired/insufficient/
-alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp` scope helpers
-(single/all/any), and `writeBearerChallenge` header formatting. Run: `zig build test-jwt`.
+- **Run:** `scripts/modtest jwt` (the suite of `zig build test-jwt`; fully offline). Interop and bench steps:
+  `zig build interop-jwt` (golang-jwt oracle, see below) and `zig build bench-jwt`.
+- **Test classes by area.** *Parse and claims (P1):* the RFC 7519 §3.1 example token end to end, `aud` as
+  string and array, claims-validation known answers (expiry, leeway boundary, `nbf`, opt-in future `iat`,
+  issuer/audience match and mismatch, `require_exp`), i64-extreme saturation, a malformed-token matrix and
+  a deterministic garbage sweep (never panics, never leaks), an allocation-failure sweep over the parse,
+  discovery, refresh, token-response, OAuth-error and URL/request builders (exactly `OutOfMemory`, no leak).
+  *Signatures (P2/P3):* RFC known-answer vectors, JWS RFC 7515 A.1 (HS256) / A.2 (RS256) / A.3 (ES256) /
+  A.4 (ES512), RFC 8037 A.4 (Ed25519), RFC 7520 §4.1/§4.2 (RS/PS signing and PS verification), JWK/JWKS
+  RFC 7517 vectors, RFC 9964 Appendix A.1 (ML-DSA), with flipped-byte, truncated, appended-byte and
+  wrong-secret negatives for every algorithm family. *Adversarial negatives:* `alg=none`, alg-confusion
+  downgrade, `kid` mismatch, embedded `jwk` ignored, `crit` rules, case-sensitive `alg`/`iss`/`aud`,
+  oct-from-network and private-key-from-network refusal, mandatory-audience confused-deputy rejection,
+  nonce-mismatch positive control, `azp` matrix. *Provider/network:* discovery, fetch, TTL, rotation,
+  rate limit, interval clock and backward step, typed failures behind a scripted `Fetcher`. *P6:*
+  `ResourceServer` end to end over a real `router` + `http.Server.serveStream`, `Guard.authenticate`
+  decisions (valid, missing, garbage, expired, insufficient scope, `alg=none`, RS-to-HS confusion),
+  `at+jwt` typ on and off, `scope`/`scp` helpers, `writeBearerChallenge`. *P7:* PKCE RFC 7636 Appendix B,
+  state/nonce generation, exact URL and token-request strings, token-response parsing, `acceptIdToken*`.
+  *Encode:* a round trip through `parseAndVerify` for every algorithm, the HMAC floor, wrong-length free
+  under `FailingAllocator`. *PEM:* `src/pem_test.zig` over OpenSSL-produced keys. *`VerifiedCache`:* hit and
+  miss, `exp` crossing while cached, `nbf`/`iat` re-check, set replacement and key rotation, policy and
+  context separation, one-byte-different tokens, failures never stored, capacity and CLOCK eviction,
+  four-thread hammering, ES256 end to end. *Audit tests:* `src/audit_test.zig` pins the findings of the
+  independent audit (duplicate JSON members refused, canonical base64url, the HMAC floor).
+- **Oracles and goldens.** Published RFC vectors above, in `src/*_vectors.zig` (RFC 9964's three
+  AKP/ML-DSA pairs verbatim, RFC 7520, OpenSSL-produced PEM keys with `tools/pem_vectors.py`). A foreign
+  oracle: `zig build interop-jwt` runs `tools/go_oracle` (golang-jwt v5.3.1) over a table of tokens and
+  judges every row against this module; the rows where the two differ are the *Ahead* line's six
+  refusals (`src/go_oracle_vectors.zig`, `src/go_oracle_test.zig`).
+- **Fuzz:** deterministic driver, `JWT_FUZZ=<runs>[,<first seed>]`, harnesses `jwt-parse`, `jwt-jwks`,
+  `jwt-sign-verify`, `jwt-token-response` (in `src/root.zig`, shared plumbing in `src/fuzz_test.zig`).
+- **ctgrind:** rows `hmac`, `ec` and `rsa` in `scripts/checks/ctgrind-expected.tsv`; the card's Hardening
+  line says what each covers. `timing_safe.eql` instead of `mem.eql` on a MAC is held by `check-ct-compare`.
+- **Stack probe:** `src/stackprobe_test.zig` (ReleaseFast) over the signing, HMAC and cache-key paths; PEM
+  loading and `VerifiedCache.init` are not probed (see Backlog).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-### Mutation run 2026-10-04
+## Performance
 
-Mutant schemata over a copy of `root.zig` + `cache.zig` (one ReleaseSafe build with the whole
-dependency closure, 134 tests in the binary, `setsid -w timeout -s KILL 20` per mutant):
-**111 mutants, 105 killed, 6 equivalent**. Points: segment split, every `crit` rule, `aud`/`iss`
-matching, `exp`/`nbf`/`iat` edges and leeway, `require_exp`, the `none`/unknown/PS* arms, ES512 (RFC 7515 A.4 known answer, A.4 JWK through JWKS),
-every signature-length check, the HMAC secret and compare, RSA modulus sizes, `parseAndVerify`'s
-stages, JWKS key selection (kid, pinned `alg`, ambiguity, `use`), private-key and `oct` refusal on
-the network path, key-material lengths, the `https://` rule, discovery issuer and `jwks_uri`
-checks, fetch status, the network/local trust source, Provider rate limit, TTL, step-back and
-issuer fallback, `protect`, Bearer extraction, both guards' scope and `at+jwt` checks, `Guard.init`
-key-source rules, scope matching, realm validation, percent-encoding, `azp`/`nonce`/multi-`aud`
-RP checks, NumericDate bounds, and the `VerifiedCache` set id, time re-check, insert guards, key
-folding and eviction.
+`zig build bench-jwt` (`tools/bench.zig` driving `tools/go_bench/main.go`; golang-jwt v5.3.1 built offline
+from a `go.sum`-pinned module cache; `tools/rust_fast_bench` for jsonwebtoken): sign and verify per
+algorithm on the same keys (RSA: RFC 7520 §3.4's 2048-bit key) and a typical access token (iss, sub, aud,
+exp, nbf, iat, scope; about 290-590 bytes). Each side doubles its batch until it takes over 100 ms and
+keeps the best of five; the sides alternate for `BENCH_ROUNDS` rounds; ratios are by wall time. Before
+timing, each side must accept the other's token for every algorithm. HS384/512, RS384/512 and PS384/512
+are not timed (same code paths as the 256 rows with another hash). The card's Performance line carries
+the figures and is authoritative.
 
-First pass: 35 survivors. **No defect in the code; 29 were test gaps**, closed by 12 tests at the
-end of `root.zig` (each states why its expected value is right):
+## What is deliberately not done
 
-- `alg` is case-sensitive (RFC 7515 §4.1.1): `hs256` with a valid MAC and `NONE` are unknown.
-- `nbf`/`iat` accept exactly `now == value − leeway` and refuse one second earlier.
-- `iss`/`aud` are exact case-sensitive matches (RFC 7519 §2): no prefix, no case folding.
-- A valid signature with one byte appended is `BadSignature` for HS256, ES256, ES384, EdDSA,
-  RS256 and ML-DSA-65 — every length check was `!=`-only by accident of coverage (`<` survived).
-- JWK `x`/`y`/`pub` one octet too long is `invalid_key`, for P-256, P-384, Ed25519 and ML-DSA-65.
-- `Provider` checks `iss` against the DISCOVERED issuer when the configured one has a trailing `/`.
-- `protect = .mutations` gates DELETE; `Digest <jwt>` and `BearerX<jwt>` are not credentials.
-- A realm with CR, LF or CRLF is refused by both `ResourceServer.init` and `Guard.init`.
-- Scopes match whole tokens exactly: no prefix, no case folding, `,admin` ≠ `admin`, `""` never.
-- A one-element `aud` array needs no `azp` (OIDC Core §3.1.3.7 step 3 is for multiple audiences).
-- `acceptIdTokenProvider` refuses an ID Token audienced at another client.
-- NumericDate 2^63 as a float is `InvalidClaim` before `@intFromFloat`; −2^63 converts exactly.
-
-Equivalent (reason): `https:` matched without `//` (the scheme is still https — no plaintext key
-source); `verifyWithStaticJwks`'s `.provider` arm (only `Guard` calls it, and `Guard.init` already
-refuses that combination); NumericDate's `isFinite` (std.json cannot produce NaN, and ±inf fail
-the range check after it); `lookup`'s and `insert`'s `set.id == 0` guards (each makes the other
-redundant: an id-0 entry is never stored or never probed); `require_exp` not folded into the cache
-key (a hit re-runs `checkTimes`, which applies it).
-
-## Performance — `bench-jwt` (2026-10-13)
-
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-jwt`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 16.9 %): ref 0.20–0.98× golang-jwt v5.3.1 (Go 1.26.8), against 0.20–0.99× (Go 1.26.0) on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement. The first 0.17 run stopped at its interop check: RS*/PS* verification read the modulus through a dangling pointer and refused valid tokens in optimized builds (fixed the same day, CHANGELOG 2026-10-20); the figures are from the run after the fix.
-
-The comparative benchmark behind the card's Performance line. Reference: golang-jwt/jwt v5.3.1
-(the scope's reference) on Go 1.26.0's standard-library crypto, built offline from the Go
-module cache (`tools/go_bench/`, `go.sum` pinned). Host: Intel Core i7-7920HQ (Kaby Lake, 4 cores / 8 threads; AVX2, AES-NI, PCLMULQDQ, ADX/BMI2; no SHA-NI, VAES or AVX-512), Linux 7.0, Zig 0.16.0 (ReleaseFast). Quiet host (no other job in the queue).
-
-Method: `zig build bench-jwt` (`tools/bench.zig` driving `tools/go_bench/main.go`): each side
-doubles its batch until it takes over 100 ms and keeps the best of five; per workload the
-sides alternate for `BENCH_ROUNDS` rounds and each keeps its best; **ratios by wall time** (the
-Go side has no cycle counter, and runs under its GC); spread = (worst round − best round) /
-best round per side. Before timing, golang-jwt must accept our token for every algorithm and
-we must accept its.
-
-Workloads, same keys on both sides (RSA: RFC 7520 §3.4's 2048-bit key), a typical access token
-(iss, sub, aud, exp, nbf, iat, scope; ~290–590 bytes): `<alg>_sign` = `encodeJson` (+ free;
-`std.heap.smp_allocator`) vs `NewWithClaims(...).SignedString`; `<alg>_verify` = `parseAndVerify`
-with issuer, audience and expiry required (+ deinit) vs `jwt.Parse` with the method pinned and
-`WithIssuer`, `WithAudience`, `WithExpirationRequired`. Since 2026-10-13 every algorithm both
-sides implement except HS384/512, RS384/512 and PS384/512 (same code paths as the 256 rows with
-another hash); before, only HS256/ES256/EdDSA were measured — which hid std's ES384 (4.21× sign,
-2.80× verify on the first widened run, 2026-10-13 morning).
-`BENCH_ROUNDS=7`, after ES384 moved onto the `p384` module (the card's run, 2026-10-13):
-
-| workload | ours ns/op | ref ns/op | ours/ref | spread ours | spread ref |
-|---|---:|---:|---:|---:|---:|
-| `hs256_sign` | 2625 | 5876 | 0.447 | 4.4% | 12.7% |
-| `hs256_verify` | 4325 | 9138 | 0.473 | 4.1% | 3.2% |
-| `es256_sign` | 31119 | 44290 | 0.703 | 2.0% | 3.5% |
-| `es256_verify` | 87950 | 93638 | 0.939 | 2.9% | 4.4% |
-| `es384_sign` | 156961 | 300798 | 0.522 | 2.1% | 3.9% |
-| `es384_verify` | 504112 | 850985 | 0.592 | 1.9% | 3.3% |
-| `es512_sign` | 236436 | 821902 | 0.288 | 1.4% | 1.4% |
-| `es512_verify` | 513473 | 2582301 | 0.199 | 3.8% | 2.1% |
-| `eddsa_sign` | 25224 | 33977 | 0.742 | 1.8% | 3.2% |
-| `eddsa_verify` | 74491 | 75356 | 0.989 | 2.1% | 3.0% |
-| `rs256_sign` | 895863 | 1437748 | 0.623 | 3.5% | 2.7% |
-| `rs256_verify` | 29188 | 48983 | 0.596 | 2.9% | 2.3% |
-| `ps256_sign` | 969334 | 1458332 | 0.665 | 2.7% | 2.6% |
-| `ps256_verify` | 31180 | 51808 | 0.602 | 1.9% | 4.6% |
-
-A second 7-round run on the same quiet host agreed within 2.5 % on every ratio. Spreads over 5 %
-are on the Go side only (its GC) and fell on different rows in the two runs (rs256_sign 21.6 %,
-then hs256_sign 12.7 %); every spread of ours is ≤ 4.4 %.
-
-**Reading.** Every row is at or ahead of golang-jwt; the worst is EdDSA verification at 0.99×
-(std's Ed25519 against Go's, level). ES384 went from 4.21× (sign) and 2.80× (verify) on std's
-generic P-384 to 0.52× and 0.59× on the `p384` module (MULX field, comb, double-base verify).
-EdDSA signing went from 1.63× to 0.74× with `ct25519`'s comb (`encode.zig` `signEd25519`), ES256
-verification is level (0.94×), RSA runs 0.60–0.67× (the `rsa` module), ES512 0.20–0.29× (`p521`).
-Worst row 0.99× → P2.
-
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig` (190–3790), `cache.zig`, `ed25519.zig`, `encode.zig`, `pem.zig`; generated mutants on every condition, optional capture, dropped `try`/void calls and wipes, ±1 literals, error-name swaps, plus manual mutants for the `verify()` dispatch (none/unknown accepted, hash and padding swaps, any key accepted), the HMAC compare, RSA modulus arithmetic, NumericDate rounding, the 401-reason tables, `checkTimes` leeway signs, the `VerifiedCache` key fold and CLOCK hand, the Ed25519 verifier and signer, and burn drops; one ReleaseSafe and one ReleaseFast schemata build, STACKPROBE clean at M0, strict verdict, adversarial read while placing mutants): 873 mutants, 816 killed (10 by hang; 5 burn/wipe mutants only under the ReleaseFast stackprobe), 35 equivalent + 22 unobservable, 0 undecided. `timing_safe.eql` → `mem.eql` stays killed by `check-ct-compare`. New tests (10): an allocation-failure sweep over `parse`, `parseJwks`, `discover`, `Provider.refresh`, `parseTokenResponse`, `parseOAuthError`, `buildAuthorizationUrl`, `buildTokenRequest` with std's FailingAllocator and a never-grow allocator (exactly `OutOfMemory`, no leak); `mapFetchError`; OKP `x` of 31/33 bytes and JWK `use` values; `challenge_scope` only when scopes are required; 401 is `text/plain`, a failed at+jwt check is `invalid_token`; every `resourceInvalidReason`; a set with id 0 stores and evicts nothing; only a dot may follow the signing input; length-delimited policy strings ((iss ab, aud c) ≠ (iss a, aud bc)); a non-object payload is `InvalidClaims`. Equivalent: `understood_crit_headers` is empty, rsa refuses `sig.len != k` itself, `readSliceShort` short only at end of stream, Windows-only arms, trimmed values, `!= 0`/`> 0` on usize, std.json yields no NaN, Guard collapses non-OOM errors, a free cache slot's zero digest (p = 2^-128), spin hint, `ceilPowerOfTwo` cannot overflow, `Config.context` (see Backlog), Ed25519 digit/carry/parity/window facts and any valid wNAF giving the same element, no JSON value above `{`. Unobservable (no probe): the dead-stack MAC-key copy in `VerifiedCache.init`, PEM-loading wipes (no PEM stackprobe), in-frame Ed25519 wipes and burn drops above the curve/rsa modules' own burns.
-
-**Mutation + review, run 2 (2026-11-12, whole module, after the `encodeJson` wrong-length-free fix,** production code of `root.zig` (190–3790), `cache.zig`, `ed25519.zig`, `encode.zig`, `pem.zig`, `burn.zig`; a text generator over every comparison, ±1 literal, wrapping/saturating swap, field-value swap, switch-arm swap, empty loop and `burn.run` frame drop, plus the run-1 error-identity swaps and 20 hand-placed semantic mutants; schemata in a detached copy, ReleaseSafe in a network namespace under `ulimit -v`, the 39 wipe/burn mutants in ReleaseFast with STACKPROBE, strict verdict, 30 s cap = hang): 1436 mutants, 1344 killed (16 by hang), 67 equivalent, 25 unobservable, 0 undecided, no defect. The fix's region (`encode.zig` resize/dupe path) got fresh mutants, all killed or equivalent. 14 new tests: compact-token dot counting, only status 200 is a key document, an RSA `modulus_len` above the real one, issuer refresh under every allocation failure, a 2047-bit RSA signing key refused (ReleaseSafe/Fast only — key generation is slow in Debug), the Bearer separator set, `Guard.challengeFor(OutOfMemory)`, `AuthContext.hasScope`, a static-set Guard with `issuer = .any`, key-set id 1 caching and slot reuse, the length-delimited policy digest, SPKI ML-DSA public keys, RSA private keys signing only RS*/PS*, SPKI X25519/X448/Ed448/ML-KEM refused. New equivalence arguments: the pre-sized arena chunk discarded by `reset(.retain_capacity)`, over-allocation shrunk at the end (`encode` 198/200), copy instead of resize (`encode` 217), `Pkce.plain` challenge == verifier by construction, BOOTTIME vs MONOTONIC (differ only across a suspend), comptime-only code (the switch is false at comptime). Unobservable: ES*/RS*/PS* signing-frame burns and in-frame wipes under `burn.run`, PEM-load wipes, one dead-stack MAC key copy in `cache.zig` — STACKPROBE finds no residue to tell them apart; the HMAC/Ed25519/ML-DSA burns are killed under it. Not mutated: comptime constants (their use sites are), straight-line initialisation with no operator of its own, declarations; ~25 compile-invalid variants dropped.
-
-**Mutation (2026-11-07, whole module,** production code of `root.zig`, `cache.zig`, `ed25519.zig`, `encode.zig`, `pem.zig`, schemata in a detached copy, two ReleaseSafe builds and one ReleaseFast (wipes, with STACKPROBE active at M0), strict verdict): 535 mutants, 508 killed (2 — `timing_safe.eql` → `mem.eql` at `root.zig:1035`/`cache.zig:267` — by `check-ct-compare`), 22 equivalent + 5 unobservable, 0 undecided; no defect. New tests (18): HS256 MAC with first/last byte flipped, a NumericDate below −2^63 (`InvalidClaim`, not a float-conversion trap), JWK skip reasons (AKP with a non-ML-DSA alg, non-string material, OKP without crv, impossible base64url length), discovery type errors and an `http://` jwks_uri, `Provider` OOM refresh not remembered and an unknown kid refreshing a hand-placed set, token endpoint 201, `ResourceServer`/`Guard` lock, `ctx.data` restore, 401 body, OOM → 500, short `Bearer` spellings, init leak-freedom at every allocation failure, `HttpFetcher` exact-fit body, four `VerifiedCache` tests (bucket spread, no-exp eviction, length-delimited policy key, `deinit` wipe), `PrivateKey.deinit` leaves no scalar. Equivalent: re-checked 271, 358, 385/386/398; ed25519 small-order facts (424, 435, 436), `slide()` digit parity and a dead iteration (445, 447), rsa refusing a wrong-length signature itself (90, 91), an empty token after a trimmed `Bearer ` (236), a free slot's zero digest (407, p = 2^-128), `Config.context` folded into a per-instance key (379, 414 — see Backlog), a non-string `crit` (514), in-frame wipes under `burn.run(ec_burn)` (489–495, STACKPROBE finds no residue without them). Unobservable: 496 (p = 2^-252), PEM-loading wipes under the PEM burn with no probe (503, 505, 508), a dead-stack MAC key copy in `VerifiedCache.init` (377). **Changes from the run:** `Provider.init` → `error.NoKeySource`, `RefreshError.NoKeySource` for options changed after init, `VerifiedCache` after `deinit` = no cache (all three were panics); `pem.zig`'s compare pinned in `ct-compare-expected.tsv` (the gate was red since `d8437cbf`).
+- **Encryption (JWE):** the sibling `jwe` module.
+- **`x5c` chain validation:** keys come from a configured JWKS/Provider; certificates are read through
+  `x509.spkiOf` + `Key.fromSpki`.
+- **Revocation lists and token introspection (RFC 7662).**
+- **`c_hash`/`at_hash`:** implicit/hybrid-flow-only checks; P7 covers the authorization *code* flow,
+  where they do not apply.
+- **`client_secret_basic` in `buildTokenRequest`:** `ClientAuth` covers the public-client (PKCE-only) and
+  `client_secret_post` cases; a confidential client wanting Basic auth sets the `Authorization` header on
+  the returned `TokenRequest` itself (one `base64(client_id:client_secret)` line), not worth a
+  builder-side seam for a single header.
+- **HashML-DSA:** no `Alg` name, so `UnsupportedAlg` (RFC 9964 specifies pure ML-DSA).
 
 ## Backlog / deferred
-- ~~**Finding (MED, consumer-reachable panic/UB on OOM, mutation run 2026-11-12):** `encodeJson`'s last line `return gpa.realloc(out, n) catch out[0..n];` returns a slice shorter than its allocation when the shrinking realloc fails, so the documented `gpa.free(token)` frees with the wrong length — `SafeAllocator` panics (`free of invalid memory`), other allocators are UB. Reachable only on an allocation failure in the final shrink (repro: `encodeJson` with a 300-byte kid under `FailingAllocator`, `fail_index` swept, `free` on every success). Fix: return `error.OutOfMemory` on the failed shrink (or dupe into an exact block and free `out`), with the OOM sweep freeing every token. ~~ **Fixed 2026-11-12:** shrink in place or copy into an exact block, `OutOfMemory` if the copy fails; test red before the fix. The fix changed `encode.zig`, so the audit above is stale until the next whole-module run (post-wave batch).
-- **Gap (same run):** no stackprobe covers PEM key loading, so its wipes are unobservable; a PEM-load probe in `stackprobe_test.zig` would decide them.
-- **2026-11-07 (mutation run):** `VerifiedCache` `Config.context` has no effect — each instance has its own table and random MAC key, so folding a per-instance constant into the key never changes a hit; separate callers are kept apart by separate instances already. Either drop the field or say so in its doc. Probes for PEM loading and `VerifiedCache.init` would decide mutants 377/503/505/508.
 
-- ~~**PEM / PKCS#8 / SPKI keys**~~ — DONE 2026-11-05 over the new `keycodec` module (one shared codec, not a fourth copy): `PrivateKey.fromPem` (PKCS#8, SEC1, PKCS#1: EC P-256/384/521, Ed25519, RSA ≥ 2048, ML-DSA `both`/`seed`; ML-DSA expanded-only refused, a `both` key's halves must agree), `PrivateKey.signingKey` / `rsaSigningKey` (RS*/PS*), `Key.fromPem` (SPKI, PKCS#1 `RSA PUBLIC KEY`), `Key.fromSpki`. Anchored on OpenSSL 3.5.5 keys (`tools/pem_vectors.py`): a token signed with the loaded key verifies under OpenSSL's public key. Not read: certificates (golang-jwt's `ParseRSAPublicKeyFromPEM` takes one; here `x509.spkiOf` + `Key.fromSpki`), encrypted keys (keycodec Backlog).
-
-- ~~**HMAC key floor on the verify side (audit 2026-10-25 F3)**~~ — DONE 2026-10-25 (owner: enforce):
-  `verify` (so every entry point, `oct` JWKs included) refuses an HS256/384/512 secret shorter
-  than the hash output with `InvalidKey`, the floor `encode` already had (RFC 7518 §3.2 "MUST").
-  golang-jwt and jsonwebtoken accept any length. Pinned by `audit_test.zig` (`f3_fixed = true`).
-- ~~**HS256 sign is 1.32× jsonwebtoken (P2, owner accepted TEMPORARILY 2026-10-25)**~~ — DONE
-  2026-10-26: HS256/384/512 run std's `Hmac` over the `sha2` module (grade 2), whose CRYPTOGAMS
-  assembly is ring's own. `bench-jwt` 2026-10-26 (5 rounds, loaded host): hs256_sign 1.05×,
-  hs256_verify 1.07× jsonwebtoken; the worst row against the field is now eddsa_verify, 1.21×.
-  Was: the last
-  axis below grade 1. `bench-jwt` 2026-10-25: hs256_sign 2.28 vs 1.72 µs, hs256_verify 1.23×;
-  58 % of our sign is SHA-256 compression (std, no SHA-NI on the bench host) against ring's
-  assembly. Routes: the `sha2` module's SIMD message schedule (≈ 1.1× on these 4-block inputs;
-  `sha2` is grade 3 and would have to reach ≤ 2 first) or a faster single-block round function.
-- ~~**ES384 is P4 (bench 2026-10-13: sign 4.2×, verify 2.8× golang-jwt)**~~ — DONE 2026-10-13: ES384
-  runs on the `p384` module (0.52× sign, 0.59× verify); the card is measured again. ~~(a) EdDSA sign
-  1.6–1.7×~~ — DONE 2026-10-13 (`ct25519.mulBase`, 0.73×). ~~(b) ES256 verify 1.4×~~ — 0.96× on
-  2026-10-13 (p256's own speed work).
-- **Dead-stack residue not yet probed or burned (found 2026-10-09 while sweeping signing):** the
-  `kty:"oct"` secret in `parseJwks` (`jwkMaterial` decodes `k` through arena/stack buffers before
-  it becomes `Key.hmac`); `VerifiedCache`'s SipHash `mac_key` (zeroed by `defer`, but the SipHash
-  state it keys is not burned; the key is not a bearer credential, only a cache-poisoning one);
-  ML-DSA/Ed25519 *key generation* in the caller's frame (std); ES384 key generation burns inside p384, but the returned `KeyPair` still lands in the caller's frame. `buildTokenRequest`'s
-  `client_secret` is a borrowed slice and only copied into the request body.
-- ~~`Provider` measures its JWKS intervals on the wall clock~~ — **fixed 2026-09-29** without an
-  API change (the web-server consumer research register H6): a `now_s` before the recorded fetch/attempt counts as the
-  interval having passed, so a backward step triggers one re-fetch that re-bases the marks instead
-  of freezing both refreshes for the step's size. ~~A separate interval clock so a FORWARD step does
-  not expire the TTL early~~ — **DONE 2026-09-29**: `ProviderOptions.interval_clock` (opt-in, null =
-  today's `now_s`, keeping the no-hidden-clock rule) with `Clock.boot` (CLOCK_BOOTTIME on Linux);
-  the claims stay on `now_s`.
-- **Mandatory audience/issuer + oct-from-network** were flagged as open decisions in the pre-public
-  review — now **RESOLVED** (safe-by-default, 2026-07-09; see Threat model above). The repo-wide
-  adversarial security pass (2026-07-10) confirmed the rest: const-time compare, alg-confusion
-  resistance, and JWKS `kid`-smuggling/rotation correctness are all clean for `jwt`; the paired
-  `aaa-gate` throttle-key amplification issue found in that pass was fixed.
-- **DPoP (RFC 9449)** — DEFERRED. Proof-of-possession access tokens need client-held key
-  management (generate/persist a signing key per client) and a per-request DPoP proof JWT (bound to
-  the HTTP method+URL+access-token hash, with replay-window `jti`/`iat` tracking on the resource
-  server) — a materially bigger, separable feature from the authorization-code+PKCE flow this pass
-  adds. `ResourceServer`'s Bearer-only enforcement is unaffected; a future pass would add a DPoP
-  variant alongside it, not replace it.
-- **`client_secret_basic` (HTTP Basic client auth)** — DEFERRED at the builder level:
-  `buildTokenRequest`'s `ClientAuth` covers the public-client (PKCE-only) and
-  `client_secret_post` cases; a confidential client wanting Basic auth sets the `Authorization`
-  header on the returned `TokenRequest` itself (one `base64(client_id:client_secret)` line at the
-  call site) — not worth a builder-side seam for a single header.
-- ~~**OAuth2 error-response parsing (RFC 6749 §5.2)**~~ — DONE 2026-10-13: `parseOAuthError` (token-endpoint body), `parseAuthorizationError` (§4.1.2.1 redirect query, decoded with `http.body.urlencoded`) and the status-aware `parseTokenEndpointResponse` (200 → `TokenResponse`, 400/401 → `OAuthError`, else `UnexpectedStatus`); `error`/`error_description`/`error_uri` held to the RFC's character sets.
-- ~~**RS\* signing**~~ — DONE 2026-10-13 (`SigningKey.rs256/384/512`, through the `rsa` module; RFC 7520 §4.1 reproduced byte for byte). Was: `encode` does not offer RS256/384/512: std has no RSA signing, and the
-  `rsa` module's `signPkcs1v15` would become a new dependency of jwt (a root `build.zig`
-  change). Add it when a consumer needs RSA-issued tokens. Still open.
-- ~~**`Guard` over a static `JwkSet`**~~ — DONE 2026-09-28 (found by the web-server consumer): `Guard.Options.jwks`
-  (exactly one of `provider`/`jwks`, else `error.InvalidKeySource`) runs the same Bearer
-  extraction, `at+jwt` check, scope policy and RFC 6750 challenges over a caller-held set;
-  nothing is fetched, so an unknown `kid` is refused at once. A static set has no issuer to
-  default to, so `claim_opts.issuer = .provider` fails `init` (`error.IssuerNotConfigured`).
-- **`VerifiedCache` behind `Provider`/`Guard`/`ResourceServer`** — not wired. `Provider.verify`
+- **DPoP (RFC 9449).** Proof-of-possession access tokens need client-held key management (generate and
+  persist a signing key per client) and a per-request DPoP proof JWT (bound to the HTTP method, URL and
+  access-token hash, with replay-window `jti`/`iat` tracking on the resource server): a materially bigger,
+  separable feature than the authorization-code + PKCE flow. `ResourceServer`'s Bearer-only enforcement
+  is unaffected; a DPoP variant would be added alongside it. golang-jwt does not offer it either.
+- **`VerifiedCache` behind `Provider`/`Guard`/`ResourceServer`** is not wired. `Provider.verify`
   returns an owned `ParsedToken`, which a hit cannot produce without allocating, and its TTL
   refresh must run before a lookup (else a hit would outlive a dropped key). The fit is a
   `derive`-style entry point on `Provider` that refreshes first and then calls
   `VerifiedCache.verifyJwks` with its current set. Add it when a consumer of those types asks.
-- No other module-local backlog recorded (README has no Deferred section).
-
-- ~~**Refuse a plain-HTTP key source**~~ — DONE 2026-09-28 (from the web-server consumer M11.8): `discover`,
-  `fetchJwks` and `Provider` refuse an `http://` (or scheme-less) issuer, discovered `jwks_uri` or
-  configured `jwks_uri` with `error.InsecureKeySource`, before any fetch — anyone on a plain-HTTP
-  path could serve their own keys and mint any token. `KeySourceOptions.allow_plain_http` /
-  `ProviderOptions.allow_plain_http` opt out (tests, a loopback issuer), through the new
-  `discoverWith`/`fetchJwksWith`; the three-argument calls keep their signatures.
-
-- ~~**PS256/384/512 verification**~~ — DONE 2026-10-13 (`rsa.VerifyKey.verifyPss`, salt = hash length; RFC 7520 §4.2 PS384 verifies). Was (survey 2026-09-30) — `verify` returns `error.UnsupportedAlg`. Providers that mandate PSS (FAPI profiles, some HSM-backed issuers) issue these tokens; golang-jwt/jose accept them. Effort: medium (RSASSA-PSS over `std.crypto.ff`, or through the in-repo `rsa` module — check dependency cost per the RS\* entry). Fits CONVENTIONS §2: yes.
-- ~~**ES512 (P-521) verification**~~ — done 2026-10-10: ES512 verify and sign through the in-repo `p521` module (raw 132-byte `R‖S`), JWK `crv:"P-521"` with 66-byte coordinates; anchored to RFC 7515 A.4.
-- ~~**RS/PS signing**~~ — DONE 2026-10-13 (`SigningKey.ps256/384/512` carry the CSPRNG for the salt). Was: already listed above under "RS\* signing"; the survey confirms it as a gap against golang-jwt (survey 2026-09-30). The `rsa` module's `signPkcs1v15` exists.
-- ~~**OAuth2 error-response parsing (RFC 6749 §5.2)**~~ — DONE 2026-10-13 (see above); the survey flagged it as the first thing a relying-party user hits on a failed token request (survey 2026-09-30).
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256`, `p384`, `p521`, `rsa`, `ct25519`, `b64ct`, `sha2`, `keycodec`, `clock` (wall-clock read for `Clock.system`) —
-canonical source is `pub const meta` in src/root.zig.
+- **`VerifiedCache` `Config.context` has no effect.** Each instance has its own table and random MAC
+  key, so folding a per-instance constant into the key never changes a hit; separate callers are
+  kept apart by separate instances already. Either drop the field or say so in its doc.
+- **Dead-stack probes missing:** no stackprobe covers PEM key loading (its wipes are unobservable) or
+  `VerifiedCache.init`'s MAC-key copy; a probe in `stackprobe_test.zig` would decide those mutants.
+- **Dead-stack residue not yet probed or burned:** the `kty:"oct"` secret in `parseJwks` (`jwkMaterial`
+  decodes `k` through arena/stack buffers before it becomes `Key.hmac`); `VerifiedCache`'s SipHash
+  `mac_key` (zeroed by `defer`, but the SipHash state it keys is not burned; the key is not a bearer
+  credential, only a cache-poisoning one); ML-DSA/Ed25519 *key generation* in the caller's frame (std);
+  ES384 key generation burns inside p384, but the returned `KeyPair` still lands in the caller's frame.
+  `buildTokenRequest`'s `client_secret` is a borrowed slice and only copied into the request body.
 
 ## Anchoring
 
@@ -514,10 +415,8 @@ canonical source is `pub const meta` in src/root.zig.
 
 **What the tests actually contain.** RFC 7515 A.1-A.3/8037 A.4 full JWS compact-token vectors + PKCE 7636 App B
 + **RFC 9964 Appendix A.1** — all three published (AKP JWK, ML-DSA JWS) pairs, verbatim, in
-`src/rfc9964_vectors.zig`. That last one is the module's strongest external anchor and was
-missing from this list until 2026-09-01: the vectors landed in `e5d6d947` and this section had
-been written in `4f75fc51` a week earlier. It matters more than a line-count omission, because
+`src/rfc9964_vectors.zig`. That is the module's strongest external anchor, because
 the RFC's private seed is 32 zero bytes and the module can regenerate all three public keys
 itself — so internal evidence alone cannot tell a genuine RFC vector from a self-generated one.
-The audit that added this line fetched the RFC and compared character by character (and
-recomputed each `kid` as the RFC 7638 thumbprint over `{alg, kty, pub}`); all three match.
+The vectors were compared with the RFC text character by character, and each `kid` recomputed as the
+RFC 7638 thumbprint over `{alg, kty, pub}`; all three match.

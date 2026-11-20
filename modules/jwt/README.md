@@ -110,6 +110,12 @@ that. Never authorize from a `ParsedToken` alone.
   an attacker HMACs a forged token with the server's *public* key bytes.
   The wrong curve within a family (ES256 vs a P-384 key) also refuses.
 - **HMAC comparison is constant-time** (`std.crypto.timing_safe.eql`).
+- **An HS256/384/512 secret shorter than the hash output is refused** with
+  `InvalidKey` on verify as well as on `encode` (RFC 7518 §3.2 "MUST"), `oct`
+  JWKs included.
+- **A plain-HTTP key source is refused** (`InsecureKeySource`) by `discover`,
+  `fetchJwks` and `Provider` before any fetch; `allow_plain_http` opts out for
+  tests and loopback issuers.
 - **JWS ECDSA signatures are the raw fixed-width `R‖S`** (RFC 7518 §3.4;
   32+32 for P-256, 48+48 for P-384) — not DER.
 - **RS\*/PS\* signatures must be exactly the modulus length** (RFC 7518 §3.3, §3.5);
