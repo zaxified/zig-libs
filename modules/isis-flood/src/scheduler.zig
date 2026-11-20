@@ -368,7 +368,7 @@ pub const Scheduler = struct {
         // entry `ssnIterator` cannot re-resolve if `Lsdb` ever yields a
         // flagged id it does not also hold — audited as W2 `isis-flood` F4 on
         // the theory that this could strand the SSN flag forever. Traced
-        // against `Lsdb` (2026-08-08): `FlagIterator.next` walks the SAME
+        // against `Lsdb`: `FlagIterator.next` walks the SAME
         // live `self.map` that `get` looks up (`store.zig` `ssnIterator` /
         // `get`), so any id it yields is by construction present; the only
         // removal path (`Lsdb.tick`'s `self.map.remove`, `store.zig:634`)
@@ -1220,7 +1220,7 @@ test "last-sent map is pruned when SRM clears (bounded by the SRM-flagged set)" 
 // ── fail-open guard: Config.lsp_entries_per_pdu is caller-supplied, and
 // `init`'s `std.debug.assert(cfg.lsp_entries_per_pdu >= 1 ...)` is the ONLY
 // thing that ever kept it there — an assert the compiler removes entirely in
-// ReleaseFast. Found while building `example/main.zig` (2026-08-23): the
+// ReleaseFast. Found while building `example/main.zig`: the
 // example's own happy path never sets this to 0 (it always goes through
 // `init` with a sane default or a positive override, same as every existing
 // test in this file), so nothing here was ever red — the gap was found by
@@ -1398,7 +1398,7 @@ test "CSNP chunks tile a SPARSE id space with no gap — the successor rule, on 
     // Wireshark golden uses CONSECUTIVE LSP-IDs, and on consecutive ids
     // `successor(entries[i-1].lsp_id)` and `entries[i].lsp_id` are the SAME
     // VALUE — so the rule was replaceable by the wrong expression with all
-    // 30 tests and all 5 goldens green (measured). The corpus is genuine and
+    // 30 tests and all 5 goldens green. The corpus is genuine and
     // byte-verified and simply cannot express the input the rule refuses;
     // genuineness and discrimination are separate properties.
     //
@@ -1447,7 +1447,7 @@ test "CSNP chunks tile a SPARSE id space with no gap — the successor rule, on 
 }
 
 test "fail-open guard: lsp_entries_per_pdu ABOVE snp.max_entries_per_pdu does not livelock" {
-    // The 2026-08-23 fix clamped the caller-supplied `lsp_entries_per_pdu`
+    // The fix clamped the caller-supplied `lsp_entries_per_pdu`
     // at its LOWER end only, while the assert it was replacing guarded
     // both: `1..=snp.max_entries_per_pdu`. Above that ceiling every
     // `buildPsnp`/`buildCsnp` returns `ValueTooLong` (the #9 TLV caps at 15
@@ -1531,7 +1531,7 @@ test "fail-open guard: lsp_entries_per_pdu == 0 does not underflow emitCsnp's en
     try testing.expect(countKind(r0.effects, .csnp) >= 1); // the periodic CSNP still fired
 }
 
-// ── whole-module mutation audit 2026-11-17 ───────────────────────────────────
+// ── whole-module mutation audit ───────────────────────────────────
 
 /// All LSP-Entries of a decoded CSNP or PSNP payload, in wire order.
 fn entriesOf(tlv_bytes: []const u8, out: []LspEntry) !usize {

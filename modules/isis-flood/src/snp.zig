@@ -218,7 +218,7 @@ test "a too-small scratch is a typed BufferTooSmall, never a panic" {
     try testing.expectError(error.BufferTooSmall, buildPsnp(&tiny, @splat(0), false, &.{}));
 }
 
-// ── whole-module mutation audit 2026-11-17 ───────────────────────────────────
+// ── whole-module mutation audit ───────────────────────────────────
 
 test "successor carries into the top octet and treats 0xFE as an ordinary value" {
     try testing.expectEqual(LspId{ 1, 0, 0, 0, 0, 0, 0, 0 }, successor(.{ 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }));
