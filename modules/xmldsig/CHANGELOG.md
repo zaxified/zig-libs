@@ -13,16 +13,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   - **XDS-2:** the rendered-namespace stack was scanned linearly on every lookup (one per attribute / listed prefix), O(depth x declarations) each; now a prefix map, O(1). Repeated prefixes on one element are de-duplicated after sorting instead of by a linear membership test.
   - **XDS-3:** the `InclusiveNamespaces` PrefixList (attacker-supplied) was walked in full at every element, O(elements x list length); below the apex only prefixes declared on the element can be novel, so only those are considered. Output is byte-identical (differential test against the whole-list walk on 600 random documents).
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std's unchecked DER reader (`Certificate.parse`) re-read against the 0.17.0 std (unchanged); 0.16-only measurements are labelled as such.
 
 - **2026-10-09** — tests: deterministic fuzz driver `XMLDSIG_FUZZ` over the existing `verify` harness, which now also checks that the genuine signed document is accepted and one with 1-3 octets flipped refused. The mode-4 oracle (genuine accepted, any flipped octet refused) exempts only changes inside the SignatureValue text and whitespace-for-whitespace inside a tag, which C14N normalizes (the 200k verdict met one at seed 33152: a space before an attribute became a tab, and the signature rightly held).
-- **2026-10-08** — **NO CONSUMER-VISIBLE CHANGE:** a test in `root.zig` follows p256's `ecdsaSign`, which now takes
-  the key and nonce by pointer, and rsa's 2026-10-08 API (keys by pointer, out-param
-  constructors).
 - **2026-10-05** — Tests: first dated mutation run (25 mutants, 24 killed, 1 equivalent; `SPEC.md`
   § "Mutation run 2026-10-05"). No defect; new tests for a non-`ds:Signature` wrapper, epilog
   PIs and `#WithComments` prolog comments, URIs without `#` and `#` alone, an over-long ECDSA

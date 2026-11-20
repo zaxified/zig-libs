@@ -6,13 +6,12 @@ XML Canonicalization (C14N) + XML-Signature **verification** (W3C xmldsig-core
 
 Verification only — this is the relying-party / service-provider side that
 checks an IdP's signature. There is no signing API. Depends on `xml`, `rsa`,
-`p256` and `std` (SHA + base64); no other dependencies.
+`p256`, `p384`, `p521`, `wipealloc` and `std` (SHA, HMAC, base64); no other dependencies.
 
 Provenance: clean-room from W3C *XML Signature Syntax and Processing* 1.1 and
 *Exclusive* / *Canonical XML* 1.0 — public specifications, whose own worked
 examples are the byte-exact canonicalization anchors. No third-party XML-DSig
-implementation was consulted, so no `NOTICE` entry is required (root
-[`NOTICE`](../../NOTICE) §0).
+implementation was consulted.
 
 ## What it does
 
@@ -40,6 +39,11 @@ you can pin / compare it against your configured cert.
   ECDSA-P521-SHA512, RSA-PSS (RFC 9231 `sha256/384/512-rsa-MGF1`, fixed profile),
   HMAC-SHA256 (`VerifyKey.hmac`; `HMACOutputLength` refused)
   (RSA-SHA1 only with `allow_weak_sha1`).
+
+## Not provided
+
+No signing, no XPath/XSLT or other transforms, no external references, no X.509 chain validation, no
+`KeyInfo`-supplied keys; the reasons are in `SPEC.md` (*What is deliberately not done*).
 
 ## Usage
 

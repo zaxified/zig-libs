@@ -40,7 +40,8 @@ parser-index and the `id_attr` branch) and KeyInfo never trusted; no C, no libxm
 worked examples of both W3C specs are byte-exact, and verification is cross-checked against two independent tools
 (xmlsec1, signxml) for enveloped and enveloping RSA-SHA256 and enveloped ECDSA-P256. **Where we are behind:** no
 signing (by design, SP side only), no XPath/XSLT transforms (by
-design), no X.509 chain validation (left to the caller / `x509` module).
+design), no X.509 chain validation (left to the caller / `x509` module); the
+reasons are under *What is deliberately not done*.
 
 ## Purpose & scope
 
@@ -51,19 +52,10 @@ and **XML-Signature verification** — per W3C *XML Signature Syntax and
 Processing (xmldsig-core 1.1)*, *Exclusive XML Canonicalization 1.0* and
 *Canonical XML 1.0*.
 
-**Out of scope (deliberate):**
-
-- **Signing / signature generation.** We are the relying party (service
-  provider) verifying an IdP's signature, never producing one. There is no
-  signing API. (The test suite drives the sibling `rsa` / `p256` *signers* to
-  build round-trip fixtures, but that is test scaffolding, not exported API.)
-- **XPath / XSLT / arbitrary transforms** — rejected by policy (attack surface).
-- **Arbitrary XPath node-sets** — the node-set model is "a subtree, optionally
-  minus one omitted descendant element", which is exactly what the
-  enveloped-signature transform needs and nothing more.
-- **External (non-same-document) references** — rejected.
-- **DTD-typed attribute normalization** (`ID`/`NMTOKENS` collapse) — the `xml`
-  layer does not process DTDs, so neither do we.
+Everything it refuses to do on purpose (signing, XPath/XSLT, external references, DTD-typed attribute
+normalization, trusting `KeyInfo`) is listed with its reason under *What is deliberately not done*. The node-set
+model is "a subtree, optionally minus one omitted descendant element", which is exactly what the
+enveloped-signature transform needs.
 
 ## Canonicalization (`c14n.zig`)
 
@@ -128,7 +120,8 @@ is removed; it is located as the exact `ds:Signature` element passed to
 
 Structural / algorithm / resolution problems return a typed `VerifyError`
 (`MalformedSignature`, `UnsupportedAlgorithm`, `UnsupportedTransform`,
-`UriNotResolved`, `KeyAlgorithmMismatch`, plus `OutOfMemory`); a structurally
+`TransformOrderInvalid`, `UriNotResolved`, `KeyAlgorithmMismatch`, `TooManyReferences`, `MaxDepthExceeded`,
+`OutputTooLarge`, plus `OutOfMemory`); a structurally
 valid signature that simply fails to verify returns `Result{ .valid = false }`
 with per-reference detail. **No input path panics.**
 
@@ -138,13 +131,24 @@ with per-reference detail. **No input path panics.**
 |-------|----------|
 | C14N / transform | exclusive & inclusive C14N (both comment variants); enveloped-signature |
 | Digest | SHA-256 (primary), SHA-384, SHA-512; SHA-1 only if `allow_weak_sha1` |
-| Signature | RSA-SHA256 (primary), RSA-SHA384, RSA-SHA512 (RSASSA-PKCS1-v1_5); ECDSA-P256-SHA256; RSA-SHA1 only if `allow_weak_sha1` |
+| Signature | RSA-SHA256 (primary), RSA-SHA384, RSA-SHA512 (RSASSA-PKCS1-v1_5); ECDSA-P256-SHA256, ECDSA-P384-SHA384, ECDSA-P521-SHA512; RSA-PSS by the RFC 9231 fixed-profile URIs (`sha256/384/512-rsa-MGF1`); HMAC-SHA256; RSA-SHA1 only if `allow_weak_sha1` |
+
+Each signature method needs its own `VerifyKey` variant (`rsa` for PKCS#1 v1.5 and PSS, `ecdsa_p256_sec1`,
+`ecdsa_p384_sec1`, `ecdsa_p521_sec1`, `hmac`); a method with the wrong key family is `error.KeyAlgorithmMismatch`,
+never a quiet `valid = false`.
 
 RSA verification uses `@import("rsa").verifyPkcs1v15`. ECDSA uses
-`@import("p256").sign.ecdsaVerify` — the XML-DSig ECDSA signature is raw
-`r‖s` (IEEE P1363), **not** DER; we require exactly 64 bytes. Any unlisted
-algorithm URI → `error.UnsupportedAlgorithm`; any unlisted transform →
-`error.UnsupportedTransform`.
+`@import("p256").sign.ecdsaVerify`, and the `EcdsaP384Sha384` / `EcdsaP521Sha512` types of `p384` / `p521` —
+the XML-DSig ECDSA signature is raw `r‖s` (IEEE P1363), **not** DER; the `SignatureValue` must have exactly the
+raw length of the curve (64 / 96 / 132 octets), any other length is `Result.valid = false`, as an RSA signature
+that does not verify is.
+RSA-PSS (RFC 9231 §2.1.1) uses `rsa.verifyPss` with MGF1 over the same hash and a salt as long as the digest;
+the method element may carry no parameter child, any child is `UnsupportedAlgorithm`.
+HMAC-SHA256 compares the full-length MAC in constant time, refuses an empty secret (`KeyAlgorithmMismatch`) and
+refuses any `HMACOutputLength` (`UnsupportedAlgorithm`): truncation would let a one-bit "MAC" verify
+against anything (CVE-2009-0217). Any unlisted algorithm URI → `error.UnsupportedAlgorithm`; any unlisted
+transform → `error.UnsupportedTransform`; the enveloped-signature transform after a C14N transform in one
+`<Transforms>` list → `error.TransformOrderInvalid` (no real signer emits that order, and the chain is untrusted).
 
 ## KeyInfo trust model (`saml` must understand this)
 
@@ -157,11 +161,8 @@ configured certificate — but the trust decision is the caller's. This is the
 correct SP posture: an attacker can always attach their own cert + matching
 signature, so a self-consistent `<KeyInfo>` proves nothing.
 
-We deliberately do **not** feed the embedded cert into
-`std.crypto.Certificate.parse`: in Zig 0.16 (and 0.17.0: the DER element reader is unchanged) that path is not panic-safe on
-adversarial DER (a tracked library hazard). We only base64-decode and surface
-the bytes; extracting a public key from the cert (with DER-defensive parsing) is
-left to the caller / a future helper.
+The embedded cert is only base64-decoded and surfaced, never parsed (reason under *What is deliberately not
+done*); extracting a public key from it, with DER-defensive parsing, is left to the caller.
 
 ## Security posture (untrusted input)
 
@@ -187,18 +188,42 @@ left to the caller / a future helper.
   layer adds "the signature must cover the element I actually consume").
 - **No panics** — every malformed-signature path is a typed error.
 
-### Dependency note (fixed during this work)
+- **Bounded work before authentication** — the reference loop runs before the `SignedInfo` signature is
+  checked, so every reference is work an attacker chose. `Options.max_references` (default 8) is counted and
+  refused with `TooManyReferences` before the reference is canonicalized; `Options.max_c14n_output_len` (default
+  64 MiB) bounds one canonical form (a reference or `SignedInfo`) with `OutputTooLarge`, because exclusive C14N
+  re-renders a namespace declaration on every element that uses the prefix and the output is therefore not
+  bounded by the input; `c14n.Options.max_depth` (default 256) bounds the recursion with `MaxDepthExceeded`,
+  independently of the depth the document was parsed with. Each reference canonicalizes in its own arena
+  released after it, so the peak is one canonical copy, not one per reference. The rendered-namespace lookup
+  is O(1) per element and a PrefixList costs per declaration, not per element.
+- **Scratch memory is wiped** — `verify` backs its arenas with `wipealloc.WipingAllocator`: they hold the
+  canonical form of the octets under verification, which on `saml`'s encrypted-assertion path is a decrypted
+  assertion.
+- **Whitespace is signed content** — `xml` keeps all character data inside an element, whitespace-only runs
+  included (the signer's whitespace is part of the signed octets); only document-level inter-element whitespace is
+  ignored.
 
-The `xml` parser's `parseDocument` originally skipped whitespace even inside an
-element, dropping significant leading whitespace in element content — fatal for
-C14N (the signer's whitespace is part of the signed octets). Fixed so that
-inside an element **all** character data, including whitespace-only runs, is
-preserved; document-level inter-element whitespace is still ignored. All `xml`
-tests remain green.
+## Verification
 
-## Validation & external-vector provenance
+Run `scripts/modtest xmldsig` (Debug, ReleaseFast with UB checks). Test classes: the W3C C14N worked examples
+(below); the external-tool signature fixtures (`src/test_external.zig`); constructed round-trip fixtures in
+`src/root.zig`; per-method tests for ECDSA P-384/P-521, RSA-PSS and HMAC (round trip, tampered `SignedInfo`,
+wrong key, key-family mismatch; no xmlsec1/signxml fixture exists for these four, the older methods keep theirs);
+resource-bound tests (reference cap, output cap, depth cap, per-reference peak memory, namespace-lookup
+complexity pinned by `c14n.Stats` counters); a blind-guard class (a valid `SignedInfo` under a non-`ds:Signature`
+element, prolog/epilog PIs and comments under `URI=""`, `#` and empty ids, unique `id_attr`, wrong-length
+`SignatureValue`s, InclusiveNamespaces outside the exc-c14n namespace, key-family mismatch).
 
-Green in Debug and ReleaseFast (UB-checked).
+- **Fuzz:** the deterministic driver, `XMLDSIG_FUZZ=<runs>[,<first seed>]` (`_ONLY=verify`), runs one harness,
+  `verify`, in the ordinary test binary: a genuine signed document must verify, and one with 1-3 octets flipped
+  must be refused, except changes inside the `SignatureValue` text and whitespace-for-whitespace inside a tag
+  (C14N normalizes both). Reach counters with an in-suite check fail the run when a label never fires; the
+  harness also runs as a `std.testing.fuzz` corpus target.
+- **ctgrind:** none; public-key verification, nothing secret is branched on (card, Hardening line).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
+
 
 **Canonicalization — external-vector-backed (byte-exact):** the worked examples
 of the W3C *Exclusive XML Canonicalization 1.0* and *Canonical XML 1.0* specs.
@@ -280,43 +305,32 @@ data or production keys appear.
 
 **What the tests actually contain.** C14N spec worked examples byte-exact; signature verify = constructed self-signed round-trip
 
-**How it got there.** The anchoring work landed. DONE 9f9d238: xmlsec1 + signxml, two independent oracles; enveloping + ECDSA + tamper
+## Limits (cost)
 
-### Mutation run 2026-10-05
+- Each of up to `max_references` references canonicalizes its whole target, so `verify` does up to 8 (`saml`:
+  1) full canonical passes per call; output is capped, work is linear per pass.
+- `max_c14n_output_len` is a byte bound on the output, not on the CPU of producing it: a document that stays under
+  it can still take a few hundred ms per pass at 64 MiB.
 
-Mutant schemata over a copy of `src/` (one ReleaseSafe build with the dependency closure,
-`setsid -w timeout -s KILL 20` per mutant): **25 mutants, 24 killed, 1 equivalent**. Points: the
-C14N/digest/signature algorithm maps, both SHA-1 gates, the `ds:Signature` element check, the
-reference cap, how a bad digest and the signature combine into `valid`, zero references, the
-enveloped-after-C14N order, unknown transforms, every prolog/epilog PI and comment refusal for
-`URI=""`, the digest comparison and its length, the `#` and empty-id rules, `id_attr`
-uniqueness, the ECDSA `SignatureValue` length, the InclusiveNamespaces namespace check, and the
-key-family mismatch.
+## What is deliberately not done
 
-First pass: 9 survivors. **No defect; 8 test gaps** closed by 5 tests and one extended test:
-a valid SignedInfo under an element that is not `ds:Signature`; an epilog PI and a prolog
-comment under `#WithComments`; `Xobj-1` (no `#`) naming the element with ID obj-1, and `#`
-alone; an ECDSA `SignatureValue` with one octet APPENDED (only the shorter shape was pinned —
-with `<` the first 64 octets verified); an `InclusiveNamespaces` element outside the exc-c14n
-namespace; an RSA method with an EC key (`KeyAlgorithmMismatch`, not a quiet `false`).
-**Equivalent:** `countByAttr`'s early exit at 3 instead of 2 (only "exactly one" matters).
+- **Signing / signature generation.** We are the relying party (service provider) verifying an IdP's signature,
+  never producing one; there is no signing API. goxmldsig and signxml sign, so a user building an IdP or metadata
+  signer cannot use this module. Decided 2026-09-30 (user): not now. The test suite drives the sibling `rsa` /
+  `p256` signers to build round-trip fixtures; that is test scaffolding, not exported API.
+- **XPath / XSLT / XPath-filter / base64 transforms** — rejected by policy (attack surface); arbitrary XPath
+  node-sets with them.
+- **External (non-same-document) references** — rejected (`UriNotResolved`).
+- **DTD-typed attribute normalization** (`ID`/`NMTOKENS` collapse) — the `xml` layer does not process DTDs, so
+  neither does this module.
+- **Trusting `KeyInfo` for the key** — see *KeyInfo trust model*.
+- **Feeding the embedded certificate to `std.crypto.Certificate.parse`** — in Zig 0.16 (and 0.17.0: the DER element
+  reader is unchanged) that path is not panic-safe on adversarial DER (a tracked library hazard).
+- **X.509 chain validation** — left to the caller / the `x509` module.
+- **The general RFC 6931 `rsa-pss` URI with `RSAPSSParams`** — unsupported; only the RFC 9231 fixed-profile URIs
+  are accepted.
 
 ## Backlog / deferred
 
-- **Sweep 2026-11-13 leftovers.** (1) Each of up to `max_references` references canonicalizes its whole target, so `verify` does up to 8 (saml: 1) full canonical passes per call; output is capped, work is linear per pass. (2) `max_c14n_output_len` is a byte bound on the output, not on the CPU of producing it; a document that stays under it can still take a few hundred ms per pass at 64 MiB. (3) A PrefixList token `xmlns` resolves to the reserved xmlns namespace and is rendered as `xmlns:xmlns=...` (pre-existing, unchanged; invalid input, not a crash).
-
-**Missing and it matters** *(survey 2026-09-30)*:
-
-- ✅ DONE 2026-11-16 (`VerifyKey.ecdsa_p384_sec1` / `ecdsa_p521_sec1` with `ecdsa-sha384` / `ecdsa-sha512`, via sibling `p384` / `p521`) **ECDSA-SHA384 / P-384 (and P-521) signatures** *(survey 2026-09-30)*: xmlsec and signxml accept them and some
-  SAML IdPs / eIDAS profiles sign with P-384; today `UnsupportedAlgorithm`. Needs a P-384 verifier (std has one; no
-  sibling `p384` module in the catalog). Effort: small-medium. Fits §2: yes.
-  (Searched: `rg -i 'p384|ecdsa' modules/xmldsig/src/root.zig`: only `ecdsa_sha256` exists.)
-- ✅ DONE 2026-11-16 (RFC 9231 fixed-profile URIs `sha256/384/512-rsa-MGF1`, salt = digest length, no parameter elements, via `rsa.verifyPss`; the general RFC 6931 `rsa-pss` URI with `RSAPSSParams` stays unsupported) **RSA-PSS (`rsa-pss-sha256`, xmldsig-more) *(xmlsec support inferred)*** *(survey 2026-09-30)*: emitted by some modern signers; rare in SAML today.
-  Effort: small — sibling `rsa` already has `verifyPss` (`modules/rsa/src/root.zig:1601`), only the URI + parameters wiring is missing. Fits §2: yes. Low priority.
-- ✅ DONE 2026-11-16 (`VerifyKey.hmac`, constant-time full-length compare, any `HMACOutputLength` refused with `UnsupportedAlgorithm`) **HMAC-SHA256 signature method** *(survey 2026-09-30)*: shared-secret XML-DSig (WS-Security style); not used in SAML. Effort: small. Fits §2: yes. Low priority.
-- **Signing (enveloped) for the IdP side and for tests/tools** *(survey 2026-09-30)*: goxmldsig and signxml sign;
-  a user building an IdP or metadata signer cannot. The SPEC's out-of-scope list makes this a scope decision, not a
-  gap: raised as a question, not filed as a commitment. **Decided 2026-09-30 (user): not now** — stays here without priority. Effort: medium. Fits §2: yes.
-
-**Deliberately not done** (already given above under *Out of scope* / *KeyInfo trust model*): XPath/XSLT transforms,
-external references, DTD-typed ID normalisation, trusting `KeyInfo` for the key, feeding the embedded cert to `std.crypto.Certificate`.
+- **PrefixList token `xmlns`.** A token `xmlns` in an `InclusiveNamespaces` `PrefixList` resolves to the reserved
+  xmlns namespace and is rendered as `xmlns:xmlns=...`; invalid input, not a crash, left as it is.
