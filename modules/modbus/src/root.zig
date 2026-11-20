@@ -556,7 +556,7 @@ pub const rtu = struct {
 /// more-follows, next object id, object count, then (id, length, value)
 /// triples inside the 253-byte PDU budget. The category ranges, the
 /// cumulative stream walk, the restart rule and the conformity values below
-/// were checked against the V1.1b3 PDF text (section 6.21) on.
+/// were checked against the V1.1b3 PDF text (section 6.21).
 pub const device_id = struct {
     /// MEI type for Read Device Identification.
     pub const mei_type = 0x0E;
