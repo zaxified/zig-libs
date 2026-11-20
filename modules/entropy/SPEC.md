@@ -80,18 +80,18 @@ into a whole-process outage. Two things bound it:
   from a pid and a clock outlives the incident, and nothing downstream will ever
   flag it.
 
-There is exactly **one** abort message, and it covers exactly one fault:
-`error.EntropyUnavailable`, a machine or policy problem (seccomp, Landlock, a
-container profile, an unreachable `arc4random_buf`). The `catch |err| switch
-(err)` is exhaustive over `std.Io.RandomSecureError`, so a future std error
-member is a compile error rather than a silent fold into this one.
+`unavailable_message` covers exactly one fault: `error.EntropyUnavailable`, a
+machine or policy problem (seccomp, Landlock, a container profile, an
+unreachable `arc4random_buf`) (`src/root.zig:191`, `:259`). Two more aborts exist
+and each has its own message, because each names a different cause, a bug in the
+`std.Io` handed in and not a machine fault: `canceled_contract_violation_message`
+(`randomSecure` returned `error.Canceled` although the draw ran blocked;
+`:209`, `:307`) and `unsupported_io_message` (the `Io` cannot block cancellation;
+`:222`, `:285`). The `catch |err| switch (err)` is exhaustive over
+`std.Io.RandomSecureError` (`:298`), so a future std error member is a compile
+error rather than a silent fold into one of them.
 
 ## Cancellation is not an entropy fault
-
-Until 2026-08-13 there was a second abort message and a second `@panic`, for
-`error.Canceled`. That was wrong, and the argument for it — that a `void`
-signature has nowhere to report a cancellation — skipped the option std itself
-takes at the same site.
 
 `std.Io.RandomSecureError` is `error{EntropyUnavailable} || std.Io.Cancelable`,
 and neither producer of `error.Canceled` means anything is wrong with the
@@ -99,206 +99,212 @@ machine: `Syscall.start()` returns it *before touching the entropy source*
 whenever a cancel is already outstanding on the task, and an EINTR mid-draw
 routes through `checkCancel()` to the same error. A consumer timing out a
 peer-driven request while it draws an ephemeral key was enough to abort the
-host process — `wireguard`'s handshake, `hpke`'s DHKEM, `sessions`, `acme`'s
-JWS are all on that shape of path. That is a library killing its host over a
-routine timeout, which is a far worse trade than the one the section above
-argues for.
+host process if `fill` treated that as a fault; the handshake, key-agreement and
+session-id draws of the wire-protocol modules are all on that shape of path. A
+library killing its host over a routine timeout is a far worse trade than the one
+the section above argues for.
 
-The fix is std's own, at the analogous site: `std.Io.Threaded.randomMainThread`
-wraps its `randomSecure` call in `swapCancelProtection(.blocked)` with a
-`defer` restore, and only then writes `error.Canceled => unreachable`. The doc
-comment on `std.Io.swapCancelProtection` carries that idiom as its worked
-example. `fill` does the same, so its `error.Canceled` arm is `unreachable`
-*because of the two lines above it*, not because the error cannot occur.
+`fill` therefore does what std does at the analogous site:
+`std.Io.Threaded.randomMainThread` wraps its `randomSecure` call in
+`swapCancelProtection(.blocked)` with a restoring `defer`. `fill` and `tryFill`
+block cancellation across the draw and restore the previous state, not
+`.unblocked`, on the way out (`src/root.zig:295`).
+
+The `error.Canceled` arm of the `randomSecure` switch is a real `@panic` with its
+own message (`canceled_contract_violation_message`, `:307`), not the
+`error.Canceled => unreachable` that `std.Io.swapCancelProtection`'s doc comment
+shows as its worked example. A conforming `Io` never reaches it, but an `Io`
+that violates the "honours `.blocked`" contract sends `fill` down that arm for
+real, and `unreachable` is a promise the optimizer acts on: in ReleaseFast an
+exhaustive two-member switch with one `unreachable` arm may collapse into the
+other arm, so the panic that still fires would report `EntropyUnavailable` for a
+contract violation. Fail-closed by accident, misleading by construction. A real
+`@panic` is correct in every build mode. `Threaded`, `Uring` and `Dispatch`
+implement `swapCancelProtection` as a real state swap.
 
 Two costs, neither hidden:
 
 - **A cancel aimed at a task inside `fill` is not observed until the draw
-  returns.** On a healthy host that is one non-blocking `getrandom(2)`. It is
-  not bounded on a machine whose entropy pool is not yet initialised (early
-  boot, a fresh VM), where `getrandom(2)` with `flags = 0` blocks until it is.
-  The alternative on that same path is not "cancel promptly", it is "abort the
-  process".
-- **`fill` now requires an `std.Io` that implements `swapCancelProtection`.**
-  `std.Io.failing` does not — every cancellation slot on it is `unreachable`.
-  **Since 2026-09-14 (F1) `fill` refuses it rather than calling it:** before the
-  swap it compares the slot with `std.Io.unreachableSwapCancelProtection` and
-  aborts with `unsupported_io_message`, in every build mode. Measured before
-  the check, on the new test: Debug printed std's "reached unreachable code",
-  ReleaseFast died with SIGSEGV. It is a check for that one std-defined slot,
-  not an allowlist of backends; no switch, since no caller has a reason to
-  call a slot that is undefined behaviour to call. The note below is the
-  history.
+  returns.** On a healthy host that is one non-blocking `getrandom(2)` (or one
+  vDSO call). It is not bounded on a machine whose entropy pool is not yet
+  initialised (early boot, a fresh VM), where `getrandom(2)` with `flags = 0`
+  blocks until it is. The alternative on that same path is not "cancel
+  promptly", it is "abort the process". So do not `fill` a buffer larger than
+  the secret you are about to use, and do not use `fill` as a bulk random-byte
+  source.
+- **`fill` and `tryFill` require an `std.Io` that implements
+  `swapCancelProtection`.** `std.Io.failing` does not: its slot is std's
+  `unreachableSwapCancelProtection`, and calling that is undefined behaviour
+  (Debug panics inside std, ReleaseFast takes SIGSEGV, ReleaseSafe aborts; an
+  optimized build does not reliably abort at all, since `unreachable` is a
+  promise to the optimizer, not a check). So before the swap the slot is
+  compared with `std.Io.unreachableSwapCancelProtection` and the call aborts with
+  `unsupported_io_message`, in every build mode (`src/root.zig:285`). It is a
+  check for that one std-defined slot, not an allowlist of backends. `Threaded`,
+  `Evented`, `Uring` and `Dispatch` all implement the slot, and no production
+  caller has a reason to hand in an `Io` that cannot.
 
-  ⚠ **Corrected 2026-09-04: "panics with 'reached
-  unreachable code'" is a Debug-only outcome, and the sentence that followed it
-  drew the wrong conclusion from it.** Measured on a 20-line isolate in all four
-  modes: Debug exits 13, ReleaseSafe exits 134 — and **ReleaseFast and
-  ReleaseSmall do not panic at all**: one binary took SIGSEGV (139), and in
-  another the call fell through into an unrelated branch and the program ran to
-  completion. `unreachable` is not a check in an optimized build; it is a
-  promise to the optimizer.
+With one abort message per cause, no test has to guess which message belongs to
+which arm; `the abort messages each name their own cause` and the whole-message
+needles of the three abort tests pin the binding.
 
-  So what is lost in the build that ships is **not the diagnostic text on a
-  path nothing takes** — it is the abort itself. The mitigating facts still
-  hold (that `Io` simulates a machine with no `Io` operations at all, a draw on
-  it was already fatal, and no production consumer passes it), but they are the
-  reason the exposure is small, not a reason the sentence was right. `Threaded`, `Evented`, `Uring` and
-  `Dispatch` all implement the slot.
+## The vDSO fast path
 
-The removal of the second `@panic` arm also closed a real test gap. With two
-arms and two message constants, no test could tell *which* message was on which
-arm — exchanging them left the suite green, so a seccomp-blocked host could
-have been told its draw was cancelled. With one arm the binding is structural
-rather than asserted.
+`getrandom(2)` costs a syscall per draw. Linux 6.11+ exports a vDSO
+`getrandom` that runs the kernel's own CRNG (a ChaCha20 state in user memory the
+kernel keys, reseeds and wipes across fork) with no syscall; Go 1.24+'s
+`crypto/rand.Read` and glibc 2.41+'s `arc4random` take it. `fill` and `tryFill`
+use it (`src/vgetrandom.zig`) only when all of these hold (`src/root.zig:293`,
+`src/vgetrandom.zig:38`):
+
+- Linux without libc (with libc std already calls `arc4random_buf`),
+- x86_64 (`__vdso_getrandom`, `LINUX_2.6`) or aarch64 (`__kernel_getrandom`,
+  `LINUX_2.6.39`),
+- a non-empty buffer, and
+- `io.vtable` is `std.Io.Threaded`'s own table. An `Io` that copies Threaded's
+  table and replaces any slot (a deterministic simulator, a counting test
+  double, the `failing` case above) still sees every draw through
+  `randomSecure`.
+
+Design, all in `src/vgetrandom.zig`:
+
+- **Symbol lookup.** std has the versioned vDSO lookup but does not export it, so
+  it is restated (`vdsoLookupAt`, `:110`): the symbol must be a defined
+  global/weak function or object and its DT_VERSYM entry must name the wanted
+  version in DT_VERDEF. The symbol count comes from DT_HASH, else from
+  DT_GNU_HASH (`gnuHashSymCount`, `:172`): the arm64 vDSO of the CI runner
+  carries only DT_GNU_HASH, and without that every draw fell back to the syscall.
+  (std's own lookup has the same gap.)
+- **State pool.** The kernel reports the state size and the `mmap` protection and
+  flags in one query call (`opaque_len = ~0`); one mapping with exactly those
+  flags (MAP_DROPPABLE: the kernel may zero the pages under memory pressure or
+  across fork, and the vDSO reseeds a zeroed state) is carved into
+  `slot_count = 64` states, whole states per page, none straddling a page
+  (`init`, `:69`). A state is never used by two threads at once: each slot has a
+  busy flag in ordinary memory (never in the droppable mapping), taken by
+  compare-and-swap and released after the draw (`draw`, `:204`); a thread starts
+  its scan at the slot it used last.
+- **No lock, no wait.** While the pool is being set up, when every slot is taken
+  (more than 64 simultaneous drawers) or when the kernel has no symbol, `draw`
+  returns false having written nothing the caller may use, and the caller takes
+  `io.randomSecure`. A fork while another thread holds a slot leaves that slot
+  busy in the child for ever; the child has one slot fewer.
+- **Fail-closed is the caller's.** `draw` returns true only when the vDSO filled
+  the whole buffer (it loops over short returns); any negative or zero return
+  sends the caller to `randomSecure`, which aborts or returns
+  `EntropyUnavailable` on a real fault. The abort behaviour is therefore the
+  same with and without the vDSO.
+
+The module keeps state because of this path: one mapping and 64 busy flags, and
+nothing else. It is the kernel's generator, not a user-space generator of ours.
 
 ## What the tests can and cannot establish
 
-**Cannot:** that `fill` actually aborts. Zig has no catchable panic, so
-observing it requires re-exec'ing the test binary in a child process, which
-costs a fork per run to assert a one-line `catch`. That trade was declined. With
-two abort arms this left a real gap — nothing pinned which message went with
-which error. With one arm it does not: `unavailable_message` is the only
-`@panic` argument in the module, so the binding is a property of the source
-rather than of a test.
+**The abort is observed, not asserted.** Zig has no catchable panic, so each test
+that needs `fill` to abort `fork`s a child, pipes its stderr back, and the parent
+asserts the child died of SIGABRT **and** printed the expected message (the
+messages share their first 50 bytes, so a prefix cannot tell them apart). Three
+tests do this, one per abort cause: no entropy (the child first installs a
+seccomp filter failing `getrandom(2)` with `EPERM`; x86_64 only, skipped where the
+filter cannot be installed), an `Io` whose `randomSecure` returns `error.Canceled`
+under blocked cancellation (`AlwaysCanceledIo`), and an `Io` carrying the
+unreachable cancel-protection slot (`std.Io.failing` and a copy of Threaded's
+table with that slot, `NoCancelProtectionIo`). A value test cannot see an abort:
+the property is an effect (the process dies), not a result, and a module that
+swallowed the error and fell back to `io.random` would pass every value test.
 
-**Can, and this is the load-bearing part:** *which std entry point the call goes
-to.* `CountingIo` copies the whole `std.Io.VTable` from a real `Io` and replaces
-the slots `fill` uses with observing delegates. `fill` must show
-`secure_calls == 1, random_calls == 0`.
+**Which std entry point the call goes to** is the load-bearing route assertion.
+`CountingIo` copies the whole `std.Io.VTable` from a real `Io` and replaces the
+slots `fill` uses with observing delegates; `fill` must show
+`secure_calls == 1, random_calls == 0`. Every *output-shaped* assertion one might
+reach for ("the bytes differ between calls", "the buffer is not all zero", "the
+whole buffer was written") passes identically under `fill = io.random(buf)`,
+because bytes out of `io.random` on a healthy host are random. A suite of those
+alone would be green against a module that had lost its entire reason to exist.
+A route assertion counts calls and inspects no bytes, so it is blind in the
+opposite direction: a `fillFn` that wrote nothing into a `SecureSource` buffer
+leaves the route green. Hence both kinds, on both entry points: route tests for
+`fill` and `SecureSource`, and sliding-window coverage tests (every position of
+the buffer written) for both.
 
-**What `CountingIo` is not.** It is not a fully working `std.Io`, and the doc
-comment that claimed it was ("keeps working if std grows more vtable entries")
-was wrong until 2026-08-13. It sets `userdata = self` so the overrides can find
-the probe, which means every slot that is *not* overridden holds the inner
-implementation's function pointer and receives the **probe's** userdata —
-a `*CountingIo` where a `*std.Io.Threaded` is expected. `std.Io.VTable` has 109
-slots at Zig 0.16 (about 110 `: *const fn` fields at 0.17.0, not re-audited); three are overridden and the other 106 are mis-bound, so
-calling one is undefined behaviour. Copying the vtable buys compilation against
-a moving std and nothing else. The rule that replaces the false guarantee:
+**What `CountingIo` is not.** It is not a fully working `std.Io`. It sets
+`userdata = self` so the overrides can find the probe, so every slot that is *not*
+overridden holds the inner implementation's function pointer and receives the
+probe's userdata, a `*CountingIo` where a `*std.Io.Threaded` is expected; calling
+one is undefined behaviour (all but three slots are mis-bound). Copying the
+vtable buys compilation against a moving std and nothing else. The rule:
 **every `std.Io` function reachable from `fill` or `SecureSource` needs an
 override in `CountingIo`.** Today that set is `random`, `randomSecure` and
-`swapCancelProtection`.
+`swapCancelProtection` (`src/root.zig:454`). A mis-bound slot does not announce
+itself: `std.Io.Threaded.swapCancelProtection` discards its `userdata` and reads
+a thread-local, and both structs have alignment 8, so a missing override stayed
+green except for the one test that sees nothing happen.
 
-That is not a theoretical hazard, and it did not announce itself. When
-`swapCancelProtection` was added to `fill` it had no override, and the suite
-stayed green: `std.Io.Threaded.swapCancelProtection` discards its `userdata`
-(`_ = t;`) and reads a thread-local instead, and `@alignOf` is 8 for both
-structs so even the `@alignCast` safety check stayed quiet. Measured: with the
-override deleted, the run is `11 pass, 1 fail` — the one red being the new
-cancel-protection test, which sees *nothing happen*, not a crash.
+**A measured limit that shapes the cancel tests.** Under the Zig test runner the
+main thread is not a `std.Io.Threaded` task, so `Thread.current` is `null` and
+`Threaded.swapCancelProtection` stores nothing and always answers `.unblocked`.
+A test that delegated and read the state back would report `.unblocked` whether
+or not `fill` blocks anything. `CountingIo` models the protection state itself
+(still driving the inner `Io`), so the assertion has teeth.
 
-**A second measured limit, which shapes what the cancel tests can assert.**
-Under the Zig test runner the main thread is not a `std.Io.Threaded` task, so
-`Thread.current` is `null` and `Threaded.swapCancelProtection` stores nothing
-and always answers `.unblocked`. A test that delegated and read the state back
-would therefore report `.unblocked` whether or not `fill` blocks anything.
-`CountingIo` models the protection state itself for that reason (while still
-driving the inner `Io`), so the assertion has teeth; the mutation evidence
-below is what makes that claim checkable rather than a promise.
-
-The route distinction is worth labouring. Every *output-shaped* assertion one
-might reach for — "the bytes differ between calls", "the buffer is not all
-zero", "the whole buffer was written" — passes identically under
-`fill = io.random(buf)`, because bytes out of `io.random` on a healthy host
-**are** random. A suite made only of those tests would be fully green against a
-module that had lost its entire reason to exist. Only an assertion about the
-*route* separates the two implementations, which is why the suite is built
-around one. It is not, however, sufficient on its own: a route assertion counts
-syscalls and inspects no bytes, so it is blind in the opposite direction — see
-the `SecureSource` measurement below.
-
-Verified by mutation, and the split is worth recording exactly. With the
-`randomSecure` call in `fill` replaced by `io.random(buf)`,
-`zig build test-entropy` reports **5 passed, 5 failed, 2 crashed** of 12
-(exit 1). The seven that notice are the route assertions (`fill draws from
-randomSecure and never from random`, `SecureSource routes every draw through
-randomSecure`, the `secure_calls == 1` checks inside the zero-length,
-large-buffer and large-`SecureSource` tests) plus the two cancel-protection
-tests, which crash rather than fail because the draw they inspect never
-happened. The five greens are precisely the output-shaped and premise tests —
-bytes differ across calls, both whole-buffer coverage checks, `std.Io.failing`'s
-contract, the message constant — none of which can tell the two implementations
-apart. That split is the evidence for the paragraph above: nearly half this file
-would certify a module that had lost its purpose.
-
-*(Recorded for comparison: before 2026-08-13 the same mutation gave a 4/4 split
-of 8 tests. The suite grew by the four tests added for the cancel-protection fix
-and the `SecureSource` output gap.)*
-
-**What the output-shaped tests do buy, on the other entry point.** `fill` had a
-sliding-window coverage assertion from the start; `SecureSource` — the adapter
-all twelve `bfv`/`tfhe` secret-key draws go through — had none, so a `fillFn`
-that wrote *nothing*, leaving every key as uninitialised stack memory, left the
-suite fully green. Measured, and it is the `wireguard`-nonce class exactly:
-`fillFn` → `fill(self.io, buffer[0..0])` was **8/8 green** before the two
-`SecureSource` coverage tests existed, and is **10 pass, 2 fail** (exit 1) with
-them; the subtler `buffer[0 .. buffer.len / 2]` gives the same 10/2. Route
-assertions and output assertions catch disjoint defects, and this module needed
-both on both entry points.
-
-`std.Io.failing` is pinned separately as the premise: a std-provided `Io` whose
+**The premise.** `std.Io.failing` is pinned separately: a std-provided `Io` whose
 `random` returns zeros and whose `randomSecure` refuses. It is std's own most
-extreme statement of the degrade, and if either half of that contract changes,
-the test says so.
+extreme statement of the degrade, and if either half of that contract changes the
+test says so.
 
 ## What a draw costs, and why the adapter is not where to fix it
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-entropy`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions): ref 0.92–1.01× Go crypto/rand.Read, against 0.98–1.01× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
+The benchmark is `zig build bench-entropy` (`tools/bench.zig`, Go's
+`crypto/rand.Read` as the reference); the card's Performance line carries the
+figures. The numbers below are for the syscall route (a draw that does not take
+the vDSO), which is what a `SecureSource` pays whenever `fill` falls back to
+`randomSecure`.
 
-`SecureSource` makes one `getrandom(2)` syscall per `std.Random` draw, including
-the four bytes `std.Random.int(u32)` takes. That is the design — every byte came
-out of the OS on this call — and it is expensive. The number belongs here rather
-than in a review comment, and so does where it goes.
-
-Measured 2026-08-13 on this host (Zig 0.16, `-Doptimize=ReleaseFast`, a
-temporary bench added to `src/root.zig` and removed afterwards), 100 000
-iterations per row:
+`SecureSource` makes one `fill` per `std.Random` draw, including the four bytes
+`std.Random.int(u32)` takes. That is the design (every byte came out of the OS on
+this call), and on the syscall route it is expensive. Measured on Zig 0.16,
+`-Doptimize=ReleaseFast`, 100 000 iterations per row:
 
 | path | ns per draw |
 |---|---|
-| `SecureSource` → `std.Random.int(u32)` | **816** |
+| `SecureSource` -> `std.Random.int(u32)` | **816** |
 | `fill(io, buf[0..4])` | 796 |
 | `io.randomSecure(buf[0..4])` | 773 |
 | bare `getrandom(2)` on 4 bytes, no `std.Io` | **771** |
-| the `swapCancelProtection` pair alone | ~0 (27 µs / 100 000) |
-| `std.Random.IoSource` → `int(u32)` (i.e. `io.random`) | 23 |
+| the `swapCancelProtection` pair alone | ~0 |
+| `std.Random.IoSource` -> `int(u32)` (i.e. `io.random`) | 23 |
 
 **94% of a `SecureSource` draw is the syscall itself.** `std.Random`'s own
 machinery costs 20 ns, the `std.Io` vtable hop 2 ns, and the cancel-protection
-pair the 2026-08-13 fix added is not measurable at this resolution. So there is
-nothing in the adapter, in `fill`, or in the vtable to tune: the only lever is
-*fewer, larger* draws. For comparison, one bulk `fill` of 400 000 bytes takes
-1.26 ms, so the per-draw route is **65×** more expensive for the same bytes.
-(An earlier note recorded 872 ns and 85×; both are superseded by the row above,
-which was re-measured rather than carried forward.)
+pair is not measurable at this resolution. So there is nothing in the adapter, in
+`fill` or in the vtable to tune: the only lever is *fewer, larger* draws (one bulk
+`fill` of 400 000 bytes takes 1.26 ms, so the per-draw route is 65x more
+expensive for the same bytes).
 
-**Buffering inside `SecureSource` is still refused, and the measurement does not
-change that.** A pool of pre-drawn bytes living across calls is a userspace
-CSPRNG wearing this module's name: bytes get *stretched*, one OS draw serves
-several logically independent secrets, and compromising the pool at time T
-compromises secrets drawn after T. That is the exact property `randomSecure`
-exists to deny.
+**Buffering inside `SecureSource` is refused.** A pool of pre-drawn bytes living
+across calls is a userspace CSPRNG wearing this module's name: bytes get
+*stretched*, one OS draw serves several logically independent secrets, and
+compromising the pool at time T compromises secrets drawn after T. That is the
+exact property `randomSecure` exists to deny.
 
 **A per-operation buffer is a different object, and the difference is not
 cosmetic.** One `fill` at the top of an operation, consumed byte-for-byte, then
 `secureZero`d: the map from OS bytes to consumed bytes is the identity (no
 expansion function, so nothing is stretched), no byte serves two operations, and
-no state survives the call. The exposure it adds is raw entropy sitting in a
-frame for the length of one operation — and whoever can read that frame can
-already read the secret being built from it in the same frame, so it puts
-nothing new within reach. A cross-call pool does: it exposes secrets that do not
-exist yet, belonging to callers that have not run. That asymmetry is the whole
-argument, and it is why "buffer per operation" is allowed here and "buffer
-inside the adapter" is not.
+no state survives the call. The exposure it adds is raw entropy sitting in a frame
+for the length of one operation, and whoever can read that frame can already read
+the secret being built from it, so it puts nothing new within reach. A cross-call
+pool exposes secrets that do not exist yet, belonging to callers that have not
+run. That asymmetry is why "buffer per operation" is allowed and "buffer inside
+the adapter" is not.
 
-**If it is ever done, do it with a small refilling window, not one big buffer.**
-Measured over 393 216 bytes (`bfv.keyGen`'s exact byte budget at N = 8192,
-L = 4), varying the size of each `fill`:
+**If a consumer buffers, it should use a small refilling window, not one big
+buffer.** Measured over 393 216 bytes (the byte budget of a `bfv` key generation
+at N = 8192, L = 4), varying the size of each `fill` on the syscall route:
 
 | window | syscalls | total |
 |---|---|---|
-| 8 B (today's per-draw route) | 49 152 | 39.7 ms |
+| 8 B (the per-draw route) | 49 152 | 39.7 ms |
 | 64 B | 6 144 | 5.77 ms |
 | 256 B | 1 536 | 2.36 ms |
 | 1 KiB | 384 | 2.17 ms |
@@ -306,52 +312,53 @@ L = 4), varying the size of each `fill`:
 | 16 KiB | 24 | 1.60 ms |
 | 64 KiB | 6 | 1.62 ms |
 
-A 4 KiB window recovers 95% of the entire available saving. Going to a
-whole-operation buffer buys another 0.24 ms and holds 384 KiB of *unconsumed*
-raw entropy instead of 4 KiB — worse on exposure, negligibly better on time. So
-the shape to reach for is a small window refilled by `fill` as it drains, inside
-one operation, zeroized on the way out.
+A 4 KiB window recovers 95% of the entire available saving. A whole-operation
+buffer buys another 0.24 ms and holds 384 KiB of *unconsumed* raw entropy instead
+of 4 KiB: worse on exposure, negligibly better on time.
 
-**No such helper is exported, because there is no caller for it.** All twelve
+**No such helper is exported, because there is no caller for it.** The twelve
 `SecureSource` sites in the collection are `pub fn X(io: std.Io)` wrappers whose
-body calls the `XForTest(random: std.Random)` twin — and every one of those
-twins carries `comptime if (!builtin.is_test) @compileError(…)`. Zig analyses the
-twin's body because the wrapper references it, so **the wrappers do not compile
-outside a test build either**. Verified rather than reasoned: a non-test
-`zig build-obj` over a root that calls `Bfv(params.test_tiny).keyGen(io)` fails
-with that `@compileError`, reported through `keyGen` (`bfv.zig:683`), exit 1;
-the same probe against `Tfhe(params.toy).lweKeyGen(16, io)` fails identically
-(`tfhe.zig:292`). Every millisecond in the tables above is therefore paid only
-by test builds. A helper here would be new API surface — on a module whose value
-is having almost none — serving a path production cannot reach. The measurement
-and the idiom are written down; the code is not.
+body calls the `XForTest(random: std.Random)` twin, and every twin carries
+`comptime if (!builtin.is_test) @compileError(...)`. Zig analyses the twin's body
+because the wrapper references it, so the wrappers do not compile outside a test
+build either (a non-test `zig build-obj` over a root calling `Bfv(...).keyGen(io)`
+fails with that `@compileError`; `Tfhe(...).lweKeyGen` fails identically). Every
+millisecond in the tables above is therefore paid only by test builds, and a
+helper here would be new API surface, on a module whose value is having almost
+none, serving a path production cannot reach. That reachability is a defect of
+the consumers, not of this module.
 
-That reachability fact is a defect in `bfv`/`tfhe`, not in this module, and it is
-recorded in their audit files rather than fixed here.
+## What is deliberately not done
 
-## Scope
+- **No generator.** No pool, no reseed, no DRBG, no state of any kind beyond the
+  kernel's vDSO states (*The vDSO fast path*). Adding one would give this module
+  something to be wrong about, and its whole value is that it has nothing to be
+  wrong about.
+- **No retry or chunking.** `randomSecure` is called at most once per `fill`
+  (after a vDSO attempt that wrote nothing usable), asserted by a test. Short
+  reads and retries are `std.Io`'s contract; a retry loop here would be a second,
+  undocumented entropy policy.
+- **No detector.** Nothing here can tell whether the `std.Io` it was handed has a
+  real entropy source behind it: a consumer that passes a doctored `Io` gets what
+  it asked for. This module removes the *accident* (reaching for the degrading
+  call because it is the one that fits), not the possibility. That is the same
+  ceiling the `Entropy` unions of the `jwe` and `dtls` modules hit, from the other
+  direction.
+- **No buffering in `SecureSource`, and no exported window helper.** See *What a
+  draw costs*.
+- **`ssh` and `bulletproofs` are not migrated.** Both hand-roll a `getrandom(2)`
+  loop with the same abort posture, and both are deliberately `platform = .linux`
+  for it. Rewriting them onto `std.Io` is a behaviour change to working, audited
+  code for no gain (`CONVENTIONS.md` section 2.2).
+- **No threshold test for distinctness.** See *What the distinctness pattern does
+  not catch*.
+- **No libc path of our own.** With libc, std calls `arc4random_buf` and so does
+  `randomSecure`; the vDSO path is not taken there.
 
-- **No generator.** No pool, no reseed, no DRBG, no state of any kind. Adding
-  one would give this module something to be wrong about, and the module's
-  whole value is that it has nothing to be wrong about.
-- **No retry or chunking.** `randomSecure` is called exactly once per `fill`,
-  asserted by a test. Short reads and retries are `std.Io`'s contract; a retry
-  loop here would be a second, undocumented entropy policy.
-- **No detector.** Nothing here can tell whether the `std.Io` it was handed has
-  a real entropy source behind it — a consumer that passes a doctored `Io` gets
-  what it asked for. This module removes the *accident* (reaching for the
-  degrading call because it is the one that fits), not the possibility. That is
-  the same ceiling `jwe`'s `Entropy` and `dtls`'s `Entropy` unions hit, from the
-  other direction.
-- **`ssh` and `bulletproofs` are not migrated.** Both hand-roll a
-  `getrandom(2)` loop with the same abort posture, and both are deliberately
-  `platform = .linux` for it. Rewriting them onto `std.Io` is a behaviour change
-  to working, audited code for no gain; see `CONVENTIONS.md` §2.2.
-
-## Model and invariants (2026-10-11)
+## Model and invariants
 
 Two things here have a right answer that a test can be checked against, and
-both now are:
+both are:
 
 - **The vDSO symbol lookup** (`vdsoLookupAt`) is compared, on the running
   kernel's own image, with `modelSymbols`: a second reader that reaches the
@@ -370,15 +377,8 @@ both now are:
   per-position check: for every length 1..130 and 4099, no position reads 0 in
   16 or more of 64 draws (Binomial(64, 1/256) tail < 1e-20). A negative control
   pins that both reject what they claim to (a stuck tail byte, a byte counter).
-  This is the threshold the next section said was not defensible for
-  *distinctness*; for a byte histogram and a per-position count it is, because
+  That threshold is not defensible for *distinctness* (see below); for a byte histogram and a per-position count it is, because
   the false-alarm rate is computed, not guessed.
-
-Mutation, 2026-10-11 (3 hand mutants, all killed): the vDSO draw loop stopping
-one byte short (3 tests), the version check dropped from the lookup (the model
-test), `fill` passing `buf[0 .. len - 1]` to the vDSO draw (the uniformity
-tests — the sliding-window coverage test above does NOT see a single unwritten
-tail byte, since its 16-byte window still holds 15 random ones).
 
 ## What the distinctness pattern does not catch
 
@@ -391,6 +391,14 @@ on how much of the buffer must change, and no threshold is defensible. Treat
 distinctness as evidence that the source is wired up, never as evidence that it
 filled the whole buffer.
 
+## Verification
+
+- **Run:** `scripts/modtest entropy` (tests are in `src/root.zig` and `src/vgetrandom.zig`); `zig build bench-entropy` is the benchmark (needs a Go toolchain, standard library only).
+- **Abort tests:** a forked child per abort cause; the no-entropy one uses a seccomp filter (x86_64 Linux, skipped where it cannot be installed).
+- **Route and output tests:** `CountingIo` route assertions, whole-buffer coverage, a byte chi-square and per-position check on every route (`Model and invariants`), and a negative control that the uniformity checks reject a stuck position and a counter.
+- **vDSO tests:** the lookup against a section-table model on every exported symbol of the running kernel's vDSO; pool and slot invariants (every state inside the mapping, in its own page, apart from the others; refusal while initializing or unavailable; scan from the hint, wrap, give up when all slots are taken); a scripted stand-in for the vDSO function (`vgetrandom.func`) driving short returns, a zero and an error; a synthetic ELF image reaching what the real vDSO cannot (load bias, a `PT_DYNAMIC` whose offset and address differ, each missing table, which symbol types and binds may bind, DT_HASH before DT_GNU_HASH and DT_GNU_HASH alone, the version check needing both DT_VERSYM and DT_VERDEF); direct tests of `versionMatches` and `gnuHashSymCount`. The vDSO tests gate on `symbolPresent()` and then require `draw` to succeed, so a broken pool does not look like a kernel without the feature.
+- **Fuzz:** none; no fuzz obligation (the card's Hardening line). **ct:** n/a, nothing computes on the secret bytes.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it. Not mutated: `supported`, the `sym` table and `threaded_vtable` (comptime), the memory orders of the busy flags (no test can observe a weaker order), `diagLookup` and `modelSymbols` (test-side). Survivors of the whole-module run: four UNOBSERVABLE (the `size_of_opaque_state == 0` guard, `size > page` as `>=` and dropped: the kernel never reports a zero or page-sized state; the post-init `.ready` check: needs an `init` that fails after the symbol was found and the race won) and two EQUIVALENT (`buf.len != 0` dropped in `draw`: an empty draw claims a slot, makes no vDSO call and returns true, only the order of `init` changes; `per_page + 1` in `init`: the page count is unchanged for this kernel's state size, which the `mapped_len` test compares).
 
 ## Anchoring
 
@@ -401,19 +409,6 @@ filled the whole buffer.
 
 **What the tests actually contain.** own policy binding over the kernel CRNG (std.Io.randomSecure, or the vDSO `getrandom` under std's Threaded Io); no algorithm and no wire, so no third party to agree with — tests pin WHICH std entry point is called, not any output value
 
-## Audit 2026-11-17 (whole-module mutation)
-
-117 mutants over every non-test line of `src/root.zig` (`fill`, `tryFill`, `SecureSource`: the abort arms and their messages, the cancel-protection pair, the vDSO routing condition) and `src/vgetrandom.zig` (pool setup, the symbol lookup and its ELF walk, `gnuHashSymCount`, `versionMatches`, `slotPtr`, the slot scan and the draw loop), one schemata build, baseline first. The suite as it stood left 57 alive: its vDSO tests returned *skip* when `draw` returned false, so a broken `init`, a leaked slot or a wrong slot address looked like a kernel without the feature, and the two abort messages share their first 50 bytes, which the 40-byte needle could not tell apart. 13 tests added (41 now, none skipped on a 6.11+ kernel):
-
-- the vDSO tests gate on `symbolPresent()` (the symbol is in the image) and then require `draw` to succeed;
-- every slot's state lies inside the mapping, in its own page, apart from the others, and the mapping is exactly the pages the slots need (`mapped_len`);
-- `draw` refuses while the pool is `initializing` or `unavailable`, runs `init` from `uninit`, scans from the hint, wraps at `slot_count`, remembers and releases its slot, and gives up (false, nothing written) when every slot is taken;
-- a scripted stand-in for the vDSO function (`vgetrandom.func`) drives the draw loop through short returns, a zero and an error, checking each call's pointer, remaining length, flags and state, and `fill`/`tryFill` routing: the Threaded table takes the vDSO path and keeps its bytes, any other table never reaches it;
-- a synthetic ELF image reaches what the real vDSO (linked at 0, both hash tables, every symbol defined) cannot: a load bias that is not the image address, a `PT_DYNAMIC` whose offset and address differ, each missing table, which symbol types and binds may bind, an undefined symbol, DT_HASH before DT_GNU_HASH and DT_GNU_HASH alone (the arm64 case, on x86_64 too), the version check needing both DT_VERSYM and DT_VERDEF; plus direct tests of `versionMatches` (the BASE definition is never matched) and `gnuHashSymCount` (a bucket starting at `symoffset`);
-- both abort tests compare the whole message, not a prefix.
-
-Source: `vgetrandom.func` is `pub` (the file is not re-exported by the root), `symbolPresent()` and `mapped_len` are new; no behaviour change. 111 mutants die. 6 do not: 4 UNOBSERVABLE (`size_of_opaque_state == 0` guard dropped, `size > page` as `>=` and dropped: the kernel never reports a zero or page-sized state, so the guards need a kernel that does; the post-init `.ready` check dropped: needs an `init` that fails after the symbol was found and the race won), 2 EQUIVALENT (`buf.len != 0` dropped: an empty draw claims a slot, makes no vDSO call and returns true, so the bytes are identical and only the order of `init` changes — cost-only; `per_page + 1` in `init`: the page count, hence the mapping, is unchanged for this kernel's state size, which the `mapped_len` test compares). Not mutated: `supported`, the `sym` table and `threaded_vtable` (comptime), the memory orders of the busy flags (no test can observe a weaker order), `diagLookup` and `modelSymbols` (test-side). Counts on the card are whole-module.
-
 ## Backlog / deferred
 
-- ~~**Speed: 1.86–6.74× Go `crypto/rand.Read`'s time**~~ **closed 2026-10-10**: `fill` takes the kernel's vDSO `getrandom` under std's Threaded Io on Linux without libc (`src/vgetrandom.zig`) → 0.98–1.01× Go (32 B 99 ns, 4 KiB, 1 MiB). Fallback to `std.Io.randomSecure` on anything the vDSO does not complete, so fail-closed is unchanged. Not done: "fastest in the field" (Rust `getrandom` takes the syscall, so Go's vDSO path is likely the fastest; unmeasured).
+- **Speed: "fastest in the field" is not measured.** The vDSO path puts `fill` at the reference (Go's `crypto/rand.Read`) on Linux without libc; the card's Performance line has the ratio. Rust `getrandom` takes the syscall, so Go's vDSO path is likely the fastest, but no run against `getrandom`, libsodium or glibc `arc4random` exists to say so.

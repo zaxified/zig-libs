@@ -18,7 +18,7 @@ without libc under std's own `Threaded` Io, out of the kernel's vDSO
   bridge.
 - **Platform:** any (`std.Io` carries the OS-specific half — `getrandom(2)` on
   Linux, `arc4random_buf` under libc). **Role:** util.
-  **Concurrency:** reentrant (the vDSO path keeps a lock-free pool of
+  **Concurrency:** threadsafe (the vDSO path keeps a lock-free pool of
   kernel-sized states in one mmap'd mapping, each taken by an atomic busy flag;
   `randomSecure` is documented threadsafe). **Allocation:** none from an
   allocator; the vDSO state pool is a kernel `mmap`, not heap.
@@ -81,22 +81,21 @@ error instead of an abort. A `SecureSource` must outlive the `std.Random` its
 
 ## Notes
 
-- Zero-length buffers are legal and still make the call, so "no bytes needed"
-  cannot be mistaken for "entropy works here".
+- Zero-length buffers are legal and return cleanly even on a machine with no
+  entropy at all: the backends short-circuit an empty buffer before any draw, so
+  "no bytes needed" is not a probe of whether entropy works here.
 - `SecureSource` makes **every** draw a call to `fill`, including the single
   bytes `std.Random.int`/`uintLessThan` take. Correct for key and nonce
   material; wasteful for anything else. Where `fill` has to take the
-  `randomSecure` syscall each of those is a syscall, and the numbers below were
-  measured that way, **before the vDSO path (2026-10-10)** existed: measured
-  2026-08-13, ReleaseFast: **816 ns per
-  `int(u32)`**, of which **771 ns is the bare `getrandom(2)`** — so 94% of it is
-  the syscall and there is nothing in the adapter to tune. Against one bulk
-  `fill` of the same bytes it is **65×**. A consumer that needs thousands of
-  small draws must restructure to fewer, larger `fill`s; buffering *inside* the
-  adapter is refused, because a pool that lives across calls is the userspace
-  CSPRNG this module exists to avoid. [SPEC.md](SPEC.md) has the full
-  decomposition, the window-size sweep, and the argument for why a
-  per-operation window is a different object from a cross-call pool.
+  `randomSecure` syscall (no vDSO: libc builds, kernels before 6.11, an `Io` that
+  is not std's `Threaded`) each of those is a syscall: 816 ns per `int(u32)`, of
+  which 771 ns is the bare `getrandom(2)`, and 65x the cost of one bulk `fill` of
+  the same bytes. A consumer that needs thousands of small draws must
+  restructure to fewer, larger `fill`s; buffering *inside* the adapter is
+  refused, because a pool that lives across calls is the userspace CSPRNG this
+  module exists to avoid. [SPEC.md](SPEC.md) has the decomposition, the
+  window-size sweep, and the argument for why a per-operation window is a
+  different object from a cross-call pool.
 - `SecureSource.interface()` hands back a plain `std.Random`, which **erases**
   the fail-closed property: downstream it is indistinguishable from
   `DefaultPrng.init(0).random()`. So swapping `std.Random.IoSource` for
@@ -106,9 +105,14 @@ error instead of an abort. A `SecureSource` must outlive the `std.Random` its
   function: `comptime if (!builtin.is_test) @compileError("…");`. All twelve
   existing sites carry it (`modules/tfhe/src/tfhe.zig`, `lweKeyGen` /
   `lweKeyGenForTest`); the `SecureSource` doc comment has the pattern in full.
-- The abort path has no unit test and cannot have one — Zig has no catchable
-  panic. What is tested is everything that decides whether it is reachable and
-  correct; [SPEC.md](SPEC.md) says what that buys and what it does not.
+- The abort paths are tested by forking a child and asserting it dies of SIGABRT
+  with the expected message; [SPEC.md](SPEC.md) says what the tests establish and
+  what they cannot.
+
+## Not provided
+
+No generator, no retry, no buffering inside `SecureSource`, no detector of a
+doctored `Io`; the reasons are in SPEC *What is deliberately not done*.
 
 ## Verify
 
