@@ -55,7 +55,7 @@ source consulted or copied). The W-TinyLFU store underneath is
 
 See `SPEC.md` for the concurrency model + rationale, the single-flight
 mechanism, the exact invalidate-during-load / TTL=0 / loader-panic edge
-semantics, and the deliberately-deferred list (including stale-while-revalidate).
+semantics, and what is open (stale-while-revalidate) or deliberately not done (*Backlog / deferred*, *What is deliberately not done*).
 
 ## Without the router (and without HTTP)
 

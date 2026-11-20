@@ -8,9 +8,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-16** — New: bulk loading. `Options.bulk_loader` (`BulkLoader`) + `Cache.getAll(keys)` / `freeAll`: hits served from the cache, keys already in flight awaited (coalesced), the remaining distinct keys fetched in ONE bulk loader call, stored under the usual TTL/negative rules (`ttl_fn` included); keys the loader omits become negative entries; without a bulk loader each missing key uses the single loader. Default behaviour unchanged.
 
 - **2026-11-16** — New: per-key TTL. `Options.ttl_fn` (`TtlFn`) + `ttl_ctx` choose the TTL of each positively loaded entry (null = `ttl_ns`, `<= 0` = never expire); default behaviour unchanged.
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that Zig has no io-less blocking mutex / `std.Thread` primitives re-checked against the 0.17.0 std (still true).
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-04** — Tests: first mutation run (36 mutants, 35 killed, 1 equivalent); added tests for the TTL boundary, uncached error with `negative_ttl_ns = 0`, invalidation during a load, invalidation/negative-hit stats, absent-key invalidate in a full cache, and the `max_entries` bound.
 - **2026-08-06** — Security audit: five findings fixed (part of the collection-wide

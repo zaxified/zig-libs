@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [eko/gocache](https://github.com/eko/gocache) | Go | MIT | 2.9k | push 2026-09-13 | README: a "loadable cache" wrapper over interchangeable stores (memory, Redis, and others). |
 | [karlseguin/cache.zig](https://github.com/karlseguin/cache.zig) + [karlseguin/singleflight.zig](https://github.com/karlseguin/singleflight.zig) | Zig | MIT | 92 / 9 | push 2026-08 / 2026-04 | The Zig alternatives (descriptions from the GitHub search only, READMEs not read): a thread-safe expiration-aware LRU cache, and a separate single-flight; no cache with a built-in loader was found. `ramcache` in this repo is the storage layer underneath ours. |
 
-**Where we are ahead:** the only Zig option found that joins storage (W-TinyLFU), loader and cross-thread miss coalescing in one API *(inferred from the search descriptions)*; negative caching of "not found" and, opt-in, of loader errors; an injectable clock so TTL logic is tested without sleeping; invalidate-during-load never loses the invalidation; O(1) `invalidateAll` by generation bump. **Where we are behind:** no stale-while-revalidate / `refreshAfterWrite`, no per-key TTL or per-call loader, no bulk `getAll`, one spinlock over the whole map, byte-slice keys and values only, `get` returns an owned copy (→ Backlog).
+**Where we are ahead:** the only Zig option found that joins storage (W-TinyLFU), loader and cross-thread miss coalescing in one API *(inferred from the search descriptions)*; negative caching of "not found" and, opt-in, of loader errors; an injectable clock so TTL logic is tested without sleeping; invalidate-during-load never loses the invalidation; O(1) `invalidateAll` by generation bump. **Where we are behind:** no stale-while-revalidate / `refreshAfterWrite` (→ Backlog), no per-call loader, one spinlock over the whole map, byte-slice keys and values only, `get` returns an owned copy.
 
 ## 1. Concurrency model — why `.threadsafe`
 
@@ -124,15 +124,17 @@ caching** entirely (every miss re-hits the loader).
   O(1), no sweep. This is precisely `ramcache`'s generation axis, used as
   intended.
 
-- **`invalidate(key)`** is the one thing `ramcache` does *not* offer directly:
-  it has `get` / `put` / `clear` / generation, but had **no per-key remove**
-  when this was written (see §7; `ramcache` has a `remove` now, and this module
-  still uses the shadow below). So a single-key invalidation shadows the entry by overwriting it with a
-  reserved **poison generation** (`maxInt(u64)`, which the live generation never
-  reaches), making the next `get` see it stale and drop it. To avoid inserting a
-  junk entry for a key that was never cached, presence is first probed with
-  `ramcache.isDirty` — a side-effect-free test that is exact here because every
-  entry `readthrough` stores is dirty (it never calls `markClean`).
+- **`invalidate(key)`** is the one thing `ramcache` does not offer through the API this
+  module uses (`get` / `put` / `clear` / generation / `isDirty`): its generation axis is
+  a single global counter, not per-key. A single-key invalidation therefore shadows
+  the entry by overwriting it with a reserved **poison generation** (`maxInt(u64)`,
+  which the live generation never reaches) and immediately reads the key under the
+  live generation, which drops the shadow, so the slot is freed at once rather than
+  lazily; a burst of invalidations does not displace live entries. To avoid inserting
+  a junk entry for a key that was never cached, presence is first probed with
+  `ramcache.isDirty` (side-effect free and exact here because every entry
+  `readthrough` stores is dirty: it never calls `markClean`). `ramcache` has a
+  per-key `remove`; switching to it is in *Backlog / deferred*.
 
 - **Invalidate during an in-flight load.** Both `invalidate(key)` and
   `invalidateAll()` set the `poisoned` flag on any matching in-flight `Call`.
@@ -143,6 +145,7 @@ caching** entirely (every miss re-hits the loader).
   that was just invalidated, but the *cache* does not durably serve it; the next
   `get` reloads. This is uniform for single-key and all-key invalidation and is
   tested under real threads.
+
 
 ## 5. Ownership / return contract
 
@@ -174,63 +177,59 @@ lock**, so `f` must be cheap and non-reentrant.
   undefined result and cannot be safely reclaimed. This mirrors `writebehind`'s
   single-owner-teardown requirement.
 
-## 7. Where the coordinator brief was imprecise (recorded for the auditor)
+## 7. Per-key TTL and bulk read
 
-The task brief said "`ramcache` already supports generation invalidation — reuse
-it" for **both** `invalidate(key)` and `invalidateAll()`. That is accurate for
-`invalidateAll` (the generation axis is exactly right) but **not** for
-`invalidate(key)`: `ramcache` then exposed no per-key remove (it has `remove` now), and its generation axis
-is a single global counter, not per-key. The per-key path is therefore
-implemented in this module via the poison-generation shadow described in §4,
-using only `ramcache`'s public `get`/`put`/`isDirty`. No change to `ramcache`
-was needed or made.
+- **Per-key TTL** (`Options.ttl_fn`, `TtlFn`, with `ttl_ctx`): called once per
+  successful positive load, on the loader's thread outside the lock, right after
+  the loader returned the value; `null` means `Options.ttl_ns`, `<= 0` means never
+  expire by time. Negative entries keep `negative_ttl_ns`. Same contract as the
+  loader: no re-entry into the same `Cache`, no panic.
+- **Bulk read** (`Options.bulk_loader`, `BulkLoader`; `Cache.getAll`, `freeAll`):
+  one `Loaded` per requested key in request order. Fresh hits (positive and
+  negative) come from the cache; the rest go to the bulk loader in one call with
+  exactly the missing distinct keys, on the caller's thread outside the lock; the
+  outcome slice is pre-set to `.missing`, so a key the loader leaves out is a
+  negative entry. A key another caller is already loading is awaited (the same
+  coalescing as `get`) and a key this call loads is visible to concurrent `get`s as
+  in flight; duplicate keys load once. Without a bulk loader each missing key goes
+  through `get`. If any key fails (loader error, cached loader error, out of
+  memory) the whole call returns that error, nothing is leaked, and values loaded
+  for the other keys stay cached. This is Caffeine's `getAll` / `loadAll` shape.
 
-## Mutation run 2026-10-04
+## Verification
 
-First mutation-schemata run (one ReleaseSafe test binary, 36 mutants behind a
-runtime switch, baseline first): 36 mutants, 35 killed, 1 equivalent. Mutants
-covered the stats counters (get and `ifCached`), the coalescing branch, the
-`poisoned` checks for value/missing/error results, the negative-TTL and
-`cache_loader_errors` guards, TTL arguments (+1/-1), `invalidate` (poison of an
-in-flight load, presence probe, poison generation, eager reclaim),
-`invalidateAll` (generation bump, poisoning), tag decoding, and `max_entries`.
+`scripts/modtest readthrough` (or `zig build test-readthrough`, also
+`-Doptimize=ReleaseFast`), `testing.allocator`-clean (no leaked `Call`, in-flight
+key or value).
 
-13 mutants survived the existing tests; 12 were killed by six new tests (TTL
-boundary at exactly ttl and ttl+1 ns, error with `negative_ttl_ns = 0`,
-invalidate/invalidateAll from inside a load for value/missing/error results,
-invalidation/negative-hit counters, absent-key invalidate in a full cache,
-`max_entries` bound). Equivalent: the clock shifted by +1 ns (`now()` feeds both
-store and lookup, so every age is unchanged). No source defects found.
+- **Deterministic unit tests** (`src/root.zig`; injected manual clock, counting
+  loader): read-through basics, distinct-key independence, TTL expiry (exactly at
+  and one nanosecond past the TTL), `invalidate` / `invalidateAll` including from
+  inside a load for value, missing and error results, negative caching (miss and
+  opt-in error, retry after the negative TTL, `negative_ttl_ns = 0`), the counters,
+  `max_entries`, per-key TTL, `getAll`, and the zero-allocation `ifCached` path.
+- **Real-thread tests** (`src/tests.zig`): single-flight proven deterministically
+  by a **gated loader** that blocks the leader inside `load` until the test has
+  seen `getStats().coalesced == N-1`, so `loads == 1` is a guarantee, not a lucky
+  interleaving; deleting the `in_flight` dedup turns the same test red
+  (`loads == N`, `coalesced == 0`), the permanent positive control. Also
+  independently owned follower copies, invalidate-during-load and a mixed-key soak
+  under contention.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it. The clock shifted
+  by one nanosecond is equivalent (`now()` feeds both store and lookup, so every age
+  is unchanged).
 
-## 8. Deliberately deferred
+## What is deliberately not done
 
-- **`invalidate` via `ramcache.Cache.remove`** (2026-10-13). `ramcache` gained a per-key
-  `remove` after the poison-generation shadow (§4) was built. Switching would drop the shadow
-  entry, but it needs an analysis of the race with a load in flight for the same key (the
-  shadow's generation is what makes that load's late `put` lose) before it replaces a mechanism
-  that is tested and correct. Not a defect; a simplification to evaluate.
-- **Stale-while-revalidate (SWR).** Serving a stale entry immediately while a
-  single background refresh runs is valuable but needs either a background
-  executor (a `workerpool` dep this module intentionally does not take — it
-  keeps a leader on the *caller's* thread) or an async runtime, plus a precise
-  staleness-window contract. Deferred rather than half-built. The single-flight
-  machinery is the right foundation to add it on later (the refresh would be a
-  leader whose result replaces the stale entry while `get`s keep serving stale).
-- **Per-key TTL / per-call loader.** TTLs are per-cache (positive + negative),
-  and the loader is fixed at construction (one backend per cache). Per-key TTL
-  or a per-`get` loader override are easy extensions but unneeded so far.
-- **Refresh-ahead / probabilistic early expiration** (recompute a hot key just
-  before its TTL to avoid a synchronous miss) — a natural follow-on to SWR;
-  deferred with it.
-- **Sharded lock.** One SpinLock serializes all access. At extreme core counts
-  the lock (not the loader, which is off-lock) could contend; a striped-lock or
-  sharded-map refinement is possible but unmeasured and unwarranted until a real
-  workload shows it.
-- **Metrics beyond the counters** (latency histograms, per-key load timing) —
-  left to the consumer's observability layer.
-- (survey 2026-09-30) Stale-while-revalidate / `refreshAfterWrite` (already the first item above): the feature of Caffeine that its users reach for first, since it removes synchronous misses for hot keys. Effort: medium; fits CONVENTIONS §2 if the refresh runs on the caller's thread or a caller-supplied executor.
-- ✅ DONE 2026-11-16 (survey 2026-09-30) Bulk `getAll(keys)` with one loader call for the missing subset (Caffeine `loadAll`): `Options.bulk_loader` (`BulkLoader`, fills a pre-`.missing` outcome slice; omitted key = negative), `Cache.getAll` / `freeAll`; hits from cache, in-flight keys awaited via the existing coalescing, one bulk call for the rest, TTL rules incl. `ttl_fn`; without a bulk loader falls back to `get` per key. A failing key fails the call.
-- ✅ DONE 2026-11-16 (survey 2026-09-30) Per-key TTL (Caffeine `Expiry`, ttlcache per-item TTL): `Options.ttl_fn` / `ttl_ctx` (`TtlFn`), a per-loaded-entry TTL chooser; null = `ttl_ns`, `<= 0` = never expire; negative entries unchanged.
+- **Per-call loader override.** The loader is fixed at construction (one backend per
+  cache); a per-`get` override is an easy extension that nothing needs.
+- **Sharded lock.** One SpinLock serializes all access. At extreme core counts the
+  lock (not the loader, which is off-lock) could contend; a striped-lock or
+  sharded-map refinement is unmeasured and unwarranted until a real workload
+  shows it.
+- **Metrics beyond the counters** (latency histograms, per-key load timing) — left
+  to the consumer's observability layer.
 
 ## Anchoring
 
@@ -240,3 +239,23 @@ store and lookup, so every age is unchanged). No source defects found.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
 **What the tests actually contain.** singleflight+cache loader, in-process, no wire
+
+
+## Backlog / deferred
+
+- **Stale-while-revalidate / `refreshAfterWrite`** (the Caffeine feature its users
+  reach for first: it removes synchronous misses for hot keys). Serving a stale entry
+  while a single refresh runs needs either a background executor (a `workerpool`
+  dependency this module does not take, it keeps a leader on the caller's thread) or
+  an async runtime, plus a precise staleness-window contract. The single-flight
+  machinery is the foundation: the refresh would be a leader whose result replaces
+  the stale entry while `get`s keep serving stale. Effort: medium; fits CONVENTIONS
+  §2 if the refresh runs on the caller's thread or a caller-supplied executor.
+- **Refresh-ahead / probabilistic early expiration** (recompute a hot key just before
+  its TTL to avoid a synchronous miss): a follow-on to the item above.
+- **`invalidate` via `ramcache.Cache.remove`.** `ramcache` gained a per-key `remove`
+  after the poison-generation shadow (§4) was built. Switching would drop the shadow
+  entry, but it needs an analysis of the race with a load in flight for the same key
+  (the shadow's generation is what makes that load's late `put` lose) before it
+  replaces a mechanism that is tested and correct. Not a defect; a simplification to
+  evaluate.
