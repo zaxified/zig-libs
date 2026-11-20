@@ -461,10 +461,9 @@ pub const AuthnResult = struct {
     /// load-bearing. `std.crypto.secureZero` it (and `attributes`) before
     /// `deinit` if the identity is sensitive in your deployment.
     ///
-    /// The sentence was missing until: the zeroization pass wiped the
-    /// three transient decrypted buffers (Z1) and did not discharge the Z2
-    /// obligation on the longest-lived copy of the same secret. `xmlenc`, one
-    /// layer down, carries it.
+    /// The zeroization pass wipes the three transient decrypted buffers (Z1);
+    /// this is the longest-lived copy of the same secret (the Z2 obligation).
+    /// `xmlenc`, one layer down, carries it.
     name_id: []const u8,
     /// `<NameID Format>` if present.
     name_id_format: ?[]const u8,
