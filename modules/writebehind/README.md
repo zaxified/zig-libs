@@ -112,6 +112,6 @@ present, idempotent under double-recovery); the `on_evict` safety net (a dirty
 entry evicted before flush is still persisted); pool concurrency over 1000 keys;
 the real on-disk `kvtree` sink over `tmpDir`; size-cap rejection; and a
 deliberately **failing** sink — that an acked write survives far more rejections
-than the WAL's old attempt cap, that an explicit cap drops the record visibly
+than `jobqueue`'s default attempt cap, that an explicit cap drops the record visibly
 and without stranding the queue, and that a newer record for a poisoned key is
 still flushed.

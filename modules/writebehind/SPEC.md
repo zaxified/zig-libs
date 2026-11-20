@@ -33,7 +33,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [jorgebay/write-behind-cache-worker](https://github.com/jorgebay/write-behind-cache-worker) | Go | MIT | 4 | push 2025-01 | A small Go example (found by search; not read). |
 | Zig ecosystem | Zig | — | — | — | No write-behind library found (`gh search repos 'write-behind cache'`: no Zig result). |
 
-**Where we are ahead:** the only one of these with a crash-safe contract: `put` returns only after its WAL record is fsync'd and `recover()` re-applies it *(Ehcache's durability: undocumented on the page read)*; per-key flush ordering, tombstone-based read-shadowing of deletes, bounded retries with dead-lettering (`max_flush_attempts`), and a pluggable `Sink` vtable. **Where we are behind:** no batching or write delay, no coalescing of superseded writes, no back-pressure (`put` never blocks and the WAL is unbounded), the write side is single-owner, one sink adapter (`kvtree`) besides the in-memory `MapSink` (→ Backlog).
+**Where we are ahead:** the only one of these with a crash-safe contract: `put` returns only after its WAL record is fsync'd and `recover()` re-applies it *(Ehcache's durability: undocumented on the page read)*; per-key flush ordering, tombstone-based read-shadowing of deletes, bounded retries with dead-lettering (`max_flush_attempts`), and a pluggable `Sink` vtable. **Where we are behind:** no batching or write delay, no coalescing of superseded writes, back-pressure only on request (`Options.max_unflushed`, default 0 = `put` never blocks and the WAL is unbounded), the write side is single-owner, one sink adapter (`kvtree`) besides the in-memory `MapSink` (→ Backlog).
+
 
 ## What it is
 
@@ -115,8 +116,10 @@ How this module satisfies each:
   futex generation. The coordinator harvests (`pump`) and does all cache/WAL bookkeeping
   single-owner.
 - **The `Sink` must tolerate concurrent calls** (multiple workers, plus the coordinator during
-  `get` read-through and `recover`). The reference `KvtreeSink`/`MapSink` serialize with a spinlock,
-  since `kvtree` is single-writer.
+- **The `Sink` must tolerate concurrent calls** (multiple workers, plus the coordinator during
+  `get` read-through and `recover`). The reference sinks serialize internally: `KvtreeSink` with a `kvtree.Lock`
+  (a `std.Io.Mutex` when the `Db`'s storage has an `Io`, so a waiting flush task yields instead of spinning;
+  `kvtree` is single-writer), `MapSink` with a spinlock (`root.zig:186-262`).
 
 ## The Sink vtable (extension point for DL6)
 
@@ -139,51 +142,41 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
 ## Recovery & liveness details
 
 - **`recover()`** dequeues the WAL globally (FIFO by id), applies each record to the sink, and acks
-  it — synchronous, no pool. Call once after `init` over a non-empty WAL, before serving.
+  it — synchronous, no pool (`root.zig:828-847`). Call once after `init` over a non-empty WAL, before serving. It
+  stops at the first sink failure with `error.SinkWriteFailed` (the record goes back through `flushFailed`; the
+  progress made so far stays) and resumes from there when called again.
 - **on_evict safety net.** A dirty entry evicted before flush fires `on_evict(dirty=true)`; the
   coordinator records the key as an **orphan** so the flusher revisits it even though the cache no
   longer lists it dirty. Its WAL record was already durable, so the write is never lost — the orphan
-  set only closes a *liveness* gap (which key to flush), not a durability one.
+  set only closes a *liveness* gap (which key to flush), not a durability one. A failed orphan
+  registration is counted, not silently lost (`n_dropped_orphans`).
 - **Non-admission safety net (the same gap, a different door).** Eviction is not the only way a key
   can leave the cache's dirty list: `ramcache.put` **refuses admission outright** to any value
-  larger than the whole cache budget (`value.len > max_bytes`) and fires **no** `on_evict`. Such a
-  key was therefore neither cache-dirty nor an orphan, and `kick()`'s only two sources are
-  `drainDirty` and `orphans` — so a server whose flush loop is the documented periodic `drain()`
-  tick left an **acked, durable** record pending forever while the WAL grew without bound.
-  `put` now checks `cache.isDirty(key)` after staging and registers a non-admitted key as an
-  orphan. `startKey` takes the value from the WAL lease rather than from the cache, so an
-  over-budget value flushes normally once selected.
+  larger than the whole cache budget (`value.len > max_bytes`) and fires **no** `on_evict`. `kick()`'s only two
+  sources are `drainDirty` and `orphans`, so a server whose flush loop is the documented periodic `drain()` tick
+  would leave an **acked, durable** record pending forever while the WAL grew without bound. `put` therefore
+  checks `cache.isDirty(key)` after staging and registers a non-admitted key as an orphan (`root.zig:690`).
+  `startKey` takes the value from the WAL lease rather than from the cache, so an over-budget value flushes
+  normally once selected.
 
-  **Why the fix lives here and not in `ramcache`.** Refusing an item bigger than the entire cache is
+  **Why this lives here and not in `ramcache`.** Refusing an item bigger than the entire cache is
   correct, deliberate cache policy — admitting it would evict everything else to hold one entry, and
   every other `ramcache` consumer relies on the bound. Nor is a synthetic `on_evict` for a value
-  that was never resident honest. The defect was this module's: it treated "handed to the cache" as
-  "registered for flush", when the cache is only a *hint* about which keys are pending and the WAL
-  is the authority. Regression test: *"over-budget value: acked write is reachable by drain() ALONE"*,
-  which deliberately avoids `flushAll` because its `flushOneSync` backstop masks the hole.
+  that was never resident honest. This module's contract is that the cache is only a *hint* about which keys are
+  pending and the WAL is the authority.
 - **`flushAll` backstop.** If records remain but none are cache-dirty/orphan (e.g. a reopened WAL
-  the operator never `recover()`ed), `flushOneSync` drains them synchronously. `deinit` calls
-  `flushAll`, so even a forgotten `recover()` loses nothing. A record the sink rejects on this path
+  the operator never `recover()`ed), `flushOneSync` drains them synchronously (`syncFlush`, `root.zig:1124-1195`).
+  `deinit` calls `flushAll`, so even a forgotten `recover()` loses nothing. A record the sink rejects on this path
   is held (leased) for the rest of the pass so the next synchronous flush moves on to the next
   record, then returned to the WAL for a retry. A key that waits out its retry backoff is not
   written early and does not stall the others: each synchronous pass reads the set of waiting keys
-  once, against one clock reading, and passes it to the WAL dequeue as `exclude`, so nothing of
-  those keys is leased; a key whose wait lapses during the pass waits for the next one. Until
-  2026-11-19 the synchronous path did not run at all while any key waited (`anyRetryWaiting`), so
-  one waiting key stalled `flushAll` and back-pressure for every key (F5b).
+  once, against one clock reading (`collectWaiting`), and passes it to the WAL dequeue as `exclude`, so nothing of
+  those keys is leased; a key whose wait lapses during the pass waits for the next one. After acking a record the
+  pass copies the key out of the lease before `ack` (which frees the lease's borrowed fields) and hands the key's
+  next record to `startFlush`, as `finishTask` does.
 
-  *An intermediate design (commit 73f0ee627, same day, never released) was wrong.* It leased the
-  records of waiting keys one by one, kept them, and handed them back with `jobqueue.release`
-  after the pass. It re-read the wait for every record, so a key whose wait lapsed between two
-  dequeues of one pass had its older record leased (kept aside) and its newer one written and
-  acked; the older one then went back to the WAL and the next pass wrote it over the newer value
-  (a lost write, and an ack out of WAL id order). This was found by review and reproduced by the
-  test *"F5b review: a key whose backoff lapses in the middle of a pass …"*, which failed on that
-  commit. It also cost O(records of the waiting keys) per pass. The exclusion leases nothing,
-  so that kind of failure cannot happen.
-
-  **Held leases and the per-key ack order (2026-11-19, second review).** The coordinator keeps a
-  list of leases it holds (`held`): synchronous rejections of the current pass, records whose
+  **Held leases and the per-key ack order.** The coordinator keeps a list of leases it holds (`held`, kinds
+  `rejected`, `nack_failed`, `ack_failed`): synchronous rejections of the current pass, records whose
   `nack` failed, and records whose `ack` failed or must wait for an older one. A key with a held
   lease is not started by the pool path (`startKey`). Because `jobqueue` does not serialize a
   partition while one of its records is leased, the synchronous global dequeue can still return a
@@ -192,59 +185,27 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   "Older" is decided by WAL id, never by position in the list (a failed nack re-appends its
   entry at the end): a held record with a *larger* id than the one landing — possible when the
   older record's nack succeeded and the newer one's failed — was never written; it stays held,
-  is released after the older one and is written then (review 2, N1: it used to be acked
-  unwritten, a lost write; reproduced before the fix). The invariant, kept by
+  is released after the older one and is written then (`ackLanded`, `oldestHeld`). The invariant, kept by
   every ack site (`finishTask`, the synchronous path, `recover`, the release of held leases):
   **acks of one key happen strictly in WAL id order, so no record older than the newest landed
   record of a key survives in the WAL without that newest one** — a restart can only replay a
   key's records oldest first and ends at the newest. When an ack fails, that record and every
   newer landed one of the key are held (`ack_failed`), stay counted in `pendingCount`, and are
-  retried by every `drain`; a `nack` that fails is held and retried the same way. **The cost:** a
+  retried by every `drain` as acks (never as nacks, so no attempt is burnt on a landed record); a `nack` that
+  fails is held and retried the same way. **The cost:** a
   key stays blocked (no newer record of it is dispatched or acked) for as long as its oldest ack
   keeps failing; `flushAll` then ends with `error.FlushIncomplete` at `flush_timeout_ns` and
-  `deinit` returns, the records still in the WAL. Only if the held list itself cannot grow (an
-  allocation failure on top of a WAL failure) is a lease dropped; that record stays in the WAL
-  and is replayed at the next restart, possibly before newer acked ones (accepted residue).
-  Reproduced before the fix: a rejected synchronous write held while the newer record of its key
-  landed was retried over it (review F1), and a pool flush whose ack failed let the key's next
-  record be written and acked, so a restart replayed the old value (both tests failed on the
-  previous code). Allocation failures in `startFlush` now return the lease through the same
-  failure path, so a dead-lettered record is counted (review F4); a run of records that keep
-  failing to dispatch is handled by a loop in `startFlush`, not by recursion per record. During
-  `deinit`/`deinitNoFlush` the last harvest no longer dispatches a key's next record: its lease is
-  left in memory and the record stays in the WAL with no attempt counted (a `nack` on the stopped
-  pool's refusal burned one and, with a finite `max_flush_attempts`, dead-lettered records the
-  sink never saw; review 2, N3).
-
-  **Known limits (not fixed).** (F2) Visibility in `jobqueue` follows the wall clock: a record
-  nacked with backoff 0 gets `run_at = now`, so a wall clock stepping back can hide it behind a
-  newer record of its key for that long. (F5) With the default `retry_backoff_ns = 0` a refusing
-  sink is retried on every completion, a tight loop until `flush_timeout_ns`; (F5b, fixed
-  2026-11-19 with `jobqueue`'s dequeue `exclude`, see above) each synchronous call costs
-  O(waiting keys) to build the list plus O(partitions × waiting keys) in the dequeue, with no
-  leasing and no storage writes. That is linear in both, so a sink outage that puts thousands of
-  keys into backoff makes each pass (every 20–50 ms while `flushAll`/`put` wait) scan
-  thousands × thousands of strings. The scan was not replaced by a set because the intended case
-  is a few failing keys. A record whose `nack` (`nack_failed`) or `ack` (`ack_failed`) keeps failing
-  stalls its key (`heldFor`) for as long as the failure lasts; it stays counted in
-  `pendingCount`. The deadline after `FlushIncomplete` does not bound a
-  sink call that never returns (`pool.drain` waits for it); `retry_at` follows the injected
-  `wal_mono_clock` while the flush deadline follows the real clock; a WAL written before
-  2026-11-19 can hold a record with a persisted future `run_at`, which `flushAll` waits for until
-  it is due or the deadline passes (F5e). (N2) The held list is not reserved ahead: if it cannot
-  grow when a lease must be held, that lease is dropped, the key is not blocked, and a restart
-  can replay the record over a newer acked one (the residue above). (N4) The held-list
-  operations are linear in its length (`heldFor` per selected key, `releaseHeld` quadratic in the
-  worst case): a reopened WAL of many records against a down sink can hold all of them in one
-  `flushAll` pass; `.held`/`.landed` iterations skip the deadline check, so a slow sink can
-  overshoot `flush_timeout_ns` by records × sink latency.
-
-  Fixed 2026-10-05: after acking a record, `flushOneSync` looked up the key's next record through
-  `lease.partition`, which `ack` had just freed, and then dropped the lease it got back — the next
-  record went invisible for the 60 s visibility timeout and `flushAll` returned with it pending
-  (with the real key bytes, as in ReleaseFast). It now copies the key before `ack` and hands the
-  next record to `startFlush`, as `finishTask` does. Regression test: *"flushOneSync: a key's next
-  record is flushed, not leased and dropped"*.
+  `deinit` returns, the records still in the WAL. Allocation failures in `startFlush` return the lease through the
+  same failure path, so a dead-lettered record is counted; a run of records that keep failing to dispatch is
+  handled by a loop in `startFlush`, not by recursion per record.
+- **Teardown.** `deinit` runs `flushAll` (bounded), then `pool.drain()`, then stops dispatching (`no_dispatch`)
+  and harvests the flushes that were still running. `deinitNoFlush` stops the pool (`shutdownNow`, which drops
+  queued jobs unrun), stops dispatching, and harvests the completed flushes *before* `pool.deinit`: acking a key
+  can advance it to its next record and `startFlush` would then submit to the pool, which a stopped pool refuses
+  (the record stays in the WAL) but a freed one would be a use-after-free. In both, the last harvest does not
+  dispatch a key's next record — its lease is left in memory and the record stays in the WAL with no attempt
+  counted. The tasks of jobs `shutdownNow` dropped unrun are freed (`in_flight` maps each key to its task)
+  (`root.zig:606-660`).
 - **Sink write failure** → the record is `nack`'d back to the WAL, visible at once, and the key is
   registered as an orphan, so a later `drain` retries it; with `retry_backoff_ns > 0` the key (the
   failed record and every later record of the key) waits that long first, an in-memory per-key
@@ -252,24 +213,20 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   (`max_flush_attempts = 0`), so `flushAll` against a permanently-failing sink keeps retrying
   (on every drain, spaced by `retry_backoff_ns`) until `flush_timeout_ns` (default 120 s) and then
   returns `error.FlushIncomplete`, the record still in the WAL — an operational fault, not a
-  data-loss one. (Until 2026-11-19 this line said "retries at ~20 Hz and does not return"; with
-  the default zero backoff the pool path actually resubmitted on every completion.)
+  data-loss one. With the default zero backoff the pool path resubmits on every completion.
 
-  **Why the backoff is not in the WAL (fixed 2026-11-19).** It used to be: `nack` with
-  `retry_backoff_ns` makes `jobqueue` move the record to its schedule heap, out of its partition's
-  FIFO, so a newer record of the same key was dequeued and written first and the retried older
-  value then overwrote it — last-writer-wins broken, and across a restart too, since the WAL
-  persists the backoff (`recover`/`flushAll` applied v2, then v1 once the backoff ran out).
-  Reproduced on the old code by the two "last-writer-wins survives a retry backoff" tests (both
-  failed: in-process v2 reached the sink while v1 waited; after a restart v1 won). Now the record
-  goes back with no WAL-side backoff and stays its key's oldest; `startKey` skips a key while its
-  `retry_at` lies ahead. After a restart the record is retried without delay (Kafka's
-  `retry.backoff.ms` is an in-memory producer setting too). A WAL written before this change can
-  still hold a persisted backoff; such a record is counted as pending and flushed once visible.
+  **Why the backoff is not in the WAL.** `nack` with `retry_backoff_ns` would make `jobqueue` move the record to
+  its schedule heap, out of its partition's FIFO, so a newer record of the same key would be dequeued and written
+  first and the retried older value would then overwrite it — last-writer-wins broken, and across a restart too,
+  since the WAL persists the backoff (`recover`/`flushAll` would apply v2, then v1 once the backoff ran out). So the
+  record goes back with no WAL-side backoff and stays its key's oldest; `startKey` skips a key while its
+  `retry_at` lies ahead (`giveBack`, `root.zig:1016-1072`). After a restart the record is retried without delay
+  (Kafka's `retry.backoff.ms` is an in-memory producer setting too). A WAL written by an earlier release can still
+  hold a persisted backoff; such a record is counted as pending and flushed once visible.
 
-  **`flushAll` contract (fixed 2026-11-19, audit finding wbmut-1).** `flushAll` blocks until every
-  pending record has landed or been dead-lettered (a finite `max_flush_attempts`; counted by
-  `poisonedCount`), bounded by `Options.flush_timeout_ns`, then returns `error.FlushIncomplete`.
+  **`flushAll` contract.** `flushAll` blocks until every pending record has landed or been dead-lettered (a finite
+  `max_flush_attempts`; counted by `poisonedCount`), bounded by `Options.flush_timeout_ns`, then returns
+  `error.FlushIncomplete`.
   *Reference:* Kafka `KafkaProducer.flush()` "blocks on the completion of the requests associated
   with these records … A request is considered completed when it is successfully acknowledged …
   or else it results in an error", and each record's wait is bounded by `delivery.timeout.ms`
@@ -277,16 +234,11 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   and the time allowed for retriable send failures", default 120 000 ms, from `ProducerConfig`).
   Ehcache's writers page leaves retry to the writer and states no flush deadline. Hence: block,
   retry, give up at 120 s with a typed error. 0 = no waiting (one synchronous pass), `maxInt` = no
-  limit. `deinit` uses the same bound (Kafka's `close()` blocks without one by default; here a
-  dead sink would otherwise hold teardown forever, and the WAL keeps the records, so bounding it
-  loses nothing; `deinitNoFlush` remains the immediate exit).
-
-  It was not true until 2026-07-31. The WAL was enqueued at `jobqueue`'s default `max_attempts` of
-  5, so the sixth rejection **dead-lettered an acknowledged write**: gone from the sink, gone from
-  the retry path, with no error to the caller and `unflushed` still counting it (so `flushAll` could
-  never reach a quiescent state again). The two reference sinks accept essentially every write, so
-  no test drove a record to that cliff — the gap was in the *failure contract*, not in the vtable's
-  shape, which is what a review looking only at the `Sink` signature would have missed.
+  limit (`Options.flush_timeout_ns`, `root.zig:341-347`). `deinit` uses the same bound (Kafka's `close()` blocks
+  without one by default; here a dead sink would otherwise hold teardown forever, and the WAL keeps the records,
+  so bounding it loses nothing; `deinitNoFlush` remains the immediate exit). Retrying forever by default is what
+  keeps the durability guarantee against a sink that is down, full or refusing: a finite WAL attempt cap would
+  dead-letter an acknowledged write after that many rejections, with no error to the caller.
 
 - **Giving up is opt-in and never silent.** Set `max_flush_attempts` to a finite value to drop a
   poison record rather than block its key behind it. A dropped record increments `poisonedCount`
@@ -295,21 +247,7 @@ run concurrently, so the adapter must be internally thread-safe (a connection po
   record does not strand the newer records behind it. **A non-zero `poisonedCount` is data loss
   that has already happened** — it is reported, not prevented.
 
-**Mutation run 2026-10-05** (in-place, Debug, 32 mutants over `Coordinator`'s put/del/get, the
-flush pump, `finishTask`'s ack/nack/advance, `kick`/`startKey`, `flushOneSync`, `recover`, `onEvict`
-and `mapWalErr`): 26 killed (one, `recover` retrying instead of returning `SinkWriteFailed`, by a
-deterministic hang of the F4 test). The first pass left 9. One was a real bug (`flushOneSync`
-above, fixed with a regression test); five tests were added for the rest — a `put` after a `del`
-clears the tombstone, a failing read-through is `SinkReadFailed` rather than a miss, `recover`
-applies a WAL delete as a delete, `drain()` alone advances a key through two records, and one key
-never has two sink calls in flight. Equivalent: the `in_flight` checks in `kick` and
-`collectDirty` (`startKey` repeats them), `onEvict` ignoring `dirty` (a clean key's flush finds no
-record and only marks it clean), and `flushOneSync` not advancing the key (the next `flushAll`
-iteration flushes that record synchronously). Not killed: copying the key after `ack` instead of
-before — a use-after-free that no value test sees in a safe mode, because `free` fills the key with
-0xAA and the lookup then simply misses.
-
-## Threat model / out of scope
+## Threat model / known limits
 
 - **Not** a distributed/replicated store: one process owns the cache + WAL + sink. Multi-writer,
   cross-process coordination, and sink transactions spanning multiple keys are out of scope.
@@ -317,7 +255,7 @@ before — a use-after-free that no value test sees in a safe mode, because `fre
   immediately. A tombstone is reclaimed as soon as either happens: a later `put` supersedes it
   (immediate, synchronous), or its delete's own flush is durably confirmed (in `finishTask`, once
   the sink no longer holds the pre-delete value, a `get` read-through would correctly miss on its
-  own — F2, wave-2 audit). The one case a tombstone still outlives its delete forever is a
+  own). The one case a tombstone still outlives its delete forever is a
   **poisoned** (dead-lettered) delete: it never reached the sink, so dropping its tombstone would
   let a later `get` read-through resurrect the stale value — deliberately conservative, and only
   reachable with a finite `Options.max_flush_attempts` (the default never dead-letters). For that
@@ -328,8 +266,32 @@ before — a use-after-free that no value test sees in a safe mode, because `fre
 - Correctness of the async wake/park, the lock-free queue, and the durable log lives in
   `workerpool` / `lockfree` / `jobqueue` / `kv` SPECs respectively; this module composes them and
   adds the flush-orchestration + recovery logic on top.
+- **Known limits of the retry and ack machinery.**
+  - Visibility in `jobqueue` follows the wall clock: a record nacked with backoff 0 gets `run_at = now`, so a wall
+    clock stepping back can hide it behind a newer record of its key for that long.
+  - With the default `retry_backoff_ns = 0` a refusing sink is retried on every completion, a tight loop until
+    `flush_timeout_ns`.
+  - Each synchronous pass costs O(waiting keys) to build the waiting list plus O(partitions × waiting keys) in the
+    dequeue, with no leasing and no storage writes. That is linear in both, so a sink outage that puts thousands of
+    keys into backoff makes each pass (every 20–50 ms while `flushAll`/`put` wait) scan thousands × thousands of
+    strings. The scan was not replaced by a set because the intended case is a few failing keys.
+  - A record whose `nack` (`nack_failed`) or `ack` (`ack_failed`) keeps failing stalls its key (`heldFor`) for as
+    long as the failure lasts; it stays counted in `pendingCount`.
+  - The deadline after `FlushIncomplete` does not bound a sink call that never returns (`pool.drain` waits for
+    it); `retry_at` follows the injected `wal_mono_clock` while the flush deadline follows the real clock; a WAL
+    written by an earlier release can hold a record with a persisted future `run_at`, which `flushAll` waits for
+    until it is due or the deadline passes.
+  - The held list is not reserved ahead: if it cannot grow when a lease must be held (an allocation failure on top
+    of a WAL failure), that lease is dropped, the key is not blocked, and a restart can replay the record over a
+    newer acked one (accepted residue).
+  - The held-list operations are linear in its length (`heldFor` per selected key, `releaseHeld` quadratic in the
+    worst case): a reopened WAL of many records against a down sink can hold all of them in one `flushAll` pass;
+    `.held`/`.landed` iterations skip the deadline check, so a slow sink can overshoot `flush_timeout_ns` by
+    records × sink latency.
+  - The coordinator never calls `jobqueue`'s `reapExpiredLeases`, so a lost lease (a sink call that never
+    returns) is redelivered only after a restart.
 
-## Back-pressure (2026-11-18)
+## Back-pressure
 
 `Options.max_unflushed` (entries; 0 = unbounded, the default, so nothing changes for existing
 users) is a high-water mark on `pendingCount()`. A `put`/`del` that finds `unflushed >=
@@ -347,169 +309,89 @@ cache operations" (the writers page does not say block or reject; it states no d
 producer blocks in `send` when `buffer.memory` is exhausted, for up to `max.block.ms` (default
 60 s), then throws `TimeoutException`; a Go bounded channel blocks the sender. Majority: block with
 a deadline, then a typed error -- implemented, with Kafka's 60 s default. Caffeine's writer is
-unbounded (the pre-change behaviour here, still the default). Counted in entries only: bytes
+unbounded (the default here). Counted in entries only: bytes
 would need accounting at every ack site; the bytes behind a mark are bounded by the mark times the
 WAL payload cap.
+## Verification
 
-**Delta mutation (2026-11-18, back-pressure):** 20 mutants over `awaitCapacity`, the early key-size
-check and the `Options` wiring of `put`/`del` (each guard dropped or flipped, `<` to `<=`, the
-deadline arithmetic, the drain and the synchronous-flush backstop skipped, the `continue` after it,
-the deadline comparison, the error return). 19 killed (12 of them as a hang: the failing test's
-`deinit` then flushes against the deliberately stalled sink), 1 unobservable: `now > deadline`
-instead of `>=` differs only on an exact nanosecond tie. Two tests came from survivors: the wait
-loop's own `drain` (the earlier flush attempts must still be in flight) and the `continue` after
-a successful synchronous flush (a zero-wait writer at the mark must succeed once it made room).
-The wait's cap of 20 ms per futex park and skipping the park (a spin) are cost-only, not
-mutated. These 20 are included in the whole-module run below, which replaces the earlier
-cumulative card entry (26/32 + 19/20, no `src` hash).
+Run: `scripts/modtest writebehind` (`zig build test-writebehind`; add `-Doptimize=ReleaseFast` for the optimized mode). The tests are in
+`src/root.zig`; they use real threads via the pool, the leak-checking allocator, an in-memory `MapSink`, a
+`FailingSink`, a real on-disk `kvtree` sink over a temporary directory, and the WAL on the deterministic
+`SimStorage`. The card's evidence class is hand-written scenarios: there is no foreign oracle (the module has no
+wire format of its own; WAL records, checksums and torn tails are `jobqueue`'s and `kv`'s, verified there).
 
-**Audit 2026-11-18 (whole-module mutation).** 280 mutants over every non-test line of `src/root.zig`
-(the module has no on-disk parsing of its own: WAL records, checksums and torn tails are
-`jobqueue`'s and `kv`'s, audited there): `put`/`del` (size caps, WAL record type / partition /
-payload / attempts, error mapping, `unflushed` accounting, cache staging, orphan and tombstone
-registration), `awaitCapacity` (every guard, the deadline arithmetic, the drain and the
-synchronous backstop), `get`, `flushAll` / `sync`, `recover`, `pump` / `finishTask` (ack, nack,
-dead-letter detection, key advance, tombstone GC), `kick` / `collectDirty` / `startKey` /
-`startFlush` (every allocation-failure branch and the refused-submit branch), `flushOneSync`,
-`flushEntry`, `onEvict`, the key-set helpers, `deinit` / `deinitNoFlush`, the accessors, `Sink`,
-`MapSink` and `KvtreeSink`; one schemata build per round, baseline first. Round 1 (the old
-tests): 180 killed (33 of them hangs), 100 survived. 29 tests were added, among them: the
-WAL's refusals as `ValueTooLarge` / `WalWriteFailed` / `OutOfMemory`; every flush path acking
-its record (a reopened WAL has nothing pending); the per-record lease held for the visibility
-timeout (a probe sink reaps from inside its own write); injected wall and monotonic clocks;
-allocation failures at each step of `startFlush` and a refused pool submit; `flushOneSync`
-handing a key's next record to the pool and returning a rejected one; `deinitNoFlush` dropping
-queued jobs; `drain` reconciling keys whose records `recover()` already applied. Round 2 killed
-70 of the 100. 6 survivors remain open: the four `unflushed > 0` underflow guards (`recover`,
-`finishTask` twice, `flushOneSync`) and flushAll's two `in_flight` loop clauses; closed
-2026-11-19 as EQUIVALENT (see the delta paragraph below: the premise that `readyCount` skips a
-record in persisted backoff was wrong). The other 24 do not die: 22 EQUIVALENT (the
-doubled scratch clear / arena reset in `kick` and the two `in_flight` prefilters, which
-`startKey` repeats; the completion generation bump and futex wake, the wait slices and the park
-in `flushAll`, `awaitCapacity`, all bounded re-polls and so cost-only; `flushAll` skipping its
-drain after a synchronous flush; `errdefer wal.close()` with nothing fallible after it;
-`deinit` skipping `pool.drain()` and the final `pump` (`pool.deinit` drains, `flushAll` left
-nothing); the leftover-completion cleanup in `deinitNoFlush`, redundant after its `pump`; a
-`FieldTooLarge` mapping that the early key-size check makes unreachable) and 2 UNOBSERVABLE
-(the completion list's spinlock, a data race that needs a race detector; `now > deadline` on an
-exact nanosecond tie). Comptime-only constants (`vis_timeout_ns`, field defaults) are pinned by
-the tests that depend on them, not mutated. Counts on the card are whole-module.
+- **Guarantee scenarios:** a `put` readable at once and the sink consistent after a flush; last-writer-wins per key;
+  delete with read-shadowing and tombstone reclamation (a poisoned delete keeping its tombstone on purpose);
+  sink read-through (the fill is clean, never registered as an orphan); crash recovery (drop the coordinator and
+  cache without flushing, `recover()` from the durable WAL: every acked write present, idempotent under a double
+  recovery, last-writer-wins across overwrites, a WAL delete applied as a delete, `recover()` stopping at the first
+  sink failure and resuming cleanly); a reopened WAL drained by `flushAll` without `recover()`.
+- **Safety nets:** `on_evict` (reached through `drain()` alone, without the `flushAll` backstop); the non-admitted
+  over-budget value reachable by `drain()` alone (the test deliberately avoids `flushAll`, whose `flushOneSync`
+  backstop masks the hole); a key registered as dirty and orphan never has two sink calls in flight.
+- **Failing sinks:** a sink that rejects far more often than `jobqueue`'s default attempt cap still lands the
+  write; an explicit cap drops the record counted and listed without stranding the queue (also for a delete, after
+  exactly that many rejections); a newer record behind a poisoned one is flushed; `flushAll` waits out a backoff,
+  survives a rejected synchronous write (the others land first) and ends in `FlushIncomplete` against a key the
+  sink always rejects; zero timeout flushes synchronously what it can; last-writer-wins survives a retry backoff,
+  also across a restart; a record in a WAL-persisted backoff is counted at reopen and flushed once visible.
+- **Retry-deadline bookkeeping:** waiting keys do not stall the synchronous backstop or back-pressure for the other
+  keys; a key whose backoff lapses mid-pass is not written past its own older record; the waiting set is fixed at
+  the start of a pass whatever the clock does, read afresh each pass, and releases a key at its deadline exactly;
+  no room for the waiting list ends a pass with nothing leased; per-key deadlines are cleared on landing and on
+  dead-lettering and moved on a new rejection.
+- **Held leases and ack order:** a failed nack keeps the record held and no newer record of the key overtakes it; a
+  key with a held synchronous rejection is not started by the pool path, and a newer landed record supersedes it;
+  acks go oldest first per key (a failed ack on the pool path blocks the key; a crash after a failed ack replays
+  the older one first; superseded records are acked by WAL id whatever their list order; an older landing never
+  acks a newer held record; a held ack is retried as an ack, never as a nack); an ack that keeps failing ends
+  `flushAll` and `deinit` at the deadline with the record kept in the WAL; allocation failures at each step of
+  `startFlush` and a refused pool submit return the lease (counted when the WAL dead-letters it); a dispatch that
+  keeps failing dead-letters a key's records one after the other in a loop. WAL failures are injected by swapping the WAL's (or its store's) allocator for a `std.testing.FailingAllocator` at a chosen failure index; the allocator stays failed, so the index decides which of two acks succeeds.
+- **Teardown:** `deinitNoFlush` acks the flushes that already completed, discards queued jobs (only the running
+  write finishes) and frees their tasks on the leak-checking allocator, meets a stopped pool rather than a freed one
+  when a harvested flush advances its key, and burns no attempt on records it can no longer dispatch (as does
+  `deinit` after a timed-out `flushAll`).
+- **Back-pressure:** mark entries admitted, mark+1 fails typed with nothing written, recovery after the sink drains;
+  a `put` waits at least `put_block_ns` at the mark then fails; the default (mark 0) never blocks; records of a
+  reopened WAL (not in the cache) are flushed synchronously to make room; back-pressure honours a key's retry
+  backoff and makes room through another key while one waits.
+- **Input and plumbing:** oversized key and value rejected before any durable write (a key of exactly the field cap
+  accepted); the WAL's refusals mapped to `ValueTooLarge` / `WalWriteFailed` / `OutOfMemory` with nothing changed;
+  every flush path acks its WAL record and holds its lease for the visibility timeout while the sink is written;
+  injected wall and monotonic clocks; `init` with a WAL held by another process; `n_workers`/`max_submitters`
+  reaching the pool; `meta` well-formed; the `Sink`, `MapSink` and `KvtreeSink` adapters on their own.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. Mutation covers every non-test line of `src/root.zig`; the survivors are argued
+  equivalent or unobservable (cost-only re-polls and wakes, redundant prefilters that `startKey` repeats, the
+  completion list's spinlock, which needs a race detector, an exact-nanosecond tie in a deadline comparison) except
+  the one use-after-free that no value test sees in a safe mode (copying the key after `ack` instead of before:
+  `free` fills it with `0xAA` and the lookup simply misses).
 
-**Delta mutation 2026-11-19 (fixes of wbmut-1 and wbmut-2).** 36 mutants, one schemata build per
-round, ReleaseSafe, baseline first: the 6 open ones of the whole-module run relocated onto the new
-code, and 30 over the changed source (`flushAll`'s deadline, the synchronous pass with its held
-rejections and their release, the retry gate in `flushAll`/`awaitCapacity`/`startKey`,
-`flushFailed`'s dead-letter test, re-registration, backoff arithmetic and deadline clearing,
-`retryWaiting`/`anyRetryWaiting`/`setRetry`, `deinit`'s bounded flush, `deinitNoFlush`'s harvest
-order and task freeing, every call of `flushFailed`). Round 1: 21 killed (2 by hang), 15
-survived; two tests added (back-pressure honouring a key's retry backoff; the synchronous path
-clearing, dead-lettering and moving per-key deadlines); round 2 killed 4 more. Delta: 25 of 30
-killed, 5 EQUIVALENT: no `drain` after a landed synchronous flush (the next iteration parks on the
-in-flight flush and drains — cost-only); the deferred `releaseHeld` at return (both exits find the
-list empty: the deadline exit releases just before, the normal exit needs `unflushed == 0`, which
-counts the held records); `finishTask` and `retryWaiting` clearing a lapsed deadline (each is
-redundant with the other; a lapsed entry is ignored by both gates); `deinitNoFlush`'s
-`drainCompletionTasks` after its `pump`. The 6 old open ones are EQUIVALENT under the counter
-invariant: `unflushed` equals the WAL records in circulation (set from `readyCount()`, which
-counts every ready record whatever its `run_at`; +1 per enqueue; −1 exactly once per record that
-is acked or dead-lettered — a failed `ack` leaves its record leased, out of circulation, until a
-restart), so the four `unflushed > 0` guards never see 0 at a decrement, and an in-flight flush
-always holds a counted record, so `in_flight > 0` implies `unflushed > 0` in `flushAll`'s loop
-condition. The card counts are cumulative: 280 + 30 mutants, 250 + 25 killed, 24 + 6 + 5
-equivalent or unobservable.
+## What is deliberately not done
 
-**Delta mutation 2026-11-19 (second review: held leases and ack order).** 32 mutants over the new
-source (drain's retry of held leases, the hold in `flushAll` and its release, `startKey`'s held
-gate, `flushFailed`'s failed-nack hold and dead-letter gate, the five `startFlush` failure
-returns, `ackLanded`'s supersede loop, blocking, kind change, landed ack and counters, the
-`releaseHeld` cases, `heldBefore`, the ack sites in `recover`/`finishTask`/the synchronous path and
-their key re-registration). The first run left 11; the survivors needed an older ack to fail while
-a newer one succeeds, which `std.testing.FailingAllocator` (it keeps failing) cannot produce, so a
-one-shot failing allocator and 6 tests were added. Result: 31 killed (1 by hang), 1 EQUIVALENT
-(continuing after a failed `nack` instead of returning only re-registers the key, which the
-later successful nack does anyway). An intermediate design was mutated twice before it was
-replaced; those runs are not counted. Card cumulative: 310 + 32 mutants, 275 + 31 killed,
-35 + 1 equivalent or unobservable. The counter invariant above changed with this: a failed ack
-no longer leaves its record out of circulation — it stays counted and held until the ack succeeds.
+- **No WAL-side retry backoff.** The wait lives in memory (`retry_at`) because a backoff in the WAL lets a newer
+  record of the key overtake the retried older one (see *Why the backoff is not in the WAL*).
+- **No silent drop of an acknowledged write.** Retries are unbounded by default; a finite `max_flush_attempts` is an
+  explicit opt-in whose drops are counted and listed.
+- **No synthetic `on_evict` and no `ramcache` change for non-admitted values.** The coordinator registers such a key
+  as an orphan itself (see *Non-admission safety net*).
+- **No value-coalescing or per-key version tracking for last-writer-wins.** Each `put` appends its own WAL record
+  and the WAL id order is the version order (see *Why LWW holds without value-coalescing*); coalescing superseded
+  records is a space optimization listed in the backlog.
+- **No distributed or cross-process operation, no multi-key sink transactions** (see *Threat model*).
 
-**Delta mutation 2026-11-19 (review 2: id order, teardown dispatch, dispatch loop).** 12 mutants
-over the change (the teardown flag and its two setters, the dispatch loop and `flushFailed`'s
-hand-over, `giveBack`'s dead-letter advance, `oldestHeld`'s key filter, floor, upper bound and
-id ordering, `ackLanded`'s floor advance, `releaseHeld`'s older-held gate), one build per round:
-round 1 killed 10 (4 by hang); two tests added (superseded entries acked by id whatever their
-list order; `deinit` after a timed-out flush burns no attempt); round 2 killed the other 2.
-12/12. Two checks the round showed to be unnecessary were removed instead of mutated (not
-advancing a key after a landing while a newer record of it is held: that newer record
-re-registers the key when it is released). Card cumulative: 342 + 12 mutants, 306 + 12 killed.
+## Backlog / deferred
 
-**Delta mutation 2026-11-19 (F5b: passing a waiting key over with `jobqueue.release`).** 17
-mutants over the change: the old `anyRetryWaiting`-style gate restored in `flushAll` and in
-`awaitCapacity`, the pass-over test forced either way, the deferred `releaseSkipped`, its release
-and its clear, the allocation-failure exit (release skipped, `continue` instead of `return`),
-`release` replaced by `nack` in `releaseOne` and in `releaseHeld`, the failed release not held or
-held as `nack_failed`, `releaseHeld`'s `release_failed` arm falling through to the nack path, its
-index advance after a failed retry, its removal and its `continue`. Round 1: 13 killed (2 by
-hang), 4 survived — three because the tests' reopened WAL was written without the attempt cap the
-test then configured (a record keeps the cap it was enqueued with), so a counted attempt could not
-dead-letter it; the fixture now writes with the cap and the tests check `deadLetterCount`. The
-fourth (the index advance) got a test with two held releases, the first failing again. Round 2:
-the 4 killed (1 by hang). 17/17. Card cumulative: 354 + 17 mutants, 318 + 17 killed, 36
-equivalent or unobservable. (That code was replaced the same day by the dequeue exclusion; the
-counts stay as the record of the run.)
-
-**Delta mutation 2026-11-19 (review fix: waiting keys excluded from the dequeue).** 7 mutants:
-the waiting list not collected, the allocation-failure exit dequeuing without exclusion, an empty
-list passed, the clearing `defer` dropped, the empty-`retry_at` fast path dropped, `<` to `<=` at
-the deadline, lapsed keys excluded too. Round 1: 4 killed, 1 EQUIVALENT (the fast path: cost-only),
-2 survived because a drain's pool path re-checks the wait itself and flushed the key; a test that
-drives the synchronous path alone, at the deadline exactly, killed both in round 2. Card
-cumulative: 371 + 7 mutants, 335 + 6 killed, 36 + 1 equivalent.
-
-**Findings of the audit** (fixed 2026-11-19; see each entry):
-
-- *wbmut-1 — `flushAll` returns with records still pending.* **Fixed 2026-11-19** (see "Sink
-  write failure" above): `flushAll` waits out backoffs and rejections up to `flush_timeout_ns`,
-  then `error.FlushIncomplete`; the failure path keeps the key registered, so `drain()` retries
-  it; a rejected synchronous write no longer ends the flush; the synchronous path also counts a
-  dead-lettered record (it ignored dead-lettering and left `unflushed` stuck). Part (d) did not
-  hold: `jobqueue.readyCount()` counts ready records whatever their `run_at`, so a record in a
-  persisted backoff was already counted at reopen (now pinned by a test). The three FINDING tests
-  assert the fixed behaviour. Original text: `flushAll` stops as soon as the
-  synchronous backstop (`flushOneSync`) reports no progress, which it also does while a record is
-  merely hidden by its retry backoff or after one rejected synchronous write. With
-  `retry_backoff_ns > 0` a failed pool flush therefore ends `flushAll` (and `deinit`'s flush)
-  early; the drain that harvested the failure also cleaned the key, so a later `drain()` does not
-  retry it either, only a `flushAll` after the backoff does. A record whose backoff outlives a
-  restart is not counted by `pendingCount` at reopen (`readyCount` skips it). Nothing is lost
-  (the WAL keeps the record for `recover()`); the contract "`flushAll` blocks until clean" is
-  what breaks. Pinned by three tests that assert today's behaviour and are marked FINDING.
-- *wbmut-2 — `deinitNoFlush` leaks the tasks of queued jobs.* **Fixed 2026-11-19.**
-  `shutdownNow` drops queued flush jobs unrun; their `FlushTask`, key and value (three
-  allocations each) were never freed, only completed tasks were. `in_flight` now maps each key to
-  its task and `deinitNoFlush` frees the tasks still listed after the harvest; the test runs on the
-  leak-checking allocator. Found with it: the harvest ran after `pool.deinit`, so a completed
-  flush that advanced its key to the next record submitted to a freed pool. The harvest now
-  runs first, against a stopped pool that refuses the submit (the record stays in the WAL).
-  Regression test: *"deinitNoFlush: a harvested flush that advances its key meets a stopped
-  pool, not a freed one"*.
-- Note: the coordinator never calls `jobqueue`'s `reapExpiredLeases`, so a lost lease (a sink
-  call that never returns) is redelivered only after a restart.
-
-## Backlog / future work
-
-- DL6 SQL sink adapter (the primary reason the `Sink` vtable exists).
-- ~~Bounded/back-pressured `put` (block or reject when `unflushed` exceeds a high-water mark).~~ DONE
-  2026-11-18: see "Back-pressure" below.
-- Coalescing superseded WAL records for a hot key (bounded WAL growth under repeated overwrites);
-  correctness already holds without it, this is a space optimization.
-- ~~A tombstone GC / compaction pass for delete-heavy workloads.~~ Done (F2, wave-2 audit) for the
-  case that matters — GC on durable delete-flush confirmation, in `finishTask`. What is still
-  backlog: a tombstone behind a **poisoned** delete is retained forever by design (see "Threat
-  model" above) — there is no compaction pass for that residue today, only the existing
-  `flushAll`-and-restart workaround.
-
-- (survey 2026-09-30) Batched sink writes with a maximum delay (`Sink.writeBatch`): Ehcache's headline write-behind option, and what makes a SQL sink affordable (one transaction per batch instead of per key). Effort: medium; fits CONVENTIONS §2.
-- (survey 2026-09-30) Back-pressure and WAL coalescing are already listed above; the survey confirms both as the gaps a user of Ehcache write-behind hits first (queue-size limit; coalescing). Priority raised.
+- **DL6 SQL sink adapter** (the primary reason the `Sink` vtable exists).
+- **Coalescing superseded WAL records for a hot key** (bounded WAL growth under repeated overwrites); correctness
+  already holds without it, this is a space optimization. Survey priority raised: with back-pressure now present,
+  coalescing is the gap a user of Ehcache write-behind hits first.
+- **A compaction pass for the tombstone behind a poisoned delete.** The tombstone is retained forever by design
+  (see *Threat model*), reachable only with a finite `max_flush_attempts`; there is no compaction pass for that
+  residue, only the `flushAll`-and-restart workaround.
+- **Batched sink writes with a maximum delay** (`Sink.writeBatch`): Ehcache's headline write-behind option, and what
+  makes a SQL sink affordable (one transaction per batch instead of per key). Effort: medium; fits CONVENTIONS §2.
 
 ## Anchoring
 
@@ -519,7 +401,3 @@ cumulative: 371 + 7 mutants, 335 + 6 killed, 36 + 1 equivalent.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
 **What the tests actually contain.** pure composition of internal cache/queue/pool modules, no wire
-
-## Backlog / deferred
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
