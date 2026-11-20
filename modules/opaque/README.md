@@ -6,9 +6,9 @@ level) and **P256-SHA256** (`opaque.P256Sha256`, same function names). The serve
 registration) and stores a record that resists precomputation attacks;
 each login yields a mutually authenticated `session_key` (both sides)
 plus a client-only `export_key`. OPRF layer reused from the sibling
-`voprf` module (RFC 9497 modeOPRF) and secret-scalar DH from the sibling
-`ct25519`; the rest is pure std
-(HKDF-SHA-512, HMAC-SHA-512, SHA-512, Ristretto255). No allocation, no
+`voprf` module (RFC 9497 modeOPRF) and secret-scalar DH through its group
+layer (for ristretto255 the sibling `ct25519`); the rest is pure std
+(HKDF, HMAC, SHA-2, Ristretto255). No allocation, no
 internal RNG (all nonces/blinds/seeds are caller-supplied CSPRNG
 output; blinds via `scalarFromWideBytes`).
 
@@ -53,6 +53,12 @@ mis-keyed MACs ⇒ `error.ServerAuthentication` /
 
 See `SPEC.md` for the threat model, the internal-keying envelope, and
 the 3DH schedule.
+
+## Not provided
+
+The curve25519 3DH configuration (RFC 9807 C.1.3/C.1.4), a bundled Argon2id/scrypt KSF (the caller supplies the
+mandatory `Ksf`), a fake-record helper, HMQV/SIGMA-I and the `randomized_password` backup login: see `SPEC.md`
+*What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from RFC 9807, a public IRTF specification, with its own
 test vectors as the byte-exact anchor. No reference implementation consulted.

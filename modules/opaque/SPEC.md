@@ -17,7 +17,7 @@
 **Downstream consumer:** no
 
 RFC 9807 OPAQUE aPAKE with the 3DH key exchange, **two configurations**:
-ristretto255-SHA-512 (the top-level API) and, since 2026-11-13,
+ristretto255-SHA-512 (`opaque.Ristretto255Sha512`, the top-level API) and
 **P256-SHA256** (`opaque.P256Sha256`: OPRF P256-SHA256, HKDF/HMAC/SHA-256,
 3DH over P-256, `Npk = 33`, `Nh = 32`; RFC 9807 Appendix C.1.5/C.1.6/C.2.3
 byte-exact, `src/kat_p256_test.zig`). The code is one generic
@@ -26,9 +26,8 @@ ristretto255 configuration in detail (OPRF: ristretto255-SHA512 / RFC 9497
 modeOPRF via the sibling `voprf` module, KDF: HKDF-SHA-512, MAC:
 HMAC-SHA-512, Hash: SHA-512, KSF: pluggable (`Ksf`, mandatory — no
 default, see below), Group: ristretto255).
-Status: **complete** — registration + login/AKE implemented and
-KAT-validated byte-exact against RFC 9807 Appendix C.1.1 and C.1.2
-(see `src/kat_test.zig`).
+Registration + login/AKE are implemented and KAT-validated byte-exact against
+RFC 9807 Appendix C.1.1 and C.1.2 (see `src/kat_test.zig`).
 
 ## Compared with
 
@@ -39,11 +38,12 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [facebook/opaque-ke](https://github.com/facebook/opaque-ke) — **reference** | Rust | Apache-2.0 OR MIT (its `Cargo.toml`) | 422 | v4.0.1 (2025-11-03); push 2026-06-23 | The best-known implementation; audited by NCC Group in 2021 (its README) and used for WhatsApp encrypted backups. Cargo features: default ristretto255, optional built-in Argon2 (`argon2`), NIST curves through the generic `elliptic-curve` traits, and it depends on `ml-kem` (a post-quantum key-exchange option — purpose not verified). Generic over a `CipherSuite` trait; this module is one fixed configuration. |
 | [bytemare/opaque](https://github.com/bytemare/opaque) | Go | MIT | 81 | v0.18.0 (2026-03-24); push 2026-08-29 | Written by one of the RFC's authors; its README says "not independently audited". Configurable group/hash/KSF ("Ensure consistent configuration (groups, hashes, KSF)"), `GetFakeRecord` for unknown users, `ServerKeyMaterial` storage. |
 | [nullstyle/opaque-zig](https://github.com/nullstyle/opaque-zig) | Zig | Apache-2.0 | 0 | no release; push 2026-09-05 | The only Zig competitor found. Same default configuration as this module (ristretto255-SHA512, 3DH), plus a selectable second group, **built-in Argon2id stretching**, `createFakeRecord`, a WASM/TypeScript layer; README calls it "early-stage", not audited, and the repository's own description says it was vibe-coded. |
-| [cfrg/draft-irtf-cfrg-opaque](https://github.com/cfrg/draft-irtf-cfrg-opaque) | Python (spec repo) | not stated (NOASSERTION) | 115 | draft-18 (2024-11-22) | The spec and its reference/vector generator; RFC 9807 is the published result. This module reproduces Appendix C.1.1/C.1.2 (and C.2.1 fake record). |
+| [cfrg/draft-irtf-cfrg-opaque](https://github.com/cfrg/draft-irtf-cfrg-opaque) | Python (spec repo) | not stated (NOASSERTION) | 115 | draft-18 (2024-11-22) | The spec and its reference/vector generator; RFC 9807 is the published result. This module reproduces Appendix C.1.1/C.1.2 (and the C.2.1 fake record) for ristretto255 and C.1.5/C.1.6/C.2.3 for P-256. |
 | [cloudflare/circl](https://github.com/cloudflare/circl) | Go | BSD-3-Clause | 1.7k | v1.6.5 (2026-08-05) | Checked: the repository root listing has `oprf` but no OPAQUE package. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | Ristretto255, HKDF, HMAC, Argon2 and P-256/P-384 exist; no OPAQUE (checked `lib/std/crypto`). |
 
-**Where we are ahead:** byte-exact against the RFC's registration and login vectors *including* the fake-credential-response case; a pluggable, mandatory KSF with no default (the Identity KSF cannot be reached by omission — the READMEs read this run of the others do not say what their default is *(inferred: unverified)*); secret-scalar DH through `ct25519` (std's ladder ends in a branch on the result); no allocation, no `Io`, no internal RNG. **Where we are behind:** a single configuration (ristretto255 + 3DH) — no P-256 or other RFC 9807 suites, so a deployment that must use a NIST group cannot use it; no built-in Argon2id (the KSF is the caller's, a stated design choice because std's Argon2 needs an allocator and `Io`); no fake-record helper (a documented recipe instead); no server-key-material or record-store helpers (→ Backlog items).
+**Where we are ahead:** byte-exact against the RFC's registration and login vectors *including* the fake-credential-response case; a pluggable, mandatory KSF with no default (the Identity KSF cannot be reached by omission — the READMEs read this run of the others do not say what their default is *(inferred: unverified)*); secret-scalar DH through `ct25519` for ristretto255 (std's ladder ends in a branch on the result); no allocation, no `Io`, no internal RNG. **Where we are behind:** two configurations only (ristretto255 and P-256, both 3DH) — not the curve25519 AKE suites (C.1.3/C.1.4); no built-in Argon2id (the KSF is the caller's, a stated design choice because std's Argon2 needs an allocator and `Io`); no fake-record helper (a documented recipe instead); no server-key-material or record-store helpers (→ Backlog items).
+
 
 ## What an aPAKE is (and why OPAQUE)
 
@@ -73,14 +73,18 @@ encrypt vault material stored server-side).
   verifies.
 - **Client enumeration** (§10.9): the credential response is XOR-
   masked under the per-user `masking_key`, so a response for a
-  registered user is indistinguishable from a fake one. The fake-record
-  *policy* (respond to unknown users with one persistent fake record,
+  registered user is indistinguishable from a fake one. The fake-credential
+  response is pinned by RFC 9807 C.2.1 (ristretto255) and C.2.3 (P-256) — the only
+  vectors that exercise this defense end to end, which C.1's "Real" vectors
+  structurally cannot (there is no missing registered record in a Real vector).
+  The fake-record *policy* (respond to unknown users with one persistent fake record,
   §6.3.2.2) is the server application's job; `generateKE2` works
   unchanged with a fake record.
 - **Out of scope for this module**: rate limiting online guesses
   (§9.2), the confidential channel registration requires (§3.2 —
   registration MUST run over server-authenticated TLS or equivalent),
   and secure erasure of the caller-held password/state.
+
 
 ## Registration (§5) — one confidential round trip
 
@@ -186,57 +190,30 @@ envelope (`EnvelopeRecovery` = wrong password) → 3DH → verify
 `client_mac` (`ClientAuthentication`) before releasing `session_key`.
 Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
 
-## Constant time (ctgrind, audit finding M5)
 
-`src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh opaque`. Each target
-taints ONE party's secrets and runs the other party untainted first, so a value
-that reached the measured party over the wire is never counted as its secret.
-Inputs are RFC 9807 C.1.1, so the printed outputs are the published vector.
-zig 0.16.0, x86_64, ReleaseFast, 2026-09-16; every untainted control and
-no-`-fvalgrind` trap row is 0, unattributed 0 everywhere.
+## Constant time (ctgrind)
 
-| target | tainted | total | in-file | witness |
-|---|---|---|---|---|
-| `register` | password, blind | 10 | 4 | 6 |
-| `login` | password, blind, client keyshare seed | 19 | 11 | 8 |
-| `serverke2` | server private key, `oprf_seed`, server keyshare seed, `masking_key` | 6 | 2 | 4 |
+`src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh opaque`; the pinned counts are the `opaque`
+rows of `scripts/checks/ctgrind-expected.tsv`. Each target taints ONE party's secrets and runs the other
+party untainted first, so a value that reached the measured party over the wire is never counted as its
+secret. Inputs are RFC 9807 C.1.1, so the printed outputs are the published vector. The harness drives the
+ristretto255 configuration only.
 
-The pattern is `root[.]zig`, which is this module's file **and** `voprf`'s and
-`ct25519`'s: their constant-time property is this module's for every byte that
-flows through them. Every in-file context, read from `--stacks` and, where the
-source did not settle it, from the disassembly:
+| target | tainted | in-file contexts |
+|---|---|---|
+| `register` | password, blind | 4 |
+| `login` | password, blind, client keyshare seed | 11 |
+| `serverke2` | server private key, `oprf_seed`, server keyshare seed, `masking_key` | 2 |
 
-- **Real branch on secret bytes — `voprf.deriveKeyPair`'s zero test**
-  (`voprf/src/root.zig:332`, `std.mem.allEqual(u8, &sk, 0)`). It compiles to a
-  per-byte early-exit chain (`test %dil,%dil; jne`, then `cmpb $0x0,…; jne`
-  for the next byte, …), so the exit point is the index of the first non-zero
-  byte of the derived secret key. One context in `register` (the client
-  long-term AKE key in `Store`), two in `login` (client keyshare, the
-  long-term key in `Recover`), both of `serverke2`'s (the per-client OPRF key,
-  the server keyshare). What leaks is small — whether leading bytes are zero,
-  an event of probability 1/256 per byte — but it is a branch on key bytes,
-  not a verdict. Recorded as a finding against `voprf`; not fixed here.
-- **Verdicts of checks that always pass, on secret-derived values** — one
-  branch each on the result, confirmed branchless before it in the
-  disassembly: `hashToGroup`'s identity rejection on `H(password)`
-  (`voprf :215`; `register`, `login`), `unblind`'s canonicity (`:272`, through
-  std's `rejectNonCanonical`) and zero test (`:549`, vectorised) on the blind
-  (two contexts; `register`, `login`).
-- **Verdicts that are public by protocol** — `Recover`'s envelope MAC check
-  (`root.zig:708`) and `generateKE3`'s server MAC check (`:1025`): success or
-  failure of a login is what the peer learns anyway.
-- **Public values tainted by construction** (`login` only) — the four
-  contexts of `diffieHellman`'s decode of `server_public_key` (std
-  `ristretto255.zig:38`, `:41`, `:70`; `voprf :255`). It is unmasked with a
-  password-derived pad, so memcheck sees it as secret, but it is the server's
-  public key and is decoded only after `Recover` has succeeded.
-
-No context's leaf frame lies in `ct25519`: the secret-scalar multiplications
-(`blind`, `blindEvaluate`, `unblind`, the key-pair derivations, the 3DH
-Diffie-Hellman steps) contribute nothing.
-Positive control: one branch on a secret byte inserted into
-`finalizeRegistrationRequest`, `generateKE3` and `generateKE2` adds exactly one
-context per target (4 → 5, 11 → 12, 2 → 3), at the inserted line.
+The source pattern also matches the sibling `voprf` and `ct25519` sources, so their constant-time property is
+this module's for every byte that flows through them. The kinds of in-file context accepted as non-leaks are verdicts of checks that
+always pass on secret-derived values (identity rejection and canonicity tests on `H(password)` and on the
+blind), verdicts that are public by protocol (the envelope MAC check and the server MAC check: success or
+failure of a login is what the peer learns anyway), and, in `login` only, `server_public_key` decoded after
+`Recover` has succeeded, which memcheck sees as secret because it is unmasked with a password-derived pad
+but which is the server's public key. The secret-scalar multiplications (`blind`, `blindEvaluate`,
+`unblind`, the key-pair derivations, the 3DH Diffie-Hellman steps) run on `ct25519` and contribute no
+context. The itemisation behind these classes was made against an earlier layout of `voprf`; see *Open*.
 
 ## Secret residue on the dead stack
 
@@ -246,7 +223,7 @@ Every public entry point that touches a secret (`deriveAkeKeyPair`,
 (`burn.run`) and then zeroes the stack that body dirtied (`burn.zig`: 8 KiB
 for the key derivation and `serverFinish`, 20 KiB for the one-multiply calls,
 24 KiB for the finalize-registration and `generateKE2`, 28 KiB for
-`generateKE3`). Measured body depth, ReleaseFast, 2026-10-09: 0.2 KiB
+`generateKE3`). Measured body depth, ReleaseFast: 0.2 KiB
 (`serverFinish`) .. 12.2 KiB (`generateKE3`); the burns are about 2x that. The
 `voprf` calls underneath burn their own frames as well.
 Secret inputs (`blind`, the key-share and AKE seeds, the server private key,
@@ -283,77 +260,95 @@ design); registers and the red zone below the stack pointer.
   the `Ksf.ctx` pointer, this module never sees it.
 - Public-key/OPRF-element inputs are validated on deserialization
   (canonical ristretto255 + identity rejection via `voprf.Element`,
-  §10.7). §6.4.1.1's "the DH shared secret MUST NOT be the identity"
-  is **no longer** discharged by the rejection inside
-  `Ristretto255.mul`, as this line used to claim: that rejection is a
-  branch on a value derived from the SECRET private key, and `catch`ing
-  it made `diffieHellman` branch on it a second time. The multiply now
-  runs on the sibling `ct25519` (std's ladder without the trailing
-  `rejectIdentity`) and the requirement is met structurally: ristretto255
-  has PRIME order and the peer element is already validated non-identity,
-  so `k*B` is the identity iff `k == 0 (mod L)` — a broken LOCAL key,
-  unreachable for any element a peer can encode, and excluded by
-  `voprf.deriveKeyPair`'s own §3.2.1 zero-rejection loop.
+- Public-key/OPRF-element inputs are validated on deserialization
+  (canonical + identity rejection via `C.Oprf.Element.fromBytes`, §10.7).
+  §6.4.1.1's "the DH shared secret MUST NOT be the identity" is met
+  structurally, not by a runtime check on the secret-derived result: the
+  multiply is `C.Oprf.Group.mulSecret`, which for ristretto255 runs on the
+  sibling `ct25519` (std's ladder without the trailing `rejectIdentity`, so it
+  does not branch on its own result). ristretto255 has PRIME order and the peer
+  element is already validated non-identity, so `k*B` is the identity iff
+  `k == 0 (mod L)` — a broken LOCAL key, unreachable for any element a peer can
+  encode, and excluded by `voprf.deriveKeyPair`'s own §3.2.1 zero-rejection loop.
 
-## Out of scope (deliberate)
+## What is deliberately not done
 
-- **The curve25519 3DH configuration** (C.1.3/C.1.4): ristretto255 OPRF
-  with an X25519 AKE group — not built yet (Backlog); P-256 is built
-  (2026-11-13).
-- ~~**Non-Identity KSFs** (Argon2id/scrypt): parameter policy belongs
-  to the consumer; seam documented above.~~ **Now pluggable, 2026-09-15**
-  (audit finding M6): `Ksf`, see above — the CONCRETE
-  algorithm/parameter choice is still the consumer's, this module never
-  picks one, but the seam is now a public callback instead of "edit
-  `randomizedPassword`".
-- ~~**The "Fake" credential flow KATs** (C.2): the fake-record response
-  is a server policy using the same `generateKE2` code path; nothing
-  new to pin.~~ **Incorrect, fixed 2026-09-10** (audit finding L3): C.2.1
-  (ristretto255) runs and is pinned (`kat_test.zig`) — it is the only
-  vector in this suite exercising the §6.3.2.2 user-enumeration defense
-  end-to-end, which C.1's "Real" vectors structurally cannot (there is no
-  missing registered record in a Real vector). C.2.2/C.2.3 (other
-  ciphersuites) remain out of scope per the point above.
+- **Other ciphersuites than the two built:** the curve25519 3DH configuration
+  (C.1.3/C.1.4, with C.2.2) is the open Backlog item; nothing else of RFC 9807 §7 is planned.
+- **A bundled non-Identity KSF** (Argon2id/scrypt): the concrete algorithm and
+  parameters are the consumer's; this module never picks one and stays `Allocator`/`Io`-free.
+  The seam is the public `Ksf` callback (see above).
 - **HMQV / SIGMA-I instantiations** (Appendix B): sketches only in the
   RFC, no vectors, no consumer.
 - **`randomized_password` backup login** (§10.13): storage-side
   feature for clients with persistent secret state; adds API surface
   without a consumer.
+- **The fake-record policy** (answering unknown users with one persistent fake record,
+  §6.3.2.2): the server application's job; `generateKE2` works unchanged with a fake record.
 
 ## Consumers
 
-None in this collection today: no module depends on `opaque` (checked
-`module_list` in `build.zig`; `aaa-gate` and `sessions`, once named here,
-do not). Intended use: password-backed authentication where the server
-must never see a password, and `export_key` for client-side vault
+None in this collection: no module depends on `opaque` (checked against the `.deps` of
+`module_list` in `build.zig`; `aaa-gate` and `sessions` do not). Intended use: password-backed
+authentication where the server must never see a password, and `export_key` for client-side vault
 encryption. The wire structs all have fixed-size `toBytes`/
 `fromBytes`, so any transport (HTTP body, MCP, raw TCP) can carry
 them.
 
-**Audit 2026-11-17 (whole-module mutation).** 271 mutants over every runtime line of `src/protocol.zig` (the generic `Opaque(C)`, so each mutant runs against both the ristretto255 and the P-256 configuration) and `src/burn.zig`: every `toBytes`/`fromBytes` field and region, `expandMulti` (loop bound, chaining, counter, block length), `i2osp2`, `checkIdentities` at its edge, every KDF label and which inputs are mixed in, the envelope `auth_tag` inputs, the identity defaults on all four paths, the masking pad and XOR, every 3DH input (which key against which peer key, `ikm` order), the key schedule (each transcript piece, extract salt, each `Derive-Secret` label and context, which MAC key and message), the three MAC comparisons (never refused / last byte unchecked / first byte unchecked), the error codes and the fields each result carries. Round 1 (ReleaseSafe): 231 killed, 40 survived. Five tests were added (`src/mutation_test.zig`): every wire field read from, and written to, its own region with bytes that do not repeat inside a 320-byte message (the old round-trip pattern had period 256, so a `server_mac` read from 256 bytes too early looked right), for both configurations; `I2OSP(len, 2)` big-endian with the high byte; `checkIdentities` at 0xffff / 0x10000 / 0x10001 for client, server and context separately; `generateKE2` / `generateKE3` refusing an oversized server identity, `generateKE3` also client and context (before, KE3 skipping its own check went unseen); a malformed evaluated element is `InvalidMessage` on both client paths. Round 2 left only wipes and burns, 27 mutants. The ReleaseFast stack probe cannot take a runtime switch in the caller's frame (the baseline went red: the probe's frame depth moved), so wipe and burn mutants are switched INSIDE `burn.zig` (`stackAt`/`zeroAt`, a separate comptime id per site; audit scratch, not committed): baseline clean, the 3 burn mutants die (half the buffer, no stores, no burn: the burns are not over-provisioned), and 24 skipped wipes survive and are EQUIVALENT by measurement: the entry-point burn already zeroes the frame, the probe reads clean without the wipe. Not mutated, because the value is a comptime constant (a runtime switch cannot reach it; `src/root.zig` pins the sizes): `Nn`..`Noe`, `masked_response_length`, `encoded_length`s, the burn sizes, the `Opaque(C)` configurations in `root.zig`, and the `"OPAQUE-" ++ label` concatenation. One catch with no reachable mutant: `recover`'s `akeKeyPair(...) catch return error.EnvelopeRecovery` needs a failing `DeriveKeyPair` (probability ~2^-256); the injection would be a stubbed KDF. Counts on the card are whole-module.
+## Verification
+
+Offline. Run `scripts/modtest opaque`.
+
+- **Anchors:** RFC 9807 Appendix C official vectors, byte-exact through the public API: ristretto255 C.1.1 and C.1.2
+  (registration record, KE1/KE2/KE3, `session_key`, `export_key`, both sides) and the C.2.1 fake credential response
+  (`src/kat_test.zig`); P-256 C.1.5, C.1.6 (alice/bob identities) and C.2.3, plus the C.1.5.1 sizes
+  (`src/kat_p256_test.zig`, vectors `src/kat_vectors_p256.zig` generated from the RFC text by `tools/gen_p256_vectors.py`).
+- **Fail-closed classes:** tampered `server_mac` / `client_mac`, wrong password and mismatched identities
+  (`EnvelopeRecovery`), identity-element keyshares, every byte of `auth_tag`, `server_mac` and `client_mac` checked,
+  identity/context past 0xffff bytes a typed error, a degenerate `client_public_key` caught by
+  `RegistrationRecord.validate`, a real Argon2id `Ksf` that changes `session_key`/`export_key` while agreeing on both
+  sides, a failing `Ksf` propagating `KsfFailed`.
+- **Mutation-driven tests** (`src/mutation_test.zig`): every wire field read from and written to its own region (both
+  configurations), `I2OSP(len, 2)` with the high byte, `checkIdentities` at its edge for client, server and context,
+  oversized identities refused by `generateKE2`/`generateKE3`, a malformed evaluated element `InvalidMessage` on both
+  client paths.
+- **Dead stack:** `src/stackprobe_test.zig` (ReleaseFast/ReleaseSmall), see *Secret residue on the dead stack*.
+- **Constant time:** the ctgrind harness above.
+- **Fuzz:** `OPAQUE_FUZZ=<runs>[,<first seed>]` runs the deterministic driver (testkit) over `opaque-login` (a run is a
+  registration plus a login; genuine accepted, flipped refused) and `opaque-hostile` (hostile wire messages); each
+  harness has an in-suite reach check.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## Open
+
+- **ctgrind in-file contexts not re-itemised.** The context-by-context itemisation behind *Constant time* was made
+  before `voprf` was restructured (its `deriveKeyPair` zero test has since become a `timing_safe.eql` compare, and
+  the harness pattern was widened to its new files); the pinned counts are unchanged but which branch each context is
+  has not been re-read. Run `scripts/checks/ctgrind.sh opaque` with `--stacks` and re-itemise.
 
 ## Backlog / deferred
 
-- **The curve25519 configuration (C.1.3/C.1.4)** — ristretto255 OPRF with an
+- **The curve25519 configuration (C.1.3/C.1.4):** ristretto255 OPRF with an
   X25519 AKE: `Opaque(C)` assumes the AKE group is the OPRF group, so this needs a
   separate `C.Ake` (keygen = `DeriveDiffieHellmanKeyPair` §6.4.1.3, DH = X25519).
   Moderate; pure Zig (`std.crypto.dh.X25519`).
-- **P256-SHA256 hardening rows** *(2026-11-13)*: the ctgrind harness and the
-  dead-stack probe drive the ristretto255 configuration only; the P-256 one runs
+- **P256-SHA256 hardening rows:** the ctgrind harness, the dead-stack probe and the fuzz harnesses
+  drive the ristretto255 configuration only; the P-256 one runs
   through the same code with `voprf`'s P-256 suite (whose own ctgrind rows are
   pinned) but has no opaque-level row yet.
-- **Fake-record helper** *(survey 2026-09-30)*. bytemare/opaque
+- **Fake-record helper:** bytemare/opaque
   (`GetFakeRecord`) and opaque-zig (`createFakeRecord`) ship one (opaque-ke not checked); here it is a
   documented recipe (`deriveAkeKeyPair` over a random seed, keep `.public_key`, zero
   envelope) — and the audit found the obvious shortcut (32 random bytes) is wrong
   93.754% of the time (root.zig header). A helper removes a proven foot-gun. Small
   (a dozen lines and a test against C.2.1); pure Zig. Not the same as the fake-record
   *policy*, which stays the server's job.
-- **Optional bundled Argon2id KSF adapter** *(survey 2026-09-30)*. opaque-zig defaults
+- **Optional bundled Argon2id KSF adapter:** opaque-zig defaults
   to Argon2id and opaque-ke has an `argon2` feature; here the caller writes the
   callback (`kat_test.zig`'s `Argon2Ksf` is the worked example). The module stays
   allocator-free by design, so this belongs in an example or a small sibling, not
   in `root.zig`. Small; pure Zig.
+
 
 ## Anchoring
 
