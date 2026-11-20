@@ -6,7 +6,7 @@
 
 **Scope:** core — RFC 5880 BFD / babeld link-cost estimation, as an estimator (surveyed 2026-09-30; re-assessed 2026-10-06 against that survey, no new survey: mvp -> core after latency-aware `pathCost()` — ETX loss cost + RFC 9616 RTT penalty — and the hysteretic `Selector`)
 
-**Audit:** review 2026-07-19 · mutation 2026-08-13 · src ?
+**Audit:** review 2026-07-19 · mutation 2026-11-20 (102/106, 4 eq) · src 5f2b1a15cc3e70e4
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — liveness hysteresis (keyword review, 2026-10-07)
 
@@ -154,6 +154,13 @@ pointwise monotone across `rtt_min`/`rtt_max` for several RTT weights, and the
 `Selector` does not move under ±20 ms RTT noise (whose raw costs cross over a
 thousand times) or one lost probe, switches exactly `hold` after a durable
 improvement, and leaves a `.down` path at once.
+
+Mutation: one whole-module run over `core.zig`, `cost.zig` and the estimator shell in `root.zig` (106 mutants; the trace, scoring
+and property harness files are test infrastructure), 102 killed, 4 equivalent (a `metric >= theta_down` clause that is dead after
+two consecutive misses, the window loss equal to the cumulative loss before the ring is full, `srtt <= rtt_min` at equality),
+none open. The scoring and property tests alone left 46 survivors: the decision thresholds were not pinned, so `core.zig` and
+`cost.zig` now carry scripted cases (EWMA values, the fast-down gate, the 18-miss floor, the regime max, the recovery gate
+including the ring forgetting a miss, direct `defaultCost` inputs, the `Selector` edges).
 
 Provenance: clean-room from RFC 5880 (BFD), the published Babel metric
 hysteresis description, RFC 8966 (ETX) / RFC 9616 (RTT penalty) and the

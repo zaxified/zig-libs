@@ -561,3 +561,95 @@ test "selector: a .down incumbent is left immediately" {
     try testing.expectEqual(@as(?usize, 0), sel.update(t, paths[0..1]));
     try testing.expectEqual(@as(?usize, null), sel.update(t, &.{}));
 }
+
+// ── whole-module mutation audit 2026-11: direct inputs and selector edges ───────
+
+fn srttCost(in: CostInputs, _: PathCostConfig) f64 {
+    return in.srtt;
+}
+
+fn downIsFreeCost(in: CostInputs, _: PathCostConfig) f64 {
+    return if (in.state == .down) 0.0 else in.srtt;
+}
+
+test "cost: direct inputs — loss clamped to [0, max_loss], negative weights are zero, degenerate ranges" {
+    const cfg: PathCostConfig = .{};
+    const full = defaultCost(.{ .loss = 1.0, .srtt = 0, .jitter = 0, .state = .down }, cfg);
+    try testing.expect(std.math.isFinite(full) and full > 1000);
+    try testing.expectEqual(@as(f64, 0), defaultCost(.{ .loss = -0.5, .srtt = 0, .jitter = 0, .state = .up }, cfg));
+    const neg: PathCostConfig = .{ .rtt_weight = -1, .jitter_weight = -1 };
+    try testing.expectEqual(@as(f64, 0), defaultCost(.{ .loss = 0, .srtt = 1e6, .jitter = 1e6, .state = .up }, neg));
+    const inv: PathCostConfig = .{ .rtt_min = 10, .rtt_max = 5 };
+    try testing.expectEqual(@as(f64, 1), rttPenalty(20, inv));
+    const j0: PathCostConfig = .{ .jitter_max = 0 };
+    try testing.expectEqual(@as(f64, 0), jitterPenalty(0, j0));
+    try testing.expectEqual(@as(f64, 1), jitterPenalty(0.5, j0));
+    try testing.expectEqual(@as(f64, 0), jitterPenalty(-5, cfg));
+}
+
+test "root: LinkState.rank orders down < suspect < up, and costInputs carries the state" {
+    try testing.expectEqual(@as(u8, 0), root.LinkState.down.rank());
+    try testing.expectEqual(@as(u8, 1), root.LinkState.suspect.rank());
+    try testing.expectEqual(@as(u8, 2), root.LinkState.up.rank());
+    var e = Estimator.init(.{});
+    e.verdict.state = .down;
+    try testing.expectEqual(LinkState.down, e.costInputs().state);
+}
+
+test "selector: edges — equal margin starts a challenge, an empty set clears it, a return of the incumbent resets it" {
+    var a = Estimator.init(.{ .path_cost = .{ .cost_fn = srttCost } });
+    var b = Estimator.init(.{ .path_cost = .{ .cost_fn = srttCost } });
+    const paths = [_]*const Estimator{ &a, &b };
+    var sel = Selector.init(.{ .margin = 50, .hold = 1000 });
+    a.verdict.srtt = 40;
+    b.verdict.srtt = 100;
+    try testing.expectEqual(@as(?usize, 0), sel.update(0, &paths));
+    a.verdict.srtt = 100;
+    b.verdict.srtt = 50; // exactly margin cheaper
+    try testing.expectEqual(@as(?usize, 0), sel.update(10, &paths));
+    try testing.expectEqual(@as(?usize, 1), sel.challenger);
+    try testing.expectEqual(@as(Time, 10), sel.challenger_since);
+    // the incumbent is the best again: the challenge is forgotten
+    a.verdict.srtt = 40;
+    try testing.expectEqual(@as(?usize, 0), sel.update(20, &paths));
+    try testing.expectEqual(@as(?usize, null), sel.challenger);
+    // a new challenge counts its hold from its own start
+    a.verdict.srtt = 100;
+    try testing.expectEqual(@as(?usize, 0), sel.update(2000, &paths));
+    try testing.expectEqual(@as(Time, 2000), sel.challenger_since);
+    try testing.expectEqual(@as(?usize, 1), sel.update(3000, &paths));
+    try testing.expectEqual(@as(?usize, null), sel.challenger); // a switch ends the challenge
+    try testing.expectEqual(@as(u64, 1), sel.switches);
+    // an empty path set drops the state, challenge included
+    a.verdict.srtt = 100;
+    b.verdict.srtt = 20;
+    sel.current = 0;
+    _ = sel.update(4000, &paths);
+    try testing.expectEqual(@as(?usize, 1), sel.challenger);
+    try testing.expectEqual(@as(?usize, null), sel.update(5000, &.{}));
+    try testing.expectEqual(@as(?usize, null), sel.current);
+    try testing.expectEqual(@as(?usize, null), sel.challenger);
+}
+
+test "selector: liveness outranks cost, and a .down incumbent is only left at once for a live path" {
+    var a = Estimator.init(.{ .path_cost = .{ .cost_fn = downIsFreeCost } });
+    var b = Estimator.init(.{ .path_cost = .{ .cost_fn = downIsFreeCost } });
+    const paths = [_]*const Estimator{ &a, &b };
+    a.verdict.srtt = 100;
+    b.verdict.srtt = 500;
+    b.verdict.state = .down; // cost 0: cheaper, but not live
+    var sel = Selector.init(.{ .margin = 10, .hold = 1000 });
+    try testing.expectEqual(@as(?usize, 0), sel.update(0, &paths));
+    // both down, the other one cheaper by the margin: no immediate switch, a challenge instead
+    var s2 = Selector.init(.{ .margin = 10, .hold = 1000 });
+    s2.current = 0;
+    var ca = Estimator.init(.{ .path_cost = .{ .cost_fn = srttCost } });
+    var cb = Estimator.init(.{ .path_cost = .{ .cost_fn = srttCost } });
+    ca.verdict.state = .down;
+    cb.verdict.state = .down;
+    ca.verdict.srtt = 100;
+    cb.verdict.srtt = 10;
+    const cp = [_]*const Estimator{ &ca, &cb };
+    try testing.expectEqual(@as(?usize, 0), s2.update(0, &cp));
+    try testing.expectEqual(@as(?usize, 1), s2.challenger);
+}

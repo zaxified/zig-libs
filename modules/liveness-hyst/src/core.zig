@@ -277,3 +277,212 @@ test "core: `since` stamps the last TRANSITION, not the last update" {
     try testing.expectEqual(root.LinkState.up, est.verdict.state);
     try testing.expect(est.verdict.since > 1_000);
 }
+
+// ── whole-module mutation audit 2026-11: scripted cases for the decision thresholds ──
+
+const Est = root.Estimator;
+const Tm = root.Time;
+
+fn replies(est: *Est, t: *Tm, n: usize, step: Tm) void {
+    for (0..n) |_| {
+        t.* += step;
+        est.onProbeReply(t.*, 20);
+    }
+}
+
+test "core: EWMA values, the first probe seeds the RTT, the weight is clamped to [1e-9, 1]" {
+    const testing = std.testing;
+    var est = Est.init(.{});
+    est.onProbeReply(100, 10);
+    try testing.expectApproxEqAbs(@as(f64, 10), est.smoothedRtt(), 1e-9);
+    est.onProbeReply(300, 100);
+    try testing.expectApproxEqAbs(@as(f64, 32.5), est.smoothedRtt(), 1e-9); // 10 + 0.25 * 90
+    est.onProbeTimeout(500);
+    try testing.expectApproxEqAbs(@as(f64, 0.25), est.metric(), 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 54.375), est.smoothedRtt(), 1e-9); // a timeout feeds rtt_max
+    // a timeout first: the seed is rtt_max, so the next reply is already smoothed
+    var e2 = Est.init(.{});
+    e2.onProbeTimeout(100);
+    e2.onProbeReply(300, 20);
+    try testing.expectApproxEqAbs(@as(f64, 95), e2.smoothedRtt(), 1e-9);
+    var hi = Est.init(.{ .metric_smoothing = 2.0 });
+    hi.onProbeTimeout(100);
+    try testing.expectEqual(@as(f64, 1.0), hi.metric());
+    var lo = Est.init(.{ .metric_smoothing = 0 });
+    lo.onProbeTimeout(100);
+    try testing.expect(lo.metric() > 0 and lo.metric() < 1e-8);
+}
+
+test "core: fast down needs two consecutive misses, 2/3 of down_threshold of silence and a clean regime" {
+    const testing = std.testing;
+    var a = Est.init(.{});
+    var t: Tm = 0;
+    for (0..11) |_| { // replies up to t = 2200: the link stays up
+        replies(&a, &t, 1, 200);
+        try testing.expectEqual(root.LinkState.up, a.state());
+    }
+    var b = a; // same history, two ways on
+    a.onProbeTimeout(2400);
+    try testing.expectEqual(root.LinkState.suspect, a.state());
+    a.onProbeTimeout(2800); // two misses, 600 ms since the last reply (floor 1000)
+    try testing.expectEqual(root.LinkState.suspect, a.state());
+    a.onProbeTimeout(3200); // 1000 ms: the floor is inclusive
+    try testing.expectEqual(root.LinkState.down, a.state());
+    b.onProbeTimeout(3300); // one miss after 1100 ms of silence is not enough
+    try testing.expectEqual(root.LinkState.suspect, b.state());
+    b.onProbeTimeout(3500); // exactly two misses and enough silence
+    try testing.expectEqual(root.LinkState.down, b.state());
+}
+
+test "core: a timeout in .down never improves the state, even after the regime turns degraded" {
+    const testing = std.testing;
+    var est = Est.init(.{});
+    var t: Tm = 0;
+    replies(&est, &t, 10, 1000);
+    var down_seen = false;
+    for (1..11) |k| {
+        t += 1000;
+        est.onProbeTimeout(t);
+        if (k >= 2) {
+            down_seen = true;
+            try testing.expectEqual(root.LinkState.down, est.state());
+        }
+    }
+    try testing.expect(down_seen);
+}
+
+test "core: in a degraded regime only 18 consecutive misses flush the link" {
+    const testing = std.testing;
+    var est = Est.init(.{ .degraded_loss_threshold = 0 });
+    var t: Tm = 0;
+    replies(&est, &t, 5, 200);
+    for (1..18) |_| {
+        t += 200;
+        est.onProbeTimeout(t);
+        try testing.expect(est.state() != .down);
+    }
+    t += 200;
+    est.onProbeTimeout(t); // the 18th
+    try testing.expectEqual(root.LinkState.down, est.state());
+}
+
+test "core: no reply in the window counts as silence" {
+    const testing = std.testing;
+    var est = Est.init(.{ .degraded_loss_threshold = 1.0 });
+    est.onProbeTimeout(100);
+    try testing.expectEqual(root.LinkState.suspect, est.state());
+    est.onProbeTimeout(300);
+    try testing.expectEqual(root.LinkState.down, est.state());
+}
+
+test "core: the regime is the larger of cumulative and windowed loss" {
+    const testing = std.testing;
+    var est = Est.init(.{});
+    var t: Tm = 0;
+    replies(&est, &t, 200, 1000); // cumulative loss stays low for the rest of the test
+    for (0..20) |_| {
+        t += 1000;
+        est.onProbeTimeout(t);
+        replies(&est, &t, 1, 1000);
+    }
+    t += 1000;
+    est.onProbeTimeout(t);
+    t += 1000;
+    est.onProbeTimeout(t); // 22 of the last 64 probes were misses: degraded, so not the fast path
+    try testing.expect(est.state() != .down);
+}
+
+test "core: the degraded threshold is exclusive" {
+    const testing = std.testing;
+    var est = Est.init(.{});
+    // 3 misses in 10 probes (30%), the last two consecutive, 2000 ms after the last reply
+    const script = [_]bool{ true, true, true, true, false, true, true, true, false, false };
+    var t: Tm = 0;
+    for (script) |reply| {
+        t += 1000;
+        if (reply) est.onProbeReply(t, 20) else est.onProbeTimeout(t);
+    }
+    try testing.expectEqual(root.LinkState.down, est.state());
+}
+
+test "core: the 10% margin keeps a small weight's two-miss metric above the threshold" {
+    const testing = std.testing;
+    var est = Est.init(.{ .metric_smoothing = 0.001 });
+    var t: Tm = 0;
+    replies(&est, &t, 30, 1000);
+    t += 1000;
+    est.onProbeTimeout(t);
+    t += 1000;
+    est.onProbeTimeout(t);
+    try testing.expectEqual(root.LinkState.down, est.state());
+}
+
+test "core: recovery needs a decayed metric, a quiet period and a timeout-free window or enough time" {
+    const testing = std.testing;
+    // (a) quiet for long enough, but the metric is still above alpha / 2
+    var a = Est.init(.{});
+    a.onProbeReply(100, 20);
+    a.onProbeTimeout(300);
+    a.onProbeReply(6000, 20); // metric 0.1875 > 0.125
+    try testing.expectEqual(root.LinkState.suspect, a.state());
+    a.onProbeReply(6200, 20); // 0.1406
+    try testing.expectEqual(root.LinkState.suspect, a.state());
+    a.onProbeReply(6400, 20); // 0.1055
+    try testing.expectEqual(root.LinkState.up, a.state());
+    // (b) metric decayed, but the last miss is younger than up_threshold, and exactly 5000 ms is enough
+    var b = Est.init(.{});
+    b.onProbeReply(100, 20);
+    b.onProbeTimeout(300);
+    var t: Tm = 300;
+    while (t < 5100) {
+        t += 200;
+        b.onProbeReply(t, 20);
+        try testing.expectEqual(root.LinkState.suspect, b.state());
+    }
+    t += 200; // 5300 = 300 + up_threshold
+    b.onProbeReply(t, 20);
+    try testing.expectEqual(root.LinkState.up, b.state());
+    // (c) a miss that left the 64-probe window is quiet whatever the clock says
+    var c = Est.init(.{});
+    c.onProbeReply(100, 20);
+    c.onProbeTimeout(300);
+    var tc: Tm = 300;
+    for (0..63) |_| {
+        tc += 50;
+        c.onProbeReply(tc, 20);
+    }
+    try testing.expectEqual(root.LinkState.suspect, c.state()); // the miss is still in the ring
+    tc += 50;
+    c.onProbeReply(tc, 20); // and now it is not
+    try testing.expectEqual(root.LinkState.up, c.state());
+    // (d) the NEWEST miss in the window counts, not the oldest
+    var d = Est.init(.{});
+    d.onProbeReply(100, 20);
+    d.onProbeTimeout(300);
+    var td: Tm = 300;
+    while (td < 5300) {
+        td += 200;
+        d.onProbeReply(td, 20);
+    }
+    try testing.expectEqual(root.LinkState.up, d.state());
+    d.onProbeTimeout(5500);
+    var step: Tm = 5500;
+    for (0..4) |_| {
+        step += 200;
+        d.onProbeReply(step, 20);
+    }
+    try testing.expectEqual(root.LinkState.suspect, d.state()); // 800 ms after the newest miss
+    // (e) the gate is metric <= alpha / 2, inclusive: with alpha 0.5 one reply lands exactly on it
+    var e = Est.init(.{ .metric_smoothing = 0.5 });
+    e.onProbeTimeout(100);
+    e.onProbeReply(5100, 20);
+    try testing.expectEqual(@as(f64, 0.25), e.metric());
+    try testing.expectEqual(root.LinkState.up, e.state());
+    // (f) a window that has not yet seen the first miss does not count it as ignored
+    var f = Est.init(.{});
+    f.onProbeTimeout(100);
+    f.onProbeReply(300, 20);
+    f.onProbeReply(500, 20);
+    f.onProbeReply(700, 20); // metric 0.105 <= 0.125 but the miss is 600 ms old
+    try testing.expectEqual(root.LinkState.suspect, f.state());
+}
