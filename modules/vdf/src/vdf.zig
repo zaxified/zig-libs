@@ -646,7 +646,7 @@ pub const VerifyError = error{InvalidElement};
 /// second half is why this verifier works in Z_N*/{±1} (BBF §6): in Z_N*
 /// the same `π` negated is a valid proof of `N-y`, so a prover chooses
 /// which of two "outputs" to publish — 38 of 38 such forgeries were
-/// accepted before. The full argument is Wesolowski §3
+/// accepted by a verifier without the quotient. The full argument is Wesolowski §3
 /// Theorem 1 over the quotient; implementing steps 1-4 above without
 /// internalizing WHY step 2's binding must include `y` (not just `N, x,
 /// T`), and why `-1` must be quotiented away, are the two easiest ways to
@@ -777,7 +777,7 @@ test "fuzz: Proof.fromBytes never panics on arbitrary bytes" {
     // Seeds at the one boundary the codec has (exactly `modulus_bytes`, one
     // short, one long): without a corpus the harness sees a single empty
     // input on the default lane — `check-fuzz-reach` measured that across
-    // the repository on.
+    // the repository.
     try testing.fuzz({}, fuzzProofFromBytes, .{ .corpus = &.{
         &(@as([group.modulus_bytes]u8, @splat(0xab))),
         &(@as([group.modulus_bytes - 1]u8, @splat(0xab))),
