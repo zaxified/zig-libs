@@ -3,7 +3,7 @@
 ACME v2 (RFC 8555) client: automated certificate issuance + renewal with the
 **HTTP-01**, **TLS-ALPN-01** (RFC 8737) and **DNS-01** challenges, wildcard
 certificates included (Let's Encrypt et al.) —
-directory discovery, nonce management, ES256 / ES384 account (JWS), order →
+directory discovery, nonce management, ES256 / ES384 / ES512 or RS256 account keys (JWS), order →
 authorization → challenge → CSR finalize → PEM chain download, external
 account binding, key rollover, revocation, ARI renewal timing, plus the
 renewal predicate.
@@ -16,10 +16,11 @@ renewal predicate.
   RFC 7638 JWK thumbprint, RFC 2986 PKCS#10, RFC 5915 EC keys).
 - **Deps:** `http` (all ACME requests via `http.Client`; the challenge
   server is `http.Server`), `router` (the challenge responder middleware),
-  `p256` / `p384` (the ES256 / ES384 account and certificate key types),
-  `entropy` (key generation), `datefmt` (RFC 3339 times in ARI responses),
-  `std.crypto` (sha2, hmac, Certificate),
-  `std.json`, `std.base64`.
+  `p256` / `p384` / `p521` (the ES256 / ES384 / ES512 account and certificate
+  key types), `rsa` (RS256 keys), `entropy` (key generation), `datefmt` (RFC
+  3339 times in ARI responses), `x509` (every read of a CA-supplied
+  certificate), `netaddr` (IP identifiers), `keycodec` (private-key PEM),
+  `std.crypto` (sha2, hmac, Certificate), `std.json`, `std.base64`.
 
 Provenance: clean-room implementation from RFC 8555 (ACME), RFC 7515 (JWS),
 RFC 7638 (JWK thumbprint), RFC 2986 (PKCS#10) and RFC 5915 (EC private keys).
@@ -61,8 +62,8 @@ only). A local test CA on `http://` gets `http` for its own URLs.
 | File | Role |
 |------|------|
 | `src/Client.zig` | The RFC 8555 protocol client (`register`, `obtain`) + `Responder` (HTTP-01 middleware) + `TlsAlpnResponder` (TLS-ALPN-01 validation-cert store). Robust nonce handling (`Replay-Nonce` harvested from every response, transparent `badNonce` retry), status polling with `Retry-After`, problem-document diagnostics via `lastProblem()` (text) and `lastProblemInfo()` (`kind` from RFC 8555 §6.7 to branch on, `detail`, HTTP `status`, `subproblems` with their identifiers; bounded, cuts flagged `truncated`). Challenge type is `Options.challenge_type`. |
-| `src/jws.zig` | JOSE layer: base64url (no pad), canonical P-256 / P-384 JWK, RFC 7638 thumbprint, RFC 8555 §8.1 key authorization, RFC 8737 §3 `acmeIdentifier` (`SHA-256(keyAuthorization)`), ES256 / ES384 flattened-JSON JWS sign **and verify** (the verify half powers the mock CA), the HS256 external-account-binding JWS (`signEab` / `verifyEab`), `Alg` / `AnyKeyPair` / `AnyPublicKey`. |
-| `src/x509.zig` | PKCS#10 CSR (DER through `rsa.der_writer`; empty subject, SAN dNSNames — the modern Let's Encrypt shape; ecdsa-with-SHA256/384), bounds-checked CSR parse-back, **RFC 8737 TLS-ALPN-01 self-signed validation cert** (`tlsAlpnCertDer` / `tlsAlpnCert`: dNSName SAN + critical `id-pe-acmeIdentifier` extension), PEM, RFC 5915 `EC PRIVATE KEY` and RFC 5958 PKCS#8 `PRIVATE KEY` read/write (P-256, P-384), the RFC 9773 ARI CertID (`ariCertId`), certificate `notAfter` via `std.crypto.Certificate`. |
+| `src/jws.zig` | JOSE layer: base64url (no pad), canonical P-256 / P-384 / P-521 and RSA JWK, RFC 7638 thumbprint, RFC 8555 §8.1 key authorization, RFC 8737 §3 `acmeIdentifier` (`SHA-256(keyAuthorization)`), ES256 / ES384 / ES512 / RS256 flattened-JSON JWS sign **and verify** (the verify half powers the mock CA), the HS256 external-account-binding JWS (`signEab` / `verifyEab`), `Alg` / `AnyKeyPair` / `AnyPublicKey`. |
+| `src/x509.zig` | PKCS#10 CSR (DER through `rsa.der_writer`; empty subject, SAN dNSNames — the modern Let's Encrypt shape; ecdsa-with-SHA256/384), bounds-checked CSR parse-back, **RFC 8737 TLS-ALPN-01 self-signed validation cert** (`tlsAlpnCertDer` / `tlsAlpnCert`: dNSName SAN + critical `id-pe-acmeIdentifier` extension), PEM, RFC 5915 `EC PRIVATE KEY` and RFC 5958 PKCS#8 `PRIVATE KEY` read/write (P-256, P-384, P-521; RSA keys through `rsa`), the RFC 9773 ARI CertID (`ariCertId`), certificate `notAfter` via `std.crypto.Certificate`. |
 | `src/Manager.zig` | Certificates that renew themselves (`autocert` / CertMagic): managed set, ARI/ratio renewal with back-off, issuer fallback (`Issuer`, `AcmeIssuer`), on-demand issuance, fleet locks, HTTP-01 middleware with redirect, TLS-ALPN-01 lookup, `checkPair` (chain, names, key). |
 | `src/storage.zig` | `Storage` (load / atomic store / delete / lease locks), `DirStorage` (0700/0600, fsync + rename), `MemStorage`. |
 | `src/root.zig` | Re-exports + `needsRenewal(cert_pem, now, within_days)`. |
@@ -413,6 +414,11 @@ contacted**:
   real HTTP (and probes that unknown tokens 404), and parses + verifies
   the CSR before "issuing" the fixture chain. Skipped only if the
   loopback bind itself fails.
+- **Pebble (outside the lane):** `tools/pebble.sh` runs the real client against
+  Let's Encrypt's test CA Pebble (HTTP-01, DNS-01 wildcard, TLS-ALPN-01, RSA,
+  IP identifiers, the account lifecycle, the `Manager`); its answers are frozen
+  in `src/testdata/pebble_transcript.zig` and replayed offline by the test lane
+  (`tools/README.md`).
 - **Lifecycle (same mock CA):** the external-account-binding JWS (checked
   against std's HMAC-SHA256 and verified by the CA), a rollover ES256 → ES384
   with both JWS layers checked and the old key refused afterwards,

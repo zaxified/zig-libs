@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-18 (606/673, 67 eq) · src 69607c00803e08ba
 
-Audit detail (2026-11-06): whole-module mutation run over every production file (`Client`, `jws`, `x509`, `Manager`, `storage`, `burn`, `root`), 623 mutant schemata in three passes (ReleaseSafe, burn and wipe mutants on ReleaseFast). 556 killed, 67 equivalent with the invariant named per id (tables and reports in the owner's session, `20261106-whole-mut/`). Fixed on the way: `Certificate.deinit` and `TlsAlpnCert.deinit` freed the key PEM unwiped; `verifyEab`'s expected MAC, the RSA PEM writer's frames (10775 B against an 8 KiB burn) and `Client.init`'s pair copy stayed on the dead stack; six pub functions panicked on a caller precondition and now return errors.
-
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACME_FUZZ) · ct 2026-10-18 (ctgrind: P-256 account / certificate scalar through jws.sign, x509.csrDer, ecPrivateKeyToPem/FromPem; 57 / 21 / 12 in-file = jws 13 delegated p256 signer + 44 base64 of the public signature, csr 13 signer + 8 Signature.toDer trimming, pem 11 (12 until 2026-10-13: p256's `rejectIdentity` now one jump) = PEM layout decisions, the b64ct validity verdict, the DER length byte sharing a base64 character with key bits, p256 comb; the first measurement found std base64 indexing its table by the key in the key PEM paths (16 + 5 contexts) — fixed the same day with `b64ct.zig` and wiped stack buffers, itemised in `scripts/checks/ctgrind-expected.tsv`; 2026-10-13 after S2: 56 / 20 / 20 — pem +9 is the `[0]` parameters element the key parser now reads after the private key, whose tag/length bytes share base64 characters with key bits, all layout decisions; 2026-10-17: 56 / 20 / 18 — the `b64ct` module's `decodeIgnoring` replaced the private copy and the whitespace switch (2 contexts gone); 2026-10-18: 56 / 20 / 18 + `pem384` 18 + `pkcs8` 17 — new targets for the P-384 and PKCS#8 key paths, and a FINDING fixed: the END-line search was std's Boyer-Moore-Horspool forward over the key's base64 (a skip-table index by key characters, a skip length depending on them; misread on 10-13 as a layout decision), now the first `-` after the body, which base64 never contains — one `findScalarPos` context per read, its outcome public by the alphabet; later the same day + `anykey` 5 — a second FINDING fixed: the HEADER searches over text that may hold a key of another label (`privateKeyFromPem` on PKCS#8, the RSA loader, the Manager's stored blob and `checkKey`) were `std.mem.indexOf` across the key's body (all of it when the label is absent); `pemBlockStart` walks the blocks and skips each body by the same `-` scan — its 5 contexts are two such body skips, the END scan, the DER walk and the p256 comb, no `findPos`) · panic 2026-10-28 (sweep of the acme module: unbounded CA lists capped (order authorizations, alternate chains, chain length), saturating clock arithmetic, 1 s floors on back-off and lock poll, bounded on-demand set, checked `@panic("acme: …")` for helper preconditions)
 
 **Performance:** n/a — the work is bound by network and CA round trips; the CPU parts are the crypto modules', measured on their own cards, and x/crypto/acme's JWS code is unexported (2026-10-10)
@@ -21,7 +19,7 @@ Audit detail (2026-11-06): whole-module mutation run over every production file 
 **Downstream consumer:** yes
 
 ACME v2 (RFC 8555) client: account registration, HTTP-01, TLS-ALPN-01 (RFC 8737) and DNS-01 challenge
-issuance (wildcards via DNS-01), and renewal. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+issuance (wildcards via DNS-01), and renewal. Usage: see ./README.md. Provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -37,7 +35,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [acmesh-official/acme.sh](https://github.com/acmesh-official/acme.sh) | Shell | GPL-3.0 (source not read) | 47.8k | 3.1.6 (2026-09-20) | The most used shell client; DNS-01 via ~150 provider scripts, so most home and small-server users get wildcards this way. |
 | [cloud-cup/acme-zig](https://github.com/cloud-cup/acme-zig) | Zig | none found (no LICENSE file, API reports none; source not read) | 1 | pushed 2024-12-16 | The only Zig ACME repository found by GitHub search (queries "acme", "letsencrypt" restricted to Zig); empty README, dormant. |
 
-**Where we are ahead:** the only maintained ACME client in Zig, pure Zig on `std.crypto`, with all three challenges (HTTP-01 and TLS-ALPN-01 served by the library itself; DNS-01 through a caller publisher, as `x/crypto/acme` leaves it); staging by default; a socket-free mock CA in the tests that verifies every JWS, injects `badNonce`, fetches HTTP-01 over real HTTP and resolves DNS-01 from the publisher's zone; `needsRenewal` errs toward renewal. Since 2026-10-13 also at `x/crypto/acme` parity on the protocol surface: external account binding (RFC 8555 §7.3.4), contact update / account key rollover / deactivation, revocation by account and by certificate key, ARI (RFC 9773) with the `replaces` order member, ES256 and ES384 account and certificate keys, PKCS#8 key I/O; since 2026-10-16 profiles, order validity, alternate chains, CSR input, extra CSR extensions (must-staple), `rateLimited` as its own error with `Retry-After`, CA presets and ES512 (which x/crypto/acme lacks), and every lifecycle call run against Pebble. Since W2 (2026-10-16) also RSA account and certificate keys and IP identifiers (RFC 8738, both challenges, Pebble-checked). Since W5 (2026-10-16) the `autocert`/CertMagic layer too: `Manager` keeps certificates current from `Storage` (`DirStorage`), renews on the CA's ARI window or a lifetime ratio with back-off, falls back across issuers, obtains on demand under a host policy and a rate limit, coordinates a fleet through storage locks and shared challenge data, answers HTTP-01 (with autocert's redirect) and TLS-ALPN-01 itself, and checks every issued chain (RFC 5280 path, names, key) before storing or serving it — run against Pebble with real keys. Since 2026-11-05 the problem document structured (`lastProblemInfo`: RFC 8555 §6.7 type as an enum, subproblems with identifiers, HTTP status — lego's `ProblemDetails`). **Where we are behind** (2026-10-16): DNS-01 publishers are the four generic ones in `acmedns` (lego also ships 200+ vendor APIs, deliberately not followed); no OCSP stapling (owner: Backlog — Let's Encrypt has switched OCSP off); no in-memory certificate cache with a capacity bound (CertMagic's `Cache`); never run against a real CA beyond Pebble.
+**Where we are ahead:** the only maintained ACME client in Zig, pure Zig on `std.crypto`, with all three challenges (HTTP-01 and TLS-ALPN-01 served by the library itself; DNS-01 through a caller publisher, as `x/crypto/acme` leaves it); staging by default; a socket-free mock CA in the tests that verifies every JWS, injects `badNonce`, fetches HTTP-01 over real HTTP and resolves DNS-01 from the publisher's zone; `needsRenewal` errs toward renewal. Since 2026-10-13 also at `x/crypto/acme` parity on the protocol surface: external account binding (RFC 8555 §7.3.4), contact update / account key rollover / deactivation, revocation by account and by certificate key, ARI (RFC 9773) with the `replaces` order member, ES256 and ES384 account and certificate keys, PKCS#8 key I/O; since 2026-10-16 profiles, order validity, alternate chains, CSR input, extra CSR extensions (must-staple), `rateLimited` as its own error with `Retry-After`, CA presets and ES512 (which x/crypto/acme lacks), and every lifecycle call run against Pebble. Since W2 (2026-10-16) also RSA account and certificate keys and IP identifiers (RFC 8738, both challenges, Pebble-checked). Since W5 (2026-10-16) the `autocert`/CertMagic layer too: `Manager` keeps certificates current from `Storage` (`DirStorage`), renews on the CA's ARI window or a lifetime ratio with back-off, falls back across issuers, obtains on demand under a host policy and a rate limit, coordinates a fleet through storage locks and shared challenge data, answers HTTP-01 (with autocert's redirect) and TLS-ALPN-01 itself, and checks every issued chain (RFC 5280 path, names, key) before storing or serving it — run against Pebble with real keys. Since 2026-11-05 the problem document structured (`lastProblemInfo`: RFC 8555 §6.7 type as an enum, subproblems with identifiers, HTTP status — lego's `ProblemDetails`). **Where we are behind:** DNS-01 publishers are the four generic ones in `acmedns` (lego also ships 200+ vendor APIs, deliberately not followed); no OCSP stapling (owner: Backlog — Let's Encrypt has switched OCSP off); no in-memory certificate cache with a capacity bound (CertMagic's `Cache`); never run against a real CA beyond Pebble.
 
 ## Design & invariants
 - **Flow:** new-nonce → new-account → new-order → authorization → finalize with a CSR → poll →
@@ -45,7 +43,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `Options.challenge_type`) share the account/order/notify/poll machinery — only the proof differs:
   - **HTTP-01** (default): serve the key-authorization token at
     `/.well-known/acme-challenge/<token>` via the `Responder` `router` middleware.
-  - **DNS-01** (RFC 8555 §8.4, since 2026-09-30): the TXT value `base64url(SHA-256(keyAuthorization))`
+  - **DNS-01** (RFC 8555 §8.4): the TXT value `base64url(SHA-256(keyAuthorization))`
     (`jws.dns01TxtValue`) goes to `_acme-challenge.<identifier>` (`dns01RecordName`) through the caller's
     `Options.dns_publisher` (`present` returns once the record is visible — propagation is the
     publisher's; `cleanup` runs once per successful `present`, whatever the outcome). **Wildcards**
@@ -66,14 +64,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
     app-side (out of scope).** No system clock: the ephemeral cert uses a fixed wide UTCTime window
     (`tls_alpn_not_before`/`tls_alpn_not_after`). Keygen takes randomness from the caller (the `io`
     in the order flow; a `std.Random` for the standalone `x509.tlsAlpnCert`) — no `std.crypto.random`.
-- **Order options** (2026-10-16): `profile` is checked against the directory's `meta.profiles`
+- **Order options:** `profile` is checked against the directory's `meta.profiles`
   before the order goes out (`required` → `NotSupported`, `preferred` → omitted); `not_before` /
   `not_after` become RFC 3339 members; `preferred_chain` compares the issuer CN of the topmost
   certificate of the default chain, then of each `Link: rel="alternate"` chain in order, and falls
   back to the default; `csr_extensions` go after the SAN in the extensionRequest (an OID twice, or
   the SAN itself, is refused). `obtainWithCsr` orders the CSR's dNSName SANs after the CSR's
   self-signature verifies (`parseCsrAny`), and returns the chain without a key.
-- **Order-level API** (W3, 2026-10-16; instant-acme's handles, lego's providers): `newOrder` /
+- **Order-level API** (instant-acme's handles, lego's providers): `newOrder` /
   `fetchOrder(url)` return an `Order` that owns its memory (url, status, identifiers,
   authorizations, finalize, certificate, expires); `waitOrder(.ready | .valid)` and `finalize`
   refresh it in place; `downloadChain` takes a `valid` one. `fetchAuthorization` returns an
@@ -92,7 +90,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   replay nonce threads from each response's `Replay-Nonce`. The curve follows the key
   (`jws.Alg`; `AnyKeyPair` is what `Client` holds); the entry points are generic over the key type,
   so a P-256 caller's code is unchanged.
-- **Account lifecycle** (2026-10-13): EAB is an HS256 inner JWS over the account JWK (`jws.signEab`,
+- **Account lifecycle:** EAB is an HS256 inner JWS over the account JWK (`jws.signEab`,
   built per newAccount URL, no nonce). `rolloverKey` sends an outer JWS (old key, `kid`, nonce) whose
   payload is the inner JWS (new key as `jwk`, **no nonce**, same `url`) over `{account, oldKey}`; the
   client swaps and wipes its key only after a 200. `deactivate` clears `accountUrl`.
@@ -101,7 +99,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `<renewalInfo>/<CertID>`, CertID = base64url(AKI keyIdentifier) "." base64url(serial content
   octets); the endpoints `keyChange`, `revokeCert`, `renewalInfo` are optional in the directory and
   their absence is `error.NotSupported`.
-- **Manager** (W5, 2026-10-16; `autocert` / CertMagic, design only). One `manage(names)` = one
+- **Manager** (`autocert` / CertMagic). One `manage(names)` = one
   certificate. `maintain()` is a step (the consumer owns the clock — the web-server consumer calls it from its own
   timer); `run()` the loop. Per due entry: adopt the stored certificate when it passes the checks and
   is newer than the current one; else take the storage lock `issue/<name>` (lease
@@ -153,7 +151,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   file `owner\nexpiry`, re-entrant for its owner (extends the lease), an unreadable one counts as
   expired; every lock operation (read → decide → create / replace / delete) runs under an exclusive
   `flock` of `locks/.guard`, so a stale lock is taken over by exactly one node and `unlock` never
-  deletes another node's fresh lock (2026-10-18, audit L6; CertMagic's file locks are
+  deletes another node's fresh lock (CertMagic's file locks are
   read-then-delete). Where the file system refuses `flock` the operations run unguarded (create by
   exclusive link, takeover delete-then-create: a duplicate order at worst). `create` = exclusive
   link. A lease shorter than an issuance still lets a second node in (no heartbeat). `MemStorage`: a map under a spin lock, values wiped
@@ -163,7 +161,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   covers RFC 5915 `EC PRIVATE KEY` and RFC 5958 PKCS#8 `PRIVATE KEY`, P-256, P-384 and P-521, and the RSA
   key PEMs through `rsa`.
 
-## Threat model / out of scope
+## Threat model / Limits
 - **Account-key custody is the security boundary** — whoever holds the ES256 account key controls
   the ACME account; the `Client` wipes its own copy in `deinit` (and the old key after a rollover),
   the caller stores and protects the original. An RS256 account key signs PKCS#1 v1.5 through `rsa`
@@ -173,10 +171,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   serving either proof on an attacker-influenced host would mis-issue — the caller must only run this
   for domains it controls.
 - Replay-nonce handling follows the RFC; the CA enforces anti-replay.
-- **CA-URL policy (2026-11-18, owner decision on the 2026-10-28 sweep question; `Options.allow_cross_host_urls`,
-  `Options.extra_allowed_hosts`, `error.UrlNotAllowed`).** A hostile or compromised CA could aim the client's
-  signed POSTs and GETs at internal hosts (SSRF): every URL the client is handed by the CA used to be a request
-  target unexamined. Now every request to a CA-supplied URL — the directory's resources, `Location`, an order's
+- **CA-URL policy (`Options.allow_cross_host_urls`, `Options.extra_allowed_hosts`, `error.UrlNotAllowed`).** A hostile
+  or compromised CA could aim the client's signed POSTs and GETs at internal hosts (SSRF), so every request to a CA-supplied URL — the directory's resources, `Location`, an order's
   authorizations / finalize / certificate, a challenge, a `Link: rel="alternate"` chain, and what the caller
   passes back to `fetchOrder` / `fetchAuthorization` / `acceptChallenge` / ... — is checked at the one place
   it is sent (`postSignedAccept`; GET/HEAD through `http.Client`'s `redirect_filter`, every hop), before a
@@ -199,8 +195,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   stricter on purpose (security first, opt-out kept).
 - DNS-01 proves control of the domain's DNS zone, and a wildcard certificate covers every name under
   it: the publisher's DNS credentials are as sensitive as the account key, and they stay the caller's
-  (the library never sees them). Out of scope: DNS provider integrations (beyond `acmedns`'s generic
-  four), OCSP, and **running the TLS listener** — for TLS-ALPN-01 the caller must serve the
+  (the library never sees them). Out of scope (see *What is deliberately not done*, *Backlog / deferred*): DNS provider integrations beyond
+  `acmedns`'s generic four, OCSP, and **running the TLS listener** — for TLS-ALPN-01 the caller must serve the
   validation cert from `TlsAlpnResponder` under ALPN `acme-tls/1` (BYO-TLS `http` seam or a proxy);
   for HTTP-01 the caller runs the port-80 `http.Server`. RSA keys (RS256) are held by pointer: the caller owns and wipes the account pair. The EAB MAC key is a secret
   of the same weight as the account key (it lets whoever holds it bind new accounts to the customer):
@@ -214,172 +210,108 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   call `certificate` for the names of its own event (an on-demand entry is busy then). **On-demand**
   without a strict `allow` lets a client make the server order a certificate for any name it sends
   (CA rate limits, account standing); `allow` is required and the rate limit bounds the rest. The
-  redirect reflects only the Host's hostname characters. Fleet: lock takeover and release are
-  read-then-delete (see Storage) — the cost of the race is one duplicate order, never a torn file.
+  redirect reflects only the Host's hostname characters. Fleet: lock takeover and release run
+  under a `flock` guard (see Storage); where the file system refuses it, the cost of the race is one duplicate order,
+  never a torn file.
+- **`Client.obtain` hands back the chain as the CA sent it.** Verification of the downloaded chain (RFC 5280 path to
+  `trust_anchors`, names, key) is the `Manager`'s (`checkPair`), not the client's.
+- **Fleet challenge reads.** With `distributed_challenges`, each unauthenticated challenge request that misses the local
+  maps costs one storage read; only a base64url token (HTTP-01) or a hostname SNI (TLS-ALPN-01) reaches storage.
+- **Directory `meta`** is parsed into a `std.json.Value` (bounded by the 1 MiB body, freed after use).
 
 ## Verification
-`zig build test-acme` — all offline + loopback, no real CA ever contacted. Offline units:
-ES256 KAT (RFC 7515 A.3), JWK thumbprint (RFC 7638 §3.1), key-authorization computation, **RFC 8737
-acmeIdentifier = SHA-256(keyAuthorization) against a hand-computed oracle**, base64url vectors, JWS
-sign→verify round-trips (jwk + kid, tampering fails), CSR DER build→parse-back (SANs + self-signature,
-cross-checked with `openssl req -verify`), **TLS-ALPN-01 validation-cert build: byte-exact
-`id-pe-acmeIdentifier` extension (OID + critical + double-`OCTET STRING` wrap per RFC 8737 §3) + dNSName
-SAN + self-signature verified over the TBSCertificate + deterministic rebuild**, `TlsAlpnResponder`
-store set/getMaterial/remove semantics, `parseAuthz` tls-alpn-01 selection + identifier capture,
-PEM/EC-key round-trips against openssl fixtures, `certNotAfter`/`needsRenewal` boundaries, challenge
-responder over the socket-free server codec. Mock-ACME integration (HTTP-01): a fake CA on
-`http.Server`+`router` serves the full RFC 8555 state machine on loopback while the real `Client`
-drives it — the mock verifies every JWS signature, enforces one-time nonce freshness, injects a
-`badNonce` rejection to prove the retry, fetches the key authorization over real HTTP, and
-parses+verifies the CSR before issuing the fixture chain. Mock-ACME integration (DNS-01, wildcard): the
-same CA offers dns-01 (with an http-01 decoy) on a `wildcard: true` authorization, resolves the TXT
-record from the zone the client's publisher wrote, compares it with the value the account key implies,
-and checks the CSR's SAN is the wildcard; the test also pins one `present` and one matching `cleanup`
-at the base name. DNS-01 TXT value: KAT against two independent tools (`openssl dgst | base64` and
-Python `base64.urlsafe_b64encode`) over the RFC 7515 key's pinned key authorization. Skips only if the loopback bind fails. The
-TLS-ALPN-01 `id-pe-acmeIdentifier` extension's DER shape (RFC 8737 §3's double-`OCTET STRING` wrap) is
-now also cross-checked against `openssl`: since the OID has no built-in name in openssl, its generic
-`DER:<hex>` extension syntax was used to build a real self-signed certificate carrying our exact bytes,
-which `openssl x509 -text`/`asn1parse` re-parsed back into the expected SEQUENCE/OID/BOOLEAN/OCTET
-STRING shape; those re-parsed bytes are frozen as a golden and compared byte-for-byte against our own
-encoder's output (see `x509.zig`'s "openssl builds + re-parses the same bytes we do" test). A live
-`acme-tls/1` TLS handshake against a real CA remains out of scope, since running the TLS listener is
-app/ianic territory — that is a distinct gap from the extension encoding closed here.
 
-**Mutation + review (2026-11-12, whole module,** production code of `Client.zig` (to 2639), `jws.zig`, `x509.zig`, `Manager.zig`, `storage.zig`, `root.zig`; the 2026-11-06 list re-applied (15 anchors rewritten after the no-panic sweep and the keycodec PEM move) plus 40 mutants for the new code — the `dns01RecordName` 253-byte bound, `present`/`cleanupDns01` error mappings, the `Client.init` burn, `Alg.crv/coordLen/sigLen` null for rs256, `base64UrlEncode`'s NoSpaceLeft, `generateAnyKeyPair` refusing rs256, `eabMacMatches`, PEM through keycodec, `splitPemChain`'s label filter, `Manager.init` node id; schemata in a detached copy, ReleaseSafe + ReleaseFast (stack probes and heap-wipe spies), plain single-mutation ReleaseFast builds for the `Client.init` burns, strict verdict): 648 mutants, 582 killed (5 by timeout, 36 by the ReleaseFast probes — incl. `rsaPrivateKeyToPem`'s burn, equivalent in 2026-11-06 and killed since the 16 KiB `pem_write_burn`), 66 equivalent, 0 undecided, no defect. New tests: the built-in DNS-01 solver refuses a 254-byte identifier and neither publishes nor removes; `pemBlockCount` is 0 for a good block followed by an unterminated one; a key block after the chain is skipped and an undecodable or unterminated CERTIFICATE block is MalformedChain; `ratioRenewAt` with notAfter < notBefore clamps the lifetime to 0. Equivalent: an empty node id (`validKey("")` refuses), `publicKeyFromCoords` reached only with an EC alg, `alloc(maxInt)`, `eabMacMatches` inside `burn.run`, the `Client.init` key wipe and burn (the plain-build stackprobe stays clean with both removed), fsync (durability only), redundant burn layers (probes green), guards backed by another layer (2026-11-06 arguments re-checked). Cut: `burn.zig`, the ctgrind harness, testdata, the comptime `max_resumed_identifiers`, the `sleepMs` cap (needs a 60 s sleep).
+Run: `scripts/modtest acme` (`zig build test-acme`) — all offline + loopback, no real CA is ever contacted by the
+test lane. The foreign-CA runs are `tools/pebble.sh` (live, Pebble v2.10.1 in `-strict` mode, outside the repository)
+and its offline replay inside the lane (see *Anchoring*); `zig build interop-acme` is the program they share
+(`tools/README.md`).
 
-**Mutation (2026-10-18,** the code added since 2026-10-04: `Manager.zig` (all), `storage.zig`, the `x509.zig` additions and the `Client.zig` additions, schemata over a copy, one ReleaseSafe build of every test except the Pebble replay, the stack probes, the fuzz drivers and the three `integration:` tests; the mock-CA tests are included): 217 mutants — `Manager`: `addIssuer`/`dueAt`/`addEntry`/`unmanage`/`validName`/`certStem`, `maintain`/`nextDue`/`run`/`step`, the lock poll and both `adoptStored` looks, issuer order, `replaces`, `d` reset and Retry-After merging, the problem texts, `unmanage` during an issuance, every `install` reset, `ratioRenewAt` (both percentage bounds, the ten-day and two-thirds rules), `backoffS` (shift, cap, base), `failed` (on-demand floor, Retry-After floor and year cap, valid-certificate clamp), `pollAri` (window change test, clamp, floor, cap), `certificate`/`lookup`/`tlsAlpnMaterial` guards, `httpRun` (HEAD, redirect, host, target), `httpKeyAuthorization`, `checkPair`/`checkKey`/`rsaPublicEql`, `loadOrCreateAccountKey`, `issuerName`, `AcmeIssuer`, `RateLimiter`; `storage`: `validKey`/`validOwner`/limits, `DirStorage` lock expiry/owner/guard, `MemStorage` create/lock/unlock; `x509`: domain limits and alphabet, CSR duplicate/critical/IP tags, PEM begin/end handling, PKCS#8 and SEC1 key reader checks, RSA bit bounds, ARI CertID; `Client`: register/EAB/rollover/deactivate/revoke payloads, `pickTime`, `renewalInfo`, 503 and bad-nonce loops, `Retry-After`, `Link` parsing. First run: 122 killed, 95 alive. The survivors clustered in `Manager` (its tests drive the happy path and one failure per rule): the new `manager_test.zig` tests (renewal percentages, the doubling and its cap, the valid-certificate clamp, reset after success, exact renewal point, a result stored while taking the lock, problem texts and the longest Retry-After, `unmanage` during an issuance, 100 names/IP literals/stems, HTTP-01 edges, distributed challenges, rate-limit edges, ARI window changes/clamp/floor/cap/re-pick, on-demand back-off and exact retry time, 253-character names), the new storage/x509/Client tests (limits and characters, owners, `pemDecode` order, PKCS#8 version/algorithm, bare `ECPrivateKey`, `pickTime` end, empty window, bad-nonce count) and a faster `Lab.stop` (client connections closed before the server drains — it cost ~10 s per mock-CA test) killed 82. **25 equivalent:** the `dueAt` `cert == null` shortcut (`renew_at` is 0 then); `validName`'s stem check (a valid domain always has a valid stem); `maintain`'s `busy` skip, the `retry_at != 0` term of `step`, `d = .{}` per issuer and the Retry-After merge in `issue` (single-threaded / every issuer overwrites both fields / `retry_after` already holds the maximum); `install`'s `ari_start` reset (`ari_end` is reset too, which already re-arms the comparison); `tlsAlpnMaterial`'s hostname check and `checkPair`'s name pre-check (the storage key / `hostname.verify` refuse the same input); `validRedirectHost` and the Host check (the HTTP parser rejects those Hosts first); `checkKey`'s PKCS#1 branch (the fallback reaches the same function); `loadOrCreateAccountKey`'s `created` return and `InvalidKey` mapping (a second load returns the same key; `load` rejects first); `ratioRenewAt`/`pollAri` clamp when `floor > not_after - 3600` (needs a certificate under 66 minutes); `storage` `path.len == 0` (an empty path has one empty segment), `.limited(max_value_len + 1)`, the unguarded takeover (needs a file system without `flock`); the pkcs8/SEC1 curve-mismatch checks (`fillPair` refuses the same pair), `raw.len == 0` and `serial.len == 0` (a zero scalar / empty serial fail later); `Client` wipe before `copyPairInto` (overwritten), `pickTime` `<=` (span 0 draws 0), `retryAfterHeader` `at <= now` (both give 0). **15 open at first, 14 now killed and 1 more equivalent (191/217 killed, 26 equivalent):** `MockCa` got test-only knobs (`Retry-After` of the injected 503 or none, a refused `replaces`, the recorded newAccount `contact`, a failing deactivation, a trailing-slash `renewalInfo` URL and a failing endpoint, order polls with a `Retry-After`) and the tests that use them: `ratioRenewAt: exactly ten days renews at half…` (46), `rsaPublicEql: modulus bytes and exponent both count…` (95, 96; in `Manager.zig`, built from `rsa.PublicKey.fromBytes`), `AcmeIssuer: a CA that refuses \`replaces\`…` (104), `RSA key PEM: the 4096-bit ceiling is inclusive; with both labels present the first block wins` (164, 166; a 4096-bit openssl key and a 1024-bit marker key), `register: the contact members are sent…` (184), `deactivate: a refusal is an error and the account stays…` (189), `renewalInfo: a trailing slash… a non-200…` (197, 198), `503: Retry-After is read as seconds; a wait of exactly 30 s is honoured, 31 s is the caller's call` (208, 209; the 30 s wait is observed on a concurrent call and cancelled while it sleeps, so nothing waits it out), `503: without Retry-After the wait doubles from one second…` (210) and `polling: the Retry-After of a pending order paces the next poll` (211). **Equivalent (new):** `rsaPublicEql`'s bit-length pre-check (`al != b.n.bits()`): when the lengths differ, either `b` does not fit `len` bytes (`toBytes` fails) or its zero-padded top byte differs from `a`'s nonzero top byte, so the byte compare refuses the same pairs.
+- **Offline units:** ES256 KAT (RFC 7515 A.3), JWK thumbprint (RFC 7638 §3.1), key-authorization computation, RFC 8737
+  acmeIdentifier = SHA-256(keyAuthorization) against a hand-computed oracle, base64url vectors, JWS sign→verify
+  round-trips (jwk + kid, tampering fails), CSR DER build→parse-back (SANs + self-signature, cross-checked with
+  `openssl req -verify`), the TLS-ALPN-01 validation certificate (byte-exact `id-pe-acmeIdentifier` extension: OID,
+  critical, double `OCTET STRING` wrap per RFC 8737 §3; dNSName SAN; self-signature verified over the TBSCertificate;
+  deterministic rebuild), `TlsAlpnResponder` set/getMaterial/remove, `parseAuthz` tls-alpn-01 selection, PEM/EC-key
+  round-trips against openssl fixtures, `certNotAfter` / `needsRenewal` boundaries, the challenge responder over the
+  socket-free server codec. The extension's DER shape is also cross-checked against `openssl` (its generic
+  `DER:<hex>` extension syntax builds a real certificate carrying our exact bytes; `openssl x509 -text` / `asn1parse`
+  re-parse it; those bytes are frozen as a golden compared with our encoder, `x509.zig` test "openssl builds +
+  re-parses the same bytes we do"). A live `acme-tls/1` handshake against a real CA stays out of scope: running the TLS
+  listener is app-side.
+- **Mock-ACME integration (`Client.zig`):** a fake CA on `http.Server` + `router` serves the RFC 8555 state machine on
+  loopback while the real `Client` drives it. It verifies every JWS signature, enforces one-time nonce freshness,
+  injects a `badNonce` rejection to prove the retry, fetches the HTTP-01 key authorization over real HTTP, and
+  parses and verifies the CSR before issuing a fixture chain. The same CA offers dns-01 (with an http-01 decoy) on a
+  `wildcard: true` authorization, resolves the TXT record from the zone the client's publisher wrote and checks it
+  against the account key's value, checks the CSR's SAN is the wildcard, and the test pins one `present` and one
+  matching `cleanup` at the base name. DNS-01 TXT value: KAT against `openssl dgst | base64` and Python
+  `base64.urlsafe_b64encode`. Skips only if the loopback bind fails.
+- **Lifecycle (same mock CA):** EAB (the CA checks kid, url, no nonce, payload = account JWK and the MAC; a separate
+  test recomputes the MAC with std's HMAC-SHA256 over the RFC 8555 §7.3.4 layout; a wrong key and a missing binding
+  are refused), rollover ES256 → ES384 → ES384 (outer and inner JWS, `oldKey`, `account`, no inner nonce; the previous
+  key is then refused; a 409 leaves the client's key unchanged), contact update, deactivation, revocation by account
+  and by certificate key, `NotSupported` without the endpoints, ARI against the RFC 9773 §4.1 CertID example, RFC 3339
+  parsing, the whole issuance with an ES384 account and certificate key. External oracles: openssl built the P-384 CSR
+  and the P-384/P-256 PKCS#8 keys (our PEM output is byte-identical), Python computed the P-384 canonical JWK and
+  thumbprint.
+- **Manager (`src/manager_test.zig`):** a scripted issuer over committed fixtures (an openssl CA and leaves with fixed
+  validity windows, `tools/gen_manager_fixtures.sh` → `src/testdata/manager_fixtures.zig`), an injected clock and
+  `MemStorage`, so every schedule is asserted to the second: first issuance and lookup by name, renewal at the
+  scheduled point with `replaces`, restart from storage, back-off and `Retry-After`, issuer fallback and order,
+  ARI window handling, another node's lock, wildcard lookup, `unmanage` (also during an issuance), on-demand (policy,
+  rate limit, back-off, threads asking for one name), failing storage (`storage_failed`), HTTP-01 through the solver and
+  middleware, TLS-ALPN-01 shared through storage, `checkPair` against wrong keys, uncovered names, expiry, a missing
+  CA, a wrong anchor and a future `notBefore`. `src/storage.zig`: one contract run against both backends (replace,
+  delete, key validation, lock exclusivity / re-entry / expiry / release), `DirStorage` modes, a garbled lock, eight
+  racing nodes on one stale lock with exactly one winner.
+- **Pebble:** `tools/interop.zig` drives the real client through the scenarios listed in `tools/README.md` (HTTP-01,
+  DNS-01 wildcard, TLS-ALPN-01, the negative controls, RSA, IP identifiers, `lifecycle`, `steps`, `manager`);
+  every issued chain must verify to Pebble's root and name every ordered domain. A recording proxy
+  (`tools/pebble_helper`) froze Pebble's answers in `src/testdata/pebble_transcript.zig`, and
+  `src/pebble_replay_test.zig` serves them back in the module's own lane, including the `badNonce` retries; the
+  `manager` scenario is live only (`tools/pebble.sh --check`).
+- **Stack and heap hygiene:** `src/stackprobe_test.zig`, `stackprobe2_test.zig` and `stackprobe3_test.zig` probe the
+  dead stack for key residue below the burns in `src/burn.zig`; `src/wipe_test.zig` watches heap blocks at the moment
+  they are freed and requires secret buffers to be zero by then.
+- **Fuzz:** deterministic driver `ACME_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `acme-csr` in `src/x509.zig`,
+  `acme-order` in `src/Client.zig`).
+- **ctgrind:** `src/ctgrind_harness.zig`; the rows (jws signer, CSR, PEM codecs, `pem384`, `pkcs8`, `anykey`) are itemised
+  in `scripts/checks/ctgrind-expected.tsv`, the card's `**Hardening:**` line summarises them.
+- **Competitor probe:** `tools/autocert_lead` (Go) drives `x/crypto/acme/autocert` against Pebble for the `**Ahead:**`
+  measurements (`tools/autocert_lead/run.sh`, scenarios `fleet` and `renew`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
-**Mutation (2026-10-18, second pass,** `pemBlockStart` and its five callers, same recipe, after the pass above): 10 mutants — the label and the trailing dashes of the header match, the body skip, each of the two RSA label searches, the `@min` of the two, `pemDecodeSecret`'s header search reverted to the first `-----BEGIN ` of any label, `adoptStored`'s certificate split, the DNS publisher's EC key search, `checkKey`'s PKCS#1 test. 9 killed (the new `pemBlockStart` test, the RSA key PEM tests, `EC private key PEM: found among other blocks`, the manager tests). 1 equivalent for the tests: not skipping a non-matching block's body (`pos = line_end`) finds the same blocks — what it changes is that the next header search runs Boyer-Moore-Horspool over the key's base64 again, which is the constant-time property the ctgrind `anykey` target pins (its contexts are the two `findScalarPos` body skips, no `findPos`). Combined: 200/227, 27 equivalent.
+## What is deliberately not done
 
-**Mutation (2026-10-04,** schemata over a copy of `jws.zig` + `x509.zig` + `root.zig` +
-`Client.zig`, one ReleaseSafe build of every test except the two loopback `integration:` ones):
-47 mutants — the token alphabet and bounds, `keyAuthorization`'s token check, every
-`verifyFlattened` gate (empty parts, 64-octet signature, alg, jwk/kid exclusivity, JWK kty/crv,
-which key verifies, the verify itself, coordinate length), `isValidDomain`'s limits and alphabet,
-the wildcard prefix, every `readElem` bound, `wellFormedRange`'s three checks, every `parseCsr`
-check (trailing bytes, version, both key OIDs, unused bits, signature OID, signature, critical
-flag, dNSName tag), `pemDecode`'s label and empty-body checks, the EC key version and length,
-`certNotAfter`'s pre-scan, `needsRenewal`'s boundary and fail direction, and in `Client.zig` the
-responder's method/nested-path/length checks, first-http-01 selection, `isBadNonce` and the
-unknown-status fallback. First run: 18 killed, 29 alive; nine tests added (crafted, validly
-signed JWS headers breaking RFC 8555 §6.2 / RFC 7518 — incl. an embedded jwk substituting for the
-account key; RFC 1035 name limits; DER indefinite/truncated lengths; the depth bound; CSR fields
-refused by name; a critical SAN and a non-dNSName GeneralName; PEM label/body; RFC 5915 key
-version/length; the responder never serving a slash-bearing name); rerun: 43 killed,
-3 equivalent, 1 alive. Equivalent: `verifyFlattened`'s empty protected/signature check (an empty
-protected header fails the JSON parse, an empty signature the 64-octet check, with the same
-error), and `wellFormedRange`'s child-past-parent error and final `index == end` (each is
-redundant given the other). Alive: `parseAuthz` taking the FIRST http-01 challenge when a CA
-lists two — RFC 8555 does not define duplicates, so no test pins a choice. No defect found.
-
-**Lifecycle and ES384 tests (2026-10-13).** Mock CA, same router/`http.Server` rig: EAB (the CA checks
-kid, url, no nonce, payload = account JWK and the MAC; a separate test recomputes the MAC with std's
-HMAC-SHA256 over the RFC 8555 §7.3.4 layout; a wrong key and a missing binding are refused), rollover
-ES256 → ES384 → ES384 (outer and inner JWS, `oldKey`, `account`, no inner nonce; the previous key is
-then refused — `UnsupportedJws` across curves, `BadSignature` within one; a 409 leaves the client's key
-unchanged), contact update, deactivation, revocation by account and by certificate key (the signer must
-be the certificate's key, read by std's parser), `NotSupported` without the endpoints, ARI against the
-RFC 9773 §4.1 CertID example (certificate transcribed from Appendix A; AKI 69885B6B…C8D4, serial
-00 87 65 43 21 → `aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE`), RFC 3339 parsing, and the whole issuance
-with an ES384 account and an ES384 certificate key. External oracles: openssl built the P-384 CSR
-(`openssl req -verify` ok) and the P-384/P-256 PKCS#8 keys (our PEM output is byte-identical), python
-computed the P-384 canonical JWK and thumbprint from openssl's public key.
-
-**Manager tests (W5, 2026-10-16).** `src/manager_test.zig`: a scripted issuer over committed fixtures
-(an openssl CA and seven leaves with fixed validity windows, `tools/gen_manager_fixtures.sh` →
-`src/testdata/manager_fixtures.zig`), an injected clock, `MemStorage` — so every schedule is asserted
-to the second: first issuance (stored, served by exact name, case and trailing dot), renewal at two
-thirds with `replaces`, a restart that serves from storage without an issuer call, a stored
-certificate past its renewal point (served, renewal attempted, kept on failure), back-off 60/120 s,
-`Retry-After` 3 h winning, the cap, issuer fallback past a chain with the wrong key, the "every
-issuer failed" event, random policy over sixteen seeds, the ten-day half rule, `renewal_window_pct`,
-the default server name, ARI (window pick, re-poll at `Retry-After`, unchanged window keeps its
-pick, `NotSupported` stops polling), another node's lock (no failure, its stored result adopted),
-wildcard lookup (one label only), `unmanage`, on-demand (policy refusal, rate limit, failure
-back-off, no background retry, renewal by `maintain`), four threads asking for one on-demand name
-(one issuance, four certificates), a storage whose writes fail (`storage_failed`, still served),
-HTTP-01 through the solver and middleware (redirect, 400s, a second manager answering from storage,
-cleanup), TLS-ALPN-01 shared through storage, `loadOrCreateAccountKey`, `issuerName`;
-`checkPair` against wrong keys, uncovered names, a literal-wildcard requirement, expiry, a leaf
-without its CA, a wrong anchor, and a notBefore in the future. `storage.zig`: one contract run
-against both backends (replace, delete, key validation, lock exclusivity / re-entry / expiry /
-release) plus `DirStorage`'s modes, no leftover temp file and a garbled lock. Client.zig: an
-`AcmeIssuer` through the mock CA with the manager's HTTP-01 solver and middleware (the mock fetches
-the token from the manager), and the manager refusing the mock's fixed chain. **Pebble:** new
-`manager` scenario (DirStorage, real keys, Pebble's root as the anchor): issued, served and
-verified, stored, ARI window from Pebble, renewal at the window with the clock moved, a restart
-from storage, TLS-ALPN-01 answered from the manager's store, on-demand issued and refused — 12/12
-live (not in the replay transcript: `pebble.sh --check` only).
-
-**Audit 2026-11-18 (delta mutation, CA-URL policy).** 25 schemata mutants (ReleaseSafe, one build,
-`MUT_TESTS` on the policy tests, survivors re-run on the whole suite) over the non-test lines of the
-change: the three `redirect_filter` wirings (directory GET, newNonce HEAD, renewalInfo GET), the
-signed-POST gate, `RedirectRefused` -> `UrlNotAllowed`, the directory-resource checks, the scheme
-rule (https, the directory's own scheme, a directory URL that does not parse), the origin rule
-(directory origin, each directory-listed origin, `extra_allowed_hosts`, the final refusal, port and
-host case in `sameOrigin`), the opt-out, the `extra_allowed_hosts` entry parser (length bound, the
-`/?#@` refusal) and the filter. 24 killed (one, a junk `directory_url` with the opt-out admitting
-`http`, after a new assertion), 1 equivalent: the `entry.len == 0` guard (an empty entry fails
-`http.Url.parse`, no host) — removed. Card: cumulative 582 + 24 / 648 + 25, 66 + 1 eq.
+- **DNS provider integrations beyond `acmedns`'s four generic publishers** (RFC 2136 + TSIG, acme-dns, httpreq, exec):
+  lego ships 200+ vendor APIs; not followed. The credentials stay the caller's.
+- **Running the TLS listener** for TLS-ALPN-01 and **the port-80 `http.Server`** for HTTP-01: app-side; the library
+  provides the certificate, key, store and middleware.
+- **A CLI and certbot's `live/` / `archive/` layout, web-server plugins, hook directories** (the manager's events
+  callback covers them).
+- **ZeroSSL's non-ACME HTTP API.**
+- **Ed25519 certificate keys:** no public CA issues them.
+- **device-attest-01.**
 
 ## Backlog / deferred
-Reviewed 2026-07-10 (adversarial security pass) — clean: JWS/ES256/nonce/CSR construction and the
-ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual staging/production recipe
-(real domain, port 80) is documented in README but is out of CI scope by design.
-- **No-panic sweep 2026-10-28:** fixed A-1 (order list bound), A-2 (alternate chains capped at 8, bodies in short-lived arenas), A-4, A-5, A-6, A-7 (checked `@panic`, no signature change), A-9, A-10, doc comments for A-8 and A-11 (stack size is an estimate, "measured: no"); not fixed: A-3 (directory `meta` is parsed into a `std.json.Value`, at most ~30-50x the 1 MiB body, bounded and freed; typing it would also change the deliberate tolerance of a `meta` of any shape, so not a small change). Owner questions: ~~(1) every URL from the CA (authorization, challenge, order, finalize, certificate, alternate, `Location`) is used as a signed-POST target without a scheme/host check, so a hostile CA can aim the client at internal hosts~~ **DONE 2026-11-18** (CA-URL policy, see "Threat model"); (2) with `distributed_challenges`, each unauthenticated challenge request costs one storage read.
-- ~~**DNS-01 challenge (and thereby wildcard certificates)**~~ — **DONE 2026-09-30** (see "Design & invariants"). Not done with it: DNS provider publishers (by design the caller's; an RFC 2136 dynamic-update publisher would be the one generic candidate, it needs a DNS message encoder — `dnswire` is a sibling), and a propagation checker (querying the authoritative servers before returning from `present`).
-- ~~**External account binding (RFC 8555 §7.3.4)**~~ — **DONE 2026-10-13** (`Options.eab`, `jws.signEab`; mock CA verifies the MAC, a test recomputes it with std HMAC-SHA256). Not run against a real EAB CA.
-- ~~**Certificate revocation, account key rollover and deactivation**~~ — **DONE 2026-10-13** (`revoke`, `revokeWithCertKey`, `rolloverKey`, `updateContact`, `deactivate`; the mock CA verifies both rollover JWS layers and refuses the old key afterwards).
-- ~~**RSA account and certificate keys**~~ — **DONE 2026-10-16** (RS256 via `rsa`, pointer-held; IP identifiers in the same wave). *(survey 2026-09-30; PKCS#8 and P-384 DONE 2026-10-13)*: a fleet whose existing keys are RSA cannot import them, and some devices need RSA certificates (RS256 is among Let's Encrypt's account-key algorithms *(from memory, not re-checked)*). The key union (`jws.AnyKeyPair`, `Alg`) is the place to add it; `rsa` is a sibling in this repo. Effort: medium. Fits §2.
-- ~~**P-521 (ES512) account and certificate keys**~~ — **DONE 2026-10-16** (via `p521`; JWK, CSR, SEC1/PKCS#8 PEM against openssl). *(2026-10-10, phase 2 of the `p521` module)*: `p521` gives an ES512 signer with std's `Ecdsa` surface. Since 2026-10-13 the account key is the `Alg`/`AnyKeyPair` union (ES256, ES384), so ES512 is one more variant: JWK `crv:"P-521"` with 66-byte coordinates, `alg:"ES512"`, a 132-byte signature, `ecdsa-with-SHA512` and the secp521r1 OID in the CSR and key codecs. Effort: small. Fits §2.
-- ~~**ARI (RFC 9773) renewal timing**~~ — **DONE 2026-10-13** (`renewalInfo`, `x509.ariCertId` against the RFC's §4.1 example, `obtainWith(.{ .replaces })`). `needsRenewal` stays as the fallback for a CA without ARI. Not done with it: a scheduler that sleeps until `pickTime` and honours `Retry-After` (the `autocert` layer below).
-- ~~**Pebble coverage of the lifecycle calls**~~ — **DONE 2026-10-16** (`lifecycle` scenario, EAB required for every account, 12/12; replayed offline). *(2026-10-13)*: `tools/interop.zig` runs the issuance flows only; EAB (Pebble's `-externalaccountbindings`-style config), rollover, revocation and ARI (Pebble supports `renewalInfo`) are mock-CA tested. Adding them to `zig build interop-acme` turns the mock's reading of the RFC into the foreign server's. Effort: small.
-- ~~**Read side onto the `x509` module**~~ — **DONE 2026-10-16**: `certNotAfter`, `ariCertId`, `issuerCommonName` read through `x509.chain.certValidity` / `certSerialAndIssuer` / `certAuthorityKeyId` and `x509.names.nameAttribute`; own walkers (`issuerCn`, `ariParts`, `derWellFormed`) deleted; mock CA uses `x509.spkiOf`. Kept on std on purpose: `tools/interop.zig` verifies Pebble's chain with std's `Certificate.verify` — an implementation independent of `x509`, which is what an interop oracle wants. Verifying the downloaded chain: DONE with W5 in the `Manager` (`checkPair`, `x509.verifyChain` against `trust_anchors`); `Client.obtain` itself still hands back the chain as the CA sent it. *(original, owner question 2026-10-16: "why did we write x509 again?")*: `src/x509.zig` is mostly CONSTRUCTION (CSR, TLS-ALPN-01 certificate, DER writer, key PEM codecs), which the `x509` module deliberately does not do (its S2 survey 2026-10-11, Backlog "Deliberately not doing", names this file as the owner of the CSR) — that part stays. But its READ side duplicates what `x509` does better: `certNotAfter` (std parse after an own pre-scan; `x509.safe.validateForStdParse`/`safeCertificate` close std's DER out-of-bounds for every caller), `ariCertId` (serial + AKI walk; `x509.chain.certSerialAndIssuer` + `extensions.iterate` — x509 lacks only an AKI parser next to `parseSubjectKeyIdentifier`), `issuerCommonName` (added 2026-10-16 for `preferred_chain`; an issuer-attribute getter belongs in `x509`), and the mock CA / `tools/interop.zig` verify chains with std's `Certificate.verify` instead of `x509.verifyChain`. Plan: add to `x509` `parseAuthorityKeyIdentifier` + `issuerAttribute(cert, oid)` (+ `notAfter` through `safe`), make acme depend on `x509` (new deps for acme: only `slhdsa`, `x509`; rsa/p256/p521 already in), delete the duplicates, optionally verify the downloaded chain (`verifyChain` against a caller-given root set). Also: `x509.names.parseIp4/6` duplicate `netaddr`. Effort: small–medium. Do before W3.
-- **Full-competitor scope (owner 2026-10-13; R-list 2026-10-16)** — waves still open (W1, W2, W3 DONE 2026-10-16 — W3 = the order-level API above; **W4 DONE 2026-10-16 in the sibling module `acmedns`** — CNAME delegation, SOA zone walk, propagation check, RFC 2136 + TSIG / acme-dns / httpreq / exec publishers, Pebble-verified; a sibling so that acme's consumers, the web-server consumer among them, do not take `dns` and `procrun` into their closure): ~~**W5**~~ **DONE 2026-10-16**: `Manager` + `storage` (see Design). Scope → parity.
-- **Manager review 2026-10-16** (an independent reviewer, read-only; every finding re-read against
-  the code by the coordinator). Fixed,
-  with tests: **H1** one `Client` was driven by several threads (on-demand handshakes + `maintain`)
-  — per-issuer locks; **M1** a past ARI window for a fresh certificate renewed every round — floor
-  at a tenth of the lifetime; **M2** failed on-demand names were retried past the policy and the
-  rate limit and never evicted — forgotten after the back-off; **M3** `run()` noticed a new
-  `manage` only at the next due time (up to an hour) — one-second steps + wake flag; **M4** a
-  handshake waited for a managed name's whole first issuance — only on-demand names are waited
-  for; **L1** an on-demand entry could be freed between creation and start — created busy;
-  **L2** key and certificate were two writes — one value; **L3** `Retry-After` could park a valid
-  certificate past its end — capped at `notAfter` − 1 h; **L4** adoption compared `notAfter` —
-  now `notBefore`; **L5** `node_id` silently truncated — validated (`init` returns `InvalidNodeId`, since 2026-11-06; was a panic);
-  **L8** malformed SNI hit the wildcard; **L9** any token / SNI from the network cost a storage
-  read, and the SNI was not lower-cased; **L11** CTLs in the redirect target; **L12** an
-  `unmanage`d entry was still stored; **L13** issuers beyond 16 silently ignored, a first issuer's
-  `Retry-After` lost; **N2** the user clock read under the lock; **N4** an RSA key in PKCS#8
-  refused; **N5** a name whose storage key is invalid accepted. ✅ 2026-10-18: **L6** the DirStorage
-  lock races — every lock operation under a `flock` guard (tests: 8 racing nodes on one stale lock,
-  exactly one wins, 40 rounds; a held guard blocks `tryLock`; negative controls: takeover by
-  replace → 8 winners, no guard → the wait test fails); **L7** two nodes starting at once created
-  two accounts — `Storage.create` (create-if-absent) + reload of the winner's key (test: a storage
-  whose load misses the stored key; with a plain store the test fails); **L10** an expired
-  certificate stays served — kept by decision: the handshake fails either way, the expired
-  certificate gives the client the precise error, renewal keeps retrying and on-demand names are
-  re-obtained once their back-off is over. Open test gaps: concurrent `unmanage`, an RSA PKCS#8
-  pair.
-- **Manager follow-ups** (2026-10-16): (a) the replay transcript does not carry the `manager`
-  scenario (regenerate with `pebble.sh` once the replay test knows the scenario); (b) the mock CA
-  issues a fixed chain whatever the CSR, so the Manager's full path is exercised only by Pebble —
-  a mock that signs the CSR's key would bring it into the lane; (c) an in-memory certificate cache
-  with a capacity (CertMagic `Cache`) for on-demand fleets with very many names — entries are
-  never evicted today, and `maintain` scans entries linearly; (d) `run()` sleeps on the awake clock
-  in ≤ 1 h steps, so a suspended host renews late by up to an hour.
-- **OCSP stapling in the manager** *(owner 2026-10-16: backlog)*: certmagic staples and replaces revoked certificates; Let's Encrypt switched its OCSP responders off in 2025, ZeroSSL/GTS still serve OCSP. Sibling `ocsp`. Effort: medium.
-- **dns-persist-01** *(owner 2026-10-16: backlog)*: draft-ietf-acme-dns-persist, lego only; wait for Pebble / a production CA.
-- Deliberately not: a CLI and certbot's `live/`/`archive/` layout, web-server plugins, hook directories (the manager's events callback will cover them), ZeroSSL's non-ACME HTTP API, Ed25519 certificate keys (no public CA issues them), device-attest-01.
-- ~~**A run against a real staging CA in CI or a scheduled job**~~ — Pebble DONE 2026-10-06 (see Anchoring; by hand through `tools/pebble.sh`, replayed in the lane). Still open: a scheduled run against Let's Encrypt STAGING itself (Boulder, a public name, port 80), out of scope for a loopback lane.
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 9 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-`gap · any · client · threadsafe` + deps `http`, `router`, `p256`, `p384`, `p521`, `rsa`, `netaddr`, `entropy`, `std.crypto` (sha2, hmac, `Certificate`),
-`std.json` — canonical source is `pub const meta` in src/root.zig.
+- **OCSP stapling in the manager** *(owner: backlog)*: certmagic staples and replaces revoked certificates; Let's
+  Encrypt switched its OCSP responders off in 2025, ZeroSSL/GTS still serve OCSP. Sibling `ocsp`. Effort: medium.
+- **dns-persist-01** *(owner: backlog)*: draft-ietf-acme-dns-persist, lego only; wait for Pebble / a production CA.
+- **A scheduled run against Let's Encrypt STAGING itself** (Boulder, a public name, port 80): out of scope for a
+  loopback lane; Pebble is the only CA the module has run against.
+- **Replay transcript for the `manager` scenario:** the offline replay does not carry it (`tools/pebble.sh --check`
+  only); regenerate with `pebble.sh` once the replay test knows the scenario.
+- **Mock CA that signs the CSR's key:** the mock issues a fixed chain whatever the CSR, so the Manager's full path is
+  exercised only by Pebble; a signing mock would bring it into the lane.
+- **In-memory certificate cache with a capacity** (CertMagic `Cache`) for on-demand fleets with very many names:
+  entries are never evicted today, and `maintain` scans them linearly.
+- **Suspended hosts:** `run()` sleeps on the awake clock in steps of at most an hour, so a suspended host renews late
+  by up to an hour.
+- **Manager test gap:** an RSA PKCS#8 key pair through `checkPair`.
+- **Typed directory `meta`:** it is parsed into a `std.json.Value` (at most about 30-50x the 1 MiB body, bounded and
+  freed); typing it would also change the deliberate tolerance of a `meta` of any shape, so it is not a small change.
 
 ## Anchoring
 
@@ -389,5 +321,3 @@ ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual stagin
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** RFC7515/7638 KATs+openssl fixtures EXTERNAL; and, since 2026-10-06, **Pebble** v2.10.1 (Let's Encrypt's ACME test CA, a foreign server run as a black-box binary) as the CA: `tools/pebble.sh` starts it in `-strict` mode with pebble-challtestsrv as its DNS and 5% of nonces rejected (15% until 2026-10-08: with the client's 3 retries that failed ~3% of interop runs on four rejections in a row), and `zig build interop-acme` (tools/interop.zig) runs the real client through six scenarios -- HTTP-01 for one name and for two, DNS-01 for a wildcard (TXT through challtestsrv), TLS-ALPN-01 (the module's validation certificate served by a Go TLS listener under `acme-tls/1`, so Pebble's validator reads the RFC 8737 extension this module encodes), a name whose A record points where nothing listens (must end `AuthorizationFailed` with Pebble's `connection` problem -- the negative control that Pebble really validates), and a name on Pebble's block list (`AcmeProblem`, `rejectedIdentifier`); every issued chain must verify up to Pebble's root and name every ordered domain. 6/6 on 2026-10-06. Since 2026-10-16 Pebble requires EAB for every account and a seventh scenario, `lifecycle`, runs one account through the `shortlived` profile (the leaf lifetime checked against the profile), ARI, a renewal with `replaces`, revocation by account and by certificate key, a contact update, rollover ES256 → ES384 with an order after it, the alternate chain to Pebble's second root (`PEBBLE_ALTERNATE_ROOTS=1`, verified against that root), and deactivation (the next order must be refused `unauthorized`): 12/12 steps, replayed offline too. Also since 2026-10-16: `rsa` (RS256 account + RSA-2048 certificate key), `ip-http01` and `ip-tlsalpn01` (127.0.0.1; the TLS-ALPN material is stored only under the reverse name, so Pebble's SNI is checked) — 9/9. A recording proxy (`tools/pebble_helper`, Go stdlib) froze Pebble's answers in `src/testdata/pebble_transcript.zig`; `src/pebble_replay_test.zig` serves them back to the client in the module's own lane, which must reach the same outcome, including the `badNonce` retries. Not anchored: nothing of the order flow is left to the mock CA alone; the mock CA tests stay as the JWS/CSR verifiers they are
-
-**How it got there.** The anchoring work landed. DONE b830ef5: openssl-built TLS-ALPN-01 extension; provenance, not extra detection
