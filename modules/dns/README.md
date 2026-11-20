@@ -10,7 +10,7 @@ update under RFC 8945 TSIG (what `nsupdate` does).
 - **Model after:** Go `net` dnsclient + `miekg/dns` (message codec) / c-ares;
   RFC 1035 (wire format), RFC 8484 (DoH).
 - **Deps:** `netaddr` (address parse/format, reverse-name construction,
-  RFC 6724 result ordering), `http` (DoH transport), `tlsclient` (DoT), `std.json` (DoH-JSON),
+  RFC 6724 result ordering), `http` (DoH transport), `tlsclient` (DoT), `b64ct` (TSIG secrets), `std.json` (DoH-JSON),
   `std.Io.net` (UDP/TCP).
 
 Provenance: clean-room from RFC 1035 (wire), RFC 8484 (DoH), RFC 2782 (SRV)
@@ -33,6 +33,8 @@ derivation was a bookkeeping error.
 | `src/tsig.zig` | RFC 8945 TSIG: `sign` / `verify` with HMAC-SHA1/224/256/384/512, request→response MAC chaining, BIND-style peer errors; secret handled under a dead-stack burn. |
 | `src/rdata.zig` | Typed views of TLSA (RFC 6698), SSHFP (RFC 4255), URI (RFC 7553), NAPTR (RFC 3403) and SVCB/HTTPS (RFC 9460) rdata: `dns.rdata.parse(T, arena, rec)` over `Record.data.unknown` (no new `Record.Data` variant, so `dnssec`'s switches are unchanged). SvcParams are validated (ascending keys, §7 value shapes, `mandatory` cross-check) and read through `alpn`/`port`/`ipv4hint`/`ipv6hint`/`ech`/`mandatory`. Golden vectors from dnspython (`tools/rdata_oracle.py` -> `src/rdata_vectors.zig`); fuzzed (`dns-rdata`). |
 | `src/root.zig` | Vocabulary re-exports + netaddr bridges (`reverseName`, `recordIp`). |
+| `src/goldens.zig`, `src/go_oracle.zig` (+ `go_oracle_vectors.zig`), `src/rdata_vectors.zig`, `src/tsig_vectors.zig`, `src/config_oracle_test.zig` | Frozen oracle data and their replay tests: six real Google DNS replies, Go `dnsmessage` verdicts, dnspython-made rdata and TSIG vectors, glibc's resolv.conf/hosts behaviour. Producers are in `tools/`. |
+| `src/fuzz_test.zig`, `src/sweep_test.zig`, `src/stackprobe_test.zig` | `DNS_FUZZ` harnesses, no-panic sweep tests, the dead-stack probe of `tsig.sign` / `tsig.verify`. `src/burn.zig` is the stack burn `tsig` runs its secret under. |
 | `src/testdata/reply_*.bin` | Three replies captured off a real loopback socket by `tools/interop.zig`: one lying about the question, one with no question section, one honest. Replayed hermetically by `Resolver.zig`. |
 | `tools/interop.zig` | The live half of that anchor: a hostile UDP server on 127.0.0.1 answering a real `query()` from a real second thread. `zig build interop-dns` (no peer, no network); `-- --capture` re-takes the frames. Never compiled into `test-dns`. |
 
@@ -219,18 +221,24 @@ per exchange, bounded like TCP by `timeout_ms` and `call_timeout_ms`.
 - `-Ddns-dot=false` (default off under `-Dprofile=small`) leaves `tlsclient`
   out of the binary; `transport = .tls` is then refused with
   `error.NoDotSupport`. `doh_url`, when set, still takes precedence.
-- Not done: connection reuse (RFC 7858 §3.4 allows it; this is one connection
-  per exchange, like `tcpExchange`) and RFC 8467 padding.
 
 ## Tests
 
-`zig build test-dns` — offline: golden query bytes, canned responses
+`zig build test-dns` (or `scripts/modtest dns`) is offline: golden query bytes, canned responses
 (compression, CNAME chain, MX/TXT/SOA/OPT, PTR), adversarial packets
 (truncations at every offset, pointer loops, bad rdata lengths, hostile
 counts under a memory limit), fuzzed decode seeded with the live captures,
 resolv.conf/hosts fixtures, search-list order, reverse-name goldens (incl. the
 RFC 3596 example), response correlation, the bailiwick rule, DoH-JSON URL
-encoding, and loopback stubs (a lying UDP server, a silent TCP server). Live
-tests (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8) run against public
-resolvers when the network is up and skip via `error.SkipZigTest` when it is
-not.
+encoding, TSIG/update vectors, the answer cache, and loopback stubs (a lying UDP
+server, a silent TCP server). The checks that need a real socket or the internet
+are programs, not tests: `zig build interop-dns` (a hostile loopback server, no
+network) and `zig build live-dns` (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of
+8.8.8.8 against public resolvers; it queries the internet).
+
+## Not provided
+
+DNSSEC validation (the sibling `dnssec` module; `authenticated` is a trusted
+upstream's AD bit), IDNA, per-address TTLs, server failover memory, DNS cookie
+state, DoT connection reuse and RFC 8467 padding, DoQ / DoH3, split DNS. See
+`SPEC.md` *What is deliberately not done* and *Backlog / deferred*.

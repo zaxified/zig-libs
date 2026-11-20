@@ -30,11 +30,11 @@ surveys and are marked where not re-verified. No foreign code was built or run. 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | Go [`net`](https://pkg.go.dev/net) resolver (pure-Go `dnsclient`) — **reference** | Go | BSD-3-Clause | — | Go stdlib | The stub resolver this module models: /etc/hosts, resolv.conf (re-checked at most every 5 s — not re-verified 2026-11-15), search list/ndots/timeout/attempts/rotate/single-request/use-vc/no-aaaa, UDP with TCP retry, parallel A+AAAA, PTR, MX/NS/SRV/TXT/CNAME, the ctx deadline, `avoidDNS`. `DNSError.IsNotFound` tells "no such host" from an outage; no TTL in results, no cache, no DoT/DoH, no AD flag. Everything a `net.Resolver` user reaches for is here, plus TTL, canonical name and NXDOMAIN/NODATA on every result, explicit server/transport choice, DoT and DoH. |
-| [c-ares/c-ares](https://github.com/c-ares/c-ares) | C | MIT | 2.2k | v1.34.8 (2026-07-07) | Asynchronous (event thread or caller-driven). **Query cache on by default since 1.31** (TTL-capped at 1 h, positive and NXDOMAIN answers); `ares_getaddrinfo` gives a per-address `ai_ttl` and the CNAME chain with TTLs; `ARES_ENOTFOUND`/`ARES_ENODATA`; server failover memory (`ARES_OPT_SERVER_FAILOVER`: a failed server retried with 10 % chance after ≥ 5 s); system configuration reloaded on change (event thread) or by `ares_reinit`; opt-in `ARES_FLAG_DNS0x20`; EDNS 1232 by default. No DoT/DoH. We match the lookup semantics (incl. 0x20 and reload) but not the cache, async API, failover memory or per-address TTL. |
+| [c-ares/c-ares](https://github.com/c-ares/c-ares) | C | MIT | 2.2k | v1.34.8 (2026-07-07) | Asynchronous (event thread or caller-driven). **Query cache on by default since 1.31** (TTL-capped at 1 h, positive and NXDOMAIN answers); `ares_getaddrinfo` gives a per-address `ai_ttl` and the CNAME chain with TTLs; `ARES_ENOTFOUND`/`ARES_ENODATA`; server failover memory (`ARES_OPT_SERVER_FAILOVER`: a failed server retried with 10 % chance after ≥ 5 s); system configuration reloaded on change (event thread) or by `ares_reinit`; opt-in `ARES_FLAG_DNS0x20`; EDNS 1232 by default. No DoT/DoH. We match the lookup semantics (incl. 0x20 and reload) and have a TTL-capped answer cache (`CachingResolver`), but no event-loop API, failover memory or per-address TTL. |
 | [miekg/dns](https://github.com/miekg/dns) | Go | BSD-3-Clause | 8.8k | v1.1.73 tag (push 2026-09-01) | A DNS toolkit, not a resolver: every RR type, zone files, TSIG/SIG(0), AXFR/IXFR, DoT, cookies, server side, DNSSEC signing *(not re-verified 2026-11-15)*. We are a client + codec, 11 typed RR kinds plus typed rdata views; DNSSEC validation is the sibling `dnssec` module. |
-| [hickory-dns/hickory-dns](https://github.com/hickory-dns/hickory-dns) (`hickory-resolver`) | Rust | MIT OR Apache-2.0 | 5.4k | v0.26.3 (2026-09-10) | Asynchronous only (generic over async runtimes; `block_on` for sync callers). `Lookup` carries the query, the answer/authority/additional records and `valid_until`; response cache (`cache_size`, positive/negative min/max TTL clamps); DNSSEC validation (`validate`, trust anchor); DoT, DoH (HTTP/2, HTTP/3), DoQ behind features; `case_randomization` (UDP), `ip_strategy`, `num_concurrent_reqs` (2 servers in parallel), `server_ordering_strategy`, `deny_answers` networks, per-server metrics; reads /etc/resolv.conf (`system_conf`), no documented reload. Missing here: cache, async, DoQ/DoH3, parallel servers, answer filters, metrics. |
+| [hickory-dns/hickory-dns](https://github.com/hickory-dns/hickory-dns) (`hickory-resolver`) | Rust | MIT OR Apache-2.0 | 5.4k | v0.26.3 (2026-09-10) | Asynchronous only (generic over async runtimes; `block_on` for sync callers). `Lookup` carries the query, the answer/authority/additional records and `valid_until`; response cache (`cache_size`, positive/negative min/max TTL clamps); DNSSEC validation (`validate`, trust anchor); DoT, DoH (HTTP/2, HTTP/3), DoQ behind features; `case_randomization` (UDP), `ip_strategy`, `num_concurrent_reqs` (2 servers in parallel), `server_ordering_strategy`, `deny_answers` networks, per-server metrics; reads /etc/resolv.conf (`system_conf`), no documented reload. Missing here: a future-per-query API, DoQ/DoH3, parallel servers, answer filters, metrics. |
 | [libunbound](https://www.nlnetlabs.nl/documentation/unbound/libunbound/) (NLnet Labs) | C | BSD-3-Clause | — | unbound 1.2x | A full recursive, caching, DNSSEC-validating resolver as a library; sync `ub_resolve` and `ub_resolve_async`. `ub_result`: `canonname`, `rcode`, `havedata`, `nxdomain`, `secure`/`bogus`/`why_bogus`, `ttl`, the answer packet. resolv.conf and hosts only on request (`ub_ctx_resolvconf`, `ub_ctx_hosts`). Our result carries the same status/TTL/canonical facts; `authenticated` is a trusted upstream's AD bit, not our own validation. |
-| [dnspython](https://dnspython.readthedocs.io/) | Python | ISC | — | 2.8.0 | `resolve()` raises `NXDOMAIN` vs `NoAnswer` (NODATA), `LifetimeTimeout`, `NoNameservers`; `Answer` has `canonical_name` (after CNAME/DNAME chaining), `expiration`, `rrset`, `response`; cache opt-in (`Cache`, `LRUCache`; none by default); reads resolv.conf; DoH nameservers, DDR upgrade to DoH/DoT; `dns.asyncresolver`; IDNA encoding of names. Missing here: IDNA, DDR, cache, async. |
+| [dnspython](https://dnspython.readthedocs.io/) | Python | ISC | — | 2.8.0 | `resolve()` raises `NXDOMAIN` vs `NoAnswer` (NODATA), `LifetimeTimeout`, `NoNameservers`; `Answer` has `canonical_name` (after CNAME/DNAME chaining), `expiration`, `rrset`, `response`; cache opt-in (`Cache`, `LRUCache`; none by default); reads resolv.conf; DoH nameservers, DDR upgrade to DoH/DoT; `dns.asyncresolver`; IDNA encoding of names. Missing here: IDNA, DDR, a future-per-query API. |
 | [systemd-resolved](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.resolve1.html) (`resolve1` D-Bus API) | C (service) | LGPL-2.1+ | — | systemd | A system service, not a library: cache, DNSSEC (`yes`/`allow-downgrade`), DoT per link, split DNS (per-link servers and routing domains), LLMNR/mDNS. Results carry the canonical name and flags `AUTHENTICATED`, `CONFIDENTIAL`, `FROM_CACHE`…; errors `DnsError.NXDOMAIN` vs `NoSuchRR` (NODATA). A program on a resolved host gets most of this by asking 127.0.0.53 through this module (cache, split DNS), but not the flags. |
 | Node.js [`dns`](https://nodejs.org/api/dns.html) | JS (c-ares + getaddrinfo) | MIT | — | Node 2x | Two worlds: `lookup()` = getaddrinfo on the thread pool (hosts, nsswitch), `resolve*()`/`reverse()` = c-ares, network only. `resolve4/6({ttl: true})` per-address TTL; error codes `NOTFOUND` vs `NODATA`, `SERVFAIL`, `TIMEOUT`; `Resolver` with own servers/timeout/tries; no cache of its own. We cover both worlds in one call (`lookupIp` reads /etc/hosts, then DNS) with TTL and status. |
 | [lun-4/zigdig](https://github.com/lun-4/zigdig) | Zig | MIT | 44 | push 2026-02-20 | Small DNS client library *(README not re-read 2026-11-15; inferred)*. |
@@ -46,27 +46,25 @@ lookup, resolv.conf/hosts handling; of the Go reference — TTL, canonical name,
 status and the AD flag on every high-level result, DoT/DoH, explicit server/transport control,
 0x20, the client side of RFC 2136 update + RFC 8945 TSIG (what `nsupdate`, certbot's rfc2136
 plugin and lego's `rfc2136` provider send; miekg/dns and dnspython offer the same; not here:
-SIG(0), GSS-TSIG, multi-message TSIG, truncated MACs, HMAC-MD5).
+SIG(0), GSS-TSIG, multi-message TSIG, truncated MACs, HMAC-MD5); of every other stub client here, a thread-safe answer
+cache with request coalescing, prefetch and serve-stale (`CachingResolver`) and many lookups in flight through `std.Io`
+(`CachingResolver.lookupIpMany`, `io.async` on any single lookup).
 
-**Where we are behind** (2026-11-15, after the default-path wave — each in the Backlog with its reason):
-- ~~No answer cache~~ — closed 2026-11-15: `CachingResolver` (see "Caching (CachingResolver)"); request coalescing and prefetch closed 2026-11-16; per-RRset TTLs remain (Backlog).
-- ~~Blocking only~~ — closed 2026-11-16: many lookups in flight from one caller through `std.Io`, the
-  way Zig spells "asynchronous" — `CachingResolver.lookupIpMany` (a `std.Io.Group` over the shared,
-  thread-safe cache, network side bounded by `max_concurrent_lookups`, concurrent lookups of one key
-  coalesced) and `io.async` on any single lookup. A plain `Resolver` stays single-owner and blocking,
-  as Go's is. What c-ares / hickory still have beyond that is a callback- or poll-driven event-loop
-  interface (`ares_process_fd`, a `Future` per query on a runtime the caller already runs): in Zig
-  that runtime is the `Io` itself, so there is no separate loop to integrate with.
-- **No IDNA** (dnspython encodes U-labels; Go, c-ares, hickory leave it to the caller).
-- **No per-address TTL** (c-ares `ai_ttl`, Node `{ttl: true}`): one `ttl_s` per result.
-- **No failover memory** (c-ares retries a failed server with 10 % chance after ≥ 5 s; hickory
-  orders servers by performance): every query walks the list from the start (or `rotate`).
-- **No DNS cookie state, no parallel servers, no DoQ/DoH3, no split DNS, no metrics, no answer
-  filters** — niche or service-level (hickory features, systemd-resolved per-link routing).
-- **DNSSEC validation** lives in the sibling `dnssec` module and is not wired into the resolver
-  (unbound, hickory `validate`, resolved do it in-line); `authenticated` reports a trusted
-  upstream's AD bit only.
-- Zone files, AXFR/IXFR and the server side are miekg/dns's territory, not a stub client's.
+
+**Where we are behind** (each in *Backlog / deferred* or *What is deliberately not done*, with its reason):
+- **No callback- or poll-driven event-loop interface** (c-ares `ares_process_fd`, a `Future` per query on a runtime the
+  caller already runs): in Zig that runtime is the `Io` itself, so there is no separate loop to integrate with. A plain
+  `Resolver` stays single-owner and blocking, as Go's is; many lookups in flight go through `CachingResolver`.
+- **No IDNA** (dnspython encodes U-labels; Go, c-ares, hickory leave it to the caller). Backlog.
+- **No per-address TTL** (c-ares `ai_ttl`, Node `{ttl: true}`): one `ttl_s` per result. Not done on purpose.
+- **No failover memory** (c-ares retries a failed server with 10 % chance after >= 5 s; hickory orders servers by
+  performance): every query walks the list from the start (or `rotate`). Backlog.
+- **No DNS cookie state, no parallel servers, no DoQ/DoH3, no split DNS, no metrics, no answer filters** — niche or
+  service-level (hickory features, systemd-resolved per-link routing). Backlog.
+- **No per-RRset cache TTLs**: the cache keeps one TTL per answer. Backlog.
+- **DNSSEC validation** lives in the sibling `dnssec` module and is not wired into the resolver (unbound, hickory
+  `validate`, resolved do it in-line); `authenticated` reports a trusted upstream's AD bit only. Not done on purpose.
+- Zone files, AXFR/IXFR and the server side are miekg/dns's territory, not a stub client's. Not done on purpose.
 
 ## Design & invariants
 Layered like `http`: `message.zig` is the pure, transport-agnostic wire codec (golden-byte
@@ -77,17 +75,17 @@ POST/GET `application/dns-message`, plus DoH-JSON via `std.json`); `root.zig` ow
 vocabulary and netaddr bridges (`reverseName`, `recordIp`). Name-compression safety: pointers must
 point strictly backwards (Go dnsmessage rule); combined with a 253-char name cap and a 16-jump
 budget, adversarial pointer loops always fail fast with a typed error rather than spinning.
-Concurrency: every lookup blocks, one owner per `Resolver` (no shared state to synchronize). Error
+Concurrency: every lookup blocks, one owner per `Resolver` (no shared state to synchronize); `CachingResolver` is the thread-safe layer over it. Error
 policy: malformed packets are typed errors, never panics; `resolve` returns the last response even
 on NXDOMAIN/empty (inspect `Message.rcode()`); the high-level lookups return an empty `items` with
 `status` `.nxdomain`/`.nodata` when nothing resolves, and `error.ServerFailed` for any other rcode. The `/etc/hosts` + UDP-PTR core, codec, TCP and
 EDNS(0)/DoH are clean-room from RFC 1035/2782/8659/8484 — see NOTICE.
 
-**Dynamic update (2026-10-16).** `update.zig` builds an RFC 2136 message in a caller buffer
+**Dynamic update.** `update.zig` builds an RFC 2136 message in a caller buffer
 (ZONE = one SOA question, PREREQUISITE = answer section, UPDATE = authority; operation in class
 and TTL, §2.4/§2.5), prerequisites strictly before updates (`error.OutOfOrder`), never
 compressed. `update.send` gives it a fresh random id, signs it when a key is given, sends it
-with `Resolver.exchange` (new: a caller-built message to one server, UDP with TC→TCP, TCP from
+with `Resolver.exchange` (a caller-built message to one server, UDP with TC→TCP, TCP from
 the start over 512 bytes) and returns the server's rcode — `no_error` = applied. A signed
 update accepts only a reply signed with the same key and the request's MAC chained in. The
 TSIG record the signature adds is written after the builder's message and the header's
@@ -96,9 +94,32 @@ ARCOUNT is restored, so the same builder can be sent again (a bug the live oracl
 lower-case names, time, fudge, error, other data), verification in §5.2's order key → MAC →
 time; the full MAC length is required; an unsigned BADSIG/BADKEY reply (how BIND answers a
 request it cannot verify) is reported as `PeerBadSig`/`PeerBadKey`. `Options.recursion_desired`
-(new, default true) lets a caller ask an authoritative server with RD clear.
+(default true) lets a caller ask an authoritative server with RD clear.
 
-## API (high-level lookups, 2026-11-15)
+**Timeouts.** `Options.timeout_ms` (struct default `default_timeout_ms` = 5000) and `Options.attempts` (`default_attempts`)
+yield to resolv.conf's `options timeout:` / `attempts:` when the caller leaves them at those defaults AND resolv.conf is in
+play (no explicit `Options.servers`): `effectiveTimeoutMs` / `effectiveAttempts` (`Resolver.zig:1739-1751`). An explicit
+non-default value always wins on the classic UDP/TCP path. Accepted cost: a caller who sets exactly the default's own value
+is indistinguishable from one who left it unset (telling them apart would make the fields `?u32`, a breaking type change);
+DoH's total timeout is set once at `init`. `Options.call_timeout_ms` (default 0 = off, Go's `ctx` deadline,
+`Resolver.zig:194`) bounds ONE public call across every attempt, server, search-list candidate and family: when it runs out
+the call ends with `error.Timeout` (a reply already in hand is still returned), and each attempt waits for the earlier of
+`timeout_ms` and what is left of it. The outermost public call owns the budget (`beginCall`, `Resolver.zig:1691`); not
+applied to DoH.
+
+**DNS over TLS (RFC 7858).** `Transport.tls` (`Resolver.zig:102`) sends a query over TCP to `Options.dot_port` (853) inside a
+TLS session (`tlsclient`) with the RFC 1035 two-byte framing, one connection per exchange, bounded like TCP. Authenticated by
+default (`dot_tls`, strict: chain against the system CA bundle, certificate must carry `tls_server_name`, which is also the
+SNI; null checks the certificate against the server's IP and sends no SNI). A failed handshake is `error.TlsFailed`, never a
+plain-DNS retry (`Resolver.zig:553-557`); a build without `dns-dot` refuses `.tls` with `error.NoDotSupport`
+(`Resolver.zig:1208`, *Build options*).
+
+**Typed rdata.** `rdata.zig` gives typed views of TLSA, SSHFP, URI, NAPTR and SVCB/HTTPS rdata
+(`rdata.parse(T, arena, rec)` over `Record.data.unknown`); there is no new `Record.Data` variant, so the sibling `dnssec`
+module's switches are unchanged (README *Layout*).
+
+
+## API (high-level lookups)
 
 Every high-level call — `lookupIp`, `reverse`, `lookupCname`, `lookupMx`, `lookupNs`,
 `lookupTxt`, `lookupSrv` — returns one shape, `Lookup(T)` (arena-owned, `deinit`, `clone`):
@@ -136,7 +157,7 @@ host"). Design choices:
 
 ## Caching (CachingResolver)
 
-`dns.CachingResolver` (`src/CachingResolver.zig`, 2026-11-15, consumer request 2026-11-15) wraps
+`dns.CachingResolver` (`src/CachingResolver.zig`) wraps
 a `*Resolver` and caches the answers of the seven high-level lookups (`lookupIp`, `reverse`,
 `lookupMx`/`Ns`/`Txt`/`Cname`/`Srv`). Parity references: hickory `CachingClient` + `ResolverOpts`
 (cache size, positive/negative TTL clamps), c-ares query cache (positive and NXDOMAIN answers,
@@ -160,6 +181,7 @@ capped at 1 h), RFC 2308 (negative caching), RFC 8767 (serve-stale). Each `Answe
 | expiry | an answer expires `ttl` seconds after the moment its query was sent (the clock is read after a pool slot is held, before the call), not after it returned: it never outlives its TTL by the lookup's duration. `lookupIp` order is RFC 6724 as of the lookup time; a `.cache`/`.stale` hit is re-sorted on the caller's clone (never the stored copy, never under the table mutex) when `resort_ip_hits` (default true), so a route change shows in the order. Cost: one route query (UDP connect, nothing sent) per item per hit; `false` serves the order stored by the filling lookup. `sort_source` (default `netaddr.systemSource`) is the test seam | RFC 6724 §6 |
 | stale window | counts from EXPIRY (RFC 8767), not from the last good answer: an entry is servable for `ttl + stale_s`. "Keep the last answer N seconds" = `stale_s` = N minus the TTL the caller saw, or N as an upper bound. Negative answers (NXDOMAIN/NODATA) live for the SOA TTL (RFC 2308) clamped by `negative_*`; they get no doubling backoff, which is for upstream failures only | RFC 8767 §4, RFC 2308 |
 | per-key invalidation | `forget(kind, name)` (`kind`: `.ip .mx .ns .txt .cname`), `forgetReverse(ip)`, `forgetSrv(service, proto, name)` drop one key, answer and backoff alike, so its next lookup asks the network; an absent key is a no-op; a lookup of that key already in flight may still store its answer afterwards. `clear()` drops all | hickory/unbound per-name flush |
+| local refusal | a lookup the Resolver refuses before sending anything (`BadName`, `NameTooLong`, `RequestTooLarge`, `InvalidOptions`, `NoDotSupport`, `NoDohEndpoint`) counts in no statistic and gives its budget token back (`isLocalRefusal`, `CachingResolver.zig:1001`, used at `:916`) | like the literal bypass |
 | stale reason | `Answer.stale_reason: ?Error`, set on `.stale`: the upstream failure just seen, the error the backoff holds, or `error.BudgetExceeded`; null otherwise | — |
 | time | whole seconds from a monotonic clock (`Options.clock` is the test seam); ages saturate, a clock going backwards neither underflows nor reports more than the stored TTL | — |
 
@@ -173,24 +195,12 @@ lookup. A `Resolver` is single-owner, so the cache owns its own: `init` takes th
 `Options.max_concurrent_lookups = 8` of them (0 = `InvalidOptions`), and a miss takes a free one
 for the duration of its lookup — an `Io.Mutex` + `Io.Condition` around the free list; when all are busy
 the miss waits (cancelable through `io`). A slow name (timeout × attempts × servers can be minutes)
-therefore blocks only its own caller, up to the pool size. Two concurrent misses on the SAME key may
-both query — no coalescing in this wave. Learned per-Resolver state (the no-EDNS server memory) is
+therefore blocks only its own caller, up to the pool size. Concurrent misses on the same key are coalesced (below). Learned per-Resolver state (the no-EDNS server memory) is
 not shared between the pooled Resolvers. The table owns clones under `gpa`; an allocation failure while storing returns the answer uncached;
 `gpa` must be thread-safe: pooled lookups allocate from several threads at once. The budget token and `network_lookups` are taken when a miss goes to the network and given back if no pool slot could be had (cancel, out of memory); `deinit` frees everything. No `pub` entry can panic: the key buffer is bounded and a name that
 does not fit is passed to the Resolver uncached.
 
-Tests (`src/CachingResolver.zig`, a loopback UDP stub that counts queries, an injected clock;
-2026-11-15 gap wave: `forget` of each kind, absent key no-op, forget during backoff, `stale_reason`
-for upstream/backoff/budget, a changed `sort_source` reordering a hit and `resort_ip_hits = false`):
-hit/expiry/aging, both clamps, NXDOMAIN and NODATA with their clamps, no-SOA, partial,
-literal/`.onion` pass-through (and no budget/slot/stat spent on literals, `.onion`, hosts hits), TTL from query send time, a failure on a fresh entry, token refund on cancel, `resetFailures`, case folding and rooted names, serve-stale on SERVFAIL and on a
-timeout with the recheck interval, stale off by default, backoff doubling/cap/reset, pass-through
-errors, budget refusal/refill/stale-under-budget, LRU eviction, expired-first eviction, prune
-(with a stale window), `InvalidOptions`, a backwards clock, a failing allocator, all seven
-lookup kinds, four threads on one cache, a held-back slow answer not blocking another name (and
-waiting with `max_concurrent_lookups = 1`).
-
-**Request coalescing, prefetch, many lookups (2026-11-16).** Concurrent misses on one key share one
+**Request coalescing, prefetch, many lookups.** Concurrent misses on one key share one
 network lookup (hickory, unbound): the first registers an in-flight record under the table mutex and
 asks; later misses of the key wait on it (cancelable) and then read the table again — the lead's
 answer as `.cache`, or its upstream failure through the backoff (so N concurrent misses on a failing
@@ -198,17 +208,12 @@ name cost one lookup, not N), serve-stale as usual. A lead that leaves nothing i
 a non-cacheable answer, a local error) wakes them to an empty table and each asks itself, in parallel
 and uncoalesced (as without coalescing): a waiter is never stranded nor queued behind another. A failed
 refresh keeps the old answer and arms the key's backoff, so a dead upstream is not retried on every
-`refreshDue`. Independent review 2026-11-16: no HIGH, two MED (serialised waiters after an empty lead,
-no backoff on a failed refresh) and three LOW fixed the same day. `Stats.coalesced` counts the waits. `Options.prefetch_pct` (unbound
+`refreshDue`. `Stats.coalesced` counts the waits. `Options.prefetch_pct` (unbound
 `prefetch`; off by default, ≤ 99): a hit with less than that share of its stored TTL left is served
 and marks the key due once; `refreshDue(max)` refreshes due keys (most recently used first) through
 the same miss path, caller-driven — no task is hidden in the library, a caller runs it from a timer on
 its `Io`; `Stats.prefetches`. `lookupIpMany(names, results)` runs `lookupIp` over a `std.Io.Group`,
-one result per name, every result set also on cancel. Tests: four concurrent misses → one query and
-three coalesced; a failed refresh held by the backoff; a held SERVFAIL shared by three misses → one lookup; a canceled waiter and a canceled
-lead (the waiter asks in turn); the four-thread test now also asserts exactly one query per name;
-prefetch off by default, the mark threshold, mark-once, renewal past the old expiry, `prefetch_pct`
-100 refused; `lookupIpMany` mixed results and length mismatch, and cancel mid-flight.
+one result per name, every result set also on cancel.
 
 ## Threat model / out of scope
 Not a validating resolver: **no DNSSEC**, so answers are trusted as far as the transport is. UDP is
@@ -220,13 +225,13 @@ one question, our name (ASCII case-insensitive, RFC 4343), our type, class IN. A
 random source port), not authentication — use DoH (TLS to the resolver) when the path is
 untrusted. TLS/DoH transport security is the `http` client's concern, not this module's.
 
-**Decoded-bytes cap (2026-11-18, owner decision on DN-5; `DecodeOptions.max_decoded_bytes`,
-`decodeWith`, `error.DecodedTooLarge`, `Message.decoded_bytes`).** `decode` counts every byte it
+**Decoded-bytes cap** (`DecodeOptions.max_decoded_bytes`,
+`decodeWith`, `error.DecodedTooLarge`, `Message.decoded_bytes`): `decode` counts every byte it
 requests for the decoded form (names, label slices, record and question arrays, RDATA copies, the
 owner-sharing map — all through a counting allocator in front of the message arena; growth is
 charged, shrinking is not refunded) and stops with `error.DecodedTooLarge` past the cap; a real
 allocation failure stays `OutOfMemory`. Default `default_max_decoded_bytes` = 1 MiB. Measured
-2026-11-18 (ReleaseFast; "decoded" = bytes requested, "heap" = bytes the arena took from the
+(ReleaseFast; "decoded" = bytes requested, "heap" = bytes the arena took from the
 allocator before the cap existed):
 
 | 65 535-byte message (or real capture) | decoded | heap | ratio (decoded) |
@@ -253,7 +258,7 @@ refusal as `MalformedResponse`. Other resolvers bound the input (64 KiB) and dec
 fixed records (Go `dnsmessage.Parser`, miekg/dns) rather than capping the decoded form; this
 module decodes eagerly into an arena, so the cap is its equivalent (security first, owner rule).
 
-TSIG (2026-10-16) authenticates an update and its reply with a shared secret; it does not
+TSIG authenticates an update and its reply with a shared secret; it does not
 encrypt them and there is no replay cache — a captured signed update can be replayed within
 its fudge (300 s), which RFC 8945 §5.2.3 accepts and which, for idempotent adds/deletes of
 DNS-01 records, re-applies the same change. The secret is touched only inside `tsig.sign` /
@@ -265,11 +270,10 @@ not a false success.
 `lookupIp` and `reverse` apply a bailiwick rule on top: only answer records whose owner is the
 queried name, or a CNAME target reachable from it through CNAME records in the same answer
 section (at most 8 hops; a loop cannot extend the chain), are returned. An A record for
-`victim.test` in a reply to `example.com` used to come back from `lookupIp("example.com")`; it is
-now ignored. `resolve`/`query` return the whole message untouched — a caller reading `answers`
+`victim.test` in a reply to `example.com` is ignored by `lookupIp("example.com")`. `resolve`/`query` return the whole message untouched — a caller reading `answers`
 itself owns that check.
 
-DNS 0x20 (`Options.case_randomization`, 2026-11-15, opt-in): the UDP query name is sent in random
+DNS 0x20 (`Options.case_randomization`, opt-in): the UDP query name is sent in random
 ASCII case and the reply must echo it byte for byte, else the datagram is dropped like any other
 spoof and the wait goes on to the same deadline. It adds one guessed bit per letter to the id and
 port entropy; it does nothing against an on-path attacker, and a server that does not preserve
@@ -279,7 +283,7 @@ Decoded names are dotted text without the trailing root dot and with no `\DDD` e
 labels are raw bytes, so a label containing `.` is indistinguishable from two labels in the text
 form and `writeName` is not its inverse; callers displaying them must escape, and callers that
 need wire structure (label counts — `dnssec` does) must not take it from the text — use
-`Record.labels` instead (audit F7, closed 2026-09-12): the owner name's actual label boundaries,
+`Record.labels` instead (audit F7): the owner name's actual label boundaries,
 as slices into `Record.name`, populated by `decode` for every record (root = `&.{}`; `&.{}` also
 on a hand-built `Record` that never set it, which callers must read as "structure unknown", not
 "root"). `Question.name` stays text-only — nothing reads a question's label structure. Out of scope:
@@ -292,203 +296,62 @@ stream). It is a per-attempt, per-server budget, not a per-call one: `query` may
 value. The DoH-JSON `name` is validated by the wire path's rule and percent-encoded into the URL.
 
 ## Verification
-`zig build test-dns`: offline tests plus a few live ones. Offline: golden query bytes; canned responses
-(name compression, CNAME chain, MX/TXT/SOA/OPT, PTR); adversarial packets (truncations at every
-offset, pointer loops, bad rdata lengths incl. SOA/MX shorter than their fields, hostile section
-counts **under a 4 KiB memory limit** so the up-front count guard is pinned by the allocation it
-prevents, not by the error name); a fuzzed `decode` seeded with the six live captures; resolv.conf/
-hosts fixtures and search-list ordering; reverse-name goldens incl. the RFC 3596 example; the
-response-correlation rule (wrong name / no question / two questions / wrong type / wrong class
-refused, case and root dot accepted); the bailiwick rule on a five-record answer with an
-out-of-order CNAME chain, a loop and an over-long chain; DoH-JSON URL encoding against parameter
-and request-line injection; a replay of the three replies `zig build interop-dns` captured off a
-real loopback socket (`src/testdata/reply_*.bin` — lying question, no question, honest); and
-loopback stubs — a UDP server that slips in an off-bailiwick record, and a TCP server that accepts
-and never answers (reached via `transport = .tcp`, via a TC-bit UDP reply, and via a UDP reply the
-kernel truncated without the server setting TC — audit F13), each bounded by `timeout_ms`.
 
-The exchange that proves the question check ON A SOCKET is a separate program,
-`tools/interop.zig` (`zig build interop-dns`; compiled by `check-interop`, run by
-`scripts/test.sh interop`). It needs no peer — the hostile server is the program itself, on
-127.0.0.1 — but it needs a second thread scheduled inside a timeout, which is precisely what a
-loaded gate cannot promise: as a test in `src/` it failed 10 runs in 20 under 32-way load
-(audit F20). `-- --capture` re-takes the frames.
-
-⚠ The `live:` tests (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8, lookupIp) **query
-public resolvers when the network is up** — they skip via `error.SkipZigTest` only when it is not.
-A gate run on a connected machine is therefore not offline.
-
-**Dynamic update + TSIG (2026-10-16).** `src/tsig_vectors.zig` pins messages dnspython 2.8.0
-signed (all five algorithms, a request and its chained response) and an UPDATE with every
-operation, rendered uncompressed (`tools/tsig_oracle.py` regenerates them): `sign` and
-`Builder` must be byte-identical, `verify` must accept them; every single-bit flip of a signed
-message is rejected except the two the RFC makes invisible (header id, case inside the TSIG
-names); truncations, key/algorithm/time/truncated-MAC/chaining and peer-error replies are
-tested; `DNS_FUZZ` gained a `tsig-verify` harness over damaged signed messages. Live:
-`tools/update_server.py check` runs a dnspython RFC 2136 server, feeds it BIND's `nsupdate` as
-a control, then `zig build interop-dns -- --update-server PORT` (37 checks: each algorithm,
-each prerequisite outcome, two values at one name, delete one, NOTZONE/NOTAUTH/REFUSED,
-wrong secret/unknown key/wrong algorithm, a > 512-byte update over TCP) and reads the result
-back with BIND's `dig`.
-
-**Result shape, reload, 0x20 (2026-11-15).** The stubs gained an authority section
-(`stubResponseAuth`, `WireBuf.soaRr`) so negative answers are tested over a socket, not only
-through the pure `judge`: for `lookupIp`, `reverse`, `lookupCname` and every typed lookup the
-TTL over a CNAME chain (and over both address families), NXDOMAIN vs NODATA with and without an
-SOA, the canonical name, AD with and without `authentic_data`; /etc/hosts and literals (no TTL,
-no canonical); `clone` outliving its original; a search list whose NODATA candidate outranks the
-NXDOMAIN ones; FORMERR as `ServerFailed`; 0x20 (the name arrives in mixed case; a server echoing
-it lower-cased is dropped to a timeout; the same server is accepted without the option);
-resolv.conf re-read after a change, not re-read with `null`, not re-stat'ed inside the interval.
-**Audit 2026-11-15 (delta mutation, CachingResolver).** 208 schemata mutants over the whole of
-`src/CachingResolver.zig` (everything above its tests): option validation (each guard dropped, each
-boundary), the key builders (kind byte, case folding, length prefixes, every size limit), the hit /
-stale / drop / remove decisions of `run`, the failure arming and backoff arithmetic, the clamps, the
-token bucket, the Resolver pool (reservation, free list, waiters, the cancel and OOM paths), the
-store/replace/supersede steps, `staleUsable`/`dead`, LRU eviction with its 16-entry scan, the
-intrusive list and `deinit`, ReleaseSafe, one build, each mutant under `setsid -w timeout` and
-`ulimit -v`. First run: 136 killed (8 by a hang), 72 survived. Each survivor ended as a test or an
-argued equivalent: new tests for options whose min equals max, `isUpstreamFailure` per error,
-`backoffDelay` with a saturated fail count, prune inside the stale window and at the exact end of a
-backoff, a payload past the stale window freed by the lookup path and by prune (allocator byte
-accounting) while the backoff is kept, a clock stepping back after the payload was dropped, the
-budget refusing an expired entry that was just removed, a payload-less failure entry never served
-stale, an answer without TTL superseding an expired one, a partial answer under `partial_ttl_s`, the
-bucket's refill rate, a clock at the end of `u64`, the 16-entry expiry scan at both edges, key
-separation (reverse against name keys, IPv6 addresses differing in the last byte, names differing in
-the last character, SRV name and part boundaries, an SRV key against an MX key, an undefined length
-byte), every key length limit, an allocation failure creating a Resolver (reservation returned, mutex
-released), a failure sweep over every allocation of a failing lookup (the upstream error survives a
-failed failure-entry allocation, no leak), a gate allocator failing the reservation while a second
-miss waits (the waiter is woken), the pool's free list (pop, push, chain, reuse), cancelling a parked
-miss, the expiry and backoff measured after a 30 s network call, a refreshed answer becoming the most
-recently used while another lookup finished, and the pooled Resolvers freed with the cache (a
-resolv.conf text only a Resolver's `deinit` frees). Rerun: all 55 killed (3 by a hang). 191 killed,
-17 not killed. EQUIVALENT, each with its invariant: the `refill_s` anchor at `init` (`tokens` starts
-at `burst` and the refill is capped at it); `prune`'s `payload != null` and `t >= expires_s` clauses
-(`dropPayload` on no payload is a no-op; `!staleUsable` already implies the expiry); the payload test
-before `dropPayload` in `run` (a payload-less entry always carries a failure count); the
-`fail_count > 0` clause before `retry_at_s` (both are zero together, `store` clears them); the
-`retry_at_s = 0` reset in `store` (only read behind `fail_count > 0`); `dead`'s `t >= expires_s`
-(a failure is armed only after the expiry); `takeToken`'s `<` against `<=` at a tie (adds nothing);
-`stored_ttl = 0` in `dropPayload` (read only with a payload, rewritten by `store`); the reverse key's
-address-family byte for IPv4 (the key length already separates it); the pool's `next_free = null` on
-pop (`release` overwrites it before the next read); the `prev`/`next` clears in `unlink` and the
-`prev` clear in `pushFront` (each redundant with the other, and `removeEntry` frees the entry);
-`touch`'s head early-return (cost only). UNOBSERVABLE, with the injection each needs: the SRV kind
-byte (an `undefined` key buffer holds 0xaa in a safe build, never 0..5; needs a ReleaseFast stack
-garbage value) and the `s < 0` guard of the default clock (an `Io` whose awake clock is negative).
-
-**Audit 2026-11-15 (delta mutation).** 49 schemata mutants over the new and changed code of
-`Resolver.zig` (status rank, `clone`/`cloneItem`, `localLookup`, `lookupIp`'s literal/hosts/
-`.onion` paths, candidate tally and `partial`, `judge`'s found/TTL/SOA/rcode/AD rules, `chainEnd`,
-`isAnswerRcode` (both directions), `Tally.add`, `reverse`'s rcode check and hosts status,
-`resolveNamed`'s decisive/failed rules, `lookupCname`'s hop cap and status, the per-type filter in
-`collectAddresses`, `takeFamily`, 0x20's switch/spelling/flip/echo check, `ConfStamp`,
-`refreshConfig`'s interval/compare, `beginCall`/`endCall`), ReleaseSafe, one build, each mutant
-under `setsid -w timeout` and `ulimit -v`: 43 killed in the first run, 6 survived (hosts family
-filter, the TTL and AD folds of two family replies, `reverse` reading SERVFAIL as empty, the conf
-stamp not stored, the size not compared) and got a test each; the rerun killed all six. 49/49,
-0 equivalent.
-
-**Audit 2026-11-15 (review-fix delta).** 38 schemata mutants over the non-test lines the review fixes
-added to `src/CachingResolver.zig`: the `local` flag of every lookup kind (the literal clause, each
-`isDnsAvoided` call, the reverse constant) and `run`'s `bypassLocal` branch, `bypassLocal` itself
-(the result source, the Resolver's `deinit`), `refundLocked` (the count, the bucket guard, the cap at
-`burst`, the amount), both refund call sites (a failed `acquire`, an /etc/hosts answer in `succeeded`),
-the `t_call` read and the times handed to `succeeded` and `failed`, the `bypass` counting (the
-`canonical != null` test, the increment and its amount), the fresh-payload guard in `failed` (each
-clause, the `touch`, both caps of the served TTL, the source) and `resetFailures` (the payload
-test, the removal, both counter resets, the step and the starting end of the walk). First run: 15
-killed, 23 survived. New tests: every lookup kind answering a literal or a DNS-avoided name with the
-budget empty and without a miss, a statistic or a table entry; the expiry measured from the send
-after the miss waited 40 s for a pool slot; `refundLocked` on a full, a half and an empty bucket and
-a zero count; the direct `bypass` counting a DNS answer and not a literal; a failure serving a fresh
-entry aged by 10 s, capped at its stored TTL when `t` is earlier, and moving it to the front of the
-LRU; `resetFailures` over two failure-only entries behind a kept stale answer with the most recently
-used entry carrying no failure. Rerun: 36 killed, 2 not. UNOBSERVABLE, with the injection each
-needs: the `r.deinit()` of `bypassLocal` (a local-only lookup never reads resolv.conf or opens a
-DoH client, so the Resolver holds nothing to free; needs a local lookup that allocates) and the
-`payload != null` clause of the fresh-payload guard in `failed` (a payload-less entry always has
-`expires_s <= t` on a monotonic clock; needs a clock stepping back after the payload was dropped).
-
-**Audit 2026-11-18 (decoded-bytes cap delta).** 11 schemata mutants (ReleaseSafe, whole suite)
-over the non-test lines of the cap: the limit taken from the options, the error mapping (always
-`OutOfMemory`, always `DecodedTooLarge`), `decoded_bytes`, the budget's comparison (`>=`, never),
-the `exceeded` flag, the running total, and the charge on `alloc`, `resize` and `remap`. 9 killed
-on the first run; the `resize` and `remap` growth charges survived — `decode`'s own arena use never
-grows a block in place — and were killed by a unit test of the budget over a fixed buffer (second
-build). 11/11. Card: cumulative 381 + 11 / 403 + 11.
-
-**Audit 2026-11-16 (cache-gap delta).** 24 schemata mutants over the non-test lines of the
-`forget` / `forgetReverse` / `forgetSrv` / `Answer.stale_reason` / `resort_ip_hits` change in
-`src/CachingResolver.zig`: each arm of `forget`'s kind switch (swapped for another kind), the key
-handed to `forgetKey` by all three entry points (dropped), `forgetKey` itself (the null-key early
-return, the `unlock`, the `removeEntry`), `reverseKey` (the address copy and the key length of both
-families), `run`'s re-sort (the option flipped, `Source.stale` skipped, `Source.network` sorted too,
-the probe replaced by a no-route one, the `TooManyCandidates` arm turned into a trap) and the reason
-handed to `staleAnswer` at its three call sites plus the assignment of `stale_reason` itself. First
-run: 16 killed, 8 survived. New tests: `forget` over all five name kinds (only the asked kind goes
-back to the network, whichever kind was forgotten); the "absent key" test now really reaches the
-too-long-key path (its 300-byte name fitted the key buffer) for `forget` and for `forgetSrv` with a
-256-byte service; a stale IP answer re-sorted by a changed route and a network answer never probed by
-the cache layer; a stored 65-address answer served unsorted (above `max_sort_candidates`) with no
-probe, plus the default `sort_source` equal to `netaddr.systemSource` on Linux. Rerun: 24 killed
-(one by timeout), 0 equivalent. Not mutated: the non-Linux default `noSource` and the
-`builtin.os.tag` choice of `defaultSortSource` (UNOBSERVABLE: comptime, needs a non-Linux host) and
-the `T == netaddr.Ip` guard of the re-sort (comptime: the other element types do not compile
-without it); the Linux half is pinned by the new default-probe assertion.
-
-**Audit 2026-11-16 (delta mutation).** 80 schemata mutants over the non-test lines of `src/CachingResolver.zig` that
-request coalescing, prefetch and `lookupIpMany` added: `init`'s `prefetch_pct` check and the `inflight` table's
-release, the two new `Stats` fields, `refreshDue` (its bound, count, statistic and the `Canceled` arm), `takeDue` (the
-due test, the clearing of the mark, the key copy and length, the newest-first walk), `refreshKey` (the refresh flag of
-every key kind and the byte offsets of the reverse and SRV keys), `lookupIpMany` (the length check, the result
-initialisation, the await, `manyOne`), `runLocked` (the `refresh` / `force` / `waited` flags and the miss count, the
-hit count and the prefetch mark with its boundary, each step of the flight wait: counter, `waiters`, cancel,
-destruction; the refresh-only budget and backoff returns, the lead's registration and its `endFlight`),
-`startFlight` / `endFlight` / `destroyFlight` (every free and the wake-up), `failed`'s refresh branch (entry lookup,
-failure count, remembered error, retry time) and the mark cleared by `store`. First run: 51 killed (5 of them by
-timeout or a crash), 29 survived. New tests: every key kind (both address families, MX, NS, TXT, CNAME, SRV) renewed by
-`refreshDue` and then served from the table, the SRV refresh asking for the same wire name again (the Stub counts it);
-`refreshDue`'s bound and its newest-first order with the next call finding the older key; a canceled `refreshDue`
-returning `error.Canceled`; the mark at the exact 20 % and 99 % boundaries; a refresh refused by the budget serving
-nothing stale; a new answer clearing the mark an expired one carried; a failed refresh remembering its error for the
-next lookup inside the backoff; a failed refresh of a key forgotten meanwhile leaving no failure entry; a refresh parked
-behind a user lookup of its key reading what that stored without asking again; waiters of a canceled lead asking the
-network themselves and a newcomer not parking behind them. Rerun: 26 more killed, 3 survived (the SRV offsets, until
-the Stub learned to count names), rerun 3 killed. 77 killed, 3 equivalent / unobservable: the `pct != 0` guard of the mark
-(with `pct == 0` the comparison `left * 100 < 0` is false anyway) and its `!e.prefetch_due` guard (it only skips setting an
-already set flag) are EQUIVALENT; the result initialisation of `lookupIpMany` is UNOBSERVABLE (every task sets its own
-result, also a canceled one; it needs a `Group` that drops tasks which never started). Latent, not a defect today: in
-`refreshKey` the SRV lengths are `u8`, so `1 + sl` and `2 + sl + pl` would overflow at 255 / 254 bytes; a key that long
-never carries an answer because the Resolver refuses labels over 63 bytes.
-
-**Audit 2026-10-04 (mutation).** 54 schemata mutants over the wire codec (name length and
-label caps, pointer direction and jump budget, section-count pre-checks, RDLENGTH/RDATA
-windows for A/AAAA/TXT/CAA/SOA/MX, header bits, EDNS fields), the reply correlation
-(`decodeResponse`, the UDP receive filter, per-datagram ids, TC retry, DoH status), the
-bailiwick chain, the search-list candidate loops, resolv.conf/hosts parsing and
-`reverseName`: 54 killed (one by a hang), 0 equivalent, 0 left alive. 15 had survived the
-existing tests and got one each: the decoder's own 253-char edge, a chain of exactly
-`max_pointer_jumps` pointers, the `min_record_wire` factor under a 4 KiB allocator, an
-SOA name overrunning RDLENGTH (BadRecord, not Truncated), CHAOS-class CNAMEs not
-extending the chain, ';' comments, the 253-char candidate cap with a roomy buffer, and --
-over loopback, with a new multi-datagram `EchoStub` and a 503 HTTP stub -- a wrong-id
-datagram skipped, a datagram from another source port skipped, a fresh id per retry
-(deterministic via `SeqRandomIo`), `resolve` moving past a NODATA candidate, `lookupIp`
-stopping at the first candidate with addresses, and DoH non-200 on both the wire and the
-JSON path.
+- **Run**: `scripts/modtest dns` (loopback stubs bind 127.0.0.1; the live checks are not in it).
+- **Codec tests** (`src/message.zig`, `src/goldens.zig`): golden query bytes; canned responses (name compression, CNAME chain,
+  MX/TXT/SOA/OPT, PTR); adversarial packets (truncations at every offset, pointer loops, bad rdata lengths including
+  SOA/MX shorter than their fields, hostile section counts under a 4 KiB memory limit so the up-front count guard is
+  pinned by the allocation it prevents, not by the error name); the decoded-bytes cap and its budget allocator.
+- **Resolver tests** (`src/Resolver.zig`, loopback stubs, each bounded by `timeout_ms`): response correlation (wrong
+  name, no question, two questions, wrong type, wrong class refused; case and root dot accepted); the bailiwick rule on
+  an out-of-order CNAME chain, a loop and an over-long chain; a UDP server that slips in an off-bailiwick record; a TCP
+  server that accepts and never answers (reached by `transport = .tcp`, by a TC-bit UDP reply, and by a UDP reply the
+  kernel truncated without TC); DoH-JSON URL encoding against parameter and request-line injection; NXDOMAIN versus NODATA
+  with and without an SOA, the TTL over a CNAME chain and over both families, the canonical name, AD with and without
+  `authentic_data`, hosts and literals (no TTL, no canonical), `clone` outliving its original, a search list whose NODATA
+  candidate outranks the NXDOMAIN ones, FORMERR as `ServerFailed`; 0x20 (mixed case on the wire, a lower-casing server
+  dropped to a timeout, accepted without the option); resolv.conf re-read after a change, not with `null`, not inside the
+  interval. A replay of the three replies `zig build interop-dns` captured off a real loopback socket
+  (`src/testdata/reply_*.bin`: lying question, no question, honest).
+- **`src/CachingResolver.zig`** (a loopback UDP stub that counts queries, an injected clock): hit, expiry, aging; both
+  clamps; negative answers with and without SOA; partial; literal / `.onion` / hosts pass-through without budget, slot
+  or statistic; TTL from query send time; serve-stale (SERVFAIL, timeout, the recheck interval, off by default); backoff
+  doubling, cap and reset; pass-through errors; budget refusal, refill and refund; LRU and expired-first eviction; `prune`;
+  `forget` of each kind, `stale_reason`, `resort_ip_hits`; option validation; key separation and limits; a backwards clock;
+  a failing allocator; all seven lookup kinds; four threads on one cache; the pool (slow name not blocking another,
+  `max_concurrent_lookups = 1`, cancel); coalescing (concurrent misses give one query, a canceled lead, a held SERVFAIL),
+  prefetch and `refreshDue` for every key kind, `lookupIpMany` (mixed results, length mismatch, cancel).
+- **Dynamic update + TSIG**: `src/tsig_vectors.zig` pins messages dnspython 2.8.0 signed (all five algorithms, a request
+  and its chained response) and an UPDATE with every operation, rendered uncompressed (`tools/tsig_oracle.py`
+  regenerates them): `sign` and `Builder` must be byte-identical and `verify` must accept them; every single-bit flip of a
+  signed message is rejected except the two the RFC makes invisible (header id, case inside the TSIG names); truncations
+  and key / algorithm / time / truncated-MAC / chaining / peer-error replies are tested.
+- **Config**: `src/config_oracle_test.zig` replays glibc's own behaviour on resolv.conf and hosts fixtures
+  (`tools/config_oracle.py`, see *Anchoring*); `src/sweep_test.zig` pins the no-panic sweep findings.
+- **Stack probe**: `src/stackprobe_test.zig` scans the dead stack after `tsig.sign` / `tsig.verify` for the secret and its
+  HMAC key blocks (ReleaseFast only).
+- **Fuzz**: `DNS_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver), harnesses in `src/fuzz_test.zig`:
+  `dns-decode`, `dns-decode-mutated`, `dns-tsig-verify`, `dns-query-roundtrip` (random `QueryOptions` incl. DO/AD/CD and
+  EDNS options, encode, decode equal or the documented refusal), `dns-rdata`, `dns-srv-order`.
+- **Programs outside the test binary** (`tools/`; each needs a real socket, a second schedulable thread, a foreign
+  toolchain or the internet, which `zig build test-dns` must not require): `zig build interop-dns` (a hostile loopback UDP
+  server answering a real `query()`; needs no peer; `-- --capture` re-takes the frames; run by `scripts/test.sh
+  interop`), `interop-dns -- --update-server PORT` against `tools/update_server.py check` (a dnspython RFC 2136 server,
+  BIND's `nsupdate` as a control, and BIND's `dig` reading the result back), and `zig build live-dns` (recursive UDP and
+  TCP, reverse PTR, the three DoH shapes against public resolvers: it queries the internet).
+- **Bench**: `zig build bench-dns` (`tools/bench.zig`) against Go `dnsmessage`; the figures are the card's
+  `**Performance:**` line.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-10-31 at the network-monitor consumer's request (trace hop
-names over PTR, no DoH):
+Consumer build options (CONVENTIONS §4.2), for a consumer that wants hop names over PTR and no DoH:
 
 | option | values | default | `-Dprofile=small` |
 |---|---|---|---|
 | `dns-doh` | `true` / `false` | `true` (graded) | `false` |
-| `dns-dot` | `true` / `false` | `true` (graded; owner 2026-11-02) | `false` |
+| `dns-dot` | `true` / `false` | `true` (graded) | `false` |
 
 - **`false`:** `Resolver.doh_enabled` is false; `Resolver.http_client` is `?void`, so nothing of
   the `http` module (and the TLS/x509/RSA/EC stack behind `http.Client`) is analysed or linked.
@@ -501,58 +364,36 @@ names over PTR, no DoH):
   the network-monitor consumer (ReleaseSafe, not stripped): 17.5 MB with DoH vs 5.5 MB before it used `dns`.
 - **What the consumer loses:** DoH (RFC 8484 wire and DoH-JSON). UDP/TCP, `/etc/hosts`,
   resolv.conf, `update`/TSIG are unaffected.
-- **`dns-dot=false`** (2026-11-02): `Resolver.dot_enabled` is false and `tlsclient` is not analysed;
+- **`dns-dot=false`**: `Resolver.dot_enabled` is false and `tlsclient` is not analysed;
   `transport = .tls` is refused with `error.NoDotSupport` on `query`/`exchange` -- never plain DNS
   instead. Size probe at `-Dprofile=small` (both off): 177 592 → 177 776 B (+184 B for the
   `.tls` branches; the 175 160 above predates the typed lookups); default profile 1 994 376 B.
 
+## What is deliberately not done
+
+- **Per-address TTL** (c-ares `ai_ttl`, Node `{ttl: true}`): RFC 2181 §5.2 makes it one value per RRset, so it would
+  differ only between A and AAAA, and a cache must honour the minimum anyway; `resolve` exposes every record's TTL. Not
+  worth a second item type.
+- **DNSSEC validation** in the resolver: it is the sibling `dnssec` module's job; `authenticated` is a trusted upstream's
+  AD bit only (*Threat model*).
+- **Zone files, AXFR/IXFR, the server side**: miekg/dns's territory, not a stub client's.
+
 ## Backlog / deferred
 
-- ✅ **Closed 2026-10-31 (`Error.ServerFailed`, for the network-monitor consumer's serve-stale cache):** **`lookupIp` reads a SERVFAIL / REFUSED reply as "no addresses"** *(found 2026-10-16 by acmedns's
-  review)*: `query` returns a server-failure reply as a message once every server failed, and
-  `lookupIp` collects addresses from it — an empty list, indistinguishable from NODATA (the
-  2026-10-01 fix covered timeouts only). Go returns an error ("server misbehaving"). Fix: record a
-  failure rcode as `last_err` — needs a new `Error` member (`ServerFailed`), i.e. an API change for
-  exhaustive switches in consumers. acmedns works around it with `zone.nameserverIps`.
-- ✅ **Closed 2026-09-12 (audit F10):** resolv.conf `options timeout:`/`attempts:` are now
-  honored by `Resolver.effectiveTimeoutMs`/`.effectiveAttempts` when the caller leaves
-  `Options.timeout_ms`/`.attempts` at their own struct defaults (`default_timeout_ms`/
-  `default_attempts`) AND resolv.conf is in play (no explicit `Options.servers`). An explicit,
-  non-default `Options` value still always wins on the classic UDP/TCP path. Known, accepted
-  cost: a caller who explicitly sets `.timeout_ms = 5000` (the default's own value) is
-  indistinguishable from one who left it unset, so that one case still yields to resolv.conf.
-- ✅ **Closed 2026-11-02:** a per-CALL deadline — `Options.call_timeout_ms` (Go's ctx deadline).
-- ✅ **Closed 2026-09-12 (audit F7):** the text name form collapses distinct wire names (see
-  Threat model), but a structured name type is no longer only hypothetical — `Record.labels`
-  gives a consumer that needs true label boundaries a way to get them without an API-breaking
-  change to `Record.name` itself.
-- ✅ **Closed 2026-11-02 (`Transport.tls`):** **DNS-over-TLS (RFC 7858), port 853** (survey 2026-09-30): miekg/dns, hickory and systemd-resolved speak it; a user who wants encrypted DNS without an HTTP stack has only DoH here. Effort: small-to-medium on top of the existing TCP length-prefixed path plus the repo's TLS client. Fits CONVENTIONS §2 (pure Zig).
-- ✅ **Closed 2026-11-02 (`dns.rdata`):** **Typed rdata for TLSA, SVCB/HTTPS (RFC 9460), NAPTR, SSHFP** (survey 2026-09-30): today they decode as `.unknown` raw bytes (rg `unknown` in `src/message.zig`), so DANE/HTTPS-record consumers parse by hand. c-ares types TLSA; miekg types all. Effort: small per type. Fits §2.
-- ✅ **Closed 2026-11-15 (`Options.case_randomization`):** 0x20 query-name case randomization, opt-in, UDP only, exact-case echo required (c-ares `ARES_FLAG_DNS0x20`, hickory `case_randomization`).
-- ✅ **Closed 2026-11-15:** TTL, canonical name, NXDOMAIN/NODATA status and the AD flag on every high-level result (`Lookup(T)`); resolv.conf re-read on change (`resolv_conf_recheck_ms`).
-- ✅ **Closed 2026-11-15 (`CachingResolver`): Caching resolver (hickory `CachingClient` parity)** (survey 2026-11-15) — the next wave: a `dns.Cache` over `Lookup(T)` (`clone` + `ttl_s` relative to receipt): per-answer TTL clamp {min, max, default}, serve-stale (RFC 8767), negative caching (RFC 2308) with failure backoff, bounded entries with expiry pruning. c-ares caches by default, hickory/unbound/resolved too: the gap that keeps the scope at `core`. Not done in the API wave because it is its own policy surface (clamps, staleness, memory bound). Effort: medium. Fits §2.
-- ✅ **Closed 2026-11-16 (request coalescing):** concurrent misses on one key share one lookup (see "Caching").
-- ✅ **Closed 2026-11-16 (`Options.prefetch_pct` + `refreshDue`):** prefetch, caller-driven.
-- ✅ **Closed 2026-11-16 (refund on the local error classes):** **A local refusal counts as a network lookup on the cached path** (found 2026-11-16): a name the Resolver refuses before sending (`BadName`, a label over 63 bytes) increments `network_lookups` (and takes a budget token) when it goes through the table, while the `bypass` path already does not count such answers. Refund on the local error classes. Small.
-- **Per-RRset TTL in the cache**: the cache keeps one TTL per answer (the minimum, as `Lookup.ttl_s`); a lookup over both families (`lookupIp`) re-queries both when the shorter expires. Caching A and AAAA separately would save the longer one's query. Medium.
-- ✅ **Closed 2026-11-16 (asynchronous API):** `lookupIpMany` over a `std.Io.Group` plus `io.async` on single lookups of the thread-safe `CachingResolver` (see "Where we are behind").
-- **IDNA (UTS #46 / RFC 5891) name encoding** (survey 2026-11-15): dnspython encodes U-labels; Go, c-ares and hickory leave it to the caller, as this module does. Needs Unicode mapping tables (a sibling module's job, not the resolver's).
-- **Per-address TTL** (c-ares `ai_ttl`, Node `{ttl: true}`): RFC 2181 §5.2 makes it one value per RRset, so it would differ only between A and AAAA; `resolve` exposes every TTL. Not worth a second item type.
-- **Server failover memory** (c-ares `ARES_OPT_SERVER_FAILOVER`, hickory server ordering): today every query starts at the first server (or the next with `rotate`), so a dead first server costs a timeout per query. Small-to-medium; wants the cache wave's per-Resolver state design first.
-- **DNS cookies state (RFC 7873)**: options can be sent (`edns_options`) but no client cookie is kept or server cookie learned. Niche for a stub (miekg/dns, BIND tools); medium.
-- **Split DNS, DoQ / DoH3, parallel servers, answer filters, per-server metrics**: service-level (systemd-resolved per-link routing) or hickory feature flags; DoQ/DoH3 need a QUIC stack the collection does not have. Niche for a stub resolver.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- ✅ **Closed 2026-11-18 (decoded-bytes cap, see "Threat model"; owner sharing of the decoded owner name had landed with REV-dns-1).** **2026-10-31 (no-panic sweep GV, DN-5) — `decode` memory amplification, a limit is a policy decision:** every record decodes into
-  its own owner-name copy plus a `labels` slice (16 bytes per label), and a 12-byte record whose owner is a compression pointer to a
-  127-label name costs about 2.4 KiB — roughly 200x its wire size. Linear in the input, so a 64 KiB TCP/UDP reply is bounded by
-  about 13 MiB and a 128 KiB DoH body (`max_doh_response`) by about 26 MiB (estimated from the struct sizes, not measured). No
-  crash or quadratic time; a cap (total decoded bytes, or sharing the decoded name between records that point at the same
-  owner) would change what `decode` accepts or its memory profile, so it is the owner's call.
-
-## Status
-`extract+gap · any (RFC 6724 result order is Linux-only) · client · blocking` · deps: `netaddr`,
-`http`, `std.json`, `std.Io.net` — canonical source is `pub const meta` in src/root.zig.
+- **Per-RRset TTL in the cache**: the cache keeps one TTL per answer (the minimum, as `Lookup.ttl_s`); a lookup over both
+  families (`lookupIp`) re-queries both when the shorter expires. Caching A and AAAA separately would save the longer one's
+  query. Medium.
+- **IDNA (UTS #46 / RFC 5891) name encoding**: dnspython encodes U-labels; Go, c-ares and hickory leave it to the caller,
+  as this module does. Needs Unicode mapping tables (a sibling module's job, not the resolver's).
+- **Server failover memory** (c-ares `ARES_OPT_SERVER_FAILOVER`, hickory server ordering): every query starts at the first
+  server (or the next with `rotate`), so a dead first server costs a timeout per query. Small-to-medium; wants the cache
+  wave's per-Resolver state design first.
+- **DNS cookies state (RFC 7873)**: options can be sent (`edns_options`) but no client cookie is kept or server cookie
+  learned. Niche for a stub (miekg/dns, BIND tools); medium.
+- **Split DNS, DoQ / DoH3, parallel servers, answer filters, per-server metrics**: service-level (systemd-resolved per-link
+  routing) or hickory feature flags; DoQ/DoH3 need a QUIC stack the collection does not have. Niche for a stub resolver.
+- **DoT connection reuse** (RFC 7858 §3.4 allows it; this is one connection per exchange, like `tcpExchange`) and RFC 8467
+  padding.
 
 ## Anchoring
 
@@ -568,19 +409,16 @@ long, OPT shapes) with 6 divergences each decided by dnspython 2.8.0, and `encod
 to dnsmessage's Builder on 18 parameter sets (refusing the same names); plus 6 real Google DNS
 responses (`goldens.zig`) and the hand-run dnspython corpus differential (`tools/README.md`). Resolver:
 interop frames from a hostile loopback server (`src/testdata/`), live UDP/TCP/DoH in `tools/live.zig`.
-`config.zig` is anchored since 2026-10-06 to glibc 2.43 itself (`tools/config_oracle.py`
+`config.zig` is anchored to glibc 2.43 itself (`tools/config_oracle.py`
 -> `src/testdata/config_oracle.zig`, replayed by `src/config_oracle_test.zig`): 17 resolv.conf
 fixtures in a user + mount + network namespace, the names glibc queried recorded by a fake DNS
 server (search order, ndots, last directive wins, comments, option values), 11 nameserver /
 attempts fixtures observed through SERVFAIL, and a hosts file through getaddrinfo per family and
 gethostbyaddr; three listed divergences where the Resolver follows Go (no nameserver: 127.0.0.1
-and ::1; attempts below 1 keeps the default). It found three defects (2026-10-06, see CHANGELOG).
+and ::1; attempts below 1 keeps the default). It found three defects (see CHANGELOG).
 
-**Go oracle 2026-10-05.** `tools/go_oracle/` (needs x/net v0.59.0 in the module cache; `GOPROXY=off`).
-It found one defect, fixed the same day: an OPT record whose EDNS options do not tile its RDATA (an
-option length past the end) was decoded with the bad stream handed on as `Opt.options`; dnsmessage and
-dnspython refuse it, and now so does `decode` (`BadRecord`). Where dnspython is stricter than both
-dnsmessage and this module (trailing bytes after the message, RDATA longer than its fields, an empty
-TXT, OPT outside the additional section or twice), this module keeps dnsmessage's leniency.
-
-**How it got there.** The anchoring work landed. DONE ea2d000: 6 real Google DNS responses incl. compression, CNAME chain, NXDOMAIN
+**Go oracle.** `tools/go_oracle/` (needs x/net v0.59.0 in the module cache; `GOPROXY=off`) asks `dnsmessage` about this
+module's message tables. An OPT record whose EDNS options do not tile its RDATA (an option length past the end) is refused
+(`BadRecord`), as dnsmessage and dnspython do. Where dnspython is stricter than both dnsmessage and this module (trailing
+bytes after the message, RDATA longer than its fields, an empty TXT, OPT outside the additional section or twice), this
+module keeps dnsmessage's leniency.
