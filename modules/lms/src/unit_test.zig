@@ -547,7 +547,7 @@ test "the LM-OTS randomizer is derived, deterministic and leaf-specific" {
     }
 }
 
-// ── audit 2026-10-03: state discipline, derivation and bounds ────────────────
+// ── audit: state discipline, derivation and bounds ────────────────
 
 test "LMS: out exactly signatureLength is enough, one byte less is OutputTooSmall" {
     var sk: lms.LmsSecretKey = undefined;

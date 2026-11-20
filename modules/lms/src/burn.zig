@@ -10,11 +10,11 @@
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -34,20 +34,20 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 }
 
 /// `Tree.init` / `initCached`: the body (with the tree walk and the OTS chains)
-/// dirtied 2.2 KiB below the probe's call in ReleaseFast (2026-10-09; the
+/// dirtied 2.2 KiB below the probe's call in ReleaseFast (the
 /// caller's frame and the entry point's are part of that).
 pub const init_burn = 4 * 1024;
 
 /// `Tree.sign` / `signWithRandomizer`: 1.2 KiB (LMS, h5/w4) and 1.5 KiB (HSS
-/// message signature) in ReleaseFast (2026-10-09). Hits without a burn lay
+/// message signature) in ReleaseFast. Hits without a burn lay
 /// up to 1.5 KiB deep.
 pub const sign_burn = 2 * 1024;
 
 /// HSS `ensureTrees` (child seed derivation, child `Tree.init`, the parent's
-/// certificate signature): 3.1 KiB in ReleaseFast (2026-10-09).
+/// certificate signature): 3.1 KiB in ReleaseFast.
 pub const hss_burn = 4 * 1024;
 
 /// `core.deriveX` / `core.deriveRandomizer`: one SHA-256 over `I || q || i ||
 /// 0xff || SEED`, called per chain on the signing path -- tight, not yet
-/// measured (`stackprobe2_test.zig`, 2026-10-09).
+/// measured (`stackprobe2_test.zig`).
 pub const derive_burn = 2 * 1024;

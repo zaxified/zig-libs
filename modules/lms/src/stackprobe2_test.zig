@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe (`testkit.stackprobe`) for the public building blocks
-//! `core.deriveX` and `core.deriveRandomizer` burned 2026-10-09 (the tree and
+//! `core.deriveX` and `core.deriveRandomizer` burned (the tree and
 //! signing entry points are in `stackprobe_test.zig`). Per-chain calls on the
 //! signing path: tight burn (`derive_burn`). ReleaseFast only
 //! (`skipUnlessOptimized`).
