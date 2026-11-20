@@ -16,8 +16,6 @@
 
 **Downstream consumer:** no
 
-Audit history (every review and mutation run, the equivalent-mutant arguments, the defects fixed): [`AUDIT.md`](AUDIT.md).
-
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Speed against these was **not**
@@ -153,8 +151,8 @@ None: every length, every alignment (loads are unaligned `readInt`s), and
   deterministic driver as `CRC32_FUZZ` (`src/fuzz_test.zig`), with a fixed seed loop and reach checks in every test
   run.
 - **Constant time:** n/a — a checksum over public data, no secret.
-- **Audit:** the card's `**Audit:**` line is the current score; the review and mutation record, with the
-  equivalent-mutant arguments, is [`AUDIT.md`](AUDIT.md).
+- **Audit:** the card's `**Audit:**` line is the current review and mutation score (review of `src/root.zig`, a
+  schemata mutation run over x86-64 and ARMv8 under qemu).
 - **Bench:** `zig build bench-crc32` (`tools/bench.zig`) against zlib `crc32_z` and Go `hash/crc32`.
 
 ## Speed
