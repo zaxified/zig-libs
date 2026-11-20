@@ -106,6 +106,9 @@ pub const Error = error{
     /// READ: no end-of-central-directory record (a truncated file, or not a
     /// ZIP archive at all). The same name `std.zip` gives it.
     ZipNoEndRecord,
+    /// READ: the central directory lists more entries than
+    /// `Archive.Options.max_entries` (opt-in; 0 = no limit).
+    ZipTooManyEntries,
 };
 
 /// A compression method beyond Store and Deflate, as a pair of factories —
@@ -134,6 +137,9 @@ pub const CodecEntry = struct {
     /// `Archive.Options.zstd_window_log_max`, for the Zstandard codec (others
     /// ignore it).
     window_log_max: u5 = 27,
+    /// `Archive.Options.lzma_max_dict`, for the LZMA and XZ codecs (others
+    /// ignore it).
+    lzma_max_dict: u32 = 64 << 20,
 };
 
 pub const CodecReader = struct {
@@ -270,23 +276,23 @@ const LzmaCodec = struct {
         var hdr: [9]u8 = undefined;
         input.readSliceAll(&hdr) catch return Error.ZipBadCentralDirectory;
         const props = lzma.Lzma1Props.fromZipHeader(&hdr) catch return Error.ZipBadCentralDirectory;
-        return open(gpa, input, .{ .lzma1 = .{
+        return open(gpa, input, entry.lzma_max_dict, .{ .lzma1 = .{
             .props = props,
             .uncompressed_size = entry.uncompressed_size,
             .allow_eopm = entry.flags & (1 << 1) != 0,
         } });
     }
 
-    fn openXzReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, _: CodecEntry) anyerror!CodecReader {
-        return open(gpa, input, .xz);
+    fn openXzReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, entry: CodecEntry) anyerror!CodecReader {
+        return open(gpa, input, entry.lzma_max_dict, .xz);
     }
 
-    fn open(gpa: Allocator, input: *std.Io.Reader, format: lzma.Format) anyerror!CodecReader {
+    fn open(gpa: Allocator, input: *std.Io.Reader, max_dict: u32, format: lzma.Format) anyerror!CodecReader {
         const s = try gpa.create(R);
         errdefer gpa.destroy(s);
         // `.max_output = null`: the entry cap (`max_entry`) is enforced above this codec,
         // so lzma's own 256 MiB default must not override it (as for bzip2, GT lesson).
-        s.r = try lzma.DecompressReader.init(gpa, input, &s.buf, format, .{ .multi_stream = false, .max_output = null });
+        s.r = try lzma.DecompressReader.init(gpa, input, &s.buf, format, .{ .multi_stream = false, .max_output = null, .max_dict = max_dict });
         return .{ .reader = &s.r.reader, .state = s, .close = closeReader };
     }
 
@@ -628,6 +634,20 @@ pub const Archive = struct {
         /// 27 (128 MiB) is libzstd's default; frames written with a larger
         /// window need it raised.
         zstd_window_log_max: u5 = 27,
+        /// LZMA and XZ entries: refuse a stream whose dictionary exceeds
+        /// this many bytes (the refusal surfaces as `error.ReadFailed` from
+        /// the entry's reader); the memory an open entry can make the
+        /// decoder allocate from a few header bytes. 64 MiB is the lzma
+        /// module's default. bzip2 needs no option: its block size caps its
+        /// memory at about 4 MiB.
+        lzma_max_dict: u32 = 64 << 20,
+        /// Refuse an archive listing more entries than this
+        /// (`Error.ZipTooManyEntries` from `init`): 0, the default, means
+        /// no limit, as in Go `archive/zip` and Info-ZIP unzip. The list
+        /// costs about 3-4x each 46-byte record in heap, so a hostile archive
+        /// of empty members costs gigabytes without it. Directory entries
+        /// skipped by default are not counted.
+        max_entries: u64 = 0,
     };
 
     fn codecFor(self: *const Archive, method: u16) ?*const Codec {
@@ -752,6 +772,7 @@ pub const Archive = struct {
             const dos: DosDateTime = .{ .time = h.last_modification_time, .date = h.last_modification_date };
             const perm: u32 = h.external_file_attributes >> 16;
 
+            if (options.max_entries != 0 and self.entries.items.len >= options.max_entries) return Error.ZipTooManyEntries;
             try self.entries.append(self.alloc, .{
                 .name = name,
                 .compression = h.compression_method,
@@ -1293,7 +1314,7 @@ pub const EntryReader = struct {
                 const codec = archive.codecFor(entry.method()) orelse return Error.UnsupportedCompressionMethod;
                 self.gpa = archive.alloc;
                 self.codec_in = in.limited(.limited64(csize), &self.codec_in_buf);
-                self.codec = try codec.open_reader.?(codec.context, archive.alloc, &self.codec_in.interface, .{ .flags = entry.flags, .uncompressed_size = entry.uncompressed_size, .window_log_max = archive.options.zstd_window_log_max });
+                self.codec = try codec.open_reader.?(codec.context, archive.alloc, &self.codec_in.interface, .{ .flags = entry.flags, .uncompressed_size = entry.uncompressed_size, .window_log_max = archive.options.zstd_window_log_max, .lzma_max_dict = archive.options.lzma_max_dict });
                 self.limited = self.codec.?.reader.limited(.limited64(entry.uncompressed_size), window);
             },
         }
@@ -3777,7 +3798,7 @@ test "LzmaCodec.open: the lzma decoder gets no output cap of its own, max_entry 
     const gpa = std.testing.allocator;
     const stored = [_]u8{ 1, 0, 1, 'a', 'b', 0 };
     var in: std.Io.Reader = .fixed(&stored);
-    const cr = try LzmaCodec.open(gpa, &in, .{ .lzma2 = .{ .dict_size = 4096 } });
+    const cr = try LzmaCodec.open(gpa, &in, 64 << 20, .{ .lzma2 = .{ .dict_size = 4096 } });
     defer cr.close(cr.state, gpa);
     const s: *LzmaCodec.R = @ptrCast(@alignCast(cr.state));
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), s.r.dec.max_out);

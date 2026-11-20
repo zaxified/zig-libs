@@ -368,3 +368,65 @@ test "addDirectory writes an unencrypted stored header when asked to encrypt (sw
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, b[6..8], .little) & 1);
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, b[8..10], .little));
 }
+
+test "Archive.Options.max_entries refuses a longer directory; 0 and an exact fit list everything" {
+    const gpa = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    var w = newWriter(&aw);
+    defer w.deinit();
+    try w.addEntry("a", "1", .{});
+    try w.addEntry("b", "2", .{});
+    try w.addEntry("c", "3", .{});
+    try w.finish();
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try testing.expectError(zs.Error.ZipTooManyEntries, archive.initSource(gpa, ms.source(), .{ .max_entries = 2 }));
+    try archive.initSource(gpa, ms.source(), .{ .max_entries = 3 });
+    try testing.expectEqual(@as(usize, 3), archive.entries.items.len);
+    archive.deinit();
+    try archive.initSource(gpa, ms.source(), .{});
+    try testing.expectEqual(@as(usize, 3), archive.entries.items.len);
+    archive.deinit();
+}
+
+test "Archive.Options.lzma_max_dict refuses an LZMA or XZ entry whose dictionary is larger" {
+    if (!zs.builtin_decoders_enabled) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    var w = newWriter(&aw);
+    defer w.deinit();
+    var data: [20_000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = "lzma dictionary limit "[i % 22];
+    try w.addEntry("l", &data, .{ .method = .lzma, .codec_level = 1 });
+    try w.addEntry("x", &data, .{ .method = .xz, .codec_level = 1 });
+    try w.finish();
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    for ([_][]const u8{ "l", "x" }) |name| {
+        // default: reads
+        {
+            var archive: zs.Archive = undefined;
+            try archive.initSource(gpa, ms.source(), .{});
+            defer archive.deinit();
+            var er: zs.EntryReader = undefined;
+            try er.open(&archive, archive.find(name).?, &window, .{});
+            defer er.deinit();
+            const got = try er.reader().allocRemaining(gpa, .unlimited);
+            defer gpa.free(got);
+            try testing.expectEqualSlices(u8, &data, got);
+        }
+        // a 4 KiB ceiling: refused, at open or while reading
+        {
+            var archive: zs.Archive = undefined;
+            try archive.initSource(gpa, ms.source(), .{ .lzma_max_dict = 4096 });
+            defer archive.deinit();
+            var er: zs.EntryReader = undefined;
+            if (er.open(&archive, archive.find(name).?, &window, .{})) {
+                defer er.deinit();
+                try testing.expectError(error.ReadFailed, er.reader().allocRemaining(gpa, .unlimited));
+            } else |_| {}
+        }
+    }
+}

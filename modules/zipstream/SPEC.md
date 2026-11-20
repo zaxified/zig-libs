@@ -195,13 +195,14 @@ decides, `authFailed()`).
 
 Limits and residual risks a consumer relies on:
 
-- **Archive memory is O(archive size), uncapped.** `Archive.init` lists every central-directory record (about 3-4x the
-  46 header bytes of heap per entry); a hostile multi-GiB archive of empty members costs gigabytes. Bounded by the
-  input, not by an option (see *Backlog / deferred*).
+- **Archive memory is O(archive size) unless capped.** `Archive.init` lists every central-directory record (about 3-4x
+  the 46 header bytes of heap per entry); a hostile multi-GiB archive of empty members costs gigabytes. Go
+  `archive/zip` and Info-ZIP unzip have no cap, so the default is none; `Archive.Options.max_entries` (0 = no limit) is an
+  opt-in cap, `Error.ZipTooManyEntries` from `init`.
 - **Zstandard window.** `Archive.Options.zstd_window_log_max` (default 27 = 128 MiB per open entry) bounds the memory
   an open Zstandard entry can make the decoder allocate from a few header bytes; a larger frame is refused
-  (`error.ReadFailed` from the entry's reader). lzma (default `max_dict` 64 MiB) and bzip2 (about 4 MiB) stay at their
-  module defaults; there is no zipstream option for them.
+  (`error.ReadFailed` from the entry's reader). `Archive.Options.lzma_max_dict` (default 64 MiB, the lzma module's
+  `max_dict`) does the same for LZMA and XZ entries; bzip2's memory is about 4 MiB by its format, so it has no option.
 - **Methods.** An entry with a method that has no codec (Deflate64, PPMd, the legacy PKZIP methods, or a built-in
   one compiled out by `-Dzipstream-builtin-decoders=false`) is listed and refused when opened,
   `error.UnsupportedCompressionMethod`.
@@ -297,10 +298,6 @@ Numbering `R<n>` is the S2 parity survey's (Go `archive/zip`, zip2, Python `zipf
   the central directory against zip-bomb quines (none of the surveyed libraries documents one, a lead rather than
   parity). The size cap already stops the 42.zip class, not a quine reading overlapping ranges. Effort S (verify), M
   (overlap).
-- **`Archive.Options.max_entries`:** cap the entry list (default unlimited or generous) so a hostile archive cannot cost
-  gigabytes (see *Limits*). A new limit, needs an owner decision.
-- **Zstandard / lzma / bzip2 limits through zipstream:** only the Zstandard window has an `Archive` option; lzma and
-  bzip2 stay at their module defaults (see *Limits*). Add options only if a consumer asks.
 
 ## Anchoring
 
