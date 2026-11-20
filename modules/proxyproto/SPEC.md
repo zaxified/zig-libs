@@ -55,12 +55,55 @@ A PROXY header is a claim by the peer about someone else. `read` therefore takes
 ## Limits and refusals
 
 - v1: 107 bytes including CRLF (spec § 2.1); a line with no LF in 107 bytes is `Malformed`.
-- v2: whole header (16 + length) at most `max_v2_len`, default **16 + 4096** (go-proxyproto's payload cap; until the 2026-11-16 review it was the specification's 536, which is a sender's guideline for headers without extra TLVs — a TLV-heavy `send-proxy-v2-ssl-cn` header can pass it, so a receiver capped there drops legitimate connections); a unix address block alone is 216. Over the cap is `error.TooLarge`, decided from the 16 fixed bytes, before any more is buffered (pinned by "v2: size cap, default 16 + 4096"). A caller that wants the tighter bound sets `max_v2_len = 536`.
+- v2: whole header (16 + length) at most `max_v2_len`, default **16 + 4096** (`default_max_v2_len`, go-proxyproto's payload cap; the specification's 536 is a sender's guideline for headers without extra TLVs — a TLV-heavy `send-proxy-v2-ssl-cn` header can pass it, so a receiver capped there drops legitimate connections); a unix address block alone is 216. Over the cap is `error.TooLarge`, decided from the 16 fixed bytes, before any more is buffered (pinned by "v2: size cap, default 16 + 4096"). A caller that wants the tighter bound sets `max_v2_len = 536`.
 - The writer (`writeV2`, `writeV2Crc`) accepts any payload up to 65535: a header over the reader's `max_v2_len` is refused by a reader with that cap, ours included. `writeV2` writes a caller's TLV area as given — a CRC32C TLV already in it is neither checked nor recomputed (use `writeV2Crc` for a computed one).
 - LOCAL and UNSPEC: the protocol block after the family byte is discarded unchecked (the specification tells a receiver to ignore it), including any TLVs and a CRC32C among them.
 - `uniqueId()` refuses a value over 128 bytes (`max_unique_id_len`, the specification's limit) with `error.Malformed`; the raw `tlv()` returns any length.
 - `read` bounds the bytes it buffers, not the time: a peer that trickles a header holds the call. Put a read deadline on the accepted stream before `read`.
 - `read` needs `r.buffer.len` at least the header it is to hold and `buf` at least its consumed length; otherwise `error.TooLarge` (for an untrusted peer: null, see § Trust). A zero-capacity reader (a `Reader.fixed("")`) is therefore `TooLarge`, not "empty".
+
+## Verification
+
+Run: `scripts/modtest proxyproto`; fuzz: `PROXYPROTO_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver,
+harness `proxyproto-parse`; never `zig build --fuzz`); interop: `zig build interop-proxyproto` (a program, not part of
+the test step; see Anchoring).
+
+- **Vectors** (`src/tests.zig`), built by hand from the specification's byte layouts: v1 TCP4/TCP6/UNKNOWN, its
+  107-byte limit and malformed forms; v2 for every family and command, LOCAL and UNSPEC, malformed fixed fields,
+  short address blocks and the size cap at both edges; split delivery asks for more at every cut; HTTP and TLS bytes
+  stay `absent`.
+- **TLV and CRC32C:** the typed helpers, SSL with sub-TLVs and each client flag bit, bounds checked at parse time,
+  CRC32C good, bad and malformed (including a TLV after the CRC TLV), `uniqueId` at 128 and 129 bytes.
+- **`read`:** the header consumed and the rest left in place, `absent` leaving every byte, untrusted peers and the
+  empty list, an untrusted peer's partial signature prefix, an IPv4-mapped peer against IPv4 and IPv6-written
+  prefixes, one-byte chunks and truncation, buffers too small and of exactly the header size, no byte asked for
+  beyond the decision.
+- **Writers:** exact text and bytes, refusals (family mismatch, unix paths over 108 bytes or with a NUL, malformed TLV
+  area, a CRC TLV already present), the 65535 / 65536 payload edge, and round trips for every family, command and
+  TLV area with and without CRC.
+- **No-panic sweep** (`src/tests.zig`, safety checks on): 20,000 hostile inputs through every `pub` entry point.
+- **Fuzz:** the harness feeds random bytes and damaged or untouched genuine headers from the writer; checks that
+  `consumed` is within the input and re-parsing it gives the same result, that every shorter prefix of an accepted
+  header asks for more, and that `read` over a chunked, possibly failing transport agrees with `parse` and consumes
+  nothing on a non-header outcome. Reach counters in every test run.
+- **Interop oracle:** against go-proxyproto, driven live (Anchoring).
+- **Constant time:** n/a — the header is public data.
+- **Example:** `example/main.zig`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
+
+## What is deliberately not done
+
+- A connection wrapper: it belongs with the accept path of a server and would give this module an I/O dependency.
+- Accepting a header from an untrusted peer "but ignoring it": **never**; ignoring silently hides a misconfigured balancer, and an error is what a caller can act on.
+
+## Open
+
+- An interop run against HAProxy `send-proxy-v2` / `send-proxy-v2-ssl` itself has not been done (the oracle in Anchoring is a second implementation, go-proxyproto, not the specification's home).
+
+## Backlog / deferred
+
+- **Decoding the cloud-provider TLVs** (AWS VPCE id, Azure LinkID, GCP): the layouts are provider documentation, not the specification; the raw bytes are returned today (`aws`, `azure`, `gcp`).
 
 ## Anchoring
 
@@ -73,69 +116,17 @@ Test vectors in `src/tests.zig` are built by hand from the spec's byte layouts; 
 
 ### Interop oracle
 
-`tools/interop.zig` (the Zig driver) and `tools/go_oracle/` (Go, public API of go-proxyproto v0.16.0 only: `ParseUDPDatagram`, `Header.Format`, `TLVs`/`SetTLVs`, `HeaderProxyFromAddrs`, `tlvparse.SSL`; fetched, pinned by `go.sum`, not vendored; the CRC32C TLV, which go-proxyproto neither writes nor verifies, is computed and checked with the standard library's Castagnoli table). Both sides produce a canonical verdict line per input (version, command, family, addresses as raw bytes and ports, TLV list, consumed length) and the driver compares. Our v2 cap is set to Go's 4096-byte payload for the run (the default stays 536). Three kinds of case, a third each: **parse** (valid headers of every family with TLVs, CRC32C and trailing application data, hand-made v2 prefixes with random family and command bytes and lengths, v1 lines with hostile addresses and ports, then truncated, bit-flipped, replaced, inserted, deleted bytes and rewritten lengths), **zig-writes** (our writer's bytes, parsed by Go, must equal the description), **go-writes** (Go's bytes, parsed here, must equal the description and are compared byte for byte with our writer's), plus one SSL TLV case per header that carries one.
-
-**Run 2026-11-16** (go-proxyproto v0.16.0, go1.26.9, seed 20261116): 160 085 cases, 50 000 per direction and 10 085 SSL: **0 unexplained disagreements**. Agreement: 27 886 headers parsed identically, 2 778 absent, 15 488 refused, 6 830 incomplete (Go sees EOF there), 50 000 of our writes read back by Go as described, 40 922 of Go's writes byte-identical to ours. No defect in this module was found.
+`tools/interop.zig` (the Zig driver) and `tools/go_oracle/` (Go, public API of go-proxyproto v0.16.0 only: `ParseUDPDatagram`, `Header.Format`, `TLVs`/`SetTLVs`, `HeaderProxyFromAddrs`, `tlvparse.SSL`; fetched, pinned by `go.sum`, not vendored; the CRC32C TLV, which go-proxyproto neither writes nor verifies, is computed and checked with the standard library's Castagnoli table). Both sides produce a canonical verdict line per input (version, command, family, addresses as raw bytes and ports, TLV list, consumed length) and the driver compares. Our `max_v2_len` is set to 16 + Go's 4096-byte payload cap (the same as our default) so both refuse the same headers. Three kinds of case, a third each: **parse** (valid headers of every family with TLVs, CRC32C and trailing application data, hand-made v2 prefixes with random family and command bytes and lengths, v1 lines with hostile addresses and ports, then truncated, bit-flipped, replaced, inserted, deleted bytes and rewritten lengths), **zig-writes** (our writer's bytes, parsed by Go, must equal the description), **go-writes** (Go's bytes, parsed here, must equal the description and are compared byte for byte with our writer's), plus one SSL TLV case per header that carries one.
 
 Documented differences (each a class the driver counts, anything else fails the run):
 
-- **v2 PROXY with UNSPEC (0x21 0x00)**: Go refuses (`UnsupportedAddressFamilyAndProtocol`); we accept, no addresses (the specification leaves it to the receiver, § Decisions). 62.
-- **v2 LOCAL with an undefined family byte**: Go refuses; we discard the whole block as the specification says a LOCAL receiver must. 600.
-- **Malformed TLV area**: Go's `Read` accepts, `TLVs()` fails later; we refuse at parse so every typed helper reads a checked area. 1 364.
-- **CRC32C**: Go never verifies it. Where our `BadChecksum` (587) or `Malformed` for a duplicate / non-4-byte CRC TLV (19) fires, the oracle's own check with `hash/crc32` agrees.
-- **`PROXY` followed by a byte other than a space**: Go commits to v1 and errors; we say absent (the bytes are not a header and stay for the real protocol). 388.
-- **Unix path over 108 bytes or with a NUL in the writer**: Go truncates silently / writes a path no parser can read back; we refuse with `InvalidHeader`. 8 425.
-- **`HeaderProxyFromAddrs`** labels a v4-mapped IPv6 pair TCP4/UDP4 whatever the caller asked (Go-side quirk); the oracle builds the header directly then, and the bytes still match. 653.
-- **SSL TLV content**: `tlvparse.SSL` also validates strings (ASCII version and cipher, UTF-8 CN, version present when the SSL flag is set); we decode the structure and leave the content to the caller. 4 083.
+- **v2 PROXY with UNSPEC (0x21 0x00)**: Go refuses (`UnsupportedAddressFamilyAndProtocol`); we accept, no addresses (the specification leaves it to the receiver, § Decisions).
+- **v2 LOCAL with an undefined family byte**: Go refuses; we discard the whole block as the specification says a LOCAL receiver must.
+- **Malformed TLV area**: Go's `Read` accepts, `TLVs()` fails later; we refuse at parse so every typed helper reads a checked area.
+- **CRC32C**: Go never verifies it. Where our `BadChecksum` or `Malformed` for a duplicate / non-4-byte CRC TLV fires, the oracle's own check with `hash/crc32` agrees.
+- **`PROXY` followed by a byte other than a space**: Go commits to v1 and errors; we say absent (the bytes are not a header and stay for the real protocol).
+- **Unix path over 108 bytes or with a NUL in the writer**: Go truncates silently / writes a path no parser can read back; we refuse with `InvalidHeader`.
+- **`HeaderProxyFromAddrs`** labels a v4-mapped IPv6 pair TCP4/UDP4 whatever the caller asked (Go-side quirk); the oracle builds the header directly then, and the bytes still match.
+- **SSL TLV content**: `tlvparse.SSL` also validates strings (ASCII version and cipher, UTF-8 CN, version present when the SSL flag is set); we decode the structure and leave the content to the caller.
 
 Re-run: `go build` the oracle into `.zig-cache/pp-oracle/gooracle` (see `tools/go_oracle/README.md`), then `zig build interop-proxyproto -- --cases 150000 --seed 20261116`.
-
-**Audit 2026-11-15 (mutation, whole module).** 224 schemata mutants over `src/root.zig`, ReleaseSafe, one
-build, each mutant under `setsid -w timeout` and `ulimit -v` (the coverage-guided `testing.fuzz` entry
-point is skipped in the mutation copy: outside the build runner it never returns; the deterministic
-driver and the 600-seed harness stay in): the TLV iterator and `findTlv`, every typed accessor's TLV
-type, `Ssl.parse` and its flag bits, `parseOpts`' prefix and signature windows, `parsePort`, `parseV1`
-(limit, CRLF, protocol, field counts, address and port order, `UNKNOWN`), `checkTlvs`, `parseV2` (version
-and command, length and cap, every family code and block size, the CRC span and comparison, the source
-and destination offsets, unix paths), `read` (want arithmetic, buffer bounds, trust order, EOF and
-`Truncated`, the re-parse), `isTrusted`, and the writers (family checks, address and port order, block
-sizes, unix guards and padding, payload cap, the CRC TLV). Constants (`tlv_type`, signature, limits)
-are comptime values a runtime switch cannot reach; the tests pin them with hand-built wire bytes.
-First run: 197 killed (7 by a hang), 27 survived. Each survivor got a test or an argued equivalent;
-new tests: a CRC TLV that is not 4 bytes, each `Ssl` flag bit, the neighbours of `'0'` and `'9'` in a
-port, a bare LF line, missing v1 fields and the `UNKNOWN` version, a command above 1 with low bits
-clear, a CRC over a TLV following the CRC TLV, an IPv4-mapped peer against an IPv6-written prefix,
-`opts.max_v2_len`, buffers of exactly the header size, a stream that fails right after the header or
-after one non-header byte (no byte asked for beyond the decision), unix writer guards (missing and
-over-long addresses) and the 65535 / 65536 payload edge. Rerun: 23 killed. 220/224. EQUIVALENT, 4:
-`lf <= 7` against `lf < 7` (a line of `PROXY ` plus CRLF has an empty protocol and is Malformed
-either way); the first `split` element of the v1 line is never absent; the two arms after the
-re-parse in `read` (the same pure parse of the same bytes cannot change its answer).
-
-**Audit 2026-11-15 (review-fix delta).** 12 schemata mutants over the two review fixes in
-`src/root.zig`: the untrusted prefix handling in `read` (the buffer-size boundary `>` against `>=`, the
-trust test dropped, the `required` choice flipped, the error kind, the arm taken, and the `Truncated`
-rule's length and trust clauses and error kind) and the NUL check of `writeV2` for unix paths (the
-source and the destination clause each dropped, the error kind). ReleaseSafe, one build, the
-coverage-guided fuzz test skipped in the copy. All 12 killed by the tests the fix commit already
-carried; no new test, 0 equivalent.
-
-## What is deliberately not done
-
-- A connection wrapper: **not now**; it belongs with the accept path of a server and would give this module an I/O dependency.
-- Decoding the cloud-provider TLVs (AWS VPCE id, Azure LinkID, GCP): **not now**; the layouts are provider documentation, not the specification.
-- Accepting a header from an untrusted peer "but ignoring it": **never**; ignoring silently hides a misconfigured balancer, and an error is what a caller can act on.
-
-**Review 2026-11-16 (independent, read-only).** No HIGH, no input-reachable panic; the eight documented differences
-against go-proxyproto judged defensible against the specification. MED: the 536-byte default cap refused legitimate
-TLV-heavy headers (now 16 + 4096); the writer could produce headers the default reader refuses (documented, and the
-gap is now 65535 vs 4112 instead of vs 536). LOW: LOCAL/UNSPEC blocks discarded unchecked (documented), UNIQUE_ID
-over 128 bytes (refused by `uniqueId`), no read-time bound (documented), `writeV2` TLV area raw (documented); the
-`required = false` default and the newer SSL sub-TLV codes 0x26/0x27 (reachable through `tlv`) stay as they are.
-Delta mutation over the fix: the `uniqueId` bound dropped and `>` → `>=`, both killed by "uniqueId: the specification's
-128 bytes pass, 129 are refused" (run by hand, the mutant applied to the source and reverted); the new default cap is
-pinned at both edges by "v2: size cap, default 16 + 4096".
-
-## Open
-
-- An interop run against HAProxy `send-proxy-v2` / `send-proxy-v2-ssl` itself has not been done (the oracle above is a second implementation, go-proxyproto, not the specification's home).
