@@ -119,6 +119,12 @@ pub const CoverParams = struct {
     /// d-mer size (1 ≤ d ≤ k); 8 as the `zstd` CLI's default (libzstd's
     /// optimizer tries 6 and 8).
     d: u32 = 8,
+    /// Opt-in ceiling on `d`: 0 (the default, as in libzstd) means none,
+    /// else a `d` above it is `error.ParameterOutOfBound`. The segment sort
+    /// compares d-mers with a `d`-byte memcmp, so a `d` near the samples'
+    /// total costs O(T·d); a caller training on untrusted samples sets this
+    /// (libzstd's documented reasonable range for `d` is 6..16).
+    max_d: u32 = 0,
     /// `zParams.compressionLevel`: the level finalization measures the
     /// entropy tables with; 0 = 3.
     level: i32 = 0,
@@ -633,7 +639,7 @@ pub fn estimateCoverMemory(total_samples_size: u64, nb_samples: usize, params: C
 /// left as it was). Checks in libzstd's order, then the memory ceiling.
 pub fn coverContentInto(gpa: Allocator, dict: []u8, samples: Samples, params: CoverParams) Error!usize {
     const n = params.notify;
-    if (!checkCoverParameters(params.k, params.d, 1.0, dict.len)) {
+    if (!checkCoverParameters(params.k, params.d, 1.0, dict.len) or (params.max_d != 0 and params.d > params.max_d)) {
         n.at(1, "Cover parameters incorrect\n", .{});
         return error.ParameterOutOfBound;
     }
@@ -939,6 +945,8 @@ pub fn fastCoverContent(gpa: Allocator, samples: Samples, capacity: usize, param
 pub const OptimizeParams = struct {
     k: u32 = 0,
     d: u32 = 0,
+    /// Opt-in ceiling on `d`; see `CoverParams.max_d`.
+    max_d: u32 = 0,
     steps: u32 = 0,
     split_point: f64 = 0,
     /// fastCover only.
@@ -1009,6 +1017,7 @@ pub const OptimizeGrid = struct {
         if (g.split_point <= 0 or g.split_point > 1) return error.ParameterOutOfBound;
         if (trainer == .fast_cover and (g.accel == 0 or g.accel > fastcover_max_accel)) return error.ParameterOutOfBound;
         if (g.k_min < g.d_max or g.k_max < g.k_min) return error.ParameterOutOfBound;
+        if (p.max_d != 0 and g.d_max > p.max_d) return error.ParameterOutOfBound;
         if (nb_samples == 0) return error.SrcSizeWrong;
         if (capacity < dict_size_min) return error.DstSizeTooSmall;
         g.k_step_size = @max((g.k_max - g.k_min) / g.steps, 1);
@@ -2022,6 +2031,11 @@ test "refusals: libzstd's, and sizes past the buffer" {
     // parameter checks come first
     try testing.expectError(error.ParameterOutOfBound, coverContentInto(gpa, dict[0..10], none, .{ .k = 50, .d = 6 }));
     try testing.expectError(error.DstSizeTooSmall, coverContentInto(gpa, dict[0..100], s, .{ .k = 50, .d = 6 }));
+    // the opt-in ceiling on d: refused above it, accepted at it, unlimited at 0
+    try testing.expectError(error.ParameterOutOfBound, coverContentInto(gpa, &dict, s, .{ .k = 50, .d = 12, .max_d = 11 }));
+    try testing.expectError(error.ParameterOutOfBound, OptimizeGrid.init(.cover, .{ .k = 100, .d = 12, .max_d = 11 }, 100, 4096));
+    _ = try OptimizeGrid.init(.cover, .{ .k = 100, .d = 12, .max_d = 12 }, 100, 4096);
+    _ = try OptimizeGrid.init(.cover, .{ .k = 100, .d = 12 }, 100, 4096);
     // a split point out of (0, 1] at the context level
     try testing.expectError(error.ParameterOutOfBound, CoverContext.init(gpa, s, 8, 0, default_memory_limit));
     try testing.expectError(error.ParameterOutOfBound, FastCoverContext.init(gpa, s, 8, 1.5, 20, accel_table[1], default_memory_limit));
