@@ -15,10 +15,9 @@
 //! canary below, never silently dropped):
 //!
 //!   (The suite's STRICT_LEVEL >= 2 tracestate grammar vectors -- illegal
-//!   key/value characters, the 256-char key cap, the 32-member cap -- were
-//!   excluded here until, while this module only guarded the
-//!   whole value's byte class. `TraceState.parse` enforces the member
-//!   grammar now, and they are asserted like the rest.)
+//!   key/value characters, the 256-char key cap, the 32-member cap -- are
+//!   asserted like the rest: `TraceState.parse` enforces the member
+//!   grammar.)
 //!   - session/connection-repetition tests (`AdvancedTest`): these assert
 //!     properties of a STATEFUL vendor HTTP service handling several
 //!     round trips (same trace-id across callbacks, distinct parent-ids
