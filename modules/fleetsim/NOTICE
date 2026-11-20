@@ -15,7 +15,7 @@ repo's `netsim` (whose own provenance note records the TigerBeetle VOPR
 methodology reference).
 
 The device-behavior envelope follows what SCADA device simulators such as
-ModbusPal (**LGPL-3.0**) and Kepware's simulation driver expose in their PUBLIC
+ModbusPal (**GPL-2.0**) and Kepware's simulation driver expose in their PUBLIC
 DOCUMENTATION — observable behavior only, no source consulted or copied.
 
 `src/master_goldens.zig` — frozen conversations with third-party masters

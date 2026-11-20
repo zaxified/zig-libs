@@ -6,7 +6,7 @@
 
 **Scope:** parity — RFC 9474 (RSABSSA, all four variants) as implemented by jedisct1's blind-rsa-signatures and CIRCL `blindrsa` (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-16 · mutation 2026-11-17 (90/108, 18 eq) · src 8a3e7c65bc0952db
+**Audit:** review 2026-09-16 · mutation 2026-11-17 (90/108, 18 eq) · src 52519fdef13b254d
 
 **Hardening:** fuzz 2026-10-07 (20,000 runs clean, BLINDRSA_FUZZ, forgery check) · ct 2026-11-13 (ctgrind: blind 3, sign 4 in-file contexts, all accept/reject verdicts) · panic 2026-11-13 (sweep of every pub entry point: `blindSign` with a `pk` that is not `sk`'s public half is `SigningFailure` in every build mode, no longer a debug assert; `blind`'s sampling of `r` makes at most 128 draws and then reports `InvalidBlindingFactor`, so a generator that only yields zeros no longer hangs it; the rsa-side blinding redraw in `blindSign` is bounded too: `rsa` reports `EntropyFailure` after 128 draws)
 

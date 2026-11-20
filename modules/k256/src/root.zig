@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! k256 — an asm-accelerated pure-Zig secp256k1, the fast alternative to
+//! k256 — a pure-Zig secp256k1, the fast alternative to
 //! `std.crypto.ecc.Secp256k1`.
 //!
 //! std's secp256k1 is portable pure-Zig (fiat-crypto Montgomery field, no asm),
@@ -58,11 +58,11 @@ pub const field_asm_active = field.field_asm_active;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "asm-accelerated secp256k1 — Solinas field + GLV verify, bit-exact vs `std.crypto.ecc.Secp256k1`/BIP340. GLV is vartime/public-only, not for secrets.",
+    .doc = "secp256k1 — Solinas field + GLV verify, bit-exact vs `std.crypto.ecc.Secp256k1`/BIP340. GLV is vartime/public-only, not for secrets.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
-    .platform_note = "amd64 asm + portable fallback",
+    .platform_note = "any (portable limb field; an amd64 asm core exists but is not dispatched)",
     .targets = .{.linux64},
     .platform = .any, // portable Solinas everywhere; amd64 MULX/ADX is an accel path
     .role = .util, // pure computation — no I/O

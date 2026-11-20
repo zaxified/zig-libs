@@ -32,10 +32,11 @@
 //! an SRM-flagged LSP every `minimumLSPTransmissionInterval` until that happens;
 //! it clears only SSN (as it produces each PSNP). See `SPEC.md`.
 //!
-//! Provenance: pure spec-only clean-room from ISO/IEC 10589 §7.3.15/.16 (a public
-//! spec — merger doctrine); no third-party implementation source consulted or
-//! ported. Like the sibling `isis` codec + `isis-adj` FSM it needs no /NOTICE
-//! entry (its ISO clause cites live in `SPEC.md`).
+//! Provenance: clean-room from ISO/IEC 10589 §7.3.15/.16 and RFC 5304/5310 (public
+//! specs). Design references: holo-isis (MIT) `packet/pdu.rs`, read for the SNP
+//! authentication behaviour only; FRR isisd (GPL-2.0-or-later) documentation only.
+//! No third-party code ported. Like the sibling `isis` codec + `isis-adj` FSM it
+//! needs no /NOTICE entry (its ISO clause cites live in `SPEC.md`).
 
 const std = @import("std");
 const isis = @import("isis");

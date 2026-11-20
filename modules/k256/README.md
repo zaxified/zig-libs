@@ -1,4 +1,4 @@
-# k256 — asm-accelerated pure-Zig secp256k1
+# k256 — pure-Zig secp256k1
 
 `k256` is a performance-specialized secp256k1 — the fast alternative to
 `std.crypto.ecc.Secp256k1`. std's curve is portable pure-Zig (a fiat-crypto

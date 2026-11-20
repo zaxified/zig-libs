@@ -6,7 +6,7 @@
 
 **Scope:** mvp — FRR isisd flooding (10.7) and holo-isis flooding (v0.9.0), ISO 10589 §7.3.15/.16 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-03 · mutation 2026-11-19 (148/163, 15 eq) · src 6d1438c6c026fa43
+**Audit:** review 2026-09-03 · mutation 2026-11-19 (148/163, 15 eq) · src af21bfdbf6dffad7
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — LSP flooding (keyword review, 2026-10-07)
 
@@ -313,9 +313,10 @@ cadence) have no wire representation, so no external oracle can grade them (see
 - **Fuzz, ct:** none (no fuzz obligation under check-fuzz; constant-time n/a for LSP flooding).
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
-Provenance: pure spec-only clean-room from ISO/IEC 10589 §7.3.15/.16 (a public
-spec — merger doctrine); no third-party implementation source consulted or ported
-(the README's `Provenance:` line). Like the sibling `isis` codec + `isis-adj` FSM it has no NOTICE.
+Provenance: clean-room from ISO/IEC 10589 §7.3.15/.16 and RFC 5304/5310 (public
+specs — merger doctrine). Design references: holo-isis (MIT) `packet/pdu.rs`, read for
+the SNP authentication behaviour only; FRR isisd (GPL-2.0-or-later) documentation only.
+No third-party code ported (the README's `Provenance:` line). Like the sibling `isis` codec + `isis-adj` FSM it has no NOTICE.
 
 ## What is deliberately not done
 

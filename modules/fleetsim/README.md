@@ -342,7 +342,7 @@ the scale test, the limits and the open items are in [SPEC.md](./SPEC.md).
 Provenance: original work of the zig-libs authors (MIT), composed over
 [`netsim`](../netsim) — which carries its own record for the TigerBeetle VOPR
 methodology reference. The device-behavior envelope follows what SCADA device
-simulators (ModbusPal, LGPL-3.0; Kepware's simulation driver) expose in their
+simulators (ModbusPal, GPL-2.0; Kepware's simulation driver) expose in their
 public documentation — observable behavior only, no source consulted. The
 `src/master_goldens.zig` captures are conversations with seven third-party
 masters run only inside the disposable VM guest — pymodbus (BSD-3-Clause),

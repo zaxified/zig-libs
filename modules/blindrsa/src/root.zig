@@ -97,7 +97,7 @@ pub const meta = .{
     .platform = .any,
     .role = .both, // both a .client role (blind/finalize) and a .server role (blindSign) live in one module — CONVENTIONS.md's split rule only forces separate modules when they are separate DELIVERABLES, which RSABSSA's tight client/server coupling (shared Context/salt/hash conventions) argues against
     .concurrency = .reentrant, // no shared/global state; everything here is plain value types + explicit buffers
-    .model_after = "RFC 9474 (RSA Blind Signatures / RSABSSA), layered on the sibling `rsa` module's RFC 8017 RSA primitives and RSASSA-PSS verify; jedisct1/zig-blind-rsa-signatures (MIT) consulted as a structural design reference for the Blind/BlindSign/Finalize/Verify API shape — see NOTICE",
+    .model_after = "RFC 9474 (RSA Blind Signatures / RSABSSA), layered on the sibling `rsa` module's RFC 8017 RSA primitives and RSASSA-PSS verify; jedisct1/zig-blind-rsa-signatures (Apache-2.0) consulted as a structural design reference for the Blind/BlindSign/Finalize/Verify API shape — see NOTICE",
     .deps = .{"rsa"},
 };
 

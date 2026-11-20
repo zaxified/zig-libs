@@ -18,7 +18,7 @@ and the next-wakeup deadline seam. LAN/DIS-driven flooding, mesh-groups, and the
 actual socket I/O are deliberately deferred — see `SPEC.md`.
 
 Model after: **ISO/IEC 10589 §7.3.15** (flooding / SNP generation) + **§7.3.16.3/.4**
-(LSP transmission pacing) — pure spec-only clean-room. **Deps:** `isis` (PDU codecs, authentication), `isis-lsdb`
+(LSP transmission pacing) — clean-room from the spec (design references in Provenance). **Deps:** `isis` (PDU codecs, authentication), `isis-lsdb`
 (the SRM/SSN flags and stored LSPs). **Concurrency:** single owner.
 
 ## What's in it
@@ -142,7 +142,8 @@ floods an LSP and acks it back through both schedulers and the `isis` wire codec
 and `std.testing.allocator` leak checks. Green in Debug and ReleaseFast;
 `zig fmt` clean.
 
-Provenance: pure spec-only clean-room from ISO/IEC 10589 §7.3.15/.16 (a public
-spec); no third-party implementation consulted or ported. Like `isis`/`isis-adj`
-it carries no `/NOTICE` entry. License: MIT.
+Provenance: clean-room from ISO/IEC 10589 §7.3.15/.16 and RFC 5304/5310 (public
+specs). Design references: holo-isis (MIT) `packet/pdu.rs`, read for the SNP
+authentication behaviour only; FRR isisd (GPL-2.0-or-later) documentation only. No
+third-party code ported. Like `isis`/`isis-adj` it carries no `/NOTICE` entry. License: MIT.
  DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from the spec clauses above and cross-checked against a third-party dissector's reading. They are this module's own construction, not bytes taken from anyone's corpus.
