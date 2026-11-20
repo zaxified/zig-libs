@@ -6,7 +6,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** `burn.WipeAllocator` is replaced by the shared `wipealloc` module's `WipingAllocator` (same code; new dependency `wipealloc`); the stack-burn helpers in `burn.zig` are unchanged. The moved code has its own whole-module mutation run (8/8 killed).
-- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (13/14 killed + 1 eq). New test: `sealSecretKey` exactly at the ops/mem caps is accepted (stopped at scrypt's first allocation by a failing allocator).
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GP). `openSecretKey` took the scrypt cost (`ops_limit`, `mem_limit`) from the key file uncapped — a hostile file cost hours of CPU or a huge allocation before the password was checked. New `SecretKeyLimits` (defaults: libsodium's `*_SENSITIVE`, which is what minisign writes) and `openSecretKeyLimited`; `openSecretKey` uses the defaults; over the cap → `error.OpsLimitTooLarge` (new) / `error.MemLimitTooLarge`, checked before any work. `sealSecretKey` rejects the same over-cap values (new `SealSecretKeyError`) so it never writes a key `openSecretKey` refuses, and `mem_limit < 1024` is `error.WeakParameters` (was a std assert). An unencrypted secret key whose public half does not match its seed is `error.NonCanonical` in every build mode (std checks it only with runtime safety). Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
@@ -49,10 +48,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   - Secret-touching bodies run one frame down and the stack they dirtied is zeroed (`burn.zig`).
     Not covered: the `std.Io.Writer` buffer that `writeSecretKeyFile` writes into, and the
     caller's own copies. `example/` and `tools/bench.zig` migrated; no other module uses minisign.
-- **2026-10-07** — **NO CONSUMER-VISIBLE CHANGE:** the `testing.fuzz` harness
-  bodies are now generic over their source and run by testkit's deterministic
-  driver `MINISIGN_FUZZ` (new `src/fuzz_test.zig`, a seed loop with reach checks in
-  every test run); test code only. New `tools/bench.zig` (`zig build bench-minisign`) against the minisign CLI.
 - **2026-10-04** — Tests: mutation schemata run (43 mutants, 42 killed, 1 equivalent).
   Four new tests: malformed / overlong / out-of-range / C1-control UTF-8 refused by
   `isPrintableComment` (U+009B is the 8-bit CSI), a CRLF signature file verifies, the

@@ -20,6 +20,9 @@ format and design notes.
 | `src/root.zig` | Raw struct codecs, text-file parse/write, `KeyPair`, sign/verify, scrypt seal/open |
 | `src/kat_vectors.zig` | Real `minisign`-generated fixtures (keys + signatures), embedded |
 | `src/kat_test.zig` | Byte-exact KAT assertions + negative tests |
+| `src/blake2b.zig` | `Blake2b512` for streaming digests: AVX2 row-vectorized on x86-64, std's elsewhere, byte-identical |
+| `src/burn.zig` | Stack burn for the secret entry points |
+| `src/sweep_test.zig`, `fuzz_test.zig`, `stackprobe_test.zig`, `stackprobe2_test.zig`, `ctgrind_harness.zig` | No-panic sweep, fuzz driver plumbing, dead-stack probes, ctgrind program |
 
 ## Import
 
@@ -98,6 +101,8 @@ const parsed = try minisign.parseSignatureFile(sig_file_text);
 try minisign.verifyFile(gpa, pk.key, message, parsed); // error.SignatureVerificationFailed / .KeyIdMismatch on failure
 ```
 
+`openSecretKey` caps the scrypt cost a key file may ask for (`SecretKeyLimits`, libsodium's `*_SENSITIVE` by default; `openSecretKeyLimited` takes others): a hostile file is refused with `error.OpsLimitTooLarge` / `error.MemLimitTooLarge` before any work.
+
 `example/main.zig` is a full `minisign-demo` command-line tool (`-G`/`-S`/`-V`/`-R`/`-C`,
 real file I/O, streaming `-S`/`-V` in the default prehashed mode) built entirely on this
 public API — the module itself stays buffer-in/writer-out and does no filesystem I/O
@@ -110,6 +115,8 @@ the real `minisign` binary; see the module CHANGELOG.
 zig build test-minisign --summary all
 zig build test-minisign -Doptimize=ReleaseFast --summary all
 ```
+
+`meta.deps = .{ "entropy", "b64ct", "wipealloc" }`.
 
 Provenance: clean-room from the minisign wire-format facts in
 jedisct1/minisign's `minisign.h`/`minisign.c` (ISC License), cross-checked
