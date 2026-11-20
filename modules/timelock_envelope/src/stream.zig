@@ -305,7 +305,7 @@ pub fn Stream(comptime Kem: type) type {
 const testing = std.testing;
 
 test "deriveStreamKey matches an independent Python HKDF recomputation" {
-    // Python hmac/hashlib, 2026-10-06: HKDF-SHA256(salt = stream_kdf_salt,
+    // Python hmac/hashlib: HKDF-SHA256(salt = stream_kdf_salt,
     // ikm = 0xA1^16 || 0xB2^32, info = "TLE2-stream-key" || 0x02 || 0x10 ||
     // be64(42) || 0xC3^32), 32 octets.
     const k = deriveStreamKeyV(@as([16]u8, @splat(0xA1)), @as([32]u8, @splat(0xB2)), 16, 42, @as([32]u8, @splat(0xC3)));

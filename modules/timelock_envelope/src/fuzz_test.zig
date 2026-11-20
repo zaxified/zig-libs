@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for timelock_envelope (added 2026-10-10): `TLE_FUZZ=<runs>[,<first seed>]`
+//! Deterministic fuzz driver for timelock_envelope: `TLE_FUZZ=<runs>[,<first seed>]`
 //! (testkit's driver; `_ONLY` selects a harness by name). Harness names:
 //! `tle-open` and `tle-stream`. Both open a genuine, once-built (fixed
 //! randomness, real drand quicknet material from `security_test.zig`)

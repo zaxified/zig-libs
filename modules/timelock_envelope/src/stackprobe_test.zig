@@ -231,7 +231,7 @@ inline fn scrubCalleeSaved() void {
 }
 
 /// `inline`: as its own frame it ran the call deeper than the region top
-/// `runProbe` computed (acme, 2026-10-08).
+/// `runProbe` computed (acme).
 inline fn measure(call: *const fn () void, n: *const Needles) Hits {
     scrubCalleeSaved();
     paint();
@@ -284,7 +284,6 @@ fn skipUnlessOptimized() !void {
 }
 
 // ── API adapter: the only place that names the shapes under test ────────────
-// (BEFORE the 2026-10-09 fix these took and returned the secrets by value.)
 
 fn apiGenerate(out: *Env.SealRandomness, io: std.Io) void {
     out.generate(io);

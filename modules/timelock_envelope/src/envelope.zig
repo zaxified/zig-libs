@@ -553,7 +553,7 @@ test "deriveKeys: round, suite and version all separate the key" {
 }
 
 test "deriveKeys matches an independent Python HKDF recomputation (salt, version byte, key/nonce split)" {
-    // Python hmac/hashlib, 2026-10-05: HKDF-SHA256(salt = kdf_salt,
+    // Python hmac/hashlib: HKDF-SHA256(salt = kdf_salt,
     // ikm = 0xA1^16 || 0xB2^32, info = label || 0x01 || 0x10 || be64(42)),
     // 44 octets = key (32) || nonce (12). The mutation run of that date
     // changed the salt, the version byte and the nonce offset, and the

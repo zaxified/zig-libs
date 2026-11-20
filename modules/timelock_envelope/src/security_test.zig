@@ -44,7 +44,7 @@ fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {
 //
 // Source: `https://api.drand.sh/v2/beacons/quicknet/info` (P_pub) and
 // `.../52db9ba7.../public/1000` (round-1000 signature), fetched
-// 2026-07-16 for tlock's KAT harness. Copied verbatim here so this
+// For tlock's KAT harness. Copied verbatim here so this
 // module's timelock round-trip uses real, pairing-verified beacon
 // material rather than a live fetch.
 
@@ -378,7 +378,7 @@ test "tamper: truncating the envelope is rejected, never a panic" {
 }
 
 test "tamper: an undecodable time-lock point is MalformedTimeLock, not TimeGateClosed" {
-    // Mutation run 2026-10-05: the generic tamper test above accepts any
+    // Mutation run: the generic tamper test above accepts any
     // error, so mapping this case to TimeGateClosed survived.
     const kp = recipientKeypair(0x0E);
     const base = try Env.seal(testing.allocator, plaintext, &kp.ek, quicknetPubkey(), seal_round, &fixedRandomness());
