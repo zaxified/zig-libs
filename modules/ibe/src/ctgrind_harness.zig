@@ -4,10 +4,8 @@
 //! `ibe.zig`'s `fp12Pow` doc comment already carries ("no secret-dependent
 //! branch and no secret-dependent memory access", citing audit finding "ibe
 //! F4"), as an actual committed program instead of an unmeasured paragraph.
-//! Run it through `../../../scripts/checks/ctgrind.sh ibe` (once the coordinator
-//! adds the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries this file's doc
-//! comment suggests below — that script REFUSES an unlisted module rather
-//! than silently skipping it). Until then, by hand:
+//! Run it through `../../../scripts/checks/ctgrind.sh ibe` (its expected rows
+//! are in `scripts/checks/ctgrind-expected.tsv`), or by hand:
 //!
 //!   zig build ctgrind -Dctgrind-module=ibe -Dctgrind-valgrind=true  -Doptimize=ReleaseFast
 //!   zig build ctgrind -Dctgrind-module=ibe -Dctgrind-valgrind=false -Doptimize=ReleaseFast
@@ -16,8 +14,8 @@
 //!
 //! NOT wired into `zig build test-ibe` — memcheck's context count is
 //! valgrind's own verdict, not something a Zig test can assert on. `zig
-//! build check-ctgrind` compiles it (a rot guard, no valgrind) once
-//! `build.zig`'s harness discovery picks this file up by its path existing
+//! build check-ctgrind` compiles it (a rot guard, no valgrind): the
+//! harness is discovered by its path existing
 //! (automatic — no `build.zig` edit needed, see that file's
 //! `ctgrindHarnesses`).
 //!
@@ -289,41 +287,3 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
     }
 }
-
-// ── suggested scripts/checks/ctgrind.sh config (coordinator: paste in, do not
-// generate mechanically — every existing entry carries hand-written
-// reasoning in its own comment; this follows the same shape) ─────────────
-//
-// declare -A TARGETS=(
-//     [ibe]="extract decrypt fp12pow"
-// )
-// declare -A MODES=(
-//     [ibe]="ReleaseFast"
-// )
-// declare -A PATTERN=(
-//     # `extract`'s own body is one line delegating straight into
-//     # `bls12_381`'s G1 ladder -- the SAME files `bls12_381/g1_scalarmul`
-//     # already measures. `ibe.zig` is listed anyway so a future change to
-//     # `extract` itself (not just the delegate) is not silently excluded.
-//     [ibe/extract]='ibe[.]zig|g1[.]zig|fp[.]zig|scalar[.]zig'
-//     # `decrypt`'s own pairing + H2/H3/H4 tag-hashing + FO compare
-//     # (`ibe.zig`, `ciphersuite.zig`) plus the full inherited pairing
-//     # internals (`bls12_381`) and std's SHA-256/512 (both live in
-//     # `sha2.zig`). The FO check's own compare is a KNOWN, documented
-//     # non-constant-time byte compare on a value whose outcome is public
-//     # by design (`ibe.zig`: "The check's outcome (accept/reject) is
-//     # public, so a non-constant-time byte compare is fine here") -- an
-//     # expected non-zero, not a defect, if it shows up attributed to
-//     # `ibe.zig`.
-//     [ibe/decrypt]='ibe[.]zig|ciphersuite[.]zig|pairing[.]zig|fp[.]zig|fp2[.]zig|fp6[.]zig|fp12[.]zig|g1[.]zig|g2[.]zig|scalar[.]zig|sha2[.]zig'
-//     # `fp12Pow`/`fp12CtSelect`/`fp6CtSelect` are all private helpers in
-//     # `ibe.zig` itself -- the finding this target exists for. `Fp12.mul`/
-//     # `.square`/`Fp2.ctSelect` bottom out in `bls12_381`'s tower
-//     # arithmetic.
-//     [ibe/fp12pow]='ibe[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig'
-// )
-// declare -A LABEL=(
-//     [ibe/extract]='ibe extract (msk -> bls12_381 G1)'
-//     [ibe/decrypt]='ibe decrypt (d_id -> pairing+hash+FO)'
-//     [ibe/fp12pow]='ibe fp12Pow (Gt windowed exponentiation, ibe F4)'
-// )
