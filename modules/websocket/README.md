@@ -123,12 +123,18 @@ behaviour only: which offer parameters it accepts (`accept.go` `acceptDeflate`),
 missing end-of-data as the end of a message (`read.go`). Its behaviour was matched where the RFC
 leaves room; no code was taken.
 
+## Not provided
+
+Automatic keepalive/ping scheduling (the caller's event loop owns the timer; `Conn.ping` sends), the transport (TLS/TCP are the caller's), extensions other than permessage-deflate, permessage-deflate's context-takeover mode and a Wasm target: `SPEC.md` *What is deliberately not done* and *Backlog / deferred* say why.
+
 ## Verification
 
-`zig build test-websocket` — 150 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
+`scripts/modtest websocket` (`zig build test-websocket`): the RFC 6455 §1.3
 handshake worked example and the §5.7 frame examples byte-exact (both parse and serialize),
-plus constructed Autobahn-style adversarial cases (unmasked-client/masked-server rejection,
+constructed Autobahn-style adversarial cases (unmasked-client/masked-server rejection,
 RSV/opcode/length-encoding/size-cap/fragmentation-sequencing/UTF-8 rejections, each with a
 positive control), every RFC 7692 §7.2.3 example, and deterministic fuzz harnesses over the
-extension grammar, `inflate` and a deflate `Connection`. See SPEC.md for the full security-rule
+handshake, the frame and close codecs, `Connection`, the extension grammar, `inflate`, a deflate
+`Connection` and `Conn`'s direct-payload path. `zig build interop-websocket` runs coder/websocket
+and gorilla/websocket as live peers in both directions. See SPEC.md for the full security-rule
 rationale and what's deliberately out of scope.

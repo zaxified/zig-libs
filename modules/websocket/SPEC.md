@@ -10,7 +10,6 @@
 
 **Audit:** review 2026-11-07 · mutation 2026-11-07 (400/425, 25 eq) · src da360c5502de81d6
 
-Audit detail: the 2026-11-01 review is a delta over `src/frame.zig` and `src/handshake.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
 
 **Hardening:** fuzz 2026-10-26 (200,000 runs per harness clean, WEBSOCKET_FUZZ, ReleaseSafe; new `conn-direct`: random frame streams through `Conn` with a 140-byte and a 4 KiB reader buffer must agree -- its first seeds found the size/UTF-8 check order depending on the chop, fixed; the deflate harnesses `extensions`, `inflate`, `deflate-connection` since 2026-10-11) · ct n/a — framing; mask key not secret (keyword review, 2026-10-07) · panic 2026-10-28 (independent sweep of every pub entry point: no peer-reachable panic; four caller-contract `assert`s made checked panics (errors since 2026-11-07: `Conn.InitError`, `Conn.WriteMessageError`, `enableDeflate`/`inflate` `BufferTooSmall`), `receiveFrame` of an RSV1 frame without deflate an error, u32 frame counters saturating)
 
@@ -20,7 +19,8 @@ Audit detail: the 2026-11-01 review is a delta over `src/frame.zig` and `src/han
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see this module's `NOTICE` and the README's `Provenance:` line (clean-room).
 
 ## Compared with
 
@@ -34,9 +34,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [karlseguin/websocket.zig](https://github.com/karlseguin/websocket.zig) | Zig | MIT | 522 | no release (push 2026-08-23) | Zig client **and** server with its own listener and per-connection handler; optional compression (its README option `compression`, disabled by default); README says it does **not** validate UTF-8 text ("expensive and most apps don't care"). Autobahn status not stated *(inferred)*. |
 | Zig `std.http.Server.WebSocket` | Zig | MIT | — | Zig 0.16.0 | Handshake detection (`upgradeRequested`, `respondWebSocket`) plus `readSmallMessage` / `writeMessage`; no fragmentation reassembly beyond small messages, no client, no extensions (checked in 0.16.0's `lib/std/http/Server.zig`). |
 | [denoland/fastwebsockets](https://github.com/denoland/fastwebsockets) — **fastest** | Rust | Apache-2.0 | 1.1k | v0.10.0 (crates.io; push 2026-07-31) | Deno's frame layer, async, SIMD UTF-8 (`simdutf8`). No permessage-deflate ("not supported yet"). Its reader does not check the masking direction or the minimal length encoding (read in `lib.rs` 2026-10-26). Measured here 2026-10-26 (`tools/rust_fast_bench`): the fastest reader of 64 KiB binary messages, 1.12× faster than this module there (1.19× before `fastmem` exported `memcpy`); slower on small, fragmented and every write row. |
-| [crossbario/autobahn-testsuite](https://github.com/crossbario/autobahn-testsuite) | Python | Apache-2.0 | 1.7k | push 2026-09-29 | Not a competitor: the conformance oracle. This module's SPEC records that the web-server consumer's Autobahn lane found the two UTF-8 timing defects fixed 2026-09-28. Source not read. |
+| [crossbario/autobahn-testsuite](https://github.com/crossbario/autobahn-testsuite) | Python | Apache-2.0 | 1.7k | push 2026-09-29 | Not a competitor: the conformance oracle. A consumer's Autobahn lane found the two UTF-8 timing defects (per fragment, and within one frame) that the design checks for (*Design & invariants*). Source not read. |
 
-**Where we are ahead:** strictness the Zig alternatives skip: incremental UTF-8 validation that fails at the fragment (and inside one frame across TCP chops) as gorilla and autobahn-python do, close-code validation per §7.4.1, duplicate-handshake-header refusal, an `Origin` allow-list with same-host default, a bound on fragment count, request-field injection checks on the client, every error mapped to a close code; RFC 6455 §1.3/§5.7 byte-exact vectors plus Go and Python oracles under `tools/`; allocation-free, transport-agnostic. **Where we are behind:** permessage-deflate only without context takeover (coder also offers the context-takeover mode, which compresses repetitive small messages better at 32 KiB of window per connection and direction); no keepalive scheduling (`Conn` gives `ping`, the timer is the caller's); no Wasm/browser target. **Closed 2026-10-11:** permessage-deflate (RFC 7692) and a ready read/write loop (`conn.Conn`) — the two gaps a coder/gorilla user noticed.
+**Where we are ahead:** strictness the Zig alternatives skip: incremental UTF-8 validation that fails at the fragment (and inside one frame across TCP chops) as gorilla and autobahn-python do, close-code validation per §7.4.1, duplicate-handshake-header refusal, an `Origin` allow-list with same-host default, a bound on fragment count, request-field injection checks on the client, every error mapped to a close code; RFC 6455 §1.3/§5.7 byte-exact vectors plus Go and Python oracles under `tools/`; allocation-free, transport-agnostic. **Where we are behind:** permessage-deflate only without context takeover (coder also offers the context-takeover mode, which compresses repetitive small messages better at 32 KiB of window per connection and direction); no keepalive scheduling (`Conn` gives `ping`, the timer is the caller's) and no Wasm/browser target (*What is deliberately not done*); the context-takeover mode is in *Backlog / deferred*. **Closed 2026-10-11:** permessage-deflate (RFC 7692) and a ready read/write loop (`conn.Conn`) — the two gaps a coder/gorilla user noticed.
 
 ## Design & invariants
 
@@ -54,7 +54,7 @@ string*, not its decoded bytes, per spec. Subprotocol negotiation (`Sec-WebSocke
 the first client-offered token (client preference order) present in the caller's allowed set,
 compared **byte for byte** (so the answer is always a spelling the client sent — RFC 6455 §4.1 has
 the client fail a subprotocol "not present in the client's handshake"; gorilla/websocket,
-python-websockets and browsers compare exactly; case-insensitive until 2026-10-04); absent that
+python-websockets and browsers compare exactly); absent that
 header or an empty allowed set, no subprotocol is negotiated. `verifyResponse` accepts only a
 subprotocol byte-identical to one it offered. Client side mirrors this:
 `generateKey` takes a caller-supplied `std.Random` (never `std.crypto.random` — this module has no
@@ -64,7 +64,7 @@ convention), and `verifyResponse` recomputes the expected accept value and rejec
 cache, proxy, or non-WebSocket-aware server that answered `101` without actually understanding the
 protocol.
 
-**`Origin` allow-list** (requested by the web-server consumer security review M6.2, 2026-09-28). RFC 6455 requires
+**`Origin` allow-list** (requested by a consumer security review). RFC 6455 requires
 every browser to send `Origin` on a WebSocket handshake (§1.3) but the base protocol enforces
 nothing about its value: unlike an ordinary cross-origin HTTP request, CORS never applies to a
 WebSocket upgrade, so a server that leans on ambient browser credentials (a session cookie, a TLS
@@ -81,7 +81,7 @@ where a custom function replaces the built-in same-origin check rather than laye
 no authority to compare and are rejected by the default. A mismatch, or a listed-but-non-matching
 origin, is `error.OriginNotAllowed` — a typical caller maps it to HTTP 403. A duplicated `Origin`
 header is `error.DuplicateHeader`, same as every other handshake-critical header this module
-checks (§ below): an intermediary that combined or picked the last of two `Origin` values would
+checks (*Threat model / Limits*): an intermediary that combined or picked the last of two `Origin` values would
 derive a different admit/deny decision than this parser's first-wins `head.header()` does. See
 `ServerAcceptOptions.origins`'s doc comment (`handshake.zig`) for the exact matching rule and its
 test suite for the case list (allowed/refused/absent Origin, same-host default, allow-list match,
@@ -94,10 +94,8 @@ possible outcomes: a decoded `Frame`, `.need_more` (the buffer doesn't yet hold 
 not an error, the normal "read more and retry" signal for a streaming transport), or a typed
 `FrameError`. `writeFrame` is the inverse, serializing to a `std.Io.Writer`. It returns
 `WriteError` — the writer's error, or `FragmentedControlFrame`/`ControlFrameTooLarge` for a
-control frame §5.5 forbids, refused before a byte is written (A1 F6, 2026-09-14: these were
-`std.debug.assert`s, so ReleaseFast wrote a 200-byte ping this module's own parser rejects, and
-Debug/ReleaseSafe panicked; `pongFor` feeds `writeFrame` a received payload, so "the caller builds
-`opts`" never made them programmer-only errors). Masking on the write
+control frame §5.5 forbids, refused before a byte is written (`pongFor` feeds `writeFrame` a received
+payload, so these are not programmer-only errors). Masking on the write
 side is never inferred — the caller passes `mask_key: ?[4]u8` explicitly (null = unmasked, a key =
 masked-with-that-key), which is also what makes the RFC §5.7 vectors byte-exact-reproducible in
 tests (the masking key in those vectors is fixed, not random).
@@ -113,11 +111,9 @@ one-frame message could walk past would not be a budget at all. Control frames (
 close) are dispatched before fragmentation state is even consulted, which is what makes
 interleaving them mid-fragmentation "just work" — no special-casing needed. UTF-8 validation
 (§5.6, required for `text`/`.continuation`-reassembled-as-text) is **incremental, checked per
-fragment as it arrives** (`IncrementalUtf8`, 2026-09-28 — found by the web-server consumer's Autobahn lane, 2026-09-26;
-before this date it ran once, against the reassembled whole, only once `FIN` arrived, which
-Autobahn|Testsuite scores §6.4.1-4 NON-STRICT: RFC 6455 §8.1 requires the failure, not its timing,
-but every other library checked — autobahn-python, gorilla, tungstenite — fails at the fragment
-that makes it certain). `IncrementalUtf8` carries the state of at most one partially-consumed
+fragment as it arrives** (`IncrementalUtf8`; a check run once against the reassembled whole, only once `FIN` arrived, is
+scored §6.4.1-4 NON-STRICT by Autobahn|Testsuite: RFC 6455 §8.1 requires the failure, not its timing,
+but autobahn-python, gorilla and tungstenite fail at the fragment that makes it certain). `IncrementalUtf8` carries the state of at most one partially-consumed
 multi-byte sequence (a code point split across fragments, which §5.4 explicitly permits, must not
 fail) across `Connection.receive` calls: each fragment's payload is fed to it as that fragment
 arrives, so a byte that can never become valid UTF-8 fails at the fragment it's in, and a message
@@ -130,13 +126,12 @@ is one implementation of "is this valid UTF-8", and `utf8ValidateSlice` survives
 `std.debug.assert` cross-check on the ACCEPT path (compiled out in ReleaseFast — never what actually
 enforces §5.6 there). Proven equivalent to `utf8ValidateSlice` by a test that runs both over the
 frozen Kuhn corpus (below) and 500 fixed-seed-random byte strings, at every possible fragment split
-point of each, rather than only the one hand-picked split ("A€B" cut mid-codepoint) this paragraph
-used to rely on as its sole proof that deferred validation doesn't false-positive on legitimate
-fragmentation — an attacker choosing where to split a message is not obliged to pick that split.
+point of each, rather than only one hand-picked split ("A€B" cut mid-codepoint): an attacker
+choosing where to split a message is not obliged to pick that split.
 
-**Within one frame, too** (2026-09-28, from the web-server consumer's Autobahn lane: §6.4.3-4 — one text frame
-delivered in TCP chops, invalid from an early chop — were still NON-STRICT after the per-fragment
-fix, because `receive` consumes whole frames only; autobahn-python and gorilla fail at the chop).
+**Within one frame, too** (Autobahn §6.4.3-4: one text frame delivered in TCP chops, invalid from
+an early chop, is NON-STRICT if `receive`, which consumes whole frames only, waits for the whole
+frame; autobahn-python and gorilla fail at the chop).
 When `parseFrame` says `.need_more` with the header complete and the frame is text (a new text
 frame, or a continuation of a text message), `receive` validates the payload bytes that did arrive
 before returning `.need_more` — starting from a fresh `IncrementalUtf8` for a text frame, or from
@@ -147,14 +142,14 @@ progress (bytes checked, validator state) is kept in `Connection.partial_text`, 
 frame's header bytes, so a caller retrying with a growing buffer — the `.need_more` contract —
 costs one pass over the payload, not one per retry; a retry whose header bytes differ starts over
 from byte 0. The partial state can only make `receive` fail **earlier**: once the frame is
-complete its whole payload is validated again from `text_utf8`, exactly as before, so nothing a
+complete its whole payload is validated again from `text_utf8`, so nothing a
 caller does with partial buffers can make an invalid message pass (cost: text frames that arrive in
 pieces are UTF-8-scanned twice). Frames that will fail anyway once complete — a text frame inside a
 fragmented message, a continuation with nothing to continue, data after close — are not checked
 early, so the error they fail with does not change. The header decode this needs is public as
 `frame.parseHeader` (`parseFrame` = `parseHeader` + "is the whole payload there" + unmask).
 
-**permessage-deflate (RFC 7692, 2026-10-11).** `deflate.zig`, one mode: no context takeover in
+**permessage-deflate (RFC 7692).** `deflate.zig`, one mode: no context takeover in
 either direction. The server's response always names both `*_no_context_takeover` parameters
 (§7.1.1.1/§7.1.1.2 let a server add them to any offer it accepts), the client's offer asks for
 both and refuses a response without `server_no_context_takeover`. Offers are walked in the
@@ -181,46 +176,32 @@ drop bits past the end, and the next `peekBitsEnding` underflows (`left.len * 8 
 consumed_bits` with `left.len == 0`): an integer-overflow panic in safe builds, wrapped
 arithmetic in ReleaseFast — on bytes a peer chooses. `inflate` feeds the decoder through
 `ZeroPadded`, a reader that continues with zero bytes, so the end is never reached; a decode
-that consumed any padding is refused. Found by `WEBSOCKET_FUZZ` `inflate` on its first 500
-seeds; the 500-seed reach test is the regression (it crashed before the reader existed).
+that consumed any padding is refused. A 500-seed reach test of the `inflate` harness
+pins it.
 
-**Speed (2026-10-11, `zig build bench-websocket`).** 0.04–0.88× coder/websocket on seven
-workloads (reads of small/fragmented/64 KiB/compressed messages, writes of small/64 KiB/compressed
-ones), ours validating UTF-8 where coder does not. ⚠ The bench binary installs `fastmem`'s memset,
-as this collection's libc-free executables do (the web-server consumer's): std 0.16's `flate.Compress.writeBlock`
-resets its 96 KiB token list once per compressed message, and with Zig 0.16's byte-wise
-compiler_rt memset `write_deflate` measured 2.0× coder (0.93× with a vectorized memset). A
-libc-free binary that sends compressed messages without `fastmem` pays ~30 µs per message for it.
-Owner decision 2026-10-11: the bench installing `fastmem` is the accepted measurement for P2
-(the alternative, an own deflate encoder, is not worth it for this).
-
-**`Conn` (2026-10-11).** `conn.zig`: `readMessage` loops `Connection.receive` over the reader's
+**`Conn`.** `conn.zig`: `readMessage` loops `Connection.receive` over the reader's
 buffer (filling it on `.need_more`), answers a ping with its pong, answers the peer's close by
 echoing its code and returns `error.Closed`, and answers any protocol error with
 `frame.closeCode`'s code before returning it. The returned payload borrows the reader's buffer
 (or `message_buf`) until the next call.
 
-**Direct payload (2026-10-26).** An uncompressed text/binary/continuation frame the reader's
-buffer cannot hold from where it starts is not shuffled or refused any more: its header is
+**Direct payload.** An uncompressed text/binary/continuation frame the reader's
+buffer cannot hold from where it starts is read without buffering the whole frame: its header is
 checked (`frame.parseHeaderWith`, every check `parseFrame` makes), `Connection.directPayload`
 names its slot in `message_buf` (offset 0 for a new message, `message_len` for a continuation)
 or refuses it with the error `receive` would give once it had arrived — data after a close,
 out of sequence, one fragment too many, no room (`MessageTooLarge`) — and the payload is read
 into the slot in 64 KiB steps, each unmasked (the key's phase follows the byte offset) and, for
 text, fed to a copy of the message's UTF-8 state before the next is read; `Connection.receiveFrame`
-then runs the state machine on it, and `appendFragment` skips the copy onto itself. Until then a
-frame over the buffer was `FrameExceedsBuffer` (1009), so `http.Server`'s 16 KiB default buffer
-refused every larger frame; the interop oracle now runs both sides on 16 KiB buffers with 1 MiB
-frames. What is left: a compressed frame (its bytes collect in `compressed_buf` through the
+then runs the state machine on it, and `appendFragment` skips the copy onto itself. The interop oracle runs both sides on 16 KiB buffers with 1 MiB frames. What is left: a compressed frame (its bytes collect in `compressed_buf` through the
 buffer) still needs a buffer of the largest compressed frame + 14, and any control frame 131
-bytes. Fail-fast UTF-8 inside such a frame is per 64 KiB step, not per TCP read (review F4).
+bytes. Fail-fast UTF-8 inside such a frame is per 64 KiB step, not per TCP read.
 After an error on this path part of the frame is gone from the reader, so `Conn.sticky` keeps
-the error and every later `readMessage` returns it; a protocol error is sticky on both paths
-(review F1/F2). `writeMessage` draws a fresh mask key per frame from the caller's
+the error and every later `readMessage` returns it; a protocol error is sticky on both paths. `writeMessage` draws a fresh mask key per frame from the caller's
 `std.Random` on the client side and compresses messages of at least `min_size` (512, coder's
 no-context-takeover threshold) when deflate was agreed.
 
-## Threat model / out of scope
+## Threat model / Limits
 
 This module parses untrusted network input end to end (the handshake request/response headers and
 every frame byte) — no panics on malformed input anywhere; every rejection is a typed error.
@@ -233,9 +214,11 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   direction unconditionally from its `role` parameter: a server-role parser rejects any unmasked
   frame (`error.UnmaskedClientFrame`, close 1002), a client-role parser rejects any masked one
   (`error.MaskedServerFrame`, close 1002). There is no configuration flag to disable this.
-- **RSV bits / reserved opcodes:** this module negotiates no extensions, so any RSV bit set is
-  immediately `error.ReservedRsvBits` (close 1002) — never silently ignored, which matters because
-  silently ignoring an RSV bit is exactly how an extension-confusion attack would look. Opcodes
+- **RSV bits / reserved opcodes:** RSV2 and RSV3 are never accepted. RSV1 is accepted only on the
+  first frame of a text/binary message and only after `Connection.enableDeflate`
+  (`ParseOptions.allow_rsv1`); on a continuation or a control frame, or with no deflate enabled, it is
+  `error.ReservedRsvBits` (close 1002) — never silently ignored, which matters because silently
+  ignoring an RSV bit is exactly how an extension-confusion attack would look. Opcodes
   0x3-0x7 and 0xB-0xF → `error.ReservedOpcode` (close 1002).
 - **Size caps (DoS bound):** `max_frame_size` is checked as soon as the length prefix is decoded —
   *before* the parser waits for (or would need to buffer) the payload bytes, so an attacker cannot
@@ -287,11 +270,11 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   caller's attacker-controlled input (e.g. `extra_headers` built from a cookie or bearer token)
   could use to inject header lines or split the request. An `extra_headers` entry naming a field
   `writeRequest` writes itself (`Host`, `Upgrade`, `Connection`, `Sec-WebSocket-Key`/`-Version`/
-  `-Protocol`/`-Extensions`, any case) is refused the same way (review F9, 2026-10-26): it would
+  `-Protocol`/`-Extensions`, any case) is refused the same way: it would
   go out twice, a request this module's own server refuses as `DuplicateHeader`.
 - **Close-code validation (RFC 6455 §7.4.1):** a close frame's status code is checked against the
   ranges permitted on the wire — `1000-1003`, `1007-1014` (1012-1014 assigned by the IANA registry
-  §11.7 makes authoritative, see "Foreign-peer corpus"), `3000-4999` — before its
+  §11.7 makes authoritative, see Verification), `3000-4999` — before its
   reason is even read. Codes `0-999` (unused), `1004`/`1005`/`1006`/`1015` (each specified "MUST NOT
   be set as a status code in a Close frame by an endpoint" — they name conditions with no
   corresponding close frame, not values a peer may legitimately send) and the unassigned
@@ -309,256 +292,55 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   `message_buf.len` on the output, the latter enforced while decoding (`MessageTooLarge`, close
   1009), so a bomb stops at the caller's budget. A malformed stream is `InvalidCompressedData`
   (close 1007), never a panic — including on the std defect described under Design. Context
-  takeover is not supported, so no state survives a message.
+  takeover is not supported, so no state survives a message (*Backlog / deferred*).
 - **Out of scope:** TLS/TCP transport (the caller's — see `http`'s BYO-TLS seam for the pattern),
   permessage-deflate's context-takeover mode, and every other extension: without
   `permessage_deflate` on, `writeRequest` sends no `Sec-WebSocket-Extensions`, any RSV bit is
   rejected, and `verifyResponse` treats any `Sec-WebSocket-Extensions` in the response as
   `error.UnexpectedExtension` (RFC 6455 §4.1 point 5). Also out of scope: automatic ping/keepalive scheduling (the caller
-  drives the event loop; `frame.pongFor` is the one building block provided). **`Origin` policy is
-  no longer out of scope** — see "`Origin` allow-list" below; a caller that genuinely wants no
-  policy at all still can, explicitly, via `.origins = &.{"*"}`.
+  drives the event loop; `frame.pongFor` is the one building block provided). `Origin` policy is
+  provided (see "`Origin` allow-list" above); a caller that genuinely wants no policy at all can say
+  so explicitly, via `.origins = &.{"*"}`.
 
 ## Verification
 
-`zig build test-websocket` — offline tests (155 run, 6 fuzz drivers skip without `WEBSOCKET_FUZZ`).
-- **Live oracle (2026-10-26):** `zig build interop-websocket` — coder/websocket v1.8.15 and
-  gorilla/websocket v1.5.3 as real peers (`tools/interop.zig`, `tools/go_oracle`): this module's
-  client against both servers and both clients against this module's server, eight scenarios
-  each (the 17-message suite 0 B–1 MiB in one frame, with and without permessage-deflate, 4 KiB
-  in fragments each way, compressed or not, pings both ways, closes both ways, subprotocols),
-  judged by the Go library's own client/server on the same scenario — same client result, same
-  record on the server; and 52 raw handshakes/frame sequences sent to all three servers. First
-  run 2026-10-26: 136 rows, 0 surprises after classification; 18 `stricter` (the `**Ahead:**`
-  rows), 1 `differs` (close 1014 vs gorilla). `--capture` → `src/testdata/interop/` (24 streams,
-  their flate output and fragmentation), replayed through `Conn` in both roles by
-  `src/interop_replay_test.zig`.
-- **Direct payload (2026-10-26):** frames over the reader's buffer read whole (binary, multi-byte
-  text across 64 KiB steps with odd read sizes — the key's phase); a failure there gives the same
-  error and close code as through a 4 KiB buffer (invalid UTF-8 in a continuation, out of sequence,
-  one fragment too many, no room) and stays sticky; a transport cut mid-payload stays failed; 400
-  random frame streams read the same through a 140-byte and a 4 KiB buffer; `directPayload`'s
-  every refusal, in `receive`'s order.
-- **permessage-deflate:** every RFC 7692 §7.2.3 example (7.2.3.1 as payload and as the RFC's
-  frames whole and split 3+4, 7.2.3.3 stored, 7.2.3.4 BFINAL with its trailing `0x00`, 7.2.3.5
-  two blocks, 7.2.3.6 empty, 7.2.3.2's context-takeover payload refused); `writeFrame` producing
-  the RFC's `c1 07 …` frame byte for byte; the bomb cap (1 MiB of `a` refused into 64 KiB, fits
-  exactly into 1 MiB, one byte short refused); compressor round trips over 300 sizes and levels;
-  offer/response grammar tables (browser offers, declines, preference order across lines);
-  handshake goldens; RSV1 rules; UTF-8 after decompression; both caps; `Conn` exchanges incl. a
-  7-byte-per-read transport. Fuzz: `extensions`, `inflate`, `deflate-connection` (oracles: own
-  output round-trips; a fitting message is never refused; nothing past the cap).
-- **RFC 6455 vector-backed (byte-exact):** the §1.3 handshake worked example
-  (`dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`, both as a standalone
-  `computeAcceptKey` check and as a full `acceptHandshake` + `writeResponse` round trip over the
-  verbatim §1.3 example request/response headers); the §5.7 frame examples — unmasked text
-  "Hello", masked text "Hello" (exact mask key + masked bytes), fragmented "Hel"+"lo", unmasked
-  ping "Hello", unmasked pong "Hello", 256-byte binary (16-bit length form), 64KiB binary (64-bit
-  length form) — each both parsed from and re-serialized to the literal RFC bytes.
-- **Constructed (Autobahn-style) teeth, each with a positive control alongside it:** unmasked
-  client frame rejected / masked server frame rejected, RSV-bit rejection, reserved-opcode
-  rejection, oversized-frame rejection (checked before the payload is even available), fragmented-
-  control-frame rejection, oversized-control-payload rejection, non-minimal 16-bit and 64-bit
-  length encodings rejected, 64-bit length with MSB set rejected, masking round-trip
-  (`applyMask` is its own inverse), close-body encode/decode round trip + malformed cases (1-byte
-  payload, invalid-UTF-8 reason), handshake rejections (non-GET, missing Upgrade/Connection/
-  version, missing/malformed key, unoffered-subprotocol echo, accept mismatch, non-101 status),
-  `Connection` fragmentation-sequencing errors (orphan continuation, new frame before finishing
-  the previous one), aggregate message-size cap on **both** the reassembled and the unfragmented
-  path (the latter with an at-exactly-the-cap positive control that also asserts the payload is
-  still borrowed from the read buffer), single-frame and reassembled invalid-UTF-8
-  rejection, the split-codepoint-across-fragments positive control, and control-frame interleaving
-  mid-fragmentation.
+`scripts/modtest websocket` (`zig build test-websocket`); the live oracle is `zig build interop-websocket`. Test classes:
 
-**Review + mutation (2026-10-26, A1).** Independent read-only review (Sonnet) of every src file,
-today's direct-payload path first: no critical/high. Fixed: F1 a failure on the direct path left
-the fragmented message in progress (W3-F7 anti-splicing), F2 a transport error mid-payload left
-the stream mid-frame and retryable (now `Conn.sticky`), F3 such frames failed with
-`FrameExceedsBuffer` where the buffered path says 1002, F9 `extra_headers` could repeat a field
-`writeRequest` writes. F4 (fail-fast per 64 KiB step) documented; F5 tests added (key phase across
-steps, differential buffers, `conn-direct` fuzz); F6/F7 accepted (info); F8 tested (BFINAL with any
-room after it). Mutation: 264 mutant schemata over all five files (Sonnet-prepared, rerun by the
-coordinator on the final source), one ReleaseSafe binary: the suite of the day killed 194 of 260;
-the survivors asked for `src/audit_test.zig` (state resets, boundaries, the close bookkeeping,
-the grammar iterators, the handshake duplicates, the direct path's contract — payload in the
-reader's buffer vs in `message_buf`), and `conn-direct` found the size/UTF-8 order; final 252/264.
-12 equivalent, each argued: three redundant `compressed_len` resets (each covered by the other
-two), two `text_utf8` resets and two `fragment_count` resets (never read stale), `appendFragment`'s
-size check (both callers check first), `in_quotes` in the list splitter (an unterminated quote is
-Malformed in `ParamIterator` anyway), the key-length check (16 decoded bytes are always 24
-characters), the empty-authority Origin check (h1 refuses an empty `Host`), and the closing byte's
-reserve in `compressMessage` (std's bit writer needs 8 free bytes before each write and the final
-flush adds at most 5 after a ≤1-byte advance, so a fixed writer is never filled to its last byte).
-
-**Mutation (2026-10-04,** schemata over a copy of `frame.zig` + `connection.zig` + `handshake.zig`,
-one ReleaseSafe build, the whole suite): 69 mutants — RSV bits, reserved opcodes, both masking
-directions, the three length-encoding checks, control-frame FIN/125 limits, `max_frame_size`,
-`parseFrame`'s completeness test, the mask tail, `writeFrame`'s control checks and length-form
-thresholds, `encodeCloseBody`'s two bounds, `isValidCloseCode` (1004-1006, 1015, 999, 5000), the
-close-body length/code/UTF-8 checks, the incremental UTF-8 validator (invalid lead, range, range
-reset, unfinished sequence), the after-close frame cap and `DataAfterClose`, fragmentation
-sequencing, fragment cap, per-fragment and final UTF-8, both message caps, `bothClosed`, the error
-reset, the partial-text key rotation, and every handshake check (key length/decode, method,
-HTTP/1.0, duplicates, Upgrade/Connection tokens, version, origin policy incl. no-Host, empty
-authority, `*` and exact entry, subprotocol match both sides, `respond`'s upgradability, request
-field validation, 101 status, accept, extensions, unoffered subprotocol). First run: 59 killed,
-9 alive; seven tests added (frame cap boundary, 126-byte length form per §5.2, close-body bounds
-per §5.5/§5.5.1, Upgrade/Connection token presence per §4.2.1, same-host with no Host, exact
-subprotocol match on each side); rerun: 68 killed, 1 equivalent — the same-host default's
-`authority.len != 0` (`h1` refuses an empty `Host`, so an empty authority can never equal it).
-**Finding, fixed:** subprotocols were matched case-insensitively on both sides and the server
-answered its own spelling — a differently-cased offer got an answer a conformant client must
-reject (RFC 6455 §4.1); now exact on both sides.
-- **External anchor (Markus Kuhn's UTF-8 stress-test corpus, frozen 2026-08-08):** a ~45-vector
-  subset of `http://www.cl.cam.ac.uk/~mgk25/ucs/examples/UTF-8-test.txt`, transcribed from the
-  installed (but unrunnable — see below) `autobahntestsuite` package's own
-  `case/case6_x_x.py`, each wrapped in a real single-frame text message and driven through
-  `Connection.receive` (`connection.zig`, "external anchor: Autobahn|Testsuite's frozen UTF-8
-  stress-test corpus"). This is independent of both this module's own understanding and of RFC
-  6455's prose (RFC 6455 §5.6 only requires "valid UTF-8 per RFC 3629"; it enumerates none of the
-  overlong-encoding, lonely-continuation-byte or surrogate-half cases the corpus covers), so it is
-  a genuine third-party oracle, not a restatement of the spec in test form. See "External-anchor
-  investigation" below for how it was obtained and what remains unanchored.
-- **External anchor (three foreign WebSocket peers, executed and frozen 2026-08-09):**
-  `connection.zig`'s `foreign_peer_corpus` — 54 masked client→server byte strings, each put in
-  front of **python-websockets 15.0.1**, **github.com/coder/websocket v1.8.15** and
-  **github.com/gorilla/websocket v1.5.3**, with what each of the three actually did recorded next
-  to it. 24 rows all three accepted, 23 all three rejected (with the close code they agreed on),
-  7 are divergences or splits, individually documented. This is what closes the §7.9 gap the
-  2026-08-08 investigation left open — see "Foreign-peer corpus" below.
-
-### External-anchor investigation: Autobahn|Testsuite (2026-08-08)
-
-F5 asked for a real `Autobahn|Testsuite` run, frozen the way `netconf` froze its live server's
-bytes. That turned out not to be obtainable as a *running* suite on this host, but part of it was
-obtainable as *data*, which changes the outcome from a flat gap to a partial anchor plus one
-precisely-scoped remaining gap.
-
-**`wstest` is broken here, confirmed directly, nothing patched or installed.**
-`wstest --help` (and any other invocation) fails immediately:
-```
-File ".../autobahntestsuite/__init__.py", line 19, in <module>
-    from _version import __version__
-ModuleNotFoundError: No module named '_version'
-```
-`from _version import __version__` is an implicit relative import — valid in Python 2, removed by
-[PEP 328](https://peps.python.org/pep-0328/) in Python 3. This host runs Python 3.14;
-`autobahntestsuite` (last released 2013) is Python-2-era and unmaintained upstream. Per this
-campaign's constraints, it was not patched and nothing was installed to work around it.
-
-**The case *definitions* are data, not runner logic, and some of them are obtainable without
-`wstest` running at all.** `autobahntestsuite/case/*.py` is plain, readable Python source — the
-package cannot be *imported* (every submodule transitively hits the same broken `__init__.py`
-and separately uses its own Python-2-era implicit relative imports, e.g. `from case import Case`),
-but it can be *read as text*, which is all a byte-exact freeze needs. Two kinds of content live
-there, with two different verdicts:
-
-- **§6 (UTF-8 validation): a real external anchor, frozen above.** `case6_x_x.py` embeds Markus
-  Kuhn's UTF-8 decoder stress test verbatim, with an explicit citation to its origin in the source
-  comment. That corpus is independently authored, predates this module and this repository, and is
-  not something reading RFC 6455 would reproduce (see the Verification bullet above for why). A
-  representative subset covering every category the corpus distinguishes — boundary lengths,
-  unexpected continuation bytes, lonely start bytes, truncated sequences, three different overlong
-  encodings, single and paired UTF-16 surrogates, and the non-character code points RFC 3629 still
-  permits — was transcribed into `connection.zig` and is asserted through the real `Connection`
-  message path.
-- **§7.9 (close-code validation): not a genuine external anchor, so none was manufactured.**
-  `case7_9_X.py` (the section covering F2's close-code gap) turns out to carry no data beyond what
-  RFC 6455 §7.4.1 already states: its test list is `[0, 999, 1004, 1005, 1006, 1016, 1100, 2000,
-  2999]` — samples from the RFC's own reserved/unassigned close-code ranges — and its expectation
-  is "clean close with protocol error code or drop TCP", i.e. RFC 6455 §7.4.1's MUST-fail-with-1002
-  rule restated in Python. Freezing these values and asserting this module rejects them would be
-  indistinguishable from writing a test against our own reading of RFC 6455 — exactly the
-  fabricated-anchor shape this repo has flagged before. **That refusal stands and was correct.**
-  What was missing was not better case data but a different *kind* of oracle — see below.
-
-### Foreign-peer corpus: three implementations, executed (2026-08-09)
-
-The §7.9 gap above is now closed, not by resurrecting `wstest` (which stays dead) but by
-replacing the suite with **real peers**. A conformance suite reports pass/fail against its
-author's interpretation; a real peer emits *bytes*, and bytes are what freeze.
-
-**What was run.** 54 masked client→server frames (mask key `37 fa 21 3d`, the RFC 6455 §5.7 key)
-covering valid traffic, header-level violations, length-form boundaries, and every close-code
-class, were put in front of three independently authored implementations in two languages:
-
-| Implementation | Licence | How it was driven |
-|---|---|---|
-| python-websockets 15.0.1 | BSD-3-Clause | its sans-io `ServerProtocol` state machine, fed directly |
-| github.com/coder/websocket v1.8.15 | ISC | real server on loopback; its close frame read off a raw socket |
-| github.com/gorilla/websocket v1.5.3 | BSD-2-Clause | likewise |
-
-Nobody's source was read for a conclusion; all three were *executed* and their behaviour
-recorded. The distinction from the refused §7.9 case data is the whole point — this is an oracle
-that can disagree with us, and on its first run it did.
-
-**What it caught immediately: close codes 1012-1014 were wrongly rejected.** `isValidCloseCode`
-permitted `1000-1003, 1007-1011, 3000-4999`, which is exactly what RFC 6455 §7.4.1's own text
-enumerates — and is wrong. §7.4.2/§11.7 make the IANA *WebSocket Close Code Number Registry* the
-authority for the 1000-2999 range, and that registry has since assigned **1012 Service Restart,
-1013 Try Again Later, 1014 Bad Gateway**. All three peers accept 1012 and 1013; two of the three
-accept 1014. The module now accepts 1012-1014 and still rejects 1015 and 1016-2999, which all
-three peers also reject. The pre-existing self-authored close-code tests were green throughout —
-they asserted the same misreading, because they were written from the same paragraph.
-
-**Divergences, kept rather than smoothed over.** Seven rows do not produce a clean shared verdict
-and are recorded as such instead of being dropped:
-
-- **Non-minimal length encodings (3 rows).** RFC 6455 §5.2 requires "the minimal number of bytes
-  MUST be used to encode the length". *None of the three enforces it* — a 126/127 form carrying a
-  value the shorter form could hold is accepted by all of them. This module rejects it
-  (`InvalidPayloadLength`, close 1002) and keeps doing so; the divergence is pinned so the choice
-  cannot drift silently.
-- **UTF-8 validation on receive (4 rows).** RFC 6455 §8.1 requires failing an invalid-UTF-8 text
-  message with close 1007. *None of the three validates UTF-8 at this layer* — invalid text
-  payloads pass through all of them. This is precisely why Autobahn has a §6 section at all, and
-  why the Kuhn corpus above, not these peers, is what carries that half of the anchor.
-- **Genuine three-way splits (4 rows, `.split`).** `close_code_1014` (gorilla rejects, the other
-  two accept), `close_body_1byte` (gorilla treats a 1-byte body as a no-code close; the other two
-  reject 1002), `close_reason_bad_utf8` (python 1007 — matching this module; gorilla 1002; coder
-  accepts), and a 64-bit length with the MSB set (both Go peers drop the TCP connection with no
-  close frame; python's reader simply waits for the 2^63 bytes). No majority verdict was
-  manufactured for these; the three answers are recorded and *this module's* answer is pinned.
-
-**Offline and non-skipping.** The capture scripts live in `tools/`
-(never built or run by a test); `build.zig.zon` stays empty. All three implementations can be
-deleted and the tests are unchanged — they never skip. Licence reasoning is in this module's
-`NOTICE`.
-
-**Handshake, separately anchored.** `tools/oracle_handshake.py` + `tools/verify_response_probe.zig`
-diff `verifyResponse`/`acceptHandshake` against python-websockets 15.0.1's `ClientProtocol`/
-`ServerProtocol` over the opening handshake itself (the frame corpus above never exercises
-either) — see `tools/README.md` for the command and the measured agreement.
-
-**Teeth, demonstrated.** Restoring `isValidCloseCode` to its previous range *together with* the
-previous self-authored close-code tests reproduces the module's state before this corpus existed:
-`zig build test-websocket` then reports 62/63 passing — every self-authored test green — with the
-**only** failure being `close_code_1012: all three peers accepted but we rejected with close 1002`.
-The RED comes from the foreign corpus and from nothing else.
+- **Fuzz:** the deterministic driver `WEBSOCKET_FUZZ=<runs>[,<first seed>]` (testkit's; harness bodies sit beside their corpora, reach labels in `src/fuzz_test.zig`). Harnesses: `response`, `response-mutated`, `request`, `request-mutated` (handshake; a `-mutated` twin takes one corpus seed and flips a few octets, because random octets never parse as an HTTP head), `frame`, `close`, `connection`, `extensions`, `inflate`, `deflate-connection` (oracles: own output round-trips; a fitting message is never refused; nothing past the cap) and `conn-direct` (random frame streams through `Conn` with a 140-byte and a 4 KiB reader buffer must agree).
+- **Live oracle:** `zig build interop-websocket` runs coder/websocket and gorilla/websocket as real peers (`tools/interop.zig`, `tools/go_oracle`): this module's client against both servers and both clients against this module's server, over scenarios that include the message-size suite 0 B–1 MiB in one frame with and without permessage-deflate, 4 KiB in fragments each way, compressed or not, pings both ways, closes both ways and subprotocols, judged by the Go library's own client/server on the same scenario (same client result, same record on the server); plus raw handshakes and frame sequences sent to all three servers and classified (`stricter` rows are the card's `**Ahead:**` rows). `--capture` writes `src/testdata/interop/` (the peers' streams, their flate output and fragmentation), replayed through `Conn` in both roles by `src/interop_replay_test.zig`.
+- **Direct payload:** frames over the reader's buffer read whole (binary, multi-byte text across 64 KiB steps with odd read sizes — the key's phase); a failure there gives the same error and close code as through a 4 KiB buffer (invalid UTF-8 in a continuation, out of sequence, one fragment too many, no room) and stays sticky; a transport cut mid-payload stays failed; random frame streams read the same through a 140-byte and a 4 KiB buffer; `directPayload`'s every refusal, in `receive`'s order.
+- **permessage-deflate:** every RFC 7692 §7.2.3 example (7.2.3.1 as payload and as the RFC's frames whole and split 3+4, 7.2.3.3 stored, 7.2.3.4 BFINAL with its trailing `0x00`, 7.2.3.5 two blocks, 7.2.3.6 empty, 7.2.3.2's context-takeover payload refused); `writeFrame` producing the RFC's `c1 07 …` frame byte for byte; the bomb cap (1 MiB of `a` refused into 64 KiB, fits exactly into 1 MiB, one byte short refused); compressor round trips over 300 sizes and levels; offer/response grammar tables (browser offers, declines, preference order across lines); handshake goldens; RSV1 rules; UTF-8 after decompression; both caps; `Conn` exchanges incl. a 7-byte-per-read transport.
+- **RFC 6455 vector-backed (byte-exact):** the §1.3 handshake worked example (`dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`, both as a standalone `computeAcceptKey` check and as a full `acceptHandshake` + `writeResponse` round trip over the verbatim §1.3 example request/response headers); the §5.7 frame examples — unmasked text "Hello", masked text "Hello" (exact mask key + masked bytes), fragmented "Hel"+"lo", unmasked ping "Hello", unmasked pong "Hello", 256-byte binary (16-bit length form), 64KiB binary (64-bit length form) — each both parsed from and re-serialized to the literal RFC bytes.
+- **Constructed (Autobahn-style) teeth, each with a positive control alongside it:** unmasked client frame rejected / masked server frame rejected, RSV-bit rejection, reserved-opcode rejection, oversized-frame rejection (checked before the payload is even available), fragmented-control-frame rejection, oversized-control-payload rejection, non-minimal 16-bit and 64-bit length encodings rejected, 64-bit length with MSB set rejected, masking round-trip (`applyMask` is its own inverse), close-body encode/decode round trip + malformed cases (1-byte payload, invalid-UTF-8 reason), handshake rejections (non-GET, missing Upgrade/Connection/version, missing/malformed key, unoffered-subprotocol echo, accept mismatch, non-101 status), `Connection` fragmentation-sequencing errors (orphan continuation, new frame before finishing the previous one), aggregate message-size cap on **both** the reassembled and the unfragmented path (the latter with an at-exactly-the-cap positive control that also asserts the payload is still borrowed from the read buffer), single-frame and reassembled invalid-UTF-8 rejection, the split-codepoint-across-fragments positive control, and control-frame interleaving mid-fragmentation.
+- **External anchor, UTF-8:** a subset of Markus Kuhn's UTF-8 stress-test corpus (`UTF-8-test.txt`), transcribed from the `autobahntestsuite` package's own `case/case6_x_x.py` (every category the corpus distinguishes: boundary lengths, unexpected continuation bytes, lonely start bytes, truncated sequences, overlong encodings, single and paired UTF-16 surrogates, the non-character code points RFC 3629 permits), each wrapped in a real single-frame text message and driven through `Connection.receive` (`connection.zig`, "external anchor: Autobahn|Testsuite's frozen UTF-8 stress-test corpus"). It is independent of this module's reading of RFC 6455, which enumerates none of those cases. `IncrementalUtf8` is also proven equivalent to `std.unicode.utf8ValidateSlice` over this corpus and fixed-seed random strings at every fragment split point.
+- **External anchor, foreign peers:** `connection.zig`'s `foreign_peer_corpus` — masked client→server byte strings (valid traffic, header-level violations, length-form boundaries, every close-code class; mask key `37 fa 21 3d`), each executed against python-websockets 15.0.1 (its sans-io `ServerProtocol`), coder/websocket v1.8.15 and gorilla/websocket v1.5.3 (real servers on loopback), with what each did recorded next to it: rows all three accepted, rows all three rejected with an agreed close code, and divergences, kept and pinned to this module's answer. This is an oracle that can disagree with the module: it showed that close codes 1012-1014 (assigned by the IANA registry that RFC 6455 §7.4.2/§11.7 make authoritative; all three accept 1012 and 1013, two accept 1014) must not be refused. Recorded divergences: none of the three enforces the minimal length encoding (§5.2) — this module rejects it (`InvalidPayloadLength`); none of the three validates UTF-8 at the frame layer (§8.1) — this module does (the Kuhn corpus carries that half of the anchor); `close_code_1014` (gorilla rejects), `close_body_1byte` (gorilla reads it as a close without a code, the other two reject 1002), `close_reason_bad_utf8` (python 1007, as here; gorilla 1002; coder accepts), a 64-bit length with the MSB set (both Go peers drop the TCP connection with no close frame; python's reader waits for the 2^63 bytes). No majority verdict was manufactured for a split.
+- **Autobahn|Testsuite itself is not run:** `wstest` (Python 2 era) does not start on a current Python, and its §7.9 case data carries nothing beyond RFC 6455 §7.4.1's own ranges, so freezing it would be a test against our own reading of the RFC; the foreign-peer corpus above replaces it for that class. All three peers can be deleted and the tests are unchanged (they never skip, `build.zig.zon` stays empty; the capture recipes are `tools/` scripts that no test builds or runs; licence reasoning in this module's `NOTICE`).
+- **Handshake, separately anchored:** `tools/oracle_handshake.py` + `tools/verify_response_probe.zig` diff `verifyResponse` / `acceptHandshake` against python-websockets 15.0.1's `ClientProtocol` / `ServerProtocol` over the opening handshake (the frame corpus never exercises it); command in `tools/README.md`.
+- **Mutation scope:** production code of `conn.zig`, `connection.zig`, `deflate.zig`, `frame.zig` and `handshake.zig`; the tests the mutation runs asked for (state resets, boundaries, the close bookkeeping, the grammar iterators, the handshake duplicates, the direct path's contract) are in `src/audit_test.zig`.
+- **ctgrind:** n/a, framing only; the mask key is not secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## Performance
 
-**Fastest in the field, measured 2026-10-26** (`zig build bench-websocket`, `BENCH_ROUNDS=5`, ReleaseFast, load average ~2–3 from other sessions, largest spread 12.5 %): every serious candidate on the same wire bytes — coder 1.26.8-built, gorilla v1.5.3 (`tools/go_bench/gorilla`), fastwebsockets 0.10.0 and tungstenite 0.30.0 (`tools/rust_fast_bench`; neither has permessage-deflate, so their deflate rows are n/a). Ours against the fastest per row: read_text_small 0.29× (fastwebsockets), read_text_fragmented 0.62× (gorilla), **read_binary_64k 1.19× (fastwebsockets)**, read_deflate 0.75× (gorilla), write_text_small 0.68×, write_binary_64k 0.94× (fastwebsockets), write_deflate 0.91× (gorilla). The one row over 1.0 is close to the P1 bound (1.25): a noisy 3-round run on 2026-10-26 gave 1.25. Its cost is the copy and the unmask of 256 KiB, nothing else (perf: `memcpy` 58 %, `applyMask` 40 %): compiler_rt's `memcpy` in a libc-free binary, and the harness copying the whole wire before parsing (as the web-server consumer's accumulator does) where fastwebsockets reserves `payload + 14` bytes and reads one frame at a time, unmasking it while it is in cache. `conn.Conn` over a `std.Io.Reader` is slower there (1.44×): the reader fills greedily, so every other 64 KiB frame is half in the buffer and copied twice — reading exactly a frame needs a buffer the reader does not offer (Backlog). fastwebsockets also skips two checks this module makes (masking direction, minimal length).
+`zig build bench-websocket` (`tools/bench.zig`, `BENCH_ROUNDS=<n>`) runs every serious candidate on the same wire bytes — coder/websocket and gorilla (`tools/go_bench`), fastwebsockets and tungstenite (`tools/rust_fast_bench`; neither has permessage-deflate, so their deflate rows are n/a) — over seven rows: read_text_small, read_text_fragmented, read_binary_64k, read_deflate, write_text_small, write_binary_64k, write_deflate. The card's `**Performance:**` line carries the figures and is authoritative.
 
-**Re-measured 2026-10-26 after `fastmem` began exporting `memcpy`** (same command, load average ~2.5, largest spread 27 % on a 69 ns row); the card carries this run: read_text_small 0.31×, read_text_fragmented 0.59×, **read_binary_64k 1.12×** (fastwebsockets; was 1.19×), read_deflate 0.75×, write_text_small 0.60×, write_binary_64k 0.89×, write_deflate 0.88×; ours/coder 0.03–0.86×. What is left in that row is `applyMask` and the whole-wire copy of the harness.
+The one row near the P1 bound is read_binary_64k against fastwebsockets: its cost is the copy and the unmask of the frames (`memcpy` and `applyMask`), compiler_rt's `memcpy` in a libc-free binary and the harness copying the whole wire before parsing (as a consumer's accumulator does), where fastwebsockets reserves `payload + 14` bytes and reads one frame at a time, unmasking it while it is in cache. `conn.Conn` over a `std.Io.Reader` is slower there: the reader fills greedily, so a frame straddling the buffer's end is copied twice (*Backlog / deferred*). fastwebsockets also skips two checks this module makes (masking direction, minimal length).
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-websocket`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 4.4 %): ref 0.04–0.88×, against 0.04–0.88× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
+The bench binary installs `fastmem`'s `memset` and `memcpy`, as this collection's libc-free executables do: std's `flate.Compress.writeBlock` resets its 96 KiB token list once per compressed message, and with the byte-wise compiler_rt `memset` of Zig 0.16 that cost about 30 µs per message (write_deflate measured 2.0× coder against 0.93× with a vectorized memset). A libc-free binary that sends compressed messages without `fastmem` pays that. Owner decision: the bench installing `fastmem` is the accepted measurement for P2; an own deflate encoder is not worth it (*What is deliberately not done*).
 
-**Mutation (2026-11-07, whole module,** `conn.zig`, `connection.zig`, `deflate.zig`, `frame.zig`, `handshake.zig` production code, schemata in a detached copy, ReleaseSafe, strict verdict): 425 mutants, 400 killed (6 by hang; 28 by 20 new tests), 23 equivalent + 2 unobservable, 0 undecided. New tests (audit_test.zig, "2026-11-07"): `pongFor`'s opcode, `encodeCloseBody` too small, a compressed first frame counting toward `max_fragments`, fragments exactly `message_buf`-sized, compressed text cut mid-code-point, the automatic pong and close echo flushed, `peer_close` reason lifetime, `min_size − 1` uncompressed, `close` `ReasonTooLong`, the extension grammar (separators, quotes, escapes, window bits 25/80/"15", server bits 15/16, valueless bits in a response), `inflate` padding refused and zeroed, `compressMessage` without room and its closing byte after a stored final block, missing `Sec-WebSocket-Version`, `respond` naming permessage-deflate, `generateKey` with the caller's random, `writeRequest` without protocols. Equivalent: vector fast paths (10, 80), the partial-check restart (188, 192), the generic accept range at `remaining == 0` (87, 88), redundant resets (122, 143, 151, 123, 174, 125, 156, 202), `appendFragment`'s bound checked by both callers (206), `readDirect`'s `allow_rsv1` (243), a clamped `@min` (268), an unterminated quote already Malformed (270), parameters parsed by `ExtensionIterator` (295, 310), the closing byte's reserve (336), the key length (342), empty authority refused by h1 (380). Unobservable: `ZeroPadded.stream` (320, 321) — std 0.17's raw-container decompressor reads only through `readVec`/`peekInt`/`toss`/`takeInt`. **Changes from the run:** F1 (LOW) `checkPartialText` summed `fragment_count + 1` unsaturated — with `max_fragments = maxInt(u32)` a peer could reach the panic after 2^32−1 continuations — now `+|`, pinned; the four caller-contract panics are errors (`Conn.InitError`, `Conn.WriteMessageError`, `enableDeflate` `BufferTooSmall`, `InflateError.BufferTooSmall`), no shared error set changed and no dependent touched.
+## What is deliberately not done
+
+- **Automatic keepalive / ping-interval scheduling:** event-loop-specific, left to the caller (`Conn.ping` sends, `Options.hooks.on_pong` sees the answer; `frame.pongFor` is the building block).
+- **Transport:** TLS and TCP are the caller's (see `http`'s BYO-TLS seam); this module never opens a socket.
+- **Extensions other than permessage-deflate**, and permessage-deflate's context-takeover mode (the latter is in *Backlog / deferred*).
+- **A Wasm/browser target.**
+- **An own deflate encoder** to avoid std's per-message token-list reset: not worth it; the bench installs `fastmem` (*Performance*).
 
 ## Backlog / deferred
 
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
-
-- No automatic keepalive/ping-interval scheduling — event-loop-specific, left to the caller (`Conn.ping` sends, `Options.hooks.on_pong` sees the answer, 2026-11-05).
+- **Differential oracle against karlseguin's library** — IDEA, not scheduled. `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 - **Context-takeover mode for permessage-deflate** — better ratio on small repetitive messages; costs a persistent 32 KiB window per connection and direction plus a compressor kept per connection (std's `flate.Compress` cannot be reset without forgetting history). Only if a consumer asks.
-- ~~**Live interop oracle for permessage-deflate**~~ **DONE 2026-10-26** — `zig build interop-websocket` drives coder and gorilla both ways (their compressor → our `inflate`, ours → theirs, compressed fragments included); their compressed frames are replayed by `src/interop_replay_test.zig`.
-- **`Conn` reads sized to the frame** (2026-10-26, from the fastest-in-field bench) — `Conn` over a `std.Io.Reader` fills its buffer greedily, so a large frame straddling the buffer's end is copied twice (1.44× fastwebsockets on 64 KiB frames, against 1.19× for the accumulator path). fastwebsockets reserves `payload + 14` bytes and reads one frame. Doing that here needs a read of an exact length into the reader's buffer, which `std.Io.Reader` does not offer (fills are greedy); a `Conn` over a raw stream instead of a `Reader` would. Also: compiler_rt's `memcpy` was the larger half of that row — done 2026-10-26, `fastmem` exports `memcpy` (1.19× → 1.12×).
-
-- ~~**permessage-deflate (RFC 7692)**~~ **DONE 2026-10-11** (no-context-takeover mode; see Design) *(survey 2026-09-30)* — coder/websocket, gorilla and websocket.zig offer it, and browsers offer it on every handshake, so text-heavy JSON feeds shrink several-fold when it works. Without it a client that *requires* it fails; ones that merely offer it fall back. Effort: medium-large (extension negotiation incl. `client_no_context_takeover`/window bits, RSV1 handling, a bounded inflate with a decompression-bomb cap; `http.gzip`/std flate as the engine). Fits §2 (std flate is pure Zig). Security-sensitive, needs its own audit pass (already noted in this SPEC).
-- ~~**Socket-driven `Conn` helper (read loop + auto pong + close handshake)**~~ **DONE 2026-10-11** (`conn.Conn`) *(survey 2026-09-30)* — a typical user of gorilla/coder expects `ReadMessage`/`WriteMessage` and automatic replies to ping and close; here it is about 50 lines the caller writes from `parseFrame`/`Connection.receive`/`pongFor`. Effort: small-medium as a thin layer over `std.Io.Reader`/`Writer`, kept optional so the codec stays transport-agnostic. Fits §2.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **`Conn` reads sized to the frame** — `Conn` over a `std.Io.Reader` fills its buffer greedily, so a large frame straddling the buffer's end is copied twice (slower than the accumulator path on 64 KiB frames). fastwebsockets reserves `payload + 14` bytes and reads one frame. Doing that here needs a read of an exact length into the reader's buffer, which `std.Io.Reader` does not offer (fills are greedy); a `Conn` over a raw stream instead of a `Reader` would.
 
 ## Anchoring
 
