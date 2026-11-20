@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **Behaviour change:** an encrypted traditional PEM is written with `DEK-Info` second, after `Proc-Type`, as RFC 1421 §4.6.1 orders them (OpenSSL writes the same order); readers that accepted the old order still accept the new one.
 - **2026-11-08** — **NO CONSUMER-VISIBLE CHANGE:** `pem`'s private `eqMask` is `b64ct.eqMask`.
 - **2026-11-07** — **Fixed:** `pbes2.decrypt` and `pbes2.encrypt` (public through `keycodec.pbes2`) now burn the dead stack themselves (`burn.pbes2_burn`), as the root entry points already did; a direct call left ~1.9 KiB of KDF/HMAC/AES state below the caller. The stack probe calls both directly.
 - **2026-11-07** — **Review fixes:** `parseEncryptedPrivateKeyPem` answers `UnsupportedEncryption` (not `NotEncrypted`) for an OpenSSL legacy `Proc-Type: 4,ENCRYPTED` block under the plain `RSA PRIVATE KEY` / `EC PRIVATE KEY` / `PRIVATE KEY` label; `pem.encodeWithHeaders` refuses control bytes other than a tab in a header value (NUL, ESC, DEL); tests now assert the decrypt-side wiping (`out`, `scrypt_work`, the in-place PEM region); SPEC states the timing limit of the single error.

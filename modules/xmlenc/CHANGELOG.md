@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-11-20** — **Behaviour change:** an RSA-OAEP `OAEPparams` label of 65–256 octets is now accepted (was refused); 257 and more are still refused.
 - **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** the private `WipingAllocator` is replaced by the shared `wipealloc` module (same code; new dependency `wipealloc`). Security-triage row xmlenc:338. The card's audit `src` hash is re-recorded over this mechanical move (the moved code has its own whole-module mutation run, 8/8 killed).
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the dead-stack probe gained the CEK, the OAEP encoded message, the PKCS#1 v1.5 block, the AES-KW key and the decoy digest as needles over five fixtures (OAEP, `rsa-1_5`, `kw-aes256`, a failing `kw-aes256` wrap, assertion/document entry points), and a ReleaseFast test checks that the plaintext of a document that fails to parse is wiped before it is freed; of the 11 wipe/burn mutants first recorded UNOBSERVABLE, 3 are now killed and 8 are equivalent through the burn (card 181/208, 27 eq). The unreachable `aes192` `UnsupportedAlgorithm` line in `classifyContent` (shadowed by the two 192-bit branches above it) was removed.
 
