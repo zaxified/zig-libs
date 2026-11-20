@@ -56,7 +56,7 @@ test-tls13-rsa-signatures.py	plain	-	PASS 8 FAIL 0	-
 test-tls13-rsapss-signatures.py	plain	-	PASS 0 FAIL 8	8 = the script assumes an RSA-PSS (id-RSASSA-PSS) certificate: none here
 test-tls13-serverhello-random.py	plain	-	PASS 128 FAIL 128	128 = its ffdhe2048 half (no FFDHE)
 test-tls13-session-resumption.py	plain	-	PASS 4 FAIL 3	fork 4/3; 3 = two TLS 1.2 conversations and PSK_ONLY (psk_ke: never, as rustls)
-test-tls13-shuffled-extentions.py	plain	-	PASS 2 FAIL 17	17 = a second ClientHello with its extensions reordered is accepted (RFC 8446 §4.1.2 wants it unchanged; rustls compares less too) -- SPEC backlog
+test-tls13-shuffled-extentions.py	plain	-	PASS 19 FAIL 0	-
 test-tls13-signature-algorithms.py	plain	-n;0	PASS 278 FAIL 4	fork 98/4 (sampled, -n 100); 4 = 32,715 schemes = a ClientHello over the 64 KiB message cap (decode_error)
 test-tls13-symetric-ciphers.py	plain	-n;0	PASS 773 FAIL 386	386 = TLS_AES_128_CCM_SHA256 and TLS_AES_128_CCM_8_SHA256: not implemented (rustls likewise)
 test-tls13-unencrypted-alert.py	plain	-	PASS 4 FAIL 0	fork 4/0

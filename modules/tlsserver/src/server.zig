@@ -1543,6 +1543,9 @@ pub const Server = struct {
     after_signature: State = .failed,
     /// RFC 8449: the client's `record_size_limit` (null: none sent).
     peer_record_limit: ?u16 = null,
+    /// SHA-256 over the first ClientHello's fields and extensions except
+    /// those RFC 8446 §4.1.2 lets the second one change (`helloDigest`).
+    first_hello_digest: [32]u8 = @splat(0),
     /// `Config.dynamic_records`: application data octets and records sent
     /// since the last reset, and when the last one was written.
     dyn_sent: u64 = 0,
@@ -2717,6 +2720,14 @@ pub const Server = struct {
         const record_limit: ?u16 = if (cfg.quic != null) null else ch.record_size_limit;
         if (retried and !std.meta.eql(record_limit, self.peer_record_limit)) return error.IllegalParameter;
         self.peer_record_limit = record_limit;
+        // RFC 8446 §4.1.2: the second hello is the first but for the listed
+        // changes (Go `illegalClientHelloChange`, which compares the fields;
+        // here their octets and order, tlsfuzzer
+        // `test-tls13-shuffled-extentions`). rustls compares only the SNI and
+        // the suite's hash.
+        const digest = helloDigest(&ch);
+        if (retried and !std.mem.eql(u8, &digest, &self.first_hello_digest)) return error.IllegalParameter;
+        self.first_hello_digest = digest;
         // JA4 of the first hello only (the one a client's software chose).
         if (cfg.ja4 and !retried) {
             // Out of line: its 2 KiB of sort buffers would deepen this frame
@@ -3149,6 +3160,47 @@ pub const Server = struct {
         var it = theirs;
         while (it.next()) |g| if (std.mem.indexOfScalar(u16, cfg.groups, g) != null) return g;
         return null;
+    }
+
+    /// SHA-256 of a ClientHello's version, random, session id, suites,
+    /// compression methods and its extensions in order, except the ones a
+    /// second hello may change (RFC 8446 §4.1.2): `key_share`,
+    /// `early_data` (removed), `cookie` (added), `pre_shared_key`
+    /// (updated), `padding` (RFC 7685) and `encrypted_client_hello`
+    /// (re-encrypted; the inner hello is the one compared). The hello was
+    /// parsed, so its extension block is well formed.
+    fn helloDigest(ch: *const hello.ClientHello) [32]u8 {
+        var h: Sha256 = .init(.{});
+        var be: [2]u8 = undefined;
+        std.mem.writeInt(u16, &be, ch.legacy_version, .big);
+        h.update(&be);
+        h.update(ch.random);
+        h.update(&.{@intCast(ch.legacy_session_id.len)});
+        h.update(ch.legacy_session_id);
+        std.mem.writeInt(u16, &be, @intCast(ch.cipher_suites_raw.len), .big);
+        h.update(&be);
+        h.update(ch.cipher_suites_raw);
+        h.update(&.{@intCast(ch.legacy_compression_methods.len)});
+        h.update(ch.legacy_compression_methods);
+        const e = ch.extensions_raw;
+        var i: usize = 0;
+        while (e.len - i >= 4) {
+            const t = std.mem.readInt(u16, e[i..][0..2], .big);
+            const n = std.mem.readInt(u16, e[i + 2 ..][0..2], .big);
+            const end = @min(e.len, i + 4 + n);
+            switch (t) {
+                @backingInt(hello.ExtensionType.key_share),
+                @backingInt(hello.ExtensionType.early_data),
+                @backingInt(hello.ExtensionType.cookie),
+                @backingInt(hello.ExtensionType.pre_shared_key),
+                @backingInt(hello.ExtensionType.encrypted_client_hello),
+                21, // padding
+                => {},
+                else => h.update(e[i..end]),
+            }
+            i = end;
+        }
+        return h.finalResult();
     }
 
     fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -5006,13 +5058,70 @@ test "HelloRetryRequest: second-hello refusals (rustls)" {
     var regrouped = x25519_share_first;
     regrouped.groups = &.{ 0x001d, 0x0017 };
     try testing.expectEqual(error.IllegalParameter, (try retry(x25519_share_first, "", regrouped)).err.?);
-    // Reordered suites: the ServerHello still says 0x1301.
+    // Reordered suites: not the same hello (RFC 8446 §4.1.2, Go).
     var reordered = p256_only;
     reordered.suites = &.{ 0x1303, 0x1301 };
-    const r = try retry(x25519_share_first, "", reordered);
+    var first_two = x25519_share_first;
+    first_two.suites = &.{ 0x1301, 0x1303 };
+    try testing.expectEqual(error.IllegalParameter, (try retry(first_two, "", reordered)).err.?);
+    // Kept in the same order: the ServerHello says the HRR's 0x1301.
+    var kept = p256_only;
+    kept.suites = first_two.suites;
+    const r = try retry(first_two, "", kept);
     try testing.expect(r.err == null);
     const sh = 5 + std.mem.readInt(u16, r.out[3..5], .big) + 6;
     try testing.expectEqualSlices(u8, &.{ 0x13, 0x01 }, r.out[sh + 5 + 4 + 2 + 32 + 1 ..][0..2]);
+}
+
+test "HelloRetryRequest: the second hello is the first but for RFC 8446 §4.1.2's changes (tlsfuzzer shuffled extensions, Go)" {
+    // Allowed: another share, early_data removed, padding changed.
+    var first = x25519_share_first;
+    first.early_data = true;
+    first.pad_to = 512;
+    first.alpn = &.{ "h2", "http/1.1" };
+    var second = p256_only;
+    second.pad_to = 600;
+    second.alpn = first.alpn;
+    try testing.expect((try retry(first, "", second)).err == null);
+    second.pad_to = 0;
+    try testing.expect((try retry(first, "", second)).err == null);
+
+    const Case = struct { []const u8, Hello };
+    var alpn = second;
+    alpn.alpn = &.{ "http/1.1", "h2" };
+    var no_alpn = second;
+    no_alpn.alpn = null;
+    var sid = second;
+    sid.session_id = &(@as([32]u8, @splat(7)));
+    var version = second;
+    version.legacy_version = 0x0301;
+    var extra = second;
+    extra.extra = &.{.{ 0x1234, "x" }};
+    var ocsp = second;
+    ocsp.ocsp = true;
+    var sigs = second;
+    sigs.sig_algs = &.{ 0x0403, 0x0804 };
+    // The same extensions in another order (`extra` puts them last).
+    var shuffled = second;
+    shuffled.versions = null;
+    shuffled.extra = &.{.{ 43, &.{ 2, 3, 4 } }};
+    const cases = [_]Case{
+        .{ "ALPN reordered", alpn },
+        .{ "ALPN dropped", no_alpn },
+        .{ "legacy_session_id changed", sid },
+        .{ "legacy_version changed", version },
+        .{ "an extension added", extra },
+        .{ "status_request added", ocsp },
+        .{ "signature_algorithms changed", sigs },
+        .{ "supported_versions moved", shuffled },
+    };
+    for (cases) |c| {
+        const r = try retry(first, "", c[1]);
+        if (r.err == null or r.err.? != error.IllegalParameter) {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "RFC 8449: protected records within the client's record_size_limit; the second hello must repeat it" {
@@ -7224,9 +7333,10 @@ test "Config.ja4: after a HelloRetryRequest the fingerprint is still the first h
     defer testing.allocator.free(first);
     _ = try s.feed(first);
     const want = s.ja4().?.*;
-    // The suites reordered and one more: allowed on the second hello.
+    // A padding extension added: allowed on the second hello (RFC 8446
+    // §4.1.2), and a fingerprint of its own (JA4 counts the extension).
     var again = p256_only;
-    again.suites = &.{ 0x1303, 0x1301 };
+    again.pad_to = 512;
     const second = try buildRecord(testing.allocator, again);
     defer testing.allocator.free(second);
     _ = try s.feed(second);

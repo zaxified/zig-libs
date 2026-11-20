@@ -457,8 +457,8 @@ the chosen group, the server fixes the suite, answers with a HelloRetryRequest n
 (no cookie) and a compatibility CCS, and restarts the transcript as
 `message_hash(Hash(ClientHello1)) ‖ HelloRetryRequest` with the suite's hash (§4.4.1). The first
 ClientHello must end its record flight (`unexpected_message`). The second must carry a share for
-that group, the same SNI, still offer that suite, and no `early_data` — otherwise
-`illegal_parameter`. Stricter than rustls, which re-chooses suite and group on the second hello
+that group, the same SNI, still offer that suite, no `early_data`, and be the first hello but for
+§4.1.2's changes (*Limits and refusals*) — otherwise `illegal_parameter`. Stricter than rustls, which re-chooses suite and group on the second hello
 and compares only the hash: RFC 8446 §4.1.4/§4.2.8 bind both to the HelloRetryRequest; the ServerHello that follows has no second CCS.
 Early data the first ClientHello announced is skipped in the clear up to 2^14 octets of
 ciphertext, an empty record counting one octet (more: `unexpected_message`, as rustls). One compatibility CCS per ClientHello is
@@ -667,12 +667,14 @@ The receive side's refusals are the table under *Wire format*. Record protection
   depths ×1.3; Debug frames are larger), so a small-stack worker or fiber must be sized for the keys and groups it enables.
   The `CertKeyPair` must not move after `certifiedKey()`.
 - **Accepted differences, kept.** `signature_algorithms` is required (`handshake_failure` without it) even on a ClientHello
-  that resumes (rustls). The second ClientHello is compared with the first only where it matters to this server (suite
-  offered, share, SNI, `early_data`), not in `random`, `legacy_session_id`, other suites or ALPN (*Backlog*). ALPN may differ
+  that resumes (rustls). The second ClientHello must be the first but for RFC 8446 §4.1.2's changes: a SHA-256 over
+  the first one's version, random, session id, suites, compression methods and extensions in order (all but `key_share`,
+  `early_data`, `cookie`, `pre_shared_key`, `padding` and `encrypted_client_hello`, whose inner hello is the one compared) must
+  match the second's, else `illegal_parameter` (Go's `illegalClientHelloChange` compares the same fields, unordered; rustls
+  only the SNI and the suite's hash; tlsfuzzer `test-tls13-shuffled-extentions` wants the order kept too). ALPN may differ
   from the ticket's on a 1-RTT resumption (RFC 8446 allows it, rustls the same). `close()` before any ClientHello still lets
   a later ClientHello get a flight. `commitWrite` / `discardOutput` past their bounds are caller-contract asserts only.
-  After a HelloRetryRequest the second ClientHello's `status_request` / `signed_certificate_timestamp` decide (as in rustls;
-  RFC 8446 §4.1.2 would have them unchanged). `CertifiedKey.check` runs right after certificate selection, before the
+  `CertifiedKey.check` runs right after certificate selection, before the
   signature scheme is matched: a misconfigured key is `internal_error` even for a client that could not have used it.
 - **Client certificates.** The leaf's key and `keyUsage` are checked before the verifier (BoringSSL's order; rustls verifies
   first, so an untrusted unusable leaf gets `unsupported_certificate` here, `unknown_ca` there); a chain signature that does
@@ -988,10 +990,6 @@ records (the per-record 4 KiB burn).
 - **`burn.zig` ML-DSA-65 size.** `burn.zig` says ML-DSA-65 expansion reaches 553 KiB, yet with `mlDsaExpand`'s burn removed the
   `fromPem` probe stays green: re-measure the burn sizes. A probe that can see those frames would decide the burn mutants that
   are unobservable today.
-- **Second ClientHello unchanged.** RFC 8446 §4.1.2 has the client resend the same ClientHello after a HelloRetryRequest but for
-  the listed changes; only the suite, the group's share, SNI and `early_data` are compared (rustls compares less). Comparing the
-  first hello's other extensions (kept as a hash of their octets) would refuse a reordered or altered one with
-  `illegal_parameter` (tlsfuzzer `test-tls13-shuffled-extentions`).
 - **Key loading.** Encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys: `fromPemEncrypted`); a private-key reader shared
   with `acme` (request filed in `x509/SPEC.md` § Backlog).
 - **The whole client chain for the application** (rustls `peer_certificates`; here the leaf only).
