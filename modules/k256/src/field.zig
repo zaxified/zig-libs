@@ -102,7 +102,7 @@ fn normalize(s0: u256, carry: u1) [4]u64 {
 /// (loose per-fold bounds: `<2^290 → <2^257 → <2^256+c → <2^256`), after
 /// which `normalize` finishes the canonicalisation.
 ///
-/// A1 audit F7 (2026-09-11): the 4th fold is provably **dead code** for
+/// A1 audit F7: the 4th fold is provably **dead code** for
 /// every input this function is ever actually called with, not merely
 /// untested. Both callers (`mulPortable`/`sqPortable`) only ever feed a
 /// product of two CANONICAL field elements (`< p = 2^256 - 2^32 - 977`), so
@@ -136,11 +136,11 @@ fn reduceWide(wide: u512) [4]u64 {
 }
 
 /// `z = a·b mod p`, portable Solinas path (the oracle the asm core mirrors).
-// ── limb-level multiply (the runtime path since 2026-11-13) ─────────────────
+// ── limb-level multiply (the runtime path) ─────────────────
 //
 // The same schoolbook product and two-fold Solinas reduction as the amd64 asm
 // core (`fast_core.zig`, see its module doc for the bounds), written in plain
-// Zig over `u128` products. Measured 2026-11-13 (`zig build bench-bip340`,
+// Zig over `u128` products. Measured (`zig build bench-bip340`,
 // ReleaseFast, same host): BIP340 verify 52.8 → 41.9 µs once `Fe.mul`/`Fe.sq`
 // are `inline` (47.8 µs before inlining), sign and keypair ~10 % faster. The
 // asm block carries a `memory` clobber and fixed registers, so every field
@@ -332,7 +332,7 @@ const fe_order = field_order;
 /// A secp256k1 base-field element: four full 2^64 little-endian limbs, always
 /// canonical (`value < p`) between operations.
 ///
-/// A1 audit F8 (2026-09-11): the backing limbs used to be a plain public
+/// A1 audit F8: the backing limbs used to be a plain public
 /// field (`limbs`), so anything could construct `Fe{ .limbs = raw }` and skip
 /// every canonicalizing constructor below — and `isZero`/`isOdd`/`toBytes`
 /// would then silently report the wrong answer for that value (e.g.
@@ -438,7 +438,7 @@ pub const Fe = struct {
     /// or `t` did, and in that case `t` is `s − p`: two carry chains and one
     /// masked select, where `normalize` (written for a general carry) spends
     /// three chains and two selects. Kept on `u256` on purpose: per-limb
-    /// `@addWithOverflow` chains measured 30% SLOWER on verify (2026-10-07)
+    /// `@addWithOverflow` chains measured 30% SLOWER on verify
     /// despite half the instructions — LLVM turns them into setc/or carry
     /// chains instead of `adc`.
     pub fn add(a: Fe, b: Fe) Fe {
@@ -562,7 +562,7 @@ pub const Fe = struct {
     /// Multiplicative inverse (`invert(0) == 0`, matching std). Constant-time
     /// in `a`.
     ///
-    /// Since 2026-11-13 the constant-time safegcd (`safegcd.inverseCt`,
+    /// Since the constant-time safegcd (`safegcd.inverseCt`,
     /// libsecp256k1's `secp256k1_modinv64`): a fixed 590 divsteps, about 3×
     /// faster here than the Fermat chain (`invertChain`), which stays as its
     /// differential oracle together with `powConst`.
@@ -572,7 +572,7 @@ pub const Fe = struct {
 
     /// Fermat's little theorem: `a^(p−2) mod p`, constant-time. `p − 2` = 223
     /// ones, a zero, 22 ones, 4 zeros, `101101` — the `onesRuns` head plus a
-    /// fixed tail: 255 squarings + 15 multiplies. `invert` until 2026-11-13;
+    /// fixed tail: 255 squarings + 15 multiplies. `invert` previously;
     /// now its test oracle.
     fn invertChain(a: Fe) Fe {
         const r = onesRuns(a);
@@ -1288,7 +1288,7 @@ test "the local seed helper produces what Smith.slice reads back" {
     try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }
 
-// Mutation run 2026-10-08: dropping either carry of `add`'s select, or the
+// Mutation run: dropping either carry of `add`'s select, or the
 // carry of `mulSmall`'s fold, left the suite green — random draws reach a sum
 // in [p, 2^256) or a fold that overflows 2^256 with probability ~2^-220. These
 // inputs reach each case on purpose; std is the oracle.
@@ -1322,7 +1322,7 @@ test "add/mulSmall: sums in [p, 2^256), sums past 2^256, folds past 2^256" {
     }
 }
 
-// ── 2026-11-14 stale-audit mutation run: tests the run asked for ────────────
+// ── stale-audit mutation run: tests the run asked for ────────────
 
 test "sK: normalize(s0, carry) == (s0 + carry·2^256) mod p, including the second fold" {
     const p: u512 = field_order;

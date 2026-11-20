@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack residue probe for `ecdsa_recover.sign` (A1/k256.md G2), the ECDH
+//! Dead-stack residue probe for `ecdsa_recover.sign` (A1 audit G2), the ECDH
 //! `Secp256k1.mul`, `sign.bip340Sign` and `Secp256k1.combMulBase`, kept in the
 //! module per `CONVENTIONS.md` §9: the instrument that checks one module lives
 //! with that module, not in an audit note.
 //!
-//! Method (2026-10-08): the direct-region engine of `p256`'s probe — a painted
+//! Method: the direct-region engine of `p256`'s probe — a painted
 //! region below the probe, the call run under a `PAD`-deep shim, a snapshot
 //! scanned for needles — because the earlier form, which scanned a local
 //! buffer below the call, was blind to the top few hundred bytes of the
@@ -36,7 +36,7 @@ const Scalar = scalarmod.Scalar;
 
 const WINDOW = 256 * 1024;
 
-// ── the measured region (2026-10-08) ────────────────────────────────────────
+// ── the measured region ────────────────────────────────────────
 //
 // Direct-region engine, as `p256`'s probe: the region lies `PAD` bytes below
 // the probe's own stack position and the measured call runs as `shim(call)`
@@ -278,7 +278,7 @@ test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack aft
     try std.testing.expectEqual(@as(usize, 0), sum);
 }
 
-// ── re-audit 2026-09-15 (A1 k256 R1): `Secp256k1.mul`, the ECDH path ─────────
+// ── re-audit (A1 k256 R1): `Secp256k1.mul`, the ECDH path ─────────
 //
 // `mul` takes the SECRET scalar of `sphinx`'s per-hop DH and `bolt8`'s Noise
 // DH. After the windowed multiply (F5, `1ce3087e`) the dead stack held the
@@ -291,7 +291,7 @@ var cur_scalar: [32]u8 = undefined;
 /// Leaves the projective result as is: a consumer that returns right after
 /// `mul` runs nothing that would overwrite its dead frames. (Encoding the
 /// point here first — a field inversion — happens to overwrite them, and the
-/// probe then reads 0 with or without the burn: measured 2026-09-15.)
+/// probe then reads 0 with or without the burn: measured.)
 noinline fn callMul() void {
     cur_point.mulInto(&point_sink, &cur_scalar, .big) catch unreachable;
     std.mem.doNotOptimizeAway(&point_sink);
@@ -339,7 +339,7 @@ test "STACKPROBE (A1 R1): no scalar residue on the dead stack after Secp256k1.mu
     try std.testing.expectEqual(@as(usize, 0), le_hits);
 }
 
-// ── review 2026-10-08: `sign.bip340Sign` ─────────────────────────────────────
+// ── review: `sign.bip340Sign` ─────────────────────────────────────
 //
 // The README's and the example's Schnorr signer, until now outside every
 // probe (SPEC "Secret residue on the dead stack" listed it as not covered). The needles are BIP340's secrets re-derived here: the key, the
@@ -411,7 +411,7 @@ test "STACKPROBE (review 2026-10-08): no key or nonce residue on the dead stack 
     }
 }
 
-// ── review 2026-10-08: `Secp256k1.combMulBase` ───────────────────────────────
+// ── review: `Secp256k1.combMulBase` ───────────────────────────────
 //
 // The fixed-base multiply every key derivation runs on a SECRET scalar
 // (bip32's `pubkeyFromPriv`, taproot's tweak, frost/dkg shares). `mul` burns

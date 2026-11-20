@@ -61,7 +61,7 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
 
     var v: [32]u8 = @as([32]u8, @splat(0x01));
     var k: [32]u8 = @as([32]u8, @splat(0x00));
-    // A1/k256.md G2: `v`/`k` (the DRBG state) and `buf`/`buf2` (which carry
+    // A1 audit G2: `v`/`k` (the DRBG state) and `buf`/`buf2` (which carry
     // `privkey` and, once the loop finds a candidate, the nonce material
     // itself) used to survive unzeroed on the dead stack after this function
     // returns — measured (`.zig-cache/probe/k256_g2_zeroize.zig`, paint +
@@ -140,7 +140,7 @@ pub const Signature = struct { r: [32]u8, s: [32]u8, recid: u2 };
 /// On return, the stack below this frame that the signing computation used
 /// has been overwritten with zeros (see `burnSignStack`).
 ///
-/// The key by pointer (BREAKING 2026-10-08): by value, the caller's frame kept
+/// The key by pointer (BREAKING): by value, the caller's frame kept
 /// a copy of it (`stackprobe_test.zig`, direct-region engine).
 pub fn sign(privkey: *const [32]u8, hash32: [32]u8) SignError!Signature {
     const result = signInner(privkey, hash32, combMulBaseCommit);
@@ -150,7 +150,7 @@ pub fn sign(privkey: *const [32]u8, hash32: [32]u8) SignError!Signature {
 
 /// The nonce commitment `R = k·G`. A parameter of `signInner` only so a test
 /// can hand the REAL signing code an `R` whose x-coordinate is ≥ n — the
-/// recovery-id bit 1 case (A1/k256.md G7), which a genuine nonce reaches with
+/// recovery-id bit 1 case (A1 audit G7), which a genuine nonce reaches with
 /// probability ~2^-128. Production passes `Secp256k1.combMulBase`, and only
 /// production calls `sign`.
 const CommitFn = fn ([32]u8, std.builtin.Endian) IdentityElementError!Secp256k1;
@@ -163,11 +163,11 @@ fn combMulBaseCommit(k: [32]u8, endian: std.builtin.Endian) IdentityElementError
 
 /// How much stack below `sign`'s frame is zeroed after every signature.
 ///
-/// A1/k256.md G2. Zeroing named locals is not enough and cannot be made
+/// A1 audit G2. Zeroing named locals is not enough and cannot be made
 /// enough from this file: after `signInner` returns, its callees' dead frames
-/// held the nonce `k` SIX times per signature (measured 2026-09-16 with
+/// held the nonce `k` SIX times per signature (measured with
 /// `stackprobe_test.zig`, ReleaseFast: `k` big-endian ×1 — the ABI copy of
-/// the `combMulBase(k_bytes)` argument the 2026-09-11 disassembly found — the
+/// the `combMulBase(k_bytes)` argument the disassembly found — the
 /// std scalar field's Montgomery image of `k` ×3, of `k⁻¹` ×1, and of `d` ×1),
 /// every one of them a compiler-made copy inside a by-value callee (`Scalar`'s
 /// `invert`/`mul`/`toBytes` are std's and take `Fe` by value) with no name the
@@ -179,7 +179,7 @@ fn combMulBaseCommit(k: [32]u8, endian: std.builtin.Endian) IdentityElementError
 ///
 /// The number is measured, not guessed: with the burn call removed, the probe
 /// reads the call tree dirtying 2 608 B below the call site (ReleaseFast,
-/// x86_64, 2026-09-16), and 16 KiB covers that about six times over. The probe
+/// x86_64), and 16 KiB covers that about six times over. The probe
 /// asserts ZERO residue in every representation, so a call tree that outgrows
 /// the burn goes red there.
 const sign_stack_burn = 16 * 1024;
@@ -190,11 +190,11 @@ const sign_stack_burn = 16 * 1024;
 /// the burn would clear nothing that held a secret. Volatile stores keep the dead store.
 noinline fn burnSignStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -217,7 +217,7 @@ noinline fn signInner(privkey_ptr: *const [32]u8, hash32: [32]u8, comptime commi
     const R = commit(k_bytes, .big) catch return error.InvalidNonce;
     const Ra = R.affineCoordinates();
     // ECDSA (SEC 1 §4.1.3) defines r = x(R) mod n, and std's signer and
-    // libsecp256k1 both reduce. A1/k256.md G7: this line used to be
+    // libsecp256k1 both reduce. A1 audit G7: this line used to be
     // `Scalar.fromBytes(x(R))`, which REJECTS x ≥ n — so a nonce whose R.x
     // landed in [n, p) made `sign` return error.InvalidNonce instead of a
     // signature, and the recid bit-1 line below could never execute. Measured
@@ -388,7 +388,7 @@ test "recoverPubkey: r=0 and s=0 are rejected (error.InvalidScalar), not silentl
 // under ANY nonce: the round-trip signs and then recovers with the same
 // code, so replacing `rfc6979Nonce` with a constant — catastrophic, since
 // two signatures under one key then reveal the private key by elementary
-// algebra — left all 34 of k256's tests green (measured 2026-08-13, exit 0).
+// algebra — left all 34 of k256's tests green (measured, exit 0).
 // The only thing in the repository that went red was a CONSUMER,
 // `lninvoice`'s BOLT#11 encode KAT. `ecdsa_recover` was moved here FROM
 // `lninvoice`, and its anchor stayed behind; this brings one back.
@@ -399,7 +399,7 @@ test "recoverPubkey: r=0 and s=0 are rejected (error.InvalidScalar), not silentl
 // implementation's test suite. They are ATTRIBUTED, under CC-BY 4.0: see
 // `../NOTICE`.
 //
-// ⛔ CORRECTED 2026-09-09. This comment used to call them "a test oracle under
+// ⛔ CORRECTED. This comment used to call them "a test oracle under
 // NOTICE policy §0". They are not. §0's oracle carve-out is for the observable
 // behaviour of a program that was RUN, and it says in as many words that
 // "numbers read out of an upstream source file by a script are reproduced data,
@@ -463,7 +463,7 @@ test "RFC 6979 nonce anchor: BOLT#11's own worked example signs to its published
     try testing.expectEqualSlices(u8, &spec_node_id, &recovered.toCompressedSec1());
 }
 
-// ── A1/k256.md G7: recovery-id bit 1, `R.x ≥ n` ─────────────────────────────
+// ── A1 audit G7: recovery-id bit 1, `R.x ≥ n` ─────────────────────────────
 //
 // No signer will ever produce this case (a nonce lands `R.x` in `[n, p)` with
 // probability ~2^-128), and none is needed to test it. Recovery
@@ -586,7 +586,7 @@ test "G7: sign sets recid bit 1 and reduces r when R.x >= n (R injected through 
     try testing.expect(real.recid & 2 == 0);
 }
 
-// Mutation run 2026-10-05: dropping `d.isZero()` left the suite green. With
+// Mutation run: dropping `d.isZero()` left the suite green. With
 // d = 0 the signer still produces `s = k⁻¹·e`, a "signature" under the point
 // at infinity. SEC 1 v2 §3.2.1: a private key is in [1, n − 1].
 test "sign refuses a private key of 0, n, or above n" {
@@ -605,7 +605,7 @@ test "sign refuses a private key of 0, n, or above n" {
     _ = try sign(&top, hash);
 }
 
-// Mutation run 2026-10-05: dropping the `x_wide >= p` check left the suite
+// Mutation run: dropping the `x_wide >= p` check left the suite
 // green. recid bit 1 means x(R) = r + n, a field element only for
 // r < p − n (~2^128.6). r = p − n gives exactly p (refused by `Fe.fromBytes`
 // even without the check); r = n − 1 gives 2n − 1 > 2^256, which does not fit
@@ -634,7 +634,7 @@ test "isLowS: half-order boundary" {
     try testing.expect(!isLowS(high));
 }
 
-// ── 2026-11-14 stale-audit mutation run: tests the run asked for ────────────
+// ── stale-audit mutation run: tests the run asked for ────────────
 
 test "sK: sign refuses r = 0 (R.x = n) and s = 0 (e = −r·d) through the signing seam" {
     const n = scalarmod.field_order;

@@ -54,14 +54,14 @@ pub const SignError = error{ InvalidSecretKey, InvalidNonce };
 
 /// BIP340 "Default Signing". Returns the 64-byte `r || s` signature.
 ///
-/// Review 2026-10-08 R3 (HIGH): the dead stack held the effective scalar `d`
+/// Review R3 (HIGH): the dead stack held the effective scalar `d`
 /// once and the nonce `k'`/`n − k'` up to twice per signature (ReleaseFast,
 /// `stackprobe_test.zig`) — and a nonce next to its published signature is the
 /// private key. Same shape as `ecdsa_recover.sign` (A1 G2): the computation
 /// runs one frame down, then `bip340_stack_burn` bytes at that depth are
 /// zeroed.
 ///
-/// The key by pointer (BREAKING 2026-10-08): by value, the caller's frame kept
+/// The key by pointer (BREAKING): by value, the caller's frame kept
 /// a copy of it (`stackprobe_test.zig`, direct-region engine).
 pub fn bip340Sign(secret_key: *const [32]u8, msg: []const u8, aux_rand: [32]u8) SignError![64]u8 {
     const result = bip340SignInner(secret_key, msg, aux_rand);
@@ -69,17 +69,17 @@ pub fn bip340Sign(secret_key: *const [32]u8, msg: []const u8, aux_rand: [32]u8) 
     return result;
 }
 
-/// `bip340SignInner`'s call tree reached 2.7 KiB in ReleaseFast (2026-10-08);
+/// `bip340SignInner`'s call tree reached 2.7 KiB in ReleaseFast;
 /// `stackprobe_test.zig` goes red when it outgrows this.
 const bip340_stack_burn = 16 * 1024;
 
 noinline fn burnBip340Stack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -244,7 +244,7 @@ pub fn ecdsaVerifyLowS(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8)
 /// the verifier that enforces it; the two must never disagree on the boundary.
 pub const isLowS = @import("ecdsa_recover.zig").isLowS;
 
-// Mutation run 2026-10-05: with the double-base multiply's identity-input
+// Mutation run: with the double-base multiply's identity-input
 // check removed, every test stayed green — and this forgery verified. SEC 1
 // v2 §3.2.2.1: a valid public key is not O, and `fromSec1` decodes the
 // one-octet `00` as O. Under Q = O the verification equation

@@ -84,7 +84,7 @@ pub const Secp256k1 = struct {
     /// `rejectIdentity` with the verdict laundered through `blackBox`, so it
     /// compiles to ONE conditional jump. The comb's endpoint check (it reveals
     /// only "the result is O", i.e. `s ≡ 0 mod n`): with the plain form LLVM
-    /// split it into two jumps after the w = 6 rewrite (2026-11-13, ctgrind
+    /// split it into two jumps after the w = 6 rewrite (ctgrind
     /// `comb` row: two contexts at the same line instead of one).
     fn rejectIdentityOneBranch(p: Secp256k1) IdentityElementError!void {
         const affine_0 = @intFromBool(p.x.equivalent(AffineCoordinates.identityElement.x)) &
@@ -289,7 +289,7 @@ pub const Secp256k1 = struct {
     /// CONSTANT-TIME scalar multiply `s·p` for a possibly-SECRET scalar and an
     /// arbitrary point — the ECDH path (`sphinx` per hop, `bolt8`'s Noise DH).
     ///
-    /// Fixed-window signed-digit multiply (A1/k256.md F5): the scalar is
+    /// Fixed-window signed-digit multiply (A1 audit F5): the scalar is
     /// recoded into `comb_t` base-2^4 digits in `[−8, 7]` by `signedDigit`, a
     /// table `(1..8)·p` is built once per call (`varBaseTable`), and the result
     /// is evaluated high window first — four doublings and ONE add per window,
@@ -317,8 +317,8 @@ pub const Secp256k1 = struct {
     /// `mul` with the scalar by pointer and the product into `out` (zeroed on
     /// error). `mul` keeps std's curve shape (std's `Ecdsa(Curve)` calls
     /// `Curve.basePoint.mul(k, .big)`), so the caller's frame keeps a copy of
-    /// the scalar it passed (`stackprobe_test.zig`, direct-region engine,
-    /// 2026-10-08); this form leaves none. Burned like `mul`.
+    /// the scalar it passed;
+    /// this form leaves none. Burned like `mul`.
     pub fn mulInto(p: Secp256k1, out: *Secp256k1, s_: *const [32]u8, endian: std.builtin.Endian) IdentityElementError!void {
         const result = mulIntoInner(p, out, s_, endian);
         burnMulStack();
@@ -337,20 +337,20 @@ pub const Secp256k1 = struct {
         return mulWithTable(&tab, s_.*, endian);
     }
 
-    /// A1 k256 R1 (re-audit 2026-09-15). The windowed multiply left the u256
+    /// A1 k256 R1 (re-audit). The windowed multiply left the u256
     /// image of the SECRET scalar on the dead stack twice per call at
     /// ReleaseFast (the ladder before it: once) — compiler-made copies of the
     /// wide shifts in the recoding, not a named local: zeroing `k` itself
-    /// changed nothing (measured). As in `ecdsa_recover.sign` (G2), the fix is
+    /// changed nothing. As in `ecdsa_recover.sign` (G2), the fix is
     /// on the region: zero `mul_stack_burn` bytes at `mulInner`'s depth.
     /// `noinline` on both is load-bearing. Pinned by `stackprobe_test.zig`.
     noinline fn burnMulStack() void {
         // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-        // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+        // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
         // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
         // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
         // between the buffer top and the saved frame pointer unzeroed -- a callee's
-        // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+        // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
         // the buffer alone did not stop it). At 16 the frame needs no realignment and
         // the buffer ends at the saved frame pointer.
         const V = @Vector(2, u64);
@@ -401,12 +401,12 @@ pub const Secp256k1 = struct {
         }
         // One jump, as the comb's endpoint: with the plain form LLVM split the
         // verdict into two jumps on `-mcpu=x86_64` (ctgrind `mul` 2 in-file
-        // instead of 1, 2026-11-18); the verdict itself is the public outcome.
+        // instead of 1); the verdict itself is the public outcome.
         try acc.rejectIdentityOneBranch();
         return acc;
     }
 
-    /// The constant-time `mul` this module shipped until 2026-09-16: a fixed
+    /// The constant-time `mul` this module shipped previously: a fixed
     /// 256-iteration double-and-add with a branch-free `cMov` bit select. Kept
     /// as `mul`'s differential oracle (as `mulPublicDoubleAdd` is for the GLV
     /// core); no production path calls it.
@@ -433,7 +433,7 @@ pub const Secp256k1 = struct {
     /// table already carries the `2^(w·i)` factor. `error.IdentityElement` iff
     /// `s ≡ 0 (mod n)`. See the comb section below for the CT-gather contract.
     pub inline fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
-        // Zig 0.17 (2026-10-19): a `[32]u8` argument to a non-inline Zig-CC
+        // Zig 0.17: a `[32]u8` argument to a non-inline Zig-CC
         // function is no longer passed in four GPRs (0.16) but by reference to
         // a copy the CALLER makes in its own frame. With `combMulBase` inlined
         // into its caller, that copy (for `combMulBaseInner`) sat in the
@@ -441,7 +441,7 @@ pub const Secp256k1 = struct {
         // (`stackprobe_test.zig`, ReleaseFast, BE needle at 111 B; bip32
         // `neuter` the same). So the scalar goes down by pointer to a local
         // this function owns and zeroes; the burn still covers everything below.
-        // `inline` (2026-10-19): in ReleaseSmall nothing inlined this, so the
+        // `inline`: in ReleaseSmall nothing inlined this, so the
         // by-value `s_` was the CALLER's copy, above the burn (BE=5 at 127 B,
         // also on 0.16). Inlined, `s` below is that copy, and it is zeroed.
         var s = s_;
@@ -457,7 +457,7 @@ pub const Secp256k1 = struct {
         return combMulBaseWithTable(&comb_table, s_.*, endian);
     }
 
-    /// Review 2026-10-08. Same class as `mul`'s A1 R1: the comb multiply left
+    /// Review. Same class as `mul`'s A1 R1: the comb multiply left
     /// the little-endian image of the SECRET scalar on the dead stack once per
     /// call (ReleaseFast, `stackprobe_test.zig`), under every key derivation
     /// built on it (bip32, taproot, frost/dkg shares). Same fix: zero
@@ -465,11 +465,11 @@ pub const Secp256k1 = struct {
     /// both is load-bearing.
     noinline fn burnCombStack() void {
         // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-        // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+        // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
         // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
         // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
         // between the buffer top and the saved frame pointer unzeroed -- a callee's
-        // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+        // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
         // the buffer alone did not stop it). At 16 the frame needs no realignment and
         // the buffer ends at the saved frame pointer.
         const V = @Vector(2, u64);
@@ -484,7 +484,7 @@ pub const Secp256k1 = struct {
     /// PUBLIC loop counters — never by a secret — so this stays constant-time
     /// for any table. `pub` for that harness (cf. `mulPublicDoubleAdd`).
     ///
-    /// Since 2026-11-13 the shape of `p256`'s `combMulBaseFastWithTable`
+    /// Since the shape of `p256`'s `combMulBaseFastWithTable`
     /// (and of libsecp256k1's `ecmult_gen`): w = 6, an AFFINE table, a
     /// Jacobian accumulator with the incomplete constant-time mixed addition
     /// (`addMixedCtJac`, 8M + 3S, against the complete projective 12M + 2·m_b)
@@ -848,7 +848,7 @@ fn glvCombine(comptime k: usize, tabs: *const [k][glv_table_len]Secp256k1, es: *
 // per signed digit, gathered constant-time from the table (the technique behind
 // libsecp256k1's `ecmult_gen`).
 //
-// Design (w = 6, since 2026-11-13; w = 4 projective before): the scalar is
+// Design (w = 6,; w = 4 projective before): the scalar is
 // recoded into `fb_t = 43` signed digits of `w` bits, d_i ∈ [−2^(w−1),
 // 2^(w−1)−1] (a running-carry Booth recoding, so Σ d_i·2^(w·i) = k exactly
 // for every raw 256-bit scalar: the top window holds 4 scalar bits, so its
@@ -872,7 +872,7 @@ const comb_teeth: usize = 1 << (comb_w - 1); // 8
 /// Number of windows: 256/w low windows plus one to absorb the recoding carry.
 const comb_t: usize = (256 / comb_w) + 1; // 65
 
-/// Fixed-base comb (`combMulBase`) window width in bits (2026-11-13; it
+/// Fixed-base comb (`combMulBase`) window width in bits (it
 /// shared `mul`'s w = 4 projective layout before). `p256`'s fixed-base
 /// layout, and libsecp256k1's default table size (86 KiB).
 const fb_w: usize = 6;
@@ -892,7 +892,7 @@ comptime {
 
 /// The precomputed fixed-base table type: `[window][magnitude−1]` AFFINE
 /// points, `43 · 32 · 64 B = 88 064 B` of `.rodata` (was `65 · 8 · 96 B =
-/// 49 920 B`, w = 4 projective, until 2026-11-13).
+/// 49 920 B`, w = 4 projective, previously).
 pub const CombTable = [fb_t][fb_teeth]AffineCoordinates;
 
 /// Jacobian `(X : Y : Z)` ↔ affine `(X/Z², Y/Z³)` for the constant-time comb
@@ -945,7 +945,7 @@ pub const VarBaseTable = [comb_teeth]Secp256k1;
 const mul_stack_burn = 16 * 1024;
 
 /// Bytes `Secp256k1.burnCombStack` zeroes below `combMulBase`'s frame after
-/// every call. Its call tree reached 1.3 KiB in ReleaseFast (2026-10-08);
+/// every call. Its call tree reached 1.3 KiB in ReleaseFast;
 /// `stackprobe_test.zig` goes red when it outgrows this.
 const comb_stack_burn = 8 * 1024;
 
@@ -978,7 +978,7 @@ inline fn signedDigit(k: u256, i: usize, carry: *u64) SignedDigit {
 /// linear scan touching EVERY entry of the row, then a masked negation. The
 /// per-entry select mask is laundered through `blackBox` so LLVM cannot
 /// recover "pick the entry where j+1 == mag" and lower it to a secret-indexed
-/// jump table (`jmp *tbl(,%reg,8)`) — the exact powMont-gather leak class
+/// jump table (`jmp *tbl(%reg,8)`) — the exact powMont-gather leak class
 /// (montint b199192). The negation computes `−y` unconditionally and selects
 /// with a branch-free `cMov`.
 inline fn gatherSigned(row: *const [comb_teeth]Secp256k1, mag: u64, is_neg: u64) Secp256k1 {
@@ -1196,7 +1196,7 @@ test "recoverY / lift_x matches std" {
     }
 }
 
-// Mutation run 2026-10-05: relaxing the `00` and `04` length checks to `<`,
+// Mutation run: relaxing the `00` and `04` length checks to `<`,
 // or adding an X9.62 hybrid arm (06/07, which libsecp256k1 accepts), left
 // every test green. The grammar this decoder documents — and std's
 // `fromSec1`, its oracle — is exactly 00 | 02/03 x | 04 x y, so each of these
@@ -1219,7 +1219,7 @@ test "fromSec1 refuses what std refuses: trailing bytes after 00/02/04, hybrid 0
     _ = try Secp256k1.fromSec1(&co);
 }
 
-// Mutation run 2026-10-05: dropping either `rejectIdentity` input check in the
+// Mutation run: dropping either `rejectIdentity` input check in the
 // GLV double-base path left the suite green, although the double-add
 // fallback it must agree with refuses an identity base. The check is what
 // keeps `ecdsaVerify` from accepting the `00` public key (see sign.zig).
@@ -1266,7 +1266,7 @@ const Sec1Corpus = struct {
     /// ⛔ `tag == 4` opens a SECOND knob — `smith.value(u8)`, which decides
     /// the arbitrary octet `buf[0]` becomes — and a seed that stops after the
     /// tag word leaves it reading an exhausted input, i.e. the range minimum,
-    /// i.e. `0x00`. Measured 2026-09-08: the seed labelled "an arbitrary tag
+    /// i.e. `0x00`. Measured: the seed labelled "an arbitrary tag
     /// octet" produced `0x00` on every replay, indistinguishable from the
     /// `tag == 0` seed beside it, while the guard below still recorded the
     /// branch as taken. `octet` is the word that knob reads.
@@ -1395,7 +1395,7 @@ test "corpus: every SEC1 seed reaches the decoder, and the counts are pinned" {
     try std.testing.expectEqual(true, tags_seen[5]);
     // ⛔ And the SECOND knob, behind `which == 4`. `tags_seen[4]` above says
     // the branch was TAKEN; it says nothing about what the branch drew, and
-    // until 2026-09-08 the answer was `0x00` on every seed because no seed
+    // previously the answer was `0x00` on every seed because no seed
     // carried the word `smith.value(u8)` reads. Distinct octets actually
     // written into `buf[0]` is the number that notices.
     try std.testing.expectEqual(@as(usize, 2), distinctOctets(&octets)); // 0x99 and 0x02
@@ -1443,7 +1443,7 @@ test "the local seedInto helper produces what Smith.slice reads back" {
     try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }
 
-// ── 2026-11-14 stale-audit mutation run: tests the run asked for ────────────
+// ── stale-audit mutation run: tests the run asked for ────────────
 
 test "sK: every identity encoding is rejected / mapped to the affine identity; near-identities are not" {
     const zero = field.Fe.zero;

@@ -20,7 +20,7 @@
 //!     a mixed addition; the accumulator lives on the isomorphic curve and the
 //!     common `Z` is multiplied back into its `Z` at the end. (`a = 0`, so the
 //!     formulas never see the curve constant that the isomorphism changes.)
-//!   * **Weak field elements** (`F`, since 2026-11-13): values `< 2^256`, not
+//!   * **Weak field elements** (`F`,): values `< 2^256`, not
 //!     reduced below `p` between operations, so add/sub/mul skip the masked
 //!     canonicalising select `Fe` pays (see `F`). Branch-free like `Fe`,
 //!     but not a constant-time claim: public data only.
@@ -56,7 +56,7 @@ const Fe = field.Fe;
 // folds and a masked add of the final carry, instead of `Fe.mul`'s
 // canonicalising four-limb select).
 // Zero tests compare against both representatives, `0` and `p`.
-// Measured 2026-11-13 (`zig build bench-bip340`): see SPEC § Performance.
+// Measured (`zig build bench-bip340`): see SPEC § Performance.
 
 const p_int: u256 = field.field_order;
 const c_fold: u256 = (1 << 32) + 977; // 2^256 − p
@@ -219,7 +219,7 @@ const Jw = struct {
     /// `Y3 = L·(T − X3) − S²`, `Z3 = Y·Z` — dbl-2009-l's point with `Z` halved
     /// (so `X` quartered, `Y` divided by eight), which trades one square for a
     /// multiply and five of its eleven additions for one halving. Until
-    /// 2026-11-13 this was dbl-2009-l itself (2M + 5S). secp256k1 has no point
+    /// this was dbl-2009-l itself (2M + 5S). secp256k1 has no point
     /// of order two (its order is an odd prime), so `Y = 0` never occurs.
     fn dbl(a: Jw) Jw {
         if (a.inf) return a;
@@ -330,7 +330,7 @@ pub const GlvHalf = struct { mag: u256, negative: bool };
 /// because the curve group has prime order `n` (`s·P = (s mod n)·P`) — the
 /// portable double-and-add scans raw bits and agrees for the same reason.
 ///
-/// Since 2026-11-13 over the integers (`splitInteger`), not through std's
+/// Since over the integers (`splitInteger`), not through std's
 /// Montgomery scalar field: the lattice gives both halves exactly, so no
 /// reduction mod `n` is needed. Same halves as the `splitScalar` route
 /// (`splitToSignedHalvesViaScalar`, its test oracle).
@@ -407,7 +407,7 @@ pub fn wnafDigits(comptime w: u5, h: GlvHalf) [wnaf_len]i16 {
     var v = h.mag;
     var i: usize = 0;
     while (v != 0) : (i += 1) {
-        // Skip the run of zero bits in one step (2026-11-13; it was one
+        // Skip the run of zero bits in one step (it was one
         // 256-bit shift per bit): same digits, ~w× fewer wide shifts.
         const z: u8 = @intCast(@ctz(v));
         v >>= z;
@@ -965,7 +965,7 @@ test "affineCoordinatesPublic == affineCoordinates (random projective points, id
     try std.testing.expectEqual(o.affineCoordinates().y.toInt(), o.affineCoordinatesPublic().y.toInt());
 }
 
-// Mutation run 2026-10-08: with G as the SECOND base the dispatch could pass
+// Mutation run: with G as the SECOND base the dispatch could pass
 // the two scalars swapped and the suite stayed green — every caller puts G
 // first. Distinct scalars, G in either position, against the double-add oracle.
 test "mulDoubleBasePublic: G as the second base takes its own scalar" {
@@ -985,7 +985,7 @@ test "mulDoubleBasePublic: G as the second base takes its own scalar" {
     try std.testing.expectEqual(want.x.toInt(), got_g_first.x.toInt());
 }
 
-// Mutation run 2026-10-08: the `z = 0` test in `affineCoordinatesPublic` could
+// Mutation run: the `z = 0` test in `affineCoordinatesPublic` could
 // go and the suite stayed green, because the only identity it saw was the
 // constant `(0 : 1 : 0)`, which the affine-(0, 1) test also catches. The
 // complete law's `P + (−P)` is `(0 : Y : 0)` with any `Y`.
@@ -1002,7 +1002,7 @@ test "affineCoordinatesPublic: an identity with z = 0 and y ∉ {0, 1}" {
     try std.testing.expectEqual(want.y.toInt(), got.y.toInt());
 }
 
-// ── 2026-11-14 stale-audit mutation run: tests the run asked for ────────────
+// ── stale-audit mutation run: tests the run asked for ────────────
 
 test "sK: F.isZero accepts exactly 0 and p, limb by limb" {
     try std.testing.expect(F.isZero(.{ .v = 0 }));

@@ -150,14 +150,14 @@ fn eqAffineStd(k: Secp256k1, s: StdCurve) !void {
 // double-and-add) times 4000 draws: measured ~2m9s for this test ALONE under
 // full-gate-level machine load (`nproc`=8, load average ~165 from other
 // concurrent test lanes) -- close enough to a 3-minute per-test budget that
-// the full gate timed it out (audit A1, 2026-09-15 attempt 4). ReleaseFast
+// the full gate timed it out (audit A1, attempt 4). ReleaseFast
 // has no such problem (comb + std's own optimized path, both fast), so only
 // Debug's random-draw count is cut; every named edge scalar below still runs
 // in every mode -- this is a coverage TRIM, not a coverage DROP, and the
 // mutant check at the end of this file (comb positive control) still runs
 // the same 500 draws in both modes since it doesn't touch std's slow path.
 // 300 (the previous cut, `14b2e983`) still ran ~9s isolated -- material
-// against the module's own <40s-in-Debug budget (k256, audit A1 2026-09-15
+// against the module's own <40s-in-Debug budget (k256, audit A1
 // attempt 6, `group.test.differential` timed the full gate out separately;
 // fixing that alone left this test as the next-largest contributor). Cut
 // further; every named edge scalar below is unconditional in all modes.
@@ -406,14 +406,14 @@ test "GATED differential: mulDoubleBasePublic (GLV 4-way) == portable double-add
     try std.testing.expect(want_single.equivalent(got_single));
 }
 
-// ── A1/k256.md fix-campaign guard tests ──────────────────────────────────
+// ── A1 audit fix-campaign guard tests ──────────────────────────────────
 //
 // F2/F3/F9: three validations the audit showed the suite could lose (source
 // deleted, or the check simply never called) without a single test going
 // red. Each test below is a genuine black-box regression test — mutating
 // away the guard it names changes the OBSERVABLE return value of a public
 // function, so these were verified RED (mutant) → GREEN (revert) by hand
-// during the fix pass; see `A1/k256.md`'s 2026-09-10 disposition for the
+// during the fix pass; see A1 audit's disposition for the
 // exact mutation and `scripts/modtest k256` output.
 
 test "F2: fromAffineCoordinates / fromSec1 reject an off-curve point" {
@@ -463,9 +463,9 @@ test "F3: Secp256k1.mul(P, s) rejects s ≡ 0 (mod n), same as combMulBase" {
     try std.testing.expect(from_mul.equivalent(from_comb));
 }
 
-// ── A1/k256.md F5: the windowed constant-time `mul` (P5 evidence) ─────────
+// ── A1 audit F5: the windowed constant-time `mul` (P5 evidence) ─────────
 //
-// `mul` stopped being the 256-bit ladder on 2026-09-16. The ladder stays as
+// `mul` is no longer the 256-bit ladder. The ladder stays as
 // `mulLadder`, and these two tests are what licenses the swap: every result
 // must equal the ladder's AND std's at the affine level, error for error, on
 // random scalars and on the shapes random scalars never produce (all-negative

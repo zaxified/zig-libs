@@ -133,7 +133,7 @@ test "bench (opt-in via K256_BENCH)" {
         std.debug.print("std       scalarmul (CT G·s): {d:>8} ns/op\n", .{dt / smul_iters});
     }
 
-    // ── A1/k256.md F5: CONSTANT-TIME variable-base multiply, interleaved A/B ──
+    // ── A1 audit F5: CONSTANT-TIME variable-base multiply, interleaved A/B ──
     // `mul` (windowed) vs `mulLadder` (the ladder it replaced) vs std's CT
     // `mul`, on a random NON-base point — the ECDH shape; std's base-point
     // path has a precomputed table and would flatter std. The three arms
@@ -295,10 +295,10 @@ test "bench (opt-in via K256_BENCH)" {
         std.mem.doNotOptimizeAway(sink);
         std.debug.print("{s} bip340 verify     : {d:>8} ns/op\n", .{ k256_label, dt / sig_iters });
 
-        // A1/k256.md G6: the bench used to skip the ONE secret-key path an
+        // A1 audit G6: the bench used to skip the ONE secret-key path an
         // in-repo consumer (`lninvoice`/BOLT#11) actually calls —
         // `ecdsa_recover.sign` (RFC 6979) and `recoverPubkey` — while
-        // measuring five things nothing in the repo calls. Added 2026-09-10.
+        // measuring five things nothing in the repo calls. Added.
         const ec_privkey = @as([32]u8, @splat(9));
         var ec_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(msg, &ec_hash, .{});

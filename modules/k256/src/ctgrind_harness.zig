@@ -30,11 +30,11 @@
 //!   through `blackBox` the doc comment says the "constant-time" scalar-mul
 //!   paths depend on.
 //! * `mul` — `Secp256k1.mul`, the CONSTANT-TIME variable-base multiply
-//!   (`group.zig`, `mul` → `mulInner` → `mulWithTable`: since 2026-09-16 a
+//!   (`group.zig`, `mul` → `mulInner` → `mulWithTable`: a
 //!   65-window signed-digit multiply sharing the comb's recoding and masked
 //!   gather; the 256-iteration ladder it replaced is `mulLadder`, which no
 //!   target drives), with the scalar tainted, over a point decoded AT RUNTIME
-//!   (2026-09-15, A1 R2 — until then the comptime base point, whose per-call
+//!   (A1 R2 — until then the comptime base point, whose per-call
 //!   table LLVM could fold: a different binary from the ECDH path).
 //! * `comb` — `Secp256k1.combMulBase`, the fixed-base comb that the signing
 //!   path actually calls (`group.zig`, `combMulBaseWithTable`), with the scalar tainted. Its
@@ -48,26 +48,26 @@
 //!   tainted 32-byte private key over a PUBLIC message hash. The module's
 //!   OTHER shipped secret path (`lninvoice`'s BOLT#11 signer is its in-repo
 //!   consumer), and the one the harness did not cover when it was added on
-//!   2026-08-13 — an omission that was neither measured nor listed as
+//!   — an omission that was neither measured nor listed as
 //!   deliberate, which is the same thing as an oversight from the outside.
 //!
 //! ## What the counts mean
 //!
 //! `mul`, `comb`, `sign` and `ecdsa` are all EXPECTED to report a small
 //! non-zero in-file count, and the point of the measurement is *which* lines.
-//! The measured attributions (`--stacks`, 2026-08-13; this paragraph used to
+//! The measured attributions (`--stacks`,; this paragraph used to
 //! say `group.zig:75` and "every one of them is a `rejectIdentity()`", and
 //! both halves were wrong — `rejectIdentity` is INLINED, so its own line
 //! never appears, and the majority of `sign`'s contexts are not it):
 //!
 //!   * `group.zig:347` — `mulWithTable`'s trailing `try acc.rejectIdentity()`,
-//!     1 context (2026-09-15, runtime point through `mulInner`; the same point
+//!     1 context (runtime point through `mulInner`; the same point
 //!     read 2 before `mulInner` existed, the base point 1; the ladder it
 //!     replaced read 2 at `group.zig:277`, LLVM having split the `z == 0` test
 //!     from the affine-identity test).
 //!   * `group.zig:553` — `combMulBaseWithTable`'s `try
 //!     proj.rejectIdentityOneBranch()` (`:399`, `acc.rejectIdentity()`, before
-//!     the 2026-11-13 w = 6 affine comb), 1 context per call: once in `comb`,
+//!     the w = 6 affine comb), 1 context per call: once in `comb`,
 //!     twice in `sign`, once in `ecdsa`. The plain `rejectIdentity` read 2 there
 //!     after the rewrite (LLVM split it into two jumps), hence the one-branch
 //!     form.
@@ -88,7 +88,7 @@
 //! `scalar.zig`, which re-exports std's field verbatim). `--pattern` is how
 //! that attribution gets re-checked instead of believed.
 //!
-//! `ecdsa`'s 11 (2026-09-16) are the same shape: `ecdsa_recover.zig:189`/`:190` on the
+//! `ecdsa`'s 11 are the same shape: `ecdsa_recover.zig:189`/`:190` on the
 //! caller's private key, `:118` on the DRBG output, `:119` the RFC 6979 §3.2
 //! retry test (a real branch on the SECRET nonce candidate — probability
 //! ≈2^-127, documented at the source in `ecdsa_recover.zig` rather than
@@ -108,7 +108,7 @@
 //! others: `mul`/`comb`/`sign` being non-zero proves the taint propagates
 //! through this module's arithmetic at all, so `field`'s zero means "no branch
 //! found", not "the harness is blind". Within `field`, `Fe.invert` runs a
-//! fixed addition chain (`onesRuns` + tail, since 2026-10-07; before that
+//! fixed addition chain (`onesRuns` + tail,; before that
 //! `powConst`, whose bit-loop branch was on the PUBLIC exponent `p − 2`): its
 //! only loops are the `sqn` counters, comptime-fixed, so untainted.
 //!
@@ -272,7 +272,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // builds its (1..8)·p table per call, and a comptime-known `p`
             // lets LLVM fold that table into constants — a different binary
             // from the ECDH path (`sphinx`, `bolt8`) this target stands for.
-            // Measured 2026-09-15 before `mulInner` existed: the base point
+            // Measured before `mulInner` existed: the base point
             // read 7/1, this point 8/2 (both in-file contexts the trailing
             // `rejectIdentity`); a secret-digit branch injected into the
             // window loop 9/3, at the injected line. Since `mulInner`: 7/1.
