@@ -158,7 +158,7 @@ registration time, not per request — `dispatch` remains allocation-free and lo
 **Residual risks and known edges.**
 - `any` and a failed `mount` are not atomic: a failing registration leaves what was inserted before it registered; treat them as startup failures, like every `add` error.
 - Regex constraint work is not pruned by `min_reach`: linear time, a constant factor.
-- `group("/x/*")` is not refused by `group()`: such a group can never register a route, the error comes at the first `add` (*Backlog / deferred*).
+- `group()` / `mount()` refuse a prefix with a `*wildcard` segment (`InvalidPrefix`): no route can sit below a wildcard (chi: `*` must be the last segment of a pattern).
 
 ## Verification
 
@@ -183,7 +183,6 @@ The bench is `zig build bench-router` (`tools/bench.zig` against go-chi/chi in `
 
 ## Backlog / deferred
 
-- **`group("/x/*")` refused up front.** A group whose prefix ends in a wildcard can never register a route; the error comes at the first `add`. Refusing it in `group()` would move the error earlier (an API change) and let the dead wildcard branch of `prefixCovers` go.
 - **Runtime `Router` static children.** They are still a hash-map `get` per level; not tried, an idea if the runtime router's speed is ever needed (`Static` already walks comptime node functions).
 
 ## Anchoring

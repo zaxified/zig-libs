@@ -370,7 +370,8 @@ pub const UseError = error{
 
 pub const GroupError = error{
     OutOfMemory,
-    /// Prefix must start with '/' and not end with '/' (e.g. "/api").
+    /// Prefix must start with '/' and not end with '/' (e.g. "/api"), and
+    /// no segment may be a `*wildcard`.
     InvalidPrefix,
 };
 
@@ -1207,7 +1208,7 @@ fn prefixCovers(prefix: []const u8, path: []const u8) ?usize {
         }
         switch (classifySegment(ps) catch return null) {
             .static => if (!std.mem.eql(u8, ps, seg)) return null,
-            .wildcard => return n + 1,
+            .wildcard => return null, // refused by `makeGroup`
             .param, .pattern => if (seg.len == 0) return null,
         }
         n += 1;
@@ -1228,6 +1229,13 @@ const RouteDef = struct {
 fn makeGroup(r: *Router, parent: ?*Group, prefix: []const u8) GroupError!*Group {
     if (prefix.len < 2 or prefix[0] != '/' or prefix[prefix.len - 1] == '/')
         return error.InvalidPrefix;
+    // A wildcard segment can never carry a route below it (chi refuses a
+    // `*` that is not the last segment of a route pattern), so refuse it
+    // here instead of at the first `add`.
+    var segs = std.mem.splitScalar(u8, prefix[1..], '/');
+    while (segs.next()) |seg| {
+        if (seg.len != 0 and seg[0] == '*') return error.InvalidPrefix;
+    }
     return newGroup(r, parent, prefix, false);
 }
 
@@ -3413,6 +3421,15 @@ test "groups: prefix validation" {
     try testing.expectError(error.InvalidPrefix, r.group("/api/"));
     try testing.expectError(error.InvalidPrefix, r.group("/"));
     try testing.expectError(error.InvalidPrefix, r.group(""));
+    // A wildcard segment can never hold a route: refused at group(), not at add().
+    try testing.expectError(error.InvalidPrefix, r.group("/x/*"));
+    try testing.expectError(error.InvalidPrefix, r.group("/x/*rest"));
+    try testing.expectError(error.InvalidPrefix, r.group("/*/x"));
+    const outer = try r.group("/ok");
+    try testing.expectError(error.InvalidPrefix, outer.group("/y/*"));
+    var sub = Router.init(testing.allocator);
+    defer sub.deinit();
+    try testing.expectError(error.InvalidPrefix, r.mount("/m/*", &sub));
 }
 
 test "add: pattern validation, duplicates, param conflicts, caps" {
@@ -4926,13 +4943,7 @@ test "an inline group's not_found is ignored for a group nested in it; a mounted
     }
 }
 
-test "insert re-checks the full prefixed pattern: wildcard prefix, empty interior segment, repeated capture, capture cap" {
-    {
-        var r = Router.init(testing.allocator);
-        defer r.deinit();
-        const g = try r.group("/f/*p");
-        try testing.expectError(error.InvalidPattern, g.get("/x", hRoot));
-    }
+test "insert re-checks the full prefixed pattern: empty interior segment, repeated capture, capture cap" {
     {
         var r = Router.init(testing.allocator);
         defer r.deinit();
