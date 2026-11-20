@@ -636,6 +636,30 @@ fn highFd(fd: i32) !i32 {
     return @intCast(rc);
 }
 
+test "indexSocketOwners: max_bytes caps the owner records at max_bytes / @sizeOf(SocketOwner) and sets truncated" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    const a = try highFd(try mkSock(linux.AF.INET, linux.SOCK.STREAM));
+    defer _ = linux.close(a);
+    const b = try highFd(try mkSock(linux.AF.INET, linux.SOCK.DGRAM));
+    defer _ = linux.close(b);
+
+    // Room for one record and a bit less than a second: this process alone
+    // holds two sockets, so the budget must cut the sweep at one record.
+    var one = try process.indexSocketOwners(gpa, io, .{ .max_bytes = 2 * @sizeOf(process.SocketOwner) - 1 });
+    defer one.deinit(gpa);
+    try testing.expect(one.truncated);
+    try testing.expectEqual(@as(usize, 1), one.owners.len);
+    // A budget below one record keeps none.
+    var none = try process.indexSocketOwners(gpa, io, .{ .max_bytes = @sizeOf(process.SocketOwner) - 1 });
+    defer none.deinit(gpa);
+    try testing.expect(none.truncated);
+    try testing.expectEqual(@as(usize, 0), none.owners.len);
+}
+
 test "indexSocketOwners: a max_owners cap ends the walk at the process that fills it; /proc entries that are not pids are not scanned (mutation audit)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});

@@ -130,7 +130,9 @@ its field lists and quirks and nothing was copied.
   (`max_owners`) and the descriptors examined across all processes (`max_total_fds`, one
   `readlinkat` each, socket or not); `truncated` is set when any cap fires. Worst-case work is
   `min(max_processes × max_fds_per_process, max_total_fds)` `readlinkat` calls; worst-case memory
-  is `max_owners` × 88 B. `SocketOwnerIndex.find`/`findAll` are O(log n).
+  is `max_owners` × 88 B. `max_bytes` (default unbounded) is an opt-in byte budget that lowers the
+  owner cap to `max_bytes / 88` (`ss`, `lsof` and prometheus/procfs have no cap, so the default
+  stays `max_owners`). `SocketOwnerIndex.find`/`findAll` are O(log n).
 - **`/proc/net/unix`.** `parseUnix`/`readUnix` take `UnixOptions{ .max_entries = 1 << 19 }` and
   return `UnixTable{ entries, truncated }`: the first valid row past the cap stops the parse, and
   exactly `max_entries` rows is not truncated. Forged short rows inside socket names amplify about
@@ -184,8 +186,7 @@ the `netlink` module's job.
 
 **`indexSocketOwners` default memory.** `SocketOwnerOptions.max_owners = 1 << 20` × 88 B is about
 92 MB live (up to about 2.5× while the list grows), the worst case a local user can force with
-dup'd sockets. It is bounded and documented; a lower default or a byte budget is an owner policy
-decision (*Backlog / deferred*).
+dup'd sockets. It is bounded and documented; `max_bytes` lets a caller set a smaller budget.
 
 Out of scope: writing to any `/proc`/`/sys` file (read-only by design); anything requiring
 elevated privileges beyond normal `/proc` read permissions.
@@ -274,8 +275,6 @@ authoritative figure.
 - **Conntrack reply tuple and `mark`/`use`/`packets`/`bytes`.** `ConntrackFlow` decodes the
   original-direction tuple only, which the type says; the reply tuple is where NAT translation is
   visible and deserves explicit modelling rather than four more fields.
-- **`indexSocketOwners` default memory.** `SocketOwnerOptions.max_owners = 1 << 20` × 88 B is about
-  92 MB live; a lower default (or a byte budget) is an owner policy decision.
 
 ## Anchoring
 

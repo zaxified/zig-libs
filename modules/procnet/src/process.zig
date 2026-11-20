@@ -161,6 +161,13 @@ pub const SocketOwnerOptions = struct {
     /// because neither walk cap had fired. Roughly 712 KB of allocation per
     /// real socket(`procnet` F7).
     max_owners: usize = 1 << 20,
+    /// Opt-in memory budget for the owner records, in bytes: the effective
+    /// owner cap is `min(max_owners, max_bytes / @sizeOf(SocketOwner))`
+    /// (88 B per record). The default is unbounded, so `max_owners` alone
+    /// decides; a caller that must stay under a fixed footprint sets this
+    /// (`truncated` is set when it fires). `ss`/`lsof` and prometheus/procfs
+    /// have no cap at all, hence no default one here.
+    max_bytes: usize = std.math.maxInt(usize),
     /// Stop once this many descriptors have been examined across ALL
     /// processes (every examined descriptor costs one `readlinkat`, socket or
     /// not); `truncated` is set. Neither `max_owners` nor the per-process cap
@@ -310,6 +317,7 @@ pub fn indexSocketOwners(
     var vanished: u32 = 0;
     var truncated = false;
     var total_fds: usize = 0;
+    const owner_cap = @min(opts.max_owners, opts.max_bytes / @sizeOf(SocketOwner));
 
     var proc_dir = std.Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch
         return .{ .owners = try out.toOwnedSlice(gpa), .scanned = 0, .denied = 0, .vanished = 0, .truncated = false };
@@ -362,7 +370,7 @@ pub fn indexSocketOwners(
                 truncated = true;
                 break;
             }
-            if (out.items.len >= opts.max_owners) {
+            if (out.items.len >= owner_cap) {
                 truncated = true;
                 break;
             }
@@ -397,7 +405,7 @@ pub fn indexSocketOwners(
                 .name_len = name_len,
             });
         }
-        if (out.items.len >= opts.max_owners) {
+        if (out.items.len >= owner_cap) {
             truncated = true;
             break;
         }
