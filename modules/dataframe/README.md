@@ -6,7 +6,7 @@ array (`int`, `float`, `bool`, `decimal`, `text`, or `boxed` cells of mixed kind
 validity bitmap where it has nulls. Rows have no labels, as in polars: a row is its
 position.
 
-- **Verbs:** `aggregate` (23 functions, fx conversion, exact `sum_exact`), `join` (inner,
+- **Verbs:** `aggregate` (24 functions, fx conversion, exact `sum_exact`), `join` (inner,
   left, right, full, semi, anti, cross), `pivot`, `unpivot` (melt), `sort` (multi-key,
   stable, null placement), `filter`, `distinct`, `dropna`, `fillna`, `select`, `drop`,
   `rename`, `map` (column arithmetic), `cumsum`, `rolling`; expressions (`mutate`,
@@ -72,18 +72,19 @@ position.
   `thousands`, `decimal`, `true_values`/`false_values`, per-column null markers, `na_filter`,
   `skipinitialspace`, `skipfooter`, `skip_rows_after_header`, a row index column, `on_bad_lines`,
   `date_format`, `escape_char`. `SPEC.md` § Input and output.
-- **Column types:** int, float, bool, text, decimal, date, timestamp, duration,
-  categorical (dictionary-encoded), list and struct (Arrow's layouts; every structural verb
-  and key carries them, a cell is a borrowed `ListView`/`RecordView`).
-
-  What is still missing against pandas and polars is listed row by row in `SPEC.md`
-  § Backlog.
+- **Column types:** int, float, bool, text, decimal, date, timestamp (optionally carrying an
+  IANA zone, `Column.time_zone`; `convert_time_zone`/`replace_time_zone` in `Expr`), duration,
+  time of day, categorical (dictionary-encoded, optionally ordered), binary, list, struct and
+  fixed-size array (Arrow's layouts; every structural verb and key carries them, a cell is a
+  borrowed `ListView`/`RecordView`), and the width types `int8`, `int16`, `int32`, `uint8`,
+  `uint16`, `uint32`, `uint64`, `float32` beside `int` (Int64) and `float` (Float64)
+  (`ColumnType`, `src/value.zig`; `SPEC.md` § Design notes by feature).
 - **Model after:** pandas 3.1 and polars 2.1, eager DataFrame API.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant (no shared state).
-  **Deps:** `datefmt` (the calendar of the `dt` functions), `csvstream` (records, fields and quoting of the CSV reader and writer).
+  **Deps:** `datefmt` (the calendar of the `dt` functions), `csvstream` (records, fields and quoting of the CSV reader and writer), `regex` (the regular-expression `Expr` functions), `tz` (time zones), `unitext` (Unicode case mapping and character classes).
 
-Provenance: original work of the zig-libs authors (MIT); the storage comes from
-`dataset`'s `Frame` and the verbs from `tabular`, same authors. Modeled after pandas
+Provenance: original work of the zig-libs authors (MIT); the storage came from
+`dataset`'s `Frame` and the verbs from `tabular`, same authors (both modules are retired). Modeled after pandas
 (BSD-3-Clause) and polars (MIT): verb names and behaviour from their documentation, no
 source copied. Design references (consulted for edge rules, nothing copied): pandas'
 `core/missing.py` and SciPy's `interpolate` package (both BSD-3-Clause) for the
@@ -169,15 +170,15 @@ borrows:** columns a verb did not touch are shared with its input, a selection o
 row in order shares them all, and the spec's names become column names. Keep the input
 and the spec alive as long as the result. Pass an arena: a result has no `deinit`, and a
 frame's arrays may be longer than its `len`, so a general-purpose allocator would leak.
-For big tables put the arena over `df.big_block_allocator` (2 MiB blocks advised for
-transparent huge pages). **In a pipeline, keep one arena and `reset(.retain_capacity)` it
+For big tables put the arena over `df.big_block_allocator` (2 MiB aligned blocks, advised for
+transparent huge pages only where the kernel's `defrag` setting allows it; `huge_page_allocator` always advises). **In a pipeline, keep one arena and `reset(.retain_capacity)` it
 between batches** rather than a fresh arena per call: a fresh one pays the kernel for
 zeroing every output page, which on 1 M rows is most of a columnar verb's cost
-(`mutate` 4.6 ms fresh, 1.3 ms retained; pandas 1.6 ms, whose malloc keeps its pages the
-same way). The card's speed is measured that way (`BENCH_RETAIN=1`).
+(pandas' malloc keeps its pages between calls the same way). The card's speed is measured
+that way (`BENCH_RETAIN=1`); its `**Performance:**` line in `SPEC.md` has the figures.
 
 Missing is null or a NaN float in every verb, as pandas' `isna`. A frame of 2^32 - 1 rows
-or more, and work past the caps in `SPEC.md` § Limits, is `error.TooLarge`.
+or more, and work past the caps in `SPEC.md` § Limits and refusals, is `error.TooLarge`.
 
 ## Building a frame
 
@@ -188,8 +189,15 @@ another frame is copied into the column's own storage. A hand-built `Frame`
 (`.{ .columns, .data, .len }`) is fine too: arrays shorter than `len` read as null past
 their end. `Frame.series(name)` gives one column as a `Series` view.
 
+## Not provided
+
+No row index or MultiIndex, no lazy engine or SQL, no Python-object conversions, no
+Arrow/Parquet or other columnar file formats (Arrow IPC over a `Frame` is the sibling `arrow`
+module), no XML, no Int128. The reasons are in `SPEC.md` § What this module is, and what it is not
+and § What is deliberately not done; the open items are in § Backlog / deferred.
+
 ## Verify
 
-`zig build test-dataframe`. The verbs are checked against `tabular`'s row verbs over
-generated tables and against pandas' and polars' frozen answers (`SPEC.md` §
-Verification).
+`scripts/modtest dataframe` (`zig build test-dataframe`). The verbs are checked against pandas'
+and polars' frozen answers, their cell-by-cell reference paths and a deterministic fuzz driver
+(`DATAFRAME_FUZZ`); see `SPEC.md` § Verification.

@@ -21,6 +21,7 @@
 
 Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (design references only, no NOTICE entry; engine answers frozen as test vectors, no source read).
 
+
 ## Compared with
 
 Surveyed 2026-11-05 per `SURVEY-PLAYBOOK.md` (the D0 survey: every eager method of the two engines' DataFrame and Series index pages gets a verdict; their documentation read, no source). Stars and releases as recorded by `tabular`'s survey of 2026-11-02, from the GitHub API that day.
@@ -31,14 +32,14 @@ Surveyed 2026-11-05 per `SURVEY-PLAYBOOK.md` (the D0 survey: every eager method 
 | [pola-rs/polars](https://github.com/pola-rs/polars) — **fastest** (one thread, to measure) | Rust | MIT | 40.2k | py-2.1.0 (2026-10-25) | Expressions, the lazy optimizer, threads; null is not NaN. The same table model as this module: no index, a row is its position. |
 | Zig alternatives | Zig | — | — | — | `nfultz/zigdf`, `zbanks/zig-dataframe`, `Adwaith-Rajesh/ziframe`, `Xemptuous/zdf`, `thiagoviks/MakiStack`: containers or toys, none with this verb set *(from `tabular`'s survey)*. `std` has none. |
 
-**Where we are ahead:** exact i128 `sum_exact` and fx-convert-before-sum in `aggregate` (neither engine has them built in *(inferred)*); in `mutate` and the `window` integer operations an integer overflow is null, never a wrapped number (`aggregate` and `pivot` `sum` of an int column go through f64 and lose exactness past 2^53; `sum_exact` does not). **Where we are behind:** see Scope and § Backlog; speed: polars is faster on 9 of the 33 bench rows by more than 1.25× (§ Maturity).
+**Where we are ahead:** exact i128 `sum_exact` and fx-convert-before-sum in `aggregate` (neither engine has them built in *(inferred)*); in `mutate` and the `window` integer operations an integer overflow is null, never a wrapped number (`pivot` `sum` of an int column goes through f64 and loses exactness past 2^53; an Int64 `aggregate` `sum` is exact in an i128, `sum_exact` for decimals and fx). **Where we are behind:** see Scope, § What is deliberately not done and § Backlog / deferred; speed: polars is faster on 9 of the 33 bench rows by more than 1.25× (§ Maturity).
+
 
 ## What this module is, and what it is not
 
 `Frame` is a table as one typed array per column with a validity bitmap; every verb is
-`(allocator, Frame, Spec) -> Frame`. It replaces `dataset` + `tabular` (the dataframe split
-plan of 2026-11-05): the storage came from `dataset.Frame`, the verbs
-from `tabular.frame`, and both stay in place until step R retires them.
+`(allocator, Frame, Spec) -> Frame`. It replaced `dataset` + `tabular`: the storage came from
+`dataset.Frame`, the verbs from `tabular.frame`, and both are retired (no module of either name remains).
 
 **Not here, refused:** a row index or MultiIndex (pandas' index family, survey row 3: every
 verb would carry its cost, and polars users do without — owner's decision 2026-11-05); a
@@ -67,6 +68,7 @@ projection of deep documents are `jsonshape`'s column key paths).
 table model, so the card measures the one path that exists); `dataset`'s private wire
 (no rival, no public purpose).
 
+
 ## Design & invariants
 
 **Storage follows the cells, not the declared `ColumnType`.** All cells of one `Value` tag
@@ -75,7 +77,7 @@ in its array and has its bit clear; NaN is a value in storage, but every verb co
 missing (pandas' `isna`). `storage_test.zig` checks, array by array, that `FrameBuilder`
 and `columnFromCells` build exactly what `dataset.Frame.fromDataset` builds.
 
-**Categorical and duration columns (rows 100, 101; 2026-11-08, tests in
+**Categorical and duration columns (rows 100, 101; tests in
 `src/catdur_test.zig`).** Both reuse a cell kind, as `.date` and `.timestamp` do, so no
 `Value` arm is added: a categorical cell is `.text`, a duration cell an `.int` of
 microseconds. A categorical column is dictionary-encoded where it is made (`cast`, `mutate`
@@ -86,16 +88,16 @@ them: both sort a categorical lexically, as here). Every verb that does not name
 reads it through `get` as text; `take` (so `filter`, `sort`, `head`, joins' payload) gathers
 the codes and shares the dictionary, `concat` encodes the union again. A column declared
 categorical may hold plain text storage (a `FrameBuilder` frame): it reads the same. Categories
-in a given order (pandas `ordered=True`, polars `Enum`) are built (wave W6, below); group/join/sort
-over the codes rather than the text (the speed of an encoded key) — Backlog, measured first. A duration is ISO 8601 in CSV and JSON
-(`formatIsoDuration`, polars' JSON form, delegating to `datefmt`'s ISO 8601 duration functions since 2026-11-17; polars refuses a duration in CSV, pandas writes
+in a given order (pandas `ordered=True`, polars `Enum`) are built (wave W6, in § Design notes by feature); group/join/sort
+over the codes rather than the text (the speed of an encoded key) is in § Backlog / deferred. A duration is ISO 8601 in CSV and JSON
+(`formatIsoDuration`, polars' JSON form, delegating to `datefmt`'s ISO 8601 duration functions; polars refuses a duration in CSV, pandas writes
 `1 days 02:03:04`, which `parseDurationCell` reads too) and polars' `1d 2h` in `format`.
 `mutate` gives an expression the temporal type it keeps (`expr.temporalType`: `ts - ts` a
 duration, `ts ± dur` a timestamp, `dur * k` a duration, the `dt` functions that move an
 instant its input's type), since the cells alone cannot tell an instant, a length and an int
 apart.
 
-**List and struct columns (rows 56, 94; 2026-11-08, tests in `src/nested_test.zig`).** Arrow's
+**List and struct columns (rows 56, 94; tests in `src/nested_test.zig`).** Arrow's
 layouts: `ColumnData.list` is `u32` offsets (rows + 1) into one element column (`items`, any
 storage, nested again), `ColumnData.@"struct"` one child column per field with the field names
 (behind a pointer, so a cell can point at it), each with its own validity bits. A cell is a
@@ -132,11 +134,12 @@ that is not one plain int or text column, `pivot`, the rank path of `sort`) it b
 row view of the key columns only, so key equality and ordering are `Value.order`'s in every
 verb. Row indexes are `u32`: a frame of 2^32 - 1 rows or more is `error.TooLarge`.
 
-**`cumsum` and `rolling` follow pandas and polars** (review 2026-11-07): they are `window`'s `.cum_sum` and `.rolling`, so a missing cell is skipped and its row is null, and a window short of values is null; an all-int `cumsum` stays int. The SIMD sum path `tabular.frame.rolling` had is gone with the row-verb rule (D4 measures).
+**`cumsum` and `rolling` follow pandas and polars:** they are `window`'s `.cum_sum` and `.rolling`, so a missing cell is skipped and its row is null, and a window short of values is null; an all-int `cumsum` stays int. 
 
-**Elsewhere the semantics are still `tabular`'s historical defaults** (`skip_na = false`, an int `sum` is
-a float). The plan decides pandas and polars semantics as the defaults; that switch is a D2
-item in § Backlog, made once the row verbs are no longer the oracle for it.
+**Elsewhere the defaults are `tabular`'s historical ones:** `AggregateSpec.skip_na` and the pivot's `skip_na`
+default to `false`, the historical behaviour documented on `AggFn` (`true` is pandas' `skipna=True`), while the sum of
+an Int64 column that stores ints is Int64, exact in an `i128` (§ Input and output, the W11 notes).
+
 
 ## Limits and refusals
 
@@ -149,7 +152,7 @@ pinned by a test in
 `src/verbs_test.zig` against the row verb's refusal. Hash tables refuse past their work cap
 (`keys.zig`), so constructed keys end in `TooLarge`, not a hang.
 
-Added by the D5 sweep (`src/sweep_s1_test.zig`), all `error.TooLarge` unless said:
+Further limits (`src/sweep_s1_test.zig`), all `error.TooLarge` unless said:
 **row indexes** are `u32`, so every verb that builds them (all but the column-only ones)
 calls `core.checkRowsU32(f.len)` at its entry, before it allocates: a frame of
 `maxInt(u32)` rows or more is refused. Only a hand-built `Frame` can claim that many rows.
@@ -164,12 +167,12 @@ each time (`error.BadArgument`, as for a depth past `max_selector_depth`). Name 
 many names build one hash index (`frame.NameIndex`, `verbs.Names`) instead of scanning
 the columns per name: a frame of millions of columns is one `pivot` or `transpose` away.
 
-**Nested columns (2026-11-08):** a list column holds at most `maxInt(u32)` elements in all (Arrow's
+**Nested columns:** a list column holds at most `maxInt(u32)` elements in all (Arrow's
 `u32` offsets; `take` past it `error.TooLarge`, a builder `error.OutOfMemory`, `readJson` `TooManyCells`
 long before); a nested value `max_nesting_depth` (64) levels down reads as null, and `readJson` keeps it as
 its JSON text.
 
-**D5 sweep (2026-11-08), expression, window and name limits.** `max_rolling_work` and
+**Expression, window and name limits.** `max_rolling_work` and
 `max_window_work` bound the work of the *whole call*, summed over every partition (`rolling`
 window x rows, `expanding` and `rolling_time` prefix per row), refused before any partition is
 computed where the sum is known from the partition sizes. They count element *visits*, not
@@ -186,7 +189,7 @@ holds the stream in `a` while it grows (`allocRemaining` doubles, and an arena k
 block), so with an arena its peak is up to about 3 x `max_bytes` before the frame is built;
 `max_bytes` is the dial, or read into a slice you own and call `readCsv`.
 
-**Callback verbs and window rank/corr/cov (2026-11-08).** `rollingMap` hands at most
+**Callback verbs and window rank/corr/cov.** `rollingMap` hands at most
 `max_rolling_map_work` (= `max_rolling_work`, 2^30) cells to its callbacks in one call, summed
 over partitions and refused before the first call; `rolling_rank` counts `rows x window` visits
 (an expanding one `rows^2`), `rolling_corr`/`rolling_cov` `2 x rows x window`, against
@@ -195,7 +198,7 @@ before it copies any and creates at most `max_join_cells` cells beyond its input
 (`verbs.growthWithin`), so a callback frame claiming 2^25 rows of no storage is `error.TooLarge`
 at once.
 
-**No-panic sweep of the S2 code (2026-11-10).** The names a `split_fields` makes count against `max_nodes` (one at its widest, 4096, costs 4096 of 65,536; fuzz seed 493021). `max_nodes` bounds the nodes of one expression
+**Limits of the S2 code.** The names a `split_fields` makes count against `max_nodes` (one at its widest, 4096, costs 4096 of 65,536; fuzz seed 493021). `max_nodes` bounds the nodes of one expression
 *including* the bodies of `list_eval`, `list_filter` and `struct_fields` (one budget for the whole
 tree; a node reached twice through a shared parent counts twice), else `error.ExprTooLarge`. The
 schema walks over an expression (nested list/struct types, temporal type, zone) run only after
@@ -205,6 +208,27 @@ schema walks over an expression (nested list/struct types, temporal type, zone) 
 column named twice in `cols` is built twice). `repeatValue` weighs a nested value by every text
 byte and element it holds, down to `max_nesting_depth`, against `max_repeat_bytes`.
 `NdjsonChunkReader` keeps no blank line, so a stream of blank lines costs no memory.
+
+**Known limits (accepted, no panic).** A hand-built `Frame` that claims more rows than it stores makes the
+frame-wide readers (`nullCount`, `hasNulls`, `equals`, `info`) and `clear(n)` linear in the claimed `len`, up to
+2^32 - 2, over no data; a hand-built list whose offsets claim more elements than its `items` hold makes `take`,
+keys and the writers work and allocate for the claimed count, up to 2^32 (a list of all-null elements legitimately
+has `.nulls` items with no length to clamp to: the same class as a claimed `len`); a hand-built storage shared as a
+DAG or pointing back at itself costs fan-out^64 within the `max_nesting_depth` bound. `rename` checks each renamed
+name against every column (renamed x width). `columnBytes` of a boxed column adds text lengths with `+` (a sum past
+2^64 needs more cells than memory holds) and counts a nested cell in a boxed column as its `Value` only. `addAffix`
+with a prefix of megabytes over 65 536 columns allocates what the caller asked for. Nested payload copied k times
+by `concat` or a join is bounded by the `u32` offsets, not by a cell budget (as text is by its bytes). `max_cell_chars`
+cuts before control bytes are escaped (a cut cell can print 4x wider); `format` counts code points, not terminal
+cells (wide characters misalign, as in pandas); `markdownTo` holds a copy of every cell; timestamps outside years
+0000-9999 are written in the expanded form `parseIsoTimestamp` does not read; `textio.formatFloatFixed` falls back
+to shortest digits above ~1.8e16 at 22 decimals (not C's `%.Nf`); a CSV header name that starts with a BOM does not
+read back as itself (`readCsv` strips it). `exprfn.reverse` and `translate` free their `charStarts` after a later
+allocation, so an arena keeps 8 bytes per character per cell (linear in the input). A `mutate` with `pad` to 2^20
+characters over a few rows takes seconds (bounded by `max_eval_bytes`; a time-shaped cap is the owner's decision).
+Producers differ on validity bits past `len` (a typed verb's result may carry set bits there, `map` through
+`verbs.allValid`); every reader masks them.
+
 
 ## Input and output (D3)
 
@@ -242,7 +266,7 @@ carry a label and the engine followed:
 | quote inside an unquoted field | literal | error | literal (csvstream) |
 | `Infinity`, `INF`, `nan`, ` 4`, `+3` | float / int | text | float / int (pandas) |
 
-**Defaults decided (2026-11-08, owner left the call to the maintainer):** `parse_dates` stays off (both
+**Defaults decided (the owner left the call to the maintainer):** `parse_dates` stays off (both
 engines; a column that merely looks like a date is not silently retyped), an integer past i64 stays text (no
 digit is lost; a caller who wants a float asks with `types`), and `writeJson` keeps RFC 3339 `…Z` timestamps
 (unambiguous and zone-explicit, where pandas' epoch milliseconds lose the type and polars' form drops the zone).
@@ -268,7 +292,7 @@ epoch milliseconds, polars: `2021-01-02 03:04:05`). `columns` is pandas' `orient
 index-keyed `"columns"` (there is no index). The tests compare the parsed documents, so number
 spelling (`1e-05` against `0.00001`) is free.
 
-**Options added in S2 (2026-11-09).** Which engine each follows; where the engines differ the vectors carry a
+**Options added in S2.** Which engine each follows; where the engines differ the vectors carry a
 label (`oracle3_io_vectors.json`: 14 `read-s2-*`, 9 `write-csv-s2-*` cases, 13 byte-for-byte `to_json` option
 cases, 8 `to_html` and 3 `glimpse` cases).
 
@@ -314,11 +338,11 @@ cases, 8 `to_html` and 3 `glimpse` cases).
   prints it, 3 vectors: names padded, `<type>` right-aligned, text in single quotes, `max_items` values, no line cut unless
   `max_width` is set).
 
-**`readJson(a, bytes, JsonReadOptions)`** (`.records`, `.columns`) and **`readNdjson`** (2026-11-08) are the
+**`readJson(a, bytes, JsonReadOptions)`** (`.records`, `.columns`) and **`readNdjson`** are the
 reverse, through `std.json.Scanner` in two passes (zig-libs has no JSON module of its own; `json5` is a
 superset parser for config files): columns in the order their keys first appear, each typed by `readCsv`'s
 rules on the same text (`csvio.parseAs` does both, so `1`, `1.5`, `true` and, with `parse_dates`, ISO dates
-and instants read as they do from CSV). Nested values (2026-11-08): a column of arrays only is a `list`
+and instants read as they do from CSV). Nested values: a column of arrays only is a `list`
 column, of objects only a `struct` column (one field per key any object has, null where one lacks it, in
 first-seen order), each element and field typed by the same rules, down to `max_nesting_depth` — polars'
 reading; pandas keeps Python objects. A column that mixes kinds (an array among numbers, arrays and objects)
@@ -326,7 +350,7 @@ or holds an integer past i64 is text, each cell its JSON source (`1`, `true`, `{
 the same (a list of `1` and `"x"` is a list of text), and so is a value nested past the bound: the source
 text loses nothing. A missing key is null (both engines). **A key repeated in one object, at any depth, is
 `error.BadJson` by default** (`duplicate_keys = .reject`, `jsonshape`'s default and reasoning: two parsers of
-one feed can disagree on it; until 2026-11-08 the last value won); `.last` keeps the last value (Python's
+one feed can disagree on it); `.last` keeps the last value (Python's
 `json`, so pandas), a repeated `columns` key its last array, and the field's type then follows every value
 the key had. `columns` arrays of different lengths are `error.RaggedColumns` (both engines refuse). ndjson
 skips blank lines and takes `\r\n`. Options: `columns`, `types` (as `readCsv`'s; a nested value reads as text,
@@ -352,7 +376,7 @@ alignment of floats is not done; `|` and newlines in a cell are escaped). Neithe
 oracle: pandas' `to_string` pads floats to a common number of decimals and `to_markdown` needs
 `tabulate`, which the pinned venv lacks; `src/io_test.zig` pins the layout by hand.
 
-**Chunked reading (S2 wave W9, 2026-11-09).** `CsvChunkReader` (`src/csvchunk.zig`; pandas
+**Chunked reading (S2 wave W9).** `CsvChunkReader` (`src/csvchunk.zig`; pandas
 `read_csv(chunksize=n)` / `iterator=True` + `get_chunk(n)`, polars `read_csv_batched` + `next_batches(n)`):
 `init(gpa, reader, CsvReadOptions, ChunkOptions)`, `next(a, n) !?Frame` (null at the end), `deinit`. The reader
 holds a byte window of one read plus one record and the queued records of one chunk, never the stream:
@@ -382,7 +406,7 @@ pandas (a cross-chunk schema would have to decide what a key one chunk lacks mea
 ndjson), and `types` fixes a column in every chunk. Engine answers: `tools/oracle2h.py`, `src/s2w9_oracle_test.zig`.
 
 
-**Wave W10 (dataframe S2, 2026-11-10): the cheap parity gaps.** Seven items the survey found "missing and it
+**Cheap parity gaps (wave W10).** Seven items the survey found "missing and it
 matters"; each was asked of the engines first (`tools/oracle2i.py`, 231 cases, replayed by
 `src/s2w10_oracle_test.zig`; the edge cases no engine is asked are in `src/s2w10_test.zig`).
 - **`Expr.find_regex`** (polars `str.find(pattern, literal=False)`): the **byte** offset of the first match
@@ -435,17 +459,15 @@ matters"; each was asked of the engines first (`tools/oracle2i.py`, 231 cases, r
   `error.BadLabels` for a label count that is not the bin count or a repeated label.
 - **`offset_by` on a zoned column**: the calendar units (`mo`, `q`, `y`, `w`, `d`) move the wall clock of the
   zone (`1d` keeps 12:00 across a DST change, an elapsed 23 or 25 hours) and the sub-day part (`h`, `m`, `s`, `ms`,
-  `us`, `ns`) is added as elapsed time after it (`1d1h`), as polars (this changes the previous elapsed-time result
-  for calendar units; `dtfn.offsetByZoned`). A wall-clock result the zone skips is `local - offset after the
+  `us`, `ns`) is added as elapsed time after it (`1d1h`), as polars (`dtfn.offsetByZoned`). A wall-clock result the zone skips is `local - offset after the
   gap` (02:30 in a 02:00 to 03:00 jump is 01:30; polars, unlike `truncate`'s forward move); one it shows twice
   is the pass the input was in (the same UTC offset), the earlier one if the input's offset is neither. `Duration`
   gained `days` (calendar days given, a week as seven). A column whose `time_zone` `tz` does not know makes
-  `offset_by` `error.BadExpr` at compile time, as `truncate` and the other zone readers (it was elapsed time
-  before W10; review W10R-3). `add_business_days` on a zoned column was not asked of the engines and is
+  `offset_by` `error.BadExpr` at compile time, as `truncate` and the other zone readers . `add_business_days` on a zoned column was not asked of the engines and is
   not built (it still works on the instant as before).
 
-**Wave W11 (dataframe S2, 2026-11-10): real dtype widths.** The owner chose real width types over names checked as
-ranges (2026-11-10): `ColumnType` `int8`, `int16`, `int32`, `uint8`, `uint16`, `uint32`, `uint64`, `float32` beside
+**Real dtype widths (wave W11).** The owner chose real width types over names checked as
+ranges: `ColumnType` `int8`, `int16`, `int32`, `uint8`, `uint16`, `uint32`, `uint64`, `float32` beside
 `int` (Int64) and `float` (Float64), each with its own array. Engines asked first (`tools/oracle2j.py`, 6113 cases of
 polars 2.1 and pandas 3.1, replayed by `src/s2w11_oracle_test.zig` (cast, read, write), `src/s2w11a_oracle_test.zig`
 (arithmetic, literals, unary, aggregates, combining) and `src/s2w11b_oracle_test.zig` (keys, sort, unique, group by,
@@ -475,9 +497,9 @@ a frame of all eight widths)). Design in one place: `src/dtype.zig` (predicates,
   joins accept keys of any two numeric types by exact value (polars refuses Int64 with Float64), the key keeping the
   left type and widening to the supertype when a right-only key does not fit it; `n_unique`/counts stay Int64 (polars
   UInt32); Float32 aggregates add in f64 and round once (within one f32 ulp of polars); the bin verbs give Int64/Float64
-  interval ends. **Changed for Int64 with W11:** `aggregate` `sum`/`prod` of an Int64 column storing ints is Int64,
-  exact in an `i128`, null on overflow (it was Float64, so 2^53 + 1 was lost; the engines' answer).
-- Not part of W11: Int128, Binary, fixed-size Array and a time-of-day type.
+  interval ends. **Int64 sums:** `aggregate` `sum`/`prod` of an Int64 column storing ints is Int64,
+  exact in an `i128`, null on overflow (the engines' answer; a float sum would lose 2^53 + 1).
+- Int128 is not provided (§ What is deliberately not done); Binary, fixed-size Array and the time-of-day type are in the parity close below.
 
 **Limits** (all `CsvReadOptions` fields, each with its own error; a hostile input is an error, never
 a panic or an unbounded allocation): `max_bytes` 256 MiB (`InputTooLarge`), `max_columns` 65536
@@ -490,150 +512,21 @@ csvstream's 64, because each stray quote then looks ahead that far (a larger cap
 the scan). Memory: the input, the header names once per pass (three copies), one `Value`
 row, and the frame -- 8 to 16 bytes per cell plus text, so at `max_cells` a frame of ints is
 ~0.5 GiB whatever the input's size; text reservations are capped at each column's share of
-the input (review 2026-11-07 H1); the one-pass reader reserves its rows only when rows x
+the input; the one-pass reader reserves its rows only when rows x
 columns fits the input's length (+ 4096 cells), else the two-pass reader, which counts the rows
-it really has, runs (sweep S2-1: blank lines, comments or quoted newlines no longer reserve a
+it really has, runs (blank lines, comments or quoted newlines do not reserve a
 row each). The table `hostile input answers errors` in
 `src/io_test.zig` pins each limit.
 
-**D5 sweep S2 (2026-11-08), closed** (`src/sweep_s2_test.zig`; files `expr exprfn window more
-analysis csvio jsonio textio render dtfn seriesfn`): S2-1 the one-pass CSV reader reserved a
-row per newline for every column, ~2000x the input with blank lines over a wide header; S2-2
-the window work cap was per partition (summed over partitions it was unbounded); S2-3
-`fillNull` kept input validity bits past the last row; S2-4 `mutate`/`where` text results had
-no total bound (`repeat` over a column of 1 MiB cells); S2-5 `contains` and friends between two
-columns were O(text x needle); S2-6 name resolution against a wide frame (`concatByName`,
-`joinAsof` suffix scan, `fillNull`/`duplicateMask`/... subsets, `window` `partition_by`,
-`describe`, `partitionBy`, `valueCounts`) was width x width; S2-7 the `is_in` key length was an
-unchecked `@intCast` to u32. `readCsv`'s `unreachable` on `SpeculationFailed` is now a fall
-back to the cell path. Every other pub entry point of these files was walked and is clean;
-operators over extreme cells and the writers over
-extreme values are pinned by "sweep clean probe" tests. **Open (LOW, no panic):**
-`exprfn.reverse`/`translate` free their `charStarts` after a later allocation (an arena keeps
-8 bytes per character per cell, linear in the input); `formatTo` with `max_rows` of
-`maxInt` over a hand-built frame claiming a huge `len` runs out of memory instead of
-refusing; `replace_many`/`contains_any` patterns are quadratic in text x pattern (the
-patterns are the caller's expression, not cell data).
 
-**Review 2026-11-07 (third, D3), closed:** H1 text reservations of a wide first row over short
-rows (~1000x the input), M1 a `writeCsv` cell of more than 64 lines did not read back, M2 the
-two false claims above, L2 `markdownTo` `f.len + 1` on a hand-built frame, L3 a cut where the
-text stops being UTF-8 split a code point, L9 a `.decimal` override refused zeros past 12
-fraction digits, L10 pass 1 now types a float with the parse pass 2 uses; plus `format` caps
-at `maxInt` (head half `n + 1`). Tests in `src/io_test.zig`. **Open (LOW, no panic):**
-`max_cell_chars` cuts before control bytes are escaped (a cut cell can print 4x wider);
-`writeCsv` has no `comment` option, so a first-column text starting with the reader's
-`comment` byte is dropped on read (csvstream's `WriteOptions.comment` could be passed
-through); a one-column frame written with `quote = 0` or `.never` turns a null into a blank
-line the reader skips; timestamps outside years 0000-9999 are written in the expanded form
-`parseIsoTimestamp` does not read; `textio.formatFloatFixed` falls back to shortest digits
-above ~1.8e16 at 22 decimals (not C's `%.Nf`); `markdownTo` holds a copy of every cell.
 
-## Verification
+## Design notes by feature
 
-- `src/verbs_test.zig` — the verbs on hand-built frames: shared columns, bitmaps and arrays shorter
-  than `len`, typed paths and their limits, the caps. (Until step R, 2026-11-08, it also ran every
-  verb against `tabular`'s row verb over generated tables; that module is retired.)
-- `src/oracle_test.zig` — all 1353 pandas/polars cases of `tabular`'s file, every one run;
-  the known differences are listed in the file and must still differ.
-- `src/more_test.zig` — the `u32` row limit and `concatByName`'s cell cap of the `more.zig` verbs.
-- `src/structure_test.zig`, `src/analysis_test.zig`, `src/exprfn_test.zig` — the D2
-  verbs (rows the row verbs never had, so no differential oracle) on hand-built tables,
-  expected cells from pandas' and polars' documentation, numpy's quantile methods and
-  Python's `str` (pandas and polars were not installed on the host: not run against them
-  yet, an item for D5's oracle).
-- `src/oracle3_io_test.zig` — `oracle3_io_vectors.json`: every `read_csv` case (types, cells, names,
-  errors), every `to_csv`/`write_csv` text byte for byte, and the JSON documents, against what
-  pandas 3.1.0 and polars 2.1.0 answered; `src/io_test.zig` — the hand-written cases: options,
-  the hostile-input table, the round trip `writeCsv` to `readCsv` over every column kind, the
-  rendering layout, `src/textio.zig` — the float spelling against Python's `repr`.
-- `src/step4_test.zig` — the callback verbs (every shape, the error paths, the caps) and window
-  `rolling_rank`/`rolling_corr`/`rolling_cov`, expected values from pandas' docstrings or by hand.
-- `src/storage_test.zig` — storage against `columnFromCells` and the input rows, hand-built frames;
-  `src/value_test.zig` — the cell model's own tests from `dataset` and a property sweep.
+The verbs and column kinds below were built in waves, each asked of the engines first (pandas 3.1.0 and polars 2.1.0, frozen as `src/oracle*_vectors.json`, written by the `tools/oracle*.py` generators named in each note, replayed by the matching `src/*oracle_test.zig`). Where the engines disagree the note says which one is followed; the differences kept on purpose are in each replay's `known` list.
 
-`testkit` is the only `test_dep`. The `dataset`/`tabular` differential is gone (step R,
-2026-11-08); the anchors are the pandas/polars vectors, the `*Cells` reference paths and the
-fuzz driver.
+### Everyday single-parameter gaps (wave W2)
 
-## Anchoring
-
-**Anchor grade:** class C · oracle n/a
-
-- **Class C** — an internal data structure and verb library; no wire format others must agree with.
-- **Oracle n/a** — class C/D carries no anchor debt.
-
-**What the tests actually contain.** What pandas 3.1.0 and polars 2.1.0 answered, frozen
-(`src/oracle_vectors.json`, filtered by `tools/filter_vectors.py` from what `tools/oracle.py`
-writes — `tabular`'s oracle, moved here with step R), what they answered for the D2 verbs
-(`src/oracle2_vectors.json`, `tools/oracle2.py`, replayed by `src/oracle2_test.zig`: where
-they disagree the vector says which one is followed, and the differences kept on purpose
-are the test's `known` list: non-padded numeric fields in `strptime` (`datefmt`), a missing text in the `is*` classes
-(null here, False in pandas' Arrow-backed `str` dtype), the `sum` of an int pivot column as a
-float, `skew`/`kurt` of a group with no spread (0 here and in `tabular`, NaN in both
-engines), and polars' `peak_min`/`peak_max` at the ends of a column, where 2.1.0 compares
-the end cell with 0), and `tabular`'s row verbs as a re-derived oracle on generated tables.
-
-## Backlog / deferred
-
-- **2026-11-15 (consumer request, open):** no binary (de)serialization of a `Frame`. The planned `arrow` (IPC stream/file, every column type incl. list/struct/array and zoned timestamps) and `parquet` modules are now tracked in the root `NEW-MODULES.md`, not only in the scope sentence above; this module stays free of them (the adapter depends on the frame).
-- **2026-11-10 (independent review of the parity-close waves, open, MED/LOW):** (M1) `extract_many`/`find_many` with `overlapping` can hold ~200 MB per row (4M hits) and scan O(len × patterns × pattern length) — capped by `TooLarge` at 4M hits, no cap on the pattern count; (L2) `winCells` maps every error but OOM to `TooLarge`; (L3) `readFwf` keeps 8 bytes per character of a line for `starts`, outside `max_bytes`, and a blank line costs O(specs); (L4) with `parse_dates`, a column of `H:M` text (ratios, scores) is inferred as `.time` — polars does the same for `HH:MM`, check its 1-digit forms; (L5) `linearSpaces` allocates the widest row up front.
-- **2026-11-10 (W11, open, LOW):** (a) an expression past `expr.numType`'s 4096-node walk has no static type, so
-  `mutate` falls back to typing by the cells (review L4, inferred, not reproduced); (b) `implode` declares a width
-  element column whose stored elements are Int64/Float64 arrays (`frame.widthsConform` does not look inside lists;
-  review L6); (c) the weak-literal rule has two copies, `expr.weakJoin` and `frameops.literalMeet` (review L5, a
-  candidate for the duplicate-code pass); (d) the W11 verbs `horizontal` min/max over Int64 and UInt64 with a negative
-  cell are Float64 (the D5 supertype), with no engine vector; (e) the sweep's near-overflow aggregate case runs 2^18
-  rows, not 1 M (the lane's 4 GB cap).
-- **2026-11-10 (W10 review, open, LOW):** (a) `scaleDuration` drops `Duration.days`; its users read only `months`
-  and `us` today, so a new user of the scaled `days` must carry it (W10R-4). (b) `binIntervals` takes float
-  breakpoints for a timestamp or duration column, which declares a type its cells do not have; a `count` over a
-  float column holding inf gives NaN/inf breaks (no panic) (W10R-5). (c) The W10 verbs (`unstack`, `wideToLong`,
-  the `bin*` verbs, `corrWith`) are not in the fuzz harness's verb list yet; its `Expr` arms are.
-- **Triage of the LOW bullets below (2026-11-10), closed and taken out of them:** fixed, tests in
-  `src/backlog_low_test.zig`: a non-object `fields` element of table JSON is skipped (jsonread a);
-  `describeWith` labels a `-0.0` percentile `0%` and describes each of two same-named columns
-  (more a, f); a zoned CSV cell keeps the seconds of an offset (`-00:44:30`, Python's `isoformat`)
-  and the RFC 3339 writers print a sub-minute negative offset as `+00:00` (textio g); without a
-  test: `businessDayCount` starts at a lower-bound search of the holidays (dtfn a, cost only);
-  `reencode` passes `OutOfMemory` on (chunked d); `groupByDynamic` says `TooLarge` where it
-  dropped a row's windows (frameops b; `lower` is monotone and already computed at both ends of
-  the scan, so not reachable today). Closed as intended, no change: an empty join key from an
-  internal caller (verbs c: `alignFrames`, `mergeOrdered` refuse it, `groupByDynamic` passes a
-  fixed one); `joinChecked`'s `unreachable` (verbs g: not exported, every caller passes
-  `validate = .none`, an internal invariant); a zero-length reader buffer (chunked b:
-  `std.Io.Reader.fixed("")` is a legal empty input with no buffer, so a check would refuse it);
-  `readCsv` with `double_quote = false` and no `escape_char` (csvio a: pandas reads it, a quote
-  ends the field; only the writer needs an escape); `quote_style = .never` writing a `decimal`
-  equal to a structural byte (csvio d: `.never` writes every byte raw, as polars does) and
-  `columns = {"a","a"}` written twice (csvio e: pandas does the same).
-- **2026-11-10 (S2 no-panic sweep, open, all LOW — cost, no panic):** (a) `explode` looks up the
-  exploded columns with `findScalar` per (row, column); a bool mask is linear. (b) literal needles of
-  `split`, `rsplit`, `partition`, `split_exact`, `replace`, `get_dummies` use `std.mem.find*`
-  (Horspool + vectorised memcmp, worst case needle x haystack per cell); a KMP table per cell would
-  make it linear. (c) `besselI0` sums up to 1000 terms per point, so a kaiser window of 2^22
-  points is ~4e9 flops (~10 s) inside `max_window_work`; cap the window or cache the weights.
-  (d) `concatByName` costs width x frames name lookups, quadratic for many frames with disjoint
-  columns; one name→index map over the union is linear. (The holiday-list scan per row is the
-  dtfn bullet (a) below.)
-- **2026-11-09 (S2 review of listfn/ranges/colfn/render/names/nestverbs/textio/structure/reshape, open, all LOW):** (a) `cumFoldColumns` output columns carry no `inner`, zone or categorical metadata (cumSum of a timestamp is a plain int column) and a repeated name in `cols` gives two same-named columns; (b) the list `Sampler` lives per compiled program, so a program evaluated twice continues the stream (same seed, different sample) — check whether a program is ever reused; (c) `hist` with `lo == hi` and |lo| ≥ 2^53: `lo -= 0.5` is a no-op, every edge equal; (d) `repeatValue` of a list/record builds no `inner`; (e) `flattenList` refuses a declared `.list` stored `.boxed` that `explode` accepts, and `explodeAll` selects a `.list`-declared column with scalar storage and then fails the whole frame; (f) `glimpse` type labels for zoned timestamps, decimals and nested types differ from polars (`<datetime[μs, Zone]>`, `<list[i64]>`) — check against polars; (h) `toHtml` clamps `float_precision` > 22 silently; (i) `PivotManySpec`: `aggs` longer than `values` ignored, `fill_value` silently wins over `fill`; (j) `matchToSchema` maps a bad zone to `SchemaMismatch` and compares zones by spelling (`UTC` vs `Etc/UTC` differ).
-- **2026-11-09 (jsonread/jsonio S2 review, open, all LOW):** (b) a repeated `data` (`.table`) or `columns` (`.split`) key and repeated keys in `.index` orient ignore `duplicate_keys` (the first wins); (c) the epoch writer writes null on i64 overflow with `.ns` (timestamps after 2262, durations past ~292 years), and a `date` written as epoch reads back as a `timestamp` — undocumented; (d) `double_precision > 15` is clamped silently (pandas raises).
-- **2026-11-09 (verbs.zig S2 review, open, all LOW):** (a) `validate` is ignored for `how = .cross` (pandas raises), `indicator`/`sort` are ignored for semi/anti; (b) an `indicator` name equal to an existing column is renamed by `uniqueNames` (pandas raises); (d) `unpivot` labels every value cell with the first value column's zone and type; (e) `pivot` with `margins` declares an int/float/timestamp row key `.text` while it holds ints plus "All"; (f) `validate` under `null_keys = .no_match` counts null keys as one equal group;
-- **2026-11-09 (dtfn.zig S2 review, open, all LOW):** (b) `zoneOffset` `.base`/`.dst` for a zone whose tzdata marks winter as DST (negative DST, e.g. Europe/Dublin) gives `dst = -3600` and the summer offset as base — not compared with polars; (c) `strftimeZoned` of a `.date` cell with `%Z` takes the abbreviation at UTC midnight; (d) `strftimeZoned` with `%Z` translates the format per cell (arena grows O(cells × format)).
-- **2026-11-09 (csvio.zig S2 review, open, all LOW):** (a) contradictory read options accepted silently: `on_bad_lines = .skip` with `truncate_ragged` (truncation wins); `na_filter = false` ignores `column_null_values` including its `NoSuchColumn` check; `TypeOverride.time_zone` on an excluded or text column is skipped silently, and an unknown zone only errors after the whole read; (b) `thousands` drops the byte anywhere (`"1,2,3"` reads 123, `",5"` reads 5): pandas-lenient, not polars-strict; (c) rows dropped by `skip_rows_after_header`/`skipfooter` are not checked for an unbalanced quote under `strict_quotes` nor against the size caps (bounded by `max_record_bytes`);
-
-- **2026-11-09 (more.zig S2 review, open, all LOW):** (a) percentiles closer than 1e-12 collapse to one label, the later winning; (b) `edgeText` prints 1e-7 as `0.0000001` and 1e300 with 301 digits (pandas repr `1e-07` / `1e+300`); (c) `cut` options silently ignored or colliding: `precision` without `interval_labels`, `interval_labels` with `labels`, `break_out` equal to `out` or to an existing column give duplicate names (`appendColumn` has no `uniqueNames`; pre-existing for `out`); (d) `describeWith` declares the non-numeric and temporal stat columns `.text` while their cells hold ints or any `Value`, and a timestamp's mean/min/max render as UTC ISO ignoring `time_zone`; (e) `concat`'s zone check runs for a repeated same-named column inside one frame though it "reads as its first"; (f) `describeWith` of zero columns returns a 0-row frame (pandas `ValueError`).
-
-- **frameops.zig, left after the S2 review (2026-11-09, source "frameops.zig S2 review", all LOW):** (a) `groupByDynamic`'s per-row window scan does up to 1<<16 steps per row and only the (row, window) pairs are capped, so rows × span is uncapped when windows are scanned but excluded by `closed`; (c) the `DynamicSpec.rule` doc says closed/label/start_by are not read, but `groupByDynamicNaive` reads closed/label for non-end-anchored rules and keeps a user `start_by` for "D" but overrides it for W-*; `origin` is silently ignored for calendar bins and weekday `start_by`: align doc and code, or `BadArgument`; (d) `interpolate` turns a non-numeric present cell (text/categorical) into null and may overwrite it with a number, a text column comes out all-null float: `TypeMismatch` instead (pre-existing); (e) `interpolate` with `by` x: limit/limit_direction/limit_area use row neighbours while the values come from x-sorted points (pandas does the same by position; low confidence).
-- **Chunked readers, left after the W9 review (2026-11-09, source "W9 review", all LOW):** (a) `max_rows` counts the `infer_rows` read-ahead (`csvchunk` `fill` against `taken -| emitted`): `.max_rows = 2, .infer_rows = 5` with `next(a, 1)` is `TooManyRows`; decide whether the cap is per emitted chunk. (c) `NdjsonChunkReader` with `n_rows` stops without reading the rest, while a whole `readNdjson` is `BadJson` on trailing garbage: document or pin.
-- **window.zig, left after the S2 review (2026-11-09, source "window.zig S2 review", all LOW):** (a) `op = .transform` silently ignores `mapping` join/explode (error or document); (b) option errors raised in `computeOne` (`BadOption`, `InvalidDecay`, e.g. `ewm_by` `half_life <= 0`) only surface when a partition exists, so an empty frame returns Ok; (c) `mapping = .join` builds a `.list` column with no `inner` type and no zone (zoned timestamps lose the zone; same as the implode path); (d) `reverse = true` with time-based ops (`rolling_time`, `ewm_by`, `ewm` `times_col`, timed rank/pair) yields all-null after row 0 without `BadOption` or a doc line; (e) NaN/inf in `Rolling.weights`, or a gaussian with a denormal std, propagate NaN silently (scipy does the same).
-- **expr.zig, left after the S2 review (2026-11-09, source "expr.zig S2 review", all LOW):** (a) `match_regex` wraps the pattern as `\A(?:…)\z`; a `(?x)` pattern ending in a `#` comment swallows the wrapper and fails to compile. (b) `zoneOf` has no case for `.list` get/first/last/min/max/item, `.field` or `.fold` (`.element` of a `list_eval` body has one since the fix): a zoned value taken out of a list or struct, or folded with min/max, gets no zone. (c) `to_datetime` with `.infer` picks the format from the first non-null cell of the frame given to `compile`, so a per-chunk `mutate` can infer different formats per chunk. (d) `replace_time_zone`/`convert_time_zone` skip the non-timestamp check when `temporalType` returns null.
-- **strfn.zig, left after the S2 review (2026-11-09, source "strfn.zig S2 review", all LOW):** (a) `wrap`'s tab stop counts a lone continuation byte as 0 columns while the character count counts bytes for invalid UTF-8 (`"\x80\tx"`): the two disagree on invalid input. (b) `fnx.charStarts` allocates (len+1)*8 bytes per cell (128 MiB for a 16 MiB cell), and one invalid byte switches the whole cell to byte indexing, so `sliceReplace` can split a code point (invalid UTF-8 out). (c) The strfn helpers rely on the `expr.zig` guards for an empty `by`/`from` and for `limit = 0` (`rsplitLiteral` with `by = ""` would loop to out-of-memory): add local guards when strfn becomes `pub`. (d) `getDummies` names borrow the input when `prefix == null` and allocate otherwise (fine under the arena contract).
-- **exprfn.zig, left after the S2 review (2026-11-09, source "exprfn.zig S2 review", all LOW, no panic found):** (a) `erfc` for |x| in about 1.5..2 is `1 - erfSeries(x)`: about 1e-13 relative, not the documented 1e-15 (the oracle tolerance 1e-12 hides it) — measure against `math.erfc` and move the series cut-off or weaken the doc; above |x| ≈ 26.5 `@exp(-x²)` is subnormal (the value is too). (b) A cell over 16 MiB: the ASCII and invalid-UTF-8 branches of `lower`/`upper`/`casefold`/`capitalize`/`title`/`swapcase` have no cap, the unitext branch (`ut_opts`, `max_text_result`) returns `TooLarge`, also for an already-normalized `normalize`. (c) `title`/`swapcase`/`capitalize` on mixed-validity text take ASCII rules (documented); no test pins it. (d) No round-trip test of `escape_regex` through `modules/regex` (`\#`, `\&`, `\~` accepted?), only the polars string oracle.
-- **Time zones, left after wave W7 (2026-11-09):** (1) A callback verb's `OutColumn` and a `struct_of`/`list` built by an `Expr` carry no zone (the inner column is described by kind): cast the result, or give the schema; `Column.inner` already carries a declared one. (2) `groupByDynamic` of a zoned index with a sub-day `every` cuts on the wall clock like `truncate`; no engine answer was taken for it (the vectors cover `1d` and `1mo`). (3) `datetime_format` of the CSV writer takes `%z` but not `%Z` (use `Expr.strftime`). (4) `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until then a zoned column before 1970 shows the zone's state at the epoch. (5) Comparison of a naive against a zoned column compares instants (pandas `False`, polars `SchemaError`).
-
-**S2 wave W2 (2026-11-09), the everyday single-parameter gaps — built, with the engine each follows.**
-pandas 3.1 unless said (`src/s2w2_test.zig` by hand; the engine cases in `tools/oracle2.py` groups `w2_*`, replayed by
+Built, with the engine each follows: pandas 3.1 unless said (`src/s2w2_test.zig` by hand; the engine cases in `tools/oracle2.py` groups `w2_*`, replayed by
 `oracle2_test.zig`): `describeWith` (`percentiles`, `include`/`exclude` by type, `all`, text/bool/categorical
 `count unique top freq`, timestamp and duration columns as ISO text; pandas prints exactly the percentiles asked, its
 documented "median always" is not so in 3.1; `std` moves last beside a timestamp column; polars `describe` differs
@@ -651,13 +544,11 @@ methods `zero` and `slinear`; `ohlc`/`ohlcAggs` (groupby and, through `groupByDy
 Engine notes: `zero` and `slinear` are not engine-checked (pandas needs SciPy, absent from the oracle venv); `slinear`
 is the linear line between known points by `by`/position, `zero` the previous known value. `quantiles` of `lower`/
 `higher`/`nearest` on an int column answers floats where pandas keeps ints. `describeWith` of a duration or
-timestamp column is hand-tested only (the oracle cannot compare pandas' string form). Not done, with the reason:
-polars `bin_intervals`/`bin_quantiles`/`bin_ranks` (their behaviour was not surveyed on a page; `cut`/`qcut` with
-`break_out` serve the same uses), `pivotKeys` does not take the new `pivotMany` fields (use `pivotMany`), `validate`
-of a `semi`/`anti`/`cross` join is not checked, `fillNull` `across_columns` for strategies other than
-forward/backward, `interpolate` `limit*` counts rows in row order (an unsorted `by` is the caller's to sort).
+timestamp column is hand-tested only (the oracle cannot compare pandas' string form). `interpolate` `limit*` counts rows in row order (an unsorted `by` is the caller's to sort).
 
-**Wave W3 (dataframe S2, 2026-11-09): constructors, small `Expr` functions, selectors, names.** Built:
+### Constructors, small `Expr` functions, selectors, names (wave W3)
+
+
 `ranges.zig` (`intRange`, `intRanges`, `linearSpace`, `repeatValue`/`ones`/`zeros`, `dateRange`/`datetimeRange`
 with `closed` and `business`, the `...Periods` forms and `datetimeSpace` for pandas' `date_range(periods=)`;
 output capped at `max_range_rows`, 2^22); `Expr` gained `Binary.truncdiv`, `Unary.erfc`/`escape_regex`,
@@ -670,12 +561,11 @@ function); `Selector` gained `alpha`/`alphanumeric`/`digit` (by name; Unicode si
 `tools/oracle2b.py` to `src/oracle2b_vectors.json` (103 cases), replayed by `src/s2w3_oracle_test.zig`.
 Differences kept: `cum_fold`/`cum_sum_horizontal` give one column per input where polars gives one struct column;
 `hist` category text prints up to six decimals as polars does; `name.replace` replaces every match
-(polars' regex form too, measured). **Left, with reasons:** `time_range`/`pl.time` (no time-of-day column
-type); pandas' anchored frequencies other than months, weeks and business days (`BMS`, `W-MON`, ... are
-named after calendars the duration language does not have; `1mo` from a month end and `business` cover
-`ME`, `MS` and `B`); `cum_*(reverse=True)`, `diff(null_behavior)` and `over(order_by, mapping_strategy)` are wave W5's; (Unicode case in `renameLower`/`renameUpper` and the Unicode `alpha`/`alphanumeric`/`digit` came with wave W8); `cs.alpha(ignore_spaces=)`; `int_ranges` takes `?i64` slices, not columns of a frame.
+(polars' regex form too, measured).
 
-**Wave W4 (dataframe S2, 2026-11-09): `str` and `dt` gaps, durations.** Built, each with the engine it follows (doc
+### `str` and `dt` gaps, durations (wave W4)
+
+Built, each with the engine it follows (doc
 comments say where the engines differ); engine answers in `tools/oracle2c.py` to `src/oracle2c_vectors.json` (293
 cases, pandas 3.1 and polars 2.1), replayed by `src/s2w4_oracle_test.zig`; hand tests in `src/s2w4_test.zig`.
 *Str* (`strfn.zig`, `Expr`): `split_ws` (Python `split()` / pandas default: runs of Unicode whitespace, no empty
@@ -684,8 +574,7 @@ column names), `split_fields` (polars `split_exact`: `n + 1` fields, the rest dr
 (Python `textwrap.wrap`, joined by newlines, pandas `str.wrap`: `width`, `break_long_words`, `break_on_hyphens`;
 `expand_tabs`, `replace_whitespace` and `drop_whitespace` at Python's defaults, the other options not offered; only the
 space is whitespace after the replacement and bytes >= 0x80 count as letters for the hyphen rules), `slice_replace`,
-`encode`/`decode` (`hex`, `base64`; decode gives text, null for invalid input or non-UTF-8 bytes: there is no binary
-type, polars' `strict=True` raises where this nulls), `affix_any` (`startswith`/`endswith` with several affixes),
+`encode`/`decode` (`hex`, `base64`; `decode` gives a binary column, see Binary in the parity close below), `affix_any` (`startswith`/`endswith` with several affixes),
 `replace_n` and `replace_regex.n` (pandas `n=`), `match_regex` (`match`, `fullmatch`: the whole pattern is anchored),
 `Unary.is_ascii`; frame verbs `splitColumns` (pandas `split(expand=True)`, polars `split_exact` + `unnest`: literal,
 regex or whitespace, `prefix`, as many columns as the widest cell, at most `max_str_columns`) and `strGetDummies`
@@ -709,90 +598,13 @@ own docs warn) and an inferred ISO column fixes the `T`/space separator from the
 8601 is read as ISO, cell by cell). Polars infers no month-name pattern (null); `infer` here knows pandas' names.
 `total_seconds_f64` divides exactly where pandas multiplies by 1e-9 (relative difference 3e-11). The business-day
 search gives null for a mask with no day on, a span past 2^30 days, or a holiday list that needs more than 4096
-refinement steps. **Left, with reasons:** `str.cat` is `concat_str` (W3); pandas `str.extractall`/`partition` into a
-DataFrame is the record plus `unnest`; Unicode case came with wave W8; `dt.combine` with a real `Time` (the
-module has no time-of-day column); `components` as a frame verb (the record plus `unnest` is the same, and keeps
-the verb count down); `time` strings other than `HH:MM[:SS[.f]]` in `combine`; the flags of `textwrap` not offered
-(`initial_indent`, `subsequent_indent`, `max_lines`, `placeholder`, `fix_sentence_endings`, `tabsize`).
+refinement steps.
 
-**Audit D5 (2026-11-08), closed.** Review: an independent read of the D3/D4 code (no HIGH; a MED in the CSV
-speculative reader's memory, four LOW, all closed by sweep S2) plus the two no-panic sweeps above. Mutation:
-mutant schemata over every production file in two groups. Group MA (verbs keys core frame value spec frameops
-structure reshape, over `387ec269`): 646 ids, 549 killed (143 by tests added for it, `src/mut_ma_test.zig`),
-72 equivalent with their invariants, 25 not decided — 19 boundaries that need inputs of 2^22-2^24 cells, 6 whose
-new tests were written after the last schemata build. Group MB (expr exprfn window more analysis csvio jsonio
-textio render dtfn seriesfn, over `00d096c7`): 1098 ids, 988 killed (201 by `src/mut_mb_test.zig`), 101
-equivalent, 9 not decided — three caps at 2^24-2^30 and `Budget`'s resize accounting in `expr.zig`. Tables:
-the coordinator's `ma.table.tsv`/`mb.table.tsv` (not kept in the repo: audit instruments are disposable,
-CONVENTIONS §9). Findings: `arith` on a result column of int and decimal cells panicked (fixed, test in
-`src/frameops_test.zig`); `translateFormat`'s doc (fixed); `csvio.Scanner.present` and
-`core.windowAgg`/`stdSample` dead outside their file (LOW, open). The code has changed since both runs
-(`readJson`, regex, time zones, `corr`/`cov`, `truncate` modes), so `src ?`: a later run over one commit with
-the 34 undecided closed is what A1 needs.
+### Dependencies, verb inventory and cross-cutting features
 
-**Review 2026-11-07 (second, the D2 verbs), closed:** HIGH1 `round` with `decimals = minInt(i32)` negated an i32 (and -309..-330 gave `0 * inf = NaN`), HIGH2 `gatherEvery` overflowed for a step near maxInt, HIGH3 `repeat("" , maxInt)` looped 2^63 times, MED4 decimal/int `round` near minInt(i128) formed `q * p` out of range, MED5 `qcut` was O(bins x rows) (now one sort), MED6 `hstack` was quadratic in time and arena memory (now one pass, hashed names), LOW7 `transpose` width now capped (`max_transpose_width`, 2^20 columns); `pow10f` is now a table of correctly rounded powers (numpy's `10.0 ** d`; `std.math.pow` was ulps off above 1e22). Tests in `src/review2_test.zig`. **Open (LOW, no panic; the `dummies`, `pivotMany`/`pivotKeys` and `Selector` items closed by sweep S1 2026-11-08):** `exprfn.reverse`/`translate` free their `charStarts` after a later allocation, so an arena keeps 8 bytes per character per cell; `fillNull(.mean)` on a bool or timestamp column changes its declared type to float; `scatter` can store a cell of another kind than the column's declared type.
+Production dependencies are `datefmt`, `csvstream`, `regex`, `tz` and `unitext` (`meta.deps` and the `build.zig` entry agree); `testkit`, `encoding` and `bzip2` are test-only. `regex` and `unitext` are heavy (Unicode tables), see § Backlog / deferred for the size knobs.
 
-**Review 2026-11-07, closed:** MED1 a huge `FrameBuilder` row hint (now clamped to `max_row_hint`, capacity arithmetic saturating), MED2 `aggregate` `drop_missing_keys` with no group columns dropped its one row (also in `tabular`, filed in its SPEC), MED3 `cumsum`/`rolling` missing-as-0, L4 `distinct(.keep = .last)` row order, L5 suffix collisions in `join`/`joinAsof` (numbered as in `aggregate`), L6 decimal to text through f64, L7 pivot key order through raw `parseFloat`, L8 `big_block_allocator` freeing with the wrong alignment, L9 the overflow claim above; tests in `src/review_test.zig`. L10, the review's nits, open (LOW, no panic): `rollingTime` skips a row with a null or out-of-order time as an output but still counts its cell in later windows; `upper`/`lower` are ASCII-only (Unicode tables are the Backlog item above); `valueCounts` with no columns answers `NoSuchColumn` rather than a dedicated error; `unpivot` types the value column after the first melted column even when the melted types differ; a `mutate` NaN among int results leaves a float cell in an `.int`-declared column (stored boxed).
-
-**Sweep 2026-11-08 (D5, group S1: verbs, keys, core, frame, value, spec, root, frameops,
-structure, reshape and the `u32` row-index class), closed:** `transpose` panicked (`.?`) on a
-text or bool cell in a column declared int/float (the builder does not check a cell against
-its declared type; the cell now stays as it is, in the boxed column); a `Selector` graph
-sharing a node 64 deep visited 2^64 nodes; `pivotMany`/`pivotKeys` and `dummies` capped
-each block, not their sum (the three open items of the second review, above); `arith`,
-`combineFirst` and `concat(.horizontal)` padded a 301-column frame to 60 000 rows
-(18 million cells out of 60 000 in); `matchToSchema` with `cast` copied the schema and
-every array of the frame once per cast column (O(schema x width) arena); quadratic name
-lookups in the width (`join`/`joinWhere` suffixes, `arith`, `combineFirst`, `update`,
-`mergeOrdered(fill_forward)`, `matchToSchema`, `select`/`drop`/`distinct`/`dropna` by many
-names, the duplicate check of `concat(.vertical)`: 10 to 76 s at 20 000 columns, now
-milliseconds); `sortedRows` had no entry check of its own for the `u32` limit. Tests in
-`src/sweep_s1_test.zig`. **Open (LOW, no panic), left deliberately:** `rename` checks each
-renamed name against every column (renamed x width); `Frame.columnIndex` stays a scan, so a
-spec of k names over `more.zig`/`analysis.zig`/`window.zig` (S2's files) costs k x width;
-`clear(n)` and the frame-wide readers (`nullCount`, `hasNulls`, `equals`, `info`) are linear
-in a claimed `len` up to 2^32 - 2 over no data; `columnBytes` of a boxed column adds text
-lengths with `+` (a sum past 2^64 needs more cells than memory holds); `addAffix` with a
-prefix of megabytes over 65 536 columns allocates what the caller asked for.
-
-**Fuzz after categorical/duration (2026-11-08):** the harness's random `cast`/`mutate` types
-now include both; 1.5 M runs, 5 jobs, ReleaseSafe, 39 s, clean after one find: `concat`'s
-typed path left a column declared categorical over text storage unencoded where the cell path
-encoded it (seed 5426, fixed, `src/catdur_test.zig`, seen failing without the fix).
-
-**D5 fuzz (2026-11-08, `src/fuzz.zig`).** First harness and driver (1.5 M runs, clean; no crash, leak or hang
-found, so no production change). Left open, all LOW: (1) the typed verbs' results may carry set validity
-bits past `len` (`map` through `verbs.allValid`; 107 k of 1.5 M runs had one), which the module's S2-3 fix
-treats as garbage to mask: producers differ, readers mask, the harness only counts them; (2) a `mutate`
-with `pad` to 2^20 characters and `strip_chars` over 16 rows took 3.7 s (bounded by `max_eval_bytes`,
-1 GiB of text is seconds to tens of seconds of per-character decoding): a time-shaped cap or a smaller
-default is a decision for the owner, the harness keeps `pad` width <= 4096; (3) a CSV header name that
-starts with a BOM (a BOM after `skip_rows`) does not read back as itself, `readCsv` strips it; the harness
-skips that round trip. The oracles: typed against `*Cells` for sort, join, joinAsof, aggregate, pivot,
-unpivot, window, fillNull, topK, valueCounts, describe, mutate and diagonal concat (an empty result's
-`.nulls` or typed array is not compared); well-formedness of every result (a null slot holds 0).
-
-Plan steps: **D2** verbs (this list), **D3** input and output, **D4** speed, **D5** audit.
-Row numbers are the D0 survey's.
-
-**D2, the verbs `tabular` has as row verbs only:** all moved (2026-11-07). Not moved, as
-compositions of the verbs here (survey §6):
-`tabular`'s `weightedGroupSum`, `percentOfTotal`, `clampRange`, `outlierFlag`,
-`mergeByKey`, `cumreturn`, `drawdown`, `rebase`, `forwardFill`, the `series` `expanding`/
-`ewm`/`pctChange` (the `window` operations cover them); `datePart` waits for the `dt`
-accessor (row 98); `format`/`formatColumn` for text rendering (row 77).
-
-**D2, decided by the plan (§ Decided, 2026-11-05):** pandas and polars defaults (skip-NA, an
-int `sum` stays int — done in W11, 2026-11-10: the oracle's `-big-agg-sum` and the six int-type entries went);
-`merge` `validate` and `indicator` (64); `corr` and `cov` on the table (41); a comptime
-callback verb for `map_elements`/`apply`/`rolling_map`/`map_groups` (21; done 2026-11-08, below); time zones through
-`tz` (71); list, struct and duration columns (56, 94, 100, 102); categorical columns (101);
-Unicode case tables (93, done in wave W8, with the build option still open: see there); regex string verbs through `regex` (91); a
-`Series` method set over the view that exists (104). Production dependencies `regex`,
-`datefmt`, `tz`, `numparse`, `decimal`, `csvstream` are allowed, each behind a CONVENTIONS
-§4.2 size knob where it is heavy.
-
-**The survey's 45 MISSING rows, built in D2 (2026-11-07, tests in `src/structure_test.zig`,
+**Verbs built from the survey's rows (tests in `src/structure_test.zig`,
 `src/analysis_test.zig`, `src/exprfn_test.zig`):** `info`/`memory_usage`/`estimated_size`
 (2), `select_dtypes` and selectors (4), `copy`/`clone`/`clear` (10), `take`/`gather`/
 `gather_every`/`reverse` (12), `insert`/`pop`/`drop_in_place`/`hstack`/`replace_column`
@@ -810,7 +622,7 @@ multi-column `nlargest` with `keep` (61), `is_sorted`/`arg_sort`/`searchsorted`/
 weekday, ordinal day, ISO week and year, quarter, days in month, the `is_*_start/end`
 family, leap year, business day, month and day names, epoch in four units, date, time,
 month start and end), `dt` arithmetic and formatting (99: `offset_by` and `truncate`
-(with `mode` `.ceil`/`.nearest`: pandas `dt.ceil`, polars `dt.round`, a tie to the later start; 2026-11-08)
+(with `mode` `.ceil`/`.nearest`: pandas `dt.ceil`, polars `dt.round`, a tie to the later start)
 with polars' duration strings, `add_business_days`, `strftime`; tests in
 `src/dtfn_test.zig`; the calendar is the sibling `datefmt`'s, the module's only
 production dependency). Wave 4 (tests in `src/wave4_test.zig`): `to_numpy` as
@@ -840,7 +652,7 @@ declared `.text` (pandas' `object`); `concat(.horizontal)` pads a shorter frame 
 nulls (polars; pandas aligns on its index, which this module has not); `dt.weekday`
 is ISO, Monday 1 to Sunday 7 (polars; pandas' `dayofweek` is 0 to 6);
 `add_business_days` from a weekend rolls forward first (polars' `roll="forward"`);
-measured against the engines on 2026-11-07: `round_sig_figs` ties go away from zero
+measured against the engines: `round_sig_figs` ties go away from zero
 (2.5 to one digit is 3); `str.slice` places the window before it cuts it (`slice(-3, 2)` of
 "a" is empty); `fill_null(mean)` of an int column stays int, the mean cut toward zero;
 `fill_null(zero)` of text is "" and of bool False; a `%y` year of 69 is 2069 (chrono), not
@@ -859,7 +671,7 @@ A temporal cell is an `.int` (microseconds since the epoch, UTC), a `YYYY-MM-DD`
 text (a date) or other ISO text (a timestamp); a temporal result keeps the shape it
 came in.
 
-**Regex (rows 50, 91; 2026-11-08, tests in `src/regex_test.zig`):** `contains_regex`, `extract`,
+**Regex (rows 50, 91; tests in `src/regex_test.zig`):** `contains_regex`, `extract`,
 `count_regex`, `replace_regex` in `Expr` (so in `mutate` and `where`), over the sibling `regex` module in
 its Rust grammar — polars' (Rust's `regex` crate), so `\w`/`\d` are Unicode; pandas' Python `re` is a
 backtracking engine with lookaround and backreferences, which RE2-family engines leave out to stay linear,
@@ -869,11 +681,10 @@ the `regex` module's (`$1`, `${name}`, `$$`; Go's `Expand` reading of `$01` as a
 group 1); a result past `max_text_result` is `error.TooLarge`, and the cells of one assignment stay under
 `max_eval_bytes`. `Selector.matches` picks columns by a pattern over their names (row 47: polars `cs.matches`, pandas
 `filter(regex=)`), each pattern compiled once per `selectColumns` call and freed after it. `extract_all`, `split_regex` and `extract_groups` (list and record results) are in the paragraph on
-list and struct namespaces; not here: regex `find`. **Build option candidate:** `regex` brings its
-Unicode tables into any binary that calls `mutate`/`where` (the instruction is dispatched at run time);
-measure with a size probe before adding a `dataframe-regex` knob (CONVENTIONS §4.2).
+list and struct namespaces; `find_regex` is in the W10 notes (§ Input and output). `regex` brings its
+Unicode tables into any binary that calls `mutate`/`where` (the instruction is dispatched at run time).
 
-**Unicode text (wave W8, dataframe S2, 2026-11-09; tests `src/s2w8_test.zig`, engine answers `tools/oracle2f.py` to
+**Unicode text (wave W8; tests `src/s2w8_test.zig`, engine answers `tools/oracle2f.py` to
 `src/oracle2f_vectors.json`, replayed by `src/s2w8_oracle_test.zig`).** `dataframe` depends on `unitext`. `lower`, `upper`,
 `title`, `capitalize`, `swapcase` (`Unary`) and `renameLower`/`renameUpper` are Unicode: the full case mappings of Python
 `str` (what pandas `str.*` documents) and Rust (polars `to_lowercase`/`to_uppercase`; the two agree on all 28-odd probe texts),
@@ -884,9 +695,9 @@ arms `casefold` (pandas), `is_decimal`, `is_numeric` (pandas), `unaccent`, and `
 is `normalize("NFKD")` and dropping the combining marks, which agrees on accented Latin (checked against that recipe in the
 tests) but leaves `ł`, `ß`, `æ` alone and also folds compatibility forms, where `unaccent` folds the former and not the latter.
 `is_alpha`/`is_digit`/`is_alnum`/`is_space`/`is_lower`/`is_upper`/`is_title` are Python's Unicode classes (`²` is a digit, `½` and
-`Ⅻ` are numeric only). The selectors follow polars, not Python: `alpha` = the Alphabetic property (`unitext.isAlphabeticCp`: letters, letter
+`Ⅻ` are numeric only). The selectors follow polars, not Python: `alpha` = the Alphabetic property  (`unitext.isAlphabeticCp`: letters, letter
 numbers such as `Ⅻ`, and combining vowel signs such as Devanagari `ा` or Thai `ิ`; a virama or a bare combining acute is
-not; since 2026-11-10), `digit` = `Nd` (`٣٤٥`, `１２`; not `²`), `alphanumeric` = both. **Invalid UTF-8 (one policy for the module):** a cell that is not
+not), `digit` = `Nd` (`٣٤٥`, `１２`; not `²`), `alphanumeric` = both. **Invalid UTF-8 (one policy for the module):** a cell that is not
 valid UTF-8 has no code points, so it is handled as bytes, as `length` and `pad` already do: the case functions change its
 ASCII letters only, `normalize`/`unaccent` return it unchanged, every `is*` class is false. A result is capped at
 `max_text_result` (`error.TooLarge`), as `pad`. **pandas storage:** pandas 3's default Arrow-backed `str` dtype maps case by
@@ -894,15 +705,12 @@ the SIMPLE mapping (`ß` stays, no final sigma, `ǆ` capitalizes to `Ǆ`) and an
 vectors use the Python storage, and the two older D2 vectors `str-uni-capitalize` and `str-uni-swapcase` (recorded from the
 Arrow storage) are `known` differences. polars has no `casefold`, `swapcase`, `capitalize` or `is*`. **Size:** the
 dependency adds 158,056 B (1,053,096 to 1,211,152, +15%) to a ReleaseSmall binary that calls `mutate` with one `add`
-(the instruction set is dispatched at run time, so the tables come in whatever the expression). **Build option candidate:**
-`dataframe-unicode` (default on, off = the former ASCII behaviour) would remove it; not added (CONVENTIONS §4.2, open for
-the owner's decision). **Strip (2026-11-10):** `strip`/`lstrip`/`rstrip` and `strip_chars` with null chars strip Unicode whitespace from a
+(the instruction set is dispatched at run time, so the tables come in whatever the expression). **Strip:** `strip`/`lstrip`/`rstrip` and `strip_chars` with null chars strip Unicode whitespace from a
 valid UTF-8 cell (`unitext.isSpaceCp`: Python `str.strip()`, as pandas; polars' Rust `White_Space` differs only on
 U+001C..U+001F, which polars keeps and Python strips, a `known` difference of the replay); U+200B is not whitespace. A
 cell that is not valid UTF-8 is bytes (the six ASCII whitespace bytes only); an explicit `chars` set is matched exactly.
-Left: language-tailored case (Turkish, Lithuanian) is not in `unitext`.
 
-**Time zones (row 71 and the column-carried zone, survey row 98; 2026-11-08 and 2026-11-09 wave W7, tests in
+**Time zones (row 71 and the column-carried zone, survey row 98; wave W7, tests in
 `src/tz_test.zig`, `src/s2w7_test.zig`, `src/s2w7_carry_test.zig`, `src/s2w7_oracle_test.zig`):**
 a `.timestamp` column may carry an IANA zone, `Column.time_zone` (polars `Datetime("us", time_zone=...)`, pandas
 `datetime64[us, zone]`; null is a naive column, the former behaviour). **The zone is schema metadata: cells stay UTC
@@ -958,7 +766,7 @@ The vectors are `src/oracle2g_vectors.json` (`tools/oracle2g.py`, 136 cases: wal
 DST changes and before 1970, `strftime`, `replace_time_zone` under every policy, `truncate`, comparison, casts,
 `group_by_dynamic`/`resample`, text I/O).
 
-**Correlation (row 41; 2026-11-08, tests in `src/corr_test.zig`):** `corr(spec)` and `cov(spec)` are
+**Correlation (row 41; tests in `src/corr_test.zig`):** `corr(spec)` and `cov(spec)` are
 pandas' `DataFrame.corr(method=, min_periods=)` and `DataFrame.cov(min_periods=, ddof=)` over the int, float
 and decimal columns (or `cols`, where a non-numeric name is `error.NotNumeric`): each pair over the rows where
 both cells are present, two-pass means (numpy's and pandas' numerics), Spearman as Pearson over average ranks
@@ -968,7 +776,7 @@ column per selected column; polars' `DataFrame.corr` is the same matrix without 
 `max_corr_work` (2^31 element visits, pairs x rows) bounds the quadratic pair count. Not here: `kendall` and a
 callable method, `numeric_only=False` (text columns raise in pandas too).
 
-**Callback verbs (rows 21, 25; 2026-11-08, `src/callback.zig`, tests in `src/step4_test.zig`).**
+**Callback verbs (rows 21, 25; `src/callback.zig`, tests in `src/step4_test.zig`).**
 Every callback has one shape, `fn (ctx: C, a: Allocator, input) E!Output`: the function is a
 `comptime` parameter (each call site its own instantiation, a direct call, no function pointer),
 `ctx` is the caller's state (`{}` for none, a pointer for an accumulator), `a` the verb's arena for
@@ -1001,7 +809,7 @@ drops it); `rollingMap`'s type is the callback's (polars; pandas' `rolling.apply
 Not here: a callback inside `aggregate` (polars `map_elements` in `agg`; `mapGroups` covers it), a
 function chosen at run time (put a function pointer in `ctx`), threads.
 
-**Window `rank`, `corr`, `cov` (row 29; 2026-11-08, tests in `src/step4_test.zig`).**
+**Window `rank`, `corr`, `cov` (row 29; tests in `src/step4_test.zig`).**
 `WindowOp.rolling_rank` (`RollingRank`; pandas `rolling(w).rank()`/`expanding().rank()`, polars
 `rolling_rank`): the row's value ranked among the present values of its window (`window = null`: the
 partition's prefix), `method` `average` (default), `min`, `max` (pandas' three) and `first`, `dense`
@@ -1012,27 +820,11 @@ values); always float (pandas); a missing row null. `rolling_corr`/`rolling_cov`
 `pearson`/`comoment` (shared with `corr`/`cov`, not copied), `cov` over `n - ddof` and null at
 `n <= ddof`, a side with no spread a NaN correlation (pandas). `min_periods` null = the window
 (pandas), 1 for an expanding window; a null, NaN or non-numeric cell does not count. The values
-are pandas' documented examples (`Rolling.rank`, `Expanding.rank`) and hand-worked windows. Where
-pandas or polars may differ, not run (TODO oracle): with `center`, the value ranked here is the
-labelled row's (the window's middle); pandas' running sums for rolling `cov`/`corr` can differ from
-the two-pass values in the last bits; polars' `rolling_cov` `ddof` default and its treatment of a
-window's nulls. Not here: polars' `random` rank method, the `rolling_time` forms, a Spearman
-window, pandas' `pairwise=True` (a matrix per window).
+are pandas' documented examples (`Rolling.rank`, `Expanding.rank`) and hand-worked windows.
 
-**Not built, each with its reason (survey rows, by number; re-checked against the code 2026-11-10):** index
-alignment of frame arithmetic (19: there is no index, so frames align by position, the refused index family);
-SciPy's `spline`, `polynomial`, `krogh`, `barycentric` and `from_derivatives` interpolation (51: pandas hands
-them to SciPy's FITPACK smoothing splines and polynomial interpolators, an optional dependency outside pandas;
-polars offers `linear` and `nearest` only; `quadratic`, `cubic`, `pchip` and `akima` — the ones a pandas user
-reaches for — were built 2026-11-10); `set_sorted` (62) and `cast_time_unit` (99) are refused with their reasons in § What this module
-is, and what it is not; `extract_many`/`find_many` (96) and `json_decode` (97) were built 2026-11-10. Built since
-this list was written: `fold` (31: `Expr.fold`, `foldColumns`), the pivot index family (53: `pivotKeys`,
-`pivotMany`, `margins`), `align_frames` (68; pandas' index `align` goes with the index), `repeat_by` into list cells
-(89: `listfn.repeatBy`), and in wave W10 `wide_to_long` (55) and polars `bin_*` (85); the `str`/`dt` gaps this list
-once held (`wrap`, `encode`/`decode`, `get_dummies`, `split` into columns, `slice_replace`, `dt`
-`combine`/`replace`, holidays and week masks) were built in wave W4.
+### Windows and dynamic groups (wave W5; survey rows 26, 29, 25, 33, 71)
 
-**Windows and dynamic groups (dataframe S2, wave W5, 2026-11-09; survey rows 26, 29, 25, 33, 71).**
+
 `window.zig`: `Rolling` gained `closed` (pandas fixed-window `closed=`: `left`/`both` start one row
 earlier, `left`/`neither` stop one earlier), `step` (pandas `step=`; the table keeps its length and the
 rows not evaluated are null, where pandas returns only the evaluated rows), `forward`
@@ -1063,51 +855,11 @@ default; the two differ for `17min`); calendar bins ignore `origin` as pandas do
 `tools/oracle2d.py` to `src/oracle2d_vectors.json` (668 cases), replayed by `src/s2w5_oracle_test.zig`;
 by hand `src/s2w5_test.zig`. **SciPy was not available:** the `win_type` vectors are pandas' own aggregation over
 windows computed in the generator from the formulas in SciPy's documentation (a stand-in `scipy.signal.windows`),
-cross-checked against numpy's `hamming`/`hanning`/`bartlett`/`blackman`/`kaiser`. **Left, with reasons:**
-`win_type` `var`/`std` (pandas' weighted variance is a streaming update that is not the weighted variance of the
-window for an asymmetric window: measured, the values differ from `sum w (x - m)^2 / sum w` scaled by any
-`n / (n - ddof)`; not reproduced); `dpss`, `chebwin`, `taylor` windows (an eigen-solver, Chebyshev polynomials
-with an FFT, an iterative design); `diff(null_behavior="drop")` (it shortens the column; `window diff` then
-`dropna` or `slice` is the same, the verb returns one value per row); polars `rolling_rank_by` with `closed`
-left/none (the rank of a value outside its own window); pandas `ewm` `var`/`std`/`sum` with `times` (pandas
-refuses them too) and `cov`/`corr` with `times`; pandas `B` (business-day bins skip weekends: not a duration)
-and calendar rules with a count other than 1 (`2MS`) or other anchors (`QE-MAR`, `YS-JUL`); pandas'
-`origin` default changing `closed`/`label` to right for `end`/`end_day` (set them explicitly); `explode` under
-`order_by` keeps first-seen partition order where polars showed another one (its group order is
-unspecified). One difference from pandas 3.1 noted, not changed: `rolling(w).count()` defaults
-`min_periods` to the window in pandas 3.1 (NaN in the first rows) where this verb has always defaulted `count` to
-0.
+cross-checked against numpy's `hamming`/`hanning`/`bartlett`/`blackman`/`kaiser`.
 
-**D3, input and output (2026-11-07, § Input and output):** `readCsv`/`readCsvReader`/`writeCsv` (73), `writeJson`
-and `writeNdjson` (74), `format` and `toMarkdown` (77). JSON read (`readJson`, `readNdjson`) done 2026-11-08; the
-S2 options of 2026-11-09 (§ Input and output, "Options added in S2") closed the rest of the survey's I/O rows except
-what follows. Not done: pandas' `typ="series"`, polars' `infer_schema_length` (every row is read) and `jsonshape`'s
-`shapeFrame` (step R, the repoint); `to_latex` (77: markup for papers, no consumer; `toHtml` and `toMarkdown` cover
-notebooks and text documents), `toHtml`'s pandas knobs `formatters`, `bold_rows`, `table_id`, `render_links`,
-`max_rows`/`max_cols` truncation and its common-digit padding of a float column (`1.5`, `2.50`; `float_precision`
-gives the fixed form); `read_csv`'s `converters` (not an option: read the column as `.text` through `types` and
-map it with the callback verb `mapElements`, which takes a comptime function per column the same way and checks its
-output type; a read-time hook would be that verb again), pandas' `warn` for `on_bad_lines` (no warning stream: the
-count lands in `bad_lines_skipped`), `encoding` and `compression` (siblings to compose with; the README shows `bzip2` + `encoding`), a comment cut
-off the end of a line (a comment is a whole line), `quoting=QUOTE_NONNUMERIC` on read (csvstream reports no
-"this field was quoted" flag, so an unquoted-means-number reading cannot be built here: **csvstream gap**: a
-`quoted: bool` per field from `splitFieldsOpts`), `to_csv`'s `index`, `chunksize` (a writer already streams into any `std.Io.Writer`), `encoding`, `compression`, `time_format`
-(no time-of-day column type), pandas' `float_format="%.3e"` exponent style (`e+02`; `float_scientific` is Rust's `e2`,
-polars), `to_json`'s `default_handler`, `date_format="iso"` at `date_unit` precision (ours is RFC 3339 with the
-digits the value needs) and the Table Schema's `extDtype`/categorical `enum` (a `readJson` `table` also ignores the schema's
-field types and keeps no index).
-Open (LOW): `format` counts code points, not terminal cells (wide characters misalign, as in pandas).
+One difference from pandas 3.1 noted, not changed: `rolling(w).count()` defaults `min_periods` to the window in pandas 3.1 (NaN in the first rows) where this verb has always defaulted `count` to 0.
 
-**D4, speed:** `tools/bench.zig` has the rows of `tabular`'s `f_` bench and `sort_*`, `pivot`; not
-run yet (`Performance: not measured`). `big_block_allocator`'s
-stall under `defrag=madvise` first; the card measured on the arena the README's first
-example uses. **Stall fixed 2026-11-08** (advice only under `defrag` = `defer`/`never`, see
-`frame.zig`): on the bench host (`defrag=madvise`) the big-block arena is now level with
-`page_allocator` (`mutate` 5.0 vs 4.9 ms, `filter` 21.5 vs 20.4 ms) — no stall and, there, no
-huge-page gain either. Honest first numbers, ours/pandas, 1 M rows, one thread: `mutate`
-2.5x, `filter` 1.9x, `cumsum` 17x (the SIMD path left with the row-verb rule).
-
-**List and struct namespaces (S3 step 3, 2026-11-08, tests in `src/list_test.zig`):** `Expr.list`
+**List and struct namespaces (tests in `src/list_test.zig`):** `Expr.list`
 with `ListOp` — polars' `list.len`, `get`, `first`, `last`, `contains`, `count_matches`, `join`,
 `sum`, `mean`, `min`, `max`, `median`, `std`, `var`, `n_unique`, `arg_min`, `arg_max`, `any`, `all`,
 `reverse`, `sort`, `unique` (first-appearance order), `drop_nulls`, `slice`, `head`, `tail` (the
@@ -1120,71 +872,15 @@ together, lengths checked, `max_explode_cells`) and `unnest` (in place, `separat
 column's union of names, `max_unnest_fields`); `AggFn.implode` (one copy of the column whatever the
 group count; in `window` `.transform` each row gets its partition's list). A list result is built
 in the evaluator's budget (`max_eval_bytes`), the element type is the source's where the
-expression names it (an element of a timestamp list stays `.timestamp`). **Not yet** (survey row
-56/94 rest): `struct` `json_encode`, regex `find` (91); everything else of the former list
-(`list.eval`/`filter`/`agg`, the set operations, `gather`, `gather_every`, `shift`, `diff`, `item`,
-`sample`, `to_struct`, `repeat_by`, `explode` of every list column, struct `rename_fields`/`with_fields`/
-`eval`) is wave W6's, below. Original design, steps 3 and 4:. Also not here: polars'
-fixed-size `array` type; group/join/sort keys over nested columns go through the encoded-row
-path (no typed fast path; measure first); `readCsv` refuses a nested `types` entry (CSV has no
-nesting; parsing a JSON text in a CSV cell is `jsonshape`'s or a later `json_decode`, row 97).
-**Review R2 of S3 steps 3 and 4 (2026-11-08, independent read), closed:** H1 `window` `.transform`
-with `implode` gave every row its partition's whole list, m^2 elements with no cap (200k rows: 4e10) —
-now `max_implode_window_cells` (2^26, summed over partitions) before anything is built; M1 a row's
-intermediate results stayed in the evaluator's budget for the rest of the column (`list.len(split(…))`
-reached `max_eval_bytes` at ~4M rows) — every instruction but the last now allocates in a per-row
-scratch reset after the row, a result read out of it is copied, and a work bound `max_eval_work`
-(16 GiB allocated in all) keeps sweep S2-4's guarantee that a `where` over `repeat` cannot run for
-hours; M2 `unnest` looked a field up by name per field per row (O(fields^2 x rows)) and could build
-fields x rows cells from disjoint names — one pass with a name index, growth capped by
-`growthWithin`; M3 a backwards hand-built `ListView` overflowed `len` (now `end -| start`, an empty
-list); M4 `explode` capped cells, not the text and nested elements it repeats — `max_explode_bytes`
-(1 GiB); L1 list offsets past the stored elements are cut to them in `ListColumn.at`; L2 `makeList`
-reserves the text it holds; L3 `charStarts` returns an owned slice (its free drifted the budget);
-L4 `list.slice` follows polars' `slice_offsets` (`slice(-10, 3)` of 3 elements is empty); L5
-`struct_of` names checked through a hash set; L7 a text element makes every numeric list reduction
-null, as `sum`; L8 `""` split by `""` is one empty piece. Tests in `src/list_test.zig` § review R2
-(written with the fixes, not run against the old code), sweep S2-4's test updated for the work bound.
-Open (LOW): `rolling_rank .dense` sorts each window (the log factor the work cap leaves out, as
-`quantile`); `implode` of a categorical declares a categorical element over text storage (as
-`first`/`min`), `pivot` with `implode` declares no element column; a list of null elements over
-`.nulls` storage has no length to check, so a hand-built one claiming 2^32 elements is walked that
-long (the class noted below).
+expression names it (an element of a timestamp list stays `.timestamp`). `list.eval`/`filter`/`agg`, the set operations, `gather`, `gather_every`, `shift`, `diff`, `item`, `sample`,
+`to_struct`, `repeat_by`, `explode` of every list column and the struct `rename_fields`/`with_fields`/`eval` are
+in the W6 notes below; `struct` `json_encode` and regex `find` in the W10 notes (§ Input and output). Group/join/sort
+keys over nested columns go through the encoded-row path (no typed fast path; § Backlog / deferred); `readCsv`
+refuses a nested `types` entry (CSV has no nesting; `jsonDecode` parses a JSON text column, § Parity close).
 
-**Review of the list/struct layer (2026-11-08, independent read, no HIGH), closed:** M1 `readJson` built a
-pass-1 node and a pass-2 builder for every distinct key path with no total cap (~80x the input for one row of
-many nested keys): columns, fields and list elements now share `max_columns`; M2 a struct's fields each got
-the column's whole text reservation (now shared, in `readJson` and `ColBuilder`); M3 column and field names
-were slices of the caller's input (top-level names were already, before this change); L2 `concat` and
-`aggregate` (`first`, `min`, `mode`…) dropped `Column.inner`; L4 a predicate compared a list cell with a
-record literal by rank (`ne` true); L5 `ColBuilder` took a record's field names as unchanged when its storage
-had the same address. Tests in `src/nested_test.zig` (written with the fixes, not run against the old code).
-**Open (LOW, no panic):** a hand-built list whose offsets claim more elements than its `items` hold makes
-`take`, keys and the writers work and allocate for the claimed count, up to 2^32 (a list of all-null elements
-legitimately has `.nulls` items with no length to clamp to; the same class as a claimed `len`); a hand-built
-storage shared as a DAG or pointing back at itself costs fan-out^64 within the depth bound; `pivot`/`unpivot`
-outputs do not carry `Column.inner`; `columnBytes` counts a nested cell in a boxed column as its `Value`
-only; nested payload copied k times by `concat`/joins is bounded by the `u32` offsets, not by a cell budget
-(as text is by its bytes); under `.last` a nested field's type follows every value its key had (top-level
-keys are deduplicated first), and a key repeated past `max_nesting_depth` is not seen (that value is text).
+### List and struct rest, ordered categoricals (wave W6)
 
-**Fuzz after list/struct (2026-11-08):** the harness generates list (nested twice), struct and
-list-in-struct columns for every verb; two oracles added because the `*Cells` paths share the
-gather with the typed ones and so could not see it: `take` checked cell by cell against its input
-(deep, to the bit), and a `json_read` target (columns whose JSON types back exactly, written in a
-drawn orient and read back `equals`, then the bytes damaged at brackets, commas, quotes and a
-doubled key, which must be an error or a well-formed frame); `wellFormed` walks every nested
-level. Each was checked by a planted mutant: a `takeList` gathering the first element in place of
-the others (missed by the old harness in 500 k runs, found by `take` in < 1 s), and `readJson`
-offsets shifted by one (found in < 1 s as `RoundTripMismatch`/`NotWellFormed`).
-
-**Categorical and duration, not yet (2026-11-08; ordered categories since wave W6):** group/join/sort keyed on the
-codes of an unordered column (measure first; `sort` itself goes by code since W6), `dt.total_*` as floats (pandas'
-`total_seconds()`; take `total_microseconds / 1e6`), durations in `aggregate` beyond the int
-functions (a `sum` of durations comes out `.int`), a JSON number read as a duration (pandas
-writes milliseconds, polars ISO text: ISO only here).
-
-**Wave W6 (dataframe S2, 2026-11-09): list and struct rest, ordered categoricals.** Engine answers: `tools/oracle2e.py`
+ Engine answers: `tools/oracle2e.py`
 to `src/oracle2e_vectors.json` (357 cases, polars 2.1 and pandas 3.1; where both have a feature the generator fails
 unless they agree), replayed by `src/s2w6_oracle_test.zig` with no mismatch; hand tests in `src/s2w6_test.zig`.
 *List* (`Expr`, over `listfn.zig`): `list_set` (`SetOp` — polars `set_union`/`set_intersection`/`set_difference`/
@@ -1206,8 +902,8 @@ polars raises), polars' `list.concat` is the existing `concat_list`. **`list.eva
 one-column scope whose column is the list's element column and evaluated for every element of every list cell (the
 row of the scope is the element's position in the list's storage, so nothing is copied before the body runs). The
 body's intermediates live in an arena that goes with the cell and is returned to the evaluator's budget, so a list of
-n elements costs n bodies against `max_eval_bytes`/`max_eval_work` (R2's bounds) and holds nothing afterwards
-(`s2w6_test.zig` "list_eval is bounded"). **Inside a body, `Expr.element_op` (2026-11-10) runs over the
+n elements costs n bodies against `max_eval_bytes`/`max_eval_work` (the bounds of § Limits and refusals) and holds nothing afterwards
+(`s2w6_test.zig` "list_eval is bounded"). **Inside a body, `Expr.element_op` runs over the
 elements of the list in hand** (polars `pl.element().sum()`, `.rank()`, `.cum_sum()` inside `eval`): its operand is
 evaluated for every element of that list, then the operation once over those values — aggregations (`sum`, `mean`,
 `median`, `min`, `max`, `count`, `len`, `n_unique`, `first`, `last`, `std`/`var` with `ddof`, `quantile`,
@@ -1252,20 +948,18 @@ polars `to_physical`, pandas `cat.codes`; a null cell stays null where pandas wr
 (a permutation only), `catRenameCategories` (`CatRename`: a list or `{old, new}` pairs); every misuse the engines reject
 (duplicates, a category to add that exists, to remove or rename that is absent, a reorder that is not a permutation, a
 rename list of the wrong length) is `error.BadCategories` (pandas `ValueError`). Differences kept: the polars `Enum`
-sort puts a null first ascending and descending; ours follows `SortSpec.missing` (the vectors use `.first`). **Not done,
-with the reason:** a categorical in `pivot`/`window` order-aware functions (`cummin`, `rank` still read the text), a
-fuzz generator for the categorical dictionary and ordering (the module's random frames hold lexical dictionaries only —
-the `Expr` generator got the new list and struct arms), polars'
-`list.sample` value stream, a struct `eval` over a nested path (`x` must be a plain column).
+sort puts a null first ascending and descending; ours follows `SortSpec.missing` (the vectors use `.first`).
 
-**Surveyed 2026-11-10 (rows 103, 108):** polars' `Expr` method list, the `arr`, `bin` and `ext`
+### Parity close
+
+Survey rows 103 and 108 covered polars' `Expr` method list, the `arr`, `bin` and `ext`
 namespaces, the top-level function pages and pandas' input/output reference; what they hold is built
-(waves of 2026-11-10: `jsonDecode`, `extract_many`/`find_many`, `readFwf`, `dateRanges`/
+(`jsonDecode`, `extract_many`/`find_many`, `readFwf`, `dateRanges`/
 `datetimeRanges`/`linearSpaces`/`timeRanges`, `toLatex`, `argWhere`, the time-of-day, Binary and
 fixed-size Array column types) or refused with its reason in § What this module is, and what it is
 not. polars' `arg_sort_by` is `argSort` over several keys and `nth` is `Selector.by_index`.
 
-**Parity close (2026-11-10).** Engine answers frozen by `tools/oracle2k.py` (628 cases, polars 2.1 /
+Engine answers frozen by `tools/oracle2k.py` (628 cases, polars 2.1 /
 pandas 3.1, replayed by `src/s2par_oracle_test.zig`; every difference kept is in its `known` list with
 the reason).
 
@@ -1304,8 +998,7 @@ the reason).
   `types` and `parse_dates` (what `parseTimeOfDay` reads), `writeCsv` the display form (polars writes
   nine digits, its nanoseconds), JSON `"01:02:03"` (Table Schema `time`). `dt.hour` … `dt.nanosecond`;
   every other `dt` part and the instant verbs (truncate, offset_by, zones, business days) are
-  `error.BadExpr`, as polars refuses them; `dt.time` of a timestamp is a time column (it was text
-  until 2026-11-10). `time - time` is a duration, other arithmetic `error.BadExpr`; comparisons use the
+  `error.BadExpr`, as polars refuses them; `dt.time` of a timestamp is a time column. `time - time` is a duration, other arithmetic `error.BadExpr`; comparisons use the
   microseconds, a text operand is not parsed. Aggregates: min/max/first/last/mode/count/n_unique keep
   the type, mean/median/quantile are times (truncated), std a duration, sum/prod/var a float (polars
   refuses these four on `Time`; the module answers a superset, as for timestamps). `strftime` with
@@ -1316,7 +1009,7 @@ the reason).
   dates, so no `switch` over `Value` grows an arm). Order, equality, join and group keys, min/max are
   bytewise. `Expr.bin`: contains, starts_with, ends_with, size (with polars' units), get, head, tail,
   slice, encode (hex, base64), reinterpret (to the integer and float widths, either endianness);
-  `str.decode` gives binary (it gave text until 2026-11-10). `binary + binary` concatenates. A binary
+  `str.decode` gives binary . `binary + binary` concatenates. A binary
   beside text or a number in a comparison, other arithmetic, and every `str.*` operation over a binary
   are `error.BadExpr` (polars refuses them). Casts: text to binary is its UTF-8 bytes; binary to text
   only valid UTF-8 (else null, `CastFailed` under `.fail`); to a number null (polars raises). Display is
@@ -1345,3 +1038,161 @@ the reason).
   akima) unsorted x and a non-finite y for pchip/akima are `error.BadArgument`, as pandas raises.
 - *`toLatex` options*: `column_format`, `longtable` (pandas' `\endfirsthead`/`\endhead`/`\endfoot`/
   `\endlastfoot` layout) and `position`, exactly as pandas 3.1 writes them (80 probed texts).
+
+## Performance
+
+`zig build bench-dataframe` (`tools/bench.zig` against `tools/bench_py.py`: pandas as the reference, polars or DuckDB as the
+fastest, one thread each, the same generated tables and seed) times the verbs over 1 M rows; workload names given as
+arguments filter, `BENCH_RETAIN=1` resets one arena with `.retain_capacity` between calls (the pipeline advice in the
+README), `BENCH_ROUNDS`, `BENCH_PY`, `BENCH_ALT` and `BENCH_HUGE` are the other dials. The figures live only in the card's
+`**Performance:**` line. `big_block_allocator` advises huge pages only where `transparent_hugepage/defrag` is `defer` or
+`never`, because under `always` and `madvise` the advice stalled the arena on a fragmented host; `huge_page_allocator` advises every
+block of 2 MiB or more (`src/frame.zig`).
+
+## Verification
+
+- **Run:** `scripts/modtest dataframe` (the module's `test-dataframe` step; `bench-dataframe` is the timing run).
+- **Oracles (pandas 3.1.0, polars 2.1.0 frozen as test vectors; producers in `tools/`, `tools/README.md`):**
+  `src/oracle_test.zig` replays `src/oracle_vectors.json` (`tools/oracle.py` + `tools/filter_vectors.py`);
+  `src/oracle2_test.zig`, `src/s2w3_oracle_test.zig`, `src/s2w4_oracle_test.zig`, `src/s2w5_oracle_test.zig`,
+  `src/s2w6_oracle_test.zig`, `src/s2w7_oracle_test.zig`, `src/s2w8_oracle_test.zig`, `src/s2w9_oracle_test.zig`,
+  `src/s2w10_oracle_test.zig`, `src/s2w11_oracle_test.zig`, `src/s2w11a_oracle_test.zig`,
+  `src/s2w11b_oracle_test.zig` and `src/s2par_oracle_test.zig` replay `oracle2*_vectors.json`
+  (`tools/oracle2*.py`: the D2 verbs, constructors, `str`/`dt`, windows, list/struct and categoricals, time zones,
+  Unicode, chunked readers, the W10 gaps, the real dtype widths, the parity close); `src/oracle3_io_test.zig` replays
+  `src/oracle3_io_vectors.json` (`tools/oracle3_io.py`: `read_csv`, `to_csv`, the JSON orients, `to_json` options, HTML,
+  `glimpse`). Every difference kept on purpose is in the replay's `known` list and must still differ.
+- **Hand-written classes:** `src/verbs_test.zig` (verbs on hand-built frames: shared columns, short arrays and bitmaps, typed paths,
+  every cap), `src/storage_test.zig` (storage against `columnFromCells`), `src/value_test.zig` (the cell model, a property sweep),
+  `src/more_test.zig`, `src/structure_test.zig`, `src/analysis_test.zig`, `src/exprfn_test.zig`, `src/frameops_test.zig`,
+  `src/dtfn_test.zig`, `src/tz_test.zig`, `src/time_ops_test.zig`, `src/catdur_test.zig`, `src/nested_test.zig`,
+  `src/list_test.zig`, `src/corr_test.zig`, `src/regex_test.zig`, `src/step4_test.zig` (callback verbs, window
+  `rank`/`corr`/`cov`), `src/jsonread_test.zig`, `src/io_test.zig` (options, the hostile-input table, the `writeCsv` to `readCsv`
+  round trip over every column kind, layouts), `src/io_s2_test.zig` (including the README's bzip2 + windows-1250 example),
+  `src/binary_test.zig`, `src/array_test.zig`, and the wave-named `src/s2w*_test.zig` and `src/parity*_test.zig`. Where an engine
+  cannot answer (SciPy-only methods, string forms, random streams) the expected values are the engine documentation's examples,
+  numpy's quantile methods, Python's `str` or hand-worked cells; § Open lists those.
+- **Differential references:** the typed fast paths are compared with their cell-by-cell `*Cells` reference paths
+  (`src/d4a_test.zig` to `src/d4d_test.zig` and the fuzz harness), bit for bit and by storage kind and validity.
+- **Review, sweep and regression tests:** `src/review_test.zig`, `src/review2_test.zig`, `src/sweep_s1_test.zig`, `src/sweep_s2_test.zig`,
+  `src/sweep_s2a_test.zig`, `src/sweep_s2b_test.zig`, `src/sweep_w11_test.zig` (every entry-point class the width types touched),
+  `src/backlog_low_test.zig`, `src/fuzz_s2_test.zig`: each pins a defect found by a review, a panic sweep or the fuzz driver; the
+  fix is seen failing without its test.
+- **Fuzz:** `src/fuzz.zig`, the deterministic driver of `testkit.fuzz.driver` run in the ordinary ReleaseSafe test binary
+  (`DATAFRAME_FUZZ=<runs>[,<seed>]`; never `zig build --fuzz`). It covers the CSV reader on generated and damaged
+  bytes (one-pass reader against the two-pass reference and a write/read round trip), random frames through 1 to 4 verbs with
+  random specs against the `*Cells` reference paths, `Expr` programs (every arm, shared and deep sub-expressions), `take`
+  against its input cell by cell, `readJson` of what `writeJson` wrote and of damaged JSON, and the writers parsed back; every
+  result is checked well formed down every nested level and with `frame.widthsConform`; the allocator can fail.
+- **Mutation:** whole-module and delta runs with mutant schemata; the killing tests live in `src/mut_m3_test.zig`,
+  `src/mut_ma_test.zig`, `src/mut_mb_test.zig` (test names end `(mut <id>)`).
+- **ctgrind:** none, the module holds table data and no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+
+## What is deliberately not done
+
+The refused families (index and MultiIndex, the lazy engine and SQL, chunked storage, Python-language mechanics, plotting,
+Period, Excel/SQL/pickle, columnar and office file formats, XML, polars' extension types and string cache, the conversions
+to Python/NumPy/Arrow objects, `cast_time_unit`, `set_sorted`, `json_normalize`) are in § What this module is, and what it is not,
+with their reasons. Also not done, each with its reason:
+
+- **Compositions, not verbs:** `weightedGroupSum`, `percentOfTotal`, `clampRange`, `outlierFlag`, `mergeByKey`, `cumreturn`,
+  `drawdown`, `rebase`, `forwardFill`, and the `series` `expanding`/`ewm`/`pctChange` of the retired `tabular` are compositions
+  of the verbs here (the `window` operations cover the series ones).
+- **Index alignment of frame arithmetic** (survey row 19): there is no index, so frames align by position.
+- **SciPy's `spline`, `polynomial`, `krogh`, `barycentric` and `from_derivatives` interpolation** (row 51): pandas hands them to SciPy's
+  FITPACK smoothing splines and polynomial interpolators, an optional dependency outside pandas; polars offers `linear` and `nearest`
+  only; `quadratic`, `cubic`, `pchip` and `akima`, the ones a pandas user reaches for, are built.
+- **Int128:** polars has it, pandas does not; Int64 or a narrower signed type with UInt64 meets in Float64 here (the W11 notes).
+- **Small selector and range options:** `pivotKeys` takes no `pivotMany` field (use `pivotMany`); `fillNull` `across_columns` for
+  strategies other than forward/backward; `cs.alpha(ignore_spaces=)`; `int_ranges` takes `?i64` slices, not frame columns.
+- **`str`/`dt` leftovers (W4):** `str.cat` is `concat_str`; `str.extractall` and `partition` into a DataFrame are the record plus
+  `unnest`; `components` as a frame verb (the record plus `unnest` is the same and keeps the verb count down); times other than
+  `HH:MM[:SS[.f]]` in `combine`; the `textwrap` flags `initial_indent`, `subsequent_indent`, `max_lines`, `placeholder`,
+  `fix_sentence_endings` and `tabsize`; polars' default `roll="raise"` of the business-day search; language-tailored case (Turkish,
+  Lithuanian), which `unitext` does not have.
+- **Windows (W5):** `win_type` `var`/`std` (pandas' weighted variance is a streaming update that is not the weighted variance of the
+  window for an asymmetric window: measured, the values differ from `sum w (x - m)^2 / sum w` scaled by any `n / (n - ddof)`; not
+  reproduced); the `dpss`, `chebwin` and `taylor` windows (an eigen-solver, Chebyshev polynomials with an FFT, an iterative design);
+  `diff(null_behavior="drop")` (it shortens the column; `window` `diff` then `dropna` or a slice is the same); polars
+  `rolling_rank_by` with `closed` left or none (the rank of a value outside its own window); pandas `ewm` `var`/`std`/`sum` with
+  `times` (pandas refuses them too) and `cov`/`corr` with `times`; pandas `B` (business-day bins skip weekends: not a duration) and
+  calendar rules with a count other than 1 (`2MS`) or other anchors (`QE-MAR`, `YS-JUL`); pandas' `origin` default changing `closed`
+  and `label` to right for `end`/`end_day` (set them explicitly); `explode` under `order_by` keeps first-seen partition order
+  where polars showed another one (its group order is unspecified).
+- **Input and output:** pandas' `typ="series"`; polars' `infer_schema_length` of `read_csv` (every row is read); `jsonshape`'s
+  `shapeFrame`; `toHtml`'s pandas knobs `formatters`, `bold_rows`, `table_id`, `render_links`, `max_rows`/`max_cols` truncation and the
+  common-digit padding of a float column (`float_precision` gives the fixed form); `read_csv`'s `converters` (read the column as `.text`
+  through `types` and map it with `mapElements`, which takes a comptime function per column the same way and checks its output
+  type); pandas' `warn` for `on_bad_lines` (no warning stream: the count lands in `bad_lines_skipped`); `encoding` and `compression`
+  (siblings to compose with; the README shows `bzip2` + `encoding`); a comment cut off the end of a line (a comment is a whole
+  line); `quoting=QUOTE_NONNUMERIC` on read (`csvstream` reports no "this field was quoted" flag, so an unquoted-means-number
+  reading cannot be built here); `to_csv`'s `index`, `chunksize` (a writer already streams into any `std.Io.Writer`), `encoding` and
+  `compression`; pandas' `float_format="%.3e"` exponent style (`e+02`; `float_scientific` is Rust's `e2`, polars); `to_json`'s
+  `default_handler`, `date_format="iso"` at `date_unit` precision (ours is RFC 3339 with the digits the value needs) and the Table
+  Schema's `extDtype`/categorical `enum` (a `readJson` `table` also ignores the schema's field types and keeps no index).
+- **Lists, structs and categoricals:** polars' `list.sample` value stream (the engines' generators differ; the properties are
+  tested); a struct `eval` over a nested path (`x` must be a plain column); a Python-callable `corr` method and `kendall`.
+
+## Open
+
+Unverified gaps only (what is claimed above but not checked against an engine or a reference run):
+
+- Window `rank`/`corr`/`cov` have hand-worked and docstring values only: with `center` the value ranked here is the labelled row's
+  (the window's middle); pandas' running sums for rolling `cov`/`corr` can differ from the two-pass values in the last bits; polars'
+  `rolling_cov` `ddof` default and its treatment of a window's nulls were not compared.
+- `interpolate` methods `zero` and `slinear` were not engine-checked (they need SciPy, absent from the oracle environment);
+  `describeWith` of a duration or timestamp column is hand-tested only (the oracle cannot compare pandas' string form); the struct
+  namespace's `drop` is hand-tested only (polars 2.1 has none); the `win_type` vectors are pandas' own aggregation over windows computed
+  in the generator from the formulas in SciPy's documentation (SciPy was not available), cross-checked against numpy's windows.
+- The fuzz generators draw lexical dictionaries only for categorical columns: dictionary order and `ordered` are not generated.
+- `horizontal` min/max over Int64 and UInt64 with a negative cell are Float64 (the supertype rule) with no engine vector.
+- Quantile `lower`/`higher`/`nearest` on an int column answer floats where pandas keeps ints (replayed, not changed).
+
+## Anchoring
+
+**Anchor grade:** class C · oracle n/a
+
+- **Class C** — an internal data structure and verb library; no wire format others must agree with.
+- **Oracle n/a** — class C/D carries no anchor debt.
+
+**What the tests actually contain.** What pandas 3.1.0 and polars 2.1.0 answered, frozen
+(`src/oracle_vectors.json`, filtered by `tools/filter_vectors.py` from what `tools/oracle.py`
+writes — `tabular`'s oracle, moved here with step R), what they answered for the D2 verbs
+(`src/oracle2_vectors.json`, `tools/oracle2.py`, replayed by `src/oracle2_test.zig`: where
+they disagree the vector says which one is followed, and the differences kept on purpose
+are the test's `known` list: non-padded numeric fields in `strptime` (`datefmt`), a missing text in the `is*` classes
+(null here, False in pandas' Arrow-backed `str` dtype), the `sum` of an int pivot column as a
+float, `skew`/`kurt` of a group with no spread (0 here and in `tabular`, NaN in both
+engines), and polars' `peak_min`/`peak_max` at the ends of a column, where 2.1.0 compares
+the end cell with 0).
+
+## Backlog / deferred
+
+Open items only; everything here is LOW unless marked, and none is a known wrong answer without a refusal or a note in the sections above.
+
+- **Consumer request:** binary (de)serialization of a `Frame`: the sibling `arrow` module (IPC over `Frame`) exists; Parquet is planned in the root `NEW-MODULES.md`; this module stays free of both (the adapters depend on the frame).
+- **Build size knobs (CONVENTIONS §4.2):** `regex` brings its Unicode tables and `unitext` adds 158,056 B (+15%) to a ReleaseSmall binary that calls `mutate` with one `add`; a `dataframe-regex` and a `dataframe-unicode` option (default on, off = the former ASCII behaviour) would remove them: measure with a size probe, the owner decides.
+- **Categoricals and speed:** group/join/sort keyed on the codes of an unordered categorical column (the speed of an encoded key; measure first); `pivot` and the order-aware `window` functions (`cummin`, `rank`) still read a categorical's text.
+- **Nested keys:** group/join/sort keys over list and struct columns take the encoded-row path with no typed fast path (measure first).
+- **Parity-close review (MED/LOW):** (M1) `extract_many`/`find_many` with `overlapping` can hold ~200 MB per row (4M hits) and scan O(len x patterns x pattern length), capped by `TooLarge` at 4M hits with no cap on the pattern count; (L2) `winCells` maps every error but OOM to `TooLarge`; (L3) `readFwf` keeps 8 bytes per character of a line for `starts`, outside `max_bytes`, and a blank line costs O(specs); (L4) with `parse_dates`, a column of `H:M` text (ratios, scores) is inferred as `.time`: polars does the same for `HH:MM`, check its 1-digit forms; (L5) `linearSpaces` allocates the widest row up front.
+- **Real dtype widths:** (a) an expression past `expr.numType`'s 4096-node walk has no static type, so `mutate` falls back to typing by the cells (inferred, not reproduced); (b) `implode` declares a width element column whose stored elements are Int64/Float64 arrays (`frame.widthsConform` does not look inside lists); (c) the weak-literal rule has two copies, `expr.weakJoin` and `frameops.literalMeet` (a candidate for the duplicate-code pass); (d) `horizontal` min/max over Int64 and UInt64 with a negative cell are Float64 (the supertype rule), with no engine vector; (e) the sweep's near-overflow aggregate case runs 2^18 rows, not 1 M (the lane's 4 GB cap).
+- **W10 verbs:** (a) `dtfn.scaleDuration` drops `Duration.days`; its users read only `months` and `us` today, so a new user of the scaled `days` must carry it; (b) `binIntervals` takes float breakpoints for a timestamp or duration column, which declares a type its cells do not have, and a `count` over a float column holding inf gives NaN/inf breaks (no panic); (c) the W10 verbs (`unstack`, `wideToLong`, the `bin*` verbs, `corrWith`) were not in the fuzz harness's verb list when this was recorded: `src/fuzz.zig` now names them, so confirm that their specs reach the interesting paths, then drop this item.
+- **No-panic sweep (cost only):** (a) `explode` looks up the exploded columns with `findScalar` per (row, column); a bool mask is linear; (b) literal needles of `split`, `rsplit`, `partition`, `split_exact`, `replace`, `get_dummies` use `std.mem.find*` (Horspool + vectorised memcmp, worst case needle x haystack per cell), a KMP table per cell would make it linear; (c) `besselI0` sums up to 1000 terms per point, so a kaiser window of 2^22 points is ~4e9 flops (~10 s) inside `max_window_work`: cap the window or cache the weights; (d) `concatByName` costs width x frames name lookups, quadratic for many frames with disjoint columns: one name-to-index map over the union is linear; (e) `formatTo` with `max_rows` of `maxInt` over a hand-built frame claiming a huge `len` runs out of memory instead of refusing; (f) `replace_many`/`contains_any` patterns are quadratic in text x pattern (the patterns are the caller's expression, not cell data).
+- **Lists, structs, windows, review leftovers:** `rolling_rank` `.dense` sorts each window (the log factor the work cap leaves out, as `quantile`); `implode` of a categorical declares a categorical element over text storage (as `first`/`min`) and `pivot` with `implode` declares no element column; `pivot`/`unpivot` outputs do not carry `Column.inner`; under `duplicate_keys = .last` a nested field's type follows every value its key had (top-level keys are deduplicated first) and a key repeated past `max_nesting_depth` is not seen (that value is text).
+- **Review leftovers (first reviews):** `fillNull(.mean)` on a bool or timestamp column changes its declared type to float; `scatter` can store a cell of another kind than the column's declared type; `rollingTime` skips a row with a null or out-of-order time as an output but still counts its cell in later windows; `valueCounts` with no columns answers `NoSuchColumn` rather than a dedicated error; `unpivot` types the value column after the first melted column even when the melted types differ (it labels every value cell with the first value column's zone and type); a `mutate` NaN among int results leaves a float cell in an `.int`-declared column (stored boxed); `csvio.Scanner.present`, `core.windowAgg` and `core.stdSample` were reported dead outside their file (`windowAgg`/`stdSample` are used only by tests; `present` was not re-checked).
+- **Time-of-day follow-ups (the `.time` column exists since the parity close):** `writeCsv` has no `time_format` (pandas' and polars' option; a time column is written in the display form, and the `writeCsv` option doc in `src/csvio.zig` still says there is no time-of-day type); `dt_combine` takes the time of day as microseconds or `HH:MM[:SS[.f]]` text, and whether a `.time` column operand reads as intended was not checked (`src/expr.zig` does not refuse it).
+- **`writeCsv` and the reader's `comment`:** `writeCsv` has no `comment` option, so a first-column text starting with the reader's `comment` byte is dropped on read (`csvstream`'s `WriteOptions.comment` could be passed through); a one-column frame written with `quote = 0` or `.never` turns a null into a blank line the reader skips.
+- **Layer review (listfn, ranges, colfn, render, names, nestverbs, textio, structure, reshape):** (a) `cumFoldColumns` output columns carry no `inner`, zone or categorical metadata (cumSum of a timestamp is a plain int column) and a repeated name in `cols` gives two same-named columns; (b) the list `Sampler` lives per compiled program, so a program evaluated twice continues the stream (same seed, different sample) — check whether a program is ever reused; (c) `hist` with `lo == hi` and |lo| ≥ 2^53: `lo -= 0.5` is a no-op, every edge equal; (d) `repeatValue` of a list/record builds no `inner`; (e) `flattenList` refuses a declared `.list` stored `.boxed` that `explode` accepts, and `explodeAll` selects a `.list`-declared column with scalar storage and then fails the whole frame; (f) `glimpse` type labels for zoned timestamps, decimals and nested types differ from polars (`<datetime[μs, Zone]>`, `<list[i64]>`) — check against polars; (h) `toHtml` clamps `float_precision` > 22 silently; (i) `PivotManySpec`: `aggs` longer than `values` ignored, `fill_value` silently wins over `fill`; (j) `matchToSchema` maps a bad zone to `SchemaMismatch` and compares zones by spelling (`UTC` vs `Etc/UTC` differ).
+- **`jsonread`/`jsonio` review:** (b) a repeated `data` (`.table`) or `columns` (`.split`) key and repeated keys in `.index` orient ignore `duplicate_keys` (the first wins); (c) the epoch writer writes null on i64 overflow with `.ns` (timestamps after 2262, durations past ~292 years), and a `date` written as epoch reads back as a `timestamp` — undocumented; (d) `double_precision > 15` is clamped silently (pandas raises).
+- **`verbs.zig` review:** (a) `validate` is ignored for `how = .cross` (pandas raises), `indicator`/`sort` are ignored for semi/anti; (b) an `indicator` name equal to an existing column is renamed by `uniqueNames` (pandas raises); (d) `unpivot` labels every value cell with the first value column's zone and type; (e) `pivot` with `margins` declares an int/float/timestamp row key `.text` while it holds ints plus "All"; (f) `validate` under `null_keys = .no_match` counts null keys as one equal group;
+- **`dtfn.zig` review:** (b) `zoneOffset` `.base`/`.dst` for a zone whose tzdata marks winter as DST (negative DST, e.g. Europe/Dublin) gives `dst = -3600` and the summer offset as base — not compared with polars; (c) `strftimeZoned` of a `.date` cell with `%Z` takes the abbreviation at UTC midnight; (d) `strftimeZoned` with `%Z` translates the format per cell (arena grows O(cells × format)).
+- **`csvio.zig` review:** (a) contradictory read options accepted silently: `on_bad_lines = .skip` with `truncate_ragged` (truncation wins); `na_filter = false` ignores `column_null_values` including its `NoSuchColumn` check; `TypeOverride.time_zone` on an excluded or text column is skipped silently, and an unknown zone only errors after the whole read; (b) `thousands` drops the byte anywhere (`"1,2,3"` reads 123, `",5"` reads 5): pandas-lenient, not polars-strict; (c) rows dropped by `skip_rows_after_header`/`skipfooter` are not checked for an unbalanced quote under `strict_quotes` nor against the size caps (bounded by `max_record_bytes`);
+- **`more.zig` review:** (a) percentiles closer than 1e-12 collapse to one label, the later winning; (b) `edgeText` prints 1e-7 as `0.0000001` and 1e300 with 301 digits (pandas repr `1e-07` / `1e+300`); (c) `cut` options silently ignored or colliding: `precision` without `interval_labels`, `interval_labels` with `labels`, `break_out` equal to `out` or to an existing column give duplicate names (`appendColumn` has no `uniqueNames`; pre-existing for `out`); (d) `describeWith` declares the non-numeric and temporal stat columns `.text` while their cells hold ints or any `Value`, and a timestamp's mean/min/max render as UTC ISO ignoring `time_zone`; (e) `concat`'s zone check runs for a repeated same-named column inside one frame though it "reads as its first"; (f) `describeWith` of zero columns returns a 0-row frame (pandas `ValueError`).
+- **`frameops.zig` review:** (a) `groupByDynamic`'s per-row window scan does up to 1<<16 steps per row and only the (row, window) pairs are capped, so rows × span is uncapped when windows are scanned but excluded by `closed`; (c) the `DynamicSpec.rule` doc says closed/label/start_by are not read, but `groupByDynamicNaive` reads closed/label for non-end-anchored rules and keeps a user `start_by` for "D" but overrides it for W-*; `origin` is silently ignored for calendar bins and weekday `start_by`: align doc and code, or `BadArgument`; (d) `interpolate` turns a non-numeric present cell (text/categorical) into null and may overwrite it with a number, a text column comes out all-null float: `TypeMismatch` instead (pre-existing); (e) `interpolate` with `by` x: limit/limit_direction/limit_area use row neighbours while the values come from x-sorted points (pandas does the same by position; low confidence).
+- **Chunked readers:** (a) `max_rows` counts the `infer_rows` read-ahead (`csvchunk` `fill` against `taken -| emitted`): `.max_rows = 2, .infer_rows = 5` with `next(a, 1)` is `TooManyRows`; decide whether the cap is per emitted chunk. (c) `NdjsonChunkReader` with `n_rows` stops without reading the rest, while a whole `readNdjson` is `BadJson` on trailing garbage: document or pin.
+- **`window.zig` review:** (a) `op = .transform` silently ignores `mapping` join/explode (error or document); (b) option errors raised in `computeOne` (`BadOption`, `InvalidDecay`, e.g. `ewm_by` `half_life <= 0`) only surface when a partition exists, so an empty frame returns Ok; (c) `mapping = .join` builds a `.list` column with no `inner` type and no zone (zoned timestamps lose the zone; same as the implode path); (d) `reverse = true` with time-based ops (`rolling_time`, `ewm_by`, `ewm` `times_col`, timed rank/pair) yields all-null after row 0 without `BadOption` or a doc line; (e) NaN/inf in `Rolling.weights`, or a gaussian with a denormal std, propagate NaN silently (scipy does the same).
+- **`expr.zig` review:** (a) `match_regex` wraps the pattern as `\A(?:…)\z`; a `(?x)` pattern ending in a `#` comment swallows the wrapper and fails to compile. (b) `zoneOf` has no case for `.list` get/first/last/min/max/item, `.field` or `.fold` (`.element` of a `list_eval` body has one since the fix): a zoned value taken out of a list or struct, or folded with min/max, gets no zone. (c) `to_datetime` with `.infer` picks the format from the first non-null cell of the frame given to `compile`, so a per-chunk `mutate` can infer different formats per chunk. (d) `replace_time_zone`/`convert_time_zone` skip the non-timestamp check when `temporalType` returns null.
+- **`strfn.zig` review:** (a) `wrap`'s tab stop counts a lone continuation byte as 0 columns while the character count counts bytes for invalid UTF-8 (`"\x80\tx"`): the two disagree on invalid input. (b) `fnx.charStarts` allocates (len+1)*8 bytes per cell (128 MiB for a 16 MiB cell), and one invalid byte switches the whole cell to byte indexing, so `sliceReplace` can split a code point (invalid UTF-8 out). (c) The strfn helpers rely on the `expr.zig` guards for an empty `by`/`from` and for `limit = 0` (`rsplitLiteral` with `by = ""` would loop to out-of-memory): add local guards when strfn becomes `pub`. (d) `getDummies` names borrow the input when `prefix == null` and allocate otherwise (fine under the arena contract).
+- **`exprfn.zig` review:** (a) `erfc` for |x| in about 1.5..2 is `1 - erfSeries(x)`: about 1e-13 relative, not the documented 1e-15 (the oracle tolerance 1e-12 hides it) — measure against `math.erfc` and move the series cut-off or weaken the doc; above |x| ≈ 26.5 `@exp(-x²)` is subnormal (the value is too). (b) A cell over 16 MiB: the ASCII and invalid-UTF-8 branches of `lower`/`upper`/`casefold`/`capitalize`/`title`/`swapcase` have no cap, the unitext branch (`ut_opts`, `max_text_result`) returns `TooLarge`, also for an already-normalized `normalize`. (c) `title`/`swapcase`/`capitalize` on mixed-validity text take ASCII rules (documented); no test pins it. (d) No round-trip test of `escape_regex` through `modules/regex` (`\#`, `\&`, `\~` accepted?), only the polars string oracle.
+- **Time zones:** (1) A callback verb's `OutColumn` and a `struct_of`/`list` built by an `Expr` carry no zone (the inner column is described by kind): cast the result, or give the schema; `Column.inner` already carries a declared one. (2) `groupByDynamic` of a zoned index with a sub-day `every` cuts on the wall clock like `truncate`; no engine answer was taken for it (the vectors cover `1d` and `1mo`). (3) `datetime_format` of the CSV writer takes `%z` but not `%Z` (use `Expr.strftime`). (4) `tz.full`'s pre-1970 history (+79 KB per binary that calls `mutate`) is the open choice in `tz`; until it is made a zoned column before 1970 shows the zone's state at the epoch. (5) Comparison of a naive against a zoned column compares instants (pandas `False`, polars `SchemaError`).
