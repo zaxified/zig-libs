@@ -123,7 +123,7 @@ repo's own record of verdicts — one line per yaml-test-suite case ID with our
 pass/fail/reject classification. It cites those IDs but reproduces none of the
 suite's documents, so nothing of yaml-test-suite is vendored here.
 
-## Writing YAML, typed mapping, merge keys (2026-10-04)
+## Writing YAML, typed mapping, merge keys
 
 - **Emitter** — `yaml.stringify(gpa, value)`, `yaml.writeValue(gpa, w, value)`,
   `yaml.writeAll(gpa, w, docs)`. Block style, two-space indent. A string is
@@ -145,18 +145,14 @@ suite's documents, so nothing of yaml-test-suite is vendored here.
   YAML 1.2). Explicit keys win, earlier mappings in a `[*a, *b]` list win,
   checked against PyYAML.
 
-## Deferred
-- **Schemas other than core.** The failsafe and JSON schemas, and the `!!set` /
-  `!!omap` types, are not resolved; those tags leave their scalars as text.
-  (`!!binary` and `!!timestamp` are checked when written explicitly and kept as
-  text: `yaml.decodeBinary` returns a `!!binary` scalar's bytes,
-  `yaml.parseTimestamp` a `!!timestamp`'s fields. `!!set` (a mapping whose values are all null) and `!!omap` (a
-  sequence of single-pair mappings, no repeated key) are validated too and keep their mapping / sequence value.
-  Malformed -> `BadTaggedScalar`.)
-- **Integers outside `i64`** stay strings holding their exact text — see
-  SPEC.md §9.
-- **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; only the UTF-8 BOM
-  is handled.
+## Not provided
+
+Only the core schema is resolved (the failsafe and JSON schemas are not; an explicit `!!binary`, `!!timestamp`, `!!set`
+or `!!omap` is validated and kept as text or as its mapping / sequence value, malformed is `error.BadTaggedScalar`:
+`yaml.decodeBinary` returns a `!!binary` scalar's bytes, `yaml.parseTimestamp` a `!!timestamp`'s fields). Integers
+outside `i64` stay strings holding their exact text (SPEC.md §9). Input is UTF-8 only: a UTF-16/UTF-32 BOM is
+rejected. The emitter writes one style and no comments. See SPEC.md *What is deliberately not done* and
+*Backlog / deferred*.
 
 ## Verification
 
@@ -167,7 +163,7 @@ branch), at both layers, from implementations that have never seen this code:
 |---|---|---|
 | events (scanner + parser) | `test.event`, byte-exact | **402/402**, including all 94 must-reject cases |
 | values (composer + core schema) | `in.json`, structural | **279/279** |
-| emitter (2026-10-04) | `in.json`, after emit → compose | **279/279** |
+| emitter | `in.json`, after emit → compose | **279/279** |
 
 279, not 282: three `in.json` files belong to must-reject cases, where they are
 a prefix artefact rather than a pass condition. A further 29 non-error cases

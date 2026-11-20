@@ -27,7 +27,7 @@ the reasoning is recorded at the call site.
 ## Compared with
 
 Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Note the shape of the competition: every
-mainstream library both parses **and** emits and (in Go, Rust, Python, JS) maps YAML onto native types; at survey time this module read only — an emitter and typed mapping followed on 2026-10-04 (§9b).
+mainstream library both parses **and** emits and (in Go, Rust, Python, JS) maps YAML onto native types; this module does both too (§9b).
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -48,11 +48,11 @@ schema by the book (`yes`/`no` are strings, `0777` is decimal); both event and v
 processed without a tree (`Parser`), with scalar style and alias information preserved; hostile-input bounds
 (`max_nodes`, `max_depth`, `max_heap_bytes` — small YAML can amplify 100x — alias sharing against billion-laughs, cyclic
 aliases rejected, duplicate keys rejected by default); differential run against PyYAML and libyaml over 200 000 mutated
-documents. Since 2026-10-04 also an emitter (its output composes back to every suite `in.json`, and PyYAML reads it
+documents. Also an emitter (its output composes back to every suite `in.json`, and PyYAML reads it
 to the same JSON), typed mapping onto Zig structs, and opt-in `<<` merge keys checked against PyYAML. **Where we are
-behind** (re-checked 2026-10-04): the emitter writes one style (block, double-quoted scalars) — no style
-round trip, no comments; only the core schema (`!!binary`/`!!timestamp`/`!!set`/`!!omap` stay text); integers outside
-`i64` stay strings; UTF-8 input only; error marks are best-effort.
+behind:** the emitter writes one style (block, double-quoted scalars) — no style
+round trip, no comments; only the core schema (an explicit `!!binary` / `!!timestamp` is validated and kept as text, `!!set` / `!!omap` are validated and keep their mapping / sequence value; the failsafe and JSON schemas are not resolved); integers outside
+`i64` stay strings (*What is deliberately not done*); UTF-8 input only; error marks are best-effort.
 
 ## 1. Why the stages are separate
 
@@ -92,19 +92,18 @@ to be able to tap the stage below. Fusing the two would delete that option.
 
 A parser that can spin on malformed input is a denial-of-service defect in its
 own right, and **94** of the suite's 402 cases are deliberately malformed, so
-any such path *will* be reached. This module had exactly that bug; the fix is
-structural rather than an iteration cap.
+any such path *will* be reached. The guard is structural rather than an
+iteration cap.
 
-**The bug.** A bare `[` (unterminated flow sequence) saved a simple key at the
-outer level and then hit EOF. `fetchStreamEnd` cleared only the *innermost*
-simple key, so the outer one stayed `possible`; `needMoreTokens` treats a
+**The failure it prevents.** A bare `[` (unterminated flow sequence) saves a simple key at the
+outer level and then hits EOF. If `fetchStreamEnd` cleared only the *innermost*
+simple key, the outer one would stay `possible`; `needMoreTokens` treats a
 possible simple key at the queue head as "cannot hand this out yet", so it
-returned true forever. `Scanner.peek`'s loop therefore called `fetchNextToken`
-again and again, and at EOF that unconditionally enqueued a *fresh* `stream_end`
-token every time. Unbounded token-queue growth — measured at **15.4 GB RSS**
-before the host's OOM killer took the whole desktop with it.
+would return true forever. `Scanner.peek`'s loop would call `fetchNextToken`
+again and again, and at EOF that would unconditionally enqueue a *fresh* `stream_end`
+token every time: unbounded token-queue growth.
 
-**The guarantees now in place**, in the order they fire:
+**The guarantees**, in the order they fire:
 
 1. **Stream end invalidates every pending simple key**, not just the innermost.
    This is the correctness fix: the queue unblocks legitimately and `[` is
@@ -121,7 +120,7 @@ before the host's OOM killer took the whole desktop with it.
 4. **`readLine` never appends without consuming.** `skipLine` is a no-op off a
    line break, which made `readLine` an append-without-consume primitive — the
    exact shape that turns a mis-guarded caller into unbounded allocation. The
-   guard is now a property of the primitive, not of each of its call sites.
+   guard is a property of the primitive, not of each of its call sites.
 5. **The parser bounds token-free events.** The scanner being monotone does not
    stop a *state machine* from cycling. Every event emitted without consuming a
    token is an implicit empty scalar or a collection close, each of which must
@@ -191,19 +190,23 @@ loop, never allocate without bound on arbitrary input** (CONVENTIONS.md §7.1).
   past the end. That is safe because the stream is validated first:
   `fetchStreamStart` rejects any input that is not UTF-8 (§5.2) or holds a
   character outside `c-printable` (§5.1) with `error.InvalidYaml`, before the
-  first token (A1/yaml.md F11, 2026-09-17; before that invalid bytes were
-  composed into scalars). Escapes may still produce such characters inside a
+  first token. Escapes may still produce such characters inside a
   double-quoted scalar; only the text itself is checked.
 - *Nesting exhaustion* — bounded by `max_depth` (§2), and independently by the
   composer's own `Options.max_depth`, which also keeps `composeNode`'s recursion
-  off the end of the stack. ⚠ A1/yaml.md F10 (fixed 2026-09-10): the second
-  bound alone was not actually a bound — nothing clamped a caller-supplied
-  `Options.max_depth`, so setting it past `max_depth` (4096) let `composeNode`
-  recurse deep enough to overflow Debug's native stack before the scanner's
-  own cap ever refused the input. `compose.zig`'s `Composer.effectiveMaxDepth`
-  now clamps whatever the caller sets to `compose.max_safe_depth` (1024, the
-  shipped default and the one depth this module has proven Debug-stack-safe),
-  so `Options.max_depth` can only ever tighten this bound, never loosen it.
+  off the end of the stack. `Composer.effectiveMaxDepth` clamps whatever the
+  caller sets to `compose.max_safe_depth` (1024, the shipped default and the one
+  depth this module has proven Debug-stack-safe), so `Options.max_depth` can only
+  tighten this bound, never loosen it: past the scanner's own 4096 cap
+  `composeNode` could recurse deep enough to overflow Debug's native stack before
+  the scanner refused the input.
+- *Heap amplification* — `Options.max_nodes` bounds nodes, `Options.max_heap_bytes`
+  (default 64 MiB, `null` = off) bounds bytes: small YAML can amplify over 100× in
+  memory, so a node cap alone lets far more heap build than the input suggests.
+  `composeAllLeaky` wraps the allocator in a counter that refuses past the budget
+  with `error.HeapBudgetExceeded`; it counts bytes requested through the allocator
+  (for an arena, what the parse and the tree asked for, not the arena's own page
+  overhead).
 - *Alias expansion bombs* — aliases share rather than copy, so "billion laughs"
   composes into O(n) nodes rather than O(2^n); `Options.max_nodes` bounds the
   total regardless. Cyclic aliases are rejected outright (§7).
@@ -215,10 +218,10 @@ loop, never allocate without bound on arbitrary input** (CONVENTIONS.md §7.1).
   meaning in a build where safety checks exist (§7.1) — it is evidence about a
   Debug or ReleaseSafe consumer, not a ReleaseFast one.
 
-## 5. Verification
+## Verification
 
-The whole verification story is the external anchor, because self-written tests
-share whatever this code misreads about YAML. yaml-test-suite anchors **both**
+`scripts/modtest yaml` runs the unit tests and the yaml-test-suite anchor. The external anchor is the main evidence,
+because self-written tests share whatever this code misreads about YAML. yaml-test-suite anchors **both**
 layers, and one ledger (`src/testdata/ledger.txt`, harness in
 `src/suite_test.zig`) carries one row per case with all of its expected
 outcomes:
@@ -227,6 +230,7 @@ outcomes:
 |---|---|---|
 | events | `test.event`, byte-exact | **402/402**, incl. all 94 must-reject |
 | values | `in.json`, structural | **279/279** |
+| emitter | `in.json`, after emit then compose | **279/279** |
 
 279 and not 282: three `in.json` files belong to must-reject cases, where they
 are a truncated artefact rather than a pass condition — the same trap
@@ -244,24 +248,30 @@ object) stays exact — which is where the core-schema bugs worth catching live.
 The int/float resolution itself is pinned by `compose.zig`'s unit tests, the
 only place it can be.
 
-Both anchors were checked to be load-bearing rather than assumed, by mutation:
-
-| mutation (one line) | cases turned red |
-|---|---|
-| block-scalar chomping default clip → strip | **63** events |
-| core schema applied to quoted scalars too | **4** json |
-| aliases resolve to `null` instead of the anchored node | **13** json |
-| core schema removed — every plain scalar stays a string | **54** json |
-
 Each failure names the case and, for the value layer, the path inside it
-(`doc0.product[0].price: yaml=float json=integer`). The ledger's other
-direction and its cross-checks were verified the same way: fabricating a
-known-fail, deleting a row, claiming a JSON oracle for a case that has none, and
-writing an incoherent row (`events fail` with a JSON claim) are each red.
+(`doc0.product[0].price: yaml=float json=integer`). The ledger is checked in both
+directions: a listed pass that regresses is red, and a known-fail that starts passing is red too.
 
 The suite is not vendored. It is a separate repository with its own history, and
-pinning a copy here would turn a live oracle into a stale one; the harness skips
-loudly when it is absent.
+pinning a copy here would turn a live oracle into a stale one; the harness reads it from
+`ZIG_LIBS_YAML_SUITE` (README has the fetch command) and skips
+loudly (`SKIPPED: …`) when it is absent.
+
+Other test classes:
+- **Unit tests** (`compose.zig`, `core_test.zig`, `root.zig`): the core schema and int/float/integer-range resolution, explicit
+  tags (`!!binary`, `!!timestamp`, `!!set`, `!!omap`), aliases, cycles and duplicate keys, the complexity counters
+  (`anchor_probes`, `dup_probes`, deterministic step counts rather than wall clocks), merge keys against recorded PyYAML
+  readings (`src/testdata/merge_vectors.zig`), emitter layout and quoting, the typed mapping (each refusal derived from
+  the type and the document; no leak on any allocation failure), and an arbitrary-input test that drives adversarial strings
+  over the full indicator alphabet through `dumpEvents`.
+- **Fuzz** (`fuzz_test.zig`): one deterministic harness, `YAML_FUZZ=<runs>[,<first seed>]` (testkit's driver, name `yaml`),
+  over the composer (with and without merge keys), the emitter and the typed mapping: a random `Value` is emitted and must
+  compose back equal; the same text damaged with aim at YAML's syntax must fail with a typed error or compose to a fixed
+  point of emit then compose; the typed mapping never crashes or leaks. A fixed set of seeds also runs in every test run.
+- **Differential oracles** (`tools/`, foreign toolchain, by hand): this module's `composeAll` against PyYAML over the
+  suite corpus and against libyaml over mutated documents (`compare.py`, `volume.py`, see Anchoring); the emitter's output
+  through PyYAML (`emit_oracle`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
 
 ## 6. The core schema, and what "1.2 core" excludes
 
@@ -289,6 +299,13 @@ literal text: only the application that defined the tag can say what it means,
 and guessing is worse than handing over the bytes. The suite agrees (`5TYM`,
 `CC74`, `6WLZ`, `7FWL`).
 
+The YAML 1.1 types are checked only when tagged **explicitly**; untagged scalars resolve as before and there is no new
+`Value` variant. `!!binary`: standard base64 with padding, ASCII whitespace ignored, validated and kept as its text (the
+suite's `565N`); `yaml.decodeBinary` returns the bytes. `!!timestamp`: validated against the YAML 1.1 grammar and kept as
+its text; `yaml.parseTimestamp` / `yaml.Timestamp` give the fields. `!!set`: a mapping whose values are all null.
+`!!omap`: a sequence of single-pair mappings with no repeated key. A malformed one, or a tag on the wrong kind of node, is
+`error.BadTaggedScalar`; the composed value of a set or omap stays the mapping / sequence.
+
 ## 7. Cyclic aliases — rejected, deliberately
 
 YAML 1.2 §3.2.1 permits a **cyclic** representation graph: an alias may name an
@@ -305,7 +322,7 @@ ancestor, as in `&a [ *a ]`. This composer rejects that with
    without expecting cycles becomes a hang or an OOM on hostile input.
 3. **No oracle requires the alternative.** JSON cannot represent a cycle, so no
    `in.json` case in the suite exercises one, and nothing was traded away to get
-   the score in §5.
+   the score in *Verification*.
 
 The detection is **structural rather than a graph search**: a collection
 registers its anchor *before* composing its children, marked in-progress, and an
@@ -322,21 +339,16 @@ that would expand to 2^n nodes composes into n. A consumer that walks the DAG
 
 The anchor **table** is a third, easily missed cost. Nothing in the format caps
 how many anchors a document may declare — an anchor is one `&name` token, and
-`max_nodes` bounds nodes rather than comparisons — so a table that is scanned
-linearly on definition *and* on alias resolution makes composing O(anchors²).
-Measured on the array-scan version (ReleaseFast, best of 5): 8.7 / 35.5 /
-142.5 ms at 2000 / 4000 / 8000 anchors = 4.0× per doubling, against 1.11 / 2.16 /
-4.74 ms = 1.95× for the same document with the anchors removed — a 128 KB input
-already 30× the anchor-free cost, and the ratio grows with n. With the index:
-1.26 / 2.47 / 5.28 ms = 2.0× per doubling, 1.2× the anchor-free control.
-`Composer` therefore keeps a name → slot index beside the array; the array
-remains the storage so slot identity and `finishAnchor` are unchanged. Pinned by
-`compose.zig`'s `anchor_probes` counter rather than by a wall-clock assertion.
+`max_nodes` bounds nodes rather than comparisons — so a table scanned
+linearly on definition *and* on alias resolution would make composing
+O(anchors²). `Composer` therefore keeps a name → slot index beside the array; the
+array remains the storage so slot identity and `finishAnchor` are unchanged.
+Pinned by `compose.zig`'s `anchor_probes` counter rather than by a wall-clock
+assertion.
 
 ## 8. Duplicate mapping keys — rejected by default
 
-YAML 1.2.2 §3.2.1.1 restricts a mapping node's keys to be unique (fetched and
-read 2026-08-07, https://yaml.org/spec/1.2.2/#3211-nodes: "The content of a
+YAML 1.2.2 §3.2.1.1 restricts a mapping node's keys to be unique (https://yaml.org/spec/1.2.2/#3211-nodes: "The content of a
 mapping node is an unordered set of key/value node pairs, with the
 restriction that each of the keys is unique"), but plenty of real-world
 parsers accept the duplicate anyway and resolve it however they see fit.
@@ -364,36 +376,28 @@ already owns the ambiguity — interop with a producer that emits duplicate
 keys on purpose, or a consumer implementing its own resolution policy — not
 as a hidden default a caller could be surprised by.
 
-**The check itself used to be exactly the "walks the DAG as a tree" defect §7
-warns a *consumer* about — except it was inside the composer, on the default
-path.** Comparing a new key against every prior key called plain structural
-equality with no bound: two aliases of the same anchor still compare content
-by content (§7's sharing is invisible to a naive walk), so a billion-laughs
-document that shares an anchor n levels deep cost up to 2^n comparisons just
-to notice ordinary duplicate keys — and a document that is *not* a duplicate,
-merely alias-heavy, paid the same 2^n to find that out and return `OK`
-(A1/yaml.md F1, measured 13.4 s / 0.61 KB and 3.7 s / 1.2 KB respectively).
-The same unbounded scan was separately O(k²) on an ordinary map with k
-distinct scalar keys and no aliases at all — no exponent, just a linear scan
-per key (F2, measured 17.6 s at k=64 000, 352× its own control) — and its
-recursion depth tracked the *value's* nesting (which an alias chain can make
-arbitrarily deep at constant syntactic depth), not `Options.max_depth`, which
-only bounds the *composer's* recursion (F3, measured SIGABRT/SIGSEGV — a
-stack overflow, not a recoverable error — walking two 200 000-deep alias
-chains).
+**The check is bounded.** Comparing a new key against the prior keys with plain
+structural equality would be exactly the "walks the DAG as a tree" defect §7
+warns a *consumer* about, inside the composer on the default path: two aliases of
+the same anchor still compare content by content (§7's sharing is invisible to a
+naive walk), so a billion-laughs document that shares an anchor n levels deep
+would cost up to 2^n comparisons just to notice ordinary duplicate keys, and an
+alias-heavy document that is *not* a duplicate would pay the same 2^n to return
+`OK`. An unbounded scan is also O(k²) on an ordinary map with k distinct scalar keys,
+and its recursion depth would track the *value's* nesting (which an alias chain
+can make arbitrarily deep at constant syntactic depth), not `Options.max_depth`,
+which only bounds the *composer's* recursion: a stack overflow, not a recoverable error.
 
-Fixed by `DupTracker` (`compose.zig`): scalar keys — the common case — go
-into a hash set, one O(1) probe per key, closing F2 outright. Sequence/
-mapping-typed keys stay on a linear scan (rare in practice), but the
-comparison itself is `dupEql`, not `valueEql`: memoized per `(pointer, pointer)`
-pair so no sub-tree is walked twice within one comparison (closing F1's
-exponential blowup — the pointer-identity fast path alone closes the common
-"two aliases of the *same* anchor" shape in O(1)), and depth-bounded by
-`Options.max_depth` (closing F3 — a document whose *value* depth exceeds it
-now fails with `error.TooDeep` instead of exhausting the stack). Regression
-tests pin the complexity on `Composer.dup_probes` — a deterministic step
-count, the same style `anchor_probes` above already uses — rather than a
-wall clock.
+`DupTracker` (`compose.zig`) closes each: scalar keys — the common case — go
+into a hash set, one O(1) probe per key. Sequence/mapping-typed keys stay on a
+linear scan (rare in practice), but the comparison is `dupEql`, memoized per
+`(pointer, pointer)` pair so no sub-tree is walked twice within one comparison (the
+pointer-identity fast path alone closes the common "two aliases of the *same*
+anchor" shape in O(1)), and depth-bounded by `Options.max_depth` (a document
+whose *value* depth exceeds it fails with `error.TooDeep` instead of exhausting
+the stack). Regression tests pin the complexity on `Composer.dup_probes` — a
+deterministic step count, the same style `anchor_probes` above uses — rather
+than a wall clock.
 
 ## 9. Integer range — the one place resolution is lossy
 
@@ -410,7 +414,7 @@ No suite case exercises this (the corpus has no oversized integers), so the unit
 test in `compose.zig` is the only thing keeping the behaviour deliberate. A
 consumer needing bignums has the exact text and can parse it itself.
 
-## 9b. Emitter, typed mapping, merge keys (2026-10-04)
+## 9b. Emitter, typed mapping, merge keys
 
 - **Emitter (`emit.zig`).** The contract is "composes back to an equal `Value`", under both this
   module (1.2 core) and a 1.1 reader. Plain scalars are restricted to simple words (start with a
@@ -425,7 +429,7 @@ consumer needing bignums has the exact text and can parse it itself.
   descending twice; a node reached twice or more is written once as `&aN` and then `*aN`, so
   output is linear in the composed DAG (the 20-level laughs bomb: < 2× its source). An aliased
   key is written `*aN :` — `:` is a legal anchor-name character, so `*aN:` would be the alias
-  "aN:" (self-review finding, fixed with a test). Recursion follows the `Value` depth, which the
+  "aN:". Recursion follows the `Value` depth, which the
   composer bounds.
 - **Typed mapping (`typed.zig`).** `Value` → `T` after composing (all composer bounds apply), the
   result aliasing the arena; strict kinds (no number → string coercion: the core schema already
@@ -439,30 +443,16 @@ consumer needing bignums has the exact text and can parse it itself.
   duplicate-key check's (`DupTracker`: hashed scalars, bounded `dupEql` for collections), so a
   merge costs one probe per candidate key; merged pairs are charged to `max_heap_bytes`. Merged
   keys are never duplicates; explicit duplicates still are (stricter than PyYAML, by §8).
-- **Mutation 2026-10-04, two equivalents:** the float layout's switch to exponent form at
-  n > 21 or n ≤ -6 moved by one — `1000000000000000000000.0` vs `1.0e+21`, `0.0000001` vs
-  `1.0e-7` are both floats to 1.1 and 1.2 and read back to the same bits.
 
-## 10. Backlog
+## What is deliberately not done
 
-- ~~**Emitter, `parseInto(T, …)`**~~ — done 2026-10-04 (§9b). **Schemas beyond core** — see README, Deferred.
-- ~~**Fuzz harness.**~~ — `fuzz_test.zig` (2026-10-04): a deterministic driver
-  (`YAML_FUZZ`) over composer, emitter and typed mapping; 240 000 runs clean.
-- **`problem`/`problem_mark` are best-effort.** The first error wins, and marks
-  point at the scanner cursor rather than always at the offending construct's
-  start. Good enough to debug with, not yet good enough to render a caret
-  diagnostic against.
-- **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; this module reads
-  UTF-8 only. A leading UTF-16/UTF-32 BOM is now *rejected* (`error.InvalidYaml`,
-  `Scanner.fetchStreamStart`) rather than silently misread as content. Actually decoding the other encodings is still not done.
-- **`Options.max_nodes` bounds nodes; `Options.max_heap_bytes` bounds bytes**
-  (A1/yaml.md F9: 64 000 sequence items, 500 890 B on the wire, peaked at
-  59.6 MB live — 119×; `max_nodes = 10_000_000` alone let roughly half a
-  gigabyte of heap build before it fired). `composeAllLeaky` wraps the
-  allocator in a counter that refuses past `max_heap_bytes` (default 64 MiB,
-  `null` = off) and reports `error.HeapBudgetExceeded`. It counts bytes
-  requested through the allocator — for an arena, what the parse and the tree
-  asked for, not the arena's own page overhead. ✅ DONE 2026-09-13 (`Options.max_heap_bytes`, default 64 MiB, `error.HeapBudgetExceeded`, modules/yaml/src/compose.zig:374, commit f978099bc).
+- **Cyclic aliases** — rejected with `error.AliasCycle` though YAML 1.2 permits them; the reasoning is §7.
+- **YAML 1.1 behaviour in the core schema** — `yes`/`no`/`on`/`off` booleans, bare-leading-zero octal and sexagesimals are
+  not resolved (§6); `<<` merge keys are opt-in (`ComposeOptions.merge_keys`, §9b).
+- **Integers beyond `i64` as numbers** — the text stays a string; a consumer needing bignums parses it (§9).
+- **New `Value` variants for `!!binary` / `!!timestamp`** — the tagged scalar is validated and kept as its text, with
+  `yaml.decodeBinary` and `yaml.parseTimestamp` for the contents (§6).
+- **Vendoring the yaml-test-suite** — it is fetched, so the oracle is never a stale copy (*Verification*).
 
 ## Anchoring
 
@@ -473,9 +463,7 @@ consumer needing bignums has the exact text and can parse it itself.
 
 **What the tests actually contain.** yaml-test-suite EXTERNAL 402/402 events + 279/279 json; int/float resolution also test-suite covered (VERIFIED 2026-08-01)
 
-**How it got there.** The anchoring work landed. VERIFIED 2026-08-01: survey was WRONG, all 402 cases already execute; teeth-checked
-
-**Differential anchor against PyYAML/libyaml (adopted 2026-09-17):** `tools/ydump.zig` +
+**Differential anchor against PyYAML/libyaml:** `tools/ydump.zig` +
 `tools/compare.py`/`volume.py` diff this module's `composeAll` against PyYAML 6.0.3 (over
 the yaml-test-suite corpus) and against libyaml (`CSafeLoader`, 200 000 mutated documents).
 Both are 1.1 parsers so most divergence is expected-and-bucketed, not a module defect — see
@@ -483,19 +471,16 @@ Both are 1.1 parsers so most divergence is expected-and-bucketed, not a module d
 
 ## Backlog / deferred
 
-
-**Missing and it matters** *(survey 2026-09-30)* — the first three overlap README "Deferred" and §10 above; the survey ranks them:
-
-**2026-10-04:** items 1–3 are done (§9b); item 4 (`!!binary`/`!!timestamp`/`!!set`/`!!omap`, other schemas) stays
-deferred — not 1.2 core, no consumer, each is a small opt-in when one appears; item 5 (comment-preserving round
-trip) stays deferred — needs comment tokens through scanner, parser and `Value`, a large change for edit-in-place
-tools no consumer has.
-
-1. ~~**Typed mapping (`parseInto(T, …)`)**~~ *(survey 2026-09-30)*: Go, Rust, Python-with-classes and libfyaml all decode YAML onto native types; a Zig user of this module walks `Value` by hand for every config. `std.json.parseFromSlice` sets the expectation in Zig. Effort: medium (comptime reflection over `Value`, as `jinja.valueFrom` does the other way). Fits §2: yes.
-2. ~~**Emitter**~~ *(survey 2026-09-30)*: libyaml, libfyaml, go-yaml, saphyr, PyYAML and eemeli/yaml all write YAML; a program that reads and rewrites config, or produces manifests, cannot use this module alone (`jinja` is the current workaround for generating text). Effort: medium-large (block/flow styles, quoting rules, round-trip of scalar style already exposed by `Parser`). Fits §2: yes.
-3. ~~**`<<` merge keys**~~ *(survey 2026-09-30)*: not in YAML 1.2 core, but docker-compose, GitLab CI, GitHub Actions and Kubernetes-adjacent files use them and go-yaml/PyYAML/eemeli/yaml resolve them. Today `<<` composes as an ordinary key. Effort: small (an opt-in `Options.merge_keys`, composer-side; interacts with the duplicate-key check). Fits §2: yes. (Searched: `rg -i 'merge|"<<"' modules/yaml/src/compose.zig modules/yaml/SPEC.md modules/yaml/README.md`: no hit.)
-4a. ✅ DONE 2026-11-16 (`!!binary`: explicit tag only, base64 with whitespace ignored, validated and kept as its text (the suite's 565N), bytes via public `yaml.decodeBinary`; `!!timestamp`: explicit tag only, validated against the YAML 1.1 grammar and kept as its text, fields via public `yaml.parseTimestamp` / `yaml.Timestamp`; malformed -> `error.BadTaggedScalar`; untagged scalars unchanged, no new `Value` variant).
-4b. ✅ DONE 2026-11-16 (`!!set` / `!!omap`: explicit tags validated — set = mapping with all-null values, omap = sequence of single-pair mappings with no repeated key; malformed -> `error.BadTaggedScalar`; value unchanged, mapping / sequence; failsafe/JSON schemas remain open) **`!!set` / `!!omap` and failsafe/JSON schemas** *(survey 2026-09-30)*: already in README Deferred; PyYAML and eemeli/yaml resolve them. Effort: small each. Fits §2: yes. Lower priority (not in the 1.2 core schema).
-5. **Comment-preserving round trip** *(survey 2026-09-30)*: eemeli/yaml, goccy/go-yaml and go-yaml keep comments for edit-in-place tools. Needs scanner support for comments plus an emitter. Effort: large. Fits §2: yes. Low priority.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
+- **`problem` / `problem_mark` are best-effort.** The first error wins, and marks
+  point at the scanner cursor rather than always at the offending construct's
+  start. Good enough to debug with, not yet good enough to render a caret
+  diagnostic against.
+- **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; this module reads
+  UTF-8 only. A leading UTF-16/UTF-32 BOM is rejected (`error.InvalidYaml`,
+  `Scanner.fetchStreamStart`) rather than silently misread as content. Decoding the other
+  encodings is not done.
+- **Failsafe and JSON schemas.** Only the core schema is resolved. Not in the 1.2 core, no consumer; each is a small
+  opt-in when one appears. Effort: small.
+- **Comment-preserving round trip.** eemeli/yaml, goccy/go-yaml and go-yaml keep comments for edit-in-place tools. Needs
+  comment tokens through scanner, parser and `Value`, plus an emitter: a large change for tools no consumer has. Effort:
+  large. Low priority.
