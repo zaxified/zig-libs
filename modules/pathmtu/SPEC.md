@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, re-surveyed for parity 2026-11-02 
 | [cavallara/plp-mtu-discovery](https://github.com/cavallara/plp-mtu-discovery) | C | MIT | 32 | push 2021-02-17 | Packetization-layer PMTUD (RFC 4821 style) experiment, stale since 2021 *(inferred from the name; README not read)*. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | Zig `std` has no PMTU discovery (this module's README); no Zig PMTU library turned up in a GitHub search. |
 
-**Where we are ahead:** the only library-shaped PMTU discovery found in any language (callable, structured `Result`, both address families), a deterministic offline-testable binary-search engine behind an injectable `Prober`, explicit ICMP black-hole detection (`Result.blackhole`) with the kernel-cache blind spot measured on a real router, and RFC 1191/4443 next-hop-MTU hints handled with a documented trust rule. **Where we are behind:** no packetization-layer discovery that works without any ICMP (RFC 4821/8899 PLPMTUD; refused, see *What is deliberately not done*), no next-hop MTU on the ping-socket lane yet (`icmp` exposes it now, *Backlog / deferred*), one-shot only, Linux only (deliberate, SPEC). **Gap verdicts:** per-hop MTU done; DGRAM error-queue read done (a Frag-Needed no longer reads as a black hole there), its next-hop hint not yet used (*Backlog / deferred*); PLPMTUD, cloudflare/pmtud-style ICMP relaying (a different problem), automatic egress-interface lookup, monitoring and non-Linux are refused (*What is deliberately not done*).
+**Where we are ahead:** the only library-shaped PMTU discovery found in any language (callable, structured `Result`, both address families), a deterministic offline-testable binary-search engine behind an injectable `Prober`, explicit ICMP black-hole detection (`Result.blackhole`) with the kernel-cache blind spot measured on a real router, and RFC 1191/4443 next-hop-MTU hints handled with a documented trust rule. **Where we are behind:** no packetization-layer discovery that works without any ICMP (RFC 4821/8899 PLPMTUD; refused, see *What is deliberately not done*), one-shot only, Linux only (deliberate, SPEC). **Gap verdicts:** per-hop MTU done; DGRAM error-queue read done (a Frag-Needed no longer reads as a black hole there, and its next-hop MTU is the hint); PLPMTUD, cloudflare/pmtud-style ICMP relaying (a different problem), automatic egress-interface lookup, monitoring and non-Linux are refused (*What is deliberately not done*).
 
 ## What this module is, and what it is not
 
@@ -121,6 +121,11 @@ codec). v4: 2 bytes at ICMP header offset 6 (`mtuHintV4`) — the low half of
 RFC 792's "unused" field, repurposed by RFC 1191; a pre-RFC-1191 router
 leaves it zero, read as "no hint". v6: 4 bytes at offset 4 (`mtuHintV6`,
 RFC 4443 §3.2) — always meaningful for a conformant Packet Too Big message.
+On the ping-socket (DGRAM) lane the kernel hands these messages only to the
+error queue; there the hint is the entry's `sock_extended_err.ee_info` (Linux
+copies the message's next-hop MTU into it; `icmp.Socket.ErrInfo.ee_info`),
+read only for a Fragmentation Needed / Packet Too Big and 0 meaning none. It is
+the same unauthenticated claim and goes through the same trust rule below.
 A hint is trusted only when it lies strictly inside the current search
 interval (`applyOutcome`); an out-of-range or inconsistent value falls back
 to treating the probed size itself as the new bound. **An accepted hint
@@ -458,10 +463,6 @@ the host changes).
 
 ## Backlog / deferred
 
-- **Next-hop MTU on the ping-socket (DGRAM) lane:** `icmp.Socket.ErrInfo` now carries `ee_info` (`sock_extended_err.ee_info`,
-  the MTU a Fragmentation Needed reports), but `probe` and `probeHops` read only the error-queue entry's type, code and
-  offender (`src/root.zig`), so they bisect without a hint: results are exact but cost about 11 probes per narrowing. Plan:
-  read `ee_info` where the entry arrives and feed it as the hint.
 - **Backoff for rate-limited routers:** a smarter backoff than the single re-probe is not built (see the per-hop walk design note).
 
 ## Open

@@ -114,8 +114,8 @@ for (walk.hops) |h| {
 that hop (never a router's claim taken on trust); it is not set for a silent hop,
 an exhausted step budget or a send that failed. `h.silence_narrowed` and
 `walk.uncertain` mark an estimate lowered by silence alone (loss and rate limits
-look like a black hole), `walk.timed_out` a walk ended by `deadline_ms`. Without a next-hop MTU (the unprivileged
-ping socket's is not read yet) the size is bisected, so the answer is exact either way.
+look like a black hole), `walk.timed_out` a walk ended by `deadline_ms`. Without a next-hop MTU (a
+pre-RFC-1191 router) the size is bisected, so the answer is exact either way.
 A router that rate-limits its ICMP errors can look silent; keep `retries` above 0.
 A reply from another address of a multi-homed destination is dropped (the
 walk then shows silence and `reached == false`). The walk allocates nothing, and is bounded by `max_hops`, the output slice,

@@ -780,9 +780,9 @@ fn LiveProberFor(comptime hop_mode: bool) type {
                     if (waitForDataMatch(self.sock, deadline - now, &wakeups, self.family, seq, if (hop_mode) self.dest_ip else null)) |hit| {
                         switch (hit.kind) {
                             // On a ping socket the kernel delivers these ONLY on the
-                            // error queue, and without the next-hop MTU (`sock_extended_err.ee_info`
-                            // is not exposed by `icmp.Socket.ErrInfo`): the search bisects.
-                            .frag_needed => return if (hop_mode) .{ .frag_needed = .{ .hint = null, .from = hit.from } } else .{ .frag_needed = null },
+                            // error queue; the next-hop MTU comes from the entry's
+                            // `ee_info`, the same hint the RAW lane reads from the message.
+                            .frag_needed => return if (hop_mode) .{ .frag_needed = .{ .hint = hit.mtu, .from = hit.from } } else .{ .frag_needed = hit.mtu },
                             .time_exceeded => if (hop_mode) return .{ .time_exceeded = hit.from },
                         }
                     }
@@ -847,6 +847,9 @@ fn waitForData(sock: *const icmp.Socket, wait_ns: u64, wakeups: *usize) void {
 const ErrHit = struct {
     kind: enum { frag_needed, time_exceeded },
     from: ?netaddr.Ip,
+    /// `.frag_needed` only: the next-hop MTU the kernel copied into
+    /// `sock_extended_err.ee_info` (null when it is 0: a pre-RFC-1191 router).
+    mtu: ?u32 = null,
 };
 
 /// `waitForData`, but the drained entries are looked at: with `family` set, the
@@ -939,7 +942,11 @@ fn errHit(family: icmp.Socket.Family, e: icmp.Socket.ErrInfo, ident: u16, seq: u
         else
             return null,
     };
-    return .{ .kind = kind, .from = ipOf(e.offender) };
+    return .{
+        .kind = kind,
+        .from = ipOf(e.offender),
+        .mtu = if (kind == .frag_needed and e.ee_info != 0) e.ee_info else null,
+    };
 }
 
 fn ipOf(src: icmp.Socket.RecvInfo.SrcAddr) ?netaddr.Ip {
@@ -2474,6 +2481,10 @@ test "errHit: the DGRAM lane's error queue yields Frag-Needed and Time Exceeded 
     const h = errHit(.v4, e, 0x4242, 9, dest).?;
     try testing.expectEqual(@as(@TypeOf(h.kind), .frag_needed), h.kind);
     try testing.expect(h.from.?.eql(.{ .v4 = .{ 10, 0, 0, 1 } }));
+    try testing.expectEqual(@as(?u32, null), h.mtu); // ee_info 0: no hint
+    // The next-hop MTU the kernel put in `ee_info` is the hint.
+    e.ee_info = 1400;
+    try testing.expectEqual(@as(?u32, 1400), errHit(.v4, e, 0x4242, 9, dest).?.mtu);
     // Not ours: ident, seq, quoted destination, origin, code, type.
     try testing.expect(errHit(.v4, e, 0x4243, 9, dest) == null);
     try testing.expect(errHit(.v4, e, 0x4242, 10, dest) == null);
@@ -2486,6 +2497,7 @@ test "errHit: the DGRAM lane's error queue yields Frag-Needed and Time Exceeded 
     e.err_type = echo.v4.time_exceeded;
     const t = errHit(.v4, e, 0x4242, 9, dest).?;
     try testing.expectEqual(@as(@TypeOf(t.kind), .time_exceeded), t.kind);
+    try testing.expectEqual(@as(?u32, null), t.mtu); // ee_info is not an MTU on a Time Exceeded
     e.err_type = 99;
     try testing.expect(errHit(.v4, e, 0x4242, 9, dest) == null);
     // A quote shorter than the echo header never indexes past it.
@@ -2498,8 +2510,10 @@ test "errHit: the DGRAM lane's error queue yields Frag-Needed and Time Exceeded 
         .err_type = echo.v6.packet_too_big,
         .err_code = 0,
         .origin = icmp.Socket.origin_icmp6,
+        .ee_info = 1280,
     };
     try testing.expectEqual(@as(@TypeOf(h.kind), .frag_needed), errHit(.v6, e6, 0x4242, 9, null).?.kind);
+    try testing.expectEqual(@as(?u32, 1280), errHit(.v6, e6, 0x4242, 9, null).?.mtu);
     e6.origin = icmp.Socket.origin_icmp;
     try testing.expect(errHit(.v6, e6, 0x4242, 9, null) == null);
 }
