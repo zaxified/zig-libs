@@ -134,3 +134,61 @@ test "w10zb2 a fast CDict of under 2^24 bytes is loaded whole" {
     const n = try framedCDict(&c, pc, &cd);
     try std.testing.expect(n < p_len / 2);
 }
+
+fn greedyCDictLen(zeros: usize) !usize {
+    const p_len = 2048;
+    const dict = try pThenZeros(p_len, zeros);
+    defer gpa.free(dict);
+    const pc = try gpa.dupe(u8, dict[0..p_len]);
+    defer gpa.free(pc);
+    var cd = try zstd.CDict.initAdvanced(gpa, dict, .{
+        .level = 5,
+        .advanced = .{ .strategy = .greedy, .window_log = 25, .hash_log = 22, .chain_log = 12, .row_match_finder = .disable },
+    });
+    defer cd.deinit();
+    var c: zstd.Compressor = .init(gpa);
+    defer c.deinit();
+    return framedCDict(&c, pc, &cd);
+}
+
+test "w10zb2 a greedy CDict loads a dictionary of over 16 MiB whole (the short-cache limit is for fast and dfast)" {
+    try std.testing.expect(try greedyCDictLen(8 << 20) < 1024);
+    try std.testing.expect(try greedyCDictLen((16 << 20) + 4096) < 1024);
+}
+
+/// The input is `a` random bytes then the first 300 bytes of an 8000-byte
+/// random dictionary, at a distance over the 2^10 window.
+fn farDictionaryLen(force_max_window: bool) !struct { n: usize, len: usize } {
+    const dict = try gpa.alloc(u8, 8000);
+    defer gpa.free(dict);
+    var prng: std.Random.DefaultPrng = .init(0xd1c7);
+    prng.random().bytes(dict);
+    const src = try gpa.alloc(u8, 800);
+    defer gpa.free(src);
+    prng.random().bytes(src[0..500]);
+    @memcpy(src[500..], dict[0..300]);
+    var c: zstd.Compressor = .init(gpa);
+    defer c.deinit();
+    const n = try framed(&c, src, .{
+        .level = 1,
+        .advanced = .{
+            .window_log = 10,
+            .force_max_window = force_max_window,
+            .long_distance_matching = .enable,
+            .ldm_hash_log = 16,
+            .ldm_min_match = 32,
+            .ldm_hash_rate_log = 1,
+            .ldm_bucket_size_log = 1,
+        },
+        .dictionary = .{ .prefix = .{ .bytes = dict } },
+    });
+    return .{ .n = n, .len = src.len };
+}
+
+test "w10zb2 with force_max_window a dictionary beyond the window is never matched, long-distance or not" {
+    // without it the dictionary counts until the input is a window past it
+    const free = try farDictionaryLen(false);
+    try std.testing.expect(free.n + 200 < free.len);
+    const forced = try farDictionaryLen(true);
+    try std.testing.expect(forced.n >= forced.len);
+}
