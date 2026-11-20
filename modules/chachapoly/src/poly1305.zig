@@ -315,10 +315,12 @@ fn mulRed(
 /// Split `W` consecutive 16-byte blocks into 5×26-bit limbs, one block per lane,
 /// with the implicit 2^128 bit set. The wide path only ever sees *whole*
 /// blocks — the zero-padded final block is the serial engine's job — so the
-/// high bit is unconditional here.
+/// high bit is unconditional here. Reached only through `loadBlocks64` when
+/// `!qwordLoad(W)` (a width other than 4/8, or a big-endian target), so a
+/// per-word gather is all it needs.
 fn loadBlocks(comptime W: usize, m: *const [16 * W]u8) [5]@Vector(W, u32) {
     const V = @Vector(W, u32);
-    const t = if (W == 8 and native_endian == .little) columns8(m) else blk: {
+    const t = blk: {
         var cols: [4][W]u32 = undefined;
         inline for (0..W) |j| {
             inline for (0..4) |k| {
@@ -346,43 +348,6 @@ fn loadBlocks(comptime W: usize, m: *const [16 * W]u8) [5]@Vector(W, u32) {
         ((t1 >> s20) | (t2 << s12)) & mask,
         ((t2 >> s14) | (t3 << s18)) & mask,
         (t3 >> s8) | hi,
-    };
-}
-
-/// Word `k` of each of 8 consecutive 16-byte blocks, block `j` in lane `j`,
-/// from four 32-byte loads and register shuffles (`vpunpck{l,h}dq`,
-/// `vpunpck{l,h}qdq`, one `vpermd` per column). The per-word gather it
-/// replaces lowered to 32 `vpinsrd` per 128 bytes (2026-10-13).
-inline fn columns8(m: *const [128]u8) [4]@Vector(8, u32) {
-    const V = @Vector(8, u32);
-    // y[p] = block 2p's words 0..3 | block 2p+1's words 0..3.
-    // Through `@Vector(32, u8)`: zig 0.17 lowers a byte-array -> u32-vector
-    // `@bitCast` to a byte-by-byte integer assembly (~140 instructions per
-    // 32 bytes); the u8-vector load plus a vector -> vector `@bitCast` is one
-    // `vmovdqu`, with the same little-endian-logical meaning on every target.
-    const B = @Vector(32, u8);
-    const y: [4]V = .{
-        @bitCast(@as(B, m[0..32].*)),
-        @bitCast(@as(B, m[32..64].*)),
-        @bitCast(@as(B, m[64..96].*)),
-        @bitCast(@as(B, m[96..128].*)),
-    };
-    const lo32 = @Vector(8, i32){ 0, ~@as(i32, 0), 1, ~@as(i32, 1), 4, ~@as(i32, 4), 5, ~@as(i32, 5) };
-    const hi32 = @Vector(8, i32){ 2, ~@as(i32, 2), 3, ~@as(i32, 3), 6, ~@as(i32, 6), 7, ~@as(i32, 7) };
-    const lo64 = @Vector(8, i32){ 0, 1, ~@as(i32, 0), ~@as(i32, 1), 4, 5, ~@as(i32, 4), ~@as(i32, 5) };
-    const hi64 = @Vector(8, i32){ 2, 3, ~@as(i32, 2), ~@as(i32, 3), 6, 7, ~@as(i32, 6), ~@as(i32, 7) };
-    // a = [b0w0 b2w0 b0w1 b2w1 | b1w0 b3w0 b1w1 b3w1], b likewise for blocks 4..7.
-    const a = @shuffle(u32, y[0], y[1], lo32);
-    const b = @shuffle(u32, y[2], y[3], lo32);
-    const c = @shuffle(u32, y[0], y[1], hi32);
-    const d = @shuffle(u32, y[2], y[3], hi32);
-    // Lane order after the 64-bit unpack: blocks 0 2 4 6 1 3 5 7.
-    const order = @Vector(8, i32){ 0, 4, 1, 5, 2, 6, 3, 7 };
-    return .{
-        @shuffle(u32, @shuffle(u32, a, b, lo64), undefined, order),
-        @shuffle(u32, @shuffle(u32, a, b, hi64), undefined, order),
-        @shuffle(u32, @shuffle(u32, c, d, lo64), undefined, order),
-        @shuffle(u32, @shuffle(u32, c, d, hi64), undefined, order),
     };
 }
 

@@ -184,7 +184,7 @@ because the widest integer multiply x86 vectors have is `PMULUDQ`'s 32×32→64.
 `lanes` is picked at comptime (AVX-512F or AVX2 → 8, otherwise 1). At L ≥ 8 a run of
 3·L/2 .. 3·L blocks takes an L/2-lane half engine over the same power table
 (`wideHalf`), so the vector entry point stays at 192 B (AVX2 runs 8 lanes as two
-independent 4-lane Horner chains, loaded with the shuffle load `columns8`; without the half
+independent 4-lane Horner chains, loaded by `loadBlocks64`'s quadword shuffle; without the half
 engine 192–383 B would fall back to std).
 
 **It is a hybrid, and that is the load-bearing design decision.** The power table
