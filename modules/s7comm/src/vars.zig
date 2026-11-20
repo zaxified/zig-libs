@@ -252,7 +252,7 @@ fn fuzzRequest(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
     // finds fewer than eight octets left and returns the range MINIMUM — so the
     // length was 0 for every seed and this harness only ever saw the empty
-    // input. Measured on 2026-09-06 over the corpus above: **0 of 9
+    // input. Measured over the corpus above: **0 of 9
     // non-empty and 0 decoded before, 9 of 9 non-empty and 4 decoded after.**
     const len: usize = fz.drawInput(S, src, &buf, &request_seeds);
     fuzzRequestMark.mark(.ran);

@@ -739,7 +739,7 @@ fn fuzzItem(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
     // finds fewer than eight octets left and returns the range MINIMUM — so the
     // length was 0 for every seed and this harness only ever saw the empty
-    // input. Measured on 2026-09-06 over the corpus above: **0 of 15
+    // input. Measured over the corpus above: **0 of 15
     // non-empty and 0 decoded before, 15 of 15 non-empty and 12 decoded after.**
     const len: usize = fz.drawInput(S, src, &buf, &item_seeds);
     fuzzItemMark.mark(.ran);
@@ -790,7 +790,7 @@ fn fuzzDataItems(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     // `value(u64)`, not `valueRangeAtMost`: a ranged draw returns its minimum
     // unless the word it reads already lies inside the range, so the iterator
     // was always constructed with a count of 0 and stopped before its first
-    // step. Measured on 2026-09-06 over the corpus above: **0 of 10 non-empty
+    // step. Measured over the corpus above: **0 of 10 non-empty
     // and one single (block, count) pair before; 10 of 10 non-empty
     // and 6 distinct pairs after.**
     const len: usize = fz.drawInput(S, src, &buf, &data_item_seeds);

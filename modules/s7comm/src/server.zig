@@ -1161,7 +1161,7 @@ const fuzz_data_sizes = [_]u8{ 0x00, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09 };
 /// `value(u64)` has full-range weights, so `weightsContain` is always true and
 /// every input word survives. The reduction is ours.
 ///
-/// Measured on 2026-09-06, over eight 2 KB seeds and four requests each, by
+/// Measured, over eight 2 KB seeds and four requests each, by
 /// re-running the builder with each of these three helpers switched back to the
 /// collapsing draw it replaced: **32 requests built, 1 DISTINCT, and 0 of them
 /// accepted by `Responder.handle` — before. 32 built, 32 distinct, 25 accepted

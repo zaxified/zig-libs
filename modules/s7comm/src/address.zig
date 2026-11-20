@@ -400,7 +400,7 @@ fn fuzzParse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
     // finds fewer than eight octets left and returns the range MINIMUM — so the
     // length was 0 for every seed and this harness only ever saw the empty
-    // input. Measured on 2026-09-06 over the corpus above: **0 of 25
+    // input. Measured over the corpus above: **0 of 25
     // non-empty and 0 that parsed before, 25 of 25 non-empty and 19 that parsed
     // after.**
     const len: usize = fz.drawInput(S, src, &buf, &address_seeds);

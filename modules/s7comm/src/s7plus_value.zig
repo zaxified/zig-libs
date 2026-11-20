@@ -788,7 +788,7 @@ fn fuzzValue(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [512]u8 = undefined;
     // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length;
     // the ranged length was 0 for every seed and `skipValue` was handed an
-    // empty cursor. Measured on 2026-09-06 over the six seeds built above:
+    // empty cursor. Measured over the six seeds built above:
     // **0 of 6 non-empty and 0 that `skipValue` accepted before, 6 of 6
     // non-empty and 4 accepted after** — the other two are the overrunning
     // array count and the over-deep nest, which must be refused.
@@ -854,7 +854,7 @@ fn fuzzVarSmith(_: void, smith: *std.testing.Smith) !void {
 fn fuzzVar(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
     var buf: [16]u8 = undefined;
-    // ⚠ See `fuzzValue`. Measured on 2026-09-06 over `varint_seeds`: **0 of 11
+    // ⚠ See `fuzzValue`. Measured over `varint_seeds`: **0 of 11
     // non-empty and 0 that decoded before, 11 of 11 non-empty and 8 that
     // decoded after.**
     const len: usize = fz.drawInput(S, src, &buf, &varint_seeds);

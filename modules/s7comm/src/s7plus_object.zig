@@ -546,7 +546,7 @@ fn fuzzObject(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
     // finds fewer than eight octets left and returns the range MINIMUM — so
     // `len` was 0 for every seed and `walkObject` was handed an empty cursor.
-    // Measured on 2026-09-06 over the five seeds built above: **0 of 5 non-empty
+    // Measured over the five seeds built above: **0 of 5 non-empty
     // and 0 that `walkObject` accepted before, 5 of 5 non-empty and 2 accepted
     // after** — the other three are the malformed marker, the over-deep nest and
     // the unterminated object, which must be refused rather than walked.
