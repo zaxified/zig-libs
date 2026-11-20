@@ -725,7 +725,7 @@ fn fuzzDecode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // and `decode` was handed an empty slice on every input a seed can carry.
     // The `smith.value(bool)` that forces a valid version byte was false for
     // the same reason, so even a full-length draw would have died at the
-    // version check. Measured 2026-09-07 over the corpus below: 0 of 8 seeds
+    // version check. Measured over the corpus below: 0 of 8 seeds
     // decoded before, 3 of 8 after.
     const drawn: usize = fz.drawInput(S, src, buf[0..fuzz_drawn], &decode_seeds);
     fuzzDecodeMark.mark(.ran);
