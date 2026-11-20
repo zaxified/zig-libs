@@ -331,7 +331,7 @@ the harnesses (UTF-7 decode, command builders, SEARCH and FETCH encoders with
 CR/LF/NUL/quote bytes injected, the response reader), in the ordinary test
 binary.
 
-**Audit:** the card's `**Audit:**` line is the current score, cumulative over the
+The mutation score is the card's `**Audit:**` line above, cumulative over the
 last whole-module mutation run and the delta runs after it.
 
 **Instruments:** `tools/` holds a differential oracle for the UTF-7 codec
