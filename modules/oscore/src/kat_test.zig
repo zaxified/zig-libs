@@ -29,7 +29,7 @@
 //!   - An end-to-end round trip: `deriveContext` -> `protect` ->
 //!     `unprotect` with FRESH random-ish key material (not a published
 //!     vector), both directions.
-//!   - The guards the A1 audit (2026-09-06) found untested or missing:
+//!   - The guards the A1 audit found untested or missing:
 //!     the AES-CCM message-length ceiling, the Partial IV ceiling on the
 //!     receive path, Appendix B.1 restart recovery, Class I `options`
 //!     binding in the AAD, §6.1 field order with BOTH kid fields present,
@@ -514,7 +514,7 @@ test "unprotect: a failed-auth attempt does not poison the replay window (§8.4)
     allocator.free(plaintext);
 }
 
-// ── A1 audit 2026-09-06: guards that were missing or had no test ─────────
+// ── A1 audit: guards that were missing or had no test ─────────
 
 /// A mirrored client/server pair with fresh (non-published) material —
 /// the shape every test below that needs BOTH directions uses.

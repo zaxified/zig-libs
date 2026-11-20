@@ -7,7 +7,6 @@
 //!    implementations — no comparison or branch on key bytes anywhere in this
 //!    module's own code."
 //!
-//! Until 2026-09-08 that sentence had no measurement behind it (audit F8).
 //!
 //! Usage: ctgrind-oscore <target> <yes|no>
 //!   targets: derive | protect | unprotect

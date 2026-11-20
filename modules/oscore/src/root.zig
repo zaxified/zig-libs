@@ -327,13 +327,11 @@ pub const ReplayWindow = struct {
             if (shift > rw.effWindow()) {
                 rw.mask = 0;
             } else if (shift == 64) {
-                // The old highest_seen sits exactly at the trailing edge
-                // (diff == window == 64), which `check` still treats as in
-                // range, so it must stay marked; `<< 64` is not expressible on
-                // u64. Until 2026-10-05 this case (and `shift == window_size`
-                // for narrower windows) cleared the mask and the old
-                // highest_seen was accepted again — a replay. Same defect as
-                // `aeadframe`'s window, found there by its mutation run.
+                // The old highest_seen sits exactly at the trailing edge (diff
+                // == window == 64), which `check` still treats as in range, so
+                // it must stay marked; `<< 64` is not expressible on u64. Same
+                // defect as `aeadframe`'s window, found there by its mutation
+                // run.
                 rw.mask = @as(u64, 1) << 63;
             } else {
                 const shift_amt: u6 = @intCast(shift);
@@ -1560,7 +1558,7 @@ test "ReplayWindow: a jump at/beyond window_size clears the old mask entirely" {
 }
 
 test "ReplayWindow: a jump of exactly window_size keeps the old highest marked (no replay)" {
-    // Review finding 2026-10-05: the shift == window case cleared the mask,
+    // Review finding: the shift == window case cleared the mask,
     // though the old highest is then at diff == window, which `check` still
     // counts as in range — so it was accepted a second time.
     inline for (.{ 4, 32, 64 }) |ws| {
@@ -1825,7 +1823,7 @@ test "ReplayWindow: oversized window_size (>64) + hostile diff/shift does not pa
     try std.testing.expectEqual(@as(u64, 270), rw.highest_seen);
 }
 
-// ── whole-module mutation tests (2026-11-17) ────────────────────────────────
+// ── whole-module mutation tests ────────────────────────────────
 
 test "ReplayWindow: a 64-wide window consults its oldest bit, and any wider setting clamps to 64" {
     for ([_]u7{ 64, 100, 127 }) |size| {
