@@ -91,7 +91,7 @@ fn msgType(p: transport.Packet) u8 {
 /// so it lives in one place — the caller's storage, `ServerConfig.host_keys`
 /// — and everything here takes `*const HostKey`: a by-value pass copied the
 /// whole key into every frame on the way, and nothing ever wiped those
-/// copies (2026-10-09 stack probe). `sign` and `fromOpenSSH` run one frame
+/// copies (stack probe). `sign` and `fromOpenSSH` run one frame
 /// down and zero the stack they dirtied (`burn.zig`).
 pub const HostKey = union(enum) {
     /// `ssh-ed25519` (RFC 8709). Signing is `std.crypto.sign.Ed25519` — no
@@ -199,7 +199,7 @@ pub const HostKey = union(enum) {
             const n_wire = pk_cur.string() catch return error.InvalidOpenSSH;
             const pk = rsa.PublicKey.fromBytes(n_wire, e_wire) catch return error.InvalidOpenSSH;
             // Cross-check: the public blob's (n, e) must be the secret key's.
-            // n alone was checked until 2026-10-09; SSH_FUZZ `ssh-keyload`
+            // n alone was checked until; SSH_FUZZ `ssh-keyload`
             // found a container whose public `e` was damaged (65537 ->
             // 0x018101) load as a host key advertising a public key its own
             // signatures do not verify under.
@@ -357,8 +357,7 @@ fn signEcdsa(kp: anytype, comptime name: []const u8, data: []const u8, w: *std.I
 // ── openssh-key-v1 container parsing (ed25519 + type dispatch) ──────────────
 
 /// Decode the base64 body of the first `-----BEGIN OPENSSH PRIVATE KEY-----`
-/// PEM block in `text` into `out`, through `keycodec.pem` (since
-/// 2026-11-06; until then a copy of the same walk): a body is crossed by a
+/// PEM block in `text` into `out`, through `keycodec.pem` (since; until then a copy of the same walk): a body is crossed by a
 /// scan for its END line's first '-', never a Boyer-Moore-Horspool search
 /// over key text, and decoded by `b64ct` in constant time straight into
 /// `out` (the caller wipes it). `InvalidPem` for a missing or garbled END
@@ -367,7 +366,7 @@ fn signEcdsa(kp: anytype, comptime name: []const u8, data: []const u8, w: *std.I
 fn pemDecodeOpensshBlock(text: []const u8, out: []u8) HostKey.FromOpenSSHError![]u8 {
     // A malformed block of another label BEFORE the key (a BEGIN line without
     // its END) is walked past, as the literal-marker search before keycodec
-    // did and as Go's `pem.Decode` does (delta audit F F1, 2026-11-06). After
+    // did and as Go's `pem.Decode` does (delta audit F F1). After
     // an error the iterator stands just past that block's BEGIN, so the walk
     // always moves on. A broken OPENSSH block itself stays `InvalidPem`, even
     // when a good one follows.
@@ -426,10 +425,9 @@ fn parseContainerHeader(bin: []const u8) HostKey.FromOpenSSHError!ContainerHeade
 /// Parse an ed25519 private key from an openssh-key-v1 container, plain
 /// (cipher/kdf `"none"`, what deployed host keys like
 /// `/etc/ssh/ssh_host_ed25519_key` use) or passphrase-protected (bcrypt +
-/// aes256-ctr/-cbc, `ssh-keygen -N`; since 2026-10-09, decrypted by the
-/// sibling `rsa` module's `opensshDecryptSection` as Go's x/crypto/ssh
-/// does for every key type). A wrong or empty passphrase is
-/// `error.IncorrectPassphrase`.
+/// aes256-ctr/-cbc, `ssh-keygen -N`;, decrypted by the sibling `rsa`
+/// module's `opensshDecryptSection` as Go's x/crypto/ssh does for every
+/// key type). A wrong or empty passphrase is `error.IncorrectPassphrase`.
 ///
 /// Private-keys section layout (all RFC 4251 §5 primitives): `uint32`
 /// checkint1 == `uint32` checkint2, `string` keytype `"ssh-ed25519"`,
@@ -480,7 +478,7 @@ fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8, passphrase: []const 
     // key there only under runtime safety (ed25519.zig:358), so in
     // ReleaseFast/ReleaseSmall it took the container's copy and this check
     // compared that copy with itself — a seed/public mismatch loaded and
-    // advertised a key its own signatures do not verify under (2026-10-18).
+    // advertised a key its own signatures do not verify under.
     errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     out.* = Ed25519.KeyPair.generateDeterministic(priv_bytes[0..32].*) catch return error.InvalidPrivateKey;
     if (!std.mem.eql(u8, &out.public_key.toBytes(), pub_bytes)) return error.InvalidPrivateKey;
@@ -488,7 +486,7 @@ fn parseEd25519Body(out: *Ed25519.KeyPair, bin: []const u8, passphrase: []const 
 
 test "parseEd25519Body: a seed that does not derive the container's public key is refused in every mode" {
     // Container whose two public copies agree with each other but belong to
-    // ANOTHER seed. Before 2026-10-18 this loaded in ReleaseFast.
+    // ANOTHER seed.
     const t = std.testing;
     const kp_a = try Ed25519.KeyPair.generateDeterministic(@splat(0xa1));
     const kp_b = try Ed25519.KeyPair.generateDeterministic(@splat(0xb2));
@@ -540,7 +538,7 @@ test "parseEd25519Body: a seed that does not derive the container's public key i
 /// -endian mpint-style with an optional leading zero byte), `string`
 /// comment, then deterministic padding.
 ///
-/// A1/yaml.md sibling finding — this is `A1/examples/ssh.md` S4+S5: `HostKey`
+/// A1 audit sibling finding — this is A1 audit S4+S5: `HostKey`
 /// already has the `.ecdsa_p256` variant and `publicBlob`/`sign` already
 /// implement it; the loader was the only gap. `example-apps/ssh-demo` grew
 /// its own copy of exactly this parser to work around it (`main.zig`'s
@@ -2000,7 +1998,7 @@ test "HostKey.fromOpenSSH rejects a key type none of the three loaders handle" {
     // `ssh-dss` (DSA) is a real OpenSSH container key-type name this module
     // has never implemented for any of the three loaders (rsa, ed25519,
     // ecdsa-p256) -- unlike `ecdsa-sha2-nistp256`, which used to be this
-    // test's example before `parseEcdsaP256OpenSSH` closed A1/examples/ssh.md
+    // test's example before `parseEcdsaP256OpenSSH` closed A1 audit
     // S4+S5 (that type now has to route to a *different* error than this
     // one, see the fixture/mutation tests above).
     const t = std.testing;
@@ -2063,7 +2061,7 @@ fn listenLoopback(io: std.Io, port_out: *u16) !std.Io.net.Server {
 /// waiting for it. A client that exits before connecting — a version that
 /// rejects one of our `-o` options, a key it declines to load, anything —
 /// leaves nobody to connect, and a bare `accept` then blocks for as long as the
-/// process lives. That is not a hypothetical: on 2026-08-15 `ssh` was the only
+/// process lives. That is not a hypothetical: `ssh` was the only
 /// module still running in every CI lane, alone for 23 to 64 minutes, and took
 /// the six-hour job limit and every other lane's verdict with it. The same
 /// tests pass locally in four seconds.
@@ -2814,7 +2812,7 @@ fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_n
     // ⭐ …AND on that client actually knowing the algorithm under test. This is
     // not defensive tidiness: `mlkem768x25519-sha256` arrived in OpenSSH 9.9,
     // this host runs 10.2p1 and the GitHub ubuntu-24.04 runner runs 9.6, so on
-    // 2026-08-15 the runner's `ssh` refused the `-o KexAlgorithms` line and
+    // The runner's `ssh` refused the `-o KexAlgorithms` line and
     // exited before opening a socket. Four sibling tests naming other KEX
     // algorithms passed on that same runner, which is what isolates the cause.
     //
@@ -3030,7 +3028,7 @@ test "live interop: OpenSSH ssh client → our server — aes128-gcm@openssh.com
     try liveOpensshClient("ed25519", "ssh-ed25519", "curve25519-sha256", "aes128-gcm@openssh.com");
 }
 
-// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+// ── whole-module mutation audit: tests for what survived ─────────
 
 test "server msgType: an empty payload is message 0" {
     try std.testing.expectEqual(@as(u8, 0), msgType(.{ .packet_length = 5, .padding_length = 4, .payload = "", .padding = "", .mac = "" }));
@@ -3678,7 +3676,7 @@ test "parseEd25519Body: a pair refused after it was derived is zeroed in `out`" 
 // Dead-stack probe of the three container parsers as entry points of their
 // own (`pub`; `stackprobe_test.zig` reaches them only through
 // `HostKey.fromOpenSSH`, whose burn covers them there). Whole-module mutation
-// audit 2026-11-18.
+// audit.
 const load_probe = struct {
     const sp = @import("testkit").stackprobe;
     const P = sp.Probe(.{ .window = 256 * 1024 });

@@ -851,7 +851,7 @@ test "live: signal TERM reaches the remote command, which reports exit-signal" {
     // `exec` so the signal hits sleep itself, not a shell waiting on it.
     // Signal only once the command is running: OpenSSH refuses a `signal`
     // request for a session with no child yet, and under load the request
-    // overtook the fork (failed once, 2026-10-10, sleep then ran its 30 s).
+    // overtook the fork (failed once, sleep then ran its 30 s).
     // Before the `exec`, TERM ends the shell, which reports TERM just the same.
     try s.exec("echo ready; exec sleep 30");
     while (std.mem.find(u8, s.stdout.items, "ready") == null) _ = try s.pumpOnce();
@@ -1246,7 +1246,7 @@ test "live: a real ssh client with the wrong one-time code is refused by our ser
 }
 
 test "live: a Session freed mid-command is closed for us; the next channel on the connection is unaffected" {
-    // Review 2026-10-06 M2: freeing a `Connection` channel used to leave it
+    // Review M2: freeing a `Connection` channel used to leave it
     // open at sshd, and its late output then failed whichever channel was
     // pumping (`error.ChannelClosed`).
     const gpa = std.testing.allocator;
@@ -1269,7 +1269,7 @@ test "live: a Session freed mid-command is closed for us; the next channel on th
 }
 
 test "live: rekey_limit_bytes = 0 re-keys after every packet instead of looping" {
-    // Review 2026-10-06 L6.
+    // Review L6.
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

@@ -238,10 +238,9 @@ pub const NameList = struct {
     }
 
     /// Iterate the comma-separated names with `next`. An empty list has zero
-    /// names (RFC 4251 §5: "zero or more names", the empty list encoded as
-    /// a zero length; Go's `parseNameList` returns none), so it yields
-    /// nothing. Before 2026-11-18 it yielded one empty name, as
-    /// `std.mem.splitScalar` does on an empty buffer.
+    /// names (RFC 4251 §5: "zero or more names", the empty list encoded as a
+    /// zero length; Go's `parseNameList` returns none), so it yields
+    /// nothing.
     pub fn iterator(self: *const NameList) std.mem.SplitIterator(u8, .scalar) {
         var it = std.mem.splitScalar(u8, self.raw, ',');
         if (self.raw.len == 0) it.index = null;
@@ -643,7 +642,7 @@ test "corpus: every readMpint seed reaches the reader, and the counts are pinned
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -653,7 +652,7 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     return &rep_result;
 }
 
-// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+// ── whole-module mutation audit: tests for what survived ─────────
 
 test "readMpint: a lone zero byte is kept, only a sign-pad before more bytes is stripped" {
     const gpa = std.testing.allocator;

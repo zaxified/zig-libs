@@ -747,7 +747,7 @@ pub const Connection = struct {
     fn unregister(self: *Connection, s: *Session) void {
         // Not closed both ways yet: send our CLOSE (best effort — deinit
         // cannot fail) and remember the id until the peer's CLOSE, so its
-        // late traffic is dropped (review 2026-10-06 M2).
+        // late traffic is dropped (review M2).
         if (!s.ch.got_close) {
             if (s.ch.open) sendCloseMsg(self.t, &s.ch) catch {};
             self.zombies.append(self.gpa, s.ch.local_id) catch {};
@@ -927,7 +927,7 @@ pub const Connection = struct {
         const originator_port = try c.uint32();
 
         // A server may open forwarded channels faster than the caller accepts
-        // them; each would buffer up to `max_output` (review 2026-10-06 M4).
+        // them; each would buffer up to `max_output` (review M4).
         if (self.forwarded.items.len >= max_unaccepted_forwards) {
             return sendOpenFailure(self.t, sender, .resource_shortage, "too many unaccepted forwarded channels");
         }
@@ -959,7 +959,8 @@ pub const ExecResult = struct {
     stderr: []u8,
     /// §6.10 exit status, if the peer reported one (OpenSSH always does for
     /// a command that ran; `null` typically means the command died on a
-    /// signal, which is reported by `exit-signal` — deferred).
+    /// signal, which the session records as `exit_signal` and this struct does
+    /// not carry).
     exit_status: ?u32,
 
     pub fn deinit(self: *ExecResult, gpa: std.mem.Allocator) void {
@@ -1121,7 +1122,7 @@ pub const CommandHandler = struct {
 /// failure message either way), but with no hook the server side has no way
 /// to know it happened — `SPEC.md` documents one session channel per
 /// connection as this module's deliberate scope, but not that refusing a
-/// second one is otherwise silent server-side (A1/examples/ssh.md S3a).
+/// second one is otherwise silent server-side (A1 audit S3a).
 /// `ctx` is the caller's own state, same idiom as `CommandHandler` above.
 ///
 /// ⚠ `kind` and `description` are borrowed for the duration of the call —
@@ -1176,7 +1177,7 @@ pub const ServeConfig = struct {
     /// is refused with `resource_shortage`. `serveSession` serves one.
     max_sessions: u32 = 8,
     /// Restricts which subsystem NAMES `subsystem` is offered for
-    /// (A1/examples/ssh.md S3b). Today's request dispatch below only looks
+    /// (A1 audit S3b). Today's request dispatch below only looks
     /// at the request TYPE ("exec" vs "subsystem") — once `subsystem` is
     /// set at all, ANY name gets SSH_MSG_CHANNEL_SUCCESS and then runs the
     /// same handler, because there was nowhere to check the name before
@@ -1193,7 +1194,7 @@ pub const ServeConfig = struct {
     /// name. This does not give different names different handlers (that
     /// needs `subsystem`'s type to become a list of `{name, handler}`
     /// pairs, a breaking change to the existing field — see
-    /// `A1/examples/ssh.md`'s Dispozice for that variant and its cost); it
+    /// the A1 audit's disposition for that variant and its cost); it
     /// only lets a single-subsystem server reject names it was never going
     /// to serve, before pretending otherwise.
     subsystem_names: []const []const u8 = &.{},
@@ -1411,7 +1412,7 @@ const Server = struct {
     /// RFC 4254 §5.3: once our CLOSE is out, the peer may still send for
     /// the channel until it has seen it (a `window-change`, trailing data).
     /// Those are dropped — we may send nothing more on it — and only its
-    /// CLOSE still counts (review 2026-10-06 M1: they used to end the whole
+    /// CLOSE still counts (review M1: they used to end the whole
     /// connection with `error.ChannelClosed`).
     fn closingByUs(sc: *const ServerChannel) bool {
         return sc.ch.sent_close and !sc.ch.got_close;
@@ -1473,7 +1474,7 @@ const Server = struct {
                 } };
                 // Owned by `channels` from here on (`deinit` frees it): no
                 // errdefer past this line, or a failed send below would
-                // free it twice (review 2026-10-06 H1).
+                // free it twice (review H1).
                 srv.channels.appendAssumeCapacity(sc);
                 srv.next_id +%= 1;
                 srv.served_one = true;
@@ -1497,7 +1498,7 @@ const Server = struct {
                 const data = try c.string();
                 try sc.ch.acceptData(data.len);
                 // `.ignore`: the handler never sees stdin, so none is kept
-                // (review 2026-10-06 L3); the window is still accounted.
+                // (review L3); the window is still accounted.
                 if (srv.config.stdin_mode == .collect_until_eof) {
                     if (sc.stdin.items.len + data.len > srv.config.max_input) return error.OutputTooLarge;
                     try sc.stdin.appendSlice(srv.gpa, data);
@@ -1913,7 +1914,7 @@ fn testListenLoopback(io: std.Io, port_out: *u16) !std.Io.net.Server {
 /// full account. Short version: the live tests spawn a real `/usr/bin/ssh` and
 /// then block waiting for it to connect, and a client that exits first leaves
 /// the accept blocked for the life of the process. That is what wedged every
-/// CI lane on 2026-08-15 into the six-hour job limit.
+/// CI lane into the six-hour job limit.
 ///
 /// ⛔ Not `SO_RCVTIMEO`: `std.Io.Threaded` panics on the `EAGAIN` it produces
 /// ("programmer bug caused syscall error: AGAIN"). `poll(2)` on the raw handle
@@ -3089,7 +3090,7 @@ test "serveSession REJECT: a non-session channel type gets OPEN_FAILURE, not a c
     );
 }
 
-/// A1/examples/ssh.md S3a: `serveSession` used to refuse a second/wrong-type
+/// A1 audit S3a: `serveSession` used to refuse a second/wrong-type
 /// channel with no server-side seam at all — only the wire-level
 /// OPEN_FAILURE the test above already checks. Records what
 /// `on_channel_open_refused` was called with, for the regression test below.
@@ -3314,7 +3315,7 @@ test "serveSession: subsystem_names rejects a name not on the list before CHANNE
 }
 
 test "serveSession: messages the client sends after our CLOSE are dropped, not a connection error (RFC 4254 §5.3)" {
-    // Review 2026-10-06 M1. The handler runs at once (`.ignore`), so our
+    // Review M1. The handler runs at once (`.ignore`), so our
     // exit-status/EOF/CLOSE go out right after the exec; the client — which
     // has not seen them yet — still sends a window-change, data and EOF,
     // then its CLOSE. All but the CLOSE must be dropped silently.
@@ -3353,7 +3354,7 @@ test "serveSession: messages the client sends after our CLOSE are dropped, not a
     try t.expectEqual(@as(u8, @backingInt(messages.MessageType.SSH_MSG_CHANNEL_CLOSE)), last);
 }
 
-// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+// ── whole-module mutation audit: tests for what survived ─────────
 
 fn countPackets(wire: []const u8, msg: u8, sizes: ?*std.ArrayList(usize), gpa: std.mem.Allocator) !usize {
     var r: std.Io.Reader = .fixed(wire);
@@ -3927,7 +3928,7 @@ test "server channels: nothing is answered after our CLOSE; stdin collection is 
     }
 }
 
-// ── whole-module mutation audit, second pass (2026-11-18) ─────────────────
+// ── whole-module mutation audit, second pass ─────────────────
 
 test "Connection: dropping a confirmed channel sends our CLOSE to the peer's id" {
     const t = std.testing;

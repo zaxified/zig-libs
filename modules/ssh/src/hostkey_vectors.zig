@@ -70,7 +70,7 @@ pub const ecdsa_p256_pub_b64 =
     "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCFDhy8iluimUa9wVoExb+NF" ++
     "52Q8aoDvzzHiwfpm5MGvnRwHOk7pL0RzHEllFDUQIb9o8+0BedHq7ZFG/zsIqVY=";
 
-// Passphrase-protected fixtures (2026-10-09), for the encrypted-container
+// Passphrase-protected fixtures, for the encrypted-container
 // loaders. Recipe (OpenSSH 10.2p1; 4 bcrypt rounds so a test run stays fast):
 //   ssh-keygen -t ed25519 -a 4 -N 'zig-libs test passphrase' -C enc-ed25519 -f k_ed_ctr
 //   ssh-keygen -t ecdsa -b 256 -a 4 -N 'zig-libs test passphrase' -C enc-ecdsa -f k_ec_ctr

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver over ssh's `testing.fuzz` harnesses (added
-//! 2026-10-09). The harness bodies stay in the files whose private items they
+//! Deterministic fuzz driver over ssh's `testing.fuzz` harnesses. The harness bodies stay in the files whose private items they
 //! drive (`messages.zig`, `transport.zig`, `connection.zig`, `userauth.zig`),
 //! now generic over their source of choices (`fn(comptime S, *S, gpa)`), and
 //! each file carries its own driver test and in-suite reach test. This file
@@ -362,7 +361,7 @@ test "fuzz harness: 300 key-loading seeds in every test run, and they get everyw
 }
 
 test "HostKey.fromOpenSSH: an RSA container whose public e disagrees with the secret key is refused" {
-    // Regression (SSH_FUZZ `ssh-keyload` seed 56422, 2026-10-09): only n was
+    // Regression (SSH_FUZZ `ssh-keyload` seed 56422): only n was
     // cross-checked, so a public blob with e = 0x018101 instead of 65537
     // loaded as a host key whose own signatures do not verify under it.
     var bin_buf: [8192]u8 = undefined;

@@ -7,25 +7,22 @@
 //!   targets: dh | ffpow | ecdh | gex | pem | pemstd
 //!
 //! * `dh` — taints the DH secret `x` and computes `e = g^x` and `K = f^x` in
-//!   both groups through `dhPowModPrime` (montint `powMont`). Until
-//!   2026-10-02 that function used `std.crypto.ff`'s `powWithEncodedExponent`,
-//!   whose window select LLVM compiles to a conditional jump in ReleaseFast
-//!   (found by threshold_ecdsa's `fac` target, objdump-confirmed).
+//!   both groups through `dhPowModPrime` (montint `powMont`).
 //! * `ffpow` — the POSITIVE CONTROL: the same `K = f^x` through ff's pow, the
 //!   code `dh` replaced. Its row must stay non-zero in `ff.zig`; if it ever
 //!   reads zero, either std fixed its pow or this instrument stopped seeing
 //!   the leak, and the `dh` zero means nothing until it is understood.
-//! * `ecdh` — `ecdh-sha2-nistp256` / `-nistp384` (2026-10-10): taints the
+//! * `ecdh` — `ecdh-sha2-nistp256` / `-nistp384`: taints the
 //!   ephemeral scalar and runs our key-pair construction (`fromScalar`), the
 //!   shared secret against a peer point (`ecdhNistShared`, std's `mul`) and
 //!   `K`'s encoding plus the exchange hash (`ecdhNistFinish`). `fromScalar`'s
-//!   zero-test verdict is declassified at its source (2026-11-18): while it
+//!   zero-test verdict is declassified at its source: while it
 //!   was counted, an early-exit zero test moved that one context from the
 //!   `if` to the loop and the row read the same (mutation audit, c1).
-//! * `gex` — `diffie-hellman-group-exchange-sha256` client (2026-10-10): the
+//! * `gex` — `diffie-hellman-group-exchange-sha256` client: the
 //!   exponent `x` through `gexPow` on montint's run-time modulus (`DynModint`,
 //!   the server-chosen prime), for the group14 and group16 primes.
-//! * `pem` — `HostKey.fromOpenSSH` on the ed25519 fixture (2026-10-18) with
+//! * `pem` — `HostKey.fromOpenSSH` on the ed25519 fixture with
 //!   the base64 characters that carry only bits of the 32-byte secret seed
 //!   tainted (the edge characters it shares with the length before it and the
 //!   public-key copy after it are not): the PEM decoder's END search and
@@ -33,7 +30,7 @@
 //!   re-derivation (std re-derives only under runtime safety, so not in the
 //!   ReleaseFast build measured here). Witness: the loaded seed.
 //! * `pemstd` — the POSITIVE CONTROL for `pem`: the same tainted text through
-//!   the decoder `pemDecodeOpensshBlock` used until 2026-10-18
+//!   the decoder `pemDecodeOpensshBlock` used earlier
 //!   (`std.mem.findPos` = Boyer-Moore-Horspool for the END line,
 //!   `std.base64.standard.Decoder`; its whitespace branch is left out, see
 //!   `pem`). Its row must stay non-zero in the `std.mem` and `std.base64` sources.
@@ -195,8 +192,7 @@ fn pem(control: bool, t: Taint) !void {
     // Base64 characters [first, last) carry ONLY the seed's bits. The (at
     // most two) edge characters that share bits with the private string's
     // length and the public-key copy stay untainted: tainting them taints that
-    // length, and every layout decision after it reads as a finding (measured
-    // 2026-10-18: 11 contexts, all string/padding bounds on the 0x40 length).
+    // length, and every layout decision after it reads as a finding (measured: 11 contexts, all string/padding bounds on the 0x40 length).
     const first = (seed_off * 8 + 5) / 6;
     const last = (seed_off + 32) * 8 / 6;
     if (t == .yes) {
@@ -214,7 +210,7 @@ fn pem(control: bool, t: Taint) !void {
         std.debug.print("seed_chars={d} ctgrind_result={x}\n", .{ last - first, out.ed25519.secret_key.seed() });
         return;
     }
-    // The pre-2026-10-18 decoder: the BMH END search over the tainted text,
+    // The earlier decoder: the BMH END search over the tainted text,
     // then std's table decoder over the stripped copy (stripped from the
     // untainted text above, then tainted the same way). Its per-character
     // whitespace branch is not reproduced: whether a key character is

@@ -352,7 +352,7 @@ fn decodeB64(buf: []u8, text: []const u8) []u8 {
 }
 
 /// Fingerprints printed by OpenSSH 10.2's `ssh-keygen -lf` (`-E sha256` and
-/// `-E md5`) for the fixture keys of `hostkey_vectors.zig`, 2026-10-10.
+/// `-E md5`) for the fixture keys of `hostkey_vectors.zig`.
 const fingerprint_vectors = [_]struct { b64: []const u8, kind: KeyType, sha256: []const u8, md5: []const u8 }{
     .{ .b64 = hv.ed25519_pub_b64, .kind = .ed25519, .sha256 = "SHA256:iL8zJBKxvwD8D8mh37xpHo+AJmjAkl0P7cxIPSRvS/k", .md5 = "5b:75:48:da:48:9f:5d:97:fa:e8:7b:b6:06:f5:8b:70" },
     .{ .b64 = hv.rsa_pub_b64, .kind = .rsa, .sha256 = "SHA256:JFma1K0t5v4k6tBK/MtiIddBR3ENmI9L6ruNbfLCWT8", .md5 = "da:e9:88:ae:04:26:c3:66:38:6b:f8:b5:c5:bb:99:cf" },
@@ -519,7 +519,7 @@ test "AuthorizedKeysIterator skips what sshd skips and findAuthorizedKey matches
     try t.expect(findAuthorizedKey(text, decodeB64(&other, hv.ecdsa_p384_pub_b64), &buf) == null);
 }
 
-// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+// ── whole-module mutation audit: tests for what survived ─────────
 
 test "PublicKey.parse: an ed25519 key of 31 or 33 bytes is InvalidKey" {
     var b: [64]u8 = undefined;

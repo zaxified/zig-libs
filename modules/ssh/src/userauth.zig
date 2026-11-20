@@ -18,7 +18,7 @@
 //!     `KbdPrompter`; the fixed one-round `KbdInteractiveCheck` stays),
 //!   - SSH_MSG_USERAUTH_FAILURE / _SUCCESS / _BANNER (the banner reaching the
 //!     caller through `BannerHandler`, not dropped),
-//!   - auth orchestration in Go `x/crypto/ssh`'s shape (2026-11-15): client
+//!   - auth orchestration in Go `x/crypto/ssh`'s shape: client
 //!     `authenticateWith` (the `none` probe, the server's method list, the
 //!     caller's method order, several keys, partial success, retryable
 //!     methods); server `AuthConfig.callbacks` returning a `Decision`
@@ -413,7 +413,7 @@ fn pkOkNamesKey(body: []const u8, blob: []const u8) bool {
 /// The rsa-sha2 hash `key` signs with, chosen against the server's RFC 8308
 /// §3.1 `server-sig-algs` instead of blindly (`null`: the key's own). A hash,
 /// not a re-tagged copy of the key: a copy put the whole private key in this
-/// frame (2026-10-09).
+/// frame.
 ///
 /// Only the `ssh-rsa` variant can differ from `key` itself: `ssh-ed25519` and
 /// `ecdsa-sha2-nistp256` each have exactly one signature algorithm name,
@@ -1067,7 +1067,7 @@ pub const AuthFailure = enum {
 
 /// Called synchronously, once, every time `serveUserauth` rejects a
 /// credential — i.e. every time `AuthConfig.failure` would be written, not
-/// just the last one before the call ultimately returns (A1/examples/ssh.md
+/// just the last one before the call ultimately returns (A1 audit
 /// S2). Optional (`AuthConfig.on_rejected`, default `null`, no behavior
 /// change without it).
 ///
@@ -1374,7 +1374,7 @@ pub const AuthConfig = struct {
     /// `error.AuthenticationFailed` specifically — a peer that simply closes
     /// the connection after one rejected credential makes this return
     /// `error.EndOfStream` instead, and `failure` already holds the right
-    /// answer even then (A1/examples/ssh.md S2). If you need to tell "holds
+    /// answer even then (A1 audit S2). If you need to tell "holds
     /// a real answer" apart from "never touched" without tracking that
     /// yourself, use `on_rejected` below instead of this field.
     failure: ?*AuthFailure = null,
@@ -1638,7 +1638,7 @@ const Step = union(enum) {
 /// `serveUserauth`'s keyboard-interactive hooks (`KbdCallback.decideFn`,
 /// `KbdInteractiveCheck.checkFn`): the answers live in their frames, and a
 /// round's `sendPacket`/`recvPacket` runs under the same burn. Not measured;
-/// the record burn plus the password burn, doubled (2026-11-15). Kept here,
+/// the record burn plus the password burn, doubled. Kept here,
 /// not in `burn.zig`, whose digest pins ctgrind's `pem` row.
 const kbd_burn = 64 * 1024;
 
@@ -1966,7 +1966,7 @@ const UserauthCorpus = struct {
         // The single `0x00` payload the target replayed on every round.
         self.push(&.{&[_]u8{0}});
         self.push(&.{});
-        // 2026-11-15, auth orchestration. Server side: a password the
+        //, auth orchestration. Server side: a password the
         // policy calls a partial success, then two keyboard-interactive
         // rounds (`FuzzPolicy`); and `none` for the one user the
         // `no_client_auth` callback admits.
@@ -2073,9 +2073,9 @@ fn serveUserauthHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
 }
 
 /// The fuzz targets' server policy: every key and every password but one
-/// accepted (as before 2026-11-15); the password "partial" is a partial
-/// success that continues with two keyboard-interactive rounds ("a", "b");
-/// `none` admits the user "guest".
+/// accepted; the password "partial" is a partial success that continues
+/// with two keyboard-interactive rounds ("a", "b"); `none` admits the user
+/// "guest".
 const FuzzPolicy = struct {
     next: AuthCallbacks = .{},
 
@@ -2470,7 +2470,7 @@ test "the userauth policy hooks carry the caller's own context" {
 /// same contract as `RejectionHandler`'s own doc comment states — copied
 /// into a fixed buffer here rather than stored as a slice, the same fix
 /// `connection.zig`'s `RefusalRecorder` needed for `ChannelOpenRejectedHandler`
-/// (A1/examples/ssh.md S3a) after the first version of that test segfaulted.
+/// (A1 audit S3a) after the first version of that test segfaulted.
 const RejectionRecorder = struct {
     calls: usize = 0,
     user_buf: [64]u8 = undefined,
@@ -3208,7 +3208,7 @@ test "parseMethodList: known names only, unknown and empty ignored" {
     for (std.enums.values(AuthMethod)) |m| try t.expectEqual(@as(?AuthMethod, m), AuthMethod.fromWire(m.wireName()));
 }
 
-// ── review fixes 2026-11-15 ────────────────────────────────────────────────
+// ── review fixes ────────────────────────────────────────────────
 
 test "authenticateWith: a declined prompt or responder is not asked again by retryable, and nothing is sent" {
     const t = std.testing;
@@ -3293,7 +3293,7 @@ const KeyThenPassword = struct {
 };
 
 test "serveUserauth: hooks and callbacks never mix, so a chain cannot be skipped" {
-    // Review 2026-11-15: `callbacks.publickey` → partial → password, plus a
+    // Review: `callbacks.publickey` → partial → password, plus a
     // `password` hook, made the hook active in step 1 — the password alone
     // logged in.
     const t = std.testing;
@@ -3339,7 +3339,7 @@ test "serveUserauth: the request that abandoned keyboard-interactive is dropped 
     try t.expectEqual(@as(usize, 0), accepting.calls);
 }
 
-// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+// ── whole-module mutation audit: tests for what survived ─────────
 
 test "userauth msgType: an empty payload is message 0" {
     try std.testing.expectEqual(@as(u8, 0), msgType(.{ .packet_length = 5, .padding_length = 4, .payload = "", .padding = "", .mac = "" }));
@@ -4009,9 +4009,6 @@ test "serveUserauth publickey: key blob and signature length bounds" {
 }
 
 test "serveUserauth: a banner over max_sent_banner_len is refused before anything is sent" {
-    // Before 2026-11-18 the bound was `max_banner_len` (8 KiB), which the
-    // 8 KiB packet frame cannot carry: 8099..8192 bytes passed the check and
-    // failed in `writePacket` (PacketTooLarge).
     const t = std.testing;
     const long: [max_banner_len + 1]u8 = @splat('b');
     var m: [1]Msg = undefined;
@@ -4100,7 +4097,7 @@ test "client userauth: the password and a keyboard-interactive answer do not sur
 }
 
 // ── dead-stack probes for the two userauth secrets without a key-path probe
-// (whole-module mutation audit 2026-11-18): the server's keyboard-interactive
+// (whole-module mutation audit): the server's keyboard-interactive
 // answers (`kbd_burn`) and the client's prompted password (`runMethod`'s
 // stack buffer). Needles only: neither entry point burns as a whole.
 

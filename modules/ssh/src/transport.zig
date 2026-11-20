@@ -334,7 +334,7 @@ pub const KexRound = enum { initial, rekey };
 pub fn offeredKexAlgorithms(out: *[offered_kex_len][]const u8, methods: []const []const u8, role: enum { client, server }, round: KexRound) []const []const u8 {
     // `usize`, not inferred: `@min` with a comptime-known bound narrows its
     // result to the smallest type holding it (`u3` for 7 methods), and the
-    // `n + 1` below then overflowed the day the list reached 7 (2026-10-10).
+    // `n + 1` below then overflowed the day the list reached 7.
     const n: usize = @min(methods.len, supported_kex_algorithms.len);
     @memcpy(out[0..n], methods[0..n]);
     if (round == .rekey) return out[0..n];
@@ -1787,7 +1787,7 @@ pub fn EcdhNistKeyPair(comptime c: EcdhNist) type {
         /// The pair for `candidate`, or null when it is not a canonical
         /// nonzero scalar (the caller draws again). Only that one bit is
         /// branched on: the zero test ORs every byte, and only its verdict is
-        /// declassified for ctgrind (`ctgrind_harness.zig`'s `ecdh`, 2026-11-18).
+        /// declassified for ctgrind (`ctgrind_harness.zig`'s `ecdh`).
         pub fn fromScalar(candidate: [c.len()]u8) ?@This() {
             const C = c.Curve();
             C.scalar.rejectNonCanonical(candidate, .big) catch return null;
@@ -2058,7 +2058,7 @@ pub fn hashStringH(comptime H: type, sh: *H, data: []const u8) void {
 ///
 /// montint's `powMont` (fixed 5-bit windows, branchless table gather), with
 /// the exponent loaded by a branchless limb loader. NOT `std.crypto.ff`'s
-/// `powWithEncodedExponent`: measured 2026-10-02 (threshold_ecdsa ctgrind,
+/// `powWithEncodedExponent`: measured (threshold_ecdsa ctgrind,
 /// objdump), LLVM compiles its constant-time window select to a conditional
 /// jump in ReleaseFast, so the DH secret's 4-bit windows leaked here.
 pub fn dhPowModPrime(prime_be: []const u8, base_be: []const u8, exp_be: []const u8, out: []u8) TransportError![]const u8 {
@@ -3055,7 +3055,7 @@ pub const Transport = struct {
     /// `deinit`; calling it is always safe.
     pub fn deinit(t: *Transport) void {
         // The traffic keys and the session id outlive nothing the caller
-        // needs (review 2026-10-06 L7).
+        // needs (review L7).
         std.crypto.secureZero(u8, std.mem.asBytes(&t.read_cipher));
         std.crypto.secureZero(u8, std.mem.asBytes(&t.write_cipher));
         t.read_cipher = .plaintext;
@@ -3176,7 +3176,7 @@ pub const Transport = struct {
 
         // Channel data may arrive here (to be queued) in packets as large as
         // the caller let the peer send — more than the 64 KiB a key-exchange
-        // packet needs (review 2026-10-06 L1).
+        // packet needs (review L1).
         const scratch = try gpa.alloc(u8, rekey_scratch_len);
         defer gpa.free(scratch);
         while (true) {
@@ -3214,7 +3214,7 @@ pub const Transport = struct {
     fn wantsRekey(t: *const Transport) bool {
         // `packets_since_kex > 0`: a limit of 0 means "after every packet",
         // not "again right after the exchange that just finished" (review
-        // 2026-10-06 L6: that looped for ever).
+        // L6: that looped for ever).
         return t.kex_count > 0 and !t.in_kex and t.gpa != null and t.packets_since_kex > 0 and
             (t.bytes_since_kex >= t.rekey_limit_bytes or t.packets_since_kex >= t.rekey_limit_packets);
     }
@@ -3589,7 +3589,7 @@ pub fn connectInto(
 /// ctgrind does not count the branch on it. A no-op outside a `-fvalgrind`
 /// build. Only the bool is declassified, never the bytes it was computed
 /// from: a branch on those (an early-exit zero test, say) stays visible
-/// (whole-module mutation audit 2026-11-18: before this, such an early exit
+/// (whole-module mutation audit: before this, such an early exit
 /// moved the one counted context instead of adding one, and the `ecdh` row
 /// could not tell).
 fn declassified(verdict: bool) bool {
@@ -5728,7 +5728,7 @@ test "a client re-exchange refuses a host key other than the one the first excha
     try t.expectEqual(HostKeyVerdict{ .reject = .key_mismatch }, other);
 }
 
-// ── whole-module mutation audit 2026-11-18: tests for what survived ─────────
+// ── whole-module mutation audit: tests for what survived ─────────
 
 test "exchangeVersions: 63 pre-banner lines then the version is accepted, 64 are refused" {
     // RFC 4253 §4.2 lets a server send other lines first; the loop bounds
@@ -6771,7 +6771,7 @@ test "rekey: what a re-exchange queues is bounded at max_pending_bytes and max_p
 }
 
 // Dead-stack probes of two transport entry points no key-exchange probe
-// reaches with a secret (whole-module mutation audit 2026-11-18): the
+// reaches with a secret (whole-module mutation audit): the
 // handshake sends only plaintext packets (so `writePacket` never encrypts
 // under a probe there), and it derives through `buildCipher`, not the public
 // `deriveKeys`.

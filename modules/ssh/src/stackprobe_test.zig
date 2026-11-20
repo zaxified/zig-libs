@@ -227,7 +227,7 @@ inline fn scrubCalleeSaved() void {
 }
 
 /// `inline`: as its own frame it ran the call deeper than the region top
-/// `runProbe` computed (acme, 2026-10-08).
+/// `runProbe` computed (acme).
 inline fn measure(call: *const fn () void, n: *const Needles) Hits {
     scrubCalleeSaved();
     paint();
@@ -420,7 +420,7 @@ noinline fn callFromOpenSSH() void {
     std.mem.doNotOptimizeAway(&hk_sink);
 }
 
-/// The passphrase-protected path (2026-10-09): bcrypt_pbkdf, the AES key
+/// The passphrase-protected path: bcrypt_pbkdf, the AES key
 /// schedule and the decrypted private section all pass through the stack.
 noinline fn callFromOpenSSHEncrypted() void {
     HostKey.fromOpenSSH(&hk_sink, cur_text, vectors.enc_passphrase) catch unreachable;
@@ -638,7 +638,7 @@ test "STACKPROBE: no key, nonce or CRT residue on the dead stack after host-key 
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Key exchange (added 2026-10-09). One KEX per method and role, each against
+// Key exchange. One KEX per method and role, each against
 // a peer thread over a socketpair, plus a full handshake per role (KEX + key
 // derivation + cipher install). The measured side draws its entropy from a
 // recording `Io`, so the needles are exactly its ephemeral secrets: the
@@ -660,7 +660,7 @@ const KexResult = transport.KexResult;
 /// into the caller's buffer: the generator's state lives only in this frame,
 /// deep inside the measured call. (A `std.Random.ChaCha` reset per call left
 /// its by-value init temporary — keystream included, i.e. the very draws —
-/// in the instrument's own frame above the burn: 2026-10-09, read as residue
+/// in the instrument's own frame above the burn:, read as residue
 /// until the stack dump showed whose frame it was.)
 const Recorder = struct {
     seed: u8,
@@ -733,8 +733,6 @@ fn kexName(k: Kex) []const u8 {
 }
 
 // ── API adapter: the only place that names the shapes under test ────────────
-// (BEFORE the 2026-10-09 fix the methods returned `KexResult` by value:
-// `out.* = try transport.curve25519Kex(r, w, …)`.)
 
 fn apiKex(k: Kex, role: Role, r: *std.Io.Reader, w: *std.Io.Writer, ent: transport.Entropy, gpa: std.mem.Allocator, out: *KexResult) !void {
     var none: transport.CipherState = .plaintext;
