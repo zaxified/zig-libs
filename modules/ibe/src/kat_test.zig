@@ -805,10 +805,10 @@ test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinn
         _ = testDecrypt(ibe.Default, f.d_id, ct) catch continue;
         decrypted += 1;
     }
-    // Measured 2026-09-07. Before: 1 round, 1 input, 0 octets corrupted,
+    // Measured. Before: 1 round, 1 input, 0 octets corrupted,
     // 1 decryption of the pristine ciphertext and 0 refusals of any kind.
     try std.testing.expectEqual(@as(usize, 7), nonempty); // the deliberate empty seed is the eighth
-    // Seed 2 joined the decode refusals 2026-10-03: its damaged `U` is on the
+    // Seed 2 joined the decode refusals: its damaged `U` is on the
     // twist but outside G2, which the checked decoder now refuses (before,
     // it reached `decrypt` and failed the FO check there).
     try std.testing.expectEqual(@as(u8, 0b1100_1110), refused_mask);

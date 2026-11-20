@@ -23,7 +23,7 @@
 //!
 //! ## Why three targets, and why they are NOT symmetric
 //!
-//! A prior triage pass (the 2026-09-01 audit ctgrind triage notes)
+//! A prior triage pass (the audit ctgrind triage notes)
 //! looked at `ibe`'s three secret-consuming entry points and reached a
 //! per-entry-point, not per-module, verdict:
 //!
@@ -125,7 +125,7 @@
 //!
 //! ## Expected inherited substrate (read before treating a nonzero as new)
 //!
-//! `bls12_381`'s own harness (measured 2026-09-08) found that
+//! `bls12_381`'s own harness found that
 //! `G1.Jacobian.scalarMul`/`G2.Jacobian.scalarMul` are the SAME code
 //! `.extract` drives here, and separately that `std.crypto.ff`'s
 //! `Uint.toBytes` (`ff.zig:150`) branches on an overflow check reached by

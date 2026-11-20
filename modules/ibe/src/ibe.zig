@@ -397,7 +397,7 @@ pub fn Scheme(comptime cs: type) type {
             }
 
             /// Inverse of `toBytes`. `g2.fromBytesCompressed` refuses a `U`
-            /// outside `G2` (since 2026-10-03), so the pairing in `decrypt`
+            /// outside `G2`, so the pairing in `decrypt`
             /// never runs on a torsion point; `decrypt`'s own consistency
             /// check (`U == r*gen`) stays the scheme-specific guard. REAL.
             pub fn fromBytes(bytes: [encoded_bytes]u8) g2.G2Error!@This() {
