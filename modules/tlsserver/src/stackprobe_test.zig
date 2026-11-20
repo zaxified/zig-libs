@@ -104,7 +104,7 @@ const keys = @import("keys.zig");
 const key_vectors = @import("key_vectors.zig");
 
 var heap_buf: [256 * 1024]u8 = undefined; // an expanded ML-DSA-87 key is ~110 KiB
-/// Past the deepest `burn.mldsa_key_burn` (1.25 MiB) and the burn's own frame.
+/// Past the deepest `burn.mldsa_key_burn` (0.77 MiB) and the burn's own frame.
 const PKey = sp.Probe(.{ .window = 1536 * 1024 });
 var pair: keys.CertKeyPair = undefined;
 var nd_s1: [8192]u8 = undefined;

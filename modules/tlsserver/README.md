@@ -77,7 +77,7 @@ The record layer alone (`tlsserver.record.Protection`: `init` from a traffic sec
 A failed `open` (`BadRecordMac`, …) leaves the sequence number unchanged and the ciphertext
 zeroed; the engine answers it with the matching alert.
 
-**Stack:** `fromPem` wants ~110 KiB (more for RSA, up to 1.3 MiB for ML-DSA keys) and a handshake
+**Stack:** `fromPem` wants ~110 KiB (more for RSA, up to 0.8 MiB for ML-DSA keys) and a handshake
 with ML-KEM-1024 or an ML-DSA-87 signature up to 256 / 352 KiB under the zeroing burns, so size a
 small-stack thread or fiber for the keys and groups it enables (`SPEC.md` § Limits and refusals).
 

@@ -670,7 +670,7 @@ The receive side's refusals are the table under *Wire format*. Record protection
   CertificateRequest over its 2^16-1 octets of extensions, `Quic.transport_parameters` over 2^16-1, a `fixed`
   certificate `CertifiedKey.check` refuses (stale RFC 8879 copies included) and ECH keys `Ech.check` refuses. `init` stays
   infallible and does not call it; a `select` callback's keys are checked per handshake.
-- **Stack.** `fromPem` wants ~110 KiB of stack (more for RSA; up to 1.3 MiB for ML-DSA, `burn.mldsa_key_burn`). A handshake
+- **Stack.** `fromPem` wants ~110 KiB of stack (more for RSA; up to 0.8 MiB for ML-DSA, `burn.mldsa_key_burn`). A handshake
   signs and exchanges under `tls13`'s burns: up to 352 KiB for an ML-DSA-87 signature and 256 KiB for ML-KEM-1024 (ReleaseFast
   depths ×1.3; Debug frames are larger), so a small-stack worker or fiber must be sized for the keys and groups it enables.
   The `CertKeyPair` must not move after `certifiedKey()`.
@@ -927,7 +927,9 @@ Test classes, by area:
   guard that a mutant showed unguarded. Fixtures for client chains and certificates: `src/client_chain_certs.zig`,
   `src/client_certs.zig`, `src/test_certs.zig` (producers in `tools/`).
 - **Dead stack** (`src/stackprobe_test.zig`, `src/interop_replay_test.zig`, ReleaseFast): the burns of `Protection`, `fromPem`,
-  `Server.deserialize`, `ech.openFirst` and the handshake steps leave no secret residue.
+  `Server.deserialize`, `ech.openFirst` and the handshake steps leave no secret residue; the two ML-DSA key burns (expansion,
+  key-to-leaf check) are probed apart in `src/keys.zig`, each body's depth under its burn, since in `fromPem` the second
+  zeroes what the first leaves.
 - **Fuzz:** the harnesses of *Fuzzing*; each runs a short fixed seed set in every test lane.
 - **ctgrind:** `src/ctgrind_harness.zig` through `scripts/checks/ctgrind.sh tlsserver`, rows `hs`, `app`, `ticket` and `ech`;
   counts and digests are pinned in `scripts/checks/ctgrind-expected.tsv`.
@@ -1000,9 +1002,6 @@ records (the per-record 4 KiB burn).
   buffer, `Connection.reader()`/`writer()` in place, `Server.writeSlot`/`commitWrite`, rekey bound
   `max_records_per_key`); the run itself — same traffic through the fork and through this server, outputs and
   throughput compared — has not been done.
-- **`burn.zig` ML-DSA-65 size.** `burn.zig` says ML-DSA-65 expansion reaches 553 KiB, yet with `mlDsaExpand`'s burn removed the
-  `fromPem` probe stays green: re-measure the burn sizes. A probe that can see those frames would decide the burn mutants that
-  are unobservable today.
 - **JA4 differential check** against Wireshark's JA4 field (`tshark` is not installed on the development host).
 
 ## Open

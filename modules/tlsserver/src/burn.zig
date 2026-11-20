@@ -63,7 +63,11 @@ pub const handshake_burn = 16 * 1024;
 /// and PKCS#8 alike); an RSA key's parse burns its own 200 KiB below.
 pub const key_burn = 64 * 1024;
 /// `keys` on an ML-DSA key, per parameter set: std builds the expanded key
-/// and the public key with its matrix A by value, and copies them. The
-/// deepest `fromPem` reached in ReleaseFast (stack probe, 2026-10-21):
-/// ML-DSA-44 350.5 KiB, ML-DSA-65 553.6 KiB, ML-DSA-87 998.6 KiB; ~1.25x.
-pub const mldsa_key_burn = .{ .mldsa44 = 448 * 1024, .mldsa65 = 704 * 1024, .mldsa87 = 1280 * 1024 };
+/// and the public key with its matrix A by value, and copies them. Two
+/// bodies run under it at the same depth, the expansion (`mlDsaExpand`) and
+/// the key-to-leaf check (`mlDsaMatches`), each with its own burn; measured
+/// apart in ReleaseFast (`keys.zig`'s ML-DSA stack probe, 2026-11-21, the
+/// `both` form): expansion 256.6 / 370.6 / 609.6 KiB, leaf check 195.1 /
+/// 318.2 / 539.4 KiB (ML-DSA-44 / 65 / 87); ~1.3x the deeper. (The figures
+/// of 2026-10-21, 350.5 / 553.6 / 998.6 KiB, were `fromPem` as a whole.)
+pub const mldsa_key_burn = .{ .mldsa44 = 336 * 1024, .mldsa65 = 480 * 1024, .mldsa87 = 784 * 1024 };

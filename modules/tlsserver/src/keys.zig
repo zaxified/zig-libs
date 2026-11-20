@@ -99,7 +99,7 @@ pub const CertKeyPair = struct {
     /// no-op free of empty slices). Runs under a dead-stack burn
     /// (`burn.key_burn`): needs ~110 KiB of stack, more for an RSA key
     /// (`rsa` burns 200 KiB of its own) and much more for an ML-DSA one
-    /// (`burn.mldsa_key_burn`: up to 1.3 MiB for ML-DSA-87) — call it from
+    /// (`burn.mldsa_key_burn`: up to 0.8 MiB for ML-DSA-87) — call it from
     /// a thread with a normal-sized stack, not a small pool worker.
     pub fn fromPem(out: *CertKeyPair, gpa: std.mem.Allocator, chain_pem: []const u8, key_pem: []const u8) Error!void {
         return burn.run(burn.key_burn, Error!void, fromPemBody, .{ out, gpa, chain_pem, key_pem });
@@ -940,4 +940,66 @@ test "wave 5: an EC leaf without named-curve parameters is a KeyMismatch, not a 
     try testing.expect(spki.algorithmIs(&x509.safe.oid_ec_public_key));
     try testing.expect(spki.namedCurveOid() == null);
     try testing.expectError(error.KeyMismatch, ecMatches(E, &x509.safe.oid_prime256v1, &sk, spki));
+}
+
+test "STACKPROBE: each ML-DSA burn covers its own body (the expansion and the leaf check apart)" {
+    // `fromPem`'s probe sees only the sum: the leaf check's burn runs at the
+    // expansion's depth and zeroes what an expansion without its burn left
+    // (mutation 2026-11-15). Here each body is measured unburned (its dirty
+    // depth must be under its burn) and each burned call site is probed
+    // alone (no residue, no needle).
+    const sp = @import("testkit").stackprobe;
+    try sp.skipUnlessOptimized();
+    const PK = sp.Probe(.{ .window = 1536 * 1024 });
+    const S = struct {
+        var der: [16 * 1024]u8 = undefined;
+        var heap: [2048 * 1024]u8 = undefined;
+        var out: PrivateKey = undefined;
+        var pair: CertKeyPair = undefined;
+    };
+    inline for (.{ .{ PrivateKey.mldsa44, "mldsa44-both" }, .{ PrivateKey.mldsa65, "mldsa65-both" }, .{ PrivateKey.mldsa87, "mldsa87-both" } }) |c| {
+        const tag: std.meta.Tag(PrivateKey) = c[0];
+        const M = MlDsaOf(tag);
+        const budget: usize = @field(burn.mldsa_key_burn, @tagName(tag));
+        const vec = comptime for (key_vectors.cases) |v| {
+            if (std.mem.eql(u8, v.name, c[1])) break v;
+        } else unreachable;
+        var fba: std.heap.FixedBufferAllocator = .init(&S.heap);
+        const gpa = fba.allocator();
+        try CertKeyPair.fromPem(&S.pair, gpa, vec.cert_pem, vec.key_pem);
+        defer S.pair.deinit(gpa);
+        const spki = try x509.spkiOf(S.pair.chain[0]);
+        const key = try keycodec.parsePrivateKeyPem(vec.key_pem, &S.der);
+        defer std.crypto.secureZero(u8, &S.der);
+        const loaded = @field(S.pair.key, @tagName(tag));
+        const needles = [_][]const u8{ &loaded.key, std.mem.asBytes(&loaded.s1_hat), std.mem.asBytes(&loaded.s2_hat) };
+
+        const W = struct {
+            fn expand(k: *M.SecretKey, kk: *const keycodec.PrivateKey) Error!void {
+                return mlDsaExpand(M, k, kk);
+            }
+            fn check(k: *const M.SecretKey, s: x509.Spki) Error!void {
+                return mlDsaMatches(M, k, s);
+            }
+            fn load(out: *PrivateKey, a: std.mem.Allocator, kk: *const keycodec.PrivateKey) Error!void {
+                return loadMlDsa(tag, out, a, kk);
+            }
+        };
+        const k = try gpa.create(M.SecretKey);
+        defer gpa.destroy(k);
+        // Unburned: how deep each body reaches.
+        const re = try PK.run("mlDsaExpand " ++ c[1], W.expand, .{ k, &key }, &.{}, .{ .burn = false, .residue = false });
+        const rm = try PK.run("mlDsaMatches " ++ c[1], W.check, .{ k, spki }, &.{}, .{ .burn = false, .residue = false });
+        std.crypto.secureZero(u8, std.mem.asBytes(k));
+        if (re.dirty_depth >= budget or rm.dirty_depth >= budget) {
+            std.debug.print("{s}: expansion {d} B, leaf check {d} B, burn {d} B\n", .{ c[1], re.dirty_depth, rm.dirty_depth, budget });
+            return error.TestUnexpectedResult;
+        }
+        // Burned, each call site alone.
+        _ = try PK.run("loadMlDsa " ++ c[1], W.load, .{ &S.out, gpa, &key }, &needles, .{});
+        _ = try PK.run("matches " ++ c[1], matches, .{ &S.out, spki }, &needles, .{});
+        const held = @field(S.out, @tagName(tag));
+        std.crypto.secureZero(u8, std.mem.asBytes(held));
+        gpa.destroy(held);
+    }
 }
