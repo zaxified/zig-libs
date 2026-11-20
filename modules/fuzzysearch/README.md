@@ -70,7 +70,7 @@ follows out of the buffer is bounds-checked by `trie`'s decoder.
   or untrusted buffers.
 - **Limits:** query ≤ `max_query_len` (256) bytes → else `error.QueryTooLong`;
   `k` ≤ `max_k` (254) → else `error.DistanceTooLarge`; an indexed key path deeper
-  than `max_depth` (1024) bytes → `error.KeyTooLong`. Addresses are far shorter.
+  than `max_depth` (1024) bytes → `error.KeyTooLong` (a defensive guard: pruning keeps every reachable path far below it). Addresses are far shorter.
 
 ## API
 

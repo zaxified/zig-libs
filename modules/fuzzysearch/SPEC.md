@@ -106,7 +106,7 @@ indexing — the same contract as `trie`.
 
 **Reused verbatim from `trie` (both format versions, magic `"ZTR1"`).**
 `fuzzysearch` defines no format of its own and adds no bytes; see `trie`'s SPEC
-field by field. Since 2026-10-04 `trie` writes version 2 by default, which is
+field by field. `trie` writes version 2 by default, which is
 path-compressed: one edge stands for `label ++ child.tail`, several bytes. The
 walk therefore keeps one DP row per BYTE of the path (not per node), extends it
 byte by byte along an edge, and prunes as soon as a row's minimum exceeds `k` —
@@ -134,7 +134,7 @@ Two further bounds keep every allocation-free inline structure finite:
 `query.len ≤ max_query_len` (256, else `error.QueryTooLong`) fixes the DP-row
 width; `k ≤ max_k` (254, else `error.DistanceTooLarge`) keeps the capped DP cell
 (`k+1`) in a `u8`; an indexed key path deeper than `max_depth` (1024) yields
-`error.KeyTooLong` rather than overrunning the inline DFS stack. Addresses are far
+`error.KeyTooLong` rather than overrunning the inline DFS stack (a defensive guard that no input reaches, see *Verification*). Addresses are far
 shorter than any of these.
 
 ### Why the pruning is correct
@@ -177,73 +177,53 @@ higher layer if producer authenticity matters. Same posture as `trie`.
 
 ## Verification
 
+Run with `scripts/modtest fuzzysearch` (or `zig build test-fuzzysearch`
+[`-Doptimize=ReleaseFast`]).
+
 - **Differential oracle:** a brute-force full-matrix OSA (`distance.zig`) over
-  every stored key, ranked identically, answers the same `search` queries; a
-  randomized differential over generated key sets, near-miss queries (a stored key
-  mutated by 0–3 edits) and `k ∈ {0..3}` must agree exactly on the ranked match
-  set, and every reported distance must equal an independent recomputation. The
-  oracle's incremental-DP-over-trie and the reference's full-matrix DP are
-  separate implementations of the same metric — a genuine cross-check.
+  every stored key, ranked identically (`Oracle` in `src/root.zig`), answers the
+  same `search` queries; a randomized differential over generated key sets,
+  near-miss queries (a stored key mutated by 0–3 edits) and `k` in 0..3 must agree
+  exactly on the ranked match set, and every reported distance must equal an
+  independent recomputation. The incremental DP over the trie and the reference's
+  full-matrix DP are separate implementations of the same metric. The differential
+  runs on both trie format versions.
 - **Adversarial cases:** `k=0` (exact); `k` larger than any key length (all
   match); empty query; empty key in the set; transposition neighbours; single
   substitution/insertion/deletion neighbours; multi-byte Czech UTF-8; duplicate
   keys (last-write-wins); the distance-exactly-`k`-vs-`k+1` boundary; a
-  many-matches cluster hitting the budget/truncation path.
-- **Corrupt-buffer fuzz:** the loader + search path are hammered with truncated /
-  random / bit-flipped-from-valid buffers and must only ever return a typed error.
+  many-matches cluster hitting the budget/truncation path; inclusive limits at
+  `max_query_len` and `max_k`; `max_visited` counting decoded nodes exactly.
+- **Fuzz:** `FUZZYSEARCH_FUZZ=<runs>` (testkit's deterministic driver) over the
+  frozen-buffer loader plus search on corpus-damaged and random buffers, which
+  must only ever return a typed error, and over the differential against the oracle.
 - **Positive controls:** a corrupted stored value makes `search` disagree with the
   oracle (and trips `loadVerified`'s CRC); a hand-built back-pointing child offset
-  yields `error.Corrupt`, not a loop — proving the checks have teeth.
-- **Round-trip:** in-memory brute-force answers == answers after
-  build → freeze → load.
-- Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
-  `zig build check-catalog` exit 0.
+  yields `error.Corrupt`, not a loop.
+- **Round-trip:** answers after build, freeze and load equal the in-memory
+  brute-force answers.
+- **Mutation:** tests kill the mutants of the limit checks, ranking, selector, DP
+  costs, pruning and the visit budget; `error.KeyTooLong` from the `max_depth`
+  check is a defensive guard no input reaches (a node is pushed only while its DP
+  row minimum is at most `k`, so a path is at most `max_query_len + max_k + 1`
+  plus one edge of at most 256 bytes, 767, below `max_depth`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
-No large benchmark is run: correctness is the bar and unit tests stay in the
-thousands-of-keys range so `zig build test-fuzzysearch` never balloons.
-
-## Mutation run 2026-10-04
-
-First mutation-schemata run (one ReleaseSafe test binary, 43 mutants behind a
-runtime switch over `search.zig` and `distance.zig`, baseline first): 43
-mutants, 41 killed, 2 equivalent. Covered: limit checks (`max_query_len`,
-`max_k`, key-buffer share, reference-helper length), ranking order, selector
-eviction/insert position, `cap` and the cell clamp, root and node terminal
-checks, the visit budget (`>=`), the depth check, DP costs (insert / delete /
-substitute / transposition and its guards), pruning thresholds, the edge byte
-loop, and the `distance.zig` reference DP.
-
-10 mutants survived the existing tests; 8 were killed by five new tests
-(inclusive limits at `max_query_len` / `max_k` with a 256-byte query, a key
-exactly filling its `key_buf` share, `max_visited` counting decoded nodes
-exactly, k=0 pruning bounded to the query's own path, `osaDistance` at exactly
-`max_ref_len`).
-
-Equivalent: (1) `end > max_depth` -> `>=` in the walk: the check is
-unreachable on any input, because a node is only pushed while its DP-row
-minimum is <= k, so its depth is <= `max_query_len + max_k + 1` = 511, and one
-v2 edge adds at most `trie.format.max_tail + 1` = 256 bytes; the deepest `end`
-is therefore 767 < `max_depth`. `error.KeyTooLong` from `search` is dead code
-(defensive; the doc comment on `max_depth` implies it can fire). (2) removing
-`osaDistance`'s `a.len == 0` early return: the loop does not run and the same
-`prev[n]` is returned.
-
-## Deliberately deferred
+## What is deliberately not done
 
 - **True (unrestricted) Damerau–Levenshtein.** Needs an alphabet last-occurrence
   table, not computable from a fixed number of trie-descent rows. OSA is the
-  documented metric; a real transposition-heavy consumer can revisit.
+  documented metric.
 - **Automaton precompilation (Schulz–Mihov universal automaton).** Precompiling
   the query into a table-driven NFA/DFA can beat the per-node DP row for large
   `k`; the DP-row method is simpler, allocation-free, and ample for the small `k`
   typo-tolerance uses. Swappable behind the same `search` API.
-- **Prefix-anchored fuzzy autocomplete** (fuzzy match on the typed prefix while
-  still completing) — a hybrid of `trie.topN` and this walk; a plausible next
-  feature, not built.
 - **Weighted / custom edit costs** (keyboard-adjacency, OCR-confusion weights).
   The metric is fixed unit-cost OSA.
 - **Transposition of multi-byte codepoints as a single edit.** Distance is over
-  bytes; a codepoint-level metric is the caller's normalization concern.
+  bytes; a codepoint-level metric is the caller's normalization concern (an
+  opt-in UTF-8-aware metric is in *Backlog / deferred*).
 
 ## Anchoring
 
@@ -252,10 +232,10 @@ is therefore 767 < `max_depth`. `error.KeyTooLong` from `search` is dead code
 - **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
-**What the tests actually contain.** in-process trie+DP fuzzy match; brute-force self oracle only (SPEC.md)
+**What the tests actually contain.** in-process trie+DP fuzzy match; brute-force self oracle only (`Oracle` in `src/root.zig`)
 
 ## Backlog / deferred
 
-- (survey 2026-09-30) **Prefix-anchored fuzzy autocomplete** — typeahead users type a *prefix* with a typo (the driving RÚIAN case); today the query must be within `k` edits of a whole key. Effort: medium (walk the automaton, then take `trie.topN` under accepting nodes). Fits CONVENTIONS §2. Already listed under *Deliberately deferred*.
-- (survey 2026-09-30) **Codepoint-level distance** — a diacritic or any non-ASCII letter costs 2+ edits, so `k=1` misses a one-letter Czech typo on `ě`. The SPEC leaves folding to the caller, but an opt-in UTF-8-aware metric is what users of SymSpell/Lucene get for free. Effort: medium. Fits §2.
-- (survey 2026-09-30) **Word-level correction / segmentation** — SymSpell's compound correction and word segmentation (`"thequickbrown"`) for multi-word input. Effort: medium-large; possibly a separate module. Fits §2.
+- **Prefix-anchored fuzzy autocomplete** — typeahead users type a *prefix* with a typo (the driving address case); the query must be within `k` edits of a whole key. A hybrid of `trie.topN` and this walk: walk the automaton, then take `trie.topN` under accepting nodes. Effort: medium. Fits CONVENTIONS §2.
+- **Codepoint-level distance** — a diacritic or any non-ASCII letter costs 2+ edits, so `k=1` misses a one-letter Czech typo on `ě`. The design leaves folding to the caller, but an opt-in UTF-8-aware metric is what users of SymSpell/Lucene get for free. Effort: medium. Fits §2.
+- **Word-level correction / segmentation** — SymSpell's compound correction and word segmentation (`"thequickbrown"`) for multi-word input. Effort: medium-large; possibly a separate module. Fits §2.
