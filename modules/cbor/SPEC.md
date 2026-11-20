@@ -40,15 +40,15 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 (EC2/OKP/AKP `COSE_Key`, `COSE_Sign1`, `Sig_structure`) anchored to RFC 9052 and `cose-wg/Examples`, including the
 RFC 9964 ML-DSA key type — none of the Zig competitors has one; hardening is structural (depth cap, no
 pre-allocation from a declared length, UTF-8 check, closed error set, fuzz test); duplicate-label check for COSE maps
-(`cose.checkLabels`). Since 2026-10-04 also: strict decoding (`reject_duplicate_keys` by data-model equality,
+(`cose.checkLabels`). Also: strict decoding (`reject_duplicate_keys` by data-model equality,
 `reject_indefinite`, `deterministic` = "is the canonical encoding of its own value"), full Core Deterministic
 Encoding (floats shrunk, NaN canonical), CBOR Sequences, diagnostic notation matching RFC 8949 Appendix A, a
 zero-allocation token reader (incremental at token granularity) and push writer, and comptime typed mapping with
-integer keys — the libcbor/fxamacker feature set a typical user reaches for. **Where we are behind** (re-checked
-2026-10-04): no callback/push decoder for input that never sits in memory whole (the reader needs a slice; it
+integer keys — the libcbor/fxamacker feature set a typical user reaches for. **Where we are behind:** no callback/push decoder for input that never sits in memory whole (the reader needs a slice; it
 retries a cut token, it does not keep partial-string state); no bignum helpers or bignum-aware preferred
 serialization; typed mapping has no field-level tag mapping or >64-bit integers; no diagnostic-notation *parser*;
 no `COSE_Mac0`/`Encrypt0`/`Sign` (libcbor has no COSE at all).
+Items refused on purpose are in *What is deliberately not done*; the open ones in *Backlog / deferred*.
 
 ## Design & invariants
 
@@ -98,12 +98,12 @@ no `COSE_Mac0`/`Encrypt0`/`Sign` (libcbor has no COSE at all).
   positive-control tests assert the exact byte sequence for both the un-sorted (default) and
   sorted (canonical) encodings of the same map — not just "output changed" — so a broken/absent/
   reversed/numeric-instead-of-bytewise sort fails the test (`kat_test.zig`).
-- **`canonical` = RFC 8949 §4.2.1 (2026-10-04).** Keys sorted bytewise on their encodings and
+- **`canonical` = RFC 8949 §4.2.1.** Keys sorted bytewise on their encodings and
   floats in the shortest exact width (`shortestFloat`: the bits must survive the round trip, so
   `-0.0` stays `-0.0` and a value that would round is not shrunk); every NaN becomes `f97e00`
   (§4.2.2 leaves NaN to the protocol — the dCBOR/cbor2 choice). Not covered: bignum-aware
   preferred serialization (§3.4.3, a tag-2/3 bignum that fits 64 bits stays a bignum).
-- **Strict decoding (2026-10-04).** `reject_indefinite` fails `NotDeterministic` at the head of
+- **Strict decoding.** `reject_indefinite` fails `NotDeterministic` at the head of
   any indefinite item. `deterministic` (implies it) also checks each head's argument against the
   next-shorter form (`minForInfo`), each float with `shortestFloat` (NaN only as `f97e00`), and
   each definite map's keys as WIRE bytes against the previous key: `<` ok, `=` `DuplicateKey`, `>`
@@ -130,12 +130,6 @@ no `COSE_Mac0`/`Encrypt0`/`Sign` (libcbor has no COSE at all).
   text). `cbor_options` must be a `pub const` (since Zig 0.17 `@hasDecl` sees only `pub` decls; a
   non-`pub` one is silently ignored). Every allocation the mapping makes is charged against `max_alloc_bytes` (default
   64 MiB) before it is made — a one-byte item can become a large `T`.
-- **Mutation 2026-10-04, four equivalents:** `shortestFloat`'s binary16 test by value instead of
-  bits (they differ only for NaN, which every caller handles first, and ±0, whose bits survive
-  either way); `Writer.simple` switching to the one-byte form below 24 instead of 20 (20..23 are
-  not simple values — a programmer error by contract); `diag`'s trailing-zero strip (the shortest
-  round-trip digits never end in a zero); `diag`'s `0 < n <= 21` bound (the branch above it takes
-  every `n >= k`, and k ≤ 17).
 - **Concurrency:** reentrant, no shared state; pure logic, no I/O.
 
 ## COSE layer (`cose.zig`)
@@ -175,7 +169,7 @@ no `COSE_Mac0`/`Encrypt0`/`Sign` (libcbor has no COSE at all).
 
 ## Threat model / out of scope
 
-`decode` (and `decodePrefix`, the same decoder without the trailing-bytes check, added 2026-09-30 for
+`decode` (and `decodePrefix`, the same decoder without the trailing-bytes check, for
 WebAuthn `authenticatorData`) is the security boundary — the only code in this module that touches untrusted
 bytes, and it is fail-closed (typed `DecodeError`, never a panic/OOB — see hardening above).
 `encode`/the `cose` layer operate on caller-constructed or already-decoded `Value` trees and are
@@ -188,101 +182,83 @@ chain, and does not enforce any policy over `alg`/`kty`/`crv` values (an unliste
 round-trips as a raw `i64` — see `cose.zig`'s doc comment on the algorithm-identifier constants
 being "a selection", not a closed enum).
 
+**`max_depth` is a stack bound, not only a policy.** `decodeValue` is recursive; raising `DecodeOptions.max_depth`
+to thousands turns a typed `DepthLimitExceeded` into a stack overflow (SIGSEGV) on attacker-chosen input. On an
+8 MiB stack nested `0x81` arrays were measured fine at 4096 and fatal at 8192 in Debug, fine at 16384 and fatal at
+32768 in ReleaseFast (`DecodeOptions` doc comment, `src/root.zig:200-212`); the default 64 leaves a 64-256x margin.
+Raise it only against a stack you have measured.
+
 ## Verification
 
-RFC 8949 Appendix A, cross-checked against the community `cbor/test-vectors` repository's
-`appendix_a.json` (a direct machine-readable transcription of the RFC table, not hand-typed from
-memory) — every row decodes to its documented value; every "roundtrip: true" (definite-length,
-shortest-form) row also re-encodes byte-exact; every "roundtrip: false" (indefinite-length) row is
-checked to decode to the identical logical value as encoding+re-decoding it through this module.
-Two canonical-encoding positive controls assert the *exact* byte sequence of both the default
-(insertion-order) and `canonical = true` (bytewise-sorted) encodings of the same non-trivial map.
-Thirteen hostile-input cases (truncated multi-byte header, declared array/byte-string length exceeding
-available input, a 200-deep nesting bomb against the default 64-deep cap — plus a sanity check that
-ordinary shallow nesting still succeeds, trailing garbage, reserved additional-info, bare `break`,
-wrong-major-type indefinite chunk, invalid UTF-8, empty input) each assert the specific typed
-`DecodeError`, plus an arbitrary-bytes `std.testing.fuzz` test asserting decode never panics.
-`cose.zig` adds its own KATs: EC2/OKP `COSE_Key` round-trip (including a byte-identical re-encode
-check) using the ctap2pin-style field layout, missing-field/unsupported-kty error cases,
-`COSE_Sign1` round-trip (including a detached-payload and a tag-18-wrapped variant), a
-`Sig_structure`-shape check, and the RFC 9964 AKP key type against the RFC's own published
-examples. Verified green in Debug and ReleaseFast; `zig fmt --check modules/cbor`
-clean. Run: `zig build test-cbor`.
+Run: `scripts/modtest cbor` (`zig build test-cbor`; add `-Doptimize=ReleaseFast` for the optimized mode).
 
-**2026-10-04 additions (`core_test.zig`, `fuzz_test.zig`):** the RFC 8949 Appendix A table as
-diagnostic notation, all 81 rows (68 verbatim; 2 bignums and 11 indefinite rows against forms
-derived by hand), transcribed mechanically from the RFC text (`tools/gen_diag_vectors.py`);
-Python cbor2 6.1.5 (MIT) driven as a black box through `dumps`/`loads` only
-(`tools/gen_cbor2_vectors.py` → `cbor2_vectors.zig`): 96 floats (edge values plus random
-binary16/32/64) against its canonical widths, 80 random trees decoded and re-encoded byte for
-byte in both its plain and canonical forms, and 22 inputs whose duplicate-key and indefinite-length
-verdicts must match its `allow_duplicate_keys=False` / `allow_indefinite=False` (cbor2's canonical
-map order is RFC 7049 length-first, so it is not used as the key-order oracle — RFC 8949 §4.2.1 is,
-by hand: `1000` before `"a"`); deterministic accept/refuse lists derived from §4.2.1; reader tokens
-and writer output against Appendix A bytes; typed encodings derived by hand. The fuzz driver
-(`CBOR_FUZZ`, testkit) ran 900 000 inputs clean with reach for every oracle (intact, damaged heads,
-arguments and copied ranges, depth, duplicates, deterministic accept and refuse, typed).
+- **RFC 8949 Appendix A** (`kat_test.zig`, `kat_vectors.zig`), cross-checked against the community
+  `cbor/test-vectors` `appendix_a.json` (a machine-readable transcription of the RFC table): every row decodes to
+  its documented value; every "roundtrip: true" (definite-length, shortest-form) row re-encodes byte-exact; every
+  "roundtrip: false" (indefinite-length) row decodes to the same logical value as its re-encoding does.
+  Two positive controls assert the exact bytes of the default (insertion-order) and `canonical` (bytewise-sorted)
+  encodings of the same map.
+- **Hostile input** (`kat_test.zig`): each case asserts its specific typed `DecodeError` — truncated multi-byte
+  head, declared array / byte-string length beyond the input, a nesting bomb against the default depth cap (and
+  ordinary shallow nesting still succeeding), trailing garbage, reserved additional-info, bare `break`, wrong-major
+  chunk in an indefinite string, invalid UTF-8, empty input — plus an arbitrary-bytes `std.testing.fuzz` decode test.
+- **Diagnostic notation, strictness, streaming, typed** (`core_test.zig`): the Appendix A table as diagnostic
+  notation (transcribed mechanically from the RFC text by `tools/gen_diag_vectors.py`; the bignum and
+  indefinite-length rows are forms derived by hand); deterministic accept/refuse lists derived from §4.2.1;
+  reader tokens and writer output against Appendix A bytes; typed encodings derived by hand.
+- **Foreign oracle** (`cbor2_vectors.zig`): Python cbor2 6.1.5 (MIT) driven as a black box through
+  `dumps`/`loads` only (`tools/gen_cbor2_vectors.py`): float widths (edge values plus random binary16/32/64)
+  against its canonical widths, random trees decoded and re-encoded byte for byte in its plain and canonical
+  forms, and inputs whose duplicate-key and indefinite-length verdicts must match its
+  `allow_duplicate_keys=False` / `allow_indefinite=False`. cbor2's canonical map order is RFC 7049 length-first, so
+  it is not the key-order oracle; RFC 8949 §4.2.1 is, by hand (`1000` before `"a"`).
+- **COSE** (`cose_kat_test.zig`, `cose_kat_vectors.zig`, `cose.zig` tests): EC2/OKP `COSE_Key` round trip
+  (byte-identical re-encode, `ctap2pin`-style field layout), missing-field and unsupported-kty errors,
+  `COSE_Sign1` round trip (detached payload, tag-18-wrapped), the `Sig_structure` shape, and RFC 9964's three
+  published ML-DSA `COSE_Key`/signature examples. External anchors: RFC 9052 Appendix C.2.1 (the single-ECDSA
+  `COSE_Sign1`, byte-identical to `cose-wg/Examples` `sign1-tests/sign-fail-01.json`'s `output.cbor` apart from that
+  file's deliberately mutated tag 998) and `sign1-tests/sign-pass-02.json`, whose published `Sig_structure`
+  intermediate (`ToBeSign_hex`, non-empty `external_aad`) `sigStructure` must match byte-exact. Tag-18-wrapped and
+  bare forms are both run against the same real vector. `sign-fail-01`'s wrong tag still parses, because
+  `parseSign1` never checks the tag number (documented in `cose.zig`). No external COSE suite publishes a pure
+  CBOR-shape failure, so the negative test truncates the RFC C.2.1 vector to a three-element array (RFC 9052 §4.2).
+- **Fuzz:** deterministic driver `CBOR_FUZZ=<runs>[,<seed>]` (`fuzz_test.zig`, testkit's driver); random trees,
+  encoded and damaged at heads, arguments and copied token ranges, through every parser, with reach counted for each
+  oracle (intact, damaged heads, arguments and copied ranges, depth, duplicates, deterministic accept and refuse,
+  typed). 300 seeds also run in every ordinary test run. Verdict recipe: `CBOR_FUZZ=150000,0` on the test binary
+  built with `--test-filter "fuzz driver"`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation
+  run and the delta runs after it.
 
-**COSE layer external anchor (`cose_kat_test.zig` / `cose_kat_vectors.zig`, added 2026-07-28):**
-the tests above are all self-round-trip (build then parse through this module's own code) — real
-external `COSE_Sign1` vectors close that gap. Anchored against:
-- **RFC 9052 Appendix C.2.1** ("Single ECDSA Signature") — the spec's own canonical
-  `COSE_Sign1` worked example (protected header `{1: -7}`, tag-18-wrapped), taken from the RFC
-  text itself, cross-checked byte-identical against `cose-wg/Examples`
-  (github.com/cose-wg/Examples) `sign1-tests/sign-fail-01.json`'s `output.cbor` (same vector,
-  tag deliberately mutated to 998 for that repo's own "wrong tag" failure case).
-- **`cose-wg/Examples` `sign1-tests/sign-pass-02.json`** — a second real vector, used to check
-  `sigStructure()` byte-exact against the file's published `Sig_structure` intermediate
-  (`ToBeSign_hex`) with a non-empty `external_aad`.
-- The tag-18-wrapped and bare-array forms are both exercised against the *same* real vector
-  (strip the one leading tag byte), confirming the module's documented dual-form acceptance
-  against external bytes, not just a homemade pair.
-- **Finding, not a bug:** `sign-fail-01`'s "wrong CBOR tag" (998 instead of 18) still parses
-  successfully through `parseSign1`, because this module deliberately never checks the tag
-  number (documented in `cose.zig`'s doc comment). Confirmed against real external test data
-  rather than assumed.
-- **Negative case:** no external COSE suite publishes a pure-CBOR-shape failure (the WG's own
-  `sign-fail-*` vectors are all signature/semantic failures, which parse fine structurally); the
-  negative test truncates the real RFC 9052 C.2.1 vector to a 3-element array to check the
-  `COSE_Sign1` 4-tuple requirement (RFC 9052 §4.2) against real vector bytes.
-- All four new vectors passed byte-exact on the first run (no divergence from this
-  implementation found). Teeth confirmed: corrupting one byte of the expected `signature_hex`
-  produces a real, reported mismatch (verified, then reverted — not left corrupted).
+## What is deliberately not done
+
+- **`Value` does not record definite versus indefinite length.** Decoding an indefinite string/array/map yields the
+  same shape as the definite form and `encode` always writes definite lengths, so a caller who must reproduce an
+  indefinite-length encoding byte for byte is not served (`reject_indefinite` refuses them instead).
+- **NaN payloads are dropped** under `canonical` / `shortest_floats`: every NaN is written as `f97e00` (RFC 8949
+  §4.2.2 leaves NaN to the protocol; dCBOR and cbor2 make the same choice).
+- **No bignum arithmetic.** Tags 2/3 decode structurally like any tag (tag number plus the byte-string payload);
+  consumers that need the numeric value convert the byte string themselves.
+- **No private-key material in COSE.** `d` (label -4, EC2/OKP) and `priv` (label -2, AKP) are never parsed or
+  emitted; the layer is for verifiers and public-key consumers, not key storage. RSA and symmetric key types return
+  `error.UnsupportedKty`.
+- **Typed mapping refuses at compile time** what it cannot map faithfully: integers wider than 64 bits,
+  sentinel-terminated slices, untagged unions (`typed.zig` `@compileError`s); tags are not mapped to Zig types (use a
+  `Value` field).
 
 ## Backlog / deferred
 
-See README "Deferred": indefinite-length round-trip fidelity, NaN payloads, bignum
-arithmetic, and COSE scope (`COSE_Mac0`/`COSE_Encrypt0`/multi-signer `COSE_Sign`, RSA/symmetric key
-types, private-key material) are all out of scope for this pass — see README for the per-item
-rationale.
-
-
-**Missing and it matters** *(survey 2026-09-30)*, on top of the items above (already in README "Deferred"):
-
-- ~~**Typed extraction / struct mapping via comptime**~~ *(survey 2026-09-30)* — **done 2026-10-04** (`typed.zig`).
-  Still deferred: tag ↔ Zig type mapping (use a `Value` field), integers wider than 64 bits.
-- ~~**Strict decode options**~~ *(survey 2026-09-30)* — **done 2026-10-04** (`reject_duplicate_keys`,
-  `reject_indefinite`, `deterministic`, `strict_options`).
-- ~~**Float shrinking so `canonical = true` is really Core Deterministic**~~ *(survey 2026-09-30)* — **done 2026-10-04**.
-- ~~**Streaming / incremental decode and encode into a caller buffer (plus CBOR Sequences, RFC 8742)**~~
-  *(survey 2026-09-30)* — **done 2026-10-04** (`Reader`, `Writer`, `Sequence`), except a push decoder with
-  partial-string state for input that never sits in memory whole: the reader needs the item's bytes in one slice
-  (it retries a cut token). Why deferred: every in-collection consumer holds the whole message; a callback decoder
-  is a second parser to keep in step with `decode`.
-- **Diagnostic notation** — **printer done 2026-10-04**; a diagnostic-notation *parser* (EDN → CBOR, for writing
-  test vectors by hand) is not built: no consumer, and a second grammar to fuzz.
-- **`COSE_Mac0` / `COSE_Encrypt0` / multi-signer `COSE_Sign`** *(survey 2026-09-30)*: still deferred — libcbor (the
-  reference) has no COSE at all, so they are not part of the core bar; they wait for a consumer beyond
-  WebAuthn/attestation. Effort: medium each. Fits §2: yes (primitives exist as siblings).
-- **Bignum-aware preferred serialization (RFC 8949 §3.4.3)** — `canonical` and `deterministic` treat tags 2/3 like any
-  tag. Small; no consumer.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 2 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`
-in src/root.zig.
+- **Push decoder with partial-string state** for input that never sits in memory whole: the reader needs an item's
+  bytes in one slice (it retries a cut token). Deferred: every in-collection consumer holds the whole message, and a
+  callback decoder is a second parser to keep in step with `decode`.
+- **Diagnostic-notation parser** (EDN to CBOR, for writing test vectors by hand): no consumer, and a second grammar
+  to fuzz.
+- **`COSE_Mac0` / `COSE_Encrypt0` / multi-signer `COSE_Sign`:** wait for a consumer beyond WebAuthn/attestation (the
+  reference, libcbor, has no COSE at all). Effort: medium each; fits CONVENTIONS §2 (the primitives exist as
+  siblings).
+- **Bignum-aware preferred serialization (RFC 8949 §3.4.3):** `canonical` and `deterministic` treat tags 2/3 like
+  any tag, so a bignum that fits 64 bits stays a bignum. Small; no consumer.
+- **Typed mapping: tag to Zig type mapping and integers wider than 64 bits.** No consumer.
 
 ## Anchoring
 
@@ -297,6 +273,6 @@ vectors including their published `Sig_structure` intermediates + RFC 9964 Appen
 published ML-DSA `COSE_Key`/signature examples — byte-exact, kat_vectors.zig and
 cose_kat_vectors.zig
 
-**Note 2026-10-04:** the tests now also carry the RFC 8949 Appendix A diagnostic column
-(`diag_vectors.zig`) and Python cbor2 6.1.5 black-box output (`cbor2_vectors.zig`: float widths,
-whole trees, duplicate-key and indefinite verdicts) — a second, foreign implementation as oracle.
+The tests also carry the RFC 8949 Appendix A diagnostic column (`diag_vectors.zig`) and Python cbor2 6.1.5
+black-box output (`cbor2_vectors.zig`: float widths, whole trees, duplicate-key and indefinite verdicts) — a
+second, foreign implementation as oracle.

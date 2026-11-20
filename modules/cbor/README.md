@@ -22,7 +22,7 @@ code needs no attribution; the RFC example vectors embedded in `src/` are covere
    map / tag / simple+float — including `false`/`true`/`null`/`undefined` and `f16`/`f32`/`f64`),
    both definite- and indefinite-length forms. Indefinite byte/text-string chunks are concatenated
    and indefinite array/map items are collected into the same shape as their definite counterparts
-   — `Value` does not record "was this indefinite on the wire" (see Deferred below).
+   — `Value` does not record "was this indefinite on the wire" (see *What is deliberately not done* in SPEC.md).
 2. **Encode ← `Value`.** `cbor.encode(allocator, value, .{})` always emits definite-length,
    shortest-form integers/lengths (RFC 8949 §4.1 "preferred serialization"). Pass
    `.{ .canonical = true }` for RFC 8949 §4.2.1 Core Deterministic Encoding: every map's entries
@@ -155,24 +155,10 @@ Vector recipes: `tools/gen_diag_vectors.py` (RFC 8949 Appendix A from the RFC te
 `tools/gen_cbor2_vectors.py` (Python cbor2 6.1.5 as a black-box oracle: float widths, whole
 trees, duplicate-key and indefinite-length verdicts).
 
-## Deferred (backlog, not implemented here)
+## Not provided
 
-- **`Value` doesn't distinguish definite from indefinite length.** Decoding an indefinite
-  byte-string/text-string/array/map produces the same shape as the definite form; `encode` always
-  emits definite-length. A caller that specifically needs to reproduce an indefinite-length
-  encoding byte-for-byte (rather than just its decoded value) isn't served by this module.
-- **NaN payloads under `canonical`/`shortest_floats`.** Every NaN is written as `f97e00`; a
-  payload is not kept (RFC 8949 §4.2.2 leaves NaN to the protocol; dCBOR and cbor2 do the same).
-- **Bignum-aware preferred serialization.** RFC 8949 §3.4.3 asks a bignum that fits 64 bits to
-  be encoded as a plain integer; `canonical` leaves tags 2/3 as given.
-- **Typed mapping limits.** No integers wider than 64 bits, no sentinel-terminated slices, no
-  untagged unions; tags are not mapped to Zig types (use a `Value` field).
-- **No bignum (RFC 8949 §3.4.3, tags 2/3) arithmetic.** A bignum tag decodes structurally (tag
-  number + the byte-string payload, like any other tag) but this module does no big-integer math
-  on it — consumers that need the numeric value convert the byte string themselves.
-- **COSE scope:** only `COSE_Key` (EC2/OKP/AKP; RSA and symmetric key types return
-  `error.UnsupportedKty`) and `COSE_Sign1`. No `COSE_Mac0`, `COSE_Encrypt0`, or full `COSE_Sign`
-  (multi-signer) — libcbor, the reference, has no COSE at all, and no consumer in the collection
-  needs them yet. Private-key material (COSE label `-4` `d` for EC2/OKP, `-2` `priv` for AKP) is
-  never parsed or emitted — this is a verifier/public-key-consumer layer, not a key-storage
-  format.
+No bignum arithmetic or bignum-aware preferred serialization, no COSE beyond `COSE_Key` (EC2/OKP/AKP, public
+material only) and `COSE_Sign1`, no diagnostic-notation parser, no callback decoder for input that never sits in
+memory whole, no recording of definite versus indefinite length in `Value`, no NaN payloads under `canonical`, and
+typed mapping stops at 64-bit integers and untagged unions. Reasons and plans: SPEC.md *What is deliberately not
+done* and *Backlog / deferred*.
