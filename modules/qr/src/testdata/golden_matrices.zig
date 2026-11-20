@@ -28,7 +28,7 @@
 //!     7.4.10-conformant version -- segno 1.6.6's own unconditionally adds a
 //!     spurious 8-bit zero byte when the bitstream is already byte-aligned
 //!     after the terminator, which this module's encoder does not do (see
-//!     the module CHANGELOG's 2026-08-18 entry: this is what the very first
+//!     the module CHANGELOG's entry: this is what the very first
 //!     capture run of this oracle actually caught, and it was segno that was
 //!     wrong, not us).
 //!

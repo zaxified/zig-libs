@@ -199,7 +199,7 @@ pub const Matrix = struct {
 
 /// Encode `text` into `out`. Allocates nothing: `out` is the only storage the
 /// caller provides, and everything else lives on this frame — which is not
-/// small. Measured (`A1/qr.md` F5, native Debug, version 40 / ECC high): a
+/// small. Measured (A1 audit F5, native Debug, version 40 / ECC high): a
 /// 40 KB call stack still overflows, a 64 KB one does not. A caller on a
 /// constrained thread (a thread pool sized for a small default, a `wasm32`
 /// host with its own limit) should give this call at least that much room.
@@ -462,7 +462,7 @@ fn sideFor(version: u6) u16 {
 ///
 /// ⚠ That check was real but was never committed: `golden_matrices.zig` covers
 /// **10** versions, not 40, so nothing in the repo re-ran it. Re-verified
-/// 2026-09-04 against segno across all 40 versions, and the claim holds — but
+/// Against segno across all 40 versions, and the claim holds — but
 /// the lesson is that "checked against an independent encoder" in a comment is
 /// a past event, not a standing property, unless the check is in the tree.
 /// `testdata/decode_vectors.bin` now covers all 40 versions on the decode side;
@@ -1900,7 +1900,7 @@ test "corpus: every encode seed reaches the encoder, and the symbols built are p
     }
     // One seed is deliberately the empty script.
     try std.testing.expectEqual(encode_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 1 seed of 1 non-empty, 1 ECC level, 1 version and
+    // Measured: 1 seed of 1 non-empty, 1 ECC level, 1 version and
     // 1 round trip before the draws were fixed — and that one symbol was the
     // encoding of the EMPTY string.
     try std.testing.expectEqual(@as(usize, 4), eccs);
@@ -1916,7 +1916,7 @@ test "corpus: every encode seed reaches the encoder, and the symbols built are p
 // standard byte-for-byte anchor (no independent encoder to compare against
 // forces a *specific* auto choice, only that its own penalty score is no
 // worse than a hand implementation's -- see the audit's three-way vote in
-// `A1/qr.md` F8), so it pins today's own output instead: a behavior change
+// A1 audit F8), so it pins today's own output instead: a behavior change
 // in the tie-break or a scoring rule is still caught, because the winner
 // moves.
 test "auto-selected mask is pinned across a spread of inputs (F8 anchor)" {
@@ -2321,7 +2321,7 @@ test "corpus: the grid and damage scripts reach the decoder, and what they did i
         if (b) sizes += 1;
     }
     try std.testing.expectEqual(decode_seeds.len - 1, grid_nonempty);
-    // Measured 2026-09-07: 1 size (17), one all-light grid, before the draws
+    // Measured: 1 size (17), one all-light grid, before the draws
     // were fixed.
     try std.testing.expectEqual(@as(usize, 4), sizes);
 
@@ -2352,7 +2352,7 @@ test "corpus: the grid and damage scripts reach the decoder, and what they did i
         if (b) eccs += 1;
     }
     try std.testing.expectEqual(damage_seeds.len - 1, damage_nonempty);
-    // Measured 2026-09-07: 1 ECC level, 0 flips, and every "recovery" was of an
+    // Measured: 1 ECC level, 0 flips, and every "recovery" was of an
     // undamaged symbol.
     try std.testing.expectEqual(@as(usize, 4), eccs);
     try std.testing.expectEqual(@as(usize, 608), total_flips);
@@ -2599,7 +2599,7 @@ test "corpus: the sequence scripts really split, and the symbol counts are pinne
     }
     // One seed is deliberately the empty script.
     try std.testing.expectEqual(sequence_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 1 ECC level, 1 sequence of 1 symbol carrying an
+    // Measured: 1 ECC level, 1 sequence of 1 symbol carrying an
     // EMPTY message, and 0 multi-symbol splits before the draws were fixed.
     try std.testing.expectEqual(@as(usize, 4), eccs);
     try std.testing.expectEqual(@as(usize, 13), encoded);
@@ -2609,7 +2609,7 @@ test "corpus: the sequence scripts really split, and the symbol counts are pinne
 
 // ── TEETH: the decoder's refusal guards, none of which had a test ───────────
 //
-// A first audit (2026-09-04) deleted seven refusal guards in `parseSegments`
+// A first audit deleted seven refusal guards in `parseSegments`
 // and `rsDecode` one at a time. **Six of the seven left all 33 tests green** —
 // only the format-info BCH radius was pinned. Two of the six are
 // silent-corruption guards, not crash guards: without them a malformed symbol
@@ -2640,11 +2640,10 @@ const TestBits = struct {
 };
 
 test "TEETH: an unimplemented segment mode is REFUSED, not read as bytes" {
-    // Mutating `else => return DecodeError.BadData` to `else => .byte` left the
-    // whole suite green: an ECI (0b0111) or Kanji (0b1000) segment would have
-    // been silently reinterpreted as byte data (ECI is implemented since
-    // 2026-11-16 and is no longer in the refused list below), i.e. decoded to a different
-    // string, with nothing to say so.
+    // Mutating `else => return DecodeError.BadData` to `else => .byte` left the whole
+    // suite green: an ECI (0b0111) or Kanji (0b1000) segment would have been silently
+    // reinterpreted as byte data (ECI is implemented and is no longer in the refused list
+    // below), i.e. decoded to a different string, with nothing to say so.
     var out: [128]u8 = undefined;
     var seq: ?Sequence = null;
     var eci: ?u32 = null;
@@ -2748,13 +2747,13 @@ test "TEETH: out-of-range numeric and alphanumeric groups are REFUSED, not folde
 }
 
 test "EXTERNAL ORACLE: 160 segno-produced grids decode back to segno's own input" {
-    // ⚠ Until 2026-09-04 the DECODER had no external anchor at all. SPEC.md
-    // named the gap in its own words: "It does not anchor decoding, error
-    // correction, structured append, or the renderers ... Extending the oracle
-    // to decoding (e.g. segno's matrices fed to this module's decoder) is
-    // future work, not something this pass claims to have done." The committed
-    // golden set anchors the ENCODER, and only 10 of 40 versions — so a shared
-    // misreading of the standard on the decode side would have gone unseen.
+    // SPEC.md named the gap in its own words: "It does not anchor decoding,
+    // error correction, structured append, or the renderers ... Extending the
+    // oracle to decoding (e.g. segno's matrices fed to this module's decoder)
+    // is future work, not something this pass claims to have done." The
+    // committed golden set anchors the ENCODER, and only 10 of 40 versions —
+    // so a shared misreading of the standard on the decode side would have
+    // gone unseen.
     //
     // These grids were produced by segno (BSD-3, independently authored) and
     // this module must read segno's own bytes back out of them. It is not a
@@ -2823,7 +2822,7 @@ test "EXTERNAL ORACLE: 160 segno-produced grids decode back to segno's own input
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);
@@ -3104,7 +3103,7 @@ test "mixed: random digit/upper/byte payloads round-trip, never a larger version
     }
 }
 
-// ── whole-module mutation tests (2026-11-17) ─────────────────────────────────
+// ── whole-module mutation tests ─────────────────────────────────
 
 fn sameMatrix(a: *const Matrix, b: *const Matrix) !void {
     const t = std.testing;

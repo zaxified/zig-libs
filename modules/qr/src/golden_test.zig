@@ -20,7 +20,7 @@
 //! `SPEC.md` used to describe exactly this kind of comparison ("672
 //! matrices... byte-identical", "320 matrices... byte-identical") with zero
 //! test code behind either number -- see the module's CHANGELOG for the
-//! 2026-08-18 entry that corrected the claim. This file, `tools/reference.py` and
+//! Entry that corrected the claim. This file, `tools/reference.py` and
 //! `testdata/golden_matrices.zig` are what make the claim real.
 
 const std = @import("std");

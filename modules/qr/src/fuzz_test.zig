@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared plumbing for qr's deterministic fuzz driver (added 2026-10-10).
+//! Shared plumbing for qr's deterministic fuzz driver.
 //!
 //! The four harness bodies (`fuzzEncode`, `fuzzDecode`, `fuzzDamage`,
 //! `fuzzSequence`) stay in `root.zig` beside their corpora, generic over their
