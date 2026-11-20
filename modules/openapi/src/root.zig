@@ -2113,12 +2113,16 @@ fn decodePointerToken(gpa: Allocator, buf: *std.ArrayList(u8), token: []const u8
     while (i < token.len) {
         var c = token[i];
         i += 1;
+        // RFC 3986 `"%" HEXDIG HEXDIG`: exactly two hex digits (parseInt would
+        // also take a sign, `%+f`, R-openapi-3).
         if (c == '%' and i + 2 <= token.len) {
-            if (std.fmt.parseInt(u8, token[i .. i + 2], 16)) |b| {
-                buf.appendAssumeCapacity(b);
+            const hi = std.fmt.charToDigit(token[i], 16) catch 16;
+            const lo = std.fmt.charToDigit(token[i + 1], 16) catch 16;
+            if (hi < 16 and lo < 16) {
+                buf.appendAssumeCapacity(hi << 4 | lo);
                 i += 2;
                 continue;
-            } else |_| {}
+            }
         }
         if (c == '~' and i < token.len) {
             switch (token[i]) {

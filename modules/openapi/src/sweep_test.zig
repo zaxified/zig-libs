@@ -333,3 +333,25 @@ test "build: 30000 route_extras matched to 30000 routes stay linear, first entry
     try expectFast(t0);
     try testing.expect(std.mem.find(u8, json, "\"/r0\":{\"get\":{\"operationId\":\"get_r0\",\"requestBody\":{\"content\":{\"application/json\":{\"example\":1}}") != null);
 }
+
+test "validateOpenApi31: a signed or short percent escape in a pointer token is not decoded (sweep R-openapi-3)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const head = "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"t\",\"version\":\"1\"},\"paths\":{}," ++
+        "\"x-k\":{\"a\\u000f\":{},\"a\\u0000\":{},\"a%\":{},\"a%4\":{}},";
+    // `%0f` / `%0F` are the byte 0x0f; `%+f` and `%-0` are not escapes (parseInt took
+    // them as 0x0f and 0x00, so they resolved), `%` or `%4` at the end stand for themselves.
+    const ok = [_][]const u8{ "a%0f", "a%0F", "a%00", "a%", "a%4" };
+    const bad = [_][]const u8{ "a%+f", "a%-0", "a%g0", "a%0", "a%4g" };
+    for (ok) |tok| {
+        const text = try arena.print("{s}\"x\":{{\"$ref\":\"#/x-k/{s}\"}}}}", .{ head, tok });
+        const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        try oa.validateOpenApi31(testing.allocator, doc);
+    }
+    for (bad) |tok| {
+        const text = try arena.print("{s}\"x\":{{\"$ref\":\"#/x-k/{s}\"}}}}", .{ head, tok });
+        const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+        try testing.expectError(error.DanglingRef, oa.validateOpenApi31(testing.allocator, doc));
+    }
+}
