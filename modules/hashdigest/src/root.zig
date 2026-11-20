@@ -49,7 +49,7 @@ pub const meta = .{
 const blake2b = @import("blake2b.zig");
 const sha2 = @import("sha2");
 
-/// Engine choice by target, measured 2026-11-02 (SPEC "Performance"): the
+/// Engine choice by target, measured (SPEC "Performance"): the
 /// sibling `sha2` module wins on x86-64 (run-time SHA-NI/AVX2 dispatch inside);
 /// the vectorised BLAKE2b wins only when the build has AVX2 (baseline x86-64:
 /// 1.25x Go vs std's ~1.21x). On 32-bit MIPS (qemu) both were slower and
@@ -159,7 +159,8 @@ pub fn sha256FileMax(io: std.Io, path: []const u8, out: *[hex_len]u8, max_bytes:
 // ── multi-algorithm layer ────────────────────────────────────────────────────
 
 /// Digest algorithms available through the unified API. Each maps 1:1 onto a
-/// `std.crypto.hash` type; nothing is reimplemented here.
+/// `std.crypto.hash` type (or the sibling `sha2`, or this module's own BLAKE2b-256 on
+/// x86-64 with AVX2).
 pub const Algorithm = enum {
     sha256,
     sha512,
@@ -412,8 +413,8 @@ pub fn blake3DeriveKey(context: []const u8, material: []const u8, out: []u8) voi
 
 /// Dead-stack burn for the keyed / derived entry points (CONVENTIONS 2.1.1):
 /// zeroes `stack_burn` bytes below the caller's frame, where BLAKE3's state and
-/// intermediates were. `noinline` is load-bearing. Not measured with a stack
-/// probe for this module (a keyed BLAKE3 convenience, not a secret-holding API).
+/// intermediates were. `noinline` is load-bearing. Its depth is checked by
+/// `stackprobe_test.zig`.
 const stack_burn = 16384;
 noinline fn burnStack() void {
     const V = @Vector(2, u64);
@@ -452,7 +453,7 @@ test "sha256Hex known-answer vectors, lowercase" {
 test "a buffer one byte short of hexLength is ShortBuffer, exactly hexLength is enough" {
     // `hex` / `MultiHasher.finalHex` need room for the whole lowercase hex
     // digest (`hexLength(algo)` bytes); one byte less is `error.ShortBuffer`,
-    // never a partial digest. Mutation 2026-10-04: an off-by-one in either
+    // never a partial digest. Mutation: an off-by-one in either
     // check survived (it then wrote past the buffer).
     var buf: [hex_len]u8 = undefined;
     try std.testing.expectError(error.ShortBuffer, hex(.sha256, "abc", buf[0 .. hex_len - 1]));

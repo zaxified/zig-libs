@@ -353,7 +353,7 @@ test "verify: one ok file and one too_large file is not allOk" {
     try testing.expect(ck.verifyAll(testing.io, tmp.dir, .sha256, text, .{ .max_file_bytes = 5 }).allOk());
 }
 
-// ── whole-module mutation 2026-11-19: survivors of the first run ────────────
+// ── whole-module mutation: survivors of the first run ────────────
 
 const abc256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
