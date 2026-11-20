@@ -330,3 +330,58 @@ test "the two S-boxes are inverse to each other" {
         try std.testing.expectEqual(a, sbox(sboxInv(a)));
     }
 }
+
+test "fromU64 reduces at the modulus boundary" {
+    try std.testing.expectEqual(@as(u64, 0), fromU64(P));
+    try std.testing.expectEqual(@as(u64, 1), fromU64(P + 1));
+    try std.testing.expectEqual(P - 1, fromU64(P - 1));
+    // 2^64 - 1 = P + (2^32 - 2): the largest input, one conditional subtraction.
+    try std.testing.expectEqual(EPSILON - 1, fromU64(std.math.maxInt(u64)));
+}
+
+test "add and sub carry across the modulus exactly" {
+    try std.testing.expectEqual(@as(u64, 0), add(P - 1, 1));
+    try std.testing.expectEqual(P - 2, add(P - 1, P - 1));
+    try std.testing.expectEqual(@as(u64, 7), add(7, 0));
+    try std.testing.expectEqual(@as(u64, 7), add(0, 7));
+    try std.testing.expectEqual(P - 1, sub(0, 1));
+    try std.testing.expectEqual(@as(u64, 0), sub(P - 1, P - 1));
+    try std.testing.expectEqual(@as(u64, 7), sub(7, 0));
+}
+
+test "neg is the additive inverse" {
+    try std.testing.expectEqual(@as(u64, 0), neg(0));
+    try std.testing.expectEqual(P - 1, neg(1));
+    try std.testing.expectEqual(@as(u64, 1), neg(P - 1));
+    var prng = std.Random.DefaultPrng.init(0x4e45_47);
+    const rnd = prng.random();
+    for (0..1_000) |_| {
+        const a = fromU64(rnd.int(u64));
+        try std.testing.expectEqual(@as(u64, 0), add(a, neg(a)));
+    }
+}
+
+test "pow agrees with a u128 ladder on full-width exponents" {
+    var prng = std.Random.DefaultPrng.init(0x504f_57);
+    const rnd = prng.random();
+    for (0..200) |_| {
+        const a = fromU64(rnd.int(u64));
+        const e = rnd.int(u64);
+        var expected: u64 = 1;
+        var base = a;
+        var k = e;
+        while (k != 0) : (k >>= 1) {
+            if (k & 1 == 1) expected = refMul(expected, base);
+            base = refMul(base, base);
+        }
+        try std.testing.expectEqual(expected, pow(a, e));
+    }
+    // Fermat: a^(p-1) = 1 and a^(p-2) is the inverse (bit 63 of the exponent is set).
+    for ([_]u64{ 2, 3, 7, P - 1, 0x1234_5678_9ABC_DEF0 % P }) |a| {
+        try std.testing.expectEqual(@as(u64, 1), pow(a, P - 1));
+        try std.testing.expectEqual(@as(u64, 1), mul(a, pow(a, P - 2)));
+    }
+    // 2^64 = EPSILON and 2^96 = -1 (mod p), the two folds reduce128 rests on.
+    try std.testing.expectEqual(EPSILON, pow(2, 64));
+    try std.testing.expectEqual(P - 1, pow(2, 96));
+}

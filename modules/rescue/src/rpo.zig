@@ -432,3 +432,46 @@ test "spec: digest lengths follow rate/2" {
     try std.testing.expectEqual(@as(usize, 4), (try spec128.hash(&.{1})).len);
     try std.testing.expectEqual(@as(usize, 5), (try spec160.hash(&.{1})).len);
 }
+
+test "Rpo256: mergeMany is hashElements over the flattened digests, for every count" {
+    // Odd counts leave a half-filled rate block at the end (4 of 8 elements),
+    // which is the path that zero-pads and permutes once more.
+    var prng = std.Random.DefaultPrng.init(0x4d45_5247);
+    var digests: [6]Rpo256.Digest = undefined;
+    for (&digests) |*d| for (d) |*e| {
+        e.* = gl.fromU64(prng.random().int(u64));
+    };
+    var flat: [24]gl.Fe = undefined;
+    for (0..7) |n| {
+        for (digests[0..n], 0..) |d, i| @memcpy(flat[i * 4 ..][0..4], &d);
+        try std.testing.expectEqual(Rpo256.hashElements(flat[0 .. n * 4]), Rpo256.mergeMany(digests[0..n]));
+    }
+}
+
+test "Rpo256: a byte string longer than one block, with a partial last block, equals a hand-built sponge" {
+    // 60 bytes pack into ceil(60 / 7) = 9 elements: eight full ones, then one
+    // holding the last four bytes and the final-chunk marker. The second block
+    // must overwrite the whole rate: the seven positions after the ninth
+    // element carry the first permutation's output and have to be zeroed, and
+    // the capacity flag (8 + 9 mod 8) is set once, before the first permutation.
+    var bytes: [60]u8 = undefined;
+    for (&bytes, 0..) |*b, i| b.* = @intCast(i + 1);
+
+    var state: Rpo256.State = @splat(0);
+    state[Rpo256.capacity_start] = Rpo256.rate_width + 9 % Rpo256.rate_width;
+    for (0..8) |k| {
+        var buf: [8]u8 = @splat(0);
+        @memcpy(buf[0..7], bytes[k * 7 ..][0..7]);
+        state[k] = std.mem.readInt(u64, &buf, .little);
+    }
+    Rpo256.Perm.permute(&state);
+
+    var last: [8]u8 = @splat(0);
+    @memcpy(last[0..4], bytes[56..60]);
+    last[4] = 1;
+    state[0] = std.mem.readInt(u64, &last, .little);
+    for (state[1..Rpo256.rate_width]) |*e| e.* = 0;
+    Rpo256.Perm.permute(&state);
+
+    try std.testing.expectEqualSlices(gl.Fe, state[0..4], &Rpo256.hash(&bytes));
+}

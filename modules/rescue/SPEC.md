@@ -6,7 +6,7 @@
 
 **Scope:** core — miden-crypto 0.28.1 `Rpo256` and the RPO reference implementation (surveyed 2026-09-30)
 
-**Audit:** review 2026-08-06 · mutation none · src ?
+**Audit:** review 2026-08-06 · mutation 2026-11-20 (141/142, 1 eq) · src 8309ba104adb20e3
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, RESCUE_FUZZ) · ct n/a — public-input hash (keyword review, 2026-10-07)
 
@@ -316,11 +316,24 @@ Test classes:
   separation, merge, empty-input behaviour of both sponges, digest lengths.
 - **Field and permutation** (`src/goldilocks.zig`, `src/perm.zig`): differential
   against a `u128 % p` oracle, MDS invertibility, `permuteInverse` round trip.
+  Boundary cases of the field (`fromU64` at the modulus, `add`/`sub` across it, `neg`) and `pow`
+  against a `u128` ladder on full-width exponents, bit 63 included.
+- **Sponge structure** (`src/rpo.zig`): `mergeMany` equals `hashElements` over the flattened digests for every
+  count (odd counts end in a half block), and a 60-byte `Rpo256.hash` equals a sponge built by hand from the
+  permutation (second block overwrites the whole rate, capacity flag set once).
 - `meta.deps` is empty (`src/root.zig`).
-- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
-  the last whole-module mutation run and the delta runs after it. There is no
-  mutation run recorded yet; the only mutation evidence is a manual five-mutation
-  experiment kept outside the repository.
+- **Mutation:** one whole-module run over `goldilocks.zig`, `perm.zig`, `rpo.zig` and `xlix.zig` as ReleaseSafe
+  schemata, strict verdicts: 142 mutants, 141 killed, 1 equivalent, 0 open. They cover the field (every carry and
+  borrow compare, the conditional subtraction, the two folds of `reduce128`, the `pow` ladder and its top bit, the
+  S-box chains step by step in both the scalar and the layer form), the permutation (round-constant slices, MDS index
+  order, every half-round step dropped, the round count, every `permuteInverse` step), both sponges (every padding
+  and capacity rule, the absorb and permute counters, the zero fill of a partial block, endianness, digest slots,
+  the second-capacity-slot domain) and Rescue-XLIX (MDS order, constants, round steps). The one equivalent mutant
+  turns `lo < h1` into `lo <= h1` in `reduce128`: at `lo == h1` the borrow fold yields `p` instead of `0`, which is
+  the same residue, and the final conditional subtraction canonicalises it. Not mutated: `params.zig` and the
+  constants tables (comptime-evaluated, pinned by `constants_test.zig` against the deployed tables), the
+  `@setEvalBranchQuota`/comptime `inv_mds` derivation, and constant-time-only differences (the module's CT claim is
+  by construction, see *Constant time*).
 - No CT disassembly sweep: see *Constant time*.
 
 ## Backlog / deferred
