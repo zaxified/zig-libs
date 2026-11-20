@@ -10,8 +10,6 @@
 
 **Audit:** review 2026-11-12 · mutation 2026-11-18 (61/68, 7 eq) · src d4beefeedf1c20df
 
-Audit detail: the 2026-11-18 delta run (12 mutants over the `max_depth` limit in `preprocessWithOptions`, its `ParseOptions` wiring and the `tooDeep` diagnostic: 12 killed, 0 eq; the `max_depth` default constant 128 is a comptime field default no runtime switch reaches, pinned instead by the exact-128 / 129 test) is cumulative on the card (49/56 + 12/12); no independent review of the new layer yet. Earlier: the 2026-11-01 review is a delta over `src/fuzz_test.zig` (the fuzz-driver test migrated from sequential `run` calls to one `driver.runAll`, same harnesses and options), test code only; the library source the mutation run scored is unchanged.
-
 **Hardening:** fuzz 2026-10-24 (200,000-run budget per harness clean, JSON5_FUZZ; 3 harnesses incl. the single-pass reader against the two-stage path, ReleaseSafe) · ct n/a — JSON5 parsing (keyword review, 2026-10-07) · panic 2026-10-28 (coordinator pass + independent sweep of every pub entry point: the diagnostic prefix no longer grows with an input run of `_` (quadratic output), recovery counters widened)
 
 **Performance:** ref 0.04–0.05× json5/json5 2.2.3 (bun 1.3.12; `zig build bench-json5`: 1.4 KB config ×1000, 1 MB JSON, 1.1 MB JSON5, `parseFromSlice` into `std.json.Value` vs `JSON5.parse`) · fastest 0.68× the json5 crate 1.3.1 (Rust, into `serde_json::Value`; json-five 0.3.1 timed beside it, 0.36–0.55×; pyjson5 not timed) (measured 2026-10-24)
@@ -20,8 +18,9 @@ Audit detail: the 2026-11-18 delta run (12 mutants over the `max_depth` limit in
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: original work of
-the zig-libs authors (MIT).
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./NOTICE and
+the README's `Provenance:` line (original work of the zig-libs authors, MIT, except the quoting/layout
+of `src/stringify.zig`, ported from json5/json5 2.2.3).
 
 ## Compared with
 
@@ -29,20 +28,20 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [json5/json5](https://github.com/json5/json5) — **reference** | JavaScript | MIT (`LICENSE.md`; API says NOASSERTION) | 7.2k | v2.2.3 (2022-12-31); pushed 2024-10-25 | The full grammar, `parse` and `stringify`. This module: a text-to-text preprocessor for the commonest subset; the actual parse is `std.json`'s. |
+| [json5/json5](https://github.com/json5/json5) — **reference** | JavaScript | MIT (`LICENSE.md`; API says NOASSERTION) | 7.2k | v2.2.3 (2022-12-31); pushed 2024-10-25 | The full grammar, `parse` and `stringify`. This module: a text-to-text preprocessor that covers the full grammar (card `**Scope:**`); the actual parse is `std.json`'s. Also `parseFromSlice` and `stringify`. |
 | [callum-oakley/json5-rs](https://github.com/callum-oakley/json5-rs) | Rust | MIT | 247 | 1.3.0 (2025-12-07); pushed 2026-09-26 | serde-based; README lists comments, trailing commas, unquoted keys, single quotes, hexadecimal, leading/trailing decimal point, `+1`, multi-line strings. |
 | [Himujjal/zig-json5](https://github.com/Himujjal/zig-json5) | Zig | MIT | 25 | pushed 2025-07-11, no release | "JSON5 parser/stringifier … resembles the `std.json` API" (README); single `main.zig`; current-Zig compatibility not checked. Grammar coverage not verified. |
 | Zig `std.json` | Zig | MIT | — | Zig 0.16.0 | Strict JSON only: no comments, trailing commas or unquoted keys (no comment handling in `lib/std/json/Scanner.zig`). This module exists to feed it. |
 | sibling `yaml` | Zig | MIT | — | this repo | A YAML parser accepts most of what a JSON5 config uses (comments, unquoted keys), with a different data model; not a substitute for JSON5 output. *(inferred from YAML being a JSON superset; module not read)* |
 
-**Where we are ahead:** the only entry that **keeps `std.json` as the parser** (output feeds `parseFromSlice` unchanged, so struct decoding, limits and error sets stay std's), and the only one with an **editor mode**: `preprocessAnnotated` recovers from broken input and reports each problem as a `$err_N` entry with its source line, guaranteed not to change whether the document parses; validated against 112 fixtures of the upstream `json5-tests` corpus in both directions. **Where we are behind:** 5 of those 112 fixtures (the ones with `Infinity`/`NaN`) are not asserted in the ordinary loop because they are an error **by design** by default — they parse under `non_finite = .quoted`, which its own test asserts (2026-09-30: hex, `.5`/`5.`, `+1`, string line continuations and the extra JSON5 whitespace are rewritten now, 37 → 5); no `stringify` (plain JSON from `std.json.Stringify` is valid JSON5, so this is cosmetic) (→ Backlog). *2026-10-24:* `stringify` exists since 2026-10-20; measured against the two Rust crates (`tools/rs_field`, read in full before building): this module is faster on every workload and refuses two documents the json5 crate 1.3.1 wrongly accepts, and reads big integers both crates refuse (card `**Ahead:**`).
+**Where we are ahead:** the only entry that **keeps `std.json` as the parser** (output feeds `parseFromSlice` unchanged, so struct decoding, limits and error sets stay std's), and the only one with an **editor mode**: `preprocessAnnotated` recovers from broken input and reports each problem as a `$err_N` entry with its source line, guaranteed not to change whether the document parses; validated against 112 fixtures of the upstream `json5-tests` corpus in both directions. Against the two Rust crates (`tools/rs_field`): faster on every workload, it refuses two documents the json5 crate 1.3.1 wrongly accepts, and it reads big integers both crates refuse (card `**Ahead:**`). **Where we are behind:** 5 of those 112 fixtures (the ones with `Infinity`/`NaN`) are not asserted in the ordinary loop because they are an error **by design** by default; they parse under `non_finite = .quoted`, which its own test asserts. Unquoted keys accept a superset of ES5.1 IdentifierName instead of Unicode ID_Start/ID_Continue, and there is no reviver/replacer, streaming reader or comment-preserving round trip (all in *What is deliberately not done*). No speed lead is claimed over pyjson5, which was not timed (Backlog).
 
 ## Design & invariants
 
-- **Single-pass `std.json.Value` reader (2026-10-24).** `parseFromSlice(std.json.Value, ...)` without
-  a `diagnostic` first runs `ValueReader`, which reads the JSON5 source straight into the `Value`
-  (one pass, no intermediate JSON, strings decoded once): 0.68× the fastest Rust crate where the
-  two-stage path was 1.30×. It is a fast path, never a second parser: it builds exactly what
+- **Single-pass `std.json.Value` reader.** `parseFromSlice(std.json.Value, ...)` without
+  a `diagnostic` (in `ParseOptions` or in its `json5` options) and without a `source_map` first runs `ValueReader`, which reads the JSON5 source straight into the `Value`
+  (one pass, no intermediate JSON, strings decoded once; the figures are on the card's
+  `**Performance:**` line). It is a fast path, never a second parser: it builds exactly what
   `preprocessWithOptions` + `std.json`'s `Value.jsonParse` build (numbers through `emitNumber` and
   `Value.parseFromNumberSlice`, the same `getOrPut` duplicate handling, the same escape decoding) and
   returns null on anything it does not take -- every error, `Infinity`/`NaN`, surrogate escapes,
@@ -56,8 +55,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   object keys (`foo:` → `"foo":`), removes trailing commas before `}`/`]`, and converts
   single-quoted strings to double-quoted — all string contexts are respected so none of the above
   transformations are applied inside string literals. Modeled after the JSON5 spec (json5.org)
-  preprocessor-to-JSON approach, but implements the practical subset a config/editor use
-  case needs, not the full grammar (see Backlog). Original work of the zig-libs authors (MIT).
+  preprocessor-to-JSON approach, and covers what a config/editor use
+  case needs: every JSON5 construct except the items in *What is deliberately not done*.
 - **JSON5 numeric literals are rewritten into plain JSON numbers** (both entry points, one shared
   helper `emitNumber`, value position only): `0x1A`/`-0xff`/`0X1a` → the **exact decimal integer**
   (`26`, `-255`); `.5` → `0.5`, `5.` → `5`, `5.e2` → `5e2`, `-.5e3` → `-0.5e3`; a leading `+` is
@@ -76,7 +75,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   junk run, so no fragment is re-scanned as a second number (`0x1.5` must not become `1` + `.5` =
   `10.5` — the `[1/*c*/2]` → `[12]` failure again). A leading zero is not stripped: `01` is invalid
   JSON5 and stays invalid.
-- **`Infinity`, `-Infinity`, `+Infinity`, `NaN` (and `±NaN`) — decided 2026-09-30.** Default
+- **`Infinity`, `-Infinity`, `+Infinity`, `NaN` (and `±NaN`).** Default
   `Options.non_finite = .reject`: `preprocess` returns `error.NonFiniteNumber` and fills
   `Options.diagnostic` (`line`, `col` in bytes, `offset`/`len` of the literal, a static end-user
   `message` and a separate integrator `hint`) — JSON has no such numbers and the main
@@ -96,26 +95,26 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   U+3000. Only *between* tokens: the same bytes inside strings are untouched, and lookalikes that are
   not whitespace (U+200B, U+180E, …) are not rewritten. Between an unquoted key and its `:` every
   JSON5 whitespace and line terminator (LF, CR, U+2028, U+2029) is skipped by both entry points —
-  JSON5 §6 lets WhiteSpace and LineTerminator separate any two tokens, so `{a\n: 1}` is `{"a": 1}`.
-  (Until 2026-10-04 a line terminator there sent `preprocess` into `$err_trace` recovery.)
+  JSON5 §6 lets WhiteSpace and LineTerminator separate any two tokens, so `{a\n: 1}` is `{"a": 1}`. A line terminator there is never a recovery trigger.
 - **Strings: control characters.** A JSON5 string may hold any character except its quote, `\` and
   a line terminator (JSON5 §5), so a raw TAB or U+0001 is content; JSON needs U+0000..U+001F escaped
   (RFC 8259 §7). Both entry points emit them as `\t`, `\b`, `\f` or `\u00XX`; a `\` before one is a
   NonEscapeCharacter (the character itself) and is emitted the same way. A raw LF/CR inside a string
-  stays raw — it is an unterminated string, refused as before. (Until 2026-10-04 they were copied
-  raw and `std.json` refused the valid document.)
-- **Strings: JSON5 escapes (2026-10-05).** JSON5 takes ECMAScript 5.1's escapes, a superset of
+  stays raw — it is an unterminated string, refused.
+- **Strings: JSON5 escapes.** JSON5 takes ECMAScript 5.1's escapes, a superset of
   JSON's: `\v` → `\u000b`, `\0` (no digit after it) → `\u0000`, `\xHH` → `\u00HH`, `\'` → `'`,
   and any other character after `\` (a NonEscapeCharacter) → the character itself (`\q` → `q`,
   `\é` → `é`). `\1`..`\9`, `\0` before a digit and a short `\x` are not escapes in JSON5 and are
   left for `std.json` to refuse. An unpaired surrogate escape (`\uD800`) is passed through as the
   JSON escape it is; `std.json` refuses it (the reference, a JS string, keeps it).
-- **Unquoted keys (2026-10-05):** an identifier is ASCII letters, digits (not first), `_`, `$`,
+- **Unquoted keys:** an identifier is ASCII letters, digits (not first), `_`, `$`,
   `\uXXXX` escapes spelling such a character or any non-whitespace non-ASCII one, and raw non-ASCII
   code points that are not JSON5 whitespace — copied into the quoted key unchanged (all valid JSON
-  string content). A superset of ES5.1 IdentifierName (Backlog). A comment may stand between the key
-  and its `:` (JSON5 §6), and the key peek skips it.
-- **Truncated input is not completed (2026-10-05).** Containers left open at the end of input are
+  string content). A superset of ES5.1 IdentifierName (*What is deliberately not done*). A comment may stand between the key
+  and its `:` (JSON5 §6), and the key peek skips it. A block comment that never closes after a key is
+  refused like one anywhere else (`atUnterminatedComment`): `{a /* x` is not recovered into a `$err_trace`
+  entry; `preprocess` refuses it and `preprocessAnnotated` leaves it for `std.json` to refuse.
+- **Truncated input is not completed.** Containers left open at the end of input are
   closed only when the same run already recovered from something (`{a b` → a `$err_trace` entry, then
   `}`); a document that is merely cut off stays open and `std.json` refuses it, as the reference does.
   Both entry points apply the rule, so they still agree on whether the result parses.
@@ -123,13 +122,48 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   never `12` / `13`.
 - **API:** `preprocess(alloc, input)` / `preprocessAnnotated(alloc, input)` are unchanged;
   `preprocessWithOptions` / `preprocessAnnotatedWithOptions` take `Options{ .non_finite,
-  .diagnostic }`. `preprocess` may now also return `error.NonFiniteNumber` and
-  `error.HexLiteralTooLarge`.
+  .diagnostic, .source_map, .max_depth }`. `preprocess` may also return `error.NonFiniteNumber`,
+  `error.HexLiteralTooLarge` and, with `Options.max_depth` set, `error.NestingTooDeep`.
 - **`preprocessAnnotated`** is a lenient variant for GUI/editor use: instead of failing on malformed
   input it recovers — missing colons, missing commas, unterminated strings, invalid bare literals —
   and surfaces each recovered problem as a synthetic `"$err_<N>": "<message>"` sibling entry in the
   emitted JSON, so the caller still gets a parseable document plus diagnostics pointing at the
   offending source line.
+- **`parseFromSlice(T, alloc, input, ParseOptions)`: typed one-call parse.** `preprocessWithOptions`
+  then `std.json.parseFromTokenSource`, the intermediate text freed before returning; strings are always
+  copied, so the result never points into it. `ParseOptions` holds the JSON5 `Options` (`json5`), std's
+  `std.json.ParseOptions` (`json`: `duplicate_field_behavior`, `ignore_unknown_fields`, `max_value_len`,
+  … — the duplicate-key policy is std's, not a module one), a `diagnostic` and `max_depth`. On any
+  failure but running out of memory, `diagnostic` holds line, byte column and offset in the **JSON5
+  source** (the error's name as `message`), not in the intermediate JSON. That mapping is `SourceMap`
+  (`Options.source_map`): one point per emitted token, an output offset back to a source offset —
+  exact inside text copied verbatim, the token's start where the preprocessor rewrote it (a quoted
+  key, a converted number), and inside a string whose escapes changed length (`\x41`, `\v`, a line
+  continuation) a position after them can be off by the difference. The map is filled by one call;
+  pass an empty one; points of a removed trailing comma are dropped so the table stays sorted.
+- **`max_depth` (typed parse).** `ParseOptions.max_depth` (default 128; `Options.max_depth` for
+  `preprocessWithOptions`, default `null`): the 129th nested container is `error.NestingTooDeep`, with a
+  `Diagnostic` at its bracket, before std recurses. Applies to every `T` except `std.json.Value`, whose
+  parse (std's and this module's single-pass reader) is iterative, so depth costs heap, not stack, and
+  stays unlimited; `null` lifts the limit for a `T` whose own depth is bounded. The default and the rule
+  are serde_json's (recursion limit 128; the json5 crate parses through serde); the json5 reference
+  has none, only the engine's stack. `preprocessAnnotated` never fails on the input and ignores it.
+  Without a limit std's typed parser overflowed the stack on a self-referential `T` fed nesting tens of
+  thousands deep (a SIGSEGV between 10 000 and 20 000 levels in ReleaseFast with an 8 MiB stack, earlier
+  in Debug).
+- **`stringify` (`json5.stringify`, `src/stringify.zig`):** the other direction, shaped after
+  `JSON5.stringify(value, {space, quote})` of json5/json5 2.2.3. `writeValue(w, std.json.Value, opts)` and
+  `write(w, value, opts)` (any Zig value `std.json.Stringify` accepts), `writeFloat`, `writeString`. It
+  matches the reference byte for byte (goldens captured from it): the quote choice per string
+  (`Options.quote`: `.auto` = the one that occurs less, a tie takes `'`; `.double`; `.single`), the escape
+  set, JS `String(number)` number formatting (`1e+21`, `-0` → `0`), unquoted identifier keys
+  (`unquoted_keys`; ASCII identifiers only — Unicode `ID_Start` keys are quoted, valid and
+  round-tripping), `key: value` layout with a trailing comma when indented (`trailing_commas`). `indent`
+  is clamped to `max_indent` (10), 0 is compact. Not supported: untagged unions (compile error),
+  `jsonStringify` hooks (ignored), many-item pointers without a sentinel; string bytes are written as
+  they are, UTF-8 is not validated. The writer recurses once per level, so `Options.max_depth` (default
+  1000) makes deeper nesting — cyclic data among it — `error.NestingTooDeep` (the reference throws
+  too); this is what bounds the output of a `std.json.Value` that parsed at any depth.
 - **Both entry points are reentrant:** take an allocator and a borrowed input slice, no shared
   state; std-only deps.
 
@@ -139,16 +173,10 @@ Not a security boundary; it is a lenient text preprocessor over untrusted/hand-e
 editor input. It guarantees `preprocess`'s output is either valid transformed JSON or an error
 (never a panic on malformed input).
 
-⚠ `preprocessAnnotated`'s output was documented here as *always* valid JSON. **It is not, and no
-implementation could make it so**: empty input cannot become a valid document, and every JSON5
-construct this module cannot express as JSON (`Infinity`/`NaN` under the default, a malformed number
-such as `0x1.5`) is passed through verbatim for `std.json` to reject, which is the intended division
-of labour. (As of 2026-09-30 `.5`, `5.`, `0x1f`, `+1`, line continuations and JSON5 whitespace are
-rewritten, no longer deferred.) The
-claim also hid real defects — 63 of the 112 vendored corpus fixtures failed it, including eight
-must-parse plain-JSON numbers whose exponent was being split apart, and the fuzz target added to
-guard it asserted only "does not panic", which is `preprocess`'s contract, not this one's
-(W2 re-audit 2026-09-02).
+`preprocessAnnotated`'s output is **not** always valid JSON, and no implementation could make it so:
+empty input cannot become a valid document, and every JSON5 construct this module cannot express as JSON
+(`Infinity`/`NaN` under the default, a malformed number such as `0x1.5`) is passed through verbatim for
+`std.json` to reject, which is the intended division of labour.
 
 The guarantee that **is** true, and the one a caller actually relies on, is a differential:
 **turning diagnostics on does not change whether the document parses.** `preprocess` and
@@ -156,149 +184,103 @@ The guarantee that **is** true, and the one a caller actually relies on, is a di
 recovery never turns a parseable document into an unparseable one, and never the reverse. What
 the recovered-error markers add is *where* the problem was, not a stronger validity promise.
 
-It does not implement the full JSON5 grammar (see Backlog for the specific gaps) and does not
-validate semantic correctness of the resulting document — only `std.json` syntax validity.
+It covers the JSON5 grammar except the items in *What is deliberately not done* (and an unpaired
+surrogate escape, which `std.json` refuses) and does not validate semantic correctness of the resulting
+document — only `std.json` syntax validity.
+
+Residual risks a caller bounds itself:
+
+- **Recovery expansion.** `preprocessAnnotated` turns each malformed member into a ~58-byte `$err_N`
+  entry: measured over 10 000 malformed members (`a b,`, `a b:1,`, `a b,c d,`, `x y z,`, a multi-byte
+  key) 9.8 to 14.4 output bytes per input byte, linear. Nothing bounds it (no reference has such a
+  recovery), so a caller facing hostile input limits the input length. A test pins "at most 16 ×".
+- **`stringify` indent.** A line holds at most `max_depth * indent` bytes of indent (10 000 at the
+  defaults and `max_indent`), so a hostile `[[[...[],[],[]...]]]` can come out about
+  `max_depth * indent / 2` times larger than it went in. The writer streams, so only a sink that
+  buffers pays; the reference has no cap either, both knobs are the caller's (test "indent bound").
+- **Depth.** The typed parse stops at `ParseOptions.max_depth`; a `std.json.Value` target is unlimited
+  (heap, not stack); `preprocessAnnotated` has no limit.
 
 ## Verification
 
-Covers the base preprocessor, annotated recovery variants, an OOB-safety
-regression test, fuzz targets over `preprocess`/`preprocessAnnotated`, and the
-vendored `json5/json5-tests` conformance corpus (NOTICE); green in Debug and
-`-Doptimize=ReleaseFast`; `zig fmt --check modules/json5` clean.
-Run: `zig build test-json5`.
+Run `scripts/modtest json5` (Debug), `-Doptimize=ReleaseFast`, and `zig fmt --check modules/json5`.
+The reference oracle is re-taken with `zig build interop-json5 -- --check` (needs `bun` with the
+`json5@2.2.3` package in its install cache; see the header of `tools/interop.zig`); the comparative
+benchmark behind the card's `**Performance:**` line is `zig build bench-json5` (`tools/bench.zig`,
+`tools/bench_ref.js`; the Rust comparison is `tools/rs_field`).
+
+- **Preprocessor and annotated recovery.** Unit tests per construct for both entry points (comments,
+  quote conversion and escaping, control characters, line continuations, JSON5 whitespace, key
+  positions, trailing and lone commas, hex/decimal/non-finite numbers, EOF handling, the diagnostic
+  prefix and message fragments), an out-of-bounds-safety regression, and an entry-point differential
+  (turning diagnostics on never changes whether the document parses).
+- **`parseFromSlice`, `SourceMap`, `max_depth`.** Typed and `std.json.Value` parses, source-coordinate
+  diagnostics for std's errors, map consistency after a removed trailing comma, `max_value_len` and
+  duplicate-key behaviour against std, `max_depth` at the exact limit and one over, hostile depth
+  refused fast, a raised and a `null` limit, the `std.json.Value` target unlimited.
+- **`stringify`.** Goldens captured from the reference `JSON5.stringify` (numbers, quote choice,
+  escapes, keys, indentation), the indent bound, the depth limit.
+- **Corpus and oracle.** See *json5/json5-tests corpus coverage* below and *Anchoring* (the reference
+  oracle, 2672 generated documents).
+- **Fuzz.** `src/fuzz_test.zig` holds three harnesses over the `JSON5_FUZZ` deterministic driver
+  (`JSON5_FUZZ=<runs>[,<first seed>]`) and `testing.fuzz`: `preprocess` and `preprocessAnnotated` on
+  arbitrary bytes (never panic), and `directHarness`, the single-pass `std.json.Value` reader against
+  the two-stage path on JSON5-shaped generated documents with mutations and varied options.
+- **Mutation.** The card's mutation entry covers `src/root.zig` and `src/stringify.zig`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ### json5/json5-tests corpus coverage
 
-`src/testdata/json5-tests/` vendors 112 fixtures from the upstream corpus
-(pinned commit in NOTICE). The corpus's own convention — confirmed from its
-README, not assumed — is that the file extension encodes the verdict:
-`.json`/`.json5` must parse, `.js`/`.txt` must be rejected.
-`json5_tests_test.zig` drives every fixture through `preprocess` +
-`std.json.parseFromSlice` (this module never claims to be a standalone JSON5
-decoder — `preprocess` hands off to `std.json` for actual syntax enforcement)
-and asserts against that convention, with two carved-out exceptions:
+`src/testdata/json5-tests/` vendors 112 fixtures from the upstream corpus (pinned commit in NOTICE). The
+corpus's own convention — confirmed from its README, not assumed — is that the file extension encodes
+the verdict: `.json`/`.json5` must parse, `.js`/`.txt` must be rejected. `json5_tests_test.zig` drives
+every fixture through `preprocess` + `std.json.parseFromSlice` (this module never claims to be a
+standalone JSON5 decoder — `preprocess` hands off to `std.json` for actual syntax enforcement) and
+asserts against that convention, with two carved-out groups:
 
-- **5 out-of-scope fixtures** (`numbers/infinity`, `nan`, `negative-infinity`, `positive-infinity`
-  and `misc/readme-example`) contain `Infinity`/`NaN`, an **error by default** (2026-09-30
-  decision). Counted but not asserted by extension — see `json5_tests_vectors.zig`'s `out_of_scope`
-  field — and instead asserted by their own test: the default returns `error.NonFiniteNumber`, and
-  `non_finite = .quoted` makes each parse. Until 2026-09-30 there were **37** (hex, `.5`/`5.`,
-  `+1`, line continuations, JSON5 whitespace, `Infinity`/`NaN`); the 32 that the new rewriting
-  handles are asserted normally now, and the entry-point differential runs in both non-finite
-  modes.
-- **1 "known disagreement" fixture** (`objects/illegal-unquoted-key-symbol.txt`)
-  is asserted to *succeed* rather than fail: this module's pre-existing
-  malformed-unquoted-key recovery (root.zig's `$err_trace_N` synthetic-entry
-  path, already pinned by the "error recovery: space inside unquoted key"
-  test) deliberately turns what the corpus calls a must-reject case into
-  parseable output. Both behaviors are correct for what they're each testing;
-  see `json5_tests_test.zig`'s `known_disagreements` comment.
-  `objects/illegal-unquoted-key-number.txt` looks like the same shape but
-  needs no carve-out: empirically it already rejects correctly (the leading
-  digits break object structure before recovery gets a chance).
+- **5 out-of-scope fixtures** (`numbers/infinity`, `nan`, `negative-infinity`, `positive-infinity` and
+  `misc/readme-example`) contain `Infinity`/`NaN`, an **error by default**. They are counted but not
+  asserted by extension (see `json5_tests_vectors.zig`'s `out_of_scope` field) and instead asserted by
+  their own test: the default returns `error.NonFiniteNumber`, and `non_finite = .quoted` makes each
+  parse. The entry-point differential runs in both non-finite modes.
+- **2 "known disagreement" fixtures** (`objects/illegal-unquoted-key-symbol.txt` and
+  `objects/illegal-unquoted-key-number.txt`) are asserted to *succeed* rather than fail: this module's
+  malformed-unquoted-key recovery (root.zig's `$err_trace_N` synthetic-entry path, pinned by the "error
+  recovery: space inside unquoted key" test) deliberately turns what the corpus calls a must-reject case
+  into parseable output (a key with an embedded space, a key that starts with a digit). The module was
+  built to never fail hard on malformed config/editor input, the corpus to assert hard failure on
+  non-identifier keys; both are correct for what they are each testing. See `json5_tests_test.zig`'s
+  `known_disagreements` comment.
 
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig` and `stringify.zig`, schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 927 mutants, 877 killed (133 by panic, 19 by leak or error log, 1 by hang), 49 equivalent + 1 unobservable, 0 undecided, no defect. The 2026-10-28 run (54 mutants) was thin: the first run here left 218 alive, closed by 33 new tests (28 in `root.zig`, 5 in `stringify.zig`). Equivalent (examples): `//` stepping by 1 instead of 2, `key_pos` resets followed by a delimiter, identifier fast paths, `findKeyColon(i+1)` (that byte is never a delimiter or quote), the `diagnosticPrefix` bound +1 (filling the table needs more than `input.len` bytes), the stringifier's `n <= 21` (shortest round-trip has at most 17 digits). Unobservable: `@memset(taken, false)` in `diagnosticPrefix` (fresh memory reads false in safe builds). Cut: mutants that loop forever by construction (skipping the advance after an opener, the `w == 0` breaks, the pop/remove loops, `trimForMessage`'s `end -= 1`), comptime-only arms (`hex_limbs_max`, `ft != void`, `p.child == u8`).
+## What is deliberately not done
 
-**Delta mutation (2026-11-12, base `e5e802410`, the unterminated-comment-after-a-key fix; whole-module run above):** the key-peek branches of `preprocess` and `preprocessAnnotated`, `skipJson5WsAndComments`, `atUnterminatedComment`, schemata in a detached copy, ReleaseSafe, strict verdict: 56 mutants, 49 killed, 7 equivalent, 0 undecided. Equivalent: the skipped `key_pos = false` after an emitted key (only whitespace, comments, `:` or EOF follow, and `:` resets it) and after `skipValue` (each stop assigns it before a read); the skipped leading-blank trim (inert for `skipValue`, trimmed by `trimForMessage`); `j += 1` on `//` (the scan skips the second `/`). 2 new tests: the helpers directly, and the recovered `{a /`, `{a / b: 1}`, `{a b*: 1}` beside the refused `{a /*`. `atUnterminatedComment` is redundant with the `orelse return input.len` for today's callers — kept as the stated contract.
+- **Strict Unicode `ID_Start`/`ID_Continue` classes for unquoted keys.** Keys accept any non-ASCII code
+  point that is not JSON5 whitespace, a superset of ES5.1 IdentifierName, so the reference refuses an
+  emoji key where this module quotes it. Accepting a superset is harmless (every accepted key is valid
+  JSON string content), and the exact classes need Unicode general-category tables (Lu Ll Lt Lm Lo Nl /
+  Mn Mc Nd Pc) that neither this module nor a sibling has. `stringify` is ASCII-only for the same reason.
+- **Reviver/replacer, a streaming reader, a comment-preserving round trip.** `std.json` typed decoding
+  replaces the reviver; no implementation surveyed has the other two.
 
-**Audit 2026-10-24 (review + mutation, grade 1).** Two Sonnet read-only reviews: the first over the
-whole module (findings: a double free and a leak on OOM in `preprocessAnnotated`, `SourceMap` points
-left behind by a removed trailing comma, recovery messages with raw control bytes or half a UTF-8
-character, an uncapped annotated key, `\u+041` taken as an identifier unit, `parseFromSlice`
-dropping a diagnostic set in `json5` options, `stringify` recursing without a limit -- all fixed with
-tests); the second over the new single-pass reader against `std.json` 0.17 (no divergence; the end
-of input mapped into a removed comma, `json5.source_map` silently dropped, a non-atomic test
-counter, one more uncapped message -- fixed). 51 schemata mutants over the final source (reader,
-preprocess fast paths, the fixes, older number/comment/escape logic): 51 killed, 0 equivalent; the
-first run left 3 survivors, each a missing test (a string-only `max_value_len` document,
-`pushSlice` at the exact end of the capacity, OOM inside std.json with a diagnostic), added.
+## Open
 
-**Audit 2026-10-04 (mutation).** 52 schemata mutants over both string branches (line
-continuations, quote conversion and escaping, control characters), comments (CR/LS ends,
-unterminated block, token separation), trailing/lone-comma removal, key-position tracking and
-key whitespace, error recovery (`findKeyColon`, `skipValue`, `trimForMessage`,
-`diagnosticPrefix`, `appendJsonStr`, the line counter), EOF auto-close, `emitNumber`
-(non-finite words, hex cap and conversion, exponent sign, `.5`/`5.` forms) and JSON5
-whitespace/line-terminator decoding: 51 killed, 1 equivalent, 0 left alive. Equivalent:
-letting `removeTrailingComma` strip a comma that follows another comma (`[1,,]` → `[1,]` is
-still rejected by `std.json`: the earlier comma is itself trailing). Two conformance defects
-found and fixed (valid JSON5 refused): raw control characters inside strings were copied
-through unescaped, and `preprocess` treated a line terminator between an unquoted key and its
-`:` as the end of the key (see the two bullets above). Tests added for both fixes and for the
-7 survivors that were test gaps: an inner `"` in a single-quoted string, hex limbs that need
-their nine-digit zero padding, recovery that keeps every sibling key across strings, escapes,
-apostrophes and nesting (both entry points), and the 30-character cap on quoted fragments.
+- No independent review of the `max_depth` layer (`Options.max_depth` in `preprocessWithOptions`, its
+  `ParseOptions` wiring and the `tooDeep` diagnostic): it is covered by a delta mutation run and tests,
+  not by a read-only review.
 
 ## Backlog / deferred
-- **FIXED 2026-11-12 (refused now, `atUnterminatedComment`) — LOW, doc vs behaviour (mutation run 2026-11-12):** `{a /* x` — an unterminated block comment after an unquoted key — goes through the key-recovery layer and parses as `{"$err_trace_1": "a /* x --> missing colon after key..."}`, while `skipJson5WsAndComments`' doc comment says the main loop "then refuses it as before" (and `{a: 1} /* x` is refused). Pinned as-is by a test. Proposed: refuse an unterminated comment in key position too (the safer reading, consistent with the trailing case), with the doc comment as the contract; done together with the next json5 source change, since it re-stales the audit.
 
-- **No-panic sweep 2026-10-28 follow-up, closed 2026-11-18 (wave 7):**
-  - **J-2, typed parse recursion: fixed.** Measured first (probe: `struct { children: []Node }`, input `{children:[` x N + closers, default options, one child process per run): ReleaseFast ok at N = 128, 1 000, 10 000 (20 000 containers), SIGSEGV at N = 20 000 (40 000 containers) and N = 50 000, 100 000 (8 MiB main stack); Debug ok at N = 10 000, SIGSEGV from N = 20 000 - the module did not bound it (`preprocessWithOptions` tracked nesting but had no limit). Now `ParseOptions.max_depth: ?usize = 128` (`Options.max_depth` for `preprocessWithOptions`): the 129th nested container is `error.NestingTooDeep`, with a `Diagnostic` at its bracket, before std recurses. Default and rule are serde_json's: its recursion limit is 128 and the json5 crate parses through serde; the json5 reference (JS) has none, only the engine's stack. Applies to every `T` except `std.json.Value`, whose parse is iterative (heap, not stack) and stays unlimited, as R7 (2026-10-24) decided; `null` lifts the limit for a `T` whose own depth is bounded. Behaviour change: a typed document nested over 128 deep used to parse (or crash) and is now refused unless the limit is raised. `preprocessAnnotated` never fails on the input and ignores it. Tests at 128 / 129, at 1e5, at a raised limit and null, array and object brackets, siblings, recovery.
-  - **Recovery expansion: documented, not capped.** Measured over 10 000 malformed members (`a b,`, `a b:1,`, `a b,c d,`, `x y z,`, a multi-byte key): 9.8 to 14.4 output bytes per input byte (one ~58-byte `$err_N` entry per ~4-byte member), linear. No reference bounds recovery (it is this module's own feature), so there is nothing to match; a caller facing hostile input limits the input length. A test pins "at most 16 x".
-  - **J-4, stringify indent: documented, not capped.** A line holds at most `max_depth * indent` bytes of indent (`max_depth` 1000, `indent` clamped to 10: 10 000), so a hostile `[[[...[],[],[]...]]]` can come out about `max_depth * indent / 2` times larger than it went in; the writer streams, so only a sink that buffers pays. The reference has no cap either; both knobs are the caller's. Test "indent bound" pins the per-line bound.
-
-- **Speed lead not claimed** (2026-10-24): 0.68× the json5 crate 1.3.1 and 0.36–0.55× json-five
-  0.3.1, but Kijewski's pyjson5 2.0.1 (Cython, C++ core) was not timed — building it from its own
-  `.pyx` was refused by the session's permission check. Its decoder (read in full) goes character by
+- **Speed lead over pyjson5.** The card's `fastest` figure is against the json5 crate 1.3.1 and
+  json-five 0.3.1; Kijewski's pyjson5 2.0.1 (Cython, C++ core) has not been timed — building it from its
+  `.pyx` was refused by the session's permission check. Its decoder, read in full, goes character by
   character into a UCS-4 buffer, so a lead is likely; claim `speed —` only after timing it.
-- **R7 (depth limit) closed as not needed for parsing** (2026-10-24): std's `Value.jsonParse` and the
-  single-pass reader are iterative, so depth costs heap, not stack. The writer recursed:
-  `stringify.Options.max_depth` (default 1000, `error.NestingTooDeep`).
-
-**S2 plan — survey 2026-10-20** (Sonnet, read-only; grammar already at parity with json5/json5 2.2.3 —
-112 json5-tests fixtures + 2672 reference-oracle documents). The substantial gaps are API, not grammar:
-
-| # | Item | Effort | Decision |
-|---|---|---|---|
-| R1 | Error position in SOURCE coordinates for every syntax error (today `Diagnostic` is filled only for NonFiniteNumber/HexLiteralTooLarge; a std.json error points into the preprocessed text). The build-tool consumer (the build-tool consumer's `core/src/config.zig:2525`) and the terminal-UI consumer (`json5span.zig`) both work around it | M | **DONE 2026-10-20** — `SourceMap` (opt-in `Options.source_map`), filled by `parseFromSlice` |
-| R2 | Typed one-call parse: `parseFromSlice(T, gpa, json5_text, opts)` keeping the preprocessed buffer alive | S | **DONE 2026-10-20** — `parseFromSlice(T, gpa, text, ParseOptions)` |
-| R3 | `stringify` to JSON5 (indent, quote choice, unquoted identifier keys, trailing commas) — json5/json5, pyjson5, json5-rs have it; the terminal-UI consumer hand-emits | M | **DONE 2026-10-20** — `stringify` |
-| R4 | Format-preserving span find/replace (the terminal-UI consumer `json5span.zig`) | M | not parity (no reference has it) — owner call |
-| R5 | Strict Unicode ID_Start/ID_Continue for unquoted keys | M | not doing (accepting a superset is harmless) |
-| R6 | Duplicate-key policy | S | **DONE** — `ParseOptions.json.duplicate_field_behavior` (std's) |
-| R7 | Depth limit for hostile input | S | `Options.max_depth` with R2 |
-| R8–R10 | Reviver/replacer, streaming reader, comment-preserving round trip | – | not doing (std.json typed decoding replaces the first; nobody does the others) |
-
-Bench plan: reference json5/json5 needs node/bun (absent) → runnable stand-ins Kijewski pyjson5 (Cython,
-fastest Python), json5-rs, titanous/json5 (Go); workloads small config / large document /
-preprocess+std.json into Value and into a struct.
-
-
-Full JSON5 spec gaps — **all struck through 2026-09-30, see the two DONE items below**:
-- ~~Hex numeric literals (`0x1A`).~~
-- ~~Leading-dot/trailing-dot numbers (`.5`, `5.`).~~
-- ~~`+Infinity`, `-Infinity`, `NaN` numeric literals.~~ (error by default, `.quoted` opt-in)
-- ~~Line-continuations inside strings (backslash-newline).~~
-- ~~Leading `+` sign on numbers~~ — found by the json5-tests corpus.
-- ~~JSON5-only extra whitespace characters~~ (form feed, vertical tab, Unicode
-  space/BOM separators) — found by the corpus.
-- ~~JSON5 string escapes that JSON lacks (`\x41`, `\0`, `\v`, an escaped non-escape character
-  such as `\a`)~~ — DONE 2026-10-05 (reference JSON5 oracle, see Anchoring).
-- **Unicode ID_Start/ID_Continue for unquoted keys** (reference JSON5 oracle, 2026-10-05): keys
-  take any non-ASCII code point that is not JSON5 whitespace, a superset of ES5.1 IdentifierName
-  (the reference refuses e.g. an emoji key; this module quotes it). Exact classes need Unicode
-  general-category tables (Lu Ll Lt Lm Lo Nl / Mn Mc Nd Pc) — none in this module or a sibling.
-  Effort: medium (a generated range table, pinned to one Unicode version). Fits §2.
-- **DONE 2026-10-17 — `Diagnostic` column + user-facing message** (request from the build-tool consumer): `col`
-  (1-based, bytes from the line start), `offset`/`len` of the literal (sign included), and the
-  `Options` advice moved out of `message` into `hint`. Consumer workaround to delete: the build-tool consumer
-  the build-tool consumer's `core/src/config.zig` `diagPreprocessError` (`zig-libs request: json5 — Diagnostic ... no column`).
-- Formalizing `AnnotatedResult` against a future `diagnostics` module (currently a raw
-  `{ out, next_id }` pair; no structured line/col/severity type yet).
-- **DONE 2026-09-30 — JSON5 numeric literals** *(survey 2026-09-30)*: rewrite hex (`0x1A`), leading/trailing-dot (`.5`, `5.`) and `+`-signed numbers to JSON numbers; `Infinity`/`NaN` decided 2026-09-30: **an error by default** (`+Infinity`, `-Infinity`, `NaN` refused with a
-  clear message — JSON has no such numbers, and the main consumer, the build-tool consumer, rejects non-finite values
-  everywhere else as a safety rule), with an **opt-in `non_finite = .quoted`** that rewrites them to
-  the strings `"Infinity"`, `"-Infinity"`, `"NaN"`: `std.json` decodes a string into an `f64` field
-  through `std.fmt.parseFloat`, which reads exactly those, so a typed struct gets the same `inf`/`nan`
-  the reference json5 (JS) produces. Never `null` — that silently loses the value. Why: json5-rs's README lists them among the basic features and the upstream corpus tests them; a config with `timeout: .5` fails today with an opaque `std.json` error. Effort: small–medium (the scanner already walks values to skip strings). Fits CONVENTIONS §2. Supersedes the SPEC list above for these items.
-- **DONE 2026-09-30 — String line continuations and JSON5 whitespace** *(survey 2026-09-30)*: backslash-newline inside strings, form feed/vertical tab/Unicode spaces/BOM between tokens. Why: the remaining corpus fixtures; hand-wrapped long strings in configs use the former. Effort: small. Fits §2.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 1 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
-## Status
-
-`extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`
-in src/root.zig.
+- **Format-preserving span find/replace.** What a terminal-UI consumer's own span helper does (replace one
+  value in place keeping the surrounding text). Not parity (no reference has it); the decision whether it
+  belongs in this module is the owner's. Effort: medium.
+- **`AnnotatedResult` against a `diagnostics` module.** Today a raw `{ out, next_id }` pair with no
+  structured line/col/severity type; formalise it once the sibling `diagnostics` module's shape is the
+  one to follow.
 
 ## Anchoring
 
@@ -308,7 +290,3 @@ in src/root.zig.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** src/json5_tests_test.zig drives preprocess through the upstream json5/json5-tests corpus (src/testdata/json5-tests) honouring its extension convention in both directions, with one known_disagreement pinned; src/ref_oracle_test.zig replays the reference `json5` package (2.2.3, under bun, `tools/ref_oracle.js` → `ref_oracle_vectors.zig`) on 2672 documents generated from the JSON5 grammar plus single-character mutations: every value the reference parses must come out of `preprocess` + `std.json` identical (doubles by bit pattern, strings by UTF-16 unit, objects by key), every document it refuses must be refused or carry this module's `$err_trace` recovery marker — never silently valid; one listed class (unpaired surrogate escapes, refused by `std.json`). Since 2026-10-06 the editor mode is anchored on the same reference too: the generator records where the reference's SyntaxError stops (line, column) on each of the 1468 documents it refuses, and `preprocessAnnotated` must either produce output `std.json` refuses or carry `$err` entries whose first names that line -- one class, TOKEN_START (the reference reports the position just past the line terminator that broke a key or an escape, this module the line the token starts on). That found 56 documents the editor mode turned into valid JSON with nothing reported (a bad bare word, or a single-quoted string broken by a newline, outside an object); fixed. Not anchored, and not wire behaviour: what a recovered object holds (which sibling `$err` key, the message wording, the `$err_trace` naming), this module's own editor format with no foreign counterpart
-
-**Reference oracle 2026-10-05.** It found five defects, fixed the same day: JSON5-only string escapes (`\v`, `\0`, `\xHH`, NonEscapeCharacters, `\'` in double quotes) made `std.json` refuse valid documents; non-ASCII and `\u`-escaped unquoted keys went into recovery; so did a comment between a key and its colon; a TRUNCATED document was silently completed by EOF auto-close (`{"servers": [{"host": "a"}` read as valid); a dropped `+` joined two numbers (`1+2` → `12`). Result: 1106 of 1204 reference values agree, the other 98 hold an unpaired surrogate; of 1468 refusals, 65 are met by recovery and the rest refused. `bun tools/ref_oracle.js --check` re-takes the vectors.
-
-**How it got there.** The anchoring work landed. DONE b8d7144: json5-tests corpus adopted, THREE real bugs fixed
