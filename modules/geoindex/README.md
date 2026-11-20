@@ -123,9 +123,13 @@ RSS is linear and allocator-insensitive. Freeze is a one-time cost: ship the
 frozen buffer and never build in the request path. See `SPEC.md` for the cost
 model.
 
+## Not provided
+
+Points only (no rectangle items), no great-circle metric or results in metres (kNN and `within` use the
+equirectangular ranking metric; only `bbox` wraps the antimeridian), `u32` payloads only. Each is listed, with its reason, under `SPEC.md` § Backlog / deferred.
+
 ## Verify
 
 ```
-zig build test-geoindex                        # Debug
-zig build test-geoindex -Doptimize=ReleaseFast # ReleaseFast
+scripts/modtest geoindex
 ```

@@ -31,14 +31,14 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [mourner/flatbush](https://github.com/mourner/flatbush) — **reference** | JavaScript | ISC | 1.6k | v4.6.2 (2026-06-09) | README: a static spatial index for 2D points *and rectangles*, `search(minX,minY,maxX,maxY)` and `neighbors(x,y,k)`. This module is points only. |
-| [mourner/geoflatbush](https://github.com/mourner/geoflatbush) | JavaScript | ISC | 51 | v2.2.1 (2026-06-22) | README: `around(index, lng, lat, maxResults, maxDistance, filterFn)` — great-circle nearest search with a distance cap in km and a filter callback. Here: `k` only, equirectangular metric, no cap, no filter. |
+| [mourner/geoflatbush](https://github.com/mourner/geoflatbush) | JavaScript | ISC | 51 | v2.2.1 (2026-06-22) | README: `around(index, lng, lat, maxResults, maxDistance, filterFn)` — great-circle nearest search with a distance cap in km and a filter callback. Here: `knn` (k nearest), `within` (radius, but in the equirectangular ranking metric, degrees, not km) and a `QueryOptions.filter` predicate; no great-circle metric. |
 | [mourner/kdbush](https://github.com/mourner/kdbush) | JavaScript | ISC | 713 | v4.1.0 (2026-05-19) | Static point index with `range` and `within(x, y, radius)` (README). |
 | [georust/rstar](https://github.com/georust/rstar) | Rust | Apache-2.0 | 561 | pushed 2026-09-11 (no releases) | Dynamic R-tree with insert/delete and nearest neighbour for points, lines, rectangles (README); source not read. In-memory, not a frozen file. |
 | [paulmach/orb](https://github.com/paulmach/orb) | Go | MIT | 1.1k | v0.13.0 (2026-03-30) | Geometry library (points, polygons, distance, quadtree) *(inferred)*. |
 | [uber/h3](https://github.com/uber/h3) / [google/s2geometry](https://github.com/google/s2geometry) | C / C++ | Apache-2.0 | 6.6k / 2.7k | v4.5.0 (2026-05-21) / v0.14.0 (2026-04-23) | Spherical cell indexes (hex / quad cells) rather than trees; cover-and-radius queries, exact spherical geometry *(inferred)*. |
 | Zig ecosystem | Zig | MIT | 0-6 | 2024-2025 | `nDimensional/zig-rtree` (MIT, 0 stars, "Generic RTree for Zig vectors") and `archaistvolts/kd-tree` (MIT, 6 stars): in-memory, no frozen format. No Zig geo index with a file format found (`gh search repos`: rtree / kd-tree / spatial index). |
 
-**Where we are ahead:** the only Zig frozen, zero-copy (mmap-able), versioned and checksummed spatial index found; bounded work (`max_visited`) with truncated-prefix semantics so an attacker query cannot walk the set; no query-side allocation; exact f64 round trip; tested against a linear-scan oracle including pole/antimeridian extremes and against a corrupt-buffer fuzz harness. **Where we are behind:** no rectangle/extent items, no radius (`within`) or max-distance cap on kNN *(searched `src/query.zig`, `src/root.zig` for `max_dist`, `radius`, `filter`, `circle`: no match)*, no filter callback, kNN metric is an equirectangular approximation (not haversine) and the antimeridian is the caller's to split, payload `u32` only.
+**Where we are ahead:** the only Zig frozen, zero-copy (mmap-able), versioned and checksummed spatial index found; bounded work (`max_visited`) with truncated-prefix semantics so an attacker query cannot walk the set; no query-side allocation; exact f64 round trip; tested against a linear-scan oracle including pole/antimeridian extremes and against a corrupt-buffer fuzz harness. **Where we are behind:** no rectangle/extent items, no max-distance cap on `knn` itself (`within` is the radius query), the kNN and `within` metric is an equirectangular approximation (not haversine, results not in metres) and only `bbox` wraps the antimeridian, payload `u32` only.
 
 ## Design decision — packed Hilbert R-tree vs Z-order array vs grid
 
@@ -75,7 +75,7 @@ would lean on `binary-search + range` bounds instead; workable, but the R-tree's
 monotone-index proof is simpler to audit.
 
 Deferred refinements (STR bulk-load bbox tightening, wider fan-out tuning,
-great-circle metric) are listed at the end; none change the query API or callers.
+great-circle metric) are listed under *Backlog / deferred*; none change the query API or callers.
 
 ### Cost model
 
@@ -151,11 +151,10 @@ Each 39-byte record:
 - **Antimeridian.** `bbox` with `min_lon > max_lon` is a rectangle wrapping across
   ±180° and is answered as `[min_lon, 180] ∪ [-180, max_lon]` (two disjoint
   passes: no duplicates; shared output buffer, visit budget and filter; status of
-  the first truncating pass). Behaviour change 2026-11-16: it used to match
-  nothing. `within` and the kNN metric take no rectangle and still measure raw
+  the first truncating pass). `within` and the kNN metric take no rectangle and still measure raw
   longitude difference, so a query point and a candidate on opposite sides of the
   antimeridian are treated as far apart even if geographically near — a documented
-  limitation, not a silent wrong answer; wrap-aware distance stays deferred.
+  limitation, not a silent wrong answer (wrap-aware distance is under *Backlog / deferred*).
 - **Hilbert grid.** Points are mapped into a 65536×65536 grid spanning the data's
   overall bounding box for the Hilbert sort. A zero-width axis (all points share
   a latitude/longitude) collapses to grid column/row 0 — no divide-by-zero. The
@@ -194,6 +193,23 @@ lower-bound (distance from a point to a lat/lon rectangle on the sphere), which
 is more involved and, more importantly, would make oracle/index bit-exact
 agreement harder to guarantee. The equirectangular metric matches great-circle
 ordering closely for the regional queries this index targets.
+
+## Radius and filter queries
+
+- **`within(lat, lon, radius, out, opts)`** (kdbush `within`, geoflatbush `maxDistance`): every point whose
+  distance in the kNN ranking metric is `<= radius`. The radius is therefore in **degrees of latitude**
+  (longitude difference scaled by `cos(query latitude)`), not metres: the module has no great-circle
+  distance. Each result is a `Neighbor` carrying `dist2` (squared metric distance, `<= radius^2`); the
+  order is unspecified (depth-first), sort by `dist2` if it matters. A negative or NaN radius, or NaN
+  query coordinates, match nothing; radius 0 matches the points exactly at the query. Subtrees whose
+  box lower bound exceeds the radius (padded by 1e-9 degrees against rounding) are pruned. Status,
+  capacity and the `max_visited` budget behave as for `bbox` (`WithinStatus` is `BboxStatus`); an empty
+  `out` over a non-empty index is `.truncated_capacity`. No allocation.
+- **`QueryOptions.filter`** (geoflatbush `filterFn`): a `Filter{ ctx, func }` predicate over a candidate
+  `Match`, applied during the search by `bbox`, `within` and `knn` (Zig has no closures, hence the
+  context pointer; it must not mutate the index buffer). A rejected point is neither reported nor
+  counted against the result capacity or `k`, so `knn` still returns the k nearest points that pass;
+  rejecting points does not widen the visit budget.
 
 ## DoS / bounded-work model
 
@@ -237,55 +253,36 @@ authenticity matters.
 
 ## Verification
 
-- **Differential oracle:** a naive linear-scan reference computes the true
-  bbox-membership multiset and the true kNN (exact distances, identical metric +
-  tie-break) and must agree exactly with the index over randomized point sets and
-  queries — bbox set equal, kNN sequence + order + `dist2` equal.
-- **Adversarial sets:** empty, single point, all-identical, collinear, duplicate
-  coordinates with different values, points on a bbox edge/corner, zero-area
-  (point) bbox, `k` > set size, pole/antimeridian extremes, a bbox matching
-  everything (budget/capacity paths), NaN/inf rejected at build.
-- **Corrupt-buffer fuzz:** `std.testing.fuzz` hammers the loader + query path
-  with arbitrary and mutated-valid bytes; only typed errors, never a panic.
-- **Positive controls:** a corrupted leaf value makes the index disagree with the
-  oracle (and the body CRC catches it); a hand-crafted self-pointing child is
-  rejected as `error.Corrupt`, not looped — proving the checkers have teeth.
-- **Round-trip:** in-memory answers == answers after build → freeze → load; freeze
-  is deterministic (byte-identical on refreeze).
-- **Mutation run 2026-10-05** (in-place, Debug, 34 mutants over the header
-  loader's refusals, `Nodes.at`/`child` bounds, the bbox/kNN budgets, stack and
-  capacity paths, the box predicates, heap order and the builder's input
-  checks): 30 killed. The first pass left 14; eight tests were added (region
-  one record short, `root_index == node_count`, an empty index claiming nodes,
-  `at(count)` over a padded buffer, a record one byte past the buffer, reserved
-  flag bits, the exact bbox budget edge, a 4097-child node hitting
-  `StackOverflow`, bbox into an empty `out`, the kNN budget). Four are
-  equivalent: `axisGap` returning 0 above the box (still a lower bound — more
-  work, same answers), a wrapping `node.data + c` (child 0 is checked against
-  the parent first, so any wrap is already `Corrupt`), the builder's value
-  tie-break reversed (another deterministic layout, same answers), and
-  `gridCoord` on a zero-width axis computing 0/0 (`@intFromFloat(NaN)` gives
-  cell 0 here unchecked; illegal behaviour no test can observe).
-- Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
-  `zig build check-catalog` exit 0.
+Run: `scripts/modtest geoindex`. Tests live in `src/root.zig` (oracle and controls), `src/query.zig`,
+`src/format.zig`, `src/builder.zig` and `src/fuzz_test.zig`.
 
-## Deliberately deferred
-
-- **Great-circle / haversine kNN** with a spherical box lower-bound (see above).
-- **Wrap-aware kNN/`within` metric** — the ±180-wrapping `bbox` is done (2026-11-16);
-  distance queries still use raw longitude difference.
-- **STR (Sort-Tile-Recursive) bulk-load** — tiles the plane before the Hilbert
-  pass for slightly tighter leaf boxes; the current single-axis Hilbert order is
-  simpler and already gives good locality.
-- **Fixed-point coordinate storage** — halves box bytes at the cost of a lossy
-  round-trip; unnecessary at RÚIAN scale.
-- **Configurable / SIMD node fan-out and a dense root fan-out table** — the
-  fan-out is fixed at 16; the decoder already reads `child_count` per node, so a
-  build-time change needs no format change.
-- **On-disk / larger-than-RAM build** — the pack currently holds the node pool in
-  memory before freezing.
-- **Payloads wider than `u32`** — callers store a `u32` record id and indirect
-  through their own table (same as the sibling `trie`).
+- **Differential oracle** (`Oracle` in `src/root.zig`, the card's `**Model:**` line): a naive linear-scan
+  reference computes the true bbox-membership multiset and the true kNN (exact distances, identical
+  metric and tie-break) and must agree exactly with the index over randomized point sets and queries:
+  bbox set equal, kNN sequence, order and `dist2` equal. `within` and the filtered queries are held to
+  a brute-force scan the same way, as is the antimeridian-wrapping `bbox`.
+- **Adversarial sets:** empty, single point, all-identical, collinear, duplicate coordinates with
+  different values, points on a bbox edge/corner, zero-area (point) bbox, `k` > set size,
+  pole/antimeridian extremes, a bbox matching everything (budget/capacity paths), NaN/inf rejected at
+  build, a set large enough to cross many R-tree levels.
+- **Boundaries of the guards:** the exact visit-budget edge, capacity versus budget truncation, an empty
+  result buffer, a node with more matching children than the DFS stack holds (`StackOverflow`), too
+  small a kNN scratch (`ScratchTooSmall`), a tie between a direct-child point and a node-wrapped point.
+- **Format and loader:** header round trip and both CRCs; every refusal (short, magic, version,
+  endian, stride, flipped, region length, root/item/node consistency at each edge, reserved flag bits);
+  `Nodes.at` at `count` and at a record one byte past the buffer; the strictly-decreasing child-index
+  rule; truncated buffers of every length; the Hilbert mapping is a bijection and locality-preserving;
+  freeze is deterministic and every parent box encloses its children.
+- **Corrupt-buffer fuzz:** two harnesses, random bytes and mutated-valid buffers (damaged with both
+  CRCs re-sealed, so the damage reaches the descent), run through `std.testing.fuzz` and through the
+  deterministic driver `GEOINDEX_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver); only typed
+  errors, never a panic. Reach tests assert that each harness hits every outcome, and corpus tests pin
+  what the random buffers get past and that the mutation scripts reach the descent.
+- **Positive controls:** a corrupted leaf value makes the index disagree with the oracle (and the body
+  CRC catches it); a hand-crafted self-pointing child is rejected as `error.Corrupt`, not looped.
+- **Round trip:** in-memory answers equal the answers after build, freeze and load.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Anchoring
 
@@ -298,8 +295,21 @@ authenticity matters.
 
 ## Backlog / deferred
 
-- (survey 2026-09-30) ✅ DONE 2026-11-16 (`Frozen.within(lat, lon, radius, out, opts)`: planar-in-ranking-metric radius, degrees, NOT metres/great-circle since the module has none; results carry `dist2`, unordered; status as bbox) **Radius / max-distance query** — `kdbush.within`, geoflatbush `maxDistance`; "everything within 500 m" is the most common geo lookup and kNN with a guessed `k` is a poor substitute. Effort: small (best-first walk with a distance cap). Fits CONVENTIONS §2.
-- (survey 2026-09-30) **Great-circle (haversine) kNN and results in metres** — `Neighbor.dist2` is an unscaled proxy that degrades away from the query latitude and near the poles; geoflatbush returns km. Effort: medium (spherical box lower bound, already listed under *Deliberately deferred*). Fits §2.
-- (survey 2026-09-30) **Rectangle items (extents)** — Flatbush indexes boxes as its main case (footprints, tiles); this index holds points. Effort: medium-large (format change: leaf boxes). Fits §2.
-- (survey 2026-09-30) **Antimeridian-wrapping bbox** ✅ DONE 2026-11-16 (`bbox` splits `min_lon > max_lon` into two passes; `within`/kNN stay raw-longitude by design) — a query crossing ±180 must be split by the caller. Effort: small (split inside `bbox`). Fits §2 (already listed above).
-- (survey 2026-09-30) ✅ DONE 2026-11-16 (`QueryOptions.filter: ?Filter{ctx, func(ctx, Match) bool}` applied in bbox, within and knn; knn still returns k passing items) **Filter callback / predicate on kNN and bbox** — geoflatbush `filterFn`; the caller currently over-fetches. Effort: small. Fits §2.
+- **Great-circle (haversine) kNN and `within`, results in metres** — `Neighbor.dist2` is an unscaled
+  proxy that degrades away from the query latitude and near the poles; geoflatbush returns km. Needs a
+  spherical box lower bound (distance from a point to a lat/lon rectangle on the sphere), and would make
+  bit-exact oracle agreement harder to guarantee. Effort: medium.
+- **Rectangle items (extents)** — Flatbush indexes boxes as its main case (footprints, tiles); this
+  index holds points. Effort: medium-large (format change: leaf boxes).
+- **Wrap-aware kNN/`within` metric** — only `bbox` wraps the antimeridian; distance queries still use
+  the raw longitude difference.
+- **STR (Sort-Tile-Recursive) bulk-load** — tiles the plane before the Hilbert pass for slightly tighter
+  leaf boxes; the current single-axis Hilbert order is simpler and already gives good locality.
+- **Fixed-point coordinate storage** — halves box bytes at the cost of a lossy round trip; unnecessary
+  at RÚIAN scale.
+- **Configurable / SIMD node fan-out and a dense root fan-out table** — the fan-out is fixed at 16; the
+  decoder already reads `child_count` per node, so a build-time change needs no format change.
+- **On-disk / larger-than-RAM build** — the pack currently holds the node pool in memory before
+  freezing.
+- **Payloads wider than `u32`** — callers store a `u32` record id and indirect through their own table
+  (same as the sibling `trie`).

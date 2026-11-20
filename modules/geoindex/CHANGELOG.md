@@ -8,8 +8,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-11-16** — **BEHAVIOUR CHANGE:** `Frozen.bbox` with `min_lon > max_lon` now answers the antimeridian-wrapping rectangle (`[min_lon, 180] ∪ [-180, max_lon]`, two disjoint passes: no duplicates, shared output buffer, visit budget and filter, capacity/budget statuses preserved); it used to match nothing. Non-wrapping queries are unchanged. `within`/kNN stay raw-longitude (they take no rectangle). Tests against a brute-force scan incl. lon = ±180 exactly.
 - **2026-11-16** — **New:** `Frozen.within(lat, lon, radius, out, opts)` radius query (kdbush `within`; radius in the kNN equirectangular ranking metric, degrees, not metres) and `QueryOptions.filter` (`Filter{ctx, func}` predicate applied during `bbox`/`within`/`knn`, so kNN still returns k passing points). Additive; tests against a brute-force scan.
 
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length.
 - **2026-10-10** — tests: deterministic fuzz driver `GEOINDEX_FUZZ` over the existing harnesses (frozen-buffer loader + queries on corpus-damaged bytes, and header/body re-sealed mutations of a valid index); reach labels count real outcomes. No code or API change.
