@@ -5,15 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** `getOrLoad` wait bound decided: no change, like Go singleflight and Caffeine (SPEC Backlog).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (the owner's private workspace name removed).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** documentation wording (consumer project names removed). Source changes are comment and test-label text only; the card's audit `src` hash is re-recorded over them (the audited code is unchanged).
-- **2026-11-15** — **NO CONSUMER-VISIBLE CHANGE:** card names its model (`**Model:**`).
-- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GQ sweep: Cache 34/37 + 3 eq, Sharded 17/17; 8 new killing tests (`src/sweep_test.zig` GQ-B1..B4, `src/sweep_sharded_test.zig` GQ-SH-1..4).
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GQ). New limits with safe defaults: `Options.max_key_len` (4096; longer keys are refused like an oversized value) and `Options.max_pinned_bytes` (null = `max_bytes`; `reserve`/the first `pin` return null past it — borrowed, unfilled and parked bytes were outside every cap); `Sharded.max_shards` = 65536 (larger requests clamp) and `Sharded.Options.max_key_len`. Fixes: `max_entries` near maxInt no longer overflows (falls back to plain LRU); pin counter ceiling instead of a wrap; double `release` ignored; re-entrant mutating calls from `on_evict`/`DirtyFn` are a checked panic instead of a use-after-free, `clear` fires hooks before freeing, a hook `get` no longer runs the hill climber (window queue corruption) nor drops a stale entry; `removeMatching` is linear; `Sharded.getOrLoad` same-thread re-entry returns `error.LoadFailed` instead of waiting for itself; `Sharded` callback re-entry on a contended shard panics instead of hanging; `shardStats` out of range returns zeros; Borrow/Fill misuse is a checked panic. Tests: `src/sweep_test.zig`, `src/sweep_sharded_test.zig`.
 - **2026-10-25** — **Additive API, one fix (below):** one seeded key hash per operation (was three to five): new `Cache.Key`, `Cache.keyFor`, `Cache.getKey`/`putKey` (the hashed forms `Sharded` uses), `Options.hash_seed` (`Sharded` sets its per-instance seed; a standalone `Cache` keeps a fixed default); the in-shard map is seeded (was std's unseeded `hashString`) and is kept at most half full. Against HEAD: get_hit 81.7 → 77.2 ns, get_miss 36.8 → 34.2, put_evict 314 → 198, zipf_mixed 158 → 131. **Fix (consumer-visible):** `isDirty`/`markClean`/`markCleanIf` treat an uncommitted reservation as absent (they reached it: a flusher's ack could mark a `reserve`'s replacement clean so it was never written behind); `timeExpired` saturates at the far ends of the clock. The seam fuzz harness now checks every step against an independent model of the contract; `tools/rust_fast_bench` (quick_cache, moka) joins `bench-ramcache`.
 
-- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-23** — Performance: `removeMatching` collects up to 512 matches per scan of the map and removes them, instead of re-scanning after every removal — `ceil(matches / 512)` scans, was one per match (a 1 GiB fully resident `pagecache` file close was ~10^10 steps). Same result, still allocation-free and infallible.
 
@@ -44,9 +38,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   added TTL-boundary agreement of get/pin/eviction, exact `max_bytes` values, region sizes, the
   admission coin, sketch reset, saturating deadlines, the `evictStep` progress guard, heap-order
   checks after random operations and a non-vacuous reflective `Sharded.stats` test.
-- **2026-10-01** — **NO CONSUMER-VISIBLE CHANGE:** `Sharded`'s `on_evict`/`drainDirty` contract
-  now states that a callback must not suspend in a `std.Io` when tasks of one thread share the
-  cache (the shard lock does not wait through the `Io`). Documentation only.
 - **2026-09-29** — Fixed: a reservation (`reserve`, before `commit`) was a HIT for `get`
   and lendable by `pin` with its uninitialized bytes, and `drainDirty` handed them to a
   flusher (a reservation is dirty from birth). Harmless while the producer fills before

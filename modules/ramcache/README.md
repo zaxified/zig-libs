@@ -3,8 +3,10 @@
 Bounded in-memory cache with **two independent freshness axes**: TTL (wall-time)
 and **generation** (logical invalidation — bump one counter to invalidate every
 generation-tied entry at once; stale entries drop **lazily on the next `get`**,
-no sweep). Byte-cap + entry-cap, **expired-then-LRU** eviction (an already-expired
-entry is always the first victim, else the least-recently-used).
+no sweep). Byte-cap + entry-cap, **W-TinyLFU** admission and eviction (an already-expired
+entry is always the first victim; otherwise a window candidate takes the main
+region's least-recently-used victim's slot only if its estimated recent
+frequency wins).
 
 Provenance: original work of the zig-libs authors (MIT) — the TTL +
 generation-invalidation + byte/entry-cap cache. The W-TinyLFU
@@ -12,9 +14,9 @@ admission/eviction upgrade is clean-room from the TinyLFU paper (Einziger &
 Friedman, "TinyLFU: A Highly Efficient Cache Admission Policy") with design
 references Caffeine (Apache-2.0; window + SLRU probation/protected structure)
 and ristretto (Go, MIT; admission anti-starvation tie-break) —
-algorithm/behavior only, no source consulted or copied. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against maypok86/otter v2.3.0, 2026-10-11) is our own tooling; it drives the reference only through its public API.
+algorithm/behavior only, no source consulted or copied. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against maypok86/otter v2.3.0) is our own tooling; it drives the reference only through its public API.
 
-- **Model after:** Go `groupcache` / `ristretto`; the generation-tie is the novel bit.
+- **Model after:** W-TinyLFU (Einziger & Friedman; Caffeine/ristretto design, clean-room); the generation tie is the novel bit.
 - **Platform:** any (pure `std`, dependency-free). **Role:** util.
 - **Concurrency:** `Cache` is `single_owner` — NOT internally synchronized, no
   lock by design. One thread/event loop owns the instance. To share a cache
@@ -59,7 +61,8 @@ key is replaced, evicted, or cleared; copy it if you need it longer.
 **Semantics:** an entry stamped with generation `G != 0` is stale as soon as the
 caller's `cur_gen != G` — the idiom is "DB-derived entries die the instant a data
 refresh bumps the generation", with external TTL-only entries (`gen == 0`)
-unaffected. An item larger than `max_bytes` is never stored.
+unaffected. An item larger than `max_bytes` is never stored, nor is a key longer than
+`Options.max_key_len` (4096, refused the same way).
 
 **Time-to-idle (opt-in):** `idle_ttl_ns > 0` also expires an entry that has not been
 read for that long (Caffeine `expireAfterAccess`). A hit (`get`, `pin`, `Sharded.getBuf`)
@@ -192,5 +195,11 @@ instead of corrupting memory under load.
 Benchmark against maypok86/otter: `zig build bench-ramcache` (needs Go 1.26.0 and otter
 v2.3.0 in the module cache).
 
-Tests: `zig build test-ramcache` (deterministic — injected `now_ns`/generation,
+## Not provided
+
+No typed keys/values (values are bytes), no refresh-after-write or async cache, no weigher, no
+persistence, and no keyed-hash hardening of a standalone `Cache`: `SPEC.md` *What is deliberately not
+done* gives the reasons and *Backlog / deferred* what is open.
+
+Tests: `scripts/modtest ramcache` (deterministic — injected `now_ns`/generation,
 no real clock; the `Sharded` concurrency tests use real threads).

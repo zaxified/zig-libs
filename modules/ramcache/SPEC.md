@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-11-01 · mutation 2026-10-30 (460/486, 26 eq) · src 8af969673a84ad77
 
-Audit detail: the 2026-11-01 review is a delta over `sweep_sharded_test.zig` only (full-CI fix: the dying sweep child's stderr goes to /dev/null); library source unchanged since the mutation run.
-
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAMCA_E_FUZZ) · ct n/a — in-memory cache (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + 2 blind reviews: max_key_len 4096 + max_pinned_bytes (= max_bytes) limits, hook re-entrancy UAF → checked panic, hook get no longer corrupts the window queues or drops stale entries, linear removeMatching, Sharded same-thread getOrLoad re-entry → LoadFailed, callback self-lock → panic, max_shards clamp; delta audit Cache 34/37 + 3 eq, Sharded 17/17)
 
 **Performance:** ref 0.23–1.01× maypok86/otter v2.3.0 · fastest 1.95× quick_cache 0.6.24 (put_evict; get_hit 1.90×, zipf_mixed 1.45×, get_miss 1.41×, put_update 1.31×; moka 0.12.16 slower than ours on every row) (measured 2026-10-25)
@@ -21,11 +19,11 @@ Audit detail: the 2026-11-01 review is a delta over `sweep_sharded_test.zig` onl
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. No foreign source was read; the module's own NOTICE already records the design references.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. No foreign source was read; the README's `Provenance:` line records the design references.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -36,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [karlseguin/cache.zig](https://github.com/karlseguin/cache.zig) | Zig | MIT | 92 | pushed 2026-08-19 (no releases) | The Zig alternative: thread-safe LRU, TTL, ref-counted entries; plain LRU admission (no frequency sketch) *(inferred from README)*. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | Hash maps only; no bounded or expiring cache. |
 
-**Where we are ahead:** in Zig, the only scan-resistant (W-TinyLFU) cache; a second, *logical* invalidation axis (generation bump stales a whole class of entries instantly, in O(1)); deterministic by construction (caller-injected clock and generation); write-behind seam (dirty bit, `drainDirty`, `on_evict`), pin/reserve zero-copy borrows, and a `Sharded` wrapper for threads with attacker-chosen-key hardening. **Where we are behind:** nothing the core feature set of Caffeine lets a user notice since 2026-10-11 — `getOrLoad` with single-flight (`Sharded`; a trivial non-concurrent twin on `Cache`), time-to-idle (`Options.idle_ttl_ns`, the effective deadline is the earlier of write-TTL and idle), and the adaptive window (`Options.adaptive_window`, opt-in hill climber). Consciously out: **typed keys/values** — values are bytes by design: `pin`/`reserve` hand out zero-copy borrows and the write-behind seam (`drainDirty`) flushes bytes; a typed layer is the caller's codec. **Refresh-after-write and async caches** (Caffeine `refreshAfterWrite`, `AsyncCache`, otter `RefreshCalculator`) — they need a background executor or an `Io`, and this module takes neither (caller-injected clock, no threads of its own); a caller that wants stale-while-revalidate runs `getOrLoad` from its own task. **A weigher** — the byte cap over value bytes is the weight; a per-entry weight function is not offered. **Stats-driven tuning** beyond `Stats` — not offered.
+**Where we are ahead:** in Zig, the only scan-resistant (W-TinyLFU) cache; a second, *logical* invalidation axis (generation bump stales a whole class of entries instantly, in O(1)); deterministic by construction (caller-injected clock and generation); write-behind seam (dirty bit, `drainDirty`, `on_evict`), pin/reserve zero-copy borrows, and a `Sharded` wrapper for threads with attacker-chosen-key hardening. **Where we are behind:** nothing the core feature set of Caffeine lets a user notice — `getOrLoad` with single-flight (`Sharded`; a trivial non-concurrent twin on `Cache`), time-to-idle (`Options.idle_ttl_ns`, the effective deadline is the earlier of write-TTL and idle), and the adaptive window (`Options.adaptive_window`, opt-in hill climber). Consciously out (the reasons are under *What is deliberately not done*): typed keys/values, refresh-after-write and async caches, a weigher, stats-driven tuning beyond `Stats`.
 
 ## Design & invariants
 
@@ -74,9 +72,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   `markClean`; `on_evict`'s `dirty` flag catches whatever a periodic sweep didn't get to before
   capacity pressure or `clear()` removed it. **Opt-in and free when unused:** `on_evict` defaults to
   `null` (no-op), and the dirty bit costs one `bool` per entry but is never consulted internally — no
-  callback set + dirty API unused ⇒ behavior and performance are byte-identical to before this
-  existed.
-- **Time-to-idle (2026-10-11).** `Options.idle_ttl_ns > 0` adds a second clock to every entry:
+  callback set + dirty API unused ⇒ behavior and performance are byte-identical to a cache without the seam.
+- **Time-to-idle.** `Options.idle_ttl_ns > 0` adds a second clock to every entry:
   `last_access_ns`, set by `put`, `get` and `pin` (a `release` has no clock and does not count).
   An entry is expired when `now - inserted > ttl` **or** `now - last_access > idle_ttl_ns` (both
   strict, so an entry is still fresh at exactly its limit). It rides the existing expiry heap:
@@ -86,7 +83,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   "expired first" eviction step. Counts in `Stats.expired` through `get`/`pin` like a TTL expiry.
   `<= 0` is off, with the same "no clamp, no assert" meaning as `default_ttl_ns <= 0`. Anchor:
   Caffeine `expireAfterAccess`, otter `ExpiryAccessing` (`expiry_calculator.go:108-126`).
-- **Adaptive window (2026-10-11), opt-in (`Options.adaptive_window`).** The fixed window is ~1 %
+- **Adaptive window, opt-in (`Options.adaptive_window`).** The fixed window is ~1 %
   of `max_entries`; with the flag on, `Cache.climbIfDue` samples the lookup hit rate over
   `10 x max_entries` lookups and moves the window limit (`window_adapt`) by a signed step,
   Caffeine's hill climber as otter v2.3.0 implements it (`policy.go:375-529`). Kept: constants
@@ -99,7 +96,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   cycle. It only moves entries between regions (never frees one), so it is safe in front of a
   lookup. A cache of fewer than ~16 entries never moves its window (the step truncates to 0 entries).
   Default off, so every golden and behaviour of the fixed window is untouched.
-- **`getOrLoad` (2026-10-11).** `Cache.getOrLoad` is `get`, then on a miss the `Loader`, then `put`
+- **`getOrLoad`.** `Cache.getOrLoad` is `get`, then on a miss the `Loader`, then `put`
   — single-owner, so no coordination. `Sharded.getOrLoad` adds single-flight: a per-shard in-flight
   table (`StringHashMap` of `*Flight`, guarded by the shard lock) holds one `Flight` per loading
   key, a stack object of the *leader*. The leader registers it under the lock, runs
@@ -109,9 +106,25 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
   in the table, wait on `done` with the shard lock's spin-then-yield discipline, copy the value
   (own `gpa`) or take the leader's error, and decrement `waiters` last. The leader leaves its frame
   only when `waiters` reads 0 — after the removal the count can only fall, so the stack object
-  cannot dangle. Waiters never retry; every caller's result is the leader's. Rule for the loader:
-  never re-enter `getOrLoad` for the same key on the same thread (it would wait for itself).
+  cannot dangle. Waiters never retry; every caller's result is the leader's. A loader that re-enters `getOrLoad` for the key it is loading, on its own thread,
+  gets `error.LoadFailed` back instead of waiting for itself.
   Anchor: Go singleflight as otter uses it (`singleflight.go:98-132`, `cache_impl.go:766-791`).
+- **Victim selection is O(1).** An intrusive doubly linked queue per region (Caffeine's
+  access-order deque, head = least recently used; a hit, an insert, a move between regions and
+  a `release` all append at the tail) plus a binary min-heap over deadlines, so `regionLruKey` and
+  `findExpiredKey` read a queue head or heap root instead of walking the map. Each entry carries
+  a small stable index node (a separate allocation, because a hash map moves its values on
+  rehash) that holds its region (`Node.region`); queue maintenance is O(1) and allocation-free,
+  the expiry heap's O(log n), neither hashes. A counter-based regression test asserts the
+  per-insert entry-visit count of the eviction path does not grow with capacity.
+- **One hash per operation.** `Cache.Key` carries the one seeded Wyhash of the key
+  (`Options.hash_seed`; `Sharded` passes its per-instance seed); the node stores it
+  (`Node.hash`, the map rehashes from it), the shard is bits 32 and up of it, and the frequency
+  sketch re-mixes it (`FrequencySketch.hashPair`, a splitmix finalizer) instead of hashing the
+  key bytes again; a test pins the spread of a shard's keys over map slots, fingerprints,
+  doorkeeper bits and sketch blocks. The sketch uses Caffeine's block layout (the key's four
+  counters in one 64-byte block). A miss records nothing in the sketch (Caffeine and otter
+  record on hits and writes only). The key map is kept at most half full (std's default is 80 %).
 
 ## Borrow seam — `pin` / `reserve` / `release`
 
@@ -205,9 +218,11 @@ the design commitments an auditor needs:
   bound. `clear` guarantees only that every entry present in shard *i* when shard *i* was locked is
   gone (a writer may repopulate an already-cleared shard). `drainDirty` visits every entry dirty in
   shard *i* when shard *i* was locked, once.
-- **`on_evict` contract change.** It now fires from whichever thread triggered the removal, with a
+- **`on_evict` contract.** It fires from whichever thread triggered the removal, with a
   shard lock held: it must be thread-safe, cheap, and must not call into the same `Sharded` — where
-  `Cache` calls reentrancy "unsupported", here it is a hard deadlock. `drainDirty`'s callback has
+  `Cache` panics on a mutating call from a callback, here a method called from a callback of the
+  same shard would self-deadlock on the non-reentrant lock, so it panics with a diagnosis instead of
+  hanging (a deadlock across two shards from callbacks, AB/BA, is not detected). `drainDirty`'s callback has
   the same restriction, which is why `Cache.drainDirty`'s allowance to call `markClean` from the
   callback does **not** carry over. The async-flusher ack is therefore `markCleanIf(key, flushed)`,
   a compare-and-clear that refuses to ack a value another thread has since overwritten; plain
@@ -218,202 +233,154 @@ the design commitments an auditor needs:
 `Cache` is not a security primitive and is **not thread-safe** (`concurrency = single_owner` — one
 thread/loop owns the instance; a caller sharing it either supplies its own lock — `sessions`'
 `RamcacheStore` and `readthrough` are the reference for that pattern — or uses `Sharded`). The
-`meta.concurrency` tag names the primary type; `Sharded` is internally synchronized. Key hashing is
-Wyhash, not keyed/DoS-resistant —
-not hardened against adversarial hash-collision flooding; intended for trusted internal keys (query
-strings, URLs), not attacker-chosen keys. No persistence — `on_evict`/dirty-set (see above) is a
+`meta.concurrency` tag names the primary type; `Sharded` is internally synchronized. Key hashing is a seeded Wyhash whose default seed (`Options.hash_seed`) is a public constant, so a
+standalone `Cache` is not hardened against adversarial hash-collision flooding: it is intended for
+trusted internal keys (query strings, URLs). A caller with attacker-chosen keys passes a random
+per-process `hash_seed` (`Sharded` derives its own). Keys are not part of `max_bytes`;
+`Options.max_key_len` (4096) bounds the footprint at `max_entries * max_key_len + max_bytes` plus
+the per-entry node overhead, and `Options.max_pinned_bytes` (default `max_bytes`) bounds the value
+bytes held by borrows (past it `pin` and `reserve` return null). The frequency sketch is allocated
+on first access at about 24 bytes per entry slot (`max_entries` rounded up to a power of two), so
+`max_entries` is a memory decision for the operator. No persistence — `on_evict`/dirty-set (see above) is a
 *seam* for a caller-built write-behind layer, not persistence itself; the cache does no I/O and
-`on_evict` must not call back into the `Cache` (reentrancy mid-removal, e.g. during `clear`'s
-iteration, is unsupported). An item larger than `max_bytes` is never stored — on a fresh insert or
+the `on_evict` and `drainDirty` callbacks may call read-only methods (`get`, `isDirty`, `markClean`): a
+call from inside one that adds or removes an entry is a checked panic (`in_hook`). An item larger than `max_bytes` is never stored — on a fresh insert or
 on an overwrite of a resident key, where the entry is dropped rather than kept at its pre-write
 value. `Sharded` does **not** inherit the "trusted keys only" posture above unchanged: there the key
-selects a lock, so it gets a per-instance shard seed and a yielding waiter (see its section). Victim
-selection is **O(1)**: an intrusive doubly linked queue per region (Caffeine's access-order deque,
-head = least recently used), plus a binary min-heap over TTL deadlines, so `regionLruKey` and
-`findExpiredKey` read a queue head / heap root instead of walking the map. Each entry carries a
-small stable index node (a separate allocation, because a hash map moves its values on rehash);
-queue maintenance is O(1) and allocation-free, the expiry heap's O(log n), neither hashes.
-Since 2026-10-11 a hit, an insert, a move between regions and a `release` all append at the queue
-tail, as in Caffeine; the region queues were tick-ordered min-heaps before (O(log n) per hit, one
-node dereference per level — the larger part of a hit, bench vs otter), and a released borrow or a
-demoted entry then kept its old tick instead of becoming its region's most recent entry. Until 2026-08-07 those two
-functions were full-map scans and `maintain` ran up to three of them on **every** insert, making one
-insert O(`max_entries`) — measured on `pagecache` at 1.98 → 93.5 us per 4 KiB page fill from 64 to
-4096 pages, against 1.33 → 0.80 us now, with the per-insert entry-visit count flat at ~2 instead of
-rising to ~10 200. (Those heaps were ordered by the same global tick the scans compared, so that
-step was a complexity change, not a policy change; the 2026-10-11 queues are Caffeine's order.)
+selects a lock, so it gets a per-instance shard seed and a yielding waiter (see its section).
 
 ## Verification
 
-Deterministic unit tests (injected `now_ns`/generation, no real clock): hit/miss, TTL expiry, lazy
-generation invalidation + `gen==0` immunity, replace/byte-accounting, entry-cap + byte-cap LRU
-eviction, expired-before-LRU, clear-keeps-counters, value-copy-on-put, borrowed-slice lifetime,
-stats. Sketch tests: exact estimate for a lone key, CMS never underestimates under collision load,
-saturation at 15(+1 doorkeeper), aging halves + clears the doorkeeper. W-TinyLFU behavior: admission
-gate, scan resistance (a 150-key one-hit burst doesn't evict a 20-key hot set), and a 60k-op
-Zipf-skewed hit-ratio benchmark asserting W-TinyLFU beats an inline plain-LRU baseline by ≥10%.
-Complexity: a counter-based (not clock-based) regression test asserts the per-insert entry-visit
-count of the eviction path does not grow when capacity goes from 64 to 4096, plus an expired-first
-test with one TTL entry buried among seven that never expire.
-Write-behind seam: `on_evict` fires on W-TinyLFU eviction / replacement / clear with the correct
-key+value+dirty+reason and does *not* fire on a plain hit or miss (positive control); dirty set on
-`put`, cleared by `markClean`, `markClean` on an absent key is a no-op; `drainDirty` visits exactly
-the dirty entries (a cleaned one is excluded, positive control); an evicted dirty entry is reported
-dirty to `on_evict` (the safety-net case) vs. an evicted clean entry reported non-dirty on the same
-path; unset `on_evict` leaves eviction/replace/clear behavior unchanged. Run: `zig build
-test-ramcache`.
+How to run: `scripts/modtest ramcache` (module tests; the `Sharded` concurrency tests use real
+threads, everything else injects `now_ns`/generation, so no real clock), `zig build bench-ramcache`
+(a program, not a test: see *Performance*).
 
-**2026-10-11 features.** *Time-to-idle:* hit/put refresh, the strict boundary, min with the write
-TTL (both which binds), `Stats.expired`, eviction taking an idle-expired entry before the frequency
-contest (RED without idle-aware expiry: the window candidate loses the tie instead), a hit moving the
-entry's place in the expiry heap (RED if the old deadline stays), `pin` as an access and `release`
-re-filing at the new deadline, off for `0` and negative, and a **naive-model test** — 6000 random
-put/get/remove steps compared with a model written straight from the definition (write TTL + idle
-TTL, `now` advancing 0..5 ns against an idle limit of 37), heap order and an exact expiry-heap
-membership/deadline invariant (`expectExpiryAgrees`) after every step. The borrow-seam fuzz harness
-gained a config byte (half the scripts run with `idle_ttl_ns = 40`, time advancing 1..136 ns per
-step) and a reach label `idled` (a lookup that finds an entry expired by idleness alone); the same
-membership invariant runs after every operation of every script. *Adaptive window:* off by default
-(window stays 2 of 200, the climber never runs); a 120 000-step random get/put/remove run with the
-climber and idle expiry on, checking heap order, region agreement, `window_adapt in [1, 80 %]`,
-`window_count <= limit` and `protected_count <= cap` after every step, and that the window actually
-moved; two deterministic traces on a 200-entry cache (80 000 ops): a pure-recency trace where the
-adaptive window must beat the fixed one by 10 points in the second half (a fixed 2-entry window
-rejects nearly every new key at its exit — each was seen once or twice, the victim at least as
-often — the climber grows it to the working set), and a zipf(1.0) trace where it must not lose more
-than one point overall. Failure messages print both rates. *`getOrLoad`:* hit does not load, miss
-loads and stores, error stores nothing and the next call loads again, ttl/gen of the stored entry,
-`OutOfMemory` on an uncopyable hit; threads: 6 threads on one cold key run the loader once, the
-loader holds the load open until 5 waiters are registered (read from the in-flight table under the
-shard lock, so single-flight is exercised by construction) and every caller gets its own copy; the
-same with a failing loader — one call, every caller gets `LoadFailed`, none retried (RED if a waiter
-ran its own load: `calls` would exceed 1).
-
-**`Sharded`.** There is no external anchor for this design, so the tests carry the argument
-themselves. Structural unit tests: `getBuf`'s `ok` slice aliases the caller's buffer (asserted by
-pointer identity); `buffer_too_small` is distinct from `miss` and reports the needed length; an
-owned copy from `get` survives a `clear()` of the entry it came from (the assertion that would read
-freed memory if a borrowed slice were returned); keys reach *every* shard and aggregate occupancy
-reaches the requested cap (a degenerate `shardIndex` stays consistent between put and get, so only
-distribution and capacity see it); shard-count rounding + both clamps; per-shard byte ceiling;
-`clear` and `stats` checked both aggregate *and* per-shard so a skipped shard cannot cancel out;
-TTL/generation axes; `markCleanIf` refusing a stale ack. Concurrency (real threads, leak-checking
-allocator): a mixed get/put/evict/clear stress where every stored value is a self-describing record
-(key id + round + derived pattern) verified on both read paths *and* inside `on_evict`, with
-`expectInvariants` re-deriving byte totals, region counters and the key→shard mapping from the raw
-maps after the join; a parallel-`clear` race; and a dedicated test that a value is never freed while
-being copied out.
-
-That copy-window test used to rest on a *memory-shaped* oracle alone — large values plus a
-`clear`-spinning thread, on the theory that an early lock release would then be caught by
-construction. Measured against the real mutation (`getBuf` unlocking right after the lookup) it was
-**5 red / 4 green over nine fresh compiles**: a coin flip, which in a gate reads as harness flake and
-gets re-run until green. Its primary oracle is now exact instead: a test-only probe (`copy_probe`,
-compiled out of non-test builds) fires from *inside* `getBuf`'s critical section and tries to take
-the very lock the copy is supposed to run under. `std.atomic.Mutex` is non-reentrant, so while the
-lock is genuinely held that `tryLock` fails on every schedule and every run — mutual exclusion, no
-window to miss. The mutation is now caught 9/9; isolated (a momentary unlock with nothing left
-dangling) the probe alone reports 6032 violations where the memory oracle sees none.
-
-Also covered since the 2026-08-11 re-audit: the **delivered** defaults (`.shards` omitted ⇒ 16
-shards and the caps divided by 16 — every other test passes `.shards` explicitly, so `1` used to
-leave the suite green); the shard seed (base constant pinned as a literal and against both sketch
-seeds; two instances from identical options disagree on where >128 of 256 keys live; an explicit
-`shard_seed` is honoured verbatim); a waiter yielding rather than spinning, proven by holding a shard
-lock by hand while a second thread blocks on it; `drainDirty`'s lock under two writer threads and a
-sweeping thread, where the callback `tryLock`s its own shard (deleting the lock previously left the
-suite green); `stats()` compared to a per-shard sum **reflectively over every `Stats` field**, with a
-real borrow taken through a shard's `Cache` so `pinned` is non-zero and the comparison is not
-vacuous; and the aggregate/per-shard byte cap under an update-only workload.
-
-**Mutation-tested.** Each central invariant was checked by mutating the implementation and
-confirming a test goes red: shard lock released before `getBuf`'s copy (8/8 red — and 0/5 before the
-dedicated copy-window test existed, which is why it exists); the same for `get`'s owned copy (3/3);
-`put` without its lock (5/5); `shardIndex` collapsed to a constant; `clear`, `stats` and
-`drainDirty` each skipping a shard; `markCleanIf` acking unconditionally; `buffer_too_small`
-reported as a miss; per-shard caps not divided.
-
-**Mutation run 2026-10-04.** 60 schemata mutants (one ReleaseSafe build, env switch, 20 s cap per
-run) over `root.zig` and `sharded.zig`: TTL and generation comparisons in `get`/`pin`/the expiry
-heap, `max_bytes` ceilings (insert, replace, reserve), entry/byte eviction triggers, window and
-protected region sizes, the admission gate (`>=` vs `>`, the `>= 6` coin, its rate), sketch
-saturation/reset, saturating deadlines, expiry/LRU heap sift directions, `removeMatching`, the
-progress guard, `Sharded` shard clamping, `getBuf` exact fit, `stats` aggregation, `markCleanIf`,
-`clear`/`drainDirty` shard coverage and the lock-held-during-copy invariant. 58 killed (including
-3 by timeout), 2 survivors not pinned on purpose: the aging trigger `samples >= sample_limit` vs
-`>` and the tombstone rebuild trigger `removals < max(32, cap/4)` vs `<=` -- both are approximate
-heuristics by their own doc ("~10x capacity", "passes a quarter of the capacity"), one sample or
-one removal of difference has no observable contract, and a test would enshrine an arbitrary
-boundary. First pass: 29 survivors; tests added (WHY in each test: doc comment or
-module invariant): TTL boundary agreement of get/pin/eviction, gen 0 immunity for `pin`,
-exact `max_bytes` values, region sizes (1%, 80%), the admit coin (threshold 6, rate 1/128, via a
-fixed-PRNG band), sketch reset per nibble, saturating deadlines (insert, replace, release),
-replacing a TTL entry with ttl 0, the `evictStep` progress guard (a corrupted node must end the
-loop), `removeMatching` with a key equal to the prefix, a 4000-step random operation test that
-checks every heap's order and back-pointers after each step, non-zero `Sharded.stats` fields,
-`deriveSeed` uniqueness. The `getBuf`/`get` early-unlock mutants were killed deterministically by
-the copy-window probe test (no race test involved). Finding fixed in the same run (behavioural):
-`Sharded.stats()` did not add `Stats.rehashes` (always 0); the reflective stats test now makes
-every field, `rehashes` included, non-zero.
+- **Unit tests.** hit/miss, TTL expiry, lazy generation invalidation and `gen == 0` immunity,
+  replace/byte-accounting, entry-cap and byte-cap eviction, expired-before-LRU, clear keeps the
+  counters, value copy on put, stats; the frequency sketch (exact estimate for a lone key, never
+  an underestimate under collision load, saturation, aging halves and clears the doorkeeper, every
+  nibble of a counter word in use); the W-TinyLFU behaviour (admission gate, scan resistance: a
+  one-hit burst does not evict a hot set; a Zipf-skewed hit-ratio test asserting W-TinyLFU beats an
+  inline plain-LRU baseline by at least 10 %); the complexity regression test of *Design*.
+- **Time-to-idle, adaptive window, `getOrLoad`.** Idle expiry: hit/put refresh, the strict
+  boundary, the earlier of write TTL and idle deadline, `Stats.expired`, eviction taking an idle-expired entry
+  before the frequency contest, a hit re-filing the entry in the expiry heap, `pin` as an access,
+  `release` re-filing, off for `0` and negative; a naive-model test (random put/get/remove against a
+  model written from the definition) with the heap order and the expiry-heap membership/deadline
+  invariant (`expectExpiryAgrees`) checked after every step. Adaptive window: off by default, a long
+  random run with the climber and idle expiry on checking heap order, region agreement,
+  `window_adapt` bounds and counters after every step, and two deterministic traces (a pure-recency
+  trace where the adaptive window must beat the fixed one, a Zipf trace where it must not lose
+  more than one point). `getOrLoad`: a hit does not load, a miss loads and stores, an error stores
+  nothing, the stored entry's ttl/gen, `OutOfMemory` on an uncopyable hit; threads on one cold
+  key run the loader once (the loader holds the load open until the waiters are registered, read
+  from the in-flight table under the shard lock, so single-flight is exercised by construction)
+  and every caller gets its own copy; with a failing loader one call is made and every caller gets
+  `LoadFailed`.
+- **Borrow seam.** The model-fuzz harness below, plus `pin`/`reserve`/`commit`/`discard`/`release`
+  unit tests (unevictable while borrowed, parking on overwrite/remove/clear/expiry, a refused borrow
+  counted as a miss, forged or repeated `release` refused).
+- **Write-behind seam.** `on_evict` fires on eviction, replacement and clear with the right
+  key, value, dirty bit and reason, and not on a plain hit or miss; the dirty bit is set by `put`,
+  cleared by `markClean` (a no-op on an absent key); `drainDirty` visits exactly the dirty entries;
+  an evicted dirty entry reaches `on_evict` as dirty; an unset `on_evict` changes nothing.
+- **`Sharded`.** There is no external anchor for this design, so the tests carry the argument
+  themselves. Structural: `getBuf`'s `ok` slice aliases the caller's buffer (pointer identity),
+  `buffer_too_small` is distinct from `miss` and reports the needed length, an owned copy from `get`
+  survives a `clear()`, keys reach every shard and aggregate occupancy reaches the requested cap,
+  shard-count rounding and both clamps, the per-shard byte ceiling, `clear`/`stats` checked
+  aggregate and per shard, TTL/generation axes, `markCleanIf` refusing a stale ack, the delivered
+  defaults (`.shards` omitted), the shard seed (pinned base constant, two instances disagree on
+  placement, an explicit `shard_seed` honoured), a waiter yielding rather than spinning (proven by
+  holding a shard lock by hand), `stats()` compared to a per-shard sum reflectively over every
+  `Stats` field. Concurrency (real threads, leak-checking allocator): a mixed get/put/evict/clear
+  stress where every stored value is a self-describing record verified on both read paths and
+  inside `on_evict`, with `expectInvariants` re-deriving byte totals, region counters and the
+  key-to-shard mapping from the raw maps after the join; a parallel-`clear` race; `drainDirty`
+  under two writer threads and a sweeping thread. The copy-window oracle is exact, not
+  memory-shaped: a test-only probe (`copy_probe`, compiled out of non-test builds) fires from inside
+  `getBuf`'s critical section and tries to take the very lock the copy is supposed to run under;
+  `std.atomic.Mutex` is non-reentrant, so the `tryLock` fails on every schedule while the lock is
+  genuinely held.
+- **Model-fuzz** (`RAMCACHE_FUZZ`, deterministic driver, never `zig build --fuzz`): the seam
+  harness compares every step against an independent per-key model of the contract (value bytes,
+  TTL/idle stamps and expiry instants, borrows unevictable and byte-stable, drops only where
+  eviction may run, caps after eviction) besides the structural invariants; a config byte
+  runs half of the scripts with idle expiry, with a reach label for a lookup that finds an entry
+  expired by idleness alone.
+- **Sweeps and audit tests.** `sweep_test.zig` and `sweep_sharded_test.zig` (no-panic sweep: one
+  test per finding), `audit_test.zig` (tests added by the mutation and review audits: sketch
+  sampling and aging, adaptive-window arithmetic, expiry-heap membership, saturating clock
+  arithmetic, uncommitted reservations).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it.
 
 ## Performance
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ramcache`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 42.5 %): ref 0.25–1.05×, against 0.24–1.07× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
+`zig build bench-ramcache` (`tools/bench.zig`; ReleaseFast): `Sharded` against maypok86/otter v2.3.0 (a Go port
+of Caffeine; `tools/go_bench/`), one thread, 64-byte values, rows get hit, get miss, TTL get
+hit, put update, put evict and a Zipf mix; the fastest-in-field side (`tools/rust_fast_bench/`:
+quick_cache and moka, pinned by `Cargo.lock`; `BENCH_FAST=0` skips it) on the same rows. The
+card's `**Performance:**` line is the authoritative figure set. Where it is not first: quick_cache
+is faster on every row it has, because its hit is a shard `RwLock` read plus a CLOCK reference
+bit, while ours takes the shard mutex, records in the sketch and moves the entry in its queue;
+what is left of a miss is mostly the shard lock's `lock cmpxchg`, where otter's read takes no lock.
+Closing it is the P1 item under *Backlog / deferred*.
 
-**One hash per operation, and a half-full map, 2026-10-25.** Until then a `Sharded` lookup hashed the key twice (Wyhash for the shard, std's unseeded `hashString` inside the shard's map) and every hit or put a third time for the sketch, an admission contest twice more (candidate and victim). Now `Cache.Key` carries the one seeded Wyhash (`Options.hash_seed`; `Sharded` passes its per-instance seed), the node stores it (`Node.hash`; the map rehashes from it), the shard is bits 32+ of it and the sketch re-mixes it (`hashPair`); a test pins the spread of a shard's keys over map slots, fingerprints, doorkeeper bits and sketch blocks. The map is kept at most half full (std's default 80 %). A/B against HEAD `36feffeb`, same quiet host, 5 rounds, two alternations: get_hit 81.7 → 77.2 ns, get_miss 36.8 → 34.2 (the one-hash step alone left the miss at 37.1; the load factor took it), put_update 95.8 → 93.5, put_evict 314 → 198, zipf_mixed 158 → 131, ttl_get_hit 104.7 → 100.7. What is left of a miss is mostly the shard lock's `lock cmpxchg`; otter's read takes no lock.
+## What is deliberately not done
 
-**The field, 2026-10-25** (`tools/rust_fast_bench`: quick_cache 0.6.24, moka 0.12.16): ours 0.21–1.01× otter and 0.14–0.51× moka, but quick_cache is 1.31–1.95× faster than ours on every row it has (get_hit 1.90×, get_miss 1.41×, put_update 1.31×, put_evict 1.95×, zipf_mixed 1.45×, at a comparable hit total: 76 151 vs ours 75895). Its hit is a shard `RwLock` read plus a CLOCK reference bit; ours takes the shard mutex, records in the sketch and moves the entry in its queue. P1 needs that read path -- see Backlog.
+- **Typed keys/values.** Values are bytes by design: `pin`/`reserve` hand out zero-copy borrows and the
+  write-behind seam (`drainDirty`) flushes bytes; a typed layer is the caller's codec.
+- **Refresh-after-write and async caches** (Caffeine `refreshAfterWrite`, `AsyncCache`, otter
+  `RefreshCalculator`): they need a background executor or an `Io`, and this module takes neither
+  (caller-injected clock, no threads of its own); a caller that wants stale-while-revalidate runs
+  `getOrLoad` from its own task.
+- **A weigher, and stats-driven tuning beyond `Stats`:** the byte cap over value bytes is the weight.
+- **Persistence and keyed-hash hardening of a standalone `Cache`:** `on_evict`/the dirty bit are a
+  seam for a caller-built write-behind layer, not persistence; see the threat model.
+- **A borrowed-slice `Sharded.get`:** it cannot be honoured concurrently. `getBuf` (copy into the
+  caller's buffer under the lock) and `get` (an owned copy) are offered; a `withValue` callback under
+  the lock was rejected because `getBuf` already gives the zero-allocation path without running caller
+  code inside a non-reentrant spinlock.
+- **A clamp on the frequency sketch's size:** it is allocated and zeroed on first access, about 24 B x
+  `ceilPowerOfTwo(max_entries)` (2^31 entries = 48 GiB), documented on `Options.max_entries`; clamping
+  would change admission for big caches, so it is left to the operator.
+- **A bound on how long a `Sharded.getOrLoad` waiter waits.** It would need a clock, and the module takes
+  none. Go `x/sync/singleflight` (`Do` blocks until the leader returns; cancellation is the caller's, via
+  `DoChan` plus its own select) and Caffeine (`LoadingCache.get` blocks on the in-flight load;
+  `AsyncLoadingCache` leaves the timeout to the returned future) bound neither: a bound belongs in the
+  loader, which owns the clock.
+- **Detection of an AB/BA deadlock across shards from callbacks.** A "panic on any contended acquire inside a
+  callback" guard was rejected: false positives on harmless contention. (A callback calling into its own
+  shard is detected.)
+- **A random default `hash_seed` for a standalone `Cache`:** it keeps a public default (so its behaviour is
+  reproducible run to run), accepted as is and documented on `Options.hash_seed`; `Sharded` seeds itself per instance.
 
 ## Backlog / deferred
 
-- **(GQ review) sketch size clamp:** the frequency sketch is allocated and zeroed on first access, ~24 B x ceilPowerOfTwo(`max_entries`) (2^31 entries = 48 GiB). Documented on `Options.max_entries`; clamping would change admission for big caches, so left to the operator.
-- (GQ review) REV-SH-2: optional `getOrLoad` wait bound. It needs a clock, and the module takes none. **Decided 2026-11-18: no change.** Go `x/sync/singleflight` (`Do` blocks until the leader returns; cancellation is the caller's, via `DoChan` + its own select) and Caffeine (`LoadingCache.get` blocks on the in-flight load; `AsyncLoadingCache` leaves the timeout to the returned future) bound neither; a bound belongs in the loader, which owns the clock.
-- (GQ review) REV-SH-3: `drainDirty`/`on_evict` hold the shard lock across the callback; the lock is an unfair test-and-set. Candidates: `drainDirtyMax`/copy-out, a ticket lock.
-- (GQ review) REV-SH-5: AB/BA deadlock across shards from callbacks goes undetected. A "panic on any contended acquire inside a callback" guard was rejected: false positives on harmless contention.
-
-- **No-panic sweep GQ (`Cache`, 2026-10-30)** -- RC-4 (`Options.max_key_len`, default 4096) and RC-6 (`removeMatching` linear) DONE; RC-5 (standalone `Cache` uses the public default `hash_seed`; doc warning, `Sharded` seeds itself) accepted as is.
-- **Audit 2026-10-25 leftovers**: MED — `Sharded.getOrLoad` waiters take the leader's value whatever their own `cur_gen`, so a caller that bumped the generation can receive a value loaded under the previous one (fix: keep `cur_gen` in `Flight` and let a waiter with another generation load for itself, or document). LOW — `reserve` reserves no expiry-heap slot and `release` ignores `expPush` OOM (the entry then loses expired-first priority); an expired-first eviction counts in `evictions`, not `expired`, against the `idle_ttl_ns` doc; `getOrLoad` stamps the entry with the call's `now_ns`, not the load's completion. Fixed in the same wave: `isDirty`/`markClean`/`markCleanIf` reached an uncommitted reservation (MED), `timeExpired` subtracted without saturating (LOW).
-- **P1: the fastest in the field is quick_cache, 1.31–1.95× faster on every row** *(measured 2026-10-25, `zig build bench-ramcache`)*. Closing it is a design change of the hot paths, not a tuning pass: a hit that takes no exclusive lock and does no queue move (Caffeine's lossy read buffer drained under the lock, or a CLOCK/S3-FIFO reference bit as quick_cache does), and an eviction that does not run the full W-TinyLFU contest per insert. Owner's call which; a session of its own (like `sort`).
-
-- ~~**Performance: hidden P4 on reads**~~ **DONE 2026-10-11 — P2, ref 0.27–1.10× otter** (two runs, BENCH_ROUNDS=5: get hit 1.00–1.03×, get miss 1.05–1.11×, TTL get hit 0.72–0.75×, put update 0.27×, put evict 0.55×, zipf mixed 0.76–0.83× with MORE hits than before, 75 757 vs 75 000). The read buffer the entry below proposed was NOT the route: Caffeine's read buffer exists for concurrency, and in one thread it only defers the same work. Profiling put the cost elsewhere, three changes closed it: (1) the region heaps became intrusive O(1) queues (hit 2.26× → 0.99×); (2) the sketch takes one Wyhash plus a splitmix re-mix instead of two, with Caffeine's block layout (the key's 4 counters in one 64-byte block; was 4 rows); (3) a miss no longer records in the sketch — Caffeine and otter both record on hit and write only (otter `getNode`: a miss is a map lookup and a stats counter), which was the larger part of our miss (1.75× → 1.08×); `region` moved onto the index node so an SLRU demotion stops re-hashing its key. otter runs its maintenance on goroutines (another core); ours is inline, measured as is. History of the measurement before the fix: `zig build bench-ramcache` vs maypok86/otter v2.3.0 (`Sharded` against otter's concurrent cache, one thread, 64-byte values; otter's side was noisy, spread up to 33 %): get hit 2.42×, get miss 1.77×, TTL get hit 1.65×; put update 0.50×, put evict 0.69×, zipf mixed 0.90×. The reads are the gap: every hit here takes the shard lock, bumps the sketch and re-files the entry in its region heap (O(log n)), where otter's read is a map lookup plus an entry in a lossy striped buffer, with the policy applied later in batches (Caffeine's read buffer). The route is the same: buffer read-side policy updates and drain them under the lock on writes / every N reads -- a design change of the read path, owner's call.
-
-- `Sharded.Options.io` (2026-10-01, spinlock audit after the simio kv pilot): the shard lock is
-  held across `on_evict` and the `drainDirty` callback and waits by spinning/thread-yielding, so a
-  callback that suspends in an `Io` running several tasks on one thread would hang a waiter.
-  Documented as "must not suspend"; no in-tree callback does. When one needs to, an optional `io`
-  would make the shard lock an `std.Io.Mutex` (the `kv.Lock` shape). Since 2026-10-11 the same
-  holds for `Sharded.getOrLoad`: its waiters wait on the leader's flight by spinning/yielding, so a
-  `Loader` that suspends in an `Io` shared with a waiter's thread would hang that waiter; the `io`
-  option would turn the waiters' wait into an `Io` wait too. Item stays open.
-**Differential oracle against karlseguin's library** — IDEA (2026-09-24, owner review of karlseguin's Zig libraries; not scheduled). `karlseguin/cache.zig` (thread-safe LRU with TTL and ref-counted entries) has no wire format, so it is not a byte oracle. Use it as a behavioural and benchmark reference: the same get/put/expire trace should give the same hit/miss sequence, then compare throughput. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
-
-None beyond what's already covered above. Persistence itself and keyed-hash hardening remain
-out of scope (unchanged); eviction callbacks + a dirty-set are now in (write-behind seam, see
-above) — no longer listed as a gap.
-
-- ~~**`getOrLoad` with single-flight** *(survey 2026-09-30)* — Caffeine, moka and otter all offer loading caches; it stops a cache stampede on a cold key and is what most callers write by hand. Effort: medium for `Sharded` (per-key in-flight table, waiters), awkward for the single-owner `Cache`. Fits CONVENTIONS §2.~~ **DONE 2026-10-11** — `Sharded.getOrLoad` (single-flight) and a non-concurrent `Cache.getOrLoad` with the same signature; see Design. Still open and related: waiting is spin-then-yield, never through an `Io` (see `Sharded.Options.io` above — a loader that suspends in a single-threaded `Io` would hang its waiters, as a suspending `on_evict` would).
-- ~~**Time-to-idle (expire after last access)** *(survey 2026-09-30)* — session-like caches want it; today only write-time TTL exists. Effort: small (second deadline refreshed on hit, feeds the existing expiry heap). Fits §2.~~ **DONE 2026-10-11** — `Options.idle_ttl_ns`; see Design.
-- ~~**Adaptive admission window** *(survey 2026-09-30)* — Caffeine tunes the window/main split by hit-rate climbing, which helps recency-skewed workloads; fixed split is measurably worse there. Effort: medium plus benchmarks. Fits §2. Low priority.~~ **DONE 2026-10-11** — `Options.adaptive_window` (opt-in hill climber); see Design.
-- **Typed values** *(survey 2026-09-30)* — **REJECTED 2026-10-11:** values are bytes by design: `pin`/`reserve` hand out zero-copy borrows and the write-behind seam (`drainDirty`) flushes bytes; a typed layer is the caller's codec.
-- **Hash the key once per operation** *(the web-server consumer perf audit 2026-09-21, re-read 2026-09-30)* — a miss
-  (`pin` -> `reserve` -> fill) hashes the key many times: the map lookup, the frequency sketch's
-  two Wyhashes, `getOrPut`, the admission comparison (candidate and victim), the victim's
-  `fetchRemove`, and in `Sharded` the shard hash. Profiled under the web-server consumer's durable store 09-21:
-  ~30 k instructions per miss inside ramcache, 30 % of it Wyhash, ~11 key hashes -- not
-  re-measured since. Shape: compute one 64-bit hash at the entry point and pass it down
-  (adapted map context, both sketch indices derived from it, the shard from its high bits).
-  Effort: small-medium, no API change. Secondary (the store's commit dominates a PUT).
-  **Re-measured 2026-09-30, not worth doing now:** The web-server consumer `wdur` (kv-store, shield smoke, `perf
-  record`): every `ramcache` symbol together is 4.7 % of server CPU, explicit `Wyhash.hash`
-  0.3 %; the server is 85 % kernel (fsync). Hashing once saves ~1 % CPU, below the lane's
-  noise floor. On a hit the sketch's first Wyhash (seed 0) equals the map's own
-  `StringContext` hash, so the cheapest slice is hit path 3 -> 1 hashes. Reopen when a
-  consumer shows ramcache hot.
-
-## Status
-
-`extract · any · util · single_owner` + deps: none (std only) — canonical source is `pub const meta`
-in src/root.zig.
+- **`drainDirty`/`on_evict` hold the shard lock across the callback; the lock is an unfair test-and-set.**
+  Candidates: `drainDirtyMax`/copy-out, a ticket lock.
+- **`Sharded.getOrLoad` waiters take the leader's value whatever their own `cur_gen`** (MED), so a caller that bumped
+  the generation can receive a value loaded under the previous one. Fix: keep `cur_gen` in `Flight` and let a
+  waiter with another generation load for itself, or document it.
+- **Smaller leftovers (LOW):** `reserve` reserves no expiry-heap slot and `release` ignores `expPush` OOM (the entry
+  then loses expired-first priority); an expired-first eviction counts in `evictions`, not `expired`, against the
+  `idle_ttl_ns` doc; `getOrLoad` stamps the entry with the call's `now_ns`, not the load's completion.
+- **P1: the fastest in the field is quick_cache, faster on every row** (`zig build bench-ramcache`; the card has the
+  figures). Closing it is a design change of the hot paths, not a tuning pass: a hit that takes no exclusive lock
+  and does no queue move (Caffeine's lossy read buffer drained under the lock, or a CLOCK/S3-FIFO reference bit
+  as quick_cache does), and an eviction that does not run the full W-TinyLFU contest per insert. Owner's call
+  which; a session of its own (like `sort`).
+- **`Sharded.Options.io`:** the shard lock is held across `on_evict` and the `drainDirty` callback and waits by
+  spinning/thread-yielding, so a callback that suspends in an `Io` running several tasks on one thread would hang
+  a waiter; the same holds for `Sharded.getOrLoad`: its waiters wait on the leader's flight by spinning/yielding,
+  so a `Loader` that suspends in an `Io` shared with a waiter's thread would hang that waiter. Documented as "must
+  not suspend"; no in-tree callback does. When one needs to, an optional `io` would make the shard lock an
+  `std.Io.Mutex` (the `kv.Lock` shape) and the waiters' wait an `Io` wait.
+- **Differential oracle against `karlseguin/cache.zig`** (thread-safe LRU with TTL and ref-counted entries; IDEA,
+  not scheduled). It has no wire format, so it is not a byte oracle; use it as a behavioural and benchmark reference:
+  the same get/put/expire trace should give the same hit/miss sequence, then compare throughput. It would live in
+  `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16.
 
 ## Anchoring
 
