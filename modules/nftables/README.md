@@ -12,12 +12,6 @@ Manage the Linux firewall from Zig, two ways:
    `NFT_MSG_*` object messages, the rule-expression vocabulary, and dumps decoded
    back into typed structs. No `nft` binary anywhere in the loop.
 
-> An earlier version of this README said we deliberately do not reimplement
-> netlink. That is no longer true for the *applying* path — the native backend
-> below is exactly that reimplementation. It remains true that we do not
-> reimplement libnftables' parser or its JSON layer: the JSON builder emits the
-> documented interchange format, and the native backend speaks the kernel's UAPI.
-
 ## Which path to use
 
 | | JSON builder | native backend |
@@ -38,6 +32,7 @@ kernel refused.
 Both speak the same vocabulary enums (`Family`, `ChainType`, `Hook`, `Policy`,
 `SetDataType`, …), so a ruleset can be described once and emitted either way.
 
+- **Depends on:** `netlink` (the transport and codec).
 - **Platform:** `any` — the JSON builder and the whole wire layer are portable;
   only `Socket` is Linux-gated (behind `builtin.os.tag`, so the module still
   builds everywhere).
@@ -50,11 +45,12 @@ Both speak the same vocabulary enums (`Family`, `ChainType`, `Hook`, `Policy`,
   `accept`/`drop`/`reject`/`return`/`continue`/`jump`/`goto`/`counter`/`log`/
   `limit`/`masquerade`/`redirect`/`snat`/`dnat`; named sets with
   flags/elements/timeout/size/auto-merge.
-- **Scope (native):** table/chain/rule/set/set-element objects
-  (`NEW*`/`DEL*`/`GET*`), transactional batches with per-command error
+- **Scope (native):** table/chain/rule/set/set-element/object/flowtable
+  messages (`NEW*`/`DEL*`/`GET*`), transactional batches with per-command error
   attribution, `NLM_F_ACK` + extended ACKs, dumps decoded into typed structs, and
-  the `payload`/`cmp`/`meta`/`ct`/`bitwise`/`lookup`/`counter`/`immediate`/
-  `limit`/`log`/`nat`/`masq` expressions with an explicit register model.
+  the rule expressions (`payload`/`cmp`/`meta`/`ct`/`bitwise`/`lookup`/`counter`/
+  `immediate`/`limit`/`log`/`nat`/`masq` and those listed below) with an explicit
+  register model.
 
 ## JSON builder
 
@@ -158,10 +154,24 @@ defer objs.deinit();
 
 Also native: `reject` (`icmp`/`icmpx`/`tcp_reset`), `queue` (range, bypass,
 fanout), `redirect [to :port]`, anonymous `quota`, `ip6 saddr/daddr` with
-prefixes, the `inet` ingress hook (`.hook = .ingress, .dev = "lo"`) and the
-bridge-name meta keys. Every one of them is a byte-exact golden of `nft`'s own
-traffic. Not modelled yet: flowtables, `nft monitor`, `dynset`, `numgen`/`hash`/
-`dup`/`fwd`/`synproxy`/`tproxy` (`Expr.raw` reaches them) — see SPEC.md.
+prefixes, the `inet` ingress hook (`.hook = .ingress, .dev = "lo"`), the
+bridge-name meta keys, and the `nft` parity set: `byteorder`, bitshifts,
+`exthdr`, `fib`, `hash`, `numgen`, `range`, `rt`, `socket`, `notrack`, `dup`,
+`fwd`, `tproxy`, `synproxy`, `connlimit`, `dynset`, `osf`, `last`, `ct`/payload
+set, `flow_offload`; concatenated and interval-concatenated sets, catch-all
+elements, flowtables (`addFlowtable`, `listFlowtables`), the other named
+objects (limit, ct helper, secmark, ct timeout, ct expectation, synproxy,
+connlimit), `destroy`/`flush`/rename commands, `getGenId` (and
+`BatchOptions.gen_id`), `Socket.getRule`, and `nft monitor`
+(`Socket.openMonitor` + `nextEvents`). Every encoder is a byte-exact golden of
+`nft`'s own traffic; a listed rule decodes to typed expressions
+(`expr.decodeExpr`, unknown shapes stay `.raw`).
+
+## Not provided
+
+No `xt` compat expressions, no inner/tunnel payload bases, no tunnel object, no
+JSON `add meter`, no response parser for the JSON path; the reasons are in
+SPEC.md *What is deliberately not done*, the open items in *Backlog / deferred*.
 
 ### Batching is the point
 
@@ -192,7 +202,7 @@ hatch for hand-built expressions and deliberately does not touch the allocator.
   payloads a stock `nft` put on the wire, captured with
   `unshare -rn strace -f -e trace=sendmsg -e write=all -xx -s 8192 -e abbrev=none nft …`.
   Each golden names the exact command it came from.
-- **Live tests** under `unshare -rn`: a native create/list/delete round-trip, a
+- **Live tests** under `unshare -rn` (skipped without `CAP_NET_ADMIN`): a native create/list/delete round-trip, a
   deliberately bad batch proving the kernel rolled the whole transaction back,
   an unspec-family dump (`listTables(null)`) proving a single request
   returns objects from more than one family, and real packets on `lo` through an
@@ -201,7 +211,7 @@ hatch for hand-built expressions and deliberately does not touch the allocator.
 - **JSON ↔ native consistency**: the native batch is applied in a netns, then
   `nft -j list ruleset` decompiles it and the result is compared against what the
   JSON builder emits for the same ruleset.
-- Hostile/truncated decode tests and fuzzing of every walker.
+- Hostile/truncated decode tests and fuzzing of the expression walker and the object decoders (`NFTABLES_FUZZ`).
 
 ```sh
 zig build test-nftables              # offline; live parts SKIP and pass

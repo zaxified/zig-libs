@@ -16,7 +16,7 @@
 
 **Downstream consumer:** yes
 
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see /NOTICE.
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 The module has two backends over one shared vocabulary: the portable **JSON builder** and the
 **native nfnetlink** path. `src/types.zig` holds the enums both speak (`Family`, `ChainType`,
@@ -50,22 +50,22 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, S2 re-survey 2026-11-07. **Licence
 | Row | Verdict |
 |---|---|
 | tables, chains (base/regular, policy, priority, bound device), rules (add/insert/replace/delete/flush/position), sets, verdict and data maps, intervals, named counter/quota, atomic batches with per-command attribution | **have** (since 2026-10-04) |
-| typed expression decode of a listed rule (`expr.decodeExpr`) | **have** — google/nftables returns typed values, we used to return raw views; unnameable values stay `.raw` |
+| typed expression decode of a listed rule (`expr.decodeExpr`) | **have** — as google/nftables returns typed values; unnameable values stay `.raw` |
 | expressions `byteorder`, bitwise shifts, `exthdr` (IPv6/TCP/IPv4/SCTP/DCCP, load/set/present), `fib`, `hash` (jhash, symhash), `numgen`, `range`, `rt`, `socket`, `notrack`, `dup`, `fwd`, `tproxy`, `synproxy`, `connlimit`, `dynset` (add/update/delete, timeout, element expressions), `osf`, `ct` set, `payload` set (checksum fix-up), `flow_offload` | **have** (2026-11-07; goldens in `goldens2.zig`) |
 | expression `last` (when the rule last matched) | **have** (golden for `last` and `last used 1h`) |
-| `xt` match/target (iptables-compat blobs), `inner`/tunnel payload bases | **not doing**: the compat ABI is per extension and `nft` itself never emits it; inner headers need a per-encapsulation model nobody has asked for in 10 years of `nft` — a reason that would convince a google/nftables user, who has `Match`/`Target` only as raw blobs too |
+| `xt` match/target (iptables-compat blobs), `inner`/tunnel payload bases | **not doing**, see *What is deliberately not done* |
 | concatenated set keys (`ipv4_addr . inet_service`), interval concatenation (pipapo, `KEY_END`, field lengths), anonymous sets, dynamic/object/expr set flags, policy, gc-interval, per-element expiration, comment (userdata), catch-all element, per-element counter, 20 more datatypes | **have** |
 | element lookup (`getSetElems`), `reset set`, `flush set`, `destroy element` | **have** |
 | table flags (dormant/owner/persist), chain flags (hw offload), multi-device base chains, chain rename, `flush table`, `destroy` of every object, `replace rule`, `reset rules`/`reset counters` | **have** |
-| stateful objects limit, ct helper, secmark, ct timeout, ct expectation, synproxy, connlimit (typed decode of every one except ct timeout: `decodeObjectData` returns null for it — the per-state entry list needs an allocator — so `ObjectInfo.data` stays the way to read it; **not built**, in Backlog) | **have** |
-| tunnel object | **not doing** *(reason inferred, not measured)*: `nft` 1.1.6 has syntax only with a tunnel device model (`tunnel` hook/encap), kernel needs `nft_tunnel`; no captures possible in a netns without it, and no google/nftables or nftables-rs user model exists either (`tunnel` is "not implemented in expr" there) |
+| stateful objects limit, ct helper, secmark, ct timeout, ct expectation, synproxy, connlimit (typed decode of every one except ct timeout: `decodeObjectData` returns null for it — the per-state entry list needs an allocator — so `ObjectInfo.data` stays the way to read it; open, see *Backlog / deferred*) | **have** |
+| tunnel object | **not doing**, see *What is deliberately not done* |
 | flowtables (add/delete/list, hook, priority, devices, flags) | **have**; the hardware-offload path cannot be exercised in a netns and is encoded only |
 | `nft monitor` (`Socket.openMonitor`, `nextEvents`, `wire.eventOf`), `NFT_MSG_NEWGEN` ids | **have** |
 | ruleset generation id (`getGenId`, `BatchOptions.gen_id`) | **have** |
 | single-rule fetch by handle (`GetRuleByHandle`) | **have** (`Socket.getRule`; request layout tested, no capture: `nft` has no such command) |
 | JSON backend: map, element, counter/quota/limit/ct helper/flowtable objects, insert/replace/destroy/rename/list/reset | **have** (`nft -c -j` accepts every shape, tested) |
 | JSON backend: statements `mangle` (`meta`/`ct`/`payload` set), `queue`, `quota` (anonymous and named), `dup`, `fwd`, `tproxy`, `synproxy`, `flow`, `notrack`, `ct count`, dynamic-set `set` (add/update/delete with per-element statements), `last`, `vmap`; expressions `numgen`, `jhash`, `symhash`, `fib`, `rt`, `socket`, `exthdr`, `tcp option`, `osf`, `map`/`vmap`, `elem`; map element pairs (`[key, verdict]` via `Expr.list` + `Expr.stmt`); objects `ct timeout`, `ct expectation`, `secmark`, `synproxy` | **have** (2026-11-07; each shape accepted by `nft -c -j` before it was written down, and replayed by two tests: exact strings and a whole-ruleset `nft -c`) |
-| JSON backend: meters (`add meter`) | **not doing**: `nft -c -j` answers "Unknown object passed to add command" — in the schema a meter is output of `list`, and the way to create one is the dynamic-set `set` statement with a `limit`, which is built |
+| JSON backend: meters (`add meter`) | **not doing**, see *What is deliberately not done* |
 
 **Where we are ahead:** the only pure-Zig nftables client we found with two backends over one vocabulary — JSON for `nft -j -f -` and native nfnetlink with atomic batches, per-command error attribution with the kernel's extended-ACK text, a register model that stops a `cmp` on an unwritten register, encodings checked against captured `nft` traffic (124 batches) and a typed rule decoder whose round trip is tested for every expression; native encode about 4× and typed decode about 25× faster than google/nftables on the bench corpus, with no allocation per expression.
 
@@ -163,14 +163,14 @@ buffer-growth probe so no datagram is ever truncated, datagrams from a non-kerne
 how a successful un-acked (`nft`-style) batch looks, so `commit` reads a receive-timeout expiry as
 success.
 
-## Design — maps, objects, intervals, more statements (2026-10-04)
+## Design — maps, objects, intervals, more statements
 
 **Maps.** `SetSpec.data` turns a set into a map: `NFT_SET_MAP` is ORed into the caller's flags and
 `NFTA_SET_DATA_TYPE`/`DATA_LEN` follow `KEY_LEN` (verdict map: `NFT_DATA_VERDICT` = 0xffffff00 and
 length 0 — the kernel sizes a verdict itself; data map: nft's datatype id and its key length).
 Elements carry either `data` (raw bytes) or `verdict` (an `NFTA_DATA_VERDICT` nest); both at once is
 `error.ElemDataConflict` rather than one silently dropped. `Program.payloadVmap` is a `lookup` with
-`dreg = NFT_REG_VERDICT`; `nft` writes DREG between SREG and SET, so the encoder now does too.
+`dreg = NFT_REG_VERDICT`; `nft` writes DREG between SREG and SET, and so does the encoder.
 
 **Named objects.** `NEWOBJ` with `NFTA_OBJ_{TABLE,NAME,TYPE,DATA}`; a counter object always carries
 both values (unlike the counter *expression*, which `nft` sends empty), a quota carries BYTES,
@@ -192,7 +192,7 @@ payload carries them; `prefixInterval` clears host bits.
 code; `queue` = NUM/TOTAL/FLAGS as big-endian u16s, with the range checked in the encoder itself
 (empty, or past queue 65535 → `error.InvalidQueueRange`) because a hand-built `Expr` never passes
 through `Program`; `redirect` puts the port in a register like `nat`; `quota` = BYTES, CONSUMED,
-FLAGS (`NFT_QUOTA_F_INV` for `over`). IPv6 matches load at offset 8 (saddr) / 24 (daddr) — RFC 8200
+FLAGS (`NFT_QUOTA_F_INV` for `over`); `log`'s GROUP and QUEUE-THRESHOLD are 16-bit big-endian attributes, so a value past 16 bits is `error.InvalidExpression`. IPv6 matches load at offset 8 (saddr) / 24 (daddr) — RFC 8200
 §3 — with the same byte-aligned-prefix shortening as IPv4.
 
 **Hooks and meta keys.** `Hook.ingress` in an `inet` table is NF_INET_INGRESS (5,
@@ -201,7 +201,7 @@ registers no ingress hook for those chain types. `MetaKey.ibridgename`/`obridgen
 `meta ibrname`/`obrname` captured, aliases of `ibriport`/`obriport` — and serialize to JSON as
 `ibrname`/`obrname`, the tokens `nft -j` accepts.
 
-## Design — parity additions (2026-11-07)
+## Design — parity additions
 
 **Typed decode.** `expr.decodeExpr(view)` is the inverse of `appendExpr`: one `Expr` per listed expression, byte slices and names borrowing from the reply (nothing allocated, so the result lives as long as the dump's arena). It never invents a value: an unknown expression name, a `meta` key outside `MetaKey`, a payload base past the transport header, a `limit` whose unit is not a whole `LimitPer`, a bitwise boolean operator or a `dynset` (nested expressions need an allocator) comes back as `.raw` with its untouched data. The round trip `appendExpr` → `decodeExpr` is tested for every variant (`expr_decode_test.zig`), the encoder side by `nft`'s own bytes, and the decoder runs inside the existing expression-walker fuzz harness so hostile bytes only ever produce a value or `Truncated`/`BadLength`.
 
@@ -209,7 +209,7 @@ registers no ingress hook for those chain types. `MetaKey.ibridgename`/`obridgen
 
 **Concatenated keys.** `NFTA_SET_KEY_TYPE` packs the component type ids six bits apiece (`ipv4_addr . inet_service` = 7 << 6 | 13 = 461), `NFTA_SET_KEY_LEN` is the sum of the components padded to 4 bytes, and only an *interval* concatenation also sets `NFT_SET_CONCAT` and sends the unpadded field lengths in `NFTA_SET_DESC_CONCAT`. `wire.concatKey` builds the padded element key; a range element is `key` + `key_end` in one element (`1.2.3.0/24 . 80-90`), not the classic start/end pair of a single-field interval.
 
-**Flowtables, events, generation.** `NEWFLOWTABLE` carries FLAGS (always), then a HOOK nest with number, priority and an `NFTA_FLOWTABLE_HOOK_DEVS` list of `NFTA_DEVICE_NAME`. The kernel multicasts every committed change on `NFNLGRP_NFTABLES`; `Socket.openMonitor(gpa, Group.NFTABLES)` binds it and `nextEvents` iterates a datagram of `wire.Event`s (object kind, new/delete, payload for the matching decoder); `error.Overrun` means events were lost and a dump must resynchronise. `getGenId` is a plain request answered by one `NEWGEN`; `BatchOptions.gen_id` puts it on `BATCH_BEGIN` as `NFNL_BATCH_GENID`, after which the kernel refuses a batch built against a stale ruleset. `getGenId` and `getRule` are plain requests answered by one message. `getSetElems` is **not**: the kernel answers a `GETSETELEM` naming N keys with N `NEWSETELEM` messages and nothing else, so it is sent with `NLM_F_ACK` and reads until the ACK (verified live 2026-11-07 in `unshare -rn`: two keys, two replies, then the ACK; a first version returned after the first reply and silently lost the rest — pinned by `scanSetElemReplies` over the kernel's bytes, `kernel_dumps.k_get2_ack`).
+**Flowtables, events, generation.** `NEWFLOWTABLE` carries FLAGS (always), then a HOOK nest with number, priority and an `NFTA_FLOWTABLE_HOOK_DEVS` list of `NFTA_DEVICE_NAME`. The kernel multicasts every committed change on `NFNLGRP_NFTABLES`; `Socket.openMonitor(gpa, Group.NFTABLES)` binds it and `nextEvents` iterates a datagram of `wire.Event`s (object kind, new/delete, payload for the matching decoder); `error.Overrun` means events were lost and a dump must resynchronise. `getGenId` is a plain request answered by one `NEWGEN`; `BatchOptions.gen_id` puts it on `BATCH_BEGIN` as `NFNL_BATCH_GENID`, after which the kernel refuses a batch built against a stale ruleset. `getGenId` and `getRule` are plain requests answered by one message. `getSetElems` is **not**: the kernel answers a `GETSETELEM` naming N keys with N `NEWSETELEM` messages and nothing else, so it is sent with `NLM_F_ACK` and reads until the ACK (seen live in `unshare -rn`: two keys, two replies, then the ACK; returning after the first reply would silently lose the rest — pinned by `scanSetElemReplies` over the kernel's bytes, `kernel_dumps.k_get2_ack`).
 
 **Objects.** `ObjectData` models every type `nft` creates except tunnel: limit (the `limit` statement's attributes), ct helper (name without a NUL, as captured), secmark (context without a NUL), ct timeout (per-state seconds under the protocol's own attribute numbers), ct expectation (`NFTA_CT_EXPECT_TIMEOUT` is the one host-order integer), synproxy, connlimit. `ObjectInfo.state()` decodes any of them from a dump (a ct timeout stays raw: its entry list needs an allocator).
 
@@ -229,7 +229,7 @@ every walker advances by at least 4 bytes so no input can loop forever. Unknown 
 skipped rather than rejected — the kernel gains `NFTA_*` types over time and a dump must not break
 on one — while malformed *lengths* are always rejected.
 
-Out of scope: the `xt` compat expressions, inner/tunnel payload bases and the tunnel object (reasons in "Compared with"). The JSON backend has no response parser: `list`/`reset` commands are generated, their reply is `nft -j`'s to deliver.
+Out of scope: the `xt` compat expressions, inner/tunnel payload bases and the tunnel object (reasons in *What is deliberately not done*). The JSON backend has no response parser: `list`/`reset` commands are generated, their reply is `nft -j`'s to deliver. JSON serialization is bounded: an `Expr`/`Stmt` chain nested past `max_json_depth` (32) is `error.TooDeep` and a `ct timeout` naming a state twice `error.DuplicateKey` (from `Ruleset.writeJson`/`toJson`). The commit and dump loops are bounded too: more than `max_await_messages` / `max_dump_messages` datagrams is `error.TooManyMessages`, and a dump interrupted by `NLM_F_DUMP_INTR` restarts up to `max_dump_attempts` (4) times before `error.InconsistentDump`. A ct timeout object is not decoded to a typed value from a dump (its entry list needs an allocator): `ObjectInfo.data` stays raw.
 
 `decodeObject` and the map-element decoder obey the decoder rules above: every length is checked by
 the shared attribute walker before a slice is formed, an object's state is decoded only for the
@@ -237,191 +237,60 @@ types it names (TYPE may follow DATA on the wire), and an unknown type keeps its
 
 ## Verification
 
-**Mutation (strict re-run, 2026-11-15, whole module,** production code of `root.zig` 1-1750, `wire.zig` 1-2120, `expr.zig` 1-2225, `socket.zig` 1-911, `types.zig`, `nl.zig`; schemata in a detached copy, ReleaseSafe, tests run in a private network namespace as `unshare -rn` so the live-kernel tests run, strict verdict: a mutant is killed only by a failure the unmutated baseline lacks): 783 mutants over every condition (flip each `if`/`while` condition; drop each arm of an `and`/`or`; `<`/`<=`/`>`/`>=` off by one; flip a returned boolean), every assignment and wipe (skip it), every `append`/`put`/`write`/`add` call and every optional-field body (skip it); 774 killed (7 by a HANG), 7 equivalent + 2 unobservable (the card's "9 eq"), 0 undecided, no defect. The 2026-10-04 table had no src hash and none of the optional-field encoders, the single-reply getters, the `list*` result ownership or the reset reads. the survivors of the two passes (115, then 21 of the 118 added operators) closed by `src/strict_test.zig` (JSON depth boundary, a `TooDeep` failure not leaking into the next error, omitted-vs-empty optional fields, builder OOM, `concatKeyType` limits, `buildGenIdRequest`/`buildRuleGetRequest`/`buildRuleResetRequest` bytes, catch-all and empty-key elements, `decodeSetElemReply` expression nests, attribute type = table size, encoder/decoder round trips for the optional registers, flags and seeded counters, userdata/position attributes) and by tests at the end of `socket.zig` (`EventIterator` framing error, `appendElems` copying every borrowed field, `recordFailure` attribution, seq-0 echoes, a zero ACK in an un-acked batch, and one live test that scribbles the receive buffer after every dump to prove each result owns its strings, then checks `getRule`/`getGenId`/`getSetElems`, that every entry point starts with a clean `lastFailure`/`lastErrorMessage`, counters zeroed only by `reset*`, an allocation failure inside a reply scan, and flowtable and counter-element sets when the kernel takes them). **The live test skips without CAP_NET_ADMIN**; nftables is in the `.netns` partition, which `scripts/test.sh` runs under `unshare -rn` (CI's full `[net]` lanes log "netns build+test (9 modules, unshare -rn)"), so CI runs it — only a host without unprivileged user namespaces skips it. Equivalent: `json_depth = 0` at the top of `writeJson` (the `defer` right below it resets it on every exit); `prefix_len >= bits_before + 8` vs `>` in `prefixInterval` (the shifted arm yields 0xff for exactly eight bits); `elems.len > 65535` and `keys.len > 65535` vs `>=` (65535 elements no longer fit one nest, `nestEnd` gives the same `AttrTooLong`); `req[nl.header_len] = UNSPEC` in `buildGenIdRequest` (the buffer is zeroed and UNSPEC is 0); `d.exprs.len > 1` vs `>= 1` in the dynset encoder (the `== 1` arm precedes it); `code < 0` vs `<= 0` in `errorFromErrno` (-0 = 0). Unobservable: the `n < max_dump_messages` loop bounds of `getOne` and `getSetElems` (a kernel that answers 65536 datagrams without terminating; the generic engines `dumpOver`/`awaitBatchOver` have scripted tests, these two bound a real socket). Cut: `while (true)` loops (flipping gives a function that cannot return), numeric wire constants (anchored by the `nft` goldens), `objectField`/`beginObject`/`endObject` calls (a skipped structural call is invalid JSON and trivially killed), `catch`/`orelse` arms (reached through their guards), the enum/constant tables of `types.zig` and the `NFTA_*` modules, printing and test helpers, and a `defer gpa.free` skip (a leak, caught by `std.testing.allocator` in every dump test).
+Run: `scripts/modtest nftables`; the live parts need `unshare -rn zig build test-nftables` (they print `SKIPPED:` and pass without `CAP_NET_ADMIN`). nftables is in the `.netns` partition, which `scripts/test.sh` runs under `unshare -rn` (CI's full `[net]` lanes), so CI runs the live tests; only a host without unprivileged user namespaces skips them.
 
-**JSON builder.** Offline golden-JSON known-answer tests: byte-exact serialization of full
-rulesets (inet filter with default-drop input chain; ip nat masquerade postrouting; named port set
-used in a rule), every non-identifier enum token, expression/statement shapes, delete+flush command
-shapes, JSON-escaping of set-ref names, and equivalence of the fluent builder vs a hand-written
-`Stmt` slice — each also parsed back with `std.json`. When an `nft` binary is present the suite
-pipes a generated ruleset through `nft -c -j -f -` (check mode, never applied) and confirms `nft -c`
-rejects a deliberately schema-invalid ruleset. **Frozen `nft` verdicts (2026-10-06):**
-`tools/interop.zig` (`unshare -rn zig build interop-nftables -- --capture`) applies eight builder
-scenarios with a real `nft -j -f -` and records `nft -j list ruleset`; `src/json_oracle_test.zig`
-requires, offline, the same JSON from the builder and every field we send back from the kernel with
-our value (`nft` may add handles, counter values and element expiries, not change anything).
+**JSON builder.** Offline golden-JSON known-answer tests: byte-exact serialization of full rulesets (inet filter with default-drop input chain; ip nat masquerade postrouting; named port set used in a rule), every non-identifier enum token, expression/statement shapes, delete+flush command shapes, JSON-escaping of set-ref names, and equivalence of the fluent builder vs a hand-written `Stmt` slice, each also parsed back with `std.json`. When an `nft` binary is present the suite pipes a generated ruleset through `nft -c -j -f -` (check mode, never applied) and confirms `nft -c` rejects a deliberately schema-invalid ruleset. Frozen `nft` verdicts: `tools/interop.zig` (`unshare -rn zig build interop-nftables -- --capture`) applies eight builder scenarios with a real `nft -j -f -` and records `nft -j list ruleset`; `src/json_oracle_test.zig` requires, offline, the same JSON from the builder and every field we send back from the kernel with our value (`nft` may add handles, counter values and element expiries, not change anything). Every JSON shape of the verdict table was accepted by `nft -c -j` before it was written down and is replayed by two tests: exact strings and a whole-ruleset `nft -c`.
 
-**Native backend — byte-exact goldens.** Every golden in `src/goldens.zig` is the complete
-`sendmsg` payload a stock `nft` (v1.1.6, Linux 7.0, x86-64) put on the wire, captured with
+**Native backend, byte-exact goldens.** Every golden in `src/goldens.zig` and `src/goldens2.zig` is the complete `sendmsg` payload a stock `nft` (v1.1.6, Linux 7.0, x86-64) put on the wire, captured with
 
 ```sh
 unshare -rn strace -f -e trace=sendmsg -e write=all -xx -s 8192 -e abbrev=none nft <command…>
 ```
 
-`-e write=all` prints the buffer verbatim, so there is no re-encoding step between the
-kernel-bound bytes and the hex in the file. Each golden carries the exact command above it.
-Captured commands: `add table inet filter` · `delete table inet filter` ·
-`add chain inet filter input '{ type filter hook input priority 0; policy drop; }'` ·
-`add chain ip nat post '{ type nat hook postrouting priority 100; }'` ·
-`add rule inet filter input tcp dport 22 counter accept` ·
-`add rule inet filter input ip saddr 10.0.0.0/8 drop` ·
-`add rule inet filter input ip saddr 10.0.0.0/12 drop` (the bitwise case) ·
-`add rule inet filter input ip saddr @blocked drop` ·
-`add rule inet filter input ct state established,related accept` ·
-`add rule inet filter input limit rate 10/second burst 5 packets accept` ·
-`add rule inet filter input log prefix "ssh: " level info` ·
-`add rule inet filter input iifname "lo" accept` ·
-`add rule ip nat post oifname "eth0" masquerade` ·
-`add rule ip nat post ip saddr 10.0.0.0/8 snat to 192.0.2.1` ·
-`add rule ip nat post tcp dport 80 dnat to 10.0.0.5:8080` ·
-`add set inet filter blocked '{ type ipv4_addr; flags interval; }'` ·
-`add element inet filter blocked '{ 10.0.0.1 }'` ·
-`delete rule inet filter input handle 4` · and a three-command `nft -f` run
-(`add table` + `add chain` + `add rule`) that is **one** batch — the framing proof.
+`-e write=all` prints the buffer verbatim, so there is no re-encoding step between the kernel-bound bytes and the hex in the file. Each golden carries the exact command above it and the state it ran against. Captures that `nft` refused at the kernel (no module in the namespace: `flow add`, secmark, `flags offload` chains) still produced the batch it tried to send, which is what a golden pins.
 
-Two things make byte-exactness possible. `nft` seeds its batch sequence at 0
-(`BATCH_BEGIN` = 0, commands 1…n, `BATCH_END` = n+1), so the goldens build with `first_seq = 0`
-and `.{ .ack = false }` (`nft` does not set `NLM_F_ACK`). And `nft` stamps a private versioned TLV
-into `NFTA_TABLE_USERDATA`/`NFTA_SET_USERDATA`; that blob is opaque to the kernel, so
-`TableSpec.userdata`/`SetSpec.userdata` pass bytes straight through and the goldens hand the module
-the exact bytes `nft` sent. Nothing interprets them.
+- `goldens.zig`: tables, chains (base, NAT, inet ingress on a device), rules (counter, accept/drop, IPv4/IPv6 prefixes including the bitwise case, set lookup, `ct state`, `limit`, `log`, `iifname`/`oifname`, masquerade/snat/dnat, reject forms, queue, redirect, quota), sets and set elements (plain, interval, open interval, map and verdict map, `vmap`), named counter/quota objects, `delete`, and a three-command `nft -f` run that is **one** batch (the framing proof).
+- `goldens2.zig`: the parity additions: `byteorder`, bitshifts, `exthdr`, `fib`, `jhash`, `symhash`, `numgen`, `range`, `rt`, `socket`, `notrack`, `dup`, `fwd`, `tproxy`, `synproxy`, `ct count`, `dynset`, `osf`, `ct mark set`, `ip ttl set`, `flow add`; table flags, chain devices and `flags offload`, `replace rule`, `destroy`, `flush`, chain rename, flowtables; concatenated and interval-concatenated sets and elements, set timeout/size/policy/gc-interval/comment/counter options, catch-all elements, maps; objects limit, ct helper, secmark, ct timeout, ct expectation, counter with a comment.
 
-**Captured 2026-10-04** (same recipe and `nft` build; the state each ran against is listed in
-`goldens.zig`): `reject` · `tcp dport 22 reject with tcp reset` · `reject with icmpx
-admin-prohibited` · `reject with icmp host-unreachable` (ip) · `queue num 3 bypass` · `queue num
-2-5 fanout` · `tcp dport 80 redirect to :8080` · `redirect` · `quota over 100 mbytes drop` · `quota
-25 bytes` · `add counter` · `add quota … { over 10 mbytes }` · `counter name c1` · `quota name q1
-drop` · `delete counter` · `add map … { type inet_service : verdict; }` · `add element … { 22 :
-accept, 80 : jump helper }` · `tcp dport vmap @vm` · interval elements `192.168.1.10-192.168.1.20`,
-`172.16.0.0/12`, `255.255.255.0/24` (open), `2001:db8::/32` · an inet `ingress` chain on `lo` ·
-`ip6 saddr 2001:db8::/32`, `ip6 daddr 2001:db8::1`, `ip6 saddr 2001:db8::/33` (bitwise). Also
-captured, recorded as a value test: `meta ibrname`/`obrname`/`ibriport` in a bridge table (17, 18,
-17), and checked with `nft -c -j`: every `MetaKey` JSON token (only `ibridgename`/`obridgename`
-were refused — fixed).
+Two things make byte-exactness possible. `nft` seeds its batch sequence at 0 (`BATCH_BEGIN` = 0, commands 1…n, `BATCH_END` = n+1), so the goldens build with `first_seq = 0` and `.{ .ack = false }` (`nft` does not set `NLM_F_ACK`). And `nft` stamps a private versioned TLV into `NFTA_TABLE_USERDATA`/`NFTA_SET_USERDATA`; that blob is opaque to the kernel, so `TableSpec.userdata`/`SetSpec.userdata` pass bytes straight through and the goldens hand the module the exact bytes `nft` sent. Nothing interprets them.
 
-Two capture-derived facts are recorded as tests rather than byte goldens: the **set datatype ids**
-(`NFTA_SET_KEY_TYPE` is a userspace number the kernel stores untouched — `ipv4_addr` = 7,
-`ipv6_addr` = 8, `ether_addr` = 9, `inet_proto` = 12, `inet_service` = 13, `mark` = 19,
-`ifname` = 41, one `nft add set` capture each), and the size/timeout set shape
-(`NFTA_SET_DESC{SIZE}` + `NFTA_SET_TIMEOUT` in **milliseconds**, asserted by value and by attribute
-order because the captured message also carried the userdata stamp).
+Capture-derived facts recorded as tests rather than byte goldens: the set datatype ids (`NFTA_SET_KEY_TYPE` is a userspace number the kernel stores untouched: `ipv4_addr` = 7, `ipv6_addr` = 8, `ether_addr` = 9, `inet_proto` = 12, `inet_service` = 13, `mark` = 19, `ifname` = 41), the size/timeout set shape (`NFTA_SET_DESC{SIZE}` + `NFTA_SET_TIMEOUT` in **milliseconds**, asserted by value and by attribute order), and `meta ibrname`/`obrname`/`ibriport` in a bridge table (17, 18, 17). Every `MetaKey` JSON token was checked with `nft -c -j`.
 
-**Live tests** (`unshare -rn zig build test-nftables`; they print `SKIPPED:` and pass otherwise):
+**Decoder goldens from the kernel (`src/kernel_dumps.zig`).** The byte goldens pin the encoders against `nft`; the decoders are pinned against the kernel's own replies: raw dump bytes of a Linux 7.0 kernel holding 18 rules (byteorder, exthdr, hash with seed/offset, range, connlimit, notrack, numgen, log with its 16-bit group and queue-threshold, `ct` set, `last`, socket, dynset, lookup + objref, vmap, bitshift, rt, synproxy), one object of each type, a flowtable, a chain, a timeout set, a concatenated interval set and a verdict map with a catch-all, fetched by a small Python `AF_NETLINK` client (not this module) and stored untouched. The round trip `appendExpr` → `decodeExpr` is tested for every variant (`expr_decode_test.zig`), including the `.raw` fallbacks and truncated input.
 
-- *Round-trip.* One batch creates a table, a base chain, a set with two elements and two rules;
-  `listTables`/`listChains`/`listSets`/`listSetElems`/`listRules` read every one of them back and
-  check the decoded fields (hook number, priority, policy, key length, expression names, the
-  `bitwise` the `/12` prefix forces); one rule is deleted by the handle the kernel reported, the
-  other survives; the table is dropped and confirmed gone.
-- *Atomic rollback.* A two-command batch whose second command references a non-existent chain.
-  `commit` returns `error.NotFound`, `lastFailure()` reports `stage = .message`, `index = 1`,
-  `command = "NEWRULE"`, `code = -2`, and the table created by command #0 is **not** in the
-  ruleset — the transaction was rolled back whole.
-- *Unspec-family sweep.* Two tables in two different families (`inet` and `ip`); one
-  `listTables(null)` call (`nfgen_family = NFPROTO_UNSPEC`, the framing `nft list ruleset`
-  uses) returns both in a single dump, each tagged with its own real family byte — proof
-  against a real kernel, not just that the request bytes are right (that half is pinned
-  offline in `wire.zig`'s "family = null sends NFPROTO_UNSPEC" test).
-- *JSON ↔ native consistency.* One `inet` table, four chains (a default-drop `input` base chain,
-  a `helper` regular chain reached by `jump`, and `post`/`pre` NAT base chains), a named
-  `ipv4_addr` set, and 13 rules spanning the statement/expression list this survey tracks:
-  verdicts (`accept`/`drop`/`jump`/`return`), a counter, `ct state established,related`, `udp
-  dport`, a named-set `ip saddr @set` lookup, a stacked `ip daddr` prefix + `meta oifname` match,
-  `limit` + `log`, and `masquerade`/`snat`/`dnat`. Each is described twice: once through the JSON
-  builder, once through `Batch`/`Program`. The **native** batch is applied over netlink, then
-  `nft -j list ruleset` decompiles the kernel's own view and it is compared against the JSON
-  builder's output, chain by chain: table/chain fields (`family`/`table`/`name`/`type`/`hook`/
-  `prio`/`policy`) exactly for all three base chains, the set's family/type/element-count, and
-  each chain's rules' statement arrays position by position — `match` statements deeply (operator,
-  left, right must be JSON-identical), other statements by name (`nft` renders a fresh counter as
-  `{"counter":{"packets":0,"bytes":0}}` where the builder emits `{"counter":null}`). Statement
-  *counts* must agree too, which additionally checks that the protocol dependencies the native
-  path emits explicitly (`meta l4proto tcp`/`udp`, `meta nfproto ipv4`) land exactly where `nft`
-  folds them back. The check was negative-controlled twice: changing the native prefix to `/13`
-  while leaving the JSON at `/12` fails with `match statement differs`, and giving `udp dport`'s
-  native builder a `tcp` protocol dependency instead of `udp`'s fails the same way on the newly
-  covered rule. `reject` is not in this comparison: the native builder (`Program.reject`) only landed on
-  2026-10-04 and is pinned by its own byte goldens; adding it here is a cheap follow-up.
+**Live tests** (`unshare -rn`):
 
-- *Core objects (2026-10-04).* An `ip` table with an output chain: an interval set built by
-  `wire.interval` (127.0.0.5–127.0.0.9), a named counter and quota, a verdict map with an
-  `accept` and a `jump`, plus an `inet` ingress chain on `lo` (the test brings `lo` up when the
-  namespace starts with it down). UDP datagrams to .9 (the LAST address — must count), .5, .10
-  (one past — must not), .4 and .77; the range rule's anonymous counter reads back 2 through
-  `decodeCounter`, the named counter 1 packet / 29 bytes and the quota 29 consumed through
-  `listObjects` (twice: listing does not reset), the map's elements decode back to their
-  verdicts, the ingress chain to hooknum 5 on `lo`; then the counter is deleted with its rule.
+- *Round-trip.* One batch creates a table, a base chain, a set with two elements and two rules; `listTables`/`listChains`/`listSets`/`listSetElems`/`listRules` read every one of them back and check the decoded fields (hook number, priority, policy, key length, expression names, the `bitwise` the `/12` prefix forces); one rule is deleted by the handle the kernel reported, the other survives; the table is dropped and confirmed gone.
+- *Atomic rollback.* A two-command batch whose second command references a non-existent chain: `commit` returns `error.NotFound`, `lastFailure()` reports `stage = .message`, `index = 1`, `command = "NEWRULE"`, `code = -2`, and the table created by command #0 is not in the ruleset.
+- *Unspec-family sweep.* Two tables in two different families (`inet` and `ip`); one `listTables(null)` call returns both in a single dump, each tagged with its own real family byte (the request bytes are pinned offline in `wire.zig`'s "family = null sends NFPROTO_UNSPEC" test).
+- *JSON and native consistency.* One `inet` table, four chains (a default-drop `input` base chain, a `helper` regular chain reached by `jump`, `post`/`pre` NAT base chains), a named `ipv4_addr` set and 13 rules spanning verdicts, a counter, `ct state`, `udp dport`, a set lookup, a stacked `ip daddr` prefix + `meta oifname` match, `limit` + `log`, and `masquerade`/`snat`/`dnat`, each described twice: through the JSON builder and through `Batch`/`Program`. The native batch is applied over netlink, then `nft -j list ruleset` decompiles the kernel's own view and it is compared with the builder's output, chain by chain: table/chain fields exactly for the base chains, the set's family/type/element-count, and each chain's statement arrays position by position (`match` statements deeply, other statements by name, since `nft` renders a fresh counter as `{"counter":{"packets":0,"bytes":0}}` where the builder emits `{"counter":null}`). Statement counts must agree too, which checks that the protocol dependencies the native path emits explicitly (`meta l4proto`, `meta nfproto`) land where `nft` folds them back. `reject` is pinned by its own byte goldens and is not in this comparison.
+- *Core objects.* An `ip` table with an output chain: an interval set built by `wire.interval` (127.0.0.5 to 127.0.0.9), a named counter and quota, a verdict map with an `accept` and a `jump`, plus an `inet` ingress chain on `lo`. UDP datagrams to .9 (the last address: must count), .5, .10 (one past: must not), .4 and .77; the range rule's anonymous counter reads back through `decodeCounter`, the named counter and the quota through `listObjects` (twice: listing does not reset), the map's elements decode back to their verdicts, the ingress chain to hooknum 5 on `lo`; then the counter is deleted with its rule.
+- *Strict tests* (`src/strict_test.zig` and the end of `socket.zig`): JSON depth boundary, a `TooDeep` failure not leaking into the next error, omitted-vs-empty optional fields, builder OOM, `concatKeyType` limits, the generation-id, rule-get and rule-reset request bytes, catch-all and empty-key elements, `decodeSetElemReply` expression nests, encoder/decoder round trips for the optional registers, flags and seeded counters, userdata/position attributes, `EventIterator` framing errors, `appendElems` copying every borrowed field, `recordFailure` attribution, seq-0 echoes, a zero ACK in an un-acked batch, and one live test that scribbles the receive buffer after every dump to prove each result owns its strings, then checks `getRule`/`getGenId`/`getSetElems`, that every entry point starts with a clean `lastFailure`/`lastErrorMessage`, counters zeroed only by `reset*`, an allocation failure inside a reply scan, and flowtable and counter-element sets when the kernel takes them.
 
-**Parity goldens (2026-11-07, `src/goldens2.zig`).** 68 more captured batches, same recipe and `nft` build: `byteorder`, `lshift`/`rshift`, `exthdr` (IPv6 hbh, TCP option load and set), `fib`, `jhash` (+ seed/offset), `symhash`, `numgen` (inc/random), `range` (eq/neq), `rt`, `socket`, `notrack`, `dup`, `fwd` (with and without address), `tproxy` (port; address and port), `synproxy`, `ct count` (over/plain), `dynset` (add with timeout, update with a `limit`), `osf`, `ct mark set`, `ip ttl set` (payload write with checksum), `flow add`; `add table` with flags dormant / owner,persist, chains with devices and with `flags offload`, `replace rule`, `destroy table|chain|set|element`, `flush table|set`, `rename chain`, `add flowtable` (plain, priority -10 with flags), `delete flowtable`; sets `type ipv4_addr . inet_service` (plain and interval), with `timeout,dynamic`/size/policy/gc-interval, with a per-element `counter`, with a comment, maps `ipv4_addr : ipv4_addr` and `ipv4_addr . inet_service : verdict`; elements concatenated (padded key), interval-concatenated (`KEY_END`), with timeout+expires+comment, catch-all, with a counter; objects limit (packets, over mbytes), ct helper, secmark, ct timeout (11 TCP states), ct expectation, counter with a comment. Capture sources that `nft` refused at the kernel (no module in the namespace: `flow add`, secmark, `flags offload` chains) still produced the batch it tried to send, which is what a golden pins. Decoders: `expr_decode_test.zig` (round trip of every typed expression, `.raw` fallbacks, truncated input), `wire.zig` tests (events, objects, set/chain/flowtable attributes, gen id, element-get layout).
+**Hostile input.** Truncated/over-long/zero-length TLVs, an `NFTA_TABLE_FLAGS` of the wrong width, a payload shorter than `nfgenmsg`, and expression nests whose declared length runs past the buffer are all rejected with `Truncated`/`BadLength`. Fuzz: `NFTABLES_FUZZ=<runs>[,<first seed>]` runs testkit's deterministic driver over the expression walker (`expr.zig`, including the typed decoder) and the object decoders (`wire.zig`); the harnesses start from the kernel's own dump bytes (damaged corpus entries) and reach typed expressions, flowtables, typed objects, events and catch-all elements; reach counters check in every test run that every label is hit. The netlink walkers `nl.zig` aliases are fuzzed one layer down, in `netlink`'s own `codec.zig`.
 
-**Decoder goldens from the kernel (2026-11-07, `src/kernel_dumps.zig`).** The byte goldens above pin the ENCODERS against `nft`; the decoders are pinned against the KERNEL's own replies: raw dump bytes of a Linux 7.0 kernel holding 18 rules (byteorder, exthdr, hash with seed/offset, range, connlimit, notrack, numgen, log with its 16-bit group and queue-threshold, `ct` set, `last`, socket, dynset, lookup + objref, vmap, bitshift, rt, synproxy), one object of each type, a flowtable, a chain, a timeout set, a concatenated interval set and a verdict map with a catch-all, fetched by a small Python `AF_NETLINK` client (not this module) and stored untouched. Writing them found that `log`'s GROUP and QUEUE-THRESHOLD are 16-bit attributes: the encoder (pre-dating this work) sent 32-bit values, so `log group 5` reached the kernel as group 0, and the decoder failed on every real dump of such a rule; both fixed, golden `log group 5 queue-threshold 3` from an `nft` capture, and a value past 16 bits is now `error.InvalidExpression`. JSON serialization is bounded: an `Expr`/`Stmt` chain nested past `max_json_depth` (32) is `error.TooDeep` and a `ct timeout` naming a state twice `error.DuplicateKey` (from `Ruleset.writeJson`/`toJson`).
+**Constant time:** n/a: firewall rules over netlink, no secret.
 
-**Hostile input.** Truncated/over-long/zero-length TLVs, an `NFTA_TABLE_FLAGS` of the wrong width,
-a payload shorter than `nfgenmsg`, and expression nests whose declared length runs past the buffer
-are all rejected with `Truncated`/`BadLength`. Two in-module fuzz targets (`std.testing.fuzz`)
-drive the expression walker (`expr.zig`) and the object decoders (`wire.zig`) with arbitrary bytes
-and assert a step bound so no input can loop; the netlink walkers `nl.zig` aliases are fuzzed one
-layer down, in `netlink`'s own `codec.zig`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-nftables` (`tools/bench.zig`, Go peer in `tools/go_bench`); figures are the card's `**Performance:**` line.
 
-Run: `zig build test-nftables` (and `--release=fast`), `unshare -rn zig build test-nftables`.
+## Performance
+
+`zig build bench-nftables`: 64 generated rules per op in five firewall shapes, wall time, no socket and no kernel; the Go peer (google/nftables) runs through the library's own `WithTestDial` seam so its real `Flush`/`GetRules` code runs. The card's `**Performance:**` line is authoritative for the figures. No second implementation is callable on bytes (libnftnl is C behind an FFI, nftables-rs only shells out to `nft`), so the fastest in the field is not measured.
+
+## What is deliberately not done
+
+- **`xt` match/target (iptables-compat blobs) and `inner`/tunnel payload bases.** The compat ABI is per extension and `nft` itself never emits it; inner headers need a per-encapsulation model nobody has asked for in 10 years of `nft`. google/nftables has `Match`/`Target` only as raw blobs too; `Expr.raw` reaches them.
+- **The tunnel object.** `nft` 1.1.6 has syntax only with a tunnel device model (`tunnel` hook/encap) and the kernel needs `nft_tunnel`; no captures are possible in a netns without it, and no google/nftables or nftables-rs user model exists either (`tunnel` is "not implemented in expr" there). *(Reason inferred, not measured.)*
+- **JSON backend meters (`add meter`).** `nft -c -j` answers "Unknown object passed to add command": in the schema a meter is output of `list`, and the way to create one is the dynamic-set `set` statement with a `limit`, which is built.
+- **`nfgenmsg` framing folded into `netlink`.** `wire.zig` and `conntrack/src/wire.zig` both define `nfgenmsg_len`/`NFNETLINK_V0`/`msgType`/`Nfgenmsg`/`parseNfgenmsg`/`appendNfgenmsg` (about 45 near-identical lines; they differ only in `appendNfgenmsg` taking a raw `u8 nfproto` here vs a typed `Family` there). `struct nfgenmsg` is a per-protocol fixed payload header, at the same layer as `ifinfomsg` (in `netlink`, with rtnetlink), `tcmsg` (in `tc`) and `genlmsghdr` (in `genetlink`), so it belongs with its family, while `netlink`'s remit is the netlink-generic mechanism. The full argument is in `modules/netlink/SPEC.md`; the trigger to revisit is a third nfnetlink family (nfqueue, nflog, ipset), which would justify a sibling `nfnetlink` module (deps: `netlink`) with both current names kept as re-export aliases.
 
 ## Backlog / deferred
-- ~~**Dependency inversion (one line in the root `build.zig`).**~~ **Done.** The `nftables` entry
-  declares `.deps = &.{"netlink"}`, and `nl.zig` is now a thin alias layer over `netlink.codec`
-  with no codec code of its own — including the eight big-endian accessors, which moved into
-  `netlink.codec` (`conntrack` had written them independently too). `socket.zig`'s dump loop is
-  `netlink.classifyDumpMessage`.
-- ~~**The transport (the fourth copy).**~~ **Done.** `netlink.Socket.open` no longer hardcodes
-  `linux.NETLINK.ROUTE`: `openProtocol(gpa, protocol)` takes it, and `netlink.Socket` is now the
-  shared transport. `socket.zig`'s `Socket` is `struct { nl: netlink.Socket, failure: ?Failure }`;
-  its `open`/`close`/`send`/`recvDatagram`/`setRecvTimeout`/`handle`/`nextSeq`/`lastErrorMessage`
-  are one-line forwards, and the private `MSG_PEEK|MSG_TRUNC` growth loop, the bind + portid
-  capture, the `NETLINK_EXT_ACK` setsockopt and the `captureExtAck` copy are deleted. The
-  `Overrun`/`WouldBlock` distinction this module depends on — a `WouldBlock` *is* how a successful
-  un-acked batch looks — became the shared implementation
-  (`netlink.Socket.recvDatagramStrict`), with `netlink`'s coarser rtnetlink mapping narrowing over
-  it, so nothing on either side changed behaviour. What stays here is the batch ACK engine
-  (`awaitBatch`/`recordFailure`), which is genuinely nf_tables-specific: it counts one ACK per
-  staged command and attributes a failure to the offending command, rather than waiting for one
-  reply to one sequence number.
-- **Not folded in, deliberately: `nfgenmsg` framing.** `wire.zig` and `conntrack/src/wire.zig`
-  both define `nfgenmsg_len`/`NFNETLINK_V0`/`msgType`/`Nfgenmsg`/`parseNfgenmsg`/`appendNfgenmsg`
-  (~45 lines, near-identical — they differ only in `appendNfgenmsg` taking a raw `u8 nfproto` here
-  vs a typed `Family` there). `struct nfgenmsg` is a *per-protocol fixed payload header*, at the
-  same layer as `ifinfomsg` (which lives in `netlink`, with rtnetlink), `tcmsg` (in `tc`) and
-  `genlmsghdr` (in `genetlink`) — so it belongs with its family, while `netlink`'s remit is
-  netlink-**generic** mechanism (nlmsghdr/nlattr framing, the transport, the dump triage, the
-  byte-order accessors). The full argument is in `modules/netlink/SPEC.md`; the trigger to revisit
-  is a third nfnetlink family (nfqueue, nflog, ipset), which would justify a sibling `nfnetlink`
-  module (deps: `netlink`) with both current names kept as re-export aliases.
-- ~~**Objects, maps.**~~ **Done** — counter, quota (2026-10-04), limit, ct helper, secmark, ct timeout, ct expectation, synproxy, connlimit and flowtables (2026-11-07, see "Design — parity additions"). Open: the tunnel object (reason in "Compared with"), `ct timeout` typed decode (the entry list needs an allocator).
-- **Expressions still not modelled** (2026-11-07): `SREG_QNUM` queue selection, bitwise boolean operators (`nft` lowers them to mask/xor, captured), `xt` match/target and inner/tunnel payload bases (not doing). `Expr.raw` reaches any of them.
-- ~~**Interval sets.**~~ **Done 2026-10-04:** `wire.interval`/`prefixInterval`. Concatenated
-  (`KEY_END`/pipapo) intervals remain hand-built — they need concatenated keys first.
-- ~~**`meta ibridgename`/`obridgename`.**~~ **Done 2026-10-04:** grounded by capture (17/18).
-- ~~**`NF_INET_INGRESS`.**~~ **Done 2026-10-04** for `inet` (5); ip/ip6/bridge correctly refuse.
-- ~~**IPv6 prefix helpers.**~~ **Done 2026-10-04:** `ip6Saddr`/`ip6Daddr`/`…Prefix`,
-  `ipv6MaskBytes`.
-- ~~**Event monitoring.**~~ **Done 2026-11-07:** `Socket.openMonitor`/`nextEvents`/`wire.eventOf` (see "Design — parity additions").
-- ~~**Unanchored header offsets.**~~ **CLOSED — `g_rule_tcp_sport` and `g_rule_ip_daddr` landed
-  since.** The bullet said mutating `Program.tcpSport`'s or `Program.ipDaddr`'s offset left
-  `zig build test-nftables` green in both lanes (verified 2026-08-10); re-verified 2026-09-02 and
-  it is no longer true — `.th, 0, 2` → `.th, 6, 2` now exits 1 on
-  `goldens.test.golden: rule — tcp sport 22 counter accept`. Left visible rather than deleted
-  because a backlog entry that outlives its defect costs a future auditor the check it describes:
-  they read "nothing pins this", and skip a check that now works.
-- **Non-x86 goldens.** The captures are little-endian; every golden test skips on a big-endian
-  host (netlink's host-endian header fields would differ). The wire layer itself is
-  endian-explicit and would need a big-endian capture to be pinned.
 
-- **Survey ranking of the items above** *(survey 2026-09-30)* — what a typical `nft` user hits first: (1) **maps / verdict maps and named objects (counter, quota)** — `dnat to ip saddr map { … }`, per-service counters; (2) **native `reject`, `queue`, `redir`, `dynset` (meters/blocklists)**; (3) **the interval-set element-pair helper** (any CIDR/range set is otherwise hand-encoded); (4) **flowtables** (`flow offload`); (5) **`nft monitor` (`NFNLGRP_NFTABLES`)**. Effort: (1) medium, (2) small per expression, (3) small, (4) medium, (5) small (copy `conntrack`'s event seam). All fit §2. **2026-10-04:** (1) maps + counter/quota objects, (2) `reject`/`queue`/`redir` (not `dynset`) and (3) the interval helper are done; (4) and (5) stay deferred (reasons in the bullets above). **2026-11-07:** (4) flowtables and (5) `nft monitor` done, and `dynset` with them; what is left is the JSON backend's typed statements (next bullets).
-- ~~**JSON backend: statements and expressions.**~~ **Done 2026-11-07** (see the verdict table); meters rejected with a reason there. Small open item: `Expr` has no `xt`/`inner` forms (rejected for the native side too).
-- ~~**Single-rule fetch by handle.**~~ **Done 2026-11-07** (`Socket.getRule`).
-- **Live lane for the 2026-11-07 additions** (unprivileged `unshare -rn`): the byte goldens and the `nft -c -j` shape check are the default evidence; a live round trip of concatenated sets, destroy, replace, rename and the monitor against a real kernel (read back through `nft list ruleset`) is not written yet — the existing live tests cover the pre-parity feature set.
-
-## Status
-`gap · any · codec · reentrant` + deps: `netlink` (Socket's nlmsghdr/nlattr codec is shared) —
-canonical source is `pub const meta` in src/root.zig. `Socket` is Linux-only and `single_owner`.
+- **`ct timeout` typed decode.** `decodeObjectData` returns null for it (the per-state entry list needs an allocator), so `ObjectInfo.data` is the way to read it.
+- **Expressions not modelled.** `SREG_QNUM` queue selection (the `queue` expression carries NUM/TOTAL/FLAGS only) and bitwise boolean operators (`nft` lowers them to mask/xor, captured; the decoder returns `.raw` for one). `Expr.raw` reaches both.
+- **Live lane for the parity additions** (unprivileged `unshare -rn`): the byte goldens and the `nft -c -j` shape check are the evidence; a live round trip of concatenated sets, destroy, replace, rename and the monitor against a real kernel (read back through `nft list ruleset`) is not written; the live tests above cover the earlier feature set.
+- **Non-x86 goldens.** The captures are little-endian; every golden test skips on a big-endian host (netlink's host-endian header fields would differ). The wire layer itself is endian-explicit and would need a big-endian capture to be pinned.
 
 ## Anchoring
 
@@ -431,5 +300,3 @@ canonical source is `pub const meta` in src/root.zig. `Socket` is Linux-only and
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** native path anchored by captured real nft traffic; JSON builder path anchored since 2026-10-06 to a real `nft` (v1.1.6) applying it (`tools/interop.zig` -> `src/testdata/nft_json.zig`, replayed by `src/json_oracle_test.zig` without nft or privileges): 8 scenarios -- base/regular chains, ct state, payload/meta matches, prefixes, counters, a named interval set, every reject/log/limit form, jump/return, snat/dnat/masquerade/redirect, set timeout/size/auto-merge, a rule comment, create/flush/delete commands and an atomic refusal -- each applied by `nft -j -f -` and read back with `nft -j list ruleset`, every field we send carried with our value; the byte goldens in `root.zig` stay as the format pin
-
-**How it got there.** The anchoring work landed. DONE 5938bfc: 3 rules -> 13 across 4 chains; reject has no builder (documented gap)
