@@ -15,13 +15,12 @@
 
 **Downstream consumer:** no
 
-Design + fill-in notes for the next (crypto-implementing) agent. Usage: see
-`./README.md`. Attribution/provenance: see `./NOTICE` (module-local for now —
-see that file's placement note).
+Design notes. Usage: see `./README.md`. Provenance: see `./NOTICE` (module-local; see that
+file's placement note).
 
 ## Compared with
 
-Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module come from its SPEC/README and `rg` over `src/` (no `alpn`, `exporter`, `srtp` hits at all; `KeyUpdate` and `NewSessionTicket` are reported as `ReceivedPostHandshakeMessage`, not processed). pion/dtls facts are from its README, read in this run; the rest are *(inferred)*. The Scope verdict weighs DTLS 1.2 heavily: it is what almost every deployed DTLS peer (WebRTC, CoAP/LwM2M, VPNs) speaks today.
+Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date. Claims about this module come from its SPEC/README and `rg` over `src/`. pion/dtls facts are from its README, read in this run; the rest are *(inferred)*. The Scope verdict weighs DTLS 1.2 heavily: it is what almost every deployed DTLS peer (WebRTC, CoAP/LwM2M, VPNs) speaks today.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
@@ -31,86 +30,56 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29) | DTLS 1.0/1.2, SRTP; DTLS 1.3 not offered as far as the survey could tell *(inferred)*. |
 | Zig `std` / Rust `rustls` / Go `crypto/tls` | — | MIT / mixed / BSD-3-Clause | — | — | None of them implement DTLS. |
 
-**Where we are ahead:** the only DTLS in pure Zig, and a rare DTLS 1.3 (RFC 9147) one at all: mbedtls and OpenSSL have none *(inferred)*; wire-verified against a live wolfSSL 5.9.1 in both roles (PSK and certificate mode, HelloRetryRequest, a 256-byte-MTU fragmented Certificate, mutual authentication), plus the X25519MLKEM768 hybrid key share, which pion does not list. **Where we are behind:** (DTLS 1.2 closed 2026-11-13, live against wolfSSL since 2026-11-17) resumption and 0-RTT; the CCM suites (the RFC 7925 CoAP default; untested against any peer); connection ID beyond framing; `use_srtp` (the exporter and ALPN it builds on landed 2026-11-13, as did KeyUpdate).
+**Where we are ahead:** the only DTLS in pure Zig, and a rare DTLS 1.3 (RFC 9147) one at all: mbedtls and OpenSSL have none *(inferred)*; wire-verified against a live wolfSSL 5.9.1 in both roles (PSK and certificate mode, HelloRetryRequest, a 256-byte-MTU fragmented Certificate, mutual authentication), plus the X25519MLKEM768 hybrid key share, which pion does not list. **Where we are behind:** resumption and 0-RTT; the CCM suites (the RFC 7925 CoAP default; not wired); connection ID beyond framing; `use_srtp` negotiation (the exporter and ALPN it builds on exist, and so does KeyUpdate) — see Backlog; rejected items are in *What is deliberately not done*.
 
 ## Design & invariants
 
-**2026-10-20:** the key schedule's code now lives in the `tls13` module
-(`tls13.keyschedule.dtls13`, shared with the planned `tlsserver`);
-`src/keyschedule.zig` is a shim that binds it to the names below (only
-`deriveSequenceNumberKey` is still defined here), and the KATs moved with it.
-The same day `certverify.zig` and its KAT vectors followed (`tls13.certverify`,
-re-exported as `dtls.certverify`; the signer burns `ecdsa_burn`/`ed25519_burn`/
-`rsa_burn` moved to `tls13/src/burn.zig`). `stackprobe_test.zig` still measures
-`certverify.sign` from here. Then the (EC)DHE key exchange (`tls13.kex`); `Connection.zig`
+The key schedule's code lives in the `tls13` module (`tls13.keyschedule.dtls13`, shared with
+`tlsserver`); `src/keyschedule.zig` is a shim that binds it to the names below (only
+`deriveSequenceNumberKey` is defined here), and the KATs live with it. `certverify` is
+`tls13.certverify`, re-exported as `dtls.certverify` (`src/root.zig:346`; the signer burns
+`ecdsa_burn`/`ed25519_burn`/`rsa_burn` are in `tls13/src/burn.zig`; `stackprobe_test.zig` still
+measures `certverify.sign` from here). The (EC)DHE key exchange is `tls13.kex`; `Connection.zig`
 keeps the group policy and wrappers named `ecdheGenerate`/`ecdheSharedSecret`/
-`ecdheServerExchange`. And the transcript hash: `engine.Transcript` is
-`tls13.transcript.Transcript(Sha256)`.
+`ecdheServerExchange`. `engine.Transcript` is `tls13.transcript.Transcript(Sha256)`.
 
-**STATUS UPDATE (crypto core AND flight engine landed):** the crypto-core
-layer (`keyschedule.zig`, `aead.zig`) is REAL and KAT-validated — the 15
-functions below are implemented (see each file's tests + `root.zig`'s module
-doc for the oracles). The handshake FLIGHT ENGINE (`Connection.startHandshake`
-/ `.handleFlight` / `.poll`) is now ALSO implemented — a real RFC 9147 §5
-PSK-only (and, additively, `.cert_dhe` certificate-only) client+server
-handshake, proven by an in-memory client↔server interop suite (see
-`Connection.zig`'s tests and `root.zig`'s module doc for the full list of
-what is exercised). The `error.HandshakeEngineNotImplemented` this section
-used to describe no longer exists in the code. PSK-mode third-party interop
-is also proven — a live wolfSSL 5.9.1 handshake in both roles, see "Live
-third-party interop" below, which lists the four wire defects that only a
-third-party peer could surface. 0-RTT/resumption/key update/CCM are not
-implemented yet and not stubbed (see Backlog); HelloRetryRequest is now IMPLEMENTED
-(both roles, both key-exchange modes, including RFC 8446 §4.1.4's group
-change). Certificate mode is
-**no longer self-interop only** — a live wolfSSL certificate server is now
-part of the suite (see "Live third-party interop"), including one run at a
-256-byte peer MTU that forces wolfSSL to fragment its Certificate across
-datagrams, a wolfSSL server that REQUIRES and verifies our client
-certificate, and a wolfSSL certificate CLIENT that verifies the chain our
-server presents. The rest of this SPEC
-is the original design/recon notes; the itemized 15-function checklist below
-is retained as an implementation record (all 15 are done).
+The crypto-core layer (`keyschedule.zig`, `aead.zig`) is KAT-validated and the handshake flight
+engine (`Connection.startHandshake` / `.handleFlight` / `.poll`) is a real RFC 9147 §5 PSK-only
+and, additively, `.cert_dhe` certificate-authenticated client+server handshake, proven by an
+in-memory client↔server interop suite (`Connection.zig`'s tests, `root.zig`'s module doc) and by
+live wolfSSL runs in both roles (see *Live third-party interop*). HelloRetryRequest is
+implemented in both roles and both key-exchange modes, including RFC 8446 §4.1.4's group change.
+0-RTT, resumption and CCM are not implemented and not stubbed (see Backlog).
 
 **Layered, like this repo's other DTLS/TLS-family scaffolds
 (`opcua`/`noise`/`x509`):** the wire-framing layer (`record.zig`,
 `handshake.zig`, `flight.zig`, `messages.zig`) is real, pure, allocation-free
 where practical, and operates only on caller-supplied byte slices — no I/O,
 no wall-clock calls (`flight.zig`'s timer takes `now_ms` from the caller),
-no key material. The crypto-core layer (`keyschedule.zig`, `aead.zig`) is now
-real. `Connection.zig` wires the two together: `Config.validate`,
+no key material. The crypto-core layer (`keyschedule.zig`, `aead.zig`) holds the
+key material. `Connection.zig` wires the two together: `Config.validate`,
 `clientInit`/`serverInit`, the application-data record path
 (`installApplicationKeys` + `send`/`recv`), and `startHandshake` /
-`handleFlight` / `poll` (the flight engine) are all real and tested — see
-the "STATUS UPDATE" above.
+`handleFlight` / `poll` (the flight engine).
 
-**Key correction to the recon below:** items reference DTLS reusing the TLS
-1.3 key schedule "unchanged" and treating `hkdfExpandLabel` as a std
-pass-through. That was WRONG — RFC 9147 §5.9 changes the label prefix to
-`"dtls13"` (no trailing space); the implementation uses its own
-`expandLabel` with that prefix. Also: "AES-CCM is NOT a std gap" holds only
-for a 13-byte nonce; the TLS/DTLS 1.3 profile needs a 12-byte nonce, which
-std's CCM presets don't offer, so CCM is left unwired.
+**DTLS 1.3 does not reuse TLS 1.3's key-schedule labels unchanged:** RFC 9147 §5.9 changes the
+HKDF-Expand-Label prefix to `"dtls13"` (no trailing space), so the key schedule uses its own
+`expandLabel` parameterized on that prefix rather than `std.crypto.tls.hkdfExpandLabel`.
 
-## RFC 9147 recon vs. Zig 0.16 `std.crypto`
+## RFC 9147 recon vs. `std.crypto`
 
-Recorded in detail in `root.zig`'s module doc comment (single source of
-truth per CONVENTIONS.md §5) — summary: `std.crypto.tls.hkdfExpandLabel` is
-genuinely `pub` and reusable (RFC 9147 §5.8 says DTLS 1.3's key schedule is
-identical to TLS 1.3's), so `keyschedule.hkdfExpandLabel` calls it directly
-rather than being stubbed. AES-CCM (incl. CCM_8, RFC 7925's IoT default) is
-present in std (`std.crypto.aead.aes_ccm`) — NOT a gap, contrary to this
-repo's earlier finding for a different AEAD need in `dnp3`. A real,
-callable single-block AES-ECB primitive exists for the RFC 9147 §4.2.3
-sequence-number mask (`std.crypto.core.aes.Aes128/Aes256.initEnc(key)
-.encrypt(...)`). Nothing else in `std.crypto.tls` is reusable — transcript
-hashing and HelloRetryRequest/cookie handling are inline in
-`tls.Client.init`'s private ~1670-line state machine, not separate types.
+Recorded in detail in `root.zig`'s module doc comment (single source of truth per
+CONVENTIONS.md §5) — summary: a single-block AES-ECB primitive exists for the RFC 9147 §4.2.3
+sequence-number mask (`std.crypto.core.aes.Aes128/Aes256.initEnc(key).encrypt(...)`). std's
+AES-CCM exports only 13-byte-nonce presets and its generic `AesCcm` is not `pub`, while the
+TLS/DTLS 1.3 profile needs a 12-byte nonce, so CCM is not wired (Backlog). Nothing else in
+`std.crypto.tls` is reusable: transcript hashing and HelloRetryRequest/cookie handling are inline
+in `tls.Client.init`'s private state machine, not separate types.
 
-## THE FABLE CORE — every function the next agent must implement
+## Key schedule and record-protection primitives
 
-All in `src/keyschedule.zig` unless noted. Each stub's doc comment already
-names the exact RFC section; this is the itemized checklist:
+All in `src/keyschedule.zig` (names bound to `tls13.keyschedule.dtls13`) unless noted. Each
+function's doc comment names its RFC section; all fifteen are implemented and KAT-validated:
 
 1. `keyschedule.earlySecret` — RFC 8446 §7.1, `HKDF-Extract(salt=0, IKM=PSK)`.
 2. `keyschedule.binderKey` — RFC 8446 §7.1, `Derive-Secret(early_secret,
@@ -118,7 +87,7 @@ names the exact RFC section; this is the itemized checklist:
 3. `keyschedule.pskBinder` — RFC 8446 §4.2.11.2, the PSK binder itself
    (HMAC over the truncated ClientHello1 transcript with a
    `"finished"`-labeled key derived from `binder_key`). **Most
-   security-critical stub in this module** — a wrong/skipped check lets an
+   security-critical item in this module** — a wrong/skipped check lets an
    attacker splice a PSK identity across connections.
 4. `keyschedule.deriveHandshakeSecret` — RFC 8446 §7.1, handles both
    `psk_ke` (zero IKM) and `psk_dhe_ke` (real (EC)DHE shared secret) modes.
@@ -148,36 +117,13 @@ names the exact RFC section; this is the itemized checklist:
     — RFC 9147 §4.2.3's ChaCha20-suite equivalent (confirm it is NOT simply
     the AES path with the cipher swapped before assuming so).
 
-(Historical note: this "once (1)-(15) are real" instruction has since been
-carried out — `Connection.startHandshake`/`handleFlight`/`send`/`recv` no
-longer have `@panic` placeholders; see the "STATUS UPDATE" at the top of this
-file. Retained here as the original implementation record, not current
-guidance.)
+## Certificate mode (RFC 8446 §4.4, additive to the PSK core)
 
-## Crypto-heaviness, honestly assessed vs. this repo's other scaffolds
-
-**Confirmed, not refuted:** this module is genuinely more crypto-heavy than
-`x509`. x509's gap (`chain.zig`) is a POLICY/decision algorithm over
-already-correct primitives (`std.crypto.Certificate.Parsed.verify` does the
-actual signature math); getting RFC 5280 §6 wrong yields a wrong
-accept/reject decision on an otherwise-intact crypto operation. DTLS 1.3's
-gap is deriving FRESH key material (HKDF label sequencing) and constructing
-FRESH nonces (epoch/sequence-number bit-packing) — a labeling or bit-packing
-mistake here doesn't just misapply correct crypto, it silently produces
-DIFFERENT (still "successfully" computed) keys/nonces with no compile-time
-or obvious-runtime signal, only an interop failure or, worse, a nonce reuse.
-
-## Certificate mode (RFC 8446 §4.4, ADDITIVE — landed after the PSK core)
-
-**STATUS UPDATE:** `Connection.zig` now also implements certificate-mode
-Certificate/CertificateVerify/CertificateRequest (`messages.zig` framing +
-`certverify.zig` sign/verify, reused unchanged, + the new `certauth.zig`
-DER/std-Certificate bridge), layered on top of the unchanged PSK key
-exchange — see `root.zig`'s module doc "Certificate mode" section and
-`Connection.zig`'s own "certificate mode" section (right before
-`handleFlightServer`) for the full design rationale. Summary of what
-changed vs. the "Out of scope" list below (now stale on this one point —
-left in place rather than silently deleted, corrected here):
+`Connection.zig` implements certificate-mode Certificate/CertificateVerify/CertificateRequest
+(`messages.zig` framing + `certverify.zig` sign/verify + `certauth.zig`'s DER/std-Certificate
+bridge), layered on top of the unchanged PSK key exchange — see `root.zig`'s module doc
+"Certificate mode" section and `Connection.zig`'s own "certificate mode" section (right before
+`handleFlightServer`) for the design rationale.
 
 - **Implemented:** Certificate/CertificateVerify/CertificateRequest wire
   framing; server always presents its cert when `Config.cert` is set;
@@ -192,8 +138,7 @@ left in place rather than silently deleted, corrected here):
   wrong-key rejection, untrusted-anchor rejection, required-but-absent-cert
   rejection) — same in-memory-oracle style as the PSK suite, no external
   peer.
-- **`signature_algorithms` extension negotiation (RFC 8446 §4.2.3) — LANDED
-  (was listed as deferred here; corrected):** the ClientHello (both `.psk`
+- **`signature_algorithms` extension negotiation (RFC 8446 §4.2.3):** the ClientHello (both `.psk`
   and `.cert_dhe` modes) and a server's `CertificateRequest` now advertise
   `Config.signature_algorithms` (defaults to every scheme `certverify.zig`
   implements) for real; `Connection.zig`'s `selectSignatureScheme` picks the
@@ -206,45 +151,32 @@ left in place rather than silently deleted, corrected here):
   there is no overlap. `verifyPeerCert` additionally rejects (`error
   .SignatureSchemeNotAdvertised`) a peer's CertificateVerify that used a
   scheme THIS side never put in its own `signature_algorithms` — a downgrade
-  guard, checked before the signature itself. `CertConfig` no longer carries
-  a fixed `signature_scheme` field.
-- **Still deferred (now explicit, not silently absent):** full RFC 5280 §6
-  certification-path building (multi-hop chains, name constraints,
-  `basicConstraints`/`keyUsage` policy checks, revocation) — `.trust_anchor`
-  is a minimal one-hop check only; `CertificateEntry` extensions (OCSP
-  stapling/SCT) — framed empty on send, length-validated-but-discarded on
-  receive.
-- **CLOSED GAP (corrected from an earlier draft of this SPEC):**
-  `std.crypto.Certificate.parse` (Zig 0.16) was confirmed by fuzzing to be
-  NOT panic-safe against malformed/adversarial DER — even trivial few-byte
-  or random ~30-60-byte inputs reliably crashed the process via an
-  unguarded array index deep in std's ASN.1 walker, rather than returning a
-  typed error, and `certauth.zig` could not intercept a panic (Zig has no
-  exception mechanism). This is no longer live: both `certauth.zig` entry
-  points (`parseLeafPublicKey`, `verifyLeafAgainstAnchor`) now route
-  PEER-supplied Certificate bytes through this collection's `x509` module's
-  bounds-checked `spkiOf`/`safeCertificate` bridge first and never call
-  `std.crypto.Certificate.parse` directly, so the same hardened parser
-  `iec62351` and `opcua` already use closes this module's copy of the gap
-  too. See `certauth.zig`'s module doc "CLOSED GAP" note for the full
-  writeup, and its `test "parseLeafPublicKey: adversarial DER returns a
-  typed error instead of panicking"` for the fuzz-style regression coverage
-  (empty/truncated/malformed DER and a full truncation sweep of a real
-  certificate, all typed-error, no crash).
+  guard, checked before the signature itself. `CertConfig` carries no
+  fixed `signature_scheme` field.
 
-## Cert-only (EC)DHE mode (RFC 8446 §4.2.8 key_share + X25519, LANDED)
+- **Untrusted DER.** `std.crypto.Certificate.parse` (Zig 0.16; the reader is unchanged in 0.17.0)
+  is not panic-safe against malformed or adversarial DER — fuzzing crashed it with trivial
+  few-byte or random inputs via an unguarded array index in std's ASN.1 walker — and Zig has no
+  exception mechanism to intercept that. Both `certauth.zig` entry points (`parseLeafPublicKey`,
+  `verifyLeafAgainstAnchor`) therefore route PEER-supplied Certificate bytes through this
+  collection's `x509` module's bounds-checked `spkiOf`/`safeCertificate` bridge first and never call
+  `std.crypto.Certificate.parse` directly — the same hardened parser `iec62351` and `opcua` use.
+  See `certauth.zig`'s module doc ("CLOSED GAP" note) and its test `parseLeafPublicKey:
+  adversarial DER returns a typed error instead of panicking` (empty/truncated/malformed DER and a
+  full truncation sweep of a real certificate, all typed-error, no crash). `.cert_dhe` mode
+  parses peer certificates through the same path.
 
-**STATUS UPDATE:** the "genuine (EC)DHE-based, PSK-LESS certificate-only key
-exchange" listed as deferred above is now IMPLEMENTED as a distinct handshake
-mode, selected by `Config.key_exchange = .cert_dhe` (default stays `.psk`, so
-every PSK / cert-over-PSK path and its RFC 8448 KATs are byte-for-byte
-unaffected — proven by the untouched existing suite). Summary:
+## Cert-only (EC)DHE mode (RFC 8446 §4.2.8 key_share + X25519)
+
+The genuine (EC)DHE-based, PSK-less certificate-only key exchange is a distinct handshake
+mode, selected by `Config.key_exchange = .cert_dhe` (default `.psk`, so every PSK /
+cert-over-PSK path and its RFC 8448 KATs are unaffected). Summary:
 
 - **`messages.zig`:** `key_share` (RFC 8446 §4.2.8, ClientHello list +
   ServerHello single-entry forms), `supported_groups` (§4.2.7),
   `signature_algorithms` (§4.2.3) encode/decode, plus the `NamedGroup` enum.
   **X25519** (`0x001d`), **secp256r1** (`0x0017`) and the PQ hybrid
-  **X25519MLKEM768** (`0x11ec`, added 2026-08-31 — see the threat-model
+  **X25519MLKEM768** (`0x11ec`, see the threat-model
   section) are wired end to end; a fresh ClientHello offers a share in
   `Config.key_share_group` (default X25519) and any other advertised group
   is used when a server names it in a HelloRetryRequest (RFC 8446 §4.1.4).
@@ -288,13 +220,12 @@ unaffected — proven by the untouched existing suite). Summary:
   self-interop cannot find: the `.cert_dhe` ClientHello carried no
   `supported_versions`, so a real server negotiated DTLS 1.2.
 
-  The two remaining certificate-mode gaps an earlier version of this section
-  listed are now closed, both live: a wolfSSL server with
-  `VERIFY_PEER | FAIL_IF_NO_PEER_CERT` and the fixture anchor as its only CA
-  verifies OUR client's Certificate + CertificateVerify (mutual auth), and a
+  Certificate authentication is also driven live in both directions: a wolfSSL
+  server with `VERIFY_PEER | FAIL_IF_NO_PEER_CERT` and the fixture anchor as its
+  only CA verifies OUR client's Certificate + CertificateVerify (mutual auth), and a
   real wolfSSL certificate CLIENT verifies the chain our server presents
-  (`wolfSSL_get_verify_result` asserted inside the peer). The first found a
-  sixth defect of the same family: the client decoded a CertificateRequest's
+  (`wolfSSL_get_verify_result` asserted inside the peer). The mutual-auth run found
+  a defect of the same family as those listed under *What it found*: the client decoded a CertificateRequest's
   `signature_algorithms` into a fixed `[8]u16`, so a real peer's list
   (wolfSSL sends 16) came back `TooManyExtensions` → `Malformed` — the same
   mistake the ClientHello path had already been fixed for, surviving here
@@ -306,22 +237,16 @@ unaffected — proven by the untouched existing suite). Summary:
   not the point encoding. An independent oracle, since the RFC 8448 vector
   covers only the X25519 half.
 
-**Untrusted-DER hazard (unchanged, inherited):** `.cert_dhe` mode parses the
-same PEER-supplied X.509 via the same `certauth` path, so it inherits the
-`std.crypto.Certificate.parse` non-panic-safety gap documented below /  in
-`certauth.zig` verbatim — this pass adds no new cert-parse call sites beyond
-that path and does not worsen it; hardened DER parsing remains the tracked
-follow-up.
 
-## Post-handshake: KeyUpdate, exporter, ALPN (2026-11-13)
+## Post-handshake: KeyUpdate, exporter, ALPN
 
-API (additive; every existing caller is unchanged):
+API:
 
 - **KeyUpdate** (RFC 9147 §8, RFC 8446 §4.6.3/§7.2).
   `Connection.requestKeyUpdate(request_peer)` queues one;
   `Config.key_update_after_records` (default 2^24, the RFC 8446 §5.5 AES-GCM
   margin; `null` = off) queues one automatically from `send`. `poll(now_ms,
-  out)`, which used to return `null` once connected, now returns the control
+  out)`, once connected, returns the control
   records this side owes, one record per call: the ACK for processed
   post-handshake messages, then the queued KeyUpdate, then — timer-gated —
   a retransmission of an un-ACKed KeyUpdate in a fresh record. The write key
@@ -361,7 +286,7 @@ API (additive; every existing caller is unchanged):
 both suites, the next read key re-derived independently from RFC 8446 §7.2's
 `"traffic upd"` label, late previous-epoch records, a lost KeyUpdate and a
 lost ACK, the exporter equal on both sides and distinct from the TLS-prefix
-exporter. **Against a live peer (2026-11-17, wolfSSL 5.9.1, PSK mode):** four interop cases. `psk-client-alpn`: our ClientHello offers
+exporter. **Against a live peer (wolfSSL 5.9.1, PSK mode):** four interop cases. `psk-client-alpn`: our ClientHello offers
 `h3`, `coap`; wolfSSL (accepts only `coap`) answers in EncryptedExtensions, `negotiatedAlpn()` is `coap` and the peer prints
 the same. `psk-server-alpn`: wolfSSL offers `h3,coap`, our server (preference `coap`, `h3`) picks `coap`, and the peer exits 0 only
 if the answer it parsed is `coap`. `psk-client-keyupdate-ours`: we send a KeyUpdate with `update_requested`; wolfSSL ACKs it and answers with its own,
@@ -372,15 +297,15 @@ including the control records `poll` emits (new ops `request_key_update`, `poll`
 Both KeyUpdate cases have wolfSSL as the SERVER; the engine is role-symmetric here, but a wolfSSL KeyUpdate in the client role is not recorded.
 The first `poll` after an update request also carries the ACK of wolfSSL's NewSessionTicket (two records, not one).
 
-**An ACK in the middle of a handshake flight (2026-11-17).** RFC 9147 §7.1 has a receiver ACK a partial flight (out-of-order or late records; SHOULD), and the ACK travels in the highest epoch the sender holds (§7: equal or higher than the acknowledged records), so a peer may place one in epoch 0 (plaintext content type 26, §4) or epoch 2 among the records of its flight. The two handshake record readers now accept it: the body is length-checked like a post-handshake ACK (`error.Malformed` for a short, truncated, odd-sized or over-long list), an epoch-2 ACK runs the same AEAD and replay-window checks as any record, and the record is then skipped. It is never added to the ACK this side owes (§7.1: ACKs only for handshake records), and its record numbers are not matched: the whole cached flight is still resent on the timer, which is conforming (§7.2 makes omitting acknowledged records a SHOULD; see Backlog "partial retransmission"). Before this a peer ACK failed the handshake with `error.UnexpectedMessage`. **Closed 2026-11-19:** §7.2's "Once all the messages in a flight have been acknowledged, the implementation MUST cancel all retransmissions of that flight" is met. `cacheFlight` records the (epoch, sequence_number) of each record of the flight (`recordFlightNumbers`: epoch-0 numbers read from the clear header, epoch-2 ones are the last numbers `hs2.send_seq` handed out), an epoch-2 ACK marks the ones it names (`noteFlightAck`; an exact (epoch, sequence_number) match, so a number we did not send, in any epoch, is ignored), and the timer is cancelled once all are marked. The marks survive `handleFlight`'s rollback (an ACK-only datagram is an incomplete flight, and a rollback would otherwise undo the cancel); only an authenticated record can set them. An epoch-0 ACK stays length-checked and skipped: it is unauthenticated, and an off-path sender naming our predictable epoch-0 numbers would otherwise silence our ClientHello. Ignoring an ACK only costs a conforming retransmission. Reference behaviour: the live interop runs against wolfSSL lose no datagram, so no partial-flight ACK from it was observed (its source is not read); whether it sends one under loss is not claimed.
+**An ACK in the middle of a handshake flight.** RFC 9147 §7.1 has a receiver ACK a partial flight (out-of-order or late records; SHOULD), and the ACK travels in the highest epoch the sender holds (§7: equal or higher than the acknowledged records), so a peer may place one in epoch 0 (plaintext content type 26, §4) or epoch 2 among the records of its flight. The two handshake record readers now accept it: the body is length-checked like a post-handshake ACK (`error.Malformed` for a short, truncated, odd-sized or over-long list), an epoch-2 ACK runs the same AEAD and replay-window checks as any record, and the record is then skipped. It is never added to the ACK this side owes (§7.1: ACKs only for handshake records), and its record numbers are not matched: the whole cached flight is still resent on the timer, which is conforming (§7.2 makes omitting acknowledged records a SHOULD; see Backlog "DTLS 1.3 partial retransmission"). **Fully ACKed flights:** §7.2's "Once all the messages in a flight have been acknowledged, the implementation MUST cancel all retransmissions of that flight" is met. `cacheFlight` records the (epoch, sequence_number) of each record of the flight (`recordFlightNumbers`: epoch-0 numbers read from the clear header, epoch-2 ones are the last numbers `hs2.send_seq` handed out), an epoch-2 ACK marks the ones it names (`noteFlightAck`; an exact (epoch, sequence_number) match, so a number we did not send, in any epoch, is ignored), and the timer is cancelled once all are marked. The marks survive `handleFlight`'s rollback (an ACK-only datagram is an incomplete flight, and a rollback would otherwise undo the cancel); only an authenticated record can set them. An epoch-0 ACK stays length-checked and skipped: it is unauthenticated, and an off-path sender naming our predictable epoch-0 numbers would otherwise silence our ClientHello. Ignoring an ACK only costs a conforming retransmission. Reference behaviour: the live interop runs against wolfSSL lose no datagram, so no partial-flight ACK from it was observed (its source is not read); whether it sends one under loss is not claimed.
 
-## Cipher suites and the suite hash (2026-11-13)
+## Cipher suites and the suite hash
 
 Wired: `aes_128_gcm_sha256` (0x1301), `aes_256_gcm_sha384` (0x1302),
 `chacha20_poly1305_sha256` (0x1303); the CCM pair is refused by
 `Config.validate` (Backlog). Default `Config.cipher_suites` is
 `{ aes_128_gcm_sha256, aes_256_gcm_sha384 }` — pion/dtls's and wolfSSL's
-order, the mandatory suite first. API (additive apart from the default):
+order, the mandatory suite first. API:
 
 - `CipherSuite.hash() HashAlg` (`.sha256` / `.sha384`). Every secret,
   transcript hash, PSK binder and Finished MAC is `Hash.length` bytes for
@@ -419,14 +344,16 @@ offering both hashes against a server preferring either, PSK and cert-DHE
 HelloRetryRequest (83-byte cookie, stateless second connection), KeyUpdate
 (Figure 14, and the next read key/IV/sn key re-derived with HKDF-SHA384
 from the 48-byte secret), the exporter (equal to an independent HKDF-SHA384
-export, 255 × 48 cap), and the PSK-hash refusals above. Not against a live
-peer: the reviewed wolfSSL interop program is pinned to
-`TLS13-AES128-GCM-SHA256` (`tools/wolfssl_peer.c` `kSuite`).
+export, 255 × 48 cap), and the PSK-hash refusals above. Live: the PSK
+handshake under `TLS13-AES256-GCM-SHA384` with a 48-byte SHA-384 PSK runs against wolfSSL 5.9.1
+in both roles, with and without a HelloRetryRequest cookie (`tools/interop.zig` cases
+`psk-client-aes256`, `psk-client-aes256-hrr`, `psk-server-aes256`, `psk-server-cookie-aes256`);
+ChaCha20-Poly1305 and certificate mode under SHA-384 are not driven against a live peer.
 
-## DTLS 1.2 (RFC 6347) and version negotiation (2026-11-13)
+## DTLS 1.2 (RFC 6347) and version negotiation
 
-Owner decision 2026-11-13. API (additive; a `Config` that does not set
-`versions` is byte-identical to before):
+Owner decision. API (a `Config` that does not set `versions` runs the 1.3
+engine, unchanged):
 
 - **`Connection12`** — the 1.2 engine, with `Connection`'s method shape
   (`clientInit`/`serverInit` from the same `Config`, `startHandshake`,
@@ -452,7 +379,7 @@ Owner decision 2026-11-13. API (additive; a `Config` that does not set
   ChaCha20-Poly1305; a connection uses only the ones `key_exchange` allows —
   PSK suites in `.psk`, the certificate suites otherwise),
   `require_extended_master_secret` (default true), `psk_identity_hint`,
-  `max_datagram_len` (2026-11-17, see "Fragmentation").
+  `max_datagram_len` (see "Fragmentation").
   `hello_retry` doubles as the HelloVerifyRequest cookie key + peer
   binding; `cert`/`peer_verify`/`expected_peer_name`/`request_client_cert`/
   `require_peer_cert`/`signature_algorithms`/`alpn_protocols` mean what they
@@ -475,7 +402,7 @@ record sequence number, HMAC-SHA256 cookie over the peer binding and RFC
 ClientHello at any `message_seq`. A client answers at most three
 HelloVerifyRequests. `renegotiation_info`: a client sends it and requires it
 in the ServerHello; a server answers the extension or the SCSV, refuses a
-non-empty one, and — since 2026-11-17 — also serves a client that signals
+non-empty one, and also serves a client that signals
 neither, without sending the extension (RFC 5746 §4.3 lets a server that
 never renegotiates continue; OpenSSL, wolfSSL and mbedTLS servers do, and
 Debian's wolfSSL 1.2 client, built without `HAVE_SECURE_RENEGOTIATION`, is
@@ -490,7 +417,7 @@ flight through `recv` (`ReceivedPostHandshakeMessage`) + `poll`. Every
 `handleFlight` is a transaction (rolled back on error). A peer alert is
 `error.ReceivedAlert` (`peer_alert` holds it); this module sends none.
 
-**Fragmentation (2026-11-17, RFC 6347 §4.2.2/§4.2.3).** *Send:*
+**Fragmentation (RFC 6347 §4.2.2/§4.2.3).** *Send:*
 `Config.max_datagram_len` (default 0 = off, the earlier behaviour) is the
 largest datagram this side emits. An epoch-0 handshake message whose record
 would exceed it is split by `handshake.Fragmenter` (the 1.3 engine's), one
@@ -521,153 +448,48 @@ queued bytes from an earlier call — is retried once from its own datagram
 with the queue (and that message) emptied: a forged later-message fragment
 cannot wedge the genuine flight (tested with 4000 forged fragments, among
 them a complete forged message, and with one latched by an earlier call). The epoch-0 replay window records a record only once it advanced
-the handshake (2026-11-19, see Backlog "Epoch-0 replay window"), so queued forgeries do not shadow the genuine records either.
+the handshake (see "Epoch-0 replay window"), so queued forgeries do not shadow the genuine records either.
 
-**Deliberately not implemented** (each a security or scope choice, not an
-omission): CBC suites (Lucky13 family), static-RSA key exchange (no forward
-secrecy, Bleichenbacher), compression, renegotiation, session resumption
-(IDs and RFC 5077 tickets), DTLS 1.0. Not yet (Backlog): CCM/CCM_8,
+
+**Epoch-0 replay window.** An epoch-0 record proves nothing, so it may not move the replay window
+on its own say-so. Rule followed: RFC 6347 §4.1.2.6 ("the receive window is updated only if the MAC
+verification succeeds") and RFC 9147 §4.5.1 ("The window MUST NOT be updated due to a received record
+until that record has been deprotected successfully"). The mandatory RFC rule decides; the model is
+pion/dtls (`replayMarker` returns a no-op marker for epoch 0 until the version is chosen, and
+`bufferHandshakeRecord` marks a packet valid only after `fragmentBuffer.Push` accepted the fragment) and
+wolfSSL's DTLS 1.3 path (`Dtls13UpdateWindowRecordRecvd` only once stateful); OpenSSL and wolfSSL's
+DTLS 1.2 path record every epoch-0 record, which the mandatory RFC rule does not allow. In the 1.2 engine an
+epoch-0 record is checked against the window first and recorded only after it completed a message (the
+next expected `message_seq` moved on) or was an accepted ChangeCipherSpec (the read epoch moved on)
+(`Connection12.processRecord`, `Progress`), and even then only if it moves the high mark at most one window
+width (64) past the current one, or past 0 before any (`Window.recordUnauthenticated`,
+`src/Connection12.zig:169`); a record further ahead is processed but not recorded. A duplicate, a partial
+fragment, a queued later message, an early ChangeCipherSpec, epoch-0 application data or a stateless
+HelloVerifyRequest exchange leave the window untouched. Companion rules: `handleFlight`'s retry-once from live
+bytes also drops a message in progress from an earlier call (not only the queue), but keeps the retry's
+result only if the datagram alone COMPLETES the message — otherwise the partial message and the error
+stand, so a forged fragment cannot evict a genuine partial one; and a server at `.start` lets a WHOLE
+ClientHello under another `message_seq` replace a partial one (a mere fragment does not). The 1.3 engine
+keeps no epoch-0 receive window at all (`hs0` counts sends only; duplicates are recognised by
+`message_seq`), so it is not affected. The residual risks are in *Threat model*.
+
+**Plain-PSK premaster.** The plain-PSK premaster buffer is `2 + max(80, max_psk_len) + 2 + max_psk_len`
+bytes (`Connection12.zig:136`, `:1080`), because RFC 4279 §2's `other_secret` is `psk.len` zero bytes; the cap
+`max_psk_len` is 512 (OpenSSL's `PSK_MAX_PSK_LEN`). The DTLS 1.3 PSK path has no such buffer (the PSK goes straight
+into HKDF-Extract; an over-long PSK identity is a typed `BufferTooShort` from the ClientHello's
+pre_shared_key buffer).
+
+Deliberately not implemented in 1.2: see *What is deliberately not done*. Not yet (Backlog): CCM/CCM_8,
 `use_srtp`, connection ID (RFC 9146).
-
-**Validation:** the PRF against Python `hmac`/`hashlib` goldens and std's
-own TLS 1.2 PRF (`std.crypto.tls.hmacExpandLabel`); the record nonces /
-AAD against std's AEADs directly (`record12.zig`); self-interop for all
-eight suites, PKCS#1 v1.5 against a client offering no PSS, mutual auth,
-untrusted / wrong-name certificates, wrong PSK / identity, HelloVerifyRequest
-(stateless, cookie refused for another peer binding), loss of flight 4 and
-of flight 6, tampering with rollback, hand-built hellos for the EMS / RI /
-unoffered-extension / sentinel refusals, and `Endpoint` in every version
-pairing (`conn12_test.zig`); fragmentation at a 200-byte limit with the
-server flight delivered reversed and duplicated (one pass, no retransmit),
-mutual auth's client flight fragmented, a fragmented retransmission, whole
-messages reversed inside one datagram, the forged-fragment flood, and
-`record.nextDatagram` at its boundaries.
-
-**Fuzz (2026-11-17, fragmentation and reordering).** `dtls12-handshake` now
-sets `max_datagram_len` (128..600) on both sides in half its cases and in
-every `reorder` case, delivers each flight datagram by datagram
-(`record.nextDatagram`), and gains a sixth fault, two datagrams of one flight
-swapped. Undamaged or duplicated, fragmented or not, the pair must connect; a
-reordered pair need not (an epoch-1 record ahead of its ChangeCipherSpec may
-be dropped, RFC 6347 §4.1, and the harness has no retransmission timer), but
-must not panic and, when it connects, must agree on keys. Reach pins
-`fragmented_connected` and `reordered_connected` within 160 seeds. Verdict:
-40,000 runs clean in 9.2 s (ReleaseSafe driver), 15,331 fragmented and 359
-reordered handshakes connected. The Smith (`--fuzz`) path is unchanged: its
-input is the first datagram.
-
-**Live peer (2026-11-17).** `tools/interop.zig` + `tools/wolfssl_peer.c`
-(modes `12-server-*` / `12-client-*`, `wolfDTLSv1_2_*_method`) run fifteen
-cases against wolfSSL 5.9.1, recorded in `testdata/wolfssl12_transcript.txt`
-(`zig build interop-dtls -- --capture --version 12`, a file of its own so the
-1.3 recording and the corpus counts derived from it stay put) and replayed by
-`src/wolfssl12_replay.zig`: ECDHE_PSK ChaCha20-Poly1305 both roles (our
-identity hint and wolfSSL's) and behind OUR stateless HelloVerifyRequest;
-ECDHE_ECDSA with AES-128-GCM, AES-256-GCM-SHA384 and ChaCha20-Poly1305, on
-X25519 and secp256r1; ECDHE_RSA both roles; mutual authentication both ways
-(wolfSSL verifies our 1.2 CertificateVerify, we verify its); wolfSSL's own
-HelloVerifyRequest on every client case; wolfSSL fragmenting at a 256-byte
-MTU; our side fragmenting at 200 bytes in both roles. One wire defect found
-and fixed: the server's RFC 5746 requirement (above). **Coverage gap:**
-plain PSK (`psk_with_aes_128_gcm_sha256`) cannot be checked against this
-peer — Debian's wolfSSL is built without `WOLFSSL_STATIC_PSK`, so it has no
-`PSK-AES128-GCM-SHA256`; it stays self-interop only.
-
-**Delta mutation (2026-11-17, fragmentation + queue + RFC 5746 server
-change).** 42 mutants on the non-test changes (`Connection12.zig`
-fragmentation, reassembler wiring, queue, retry-without-queue, `peer_ri`;
-`record.nextDatagram` / `recordWireLen`; the `max_datagram_len` floor in
-`Config.validate`), one schemata build in ReleaseSafe plus one rebuild after
-the first run: 37 killed (one a hang), 5 EQUIVALENT, 0 survivors. The first
-run left three that became tests: skipping `o.len = 0` before the retry (a
-failed first pass's flight was sent in front of the retry's — test "a retry
-after a queued message failed sends ONE answer"), not clearing the
-"message holds queued bytes" flag on completion (a later forged fragment
-could then evict a genuine partial message), and keeping stale queued copies
-(test: two early copies of one message). EQUIVALENT: (a) `cur_epoch` from
-the queued entry — an epoch-1 handshake fragment can only be read once the
-peer's CCS was accepted, which requires every earlier message, so nothing
-after Finished is ever processed and every drained entry meets the same
-`UnexpectedMessage` in either epoch; (b) fragmenting a record of exactly
-`max_datagram_len` — it becomes one fragment at offset 0 of full length,
-byte-identical to the unfragmented record (cost-only); (c) dropping the
-`kind != .handshake_epoch0` guard — CCS (1 byte) and Finished (24) always fit
-under the 128-byte floor; (d) `or true` on the fragment loop — `Fragmenter
-.next` returns null after the last fragment and the loop breaks; (e) the
-early `end >= max_len` break in `nextDatagram` — the next iteration's
-`end + n > max_len` breaks anyway (cost-only). This delta is part of the
-whole-module run below.
-
-**Audit 2026-11-17 (whole-module mutation).**
-1327 mutants over every non-test line of `src/` (test files, the fuzz corpus,
-KAT/replay data, the ctgrind harness and stack probes excluded), generated
-one per condition × class: guard dropped (per disjunct / conjunct), ordering
-comparison off by one, counter increment skipped, `self.*` assignment
-skipped, wipe skipped. One ReleaseSafe schemata binary per round, six
-rounds. Result: **1127 killed (one of them a hang), 156 EQUIVALENT, 44
-UNOBSERVABLE, none open** (the card counts UNOBSERVABLE with the
-equivalents: 200). Mutant 301 is counted EQUIVALENT although a test fails
-on it: that test calls the private `clientCertificateRequest` twice on one
-connection, a sequence no handshake produces (one CertificateRequest per
-handshake), so the mutant changes no reachable behaviour. The killing tests are `src/audit_test.zig` (black-box:
-exact-size output buffers and one-past-the-limit lengths for every
-`messages` / `messages12` encoder, decoder edges, record / record12 /
-Reassembler / FlightTracker / AEAD / PRF boundaries, a 33-byte Ed25519 key,
-and for the DTLS 1.2 engine a fake peer that feeds crafted ServerHello /
-HelloVerifyRequest / ServerKeyExchange / ClientHello / ClientKeyExchange /
-CCS / Finished records — a Finished one byte long or one bit off on both
-sides, a retransmitted ClientHello to a stateless server, a flight repeated
-inside one datagram, the queue-retry corners, the post-handshake resend
-duties) and test blocks at the end of `Connection12.zig` and
-`Connection.zig` for the private helpers (transcript / flight-cache / queue
-caps filled exactly, epoch-1 records around the CCS, scheme selection and
-the suite-family check, the 1.3 record and handshake-record writers and
-readers at their size, width and replay edges, ACK / KeyUpdate framing and
-bookkeeping, re-installing application keys, the cookie's version and
-length, CertificateRequest / Certificate / CertificateVerify order and
-repetition, a dual server's `supported_versions` parse, the client's and
-the server's Finished checks, a ClientHello2 that drops the suite the retry
-committed to). Classes of the EQUIVALENT verdicts: a length check whose
-exact-boundary case fails the very next check with the same error;
-infeasible values (lengths that are always even or multiples of 16, a
-header without a connection ID is at most 5 bytes, a request context is at
-most 255 bytes, the identity and binder lists of `pre_shared_key` have the
-same count); invariants on our own state (`stateless_reply` never outlives
-a call, `tx_len` is 0 only at `.start`, one CertificateRequest per
-handshake, each optional certificate message at most once, the KeyUpdate
-record ring is reset on every path into `.in_flight`, a reset window with
-`recv_seen_any` false behaves like a fresh one); defence-in-depth that an
-encoder or AEAD repeats (the cookie buffer, `protect`'s own length check);
-cost-only (the ML-KEM expanded key, `nextDatagram`'s early break, the
-queue-less retry); and dead bookkeeping — the 14 mutants of the 1.3 flight tracker
-(`pending_flight_count` and the record lists that fed it) were equivalent
-because nothing read them; the code was deleted on 2026-11-17 and its 14
-mutants left both card counts (1327 became 1313, 200 eq became 186 eq). The same day's delta mutation of the mid-handshake ACK skip added 15 mutants (the length check's three conditions, the two readers' content-type admission, the branch, the skip and the inner-type hand-over; all killed, one by a test added for it), so the card reads 1142/1328, 186 eq. UNOBSERVABLE: wipes of keys, secrets, premasters and rollback
-copies (they need a read of dead memory or of a struct after `deinit`) and
-the write-only `ecdhe_live` / `ecdhe_secret_live` bookkeeping behind them.
-**Finding (fixed):** the plain-PSK premaster buffer held 2 + 80 + 2 + 512
-bytes, but RFC 4279 §2's `other_secret` is `psk.len` zero bytes, so a
-297..512-byte `Config.psk` overflowed it (panic in ReleaseSafe, stack
-overflow in ReleaseFast); now `2 + max(80, max_psk_len) + 2 +
-max_psk_len`, the 512 cap (OpenSSL's `PSK_MAX_PSK_LEN`) kept. Only the
-local configuration reaches it, not a peer. The DTLS 1.3 PSK path has no
-such buffer (the PSK goes straight into HKDF-Extract; an over-long PSK
-identity is a typed `BufferTooShort` from the ClientHello's pre_shared_key
-buffer). The 2026-11-17 triage item "1.2: a later message is dropped" is
-refuted: later messages are queued (test "whole messages arriving in
-reverse order inside one datagram are queued, not dropped", and the queue
-mutants were killed). The per-mutant table is the audit's scratch, not
-committed.
 
 ## Threat model / out of scope
 
-- **Not yet — see Backlog (not silently skipped):** session resumption /
+- **Not provided — see Backlog (not silently skipped):** session resumption /
   `NewSessionTicket` (no `"res binder"`/resumption-PSK path — only `"ext
   binder"`/externally-configured PSK), 0-RTT/early data, connection
   migration beyond the connection-ID field already framed in `record.zig`.
-  (X.509/certificate auth was in this list originally — see "Certificate
-  mode" above for what landed and what of it is still genuinely deferred.)
-- **Post-quantum key exchange: CLOSED (2026-08-31).** `X25519MLKEM768`
+
+- **Post-quantum key exchange.** `X25519MLKEM768`
   (0x11ec, draft-ietf-tls-ecdhe-mlkem) is wired end to end in both roles:
   the 1216-byte client share (`ML-KEM-768 encapsulation key ‖ X25519 public`
   — ML-KEM FIRST, the draft's famous naming inconsistency), the 1120-byte
@@ -682,13 +504,8 @@ committed.
   Live-proven against wolfSSL 5.9.1 in three shapes: offered directly,
   reached via HRR upgrade, and a wolfSSL client's share answered by our
   server's encapsulation path.
-  - Cost was never the blocker, measured on this repo's audit host
-    (2026-08-22, ReleaseFast): std's ML-KEM-768 costs **less** than its own
-    X25519 — keygen 52 vs 54 µs, encaps 29 µs, decaps 43 µs — and beats
-    OpenSSL 3.5.5's own ML-KEM-768 (65/40/60 µs) on the same machine.
   - ⚠ The combiner trap `ssh` documents turned out to have a SECOND instance,
-    in std itself: `std.crypto.kem.hybrid.MlKem768X25519` (which an earlier
-    revision of this note recommended as "ready-made") has exactly these
+    in std itself: `std.crypto.kem.hybrid.MlKem768X25519` has exactly these
     share sizes but is **X-Wing** — a SHA3-256 combiner over
     `secrets ‖ ciphertext ‖ key ‖ label` — while TLS wants the bare
     concatenation, and `ssh` hashes `SHA256(ss_M ‖ ss_X)`. Three
@@ -711,21 +528,82 @@ committed.
   `error.DecryptionFailed` on any tag mismatch, never panic, never leak
   timing differences between "bad tag" and "bad padding"/other failure
   modes — attacker-controlled ciphertext must never reach a panic path.
+- **Certificate paths and entries:** `.trust_anchor` is a minimal one-hop check (no multi-hop chains, name
+  constraints, `basicConstraints`/`keyUsage` policy, revocation); `CertificateEntry` extensions (OCSP
+  stapling/SCT) are framed empty on send and length-validated-but-discarded on receive (Backlog).
+- **The cookie exchange is not stateless against a FRAGMENTED ClientHello.**
+  `serverProcessClientHello` fully reassembles the ClientHello (`takeHandshakeMessage`) before the cookie
+  check ever runs — the cookie lives inside the ClientHello body, so it cannot be read from a partial one.
+  A 26-byte datagram declaring a 2048-byte message with a 1-byte fragment returns `need_more_data` before the
+  cookie logic (or `sendHelloRetryRequest`) is reached, and the caller cannot tell that apart from a
+  legitimately fragmenting client — both produce an empty `out`. Each such source address costs the server one
+  live `Connection` (~13 KB) held until `max_flight_bytes` forces `FlightTooLarge`: a ~500x memory
+  amplification against a 26-byte packet, on the path §5.1's cookie exists to keep stateless.
+  `sendHelloRetryRequest`'s "stores nothing" claim is true once reached — the gap is everything upstream of
+  it. A real design tension: a legitimate peer with a large (e.g. PQ-hybrid) ClientHello genuinely needs to
+  fragment, and `max_flight_bytes` bounds one connection's growth, not how many a caller ends up holding.
+- **Cookie rotation.** RFC 9147 §5.1 RECOMMENDS accepting the previous `cookie_secret` for a period.
+  `HelloRetryConfig` takes one secret; a caller wanting the overlap retries ClientHello2 under a second
+  `Connection` configured with the older secret — caller policy.
+- **DTLS 1.3 flight accumulation.** `max_flight_bytes` (`Connection.zig:1030`) caps what is buffered
+  unauthenticated; exactly one message is reassembled at a time. A peer that RETRANSMITS a whole flight it
+  already sent, verbatim, into the middle of an incomplete accumulation is rejected (`handleFlight`'s "KNOWN
+  LIMIT", `Connection.zig:1907`) and the caller restarts; redundant fragments of the message being reassembled
+  and retransmitted copies of consumed messages are absorbed. The 1.3 engine never splits what it SENDS, so it
+  needs a peer MTU that fits its largest message (`max_cert_message_body` and friends); a tiny-MTU peer cannot be
+  served a large certificate chain (Backlog).
+- **Epoch-0 residuals (1.2),** inherent to unauthenticated epoch 0; all are first-in-wins races an off-path
+  sender could already run, and none is closed: (1) a forged partial latched AHEAD of, or a forged fragment with
+  the right type/length/`message_seq` and wrong bytes arriving AFTER the first fragment of, a genuine message that
+  the peer FRAGMENTS across datagrams blocks it by content (every later genuine fragment of that range is
+  `OverlappingFragment`, and no single genuine datagram completes the message for the retry) until the caller's
+  handshake timeout; the hellos travel whole unless `max_datagram_len` forces otherwise (the length is
+  brute-forceable within `max_message_len`); (2) a forged WHOLE message under the expected `message_seq` replaces a
+  genuine partial one through the retry; handlers of authenticated content (Certificate chain, ServerKeyExchange
+  signature, Finished) still refuse it and the partial is restored, an unauthenticated one (ServerHello,
+  ServerHelloDone, HelloVerifyRequest) is taken and the handshake then fails at Finished — no worse than the same
+  forgery arriving first, and the retry processes such a message at most twice; in cookie mode a forged whole
+  ClientHello only earns a stateless HelloVerifyRequest and changes nothing; (3) a forged HelloVerifyRequest that
+  precedes the genuine one moves the client to `message_seq` 1, after which the genuine HelloVerifyRequest
+  (`message_seq` 0) is an old duplicate and the client keeps resending its ClientHello with the forged cookie
+  (bounded by `hvr_count`). Closing these would need authentication that epoch 0 does not have.
+- **Replay of unrecorded epoch-0 records.** A record that is not recorded in the window is processed again when
+  replayed verbatim: a replayed duplicate makes this side resend its flight once per replayed datagram, to the same
+  peer address, with no growth (a forged duplicate under a fresh record number always could); queued later
+  fragments are likewise re-queued, bounded by `max_future_bytes`. A forged record that does complete a message
+  is message injection, which epoch 0 cannot prevent anyway (the Finished check fails it).
 
-## Live third-party interop — done, and what it cost
+## What is deliberately not done
+
+- **DTLS 1.2: CBC suites** (Lucky13 family), **static-RSA key exchange** (no forward secrecy, Bleichenbacher),
+  **compression**, **renegotiation** (a HelloRequest or a new ClientHello after the handshake is ignored,
+  `ReceivedPostHandshakeMessage`) and **DTLS 1.0** — each a security or scope choice, not an omission.
+- **A server-side cookie expiry.** RFC 9147 §5.1 offers timestamps as an ALTERNATIVE to secret rotation, and
+  rotation is what the API exposes; a clock would also be the first one this module reads.
+- **A SERVER-initiated group change** (RFC 8446 §4.1.4). The client half is implemented (a retry naming another
+  advertised group is answered with a fresh share in it, live-anchored against wolfSSL); this server takes
+  whichever offered share it can use and answers a ClientHello with nothing usable with `error.MissingKeyShare`,
+  never a group-change retry — deciding a group before the cookie verifies would mean holding more state for an
+  unverified peer, which is what `sendHelloRetryRequest` exists not to do.
+- **`psk_dhe_ke`.** `.psk` mode stays PSK-only, so a retry carrying a `key_share` there is
+  `error.HelloRetryRequestUnsupported` (`Connection.zig:4225`) rather than a silent upgrade to an exchange this
+  engine does not run.
+- **More than ONE in-progress inbound handshake message in the 1.3 engine.** A fragment of a later message
+  arriving while an earlier one is incomplete is `error.InterleavedFragments` (`Connection.zig:785`) rather than
+  buffered — the deliberate cap on attacker-driven memory (see `max_flight_bytes`); no conforming sender produces
+  that ordering. (The 1.2 engine queues later messages, bounded.)
+
+## Live third-party interop
 
 `tools/interop.zig` runs real DTLS 1.3 handshakes over a loopback UDP socket
 against **wolfSSL 5.9.1**, in both roles and in both PSK and certificate mode,
-each followed by an application-data round trip — eighteen cases in all (the last four, 2026-11-17: ALPN in both roles, a KeyUpdate from each side).
+each followed by an application-data round trip — twenty-two cases in all (including ALPN in both roles, a KeyUpdate from each side, and the four AES-256-GCM-SHA384 PSK cases).
 
-**It is a PROGRAM, not a test, since 2026-09-06, and that is the design.** A
+**It is a PROGRAM, not a test, and that is the design.** A
 zig-libs module is standalone Zig with no external dependency; an anchor against
-a foreign implementation needs a C compiler and a system library. Those two used
-to live in one file (`src/wolfssl_interop.zig`, compiled into `test-dtls`), so
-the module shipped 555 lines of C, `zig build test-dtls` wanted a toolchain it
-had no business wanting, and where that toolchain was missing all fourteen cases
-skipped — silently, in CI, where the peer install is `continue-on-error`. The
-split:
+a foreign implementation needs a C compiler and a system library, which a test
+binary must not want (where that toolchain is missing a test would skip silently,
+in CI, where the peer install is `continue-on-error`). The split:
 
 - `tools/interop.zig` + `tools/wolfssl_peer.c` — outside the module, run by
   `zig build interop-dtls`, compiled (never run) by `zig build check-interop`.
@@ -755,21 +633,26 @@ cannot re-check what was never on the wire — the peer's exit status, its
 `wolfSSL_get_verify_result` and the `PEERCERT` subject it printed were checked
 when the recording was taken and are kept in the file as comments.
 
-**The oracle ranking this section used to carry was wrong, and the error was
-not a detail.** It ranked OpenSSL first on the claim that "OpenSSL 3.2+ has
-DTLS 1.3 support". OpenSSL has no DTLS 1.3 at all as of 3.5.5 — `s_server`
-offers only `-dtls1`/`-dtls1_2` — and GnuTLS 3.8.12, ranked second, stops at
-`VERS-DTLS1.2` (`+VERS-DTLS1.3` is not even a recognised token). Both
-"recommendations" were untested assumptions, and acting on them produced a
-backlog entry that read "blocked: no DTLS 1.3 peer exists" for as long as
-nobody checked what could be *installed*. wolfSSL was packaged the whole
-time (`libwolfssl-dev`, built with `WOLFSSL_DTLS13`).
-
-The peer is a 555-line C program (`tools/wolfssl_peer.c`), read from its own
+The peer is a C program (`tools/wolfssl_peer.c`), read from its own
 path and compiled with `cc -lwolfssl` when `zig build interop-dtls` runs. It is
 not embedded in anything and it is not part of the shipped module; the program
 fails with an actionable message (`sudo apt install libwolfssl-dev`) rather than
-skipping, because unlike a test it is allowed to require its peer.
+skipping, because unlike a test it is allowed to require its peer. wolfSSL has
+`WOLFSSL_DTLS13`; OpenSSL has no DTLS 1.3 and GnuTLS stops at DTLS 1.2, so wolfSSL is the
+only installable DTLS 1.3 peer.
+
+**DTLS 1.2.** `tools/interop.zig` + `tools/wolfssl_peer.c` (modes `12-server-*` / `12-client-*`,
+`wolfDTLSv1_2_*_method`) run fifteen cases against wolfSSL 5.9.1, recorded in
+`src/testdata/wolfssl12_transcript.txt` (`zig build interop-dtls -- --capture --version 12`, a file of its
+own so the 1.3 recording and the corpus counts derived from it stay put) and replayed by
+`src/wolfssl12_replay.zig`: ECDHE_PSK ChaCha20-Poly1305 both roles (our identity hint and wolfSSL's) and
+behind OUR stateless HelloVerifyRequest; ECDHE_ECDSA with AES-128-GCM, AES-256-GCM-SHA384 and
+ChaCha20-Poly1305, on X25519 and secp256r1; ECDHE_RSA both roles; mutual authentication both ways (wolfSSL
+verifies our 1.2 CertificateVerify, we verify its); wolfSSL's own HelloVerifyRequest on every client case;
+wolfSSL fragmenting at a 256-byte MTU; our side fragmenting at 200 bytes in both roles. The live run found one
+wire defect, fixed: the server's RFC 5746 requirement (above). **Coverage gap:** plain PSK
+(`psk_with_aes_128_gcm_sha256`) cannot be checked against this peer — Debian's wolfSSL is built without
+`WOLFSSL_STATIC_PSK`, so it has no `PSK-AES128-GCM-SHA256`; it stays self-interop only (Backlog).
 
 ### What it found
 
@@ -815,37 +698,6 @@ had ever sent a `CertificateRequest`, and its list is short — so the fix
 applied to the ClientHello path never reached this one. Found the day the
 live mutual-auth test was written; same `filterU16ListExtension` fix.
 
-### Mutation testing: cert-mode HelloRetryRequest + secp256r1
-
-Every central invariant of the §4.1.4 work was deliberately broken and the
-suite re-run. What each mutation cost:
-
-| mutation | caught by |
-|---|---|
-| keep ClientHello1's `key_share` instead of regenerating in the named group | the group-change unit tests (`ecdhe_group` assertions) |
-| ALWAYS regenerate, even for a cookie-only retry (a §4.1.2 violation) | the cookie-only unit test's byte-identical `key_share` assertion — nothing else, wolfSSL accepts it |
-| draw a fresh ClientHello2 `random` | the §4.1.2 conformance comparator |
-| accept a retry naming a group already offered | its reject test (the retry-loop guard) |
-| accept a retry naming a group never advertised | its reject test |
-| secp256r1 shared secret = the Y coordinate instead of X | the OpenSSL-derived ECDH KAT |
-| drop the "ServerHello share must be in the group we offered" check | its reject test — **but only after the test was fixed.** The original version sent a 65-byte P-256 point, which the length check inside `ecdheSharedSecret` also rejects, so both the correct and the mutated code returned `MissingKeyShare` and the test passed either way. It now sends a 32-byte value labelled secp256r1, where only the GROUP is wrong |
-| RFC 8446 §4.4.1's synthetic `message_hash` type changed 254 → 253 (both sides share the constant) | **only** the live wolfSSL tests. All 18 local HelloRetryRequest tests stay green — the two sides simply agree on a transcript nobody else computes |
-| revert the `CertificateRequest` `signature_algorithms` fix above | **only** the live mutual-auth test (230 other tests passed) |
-
-Two of those are worth keeping in mind. The second — a gratuitously
-regenerated share — is a real protocol violation that **no live peer
-objected to**, so a live oracle is necessary but not sufficient. The
-seventh is the "it comes out the same either way" trap: a reject test whose
-expected error is also produced by a *different* check downstream proves
-nothing, and only mutation showed it.
-
-Note that fully REMOVING `resetToMessageHash`'s body (rather than changing
-the constant) is NOT a consistent mutation here and self-interop does catch
-it: our server is stateless, so it rebuilds the transcript on a brand-new
-`Connection` whose hasher starts empty, while the client's would still carry
-ClientHello1 — the two diverge. Only a mutation that keeps both sides doing
-the same wrong thing hides from self-interop.
-
 ### Proven against wolfSSL: the HelloRetryRequest cookie exchange, both roles
 
 RFC 9147 §5.1's return-routability check runs in both directions against a
@@ -855,87 +707,55 @@ against a stock wolfSSL client. Both live tests assert the retry ACTUALLY
 happened (`Connection.sawHelloRetryRequest`), so neither can silently decay
 into a duplicate of the no-retry test if the exchange stops taking effect.
 
-Three mutations were run against the server side to check the tests have
-teeth:
+## Verification
 
-| mutation | caught by |
-|---|---|
-| `peer_binding` dropped from the cookie MAC | the cross-binding replay test + the cookie unit test — nothing else, and the handshake still completes |
-| RFC 8446 §4.4.1's `message_hash` rewrite skipped when rebuilding the transcript | self-interop AND the live test (wolfSSL: binder does not verify) |
-| `message_seq` not restored on the connection that handles ClientHello2 | **only** the live test — our own client ignores a ServerHello's `message_seq`, so every self-interop test stays green |
-
-The last one is the argument for the live oracle in one line: a defect that
-two `Connection`s written from the same reading of the RFC cannot see.
-
-### Still not proven / not implemented
-
-- **The cookie exchange is not stateless against a FRAGMENTED ClientHello
-  (audit A1 F6/LOW6).** `serverProcessClientHello` fully reassembles the
-  ClientHello (`takeHandshakeMessage`) before the cookie check ever runs —
-  the cookie lives inside the ClientHello body, so it cannot be read from a
-  partial one. A 26-byte datagram declaring a 2048-byte message with a
-  1-byte fragment returns `need_more_data` before the cookie logic (or
-  `sendHelloRetryRequest`) is reached at all, and the caller cannot tell
-  that apart from a legitimately fragmenting client — both produce an empty
-  `out`. Each such source address then costs the server one live
-  `Connection` (~13 KB) held until `max_flight_bytes` forces
-  `FlightTooLarge`: a ~500x memory amplification against a 26-byte packet,
-  on the exact path §5.1's cookie exists to keep stateless.
-  `sendHelloRetryRequest`'s own "stores nothing" claim is true once reached
-  — the gap is everything upstream of it. Real design tension, not a coding
-  slip: a legitimate peer with a large (e.g. PQ-hybrid) ClientHello
-  genuinely needs to fragment, and `max_flight_bytes` bounds the growth of
-  one such connection, not how many a caller ends up holding. Left as a
-  documented limit; a fix would need either a lightweight pre-reassembly
-  return-routability check independent of the cookie, or accepting the
-  amplification as the cost of the fragmentation this module also needs to
-  support.
-- **A cookie-rotation overlap window.** RFC 9147 §5.1 RECOMMENDS a server be
-  able to accept the previous `cookie_secret` for a period, so clients
-  handshaking across a rotation are not dropped. `HelloRetryConfig` takes one
-  secret; a caller wanting the overlap must retry ClientHello2 under a second
-  `Connection` configured with the older secret. Workable, but it is caller
-  policy rather than something the module does.
-- **A server-side cookie expiry.** Deliberate, not missing: RFC 9147 §5.1
-  offers timestamps as an ALTERNATIVE to secret rotation, and rotation is
-  what the API exposes. A clock would also be the first one this module
-  reads.
-- **A SERVER-initiated group change.** The client half of RFC 8446 §4.1.4's
-  `key_share` path is implemented (a retry naming another advertised group
-  is answered with a fresh share in it, live-anchored against wolfSSL); the
-  server half is not. This server takes whichever offered share it can use
-  and answers a ClientHello with nothing usable with
-  `error.MissingKeyShare`, never a group-change retry — deciding a group
-  before the cookie verifies would mean holding more state for an unverified
-  peer, which is what `sendHelloRetryRequest` exists not to do.
-- **`psk_dhe_ke`.** `.psk` mode stays PSK-only, so a retry carrying a
-  `key_share` there is `error.HelloRetryRequestUnsupported` rather than a
-  silent upgrade to an exchange this engine does not run.
-- **Send-side fragmentation.** This engine reassembles what it RECEIVES but
-  never splits what it SENDS, so it needs a peer MTU large enough for its
-  own largest message (`max_cert_message_body` and friends). A peer that
-  advertises a tiny MTU can be talked to, but cannot be talked to with a
-  large certificate chain.
-- **A whole flight RETRANSMITTED verbatim into an incomplete
-  accumulation.** Fragmentation is handled; a peer resending an entire
-  flight it already sent, mid-reassembly, is rejected and the caller must
-  restart. Redundant fragments of the message being reassembled, and
-  retransmitted copies of messages already consumed, are both absorbed. See
-  `handleFlight`'s "KNOWN LIMIT".
-- **More than ONE in-progress inbound message.** A fragment of a later
-  handshake message arriving while an earlier one is incomplete is
-  `error.InterleavedFragments` rather than buffered — the deliberate cap on
-  attacker-driven memory (see `max_flight_bytes`). No conforming sender
-  produces that ordering.
-- **Certificate mode: MUTUAL auth against a third party.** The live cert
-  test verifies wolfSSL's chain; our own client certificate has still only
-  ever been checked by our own server.
-- **A second independent stack.** wolfSSL agreeing with us rules out the
-  four defects above, but a bug the two happen to share would still pass.
-  mbedTLS or picotls would be the natural cross-check.
-- **CCM suites** — unwired (Zig 0.17 std ships only 13-byte-nonce CCM presets -- `aes_ccm.zig` has a generic `AesCcm(Aes, tag_len, nonce_len)` for nonces 7..13 but it is not `pub`; the
-  DTLS profile needs 12), so the RFC 7925 CoAP default suite is untested
-  against any peer.
+- **Run:** `scripts/modtest dtls` (includes the hermetic wolfSSL replays of both transcripts; needs nothing
+  external). `zig build check-interop` compiles the live interop program without running it; `zig build
+  interop-dtls` runs the live wolfSSL cases (needs `libwolfssl-dev` and `cc`; `-- --version 12` for DTLS 1.2;
+  `-- --capture` re-records `src/testdata/wolfssl_transcript.txt`, with `--version 12` the 1.2 file).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it. Its killing tests are `src/audit_test.zig` (black-box: exact-size output buffers and
+  one-past-the-limit lengths for every `messages` / `messages12` encoder, decoder edges, record / record12 /
+  Reassembler / FlightTracker / AEAD / PRF boundaries, and for the 1.2 engine a fake peer that feeds crafted
+  handshake records) and test blocks at the end of `Connection12.zig` and `Connection.zig` for the private helpers.
+- **Anchors:** see *Anchoring*. The key schedule against RFC 8448 §3/§4 byte for byte and an independent Python
+  `hmac`/`hashlib` reimplementation; the AEAD record protection against OpenSSL; the X25519 key_share and its feed
+  into the schedule against RFC 8448 §3; secp256r1 ECDH against a Python-`cryptography`/OpenSSL KAT (the shared
+  point's X coordinate only, RFC 8446 §7.4.2); the 1.2 PRF against Python `hmac`/`hashlib` goldens and std's own
+  TLS 1.2 PRF, the 1.2 record nonces / AAD against std's AEADs (`record12.zig`); the live wolfSSL transcripts of
+  both versions replayed byte for byte (`src/wolfssl_replay.zig`, `src/wolfssl12_replay.zig`). No published DTLS 1.3
+  KeyUpdate, exporter, SHA-384 or cert-only byte trace exists, so those paths rest on self-interop, independent
+  re-derivation in the tests and the live peer.
+- **Self-interop (in memory):** every wired 1.3 suite reaches `.connected` with byte-identical keys, a real
+  `send`/`recv` round trip, caller-clocked retransmission on a dropped ClientHello, and typed-error rejection of a
+  wrong PSK, mismatched identity, corrupted ServerHello and a malformed HelloRetryRequest; certificate mode
+  (server-cert-only, mutual auth, wrong key, untrusted anchor, required-but-absent certificate); `.cert_dhe` with
+  its reject teeth (tampered ServerHello key_share, wrong CertificateVerify key, missing key_share);
+  HelloRetryRequest in both modes and both hashes; KeyUpdate (RFC 9147 §8 Figure 14) and the exporter. DTLS 1.2
+  (`conn12_test.zig`): all eight suites, PKCS#1 v1.5 against a client offering no PSS, mutual auth, untrusted /
+  wrong-name certificates, wrong PSK / identity, HelloVerifyRequest (stateless, cookie refused for another peer
+  binding), loss of flights, tampering with rollback, hand-built hellos for the EMS / RI / unoffered-extension /
+  sentinel refusals, `Endpoint` in every version pairing; fragmentation at a 200-byte limit with the server flight
+  delivered reversed and duplicated, a fragmented retransmission, the forged-fragment flood, `record.nextDatagram`
+  at its boundaries; the epoch-0 replay window tests in `Connection12.zig` and `conn12_test.zig`; `Connection.zig`'s
+  test that an injected epoch-0 record with a huge number does not affect the 1.3 engine.
+- **Fuzz:** `DTLS_FUZZ=<runs>[,<first seed>]` (testkit's deterministic driver; `_ONLY` selects a harness):
+  `dtls-handshake` (PSK, HelloRetryRequest cookie and (EC)DHE with one flight damaged; certificate-authenticated
+  flights are not driven), `dtls-record`, `dtls-wire`, `dtls-keyupdate` (`src/fuzz_test.zig`); `dtls12-handshake`
+  (PSK, ECDHE_PSK, PSK behind a HelloVerifyRequest, ECDHE_ECDSA; one datagram damaged / random / dropped /
+  duplicated; flights fragmented at `max_datagram_len` 128..600 in half the cases and in every reorder case,
+  delivered datagram by datagram, and two datagrams of one flight swapped — undamaged, duplicated, fragmented or
+  not the pair must connect, a reordered pair need not but must not panic and must agree on keys when it connects;
+  reach pins `fragmented_connected` and `reordered_connected`) and `dtls12-wire` (the `messages12` decoders)
+  (`src/fuzz12_test.zig`). The Smith (`--fuzz`) path of `dtls12-handshake` feeds the first datagram only.
+- **Constant time:** `src/ctgrind_harness.zig` through `scripts/checks/ctgrind.sh dtls`: targets `hs`, `app` and `ku`
+  (1.3: PSK through full handshakes under both hashes, record keys through send/recv, KeyUpdate both ways +
+  exporter with traffic and exporter secrets tainted) and `hs12`, `app12` (1.2: PSK and ECDHE_PSK handshakes, the
+  server's ECDHE key through an ECDHE_ECDSA AES-256-GCM-SHA384 one, record keys tainted); the expected rows are in
+  `scripts/checks/ctgrind-expected.tsv`. The reported sites are the Finished / AEAD tag verdicts and the parsing of
+  decrypted content, none a branch on a key.
+- **Dead stack:** `src/stackprobe_test.zig`, `src/stackprobe2_test.zig` drive the burned entry points through full
+  in-memory handshakes (PSK, cert X25519, cert P-256 with mutual auth, cert X25519MLKEM768; both AEADs).
 
 ## Anchoring
 
@@ -948,20 +768,47 @@ two `Connection`s written from the same reading of the RFC cannot see.
 
 ## Backlog / deferred
 
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet; still the stateless call per record — a cached context would need per-epoch key storage behind the generic `Protection(Aead)` shared with ChaCha20 (deferred until a consumer measures DTLS throughput).
-
-- ✅ DONE 2026-11-17 (fifteen live cases, see "DTLS 1.2" → "Live peer"; one defect found: the server's RFC 5746 requirement) **DTLS 1.2 against a live peer.** Remaining: plain PSK, which Debian's wolfSSL cannot speak (no static PSK) — an OpenSSL `s_server -dtls1_2 -psk` case would cover it.
-- ✅ DONE 2026-11-17 (`Config.max_datagram_len`, `record.nextDatagram`, the receive queue; see "DTLS 1.2" → "Fragmentation") **DTLS 1.2 send-side fragmentation and out-of-order buffering.**
-- **DTLS 1.3 send-side fragmentation** (2026-11-17). `Config.max_datagram_len` is honoured by the 1.2 engine only; the 1.3 engine still sends one record per message (`protectHandshakeMessage`'s 1500-byte buffer, the cached `last_flight` as finished records, so a tiny-MTU 1.3 peer with a large chain still cannot be served. Wiring it means fragmenting at record build time and widening `FlightTracker`. Effort: small-medium.
-- ✅ DONE 2026-11-19 (`flight_rns`, `noteFlightAck`; see "Post-handshake" → "An ACK in the middle of a handshake flight") **DTLS 1.3: a fully ACKed flight must stop being retransmitted (RFC 9147 §7.2, MUST)** (2026-11-17). Items (1) and (2) of the next entry now exist: the cached flight's record numbers, and a handshake-time consumer of authenticated (epoch-2) ACKs. When every record of `last_flight` has been named by such ACKs, its retransmission timer is cancelled; an ACK naming records we did not send changes nothing; an epoch-0 ACK is never consulted (unauthenticated: it would let an off-path sender stop our retransmissions). Tests: `Connection.zig` "the cached flight's record numbers …", "RFC 9147 §7.2 — a flight whose every record is ACKed …", "an ACK naming records we did not send, or arriving unauthenticated, cancels nothing", "a full ACK that shares a datagram with a failing record still cancels". Live: the 37 wolfSSL cases still pass (2026-11-19); wolfSSL ACKs no complete flight on a lossless loopback, so the cancel itself is proven by the unit tests only.
-- **DTLS 1.3 partial retransmission (RFC 9147 §7.2)** (2026-11-17; the dead flight-tracker state that stood here was deleted the same day). A lost flight is resent whole from `last_flight` on the timer, which conforms (§7.2 is a SHOULD: "omit them from any future retransmissions"); wolfSSL's 1.3 stack does send partial flights. Resending only what an ACK did not name needs four things the engine lacks: (1) ✅ 2026-11-19 the record numbers of the cached flight (`flight_rns`, re-derived from `last_flight` by `recordFlightNumbers`, at most `max_flight_records`; widen when send-side fragmentation lands); (2) ✅ 2026-11-19 a handshake-time ACK consumer that matches record numbers against it (`noteFlightAck`, epoch-2 ACKs only; it marks, it does not yet drop records from the resend); (3) a decision on retransmitting under the old record numbers (today: verbatim bytes) versus fresh ones (RFC 9147 §5.8 sends retransmissions in new records); (4) partial-flight ACKs on the sending side (§7.2 SHOULD; today only the final flight and post-handshake records are ACKed). Pairs with "DTLS 1.3 send-side fragmentation". Effort: medium.
-- ✅ DONE 2026-11-19 (1.2 engine hardened; the 1.3 engine had no epoch-0 window to harden) **Epoch-0 replay window advanced by unauthenticated records** (found 2026-11-17 while testing the 1.2 queue). The 1.2 engine's epoch-0 window accepted and recorded any well-formed record, so an off-path sender with a high sequence number made the genuine early records look stale (dropped until the peer's retransmissions overtook it, never for a number near 2^48). **Rule followed:** RFC 6347 §4.1.2.6 ("the receive window is updated only if the MAC verification succeeds") and RFC 9147 §4.5.1 ("The window MUST NOT be updated due to a received record until that record has been deprotected successfully"): an epoch-0 record proves nothing, so it may not move the window on its own say-so. **References (checked in source):** OpenSSL (`ssl/record/methods/dtls_meth.c`, `dtls_record_bitmap_update` after the null cipher step) and wolfSSL 5.9.1's DTLS 1.2 path (`DtlsUpdateWindow` in `ProcessReplyEx` before the message is parsed) record every epoch-0 record; pion/dtls (`conn.go`: `replayMarker` returns a no-op marker for epoch 0 until the version is chosen, and `bufferHandshakeRecord` calls `markPacketAsValid` only after `fragmentBuffer.Push` accepted the fragment) and wolfSSL's DTLS 1.3 path (`Dtls13UpdateWindowRecordRecvd` only once `dtlsStateful`) hold back. The RFC rule is the mandatory one, so it decides (the 2026-11-18 "kept" decision is superseded); pion's shape is the model. **Now (1.2):** an epoch-0 record is checked against the window first and recorded only after it completed a message (the next expected `message_seq` moved on) or was an accepted ChangeCipherSpec (the read epoch moved on) (`Connection12.processRecord`, `Progress`), and even then only if it moves the high mark at most one window width (64) past the current one, or past 0 before any (`Window.recordUnauthenticated`); a record further ahead is processed but not recorded. A duplicate, a partial fragment, a queued later message, an early ChangeCipherSpec, epoch-0 application data or a stateless HelloVerifyRequest exchange leave the window untouched. **Review fix (same day):** the first version also counted new bytes of a message in progress, so one forged 1-byte ServerHello/ClientHello fragment under record number 2^48-1 became the high mark and every genuine record afterwards was stale. The same forged fragment also wedged the handshake by CONTENT (the genuine copy then contradicts the latched one, `InconsistentLength`, for ever), so two more changes go with it: `handleFlight`'s retry-once from live bytes now also drops a message in progress from an earlier call (it was only the queue), but keeps the retry's result only if the datagram alone COMPLETES the message — otherwise the partial message and the error stand, so a forged fragment still cannot evict a genuine partial one; and a server at `.start` lets a WHOLE ClientHello under another `message_seq` replace a partial one (a mere fragment does not). **Residuals, inherent to unauthenticated epoch 0 (second review 2026-11-19; all are first-in-wins races an off-path sender could already run, none is closed):** (1) a forged partial latched AHEAD of, or a forged fragment with the right type/length/`message_seq` and wrong bytes arriving AFTER the first fragment of, a genuine message that the peer FRAGMENTS across datagrams blocks it by content (every later genuine fragment of that range is `OverlappingFragment`, and no single genuine datagram completes the message for the retry) until the caller's handshake timeout; the hellos travel whole unless `max_datagram_len` forces otherwise (pre-existing; the length is brute-forceable within `max_message_len`); (2) a forged WHOLE message under the expected `message_seq` now replaces a genuine partial one through the retry (before, the genuine partial refused it); handlers of authenticated content (Certificate chain, ServerKeyExchange signature, Finished) still refuse it and the partial is restored, an unauthenticated one (ServerHello, ServerHelloDone, HelloVerifyRequest) is taken and the handshake then fails at Finished — no worse than the same forgery arriving first, and the retry processes such a message at most twice; in cookie mode a forged whole ClientHello only earns a stateless HelloVerifyRequest and changes nothing; (3) a forged HelloVerifyRequest that precedes the genuine one moves the client to `message_seq` 1, after which the genuine HelloVerifyRequest (`message_seq` 0) is an old duplicate and the client keeps resending its ClientHello with the forged cookie (pre-existing; bounded by `hvr_count`). Closing these would need authentication that epoch 0 does not have. **Replay (review F2, documented, not changed):** a record that is not recorded is processed again when replayed verbatim; a replayed duplicate makes this side resend its flight once per replayed datagram, to the same peer address, with no growth — a forged duplicate under a fresh record number always could. Queued later fragments are likewise re-queued, bounded by `max_future_bytes`. A forged record that does complete a message is message injection, which epoch 0 cannot prevent anyway (the Finished check fails it). **1.3:** the engine keeps no epoch-0 receive window at all (`hs0` counts sends only; duplicates are recognised by `message_seq`), so it was never affected; pinned by a test. Tests: `Connection12.zig` "epoch-0 replay window: only a record that advanced the handshake is recorded", "… moves the high mark at most one window width", `conn12_test.zig` "one forged 1-byte hello fragment with a huge record number does not wedge the handshake (review F1)" (client and server, two `message_seq`s), "a forged early ChangeCipherSpec …", "a fragmented flight whose record numbers jumped far ahead …",, `conn12_test.zig` "an injected epoch-0 record with a huge record number …" (both roles) and the forged-fragment flood test (its `send_seq` workaround removed), `Connection.zig` "an injected epoch-0 record with a huge record number …".
-  Mutation delta 2026-11-19 (both fixes, all new non-test source: `Connection12.processRecord`'s check/record split and `Progress`, `Connection`'s `recordFlightNumbers` / `noteFlightAck` / `keepFlightAcks`, the rollback carry and the epoch-0-ACK refusal): 33 mutants, 33 killed, 0 equivalent, 0 survivors; added to the card's cumulative counts. ctgrind counts unchanged (hs 176, app 13, ku 21, hs12 53, app12 3; x86_64 variants unchanged), digests re-pinned.
-  Mutation delta of the review fix (2026-11-19: `Window.recordUnauthenticated`, `Progress` without the bytes, the partial-message retry and its completion rule, the `.start` ClientHello re-latch): 15 mutants, 12 killed, 3 EQUIVALENT, 0 survivors. The equivalents: always retrying even with no partial message (the retry starts from the identical restored state, so it reproduces the identical error; cost-only); re-latching at `.start` also for a whole ClientHello under the SAME `message_seq`, and not clearing `rx_active` in that re-latch (in both, the whole ClientHello either merges with the partial one or contradicts it, and the contradiction goes to the retry, which drops the partial and completes the message; the end state is the same). A demonstration switch reverting all four parts at once (not counted) fails both review-F1 tests, i.e. they fail on the pre-fix behaviour.
-- ✅ DONE 2026-11-17 (four cases in `tools/interop.zig`, `wolfssl_peer.c` modes `server-alpn`/`client-alpn`/`server-ku-ours`/`server-ku-theirs`, transcript re-captured; see "Post-handshake") **KeyUpdate / ALPN against a live peer** (2026-11-13). Remaining: a wolfSSL-initiated KeyUpdate with wolfSSL as the client, ALPN and KeyUpdate in certificate mode.
-- ✅ DONE 2026-11-17 (four live-only cases in `tools/interop.zig`, `wolfssl_peer.c` modes `server-aes256` / `server-aes256-hrr` / `client-aes256`; all four pass against wolfSSL 5.9.1) **AES-256-GCM-SHA384 against a live peer.** `TLS13-AES256-GCM-SHA384` with a 48-byte SHA-384 PSK (`Config.psk_hash = .sha384`): our client against a stock server, with and without its HelloRetryRequest cookie (`psk-client-aes256`, `psk-client-aes256-hrr`: SHA-384 binder, key schedule, `message_hash` rewrite, AES-256-GCM records), and a stock client against our server, stateful and with our stateless cookie (`psk-server-aes256`, `psk-server-cookie-aes256`: the 83-byte cookie of a SHA-384 suite and its re-derived transcript). Each case also asserts our side negotiated the intended suite (`conn.suite`). **Recorded (2026-11-17, same day):** the four cases are in `src/testdata/wolfssl_transcript.txt` (22 cases; the 18 older ones are byte-identical, the four were spliced in after `psk-server-cookie` from a fresh `--capture --version 13`), `src/wolfssl_replay.zig` maps `suite=aes_256_gcm_sha384` (PSK cases only) to `.aes_256_gcm_sha384` with `psk_hash = .sha384` and counts the SHA-384 cases (floor 4), and the corpus pins moved with the recording (datagrams 156 -> 186, ClientHello bodies 15 -> 20, ServerHello bodies 23 -> 29; messages/record reach pins re-measured). The replay and the corpus code are test-only; no non-test source changed, so no mutation delta applies.
-- **CCM / CCM_8 suites** (survey 2026-09-30). RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8. Blocked on a 12-byte-nonce CCM: std 0.17.1 exports only the 13-byte presets (its generic `AesCcm` is private, `aes_ccm.zig:36`), and the sibling `oscore` uses std's 13-byte `Aes128Ccm8` directly, so there is no CCM core to reuse. Wanted: an **`aesccm` module (12/13-byte nonce, tag 8/16) shared by oscore + dtls** (rechecked 2026-11-13). Effort: medium. Fits §2.
-- **Session tickets / resumption and 0-RTT** (survey 2026-09-30; still open for both engines after 1.2 landed 2026-11-13). Saves a handshake on constrained links; pion has it for 1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.
-- **use_srtp (RFC 5764)** (survey 2026-09-30; exporter and ALPN landed 2026-11-13). The SRTP protection-profile negotiation; the keying material is already `exportKeyingMaterial("EXTRACTOR-dtls_srtp", …)`. Needed for DTLS-SRTP (WebRTC). Effort: medium. Fits §2.
-- **Dead-stack hygiene, what the 2026-10-09 sweep did not cover** (narrowed from "beyond CertificateVerify signing"). `Connection.startHandshake`/`handleFlight`/`installApplicationKeys`/`send`/`recv` are burned and probed through a full in-memory handshake (PSK, cert X25519, cert P-256 with mutual auth, cert X25519MLKEM768; both AEADs; 0 residue, see CHANGELOG). Not covered: (a) the standalone public helpers `keyschedule.*`, `aead.Protection`, `record.*` called directly by a consumer return/take secrets by value in the CALLER's frame (the engine's own uses are inside the entry-point burns); (b) secrets that stay in the live `Connection` after the handshake (`pending_ap_*` on the server, `hs_*` keys and traffic secrets until `deinit`) are by design, not dead stack; (c) HelloRetryRequest/cookie flows and the retransmission path (`poll`) are not driven by the probe; (d) the signature noise and nonce of the client/server CertificateVerify are measured only as far as the entropy draw and `certverify.sign`'s own probe, not the ECDSA nonce itself inside a live connection. Effort: small.
-
+- **AEAD record protection is the stateless per-record call** of the `aesgcm` module (AES-128-GCM); the bulk
+  path is not re-measured since it moved there. A cached context would need per-epoch key storage behind the generic
+  `Protection(Aead)` shared with ChaCha20. Deferred until a consumer measures DTLS throughput.
+- **DTLS 1.2 plain PSK against a live peer.** `psk_with_aes_128_gcm_sha256` is self-interop only, because Debian's
+  wolfSSL has no static PSK; an OpenSSL `s_server -dtls1_2 -psk` case would cover it.
+- **KeyUpdate / ALPN against a live peer, the rest:** a wolfSSL-initiated KeyUpdate with wolfSSL as the client, and
+  ALPN and KeyUpdate in certificate mode.
+- **DTLS 1.3 send-side fragmentation.** `Config.max_datagram_len` is honoured by the 1.2 engine only; the 1.3 engine
+  still sends one record per message (`protectHandshakeMessage`'s 1500-byte buffer, the cached `last_flight` as
+  finished records), so a tiny-MTU 1.3 peer with a large chain still cannot be served. Wiring it means fragmenting at
+  record build time and widening `FlightTracker`. Effort: small-medium.
+- **DTLS 1.3 partial retransmission (RFC 9147 §7.2).** A lost flight is resent whole from `last_flight` on the timer,
+  which conforms (§7.2 is a SHOULD: "omit them from any future retransmissions"); wolfSSL's 1.3 stack does send partial
+  flights. The cached flight's record numbers (`flight_rns`, `recordFlightNumbers`, at most `max_flight_records`; widen
+  when send-side fragmentation lands) and a handshake-time ACK consumer that matches them (`noteFlightAck`, epoch-2 ACKs
+  only; it marks, it does not drop records from the resend) exist. Still needed to resend only what an ACK did not name:
+  (3) a decision on retransmitting under the old record numbers (today: verbatim bytes) versus fresh ones (RFC 9147 §5.8
+  sends retransmissions in new records); (4) partial-flight ACKs on the sending side (§7.2 SHOULD; today only the final
+  flight and post-handshake records are ACKed). Pairs with "DTLS 1.3 send-side fragmentation". Effort: medium.
+- **CCM / CCM_8 suites.** RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8.
+  Blocked on a 12-byte-nonce CCM: std 0.17.1 exports only the 13-byte presets (its generic `AesCcm` is private,
+  `aes_ccm.zig:36`), and the sibling `oscore` uses std's 13-byte `Aes128Ccm8` directly, so there is no CCM core to reuse.
+  Wanted: an **`aesccm` module (12/13-byte nonce, tag 8/16) shared by oscore + dtls**. Effort: medium. Fits §2.
+- **Session tickets / resumption and 0-RTT**, for both engines. Saves a handshake on constrained links; pion has it for
+  1.2, wolfSSL for 1.3. Effort: medium (sibling `tlsresume` covers the server ticket seal for TLS). Fits §2.
+- **use_srtp (RFC 5764).** The SRTP protection-profile negotiation; the keying material is already
+  `exportKeyingMaterial("EXTRACTOR-dtls_srtp", …)`. Needed for DTLS-SRTP (WebRTC). Effort: medium. Fits §2.
+- **Connection ID (RFC 9146).** Only the framing exists (`record.zig`'s unified header carries and decodes a CID, with
+  `negotiated_cid_len` passed in); there is no negotiation and no CID in the engines.
+- **Certification-path building** (RFC 5280 §6: multi-hop chains, name constraints, `basicConstraints`/`keyUsage`
+  policy, revocation) and **`CertificateEntry` extensions** (OCSP stapling/SCT); `.trust_anchor` is a minimal one-hop check.
+- **A stateless cookie exchange against a fragmented ClientHello** (see *Threat model*): a fix would need either a
+  lightweight pre-reassembly return-routability check independent of the cookie, or accepting the amplification as the
+  cost of the fragmentation this module also needs to support.
+- **A second independent stack.** wolfSSL agreeing with us rules out the wire defects listed under *What it found*, but a
+  bug the two happen to share would still pass; mbedTLS or picotls would be the natural cross-check.
+- **Dead-stack hygiene, what the sweep did not cover.** `Connection.startHandshake`/`handleFlight`/`installApplicationKeys`/
+  `send`/`recv` are burned and probed through a full in-memory handshake. Not covered: (a) the standalone public helpers
+  `keyschedule.*`, `aead.Protection`, `record.*` called directly by a consumer return/take secrets by value in the CALLER's
+  frame (the engine's own uses are inside the entry-point burns); (b) secrets that stay in the live `Connection` after the
+  handshake (`pending_ap_*` on the server, `hs_*` keys and traffic secrets until `deinit`) are by design, not dead stack;
+  (c) HelloRetryRequest/cookie flows and the retransmission path (`poll`) are not driven by the probe; (d) the signature noise
+  and nonce of the client/server CertificateVerify are measured only as far as the entropy draw and `certverify.sign`'s own
+  probe, not the ECDSA nonce itself inside a live connection. Effort: small.

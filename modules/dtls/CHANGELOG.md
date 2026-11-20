@@ -5,47 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** SPEC: the epoch-0 residuals found by the second review are documented as inherent to unauthenticated epoch 0 — a forged whole message replacing a genuine partial via the retry, a forged same-header fragment after the genuine first one (OverlappingFragment until timeout), and a forged HelloVerifyRequest ahead of the genuine one; the earlier "forged partial ahead" residual wording is widened.
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the review fix (15 mutants: 12 killed, 3 equivalent, argued in SPEC; one killing test tightened); card `**Audit:**` now `mutation 2026-11-19 (1187/1376, 189 eq)`; ctgrind digests of the dtls rows re-pinned.
 - **2026-11-19** — **Behaviour change / Security fix (1.2 engine, review follow-up):** the epoch-0 window records a record only when it completed a message or was an accepted ChangeCipherSpec, and never more than one window width (64) ahead of its high mark; a forged 1-byte hello fragment with record number 2^48-1 no longer shadows the genuine records. `handleFlight`'s retry from live bytes now also drops a partial message latched by an earlier call (kept only if the datagram alone completes the message), and a server at `.start` lets a whole ClientHello under another `message_seq` replace a partial one, so the same forged fragment no longer wedges the reassembly either. 1.3: `handleFlight` asserts the cached flight's record table is unchanged before ACK marks are carried across a rollback.
-- **2026-11-19** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the epoch-0 window and flight-ACK changes (33/33 killed); card `**Audit:**` now `mutation 2026-11-19 (1175/1361, 186 eq)`; ctgrind digests of the dtls rows re-pinned (counts unchanged, native and x86_64).
 - **2026-11-19** — **Behaviour change (1.3 engine):** RFC 9147 §7.2 MUST — once an authenticated (epoch-2) ACK has named every record of the flight this side last sent, that flight is no longer retransmitted by `poll`. The cached flight's record numbers are kept (`flight_rns`); ACKs naming records not sent are ignored; epoch-0 ACKs are still only length-checked (unauthenticated). The ACK marks survive the incomplete-flight rollback.
 - **2026-11-19** — **Behaviour change / Security fix (1.2 engine):** the epoch-0 replay window is no longer advanced by unauthenticated records. A record is checked against the window and recorded only once it advanced the handshake (next message, bytes of the message in progress, or a ChangeCipherSpec), so an off-path sender can no longer make the genuine hellos look stale with a huge record number (RFC 6347 §4.1.2.6, RFC 9147 §4.5.1; pion/dtls does the same). The 1.3 engine keeps no epoch-0 window and is unchanged; a test pins it. Supersedes the 2026-11-18 "kept" decision.
-- **2026-11-18** — **NO CONSUMER-VISIBLE CHANGE:** epoch-0 replay window decided: kept, like OpenSSL and wolfSSL (SPEC Backlog).
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the four `TLS13-AES256-GCM-SHA384` live interop cases are now recorded in `src/testdata/wolfssl_transcript.txt` and replayed on every test run (`Case.live_only` is gone from `tools/interop.zig`): `src/wolfssl_replay.zig` maps `suite=aes_256_gcm_sha384` to the AES-256 suite with a SHA-384 PSK and asserts at least four such cases; the 18 older cases are byte-identical (the four new ones were spliced from a fresh `--capture --version 13` of 22 live cases against wolfSSL 5.9.1). Pins that moved with the recording: `fuzz_corpus.zig` datagrams 156 -> 186, ClientHello bodies 15 -> 20, ServerHello bodies 23 -> 29 (five new ClientHello and six new ServerHello/HelloRetryRequest bodies, thirty new datagrams); `messages.zig` reach ClientHello 21/16/109 -> 26/21/152, ServerHello 29/26/51 -> 35/32/63, extension blocks 38/34/131 -> 45/41/173, cookies 8/5/270 -> 10/7/436 (two new 83-byte cookies), offered-PSK (`pre_shared_key`) 13/9/8 -> 18/14/13; `record.zig` decoded 113 -> 131, consumed 529 -> 611, with-length 111 -> 129, plaintext handshake records 23 -> 28, declared 10411 -> 12000. Capacity fixes the bigger recording needed: the record corpora's stores (8192 B, 128 entries -> 16384 B, 256; they were silently dropping frames, which also hid the CID seeds), the ClientHello store of the instrument test and the two inner stores of `collectExtensionBlocks` / `collectExtensionData` (8192 B, 32 -> 16384 B, 64). ctgrind digests re-pinned, counts unchanged.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** live wolfSSL interop gains four `TLS13-AES256-GCM-SHA384` PSK cases (`tools/interop.zig`, `tools/wolfssl_peer.c`): our client with and without the HelloRetryRequest cookie, a stock client against our server stateful and with our stateless cookie, all with a 48-byte SHA-384 PSK; all pass against wolfSSL 5.9.1. They are live-only (not in the replay transcript, which was not re-captured). A failing case no longer hangs the run (the peer is killed instead of waited for). SPEC Backlog item closed.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind `dtls/hs` 174 → 176 (the handshake-time ACK tolerance adds the inner-content-type test on decrypted records, the documented decrypted-content class); digests re-pinned. SPEC Backlog: the RFC 9147 §7.2 MUST (stop retransmitting a fully ACKed flight) is its own item.
 - **2026-11-17** — **Behaviour change / Fix:** an RFC 9147 §7 ACK record arriving in the middle of a handshake flight (epoch 0 plaintext, or epoch 2) no longer fails the handshake with `error.UnexpectedMessage`: a well-formed one is authenticated, replay-checked, length-checked and skipped; a malformed one (short, truncated, odd-sized, trailing byte) is `error.Malformed`, as before an error. It is not matched against the cached flight (the whole flight is still resent on the timer; SPEC Backlog "partial retransmission"). Tests: an ACK between the records of the server's flight (both epochs) and ahead of the client's Finished, four malformed bodies in both epochs, a replayed ACK, another inner content type.
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the DTLS 1.3 engine's dead flight-tracker bookkeeping is deleted (`pending_flight_buf`, `pending_flight_count`, `markFlightSent`, `clearFlightTracker` and the `extra_records` / `all_records` lists that fed them): written on every flight and never read, found by the whole-module mutation (14 equivalent mutants). `flight.FlightTracker` stays (public, tested). A lost flight is still resent whole from the cached copy (RFC 9147 §7.2 makes partial retransmission a SHOULD); SPEC Backlog lists what partial retransmission would need.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit closed (see SPEC "Audit 2026-11-17"): the 215 open mutants of `Connection12.zig` and `Connection.zig` are 143 killed by new tests and 72 argued EQUIVALENT; the card records `mutation 2026-11-17 (1127/1327, 200 eq; mutant 301 recounted as equivalent by the coordinator)`. New tests in `src/audit_test.zig` (a DTLS 1.2 Finished one byte long or one bit off on both sides, a stateless server answering a retransmitted ClientHello again and once per datagram, a flight repeated inside one datagram answered once, post-handshake resend duties, the queue-retry corners) and test blocks at the end of `Connection12.zig` and `Connection.zig` for private helpers (caps filled exactly, epoch-1 records around the CCS, signature-scheme selection, the 1.3 record writers/readers at their size, width and replay edges, ACK / KeyUpdate framing, re-installing keys, cookie version and length, certificate-flight order, a dual server's `supported_versions`, both Finished checks, a ClientHello2 that drops the committed suite). SPEC Backlog: the 1.3 engine's `pending_flight_count` bookkeeping is written and never read.
 - **2026-11-17** — **Fix:** the DTLS 1.2 plain-PSK premaster (RFC 4279 §2: `other_secret` is `psk.len` zero bytes) overflowed its 596-byte stack buffer for PSKs of 297..512 bytes (`max_psk_len`): a panic in ReleaseSafe, a stack overflow in ReleaseFast. Reached only through the local `Config.psk`, never by a peer. Both buffers (client and server) are now `2 + max(80, max_psk_len) + 2 + max_psk_len`; the 512-byte cap (OpenSSL's `PSK_MAX_PSK_LEN`) and the wipe of the buffer are unchanged. Found by the whole-module mutation audit; test "dtls12 PSK of 512 bytes works, 513 is KeyExchangeFailed" (296/297/512 both PSK suites).
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** whole-module mutation audit, partial (see SPEC "Audit 2026-11-17"): 1327 mutants, `src/audit_test.zig` with the killing tests (exact-size output buffers and one-past-the-limit lengths for every encoder of `messages`/`messages12`, decoder edges, record/record12/Reassembler/FlightTracker/AEAD/PRF boundaries, the DTLS 1.2 client and server refusals of crafted ServerHello/HelloVerifyRequest/ServerKeyExchange/ClientHello/ClientKeyExchange, the 1.2 send/recv API edges).
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** the `dtls12-handshake` fuzz harness fragments flights (`max_datagram_len` 128..600 in half the cases), delivers them datagram by datagram and swaps two datagrams of one flight as a sixth fault, so the fragmentation, reassembly and future-message queue are fuzzed, not only unit-tested; reach pins a fragmented and a reordered handshake that connect. 40,000 runs clean.
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind `hs12` re-pinned 96 → 53 after `--stacks` runs of the old and new tree diffed site by site: the decrypted Finished's reassembly moved into `handshake.Reassembler` (counted), and memcheck's four-IP duplicate rule merges copies that were distinct while `handleFlightBody` was inlined; no new kind of site. hs/app/ku/app12 counts unchanged, all dtls digests re-pinned. SPEC Backlog: OpenSSL and wolfSSL also advance the epoch-0 replay window on unauthenticated records (checked in their source; behaviour kept).
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation of the day's 1.2 changes (42 mutants: 37 killed, 5 EQUIVALENT argued in SPEC "DTLS 1.2"); three first-run survivors became tests (one answer after a retry, no eviction of a genuine partial message after a queue-completed one, stale queued copies discarded). The card has no whole-module counts, so the result is a SPEC paragraph only.
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** test: a 1.2 server fragmenting its flight at the end of the epoch-0 sequence space gets `SequenceNumberExhausted` rather than wrapping.
 
 - **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE (hardening of the same-day 1.2 receive queue):** the retry-without-queue also runs when the message in progress holds queued bytes latched by an EARLIER call (a forged partial fragment queued, then drained when the genuine previous message completed), and then forgets that message too. New tests: that case; a record of exactly `max_datagram_len` is not fragmented and one byte over is; a short output buffer while fragmenting is `BufferTooShort`; no stale queued copies left after a reversed, duplicated flight; `nextDatagram` on a truncated unified header.
 
 - **2026-11-17** — **NEW API + Behaviour change (DTLS 1.2):** (1) **Live wolfSSL 1.2 interop:** `tools/wolfssl_peer.c` gains `12-server-*` / `12-client-*` modes (`wolfDTLSv1_2_*_method`), `tools/interop.zig` fifteen 1.2 cases (ECDHE_PSK, ECDHE_ECDSA with AES-128-GCM / AES-256-GCM-SHA384 / ChaCha20-Poly1305 and on secp256r1, ECDHE_RSA, both roles, mutual auth both ways, wolfSSL's HelloVerifyRequest and our stateless one, wolfSSL fragmenting at MTU 256, us fragmenting at 200) and `--version 12|13`; recorded into the new `testdata/wolfssl12_transcript.txt` and replayed by the new `wolfssl12_replay.zig` (the 1.3 transcript is untouched). Plain PSK stays self-interop only: Debian's wolfSSL has no static PSK. **Behaviour change (finding, fixed):** a 1.2 server no longer refuses a client that signals neither RFC 5746 `renegotiation_info` nor the SCSV (`SecureRenegotiationRequired`) — RFC 5746 §4.3 lets a server that never renegotiates continue, OpenSSL / wolfSSL / mbedTLS servers do, and wolfSSL's own 1.2 client is such a client; the ServerHello then carries no `renegotiation_info`. A client still requires it. (2) **NEW API `Config.max_datagram_len`** (default 0 = unchanged; 1.2 only, the 1.3 engine ignores it — Backlog) and **`record.nextDatagram`**: a 1.2 handshake message whose record would exceed the limit is sent as RFC 6347 §4.2.3 fragments, and the caller cuts the returned bytes into datagrams; `ConfigError.MaxDatagramLenTooSmall` below `min_max_datagram_len` (128). **Behaviour change:** incoming 1.2 messages are reassembled by `handshake.Reassembler` (fragments in any order; a contradicting overlap is now `OverlappingFragment` / `InconsistentLength` / `InconsistentMessageType` instead of `Malformed`), and fragments of up to 8 later messages (6144 bytes) are queued instead of dropped; a call that fed a queued fragment and failed is retried once without the queue, so forged queued fragments cannot wedge a flight. `Connection12` grows by about 10 KiB.
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE:** `prf12.masterSecret` carries the `secret-api-ok` note its sibling `prf` has (it writes into the caller's `out`; its only engine caller runs inside the entry points' burns) — `check-secret-api --ratchet` flagged it once dtls was touched. `ctgrind --check dtls` re-measured: hs 174, app 13, ku 21, hs12 96, app12 3, all unchanged; hs12/app12 source digests re-pinned (comment-only change).
 
-- **2026-11-17** — **NO CONSUMER-VISIBLE CHANGE (live-peer coverage):** `tools/interop.zig` and `tools/wolfssl_peer.c` gain four wolfSSL 5.9.1 cases: ALPN as client and as server, a KeyUpdate sent by our side (wolfSSL ACKs and answers) and one sent by wolfSSL (`wolfSSL_update_keys`; our `recv` reports `ReceivedKeyUpdate`, `poll` answers). The committed transcript was re-captured whole (18 cases, new ops `request_key_update` / `poll` / `poll_idle` / `expect_epochs`, `config alpn=`, `expect alpn=`), `src/wolfssl_replay.zig` replays them, and the counts the corpora derive from the transcript are re-pinned (`record.zig`, `messages.zig`, `fuzz_corpus.zig`). No production code touched; no wire defect found. `ctgrind --check dtls`: every count unchanged (hs 174, app 13, ku 21, hs12 96, app12 3), source digests re-pinned (the test code in `record.zig`/`messages.zig` is in the digested files).
 
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** DTLS 1.2 tests: a Certificate fragmented across two datagrams (RFC 6347 §4.2.3; `need_more_data`, a duplicate first datagram absorbed), and a peer alert (`error.ReceivedAlert`) in epoch 0 during the handshake (rolled back) and encrypted after it.
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** SPEC: new section "DTLS 1.2 (RFC 6347) and version negotiation" (API, wire behaviour, what is deliberately absent, validation); Scope card mvp → core with the remaining gaps (CCM, resumption, `use_srtp`, connection ID, no live 1.2 peer yet); Hardening line (1.2 fuzz harnesses, ctgrind `hs12`/`app12`); Backlog: DTLS 1.2 replaced by its live-peer check and send-side fragmentation. README section with a negotiation example. The 1.2 fuzz harnesses draw their first knob full-range (check-fuzz-reach R1/R2); `secret-api-ok` notes on the new entry points; dtls12 source pins re-pinned.
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind targets `hs12` (DTLS 1.2 PSK and ECDHE_PSK handshakes with the PSK tainted, an ECDHE_ECDSA AES-256-GCM-SHA384 one with the server's ephemeral ECDHE key tainted: 96 in-file) and `app12` (1.2 record keys tainted, three AEADs: 3 in-file). Contexts read by top frame: Finished and AEAD tag verdicts plus parsing of the decrypted Finished; the PRF, premaster and ECDH add none. `hs`/`app`/`ku` counts unchanged (174/13/21), source pins re-pinned for the `Connection.zig` 1.2 additions.
 - **2026-11-13** — **NEW API:** DTLS 1.2 (RFC 6347), client and server: `Connection12` (same method shape as `Connection`, same `Config`) and `Endpoint` (negotiates 1.3 vs 1.2 from the new `Config.versions`, default `{.dtls13}` = unchanged). Suites (`CipherSuite12`, `Config.cipher_suites12`): ECDHE_ECDSA and ECDHE_RSA with AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305, PSK with AES-128-GCM, ECDHE_PSK with ChaCha20-Poly1305; X25519 / secp256r1 / secp384r1; RSA-PSS preferred, PKCS#1 v1.5 accepted and produced for 1.2 only. HelloVerifyRequest cookie exchange (stateless, `Config.hello_retry`), retransmission with fresh record numbers, mutual authentication, RFC 7627 extended master secret required by default (`Config.require_extended_master_secret`), RFC 5746 `renegotiation_info` sent and required, renegotiation never performed, RFC 5705 exporter, ALPN, RFC 8446 §4.1.3 downgrade sentinel in both roles. A dual-version ClientHello adds 1.2 to `supported_versions`, the 1.2 suites and the EMS / RI / point-format extensions. New errors `ExtendedMasterSecretRequired`, `SecureRenegotiationRequired`, `DowngradeDetected`, `NegotiatedDtls12` (internal to `Endpoint`), `ReceivedAlert`, `ConfigError.InvalidVersions` / `NoCipherSuites12`; `Config.psk_identity_hint`. New files `prf12`, `record12`, `messages12`, `sig12`, `suite12`; fuzz harnesses `dtls12-handshake`, `dtls12-wire`; an RSA-2048 test fixture.
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** SPEC: new section "Cipher suites and the suite hash"; Scope card (AES-256-GCM-SHA384 closed; core still lacks DTLS 1.2 and CCM); Hardening ctgrind counts; Backlog keeps only the live-peer check of the new suite (the wolfSSL interop program is pinned to AES-128-GCM). README suite list.
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind covers AES-256-GCM-SHA384 (`hs`: a second handshake with a SHA-384 PSK; `app`/`ku`: a third suite). Re-pinned from `--stacks` runs of the old and the new tree, contexts matched one by one: `hs` 123 → 174 (the SHA-384 transcript hashing of the decrypted handshake messages, SHA-384 block buffering, the Finished verdict now in `suitehash.macEql`), `app` 23 → 13 and `ku` 22 → 21 (the same record-path sites counted once: the harness's old two-suite loop was unrolled by LLVM). No new kind of site, none a branch on a key. `suitehash.zig` joins the dtls source pin.
 - **2026-11-13** — **NEW API:** `TLS_AES_256_GCM_SHA384` (0x1302): `CipherSuite.aes_256_gcm_sha384` with the SHA-384 key schedule end to end (48-byte secrets, transcript, PSK binder, Finished MACs, HelloRetryRequest `message_hash` and an 83-byte cookie, KeyUpdate, the RFC 8446 §7.5 exporter under SHA-384). New `HashAlg`, `CipherSuite.hash()`, `Config.psk_hash` (default `.sha256`, RFC 8446 §4.2.11: in `.psk` mode a client offers and a server selects only suites of the PSK's hash; a ServerHello or HelloRetryRequest naming another is refused), `ConfigError.PskHashMismatch` (no configured suite of `psk_hash`), `Connection.installApplicationSecrets` (slices, any suite; `installApplicationKeys` keeps its `*const [32]u8` signature and refuses a SHA-384 suite). **Default `Config.cipher_suites` is now `{ aes_128_gcm_sha256, aes_256_gcm_sha384 }`** (pion/wolfSSL order): a `.cert_dhe` ClientHello offers both; a default `.psk` ClientHello is byte-identical (SHA-256 PSK). The client's transcript runs SHA-256 and SHA-384 side by side until the ServerHello / HelloRetryRequest names the suite (`suitehash.Transcript`); `Connection.client_hello1_hash` is gone (read from that transcript). A client now refuses a HelloRetryRequest naming a suite it did not offer (`error.IllegalHelloRetryRequest`, RFC 8446 §4.1.4) at the retry rather than at the ServerHello.
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** SPEC: Scope note and Backlog updated (KeyUpdate / exporter / ALPN closed; AES-256-GCM-SHA384 design recorded; CCM blocked on a shared `aesccm` module, since `oscore` uses std's 13-byte preset and has no CCM core to reuse).
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** ctgrind target `ku` (KeyUpdate both ways + exporter with the application traffic and exporter secrets tainted: 22 in-file, all processing of decrypted content); `hs` 120 → 123 (ALPN parsing of the decrypted EncryptedExtensions), `app` 13 → 23 (per-epoch replay window). Contexts read one by one; none is a branch on a key.
-- **2026-11-13** — **NO CONSUMER-VISIBLE CHANGE:** fuzz harness `dtls-keyupdate` (KeyUpdates under dropped / damaged / duplicated ACK and KeyUpdate records, then a lossless flush: nothing pending, keys agree) and ALPN in `dtls-wire` (`AlpnIter`, `decodeAlpnSelected` on damaged lists).
 - **2026-11-13** — **NEW API:** KeyUpdate in both directions (RFC 9147 §8): `Connection.requestKeyUpdate`, `keyUpdatePending`, `Config.key_update_after_records` (default 2^24, automatic rekey; `null` = off); `recv` processes a peer KeyUpdate (new `error.ReceivedKeyUpdate`) instead of leaving the connection on an un-updatable key, keeps the previous read epoch for late records, and ACKs NewSessionTicket; `poll` now returns the ACK / KeyUpdate records once connected (it returned `null` before). New `error.KeyUpdatePending`. RFC 8446 §7.5 exporter `Connection.exportKeyingMaterial` (`"dtls13"` labels). RFC 7301 ALPN: `Config.alpn_protocols`, `Connection.negotiatedAlpn`, `error.NoApplicationProtocol`, `error.InvalidAlpnProtocols`; `messages.encodeAlpn`/`AlpnIter`/`decodeAlpnSelected`. The client's EncryptedExtensions buffer grew 64 → 512 bytes.
 - **2026-11-01** — **NO CONSUMER-VISIBLE CHANGE:** the ML-KEM half of the PQ hybrid comes from `tls13.kex`, which now runs on the `mlkem` module; `mlkem` is a direct dep for the tests that decapsulate with it.
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** the client keeps the expanded ML-KEM decapsulation key from key generation (`tls13.kex.generateExpanded` / `sharedSecretExpanded`, new `Connection.ecdhe_expanded`, wiped wherever `ecdhe_secret` is), so the hybrid / ML-KEM-1024 shared secret no longer re-expands the key. `Connection` grows by ~12 KiB.
@@ -72,7 +49,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   test for `deriveSequenceNumberKey`, the one DTLS-only derivation. New dependency: `tls13`.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** the AES-128-GCM record protection now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
-- **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC CCM statement corrected for 0.17.0 (std exports only the 13-byte-nonce presets; its generic `AesCcm` is not `pub`); DER-reader note re-checked.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `X25519.KeyPair.generateDeterministic`/`recoverPublicKey` no longer return errors: the `catch return error.KeyExchangeFailed` arms (and their secret wipe, now unreachable) are gone; `EnumSet.initEmpty()` -> `.empty`; the `Entropy` union test reads `field_names`/`field_types`.
 - **2026-10-10** — tests: deterministic fuzz driver `DTLS_FUZZ` (`src/fuzz_test.zig`) over the in-memory client <-> server flow. `dtls-handshake`: PSK (AES-GCM, ChaCha20), PSK with the HelloRetryRequest cookie exchange and certificate-less (EC)DHE, one flight damaged / replaced by random bytes / dropped / duplicated; an undamaged handshake connects, a connected pair agrees on its directional keys and carries a record each way, a damaged flight that still connects differs only in a plaintext record header's legacy_version / epoch / sequence octets (the receiver does not check a plaintext record's epoch field). `dtls-record`: damaged, replayed and reordered application records (a damaged record is never accepted, a replay is refused). `dtls-wire`: record, handshake-header, reassembler, ClientHello / ServerHello / extension / ACK parsers on damaged genuine hellos and random bytes. 200,000-run verdicts clean. No code change.
@@ -154,7 +130,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `rsa.signPss` by pointer, and the KAT key fixture builds through rsa's out-param `fromPrimes`
   (rsa 2026-10-08).
 - **2026-10-06** — ⛔ **Fixed: Ed25519 `sign` with a secret key whose embedded public half is not its own went ahead in ReleaseFast.** It relied on `std`'s `Ed25519.KeyPair.fromSecretKey`, which checks the embedded public key only under `std.debug.runtime_safety` (signing one message under two public keys gives away the secret scalar). It now derives the pair from the seed and compares in every mode (`error.KeyMismatch`). Same defect as webhooksig's, found by grepping siblings; new test, teeth checked in ReleaseFast.
-- **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: resumption/0-RTT (and key update/CCM) read "not yet — see Backlog" instead of "out of scope, by design"; the stale "once `pskBinder` is implemented" note now records the existing constant-time server-side binder check.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** the application-epoch
   `send`/ack path now refuses (`error.SequenceNumberExhausted`, new
   `SendError` member) the record that would need `send_seq` to wrap past its
@@ -202,117 +177,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `decodeCertificate("")` once and stopped. The crashing shape is now both a
   named regression test and a corpus seed.
 
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the module's last two fuzz
-  targets stop drawing their whole scenario from collapsing draws, and `dtls`
-  reaches zero on `scripts/checks/check-fuzz-reach.py` (17 → 0).
 
-  `handshake.fuzzReassemble` and `Connection.fuzzHandleFlight` both draw a
-  SHAPE rather than a frame, and both took every choice from
-  `smith.valueRangeAtMost` — starting with the first. A ranged draw reads eight
-  octets as a little-endian `u64` and returns the range MINIMUM unless the whole
-  word lands inside the range, and after one short read `Smith` discards the
-  rest of the input. Neither was exempted: a state machine driven by a byte
-  script has a byte-first form, so both now take one `smith.slice` and read
-  their choices out of it with `testkit.fuzz.Cursor`. `fuzzReassemble`'s
-  hand-written corpus of 8-octet little-endian words, and the
-  `CorpusItem`/`corpusBytes`/`stormFragment` apparatus that built it, are gone;
-  the seeds are now hex scripts that read as the scenario they are.
 
-  ⭐ What the collapse was hiding in `fuzzHandleFlight`: its second-fragment
-  branch is commented *"Half the time, feed the TRUE remaining bytes at the TRUE
-  offset, so the completing path is reached too and not only the rejecting
-  one"*. That `smith.boolWeighted(1, 1)` was drawn after the input was
-  exhausted, so it was `false` every time — **the completing path, which is the
-  half of the accumulate/snapshot transaction the target was written to cover,
-  had never run**. The target had executed exactly one scenario for its whole
-  life: split = 1, an empty continuation of a zero-length message.
 
-  Measured before → after: `fuzzReassemble` **1 script, 3 octets stitched → 10
-  scripts, 408 octets stitched, 31 declared-vs-present mismatches refused**;
-  `fuzzHandleFlight` **1 script, 0 truthful continuations → 8 scripts, 4
-  truthful, 360 octets of real ClientHello body delivered**. Both keep the
-  collapsed run as an executable "before" line in their corpus guards.
-
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the twelve handshake-message
-  fuzz targets and the certificate-bridge one stop throwing their input away,
-  and two new certificate fixtures reach two dispatch arms that had never run.
-
-  Nine `messages.zig` targets opened with `smith.bytes(&buf)` followed by
-  `smith.valueRangeAtMost(u16, 0, buf.len)`, which is the range MINIMUM once
-  `bytes` has consumed the input — so `len` was 0 and every decoder was called
-  with an empty slice. The other three built a message with this file's own
-  encoders from parts that were *all* ranged draws, so the message was the same
-  one every time: an empty session id, **zero cipher suites and zero
-  extensions**. `certauth.fuzzParseLeafPublicKey` was the first shape again.
-  None of the thirteen declared a corpus, so outside `--fuzz` the runner
-  replayed exactly one input each.
-
-  Measured 2026-09-07, before → after (non-empty seeds / accepted / fields
-  walked): ClientHello **0/0/0 → 18/14/91**, ServerHello **0/0/0 → 25/23/45**,
-  Certificate **0/0/0 → 9/4/1161 DER octets**, extension blocks **0/0/0 →
-  35/32/115 extensions**, `key_share` ClientHello **0/0/0 → 10/9/3809 octets**,
-  `parseLeafPublicKey` **0/0 → 13/5 keys in 4 of the 4 supported kinds**.
-
-  Two things the collapse had been hiding:
-
-  * **The buffers were too small for this module's own traffic.** The largest
-    recorded ClientHello body is 1554 octets and the largest `key_share` 1222 —
-    the hybrid X25519MLKEM768 offer this module exists to make — against 1024-
-    and 256-octet harness buffers. A seed longer than the buffer reads back as
-    the EMPTY one, so the flagship handshake could never have passed through its
-    own harnesses even with the draw fixed. Raised to 2048.
-  * **`parseLeafPublicKey`'s P-384 and Ed25519 arms had no fixture.** Its own
-    comment says those two arms are the reason the harness exists (the RSA and
-    P-256 paths are re-fuzzed in `x509` and `rsa`), but the module owned no
-    P-384 and no Ed25519 certificate, so neither arm had ever executed.
-    `src/testdata/certs/p384-cert.der` and `ed25519-cert.der` were generated
-    with the same OpenSSL 3.5.5 and the same validity window as the existing
-    fixtures, and are exported as `p384_cert_der` / `ed25519_cert_der`.
-
-  Also fixed, and recorded because both were false when written: "then
-  SOMETIMES flip one byte" (the flip hung on a `boolWeighted` drawn after the
-  input was gone — it had never fired), and "plain random bytes at a plausible
-  length already reach their interior loops" (the length was 0). The mutation is
-  now a full-width `smith.value(u64)` carried in the seed's tail, and the corpus
-  guard pins how many seeds carry one.
-
-- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the record-layer fuzz targets
-  stop throwing their input away, and the module gains a corpus source built
-  from the recorded wolfSSL transcript (`src/fuzz_corpus.zig`).
-
-  `fuzzDecodeUnified` and `fuzzDecodePlaintext` both opened with
-  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u8, 0, buf.len)`.
-  `Smith.bytes` consumes `@min(buf.len, in.len)` octets, so the ranged draw
-  found fewer than the eight it reads as a little-endian `u64` and returned the
-  range MINIMUM: `len` was **0 for every input**, and both decoders were handed
-  an empty slice. Neither target declared a corpus either, so outside `--fuzz`
-  the runner replayed exactly one input each — the empty one. Measured
-  2026-09-07: **1 input each, 0 non-empty and 0 headers decoded before; 92 and
-  22 seeds, all non-empty, 85 and 21 headers decoded after.**
-
-  Two knobs went the same way, both drawn after the byte draw and therefore
-  after the input was exhausted: the `boolWeighted(1, 6)` that was supposed to
-  bias byte 0 into the valid fixed-bit pattern had **never executed once**, and
-  the negotiated CID length was 0 on every call — so `decodeUnified`'s entire
-  `has_cid` arm, `error.UnsupportedCidLength` included, was unreachable from its
-  own harness. Both now come out of one full-width `smith.value(u64)` carried in
-  the seed's tail, and the corpus guard pins 4 headers decoded WITH a CID.
-
-  `src/fuzz_corpus.zig` reads the 120 recorded datagrams out of
-  `src/testdata/wolfssl_transcript.txt` and hands them over in the framing
-  `Smith.slice` reads. Nothing under `src/` is changed for a consumer; the file
-  is test-only, and it re-introduces the `testkit` test dependency dropped on
-  2026-09-06 (nothing under `src/` imported it *then*; `testkit.fuzz`'s seed
-  helpers are what this needs, rather than a 34th private copy of them).
-
-- **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** `dtls` stops declaring itself
-  `live` and stops declaring a `testkit` test dependency. Both went stale earlier
-  the same day, when the wolfSSL peer moved to `tools/interop.zig`: `live` means
-  "this module's tests talk to a real external peer, so run them serially", and
-  `test-dtls` now opens nothing — it replays `src/testdata/wolfssl_transcript.txt`
-  and passes 268/268 with no compiler and no wolfSSL on the box. Nothing under
-  `src/` had imported `testkit` since the move either. The cost of leaving them
-  was a needlessly serialised test run; no behaviour, API or output changes.
 
 - **2026-09-06** — **The module stops shipping foreign source.** The live
   wolfSSL interop moved out of `src/` and became a standalone program; what it

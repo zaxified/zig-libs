@@ -1,6 +1,6 @@
 # dtls
 
-DTLS 1.3 (RFC 9147) and DTLS 1.2 (RFC 6347, since 2026-11-13 — see
+DTLS 1.3 (RFC 9147) and DTLS 1.2 (RFC 6347 — see
 "DTLS 1.2 and version negotiation" below). Two key-exchange modes (`Config.key_exchange`): `.psk`
 (default, pre-shared-key, no (EC)DHE) with an additive X.509
 Certificate/CertificateVerify/CertificateRequest authentication layer on top,
@@ -23,8 +23,8 @@ Implemented and validated:
   `hmac`/`hashlib` reimplementation.
 - **AEAD record protection** (`src/aead.zig`) — the RFC 9147 §4.2.2 per-record
   nonce, seal/open over the unified header, and §4.2.3 sequence-number
-  encryption (AES-ECB and ChaCha20 masks). Suites `aes_128_gcm_sha256` and
-  `chacha20_poly1305_sha256`. Validated byte-for-byte against OpenSSL.
+  encryption (AES-ECB and ChaCha20 masks). Suites `aes_128_gcm_sha256`,
+  `aes_256_gcm_sha384` and `chacha20_poly1305_sha256`. Validated byte-for-byte against OpenSSL.
 - **Handshake flight engine** (`src/Connection.zig`'s `startHandshake` /
   `handleFlight` / `poll`) — a real RFC 9147 §5 PSK client+server handshake
   (ClientHello with a real PSK binder → ServerHello → EncryptedExtensions +
@@ -61,7 +61,7 @@ bookkeeping, and the handshake message bodies incl. the PSK and cert-mode
 extensions.
 
 **Third-party interop — taken live, replayed hermetically.** The module
-itself ships no foreign source and needs no C compiler. Eighteen real DTLS 1.3
+itself ships no foreign source and needs no C compiler. Twenty-two real DTLS 1.3
 handshakes against **wolfSSL 5.9.1** over a loopback UDP socket, each followed
 by an application-data round trip, are run by `tools/interop.zig` — a
 standalone program *outside* the module (`zig build interop-dtls`, needs
@@ -71,10 +71,10 @@ seed, the configuration and the post-handshake assertions — is replayed
 byte-for-byte by `src/wolfssl_replay.zig` in `zig build test-dtls`, in pure
 Zig, with no wolfSSL, no C compiler, no child process and no socket. The
 replay is what runs per commit; the live program is the pre-release check and
-the only thing that can find a NEW divergence. Four further cases (in the
-recording too) run the PSK handshake under AES-256-GCM-SHA384 with a SHA-384
-PSK, with and without a HelloRetryRequest, in both roles. Covered live, and in
-the recording:
+the only thing that can find a NEW divergence. Four of them run the
+PSK handshake under AES-256-GCM-SHA384 with a SHA-384 PSK, with and without a
+HelloRetryRequest, in both roles; four more cover ALPN in both roles and a
+KeyUpdate from each side. Covered live, and in the recording:
 
 - **PSK, both roles** — our client against its server, our server against
   its client;
@@ -183,26 +183,27 @@ never leaves the state machine, transcript, key schedule or anti-replay
 windows half-advanced.
 
 Because those buffered bytes are not authenticated yet, every dimension is
-capped: 4096 bytes per flight (`error.FlightTooLarge` past that, buffer
+capped: 5632 bytes per flight (`max_flight_bytes`) (`error.FlightTooLarge` past that, buffer
 dropped), exactly one in-progress message (`error.InterleavedFragments` for a
 fragment of a later one), and a fragment that re-covers already-received
 bytes with *different* content is `error.OverlappingFragment` — byte-identical
 re-delivery is fine, contradiction is not, because "last writer wins" would
 let an off-path attacker steer what ends up in the transcript hash.
 
-Sending is still single-fragment: this engine never splits a message it
+Sending is single-fragment in the 1.3 engine: it never splits a message it
 emits, so it needs a peer MTU that fits the messages it sends (bounded by
-`max_cert_message_body` and friends). And what the accumulator tolerates is a
+`max_cert_message_body` and friends); the 1.2 engine does split, see
+`Config.max_datagram_len` below. And what the accumulator tolerates is a
 peer that *fragments*, not one that retransmits a whole flight verbatim into
 the middle of an incomplete one — see `handleFlight`'s "KNOWN LIMIT".
 
-**Deferred / out of scope:** full RFC 5280 §6 certification-path building
-(multi-hop chains, name constraints, revocation — `.trust_anchor` is a
-minimal one-hop check only), `CertificateEntry` extensions (OCSP/SCT),
-0-RTT/early data,
-session resumption, and the CCM suites (Zig 0.17 std ships only
-13-byte-nonce CCM presets, its generic `AesCcm` is not `pub`; the TLS/DTLS profile needs a 12-byte nonce — see
-`src/aead.zig`).
+## Not provided
+
+Resumption and tickets, 0-RTT, the CCM suites, `use_srtp` negotiation, connection ID
+negotiation, full RFC 5280 §6 path building (`.trust_anchor` is a one-hop check) and
+`CertificateEntry` extensions are not built; DTLS 1.2 CBC suites, static-RSA key exchange,
+compression, renegotiation and DTLS 1.0 are refused on purpose. See [SPEC.md](SPEC.md) *Backlog /
+deferred* and *What is deliberately not done*.
 
 ## DTLS 1.2 and version negotiation
 
@@ -238,8 +239,8 @@ via `Config.hello_retry`), retransmission, mutual authentication, the RFC
 the peer by default; a client requires RFC 5746 `renegotiation_info` from the
 server, a server answers it when offered and, since it never renegotiates,
 also serves a client that does not offer it (as OpenSSL, wolfSSL and mbedTLS
-servers do). Renegotiation itself, CBC suites, static-RSA key exchange,
-compression and resumption are deliberately absent.
+servers do). Renegotiation, CBC suites, static-RSA key exchange and
+compression are deliberately absent; resumption is not built.
 
 **Small MTUs.** `Config.max_datagram_len` (1.2 only, default 0 = off) splits
 every handshake message whose record would exceed it into RFC 6347 §4.2.3
