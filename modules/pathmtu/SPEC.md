@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`, re-surveyed for parity 2026-11-02 
 | [cavallara/plp-mtu-discovery](https://github.com/cavallara/plp-mtu-discovery) | C | MIT | 32 | push 2021-02-17 | Packetization-layer PMTUD (RFC 4821 style) experiment, stale since 2021 *(inferred from the name; README not read)*. |
 | Zig `std` / Zig ecosystem | Zig | — | — | — | Zig `std` has no PMTU discovery (this module's README); no Zig PMTU library turned up in a GitHub search. |
 
-**Where we are ahead:** the only library-shaped PMTU discovery found in any language (callable, structured `Result`, both address families), a deterministic offline-testable binary-search engine behind an injectable `Prober`, explicit ICMP black-hole detection (`Result.blackhole`) with the kernel-cache blind spot measured on a real router, and RFC 1191/4443 next-hop-MTU hints handled with a documented trust rule. **Where we are behind:** no packetization-layer discovery that works without any ICMP (RFC 4821/8899 PLPMTUD; rejected, it needs a cooperating transport and no sibling module is one), no next-hop MTU on the ping-socket lane (request to `icmp`), one-shot only, Linux only (deliberate, SPEC). **Gap verdicts (2026-11-03):** per-hop MTU done; DGRAM error queue read (Frag-Needed no longer reads as a black hole there) done, hint missing; PLPMTUD rejected as above; cloudflare/pmtud-style ICMP relaying is a different problem, rejected; automatic egress-interface lookup stays rejected (see "What is deliberately not done"); monitoring, non-Linux rejected.
+**Where we are ahead:** the only library-shaped PMTU discovery found in any language (callable, structured `Result`, both address families), a deterministic offline-testable binary-search engine behind an injectable `Prober`, explicit ICMP black-hole detection (`Result.blackhole`) with the kernel-cache blind spot measured on a real router, and RFC 1191/4443 next-hop-MTU hints handled with a documented trust rule. **Where we are behind:** no packetization-layer discovery that works without any ICMP (RFC 4821/8899 PLPMTUD; refused, see *What is deliberately not done*), no next-hop MTU on the ping-socket lane yet (`icmp` exposes it now, *Backlog / deferred*), one-shot only, Linux only (deliberate, SPEC). **Gap verdicts:** per-hop MTU done; DGRAM error-queue read done (a Frag-Needed no longer reads as a black hole there), its next-hop hint not yet used (*Backlog / deferred*); PLPMTUD, cloudflare/pmtud-style ICMP relaying (a different problem), automatic egress-interface lookup, monitoring and non-Linux are refused (*What is deliberately not done*).
 
 ## What this module is, and what it is not
 
@@ -38,7 +38,8 @@ Path MTU discovery for one destination: `query` reads whatever the kernel's
 own PMTU destination cache already holds (unprivileged, instant, but blind
 to a specific failure mode — see below); `probe` is an authoritative DF-bit
 binary search over a real ICMP socket that finds the true path MTU itself
-and, in doing so, can tell a well-behaved path from an ICMP black hole.
+and, in doing so, can tell a well-behaved path from an ICMP black hole; `probeHops`
+walks the path TTL by TTL and gives every hop's MTU (what `tracepath` prints).
 
 **What a reader might reasonably expect here and not find:** continuous or
 background PMTU monitoring (this is a one-shot discovery, called when a
@@ -77,29 +78,20 @@ search proper begins — see "Limits and refusals"); `hi` is the smallest
 size believed not to. Each probe outcome narrows the interval
 (`applyOutcome`): `.ok` raises `lo` to the confirmed-good size;
 `.local_reject`/`.send_failed`/`.no_reply` lower `hi` to the probed size
-itself (all three are our own direct observations). `.frag_needed` is the one case that can move
-*both* bounds at once: when it carries a valid RFC 1191/4443 next-hop-MTU
-hint `h` strictly inside `(lo, size)`, the search trusts it the way a real
-kernel PMTUD implementation does — `lo` jumps to `h` and `hi` to `h + 1`,
-converging immediately without re-probing that exact size (this is the one
-place `lo` moves on something other than our own confirmed `.ok`, and is a
-deliberate trust decision, not an oversight — see "Threat model" for what
-trusting an unauthenticated hint costs). Without a usable hint, `hi` simply
-drops to the probed size, and bisection proceeds as usual. The loop
-terminates because `mid = lo + (hi-lo)/2` is always strictly inside
-`(lo, hi)` once `hi - lo >= 2`, so every iteration shrinks the interval —
-**given `searchWith`'s own `ceiling > floor` precondition holds**, which it
-now checks itself (`error.CeilingTooLow` otherwise — see "Limits and
-refusals"). That check used to be a bare `std.debug.assert`, and an audit
-(2026-08-18) found the gap that left: `assert` compiles out entirely in
-ReleaseFast/ReleaseSmall, so a caller of this `pub` function — which this
-doc comment itself invites, for substituting a transport — violating the
-precondition in that lane didn't panic, it underflowed `hi - lo` on
-unsigned `u16` arithmetic and looped from a huge wrapped starting value
-until killed (confirmed: 15+ seconds, see CHANGELOG.md). Termination is
-structural now for every call that returns a `Result` at all; a call that
-would have violated the precondition gets a checked error instead of a
-hang, in every build mode alike.
+itself (all three are our own direct observations). `.frag_needed` with a
+valid RFC 1191/4443 next-hop-MTU hint `h` strictly inside `(lo, size)` lowers
+`hi` to `h + 1`: the search skips everything above the hint, but `lo` — and so
+`Result.mtu` — moves only on an `.ok` this module saw itself (see "RFC
+1191/4443 MTU hint", and "Threat model" for what trusting an unauthenticated
+hint costs). Without a usable hint, `hi` simply drops to the probed size, and
+bisection proceeds as usual. The loop terminates because
+`mid = lo + (hi-lo)/2` is always strictly inside `(lo, hi)` once
+`hi - lo >= 2`, so every iteration shrinks the interval — given
+`searchWith`'s own `ceiling > floor` precondition, which it checks itself
+(`error.CeilingTooLow` otherwise; a bare `assert` would compile out in
+ReleaseFast and let `hi - lo` underflow on `u16`, so the check is a real error
+in every build mode). `probe`/`probeHops` clamp or refuse the ceiling before it
+reaches the search (see "Limits and refusals").
 
 **The black-hole signal.** Two booleans accumulate across the whole search:
 `saw_frag_needed` (set by any `.frag_needed` outcome, from *any* candidate
@@ -115,14 +107,11 @@ silent" from "the whole path is silent" once any hop has spoken up.
 `.local_reject` (`EMSGSIZE` from the *local* kernel, against the outgoing
 interface's own configured MTU) narrows `hi` like a failure but touches
 neither flag — it is a real, definitive signal, but a purely local one that
-says nothing about the remote path. `.send_failed` (A1 F4: every retry's
+says nothing about the remote path. `.send_failed` (every retry's
 `sendto` failed for a reason OTHER than `EMSGSIZE` — permission, no route,
 ...) is treated the same way and for the same reason: zero packets ever
-left this host for that size, which is not evidence about the path either.
-Before this fix `LiveProber.attempt` reported that as plain `.no_reply`
-after silently exhausting every retry on the send side, so a destination
-that refuses every send outright read exactly like a path that swallows
-genuinely sent probes — `blackhole = true` with nothing ever transmitted.
+left this host for that size, which is not evidence about the path either, so
+a destination that refuses every send outright is not reported as a black hole.
 
 **RFC 1191/4443 MTU hint.** Read directly from the raw ICMP bytes rather
 than through the sibling `icmp.echo` module's `Reply.icmp_error` (which
@@ -138,24 +127,36 @@ to treating the probed size itself as the new bound. **An accepted hint
 narrows the ceiling and nothing else** — `Result.mtu` is always a size this
 module probed and saw succeed.
 
-⚠ **That last sentence is the first audit's correction (2026-09-04), and the
-claim it replaces was false.** This used to say a hostile hint "can only make
-the search slower, never wrong", and elsewhere that a falsely-large MTU with
-`blackhole = false` is a shape the spoofed-hint case "structurally cannot
-produce". `applyOutcome`'s hint arm set `lo` to the hint and returned, so the
-reported size was **never probed**. Measured against a prober whose true path
-MTU is 300, answering the first (ceiling) probe with a forged
-Fragmentation-Needed: **reported `mtu = 1499`, `blackhole = false`, in 2
-probes** — any value the attacker names in `(floor, ceiling)`, 1199 bytes too
-large, flagged as a well-behaved path. ICMP is unauthenticated, so that packet
-costs an off-path spoofer one guess of `ident`.
+A hint therefore only narrows `hi` (to `h + 1`), never sets `lo`: the search keeps the
+hint's whole benefit (everything above it is skipped) at a cost of one extra probe,
+and satisfies RFC 1191 §3 and RFC 8201 §4, which both say a PMTU estimate may only
+ever **decrease** for a path. A forged hint can make the search slower and can
+supply `saw_frag_needed`, but cannot make the reported MTU larger than a size this
+module probed and saw succeed.
 
-The safe-direction argument was made about the *ceiling* (`h < size`) and then
-read as an argument about the *true path MTU* — the bound was real, it just
-bounded a different quantity. Setting only `hi` keeps the hint's whole benefit
-(the search still skips everything above it) at a cost of one extra probe, and
-satisfies RFC 1191 §3 and RFC 8201 §4, which both say a PMTU estimate may only
-ever **decrease** for a path.
+**Per-hop walk (`probeHops`, `src/hops.zig`).** `hopsWith`, a pure engine behind an injectable `HopProber`, walks
+TTL 1, 2, 3 … with DF probes of the current path-MTU estimate. A Time Exceeded names the router at that TTL; a
+Fragmentation Needed / Packet Too Big says some link before it is smaller (the sender is the router whose OUTGOING
+link is the limit, `Hop.narrowed_by`) and lowers the estimate; the destination's Echo Reply ends the walk. Within one TTL
+the estimate is searched like `searchWith` does, and a hint inside `(lo, hi)` is probed first, never adopted. It
+terminates: the TTL runs to `min(max_hops, out.len)`, at most `max_steps_per_hop` (32) probes are sent per TTL plus one
+floor check, whatever a prober returns. `Hop.proved` says `mtu` is a size probed and answered by THAT hop (or the
+destination), never a hint taken on trust; otherwise it is the estimate carried over (a silent hop, an exhausted step
+budget, no probe could be sent, or even the floor-sized probe failed). **Silence is not evidence of a drop:** a size that
+got no answer after the prober's own retries is re-probed once at the end of the hop's search, and either way the hop
+is `silence_narrowed` and the result `uncertain` (the possibly too small estimate carries to every later hop); a router
+that rate-limits its ICMP errors (Linux: 1 per second per peer after a burst) looks exactly like a black hole, so
+`blackhole` is evidence, not proof, and `retries` should stay above 0. `Options.deadline_ms` (default 120000) bounds the
+whole walk in wall time: once spent every further probe counts as unanswered without being sent, the walk ends through
+`max_silent_hops` and `HopsResult.timed_out` is set. The walk allocates nothing.
+
+**Route PMTU is not consulted.** `probe` and `probeHops` set `IP_PMTUDISC_PROBE` / `IPV6_PMTUDISC_PROBE` on their own
+socket (`noRoutePmtu`, `src/root.zig:1135-1136`; a failure is harmless, the stricter mode stays), so a Fragmentation
+Needed forged against a live socket of the host — which lowers the kernel's cached PMTU for the destination for about
+ten minutes — cannot turn into a local `EMSGSIZE` that narrows the search with no router answering. `query` still reads
+the cached value: that is its job. `Result.cache_is_exception` compares `query`'s reading with the interface MTU; the
+comparison caps the interface MTU at 65535 for IPv4 only (`IP_MTU` cannot read more, `lo` is 65536), the IPv6 link MTU is
+a 32-bit quantity read as it is (`cacheIsException`, `src/root.zig:364`).
 
 ## Threat model / out of scope
 
@@ -163,101 +164,61 @@ ever **decrease** for a path.
 correlated by ident+seq quoted in the ICMP error, the same authentication
 posture as the sibling `traceroute` module — **not authenticated**, a
 spoofed off-path reply with the right ident/seq would be accepted as a real
-signal. Concretely for this module: a spoofed Fragmentation-Needed/Packet
-Too Big carrying a forged MTU hint is trusted the same way a genuine one is
-(see "The search invariant" above) — bounded above by whatever size the
-attacker's spoof responds to (a hint outside `(lo, size)` is discarded).
+signal. Two directions of the same hole:
 
-⚠ **Revised 2026-09-04.** This used to conclude that a forgery "can steer the
-reported MTU down within that range … but cannot claim a size larger than what
-has already failed", and that reading is what made the falsely-large case look
-impossible: the hint was bounded by the size that just failed, which says
-nothing about the *true* path MTU. Measured: a forged hint of 1499 against a
-true path MTU of **300** was reported as `mtu = 1499, blackhole = false` — the
-attacker's number, 1199 bytes too large, never probed. Since an accepted hint
-now only narrows `hi`, a forged Frag-Needed can make the search **slower**, and
-can still clear `blackhole` by supplying `saw_frag_needed`, but the reported
-MTU is always a size this module probed and saw succeed.
-
-**That is the weaker of the two directions, and an audit (2026-08-18) found
-this document only ever named that one.** The stronger direction: a
-forged, matching *echo reply* (not a Frag-Needed/Packet-Too-Big) triggers
-`applyOutcome`'s `.ok` arm, which sets `lo.* = size` **unconditionally** —
-`classify` accepts it on ident+seq match alone, no payload check, no
-binding to anything about the specific probe beyond those two fields. A
-single forged echo reply matching ident+seq for the very first (ceiling
--size) probe converges the *entire* search immediately to
-`mtu = ceiling, blackhole = false` — a **falsely large** reported MTU. This
-is the more dangerous direction, not merely the missing half of a
-symmetric weakness: `blackhole = false` and a big number is exactly the
-"everything's fine" signal a caller trusts and stops investigating on — the
-one shape this module exists to independently confirm before a caller
-believes it, and the one direction the spoofed-hint case above structurally
-*cannot* produce (a hint can only push the answer down, or clear
-`blackhole`, never claim a size larger than something that already failed).
-This is not a new hole — `probe`'s live path was already, and remains,
-completely unauthenticated end to end, same as `traceroute` states for
-itself — it is a direction of the *same* hole this document previously did
-not name.
+- **A forged Fragmentation-Needed / Packet-Too-Big with a forged MTU hint** is
+  trusted the same way a genuine one is (see "The search invariant" above),
+  bounded by the search interval (a hint outside `(lo, size)` is discarded). It
+  can make the search **slower**, and can clear `blackhole` by supplying
+  `saw_frag_needed`, but the reported MTU is always a size this module probed
+  and saw succeed.
+- **A forged, matching *echo reply*** (the stronger direction): `classify`
+  accepts it on ident+seq match alone, no payload check, and `applyOutcome`'s
+  `.ok` arm sets `lo.* = size` unconditionally. A single forged echo reply
+  matching ident+seq for the very first (ceiling-size) probe converges the
+  *entire* search immediately to `mtu = ceiling, blackhole = false` — a
+  **falsely large** reported MTU, exactly the "everything's fine" signal a
+  caller trusts and stops investigating on, and the one shape this module
+  exists to independently confirm. It is the same unauthenticated live path
+  `traceroute` states for itself, not a separate hole.
 
 *What stands between an attacker and a successful forgery, and for whom.*
 Two ICMP fields gate acceptance: `ident` (whatever the sibling `icmp`
 module's `Socket.open` assigned — RAW sockets: the process's own PID
 `& 0xffff`, a handful of guesses on a freshly started process, often
 single digits in a container; DGRAM sockets: a kernel-assigned ephemeral
-port, ~28000 possible values on this host's default range) and `seq`
+port, ~28000 possible values on a default range) and `seq`
 (entirely this module's own choice). Neither is a secret from an **on-path**
 attacker — one who can observe this session's real ICMP traffic (a
 compromised router on the path, a monitoring tap) sees every real ident,
 seq, and payload byte the moment a probe leaves the wire, and needs to
 guess nothing. No value this module could randomize, pad, or nonce inside
 its own probe packets changes that; this module's posture toward an
-on-path attacker is, and stays, exactly `traceroute`'s own stated one —
-**not a security boundary** — and no code change below alters that
-sentence's truth.
+on-path attacker is exactly `traceroute`'s own stated one —
+**not a security boundary**.
 
 Against a **blind off-path** attacker — one spoofing source addresses
 without seeing this session's real traffic, who must therefore *guess*
-ident+seq — the picture is different, and was worse than documented before
-this audit: `seq` started at the fixed value 1 and incremented by exactly 1
-per attempt, so a blind attacker needed only to guess `ident` once and then
-spray roughly the first ~15–20 sequential `seq` values to land a forged
-reply on every probe the search would ever issue, for either address family
-or socket kind. `probe` now seeds `seq` from a per-call `getrandom(2)` draw
+ident+seq — `probe` seeds `seq` from a per-call `getrandom(2)` draw
 (`randomStartSeq`, Linux-only direct syscall, matching the posture `ssh`/
-`bulletproofs` already use elsewhere in this repo for the same reason —
+`bulletproofs` use elsewhere in this repo for the same reason —
 CONVENTIONS.md §2.2's named deliberate exceptions to threading `std.Io`
-through for a random draw) rather than the fixed value 1. A blind attacker
-now has to guess a full unknown 16-bit `seq` in addition to `ident`, raising
-the cost of a successful blind forgery by roughly `2^16`. This is a real,
-honestly-scoped improvement and nothing more: 16 bits is not a
-cryptographic margin, `ident` for a RAW-socket session is still PID-shaped
-and not randomized by this module (that value belongs to the sibling `icmp`
-module, outside this module's own surface), and a sufficiently
-high-volume, sufficiently patient blind spoofer is not ruled out — only
-made materially more expensive. It does **nothing at all** for an attacker
-who is not blind, per the paragraph above.
+through for a random draw). A blind attacker has to guess a full unknown
+16-bit `seq` in addition to `ident`, raising the cost of a successful blind
+forgery by roughly `2^16`. That is an honestly-scoped improvement and nothing
+more: 16 bits is not a cryptographic margin, `ident` for a RAW-socket session
+is still PID-shaped and not randomized by this module (that value belongs to
+the sibling `icmp` module), and a sufficiently high-volume, sufficiently
+patient blind spoofer is not ruled out. It does **nothing** for an attacker who
+is not blind.
 
-Two further candidates were considered and deliberately **not** implemented:
-- **Randomizing `ident` from within `pathmtu`.** Not this module's value to
-  change — it is assigned by the sibling `icmp` module's `Socket.open` (PID
-  for RAW, kernel ephemeral port for DGRAM) and this module does not touch
-  `icmp`'s internals. Would need `icmp` module changes, out of this
-  module's scope.
-- **A per-probe nonce woven into the echo payload, checked on receipt.**
-  Technically reachable entirely within `classify` (which already sees the
-  raw ICMP bytes past the echo header) without touching `icmp`. Not added:
-  its only genuine benefit over the `seq` randomization above is a larger
-  guess space against the *same* attacker class (blind off-path) — it adds
-  no protection against an on-path attacker either, for the same reason
-  `seq`/`ident` don't (the payload is just as visible on the wire as the
-  header). Given the marginal benefit is "harder to blind-guess by more
-  bits," not "stops a new attacker," it did not clear the bar for the added
-  complexity (payload construction, `classify` signature, per-attempt nonce
-  bookkeeping) — an honest "raises the bar further against the same limited
-  attacker" is not the same claim as "closes the gap," and this document
-  does not want to imply the latter for a module whose live path is, and
-  states itself to be, unauthenticated.
+**Forged route PMTU.** A forged Frag-Needed / Packet-Too-Big quoting a live UDP
+socket's datagram lowers the kernel's cached PMTU for the destination for about
+10 minutes (`ip route get` shows it), and a later socket to that destination
+inherits it. `probe` and `probeHops` do not consult it (see "Route PMTU is not
+consulted"); `query` still reads it, that is its job. The forgery needs the
+victim's 4-tuple. Forged ICMP that reaches the probing socket as a datagram or
+error-queue entry is still accepted on ident+seq, as above.
 
 Malformed/hostile ICMP bytes never panic — `classify` reads fixed offsets
 only after `icmp.echo.parseV4`/`parseV6`'s own bounds-checked parse has
@@ -278,7 +239,7 @@ based PMTU probing methods (this module is ICMP/DF-bit only, per RFC
   or `Options.iface`'s `SIOCGIFMTU` reading, in that priority) —
   `error.CeilingTooLow` if the resolved ceiling is at or below the floor;
   refused rather than silently returning a fabricated `Result`. `searchWith`
-  itself now enforces the equivalent `ceiling > floor` precondition (see
+  itself enforces the equivalent `ceiling > floor` precondition (see
   "The search invariant" above) as a checked error, not only `probe()`.
 - **`max_probe_mtu = 9000`** — the fixed stack buffer `LiveProber` builds
   echo requests in (covers common jumbo-frame ceilings; zero-filled once at
@@ -294,34 +255,24 @@ based PMTU probing methods (this module is ICMP/DF-bit only, per RFC
   `CeilingTooLow` above already refuses rather than commits. No allocator
   is used anywhere in this module.
 
-  An audit (2026-08-18) found that `Options.ceiling_mtu` previously flowed
-  into `LiveProber` completely unchecked: `probe()` clamped only the
-  `iface`-derived ceiling (`@min(m, max_probe_mtu)`), so a caller-supplied
-  `ceiling_mtu` above 9000 reached `LiveProber.attempt`'s
-  `payload_len = wire_size - ip_header_len` slice into the fixed
-  `[max_probe_mtu]u8` buffer unclamped. In Debug/ReleaseSafe this panicked
-  (`index out of bounds`); in **ReleaseFast, Zig's own slice-bounds check
-  compiles out along with every other runtime safety check** — `attempt`
-  read past the end of the buffer, handed the over-length slice to
-  `sendTo`/`sendto(2)`, and the kernel put whatever was on the stack past
-  that 9000 bytes onto the wire as ICMP echo payload: a stack-memory
-  disclosure to the probed destination, returning a fabricated
-  `Result{ .mtu = <the bogus ceiling>, .blackhole = false }` rather than an
-  error (confirmed: `mtu=20000 blackhole=false` for `ceiling_mtu = 20000`,
-  followed by a SIGSEGV on return from the corrupted stack frame). Fixed by
-  refusing (`error.CeilingTooHigh`) before any of it is built, so the
-  buffer invariant holds for every caller by construction, not only a
-  polite one; `LiveProber.attempt` also carries a defense-in-depth
-  `@panic`-based check on the same condition (deliberately not another
-  `std.debug.assert` — the same reasoning as above: an `assert` here would
-  repeat the exact failure mode that let this bug through ReleaseFast in
-  the first place). Separately, `LiveProber.buf` is now zero-filled at
-  construction rather than `undefined`: `echo.writeEchoRequest` only
-  writes the 8-byte echo header, and payload bytes beyond it were
-  previously whatever the stack last held — leaking uninitialized stack
-  content as ICMP payload on every probe, not only the out-of-bounds one
-  above (smaller blast radius, same root cause; found while fixing the
-  headline defect).
+  `Options.ceiling_mtu` is checked before anything is built from it, so the fixed
+  `[max_probe_mtu]u8` buffer invariant holds for every caller by construction;
+  `LiveProber.attempt` also carries a defense-in-depth `@panic`-based check on the
+  same condition (deliberately not `std.debug.assert`, which compiles out in
+  ReleaseFast). `LiveProber.buf` is zero-filled at construction, not `undefined`:
+  `echo.writeEchoRequest` writes only the 8-byte echo header, so the rest of the
+  payload is zeros, never stale stack content.
+- **Wall-clock bound of `probe`:** about 17 sizes x (`retries` + 1) x `timeout_ms`,
+  all caller parameters. `probeHops` has `Options.deadline_ms` (default 2 minutes);
+  `probe` has none.
+- **A multi-homed destination:** `probeHops` takes an Echo Reply only from the exact
+  address it probed (anything else could be a spoof). A reply from another address
+  of the same host is dropped; the caller sees silence at that hop,
+  `reached == false`, and a walk ended by `max_silent_hops` or the deadline.
+  Matching is not widened.
+- **Per-hop black-hole attribution:** the walk flags `blackhole` when a floor-sized
+  probe is answered where a larger one is not, at any hop, and does not name the hop
+  beyond its position in `hops`.
 
 ## Anchoring
 
@@ -335,17 +286,17 @@ based PMTU probing methods (this module is ICMP/DF-bit only, per RFC
 
 **What the tests actually contain.** src/kernel_oracle_test.zig replays 22 transcripts of `probe` against real Linux kernels (`tools/interop.zig` + `tools/kernel_oracle.py` → `kernel_oracle_vectors.zig`): for v4 and v6, a fresh client → router → server topology of network namespaces with a lowered router→server link (576, 1000, 1280, 1300, 1400, 1492, 1499), none, jumbo frames (9000 to 4000, 9000 clean), and a router whose nft rule drops its own ICMP Fragmentation Needed / Packet Too Big (1300, 1400). Every attempt the live prober made is recorded through `Options.on_attempt` with the kernel's answer (forwarded, refused locally with `EMSGSIZE`, Frag-Needed with its hint, silence); `searchWith` must ask the same sizes in the same order and arrive at the smallest configured link MTU, flagging a black hole exactly where the router was made one. The truth is the configured link MTU; iputils `tracepath` (a third implementation) reported the same pmtu on every well-behaved path and — like `query` — the interface MTU through every black hole. `classify` is additionally anchored by the real Frag-Needed / Packet-Too-Big captures below. Self only: nothing — the search is judged by real kernels' answers
 
-**Kernel oracle 2026-10-05.** No defect. What the transcripts show: on a well-behaved path the kernel learns the PMTU from the first oversized packet (even `query`'s own nudge), so most of `probe`'s oversized attempts come back as a local `EMSGSIZE`, not as ICMP; the search converges either way.
+**What the kernel transcripts show.** on a well-behaved path the kernel learns the PMTU from the first oversized packet (even `query`'s own nudge), so most of `probe`'s oversized attempts come back as a local `EMSGSIZE`, not as ICMP; the search converges either way.
 
-### Per-hop walk, judged by real kernels (2026-11-03)
+### Per-hop walk, judged by real kernels
 
-`tools/hops_oracle.py` (`zig build interop-pathmtu -- --hops-oracle`, about 2 minutes, no root, nothing frozen) builds a client, r1, r2, server topology of namespaces and walks it with `probeHops` once per ICMP socket kind (the unprivileged DGRAM one, with `ping_group_range` opened in the client namespace, and RAW), v4 and v6, over six link layouts each (clean, narrow in the middle, narrow twice, narrow at the last link down to 1280, jumbo 9000/4000/1500, and an ICMP black hole before the server): 24 walks, 0 disagreements with the configured links. A 25th run bounds the walk with a 1.5 s deadline while each probe would wait 60 s with 255 retries on the black-hole path: it must end by itself, flagged `timed_out`, without reaching the server (it took 1.5 s). Each walk must list r1, r2 and the server in order, give every hop the smallest link MTU in front of it, attribute a narrowing to the router whose outgoing link is smaller, flag the black hole and still find the link, and agree with `probe` over the same socket and with iputils `tracepath -n` (hop addresses and final pmtu; tracepath cannot pass the black hole). Two findings of building it: the RAW socket must not let the error queue pre-empt the datagram that carries the next-hop MTU, and a router's own ICMP rate limit makes a quick walk read 1398 for a 1400 link (Backlog).
+`tools/hops_oracle.py` (`zig build interop-pathmtu -- --hops-oracle`, about 2 minutes, no root, nothing frozen) builds a client, r1, r2, server topology of namespaces and walks it with `probeHops` once per ICMP socket kind (the unprivileged DGRAM one, with `ping_group_range` opened in the client namespace, and RAW), v4 and v6, over six link layouts each (clean, narrow in the middle, narrow twice, narrow at the last link down to 1280, jumbo 9000/4000/1500, and an ICMP black hole before the server): 24 walks, 0 disagreements with the configured links. A 25th run bounds the walk with a 1.5 s deadline while each probe would wait 60 s with 255 retries on the black-hole path: it must end by itself, flagged `timed_out`, without reaching the server (it took 1.5 s). Each walk must list r1, r2 and the server in order, give every hop the smallest link MTU in front of it, attribute a narrowing to the router whose outgoing link is smaller, flag the black hole and still find the link, and agree with `probe` over the same socket and with iputils `tracepath -n` (hop addresses and final pmtu; tracepath cannot pass the black hole). Two findings of building it: the RAW socket must not let the error queue pre-empt the datagram that carries the next-hop MTU, and a router's own ICMP rate limit makes a quick walk read 1398 for a 1400 link (see "Per-hop walk" in the design notes).
 
 ### External anchor: a real forwarding router, a real lowered-MTU link
 
 The premise the whole module rests on — that a black hole is a real,
 reproducible network condition and not a hypothetical — was verified live,
-not just reasoned about. Method (2026-08-18), inside one fully unprivileged
+not just reasoned about. Method: inside one fully unprivileged
 `unshare --user --net` sandbox on this host (`unshare -rn`-class isolation;
 no sudo, no setcap, nothing on the host changed):
 
@@ -410,14 +361,19 @@ flag) against a fake `Prober`, in `src/root.zig`'s test section.
 Linux `tracepath(8)` describe (bisect on DF-probe failure). Its offline tests
 keep the `FakeProber` property checks (exact convergence across six
 bottlenecks that share no alignment with the search's arithmetic, the
-blackhole-flag derivation, `local_reject`'s neutrality, forged hints); since
-2026-10-05 the same engine also replays real kernels' answers
+blackhole-flag derivation, `local_reject`'s neutrality, forged hints); the
+same engine also replays real kernels' answers
 (`kernel_oracle_test.zig`, see "What the tests actually contain" above),
 so the value it converges to is checked against a configured link, not
 against a model of one.
 
 ## What is deliberately not done
 
+- **Packetization-layer PMTUD (RFC 4821 / RFC 8899).** It needs a cooperating transport (a peer that
+  acknowledges UDP/QUIC/DTLS probes); `probe` is ICMP/DF-bit only and no sibling module offers such a
+  transport. `probe` detects the black hole (`blackhole = true`) and still finds a number. Revisit if a
+  transport module with probe acknowledgements appears.
+- **ICMP relaying across machines (what `cloudflare/pmtud` does):** a different problem, not discovery.
 - **Automatic egress-interface resolution.** Determining which local
   interface routes to `dest` (so `Result.iface_mtu` could be filled in
   without the caller naming it) would need either a route-table lookup
@@ -430,51 +386,93 @@ against a model of one.
   `pathmtu.ifaceMtu(name)` gets a caller the same information for the one
   extra line of naming their own interface. **Not now**, not never — if a
   consumer needs it, the mechanism above is the honest way to build it.
-- **A single search cannot separate two distinct hops' behavior.** If one
+- **One `probe` search cannot separate two distinct hops' behavior.** If one
   router genuinely sends ICMP feedback and a *different* hop on the same
   path silently drops, one binary search sees only the tighter of the two
   boundaries and (per the black-hole derivation above) reports
   `blackhole = false` because *some* real ICMP was seen — even though the
-  actual bottleneck might be the silent hop. Distinguishing this would need
-  per-hop TTL-limited probing (traceroute's own method) combined with
-  per-hop PMTU probing, a materially different and heavier design. Not
-  attempted here; documented as a known limitation
-  (`searchWith: one explicit Frag-Needed anywhere clears blackhole...`
-  test names it explicitly).
+  actual bottleneck might be the silent hop. `probeHops` is the per-hop design
+  (TTL-limited probing with per-hop MTU) and flags the black hole there, but
+  `probe` itself stays a single search (`searchWith: one explicit Frag-Needed
+  anywhere clears blackhole...` test names it explicitly).
 - **Continuous/background PMTU monitoring.** `probe` is one-shot by design,
   matching `sntp.query`/`stun.query`'s convention; a caller that wants
   periodic re-checks calls it periodically.
+- **Randomizing `ident` from within `pathmtu`.** It is assigned by the sibling `icmp` module's
+  `Socket.open` (PID for RAW, kernel ephemeral port for DGRAM); this module does not touch `icmp`'s
+  internals, so that needs `icmp` module changes.
+- **A per-probe nonce woven into the echo payload, checked on receipt.** Technically reachable within
+  `classify` without touching `icmp`, but its only benefit over the `seq` randomization is a larger guess
+  space against the *same* attacker class (blind off-path); it adds no protection against an on-path
+  attacker (the payload is as visible on the wire as the header), so it did not clear the bar for the added
+  complexity (payload construction, `classify` signature, per-attempt nonce bookkeeping). "Raises the bar
+  further against the same limited attacker" is not "closes the gap", and a module whose live path is
+  unauthenticated should not imply the latter.
+- **IPv6 Fragment Header handling beyond DF-equivalent PMTUD:** IPv6 has no DF bit;
+  `IPV6_MTU_DISCOVER=PMTUDISC_DO` is the kernel's own equivalent and is what is used.
 
-## Audit 2026-11-17 (whole-module mutation)
+## Verification
 
-394 mutants over every non-test line of `src/root.zig` and `src/hops.zig`: `query` (socket options, connect, the nudge, the cached read, the 65535 cap of the iface comparison), `applyOutcome` (every hint guard, every flag, every narrowing), `searchWith` (bounds, midpoint, the `blackhole` rule), the wire classification (`classify` for v4 and v6, `stripIpv4`, `mtuHintV4/V6`, `quotesDestination`, `isTimeExceeded`, `errHit`, `preferHit`, `ipOf`, `fromIs`), the live prober (TTL / hop limit, retries, deadlines, send errors, the destination and quote filters), `ceilingFor`, `probeFits`, the refusals and wiring of `probe` and `probeHops`, `noRoutePmtu`, `ObservedProber`, `setOptInt`, `ifaceMtu`, and the whole hop engine (`hopsWith`: every guard, flag and narrowing step, the silence / confirmation / floor-check machinery, the result fields). A schemata build per round (ReleaseSafe, runtime switch); two further attempts failed to compile in under two seconds and are not counted as builds.
+Run: `scripts/modtest pathmtu`. The loopback tests (`.loopback = true` in the build) need an ICMP socket and skip
+(`error.SkipZigTest`) where one cannot be opened. Fuzz: `PATHMTU_FUZZ=<runs>[,<first seed>] scripts/modtest pathmtu
+-Doptimize=ReleaseSafe` (testkit's deterministic driver). The kernel oracles are run by hand (`tools/README.md`):
+`zig build interop-pathmtu` re-takes the transcripts, `-- --check` compares them with the committed file,
+`-- --hops-oracle` walks live namespaces (python3, `unshare`, `ip`, `nft`, `ping`, `tracepath`; no root, nothing on
+the host changes).
 
-264 mutants died on the existing suite (7 of them as hangs), 123 survived the first round. Seven sites the first list had missed were appended (ids 388-394: `probeHops` header length and floor per family, `ipOf`). 20 tests were added (18 in `src/root.zig`, 2 in `src/hops.zig`, at the end of each file) and, of the 130 mutants run again, they kill 83:
-
-- the hop engine: four scripted paths (`ScriptPath`: per-router links, ICMP or silence above a link, silent routers, probes lost by call number, a local size limit, a TTL whose sends fail) whose complete walks (every hop's MTU, `proved`, `narrowed`, `silence_narrowed`, who answered, who narrowed, the result flags and the exact probe count) were computed by an independent port of the algorithm and picked by a greedy cover over a random search so that each mutant of the confirmation, floor-check, local-reject, send-failure, hint-boundary and silent-run logic is separated from the original; plus a hostile prober that must cost exactly `max_steps_per_hop` probes per TTL;
-- the wire pieces: `stripIpv4` at its exact bounds (20-byte header, IHL 6 with options, the version nibble not leaking into the length, IHL < 5), a raw v4 packet with no valid IP header refused by `classify`, `quotesDestination` and `isTimeExceeded` (it is not parsed as bare ICMP), an error of another kind carrying code 4, v6 ident/seq mismatches for replies and quotes, the whole v6 quoted destination, the first of two Time Exceeded, `fromIs`/`ipOf`;
-- live, on loopback (skipped where ICMP sockets are not available): `query` reads the loopback MTU exactly (v4 capped at 65535, v6 uncapped), `probe` starts at the family floor, takes its ceiling from `Options.iface` and reports the interface MTU with and without an observer, `probeHops` takes its ceiling from `Options.iface` and reports `timed_out`, the hop prober applies the TTL / hop limit, remembers a TTL the kernel refuses (TTL 0) and drops an Echo Reply from another address, `noRoutePmtu` sets `PMTUDISC_PROBE`, `setOptInt` reports the kernel's answer, `ifaceMtu` refuses names the 16-byte field cannot hold;
-- error precedence: with `.socket = .raw` (not openable unprivileged) the ceiling-below-floor, per-family floor, ceiling-above-buffer and empty-walk refusals of `probe` and `probeHops` must come before any socket is opened.
-
-47 do not die, none of them a defect in the code:
-
-- 12 EQUIVALENT: the hint guards `h < maxInt(u16)` (two mutants; `h < size` on a u16 already implies it); the first length check of `stripIpv4` (`packet.len < ihl` refuses the same packets); three clock-equality boundaries (`>=` against `>` on monotonic nanosecond reads); the endianness of the random start seq; an empty and a 16-character interface name (the kernel answers `NoSuchInterface` itself); `hi_silent`'s initial value in `hopsWith` (always assigned before it is read); `hi = hint` against `hint + 1` (after a hint `hi_silent` is false and `hi - lo` is 0 or 1, the same arm); the `proved` term of the narrowing confirmation (a silent failure only gets past the floor probe after that probe answered).
-- 35 UNOBSERVABLE, each needing something loopback and an unprivileged test do not have. A link narrower than the first hop or a router answering with ICMP (11: the cache nudge, the DF mode of `query`, the route-PMTU setting against a forged Fragmentation Needed in `probe` and `probeHops`, the six error-queue read and filter mutants). The wire itself (9: payload length and IP header length in `probe` and `probeHops`, the ident, the start seq, the extra probe after a walk deadline). A silent path (6: retries and timeouts in `probe` and `probeHops`, the walk's floor probe, the unit of the walk deadline). CAP_NET_RAW (3: the RAW-only header strip in both entry points and the Fragmentation Needed quote filter). A failing syscall or a small interface MTU (4: `getrandom` failing twice over, `IP_TTL` refused for a valid TTL, an EMSGSIZE send). A 15-character interface name (1) and the buffer guard in `attempt` that `ceilingFor` makes unreachable (1). The netns kernel oracle (`tools/kernel_oracle.py`, `tools/hops_oracle.py`) is what observes most of the first group (not run per mutant). The start-seq call site in `probe` / `probeHops` has no test at all (the existing test covers `randomStartSeq` only); making it observable needs a seam or a capture, recorded here rather than added.
-
-Not mutated: the comptime constants and `Options` defaults (a schemata switch cannot reach them), `meta`, the error-set mappings of `probe`/`probeHops` after the socket open (`PermissionDenied`, `AddressFamilyUnsupported`, the `hopsWith` error arms that the up-front checks make unreachable), formatting and doc comments. Counts on the card are whole-module.
-
-Delta, same day: the v6 cap defect (see Backlog, closed) was fixed. `query`'s comparison moved into `cacheIsException(family, mtu, im)`; the four old mutants on the two removed lines (cap dropped, cap 65536, assignment skipped, comparison inverted) were replaced by six on the new code (assignment skipped, family forced to v4, v4 cap dropped, v4 cap 65536, v6 capped, comparison inverted): all six killed by the new pure test and the live `::1` test. Card: 349/396 (394 - 4 + 6; 47 eq unchanged).
+- **Search engine, offline:** `searchWith` against a fake in-process `Prober`: exact convergence across six
+  bottlenecks that share no alignment with the search's arithmetic, with and without an ICMP hint; the well-behaved path
+  and the black hole converging to the same MTU with a different `blackhole` flag; an unreachable floor; a mixed-signal
+  path; `local_reject` and `send_failed` neutrality; forged hints (the answer is never a size that was not probed); the
+  `ceiling > floor` refusals.
+- **Wire classification:** `classify` against bytes captured from a real Linux router forwarding a DF-oversized ping onto a
+  lowered-MTU link (`real_v4_frag_needed`, `real_v6_packet_too_big`), whose MTU-hint fields read back exactly; the stripping,
+  quote and error-queue pieces at their exact bounds (`stripIpv4`, `quotesDestination`, `isTimeExceeded`, `errHit`).
+- **Hop engine:** scripted paths (`ScriptPath` in `src/hops.zig`: per-router links, ICMP or silence above a link, silent
+  routers, lost probes, a local size limit, a TTL whose sends fail) whose complete walks were computed by an independent
+  port of the algorithm; a hostile prober that must cost exactly `max_steps_per_hop` probes per TTL.
+- **Kernel replay:** `src/kernel_oracle_test.zig` replays real kernels' transcripts (`tools/interop.zig` +
+  `tools/kernel_oracle.py` -> `src/kernel_oracle_vectors.zig`); see Anchoring.
+- **Live, on loopback:** `query` reads the loopback MTU (IPv4 capped at 65535, IPv6 uncapped); `probe` starts at the family
+  floor and takes its ceiling from `Options.iface`; `probeHops` reports `timed_out`; the route-PMTU mode is set on the probing
+  socket; refusals come before any socket is opened (ceiling below the floor, above the buffer, an empty walk).
+- **No-panic sweep:** `src/sweep_test.zig` (extreme floor, ceiling, `max_hops` and silence counts).
+- **Fuzz:** four harnesses under `PATHMTU_FUZZ`: `classify`, `classify` over mutated inputs, the hop engine, the
+  error-queue classification; each with a reach check that every outcome label is hit.
+- **Mutation:** a whole-module schemata run (ReleaseSafe, runtime switch) over every non-test line of `src/root.zig` and
+  `src/hops.zig`: `query`, `applyOutcome`, `searchWith`, the wire classification, the live prober, `ceilingFor`,
+  `probeFits`, the refusals and wiring of `probe` and `probeHops`, `noRoutePmtu`, `ObservedProber`, `setOptInt`, `ifaceMtu`
+  and the whole hop engine. Not mutated: the comptime constants and `Options` defaults (a schemata switch cannot reach
+  them), `meta`, the error-set mappings after the socket open that the up-front checks make unreachable, formatting and
+  doc comments. Equivalent mutants: the hint guards `h < maxInt(u16)` (`h < size` on a `u16` already implies it); the first
+  length check of `stripIpv4` (`packet.len < ihl` refuses the same packets); three clock-equality boundaries (`>=` against
+  `>` on monotonic nanosecond reads); the endianness of the random start seq; an empty and a 16-character interface name (the
+  kernel answers `NoSuchInterface` itself); `hi_silent`'s initial value in `hopsWith` (always assigned before it is read);
+  `hi = hint` against `hint + 1` in `hopsWith` (after a hint `hi_silent` is false and `hi - lo` is 0 or 1, the same arm);
+  the `proved` term of the narrowing confirmation (a silent failure only gets past the floor probe after that probe
+  answered). The mutants no loopback, unprivileged test can observe are listed under *Open*.
+- **Constant time:** n/a — PMTU probing, no secret.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Performance:** n/a (see the card).
 
 ## Backlog / deferred
-- **Packetization-layer PMTUD (RFC 4821 / RFC 8899)**: REJECTED for this module (2026-11-03). It needs a cooperating transport (a peer that echoes UDP/QUIC probes); no sibling module is one (`ls modules`: `icmp`, `probe`, `traceroute`, `quic-crypto` only). `probe` detects the black hole (`blackhole = true`) and still finds a number. Revisit if a transport module appears.
-- **Next-hop MTU on the ping-socket (DGRAM) lane**: `icmp.Socket.ErrInfo` does not carry `sock_extended_err.ee_info`, which is the MTU a Fragmentation Needed reports. `probe` and `probeHops` read the error-queue entry (type, code, offender) and bisect without a hint, so results are exact but cost about 11 probes per narrowing. Needs an `ErrInfo.info` field in `icmp` (request in the report, not filed from here).
-- **Wall-clock bound of `probe`** *(sweep GX, 2026-10-31)*: about 17 sizes x (`retries` + 1) x `timeout_ms`, caller parameters. `probeHops` has `Options.deadline_ms` (default 2 minutes); `probe` has none yet, add one only if a consumer forwards the values (the router-tool consumer's core passes 2 / 1000).
-- **Rate-limited or lossy routers** *(2026-11-03)*: a router that limits its Time Exceeded / Fragmentation Needed answers (Linux: 1 per second per peer after a burst) looks silent, and silence is how a black hole looks too; the walk may then report a smaller MTU than the link (found while building the oracle: 1398 for a 1400 link until the routers' limit was lifted). The result does not claim certainty: a size that got no answer is re-probed once before it is believed, the hop is marked `silence_narrowed`, the result `uncertain` (the estimate carries to every later hop), and `blackhole` is evidence, not proof. Keep `retries` above 0; a smarter backoff is not built.
-- **Spoofed Fragmentation Needed and the route PMTU** *(2026-11-03, reproduced)*: a forged Frag-Needed / Packet-Too-Big quoting a live UDP socket's datagram lowers the kernel's cached PMTU for the destination for about 10 minutes (`ip route get` shows it), and a later socket to that destination inherits it. With `PMTUDISC_DO` later sends then fail locally with `EMSGSIZE`, which narrows the search with no router answering. Measured on a clean 1500 path, Linux 7.0, both socket kinds: with the protection removed `probe` and every hop read 1000 (v4) and 1300 (v6). `probe` and `probeHops` set `IP_PMTUDISC_PROBE` / `IPV6_PMTUDISC_PROBE` on their own socket, so the cached value is not consulted, and read 1500; `hops_oracle.py`, scenarios `*-forged-route-pmtu`, which refuse to run unless the forgery really lowered the route. `query` still reads the cached value: that is its job. The forgery needs the victim's 4-tuple; the scenario gives it to the forger. Forged ICMP that reaches the socket as a datagram or error-queue entry is still accepted on ident+seq (see the threat model). ✅ DONE 2026-11-03 (`IP_PMTUDISC_PROBE`/`IPV6_PMTUDISC_PROBE` set at modules/pathmtu/src/root.zig:1135-1136, asserted by a test, forged-route scenarios in the hops oracle, commit 1a534d6c6).
-- **A multi-homed destination** *(2026-11-03)*: `probeHops` takes an Echo Reply only from the exact address it probed (anything else could be a spoof). A reply from another address of the same host is dropped; the caller sees silence at that hop, `reached == false`, and a walk ended by `max_silent_hops` or the deadline. Matching is not widened.
-- **Per-hop black-hole attribution**: the walk flags `blackhole` when a floor-sized probe is answered where a larger one is not, at any hop, and does not name the hop beyond its position in `hops`.
-- *(closed 2026-11-17)* **`query` over IPv6 on a loopback with MTU above 65535**: `IPV6_MTU` reads the interface MTU uncapped (65536 on `lo`) but `query` compared it with `min(iface_mtu, 65535)`, the cap of `IP_MTU`, so `query(::1, .{ .iface = "lo" })` reported `cache_is_exception = true` with no exception. Fixed: the comparison is capped for IPv4 only (`cacheIsException`); the IPv6 link MTU is a 32-bit quantity (RFC 8200 allows jumbograms), the kernel returns it as is. Pinned by a pure test of both families and by the live `::1` test.
+
+- **Next-hop MTU on the ping-socket (DGRAM) lane:** `icmp.Socket.ErrInfo` now carries `ee_info` (`sock_extended_err.ee_info`,
+  the MTU a Fragmentation Needed reports), but `probe` and `probeHops` read only the error-queue entry's type, code and
+  offender (`src/root.zig:774`), so they bisect without a hint: results are exact but cost about 11 probes per narrowing. Plan:
+  read `ee_info` where the entry arrives and feed it as the hint.
+- **A wall-clock bound for `probe`:** add one (as `probeHops` has `Options.deadline_ms`) only if a consumer forwards the
+  `timeout_ms` and `retries` values that make the worst case long.
+- **Backoff for rate-limited routers:** a smarter backoff than the single re-probe is not built (see the per-hop walk design note).
 
 ## Open
 
-Nothing else known missing or unverified beyond what's stated above.
+- **The start-seq call site in `probe` / `probeHops` has no test** (the existing test covers `randomStartSeq` only); making it
+  observable needs a seam or a capture.
+- **Mutants that loopback and an unprivileged test cannot observe** (counted in the card's open total, not defects): a link
+  narrower than the first hop or a router answering with ICMP (the cache nudge, the DF mode of `query`, the route-PMTU setting
+  against a forged Fragmentation Needed in `probe` and `probeHops`, the error-queue read and filter); the wire itself (payload
+  and IP header length, the ident, the start seq, the extra probe after a walk deadline); a silent path (retries and timeouts,
+  the walk's floor probe, the unit of the walk deadline); CAP_NET_RAW (the RAW-only header strip, the Fragmentation Needed quote
+  filter); a failing syscall or a small interface MTU (`getrandom` failing twice, `IP_TTL` refused for a valid TTL, an
+  `EMSGSIZE` send). The netns kernel oracles observe most of the first group; they are not run per mutant.

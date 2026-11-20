@@ -115,7 +115,7 @@ that hop (never a router's claim taken on trust); it is not set for a silent hop
 an exhausted step budget or a send that failed. `h.silence_narrowed` and
 `walk.uncertain` mark an estimate lowered by silence alone (loss and rate limits
 look like a black hole), `walk.timed_out` a walk ended by `deadline_ms`. Without a next-hop MTU (the unprivileged
-ping socket gets none) the size is bisected, so the answer is exact either way.
+ping socket's is not read yet) the size is bisected, so the answer is exact either way.
 A router that rate-limits its ICMP errors can look silent; keep `retries` above 0.
 A reply from another address of a multi-homed destination is dropped (the
 walk then shows silence and `reached == false`). The walk allocates nothing, and is bounded by `max_hops`, the output slice,
@@ -128,7 +128,7 @@ substitute a different transport if ever needed.
 
 ## Tests
 
-`zig build test-pathmtu` — the binary-search algorithm itself
+`scripts/modtest pathmtu` (or `zig build test-pathmtu`) — the binary-search algorithm itself
 (`searchWith`) against a fake, in-process `Prober`: exact convergence with
 and without an ICMP MTU hint, the well-behaved-path-vs-black-hole
 distinction converging to the *same* MTU with a *different* `blackhole`
@@ -138,21 +138,13 @@ captured from a real Linux router forwarding a DF-oversized ping onto a
 genuinely lowered-MTU link (a `veth` pair in an unprivileged network
 namespace) — see SPEC.md "Anchoring" for the full method, including how the
 kernel-cache blind spot itself was verified live. `probe`/`query` against
-loopback are live-gated (`error.SkipZigTest` without the needed privilege).
+loopback are live-gated (`error.SkipZigTest` without the needed privilege). The hop engine, a replay of real
+kernels' transcripts and a fuzz driver (`PATHMTU_FUZZ=<runs>`) run in the same lane; the live namespace oracle
+for `probeHops` (`zig build interop-pathmtu -- --hops-oracle`) is run by hand. SPEC *Verification* lists it all.
 
-## Not done, and why
+## Not provided
 
-- Packetization-layer PMTUD (RFC 4821 / RFC 8899): it needs a cooperating
-  transport (a QUIC or UDP peer that echoes probes). No sibling module is such a
-  transport; `probe` still names the ICMP black hole it cannot see through.
-- Reading the next-hop MTU on the ping-socket lane: `icmp.Socket.ErrInfo` does
-  not expose `ee_info`; requested from the `icmp` module.
-
-## Deferred
-
-- Automatic egress-interface resolution (no route lookup) — `Options.iface`
-  is caller-supplied.
-- IPv6 Fragment Header handling beyond DF-equivalent PMTUD (IPv6 has no DF
-  bit; `IPV6_MTU_DISCOVER=PMTUDISC_DO` is the kernel's own equivalent, used
-  here).
-- Continuous/background PMTU monitoring — `probe` is a one-shot discovery.
+Packetization-layer PMTUD (RFC 4821 / RFC 8899), automatic egress-interface resolution (`Options.iface` is
+caller-supplied), continuous monitoring and non-Linux platforms are not provided; the reasons are in SPEC *What is
+deliberately not done*. Open items (the next-hop MTU on the ping-socket lane, a wall-clock bound for `probe`) are in
+SPEC *Backlog / deferred*.
