@@ -23,22 +23,10 @@
 ## What this module is, and what it is not
 
 A small wrapper over blocked-mask + `signalfd` for the process's own stop signals
-(consumer request 2026-11-15; before it, three consumer programs wrote the same
-code by hand). Wanted by a daemon that waits for SIGTERM/SIGINT, flushes state and
-exits 0.
+(written because three consumer programs had each hand-written the same code). Wanted
+by a daemon that waits for SIGTERM/SIGINT, flushes state and exits 0.
 
-Not provided, and why:
-
-- **A global handler / "flag" set from `sigaction`.** The flag form is `poll()` on the
-  signalfd; no handler state is global, so two components cannot trample each other's
-  handler. A caller that needs async-signal-safe handler behaviour (e.g. interrupting
-  a syscall in a thread that cannot block the signal) needs `sigaction` and is not served.
-- **Real-time signals, SIGCHLD, SIGALRM, SIGPIPE, synchronous signals (SIGSEGV...).**
-  Not stop signals; the `Signo` enum is closed on purpose.
-- **Windows (`SetConsoleCtrlHandler`), macOS/BSD (`kqueue` EVFILT_SIGNAL).** Not now:
-  `init` returns `error.Unsupported` there.
-- **Escalation policy** (second Ctrl-C kills at once, grace timers). The caller decides
-  what to do with each `Signo`; call `wait`/`poll` again for the next one.
+Linux only; the signals are SIGTERM and SIGINT by default, SIGHUP, SIGQUIT, SIGUSR1 and SIGUSR2 opt-in. What is refused on purpose is in *What is deliberately not done*; what is missing but possible is in *Backlog / deferred*.
 
 ## Threading contract
 
@@ -53,16 +41,15 @@ Not provided, and why:
   and `poll` reads only after a zero-timeout `poll(2)` says data is ready; a second
   reader taking the record in between would make `poll` block.
 
-## Finding: the blocked mask crosses `fork`/`exec`
+
+## Inheritance across `fork`/`exec`
 
 A child inherits the spawning thread's signal mask across `fork`/`exec`, so a child
 spawned by a program holding a `StopSignals` would start with SIGTERM/SIGINT blocked
-and could be stopped only by SIGKILL. Found 2026-11-15 in procrun's vfork spawner,
-which restored the parent's mask in the child; fixed there the same day:
-`procrun.Spec.reset_signal_mask` (default `true`, as Go's `os/exec` and Rust's
-`Command`) starts the child with an empty mask. `std.process.spawn` (fork path) still
-passes the mask on; a caller with its own spawn or pre-exec step unblocks
-`childMask()` there.
+and could be stopped only by SIGKILL. `procrun.Spec.reset_signal_mask` (default
+`true`, as Go's `os/exec` and Rust's `Command`) starts the child with an empty mask.
+`std.process.spawn` (fork path) still passes the mask on; a caller with its own spawn
+or pre-exec step unblocks `childMask()` there.
 
 ## Limits and refusals
 
@@ -74,35 +61,35 @@ passes the mask on; a caller with its own spawn or pre-exec step unblocks
 - No panic is reachable from the public API: syscall failures are errors; an unknown
   signal number in a record (cannot happen for a signalfd limited to the set) is
   `error.Unexpected`.
+- `deinit` called twice is a no-op; `poll`/`wait` after `deinit` return `error.Unexpected`
+  (the descriptor is -1, so no unrelated descriptor is touched). Pinned by the test "deinit
+  twice, and use after deinit, never touch another descriptor".
+- Not Linux: `init`, `poll` and `wait` return `error.Unsupported` (compile-checked for
+  x86_64-windows and x86_64-macos; not run there).
+- Overlapping instances must be `deinit`ed in LIFO order; an instance blocks only what it
+  moved from unblocked to blocked, so a signal blocked beforehand stays blocked.
+- A signal ignored at start (`nohup`, a background job) is still queued while blocked, so it
+  is delivered to `wait`/`poll`, as with Go's `signal.Notify`; the disposition is never touched.
+- `wait` returns only signals of the set; a signal outside the set keeps its disposition and
+  `wait` blocks (until cancelled, `error.Canceled`) if none arrives.
+- `deinit` from another thread unblocks that thread's mask only and leaves the `init` thread's
+  mask blocked (documented caller bug).
 
-**Audit 2026-11-15 (delta mutation, hardening).** 14 schemata mutants over the lines changed by the
-hardening: the `deinit` hardening stores (fd, `newly_blocked`, `mask`) and its non-Linux early return,
-`poll`'s non-Linux return and its closed-descriptor guard (dropped, boundary, error value), `wait`'s
-non-Linux return, and `wait`'s unmodelled-errno mapping, ReleaseSafe, one build. First run: 9 killed,
-5 survived. One new test: a second `deinit` after another party blocked a signal must not unblock it
-(`newly_blocked` emptied); rerun killed it, 10 killed. Not killed, 4: the `mask` clear in `deinit`
-is EQUIVALENT (the field has no reader after `deinit`); UNOBSERVABLE, each with its injection: the
-error values of the two non-Linux returns (`Unsupported`; needs a non-Linux target) and `fd_ < 0`
-against `fd_ <= 0` (needs `init` to hand back descriptor 0, a process started with stdin closed).
-60/70 cumulative; 10 eq (6 + 4).
+Behaviour on hostile calls (no entry point reaches `unreachable`, `assert`, an `@intCast` of a
+caller value or an allocation; the module allocates nothing):
 
-**Audit 2026-11-15 (delta mutation, whole module).** 56 schemata mutants over `src/root.zig`, ReleaseSafe, one build, each
-mutant under `setsid -w timeout` and `ulimit -v`: `Set.any` (each member dropped), `init`'s empty-set refusal,
-each `sigaddset` (dropped, wrong signal), `Signo.sig` (each arm swapped), `fromRaw`, the mask arithmetic
-(`newly_blocked` as the whole mask, the subtraction inverted or skipped), the `sigprocmask` result, `SFD_CLOEXEC`,
-the signalfd failure path (guard, unblock, both error mappings), `deinit` (unblock skipped, wrong operation, close
-skipped, poisoning skipped), `childMask`, the `mask` field, `poll` (events, timeout, ready test, size, error arms) and
-`wait` (blocking hint, short read, unmodelled number, both error arms). The tests written with the list (close-on-exec
-and closed by `deinit`, `childMask` against `mask` with a signal blocked beforehand, an fd limit refusal giving
-`SystemResources` with the mask restored) plus two found by the first run: a pipe-fed `poll`/`wait` that injects
-records the kernel never delivers (a modelled signal, an unmodelled one, a short read whose first four bytes name a
-signal, a closed descriptor) and a cancelled `wait` giving `error.Canceled`. Rerun: 50 killed (2 by a hang).
-Left: poisoning `*self` in `deinit` is EQUIVALENT (a hardening store nothing reads). UNOBSERVABLE, each with the
-injection it would need: the `else` arm of the failure mapping (an errno other than the resource ones, needs a
-syscall fault injector); `EINTR` retries in `poll` and `read` (neither call can return `EINTR` on a ready,
-non-blocking-timeout fd; needs seccomp errno injection); `EAGAIN` after a ready `poll` (needs a second reader
-racing the first, which the contract forbids); the `nonblocking` hint of `wait` (matters only to an evented `Io`;
-`testing.io` is the threaded one). 50/56; the score counts the unobservable ones with the equivalents (6 eq): 1 equivalent, 5 unobservable.
+| Entry | Hostile case | Result |
+|---|---|---|
+| `init` | set already blocked | works; nothing newly blocked; `deinit` leaves them blocked |
+| `init` | fd limit reached | `error.SystemResources`, mask restored |
+| `poll` | descriptor closed behind its back | `error.Unexpected` (`EBADF` from the read) |
+| `poll` | short or unmodelled record | `error.Unexpected` |
+| `wait` | closed fd, short record, unmodelled number | `error.Unexpected` |
+| `fd`, `childMask` | any state | plain field reads, total |
+
+Caller-contract violations left as documented: two readers at once (the second may block
+in `poll`'s read if it loses the race, the descriptor is blocking) and a copied struct
+after `deinit`.
 
 ## Compared with
 
@@ -126,79 +113,46 @@ There is no performance axis here, so no row is marked **fastest**.
 **Where we are ahead:** the only Zig module for this; no handler, no global state, so two components cannot
 trample each other's disposition (Go and signal-hook install a process-wide handler); the arrival is an ordinary
 value (`wait` cancelable through `std.Io`, `poll`, `fd` for epoll). **Where we are behind:** Linux only; a
-closed signal set; one subscriber; no disposition control; no sender information (each below, with a verdict).
+closed signal set; one subscriber; no disposition control; no sender information (see *What is deliberately not done* and *Backlog / deferred*).
 
-## Backlog / deferred
+## What is deliberately not done
 
-Verdicts of the 2026-11-15 survey; nothing here was implemented (each is new API; main decides).
+- **A global handler / "flag" set from `sigaction`.** The flag form is `poll()` on the
+  signalfd; no handler state is global, so two components cannot trample each other's
+  handler. A caller that needs async-signal-safe handler behaviour (e.g. interrupting
+  a syscall in a thread that cannot block the signal) needs `sigaction` and is not served.
+- **Real-time signals, SIGCHLD, SIGALRM, SIGPIPE, synchronous signals (SIGSEGV...), any
+  signal number (tokio `from_raw`, nix `SigSet`, libuv).** Not stop signals, and the closed
+  `Signo` keeps `error.Unexpected` unreachable in practice. A caller that needs `SIGRTMIN+n`
+  uses the fd and `signalfd(2)` itself.
+- **More than one subscriber (Go, tokio, libuv).** The kernel queue is one per signalfd and a
+  signal is consumed by the first reader. A fan-out is a layer on top (one reader thread, a
+  channel); a caller can also open two instances with disjoint sets.
+- **`Ignore` / `Reset` (Go).** Disposition changes are `std.posix.sigaction`, and mixing them
+  with a blocked-mask design would hide which one wins.
+- **Escalation policy** (second Ctrl-C kills at once, grace timers; signal-hook
+  `register_conditional_shutdown`). The caller decides what to do with each `Signo`; call
+  `wait`/`poll` again for the next one.
 
-- **Sender pid/uid (`signalfd_siginfo.pid/uid`) — missing and it matters a little.** nix exposes it; a daemon can log
-  "stopped by pid 1 (systemd)" vs "by a user". Proposed: `waitInfo`/`pollInfo` returning `Info{ signo, pid, uid }`,
-  `wait`/`poll` unchanged. Effort S.
-- **A non-blocking descriptor option (`SFD_NONBLOCK`) — missing, small.** `fd()` is blocking so `wait` can go through
-  `std.Io`; a caller's own epoll loop must read only after readiness (which is how epoll is used). A
-  `Options.nonblocking` would serve a loop that polls the fd optimistically; it would turn `wait` into an evented
-  read. Effort S; deferred until a consumer asks.
-- **More than one subscriber (Go, tokio, libuv).** Rejected for the instance: the kernel queue is one per signalfd and
-  a signal is consumed by the first reader. A fan-out is a layer on top (one reader thread, a channel); a caller can
-  also open two instances with disjoint sets.
-- **Any signal number / real-time signals (tokio `from_raw`, nix `SigSet`, libuv).** Rejected: not stop signals, and
-  the closed `Signo` keeps `error.Unexpected` unreachable in practice. A caller that needs `SIGRTMIN+n` uses the fd
-  and `signalfd(2)` itself.
-- **`Ignore` / `Reset` (Go).** Rejected: disposition changes are `std.posix.sigaction`, and mixing them with a
-  blocked-mask design would hide which one wins.
-- **Windows (`SetConsoleCtrlHandler`) and macOS/BSD (`kqueue` `EVFILT_SIGNAL`).** Deferred with a reason: no consumer;
-  tokio `ctrl_c` and libuv have it, so this is the one gap a user of those would hit. `init` returns `error.Unsupported`.
-- **Escalation (second signal terminates, signal-hook `register_conditional_shutdown`).** Rejected, the caller's
-  policy (see above).
-- **A `NotifyContext` helper (cancel an `Io.Group`/`Future` on the first signal).** Deferred: a few lines over `wait`
-  in the caller's `main`; revisit when a second consumer writes it the same way.
+## Verification
 
-## Review 2026-11-15 (independent read of `src/root.zig`, not by its author)
+`scripts/modtest stopsignal`. The tests send signals to the test's own thread (`tgkill`)
+and read them back through the module; expected values are the kernel's behaviour as
+documented in `signalfd(2)`. Classes: each `Signo` round trip; the same signal sent twice
+coalesces into one; `init` with the set already blocked, with a pending outside signal and
+with a signal ignored at start; close-on-exec and closure by `deinit`; `childMask` against
+`mask`; an fd limit refusal giving `SystemResources` with the mask restored; a second
+`deinit` after another party blocked a signal must not unblock it; `deinit` twice and use
+after `deinit`; a pipe-fed `poll`/`wait` that injects records the kernel never delivers (a
+modelled signal, an unmodelled one, a short read, a closed descriptor); a cancelled `wait`
+giving `error.Canceled`. No fuzz harness: the only input is a fixed-size kernel record
+read from a signalfd limited to the set.
 
-Read for: mask handling per thread, `newly_blocked`, `deinit`, signalfd lifecycle, `wait` through `std.Io`,
-`poll` races, error mapping, non-Linux behaviour, doc truthfulness. Found and fixed:
-
-1. `poll`/`wait` named in the docs as `Unsupported` off Linux, but only `init` was guarded: calling `wait` on a
-   Windows target did not compile (`std.Io.File` takes a `HANDLE`, not an fd). Now guarded (cross-compile checked for
-   x86_64-windows and x86_64-macos, with every pub fn referenced).
-2. `deinit` poisoned the struct with `undefined`: a second `deinit` closed a random descriptor number, in ReleaseFast
-   possibly one a later `open` had received. It now stores `fd_ = -1` and empty masks, so a repeated `deinit` is a
-   no-op, `wait` gets `EBADF` (`error.Unexpected`) and `poll` returns `error.Unexpected`. Test: "deinit twice, and use
-   after deinit, never touch another descriptor".
-3. Doc gaps that a reader hits: overlapping instances must be `deinit`ed LIFO; a signal ignored at start (`nohup`,
-   background job) is delivered once blocked; `wait` never returns a signal outside the set. Added to the module header,
-   each with a test (init with the set already blocked, a pending outside signal, an ignored-at-start SIGHUP).
-
-Checked and found correct: `newly_blocked = mask & ~old` (so a signal blocked beforehand stays blocked); the mask is
-restored on every `init` failure path; the kernel queues a blocked signal even when its disposition is `SIG_IGN`
-(`sig_ignored` returns false for blocked signals), so the `nohup` case is real; `signalfd` records are read whole or
-refused; `poll`'s zero-timeout check plus read cannot block with a single reader; `EAGAIN` after a ready `poll`
-returns `null`. Not changed (documented): `deinit` from another thread leaves the `init` thread's mask blocked.
-
-## No-panic sweep 2026-11-15
-
-Every pub entry point, with hostile inputs and states; none reaches `unreachable`, `assert`, an `@intCast` of a
-caller value or an unbounded allocation (the module allocates nothing):
-
-| Entry | Hostile case | Result |
-|---|---|---|
-| `init` | empty set | `error.EmptySet` |
-| `init` | every signal already blocked / set already blocked | works; `newly_blocked` empty; `deinit` leaves them blocked (test) |
-| `init` | fd limit reached | `error.SystemResources`, mask restored (test) |
-| `init` | not Linux | `error.Unsupported` |
-| `init` | second instance, overlapping set | works; LIFO `deinit` documented |
-| `deinit` | called twice | no-op (test) |
-| `deinit` | from another thread | unblocks that thread's mask only, documented |
-| `poll` | after `deinit` (fd -1), or a descriptor closed behind its back | `error.Unexpected` (first: test; second: `EBADF` from the read, by inspection) |
-| `poll` | short or unmodelled record | `error.Unexpected` (pipe-fed test) |
-| `wait` | signal outside the set | blocks until cancelled, `error.Canceled` (test) |
-| `wait` | closed fd, short record, unmodelled number | `error.Unexpected` (tests) |
-| `wait`/`poll` | not Linux | `error.Unsupported` (compile-checked) |
-| `fd`, `childMask` | any state | plain field reads, total |
-
-Caller-contract violations left as documented (class 2): two readers at once (the second may block in `poll`'s read
-only if it loses the race — the fd is blocking), a copied struct after `deinit`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over
+  the last whole-module mutation run and the delta runs after it. The survivors are
+  equivalent or unobservable (a hardening store nothing reads; error values of the
+  non-Linux returns; `EINTR` retries; `EAGAIN` after a ready `poll`; the `nonblocking`
+  hint of `wait`, which matters only to an evented `Io`).
 
 ## Anchoring
 
@@ -209,6 +163,22 @@ the test sends the signal to the test's thread and reads the same signal back.
 
 ## Open
 
-- Non-Linux targets compile (x86_64-macos and x86_64-windows, 2026-11-15) to `error.Unsupported` but have not been run.
-- The card's `src` hash and the Grade line are stale after this review's source changes; refresh with `gen-catalog`,
-  and a delta mutation over the new `poll`/`wait`/`deinit` lines is due.
+- Non-Linux targets compile to `error.Unsupported` but have not been run.
+
+## Backlog / deferred
+
+Each is new API; none is implemented.
+
+- **Sender pid/uid (`signalfd_siginfo.pid/uid`).** nix exposes it; a daemon can log
+  "stopped by pid 1 (systemd)" vs "by a user". Proposed: `waitInfo`/`pollInfo` returning
+  `Info{ signo, pid, uid }`, `wait`/`poll` unchanged. Effort S.
+- **A non-blocking descriptor option (`SFD_NONBLOCK`).** `fd()` is blocking so `wait` can go
+  through `std.Io`; a caller's own epoll loop must read only after readiness (which is how
+  epoll is used). An `Options.nonblocking` would serve a loop that polls the fd
+  optimistically; it would turn `wait` into an evented read. Effort S; deferred until a
+  consumer asks.
+- **Windows (`SetConsoleCtrlHandler`) and macOS/BSD (`kqueue` `EVFILT_SIGNAL`).** No consumer;
+  tokio `ctrl_c` and libuv have it, so this is the one gap a user of those would hit. `init`
+  returns `error.Unsupported`.
+- **A `NotifyContext` helper (cancel an `Io.Group`/`Future` on the first signal).** A few lines
+  over `wait` in the caller's `main`; revisit when a second consumer writes it the same way.

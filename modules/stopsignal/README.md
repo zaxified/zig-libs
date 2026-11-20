@@ -40,9 +40,12 @@ while (true) {
   (`Spec.reset_signal_mask`); a program with its own spawn or pre-exec step unblocks
   this set in the child before `exec`.
 
-Not Linux: `init` returns `error.Unsupported`. Details and refusals: [SPEC.md](SPEC.md).
+Not Linux: `init`, `poll` and `wait` return `error.Unsupported`. Details and refusals: [SPEC.md](SPEC.md).
+
+## Not provided
+
+A signal handler, real-time or non-stop signals, several subscribers per signal, disposition control and escalation policy are refused on purpose; sender pid/uid, a non-blocking descriptor option and Windows/macOS support are open. See SPEC *What is deliberately not done* and *Backlog / deferred*.
 
 Provenance: clean-room from the Linux `signalfd(2)` and `sigprocmask(2)` man pages; the
 API shape follows Go's `os/signal` and tokio's `signal::unix` (public documentation only,
-no third-party source ported or studied), so no `NOTICE` entry is required (root
-[`NOTICE`](../../NOTICE) §0).
+no third-party source ported or studied), so there is no `NOTICE` file.
