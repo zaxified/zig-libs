@@ -13,18 +13,15 @@ verifier while revealing only a chosen subset of attributes in zero knowledge
 (the credential itself and the undisclosed attributes stay hidden, and repeated
 shows are unlinkable).
 
-> **Status: Phase 1 — COMPLETE.** The mechanical layer (pairing/curve plumbing,
-> threshold keygen, Lagrange-in-exponent verification-key aggregation, wire
-> codecs, and the `psSignWithSecret`/`psVerifyPlain` PS oracles) is real and
-> tested. The four irreducible cores — `signPartial`, `aggregateCredential`,
-> `proveCredential`, `verifyCredential` — are implemented behind
-> `gate.fable_core_implemented` (now `true`). The end-to-end anchor
-> (threshold-issue → aggregate → show → verify) PASSES and the NIZK-soundness
-> controls (tampered credential/κ/ν/σ', mutated challenge, wrong disclosed
-> value, forged undisclosed attribute) all REJECT; the `BrokenCoconut` positive
-> control and every mechanical unit test also pass. See `SPEC.md` for the
-> construction, the full Fiat-Shamir transcript element list, the
-> Fable-vs-mechanical split, the tier finding, and the deferred increments.
+> Public-attribute issuance (every authority sees every attribute); selective disclosure at show time
+> is complete. The four cores — `signPartial`, `aggregateCredential`, `proveCredential`, `verifyCredential` —
+> are implemented behind `gate.fable_core_implemented` (`true`). See `SPEC.md` for the construction, the full
+> Fiat-Shamir transcript, the tier finding and the backlog.
+
+## Not provided
+
+Blind issuance (private attributes hidden from the issuing authorities, paper §4.3) and dealer-free key generation
+(`keygen` is a trusted dealer). `SPEC.md`, *Backlog / deferred*, has the plan.
 
 ## API
 
@@ -86,18 +83,10 @@ no consumer needs a deterministic issuance. This module's own tests use
 `keygenSeededForTest` / `proveCredentialSeededForTest`; the names are the
 signal, and there is no seeded option on the production functions.
 
-`std.Io.randomSecure` is the fail-closed alternative to `std.Io.random`
-(errors/aborts instead of degrading). Whether this module's secret draws
-should fail closed was an open decision tracked in the project backlog; it is
-now closed (`CONVENTIONS.md` §2.2) and, per the paragraph above, this module
-already meets it — through `bls12_381`'s `Fr.random`, not by importing
-`entropy` directly.
-
 ## Verify
 
 ```
-zig build test-coconut                     # Debug
-zig build test-coconut -Doptimize=ReleaseFast
+scripts/modtest coconut
 ```
 
 Provenance: clean-room from the Coconut NDSS 2019 paper (a public academic
