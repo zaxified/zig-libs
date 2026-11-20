@@ -43,7 +43,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [zigzap/zap](https://github.com/zigzap/zap) `serveStatic` | Zig over C (facil.io) | MIT | 3.4k | v0.11.0 (2025-08-28); **archived** | Static example server via C facil.io; the repo is archived and points to a pure-Zig successor. Not a pure-Zig option any more. |
 | Zig `std.http` | Zig | MIT | — | Zig 0.16.0 | No static file handler at all (server primitives only). |
 
-**Where we are ahead:** two-layer containment with a symlink policy and `openat2(RESOLVE_BENEATH)`, tested against real escaping symlinks; a **strong content-hash ETag** in `Snapshot`/`Live` (SHA-256, resumable ranges) where Go/nginx use size+mtime; `Snapshot`/`Live` serve from held descriptors with **zero syscalls per request** (sandbox/Landlock friendly) and `Live` republishes lock-free; precompressed `.br/.zst/.gz` with `Vary`; RCU-style generations with tested descriptor accounting; audited and mutation-tested (2026-09-10). **Where we are behind:** no multi-range `multipart/byteranges` (deliberately refused as an amplification vector), no content sniffing for unknown extensions (embedded table of ~70 types), no zero-copy `sendfile` (64 KiB read loop).
+**Where we are ahead:** two-layer containment with a symlink policy and `openat2(RESOLVE_BENEATH)`, tested against real escaping symlinks; a **strong content-hash ETag** in `Snapshot`/`Live` (SHA-256, resumable ranges) where Go/nginx use size+mtime; `Snapshot`/`Live` serve from held descriptors with **zero syscalls per request** (sandbox/Landlock friendly) and `Live` republishes lock-free; precompressed `.br/.zst/.gz` with `Vary`; RCU-style generations with tested descriptor accounting; audited and mutation-tested (2026-09-10). **Where we are behind:** no multi-range `multipart/byteranges`, no content sniffing for unknown extensions (embedded table of ~70 types), no zero-copy `sendfile` (64 KiB read loop); the first two are refused on purpose (see *What is deliberately not done*).
 
 ## 1. Path-traversal threat model
 
@@ -74,9 +74,9 @@ A **trailing slash** says the request names a DIRECTORY (`namesDirectory`: the d
 in `/`, ignoring trailing `.` segments — `/a.txt/`, `/a.txt%2f`, `/a.txt/.`). Layer 1 drops that
 slash, so the serve paths (`Handler.serve`, `resolveFile`, `Snapshot`/`Live`) carry the fact
 separately and open the leaf as a directory only: a regular file there is **404** (POSIX
-`ENOTDIR`, nginx, Apache), never the file. Until 2026-10-05 `/secret.txt/` was served as
-`/secret.txt`, so an exact-path rule in a proxy in front was bypassed by one character (found by
-the Go `net/http` oracle, Anchoring).
+`ENOTDIR`, nginx, Apache), never the file. Serving `/secret.txt/` as `/secret.txt` would let one
+added character bypass an exact-path rule in a proxy in front (found by the Go `net/http` oracle,
+Anchoring).
 
 Note: `%2f` decodes to a real `/` — after decoding it is a genuine segment separator, not a
 traversal (a nested path like `a%2fb.txt` becomes `a/b.txt`). Because every `..` is rejected
@@ -110,8 +110,8 @@ within the root.
 
 A FIFO, device or socket is never opened (`openServable`): the leaf, an index and a precompressed
 sibling are `stat`ed first and anything but a regular file or directory is 403. Opening a FIFO with
-no writer blocks in `open(2)` forever, so until 2026-10-24 (review M3) one request per FIFO in the
-root pinned a connection thread — the `fstat` check after the open never ran. std 0.17 has no
+no writer blocks in `open(2)` forever, so one request per FIFO in the root would pin a connection
+thread — an `fstat` check after the open never runs. std 0.17 has no
 `O_NONBLOCK` open on Linux, hence the stat; a FIFO swapped in between stat and open needs write
 access to the root. `Snapshot`/`Live` only ever open entries the walk saw as regular files. A
 directory named like a variant (`app.js.br/`) is not one.
@@ -159,8 +159,8 @@ Go's `net/http` `FileServer` and nginx make, not a gap specific to this module).
 - **`Last-Modified`**: the file's mtime (`stat.mtime`), formatted as an IMF-fixdate. As an `If-Range` date it
   counts only when strong (at least one second before the response's `Date`, RFC 9110 §8.8.2.2); a file
   modified within the last second answers a date-conditioned `Range` with the full 200.
-- **`ETag`**: `"<size:hex>-<mtime_seconds:hex>"`, **weak** (`W/` prefix) by default since A1 F5
-  (round-2 Q8, 2026-09-11) — `Options.strong_etag = true` reverts to the pre-fix strong form. Weak
+- **`ETag`**: `"<size:hex>-<mtime_seconds:hex>"`, **weak** (`W/` prefix) by default (A1 F5) —
+  `Options.strong_etag = true` selects the strong form. Weak
   is the safe choice: `mtime`'s granularity is one SECOND, so a same-second, same-size edit (an
   atomic `rename` over a file of identical length) leaves a STRONG tag unchanged despite RFC 9110
   §8.8.1 requiring a strong validator to change on every representation edit — and a strong tag
@@ -170,16 +170,15 @@ Go's `net/http` `FileServer` and nginx make, not a gap specific to this module).
   a range response either. `Options.strong_etag` exists for an operator who needs resume and either
   accepts that gap or does not do same-size same-second in-place edits. Computing the tag is cheap
   either way — no file read — and it changes on any edit that moves the size or mtime. A content
-  hash (strong against same-second, same-size touches too, at the cost of reading the file) is the
-  documented alternative to `strong_etag`; it is intentionally not offered because it turns every
-  conditional GET into a full read.
+  hash is strong against same-second, same-size touches too, at the cost of reading the file:
+  `Handler` does not offer it (see *What is deliberately not done*), the `Snapshot`/`Live` content
+  tags do (§3.7).
 
 Both computed header values live in plain locals, not threadlocal scratch: the response writer's
 `setHeader` copies the bytes into its own storage at call time (`http`'s `putHeader` → `dupe`), so
-the locals only need to outlive the `setHeader` calls that pass them, not the response. (A1 F14:
-this section, and the ledger entry that cited it, previously described the opposite mechanism —
-a threadlocal buffer the writer borrows without copying — which is not what the code does or ever
-did; see `root.zig`'s own "Locals, not thread-locals" comment at the `sendFile` call site.)
+the locals only need to outlive the `setHeader` calls that pass them, not the response (see
+`root.zig`'s own "Locals, not thread-locals" comment at the `sendFile` call site). Nothing here is
+a threadlocal buffer the writer borrows.
 
 ### Conditional requests (RFC 9110 §8.8/§13)
 
@@ -211,17 +210,22 @@ slash-terminated form first (`Options.redirect_to_trailing_slash`, default true 
 round-2 Q8), matching Go `net/http` `FileServer` / nginx: `GET /sub` → `301 Location: /sub/`, query
 string preserved. The `Location` starts with exactly one `/`: `//docs` names the directory `docs`
 (empty segments are dropped), and a `Location: //docs/` would be a protocol-relative URL to the host
-`docs` — an open redirect until 2026-10-24 (review M1; Go answers with relative Locations, nginx
-merges slashes). Without this, `/sub` and `/sub/` silently served the identical content under two
+`docs`, an open redirect (Go answers with relative Locations, nginx merges slashes). Without this, `/sub` and `/sub/` silently served the identical content under two
 different URLs, and a relative link/asset inside that page resolves against whichever one the
 browser's address bar shows — correct only from the slash-terminated form. Set
-`redirect_to_trailing_slash = false` to keep the pre-fix dual serving. A plain file is never
+`redirect_to_trailing_slash = false` to serve both forms. A plain file is never
 redirected regardless of its name.
 
 Past that redirect, a directory request resolves to `Options.index` (`index.html`). With no index:
-**403** by default, or an HTML listing when `directory_listing = true`. Listing entry names are
-HTML-escaped (`& < > " '`) so a crafted filename cannot inject markup; dotfile entries are skipped
-unless `serve_dotfiles` is set.
+**403** by default, or an HTML listing when `directory_listing = true`. Each listing entry is a
+relative link (`<a href>` percent-encoded down to the RFC 3986 unreserved bytes, text HTML-escaped
+`& < > " '` so a crafted filename cannot inject markup, a `/` after a directory; as Go `FileServer`
+and nginx `autoindex` do); dotfile entries are skipped unless `serve_dotfiles` is set. The listing
+carries `Content-Type: text/html; charset=utf-8` (a failure to set it is a 500), the configured
+`Cache-Control` (likewise a 500 when it cannot be set) and best-effort `nosniff`. An I/O error
+before the first entry answers 500; one after it ends the list with a `[listing incomplete]` row (the
+status is already sent), and `Options.max_listing_entries` (default 10 000, skipped dotfiles count)
+ends it with a `[listing truncated]` row.
 
 ### Cache-Control
 
@@ -266,10 +270,13 @@ an event loop whose file opens would block a shared thread.
 Differences from `Handler`, all by construction: a symlink (any non-regular entry) is not in the
 table — 404, where `Handler` answers 403; a directory whose index is a symlink is a directory
 with no index (301 then 403, where `Handler` answers 403). No directory listing, no
-`follow_symlinks`, no SPA `fallback` (each `error.Unsupported` at `open`; the fallback was ignored
-silently until 2026-10-24). A file created after `open` is a 404; one
+`follow_symlinks`, no SPA `fallback` (each `error.Unsupported` at `open`, never ignored silently). A file created after `open` is a 404; one
 replaced by rename keeps serving the old inode until the next snapshot. `max_files` bounds the
-descriptors (`error.TooManyFiles`, never a partial table). A test serves one fixture tree through
+descriptors and `max_dirs` the directories (both `error.TooManyFiles`, never a partial table),
+`max_depth` the nesting (`error.TooDeep`). The walk reads an entry's kind from the directory entry;
+on a filesystem that reports DT_UNKNOWN (some XFS, NFS, FUSE) it classifies the entry with one
+no-follow `fstatat` (`Snapshot.realKind`, as `find`/`ftw` do; the directory listing uses it too), a
+failed stat skips the entry, and a symlink stays unserved. A test serves one fixture tree through
 both and requires the same status, body, `Location` and `ETag` for every non-symlink path,
 traversal vectors included.
 
@@ -305,8 +312,7 @@ count, `text/html;q=0` refuses) is answered with the fallback
 file: 200, the file's `Content-Type`/`ETag`/`Last-Modified`, conditional and Range rules, its
 precompressed variants when those are on. It is served at the requested URL (no trailing-slash
 redirect), with `Vary: Accept` because the same URL is a 404 to another `Accept` — and that 404 carries
-`Vary: Accept` too (review 2026-10-24 L6: a cached 404 for an API client was served to a later
-navigation). The fallback path
+`Vary: Accept` too (a cached 404 for an API client must not be served to a later navigation). The fallback path
 is resolved by the same `resolveForServe` as a request: sanitizing, no-follow walk, dotfile policy,
 containment under `follow_symlinks`; a fallback that is missing, refused, a symlink under
 no-follow, or a directory with no index leaves the ordinary 404 (a directory WITH an index serves
@@ -320,7 +326,10 @@ broken asset link is never answered with HTML. Other methods keep 405. The multi
 (SHA-256), and its `ETag` is `"` + the first 128 bits in hex + `"` — a **strong** validator in the
 full §8.8.1 sense, since it changes exactly when the bytes do, so `If-Range` may authorize a range
 (resumed downloads work, unlike with the weak size+mtime tag) and a rewrite with identical bytes
-keeps its tag. `Handler.sendFileTagged` takes the tag; `sendFile` is it with null.
+keeps its tag. `Handler.sendFileTagged` takes the tag; `sendFile` is it with null. A file larger than
+`SnapshotOptions.max_fingerprint_bytes` (64 MiB) keeps `Handler`'s size+mtime tag instead, so one
+huge file cannot make `open` or a `Live` rescan read gigabytes; a file is hashed up to the size it
+had when opened, never past it.
 
 `Live` rescans (`reload`, or `start`'s thread every `rescan_ms`) and publishes a new generation when
 anything changed. A generation is built from the previous one: a file whose `fstatat` (no follow)
@@ -343,7 +352,7 @@ published by the first rescan after the oldest hold is released. Memory and desc
 by the module, not by the server's write timeout (nginx and Go serve straight from disk and have no
 generations to pin; this is the price of zero syscalls per request, capped).
 
-The re-read of `side` closes a use-after-free (review 2026-10-24 M2): a request that read `side`,
+The re-read of `side` closes a use-after-free: a request that read `side`,
 stalled across one whole publish and only then counted itself was counted on the side the NEXT
 publisher does not wait for, which freed the generation the request was about to hold (a seam test
 reproduces it: segfault without the re-read).
@@ -368,12 +377,6 @@ Content-Length buffers) is stack-local to the call that computes it, copied by t
 writer's `setHeader` before that call returns — no threadlocal state involved. No dynamic
 allocation on the serve path; the 64 KiB streaming buffer is stack-local per request too.
 
-**Mutation + review (2026-11-12, whole module,** production code of `root.zig` — the traversal layers, symlink and dotfile policy, header-failure escalation, precompressed variants, `Snapshot`/`Live`, descriptor accounting; Range, `If-*` and conneg are `http`'s and mutated there — schemata in a detached copy, ReleaseSafe + one Debug build, strict verdict, adversarial read while placing mutants): 387 mutants, 343 killed (8 by hang; 5 only in Debug, where std's `statFile` panics on a segment over NAME_MAX — in release modes std returns `error.Unexpected` and the answer is the same NotFound, so the guard keeps Debug builds from panicking, not ReleaseFast defined), 44 equivalent or unobservable, 0 undecided, no defect. The 2026-10-28 run (158 mutants) was thin: the first run here left 107 alive. Coverage gaps closed by 21 new tests, two of them on the containment path: `openWithinRoot`/`resolveFile` were not tested against a symlinked directory below depth 1 (a mutant splitting the path at the first `/` instead of the last let the kernel follow a symlink at depth ≥ 2 — a root escape no test caught), and a symlink to the root itself (`self -> .`) reached an untested `>=`/`>` in `verifyContainedDir`. Others: descriptor accounting via `/proc/self/fd` per route and for `Snapshot.open`; a segment over NAME_MAX; `resolveFile`'s dotfile policy; `mimeType` edges and overrides; malformed `%` escapes; the `.zst` switch and the SPA fallback's last-segment rule; known-answer ETags incl. a pre-1970 mtime, the SHA-256 content tag and its `size` bound; Snapshot variant ETags, HEAD, 405, 414; `Content-Length: 0` on bare statuses; a file shrunk after its stat; `Vary`/`Content-Encoding` refused under exact header-slot exhaustion; `Live` rescan cadence, stop and restart. Equivalent: post-open `kind != .file` checks (pre-stat refuses every non-regular name; only a race passes), the two overlapping `contentTag` breaks, `setContentLength(rw, 0)` (the server frames a body-less answer itself), the `.head` guard (the server drops a HEAD body), `sameAs` (redundant with the key loop and ownership accounting); unobservable without fault injection or a race: EPERM from open, a failing first `readdir`, a Location over 16 KiB of head, a directory vanishing mid-walk; timing only: one 50 ms step. Cut: OOM/`catch` paths, the u32 file-count cast, `verifyContained`'s `realPath` failure arms, the two `@panic` guards, `httpHandler`'s missing context.
-
-**Delta mutation (2026-11-12, base `f3168d355`, the test-only F11 counter gate; whole-module run above):** the whole of `resolveForServe`, schemata in a detached copy, ReleaseSafe, strict verdict: 44 mutants, 35 killed, 5 equivalent (`sanitizePath` already refuses `..`; `isSymlinkComponent` on an over-long name fails its stat; one differs only through a race), 4 unobservable (an `Io` whose fstat of an opened file fails; a swap between `openServable`'s stat and open), 0 undecided. 1 new test: a followed file link that leaves the root answers 403 and closes its descriptor. The `is_test` gate is comptime in the test binary, so no mutant on it can differ.
-
-**Delta mutation (2026-11-19, base `04c1315c4`, the DT_UNKNOWN classification and the listing changes; cumulative on the card):** `Snapshot.realKind`, `writeListingEntries`, `writeHrefEscaped` and the `Cache-Control`/`nosniff` lines of `serveDirectory`, schemata in a detached copy, ReleaseSafe, strict verdict: 29 mutants, 25 killed, 4 equivalent or unobservable, 0 undecided. First run left 6 alive; two (`Z` and `0` as unreserved href characters) became a test name `AZaz09`, killed on rerun. Equivalent: the `.head` guard (the server drops a HEAD body, as in the whole-module run), `entry.name.len == 0` (an entry name is never empty, so the `[0]` read behind it is never reached). Unobservable without a filesystem that reports DT_UNKNOWN: the two mutants that bypass `realKind` at its call sites (`walk`, the listing slash); the helper itself is killed through three mutants. Not mutated: the `[listing incomplete]` `break` (a missing break loops forever on a failing iterator, i.e. is a hang the test would catch, no distinct class).
-
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -396,58 +399,32 @@ present: starlette.staticfiles as a black-box Range/ETag oracle (src/root.zig `i
 oracle)`). Self only: `Snapshot`/`Live` rescans and content tags, precompressed variant choice, the
 MIME table and the listing markup.
 
-**Go oracle 2026-10-05.** Two defects, fixed the same day: a file asked for as a directory
-(`/secret.txt/`, `/secret.txt%2f`, `/secret.txt/.`) was served — in `Handler`, `resolveFile` and
-`Snapshot` (§1); and an over-long DIRECTORY component (`/dir/<256 bytes>/x`) made a Debug build
-**panic** — the failed `openDir` went on to a no-follow `statFile`, which zig 0.16's Linux backend
-treats as a programmer bug on `ENAMETOOLONG` (Release mapped it to 404). Regenerate with
-`cd tools/go_oracle && go run . -out ../../src/go_oracle_vectors.zig`; `-check <file>` re-takes and
-compares.
+Regenerate the Go vectors with `zig build interop-staticfiles` (`-- --check` re-takes and compares);
+the producer is `tools/go_oracle/` (`go run . -out ../../src/go_oracle_vectors.zig`).
 
-**How it got there.** The anchoring work landed. DONE 9dee82e: starlette oracle; found If-Range NOT IMPLEMENTED -> backlog 1B-bis
+## Verification
+
+- **Run:** `scripts/modtest staticfiles`; the Go oracle is re-taken by `zig build interop-staticfiles [-- --check]` (needs Go, loopback only).
+- **Tests** (`src/root.zig`, `src/go_oracle_test.zig`): the traversal vectors of §1 against a real out-of-root secret and escaping symlinks (including a symlinked directory below depth 1 and a link to the root itself); status mapping, MIME table and overrides, conditional and Range shapes, weak/strong and variant ETags with known answers; precompressed variants and the SPA fallback in `Handler` and `Snapshot`; the listing markup and its limits; `Snapshot` against `Handler` over one fixture tree; `Live` rescans, descriptor counts in `/proc/self/fd` against a baseline, bounded retirement, reader threads against a swapping rescan thread, and seam tests that pause a reader between its steps.
+- **Oracles:** Go `net/http` (`go_oracle_vectors.zig`, producer `tools/go_oracle/`) and the starlette black-box transcript, see *Anchoring*.
+- **Fuzz:** one harness over `sanitizePath` (accepted paths contain no `..`, NUL, backslash or dotfile unless allowed), run by testkit's deterministic driver as `STATICFILES_FUZZ=<runs>[,<first seed>]` (`src/fuzz_test.zig`), with a fixed seed loop and reach checks in every test run.
+- **Constant time:** n/a, static file serving.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and the delta runs after it.
+- **Bench:** `zig build bench-staticfiles` (`tools/bench.zig`, with `tools/go_bench` and `tools/rust_fast_bench` as the Go and Rust sides).
 
 ## Performance
 
-**2026-10-24** (`zig build bench-staticfiles`, `BENCH_ROUNDS=5`, ReleaseFast, Go 1.26.8 local, with the
-`tools/rust_fast_bench` tower-http side): ours/Go small 0.43, large 0.11, cond 0.38, miss 0.55; tower-http
-175 / 398 / 93 / 35 µs per set against Go's 64 / 394 / 35 / 19 (its file IO goes through tokio's blocking
-pool). The pre-open `stat` (review M3) costs small +0.05; using its answer (a missing name is 404 and a
-directory is the index branch without the open + fstat + close) took miss from 0.61 to 0.55. Largest
-spread 13.7 % (Go's `large` row; the margin is 2×).
+The bench is `zig build bench-staticfiles` (`BENCH_ROUNDS=5`, ReleaseFast); the card's Performance line carries the figures and is authoritative. A `Handler` request costs one `stat` before the open (it answers a missing name and a directory without the open/fstat/close, and keeps a FIFO from blocking the open); `Snapshot`/`Live` make no filesystem call per request.
 
-**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-staticfiles`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 7.0 %): ref 0.11–0.61×, against 0.11–0.59× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
+## What is deliberately not done
+
+- **Multi-range `multipart/byteranges`.** Go and nginx serve it; here a multi-range request answers 200 with the full body, which RFC 7233 §6.1 permits. A known amplification vector; not a backlog item unless a consumer asks.
+- **Content sniffing of unknown extensions.** Go sniffs the first 512 bytes; here an unlisted extension is `application/octet-stream` (the embedded table covers the common web types, `Options.mime_overrides` adds more) and `nosniff` tells the browser not to guess.
+- **A content-hash `ETag` in `Handler`.** It would turn every conditional GET into a full read; `Snapshot`/`Live` hash once per file at `open`.
+- **Staleness and size checks of precompressed siblings.** A `.gz`/`.br`/`.zst` older than its source, or larger than it, is served as is, as nginx `gzip_static` does; the deploy tool owns consistency.
+- **`Content-Disposition` or any other way to force a download.** An uploaded `.html`/`.svg` inside the root is served as a document on the serving origin, the same trade-off as Go `FileServer` and nginx.
 
 ## Backlog / deferred
-- **FIXED 2026-11-12 (`builtin.is_test`-gated) — LOW, data race on a test counter (mutation run 2026-11-12):** `resolveForServe` increments the global `test_f11_leaf_dir_opens` (a measurement for an A1 test) non-atomically on every directory request, in production builds too; `Handler` is `shared_read`, so concurrent serves race on it (benign in effect, TSan would flag it). Fix: guard it with `builtin.is_test` or make it atomic — with the next staticfiles source change, since it re-stales the audit.
 
-- **No-panic sweep 2026-10-28 (LOW, not fixed):** `(max_retired + 1) × max_files` descriptors can be open
-  at once in `Live`; only documented on `LiveOptions.max_retired`, no check against `RLIMIT_NOFILE`.
-  `Snapshot.walk` still counts only directories and regular files, so a directory of millions of
-  symlinks/sockets is read in full (time, no memory growth) before `open` returns.
-
-- **FIXED 2026-11-18 (owner decision, RFC 9110 §13.1.5 / §8.8.2.2) — `If-Range` by DATE authorized a range across a same-second replace (review L4, 2026-10-24).**
-  The date branch of `If-Range` now counts only when the `Last-Modified` the server sends is STRONG: at
-  least one second older than the response's `Date` (the file's `mtime` against the real clock at full
-  timestamp precision; an `mtime` in the future is not strong). Otherwise the date validator is treated as
-  absent and the request gets the full 200; an entity tag (strong, `strong_etag` or a `Snapshot`/`Live`
-  content tag) still authorizes a range as before. The RFC makes this mandatory for a date comparison
-  (§13.1.5: the date matches only when the representation's `Last-Modified` is a strong validator by
-  §8.8.2.2's one-second rule), which beats the majority (Go `net/http` and nginx compare the date without it). The check is
-  `isStrongLastModified` and takes the clock from `io`; the exact one-second boundary cannot be pinned by a
-  test (no injectable clock), see the mutation note on the card.
-- **DONE 2026-11-19 — 2026-10-24 (review L9) — `Snapshot.walk` skipped entries whose `d_type` is DT_UNKNOWN** (some
-  XFS/NFS/FUSE). Now classified by one no-follow `fstatat` (`Snapshot.realKind`; `find`/`ftw` do the same); a failed stat still skips, a symlink stays unserved. Tested on the helper (no filesystem here reports DT_UNKNOWN).
-- **2026-10-24 (review L10) — smaller, status 2026-11-19:**
-  DONE: the directory listing sets `Cache-Control` (when configured; failure is a 500 like for a file) and `nosniff`; its entries are links (`<a href>` percent-encoded, text HTML-escaped; Go `FileServer` and nginx `autoindex` do the same); an iteration error after the first entry ends the list with `[listing incomplete]` instead of silently shortening a 200 (the status is already sent).
-  Open, DECISION: `max_depth * 256` reaches the 8 KiB request-path limit (a deep tree can be snapshotted but not asked for): the fix is either a clamp of `max_depth` or skipping/refusing over-long paths at `open`, a new error or silent omission; `TooDeep`/`TooManyFiles` abort the whole rescan, so one new deep directory keeps `Live` on the old generation (reported as `failed`): the alternative (publish the partial tree, or skip the offending subtree) trades the fail-closed completeness guarantee for availability.
-
-- ~~**2026-10-19 (audit S15) — `Live` retired generations are unbounded while one request holds an old one.** `Live.reclaim` frees oldest first and stops at the first still-held generation (`src/root.zig` `reclaim`), so one slow download that holds generation N pins every later generation too; each holds a full copy of the path map and arrays plus the descriptors of the files it replaced. Growth is one generation per rescan that saw a change (operator-paced, default 2 s), and ends when the request does (the server's write timeout), so it is bounded in practice, not by the module. Proposed: a `max_retired` cap after which `rescan` returns a new `error.TooManyGenerations` (or skips publishing) until the oldest is released. Owner decision 2026-10-20: FIX (a bounded resource beats every competitor's posture — nginx/Go serve straight from disk and have no generations to pin); prefer "skip publishing + keep serving the current generation" over a new error so `rescan` callers need no change.~~ — done 2026-10-24 (`LiveOptions.max_retired`, `Outcome.held_back`; test "one held generation pins at most max_retired").
-- **2026-10-19 (audit S15) — precompressed siblings are not checked for staleness or size** (`Handler.openVariant`, `Snapshot.build`): a `.gz`/`.br` older than its source, or larger than it, is served as is. nginx `gzip_static` behaves the same; the deploy tool owns consistency. Recorded, not planned.
-
-- ~~**SPA / fallback file (`try_files`-style)** *(survey 2026-09-30)* — single-page apps need an unknown path to serve `index.html` (200) instead of 404; nginx, starlette (`html=True`) and tower-http (`fallback`) do it, here the caller wraps `resolveFile` (the SPEC's documented custom-404 recipe). Effort: small (`Options.fallback: ?[]const u8`, only for GET with an `Accept: text/html`, never for paths with an extension). Fits §2.~~ — done 2026-10-11 (`Options.fallback`).
-- ~~**Precompressed variants in the path-based `Handler`** *(survey 2026-09-30)* — nginx `gzip_static` works per request; here only `Snapshot` does. A user of `Handler` who ships `app.js.br` gets the uncompressed file. Effort: small-medium (reuse `http.conneg`, second `openWithinRoot`, `Vary`). Fits §2.~~ — done 2026-10-11 (`Options.precompressed`).
-- ~~**Fuller MIME table / content sniffing** *(survey 2026-09-30)* — Go sniffs unknown extensions; nginx ships a ~100-entry `mime.types`. Here an unlisted extension is `application/octet-stream` (e.g. `.webmanifest`, `.mov`, `.flac`, `.jsonld` are not in the table above). Effort: small (extend table; optional 512-byte sniff). Fits §2.~~ — done 2026-10-11 (the table; content sniffing deliberately not done).
-- **Multi-range `multipart/byteranges`** *(survey 2026-09-30)* — Go and nginx serve it; here multi-range answers 200 full body. A PDF viewer or media player issuing multi-range still works (RFC permits ignoring). Deliberately refused already (README: amplification vector), so not a backlog item unless a consumer asks; listed for the record.
-
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): no own sites, only std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-
+- **Descriptors of `Live` at the retirement cap, and uncounted entries (LOW).** Up to `(max_retired + 1) × max_files` descriptors can be open at once in `Live`; this is documented on `LiveOptions.max_retired` only, with no check against `RLIMIT_NOFILE`. `Snapshot.walk` counts regular files (`max_files`) and directories (`max_dirs`) but not symlinks, sockets or devices, so a directory of millions of them is read in full (time, no memory growth) before `open` returns.
+- **Decision: deep trees against the 8 KiB request-path limit.** `max_depth * 256` reaches `max_path_bytes`, so a deep tree can be snapshotted but not asked for. The fix is either a clamp of `max_depth` or skipping/refusing over-long paths at `open` (a new error or a silent omission). Related: `TooDeep`/`TooManyFiles` abort the whole rescan, so one new deep directory keeps `Live` on the old generation (reported as `failed`); publishing the partial tree, or skipping the offending subtree, would trade the fail-closed completeness guarantee for availability.
