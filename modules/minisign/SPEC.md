@@ -6,7 +6,7 @@
 
 **Scope:** parity — jedisct1/minisign 0.12 (file format and crypto; the CLI is out of scope by design) (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-10-04 (42/43, 1 eq) · src ?
+**Audit:** review 2026-09-10 · mutation 2026-11-20 (122/135, 13 eq) · src 2618645a5a912fed
 
 **Hardening:** fuzz 2026-10-07 (500,000 runs clean per harness, MINISIGN_FUZZ) · ct 2026-10-20 (ctgrind: Ed25519 seed (sign), seed + password (seal), password (open) tainted; sign 2 in-file = std `rejectIdentity` on R, seal 2 = std scrypt ROMix index (RFC 7914 by design), open 6 = scrypt 2 + the `timing_safe.eql` WrongPassword verdict + 3 on the public key derived from the seed (std `rejectIdentity`, `PublicKey.fromBytes`, the NonCanonical verdict; since § GP 2026-10-30); no minisign branch on a secret; itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-10-30 (sweep + blind review: scrypt cost from the key file capped (SecretKeyLimits, libsodium *_SENSITIVE), seal refuses what open would, mem_limit < 1024 → WeakParameters, public half checked in every mode; delta audit 13/14 + 1 eq)
 
@@ -268,7 +268,14 @@ algorithms and for a file larger than the CLI's 64 KiB streaming chunk size
   the in-file contexts are std's (`rejectIdentity`, scrypt's ROMix index) and the declassified verdicts, itemised in
   `scripts/checks/ctgrind-expected.tsv`.
 - **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
-  the delta runs after it.
+  the delta runs after it. The last whole-module run put 135 mutants over `src/root.zig` and `src/blake2b.zig` (key and
+  signature parse, comment printability, both verify layers, the scrypt cost caps, seal and open): 122 killed, 13 equivalent.
+  Twelve of those are arguments from invariants (`isPrintableComment`'s lead-byte ranges, masks and `cp` guards are
+  redundant with the ranges and continuation checks before them; `mem_limit == 1024` reaches scrypt's own `WeakParameters`
+  as the guard would); one is unobservable in a safe build (the `errdefer` zero of the base64 codec's out parameter, whose
+  frame `burn.run` burns anyway). 22 survived the first pass: the rest were test gaps (the comment slice and the zeroing of
+  `parseSecretKeyFile` on error, newlines in secret-key and signature writers, the sealed limits, `verifyFile`'s message layer,
+  two UTF-8 boundaries), closed by 6 tests; no code defect.
 
 ## Anchoring
 

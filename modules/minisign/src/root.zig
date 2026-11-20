@@ -2009,3 +2009,81 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── whole-module mutation run: survivors of 135 mutants ──────────────────────
+
+test "isPrintableComment: an overlong two-byte lead and the C1 control U+009F are refused, U+00A0 is not" {
+    try std.testing.expect(!isPrintableComment("\xC1\x81")); // overlong 'A'
+    try std.testing.expect(!isPrintableComment("\xC2\x9F")); // U+009F
+    try std.testing.expect(isPrintableComment("\xC2\xA0")); // U+00A0
+}
+
+test "parseSecretKeyFile: the comment is the text after the prefix; an error zeroes the key and clears the comment" {
+    const io = std.testing.io;
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, io);
+    var raw: RawSecretKey = undefined;
+    kp.toRawSecretKeyPlain(&raw);
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeSecretKeyFile(&w, "my key comment", &raw);
+    var parsed: ParsedSecretKey = undefined;
+    try parseSecretKeyFile(&parsed, w.buffered());
+    try std.testing.expectEqualStrings("my key comment", parsed.untrusted_comment);
+
+    // An unsupported checksum algorithm is found after the key was decoded.
+    raw.chk_alg = "XX".*;
+    var w2: std.Io.Writer = .fixed(&buf);
+    try writeSecretKeyFile(&w2, "stale", &raw);
+    var out: ParsedSecretKey = undefined;
+    @memset(std.mem.asBytes(&out.key), 0xaa);
+    out.untrusted_comment = "stale";
+    try std.testing.expectError(error.UnsupportedAlgorithm, parseSecretKeyFile(&out, w2.buffered()));
+    try std.testing.expectEqualStrings("", out.untrusted_comment);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&out.key), 0));
+}
+
+test "writeSecretKeyFile and writeSignatureFile refuse a newline in the untrusted comment" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var raw: RawSecretKey = undefined;
+    @memset(std.mem.asBytes(&raw), 0);
+    try std.testing.expectError(error.EmbeddedNewline, writeSecretKeyFile(&w, "a\nb", &raw));
+    const sig: RawSignature = .{ .sig_alg = sig_alg_prehashed, .key_number = @splat(0), .signature = @splat(0) };
+    try std.testing.expectError(error.EmbeddedNewline, writeSignatureFile(&w, "a\nb", sig, "ok", @splat(0)));
+}
+
+test "sealSecretKey stores the limits it was given, and the scrypt floor itself is not the guard's refusal" {
+    const gpa = std.testing.allocator;
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, std.testing.io);
+    const salt: [salt_length]u8 = @splat(5);
+    var raw: RawSecretKey = undefined;
+    try sealSecretKey(gpa, &raw, &kp, "pw", salt, 32768, 1 << 16);
+    try std.testing.expectEqual(@as(u64, 32768), raw.ops_limit);
+    try std.testing.expectEqual(@as(u64, 1 << 16), raw.mem_limit);
+    // Exactly 1024 passes the guard and scrypt itself refuses N = 1 (`ln == 0`):
+    // the same error as the guard's, which is why `<` and `<=` cannot be told apart here.
+    var raw2: RawSecretKey = undefined;
+    try std.testing.expectError(error.WeakParameters, sealSecretKey(gpa, &raw2, &kp, "pw", salt, 32768, scrypt_min_mem_limit));
+}
+
+test "verifyFile checks the message as well as the trusted comment" {
+    const gpa = std.testing.allocator;
+    var kp: KeyPair = undefined;
+    KeyPair.generate(&kp, std.testing.io);
+    const pk = kp.publicKey();
+    const signed = try signFile(gpa, &kp, "the message", .prehashed, "tc");
+    const parsed: ParsedSignature = .{
+        .untrusted_comment = "",
+        .signature = signed.signature,
+        .algorithm = .prehashed,
+        .trusted_comment = "tc",
+        .global_signature = signed.global_signature,
+    };
+    try verifyFile(gpa, pk, "the message", parsed);
+    try std.testing.expectError(error.SignatureVerificationFailed, verifyFile(gpa, pk, "another message", parsed));
+    var bad_tc = parsed;
+    bad_tc.trusted_comment = "tc2";
+    try std.testing.expectError(error.SignatureVerificationFailed, verifyFile(gpa, pk, "the message", bad_tc));
+}

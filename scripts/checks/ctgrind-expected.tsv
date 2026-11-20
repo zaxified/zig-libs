@@ -2093,9 +2093,9 @@ jwt	ReleaseFast	rsa	1	3	d76e154c59442cec	f2bee89c3c58cdaf
 #    → pcMul16 `rejectIdentity` and → `PublicKey.fromBytes`, and the
 #    `timing_safe.eql` verdict "derived public half == stored public half"
 #    (NonCanonical or not). `fromSecretKey` is no longer called.
-minisign	ReleaseFast	sign	1	2	6b8a8eb128632bbf	812c5ebd56623021
-minisign	ReleaseFast	seal	1	2	6b8a8eb128632bbf	d241260799cd24a3
-minisign	ReleaseFast	open	1	6	6b8a8eb128632bbf	1876f3ea9f53cddd
+minisign	ReleaseFast	sign	1	2	0d9dc0a15c4d6725	812c5ebd56623021
+minisign	ReleaseFast	seal	1	2	0d9dc0a15c4d6725	d241260799cd24a3
+minisign	ReleaseFast	open	1	6	0d9dc0a15c4d6725	1876f3ea9f53cddd
 # aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
 # (tokens, API keys, Basic user:password), tainted in place; the presented value
 # is the client's own and the verdict is public. Each target verifies a good and
@@ -2272,10 +2272,10 @@ jwe	ReleaseFast	rsa	1	20	878e24b05da43e38	043474d84426957a
 #   branch (ed25519.zig:115 x2 are its keygen twins) + 1 root.zig:494, the
 #   constant-time compare of the embedded public half against the derived one
 #   (true for every valid key, a verdict by design).
-webhooksig	ReleaseFast	verify	1	0	691f63387d17ed1d	b517d0804f4a93d2
-webhooksig	ReleaseFast	sign	1	77	691f63387d17ed1d	854ae236c5fea038
-webhooksig	ReleaseFast	keys	1	1	691f63387d17ed1d	4fb3c2a0bf839a0e
-webhooksig	ReleaseFast	ed25519	1	30	691f63387d17ed1d	0ddab6b90956b2fe
+webhooksig	ReleaseFast	verify	1	0	b8129bc88c9609fd	b517d0804f4a93d2
+webhooksig	ReleaseFast	sign	1	77	b8129bc88c9609fd	854ae236c5fea038
+webhooksig	ReleaseFast	keys	1	1	b8129bc88c9609fd	4fb3c2a0bf839a0e
+webhooksig	ReleaseFast	ed25519	1	30	b8129bc88c9609fd	0ddab6b90956b2fe
 # mcp (2026-11-21) — the `StateSeal` HMAC key (request-state integrity). Three targets; the
 # harness taints only the 32-byte key and drives seal / open through the public API.
 # seal 16 = the PUBLIC MAC through the token's base64url encoder: std base64 `encode`
@@ -2458,7 +2458,7 @@ acme	ReleaseFast	pem	1	43	5338dfdbd665eb9f	e3f3e71bec825dd7	cpu=x86_64
 acme	ReleaseFast	pem384	1	44	5338dfdbd665eb9f	5eb84a3bc4959381	cpu=x86_64
 acme	ReleaseFast	pkcs8	1	46	5338dfdbd665eb9f	b26448f1c577ca4e	cpu=x86_64
 acme	ReleaseFast	anykey	1	16	5338dfdbd665eb9f	7dff1d27c302259e	cpu=x86_64
-webhooksig	ReleaseFast	sign	1	61	691f63387d17ed1d	854ae236c5fea038	cpu=x86_64
+webhooksig	ReleaseFast	sign	1	61	b8129bc88c9609fd	854ae236c5fea038	cpu=x86_64
 #
 # falcon -- the OPEN fpr question (SPEC Threat model: 112 of 133 native contexts in fpr.zig), larger
 # on x86_64: pack +67, add +88, half -26, sampler -12 vs native. A bound, as the native row; not a
