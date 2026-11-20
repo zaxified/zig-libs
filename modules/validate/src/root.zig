@@ -63,12 +63,12 @@
 //! middleware and the handler must preserve `ctx.data` (the router's
 //! cooperative-scratch convention) or the getters return null.
 //!
-//! Regex `pattern`: this module has no regex engine of its own (the repo's
-//! `regex` module is not a dependency), so `Pattern.matcher` takes
-//! the caller's (any `fn (ctx, string) bool` — a regex library, a hand-written
-//! check) together with the expression's source text, which this module never
+//! Regex `pattern`: this module does not depend on the repo's `regex` module,
+//! so `Pattern.matcher` takes the caller's matcher (any `fn (ctx, string)
+//! bool` — the `regex` module, another library, a hand-written check)
+//! together with the expression's source text, which this module never
 //! interprets: it is what the exported JSON Schema's `pattern` says and what
-//! the error message quotes (decision).
+//! the error message quotes.
 
 const std = @import("std");
 const testkit = @import("testkit");
@@ -550,8 +550,9 @@ pub const CrossOp = enum {
     /// The field equals the sibling `other` (code `field_mismatch`). Numbers
     /// compare by value, strings by text, booleans and `null` by identity;
     /// different JSON types are unequal; arrays and objects are never equal;
-    /// a missing sibling fails. Two `date-time` strings (or two `date`
-    /// strings) compare as instants, as go-playground compares `time.Time`.
+    /// a missing sibling fails. When the rule's `format` is `date_time` or
+    /// `date`, two `date-time` strings compare as instants (as go-playground
+    /// compares `time.Time`); without it they are plain strings.
     /// (baked_in.go `isEqField`, line 1372.)
     eq_field,
     /// The field differs from `other` (code `field_equal`); a missing
@@ -1304,11 +1305,12 @@ fn fractionOrder(a: []const u8, b: []const u8) std.math.Order {
 }
 
 /// Order of two scalars for the comparison ops; null = not comparable.
-/// Numbers by value; two date-times or two dates as instants; any other two
-/// strings by byte length (go-playground's `len`).
-fn scalarOrder(x: Value, y: Value) ?std.math.Order {
+/// Numbers by value; two date-times as instants when `instants` (the rule's
+/// `format` is `date_time`/`date`, see `instantsFor`), two dates by text; any
+/// other two strings by byte length (go-playground's `len`).
+fn scalarOrder(x: Value, y: Value, instants: bool) ?std.math.Order {
     if (x == .string and y == .string) {
-        if (isDateTime(x.string) and isDateTime(y.string)) {
+        if (instants and isDateTime(x.string) and isDateTime(y.string)) {
             const ix = instantOf(x.string);
             const iy = instantOf(y.string);
             const o = std.math.order(ix.secs, iy.secs);
@@ -1320,14 +1322,23 @@ fn scalarOrder(x: Value, y: Value) ?std.math.Order {
     return numberOrder(x, y);
 }
 
+/// Whether a cross rule on `rule` compares date-time strings as instants:
+/// only when the rule says it holds a date or date-time (`format`), the way
+/// ajv-formats' `formatMinimum`/`formatMaximum` act on the `format` beside
+/// them; with no such format a string is text (eq) or its length (ordering).
+fn instantsFor(rule: *const Rule) bool {
+    const f = rule.format orelse return false;
+    return f == .date_time or f == .date;
+}
+
 /// `eq_field` / `ne_field`'s notion of equal. Strings are equal as text
-/// (or as instants when both are date-times -- the same instant in two
-/// offsets is one value, as `time.Time.Equal` has it).
-fn scalarsEqual(x: Value, y: Value) bool {
+/// (or as instants when `instants` and both are date-times -- the same
+/// instant in two offsets is one value, as `time.Time.Equal` has it).
+fn scalarsEqual(x: Value, y: Value, instants: bool) bool {
     switch (x) {
         .string => |s| {
             if (y != .string) return false;
-            if (isDateTime(s) and isDateTime(y.string)) return scalarOrder(x, y).? == .eq;
+            if (instants and isDateTime(s) and isDateTime(y.string)) return scalarOrder(x, y, true).? == .eq;
             return std.mem.eql(u8, s, y.string);
         },
         .bool => |p| return y == .bool and y.bool == p,
@@ -1528,6 +1539,7 @@ fn checkCross(b: *Builder, path: []const u8, rule: *const Rule, self: CrossSlot,
     }
     if (try checkExcluded(b, path, rule, lookup)) return;
     if (!crossGated(rule, self)) return;
+    const instants = instantsFor(rule);
     for (rule.cross) |*c| {
         const holds = switch (c.op) {
             .eq_field, .ne_field, .gt_field, .gte_field, .lt_field, .lte_field => blk: {
@@ -1542,11 +1554,11 @@ fn checkCross(b: *Builder, path: []const u8, rule: *const Rule, self: CrossSlot,
                 };
                 if (c.op == .ne_field) {
                     if (mine == null or theirs == null) break :blk true;
-                    break :blk !scalarsEqual(mine.?, theirs.?);
+                    break :blk !scalarsEqual(mine.?, theirs.?, instants);
                 }
                 if (other == .absent or mine == null or theirs == null) break :blk false;
-                if (c.op == .eq_field) break :blk scalarsEqual(mine.?, theirs.?);
-                const o = scalarOrder(mine.?, theirs.?) orelse break :blk false;
+                if (c.op == .eq_field) break :blk scalarsEqual(mine.?, theirs.?, instants);
+                const o = scalarOrder(mine.?, theirs.?, instants) orelse break :blk false;
                 break :blk switch (c.op) {
                     .gt_field => o == .gt,
                     .gte_field => o != .lt,
@@ -10293,7 +10305,7 @@ test "cross: ordering strings — by length, and date-times as instants (isGtFie
     // 2026-01-01T01:00+02:00 is 2025-12-31T23:00Z: BEFORE the start.
     const span = [_]Rule{
         .{ .field = "start", .kind = .string },
-        .{ .field = "end", .kind = .string, .cross = &.{.{ .op = .gte_field, .other = "start" }} },
+        .{ .field = "end", .kind = .string, .format = .date_time, .cross = &.{.{ .op = .gte_field, .other = "start" }} },
     };
     try expectBoth("{\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-01-01T01:00:00+02:00\"}", &span, &.{.{ "end", "greater_than_equal_field" }});
     try expectBoth("{\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-01-01T00:30:00+00:00\"}", &span, &.{});
@@ -10301,11 +10313,15 @@ test "cross: ordering strings — by length, and date-times as instants (isGtFie
     // Fractions of a second count.
     try expectBoth("{\"start\":\"2026-01-01T00:00:00.5Z\",\"end\":\"2026-01-01T00:00:00.25Z\"}", &span, &.{.{ "end", "greater_than_equal_field" }});
     // Plain dates order as dates (same length, so a `len` comparison could not).
-    try expectBoth("{\"start\":\"2026-02-01\",\"end\":\"2026-01-31\"}", &span, &.{.{ "end", "greater_than_equal_field" }});
-    try expectBoth("{\"start\":\"2026-02-01\",\"end\":\"2026-02-01\"}", &span, &.{});
+    const dates = [_]Rule{
+        .{ .field = "start", .kind = .string },
+        .{ .field = "end", .kind = .string, .format = .date, .cross = &.{.{ .op = .gte_field, .other = "start" }} },
+    };
+    try expectBoth("{\"start\":\"2026-02-01\",\"end\":\"2026-01-31\"}", &dates, &.{.{ "end", "greater_than_equal_field" }});
+    try expectBoth("{\"start\":\"2026-02-01\",\"end\":\"2026-02-01\"}", &dates, &.{});
     // The same instant in two offsets is equal.
     const same = [_]Rule{
-        .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "a", .format = .date_time, .cross = &.{.{ .op = .eq_field, .other = "b" }} },
         .{ .field = "b" },
     };
     try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &same, &.{});
@@ -10759,8 +10775,26 @@ test "cross: lt_field is strict, and an .any rule does not compare a null" {
     try expectBoth("{\"a\":null,\"b\":2}", &any, &.{});
 }
 
+test "cross: date-time shaped strings are instants only under format date_time/date (ajv-formats shape)" {
+    // No `format` on the rule: plain strings. The same instant in two
+    // offsets differs as text, and orders by byte length.
+    const plain_eq = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} }, .{ .field = "b" } };
+    try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &plain_eq, &.{.{ "a", "field_mismatch" }});
+    try expectBoth("{\"a\":\"2026-01-01T00:00:00Z\",\"b\":\"2026-01-01T00:00:00Z\"}", &plain_eq, &.{});
+    const plain_ne = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .ne_field, .other = "b" }} }, .{ .field = "b" } };
+    try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &plain_ne, &.{});
+    const plain_gt = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .gt_field, .other = "b" }} }, .{ .field = "b" } };
+    // 25 bytes against 20: longer wins although it is the EARLIER instant.
+    try expectBoth("{\"a\":\"2026-01-01T00:00:00+02:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &plain_gt, &.{});
+    // With the format: instants.
+    const inst_eq = [_]Rule{ .{ .field = "a", .format = .date_time, .cross = &.{.{ .op = .eq_field, .other = "b" }} }, .{ .field = "b" } };
+    try expectBoth("{\"a\":\"2026-01-01T01:00:00+01:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &inst_eq, &.{});
+    const inst_gt = [_]Rule{ .{ .field = "a", .format = .date_time, .cross = &.{.{ .op = .gt_field, .other = "b" }} }, .{ .field = "b" } };
+    try expectBoth("{\"a\":\"2026-01-01T00:00:00+02:00\",\"b\":\"2026-01-01T00:00:00Z\"}", &inst_gt, &.{.{ "a", "greater_than_field" }});
+}
+
 test "cross: date-times order as instants — fraction digits padded, offset sign and minutes, versus a plain string" {
-    const eq = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} }, .{ .field = "b" } };
+    const eq = [_]Rule{ .{ .field = "a", .format = .date_time, .cross = &.{.{ .op = .eq_field, .other = "b" }} }, .{ .field = "b" } };
     // .5 and .50 are one fraction (padded with zeros, not with anything else).
     try expectBoth("{\"a\":\"2026-01-01T00:00:00.5Z\",\"b\":\"2026-01-01T00:00:00.50Z\"}", &eq, &.{});
     // A negative offset is behind UTC; the minutes of an offset count.
@@ -13259,17 +13293,17 @@ test "a1 mutation: scalar order of date-times (no offset, fractions of any lengt
             return .{ .string = t };
         }
     };
-    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01T00:00:00"), S.s("2020-01-01T00:00:01")).?);
-    try testing.expectEqual(@as(O, .gt), scalarOrder(S.s("2020-01-01T00:00:00.5"), S.s("2020-01-01T00:00:00.25")).?);
-    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01T00:00:00.5"), S.s("2020-01-01T00:00:00.51")).?);
-    try testing.expectEqual(@as(O, .gt), scalarOrder(S.s("2020-01-01T00:00:00.51"), S.s("2020-01-01T00:00:00.5")).?);
-    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2020-01-01T00:00:00.5Z"), S.s("2020-01-01T00:00:00.50Z")).?);
-    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2020-01-01T01:00:00+01:00"), S.s("2020-01-01T00:00:00Z")).?);
-    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2019-12-31T23:00:00-01:00"), S.s("2020-01-01T00:00:00Z")).?);
+    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01T00:00:00"), S.s("2020-01-01T00:00:01"), true).?);
+    try testing.expectEqual(@as(O, .gt), scalarOrder(S.s("2020-01-01T00:00:00.5"), S.s("2020-01-01T00:00:00.25"), true).?);
+    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01T00:00:00.5"), S.s("2020-01-01T00:00:00.51"), true).?);
+    try testing.expectEqual(@as(O, .gt), scalarOrder(S.s("2020-01-01T00:00:00.51"), S.s("2020-01-01T00:00:00.5"), true).?);
+    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2020-01-01T00:00:00.5Z"), S.s("2020-01-01T00:00:00.50Z"), true).?);
+    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2020-01-01T01:00:00+01:00"), S.s("2020-01-01T00:00:00Z"), true).?);
+    try testing.expectEqual(@as(O, .eq), scalarOrder(S.s("2019-12-31T23:00:00-01:00"), S.s("2020-01-01T00:00:00Z"), true).?);
     // a date against a non-date string is compared by length, not by text
-    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01"), S.s("0000000000000")).?);
-    try testing.expect(!scalarsEqual(S.s("2020-01-01T00:00:00Z"), S.s("xxxxxxxxxxxxxxxxxxxx")));
-    try testing.expect(scalarsEqual(S.s("2020-01-01T01:00:00+01:00"), S.s("2020-01-01T00:00:00Z")));
+    try testing.expectEqual(@as(O, .lt), scalarOrder(S.s("2020-01-01"), S.s("0000000000000"), true).?);
+    try testing.expect(!scalarsEqual(S.s("2020-01-01T00:00:00Z"), S.s("xxxxxxxxxxxxxxxxxxxx"), true));
+    try testing.expect(scalarsEqual(S.s("2020-01-01T01:00:00+01:00"), S.s("2020-01-01T00:00:00Z"), true));
 }
 
 test "a1 mutation: exact integer against float order never converts what does not fit" {

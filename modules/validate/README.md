@@ -196,8 +196,8 @@ const rules = [_]validate.Rule{
 
 | op | holds when | code |
 |---|---|---|
-| `eq_field` / `ne_field` | equal / different (numbers by value, date-times as instants, strings by text) | `field_mismatch` / `field_equal` |
-| `gt_field` `gte_field` `lt_field` `lte_field` | numbers by value, date-times chronologically, other strings by byte length | `greater_than_field` `greater_than_equal_field` `less_than_field` `less_than_equal_field` |
+| `eq_field` / `ne_field` | equal / different (numbers by value, date-times as instants when the rule has `format` `date_time`/`date`, other strings by text) | `field_mismatch` / `field_equal` |
+| `gt_field` `gte_field` `lt_field` `lte_field` | numbers by value, date-times chronologically (when the rule has `format` `date_time`/`date`), other strings by byte length | `greater_than_field` `greater_than_equal_field` `less_than_field` `less_than_equal_field` |
 | `required_if` / `required_unless` | the field is present when EVERY entry's sibling equals `value` / unless ANY does | `missing` |
 | `required_with` / `required_without` | present when ANY named sibling is present / absent | `missing` |
 | `required_with_all` / `required_without_all` | present when EVERY named sibling is present / absent | `missing` |
