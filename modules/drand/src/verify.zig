@@ -32,7 +32,7 @@
 //!   to the deprecated `bls-unchained-on-g1`, which hashes to `G1` under
 //!   the `G2` DST — still unverified here.)
 //!
-//! Until 2026-10-06 this file evaluated both equations directly on
+//! Until this file evaluated both equations directly on
 //! `bls12_381.pairing`, because `bls12_381` then offered only the
 //! min-pk / ProofOfPossession suite (`_POP_` DST), which verifies neither.
 //! The suite's `verify` runs drand's `KeyValidate` on BOTH operands
@@ -387,7 +387,7 @@ test "verifyRound: quicknet chain info against a G2 (chained) round → SchemeGr
     // `SchemeGroupMismatch` this mismatch is supposed to report). A
     // realistic way to hit this: a caller fetches `/info` from a
     // verifiable (quicknet) chain but round data from the chained default
-    // beacon (96-byte G2 signature). Since 2026-10-06 that signature is a
+    // beacon (96-byte G2 signature). Since that signature is a
     // genuine default-chain round (`parseRound` now decodes G2 and refuses
     // the junk bytes this test used before).
     const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
@@ -1101,8 +1101,8 @@ test "corpus: every parse seed reaches a parser, and what each one decodes is pi
     }
     // One seed is deliberately the empty document.
     try testing.expectEqual(parse_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: every counter below was 0 before the draw was fixed.
-    // 2026-10-06: +1 each for the chained /info and round seeds.
+    // Measured: every counter below was 0 before the draw was fixed.
+    // +1 each for the chained /info and round seeds.
     try testing.expectEqual(@as(usize, 3), infos);
     try testing.expectEqual(@as(usize, 3), pubkeys_decoded);
     try testing.expectEqual(@as(usize, 5), rounds);
@@ -1243,8 +1243,8 @@ fn checkFixture(c: Choices) !void {
     // The key, hash and groupHash are all inputs to the chain hash, so any
     // alteration of them must fail the parse. The scheme label is not
     // hashed, but `pedersen-bls-chained` KeyValidates a 48-byte G1 key, so
-    // quicknet's 96-byte key under that label must fail too (since
-    // 2026-10-06); under the other labels an untouched trio parses.
+    // quicknet's 96-byte key under that label must fail too;
+    // under the other labels an untouched trio parses.
     const info_damaged = pk_damaged or hash_damaged or ghash_damaged or c.scheme_idx == 1;
     const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {
         if (!info_damaged) return e; // fixture or parser drifted
@@ -1458,7 +1458,7 @@ const chained_seeds = [_][]const u8{
 };
 
 test "a chain key outside the order-r subgroup is refused by both points-level verifiers" {
-    // Since 2026-10-06 the points-level verifiers run `KeyValidate` on the
+    // Since the points-level verifiers run `KeyValidate` on the
     // key too (the suite's `verify`); before, only `parseInfo` did, and a
     // caller handing in a decoded key from elsewhere had to remember it.
 
@@ -1510,7 +1510,7 @@ test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
     // one-sided half of the guard alone stops that the pairing check does
     // not already stop — it is pure defense-in-depth, verified redundant,
     // not an independently pinned property. Kept as a guard (since
-    // 2026-10-06 it is `bls12_381.scheme`'s `KeyValidate`, which refuses an
+    // it is `bls12_381.scheme`'s `KeyValidate`, which refuses an
     // identity key outright), but a test cannot honestly claim to enforce it.
     try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.generator));
     try std.testing.expect(!verifyRoundPoints(g2.Affine.generator, 1, g1.Affine.identity));
@@ -1520,7 +1520,7 @@ test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests added by the 2026-11-17 whole-module mutation of `json_uint.zig`,
+//! Tests added by the whole-module mutation of `json_uint.zig`,
 //! `round.zig`, `chaininfo.zig` and `verify.zig`: the exact boundaries of the
 //! document and field limits, the error code of each refusal, the tolerance
 //! the Go reference has (unknown fields), allocation failure, and the
