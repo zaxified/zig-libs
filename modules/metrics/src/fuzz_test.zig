@@ -813,7 +813,7 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                 const row = &fams[d.below(nf)];
                 var vbufs: [3][96]u8 = undefined;
                 var vals: [3][]const u8 = undefined;
-                for (vals[0..row.nlabels], vbufs[0..row.nlabels]) |*v, *vb| v.* = d.str(vb, &label_vocab);
+                for (vals[0..row.nlabels], vbufs[0..row.nlabels]) |*v, *vb| v.* = d.str(vb, &label_ok_vocab);
                 var exl: [4]metrics.Label = undefined;
                 var enb: [4][20]u8 = undefined;
                 var evb: [4][72]u8 = undefined;
@@ -823,7 +823,11 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                     // Some values run to the rune cap (128 runes in all) or past it.
                     const long = d.byte() < 110;
                     l.* = .{
-                        .name = if (d.byte() < 235) pool_labels[(estart + ek) % pool_labels.len] else d.str(nb, &name_vocab),
+                        .name = switch (d.byte()) {
+                            0...199 => pool_labels[(estart + ek) % pool_labels.len],
+                            200...234 => pool_labels[d.below(pool_labels.len)], // may repeat
+                            else => d.str(nb, &name_vocab),
+                        },
                         .value = if (long) blk: {
                             const k = 20 + d.below(vb.len - 20);
                             @memset(vb[0..k], 'x');
@@ -881,6 +885,7 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                     l.* = .{ .name = if (d.byte() < 235) pool_labels[(start + k) % pool_labels.len] else d.str(nb, &name_vocab), .value = d.str(vb, &label_vocab) };
                 }
                 const bk = drawBuckets(&d, &buckets);
+                const before = reg.families.items.len;
                 const ok = switch (d.below(3)) {
                     0 => if (reg.counter(name, "plain", lbs[0..nl])) |c| blk: {
                         c.inc();
@@ -895,6 +900,8 @@ fn fuzzRegistry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
                         break :blk true;
                     } else |_| false,
                 };
+                // A refused registration leaves no family behind.
+                if (!ok and reg.families.items.len != before) return error.RefusedRegistrationLeftAFamily;
                 if (ok) {
                     hit("plain-registered");
                     for (lbs[0..nl]) |l| {
