@@ -11,9 +11,7 @@ byte-faithfully through both.
   reader ingests them into a content-addressed vault.
 - **Compatible with:** GNU tar / busybox tar — headers implemented from the
   POSIX ustar + GNU extension layout, with a GNU tar binary used as a
-  black-box compatibility oracle only. (This line said "model after GNU tar /
-  libarchive" until 2026-08-14; `667b29d` retracted that wording in SPEC.md on
-  2026-07-09 and did not reach here.)
+  black-box compatibility oracle only.
 - **Platform:** the codec (`Reader`/`Writer`/`packTarGz`) is platform-pure —
   no I/O beyond the caller's `std.Io.Reader`/`Writer`, compiles and tests
   anywhere; only `packDir` (the filesystem walker) is Linux (raw
@@ -61,7 +59,7 @@ var tr = tar.Reader.init(gpa, src);
 defer tr.deinit();
 while (try tr.next()) |e| {
     // e.path, e.kind (.file/.dir/.symlink/.hardlink/.other), e.mode,
-    // e.uid, e.gid, e.mtime (+ e.mtime_nsec), e.size, e.link_target
+    // e.uid, e.gid, e.uname, e.gname, e.mtime (+ e.mtime_nsec), e.size, e.link_target
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = try tr.read(&buf); // stream content; 0 = entry done
@@ -98,7 +96,7 @@ const stats2 = try tar.packDirToPath(io, gpa, &.{"/etc/config"}, "/backups/confi
   `ustar\0` magic — GNU reuses those bytes), octal and GNU/star base-256
   size fields, pax 'x' headers: `path`, `linkpath`, `size`, `uid`, `gid` and
   `mtime` (whole seconds + `Entry.mtime_nsec`, negative allowed) override the
-  ustar fields, other records are parsed past, a malformed record or a
+  ustar fields, `uname`/`gname` fill `Entry.uname`/`gname`, other records are parsed past, a malformed record or a
   non-numeric/over-range `uid`/`gid`/`mtime` is `error.BadHeader`; pax global
   ('g') headers are skipped; **sparse members** (GNU 'S', pax `GNU.sparse`
   0.0 / 0.1 / 1.0) read as ordinary files of their logical size, the holes as
@@ -127,7 +125,7 @@ const n = try tar.checkArchive(gpa, src, .{}); // or per entry:
 try tar.checkEntry(entry, .{ .allow_absolute = false });
 ```
 
-`Policy` (`allow_absolute`, `allow_parent`, `allow_special`) loosens a rule; the
+`Policy` (`allow_absolute`, `allow_parent`, `allow_special`, `allow_link_dotdot_after_name`) loosens a rule; the
 default is the safe one. The check is lexical: an entry written *through* a
 symlink an earlier entry created is the extractor's to prevent (`openat2` with
 `RESOLVE_BENEATH`, or do not follow links while extracting). A sparse member
@@ -147,6 +145,12 @@ tar --numeric-owner --full-time -tvvf out.tar        # 5000000/6000000 ... :07.5
 python3 -c "import tarfile; [print(len(m.name), m.uid, m.gid, m.mtime) for m in tarfile.open('out.tar').getmembers()]"
 # -> 150 5000000 6000000 1727700007.5
 ```
+
+## Not provided
+
+No extractor (only the `checkPath`/`checkEntry`/`checkArchive` checks one runs first), no sparse writing, no pax
+'g' global headers, no xattrs or other arbitrary pax records, no per-file compression or encryption. The reasons are in
+SPEC *What is deliberately not done*; open items are in SPEC *Backlog / deferred*.
 
 ## Design notes
 

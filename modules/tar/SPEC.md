@@ -8,10 +8,6 @@
 
 **Audit:** review 2026-09-01 · mutation 2026-11-19 (66/68, 2 eq) · src d0d9dc0fda41cf7d
 
-Delta mutation 2026-11-19 (`packDirOptions`: `same_device`, `max_entries`, `max_bytes`, the device key): 15 mutants, 12 killed at once, 3 survived the first tests (the entry-count gate for directories and for symlinks, `same_device` re-reading the device per root) and got tests; 15 killed, 0 equivalent. The card counts are cumulative: the 2026-10-04 run (51/53, 2 eq) plus these 15.
-
-Delta audit 2026-11-04 (independent read of the 2026-11 production diff, 112 mutants: 103 killed, 37 of them by 18 tests it added, 9 decided). Proven against GNU tar 1.35 and fixed: an 'S' member whose `size` its map does not use let `tar -x` create a member `checkArchive` never saw, now `BadHeader` as in Go; a symlink at `a/b/` was counted one level too deep; `-Dtar-sparse=false` read sparse members as something else. `GNU.sparse.major` without a minor is now `BadHeader`. These fixes came after the mutant run: each has a test that went red first, no mutants. Not a whole-module score, so the Audit line stays as it is. Kept as policy: zero-length map entries are dropped unvalidated, an empty pax `uname`/`gname` leaves the ustar field.
-
 **Hardening:** fuzz 2026-11-04 (`TAR_FUZZ`: `reader`/`mutated` 30,000 runs and the new `sparse` harness 100,000 runs clean, Debug; `sparse` reach: `sparse_entry` 67,599 and `after_sparse` 58,793 of 100,000, i.e. past the sparse member to the one behind it) · ct n/a — archive reading (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: iterative `packDir` walk, unopenable files skipped before the header, short reads zero-padded and counted in `skipped`, `writeEntry` checked panic; delta audit 18/24 + 5 eq, 1 unkillable (needs a truncation race))
 
 **Performance:** ref 0.15–1.01× Go 1.26.8 `archive/tar` (`zig build bench-tar -Djcc-safe`, final code, 2026-11-04, two runs of 11 and 15 rounds, worst ratio 0.99 and 1.01: `read_many` 0.19× (2048 members, 4 MB), `read_pax` 0.15–0.16× (1024 pax long-path members), `read_big` 0.99–1.01× (one 32 MiB member, copy-bound: both sides are memcpy-limited, so about 1.0 with 9–18 % spread, inside 1.1× but not distinguishable from parity), `write_many` 0.17× (0.10× in an earlier run before owner names were added to the header path and without `-Djcc-safe`), `write_big` 0.43×; memory to memory, a counting sink, same bytes both sides; shared machine, spreads 5–35 %; the Go side cannot be JCC-padded) · fastest ? (Zig `std.tar` reads `read_many`/`read_pax` in 0.66–0.86× our time while surfacing no uid/gid/mtime, i.e. less work, informational; tar-rs, libarchive and GNU/busybox tar not measured: no foreign build, see Compared with) (measured 2026-11-04)
@@ -20,30 +16,29 @@ Delta audit 2026-11-04 (independent read of the 2026-11 production diff, 112 mut
 
 **Downstream consumer:** yes
 
+Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code; the installed GNU tar binary was used only as a black-box test oracle).
+
 ## Compared with
 
 Surveyed 2026-09-30, re-surveyed for S2 on 2026-11-04 per `SURVEY-PLAYBOOK.md` and the S2 brief; stars and activity as of the first date. No foreign source was read: LICENSE files, READMEs, `go doc` and tool `--help` only. Marks: [V] verified this session, [I] inferred.
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [Go `archive/tar`](https://pkg.go.dev/archive/tar) — **reference** (measured, `tools/go_bench`) | Go | BSD-3-Clause *(Go stdlib; [I])* | — | Go 1.26.8 | Reads and writes ustar, pax (path/linkpath/size/uid/gid/uname/mtime, arbitrary records), GNU long names, GNU and pax sparse on read [V: `go doc`, and Go read our four GNU tar sparse fixtures to the same SHA-256]; `Header`/`FileInfoHeader`; `ErrInsecurePath` for non-local names under `GODEBUG=tarinsecurepath=0` [V]. Pax 'g' headers are parsed and composed but "not persisted across files" [V]. Here: all of the above except uname/gname, arbitrary records and sparse writing; `checkEntry` is the explicit form of `ErrInsecurePath` and also covers link targets and special files. |
-| [alexcrichton/tar-rs](https://github.com/alexcrichton/tar-rs) | Rust | MIT OR Apache-2.0 (LICENSE-MIT + LICENSE-APACHE present) | 739 | 0.4.46 (2026-05) | Reader/Builder, `unpack` to disk with path-safety handling, pax long paths, GNU extensions *[I]*. Not benchmarked: no pinned crate in the offline cargo cache and no download was made. We have no extraction-to-disk helper (rejected, below). |
+| [Go `archive/tar`](https://pkg.go.dev/archive/tar) — **reference** (measured, `tools/go_bench`) | Go | BSD-3-Clause *(Go stdlib; [I])* | — | Go 1.26.8 | Reads and writes ustar, pax (path/linkpath/size/uid/gid/uname/mtime, arbitrary records), GNU long names, GNU and pax sparse on read [V: `go doc`, and Go read our four GNU tar sparse fixtures to the same SHA-256]; `Header`/`FileInfoHeader`; `ErrInsecurePath` for non-local names under `GODEBUG=tarinsecurepath=0` [V]. Pax 'g' headers are parsed and composed but "not persisted across files" [V]. Here: all of the above except arbitrary records and sparse writing; `checkEntry` is the explicit form of `ErrInsecurePath` and also covers link targets and special files. |
+| [alexcrichton/tar-rs](https://github.com/alexcrichton/tar-rs) | Rust | MIT OR Apache-2.0 (LICENSE-MIT + LICENSE-APACHE present) | 739 | 0.4.46 (2026-05) | Reader/Builder, `unpack` to disk with path-safety handling, pax long paths, GNU extensions *[I]*. Not benchmarked: no pinned crate in the offline cargo cache and no download was made. We have no extraction-to-disk helper (see *What is deliberately not done*). |
 | [libarchive/libarchive](https://github.com/libarchive/libarchive) | C | BSD-2-Clause (COPYING; API says NOASSERTION) | 3.6k | v3.8.9 (2026-07) | Every tar dialect, pax, sparse, many other formats and filters. The de-facto everything-archive library; different scale. Not benchmarked (C build and no `bsdtar` on this host). |
 | GNU tar 1.35 / busybox 1.37 tar | C | GPL-3.0-or-later / GPL-2.0 *[I]*; source never read | — | — | Black-box oracles only: the goldens, the four sparse fixtures (`tar --sparse`) and the live `tar tvf`/`xf` cross-checks. Full feature set incl. `--sparse`, pax global headers, xattrs/ACLs, `--one-top-level`, `-P`. |
-| [Zig `std.tar`](https://ziglang.org/documentation/master/std/#std.tar) — **fastest measured** (partial) | Zig | MIT | — | Zig 0.17.0 | Iterator, `extract` to a directory; understands pax path/linkpath/size, skips GNU sparse extension blocks without expanding them [V: source of the toolchain, public API]; drops uid/gid/mtime. 0.78–0.86× our read time on `read_many`/`read_pax` because it parses less. |
+| [Zig `std.tar`](https://ziglang.org/documentation/master/std/#std.tar) — **fastest measured** (partial) | Zig | MIT | — | Zig 0.17.0 | Iterator, `extract` to a directory; understands pax path/linkpath/size, skips GNU sparse extension blocks without expanding them [V: source of the toolchain, public API]; drops uid/gid/mtime. Reads `read_many`/`read_pax` faster than we do because it parses less; informational, the figures are the card's `**Performance:**` line. |
 
 **Verdict per gap** (each a feature a user would notice):
-- **Sparse files, read** (GNU 'S', pax 0.0/0.1/1.0): done 2026-11-04, `Entry.size` logical, holes read as zeros; Go and GNU tar are the anchors.
-- **Sparse files, write**: rejected; a sparse file is packed whole (`packDir` has no SEEK_HOLE walk) and nothing reads a sparse member back from this module's writer. Go's writer does not write them either *[I]*.
-- **Extraction-safety** (absolute, `..`, symlink and hard-link escape, FIFO/device): done as `checkPath`/`checkEntry`/`checkArchive`; an **extractor** itself is rejected: `std.tar.extract` exists in the toolchain and drops uid/gid/mtime, an extractor that keeps them needs `fchownat`/`utimensat` policy (root or not) that belongs to the application; the check is the part every extractor needs and can get wrong.
-- **pax 'g' global headers**: rejected, skipped (Go does not apply them [V]; no consumer).
-- **uname/gname**: done (fix round 2026-11-04), `Entry.uname`/`gname` on read (ustar fields or a pax record up to 255 bytes, stored in the Reader, no allocation) and write (`.gnu`: up to 32 bytes else `FieldOutOfRange`; `.pax`: a pax record beyond). **Arbitrary pax records** (xattrs, ACLs): rejected, parsed past: surfacing them needs an unbounded allocation per entry, which the Reader avoids by design (bounded memory).
+- **Sparse files, read** (GNU 'S', pax 0.0/0.1/1.0): done, `Entry.size` logical, holes read as zeros; Go and GNU tar are the anchors. **Sparse files, write**: not done, see *What is deliberately not done*.
+- **Extraction-safety** (absolute, `..`, symlink and hard-link escape, FIFO/device): done as `checkPath`/`checkEntry`/`checkArchive`; an **extractor** itself is not done (*What is deliberately not done*).
+- **pax 'g' global headers** and **arbitrary pax records** (xattrs, ACLs): not done, see *What is deliberately not done*.
+- **uname/gname**: done, `Entry.uname`/`gname` on read (ustar fields or a pax record up to 255 bytes, stored in the Reader, no allocation) and write (`.gnu`: up to 32 bytes else `FieldOutOfRange`; `.pax`: a pax record beyond).
 - **Reading .tar.gz / .tar.zst / .tar.xz**: owned by siblings (`zstd`, `lzma`, `bzip2`, `brotli` modules and `std.compress.flate`): `Reader` takes any `*std.Io.Reader`. Verified present with `ls modules`.
-- **Hostile input**: sparse map, pax and GNU long records bounded (`max_sparse_segments`, `max_sparse_size`, `max_pax_len`, `max_name_len`); 32-bit targets (the router-tool consumer's mips / arm) checked under qemu, which found and fixed a size-overflow panic in the skip path.
+- **Hostile input**: sparse map, pax and GNU long records bounded (`max_sparse_segments`, `max_sparse_size`, `max_pax_len`, `max_name_len`); 32-bit targets (the router-tool consumer's mips / arm) are checked under qemu (see *Verification*).
 
 **Where we are ahead:** over `std.tar`: uid/gid/uname/gname/mtime preserved both ways, sparse expansion, hard links, GNU 'L'/'K' writing, streaming gzip packer, `packDir` with real `statx` attributes, `Entry.dupe`, offline GNU tar 1.35 golden archives, extraction checks · **Where we are behind:** no sparse writing; no xattrs or arbitrary pax records; no extractor.
-
-Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenance: see ./README.md (no NOTICE entry — own code; the installed GNU tar binary was used only as a black-box test oracle).
 
 ## Design & invariants
 Headers are the security boundary: every 512-byte header is checksum-verified (unsigned sum per
@@ -56,7 +51,7 @@ bounded memory: `Reader` streams content via `read()` and auto-skips unread byte
 allocate exactly one flate window. Format subset (busybox + GNU): files/dirs/symlinks/hard links,
 GNU long-name('L')/long-link('K') records, ustar `prefix` field (honored only under POSIX `ustar\0`
 magic — GNU reuses those bytes for atime/ctime), octal and GNU/star base-256 size fields; pax
-'x' headers (`path`, `linkpath`, `size`, `uid`, `gid`, `mtime` override the ustar fields exactly, other records parsed past; `mtime` keeps whole seconds plus nanoseconds in `Entry.mtime`/`mtime_nsec`, floor semantics for negative fractions, digits past the ninth cut; an empty value deletes the keyword, a repeated one is last-wins; a malformed header or a non-numeric/over-range `uid`/`gid`/`mtime` is `BadHeader`, payload capped at `max_pax_len`, a path at `max_name_len`), pax 'g' global headers skipped; unknown typeflags surface as `.other` (writer rejects with
+'x' headers (`path`, `linkpath`, `size`, `uid`, `gid`, `mtime` override the ustar fields exactly, `uname`/`gname` set `Entry.uname`/`gname` (`root.zig:877`), other records parsed past; `mtime` keeps whole seconds plus nanoseconds in `Entry.mtime`/`mtime_nsec`, floor semantics for negative fractions, digits past the ninth cut; an empty value deletes the keyword, a repeated one is last-wins; a malformed header or a non-numeric/over-range `uid`/`gid`/`mtime` is `BadHeader`, payload capped at `max_pax_len`, a path at `max_name_len`), pax 'g' global headers skipped; unknown typeflags surface as `.other` (writer rejects with
 `error.UnsupportedKind`). Writer: `WriteOptions.long_names` is `.gnu` (default, output byte-identical to
 every earlier release: 'L'/'K' records, `FieldOutOfRange` for ids/mtime that do not fit) or `.pax`: a pax
 'x' header (`././@PaxHeader`, records in key order `gid linkpath mtime path size uid`, each `"<len> <key>=<value>\n"`
@@ -71,7 +66,7 @@ tar binary was used only as a black-box compatibility test oracle (see Verificat
 was never consulted, and no GPL code is involved — no NOTICE entry needed (own code, no third-party
 source).
 
-## API surface additions (2026-08-18)
+## API surface additions
 `packDirToPath(io, gpa, roots, out_path)` wraps `packDir` with the create-file/wrap-writer/flush
 steps a caller otherwise repeats for every call site; `packDir` is unchanged and still writes to a
 caller-owned `*std.Io.Writer`. `Entry.dupe(allocator) -> OwnedEntry` copies the borrowed
@@ -80,7 +75,7 @@ comment) into the caller's allocator; `OwnedEntry` is a distinct type with its o
 caller building a manifest across multiple entries has an unmistakable ownership signal at the call
 site rather than relying on remembering the doc comment.
 
-## Sparse members, extraction safety (2026-11-04)
+## Sparse members, extraction safety
 **Sparse (read).** GNU old 'S' (four map pairs in the header, 21 per extension block, `isextended`
 chain bounded) and pax `GNU.sparse` 0.0 (`offset`/`numbytes` records), 0.1 (`map`) and 1.0 (map as
 text in the data, padded to a block). The entry is a `.file` whose `Entry.size` is the LOGICAL size;
@@ -91,7 +86,13 @@ disjoint, inside the logical size, no more data than is stored, `max_sparse_segm
 1 MiB of map); a violation is `BadHeader`. `Reader.max_sparse_size` (default 256 MiB, a larger one is an explicit option; a claim over it is `BadHeader`, never truncated) bounds the
 logical size a few header bytes can declare: holes cost the reader nothing to declare but the
 consumer a drain loop to read, so a consumer that copies to disk applies its own quota to
-`Entry.size` anyway. Sparse members are never written (a sparse file is packed whole).
+`Entry.size` anyway. Sparse members are never written (a sparse file is packed whole). A member whose stored `size` its map does not use is
+`BadHeader` (exact, as Go: GNU tar 1.35 stops skipping earlier on such a header and would read a member `checkArchive`
+never saw, `root.zig:777-780`); `GNU.sparse.major` without a minor is `BadHeader` (`root.zig:702`); zero-length map
+entries are dropped unvalidated and an empty pax `uname`/`gname` leaves the ustar field, both kept as policy.
+With `-Dtar-sparse=false` a sparse member is `BadHeader` (see *Build options*). `Reader.discard` skips in steps of at
+most 256 MiB because `std.Io.Reader.discardAll64` overflows `seek + n` on 32-bit targets for a declared size of a few
+GiB (`root.zig:912-927`; see *Backlog / deferred*).
 
 **Extraction safety.** The module still writes no files; it ships the check an extractor needs.
 `checkPath` (empty, NUL, absolute, `..`), `checkEntry` (plus: only file/dir/symlink/hard link, a
@@ -124,77 +125,83 @@ and the sparse map. `Reader` returns names and link targets verbatim (it is a co
 paths, symlink/hard-link escapes and special files before creating anything. Out of scope: pax
 global ('g') headers (skipped: `go doc archive/tar.TypeXGlobalHeader` says Go "does not currently
 support persisting the global state across files" either; rejected, no consumer needs it) and the pax records beyond
-`path`/`linkpath`/`size`/`uid`/`gid`/`mtime` and `GNU.sparse.*` (xattrs and ACLs: no
+`path`/`linkpath`/`size`/`uid`/`gid`/`mtime`/`uname`/`gname` and `GNU.sparse.*` (xattrs and ACLs: no
 bounded representation), per-file compression other than the
 whole-stream gzip, encryption/signing, writing sparse members or special files (fifo/dev/socket —
 `packDir` skips them). `packDir` is best-effort (unstatable/unreadable
-entries skipped so one bad file never fails the archive).
+entries skipped so one bad file never fails the archive). Its limits, as built: a file that shrinks, is replaced or fails
+to read while packed is zero-padded to its header size and counted in `skipped` (GNU tar behaviour); a refused
+DIRECTORY (uid/gid/mtime out of ustar range) is counted once in `skipped` whatever its subtree holds, and one whose
+`openDir` fails keeps its header and is not counted (open fds: one per stack frame, `RLIMIT_NOFILE`); `packDir`
+neither stays on one device nor avoids pseudo filesystems (`/proc/kcore`, bind-mount loops can make the tree
+effectively infinite) unless `packDirOptions` is used: `PackOptions.same_device` (a mount point keeps its header, is
+not descended and not counted in `skipped`; GNU tar `--one-file-system`), `max_entries` and `max_bytes`
+(`error.LimitExceeded`, the destination then holds an unfinished stream), defaults off so `packDir` is unchanged
+(`root.zig:1645-1660`); stored names are the given paths (a root `../x` yields an escaping archive). The module has no
+extractor: path-escape checks belong to whoever extracts.
 
 ## Verification
-Golden header bytes captured from GNU tar 1.35 pinned (read side) and field-compared against the
-writer's emit (write side). Write→read round-trips assert uid/gid/mtime/mode/size/path/link_target
-survive, incl. >100-byte GNU 'L'/'K' long names, dirs, symlinks, hard links; a gzip round-trip goes
-`packTarGz` → `std.compress.flate` decompress → `Reader`. Malformed-input tests: truncated
-header/content, mid-archive truncation, bad checksum, garbage block, hostile 'L' size, empty archive.
-A live external cross-check writes an archive that system GNU `tar` must list (`tvf`) and extract
-(`xf`), and reads a GNU-tar-produced archive back (skips cleanly with no `tar` on PATH); `packDir`
-round-trips real statx attrs on Linux.
 
-The live cross-check only anchors the writer on a machine with `tar` installed. `write_golden_test.zig`
-closes that gap offline: five archives (`testdata/write_golden_*.tar`) captured once from real GNU tar
-1.35 (`--format=ustar` for four — byte-identical magic to this module's own writer, so those are
-asserted fully byte-exact, incl. the 512-byte content padding and the two-zero-block trailer; `--format=gnu`
-for the >100-byte long-name case, asserted field-by-field since GNU's own magic/uname/gname differ by
-design) cover the writer's header field padding/octal formatting, the checksum field, every typeflag
-(file/dir/symlink/hardlink), the GNU 'L' long-name extension, and — read back through this module's own
-`Reader` — the real 10240-byte record-blocking-factor padding GNU tar itself emits (which this module's
-`Writer.finish()` deliberately does not replicate; a design choice, not a gap — see that file's doc
-comment). No subprocess, no skip path.
+`scripts/modtest tar` (`zig build test-tar`); `zig build bench-tar` (needs go); `zig build interop-tar` re-takes the Go
+oracle (below). Size and 32-bit: see *Build options*.
 
-`packDirToPath` is verified by a real round-trip through disk: pack a tree into a path, then reopen and
-decompress+read that exact file back with `Reader`, asserting the same content and stats `packDir`
-itself would produce. `Entry.dupe`/`OwnedEntry` is verified by a test that duped an entry's fields,
-then called `Reader.next()` again (the operation that invalidates a plain `Entry`'s borrowed
-`path`/`link_target`) and only then asserted the duped copy's content — a test shaped so it would
-fail if `dupe` forgot to actually copy the bytes, unlike a test that asserts before advancing (which
-the un-duped path would also pass).
-
-pax (2026-09-30): the reader is anchored to three archives written by real tools, never by this module
-(`testdata/read_pax_*.tar`, < 10 KiB each, recipes and the tools' own listings quoted in `pax_test.zig`):
-GNU tar 1.35 `--format=pax` (nanosecond mtime, uid 3000000/gid 4000001; a 130-byte path with mtime
-`-315619199.5`) and Python `tarfile` PAX_FORMAT (150-byte path, uid 5000000, mtime 1727700007.5 and
--1.25, 130-byte link target). The writer's pax bytes are pinned by hand-computed expectations (record
-lengths incl. the 999/1001/1002 digit boundary, ustar field values, prefix split), round-trips cover a long
-path, long links, uid/gid up to `maxInt(u32)`, fractional, negative and out-of-range mtime, a 20 GiB size and
-`minInt(i64)`; a live test has system GNU `tar` list (`--numeric-owner --full-time -tvvf`) and extract a
-pax-mode archive (skips without `tar`); the layout was also checked once by emulating the writer's bytes
-in Python and loading them with GNU tar and `tarfile`. Negative tests: a lying length prefix, non-numeric
-or `u32`/`i64`-overflowing `uid`/`gid`/`mtime`, a path over `max_name_len`, a payload over `max_pax_len`
-— each `error.BadHeader`.
-
-Sparse members (2026-11-04): `src/sparse_test.zig`. Four archives written by GNU tar 1.35 (`--sparse`, formats gnu / pax 1.0 / 0.1 / 0.0) of one 1,053,576-byte file with three data islands; each is read back byte for byte against the generator, and Go's `archive/tar` reads the same four to the same SHA-256 as the source file (the external anchor, a throwaway Go program; recipe in the file header). Hand-built archives of every generation round-trip (also > 4 segments with GNU extension blocks, an all-hole file), hostile maps (unordered, overlapping, past the size, wrapping, over `max_sparse_size`, more or less data than stored, malformed `GNU.sparse.*` records, a 1.0 map with bad digits, a cut stream, an endless extension chain) are `BadHeader`/`TruncatedArchive`, the segment cap is pinned at 65,536 / 65,537. `sweep_test.zig`: every truncation of each fixture, `checkPath`/`checkEntry`/`checkArchive` over hostile names, links, special files and an empty archive. Fuzz harness `sparse` (see Hardening). Mutation (schemata, a copy of `src/`): 11 mutants over the new validation and read paths, 9 killed (two survived the first test set and got tests: the GNU `max_sparse_size` guard and the exact segment cap), 2 equivalent (the 1.0 `count` cap, which `appendSeg` and the size accounting enforce anyway, and the 20-digit limit, which `math.mul` enforces). 32-bit: the whole module test set also runs under `qemu-mips` (`mips-linux-musl`, `mips32+soft_float`, big-endian) and `qemu-arm` (`arm-linux-musleabi`, `cortex_a7`): 122 passed, 3 skipped (the fuzz driver, two Linux `packDir` tests), 0 failed on both; it found a real panic (`std.Io.Reader.discardAll64` overflow on a declared multi-GiB size, now `Reader.discard` skips in 256 MiB steps) and a test that could not set a 64-bit mtime.
-
-Run: `zig build test-tar`; `zig build bench-tar` (needs go); size/32-bit: see Backlog.
-
-**Audit 2026-10-04 (mutation).** 53 schemata mutants over the reader's guards (short and
-zero blocks, checksum incl. the signed form and the 8-byte space window, size-overflow
-guards, GNU 'L'/'K' and pax caps, every pax record-shape check, keyword deletion and
-per-entry scope, `carries_content`, typeflag mapping, prefix under POSIX vs GNU magic,
-base-256 high bytes) and the writer's (field ranges, NUL refusal, 'L' threshold,
-`splitPrefix` limits, pax record length fixed point and thresholds, octal/base-256 switch,
-checksum): 51 killed, 2 equivalent, 0 left alive. Equivalent: dropping `sp == 0` in
-`readPax` (an empty length then fails `parseInt`, still `BadHeader`); `len <= sp + 1` →
-`len < sp + 1` (at `len == sp + 1` the record's last byte is the space, so the newline
-check refuses it). 16 survivors got tests: size guards on the 'g' and pax-size paths
-(no overflow panic), pax `size` scoped to its own entry, `size=` deleting the keyword,
-signed / `_`-free decimal digits in pax lengths and values, '7' as a regular file, an empty
-'L' payload, GNU-magic atime bytes not read as a prefix, a 7-digit+NUL checksum field and a
-signed-sum header accepted, the exact 100/155-byte name/prefix limits on both writer modes,
-and the 8 GiB octal/base-256/pax-`size` boundary.
+- **Writer and reader goldens.** Header bytes captured from GNU tar 1.35 pinned (read side) and field-compared
+  against the writer's emit (write side). Write-then-read round-trips assert uid/gid/mtime/mode/size/path/link_target
+  survive, including >100-byte GNU 'L'/'K' long names, dirs, symlinks, hard links; a gzip round-trip goes
+  `packTarGz` -> `std.compress.flate` decompress -> `Reader`. Malformed-input tests: truncated header/content,
+  mid-archive truncation, bad checksum, garbage block, hostile 'L' size, empty archive.
+- **Live cross-checks** (skip without `tar` on PATH): an archive this writer writes must be listed (`tvf`) and extracted
+  (`xf`) by system GNU `tar`, in `.gnu` and in `.pax` mode (`--numeric-owner --full-time -tvvf`), and a GNU-tar-produced
+  archive is read back; `packDir` round-trips real statx attributes on Linux.
+- **Offline write goldens** (`src/write_golden_test.zig`, `testdata/write_golden_*.tar`): five archives captured once
+  from real GNU tar 1.35 (`--format=ustar` for four, byte-identical magic to this writer, asserted fully byte-exact
+  including the 512-byte content padding and the two-zero-block trailer; `--format=gnu` for the >100-byte long-name
+  case, asserted field by field since GNU's magic/uname/gname differ by design) cover header field padding and octal
+  formatting, the checksum field, every typeflag and the GNU 'L' extension, and, read back through this module's
+  `Reader`, the 10240-byte record-blocking-factor padding GNU tar emits (which `Writer.finish()` deliberately does
+  not replicate; a design choice, not a gap).
+- **`packDirToPath` and `Entry.dupe`.** `packDirToPath` is verified by a round-trip through disk: pack a tree into a
+  path, reopen and decompress+read that file with `Reader`, same content and stats `packDir` would produce.
+  `Entry.dupe`/`OwnedEntry` by a test that dupes an entry, calls `Reader.next()` again (which invalidates a plain
+  `Entry`'s borrowed strings) and only then asserts the copy, so it fails if `dupe` forgot to copy.
+- **pax** (`src/pax_test.zig`): the reader is anchored to three archives written by real tools, never by this module
+  (`testdata/read_pax_*.tar`, recipes and the tools' own listings quoted in the test file): GNU tar 1.35
+  `--format=pax` (nanosecond mtime, large uid/gid, a 130-byte path with a negative fractional mtime) and Python
+  `tarfile` PAX_FORMAT (150-byte path, large uid, fractional and negative mtime, 130-byte link target). The writer's
+  pax bytes are pinned by hand-computed expectations (record lengths including the 999/1001/1002 digit boundary,
+  ustar field values, prefix split); round-trips cover a long path, long links, uid/gid up to `maxInt(u32)`,
+  fractional, negative and out-of-range mtime, a 20 GiB size and `minInt(i64)`. Negative tests: a lying length prefix,
+  non-numeric or `u32`/`i64`-overflowing `uid`/`gid`/`mtime`, a path over `max_name_len`, a payload over
+  `max_pax_len`, each `error.BadHeader`.
+- **Sparse members** (`src/sparse_test.zig`): four archives written by GNU tar 1.35 (`--sparse`, formats gnu / pax 1.0 /
+  0.1 / 0.0) of one file with three data islands, each read back byte for byte against the generator; Go's
+  `archive/tar` reads the same four to the same SHA-256 as the source file (the external anchor, a throwaway Go
+  program; recipe in the file header). Hand-built archives of every generation round-trip (also more than four
+  segments with GNU extension blocks, an all-hole file); hostile maps (unordered, overlapping, past the size,
+  wrapping, over `max_sparse_size`, more or less data than stored, malformed `GNU.sparse.*` records, a 1.0 map with
+  bad digits, a cut stream, an endless extension chain) are `BadHeader`/`TruncatedArchive`; the segment cap is pinned
+  at 65,536 / 65,537. `src/sweep_test.zig`: every truncation of each fixture, and `checkPath`/`checkEntry`/
+  `checkArchive` over hostile names, links, special files and an empty archive.
+- **Go oracle** (`tools/go_oracle/`, stdlib only; `src/go_oracle.zig` + `go_oracle_vectors.zig`): `zig build
+  interop-tar` writes our archives, checks that Go read every entry as written and that the committed vectors are fresh
+  (`-- --regen` rewrites them); `go run . -dump DIR` writes every read case as a file, which is how GNU tar is asked
+  on a divergence.
+- **Fuzz** (`TAR_FUZZ=<runs>[,<first seed>]`, `src/fuzz_test.zig`): the `reader` and `mutated` harnesses, and `sparse`,
+  whose reach counters check that inputs get past the sparse member to the one behind it.
+- **32-bit:** the whole module test set also runs under `qemu-mips` (`mips-linux-musl`, `mips32+soft_float`,
+  big-endian) and `qemu-arm` (`arm-linux-musleabi`, `cortex_a7`); the fuzz driver and the two Linux `packDir` tests
+  skip there.
+- **Mutation scope:** the reader's guards (short and zero blocks, checksum including the signed form, size-overflow
+  guards, GNU 'L'/'K' and pax caps, every pax record-shape check, keyword deletion and per-entry scope, typeflag
+  mapping, prefix under POSIX vs GNU magic, base-256), the writer's (field ranges, NUL refusal, 'L' threshold,
+  `splitPrefix` limits, pax record length fixed point, octal/base-256 switch, checksum), the sparse validation and
+  read paths, and `packDirOptions`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Build options
 
-Consumer build options (CONVENTIONS §4.2), added 2026-11-04 because the router-tool consumer's backup vault copies `Entry.size` bytes
+Consumer build options (CONVENTIONS §4.2), because the router-tool consumer's backup vault copies `Entry.size` bytes
 of a member to disk and a sparse header of a few hundred bytes can declare a large one:
 
 | option | values | default | `-Dprofile=small` |
@@ -202,35 +209,41 @@ of a member to disk and a sparse header of a few hundred bytes can declare a lar
 | `tar-sparse` | `true` / `false` | `true` (graded) | `false` |
 
 - **`false`:** the sparse reader is gone and a sparse member is `error.BadHeader`: typeflag 'S', or a regular
-  file with a `GNU.sparse.*` pax record (delta audit 2026-11-04: reading 'S' as `.other` left its extension
-  blocks unread and hid the members behind them). `Reader.read` is the plain path.
+  file with a `GNU.sparse.*` pax record (reading 'S' as `.other` would leave its extension
+  blocks unread and hide the members behind them). `Reader.read` is the plain path.
   `tar.sparse_enabled` is the comptime value; the sparse tests skip.
-- **Gain** (`tools/sizeprobe.zig`, ReleaseSmall, mips soft-float): 179,568 -> 172,036 bytes of text.
-- **Independent of the option:** `Entry.uname`/`gname`, the sticky error, the lone-zero-block rule,
+- **Gain** (`tools/sizeprobe.zig`, a Reader walk plus Writer, ReleaseSmall, `mips-linux-musl` + `mips32,soft_float`, stripped): 179,568 -> 172,036 bytes of text. The knob has precedent in `zipstream-builtin-decoders`, `dns-doh` and `ct25519-base-comb`.
+- **Independent of the option:** `Entry.uname`/`gname`, the sticky error, the lone-zero-block rule, the 256 MiB skip steps,
   `checkPath`/`checkEntry`/`checkArchive` (lazy, linked only when called).
-- **Floor row** for `scripts/checks/small-size-expected.tsv` (the coordinator adds it; not touched here):
-  `tar<TAB>3500<TAB>2026-11-04: 179568 -> 172036 B text (gain 7532), knob tar-sparse; mips-linux-musl soft-float probe`.
+
+## What is deliberately not done
+
+- **Sparse writing:** a sparse file is packed whole (`packDir` has no SEEK_HOLE walk) and nothing reads a sparse member
+  back from this module's writer. Go's writer does not write them either.
+- **An extractor** (extraction to disk): `std.tar.extract` exists in the toolchain and drops uid/gid/mtime; an extractor
+  that keeps them needs `fchownat`/`utimensat` policy (root or not) that belongs to the application. The module ships
+  the check every extractor needs and can get wrong (`checkPath`/`checkEntry`/`checkArchive`). The check is lexical: an
+  extractor must itself refuse to write through a symlink an earlier entry created (`openat2` with
+  `RESOLVE_BENEATH`, or no link following).
+- **pax 'g' global headers:** skipped; Go parses them but does not apply them across files, and no consumer needs them.
+- **Arbitrary pax records** (xattrs, ACLs): parsed past; surfacing them needs an unbounded allocation per entry, which
+  the Reader avoids by design (bounded memory).
+- **Per-file compression** other than the whole-stream gzip, **encryption/signing**, **special files** (fifo, device,
+  socket) in `packDir`.
 
 ## Backlog / deferred
-- ~~(survey 2026-09-30) **pax extended header interpretation**~~ — DONE 2026-09-30: `path`, `linkpath`, `size` (the survey found the reader returning the truncated ustar name and desynchronising on a pax `size`; graded a defect, fixed the same day, with an external anchor against GNU tar `--format=pax`) and, the same day (C17), `uid`, `gid`, `mtime` incl. nanoseconds (`Entry.mtime_nsec`), anchored to GNU tar and Python tarfile archives. Why a user cared: bsdtar/macOS tar, Go and many CI tools emit pax by default; today the reader silently returns the truncated ustar name or 0/absent size for such entries (SPEC currently only says "skipped, never fatal"). ~200 lines incl. bounded-record parsing (reuse `max_name_len`); fits CONVENTIONS section 2.
-- ~~(survey 2026-09-30) **pax writing** (long path/large uid without GNU 'L')~~ — DONE 2026-09-30 (C17): `WriteOptions.long_names = .pax`, default `.gnu` unchanged. Open follow-ups: pax `uname`/`gname` and arbitrary records on read/write (no caller yet); the writer does not cap a pax payload at the reader's `max_pax_len`/`max_name_len` (a caller writing a > 64 KiB path produces an archive this reader refuses, same as the GNU 'L' mode).
-- (§ GW delta audit, 2026-10-31) **`packDir` over a file whose `read` returns EINVAL panics in Debug only**: std.Io
-  maps EINVAL from `read()` to `errnoBug`, a panic in Debug; ReleaseSafe/Fast get the error and pad + count it in
-  `skipped` as documented (sysfs attributes do this). Not ours to fix; GW-TA8 skips itself in Debug. LOW.
-- ~~(survey 2026-09-30) **sparse-file reading** (GNU 'S', pax sparse)~~ — DONE 2026-11-04 (S2): all four generations, GNU tar 1.35 fixtures read by Go to the same SHA-256, sparse fuzz harness, 9/11 mutants killed + 2 equivalent (below).
-- ~~(survey 2026-09-30) **extraction-to-disk helper with path sanitizing**~~ — the CHECK is DONE 2026-11-04 (`checkPath`/`checkEntry`/`checkArchive`, `Policy`); the extractor itself is rejected (see Compared with). Open follow-up for an extractor author: refuse to write through a symlink an earlier entry created (`openat2 RESOLVE_BENEATH`).
-- (S2 survey 2026-11-04, fix round) **ReleaseSmall size**: `-Dtar-sparse=false` (default under `-Dprofile=small`, shape of `zipstream-builtin-decoders`, read at comptime from `zl_options`) removes the sparse code. Probe `tools/sizeprobe.zig` (Reader walk + Writer, ReleaseSmall, `mips-linux-musl` + `mips32,soft_float`, stripped), text bytes: before this branch 170,288; sparse on 179,568 (+9,280); sparse off 172,036 (+1,748). The +1.7 KB with the option off is NOT zero: owner names (`Entry.uname`/`gname`), the sticky-error wrapper, the lone-zero-block rule and the 256 MiB skip steps are not behind the option. The earlier note here that the collection has no precedent for a comptime switch was wrong (`zipstream-builtin-decoders`, `dns-doh`, `ct25519-base-comb`).
-- (S2 survey 2026-11-04) **zig-libs request, not filed**: `std.Io.Reader.discardAll64` overflows `seek + n` on 32-bit targets (worked around in `Reader.discard`); upstream takes no agent reports, so only this note.
-- (S2 survey 2026-11-04) **not measured**: tar-rs, libarchive, GNU/busybox tar throughput (no `bsdtar`; no pinned crate in the offline cargo cache; CLI timing is process-bound). Command to add tar-rs: a `tools/rust_bench` crate pinned to `tar = "=0.4.46"` built with `cargo build --release` in its own `target/`.
-Beyond the documented out-of-scope list (pax 'g' and records beyond
-`path`/`linkpath`/`size`/`uid`/`gid`/`mtime`/`GNU.sparse.*`, sparse writing, per-file compression, encryption/signing, special files).
 
-- **2026-10-19, closed 2026-11-10 — Zig 0.17.0 miscompile #37131** (signed → narrower unsigned cast emitted as `trunc nsw`): 6 own site(s) and the std sites recorded here on 0.17.0 are moot. Zig 0.17.1 fixes it, `build.zig` refuses older compilers, and the IR re-scan on 0.17.1 found no signed → narrower-unsigned `trunc nsw` in 934 build roots (2026-11-10).
-- (sweep GW 2026-10-31, fix round) **`packDir` limits left as documented**: a file that shrinks, is replaced or fails to read while packed is now zero-padded to its header size and counted in `skipped` (GNU tar behaviour); a refused DIRECTORY (uid/gid/mtime out of ustar range) is counted once in `skipped` whatever its subtree holds, and one whose `openDir` fails keeps its header and is not counted (open fds: one per stack frame, RLIMIT_NOFILE); the walk of `packDir` neither stays on one device nor avoids pseudo filesystems (`/proc/kcore`, bind-mount loops can make the tree effectively infinite) -- DONE 2026-11-19: `packDirOptions` with `PackOptions.same_device` (mount point keeps its header, not descended; GNU tar `--one-file-system`), `max_entries`, `max_bytes` (`error.LimitExceeded`), defaults off so `packDir` is unchanged (GNU tar crosses devices by default too); stored names are the given paths (a root `../x` yields an escaping archive). The module has no extractor: path-escape checks belong to whoever extracts (the router-tool consumer's core only packs; the router-tool consumer's backup vault ingest only re-hashes content).
-
-## Status
-`extract · any (packDir: linux) · both (reader+writer) · reentrant` + deps: none (std only —
-`std.compress.flate` for gzip) — canonical source is `pub const meta` in src/root.zig.
+- **The pax writer does not cap a payload at the reader's `max_pax_len`/`max_name_len`:** a caller writing a path over
+  64 KiB produces an archive this reader refuses (the same as the GNU 'L' mode). Open; no caller needs it.
+- **`packDir` over a file whose `read` returns EINVAL panics in Debug only:** `std.Io` maps EINVAL from `read()` to
+  `errnoBug`, a panic in Debug; ReleaseSafe/Fast get the error and pad + count it in `skipped` as documented (sysfs
+  attributes do this). Not ours to fix (std); the test skips itself in Debug. LOW.
+- **std workaround to drop when std is fixed:** `Reader.discard` (256 MiB steps) works around
+  `std.Io.Reader.discardAll64` overflowing `seek + n` on 32-bit targets. Zig upstream takes no agent reports, so there is
+  no report to file; delete the workaround when a newer std no longer overflows.
+- **Not measured:** tar-rs, libarchive and GNU/busybox tar throughput (no `bsdtar`; no pinned crate in the offline cargo
+  cache; CLI timing is process-bound). To add tar-rs: a `tools/rust_bench` crate pinned to `tar = "=0.4.46"` built with
+  `cargo build --release` in its own `target/`.
 
 ## Anchoring
 
@@ -246,16 +259,3 @@ real GNU tar 1.35 and Python tarfile archives (`testdata/read_pax_*.tar`, `write
 path: Go reads this module's Writer output in both modes and through `packTarGz` (the replay rewrites
 Go's view and requires the same bytes), plus the GNU tar goldens. Self only: `packDir`'s statx walk
 (the OS is its truth).
-
-**Go oracle 2026-10-05.** `tools/go_oracle/` (stdlib only) answers this module's own cases;
-`zig build interop-tar` re-takes it (writes our archives, checks Go read every entry as written, checks
-the committed vectors are fresh; `-- --regen` rewrites them). It found five defects, fixed the same day:
-GNU/star base-256 numeric fields read as 0 (uid 3000000 from `tar --format=gnu` came back as **root**,
-negative and far-future mtimes as the epoch); non-octal bytes in a numeric field read as 0 (again uid 0)
-instead of refused; a sign in an octal field accepted (`+5`); a NUL-typeflag entry named `dir/` read as a
-file (GNU tar and Go: a directory); `packTarGz`/`packDir` into a writer with a buffer of 8 bytes or less
-(`Writer.Allocating.init`, an unbuffered file) tripped `flate.Compress`'s assertion. One leniency aligned:
-pax `mtime=1.` is 1 s (GNU tar and Go). `go run . -dump DIR` writes every read case as a file, which is how
-GNU tar was asked on each divergence.
-
-**How it got there.** The anchoring work landed. DONE 23312c0: 5 real GNU tar archives frozen, write path anchored offline
