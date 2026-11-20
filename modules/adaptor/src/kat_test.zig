@@ -409,7 +409,7 @@ fn fuzzPreVerify(_: void, smith: *std.testing.Smith) !void {
     // no corpus, on the single `in = ""` round the lane runs, `n_flips` was 0
     // and the harness verified vector 0's PRISTINE pre-signature, unmodified,
     // for ever. The word "corrupted" in this target's own name had never been
-    // true of a single input it ran. Measured 2026-09-07: 1 input, 0 flips,
+    // true of a single input it ran. Measured: 1 input, 0 flips,
     // 0 refusals from `fromBytes`.
     var script_buf: [32]u8 = undefined;
     const n: usize = smith.slice(&script_buf);
@@ -488,7 +488,7 @@ test "corpus: every seed reaches preVerify or its decoder, and both verdicts are
         };
         if (adaptor.preVerify(px, vec0.msg, t_point, presig)) verified += 1 else rejected += 1;
     }
-    // Measured 2026-09-07. Before: 0 damaged encodings, 0 decode refusals, 0
+    // Measured. Before: 0 damaged encodings, 0 decode refusals, 0
     // rejections — one input, and it verified.
     try std.testing.expectEqual(@as(usize, 11), distinct);
     try std.testing.expectEqual(@as(usize, 2), decode_refusals);
@@ -496,7 +496,7 @@ test "corpus: every seed reaches preVerify or its decoder, and both verdicts are
     try std.testing.expectEqual(@as(usize, 9), rejected);
 }
 
-// Mutation run 2026-10-05: every scalar/field range check outside `preVerify`
+// Mutation run: every scalar/field range check outside `preVerify`
 // stood untested — the vectors are all canonical — so reducing instead of
 // refusing survived in `PreSignature.fromBytes`, `adapt` and `extract`. A
 // value ≥ n (or r ≥ p) is a different encoding, not the same scalar: n + 1
@@ -537,7 +537,7 @@ test "range checks: r >= p and s' >= n in PreSignature.fromBytes, s' >= n and t 
 
     // s' >= n in extract: a hand-built pre-signature is refused as such, not
     // reduced mod n and reported as a mismatch (the reduction survived the
-    // 2026-10-08 mutation run: nothing called extract with a bad s').
+    // mutation run: nothing called extract with a bad s').
     full = try bip340.Signature.fromBytes(sig);
     try std.testing.expectError(error.InvalidPreSignature, adaptor.extract(bad_s, full, t_point));
 }

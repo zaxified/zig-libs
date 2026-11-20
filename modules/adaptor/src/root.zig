@@ -307,7 +307,7 @@ pub fn preSign(
     return result;
 }
 
-/// Audit 2026-10-08 (HIGH). `preSign` had no stack burn: measured with
+/// Audit (HIGH). `preSign` had no stack burn: measured with
 /// `stackprobe_test.zig` (ReleaseFast), every pre-signature left the nonce
 /// `k0` and its hash `rand` on the dead stack, and the nonce next to the
 /// published `s_prime` and the public challenge is the secret key
@@ -325,8 +325,7 @@ noinline fn preSignFromSecretKey(
 }
 
 /// How much stack below the burning frame is zeroed after steps 1-8. The
-/// probe printed 21.6 KB dirtied below a `preSign` call (2026-10-08,
-/// ReleaseFast), self-check included; the steps alone use less.
+/// probe printed 21.6 KB dirtied below a `preSign` call (ReleaseFast), self-check included; the steps alone use less.
 /// `stackprobe_test.zig` fails on any residue and prints the depth, so a
 /// call tree that outgrows this goes red there.
 const presign_stack_burn = 32 * 1024;
@@ -337,11 +336,11 @@ const presign_stack_burn = 32 * 1024;
 /// Volatile stores keep the dead store.
 noinline fn burnPreSignStack() void {
     // Volatile 16-byte vector stores (`secureZero` is a volatile byte memset,
-    // ~3 B/ns without libc; this is ~50 B/ns, 2026-10-09). 16, not 32: with a
+    // ~3 B/ns without libc; this is ~50 B/ns). 16, not 32: with a
     // 32-byte vector LLVM raised the buffer's alignment to 32 for small burns
     // (n <= 2 KiB) and realigned the frame (`and $-32, %rsp`), leaving 32..63 bytes
     // between the buffer top and the saved frame pointer unzeroed -- a callee's
-    // 32-byte scalar survived there (voprf stack probe, 2026-10-09; `align(16)` on
+    // 32-byte scalar survived there (voprf stack probe,; `align(16)` on
     // the buffer alone did not stop it). At 16 the frame needs no realignment and
     // the buffer ends at the saved frame pointer.
     const V = @Vector(2, u64);
@@ -354,14 +353,13 @@ noinline fn burnPreSignStack() void {
 /// deliberately-corrupted stand-in — hands to `preSignImpl`.
 const ComputeResult = struct { presig: PreSignature, pubkey: bip340.XOnlyPublicKey };
 
-/// A1 F5, round-2 follow-up (2026-09-11): the first version of this seam
+/// A1 F5, round-2 follow-up: the first version of this seam
 /// (bip340 sibling, same fix, same session) split `preSign` into
 /// `computeUnverified` + a standalone `selfCheck`, and a test called both
 /// directly — but that only proved `selfCheck` can reject a bad
 /// pre-signature; it said nothing about whether `preSign`'s own body still
 /// CALLS it. Measured: deleting `preSign`'s `try selfCheck(...)` line left
-/// every test green (`feedback_n_copies_of_one_invariant_is_one_
-/// unverifiable_guard` — the guard and the thing verifying it were two
+/// every test green (the guard and the thing verifying it were two
 /// separate, independently-deletable places). See `bip340.zig`'s `signImpl`
 /// for the full writeup; same fix here.
 ///
@@ -372,7 +370,7 @@ const ComputeResult = struct { presig: PreSignature, pubkey: bip340.XOnlyPublicK
 /// (`computeUnverified`); a permanent test calls `preSignImpl` with a
 /// deliberately corrupted computation and confirms THIS function — not a
 /// copy of its logic — rejects it. Measured three ways in the fix commit's
-/// dispozice (`A1/adaptor.md`): today's tree (GREEN), the self-check CALL
+/// audit notes (A1 audit): today's tree (GREEN), the self-check CALL
 /// deleted from `preSignImpl` (RED), and the self-check's own verdict
 /// ignored (RED) — plus a positive control (an honest computation still
 /// succeeds).

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack probe on the shared engine (`testkit.stackprobe`) for the two
-//! adaptor-secret entry points burned in the 2026-10-09 sweep:
+//! adaptor-secret entry points burned in the sweep:
 //! `AdaptorPoint.fromSecret` and `adapt`. (`preSign` stays covered by the
 //! older `stackprobe_test.zig`.) ReleaseFast only (`skipUnlessOptimized`).
 

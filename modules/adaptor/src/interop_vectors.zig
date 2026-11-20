@@ -18,7 +18,7 @@
 //!   crate:    schnorr_fun 0.13.0        (license 0BSD)
 //!   crate:    secp256kfun 0.12.1        (license 0BSD, pulled transitively)
 //!   repo:     https://github.com/LLFourn/secp256kfun
-//!   captured: 2026-08-09, rustc 1.93.1
+//!   captured:, rustc 1.93.1
 //!   command:  cargo run --release --manifest-path modules/adaptor/tools/vectors/Cargo.toml \
 //!               > modules/adaptor/src/interop_vectors.zig
 //!
