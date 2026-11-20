@@ -20,7 +20,7 @@
 **Downstream consumer:** yes
 
 Allowlist validators + a typed argv builder neutralizing argument/flag injection into an exec argv.
-Usage: see ./README.md. Attribution/provenance: see this module's README "Provenance" note — clean-room, so there is deliberately no root `/NOTICE` entry to point at (root `NOTICE` §0).
+Usage: see ./README.md. Attribution/provenance: see the README's `Provenance:` line.
 
 ## Compared with
 
@@ -35,7 +35,7 @@ Surveyed 2026-09-30, re-surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`; stars and 
 | sibling `validate` (this repo) | Zig | MIT | — | — | Request body/query/path validation with aggregated errors; not argv-oriented. The sibling `netaddr` covers IP/CIDR parsing. |
 | Zig `std` | Zig | MIT | — | Zig 0.16.0 | `std.process.spawn`/`run` take an argv array (no shell), which removes shell injection but not flag injection; std offers no validators. |
 
-**Where we are ahead:** the only one of the tools compared that addresses *flag* injection into an exec argv (leading `-`, NUL, control bytes, `..`) as the default, with a builder where an unvalidated element cannot be appended (`push` accepts comptime literals only; a rejected `pushChecked` poisons `slice()`), `explain` returning the reason, and `Template` (trusted-config argv shape, untrusted holes) which none of the above has. **Where we are behind:** the validator set is the seven shapes the source project needed (identifier, path, URL by character class, base64, CIDR list, kv value, allow-list), not a general format library (email) — hostname, port, bounded integer and interface name were added 2026-11-02; no shell quoting and no Windows quoting, both rejected on purpose (→ Backlog).
+**Where we are ahead:** the only one of the tools compared that addresses *flag* injection into an exec argv (leading `-`, NUL, control bytes, `..`) as the default, with a builder where an unvalidated element cannot be appended (`push` accepts comptime literals only; a rejected `pushChecked` poisons `slice()`), `explain` returning the reason, and `Template` (trusted-config argv shape, untrusted holes) which none of the above has. **Where we are behind:** the validator set is the seven shapes the source project needed (identifier, path, URL by character class, base64, CIDR list, kv value, allow-list), not a general format library (email) — hostname, port, bounded integer and interface name come on top of those seven; no shell quoting and no Windows quoting, both rejected on purpose (*What is deliberately not done*).
 
 ## Design & invariants
 - **`CharClass`** — the one composable predicate every convenience function collapses to: byte-class
@@ -58,15 +58,15 @@ Surveyed 2026-09-30, re-surveyed 2026-11-02 per `SURVEY-PLAYBOOK.md`; stars and 
     implementation detail and only ever go through `push`/`pushChecked`/`pushIf`/`slice`/`deinit`. A
     future refactor should consider a stronger encapsulation (e.g. an opaque handle plus an
     accessor in a separate file) to make the invariant harder to violate by accident.
-- **`CharClass.explain(s) ?Reason` — DONE 2026-09-28** (requested by the terminal-UI consumer). `check` is now
+- **`CharClass.explain(s) ?Reason`**. `check` is
   `explain(s) == null`, not a second hand-written copy of the same conditions — the two cannot
   drift apart because there is only one implementation. `Reason` names which condition failed
   (`too_short`, `too_long`, `nul_byte`, `leading_dash`, `forbidden_substring`, `bad_first_char`,
   `control_byte`, `bad_byte`), tested in the exact order `check` always tested them in, so a caller
   (a UI, a config-validation error) can say *why* a value was rejected without re-implementing
   `check`'s rules.
-- **`Template` — an argv shape from a trusted config, holes filled from untrusted values — DONE
-  2026-09-28** (requested by the terminal-UI consumer, ideal API sketched in the former backlog entry below).
+- **`Template` — an argv shape from a trusted config, holes filled from untrusted values.**
+  The precedent it follows is Ansible, systemd `ExecStart=` specifiers and Rundeck/StackStorm actions.
   `Template.parse(tokens, holes: []const Hole{ name, class })` validates a template
   (`["systemctl", "restart", "{unit}"]`-shaped) up front, allocating nothing (`tokens`/`holes` are
   borrowed — the template is config, trusted to outlive every `fill`). It fails closed on a config
@@ -106,51 +106,61 @@ are the proven-in-production ceilings carried from the pre-consolidation validat
 44/≤512).
 
 ## Verification
-**2026-11-02 (grade 2 work).** `src/model_test.zig`: hostname, interface name, port and uint against reference models written a different way (label splitting, `std.fmt.parseInt`) on all strings of length 0..5 over a 13-byte alphabet (~0.4 M) and 20 000 seeded mutations of valid names. `src/oracle_test.zig`: 6 319 corpus strings with frozen foreign verdicts (`tools/oracle.py`). Soundness direction: every string accepted by `isSafeIdentifier`, `isSafeBase64`, `isSafeCidrList(',')`, `isSafeKvValue(false)`, `isSafeHostname`, `isSafePort` or `isSafeIfname` is one word to Python `shlex`, to dash (with glob-matching files present, empty PATH) and to the UCRT command-line rules; hostname and port never accept what go-playground refuses (label `ours`: none); every `reject` (we refuse, Go accepts) is a named class (label ending in `-`, over 253 bytes, `+`/leading zero in a port); every interface name we accept the kernel accepts, and it accepts far more (`reject` is expected). `isSafePath`, `isSafeUrl` and `isSafeKvValue(true)` are shown NOT to be shell-safe (documented). No accepted-but-unsafe value was found in the existing predicates.
-`zig build test-argsafe`. Golden allow/reject tables covering every validator (incl.
-base64 exactly-44 with 43/45 rejected, `isSafePath` rejecting `..`,
-`isSafeCidrList` rejecting a leading dash even when the caller's `sep` is `'-'` itself), a
-property-style adversarial sweep feeding every predicate a raw NUL/`\n`/leading-`-`/`..`/DEL/ESC and
-asserting none are accepted, and `Argv` tests (validated build; a rejected `pushChecked`/`pushIf`
-poisons `slice()`). `CharClass.explain`/`check` agreement over a representative sweep of classes and
-inputs, plus each `Reason` shown reachable. `Template`: every `ParseError` (unknown hole, a hole in
-argv[0] — including an unknown name there, still `HoleInArgv0` not `UnknownHole` — unbalanced
-braces both unclosed and a stray close, duplicate hole names, an empty template), a successful fill
-with a hole as the whole token and one embedded mid-token, a hole reused twice (same token and
-across tokens) substituting consistently, `{{`/`}}` literal-brace escaping, every refusal `Reason`
-surfacing with the correct hole name, a flag-injection attempt (leading `-`) refused by default, and
-the `reject_leading_dash = false` opt-out allowing it. Green in Debug and ReleaseFast; `zig fmt
---check` clean.
 
-**Audit 2026-10-04 (mutation).** 40 schemata mutants over `CharClass.explain` (every
-check, each `first_char` rule, DEL, `allow_alnum`), the convenience predicates (lengths,
-schemes, leading-dash guards, charsets, DEL), `Argv`'s poisoning, and `Template`
-(empty, duplicate holes, argv[0] holes, unknown holes, stray braces, value count, per-value
-check, `{{` rendering): 40 killed, 0 equivalent, 0 left alive. Eight survivors of the first
-run were boundaries no test touched and got one table test: DEL as `control_byte` even when
-`extra` holds it, `allow_alnum = false`, no `.` in `isSafeIdentifier`, the 4096-byte path cap
-and DEL in a path, the 512-byte base64 cap, non-hex letters in a CIDR list, DEL in a printable
-kv value.
+Run: `scripts/modtest argsafe`; the foreign verdicts are re-taken with `tools/oracle.py` (commands in `tools/README.md`).
+
+- **Golden tables** (`src/root.zig`): allow/reject cases for every validator, including base64 at exactly the
+  required length with one byte less and more rejected, `isSafePath` rejecting `..`, and `isSafeCidrList` rejecting a
+  leading dash even when the caller's `sep` is `'-'` itself; the documented edges of every predicate (DEL, the length
+  caps, `allow_alnum = false`).
+- **Adversarial sweep** (`src/root.zig`): every predicate fed a raw NUL, `\n`, leading `-`, `..`, DEL and ESC, asserting
+  none is accepted.
+- **`CharClass`:** `explain` and `check` agree over a representative sweep of classes and inputs, and each `Reason` is
+  shown reachable; `reject_leading_dash` is load-bearing in isolation.
+- **`Argv`:** a validated build; a rejected `pushChecked` or `pushIf` poisons `slice()`; a swallowed allocation
+  failure poisons it too.
+- **`Template`:** every `ParseError` (unknown hole, a hole in argv[0] including an unknown name there, which is still
+  `HoleInArgv0`, unbalanced braces both unclosed and stray close, duplicate hole names, empty template); a fill with a
+  hole as the whole token and one embedded mid-token; a hole reused in one token and across tokens; `{{`/`}}`
+  escaping; every refusal `Reason` surfacing with the right hole name; a leading `-` refused by default and allowed
+  by the `reject_leading_dash = false` opt-out; a wrong number of values as `ValueCountMismatch`.
+- **Reference models** (`src/model_test.zig`): hostname, interface name, port and bounded integer against models
+  written a different way (label splitting, `std.fmt.parseInt`) on every string up to a short length over an alphabet
+  of each byte class that matters, then on seeded mutations of valid names; deterministic, no fuzz driver.
+- **Foreign oracle** (`src/oracle_test.zig`, vectors in `src/oracle_vectors.zig` from `tools/oracle.py`): frozen
+  verdicts of POSIX sh (Python `shlex`, dash with glob-matching files present and an empty PATH), the UCRT
+  command-line rules (a transcription of the documentation, not a Windows run), go-playground/validator
+  `hostname_rfc1123` and the port half of `hostname_port`, and the Linux kernel's interface-name check. Soundness
+  direction: every string accepted by `isSafeIdentifier`, `isSafeBase64`, `isSafeCidrList(',')`,
+  `isSafeKvValue(false)`, `isSafeHostname`, `isSafePort` or `isSafeIfname` is one word to the shell parsers and to the
+  UCRT rules; hostname and port never accept what go-playground refuses (label `ours`: none); every `reject` (we
+  refuse, Go accepts) is a named class; every interface name accepted here the kernel accepts. `isSafePath`,
+  `isSafeUrl` and `isSafeKvValue(true)` are shown NOT to be shell-safe, as documented.
+- **Panic sweep** (`src/sweep_test.zig`): hostile and oversized input to the shape predicates is refused, never a
+  panic; a never-parsed `Template` with an unclosed brace or an undeclared hole is a checked panic in `fill`; an empty
+  base64 string and a NUL, control, space or non-ASCII CIDR separator are refused.
+- **Constant time, fuzz:** n/a (argv quoting only; no fuzz obligation).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run and
+  the delta runs after it.
+
+## What is deliberately not done
+
+- **Windows argv quoting (`CommandLineToArgvW` rules).** Rejected: argsafe never builds a command line, `std.process`
+  composes one on Windows itself (`argvToCommandLineWindows`), and every one-word predicate survives the UCRT rules
+  unchanged (oracle bit WIN). `cmd.exe` metacharacters are out of scope.
+- **Opt-in shell-word quoting for `sh -c`.** Rejected: a quoter replaces "refuse" with "escape", and quoting bugs are
+  the injection class this module exists to remove; Python `shlex.quote` and Rust `shlex` own that job. Sibling `uci`
+  keeps a private `shellQuote` for the uci batch format; if a second consumer needs one, it is a new module, not a
+  flag here.
+- **Environment-variable injection.** Argv only (see *Threat model*).
 
 ## Backlog / deferred
 
-~~**argv template filled from a trusted config**~~ — **DONE 2026-09-28**, see the "Design &
-invariants" `Template`/`CharClass.explain` bullets above. Precedent this design followed: Ansible,
-systemd `ExecStart=` specifiers, Rundeck/StackStorm actions.
-
-Windows argv quoting and environment-variable-injection allowlisting are explicitly out of scope for
-v1 (see Threat model). No other deferred items in README beyond the general pre-public
-review pass.
-
-- ~~**A few more common shapes: hostname, port / bounded integer, interface name**~~ — **DONE 2026-11-02**: `isSafeHostname`, `isSafeUint`, `isSafePort`, `isSafeIfname`; each compared with a reference model and, where one exists, a foreign oracle (go-playground hostname/port, the kernel for interface names). Deliberate differences, all on the strict side: no label ending in `-`, no trailing dot, no leading zeros or `+` in a port, `..` and `@`/`:` refused in an interface name.
-- **Windows argv quoting (`CommandLineToArgvW` rules)** — **rejected 2026-11-02**: argsafe never builds a command line, `std.process` composes one on Windows itself (`argvToCommandLineWindows`), and every one-word predicate (README) survives the UCRT rules unchanged (oracle bit WIN). `cmd.exe` metacharacters are out of scope.
-- **Opt-in shell-word quoting for `sh -c`** — **rejected 2026-11-02**: a quoter replaces "refuse" with "escape", and quoting bugs are the injection class this module exists to remove; `shlex.quote` / Rust `shlex` own that job. Sibling `uci` keeps a private `shellQuote` for the uci batch format; if a second consumer needs one, it is a new module, not a flag here.
-- **Mutation run over the new predicates** (open): the 2026-10-04 run (40/40) predates `isSafeHostname`/`isSafeUint`/`isSafePort`/`isSafeIfname`; the model tests are exhaustive to length 5, but no mutants were run against them. The card's `src` hash is stale for the same reason (the coordinator regenerates it).
-- **Fuzz driver over the models** (open, E2 → E1): the model tests are deterministic enumeration; a driver comparing predicates with models on longer, structured inputs would earn model-fuzz.
-
-## Status
-`gap · any · util · reentrant` + deps: none (std only) — canonical source is `pub const meta` in
-src/root.zig.
+- **Mutation run over the shape predicates.** The recorded run (40/40) predates `isSafeHostname`, `isSafeUint`,
+  `isSafePort` and `isSafeIfname`; the model tests are exhaustive to a short length, but no mutants were run against
+  them, and the card's `src` hash does not cover them.
+- **Fuzz driver over the models (evidence E2 to E1).** The model tests are deterministic enumeration; a driver
+  comparing the predicates with the models on longer, structured inputs would earn model-fuzz.
 
 ## Anchoring
 

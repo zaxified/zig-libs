@@ -129,8 +129,8 @@ than being built in Zig source. `Template.parse` validates up front and
 allocates nothing — `tokens`/`holes` are borrowed, so the config must outlive
 every `fill` call. It fails closed on a config error, never a per-value
 refusal: `error.UnknownHole` (a `{name}` not in `holes`), `error.HoleInArgv0`
-(any hole in the program name, valid or not), `error.UnbalancedBrace`, or
-`error.DuplicateHoleName`. A hole may be the whole token or sit inside one
+(any hole in the program name, valid or not), `error.UnbalancedBrace`,
+`error.DuplicateHoleName`, or `error.EmptyTemplate` (no tokens). A hole may be the whole token or sit inside one
 (`"--unit={unit}"`), and the same hole may be **reused** — every occurrence
 substitutes the identical value. Write a literal `{`/`}` doubled — `{{`/`}}`
 — the same convention as `std.fmt`/Python `str.format`.
@@ -153,23 +153,12 @@ rule failed (`too_short`, `too_long`, `nul_byte`, `leading_dash`,
 `forbidden_substring`, `bad_first_char`, `control_byte`, `bad_byte`) for a UI
 that wants to say why without re-implementing `check`.
 
-## Boundaries (deferred — out of scope for v1)
+## Not provided
 
-- **Windows `CommandLineToArgvW` quoting.** Rejected (2026-11-02): this module
-  never builds a command line, and `std.process` composes one from the argv array
-  itself on Windows. The one-word predicates above contain no quote, backslash or
-  blank, so the UCRT rules reproduce them unchanged (checked in the oracle vectors);
-  `cmd.exe` metacharacters (`& | ^ %`) are not covered.
-- **Shell-word quoting for `sh -c`.** Rejected (2026-11-02), for a security
-  reason: this module refuses, it does not escape, because a quoter is the
-  component whose bugs cause injections. Use an argv, or a dedicated quoter
-  (Python `shlex.quote`, Rust `shlex`).
-- **Environment-variable injection.** Scope is argv only; a validated allowlist
-  for the child environment (`std.process.Child.env_map`) is out of scope.
-- **Per-encoding length rationale.** The convenience predicates use fixed
-  byte bounds (path ≤4096, url ≤1024, cidr ≤256, base64 44/≤512); a
-  first-principles justification per encoding is not attempted — they are
-  proven-in-production ceilings.
+No Windows command-line quoting, no shell-word quoting for `sh -c`, and no validation of the child environment
+(`std.process.Child.env_map`): argv only. The first two are refused on purpose, with the reasons in `SPEC.md` *What is
+deliberately not done*; open work is in *Backlog / deferred*. The convenience predicates use fixed byte ceilings
+(path ≤4096, url ≤1024, cidr ≤256, base64 44/≤512), proven in production, not derived per encoding.
 
 ## Verification
 
