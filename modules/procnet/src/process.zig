@@ -159,7 +159,7 @@ pub const SocketOwnerOptions = struct {
     /// sixteen processes holding one socket each and 8000 dups apiece
     /// produced 129 322 owner records and 11.4 MB with `truncated = false`,
     /// because neither walk cap had fired. Roughly 712 KB of allocation per
-    /// real socket (W2 re-audit 2026-09-02, `procnet` F7).
+    /// real socket(`procnet` F7).
     max_owners: usize = 1 << 20,
     /// Stop once this many descriptors have been examined across ALL
     /// processes (every examined descriptor costs one `readlinkat`, socket or
@@ -336,7 +336,7 @@ pub fn indexSocketOwners(
                 // privilege refusal nor a race, and folding it into
                 // `vanished` made a resource exhaustion read as "/proc moved
                 // under us". Counted as a refusal-to-see instead, and the
-                // sweep is marked partial (W2 re-audit 2026-09-02).
+                // sweep is marked partial.
                 else => {
                     denied += 1;
                     truncated = true;
@@ -660,7 +660,7 @@ const seed = fuzzsample.seed;
 /// audit's fix. The comment it carried read: *"Was `proc_stat_corpus[0]`, so
 /// the two paren-heavy samples this harness exists for — `((sd-pam))` and
 /// `my weird) name` — were never mutation seeds. `sockets.zig` draws its seed;
-/// this did not (W2 re-audit 2026-09-02, `procnet` F10)."* Replacing the
+/// this did not(`procnet` F10)."* Replacing the
 /// constant `0` with `smith.index(proc_stat_corpus.len)` bought nothing:
 /// `index` is a ranged draw, it returned 0 on every input a corpus can carry,
 /// and the two samples the fix was written for stayed unreached. The index now
@@ -735,7 +735,7 @@ test "corpus: every stat script reaches the parser, and the samples selected are
     }
     // One seed is deliberately the empty script.
     try testing.expectEqual(proc_stat_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 1 sample, 0 lines parsed and 0 octets mutated
+    // Measured: 1 sample, 0 lines parsed and 0 octets mutated
     // before the draws were restructured.
     try testing.expectEqual(proc_stat_corpus.len, samples);
     try testing.expectEqual(@as(usize, 9), parsed);

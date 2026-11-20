@@ -104,7 +104,7 @@ pub const SocketEntry = struct {
 ///   * big-endian producer:    `7F000001` -> 7F 00 00 01 -> 127.0.0.1
 /// Both of those are the same socket; the file differs, not the address.
 ///
-/// Measured, not inferred (2026-08-24): a big-endian MIPS kernel (OpenWrt
+/// Measured, not inferred: a big-endian MIPS kernel (OpenWrt
 /// 25.12.4 `malta/be` under `qemu-system-mips`) with a socket bound to a
 /// known `127.0.0.1:12345` printed `7F000001:3039` — see
 /// `testdata/tcp-mips-be.txt` and SPEC.md. This function used to take the
@@ -126,7 +126,7 @@ fn hexWord(s: []const u8, producer: std.builtin.Endian) ?[4]u8 {
     // characters and decode to addresses the text does not spell. No kernel
     // writes either, but the `*WithEndian` entry points exist precisely for
     // text that did not come from this kernel
-    // (W2 re-audit 2026-09-02, `procnet` F11).
+    //(`procnet` F11).
     for (s) |c| if (!std.ascii.isHex(c)) return null;
     const v = std.fmt.parseInt(u32, s, 16) catch return null;
     var b: [4]u8 = undefined;
@@ -303,7 +303,7 @@ pub const socket_table_read_limit = 512 * 1024;
 /// is a wrong one. Both siblings in this module already reported it
 /// (`ConntrackResult.total`, `SocketOwnerIndex.truncated`), so this was an
 /// inconsistency inside the module, not a house style
-/// (W2 re-audit 2026-09-02, `procnet` F8).
+///(`procnet` F8).
 pub const SocketTable = struct {
     entries: []SocketEntry,
     /// At least one of the four `/proc/net` tables hit
@@ -370,8 +370,7 @@ const udp6_fixture = @embedFile("testdata/udp6.txt");
 /// `openwrt-25.12.4-malta-be-vmlinux-initramfs.elf` (sha256 checked against
 /// the release's `sha256sums`) under `qemu-system-mips -M malta`, `uname -m` =
 /// `mips`, `/proc/cpuinfo` "system type: MIPS Malta"; the single row is
-/// `dropbear -R -p 127.0.0.1:12345` after `ip link set lo up`, captured
-/// 2026-08-24. The ground truth needs no foreign tool: the address and port
+/// `dropbear -R -p 127.0.0.1:12345` after `ip link set lo up`, captured. The ground truth needs no foreign tool: the address and port
 /// were CHOSEN when the socket was bound.
 const tcp_be_fixture = @embedFile("testdata/tcp-mips-be.txt");
 
@@ -614,7 +613,7 @@ test "parseTcp: the endian-less entry point means NATIVE, and the decode shows i
 
 test "parseTcp: v6 words each follow the producer's byte order — measured, not derived" {
     // Captured from the same big-endian kernel as the v4 fixture. This was
-    // DERIVED until 2026-08-24 ("a v6 column is four v4 groups, so it must
+    // DERIVED earlier ("a v6 column is four v4 groups, so it must
     // follow"); the reasoning was right, but a rule that has been measured and
     // one that has been argued are not the same evidence, and this repository
     // has been caught out by the difference before.
@@ -765,7 +764,7 @@ test "corpus: every socket script reaches both parsers, and the sockets decoded 
     }
     // One seed is deliberately the empty script.
     try testing.expectEqual(socket_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 1 sample, 0 TCP entries, 0 UDP entries and 0 octets
+    // Measured: 1 sample, 0 TCP entries, 0 UDP entries and 0 octets
     // mutated before the draws were restructured.
     try testing.expectEqual(socket_corpus.len, samples);
     try testing.expectEqual(@as(usize, 45), tcp);
@@ -777,7 +776,7 @@ test "hexWord accepts eight HEX DIGITS, not eight characters" {
     // `std.fmt.parseInt` takes a leading `+` and `_` separators, so a length
     // check alone let two spellings through that decode to an address the
     // text does not contain — and the `*WithEndian` entry points exist for
-    // text this kernel did not write (W2 re-audit 2026-09-02, `procnet` F11).
+    // text this kernel did not write(`procnet` F11).
     try testing.expect(hexWord("0100007F", .little) != null);
     try testing.expect(hexWord("+100007F", .little) == null);
     try testing.expect(hexWord("0100_07F", .little) == null);

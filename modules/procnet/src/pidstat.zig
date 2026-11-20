@@ -187,7 +187,7 @@ pub fn readPidStat(io: std.Io, ref: procnet.ProcRef) ?PidStat {
 
 const testing = std.testing;
 
-// A real capture of this machine's own `/proc/self/stat` (kernel 7.0, 2026-10-17).
+// A real capture of this machine's own `/proc/self/stat` (kernel 7.0).
 const real_stat = @embedFile("testdata/pid_stat.txt");
 
 test "parsePidStat: every field of a real capture" {
@@ -369,7 +369,7 @@ test "parsePidStat: a close-paren before the open-paren is no comm" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

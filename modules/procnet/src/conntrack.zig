@@ -46,7 +46,7 @@ pub const ConntrackResult = struct {
     /// unconditionally while `readConntrack` handed it a 4 MiB prefix, so
     /// past ~20 000 flows the very signal that says "you are seeing a partial
     /// view" was itself partial, and short by a plausible amount
-    /// (W2 re-audit 2026-09-02, `procnet` F6).
+    ///(`procnet` F6).
     total: usize,
     /// The source file was longer than the read limit, so `total` counts only
     /// the prefix that was read. `parseConntrack` on caller-supplied text
@@ -275,7 +275,7 @@ test "corpus: every conntrack script reaches the parser, and the flows decoded a
     }
     // One seed is deliberately the empty script.
     try testing.expectEqual(conntrack_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 0 flows and 0 mutations before the draws were
+    // Measured: 0 flows and 0 mutations before the draws were
     // restructured — every iteration parsed the empty string.
     try testing.expectEqual(@as(usize, 30), flows);
     try testing.expectEqual(@as(usize, 37), rows);
@@ -288,7 +288,7 @@ test "a capped read says so, instead of reporting a short total as the true one"
     // way `readConntrack` does. Before the fix `total` was the row count of
     // the 4 MiB prefix, presented by the doc as "the true total row count" —
     // a partial answer to the very question "is this view partial?", and
-    // short by a plausible amount (W2 re-audit 2026-09-02, `procnet` F6).
+    // short by a plausible amount(`procnet` F6).
     const line = "ipv4     2 tcp      6 431999 ESTABLISHED src=10.0.0.1 dst=10.0.0.2 sport=1 dport=2 [ASSURED] mark=0 use=1\n";
     const rows = 200;
     var text: std.ArrayList(u8) = .empty;

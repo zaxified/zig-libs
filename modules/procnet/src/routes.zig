@@ -45,7 +45,7 @@ pub const RouteEntry = struct {
 /// converting — so the eight hex chars are that word's MEMORY IMAGE, and the
 /// address octets come back by writing the parsed value out again in the byte
 /// order of the kernel that wrote the file (`0100007F` little / `7F000001`
-/// big are both 127.0.0.1). Measured on a big-endian MIPS kernel 2026-08-24;
+/// big are both 127.0.0.1). Measured on a big-endian MIPS kernel;
 /// `sockets.hexWord` carries the full note and the capture that shows it.
 /// This used to take the low byte as the first octet unconditionally, which
 /// is right only for a little-endian producer.
@@ -61,7 +61,7 @@ fn hexToV4(s: []const u8, producer: std.builtin.Endian) ?netaddr.Ip {
     // characters and decode to addresses the text does not spell. No kernel
     // writes either, but the `*WithEndian` entry points exist precisely for
     // text that did not come from this kernel
-    // (W2 re-audit 2026-09-02, `procnet` F11).
+    //(`procnet` F11).
     for (s) |c| if (!std.ascii.isHex(c)) return null;
     const v = std.fmt.parseInt(u32, s, 16) catch return null;
     var b: [4]u8 = undefined;
@@ -438,7 +438,7 @@ test "corpus: every routes script reaches the parser, and the rows decoded are p
         const text = fuzzsample.build(script[0..n], &routes_samples, &buf, &choice);
         mutations += choice.mutations;
         // The samples are little-endian captures: decode them as such, or a
-        // big-endian target (qemu-mips, 2026-10-18: 7 rows) rejects their
+        // big-endian target (qemu-mips: 7 rows) rejects their
         // masks as non-contiguous and the pin below means nothing there.
         const entries = parseRoutesWithEndian(testing.allocator, text, .little) catch continue;
         defer testing.allocator.free(entries);
@@ -446,7 +446,7 @@ test "corpus: every routes script reaches the parser, and the rows decoded are p
     }
     // One seed is deliberately the empty script.
     try testing.expectEqual(routes_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 0 rows and 0 mutations before the draws were
+    // Measured: 0 rows and 0 mutations before the draws were
     // restructured — every iteration parsed the empty string.
     try testing.expectEqual(@as(usize, 37), rows);
     try testing.expectEqual(@as(usize, 42), mutations);

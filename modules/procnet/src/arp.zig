@@ -267,7 +267,7 @@ test "corpus: every arp script reaches the parser, and the entries decoded are p
     }
     // One seed is deliberately the empty script.
     try testing.expectEqual(arp_seeds.len - 1, nonempty);
-    // Measured 2026-09-07: 0 entries decoded and 0 octets mutated before the
+    // Measured: 0 entries decoded and 0 octets mutated before the
     // draws were restructured — every iteration parsed the empty string.
     try testing.expectEqual(@as(usize, 37), entries_decoded);
     try testing.expectEqual(@as(usize, 42), mutations);

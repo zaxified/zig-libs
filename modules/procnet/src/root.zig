@@ -244,7 +244,7 @@ pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, lim
 /// promise its own reader a *complete* answer — "the true total row count",
 /// "all four live tables" — cannot keep that promise without knowing. Two of
 /// this module's own readers promised exactly that and could not tell
-/// (W2 re-audit 2026-09-02, `procnet` F6/F8).
+///(`procnet` F6/F8).
 pub const VirtualFile = struct {
     bytes: []u8,
     /// The file was LONGER than `limit` bytes and `bytes` is a prefix of it (a file of exactly `limit` bytes is complete and not flagged).
@@ -382,7 +382,7 @@ pub fn copyClamped(buf: []u8, s: []const u8) usize {
     // `buf` longer than 255 was a panic in Debug/ReleaseSafe and lost the
     // length entirely in ReleaseFast. Nothing in this module passes such a
     // buffer, but the signature is public and states no bound
-    // (W2 re-audit 2026-09-02, `procnet` F9).
+    //(`procnet` F9).
     const n = @min(s.len, buf.len);
     @memcpy(buf[0..n], s[0..n]);
     return n;
@@ -405,7 +405,7 @@ fn firstFloat(text: []const u8) f64 {
 /// of 584 billion years in ReleaseFast.
 ///
 /// The previous audit fixed this shape once, in `process.zig`, as the case
-/// rather than as the rule (W2 re-audit 2026-09-02, `procnet` F5).
+/// rather than as the rule(`procnet` F5).
 fn secondsFromFloat(f: f64) u64 {
     if (!std.math.isFinite(f) or f < 0) return 0;
     if (f >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
@@ -749,7 +749,7 @@ test "smoke: snapshot() and listProcesses() run against the real /proc" {
 // as a single direct-read-then-wrapper-read pair, this test asserted that two
 // samples of /proc taken microseconds apart were equal — true on a quiet
 // machine, and false the moment anything opened a socket in between. It failed
-// exactly that way on the ReleaseSafe amd64 lane of tag 2026-08-15 with
+// exactly that way on the ReleaseSafe amd64 lane of a tag with
 // "expected 96, found 97": one socket appeared mid-test, in a step that runs
 // 211 modules' tests concurrently, many of which open sockets on purpose.
 //
@@ -960,7 +960,7 @@ test "a /proc/uptime that is not the kernel's own cannot abort snapshot()" {
     // ~584 billion years that no caller could tell from a reading. lxcfs
     // bind-mounts exactly this file into every LXC container, and this
     // module's own fuzz harnesses declare a faked `/proc` in scope
-    // (W2 re-audit 2026-09-02, `procnet` F5).
+    //(`procnet` F5).
     try testing.expectEqual(@as(u64, 0), secondsFromFloat(firstFloat("inf 1.0")));
     try testing.expectEqual(@as(u64, 0), secondsFromFloat(firstFloat("-inf 1.0")));
     try testing.expectEqual(@as(u64, 0), secondsFromFloat(firstFloat("nan 1.0")));
@@ -975,7 +975,7 @@ test "copyClamped's return type does not bound the buffer it accepts" {
     // Public API with no stated bound on `buf`, and a `u8` return: a buffer
     // longer than 255 was a panic in Debug and a lost length in ReleaseFast.
     // No in-module caller can reach it, which is exactly why the signature
-    // had to be the fix (W2 re-audit 2026-09-02, `procnet` F9).
+    // had to be the fix(`procnet` F9).
     var big: [512]u8 = undefined;
     const src = strRepeat("x", 300);
     try testing.expectEqual(@as(usize, 300), copyClamped(&big, src));
@@ -988,7 +988,7 @@ test "copyClamped's return type does not bound the buffer it accepts" {
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

@@ -127,7 +127,7 @@ test "SocketOwnerIndex: inode 0 never matches even when owners hold inode 0 (swe
     try testing.expectEqual(@as(u32, 1), idx.find(7).?.pid);
 }
 
-// ── mutation audit 2026-11-13 (delta over bbe3a85c5): tests asked for by survivors ──
+// ── mutation audit (delta over bbe3a85c5): tests asked for by survivors ──
 
 const linux = std.os.linux;
 
