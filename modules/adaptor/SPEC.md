@@ -8,8 +8,6 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-11-14 (60/70, 10 eq) · src a274653f66e9d601
 
-*Delta mutation run 2026-11-14* (under 10 % of the production lines changed since 2026-10-08: pointer arguments and `burn.run` in `fromSecret`/`adapt`, vector-store burns, the new `burn.zig`): `reduceToScalar`, `fromSecret`(+body), `preSign`, `preSignFromSecretKey`, `burnPreSignStack`, `computeUnverified`, `preSignImpl`, `adapt`(+body), `burn.stack`/`burn.run` whole plus `preVerify`'s step guards -- 41 mutants, 34 killed (burn mutants by the ReleaseFast stack probes), 7 decided: a 512-byte burn in `fromSecret` leaves no residue (the call dirties 8.8 KB, `combMulBase` leaves zeros below ~1.1 KB; 32 KiB is margin), three wipes under `preSign`'s unconditional burn, `preVerify`'s `Fe.fromBytes(r)` repeated by step 6, and two unobservable without a seam for `k0` (a tagged hash = 0 mod n; T = -k0*G with k0 hashed over T). No new tests were needed.
-
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, ADAPTOR_FUZZ; flow at 1/4 of it) · ct 2026-09-09 (ctgrind)
 
 **Performance:** not measured
@@ -22,11 +20,6 @@ Schnorr adaptor signatures ("one-time verifiably encrypted signatures",
 the scriptless-scripts construction) over BIP340 on secp256k1; see
 [README.md](README.md) for purpose and API. Provenance: see
 [NOTICE](NOTICE).
-
-**Status: complete.** Wire codecs (`AdaptorPoint`, `PreSignature`) and the
-four crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) are all
-implemented — no `@panic`/TODO stub remains in `root.zig`. See "The four
-crypto cores" below for what each does and how it is anchored.
 
 ## Compared with
 
@@ -230,10 +223,9 @@ solves differently). The chain of reasoning:
   match `(pubkey, msg, T)` will silently produce 64 bytes that simply fail
   that check, not an error from `adapt` itself.
 
-## The four crypto cores (all implemented)
+## The four crypto cores
 
-The four crypto cores in `root.zig` are all real — no `@panic`/TODO stub
-remains. Each function's own doc comment in `root.zig` spells out the
+Each of the four crypto cores in `root.zig` has a doc comment that spells out the
 exact construction step-by-step, following `bip340`'s own established
 idioms (masked constant-time parity selects, `taggedHasher` streaming,
 `mulDoubleBasePublic` for the public verify equation):
@@ -260,8 +252,30 @@ independent correctness signal beyond the byte-exact numbers.
 
 ## Verification
 
-- `zig build test-adaptor` and `-Doptimize=ReleaseFast` both go green;
-  `zig fmt --check modules/adaptor/` clean.
+- **Run:** `scripts/modtest adaptor`; the dead-stack probes run only in an optimised build
+  (`scripts/modtest adaptor -Doptimize=ReleaseFast`, which the push lane also runs for modules with such tests).
+- **Test classes** (`src/`):
+  - `kat_test.zig` — byte-exact `preSign` / `adapt` / `extract` against the six self-authored vectors; the
+    full pipeline (`preSign` -> `preVerify` -> `adapt` -> `bip340.verify` -> `extract`); tamper rejection (wrong `T`,
+    wrong message, flipped `needs_negation`, mismatched `r`, an `r`-matching signature adapted with another point,
+    a recovered scalar `n - t`, non-canonical `s'`); the range checks of the codec, `adapt` and `extract`; the
+    pin that a pre-signature verifies under `(T, flag)` or `(-T, !flag)`.
+  - `root.zig` tests — codec round trips and refusals (`AdaptorPoint.fromBytes`, `PreSignature.fromBytes`,
+    `fromSecret` at `n`), and `preSignImpl`'s step-9 self-check on the production path (a corrupted `s'`, `r` or flag
+    is refused).
+  - `interop_test.zig` — `preVerify`, `adapt`, `extract` and `bip340.verify` against the twelve foreign
+    pre-signatures and that implementation's verdict on the six self-authored ones (see Anchoring).
+- **Fuzz:** `src/fuzz_test.zig`, driver prefix `ADAPTOR_FUZZ=<runs>[,<first seed>]`: the `preverify` harness
+  (`preVerify` never panics on damaged pre-signature bytes, and only the pristine one verifies) and the `flow`
+  harness (pre-sign, adapt, extract round trip; every damaged part refused; run at a quarter of the budget). Each has
+  a reach test that counts every outcome.
+- **Dead-stack probes:** `src/stackprobe_test.zig` (`preSign`: the nonce, `k0`, `rand`, `d`, `t_pad` and the secret
+  key must not survive on the dead stack) and `src/stackprobe2_test.zig` (`AdaptorPoint.fromSecret` and `adapt`: the
+  adaptor secret). The burns are mutual guards in `preSign` (either one alone keeps the probe green).
+- **ctgrind:** `src/ctgrind_harness.zig`; rows `presign`, `adapt`, `extract` in `scripts/checks/ctgrind-expected.tsv`
+  (`scripts/checks/ctgrind.sh --check adaptor`).
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  and the delta runs after it.
 
 ## Anchoring
 
@@ -276,8 +290,7 @@ independent correctness signal beyond the byte-exact numbers.
   implementation (LLFourn/secp256kfun's `schnorr_fun::adaptor`, 0BSD), frozen
   2026-08-09 — see `NOTICE` for exact versions and the regeneration command.
   (Audit A1 F9: this section previously said no external oracle existed;
-  `interop_vectors.zig`/`interop_test.zig` were added the same day the KAT
-  corpus landed and this file was never updated to say so.)
+
 
 **What the tests actually contain.** No official BIP/spec exists for Schnorr
 adaptor signatures. `kat_vectors.zig`: six self-authored vectors computed
@@ -287,60 +300,6 @@ implementation's own verdict on all six self-authored vectors — this module's
 `preSign` can never produce these bytes itself (the nonce derivations differ
 by design), so they exercise `preVerify`/`adapt`/`extract` against inputs
 this codebase did not generate.
-
-**How it got there.** `kat_vectors.zig`: computed independently in Python from
-this exact construction (no shared code path with `root.zig`). `interop_vectors.zig`:
-captured from a real external implementation and frozen as bytes — fully
-offline afterward; see `NOTICE` for the regeneration command if the upstream
-crate needs re-checking.
-
-### Audit 2026-10-08 (review + mutation over the current src)
-
-Review of the four cores and the codecs against the scriptless-scripts construction and
-secp256kfun's `schnorr_fun::adaptor`, over the bip340/k256 that the 2026-10-07/08 work rewrote
-(`KeyPair.fromSecretKey` now burns its own stack): the nonce preimage binds `T`; the masked
-parity select; `preVerify`'s two routes to `k·G` (`R_even ∓ T`) in both `needs_negation` arms;
-`adapt`/`extract` as exact inverses with the same flag; `extract`'s `y·G == T` check. The
-algebra is right. One finding, fixed:
-- **HIGH — the nonce on the dead stack after `preSign`.** No probe existed here, so the module's
-  claim to follow `bip340.sign`'s steps was never measured for the class bip340 burns against.
-  The new `src/stackprobe_test.zig` (bip340's method: paint, call, scan an uninitialised window;
-  negative and positive control; needles `d`, `n−d`, `t_pad`, `rand`, `k0`, `n−k0` in every
-  representation, the secret key) found `k0` and `rand` once per pre-signature in ReleaseFast —
-  with `s_prime` and the public `e`, `d = (s_prime − k)/e`. Fixed as bip340: `preSign` →
-  `noinline preSignFromSecretKey` → `preSignImpl`, the steps in `noinline computeUnverified`,
-  `presign_stack_burn` (32 KiB; the probe printed 21.6 KB dirtied) burned after the steps and
-  after the whole call. Probe green; both burns removed → `k0` and `rand` 5/5 again; either one
-  alone left the probe green (each covers the other's region), so they are mutual guards.
-  The push lane runs the probe (`test.sh`'s ReleaseFast re-run of modules with such tests).
-
-Mutation schemata (29 mutants over `root.zig`): ReleaseSafe for the logic — `t_pad`'s xor and
-`aux` hash, the nonce preimage's `px` and `T`, `k0 ≠ 0`, `R̂ ≠ O`, the parity mask and the stored
-flag, the challenge's `px`, `s' = k + e·d`, the self-check, `preVerify`'s branch, `e`'s sign and
-range checks, `adapt`'s zero check, sign and sum, `extract`'s nonce match, sign, `T` check and
-range check, `fromSecret`'s range, the codec's flag, ranges and encoding — and the two burns
-in the module's own ReleaseFast build (a schemata binary's layout hid the residue there, as for
-bip340's R1). **26/29**: 24 killed in the schemata, the two burns killed together by the probe;
-**3 equivalent** — `k0 == 0` (2^-256), `R̂ = O` (needs `T = −k0·G`, i.e. the nonce), and
-`preVerify`'s `r < p` (the `XOnlyPublicKey.fromBytes(r)` right after refuses the same).
-One test the run asked for: `extract` refuses a hand-built pre-signature with `s' ≥ n`
-(reducing it survived; it surfaced as a mismatch instead).
-
-### Mutation run 2026-10-05
-
-Mutant schemata over a copy of `src/` (one ReleaseSafe build with the dependency closure,
-`setsid -w timeout -s KILL 20` per mutant): **25 mutants, 22 killed, 3 equivalent**. Points:
-`AdaptorPoint` decoding and `fromSecret`'s range, every `PreSignature.fromBytes` check, the
-self-verify, the nonce derivation's inputs, `k0` and `R + T`, the negation flag in all three
-operations, `preVerify`'s key, ranges, challenge, branch and verdict, `adapt`'s ranges and zero
-secret, and `extract`'s nonce match, range and the `t·G == T` check.
-
-First pass: 8 survivors — **no defect, 5 test gaps** closed by one test: every range check
-outside `preVerify` (r ≥ p and s' ≥ n in `PreSignature.fromBytes`, s' ≥ n and t ≥ n in `adapt`,
-s ≥ n in `extract`) — the vectors are all canonical, so reducing instead of refusing survived;
-`adapt(t = n + 1)` would have produced a signature under t = 1. **Equivalent (3):** `k0 = 0` and
-`R + T = O` (probability ~2^-256 / a discrete logarithm), and `preVerify`'s `r < p` (the x-only
-lift of `r` right after refuses the same values).
 
 ## Backlog / deferred
 

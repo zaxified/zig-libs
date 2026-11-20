@@ -5,7 +5,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-11-14** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit recorded (41 mutants, 34 killed, 7 decided); Audit line refreshed (A1).
 - **2026-10-10** — tests: deterministic fuzz driver `ADAPTOR_FUZZ` (testkit) over `preVerify` on damaged pre-signatures (only the pristine one verifies) and pre-sign/adapt/extract (adapted signature verifies, extract returns the secret; flipped pre-signature/signature and another adaptor point refused). No change to the library code.
 - **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `AdaptorPoint.fromSecret(adaptor_secret: *const [32]u8)` and `adapt(presig, adaptor_secret: *const [32]u8)` take the adaptor secret by pointer (were by value). Both now run under a stack burn (new `src/burn.zig`: 32 KiB / 4 KiB); `preSign` keeps its own. New `src/stackprobe2_test.zig` probes them. README snippet migrated.
 
@@ -39,10 +38,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   § "Mutation run 2026-10-05"). No defect; one new test pins the range checks of
   `PreSignature.fromBytes`, `adapt` and `extract`. No source change.
 
-- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
-  dead-stack probe `src/stackprobe_test.zig` (A1 F3) is deleted: it asserted
-  nothing and its stderr failed the CI lane in ReleaseFast. Per CONVENTIONS.md
-  §9 a one-finding probe is not kept once the finding is closed.
 
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F5 (MED): the
   mandatory step-9 self-check (fault-injection guard, sibling to
@@ -93,7 +88,6 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   scripts/modtest adaptor: 34/34 (Debug 33+1 skip, ReleaseSafe 34/34,
   ReleaseFast 34/34; was 28/28 debug-equivalent).
 
-- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **presign 90 / adapt 2 / extract 3**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. 74 of `presign`'s 90 are the mandatory step-9 self-check calling `preVerify`, which `SPEC.md` itself documents as appropriate variable-time on public data — the same self-verify shape as `bip340` and `musig2`. The 16 direct contexts are accepted classes (`isZero` nonce rejection, `rejectIdentity`, scalar canonicality). ⚠ ONE CONTEXT IS DELIBERATELY LEFT UNRESOLVED: `root.zig:338`, the masked-select loop SPEC calls constant-time, produced one "Use of uninitialised value of size 8" (not "Conditional jump"). The source has no branch there, so the likely explanation is LLVM vectorising the byte loop and memcheck checking the 8-byte load conservatively — but that is a guess, no disassembly was run, and this claim is not closed until someone does one.
 
 - **2026-09-07** — **Test-only: the "corrupted pre-signature" fuzz target had
   never corrupted anything.** `fuzzPreVerify` opened with

@@ -8,17 +8,16 @@ tagged hashing, x-only key handling, and — crucially — the exact challenge
 tag, so a completed adaptor signature is a plain, ordinary BIP340
 signature indistinguishable from one produced by `bip340.sign` directly.
 
-**Status: complete.** Wire codecs (`AdaptorPoint`, `PreSignature`) and the
-four crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) are all
-implemented and KAT-validated — no `@panic`/TODO stub remains in
-`root.zig`. See [SPEC.md](SPEC.md) for the design and the parity
-subtlety this scheme's correctness hinges on.
+The wire codecs (`AdaptorPoint`, `PreSignature`) and the four crypto cores
+(`preSign`, `preVerify`, `adapt`, `extract`) are KAT-validated and checked
+against an independent implementation. See [SPEC.md](SPEC.md) for the design
+and the parity subtlety this scheme's correctness hinges on.
 
 | File | Contents |
 |---|---|
-| `root.zig` | `AdaptorPoint` (33-byte general point), `PreSignature` (65-byte pre-signature codec), and the 4 crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) — all REAL |
+| `root.zig` | `AdaptorPoint` (33-byte general point), `PreSignature` (65-byte pre-signature codec), and the 4 crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) |
 | `kat_vectors.zig` | 6 self-authored reference vectors (no official BIP/spec exists for this scheme) — both `needs_negation` branches, both BIP340 key-normalization branches |
-| `kat_test.zig` | Byte-exact KAT assertions + a round-trip property harness (`preVerify` accept, `bip340.verify` accept, `extract` round-trip) + tamper-rejection tests + a fuzz target on hostile `PreSignature` wire bytes |
+| `kat_test.zig` | Byte-exact KAT assertions + a round-trip property harness (`preVerify` accept, `bip340.verify` accept, `extract` round-trip) + tamper-rejection tests + a corpus-seeded fuzz target on hostile `PreSignature` wire bytes (the driver harnesses are in `fuzz_test.zig`) |
 | `interop_vectors.zig` | 12 pre-signatures EXTERNALLY originated by LLFourn/secp256kfun's `schnorr_fun::adaptor` (0BSD), frozen 2026-08-09, plus that implementation's own verdict on the 6 self-authored vectors — see `NOTICE` |
 | `interop_test.zig` | Asserts `preVerify` accepts the 12 external pre-signatures and `adapt`/`extract` reproduce `schnorr_fun`'s `decrypt_signature`/`recover_decryption_key` byte-for-byte |
 
@@ -68,11 +67,17 @@ adaptor → bip340 → k256 (Secp256k1 group, byte-exact to std.crypto.ecc.Secp2
 adaptor → k256   (point arithmetic and scalar field)
 ```
 
+## Not provided
+
+MuSig2 adaptor combination and ECDSA adaptor signatures (the DLC/Lightning variant) are not provided; see
+[SPEC.md](SPEC.md) *Backlog / deferred*. A pre-signature is bound to `±T`, and `adapt` does not check its own
+output: verify it with `bip340.verify` (SPEC *Threat model / limits*).
+
 ## Verify
 
 ```
-zig build test-adaptor                       # Debug — green
-zig build test-adaptor -Doptimize=ReleaseFast # also green
+scripts/modtest adaptor
+scripts/modtest adaptor -Doptimize=ReleaseFast   # also runs the dead-stack probes
 zig fmt --check modules/adaptor/
 ```
 
