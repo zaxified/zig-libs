@@ -2,21 +2,20 @@
 
 //! field — the NIST P-256 base field `Fe` over the Solinas prime
 //! `p = 2^256 − 2^224 + 2^192 + 2^96 − 1`, stored as four full 2^64 limbs
-//! (little-endian), NORMAL domain (not Montgomery — the special reduction is
-//! used directly, as OpenSSL's nistz256 does for its field).
+//! (little-endian), always canonical (`< p`), in the MONTGOMERY domain
+//! (`limbs = a·2^256 mod p`).
 //!
-//! The multiply/square hot path uses the curve-specific **P-256 Solinas
-//! reduction**: a 256×256→512-bit schoolbook product, then the fold
-//! `2^256 ≡ 2^224 − 2^192 − 2^96 + 1 (mod p)` collapses the high half back into
-//! 256 bits (repeat until < 2^257), then two conditional folds of the final
-//! carry bit + one constant-time conditional subtract of `p`. The portable path
-//! ships that reduction written straightforwardly on wide (`u256`/`u512`)
-//! integers — it is the correctness ORACLE, byte-exact against
-//! `std.crypto.ecc.P256.Fe`. The irreducible `MULX/ADX` core
-//! (`fast_core.fieldMul`/`fieldSq`, IMPLEMENTED, gated by
-//! `gate.field_asm_implemented`) computes the same reduction via the NIST
-//! word-shuffle and is pinned to this oracle by the gated differential; on
-//! non-amd64 targets `mul`/`sq` dispatch to the portable reduction below.
+//! `Fe.mul`/`sq` are a Montgomery multiply: a 256×256→512-bit product, then
+//! four REDC rounds (for this prime `−p⁻¹ ≡ 1 (mod 2^64)`, so each round's
+//! quotient digit is the low limb itself). The portable path is
+//! `montMulPortable`/`montSqPortable` (`montReducePortable`, comptime-
+//! evaluable); the amd64 `MULX/ADX` core (`fast_core.montMulRegs`/
+//! `montSqRegs`, gated by `gate.field_asm_implemented`) computes the same
+//! thing and is pinned to the portable path by the differential. On other
+//! targets `mul`/`sq` use the portable path. The Solinas reduction in
+//! `mulPortable`/`sqPortable` (normal domain, the NIST word-shuffle in
+//! `fast_core.fieldMul`/`fieldSq`) is kept, with its differentials, as an
+//! independent second reduction and is not reached by `Fe`.
 //!
 //! The API mirrors `std.crypto.ecc.P256.Fe` (same method names/semantics) so
 //! `group.zig` is a drop-in over this field and the oracle differential is a

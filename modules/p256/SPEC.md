@@ -6,7 +6,7 @@
 
 **Scope:** parity — OpenSSL 3.5.5 (surveyed 2026-10-13)
 
-**Audit:** review 2026-07-21 · mutation 2026-11-18 (282/359, 77 eq) · src 8966c610edddfd4e
+**Audit:** review 2026-07-21 · mutation 2026-11-18 (282/359, 77 eq) · src baf7f11215fce7eb
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind) · panic 2026-10-30 (sweep + blind review: own Signature type with a total toDer (std's indexes an empty slice for r/s = 0), explicit identity-key reject; delta audit 11/12 + 1 eq)
 
@@ -365,8 +365,6 @@ formulas in nistz256's operation order, the Jacobian windowed multiply and comb)
 - **Hash-to-curve (RFC 9380 P256_XMD:SHA-256_SSWU_RO_)**, deferred: no module of the collection asks for it of P-256 today
   (hash-to-curve exists in `bls12_381` only), and a point-level `hashToCurve` is one more public surface to keep correct.
   Effort: medium (SSWU map, isogeny-free for P-256, plus the RFC's vectors).
-- **Rewire the P-256 consumers** (jwt ES256, ctap2pin, spake2plus, hpke/voprf/mls/jwe) from `std.crypto.ecc.P256` to
-  p256, where not yet done (several already import `p256`).
 
 ## Anchoring
 
