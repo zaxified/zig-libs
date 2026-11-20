@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deterministic fuzz driver for opaque (added 2026-10-10): `OPAQUE_FUZZ=<runs>[,<first seed>]`
+//! Deterministic fuzz driver for opaque: `OPAQUE_FUZZ=<runs>[,<first seed>]`
 //! (testkit's driver; `_ONLY` selects a harness by name). Harness names:
 //! `opaque-login` (a whole registration + login with knob-chosen keys,
 //! password and context; the genuine KE3 is accepted by the server and both

@@ -513,7 +513,7 @@ test "M6: a failing KSF propagates error.KsfFailed, not silently swallowed or pa
     );
 }
 
-// ── (6) full-width MAC ladder (A1/opaque.md H1) ──────────────────────────
+// ── (6) full-width MAC ladder (A1 audit H1) ──────────────────────────
 //
 // The two tamper tests above (§4) each flip exactly one byte — byte 0 for
 // server_mac, the LAST byte for client_mac — because that is where the
@@ -637,13 +637,13 @@ test "H1: every byte of KE3's client_mac is checked, not just the last byte" {
 
 // ── (7) RFC 9807 Appendix C.2.1 -- the FAKE (unregistered-user) vector ───
 //
-// A1/opaque.md L3: SPEC.md used to say the fake-record response has
+// A1 audit L3: SPEC.md used to say the fake-record response has
 // "nothing new to pin" because it is the same `generateKE2` code path as
 // a real one. C.2.1 is the ristretto255 FAKE vector and it IS runnable —
 // it is also the only vector in this suite that exercises the §6.3.2.2
 // user-enumeration defense end-to-end, which C.1's "Real" vectors cannot
 // (there is no registered record to be missing). Bytes extracted
-// mechanically from `rfc9807.txt` by `A1/repro/opaque/gen_fake_probe.py`,
+// mechanically from `rfc9807.txt` by ,
 // same method C1 uses for the "Real" vectors.
 
 fn hx(comptime s: []const u8) [s.len / 2]u8 {
@@ -673,7 +673,7 @@ test "RFC 9807 C.2.1 fake credential response reproduces KE2 byte-exact" {
 
     // §6.3.2.2's fake record: this client_public_key/masking_key pair IS
     // the "randomly generated public key" the module doc comment (and
-    // A1/opaque.md M1) now describes -- the RFC's own fixture for it,
+    // A1 audit M1) now describes -- the RFC's own fixture for it,
     // not 32 uniform random bytes.
     const record = opaque_pake.RegistrationRecord{
         .client_public_key = client_public_key,
@@ -697,10 +697,10 @@ test "RFC 9807 C.2.1 fake credential response reproduces KE2 byte-exact" {
     try testing.expectEqualSlices(u8, &ke2, &res.ke2.toBytes());
 }
 
-// ── (8) RegistrationRecord.validate (A1/opaque.md L1) ────────────────────
+// ── (8) RegistrationRecord.validate (A1 audit L1) ────────────────────
 
 test "M2: an identity/context past 0xffff bytes is a typed error, not a panic or a silent wrap" {
-    // A1/opaque.md M2: `i2osp2`'s length prefix (used to bind identities
+    // A1 audit M2: `i2osp2`'s length prefix (used to bind identities
     // and context into the envelope MAC / AKE transcript) silently wraps
     // mod 65536 in ReleaseFast past this bound, and panics in Debug --
     // neither is a caller-visible, typed failure. `oversized` is one byte

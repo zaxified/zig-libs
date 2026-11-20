@@ -148,7 +148,7 @@ pub fn Opaque(comptime C: type) type {
                 };
             }
 
-            /// A1/opaque.md L1: `fromBytes` is pure slicing — a server that stores
+            /// A1 audit L1: `fromBytes` is pure slicing — a server that stores
             /// whatever bytes a registering client uploaded, unchecked, only
             /// discovers a malformed `client_public_key` at the first login
             /// attempt, as `generateKE2`'s `error.InvalidPublicKey` (via the
@@ -320,7 +320,7 @@ pub fn Opaque(comptime C: type) type {
         /// `len <= 0xffff` first (`checkI2ospLen`/`checkIdentities`) — an
         /// application-supplied identity or context past that bound reaches here
         /// only in ReleaseFast, where the assert below compiles out and the
-        /// length silently wraps mod 65536 (A1/opaque.md M2).
+        /// length silently wraps mod 65536 (A1 audit M2).
         pub fn i2osp2(len: usize) [2]u8 {
             std.debug.assert(len <= 0xffff);
             var out: [2]u8 = undefined;
@@ -328,7 +328,7 @@ pub fn Opaque(comptime C: type) type {
             return out;
         }
 
-        /// A1/opaque.md M2: `identities.client`/`.server` and `context` are
+        /// A1 audit M2: `identities.client`/`.server` and `context` are
         /// application-controlled byte strings with no documented or enforced
         /// bound, fed to `i2osp2` wherever the envelope MAC or the AKE transcript
         /// binds them (`envelopeAuthTag`, `runKeySchedule`). Past `0xffff` bytes,
@@ -526,7 +526,7 @@ pub fn Opaque(comptime C: type) type {
             var seed: [Nseed]u8 = undefined;
             defer std.crypto.secureZero(u8, &seed);
             expandMulti(&seed, randomized_password, &.{ &envelope_nonce, "PrivateKey" });
-            // A1/opaque.md H2: `kp.private_key` is the client's long-term AKE
+            // A1 audit H2: `kp.private_key` is the client's long-term AKE
             // private key, deterministic in (password, user) — whoever recovers it
             // once owns the account forever, even across server key rotation. It
             // never leaves this function (only `kp.public_key` is returned), so
@@ -606,7 +606,7 @@ pub fn Opaque(comptime C: type) type {
             return .{ .blinded_message = blinded.toBytes() };
         }
 
-        /// No `InvalidSecretKey`: `C.Oprf.blindEvaluate` returns no error (A1/opaque.md L2).
+        /// No `InvalidSecretKey`: `C.Oprf.blindEvaluate` returns no error (A1 audit L2).
         pub const CreateRegistrationResponseError = error{ InvalidMessage, DeriveKeyPairFailed };
 
         /// §5.2.2 `CreateRegistrationResponse`: derive the per-client OPRF key
@@ -628,7 +628,7 @@ pub fn Opaque(comptime C: type) type {
             credential_identifier: []const u8,
             oprf_seed: *const [Nh]u8,
         ) CreateRegistrationResponseError!RegistrationResponse {
-            // A1/opaque.md H2: per-client OPRF key, never returned to the caller.
+            // A1 audit H2: per-client OPRF key, never returned to the caller.
             var oprf_key = try deriveOprfKey(oprf_seed.*, credential_identifier);
             defer std.crypto.secureZero(u8, &oprf_key);
             const blinded = C.Oprf.Element.fromBytes(request.blinded_message) catch return error.InvalidMessage;
@@ -718,7 +718,7 @@ pub fn Opaque(comptime C: type) type {
         };
 
         /// No `InvalidBlind`: `C.Oprf.blind` only returns `InvalidInput`; the blind is
-        /// first used, and can first fail, in `generateKE3` (A1/opaque.md L2).
+        /// first used, and can first fail, in `generateKE3` (A1 audit L2).
         /// `InputTooLong`: a password longer than RFC 9497's `2^16 - 1`-byte OPRF input bound.
         pub const GenerateKE1Error = error{ InvalidInput, DeriveKeyPairFailed, InputTooLong };
 
@@ -771,7 +771,7 @@ pub fn Opaque(comptime C: type) type {
             } };
         }
 
-        /// No `InvalidSecretKey`: `C.Oprf.blindEvaluate` returns no error (A1/opaque.md L2).
+        /// No `InvalidSecretKey`: `C.Oprf.blindEvaluate` returns no error (A1 audit L2).
         pub const GenerateKE2Error = error{ InvalidMessage, InvalidPublicKey, DeriveKeyPairFailed, IdentityTooLong };
 
         pub const GenerateKE2Result = struct {
@@ -823,7 +823,7 @@ pub fn Opaque(comptime C: type) type {
         ) GenerateKE2Error!void {
             try checkIdentities(identities, context);
             // §6.3.2.2 CreateCredentialResponse.
-            // A1/opaque.md H2: per-client OPRF key, never returned to the caller.
+            // A1 audit H2: per-client OPRF key, never returned to the caller.
             var oprf_key = try deriveOprfKey(oprf_seed.*, credential_identifier);
             defer std.crypto.secureZero(u8, &oprf_key);
             const blinded = C.Oprf.Element.fromBytes(ke1.credential_request.blinded_message) catch
@@ -841,7 +841,7 @@ pub fn Opaque(comptime C: type) type {
             };
 
             // §6.4.4 AuthServerRespond.
-            // A1/opaque.md H2: the server's ephemeral keyshare private key; only
+            // A1 audit H2: the server's ephemeral keyshare private key; only
             // `keyshare.public_key` (below) and the DH outputs it feeds (already
             // zeroed via `ikm`) leave this function.
             var keyshare = try akeKeyPair(server_keyshare_seed);
@@ -950,13 +950,13 @@ pub fn Opaque(comptime C: type) type {
             const server_public_key: [Npk]u8 = plaintext[0..Npk].*;
             const envelope = Envelope.fromBytes(plaintext[Npk..].*);
 
-            // A1/opaque.md H2: the client's long-term AKE private key, statically
+            // A1 audit H2: the client's long-term AKE private key, statically
             // derived from (password, user) — see the identical note in `store`.
             var credentials = try recover(&rp, server_public_key, envelope, identities);
             defer std.crypto.secureZero(u8, &credentials.client_private_key);
 
             // §6.4.3 AuthClientFinalize.
-            // A1/opaque.md H2: `state` is a by-value parameter, so this is already
+            // A1 audit H2: `state` is a by-value parameter, so this is already
             // a local copy distinct from whatever the caller holds — zeroing it
             // here is scoped to this function's own stack frame, the same scope
             // the audit's `stackscan` probe measured.

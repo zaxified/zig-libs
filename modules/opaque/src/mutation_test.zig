@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Tests added by the 2026-11-17 whole-module mutation of `protocol.zig` /
+//! Tests added by the whole-module mutation of `protocol.zig` /
 //! `burn.zig`: wire fields read from the right region (with bytes that do not
 //! repeat inside a message), the `I2OSP(len, 2)` prefix, the identity / context
 //! length bound at its exact edge, and the error code of a malformed peer

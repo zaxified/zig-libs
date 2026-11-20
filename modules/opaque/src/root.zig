@@ -119,7 +119,7 @@
 //!   `masking_key`, all-zero envelope) and call `generateKE2` with it;
 //!   nothing extra is needed from this module. ⚠ "Randomly generated
 //!   public key" is NOT 32 uniformly random bytes reinterpreted as
-//!   `client_public_key` (A1/opaque.md M1: 93.754% of those are
+//!   `client_public_key` (A1 audit M1: 93.754% of those are
 //!   rejected by `generateKE2`'s peer-element check as
 //!   `error.InvalidPublicKey`, since ristretto255 only accepts
 //!   canonically-encoded points — a server that builds its one fake
@@ -399,7 +399,7 @@ test "record and message serialization round-trips" {
 
 // ── fuzz + hostile-wire tests: the functions that VALIDATE, not just decode ──
 //
-// A1/opaque.md M4: the three harnesses above exercise `fromBytes`, which is
+// A1 audit M4: the three harnesses above exercise `fromBytes`, which is
 // plain field slicing with nothing to reject — every input is "valid". The
 // functions where a hostile peer's bytes actually get checked
 // (`createRegistrationResponse`, `generateKE2`, `generateKE3` — each starts
