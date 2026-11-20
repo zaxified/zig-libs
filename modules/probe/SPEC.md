@@ -10,7 +10,6 @@
 
 **Audit:** review 2026-11-11 · mutation 2026-11-11 (188/208, 20 eq) · src 55b3b05b0b794bc3
 
-Audit detail: Mutation delta 2026-11-07 (commits `c65d2d91`, `ef2f0895`: the answering address in `Result`/`ConnectOutcome`, `LiveConnector`, `PosixConnector`, `connectRaceWith`; schemata, ReleaseSafe, the delta-audit, race, `probeTcp`, self-bound and `VerdictFold` tests): 19 mutants, 18 killed, 1 equivalent (`addr` of the race's no-winner result written as `refused_at` unconditionally: `VerdictFold` keeps a refusal over every later attempt, so `refused_at` is set exactly when the verdict is `.refused`). Four survived the first run and are killed by added cases: a non-refused connect failure of a literal (`255.255.255.255`) carrying no address, and an error followed by a refusal (decided in `start`, and through poll) naming the refuser, not the first failure.
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — TCP/ICMP probing (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: poll-timeout round-up saturates; `monoNs` total on a failed `clock_gettime`; `probeMany` attempts capped by `max_attempts`)
 
@@ -49,11 +48,7 @@ declared) and network-stack libraries, none offering connect classification with
 with a real wall-clock bound (`poll` on a non-blocking socket, EINTR-safe; 200 ms budget measured at 200.3 ms), races
 the resolved addresses (RFC 8305, 250 ms attempt delay) where the reference dials one, returns the raw `errno`, aggregates min/avg/max/jitter/loss through
 `latency-stats`, and fans out with a hard worker cap and order-stable results, all offline-testable through the
-`Connector` seam. **Where we are behind:** ~~no source-address/interface binding~~ (DONE 2026-10-11: `PosixConnector.source`/`.device`),
-~~no IP-family preference~~ (DONE 2026-10-11: `PosixConnector.ip_protocol`), ~~no inter-repetition interval~~
-(DONE 2026-10-11: `Options.interval`), ~~no answering address~~ (DONE 2026-11-05: `Result.addr`; `LiveConnector` only for IP literals); still: no send/expect over the open connection (SPEC: banner
-grabbing out of scope), no TLS timing (sibling `tls` modules exist for that), `PosixConnector` is Linux-only
-(consciously deferred → Backlog).
+`Connector` seam, reports the answering address (`Result.addr`), and binds a source address or interface, restricts or prefers an IP family and spaces repetitions. **Where we are behind:** no send/expect over the open connection (banner grabbing is deliberately not done, see *What is deliberately not done*), no TLS timing (sibling `tls` modules exist for that), `PosixConnector` is Linux-only (consciously deferred → *Backlog / deferred*).
 
 ## Design & invariants
 Pure engine behind a `Connector` seam: all connect I/O goes through `connectFn(target,
@@ -76,7 +71,7 @@ rep counted as loss), `probeMany` (a target list, order-stable). Bounded concurr
 deals work via an atomic next-target counter; the calling thread plus up to `max_concurrent - 1`
 helper threads each own disjoint `TargetResult` slots, so no locking is needed and in-flight
 connects never exceed `max_concurrent`; degrades to inline on one thread if spawning is
-unavailable, and never spawns more than `max_workers = 256` helpers no matter what `max_concurrent` says — the ceiling is the module's, not the caller's, so an aggressive config over a `max_targets` list cannot ask the OS for tens of thousands of threads (it degraded gracefully when the OS refused, which is a weaker property than never asking). Counts bounded (`max_repetitions = 4096`, `max_workers = 256`, `max_targets`). Error policy: a malformed
+unavailable, and never spawns more than `max_workers = 256` helpers no matter what `max_concurrent` says — the ceiling is the module's, not the caller's, so an aggressive config over a `max_targets` list cannot ask the OS for tens of thousands of threads (it degraded gracefully when the OS refused, which is a weaker property than never asking). Counts bounded (`max_repetitions = 4096`, `max_workers = 256`, `max_targets`, and `max_attempts` = `targets.len * count` after the count clamp, default 2^20: each attempt is a connect and a `Result` slot allocated up front, and the separate caps alone allowed ~268 M of them; a larger batch is `error.TooManyAttempts`). Error policy: a malformed
 `host:port` is a typed `Target.ParseError` (Go `SplitHostPort` semantics via
 `netaddr.parseHostPort`, port required, `[v6]:port` supported); a DNS/connect failure is an
 `error` `Result`, never a panic. Optional `AppCheck` runs after a handshake and downgrades
@@ -86,42 +81,62 @@ is referenced, so a non-Linux consumer using `LiveConnector` still builds. Clean
 TCP-connect reachability technique is a standard,
 decades-old approach (nmap's `-sT`, fping's parallel sweep) — behavior modeled only, no
 third-party source consulted or copied; there is no `probe` entry in NOTICE (nothing derived
-requires attribution). Deps `netaddr` + `latency-stats` are sibling modules.
+requires attribution). Deps `netaddr`, `latency-stats` and `clock` (the monotonic read) are sibling modules.
+
+### Result fields, `addr` and the underlying error
+
+`Result.addr` (and `ConnectOutcome.addr`) is the address that answered (tcping's per-line address, blackbox's
+`probe_ip_addr_hash`): the one that completed the handshake for `.up`, the one that refused for `.refused` (the
+race keeps the first refusal), null otherwise. `PosixConnector` always knows it; `LiveConnector` only for an
+IP-literal target, because std's `HostName.connect` does not report which resolved address won.
+
+`ConnectOutcome`/`Result` classify every connect into `up`/`refused`/`timeout`/`canceled`/`error`, but two
+different failures can classify the same way (`EHOSTUNREACH`/`ENETUNREACH`/`EACCES` are all `.error`), and the
+classification alone throws away which one happened. `errno: ?i32` and `err_name: ?[]const u8` carry it:
+`PosixConnector` sets `errno` to the raw `SO_ERROR`/`connect()` code (`classifyErrno`'s input, preserved);
+`LiveConnector` sets `err_name` to `@errorName` of the `std.Io.net` error, since that connector has no numeric
+errno to report. **At most** one of the two is ever set, since exactly one connector produced any given
+outcome, and both are null for `.up`, for an `app_check`-downgraded `.error` (nothing at the OS/transport level
+failed there), **and for the handful of `.error` exits that have no error to name**: a name given to
+`.literal_only`, a `.system` probe with no `io`, a lookup that returned nothing, `POLLNVAL`,
+`LiveConnector`'s own parse/`HostName.init` refusals, an address excluded by `ip_protocol`, a `source` of the
+other family, and a malformed `device` name; a kernel refusal of `socket()` (`EMFILE` under fd exhaustion is a
+local limit, not a dead host), `bind` or `SO_BINDTODEVICE` does carry its errno. A consumer must therefore never write `r.errno.?` on a non-`up`
+result: a panic in Debug and illegal behaviour in ReleaseFast. `@errorName` returns a static, program-lifetime
+string, so `err_name` needs no allocation or ownership story, the same as every other string this module hands
+back.
 
 ### Cancelation is not a transport failure
 
 `Status` carries a fifth value, `canceled`, alongside `up`/`refused`/`timeout`/`error`.
 `std.Io.net`'s `ConnectError` includes `Io.Cancelable` (`error.Canceled`) — a caller that
 canceled its own `std.Io` task (`Future.cancel`) while a `LiveConnector` connect was
-blocked, not a fact about the target. `LiveConnector.classifyErr` used to fold it into the
-`else => .@"error"` arm, which meant a caller that canceled a sweep mid-flight saw the
-targets it never actually finished probing reported as dead hosts — wrong data, not just a
-mislabeled error, since `.@"error"` reads as "we tried and it failed" and `.canceled` means
-"we didn't get an answer because our own caller pulled the plug". `PosixConnector`'s
-connect/poll/getsockopt path is plain `std.os.linux` syscalls, entirely outside `std.Io`'s
-cancellation registry (the same limitation the `-poll`-based-timeout note in
-`CONVENTIONS.md` §2 describes for other modules), so its connects never observe one; its
-`.system` name lookup does, and reports `.canceled` (2026-10-23; it used to be swallowed into
-"no address", i.e. `.error`).
+blocked, not a fact about the target. `LiveConnector.classifyErr` maps it to `.canceled`
+explicitly: folding it into `else => .@"error"` would report the targets a canceled sweep
+never finished probing as dead hosts — wrong data, since `.@"error"` reads as "we tried and
+it failed" and `.canceled` means "we didn't get an answer because our own caller pulled the
+plug". `PosixConnector`'s connect/poll/getsockopt path is plain `std.os.linux` syscalls,
+entirely outside `std.Io`'s cancellation registry (the same limitation the `-poll`-based-timeout
+note in `CONVENTIONS.md` §2 describes for other modules), so its connects never observe one;
+its `.system` name lookup does, and reports `.canceled`.
 
-**A cancelation ends the run (2026-10-23).** std reports a cancelation ONCE, at one
-cancelation point; before 2026-10-23 the module treated it as one sample's outcome and went
-on — the next repetition and the next target connected as usual, an `IoSleeper` interval
-swallowed it outright, and `probeMany`'s helper threads (plain threads, not `Io` tasks)
-never saw it. Now the first `.canceled` sample, or an interval sleep answering
-`error.Canceled` (`Sleeper.sleepFn` returns `error{Canceled}!void`), sets a stop flag shared
-by every worker of the batch: no further connect is made and every repetition not yet
-probed is `.canceled`. `IoSleeper` and `resolveAll` re-arm the cancelation
-(`io.recancel()`) so the caller's next cancelation point still sees it.
+**A cancelation ends the run.** std reports a cancelation ONCE, at one cancelation point,
+so treating it as one sample's outcome would let the next repetition and the next target
+connect as usual, an interval sleep swallow it, and `probeMany`'s helper threads (plain
+threads, not `Io` tasks) never see it. The first `.canceled` sample, or an interval sleep
+answering `error.Canceled` (`Sleeper.sleepFn` returns `error{Canceled}!void`), therefore sets
+a stop flag shared by every worker of the batch: no further connect is made and every
+repetition not yet probed is `.canceled`. `IoSleeper` and `resolveAll` re-arm the
+cancelation (`io.recancel()`) so the caller's next cancelation point still sees it.
 
-Two shapes were on the table for surfacing this; both preserve the existing outcome-record
-API, so the choice was between doing that (shape A, taken) versus not doing it at all
+Two shapes were considered for surfacing a cancelation; both preserve the existing
+outcome-record API, so the choice was between doing that (shape A, taken) and not doing it
 (shape B, rejected):
 
 * **(A, taken) add `Status.canceled`.** Small, additive to the public enum; every switch on
-  `Status` becomes non-exhaustive until it is updated (found and fixed both sites this
-  module has — `classifyErr` and `PosixConnector.connectImpl`). A canceled repetition still
-  produces a `Result`/`TargetResult` sample, just correctly labeled.
+  `Status` is non-exhaustive until it is updated (this module's two sites are `classifyErr`
+  and `PosixConnector.connectImpl`). A canceled repetition still produces a
+  `Result`/`TargetResult` sample, just correctly labeled.
 * **(B, rejected) make the fan-out stop instead of recording an outcome.** Rejected on two
   grounds. First, it cannot be built without (A) as a prerequisite: the `Connector` vtable's
   `connectFn(ctx, target, timeout_ns) ConnectOutcome` has no `io` parameter and no error
@@ -135,39 +150,40 @@ API, so the choice was between doing that (shape A, taken) versus not doing it a
   of it, for a benefit (A, held by a caller who already gets a fully-labeled batch back) can
   already approximate: check for any `.canceled` sample in the results `probeMany` returns.
 
-### Several addresses: a race, not a queue (2026-10-23)
+### Several addresses: a race, not a queue
 
-A `.system` name can resolve to several addresses (dual stack: `::1` and `127.0.0.1`).
-They used to be tried one after another, each with the whole remaining budget, so a
-black-holed first address (a broken IPv6 path) used it all and a service answering on the
-second was reported `.timeout`. `connectRaceWith` now follows RFC 8305: the first address
+A `.system` name can resolve to several addresses (dual stack: `::1` and `127.0.0.1`), at most
+`max_addresses` (8) of them tried. Trying them one after another with the whole remaining budget each would
+let a black-holed first address (a broken IPv6 path) use it all, and a service answering on the second would be
+reported `.timeout`. `connectRaceWith` therefore follows RFC 8305: the first address
 starts at once, each next one `attempt_delay_ns` (250 ms) later or at once when every
 started attempt has failed, the attempts run side by side in one `poll`, the first
 completed handshake wins and the rest are closed; verdicts fold as `VerdictFold` (refused
-outranks a later error or timeout). The system calls are a comptime `Sys` value, so the
+outranks a later error or timeout; a per-address timeout or a spent budget makes a non-refused answer
+`.timeout`). The system calls are a comptime `Sys` value, so the
 timing and bookkeeping are tested on a scripted virtual clock (`FakeSys`) — on loopback a
 refusal and a success both complete inside `connect`, and an asynchronous failure only
 arrives with the first SYN retransmit. The RTT of an `.up` is the winning attempt's own
-connect; resolution and the other attempts are charged against the budget but not in it.
+connect; resolution and the other attempts are charged against the budget but not in it
+(fping and nmap time the connect alone, so a cold resolver does not skew min/avg/max); a `.timeout`'s `rtt_ns`
+is the whole attempt, and `LiveConnector` cannot split them (its `rtt_ns` is the whole attempt).
 
-### Underlying error alongside `Status`
+### Binding, family policy and repetition interval
 
-`ConnectOutcome`/`Result` classify every connect into `up`/`refused`/`timeout`/`canceled`/
-`error`, and that classification is unchanged by this — but two different failures can classify the same way
-(`EHOSTUNREACH`/`ENETUNREACH`/`EACCES` are all `.error`), and the classification alone throws away
-which one actually happened. `errno: ?i32` and `err_name: ?[]const u8` carry it: `PosixConnector`
-sets `errno` to the raw `SO_ERROR`/`connect()` code (`classifyErrno`'s input, preserved rather than
-discarded after use); `LiveConnector` sets `err_name` to `@errorName` of the `std.Io.net` error,
-since that connector has no numeric errno to report. **At most** one of the two is ever set — never
-both, since exactly one connector produced any given outcome — and both are null for `.up`, for
-an `app_check`-downgraded `.error` (nothing at the OS/transport level failed there), **and for
-the handful of `.error` exits that have no error to name**: a name given to `.literal_only`, a
-`.system` probe with no `io`, a lookup that returned nothing, `socket()` itself failing,
-`POLLNVAL`, `LiveConnector`'s own parse/`HostName.init` refusals, and (2026-10-11) an address excluded by `ip_protocol`, a `source` of the other family, and a malformed `device` name; a kernel refusal of `bind`/`SO_BINDTODEVICE` does carry its errno. ⚠ This paragraph used to say
-*exactly* one, which invites `r.errno.?` on a non-`up` result — a panic in Debug and illegal
-behaviour in ReleaseFast (W2 re-audit 2026-09-02, `probe` F4). `@errorName`
-returns a static, program-lifetime string, so `err_name` needs no allocation or ownership story, the
-same as every other string this module hands back.
+- **Source address / interface** (`PosixConnector.source`, `.device`): blackbox_exporter's
+  `source_ip_address`, and `SO_BINDTODEVICE`. The socket binds to `source:0` before the connect, per address;
+  a family mismatch, a malformed device name (empty, longer than 15 bytes, a NUL or `/`: an empty option
+  value would *remove* a binding), or a failing `bind`/`SO_BINDTODEVICE` is an `.error` Result (carrying the
+  kernel's errno when the kernel refused). Before Linux 5.7 `SO_BINDTODEVICE` needs `CAP_NET_RAW`.
+- **IP family** (`PosixConnector.ip_protocol`: `.any`, `.ip4`, `.ip6`, `.prefer_ip4`, `.prefer_ip6`):
+  blackbox's `preferred_ip_protocol` with `ip_protocol_fallback: false` (`.ip4`/`.ip6`) or `true`
+  (`.prefer_*`). It applies to IP literals and resolved names alike; an excluded family is `.error`, the
+  "no usable address" outcome, decided before the budget is looked at.
+- **Interval** (`Options.interval = .{ .ms, .sleeper }`): a pause between the repetitions of one target, none
+  before the first, none after the last (so `count = 1` never sleeps), none between targets. The pause and the
+  way to sleep (`IoSleeper` builds a `Sleeper` from `std.Io`) are one value, so an interval that would silently
+  not happen cannot be configured. In `probeMany` a sleeping target holds its worker slot (the pause counts
+  against `max_concurrent`) but blocks no other worker.
 
 ## Threat model / out of scope
 Not a security scanner and not privileged (an ordinary TCP connect; no raw sockets, no SYN/stealth
@@ -186,101 +202,75 @@ mode. `LiveConnector` on `timeout_ns`: **advisory** for a different reason — `
 panics if a connect timeout is passed, so the attempt blocks for the OS default (measured 134 367 ms
 for a 200 ms budget) and only the result respects the budget. That is a property of that backend,
 not a reason for `probe` to be unbounded; `PosixConnector` is the answer. Out of scope: UDP/ICMP
-probing, banner grabbing, TLS/protocol handshakes, port-range sweeping, IPv6 zone/scope ids.
+probing, banner grabbing, TLS/protocol handshakes, port-range sweeping, IPv6 zone/scope ids (see
+*What is deliberately not done*). There is no total-time cap across `LiveConnector`'s OS connect timeout,
+`Options.interval` and `timeout_ms`: they are documented knobs, bounded individually.
+
+## What is deliberately not done
+
+- **Bounding name resolution by `timeout_ns`**: a `poll`-based connector cannot; see *Threat model* for what
+  each `Resolve` mode promises.
+- **A bounded `LiveConnector` connect**: its `timeout_ns` stays advisory, because `std.Io.Threaded` panics on a
+  connect timeout; the answer is `PosixConnector`, not waiting for std.
+- **UDP/ICMP probing, raw or SYN scans, banner grabbing and send/expect over the open connection
+  (blackbox's `query_response`), TLS/protocol handshakes, port-range sweeping, IPv6 zone/scope ids.**
+- **Stopping the fan-out instead of recording a `.canceled` outcome** (shape B in *Design*).
 
 ## Verification
-Offline-first: a scripted fake `Connector` on a virtual clock drives every path — per-outcome
-classification, N-rep min/avg/max + loss%, `AppCheck` downgrade, `Target.parse` KATs (incl.
-`[v6]:port` and typed-error negatives), and a 50-target fan-out asserting order stability, one call
-per target, and `max_in_flight <= max_concurrent`.
 
-The timeout claim cannot be tested that way, so `PosixConnector` is driven by live tests that stay
-on loopback (hermetic, no netns needed — a fresh namespace starts with `lo` down, the same reason
-`icmp`/`traceroute` are excluded from `NETNS_MODULES`). The hard case is a **black hole**, a
-destination that neither completes nor refuses: `listen(fd, 1)` plus enough never-accepted connects
-fills the one-slot accept queue, after which Linux drops the incoming SYN (`sk_acceptq_is_full`) and
-the client retries for `tcp_syn_retries` rounds (~127 s). Verified on this kernel before being
-relied on — closed port 0.1 ms `revents=0x1c`/`SO_ERROR=111`, empty queue 0.1 ms `revents=0x4`, full
-queue hung through both a 200 ms and a 3 000 ms poll — and re-asserted every run, since a one-second
-budget that still returns `.timeout` is something neither a listening peer nor a closed port can
-produce on loopback. Measured: **200 ms budget → 200.3 ms, 1 000 ms budget → 1 000.9 ms**, refused
-0.041 ms under a 5 s budget, up rtt 0.050 ms, 8 black-holed targets fanned out at a 200 ms budget →
-202.4 ms total. The contrast is the evidence: the same black hole and the same 200 ms budget through
-`LiveConnector` on an abandoned thread is **still blocked after 2 000 ms** (run to completion once
-outside the gate: 134 367 ms). A signal-storm test (`tgkill` every 10 ms for 600 ms, no `SA_RESTART`)
-pins that `EINTR` recomputes the remainder instead of restarting the budget: 200.7 ms with 20
-signals delivered. Run: `zig build test-probe`.
-
-**Mutation + review (2026-11-11, whole module,** production part of `root.zig` (lines 1–1292: `probeTcp`/`probeTarget`/`probeMany`, `LiveConnector`, `PosixConnector` race with `VerdictFold`, `startAttempt`/`finishAttempt`, `classifyErrno`, `IoSleeper`), schemata in a detached copy, ReleaseSafe, strict verdict, adversarial read while placing mutants): 208 mutants, 188 killed (32 by 17 new tests), 10 equivalent + 10 not hermetically testable, 0 undecided, no finding. New tests: rtt kept for `.up` only, inclusive `max_targets`, `probeMany` leak-free under allocation failure at every step, inline fallback when the thread array fails, the caller works beside the helpers, `VerdictFold` (up after timeout, timeout keeps its errno), `connectRaceWith` on `FakeSys` (saturating budget, `now +| delay`, budget 0 polls with -1, `.done` up has `connect_ns` 0, poll failure carries its errno), ip6-only on a v4 literal, a spent budget keeps its rtt, a black-holed timeout reports its rtt, NONBLOCK|CLOEXEC sockets, EMFILE errno (RLIMIT_NOFILE, restored), no fd leak on bind/device failure, ENODEV and broadcast errnos, `finishAttempt` POLLNVAL/HUP-without-OUT/EBADF, invalid host name is `.error`, canceled lookup and sleep leave the cancelation armed, `LiveConnector` closes its stream. Equivalent: `runFanout` `n == 0` and `helpers == 0` shortcuts, the LiveConnector literal-parse fallback (std and netaddr agree on 19 probed literals), the post-lookup `n == 0` guard, `>=`/`>` on the deadline (needs the clock to read exactly `timeout_ns`), SO_BINDTODEVICE optlen without the NUL (zeroed buffer, kernel clamps), the revents reset and `ready == 0` shortcut, race `.addr` on every verdict. Not hermetically testable: resolution time charged to the budget (#86/#91), `.up` after the deadline (#97), a `.timeout` carrying ETIMEDOUT (#101, ~127 s), a synchronous connect success/EINTR/ECONNREFUSED (#131/#132/#134: loopback always gives EINPROGRESS), a failing non-canceled `.system` lookup and the 8-address cap (#191/#192, need DNS), a cancel between `lookup()` and `queue.getOne` (#193).
-
-**Audit 2026-10-04 (mutation).** 27 schemata mutants over `TargetResult`
-(`canceledCount`, `reachable`), the worker/repetition clamps, `probeTcp` (app check, errno
-carry), the aggregation (cancellations excluded, an `.up` without rtt as loss), the
-target cap and fan-out, `overBudget`, `classifyErr`/`classifyErrno`, and `PosixConnector`
-(literal-only, the per-address budget fold, `connectBounded`'s deadline, poll and SO_ERROR
-logic): 24 killed, 1 equivalent, 2 left alive. Equivalent: the `n == 0` early return after
-resolution (with no address the fold never runs and its verdict is already `.error`).
-Alive, kernel edges no offline test can drive: `connect()` completing synchronously on a
-non-blocking socket (Linux loopback answers `EINPROGRESS`), and a poll wake with
-`SO_ERROR = 0` but no `POLLOUT`. The multi-address rules (`ran_out` on a per-address
-timeout, `.refused` outranking a later `.error`, `.refused` surviving a spent budget) were
-reachable only through a name resolving to several addresses; the loop's decision logic was
-extracted unchanged into `PosixConnector.VerdictFold` (same verdict for every sequence of
-per-address outcomes) and is pinned there -- a 6-mutant follow-up run on the fold killed all
-six. Tests added: `canceledCount` counts only cancellations, a single `.up` repetition is
-reachable, a budget already spent before the connect is `.timeout` with nothing attempted,
-and one sequence per fold rule.
-
-**Model-based differential (2026-10-11).** Test `model: probeTarget and probeMany agree with a naive
-model …` runs 300 seeds (80 in Debug): 1–12 targets, `count` 0 (clamped to 1) … 40, `max_concurrent`
-0–5, an app check that rejects odd ports on a third of the seeds, and per target a random script of
-connector outcomes — `up` with an RTT, `up` with none (a broken connector), refused, timeout,
-canceled and error with random errno / error names — biased so some targets are all-down or
-all-cancelled; half the seeds go through `probeMany`, half through `probeTarget`. `ProbeModel`
-re-derives each sample and the statistics on its own (two-pass mean and population stddev instead
-of Welford, RFC 3550 §6.4.1 jitter over consecutive received RTTs, loss over non-cancelled
-repetitions) and every sample field, `canceledCount`, `reachable` and every statistic is compared.
-Reach (all must be hit): up, up without RTT, refused, timeout, canceled, error, app-rejected, a
-target whose every repetition was cancelled, an unreachable target, and the `probeMany` path.
-Negative controls: counting cancelled repetitions as loss fails it (and one hand-written test);
-keeping the RTT on an app-check downgrade fails it ALONE — no earlier test asserted that RTT.
+- **Run:** `scripts/modtest probe` (the live tests stay on loopback: hermetic, no netns needed, because a fresh
+  namespace starts with `lo` down, the same reason `icmp`/`traceroute` are excluded from `NETNS_MODULES`).
+  The card's `**Ahead:**` line is reproduced by `tools/blackbox_probe/run.sh` (see `tools/README.md`).
+- **Offline first:** a scripted fake `Connector` on a virtual clock drives every path: per-outcome
+  classification, N-rep min/avg/max and loss, `AppCheck` downgrade, `Target.parse` KATs (including
+  `[v6]:port` and typed-error negatives), a 50-target fan-out asserting order stability, one call per target
+  and `max_in_flight <= max_concurrent`, the worker ceiling, `max_targets` and `max_attempts`, the interval
+  and cancelation paths, `selectAddresses` for every `IpProtocol`, and the `Result.addr` rules.
+- **The race:** `connectRaceWith` on `FakeSys` (scripted virtual clock): start spacing, an immediate
+  next start on failure, a failure in the middle of the open set, black holes ended by the budget with every
+  descriptor closed, saturating arithmetic near the top of the clock, a failing `poll`; `VerdictFold` has one
+  sequence per rule. Live: a black-holed first address does not starve a listening second one, and the RTT
+  is the winning connect.
+- **The timeout claim cannot be tested offline**, so `PosixConnector` is driven by live loopback tests. The
+  hard case is a **black hole**, a destination that neither completes nor refuses: `listen(fd, 1)` plus
+  enough never-accepted connects fills the one-slot accept queue, after which Linux drops the incoming SYN
+  and the client retries for `tcp_syn_retries` rounds (~127 s). The tests re-assert the premise every run (a
+  closed port is refused at once with `revents=0x1c` and `SO_ERROR=111`, an empty queue completes, a full
+  queue hangs through the poll), so a budget that still returns `.timeout` is something neither a listening
+  peer nor a closed port can produce on loopback. They check the wall clock against the budget, refused and
+  up timing, a fan-out over black-holed targets, and the contrast: the same black hole through
+  `LiveConnector` on an abandoned thread is still blocked long after the budget. A signal-storm test
+  (`tgkill` every 10 ms, no `SA_RESTART`) pins that `EINTR` recomputes the remainder instead of restarting
+  the budget. Source and device binding are tested on loopback (source `127.0.0.2` seen as the peer address,
+  device `lo`); descriptor leaks on every outcome; `EMFILE` under `RLIMIT_NOFILE`.
+- **Model-based differential:** test `model: probeTarget and probeMany agree with a naive model …` runs random
+  seeds of 1–12 targets, `count` 0 (clamped to 1) up to 40, `max_concurrent` 0–5, an app check that rejects
+  odd ports on a third of the seeds, and per target a random script of connector outcomes (`up` with an RTT,
+  `up` with none (a broken connector), refused, timeout, canceled, error with random errno / error names),
+  biased so some targets are all-down or all-cancelled; half the seeds go through `probeMany`, half through
+  `probeTarget`. `ProbeModel` re-derives each sample and the statistics on its own (two-pass mean and
+  population stddev instead of Welford, RFC 3550 §6.4.1 jitter over consecutive received RTTs, loss over
+  non-cancelled repetitions) and every sample field, `canceledCount`, `reachable` and every statistic is
+  compared. Reach (all must be hit): up, up without RTT, refused, timeout, canceled, error, app-rejected, a
+  target whose every repetition was cancelled, an unreachable target, and the `probeMany` path.
+- **Not hermetically testable** (kernel edges and DNS): resolution time charged to the budget, an `.up` after
+  the deadline, a `.timeout` carrying `ETIMEDOUT` (~127 s), a synchronous connect success/`EINTR`/
+  `ECONNREFUSED` (loopback always gives `EINPROGRESS`), a failing non-canceled `.system` lookup and the
+  8-address cap (need DNS), a cancel between `lookup()` and the queue read, `monoNs` on a failing
+  `clock_gettime`.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module
+  mutation run and the delta runs after it.
 
 ## Backlog / deferred
-- **Delta audit 2026-10-29 (no-panic sweep § GI):** 1 mutant (the plain `+` back in the poll-timeout round-up): killed. Not scored: `monoNs`'s failed-`clock_gettime` path (no test can make the call fail). Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GI)**: R-probe-1 / PR-2 (MED) `probeMany` capped targets and repetitions but not their product (~268 M connects, ~15 GiB of `Result` slots) — closed by `Options.max_attempts` (owner 2026-10-29, `error.TooManyAttempts`); R-probe-3 (LOW) no total-time cap across `LiveConnector`'s OS connect timeout, `interval.ms` and `timeout_ms` (documented knobs).
-Name resolution is not bounded by `timeout_ns` and cannot be by a `poll`-based connector — see the
-threat-model section for what each `Resolve` mode does and does not promise. `LiveConnector`'s
-advisory `timeout_ns` stays advisory: `std.Io.Threaded` panics on a connect timeout, and the fix is
-to use `PosixConnector`, not to wait for std. UDP/ICMP probing, banner grabbing, TLS/protocol
-handshakes, port-range sweeping and IPv6 zone/scope ids are explicit out-of-scope items.
 
-Survey 2026-09-30 — missing and it matters (pure Zig, fit CONVENTIONS §2):
-
-- ~~(survey 2026-09-30) **Source address / interface binding** (`source_ip_address` in blackbox_exporter, `SO_BINDTODEVICE`).~~
-  **DONE 2026-10-11** (`PosixConnector.source`, `.device`; bind to `source:0` before connect, per address; a
-  family mismatch, bind or device failure is an `.error` Result). Why: probing from a specific uplink on a multi-homed router, the everyday case for a network-health checker. Effort:
-  small (`bind` before `connect` in `PosixConnector`; the raw `bind` is already used in tests).
-- ~~(survey 2026-09-30) **Inter-repetition interval** (`Options.interval_ms` for `count > 1`).~~ **DONE 2026-10-11**
-  (`Options.interval = .{ .ms, .sleeper }`; `IoSleeper` builds the sleeper from `std.Io`; pause and sleeper are
-  one value, so an interval that would silently not happen cannot be configured). Why: tcping-style
-  monitoring spaces attempts; today they run back-to-back, which measures burst RTT and can trip SYN rate limits.
-  Effort: small (but must not block fan-out workers; sleeping needs `io` or a clock seam).
-- ~~(survey 2026-09-30) **IP-family preference / restriction** (`preferred_ip_protocol` v4-only, v6-only).~~ **DONE
-  2026-10-11** (`PosixConnector.ip_protocol`: `.any/.ip4/.ip6/.prefer_ip4/.prefer_ip6`; excluded family = `.error`,
-  the "no usable address" outcome). Why: "is the
-  IPv6 path up" is a separate question from "is the host up". Effort: small (filter `resolveAll`'s result).
-- (survey 2026-09-30) **Non-Linux `PosixConnector`** (BSD/macOS via the same poll technique). **Consciously deferred
-  2026-10-11:** BSD/macOS have no stable syscall ABI, so a libc-free poll connector there means libc, which §2 rules
+- **Non-Linux `PosixConnector`** (BSD/macOS via the same poll technique) *(survey 2026-09-30)*. Consciously
+  deferred: BSD/macOS have no stable syscall ABI, so a libc-free poll connector there means libc, which §2 rules
   out for this module; `LiveConnector` stays the portable path (owner can overrule). Why: only `LiveConnector`
   is portable and it cannot bound a connect. Effort: medium; needs a syscall path other than `std.os.linux` (fits §2
   only if no libc — check per target).
-- Not filed (already refused above): send/expect and banner grabbing, TLS handshakes, port sweeps, UDP/ICMP. Question
-  for the owner: should `AppCheck` ever get a way to use the open socket (blackbox's `query_response`)? The SPEC
-  refuses banner grabbing, so this is recorded as a question, not a backlog item.
-
-## Status
-`gap · any · client · single_owner` + deps: `netaddr`, `latency-stats` — canonical source is
-`pub const meta` in src/root.zig.
+- **Question for the owner, not a backlog item:** should `AppCheck` ever get a way to use the open socket
+  (blackbox's `query_response`)? Banner grabbing is refused (*What is deliberately not done*), so this is a
+  question only.
 
 ## Anchoring
 

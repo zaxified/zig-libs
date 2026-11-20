@@ -40,11 +40,13 @@ never reaches the resolver in either mode.
   `getsockopt` only through `std.os.linux`).
 - **Model after:** `nmap -sT` / `fping`-style fan-out (technique, public knowledge).
 - **Deps:** `netaddr` (target address parse/format, incl. `[v6]:port`),
-  `latency-stats` (per-target min/avg/max/loss).
+  `latency-stats` (per-target min/avg/max/loss), `clock` (the monotonic read).
 
-Layers: `probeTcp` — one connect attempt → `Result { kind, rtt_ns, errno, err_name }`;
+Layers: `probeTcp` — one connect attempt → `Result { kind, rtt_ns, errno, err_name, addr }` (`addr`: the address that answered, for `up` and `refused`; `LiveConnector` knows it only for an IP literal);
 `probeTarget` — N reps of one target → aggregated min/avg/max/loss;
-`probeMany` — fan out a target list with bounded concurrency, order-stable.
+`probeMany` — fan out a target list with bounded concurrency, order-stable; the batch is bounded
+(`max_targets`, `max_repetitions`, `max_workers` and `max_attempts` = targets × count, over which it is
+`error.TooManyAttempts`).
 An optional app-level check hook runs after the handshake. `Target.parse`
 accepts `host:port` and `[v6]:port`.
 
@@ -103,8 +105,14 @@ clock, and the same black hole through `LiveConnector` to show the old path does
 not come back. Source/device binding is tested on loopback (source `127.0.0.2`,
 the accepted peer address is checked; device `lo`). All hermetic: loopback only, no resolver traffic, no netns.
 
+## Not provided
+
+UDP/ICMP probing, raw or SYN scans, banner grabbing and send/expect over the open connection, TLS or
+protocol handshakes, port-range sweeping, IPv6 zone ids, a name-resolution bound by the timeout, and a
+`PosixConnector` outside Linux. See SPEC *What is deliberately not done* and *Backlog / deferred*.
+
 Provenance: clean-room — implements the standard TCP-connect probing technique
 (`nmap -sT` / `fping` fan-out, public knowledge); no third-party source consulted
-or copied — behavior only. Deps `netaddr` + `latency-stats` are sibling modules.
+or copied — behavior only. Deps `netaddr`, `latency-stats` and `clock` are sibling modules.
 Data: `tools/blackbox_probe/blackbox.yml` is a fixture of our own tooling that runs
 Ubuntu's blackbox_exporter binary as a black-box oracle (no source of it read or copied).
