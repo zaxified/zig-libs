@@ -124,72 +124,44 @@ The round constants and MDS matrices are separately pinned by SHA-256 against
 authors' sage files (both BLS12-381 widths), plus literal spot values an
 auditor can read off upstream by eye.
 
-### Mutation — evidence the tests bite
+The MDS security checks are cross-checked against an independent sympy port of the
+same sage source, a grade-2 oracle (a second transcription by the same author, not
+external validation); `SPEC.md` §"Anchoring" is explicit about what it can and
+cannot prove. The module is standalone Zig, so the comparison is split in two: the
+transcript of the sympy peer's verdicts for 182 matrices is committed
+(`src/testdata/mds_subspace_trail.txt`) and replayed by `src/mds_replay_test.zig`
+with **no `python3` anywhere**, so it asserts on every host; the live peer is a
+pre-release check:
 
-Twelve deliberate breakages, each reverted. The eight aimed at the MDS
-security checks and the rejection loop are tabulated in `SPEC.md`; the sharpest
-is *"a rejection is detected but does not consume its Grain draw"*, which still
-yields a valid, invertible, MDS, perfectly deterministic matrix and is invisible
-to every structural property — only "the accepted matrix is the k-th draw and
-differs from the first" catches it.
-
-The original four, on the permutation and the generator, each verified restored
-by file checksum (the module was untracked at the time, so `git diff` had
-nothing to compare):
-
-| mutation | result |
-|---|---|
-| partial-round S-box on `state[t-1]` instead of `state[0]` | **caught** — 10 vector tests fail; all constant pins and structural tests still pass |
-| S-box applied to all elements in partial rounds (no partial/full distinction) | **caught** — the same 10 vector tests fail |
-| round split shifted (`R_F/2 + 1` leading full rounds, one fewer partial round, identical total round count and identical constant consumption) | **caught** — the same 10 vector tests fail |
-| MDS seed draws rejection-sampled instead of reduced (`grain.zig`) | **caught** — 8 vector tests + 3 constant pins fail; the failure message names the layer (`MDS digest mismatch at t=2`) while the round-constant digests stay green |
-
-Two things worth recording from that last one. First, the constant pins do
-what they are for: they separate "the generator drifted" from "the
-permutation is wrong". Second, `poseidonperm_x5_254_5` and
-`poseidonperm_x5_255_5` **survived** it — at `t = 5` no MDS draw happened to
-land above `p`, so the matrix was unchanged. The `t = 2..17` sweep is what
-caught it there, which is the concrete reason that sweep exists rather than
-just the three widths upstream's own suite exercises.
+```sh
+zig build interop-poseidon                # re-run the sympy peer, diff, no rewrite
+zig build interop-poseidon -- --capture   # re-take the transcript (tools/interop.zig drives tools/subspace_trail.py)
+```
 
 ## Tests
 
 ```sh
-zig build test-poseidon                             # 61 tests, ~42 s in Debug
-zig build test-poseidon -Doptimize=ReleaseFast      # ~3 s
-zig build test-poseidon --fuzz --release=safe       # injectivity harnesses
+zig build test-poseidon                             # slow in Debug (see below)
+zig build test-poseidon -Doptimize=ReleaseFast      # a few seconds
 ```
 
-`--release=safe` is not optional for `--fuzz`. Green in Debug, ReleaseSafe and
-ReleaseFast.
+The fuzz harnesses (injectivity of the permutation) are run by the repo's
+deterministic fuzz driver (`POSEIDON_FUZZ`), as every module's are; `SPEC.md`
+§"Verification" lists the test classes. The tests are green in Debug, ReleaseSafe
+and ReleaseFast.
 
 The Debug lane is slow because `std.crypto.ff`'s constant-time multiply costs
 9.6 µs unoptimized against 0.8 µs optimized, and the MDS security checks are
-~70 000 multiplications at `t = 17`. `SPEC.md` §"Performance note" records why
-marking the module `heavy` was measured and makes it *worse*.
+~70 000 multiplications at `t = 17`. `SPEC.md` records why marking the module
+`heavy` was measured and makes it *worse*.
 
-The security checks are cross-checked against an independent sympy port of the
-same sage source. Since 2026-09-06 that comparison is split in two, because a
-module here is standalone Zig and an oracle that needs `python3` is not:
+## Not provided
 
-```sh
-zig build interop-poseidon                # re-run the sympy peer, diff, no rewrite
-zig build interop-poseidon -- --capture   # re-take the transcript
-```
-
-`tools/interop.zig` drives `tools/subspace_trail.py` and captures its verdicts
-for 182 matrices into `src/testdata/mds_subspace_trail.txt`;
-`src/mds_replay_test.zig` replays that file with **no `python3` anywhere**, so
-the comparison now asserts on every host instead of skipping on the ones without
-sympy. That oracle is grade 2 — a second transcription by the same author, not
-external validation. `SPEC.md` §"Anchoring" is explicit about what it can and
-cannot prove.
-
-## Not here
-
-Variable-length (sponge) hashing, Poseidon2, Rescue/Rescue-Prime, and circuit
-/ constraint-system integration. `SPEC.md` gives the reasoning for each and
-names Rescue-Prime as the obvious follow-up module.
+Variable-length (sponge) hashing and circuit / constraint-system integration are
+refused; Poseidon2 and a neptune-compatible BLS12-381 framing are not built (open
+items). Rescue-Prime is the sibling module [`rescue`](../rescue/README.md).
+`SPEC.md` gives the reasoning (*What is deliberately not done*, *Backlog /
+deferred*).
 
 Constant-time behaviour, and where it does and does not apply: `SPEC.md`
 §"Constant time". Short version — the permutation is constant time with
