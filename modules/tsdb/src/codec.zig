@@ -53,7 +53,7 @@ pub const tag_point: u8 = 0x01;
 pub const tag_series_index: u8 = 0x02;
 /// Reverse index: `tag | series_id(BE u64)` → canonical(name, labels).
 pub const tag_series_rev: u8 = 0x03;
-// 0x04 is reserved for the inverted label index (SPEC §9).
+// 0x04 is reserved for the inverted label index (see SPEC).
 /// A compacted block of samples: `tag | series_id(BE u64) | orderedTs(LAST
 /// sample, BE u64)` → `chunk.zig` block bytes. Keyed by the LAST timestamp so
 /// that `seek(blockKey(series, from))` lands on the first block that can hold
@@ -723,7 +723,7 @@ test "corpus: the point-key seeds reach the decoder, and the counts are pinned" 
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     // One @splat + @bitCast, not a loop: a comptime loop writing into an
     // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
-    // binary spent ~5 min in Sema on these, 2026-10-24).
+    // binary spent ~5 min in Sema on these).
     const rep_result = comptime blk: {
         const unit: [s.len]u8 = s[0..s.len].*;
         const grid: [n][s.len]u8 = @splat(unit);

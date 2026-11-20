@@ -141,7 +141,7 @@ pub const Db = struct {
     /// call (and across calls) instead of a fresh `alloc`/`free` every
     /// chunk of a long retention sweep.
     sweep_scratch: std.ArrayList([codec.point_key_len]u8) = .empty,
-    /// `range`'s block-cursor shortcut (the terminal-UI consumer repin A/B, 2026-10-17): the
+    /// `range`'s block-cursor shortcut (the terminal-UI consumer repin A/B): the
     /// kvtree version (`Snapshot.txn_id`) at which the store was seen to hold
     /// NO compacted block at all. A snapshot at that same version skips the
     /// second cursor and its root-to-leaf seek; any commit, by this `Db` or
@@ -262,7 +262,8 @@ pub const Db = struct {
     /// not one per series — a first scrape of 1000 new series was 1000 commits
     /// with two fsyncs each). `out[i]` is the id of `specs[i]`; the same series
     /// twice in `specs` gets the same id. All or nothing: on an error no new
-    /// series exists. `max_series` counts the whole batch.
+    /// series exists. `max_series` counts the whole batch. Precondition:
+    /// `out.len >= specs.len` (a shorter `out` panics).
     pub fn seriesIds(self: *Db, specs: []const SeriesSpec, out: []SeriesId) Error!void {
         if (out.len < specs.len) @panic("tsdb: seriesIds: out is shorter than specs");
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
@@ -3072,7 +3073,7 @@ test "F1: CorruptIndex/CorruptPoint reject paths actually fire on a malformed va
 }
 
 test "retention bounds the file: appending and sweeping at the same rate reaches a steady size" {
-    // The 2026-09-28 measurement, as a test: 1000 points in and 1000 swept
+    // The measurement, as a test: 1000 points in and 1000 swept
     // per round grew the file ~60 KiB a round, linearly, because kvtree kept
     // the leaves the sweep emptied and a series never writes below its
     // cutoff again. kvtree now drops emptied leaves, so their pages recycle.
@@ -3191,7 +3192,7 @@ test "compact: a regular series packs into blocks, reads back bit-exact, and liv
 }
 
 test "range: no block cursor while the store has no block; a compact through another Db is seen at once" {
-    // the terminal-UI consumer repin A/B (2026-10-17): every `range` used to seek a second
+    // the terminal-UI consumer repin A/B: every `range` used to seek a second
     // cursor into the block keyspace, 1.37x task-clock on small scans of a
     // store never compacted. The shortcut is keyed on the kvtree version, so a
     // second `Db` over the same tree compacting must not make the first miss
@@ -3563,7 +3564,7 @@ test "deleteSeries: raw and compacted samples and both index entries go; the id 
     try testing.expect(!(try fx.db.deleteSeries(gone, .{})).existed);
 }
 
-// ── mutation-audit additions (2026-10-04) ────────────────────────────────────
+// ── mutation-audit additions ────────────────────────────────────
 
 fn blockBytesInTree(db: *Db) !u64 {
     var cur = try db.tree.cursor();
@@ -3886,7 +3887,7 @@ test "deleteSeries: deleting a LOWER id never touches a higher series, and chunk
     try testing.expectEqual(@as(usize, 1), try checkBlockInvariants(&fx.db));
 }
 
-// ── S2 additions (2026-10-20): maintain, max_series, label listing, matchers,
+// ── S2 additions: maintain, max_series, label listing, matchers,
 // deleteRange, aggregate ─────────────────────────────────────────────────────
 
 const all_lo = std.math.minInt(i64);

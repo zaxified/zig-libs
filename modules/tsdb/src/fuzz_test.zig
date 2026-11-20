@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Deterministic fuzz driver over tsdb's two `testing.fuzz` harnesses,
-//! `parseCanonical` and `decodePointKey` (added 2026-10-09). Both bodies are
+//! `parseCanonical` and `decodePointKey`. Both bodies are
 //! generic over their source of choices (`fn(comptime S, *S, gpa)`). The first
 //! draw is one `slice` of bytes (the input, as `std.testing.fuzz` seeds it);
 //! a second, ranged draw picks a SHAPE: 0 = the bytes as they are, 1-3 = a
