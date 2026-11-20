@@ -31,13 +31,12 @@ only the ubus protocol constants + the packed msghdr layout from `ubusmsg.h`
 (LGPL-2.1) as uncopyrightable protocol facts. `libubus-io.c` (LGPL-2.1)
 contributed no code — the socket transport is original. The wire format is
 golden-byte tested against hand-derived expected output (from the documented
-libubox spec, not a captured device transcript), exercised end-to-end against a
-real `ubusd` when one is reachable (see "Testing without hardware" below), and
-`codec.zig`'s "real ubusd capture" tests additionally freeze wire bytes and the
-matching `ubus -S` JSON stdout from a real `ubus`/`ubusd` pair run once inside
-the `scripts/vm/` OpenWRT VM — a genuine textual byte-parity check, closing the
-gap an earlier revision of this note said had not been done; see `SPEC.md` for
-the findings. See [`NOTICE`](NOTICE) beside this file.
+libubox spec), replayed against frames captured from a real `ubus`/`ubusd` pair
+(above, plus `codec.zig`'s "real ubusd capture" tests, which freeze wire bytes and
+the matching `ubus -S` JSON stdout from a pair run inside the `scripts/vm/`
+OpenWRT VM), and exercised end-to-end against a live `ubusd` when one is
+reachable (see "Testing without hardware" below); see `SPEC.md` *Verification*.
+See [`NOTICE`](NOTICE) beside this file.
 
 ## API
 
@@ -110,12 +109,18 @@ _ = try ms.poll(&lines);
 _ = ms.malformed; // frames it could not read: skipped and counted, never silent
 ```
 
-Not implemented: the provider side and fd passing (see SPEC.md, "Compared
-with"). A status code is a verdict: a `list` whose closing STATUS is non-zero
+A status code is a verdict: a `list` whose closing STATUS is non-zero
 is an error, never an empty listing, and a closing STATUS without a code is a
-`BadMessage` (a real ubusd always sends it). `ubus -t 0` (no limit, the real CLI waits for ever) is a
-named gap: it is refused with `error.Unsupported`, every call here is bounded.
+`BadMessage` (a real ubusd always sends it).
 `c.subscribeMany(&.{ "a", "b" })` is `ubus listen a b`.
+
+## Not provided
+
+The object provider side and fd passing are refused by design; `ubus -t 0` (no
+limit, the real CLI waits for ever) is refused with `error.Unsupported`, every call here is
+bounded (give a large `call_timeout_ms` instead). The reasons are in `SPEC.md`,
+*What is deliberately not done*; the one open item (event-driven `wait_for`) is in
+*Backlog / deferred*.
 
 Low-level, for custom messages (all `pub`): `blobmsg.codec` — bounds-checked
 `AttrIterator` (raw blob attrs) and `FieldIterator` (typed blobmsg fields),
@@ -162,7 +167,8 @@ bool→INT8, integer→INT32 (INT64 when it overflows i32), float→DOUBLE.
 - **Two daemon behaviors the ubusd daemon requires** (both mandatory): an
   INVOKE must carry `UBUS_ATTR_DATA` even with no arguments
   (INVALID_ARGUMENT otherwise), and the INVOKE reply choreography is
-  ack-STATUS (no OBJID) → DATA → completion-STATUS (OBJID + return code) —
+  zero or more ack STATUS frames (no OBJID; a real ubusd sends none on the client's
+  connection) → DATA → completion-STATUS (OBJID + return code) —
   while ubusd-internal objects (the event registry) answer directly with a
   single STATUS. The event "object" id must be blobmsg INT32, not the
   generic JSON-int mapping.
@@ -182,15 +188,13 @@ bool→INT8, integer→INT32 (INT64 when it overflows i32), float→DOUBLE.
 - **Testing without hardware:** a scripted in-process daemon (unix socket +
   thread) speaks the exact reply choreography, asserting both required
   behaviors from the daemon side; golden byte tests pin the wire format
-  against hand-derived expected bytes (from the documented libubox spec, not
-  a captured device transcript). A real-ubusd integration test runs when
-  `/var/run/ubus/ubus.sock` exists and skips cleanly otherwise — it checks
-  that `list()` returns at least one object and that `invoke("system",
-  "board", null)` round-trips to parseable JSON, **not** a byte-level
-  comparison against anything. **Now done** (audit F11: this paragraph used
-  to say otherwise, stale after the fact): `codec.zig`'s "real-daemon
-  capture" section freezes wire bytes and the matching `ubus -S` JSON
-  stdout from a real `ubus`/`ubusd` pair, captured once in the
-  `scripts/vm/` OpenWRT VM lane — a genuine textual byte-parity check
-  against real hardware output, not merely "parses without error"; see
-  SPEC.md's "Real-daemon capture" section for the findings.
+  against hand-derived expected bytes (from the documented libubox spec). A
+  replay of frames captured from a real `ubusd` and the real `ubus` CLI checks
+  that every request this client sends is byte-identical to the CLI's, and
+  `codec.zig`'s "real-daemon capture" section freezes wire bytes and the matching
+  `ubus -S` JSON stdout from a pair run in the `scripts/vm/` OpenWRT VM. A
+  live-`ubusd` test runs when `/var/run/ubus/ubus.sock` exists (or
+  `BLOBMSG_UBUS_SOCKET` names a socket) and skips cleanly otherwise: it checks
+  that `list()` works and that `invoke("system", "board", null)` (or, on a bare
+  daemon, the capture tool's `probe.echo`) round-trips to parseable JSON. See `SPEC.md` *Verification* for the
+  capture tool and its findings.

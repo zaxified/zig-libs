@@ -12,10 +12,6 @@
 
 **Performance:** ref 0.54–1.01× libubox a396f38a + json-c d9b375ff, both compiled from source (`zig build bench-blobmsg`, default configuration, user-mode cycles, 2026-11-04, final code, 5 rounds: `json2blob` with the parse 0.77/0.54/0.57× on 87 B / 1.1 KB / 50 KB documents, `blob2json` 0.77/0.95/0.82×, full validating `walk` 1.00/1.01/0.92×; each side allocates per op as its API does; other runs of this code: worst 1.05× at spread ≤ 2.9 %, 1.08× on a loaded machine. NEAR THE LIMIT: with `-Djcc-safe` on both sides worst 1.11×, `walk.small` 1.10×, `walk.status` 1.11×, so P2 is not shown robust against the JCC-padded build; the `walk` rows were 1.2–1.4× before `firstNul`) · fastest ? (measured 2026-11-04)
 
-The 2026-09-10 audit above predates the 2026-11-03/04 client changes (`Options`, `sendEvent`, `waitFor`, the status rules, `poll` errors, `subscribeObject`, `monitor`, `firstNul`). Delta audit 2026-11-04 over those changes (independent read, 208 mutants: 195 killed, 50 of them by 14 tests it added, 13 equivalent) found no consumer-reachable panic beyond a failing `clock_gettime`, now failing shut. Fixed after it, each test red first on the old code except the clock's: one deadline over a whole handshake (it was per step, up to 7 times the bound), `last_status` reset on every path, seq matched in `subscribeMany`, `lookupId` exact name, the `broken` rule. Live against a private ubusd under `unshare -r` on the final code: 133/135, 2 fuzz drivers skipped. Mutants not re-run over these fixes. The whole-module run below supersedes it.
-
-**Audit 2026-11-18 (whole-module mutation).** 564 schemata mutants over `codec.zig` and `root.zig` (ReleaseSafe, one runtime switch per mutant, a detached copy; wire constants, framing, every guard of the walkers and encoders, the JSON mapping, the socket plumbing, the call/handshake state machines, `poll` and the monitor JSON). Round 1 killed 446 of them by the suite as it was; the survivors of the codec, `msUntil`/`monoFrom`/`writeAll`/`readMessage`, the handshake budget, negative status codes, whitespace-only args, `waitFor`'s verdict, the poll/hang-up/length edges, `monitorJson` and the nesting and size boundaries got 32 new tests (`codec.zig`, `root.zig`), which killed 76 more. Final: 522 killed (10 of them hangs), 42 equivalent or unobservable, none surviving. Equivalent (27): a guard another check subsumes (`namelen` header, the `idLen` id mask, the STRING terminator slice), two clock readings equal to the nanosecond, `{}` args encoding to the bytes of no args, flags the kernel makes redundant (`SO_RCVTIMEO` on poll-gated non-blocking reads, the NUL after a path, POLLHUP only together with POLLRDHUP, a blocking peek after poll), a stale flag no caller reads, and `u32` ms times 10^6 not overflowing `u64`. Unobservable (15): needs `clock_gettime` to fail at run time, EINTR from `poll` with a zero timeout, EPIPE from a unix stream read, a spurious EAGAIN after POLLIN, an allocator failing exactly at `objects.append`, a ubusd on a privileged default path, the deadline passing in the microseconds between two checks, or an error arm that `poll`'s own checks make unreachable. Not switchable (comptime): the `switch` prongs on errnos (mutated through the value instead), field defaults (`call_timeout_ms`, `max_reply_bytes`) and `max_depth`/`max_msg` (pinned by the new boundary tests). Behaviour found: none changed; `Client.fd` and the stream fds are now asserted close-on-exec and non-blocking, a failed connect gives its descriptor back.
-
 **Known defects:** none recorded
 
 **Downstream consumer:** yes
@@ -26,26 +22,26 @@ Surveyed 2026-09-30, re-surveyed 2026-11-04 per `SURVEY-PLAYBOOK.md`; stars and 
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [openwrt/ubus](https://github.com/openwrt/ubus) (libubus, `ubus` CLI, `ubusd`) — **reference**; blob/blobmsg live in [openwrt/libubox](https://github.com/openwrt/libubox) | C | libubus LGPL-2.1, libubox ISC (per this module's README/NOTICE; API reports none) | 37 / 33 | push 2026-09 / 2026-07 (no releases) | CLI verbs list, call, listen, **send**, **wait_for**, monitor, `-t` timeout; libubus also adds object providers (server side), notifications, fd passing. We do list/call/listen, no libc, no shell-out; the provider side is refused by design (Threat model / out of scope). |
+| [openwrt/ubus](https://github.com/openwrt/ubus) (libubus, `ubus` CLI, `ubusd`) — **reference**; blob/blobmsg live in [openwrt/libubox](https://github.com/openwrt/libubox) | C | libubus LGPL-2.1, libubox ISC (per this module's README/NOTICE; API reports none) | 37 / 33 | push 2026-09 / 2026-07 (no releases) | CLI verbs list, call, listen, **send**, **wait_for**, monitor, `-t` timeout; libubus also adds object providers (server side), notifications, fd passing. We do list/call/listen, no libc, no shell-out; the provider side is refused by design (*What is deliberately not done*). |
 | [jbit/ubus-rs](https://github.com/jbit/ubus-rs) | Rust | BSD-2-Clause | 12 | push 2025-01 | "Work in progress": blob TLV and `lookup` only; call/subscribe are its TODO. We are ahead. |
 | [HoneyBBQ/goubus](https://github.com/HoneyBBQ/goubus) | Go | MIT | 9 | push 2026-08 | Go client speaking to ubus over rpcd HTTP/JSON, not the unix socket *(inferred from README)*. |
 | [golangwrt/ubus](https://github.com/golangwrt/ubus) | Go | none stated | 14 | push 2018-03 | cgo wrapper around libubus; unmaintained. |
 | Zig ecosystem / `std` | Zig | — | — | — | Nothing found for ubus or blobmsg (searched GitHub for `ubus` in Go/Rust; Zig alternatives are not listed by that search; the module README says none exist). |
 
-**Where we are ahead:** the only pure-Zig, libc-free ubus client we found; the codec is a bounds-checked, fuzzed, platform-pure library with byte-parity against a real `ubus`/`ubusd` capture; every request shape of `list`, `call`, `send`, `listen`, `subscribe <object>` and `monitor` is byte-identical to the real CLI's (replayed in `capture_test.zig`); call-level byte and wall-clock budget (`CallBudget`) that libubus's per-recv timeout does not give · **Where we are behind:** no fd passing, no provider side (→ verdicts below). Closed 2026-11-03: configurable call timeout and byte cap (`Options`), event `send` (`Client.sendEvent`), `wait_for` (`Client.waitFor`), the daemon's status code (`Client.last_status`). Closed 2026-11-04: `subscribe <object>` (`Client.subscribeObject`) and `monitor` (`Client.monitor`).
+**Where we are ahead:** the only pure-Zig, libc-free ubus client we found; the codec is a bounds-checked, fuzzed, platform-pure library with byte-parity against a real `ubus`/`ubusd` capture; every request shape of `list`, `call`, `send`, `listen`, `subscribe <object>` and `monitor` is byte-identical to the real CLI's (replayed in `capture_test.zig`); call-level byte and wall-clock budget (`CallBudget`) that libubus's per-recv timeout does not give · **Where we are behind:** no fd passing, no provider side (→ verdicts below and *What is deliberately not done*).
 
-**Parity verdicts (2026-11-04; [V] verified against a real ubusd, replayed or live):**
+**Parity verdicts** ([V] verified against a real ubusd, replayed or live):
 
 | Feature (libubus / `ubus` CLI) | Verdict |
 |---|---|
 | `list [pattern]`, `call`, `listen [pattern...]` | done (`Client.subscribe`, `Client.subscribeMany`: one `register` per pattern on one connection, each answered STATUS 0 [V, `listen_two_register`: an event matching one pattern was printed once]); list fails on a non-zero closing STATUS instead of returning an empty "complete" listing, and a closing STATUS without a code is `BadMessage` [V: the real LOOKUP closes with STATUS 0 after the entries and 4 for no match, always with the code attr] |
-| `-t <timeout>` | done: `Options.call_timeout_ms`, `Client.openWith` [V]. **`-t 0` is a parity GAP, kept on purpose**: the real CLI waits without a limit (a provider answering after 33 s was waited for with `-t 0`, while the same call with the default timeout gave up "Request timed out" and `-t 1` gave up at 1 s [V, `call_t0_long`, `call_default_long`, `call_t1_slow`]); this module bounds every call (a hung daemon must not hang the caller, `CallBudget`), so 0 stays `error.Unsupported` and a caller wanting a long call passes a large value |
+| `-t <timeout>` | done: `Options.call_timeout_ms`, `Client.openWith` [V]. `-t 0` (no limit) is a parity gap kept on purpose, see *What is deliberately not done*: 0 is `error.Unsupported` and a caller wanting a long call passes a large value |
 | `send <type> [json]` | done: `Client.sendEvent`; the request is byte-identical to the real CLI's (INVOKE of the registry's `send` with `{id, data}`), answered by one STATUS 0, delivered to a `listen`er as an INVOKE with NO_REPLY [V]; an ordinary user is refused with 6 [V] |
-| `wait_for <obj>...` | done: `Client.waitFor`, a 50 ms LOOKUP poll under a deadline. [V] only for the LOOKUP it sends (byte-identical to the real CLI's `list <name>` request, answered by the real reply, replayed from `lookup_match`); the real CLI instead registers for `ubus.object.add` events (captured: ADD_OBJECT, `register`, LOOKUP) and that path is not reproduced (Backlog), so the mark covers the observable result and the 50 ms latency bound, not the same wire |
+| `wait_for <obj>...` | done: `Client.waitFor`, a 50 ms LOOKUP poll under a deadline. [V] only for the LOOKUP it sends (byte-identical to the real CLI's `list <name>` request, answered by the real reply, replayed from `lookup_match`); the real CLI instead registers for `ubus.object.add` events (captured: ADD_OBJECT, `register`, LOOKUP) and that path is not reproduced (*Backlog / deferred*), so the mark covers the observable result and the 50 ms latency bound, not the same wire |
 | `monitor` | done: `Client.monitor` / `MonitorStream`. The request is the CLI's INVOKE `add` on the daemon's monitor object (id 3), byte-identical; the daemon then sends a MONITOR frame per routed message (client, peer, direction, seq, type, the message's own attrs), including the answer to the request itself, before the request's STATUS; `-m`/`-M` are filtered on the CLI's side (the request does not change), so they are the caller's. Every line of the real CLI's output for the captured session is reproduced field for field [V]. A frame with a repeated attr id, a non-UTF-8 string or a missing mandatory attr is dropped whole and counted in `malformed` (no duplicate JSON key, no half-written line); ids are written unsigned where the CLI prints them signed; a message type is written by name only for the five the CLI printed in the capture (hello, status, data, lookup, invoke), else as its number |
 | `subscribe <object>` / notifications | done: `Client.subscribeObject` / `ObjectStream`. ADD_OBJECT (no attrs), LOOKUP, SUBSCRIBE{OBJID, TARGET}, byte-identical to the real CLI's; only a LOOKUP entry whose OBJPATH is the requested name counts (it must carry its OBJID, else `BadMessage`; no entry at all, even after STATUS 0, is `NotFound`); a notification arrives as an INVOKE (METHOD = type, DATA) the subscriber must answer with STATUS 0 (same seq and peer) or the notifier waits; UNSUBSCRIBE from the daemon naming our object and the target sets `target_gone`, any other is counted in `malformed`; a notification whose attrs cannot be walked is counted and answered STATUS 2 only if what was read before the damage already shows it is ours and wants an answer [V for the choreography; the answer to a garbled frame is a decision, not an observation: a real notifier waits for a STATUS, a stray one for a NO_REPLY event was not tried]. A name that is empty, has `*` or a NUL, or cannot fit a message is refused before any connection (`Unsupported`, `TooLarge`). Subscribing to an object that does not exist is `NotFound` (STATUS 4) [V] |
-| object provider side (`ubus_add_object`, handlers, `ubus_send_reply`, `ubus_notify`) | **rejected**: a provider must answer INVOKEs that arrive while it waits for its own reply, so the blocking one-request-at-a-time `Client` cannot host it; it needs an event loop, per-method argument policies and object lifecycle (hundreds of lines, and a different threat model: it parses attacker-controlled method calls from every other bus client). A sibling module if wanted; the role stays `client` |
-| fd passing (`SCM_RIGHTS`) | **rejected** with the provider side: only providers and fd-exchanging clients use it (`ubus call` never does); it needs a recvmsg path with cmsg handling per frame |
+| object provider side (`ubus_add_object`, handlers, `ubus_send_reply`, `ubus_notify`) | refused by design, see *What is deliberately not done*; the role stays `client` |
+| fd passing (`SCM_RIGHTS`) | refused by design with the provider side, see *What is deliberately not done* |
 | ACL / user / group attrs | n/a on the client wire: the daemon enforces them from the socket peer credentials. Observed: without ACL files `ubusd` lets only uid 0 register events, publish objects, send events or call methods; an ordinary user gets STATUS 6 (register, send) or 2 (publish a named object) [V]; the INVOKE the provider receives carries the caller's USER and GROUP |
 
 OpenWRT ubus wire codec + Linux unix-socket client. Usage: see ./README.md. Attribution/provenance:
@@ -75,10 +71,10 @@ see this module's `NOTICE` and README "Provenance".
   integer→INT32 (INT64 on i32 overflow), float→DOUBLE (BE u64 of the f64 bits).
 - **Client = one persistent connection, reentrant** (one `Client` per thread/loop, no globals). All
   socket work is errno-encoded `std.os.linux`, bounded recv timeout, `SOCK_CLOEXEC`, 1 MiB reply cap
-  (= ubusd's `UBUS_MAX_MSG_LEN`) **per message**. A whole multi-message call (`list`, `invoke`,
+  (= ubusd's `UBUS_MAX_MSG_LEN`) **per message**. `Options.call_timeout_ms` (default 2000) and `Options.max_reply_bytes` (default 1 MiB) are the caller's knobs; 0 for either is `error.Unsupported`. A whole multi-message call (`list`, `invoke`,
   `lookupId`, `subscribe`'s handshake, one `EventStream.poll` drain) is additionally bounded by a
-  `CallBudget`: an aggregate payload-byte budget (1 MiB across the whole call, not just one frame)
-  and a 2 s wall-clock deadline — `SO_RCVTIMEO` only bounds a single `recv`, so a daemon that keeps
+  `CallBudget`: an aggregate payload-byte budget (`max_reply_bytes` across the whole call, not just one frame)
+  and a wall-clock deadline (`call_timeout_ms`) — `SO_RCVTIMEO` only bounds a single `recv`, so a daemon that keeps
   sending resets it forever without this (audit F2: measured 96 062 933 B live from a LOOKUP reply
   that never closed). Each request gets a fresh sequence number, replies matched on it (stragglers
   skipped); the HELLO greeting is required. The multi-step verbs that open their own connection
@@ -93,7 +89,8 @@ see this module's `NOTICE` and README "Provenance".
   disagree, each taking a different copy).
 - **Two daemon behaviors the ubusd daemon requires** (both mandatory): an INVOKE must carry
   `UBUS_ATTR_DATA` even with no args (INVALID_ARGUMENT otherwise); INVOKE reply choreography is
-  ack-STATUS (no OBJID) → DATA → completion-STATUS (OBJID + return code), while ubusd-internal
+  zero or more ack STATUS frames (no OBJID, status 0; a real ubusd sends none on the client's connection) → DATA →
+  completion-STATUS (OBJID + return code), while ubusd-internal
   objects (event registry) answer directly with a single STATUS. `subscribe` opens a dedicated
   connection (events are unsolicited INVOKEs that must not interleave with request/reply) and its
   registered "object" id must be a blobmsg INT32, not the generic JSON-int mapping.
@@ -102,7 +99,8 @@ see this module's `NOTICE` and README "Provenance".
   own limit; HELLO required; no hidden allocators. There is no CLI-fallback layer — this module
   reports typed errors.
 
-## Threat model / out of scope
+## Threat model / Limits
+
 Trust boundary is a bit-flipped or hostile daemon reply: walkers + JSON decoder are fuzzed and
 bounds-check every length, so no reply can panic, loop, read OOB, or blow the stack (nesting cap);
 the reply-size cap bounds memory **per call**, not just per message (`CallBudget`, audit F2) —
@@ -112,64 +110,115 @@ unix-socket permissions + ubusd ACLs — out of scope), does not implement the u
 object-provider side, no TLS/remote transport (local unix socket only). JSON args must be an object
 whose values all have a blobmsg mapping (null/non-object → `error.Unsupported`).
 
+Known limits a caller relies on:
+
+- **An impossible frame length in `poll` reads as closed.** `poll` of the event, object and monitor streams returns `true` (sticky, the stream is
+  `broken`) for a header whose length is under 4 or over 1 MiB, where `readMessageEx` gives `BadMessage` /
+  `TooLarge` for the same bytes: after such a header the stream cannot be resynchronised. Pinned by a sweep test and
+  documented on the field.
+- **The `peer` of a reply is not checked.** Replies are matched on `seq` and message type only; the live captures
+  show no stable peer (the STATUS replies carry five different values over the capture set: client ids, object
+  ids, 0), so a check would reject real replies.
+- **`-t 0` (no limit) is refused** with `error.Unsupported`, and so is a zero `max_reply_bytes`: there is no
+  unbounded call.
+
 ## Verification
-A scripted in-process daemon (unix socket + thread) speaks the exact reply choreography and asserts
-both required daemon behaviors from the daemon side, covering list/filtered-list/invoke-with-args/
-void/error/unknown-object and subscribe→event-delivery→EOF. Codec tests pin golden wire bytes
-(hand-derived from the documented libubox `blob.h`/`blobmsg.h` format), decode nested TABLE/ARRAY,
-round-trip JSON→blobmsg→JSON, split INT32/INT64 at the i32 boundary, golden DOUBLE bits, reject
-truncated/bad-length/OOB/hostile-nesting/oversized input; a `std.testing.fuzz` case asserts walkers +
-JSON decoder never crash/loop/read OOB. A real-ubusd integration test runs when
-`/var/run/ubus/ubus.sock` exists and skips cleanly otherwise. 2026-11-03: status codes are verdicts (a non-zero closing STATUS of `list`, a completion without a code, a refusal STATUS) and a failed read is never absence (`poll(2)` error, malformed LOOKUP entry), pinned by `sweep_test.zig` "goal 3" tests; the whole suite also passes for big-endian MIPS32 soft-float (`qemu-mips`) and 32-bit ARM (`qemu-arm`), `zig test --test-no-exec` + qemu-user, ReleaseSafe: 93 passed, 4 skipped (the two live-ubusd tests and the two fuzz-driver cases that need their env). Evidence by origin (2026-11-04): every status rule is now CAPTURED from a live ubusd (below); the scripted peers remain for the failure shapes a real daemon does not produce.
 
-**Live ubusd, 2026-11-04.** `tools/ubus_capture.py` starts a private `ubusd -s <socket>` (inside `.zig-cache`, torn down after) and records the frames of the real `ubus` CLI and of a small scripted provider through a byte relay; the privileged half runs under `unshare -r` (a user namespace mapping us to uid 0 with no host privilege: an ordinary user is refused by the daemon, and the refusals are captured too). It writes `src/testdata/ubusd_capture.zig` (frozen, ids are whatever the daemon chose and no test asserts one). `src/capture_test.zig` replays one captured connection to our `Client` and requires every request our client sends to be BYTE-identical to the real CLI's, for `list` (all, match, no match), `invoke` (result, provider failure 9, unknown object), `sendEvent`, `subscribe`, `subscribeObject` (setup, two notifications with our answers, the target going away, a missing target), `monitor` (checked line by line against the CLI's own output); the same file runs the client against the live daemon when `BLOBMSG_UBUS_SOCKET` names a socket (`unshare -r python3 tools/ubus_capture.py --with-daemon -- <test binary>` sets it and also starts a provider "probe"): 115 passed, 2 skipped (the fuzz drivers) on the 117-test ReleaseSafe binary; the 7 skipped in a plain run (CI has no ubusd) are those two and the 5 live tests (3 in `capture_test.zig`, 2 in `root.zig`). Mind: the daemon of this check was built from source on this host, not the OpenWrt VM of the earlier capture.
+Run `scripts/modtest blobmsg`. Live-daemon step: `unshare -r python3 tools/ubus_capture.py --with-daemon -- <test
+binary>` starts a private `ubusd` and a provider object, and sets `BLOBMSG_UBUS_SOCKET` for the tests; without that
+variable the live tests skip (CI has no `ubusd`).
 
-**Where the wire names come from (2026-11-04).** The ubus source was never read, in this round or the earlier ones. What a frame shows is its numbers; the NAMES are of two kinds. Confirmed by the real CLI's printed output: message types hello, status, data, lookup, invoke (`ubus monitor`), and the attr keys status, objpath, objid, objtype, method, signature, data, user, group; `ubus listen`/`subscribe` print `{ "<type>": <data> }`. Recalled interface names, unverified, shown by no CLI output: message types ping (3), add_object (6), remove_object (7), subscribe (8), unsubscribe (9), notify (10), monitor (11) and attr ids TARGET (8), ACTIVE (9), NO_REPLY (10), SUBSCRIBERS (11); `codec.zig` says so at the constants. The numbers' use is observed (the frames and their replies behave as the names say), the spelling is not. The monitor output therefore uses a name only for the confirmed ones and numbers / `attr<N>` hex for the rest. The monitor frame's attr ids 0..5 (client, peer, direction, seq, type, nested message) were derived from the frames and checked against the CLI's printed client, peer, direction and type.
+- **In-process daemon.** A scripted daemon (unix socket + thread) speaks the exact reply choreography and asserts both
+  required daemon behaviours from the daemon side: list, filtered list, invoke with args, void, error, unknown
+  object, subscribe → event delivery → EOF. Status codes are verdicts (a non-zero closing STATUS of `list`, a
+  completion without a code, a refusal STATUS) and a failed read is never absence (`poll(2)` error, malformed
+  LOOKUP entry); `sweep_test.zig` pins them.
+- **Codec goldens and properties.** Golden wire bytes (hand-derived from the documented libubox `blob.h`/`blobmsg.h`
+  format), nested TABLE/ARRAY decode, JSON → blobmsg → JSON round trips, INT32/INT64 split at the i32 boundary,
+  golden DOUBLE bits, and rejection of truncated, bad-length, out-of-bounds, hostile-nesting and oversized input.
+- **Real-daemon capture.** `tools/ubus_capture.py` starts a private `ubusd -s <socket>` (inside `.zig-cache`, torn
+  down after) and records, through a byte relay, the frames of the real `ubus` CLI and of a small scripted provider.
+  The privileged half runs under `unshare -r` (a user namespace mapping us to uid 0 with no host privilege: an
+  ordinary user is refused by the daemon, and the refusals are captured too). The tool writes
+  `src/testdata/ubusd_capture.zig` (frozen; ids are whatever the daemon chose and no test asserts one).
+  `src/capture_test.zig` replays one captured connection to our `Client` and requires every request the client
+  sends to be BYTE-identical to the real CLI's, for `list` (all, match, no match), `invoke` (result, provider
+  failure 9, unknown object), `sendEvent`, `subscribe`, `subscribeObject` (setup, two notifications with our
+  answers, the target going away, a missing target) and `monitor` (checked line by line against the CLI's own
+  output); hostile-daemon variants refuse, cut or drop the code of every step of `subscribeObject` and `monitor`,
+  and a frame cut by the hang-up is the stream ending, never an event. The same file runs the client against a live
+  daemon when `BLOBMSG_UBUS_SOCKET` names one. The daemon of that check was built from source on the host, not an
+  OpenWrt image.
+- **Earlier OpenWrt capture.** `codec.zig`'s "real ubusd capture" section freezes bytes from one run inside the
+  `scripts/vm/` OpenWrt VM: a throwaway byte relay between the real `ubus` CLI and the real `ubusd` captured a
+  LOOKUP + reply, an INVOKE with empty args + reply and an INVOKE with JSON args + reply, across four real
+  provider objects (`system.board`, `system.info`, `network.device.status`, `network.interface.lan.status`). The
+  frozen DATA replies decode **byte-identical** to the real `ubus -S` CLI's own JSON stdout for the same calls, two
+  encode-direction tests reproduce the real CLI's INVOKE bytes exactly (empty and JSON args), and the real
+  signature table confirms the `BM.*` constants (`"Boolean"` decodes to `7 == BM.INT8`, `"Table"` to `2 == BM.TABLE`).
+  The client-visible INVOKE reply there is exactly DATA then a completion STATUS (OBJID + status code); an ack STATUS
+  without OBJID before DATA was never observed on the client's connection, though `Client.invoke` tolerates zero or
+  more of them (only the scripted daemon's ack exercises that branch).
+- **Where the wire names come from.** The ubus source was never read. What a frame shows is its numbers; the NAMES are
+  of two kinds. Confirmed by the real CLI's printed output: message types hello, status, data, lookup, invoke
+  (`ubus monitor`), and the attr keys status, objpath, objid, objtype, method, signature, data, user, group;
+  `ubus listen`/`subscribe` print `{ "<type>": <data> }`. Recalled interface names, unverified, shown by no CLI
+  output: message types ping (3), add_object (6), remove_object (7), subscribe (8), unsubscribe (9), notify (10),
+  monitor (11) and attr ids TARGET (8), ACTIVE (9), NO_REPLY (10), SUBSCRIBERS (11); `codec.zig` says so at the
+  constants. The numbers' use is observed (the frames and their replies behave as the names say), the spelling is
+  not, so the monitor output uses a name only for the confirmed ones and numbers / `attr<N>` hex for the rest. The
+  monitor frame's attr ids 0..5 (client, peer, direction, seq, type, nested message) were derived from the frames
+  and checked against the CLI's printed client, peer, direction and type.
+- **libubox oracle.** See *Anchoring*: `encodeArgs` / `decodeToJson` against libubox's own JSON codec.
+- **Known gap in the real corpus.** No `BM.DOUBLE` or `BM.INT16` value appears in any real capture (`ubus`'s own
+  blobmsg-JSON codec only ever emits STRING/INT8 (bool)/INT32/INT64/TABLE/ARRAY); both are covered only by the
+  hand-derived goldens and, for DOUBLE, the libubox oracle's doubles.
+- **Fuzz** (`BLOBMSG_FUZZ=<runs>[,<first seed>]`, testkit's deterministic driver, ReleaseSafe test binary run
+  directly). Harnesses `codec`, `codec-mutated`, `encode`, `encode-mutated` (walkers, the JSON decoder and encoder
+  on arbitrary and mutated bytes; `fuzz_test.zig`, `codec.zig`) and `client` (`client_fuzz_test.zig`): the client's
+  reply state machines (`list`, `invoke`, `sendEvent`, `waitFor`, `subscribe`, `subscribeObject`, `monitor` and
+  their `poll`s) against a scripted peer over a socketpair, with coherent conversations damaged in place, random
+  frames, corrupted lengths, cut streams and stall modes; the object name varies so a stray or missing LOOKUP entry
+  is reached. Properties: no panic, no leak, no call outlasts its deadline, a success returns valid JSON, a stream
+  that errors or closes stays closed. Reach labels are asserted in an every-run test. The fuzz does NOT reach a real
+  daemon's bytes (those are replayed by `capture_test.zig`), a non-EOF `poll`/`recv` errno through a socket, a
+  mid-body stall for the own-connection verbs, or allocation failure; listener-based seeds are not exactly
+  replayable.
+- **Other targets.** The whole suite is also run for big-endian MIPS32 soft-float (`qemu-mips`) and 32-bit ARM
+  (`qemu-arm`) with `zig test --test-no-exec` + qemu-user, ReleaseSafe.
+- **Constant time:** n/a — an ubus message codec, no secret.
+- **Bench:** `zig build bench-blobmsg` (`tools/bench.zig`, with `tools/bench_libubox.c`) against libubox blobmsg +
+  json-c compiled from source; the card's Performance line has the figures.
+- **Audit:** the card's `**Audit:**` line is the current score, cumulative over the last whole-module mutation run
+  (`codec.zig` and `root.zig`) and the delta runs after it.
 
-**Real-daemon capture of 2026-09 (the first byte-parity check).**
-`codec.zig`'s "real ubusd capture"
-section freezes bytes from a single real run inside the `scripts/vm/` OpenWRT VM (25.12.4): a
-throwaway byte-relay (never committed) was spliced between the real `ubus` CLI and the real `ubusd`
-via `ubus -s <socket>`, capturing the exact wire bytes of a LOOKUP + reply, an INVOKE with an empty
-args gotcha + reply, and an INVOKE with JSON args + reply, across four different real provider
-objects (`system.board`, `system.info`, `network.device.status`, `network.interface.lan.status`).
-The frozen DATA replies are asserted to decode **byte-identical** to the real `ubus -S` CLI's own
-JSON stdout for the same calls (captured in the same run) — a genuine textual byte-parity check, not
-merely "parses without error". Two encode-direction tests independently confirm this module's own
-`encodeMessage`/`appendAttr*`/`encodeArgs` reproduce the real `ubus` CLI's INVOKE bytes exactly, for
-both the empty-args and the JSON-args case. The real signature table also confirms this module's
-`BM.*` type constants match the daemon's own encoding (`"Boolean"` decodes to `7 == BM.INT8`,
-`"Table"` to `2 == BM.TABLE`, etc.).
+## Performance
 
-**Findings from the capture:**
-- The client-visible INVOKE reply is exactly DATA then a completion STATUS (OBJID + status code) —
-  confirmed across all four real provider objects above. No separate "ack STATUS (no OBJID)" was
-  ever observed before DATA on the client's own connection, though `Client.invoke`'s loop already
-  tolerates zero-or-more such acks before the completion, so this is not a functional bug — only the
-  scripted mock daemon's ack is exercised by any test; the real corpus never hits that branch.
-- The real `ubus` CLI independently confirms daemon gotcha #1 (an INVOKE always carries
-  `UBUS_ATTR_DATA`, empty when there are no arguments) — previously verified only against this
-  module's own scripted mock daemon.
-- No `BM.DOUBLE` or `BM.INT16` value appears anywhere in this real corpus (`ubus`'s own blobmsg-JSON
-  codec only ever emits STRING/INT8(bool)/INT32/INT64/TABLE/ARRAY); both remain covered only by the
-  hand-derived goldens, which is documented rather than left silently unstated.
-- No disagreement between this module's encoder and the real client's bytes was found.
+The bench is `zig build bench-blobmsg`; the card's Performance line holds the figures and their spread (the card is
+authoritative). The `walk` rows are close to the reference's JCC-padded build, so P2 is not shown robust there.
+
+## What is deliberately not done
+
+- **Object provider side** (`ubus_add_object`, handlers, `ubus_send_reply`, `ubus_notify`): a provider must answer
+  INVOKEs that arrive while it waits for its own reply, so the blocking one-request-at-a-time `Client` cannot host
+  it; it needs an event loop, per-method argument policies and object lifecycle (hundreds of lines, and a different
+  threat model: it parses attacker-controlled method calls from every other bus client). A sibling module if wanted;
+  the role stays `client`.
+- **fd passing** (`SCM_RIGHTS`): refused with the provider side; only providers and fd-exchanging clients use it
+  (`ubus call` never does), and it needs a recvmsg path with cmsg handling per frame.
+- **`ubus -t 0` (no limit).** The real CLI waits without a limit (a provider answering after 33 s was waited for with
+  `-t 0`, while the same call with the default timeout gave up "Request timed out" and `-t 1` gave up at 1 s,
+  observed against a real `ubusd`). This module bounds every call (a hung daemon must not hang the caller,
+  `CallBudget`), so 0 is `error.Unsupported`; a caller wanting a long call passes a large `call_timeout_ms`.
+- **Monitor filters** (`-m <type>`, `-M r|t`) stay the caller's: a `MonitorStream.setFilter` would only save the
+  caller a JSON parse; nothing needs it.
+- **A check of a reply's `peer`**: see *Threat model / Limits*.
 
 ## Backlog / deferred
-- (2026-11-03) **`ubus.object.add`-driven `wait_for`**: would remove the 50 ms polling latency. The shape is now visible in the capture (`wait_for` = ADD_OBJECT, `register` with the object name, LOOKUP of everything); not worth the extra state until a consumer needs lower latency.
-- (2026-11-04) **Build recipe fixed**: the 2026-11-03 compile line listed for libubox is stale. A working one (the coordinator's `foreign-build.sh`): `gcc -O1 -std=gnu99 -D_GNU_SOURCE -DUBUS_MAX_MSGLEN=1048576 '-DUBUS_UNIX_SOCKET="/nonexistent/ubus.sock"' -I. -Ijson-c -Ijson-c-build -Iubus -iquote libubox ubus/ubusd*.c libubox/{blob,blobmsg,blobmsg_json,uloop,usock,ustream,ustream-fd,avl,utils,runqueue,md5,base64,kvlist,vlist,safe_list,ulog,udebug,udebug-remote,avl-cmp}.c json-c-build/libjson-c.a -lm` (`udebug`, `udebug-remote` and `avl-cmp` are new; `-Ilibubox` would shadow `<assert.h>`, hence `-iquote`). The bench needs only `blob`, `blobmsg`, `blobmsg_json` and json-c's own sources.
-- (2026-11-04) **`ubus -t 0`** (no limit) is not offered, see the `-t` row. **Monitor filters** (`-m <type>`, `-M r|t`) are the caller's; a `MonitorStream.setFilter` would only save the caller a JSON parse. Not done: nothing needs it.
-- (2026-11-04) **Mutation testing** of the 2026-11 client code ran (delta audit, 208 mutant schemata over root.zig and codec.zig, one build, runtime switch): 195 killed, 13 equivalent (deadline comparisons at nanosecond resolution, second deadline checks that another check makes redundant, a branch the peek pre-checks make unreachable, 7-bit attr ids; accepting an empty socket path in `connectPath` is the one guard no test pins, it only matters with an abstract-socket impostor). The survivors of the first run are killed by tests added in the same audit.
-- (2026-11-04) **Impossible frame length in `poll` reads as closed**: `Stream.poll` returns `true` (sticky) for a header whose length is under 4 or over 1 MiB, where `readMessageEx` gives `BadMessage` / `TooLarge` for the same bytes. Pinned by sweep GY-A7 and documented on the field; left as it is.
-- (2026-11-04) **`peer` of a reply is not checked**: replies are matched on `seq` and message type only. The live captures show no stable peer: the STATUS replies carry five different values over the capture set (client ids, object ids, 0), so a check would reject real replies.
 
-Beyond the documented DOUBLE/INT16 real-corpus gap noted above (the module's own encode/decode
-API supports both; the real daemon's JSON codepath simply never produces them on the captured
-OpenWRT build).
-
-## Status
-`extract · linux (codec: any) · client · reentrant` + deps: none (std only — `std.json` for the
-JSON↔blobmsg mapping) — canonical source is `pub const meta` in src/root.zig.
+- **`ubus.object.add`-driven `wait_for`**: would remove the 50 ms polling latency. The shape is visible in the
+  capture (the real CLI's `wait_for` = ADD_OBJECT, `register` with the object name, LOOKUP of everything); deferred
+  until a consumer needs lower latency, because it adds state.
 
 ## Anchoring
 
@@ -179,5 +228,3 @@ JSON↔blobmsg mapping) — canonical source is `pub const meta` in src/root.zig
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** frozen real `ubus`/`ubusd` wire bytes + `ubus -S` JSON from the OpenWRT VM lane; since 2026-10-06 libubox's own JSON codec on 15 objects (`tools/libubox_oracle.py` + `tools/oracle_blobmsg.c` -> `src/testdata/libubox_oracle.zig`, replayed by `src/libubox_oracle_test.zig`): `encodeArgs` must build the bytes `blobmsg_add_json_from_string` builds (ints at both i32/i64 edges, bools, strings with escapes and UTF-8, doubles, nested and empty containers, null, duplicate and empty keys) and `decodeToJson` must read them as `blobmsg_format_json` does -- one listed divergence, the empty member name libubox prints as invalid JSON; the hand-derived goldens remain as the format pin; a live ubusd test when reachable
-
-**How it got there.** The anchoring work landed. DONE 463e443: real ubusd captures; ARRAY/TABLE tag swap blind to all 32 old tests
