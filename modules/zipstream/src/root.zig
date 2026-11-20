@@ -269,8 +269,7 @@ const LzmaCodec = struct {
     fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, entry: CodecEntry) anyerror!CodecReader {
         var hdr: [9]u8 = undefined;
         input.readSliceAll(&hdr) catch return Error.ZipBadCentralDirectory;
-        if (std.mem.readInt(u16, hdr[2..4], .little) != 5) return Error.ZipBadCentralDirectory;
-        const props = lzma.Lzma1Props.fromBytes(hdr[4..9]) catch return Error.ZipBadCentralDirectory;
+        const props = lzma.Lzma1Props.fromZipHeader(&hdr) catch return Error.ZipBadCentralDirectory;
         return open(gpa, input, .{ .lzma1 = .{
             .props = props,
             .uncompressed_size = entry.uncompressed_size,
@@ -305,8 +304,7 @@ const LzmaCodec = struct {
     fn openWriter(_: ?*anyopaque, gpa: Allocator, output: *std.Io.Writer, level: i32) anyerror!CodecWriter {
         const opts = options(level);
         const p: lzma.Lzma1Props = .{ .lc = @intCast(opts.lzma.lc), .lp = @intCast(opts.lzma.lp), .pb = @intCast(opts.lzma.pb), .dict_size = opts.lzma.dict_size };
-        try output.writeAll(&.{ 9, 4, 5, 0 }); // LZMA SDK 9.4, 5 property bytes
-        try output.writeAll(&p.toBytes());
+        try output.writeAll(&p.toZipHeader());
         return writer(gpa, output, .lzma1, opts);
     }
 
@@ -467,6 +465,8 @@ pub const DosDateTime = struct {
 
 /// Info-ZIP extended timestamp extra field id ("UT").
 const extra_id_ut: u16 = 0x5455;
+/// Android `zipalign`'s alignment padding record (`AddEntryOptions.align_stored`).
+const extra_id_align: u16 = 0xD935;
 /// `version made by` host byte for Unix (APPNOTE 4.4.2).
 const host_unix: u16 = 3;
 /// `S_IFREG`, the regular-file type bits Info-ZIP puts above the permissions.
@@ -1446,6 +1446,25 @@ pub const WriteMethod = enum {
     custom,
 };
 
+/// What `ArchiveWriter.addTree` refuses besides the writer's own errors.
+pub const TreeError = error{ZipIrregularFile};
+
+/// Options of `ArchiveWriter.addTree`.
+pub const AddTreeOptions = struct {
+    /// Put in front of every entry name (`"app/"`); `""` = none.
+    prefix: []const u8 = "",
+    /// The method, level, comment, … of every entry. `mtime` and `mode` set here
+    /// win over what `preserve_metadata` reads from the file system.
+    entry: AddEntryOptions = .{},
+    /// Take each entry's modification time and (where the file system has them)
+    /// Unix permission bits from the tree, as Go's `FileInfoHeader` does. Off:
+    /// the fixed 1980 date and no mode, so equal trees give equal bytes anywhere.
+    preserve_metadata: bool = true,
+    /// A symlink: `.refuse` (Go: only regular files), `.store` it as a symlink
+    /// entry (target kept, never followed) or `.skip` it.
+    symlinks: enum { refuse, store, skip } = .refuse,
+};
+
 pub const AddEntryOptions = struct {
     method: WriteMethod = .deflate,
     /// Deflate speed/ratio trade-off (`std.compress.flate.Compress.Options`);
@@ -1481,6 +1500,18 @@ pub const AddEntryOptions = struct {
     /// Encrypt with WinZip AES (AE-2: CRC stored as 0, the 10-byte code
     /// authenticates), as zip2 and 7-Zip write it. Never ZipCrypto.
     encryption: ?Encryption = null,
+    /// `.store` entries only: start the stored data at an archive offset that is
+    /// a multiple of this many bytes (0 or 1 = no alignment), as Android's
+    /// `zipalign` does (4 for APK data, 4096 for a page-mapped `.so`), by padding
+    /// the local header's extra field with a record of id 0xD935 (the alignment as
+    /// a `u16`, then zeros). The central directory carries no padding. Needs a
+    /// 6-byte record at least, so a gap under 6 bytes costs one more multiple.
+    /// Ignored for any other method, an encrypted entry, a directory and a
+    /// symlink. The offset is the archive writer's own count of the bytes it
+    /// wrote: the caller must hand it a destination that starts at the archive's
+    /// offset 0. Padding that would make the local extra field exceed 65535 bytes
+    /// is `error.ZipWriteTooLarge`.
+    align_stored: u16 = 0,
 
     pub const Encryption = struct {
         password: []const u8,
@@ -1705,8 +1736,11 @@ pub const ArchiveWriter = struct {
     const max_caller_extra = std.math.maxInt(u16) - central_own_extra_max;
 
     fn writeLocal(self: *ArchiveWriter, name: []const u8, h: Header, crc: u32, csize: u64, usize_: u64, zip64: bool, streamed: bool, options: AddEntryOptions) !void {
-        const extra_len: u16 = @intCast(@as(usize, if (h.ut != null) ut_extra_len else 0) + @as(usize, if (zip64) zip64_local_len else 0) +
-            @as(usize, if (h.aes_extra != null) 11 else 0) + options.extra.len);
+        const base_extra = @as(usize, if (h.ut != null) ut_extra_len else 0) + @as(usize, if (zip64) zip64_local_len else 0) +
+            @as(usize, if (h.aes_extra != null) 11 else 0) + options.extra.len;
+        const pad = alignPad(self.offset + @sizeOf(std.zip.LocalFileHeader) + name.len + base_extra, h, options);
+        if (base_extra + pad > std.math.maxInt(u16)) return Error.ZipWriteTooLarge;
+        const extra_len: u16 = @intCast(base_extra + pad);
         const lfh: std.zip.LocalFileHeader = .{
             .signature = std.zip.local_file_header_sig,
             .version_needed_to_extract = if (zip64) 45 else 20,
@@ -1735,7 +1769,26 @@ pub const ArchiveWriter = struct {
         }
         if (h.aes_extra) |*x| try self.out.writeAll(x);
         try self.out.writeAll(options.extra);
+        if (pad != 0) {
+            var rec: [4 + 2]u8 = undefined;
+            std.mem.writeInt(u16, rec[0..2], extra_id_align, .little);
+            std.mem.writeInt(u16, rec[2..4], @intCast(pad - 4), .little);
+            std.mem.writeInt(u16, rec[4..6], options.align_stored, .little);
+            try self.out.writeAll(&rec);
+            try self.out.splatByteAll(0, pad - rec.len);
+        }
         self.offset += @sizeOf(std.zip.LocalFileHeader) + name.len + extra_len;
+    }
+
+    /// Bytes of 0xD935 padding record that bring the data starting at `data_start`
+    /// to a multiple of `options.align_stored` (0 = none).
+    fn alignPad(data_start: u64, h: Header, options: AddEntryOptions) usize {
+        const a: u64 = options.align_stored;
+        if (a <= 1 or h.method != .store or h.aes_extra != null) return 0;
+        var pad: u64 = (a - data_start % a) % a;
+        if (pad == 0) return 0;
+        while (pad < 6) pad += a;
+        return @intCast(pad);
     }
 
     fn record(self: *ArchiveWriter, name: []const u8, h: Header, crc: u32, csize: u64, usize_: u64, offset: u64, streamed: bool, options: AddEntryOptions) !void {
@@ -1831,6 +1884,7 @@ pub const ArchiveWriter = struct {
         var o = options;
         o.method = .store;
         o.encryption = null;
+        o.align_stored = 0;
         const h = try self.prepare(dir, .store, o, 0o040000);
         const off = self.offset;
         try self.writeLocal(dir, h, 0, 0, 0, o.force_zip64, false, o);
@@ -1845,6 +1899,7 @@ pub const ArchiveWriter = struct {
         var o = options;
         o.method = .store;
         o.encryption = null;
+        o.align_stored = 0;
         if (o.mode == null) o.mode = 0o777;
         const h = try self.prepare(name, .store, o, 0o120000);
         // As `addEntry`: a target past 4 GiB needs the zip64 records.
@@ -1856,6 +1911,89 @@ pub const ArchiveWriter = struct {
         try self.out.writeAll(target);
         self.offset += target.len;
         try self.record(name, h, crc, target.len, target.len, off, false, o);
+    }
+
+    /// Adds every directory, file and (per `opts.symlinks`) symlink below `dir`
+    /// as entries, in a fixed order (each directory's children sorted by name,
+    /// as Go's `fs.WalkDir` yields them, so the same tree gives the same
+    /// archive). Directories get a trailing `/`; a file is streamed (data
+    /// descriptor, nothing buffered beyond one read block) with `opts.entry`'s
+    /// method and level. `dir` must have been opened with `.iterate = true`; it
+    /// is not closed. A name is `opts.prefix` followed by the path below `dir`
+    /// with `/` separators. Like Go's `Writer.AddFS`, a file that is neither a
+    /// directory nor a regular file is refused (`error.ZipIrregularFile`), a
+    /// symlink too unless `opts.symlinks` says otherwise.
+    pub fn addTree(self: *ArchiveWriter, io: std.Io, dir: std.Io.Dir, opts: AddTreeOptions) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const Item = struct { path: []const u8, kind: std.Io.File.Kind };
+        var items: std.ArrayList(Item) = .empty;
+        {
+            var walker = try dir.walk(arena);
+            defer walker.deinit();
+            while (try walker.next(io)) |e| try items.append(arena, .{ .path = try arena.dupe(u8, e.path), .kind = e.kind });
+        }
+        std.mem.sort(Item, items.items, {}, struct {
+            // The separator sorts below every name byte, so a directory's
+            // children follow it and precede a sibling like `a.txt` after `a`.
+            fn key(c: u8) u8 {
+                return if (c == std.fs.path.sep) 0 else c;
+            }
+            fn less(_: void, a: Item, b: Item) bool {
+                const n = @min(a.path.len, b.path.len);
+                for (a.path[0..n], b.path[0..n]) |x, y| {
+                    if (key(x) != key(y)) return key(x) < key(y);
+                }
+                return a.path.len < b.path.len;
+            }
+        }.less);
+
+        var name: std.ArrayList(u8) = .empty;
+        for (items.items) |it| {
+            name.clearRetainingCapacity();
+            try name.appendSlice(arena, opts.prefix);
+            const start = name.items.len;
+            try name.appendSlice(arena, it.path);
+            if (std.fs.path.sep != '/') std.mem.replaceScalar(u8, name.items[start..], std.fs.path.sep, '/');
+            var o = opts.entry;
+            if (opts.preserve_metadata or it.kind == .file) {
+                const st = try dir.statFile(io, it.path, .{ .follow_symlinks = false });
+                if (opts.preserve_metadata) {
+                    if (o.mtime == null) o.mtime = st.mtime.toSeconds();
+                    if (o.mode == null and comptime @hasDecl(std.Io.File.Permissions, "toMode")) o.mode = @intCast(st.permissions.toMode() & 0o7777);
+                }
+                if (st.size > u32_max) o.force_zip64 = true;
+            }
+            switch (it.kind) {
+                .directory => try self.addDirectory(name.items, o),
+                .file => {
+                    var f = try dir.openFile(io, it.path, .{});
+                    defer f.close(io);
+                    var rbuf: [8192]u8 = undefined;
+                    var block: [8192]u8 = undefined;
+                    var fr = f.reader(io, &rbuf);
+                    const w = try self.beginEntry(name.items, o);
+                    // A short read is the end of the file; the entry writer has no buffer to stream into.
+                    while (true) {
+                        const n = try fr.interface.readSliceShort(&block);
+                        try w.writeAll(block[0..n]);
+                        if (n < block.len) break;
+                    }
+                    try self.endEntry();
+                },
+                .sym_link => switch (opts.symlinks) {
+                    .skip => {},
+                    .refuse => return TreeError.ZipIrregularFile,
+                    .store => {
+                        var tbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                        const n = try dir.readLink(io, it.path, &tbuf);
+                        try self.addSymlink(name.items, tbuf[0..n], o);
+                    },
+                },
+                else => return TreeError.ZipIrregularFile,
+            }
+        }
     }
 
     /// State of a streamed entry: the caller writes to `input`, which hashes

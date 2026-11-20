@@ -152,6 +152,8 @@ try w.writeAll(chunk); // … as the data arrives
 try zw.endEntry();
 try zw.addDirectory("docs", .{});
 try zw.addSymlink("docs/latest", "v2.txt", .{});
+try zw.addTree(io, src_dir, .{ .prefix = "site/" }); // a directory tree, in name order (Go AddFS)
+try zw.addEntry("lib.so", so_bytes, .{ .method = .store, .align_stored = 4096 }); // zipalign-style
 zw.comment = "built 2026-10-20";
 
 // Extraction with a zip-slip guard, a total-size cap and a symlink policy.

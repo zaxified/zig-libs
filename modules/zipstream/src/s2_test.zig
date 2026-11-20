@@ -555,3 +555,229 @@ test "extractAll: windows_names applies to a symlink target too" {
     defer tmp2.cleanup();
     try zs.extractAll(&archive, testing.io, tmp2.dir, .{ .symlinks = .create, .windows_names = false });
 }
+
+// ── stored-data alignment (AddEntryOptions.align_stored) ────────────────────
+
+/// The archive offset where entry `e`'s data starts: its local header, name and extra field.
+fn dataStart(bytes: []const u8, e: *const zs.Entry) u64 {
+    const h = bytes[@intCast(e.file_offset)..][0..30];
+    return e.file_offset + 30 + std.mem.readInt(u16, h[26..28], .little) + std.mem.readInt(u16, h[28..30], .little);
+}
+
+test "align_stored: stored data starts on the requested boundary, other entries are untouched" {
+    const a = testing.allocator;
+    for ([_]u16{ 2, 4, 7, 64, 4096 }) |al| {
+        var aw: std.Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        var zw = zs.ArchiveWriter.init(a, &aw.writer);
+        defer zw.deinit();
+        const names = [_][]const u8{ "a", "bb", "ccc", "dddd", "eeeee", "ffffff", "g/ggggggg", "h/hhhhhhhh.so" };
+        for (names, 0..) |n, i| {
+            var data: [40]u8 = undefined;
+            @memset(&data, @intCast('a' + i));
+            try zw.addEntry(n, data[0 .. 3 + i * 5], .{ .method = .store, .align_stored = al, .mtime = if (i % 2 == 0) 1_700_000_000 else null });
+        }
+        const w = try zw.beginEntry("streamed.bin", .{ .method = .store, .align_stored = al });
+        try w.writeAll("streamed payload");
+        try zw.endEntry();
+        try zw.addEntry("deflated.txt", "deflated payload deflated payload", .{ .align_stored = al }); // not stored: no padding
+        try zw.addEntry("big.bin", "forced zip64", .{ .method = .store, .align_stored = al, .force_zip64 = true });
+        try zw.finish();
+
+        var ms: zs.MemorySource = .{ .bytes = aw.written() };
+        var archive: zs.Archive = undefined;
+        try archive.initSource(a, ms.source(), .{});
+        defer archive.deinit();
+        try testing.expectEqual(names.len + 3, archive.entries.items.len);
+        for (archive.entries.items) |*e| {
+            const start = dataStart(aw.written(), e);
+            if (std.mem.eql(u8, e.name, "deflated.txt")) {
+                const h = aw.written()[@intCast(e.file_offset)..][0..30];
+                try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, h[28..30], .little)); // no extra field at all
+            } else {
+                testing.expectEqual(@as(u64, 0), start % al) catch |err| {
+                    std.debug.print("align {d}: {s} starts at {d}\n", .{ al, e.name, start });
+                    return err;
+                };
+            }
+            try testing.expect(std.mem.indexOf(u8, e.extra, &.{ 0x35, 0xD9 }) == null); // the central directory has no padding
+            const got = try readAll(a, &archive, e);
+            defer a.free(got);
+            try testing.expectEqual(@as(u64, got.len), e.uncompressed_size);
+        }
+        const sp = try readAll(a, &archive, archive.find("streamed.bin").?);
+        defer a.free(sp);
+        try testing.expectEqualStrings("streamed payload", sp);
+    }
+}
+
+test "align_stored: the padding record is 0xD935 + the alignment + zeros, and no padding when already aligned" {
+    const a = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    // First entry: header 30 + name 1 = 31, so 1 byte short of 32: under 6, so one more multiple: 33 bytes.
+    try zw.addEntry("a", "x", .{ .method = .store, .align_stored = 32 });
+    const first_end = aw.written().len;
+    // Offset is now 31 + 33 + 1 = 65; a name of 29 bytes makes 30 + 29 = 59 -> start 124, pad 4 -> 36.
+    try zw.addEntry("bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "y", .{ .method = .store, .align_stored = 32 });
+    try zw.finish();
+    const bytes = aw.written();
+    try testing.expectEqual(@as(usize, 31 + 33 + 1), first_end);
+    const extra = bytes[31..][0..33];
+    try testing.expectEqual(@as(u16, 0xD935), std.mem.readInt(u16, extra[0..2], .little));
+    try testing.expectEqual(@as(u16, 29), std.mem.readInt(u16, extra[2..4], .little));
+    try testing.expectEqual(@as(u16, 32), std.mem.readInt(u16, extra[4..6], .little));
+    for (extra[6..]) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(@as(u8, 'x'), bytes[64]);
+    // Already aligned: an entry whose data would start on the boundary gets no record.
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    defer aw2.deinit();
+    var zw2 = zs.ArchiveWriter.init(a, &aw2.writer);
+    defer zw2.deinit();
+    try zw2.addEntry("nn", "z", .{ .method = .store, .align_stored = 32 }); // 30 + 2 = 32
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, aw2.written()[28..30], .little));
+    // Off by default, and for 0 / 1.
+    for ([_]u16{ 0, 1 }) |off| {
+        var aw3: std.Io.Writer.Allocating = .init(a);
+        defer aw3.deinit();
+        var zw3 = zs.ArchiveWriter.init(a, &aw3.writer);
+        defer zw3.deinit();
+        try zw3.addEntry("abc", "z", .{ .method = .store, .align_stored = off });
+        try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, aw3.written()[28..30], .little));
+    }
+}
+
+test "align_stored: padding that would overflow the extra field is refused before anything is written" {
+    const a = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    // Data would start at 30 + 1 + 59_970 = 60_001, one past the boundary: 59_999 bytes of padding.
+    const extra = try a.alloc(u8, 59_970);
+    defer a.free(extra);
+    @memset(extra, 0);
+    for (0..extra.len / 4) |i| std.mem.writeInt(u16, extra[i * 4 ..][0..2], 0x7777, .little); // records with id 0x7777, length 0
+    try testing.expectError(error.ZipWriteTooLarge, zw.addEntry("a", "x", .{ .method = .store, .align_stored = 60_000, .extra = extra }));
+    try testing.expectEqual(@as(usize, 0), aw.written().len);
+}
+
+// ── addTree ─────────────────────────────────────────────────────────────────
+
+fn namesOf(a: std.mem.Allocator, archive: *const zs.Archive) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    errdefer out.deinit();
+    for (archive.entries.items) |e| try out.writer.print("{s}\n", .{e.name});
+    return out.toOwnedSlice();
+}
+
+test "addTree: a directory tree in name order, with contents, modes and times" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "a/c");
+    try tmp.dir.createDirPath(testing.io, "e");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/b.txt", .data = "bee" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/c/d.txt", .data = "dee" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "dot" });
+    var big: [100_000]u8 = undefined;
+    for (&big, 0..) |*b, i| b.* = @intCast('a' + i % 7);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "z", .data = &big });
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    try zw.addTree(testing.io, tmp.dir, .{ .prefix = "pkg/" });
+    try zw.finish();
+
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(a, ms.source(), .{ .list_directories = true });
+    defer archive.deinit();
+    const names = try namesOf(a, &archive);
+    defer a.free(names);
+    try testing.expectEqualStrings("pkg/a/\npkg/a/b.txt\npkg/a/c/\npkg/a/c/d.txt\npkg/a.txt\npkg/e/\npkg/z\n", names);
+    const z = archive.find("pkg/z").?;
+    const got = try readAll(a, &archive, z);
+    defer a.free(got);
+    try testing.expectEqualSlices(u8, &big, got);
+    const d = try readAll(a, &archive, archive.find("pkg/a/c/d.txt").?);
+    defer a.free(d);
+    try testing.expectEqualStrings("dee", d);
+    try testing.expect(archive.find("pkg/e/").?.is_directory);
+    try testing.expect(z.mtime != null and z.mtime.? > 1_000_000_000); // the file's own time, not 1980
+    try testing.expect(z.mode == null or z.mode.? & 0o600 == 0o600);
+}
+
+test "addTree: preserve_metadata off writes the fixed date, equal trees give equal bytes" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "d");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "d/f", .data = "same" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "g", .data = "also" });
+    var outs: [2][]u8 = undefined;
+    for (&outs) |*o| {
+        var aw: std.Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        var zw = zs.ArchiveWriter.init(a, &aw.writer);
+        defer zw.deinit();
+        try zw.addTree(testing.io, tmp.dir, .{ .preserve_metadata = false, .entry = .{ .method = .store } });
+        try zw.finish();
+        o.* = try a.dupe(u8, aw.written());
+    }
+    defer for (outs) |o| a.free(o);
+    try testing.expectEqualSlices(u8, outs[0], outs[1]);
+    var ms: zs.MemorySource = .{ .bytes = outs[0] };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(a, ms.source(), .{});
+    defer archive.deinit();
+    try testing.expectEqual(@as(?i64, 315532800), archive.find("g").?.mtime); // 1980-01-01 00:00:00 UTC
+    try testing.expectEqual(@as(?u16, null), archive.find("g").?.mode);
+}
+
+test "addTree: a symlink is refused by default, stored or skipped on request" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = "file" });
+    try tmp.dir.symLink(testing.io, "f", "ln", .{});
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    try testing.expectError(error.ZipIrregularFile, zw.addTree(testing.io, tmp.dir, .{}));
+
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    defer aw2.deinit();
+    var zw2 = zs.ArchiveWriter.init(a, &aw2.writer);
+    defer zw2.deinit();
+    try zw2.addTree(testing.io, tmp.dir, .{ .symlinks = .store });
+    try zw2.finish();
+    var ms: zs.MemorySource = .{ .bytes = aw2.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(a, ms.source(), .{});
+    defer archive.deinit();
+    try testing.expect(archive.find("ln").?.isSymlink());
+    const target = try readAll(a, &archive, archive.find("ln").?);
+    defer a.free(target);
+    try testing.expectEqualStrings("f", target);
+
+    var aw3: std.Io.Writer.Allocating = .init(a);
+    defer aw3.deinit();
+    var zw3 = zs.ArchiveWriter.init(a, &aw3.writer);
+    defer zw3.deinit();
+    try zw3.addTree(testing.io, tmp.dir, .{ .symlinks = .skip });
+    try zw3.finish();
+    var ms3: zs.MemorySource = .{ .bytes = aw3.written() };
+    var archive3: zs.Archive = undefined;
+    try archive3.initSource(a, ms3.source(), .{});
+    defer archive3.deinit();
+    try testing.expectEqual(@as(usize, 1), archive3.entries.items.len);
+    try testing.expect(archive3.find("ln") == null);
+}
