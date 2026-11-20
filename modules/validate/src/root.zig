@@ -1700,9 +1700,9 @@ fn checkRuleBody(b: *Builder, path: []const u8, v: Value, rule: *const Rule) All
             }
             // go-playground's `oneof` on a number (`oneof=5 7 9`): each entry
             // is a JSON number text, compared by value (integers exactly).
-            // ⛔ An `.int`/`.float` rule ignored `one_of` before,
-            // while the schema it exported listed the entries as strings and
-            // so refused every number.
+            // ⛔ An `.int`/`.float` rule must honour `one_of`: the schema it
+            // exports lists the entries as numbers (a string list would
+            // refuse every number).
             if (rule.one_of) |allowed| if (rule.kind != .any and numValue(v) != null and !oneOfNumber(allowed, v)) {
                 try b.appendEnumError(path, allowed);
             };
