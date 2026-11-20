@@ -6,7 +6,7 @@
 
 **Scope:** core — go-webauthn/webauthn (verification half); tpm/android-key/apple attestation are missing (surveyed 2026-09-30; raised from mvp 2026-09-30 when authenticatorData extensions became accepted)
 
-**Audit:** review 2026-09-02 · mutation 2026-11-20 (143/145, 2 eq) · src 60efc09b91b93195
+**Audit:** review 2026-09-02 · mutation 2026-11-20 (143/145, 2 eq) · src 98161b1ab0e33d2e
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WEBAUTHN_FUZZ: `webauthn-assertion` and `webauthn-registration` over the six W3C §16 ceremonies — genuine accepted, a damaged authData / clientDataJSON / signature / COSE key refused; the script-driven parser harnesses are unchanged) · ct n/a — relying-party verifier: every input (signatures, credential public keys, challenges, client data) is public or sent in clear; holds no key, MAC key or secret (review, 2026-10-10)
 **Performance:** not measured

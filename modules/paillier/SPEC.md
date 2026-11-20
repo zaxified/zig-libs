@@ -6,7 +6,7 @@
 
 **Scope:** core — data61/python-paillier (phe) 1.5.1 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-17 · mutation 2026-11-19 (91/110, 19 eq) · src 16f583fea4a2dd31
+**Audit:** review 2026-09-17 · mutation 2026-11-19 (91/110, 19 eq) · src 420b6ff56b89a4e4
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; `paillier-roundtrip` at scale 20 = 10,000 runs at a 512-bit key, PAILLIER_FUZZ) · ct 2026-10-06 (ctgrind)
 

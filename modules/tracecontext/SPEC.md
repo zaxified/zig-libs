@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — OpenTelemetry Go v1.46.0 `propagation.TraceContext`, the propagator the reference spec is measured against here (the `**Performance:**` reference), breaks three W3C rules on the oracle's own request headers (`tools/go_oracle`, re-taken 2026-10-24 by `tools/interop.zig --check`): it drops the whole trace on unknown trace-flags bits (`…-ff`, `…-09`; W3C: accept and zero them on the way out), reads only the first of two `tracestate` fields (W3C: combine them, RFC 9110 §5.3 — a second vendor's state is lost) and drops the whole `tracestate` list on one duplicated key (the W3C suite's `test_tracestate_duplicated_keys` requires it kept); this module does all three as specified (test "otel oracle: the middleware continues, restarts and carries state as OpenTelemetry Go does", divergences shape02 shape04 sub53f sub54f state_split state27) (measured 2026-10-24)
 
-**Audit:** review 2026-11-11 · mutation 2026-11-17 (446/470, 24 eq) · src 146cd16917a6febb
+**Audit:** review 2026-11-11 · mutation 2026-11-17 (446/470, 24 eq) · src 6d663733275f5901
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TRACECONTEXT_FUZZ) · ct n/a — trace id headers (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: no data-reachable panic; monotonic seed clock wraps)
 

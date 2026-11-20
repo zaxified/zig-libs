@@ -6,7 +6,7 @@
 
 **Scope:** core — bnb-chain/tss-lib (surveyed 2026-09-30; re-assessed 2026-10-03 against the same table: dealer-free keygen and key refresh through `dkg`, one-round online signing over presignatures, identifiable abort for every GG20 type including 5 and 7, signed messages naming an equivocator, a consume-once presignature pool; the gaps a user can hit are under Backlog)
 
-**Audit:** review 2026-10-03 · mutation 2026-11-17 (553/621, 68 eq) · src adfbf432e5b382ba
+**Audit:** review 2026-10-03 · mutation 2026-11-17 (553/621, 68 eq) · src 3ad29cec54ff12ff
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, TECDSA_FUZZ) · ct 2026-10-03 (ctgrind)
 

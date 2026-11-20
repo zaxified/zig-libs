@@ -6,7 +6,7 @@
 
 **Scope:** core — libmodbus 3.2.0 (surveyed 2026-09-30)
 
-**Audit:** review 2026-09-10 · mutation 2026-11-19 (616/632, 16 eq) · src 005eed62f197b758
+**Audit:** review 2026-09-10 · mutation 2026-11-19 (616/632, 16 eq) · src 873fc2d8e7e3835e
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MODBUS_FUZZ) · ct n/a — industrial protocol, no auth (keyword review, 2026-10-07)
 

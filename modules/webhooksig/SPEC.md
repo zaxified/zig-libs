@@ -6,7 +6,7 @@
 
 **Scope:** core — Standard Webhooks / svix-webhooks v2.6.0 (surveyed 2026-10-04)
 
-**Audit:** review 2026-10-04 · mutation 2026-11-20 (123/125, 2 eq) · src c664b1c0ab43c042
+**Audit:** review 2026-10-04 · mutation 2026-11-20 (123/125, 2 eq) · src fa984b7a537bfcd5
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, WEBHOOKSIG_FUZZ) · ct 2026-11-13 (ctgrind: verify 0 in-file = the signature comparison and HMAC under a tainted secret raise no branch of the module (sha256/sha1/sha512, hex/base64, rotation set, Stripe, Slack, Standard Webhooks); sign 77 = the public MAC through the hex/base64 encoders; keys 1 = the SP/TAB trim of the `whsec_` text; ed25519 30 = public-signature base64 22, trims 2, std `rejectIdentity` 5, the embedded-public-half compare 1; itemised in `scripts/checks/ctgrind-expected.tsv`) · panic 2026-11-13 (sweep of every pub entry point: `Verifier.init`'s option preconditions were `std.debug.assert`, now `error.InvalidOptions`; no request-data crash found)
 
